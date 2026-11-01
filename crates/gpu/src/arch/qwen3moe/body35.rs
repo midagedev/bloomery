@@ -1107,10 +1107,10 @@ fn draft_layer(
 }
 
 /// The header a whole-card load of `file` plans by and where its card tensors come from
-/// ([`Model::into_origin`]); the next-token layer (`mtp`) of a checkpoint folder is refused by
+/// ([`Model::into_whole`]); the next-token layer (`mtp`) of a checkpoint folder is refused by
 /// name, since the folder's map leaves its `mtp.*` tensors out.
 fn whole_origin(file: Model, mtp: bool) -> Result<(Split, Origin), GpuError> {
-    let (header, origin) = file.into_origin(Residency::Off)?;
+    let (header, origin) = file.into_whole();
     if mtp && matches!(origin, Origin::Folder { .. }) {
         return Err(GpuError::shape(
             "qwen35moe GpuModel::open_mtp",

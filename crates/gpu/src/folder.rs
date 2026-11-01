@@ -44,31 +44,48 @@ impl<X> Model<X> {
         }
     }
 
-    /// The header the load plans by and where the card's tensors come from, the choice a body's
-    /// open takes once. A folder's load under `residency` stages its experts from where its
-    /// located header says the folder stores them; a header that locates no file
+    /// The header a load of `plan` plans by and where the card's tensors come from, the choice a
+    /// body's open takes once. A folder's load under `residency` stages its experts from where
+    /// its located header says the folder stores them; a header that locates no file
     /// (`gguf::Split::header_only`) is refused by name under a residency machine, its host holding
-    /// no expert to stage.
-    pub fn into_origin(self, residency: Residency) -> Result<(Split, Origin<X>), GpuError> {
-        match self {
-            Model::Split(file) => Ok((file, Origin::File)),
-            Model::Folder(f) => {
-                if residency != Residency::Off && f.header.is_header_only() {
-                    return Err(GpuError::shape(
-                        WHAT,
-                        "a checkpoint folder whose header locates no file runs under \
-                         BLOOMERY_RESIDENCY=off: the residency machine's source reads each \
-                         expert where the folder stores it",
-                    ));
-                }
-                Ok((
-                    f.header,
-                    Origin::Folder {
-                        parts: f.parts,
-                        extra: f.extra,
-                    },
-                ))
+    /// no expert to stage. Before any host reader, a folder's part source writes what its header
+    /// locates in another form than the folder stores (`model::part::Source::make_in_place`)
+    /// wherever the host reads in place: under a residency machine, or where `plan` holds such a
+    /// tensor on the host or the NVMe tier.
+    pub fn into_origin(
+        self,
+        residency: Residency,
+        plan: &Plan<'_>,
+    ) -> Result<(Split, Origin<X>), GpuError> {
+        if let Model::Folder(f) = &self {
+            if residency != Residency::Off && f.header.is_header_only() {
+                return Err(GpuError::shape(
+                    WHAT,
+                    "a checkpoint folder whose header locates no file runs under \
+                     BLOOMERY_RESIDENCY=off: the residency machine's source reads each \
+                     expert where the folder stores it",
+                ));
             }
+            if residency != Residency::Off || InPlace::of(&f.header).read_off_cards(plan) {
+                f.parts.make_in_place()?;
+            }
+        }
+        Ok(self.into_whole())
+    }
+
+    /// The header and where the card's tensors come from for a load that holds the whole model on
+    /// its card, whose host reads nothing in place.
+    #[must_use]
+    pub fn into_whole(self) -> (Split, Origin<X>) {
+        match self {
+            Model::Split(file) => (file, Origin::File),
+            Model::Folder(f) => (
+                f.header,
+                Origin::Folder {
+                    parts: f.parts,
+                    extra: f.extra,
+                },
+            ),
         }
     }
 }
@@ -166,20 +183,29 @@ impl<X> Origin<X> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use gguf::Value;
-    use gguf::write::{Layout, TensorDecl};
-    use model::part::{Part, Planned, Take};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// A part source that holds nothing: a load that read it would be refused by name.
-    struct Empty;
+    use super::*;
+    use gguf::write::{Layout, TensorDecl};
+    use gguf::{GgmlType, Place, Value};
+    use model::part::{Part, Planned, Take};
+    use model::placement::{
+        KvBytes, ModelTensor, ModelTensors, PlanLevers, Role, plan_host_routed, plan_with,
+        workstation,
+    };
+
+    /// A part source that holds nothing, a load that read it refused by name, which counts the
+    /// times a load asks it to write what the host reads in place.
+    #[derive(Clone, Default)]
+    struct Empty(Arc<AtomicUsize>);
 
     impl Source for Empty {
         type Error = std::fmt::Error;
 
         fn plan<E: std::fmt::Display>(
             &self,
-            _: impl Fn(&str, gguf::GgmlType, &[u64]) -> Result<Take, E>,
+            _: impl Fn(&str, GgmlType, &[u64]) -> Result<Take, E>,
         ) -> Result<Vec<Planned>, Self::Error> {
             Err(std::fmt::Error)
         }
@@ -191,18 +217,65 @@ mod tests {
         fn read(&self, _: &Planned) -> Result<Part<'_>, Self::Error> {
             Err(std::fmt::Error)
         }
+
+        fn make_in_place(&self) -> Result<(), Self::Error> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
     }
 
-    fn header() -> Split {
+    struct NoKv;
+
+    impl KvBytes for NoKv {
+        fn layer_bytes(&self, _: usize, _: u64) -> u64 {
+            0
+        }
+    }
+
+    /// The header's one tensor: the head, or (`routed`) one layer's routed stack of one expert.
+    fn model_of(routed: bool) -> ModelTensors {
+        let (layer, role, dims) = match routed {
+            false => (None, Role::Head, vec![256, 16]),
+            true => (Some(0), Role::RoutedExperts, vec![256, 16, 1]),
+        };
+        ModelTensors {
+            tensors: vec![ModelTensor {
+                name: "w.weight".into(),
+                shard: 0,
+                layer,
+                role,
+                ty: GgmlType::Q8_0,
+                dims,
+                file_bytes: 4352,
+                gathered_rows: None,
+            }],
+            layers: 1,
+            experts: u64::from(routed),
+            experts_used: u64::from(routed),
+            bf16_words: |_| false,
+        }
+    }
+
+    /// `f` of a plan that holds the header's one tensor on an A6000 workstation's card.
+    fn with_plan<R>(f: impl FnOnce(&Plan<'_>) -> R) -> R {
+        let model = model_of(false);
+        let machine = workstation::plan_on(workstation::A6000, 1);
+        f(&plan_with(&model, &machine, 16, &NoKv, None).expect("a plan"))
+    }
+
+    fn layout() -> Layout {
         let kvs = [("toy.layers".to_string(), Value::U32(1))];
         let tensors = vec![TensorDecl {
             name: "w.weight".into(),
-            dims: vec![32],
-            type_id: gguf::GgmlType::F32.as_u32(),
-            nbytes: 128,
+            dims: vec![256, 16],
+            type_id: GgmlType::Q8_0.as_u32(),
+            nbytes: 4352,
         }];
-        let layout = Layout::new(&kvs, tensors).unwrap();
-        Split::header_only(std::env::temp_dir().join("folder-toy.gguf"), &layout).unwrap()
+        Layout::new(&kvs, tensors).unwrap()
+    }
+
+    fn header() -> Split {
+        Split::header_only(std::env::temp_dir().join("folder-toy.gguf"), &layout()).unwrap()
     }
 
     /// A load of a split reads the split's own tensors under any residency and carries no
@@ -213,16 +286,18 @@ mod tests {
             pinned: 1,
             spares: 1,
         };
-        let (_, split) = Model::<u8>::from(header()).into_origin(mid).unwrap();
-        assert!(matches!(split.bytes(), CardBytes::File));
-        assert!(split.extra().is_none());
-        let (_, folder) = Model::from(Folder::with(header(), Empty, 7u8))
-            .into_origin(Residency::Off)
-            .unwrap();
-        assert!(matches!(folder.bytes(), CardBytes::Parts(_)));
-        assert_eq!(folder.extra(), Some(&7));
-        let plain: Model = Folder::new(header(), Empty).into();
-        assert!(plain.into_origin(Residency::Off).is_ok());
+        with_plan(|plan| {
+            let (_, split) = Model::<u8>::from(header()).into_origin(mid, plan).unwrap();
+            assert!(matches!(split.bytes(), CardBytes::File));
+            assert!(split.extra().is_none());
+            let (_, folder) = Model::from(Folder::with(header(), Empty::default(), 7u8))
+                .into_origin(Residency::Off, plan)
+                .unwrap();
+            assert!(matches!(folder.bytes(), CardBytes::Parts(_)));
+            assert_eq!(folder.extra(), Some(&7));
+            let plain: Model = Folder::new(header(), Empty::default()).into();
+            assert!(plain.into_origin(Residency::Off, plan).is_ok());
+        });
     }
 
     // PIN(2026-10-22): folder drafts use the placed MTP load; only residency is refused here.
@@ -234,10 +309,70 @@ mod tests {
             pinned: 1,
             spares: 1,
         };
-        let folder = || Model::<()>::from(Folder::new(header(), Empty));
-        let e = folder().into_origin(mid).err().unwrap();
-        assert!(e.to_string().contains("BLOOMERY_RESIDENCY=off"), "{e}");
-        assert!(folder().into_origin(Residency::Off).is_ok());
-        assert!(Model::<()>::from(header()).into_origin(mid).is_ok());
+        with_plan(|plan| {
+            let folder = || Model::<()>::from(Folder::new(header(), Empty::default()));
+            let e = folder().into_origin(mid, plan).err().unwrap();
+            assert!(e.to_string().contains("BLOOMERY_RESIDENCY=off"), "{e}");
+            assert!(folder().into_origin(Residency::Off, plan).is_ok());
+            assert!(Model::<()>::from(header()).into_origin(mid, plan).is_ok());
+        });
+    }
+
+    /// A folder's part source writes what its located header holds in place before a load whose
+    /// host reads there: under a residency machine, and under `off` where the plan holds such a
+    /// tensor on the host (`parts::InPlace::read_off_cards`), not under `off` with every tensor on
+    /// the card, and never for a header that locates no file or a whole-card load. Mutants: the
+    /// write left out under a residency machine, or for an `off` plan that holds it on the host.
+    #[test]
+    fn a_folder_writes_what_its_host_reads_in_place_first() {
+        let dir = std::env::temp_dir().join(format!("folder-in-place-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("w.bin");
+        std::fs::write(&file, vec![0u8; 4352]).unwrap();
+        let located = || {
+            let place = Place::File {
+                shard: 0,
+                range: 0..4352,
+            };
+            Split::located(
+                file.clone(),
+                &layout(),
+                std::slice::from_ref(&file),
+                vec![place],
+            )
+            .unwrap()
+        };
+        let mid = Residency::Mid {
+            pinned: 1,
+            spares: 1,
+        };
+        with_plan(|plan| {
+            for (header, residency, made) in [
+                (located(), Residency::Off, 0),
+                (located(), mid, 1),
+                (header(), Residency::Off, 0),
+            ] {
+                let source = Empty::default();
+                let model: Model = Folder::new(header, source.clone()).into();
+                model.into_origin(residency, plan).unwrap();
+                assert_eq!(source.0.load(Ordering::Relaxed), made, "{residency:?}");
+            }
+            let source = Empty::default();
+            let _ = Model::from(Folder::new(located(), source.clone())).into_whole();
+            assert_eq!(source.0.load(Ordering::Relaxed), 0);
+        });
+        let model = model_of(true);
+        let machine = workstation::plan_on(workstation::A6000, 1);
+        let host =
+            plan_host_routed(&model, &machine, 16, &NoKv, &PlanLevers::default()).expect("a plan");
+        assert!(
+            InPlace::of(&located()).read_off_cards(&host),
+            "the plan holds the stack on the host"
+        );
+        let source = Empty::default();
+        let model: Model = Folder::new(located(), source.clone()).into();
+        model.into_origin(Residency::Off, &host).unwrap();
+        assert_eq!(source.0.load(Ordering::Relaxed), 1, "off, on the host");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

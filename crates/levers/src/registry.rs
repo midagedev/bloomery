@@ -1948,6 +1948,18 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          track's own in a parallel round.",
     ),
     path(
+        "BLOOMERY_SCALES",
+        None,
+        "The directory of the scale store, where a load of a checkpoint folder whose NVFP4 \
+         experts store their block scales compressed (`csf`, `csf_32x2_v1`, as FP4-Local's do) \
+         keeps those scales read back, one file per folder generation, so the host reads its \
+         experts in place (`crates/model-hf/src/folder/scales.rs`); `~/.cache/bloomery/scales` \
+         when unset. The \
+         open sizes the file and writes no scale; the first load whose host reads an expert \
+         decodes them, and later loads of the unchanged folder read them as written. A changed \
+         folder opens another path; older files stay available to loads holding their paths.",
+    ),
+    path(
         "BLOOMERY_TOKENIZE_BIN",
         Some("ref/ik-draft.sh"),
         "The `bloomery-tokenize` binary `tools/ref/ik-draft.sh` runs.",

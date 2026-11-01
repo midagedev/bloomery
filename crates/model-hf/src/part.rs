@@ -24,6 +24,7 @@ use model::placement::tp::TpError;
 use safetensors::{Dtype, Folder, Raw};
 
 use crate::folder::Constant;
+use crate::folder::scales::Decoded;
 
 /// The most stored bytes one direct read of a stack's sources holds, unless a single source is
 /// larger ([`Checkpoint::read_stack`]).
@@ -52,6 +53,10 @@ pub enum Error {
     /// A direct-read helper could not be placed.
     #[error(transparent)]
     Helper(#[from] threads::helper::HelperError),
+    /// The scale store could not take a folder's block scales read back from their compressed
+    /// form; the reason names its file.
+    #[error("{0}")]
+    Scales(String),
 }
 
 impl From<TpError> for Error {
@@ -88,6 +93,9 @@ pub struct Checkpoint {
     made: BTreeMap<String, Made>,
     /// The tensors no folder tensor holds ([`Constant`]), made whole and cut as a moved tensor is.
     constants: BTreeMap<String, Constant>,
+    /// The block scales a located header reads from the scale store, decoded on the first
+    /// [`Source::make_in_place`].
+    scales: Option<Decoded>,
 }
 
 impl Checkpoint {
@@ -115,6 +123,7 @@ impl Checkpoint {
             plan,
             made,
             constants: BTreeMap::new(),
+            scales: None,
         })
     }
 
@@ -122,6 +131,14 @@ impl Checkpoint {
     #[must_use]
     pub fn with_constants(mut self, constants: BTreeMap<String, Constant>) -> Checkpoint {
         self.constants = constants;
+        self
+    }
+
+    /// This checkpoint with the scale store's file its located header reads the block scales
+    /// of its compressed stacks from, once [`Source::make_in_place`] has written them.
+    #[must_use]
+    pub(crate) fn with_scales(mut self, scales: Option<Decoded>) -> Checkpoint {
+        self.scales = scales;
         self
     }
 
@@ -569,6 +586,14 @@ impl Source for Checkpoint {
             }
         }
         Ok(())
+    }
+
+    /// The block scales of the stacks stored with them compressed, decoded into the scale
+    /// store's file once ([`Decoded::fill`]).
+    fn make_in_place(&self) -> Result<(), Error> {
+        self.scales
+            .as_ref()
+            .map_or(Ok(()), |s| s.fill(&self.folder))
     }
 }
 

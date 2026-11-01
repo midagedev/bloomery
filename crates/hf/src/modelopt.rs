@@ -302,11 +302,7 @@ pub fn normalize_part<'a>(
         PartPlan::Experts(r) => return normalize(get, &sources[r], role),
         PartPlan::Cuts(cuts) => cuts,
     };
-    let encoding = match sources[0].1.format {
-        Format::Nvfp4Csf => Some(csf::Encoding::Csf),
-        Format::Nvfp4Csf32 => Some(csf::Encoding::Csf32),
-        _ => None,
-    };
+    let encoding = csf::Encoding::of(sources[0].1.format);
     let (decoded, places) = match encoding {
         Some(encoding) => decode_scales(&get, sources, encoding)?,
         None => (HashMap::new(), vec![]),
@@ -627,15 +623,7 @@ fn decode_scales<'s, 'a>(
             format: placed.format,
             what,
         };
-        let (Some((scale, _)), [_, .., tensor_scale]) = (
-            placed.companions.first().and_then(|c| c.rsplit_once('.')),
-            placed.companions.as_slice(),
-        ) else {
-            return Err(refuse(format!(
-                "its place names {:?}, not a compressed block scale and a tensor scale",
-                placed.companions
-            )));
-        };
+        let (scale, tensor_scale) = compressed_scales_of(weight, placed)?;
         let w = get(weight)?;
         let &[rows, half] = w.shape else {
             return Err(refuse(format!("{:?} is not [rows, k/2]", w.shape)));
@@ -655,12 +643,31 @@ fn decode_scales<'s, 'a>(
         places.push((
             weight,
             Placed {
-                format: Format::Nvfp4,
-                companions: vec![scale.to_string(), tensor_scale.clone()],
+                format: placed.format.decoded(),
+                companions: vec![scale.to_string(), tensor_scale.to_string()],
             },
         ));
     }
     Ok((decoded, places))
+}
+
+/// The stem a compressed block scale's parts are named under and the tensor scale `placed` lists
+/// for `weight`: its first companion's name less the part, and its last companion.
+fn compressed_scales_of<'p>(weight: &str, placed: &'p Placed) -> Result<(&'p str, &'p str), Error> {
+    match (
+        placed.companions.first().and_then(|c| c.rsplit_once('.')),
+        placed.companions.as_slice(),
+    ) {
+        (Some((stem, _)), [_, .., tensor]) => Ok((stem, tensor.as_str())),
+        _ => Err(Error::Format {
+            name: weight.to_string(),
+            format: placed.format,
+            what: format!(
+                "its place names {:?}, not a compressed block scale and a tensor scale",
+                placed.companions
+            ),
+        }),
+    }
 }
 
 /// A tensor its type writes one source at a time, into one allocation reserved at its length on
@@ -944,14 +951,108 @@ pub fn nvfp4_rows_scale<'a, 'p>(
             what: "not plain NVFP4 code and scale rows".into(),
         });
     }
-    let shape = |name: String, what: String| Error::Shape { name, what };
-    let wname = weight.to_string();
     let Scales {
         block: sname,
         tensor: tname,
         input,
     } = scales_of(weight, placed)?;
-    let (w, s) = (get(&wname)?, get(sname)?);
+    let (rows, half) = rows_codes(get, weight)?;
+    let s = get(sname)?;
+    if s.dtype != Dtype::F8E4M3 || s.shape != [rows, half / 8] || s.bytes.len() != rows * half / 8 {
+        return Err(Error::Shape {
+            name: sname.to_string(),
+            what: format!(
+                "{} {:?}; the groups are F8_E4M3 [{rows}, {}]",
+                s.dtype.name(),
+                s.shape,
+                half / 8
+            ),
+        });
+    }
+    let scale = rows_tensor_scale(get, placed.format, weight, tname)?;
+    if let Some(input) = input {
+        input_scale(get, weight, placed.format, input)?;
+    }
+    Ok((scale, sname))
+}
+
+/// A block scale a checkpoint stores compressed ([`csf`]), as [`nvfp4_compressed_rows_scale`]
+/// found it: [`CompressedScale::decode`] reads back the plain bytes.
+#[derive(Debug)]
+pub struct CompressedScale {
+    stem: String,
+    encoding: csf::Encoding,
+    rows: usize,
+    groups: usize,
+}
+
+impl CompressedScale {
+    /// The plain block scale's bytes: one F8_E4M3 a 16-value group.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.rows as u64 * self.groups as u64
+    }
+
+    /// The plain block scale, `rows · k/16` bytes row-major, as a plain checkpoint stores it.
+    ///
+    /// # Errors
+    ///
+    /// A part `get` refuses or lacks, and every rule of the decoder ([`csf`]), by name.
+    pub fn decode<'a>(
+        &self,
+        get: impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
+    ) -> Result<Vec<u8>, Error> {
+        Ok(csf::weight_scale(
+            get,
+            &self.stem,
+            self.encoding,
+            self.rows,
+            self.groups,
+        )?)
+    }
+}
+
+/// The tensor scale of NVFP4 rows whose place stores the block scale compressed (`csf` or
+/// `csf_32x2_v1`), and that block scale: [`nvfp4_rows_scale`] of the plain rows its decoded scale
+/// makes. Checks the code plane alike and reads no compressed part.
+///
+/// # Errors
+///
+/// Another format, a place that does not list a compressed block scale and a tensor scale, and
+/// [`nvfp4_rows_scale`]'s refusals of the code plane and the tensor scale, each by name.
+pub fn nvfp4_compressed_rows_scale<'a>(
+    get: &impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
+    weight: &str,
+    placed: &Placed,
+) -> Result<(f32, CompressedScale), Error> {
+    let encoding = csf::Encoding::of(placed.format).ok_or_else(|| Error::Format {
+        name: weight.to_string(),
+        format: placed.format,
+        what: "not NVFP4 rows with a compressed block scale".into(),
+    })?;
+    let (stem, tensor) = compressed_scales_of(weight, placed)?;
+    let (rows, half) = rows_codes(get, weight)?;
+    let scale = rows_tensor_scale(get, placed.format, weight, tensor)?;
+    Ok((
+        scale,
+        CompressedScale {
+            stem: stem.to_string(),
+            encoding,
+            rows,
+            groups: half / 8,
+        },
+    ))
+}
+
+/// The `[rows, k/2]` of the U8 code plane `weight` of NVFP4 rows, checked as whole 16-value groups
+/// whose bytes, codes and scales, stay within `usize`.
+fn rows_codes<'a>(
+    get: &impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
+    weight: &str,
+) -> Result<(usize, usize), Error> {
+    let shape = |name: String, what: String| Error::Shape { name, what };
+    let wname = weight.to_string();
+    let w = get(&wname)?;
     let &[rows, half] = w.shape else {
         return Err(shape(
             wname,
@@ -980,17 +1081,18 @@ pub fn nvfp4_rows_scale<'a, 'p>(
     if w.bytes.len() != size {
         return Err(shape(wname, format!("{} bytes, not {size}", w.bytes.len())));
     }
-    if s.dtype != Dtype::F8E4M3 || s.shape != [rows, half / 8] || s.bytes.len() != size / 8 {
-        return Err(shape(
-            sname.to_string(),
-            format!(
-                "{} {:?}; the groups are F8_E4M3 [{rows}, {}]",
-                s.dtype.name(),
-                s.shape,
-                half / 8
-            ),
-        ));
-    }
+    Ok((rows, half))
+}
+
+/// The tensor scale `tname` of the NVFP4 weight `weight` in `format`: one finite F32, as the
+/// multiplier GGUF keeps ([`multiplier`]).
+fn rows_tensor_scale<'a>(
+    get: &impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
+    format: Format,
+    weight: &str,
+    tname: &str,
+) -> Result<f32, Error> {
+    let shape = |name: String, what: String| Error::Shape { name, what };
     let t = get(tname)?;
     let scale = match (t.dtype, t.bytes) {
         (Dtype::F32, &[a, b, c, d]) => f32::from_le_bytes([a, b, c, d]),
@@ -1007,11 +1109,7 @@ pub fn nvfp4_rows_scale<'a, 'p>(
             format!("tensor scale {scale} is not finite"),
         ));
     }
-    let scale = multiplier(placed.format, weight, tname, scale)?;
-    if let Some(input) = input {
-        input_scale(get, weight, placed.format, input)?;
-    }
-    Ok((scale, sname))
+    multiplier(format, weight, tname, scale)
 }
 
 /// The NVFP4 weight `source` as [`GgmlType::NVFP4_ROWS`]: each 16-value group
@@ -1423,12 +1521,7 @@ fn append<'a>(
     out: &mut Normal,
     left: usize,
 ) -> Result<[usize; 2], Error> {
-    let encoding = match placed.format {
-        Format::Nvfp4Csf => Some(csf::Encoding::Csf),
-        Format::Nvfp4Csf32 => Some(csf::Encoding::Csf32),
-        _ => None,
-    };
-    if let Some(encoding) = encoding {
+    if let Some(encoding) = csf::Encoding::of(placed.format) {
         let (decoded, places) = decode_scales(get, &[(weight, placed)], encoding)?;
         let read = |n: &str| match decoded.get(n) {
             Some(t) => Ok(t.raw()),
@@ -2850,7 +2943,8 @@ mod tests {
 
     /// The compressed-scale lines and the row line. A `csf` and a `csf_32x2_v1` weight, a
     /// linear and a two-expert stack, normalize to the bytes and scales of the same weight
-    /// with its plain `weight_scale` (the fixture's encoded scales beside the bytes they encode).
+    /// with its plain `weight_scale` (the fixture's encoded scales beside the bytes they encode),
+    /// and its block scale read back for rows ([`nvfp4_compressed_rows_scale`]) is that plain one.
     /// An NVFP4 row table keeps each group's scale byte then its 8 code bytes, its tensor scale
     /// the companion's; a scale byte that is no UE4M3 scale is refused naming its row and group.
     #[test]
@@ -2879,7 +2973,7 @@ mod tests {
                     "p.weight_scale".into(),
                     "F8_E4M3",
                     vec![rows, groups],
-                    plain_scale,
+                    plain_scale.clone(),
                 ),
                 ("p.weight_scale_2".into(), "F32", vec![], two.to_vec()),
             ];
@@ -2919,11 +3013,23 @@ mod tests {
             assert_eq!(ours.dims, [2 * half as u64, rows as u64]);
             let stack = packed(&[("c.weight", &c), ("c.weight", &c)]);
             assert_eq!(stack, packed(&[(&pw, &p), (&pw, &p)]), "{stem}");
+            let (scale, compressed) = nvfp4_compressed_rows_scale(&get, "c.weight", &c).unwrap();
+            assert_eq!((scale, compressed.bytes()), (2.0, (rows * groups) as u64));
+            assert_eq!(compressed.decode(get).unwrap(), plain_scale, "{stem}");
+            assert_eq!(nvfp4_rows_scale(&get, &pw, &p).unwrap().0, 2.0);
+            let e = nvfp4_compressed_rows_scale(&get, &pw, &p).unwrap_err();
+            assert!(e.to_string().contains("compressed block scale"), "{e}");
             let alone = Placed {
                 format,
                 companions: vec!["c.weight_scale_2".into()],
             };
             let e = normalize(get, &[("c.weight", &alone)], m).unwrap_err();
+            assert!(
+                e.to_string()
+                    .contains("not a compressed block scale and a tensor scale"),
+                "{e}"
+            );
+            let e = nvfp4_compressed_rows_scale(&get, "c.weight", &alone).unwrap_err();
             assert!(
                 e.to_string()
                     .contains("not a compressed block scale and a tensor scale"),

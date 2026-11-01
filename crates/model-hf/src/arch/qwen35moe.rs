@@ -2151,12 +2151,12 @@ mod tests {
     }
 
     /// nvidia/Qwen3.8-Flash-Next-NVFP4's routed stacks (layers 0, 1 and 3) are kept for a load
-    /// where the folder stores them, as NVFP4 rows planes with a tensor scale an expert; the
-    /// split `prepare` writes makes them NVFP4, and so does a load of the stacks stored with
-    /// `csf` block scales (FP4-Local's encoding), a form the host does not read in place.
-    /// FAIL-first: the map makes every stack, so a load keeps none.
+    /// where the folder stores them, as NVFP4 rows planes with a tensor scale an expert, and so
+    /// are the stacks stored with `csf` block scales (FP4-Local's encoding), whose scales the load
+    /// reads back into the scale store; the split `prepare` writes makes both NVFP4.
+    /// FAIL-first: the map makes every stack, so a load keeps none; the csf stacks were made.
     #[test]
-    fn a_load_keeps_plain_nvfp4_stacks_where_the_folder_stores_them() {
+    fn a_load_keeps_nvfp4_stacks_where_the_folder_stores_them() {
         use crate::folder::Make;
         let plain = entries(&json(
             "checkpoint-headers/qwen3.8-flash-next-nvfp4-layers-0-1-3.tensors.json.gz",
@@ -2232,6 +2232,13 @@ mod tests {
                 &csf_hq,
                 &csf,
                 folder::Keep::InPlace,
+                (GgmlType::NVFP4_ROWS, kept),
+            ),
+            (
+                "csf split",
+                &csf_hq,
+                &csf,
+                folder::Keep::Made,
                 (GgmlType::NVFP4, Origin::Made),
             ),
         ] {

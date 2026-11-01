@@ -25,6 +25,8 @@ use model::part::{StoredPlane, StoredRows};
 
 use crate::part::{self, Made};
 
+pub(crate) mod scales;
+
 /// The vocabulary a map names: the config's vocabulary fields.
 pub type VocabSpec = hf::vocab::Config;
 
@@ -153,8 +155,9 @@ pub enum Origin {
     File(GgmlType),
     /// The sources, a matrix each in expert order, as the folder stores them, declared as the
     /// type in the layout: the host reads each matrix in place. Kept only where the stored
-    /// format is that type's rows ([`modelopt::type_of`] of [`Use::Rows`]); a stack stored in
-    /// another (NVFP4 with `csf` block scales, BF16) is made.
+    /// format is that type's rows ([`modelopt::type_of`] of [`Use::Rows`]), or NVFP4 whose block
+    /// scales are stored compressed, read back once into the scale store ([`scales`]); a stack
+    /// stored in another (BF16) is made.
     Stack { ty: GgmlType, layout: StackLayout },
 }
 
@@ -519,7 +522,13 @@ pub fn open_as<M: FolderMap>(dir: &Path, config: &Json) -> Result<Opened, Error>
         draft,
         source,
         rows,
-    } = assemble(&checkpoint, dir, folder, plan, planned, &kvs)?;
+    } = assemble(
+        &checkpoint,
+        dir,
+        (folder, plan, planned),
+        &kvs,
+        scales::store().as_deref(),
+    )?;
     Ok(Opened {
         header,
         draft,
@@ -607,15 +616,18 @@ enum Spot {
     },
 }
 
+/// The located header, the draft, the part source and the row tables of the folder `dir`'s
+/// planned tensors, its compressed block scales read back into the scale store `store`
+/// ([`scales`]).
 fn assemble<M: FolderMap>(
     checkpoint: &M,
     dir: &Path,
-    folder: Folder,
-    plan: Plan,
-    planned: Vec<Planned<M::Step>>,
+    (folder, plan, planned): (Folder, Plan, Vec<Planned<M::Step>>),
     kvs: &[(String, Value)],
+    store: Option<&Path>,
 ) -> Result<Assembled, Error> {
     let layout = Layout::new(kvs, planned.iter().map(|p| p.decl.clone()).collect())?;
+    let mut wanted = scales::Wanted::new(dir, store)?;
     let mut spots = Vec::with_capacity(planned.len());
     let mut made = BTreeMap::new();
     let mut constants = BTreeMap::new();
@@ -644,7 +656,9 @@ fn assemble<M: FolderMap>(
                 let (file, range) = folder.file_range(&m.sources[0])?;
                 Spot::File(file, range)
             }
-            Origin::Stack { layout, .. } => stack_in_place(&folder, &plan, &decl, &m, layout)?,
+            Origin::Stack { layout, .. } => {
+                stack_in_place(&folder, &plan, &decl, &m, layout, &mut wanted)?
+            }
         });
         let step = checkpoint.mover(&decl.name, &m.steps);
         made.insert(
@@ -656,6 +670,21 @@ fn assemble<M: FolderMap>(
                 step,
             },
         );
+    }
+    let pending_path = wanted.path.clone();
+    // Keep the lock until the header maps this cache generation.
+    let (decoded, scale_lock) = wanted.open()?.unzip();
+    let decoded_path = decoded.as_ref().map(|d| d.path().to_path_buf());
+    if let (Some(pending), Some(decoded)) = (pending_path, decoded_path.as_ref()) {
+        for spot in &mut spots {
+            if let Spot::Stack { scales_in, .. } = spot {
+                for file in scales_in {
+                    if *file == pending {
+                        file.clone_from(decoded);
+                    }
+                }
+            }
+        }
     }
     let used: BTreeSet<&PathBuf> = spots
         .iter()
@@ -669,7 +698,12 @@ fn assemble<M: FolderMap>(
             } => codes_in.iter().chain(scales_in).collect(),
         })
         .collect();
-    let mut files: Vec<PathBuf> = used.into_iter().cloned().collect();
+    // The scale store follows the folder shards.
+    let mut files: Vec<PathBuf> = used
+        .into_iter()
+        .filter(|f| decoded_path.as_ref() != Some(*f))
+        .cloned()
+        .collect();
     if !files.is_empty() {
         let first = first_shard(&folder)?;
         if !files.contains(&first) {
@@ -677,6 +711,7 @@ fn assemble<M: FolderMap>(
         }
         files.sort();
     }
+    files.extend(decoded_path);
     let index = |file: &PathBuf| {
         files
             .iter()
@@ -717,6 +752,7 @@ fn assemble<M: FolderMap>(
         .collect::<Result<Vec<_>, Error>>()?;
     let path = files.first().cloned().unwrap_or_else(|| dir.to_path_buf());
     let header = Split::located(path.clone(), &layout, &files, places)?;
+    drop(scale_lock);
     let draft = checkpoint
         .draft(&path, &folder, &plan, kvs)
         .and_then(|drafted| {
@@ -752,7 +788,9 @@ fn assemble<M: FolderMap>(
     Ok(Assembled {
         header,
         draft,
-        source: part::Checkpoint::new(folder, plan, made)?.with_constants(constants),
+        source: part::Checkpoint::new(folder, plan, made)?
+            .with_constants(constants)
+            .with_scales(decoded),
         rows,
     })
 }
@@ -781,13 +819,15 @@ fn scale_name(name: &str) -> String {
 /// The stack `decl`, mapped as `m`, where `folder` stores it: each expert's code plane and its
 /// block-scale plane, two runs wherever the folder keeps them, each in its own shard
 /// ([`StackLayout::Planes`]), with the expert's tensor scale, the factor its results are
-/// multiplied by. Every code plane has the stack's size, and every block-scale plane.
+/// multiplied by; a block scale stored compressed is the plain one `wanted` places in the scale
+/// store. Every code plane has the stack's size, and every block-scale plane.
 fn stack_in_place<S>(
     folder: &Folder,
     plan: &Plan,
     decl: &TensorDecl,
     m: &Mapped<S>,
     layout: StackLayout,
+    wanted: &mut scales::Wanted,
 ) -> Result<Spot, Error> {
     let name = &decl.name;
     if layout != StackLayout::Planes {
@@ -801,9 +841,14 @@ fn stack_in_place<S>(
     let mut scales = Vec::with_capacity(m.sources.len());
     let mut per: Option<(u64, u64)> = None;
     for (source, placed) in m.placed(plan)? {
-        let (scale, block_scale) = modelopt::nvfp4_rows_scale(&get, source, placed)?;
+        let (scale, scale_file, planes) = if placed.format == placed.format.decoded() {
+            let (scale, block_scale) = modelopt::nvfp4_rows_scale(&get, source, placed)?;
+            let (file, planes) = folder.file_range(block_scale)?;
+            (scale, file, planes)
+        } else {
+            wanted.push(folder, source, placed)?
+        };
         let (codes_file, codes) = folder.file_range(source)?;
-        let (scale_file, planes) = folder.file_range(block_scale)?;
         let sizes = (codes.end - codes.start, planes.end - planes.start);
         if let Some(of) = per.filter(|&of| of != sizes) {
             return Err(format!(
@@ -1010,7 +1055,7 @@ pub fn planned_tensors<S>(
         m.origin = match (keep, m.origin) {
             (Keep::Made, _) => Origin::Made,
             (Keep::InPlace, Origin::Stack { ty, .. })
-                if modelopt::type_of(format, Use::Rows) != Some(ty.as_u32()) =>
+                if modelopt::type_of(format.decoded(), Use::Rows) != Some(ty.as_u32()) =>
             {
                 Origin::Made
             }
@@ -1609,6 +1654,9 @@ mod tests {
         TwoFiles,
         /// Every expert's codes in one file, every block scale and tensor scale in another.
         ScalesElsewhere,
+        /// As [`Experts::Planes`], each expert 16 rows whose block scales are stored as `csf`
+        /// ([`csf_scales`]).
+        Csf,
         /// As [`Experts::Planes`], the last expert's codes one row short.
         Uneven,
     }
@@ -1621,6 +1669,28 @@ mod tests {
 
     fn block_scales(e: usize) -> Vec<u8> {
         (0..16).map(|j| 0x30 + 4 * e as u8 + j).collect()
+    }
+
+    /// Expert `e`'s plain block scales under [`Experts::Csf`]: 16 rows of 4 groups, each a byte a
+    /// row's base and a 4-bit code give, but one the `csf` stream stores apart.
+    fn csf_scales(e: usize) -> Vec<u8> {
+        let mut s: Vec<u8> = (0..64)
+            .map(|i| 0x30 + ((i / 4 + i % 4 + e) % 8) as u8)
+            .collect();
+        s[21] = 0x7e;
+        s
+    }
+
+    /// [`csf_scales`] stored as `csf`: the fixed slab (16 bases, then each row's codes two a
+    /// byte, low nibble first) and the exception word of the byte stored apart.
+    fn csf_parts(e: usize) -> (Vec<u8>, Vec<u8>) {
+        let s = csf_scales(e);
+        let mut fixed = vec![0x30u8; 16];
+        fixed.extend(
+            s.chunks(2)
+                .map(|p| (p[0] - 0x30) & 15 | ((p[1] - 0x30) & 15) << 4),
+        );
+        (fixed, (21u32 | 0x7e << 24).to_le_bytes().to_vec())
     }
 
     const TENSOR_SCALES: [f32; 3] = [1.5, 2.5, 3.5];
@@ -1638,6 +1708,31 @@ mod tests {
         let gate: Vec<u8> = (0..64).map(|i| 0x80 + i).collect();
         let norm: Vec<u8> = (0..16).map(|i| 0x40 + i).collect();
         let expert = |e: usize, rows: usize| -> Vec<Tensor> {
+            if experts == Experts::Csf {
+                let (fixed, exceptions) = csf_parts(e);
+                let codes: Vec<u8> = (0..4).flat_map(|_| codes(e)).collect();
+                return vec![
+                    (format!("ex.{e}.weight"), "U8", vec![16, 32], codes),
+                    (
+                        format!("ex.{e}.weight_scale.nvfp4_csf_fixed"),
+                        "U8",
+                        vec![1, 48],
+                        fixed,
+                    ),
+                    (
+                        format!("ex.{e}.weight_scale.nvfp4_csf_exceptions"),
+                        "U32",
+                        vec![1],
+                        exceptions,
+                    ),
+                    (
+                        format!("ex.{e}.weight_scale_2"),
+                        "F32",
+                        vec![1],
+                        TENSOR_SCALES[e].to_le_bytes().to_vec(),
+                    ),
+                ];
+            }
             vec![
                 (
                     format!("ex.{e}.weight"),
@@ -1671,7 +1766,7 @@ mod tests {
         let mut b: Vec<Tensor> = vec![("gate.weight".into(), "F32", vec![2, 8], gate)];
         let mut c: Vec<Tensor> = vec![];
         match experts {
-            Experts::Planes | Experts::Uneven => {
+            Experts::Planes | Experts::Uneven | Experts::Csf => {
                 let last = if experts == Experts::Uneven { 3 } else { 4 };
                 b.extend(expert(2, last));
                 b.extend(expert(0, 4));
@@ -1724,8 +1819,12 @@ mod tests {
             json!({"model_type": "toy", "vocab_size": 16}).to_string(),
         )
         .unwrap();
+        let mut ex = json!({"quant_algo": "NVFP4"});
+        if experts == Experts::Csf {
+            ex["weight_scale_encoding"] = "csf".into();
+        }
         let hq = json!({"quantization": {"quant_algo": "MIXED_PRECISION",
-            "quantized_layers": {"ex": {"quant_algo": "NVFP4"}}}});
+            "quantized_layers": {"ex": ex}}});
         std::fs::write(dir.join("hf_quant_config.json"), hq.to_string()).unwrap();
     }
 
@@ -1739,7 +1838,14 @@ mod tests {
             kvs,
             ..
         } = fold::<Toy>(dir, &config, false, Keep::InPlace)?;
-        assemble(&checkpoint, dir, folder, plan, planned, &kvs)
+        let store = dir.join("scales");
+        assemble(
+            &checkpoint,
+            dir,
+            (folder, plan, planned),
+            &kvs,
+            Some(&store),
+        )
     }
 
     /// The toy folder opens as a located split over its files: the embedding and the router are
@@ -1855,6 +1961,125 @@ mod tests {
         }
     }
 
+    /// A stack whose block scales the folder stores as `csf` opens in place as a plain one: each
+    /// expert's codes where the folder stores them, its plain block scale at its place in the scale
+    /// store's file, which follows the folder's files. The open writes no scale: the file holds
+    /// zeros until the part source makes them (`make_in_place`), then each expert's plain scale.
+    /// A later open keeps a written file as it is (a byte changed in it stays), also through an
+    /// alias of the folder's path; one after a folder file changed opens another generation,
+    /// and an open before that one's scales are written keeps its file under the key's pending
+    /// mark. Older headers reopen their own generation, whether already filled or still pending.
+    /// FAIL-first: the stack was made, so the header held no matrix of it; replacing a generation
+    /// at the same path makes an older header reopen the new one's unwritten scales.
+    #[test]
+    fn a_folder_reads_compressed_block_scales_back_once() {
+        use model::part::Source;
+
+        let dir = temp_dir("folder-csf");
+        toy_folder(&dir, Experts::Csf, &[]);
+        let a = toy_assembled(&dir).unwrap();
+        let split = &a.header;
+        assert_eq!(split.shard_count(), 3);
+        let file = split.shard_path(2).unwrap().to_path_buf();
+        assert_eq!(file.parent(), Some(dir.join("scales").as_path()));
+        let Some(Place::Stack {
+            codes_in,
+            scales_in,
+            scales_at,
+            scales_per,
+            scales,
+            ..
+        }) = split.place("exps.weight")
+        else {
+            panic!("the stack is kept in place");
+        };
+        assert_eq!((&codes_in[..], &scales_in[..]), (&[1; 3][..], &[2; 3][..]));
+        assert_eq!((*scales_per, &scales[..]), (64, &TENSOR_SCALES[..]));
+        let matrix = |split: &Split, e: usize| {
+            let m = split.matrix("exps.weight", e).unwrap();
+            (m.codes.to_vec(), m.block_scales.to_vec())
+        };
+        for e in 0..3 {
+            let codes: Vec<u8> = (0..4).flat_map(|_| codes(e)).collect();
+            assert_eq!(matrix(split, e), (codes, vec![0; 64]), "expert {e}");
+        }
+        a.source.make_in_place().unwrap();
+        for e in 0..3 {
+            assert_eq!(matrix(split, e).1, csf_scales(e), "expert {e}");
+        }
+        let alias = dir.with_extension("alias");
+        std::os::unix::fs::symlink(&dir, &alias).unwrap();
+        let through = toy_assembled(&alias).unwrap();
+        assert_eq!(
+            through
+                .header
+                .shard_path(2)
+                .unwrap()
+                .canonicalize()
+                .unwrap(),
+            file.canonicalize().unwrap()
+        );
+        assert_eq!(
+            matrix(&through.header, 0).1,
+            csf_scales(0),
+            "an alias of the folder keeps its file"
+        );
+        std::fs::remove_file(&alias).unwrap();
+        let poke = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+        std::os::unix::fs::FileExt::write_all_at(&poke, &[0x55], scales_at[0]).unwrap();
+        let b = toy_assembled(&dir).unwrap();
+        assert_eq!(b.header.shard_path(2).unwrap(), file);
+        b.source.make_in_place().unwrap();
+        assert_eq!(matrix(&b.header, 0).1[0], 0x55, "the written file is kept");
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join("b.safetensors"))
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        let c = toy_assembled(&dir).unwrap();
+        let old_bytes = std::fs::read(split.shard_path(2).unwrap()).unwrap();
+        let at = usize::try_from(scales_at[0]).unwrap();
+        assert_eq!(
+            &old_bytes[at..at + 64],
+            matrix(split, 0).1.as_slice(),
+            "an older header reopens its mapped generation"
+        );
+        assert_ne!(c.header.shard_path(2).unwrap(), file);
+        assert_eq!(
+            matrix(&c.header, 0).1,
+            vec![0; 64],
+            "a new generation, not yet made"
+        );
+        let d = toy_assembled(&dir).unwrap();
+        assert_eq!(c.header.shard_path(2), d.header.shard_path(2));
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join("b.safetensors"))
+            .unwrap()
+            .set_modified(later + std::time::Duration::from_secs(60))
+            .unwrap();
+        let e = toy_assembled(&dir).unwrap();
+        c.source.make_in_place().unwrap();
+        assert_eq!(matrix(&c.header, 0).1, csf_scales(0));
+        assert_eq!(
+            matrix(&d.header, 0).1,
+            csf_scales(0),
+            "an unwritten file under the key's pending mark is kept"
+        );
+        let pending_bytes = std::fs::read(c.header.shard_path(2).unwrap()).unwrap();
+        assert_eq!(
+            &pending_bytes[at..at + 64],
+            csf_scales(0),
+            "an older pending generation is filled at its own path"
+        );
+        assert_eq!(matrix(&e.header, 0).1, vec![0; 64]);
+        e.source.make_in_place().unwrap();
+        assert_eq!(matrix(&e.header, 0).1, csf_scales(0));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A constant of the map is a tensor of the header that no folder tensor holds: declared F32
     /// at its dims, made (no run of any file), held by the part source beside the folder's
     /// tensors, and read by it whole or cut along a dim as its values are. One that takes a name
@@ -1895,7 +2120,7 @@ mod tests {
             constants.keys().map(String::as_str).collect::<Vec<_>>(),
             ["rope.weight"]
         );
-        let a = assemble(&checkpoint, &dir, folder, plan, planned, &kvs).unwrap();
+        let a = assemble(&checkpoint, &dir, (folder, plan, planned), &kvs, None).unwrap();
         let (_, info) = a.header.find("rope.weight").unwrap();
         assert_eq!(
             (info.ty, info.dims.clone(), info.nbytes),
@@ -2034,7 +2259,8 @@ mod tests {
             type_id: GgmlType::NVFP4_ROWS.as_u32(),
             nbytes: 3 * 144,
         };
-        let e = stack_in_place(&folder, &p, &decl, &m, StackLayout::Planes)
+        let mut wanted = scales::Wanted::new(&dir, None).unwrap();
+        let e = stack_in_place(&folder, &p, &decl, &m, StackLayout::Planes, &mut wanted)
             .err()
             .unwrap()
             .to_string();
@@ -2044,7 +2270,7 @@ mod tests {
             ),
             "{e}"
         );
-        let e = stack_in_place(&folder, &p, &decl, &m, StackLayout::Rows)
+        let e = stack_in_place(&folder, &p, &decl, &m, StackLayout::Rows, &mut wanted)
             .err()
             .unwrap()
             .to_string();
@@ -2223,7 +2449,7 @@ mod tests {
             skipped,
             kvs,
         } = fold::<Toy>(&dir, &config, false, Keep::InPlace).unwrap();
-        let a = assemble(&checkpoint, &dir, folder, plan, planned, &kvs).unwrap();
+        let a = assemble(&checkpoint, &dir, (folder, plan, planned), &kvs, None).unwrap();
         let name = |ty: GgmlType| ty.name().unwrap();
         // Header: token_embd BF16 64 B and ffn_gate_inp F32 64 B in place; exps NVFP4 3 x 144 B a
         // stack; output_norm F32 32 B and exps.scale F32 12 B made.

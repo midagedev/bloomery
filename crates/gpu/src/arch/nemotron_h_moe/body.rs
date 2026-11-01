@@ -165,7 +165,7 @@ impl GpuModel<Body> {
             .ok()
             .filter(|&c| c > 0)
             .ok_or_else(|| GpuError::shape(WHAT, format!("the plan's ctx_max {}", plan.ctx_max)))?;
-        let (file, origin) = file.into().into_origin(Residency::Off)?;
+        let (file, origin) = file.into().into_origin(Residency::Off, plan)?;
         GpuModel::load_placed_bytes(
             file,
             origin.bytes(),

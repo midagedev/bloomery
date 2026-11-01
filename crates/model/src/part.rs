@@ -282,10 +282,19 @@ pub trait Source {
     fn release(&self, _p: &Planned) -> Result<(), Self::Error> {
         Ok(())
     }
+
+    /// Write what the host reads of the source where a located header holds it but the source
+    /// keeps in another form (a checkpoint folder's block scales stored compressed), before any
+    /// host reader takes it. A source that keeps every such byte as the header holds it writes
+    /// nothing.
+    fn make_in_place(&self) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
-/// A source whose plan considers only the names `keep` selects. Reads and page release use
-/// the underlying source, so several model components can share its stored tensors.
+/// A source whose plan considers only the names `keep` selects. Reads, page release and the
+/// in-place writes use the underlying source, so several model components can share its stored
+/// tensors.
 pub struct Filtered<'s, S, F> {
     pub source: &'s S,
     pub keep: F,
@@ -317,6 +326,10 @@ impl<S: Source, F: Fn(&str) -> bool> Source for Filtered<'_, S, F> {
 
     fn release(&self, p: &Planned) -> Result<(), Self::Error> {
         self.source.release(p)
+    }
+
+    fn make_in_place(&self) -> Result<(), Self::Error> {
+        self.source.make_in_place()
     }
 }
 
