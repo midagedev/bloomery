@@ -1618,8 +1618,7 @@ fn mlx_setup(
 
 /// MLX's arms at one key count, in the shipped `packed` unit: the
 /// single-pass kernel, pass 1 alone, pass 2 alone and both passes, at MLX's
-/// block count for this GPU and at the engine's segment cap. Whether any
-/// arm failed.
+/// block count for this GPU. Whether any arm failed.
 fn mlx_arms(
     device: &MetalDevice,
     stream: &MetalStream,
@@ -1630,11 +1629,7 @@ fn mlx_arms(
     trials: usize,
 ) -> bool {
     let mut failed = false;
-    let rule = mlx::blocks_g13s(keys, QUERY_HEADS / KV_HEADS);
-    let mut block_counts = vec![rule];
-    if rule != bloomery_metal::kernels::SEGMENT_CAP {
-        block_counts.push(bloomery_metal::kernels::SEGMENT_CAP);
-    }
+    let blocks = mlx::blocks_g13s(keys, QUERY_HEADS / KV_HEADS);
     let mut report = |name: &str, r: Result<Timed, String>| match r {
         Ok(t) => print_row(name, keys, "packed", packed, &t),
         Err(e) => {
@@ -1649,42 +1644,40 @@ fn mlx_arms(
             mlx::encode_vec(encoder, pipes, &mut mlx_launch(bufs, keys), mb)
         }),
     );
-    for blocks in block_counts {
+    report(
+        &format!("mlx_2p_b{blocks}"),
+        time_arm(device, stream, packed, trials, |encoder, _| {
+            let mut l = mlx_launch(bufs, keys);
+            mlx::encode_pass1(encoder, &pipes.pass1, &mut l, mb, blocks)?;
+            encoder.memory_barrier();
+            mlx::encode_pass2(encoder, pipes, &l, mb, blocks)
+        }),
+    );
+    report(
+        &format!("mlx_2p1_b{blocks}"),
+        time_arm(device, stream, packed, trials, |encoder, _| {
+            mlx::encode_pass1(
+                encoder,
+                &pipes.pass1,
+                &mut mlx_launch(bufs, keys),
+                mb,
+                blocks,
+            )
+        }),
+    );
+    report(
+        &format!("mlx_2p2_b{blocks}"),
+        time_arm(device, stream, packed, trials, |encoder, _| {
+            mlx::encode_pass2(encoder, pipes, &mlx_launch(bufs, keys), mb, blocks)
+        }),
+    );
+    for (name, arm) in &pipes.arms {
         report(
-            &format!("mlx_2p_b{blocks}"),
+            &format!("{name}_b{blocks}"),
             time_arm(device, stream, packed, trials, |encoder, _| {
-                let mut l = mlx_launch(bufs, keys);
-                mlx::encode_pass1(encoder, &pipes.pass1, &mut l, mb, blocks)?;
-                encoder.memory_barrier();
-                mlx::encode_pass2(encoder, pipes, &l, mb, blocks)
+                mlx::encode_pass1(encoder, arm, &mut mlx_launch(bufs, keys), mb, blocks)
             }),
         );
-        report(
-            &format!("mlx_2p1_b{blocks}"),
-            time_arm(device, stream, packed, trials, |encoder, _| {
-                mlx::encode_pass1(
-                    encoder,
-                    &pipes.pass1,
-                    &mut mlx_launch(bufs, keys),
-                    mb,
-                    blocks,
-                )
-            }),
-        );
-        report(
-            &format!("mlx_2p2_b{blocks}"),
-            time_arm(device, stream, packed, trials, |encoder, _| {
-                mlx::encode_pass2(encoder, pipes, &mlx_launch(bufs, keys), mb, blocks)
-            }),
-        );
-        for (name, arm) in &pipes.arms {
-            report(
-                &format!("{name}_b{blocks}"),
-                time_arm(device, stream, packed, trials, |encoder, _| {
-                    mlx::encode_pass1(encoder, arm, &mut mlx_launch(bufs, keys), mb, blocks)
-                }),
-            );
-        }
     }
     failed
 }

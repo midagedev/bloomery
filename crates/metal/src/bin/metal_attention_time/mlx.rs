@@ -321,7 +321,9 @@ static void mlx_p1_arm(device float const *queries,
         }
     }
 
-    pad[(simd_gid * BD + simd_lid) % pad_n] = max_score;
+    if (simd_gid * BD + simd_lid < pad_n) {
+        pad[simd_gid * BD + simd_lid] = max_score;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (args.blocks > 0x7fffffffu) {
         sum_exp_score += pad[(simd_lid * 7u + 1u) % pad_n];

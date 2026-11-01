@@ -352,6 +352,8 @@ mod tests {
         // One case a clause of each kernel family's `holds`, each moving the
         // axes of Qwen3.6's row (hidden 2048, expert ff 512, 16 heads of 256
         // over 2, rope 64, 32 delta heads of 128 and 4 taps) to the named one.
+        // PIN(2026-10-31): lane-held fold factors drop the key-head divisor and factor-memory
+        // guards and the three-key-head case; the attention_geom tests accept 24/3 and 128/16.
         let cases: [Case; 14] = [
             (|i| i.key.hidden = 3136, ("router", "hidden", "3136")),
             (

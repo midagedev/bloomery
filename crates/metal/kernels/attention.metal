@@ -528,9 +528,6 @@ inline void attn_commit_plain(device float *out, uint index, float attn) {
 struct F16Cache {
     device ushort *k;
     device ushort *v;
-    // Unread: the walk reads the cache rows alone. The rows append names them.
-    threadgroup attn_lane_word *tile_k;
-    threadgroup attn_lane_word *tile_v;
 
     typedef attn_lane_word Word;
 
@@ -884,7 +881,9 @@ static void attn_epilogue(thread const AttnArgs &args,
 // and the weight sum is the group's sum of each weight sum times its factor.
 // A lane keeps its LANE_DIMS values of the head, each segment's values added
 // by fma in ascending segment order times the factor its lane passes by
-// shuffle; a segment of factor 0 is skipped.
+// shuffle; a segment with no weight is skipped. A segment that holds weight
+// but whose factor underflows to 0 is still added: 0 times a finite value
+// adds an exact 0, and 0 times a NaN value is the NaN its head must carry.
 // A NaN partial (a refused position) writes NaN for its head.
 //
 // The reads are the ticket's coherent ones: the writers fence before they
@@ -943,7 +942,7 @@ static void attn_fold(device coherent(device) float *partials,
         for (uint r = 0u; r < ATTN_FOLD_ROUNDS; ++r) {
             for (uint c = 0u; c < 32u && 32u * r + c < args.segments; ++c) {
                 float f = simd_shuffle(factors[r], ushort(c));
-                if (f == 0.0f) {
+                if (simd_shuffle(ls[r], ushort(c)) == 0.0f) {
                     continue;
                 }
                 uint at = (head * args.segments + 32u * r + c) * BLOOMERY_ATTN_PARTIAL + 2u;
@@ -1153,8 +1152,6 @@ kernel void attn_norm_rope_rows(device float const *k [[buffer(0)]],
     F16Cache cache;
     cache.k = cache_k;
     cache.v = cache_v;
-    cache.tile_k = nullptr;
-    cache.tile_v = nullptr;
     uint kv = group.x;
     uint row = group.y;
     AttnArgs a = attn_row_args(args, row);

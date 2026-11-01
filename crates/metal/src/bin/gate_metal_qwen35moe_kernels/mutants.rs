@@ -94,6 +94,7 @@ pub const Q30_KEPT: &[&str] = &[
     "attn_prefetch_stale",
     "attn_fold_stage_l",
     "attn_fold_empty_unskipped",
+    "attn_fold_underflow_skipped",
     "attn_one_dead_unmasked",
     "attn_one_chunk_rescale",
     "attn_one_merge_unscaled",
@@ -320,6 +321,7 @@ pub const ATTN_KEPT: &[&str] = &[
     "attn_prefetch_stale",
     "attn_fold_stage_l",
     "attn_fold_empty_unskipped",
+    "attn_fold_underflow_skipped",
     "attn_one_dead_unmasked",
     "attn_one_chunk_rescale",
     "attn_one_merge_unscaled",
@@ -2589,6 +2591,16 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[(
             "if (slot < args.segments) {",
             "if (slot < args.segments + 1u) {",
+            1,
+        )],
+    },
+    Mutant {
+        name: "attn_fold_underflow_skipped",
+        clause: "attn_fold_nan",
+        why: "the fold skips a segment whose f32 factor is 0, so the NaN values of a live segment whose weight underflows never reach the output",
+        edits: &[(
+            "if (simd_shuffle(ls[r], ushort(c)) == 0.0f) {",
+            "if (f == 0.0f) {",
             1,
         )],
     },
