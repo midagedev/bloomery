@@ -655,8 +655,8 @@ mod gate {
                            which of them is the longest.";
     /// The slots clause's requests: long enough that the together run holds
     /// dozens of rounds with both streams live (and `TURN_A`'s greedy reply
-    /// runs past it without an end-of-generation id — no `ignore_eos`, which
-    /// steps a request plainly).
+    /// runs past it without an end-of-generation id, so it needs no
+    /// `ignore_eos`).
     const SLOTS_PREDICT: usize = 96;
     /// The drafted rounds clause's late request: the second posted once the
     /// first has run this many decode calls, polled at
@@ -664,8 +664,8 @@ mod gate {
     const DRAFTED_LATE_ROUNDS: u64 = 4;
     const DRAFTED_LATE_POLL: Duration = Duration::from_millis(50);
     const DRAFTED_LATE_POLLS: usize = 600;
-    /// The drafted sampled tail clause's short request: the long one steps
-    /// beside it this many rounds, then drafts alone.
+    /// The ids the drafted sampled tail clause's short request asks: the
+    /// long one drafts beside it, then continues alone.
     const DRAFTED_SAMPLED_SHORT: usize = 8;
     /// The one chat turn the chat clauses send.
     const CHAT: &str = "What is the capital of France? Answer in one word.";
@@ -2044,9 +2044,9 @@ mod gate {
     /// when `ignore_eos`, asking `n_probs` probabilities a token (0 asks
     /// none): its ids a function of its logits rows and the seed alone (the
     /// server seeds each request's sampler from its own `seed`). It steps on
-    /// a load that drafts nothing, and on a drafted load while it asks
-    /// probabilities; else on a drafted load it drafts, banning or not,
-    /// alone in its round or beside another busy slot.
+    /// a load that drafts nothing; on a drafted load it drafts, banning or
+    /// not, asking probabilities or not, alone in its round or beside
+    /// another busy slot.
     fn sampled_stream(
         addr: &str,
         ids: &[u32],
