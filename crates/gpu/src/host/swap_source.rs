@@ -1467,6 +1467,90 @@ mod tests {
         }
     }
 
+    /// A located planes stack's parts come from the arena's slot where the lane's open read finds
+    /// its id filled, and from where the folder keeps the matrix otherwise
+    /// ([`FileSwap::matrix`]): after the fill the folder's bytes change, and the filled id's codes
+    /// and block scales are the bytes the fill wrote, the unfilled id's the folder's new ones.
+    /// FAIL-first: the matrix read from the mapping whatever the arena holds (the filled id reads
+    /// the folder's new bytes).
+    #[test]
+    fn a_filled_id_stages_its_planes_from_its_slot() {
+        use super::super::nvtier::tests::{
+            LOCATED_CODES, LOCATED_PER, Scratch, located_split, located_tier, routed,
+        };
+        use model::placement::workstation;
+        use model::placement::{KvBytes, ModelTensors, PlanLevers, plan_host_routed};
+        use std::os::unix::fs::FileExt;
+
+        struct NoKv;
+        impl KvBytes for NoKv {
+            fn layer_bytes(&self, _: usize, _: u64) -> u64 {
+                0
+            }
+        }
+        let scratch = Scratch::new("swap-located");
+        let split = located_split(&scratch);
+        let tier = Arc::new(located_tier(&split));
+        let t = routed(&split, "s.weight", None);
+        // The host set holds no page: the arena serves every id of the stack.
+        let model = ModelTensors {
+            tensors: Vec::new(),
+            layers: 1,
+            experts: 3,
+            experts_used: 1,
+            bf16_words: |_| false,
+        };
+        let machine = workstation::plan_on(workstation::A6000, 1);
+        let plan = plan_host_routed(&model, &machine, 4096, &NoKv, &PlanLevers::default())
+            .expect("the plan");
+        let pair = R8Pair::at_load(Arc::clone(&split), false).expect("the pair");
+        let set = HostSet::of(pair.source(), &plan, |_| false).expect("an empty host set");
+        let parts = vec![LOCATED_CODES, LOCATED_PER - LOCATED_CODES];
+        let swap = FileSwap {
+            tier: OnceLock::new(),
+            pair,
+            set,
+            experts: 3,
+            first: 0,
+            layers: vec![Some(LayerParts {
+                tensors: vec![t],
+                base: vec![0; 2],
+                slots: 2,
+                parts,
+                of: vec![(0, Plane::Codes), (0, Plane::BlockScales)],
+                scales: vec![Vec::new()],
+            })],
+            union_tag: String::new(),
+            convert: None,
+        };
+        assert!(swap.tier.set(Arc::clone(&tier)).is_ok());
+        let matrix = |id: usize| {
+            let m = split.matrix("s.weight", id).expect("the matrix");
+            [m.codes.to_vec(), m.block_scales.to_vec()]
+        };
+        tier.ensure(0, &[1]).expect("the fill");
+        let filled = matrix(1);
+        for shard in 0..2 {
+            let path = scratch.0.join(format!("folder-{shard}.bin"));
+            let flipped: Vec<u8> = std::fs::read(&path).unwrap().iter().map(|b| !b).collect();
+            let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            f.write_all_at(&flipped, 0).unwrap();
+        }
+        assert_ne!(
+            matrix(1),
+            filled,
+            "the folder's bytes changed under the mapping"
+        );
+        for (id, want) in [(1, filled), (0, matrix(0))] {
+            swap.open_read(0, id).expect("the open read");
+            for (part, want) in want.iter().enumerate() {
+                let got = swap.source(0, id, part).expect("the part");
+                assert_eq!(got.bytes, &want[..], "expert {id} part {part}");
+            }
+            swap.release_read(0, id).expect("the read's end");
+        }
+    }
+
     /// A resident K-quant stack of `ty`: `words` words, `rows` rows.
     fn resident(ty: GgmlType, words: usize, rows: usize) -> Option<FoundStack> {
         Some(FoundStack {

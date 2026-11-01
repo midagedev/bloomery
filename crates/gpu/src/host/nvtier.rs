@@ -3992,7 +3992,7 @@ impl<'a> TicketWait<'a> for NvTier {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::{
         FILLED, FILLING, FREE, NoSlot, PARTS, PartRange, SlotBook, advice_disjoint, audit_offsets,
         layer_bases, pick_slot, slots_of, window_bytes, window_span,
@@ -5585,10 +5585,10 @@ mod tests {
     /// A directory under the workspace's `target`, on the tree's disk (the
     /// system's temp directory can be a tmpfs, which may refuse an
     /// `O_DIRECT` open), removed on drop, a failed test's included.
-    struct Scratch(std::path::PathBuf);
+    pub(in crate::host) struct Scratch(pub(in crate::host) std::path::PathBuf);
 
     impl Scratch {
-        fn new(tag: &str) -> Scratch {
+        pub(in crate::host) fn new(tag: &str) -> Scratch {
             let d = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../target")
                 .join(format!("nvtier-{tag}-{}", std::process::id()));
@@ -5624,7 +5624,7 @@ mod tests {
     /// block scales at offsets off every page, in two shards
     /// ([`gguf::Place::Stack`]): matrix `e`'s codes in shard `e % 2`, its
     /// scales in the other.
-    fn located_split(scratch: &Scratch) -> std::sync::Arc<gguf::Split> {
+    pub(in crate::host) fn located_split(scratch: &Scratch) -> std::sync::Arc<gguf::Split> {
         use gguf::write::{Layout, TensorDecl};
         use gguf::{GENERAL_ARCHITECTURE, Place, StackLayout, Value};
         let files: Vec<_> = (0..2)
@@ -5667,40 +5667,30 @@ mod tests {
     }
 
     /// A located matrix's bytes: its codes, then its block scales.
-    const LOCATED_CODES: usize = 5000;
-    const LOCATED_PER: usize = LOCATED_CODES + 704;
+    pub(in crate::host) const LOCATED_CODES: usize = 5000;
+    pub(in crate::host) const LOCATED_PER: usize = LOCATED_CODES + 704;
 
-    /// A stack a checkpoint folder locates is read where the folder keeps
-    /// it: each part of an expert is its matrix's two runs, each in its own
-    /// shard ([`super::stack_runs`]), read into a window each and joined, so
-    /// a pinned slot lends the matrix as `gguf::Split::matrix` reads it, its
-    /// codes then its block scales, in a slot of the placement's part shape
-    /// ([`window_bytes`]); and a drop names every run in its own shard. A
-    /// stack the split does not locate stays one run of its file. FAIL-first:
-    /// the arena's runs taken as one run of the file (`gguf::Split::run`)
-    /// refuse the stack by name, and a fill without the join lends the codes
-    /// and the bytes after them in the codes' window.
-    #[test]
-    fn a_located_stack_fills_each_matrix_from_its_two_shards() {
-        use super::NvTier;
-        use model::moe::TierSlots;
+    /// The tier of [`located_split`]'s stack: one layer of its three experts
+    /// in two slots, each of an expert's parts its matrix (the stack's row,
+    /// named `s.weight`) read where the folder keeps it, its runs opened
+    /// buffered.
+    pub(in crate::host) fn located_tier(split: &std::sync::Arc<gguf::Split>) -> super::NvTier {
         use model::placement::workstation::ArenaGrant;
-        let scratch = Scratch::new("located");
-        let split = located_split(&scratch);
-        let runs = super::stack_runs(&split, &routed(&split, "s.weight", None), 3)
+        let runs = super::stack_runs(split, &routed(split, "s.weight", None), 3)
             .expect("the folder's runs");
         let mut files = Vec::new();
         for r in runs
             .iter()
             .flat_map(|&(codes, scales)| std::iter::once(codes).chain(scales))
         {
-            super::open_shard(&split, &mut files, r.shard, false, "s.weight").unwrap();
+            super::open_shard(split, &mut files, r.shard, false, "s.weight").unwrap();
         }
         let window = window_bytes(LOCATED_CODES, LOCATED_PER - LOCATED_CODES);
         let mut arena = arena_of(3, 0);
         arena.windows = [0, window, 2 * window];
         arena.slot_bytes = PARTS * window;
         arena.files = files.into();
+        arena.names = std::array::from_fn(|_| "s.weight".to_string());
         arena.parts = runs
             .iter()
             .map(|&(codes, scales)| {
@@ -5715,16 +5705,34 @@ mod tests {
         arena.part_of.set([0, 1, 2]).unwrap();
         let slots = [arena.slot_bytes];
         let grant = ArenaGrant::whole((2 * slots[0]) as u64);
-        let tier = NvTier::carve(
+        super::NvTier::carve(
             vec![Some(arena)],
             &slots,
             2,
             grant,
             0,
-            &split,
+            split,
             super::ArenaKind::Anon,
         )
-        .expect("the tier's carve");
+        .expect("the tier's carve")
+    }
+
+    /// A stack a checkpoint folder locates is read where the folder keeps
+    /// it: each part of an expert is its matrix's two runs, each in its own
+    /// shard ([`super::stack_runs`]), read into a window each and joined, so
+    /// a pinned slot lends the matrix as `gguf::Split::matrix` reads it, its
+    /// codes then its block scales, in a slot of the placement's part shape
+    /// ([`window_bytes`]); and a drop names every run in its own shard. A
+    /// stack the split does not locate stays one run of its file. FAIL-first:
+    /// the arena's runs taken as one run of the file (`gguf::Split::run`)
+    /// refuse the stack by name, and a fill without the join lends the codes
+    /// and the bytes after them in the codes' window.
+    #[test]
+    fn a_located_stack_fills_each_matrix_from_its_two_shards() {
+        use model::moe::TierSlots;
+        let scratch = Scratch::new("located");
+        let split = located_split(&scratch);
+        let tier = located_tier(&split);
         for id in 0..3u32 {
             tier.ensure(0, &[id]).expect("the fill");
             let _pin = tier.pin(0, &[id]).expect("a filled id pins");
@@ -5760,7 +5768,7 @@ mod tests {
 
     /// Routed stack `name` of `split` as a plan's tensor of layer 0, of `dims` (its header's when
     /// `None`).
-    fn routed(
+    pub(in crate::host) fn routed(
         split: &gguf::Split,
         name: &str,
         dims: Option<Vec<u64>>,
