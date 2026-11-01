@@ -7,8 +7,9 @@
 //!
 //! The card bytes of an activation form are here too ([`q8_act_bytes`],
 //! [`q8_blocks32_bytes`]) and of one run of the card leg's buffers
-//! ([`leg_bytes`]): the forms every card leg, plan and family sizes, in one
-//! place.
+//! ([`leg_bytes`]), and the form a card route holds a run in
+//! ([`ffn::RouteForm`]): the forms every card leg, plan and family sizes, in
+//! one place.
 
 use gguf::GgmlType;
 pub use gguf::card::{

@@ -2716,6 +2716,9 @@ mod gate {
                 "dense_mma"
                     | "bf16_store"
                     | "g32_slab"
+                    | "g32_routed"
+                    | "g38_iq4nl"
+                    | "q5_0p_is_the_gemv"
                     | "norm_form"
                     | "mxfp8_w8a8"
                     | "nvfp4_native"
@@ -5740,7 +5743,9 @@ mod gate {
         /// [`ROWS`] rows at K 640 (the routed down's K), each slot its own
         /// column, and one Q8_0 plane stack of 8 experts at K 2560 whose two
         /// slots a token share the token's column; plus a Q5_1 stack at the
-        /// routed down's full shape, 2560 rows × K 640.
+        /// routed down's full shape, 2560 rows × K 640. A stack whose slots
+        /// read their own column (a routed down's) stores BF16 too
+        /// (`enqueue_gemm32_bf16`): the F32 cells rounded to nearest even.
         fn routed_case(dev: &Dev<'_>) -> Result<bool, GateError> {
             if !wanted("g32_routed") {
                 return Ok(true);
@@ -5839,17 +5844,22 @@ mod gate {
                             &got,
                             n_slots,
                         )?;
+                        // A routed down's BF16 store (one column a slot): the F32
+                        // cells rounded to nearest even.
+                        let bf16 = shared
+                            || bf16_product32(dev, res.weight(lay)?, rows, (&act, &route), &got)?;
                         let fault = gpu.take_fault()?;
                         let pass = dec
                             && unwritten == 0
                             && band_off == 0
                             && bits_off == 0
+                            && bf16
                             && fault.is_none();
                         println!(
                             "gemm32 case=g32_routed {name} T={t} routing={r:?} slots={n_slots} \
                              decode_vs_ggml={dec} unwritten={unwritten} checked={checked} \
                              worst_err_over_band={worst:.3} band_off={band_off} contract_bits_differ={bits_off} \
-                             y_fnv={:016x} {}",
+                             bf16_eq_f32_rne={bf16} y_fnv={:016x} {}",
                             Fnv1a64::default().f32s(&got).value(),
                             verdict(pass)
                         );
@@ -6812,8 +6822,9 @@ mod gate {
         /// quantizers' codes, scales and sums the host's; every output of
         /// both written and finite; every checked output bit for bit the
         /// contract's transcription and within the gemv band
-        /// (`gemm32::q5_0p_gemv_roundings`, scaled by [`Q50_PIN`]). Its
-        /// refusal at another K is `g32_refuse`'s.
+        /// (`gemm32::q5_0p_gemv_roundings`, scaled by [`Q50_PIN`]), and its
+        /// BF16 store the F32 cells rounded to nearest even. Its refusal at
+        /// another K is `g32_refuse`'s.
         fn q5_0p_case(dev: &Dev<'_>) -> Result<bool, GateError> {
             if !wanted("q5_0p_is_the_gemv") {
                 return Ok(true);
@@ -6899,10 +6910,13 @@ mod gate {
                         same_bits,
                         first,
                     } = gemv_cmp(&w, rows, &ha, &got, &yv, u)?;
+                    let wgt = Gemm32Weight::Q5_0Packed(&wt);
+                    let bf16 = bf16_product32(dev, wgt, rows, (&act, &route), &got)?;
                     let fault = gpu.take_fault()?;
                     let pass = dec
                         && act_ok
                         && act8_ok
+                        && bf16
                         && unwritten == 0
                         && nonfinite == 0
                         && checked > 0
@@ -6914,7 +6928,7 @@ mod gate {
                          act_eq_host={act_ok} q8blocks32_eq_host={act8_ok} unwritten={unwritten} \
                          nonfinite={nonfinite} checked={checked} contract_bits_differ={bits_off} \
                          gemv_band_off={band_off} worst_over_gemv_band={worst:.4} \
-                         gemv_bits_equal={same_bits} y_fnv={:016x} {}",
+                         gemv_bits_equal={same_bits} bf16_eq_f32_rne={bf16} y_fnv={:016x} {}",
                         Fnv1a64::default().f32s(&got).value(),
                         verdict(pass)
                     );
@@ -6935,7 +6949,8 @@ mod gate {
         /// at TOKENS; the decode against ggml's `dequant_row`, every checked
         /// output in its band and bit for bit the contract with `y_fnv`, a rerun
         /// bit-identical, a NaN `d` block's outputs NaN, and the host API's
-        /// refusal of the stack at another K.
+        /// refusal of the stack at another K; each run's BF16 store the F32
+        /// cells rounded to nearest even.
         fn iq4nl_case(dev: &Dev<'_>) -> Result<bool, GateError> {
             if !wanted("g38_iq4nl") {
                 return Ok(true);
@@ -6994,14 +7009,20 @@ mod gate {
                         &got,
                         n_slots,
                     )?;
+                    let wgt = res.weight(Lay::Iq4Nl)?;
+                    let bf16 = bf16_product32(dev, wgt, rows, (&act, &route), &got)?;
                     let fault = gpu.take_fault()?;
-                    let pass =
-                        dec && unwritten == 0 && band_off == 0 && bits_off == 0 && fault.is_none();
+                    let pass = dec
+                        && unwritten == 0
+                        && band_off == 0
+                        && bits_off == 0
+                        && bf16
+                        && fault.is_none();
                     println!(
                         "gemm32 case=g38_iq4nl down T={t} routing={r:?} slots={n_slots} \
                          decode_vs_ggml={dec} unwritten={unwritten} checked={checked} \
                          worst_err_over_band={worst:.3} band_off={band_off} \
-                         contract_bits_differ={bits_off} y_fnv={:016x} {}",
+                         contract_bits_differ={bits_off} bf16_eq_f32_rne={bf16} y_fnv={:016x} {}",
                         Fnv1a64::default().f32s(&got).value(),
                         verdict(pass)
                     );
