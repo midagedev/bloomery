@@ -237,34 +237,29 @@ def _record_types(cls):
 
 
 @functools.cache
-def _schema_shape(annotation):
-    return typing.get_origin(annotation), typing.get_args(annotation), dataclasses.is_dataclass(annotation)
-
-
-def _typed(value, annotation):
-    """Strict container/record checks for the fixed structural schema; bool is not a node index."""
-    if annotation is str or annotation is int or annotation is bool or annotation is type(None):
-        return type(value) is annotation
-    origin, args, record = _schema_shape(annotation)
+def _typed(annotation):
+    """Compile the fixed schema once; every value still gets strict container/record checks."""
+    origin, args = typing.get_origin(annotation), typing.get_args(annotation)
     if origin in (typing.Union, types.UnionType):
-        return any(_typed(value, a) for a in args)
-    if origin in (list, set, frozenset):
-        if type(value) is not origin:
-            return False
-        return all(type(v) is args[0] for v in value) if args[0] in _SCALARS else all(_typed(v, args[0]) for v in value)
+        checks = tuple(_typed(a) for a in args)
+        return lambda value: any(check(value) for check in checks)
+    if origin in (list, set, frozenset) or (origin is tuple and len(args) == 2 and args[1] is Ellipsis):
+        element = args[0]
+        if element in _SCALARS:
+            return lambda value: type(value) is origin and all(type(v) is element for v in value)
+        check = _typed(element)
+        return lambda value: type(value) is origin and all(check(v) for v in value)
     if origin is dict:
-        return type(value) is dict and all(_typed(k, args[0]) and _typed(v, args[1]) for k, v in value.items())
+        key, item = (_typed(a) for a in args)
+        return lambda value: type(value) is dict and all(key(k) and item(v) for k, v in value.items())
     if origin is tuple:
-        if type(value) is not tuple:
-            return False
-        if len(args) == 2 and args[1] is Ellipsis:
-            return all(type(v) is args[0] for v in value) if args[0] in _SCALARS else all(_typed(v, args[0]) for v in value)
-        return len(value) == len(args) and all(_typed(v, a) for v, a in zip(value, args))
-    if type(value) is not annotation:
-        return False
-    if record:
-        return all(_typed(getattr(value, k), a) for k, a in _record_types(annotation).items())
-    return True
+        checks = tuple(_typed(a) for a in args)
+        return lambda value: (type(value) is tuple and len(value) == len(checks)
+                              and all(check(v) for v, check in zip(value, checks)))
+    if dataclasses.is_dataclass(annotation):
+        fields = tuple((k, _typed(a)) for k, a in _record_types(annotation).items())
+        return lambda value: type(value) is annotation and all(check(getattr(value, k)) for k, check in fields)
+    return lambda value: type(value) is annotation
 
 
 def _validate(state, tree, module):
@@ -289,12 +284,12 @@ def _validate(state, tree, module):
         "_facts": dict[tuple[str, bool], module.RustFacts],
     }
     for key, annotation in schemas.items():
-        if not _typed(state[key], annotation):
+        if not _typed(annotation)(state[key]):
             raise ValueError("invalid Reach field type: " + key)
     for (f, test), facts in state["_facts"].items():
-        if f not in state["_text"] or not _typed(facts.units, tuple[module.Unit, ...]):
+        if f not in state["_text"] or not _typed(tuple[module.Unit, ...])(facts.units):
             raise ValueError("invalid Reach fact provenance")
-        if not _typed(facts.binds, tuple[tuple[mod, mod, str, bool], ...]) or not _typed(facts.exported, frozenset[str]):
+        if not _typed(tuple[tuple[mod, mod, str, bool], ...])(facts.binds) or not _typed(frozenset[str])(facts.exported):
             raise ValueError("invalid Reach import facts")
     for f, text in state["_text"].items():
         if not f.endswith("/<doctests>.rs"):
