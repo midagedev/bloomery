@@ -949,7 +949,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         default: Unset::Means(
             "Qwen3.8 (`generate_qwen3moe`, `bloomery-serve-qwen38`), and the Muse Spark and \
              MiniMax-M3.1 seats (`bloomery-serve`, MiniMax-M3.1's gates): `split` under `--place a` \
-             with a residency (`admit` when the card has no room for the ring), `admit` under \
+             with a residency (`admit` when the ring has no room or cannot hold the stack layout), `admit` under \
              `--place bp` with one, `off` everywhere else",
         ),
         doc: "Qwen3.8, Muse Spark and MiniMax-M3.1 prompt calls fed by ubatches or passes under adaptive residency \
@@ -969,7 +969,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               experts out. The prompt's bits are then the band's, not the decode steps'. `off` \
               keeps a prompt call bit for bit the decode steps' state, the same-binary arm. \
               Unset is `split` under `--place a` with a residency (`admit` when the card has no \
-              room for the ring, the load line saying so), `admit` under `--place bp` (the ring \
+              room for the ring or it cannot hold the stack layout, the load line saying so), `admit` under `--place bp` (the ring \
               serves no expert tier), `off` everywhere else; `admit` and `split` are refused by \
               name beside `BLOOMERY_RESIDENCY=off` and on a qwen3moe or qwen35moe file, `split` \
               on a load with an expert tier. The load line prints `xstream=`, every streamed \
