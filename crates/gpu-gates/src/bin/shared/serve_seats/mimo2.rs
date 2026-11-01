@@ -135,7 +135,6 @@ use app::{Loaded, OpenArgs, OpenLog, Session, SessionError};
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::GateError;
-use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{Cached, PutBack, Seat, SlotStep, note_line, put_back};
 use bloomery_gpu_gates::generate::{Lane, Place, TierRule};
 use bloomery_gpu_gates::record::{self, Record};
@@ -320,15 +319,10 @@ impl Mimo {
             graph_nodes: 0,
             lane: a.lane,
         };
+        let machine = a.machine;
         let args = OpenArgs {
             place: a.place.name(),
-            machine: beside::with_reserve(
-                a.place.machine(None, a.tier_batch)?,
-                Beside {
-                    image: None,
-                    embedding: a.embedding,
-                },
-            ),
+            machine: move |_| machine.clone(),
             ctx: a.ctx,
             mode: StepMode::Graph,
             cfg: Mimo2Cfg {

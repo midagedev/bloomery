@@ -996,13 +996,15 @@ fn a_held_card_plans_within_its_free_bytes() {
 /// cache; a pinned arena moves from the anonymous class to the pinned one.
 /// A folder's part reads are counted once, as its read-ahead (a need that
 /// also kept them among its reserves would put them in the run-ahead window
-/// too). A reserve with no class, a need whose OS reserve is not the host's
-/// and one whose reserves are under the host's own are refused by name.
+/// too), and the stream's staging is pinned beside them. A reserve with no
+/// class, a need whose OS reserve is not the host's and one whose reserves
+/// are under the host's own are refused by name.
 #[test]
 fn a_host_need_is_held_by_page_class() {
     use workstation::{
         CHECKPOINTS_RESERVE, HostNeed, Hosting, NeedClassError, NeedClasses, NeedTerm, OS_RESERVE,
         PART_READS, POINT_ROWS_RESERVE, PageClass, TIER_BATCH_HOST_RESERVE,
+        XSTREAM_STAGING_RESERVE,
     };
     let model = layered(3);
     let machine_with = |reserves: Vec<(String, u64)>| Machine {
@@ -1115,6 +1117,7 @@ fn a_host_need_is_held_by_page_class() {
             (PageClass::Pinned, PageClass::Pinned),
             (PageClass::Pinned, PageClass::Pinned),
             (PageClass::Pinned, PageClass::Pinned),
+            (PageClass::Pinned, PageClass::Pinned),
             (PageClass::Cache, PageClass::Cache),
             (PageClass::Cache, PageClass::Cache),
             (PageClass::Cache, PageClass::Locked),
@@ -1156,6 +1159,23 @@ fn a_host_need_is_held_by_page_class() {
             anon: without.anon + 17,
             ..without
         }
+    );
+    // The expert stream's staging is pinned for the load's life: it adds to the need beside the
+    // part reads, not inside their peak.
+    let streaming = machine_with(vec![
+        (OS_RESERVE.to_string(), 100),
+        (PART_READS.to_string(), 17),
+        (XSTREAM_STAGING_RESERVE.to_string(), 23),
+    ]);
+    let streaming_plan = plan_with(&model, &streaming, 4096, &NoKv, None).expect("plans");
+    let staged = HostNeed::of(&streaming_plan, 0);
+    assert_eq!(staged.bytes(), reads.bytes() + 23);
+    assert_eq!(
+        staged.classes(&streaming_plan, loose),
+        Ok(NeedClasses {
+            pinned: with.pinned + 23,
+            ..with
+        })
     );
     // A need that is not the plan's.
     let other_os = HostNeed { os: 1, ..need };

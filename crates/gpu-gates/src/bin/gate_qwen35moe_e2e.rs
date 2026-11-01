@@ -4321,7 +4321,9 @@ mod gate {
             kv: KvQ8::F16,
             media: false,
         };
-        let q = PlaceQ3::qwen35(&file, Place::parse("cuda0")?, o)?;
+        // Both loads take the residency load's plan, which streams its prompt calls under (e)'s
+        // `split` and so keeps the lane's staging on the host: the off load runs the same plan.
+        let q = PlaceQ3::qwen35(&file, Place::parse("cuda0")?, o)?.streaming()?;
         let levers = PlanLevers {
             card_budget_bytes: Some(placed_budget()).into(),
         };

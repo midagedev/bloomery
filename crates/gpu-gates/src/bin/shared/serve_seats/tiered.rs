@@ -44,7 +44,7 @@ use gguf::Split;
 use model::arch::Arch;
 use model::arch::place_hybrid::PlanInputs;
 use model::placement::ctx_ask::{Chosen, DEFAULT_SLOTS, probe_of};
-use model::placement::workstation::{HostNeed, TierBatchBytes};
+use model::placement::workstation::{self, HostNeed, TierBatchBytes};
 use model::placement::{Machine, PlacementError, Plan, PlanLevers};
 use serve::reasoning::ThinkTags;
 use serve::{EngineProps, ServeError};
@@ -62,6 +62,9 @@ pub struct Open<F> {
     pub ctx: usize,
     /// The resident slots the plan counted; the body of a seat that holds one sequence reads 1.
     pub slots: NonZeroUsize,
+    /// The machine the run's plan was made on, with every reserve the run set on it (the side
+    /// model's, a folder's part reads, the expert stream's staging): the open plans on it.
+    pub machine: Machine,
     pub path: PathBuf,
     pub plan: PlanLevers,
     pub host: HostCfg,
@@ -69,11 +72,6 @@ pub struct Open<F> {
     pub pin_main: bool,
     /// The batches a prompt group runs layer by layer (`BLOOMERY_PREFILL_GROUP`).
     pub group: usize,
-    /// The side model's reserve on the stage card, which the plan counted.
-    pub embedding: Option<u64>,
-    /// The expert tier's prompt-batch bytes the plan reserved on the placement's tier card
-    /// ([`Tiered::tier_batch`]); `None` under a placement with no tier card.
-    pub tier_batch: Option<TierBatchBytes>,
     /// The residency the plan chose, `Off` where the body keeps the experts the plan placed.
     pub residency: Residency,
     /// The prompt cache's byte budget ([`Tiered::cache_budget`]): the pinned staging a seat's save
@@ -245,9 +243,9 @@ pub trait Tiered: Seat + Sized + 'static {
     /// One of the seat's own flags (`SeatFlags::parse`'s `own`): `Ok(true)` took it.
     fn flags(flag: &str, value: &str, out: &mut Self::Flags) -> Result<bool, GateError>;
 
-    /// The machine the plan of a file of `layers` layers runs over on `place`, the run's probe's
-    /// and the open's alike: the placement's ([`Place::machine`]: the token embedding on the host,
-    /// a row gathered a token, and `tier_batch` on a tier card) by default. A body that reads its
+    /// The machine the plan of a file of `layers` layers runs over on `place`, the run's, which
+    /// the open plans on ([`Open::machine`]): the placement's ([`Place::machine`]: the token
+    /// embedding on the host, a row gathered a token, and `tier_batch` on a tier card) by default. A body that reads its
     /// token embedding from a table on its card plans a placed load's machine instead
     /// ([`Place::machine_placed`]).
     fn machine(
@@ -468,6 +466,70 @@ fn plan_at<'a, H>(
     })
 }
 
+/// The plan a streaming seat loads on its staged machine, with whether it keeps the ring: the
+/// ring's plan `with_ring` where `set` (the lever asks the stream) or the plain plan `hosts`
+/// experts, `None` (the plain plan) where it holds every expert on the card, the ring's plan
+/// refused or not: nothing streams there. Where the ring does not fit, the lever is unset and the
+/// plain plan hosts experts, the plan `without` it on the same machine, its refusal the seat's:
+/// the open's stream rule may still start the stream from the card's free bytes, and the plain
+/// plan holds no staging.
+fn ringed<P>(
+    set: bool,
+    hosts: bool,
+    with_ring: impl FnOnce() -> Result<P, GateError>,
+    without: impl FnOnce() -> Result<P, GateError>,
+) -> Result<Option<(P, bool)>, GateError> {
+    match with_ring() {
+        Ok(p) if set || hosts => Ok(Some((p, true))),
+        Ok(_) => Ok(None),
+        Err(_) if !set && !hosts => Ok(None),
+        Err(e) if !set => {
+            eprintln!("xstream ring: the plan cannot hold it, so it plans without: {e}");
+            Ok(Some((without()?, false)))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// The plan a streaming seat loads, whether it keeps the ring, and the residency pick it opens
+/// with, `pick` of the plan (the seat's `Tiered::residency`, asked once: it prints its record):
+/// the staged plan of `attempt` ([`ringed`]), or the `plain` plan where the attempt keeps none.
+/// A pick that streams nothing (`off`, or none) ends the stream rule at `off`: the load runs the
+/// plain plan, which holds no staging, so the card keeps the ring's bytes for experts and context
+/// and the host for its set; the pick holds there, for `off` reads no room. A refused attempt under
+/// an unset lever (`set` false) is the seat's refusal only where the plain plan's pick streams.
+fn picked<P, K>(
+    attempt: Result<Option<(P, bool)>, GateError>,
+    set: bool,
+    plain: P,
+    pick: impl Fn(&P) -> Result<Option<K>, GateError>,
+    off: impl Fn(&K) -> bool,
+) -> Result<(P, bool, Option<K>), GateError> {
+    let streams = |k: &Option<K>| k.as_ref().is_some_and(|k| !off(k));
+    let (p, ring) = match attempt {
+        Ok(Some(staged)) => staged,
+        Ok(None) => {
+            let k = pick(&plain)?;
+            return Ok((plain, false, k));
+        }
+        Err(e) if !set => {
+            let k = pick(&plain)?;
+            return if streams(&k) {
+                Err(e)
+            } else {
+                Ok((plain, false, k))
+            };
+        }
+        Err(e) => return Err(e),
+    };
+    let k = pick(&p)?;
+    Ok(if streams(&k) {
+        (p, ring, k)
+    } else {
+        (plain, false, k)
+    })
+}
+
 /// The common flags of `args` and the seat's own; `--parallel` above one is refused by name on a
 /// body that holds one sequence.
 fn parse_args<S: Tiered>(args: &[String]) -> Result<(SeatFlags, S::Flags), GateError> {
@@ -597,53 +659,50 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
     {
         let in_place = bloomery_gpu::parts::InPlace::of(&split);
         let reads = bloomery_gpu::parts::least_reads(source, &in_place, &probe, 0)?;
-        model::placement::workstation::reserve_part_reads(&mut machine, reads);
+        workstation::reserve_part_reads(&mut machine, reads);
     }
+    // A load that streams pins the stream's lane staging for its life: its plan reserves it on
+    // the host (`workstation::reserve_stream_staging`).
+    let staged = ring_inputs.as_ref().map(|r| {
+        let mut staged = machine.clone();
+        workstation::reserve_stream_staging(&mut staged, r.stream_slot);
+        staged
+    });
     // The context, then the plan of every slot around it (`choose_ctx`, every seat's): a tier
     // card, a second card, a context the card cannot hold, a host room that cannot hold the host
     // experts and a budget that binds are refused here by name, before any load; the load plans
     // the same.
     let asking = (a.ctx, slots);
-    let on = (&machine, &plan_levers, n, place);
-    let plain = plan_at(&split, asking, &inputs, on)?;
-    // Where the seat streams, the ring's plan beside it, and the pick is fitted to the plan the load
-    // runs. An unset `BLOOMERY_XSTREAM` keeps no ring where the plan without it holds every expert
-    // on the card (the rule then ends at `off`: nothing to stream) or where the plan cannot hold
-    // the ring (the rule then sizes it from what the card leaves free at the load,
-    // [`PlanInputs::streaming`]).
+    let plain = plan_at(&split, asking, &inputs, (&machine, &plan_levers, n, place))?;
+    // Where the seat streams, the ring's plan on the staged machine beside it, and the pick is
+    // fitted to the plan the load runs. An unset `BLOOMERY_XSTREAM` keeps no ring where the plan
+    // without it holds every expert on the card (the rule then ends at `off`: nothing to stream).
+    // Where the plan cannot hold the ring, the rule sizes it from what the card leaves free at the
+    // load ([`PlanInputs::streaming`]), so that plan keeps the staging on the host.
     let set = levers.xstream().is_some();
-    let ringed = match &ring_inputs {
-        Some(r) => match plan_at(&split, asking, r, on) {
-            Ok(p) if set || plain.plan.host.experts > 0 => Some(p),
-            Ok(_) => None,
-            Err(e) if !set => {
-                eprintln!("xstream ring: the plan cannot hold it, so it plans without: {e}");
-                None
-            }
-            Err(e) => return Err(e),
-        },
-        None => None,
-    };
-    let (mut asked, plain) = match ringed {
-        Some(p) => (p, Some(plain)),
-        None => (plain, None),
-    };
-    let pick = S::residency(&levers, &flags, place, &asked.plan)?;
-    // A pick of `off` ends the stream rule at `off`: the load runs the plan without the ring, so the
-    // card keeps those bytes for experts and context. The pick holds there, for `off` reads no
-    // room.
-    let ring = match plain {
-        Some(plain) if pick.as_ref().is_none_or(|p| p.word == "off") => {
-            asked = plain;
-            false
+    let attempt = match (&ring_inputs, &staged) {
+        (Some(r), Some(staged)) => {
+            let on = (staged, &plan_levers, n, place);
+            ringed(
+                set,
+                plain.plan.host.experts > 0,
+                || plan_at(&split, asking, r, on),
+                || plan_at(&split, asking, &inputs, on),
+            )
         }
-        Some(_) => true,
-        None => false,
+        _ => Ok(None),
     };
+    let (asked, ring, pick) = picked(
+        attempt,
+        set,
+        plain,
+        |p| S::residency(&levers, &flags, place, &p.plan),
+        |pick| pick.word == "off",
+    )?;
     eprintln!("{}", asked.line());
     let slot_ctx = usize::try_from(asked.slot_ctx)?;
     let plan = asked.plan;
-    record::plan(place.name(), &machine, &plan).eprint();
+    record::plan(place.name(), plan.machine, &plan).eprint();
     let (residency, extra) = match pick {
         Some(pick) => S::settle(&plan, pick)?,
         None => (Residency::Off, 0),
@@ -657,10 +716,11 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
     }
     let props = EngineProps {
         model: Some(model_props(&split, &inputs.model)),
-        placement: placement_of(S::NAME, &machine, &plan),
+        placement: placement_of(S::NAME, plan.machine, &plan),
         ..EngineProps::default()
     };
     let card = machine.cards[0].name.clone();
+    let machine = plan.machine.clone();
     drop(plan);
     // A folder's header goes to the engine thread with its parts; a file's is reopened there.
     let folder = match source {
@@ -683,13 +743,12 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
         lane,
         ctx: slot_ctx,
         slots: n,
+        machine,
         path: path.clone(),
         plan: plan_levers,
         host: levers.host(),
         pin_main: levers.pin_main(),
         group: levers.prefill_group(),
-        embedding,
-        tier_batch,
         residency,
         cache_ram,
         xstream: levers.xstream(),
@@ -718,4 +777,69 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
         .w("addr", server.local_addr()?)
         .eprint();
     Ok(server.run())
+}
+
+#[cfg(test)]
+mod tests {
+    use bloomery_gpu_gates::GateError;
+
+    /// A streaming seat's refused staged plans under an unset lever load the plain plan where its
+    /// residency pick is `off` (a plain plan of no card expert streams nothing), with that one
+    /// pick; a pick that streams keeps the refusal, as does a set lever. A staged plan whose pick
+    /// is `off` loads the plain plan. FAIL-first: the refusal returned before the pick, and a
+    /// fitting plain plan of no card expert did not load.
+    #[test]
+    fn a_plain_plan_that_streams_nothing_loads_past_refused_staging() {
+        let refused = || Err::<Option<(u8, bool)>, GateError>("the host room".into());
+        let off = |w: &&str| *w == "off";
+        let picks = |w: &'static str| move |_: &u8| Ok(Some(w));
+        assert_eq!(
+            super::picked(refused(), false, 1, picks("off"), off).unwrap(),
+            (1, false, Some("off"))
+        );
+        let e = super::picked(refused(), false, 1, picks("mid"), off).expect_err("streams");
+        assert!(e.to_string().contains("the host room"), "{e}");
+        assert!(super::picked(refused(), true, 1, picks("off"), off).is_err());
+        assert_eq!(
+            super::picked(Ok(Some((2, true))), false, 1, picks("mid"), off).unwrap(),
+            (2, true, Some("mid"))
+        );
+        assert_eq!(
+            super::picked(Ok(Some((2, true))), false, 1, picks("off"), off).unwrap(),
+            (1, false, Some("off"))
+        );
+        assert_eq!(
+            super::picked(Ok(None), false, 1, picks("mid"), off).unwrap(),
+            (1, false, Some("mid"))
+        );
+    }
+
+    /// A streaming seat whose ring does not fit under an unset lever plans without it on the
+    /// staged machine, and that plan's refusal is the seat's; where the plain plan hosts no
+    /// expert, nothing streams and the seat loads the plain plan. FAIL-first: the second refusal
+    /// was dropped and the seat loaded the plain plan, which holds no staging (`None`); then a
+    /// plain plan that hosts no expert was refused by the staged plans' room.
+    #[test]
+    fn a_refused_plan_without_the_ring_is_the_seats_refusal() {
+        let refused = || Err::<u8, GateError>("the host room".into());
+        let e = super::ringed(false, true, refused, refused).expect_err("the refusal");
+        assert!(e.to_string().contains("the host room"), "{e}");
+        assert_eq!(
+            super::ringed(false, true, refused, || Ok(1)).unwrap(),
+            Some((1, false))
+        );
+        assert!(
+            super::ringed(true, true, refused, || Ok(1)).is_err(),
+            "a set lever's refusal"
+        );
+        assert_eq!(
+            super::ringed(false, false, || Ok(2), || Ok(1)).unwrap(),
+            None
+        );
+        assert_eq!(
+            super::ringed(false, false, refused, refused).unwrap(),
+            None,
+            "a plain plan that hosts no expert streams nothing"
+        );
+    }
 }

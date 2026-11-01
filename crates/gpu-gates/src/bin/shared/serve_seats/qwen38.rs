@@ -472,7 +472,8 @@ use bloomery_gpu_gates::residency38::{
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path, side_seat, vision_seat};
 use bloomery_levers::{
     ChurnHosting, Draft38At, Draft38Off, Paged, Residency38At, ResidencyPick, ResidencyWhy,
-    draft38_unset, residency_word_least_fewest, residency38_least_fewest, residency38_unset,
+    draft38_unset, residency_word_least_fewest, residency38_least_fewest, residency38_off,
+    residency38_unset,
 };
 use cuda_core::sys;
 use gguf::Split;
@@ -512,7 +513,7 @@ mod qwen38_levers;
 pub(crate) use qwen38_levers::ACTS_ON;
 #[path = "../route_trace38.rs"]
 mod route_trace38;
-use super::xstream_rule::{Stage, xstream_rule};
+use super::xstream_rule::{Stage, plans_ring, xstream_rule};
 #[allow(
     clippy::duplicate_mod,
     reason = "three seats of one bin include this file"
@@ -624,6 +625,11 @@ pub(crate) struct Place38 {
     /// ([`Folder38::least_reads`]), which every machine of the placement reserves on the host
     /// (`workstation::reserve_part_reads`); 0 for a file.
     reads: u64,
+    /// The expert stream's ring slot where the load's prompt calls stream (the common rule asked
+    /// before the plans, [`plans_ring`]; [`PlanInputs::stream_slot`]), whose lane staging every
+    /// machine of the placement reserves on the host (`workstation::reserve_stream_staging`); 0
+    /// for a load that streams nothing.
+    stream: u64,
 }
 
 impl Place38 {
@@ -635,6 +641,7 @@ impl Place38 {
         image: None,
         media: false,
         reads: 0,
+        stream: 0,
     };
 
     /// The seat's reading of a `--place` word: the shared grammar
@@ -673,6 +680,7 @@ impl Place38 {
             image: None,
             media: false,
             reads: 0,
+            stream: 0,
         }
     }
 
@@ -783,6 +791,7 @@ impl Place38 {
         if self.reads > 0 {
             model::placement::workstation::reserve_part_reads(&mut machine, self.reads);
         }
+        model::placement::workstation::reserve_stream_staging(&mut machine, self.stream);
         if mtp.is_some() {
             let (gdn, qsa) = layer_counts(inputs);
             let bytes = point_row_budget38(gdn, qsa, ctx)?;
@@ -1951,7 +1960,19 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         image: None,
         media: false,
         reads: 0,
+        stream: 0,
     };
+    // A load whose prompt calls stream pins the lane's staging for its life: every machine below
+    // reserves it, so the NVMe expert tier's split leaves it room and the need counts it pinned.
+    // A residency `off` before the plan (set, or unset under the route trace or the step feed)
+    // starts no stream.
+    if plans_ring(
+        levers.xstream(),
+        a.place.stage38(),
+        residency38_off(levers.residency(), feed.residency_at(a.place)),
+    ) {
+        a.place.stream = inputs.stream_slot(experts)?;
+    }
     // A folder's load reads its card's parts before its host set: every machine below reserves
     // the least of those reads, read from the plans at the least context a seat asks with and
     // without the draft (the most card tensors either holds), so the NVMe expert tier's split
@@ -4606,6 +4627,43 @@ mod tests {
                 set.is_some()
             );
         }
+    }
+
+    /// A placement whose load streams carries the lane's staging on every machine it plans on:
+    /// the host reserve of 64 ring slots (`workstation::reserve_stream_staging`), none where it
+    /// streams nothing. FAIL-first: the seat's machines reserved no staging.
+    #[test]
+    fn a_streaming_placement_reserves_its_staging() {
+        use model::arch::qwen35moe::place::Experts;
+        use model::placement::PlanLevers;
+        use model::placement::workstation::XSTREAM_STAGING_RESERVE;
+
+        let (inputs, _, place) = seat_plan_inputs();
+        let staging = |place: super::Place38| {
+            place
+                .machine(
+                    &inputs,
+                    (4096, 1),
+                    Experts::Host,
+                    &PlanLevers::default(),
+                    None,
+                    1,
+                )
+                .expect("the machine")
+                .host()
+                .reserves
+                .iter()
+                .filter(|(name, _)| name == XSTREAM_STAGING_RESERVE)
+                .map(|(_, bytes)| *bytes)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(staging(place), Vec::<u64>::new());
+        let slot = 3 << 20;
+        let streaming = super::Place38 {
+            stream: slot,
+            ..place
+        };
+        assert_eq!(staging(streaming), [64 * slot]);
     }
 
     /// A checkpoint folder's plan holds its least part reads where its NVMe

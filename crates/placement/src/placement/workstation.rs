@@ -206,14 +206,16 @@ pub const PART_READ_CONTEXT: u64 = 1;
 /// need. The caller reads `bytes` from the plan's card parts
 /// (`bloomery_gpu::parts::least_reads`), which no host term moves.
 pub fn reserve_part_reads(machine: &mut Machine, bytes: u64) {
-    machine
-        .host_mut()
-        .reserves
-        .retain(|(name, _)| name != PART_READS);
+    set_host_reserve(machine, PART_READS, bytes);
+}
+
+/// `machine`'s host reserve `name` at `bytes`, in place of any set before.
+fn set_host_reserve(machine: &mut Machine, name: &'static str, bytes: u64) {
+    machine.host_mut().reserves.retain(|(n, _)| n != name);
     machine
         .reserve(Reserve {
             on: Device::Host,
-            name: PART_READS,
+            name,
             bytes,
         })
         .expect("a machine has a host");
@@ -449,6 +451,39 @@ pub const CHECKPOINTS_RESERVE: &str = "checkpoints";
 /// checkpoints' hidden rows: each slot's points at most, one row each,
 /// beside the checkpoints themselves.
 pub const POINT_ROWS_RESERVE: &str = "mtp point rows";
+
+/// The host reserve of a load whose prompt calls stream their host experts
+/// (`BLOOMERY_XSTREAM=split`): the lane's pinned staging, its slots of a ring
+/// slot's bytes each, held for the load's life beside every other term
+/// ([`reserve_stream_staging`]).
+pub const XSTREAM_STAGING_RESERVE: &str = "xstream staging";
+
+/// The most pinned staging slots the expert stream's lane holds
+/// (`bloomery_gpu::host::xstream`): a ring slot's bytes each, at most the
+/// ring's half, which a plan does not know before the load sizes its ring.
+pub const STAGING_SLOTS: usize = 64;
+
+/// Set aside on `machine`'s host the staging a load whose prompt calls
+/// stream pins for its life, [`STAGING_SLOTS`] slots of `slot` bytes (a ring
+/// slot, `place_hybrid::stream_slot_bytes`), as [`XSTREAM_STAGING_RESERVE`]
+/// in place of any set before: a plan made on it counts them pinned in its
+/// host need and the NVMe expert tier's split leaves them room. A `slot` of 0,
+/// a load that streams nothing, sets none. The caller asks before the plan
+/// whether the load streams (the common `BLOOMERY_XSTREAM` rule).
+pub fn reserve_stream_staging(machine: &mut Machine, slot: u64) {
+    if slot == 0 {
+        machine
+            .host_mut()
+            .reserves
+            .retain(|(n, _)| n != XSTREAM_STAGING_RESERVE);
+    } else {
+        set_host_reserve(
+            machine,
+            XSTREAM_STAGING_RESERVE,
+            slot.saturating_mul(STAGING_SLOTS as u64),
+        );
+    }
+}
 
 /// The expert tier's prompt-batch service in bytes ([`tier_batch_bytes`]):
 /// on the tier card, the staging a block is copied into — the activations,
@@ -1449,6 +1484,9 @@ pub enum NeedTerm {
     /// The hidden rows of those checkpoints under the MTP draft
     /// ([`POINT_ROWS_RESERVE`]), pinned host buffers.
     PointRows,
+    /// The expert stream's lane staging ([`XSTREAM_STAGING_RESERVE`]),
+    /// allocated with `cuMemHostAlloc`.
+    StreamStaging,
     /// The page cache the row-gathered tables on the NVMe tier are read
     /// through (`HostTotals::row_reserve_bytes`).
     RowCache,
@@ -1469,13 +1507,14 @@ pub enum NeedTerm {
 
 impl NeedTerm {
     /// Every term, in the order [`HostNeed::classes`] adds them.
-    pub const ALL: [NeedTerm; 12] = [
+    pub const ALL: [NeedTerm; 13] = [
         NeedTerm::Experts,
         NeedTerm::Tables,
         NeedTerm::Shadows,
         NeedTerm::TierRows,
         NeedTerm::Checkpoints,
         NeedTerm::PointRows,
+        NeedTerm::StreamStaging,
         NeedTerm::RowCache,
         NeedTerm::RunAhead,
         NeedTerm::Extra,
@@ -1498,7 +1537,8 @@ impl NeedTerm {
             NeedTerm::Shadows
             | NeedTerm::TierRows
             | NeedTerm::Checkpoints
-            | NeedTerm::PointRows => PageClass::Pinned,
+            | NeedTerm::PointRows
+            | NeedTerm::StreamStaging => PageClass::Pinned,
             NeedTerm::RowCache | NeedTerm::RunAhead => PageClass::Cache,
             NeedTerm::PartReads => PageClass::Anon,
             NeedTerm::Arena => {
@@ -1522,6 +1562,7 @@ fn reserve_term(name: &str) -> Result<Option<NeedTerm>, NeedClassError> {
         TIER_BATCH_HOST_RESERVE => Ok(Some(NeedTerm::TierRows)),
         CHECKPOINTS_RESERVE => Ok(Some(NeedTerm::Checkpoints)),
         POINT_ROWS_RESERVE => Ok(Some(NeedTerm::PointRows)),
+        XSTREAM_STAGING_RESERVE => Ok(Some(NeedTerm::StreamStaging)),
         other => Err(NeedClassError::Reserve(other.to_string())),
     }
 }

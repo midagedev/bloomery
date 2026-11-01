@@ -152,7 +152,6 @@ use bloomery_gpu::checkpoint::saved::SaveLane;
 use bloomery_gpu::host::served::TierBody;
 use bloomery_gpu::model::{ChainBody, StepMode};
 use bloomery_gpu_gates::GateError;
-use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{Seat, note_line};
 use bloomery_gpu_gates::generate::{Place, TierRule};
 use bloomery_gpu_gates::record::{self, Record};
@@ -253,13 +252,7 @@ impl MiniMax {
         } else {
             inputs
         };
-        let machine = beside::with_reserve(
-            a.place.machine(None, a.tier_batch)?,
-            Beside {
-                image: None,
-                embedding: a.embedding,
-            },
-        )(inputs.model.layers);
+        let machine = a.machine;
         let ctx = u64::try_from(a.ctx)
             .map_err(|_| format!("a context of {} positions passes u64", a.ctx))?;
         let plan = inputs

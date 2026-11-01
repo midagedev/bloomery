@@ -140,7 +140,6 @@ use bloomery_gpu::host::served::TierBody;
 use bloomery_gpu::model::{ChainBody, StepMode};
 use bloomery_gpu::{GpuError, GpuModel};
 use bloomery_gpu_gates::GateError;
-use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{Seat, note_line};
 use bloomery_gpu_gates::generate::{Place, TierRule};
 use bloomery_gpu_gates::record::{self, Record};
@@ -241,14 +240,7 @@ impl Muse {
         } else {
             inputs
         };
-        let mut machine = <Muse as Tiered>::machine(a.place, a.tier_batch, inputs.model.layers)?;
-        beside::reserve_on(
-            &mut machine,
-            Beside {
-                image: None,
-                embedding: a.embedding,
-            },
-        );
+        let machine = a.machine;
         let ctx = u64::try_from(a.ctx)
             .map_err(|_| format!("a context of {} positions passes u64", a.ctx))?;
         let plan = inputs
@@ -496,10 +488,11 @@ impl Tiered for Muse {
 
     /// The inputs of a plan that keeps the stream's ring and its ring pass's
     /// buffers out of the expert budget ([`PlanInputs::streaming`] by
-    /// [`place::stream_bytes`]).
+    /// [`place::stream_bytes`], a slot [`place::stream_slot_bytes`]).
     fn with_ring(inputs: PlanInputs<Self::H>) -> Result<PlanInputs<Self::H>, GateError> {
         let bytes = place::stream_bytes(&inputs.hp, &inputs.model)?;
-        Ok(inputs.streaming(bytes))
+        let slot = place::stream_slot_bytes(&inputs.hp, &inputs.model)?;
+        Ok(inputs.streaming(bytes, slot))
     }
 
     fn register(args: &[String]) {

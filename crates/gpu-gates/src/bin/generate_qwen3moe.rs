@@ -439,7 +439,7 @@ mod cli {
     use super::q38place;
     use super::route_trace38::{self, TraceRun, experts_name};
     use super::taps;
-    use super::xstream_rule::{Stage, xstream_rule};
+    use super::xstream_rule::{Stage, plans_ring, xstream_rule};
     use app::arch::qwen3moe::Q38Cfg;
     use app::mtp::{MtpBody, MtpDraft, WindowDraft};
     use app::{Session, SessionError};
@@ -472,7 +472,7 @@ mod cli {
     use bloomery_gpu_gates::{Fnv1a64, GateError, gpu_census, ref_model_path};
     use bloomery_levers::{
         Draft38At, Draft38Off, Levers, PagedAt, Residency38At, ResidencyPick, ResidencyWhy,
-        draft38_unset, paged_draft, residency38_unset,
+        draft38_unset, paged_draft, residency38_off, residency38_unset,
     };
     use cuda_core::sys;
     use gguf::Split;
@@ -481,7 +481,7 @@ mod cli {
         Experts, MtpInputs, PlanInputs, machine_for_route, serve_ctx, tier_batch,
     };
     use model::placement::accepts::{Program, program_of};
-    use model::placement::workstation::HostRead;
+    use model::placement::workstation::{self, HostRead};
     use model::placement::{Device, Machine, Plan, PlanLevers};
     use refset::arch::qwen4exp::VERIFIED_POSITIONS;
     use refset::arch::qwen4exp::mtp::{draft_file, draft_places};
@@ -1379,7 +1379,7 @@ mod cli {
     fn arena38(
         file: &Split,
         levers: &Levers,
-        (place, experts, room): (Place, Experts, &(u64, HostRead)),
+        (path, place, experts, room): (Prompt38, Place, Experts, &(u64, HostRead)),
         (ctx, slots): (usize, usize),
         mtp: bool,
     ) -> Result<u64, GateError> {
@@ -1390,7 +1390,13 @@ mod cli {
         let plan_levers = PlanLevers::from_levers(levers)?;
         let drafts = mtp;
         if !drafts {
-            let machine = machine38(place, &inputs, (ctx_max, ub, slots, drafts), experts, None)?;
+            let machine = machine38(
+                (place, levers, path),
+                &inputs,
+                (ctx_max, ub, slots, drafts),
+                experts,
+                None,
+            )?;
             let plan =
                 inputs.plan_with_slots(&machine, (ctx_max, ub), &plan_levers, experts, slots)?;
             return Ok(plan.host.nvme_arena_bytes);
@@ -1401,7 +1407,13 @@ mod cli {
         } else {
             None
         };
-        let machine = machine38(place, &inputs, (ctx_max, ub, 1, drafts), experts, reserve)?;
+        let machine = machine38(
+            (place, levers, path),
+            &inputs,
+            (ctx_max, ub, 1, drafts),
+            experts,
+            reserve,
+        )?;
         let plan = inputs.plan_mtp_with(&machine, (ctx_max, ub), &plan_levers, &mtp, experts)?;
         Ok(plan.plan.host.nvme_arena_bytes)
     }
@@ -1416,14 +1428,20 @@ mod cli {
     fn paged38(
         file: &Split,
         levers: &Levers,
-        (place, experts, room): (Place, Experts, &(u64, HostRead)),
+        (path, place, experts, room): (Prompt38, Place, Experts, &(u64, HostRead)),
         (ctx, slots): (usize, usize),
         (draft, off): (Draft38, Option<Draft38Off>),
     ) -> Result<(Draft38, Option<Draft38Off>), GateError> {
         if draft != Draft38::Mtp {
             return Ok((draft, off));
         }
-        let arena = arena38(file, levers, (place, experts, room), (ctx, slots), true)?;
+        let arena = arena38(
+            file,
+            levers,
+            (path, place, experts, room),
+            (ctx, slots),
+            true,
+        )?;
         let at = PagedAt {
             arena,
             draft: true,
@@ -1440,6 +1458,18 @@ mod cli {
         place != Place::Gate
     }
 
+    /// What decides `BLOOMERY_RESIDENCY` unset before the plan of a Qwen3.8 file at `place`
+    /// whose prompt `path` feeds ([`residency38_unset`]).
+    fn residency_at38(place: Place, levers: &Levers, path: Prompt38) -> Residency38At {
+        Residency38At {
+            qwen38_file: true,
+            dump_taps: false,
+            place_a: stage_a(place),
+            route_trace: levers.route_trace().is_some(),
+            prefill_step: path == Prompt38::Step,
+        }
+    }
+
     /// The stage as the unset `BLOOMERY_XSTREAM` rule reads it.
     fn stage38(place: Place) -> Stage {
         Stage::of(place)
@@ -1452,9 +1482,11 @@ mod cli {
     /// reserve their page rounding before planning. `draft` is the MTP draft's card
     /// bytes when the draft runs beside the target, which plan (b′) reserves on
     /// its stage card (`q38place::machine_bp38`) and the one-card plans count in
-    /// `plan_mtp_with` instead.
+    /// `plan_mtp_with` instead. A load whose prompt calls stream (`levers` under the seat's rule,
+    /// [`plans_ring`], with no residency `off` before the plan at `path`, [`residency38_off`])
+    /// reserves the lane's staging on the host (`workstation::reserve_stream_staging`).
     fn machine38(
-        place: Place,
+        (place, levers, path): (Place, &Levers, Prompt38),
         inputs: &PlanInputs,
         (ctx, ub, slots, drafts): (u64, u64, usize, bool),
         experts: Experts,
@@ -1484,6 +1516,13 @@ mod cli {
             }
         };
         inputs.reserve_room(&mut machine, (ctx, u64::try_from(slots)?, drafts), page)?;
+        if plans_ring(
+            levers.xstream(),
+            stage38(place),
+            residency38_off(levers.residency(), residency_at38(place, levers, path)),
+        ) {
+            workstation::reserve_stream_staging(&mut machine, inputs.stream_slot(experts)?);
+        }
         Ok(machine)
     }
 
@@ -1923,18 +1962,15 @@ mod cli {
                     .into());
                 }
                 let room = model::placement::workstation::host_available_read()?;
+                let path = Body38::path(prefill)?;
                 let (draft, off) = paged38(
                     &file,
                     &levers,
-                    (place, experts, &room),
+                    (path, place, experts, &room),
                     (ctx, slots),
                     (draft, off),
                 )?;
-                (
-                    Chosen::Qwen38(Body38::path(prefill)?, place, draft, room),
-                    off,
-                    lane,
-                )
+                (Chosen::Qwen38(path, place, draft, room), off, lane)
             }
         };
         let draft = match chosen {
@@ -2051,19 +2087,18 @@ mod cli {
             )
             .into());
         }
-        let (place_a, prefill_step) = match chosen {
-            Chosen::Qwen38(path, place, ..) => (stage_a(place), path == Prompt38::Step),
+        let at = match chosen {
+            Chosen::Qwen38(path, place, ..) => residency_at38(place, &levers, path),
             Chosen::Qwen3(..)
             | Chosen::Qwen35(..)
             | Chosen::NemotronH(_)
-            | Chosen::NemotronHMoe(_) => (false, false),
-        };
-        let at = Residency38At {
-            qwen38_file: family == Family::Qwen38,
-            dump_taps: false,
-            place_a,
-            route_trace: levers.route_trace().is_some(),
-            prefill_step,
+            | Chosen::NemotronHMoe(_) => Residency38At {
+                qwen38_file: family == Family::Qwen38,
+                dump_taps: false,
+                place_a: false,
+                route_trace: levers.route_trace().is_some(),
+                prefill_step: false,
+            },
         };
         if matches!(family, Family::Qwen3 | Family::Qwen35) {
             residency_unset_early(&levers, at);
@@ -2917,7 +2952,7 @@ mod cli {
         let ub = ubatch_for(ctx)?;
         let drafts = false;
         let machine = machine38(
-            place,
+            (place, levers, path),
             &inputs,
             (u64::try_from(ctx)?, u64::try_from(ub)?, slots, drafts),
             experts,
@@ -3035,7 +3070,7 @@ mod cli {
         };
         let drafts = true;
         let machine = machine38(
-            place,
+            (place, levers, path),
             &inputs,
             (ctx_max, u64::try_from(ub)?, 1, drafts),
             experts,

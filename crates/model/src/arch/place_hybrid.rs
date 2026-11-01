@@ -184,16 +184,26 @@ pub const fn ring_pass_bytes_in(
 
 /// The card bytes a prompt call's expert stream takes beside the plan's terms
 /// (`BLOOMERY_XSTREAM=split`), the rule every family's streaming plan keeps room by: the ring's two
-/// halves of `half` slots, a slot the widest layer's expert at its routed stacks' file bytes per
-/// expert (`stacks(l)`, the gate, up and down of layer `l` of `model`'s `n_expert`-expert stacks; a
-/// layer with none of the three streams nothing), and `beside`, what the body makes for the ring's
-/// pass. Refused by name: a layer that holds some of its three stacks and not all, and a stack that
-/// is not one of `n_expert` experts.
+/// halves of `half` slots of [`stream_slot_bytes`], and `beside`, what the body makes for the
+/// ring's pass. Refused as [`stream_slot_bytes`] refuses.
 pub fn stream_ring_bytes(
     model: &ModelTensors,
     stacks: impl Fn(usize) -> [String; 3],
     (n_expert, half): (u64, u64),
     beside: u64,
+) -> Result<u64, PlacementError> {
+    Ok(2 * half * stream_slot_bytes(model, stacks, n_expert)? + beside)
+}
+
+/// A slot of the expert stream: the widest layer's expert at its routed stacks' file bytes per
+/// expert (`stacks(l)`, the gate, up and down of layer `l` of `model`'s `n_expert`-expert stacks; a
+/// layer with none of the three streams nothing). The ring's card slots and the lane's pinned host
+/// staging slots are of these bytes. Refused by name: a layer that holds some of its three stacks
+/// and not all, and a stack that is not one of `n_expert` experts.
+pub fn stream_slot_bytes(
+    model: &ModelTensors,
+    stacks: impl Fn(usize) -> [String; 3],
+    n_expert: u64,
 ) -> Result<u64, PlacementError> {
     let mut slot = 0;
     for l in 0..model.layers {
@@ -216,7 +226,7 @@ pub fn stream_ring_bytes(
         }
         slot = slot.max(expert);
     }
-    Ok(2 * half * slot + beside)
+    Ok(slot)
 }
 
 /// The card bytes a tiered load makes beside the prompt batch's reserve: per routed slot of the
@@ -264,6 +274,11 @@ pub struct PlanInputs<H> {
     /// keeps `bytes` more than [`PlanInputs::prompt_reserve`] on a machine that names a tier card,
     /// the buffers only a tiered load makes.
     pub tier_reserve: Option<u64>,
+    /// A slot of the expert stream's ring for a load whose prompt calls stream their host experts
+    /// ([`PlanInputs::streaming`], [`stream_slot_bytes`]); 0 for a load that does not stream. The
+    /// stream's lane pins its host staging in slots of these bytes for the load's life, which the
+    /// seat reserves on the plan's host (`workstation::XSTREAM_STAGING_RESERVE`).
+    pub stream_slot: u64,
     /// Whether the loader serves the common host-run NVMe arena. Opt-in only: a plan cannot
     /// promise paging merely because the placement can split the expert stacks.
     nvme_tier: bool,
@@ -391,6 +406,7 @@ impl<H> PlanInputs<H> {
             arena,
             prompt_reserve: 0,
             tier_reserve: None,
+            stream_slot: 0,
             nvme_tier: false,
             engine,
         })
@@ -407,13 +423,17 @@ impl<H> PlanInputs<H> {
     }
 
     /// `self` for a load whose prompt calls stream their host experts (`BLOOMERY_XSTREAM=split`):
-    /// the prompt reserve grows by the stream's `ring` bytes ([`stream_ring_bytes`]). A load that
-    /// does not stream plans without them; its ring, if one is set later, takes what the card's
-    /// margin leaves free past the stream's keep-free.
+    /// the prompt reserve grows by the stream's `ring` bytes ([`stream_ring_bytes`]), and a slot of
+    /// the ring is `slot` bytes ([`PlanInputs::stream_slot`]). A load that does not stream plans
+    /// without them; its ring, if one is set later, takes what the card's margin leaves free past
+    /// the stream's keep-free.
     #[must_use]
-    pub fn streaming(self, ring: u64) -> PlanInputs<H> {
+    pub fn streaming(self, ring: u64, slot: u64) -> PlanInputs<H> {
         let reserve = self.prompt_reserve.saturating_add(ring);
-        self.with_prompt_reserve(reserve)
+        PlanInputs {
+            stream_slot: slot,
+            ..self.with_prompt_reserve(reserve)
+        }
     }
 
     /// `self` for a body that serves an expert tier card, which makes `bytes` of card buffers

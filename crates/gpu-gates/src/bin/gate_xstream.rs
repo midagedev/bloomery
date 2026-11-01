@@ -386,6 +386,23 @@ mod gate {
         let src = Arc::new(Synth::new());
         let mut ok = true;
 
+        let capped = XStream::new(
+            ctx,
+            stream,
+            Arc::clone(&src) as Arc<dyn SwapSource>,
+            L,
+            cfg(2, HALF + 1),
+        )?;
+        let cap_ok = capped.staging_slots() == HALF;
+        println!(
+            "staging cap: asked {}, half {HALF}, staging {} {}",
+            HALF + 1,
+            capped.staging_slots(),
+            verdict(cap_ok)
+        );
+        ok &= cap_ok;
+        drop(capped);
+
         // probe
         let mut x = XStream::new(
             ctx,

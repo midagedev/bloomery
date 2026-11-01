@@ -1028,6 +1028,12 @@ fn residency38_unset_follows_the_plan() {
         ),
     ] {
         assert_eq!(residency38_unset(at), want, "{at:?}");
+        // Before the plan the load's residency is `off` where the unset rule turns it so, and
+        // a set word is as given. FAIL-first: the stream staging asked only a set `off`, and
+        // the route trace and the step feed reserved staging no stream reads.
+        assert_eq!(residency38_off(None, at), want.is_some(), "{at:?}");
+        assert!(residency38_off(Some("off"), at), "{at:?}");
+        assert!(!residency38_off(Some("mid-p4-s1"), at), "{at:?}");
     }
 
     // The pool is 10 B an expert past the pinned ones, on two layers of the
