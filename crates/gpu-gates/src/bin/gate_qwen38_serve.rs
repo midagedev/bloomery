@@ -9,7 +9,7 @@
 //! Three arms, each a process under the recipe's gate lock. `lookup` runs
 //! two two-slot servers, draft off then lookup: their ids agree, including
 //! a seeded sampled request the lookup drafts, whose draws leave the greedy
-//! ids, and one with logprobs that steps; two-row capture nodes and draft
+//! ids, and one with logprobs that drafts too; two-row capture nodes and draft
 //! counts prove that verifies keep both one and two positions (file-bound),
 //! and a completion whose draft counts are malformed, or one without the
 //! other, fails the arm. Both
@@ -6021,7 +6021,7 @@ mod gate {
         /// them.
         Sampled,
         /// Drawn at [`SAMPLED_TEMPERATURE`] with [`SAMPLED_SEED`] and two
-        /// probabilities a token: plain steps, no draft.
+        /// probabilities a token, collected from the verified rows.
         Logprobs,
     }
 
@@ -6143,11 +6143,12 @@ mod gate {
                         &format!("lookup_{i}_ids_are_draft_off"),
                         answer.tokens == plain[i].tokens,
                     );
-                    if taken == Taken::Logprobs {
-                        check(&mut ok, "lookup_logprobs_step_without_a_draft", d == 0);
-                    } else if i > 0 {
+                    if i > 0 {
                         // The draft proposes only where the text repeats an n-gram of its own: the
                         // fixture's random-weight target writes none, so the file answers it.
+                        // PIN(2026-11-01): logprobs use verified rows too; the old
+                        // `lookup_logprobs_step_without_a_draft` clause is replaced by
+                        // this request's proposal check under the same file-bound rule.
                         let name = format!("lookup_{i}_verifies_proposals");
                         if tier::run_clause(&name, Tag::FileBound)? {
                             check(&mut ok, &name, d > 0);
