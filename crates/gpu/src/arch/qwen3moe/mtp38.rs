@@ -93,7 +93,7 @@
 //! Each op computes a row's values from that row's inputs alone, so a
 //! row's keys and values do not depend on the walk it lands in or on its
 //! neighbours. A store walk of several resident sequences' rows (the
-//! body's `mtp_store_slots`, a round's waiting rows) rests on it: each
+//! shared `GpuModel::draft_store_slots`, a round's waiting rows) rests on it: each
 //! sequence's rows are checked and staged on that sequence as a block of
 //! the store arena's rows ([`StoreBlock`]), the launches run once over
 //! every block, the embedding a block at its own positions, and each
@@ -118,7 +118,10 @@ use super::scratch38::{PASS_ROWS, VERIFY_ROWS};
 use crate::card_slots::CardAcc;
 use crate::checkpoint::bytes::{Fail, Put, Take};
 use crate::checkpoint::saved::Spans;
-use crate::draft::{DraftFeed, DraftHead, Feed, Held, Hidden, WalkBounds, WalkMode, refuse_rows};
+use crate::draft::{
+    ChainBlock, DraftFeed, DraftHead, Feed, Held, Hidden, Proposal, WalkBounds, WalkMode,
+    chain_rows, refuse_rows,
+};
 use crate::fault::Fault;
 use crate::flash_gqa::{partials_ms_len, partials_v_len_256};
 use crate::gemm::{GemmAct32, GemmRoute};
@@ -1025,10 +1028,10 @@ pub(super) struct Target38<'a> {
 /// One sequence's rows of a store walk ([`Mtp38::store_rows`]): rows
 /// `at .. at + m` of the store arena, at positions `pos0 ..` of their
 /// sequence. A walk of one sequence is one block at row 0; a store walk of
-/// several sequences' rows (`Body38`'s `mtp_store_slots`) lays a block a
+/// several sequences' rows (`GpuModel::draft_store_slots`) lays a block a
 /// sequence, each appended to its own store ([`Mtp38::append_store`]).
 #[derive(Clone, Copy, Debug)]
-pub(super) struct StoreBlock<'a> {
+pub struct StoreBlock<'a> {
     at: usize,
     m: usize,
     pos0: u32,
@@ -1092,45 +1095,12 @@ struct WalkRows {
 /// Where a walk's rows' ids sit on the card: inbox words from a word on,
 /// the own id the last walk copied beside the arena (one row), or one word
 /// of the readback of several sequences' chains, the id a sequence's walk
-/// before proposed (one row, [`Mtp38::chain_rows`]).
+/// before proposed (one row, [`walk_rows`]).
 #[derive(Clone, Copy, Debug)]
 enum IdsAt {
     Inbox(usize),
     Own,
     Chains(usize),
-}
-
-/// One sequence's chain in a walk of several sequences' chains
-/// ([`Mtp38::stage_chain`]): the round's block `block`, its refresh's arena
-/// rows `at .. at + m` from position `pos0`, then `own` own walks, and the
-/// first of its readback pairs (one a walk: the id and the probability's
-/// bits).
-#[derive(Clone, Copy, Debug)]
-pub(super) struct ChainBlock {
-    block: usize,
-    at: usize,
-    m: usize,
-    pos0: u32,
-    own: usize,
-    pair: usize,
-}
-
-impl ChainBlock {
-    /// The refresh's rows.
-    pub(super) fn m(&self) -> usize {
-        self.m
-    }
-
-    /// Positions of the sequence its store holds after the chain: through
-    /// the refresh, as [`Mtp38::run_chain`] leaves them.
-    pub(super) fn end(&self) -> usize {
-        self.pos0 as usize + self.m
-    }
-
-    /// The pairs its walks fill: one a walk.
-    pub(super) fn pairs(&self) -> usize {
-        1 + self.own
-    }
 }
 
 /// The inbox's first word of the positions a walk of several sequences'
@@ -1142,14 +1112,6 @@ const CHAIN_POS: usize = IN_IDS + MTP_ROWS;
 /// store arena's position words less the fault word and its site mask
 /// ([`Mtp38::read_chains`]).
 pub(super) const CHAIN_PAIRS: usize = MTP_STORE_ROWS / 2 - 1;
-
-/// A walk's readback: each row's token and the draft's probability of it
-/// among the head's rows.
-#[derive(Clone, Debug, PartialEq)]
-pub struct MtpDraft {
-    pub tokens: Vec<u32>,
-    pub p: Vec<f32>,
-}
 
 /// A gate's taps of an eager walk: the streams `eh_proj` wrote (`m · 4 ·
 /// 2560`), the router's logits, ids and weights, `slots` and `logits` a row
@@ -1850,7 +1812,7 @@ impl Mtp38 {
         feed: DraftFeed<'_, TargetRows>,
         head: DraftHead,
         mode: WalkMode,
-    ) -> Result<MtpDraft, GpuError> {
+    ) -> Result<Proposal, GpuError> {
         let stream = c.gpu.stream();
         refuse_store(
             mode,
@@ -2016,13 +1978,13 @@ impl Mtp38 {
         Ok(Checked { m, pos0, rows, src })
     }
 
-    /// One sequence's rows of a store walk of several sequences' rows (the
-    /// body's `mtp_store_slots`), staged at rows `at ..` of the store arena:
-    /// `feed` checked as a store walk into `head` on this sequence, the live
-    /// one ([`Mtp38::checked`]), and its hidden rows copied in. Refused by
-    /// name as [`Mtp38::run_walk`] refuses a store walk, and for rows past
-    /// the store arena's [`MTP_STORE_ROWS`]; nothing but the arena's scratch
-    /// moves.
+    /// One sequence's rows of a store walk of several sequences' rows
+    /// ([`GpuModel::draft_store_slots`](crate::GpuModel::draft_store_slots),
+    /// which holds the walk to the store arena's [`MTP_STORE_ROWS`]), staged
+    /// at rows `at ..` of the store arena: `feed` checked as a store walk
+    /// into `head` on this sequence, the live one ([`Mtp38::checked`]), and
+    /// its hidden rows copied in. Refused by name as [`Mtp38::run_walk`]
+    /// refuses a store walk; nothing but the arena's scratch moves.
     pub(super) fn stage_store<'f>(
         &mut self,
         stream: &CudaStream,
@@ -2033,15 +1995,6 @@ impl Mtp38 {
     ) -> Result<StoreBlock<'f>, GpuError> {
         head.check_opened(WHAT, self.head.rows.is_some())?;
         let w = self.checked(target, DraftFeed::Rows(feed), WalkMode::Store)?;
-        if at + w.m > MTP_STORE_ROWS {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "{} rows from row {at} of a store walk of at most {MTP_STORE_ROWS} rows",
-                    w.m
-                ),
-            ));
-        }
         self.store.fit(w.pos0 as usize + w.m)?;
         self.store.own_from(w.pos0 as usize)?;
         let b = StoreBlock {
@@ -2090,7 +2043,7 @@ impl Mtp38 {
         own: usize,
         head: DraftHead,
         mode: WalkMode,
-    ) -> Result<MtpDraft, GpuError> {
+    ) -> Result<Proposal, GpuError> {
         let stream = c.gpu.stream();
         refuse_store(
             mode,
@@ -2178,7 +2131,7 @@ impl Mtp38 {
             return Err(GpuError::fault(WHAT, fault));
         }
         // Walk i's id and probability bits sit at words 2i and 2i + 1.
-        Ok(MtpDraft {
+        Ok(Proposal {
             tokens: out[..2 * n].iter().step_by(2).copied().collect(),
             p: out[1..2 * n]
                 .iter()
@@ -2295,7 +2248,7 @@ impl Mtp38 {
         blocks: &[ChainBlock],
         j: usize,
     ) -> Result<(), GpuError> {
-        let rows: Vec<WalkRows> = chain_rows(blocks, j).map(|(_, r)| r).collect();
+        let rows: Vec<WalkRows> = walk_rows(blocks, j).map(|(_, r)| r).collect();
         self.walk_in(c, &rows, false)
     }
 
@@ -2312,7 +2265,7 @@ impl Mtp38 {
         j: usize,
         head: DraftHead,
     ) -> Result<(), GpuError> {
-        let rows: Vec<(ChainBlock, WalkRows)> = chain_rows(blocks, j).collect();
+        let rows: Vec<(ChainBlock, WalkRows)> = walk_rows(blocks, j).collect();
         let m = rows.last().map_or(0, |(_, r)| r.at + r.m);
         self.walk_out(c, m, head)?;
         let stream = c.gpu.stream();
@@ -2370,7 +2323,7 @@ impl Mtp38 {
         &self,
         stream: &CudaStream,
         blocks: &[ChainBlock],
-    ) -> Result<Vec<MtpDraft>, GpuError> {
+    ) -> Result<Vec<Proposal>, GpuError> {
         let out = self.arena_ref()?.st.pos.to_host_vec(stream)?;
         let (Some(&word), Some(&sites)) = (out.get(2 * CHAIN_PAIRS), out.get(2 * CHAIN_PAIRS + 1))
         else {
@@ -2388,7 +2341,7 @@ impl Mtp38 {
                 let w = out
                     .get(2 * b.pair..2 * (b.pair + b.pairs()))
                     .ok_or(GpuError::state(WHAT, "a block's pairs inside the readback"))?;
-                Ok(MtpDraft {
+                Ok(Proposal {
                     tokens: w.iter().step_by(2).copied().collect(),
                     p: w[1..]
                         .iter()
@@ -3218,49 +3171,30 @@ impl Mtp38 {
     }
 }
 
-/// The rows walk `j` of a round of `blocks`' chains runs, a block's at a
-/// time for every block whose chain reaches it, in `blocks`' order: walk 0
-/// each block's refresh at its own arena rows and inbox ids, a later walk
-/// each block's one own row at the next arena row, its id the one the
-/// block's walk before proposed ([`Mtp38::chain_out`]); each block's
-/// position the inbox word [`Mtp38::stage_chain`] wrote for it.
-fn chain_rows(
-    blocks: &[ChainBlock],
-    j: usize,
-) -> impl Iterator<Item = (ChainBlock, WalkRows)> + '_ {
-    blocks
-        .iter()
-        .filter(move |b| b.own >= j)
-        .enumerate()
-        .map(move |(next, &b)| {
-            let rows = if j == 0 {
-                WalkRows {
-                    at: b.at,
-                    m: b.m,
-                    ids: IdsAt::Inbox(IN_IDS + b.at),
-                    pos0: CHAIN_POS + b.block,
-                }
-            } else {
-                WalkRows {
-                    at: next,
-                    m: 1,
-                    ids: IdsAt::Chains(2 * (b.pair + j - 1)),
-                    pos0: CHAIN_POS + j * MTP_ROWS + b.block,
-                }
-            };
-            (b, rows)
-        })
-}
-
-/// The arena rows each block reached by walk `j` of a round of `blocks`'
-/// chains runs ([`chain_rows`]): its index in `blocks`, its first row and
-/// its rows, the span its own sequence's attention takes
-/// ([`Mtp38::attend`]).
-pub(super) fn chain_spans(
-    blocks: &[ChainBlock],
-    j: usize,
-) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
-    chain_rows(blocks, j).map(|(b, r)| (b.block, r.at, r.m))
+/// The rows walk `j` of a round of `blocks`' chains runs ([`chain_rows`]):
+/// walk 0 each block's refresh at its inbox ids, a later walk each block's
+/// one own row, its id the one the block's walk before proposed
+/// ([`Mtp38::chain_out`]); each block's position the inbox word
+/// [`Mtp38::stage_chain`] wrote for it.
+fn walk_rows(blocks: &[ChainBlock], j: usize) -> impl Iterator<Item = (ChainBlock, WalkRows)> + '_ {
+    chain_rows(blocks, j).map(move |(b, at, m)| {
+        let rows = if j == 0 {
+            WalkRows {
+                at,
+                m,
+                ids: IdsAt::Inbox(IN_IDS + at),
+                pos0: CHAIN_POS + b.block,
+            }
+        } else {
+            WalkRows {
+                at,
+                m,
+                ids: IdsAt::Chains(2 * (b.pair + j - 1)),
+                pos0: CHAIN_POS + j * MTP_ROWS + b.block,
+            }
+        };
+        (b, rows)
+    })
 }
 
 /// Refuse by name a store walk ([`WalkMode::Store`]) where the head's rows
@@ -3337,7 +3271,7 @@ fn splice_media(
 /// The readback of a walk of `m` rows: the tokens, then the probabilities'
 /// bits, then the fault word and its site mask. Blocking; a raised fault is
 /// [`GpuError::Fault`].
-fn read_draft(a: &MtpArena, stream: &CudaStream, m: usize) -> Result<MtpDraft, GpuError> {
+fn read_draft(a: &MtpArena, stream: &CudaStream, m: usize) -> Result<Proposal, GpuError> {
     let out = a.out.to_host_vec(stream)?;
     let (Some(&word), Some(&sites)) = (out.get(2 * m), out.get(2 * m + 1)) else {
         return Err(GpuError::state(WHAT, "a readback of 2m + 2 words"));
@@ -3345,7 +3279,7 @@ fn read_draft(a: &MtpArena, stream: &CudaStream, m: usize) -> Result<MtpDraft, G
     if let Some(fault) = Fault::from_words(word, sites) {
         return Err(GpuError::fault(WHAT, fault));
     }
-    Ok(MtpDraft {
+    Ok(Proposal {
         tokens: out[..m].to_vec(),
         p: out[m..2 * m].iter().map(|&b| f32::from_bits(b)).collect(),
     })

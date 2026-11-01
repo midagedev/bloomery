@@ -68,8 +68,8 @@ pub use body38::{
 pub use draft_taps::TapRowsSink;
 pub use mtp35::{Mtp35, MtpArena, addresses, mtp_chain, mtp_walk, prompt_with35};
 pub use mtp38::{
-    BorrowedPlanes, DraftRows38, MTP_GRAPH_ROWS, MTP_ROWS, MTP_STORE_ROWS, Mtp38, MtpDraft,
-    MtpNode, MtpTaps, TargetRows, walk_launches,
+    BorrowedPlanes, DraftRows38, MTP_GRAPH_ROWS, MTP_ROWS, MTP_STORE_ROWS, Mtp38, MtpNode, MtpTaps,
+    TargetRows, walk_launches,
 };
 pub use placed::{Placed, WideRoute, WideRouteLayer};
 pub use taps35::{Delta35Run, Ffn35Run, Gqa35Run, Layer35Run, Mixer35Run, StoreHost};

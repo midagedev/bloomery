@@ -4,10 +4,21 @@
 //! its target arenas hold ([`Held`]) and the names of its row bounds
 //! ([`WalkBounds`]). Each draft program — Qwen3.8's MTP layer and GLM's
 //! NextN layer — walks these.
+//!
+//! The walk of several resident sequences' rows at once is this module's
+//! too ([`SlotDraft`]): [`GpuModel::draft_store_slots`] runs one store walk
+//! of every slot's rows, and [`GpuModel::draft_chain_slots`] a round of
+//! every slot's window chains, each depth one walk over every chain that
+//! reaches it ([`ChainBlock`]) and the round read back once. The program
+//! gives the phases: each sequence's rows checked and staged, the row-wise
+//! launches over all of them, each sequence's append and attention over its
+//! own store, the head and the readback.
 
-use crate::GpuError;
 use crate::media::CallRows;
-use crate::model::StepMode;
+use crate::model::slots::slot_twice;
+use crate::model::{GpuModel, MAX_PASS_ROWS, Slots, StepMode};
+use crate::weights::Weights;
+use crate::{Gpu, GpuError};
 
 /// Copy one final hidden row to row 0 of a sequence-owned arena, ordered on
 /// `stream`. The caller validates the source's position record first.
@@ -325,10 +336,440 @@ impl Held {
     }
 }
 
+/// A walk's readback: each row's token and, for a program whose readback
+/// holds it, the draft's probability of it among the head's rows (empty
+/// for one whose readback holds the ids alone).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Proposal {
+    pub tokens: Vec<u32>,
+    pub p: Vec<f32>,
+}
+
+/// One slot's chain of a round of several slots' chains
+/// ([`GpuModel::draft_chain_slots`]): the slot, the refresh, the own walks.
+pub type SlotChain<'a, A> = (usize, Feed<'a, A>, usize);
+
+/// One sequence's chain in a round of several sequences' chains
+/// ([`SlotDraft::stage_chain`]): the round's block `block`, its refresh's
+/// arena rows `at .. at + m` from position `pos0`, then `own` own walks, and
+/// the first of its readback pairs (one a walk).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainBlock {
+    pub block: usize,
+    pub at: usize,
+    pub m: usize,
+    pub pos0: u32,
+    pub own: usize,
+    pub pair: usize,
+}
+
+impl ChainBlock {
+    /// Positions of the sequence its store holds after the chain: through
+    /// the refresh.
+    #[must_use]
+    pub fn end(&self) -> usize {
+        self.pos0 as usize + self.m
+    }
+
+    /// The pairs its walks fill: one a walk.
+    #[must_use]
+    pub fn pairs(&self) -> usize {
+        1 + self.own
+    }
+}
+
+/// The rows walk `j` of a round of `blocks`' chains runs, a block's at a
+/// time for every block whose chain reaches it, in `blocks`' order, each
+/// with its first arena row and its rows: walk 0 each block's refresh at
+/// its own rows, a later walk each block's one own row at the next arena
+/// row.
+pub fn chain_rows(
+    blocks: &[ChainBlock],
+    j: usize,
+) -> impl Iterator<Item = (ChainBlock, usize, usize)> + '_ {
+    blocks
+        .iter()
+        .filter(move |b| b.own >= j)
+        .enumerate()
+        .map(move |(next, &b)| if j == 0 { (b, b.at, b.m) } else { (b, next, 1) })
+}
+
+/// A [`Slots`] body whose draft walks several resident sequences' rows at
+/// once, over the target's arenas `A`: the phases [`GpuModel`]'s
+/// [`GpuModel::draft_store_slots`] and [`GpuModel::draft_chain_slots`] run.
+/// A phase marked "live" acts on the live sequence, which the round makes
+/// each block's in turn; the others run once over every block. Each launch
+/// computes a row from that row's inputs alone, so a sequence's store and
+/// proposal are those its own walks leave.
+pub trait SlotDraft<A>: Slots {
+    /// The draft program whose bounds a walk of several sequences holds to:
+    /// a store walk its [`WalkBounds::STORE_ROWS`], a round's walk its
+    /// [`WalkBounds::WALK_ROWS`].
+    type Program: WalkBounds;
+    /// The most readback pairs (one a chain a walk) a round reads back.
+    const ROUND_PAIRS: usize;
+
+    /// One sequence's store rows staged at rows `at ..` of the store walk
+    /// (live): `feed` checked as a store walk into `head` and its hidden rows
+    /// copied in; nothing but the walk's scratch moves.
+    type StoreBlock<'f>: Copy;
+
+    /// See [`SlotDraft::StoreBlock`].
+    fn stage_store<'f>(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        feed: Feed<'f, A>,
+        head: DraftHead,
+        at: usize,
+    ) -> Result<Self::StoreBlock<'f>, GpuError>;
+
+    /// The store walk's row-wise launches once over every block, the rows'
+    /// tokens `ids` in the blocks' order.
+    fn store_rows(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        ids: &[u32],
+        blocks: &[Self::StoreBlock<'_>],
+    ) -> Result<(), GpuError>;
+
+    /// Block `b`'s rows appended to its sequence's store (live).
+    fn append_store(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        b: Self::StoreBlock<'_>,
+    ) -> Result<(), GpuError>;
+
+    /// One sequence's chain checked and staged (live): `walk` its `(own,
+    /// head, mode)`, `refresh`'s rows then `own` own walks into `head`, as
+    /// the round's `(block, at, pair)`: block `block` at arena rows `at ..`,
+    /// its readback pairs from `pair`. Refused by name as the
+    /// program's chain refuses it; nothing but the round's scratch moves.
+    fn stage_chain(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        refresh: Feed<'_, A>,
+        walk: (usize, DraftHead, WalkMode),
+        at: (usize, usize, usize),
+    ) -> Result<ChainBlock, GpuError>;
+
+    /// The round's staged host words copied to the card ahead of its walks.
+    fn upload_chains(&mut self, gpu: &Gpu) -> Result<(), GpuError>;
+
+    /// Walk `j` of the round up to its attention, over the rows
+    /// [`chain_rows`] names.
+    fn chain_in(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        blocks: &[ChainBlock],
+        j: usize,
+    ) -> Result<(), GpuError>;
+
+    /// A walk's `rows`, `(at, m)`: arena rows `at .. at + m` of block `b`,
+    /// over its own store (live).
+    fn attend(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        b: &ChainBlock,
+        rows: (usize, usize),
+    ) -> Result<(), GpuError>;
+
+    /// Walk `j` after its attention, through the head, each block's last
+    /// row's readback pair filled; the round's last walk closes the
+    /// readback with the card's fault word.
+    fn chain_out(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        blocks: &[ChainBlock],
+        j: usize,
+        head: DraftHead,
+    ) -> Result<(), GpuError>;
+
+    /// The round ended for `b`'s sequence (live): its store holds the
+    /// sequence through the refresh ([`ChainBlock::end`]).
+    fn end_chain(&mut self, b: &ChainBlock) -> Result<(), GpuError>;
+
+    /// The round read back once: each block's proposal, in `blocks`' order.
+    /// A fault any walk of the round raised is [`GpuError::Fault`].
+    fn read_chains(&mut self, gpu: &Gpu, blocks: &[ChainBlock]) -> Result<Vec<Proposal>, GpuError>;
+}
+
+/// `f` on `b` with `seq` live, exchanged in and back out
+/// ([`Slots::swap_seq`]), or with the live sequence when `None`.
+fn on_seq<B: Slots, T>(
+    b: &mut B,
+    gpu: &Gpu,
+    seq: Option<&mut B::Seq>,
+    f: impl FnOnce(&mut B) -> Result<T, GpuError>,
+) -> Result<T, GpuError> {
+    match seq {
+        None => f(b),
+        Some(seq) => {
+            b.swap_seq(gpu, seq)?;
+            let r = f(b);
+            b.swap_seq(gpu, seq)?;
+            r
+        }
+    }
+}
+
+/// Refused by name: a slot named twice among `slots`.
+fn refuse_twice(
+    what: &'static str,
+    slots: impl Iterator<Item = usize> + Clone,
+) -> Result<(), GpuError> {
+    for (i, slot) in slots.clone().enumerate() {
+        if slots.clone().take(i).any(|s| s == slot) {
+            return Err(slot_twice(what, slot));
+        }
+    }
+    Ok(())
+}
+
+/// How many chains of `sizes` (each chain's rows and readback pairs, in
+/// order) one round takes: as many as fit `most` rows and pairs, and the
+/// first always.
+fn round_len(
+    sizes: impl Iterator<Item = (usize, usize)>,
+    (most_rows, most_pairs): (usize, usize),
+) -> usize {
+    let (mut rows, mut pairs, mut n) = (0, 0, 0);
+    for (r, p) in sizes {
+        if n > 0 && (rows + r > most_rows || pairs + p > most_pairs) {
+            break;
+        }
+        (rows, pairs, n) = (rows + r, pairs + p, n + 1);
+    }
+    n
+}
+
+impl<B: Slots> GpuModel<B>
+where
+    B::Seq: 'static,
+{
+    /// One store walk of several resident sequences' rows: each `(slot,
+    /// feed)`'s rows checked and staged with its slot selected, the walk's
+    /// row-wise launches once over every slot's rows, then each slot's
+    /// append into its own store. Each slot's store and the positions it
+    /// holds come out as its own store walk leaves them, and the selected
+    /// slot stays selected. Refused by name: a slot named twice, rows past
+    /// the program's [`WalkBounds::STORE_ROWS`], a poisoned model, and as
+    /// the program refuses each slot's walk, before anything but the walk's
+    /// scratch moves. A fault a launch raises stays on the card's fault
+    /// word, which the next readback names.
+    pub fn draft_store_slots<A>(
+        &mut self,
+        walks: &[(usize, Feed<'_, A>)],
+        head: DraftHead,
+    ) -> Result<(), GpuError>
+    where
+        B: SlotDraft<A>,
+        A: Copy,
+    {
+        const WHAT: &str = "draft store_slots";
+        self.refuse_if_poisoned(WHAT)?;
+        refuse_twice(WHAT, walks.iter().map(|&(slot, _)| slot))?;
+        let home = self.selected();
+        let r = self.store_slots_at(walks, head);
+        let back = self.select_slot(home);
+        self.note_fault(WHAT, r.and(back))
+    }
+
+    /// [`GpuModel::draft_store_slots`]'s walk, its checks done.
+    fn store_slots_at<A>(
+        &mut self,
+        walks: &[(usize, Feed<'_, A>)],
+        head: DraftHead,
+    ) -> Result<(), GpuError>
+    where
+        B: SlotDraft<A>,
+        A: Copy,
+    {
+        const WHAT: &str = "draft store_slots";
+        let mut blocks = Vec::with_capacity(walks.len());
+        let mut ids = Vec::new();
+        for &(slot, feed) in walks {
+            let at = ids.len();
+            let m = feed.tokens.len();
+            let most = <B::Program as WalkBounds>::STORE_ROWS;
+            if at + m > most {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!("{m} rows from row {at} of a store walk of at most {most} rows"),
+                ));
+            }
+            self.select_slot(slot)?;
+            let (gpu, w, body) = self.body_parts(WHAT)?;
+            blocks.push(body.stage_store(gpu, w, feed, head, at)?);
+            ids.extend_from_slice(feed.tokens);
+        }
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        let (gpu, w, body) = self.body_parts(WHAT)?;
+        body.store_rows(gpu, w, &ids, &blocks)?;
+        for (&(slot, _), &b) in walks.iter().zip(&blocks) {
+            self.select_slot(slot)?;
+            let (gpu, w, body) = self.body_parts(WHAT)?;
+            body.append_store(gpu, w, b)?;
+        }
+        Ok(())
+    }
+
+    /// Several slots' window chains of the draft at once, one readback a
+    /// round: each `(slot, refresh, own)` the chain the program runs on that
+    /// slot alone, the chains' walks of each depth run as one walk over
+    /// every slot's rows, its attention each slot's over its own store, and
+    /// each slot's proposal and store come out as its own chain leaves them.
+    /// Chains past one walk's rows (the program's [`WalkBounds::WALK_ROWS`])
+    /// or readback ([`SlotDraft::ROUND_PAIRS`]) run in rounds of them
+    /// (`round_len`), in order, and more chains than one call binds
+    /// ([`MAX_PASS_ROWS`]) in calls of that many. The model stands with slot 0 selected
+    /// ([`GpuModel::on_slots`]). Refused by name: a slot named twice, a
+    /// poisoned model, and as the program refuses each chain, before its
+    /// round's first walk; earlier rounds have run. A fault any walk raised
+    /// poisons every slot its call named.
+    pub fn draft_chain_slots<A>(
+        &mut self,
+        chains: &[SlotChain<'_, A>],
+        head: DraftHead,
+        mode: WalkMode,
+    ) -> Result<Vec<Proposal>, GpuError>
+    where
+        B: SlotDraft<A>,
+        A: Copy,
+    {
+        const WHAT: &str = "draft chain_slots";
+        self.refuse_if_poisoned(WHAT)?;
+        refuse_twice(WHAT, chains.iter().map(|&(slot, ..)| slot))?;
+        if chains.len() > MAX_PASS_ROWS {
+            let mut out = Vec::with_capacity(chains.len());
+            for part in chains.chunks(MAX_PASS_ROWS) {
+                out.extend(self.draft_chain_slots(part, head, mode)?);
+            }
+            return Ok(out);
+        }
+        let slots: Vec<usize> = chains.iter().map(|&(slot, ..)| slot).collect();
+        self.on_slots(&slots, WHAT, |gpu, w, body, parked| {
+            let mut seqs = Vec::with_capacity(chains.len());
+            let mut next = 0..parked.len();
+            for &(slot, ..) in chains {
+                seqs.push(match slot {
+                    0 => None,
+                    _ => Some(next.next().ok_or(GpuError::state(
+                        WHAT,
+                        "a parked sequence for every slot but slot 0",
+                    ))?),
+                });
+            }
+            let most = (<B::Program as WalkBounds>::WALK_ROWS, B::ROUND_PAIRS);
+            let mut out = Vec::with_capacity(chains.len());
+            let mut start = 0;
+            while start < chains.len() {
+                let sizes = chains[start..]
+                    .iter()
+                    .map(|(_, feed, own)| (feed.tokens.len(), 1 + own));
+                let end = start + round_len(sizes, most);
+                let round = (&chains[start..end], &seqs[start..end]);
+                out.extend(chain_round(body, gpu, w, parked, round, head, mode)?);
+                start = end;
+            }
+            Ok(out)
+        })
+    }
+}
+
+/// One round of several slots' chains ([`GpuModel::draft_chain_slots`]),
+/// the homes canonical: each chain's sequence the live one (`None`) or
+/// `parked`'s entry its `seqs` index names. Each chain is checked and staged
+/// with its sequence live, then each walk runs once over every chain it
+/// reaches, each chain's attention with its sequence live, and the round is
+/// read back once.
+fn chain_round<A: Copy, B: SlotDraft<A>>(
+    body: &mut B,
+    gpu: &Gpu,
+    w: &Weights,
+    parked: &mut [&mut B::Seq],
+    (chains, seqs): (&[SlotChain<'_, A>], &[Option<usize>]),
+    head: DraftHead,
+    mode: WalkMode,
+) -> Result<Vec<Proposal>, GpuError> {
+    let mut blocks: Vec<ChainBlock> = Vec::with_capacity(chains.len());
+    let (mut at, mut pair) = (0, 0);
+    for (block, (&(_, feed, own), &seq)) in chains.iter().zip(seqs).enumerate() {
+        let seq = seq.map(|i| &mut *parked[i]);
+        let b = on_seq(body, gpu, seq, |body| {
+            body.stage_chain(gpu, w, feed, (own, head, mode), (block, at, pair))
+        })?;
+        at += b.m;
+        pair += b.pairs();
+        blocks.push(b);
+    }
+    body.upload_chains(gpu)?;
+    let walks = blocks.iter().map(ChainBlock::pairs).max().unwrap_or(0);
+    for j in 0..walks {
+        body.chain_in(gpu, w, &blocks, j)?;
+        for (b, at, m) in chain_rows(&blocks, j) {
+            let seq = seqs[b.block].map(|i| &mut *parked[i]);
+            on_seq(body, gpu, seq, |body| body.attend(gpu, w, &b, (at, m)))?;
+        }
+        body.chain_out(gpu, w, &blocks, j, head)?;
+    }
+    for (b, &seq) in blocks.iter().zip(seqs) {
+        let seq = seq.map(|i| &mut *parked[i]);
+        on_seq(body, gpu, seq, |body| body.end_chain(b))?;
+    }
+    body.read_chains(gpu, &blocks)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Held;
+    use super::{ChainBlock, Held, chain_rows, refuse_twice, round_len};
     use crate::GpuError;
+
+    /// A round's depths: walk 0 runs every block's refresh at its own rows,
+    /// a later walk one row for each block whose chain still walks, packed
+    /// in the blocks' order; a slot named twice is refused by name; a round
+    /// takes chains up to its rows and pairs, and its first chain always.
+    #[test]
+    fn a_round_walks_each_chain_to_its_depth() {
+        let block = |block, at, m, own, pair| ChainBlock {
+            block,
+            at,
+            m,
+            pos0: 10,
+            own,
+            pair,
+        };
+        let blocks = [
+            block(0, 0, 3, 2, 0),
+            block(1, 3, 1, 0, 3),
+            block(2, 4, 2, 1, 4),
+        ];
+        let rows = |j| {
+            chain_rows(&blocks, j)
+                .map(|(b, at, m)| (b.block, at, m))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows(0), [(0, 0, 3), (1, 3, 1), (2, 4, 2)]);
+        assert_eq!(rows(1), [(0, 0, 1), (2, 1, 1)]);
+        assert_eq!(rows(2), [(0, 0, 1)]);
+        assert!(rows(3).is_empty());
+        assert_eq!((blocks[0].end(), blocks[0].pairs()), (13, 3));
+        refuse_twice("round", [0, 2, 1].into_iter()).expect("three slots");
+        let e = refuse_twice("round", [0, 2, 0].into_iter()).expect_err("slot 0 twice");
+        assert!(matches!(e, GpuError::Shape { what: "round", .. }), "{e}");
+        let round = |sizes: &[(usize, usize)]| round_len(sizes.iter().copied(), (6, 4));
+        assert_eq!(round(&[(3, 1), (3, 2), (1, 1)]), 2);
+        assert_eq!(round(&[(2, 2), (2, 2), (1, 1)]), 2);
+        assert_eq!(round(&[(9, 9), (1, 1)]), 1);
+    }
 
     #[test]
     fn held_rows_respect_row_and_position_widths_and_cuts() {

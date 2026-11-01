@@ -90,6 +90,7 @@ use crate::{Draw, Keep, Prompt, RoundWindow, Session, SessionError};
 /// The types a draft walk is given, owned by the card crate (`bloomery_gpu`):
 /// how a walk runs, where its hidden rows come from and the rows it walks.
 pub use bloomery_gpu::draft::{DraftHead, Feed, Hidden, WalkMode};
+use bloomery_gpu::draft::{Proposal, SlotDraft};
 
 mod policy;
 
@@ -314,7 +315,8 @@ pub trait MtpBody: Prompt + Keep + Rows + Rollback {
     /// once and at most [`MtpBody::STORE_ROWS`] rows in all. Each slot's
     /// draft store comes out as its own walk leaves it, and the selected
     /// slot stays selected. The default walks the slots in turn; a body
-    /// whose store walk runs several sequences' rows at once overrides it.
+    /// whose draft walks several sequences' rows at once ([`SlotDraft`])
+    /// overrides it with [`GpuModel::draft_store_slots`].
     fn store_slots(
         m: &mut GpuModel<Self>,
         walks: &[(usize, Feed<'_, Self::Arena>)],
@@ -359,8 +361,9 @@ pub trait MtpBody: Prompt + Keep + Rows + Rollback {
     /// when it holds `p`, each id's probability to the front of `p`, bit for
     /// bit what that chain alone writes. Returns each chain's proposal
     /// length, in order. The default runs the chains in turn and leaves the
-    /// selected slot selected; a body whose walks run several sequences'
-    /// rows at once overrides it and may leave another slot selected.
+    /// selected slot selected; a body whose draft walks several sequences'
+    /// rows at once ([`SlotDraft`]) overrides it with [`chains_at_once`] and
+    /// may leave another slot selected.
     fn chain_slots(
         m: &mut GpuModel<Self>,
         chains: &mut [SlotChain<'_, Self::Arena>],
@@ -395,6 +398,69 @@ pub struct SlotChain<'a, A> {
     pub own: usize,
     pub out: &'a mut [u32],
     pub p: Option<&'a mut [f32]>,
+}
+
+/// [`MtpBody::chain_slots`] of a body whose draft walks several sequences'
+/// chains at once ([`SlotDraft`]): one round call
+/// ([`GpuModel::draft_chain_slots`]), each proposal written to its chain's
+/// room ([`write_proposal`]).
+pub fn chains_at_once<B>(
+    m: &mut GpuModel<B>,
+    chains: &mut [SlotChain<'_, <B as MtpBody>::Arena>],
+    head: DraftHead,
+    mode: WalkMode,
+) -> Result<Vec<usize>, GpuError>
+where
+    B: MtpBody + SlotDraft<<B as MtpBody>::Arena>,
+    B::Seq: 'static,
+{
+    let feeds: Vec<_> = chains.iter().map(|c| (c.slot, c.refresh, c.own)).collect();
+    let drafts = m.draft_chain_slots(&feeds, head, mode)?;
+    chains
+        .iter_mut()
+        .zip(&drafts)
+        .map(|(c, d)| write_proposal(d, c.out, c.p.as_deref_mut()))
+        .collect()
+}
+
+/// A chain's readback `d` written to the front of `out` and, when asked, its
+/// probabilities to the front of `p`; how many. Room short of the proposal,
+/// and probabilities asked of a readback that holds none, are refused by
+/// name.
+pub fn write_proposal(
+    d: &Proposal,
+    out: &mut [u32],
+    p: Option<&mut [f32]>,
+) -> Result<usize, GpuError> {
+    const WHAT: &str = "mtp proposal";
+    let n = d.tokens.len();
+    let places = out.len();
+    out.get_mut(..n)
+        .ok_or_else(|| {
+            GpuError::shape(WHAT, format!("a proposal of {n} ids into {places} places"))
+        })?
+        .copy_from_slice(&d.tokens);
+    if let Some(p) = p {
+        if d.p.len() != n {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a proposal's probabilities: its readback holds {} for {n} ids",
+                    d.p.len()
+                ),
+            ));
+        }
+        let places = p.len();
+        p.get_mut(..n)
+            .ok_or_else(|| {
+                GpuError::shape(
+                    WHAT,
+                    format!("a proposal's {n} probabilities into {places} places"),
+                )
+            })?
+            .copy_from_slice(&d.p);
+    }
+    Ok(n)
 }
 
 /// One drafted window as the draft saw it ([`MtpDraft::keep_windows`]): the
@@ -1419,5 +1485,49 @@ impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
     /// pass that runs a proposal.
     fn before_plain(&mut self, t: &mut Session<B>, last: u32) -> Result<(), SessionError> {
         self.before_step(t, last)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_proposal;
+    use bloomery_gpu::GpuError;
+    use bloomery_gpu::draft::Proposal;
+
+    /// A proposal fills the front of its rooms; room short of it, and
+    /// probabilities asked of a readback that holds none, are refused by name.
+    #[test]
+    fn a_proposal_fills_its_rooms_or_is_refused_by_name() {
+        let d = Proposal {
+            tokens: vec![4, 5],
+            p: vec![0.5, 0.25],
+        };
+        let (mut out, mut p) = ([0; 3], [0.0; 3]);
+        assert_eq!(write_proposal(&d, &mut out, Some(&mut p)).expect("room"), 2);
+        assert_eq!((out, p), ([4, 5, 0], [0.5, 0.25, 0.0]));
+        let refused = |r: Result<usize, GpuError>| {
+            matches!(
+                r,
+                Err(GpuError::Shape {
+                    what: "mtp proposal",
+                    ..
+                })
+            )
+        };
+        assert!(refused(write_proposal(&d, &mut [0; 1], None)));
+        assert!(refused(write_proposal(&d, &mut out, Some(&mut [0.0; 1]))));
+        let ids_alone = Proposal {
+            tokens: vec![1],
+            p: vec![],
+        };
+        assert!(refused(write_proposal(
+            &ids_alone,
+            &mut out,
+            Some(&mut [0.0])
+        )));
+        assert_eq!(
+            write_proposal(&ids_alone, &mut out, None).expect("ids alone"),
+            1
+        );
     }
 }

@@ -4,13 +4,15 @@
 //! path are Qwen3.8's own types.
 
 use bloomery_gpu::GpuError;
-use bloomery_gpu::arch::qwen3moe::{Body38, Mtp38, MtpDraft, Prompt38, Qwen38Model, TargetRows};
+use bloomery_gpu::arch::qwen3moe::{Body38, Mtp38, Prompt38, Qwen38Model, TargetRows};
 use bloomery_gpu::draft::{DraftFeed, WalkBounds};
 use bloomery_gpu::media::ImageSpan;
 use bloomery_gpu::model::Rows;
 
 use super::WHAT;
-use crate::mtp::{DraftHead, Feed, MtpBody, SlotChain, UnitSink, WalkMode};
+use crate::mtp::{
+    DraftHead, Feed, MtpBody, SlotChain, UnitSink, WalkMode, chains_at_once, write_proposal,
+};
 use runtime::prompt::CallEnd;
 
 impl MtpBody for Body38 {
@@ -107,13 +109,13 @@ impl MtpBody for Body38 {
     }
 
     /// One store walk of every slot's rows at once
-    /// ([`Qwen38Model::mtp_store_slots`]).
+    /// ([`Qwen38Model::draft_store_slots`]).
     fn store_slots(
         m: &mut Qwen38Model,
         walks: &[(usize, Feed<'_, TargetRows>)],
         head: DraftHead,
     ) -> Result<(), GpuError> {
-        m.mtp_store_slots(walks, head)
+        m.draft_store_slots(walks, head)
     }
 
     fn chain(
@@ -126,49 +128,19 @@ impl MtpBody for Body38 {
         p: Option<&mut [f32]>,
     ) -> Result<usize, GpuError> {
         let d = m.mtp_chain(DraftFeed::Rows(refresh), own, head, mode)?;
-        proposal(&d, out, p)
+        write_proposal(&d, out, p)
     }
 
-    /// Every slot's chains at once ([`Qwen38Model::mtp_chain_slots`]: one
-    /// walk a depth over every slot's rows).
+    /// Every slot's chains at once ([`chains_at_once`]: one walk a depth
+    /// over every slot's rows).
     fn chain_slots(
         m: &mut Qwen38Model,
         chains: &mut [SlotChain<'_, TargetRows>],
         head: DraftHead,
         mode: WalkMode,
     ) -> Result<Vec<usize>, GpuError> {
-        let feeds: Vec<_> = chains.iter().map(|c| (c.slot, c.refresh, c.own)).collect();
-        let drafts = m.mtp_chain_slots(&feeds, head, mode)?;
-        chains
-            .iter_mut()
-            .zip(&drafts)
-            .map(|(c, d)| proposal(d, c.out, c.p.as_deref_mut()))
-            .collect()
+        chains_at_once(m, chains, head, mode)
     }
-}
-
-/// A chain's readback `d` written to the front of `out` and, when asked, its
-/// probabilities to the front of `p`; how many. Room short of the proposal
-/// is refused by name.
-fn proposal(d: &MtpDraft, out: &mut [u32], p: Option<&mut [f32]>) -> Result<usize, GpuError> {
-    let n = d.tokens.len();
-    let places = out.len();
-    out.get_mut(..n)
-        .ok_or_else(|| GpuError::Shape {
-            what: WHAT,
-            detail: format!("a proposal of {n} ids into {places} places"),
-        })?
-        .copy_from_slice(&d.tokens);
-    if let Some(p) = p {
-        let places = p.len();
-        p.get_mut(..n)
-            .ok_or_else(|| GpuError::Shape {
-                what: WHAT,
-                detail: format!("a proposal's {n} probabilities into {places} places"),
-            })?
-            .copy_from_slice(&d.p);
-    }
-    Ok(n)
 }
 
 // The adapter's widths fit together, and a refresh of a whole verify's

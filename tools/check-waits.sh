@@ -12,8 +12,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 # file|the function's signature, as a fixed prefix of its `fn` line after the indent
+# PIN(2026-11-02): read_tokens owns the bounded readback formerly in Head::tokens.
 ROWS=(
-  "crates/gpu/src/head.rs|pub fn tokens(&self, gpu: &Gpu)"
+  "crates/gpu/src/head.rs|pub fn read_tokens(gpu: &Gpu, words: &DeviceBuffer<u32>)"
   "crates/gpu/src/host/batch.rs|pub fn routed_ids(&mut self, key: BatchKey)"
   "crates/gpu/src/host/batch.rs|fn serve_tiered("
   "crates/gpu/src/lib.rs|pub fn fault(&self) -> Result<Option<Fault>, GpuError>"
