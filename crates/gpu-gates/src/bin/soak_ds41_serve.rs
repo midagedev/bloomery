@@ -57,7 +57,7 @@ mod soak {
     use std::process::{Child, ChildStdout, Command, Stdio};
     use std::time::{Duration, Instant};
 
-    use bloomery_gpu_gates::serve_client::{Served, curl, ids_of, json_of};
+    use bloomery_gpu_gates::serve_client::{Served, curl, ids_of, json_of, stop_of};
     use bloomery_gpu_gates::{GateError, checks_failed, data_dir, ref_model_path, verdict};
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
@@ -435,8 +435,7 @@ mod soak {
         }
         let mut s = String::new();
         for e in chunks.into_iter().filter(|e| *e != "[DONE]") {
-            let v: Value = serde_json::from_str(e)
-                .map_err(|err| format!("{WHAT}: stream event {e:?}: {err}"))?;
+            let v = stream_event(e).map_err(|err| format!("{WHAT}: {err}"))?;
             let delta = v
                 .pointer("/choices/0/delta")
                 .and_then(Value::as_object)
@@ -466,19 +465,29 @@ mod soak {
             .collect()
     }
 
+    /// One SSE payload, including the stop of a native completion's terminal event.
+    fn stream_event(e: &str) -> Result<Value, GateError> {
+        let v = json_of("unreadable SSE event", 200, e)?;
+        if v["stop"].as_bool() == Some(true) {
+            stop_of(&v)?;
+        }
+        Ok(v)
+    }
+
     fn sse_errors(sse: &str) -> Result<u64, GateError> {
         let chunks = events(sse)?;
+        let mut complete = chunks.contains(&"[DONE]");
         let mut errors = 0;
-        for e in &chunks {
-            if *e == "[DONE]" {
+        for e in chunks {
+            if e == "[DONE]" {
                 continue;
             }
-            let v: Value = serde_json::from_str(e)
-                .map_err(|err| format!("unreadable SSE event {e:?}: {err}"))?;
+            let v = stream_event(e)?;
             errors += u64::from(v.get("error").is_some());
+            complete |= v["stop"].as_bool() == Some(true);
         }
-        if errors == 0 && !chunks.contains(&"[DONE]") {
-            return Err(format!("stream has no [DONE]: {sse:?}").into());
+        if errors == 0 && !complete {
+            return Err(format!("stream has no [DONE] or completion stop: {sse:?}").into());
         }
         Ok(errors)
     }
@@ -673,7 +682,7 @@ mod soak {
             self.c.n.generations += 1;
             let t = Instant::now();
             let mut s = Stream::open(&self.c.url("/completion"), &body)?;
-            s.read(Some(DROP_AFTER));
+            s.read(Some(DROP_AFTER))?;
             let _ = s.child.kill();
             let _ = s.child.wait();
             let ms = t.elapsed().as_millis();
@@ -720,7 +729,7 @@ mod soak {
             self.c.n.pairs += 1;
             let t = Instant::now();
             let mut a = Stream::open(&self.c.url("/completion"), &a_body)?;
-            a.read(Some(1));
+            a.read(Some(1))?;
             let b = Command::new("curl")
                 .args(["-sS", "--max-time", "600", "-w", "\n%{http_code}"])
                 .args([
@@ -743,7 +752,9 @@ mod soak {
                     break;
                 }
             }
-            a.read(None);
+            let read = a.read(None);
+            let out = b.wait_with_output()?;
+            read?;
             let a_rc = a.child.wait()?;
             let (a_status, a_events, a_done) = (a.status, a.events, a.ended);
             match a_status {
@@ -755,7 +766,6 @@ mod soak {
                 None => self.c.n.transport += 1,
             }
             self.c.n.sse_errors += a.errors;
-            let out = b.wait_with_output()?;
             let b_status = String::from_utf8_lossy(&out.stdout)
                 .rsplit_once('\n')
                 .and_then(|(_, code)| code.trim().parse::<u16>().ok());
@@ -854,7 +864,7 @@ mod soak {
     /// A streamed request through curl, its head on stdout (`-D -`), read as
     /// it arrives: the status (the last head's), the `data:` events seen, the
     /// `error` events among them, and whether the stream ended (the
-    /// connection closed or `data: [DONE]`).
+    /// native terminal event, connection closed or `data: [DONE]`).
     struct Stream {
         child: Child,
         r: BufReader<ChildStdout>,
@@ -862,6 +872,16 @@ mod soak {
         events: usize,
         errors: u64,
         ended: bool,
+        body: bool,
+    }
+
+    impl Drop for Stream {
+        fn drop(&mut self) {
+            if matches!(self.child.try_wait(), Ok(None)) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
     }
 
     impl Stream {
@@ -882,32 +902,47 @@ mod soak {
                 events: 0,
                 errors: 0,
                 ended: false,
+                body: false,
             })
         }
 
         /// Reads until `stop` events have been seen in all, or the end.
-        fn read(&mut self, stop: Option<usize>) {
+        fn read(&mut self, stop: Option<usize>) -> Result<(), GateError> {
             let mut line = String::new();
             while !self.ended && !stop.is_some_and(|n| self.events >= n) {
                 line.clear();
-                if !matches!(self.r.read_line(&mut line), Ok(n) if n > 0) {
+                if self
+                    .r
+                    .read_line(&mut line)
+                    .map_err(|err| format!("/completion: SSE read: {err}"))?
+                    == 0
+                {
                     self.ended = true;
+                    if self.status == Some(200) && self.errors == 0 {
+                        return Err("/completion: stream has no [DONE] or completion stop".into());
+                    }
                     break;
                 }
                 let l = line.trim_end();
                 if l.starts_with("HTTP/") {
                     self.status = l.split_whitespace().nth(1).and_then(|s| s.parse().ok());
-                } else if let Some(e) = l.strip_prefix("data: ") {
-                    self.events += 1;
-                    if e == "[DONE]" {
-                        self.ended = true;
-                    } else if serde_json::from_str::<Value>(e)
-                        .is_ok_and(|v| v.get("error").is_some())
-                    {
-                        self.errors += 1;
+                    self.body = false;
+                } else if !self.body {
+                    self.body = l.is_empty();
+                } else if !l.is_empty() && self.status == Some(200) {
+                    for e in events(l).map_err(|err| format!("/completion: {err}"))? {
+                        self.events += 1;
+                        if e == "[DONE]" {
+                            self.ended = true;
+                        } else {
+                            let v = stream_event(e).map_err(|err| format!("/completion: {err}"))?;
+                            self.errors += u64::from(v.get("error").is_some());
+                            self.ended = v["stop"].as_bool() == Some(true);
+                        }
                     }
                 }
             }
+            Ok(())
         }
     }
 
@@ -1450,7 +1485,7 @@ mod soak {
     #[cfg(test)]
     mod tests {
         use super::{
-            Client, Conversation, Corpus, Counts, GateError, Mix, Rng, served, sse_errors,
+            Client, Conversation, Corpus, Counts, GateError, Mix, Rng, Stream, served, sse_errors,
             streamed_text, string_at,
         };
         use serde_json::json;
@@ -1527,80 +1562,108 @@ mod soak {
             let bare = "data: {\"choices\":[{}]}\n\ndata: [DONE]\n\n";
             assert!(refused(streamed_text(bare)).contains("no delta"));
 
+            let native = "data: {\"content\":\"a\",\"stop\":false}\n\ndata: {\"content\":\"\",\"stop\":true,\"stop_type\":\"limit\"}\n\n";
+            assert_eq!(sse_errors(native).unwrap(), 0);
             for (stream, body, error, errors) in [
                 (false, "<html>", Some("/completion"), 0),
                 (false, r#"{"tokens":[1]}"#, Some("stop_type"), 0),
                 (false, r#"{"tokens":[1],"stop_type":"limit"}"#, None, 0),
                 (true, "data: {cut\n\n", Some("unreadable SSE event"), 0),
                 (true, "data: {}\n\n", Some("no [DONE]"), 0),
-                (true, "data: {}\n\ndata: [DONE]\n\n", None, 0),
+                (true, native, None, 0),
+                (true, "data: {\"stop\":true}\n\n", Some("stop_type"), 0),
+                (
+                    true,
+                    "data: {\"stop\":true,\"stop_type\":\"bad\"}\n\n",
+                    Some("stop_type"),
+                    0,
+                ),
+                (
+                    true,
+                    "data:{\"content\":\"a\"}\n\n",
+                    Some("unreadable SSE frame"),
+                    0,
+                ),
                 (true, "data: {\"error\":\"failed\"}\n\n", None, 1),
             ] {
-                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-                let addr = listener.local_addr().unwrap();
-                let (peer, _) = spawn_helper("soak-reader-response", Placement::Float, move || {
-                    let (mut socket, _) = listener.accept().unwrap();
-                    socket
-                        .set_read_timeout(Some(Duration::from_secs(5)))
-                        .unwrap();
-                    let mut request = BufReader::new(&mut socket);
-                    let mut line = String::new();
-                    request.read_line(&mut line).unwrap();
-                    assert!(line.starts_with("POST /completion HTTP/"), "{line}");
-                    let mut length = 0;
-                    loop {
-                        line.clear();
-                        assert!(request.read_line(&mut line).unwrap() > 0);
-                        if line == "\r\n" {
-                            break;
-                        }
-                        if let Some(n) = line.strip_prefix("Content-Length: ") {
-                            length = n.trim().parse().unwrap();
-                        }
-                    }
-                    request.read_exact(&mut vec![0; length]).unwrap();
-                    write!(
+                for paired in 0..=usize::from(stream) {
+                    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                    let addr = listener.local_addr().unwrap();
+                    let (peer, _) =
+                        spawn_helper("soak-reader-response", Placement::Float, move || {
+                            let (mut socket, _) = listener.accept().unwrap();
+                            socket
+                                .set_read_timeout(Some(Duration::from_secs(5)))
+                                .unwrap();
+                            let mut request = BufReader::new(&mut socket);
+                            let mut line = String::new();
+                            request.read_line(&mut line).unwrap();
+                            assert!(line.starts_with("POST /completion HTTP/"), "{line}");
+                            let mut length = 0;
+                            loop {
+                                line.clear();
+                                assert!(request.read_line(&mut line).unwrap() > 0);
+                                if line == "\r\n" {
+                                    break;
+                                }
+                                if let Some(n) = line.strip_prefix("Content-Length: ") {
+                                    length = n.trim().parse().unwrap();
+                                }
+                            }
+                            request.read_exact(&mut vec![0; length]).unwrap();
+                            write!(
                         socket,
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     )
                     .unwrap();
-                })
-                .unwrap();
-                let mut mix = Mix {
-                    c: Client {
-                        base: format!("http://{addr}"),
-                        t0: Instant::now(),
-                        log: OpenOptions::new().write(true).open("/dev/null").unwrap(),
-                        n: Counts::default(),
-                    },
-                    rng: Rng(1),
-                    corpus: Corpus {
-                        prose: vec![],
-                        code: vec![1, 2],
-                    },
-                    conv: Conversation {
-                        messages: vec![],
-                        held: 0,
-                    },
-                    probe: None,
-                    probes: 0,
-                    probes_equal: 0,
-                    light_next: 0,
-                };
-                let result = mix.fresh(1, stream, (0.0, 1));
-                peer.join().unwrap();
-                if let Some(name) = error {
-                    assert!(refused(result).contains(name), "{body}");
-                } else {
-                    result.unwrap();
+                        })
+                        .unwrap();
+                    let mut mix = Mix {
+                        c: Client {
+                            base: format!("http://{addr}"),
+                            t0: Instant::now(),
+                            log: OpenOptions::new().write(true).open("/dev/null").unwrap(),
+                            n: Counts::default(),
+                        },
+                        rng: Rng(1),
+                        corpus: Corpus {
+                            prose: vec![],
+                            code: vec![1, 2],
+                        },
+                        conv: Conversation {
+                            messages: vec![],
+                            held: 0,
+                        },
+                        probe: None,
+                        probes: 0,
+                        probes_equal: 0,
+                        light_next: 0,
+                    };
+                    let (result, observed_errors) = if paired == 1 {
+                        let mut s = Stream::open(&mix.c.url("/completion"), &json!({})).unwrap();
+                        let result = s.read(None);
+                        assert_eq!(s.status, Some(200));
+                        let errors = s.errors;
+                        drop(s);
+                        (result, errors)
+                    } else {
+                        let result = mix.fresh(1, stream, (0.0, 1));
+                        assert_eq!(mix.c.n.requests, 1);
+                        assert_eq!(
+                            mix.c.n.transport + mix.c.n.other_status + mix.c.n.server_5xx,
+                            0
+                        );
+                        (result, mix.c.n.sse_errors)
+                    };
+                    peer.join().unwrap();
+                    if let Some(name) = error {
+                        assert!(refused(result).contains(name), "{body}");
+                    } else {
+                        result.unwrap();
+                    }
+                    assert_eq!(observed_errors, errors);
                 }
-                assert_eq!(mix.c.n.requests, 1);
-                assert_eq!(
-                    mix.c.n.transport + mix.c.n.other_status + mix.c.n.server_5xx,
-                    0
-                );
-                assert_eq!(mix.c.n.sse_errors, errors);
             }
         }
     }
