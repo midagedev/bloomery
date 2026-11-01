@@ -34,6 +34,8 @@ pub mod dspark;
 pub mod mtp;
 pub mod warm;
 
+use std::collections::BTreeSet;
+
 use bloomery_gpu::best;
 use bloomery_gpu::host::PassKind;
 use bloomery_gpu::host::served::prompt_pass;
@@ -749,6 +751,41 @@ where
         Ok(self.model.step_slots(rows)?)
     }
 
+    /// Capture every pass a round of slots `0..slots` runs when each busy
+    /// slot holds 1 to `rows` rows ([`GpuModel::capture_slots`]): each set
+    /// of busy slots in slot order and each row count, cut as a round cuts
+    /// them ([`round_passes`]), so no round captures a pass on its first
+    /// use. The rounds number `(rows + 1)^slots - 1`. Then every slot's own
+    /// graphs, which a round of one busy slot replays
+    /// ([`GpuModel::capture_each_slot`]: its step, its draft's walks).
+    /// Returns how many passes and how many slots' own graphs it captured.
+    /// Load-time; graph mode only, an eager pass capturing nothing. Refused
+    /// by name past the body's slots or rows a pass.
+    pub fn capture_rounds(
+        &mut self,
+        slots: usize,
+        rows: usize,
+    ) -> Result<(usize, usize), SessionError> {
+        self.idle("capture_rounds")?;
+        if slots > B::MAX_SLOTS || rows > B::MAX_ROWS {
+            return Err(SessionError::Refused(format!(
+                "the rounds of {slots} slots of up to {rows} rows: a pass takes up to {} slots \
+                 and {} rows",
+                B::MAX_SLOTS,
+                B::MAX_ROWS
+            )));
+        }
+        if self.model.mode() != StepMode::Graph {
+            return Ok((0, 0));
+        }
+        let keys = round_keys(slots, rows, (B::MAX_ROWS, B::MAX_SLOTS))?;
+        for key in &keys {
+            self.model.capture_slots(key)?;
+        }
+        let own = self.model.capture_each_slot()?;
+        Ok((keys.len(), own))
+    }
+
     /// One pass of several slots' verify rows ([`GpuModel::verify_slots`]):
     /// each row's greedy next token, each slot standing past its rows and
     /// waiting for [`Session::commit_slots`], which every other call waits
@@ -1058,6 +1095,36 @@ pub(crate) fn round_passes(
     Ok(cuts)
 }
 
+/// The passes the rounds of slots `0..slots` run when each busy slot holds
+/// 1 to `rows` rows ([`Session::capture_rounds`]): each set of busy slots in
+/// slot order and each row count, cut by [`round_passes`] within `limits`,
+/// each pass's key (its slots and row counts) once.
+fn round_keys(
+    slots: usize,
+    rows: usize,
+    limits: (usize, usize),
+) -> Result<BTreeSet<Vec<(usize, usize)>>, SessionError> {
+    let mut keys = BTreeSet::new();
+    if rows == 0 {
+        return Ok(keys);
+    }
+    for busy in 1..1usize << slots {
+        let on: Vec<usize> = (0..slots).filter(|s| busy >> s & 1 == 1).collect();
+        let mut counts = vec![1; on.len()];
+        loop {
+            let round: Vec<(usize, usize)> = on.iter().copied().zip(counts.clone()).collect();
+            let cuts = round_passes(round.iter().copied(), limits)?;
+            keys.extend(cuts.into_iter().map(|cut| round[cut].to_vec()));
+            let Some(at) = counts.iter().position(|&n| n < rows) else {
+                break;
+            };
+            counts[..at].fill(1);
+            counts[at] += 1;
+        }
+    }
+    Ok(keys)
+}
+
 /// What [`Session::step_slots_rounds`] ran: each row's greedy next token in
 /// row order, the passes the round took (one a cut at the body's
 /// row and sequence bounds), and the requested rows' logits in the round's row order, the
@@ -1302,7 +1369,7 @@ impl<B: Prompt + Keep + Rows + Rollback> Session<B> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ArmFailed, BestRows, SessionError, clearable, round_passes, run_arms};
+    use super::{ArmFailed, BestRows, SessionError, clearable, round_keys, round_passes, run_arms};
     use bloomery_gpu::{Fault, FaultSite, GpuError, best};
 
     /// A best read's row holds its own list alone: the row read before it is
@@ -1400,6 +1467,36 @@ mod tests {
             panic!("a window past the pass was not refused");
         };
         assert!(text.contains("slot 1's"), "{text}");
+    }
+
+    /// The passes two slots' rounds of one to four rows run: each slot
+    /// alone at each count, and the two together in slot order at each pair
+    /// of counts when a pass holds them (16 of them at eight rows a pass),
+    /// cut into the slots alone when it does not (the pairs past four rows
+    /// at GLM's four rows a pass). No rows is no pass.
+    #[test]
+    fn round_keys_are_every_pass_a_round_runs() {
+        let alone: Vec<Vec<(usize, usize)>> = (0..2)
+            .flat_map(|s| (1..=4).map(move |n| vec![(s, n)]))
+            .collect();
+        let together = |fit: usize| -> Vec<Vec<(usize, usize)>> {
+            (1..=4)
+                .flat_map(|a| (1..=4).map(move |b| vec![(0, a), (1, b)]))
+                .filter(|k| k.iter().map(|&(_, n)| n).sum::<usize>() <= fit)
+                .collect()
+        };
+        for (limits, fit) in [((8, 8), 8), ((4, 2), 4)] {
+            let mut want = alone.clone();
+            want.extend(together(fit));
+            want.sort();
+            let got: Vec<_> = round_keys(2, 4, limits)
+                .expect("keys")
+                .into_iter()
+                .collect();
+            assert_eq!(got, want, "limits {limits:?}");
+        }
+        assert_eq!(round_keys(2, 4, (8, 8)).expect("keys").len(), 24);
+        assert!(round_keys(2, 0, (8, 8)).expect("keys").is_empty());
     }
 
     #[test]

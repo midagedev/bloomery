@@ -137,6 +137,15 @@ pub trait ChainBody: Sized {
         Ok(())
     }
 
+    /// Capture every graph the body keeps beside the chain for the live
+    /// sequence (a draft layer's walks) that is not captured yet, so no call
+    /// captures one on its first use; how many it captured. Nothing is
+    /// launched. Load-time; `Ok(0)` for a body that keeps none (the default).
+    fn capture_seq(&mut self, gpu: &Gpu, w: &Weights) -> Result<usize, GpuError> {
+        let _ = (gpu, w);
+        Ok(0)
+    }
+
     /// Enqueue the whole chain — every resident layer and then `head`.
     /// Asynchronous throughout: no allocation, no synchronization, no host
     /// round trip, so this is both the eager body and what the capture
@@ -1225,6 +1234,21 @@ impl<B: ChainBody> GpuModel<B> {
         let nodes = graph.node_count();
         *graphs.slot(1, WHAT)? = Some(graph);
         Ok(nodes)
+    }
+
+    /// Capture the graphs the body keeps beside the chain for the live
+    /// sequence that are not captured yet ([`ChainBody::capture_seq`]: a
+    /// draft layer's walks), so no call captures one on its first use; how
+    /// many it captured. Load-time; graph mode only, an eager model
+    /// capturing nothing.
+    pub fn capture_seq(&mut self) -> Result<usize, GpuError> {
+        if self.mode != StepMode::Graph {
+            return Ok(0);
+        }
+        let GpuModel {
+            body, weights, gpu, ..
+        } = self;
+        body.capture_seq(gpu, weights)
     }
 
     /// Every node of the captured whole chain, as the driver lists them —
