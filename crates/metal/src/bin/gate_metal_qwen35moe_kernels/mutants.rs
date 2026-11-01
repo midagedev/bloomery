@@ -95,6 +95,9 @@ pub const Q30_KEPT: &[&str] = &[
     "attn_fold_stage_l",
     "attn_fold_empty_unskipped",
     "attn_fold_underflow_skipped",
+    "attn_fold_one_ticket",
+    "attn_fold_kv_heads",
+    "attn_score_butterfly_half",
     "attn_one_dead_unmasked",
     "attn_one_chunk_rescale",
     "attn_one_merge_unscaled",
@@ -322,6 +325,9 @@ pub const ATTN_KEPT: &[&str] = &[
     "attn_fold_stage_l",
     "attn_fold_empty_unskipped",
     "attn_fold_underflow_skipped",
+    "attn_fold_one_ticket",
+    "attn_fold_kv_heads",
+    "attn_score_butterfly_half",
     "attn_one_dead_unmasked",
     "attn_one_chunk_rescale",
     "attn_one_merge_unscaled",
@@ -1354,11 +1360,18 @@ pub const MUTANTS: &[Mutant] = &[
         name: "attn_score_scale",
         clause: "attn_f16",
         why: "the score is twice the scaled dot, in the segmented and the one-pass flash",
-        edits: &[(
-            "float score = dot * args.scale;",
-            "float score = dot * args.scale * 2.0f;",
-            2,
-        )],
+        edits: &[
+            (
+                "float score = dot * args.scale;",
+                "float score = dot * args.scale * 2.0f;",
+                1,
+            ),
+            (
+                "float score = (sixteen + simd_shuffle_xor(sixteen, ushort(16))) * args.scale;",
+                "float score = (sixteen + simd_shuffle_xor(sixteen, ushort(16))) * args.scale * 2.0f;",
+                1,
+            ),
+        ],
     },
     Mutant {
         name: "attn_q8_id",
@@ -1411,8 +1424,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "attn_f16",
         why: "the fold never runs, so past one segment the output is never written",
         edits: &[(
-            "if (args.segments > 1u) {\n        ticket_is_last(ticket, groups, tid, last_flag);",
-            "if (args.segments > 64u) {\n        ticket_is_last(ticket, groups, tid, last_flag);",
+            "if (args.segments > 1u && active) {\n        ticket_is_last(ticket + kv, args.segments, tid, last_flag);",
+            "if (args.segments > 64u && active) {\n        ticket_is_last(ticket + kv, args.segments, tid, last_flag);",
             1,
         )],
     },
@@ -2537,8 +2550,8 @@ pub const MUTANTS: &[Mutant] = &[
         why: "a key past the segment's end scores its zero row as 0 and weighs in",
         edits: &[
             (
-                "float scored = FULL || lo + t < hi ? score : -INFINITY;",
-                "float scored = score;",
+                "float mine = FULL || lo + t < hi ? score : -INFINITY;",
+                "float mine = score;",
                 1,
             ),
             (
@@ -2559,8 +2572,18 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "attn_f16",
         why: "lane t keeps the score of the tile's key t - 1, so every key weighs at its neighbour's score",
         edits: &[(
-            "mine = lane == t ? scored : mine;",
-            "mine = lane == t + 1u ? scored : mine;",
+            "float mine = FULL || lo + t < hi ? score : -INFINITY;",
+            "float mine = FULL || lo + t < hi ? simd_shuffle(score, ushort((lane + 31u) & 31u)) : -INFINITY;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "attn_score_butterfly_half",
+        clause: "attn_f16",
+        why: "the butterfly's last step adds a lane's half to itself, not the other half's, so each score sums sixteen lanes twice",
+        edits: &[(
+            "float score = (sixteen + simd_shuffle_xor(sixteen, ushort(16))) * args.scale;",
+            "float score = (sixteen + sixteen) * args.scale;",
             1,
         )],
     },
@@ -2601,6 +2624,26 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[(
             "if (simd_shuffle(ls[r], ushort(c)) == 0.0f) {",
             "if (f == 0.0f) {",
+            1,
+        )],
+    },
+    Mutant {
+        name: "attn_fold_one_ticket",
+        clause: "attn_f16",
+        why: "the key heads arrive on one ticket word, so one key head folds at the segment count's arrival and the others' query heads are never written",
+        edits: &[(
+            "ticket_is_last(ticket + kv, args.segments, tid, last_flag);",
+            "ticket_is_last(ticket, args.segments, tid, last_flag);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "attn_fold_kv_heads",
+        clause: "attn_f16",
+        why: "every key head's fold folds key head 0's query heads, so the other key heads' outputs are never written",
+        edits: &[(
+            "h += BLOOMERY_ATTN_SG) {\n        uint head = kv * BLOOMERY_ATTN_GQA + h;",
+            "h += BLOOMERY_ATTN_SG) {\n        uint head = h;",
             1,
         )],
     },

@@ -16,9 +16,10 @@
 //
 // One segment is the flash alone: the epilogue normalizes, applies the gate
 // when the layer has one, and writes the output. More than one writes a
-// partial per segment, and the last threadgroup of the dispatch — the
-// ticket's — folds those partials, applies the gate and writes the output,
-// in the merge's arithmetic, then resets the ticket. There is no merge
+// partial per segment, and the last threadgroup of each key head — its ticket
+// word's — folds that key head's partials, applies the gate and writes its
+// query heads' output, in the merge's arithmetic, then resets the word. The
+// key heads fold at once, one query head a SIMD group. There is no merge
 // dispatch. The f16 cache's one segment is the one-pass flash instead
 // (attn_flash_one_f16, after the rows launches): a threadgroup a query head
 // over every key, described there.
@@ -36,12 +37,13 @@
 // nearest_int(v * id) with id = 127 / amax (0 when amax is 0 or id
 // overflows).
 //
-// The score is each lane's fmas in dim order, then the SIMD group's
-// built-in sum (at most 31 adds, whichever tree the language picks), then
-// the scale (exact at head 256, ik's f32 1/sqrt(head) otherwise), as the
-// band in the oracle derives. The softmax rescales once a 16-key tile; the
-// fold adds the segments' partials in ascending segment order. The value
-// sum is one fma a key in key order, per dim.
+// The score is each lane's fmas in dim order, then 31 adds across the lanes
+// (the segmented flash's xor butterfly, the one-pass flash's SIMD-group sum,
+// whichever tree the language picks for it), then the scale (exact at head
+// 256, ik's f32 1/sqrt(head) otherwise), as the band in the oracle derives.
+// The softmax rescales once a 16-key tile; the fold adds the segments'
+// partials in ascending segment order. The value sum is one fma a key in key
+// order, per dim.
 //
 // A tile holds no branch on a key's liveness: a key past the segment's end
 // is a zero row, scores -infinity and weighs exactly 0, so the tile's sixteen
@@ -53,7 +55,7 @@
 // row r's key and value at position from + r, by the same append the decode
 // flash runs, one SIMD group a (key head, row). gqa256_flash_f16_rows is the
 // decode flash with a row grid dimension: row r is the launch at position
-// from + r over from + r + 1 keys, with its own partials and ticket word, and
+// from + r over from + r + 1 keys, with its own partials and ticket words, and
 // it reads the rows the append dispatch wrote. A row is the bits of the decode
 // launch at its position with the same segment count; at one segment both are
 // the one-pass flash's.
@@ -700,16 +702,26 @@ static void attn_prepare_q(thread const AttnArgs &args,
 // Online softmax over this segment's keys, a tile of BLOOMERY_ATTN_TILE keys
 // at a time, each lane reading its word of every key and value row straight
 // from the cache, ATTN_WALK_AHEAD rows in flight. Lane t keeps the score of
-// the tile's key t, so the tile's weights are one exp a lane and its rescale
-// one exp; each weight reaches the value fmas by shuffle. The running max,
-// weight sum and values stay in registers. A key past the segment's live end
-// (`hi`) is a zero row: its score is -infinity and its weight exactly 0, so
-// the loop has no branch on a key and its dead fma adds an exact 0. A whole
-// tile (FULL) reads its rows with no test on a key.
+// the tile's key t & 15, so the tile's weights are one exp a lane and its
+// rescale one exp; each weight reaches the value fmas by shuffle. The running
+// max, weight sum and values stay in registers. A key past the segment's live
+// end (`hi`) is a zero row: its score is -infinity and its weight exactly 0,
+// so the loop has no branch on a key and its dead fma adds an exact 0. A
+// whole tile (FULL) reads its rows with no test on a key.
+//
+// The scores sum the lanes' partial dots by a halving butterfly, one shuffle
+// a key: the four rows in flight pair by lane bit 0 (xor 1), then bit 1
+// (xor 2), so lane l holds key 4g + (l & 3) of row group g summed over its
+// lane quad; the tile's four groups then pair by bit 2 (xor 4) and bit 3
+// (xor 8), and the two halves add across xor 16. Every key's sum is the same
+// xor tree over the 32 lanes, and lanes t and t + 16 end with key t's score;
+// a lane past the tile's sixteen weighs nothing, since lo + lane >= hi.
 #define ATTN_WALK_AHEAD 4u
 
 static_assert(BLOOMERY_ATTN_TILE <= BLOOMERY_ATTN_LANES, "a lane keeps one tile key's score");
 static_assert(BLOOMERY_ATTN_TILE % ATTN_WALK_AHEAD == 0u, "the rows in flight divide a tile");
+static_assert(BLOOMERY_ATTN_TILE == 16u && ATTN_WALK_AHEAD == 4u && BLOOMERY_ATTN_LANES == 32u,
+              "the score butterfly halves four rows, then four groups, over 32 lanes");
 
 template <typename Cache, bool FULL>
 static void attn_tile(Cache cache,
@@ -722,27 +734,37 @@ static void attn_tile(Cache cache,
                       thread float *running_m,
                       thread float *running_l,
                       thread float acc[BLOOMERY_ATTN_LANE_DIMS]) {
-    float mine = -INFINITY;
+    bool b0 = (lane & 1u) != 0u;
+    bool b1 = (lane & 2u) != 0u;
+    float quads[BLOOMERY_ATTN_TILE / ATTN_WALK_AHEAD];
     for (uint t0 = 0u; t0 < BLOOMERY_ATTN_TILE; t0 += ATTN_WALK_AHEAD) {
         typename Cache::Word words[ATTN_WALK_AHEAD];
         for (uint c = 0u; c < ATTN_WALK_AHEAD; ++c) {
             uint key = lo + t0 + c;
             words[c] = FULL || key < hi ? cache.key_word(row0 + key, lane) : Cache::zero();
         }
+        float part[ATTN_WALK_AHEAD];
         for (uint c = 0u; c < ATTN_WALK_AHEAD; ++c) {
-            uint t = t0 + c;
             float kvv[BLOOMERY_ATTN_LANE_DIMS];
             Cache::widen(words[c], kvv);
             float dot = 0.0f;
             for (uint d = 0u; d < BLOOMERY_ATTN_LANE_DIMS; ++d) {
                 dot = fma(qv[d], kvv[d], dot);
             }
-            dot = simd_sum(dot);
-            float score = dot * args.scale;
-            float scored = FULL || lo + t < hi ? score : -INFINITY;
-            mine = lane == t ? scored : mine;
+            part[c] = dot;
         }
+        float pair0 = (b0 ? part[1] : part[0]) + simd_shuffle_xor(b0 ? part[0] : part[1], ushort(1));
+        float pair1 = (b0 ? part[3] : part[2]) + simd_shuffle_xor(b0 ? part[2] : part[3], ushort(1));
+        quads[t0 / ATTN_WALK_AHEAD] = (b1 ? pair1 : pair0) + simd_shuffle_xor(b1 ? pair0 : pair1, ushort(2));
     }
+    bool b2 = (lane & 4u) != 0u;
+    bool b3 = (lane & 8u) != 0u;
+    float half0 = (b2 ? quads[1] : quads[0]) + simd_shuffle_xor(b2 ? quads[0] : quads[1], ushort(4));
+    float half1 = (b2 ? quads[3] : quads[2]) + simd_shuffle_xor(b2 ? quads[2] : quads[3], ushort(4));
+    float sixteen = (b3 ? half1 : half0) + simd_shuffle_xor(b3 ? half0 : half1, ushort(8));
+    float score = (sixteen + simd_shuffle_xor(sixteen, ushort(16))) * args.scale;
+    uint t = lane & (BLOOMERY_ATTN_TILE - 1u);
+    float mine = FULL || lo + t < hi ? score : -INFINITY;
     float new_m = max(*running_m, simd_max(mine));
     float old_m = *running_m;
     float factor = old_m > -INFINITY ? exp(old_m - new_m) : 0.0f;
@@ -872,10 +894,11 @@ static void attn_epilogue(thread const AttnArgs &args,
     }
 }
 
-// The merge, folded into the flash: the dispatch's last threadgroup folds
-// every head's segment partials, applies the gate when the layer has one and
-// writes the output, then resets the ticket. SIMD group g folds heads g,
-// g + SG, ... Lane s of the group holds slots s, s + 32, ... of the head's
+// The merge, folded into the flash: the last threadgroup of key head `kv`
+// folds the segment partials of that key head's query heads, applies the gate
+// when the layer has one and writes their output, then resets the key head's
+// ticket word. SIMD group g folds the key head's query heads g, g + SG, ...
+// Lane s of the group holds slots s, s + 32, ... of the head's
 // segments: the head's maximum M is the largest maximum of a segment that
 // holds weight, a segment's factor is exp(m - M) (0 for one that holds none)
 // and the weight sum is the group's sum of each weight sum times its factor.
@@ -899,12 +922,14 @@ static void attn_fold(device coherent(device) float *partials,
                       device float const *q,
                       device float *out,
                       device atomic_uint *faults,
-                      uint tid) {
+                      uint tid,
+                      uint kv) {
     ticket_acquire();
     uint sg = tid / BLOOMERY_ATTN_LANES;
     uint lane = tid % BLOOMERY_ATTN_LANES;
     uint fold_dim0 = lane * BLOOMERY_ATTN_LANE_DIMS;
-    for (uint head = sg; head < BLOOMERY_ATTN_Q; head += BLOOMERY_ATTN_SG) {
+    for (uint h = sg; h < BLOOMERY_ATTN_GQA; h += BLOOMERY_ATTN_SG) {
+        uint head = kv * BLOOMERY_ATTN_GQA + h;
         float ms[ATTN_FOLD_ROUNDS];
         float ls[ATTN_FOLD_ROUNDS];
         float big = -INFINITY;
@@ -1023,7 +1048,6 @@ static void attn_flash(Cache cache,
                        device float *out,
                        device atomic_uint *faults,
                        device atomic_uint *ticket,
-                       uint groups,
                        uint group,
                        uint tid,
                        threadgroup float *scratch,
@@ -1064,18 +1088,32 @@ static void attn_flash(Cache cache,
                       &running_l, acc);
     }
 
-    // Past one segment the last threadgroup folds the partials; the ticket
-    // is the dispatch's own, and the fold resets it for the next launch.
-    if (args.segments > 1u) {
-        ticket_is_last(ticket, groups, tid, last_flag);
+    // Past one segment the last threadgroup of each key head folds that key
+    // head's partials; `ticket` holds the launch's word a key head, and each
+    // fold resets its word for the next launch.
+    if (args.segments > 1u && active) {
+        ticket_is_last(ticket + kv, args.segments, tid, last_flag);
         if (last_flag == 1u) {
-            attn_fold(partials, ticket, args, ATTN_GATE_SRC, out, faults, tid);
+            attn_fold(partials, ticket + kv, args, ATTN_GATE_SRC, out, faults, tid, kv);
         }
     }
 }
 
+// A segmented flash at the segment cap launches KV x SEGMENT_CAP
+// threadgroups, KV a core on a GPU of SEGMENT_CAP cores. The kernel declares
+// KV threadgroups' threads its maximum, so the compiler keeps its registers
+// within what holds them resident together and the dispatch runs as one wave.
+// Past a threadgroup's thread limit (more than 32 query heads) no group size
+// holds them, and the kernel declares none: the compiler's own allocation.
+#if BLOOMERY_ATTN_THREADS * BLOOMERY_ATTN_KV <= 1024
+#define ATTN_FLASH_HOLD [[max_total_threads_per_threadgroup(BLOOMERY_ATTN_THREADS * BLOOMERY_ATTN_KV)]]
+#else
+#define ATTN_FLASH_HOLD
+#endif
+
 // The threadgroup's one shared block, in 16-byte words: the scratch the
 // append and the q prepare pair through.
+ATTN_FLASH_HOLD
 kernel void gqa256_flash_f16(device float const *q [[buffer(0)]],
                              device float const *k [[buffer(1)]],
                              device float const *v [[buffer(2)]],
@@ -1090,8 +1128,7 @@ kernel void gqa256_flash_f16(device float const *q [[buffer(0)]],
                              device atomic_uint *faults [[buffer(11)]],
                              device atomic_uint *ticket [[buffer(12)]],
                              uint tid [[thread_index_in_threadgroup]],
-                             uint3 group [[threadgroup_position_in_grid]],
-                             uint3 tpg [[threadgroups_per_grid]] ATTN_HGATE_PARAM(13)) {
+                             uint3 group [[threadgroup_position_in_grid]] ATTN_HGATE_PARAM(13)) {
     threadgroup uint4 shared[ATTN_SHARED_WORDS];
     threadgroup uint last_flag = 0u;
     AttnArgs args = launch;
@@ -1099,10 +1136,11 @@ kernel void gqa256_flash_f16(device float const *q [[buffer(0)]],
     cache.k = cache_k;
     cache.v = cache_v;
     attn_flash<F16Cache, true>(cache, args, q, k, v, q_gain, k_gain, rope,
-                               ATTN_HGATE_ACTUAL(0u) partials, out, faults, ticket, tpg.x,
-                               group.x, tid, (threadgroup float *)shared, last_flag);
+                               ATTN_HGATE_ACTUAL(0u) partials, out, faults, ticket, group.x,
+                               tid, (threadgroup float *)shared, last_flag);
 }
 
+ATTN_FLASH_HOLD
 kernel void gqa256_flash_q8(device float const *q [[buffer(0)]],
                             device float const *k [[buffer(1)]],
                             device float const *v [[buffer(2)]],
@@ -1119,8 +1157,7 @@ kernel void gqa256_flash_q8(device float const *q [[buffer(0)]],
                             device atomic_uint *faults [[buffer(13)]],
                             device atomic_uint *ticket [[buffer(14)]],
                             uint tid [[thread_index_in_threadgroup]],
-                            uint3 group [[threadgroup_position_in_grid]],
-                            uint3 tpg [[threadgroups_per_grid]] ATTN_HGATE_PARAM(15)) {
+                            uint3 group [[threadgroup_position_in_grid]] ATTN_HGATE_PARAM(15)) {
     threadgroup uint4 shared[ATTN_SHARED_WORDS];
     threadgroup uint last_flag = 0u;
     AttnArgs args = launch;
@@ -1130,8 +1167,8 @@ kernel void gqa256_flash_q8(device float const *q [[buffer(0)]],
     cache.v_codes = v_codes;
     cache.v_scales = v_scales;
     attn_flash<Q8Cache, true>(cache, args, q, k, v, q_gain, k_gain, rope,
-                              ATTN_HGATE_ACTUAL(0u) partials, out, faults, ticket, tpg.x,
-                              group.x, tid, (threadgroup float *)shared, last_flag);
+                              ATTN_HGATE_ACTUAL(0u) partials, out, faults, ticket, group.x,
+                              tid, (threadgroup float *)shared, last_flag);
 }
 
 // The append of a chunk of rows to the f16 cache: row r's key is normed and
@@ -1166,8 +1203,9 @@ kernel void attn_norm_rope_rows(device float const *k [[buffer(0)]],
 // The flash of a chunk of rows over the f16 cache: the decode flash with a
 // row grid dimension, row r at position from + r with from + r + 1 live keys,
 // each row the bits of the decode launch at its position. The grid is
-// (key heads x segments, rows); every row has its own partials and ticket
-// word.
+// (key heads x segments, rows); every row has its own partials and its own
+// ticket word a key head.
+ATTN_FLASH_HOLD
 kernel void gqa256_flash_f16_rows(device float const *q [[buffer(0)]],
                                   device float const *q_gain [[buffer(1)]],
                                   device float const *rope [[buffer(2)]],
@@ -1179,8 +1217,7 @@ kernel void gqa256_flash_f16_rows(device float const *q [[buffer(0)]],
                                   device atomic_uint *faults [[buffer(8)]],
                                   device atomic_uint *ticket [[buffer(9)]],
                                   uint tid [[thread_index_in_threadgroup]],
-                                  uint3 group [[threadgroup_position_in_grid]],
-                                  uint3 tpg [[threadgroups_per_grid]] ATTN_HGATE_PARAM(10)) {
+                                  uint3 group [[threadgroup_position_in_grid]] ATTN_HGATE_PARAM(10)) {
     threadgroup uint4 shared[ATTN_SHARED_WORDS];
     threadgroup uint last_flag = 0u;
     F16Cache cache;
@@ -1191,8 +1228,9 @@ kernel void gqa256_flash_f16_rows(device float const *q [[buffer(0)]],
     uint partials_stride = BLOOMERY_ATTN_Q * args.segments * BLOOMERY_ATTN_PARTIAL;
     attn_flash<F16Cache, false>(cache, a, q + row * args.q_stride, nullptr, nullptr, q_gain,
                                 nullptr, rope, ATTN_HGATE_ACTUAL(row) partials + row * partials_stride,
-                                out + row * args.out_stride, faults, ticket + row, tpg.x, group.x,
-                                tid, (threadgroup float *)shared, last_flag);
+                                out + row * args.out_stride, faults,
+                                ticket + row * BLOOMERY_ATTN_KV, group.x, tid,
+                                (threadgroup float *)shared, last_flag);
 }
 
 // The one-pass flash: the f16 launch of one segment. A threadgroup is one

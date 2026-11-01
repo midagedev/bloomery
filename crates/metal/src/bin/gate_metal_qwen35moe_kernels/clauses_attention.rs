@@ -541,7 +541,9 @@ fn launch(
     let (k_gain, _) = upload_f32(device, stream, &tables.k_gain)?;
     let (rope, _) = upload_f32(device, stream, &tables.rope[..scene.ctx * attn.rot])?;
     let mut partials = device.upload(stream, &vec![0f32; partial_n]).map_err(why)?;
-    let mut ticket = device.upload(stream, &[0u32]).map_err(why)?;
+    let mut ticket = device
+        .upload(stream, &vec![0u32; attn.kv_heads])
+        .map_err(why)?;
     let sentinel = f32::from_bits(SENTINEL_BITS);
     let out_host = super::padded(sentinel, OUT_GUARD, &vec![sentinel; out_n], OUT_GUARD);
     let mut out_buf = device.upload(stream, &out_host).map_err(why)?;
@@ -574,21 +576,20 @@ fn launch(
             partials: partials.window_mut(Elems(0), Elems(partial_n))?,
             out: out_buf.window_mut(Elems(OUT_GUARD), Elems(out_n))?,
             fault: device.fault_word(),
-            ticket: ticket.window_mut(Elems(0), Elems(1))?,
+            ticket: ticket.window_mut(Elems(0), Elems(attn.kv_heads))?,
         };
-        // One dispatch: past one segment its last threadgroup folds the
-        // partials and writes the gated output.
+        // One dispatch: past one segment the last threadgroup of each key
+        // head folds that key head's partials and writes its gated output.
         h.kernels.attention_flash(encoder, flash)?;
         Ok(())
     })?;
-    let mut ticket_back = [1u32; 1];
+    let mut ticket_back = vec![1u32; attn.kv_heads];
     device
         .read(stream, ticket.whole().map_err(why)?, &mut ticket_back)
         .map_err(why)?;
-    if ticket_back[0] != 0 {
+    if ticket_back.iter().any(|&t| t != 0) {
         return Err(format!(
-            "the fold's ticket reads back {}, not the zero it resets to",
-            ticket_back[0]
+            "the folds' tickets read back {ticket_back:?}, not the zeros they reset to"
         ));
     }
     let mut back = vec![0f32; out_host.len()];
@@ -1330,7 +1331,7 @@ struct Bounds {
 }
 
 /// The launch of one case: a head dim, a head count, a segment count, a cache
-/// width or the query window, one of them bad.
+/// width, the query window or the ticket window, one of them bad.
 #[derive(Clone, Copy)]
 struct Args {
     head_dim: usize,
@@ -1339,6 +1340,7 @@ struct Args {
     segments: usize,
     ctx: usize,
     q_window: usize,
+    ticket: usize,
 }
 
 impl Args {
@@ -1350,6 +1352,7 @@ impl Args {
             segments: 1,
             ctx: CTX,
             q_window,
+            ticket: attn.kv_heads,
         }
     }
 }
@@ -1394,7 +1397,7 @@ fn refuse(
             partials: b.partials.window_mut(Elems(0), Elems(partial_n))?,
             out: b.out.window_mut(Elems(0), Elems(out_n))?,
             fault: h.device.fault_word(),
-            ticket: b.ticket.window_mut(Elems(0), Elems(1))?,
+            ticket: b.ticket.window_mut(Elems(0), Elems(a.ticket))?,
         },
     )
 }
@@ -1451,7 +1454,9 @@ pub fn attn_bounds(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         v_cache: device
             .upload(stream, &vec![F16_HOLE; attn.f16_len(CTX).ok_or("cache")?])
             .map_err(why)?,
-        ticket: device.upload(stream, &[0u32]).map_err(why)?,
+        ticket: device
+            .upload(stream, &vec![0u32; attn.kv_heads])
+            .map_err(why)?,
     };
     let whole = Args::whole(&attn, q_n);
     let case = |what: &'static str, needle: &'static str, edit: Box<dyn FnOnce(&mut Args)>| {
@@ -1480,6 +1485,11 @@ pub fn attn_bounds(h: &Harness<'_>, fixture: &Fixture) -> Clause {
             Box::new(|a| a.segments = 0),
         ),
         case("a cache of no rows", "ctx", Box::new(|a| a.ctx = 0)),
+        case(
+            "a ticket window short of one word a key head",
+            "ticket window",
+            Box::new(|a| a.ticket -= 1),
+        ),
     ];
     let unchanged =
         |h: &Harness<'_>, b: &Bounds| common::still(h, &b.out, |v| v.to_bits() == SENTINEL_BITS);
@@ -1488,7 +1498,7 @@ pub fn attn_bounds(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     // its every output, so an unwritten word is red there.
     let checked = run(h, &tables, &scene_one(1, false))?;
     Ok(Verdict::Noted(format!(
-        "head dim, query heads, kv heads, window, segments and ctx refused, nothing written; S=1 worst ratio {:.4}",
+        "head dim, query heads, kv heads, window, segments, ctx and ticket window refused, nothing written; S=1 worst ratio {:.4}",
         checked.worst
     )))
 }

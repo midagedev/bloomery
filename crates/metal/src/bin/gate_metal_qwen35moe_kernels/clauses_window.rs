@@ -388,7 +388,9 @@ fn launch(
     let mut partials = device
         .upload(stream, &vec![0f32; rows * partial_n + 1])
         .map_err(why)?;
-    let mut ticket = device.upload(stream, &vec![0u32; rows]).map_err(why)?;
+    let mut ticket = device
+        .upload(stream, &vec![0u32; rows * attn.kv_heads])
+        .map_err(why)?;
     let out_host = super::padded(
         sentinel,
         OUT_GUARD,
@@ -422,7 +424,7 @@ fn launch(
                 partials: partials.window_mut(Elems(0), Elems(partial_n))?,
                 out: out_buf.window_mut(Elems(OUT_GUARD), Elems(out_n))?,
                 fault: device.fault_word(),
-                ticket: ticket.window_mut(Elems(0), Elems(1))?,
+                ticket: ticket.window_mut(Elems(0), Elems(attn.kv_heads))?,
             },
             AttnLayer {
                 window: case.window,
@@ -455,7 +457,7 @@ fn launch(
                 out: out_buf.window_mut(Elems(OUT_GUARD), Elems(rows * out_n))?,
                 out_stride: out_n,
                 fault: device.fault_word(),
-                ticket: ticket.window_mut(Elems(0), Elems(rows))?,
+                ticket: ticket.window_mut(Elems(0), Elems(rows * attn.kv_heads))?,
             },
             AttnLayer {
                 window: case.window,
@@ -486,7 +488,8 @@ fn launch(
                         partials: partials.window_mut(Elems(r * partial_n), Elems(partial_n))?,
                         out: out_buf.window_mut(Elems(OUT_GUARD + r * out_n), Elems(out_n))?,
                         fault: device.fault_word(),
-                        ticket: ticket.window_mut(Elems(r), Elems(1))?,
+                        ticket: ticket
+                            .window_mut(Elems(r * attn.kv_heads), Elems(attn.kv_heads))?,
                     },
                     AttnLayer {
                         window: case.window,
@@ -527,7 +530,7 @@ fn launch(
             },
         ),
     })?;
-    let mut tickets = vec![1u32; rows];
+    let mut tickets = vec![1u32; rows * attn.kv_heads];
     device
         .read(stream, ticket.whole().map_err(why)?, &mut tickets)
         .map_err(why)?;
@@ -1019,7 +1022,9 @@ pub fn attn_layer_refusals(h: &Harness<'_>) -> Clause {
     let gate_buf = up(&vec![0.5f32; heads + 1])?;
     let partial_n = attn.partials_len(1).ok_or("the partial length wraps")?;
     let mut partials = device.upload(stream, &vec![0f32; partial_n]).map_err(why)?;
-    let mut ticket = device.upload(stream, &[0u32]).map_err(why)?;
+    let mut ticket = device
+        .upload(stream, &vec![0u32; attn.kv_heads])
+        .map_err(why)?;
     let out_host = super::padded(sentinel, OUT_GUARD, &vec![sentinel; out_n], OUT_GUARD);
     let mut out_buf = device.upload(stream, &out_host).map_err(why)?;
     let mut uploaded = upload_cache(device, stream, &planted)?;
@@ -1100,7 +1105,7 @@ pub fn attn_layer_refusals(h: &Harness<'_>) -> Clause {
                 partials: partials.window_mut(Elems(0), Elems(partial_n))?,
                 out: out_buf.window_mut(Elems(OUT_GUARD), Elems(out_n))?,
                 fault: device.fault_word(),
-                ticket: ticket.window_mut(Elems(0), Elems(1))?,
+                ticket: ticket.window_mut(Elems(0), Elems(attn.kv_heads))?,
             };
             if plain {
                 return h.kernels.attention_flash(encoder, params);

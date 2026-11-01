@@ -155,7 +155,14 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "m_logits",
         why: "the attention score is the raw dot: the softmax over two or more keys is \
               sharper than the model's",
-        edits: &[("float score = dot * args.scale;", "float score = dot;", 2)],
+        edits: &[
+            ("float score = dot * args.scale;", "float score = dot;", 1),
+            (
+                "float score = (sixteen + simd_shuffle_xor(sixteen, ushort(16))) * args.scale;",
+                "float score = sixteen + simd_shuffle_xor(sixteen, ushort(16));",
+                1,
+            ),
+        ],
     },
     Mutant {
         name: "rope_key_row_zero",

@@ -34,7 +34,9 @@
 //! a,b,c` (segment counts timed at every key count, in place of the rule's),
 //! `--phase-arms lone|packed` (the phase arms' unit, default `lone`),
 //! `--no-phases` (skip the phase arms and the self-check), `--no-mlx` (skip
-//! MLX's kernels, `mlx.rs`), `--help`.
+//! MLX's kernels, `mlx.rs`), `--variants` (the source variants and the merge
+//! dispatch), `--help`. The shapes are the build's host instance's: its head,
+//! query and key heads, its rope width and whether its query carries a gate.
 
 use std::process::ExitCode;
 
@@ -47,8 +49,8 @@ use bloomery_metal::device::MetalDevice;
 use bloomery_metal::encode::{Binding, ComputeEncoder};
 use bloomery_metal::instance::HOST;
 use bloomery_metal::kernels::{
-    AttentionParams, AttnCache, KV_HEADS, Kernels, QUERY_HEADS, SCALE, f16_len, out_len,
-    partials_len, qg_len, segments_for_keys,
+    AttentionParams, AttnCache, HEAD_DIM, KV_HEADS, Kernels, QG_STRIDE, QUERY_HEADS, ROT, SCALE,
+    SEGMENT_CAP, f16_len, out_len, partials_len, qg_len, segments_for_keys,
 };
 use bloomery_metal::library::{Library, Pipeline, SOURCE};
 
@@ -61,6 +63,11 @@ use gpu_time::{Timed, WARMUPS, time_arm};
 
 /// The cache rows the probe holds: the largest key count it times.
 const CTX: u32 = 16384;
+
+/// The most segments the probe's buffers hold: the fold's one round of
+/// lanes. Past the host's [`SEGMENT_CAP`] only the source variants time, the
+/// shipped launch refusing the count.
+const PROBE_SEG_MAX: usize = 32;
 
 /// The bytes one timed command buffer's dispatches read, so every buffer
 /// moves about the same total.
@@ -361,7 +368,6 @@ static void probe_flash(Cache cache,
                         device float *out,
                         device atomic_uint *faults,
                         device atomic_uint *ticket,
-                        uint groups,
                         uint phase,
                         uint group,
                         uint tid,
@@ -413,20 +419,21 @@ static void probe_flash(Cache cache,
         }
     }
 
-    if (args.segments > 1u && (phase & PROBE_PHASE_NO_FOLD) == 0u) {
-        ticket_is_last(ticket, groups, tid, last_flag);
+    if (args.segments > 1u && active && (phase & PROBE_PHASE_NO_FOLD) == 0u) {
+        ticket_is_last(ticket + kv, args.segments, tid, last_flag);
         if (last_flag == 1u) {
             if ((phase & PROBE_PHASE_TICKET_ONLY) != 0u) {
                 if (tid == 0u) {
-                    ticket_reset(ticket);
+                    ticket_reset(ticket + kv);
                 }
             } else {
-                attn_fold(partials, ticket, args, q, out, faults, tid);
+                attn_fold(partials, ticket + kv, args, q, out, faults, tid, kv);
             }
         }
     }
 }
 
+ATTN_FLASH_HOLD
 kernel void probe_flash_f16(device float const *q [[buffer(0)]],
                             device float const *k [[buffer(1)]],
                             device float const *v [[buffer(2)]],
@@ -442,16 +449,64 @@ kernel void probe_flash_f16(device float const *q [[buffer(0)]],
                             device atomic_uint *ticket [[buffer(12)]],
                             constant AttnProbeArgs &probe [[buffer(13)]],
                             uint tid [[thread_index_in_threadgroup]],
-                            uint3 group [[threadgroup_position_in_grid]],
-                            uint3 tpg [[threadgroups_per_grid]]) {
+                            uint3 group [[threadgroup_position_in_grid]]) {
     threadgroup uint4 shared[ATTN_SHARED_WORDS];
     threadgroup uint last_flag = 0u;
     AttnArgs args = launch;
     F16Cache cache;
     cache.k = cache_k;
     cache.v = cache_v;
-    probe_flash(cache, args, q, k, v, q_gain, k_gain, rope, partials, out, faults, ticket, tpg.x,
+    probe_flash(cache, args, q, k, v, q_gain, k_gain, rope, partials, out, faults, ticket,
                 probe.phase, group.x, tid, (threadgroup float *)shared, last_flag);
+}
+
+// The fold as a dispatch of its own, after a flash whose fold is off (the
+// `nofold` variant): a threadgroup a query head, a thread a value of it, plain
+// loads (the dispatch boundary publishes the partials). Every thread reads
+// the head's segment maxima and weight sums; the values add by fma in
+// ascending segment order times exp(m - M). The packed gate is applied; an
+// instance that gates per head writes the ungated value (a timing arm).
+kernel void probe_merge_f16(device float const *q [[buffer(0)]],
+                            device float const *partials [[buffer(1)]],
+                            device float *out [[buffer(2)]],
+                            constant AttnArgs &args [[buffer(3)]],
+                            device atomic_uint *faults [[buffer(4)]],
+                            uint dim [[thread_index_in_threadgroup]],
+                            uint3 group [[threadgroup_position_in_grid]]) {
+    uint head = group.x;
+    float big = -INFINITY;
+    bool refused = false;
+    for (uint s = 0u; s < args.segments; ++s) {
+        uint base = (head * args.segments + s) * BLOOMERY_ATTN_PARTIAL;
+        float m = partials[base];
+        float l = partials[base + 1u];
+        if (isnan(m) || isnan(l)) {
+            refused = true;
+        } else if (l > 0.0f) {
+            big = max(big, m);
+        }
+    }
+    float l = 0.0f;
+    float acc = 0.0f;
+    for (uint s = 0u; s < args.segments; ++s) {
+        uint base = (head * args.segments + s) * BLOOMERY_ATTN_PARTIAL;
+        float ls = partials[base + 1u];
+        float f = !refused && ls > 0.0f ? exp(partials[base] - big) : 0.0f;
+        l = fma(ls, f, l);
+        acc = fma(partials[base + 2u + dim], f, acc);
+    }
+    uint o = head * BLOOMERY_ATTN_HEAD + dim;
+    if (refused || !(l > 0.0f) || !isfinite(big)) {
+        out[o] = NAN;
+        return;
+    }
+    float attn = acc * (1.0f / l);
+#if BLOOMERY_ATTN_GATED
+    float g = q[head * BLOOMERY_ATTN_QG + BLOOMERY_ATTN_HEAD + dim];
+    attn_commit(out, o, attn, g, attn * attn_sigmoid(g), faults, args.layer);
+#else
+    attn_commit_plain(out, o, attn);
+#endif
 }
 "#;
 
@@ -484,15 +539,16 @@ fn value(state: &mut u64, span: f32) -> f32 {
     (unit - 0.5) * 2.0 * span
 }
 
-/// The rope table, `ctx` rows of the interleaved cos/sin pairs of a base.
+/// The rope table, `ctx` rows of [`ROT`] values: the interleaved cos/sin
+/// pairs of a base.
 fn rope_rows(ctx: u32) -> Vec<f32> {
     let base = 10_000.0f64;
-    let mut out = vec![0f32; ctx as usize * 64];
+    let mut out = vec![0f32; ctx as usize * ROT];
     for pos in 0..ctx {
-        for i in 0..32 {
-            let exp = -(i as f64) * 2.0 / 64.0;
+        for i in 0..ROT / 2 {
+            let exp = -(i as f64) * 2.0 / ROT as f64;
             let theta = f64::from(pos) * base.powf(exp);
-            let at = pos as usize * 64 + 2 * i;
+            let at = pos as usize * ROT + 2 * i;
             out[at] = theta.cos() as f32;
             out[at + 1] = theta.sin() as f32;
         }
@@ -500,10 +556,10 @@ fn rope_rows(ctx: u32) -> Vec<f32> {
     out
 }
 
-/// The K/V bytes one flash dispatch reads: `keys` rows of K and V, both key
-/// heads, f16.
+/// The K/V bytes one flash dispatch reads: `keys` rows of K and V, every key
+/// head, f16.
 fn kv_bytes(keys: u32) -> u64 {
-    u64::from(keys) * 256 * 2 * 2 * KV_HEADS as u64
+    u64::from(keys) * HEAD_DIM as u64 * 2 * 2 * KV_HEADS as u64
 }
 
 /// The attention's launch parameters over the planted buffers.
@@ -523,7 +579,7 @@ fn params<'w>(
         detail: "the cache length wraps".to_string(),
     })?;
     Ok(AttentionParams {
-        head_dim: 256,
+        head_dim: HEAD_DIM,
         query_heads: QUERY_HEADS,
         kv_heads: KV_HEADS,
         segments,
@@ -534,11 +590,11 @@ fn params<'w>(
         n_keys: keys,
         q: b.q
             .window(Elems(0), Elems(qg_len().expect("the query length wraps")))?,
-        k: b.k.window(Elems(0), Elems(KV_HEADS * 256))?,
-        v: b.v.window(Elems(0), Elems(KV_HEADS * 256))?,
-        q_gain: b.q_gain.window(Elems(0), Elems(256))?,
-        k_gain: b.k_gain.window(Elems(0), Elems(256))?,
-        rope: b.rope.window(Elems(0), Elems(CTX as usize * 64))?,
+        k: b.k.window(Elems(0), Elems(KV_HEADS * HEAD_DIM))?,
+        v: b.v.window(Elems(0), Elems(KV_HEADS * HEAD_DIM))?,
+        q_gain: b.q_gain.window(Elems(0), Elems(HEAD_DIM))?,
+        k_gain: b.k_gain.window(Elems(0), Elems(HEAD_DIM))?,
+        rope: b.rope.window(Elems(0), Elems(CTX as usize * ROT))?,
         cache: AttnCache::F16 {
             k: b.cache_k.window_mut(Elems(0), Elems(cache_n))?,
             v: b.cache_v.window_mut(Elems(0), Elems(cache_n))?,
@@ -548,7 +604,7 @@ fn params<'w>(
             .out
             .window_mut(Elems(0), Elems(out_len().expect("the out length wraps")))?,
         fault,
-        ticket: b.ticket.window_mut(Elems(0), Elems(1))?,
+        ticket: b.ticket.window_mut(Elems(0), Elems(KV_HEADS))?,
     })
 }
 
@@ -582,17 +638,23 @@ fn encode_phase(
     encoder.set_binding(0, Binding::of(&b.q.window(Elems(0), Elems(qg))?)?)?;
     encoder.set_binding(
         1,
-        Binding::of(&b.k.window(Elems(0), Elems(KV_HEADS * 256))?)?,
+        Binding::of(&b.k.window(Elems(0), Elems(KV_HEADS * HEAD_DIM))?)?,
     )?;
     encoder.set_binding(
         2,
-        Binding::of(&b.v.window(Elems(0), Elems(KV_HEADS * 256))?)?,
+        Binding::of(&b.v.window(Elems(0), Elems(KV_HEADS * HEAD_DIM))?)?,
     )?;
-    encoder.set_binding(3, Binding::of(&b.q_gain.window(Elems(0), Elems(256))?)?)?;
-    encoder.set_binding(4, Binding::of(&b.k_gain.window(Elems(0), Elems(256))?)?)?;
+    encoder.set_binding(
+        3,
+        Binding::of(&b.q_gain.window(Elems(0), Elems(HEAD_DIM))?)?,
+    )?;
+    encoder.set_binding(
+        4,
+        Binding::of(&b.k_gain.window(Elems(0), Elems(HEAD_DIM))?)?,
+    )?;
     encoder.set_binding(
         5,
-        Binding::of(&b.rope.window(Elems(0), Elems(CTX as usize * 64))?)?,
+        Binding::of(&b.rope.window(Elems(0), Elems(CTX as usize * ROT))?)?,
     )?;
     encoder.set_binding(
         6,
@@ -612,9 +674,10 @@ fn encode_phase(
     )?;
     encoder.set_binding(10, Binding::bytes(&words)?)?;
     encoder.set_binding(11, fault.binding())?;
+    // Every key head's ticket word: each key head's fold reads its own.
     encoder.set_binding(
         12,
-        Binding::of_mut(&b.ticket.window_mut(Elems(0), Elems(1))?)?,
+        Binding::of_mut(&b.ticket.window_mut(Elems(0), Elems(KV_HEADS))?)?,
     )?;
     encoder.set_binding(13, Binding::bytes(&probe)?)?;
     encoder.dispatch_groups(KV_HEADS * segments, 1, FLASH_THREADS)
@@ -653,12 +716,14 @@ us_min, us_p90, kv_bytes, gbps.
   --trials N    timed command buffers per arm (default 16; `lone` takes twice)
   --keys LIST   comma-separated key counts (default 100,512,1024,4096)
   --segs LIST   comma-separated segment counts timed at every key count, in place of the rule's
+                (at most 32; past the host's cap only the variants time)
   --phase-arms U  the phase arms' unit: `lone` (default), one dispatch to a command buffer like
                 the shipped `lone` arm, or `packed`, many dispatches to a buffer like the shipped
                 `packed` arm
   --no-phases   skip the phase arms and the self-check they need
   --no-mlx      skip MLX's kernels (sdpa_vector and its two passes) on the same cache
-  --variants    time the segmented flash of each source variant (VARIANTS) at every split scene"
+  --variants    time the segmented flash of each source variant (VARIANTS) at every split scene,
+                and the fold as a merge dispatch after the `nofold` variant"
     );
 }
 
@@ -755,8 +820,10 @@ fn parse(args: &[String]) -> Result<Run, String> {
                         let n: usize = tok
                             .parse()
                             .map_err(|_| format!("--segs takes segment counts, not {tok:?}"))?;
-                        if n == 0 || n > bloomery_metal::kernels::SEGMENT_CAP {
-                            return Err(format!("a segment count of {n} is not 1..=the cap"));
+                        if n == 0 || n > PROBE_SEG_MAX {
+                            return Err(format!(
+                                "a segment count of {n} is not 1..={PROBE_SEG_MAX}"
+                            ));
                         }
                         Ok(n)
                     })
@@ -855,24 +922,26 @@ fn timed(
         run.phase_unit.name(),
     );
 
-    // The planted buffers: a query with finite gates, one K and V row per
-    // key head, gains of one, the rope table, and a cache of small
-    // deterministic f16 rows.
+    // The planted buffers: a query (with finite gates when the instance's
+    // query carries them), one K and V row per key head, gains of one, the
+    // rope table, and a cache of small deterministic f16 rows.
     let mut state = 0x6B70_726F_6265u64;
     let qg = qg_len().expect("the query length wraps");
     let mut q_host = (0..qg).map(|_| value(&mut state, 0.5)).collect::<Vec<_>>();
-    for head in 0..QUERY_HEADS {
-        for dim in 0..256 {
-            q_host[head * 512 + 256 + dim] = value(&mut state, 2.0);
+    if QG_STRIDE == 2 * HEAD_DIM {
+        for head in 0..QUERY_HEADS {
+            for dim in 0..HEAD_DIM {
+                q_host[head * QG_STRIDE + HEAD_DIM + dim] = value(&mut state, 2.0);
+            }
         }
     }
-    let k_host = (0..KV_HEADS * 256)
+    let k_host = (0..KV_HEADS * HEAD_DIM)
         .map(|_| value(&mut state, 0.5))
         .collect::<Vec<_>>();
-    let v_host = (0..KV_HEADS * 256)
+    let v_host = (0..KV_HEADS * HEAD_DIM)
         .map(|_| value(&mut state, 0.5))
         .collect::<Vec<_>>();
-    let gain_host = vec![1.0f32; 256];
+    let gain_host = vec![1.0f32; HEAD_DIM];
     let mut cache_host = vec![0u16; f16_len(CTX as usize).expect("the cache length wraps")];
     {
         let mut cstate = 0x6B63_6163_6865u64;
@@ -880,8 +949,7 @@ fn timed(
             *word = gguf::quant::f32_to_f16_bits(value(&mut cstate, 0.1));
         }
     }
-    let partials_host =
-        vec![0f32; partials_len(bloomery_metal::kernels::SEGMENT_CAP).expect("fits")];
+    let partials_host = vec![0f32; partials_len(PROBE_SEG_MAX).expect("fits")];
     let out_host = vec![0f32; out_len().expect("the out length wraps")];
     let upload = |host: &[f32]| -> Result<MetalBuffer<f32>, String> {
         device.upload(stream, host).map_err(why)
@@ -897,7 +965,7 @@ fn timed(
         cache_v: device.upload(stream, &cache_host).map_err(why)?,
         partials: upload(&partials_host)?,
         out: upload(&out_host)?,
-        ticket: device.upload(stream, &[0u32]).map_err(why)?,
+        ticket: device.upload(stream, &[0u32; KV_HEADS]).map_err(why)?,
     };
     device.fault_word().clear(stream).map_err(why)?;
 
@@ -940,7 +1008,7 @@ fn timed(
     let variants = if run.variants {
         variant_pipelines(device)?
     } else {
-        Vec::new()
+        Variants::default()
     };
     let mut mlx_timed: Vec<u32> = Vec::new();
     let scenes: Vec<(u32, usize)> = run
@@ -976,9 +1044,15 @@ fn timed(
         // The production flash: many dispatches in one buffer, then one per
         // buffer. The phase arms divide by the one of their own unit.
         let mut shipped_us = None;
-        for (name, arm_dispatches, arm_trials) in
-            [("packed", packed, run.trials), ("lone", 1, 2 * run.trials)]
-        {
+        let shipped_arms = if segments <= SEGMENT_CAP {
+            vec![("packed", packed, run.trials), ("lone", 1, 2 * run.trials)]
+        } else {
+            println!(
+                "attn\tkernel={shipped}\tkeys={keys}\tskipped=segments of {segments} past the host's {SEGMENT_CAP}"
+            );
+            Vec::new()
+        };
+        for (name, arm_dispatches, arm_trials) in shipped_arms {
             match time_arm(device, stream, arm_dispatches, arm_trials, |encoder, _| {
                 let p = params(&mut bufs, segments, pos, keys, device.fault_word())?;
                 kernels.attention_flash(encoder, p)
@@ -1002,9 +1076,15 @@ fn timed(
             failed |= mlx_arms(device, stream, &mut bufs, m, keys, packed, run.trials);
         }
         if segments > 1 {
-            for (name, pipeline) in &variants {
+            for (name, pipeline) in &variants.flash {
                 failed |= variant_arm(
                     device, stream, &mut bufs, kernels, name, pipeline, keys, segments, &args,
+                    packed, run.trials,
+                );
+            }
+            if let Some((nofold, merge)) = variants.merge() {
+                failed |= merge_arms(
+                    device, stream, &mut bufs, kernels, nofold, merge, keys, segments, &args,
                     packed, run.trials,
                 );
             }
@@ -1073,12 +1153,12 @@ fn clear_scratch(
     stream: &MetalStream,
     bufs: &mut Bufs,
 ) -> Result<(), String> {
-    let parts = partials_len(bloomery_metal::kernels::SEGMENT_CAP).expect("the partials fit");
+    let parts = partials_len(PROBE_SEG_MAX).expect("the partials fit");
     bufs.partials = device.zeroed::<f32>(stream, Elems(parts)).map_err(why)?;
     bufs.out = device
         .zeroed::<f32>(stream, Elems(out_len().expect("the out length wraps")))
         .map_err(why)?;
-    bufs.ticket = device.zeroed::<u32>(stream, Elems(1)).map_err(why)?;
+    bufs.ticket = device.zeroed::<u32>(stream, Elems(KV_HEADS)).map_err(why)?;
     Ok(())
 }
 
@@ -1139,7 +1219,7 @@ fn self_check(
     let segments = CHECK_SEGMENTS;
     let args = args_words(segments as u32, pos, keys);
     let out_n = out_len().expect("the out length wraps");
-    let parts_all = partials_len(bloomery_metal::kernels::SEGMENT_CAP).expect("the partials fit");
+    let parts_all = partials_len(PROBE_SEG_MAX).expect("the partials fit");
     let parts_used = partials_len(segments).ok_or("the self-check partials do not fit")?;
     // The floats of one (head, segment) partial: the max, the weight sum and
     // the head's values.
@@ -1360,68 +1440,181 @@ fn phase_arms(
 }
 
 /// Source edits timed against the shipped segmented flash: each is the shipped
-/// source with every occurrence of its finds replaced, compiled as a library of
-/// its own, its `gqa256_flash_f16` launched with the shipped bindings. A
-/// development-loop instrument: a variant is a question about one term.
+/// source with each of its finds replaced (a find must stand exactly once in
+/// the probe's text), compiled as a library of its own, its `gqa256_flash_f16`
+/// launched with the shipped bindings. A development-loop instrument: a
+/// variant is a question about one term.
+///
+/// - `nofold`: no ticket and no fold; the partials are written and left.
+/// - `onefold`: one ticket word for the launch; its last threadgroup folds
+///   every key head's query heads, the key heads one after another.
+/// - `nobf`: each key's score summed by the SIMD-group sum, not the tile's
+///   butterfly; lane t keeps tile key t's score.
+/// - `noattr`: the flash declares no maximum threads, so the compiler picks
+///   its registers (and the threadgroups a core holds) alone.
+/// - `vpre`: the value phase's first rows issued before the tile's softmax.
+/// - `interleave`: segment s walks tiles s, s + S, ... of the keys.
 const VARIANTS: &[(&str, &[(&str, &str)])] = &[
-    (
-        "ahead2",
-        &[("#define ATTN_WALK_AHEAD 4u", "#define ATTN_WALK_AHEAD 2u")],
-    ),
-    (
-        "ahead8",
-        &[("#define ATTN_WALK_AHEAD 4u", "#define ATTN_WALK_AHEAD 8u")],
-    ),
-    (
-        "fastexp",
-        &[
-            (
-                "? exp(old_m - new_m) : 0.0f;",
-                "? fast::exp(old_m - new_m) : 0.0f;",
-            ),
-            (
-                "? exp(mine - new_m) : 0.0f;",
-                "? fast::exp(mine - new_m) : 0.0f;",
-            ),
-        ],
-    ),
-    (
-        "unguarded",
-        &[
-            (
-                "words[c] = FULL || key < hi ? cache.key_word(row0 + key, lane) : Cache::zero();",
-                "words[c] = cache.key_word(row0 + key, lane);",
-            ),
-            (
-                "words[c] = FULL || key < hi ? cache.value_word(row0 + key, lane) : Cache::zero();",
-                "words[c] = cache.value_word(row0 + key, lane);",
-            ),
-        ],
-    ),
-    (
-        "noprep",
-        &[(
-            "attn_prepare_q(args, q, q_gain, rope, ok, kv, sg, lane, scratch, qv);",
-            "for (uint d = 0u; d < BLOOMERY_ATTN_LANE_DIMS; ++d) { qv[d] = q[(kv * BLOOMERY_ATTN_GQA + sg) * BLOOMERY_ATTN_QG + lane * BLOOMERY_ATTN_LANE_DIMS + d]; }",
-        )],
-    ),
     (
         "nofold",
         &[(
-            "if (args.segments > 1u) {\n        ticket_is_last(ticket, groups, tid, last_flag);",
-            "if (false) {\n        ticket_is_last(ticket, groups, tid, last_flag);",
+            "if (args.segments > 1u && active) {\n        ticket_is_last(ticket + kv, args.segments, tid, last_flag);",
+            "if (false) {\n        ticket_is_last(ticket + kv, args.segments, tid, last_flag);",
         )],
+    ),
+    (
+        "onefold",
+        &[(
+            "    if (args.segments > 1u && active) {\n        ticket_is_last(ticket + kv, args.segments, tid, last_flag);\n        if (last_flag == 1u) {\n            attn_fold(partials, ticket + kv, args, ATTN_GATE_SRC, out, faults, tid, kv);\n        }",
+            "    if (args.segments > 1u) {\n        ticket_is_last(ticket, BLOOMERY_ATTN_KV * args.segments, tid, last_flag);\n        if (last_flag == 1u) {\n            for (uint f = 0u; f < BLOOMERY_ATTN_KV; ++f) {\n                attn_fold(partials, ticket, args, ATTN_GATE_SRC, out, faults, tid, f);\n            }\n        }",
+        )],
+    ),
+    (
+        "nobf",
+        &[(
+            "    bool b0 = (lane & 1u) != 0u;
+    bool b1 = (lane & 2u) != 0u;
+    float quads[BLOOMERY_ATTN_TILE / ATTN_WALK_AHEAD];
+    for (uint t0 = 0u; t0 < BLOOMERY_ATTN_TILE; t0 += ATTN_WALK_AHEAD) {
+        typename Cache::Word words[ATTN_WALK_AHEAD];
+        for (uint c = 0u; c < ATTN_WALK_AHEAD; ++c) {
+            uint key = lo + t0 + c;
+            words[c] = FULL || key < hi ? cache.key_word(row0 + key, lane) : Cache::zero();
+        }
+        float part[ATTN_WALK_AHEAD];
+        for (uint c = 0u; c < ATTN_WALK_AHEAD; ++c) {
+            float kvv[BLOOMERY_ATTN_LANE_DIMS];
+            Cache::widen(words[c], kvv);
+            float dot = 0.0f;
+            for (uint d = 0u; d < BLOOMERY_ATTN_LANE_DIMS; ++d) {
+                dot = fma(qv[d], kvv[d], dot);
+            }
+            part[c] = dot;
+        }
+        float pair0 = (b0 ? part[1] : part[0]) + simd_shuffle_xor(b0 ? part[0] : part[1], ushort(1));
+        float pair1 = (b0 ? part[3] : part[2]) + simd_shuffle_xor(b0 ? part[2] : part[3], ushort(1));
+        quads[t0 / ATTN_WALK_AHEAD] = (b1 ? pair1 : pair0) + simd_shuffle_xor(b1 ? pair0 : pair1, ushort(2));
+    }
+    bool b2 = (lane & 4u) != 0u;
+    bool b3 = (lane & 8u) != 0u;
+    float half0 = (b2 ? quads[1] : quads[0]) + simd_shuffle_xor(b2 ? quads[0] : quads[1], ushort(4));
+    float half1 = (b2 ? quads[3] : quads[2]) + simd_shuffle_xor(b2 ? quads[2] : quads[3], ushort(4));
+    float sixteen = (b3 ? half1 : half0) + simd_shuffle_xor(b3 ? half0 : half1, ushort(8));
+    float score = (sixteen + simd_shuffle_xor(sixteen, ushort(16))) * args.scale;
+    uint t = lane & (BLOOMERY_ATTN_TILE - 1u);
+    float mine = FULL || lo + t < hi ? score : -INFINITY;
+",
+            "    float mine = -INFINITY;
+    for (uint t0 = 0u; t0 < BLOOMERY_ATTN_TILE; t0 += ATTN_WALK_AHEAD) {
+        typename Cache::Word words[ATTN_WALK_AHEAD];
+        for (uint c = 0u; c < ATTN_WALK_AHEAD; ++c) {
+            uint key = lo + t0 + c;
+            words[c] = FULL || key < hi ? cache.key_word(row0 + key, lane) : Cache::zero();
+        }
+        for (uint c = 0u; c < ATTN_WALK_AHEAD; ++c) {
+            uint t = t0 + c;
+            float kvv[BLOOMERY_ATTN_LANE_DIMS];
+            Cache::widen(words[c], kvv);
+            float dot = 0.0f;
+            for (uint d = 0u; d < BLOOMERY_ATTN_LANE_DIMS; ++d) {
+                dot = fma(qv[d], kvv[d], dot);
+            }
+            dot = simd_sum(dot);
+            float score = dot * args.scale;
+            float scored = FULL || lo + t < hi ? score : -INFINITY;
+            mine = lane == t ? scored : mine;
+        }
+    }
+",
+        )],
+    ),
+    (
+        "noattr",
+        &[(
+            "#define ATTN_FLASH_HOLD [[max_total_threads_per_threadgroup(BLOOMERY_ATTN_THREADS * BLOOMERY_ATTN_KV)]]",
+            "#define ATTN_FLASH_HOLD",
+        )],
+    ),
+    (
+        "vpre",
+        &[
+            (
+                "    float new_m = max(*running_m, simd_max(mine));\n    float old_m = *running_m;",
+                "    typename Cache::Word vfirst[ATTN_WALK_AHEAD];\n    for (uint c = 0u; c < ATTN_WALK_AHEAD; ++c) {\n        uint key = lo + c;\n        vfirst[c] = FULL || key < hi ? cache.value_word(row0 + key, lane) : Cache::zero();\n    }\n    float new_m = max(*running_m, simd_max(mine));\n    float old_m = *running_m;",
+            ),
+            (
+                "            words[c] = FULL || key < hi ? cache.value_word(row0 + key, lane) : Cache::zero();",
+                "            words[c] = t0 == 0u ? vfirst[c] : (FULL || key < hi ? cache.value_word(row0 + key, lane) : Cache::zero());",
+            ),
+        ],
+    ),
+    (
+        "interleave",
+        &[
+            (
+                "    bool owns = ok && args.pos < args.keys && args.pos / span == seg;",
+                "    bool owns = ok && args.pos < args.keys && (args.pos / BLOOMERY_ATTN_TILE) % args.segments == seg;",
+            ),
+            (
+                "    uint lo0 = seg * span;\n    uint seg_hi = min((seg + 1u) * span, max_live);\n#endif\n    uint row0 = kv * args.ctx;\n    for (uint lo = lo0; lo < seg_hi; lo += BLOOMERY_ATTN_TILE) {",
+                "    uint lo0 = seg * BLOOMERY_ATTN_TILE;\n    uint seg_hi = max_live;\n#endif\n    uint row0 = kv * args.ctx;\n    for (uint lo = lo0; lo < seg_hi; lo += args.segments * BLOOMERY_ATTN_TILE) {",
+            ),
+        ],
     ),
 ];
 
-/// Each variant's `gqa256_flash_f16` pipeline, with its resource row.
-fn variant_pipelines(device: &MetalDevice) -> Result<Vec<(&'static str, Pipeline)>, String> {
-    let mut out = Vec::new();
-    for &(name, edits) in VARIANTS {
+/// Variants made of other variants' edits, applied in the order named.
+const COMBOS: &[(&str, &[&str])] = &[
+    ("nobf_noattr", &["nobf", "noattr"]),
+    ("before", &["onefold", "nobf", "noattr"]),
+];
+
+/// The variants' pipelines, and the merge dispatch the `nofold` variant pairs
+/// with.
+#[derive(Default)]
+struct Variants {
+    flash: Vec<(&'static str, Pipeline)>,
+    merge: Option<Pipeline>,
+}
+
+impl Variants {
+    /// The `nofold` flash and the merge it pairs with, when both were built.
+    fn merge(&self) -> Option<(&Pipeline, &Pipeline)> {
+        let nofold = self
+            .flash
+            .iter()
+            .find_map(|(n, p)| (*n == "nofold").then_some(p))?;
+        Some((nofold, self.merge.as_ref()?))
+    }
+}
+
+/// Each variant's `gqa256_flash_f16` pipeline, with its resource row, and the
+/// probe's merge kernel.
+fn variant_pipelines(device: &MetalDevice) -> Result<Variants, String> {
+    let mut out = Variants::default();
+    let mut all: Vec<(&str, Vec<(&str, &str)>)> = VARIANTS
+        .iter()
+        .map(|&(name, edits)| (name, edits.to_vec()))
+        .collect();
+    for &(name, parts) in COMBOS {
+        let mut edits = Vec::new();
+        for part in parts {
+            let (_, e) = VARIANTS
+                .iter()
+                .find(|(n, _)| n == part)
+                .ok_or_else(|| format!("combo {name}: no variant named {part}"))?;
+            edits.extend_from_slice(e);
+        }
+        all.push((name, edits));
+    }
+    for (name, edits) in all {
         let mut text = probe_source();
-        for &(find, replace) in edits {
-            if !text.contains(find) {
-                return Err(format!("variant {name}: the source has no {find:?}"));
+        for &(find, replace) in &edits {
+            let hits = text.matches(find).count();
+            if hits != 1 {
+                return Err(format!(
+                    "variant {name}: the source holds {hits} of {find:?}, not one"
+                ));
             }
             text = text.replace(find, replace);
         }
@@ -1433,13 +1626,16 @@ fn variant_pipelines(device: &MetalDevice) -> Result<Vec<(&'static str, Pipeline
             pipeline.execution_width(),
             pipeline.static_group_bytes()
         );
-        out.push((name, pipeline));
+        out.flash.push((name, pipeline));
     }
+    let library = Library::from_source_text(device, &probe_source()).map_err(why)?;
+    out.merge = Some(library.pipeline("probe_merge_f16").map_err(why)?);
     Ok(out)
 }
 
 /// One variant at one split scene: its output against the shipped flash's
-/// (the largest difference), then its packed time.
+/// (the largest difference; skipped past the host's segment cap, where the
+/// shipped launch refuses), then its packed time.
 #[allow(clippy::too_many_arguments)]
 fn variant_arm(
     device: &MetalDevice,
@@ -1457,7 +1653,10 @@ fn variant_arm(
     let pos = keys - 1;
     let out_n = out_len().expect("the out length wraps");
     let fault = device.fault_word();
-    let compared = (|| -> Result<f32, String> {
+    let compared = (|| -> Result<Option<f32>, String> {
+        if segments > SEGMENT_CAP {
+            return Ok(None);
+        }
         clear_scratch(device, stream, bufs)?;
         dispatch_once(stream, |encoder| {
             let p = params(bufs, segments, pos, keys, fault)?;
@@ -1469,18 +1668,21 @@ fn variant_arm(
             encode_phase(encoder, pipeline, bufs, fault, args, 0, segments)
         })?;
         let got = read_f32(device, stream, &bufs.out, out_n)?;
-        Ok(shipped
-            .iter()
-            .zip(&got)
-            .fold(0f32, |a, (x, y)| a.max((x - y).abs())))
+        Ok(Some(
+            shipped
+                .iter()
+                .zip(&got)
+                .fold(0f32, |a, (x, y)| a.max((x - y).abs())),
+        ))
     })();
     let timed = time_arm(device, stream, packed, trials, |encoder, _| {
         encode_phase(encoder, pipeline, bufs, fault, args, 0, segments)
     });
     match (compared, timed) {
         (Ok(diff), Ok(t)) => {
+            let diff = diff.map_or_else(|| "skipped".to_string(), |d| format!("{d:e}"));
             println!(
-                "variant\tname={name}\tkeys={keys}\tsegments={segments}\tmax_diff_vs_shipped={diff:e}"
+                "variant\tname={name}\tkeys={keys}\tsegments={segments}\tmax_diff_vs_shipped={diff}"
             );
             print_row(&format!("var_{name}"), keys, "packed", packed, &t);
             false
@@ -1490,6 +1692,116 @@ fn variant_arm(
             true
         }
     }
+}
+
+/// The probe's merge dispatch over the partials a flash left: a threadgroup
+/// a query head, a thread a value.
+fn encode_merge(
+    encoder: &mut ComputeEncoder<'_>,
+    merge: &Pipeline,
+    b: &mut Bufs,
+    fault: &bloomery_metal::fault::MetalFaultWord,
+    args: &[[u8; 4]; 7],
+    segments: usize,
+) -> Result<(), DeviceError> {
+    let qg = qg_len().expect("the query length wraps");
+    let parts = partials_len(segments).ok_or_else(|| DeviceError::Range {
+        what: "attention",
+        detail: format!("the partials of {segments} segments do not fit"),
+    })?;
+    let out_n = out_len().expect("the out length wraps");
+    let words: Vec<u8> = args.iter().flatten().copied().collect();
+    encoder.set_pipeline(merge);
+    encoder.set_binding(0, Binding::of(&b.q.window(Elems(0), Elems(qg))?)?)?;
+    encoder.set_binding(1, Binding::of(&b.partials.window(Elems(0), Elems(parts))?)?)?;
+    encoder.set_binding(
+        2,
+        Binding::of_mut(&b.out.window_mut(Elems(0), Elems(out_n))?)?,
+    )?;
+    encoder.set_binding(3, Binding::bytes(&words)?)?;
+    encoder.set_binding(4, fault.binding())?;
+    encoder.dispatch_groups(QUERY_HEADS, 1, HEAD_DIM)
+}
+
+/// The fold priced as a dispatch of its own: the `nofold` flash then the
+/// merge behind a barrier (`merge_pair`, its output against the shipped
+/// flash's), and the merge alone over the partials the pair left. Whether an
+/// arm failed.
+#[allow(clippy::too_many_arguments)]
+fn merge_arms(
+    device: &MetalDevice,
+    stream: &MetalStream,
+    bufs: &mut Bufs,
+    kernels: &Kernels,
+    nofold: &Pipeline,
+    merge: &Pipeline,
+    keys: u32,
+    segments: usize,
+    args: &[[u8; 4]; 7],
+    packed: usize,
+    trials: usize,
+) -> bool {
+    let pos = keys - 1;
+    let out_n = out_len().expect("the out length wraps");
+    let fault = device.fault_word();
+    let compared = (|| -> Result<String, String> {
+        let shipped = if segments <= SEGMENT_CAP {
+            clear_scratch(device, stream, bufs)?;
+            dispatch_once(stream, |encoder| {
+                let p = params(bufs, segments, pos, keys, fault)?;
+                kernels.attention_flash(encoder, p)
+            })?;
+            Some(read_f32(device, stream, &bufs.out, out_n)?)
+        } else {
+            None
+        };
+        clear_scratch(device, stream, bufs)?;
+        dispatch_once(stream, |encoder| {
+            encode_phase(encoder, nofold, bufs, fault, args, 0, segments)?;
+            encoder.memory_barrier();
+            encode_merge(encoder, merge, bufs, fault, args, segments)
+        })?;
+        let got = read_f32(device, stream, &bufs.out, out_n)?;
+        if got.iter().any(|x| !x.is_finite()) {
+            return Err("the merge wrote a value that is not finite".to_string());
+        }
+        Ok(shipped.map_or_else(
+            || "skipped".to_string(),
+            |shipped| {
+                let d = shipped
+                    .iter()
+                    .zip(&got)
+                    .fold(0f32, |a, (x, y)| a.max((x - y).abs()));
+                format!("{d:e}")
+            },
+        ))
+    })();
+    match compared {
+        Ok(diff) => println!(
+            "variant\tname=merge_pair\tkeys={keys}\tsegments={segments}\tmax_diff_vs_shipped={diff}"
+        ),
+        Err(e) => {
+            println!("attn\tkernel=merge_pair\tkeys={keys}\tarm=packed\tFAIL\t{e}");
+            return true;
+        }
+    }
+    let mut failed = false;
+    for (name, with_flash) in [("merge_pair", true), ("merge_alone", false)] {
+        match time_arm(device, stream, packed, trials, |encoder, _| {
+            if with_flash {
+                encode_phase(encoder, nofold, bufs, fault, args, 0, segments)?;
+                encoder.memory_barrier();
+            }
+            encode_merge(encoder, merge, bufs, fault, args, segments)
+        }) {
+            Ok(t) => print_row(name, keys, "packed", packed, &t),
+            Err(e) => {
+                println!("attn\tkernel={name}\tkeys={keys}\tarm=packed\tFAIL\t{e}");
+                failed = true;
+            }
+        }
+    }
+    failed
 }
 
 /// Every flash pipeline's resource figures, as Metal reports them: the most
@@ -1536,7 +1848,7 @@ fn mlx_launch(bufs: &mut Bufs, keys: u32) -> mlx::MlxLaunch<'_> {
         keys,
         ctx: CTX,
         scale: SCALE,
-        head: 256,
+        head: HEAD_DIM,
     }
 }
 
@@ -1559,10 +1871,10 @@ fn mlx_setup(
             .map(|&name| Ok((name, library.pipeline(name).map_err(why)?)))
             .collect::<Result<_, String>>()?,
     };
-    let mut m = mlx::MlxBufs::new(device, stream, 256)?;
+    let mut m = mlx::MlxBufs::new(device, stream, HEAD_DIM)?;
     let keys = CHECK_KEYS;
     let blocks = mlx::blocks_g13s(keys, QUERY_HEADS / KV_HEADS);
-    let out_n = QUERY_HEADS * 256;
+    let out_n = QUERY_HEADS * HEAD_DIM;
     dispatch_once(stream, |encoder| {
         mlx::encode_vec(encoder, &pipes, &mut mlx_launch(bufs, keys), &mut m)
     })?;

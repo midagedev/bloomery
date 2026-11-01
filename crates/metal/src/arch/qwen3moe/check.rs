@@ -1700,7 +1700,7 @@ impl Checked {
             geom.delta.partials_stride,
             g.attn_out,
             g.attn_partials,
-            1,
+            geom.attn.kv_heads,
             geom.experts.slots * geom.experts.k,
             g.vocab,
             super::arena::RECORD_SLOTS,
@@ -2266,7 +2266,7 @@ mod tests {
                 g.delta.partials_stride,       // delta_partials
                 value_heads * head_cols,       // attn
                 attn_partials,                 // attn_partials
-                1,                             // attn_ticket
+                g.attn.kv_heads,               // attn_ticket
                 CTX * g.attn.rot,              // rope
                 g.experts.slots * g.experts.k, // h
                 vocab,                         // logits
@@ -2371,7 +2371,7 @@ mod tests {
                 g.delta.partials_stride,       // delta_partials
                 value_heads * head_cols,       // attn
                 attn_partials,                 // attn_partials
-                1,                             // attn_ticket
+                g.attn.kv_heads,               // attn_ticket
                 CTX * g.attn.rot,              // rope
                 g.experts.slots * g.experts.k, // h
                 vocab,                         // logits
@@ -3279,7 +3279,7 @@ mod tests {
                 g.delta.partials_stride,                 // delta_partials
                 attn_out,                                // attn
                 attn_partials,                           // attn_partials
-                1,                                       // attn_ticket
+                g.attn.kv_heads,                         // attn_ticket
                 g.experts.slots * g.experts.k,           // h
                 vocab,                                   // logits
                 RECORD_SLOTS,                            // step_id
