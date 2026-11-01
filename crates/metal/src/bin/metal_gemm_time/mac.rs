@@ -436,7 +436,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "--src",
         "--dump-source",
     ] {
-        if let Some(None) = flag(&args, name) {
+        if args.last().is_some_and(|a| a == name) {
             return Err(format!("{name} takes a value"));
         }
     }
@@ -1164,6 +1164,38 @@ fn fnv(h: u64, v: &[f32]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_value_flag_requires_a_value_after_its_last_occurrence() {
+        for (name, value) in [
+            ("--shape", "1:2:3"),
+            ("--trials", "1"),
+            ("--warmups", "0"),
+            ("--gflop", "1"),
+            ("--copies", "1"),
+            ("--warm-ms", "0"),
+            ("--only", "test"),
+            ("--arm", "ship"),
+            ("--quant", "q4k"),
+            ("--rows", "1"),
+            ("--skew", "0"),
+            ("--src", "test"),
+            ("--dump-source", "/dev/null"),
+        ] {
+            for repeated in [false, true] {
+                let mut args = vec!["--dump-source".to_string(), "/dev/null".to_string()];
+                if repeated {
+                    args.extend([name.to_string(), value.to_string()]);
+                }
+                args.push(name.to_string());
+                assert_eq!(
+                    super::run(args),
+                    Err(format!("{name} takes a value")),
+                    "a trailing {name} must be refused, repeated={repeated}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn shape_requires_exactly_three_whole_numbers() {
         let overflow = format!("{}0", usize::MAX);
