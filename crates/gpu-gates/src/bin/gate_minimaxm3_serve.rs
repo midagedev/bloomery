@@ -177,8 +177,8 @@ mod gate {
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::serve_client::{
         Answer, SeatGate, Served, check, curl, greedy, held_ms, ids_of, json_of, metric,
-        no_residency_host, residency_lever_is, residency_lever_resolved, server_log, together,
-        tokenized,
+        no_residency_host, residency_lever_is, residency_lever_resolved, server_log, stop_of,
+        together, tokenized,
     };
     use bloomery_gpu_gates::{GateError, checks_failed, gpu_census, ref_model_path};
     use model::arch::minimaxm3::place::PlanInputs;
@@ -564,7 +564,7 @@ mod gate {
         std::fs::write(d.join(format!("{name}.json")), &text)?;
         let v = json_of("/completion", st, &text)?;
         let tokens = ids_of(&v["tokens"])?;
-        let stop = v["stop_type"].as_str().unwrap_or("").to_owned();
+        let stop = stop_of(&v)?.to_owned();
         let slot = v["id_slot"].as_u64();
         let held_ms = held_ms(name, &v)?;
         let entries = v["completion_probabilities"]

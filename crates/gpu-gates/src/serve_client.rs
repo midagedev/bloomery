@@ -258,6 +258,18 @@ pub fn ids_of(v: &Value) -> Result<Vec<u32>, GateError> {
         .collect()
 }
 
+/// The `stop_type` of a completion answer `v`, one the server emits (`eos`,
+/// `word`, `limit`, `reasoning_loop`). A missing, non-string or unknown value
+/// is refused by name, so it never reaches [`agree`] as a stop that is not
+/// `eos` and lets matching ids pass.
+pub fn stop_of(v: &Value) -> Result<&str, GateError> {
+    match v["stop_type"].as_str() {
+        Some(s @ ("eos" | "word" | "limit" | "reasoning_loop")) => Ok(s),
+        Some(s) => Err(format!("stop_type: {s:?} is no stop the server emits").into()),
+        None => Err(format!("stop_type: {} is missing or not a string", v["stop_type"]).into()),
+    }
+}
+
 /// A completion's draft counts, `timings.draft_n` and
 /// `draft_n_accepted`: both absent is a request that proposed nothing,
 /// as the server omits them then. Refused by name: no `timings` object,
@@ -299,12 +311,7 @@ impl LookupCompletion {
         if tokens.is_empty() {
             return Err("lookup completion: tokens is empty".into());
         }
-        let stop = answer["stop_type"]
-            .as_str()
-            .ok_or("lookup completion: stop_type is missing or not a string")?;
-        if !matches!(stop, "eos" | "word" | "limit") {
-            return Err(format!("lookup completion: stop_type is unknown: {stop}").into());
-        }
+        let stop = stop_of(answer).map_err(|e| format!("lookup completion: {e}"))?;
         let slot = answer["id_slot"]
             .as_u64()
             .filter(|&n| n < slots)
@@ -927,7 +934,9 @@ pub fn completion(
     cache: bool,
 ) -> Result<Value, GateError> {
     let (st, text) = completion_raw(url, ids, n, cache)?;
-    json_of("/completion", st, &text)
+    let v = json_of("/completion", st, &text)?;
+    stop_of(&v)?;
+    Ok(v)
 }
 
 /// Greedy ids on the same loaded server without a speculative pass, and the
@@ -997,7 +1006,7 @@ pub fn greedy(
     std::fs::write(dir.join(format!("{name}.json")), &text)?;
     let v = json_of("/completion", st, &text)?;
     let tokens = ids_of(&v["tokens"])?;
-    let stop = v["stop_type"].as_str().unwrap_or("").to_owned();
+    let stop = stop_of(&v)?.to_owned();
     let cache_n = v["timings"]["cache_n"]
         .as_u64()
         .ok_or("/completion: missing or invalid timings.cache_n")?;
@@ -1435,7 +1444,7 @@ mod tests {
 
     use super::{
         LookupCompletion, agree, completion, curl, draft_counts, held_ms, ids_of, slot_erased,
-        stepped_completion, together,
+        stepped_completion, stop_of, together,
     };
     use serde_json::json;
 
@@ -1660,6 +1669,37 @@ mod tests {
             valid["id_slot"] = json!(1);
             valid["timings"] = json!({"cache_n": 0});
             assert!(LookupCompletion::read(&valid, 2, 4096).is_ok());
+        }
+    }
+
+    /// A completion whose ids match the reference is still refused when its
+    /// `stop_type` is gone, not a string or no stop the server emits. Mutant:
+    /// the gates' old `unwrap_or("")` read, which turned each of these into a
+    /// stop that let matching ids pass.
+    #[test]
+    fn stop_of_refuses_a_stop_it_cannot_read() {
+        let valid = json!({"tokens": [5, 6, 7], "stop_type": "limit"});
+        assert_eq!(ids_of(&valid["tokens"]).unwrap(), [5, 6, 7]);
+        for stop in ["eos", "word", "limit", "reasoning_loop"] {
+            let mut v = valid.clone();
+            v["stop_type"] = json!(stop);
+            assert_eq!(stop_of(&v).unwrap(), stop);
+        }
+        let mut gone = valid.clone();
+        gone.as_object_mut().unwrap().remove("stop_type");
+        assert!(stop_of(&gone).is_err(), "{gone}");
+        for bad in [
+            json!(null),
+            json!(1),
+            json!(true),
+            json!({}),
+            json!(""),
+            json!("EOS"),
+            json!("stop"),
+        ] {
+            let mut v = valid.clone();
+            v["stop_type"] = bad;
+            assert!(stop_of(&v).is_err(), "{v}");
         }
     }
 
