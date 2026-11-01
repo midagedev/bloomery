@@ -67,7 +67,6 @@
 //! read back by a gate; they refuse a captured graph, which would not hold
 //! the copies.
 
-use bloomery_gpu::Pitched;
 use bloomery_gpu::arch::hybrid::{Acts, DecodeInput, GqaCx};
 use bloomery_gpu::flash::{FlashKernels, FlashMergeArgs, FlashSegArgs, segments_for};
 use bloomery_gpu::flash_gqa::FlashGqaKernels;
@@ -83,7 +82,7 @@ use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
 use bloomery_gpu::route_softmax::{RouterBufs, RouterDims, RouterKernels};
 use bloomery_gpu::site::KGemvKernels;
 use bloomery_gpu::weights::{DevWeight, Weights};
-use bloomery_gpu::{DeviceTensor, FaultSink, FaultSite, Gpu, GpuError, Q8Act, Window, dtod_2d};
+use bloomery_gpu::{DeviceTensor, FaultSink, FaultSite, Gpu, GpuError, Q8Act, Window, copy_row};
 use bloomery_gpu_deepseek41::attn::{AttnArgs, AttnKernels, SelectedRows, segments};
 use bloomery_gpu_deepseek41::index_key::{IndexKeyInputArgs, IndexKeyKernels};
 use bloomery_gpu_deepseek41::indexer::{IndexerArgs, IndexerKernels, IndexerScratch};
@@ -100,10 +99,11 @@ use crate::tensors::{self, Ffn, Kind, Layer};
 const WHAT: &str = "mistrallarge4::Body::load";
 const STEP: &str = "mistrallarge4::Body::enqueue_chain";
 
-/// The experts the routing body softmaxes over: the qwen3moe instance's own
-/// width, the real file's expert count. A file of fewer experts (the
-/// fixture's 16) routes through it on pad lanes the picks never reach.
-const ROUTE_WIDTH: usize = 128;
+/// The experts the routing body softmaxes over: the softmax instance's own
+/// width (`route_softmax::ROW`), the real file's expert count. A file of
+/// fewer experts (the fixture's 16) routes through it on pad lanes the picks
+/// never reach.
+const ROUTE_WIDTH: usize = bloomery_gpu::route_softmax::ROW.experts() as usize;
 
 /// The f32 that fills the routing body's pad lanes: finite, and its
 /// probability `exp(f32::MIN − max)` is exactly zero, so a pad lane never
@@ -835,27 +835,6 @@ impl Perm {
     }
 }
 
-/// `n` f32 of `src` copied into `dst`, one row.
-fn copy_row(
-    stream: &CudaStream,
-    src: &DeviceBuffer<f32>,
-    dst: &mut DeviceBuffer<f32>,
-    n: usize,
-) -> Result<(), GpuError> {
-    let width = n * 4;
-    dtod_2d(
-        stream,
-        (src, 0),
-        (dst, 0),
-        Pitched {
-            width,
-            rows: 1,
-            dev_pitch: width,
-            host_pitch: width,
-        },
-    )
-}
-
 /// The attention's logit scale: `1/√key_length_mla`, the reference's own
 /// (`kq_scale` of its graph — YaRN without magnitude scaling).
 fn kq_scale(sh: Shape) -> f32 {
@@ -1011,6 +990,7 @@ fn attention(
             sh.idx_heads,
             sh.idx_d,
             1,
+            fault,
         )?;
         idx.k.project(cx, acts, l, &s.xn, &mut s.kidx)?;
         if rope {
@@ -1098,6 +1078,7 @@ fn attention(
         sh.heads,
         width,
         1,
+        fault,
     )?;
     // 7. the attention over the picked rows.
     let list = stores[a.kind.indexer]
@@ -1522,7 +1503,8 @@ impl ChainBody for Body {
         // beside it never moves, so the host copy carries it every step.
         self.s.host_ints[words::TOP_K] = sh.top_k as u32;
         self.s.host_token[0] = token;
-        self.s.host_vis = vec![0, n.min(sh.top_k) as u32];
+        self.s.host_vis[0] = 0;
+        self.s.host_vis[1] = n.min(sh.top_k) as u32;
         self.s.host_n_keys[words::N_KEYS] = n.min(sh.top_k) as u32;
         // The gathered flash's rows are the selection's own count
         // (`min(pos + 1, top_k)`): the flash counts the current row on top
@@ -1532,7 +1514,10 @@ impl ChainBody for Body {
         self.s.host_cs.clear();
         self.table
             .push(pos, Direction::Forward, &mut self.s.host_cs);
-        self.s.host_table_words = self.s.host_cs.iter().map(|v| v.to_bits()).collect();
+        self.s.host_table_words.clear();
+        self.s
+            .host_table_words
+            .extend(self.s.host_cs.iter().map(|f| f.to_bits()));
         self.s.pos.copy_from_host(stream, &self.s.host_pos)?;
         self.s.token.copy_from_host(stream, &self.s.host_token)?;
         // `n_vis` the embedding launch rewrites; the width beside it stays.
@@ -1611,7 +1596,9 @@ impl bloomery_gpu::model::Instrumented for Body {
     /// synthetic pattern — the latent rows a position-scaled ramp, the
     /// index-key rows a sign-alternating one, both inside the f16 normals
     /// and the rows past them zero: the state a prompt of `rows` tokens
-    /// could have left behind, not what the model would have written.
+    /// could have left behind, not what the model would have written. The
+    /// pattern goes into the buffers the load made, never a new allocation,
+    /// so a captured chain stays valid over the addresses it recorded.
     fn seed_depth(&mut self, gpu: &Gpu, rows: usize) -> Result<(), GpuError> {
         const WHAT: &str = "mistrallarge4::Body::seed_depth";
         if rows > self.sh.ctx {
@@ -1636,7 +1623,7 @@ impl bloomery_gpu::model::Instrumented for Body {
             if let Some(latent) = st.latent.as_mut() {
                 let (r, w) = (latent.rows(), latent.cols());
                 let host: Vec<u16> = (0..r * w).map(|i| ramp((i / w, i % w))).collect();
-                *latent = DeviceTensor::upload(stream, &host, r, w)?;
+                latent.buf_mut().copy_from_host(stream, &host)?;
             }
             if let Some(idx) = st.idx.as_mut() {
                 let (r, w) = (idx.keys.rows(), idx.keys.cols());
@@ -1654,7 +1641,7 @@ impl bloomery_gpu::model::Instrumented for Body {
                         gguf::quant::f32_to_f16_bits(sign * (0.25 + 0.001 * (col % 13) as f32))
                     })
                     .collect();
-                idx.keys = DeviceTensor::upload(stream, &host, r, w)?;
+                idx.keys.buf_mut().copy_from_host(stream, &host)?;
             }
         }
         Ok(())
