@@ -537,29 +537,31 @@ mod gate {
         }
     }
 
-    /// A row's merged image tokens by the release's grids: a grid (t, h, w) is t·h·w / 4; a
-    /// product past `u64` is refused by name.
+    /// A row's merged image tokens by the release's grids: a grid (1, h, w) of even h and w is
+    /// h·w / 4 (`tools/ref/clef_ref.py` writes only such grids); any other grid and a product past
+    /// `u64` are refused by name.
     fn image_counts(id: &str, row: &Json) -> Result<Vec<u64>, GateError> {
         entries(id, row, "image_grid_thw")?
             .iter()
             .map(|g| {
-                let n = numbers::<3>(id, "image_grid_thw", g)?
-                    .into_iter()
-                    .try_fold(1u64, u64::checked_mul)
-                    .ok_or_else(|| {
-                        format!("{id}: image_grid_thw {} overflows u64", dumps(g, false))
-                    })?;
+                let [t, h, w] = numbers::<3>(id, "image_grid_thw", g)?;
+                if t != 1 || h == 0 || w == 0 || !h.is_multiple_of(2) || !w.is_multiple_of(2) {
+                    return Err(format!(
+                        "{id}: image_grid_thw {} needs t = 1 and positive even h, w",
+                        dumps(g, false)
+                    )
+                    .into());
+                }
+                let n = h.checked_mul(w).ok_or_else(|| {
+                    format!("{id}: image_grid_thw {} overflows u64", dumps(g, false))
+                })?;
                 Ok(n / 4)
             })
             .collect()
     }
 
-    /// A row's pad run lengths by the release's spans (start, length); a row with no image may
-    /// leave `image_spans` out.
+    /// A row's pad run lengths by the release's spans (start, length).
     fn image_runs(id: &str, row: &Json) -> Result<Vec<u64>, GateError> {
-        if row.get("image_spans").is_none() {
-            return Ok(Vec::new());
-        }
         entries(id, row, "image_spans")?
             .iter()
             .map(|s| Ok(numbers::<2>(id, "image_spans", s)?[1]))
@@ -1204,20 +1206,24 @@ mod gate {
             let good = row(r#"{"image_grid_thw": [[1, 4, 6]], "image_spans": [[9, 6]]}"#);
             assert_eq!(image_counts("i1", &good).unwrap(), [6]);
             assert_eq!(image_runs("i1", &good).unwrap(), [6]);
-            let text = row(r#"{"image_grid_thw": []}"#);
+            let text = row(r#"{"image_grid_thw": [], "image_spans": []}"#);
             assert_eq!(image_runs("t1", &text).unwrap(), Vec::<u64>::new());
-            let cases: [(&str, Read); 8] = [
+            let cases: [(&str, Read); 12] = [
                 (r#"{"image_grid_thw": [[1, null, 2, 8]]}"#, image_counts),
                 (
                     r#"{"image_grid_thw": [[1, 4, 4611686018427387910]]}"#,
                     image_counts,
                 ),
                 (r#"{"image_grid_thw": [[1, 4, 6.0]]}"#, image_counts),
+                (r#"{"image_grid_thw": [[1, 1, 785]]}"#, image_counts),
+                (r#"{"image_grid_thw": [[1, 0, 6]]}"#, image_counts),
+                (r#"{"image_grid_thw": [[2, 4, 6]]}"#, image_counts),
                 (r#"{"image_grid_thw": [[4, 6]]}"#, image_counts),
                 (r#"{}"#, image_counts),
                 (r#"{"image_spans": [[9, "6"]]}"#, image_runs),
                 (r#"{"image_spans": [[9]]}"#, image_runs),
                 (r#"{"image_spans": 6}"#, image_runs),
+                (r#"{}"#, image_runs),
             ];
             for (bad, read) in cases {
                 let e = read("i1", &row(bad)).expect_err(bad).to_string();

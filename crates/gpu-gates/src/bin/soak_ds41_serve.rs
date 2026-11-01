@@ -57,7 +57,9 @@ mod soak {
     use std::process::{Child, ChildStdout, Command, Stdio};
     use std::time::{Duration, Instant};
 
-    use bloomery_gpu_gates::serve_client::{Served, curl, ids_of, json_of, stop_of};
+    use bloomery_gpu_gates::serve_client::{
+        Served, curl, ids_of, json_of, sse_event, sse_events, string_at,
+    };
     use bloomery_gpu_gates::{GateError, checks_failed, data_dir, ref_model_path, verdict};
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
@@ -414,36 +416,24 @@ mod soak {
         }
     }
 
-    /// The string at `pointer` of a served answer, refused by name when the
-    /// answer holds none there.
-    fn string_at(what: &str, v: &Value, pointer: &str) -> Result<String, GateError> {
-        v.pointer(pointer)
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .ok_or_else(|| format!("{what}: no string at {pointer} in {v}").into())
-    }
-
     /// The text of a streamed chat answer, its events' `delta.content` in
     /// order. Refused by name: a stream with no `[DONE]`, an event that is no
     /// JSON, an unreadable SSE frame, an event with no `delta` object, and a
     /// `content` that is neither absent, null nor a string.
     fn streamed_text(sse: &str) -> Result<String, GateError> {
         const WHAT: &str = "/v1/chat/completions";
-        let chunks = events(sse).map_err(|e| format!("{WHAT}: {e}"))?;
+        let chunks = sse_events(sse).map_err(|e| format!("{WHAT}: {e}"))?;
         if !chunks.contains(&"[DONE]") {
             return Err(format!("{WHAT}: stream has no [DONE]: {sse:?}").into());
         }
         let mut s = String::new();
         for e in chunks.into_iter().filter(|e| *e != "[DONE]") {
-            let v = stream_event(e).map_err(|err| format!("{WHAT}: {err}"))?;
+            let v = sse_event(e).map_err(|err| format!("{WHAT}: {err}"))?;
             let delta = v
                 .pointer("/choices/0/delta")
-                .and_then(Value::as_object)
                 .ok_or_else(|| format!("{WHAT}: no delta object in {v}"))?;
-            match delta.get("content") {
-                None | Some(Value::Null) => {}
-                Some(Value::String(t)) => s.push_str(t),
-                Some(_) => return Err(format!("{WHAT}: delta.content is no string in {v}").into()),
+            if let Some(t) = delta["content"].as_str() {
+                s.push_str(t);
             }
         }
         Ok(s)
@@ -453,36 +443,29 @@ mod soak {
         s.lines().next().unwrap_or("").chars().take(200).collect()
     }
 
-    /// The `data:` payloads of an SSE body; an unreadable frame is refused by name.
-    fn events(sse: &str) -> Result<Vec<&str>, GateError> {
-        sse.split("\n\n")
-            .filter(|e| !e.trim().is_empty())
-            .map(|e| {
-                e.trim_start()
-                    .strip_prefix("data: ")
-                    .ok_or_else(|| format!("unreadable SSE frame {e:?}").into())
-            })
-            .collect()
-    }
-
-    /// One SSE payload, including the stop of a native completion's terminal event.
-    fn stream_event(e: &str) -> Result<Value, GateError> {
-        let v = json_of("unreadable SSE event", 200, e)?;
-        if v["stop"].as_bool() == Some(true) {
-            stop_of(&v)?;
-        }
-        Ok(v)
+    /// The text of a plain chat answer, refused by name when it is no JSON or
+    /// holds no `choices[0].message.content` string.
+    fn chat_answer(st: u16, text: &str) -> Result<String, GateError> {
+        const WHAT: &str = "/v1/chat/completions";
+        string_at(
+            WHAT,
+            &json_of(WHAT, st, text)?,
+            "/choices/0/message/content",
+        )
     }
 
     fn sse_errors(sse: &str) -> Result<u64, GateError> {
-        let chunks = events(sse)?;
+        let chunks = sse_events(sse)?;
         let mut complete = chunks.contains(&"[DONE]");
+        if complete && chunks.iter().all(|e| *e == "[DONE]") {
+            return Err(format!("stream has no answer event: {sse:?}").into());
+        }
         let mut errors = 0;
         for e in chunks {
             if e == "[DONE]" {
                 continue;
             }
-            let v = stream_event(e)?;
+            let v = sse_event(e)?;
             errors += u64::from(v.get("error").is_some());
             complete |= v["stop"].as_bool() == Some(true);
         }
@@ -597,12 +580,7 @@ mod soak {
             } else if stream {
                 Some(streamed_text(&text)?)
             } else {
-                let v = json_of("/v1/chat/completions", st, &text)?;
-                Some(string_at(
-                    "/v1/chat/completions",
-                    &v,
-                    "/choices/0/message/content",
-                )?)
+                Some(chat_answer(st, &text)?)
             };
             match answer {
                 Some(a) => {
@@ -681,7 +659,7 @@ mod soak {
             self.c.n.requests += 1;
             self.c.n.generations += 1;
             let t = Instant::now();
-            let mut s = Stream::open(&self.c.url("/completion"), &body)?;
+            let mut s = CompletionStream::open(&self.c.url("/completion"), &body)?;
             s.read(Some(DROP_AFTER))?;
             let _ = s.child.kill();
             let _ = s.child.wait();
@@ -728,7 +706,7 @@ mod soak {
             self.c.n.generations += 2;
             self.c.n.pairs += 1;
             let t = Instant::now();
-            let mut a = Stream::open(&self.c.url("/completion"), &a_body)?;
+            let mut a = CompletionStream::open(&self.c.url("/completion"), &a_body)?;
             a.read(Some(1))?;
             let b = Command::new("curl")
                 .args(["-sS", "--max-time", "600", "-w", "\n%{http_code}"])
@@ -766,11 +744,19 @@ mod soak {
                 None => self.c.n.transport += 1,
             }
             self.c.n.sse_errors += a.errors;
-            let b_status = String::from_utf8_lossy(&out.stdout)
+            let text = String::from_utf8(out.stdout)
+                .map_err(|e| format!("pair /v1/chat/completions: {e}"))?;
+            let reply = text
                 .rsplit_once('\n')
-                .and_then(|(_, code)| code.trim().parse::<u16>().ok());
-            match b_status {
-                Some(st) if out.status.success() => self.c.status(st),
+                .and_then(|(body, code)| code.trim().parse::<u16>().ok().map(|st| (st, body)));
+            let b_status = reply.map(|(st, _)| st);
+            match reply {
+                Some((st, body)) if out.status.success() => {
+                    self.c.status(st);
+                    if st == 200 {
+                        chat_answer(st, body)?;
+                    }
+                }
                 _ => self.c.n.transport += 1,
             }
             self.c.n.pairs_deferred += u64::from(deferred);
@@ -865,7 +851,7 @@ mod soak {
     /// it arrives: the status (the last head's), the `data:` events seen, the
     /// `error` events among them, and whether the stream ended (the
     /// native terminal event, connection closed or `data: [DONE]`).
-    struct Stream {
+    struct CompletionStream {
         child: Child,
         r: BufReader<ChildStdout>,
         status: Option<u16>,
@@ -875,7 +861,7 @@ mod soak {
         body: bool,
     }
 
-    impl Drop for Stream {
+    impl Drop for CompletionStream {
         fn drop(&mut self) {
             if matches!(self.child.try_wait(), Ok(None)) {
                 let _ = self.child.kill();
@@ -884,8 +870,8 @@ mod soak {
         }
     }
 
-    impl Stream {
-        fn open(url: &str, body: &Value) -> Result<Stream, GateError> {
+    impl CompletionStream {
+        fn open(url: &str, body: &Value) -> Result<CompletionStream, GateError> {
             let mut child = Command::new("curl")
                 .args(["-sS", "-N", "--max-time", "600", "-D", "-"])
                 .args(["-H", "Content-Type: application/json"])
@@ -895,7 +881,7 @@ mod soak {
                 .stderr(Stdio::null())
                 .spawn()?;
             let out = child.stdout.take().ok_or("curl gave no stdout")?;
-            Ok(Stream {
+            Ok(CompletionStream {
                 child,
                 r: BufReader::new(out),
                 status: None,
@@ -906,10 +892,13 @@ mod soak {
             })
         }
 
-        /// Reads until `stop` events have been seen in all, or the end.
+        /// Reads until `stop` events have been seen in all, or the body ends. The
+        /// body's lines are gathered into frames up to each blank line and
+        /// read by [`sse_events`], as a whole body is.
         fn read(&mut self, stop: Option<usize>) -> Result<(), GateError> {
             let mut line = String::new();
-            while !self.ended && !stop.is_some_and(|n| self.events >= n) {
+            let mut frame = String::new();
+            while !stop.is_some_and(|n| self.events >= n) {
                 line.clear();
                 if self
                     .r
@@ -917,29 +906,47 @@ mod soak {
                     .map_err(|err| format!("/completion: SSE read: {err}"))?
                     == 0
                 {
-                    self.ended = true;
-                    if self.status == Some(200) && self.errors == 0 {
+                    self.frame(&frame)?;
+                    if !self.ended && self.status == Some(200) && self.errors == 0 {
                         return Err("/completion: stream has no [DONE] or completion stop".into());
                     }
+                    self.ended = true;
                     break;
                 }
-                let l = line.trim_end();
-                if l.starts_with("HTTP/") {
+                let l = line.trim_end_matches(['\r', '\n']);
+                if l.starts_with("HTTP/") && (!self.body || self.status.is_some_and(|s| s < 200)) {
                     self.status = l.split_whitespace().nth(1).and_then(|s| s.parse().ok());
                     self.body = false;
                 } else if !self.body {
                     self.body = l.is_empty();
-                } else if !l.is_empty() && self.status == Some(200) {
-                    for e in events(l).map_err(|err| format!("/completion: {err}"))? {
-                        self.events += 1;
-                        if e == "[DONE]" {
-                            self.ended = true;
-                        } else {
-                            let v = stream_event(e).map_err(|err| format!("/completion: {err}"))?;
-                            self.errors += u64::from(v.get("error").is_some());
-                            self.ended = v["stop"].as_bool() == Some(true);
+                } else if self.status == Some(200) {
+                    if l.is_empty() {
+                        self.frame(&frame)?;
+                        frame.clear();
+                    } else {
+                        if !frame.is_empty() {
+                            frame.push('\n');
                         }
+                        frame.push_str(l);
                     }
+                }
+            }
+            Ok(())
+        }
+
+        /// Counts the events of one SSE frame of a 200 body; an empty frame holds none.
+        fn frame(&mut self, frame: &str) -> Result<(), GateError> {
+            for e in sse_events(frame).map_err(|err| format!("/completion: {err}"))? {
+                if e == "[DONE]" && self.events == 0 {
+                    return Err("/completion: stream has no answer event".into());
+                }
+                self.events += 1;
+                if e == "[DONE]" {
+                    self.ended = true;
+                } else {
+                    let v = sse_event(e).map_err(|err| format!("/completion: {err}"))?;
+                    self.errors += u64::from(v.get("error").is_some());
+                    self.ended |= v["stop"].as_bool() == Some(true);
                 }
             }
             Ok(())
@@ -1485,8 +1492,8 @@ mod soak {
     #[cfg(test)]
     mod tests {
         use super::{
-            Client, Conversation, Corpus, Counts, GateError, Mix, Rng, Stream, served, sse_errors,
-            streamed_text, string_at,
+            Client, CompletionStream, Conversation, Corpus, Counts, GateError, Mix, Rng,
+            chat_answer, served, sse_errors, streamed_text, string_at,
         };
         use serde_json::json;
         use std::fs::OpenOptions;
@@ -1525,6 +1532,12 @@ mod soak {
                 string_at("/detokenize", &json!({"content": "ab"}), "/content").unwrap(),
                 "ab"
             );
+            let answer = json!({"choices": [{"message": {"content": "ab"}}]});
+            assert_eq!(chat_answer(200, &answer.to_string()).unwrap(), "ab");
+            for bad in ["<html>", "{}"] {
+                assert!(refused(chat_answer(200, bad)).contains("/v1/chat/completions"));
+            }
+            const PARTIAL: &str = "data: {\"content\":\"\",\"stop\":false}\n\n";
             let delta = |t: &str| json!({"choices": [{"delta": {"content": t}}]});
             let sse = format!(
                 "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
@@ -1550,7 +1563,7 @@ mod soak {
                 refused(streamed_text(&format!("data: {}\n\n", delta("a")))).contains("no [DONE]")
             );
             assert!(refused(sse_errors("data: {cut\n\n")).contains("unreadable SSE event"));
-            assert!(refused(sse_errors("data: {}\n\n")).contains("no [DONE]"));
+            assert!(refused(sse_errors(PARTIAL)).contains("no [DONE]"));
             assert!(refused(sse_errors("")).contains("no [DONE]"));
             assert_eq!(sse_errors(&sse).unwrap(), 0);
             assert_eq!(sse_errors("data: {\"error\": \"failed\"}\n\n").unwrap(), 1);
@@ -1563,14 +1576,25 @@ mod soak {
             assert!(refused(streamed_text(bare)).contains("no delta"));
 
             let native = "data: {\"content\":\"a\",\"stop\":false}\n\ndata: {\"content\":\"\",\"stop\":true,\"stop_type\":\"limit\"}\n\n";
+            let one_frame = "data: {\"content\":\"a\",\"stop\":false}\ndata: {\"content\":\"\",\"stop\":true,\"stop_type\":\"limit\"}\n\n";
+            let native_cut = format!("{native}data: {{cut\n\n");
             assert_eq!(sse_errors(native).unwrap(), 0);
             for (stream, body, error, errors) in [
                 (false, "<html>", Some("/completion"), 0),
                 (false, r#"{"tokens":[1]}"#, Some("stop_type"), 0),
                 (false, r#"{"tokens":[1],"stop_type":"limit"}"#, None, 0),
                 (true, "data: {cut\n\n", Some("unreadable SSE event"), 0),
-                (true, "data: {}\n\n", Some("no [DONE]"), 0),
+                (true, PARTIAL, Some("no [DONE]"), 0),
+                (true, "data: [DONE]\n\n", Some("no answer event"), 0),
+                (
+                    true,
+                    "data: {\"content\":\"a\",\"stop\":false}\n \ndata: {\"stop\":true,\"stop_type\":\"limit\"}\n\n",
+                    Some("unreadable SSE event"),
+                    0,
+                ),
                 (true, native, None, 0),
+                (true, one_frame, Some("unreadable SSE event"), 0),
+                (true, &native_cut, Some("unreadable SSE event"), 0),
                 (true, "data: {\"stop\":true}\n\n", Some("stop_type"), 0),
                 (
                     true,
@@ -1589,6 +1613,7 @@ mod soak {
                 for paired in 0..=usize::from(stream) {
                     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
                     let addr = listener.local_addr().unwrap();
+                    let reply = body.to_owned();
                     let (peer, _) =
                         spawn_helper("soak-reader-response", Placement::Float, move || {
                             let (mut socket, _) = listener.accept().unwrap();
@@ -1613,8 +1638,8 @@ mod soak {
                             request.read_exact(&mut vec![0; length]).unwrap();
                             write!(
                         socket,
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
+                        "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                        reply.len()
                     )
                     .unwrap();
                         })
@@ -1641,8 +1666,9 @@ mod soak {
                         light_next: 0,
                     };
                     let (result, observed_errors) = if paired == 1 {
-                        let mut s = Stream::open(&mix.c.url("/completion"), &json!({})).unwrap();
-                        let result = s.read(None);
+                        let mut s =
+                            CompletionStream::open(&mix.c.url("/completion"), &json!({})).unwrap();
+                        let result = s.read(Some(1)).and_then(|()| s.read(None));
                         assert_eq!(s.status, Some(200));
                         let errors = s.errors;
                         drop(s);

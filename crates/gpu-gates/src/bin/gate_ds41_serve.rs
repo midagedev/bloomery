@@ -313,7 +313,7 @@ mod gate {
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::serve_client::{
         self, Served, agree, curl, ids_of, json_of, metric, parse_ids, plan_run, server_log,
-        slot_action, stop_of,
+        slot_action, sse_event, sse_events, stop_of,
     };
     use bloomery_gpu_gates::{GateError, checks_failed, data_dir, ref_model_path, verdict};
     use gguf::{Gguf, Split};
@@ -3145,10 +3145,8 @@ mod gate {
         });
         let (st, body) = curl(&url("/v1/chat/completions"), Some(&chat), false)?;
         let plain = json_of("/v1/chat/completions", st, &body)?;
-        let plain_content = plain["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("")
-            .to_owned();
+        let plain_content =
+            serve_client::string_at("/v1/chat/completions", &plain, "/choices/0/message/content")?;
         println!(
             "chat content={:?} finish_reason={} usage={}",
             plain_content, plain["choices"][0]["finish_reason"], plain["usage"]
@@ -3157,15 +3155,15 @@ mod gate {
         streamed["stream"] = json!(true);
         let (st, sse) = curl(&url("/v1/chat/completions"), Some(&streamed), true)?;
         std::fs::write(a.dir.join("chat-stream.sse"), &sse)?;
-        let events: Vec<&str> = sse
-            .split("\n\n")
-            .filter_map(|e| e.strip_prefix("data: "))
-            .collect();
+        let events = if st == 200 {
+            sse_events(&sse).map_err(|e| format!("/v1/chat/completions: {e}"))?
+        } else {
+            Vec::new()
+        };
         let mut deltas = String::new();
-        for e in &events {
-            if let Ok(v) = serde_json::from_str::<Value>(e)
-                && let Some(t) = v["choices"][0]["delta"]["content"].as_str()
-            {
+        for e in events.iter().filter(|e| **e != "[DONE]") {
+            let v = sse_event(e).map_err(|e| format!("/v1/chat/completions: {e}"))?;
+            if let Some(t) = v["choices"][0]["delta"]["content"].as_str() {
                 deltas.push_str(t);
             }
         }
