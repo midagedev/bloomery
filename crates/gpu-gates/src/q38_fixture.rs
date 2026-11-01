@@ -37,8 +37,9 @@ const PLE_SITE_LAUNCHES: usize = 5;
 /// its input rows to q8_1 first, and a Q5_K one copies its token-major logits past one row
 /// ([`Shape::head`]), one more each.
 const HEAD_LAUNCHES: usize = 5;
-/// Nodes a verify's PLE rows' arrival adds at the PLE site: the wait on the host's flag (a batch
-/// memory operation) and the copy of the rows from the host's staging ([`Shape::arrivals`]).
+/// Nodes a step's or a verify's PLE rows' arrival adds at the PLE site: the wait on the host's
+/// flag (a batch memory operation) and the copy of the rows from the host's staging
+/// ([`Shape::arrivals`]).
 const ARRIVAL_NODES: usize = 2;
 /// Launches the card leg adds on a card layer: the normed rows' q8_1, the gate·up, the card
 /// slots' q8_1, the down and the card sum.
@@ -148,19 +149,21 @@ impl Shape {
     }
 
     /// The captured decode step's nodes: the embedding row, each layer's launches, the PLE site's
-    /// and the head's.
+    /// and its rows' arrival, and the head's.
     #[must_use]
     pub fn nodes_decode(&self) -> usize {
         EMBED_LAUNCHES
             + self.n_gdn() * GDN_LAYER_LAUNCHES
             + self.n_qsa() * QSA_LAYER_LAUNCHES
             + self.ple_layer.map_or(0, |_| PLE_SITE_LAUNCHES)
+            + self.arrivals() * ARRIVAL_NODES
             + HEAD_LAUNCHES
             + usize::from(self.head.quantizes)
             + self.by_name.one
     }
 
-    /// The stream memory-operation batches of a captured step: each layer's go and wait.
+    /// The stream memory-operation batches of a captured step's layers: each layer's go and wait
+    /// (the PLE rows' arrival adds one more, [`Shape::arrivals`]).
     #[must_use]
     pub fn memops(&self) -> usize {
         2 * self.n_layer
@@ -180,19 +183,18 @@ impl Shape {
         2 * (self.n_layer - hostless)
     }
 
-    /// The captured verify's nodes at 2, 3 and 4 rows: a layer's launches are the step's (a
-    /// delta layer's joined β·α projection is one launch at every row count), past the by-name
-    /// launches of more than one row, the head's row copy and the PLE rows' arrival.
+    /// The captured verify's nodes at 2, 3 and 4 rows: a layer's launches and the PLE rows'
+    /// arrival are the step's (a delta layer's joined β·α projection is one launch at every row
+    /// count), past the by-name launches of more than one row and the head's row copy.
     #[must_use]
     pub fn nodes_verify(&self) -> usize {
         self.nodes_decode() - self.by_name.one
             + self.by_name.rows
             + usize::from(self.head.copies_rows)
-            + self.arrivals() * ARRIVAL_NODES
     }
 
-    /// The PLE rows' arrivals of a captured verify: one on a file with a PLE site. Each is one
-    /// batch memory operation and one copy among the verify's nodes.
+    /// The PLE rows' arrivals of a captured step or verify: one on a file with a PLE site. Each
+    /// is one batch memory operation and one copy among the call's nodes.
     #[must_use]
     pub fn arrivals(&self) -> usize {
         usize::from(self.ple_layer.is_some())
@@ -235,28 +237,28 @@ mod tests {
         let every_fourth = (0..12).map(|i| 4 * i + 3).collect();
         let real = Shape::from_layers(48, every_fourth, Some(1), Some(248_056)).expect("real");
         assert_eq!((real.n_qsa(), real.n_gdn()), (12, 36));
-        assert_eq!(real.nodes_decode(), 1139);
+        assert_eq!(real.nodes_decode(), 1141);
         assert_eq!(real.memops(), 96);
         assert_eq!(real.nodes_verify(), 1141);
         assert_eq!(real.nodes_slot(), 3);
-        assert_eq!(real.nodes_decode_card(48), 1379);
+        assert_eq!(real.nodes_decode_card(48), 1381);
         assert_eq!(real.nodes_verify_card(48), 1381);
         assert_eq!((real.memops_card(0), real.memops_card(48)), (96, 0));
         let fix = Shape::from_layers(4, vec![1, 3], Some(2), Some(248_056)).expect("fixture");
         assert_eq!((fix.n_qsa(), fix.n_gdn()), (2, 2));
-        assert_eq!(fix.nodes_decode(), 1 + 2 * 22 + 2 * 28 + 5 + 5);
-        assert_eq!(fix.nodes_decode(), 111);
+        assert_eq!(fix.nodes_decode(), 1 + 2 * 22 + 2 * 28 + 5 + 2 + 5);
+        assert_eq!(fix.nodes_decode(), 113);
         assert_eq!(fix.nodes_verify(), 113);
         assert_eq!(fix.nodes_slot(), 3);
-        assert_eq!(fix.nodes_decode_card(4), 131);
+        assert_eq!(fix.nodes_decode_card(4), 133);
         assert_eq!(fix.nodes_verify_card(4), 133);
         let kq = fix.clone().with_head(Head {
             quantizes: true,
             copies_rows: false,
         });
-        assert_eq!(kq.nodes_decode(), 112);
+        assert_eq!(kq.nodes_decode(), 114);
         assert_eq!(kq.nodes_verify(), 114);
-        assert_eq!(kq.nodes_decode_card(4), 132);
+        assert_eq!(kq.nodes_decode_card(4), 134);
         assert_eq!(kq.nodes_slot(), fix.nodes_slot());
         // A Q5_K head also copies its token-major logits past one row: the decode step at one
         // row is the K-quant head's, the verify one launch more.
@@ -264,7 +266,7 @@ mod tests {
             quantizes: true,
             copies_rows: true,
         });
-        assert_eq!(q5.nodes_decode(), 112);
+        assert_eq!(q5.nodes_decode(), 114);
         assert_eq!(q5.nodes_verify(), 115);
         assert_eq!(q5.nodes_verify_card(4), 135);
         assert_eq!(q5.nodes_slot(), fix.nodes_slot());
@@ -275,10 +277,10 @@ mod tests {
             one: 2 * 5 + 2 * 8,
             rows: 2 * 5 + 2 * 8 + 3 + 4,
         });
-        assert_eq!(by.nodes_decode(), 111 + 26);
+        assert_eq!(by.nodes_decode(), 113 + 26);
         assert_eq!(by.nodes_verify(), 113 + 26 + 7);
         assert_eq!(by.nodes_slot(), 3);
-        assert_eq!(by.nodes_decode_card(4), 131 + 26);
+        assert_eq!(by.nodes_decode_card(4), 133 + 26);
     }
 
     /// A description no gate can read a shape from is a named error, and a file with no PLE site

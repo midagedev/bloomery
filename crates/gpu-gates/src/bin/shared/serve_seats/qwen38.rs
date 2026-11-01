@@ -463,7 +463,7 @@ use bloomery_gpu_gates::generate::{
     BreakEven, DraftYield, FloorShort, Lane, Place, draft_yield, holds_no_ctx, lane_of,
 };
 use bloomery_gpu_gates::need;
-use bloomery_gpu_gates::nodes::count_kinds;
+use bloomery_gpu_gates::nodes::step_census;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{
     CARD38, Lever38, Seqs, check_reserve, checkpoints_reserved, churn_bytes, reserve_checkpoints,
@@ -475,7 +475,6 @@ use bloomery_levers::{
     draft38_unset, residency_word_least_fewest, residency38_least_fewest, residency38_off,
     residency38_unset,
 };
-use cuda_core::sys;
 use gguf::Split;
 use model::arch::models::headpick::HeadSet;
 use model::arch::models::{Mixer, ModelSpec};
@@ -2886,23 +2885,9 @@ impl Q38 {
                     .eprint();
             }
         }
-        let (launches, memops) = m.body(WHAT)?.step_launches();
+        let counts = m.body(WHAT)?.step_launches();
         let nodes = m.capture_step()?;
-        let kernel = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL;
-        let memop = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP;
-        let ([k, b], other) = count_kinds(&m.step_graph_nodes()?, [kernel, memop]);
-        eprintln!(
-            "capture graph_nodes={nodes} kernel={k} batch_mem_op={b} other={other} (the \
-             program counts {launches}, {memops} of them batch_mem_op)"
-        );
-        if nodes != launches || b != memops || k + b != nodes || other != 0 {
-            return Err(format!(
-                "the captured step is not the program's: {nodes} nodes ({k} kernel, {b} \
-                 batch_mem_op, {other} other) against {launches} launches, {memops} of them \
-                 batch_mem_op"
-            )
-            .into());
-        }
+        eprintln!("{}", step_census(nodes, counts, &m.step_graph_nodes()?)?);
         // Every prompt call copies the recurrent stores at its marks: the
         // checkpoints a later request's cut and a saved state come from.
         m.body_parts(WHAT)?.2.set_checkpoints(true);

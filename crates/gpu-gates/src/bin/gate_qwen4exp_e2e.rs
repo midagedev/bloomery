@@ -465,11 +465,14 @@ mod gate {
     /// 1 + 36·22 + 12·29 + 5 + 5.
     /// PIN(2026-10-30): the selected flash's merge writes under the out gate,
     /// so a selecting layer's mixer is 13 launches: 1 + 36·22 + 12·28 + 5 + 5.
+    /// PIN(2026-11-01): the step's PLE rows arrive at its PLE site after its
+    /// launch, as a verify's do: the wait on the host's flag and the rows'
+    /// copy, two nodes more: 1139 + 2.
     const REAL_N_LAYER: usize = 48;
     const REAL_PLE_LAYER: usize = 1;
     const REAL_N_QSA: usize = 12;
     const REAL_N_GDN: usize = 36;
-    const REAL_NODES_DECODE: usize = 1139;
+    const REAL_NODES_DECODE: usize = 1141;
 
     /// PIN(2026-09-27): each layer's go and wait.
     const REAL_MEMOPS: usize = 2 * REAL_N_LAYER;
@@ -492,6 +495,8 @@ mod gate {
     /// PIN(2026-10-30): the step's 1139 (the gated merge): 1139 + 36·1 + 2.
     /// PIN(2026-10-31): the joined β·α projection is one launch at every
     /// row count, so a delta layer adds none: 1139 + 2.
+    /// PIN(2026-11-01): the step's [`REAL_NODES_DECODE`] carries the
+    /// arrival: 1141.
     const REAL_NODES_VERIFY: usize = 1141;
 
     /// PIN(2026-11-01): the nodes one more busy slot adds to a captured pass
@@ -531,7 +536,8 @@ mod gate {
     /// PIN(2026-10-27): the verify's [`REAL_NODES_VERIFY`]: 1189 + 5·48.
     /// PIN(2026-10-30): the gated merge: 1139 + 5·48 and 1177 + 5·48.
     /// PIN(2026-10-31): the verify's [`REAL_NODES_VERIFY`]: 1141 + 5·48.
-    const REAL_NODES_DECODE_CARD: usize = 1379;
+    /// PIN(2026-11-01): the step's [`REAL_NODES_DECODE`]: 1141 + 5·48.
+    const REAL_NODES_DECODE_CARD: usize = 1381;
     const REAL_NODES_VERIFY_CARD: usize = 1381;
 
     // PIN(2026-10-11): the split prompt walk moves none of the counts
@@ -930,21 +936,26 @@ mod gate {
             kinds.len(),
             verdict(ok)
         );
-        let (counted, memops_counted) = body.step_launches();
+        let (counted, memops_counted, copies_counted) = body.step_launches();
         let kernel = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL;
         let memop = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP;
-        let ([k, b], other) = count_kinds(&m.step_graph_nodes()?, [kernel, memop]);
-        let (want_nodes, want_memops) = (nodes_decode(), memops());
+        let memcpy = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_MEMCPY;
+        let ([k, b, c], other) = count_kinds(&m.step_graph_nodes()?, [kernel, memop, memcpy]);
+        let arrivals = shape().arrivals();
+        let (want_nodes, want_memops) = (nodes_decode(), memops() + arrivals);
         let pass = nodes == want_nodes
             && counted == want_nodes
             && memops_counted == want_memops
+            && copies_counted == arrivals
             && b == want_memops
-            && k == want_nodes - want_memops
+            && c == arrivals
+            && k == want_nodes - want_memops - arrivals
             && other == 0;
         println!(
             "structure decode graph_nodes={nodes} (want {want_nodes}; the program counts \
-             {counted}, {memops_counted} of them batch_mem_op) kernel={k} batch_mem_op={b} (want \
-             {want_memops}) other={other} {}",
+             {counted}, {memops_counted} of them batch_mem_op, {copies_counted} memcpy) kernel={k} \
+             batch_mem_op={b} (want {want_memops}) memcpy={c} (want {arrivals}: the PLE rows' \
+             copy) other={other} {}",
             verdict(pass)
         );
         ok &= pass;
@@ -3658,25 +3669,33 @@ mod gate {
     fn card_structure(m: &mut Qwen38Model, plan: &PlanFacts) -> Result<bool, GateError> {
         let nodes = m.capture_step()?;
         let body = m.body("card_structure")?;
-        let (layers, (counted, memops_counted)) = (body.card_layers(), body.step_launches());
+        let (layers, (counted, memops_counted, copies_counted)) =
+            (body.card_layers(), body.step_launches());
         let kernel = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL;
         let memop = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP;
-        let ([k, b], other) = count_kinds(&m.step_graph_nodes()?, [kernel, memop]);
-        let want_memops = shape().memops_card(hostless(plan));
+        let memcpy = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_MEMCPY;
+        let ([k, b, c], other) = count_kinds(&m.step_graph_nodes()?, [kernel, memop, memcpy]);
+        let layer_memops = shape().memops_card(hostless(plan));
+        let arrivals = shape().arrivals();
+        let want_memops = layer_memops + arrivals;
         // PIN(2026-10-29): each hostless layer folds its card sum into the shared add.
-        let want_nodes =
-            shape().nodes_decode_card(plan.card_layers) - (memops() - want_memops) - hostless(plan);
+        let want_nodes = shape().nodes_decode_card(plan.card_layers)
+            - (memops() - layer_memops)
+            - hostless(plan);
         let ok = layers == plan.card_layers
             && nodes == want_nodes
             && counted == want_nodes
             && memops_counted == want_memops
+            && copies_counted == arrivals
             && b == want_memops
-            && k == want_nodes - want_memops
+            && c == arrivals
+            && k == want_nodes - want_memops - arrivals
             && other == 0;
         println!(
             "card leg structure: card layers {layers} (want {}, the plan's); decode graph_nodes=\
              {nodes} (want {want_nodes}; the program counts {counted}, {memops_counted} of them \
-             batch_mem_op) kernel={k} batch_mem_op={b} (want {want_memops}) other={other} {}",
+             batch_mem_op, {copies_counted} memcpy) kernel={k} batch_mem_op={b} (want \
+             {want_memops}) memcpy={c} (want {arrivals}) other={other} {}",
             plan.card_layers,
             verdict(ok)
         );
@@ -4196,8 +4215,8 @@ mod gate {
         };
         let premise = !fixture || whole == n_layer();
         let counts = premise
-            && b == shape().memops_card(whole)
-            && kb == memops()
+            && b == shape().memops_card(whole) + shape().arrivals()
+            && kb == memops() + shape().arrivals()
             && served == [(n_layer() - whole) as u64; 3]
             && kserved == [n_layer() as u64; 3]
             && [views, kviews] == [n_layer() - whole; 2];
@@ -4213,8 +4232,8 @@ mod gate {
             } else {
                 " (the real tier does not require it: the card's memory decides)".to_string()
             },
-            shape().memops_card(whole),
-            memops(),
+            shape().memops_card(whole) + shape().arrivals(),
+            memops() + shape().arrivals(),
             n_layer() - whole,
             n_layer(),
             n_layer() - whole,
