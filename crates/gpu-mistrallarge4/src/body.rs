@@ -701,7 +701,10 @@ impl Body {
             let n_vocab = head.n_vocab();
             head.enqueue_with_tail(gpu, w, |act, out_w, fault, logits, token_out| {
                 gpu.enqueue_gemv_q6k(out_w, act, logits)?;
-                elem.enqueue_softcap_rows(gpu.stream(), logits, n_vocab, softcap)?;
+                // 0 is no cap: the reference graph caps only on a nonzero bound.
+                if softcap > 0.0 {
+                    elem.enqueue_softcap_rows(gpu.stream(), logits, n_vocab, softcap)?;
+                }
                 elem.enqueue_argmax_fault(gpu.stream(), logits, n_vocab, fault, token_out)
             })?;
         }
@@ -851,22 +854,6 @@ fn copy_row(
             host_pitch: width,
         },
     )
-}
-
-/// The resident q8_0 weight `name`'s two planes, refused by name unless
-/// they hold `rows` rows of `k` values.
-fn q8_planes<'w>(
-    w: &'w Weights,
-    name: &str,
-    (rows, k): (usize, usize),
-) -> Result<(&'w DeviceTensor<u32>, &'w DeviceTensor<u16>), GpuError> {
-    match w.resident(STEP, name)? {
-        DevWeight::Q8_0 { qs, d, .. } if d.rows() == rows && d.cols() * 32 == k => Ok((qs, d)),
-        _ => Err(GpuError::shape(
-            STEP,
-            format!("{name} is not a q8_0 weight of {rows} rows of {k} values"),
-        )),
-    }
 }
 
 /// The attention's logit scale: `1/√key_length_mla`, the reference's own
@@ -1078,7 +1065,7 @@ fn attention(
     // 6. the absorbed query: each head's nope slice dotted into the latent
     //    width, a rope layer's flash row `[q_rope | q_nope2]` assembled and
     //    the whole row scaled by the main SSMax.
-    let (qs, dd) = q8_planes(w, &a.k_b, (sh.heads * sh.latent, sh.head_k - pe))?;
+    let (qs, dd) = w.q8_planes(STEP, &a.k_b)?;
     k.step.enqueue_q8_0_gemv_heads(
         stream,
         Q8_0GemvHeadsArgs {
@@ -1218,7 +1205,7 @@ fn attention(
         r?;
     }
     // 8. the heads' values up-projected, the output projection.
-    let (qs, dd) = q8_planes(w, &a.v_b, (sh.heads * sh.head_v, sh.latent))?;
+    let (qs, dd) = w.q8_planes(STEP, &a.v_b)?;
     k.step.enqueue_q8_0_gemv_heads(
         stream,
         Q8_0GemvHeadsArgs {
@@ -1470,9 +1457,9 @@ impl LayerTap {
         copy_row(stream, &s.xn, &mut self.attn_norm, sh.hidden)
     }
 
-    /// The tap's values, the scratch copies alone (the routing and the list
-    /// are read where they live, at [`Body::nodes`])); it
-    /// synchronizes the stream.
+    /// The tap's values, the scratch copies and the list the layer read (the
+    /// routing is read where it lives, at [`Body::nodes`]); it synchronizes
+    /// the stream.
     fn to_host(&self, stream: &CudaStream) -> Result<LayerNodes, GpuError> {
         let v = |b: &DeviceBuffer<f32>| b.to_host_vec(stream);
         Ok(LayerNodes {
@@ -1819,8 +1806,8 @@ impl Body {
     }
 
     /// The armed taps' values of `layers`, read back (a gate's instrument;
-    /// it synchronizes the stream), beside each layer's routing and the
-    /// list it read. Refused by name: a range past the model's layers.
+    /// it synchronizes the stream), beside each layer's routing. Refused by
+    /// name: a range past the model's layers.
     pub fn nodes(&mut self, gpu: &Gpu, layers: Range<usize>) -> Result<Vec<LayerNodes>, GpuError> {
         const WHAT: &str = "mistrallarge4::nodes";
         let stream = gpu.stream();
@@ -1838,11 +1825,6 @@ impl Body {
         let mut out = Vec::with_capacity(layers.len());
         for l in layers {
             let t = taps.layers[l].to_host(stream)?;
-            let list = &self.stores[self.layers[l].kind.indexer]
-                .idx
-                .as_ref()
-                .unwrap()
-                .list;
             let route = self.routes[l].as_ref();
             let (logits, ids, probs, weights) = match route {
                 None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
@@ -1854,7 +1836,6 @@ impl Body {
                 ),
             };
             out.push(LayerNodes {
-                list: list.to_host_vec(stream)?,
                 route_logits: logits,
                 route_ids: ids,
                 route_probs: probs,

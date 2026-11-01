@@ -30,16 +30,13 @@ use serde_json::Value;
 use crate::callstream::Progress;
 use crate::constrain::{Call, CallMode, Fun, Part, Refusal, call};
 use crate::dsml::{Scanned, ToolCall};
-use crate::hermes::compact_prefix;
+use crate::hermes::{compact_prefix, quote};
 use crate::reasoning::partial_suffix;
 
 /// Opens a call.
 pub const CALL_OPEN: &str = "[TOOL_CALLS]";
 /// Between a call's name and its arguments.
 pub const ARGS: &str = "[ARGS]";
-
-/// How much of the offending text an error quotes.
-const QUOTE: usize = 40;
 
 /// A generation whose tool-call markup does not parse. `index` counts calls
 /// in the generation from 0.
@@ -216,11 +213,6 @@ impl MistralScan {
             arguments: v.to_string(),
         })
     }
-}
-
-/// The first characters of `s`, for an error.
-fn quote(s: &str) -> String {
-    s.chars().take(QUOTE).collect()
 }
 
 /// Whether `name` may name a call: non-empty, and free of the markup's own

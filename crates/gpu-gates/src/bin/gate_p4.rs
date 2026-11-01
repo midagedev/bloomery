@@ -1100,9 +1100,9 @@ fn run() -> Result<(), GateError> {
     // hidden row). No oracle row: synthetic rows at the family's two hidden
     // widths (the fixture's 1,024 and the real file's 6,144), the mean and
     // variance mirrored in f64 op for op (the lightning index key's own
-    // order), each output's two products and sum rounded on their own, and a
-    // bit-identical rerun. A row holding an inf leaves every value NaN and
-    // raises `F32Product`.
+    // order), each output's two products and sum rounded on their own, every
+    // output finite, and a bit-identical rerun. A row holding an inf leaves
+    // every value NaN and raises `F32Product`.
     {
         use bloomery_gpu::FaultSite;
         let ln_ref = |x: &[f32], gain: &[f32], bias: &[f32], eps: f32| -> Vec<f32> {
@@ -1189,14 +1189,17 @@ fn run() -> Result<(), GateError> {
                 && gpu
                     .take_fault()?
                     .is_some_and(|f| f.code == FaultSite::F32Product as u32);
-            let pass = band <= PLAIN_BAND * 64.0 && rerun && refused;
+            // `f32::max` drops a NaN, so a NaN output has no band: every
+            // output value must be finite on its own.
+            let finite = y.iter().all(|v| v.is_finite());
+            let pass = finite && band <= PLAIN_BAND * 64.0 && rerun && refused;
             println!(
-                "ln_rows {label}: band {band:.3e} (band {:.0e})",
+                "ln_rows {label}: band {band:.3e} (band {:.0e}) finite {finite}",
                 PLAIN_BAND * 64.0
             );
             ok &= pass;
             if !pass {
-                println!("ln_rows {label} FAIL");
+                println!("ln_rows {label} FAIL (rerun {rerun}, refused {refused})");
             }
         }
     }

@@ -43,6 +43,7 @@
 
 use bloomery_gpu::elem::rms_scale_checked;
 use bloomery_gpu::flash::{f16_finite, f32_to_f16_bits};
+use bloomery_gpu::latent::warp_sum_f64;
 use bloomery_gpu::{DeviceTensor, FaultSink, FaultSite, GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::float::{add_rn_f32, fma_rn_f32, mul_rn_f32};
@@ -161,20 +162,6 @@ pub(crate) fn ht_warp(n: [f32; PER_LANE], lane: u32) -> [f32; PER_LANE] {
         m <<= 1;
     }
     h
-}
-
-/// A warp's sum of one f64 a lane, the xor butterfly (16, 8, 4, 2, 1): every
-/// lane ends with the same sum. Every lane of the warp calls it (a warp
-/// collective).
-#[inline(always)]
-fn warp_sum_f64(v: f64) -> f64 {
-    let mut acc = v;
-    acc += warp::shuffle_xor_f64(acc, 16);
-    acc += warp::shuffle_xor_f64(acc, 8);
-    acc += warp::shuffle_xor_f64(acc, 4);
-    acc += warp::shuffle_xor_f64(acc, 2);
-    acc += warp::shuffle_xor_f64(acc, 1);
-    acc
 }
 
 /// The LayerNorm's statistics of a [`WIDTH`]-value key a warp holds, lane
