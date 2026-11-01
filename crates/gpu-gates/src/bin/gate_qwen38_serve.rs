@@ -1223,7 +1223,7 @@ mod gate {
                 let v = json_of("/completion", 200, &text)?;
                 Greedy {
                     ok: true,
-                    tokens: ids_of(&v["tokens"]),
+                    tokens: ids_of(&v["tokens"])?,
                     cache_n: v["timings"]["cache_n"].as_u64().unwrap_or(u64::MAX),
                     draft_n: v["timings"]["draft_n"].as_u64().unwrap_or(0),
                     joins: Vec::new(),
@@ -1472,7 +1472,10 @@ mod gate {
         let mut ok = true;
         let (st, body) = sampled;
         let drafted = serde_json::from_str::<Value>(body).unwrap_or(Value::Null);
-        let got = ids_of(&drafted["tokens"]);
+        let got = match st {
+            200 => ids_of(&drafted["tokens"])?,
+            _ => Vec::new(),
+        };
         println!("sampled on the drafted server: HTTP {st} tokens {got:?}");
         check(
             &mut ok,
@@ -1488,7 +1491,7 @@ mod gate {
         );
         let (st1, body1) = top1;
         let k1 = json_of("/completion", st1, body1)?;
-        let got1 = ids_of(&k1["tokens"]);
+        let got1 = ids_of(&k1["tokens"])?;
         println!("top_k 1 on the drafted server: tokens {got1:?}, greedy {first:?}");
         check(
             &mut ok,
@@ -2016,8 +2019,8 @@ mod gate {
                     ) {
                         drafts = (n, a);
                     }
-                    if v.get("tokens").is_some_and(Value::is_array) {
-                        tokens = ids_of(&v["tokens"]);
+                    if v.get("tokens").is_some() {
+                        tokens = ids_of(&v["tokens"]).map_err(|e| format!("curl {url}: {e}"))?;
                     }
                 }
                 let status = child.wait().map_err(|e| format!("curl {url}: {e}"))?;
@@ -2888,9 +2891,10 @@ mod gate {
                     "return_tokens": true, "cache_prompt": false,
                 });
                 let (st, reply) = curl(&url("/completion"), Some(&body), false)?;
-                let tokens = json_of("/completion", st, &reply)
-                    .map(|c| ids_of(&c["tokens"]))
-                    .unwrap_or_default();
+                let tokens = match st {
+                    200 => ids_of(&json_of("/completion", st, &reply)?["tokens"])?,
+                    _ => Vec::new(),
+                };
                 println!(
                     "churn-unhosted: the request: HTTP {st}, {} ids",
                     tokens.len()
@@ -3508,7 +3512,7 @@ mod gate {
         });
         let (st, body) = curl(&url("/completion"), Some(&completion), false)?;
         let c = json_of("/completion", st, &body)?;
-        let ids = ids_of(&c["tokens"]);
+        let ids = ids_of(&c["tokens"])?;
         let stop = c["stop_type"].as_str().unwrap_or("").to_owned();
         println!("width-cost tokens {ids:?} stop_type={stop}");
         // PIN(2026-10-30): this load's steps replace the plain run's ids: the draft's card
@@ -4735,9 +4739,10 @@ mod gate {
                     "return_tokens": true,
                 });
                 let (st, reply) = curl(&format!("http://{addr}/completion"), Some(&body), false)?;
-                let tokens = json_of("/completion", st, &reply)
-                    .map(|c| ids_of(&c["tokens"]))
-                    .unwrap_or_default();
+                let tokens = match st {
+                    200 => ids_of(&json_of("/completion", st, &reply)?["tokens"])?,
+                    _ => Vec::new(),
+                };
                 println!(
                     "paged: the residency server's request: HTTP {st}, {} ids",
                     tokens.len()
@@ -5289,7 +5294,7 @@ mod gate {
         });
         let (st, body) = curl(&url("/completion"), Some(&completion), false)?;
         let c1 = json_of("/completion", st, &body)?;
-        let first = ids_of(&c1["tokens"]);
+        let first = ids_of(&c1["tokens"])?;
         let stop = c1["stop_type"].as_str().unwrap_or("").to_owned();
         println!(
             "completion tokens {first:?} stop_type={stop} content={}",
@@ -5323,13 +5328,13 @@ mod gate {
         let c3 = json_of("/completion", st, &body)?;
         println!(
             "completion after the other requests {:?} cache_n={}",
-            ids_of(&c3["tokens"]),
+            ids_of(&c3["tokens"])?,
             c3["timings"]["cache_n"]
         );
         check(
             &mut ok,
             "completion_after_other_requests_identical",
-            ids_of(&c3["tokens"]) == first,
+            ids_of(&c3["tokens"])? == first,
         );
 
         ok &= props_ctx(&url)?;
@@ -5464,7 +5469,7 @@ mod gate {
         });
         let (st, body) = curl(&url("/completion"), Some(&completion), false)?;
         let c1 = json_of("/completion", st, &body)?;
-        let first = ids_of(&c1["tokens"]);
+        let first = ids_of(&c1["tokens"])?;
         let stop = c1["stop_type"].as_str().unwrap_or("").to_owned();
         println!(
             "completion tokens {first:?} stop_type={stop} content={}",

@@ -536,7 +536,7 @@ fn asked(
             .as_str()
             .ok_or_else(|| format!("{name}: the answer carries no content text"))?
             .to_owned(),
-        tokens: ids_of(&v["tokens"]),
+        tokens: ids_of(&v["tokens"])?,
     })
 }
 

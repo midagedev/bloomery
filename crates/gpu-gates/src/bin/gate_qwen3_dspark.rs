@@ -241,7 +241,7 @@ mod gate {
         let url = |p: &str| format!("http://{addr}{p}");
         let ids = tokenized(&url, PROMPT)?;
         let answer = completion(&url, &ids, N, false)?;
-        let tokens = ids_of(&answer["tokens"]);
+        let tokens = ids_of(&answer["tokens"])?;
         println!("{tag} {} tokens {tokens:?}", case.name);
         match arm {
             Some(Arm::Dspark(_)) => {

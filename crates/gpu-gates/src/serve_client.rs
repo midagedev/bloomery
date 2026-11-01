@@ -241,15 +241,21 @@ pub fn json_of(what: &str, status: u16, body: &str) -> Result<Value, GateError> 
     Ok(serde_json::from_str(body).map_err(|e| format!("{what}: {e}: {body}"))?)
 }
 
-/// The ids of a JSON array (entries that are not ids are left out).
-pub fn ids_of(v: &Value) -> Vec<u32> {
-    v.as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_u64().and_then(|i| u32::try_from(i).ok()))
-                .collect()
+/// The ids of a JSON array of token ids. Refused by name: a value that is
+/// no array, and an entry that is no integer in `u32`'s range, so a
+/// malformed answer never reaches a comparison as a shorter vector.
+pub fn ids_of(v: &Value) -> Result<Vec<u32>, GateError> {
+    let a = v
+        .as_array()
+        .ok_or_else(|| format!("token ids: {v} is no array"))?;
+    a.iter()
+        .enumerate()
+        .map(|(i, x)| {
+            x.as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| format!("token ids: entry {i} ({x}) is no u32 id in {v}").into())
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 /// A completion's draft counts, `timings.draft_n` and
@@ -289,8 +295,7 @@ pub struct LookupCompletion {
 impl LookupCompletion {
     /// Read every required field before the gate compares completions.
     pub fn read(answer: &Value, slots: u64, ctx: u64) -> Result<Self, GateError> {
-        let tokens: Vec<u32> = serde_json::from_value(answer["tokens"].clone())
-            .map_err(|e| format!("lookup completion: tokens: {e}"))?;
+        let tokens = ids_of(&answer["tokens"]).map_err(|e| format!("lookup completion: {e}"))?;
         if tokens.is_empty() {
             return Err("lookup completion: tokens is empty".into());
         }
@@ -601,7 +606,7 @@ pub fn tokenized(url: &dyn Fn(&str) -> String, text: &str) -> Result<Vec<u32>, G
         Some(&json!({ "content": text, "add_special": false })),
         false,
     )?;
-    Ok(ids_of(&json_of("/tokenize", st, &body)?["tokens"]))
+    ids_of(&json_of("/tokenize", st, &body)?["tokens"])
 }
 
 /// The ids of `messages` as the server's chat template renders them
@@ -951,8 +956,7 @@ pub fn stepped_completion(
         proposed = proposed
             .checked_add(draft_counts(&s)?.0)
             .ok_or("step reference: draft count overflow")?;
-        let ids: Vec<u32> = serde_json::from_value(s["tokens"].clone())
-            .map_err(|e| format!("step reference: tokens: {e}"))?;
+        let ids = ids_of(&s["tokens"]).map_err(|e| format!("step reference: {e}"))?;
         match ids.as_slice() {
             [id] => {
                 prefix.push(*id);
@@ -992,7 +996,7 @@ pub fn greedy(
     let (st, text) = completion_raw(url, &prompt, n, cache)?;
     std::fs::write(dir.join(format!("{name}.json")), &text)?;
     let v = json_of("/completion", st, &text)?;
-    let tokens = ids_of(&v["tokens"]);
+    let tokens = ids_of(&v["tokens"])?;
     let stop = v["stop_type"].as_str().unwrap_or("").to_owned();
     let cache_n = v["timings"]["cache_n"]
         .as_u64()
@@ -1464,7 +1468,7 @@ mod tests {
         assert!(draft_counts(&drafted).unwrap().0 > 0, "{drafted}");
         let (steps, count) = stepped_completion(&url, &ids, 16).unwrap();
         assert_eq!(count, 0, "the reference drafted {count} ids");
-        assert_eq!(steps, ids_of(&drafted["tokens"]));
+        assert_eq!(steps, ids_of(&drafted["tokens"]).unwrap());
         assert_eq!(stepped_completion(&url, &ids, 0).unwrap(), (vec![], 0));
         assert_eq!(stepped_completion(&url, &ids, 1).unwrap().0.len(), 1);
         assert_eq!(
@@ -1575,6 +1579,30 @@ mod tests {
                 LookupCompletion::read(&answer, 2, 4096).is_err(),
                 "{answer}"
             );
+        }
+    }
+
+    /// A response's ids are every entry of an array of `u32` ids; a value that is no
+    /// array and an entry that is no such id are refused by name, never left out.
+    #[test]
+    fn ids_of_refuses_what_is_no_id() {
+        assert_eq!(ids_of(&json!([7, 0, u32::MAX])).unwrap(), [7, 0, u32::MAX]);
+        assert_eq!(ids_of(&json!([])).unwrap(), Vec::<u32>::new());
+        for (bad, entry) in [
+            (json!([7, null, 8]), "entry 1 (null)"),
+            (json!([7, u64::from(u32::MAX) + 1]), "entry 1 (4294967296)"),
+            (json!([-1]), "entry 0 (-1)"),
+            (json!([1.5]), "entry 0 (1.5)"),
+            (json!(["7"]), "entry 0 (\"7\")"),
+        ] {
+            let e = ids_of(&bad)
+                .expect_err("an entry that is no id")
+                .to_string();
+            assert!(e.contains(entry), "{bad}: {e}");
+        }
+        for bad in [json!(null), json!({}), json!("7,8")] {
+            let e = ids_of(&bad).expect_err("no array").to_string();
+            assert!(e.ends_with("is no array"), "{bad}: {e}");
         }
     }
 

@@ -531,7 +531,7 @@ mod gate {
         let body = json!({"prompt": ids, "n_predict": N_PREDICT, "temperature": 0,
             "ignore_eos": true, "return_tokens": true, "cache_prompt": false});
         let (status, text) = curl(&url("/completion"), Some(&body), false)?;
-        Ok(ids_of(&json_of("/completion", status, &text)?["tokens"]))
+        ids_of(&json_of("/completion", status, &text)?["tokens"])
     }
 
     fn refusal(

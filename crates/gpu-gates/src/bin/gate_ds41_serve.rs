@@ -505,7 +505,7 @@ mod gate {
         });
         let (st, body) = curl(&url("/completion"), Some(&body), false)?;
         let v = json_of("/completion", st, &body)?;
-        let ids = ids_of(&v["tokens"]);
+        let ids = ids_of(&v["tokens"])?;
         println!(
             "sampled seed {seed} top_k {top_k}: {ids:?} stop_type={}",
             v["stop_type"]
@@ -674,7 +674,7 @@ mod gate {
             .ok_or("/apply-template gave no prompt")?
             .to_owned();
         let (st, body) = curl(&url("/tokenize"), Some(&json!({"content": text})), false)?;
-        Ok(ids_of(&json_of("/tokenize", st, &body)?["tokens"]))
+        ids_of(&json_of("/tokenize", st, &body)?["tokens"])
     }
 
     /// A JSON count as a `usize`; `None` when it is not one.
@@ -818,7 +818,7 @@ mod gate {
             });
             let (code, text) = curl(&url("/completion"), Some(&body), false)?;
             let v = json_of("/completion", code, &text)?;
-            fresh.push((ids_of(&v["tokens"]), v));
+            fresh.push((ids_of(&v["tokens"])?, v));
         }
         let thinking = s.kwargs["thinking"] == json!(true);
         let mut before = ledger.clone();
@@ -930,7 +930,7 @@ mod gate {
             Some(&json!({"content": bos_text})),
             false,
         )?;
-        let bos = ids_of(&json_of("/tokenize", code, &body)?["tokens"]);
+        let bos = ids_of(&json_of("/tokenize", code, &body)?["tokens"])?;
         let mut ledger = Ledger(vec![bos]);
         let rules_text: String = (1..=LONG_RULES)
             .map(|i| {
@@ -1068,7 +1068,7 @@ mod gate {
             Some(&json!({"content": serve::reasoning::THINK_CLOSE})),
             false,
         )?;
-        let close = ids_of(&json_of("/tokenize", st, &body)?["tokens"]);
+        let close = ids_of(&json_of("/tokenize", st, &body)?["tokens"])?;
         // A run's ids, from a reset cache.
         let run = |prompt: &[u32], budget: Value, n: usize| -> Result<Vec<u32>, GateError> {
             let body = json!({
@@ -1076,7 +1076,7 @@ mod gate {
                 "return_tokens": true, "cache_prompt": false, "reasoning_budget": budget,
             });
             let (st, text) = curl(&url("/completion"), Some(&body), false)?;
-            Ok(ids_of(&json_of("/completion", st, &text)?["tokens"]))
+            ids_of(&json_of("/completion", st, &text)?["tokens"])
         };
         let capped = run(&p, json!(THINK_BUDGET), THINK_PREDICT)?;
         let through = THINK_BUDGET + close.len();
@@ -1116,7 +1116,7 @@ mod gate {
         });
         let (st, body) = curl(&url("/completion"), Some(&body), false)?;
         let v = json_of("/completion", st, &body)?;
-        let ids = ids_of(&v["tokens"]);
+        let ids = ids_of(&v["tokens"])?;
         println!(
             "greedy prompt {} ids cache_prompt={cache}: cache_n={} tokens {ids:?}",
             prompt.len(),
@@ -1163,7 +1163,7 @@ mod gate {
             Some(&json!({"content": "<｜User｜>"})),
             false,
         )?;
-        let marker = ids_of(&json_of("/tokenize", st, &body)?["tokens"]);
+        let marker = ids_of(&json_of("/tokenize", st, &body)?["tokens"])?;
         let mark = p1
             .iter()
             .position(|id| marker.as_slice() == [*id])
@@ -1235,7 +1235,7 @@ mod gate {
         let (st, text) = curl(&url("/completion"), Some(&body), false)?;
         let v = json_of("/completion", st, &text)?;
         let slot = v["id_slot"].as_u64().unwrap_or(u64::MAX);
-        let ids = ids_of(&v["tokens"]);
+        let ids = ids_of(&v["tokens"])?;
         println!(
             "slot {slot}: prompt {} ids cache_prompt={cache}: cache_n={} tokens {ids:?}",
             prompt.len(),
@@ -1413,7 +1413,7 @@ mod gate {
             Some(&json!({"content": "", "add_special": true})),
             false,
         )?;
-        let mut taken = ids_of(&json_of("/tokenize", st, &body)?["tokens"]);
+        let mut taken = ids_of(&json_of("/tokenize", st, &body)?["tokens"])?;
         taken.extend(a.ids.first().into_iter().chain(a.ids.last()));
         Ok(taken)
     }
@@ -1429,7 +1429,7 @@ mod gate {
         taken: &mut Vec<u32>,
     ) -> Result<Vec<u32>, GateError> {
         let (st, body) = curl(&url("/tokenize"), Some(&json!({"content": text})), false)?;
-        let ids = ids_of(&json_of("/tokenize", st, &body)?["tokens"]);
+        let ids = ids_of(&json_of("/tokenize", st, &body)?["tokens"])?;
         match ids.first() {
             Some(&first) if !taken.contains(&first) => {
                 taken.push(first);
@@ -1574,7 +1574,7 @@ mod gate {
         let (rst, answer) = probe("/completion", Some(&body));
         let answered = rst == 200
             && serde_json::from_str::<Value>(&answer)
-                .is_ok_and(|v| ids_of(&v["tokens"]).len() == REUSE_PREDICT);
+                .is_ok_and(|v| ids_of(&v["tokens"]).is_ok_and(|t| t.len() == REUSE_PREDICT));
         println!(
             "other context {ctx}: restore HTTP {st} {e}; health {hst} {health}; a request: HTTP \
              {rst}"
@@ -2198,7 +2198,7 @@ mod gate {
         let mut alone = Vec::new();
         for body in &bodies {
             let (st, text) = curl(&url("/completion"), Some(body), false)?;
-            alone.push(ids_of(&json_of("/completion", st, &text)?["tokens"]));
+            alone.push(ids_of(&json_of("/completion", st, &text)?["tokens"])?);
         }
         let (decode0, busy0) = rounds(url)?;
         type Answer = Result<(u16, String), String>;
@@ -2220,7 +2220,7 @@ mod gate {
             let (st, text) = rx
                 .recv()
                 .map_err(|_| format!("slots: the {what} request's thread gave no answer"))??;
-            together.push(ids_of(&json_of("/completion", st, &text)?["tokens"]));
+            together.push(ids_of(&json_of("/completion", st, &text)?["tokens"])?);
         }
         let (decode1, busy1) = rounds(url)?;
         let swaps = metric(url, "swaps_total")?;
@@ -2289,7 +2289,7 @@ mod gate {
             let (st, text) = rx.recv().map_err(|_| {
                 format!("slots rounds: the {what} request's thread gave no answer")
             })??;
-            together.push(ids_of(&json_of("/completion", st, &text)?["tokens"]));
+            together.push(ids_of(&json_of("/completion", st, &text)?["tokens"])?);
         }
         let decode1 = rounds(url)?.0;
         let rounds_log =
@@ -2525,7 +2525,7 @@ mod gate {
         });
         let (st, body) = curl(&url("/completion"), Some(&body), false)?;
         let v = json_of("/completion", st, &body)?;
-        let ids = ids_of(&v["tokens"]);
+        let ids = ids_of(&v["tokens"])?;
         let t = v["timings"].clone();
         println!(
             "{what}: prompt {} ids cache_prompt={cache}: cache_n={} prompt_n={} draft_n={} \
@@ -2575,7 +2575,10 @@ mod gate {
         for (what, body) in cases {
             let (st, text) = curl(&url("/completion"), Some(&body), false)?;
             let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-            let ids = ids_of(&v["tokens"]);
+            let ids = match st {
+                200 => ids_of(&v["tokens"])?,
+                _ => Vec::new(),
+            };
             println!(
                 "{what} under the draft: HTTP {st} tokens {ids:?} draft_n={} error={}",
                 v["timings"]["draft_n"], v["error"]
@@ -2637,7 +2640,7 @@ mod gate {
         });
         let (st, body) = curl(&url("/completion"), Some(&completion), false)?;
         let c1 = json_of("/completion", st, &body)?;
-        let ids = ids_of(&c1["tokens"]);
+        let ids = ids_of(&c1["tokens"])?;
         let stop = c1["stop_type"].as_str().unwrap_or("").to_owned();
         let t = &c1["timings"];
         println!("completion tokens {ids:?} stop_type={stop}");
@@ -2959,7 +2962,7 @@ mod gate {
         });
         let (st, body) = curl(&url("/completion"), Some(&completion), false)?;
         let c1 = json_of("/completion", st, &body)?;
-        let ids = ids_of(&c1["tokens"]);
+        let ids = ids_of(&c1["tokens"])?;
         let stop = c1["stop_type"].as_str().unwrap_or("").to_owned();
         let t = &c1["timings"];
         println!("completion tokens {ids:?} stop_type={stop}");
@@ -3116,7 +3119,7 @@ mod gate {
         });
         let (st, body) = curl(&url("/completion"), Some(&completion), false)?;
         let c1 = json_of("/completion", st, &body)?;
-        let first = ids_of(&c1["tokens"]);
+        let first = ids_of(&c1["tokens"])?;
         let stop = c1["stop_type"].as_str().unwrap_or("").to_owned();
         println!(
             "completion tokens {first:?} stop_type={stop} content={}",
@@ -3196,13 +3199,13 @@ mod gate {
         let again = json_of("/completion", st, &body)?;
         println!(
             "completion again {:?} cache_n={}",
-            ids_of(&again["tokens"]),
+            ids_of(&again["tokens"])?,
             again["timings"]["cache_n"]
         );
         check(
             &mut ok,
             "completion_after_reset_identical",
-            ids_of(&again["tokens"]) == first,
+            ids_of(&again["tokens"])? == first,
         );
         // Right after itself: the cache holds the prompt and all but the last
         // generated id, so the prompt shares all n of its ids and the last is
@@ -3215,7 +3218,7 @@ mod gate {
         let t = &repeat["timings"];
         println!(
             "completion repeated {:?} cache_n={} prompt_n={} (n {n}, at least {floor} kept)",
-            ids_of(&repeat["tokens"]),
+            ids_of(&repeat["tokens"])?,
             t["cache_n"],
             t["prompt_n"],
         );
@@ -3230,7 +3233,7 @@ mod gate {
         check(
             &mut ok,
             "repeat_ids_identical",
-            ids_of(&repeat["tokens"]) == first,
+            ids_of(&repeat["tokens"])? == first,
         );
 
         let reuse = |prompt: &[u32], cache: bool| -> Result<(Vec<u32>, Value), GateError> {
@@ -3240,7 +3243,7 @@ mod gate {
             });
             let (st, body) = curl(&url("/completion"), Some(&body), false)?;
             let v = json_of("/completion", st, &body)?;
-            let ids = ids_of(&v["tokens"]);
+            let ids = ids_of(&v["tokens"])?;
             let t = &v["timings"];
             println!(
                 "reuse prompt {} ids cache_prompt={cache}: cache_n={} prompt_n={} tokens {ids:?}",

@@ -169,7 +169,7 @@ mod gate {
             Some(&json!({ "content": text, "add_special": true })),
             false,
         )?;
-        let raw = ids_of(&json_of("/tokenize", st, &body)?["tokens"]);
+        let raw = ids_of(&json_of("/tokenize", st, &body)?["tokens"])?;
         let answer = chatted(
             url,
             dir,
