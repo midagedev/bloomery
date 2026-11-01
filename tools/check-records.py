@@ -870,6 +870,32 @@ def self_test():
             hit = [p for p in problems if "vision_seat.rs" in p and "TOP2" in p]
             if not hit:
                 fails.append(f"a TOP2 line in vision_seat.rs is not named: {problems[:3]}")
+            with open(vs, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            host_tier = os.path.join(top, SRC, "record/host_tier.rs")
+            record = os.path.join(top, RECORD)
+            for path, old, new, want in [
+                (record, "pub const ARENA: &[&Kind] = &[&NVTIER];", "pub const ARENA: &[&Kind] = &[];", "constructs NVTIER"),
+                (record, "pub const CENSUS: &[&Kind] = &[&TIER_CENSUS];", "pub const CENSUS: &[&Kind] = &[];", "constructs TIER_CENSUS"),
+                (host_tier, 'record::require(record::groups::host_tier::ARENA, "host_tier::eprint_nvtier");', "", "groups::host_tier::ARENA is required by no"),
+                (host_tier, 'record::require(record::groups::host_tier::CENSUS, "CensusSpan::mark");', "", "groups::host_tier::CENSUS is required by no"),
+            ]:
+                with open(path, encoding="utf-8") as fh:
+                    original = fh.read()
+                if original.count(old) != 1:
+                    fails.append(f"host-tier mutant {want}: expected one mutation site")
+                    continue
+                try:
+                    with open(path, "w", encoding="utf-8") as fh:
+                        fh.write(original.replace(old, new, 1))
+                    problems, _, _ = check_tree(recipes.Tree(top, meta=meta))
+                    if not any("host_tier.rs" in p and want in p for p in problems):
+                        fails.append(f"host-tier mutant {want}: {problems}")
+                    else:
+                        print(f"check-records: FAIL-first host-tier {want}: ok")
+                finally:
+                    with open(path, "w", encoding="utf-8") as fh:
+                        fh.write(original)
         finally:
             shutil.rmtree(top, ignore_errors=True)
     else:

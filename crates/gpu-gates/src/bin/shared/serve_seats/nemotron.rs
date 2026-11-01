@@ -294,7 +294,7 @@ fn prefill_bolt(m: &mut NemotronHMoeModel, ids: &[u32]) -> Result<u32, GpuError>
 /// The load's cumulative `nvtier` record on stderr, on a placed load whose
 /// plan paged routed experts; nothing on any other load.
 fn print_nvtier(m: &NemotronHMoeModel) -> Result<(), GpuError> {
-    record::eprint_nvtier(m.body(NAME)?.placed().and_then(|p| p.hybrid().nvme_tier()));
+    record::host_tier::eprint_nvtier(m.body(NAME)?.placed().and_then(|p| p.hybrid().nvme_tier()));
     Ok(())
 }
 

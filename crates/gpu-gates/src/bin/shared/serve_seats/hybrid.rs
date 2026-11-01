@@ -113,6 +113,9 @@ pub trait Family: Sized + 'static {
 pub struct Hybrid<F: Family> {
     s: Session<F::Body>,
     ctx: usize,
+    /// The `tier census` records' span start ([`record::host_tier::CensusSpan`]): each
+    /// prompt prints the steps since the last one's, then its own.
+    census: record::host_tier::CensusSpan,
 }
 
 /// The open's records: the plan's expert counts are kept until the step is
@@ -189,7 +192,7 @@ impl<F: Family> Log<F> {
             .f("load_s", total.as_secs_f64())
             .eprint();
         record::eprint_load_phases(m, total, self.opened);
-        record::eprint_nvtier(m.body(F::NAME).ok().and_then(|b| b.hybrid().nvme_tier()));
+        record::host_tier::eprint_nvtier(m.body(F::NAME).ok().and_then(|b| b.hybrid().nvme_tier()));
     }
 }
 
@@ -238,7 +241,13 @@ fn open_session<F: Family>(a: Open<()>) -> Result<Hybrid<F>, GateError> {
         .ready(&mut log)?;
     <F::Body as Batch>::Sequences::add(&mut s, a.slots)?;
     log.record(s.model());
-    Ok(Hybrid { s, ctx: a.ctx })
+    let mut census = record::host_tier::CensusSpan::default();
+    census.mark("load", record::census_of(s.model().body(F::NAME)?.hybrid()));
+    Ok(Hybrid {
+        s,
+        ctx: a.ctx,
+        census,
+    })
 }
 
 impl<F: Family> Seat for Hybrid<F> {
@@ -259,10 +268,15 @@ impl<F: Family> Seat for Hybrid<F> {
     }
 
     /// The prompt in batches (`app::Prompt for Body`), the argmax after the
-    /// last.
+    /// last;
+    /// the `tier census` records of the steps since the last prompt and of
+    /// this one, then the `nvtier` record.
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
+        self.census
+            .steps(Some(self.s.model().body(F::NAME)?.hybrid()));
         let next = <F::Body as Prompt>::prompt(self.s.model_mut(), ids)?;
-        record::eprint_nvtier(self.s.model().body(F::NAME)?.hybrid().nvme_tier());
+        self.census
+            .prompt(Some(self.s.model().body(F::NAME)?.hybrid()));
         Ok(next)
     }
 

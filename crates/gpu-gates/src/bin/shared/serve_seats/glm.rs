@@ -1484,7 +1484,7 @@ impl OpenLog<Body> for Log {
         }
         // The NVMe expert tier's arena as the load was granted it, beside
         // the one its plan reserved; a load with no tier prints nothing.
-        record::eprint_nvtier(b.nvme_tier());
+        record::host_tier::eprint_nvtier(b.nvme_tier());
         match &self.draft_off {
             Some(why) => Record::new(&record::LOAD_DRAFT_OFF_GLM)
                 .w("why", why)

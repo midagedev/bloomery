@@ -1008,19 +1008,10 @@ fn lane_of(s: &Session<Body38>) -> Result<Option<LaneStats>, GateError> {
         .map(|m| m.lane_stats()))
 }
 
-/// The load's tier census since the load (`HostTier::census`): `None` on a
-/// load with no tier.
+/// The load's tier census since the load (`HostTier::census`).
 fn census_of(s: &Session<Body38>) -> Result<Option<TierCensus>, GateError> {
     let b = s.model().body(NAME)?;
-    Ok(b.hybrid().census(b.nvme_tier().map(|t| &**t)))
-}
-
-/// The `tier census` record of span `c`, phase `phase`.
-fn census_record(phase: &str, c: &TierCensus) -> Record {
-    c.fields().iter().fold(
-        Record::new(&record::TIER_CENSUS).w("phase", phase),
-        |r, &(k, v)| r.u(k, v),
-    )
+    Ok(record::census_of(b.hybrid()))
 }
 
 /// The tier's own drop of every run of `regions` ([`NvTier::drop_layer`]).
@@ -3045,7 +3036,7 @@ fn run() -> Result<(), GateError> {
     census.push(("slots_mid", 2 * STEP_COLS, mid_census));
     let mut census_ok = census.len() == 4;
     for (phase, tokens, c) in &census {
-        census_record(phase, c).print();
+        record::census_record(phase, c).print();
         census_ok &= c.picks > 0 && c.adds_up() && c.tokens == *tokens as u64;
         if *phase == "prompt" {
             // The prompt's union reads each tier id from its arena slot: the
