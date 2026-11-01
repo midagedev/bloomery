@@ -488,7 +488,13 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
             && !kept(walk)
         {
             retain(walk, rows - 1, pos)?;
-            self.last_unit = Some((self.shape.step, 1));
+            self.last_unit = None;
+            self.next = Some(Refresh {
+                tokens: vec![0],
+                pos0: pos,
+                walk: self.shape.step,
+                first: 0,
+            });
         }
         Ok(())
     }
@@ -852,7 +858,7 @@ mod tests {
 
     #[test]
     fn retain_prompt_keeps_the_anchor_when_another_sequence_overwrites_the_prompt_arena() {
-        for begun in [false, true] {
+        for (begun, stepped) in [(false, false), (true, false), (false, true)] {
             let mut rig = Rig::new(64);
             rig.prompt(&IDS, 4, Ar::Ubatch).unwrap();
             if begun {
@@ -884,10 +890,17 @@ mod tests {
             assert_eq!(parked.skip, None);
             rig.p.restart();
             rig.p.unpark(&parked);
-            if !begun {
+            if stepped {
+                rig.plain_step().unwrap();
+                assert_eq!(rig.c.store, (pos + 1) as usize);
+            } else if !begun {
                 rig.begin().unwrap();
             }
-            let chain = rig.p.chain(pos, rig.c.ctx, rig.last, 4).unwrap().unwrap();
+            let chain = rig
+                .p
+                .chain(rig.c.pos, rig.c.ctx, rig.last, 4)
+                .unwrap()
+                .unwrap();
             assert_eq!((chain.refresh.walk, chain.refresh.first), (Ar::Step, 0));
             rig.c.walk(&chain.refresh.as_walk(STORE)).unwrap();
         }
