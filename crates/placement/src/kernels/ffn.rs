@@ -137,6 +137,19 @@ impl RoutedBatch {
     }
 }
 
+/// How a load's card route holds a run's rows between the routing and the
+/// down GEMM: a model reads its file's form and counts a run token's card
+/// bytes by it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteForm {
+    /// The gate and up GEMMs read the run's rows in the q8_1 or the 32-value
+    /// form and write f32 rows.
+    Rows,
+    /// One native FP4 launch runs the gate, the up and the SwiGLU over the
+    /// run's rows in the native FP4 form alone.
+    Native,
+}
+
 /// Prompt walk units and the shared host-sum upload buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PromptWalk {

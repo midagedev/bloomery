@@ -204,6 +204,7 @@ generate_ds41   gemm_iq3s                                8           8
 # scalar global loads 72 -> 138); 7d4d5f6d8 moved this entry's sm_86 reading in sm_86-cc12.1.tsv from 0 to 16.
 generate_ds41   gemm_iq3xxs                             16           8
 generate_ds41   gemm_iq4nl               0  0
+generate_ds41   gemm_iq4nl_bf16          0  0
 generate_ds41   gemm_iq4xs               0  0
 # PIN(2026-11-01): each new gemm_*_bf16 entry is its F32 entry's body with the BF16 store, pinned at that entry's values until a scan on this table's arch and capability.
 generate_ds41   gemm_iq4xs_bf16                          0           0
@@ -222,12 +223,15 @@ generate_ds41   gemm_q3k_bf16                            0           0
 generate_ds41   gemm_q4k                                 0           0
 generate_ds41   gemm_q4k_bf16                            0           0
 generate_ds41   gemm_q5_0p                               0           0
+generate_ds41   gemm_q5_0p_bf16                          0           0
 generate_ds41   gemm_q5_1                                0           0
+generate_ds41   gemm_q5_1_bf16                           0           0
 generate_ds41   gemm_q5k                                 0           0
 generate_ds41   gemm_q5k_bf16                            0           0
 generate_ds41   gemm_q6k                                 0           0
 generate_ds41   gemm_q6k_bf16                            0           0
 generate_ds41   gemm_q8_0f                               0           0
+generate_ds41   gemm_q8_0f_bf16                          0           0
 generate_ds41   gemm_q8_0p                               0           0
 generate_ds41   gemm_q8_0p_bf16                          0           0
 generate_ds41   gemm_q8_0p_slab                          0           0

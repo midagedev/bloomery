@@ -39,8 +39,7 @@
 //!   host leg the shared expert runs first and each run's card sum is the
 //!   block's output with its gated rows added (`card_sum_join`),
 //!   no acc, no host sum and nothing left for the back; when every layer
-//!   runs so over NVFP4 downs in the native FP4 form, the down rows are
-//!   BF16 (`Down38`);
+//!   runs so, the down rows of every down type are BF16 (`Down38`);
 //! - the selecting layer's rows the prefill flash while `qsa::scored` says a
 //!   row selects nothing (every key below its count), the selection and the
 //!   prefill flash over each row's list in runs of the arena's selection rows
@@ -836,9 +835,9 @@ pub(super) enum CardSum<'b> {
 }
 
 /// A card route's down rows ([`CardRoute38`]'s): BF16 bits on a load whose
-/// every layer runs without a host leg over NVFP4 downs in the native FP4
-/// form, which the down product stores (`enqueue_gemm32_bf16`) and the
-/// block's card sum reads; F32 on any other load.
+/// every layer runs without a host leg, which the down product of every type
+/// stores (`enqueue_gemm32_bf16`) and the block's card sum reads
+/// (`card_sum_join_bf16`); F32 on any other load.
 enum Down38 {
     F32(DeviceBuffer<f32>),
     Bf16(DeviceBuffer<u16>),
@@ -1017,10 +1016,7 @@ impl CardRoute38 {
                 card.routed_types().map(|(_, down)| down),
             )?
         };
-        let bf16_down = !tiered
-            && card.all_hostless()
-            && act.has_native_form()
-            && card.routed_types().all(|(_, down)| down == GgmlType::NVFP4);
+        let bf16_down = !tiered && card.all_hostless();
         let fused = act.has_native_form() && card.blocks32_gate_up() && all_nvfp4;
         let product_cells = if fused { 0 } else { slots * geo::FF };
         Ok(CardRoute38 {

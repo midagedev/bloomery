@@ -214,6 +214,7 @@ generate_ds41 gemm_iq2xxs 0 0
 generate_ds41 gemm_iq3s 24 16
 generate_ds41 gemm_iq3xxs 0 0
 generate_ds41 gemm_iq4nl 0 0
+generate_ds41 gemm_iq4nl_bf16 0 0
 generate_ds41 gemm_iq4xs 0 0
 # PIN(2026-11-01): each new gemm_*_bf16 entry is its F32 entry's body with the BF16 store, pinned at that entry's values until a scan on this table's arch and capability.
 generate_ds41 gemm_iq4xs_bf16 0 0
@@ -235,7 +236,9 @@ generate_ds41 gemm_q3k_bf16 0 0
 generate_ds41 gemm_q4k 0 0
 generate_ds41 gemm_q4k_bf16 0 0
 generate_ds41 gemm_q5_0p 0 0
+generate_ds41 gemm_q5_0p_bf16 0 0
 generate_ds41 gemm_q5_1 0 0
+generate_ds41 gemm_q5_1_bf16 0 0
 generate_ds41 gemm_q5k 0 0
 generate_ds41 gemm_q5k_bf16 0 0
 # PIN(2026-10-23): ptxas and the cc 12.1 JIT on GB10, driver 595.84, CUDA 13.3.1. The bytes over 212 and 48 are the exact walk's, which runs only for a tile whose F32 walk leaves the F32 range: the same scan at sm_121 with that walk compiled out holds 212 and 48.
@@ -243,6 +246,7 @@ generate_ds41 gemm_q6k 532 64
 # PIN(2026-11-01): gemm_q6k_bf16 at gemm_q6k's values, its body with the BF16 store, until a scan on this table's arch and capability.
 generate_ds41 gemm_q6k_bf16 532 64
 generate_ds41 gemm_q8_0f 0 0
+generate_ds41 gemm_q8_0f_bf16 0 0
 generate_ds41 gemm_q8_0p 0 0
 generate_ds41 gemm_q8_0p_bf16 0 0
 generate_ds41 gemm_q8_0p_slab 0 0

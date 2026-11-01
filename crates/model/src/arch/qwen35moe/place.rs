@@ -1439,10 +1439,12 @@ pub const CARD_ROUTE_ROWS: u64 = 2_048;
 /// gate·up the 32-value GEMM reads in its one input form, a `GemmAct32` of
 /// 3,200 B a column (40 steps of 80 B); the gate and up f32 rows
 /// 2 · 10 · 640 · 4 = 51,200 B; the SwiGLU `GemmAct32` at K = 640, 800 B a
-/// column, 8,000 B; the down f32 rows 10 · 2,560 · 4 = 102,400 B; two route
-/// tables — the cols list 2 · 40 B, their tile words at the most experts
-/// 2 · 8 · (320 + 512) / 2,048 = 3.25 B, the counts; the identity map of
-/// the ids compression 512 words = 1 B: 170,272 + 87.6 + 1, rounded up].
+/// column, 8,000 B; the down f32 rows 10 · 2,560 · 4 = 102,400 B (a load
+/// whose every layer runs without the host leg keeps them in BF16, half);
+/// two route tables — the cols list 2 · 40 B, their tile words at the most
+/// experts 2 · 8 · (320 + 512) / 2,048 = 3.25 B, the counts; the identity
+/// map of the ids compression 512 words = 1 B: 170,272 + 87.6 + 1, rounded
+/// up].
 pub const CARD_ROUTE_RUN_TOKEN_BYTES: u64 = 170_360;
 
 /// Card bytes a ubatch walk's card route holds a run token in
@@ -1464,29 +1466,16 @@ pub const CARD_ROUTE_RUN_TOKEN_BYTES: u64 = 170_360;
 /// [`CARD_ROUTE_RUN_TOKEN_BYTES`].
 pub const NATIVE_ROUTE_RUN_TOKEN_BYTES: u64 = 108_172;
 
-/// How a load's card route holds a run's rows between the routing and the
-/// down GEMM, which the plan counts a run token by
-/// ([`card_route_scratch_bytes`]); a load reads its file's form
-/// ([`PlanInputs::route_form`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RouteForm {
-    /// The gate and up GEMMs read the run's rows in the q8_1 or the 32-value
-    /// form and write f32 rows ([`CARD_ROUTE_RUN_TOKEN_BYTES`]).
-    Rows,
-    /// One native FP4 launch runs the gate, the up and the SwiGLU over the
-    /// run's rows in the native FP4 form alone
-    /// ([`NATIVE_ROUTE_RUN_TOKEN_BYTES`]).
-    Native,
-}
+pub use crate::placement::kernels::ffn::RouteForm;
 
-impl RouteForm {
-    /// The card bytes a run token of the route holds in this form.
-    #[must_use]
-    pub const fn run_token_bytes(self) -> u64 {
-        match self {
-            RouteForm::Rows => CARD_ROUTE_RUN_TOKEN_BYTES,
-            RouteForm::Native => NATIVE_ROUTE_RUN_TOKEN_BYTES,
-        }
+/// The card bytes a run token of the route holds in `form`
+/// ([`CARD_ROUTE_RUN_TOKEN_BYTES`], [`NATIVE_ROUTE_RUN_TOKEN_BYTES`]), which
+/// the plan counts a run token by ([`card_route_scratch_bytes`]); a load
+/// reads its file's form ([`PlanInputs::route_form`]).
+const fn route_token_bytes(form: RouteForm) -> u64 {
+    match form {
+        RouteForm::Rows => CARD_ROUTE_RUN_TOKEN_BYTES,
+        RouteForm::Native => NATIVE_ROUTE_RUN_TOKEN_BYTES,
     }
 }
 
@@ -1506,7 +1495,7 @@ pub const fn card_route_scratch_bytes(u: u64, form: RouteForm) -> u64 {
     } else {
         CARD_ROUTE_ROWS
     };
-    run * form.run_token_bytes() + u * CARD_ROUTE_ACC_TOKEN_BYTES
+    run * route_token_bytes(form) + u * CARD_ROUTE_ACC_TOKEN_BYTES
 }
 
 /// Card bytes the ubatch walk's card route holds past
@@ -1530,7 +1519,7 @@ pub const fn card_tier_join_bytes(u: u64) -> u64 {
 /// Card bytes a tier layer's join keeps a token of the unit past the card
 /// route's run: its card slots' down rows and places [derived:
 /// 10 · 2,560 · 4 + 10 · 4], which a run holds a run token too
-/// ([`RouteForm::run_token_bytes`]).
+/// ([`route_token_bytes`]).
 const JOIN_TOKEN_BYTES: u64 = 102_440;
 
 /// What a stage card's reserve for its card route's run of the whole
@@ -1543,7 +1532,7 @@ const ROUTE_UNIT_RESERVE: &str = "card route's whole-ubatch run";
 /// The card bytes the card route's run in `form` of a whole ubatch of up
 /// to `u` positions holds past its runs of [`CARD_ROUTE_ROWS`] tokens: the
 /// `u − min(u, CARD_ROUTE_ROWS)` run tokens more
-/// ([`RouteForm::run_token_bytes`]), less on a load with an expert tier
+/// ([`route_token_bytes`]), less on a load with an expert tier
 /// (`tiered`) the down rows and places the join already keeps for them
 /// ([`card_tier_join_bytes`]). 0 for a ubatch of one such run; saturated
 /// past u64 bytes, which no card holds.
@@ -1551,9 +1540,9 @@ const ROUTE_UNIT_RESERVE: &str = "card route's whole-ubatch run";
 const fn route_unit_bytes(u: u64, tiered: bool, form: RouteForm) -> u64 {
     let past = u.saturating_sub(CARD_ROUTE_ROWS);
     let token = if tiered {
-        form.run_token_bytes() - JOIN_TOKEN_BYTES
+        route_token_bytes(form) - JOIN_TOKEN_BYTES
     } else {
-        form.run_token_bytes()
+        route_token_bytes(form)
     };
     past.saturating_mul(token)
 }

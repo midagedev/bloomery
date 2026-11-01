@@ -1865,10 +1865,10 @@ impl Gemm32Kernels {
 
     /// [`Gemm32Kernels::enqueue_gemm32`]'s products as BF16 bits, each value
     /// its F32 one rounded to nearest even (a value past the BF16 range an
-    /// infinity): NVFP4 planes over the native FP4 activation form or over
-    /// the q8 blocks of 32, and Q8_0 planes, the stacks a dense site reads;
-    /// another stack is refused by name, nothing launched. Asynchronous,
-    /// allocation-free, capturable.
+    /// infinity), for every stack it reads: NVFP4 planes over the native FP4
+    /// activation form or over the q8 blocks of 32, Q8_0 planes, and the
+    /// file's Q8_0, Q5_1 and IQ4_NL blocks and the packed Q5_0 (a routed
+    /// down's). Asynchronous, allocation-free, capturable.
     pub fn enqueue_gemm32_bf16(
         &self,
         stream: &CudaStream,
@@ -1923,14 +1923,14 @@ impl Gemm32Kernels {
                     scales.buf()
                 );
             }
-            _ => {
-                return Err(GpuError::shape(
-                    what,
-                    format!(
-                        "BF16 products of {} rows come from Q8_0 or NVFP4 planes",
-                        g.rows
-                    ),
-                ));
+            Gemm32Weight::Q8_0File(w) => launch!(prepare_gemm_q8_0f_bf16, gemm_q8_0f_bf16, w.buf()),
+            Gemm32Weight::Q5_1File(w) => launch!(prepare_gemm_q5_1_bf16, gemm_q5_1_bf16, w.buf()),
+            Gemm32Weight::Iq4NlFile(w) => {
+                launch!(prepare_gemm_iq4nl_bf16, gemm_iq4nl_bf16, w.buf())
+            }
+            Gemm32Weight::Q5_0Packed(w) => {
+                let s_words = launch_u32(what, "s_words", (g.kb as usize).div_ceil(2))?;
+                launch!(prepare_gemm_q5_0p_bf16, gemm_q5_0p_bf16, w.buf(), s_words);
             }
         }
         Ok(())

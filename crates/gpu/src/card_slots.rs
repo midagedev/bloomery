@@ -22,7 +22,7 @@
 //!   host: it raises [`FaultSite::ExpertId`] and its token's values are NaN.
 //!
 //! - **Join** (`card_sum_join`, `_bf16` over BF16 down rows): the sum above
-//!   at any slot count, then the shared expert's output added in the same
+//!   at its slot counts (the count as data), then the shared expert's output added in the same
 //!   launch, `(base + acc) + sh · g` with each step rounded — `g` a router
 //!   weight or 1, `base` the zeros of an empty host list or nothing — so a
 //!   layer whose host part is added later, or that has none, writes no sum
@@ -246,17 +246,8 @@ mod card_slots_kernels {
         }
         // SAFETY: i < n·m, and the launch contract gives every length the
         // helper's contract asks for at SLOTS_6 slots.
-        let v = unsafe {
-            card_acc_at(
-                down,
-                w,
-                sel,
-                (n, SLOTS_6, w_pitch as usize),
-                n_card,
-                fault,
-                i,
-            )
-        };
+        let v =
+            unsafe { card_acc_at::<SLOTS_6>(down, w, sel, n, n_card, w_pitch as usize, fault, i) };
         // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
         unsafe { *acc.get_unchecked_mut(i) = v };
     }
@@ -297,17 +288,8 @@ mod card_slots_kernels {
         }
         // SAFETY: i < n·m, and the launch contract gives every length the
         // helper's contract asks for at SLOTS_8 slots.
-        let v = unsafe {
-            card_acc_at(
-                down,
-                w,
-                sel,
-                (n, SLOTS_8, w_pitch as usize),
-                n_card,
-                fault,
-                i,
-            )
-        };
+        let v =
+            unsafe { card_acc_at::<SLOTS_8>(down, w, sel, n, n_card, w_pitch as usize, fault, i) };
         // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
         unsafe { *acc.get_unchecked_mut(i) = v };
     }
@@ -348,17 +330,8 @@ mod card_slots_kernels {
         }
         // SAFETY: i < n·m, and the launch contract gives every length the
         // helper's contract asks for at SLOTS_10 slots.
-        let v = unsafe {
-            card_acc_at(
-                down,
-                w,
-                sel,
-                (n, SLOTS_10, w_pitch as usize),
-                n_card,
-                fault,
-                i,
-            )
-        };
+        let v =
+            unsafe { card_acc_at::<SLOTS_10>(down, w, sel, n, n_card, w_pitch as usize, fault, i) };
         // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
         unsafe { *acc.get_unchecked_mut(i) = v };
     }
@@ -399,17 +372,8 @@ mod card_slots_kernels {
         }
         // SAFETY: i < n·m, and the launch contract gives every length the
         // helper's contract asks for at SLOTS_4 slots.
-        let v = unsafe {
-            card_acc_at(
-                down,
-                w,
-                sel,
-                (n, SLOTS_4, w_pitch as usize),
-                n_card,
-                fault,
-                i,
-            )
-        };
+        let v =
+            unsafe { card_acc_at::<SLOTS_4>(down, w, sel, n, n_card, w_pitch as usize, fault, i) };
         // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
         unsafe { *acc.get_unchecked_mut(i) = v };
     }
@@ -450,17 +414,8 @@ mod card_slots_kernels {
         }
         // SAFETY: i < n·m, and the launch contract gives every length the
         // helper's contract asks for at SLOTS_9 slots.
-        let v = unsafe {
-            card_acc_at(
-                down,
-                w,
-                sel,
-                (n, SLOTS_9, w_pitch as usize),
-                n_card,
-                fault,
-                i,
-            )
-        };
+        let v =
+            unsafe { card_acc_at::<SLOTS_9>(down, w, sel, n, n_card, w_pitch as usize, fault, i) };
         // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
         unsafe { *acc.get_unchecked_mut(i) = v };
     }
@@ -582,30 +537,35 @@ impl RowValues for &[u16] {
 }
 
 /// The card slots' sum of value `i` (token `t = i / n`, value `d = i % n`)
-/// of `N = slots` slots a token: `acc = fma(down[(Nt + j)·n + d], w[t·w_pitch
-/// + j], acc)` from zero for each slot `j` below `N` whose place `sel[Nt + j]`
-/// is below `n_card`, in ascending `j` — the order `runtime::combine::card_sum`
+/// of `N` slots a token: `acc = fma(down[(Nt + j)·n + d], w[t·w_pitch + j],
+/// acc)` from zero for each slot `j` below `N` whose place `sel[Nt + j]` is
+/// below `n_card`, in ascending `j` — the order `runtime::combine::card_sum`
 /// pins (this order is the gate); no other slot's rows or weight are read. A
 /// place in `[n_card, HOST)` raises [`FaultSite::ExpertId`] (from the token's
 /// value 0) and the value is NaN.
 ///
 /// SAFETY: `i < n · m` for an `m` with `down` holding `N · n · m` cells,
 /// `sel.len() >= N · m`, and `w.len() >= w_pitch · m` with `w_pitch >= N`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device helper: the entries' arguments flat (rust-quality R8)"
+)]
 #[inline(always)]
-pub(crate) unsafe fn card_acc_at(
+pub(crate) unsafe fn card_acc_at<const N: usize>(
     down: impl RowValues,
     w: &[f32],
     sel: &[u32],
-    (n, slots, w_pitch): (usize, usize, usize),
+    n: usize,
     n_card: u32,
+    w_pitch: usize,
     fault: FaultSink,
     i: usize,
 ) -> f32 {
     let (t, d) = (i / n, i % n);
     let mut acc = 0.0f32;
-    for j in 0..slots {
+    for j in 0..N {
         cuda_device::thread::__unroll_config::<0>();
-        let s = t * slots + j;
+        let s = t * N + j;
         // SAFETY: s < N·m <= sel.len() by this fn's contract.
         let place = unsafe { *sel.get_unchecked(s) };
         if place < n_card {
@@ -660,8 +620,20 @@ unsafe fn card_join_at(
     if i >= n * m {
         return;
     }
-    // SAFETY: i < n·m, and this fn's contract is the helper's.
-    let a = unsafe { card_acc_at(down, w, sel, (n, slots as usize, w_pitch), n_card, fault, i) };
+    let at = (n, n_card, w_pitch, fault, i);
+    // SAFETY: i < n·m, and this fn's contract is the helper's at `slots`
+    // slots. Another count than the launcher takes (`CardSlots`) reads
+    // nothing: its NaN raises `F32Product` in the join.
+    let a = unsafe {
+        match slots as usize {
+            SLOTS_4 => card_acc_at::<SLOTS_4>(down, w, sel, at.0, at.1, at.2, at.3, at.4),
+            SLOTS_6 => card_acc_at::<SLOTS_6>(down, w, sel, at.0, at.1, at.2, at.3, at.4),
+            SLOTS_8 => card_acc_at::<SLOTS_8>(down, w, sel, at.0, at.1, at.2, at.3, at.4),
+            SLOTS_9 => card_acc_at::<SLOTS_9>(down, w, sel, at.0, at.1, at.2, at.3, at.4),
+            SLOTS_10 => card_acc_at::<SLOTS_10>(down, w, sel, at.0, at.1, at.2, at.3, at.4),
+            _ => f32::NAN,
+        }
+    };
     // SAFETY: i < n·m <= sh.len() by this fn's contract.
     let s = unsafe { *sh.get_unchecked(i) };
     let g = if (gate as usize) < w_pitch {
@@ -675,6 +647,38 @@ unsafe fn card_join_at(
     // SAFETY: i < n·m <= y.len() by this fn's contract; thread i is y[i]'s
     // only writer.
     unsafe { *y.get_unchecked_mut(i) = out };
+}
+
+/// The launch of `n · m` threads over `slots` slots a token at a weights
+/// pitch of `w_pitch` (`card_sum_join`'s), refused by name as `what`'s for
+/// no value, token or slot, a pitch under the slot count, a count past one
+/// launch's grid, and a shared `gate` among the routed slots or past the
+/// pitch. The launch and `n · m`.
+fn slots_launch(
+    what: &'static str,
+    (n, m): (usize, usize),
+    (slots, w_pitch): (usize, usize),
+    gate: Option<usize>,
+) -> Result<(LaunchConfig1D, usize), GpuError> {
+    let gate_ok = gate.is_none_or(|g| g >= slots && g < w_pitch);
+    let nm = n.checked_mul(m).filter(|&nm| nm != 0);
+    let (Some(nm), true, true) = (nm, slots != 0 && w_pitch >= slots, gate_ok) else {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "{n} values of {m} tokens, {slots} slots at a weights pitch of {w_pitch}, the \
+                 shared gate {gate:?}: a value, a token and a slot, a pitch of the slot count or \
+                 more, and a gate past the routed slots within the pitch"
+            ),
+        ));
+    };
+    let grid = launch_u32(what, "grid", nm.div_ceil(THREADS as usize))?;
+    Ok((LaunchConfig1D::new(grid, THREADS, 0), nm))
+}
+
+/// `k · x` cells, or more than any buffer holds when the product wraps.
+fn cells(k: usize, x: usize) -> usize {
+    k.saturating_mul(x)
 }
 
 /// What [`CardSlotKernels::enqueue_places`] reads: `n` routed ids, and the
@@ -888,8 +892,8 @@ impl CardSlotKernels {
     }
 
     /// Enqueue the card sums of `a.m` tokens of `a.n_used` slots
-    /// (`ds41_ffn_card_acc` for 6, `_8` for 8, `_10` for 10; any other count
-    /// is refused by name): value `i` of token `t = i / a.n` into `acc[i]`,
+    /// (`ds41_ffn_card_acc` for 6, `_8` for 8, `_10` for 10, `_4` and `_9`;
+    /// any other count is refused by name): value `i` of token `t = i / a.n` into `acc[i]`,
     /// the card half of the combine; a card of no expert (`a.n_card` 0, every
     /// place [`HOST`]) sums to zeros. No value or token, a weights pitch
     /// under the slot count, and buffers short of `a.m` tokens are refused by
@@ -902,34 +906,20 @@ impl CardSlotKernels {
         a: &CardAcc<'_>,
         acc: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
+        let down = a.down;
         let slots = CardSlots::of(a.n_used).ok_or_else(|| CardSlots::refusal(a.n_used))?;
         let what = slots.entry();
-        let (nm, k) = (a.n * a.m, slots.n());
-        if nm == 0 || a.w_pitch < k {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "{} values of {} tokens, weights at a pitch of {} for {k} slots: a value and a \
-                     token, and a pitch of the slot count or more",
-                    a.n, a.m, a.w_pitch
-                ),
-            ));
-        }
-        for (name, len, need) in [
-            ("down", a.down.len(), k * nm),
-            ("w", a.w.len(), a.w_pitch * a.m),
-            ("sel", a.sel.len(), k * a.m),
-            ("acc", acc.len(), nm),
-        ] {
-            if len < need {
-                return Err(GpuError::shape(
-                    what,
-                    format!("{name} holds {len} words, {need} needed"),
-                ));
-            }
-        }
-        let grid = launch_u32(what, "grid", nm.div_ceil(THREADS as usize))?;
-        let cfg = LaunchConfig1D::new(grid, THREADS, 0);
+        let k = slots.n();
+        let (cfg, nm) = slots_launch(what, (a.n, a.m), (k, a.w_pitch), None)?;
+        short(
+            what,
+            &[
+                ("down", down.len(), cells(k, nm)),
+                ("w", a.w.len(), cells(a.w_pitch, a.m)),
+                ("sel", a.sel.len(), cells(k, a.m)),
+                ("acc", acc.len(), nm),
+            ],
+        )?;
         let (n, m, n_card, w_pitch) = (
             launch_u32(what, "n", a.n)?,
             launch_u32(what, "m", a.m)?,
@@ -941,31 +931,31 @@ impl CardSlotKernels {
             CardSlots::Six => {
                 let prep = mo.prepare_ds41_ffn_card_acc(cfg)?;
                 mo.ds41_ffn_card_acc(
-                    stream, &prep, a.down, a.w, a.sel, n, m, n_card, w_pitch, a.fault, acc,
+                    stream, &prep, down, a.w, a.sel, n, m, n_card, w_pitch, a.fault, acc,
                 )?;
             }
             CardSlots::Eight => {
                 let prep = mo.prepare_ds41_ffn_card_acc_8(cfg)?;
                 mo.ds41_ffn_card_acc_8(
-                    stream, &prep, a.down, a.w, a.sel, n, m, n_card, w_pitch, a.fault, acc,
+                    stream, &prep, down, a.w, a.sel, n, m, n_card, w_pitch, a.fault, acc,
                 )?;
             }
             CardSlots::Four => {
                 let prep = mo.prepare_ds41_ffn_card_acc_4(cfg)?;
                 mo.ds41_ffn_card_acc_4(
-                    stream, &prep, a.down, a.w, a.sel, n, m, n_card, w_pitch, a.fault, acc,
+                    stream, &prep, down, a.w, a.sel, n, m, n_card, w_pitch, a.fault, acc,
                 )?;
             }
             CardSlots::Nine => {
                 let prep = mo.prepare_ds41_ffn_card_acc_9(cfg)?;
                 mo.ds41_ffn_card_acc_9(
-                    stream, &prep, a.down, a.w, a.sel, n, m, n_card, w_pitch, a.fault, acc,
+                    stream, &prep, down, a.w, a.sel, n, m, n_card, w_pitch, a.fault, acc,
                 )?;
             }
             CardSlots::Ten => {
                 let prep = mo.prepare_ds41_ffn_card_acc_10(cfg)?;
                 mo.ds41_ffn_card_acc_10(
-                    stream, &prep, a.down, a.w, a.sel, n, m, n_card, w_pitch, a.fault, acc,
+                    stream, &prep, down, a.w, a.sel, n, m, n_card, w_pitch, a.fault, acc,
                 )?;
             }
         }
@@ -975,9 +965,9 @@ impl CardSlotKernels {
     /// Enqueue the block output of `a.m` tokens of `a.n` values
     /// ([`CardJoin`], `card_sum_join` or `_bf16` by the rows' form): the
     /// card sum of `a.n_used` slots ([`CardSlotKernels::enqueue_card_acc`]'s
-    /// order and faults) and the shared expert's gated output, `(base + acc)
-    /// + sh · g` ([`SharedJoin`]), into `y`, without writing the sum. No
-    /// value, token or slot, a weights pitch under the slot count, a gate
+    /// slot counts, order and faults) and the shared expert's gated output,
+    /// `(base + acc) + sh · g` ([`SharedJoin`]), into `y`, without writing the
+    /// sum. No value, token or slot, a weights pitch under the slot count, a gate
     /// among the routed slots or past the pitch, more than one launch's grid
     /// and a buffer short of them are refused by name, nothing launched. One
     /// launch. Asynchronous, allocation-free, capturable.
@@ -988,26 +978,9 @@ impl CardSlotKernels {
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         const WHAT: &str = "card_sum_join";
-        let nm = a.n.checked_mul(a.m).filter(|&nm| nm != 0);
-        let gate_ok = a.shared.gate.is_none_or(|g| g >= a.n_used && g < a.w_pitch);
-        let (Some(nm), true, true) = (nm, a.n_used != 0 && a.w_pitch >= a.n_used, gate_ok) else {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "{} values of {} tokens, {} slots at a weights pitch of {}, the shared gate \
-                     {:?}: a value, a token and a slot, a pitch of the slot count or more, and a \
-                     gate past the routed slots within the pitch",
-                    a.n, a.m, a.n_used, a.w_pitch, a.shared.gate
-                ),
-            ));
-        };
-        // The grid bounds n·m; the slot and pitch multiples are checked.
-        let cfg = LaunchConfig1D::new(
-            launch_u32(WHAT, "grid", nm.div_ceil(THREADS as usize))?,
-            THREADS,
-            0,
-        );
-        let cells = |k: usize, x: usize| k.checked_mul(x).unwrap_or(usize::MAX);
+        CardSlots::of(a.n_used).ok_or_else(|| CardSlots::refusal(a.n_used))?;
+        let shape = (a.n_used, a.w_pitch);
+        let (cfg, nm) = slots_launch(WHAT, (a.n, a.m), shape, a.shared.gate)?;
         short(
             WHAT,
             &[
@@ -1067,6 +1040,134 @@ mod tests {
             std::array::from_fn(|j| w[t * w_pitch + j]),
             std::array::from_fn(|j| sel[t * N + j] < n_card),
         )
+    }
+
+    /// Both card sum launchers refuse empty or overflowing geometry and
+    /// short buffers through their common checks, naming the same input.
+    #[test]
+    #[ignore = "needs CUDA buffers; `just gate-gpu-lib` runs it on the box"]
+    fn hw_the_card_sum_launchers_refuse_invalid_shapes() {
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let stream = gpu.stream();
+        let kernels = CardSlotKernels::load(gpu.context()).expect("the card slots' module");
+        let mut red = Vec::new();
+        for (name, n, m, pitch, lens, needle) in [
+            ("minimal", 1, 1, 4, [4, 4, 4, 1], None),
+            (
+                "no_value",
+                0,
+                2,
+                4,
+                [16, 8, 8, 4],
+                Some("4 slots at a weights pitch of 4"),
+            ),
+            (
+                "no_token",
+                2,
+                0,
+                4,
+                [16, 8, 8, 4],
+                Some("4 slots at a weights pitch of 4"),
+            ),
+            (
+                "short_pitch",
+                2,
+                2,
+                3,
+                [16, 8, 8, 4],
+                Some("4 slots at a weights pitch of 3"),
+            ),
+            (
+                "shape_overflow",
+                usize::MAX,
+                2,
+                4,
+                [16, 8, 8, 4],
+                Some("a value, a token and a slot"),
+            ),
+            (
+                "weight_overflow",
+                1,
+                2,
+                usize::MAX / 2 + 1,
+                [16, 8, 8, 4],
+                Some("w.len()"),
+            ),
+            ("short_down", 2, 2, 4, [15, 8, 8, 4], Some("down.len()")),
+            ("short_weights", 2, 2, 4, [16, 7, 8, 4], Some("w.len()")),
+            ("short_places", 2, 2, 4, [16, 8, 7, 4], Some("sel.len()")),
+            ("short_output", 2, 2, 4, [16, 8, 8, 3], Some(".len() 3 < 4")),
+        ] {
+            let down = DeviceBuffer::from_host(stream, &vec![0.0f32; lens[0]]).expect("down");
+            let w = DeviceBuffer::from_host(stream, &vec![0.0f32; lens[1]]).expect("weights");
+            let sel = DeviceBuffer::from_host(stream, &vec![HOST; lens[2]]).expect("places");
+            let sh = DeviceBuffer::from_host(stream, &[0.0f32; 4]).expect("shared output");
+            let mut out = DeviceBuffer::from_host(stream, &vec![1.0f32; lens[3]]).expect("output");
+            let fault = gpu.unlabelled_sink();
+            let a = CardAcc {
+                down: &down,
+                w: &w,
+                sel: &sel,
+                n,
+                m,
+                n_card: 0,
+                n_used: SLOTS_4,
+                w_pitch: pitch,
+                fault,
+            };
+            let j = CardJoin {
+                down: DownRows::F32(&down),
+                w: &w,
+                sel: &sel,
+                n,
+                m,
+                n_card: 0,
+                n_used: SLOTS_4,
+                w_pitch: pitch,
+                shared: SharedJoin {
+                    sh: &sh,
+                    gate: None,
+                },
+                fault,
+            };
+            for (what, result) in [
+                (
+                    CardSlots::Four.entry(),
+                    kernels.enqueue_card_acc(stream, &a, &mut out),
+                ),
+                (
+                    "card_sum_join",
+                    kernels.enqueue_card_join(stream, &j, &mut out),
+                ),
+            ] {
+                let pass = match (needle, &result) {
+                    (None, Ok(())) => true,
+                    (Some(needle), Err(GpuError::Shape { what: got, detail })) => {
+                        *got == what && detail.contains(needle)
+                    }
+                    _ => false,
+                };
+                println!(
+                    "card_slots_refuse[{what}:{name}] {result:?} {}",
+                    if pass { "PASS" } else { "FAIL" }
+                );
+                if !pass {
+                    red.push(format!("{what}:{name}"));
+                }
+            }
+            let want = if needle.is_some() { 1.0 } else { 0.0 };
+            let unchanged = out
+                .to_host_vec(stream)
+                .expect("output")
+                .iter()
+                .all(|&v| v == want);
+            if !unchanged {
+                red.push(format!("{name}:output"));
+            }
+        }
+        stream.synchronize().expect("sync");
+        assert_eq!(gpu.take_fault().expect("the fault word"), None);
+        assert!(red.is_empty(), "red refusals: {red:?}");
     }
 
     /// The sum at 4, 6, 8, 9 and 10 slots (the weights at the router's pitch of
