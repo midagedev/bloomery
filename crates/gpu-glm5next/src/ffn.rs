@@ -17,12 +17,12 @@
 //!   and the go.
 //! - [`shadow`]: while the host computes, the card's slots — the common card
 //!   leg (`bloomery_gpu::card_leg`): the norm's q8_1 form, the gate·up `_sel`
-//!   with the routed clamped SwiGLU, the q8_1 of those slots' columns, the
-//!   down `_sel` and the card slots' weighted sum (`ds41_ffn_card_acc_8`) —
-//!   then the shared expert (the common gated block, as the dense one), and
-//!   the card sum plus the shared expert's output. Two kernels without card
-//!   experts over q8_0 planes, [`CARD_LAUNCHES`] more with, and
-//!   [`BlockPlan::extra_launches`] more over K-quants.
+//!   with the routed clamped SwiGLU, the q8_1 of those slots' columns and the
+//!   down `_sel` — then the shared expert (the common gated block, as the
+//!   dense one), and the card slots' weighted sum joined with the shared
+//!   expert's output in one launch (`card_sum_join`, [`enqueue_join`]). Two
+//!   kernels without card experts over q8_0 planes, [`CARD_LAUNCHES`] more
+//!   with, and [`BlockPlan::extra_launches`] more over K-quants.
 //! - [`back`]: the wait, then the host's routed sum plus the shadow's:
 //!   `hsum + (card + shexp)`, or `hsum + shexp` on a layer without card
 //!   experts (`moe + shexp` as ik adds them). One kernel after the wait.
@@ -34,8 +34,9 @@
 //! tier's; the shadow runs the card slots' downs but not their sum; the back
 //! waits for the host and the tier, then sums the card's and the tier's rows
 //! in one weighted sum (`ds41_ffn_card_acc_8_tier`, the card sum's order with
-//! the tier's slots in it), adds the shared expert and the host's sum. The
-//! step graph holds the same node count either way.
+//! the tier's slots in it), adds the shared expert and the host's sum: one
+//! launch more than a one-card layer with card experts, whose sum is the
+//! shadow's join.
 //!
 //! The handoff carries the boundary's eight slots through
 //! `FfnKernels::enqueue_handoff`, which picks its entry by the slot count and
@@ -50,7 +51,7 @@
 //!
 //! [`BlockPlan::extra_launches`]: bloomery_gpu_deepseek41::block::BlockPlan::extra_launches
 
-use bloomery_gpu::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks, LegSum};
+use bloomery_gpu::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks};
 use bloomery_gpu::host::leg_tier::{STAGE_TIER, TierSide};
 use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::hybrid::{Boundary, Hybrid, SlotMap};
@@ -59,9 +60,11 @@ use bloomery_gpu::kquant::{
 };
 use bloomery_gpu::routed_block::wait_add;
 use bloomery_gpu::weights::Weights;
-use bloomery_gpu::{Gpu, GpuError, Q8Act};
+use bloomery_gpu::{FaultSink, Gpu, GpuError, Q8Act};
 use bloomery_gpu_deepseek41::block::{Block, BlockIo, enqueue_block};
-use bloomery_gpu_deepseek41::chain::ffn::{CardAcc, CardAccTier, FfnBatchKernels, Handoff, Places};
+use bloomery_gpu_deepseek41::chain::ffn::{
+    CardAcc, CardAccTier, CardJoin, DownRows, FfnBatchKernels, Handoff, Places, SharedJoin,
+};
 use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED};
 use bloomery_gpu_deepseek41::span::{span, span_mut};
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -82,9 +85,9 @@ pub(crate) const DENSE_LAUNCHES: usize = 3;
 pub(crate) const MOE_LAUNCHES: usize = 3 + 1 + 2 + 1 + 1;
 
 /// The shadow's launches more on a layer with card experts: the norm's q8_1,
-/// the gate·up, the q8_1 of its card columns, the down, the card sum and the
-/// add of the shared expert's output.
-pub(crate) const CARD_LAUNCHES: usize = 6;
+/// the gate·up, the q8_1 of its card columns, the down, and the card sum
+/// joined with the shared expert's output.
+pub(crate) const CARD_LAUNCHES: usize = 5;
 
 /// A layer's card experts: how many its stacks hold, the routed SwiGLU limit
 /// (`swiglu_clamp_exp`) and the stacks' names (gate, up, down), made once at
@@ -342,7 +345,8 @@ impl CardExperts {
         layer_of(&self.layers, l)
     }
 
-    /// Row 0's card slots' weighted sum of the last card layer enqueued.
+    /// Row 0's card sum of the last card layer `ffn::card_sum` or a tier
+    /// layer's back wrote.
     pub(crate) fn acc(&self) -> Result<&DeviceBuffer<f32>, GpuError> {
         Ok(&card_row(&self.rows, 0)?.acc)
     }
@@ -586,7 +590,7 @@ pub(crate) fn shadow(
     let card = p.card.has(l);
     let tiered = p.card.tier_k(l) > 0;
     if card {
-        card_slots(gpu, w, p, boundary, l, tiered)?;
+        card_slots(gpu, w, p, boundary, l)?;
     }
     let sh = moe_names(p, l)?;
     let s = &mut *p.s;
@@ -605,24 +609,84 @@ pub(crate) fn shadow(
     };
     enqueue_block(gpu, w, &kernels, &mut s.block, &blk, io)?;
     if card && !tiered {
-        let k = card_row_mut(&mut p.card.rows, p.row)?;
-        gpu.elem()
-            .enqueue_add(gpu.stream(), &k.acc, &s.sh_y, n, &mut k.pre)?;
+        let n_card = p.card.n_card(l);
+        let CardExperts { batch, rows, .. } = &mut *p.card;
+        let k = card_row_mut(rows, p.row)?;
+        let slots = (k.leg.down(), &s.rout.weights, &s.sel);
+        let sink = gpu.layer_sink(l)?;
+        enqueue_join(
+            batch,
+            gpu.stream(),
+            slots,
+            (n, 1, n_card),
+            (&s.sh_y, sink),
+            &mut k.pre,
+        )?;
     }
     Ok(())
 }
 
-/// Layer `l`'s card slots into the card sum `acc` (module doc): the card leg
-/// over every slot the handoff placed below the layer's `n_card` on the card,
-/// the host's left alone; on a `tiered` layer without the sum, whose [`back`]
-/// reads their downs beside the tier's rows.
+/// The card sum of `m` tokens' slots — `down` the card slots' rows,
+/// slot-major, `w` and `sel` their weights and places, [`N_USED`] a token —
+/// joined with the shared expert's output `sh` into `y` in one launch,
+/// `acc + sh` (`card_sum_join`): the shared expert takes no router weight,
+/// and the host's sum, where the layer has one, is added after the wait.
+pub(crate) fn enqueue_join(
+    batch: &FfnBatchKernels,
+    stream: &CudaStream,
+    (down, w, sel): (&DeviceBuffer<f32>, &DeviceBuffer<f32>, &DeviceBuffer<u32>),
+    (n, m, n_card): (usize, usize, usize),
+    (sh, fault): (&DeviceBuffer<f32>, FaultSink),
+    y: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    let a = CardJoin {
+        down: DownRows::F32(down),
+        w,
+        sel,
+        n,
+        m,
+        n_card,
+        n_used: N_USED,
+        w_pitch: N_USED,
+        shared: SharedJoin { sh, gate: None },
+        fault,
+    };
+    batch.enqueue_card_join(stream, &a, y)
+}
+
+/// Layer `l`'s card sum alone into the row's `acc`, for a reader of the
+/// sum beside the block's output (`forced_row`): the shadow's join writes the
+/// output without it. A tier layer's [`back`] already wrote its sum there.
+pub(crate) fn card_sum(gpu: &Gpu, p: &mut Parts<'_>, l: usize) -> Result<(), GpuError> {
+    let n_card = p.card.n_card(l);
+    let s = &*p.s;
+    let CardExperts { batch, rows, .. } = &mut *p.card;
+    let k = card_row_mut(rows, p.row)?;
+    let a = CardAcc {
+        down: k.leg.down(),
+        w: &s.rout.weights,
+        sel: &s.sel,
+        n: k.acc.len(),
+        m: 1,
+        n_card,
+        n_used: N_USED,
+        w_pitch: N_USED,
+        fault: gpu.layer_sink(l)?,
+    };
+    batch.enqueue_card_acc(gpu.stream(), &a, &mut k.acc)
+}
+
+/// Layer `l`'s card slots' down rows (module doc): the card leg over every
+/// slot the handoff placed below the layer's `n_card` on the card, the host's
+/// left alone, without the sum: the shadow joins it with the shared expert
+/// ([`enqueue_join`]), and a tier layer's [`back`] reads the downs beside the
+/// tier's rows.
 fn card_slots(
     gpu: &Gpu,
     w: &Weights,
     p: &mut Parts<'_>,
     boundary: &Boundary,
     l: usize,
-    tiered: bool,
 ) -> Result<(), GpuError> {
     const W: &str = "glm5next card_slots";
     let s = &*p.s;
@@ -644,20 +708,17 @@ fn card_slots(
         n_card: cl.n_card,
         rule: Act::SwigluClamp { limit: cl.limit },
     };
-    let sum = (!tiered).then_some(LegSum {
-        w: &s.rout.weights,
-        acc: &mut k.acc,
-    });
-    leg.enqueue(gpu, &mut k.leg, &run, sum)
+    leg.enqueue(gpu, &mut k.leg, &run, None)
 }
 
 /// Enqueue layer `l`'s routed block on a tensor-parallel rank (`crate::tp`),
 /// whose card holds every expert at its own id and the rank's part of each
 /// one's inner width: `ffn_norm` RMS, the router (as [`front`]'s), each slot's
 /// place from the slot map (`ds41_ffn_places`, the handoff's rule), the card
-/// leg over the eight slots with their weighted sum, the shared expert at the
-/// rank's width, and the sum plus the shared expert's output into `out`: the
-/// rank's part of the block's output, which the ranks' gather adds. With every
+/// leg over the eight slots, the shared expert at the rank's width, and the
+/// slots' weighted sum joined with the shared expert's output into `out`
+/// ([`enqueue_join`]): the rank's part of the block's output, which the
+/// ranks' gather adds. With every
 /// expert on the card these are the launches the one-card body's front, shadow
 /// and back make but the handoff, the go and the wait, and the sum is theirs
 /// with no host part added.
@@ -726,11 +787,7 @@ pub(crate) fn rank_moe(
         n_card: cl.n_card,
         rule: Act::SwigluClamp { limit: cl.limit },
     };
-    let sum = LegSum {
-        w: &s.rout.weights,
-        acc: &mut k.acc,
-    };
-    leg.enqueue(gpu, &mut k.leg, &run, Some(sum))?;
+    leg.enqueue(gpu, &mut k.leg, &run, None)?;
     let kernels = p.k.block_kernels();
     let blk = Block {
         plan: c.block,
@@ -745,23 +802,28 @@ pub(crate) fn rank_moe(
         y: &mut s.sh_y,
     };
     enqueue_block(gpu, w, &kernels, &mut s.block, &blk, io)?;
-    gpu.elem()
-        .enqueue_add(stream, &k.acc, &s.sh_y, d.embd, &mut s.out)
+    let slots = (k.leg.down(), &s.rout.weights, &s.sel);
+    let shared = (&s.sh_y, fault);
+    enqueue_join(
+        batch,
+        stream,
+        slots,
+        (d.embd, 1, cl.n_card),
+        shared,
+        &mut s.out,
+    )
 }
 
 /// A prompt batch's card slots ([`card_rows`]): the batch's `t` normed rows
-/// and their routing, the places the call writes, the grouped path's scratch
-/// and the card sums, `t` rows. On a `tiered` layer no card sum is written:
-/// the back's sums the scratch's downs with the tier's rows.
+/// and their routing, the places the call writes and the grouped path's
+/// scratch, whose downs the shadow's join ([`enqueue_join`]) or a tier
+/// layer's back sums.
 pub(crate) struct CardRows<'a> {
     pub normed: &'a DeviceBuffer<f32>,
     pub ids: &'a DeviceBuffer<u32>,
-    pub weights: &'a DeviceBuffer<f32>,
     pub t: usize,
     pub sel: &'a mut DeviceBuffer<u32>,
     pub tiles: &'a mut CardTiles,
-    pub acc: &'a mut DeviceBuffer<f32>,
-    pub tiered: bool,
 }
 
 /// The grouped path's scratch for prompt batches of up to `cap` tokens of
@@ -844,13 +906,13 @@ impl CardTiles {
     }
 }
 
-/// Layer `l`'s card slots over a prompt batch's `t` tokens into the card
-/// sums `io.acc`: every slot's place from the slot map in one launch
+/// Layer `l`'s card slots over a prompt batch's `t` tokens into the
+/// scratch's downs: every slot's place from the slot map in one launch
 /// (`ds41_ffn_places`, the handoff's rule), then the card slots' downs by
 /// slot — on a layer [`card_tiles_run`] names, by tile items
 /// ([`card_tiles`]: each weight row read once for up to eight of an expert's
 /// slots), on any other, on the card leg in runs of its buffers' tokens
-/// ([`card_leg_rows`]) — and the card sums (`ds41_ffn_card_acc_8`). Each
+/// ([`card_leg_rows`]). Each
 /// slot and token is what the one-token launches write for it (the grouped
 /// entries are the `_sel`s' bit for bit, the leg runs the `_sel`s), the
 /// host's slots left alone. Refused by name on a layer without card experts.
@@ -893,21 +955,7 @@ pub(crate) fn card_rows(
     } else {
         card_leg_rows(gpu, k, cl, &st, l, n, io.normed, sel, t, tl)?;
     }
-    if io.tiered {
-        return Ok(());
-    }
-    let acc = CardAcc {
-        down: &tl.down,
-        w: io.weights,
-        sel,
-        n,
-        m: t,
-        n_card: cl.n_card,
-        n_used: N_USED,
-        w_pitch: N_USED,
-        fault,
-    };
-    k.batch.enqueue_card_acc(stream, &acc, &mut *io.acc)
+    Ok(())
 }
 
 /// [`card_rows`]'s card slots on the grouped tile kernels (a layer

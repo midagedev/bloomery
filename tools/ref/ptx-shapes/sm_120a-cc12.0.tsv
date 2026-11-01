@@ -8,6 +8,8 @@
 # binary entry spill jit_local
 # PIN(2026-10-31): the first cc 12.0 scan of these entries (ptxas 13.3.73 sm_120a, RTX 5090 driver 595.99.02): ptxas spills
 # or the driver JIT keeps local memory for each row of this block.
+generate_ds41 card_sum_join 0 0
+generate_ds41 card_sum_join_bf16 0 0
 generate_ds41 raon_hc_route 0 112
 generate_ds41 bf16_mma_norm_gate 644 168
 generate_ds41 cand_select 8 8
@@ -398,8 +400,6 @@ generate_ds41 rows_iq4nl 0 0
 generate_ds41 rows_f8 0 0
 generate_ds41 q2_k_rows 0 0
 generate_ds41 q38_card_shared_add 0 0
-generate_ds41 q38_card_sum_shared_add 0 0
-generate_ds41 q38_card_sum_shared_add_bf16 0 0
 generate_ds41 q38_card_tier_acc 0 0
 generate_ds41 q38_card_tier_shared_add 0 0
 generate_ds41 q38_shared_add 0 0

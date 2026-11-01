@@ -1,11 +1,13 @@
 //! Clause 10's Qwen3.8 combine launches beside `gate_kquant`'s card leg:
-//! the one launch of a layer without a host leg (`q38_card_sum_shared_add`,
-//! on F32 and on BF16 down rows), its check, and the refusals of both combine
+//! the one launch of a layer without a host leg (the common `card_sum_join`,
+//! on F32 and on BF16 down rows, gated by the router's last weight from the
+//! host list's zeros), the same launch ungated from the card sum itself
+//! (GLM-5.3's shared expert), their checks, and the refusals of both combine
 //! launchers.
 
-use bloomery_gpu::card_slots::DownRows;
+use bloomery_gpu::card_slots::{CardJoin, DownRows, SharedJoin};
 use bloomery_gpu::hybrid::HOST;
-use bloomery_gpu::q38::{CardSharedAddArgs, CardSumSharedAddArgs, SLOTS, W_PITCH};
+use bloomery_gpu::q38::{CardSharedAddArgs, SLOTS, W_PITCH};
 use bloomery_gpu::{Fault, FaultSite, GpuError, LAYER_NONE};
 use bloomery_gpu_gates::{GateError, bits_equal, verdict};
 use cuda_core::DeviceBuffer;
@@ -20,8 +22,35 @@ const NEG0: usize = 3;
 type CombineRefusal = (&'static str, &'static str, Result<(), GpuError>);
 
 impl Leg38 {
-    /// A layer without a host leg's one launch on `down` and the leg's
-    /// weights and shared rows, `m` tokens placed by `sel`, into `y`.
+    /// The common join on `down` and the leg's weights and shared rows, `m`
+    /// tokens placed by `sel`, into `y`: Qwen3.8's (`shared` [`None`]: the
+    /// router's last weight from the host list's zeros) or `shared`'s.
+    fn join(
+        &self,
+        c: &Ctx,
+        (down, sel, m): (DownRows<'_>, &DeviceBuffer<u32>, usize),
+        shared: Option<SharedJoin<'_>>,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let a = CardJoin {
+            down,
+            w: &self.w,
+            sel,
+            n: N38,
+            m,
+            n_card: E38,
+            n_used: SLOTS,
+            w_pitch: W_PITCH,
+            shared: shared.unwrap_or(SharedJoin {
+                sh: &self.sh,
+                gate: Some(SLOTS),
+            }),
+            fault: c.gpu.unlabelled_sink(),
+        };
+        self.slots.enqueue_card_join(c.gpu.stream(), &a, y)
+    }
+
+    /// A layer without a host leg's one launch, Qwen3.8's join.
     fn sum_hostless(
         &self,
         c: &Ctx,
@@ -30,20 +59,7 @@ impl Leg38 {
         m: usize,
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
-        self.q38.enqueue_card_sum_shared_add(
-            c.gpu.stream(),
-            CardSumSharedAddArgs {
-                down,
-                w: &self.w,
-                sel,
-                sh: &self.sh,
-                n: N38,
-                m,
-                n_card: E38,
-                fault: c.gpu.unlabelled_sink(),
-                y,
-            },
-        )
+        self.join(c, (down, sel, m), None, y)
     }
 
     /// Clause 10's block output of a layer without a host leg over the leg's
@@ -134,13 +150,47 @@ impl Leg38 {
                 mismatch("first_mismatch", &got, &want, N38),
             );
         }
+        // Ungated from the card sum itself: the card sum launch, then `acc +
+        // sh` (GLM-5.3's two launches), bit for bit, the `-0.0` sum kept.
+        self.sum(c, stream)?;
+        stream.synchronize()?;
+        let acc = self.acc.to_host_vec(stream)?;
+        let want: Vec<f32> = acc.iter().zip(&sh).map(|(a, s)| a + s).collect();
+        let mut y = DeviceBuffer::from_host(stream, &vec![SENT; M38 * N38])?;
+        let ungated = SharedJoin {
+            sh: &self.sh,
+            gate: None,
+        };
+        let sel = DeviceBuffer::from_host(stream, &SEL38)?;
+        self.join(
+            c,
+            (DownRows::F32(&self.y_down), &sel, M38),
+            Some(ungated),
+            &mut y,
+        )?;
+        stream.synchronize()?;
+        let (y, fault) = (y.to_host_vec(stream)?, c.gpu.take_fault()?);
+        let same = bits_equal(&y, &want);
+        let neg0 = y[NEG0].to_bits();
+        let pass = same && neg0 == (-0.0f32).to_bits() && fault.is_none();
+        ok &= pass;
+        println!(
+            "card_join[ungated, from the card sum] is_card_acc_plus_shared={same} \
+             neg_zero_sum_bits={neg0:#010x} (want 0x80000000) fault=\"{}\" {}{}",
+            shown(fault),
+            verdict(pass),
+            mismatch("first_mismatch", &y, &want, N38),
+        );
         Ok(ok)
     }
 
     /// The combine launchers' rows of clause 10's refusals, each `(launcher,
     /// case, result)`: a combine slot past the weights, and a layer without
-    /// a host leg of no token or an output a value short.
+    /// a host leg with a shared gate among the routed slots or past the
+    /// weights' pitch.
     pub(crate) fn combine_refusals(&mut self, c: &Ctx) -> Result<[CombineRefusal; 3], GateError> {
+        // PIN(2026-11-02): no_token and short output are covered by
+        // card_slots::tests::hw_the_card_sum_launchers_refuse_invalid_shapes.
         let stream = c.gpu.stream();
         let r_slot = self.q38.enqueue_card_shared_add(
             stream,
@@ -159,14 +209,19 @@ impl Leg38 {
         );
         let mut y = DeviceBuffer::from_host(stream, &vec![SENT; M38 * N38])?;
         let rows = DownRows::F32(&self.y_down);
-        let r_no_token = self.sum_hostless(c, rows, &self.sel, 0, &mut y);
-        let mut short = DeviceBuffer::from_host(stream, &vec![SENT; M38 * N38 - 1])?;
-        let r_short = self.sum_hostless(c, rows, &self.sel, M38, &mut short);
-        let what = "q38::enqueue_card_sum_shared_add";
+        let mut gated = |gate| {
+            let shared = SharedJoin {
+                sh: &self.sh,
+                gate: Some(gate),
+            };
+            self.join(c, (rows, &self.sel, M38), Some(shared), &mut y)
+        };
+        let (r_routed_gate, r_gate_past) = (gated(SLOTS - 1), gated(W_PITCH));
+        let what = "card_sum_join";
         Ok([
             ("q38::enqueue_card_shared_add", "slot_11_of_11", r_slot),
-            (what, "no_token", r_no_token),
-            (what, "an_output_a_value_short", r_short),
+            (what, "a_gate_among_the_routed_slots", r_routed_gate),
+            (what, "a_gate_past_the_pitch", r_gate_past),
         ])
     }
 }

@@ -1235,6 +1235,18 @@ impl FfnBatchKernels {
         self.slots.enqueue_card_acc(stream, a, acc)
     }
 
+    /// Enqueue the card sums of `a.m` tokens joined with the shared expert's
+    /// output in one launch ([`CardSlotKernels::enqueue_card_join`]), into
+    /// `y`. One launch. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_card_join(
+        &self,
+        stream: &CudaStream,
+        a: &CardJoin<'_>,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        self.slots.enqueue_card_join(stream, a, y)
+    }
+
     /// Enqueue `ds41_ffn_card_acc_tier`: the card sums of `a.m` tokens over
     /// the stage card's and the tier's slots, value `i` of token `t = i / a.n`
     /// into `acc[i]`: `ds41_ffn_card_acc_tier` for six slots a token,

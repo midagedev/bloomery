@@ -116,7 +116,9 @@ pub use batch::{
 };
 // The card half of the combine, and the places and sum launches the common
 // card slots own (`bloomery_gpu::card_slots`).
-pub use bloomery_gpu::card_slots::{CardAcc, Places, card_sum_elem};
+pub use bloomery_gpu::card_slots::{
+    CardAcc, CardJoin, DownRows, Places, SharedJoin, card_sum_elem,
+};
 pub use tier::{Ds41Tier, STAGE_TIER, TierPiece};
 
 /// What the enqueue path's errors name.

@@ -3028,8 +3028,8 @@ impl PromptProgram<'_> {
     }
 
     /// `at`'s card experts, where the slot map puts any, and its shared
-    /// expert by chunk, under its host leg; the card sum plus the shared
-    /// expert's output after them.
+    /// expert by chunk, under its host leg; the card sum joined with the
+    /// shared expert's output after them ([`ffn::enqueue_join`]).
     fn shadow_rows(&mut self, at: At) -> Result<(), GpuError> {
         let l = at.layer;
         let (gpu, w, t) = (self.gpu, self.w, self.t[at.unit]);
@@ -3049,12 +3049,9 @@ impl PromptProgram<'_> {
                 CardRows {
                     normed: &b.normed,
                     ids: &b.ids,
-                    weights: &ub.weights,
                     t,
                     sel: &mut b.sel,
                     tiles: &mut b.tiles,
-                    acc: &mut b.acc,
-                    tiered,
                 },
             )?;
         }
@@ -3078,8 +3075,14 @@ impl PromptProgram<'_> {
             hidden_tap(self.ffn_in.as_deref_mut(), l, p0),
         )?;
         if card && !tiered {
-            gpu.elem()
-                .enqueue_add(stream, &b.acc, &b.sh_y, t * n, &mut b.pre)?;
+            ffn::enqueue_join(
+                self.p.card.batch(),
+                stream,
+                (b.tiles.down(), &ub.weights, &b.sel),
+                (n, t, self.p.card.n_card(l)),
+                (&b.sh_y, gpu.layer_sink(l)?),
+                &mut b.pre,
+            )?;
         }
         Ok(())
     }

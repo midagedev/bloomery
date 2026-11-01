@@ -29,6 +29,8 @@ generate_ds41   attn_out_gate_sigmoid                    0           0
 generate_ds41   attn_out_gate_sigmoid_head               0           0
 generate_ds41   best_merge                               0           0
 generate_ds41   best_part                                0           0
+generate_ds41   card_sum_join                            0           0
+generate_ds41   card_sum_join_bf16                       0           0
 generate_ds41   short_conv                               0           0
 generate_ds41   bf16_cols                                0           0
 generate_ds41   bf16_gemv                                0           0
@@ -457,10 +459,8 @@ generate_ds41   rows_iq4nl                               0           0
 generate_ds41   rows_f8                                  0           0
 generate_ds41   q2_k_rows                                0           0
 generate_ds41   q38_card_shared_add                      0           0
-generate_ds41   q38_card_sum_shared_add                  0           0
 # PIN(2026-10-28): the BF16 rows' entry at its F32 sibling's values (the same body, a 16-bit read), not measured
 # at cc 8.6 until a scan there runs; measured 0 and 0 at sm_121a on GB10.
-generate_ds41   q38_card_sum_shared_add_bf16             0           0
 generate_ds41   q38_card_tier_acc                        0           0
 generate_ds41   q38_card_tier_shared_add                 0           0
 generate_ds41   q38_shared_add                           0           0

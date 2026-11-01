@@ -588,11 +588,12 @@ mod gate {
     const STREAMS: usize = 4;
     const N_VOCAB: usize = 154_880;
 
-    /// PIN(2026-09-27): the shadow's launches more on a routed layer with card
+    /// PIN(2026-11-01): the shadow's launches more on a routed layer with card
     /// experts: the norm's q8_1, the gate·up `_sel`, the q8_1 of its card
-    /// columns, the down `_sel`, the card slots' sum and its add to the
-    /// shared expert's output.
-    const CARD_NODES: usize = 6;
+    /// columns, the down `_sel`, and the card slots' sum joined with the
+    /// shared expert's output in one launch (`card_sum_join`; 6 before, a
+    /// sum and an add).
+    const CARD_NODES: usize = 5;
 
     /// The trunk's layers, from the header.
     fn n_layer() -> usize {

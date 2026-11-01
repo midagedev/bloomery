@@ -21,15 +21,25 @@
 //!   read. A place in `[n_card, HOST)` names neither a card slot nor the
 //!   host: it raises [`FaultSite::ExpertId`] and its token's values are NaN.
 //!
+//! - **Join** (`card_sum_join`, `_bf16` over BF16 down rows): the sum above
+//!   at any slot count, then the shared expert's output added in the same
+//!   launch, `(base + acc) + sh · g` with each step rounded — `g` a router
+//!   weight or 1, `base` the zeros of an empty host list or nothing — so a
+//!   layer whose host part is added later, or that has none, writes no sum
+//!   and reads it back. A non-finite input or result of the join raises
+//!   [`FaultSite::F32Product`].
+//!
 //! The entries keep the names the DeepSeek-V4.1 family gave them; no family
-//! keeps its own sum for the fault or the weights' pitch. A family whose sum
-//! is another rule (a shared expert, the expert tier's rows) keeps its own.
+//! keeps its own sum for the fault, the weights' pitch or the shared
+//! expert's join. A family whose sum is another rule (the expert tier's
+//! rows) keeps its own.
 
 use crate::fault::{FaultSink, FaultSite};
 use crate::hybrid::HOST;
 use crate::q8f32::RowValues;
-use crate::{GpuError, launch_u32};
+use crate::{GpuError, launch_u32, short};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
+use cuda_device::float::{add_rn_f32, mul_rn_f32};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
 use cuda_host::cuda_module;
 use std::sync::Arc;
@@ -236,8 +246,17 @@ mod card_slots_kernels {
         }
         // SAFETY: i < n·m, and the launch contract gives every length the
         // helper's contract asks for at SLOTS_6 slots.
-        let v =
-            unsafe { card_acc_at::<SLOTS_6>(down, w, sel, n, n_card, w_pitch as usize, fault, i) };
+        let v = unsafe {
+            card_acc_at(
+                down,
+                w,
+                sel,
+                (n, SLOTS_6, w_pitch as usize),
+                n_card,
+                fault,
+                i,
+            )
+        };
         // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
         unsafe { *acc.get_unchecked_mut(i) = v };
     }
@@ -278,8 +297,17 @@ mod card_slots_kernels {
         }
         // SAFETY: i < n·m, and the launch contract gives every length the
         // helper's contract asks for at SLOTS_8 slots.
-        let v =
-            unsafe { card_acc_at::<SLOTS_8>(down, w, sel, n, n_card, w_pitch as usize, fault, i) };
+        let v = unsafe {
+            card_acc_at(
+                down,
+                w,
+                sel,
+                (n, SLOTS_8, w_pitch as usize),
+                n_card,
+                fault,
+                i,
+            )
+        };
         // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
         unsafe { *acc.get_unchecked_mut(i) = v };
     }
@@ -320,8 +348,17 @@ mod card_slots_kernels {
         }
         // SAFETY: i < n·m, and the launch contract gives every length the
         // helper's contract asks for at SLOTS_10 slots.
-        let v =
-            unsafe { card_acc_at::<SLOTS_10>(down, w, sel, n, n_card, w_pitch as usize, fault, i) };
+        let v = unsafe {
+            card_acc_at(
+                down,
+                w,
+                sel,
+                (n, SLOTS_10, w_pitch as usize),
+                n_card,
+                fault,
+                i,
+            )
+        };
         // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
         unsafe { *acc.get_unchecked_mut(i) = v };
     }
@@ -362,8 +399,17 @@ mod card_slots_kernels {
         }
         // SAFETY: i < n·m, and the launch contract gives every length the
         // helper's contract asks for at SLOTS_4 slots.
-        let v =
-            unsafe { card_acc_at::<SLOTS_4>(down, w, sel, n, n_card, w_pitch as usize, fault, i) };
+        let v = unsafe {
+            card_acc_at(
+                down,
+                w,
+                sel,
+                (n, SLOTS_4, w_pitch as usize),
+                n_card,
+                fault,
+                i,
+            )
+        };
         // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
         unsafe { *acc.get_unchecked_mut(i) = v };
     }
@@ -404,10 +450,124 @@ mod card_slots_kernels {
         }
         // SAFETY: i < n·m, and the launch contract gives every length the
         // helper's contract asks for at SLOTS_9 slots.
-        let v =
-            unsafe { card_acc_at::<SLOTS_9>(down, w, sel, n, n_card, w_pitch as usize, fault, i) };
+        let v = unsafe {
+            card_acc_at(
+                down,
+                w,
+                sel,
+                (n, SLOTS_9, w_pitch as usize),
+                n_card,
+                fault,
+                i,
+            )
+        };
         // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
         unsafe { *acc.get_unchecked_mut(i) = v };
+    }
+
+    /// The block output of `m` tokens of `n` values, one thread a value
+    /// ([`card_join_at`]): the card sum of `slots` slots a token, then
+    /// `(base + acc) + sh · g` — `g` the token's router weight `gate` of
+    /// `w_pitch`, or 1 for a `gate` at or past it — each step rounded. A
+    /// place in `[n_card, HOST)` raises [`FaultSite::ExpertId`] and its
+    /// token's values are NaN; a non-finite input or result of the join
+    /// raises [`FaultSite::F32Product`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            w_pitch >= slots,
+            down.len() >= slots * n * m,
+            w.len() >= w_pitch * m,
+            sel.len() >= slots * m,
+            sh.len() >= n * m,
+            y.len() >= n * m
+        )
+    )]
+    pub fn card_sum_join(
+        down: &[f32],
+        w: &[f32],
+        sel: &[u32],
+        sh: &[f32],
+        n: u32,
+        m: u32,
+        n_card: u32,
+        slots: u32,
+        w_pitch: u32,
+        gate: u32,
+        base: f32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        // SAFETY: the launch contract's lengths, read as the body's.
+        unsafe {
+            card_join_at(
+                i,
+                down,
+                (w, sel, sh),
+                (n, m, n_card),
+                (slots, w_pitch, gate, base),
+                fault,
+                &mut y,
+            )
+        }
+    }
+
+    /// [`card_sum_join`] over BF16 down rows (each cell widened exactly to
+    /// F32): the same sum, join and faults.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            w_pitch >= slots,
+            down.len() >= slots * n * m,
+            w.len() >= w_pitch * m,
+            sel.len() >= slots * m,
+            sh.len() >= n * m,
+            y.len() >= n * m
+        )
+    )]
+    pub fn card_sum_join_bf16(
+        down: &[u16],
+        w: &[f32],
+        sel: &[u32],
+        sh: &[f32],
+        n: u32,
+        m: u32,
+        n_card: u32,
+        slots: u32,
+        w_pitch: u32,
+        gate: u32,
+        base: f32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        // SAFETY: the launch contract's lengths, read as the body's.
+        unsafe {
+            card_join_at(
+                i,
+                down,
+                (w, sel, sh),
+                (n, m, n_card),
+                (slots, w_pitch, gate, base),
+                fault,
+                &mut y,
+            )
+        }
     }
 }
 
@@ -422,35 +582,30 @@ impl RowValues for &[u16] {
 }
 
 /// The card slots' sum of value `i` (token `t = i / n`, value `d = i % n`)
-/// of `N` slots a token: `acc = fma(down[(Nt + j)·n + d], w[t·w_pitch + j],
-/// acc)` from zero for each slot `j` below `N` whose place `sel[Nt + j]` is
-/// below `n_card`, in ascending `j` — the order `runtime::combine::card_sum`
+/// of `N = slots` slots a token: `acc = fma(down[(Nt + j)·n + d], w[t·w_pitch
+/// + j], acc)` from zero for each slot `j` below `N` whose place `sel[Nt + j]`
+/// is below `n_card`, in ascending `j` — the order `runtime::combine::card_sum`
 /// pins (this order is the gate); no other slot's rows or weight are read. A
 /// place in `[n_card, HOST)` raises [`FaultSite::ExpertId`] (from the token's
 /// value 0) and the value is NaN.
 ///
 /// SAFETY: `i < n · m` for an `m` with `down` holding `N · n · m` cells,
 /// `sel.len() >= N · m`, and `w.len() >= w_pitch · m` with `w_pitch >= N`.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "device helper: the entries' arguments flat (rust-quality R8)"
-)]
 #[inline(always)]
-pub(crate) unsafe fn card_acc_at<const N: usize>(
+pub(crate) unsafe fn card_acc_at(
     down: impl RowValues,
     w: &[f32],
     sel: &[u32],
-    n: usize,
+    (n, slots, w_pitch): (usize, usize, usize),
     n_card: u32,
-    w_pitch: usize,
     fault: FaultSink,
     i: usize,
 ) -> f32 {
     let (t, d) = (i / n, i % n);
     let mut acc = 0.0f32;
-    for j in 0..N {
+    for j in 0..slots {
         cuda_device::thread::__unroll_config::<0>();
-        let s = t * N + j;
+        let s = t * slots + j;
         // SAFETY: s < N·m <= sel.len() by this fn's contract.
         let place = unsafe { *sel.get_unchecked(s) };
         if place < n_card {
@@ -467,6 +622,59 @@ pub(crate) unsafe fn card_acc_at<const N: usize>(
         }
     }
     acc
+}
+
+/// One value of a block output with card experts: `(h + a) + s · g`, the
+/// host's routed sum `h`, then the card's `a`, then the shared expert's
+/// output `s` times its gate `g`, the product and each sum rounded — this
+/// order is the gate. A non-finite input or result raises
+/// [`FaultSite::F32Product`].
+#[inline(always)]
+pub(crate) fn join_value(h: f32, a: f32, s: f32, g: f32, fault: FaultSink) -> f32 {
+    let out = add_rn_f32(add_rn_f32(h, a), mul_rn_f32(s, g));
+    if !(h.is_finite() & a.is_finite() & s.is_finite() & g.is_finite() & out.is_finite()) {
+        fault.raise(FaultSite::F32Product);
+    }
+    out
+}
+
+/// The join entries' value `i` (the thread's): the card sum of its `slots`
+/// slots ([`card_acc_at`]), then [`join_value`] from `base` with the shared
+/// expert's output `sh[i]` times the token's router weight `gate` — or 1
+/// for a `gate` at or past `w_pitch`, an ungated shared expert.
+///
+/// # Safety
+/// [`card_acc_at`]'s contract at `slots` slots, and `sh` and `y` hold
+/// `n·m` values.
+#[inline(always)]
+unsafe fn card_join_at(
+    i: usize,
+    down: impl RowValues,
+    (w, sel, sh): (&[f32], &[u32], &[f32]),
+    (n, m, n_card): (u32, u32, u32),
+    (slots, w_pitch, gate, base): (u32, u32, u32, f32),
+    fault: FaultSink,
+    y: &mut DisjointSlice<f32>,
+) {
+    let (n, m, w_pitch) = (n as usize, m as usize, w_pitch as usize);
+    if i >= n * m {
+        return;
+    }
+    // SAFETY: i < n·m, and this fn's contract is the helper's.
+    let a = unsafe { card_acc_at(down, w, sel, (n, slots as usize, w_pitch), n_card, fault, i) };
+    // SAFETY: i < n·m <= sh.len() by this fn's contract.
+    let s = unsafe { *sh.get_unchecked(i) };
+    let g = if (gate as usize) < w_pitch {
+        // SAFETY: i / n < m and gate < w_pitch put the index below
+        // w_pitch·m <= w.len() by this fn's contract.
+        unsafe { *w.get_unchecked(i / n * w_pitch + gate as usize) }
+    } else {
+        1.0
+    };
+    let out = join_value(base, a, s, g, fault);
+    // SAFETY: i < n·m <= y.len() by this fn's contract; thread i is y[i]'s
+    // only writer.
+    unsafe { *y.get_unchecked_mut(i) = out };
 }
 
 /// What [`CardSlotKernels::enqueue_places`] reads: `n` routed ids, and the
@@ -496,7 +704,7 @@ pub struct ColPlaces<'a> {
 }
 
 /// A card route's slot-major down rows as a card sum reads them: F32, or
-/// BF16 bits (the native FP4 product's, `enqueue_gemm32_bf16`).
+/// BF16 bits (a down product's BF16 store, `enqueue_gemm32_bf16`).
 #[derive(Clone, Copy)]
 pub enum DownRows<'a> {
     F32(&'a DeviceBuffer<f32>),
@@ -522,7 +730,7 @@ impl<'a> DownRows<'a> {
             Self::F32(d) => Ok(d),
             Self::Bf16(_) => Err(GpuError::state(
                 what,
-                "F32 down rows (BF16 rows feed the block's card sum alone)",
+                "F32 down rows (BF16 rows feed the card sum's join alone)",
             )),
         }
     }
@@ -544,6 +752,36 @@ pub struct CardAcc<'a> {
     pub n_card: usize,
     pub n_used: usize,
     pub w_pitch: usize,
+    pub fault: FaultSink,
+}
+
+/// The shared expert's output a card sum joins
+/// ([`CardSlotKernels::enqueue_card_join`]): `sh` (`[m][n]`) times its gate —
+/// the router's weight `gate` of a token's `w_pitch` (Qwen3.8's last), or 1
+/// for an ungated shared expert (`None`, GLM-5.3) — added after the card sum.
+/// A gated join starts from the zeros of an empty host list, `+0.0 + acc`
+/// (a layer run without its host leg, whose sum a two-launch join added to
+/// those zeros: a `-0.0` sum turns `+0.0`); an ungated one from the card sum
+/// itself (`-0.0 + acc`, exact).
+#[derive(Clone, Copy)]
+pub struct SharedJoin<'a> {
+    pub sh: &'a DeviceBuffer<f32>,
+    pub gate: Option<usize>,
+}
+
+/// What [`CardSlotKernels::enqueue_card_join`] reads: [`CardAcc`]'s slots
+/// with the down rows in either form ([`DownRows`]) and the shared expert's
+/// output it joins.
+pub struct CardJoin<'a> {
+    pub down: DownRows<'a>,
+    pub w: &'a DeviceBuffer<f32>,
+    pub sel: &'a DeviceBuffer<u32>,
+    pub n: usize,
+    pub m: usize,
+    pub n_card: usize,
+    pub n_used: usize,
+    pub w_pitch: usize,
+    pub shared: SharedJoin<'a>,
     pub fault: FaultSink,
 }
 
@@ -728,6 +966,83 @@ impl CardSlotKernels {
                 let prep = mo.prepare_ds41_ffn_card_acc_10(cfg)?;
                 mo.ds41_ffn_card_acc_10(
                     stream, &prep, a.down, a.w, a.sel, n, m, n_card, w_pitch, a.fault, acc,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Enqueue the block output of `a.m` tokens of `a.n` values
+    /// ([`CardJoin`], `card_sum_join` or `_bf16` by the rows' form): the
+    /// card sum of `a.n_used` slots ([`CardSlotKernels::enqueue_card_acc`]'s
+    /// order and faults) and the shared expert's gated output, `(base + acc)
+    /// + sh · g` ([`SharedJoin`]), into `y`, without writing the sum. No
+    /// value, token or slot, a weights pitch under the slot count, a gate
+    /// among the routed slots or past the pitch, more than one launch's grid
+    /// and a buffer short of them are refused by name, nothing launched. One
+    /// launch. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_card_join(
+        &self,
+        stream: &CudaStream,
+        a: &CardJoin<'_>,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "card_sum_join";
+        let nm = a.n.checked_mul(a.m).filter(|&nm| nm != 0);
+        let gate_ok = a.shared.gate.is_none_or(|g| g >= a.n_used && g < a.w_pitch);
+        let (Some(nm), true, true) = (nm, a.n_used != 0 && a.w_pitch >= a.n_used, gate_ok) else {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "{} values of {} tokens, {} slots at a weights pitch of {}, the shared gate \
+                     {:?}: a value, a token and a slot, a pitch of the slot count or more, and a \
+                     gate past the routed slots within the pitch",
+                    a.n, a.m, a.n_used, a.w_pitch, a.shared.gate
+                ),
+            ));
+        };
+        // The grid bounds n·m; the slot and pitch multiples are checked.
+        let cfg = LaunchConfig1D::new(
+            launch_u32(WHAT, "grid", nm.div_ceil(THREADS as usize))?,
+            THREADS,
+            0,
+        );
+        let cells = |k: usize, x: usize| k.checked_mul(x).unwrap_or(usize::MAX);
+        short(
+            WHAT,
+            &[
+                ("down", a.down.cells(), cells(a.n_used, nm)),
+                ("w", a.w.len(), cells(a.w_pitch, a.m)),
+                ("sel", a.sel.len(), cells(a.n_used, a.m)),
+                ("sh", a.shared.sh.len(), nm),
+                ("y", y.len(), nm),
+            ],
+        )?;
+        let w_pitch = launch_u32(WHAT, "w_pitch", a.w_pitch)?;
+        let (n, m, n_card, slots, gate) = (
+            launch_u32(WHAT, "n", a.n)?,
+            launch_u32(WHAT, "m", a.m)?,
+            launch_u32(WHAT, "n_card", a.n_card)?,
+            launch_u32(WHAT, "slots", a.n_used)?,
+            a.shared
+                .gate
+                .map_or(Ok(w_pitch), |g| launch_u32(WHAT, "gate", g))?,
+        );
+        let base = if a.shared.gate.is_some() { 0.0 } else { -0.0 };
+        let (mo, sh) = (&self.module, a.shared.sh);
+        match a.down {
+            DownRows::F32(down) => {
+                let prep = mo.prepare_card_sum_join(cfg)?;
+                mo.card_sum_join(
+                    stream, &prep, down, a.w, a.sel, sh, n, m, n_card, slots, w_pitch, gate, base,
+                    a.fault, y,
+                )?;
+            }
+            DownRows::Bf16(down) => {
+                let prep = mo.prepare_card_sum_join_bf16(cfg)?;
+                mo.card_sum_join_bf16(
+                    stream, &prep, down, a.w, a.sel, sh, n, m, n_card, slots, w_pitch, gate, base,
+                    a.fault, y,
                 )?;
             }
         }

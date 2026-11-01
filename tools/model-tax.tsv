@@ -52,7 +52,6 @@ crates/gpu-gates/src/bin/gate_hybrid.rs	deepseek	15	baseline T 15: case-table ro
 crates/gpu-gates/src/bin/gate_iq.rs	nemotron	2	baseline T 2: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/gate_iq_sel.rs	nemotron	59	baseline T 59: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/gate_iq_sel.rs	qwen	5	baseline T 5: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
-crates/gpu-gates/src/bin/gate_kquant.rs	deepseek	1	baseline T 1: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/gate_kquant.rs	qwen	19	baseline T 19: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/gate_lev_serve.rs	clef	4	baseline T 4: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/gate_lev_serve.rs	deepseek	3	baseline T 3: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
