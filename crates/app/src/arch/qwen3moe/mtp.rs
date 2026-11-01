@@ -10,9 +10,7 @@ use bloomery_gpu::media::ImageSpan;
 use bloomery_gpu::model::Rows;
 
 use super::WHAT;
-use crate::mtp::{
-    DraftHead, Feed, MtpBody, SlotChain, UnitSink, WalkMode, chains_at_once, write_proposal,
-};
+use crate::mtp::{DraftHead, Feed, MtpBody, UnitSink, WalkMode, write_proposal};
 use runtime::prompt::CallEnd;
 
 impl MtpBody for Body38 {
@@ -108,16 +106,6 @@ impl MtpBody for Body38 {
         m.mtp_walk(DraftFeed::Rows(feed), head, mode)
     }
 
-    /// One store walk of every slot's rows at once
-    /// ([`Qwen38Model::draft_store_slots`]).
-    fn store_slots(
-        m: &mut Qwen38Model,
-        walks: &[(usize, Feed<'_, TargetRows>)],
-        head: DraftHead,
-    ) -> Result<(), GpuError> {
-        m.draft_store_slots(walks, head)
-    }
-
     fn chain(
         m: &mut Qwen38Model,
         refresh: Feed<'_, TargetRows>,
@@ -129,17 +117,6 @@ impl MtpBody for Body38 {
     ) -> Result<usize, GpuError> {
         let d = m.mtp_chain(DraftFeed::Rows(refresh), own, head, mode)?;
         write_proposal(&d, out, p)
-    }
-
-    /// Every slot's chains at once ([`chains_at_once`]: one walk a depth
-    /// over every slot's rows).
-    fn chain_slots(
-        m: &mut Qwen38Model,
-        chains: &mut [SlotChain<'_, TargetRows>],
-        head: DraftHead,
-        mode: WalkMode,
-    ) -> Result<Vec<usize>, GpuError> {
-        chains_at_once(m, chains, head, mode)
     }
 }
 

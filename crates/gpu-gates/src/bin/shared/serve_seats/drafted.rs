@@ -40,6 +40,7 @@ use app::{Draw, Keep, Prompt, RoundWindow, RowsLog, Session, SessionError};
 use bloomery_gpu::GpuModel;
 use bloomery_gpu::best;
 use bloomery_gpu::checkpoint::bytes;
+use bloomery_gpu::draft::SlotDraft;
 use bloomery_gpu::model::{Rollback, Rows, SlotRows, Slots};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::bind::call_token;
@@ -1188,7 +1189,7 @@ where
 /// proposes and verifies them) and put back after it, its chooser bypassed.
 impl<B, const M: usize> RoundDrafts<B> for SlotDrafts<B, M>
 where
-    B: MtpBody + SlotRows,
+    B: MtpBody + SlotRows + SlotDraft<<B as MtpBody>::Arena>,
     B::Seq: 'static,
     Window<M>: Widths,
 {
