@@ -2238,6 +2238,12 @@ impl Body38 {
         first: usize,
         pos: u32,
     ) -> Result<(), GpuError> {
+        let TargetRows::Ubatch = walk else {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("a shared prompt arena, got {walk:?}"),
+            ));
+        };
         let width = geo::STREAMS * geo::HIDDEN;
         super::mtp38::check_target_rows(
             WHAT,
@@ -2251,12 +2257,13 @@ impl Body38 {
             pos,
         )?;
         let cur = final_res(&self.plans);
-        let source = match walk {
-            TargetRows::Ubatch => &self.wa.res[cur],
-            TargetRows::Pass => &self.a.res[cur],
-            TargetRows::Step => return Ok(()),
-        };
-        crate::draft::retain_hidden_row(gpu.stream(), source, first, width, &mut self.s.res[cur])?;
+        crate::draft::retain_hidden_row(
+            gpu.stream(),
+            &self.wa.res[cur],
+            first,
+            width,
+            &mut self.s.res[cur],
+        )?;
         self.wrote.set(TargetRows::Step, pos - 1, 1, 1);
         Ok(())
     }

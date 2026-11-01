@@ -4,7 +4,6 @@
 //! program's walks (`bloomery_gpu_glm5next::nextn_walk`, `nextn_chain`)
 //! held against ik's MTP draft set (refset family `mtp-glm5next`) and the
 //! drafted windows (`app::mtp::MtpDraft<Body>`) against the plain run.
-//! `--slots` runs only the two resident sequences' prompt and drafted rounds.
 //!
 //! What is asserted:
 //! - (m) the set's MTP input: its warmup graph's `enorm` reads `inp_embd`
@@ -1798,12 +1797,8 @@ mod gate {
         inputs: &PlanInputs,
         nextn: &NextnInputs,
         levers: &bloomery_levers::Levers,
+        windows: [&[u32]; Z_SLOTS],
     ) -> Result<bool, GateError> {
-        let prefill = glm5next_tier::d1k_prefill()?;
-        if prefill.len() < 340 {
-            return Err(format!("{D1K}: {} prefill ids, (z) reads 340", prefill.len()).into());
-        }
-        let windows = [&prefill[..33], &prefill[300..340]];
         let file = glm5next_tier::open()?;
         let mut machine = crate::gate_card::plan_gate(inputs.model.layers);
         reserve_checkpoints(
@@ -1968,13 +1963,6 @@ mod gate {
         let file = open()?;
         let inputs = PlanInputs::read(&file)?;
         let nextn = NextnInputs::read(&inputs)?;
-        if std::env::args().any(|arg| arg == "--slots") {
-            return if slots_pass(&inputs, &nextn, &levers)? {
-                Ok(())
-            } else {
-                Err(checks_failed())
-            };
-        }
         // The fixture's band is counted over the layer's own tensors, so it is read from the file
         // the loads open.
         let fx_band = if Tier::from_env()? == Tier::Fixture {
@@ -2187,8 +2175,13 @@ mod gate {
         // (z) on a load of its own: this one's plan counts one sequence, and
         // the card holds one load.
         drop(m);
+        let prefill = glm5next_tier::d1k_prefill()?;
+        if prefill.len() < 340 {
+            return Err(format!("{D1K}: {} prefill ids, (z) reads 340", prefill.len()).into());
+        }
+        let windows = [&prefill[..33], &prefill[300..340]];
         tier::sc("(z) two windows' drafted rounds as one pass of both slots")?;
-        ok &= slots_pass(&inputs, &nextn, &levers).unwrap_or_else(|e| {
+        ok &= slots_pass(&inputs, &nextn, &levers, windows).unwrap_or_else(|e| {
             println!("(z) a call failed: {e} {}", verdict(false));
             false
         });

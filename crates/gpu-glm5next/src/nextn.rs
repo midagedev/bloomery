@@ -652,6 +652,9 @@ pub fn retain_prompt_row(
     first: usize,
     pos: u32,
 ) -> Result<(), GpuError> {
+    if walk != GlmArena::Prefill {
+        return Err(shape(format!("a shared prompt arena, got {walk:?}")));
+    }
     let (gpu, _, body) = m.body_parts(WHAT)?;
     let fin = crate::program::final_streams(body.cfg.len());
     let width = HC_STREAMS * body.dims.embd;
@@ -659,9 +662,6 @@ pub fn retain_prompt_row(
         .prompt
         .final_streams(fin)
         .ok_or_else(|| shape("prompt-batch rows before any batch buffers".to_string()))?;
-    if walk != GlmArena::Prefill {
-        return Err(shape(format!("a shared prompt arena, got {walk:?}")));
-    }
     body.wrote
         .prefill
         .check_read(WHAT, walk, rows, (first, 1), pos)?;
