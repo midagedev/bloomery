@@ -342,7 +342,10 @@ mod agent {
             }
         }
         if let Some(p) = err.downcast_ref::<PlacementError>() {
-            let need = p.card_short().map(|s| s.need);
+            let need = p
+                .card_short()
+                .or_else(|| p.host_floor_short())
+                .map(|s| s.need);
             return Some((placement_code(p), Vec::new(), need));
         }
         if let Some(f) = err.downcast_ref::<FloorShort>() {
@@ -358,7 +361,7 @@ mod agent {
             return Some((Code::NoFit, next, Some(c.short.need)));
         }
         if let Some(h) = err.downcast_ref::<HostShort>() {
-            return Some((Code::NoFit, Vec::new(), h.pool_short().map(|s| s.need)));
+            return Some((Code::NoFit, Vec::new(), Some(h.need.bytes())));
         }
         if let Some(p) = err.downcast_ref::<PastLimit>() {
             return Some((Code::Usage, ctx_next(p.limit), None));
@@ -747,9 +750,10 @@ mod agent {
             assert_eq!(chosen(8192), (false, Some(8192)));
         }
 
-        /// A plan refusal named with the reserves beside the plan keeps its class and its cause:
-        /// the draft's host experts past the room are no fit, and the message the plan line and
-        /// the error event carry names the reserve and the refusal both.
+        /// A plan refusal named with the reserves beside the plan keeps its class, its cause and
+        /// the bytes it asked for: the draft's host experts past the room are no fit asking the
+        /// draft's bytes, and the message the plan line and the error event carry names the
+        /// reserve and the refusal both.
         #[test]
         fn a_reserve_named_refusal_keeps_its_class_and_cause() {
             let cause = PlacementError::DraftHostRoom { room: 8, draft: 9 };
@@ -762,19 +766,20 @@ mod agent {
                 cause,
             );
             let (code, _, need) = classify(e.as_ref()).expect("a named refusal");
-            assert_eq!(code, Code::NoFit);
+            assert_eq!((code, need), (Code::NoFit, Some(9)));
             let line = refusal_json(code, &e.to_string(), need);
             let message = line["refused"]["message"].as_str().expect("a message");
             assert!(message.contains("image encoder's 7 B"), "{message}");
             assert!(message.contains(&text), "{message}");
         }
 
-        /// A placement refusal a family's error carries keeps its class: a host room under the
-        /// NVMe tier floor is no fit whichever shared plan, the nodes' plan or the load refused
-        /// it. Each architecture's own planner error carries it as its source the same way
-        /// (`model::arch`'s `a_family_placement_refusal_is_its_errors_source`).
+        /// A placement refusal a family's error carries keeps its class and the bytes it asked
+        /// for: a host room under the NVMe tier floor is no fit, asking the floor, whichever
+        /// shared plan, the nodes' plan or the load refused it. Each architecture's own planner
+        /// error carries it as its source the same way (`model::arch`'s
+        /// `a_family_placement_refusal_is_its_errors_source`).
         #[test]
-        fn a_family_placement_refusal_keeps_its_class() {
+        fn a_family_placement_refusal_keeps_its_class_and_need() {
             use model::arch::{draft, hybrid, place_hybrid};
             let floor = || PlacementError::HostRoomFloor {
                 room: 1,
@@ -792,8 +797,56 @@ mod agent {
                 Box::new(model::ModelError::Placement(floor())),
             ];
             for e in families {
-                assert_eq!(class_of(&e), Some(Code::NoFit), "{e:?}");
+                let named = classify(e.as_ref()).map(|(code, _, need)| (code, need));
+                assert_eq!(named, Some((Code::NoFit, Some(2))), "{e:?}");
                 assert_eq!(e.to_string(), floor().to_string(), "{e:?}");
+            }
+        }
+
+        /// A host-side refusal names the bytes it asked for: an arena past what the room leaves
+        /// over the NVMe tier's floor, an arena under its least, and a load's host need where
+        /// each card has memory of its own.
+        #[test]
+        fn a_host_refusal_names_the_bytes_it_asked() {
+            use model::placement::ArenaFloor;
+            use model::placement::workstation::{HostNeed, HostRead};
+            let least = ArenaFloor::new(8, 1, 0, 3).expect("a floor");
+            let need = HostNeed {
+                experts: 4,
+                tables: 0,
+                shadows: 0,
+                reserves: 1,
+                extra: 0,
+                read_ahead: 0,
+                arena: 0,
+                cards: 0,
+                os: 0,
+                card_budget: false,
+            };
+            let host = HostShort {
+                need,
+                available: 2,
+                read: Box::new(HostRead::MemAvailable),
+                floor: None,
+            };
+            let refusals: [(GateError, u64); 3] = [
+                (
+                    Box::new(PlacementError::NvTierArena {
+                        arena: 6,
+                        room: 9,
+                        floor: 5,
+                    }),
+                    6,
+                ),
+                (
+                    Box::new(PlacementError::NvTierArenaUnder { arena: 1, least }),
+                    least.bytes,
+                ),
+                (Box::new(host), 5),
+            ];
+            for (e, asked) in refusals {
+                let named = classify(e.as_ref()).map(|(code, _, need)| (code, need));
+                assert_eq!(named, Some((Code::NoFit, Some(asked))), "{e}");
             }
         }
 
