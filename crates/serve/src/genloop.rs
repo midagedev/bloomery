@@ -2964,6 +2964,14 @@ impl Gen {
                 self.stop = StopKind::Loop;
                 break;
             }
+            // A watch's refusal of the text this id wrote is returned once
+            // the id is taken, a token limit that ends the request on it
+            // included; one drafted behind ids still to be taken waits for them.
+            if self.taken >= self.kept.len()
+                && let Some(e) = self.refused_after.take()
+            {
+                return Err(e.into());
+            }
             if self.generated.len() >= self.budget {
                 break;
             }
@@ -2987,9 +2995,6 @@ impl Gen {
                 self.taken += 1;
                 self.tok = Some(t);
                 continue;
-            }
-            if let Some(e) = self.refused_after.take() {
-                return Err(e.into());
             }
             let (n, len) = (self.n, self.generated.len());
             // Feeding `tok` takes position n + len - 1; the cache holds ctx_max.
