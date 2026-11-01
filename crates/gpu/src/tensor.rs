@@ -487,6 +487,30 @@ pub fn dtod_2d<D>(
     cu(rc, "cuMemcpy2DAsync_v2 (device to device)")
 }
 
+/// `n` f32 of `src` copied into `dst`, one row: a tap's or a checkpoint's
+/// copy of a value the step leaves. Asynchronous on `stream`; refused by
+/// name, nothing enqueued, when either span leaves its buffer
+/// ([`dtod_2d`]'s own check).
+pub fn copy_row(
+    stream: &CudaStream,
+    src: &DeviceBuffer<f32>,
+    dst: &mut DeviceBuffer<f32>,
+    n: usize,
+) -> Result<(), GpuError> {
+    let width = n * 4;
+    dtod_2d(
+        stream,
+        (src, 0),
+        (dst, 0),
+        Pitched {
+            width,
+            rows: 1,
+            dev_pitch: width,
+            host_pitch: width,
+        },
+    )
+}
+
 /// One device allocation cut into `N` consecutive parts, each of which the
 /// launches read and write as a buffer of its own, while a launch handed the
 /// whole writes every part at once — a gemv over row-concatenated weights

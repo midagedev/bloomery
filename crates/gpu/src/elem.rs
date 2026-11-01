@@ -1544,13 +1544,18 @@ mod elem_kernels {
     /// serves token `b / ceil(h·d / 256)`: its first thread forms the basis
     /// once and the block reads it past the barrier. A value or a weight that
     /// is not finite makes the values it scales not finite, the rule's own
-    /// result (nothing is clamped, and no fault is raised).
+    /// result (nothing is clamped) and raises [`FaultSite::F32Product`] from
+    /// the lane that wrote the value.
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
         domain = 1,
         block = (256, 1, 1),
         requires = (x.len() >= m * h * d, pos.len() >= m, s.len() >= h, b.len() >= h)
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
     )]
     pub fn ssmax_rows(
         mut x: DisjointSlice<f32>,
@@ -1560,6 +1565,7 @@ mod elem_kernels {
         d: u32,
         h: u32,
         m: u32,
+        fault: FaultSink,
     ) {
         static mut BASIS: SharedArray<f32, 1> = SharedArray::UNINIT;
 
@@ -1601,7 +1607,11 @@ mod elem_kernels {
                 *b.get_unchecked(head),
             );
             let v = x.get_unchecked_mut(t * row + i);
-            *v = mul_rn_f32(*v, f);
+            let out = mul_rn_f32(*v, f);
+            if !out.is_finite() {
+                fault.raise(FaultSite::F32Product);
+            }
+            *v = out;
         }
     }
 
@@ -3101,9 +3111,10 @@ impl ElemKernels {
     /// `(ssmax_basis(pos[t])·s[head]) + b[head]`. `pos` holds `m` positions
     /// and `s` and `b` the `h` heads' scale and bias, each a device buffer
     /// of f32 (positions u32); the counts and the one `m·h·d` span fit a
-    /// launch's u32. Refused before the launch: an empty token, head or
-    /// width, short `x`, `pos`, `s` or `b`. Asynchronous, allocation-free,
-    /// capturable.
+    /// launch's u32. A value the rule leaves not finite raises
+    /// `fault`'s [`FaultSite::F32Product`]. Refused before the launch: an
+    /// empty token, head or width, short `x`, `pos`, `s` or `b`. Asynchronous,
+    /// allocation-free, capturable.
     #[allow(
         clippy::too_many_arguments,
         reason = "host launcher: one argument per kernel argument it binds (rust-quality R8)"
@@ -3118,6 +3129,7 @@ impl ElemKernels {
         h: usize,
         d: usize,
         m: usize,
+        fault: FaultSink,
     ) -> Result<(), GpuError> {
         let what = "enqueue_ssmax_rows";
         if m == 0 || h == 0 || d == 0 {
@@ -3150,7 +3162,7 @@ impl ElemKernels {
             .module
             .prepare_ssmax_rows(LaunchConfig1D::new(grid, 256, 0))?;
         self.module
-            .ssmax_rows(stream, &prep, x, pos, s, b, d, h, m)?;
+            .ssmax_rows(stream, &prep, x, pos, s, b, d, h, m, fault)?;
         Ok(())
     }
 
