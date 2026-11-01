@@ -11,6 +11,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
+use std::time::{Duration, Instant};
 
 use cuda_core::CudaStream;
 use gguf::{GgmlType, Place, Split, TensorInfo};
@@ -41,7 +42,15 @@ pub fn load<S: Source + Sync, E: std::fmt::Display>(
 ) -> Result<Weights, GpuError> {
     let reading = host_available_read().map_err(refused)?;
     let plan = LoadPlan::new(source, rule, reading.0)?;
-    load_plan(stream, source, &plan, card, release, &reading)
+    Ok(load_plan(stream, source, &plan, card, release, &reading)?.0)
+}
+
+/// What a part source's load read: the wall from its first part's read to its last's, and the
+/// most host bytes its reads were planned to hold at once (`LoadPlan::host_bytes`).
+#[derive(Clone, Copy, Debug)]
+pub struct PartsRead {
+    pub read: Duration,
+    pub peak: u64,
 }
 
 fn load_plan<S: Source + Sync>(
@@ -51,7 +60,7 @@ fn load_plan<S: Source + Sync>(
     card: impl Fn(&TensorInfo) -> Option<CardFormat>,
     release: bool,
     room: &(u64, HostRead),
-) -> Result<Weights, GpuError> {
+) -> Result<(Weights, PartsRead), GpuError> {
     plan.check(room)?;
     for p in plan.parts.iter() {
         if let Some(format) = card(&p.info) {
@@ -63,7 +72,7 @@ fn load_plan<S: Source + Sync>(
     // Dropped before the staged device buffers: draining the ring protects refused loads.
     let mut ring = UploadRing::new(stream, plan.upload_bytes)?;
     let live = || host_available_read().map_err(refused);
-    read_staged(source, plan, live, release, |_, part| {
+    let read = read_staged(source, plan, live, release, |_, part| {
         let one = TensorPart {
             info: part.info.clone(),
             spans: part.spans(),
@@ -75,7 +84,11 @@ fn load_plan<S: Source + Sync>(
         Ok(())
     })?;
     ring.finish(stream)?;
-    Ok(Weights::of_staged(staged))
+    let read = PartsRead {
+        read,
+        peak: plan.host_bytes,
+    };
+    Ok((Weights::of_staged(staged), read))
 }
 
 /// Whether a part may start its read ([`LoadPlan::admits`]).
@@ -104,6 +117,8 @@ struct Window {
     stop: bool,
     /// The live reading has held a read back once (named once on stderr).
     short: bool,
+    /// The first part's read start and the last part's read end.
+    reads: Option<(Instant, Instant)>,
 }
 
 /// `plan`'s parts read on threads of their own while `stage` takes each, in plan order, as soon
@@ -115,14 +130,14 @@ struct Window {
 /// first sets its mask to the pool's cpus, since a spawned thread inherits the caller's pin. The
 /// first refusal, a reader's, an admission's, a read's, a release's or the stage's, stops the
 /// readers taking more parts; a reader's or the stage's panic stops them the same way and then
-/// unwinds.
+/// unwinds. The wall from the first part's read to the last's.
 fn read_staged<'s, 'p, S: Source + Sync>(
     source: &'s S,
     plan: &'p LoadPlan,
     available: impl Fn() -> Result<(u64, HostRead), GpuError> + Sync,
     release: bool,
     mut stage: impl FnMut(&'p Planned, Part<'s>) -> Result<(), GpuError>,
-) -> Result<(), GpuError> {
+) -> Result<Duration, GpuError> {
     let parts: &[Planned] = &plan.parts;
     let pool = threads::pool();
     let cpus: Vec<u32> = pool.topology().concat();
@@ -176,11 +191,16 @@ fn read_staged<'s, 'p, S: Source + Sync>(
                         Ok(Admit::Read) => {
                             w.next += 1;
                             drop(w);
+                            let start = Instant::now();
                             let read = source.read(&parts[i]).map_err(|e| e.to_string());
+                            let end = Instant::now();
                             if tx.send((i, read)).is_err() {
                                 return;
                             }
                             w = lock();
+                            let (first, last) = w.reads.get_or_insert((start, end));
+                            *first = (*first).min(start);
+                            *last = (*last).max(end);
                         }
                         Ok(admit) => {
                             if admit == Admit::Short && !std::mem::replace(&mut w.short, true) {
@@ -235,13 +255,10 @@ fn read_staged<'s, 'p, S: Source + Sync>(
         drop(rx);
         staged
     })?;
-    match shared
-        .into_inner()
-        .unwrap_or_else(PoisonError::into_inner)
-        .failed
-    {
+    let w = shared.into_inner().unwrap_or_else(PoisonError::into_inner);
+    match w.failed {
         Some(e) => Err(e),
-        None => Ok(()),
+        None => Ok(w.reads.map_or(Duration::ZERO, |(first, last)| last - first)),
     }
 }
 
@@ -316,10 +333,10 @@ impl<S: Source + Send + Sync> crate::model::PartsLoad for PlacedSource<S> {
         card: usize,
         release: bool,
         room: u64,
-    ) -> Result<Weights, GpuError> {
+    ) -> Result<(Weights, PartsRead), GpuError> {
         let (on, read) = self.reading(plan, card, room)?;
         let (available, reading) = host_available_read().map_err(refused)?;
-        let w = load_plan(
+        let (w, read) = load_plan(
             stream,
             &self.source,
             &read,
@@ -328,7 +345,7 @@ impl<S: Source + Send + Sync> crate::model::PartsLoad for PlacedSource<S> {
             &(available.min(room), reading),
         )?;
         on.check(&w)?;
-        Ok(w)
+        Ok((w, read))
     }
 
     fn load_whole(&self, stream: &CudaStream, card: CardOf<'_>) -> Result<Weights, GpuError> {
@@ -835,7 +852,8 @@ mod tests {
     /// a reader's or the stage's panic that leaves the other readers waiting stalls its load;
     /// admitting a part without the held parts, or reading on a `Wait` or a `Short`, holds more
     /// parts than the peaks; never reading beside a held part holds fewer; a reader's admission
-    /// error not kept as the load's error names a stopped reader instead.
+    /// error not kept as the load's error names a stopped reader instead; a reads' wall left at
+    /// zero falls under the longest read.
     #[test]
     fn parts_stage_in_order_as_their_reads_arrive() {
         let (finished, watch) = mpsc::channel::<()>();
@@ -928,7 +946,13 @@ mod tests {
         let whole = plan(9, 36, "p");
         let refusing = plan(12, 48, "p");
         let turning = plan(4, 8, "q");
-        read_staged(&slow, &whole, room, release, &mut stage).unwrap();
+        // The reads' wall spans the longest read (part 0's sleep) and lies inside the load.
+        let started = Instant::now();
+        let reads = read_staged(&slow, &whole, room, release, &mut stage).unwrap();
+        assert!(
+            reads >= Duration::from_millis(24) && reads <= started.elapsed(),
+            "{reads:?}"
+        );
         let mut released = std::mem::take(&mut *RELEASED.lock().unwrap());
         released.sort_unstable();
         assert_eq!(released, (0..9).collect::<Vec<u64>>());
@@ -1130,7 +1154,7 @@ mod tests {
         let plan = LoadPlan::new(&source, |_, _, _| Ok::<_, String>(Take::Whole), room.0).unwrap();
         let gpu = crate::Gpu::with_device(0).unwrap();
         for (release, want) in [(false, vec![]), (true, vec!["a.weight", "b.weight"])] {
-            let w = load_plan(gpu.stream(), &source, &plan, |_| None, release, &room).unwrap();
+            let (w, _) = load_plan(gpu.stream(), &source, &plan, |_| None, release, &room).unwrap();
             assert_eq!(w.names().collect::<Vec<_>>(), ["a.weight", "b.weight"]);
             let mut released = std::mem::take(&mut *source.0.lock().unwrap());
             released.sort_unstable();

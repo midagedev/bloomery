@@ -326,11 +326,12 @@ pub static LOAD_GENERATOR: Kind = Kind {
 /// `load_s`: the file's headers, the placement plan when its loader timed
 /// it, the card's context and device modules, the weights upload, the
 /// derived weights, the plan's host set, the body's build, the output head,
-/// and the rest of the span.
+/// and the rest of the span; then, for an upload from a part source, its
+/// reads' wall and planned host peak, and the process's peak resident set.
 pub static LOAD_PHASES: Kind = Kind {
     name: "load_phases",
     head: "load phases",
-    doc: "The load's phases, each the wall of its span inside the load line's load_s: the file's headers, the placement plan when its loader timed it, the card's context and device modules, the weights upload, the derived weights, the plan's host set, the body's build, the output head, and the rest of the span.",
+    doc: "The load's phases, each the wall of its span inside the load line's load_s: the file's headers, the placement plan when its loader timed it, the card's context and device modules, the weights upload, the derived weights, the plan's host set, the body's build, the output head, and the rest of the span. For an upload from a part source (a checkpoint folder), read_s is the wall from its first part's read to its last's, inside upload_s, and read_peak the most host bytes its reads were planned to hold at once; rss_peak is the process's peak resident set when the record is printed.",
     parts: &[
         key("open_s", F64(2), "s"),
         opt("plan_s", F64(2), "s"),
@@ -341,6 +342,9 @@ pub static LOAD_PHASES: Kind = Kind {
         key("body_s", F64(2), "s"),
         key("head_s", F64(2), "s"),
         key("other_s", F64(2), "s"),
+        opt("read_s", F64(2), "s"),
+        opt("read_peak", U64, "B"),
+        opt("rss_peak", U64, "B"),
     ],
 };
 
@@ -3821,7 +3825,8 @@ pub fn load_phases(
 /// and the plan where the seat makes it before the loader's call), the other
 /// phases those the load timed ([`bloomery_gpu::model::GpuModel::load_times`]).
 /// A load that timed none prints nothing; phases past `total` panic by name,
-/// as [`load_phases`] does.
+/// as [`load_phases`] does. A load from a part source adds what its parts
+/// read, and every load the process's peak resident set where the OS gives it.
 #[cfg(feature = "gpu")]
 pub fn eprint_load_phases<B: bloomery_gpu::model::ChainBody>(
     model: &bloomery_gpu::model::GpuModel<B>,
@@ -3831,7 +3836,7 @@ pub fn eprint_load_phases<B: bloomery_gpu::model::ChainBody>(
     let Some(times) = model.load_times() else {
         return;
     };
-    load_phases(
+    let r = load_phases(
         total.as_secs_f64(),
         open.as_secs_f64(),
         times.plan.map(|d| d.as_secs_f64()),
@@ -3841,7 +3846,17 @@ pub fn eprint_load_phases<B: bloomery_gpu::model::ChainBody>(
         times.host_set.as_secs_f64(),
         times.body.as_secs_f64(),
         times.head.as_secs_f64(),
-    )
+    );
+    let r = match times.parts {
+        Some(read) => r
+            .f("read_s", read.read.as_secs_f64())
+            .u("read_peak", read.peak),
+        None => r,
+    };
+    match os::max_rss_bytes() {
+        Ok(rss) => r.u("rss_peak", rss),
+        Err(_) => r,
+    }
     .eprint();
 }
 

@@ -337,7 +337,7 @@ impl Mtp38 {
                     .map_err(|e| GpuError::plan(WHAT, e))?;
                 let (need, room) = parts.host_need(&rows, 0, 0, reading.0)?;
                 need.check(&reading).map_err(|e| GpuError::plan(WHAT, e))?;
-                parts.load(stream, &rows, 0, card_dontneed, room)?
+                parts.load(stream, &rows, 0, card_dontneed, room)?.0
             }
             None => Weights::load_placed(stream, draft_file, &rows, 0, card_dontneed)?,
         };
