@@ -36,7 +36,7 @@ const HEAD: &str = "language_model.lm_head.weight";
 mod names {
     pub(super) use model::arch::names::{
         attn_k, attn_k_norm, attn_norm, attn_output, attn_q, attn_q_norm, attn_v, ffn_down,
-        ffn_gate, ffn_norm, ffn_up, output, output_norm, token_embd,
+        ffn_gate, ffn_norm, ffn_up, output, output_norm, rope_freqs, token_embd,
     };
 
     use model::arch::names::blk;
@@ -69,11 +69,6 @@ mod names {
     /// `blk.{l}.shortconv.out_proj.weight`.
     pub(super) fn shortconv_out_proj(l: usize) -> String {
         blk(l, "shortconv.out_proj.weight")
-    }
-
-    /// `rope_freqs.weight`, the per-pair frequency factors of a full-attention layer.
-    pub(super) fn rope_freqs() -> String {
-        "rope_freqs.weight".to_string()
     }
 }
 
@@ -433,16 +428,7 @@ impl FolderMap for Checkpoint {
         _planned: &[(&str, &[u64])],
         _folder: &safetensors::Folder,
     ) -> Result<Vec<(String, Value)>, Error> {
-        let mut keys = vec![(
-            gguf::GENERAL_ARCHITECTURE.to_string(),
-            Value::String(ARCHITECTURE.into()),
-        )];
-        keys.extend(
-            self.keys
-                .iter()
-                .map(|(k, v)| (format!("{ARCHITECTURE}.{k}"), v.clone())),
-        );
-        Ok(keys)
+        Ok(trunk::header(ARCHITECTURE, &self.keys))
     }
 
     fn vocab(&self) -> &VocabSpec {

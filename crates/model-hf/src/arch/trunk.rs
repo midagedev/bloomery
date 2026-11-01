@@ -214,6 +214,20 @@ pub(super) fn metadata(
     keys
 }
 
+/// The header's keys: the architecture, then each model field under the architecture's name.
+pub(super) fn header(arch: &str, fields: &[(String, Value)]) -> Vec<(String, Value)> {
+    let mut keys = vec![(
+        gguf::GENERAL_ARCHITECTURE.to_string(),
+        Value::String(arch.into()),
+    )];
+    keys.extend(
+        fields
+            .iter()
+            .map(|(k, v)| (format!("{arch}.{k}"), v.clone())),
+    );
+    keys
+}
+
 /// Whether `shape` names a tensor of at least one value, whose count fits `usize`.
 pub(super) fn sized(shape: &[usize]) -> bool {
     !shape.is_empty()

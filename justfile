@@ -98,21 +98,23 @@ mac-test:
 lab-metal:
     cargo test -p bloomery-metal --lib && cargo test -p bloomery-metal --features pipeline-scan --bin metal_scan && cargo test -p bloomery-metal --bin metal_attention_time --bin generate_metal && cargo build --release -p bloomery-metal --bin gate_metal_device --bin gate_metal_qwen35moe_kernels && ./tools/mac-gate.sh gate_metal_device && ./tools/mac-gate.sh gate_metal_qwen35moe_kernels && BLOOMERY_GATE_BOUND=1800 ./tools/mac-gate.sh gate_metal_qwen35moe_kernels --mutants-all
 
-# The Metal session's e2e gate on an Apple Silicon Mac, run by tools/mac-gate.sh over four rows (`--row`): the qwen35moe
+# The Metal session's e2e gate on an Apple Silicon Mac, run by tools/mac-gate.sh over five rows (`--row`): the qwen35moe
 # MLX split, then the qwen3moe MLX split (attention layers only, no shared expert, no recurrent store; the clauses that
 # hold a delta contract print SKIP with their reason), then the qwen38d MLX split (Qwen3.8-27B's fixture: a dense FFN in
 # every layer, so the clause that walks a router's picks prints SKIP), then the lfm3 checkpoint folder (LFM3-1.7B's
 # MLX 4-bit folder, `$BLOOMERY_FIXTURE_ROOT/lfm3-mlx`: a short conv beside the attention layers, a sandwich residual, a
 # dense FFN and a tied head; no `prepare` map reads it, so the folder is the model, and the clause that tells a folder
-# from its split prints SKIP). A split row opens
+# from its split prints SKIP), then the llama checkpoint folder (Llama-3.1-8B-Instruct's MLX 4-bit folder cut to four
+# layers, `$BLOOMERY_FIXTURE_ROOT/llama-mlx`: grouped-query attention with no head norm and NORM rope pairs, a dense
+# SwiGLU and a head of its own; the folder is the model there too). A split row opens
 # `$BLOOMERY_FIXTURE_ROOT/<family>-mlxsplit`: the token's encoded count, the fault path of a bad token id, the
 # generation core the CLI runs (ids, stops, sink), the
 # profile step (its picks and logits equal the plain step's, its group tags covering the count's groups, its weight
 # bytes equal the file's own tensors), the MLX folder opened as it is, which must tell what its prepared split tells
 # (m_mlx_folder; before the gate, model-hf's hw_a_ tests hold the two files' tensor bytes equal), and the first-step
 # logits against the committed mlx-lm dump (m_logits, and for the lfm3 row m_logits_deep over its deep pin, past the
-# sliding window); then the gate's kernel mutants of the qwen35moe row, of the qwen38d row and of the lfm3 row, each of
-# which its clause must catch; then the generate_metal CLI's smoke on the qwen35moe split (and, for
+# sliding window); then the gate's kernel mutants of the qwen35moe row, of the qwen38d row, of the lfm3 row and of the
+# llama row, each of which its clause must catch; then the generate_metal CLI's smoke on the qwen35moe split (and, for
 # the ids and the text prompt, on the qwen3moe and qwen38d splits). The prompt ids through --tokens must print the ids
 # pinned here, a text prompt must decode to non-empty stdout, and the decode rate and the profile's decode_ms must count the loop's passes (none for a one-token
 # run, 7 for eight tokens). The GGUF fixture smoke left with the ik clauses.
@@ -131,9 +133,11 @@ lab-metal-e2e:
     run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --row qwen3moe
     run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --row qwen38d
     run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --row lfm3
+    run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --row llama
     run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --mutants-all
     run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --row qwen38d --mutants-all
     run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --row lfm3 --mutants-all
+    run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --row llama --mutants-all
     # The smoke opens the MLX split's first shard, the same file the e2e gate opens.
     shard() {
         local dir="${BLOOMERY_FIXTURE_ROOT:-/models/fixtures}/$1-mlxsplit" found=()

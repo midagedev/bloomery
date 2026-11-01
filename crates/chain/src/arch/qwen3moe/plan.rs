@@ -134,15 +134,6 @@ impl GqaKind {
             .iter()
             .any(|c| c.kind == self && c.rope_factors)
     }
-
-    /// Which values of a head the kind's rope turns together.
-    #[must_use]
-    pub fn pairs(self) -> Pairs {
-        match self {
-            GqaKind::Neox128 | GqaKind::Gated256 | GqaKind::HeadGate128 => Pairs::Neox,
-            GqaKind::Head128 { pairs, .. } => pairs,
-        }
-    }
 }
 
 /// Which values of a head a rope turns together.
@@ -1562,12 +1553,10 @@ mod tests {
     }
 
     /// What a kind keeps per layer is its class row's: rope factors on the head-128 NORM attention
-    /// and on the head with a gate of its own and on no other, and the pairing a kind reports is the
-    /// row's. Mutant: a kind's `pairs` arm that disagrees with its row.
+    /// and on the head with a gate of its own and on no other.
     #[test]
     fn a_kind_reports_the_rope_its_class_row_says() {
         for class in &GqaKind::CLASSES {
-            assert_eq!(class.kind.pairs(), class.pairs, "{:?}", class.kind);
             assert_eq!(
                 class.kind.rope_factors(),
                 matches!(class.kind, GqaKind::HeadGate128 | GqaKind::Head128 { .. }),

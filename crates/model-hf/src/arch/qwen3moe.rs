@@ -181,16 +181,7 @@ impl FolderMap for Checkpoint {
         _planned: &[(&str, &[u64])],
         _folder: &safetensors::Folder,
     ) -> Result<Vec<(String, Value)>, Error> {
-        let mut keys = vec![(
-            gguf::GENERAL_ARCHITECTURE.to_string(),
-            Value::String(ARCHITECTURE.into()),
-        )];
-        keys.extend(
-            self.keys
-                .iter()
-                .map(|(k, v)| (format!("{ARCHITECTURE}.{k}"), v.clone())),
-        );
-        Ok(keys)
+        Ok(trunk::header(ARCHITECTURE, &self.keys))
     }
 
     fn vocab(&self) -> &VocabSpec {
