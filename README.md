@@ -277,6 +277,15 @@ RAM, one request at a time at the serving defaults, greedy, 128 tokens, median o
 |---|---|---|---|
 | Qwen3.6-35B-A3B `Q4_K_M`, whole on the card | 14,249, 287 ms code; 14,298, 286 ms prose | 344.1 code, 344.2 prose | — |
 
+With its MTP draft, on the same card at a power limit of 400 W (default 600 W), at `3ebdff767`: unsloth's
+`UD-Q4_K_M`, which carries the next-token layer, `BLOOMERY_DRAFT=mtp`, 4,096-id prompts, 128 greedy tokens, one request
+at a time, median of three rounds
+([`docs/numbers.md`](docs/numbers.md#rtx-5090-qwen36-35b-a3b-with-its-mtp-draft-by-juliankang4)).
+
+| Model | Prefill tok/s | Decode tok/s | First token |
+|---|---|---|---|
+| Qwen3.6-35B-A3B `UD-Q4_K_M`, MTP draft on | 8,747 | 268.2 | 470 ms |
+
 **M5 Ultra**, measured by [@avlp12](https://github.com/avlp12) at 0.3.9's Metal code
 ([#593](https://github.com/midagedev/bloomery/issues/593); conditions in [`docs/mac.md`](docs/mac.md#numbers)).
 
