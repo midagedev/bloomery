@@ -1483,7 +1483,7 @@ mod cli {
     /// whose prompt calls stream (`levers` under the seat's rule, [`plans_ring`], with no
     /// residency `off` before the plan at `path`, [`residency38_off`]) reserves the lane's staging
     /// on the host (`workstation::reserve_stream_staging`) where its plan has host experts to
-    /// stream (`workstation::plan_streams`, of the plan the caller makes, [`plan38`]).
+    /// stream (`workstation::plan_streams`, of [`PlanInputs::plan_target`]).
     fn machine38(
         (place, levers, path): (Place, &Levers, Prompt38),
         inputs: &PlanInputs,
@@ -1521,35 +1521,14 @@ mod cli {
             stage38(place),
             residency38_off(levers.residency(), residency_at38(place, levers, path)),
         ) {
-            let mut staged = machine.clone();
-            workstation::reserve_stream_staging(&mut staged, inputs.stream_slot(experts)?);
             let plan_levers = PlanLevers::from_levers(levers)?;
-            let on = (&plan_levers, experts, mtp, slots);
-            if workstation::plan_streams(&plan38(inputs, &staged, (ctx, ub), on)?) {
-                return Ok(staged);
+            let plan =
+                inputs.plan_target(&machine, (ctx, ub), &plan_levers, experts, mtp, slots)?;
+            if workstation::plan_streams(&plan) {
+                workstation::reserve_stream_staging(&mut machine, inputs.stream_slot(experts)?);
             }
         }
         Ok(machine)
-    }
-
-    /// The plan of `inputs` on `machine` at `ctx` positions and ubatches of `ub` under `levers`
-    /// and `experts`: with the MTP draft beside the target where `mtp` is given
-    /// (`plan_mtp_with`), else for `slots` resident sequences (`plan_with_slots`), as each
-    /// caller of [`machine38`] plans it.
-    fn plan38<'a>(
-        inputs: &'a PlanInputs,
-        machine: &'a Machine,
-        (ctx, ub): (u64, u64),
-        (levers, experts, mtp, slots): (&PlanLevers, Experts, Option<&'a MtpInputs>, usize),
-    ) -> Result<Plan<'a>, GateError> {
-        Ok(match mtp {
-            None => inputs.plan_with_slots(machine, (ctx, ub), levers, experts, slots)?,
-            Some(mi) => {
-                inputs
-                    .plan_mtp_with(machine, (ctx, ub), levers, mi, experts)?
-                    .plan
-            }
-        })
     }
 
     /// The `plan` record of `plan` at `place` under `experts`: the stage

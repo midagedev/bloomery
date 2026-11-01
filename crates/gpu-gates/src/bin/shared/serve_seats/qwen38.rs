@@ -792,7 +792,6 @@ impl Place38 {
         if self.reads > 0 {
             model::placement::workstation::reserve_part_reads(&mut machine, self.reads);
         }
-        model::placement::workstation::reserve_stream_staging(&mut machine, self.stream);
         if mtp.is_some() {
             let (gdn, qsa) = layer_counts(inputs);
             let bytes = point_row_budget38(gdn, qsa, ctx)?;
@@ -801,7 +800,13 @@ impl Place38 {
                 .reserves
                 .push((POINT_ROWS_RESERVE.to_owned(), pinned(slots, bytes)));
         }
-        let (machine, (streams, got)) = widen_card_route(
+        if self.stream > 0 {
+            let plan = inputs.plan_target(&machine, (ctx, ub), levers, experts, mtp, slots)?;
+            if workstation::plan_streams(&plan) {
+                workstation::reserve_stream_staging(&mut machine, self.stream);
+            }
+        }
+        Ok(widen_card_route(
             machine,
             ub,
             form,
@@ -810,13 +815,8 @@ impl Place38 {
                     .plan_target(m, (ctx, ub), levers, experts, mtp, slots)
                     .map(|p| on(&p))
             },
-            |p| (workstation::plan_streams(p), read(p)),
-        )?;
-        if self.stream > 0 && !streams {
-            let idle = Place38 { stream: 0, ..self };
-            return idle.machine_read(inputs, (ctx, ub), (experts, levers, mtp, slots), read);
-        }
-        Ok((machine, got))
+            read,
+        )?)
     }
 }
 
@@ -4672,12 +4672,13 @@ mod tests {
     /// the host reserve of 64 ring slots (`workstation::reserve_stream_staging`) where the plan
     /// leaves routed experts on the host, none where it streams nothing — a load that does not
     /// stream, and a plan that holds every expert on the card or has none to route
-    /// (`workstation::plan_streams`). FAIL-first: the seat's machines reserved no staging; then a
-    /// plan with nothing on the host still set it aside.
+    /// (`workstation::plan_streams`), even where the host room holds the plain plan but not
+    /// staging. FAIL-first: the seat's machines reserved no staging; then a plan with nothing
+    /// on the host still set it aside or was refused before dropping it.
     #[test]
     fn a_streaming_placement_reserves_its_staging() {
         use model::arch::qwen35moe::place::Experts;
-        use model::placement::workstation::XSTREAM_STAGING_RESERVE;
+        use model::placement::workstation::{self, HostNeed, HostRead, XSTREAM_STAGING_RESERVE};
         use model::placement::{ModelTensor, PlanLevers, Role};
 
         let (mut inputs, _, place) = seat_plan_inputs();
@@ -4730,6 +4731,28 @@ mod tests {
             staging(&inputs, streaming, Experts::Card),
             none,
             "every expert on the card"
+        );
+        let levers = PlanLevers::default();
+        let machine = place
+            .machine(&inputs, (4096, 1), Experts::Card, &levers, None, 1)
+            .expect("the card-only machine without staging");
+        let plan = inputs
+            .plan_target(&machine, (4096, 1), &levers, Experts::Card, None, 1)
+            .expect("the card-only plan");
+        let room = HostNeed::of(&plan, 0).bytes() + 32 * slot;
+        inputs.room = (room, HostRead::Given);
+        let mut staged = machine.clone();
+        workstation::reserve_stream_staging(&mut staged, slot);
+        assert!(
+            inputs
+                .plan_target(&staged, (4096, 1), &levers, Experts::Card, None, 1)
+                .is_err(),
+            "the host room covers the plain plan but not the unused staging"
+        );
+        assert_eq!(
+            staging(&inputs, streaming, Experts::Card),
+            none,
+            "a card-only load fits before staging is reserved"
         );
     }
 

@@ -3197,8 +3197,8 @@ mod tests {
     }
 
     /// A qwen4exp file's stream slot is its widest routed expert, the gate, up and down at their
-    /// file bytes: three Q8_0 rows of 64 values, 68 B each. A file whose layer 2 stacks are NVFP4
-    /// streams nothing (slot 0), nor does a load of every expert on the host, whose plan keeps
+    /// file bytes: three Q8_0 rows of 64 values, 68 B each, or three NVFP4 rows, 36 B each.
+    /// A load of every expert on the host streams nothing (slot 0), keeping
     /// the need of the plan without staging. The lane's staging a plan reserves for the slot
     /// (`workstation::reserve_stream_staging`) is the need's, pinned: 64 slots more than the plan
     /// without it. FAIL-first: the qwen38 seat and the CLI planned the Qwen3.8 stream's staging
