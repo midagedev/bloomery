@@ -23,7 +23,8 @@
 //! at warm, every [`SAMPLE_EVERY`] and at end, between requests: `/metrics`,
 //! then the server's `/proc` status and fd table read until three reads in a
 //! row agree (settled), then its card memory by pid. Each request is a line of
-//! `<dir>/requests.tsv`.
+//! `<dir>/requests.tsv`. A 200 answer the mix cannot read (no JSON, or no
+//! text where it reads one) ends the soak with an error naming it.
 //!
 //! The verdict, from warm on: card memory of the server pid equal to warm;
 //! settled fds, sockets and threads equal to warm; anonymous RSS
@@ -385,11 +386,61 @@ mod soak {
             }
         }
 
-        /// A 200 response's JSON; anything else is counted and gives `None`.
-        fn json(&mut self, kind: &str, path: &str, body: Option<&Value>) -> Option<Value> {
-            let (st, text) = self.send(kind, path, body, false)?;
-            json_of(path, st, &text).ok()
+        /// A 200 response's JSON; see [`served`].
+        fn json(
+            &mut self,
+            kind: &str,
+            path: &str,
+            body: Option<&Value>,
+        ) -> Result<Option<Value>, GateError> {
+            served(path, self.send(kind, path, body, false))
         }
+    }
+
+    /// The JSON of a 200 reply; `None` for a request that was not served
+    /// (its status or transport error counted by [`Client::send`]), and a
+    /// 200 whose body is no JSON refused by name.
+    fn served(path: &str, reply: Reply) -> Result<Option<Value>, GateError> {
+        match reply {
+            Some((200, text)) => json_of(path, 200, &text).map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    /// The string at `pointer` of a served answer, refused by name when the
+    /// answer holds none there.
+    fn string_at(what: &str, v: &Value, pointer: &str) -> Result<String, GateError> {
+        v.pointer(pointer)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| format!("{what}: no string at {pointer} in {v}").into())
+    }
+
+    /// The text of a streamed chat answer, its events' `delta.content` in
+    /// order. Refused by name: a stream with no `[DONE]`, an event that is no
+    /// JSON, an event with no `delta` object, and a `content` that is neither
+    /// absent, null nor a string.
+    fn streamed_text(sse: &str) -> Result<String, GateError> {
+        const WHAT: &str = "/v1/chat/completions";
+        let chunks = events(sse);
+        if !chunks.contains(&"[DONE]") {
+            return Err(format!("{WHAT}: stream has no [DONE]: {sse:?}").into());
+        }
+        let mut s = String::new();
+        for e in chunks.into_iter().filter(|e| *e != "[DONE]") {
+            let v: Value = serde_json::from_str(e)
+                .map_err(|err| format!("{WHAT}: stream event {e:?}: {err}"))?;
+            let delta = v
+                .pointer("/choices/0/delta")
+                .and_then(Value::as_object)
+                .ok_or_else(|| format!("{WHAT}: no delta object in {v}"))?;
+            match delta.get("content") {
+                None | Some(Value::Null) => {}
+                Some(Value::String(t)) => s.push_str(t),
+                Some(_) => return Err(format!("{WHAT}: delta.content is no string in {v}").into()),
+            }
+        }
+        Ok(s)
     }
 
     fn first_line(s: &str) -> String {
@@ -442,28 +493,26 @@ mod soak {
         light_next: usize,
     }
 
-    /// Text of `ids` through the server's `/detokenize`.
-    fn text_of(c: &mut Client, kind: &str, ids: &[u32]) -> Option<String> {
-        let v = c.json(kind, "/detokenize", Some(&json!({"tokens": ids})))?;
-        v["content"].as_str().map(str::to_owned)
+    /// Text of `ids` through the server's `/detokenize`; `None` when it was
+    /// not served.
+    fn text_of(c: &mut Client, kind: &str, ids: &[u32]) -> Result<Option<String>, GateError> {
+        c.json(kind, "/detokenize", Some(&json!({"tokens": ids})))?
+            .map(|v| string_at("/detokenize", &v, "/content"))
+            .transpose()
     }
 
     /// The count of the rendered ids of `messages`, through the server's
     /// template and tokenizer; `None` when a request was not served, and an
-    /// answer whose ids are not all ids refused by name.
+    /// answer it cannot read (no prompt, ids that are not all ids) refused by
+    /// name.
     fn rendered(c: &mut Client, messages: &[Value]) -> Result<Option<usize>, GateError> {
-        let tokenized = (|| {
-            let v = c.json(
-                "chat",
-                "/apply-template",
-                Some(&json!({"messages": messages})),
-            )?;
-            let text = v["prompt"].as_str()?.to_owned();
-            c.json("chat", "/tokenize", Some(&json!({"content": text})))
-        })();
-        tokenized
-            .map(|v| Ok(ids_of(&v["tokens"])?.len()))
-            .transpose()
+        let body = json!({"messages": messages});
+        let Some(v) = c.json("chat", "/apply-template", Some(&body))? else {
+            return Ok(None);
+        };
+        let text = string_at("/apply-template", &v, "/prompt")?;
+        let tokens = c.json("chat", "/tokenize", Some(&json!({"content": text})))?;
+        tokens.map(|v| Ok(ids_of(&v["tokens"])?.len())).transpose()
     }
 
     impl Mix {
@@ -478,7 +527,7 @@ mod soak {
             temp: (f64, u64),
         ) -> Result<(), GateError> {
             let ids = Corpus::slice(&self.corpus.prose, &mut self.rng, user);
-            let Some(text) = text_of(&mut self.c, "chat", &ids) else {
+            let Some(text) = text_of(&mut self.c, "chat", &ids)? else {
                 return Ok(());
             };
             if self.conv.held + user + predict + 64 > CHAT_CAP {
@@ -511,22 +560,18 @@ mod soak {
             };
             let answer = if st != 200 {
                 None
+            } else if stream && sse_errors(&text) > 0 {
+                // An engine failure's stream: its `error` event is counted, and it ends with no `[DONE]`.
+                None
             } else if stream {
-                let mut s = String::new();
-                for e in events(&text) {
-                    if let Ok(v) = serde_json::from_str::<Value>(e)
-                        && let Some(t) = v["choices"][0]["delta"]["content"].as_str()
-                    {
-                        s.push_str(t);
-                    }
-                }
-                Some(s)
+                Some(streamed_text(&text)?)
             } else {
-                serde_json::from_str::<Value>(&text).ok().and_then(|v| {
-                    v["choices"][0]["message"]["content"]
-                        .as_str()
-                        .map(str::to_owned)
-                })
+                let v = json_of("/v1/chat/completions", st, &text)?;
+                Some(string_at(
+                    "/v1/chat/completions",
+                    &v,
+                    "/choices/0/message/content",
+                )?)
             };
             match answer {
                 Some(a) => {
@@ -567,7 +612,7 @@ mod soak {
             self.c.n.generations += 1;
             let ids = self
                 .c
-                .json("probe", "/completion", Some(&body))
+                .json("probe", "/completion", Some(&body))?
                 .map(|v| ids_of(&v["tokens"]))
                 .transpose()?
                 .unwrap_or_default();
@@ -638,7 +683,7 @@ mod soak {
                 "prompt": ids, "n_predict": 64, "temperature": 0, "cache_prompt": false, "stream": true,
             });
             let ids = Corpus::slice(&self.corpus.prose, &mut self.rng, 128);
-            let Some(text) = text_of(&mut self.c, "pair", &ids) else {
+            let Some(text) = text_of(&mut self.c, "pair", &ids)? else {
                 return Ok(());
             };
             let b_body = json!({
@@ -1373,6 +1418,60 @@ mod soak {
         } else {
             println!("soak: FAIL {}", failed.join(" "));
             Err(checks_failed())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{GateError, served, streamed_text, string_at};
+        use serde_json::json;
+
+        fn refused<T: std::fmt::Debug>(r: Result<T, GateError>) -> String {
+            r.expect_err("refused").to_string()
+        }
+
+        /// A served answer the soak cannot read is refused by name; an
+        /// unserved request (counted when sent) stays `None`. Mutant: the
+        /// readers' old `.ok()` and `as_str()?`, which skipped such a turn
+        /// uncounted.
+        #[test]
+        fn a_served_answer_the_soak_cannot_read_is_refused() {
+            assert!(
+                refused(served("/detokenize", Some((200, "<html>".into()))))
+                    .contains("/detokenize")
+            );
+            assert_eq!(
+                served("/tokenize", Some((503, "busy".into()))).unwrap(),
+                None
+            );
+            assert_eq!(served("/tokenize", None).unwrap(), None);
+            assert_eq!(
+                served("/tokenize", Some((200, r#"{"tokens":[1]}"#.into()))).unwrap(),
+                Some(json!({"tokens": [1]}))
+            );
+            let v = json!({"prompt": 7});
+            assert!(refused(string_at("/apply-template", &v, "/prompt")).contains("/prompt"));
+            assert!(refused(string_at("/detokenize", &json!({}), "/content")).contains("/content"));
+            assert_eq!(
+                string_at("/detokenize", &json!({"content": "ab"}), "/content").unwrap(),
+                "ab"
+            );
+            let delta = |t: &str| json!({"choices": [{"delta": {"content": t}}]});
+            let sse = format!(
+                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                delta("a"),
+                delta("b")
+            );
+            assert_eq!(streamed_text(&sse).unwrap(), "ab");
+            assert!(refused(streamed_text(&format!("{sse}data: {{cut\n\n"))).contains("{cut"));
+            assert!(refused(streamed_text("<html>")).contains("no [DONE]"));
+            let seven = r#"data: {"choices":[{"delta":{"content":7}}]}"#;
+            assert!(
+                refused(streamed_text(&format!("{seven}\n\ndata: [DONE]\n\n")))
+                    .contains("no string")
+            );
+            let bare = "data: {\"choices\":[{}]}\n\ndata: [DONE]\n\n";
+            assert!(refused(streamed_text(bare)).contains("no delta"));
         }
     }
 }

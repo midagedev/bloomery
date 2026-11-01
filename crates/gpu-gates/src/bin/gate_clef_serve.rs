@@ -505,6 +505,67 @@ mod gate {
         provenance: bool,
     }
 
+    /// The `N` unsigned integers of a set D row's `[...]` entry `v` of `key`; anything else (no
+    /// array, another length, an entry that is no unsigned integer) is refused by name.
+    fn numbers<const N: usize>(id: &str, key: &str, v: &Json) -> Result<[u64; N], GateError> {
+        let refused = || {
+            format!(
+                "{id}: {key} entry {} is not {N} unsigned integers",
+                dumps(v, false)
+            )
+        };
+        let Json::Array(a) = v else {
+            return Err(refused().into());
+        };
+        let n: Vec<u64> = a
+            .iter()
+            .map(Json::as_u64)
+            .collect::<Option<_>>()
+            .ok_or_else(refused)?;
+        Ok(n.try_into().map_err(|_| refused())?)
+    }
+
+    /// The array a set D row holds at `key`, refused by name when it is anything else.
+    fn entries<'a>(id: &str, row: &'a Json, key: &str) -> Result<&'a [Json], GateError> {
+        match row.get(key) {
+            Some(Json::Array(a)) => Ok(a),
+            other => Err(format!(
+                "{id}: {key} is no array: {}",
+                other.map_or("absent".to_owned(), |v| dumps(v, false))
+            )
+            .into()),
+        }
+    }
+
+    /// A row's merged image tokens by the release's grids: a grid (t, h, w) is t·h·w / 4; a
+    /// product past `u64` is refused by name.
+    fn image_counts(id: &str, row: &Json) -> Result<Vec<u64>, GateError> {
+        entries(id, row, "image_grid_thw")?
+            .iter()
+            .map(|g| {
+                let n = numbers::<3>(id, "image_grid_thw", g)?
+                    .into_iter()
+                    .try_fold(1u64, u64::checked_mul)
+                    .ok_or_else(|| {
+                        format!("{id}: image_grid_thw {} overflows u64", dumps(g, false))
+                    })?;
+                Ok(n / 4)
+            })
+            .collect()
+    }
+
+    /// A row's pad run lengths by the release's spans (start, length); a row with no image may
+    /// leave `image_spans` out.
+    fn image_runs(id: &str, row: &Json) -> Result<Vec<u64>, GateError> {
+        if row.get("image_spans").is_none() {
+            return Ok(Vec::new());
+        }
+        entries(id, row, "image_spans")?
+            .iter()
+            .map(|s| Ok(numbers::<2>(id, "image_spans", s)?[1]))
+            .collect()
+    }
+
     /// Every request of set D (`$BLOOMERY_DATA/clefvis/ref/`), in the order of `images.jsonl`.
     fn set_d() -> Result<Vec<Case>, GateError> {
         let dir = refset::data_dir().join("clefvis/ref");
@@ -517,12 +578,6 @@ mod gate {
                 .find(|r| id_of(r).is_ok_and(|i| i == id))
                 .cloned()
                 .ok_or_else(|| format!("{id}: no such row in set D's files").into())
-        };
-        let numbers = |v: Option<&Json>| -> Vec<u64> {
-            match v {
-                Some(Json::Array(a)) => a.iter().filter_map(Json::as_u64).collect(),
-                _ => Vec::new(),
-            }
         };
         let mut cases = Vec::new();
         for row in &rows {
@@ -556,19 +611,9 @@ mod gate {
                     _ => out.push((k.clone(), v.clone())),
                 }
             }
-            // The release's own counts: a grid (t, h, w) is t·h·w / 4 merged tokens, and its pad
-            // runs say the same.
-            let counts: Vec<u64> = match row.get("image_grid_thw") {
-                Some(Json::Array(grids)) => grids
-                    .iter()
-                    .map(|g| numbers(Some(g)).iter().product::<u64>() / 4)
-                    .collect(),
-                _ => Vec::new(),
-            };
-            let runs: Vec<u64> = match row.get("image_spans") {
-                Some(Json::Array(spans)) => spans.iter().map(|s| numbers(Some(s))[1]).collect(),
-                _ => Vec::new(),
-            };
+            // The release's own counts: its grids and its pad runs say the same.
+            let counts = image_counts(&id, row)?;
+            let runs = image_runs(&id, row)?;
             let said = pair
                 .get("facts")
                 .and_then(|f| f.get("revision"))
@@ -1141,6 +1186,43 @@ mod gate {
             Ok(())
         } else {
             Err(checks_failed())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{GateError, Json, image_counts, image_runs, json};
+
+        type Read = fn(&str, &Json) -> Result<Vec<u64>, GateError>;
+
+        /// Set D's grids and spans are read whole or refused by name. Mutant: the old reader,
+        /// which left out an entry that is no unsigned integer, so a short grid and its short
+        /// pad run agreed.
+        #[test]
+        fn set_d_numbers_refuse_what_they_cannot_read() {
+            let row = |s: &str| json::parse(s).unwrap();
+            let good = row(r#"{"image_grid_thw": [[1, 4, 6]], "image_spans": [[9, 6]]}"#);
+            assert_eq!(image_counts("i1", &good).unwrap(), [6]);
+            assert_eq!(image_runs("i1", &good).unwrap(), [6]);
+            let text = row(r#"{"image_grid_thw": []}"#);
+            assert_eq!(image_runs("t1", &text).unwrap(), Vec::<u64>::new());
+            let cases: [(&str, Read); 8] = [
+                (r#"{"image_grid_thw": [[1, null, 2, 8]]}"#, image_counts),
+                (
+                    r#"{"image_grid_thw": [[1, 4, 4611686018427387910]]}"#,
+                    image_counts,
+                ),
+                (r#"{"image_grid_thw": [[1, 4, 6.0]]}"#, image_counts),
+                (r#"{"image_grid_thw": [[4, 6]]}"#, image_counts),
+                (r#"{}"#, image_counts),
+                (r#"{"image_spans": [[9, "6"]]}"#, image_runs),
+                (r#"{"image_spans": [[9]]}"#, image_runs),
+                (r#"{"image_spans": 6}"#, image_runs),
+            ];
+            for (bad, read) in cases {
+                let e = read("i1", &row(bad)).expect_err(bad).to_string();
+                assert!(e.starts_with("i1: image_"), "{bad}: {e}");
+            }
         }
     }
 }
