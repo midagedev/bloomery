@@ -651,7 +651,7 @@ fn pipelines(device: &MetalDevice, libs: &mut Libs, arms: &[Arm]) -> Result<(), 
         for quant in [Quant::Q4K, Quant::Q6K, Quant::A4] {
             let (library, name): (&Library, String) = match arm {
                 Arm::Engine(o) => (device.library(), engine_kernel(quant, o)),
-                Arm::Half => (device.library(), engine_kernel(quant, Operand::F16)),
+                Arm::Half => (device.library(), format!("gemm_{}_store_h16", quant.name())),
                 Arm::Tensor(o, relaxed) => {
                     (&libs.tensor(device, relaxed)?.0, engine_kernel(quant, o))
                 }
@@ -865,12 +865,28 @@ fn one(ctx: &Ctx<'_>, libs: &mut Libs, arm: Arm, cfg: &Config) -> Result<(), Str
     let fault = ctx.device.fault_word();
 
     let timed = match arm {
-        Arm::Engine(operand) | Arm::Tensor(operand, _) => {
-            let kernels = match arm {
-                Arm::Tensor(_, relaxed) => &libs.tensor(ctx.device, relaxed)?.1,
-                _ => ctx.kernels,
+        Arm::Engine(_) | Arm::Tensor(_, _) | Arm::Half => {
+            let (kernels, operand) = match arm {
+                Arm::Engine(o) => (ctx.kernels, o),
+                Arm::Tensor(o, relaxed) => (&libs.tensor(ctx.device, relaxed)?.1, o),
+                Arm::Half => (ctx.kernels, Operand::F16),
+                _ => unreachable!("the arm runs through Kernels::gemm"),
             };
             time_dispatches(ctx, pool.copies, dispatches, |encoder, copy| {
+                let x = match arm {
+                    Arm::Half => GemmX::F16 {
+                        x: x_h16
+                            .as_ref()
+                            .expect("the half arm's activation rows")
+                            .window(Elems(0), Elems(r * k))
+                            .map_err(why)?,
+                        stride: k,
+                    },
+                    _ => GemmX::F32 {
+                        x: x_f32.window(Elems(0), Elems(r * k)).map_err(why)?,
+                        stride: k,
+                    },
+                };
                 kernels
                     .gemm(
                         encoder,
@@ -880,41 +896,11 @@ fn one(ctx: &Ctx<'_>, libs: &mut Libs, arm: Arm, cfg: &Config) -> Result<(), Str
                             cols: k,
                             acts: r,
                             weights: pool.window(copy, 0)?,
-                            x: GemmX::F32 {
-                                x: x_f32.window(Elems(0), Elems(r * k)).map_err(why)?,
-                                stride: k,
-                            },
+                            x,
                             y: y.window_mut(Elems(0), Elems(r * n)).map_err(why)?,
                             y_stride: n,
                             mode: GemmMode::Store,
                             operand,
-                            fault,
-                            layer: LAYER_NONE,
-                        },
-                    )
-                    .map_err(|e| format!("the dispatch did not encode: {e}"))
-            })?
-        }
-        Arm::Half => {
-            let x_h16 = x_h16.as_ref().expect("the half arm's activation rows");
-            time_dispatches(ctx, pool.copies, dispatches, |encoder, copy| {
-                ctx.kernels
-                    .gemm(
-                        encoder,
-                        GemmParams {
-                            quant,
-                            rows: n,
-                            cols: k,
-                            acts: r,
-                            weights: pool.window(copy, 0)?,
-                            x: GemmX::F16 {
-                                x: x_h16.window(Elems(0), Elems(r * k)).map_err(why)?,
-                                stride: k,
-                            },
-                            y: y.window_mut(Elems(0), Elems(r * n)).map_err(why)?,
-                            y_stride: n,
-                            mode: GemmMode::Store,
-                            operand: Operand::F16,
                             fault,
                             layer: LAYER_NONE,
                         },
@@ -1046,7 +1032,9 @@ fn one(ctx: &Ctx<'_>, libs: &mut Libs, arm: Arm, cfg: &Config) -> Result<(), Str
         Arm::Source(s, _) => (s.rows, 4),
         _ => (GEMM_ROWS, 4),
     };
-    let issued = bytes + (n / tile) * r * k * elem + r * n * elem;
+    // The engine arms store f32 rows whatever their input; MLX's store its own type.
+    let out_elem = if matches!(arm, Arm::Mlx(_)) { elem } else { 4 };
+    let issued = bytes + (n / tile) * r * k * elem + r * n * out_elem;
     println!(
         "gemm quant={} op={op_name} n={n} k={k} r={r} \
          ms={:.3} tflops={:.2} gbps={:.1} wall_ms={:.3}",
