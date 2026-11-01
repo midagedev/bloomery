@@ -76,7 +76,7 @@ pub fn tier_batch(hp: &Hparams) -> TierBatchBytes {
 #[derive(Debug, thiserror::Error)]
 pub enum PlaceError {
     /// The placement could not be built.
-    #[error(transparent)]
+    #[error("{0}")]
     Placement(#[from] PlacementError),
     /// The plan was built and breaks these invariants, every one of them.
     #[error("the plan breaks its invariants: {}", joined(.0))]

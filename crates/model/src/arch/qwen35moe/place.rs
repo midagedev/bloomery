@@ -206,7 +206,7 @@ pub struct PlanInputs {
 #[derive(Debug, thiserror::Error)]
 pub enum PlaceError {
     /// The placement could not be built.
-    #[error(transparent)]
+    #[error("{0}")]
     Placement(#[from] PlacementError),
     /// A load whose ubatch is outside its context or supported width.
     #[error("ubatch {ubatch}: expected 1..=min({ctx_max}, {UBATCH_PLANNED})")]

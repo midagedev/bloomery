@@ -101,8 +101,8 @@ pub enum ModelError {
     #[error("metadata {key}: {detail}")]
     Metadata { key: String, detail: String },
     /// A refusal of the placement layer that is not a metadata key's.
-    #[error(transparent)]
-    Placement(placement::PlacementError),
+    #[error("{0}")]
+    Placement(#[source] placement::PlacementError),
     /// A refusal of the r8 sidecar format: writing, opening or comparing it.
     #[error(transparent)]
     R8(#[from] r8file::R8Error),

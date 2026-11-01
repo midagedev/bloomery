@@ -128,7 +128,7 @@ pub const DEFAULT_SHARD_BYTES: u64 = 16 << 30;
 pub enum FixtureError {
     #[error(transparent)]
     Load(#[from] LoadError),
-    #[error(transparent)]
+    #[error("{0}")]
     Placement(#[from] PlacementError),
     #[error("{path}: {op}: {source}")]
     Io {

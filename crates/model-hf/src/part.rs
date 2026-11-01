@@ -40,7 +40,7 @@ pub enum Error {
     #[error("{0}")]
     Step(String),
     /// A stored tensor's file pages could not be released.
-    #[error(transparent)]
+    #[error("{0}")]
     Release(#[from] model::placement::PlacementError),
     #[error(transparent)]
     Tensors(#[from] safetensors::Error),

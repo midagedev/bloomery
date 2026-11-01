@@ -51,7 +51,7 @@ pub const F16_HIDDEN: u16 = 0xfc00;
 #[derive(Debug, thiserror::Error)]
 pub enum PlanError {
     /// The file lacks a value the plan is laid out from.
-    #[error(transparent)]
+    #[error("{0}")]
     File(#[from] PlacementError),
     /// Values no plan can be laid out from.
     #[error("plan layout: {0}")]
