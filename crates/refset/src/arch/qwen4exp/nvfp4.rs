@@ -6,7 +6,8 @@
 //! and carry ik's tap names, so a gate reads them as it reads [`super::IK`]'s; the ids are the
 //! batch set's and [`super::D3K`]'s. The two `_bf16` sets widen the checkpoint's BF16 projections
 //! instead, as the split `prepare` writes by default holds them; between the two pairs lies the
-//! Q8_0 rounding's own share.
+//! Q8_0 rounding's own share. [`FX`] holds the same four sets of the oracle on the profile's cut
+//! (`tools/fixture-cuts/qwen38nvfp4.json`), the fixture tier's.
 
 use super::ARCH;
 use crate::RefError;
@@ -19,10 +20,11 @@ pub const MODEL: &str =
 
 /// The md5 of `tools/ref/qwen4exp-nvfp4-oracle.py`, the sets' writer, which states it in each
 /// set's `# build` line.
-// PIN(2026-10-20): the writer at transformers 4c414256 that dequantizes one decoder layer at a
-// time and writes the route ids' logical copy and exact twins as ik's dumper does;
+// PIN(2026-11-02): the writer at transformers 4c414256 that dequantizes one decoder layer at a
+// time, writes the route ids' logical copy and exact twins as ik's dumper does, and reads a cut
+// of the folder as the fixture tier's model, resuming only on the cut generation it paused on;
 // `the_oracle_writer_pin_is_the_source_in_the_tree` holds it to the tree.
-pub const HARNESS: &str = "3e4604613303dfa99992c57be76d894f";
+pub const HARNESS: &str = "3e082b03401bc7720744f97b321e1205";
 
 /// The 5-token batch, every position.
 pub const BATCH: &str = "hf-qwen4exp-nvfp4/hf_qwen4exp_nvfp4";
@@ -35,9 +37,25 @@ pub const BATCH_BF16: &str = "hf-qwen4exp-nvfp4/hf_qwen4exp_nvfp4_bf16";
 /// the routes of every position.
 pub const D3K_BF16: &str = "hf-qwen4exp-nvfp4/hf_qwen4exp_nvfp4_d3k_bf16";
 
+/// The model profile whose cut [`FX`]'s sets are dumped from (`tools/fixture-dirs.tsv`).
+pub const PROFILE: &str = "qwen4exp-nvfp4";
+/// [`BATCH`] on the cut.
+pub const FX_BATCH: &str = "fx_hf-qwen4exp-nvfp4/hf_qwen4exp_nvfp4";
+/// [`D3K`] on the cut.
+pub const FX_D3K: &str = "fx_hf-qwen4exp-nvfp4/hf_qwen4exp_nvfp4_d3k";
+/// [`BATCH_BF16`] on the cut.
+pub const FX_BATCH_BF16: &str = "fx_hf-qwen4exp-nvfp4/hf_qwen4exp_nvfp4_bf16";
+/// [`D3K_BF16`] on the cut.
+pub const FX_D3K_BF16: &str = "fx_hf-qwen4exp-nvfp4/hf_qwen4exp_nvfp4_d3k_bf16";
+
 /// [`MODEL`], as the family's `runs`.
 fn model() -> Result<String, RefError> {
     Ok(MODEL.to_string())
+}
+
+/// The cut's first shard, as [`FX`]'s `runs`.
+fn cut() -> Result<String, RefError> {
+    crate::fixture::first_shard(PROFILE)
 }
 
 /// The NVFP4 checkpoint's forward sets.
@@ -52,6 +70,22 @@ pub static HF: Family = Family {
     runs: Some(model),
     draft_runs: None,
     consumers: &["gate-gpu-qwen4exp-nvfp4"],
+};
+
+/// [`HF`] on the profile's cut: the same writer, its `# model` the cut's first shard and its
+/// `# fixture` line the cut's. Its consumer is the fixture-only twin of [`HF`]'s, which runs on
+/// any card where [`HF`]'s needs one that holds the whole file's plan.
+pub static FX: Family = Family {
+    name: "fx-hf-qwen4exp-nvfp4",
+    sets: &[FX_BATCH, FX_D3K, FX_BATCH_BF16, FX_D3K_BF16],
+    resolve: None,
+    recipe: "BLOOMERY_TIER=fixture just dump-ref-qwen4exp-nvfp4 IDS",
+    identity: Identity::FixtureManifest,
+    arch: Some(ARCH),
+    build: Some(Build::Is(HARNESS)),
+    runs: Some(cut),
+    draft_runs: None,
+    consumers: &["gate-gpu-qwen4exp-nvfp4-cut"],
 };
 
 #[cfg(test)]
@@ -113,6 +147,10 @@ mod tests {
             (super::BATCH_BF16, 0),
             (super::D3K, 3000),
             (super::D3K_BF16, 3000),
+            (super::FX_BATCH, 0),
+            (super::FX_BATCH_BF16, 0),
+            (super::FX_D3K, 3000),
+            (super::FX_D3K_BF16, 3000),
             (qwen::BATCH, 0),
             (fixture::BATCH, 0),
             (qwen::STEP4, 4),

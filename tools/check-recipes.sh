@@ -450,6 +450,7 @@ pytools_list() {
     "tools/ref/ptx-canon.py --self-test"
     "tools/ref/q3pp.py --self-test"
     "tools/ref/qdot-rate-floors.py --self-test"
+    "tools/ref/qwen4exp-nvfp4-oracle-test.py --self-test"
     "tools/ref/route-trace-chat.py --self-test"
     "tools/ref/router-coverage.py --self-test"
     "tools/ref/router-residency.py --self-test"

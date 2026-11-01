@@ -284,9 +284,10 @@ mod tests {
         );
     }
 
-    /// The fixture families are the table of eight, each the mirror of one real
+    /// The fixture families are the table of nine, each the mirror of one real
     /// family: its name is `fx-` and the real family's, and it takes the real
-    /// family's architecture, ik build and consumers, the fixture twin of its
+    /// family's architecture, ik build and consumers (for a real family of
+    /// [`NEEDS_ENV`], recipes that open with `fixture-only.sh`), the fixture twin of its
     /// identity, a draft file when the real family has one and no per-file set
     /// name; each set is the real family's set under the `fx_` prefix
     /// (`ref-mtp/fx_` for an MTP set). The real family's node dumps stay the
@@ -294,11 +295,15 @@ mod tests {
     /// have no family, held by their own module's test.
     #[test]
     fn each_fixture_family_mirrors_a_real_one() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../justfile");
+        let justfile =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         let sets_of = [
             ("fx-ik-glm5next", 4),
             ("fx-ik-glm5next-dsa", 2),
             ("fx-mtp-glm5next", 1),
             ("fx-ik-qwen4exp", 5),
+            ("fx-hf-qwen4exp-nvfp4", 4),
             ("fx-mtp-qwen4exp", 1),
             ("fx-ik-qwen35moe", 3),
             ("fx-ik-deepseek41", 4),
@@ -319,7 +324,17 @@ mod tests {
             let real = named(real_name).unwrap_or_else(|| panic!("{name} mirrors no {real_name}"));
             assert_eq!(fx.arch, real.arch, "{name}: arch");
             assert_eq!(fx.build, real.build, "{name}: build");
-            assert_eq!(fx.consumers, real.consumers, "{name}: consumers");
+            if NEEDS_ENV.iter().any(|&(f, _, _)| std::ptr::eq(f, real)) {
+                assert!(!fx.consumers.is_empty(), "{name}: no consumer");
+                for c in fx.consumers {
+                    assert!(
+                        justfile.contains(&format!("bash tools/ref/fixture-only.sh {c} ")),
+                        "{name}: {c} does not open with fixture-only.sh"
+                    );
+                }
+            } else {
+                assert_eq!(fx.consumers, real.consumers, "{name}: consumers");
+            }
             assert_eq!(
                 fx.draft_runs.is_some(),
                 real.draft_runs.is_some(),

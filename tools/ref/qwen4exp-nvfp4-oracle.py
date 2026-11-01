@@ -3,11 +3,12 @@ forward of nvidia/Qwen3.8-Flash-Next-NVFP4 in transformers' qwen4_exp at TRANSFO
 weights the split `prepare` writes from that folder holds.
 
 Every weight is dequantized by its own rule (quantization_config.quantized_layers of config.json picks the rule per
-module), then, for the dense arm `q8`, rounded to the type `prepare` writes it in:
+module), then, for the dense arm `q8`, rounded to the type `prepare` writes it in under BLOOMERY_PREPARE_Q8=1:
   NVFP4 (routed experts)     e2m1 x e4m3(weight_scale, one per 16 along K) x weight_scale_2
   FP8 (the PLE table)        e4m3 x weight_scale (one BF16 value for the table), only the rows the ids hash to
   BF16 projections           arm q8: Q8_0 by ggml's reference rule (d = amax / 127 stored as f16, q = roundf(x / d)),
-                             the tensors prepare writes as Q8_0 (Q8_SUFFIXES, Q8_TOP); arm bf16: widened
+                             the tensors prepare rewrites to Q8_0 (Q8_SUFFIXES, Q8_TOP); arm bf16: widened, as
+                             prepare's default split stores them
   other BF16 / F32 / I64     widened to f32 (I64 buffers kept, and checked equal to the values the module derives)
 input_scale is ignored: activations stay f32 at every linear.
 
@@ -33,16 +34,22 @@ is written as ik's dumper writes one: its f32 file and a `.logical` copy, and th
 `# model` names the folder as a node's model store mounts it (MODEL_ID) and `# build` the md5 of this file, which the
 family pins.
 
+DIR may also be a cut of that folder (`fixture cut`, whose first shard's `bloomery.fixture.*` keys name REPO at
+MODEL_REV): the fixture tier's model, read the same way. Its sets' `# model` names its first shard as DIR names it,
+and `# fixture` is the line --fixture-line gives (`refset-check --fixture-line` of that shard), the identity of refset
+family fx-hf-qwen4exp-nvfp4, whose sets are these under the `fx_` prefix of their directory.
+
 --until L stops after layer L - 1 with the run's state saved, and --resume continues from it, so a long run can be cut
 into sittings.
 
-    qwen4exp-nvfp4-oracle.py --model DIR --out DIR --prose IDS [--until L] [--resume]
+    qwen4exp-nvfp4-oracle.py --model DIR --out DIR --prose IDS [--fixture-line LINE] [--until L] [--resume]
 
-DIR is the checkpoint folder at MODEL_REV; IDS holds the 3,001 ids, whitespace separated. Needs torch, numpy,
-safetensors and transformers at TRANSFORMERS_REV; reads about 13 GiB of the folder a layer and holds one layer.
+DIR is the checkpoint folder at MODEL_REV or a cut of it; IDS holds the 3,001 ids, whitespace separated. Needs torch,
+numpy, safetensors and transformers at TRANSFORMERS_REV; reads about 13 GiB of the folder a layer and holds one layer.
 """
 
 import argparse
+import glob
 import hashlib
 import json
 import os
@@ -168,6 +175,27 @@ def q8_name(name):
         return True
     rest = name[len(PFX):] if name.startswith(PFX + "layers.") else None
     return rest is not None and rest.split(".", 2)[2] in Q8_SUFFIXES
+
+
+def cut_shard(folder, line):
+    """The first shard of `folder`, as `folder` names it, when the folder is a cut of REPO at MODEL_REV and `line` its
+    `# fixture` line; None for the checkpoint folder itself, which must be at MODEL_REV and take no line."""
+    first = glob.glob(os.path.join(folder, "*-00001-of-*.safetensors"))
+    if len(first) != 1:
+        raise SystemExit("%s: %d first shards, want one" % (folder, len(first)))
+    meta = safe_open(first[0], framework="pt").metadata() or {}
+    if "bloomery.fixture.version" not in meta:
+        if not os.path.realpath(folder).endswith(MODEL_REV):
+            raise SystemExit("model folder is not rev %s" % MODEL_REV)
+        if line is not None:
+            raise SystemExit("--fixture-line names a cut's line, and %s is the checkpoint folder" % folder)
+        return None
+    source = (meta.get("bloomery.fixture.source"), meta.get("bloomery.fixture.rev"))
+    if source != (REPO, MODEL_REV):
+        raise SystemExit("%s is a cut of %s@%s, not of %s@%s" % (first[0], source[0], source[1], REPO, MODEL_REV))
+    if line is None or not line.startswith("# fixture\t") or "\n" in line:
+        raise SystemExit("%s is a cut: --fixture-line gives its one `# fixture` line" % folder)
+    return first[0]
 
 
 class Checkpoint:
@@ -453,6 +481,7 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--prose", required=True)
+    ap.add_argument("--fixture-line", help="a cut's `# fixture` line (refset-check --fixture-line of its first shard)")
     ap.add_argument("--until", type=int, default=None, help="stop after this many layers with the state saved")
     ap.add_argument("--resume", action="store_true")
     a = ap.parse_args()
@@ -464,9 +493,8 @@ def main():
         build = hashlib.md5(f.read()).hexdigest()
     print("build %s transformers %s (%s) modeling_qwen4_exp %s torch %s" % (
         build, TRANSFORMERS_REV, transformers.__version__, sha256(hf.__file__), torch.__version__), flush=True)
+    shard = cut_shard(a.model, a.fixture_line)
     model = os.path.realpath(a.model)
-    if not model.endswith(MODEL_REV):
-        raise SystemExit("model folder is not rev %s" % MODEL_REV)
     cfg_json = json.load(open(model + "/config.json"))
     cfg = Qwen4ExpTextConfig(**cfg_json["text_config"])
     cfg._attn_implementation = "eager"
@@ -490,15 +518,17 @@ def main():
             Arm("hf_qwen4exp_nvfp4_bf16", REF_TOKENS, "bf16", True),
             Arm("hf_qwen4exp_nvfp4_d3k_bf16", prose, "bf16", False)]
     ckpt_path = os.path.join(a.out, "resume.pt")
-    identity = (build, model, cfg_json, sha256(hf.__file__), str(torch.__version__),
-                tuple((arm.name, tuple(arm.ids), arm.dense, arm.every_position) for arm in arms))
+    identity = (
+        build, model, a.fixture_line, cfg_json, sha256(hf.__file__), str(torch.__version__),
+        tuple((arm.name, tuple(arm.ids), arm.dense, arm.every_position) for arm in arms),
+    )
     ck = None
     if a.resume:
         if not os.path.isfile(ckpt_path):
             raise SystemExit("resume.pt: no saved state for --resume")
         ck = torch.load(ckpt_path)
         if ck.get("identity") != identity:
-            raise SystemExit("resume.pt: writer, model or tokens changed; restart without --resume")
+            raise SystemExit("resume.pt: writer, model, cut or tokens changed; restart without --resume")
     writers = {arm.name: SetWriter(a.out, arm) for arm in arms}
 
     stop = threading.Event()
@@ -631,7 +661,9 @@ def main():
         with open(os.path.join(w.dir, "MANIFEST.tsv"), "w") as f:
             f.write("# hf_dump: transformers qwen4_exp f32 forward of an NVIDIA ModelOpt NVFP4 folder, raw f32, "
                     "little-endian\n")
-            f.write("# model\t%s\n" % MODEL_ID)
+            f.write("# model\t%s\n" % (shard or MODEL_ID))
+            if shard:
+                f.write("%s\n" % a.fixture_line)
             f.write("# model_dir\t%s\n" % model)
             f.write("# build\t%s\n" % build)
             f.write("# transformers\t%s %s\n" % (TRANSFORMERS_REV, transformers.__version__))

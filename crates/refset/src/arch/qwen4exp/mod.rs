@@ -58,10 +58,17 @@ pub fn check_inputs(man: &RefManifest, name: &str) -> Result<(), RefError> {
         .step()
         .map_err(|e| RefError::malformed(name, e.to_string()))?;
     let expected = match name {
-        BATCH | fixture::BATCH | nvfp4::BATCH | nvfp4::BATCH_BF16 => (0, 5),
+        BATCH
+        | fixture::BATCH
+        | nvfp4::BATCH
+        | nvfp4::BATCH_BF16
+        | nvfp4::FX_BATCH
+        | nvfp4::FX_BATCH_BF16 => (0, 5),
         STEP4 | STEP4_EVERY_NODE | fixture::STEP4 | fixture::STEP4_EVERY_NODE => (4, 1),
         D1K | fixture::D1K => (1024, 1),
-        D3K | fixture::D3K | nvfp4::D3K | nvfp4::D3K_BF16 => (3000, 1),
+        D3K | fixture::D3K | nvfp4::D3K | nvfp4::D3K_BF16 | nvfp4::FX_D3K | nvfp4::FX_D3K_BF16 => {
+            (3000, 1)
+        }
         _ => return Err(RefError::malformed(name, "unknown Qwen3.8 oracle set")),
     };
     if (pos, step.len()) != expected || prefill.len() != pos as usize {
@@ -105,6 +112,7 @@ pub static FAMILIES: &[&Family] = &[
     &nvfp4::HF,
     &fixture::IK,
     &fixture::MTP,
+    &nvfp4::FX,
     &vis::TAPS,
     &vis::CHATIDS,
     &vis::HIDDEN,

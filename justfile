@@ -1186,9 +1186,11 @@ dump-ref-glm5next-hf-map:
 # qwen4_exp, f32 on the CPU, with the weights the prepared split holds, on the batch set's ids and on IDS, a file of the 3,001
 # ids of ref_qwen4exp_d3k (its `# tokens` line). One decoder layer is resident at a time (about 13 GiB of the folder read a
 # layer); no card. QWEN4EXP_NVFP4_PY (in BLOOMERY_BOX_ENV) names a Python with torch, numpy, safetensors and transformers at the
-# script's TRANSFORMERS_REV. `just gate-gpu-qwen4exp-nvfp4` reads the sets.
+# script's TRANSFORMERS_REV. `just gate-gpu-qwen4exp-nvfp4` reads the sets. BLOOMERY_TIER=fixture runs the same forward on the
+# profile's cut of four layers (tools/fixture-cuts/qwen38nvfp4.json) into $BLOOMERY_DATA/fx_hf-qwen4exp-nvfp4/ (refset family
+# fx-hf-qwen4exp-nvfp4), each set naming the cut's first shard and its `# fixture` line.
 dump-ref-qwen4exp-nvfp4 IDS *ARGS:
-    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/real-only.sh dump-ref-qwen4exp-nvfp4 && "${QWEN4EXP_NVFP4_PY:-python3}" tools/ref/qwen4exp-nvfp4-oracle.py --model /models/nvidia__Qwen3.8-Flash-Next-NVFP4/fc694b54fb0174e0913e6adf86691ef85a4ead47 --out "$BLOOMERY_DATA/hf-qwen4exp-nvfp4" --prose {{IDS}} {{ARGS}}'
+    BLOOMERY_MODEL=qwen4exp-nvfp4 ./tools/box.sh 'if [ "${BLOOMERY_TIER:-real}" = fixture ]; then . tools/ref/ref-paths.sh && fixture_dump_tier dump-ref-qwen4exp-nvfp4 && __l=$(fixture_line dump-ref-qwen4exp-nvfp4) && set -- --model "$MODEL" --out "$BLOOMERY_DATA/${SET_PREFIX}hf-qwen4exp-nvfp4" --fixture-line "$__l"; else set -- --model /models/nvidia__Qwen3.8-Flash-Next-NVFP4/fc694b54fb0174e0913e6adf86691ef85a4ead47 --out "$BLOOMERY_DATA/hf-qwen4exp-nvfp4"; fi && "${QWEN4EXP_NVFP4_PY:-python3}" tools/ref/qwen4exp-nvfp4-oracle.py "$@" --prose {{IDS}} {{ARGS}}'
 
 # ik's node dump of a family's fixture file (glm5next, qwen4exp, qwen35moe, deepseek41), into $BLOOMERY_DATA/fx_<the real twin's set>
 # (refset's fixture families): the same dumper and profile as the family's real recipe, the fixture first shard as the model,
@@ -1777,11 +1779,22 @@ gate-gpu-qwen4exp-iqleg:
 # those host experts onto the card, every part of each (an NVFP4 stack's codes, block scales and tensor scale) the bytes a
 # static load uploads, and the eager steps hold the band again. The bin's unit
 # test, which holds the choice of sets to the split's dense form, runs first. BLOOMERY_REF_MODEL moves the split from
-# the model folder below, including to prepare's stored-form output, or names the checkpoint folder itself, which the
-# load reads as stored (no prepare). Needs BLOOMERY_CARD_ALL_EXPERTS: only a card of 128 GB or more holds the plan, so the
-# maintainers' box defers it by name (the fixture holds no NVFP4 stack either).
+# the profile's model path (tools/ref/models/qwen4exp-nvfp4.sh), including to prepare's stored-form output, or names the
+# checkpoint folder itself, which the load reads as stored (no prepare). Needs BLOOMERY_CARD_ALL_EXPERTS: only a card of 128
+# GB or more holds the whole file's plan, so the maintainers' box defers it by name; `just gate-gpu-qwen4exp-nvfp4-cut` runs
+# the same clauses on a cut that any card holds.
 gate-gpu-qwen4exp-nvfp4:
-    BLOOMERY_REF_MODEL="${BLOOMERY_REF_MODEL:-/models/Qwen3.8-Flash-Next-NVFP4/Qwen3.8-Flash-Next-NVFP4-00001-of-00004.gguf}" BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/needs-env.sh gate-gpu-qwen4exp-nvfp4 BLOOMERY_CARD_ALL_EXPERTS && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features gpu,checkpoint --bin gate_qwen4exp_nvfp4 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu,checkpoint --release --bin gate_qwen4exp_nvfp4 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen4exp_nvfp4'
+    BLOOMERY_MODEL=qwen4exp-nvfp4 ./tools/box.sh 'bash tools/ref/needs-env.sh gate-gpu-qwen4exp-nvfp4 BLOOMERY_CARD_ALL_EXPERTS && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features gpu,checkpoint --bin gate_qwen4exp_nvfp4 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu,checkpoint --release --bin gate_qwen4exp_nvfp4 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen4exp_nvfp4'
+
+# The Qwen3.8 NVFP4 gate's fixture tier on any card: gate_qwen4exp_nvfp4's clauses on the qwen4exp-nvfp4 profile's cut (four
+# layers of nvidia/Qwen3.8-Flash-Next-NVFP4 in their stored bits, tools/fixture-cuts/qwen38nvfp4.json) against the oracle's
+# sets of that cut (fx_hf-qwen4exp-nvfp4, `BLOOMERY_TIER=fixture just dump-ref-qwen4exp-nvfp4 IDS`), every plan under the card
+# budget the cut records, which holds every routed expert, and (s) short of (l)'s card bytes by an eighth of them; then (l),
+# the route taps of (c) and (rt) on the qwen4exp-fp4l profile's cut, the same layers of FP4-Local with its csf block scales
+# (tools/fixture-cuts/qwen38fp4l.json). Fixture-only (tools/ref/fixture-only.sh): the real tier is
+# `just gate-gpu-qwen4exp-nvfp4`'s, behind its card requirement.
+gate-gpu-qwen4exp-nvfp4-cut:
+    BLOOMERY_MODEL=qwen4exp-nvfp4 ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-qwen4exp-nvfp4-cut && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features gpu,checkpoint --bin gate_qwen4exp_nvfp4 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu,checkpoint --release --bin gate_qwen4exp_nvfp4 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen4exp_nvfp4'
 
 # Qwen3.8's MTP draft program on the 3090 beside the target: first, before any walk, the draft's load — its weights,
 # store and row map hold its plan's bytes, its token_embd and output are the target's own buffers at their addresses,

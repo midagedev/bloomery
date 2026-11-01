@@ -740,6 +740,21 @@ pub fn fixture_set(clause: &str, family: &Family, set: &str) -> Result<PathBuf, 
     Ok(fixture_set_in(&crate::data_dir(), clause, family, set)?)
 }
 
+/// The folder of the cut `profile`'s row of `tools/fixture-dirs.tsv` names: the fixture tier's
+/// model, which no architecture's own fixture is. Prints the cut's `# fixture` line.
+///
+/// # Errors
+/// [`refset::fixture::first_shard`]'s refusal, a first shard with no folder, or one whose fixture
+/// line does not read.
+pub fn cut(profile: &str) -> Result<PathBuf, GateError> {
+    let first = refset::fixture::first_shard(profile)?;
+    let folder = Path::new(&first)
+        .parent()
+        .ok_or_else(|| format!("{profile}: the cut's first shard {first} has no folder"))?;
+    println!("  {}", refset::fixture::line(Path::new(&first))?.trim_end());
+    Ok(folder.to_path_buf())
+}
+
 /// A set a clause reads only as its input ([`input_set`]): its name, its family and its path.
 pub struct InputSet<'a> {
     pub name: &'a str,

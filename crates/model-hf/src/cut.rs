@@ -833,7 +833,10 @@ fn slice_planes(
 
 /// `tensors` (each with its group) in write order, each given its shard and offset: a group's
 /// tensors keep their source order, groups follow one another whole, and a group opens a new shard
-/// when it would take the current one past `shard_bytes`. Returns the tensors and the shard count.
+/// when it would take the current one past `shard_bytes`. A group whose source order would start a
+/// tensor off its element's size (a layer read from several source shards whose odd lengths come
+/// before an I64 one, as in the FP4-Local folder) is written widest element first instead, each
+/// width in source order. Returns the tensors and the shard count.
 fn place(
     mut tensors: Vec<(usize, Planned)>,
     shard_bytes: u64,
@@ -854,6 +857,15 @@ fn place(
         if used > 0 && used + size > shard_bytes {
             shard += 1;
             used = 0;
+        }
+        let mut at = used;
+        let in_order = tensors[i..end].iter().all(|(_, t)| {
+            let fits = at.is_multiple_of(to_u64(t.dtype.size()));
+            at += t.view.len();
+            fits
+        });
+        if !in_order {
+            tensors[i..end].sort_by_key(|(_, t)| std::cmp::Reverse(t.dtype.size()));
         }
         for (_, t) in &mut tensors[i..end] {
             let align = to_u64(t.dtype.size());
@@ -2327,6 +2339,58 @@ pub(crate) mod tests {
         fs::remove_dir_all(&w.root).unwrap();
     }
 
+    /// A layer read from two source shards, the first ending at an odd length and the second
+    /// opening with an I64 tensor (the FP4-Local folder's layer 1), is written widest element
+    /// first, each width in source order; a layer whose source order lands every tensor on its
+    /// element keeps it; an I64 tensor no order can land is refused by name.
+    #[test]
+    fn a_layer_whose_source_order_misaligns_is_written_widest_first() {
+        let t = |name: &str, dtype: Dtype, src_shard: &str, start: u64, len: u64| Planned {
+            name: name.to_string(),
+            dtype,
+            shape: vec![usize::try_from(len).unwrap() / dtype.size()],
+            src_name: name.to_string(),
+            src_shard: src_shard.to_string(),
+            view: View::whole(start, len),
+            shard: 0,
+            offset: 0,
+        };
+        let layer = |g: usize| {
+            vec![
+                (g, t(&format!("l{g}.codes"), Dtype::U8, "a", 0, 3)),
+                (g, t(&format!("l{g}.scale"), Dtype::F32, "a", 8, 4)),
+                (g, t(&format!("l{g}.ids"), Dtype::I64, "b", 0, 8)),
+            ]
+        };
+        let order = |placed: &[Planned]| -> Vec<(String, u64)> {
+            placed.iter().map(|t| (t.name.clone(), t.offset)).collect()
+        };
+        let (placed, _) = place(layer(1), 1 << 20).unwrap();
+        assert_eq!(
+            order(&placed),
+            [
+                ("l1.ids".into(), 0),
+                ("l1.scale".into(), 8),
+                ("l1.codes".into(), 12)
+            ]
+        );
+        let aligned = vec![
+            (1, t("l1.ids", Dtype::I64, "a", 0, 8)),
+            (1, t("l1.codes", Dtype::U8, "a", 8, 3)),
+        ];
+        let (placed, _) = place(aligned, 1 << 20).unwrap();
+        assert_eq!(
+            order(&placed),
+            [("l1.ids".into(), 0), ("l1.codes".into(), 8)]
+        );
+        let odd_start = [layer(1), layer(2)].concat();
+        let e = place(odd_start, 1 << 20).err().unwrap();
+        assert!(
+            matches!(&e, CutError::Misaligned { name, offset: 15, align: 8, .. } if name == "l2.ids"),
+            "{e}"
+        );
+    }
+
     /// The edited config, the first shard's identity and the copied file: the layer count, the
     /// routed width and every per-layer array follow the kept layers, a layer-named entry is
     /// renumbered or dropped, the metadata names the spec's source, revision, layers, width, the
@@ -3190,6 +3254,46 @@ pub(crate) mod tests {
                 "layer {i}: layer_types and the interval disagree"
             );
         }
+    }
+
+    /// The qwen38nvfp4 spec over the real Flash-Next NVFP4 `config.json` keeps layers 0 to 3,
+    /// the PLE site of layer 1 among them: four `layer_types` of the kept
+    /// `full_attention_interval` of 4, and the routed group's targets and the ignore list cut to
+    /// the kept layers; nothing else moves.
+    #[test]
+    fn the_qwen38nvfp4_spec_edits_the_real_config_to_four_layers() {
+        let spec =
+            Spec::parse(include_str!("../../../tools/fixture-cuts/qwen38nvfp4.json")).unwrap();
+        let real = String::from_utf8(gunzipped(
+            "quant-configs/nvidia__Qwen3.8-Flash-Next-NVFP4__config.json.gz",
+        ))
+        .unwrap();
+        let before: Value = serde_json::from_str(&real).unwrap();
+        let edited: Value = serde_json::from_str(&edit_config(&spec, &real).unwrap()).unwrap();
+        let mut want = before.clone();
+        want["text_config"]["num_hidden_layers"] = json!(4);
+        want["text_config"]["layer_types"] = json!([
+            "linear_attention",
+            "linear_attention",
+            "linear_attention",
+            "full_attention"
+        ]);
+        want["quantization_config"]["config_groups"]["group_0"]["targets"] = json!(
+            (0..4)
+                .map(|l| format!("model.language_model.layers.{l}.mlp.experts"))
+                .collect::<Vec<_>>()
+        );
+        let kept: Vec<Value> = before["quantization_config"]["ignore"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|n| layered(&spec.layer_prefix, n.as_str().unwrap()).is_none_or(|(l, _)| l < 4))
+            .cloned()
+            .collect();
+        assert!(kept.len() > 4 * 5, "the ignore list names the kept layers");
+        want["quantization_config"]["ignore"] = Value::Array(kept);
+        assert_eq!(edited, want);
+        assert_eq!(edited["text_config"]["ple_layer_ids"], json!([2]));
     }
 
     /// The llama spec over the real 8B folder's one shard header (743 tensors,

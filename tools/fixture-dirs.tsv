@@ -21,6 +21,8 @@ qwen35moe	qwen35moe
 solar-open2	solar2
 deepseek2	self
 qwen38d	qwen38nv
+qwen4exp-nvfp4	qwen38nvfp4
+qwen4exp-fp4l	qwen38fp4l
 lfm3	self
 qwen3moe	qwen3moe
 qwen35	self
