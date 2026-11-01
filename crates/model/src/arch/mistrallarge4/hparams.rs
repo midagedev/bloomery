@@ -191,12 +191,14 @@ pub fn unread_keys(split: &Split) -> Vec<String> {
 
 impl Hparams {
     /// Every value from `split`'s headers. A missing key, a key of a value
-    /// the model cannot hold (another gating func, another index head count,
-    /// a rope wider than the head or the index head, a key length the rope
-    /// and latent do not sum to, a query latent, a KV source above its layer,
-    /// itself a reader or of another rope-ness, a shared first indexer), or a
-    /// tensor missing or of other dims than the keys give is an error naming
-    /// the key or the tensor.
+    /// the model cannot hold (another gating func, a router that does not
+    /// renormalize or that scales, a YaRN multiplier of a net magnitude other
+    /// than 1 or an original context past ggml's int, another index head
+    /// count, a rope wider than the head or the index head, a key length the
+    /// rope and latent do not sum to, a query latent, a KV source above its
+    /// layer, itself a reader or of another rope-ness, a shared first
+    /// indexer), or a tensor missing or of other dims than the keys give is
+    /// an error naming the key or the tensor.
     pub fn read(split: &Split) -> Result<Hparams, PlacementError> {
         let n_layer = positive(split, "block_count")?;
         let n_embd = positive(split, "embedding_length")?;
@@ -321,6 +323,14 @@ impl Hparams {
         }
         let factor = finite_positive(split, "rope.scaling.factor")?;
         let orig_ctx = positive(split, "rope.scaling.original_context_length")?;
+        // ggml's `n_ctx_orig` is an `int`.
+        if i32::try_from(orig_ctx).is_err() {
+            return Err(metadata(
+                split,
+                "rope.scaling.original_context_length",
+                format!("is {orig_ctx}, past ggml's int"),
+            ));
+        }
         let beta_fast = finite_positive(split, "rope.scaling.yarn_beta_fast")?;
         let beta_slow = finite_positive(split, "rope.scaling.yarn_beta_slow")?;
         let mut defaults = Vec::new();
@@ -335,6 +345,26 @@ impl Hparams {
                 0.0
             }
         };
+        let yarn = YarnKeys {
+            factor,
+            orig_ctx,
+            beta_fast,
+            beta_slow,
+            log_mul,
+        };
+        // The rope table is YaRN without magnitude scaling: a multiplier whose
+        // net magnitude is not 1 would rotate by values the table never applies.
+        let magnitude = yarn.magnitude();
+        if magnitude != 1.0 {
+            return Err(metadata(
+                split,
+                "rope.scaling.yarn_log_multiplier",
+                format!(
+                    "is {log_mul}, a net magnitude of {magnitude} on the rotated values; the \
+                     rope table applies none (net 1)"
+                ),
+            ));
+        }
         let (n_expert, n_used) = expert_counts(split)?;
         let expert_ff = positive(split, "expert_feed_forward_length")?;
         let n_shared = positive(split, "expert_shared_count")?;
@@ -350,8 +380,24 @@ impl Hparams {
             ));
         }
         one_expert_group(split, "the mistral-large4 router")?;
+        // The routing body renormalizes the kept weights to sum to one and
+        // applies no scale (the rule the device runs is the one softmax form).
         let weights_norm = meta_bool(split, "expert_weights_norm")?;
+        if !weights_norm {
+            return Err(metadata(
+                split,
+                "expert_weights_norm",
+                "is false; the router renormalizes the kept weights to sum to one",
+            ));
+        }
         let weights_scale = finite_positive(split, "expert_weights_scale")?;
+        if weights_scale != 1.0 {
+            return Err(metadata(
+                split,
+                "expert_weights_scale",
+                format!("is {weights_scale}; the router applies no scale (1)"),
+            ));
+        }
         let dense_lead = match optional_usize(split, "leading_dense_block_count")? {
             Some(v) => v,
             None => {
@@ -396,13 +442,7 @@ impl Hparams {
             head_v,
             rope_dims,
             rope_base,
-            yarn: YarnKeys {
-                factor,
-                orig_ctx,
-                beta_fast,
-                beta_slow,
-                log_mul,
-            },
+            yarn,
             rope_layer,
             indexer_full,
             kv_source,
