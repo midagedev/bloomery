@@ -24,7 +24,7 @@ pub fn retain_hidden_row(
         .ok_or_else(|| GpuError::shape("draft::retain_hidden_row", "hidden row offset overflow"))?;
     let source = crate::tensor::Window::<f32>::of(source, byte_off, width)?;
     let mut target = crate::tensor::WindowMut::<f32>::of_mut(target, 0, width)?;
-    target.copy_from_device_async(stream, &source)?;
+    target.copy_from_device_async(&source, stream)?;
     Ok(())
 }
 
