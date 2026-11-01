@@ -112,6 +112,23 @@ as fast) is in the [release notes](https://github.com/midagedev/bloomery/release
 
 ¹ with `BLOOMERY_HOST_ROOM=56G` on 64 GB of RAM: 0.3.0 refuses this load at the defaults.
 
+## RTX 5090, Qwen3.6-35B-A3B with its MTP draft (by @juliankang4)
+
+One RTX 5090 32 GB at a power limit of 400 W (the card's default is 600 W), measured by
+[@juliankang4](https://github.com/juliankang4) on their own machine at `3ebdff767`: unsloth's
+`Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`, which carries the model's next-token layer, with the MTP draft on
+(`BLOOMERY_DRAFT=mtp`), `--parallel 1`, `--ctx-size 16896`, 4,096-id prompts (8 code and 8 English prose windows), 128
+greedy tokens, one request at a time. Each value is the median of three rounds, each round the median of the 16
+requests, the rounds' range in brackets. End-to-end is (prompt ids + generated ids) over the request's whole time.
+
+| Metric | `3ebdff767` |
+|---|---|
+| Prefill, tok/s | 8,747.2 [8,743.6 to 8,754.5] |
+| Decode, tok/s | 268.2 [268.1 to 268.3] |
+| Time to first token, ms | 470 [470 to 471] |
+| End-to-end, tok/s | 4,456.9 [4,442.6 to 4,457.1] |
+
+Decode by corpus: code 282.8 tok/s, English prose 254.3 tok/s.
 
 ## Apple Silicon: M4 Pro, M3 Ultra, M5 Ultra (Qwen3.6-35B-A3B)
 
