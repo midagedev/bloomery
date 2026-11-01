@@ -470,9 +470,12 @@ fn run(args: Vec<String>) -> Result<(), String> {
         .windows(2)
         .filter(|w| w[0] == "--shape")
         .map(|w| {
-            let parts: Vec<usize> = w[1].split(':').filter_map(|p| p.parse().ok()).collect();
-            match parts[..] {
-                [n, k, r] => Ok((n, k, r)),
+            let parts = w[1]
+                .split(':')
+                .map(str::parse::<usize>)
+                .collect::<Result<Vec<_>, _>>();
+            match parts.as_deref() {
+                Ok([n, k, r]) => Ok((*n, *k, *r)),
                 _ => Err(format!("--shape takes N:K:R, not {}", w[1])),
             }
         })
