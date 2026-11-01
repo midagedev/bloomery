@@ -655,7 +655,7 @@ mod gate {
             Some(&json!({"content": text, "add_special": false})),
             false,
         )?;
-        let ids = ids_of(&json_of("/tokenize", st, &body)?["tokens"]);
+        let ids = ids_of(&json_of("/tokenize", st, &body)?["tokens"])?;
         println!("chat prompt {text:?} ids {ids:?}");
         if ids.is_empty() {
             return Err("the chat prompt tokenizes to no id".into());
@@ -1238,7 +1238,7 @@ mod gate {
             draft.is_some() && word == "off" && why == "set" && host.is_none(),
         );
         let c = greedy(&url, ids, N_PREDICT, false)?;
-        let got = ids_of(&c["tokens"]);
+        let got = ids_of(&c["tokens"])?;
         let stop = c["stop_type"].as_str().unwrap_or("").to_owned();
         let t = &c["timings"];
         println!(
@@ -1262,7 +1262,7 @@ mod gate {
         });
         let (st, text) = curl(&url("/completion"), Some(&top1), false)?;
         let k1 = json_of("/completion", st, &text)?;
-        let sampled = ids_of(&k1["tokens"]);
+        let sampled = ids_of(&k1["tokens"])?;
         let k1_stop = k1["stop_type"].as_str().unwrap_or("").to_owned();
         println!(
             "draft-only top_k 1 sample tokens {sampled:?} stop_type={k1_stop} draft_n={}",
@@ -1313,7 +1313,7 @@ mod gate {
             let c = greedy(url, ids, N_PREDICT, cache)?;
             let (draft_n, accepted) = draft_counts(&c)?;
             Ok(Turn {
-                tokens: ids_of(&c["tokens"]),
+                tokens: ids_of(&c["tokens"])?,
                 cache_n: c["timings"]["cache_n"].as_u64().unwrap_or(u64::MAX),
                 draft_n,
                 accepted,
@@ -1809,7 +1809,7 @@ mod gate {
         // A request's ids and the draft's counts.
         let run = |v: &Value| -> Result<(Vec<u32>, u64, u64), GateError> {
             let (drafts, accepted) = draft_counts(v)?;
-            Ok((ids_of(&v["tokens"]), drafts, accepted))
+            Ok((ids_of(&v["tokens"])?, drafts, accepted))
         };
         let a_ids = rendered(&url, json!([{ "role": "user", "content": TURN_A }]))?;
         let c_ids = rendered(&url, json!([{ "role": "user", "content": TURN_C }]))?;
@@ -1935,21 +1935,30 @@ mod gate {
         let window = rounds_from(err_log, before)?;
         let ids_of_v = |v: &Value| ids_of(&v["tokens"]);
         let drafted = |v: &Value| v["timings"]["draft_n"].as_u64().is_some_and(|n| n > 0);
+        let alone_ids = alone.iter().map(ids_of_v).collect::<Result<Vec<_>, _>>()?;
+        let together_ids = together
+            .iter()
+            .map(|v| v.as_ref().map(ids_of_v).transpose())
+            .collect::<Result<Vec<_>, _>>()?;
         println!(
             "slots sampled alone {:?} and {:?} ids, together {:?} and {:?}",
-            ids_of_v(&alone[0]).len(),
-            ids_of_v(&alone[1]).len(),
-            together[0].as_ref().map(|v| ids_of_v(v).len()),
-            together[1].as_ref().map(|v| ids_of_v(v).len()),
+            alone_ids[0].len(),
+            alone_ids[1].len(),
+            together_ids[0].as_ref().map(Vec::len),
+            together_ids[1].as_ref().map(Vec::len),
         );
         check(
             &mut ok,
             "slots_sampled_together_ids_are_alone",
-            alone.iter().all(|v| !ids_of_v(v).is_empty() && drafted(v))
-                && together.iter().zip(&alone).all(|(t, a)| {
-                    t.as_ref()
-                        .is_some_and(|t| drafted(t) && ids_of_v(t) == ids_of_v(a))
-                }),
+            alone
+                .iter()
+                .zip(&alone_ids)
+                .all(|(v, a)| !a.is_empty() && drafted(v))
+                && together
+                    .iter()
+                    .zip(&together_ids)
+                    .zip(&alone_ids)
+                    .all(|((t, ti), a)| t.as_ref().is_some_and(drafted) && ti.as_ref() == Some(a)),
         );
         check(
             &mut ok,
@@ -1966,22 +1975,21 @@ mod gate {
         let window = rounds_from(err_log, before)?;
         let counts = |v: &Value| -> Result<(Vec<u32>, u64, u64), GateError> {
             let (drafts, accepted) = draft_counts(v)?;
-            Ok((ids_of_v(v), drafts, accepted))
+            Ok((ids_of_v(v)?, drafts, accepted))
         };
         let greedy_mixed = mixed[0].as_ref().map(counts).transpose()?;
+        let sampled_mixed = mixed[1].as_ref().map(ids_of_v).transpose()?;
         println!(
             "slots mixed greedy (ids, drafts, accepted) {:?} against alone {:?}; sampled {:?} ids",
             greedy_mixed.as_ref().map(|c| (c.0.len(), c.1, c.2)),
             (greedy_alone.0.len(), greedy_alone.1, greedy_alone.2),
-            mixed[1].as_ref().map(|v| ids_of_v(v).len()),
+            sampled_mixed.as_ref().map(Vec::len),
         );
         check(
             &mut ok,
             "slots_mixed_together_ids_are_alone",
             greedy_mixed.as_ref() == Some(greedy_alone)
-                && mixed[1]
-                    .as_ref()
-                    .is_some_and(|v| ids_of_v(v) == ids_of_v(&alone[1])),
+                && sampled_mixed.as_ref() == Some(&alone_ids[1]),
         );
         check(
             &mut ok,
@@ -2027,7 +2035,7 @@ mod gate {
         // replacement text parting at the reply, so the strip shares exactly
         // the turn and cuts to its prompt call's end.
         let first = greedy(url, ids[0], SLOTS_PREDICT, false)?;
-        let reply = ids_of(&first["tokens"]);
+        let reply = ids_of(&first["tokens"])?;
         let stopped = first["stop_type"].as_str().unwrap_or("");
         if stopped != "limit" || reply.len() != SLOTS_PREDICT {
             return Err(format!(
@@ -2050,7 +2058,7 @@ mod gate {
         let cache_n = |v: &Value| v["timings"]["cache_n"].as_u64();
         let run_of = |v: &Value| -> Result<(Vec<u32>, u64, u64), GateError> {
             let (drafts, accepted) = draft_counts(v)?;
-            Ok((ids_of(&v["tokens"]), drafts, accepted))
+            Ok((ids_of(&v["tokens"])?, drafts, accepted))
         };
         // The `mtp prompt` records of `lines` that say the draft skips, their
         // `skipped` texts.
@@ -2061,7 +2069,7 @@ mod gate {
         // round record and no turn-off record).
         let from = lines_from(err_log, 0)?.len();
         let alone = greedy(url, &strip, SLOTS_PREDICT, true)?;
-        let alone_ids = ids_of(&alone["tokens"]);
+        let alone_ids = ids_of(&alone["tokens"])?;
         let alone_skips = skips_of(&lines_from(err_log, from)?)?;
         println!(
             "slots skipping: the strip alone {} ids ({}) cache_n {:?} (the turn's end \
@@ -2091,7 +2099,7 @@ mod gate {
         let skips = skips_of(&lines_from(err_log, from)?)?;
         let strip_at = together[0].as_ref();
         let turn_at = together[1].as_ref();
-        let strip_ids = strip_at.map(|v| ids_of(&v["tokens"]));
+        let strip_ids = strip_at.map(|v| ids_of(&v["tokens"])).transpose()?;
         let strip_drafts = strip_at.map(draft_counts).transpose()?.map(|(d, _)| d);
         let turn_together = turn_at.map(run_of).transpose()?;
         println!(
@@ -2290,7 +2298,7 @@ mod gate {
         let c_ids = rendered(&url, json!([{ "role": "user", "content": TURN_C }]))?;
         let mut alone = Vec::new();
         for ids in [&a_ids, &c_ids, &a_ids, &c_ids] {
-            alone.push(ids_of(&greedy(&url, ids, SLOTS_PREDICT, false)?["tokens"]));
+            alone.push(ids_of(&greedy(&url, ids, SLOTS_PREDICT, false)?["tokens"])?);
         }
         check(
             &mut ok,
@@ -2317,8 +2325,8 @@ mod gate {
             ],
         )?
         .iter()
-        .map(|v| v.as_ref().map(|v| ids_of(&v["tokens"])))
-        .collect();
+        .map(|v| v.as_ref().map(|v| ids_of(&v["tokens"])).transpose())
+        .collect::<Result<_, _>>()?;
         let window = rounds_from(&err_log, before)?;
         let every = !window.is_empty()
             && window.iter().all(|r| {
@@ -2490,7 +2498,7 @@ mod gate {
         let (st, _) = chat(&url)?;
         check(&mut ok, "plain_chat_turn_served", st == 200);
         let c = greedy(&url, &ids, N_PREDICT, false)?;
-        let got = ids_of(&c["tokens"]);
+        let got = ids_of(&c["tokens"])?;
         let stop = c["stop_type"].as_str().unwrap_or("").to_owned();
         println!("plain completion tokens {got:?} stop_type={stop}");
         let (st, body) = curl(&url("/residency/reset"), Some(&json!({})), false)?;
@@ -2545,7 +2553,7 @@ mod gate {
         let url = |p: &str| format!("http://{addr}{p}");
         let mut ok = true;
         let c = greedy(&url, ids, N_PREDICT, false)?;
-        let got = ids_of(&c["tokens"]);
+        let got = ids_of(&c["tokens"])?;
         let stop = c["stop_type"].as_str().unwrap_or("").to_owned();
         let t = &c["timings"];
         println!(
@@ -2640,7 +2648,7 @@ mod gate {
 
         let before = lines_from(&err_log, 0)?.len();
         let c = greedy(&url, &ids, N_PREDICT, false)?;
-        let first = ids_of(&c["tokens"]);
+        let first = ids_of(&c["tokens"])?;
         let stop = c["stop_type"].as_str().unwrap_or("").to_owned();
         let t = &c["timings"];
         println!(
@@ -2689,7 +2697,7 @@ mod gate {
                         .all(|(k, v)| reset[*k].as_u64() == Some(*v))
                 }),
         );
-        let again = ids_of(&greedy(&url, &ids, N_PREDICT, false)?["tokens"]);
+        let again = ids_of(&greedy(&url, &ids, N_PREDICT, false)?["tokens"])?;
         println!("drafted completion after the reset tokens {again:?}");
         check(
             &mut ok,
@@ -2716,7 +2724,7 @@ mod gate {
             "drafted continuation (not held): cache_n={} draft_n={} tokens {:?} joins {joins:?}",
             x["timings"]["cache_n"],
             x["timings"]["draft_n"],
-            ids_of(&x["tokens"])
+            ids_of(&x["tokens"])?
         );
         ok &= resume_under_residency(&url, &err_log)?;
 

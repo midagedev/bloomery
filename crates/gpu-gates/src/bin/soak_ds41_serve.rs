@@ -448,17 +448,22 @@ mod soak {
         v["content"].as_str().map(str::to_owned)
     }
 
-    /// The rendered ids of `messages`, through the server's template and
-    /// tokenizer.
-    fn rendered(c: &mut Client, messages: &[Value]) -> Option<usize> {
-        let v = c.json(
-            "chat",
-            "/apply-template",
-            Some(&json!({"messages": messages})),
-        )?;
-        let text = v["prompt"].as_str()?.to_owned();
-        let v = c.json("chat", "/tokenize", Some(&json!({"content": text})))?;
-        Some(ids_of(&v["tokens"]).len())
+    /// The count of the rendered ids of `messages`, through the server's
+    /// template and tokenizer; `None` when a request was not served, and an
+    /// answer whose ids are not all ids refused by name.
+    fn rendered(c: &mut Client, messages: &[Value]) -> Result<Option<usize>, GateError> {
+        let tokenized = (|| {
+            let v = c.json(
+                "chat",
+                "/apply-template",
+                Some(&json!({"messages": messages})),
+            )?;
+            let text = v["prompt"].as_str()?.to_owned();
+            c.json("chat", "/tokenize", Some(&json!({"content": text})))
+        })();
+        tokenized
+            .map(|v| Ok(ids_of(&v["tokens"])?.len()))
+            .transpose()
     }
 
     impl Mix {
@@ -486,7 +491,7 @@ mod soak {
             self.conv
                 .messages
                 .push(json!({"role": "user", "content": text}));
-            let Some(n) = rendered(&mut self.c, &self.conv.messages) else {
+            let Some(n) = rendered(&mut self.c, &self.conv.messages)? else {
                 self.conv.messages.pop();
                 return Ok(());
             };
@@ -564,6 +569,7 @@ mod soak {
                 .c
                 .json("probe", "/completion", Some(&body))
                 .map(|v| ids_of(&v["tokens"]))
+                .transpose()?
                 .unwrap_or_default();
             self.probes += 1;
             match &self.probe {

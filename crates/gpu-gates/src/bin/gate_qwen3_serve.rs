@@ -2058,8 +2058,8 @@ mod gate {
                     else {
                         continue;
                     };
-                    if v.get("tokens").is_some_and(Value::is_array) {
-                        tokens = ids_of(&v["tokens"]);
+                    if v.get("tokens").is_some() {
+                        tokens = ids_of(&v["tokens"]).map_err(|e| format!("curl {url}: {e}"))?;
                     }
                 }
                 let status = child.wait().map_err(|e| format!("curl {url}: {e}"))?;
@@ -3017,9 +3017,7 @@ mod gate {
             Err(e) => (0, e.to_string()),
         };
         let tokens = match st {
-            200 => serde_json::from_str::<Value>(&text)
-                .map(|v| ids_of(&v["tokens"]))
-                .unwrap_or_default(),
+            200 => ids_of(&json_of("/completion", st, &text)?["tokens"])?,
             _ => Vec::new(),
         };
         println!(
@@ -3449,14 +3447,14 @@ mod gate {
             json_of("/completion", st, &text)
         };
         let jump = ask(false)?;
-        let jt = ids_of(&jump["tokens"]);
+        let jt = ids_of(&jump["tokens"])?;
         let j = &jump["timings"]["constrained"];
         let count = |v: &Value, k: &str| v[k].as_u64().unwrap_or(u64::MAX);
         if marks {
             answer_spans_take_no_marks(url, dir, &prompt, &jt, j, ok)?;
         }
         let step = ask(true)?;
-        let st = ids_of(&step["tokens"]);
+        let st = ids_of(&step["tokens"])?;
         let s = &step["timings"]["constrained"];
         println!(
             "schema jump: content {:?} / {:?}, stop {:?} / {:?}, {} / {} ids; jump {j}; step {s}",

@@ -563,7 +563,7 @@ mod gate {
         let (st, text) = curl(&url("/completion"), Some(&body), false)?;
         std::fs::write(d.join(format!("{name}.json")), &text)?;
         let v = json_of("/completion", st, &text)?;
-        let tokens = ids_of(&v["tokens"]);
+        let tokens = ids_of(&v["tokens"])?;
         let stop = v["stop_type"].as_str().unwrap_or("").to_owned();
         let slot = v["id_slot"].as_u64();
         let held_ms = held_ms(name, &v)?;
