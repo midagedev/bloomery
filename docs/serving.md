@@ -985,8 +985,8 @@ and the model fits) states no need and consults no hook; a set hook is named on 
   before it; a long V4.1 prompt (P = 4096) is bound by the card, since the prompt call streams host experts in.
 - Structured output is served for `response_format` of type `json_schema` or `json_object` and for `tool_choice`
   `"required"` or a named function (Anthropic `any` and `tool`, Responses `text.format` `json_schema` or
-  `json_object`), on every generative seat. The schema subset is an object (every property written, in the schema's
-  order), an array of `items`, `anyOf`, a `$ref` into the schema itself (`#/$defs/...`, written out where it stands;
+  `json_object`), on every generative seat. The schema subset is an object (its `required` properties in the schema's
+  order, then each optional one in order, each of which may be left out), an array of `items`, `anyOf`, a `$ref` into the schema itself (`#/$defs/...`, written out where it stands;
   a recursive one, or one that writes out deeper than the 128 nested JSON levels the request parser reads, is
   refused), string, integer and boolean enums, `const`, booleans, `null`, integers, numbers, and free strings with an optional
   `maxLength`. `json_object` is any JSON object with at least one member (an empty object or array is served only
@@ -994,6 +994,19 @@ and the model fits) states no need and consults no hook; a set hook is named on 
   the ids the schema allows). A positive `temperature` or a penalty draws with the request's sampler from the row with
   every id the schema does not allow masked out, so `top_k`, `top_p`, `min_p` and `seed` apply as on free text.
   Arrays, numbers and `json_object` have no length bound; reaching the token or context limit can leave incomplete JSON with a `length` finish reason.
+- Under `tool_choice` `"auto"` (or none given) with tools, the reply is free until the model writes its chat
+  format's own call opener (`<tool_call>` on Hermes and Qwen3-Coder XML, the call opener of GLM, Solar and DSML);
+  from there the call follows the program a forced call compiles, until it closes, and the reply is free again
+  after it. A watched call waits for the think span's own close, as a forced one does. A tool schema that is
+  invalid (`required` names a property it does not hold, a type that is no JSON Schema type, a `$ref` that points
+  nowhere) is a 400 as under a forced choice; a valid one outside the subset above (a list of types, `pattern`, an
+  array with no `items`, …) leaves every call of that request unwatched, as before. Muse Spark's replies and
+  Qwen3-Coder's bare first call (`<function=NAME>` with no `<tool_call>`) are not watched. With drafting on (MTP,
+  DSpark or lookup) the watched reply keeps the draft's passes: each verified row's id is a free pick up to the
+  opener's and the call's program's pick after it, so the reply reads whole rows as a `response_format` does; a
+  greedy reply on an engine that does not draft reads no row while it waits. A stop word the opener's text matches
+  ends the reply there, before the text after the opener is read. An opener's piece that runs into the call's text
+  (`<tool_call` then `>get`) enters a function name's choice by that text.
 - A prompt that leaves the think span open (thinking on) is read by what the program writes. A JSON `response_format`
   closes the span at once and writes the document after it. A `tool_choice` that forces a call lets the model reason
   freely, with the request's sampling and `logit_bias`, until it generates the span's close itself, and the call's

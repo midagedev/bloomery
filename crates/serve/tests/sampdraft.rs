@@ -696,7 +696,7 @@ fn hw_a_constrained_request_drafts() {
     let plain = serve(drafting(4096).without_sampled(), &plog);
     let schema = json!({"type": "object", "properties": {
         "id": {"type": "integer", "enum": [7, 8]}, "ok": {"type": "boolean"},
-        "tag": {"type": "string", "maxLength": 5}}});
+        "tag": {"type": "string", "maxLength": 5}}, "required": ["id", "ok", "tag"]});
     let rf = json!({"type": "json_schema", "json_schema": {"name": "r", "schema": schema}});
     let greedy = json!({"prompt": BRANCHY, "n_predict": 120, "response_format": rf});
     let mut drawn = sampled(BRANCHY, 120, 0.8, 6);

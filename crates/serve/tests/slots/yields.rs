@@ -674,7 +674,8 @@ fn serve_jump(engine: Yielding, jump: bool) -> (SocketAddr, Arc<Mutex<Vec<Call>>
 fn document() -> Value {
     let schema = json!({"type": "object", "properties": {
         "a": {"type": "boolean"},
-        "abcdefghijklmnopqrstuvwx": {"type": "boolean"}}});
+        "abcdefghijklmnopqrstuvwx": {"type": "boolean"}},
+        "required": ["a", "abcdefghijklmnopqrstuvwx"]});
     json!({"prompt": "ab", "n_predict": 100, "return_tokens": true,
         "response_format": {"type": "json_schema",
             "json_schema": {"name": "r", "schema": schema}}})
@@ -706,8 +707,12 @@ fn hw_a_schema_fill_reaches_the_client_before_the_next_fill_finishes() {
             assert!(decoded.wait_entered(BOUND), "the decoding slot never ran");
             let mut body = document();
             if more {
-                body["response_format"]["json_schema"]["schema"]["properties"]["z"] =
-                    json!({"type": "boolean"});
+                let schema = &mut body["response_format"]["json_schema"]["schema"];
+                schema["properties"]["z"] = json!({"type": "boolean"});
+                schema["required"]
+                    .as_array_mut()
+                    .expect("required")
+                    .push(json!("z"));
             }
             body["stream"] = json!(true);
             let mut readers = Vec::new();

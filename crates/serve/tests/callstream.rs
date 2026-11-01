@@ -33,7 +33,11 @@ const GLM5: &str = include_str!("fixtures/glm5-chat-template.jinja");
 
 /// The long text of `content`: twelve lines, each with quotes, a backslash, a
 /// tab, non-ASCII text and a near-tag of every markup (each shares a prefix
-/// with a tag that ends a value or a call, and is not one).
+/// with a tag that ends a value or a call, and is not one). No watched call
+/// writes it — a JSON string the watch's program writes takes no quote,
+/// backslash or control byte, and a raw value no byte of its markup's closers
+/// — so the server gates send their tools unwatched ([`body`]) and the
+/// parser gates read it under every cut.
 fn content() -> String {
     (0..12)
         .map(|i| {
@@ -117,14 +121,15 @@ fn cases() -> Vec<Case> {
             tools: Tools::QwenXml(Framing::Lines, ParamKinds::of_tools(Some(&tools()))),
         },
         // The compact framing: the long text is the bytes between its tags,
-        // its newlines its own, the last one with it.
+        // the template's own spelling (no byte between one parameter and the
+        // next).
         Case {
             label: "qwen-compact",
             template: MIMO,
             lead: "",
             call: format!(
-                "<tool_call>\n<function=write>\n<parameter=path>/a.txt</parameter>\n\
-                 <parameter=mode>420</parameter>\n<parameter=content>{c}</parameter>\n\
+                "<tool_call>\n<function=write>\n<parameter=path>/a.txt</parameter>\
+                 <parameter=mode>420</parameter><parameter=content>{c}</parameter>\
                  </function>\n</tool_call>"
             ),
             tools: Tools::QwenXml(Framing::Compact, ParamKinds::of_tools(Some(&tools()))),
@@ -132,14 +137,17 @@ fn cases() -> Vec<Case> {
     ]
 }
 
+/// The request the server gates send: its tools unwatched, so the script's
+/// call, whose [`content`] no watched program writes, reaches the scan as
+/// the model wrote it.
 fn body(stream: bool) -> Value {
-    json!({
+    common::unwatched(json!({
         "model": "m",
         "messages": [{"role": "user", "content": "write it"}],
         "temperature": 0,
         "tools": tools(),
         "stream": stream,
-    })
+    }))
 }
 
 /// The `tool_calls` deltas of a streamed chat body in order, and whether a

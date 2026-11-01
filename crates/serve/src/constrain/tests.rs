@@ -13,7 +13,7 @@ use super::{Ask, Constraint, Part, Refusal, Vocab, Walk, request};
 use crate::api::logprobs::Ask as Probs;
 use crate::callstream::CallPiece;
 use crate::dsml::{ChatParser, DsmlScan, MarkupError, Spelling, ToolFormat, Tools};
-use crate::engine::{Decoder, Engine, EngineError, SamplingParams, Tokenizer};
+use crate::engine::{Decoder, Drafted, Engine, EngineError, Sampler, SamplingParams, Tokenizer};
 use crate::genloop::{
     Event, GenError, GenParams, Outcome, Slot, StopKind, Timings, generate, generate_in_quanta,
 };
@@ -21,7 +21,7 @@ use crate::glmxml::{ArgTypes, KvScan, KvSpelling};
 use crate::hermes::HermesScan;
 use crate::mock::SPECIALS;
 use crate::qwenxml::{CALL_CLOSE, CALL_OPEN, Framing, ParamKinds, QwenScan};
-use crate::reasoning::{ReasoningFormat, ThinkEntry, ThinkTags};
+use crate::reasoning::{ReasoningFormat, ThinkEntry, ThinkSplit, ThinkTags};
 use crate::sampling;
 
 /// The key/value markup in each spelling.
@@ -29,6 +29,7 @@ const GLM: ToolFormat = ToolFormat::KvMarkup(KvSpelling::Glm);
 const SOLAR: ToolFormat = ToolFormat::KvMarkup(KvSpelling::Solar);
 /// Qwen3-Coder's markup in each framing of a value.
 const QWEN: ToolFormat = ToolFormat::QwenXml(Framing::Lines);
+const QWEN_CODER: ToolFormat = ToolFormat::QwenXml(Framing::Coder);
 const QWEN_COMPACT: ToolFormat = ToolFormat::QwenXml(Framing::Compact);
 
 const CALL_SPECIALS: [&str; 4] = [
@@ -217,9 +218,20 @@ fn stop_tok() -> Arc<dyn Tokenizer> {
     Arc::new(Pieces(Arc::new(PieceTok(&[STOP_PIECE]))))
 }
 
-/// An engine whose row at its `k`-th step favours `want[k]` (the end of
-/// generation once `want` is spent) over a fixed pseudo-random floor. `read`
-/// holds, for each step, whether the caller asked for its row.
+/// The row at step `k` of an engine that favours `want[k]` (the end of
+/// generation once `want` is spent) over a fixed pseudo-random floor, and the
+/// id it favours, which is the row's argmax.
+fn row(tok: &dyn Tokenizer, want: &[u32], k: usize) -> (Vec<f32>, u32) {
+    let mut row: Vec<f32> = (0..tok.n_vocab())
+        .map(|i| ((i * 37 + k * 11) % 17) as f32 * 0.1)
+        .collect();
+    let id = want.get(k).copied().unwrap_or_else(|| tok.eos());
+    row[id as usize] = 10.0;
+    (row, id)
+}
+
+/// An engine whose row at its `k`-th step is [`row`]'s. `read` holds, for
+/// each step, whether the caller asked for its row.
 struct Rows {
     tok: Arc<dyn Tokenizer>,
     want: Vec<u32>,
@@ -236,20 +248,10 @@ impl Engine for Rows {
     }
     fn next(&mut self, _last: u32, out: Option<&mut [f32]>) -> Result<u32, EngineError> {
         self.read.lock().expect("the log").push(out.is_some());
-        let n = self.tok.n_vocab();
-        let mut row: Vec<f32> = (0..n)
-            .map(|i| ((i * 37 + self.k * 11) % 17) as f32 * 0.1)
-            .collect();
-        let favoured = self
-            .want
-            .get(self.k)
-            .copied()
-            .unwrap_or_else(|| self.tok.eos());
-        row[favoured as usize] = 10.0;
+        let (logits, best) = row(&*self.tok, &self.want, self.k);
         self.k += 1;
-        let best = sampling::argmax(&row);
         if let Some(out) = out {
-            out.copy_from_slice(&row);
+            out.copy_from_slice(&logits);
         }
         Ok(best)
     }
@@ -618,7 +620,8 @@ fn wide_schema() -> Value {
             "xs": {"type": "array", "items": {"$ref": "#/$defs/tag"}},
             "o": {"anyOf": [{"type": "number"}, {"type": "null"}]},
             "e": {"type": "array", "items": {"type": "integer"}}
-        }
+        },
+        "required": ["n", "xs", "o", "e"]
     })
 }
 
@@ -758,7 +761,7 @@ fn an_end_token_absorbs_the_front_of_the_next_text() {
     let merged = pieces.piece(PIECE);
     let tok: Arc<dyn Tokenizer> = Arc::new(Pieces(pieces));
     let schema = json!({"type": "object", "properties": {
-        "a": {"type": "string"}, "b": {"type": "boolean"}}});
+        "a": {"type": "string"}, "b": {"type": "boolean"}}, "required": ["a", "b"]});
     let c = build(&tok, ToolFormat::Hermes, &schema_body(&schema)).expect("served");
     let mut want = ids(&tok, "{\"a\": \"");
     want.push(BYTES + u32::from(b'x'));
@@ -815,7 +818,9 @@ fn a_walk_that_cannot_step_is_a_named_error() {
     assert!(e.to_string().contains("none of the option ids"), "{e}");
 }
 
-/// Every refusal is named, with the path of the keyword.
+/// Every refusal is named, with the path of the keyword, and says whether
+/// the request is invalid or valid but outside what the compiler serves
+/// (a watched call serves the second with no watch).
 #[test]
 fn each_refusal_names_its_field() {
     let tok = bytes_tok();
@@ -831,62 +836,73 @@ fn each_refusal_names_its_field() {
     }
     let deep = json!({"type": "object", "$defs": defs,
         "properties": {"x": {"$ref": "#/$defs/d129"}}});
-    let cases: Vec<(Value, ToolFormat, &str)> = vec![
+    let cases: Vec<(Value, ToolFormat, &str, bool)> = vec![
         (
             json!({"tool_choice": "required", "tools": [{"function": {"name": "f",
                 "parameters": deep}}]}),
             ToolFormat::Dsml(Spelling::Joined),
             "tools[0].f.parameters: the schema is too deeply nested once its $refs are written out",
+            true,
         ),
         (
             schema_body(&deep),
             ToolFormat::Hermes,
             "schema: the schema is too deeply nested once its $refs are written out",
+            true,
         ),
         (
             node(json!({"type": "string", "pattern": "a+"})),
             ToolFormat::Hermes,
             "schema.properties.p: the keyword \"pattern\"",
+            true,
         ),
         (
             node(json!({"$ref": "#/x"})),
             ToolFormat::Hermes,
             "$ref \"#/x\" does not point into this schema",
+            false,
         ),
         (
             schema_body(&json!({"type": "object", "properties": {"p": {"$ref": "#"}}})),
             ToolFormat::Hermes,
             "$ref \"#\" is met again inside the schema it points to",
+            true,
         ),
         (
-            node(json!({"$ref": "#/$defs/d", "type": "string"})),
+            node(json!({"$ref": "#/properties/p", "type": "string"})),
             ToolFormat::Hermes,
             "the keyword \"type\" beside $ref",
+            true,
         ),
         (
             node(json!({"oneOf": [{"type": "string"}]})),
             ToolFormat::Hermes,
             "the keyword \"oneOf\"",
+            true,
         ),
         (
             node(json!({"anyOf": []})),
             ToolFormat::Hermes,
             "anyOf must be a non-empty array",
+            false,
         ),
         (
             node(json!({"type": "integer", "minimum": 0})),
             ToolFormat::Hermes,
             "the keyword \"minimum\"",
+            true,
         ),
         (
             node(json!({"type": "array"})),
             ToolFormat::Hermes,
             "type array needs items",
+            true,
         ),
         (
             node(json!({"type": "array", "items": {"type": "string"}, "minItems": 1})),
             ToolFormat::Hermes,
             "the keyword \"minItems\"",
+            true,
         ),
         (
             json!({"tool_choice": "required", "tools": [{"function": {"name": "f", "parameters":
@@ -894,126 +910,151 @@ fn each_refusal_names_its_field() {
             {"type": "string"}]}}}}}]}),
             QWEN,
             "an anyOf with a text option",
+            true,
         ),
         (
             node(json!({"type": "number", "enum": [1.5]})),
             ToolFormat::Hermes,
             "not an integer",
+            true,
         ),
         (
             node(json!({"enum": [1, "a"]})),
             ToolFormat::Hermes,
             "mixed kinds",
+            true,
         ),
         (
             node(json!({"enum": ["a", "a"]})),
             ToolFormat::Hermes,
             "listed twice",
+            true,
         ),
         (
             node(json!({"enum": ["a", ""]})),
             ToolFormat::Hermes,
             "an empty string",
+            true,
         ),
         (
             node(json!({"enum": [1, 10]})),
             ToolFormat::Hermes,
             "one is a prefix of the other",
+            true,
         ),
         (
             node(json!({"enum": ["a", "ab"]})),
             ToolFormat::Hermes,
             "one is a prefix of the other",
+            true,
         ),
         (
             node(json!({"type": "string", "enum": [1]})),
             ToolFormat::Hermes,
             "does not match",
+            false,
         ),
         (
             node(json!({"type": "string", "maxLength": -1})),
             ToolFormat::Hermes,
             "maxLength must be",
+            false,
         ),
         (
             node(json!({"type": "boolean", "maxLength": 3})),
             ToolFormat::Hermes,
             "beside type boolean",
+            true,
         ),
         (
             node(json!({"description": "no type"})),
             ToolFormat::Hermes,
             "needs a type, an enum or a const",
+            true,
         ),
         (
-            schema_body(&json!({"type": "object", "required": ["q"]})),
+            schema_body(&json!({"type": "object", "required": ["q"],
+                "additionalProperties": false})),
             ToolFormat::Hermes,
             "required names \"q\"",
+            false,
         ),
         (
             json!({"tool_choice": "required", "tools": tools,
                 "response_format": {"type": "json_object"}}),
             ToolFormat::Hermes,
             "has one program",
+            false,
         ),
         (
             json!({"response_format": {"type": "xml"}}),
             ToolFormat::Hermes,
             "response_format",
+            false,
         ),
         (
             json!({"response_format": {"type": "json_schema"}}),
             ToolFormat::Hermes,
             "json_schema.schema",
+            false,
         ),
         (
             json!({"json_schema": {"type": "object"}}),
             ToolFormat::Hermes,
             "json_schema is not supported",
+            false,
         ),
         (
             json!({"tool_choice": "required"}),
             ToolFormat::Hermes,
             "needs the request's tools",
+            false,
         ),
         (
             json!({"tool_choice": "sometimes", "tools": tools}),
             ToolFormat::Hermes,
             "\"sometimes\"",
+            false,
         ),
         (
             json!({"tool_choice": {"type": "function", "function": {"name": "g"}}, "tools": tools}),
             ToolFormat::Hermes,
             "the function g is not among",
+            false,
         ),
         (
             json!({"tool_choice": "required", "tools": tools,
                 "response_format": {"type": "json_schema", "json_schema": {"schema": {"type": "boolean"}}}}),
             ToolFormat::Hermes,
             "has one program",
+            false,
         ),
         (
             json!({"tool_choice": "required", "tools": [{"function": {"name": "a<b"}}]}),
             ToolFormat::Hermes,
             "not a plain name",
+            true,
         ),
         (
             json!({"tool_choice": "required", "tools": [{"function": {"name": "f", "parameters":
             {"type": "object", "properties": {"q": {"enum": ["a"]}}}}}]}),
             GLM,
             "under \"type\": \"string\"",
+            true,
         ),
         (
             json!({"tool_choice": "required", "tools": [{"function": {"name": "f", "parameters":
             {"type": "object", "properties": {"q": {"enum": ["a"]}}}}}]}),
             SOLAR,
             "Solar's tool markup reads a text value as text only under \"type\": \"string\"",
+            true,
         ),
     ];
-    for (body, format, needle) in cases {
+    for (body, format, needle, outside) in cases {
         let e = build(&tok, format, &body).expect_err(&body.to_string());
         assert!(e.message.contains(needle), "{body}: {e}");
         assert!(!e.unsupported, "{body}: {e}");
+        assert_eq!(e.outside_subset, outside, "{body}: {e}");
     }
     let e = build(
         &tok,
@@ -1038,11 +1079,14 @@ fn a_schema_is_refused_before_it_grows_past_its_budget() {
             .message
     };
     let over = "the schema passes 67108864 bytes once its $refs are written out";
+    // One property is required, so the optional ones follow it one by one
+    // and the written-out bytes, not the alternatives of an object any of
+    // whose properties may come first, are what each tool spends.
     let large = |refs: usize| {
         let props: Map<String, Value> = (0..refs)
             .map(|i| (format!("p{i}"), json!({"$ref": "#/$defs/large"})))
             .collect();
-        json!({"type": "object", "properties": props,
+        json!({"type": "object", "properties": props, "required": ["p0"],
             "$defs": {"large": {"const": "a".repeat(65 * 1024)}}})
     };
     let e = refused(large(1024));
@@ -1083,11 +1127,13 @@ fn forecast_tools() -> Value {
         {"type": "function", "function": {"name": "get_weather", "parameters": {
             "type": "object", "properties": {
                 "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
-                "days": {"type": "integer", "enum": [1, 2, 3]}}}}},
+                "days": {"type": "integer", "enum": [1, 2, 3]}},
+            "required": ["unit", "days"]}}},
         {"type": "function", "function": {"name": "search", "parameters": {
             "type": "object", "properties": {
                 "query": {"type": "string", "maxLength": 16},
-                "deep": {"type": "boolean"}}}}}
+                "deep": {"type": "boolean"}},
+            "required": ["query", "deep"]}}}
     ])
 }
 
@@ -1106,8 +1152,8 @@ fn markup(format: ToolFormat) -> [String; 2] {
             "<tool_call>\n<function=search>\n<parameter=query>\ncats\n</parameter>\n<parameter=deep>\nfalse\n</parameter>\n</function>\n</tool_call>",
         ],
         QWEN_COMPACT => [
-            "<tool_call>\n<function=get_weather>\n<parameter=unit>celsius</parameter>\n<parameter=days>2</parameter>\n</function>\n</tool_call>",
-            "<tool_call>\n<function=search>\n<parameter=query>cats</parameter>\n<parameter=deep>false</parameter>\n</function>\n</tool_call>",
+            "<tool_call>\n<function=get_weather>\n<parameter=unit>celsius</parameter><parameter=days>2</parameter></function>\n</tool_call>",
+            "<tool_call>\n<function=search>\n<parameter=query>cats</parameter><parameter=deep>false</parameter></function>\n</tool_call>",
         ],
         GLM => [
             "<tool_call>get_weather<arg_key>unit</arg_key><arg_value>celsius</arg_value><arg_key>days</arg_key><arg_value>2</arg_value></tool_call>",
@@ -1305,7 +1351,8 @@ fn a_forced_calls_numbers_arrays_and_any_of_read_back() {
     let params = json!({"type": "object", "properties": {
         "n": {"type": "integer"},
         "xs": {"type": "array", "items": {"type": "integer"}},
-        "o": {"anyOf": [{"type": "integer"}, {"type": "null"}]}}});
+        "o": {"anyOf": [{"type": "integer"}, {"type": "null"}]}},
+        "required": ["n", "xs", "o"]});
     let tools = json!([{"type": "function", "function": {"name": "f", "parameters": params}}]);
     let wrong = cycling(b"Z7,]}\n<n", 300);
     for format in FORMATS.into_iter().chain([ToolFormat::MuseSpark]) {
@@ -1443,7 +1490,8 @@ fn a_string_ref_reads_back_as_text() {
     let tok = bytes_tok();
     let params = json!({"type": "object",
         "$defs": {"s": {"type": "string", "const": "123"}},
-        "properties": {"s": {"$ref": "#/$defs/s"}}});
+        "properties": {"s": {"$ref": "#/$defs/s"}},
+        "required": ["s"]});
     let tools = json!([{"type": "function", "function": {"name": "f", "parameters": params}}]);
     let want = json!({"s": "123"});
     for (format, spelling) in [(GLM, KvSpelling::Glm), (SOLAR, KvSpelling::Solar)] {
@@ -1584,6 +1632,26 @@ fn a_walk_takes_no_stop_id_before_the_program_is_spent() {
     assert_eq!(w.choose(&row), Ok(tok.eos()));
 }
 
+/// A waiting walk has no pick: its free text is the request's own draw, which
+/// the walk only watches. Asked for one, it is the named error, not a pick
+/// from a row. Mutant: the walk draws free text itself.
+#[test]
+fn a_waiting_walk_refuses_a_pick() {
+    let tok = bytes_tok();
+    let body = json!({"tools": forecast_tools(), "tool_choice": "auto"});
+    let c = build(&tok, QWEN, &body).expect("served");
+    let mut w = Walk::new(&c, false);
+    assert!(w.waiting());
+    let mut row = vec![0.0; tok.n_vocab()];
+    row[(BYTES + u32::from(b'x')) as usize] = 1.0;
+    let e = w.choose(&row).expect_err("a waiting walk picks nothing");
+    assert!(
+        e.to_string().contains("a waiting walk picks nothing"),
+        "{e}"
+    );
+    assert!(w.waiting(), "the refusal leaves the walk waiting");
+}
+
 /// A tool's parameters are read by the one schema compiler: a keyword it does
 /// not read, or a `required` naming nothing, is refused by name, never
 /// dropped.
@@ -1601,15 +1669,16 @@ fn a_tool_parameter_schema_is_read_whole() {
             "tools[0].f.parameters: the keyword \"anyOf\"",
         ),
         (
-            json!({"type": "object", "properties": q, "$ref": "#/defs/p"}),
+            json!({"type": "object", "properties": q, "$ref": "#/properties/q"}),
             "tools[0].f.parameters: the keyword \"$ref\"",
         ),
         (
-            json!({"type": "object", "properties": q, "required": ["nope"]}),
+            json!({"type": "object", "properties": q, "required": ["nope"],
+                "additionalProperties": false}),
             "required names \"nope\"",
         ),
         (
-            json!({"type": "object", "required": ["q"]}),
+            json!({"type": "object", "required": ["q"], "additionalProperties": false}),
             "required names \"q\"",
         ),
         (
@@ -1731,9 +1800,9 @@ fn a_raw_literal_with_an_angle_bracket_is_refused() {
 fn a_literal_with_closing_tags_reads_back_through_each_scanner() {
     let tok = bytes_tok();
     let nested = json!({"type": "object", "properties": {"q": {"type": "object", "properties": {
-        "s": {"type": "string", "const": TAGS}}}}});
+        "s": {"type": "string", "const": TAGS}}, "required": ["s"]}}, "required": ["q"]});
     let direct = json!({"type": "object", "properties": {
-        "t": {"type": "string", "const": TAGS}}});
+        "t": {"type": "string", "const": TAGS}}, "required": ["t"]});
     for format in FORMATS {
         let mut served = vec![(&nested, json!({"q": {"s": TAGS}}))];
         if format == ToolFormat::Hermes {
@@ -1761,9 +1830,10 @@ fn a_literal_with_closing_tags_reads_back_through_each_scanner() {
 fn a_free_string_cannot_spell_its_formats_closing_tag() {
     let tok = bytes_tok();
     let direct = call_body(&json!({"type": "object", "properties": {
-        "q": {"type": "string", "maxLength": 40}}}));
+        "q": {"type": "string", "maxLength": 40}}, "required": ["q"]}));
     let nested = call_body(&json!({"type": "object", "properties": {
-        "q": {"type": "object", "properties": {"s": {"type": "string", "maxLength": 40}}}}}));
+        "q": {"type": "object", "properties": {"s": {"type": "string", "maxLength": 40}},
+            "required": ["s"]}}, "required": ["q"]}));
     let tags = [
         (ToolFormat::Hermes, "</tool_call>"),
         (QWEN, "\n</parameter>\n"),
@@ -2330,7 +2400,8 @@ fn a_forced_call_is_fed_in_the_planned_calls() {
         json!({"type": "function", "function": {"name": name, "parameters": {
             "type": "object", "properties": {
                 "color": {"type": "string", "enum": ["red", "green", "blue"]},
-                "mode": {"type": "string", "enum": ["yes", "no"]}}}}})
+                "mode": {"type": "string", "enum": ["yes", "no"]}},
+            "required": ["color", "mode"]}}})
     };
     let tools: Vec<Value> = [
         "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
@@ -2438,7 +2509,8 @@ fn a_free_strings_end_hands_the_rest_to_the_run() {
     let merged = pieces.piece(PIECE);
     let tok: Arc<dyn Tokenizer> = Arc::new(Pieces(pieces));
     let schema = json!({"type": "object", "properties": {
-        "a": {"type": "string"}, "bb": {"type": "boolean"}, "c": {"type": "string"}}});
+        "a": {"type": "string"}, "bb": {"type": "boolean"}, "c": {"type": "string"}},
+        "required": ["a", "bb", "c"]});
     let c = build(&tok, ToolFormat::Hermes, &schema_body(&schema)).expect("served");
     let x = BYTES + u32::from(b'x');
     // The first string says `x` and ends on the merged piece; the rest of
@@ -2510,8 +2582,9 @@ fn a_run_is_cut_at_the_budget_and_the_context() {
 fn a_penalty_counts_the_fixed_ids_before_a_decision() {
     let tok = bytes_tok();
     let pair = |x: &str, y: &str| json!({"type": "string", "enum": [x, y]});
-    let schema =
-        json!({"type": "object", "properties": {"a": pair("a", "b"), "c": pair("c", "d")}});
+    let schema = json!({"type": "object",
+        "properties": {"a": pair("a", "b"), "c": pair("c", "d")},
+        "required": ["a", "c"]});
     let c = build(&tok, ToolFormat::Hermes, &schema_body(&schema)).expect("served");
     let byte = |b: u8| BYTES + u32::from(b);
     let favour = |hi: u8, lo: u8| vec![(byte(hi), 10.0), (byte(lo), 9.0)];
@@ -3339,4 +3412,2003 @@ fn a_merged_close_writes_nothing_outside_the_held_program() {
         }
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// A `tool_choice: auto` request's call, watched: the free text before the
+/// opener is the model's own, and once the opener arrives the arguments the
+/// schema types an array cannot be written as a Python literal — the mask
+/// refuses the first id the schema does not allow — where JSON passes and
+/// the closed call parses back through the format's own scanner. The opener
+/// spelled in ordinary tokens and the vocabulary's one special token for it
+/// both open the program; under a vocabulary that holds the special token,
+/// the same characters in ordinary tokens stay free text, as the scanner
+/// reads them.
+#[test]
+fn a_watched_call_is_held_to_its_schema_once_it_opens() {
+    let schema = json!({"type": "object", "properties": {
+        "edits": {"type": "array", "items": {"type": "integer"}}},
+        "required": ["edits"]});
+    let tools = json!([{"type": "function", "function": {"name": "edit", "parameters": schema}}]);
+    let body = json!({"tools": tools, "tool_choice": "auto"});
+    let literal = cycling(b"[{'a': 1}]", 40);
+    for (tok, opener_special, spelled_opens) in [
+        (bytes_tok(), false, true),
+        (
+            Arc::new(Pieces(Arc::new(PieceTok(&TAG_PIECES)))) as Arc<dyn Tokenizer>,
+            true,
+            true,
+        ),
+        (
+            Arc::new(Pieces(Arc::new(PieceTok(&[CALL_OPEN])))) as Arc<dyn Tokenizer>,
+            true,
+            false,
+        ),
+    ] {
+        let c = build(&tok, QWEN, &body).expect("served");
+        // Free text, then the opener, then the literal at the typed value:
+        // the one id the vocabulary holds for the opener, or its characters
+        // one by one.
+        let opener = match (opener_special, spelled_opens) {
+            // The tag a special token owns, spelled in ordinary tokens.
+            (true, false) => CALL_OPEN
+                .bytes()
+                .map(|b| BYTES + u32::from(b))
+                .collect::<Vec<_>>(),
+            _ => ids(&tok, CALL_OPEN),
+        };
+        let mut want = ids(&tok, "sure. ");
+        want.extend(opener);
+        want.extend(literal.iter().copied());
+        let o = run(&tok, Some(c), ThinkEntry::Closed, &want);
+        let mut m = parser(QWEN, &tools).reading_specials(&*tok);
+        m.try_push(&o.content, &o.specials)
+            .and_then(|_| m.try_finish())
+            .expect("the answer parses");
+        let m = m.message();
+        if !spelled_opens {
+            // Ordinary tokens spelling the tag a special token owns are
+            // text: no call opens, nothing is held.
+            assert_eq!(m.calls.len(), 0, "{}", o.content);
+            assert!(o.content.contains(CALL_OPEN), "{}", o.content);
+            assert!(o.content.contains("'a'"), "{}", o.content);
+            continue;
+        }
+        assert_eq!(m.calls.len(), 1, "{}", o.content);
+        assert_eq!(m.calls[0].name, "edit", "{}", o.content);
+        let args: Value = serde_json::from_str(&m.calls[0].arguments)
+            .unwrap_or_else(|e| panic!("{e}: {}", o.content));
+        assert!(
+            args["edits"]
+                .as_array()
+                .is_some_and(|a| a.iter().all(Value::is_i64)),
+            "{}: {}",
+            o.content,
+            m.calls[0].arguments
+        );
+        assert!(
+            !m.calls[0].arguments.contains('\''),
+            "the Python literal never lands: {}",
+            m.calls[0].arguments
+        );
+        assert_eq!(o.stop, StopKind::Eos);
+        assert!(o.content.starts_with("sure. "), "{}", o.content);
+        // Rows that favour JSON at the typed value pass through the mask:
+        // where greedy already obeys the program, the pick is greedy's.
+        let c = build(&tok, QWEN, &body).expect("served");
+        let call = format!(
+            "{CALL_OPEN}\n<function=edit>\n<parameter=edits>\n[1, 2]\n</parameter>\n</function>\n{CALL_CLOSE}"
+        );
+        let mut want = ids(&tok, "sure. ");
+        want.extend(ids(&tok, &call));
+        let o = run(&tok, Some(c), ThinkEntry::Closed, &want);
+        let mut m = parser(QWEN, &tools).reading_specials(&*tok);
+        m.try_push(&o.content, &o.specials)
+            .and_then(|_| m.try_finish())
+            .expect("the answer parses");
+        let m = m.message();
+        assert_eq!(m.calls[0].arguments, r#"{"edits":[1, 2]}"#, "{}", o.content);
+        // A sampled request draws its free text from the whole row and its
+        // call from the mask: the literal is held off the same way.
+        let c = build(&tok, QWEN, &body).expect("served");
+        let mut p = params(Some(c), ThinkEntry::Closed);
+        p.sampling.temperature = 0.1;
+        let mut want = ids(&tok, "sure. ");
+        want.extend(ids(&tok, CALL_OPEN));
+        want.extend(literal.iter().copied());
+        let o = run_read(&tok, &p, &want).0;
+        let mut m = parser(QWEN, &tools).reading_specials(&*tok);
+        m.try_push(&o.content, &o.specials)
+            .and_then(|_| m.try_finish())
+            .expect("the answer parses");
+        let m = m.message();
+        assert_eq!(m.calls.len(), 1, "{}", o.content);
+        assert!(
+            serde_json::from_str::<Value>(&m.calls[0].arguments).is_ok_and(|v| v["edits"]
+                .as_array()
+                .is_some_and(|a| a.iter().all(Value::is_i64))),
+            "{}",
+            o.content
+        );
+    }
+}
+
+/// Every format wired for a watched call holds its typed value: the opener
+/// each format's own markup spells, then a Python literal at an argument the
+/// schema types an array, gives one call whose arguments the schema accepts.
+#[test]
+fn each_watched_format_holds_its_typed_value() {
+    let tok = bytes_tok();
+    let schema = json!({"type": "object", "properties": {
+        "edits": {"type": "array", "items": {"type": "integer"}}},
+        "required": ["edits"]});
+    let tools = json!([{"type": "function", "function": {"name": "edit", "parameters": schema}}]);
+    let body = json!({"tools": tools, "tool_choice": "auto"});
+    let openers = [
+        (ToolFormat::Hermes, "<tool_call>"),
+        (QWEN, CALL_OPEN),
+        (QWEN_COMPACT, CALL_OPEN),
+        (GLM, "<tool_call>"),
+        (SOLAR, "<|tool_call:start|>"),
+        (ToolFormat::Dsml(Spelling::Joined), "<｜DSML｜tool_calls>"),
+        (ToolFormat::Dsml(Spelling::Spaced), "<｜DSML｜ calls>"),
+    ];
+    for (format, opener) in openers {
+        let c = build(&tok, format, &body).unwrap_or_else(|e| panic!("{format:?}: {e}"));
+        let mut want = ids(&tok, "hi ");
+        want.extend(ids(&tok, opener));
+        want.extend(cycling(b"[{'a': 1}]", 40).iter().copied());
+        let o = run(&tok, Some(c), ThinkEntry::Closed, &want);
+        let mut m = parser(format, &tools);
+        m.try_push(&o.content, &o.specials)
+            .and_then(|_| m.try_finish())
+            .unwrap_or_else(|e| panic!("{format:?}: {e}: {}", o.content));
+        let m = m.message();
+        assert_eq!(m.calls.len(), 1, "{format:?}: {}", o.content);
+        assert_eq!(m.calls[0].name, "edit", "{format:?}");
+        let args: Value = serde_json::from_str(&m.calls[0].arguments)
+            .unwrap_or_else(|e| panic!("{format:?}: {e}: {}", o.content));
+        assert!(
+            args["edits"]
+                .as_array()
+                .is_some_and(|a| a.iter().all(Value::is_i64)),
+            "{format:?}: {}",
+            m.calls[0].arguments
+        );
+        assert!(
+            !m.calls[0].arguments.contains('\''),
+            "{format:?}: {}",
+            m.calls[0].arguments
+        );
+        assert_eq!(o.stop, StopKind::Eos, "{format:?}");
+    }
+}
+
+/// The free text around watched calls is unconstrained: any id before the
+/// opener and after the close — an angle bracket and a newline among them —
+/// and a second opener opens the program again.
+#[test]
+fn the_free_text_around_a_watched_call_is_unconstrained() {
+    let tok = bytes_tok();
+    let schema = json!({"type": "object", "properties": {
+        "edits": {"type": "array", "items": {"type": "integer"}}},
+        "required": ["edits"]});
+    let tools = json!([{"type": "function", "function": {"name": "edit", "parameters": schema}}]);
+    let body = json!({"tools": tools, "tool_choice": "auto"});
+    let c = build(&tok, QWEN, &body).expect("served");
+    // Openers spread through the tail, free text between them: a call's own
+    // forced ids take rows without reading them, so the free picks resume
+    // wherever the rows stand.
+    let mut want = ids(&tok, "a<b\nc ");
+    want.extend(ids(&tok, CALL_OPEN));
+    for _ in 0..20 {
+        want.extend(ids(&tok, CALL_OPEN));
+        want.extend(cycling(b"z<\n", 3));
+    }
+    want.extend(cycling(b"z<\n", 40));
+    let o = run(&tok, Some(c), ThinkEntry::Closed, &want);
+    assert!(
+        o.content.starts_with("a<b\nc "),
+        "the leading free text is the model's own: {}",
+        o.content
+    );
+    let mut m = parser(QWEN, &tools).reading_specials(&*tok);
+    m.try_push(&o.content, &o.specials)
+        .and_then(|_| m.try_finish())
+        .expect("the answer parses");
+    let m = m.message();
+    assert!(m.calls.len() >= 2, "{}", o.content);
+    for call in &m.calls {
+        let args: Value =
+            serde_json::from_str(&call.arguments).unwrap_or_else(|e| panic!("{e}: {}", o.content));
+        assert!(
+            args["edits"]
+                .as_array()
+                .is_some_and(|a| a.iter().all(Value::is_i64)),
+            "{}",
+            o.content
+        );
+    }
+    let (_, after) = o
+        .content
+        .rsplit_once(CALL_CLOSE)
+        .expect("the last call closed");
+    assert!(
+        after.contains('<') && after.contains('\n'),
+        "the text past the close is free: {after:?}"
+    );
+    assert_eq!(o.stop, StopKind::Eos);
+}
+
+/// What builds no program, as today: `tool_choice: none`, a format whose
+/// markup no watch reads (Muse Spark's recipient slot, markup nothing
+/// parses). Tools with no `tool_choice` given are watched. A JSON
+/// `response_format` beside tools under auto keeps its own one program —
+/// the reply is the schema's, its strings kept clear of a call's opener, as
+/// the refusal shape today is none.
+#[test]
+fn none_unwatched_and_json_replies_build_no_watch() {
+    let tok = bytes_tok();
+    let tools = forecast_tools();
+    let vocab = Arc::new(Vocab::read(&*tok));
+    let ask = |format: ToolFormat| Ask {
+        tok: &*tok,
+        vocab: &vocab,
+        format,
+        think: ThinkTags::THINK,
+    };
+    for (format, body) in [
+        (
+            ToolFormat::MuseSpark,
+            json!({"tools": tools, "tool_choice": "none"}),
+        ),
+        (
+            ToolFormat::MuseSpark,
+            json!({"tools": tools, "tool_choice": "auto"}),
+        ),
+        (
+            ToolFormat::Unparsed,
+            json!({"tools": tools, "tool_choice": "auto"}),
+        ),
+    ] {
+        assert!(
+            request(body.as_object().unwrap(), &ask(format))
+                .expect("served")
+                .is_none(),
+            "{format:?}: {}",
+            body
+        );
+    }
+    assert!(
+        request(
+            json!({"tools": tools}).as_object().unwrap(),
+            &ask(ToolFormat::Hermes)
+        )
+        .expect("served")
+        .is_some(),
+        "tools with no tool_choice given are watched"
+    );
+    // A JSON response_format beside tools under auto keeps its own program:
+    // the reply is the schema's, no call opens in it.
+    let body = json!({"tools": tools, "response_format": {"type": "json_schema",
+        "json_schema": {"name": "x", "strict": true, "schema": weather_schema()}}});
+    let c = build(&tok, ToolFormat::Hermes, &body).expect("served");
+    let o = run(&tok, Some(c), ThinkEntry::Closed, &ids(&tok, WEATHER));
+    assert_eq!(o.content, WEATHER);
+    assert_eq!(
+        parsed(ToolFormat::Hermes, &tools, &o.content)
+            .expect("parses")
+            .1,
+        0
+    );
+}
+
+/// A `required` or `properties` of null reads as absent (some tool-schema
+/// generators write null for an empty list or map): the call is watched,
+/// not refused. Mutant: null refused as a non-array or non-object.
+#[test]
+fn a_null_required_or_properties_reads_as_absent() {
+    let tok = bytes_tok();
+    let vocab = Arc::new(Vocab::read(&*tok));
+    for parameters in [
+        json!({"type": "object", "properties": {"a": {"type": "string"}}, "required": null}),
+        json!({"type": "object", "properties": null}),
+        json!({"type": "object", "properties": null, "required": null}),
+    ] {
+        let tools = json!([{"type": "function", "function": {"name": "f",
+            "parameters": parameters}}]);
+        let watched = request(
+            json!({"tools": tools, "tool_choice": "auto"})
+                .as_object()
+                .unwrap(),
+            &Ask {
+                tok: &*tok,
+                vocab: &vocab,
+                format: ToolFormat::Hermes,
+                think: ThinkTags::THINK,
+            },
+        )
+        .unwrap_or_else(|e| panic!("{parameters}: {e}"));
+        assert!(watched.is_some(), "{parameters}: no watch");
+    }
+}
+
+/// A required property another keyword supplies (`additionalProperties`
+/// true, a schema, or none at all: JSON Schema allows any property then) is
+/// valid JSON Schema the compiler cannot write: outside the subset, so
+/// `tool_choice: auto` serves it with no watch, and a forced call and a JSON
+/// `response_format` refuse it rather than write an object that leaves the
+/// property out. Mutant: the object rule compiles the declared properties
+/// alone, or the validator reads an absent `additionalProperties` as `false`.
+#[test]
+fn a_required_property_with_no_schema_is_outside_the_subset() {
+    let tok = bytes_tok();
+    let vocab = Arc::new(Vocab::read(&*tok));
+    let ask = Ask {
+        tok: &*tok,
+        vocab: &vocab,
+        format: ToolFormat::Hermes,
+        think: ThinkTags::THINK,
+    };
+    for schema in [
+        json!({"type": "object", "properties": {}, "required": ["x"],
+            "additionalProperties": true}),
+        json!({"type": "object", "properties": {}, "required": ["x"],
+            "additionalProperties": {"type": "string"}}),
+        json!({"type": "object", "required": ["x"]}),
+        json!({"type": "object", "properties": {"y": {"type": "string"}},
+            "required": ["x", "y"]}),
+    ] {
+        let tools = json!([{"type": "function", "function": {"name": "f",
+            "parameters": schema}}]);
+        let auto = request(
+            json!({"tools": tools, "tool_choice": "auto"})
+                .as_object()
+                .unwrap(),
+            &ask,
+        )
+        .unwrap_or_else(|e| panic!("{schema}: auto refused: {e}"));
+        assert!(auto.is_none(), "{schema}: auto watched");
+        for body in [
+            json!({"tools": tools, "tool_choice": "required"}),
+            json!({"response_format": {"type": "json_schema",
+                "json_schema": {"name": "x", "schema": schema}}}),
+        ] {
+            let e = request(body.as_object().unwrap(), &ask).expect_err(&format!("{body}: served"));
+            assert!(
+                e.outside_subset && e.message.contains("\"x\""),
+                "{body}: {e}"
+            );
+        }
+    }
+}
+
+/// `additionalProperties: false` supplies no property, so a required name the
+/// node's `properties` lacks contradicts the schema: it is invalid, not
+/// outside the subset, on every route (`tool_choice: auto` too). Mutant: the
+/// validator counts `false` as a keyword that supplies.
+#[test]
+fn a_required_name_no_keyword_supplies_is_invalid() {
+    let tok = bytes_tok();
+    let vocab = Arc::new(Vocab::read(&*tok));
+    let ask = Ask {
+        tok: &*tok,
+        vocab: &vocab,
+        format: ToolFormat::Hermes,
+        think: ThinkTags::THINK,
+    };
+    for schema in [
+        json!({"type": "object", "required": ["x"], "additionalProperties": false}),
+        json!({"type": "object", "properties": {"y": {"type": "string"}},
+            "required": ["x", "y"], "additionalProperties": false}),
+    ] {
+        let tools = json!([{"type": "function", "function": {"name": "f",
+            "parameters": schema}}]);
+        for body in [
+            json!({"tools": tools, "tool_choice": "auto"}),
+            json!({"tools": tools, "tool_choice": "required"}),
+            json!({"response_format": {"type": "json_schema",
+                "json_schema": {"name": "x", "schema": schema}}}),
+        ] {
+            let e = request(body.as_object().unwrap(), &ask).expect_err(&format!("{body}: served"));
+            assert!(!e.outside_subset && !e.unsupported, "{body}: {e}");
+            assert!(e.message.contains("required names \"x\""), "{body}: {e}");
+        }
+    }
+}
+
+/// Under `tool_choice: auto` a tool whose schema is invalid (it contradicts
+/// itself or JSON Schema) is refused by name, the refusal a forced choice
+/// gives, and one that is valid but outside what the compiler serves (a
+/// keyword it does not read, a shape or text it cannot write) is served with
+/// no watch: the reply is the model's.
+#[test]
+fn an_invalid_tool_schema_under_auto_is_refused_and_one_outside_the_subset_is_unwatched() {
+    let tok = bytes_tok();
+    let vocab = Arc::new(Vocab::read(&*tok));
+    let watch = |format: ToolFormat, parameters: &Value| {
+        let tools = json!([{"type": "function", "function": {"name": "f",
+            "parameters": parameters}}]);
+        request(
+            json!({"tools": tools, "tool_choice": "auto"})
+                .as_object()
+                .unwrap(),
+            &Ask {
+                tok: &*tok,
+                vocab: &vocab,
+                format,
+                think: ThinkTags::THINK,
+            },
+        )
+    };
+    let prop = |p: Value| json!({"type": "object", "properties": {"p": p}});
+    let invalid = [
+        json!({"type": "object", "properties": {"a": {"type": "string"}}, "required": ["b"],
+            "additionalProperties": false}),
+        json!({"type": "object", "properties": []}),
+        json!({"type": "object", "required": "p"}),
+        prop(json!({"type": "str"})),
+        prop(json!({"type": 5})),
+        prop(json!({"type": "string", "maxLength": -1})),
+        prop(json!({"anyOf": []})),
+        prop(json!({"enum": []})),
+        prop(json!({"type": "string", "enum": [1]})),
+        prop(json!({"$ref": "#/$defs/missing"})),
+        prop(json!({"$ref": 5})),
+        json!({"type": "string"}),
+        json!(5),
+        json!({"type": "object", "properties": {}, "required": [1],
+            "additionalProperties": false}),
+        json!({"type": "object", "properties": {}, "required": ["x"],
+            "additionalProperties": false}),
+        json!({"type": "object", "allOf": [{"properties": {"x": {"type": "string"}}}],
+            "required": [1]}),
+    ];
+    for parameters in &invalid {
+        for format in [ToolFormat::Hermes, QWEN] {
+            let e = watch(format, parameters).expect_err(&parameters.to_string());
+            assert!(!e.outside_subset && !e.unsupported, "{parameters}: {e}");
+            assert!(
+                e.field
+                    .as_deref()
+                    .is_some_and(|f| f.starts_with("tools[0].f.parameters")),
+                "{parameters}: {e}"
+            );
+        }
+    }
+    let outside = [
+        (
+            ToolFormat::Hermes,
+            prop(json!({"type": ["string", "null"]})),
+        ),
+        (
+            ToolFormat::Hermes,
+            prop(json!({"type": "string", "pattern": "a+"})),
+        ),
+        (ToolFormat::Hermes, prop(json!({"type": "array"}))),
+        (ToolFormat::Hermes, prop(json!(true))),
+        (ToolFormat::Hermes, prop(json!({"description": "no type"}))),
+        (ToolFormat::Hermes, prop(json!({"enum": [1, "a"]}))),
+        (ToolFormat::Hermes, prop(json!({"enum": ["a", "a"]}))),
+        (ToolFormat::Hermes, prop(json!({"enum": ["a", "ab"]}))),
+        (
+            ToolFormat::Hermes,
+            prop(json!({"type": "number", "const": 1})),
+        ),
+        (
+            ToolFormat::Hermes,
+            prop(json!({"$ref": "https://example.com/s.json"})),
+        ),
+        (ToolFormat::Hermes, prop(json!({"$ref": "#"}))),
+        (ToolFormat::Hermes, json!({"type": ["object", "null"]})),
+        (ToolFormat::Hermes, json!({"anyOf": [{"type": "object"}]})),
+        (
+            ToolFormat::Hermes,
+            json!({"type": "object", "allOf": [{"properties": {"x": {"type": "string"}}}],
+                "required": ["x"]}),
+        ),
+        (
+            QWEN,
+            prop(json!({"anyOf": [{"type": "integer"}, {"type": "string"}]})),
+        ),
+        (GLM, prop(json!({"enum": ["a"]}))),
+    ];
+    for (format, parameters) in &outside {
+        let served = watch(*format, parameters)
+            .unwrap_or_else(|e| panic!("{format:?} {parameters}: refused: {e}"));
+        assert!(served.is_none(), "{format:?} {parameters}: watched");
+    }
+    // What the compiler serves is watched, as before.
+    let served = watch(
+        ToolFormat::Hermes,
+        &prop(json!({"type": "array", "items": {"type": "integer"}})),
+    )
+    .expect("served");
+    assert!(served.is_some());
+}
+
+/// Whether a schema is invalid does not depend on what else the compiler
+/// would refuse: an invalid node is refused by name beside a keyword outside
+/// the subset on its own node, below an outside node (through `properties`,
+/// `items`, `anyOf` and a `$ref`'s target), and past an unresolved or boolean
+/// sibling, on every route that reads a schema: `tool_choice` auto, a forced
+/// call and `response_format`. Mutant: the compiler's own order decides, the
+/// outside refusal first (and under auto, the request served unwatched).
+#[test]
+fn an_invalid_node_is_refused_beside_an_outside_one() {
+    let tok = bytes_tok();
+    let vocab = Arc::new(Vocab::read(&*tok));
+    let ask = |format: ToolFormat| Ask {
+        tok: &*tok,
+        vocab: &vocab,
+        format,
+        think: ThinkTags::THINK,
+    };
+    let prop = |p: Value| json!({"type": "object", "properties": {"p": p}});
+    // The schema, and the path under it of the invalid node.
+    let cases = [
+        (
+            prop(json!({"type": "str", "pattern": "a+"})),
+            ".properties.p",
+        ),
+        (
+            prop(json!({"type": "string", "maxLength": -1, "pattern": "a+"})),
+            ".properties.p",
+        ),
+        (
+            prop(json!({"type": "string", "enum": ["a", 1]})),
+            ".properties.p",
+        ),
+        (
+            prop(json!({"type": "integer", "minimum": 0, "properties": {"q": {"type": "str"}}})),
+            ".properties.p.properties.q",
+        ),
+        (
+            prop(json!({"type": "array", "minItems": 1, "items": {"type": "str"}})),
+            ".properties.p.items",
+        ),
+        (
+            prop(json!({"anyOf": [{"type": "string", "pattern": "a"}, {"type": "str"}]})),
+            ".properties.p.anyOf[1]",
+        ),
+        (
+            json!({"type": "object", "properties": {
+                "a": {"type": "string", "pattern": "x"}, "b": {"$ref": "#/$defs/d"}},
+                "$defs": {"d": {"type": "str"}}}),
+            ".properties.b",
+        ),
+        (
+            json!({"type": "object", "properties": {
+                "a": {"$ref": "https://example.com/s.json"}, "b": {"$ref": "#/nope"}}}),
+            ".properties.b",
+        ),
+        (
+            json!({"type": "object", "properties": {"a": true, "b": {"type": "str"}}}),
+            ".properties.b",
+        ),
+        (
+            json!({"type": "object", "minProperties": 1, "required": ["q"],
+                "additionalProperties": false}),
+            "",
+        ),
+    ];
+    let refused = |e: Refusal, field: String, body: &Value| {
+        assert!(!e.outside_subset && !e.unsupported, "{body}: {e}");
+        assert_eq!(e.field.as_deref(), Some(field.as_str()), "{body}: {e}");
+    };
+    for (schema, at) in &cases {
+        let tools = json!([{"type": "function", "function": {"name": "f", "parameters": schema}}]);
+        let here = format!("tools[0].f.parameters{at}");
+        for (format, choice) in [
+            (ToolFormat::Hermes, "auto"),
+            (QWEN, "auto"),
+            (ToolFormat::Hermes, "required"),
+        ] {
+            let body = json!({"tools": tools, "tool_choice": choice});
+            let e = request(body.as_object().unwrap(), &ask(format))
+                .expect_err(&format!("{format:?} {body}"));
+            refused(e, here.clone(), &body);
+        }
+        let body = schema_body(schema);
+        let e = build(&tok, ToolFormat::Hermes, &body).expect_err(&body.to_string());
+        refused(e, format!("response_format.json_schema.schema{at}"), &body);
+    }
+}
+
+/// Every tool's schema is validated before the first tool the compiler
+/// refuses as outside the subset decides: an earlier tool's outside keyword,
+/// root `anyOf`, list of types, name that is not plain or repeated name does
+/// not hide a later tool's invalid schema, under auto and under a forced
+/// choice. Mutant: `funs` returns at the first refusal.
+#[test]
+fn an_invalid_tool_is_refused_after_an_outside_one() {
+    let tok = bytes_tok();
+    let vocab = Arc::new(Vocab::read(&*tok));
+    let tool = |name: &str, parameters: Value| json!({"type": "function", "function": {"name": name, "parameters": parameters}});
+    let prop = |p: Value| json!({"type": "object", "properties": {"p": p}});
+    let invalid = || prop(json!({"type": "str"}));
+    let firsts = [
+        tool("a", prop(json!({"type": "string", "pattern": "x"}))),
+        tool("a", json!({"anyOf": [{"type": "object"}]})),
+        tool("a", json!({"type": ["object", "null"]})),
+        tool("a<b", prop(json!({"type": "string"}))),
+        tool("b", prop(json!({"type": "string"}))),
+    ];
+    for first in &firsts {
+        let tools = json!([first, tool("b", invalid())]);
+        for (format, choice) in [
+            (ToolFormat::Hermes, "auto"),
+            (QWEN, "auto"),
+            (ToolFormat::Hermes, "required"),
+            (ToolFormat::Dsml(Spelling::Joined), "required"),
+        ] {
+            let body = json!({"tools": tools, "tool_choice": choice});
+            let e = request(
+                body.as_object().unwrap(),
+                &Ask {
+                    tok: &*tok,
+                    vocab: &vocab,
+                    format,
+                    think: ThinkTags::THINK,
+                },
+            )
+            .expect_err(&format!("{format:?} {body}"));
+            assert!(!e.outside_subset && !e.unsupported, "{body}: {e}");
+            assert_eq!(
+                e.field.as_deref(),
+                Some("tools[1].b.parameters.properties.p"),
+                "{body}: {e}"
+            );
+        }
+    }
+}
+
+/// A schema is invalid on every route or on none, and the compiler holds
+/// only what the validator passed: a sweep of node shapes (a keyword of the
+/// wrong type or of another kind than its partner, a missing partner), each
+/// as the schema and below a well-formed object, is read on every route
+/// (`response_format`, a forced call and a watched one, in each markup's
+/// style); the routes agree on whether it is invalid, and none stops the
+/// request thread. Mutant: a check the compiler dropped is not in the
+/// validator, or a route skips the validator.
+#[test]
+fn a_schema_is_invalid_on_every_route_or_on_none() {
+    struct Rng(u64);
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            usize::try_from(self.0 % u64::try_from(n).unwrap()).unwrap()
+        }
+    }
+    let pool: [(&str, [Value; 6]); 10] = [
+        (
+            "type",
+            [
+                json!("object"),
+                json!("string"),
+                json!("number"),
+                json!("array"),
+                json!(["string", "null"]),
+                json!(5),
+            ],
+        ),
+        (
+            "enum",
+            [
+                json!([]),
+                json!(["a"]),
+                json!([1]),
+                json!(["a", 1]),
+                json!([1.5]),
+                json!("a"),
+            ],
+        ),
+        (
+            "const",
+            [
+                json!("a"),
+                json!(1),
+                json!(1.5),
+                json!(null),
+                json!([1]),
+                json!(true),
+            ],
+        ),
+        (
+            "anyOf",
+            [
+                json!([]),
+                json!([{"type": "string"}]),
+                json!([{"type": "integer"}, {"type": "null"}]),
+                json!([5]),
+                json!(5),
+                json!([{"type": "str"}]),
+            ],
+        ),
+        (
+            "properties",
+            [
+                json!(null),
+                json!({}),
+                json!({"q": {"type": "string"}}),
+                json!([]),
+                json!({"q": 5}),
+                json!({"q": true}),
+            ],
+        ),
+        (
+            "required",
+            [
+                json!(null),
+                json!([]),
+                json!(["q"]),
+                json!(["z"]),
+                json!("q"),
+                json!([5]),
+            ],
+        ),
+        (
+            "additionalProperties",
+            [
+                json!(false),
+                json!(true),
+                json!({"type": "string"}),
+                json!({"type": "str"}),
+                json!(null),
+                json!(5),
+            ],
+        ),
+        (
+            "items",
+            [
+                json!({"type": "integer"}),
+                json!(5),
+                json!([{"type": "integer"}]),
+                json!(true),
+                json!({}),
+                json!(null),
+            ],
+        ),
+        (
+            "maxLength",
+            [
+                json!(0),
+                json!(-1),
+                json!("x"),
+                json!(1.5),
+                json!(9),
+                json!(null),
+            ],
+        ),
+        (
+            "$ref",
+            [
+                json!("#"),
+                json!("#/$defs/d"),
+                json!("#/nope"),
+                json!(5),
+                json!("#d"),
+                json!("#/properties/r"),
+            ],
+        ),
+    ];
+    let shape = |rng: &mut Rng| {
+        let mut o = Map::new();
+        for (key, values) in &pool {
+            if rng.below(3) == 0 {
+                o.insert((*key).to_owned(), values[rng.below(values.len())].clone());
+            }
+        }
+        o
+    };
+    let routes: [(ToolFormat, &str); 6] = [
+        (ToolFormat::Hermes, "required"),
+        (QWEN, "required"),
+        (GLM, "required"),
+        (ToolFormat::Dsml(Spelling::Joined), "required"),
+        (ToolFormat::Hermes, "auto"),
+        (QWEN, "auto"),
+    ];
+    let tok = bytes_tok();
+    let vocab = Arc::new(Vocab::read(&*tok));
+    let read = |format: ToolFormat, body: &Value| {
+        let ask = Ask {
+            tok: &*tok,
+            vocab: &vocab,
+            format,
+            think: ThinkTags::THINK,
+        };
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            request(body.as_object().unwrap(), &ask)
+        }))
+        .unwrap_or_else(|_| panic!("the compiler stopped on {body}"))
+    };
+    let invalid = |r: &Result<Option<Constraint>, Refusal>| {
+        r.as_ref()
+            .is_err_and(|e| !e.outside_subset && !e.unsupported)
+    };
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    let (mut refused, mut served) = (0, 0);
+    for _ in 0..1500 {
+        // Below a well-formed object, every route reads the node as a
+        // property: the routes must agree on it.
+        let wrapped = json!({"type": "object", "$defs": {"d": {"type": "string"}},
+            "properties": {"q": shape(&mut rng), "r": {"type": "integer"}}, "required": ["q"]});
+        let verdict = invalid(&read(ToolFormat::Hermes, &schema_body(&wrapped)));
+        let tools = json!([{"type": "function", "function": {"name": "f", "parameters": wrapped}}]);
+        for (format, choice) in routes {
+            let body = json!({"tools": tools, "tool_choice": choice});
+            assert_eq!(invalid(&read(format, &body)), verdict, "{format:?} {body}");
+        }
+        if verdict {
+            refused += 1;
+        } else {
+            served += 1;
+        }
+        // As the schema itself, the compiler still stops on nothing.
+        let alone = Value::Object(shape(&mut rng));
+        let _ = read(ToolFormat::Hermes, &schema_body(&alone));
+        let tools = json!([{"type": "function", "function": {"name": "f", "parameters": alone}}]);
+        for (format, choice) in routes {
+            let _ = read(format, &json!({"tools": tools, "tool_choice": choice}));
+        }
+    }
+    assert!(
+        refused > 100 && served > 100,
+        "the sweep covers both: {refused} refused, {served} not"
+    );
+}
+
+/// A watched call waits for the think span's own end: an opener inside the
+/// span is reasoning where the format's parser reads it so (Hermes'), and
+/// the program starts at the first opener past the close; where the parser's
+/// own rule ends the span at a call opener (Qwen3-Coder's), the opener that
+/// ends the span starts the program. A span the model opens itself is waited
+/// out the same way.
+#[test]
+fn a_watched_call_waits_for_the_think_spans_own_end() {
+    let schema = json!({"type": "object", "properties": {
+        "edits": {"type": "array", "items": {"type": "integer"}}},
+        "required": ["edits"]});
+    let tools = json!([{"type": "function", "function": {"name": "edit", "parameters": schema}}]);
+    let body = json!({"tools": tools, "tool_choice": "auto"});
+    let mut bad = Vec::new();
+    let one_call = |tok: &Arc<dyn Tokenizer>,
+                    prompt: &str,
+                    scan: Tools,
+                    entry: ThinkEntry,
+                    split: Option<ThinkSplit>,
+                    want: &[u32],
+                    reasoning: &str| {
+        let c = build(tok, ToolFormat::Hermes, &body).expect("served");
+        let mut p = params(Some(c), entry);
+        p.think_split = split;
+        let o = run_read(tok, &p, want).0;
+        let mut m = ChatParser::with_tags(
+            prompt,
+            ReasoningFormat::Deepseek,
+            Some(scan),
+            ThinkTags::THINK,
+        )
+        .reading_specials(&**tok);
+        let parsed = m
+            .try_push(&o.content, &o.specials)
+            .and_then(|_| m.try_finish());
+        let m = m.message();
+        let ok = parsed.is_ok()
+            && m.reasoning == reasoning
+            && m.calls.len() == 1
+            && m.calls[0].name == "edit"
+            && serde_json::from_str::<Value>(&m.calls[0].arguments).is_ok_and(|v| {
+                v["edits"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().all(Value::is_i64))
+            });
+        (ok, o.content, m.reasoning.clone(), m.calls.len())
+    };
+    // A prompt that left the span open, Hermes' markup: the opener inside
+    // the span is reasoning, and the program starts at the opener past the
+    // close.
+    let tok = bytes_tok();
+    let mut want = ids(&tok, "mull <tool_call> mull ");
+    want.extend(ids(&tok, "</think> rest "));
+    want.extend(ids(&tok, CALL_OPEN));
+    want.extend(cycling(b"[{'a': 1}]", 40));
+    let (ok, content, reasoning, calls) = one_call(
+        &tok,
+        "<think>\n",
+        Tools::Hermes,
+        ThinkEntry::Open,
+        None,
+        &want,
+        "mull <tool_call> mull ",
+    );
+    if !ok {
+        bad.push(format!(
+            "hermes open: {content:?} reasoning={reasoning:?} calls={calls}"
+        ));
+    }
+    // Qwen3-Coder's markup ends the span at a call opener: the opener that
+    // ends it starts the program.
+    let mut want = ids(&tok, "mull ");
+    want.extend(ids(&tok, CALL_OPEN));
+    want.extend(cycling(b"[{'a': 1}]", 40));
+    let split = ChatParser::with_tags(
+        "<think>\n",
+        ReasoningFormat::None,
+        Some(Tools::QwenXml(Framing::Lines, ParamKinds::default())),
+        ThinkTags::THINK,
+    )
+    .think;
+    let c = build(&tok, QWEN, &body).expect("served");
+    let mut p = params(Some(c), ThinkEntry::Open);
+    p.think_split = split;
+    let o = run_read(&tok, &p, &want).0;
+    let mut m = ChatParser::with_tags(
+        "<think>\n",
+        ReasoningFormat::Deepseek,
+        Some(Tools::QwenXml(
+            Framing::Lines,
+            ParamKinds::of_tools(Some(&tools)),
+        )),
+        ThinkTags::THINK,
+    )
+    .reading_specials(&*tok);
+    let parsed = m
+        .try_push(&o.content, &o.specials)
+        .and_then(|_| m.try_finish());
+    let m = m.message();
+    if !(parsed.is_ok()
+        && m.reasoning == "mull "
+        && m.calls.len() == 1
+        && m.calls[0].name == "edit"
+        && serde_json::from_str::<Value>(&m.calls[0].arguments).is_ok_and(|v| {
+            v["edits"]
+                .as_array()
+                .is_some_and(|a| a.iter().all(Value::is_i64))
+        }))
+    {
+        bad.push(format!(
+            "qwen open: {:?} reasoning={:?} calls={}",
+            o.content,
+            m.reasoning,
+            m.calls.len()
+        ));
+    }
+    // A span the model opens itself: the opener inside it is reasoning, the
+    // program starts past the close.
+    let mut want = ids(&tok, "<think>mull <tool_call> mull ");
+    want.extend(ids(&tok, "</think> rest "));
+    want.extend(ids(&tok, CALL_OPEN));
+    want.extend(cycling(b"[{'a': 1}]", 40));
+    let (ok, content, reasoning, calls) = one_call(
+        &tok,
+        "",
+        Tools::Hermes,
+        ThinkEntry::MayOpen,
+        None,
+        &want,
+        "mull <tool_call> mull ",
+    );
+    if !ok {
+        bad.push(format!(
+            "hermes may-open: {content:?} reasoning={reasoning:?} calls={calls}"
+        ));
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
+/// A call opener the vocabulary holds as one special token starts the watched
+/// program where that token ends the free text, the first content of a reply
+/// whose span the model may still open included, with whitespace before it or
+/// none: the call that follows is held to its schema, not left as the model
+/// wrote it. A spelling of the opener in ordinary ids is not an opener.
+#[test]
+fn a_special_opener_at_the_first_content_starts_the_watched_program() {
+    let pieces = Arc::new(PieceTok(&TAG_PIECES));
+    let tok: Arc<dyn Tokenizer> = Arc::new(Pieces(Arc::clone(&pieces)));
+    let tools = json!([{"type": "function", "function": {"name": "edit", "parameters": {
+        "type": "object",
+        "properties": {"edits": {"type": "array", "items": {"type": "integer"}}},
+        "required": ["edits"]}}}]);
+    let c = build(
+        &tok,
+        ToolFormat::Hermes,
+        &json!({"tools": tools, "tool_choice": "auto"}),
+    )
+    .expect("served");
+    // The call the model writes names `edits` a string: only the program
+    // can make it the array of integers the schema asks for.
+    let written = "\n{\"name\": \"edit\", \"arguments\": {\"edits\": \"x\"}}\n";
+    let held = |opener: Vec<u32>, lead: &str| {
+        let mut want = ids(&tok, lead);
+        want.extend(opener);
+        want.extend(ids(&tok, written));
+        want.push(pieces.piece(CALL_CLOSE));
+        let o = run_read(&tok, &params(Some(c.clone()), ThinkEntry::MayOpen), &want).0;
+        let mut m = ChatParser::with_tags(
+            "",
+            ReasoningFormat::Deepseek,
+            Some(Tools::Hermes),
+            ThinkTags::THINK,
+        )
+        .reading_specials(&*tok);
+        m.try_push(&o.content, &o.specials)
+            .and_then(|_| m.try_finish())
+            .expect("the generation parses");
+        m.message().clone()
+    };
+    for lead in ["", "\n"] {
+        let m = held(vec![pieces.piece(CALL_OPEN)], lead);
+        assert_eq!(m.calls.len(), 1, "{lead:?}: {m:?}");
+        let args: Value = serde_json::from_str(&m.calls[0].arguments).expect("JSON arguments");
+        assert!(
+            args["edits"]
+                .as_array()
+                .is_some_and(|a| a.iter().all(Value::is_i64)),
+            "{lead:?}: {args}"
+        );
+    }
+    // The opener's characters in ordinary ids start no program: the call is
+    // content and stays as written.
+    let plain: Vec<u32> = CALL_OPEN.bytes().map(|b| BYTES + u32::from(b)).collect();
+    let m = held(plain, "");
+    assert!(m.calls.is_empty(), "{m:?}");
+    assert!(m.content.contains("\"edits\": \"x\""), "{m:?}");
+}
+
+// ------------------------------------------------- the object rule
+
+/// The tools of the object-rule tests: `city` required, then `days` and `ok`
+/// optional, in the schema's order.
+fn city_tools() -> Value {
+    json!([{"type": "function", "function": {"name": "get_weather", "parameters": {
+        "type": "object",
+        "properties": {
+            "city": {"type": "string", "maxLength": 8},
+            "days": {"type": "integer"},
+            "ok": {"type": "boolean"}},
+        "required": ["city"]}}}])
+}
+
+/// The arguments a call over [`city_tools`] with `keys` written holds, in
+/// that order.
+fn city_args(keys: &[&str]) -> Value {
+    let mut v = Map::new();
+    for k in keys {
+        let a = match *k {
+            "city" => json!("Seoul"),
+            "days" => json!(3),
+            "ok" => json!(true),
+            other => panic!("{other}"),
+        };
+        v.insert((*k).to_owned(), a);
+    }
+    Value::Object(v)
+}
+
+/// `format`'s markup of one `get_weather` call over [`city_tools`] with
+/// `keys` written, in the order given.
+fn city_call(format: ToolFormat, keys: &[&str]) -> String {
+    let value = |k: &str| match k {
+        "city" => ("Seoul", true),
+        "days" => ("3", false),
+        "ok" => ("true", false),
+        other => unreachable!("{other}"),
+    };
+    let mut members = Vec::new();
+    for (i, k) in keys.iter().enumerate() {
+        let (v, text) = value(k);
+        members.push(match format {
+            ToolFormat::Hermes => format!(
+                "{}\"{k}\": {}",
+                if i == 0 { "" } else { ", " },
+                if text {
+                    format!("\"{v}\"")
+                } else {
+                    v.to_owned()
+                }
+            ),
+            QWEN | QWEN_CODER => format!("<parameter={k}>\n{v}\n</parameter>\n"),
+            QWEN_COMPACT => format!("<parameter={k}>{v}</parameter>"),
+            GLM => format!("<arg_key>{k}</arg_key><arg_value>{v}</arg_value>"),
+            SOLAR => format!("<|tool_arg:start|>{k}<|tool_arg:value|>{v}<|tool_arg:end|>\n"),
+            ToolFormat::Dsml(_) => format!(
+                "<｜DSML｜parameter name=\"{k}\" string=\"{text}\">{v}</｜DSML｜parameter>\n"
+            ),
+            ToolFormat::MuseSpark => format!("<atem:parameter name=\"{k}\">{v}</atem:parameter>\n"),
+            ToolFormat::Unparsed => unreachable!("a parsed format"),
+        });
+    }
+    let members = members.concat();
+    let joined = match format {
+        ToolFormat::Hermes => format!(
+            "<tool_call>\n{{\"name\": \"get_weather\", \"arguments\": {{{members}}}}}\n</tool_call>"
+        ),
+        QWEN | QWEN_CODER | QWEN_COMPACT => {
+            format!("<tool_call>\n<function=get_weather>\n{members}</function>\n</tool_call>")
+        }
+        GLM => format!("<tool_call>get_weather{members}</tool_call>"),
+        SOLAR => format!("<|tool_call:start|>get_weather\n{members}<|tool_call:end|>"),
+        ToolFormat::Dsml(_) => format!(
+            "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n{members}\
+             </｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+        ),
+        ToolFormat::MuseSpark => format!(
+            " to=get_weather<|message|><atem:function_calls>\n\
+             <atem:invoke name=\"get_weather\">\n{members}</atem:invoke>\n</atem:function_calls>"
+        ),
+        ToolFormat::Unparsed => unreachable!("a parsed format"),
+    };
+    match format {
+        ToolFormat::Dsml(Spelling::Spaced) => joined
+            .replace("｜DSML｜tool_calls", "｜DSML｜ calls")
+            .replace("｜DSML｜invoke", "｜DSML｜ invoke")
+            .replace("｜DSML｜parameter", "｜DSML｜ parameter"),
+        _ => joined,
+    }
+}
+
+/// The object rule, llama.cpp's (`_build_object_rule`): a tool's optional
+/// parameters may be left out — under the watch and under a forced call, in
+/// every format — any subset of them in the schema's order, and a required
+/// one is still forced (a script that leaves it out answers a call that
+/// holds it).
+#[test]
+fn optional_parameters_may_be_left_out_in_schema_order() {
+    let tok = bytes_tok();
+    let tools = city_tools();
+    let subsets: [&[&str]; 4] = [
+        &["city"],
+        &["city", "days"],
+        &["city", "ok"],
+        &["city", "days", "ok"],
+    ];
+    for format in [
+        ToolFormat::Hermes,
+        QWEN,
+        QWEN_COMPACT,
+        GLM,
+        SOLAR,
+        ToolFormat::Dsml(Spelling::Joined),
+        ToolFormat::Dsml(Spelling::Spaced),
+    ] {
+        for keys in subsets {
+            let body = json!({"tools": tools, "tool_choice": "auto"});
+            let c = build(&tok, format, &body).unwrap_or_else(|e| panic!("{format:?}: {e}"));
+            // [`city_call`] opens with the format's own call opener.
+            let mut want = ids(&tok, "sure. ");
+            want.extend(ids(&tok, &city_call(format, keys)));
+            let o = run(&tok, Some(c), ThinkEntry::Closed, &want);
+            let mut m = parser(format, &tools);
+            m.try_push(&o.content, &o.specials)
+                .and_then(|_| m.try_finish())
+                .unwrap_or_else(|e| panic!("{format:?} {keys:?}: {e}: {}", o.content));
+            let m = m.message();
+            assert_eq!(m.calls.len(), 1, "{format:?} {keys:?}: {}", o.content);
+            assert_eq!(m.calls[0].name, "get_weather", "{format:?}");
+            let args: Value = serde_json::from_str(&m.calls[0].arguments)
+                .unwrap_or_else(|e| panic!("{format:?} {keys:?}: {e}: {}", o.content));
+            assert_eq!(args, city_args(keys), "{format:?} {keys:?}: {}", o.content);
+        }
+    }
+    for format in [
+        ToolFormat::Hermes,
+        QWEN,
+        QWEN_COMPACT,
+        GLM,
+        SOLAR,
+        ToolFormat::Dsml(Spelling::Joined),
+        ToolFormat::Dsml(Spelling::Spaced),
+        ToolFormat::MuseSpark,
+    ] {
+        for keys in subsets {
+            let body = json!({"tools": tools, "tool_choice": "required"});
+            let c = build(&tok, format, &body).unwrap_or_else(|e| panic!("{format:?}: {e}"));
+            let want = ids(&tok, &city_call(format, keys));
+            let o = run(&tok, Some(c), ThinkEntry::Closed, &want);
+            let mut m = parser(format, &tools);
+            m.try_push(&o.content, &o.specials)
+                .and_then(|_| m.try_finish())
+                .unwrap_or_else(|e| panic!("{format:?} {keys:?}: {e}: {}", o.content));
+            let m = m.message();
+            assert_eq!(m.calls.len(), 1, "{format:?} {keys:?}: {}", o.content);
+            assert_eq!(m.calls[0].name, "get_weather", "{format:?}");
+            let args: Value = serde_json::from_str(&m.calls[0].arguments)
+                .unwrap_or_else(|e| panic!("{format:?} {keys:?}: {e}: {}", o.content));
+            assert_eq!(args, city_args(keys), "{format:?} {keys:?}: {}", o.content);
+        }
+        // The required parameter stays forced: rows that favour nothing of
+        // the call still answer one whose arguments hold it.
+        let body = json!({"tools": tools, "tool_choice": "required"});
+        let c = build(&tok, format, &body).unwrap_or_else(|e| panic!("{format:?}: {e}"));
+        let wrong = vec![BYTES + u32::from(b'Z'); 300];
+        let o = run(&tok, Some(c), ThinkEntry::Closed, &wrong);
+        let calls = scanned(format, &tools, &o.content);
+        let [(name, args)] = calls.as_slice() else {
+            panic!("{format:?}: {}", o.content);
+        };
+        assert_eq!(name, "get_weather", "{format:?}");
+        assert!(args["city"].is_string(), "{format:?}: {args}");
+    }
+}
+
+/// An object whose properties are all optional may leave every one of them
+/// out — the empty arguments in the formats that need no parameter text of
+/// their own for it (a DSML invoke writes the template's own empty line,
+/// the next test), and the empty object of a `response_format` json_schema.
+#[test]
+fn an_object_with_no_required_property_may_be_empty() {
+    let tok = bytes_tok();
+    let tools = json!([{"type": "function", "function": {"name": "get_time", "parameters": {
+        "type": "object", "properties": {"zone": {"type": "integer"}}}}}]);
+    for format in [ToolFormat::Hermes, QWEN, QWEN_COMPACT, GLM, SOLAR] {
+        for keys in [&[] as &[&str], &["zone"]] {
+            let body = json!({"tools": tools, "tool_choice": "auto"});
+            let c = build(&tok, format, &body).unwrap_or_else(|e| panic!("{format:?}: {e}"));
+            let call = match keys {
+                [] => match format {
+                    ToolFormat::Hermes => {
+                        "<tool_call>\n{\"name\": \"get_time\", \"arguments\": {}}\n</tool_call>"
+                    }
+                    QWEN | QWEN_CODER | QWEN_COMPACT => {
+                        "<tool_call>\n<function=get_time>\n</function>\n</tool_call>"
+                    }
+                    GLM => "<tool_call>get_time</tool_call>",
+                    SOLAR => "<|tool_call:start|>get_time\n<|tool_call:end|>",
+                    ToolFormat::Dsml(_) | ToolFormat::MuseSpark | ToolFormat::Unparsed => {
+                        unreachable!("not in this loop")
+                    }
+                },
+                ["zone"] => match format {
+                    ToolFormat::Hermes => {
+                        "<tool_call>\n{\"name\": \"get_time\", \
+                        \"arguments\": {\"zone\": 1}}\n</tool_call>"
+                    }
+                    QWEN | QWEN_CODER => {
+                        "<tool_call>\n<function=get_time>\n<parameter=zone>\n1\n\
+                        </parameter>\n</function>\n</tool_call>"
+                    }
+                    QWEN_COMPACT => {
+                        "<tool_call>\n<function=get_time>\n<parameter=zone>1\
+                        </parameter></function>\n</tool_call>"
+                    }
+                    GLM => {
+                        "<tool_call>get_time<arg_key>zone</arg_key><arg_value>1</arg_value>\
+                        </tool_call>"
+                    }
+                    SOLAR => {
+                        "<|tool_call:start|>get_time\n<|tool_arg:start|>zone\
+                        <|tool_arg:value|>1<|tool_arg:end|>\n<|tool_call:end|>"
+                    }
+                    ToolFormat::Dsml(_) | ToolFormat::MuseSpark | ToolFormat::Unparsed => {
+                        unreachable!("not in this loop")
+                    }
+                },
+                _ => unreachable!("two keys"),
+            };
+            // `call` opens with the format's own call opener.
+            let mut want = ids(&tok, "sure. ");
+            want.extend(ids(&tok, call));
+            let o = run(&tok, Some(c), ThinkEntry::Closed, &want);
+            let mut m = parser(format, &tools);
+            m.try_push(&o.content, &o.specials)
+                .and_then(|_| m.try_finish())
+                .unwrap_or_else(|e| panic!("{format:?} {keys:?}: {e}: {}", o.content));
+            let m = m.message();
+            assert_eq!(m.calls.len(), 1, "{format:?} {keys:?}: {}", o.content);
+            let want = match keys {
+                [] => "{}".to_owned(),
+                _ => r#"{"zone":1}"#.to_owned(),
+            };
+            assert_eq!(
+                m.calls[0].arguments, want,
+                "{format:?} {keys:?}: {}",
+                o.content
+            );
+        }
+    }
+    // A `response_format` json_schema follows the same rule: an optional
+    // property may be left out, and an object of optionals only may be `{}`.
+    let with_required = json!({"type": "object", "properties": {
+        "city": {"type": "string", "maxLength": 8}, "days": {"type": "integer"}},
+        "required": ["city"]});
+    let c = build(&tok, ToolFormat::Hermes, &schema_body(&with_required)).expect("served");
+    let o = run(
+        &tok,
+        Some(c),
+        ThinkEntry::Closed,
+        &ids(&tok, r#"{"city": "Seoul"}"#),
+    );
+    assert_eq!(o.content, r#"{"city": "Seoul"}"#);
+    let all_optional = json!({"type": "object", "properties": {
+        "days": {"type": "integer"}, "ok": {"type": "boolean"}}});
+    let c = build(&tok, ToolFormat::Hermes, &schema_body(&all_optional)).expect("served");
+    let o = run(&tok, Some(c.clone()), ThinkEntry::Closed, &ids(&tok, "{}"));
+    assert_eq!(o.content, "{}");
+    let o = run(
+        &tok,
+        Some(c),
+        ThinkEntry::Closed,
+        &ids(&tok, r#"{"ok": false}"#),
+    );
+    assert_eq!(o.content, r#"{"ok": false}"#);
+}
+
+/// A DSML invoke whose parameters are all optional writes the template's own
+/// empty line where the model leaves every one of them out, as it does for a
+/// call of no parameters. Mutant: the empty alternative writes no newline.
+#[test]
+fn a_dsml_invoke_with_no_parameter_written_keeps_its_empty_line() {
+    let tok = bytes_tok();
+    let tools = json!([{"type": "function", "function": {"name": "get_time", "parameters": {
+        "type": "object", "properties": {"zone": {"type": "integer"}}}}}]);
+    let body = json!({"tools": tools, "tool_choice": "auto"});
+    let format = ToolFormat::Dsml(Spelling::Joined);
+    let c = build(&tok, format, &body).expect("served");
+    let call = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_time\">\n\n\
+                </｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+    let mut want = ids(&tok, "sure. ");
+    want.extend(ids(&tok, call));
+    let o = run(&tok, Some(c), ThinkEntry::Closed, &want);
+    assert!(o.content.contains(call), "{}", o.content);
+    let mut m = parser(format, &tools);
+    m.try_push(&o.content, &o.specials)
+        .and_then(|_| m.try_finish())
+        .expect("the answer parses");
+    let m = m.message();
+    assert_eq!(m.calls.len(), 1, "{}", o.content);
+    assert_eq!(m.calls[0].arguments, "{}", "{}", o.content);
+    assert_eq!(o.stop, StopKind::Eos);
+}
+
+// PIN(2026-11-01): `an_auto_watch_is_armed_only_on_an_engine_that_cuts_into_its_passes` removed: every engine arms the auto watch now, its pick reading the opener inside a pass.
+// PIN(2026-11-01): `a_waiting_watch_takes_the_passes_and_its_call_the_rows` and
+// `a_watch_on_an_engine_that_cuts_no_pass_steps_and_never_resets` removed: no pass is cut at the opener now;
+// `a_watch_drafts_its_free_text_and_its_call` and `a_watch_on_an_engine_that_drafts_no_sampled_pass_steps` hold the passes.
+
+/// What a [`Passes`] engine was asked, in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Asked {
+    /// A step, and whether its row was read.
+    Step(bool),
+    /// A greedy drafted pass, which hands no row out.
+    Pass,
+    /// A drafted pass whose verified rows the request's pick reads.
+    Sampled,
+    /// A cut to this many positions.
+    Cut(usize),
+    /// A reset.
+    Reset,
+}
+
+/// A drafting engine whose row at each position after the prompt's last is
+/// [`row`]'s at that step: it favours `want`'s id there, the end of
+/// generation once `want` is spent, and its draft proposes that id. A pass
+/// keeps three ids: a greedy one the rows' argmaxes; a sampled one (on an
+/// engine that drafts sampled requests, where `sampled`) the request's pick
+/// from each verified row, stopping after the first pick that is not the
+/// draft's. The rows follow the positions fed whatever the calls were.
+struct Passes {
+    tok: Arc<dyn Tokenizer>,
+    want: Vec<u32>,
+    sampled: bool,
+    pos: usize,
+    /// The position of the prompt's last id, once stepped.
+    start: Option<usize>,
+    asked: Arc<Mutex<Vec<Asked>>>,
+}
+
+impl Passes {
+    fn ask(&self, a: Asked) {
+        self.asked.lock().expect("the log").push(a);
+    }
+}
+
+impl Engine for Passes {
+    fn tokenizer(&self) -> Arc<dyn Tokenizer> {
+        Arc::clone(&self.tok)
+    }
+    fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
+        self.pos += ids.len();
+        Ok(())
+    }
+    fn next(&mut self, _last: u32, out: Option<&mut [f32]>) -> Result<u32, EngineError> {
+        self.ask(Asked::Step(out.is_some()));
+        let start = *self.start.get_or_insert(self.pos);
+        let (logits, id) = row(&*self.tok, &self.want, self.pos - start);
+        self.pos += 1;
+        if let Some(out) = out {
+            out.copy_from_slice(&logits);
+        }
+        Ok(id)
+    }
+    fn advance(&mut self, _last: u32, out: &mut Vec<u32>) -> Result<Drafted, EngineError> {
+        self.ask(Asked::Pass);
+        let start = self.start.expect("the prompt's last id was stepped");
+        for _ in 0..3 {
+            out.push(row(&*self.tok, &self.want, self.pos - start).1);
+            self.pos += 1;
+        }
+        Ok(Drafted {
+            proposed: 2,
+            accepted: 2,
+        })
+    }
+    fn advance_rows(&self) -> usize {
+        3
+    }
+    fn advance_sampled(
+        &mut self,
+        _last: u32,
+        history: Vec<u32>,
+        mut sampler: Sampler,
+        _best: Option<usize>,
+        out: &mut Vec<u32>,
+    ) -> (Result<Drafted, EngineError>, Vec<u32>, Sampler) {
+        self.ask(Asked::Sampled);
+        let start = self.start.expect("the prompt's last id was stepped");
+        let mut seen = history.clone();
+        for _ in 0..3 {
+            let (logits, draft) = row(&*self.tok, &self.want, self.pos - start);
+            let id = sampler(&logits, &seen);
+            seen.push(id);
+            out.push(id);
+            self.pos += 1;
+            if id != draft {
+                break;
+            }
+        }
+        let accepted = out.len() - 1;
+        (
+            Ok(Drafted {
+                proposed: 2,
+                accepted,
+            }),
+            history,
+            sampler,
+        )
+    }
+    fn drafts_sampled(&self) -> bool {
+        self.sampled
+    }
+    fn cut(&mut self, n: usize) -> Result<(), EngineError> {
+        self.ask(Asked::Cut(n));
+        self.pos = n;
+        Ok(())
+    }
+    /// Asked of the reply once the prompt's last id was stepped; the reset a
+    /// fresh slot's request opens with is not the reply's.
+    fn reset(&mut self) -> Result<(), EngineError> {
+        if self.start.is_some() {
+            self.ask(Asked::Reset);
+        }
+        self.pos = 0;
+        Ok(())
+    }
+    fn ctx_max(&self) -> usize {
+        4096
+    }
+    fn describe(&self) -> String {
+        "passes".to_owned()
+    }
+}
+
+/// One generation of `p` from "hi" on a [`Passes`] engine whose rows favour
+/// `want`, the jump arm `jump`, that drafts sampled requests where `sampled`,
+/// and what the engine was asked; the outcome, or the generation's error.
+fn run_passes_with(
+    tok: &Arc<dyn Tokenizer>,
+    p: &GenParams,
+    want: &[u32],
+    jump: bool,
+    sampled: bool,
+) -> (Result<Outcome, GenError>, Vec<Asked>) {
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let mut slot = Slot::new(Box::new(Passes {
+        tok: Arc::clone(tok),
+        want: want.to_vec(),
+        sampled,
+        pos: 0,
+        start: None,
+        asked: Arc::clone(&asked),
+    }))
+    .schema_jump(jump);
+    let o = generate(
+        &mut slot,
+        &sampling::reference_factory(),
+        &tok.encode("hi"),
+        p,
+        &mut |_| Ok(()),
+        &mut |_| {},
+        &mut Timings::default(),
+    );
+    let asked = asked.lock().expect("the log").clone();
+    (o, asked)
+}
+
+/// [`run_passes_with`] of a greedy request following `c` (none for free
+/// text) with the span `think` left, which ends in an answer.
+fn run_passes(
+    tok: &Arc<dyn Tokenizer>,
+    c: Option<Constraint>,
+    think: ThinkEntry,
+    want: &[u32],
+    jump: bool,
+    sampled: bool,
+) -> (Outcome, Vec<Asked>) {
+    let (o, asked) = run_passes_with(tok, &params(c, think), want, jump, sampled);
+    (o.expect("a generation"), asked)
+}
+
+/// A watch drafts on an engine that drafts sampled requests: a
+/// `tool_choice: auto` request with tools takes every id after the prompt's
+/// through the engine's passes, its pick reading the free text inside each
+/// pass — the think span's own close, then the call opener — and every id a
+/// pass keeps after the opener's is the program's pick from its verified
+/// row: the Python literal the rows favour never lands. Wherever the
+/// opener's last id falls in a pass, on either arm, with or without the
+/// model's reasoning first, the answer is the one plain steps give over the
+/// same rows, the prompt's step reads no row, and nothing is cut or reset.
+/// Mutant: the pick watches no free text inside a pass, and the literal
+/// lands in the call.
+#[test]
+fn a_watch_drafts_its_free_text_and_its_call() {
+    let tok = bytes_tok();
+    let schema = json!({"type": "object", "properties": {
+        "edits": {"type": "array", "items": {"type": "integer"}}},
+        "required": ["edits"]});
+    let tools = json!([{"type": "function", "function": {"name": "edit", "parameters": schema}}]);
+    let body = json!({"tools": tools, "tool_choice": "auto"});
+    for think in [ThinkEntry::Closed, ThinkEntry::Open] {
+        for lead in ["a", "ab", "abc"] {
+            let mut want = Vec::new();
+            if think == ThinkEntry::Open {
+                want.extend(ids(&tok, "plan"));
+                want.extend(ids(&tok, ThinkTags::THINK.close));
+            }
+            want.extend(ids(&tok, &format!("sure {lead}. ")));
+            want.extend(ids(&tok, CALL_OPEN));
+            // The generated index of the opener's last id.
+            let opener = want.len() - 1;
+            want.extend(cycling(b"[{'a': 1}]", 40));
+            let stepped = run(
+                &tok,
+                Some(build(&tok, QWEN, &body).expect("served")),
+                think,
+                &want,
+            );
+            for jump in [false, true] {
+                let label = format!("think={think:?} lead={lead} jump={jump}");
+                let c = build(&tok, QWEN, &body).expect("served");
+                let (o, asked) = run_passes(&tok, Some(c), think, &want, jump, true);
+                assert_eq!(o.content, stepped.content, "{label}");
+                assert_eq!(o.tokens, stepped.tokens, "{label}");
+                assert!(
+                    !asked
+                        .iter()
+                        .any(|a| matches!(a, Asked::Reset | Asked::Cut(_))),
+                    "{label}: {asked:?}"
+                );
+                // The prompt's step, then passes up to the one that keeps the
+                // opener: the first id from the prompt's step, three a pass.
+                let passes = opener.div_ceil(3);
+                assert_eq!(asked[0], Asked::Step(false), "{label}: {asked:?}");
+                assert!(
+                    asked[1..=passes].iter().all(|a| *a == Asked::Sampled),
+                    "{label}: {asked:?}"
+                );
+                // The step arm's call drafts to its close too.
+                if !jump {
+                    assert!(
+                        asked[1..].iter().all(|a| *a == Asked::Sampled),
+                        "{label}: {asked:?}"
+                    );
+                }
+                let mut m = parser(QWEN, &tools).reading_specials(&*tok);
+                m.try_push(&o.content, &o.specials)
+                    .and_then(|_| m.try_finish())
+                    .expect("the answer parses");
+                let m = m.message();
+                assert_eq!(m.calls.len(), 1, "{label}: {}", o.content);
+                assert!(
+                    serde_json::from_str::<Value>(&m.calls[0].arguments).is_ok_and(|v| v["edits"]
+                        .as_array()
+                        .is_some_and(|a| a.iter().all(Value::is_i64))),
+                    "{label}: {}",
+                    o.content
+                );
+                assert!(
+                    o.content.contains(&format!("sure {lead}. ")),
+                    "{label}: {}",
+                    o.content
+                );
+            }
+        }
+    }
+}
+
+/// A request with no tools takes the drafting engine's greedy passes as it
+/// did: the prompt's step reads no row, and every id after it comes from a
+/// pass that hands no row out, whether or not the engine drafts sampled
+/// requests.
+#[test]
+fn a_request_with_no_tools_keeps_its_passes() {
+    let tok = bytes_tok();
+    let want = ids(&tok, "plain text, no call <tool_call> at all");
+    for sampled in [true, false] {
+        let (o, asked) = run_passes(&tok, None, ThinkEntry::Closed, &want, true, sampled);
+        assert_eq!(o.content, "plain text, no call <tool_call> at all");
+        assert_eq!(asked[0], Asked::Step(false), "sampled={sampled}: {asked:?}");
+        assert!(
+            asked[1..].iter().all(|a| *a == Asked::Pass),
+            "sampled={sampled}: {asked:?}"
+        );
+        assert_eq!(
+            asked.len(),
+            1 + want.len().div_ceil(3),
+            "sampled={sampled}: {asked:?}"
+        );
+    }
+}
+
+/// On a drafting engine that drafts no sampled request, a watch steps, as a
+/// request that reads its rows does there, and reads no row while it waits:
+/// the answer is the step arm's, on either arm, and nothing is cut or reset.
+#[test]
+fn a_watch_on_an_engine_that_drafts_no_sampled_pass_steps() {
+    let tok = bytes_tok();
+    let schema = json!({"type": "object", "properties": {
+        "edits": {"type": "array", "items": {"type": "integer"}}},
+        "required": ["edits"]});
+    let tools = json!([{"type": "function", "function": {"name": "edit", "parameters": schema}}]);
+    let body = json!({"tools": tools, "tool_choice": "auto"});
+    for lead in ["ab", "abc", "a"] {
+        let mut want = ids(&tok, &format!("sure {lead}. "));
+        want.extend(ids(&tok, CALL_OPEN));
+        let opener = want.len() - 1;
+        want.extend(cycling(b"[{'a': 1}]", 40));
+        let stepped = run(
+            &tok,
+            Some(build(&tok, QWEN, &body).expect("served")),
+            ThinkEntry::Closed,
+            &want,
+        );
+        for jump in [false, true] {
+            let label = format!("lead={lead} jump={jump}");
+            let c = build(&tok, QWEN, &body).expect("served");
+            let (o, asked) = run_passes(&tok, Some(c), ThinkEntry::Closed, &want, jump, false);
+            assert_eq!(o.content, stepped.content, "{label}");
+            assert_eq!(o.tokens, stepped.tokens, "{label}");
+            assert!(
+                asked.iter().all(|a| matches!(a, Asked::Step(_))),
+                "{label}: {asked:?}"
+            );
+            // The prompt's step and one a free-text id up to the opener's
+            // last, none reading its row.
+            assert!(
+                asked[..=opener].iter().all(|a| *a == Asked::Step(false)),
+                "{label}: {asked:?}"
+            );
+        }
+    }
+}
+
+/// An engine whose every row is `row`.
+struct Flat {
+    tok: Arc<dyn Tokenizer>,
+    row: Vec<f32>,
+}
+
+impl Engine for Flat {
+    fn tokenizer(&self) -> Arc<dyn Tokenizer> {
+        Arc::clone(&self.tok)
+    }
+    fn prefill(&mut self, _ids: &[u32]) -> Result<(), EngineError> {
+        Ok(())
+    }
+    fn next(&mut self, _last: u32, out: Option<&mut [f32]>) -> Result<u32, EngineError> {
+        if let Some(out) = out {
+            out.copy_from_slice(&self.row);
+        }
+        Ok(sampling::argmax(&self.row))
+    }
+    fn reset(&mut self) -> Result<(), EngineError> {
+        Ok(())
+    }
+    fn ctx_max(&self) -> usize {
+        4096
+    }
+    fn describe(&self) -> String {
+        "flat".to_owned()
+    }
+}
+
+/// A greedy request that changes its rows (`ignore_eos`, a `logit_bias` on the
+/// engine's pick) ties `-0.0` and `+0.0` by id, as the engine's argmax does,
+/// whether or not a watch waits in its free text: the ids are the unwatched
+/// request's. The row puts the end of generation first, then `-0.0` at the
+/// lower id and `+0.0` at the higher over a floor below zero. Mutant: the
+/// waiting watch's copy of the row keeps the zero signs, so the higher id wins
+/// the `total_cmp` tie.
+#[test]
+fn a_waiting_watch_ties_signed_zeros_as_an_unwatched_request_does() {
+    let tok = bytes_tok();
+    let (low, high) = (BYTES + u32::from(b'x'), BYTES + u32::from(b'y'));
+    let mut row = vec![-1.0; tok.n_vocab()];
+    row[tok.eos() as usize] = 1.0;
+    row[low as usize] = -0.0;
+    row[high as usize] = 0.0;
+    let body = json!({"tools": forecast_tools(), "tool_choice": "auto"});
+    let ask = |constraint: Option<Constraint>, ignore_eos: bool, bias: Vec<(u32, f32)>| {
+        let mut p = params(constraint, ThinkEntry::Closed);
+        p.n_predict = 3;
+        p.ignore_eos = ignore_eos;
+        p.logit_bias = bias;
+        let mut slot = Slot::new(Box::new(Flat {
+            tok: Arc::clone(&tok),
+            row: row.clone(),
+        }))
+        .schema_jump(false);
+        generate(
+            &mut slot,
+            &sampling::reference_factory(),
+            &tok.encode("hi"),
+            &p,
+            &mut |_| Ok(()),
+            &mut |_| {},
+            &mut Timings::default(),
+        )
+        .expect("a generation")
+    };
+    for (ignore_eos, bias) in [(true, Vec::new()), (false, vec![(tok.eos(), -5.0)])] {
+        let plain = ask(None, ignore_eos, bias.clone());
+        assert_eq!(plain.tokens, [low; 3], "ignore_eos={ignore_eos}");
+        let c = build(&tok, QWEN, &body).expect("served");
+        let watched = ask(Some(c), ignore_eos, bias);
+        assert_eq!(watched.tokens, plain.tokens, "ignore_eos={ignore_eos}");
+    }
+}
+
+/// A sampled step in a watch's free text is the unwatched request's step: the
+/// sampler draws from the engine's row (a copy only where the request
+/// changes its rows), and the program's mask of the row is built for no id
+/// while the watch waits. With the engine's rows and the sampler's seed the
+/// same, a watched request that never opens a call returns the ids an
+/// unwatched one does, whether it samples, bans the end of generation or
+/// biases an id; a call that does open is drawn through the mask.
+/// Mutant: a waiting walk draws through [`Draw::Sampled`] as a program does.
+#[test]
+fn a_waiting_watch_draws_free_text_as_an_unwatched_request_does() {
+    let tok = bytes_tok();
+    let body = json!({"tools": forecast_tools(), "tool_choice": "auto"});
+    let plain_ids = |p: &GenParams, seed: u64| scripted_in(&tok, p, seed, Vec::new(), false, 4096);
+    let mut distinct = std::collections::HashSet::new();
+    for (temperature, ignore_eos, bias) in [
+        (0.8, false, Vec::new()),
+        (0.8, true, Vec::new()),
+        (0.8, false, vec![(BYTES + u32::from(b'e'), 3.0)]),
+        (0.0, true, Vec::new()),
+        (0.0, false, vec![(tok.eos(), -9.0)]),
+    ] {
+        for seed in [1, 2, 3] {
+            let label =
+                format!("t={temperature} ignore_eos={ignore_eos} bias={bias:?} seed={seed}");
+            let mut p = params(None, ThinkEntry::Closed);
+            p.n_predict = 60;
+            p.sampling.temperature = temperature;
+            p.sampling.seed = seed;
+            p.ignore_eos = ignore_eos;
+            p.logit_bias = bias.clone();
+            let plain = plain_ids(&p, seed);
+            p.constraint = Some(build(&tok, QWEN, &body).expect("served"));
+            let before = program::masks();
+            let watched = plain_ids(&p, seed);
+            assert_eq!(program::masks(), before, "{label}: a mask while waiting");
+            assert_eq!(watched.out.tokens, plain.out.tokens, "{label}");
+            assert_eq!(watched.out.content, plain.out.content, "{label}");
+            distinct.insert((temperature.to_bits(), plain.out.tokens));
+        }
+    }
+    assert!(
+        distinct.len() > 5,
+        "the seeds draw apart: {}",
+        distinct.len()
+    );
+    // A call that opens is drawn through the mask.
+    let mut want = ids(&tok, "sure. ");
+    want.extend(ids(&tok, CALL_OPEN));
+    let peaks: Peaks = (0..want.len())
+        .map(|i| (want[..i].to_vec(), vec![(want[i], 50.0)]))
+        .collect();
+    let mut p = params(
+        Some(build(&tok, QWEN, &body).expect("served")),
+        ThinkEntry::Closed,
+    );
+    p.n_predict = 60;
+    p.sampling.temperature = 0.8;
+    p.sampling.seed = 1;
+    let before = program::masks();
+    let r = scripted_in(&tok, &p, 1, peaks, false, 4096);
+    assert!(r.out.content.starts_with("sure. "), "{}", r.out.content);
+    assert!(program::masks() > before, "the call's picks are masked");
+}
+
+/// The pieces a text opener splits into, the second carrying what follows
+/// it: the program's own newline, or a byte no call program starts with.
+const SPLIT_OPENER: [&str; 3] = ["<tool_call", ">\n", ">x"];
+
+/// A text opener split over decoded pieces opens the watch, and the text
+/// after it in the piece that ends it is the program's first: the call that
+/// follows is held to its schema. Text after the opener that the program
+/// does not start with is the named error, never free text inside a call,
+/// on a step and inside a pass alike — unless a stop word ends the request
+/// at the opener first: then it ends as a stop word ends it, the stop and
+/// the text after it left out.
+/// Mutant: the opener's suffix is refused before the stop words are read,
+/// and the stopped request fails.
+#[test]
+fn a_text_opener_split_over_pieces_opens_the_watch() {
+    let tok: Arc<dyn Tokenizer> = Arc::new(Pieces(Arc::new(PieceTok(&SPLIT_OPENER))));
+    let piece = |text: &str| PieceTok(&SPLIT_OPENER).piece(text);
+    let schema = json!({"type": "object", "properties": {
+        "edits": {"type": "array", "items": {"type": "integer"}}},
+        "required": ["edits"]});
+    let tools = json!([{"type": "function", "function": {"name": "edit", "parameters": schema}}]);
+    let body = json!({"tools": tools, "tool_choice": "auto"});
+    let mut want = ids(&tok, "sure. ");
+    want.extend([piece("<tool_call"), piece(">\n")]);
+    want.extend(cycling(b"[{'a': 1}]", 40));
+    let o = run(
+        &tok,
+        Some(build(&tok, QWEN, &body).expect("served")),
+        ThinkEntry::Closed,
+        &want,
+    );
+    let mut m = parser(QWEN, &tools).reading_specials(&*tok);
+    m.try_push(&o.content, &o.specials)
+        .and_then(|_| m.try_finish())
+        .expect("the answer parses");
+    let m = m.message();
+    assert_eq!(m.calls.len(), 1, "{}", o.content);
+    assert!(
+        serde_json::from_str::<Value>(&m.calls[0].arguments).is_ok_and(|v| v["edits"]
+            .as_array()
+            .is_some_and(|a| a.iter().all(Value::is_i64))),
+        "{}",
+        o.content
+    );
+    assert!(
+        o.content.starts_with("sure. <tool_call>\n"),
+        "{}",
+        o.content
+    );
+    let mut want = ids(&tok, "sure. ");
+    want.extend([piece("<tool_call"), piece(">x")]);
+    let p = params(
+        Some(build(&tok, QWEN, &body).expect("served")),
+        ThinkEntry::Closed,
+    );
+    let mut slot = Slot::new(Box::new(Rows {
+        tok: Arc::clone(&tok),
+        want: want.clone(),
+        k: 0,
+        read: Arc::new(Mutex::new(Vec::new())),
+    }))
+    .schema_jump(false);
+    let Err(e) = generate(
+        &mut slot,
+        &sampling::reference_factory(),
+        &tok.encode("hi"),
+        &p,
+        &mut |_| Ok(()),
+        &mut |_| {},
+        &mut Timings::default(),
+    ) else {
+        panic!("text after the opener outside the program");
+    };
+    let refused = |e: &GenError| {
+        matches!(e, GenError::Constrained(super::StepError::NoAllowed { why, .. })
+            if why.contains("after the call opener"))
+    };
+    assert!(refused(&e), "{e}");
+    let (e, _) = run_passes_with(&tok, &p, &want, false, true);
+    assert!(
+        e.as_ref().err().is_some_and(refused),
+        "a pass: {:?}",
+        e.err()
+    );
+    let mut stopped = p.clone();
+    stopped.stop = vec!["<tool_call>".to_owned()];
+    let (o, _) = run_read(&tok, &stopped, &want);
+    assert_eq!(o.stop, StopKind::Word);
+    assert_eq!(o.stopping_word, "<tool_call>");
+    assert_eq!(o.content, "sure. ");
+    let (o, asked) = run_passes_with(&tok, &stopped, &want, false, true);
+    let o = o.expect("a stop word ends a pass's request");
+    assert!(asked.contains(&Asked::Sampled), "{asked:?}");
+    assert_eq!(o.stop, StopKind::Word);
+    assert_eq!(o.content, "sure. ");
+}
+
+/// A merged opener piece enters a function-name choice: GLM's call opens on
+/// the name, and where the vocabulary's opener is text, the piece that ends
+/// it can carry the name's first characters. The watched call's names are
+/// text forks, which the text after the opener enters at any character, so
+/// the call completes with the name the model goes on to choose, on a step
+/// and inside a pass.
+/// Mutant: the names stay a choice of ids, which no text enters, and the
+/// call is refused at its opener.
+#[test]
+fn a_merged_opener_piece_enters_a_function_name() {
+    const MERGED: [&str; 2] = ["<tool_call", ">get"];
+    let tok: Arc<dyn Tokenizer> = Arc::new(Pieces(Arc::new(PieceTok(&MERGED))));
+    let piece = |text: &str| PieceTok(&MERGED).piece(text);
+    let tools = json!([
+        {"type": "function", "function": {"name": "get_weather", "parameters": {
+            "type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}},
+        {"type": "function", "function": {"name": "get_time", "parameters": {
+            "type": "object", "properties": {"zone": {"type": "integer"}}, "required": ["zone"]}}},
+    ]);
+    let body = json!({"tools": tools, "tool_choice": "auto"});
+    let mut want = ids(&tok, "sure. ");
+    want.extend([piece("<tool_call"), piece(">get")]);
+    want.extend(ids(
+        &tok,
+        "_time<arg_key>zone</arg_key><arg_value>7</arg_value></tool_call>",
+    ));
+    let stepped = run(
+        &tok,
+        Some(build(&tok, GLM, &body).expect("served")),
+        ThinkEntry::Closed,
+        &want,
+    );
+    let (drafted, _) = run_passes(
+        &tok,
+        Some(build(&tok, GLM, &body).expect("served")),
+        ThinkEntry::Closed,
+        &want,
+        false,
+        true,
+    );
+    for (arm, o) in [("step", &stepped), ("pass", &drafted)] {
+        let mut m = parser(GLM, &tools).reading_specials(&*tok);
+        m.try_push(&o.content, &o.specials)
+            .and_then(|_| m.try_finish())
+            .unwrap_or_else(|e| panic!("{arm}: {e}: {}", o.content));
+        let m = m.message();
+        assert_eq!(m.calls.len(), 1, "{arm}: {}", o.content);
+        assert_eq!(m.calls[0].name, "get_time", "{arm}: {}", o.content);
+        assert_eq!(
+            m.calls[0].arguments, r#"{"zone":7}"#,
+            "{arm}: {}",
+            o.content
+        );
+    }
+}
+
+/// An object of many optional properties none of which is required is
+/// refused by name before its alternatives are built: any of them may come
+/// first, so the alternatives grow as the square of the properties.
+#[test]
+fn an_object_of_many_optional_properties_is_refused_before_it_is_built() {
+    let tok = bytes_tok();
+    for n in [91, 4000] {
+        let props: Map<String, Value> = (0..n)
+            .map(|i| (format!("p{i}"), json!({"type": "integer"})))
+            .collect();
+        let e = build(
+            &tok,
+            ToolFormat::Hermes,
+            &schema_body(&json!({"type": "object", "properties": props})),
+        )
+        .expect_err("over the schema budget");
+        assert!(
+            e.outside_subset
+                && e.message
+                    .contains(&format!("{n} optional properties and none required")),
+            "{n}: {e}"
+        );
+    }
 }

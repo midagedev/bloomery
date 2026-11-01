@@ -43,7 +43,10 @@ use serde_json::{Map, Value, json};
 use crate::callstream::{
     self, Advance, Args, CallPiece, Progress, Reading, Streamer, find_from, held, read_value,
 };
-use crate::constrain::{Fun, Part, Refusal, Style, call, is_text, value};
+use crate::constrain::{
+    Arg, Call, CallMode, Fun, Part, Refusal, Style, any_start, call, is_text, object_parameters,
+    value,
+};
 use crate::engine::Tokenizer;
 use crate::glmxml::{self, ArgTypes, KvError, KvScan, KvSpelling};
 use crate::hermes::{self, HermesError, HermesScan};
@@ -1142,20 +1145,25 @@ fn cut_close(p: &Progress) -> Scanned {
 }
 
 impl ToolFormat {
-    /// The forced call in this format's markup: the inverse of the format's
-    /// scan, or a 501 refusal for markup no scan here reads.
-    pub(crate) fn call_parts(self, funs: &[Fun<'_>]) -> Result<Vec<Part>, Refusal> {
+    /// The call in this format's markup: the inverse of the format's scan,
+    /// or a 501 refusal for markup no scan here reads. Forced, the parts
+    /// write the call from its opener on; watched, they follow the opener a
+    /// `tool_choice: auto` reply is watched for, which the call names apart
+    /// (`None` for Muse Spark, whose recipient slot names the answer's
+    /// channels as well as a tool).
+    pub(crate) fn call_parts(self, funs: &[Fun<'_>], mode: CallMode) -> Result<Call, Refusal> {
         match self {
-            ToolFormat::Hermes => hermes::call_parts(funs),
-            ToolFormat::QwenXml(framing) => qwenxml::call_parts(framing, funs),
-            ToolFormat::KvMarkup(spelling) => glmxml::call_parts(spelling, funs),
-            ToolFormat::Dsml(spelling) => call_parts(spelling, funs),
-            ToolFormat::MuseSpark => crate::museatem::call_parts(funs),
+            ToolFormat::Hermes => hermes::call_parts(funs, mode),
+            ToolFormat::QwenXml(framing) => qwenxml::call_parts(framing, funs, mode),
+            ToolFormat::KvMarkup(spelling) => glmxml::call_parts(spelling, funs, mode),
+            ToolFormat::Dsml(spelling) => call_parts(spelling, funs, mode),
+            ToolFormat::MuseSpark => crate::museatem::call_parts(funs, mode),
             ToolFormat::Unparsed => Err(Refusal {
                 message: "the chat template's tool-call markup has no inverse in this server: \
                           send the request without tool_choice \"required\" or a named function"
                     .to_owned(),
                 unsupported: true,
+                outside_subset: false,
                 field: None,
             }),
         }
@@ -1166,26 +1174,76 @@ impl ToolFormat {
 /// inverse of [`DsmlScan`]. One `invoke` block with a `parameter` block per
 /// parameter in the schema's order, `string="true"` around a text value (raw)
 /// and `string="false"` around any other (JSON), in the template's spelling.
-pub(crate) fn call_parts(spelling: Spelling, funs: &[Fun<'_>]) -> Result<Vec<Part>, Refusal> {
+/// The opener is the tool_calls block's opening tag. Watched, the block holds
+/// one invoke after another, each held to its schema, until the model closes
+/// it (the template writes a conversation's calls in one block).
+pub(crate) fn call_parts(
+    spelling: Spelling,
+    funs: &[Fun<'_>],
+    mode: CallMode,
+) -> Result<Call, Refusal> {
     let t = spelling.tags();
-    call(
-        funs,
-        &format!("{}\n{}", t.calls_open, t.invoke_open),
-        str::to_owned,
-        |f| {
-            let mut parts = vec![Part::Text("\">\n".to_owned())];
-            for a in &f.args {
-                parts.push(Part::Text(format!(
-                    "{}{}\" string=\"{}\">",
-                    t.param_open,
-                    a.key,
-                    is_text(&a.schema)
-                )));
-                parts.extend(value(&a.schema, Style::Raw, &a.path)?);
-                parts.push(Part::Text(format!("{}\n", t.param_close)));
-            }
-            parts.push(Part::Text(format!("{}\n{}", t.invoke_close, t.calls_close)));
+    let open = format!("\n{}", t.invoke_open);
+    let close = format!("\n{}", t.calls_close);
+    let parts = match mode {
+        CallMode::Forced => call(funs, &open, str::to_owned, |f| {
+            let mut parts = body(t, f)?;
+            parts.push(Part::Text(close.clone()));
             Ok(parts)
-        },
-    )
+        })?,
+        CallMode::Watched => {
+            // The block's end after an invoke: the model closes it or opens
+            // another invoke, which ends the same way.
+            let again = Part::Rep {
+                close: vec![Part::Text(close)],
+                more: call(funs, &open, str::to_owned, |f| body(t, f))?,
+            };
+            call(funs, &open, str::to_owned, |f| {
+                let mut parts = body(t, f)?;
+                parts.push(again.clone());
+                Ok(parts)
+            })?
+        }
+    };
+    Ok(Call::opened(t.calls_open, mode, parts))
+}
+
+/// One invoke's own text, after its function's name: a `parameter` block per
+/// parameter as the object rule writes them — the required ones, in the
+/// schema's order, then the optional ones, each of which may be left out
+/// (`string="true"` around a text value, `string="false"` around any other)
+/// — the template's own empty line for a call that writes no parameter at
+/// all, and the invoke's close.
+fn body(t: &Tags, f: &Fun<'_>) -> Result<Vec<Part>, Refusal> {
+    let block = |a: &Arg<'_>| -> Result<Vec<Part>, Refusal> {
+        let mut parts = vec![Part::Text(format!(
+            "{}{}\" string=\"{}\">",
+            t.param_open,
+            a.key,
+            is_text(&a.schema)
+        ))];
+        parts.extend(value(&a.schema, Style::Raw, &a.path)?);
+        parts.push(Part::Text(format!("{}\n", t.param_close)));
+        Ok(parts)
+    };
+    let optional: Vec<&Arg<'_>> = f.args.iter().filter(|a| !a.required).collect();
+    let mut parts = vec![Part::Text("\">\n".to_owned())];
+    if !optional.is_empty() && !f.args.iter().any(|a| a.required) {
+        // No parameter is required: whichever are written come in order, and
+        // the template's own empty line where none is.
+        parts.push(any_start(
+            &optional,
+            &block,
+            "",
+            vec![Part::Text("\n".to_owned())],
+        )?);
+    } else {
+        parts.extend(object_parameters(&f.args, &block)?);
+        if f.args.is_empty() {
+            // The template's own empty line for a call of no parameters.
+            parts.push(Part::Text("\n".to_owned()));
+        }
+    }
+    parts.push(Part::Text(t.invoke_close.to_owned()));
+    Ok(parts)
 }

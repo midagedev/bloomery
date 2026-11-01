@@ -544,17 +544,287 @@ fn hw_hermes_malformed_call_is_an_api_error() {
         ),
     ] {
         let addr = start(script);
-        let r = post(addr, "/v1/chat/completions", &tool_body(false));
+        let r = post(
+            addr,
+            "/v1/chat/completions",
+            &common::unwatched(tool_body(false)),
+        );
         assert_eq!(r.status, 500, "{}", r.body);
         let m = r.json()["error"]["message"]
             .as_str()
             .unwrap_or("")
             .to_owned();
         assert!(m.starts_with(want), "{m}");
-        let r = post(addr, "/v1/chat/completions", &tool_body(true));
+        let r = post(
+            addr,
+            "/v1/chat/completions",
+            &common::unwatched(tool_body(true)),
+        );
         let e = fold_stream(&r.body).expect_err("an error event");
         assert!(e.starts_with(want), "{e}");
     }
+}
+
+/// On a drafting engine `tool_choice` auto arms its watch and keeps the
+/// engine's passes: the reply drafts, its pick reading the free text inside
+/// each pass for the call opener, and the call is held to its schema, an
+/// integer where the script writes a string. With no watch (a tool the
+/// subset cannot compile) the same script reads back as the model wrote it.
+/// Mutant: a drafting engine arms no auto watch, and `days` is the string.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_drafting_engine_keeps_its_passes_and_the_auto_watch() {
+    let script = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": \
+                  {\"location\": \"Seoul\", \"days\": \"3\"}}\n</tool_call>";
+    let addr = start_templated(
+        Box::new(ScriptedEngine::new(4096, script).drafting(4)),
+        TEMPLATE,
+    );
+    let call_of = |body: &Value| {
+        let r = post(addr, "/v1/chat/completions", body);
+        assert_eq!(r.status, 200, "{}", r.body);
+        let v = r.json();
+        assert!(
+            v["timings"]["draft_n"].as_u64().is_some_and(|n| n > 0),
+            "{}",
+            r.body
+        );
+        let call = &v["choices"][0]["message"]["tool_calls"][0]["function"];
+        assert_eq!(call["name"], "get_weather", "{}", r.body);
+        let args: Value =
+            serde_json::from_str(call["arguments"].as_str().expect("text")).expect("JSON");
+        args
+    };
+    let watched = call_of(&tool_body(false));
+    assert_eq!(watched["location"], "Seoul", "{watched}");
+    assert!(watched["days"].is_i64(), "{watched}");
+    let free = call_of(&common::unwatched(tool_body(false)));
+    assert_eq!(free, json!({"location": "Seoul", "days": "3"}), "{free}");
+}
+
+/// Before the model opens a call, an auto watch is free text: `ignore_eos` and
+/// `reasoning_budget` are served and act as on the same request with no watch
+/// ([`common::unwatched`]). `ignore_eos` puts the best other id where the
+/// script ends, in free text or inside a span the model opened, and the reply
+/// runs to its limit; the budget caps a span the model opened and one the
+/// prompt left open. A forced call starts its program at once and still
+/// refuses both by name.
+/// Mutant: the full-program check applies to a watch too, and the first two
+/// are 400s.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_an_auto_watch_keeps_ignore_eos_and_the_think_budget() {
+    let with_tools = |extra: Value| {
+        let mut b = qwen_chat(extra);
+        b["tools"] = tools();
+        b
+    };
+    let ask = |template: &str, script: &str, body: &Value| {
+        let engine = Box::new(ScriptedEngine::new(4096, script));
+        let r = post(
+            start_templated(engine, template),
+            "/v1/chat/completions",
+            body,
+        );
+        assert_eq!(r.status, 200, "{body}: {}", r.body);
+        r.json()
+    };
+    for (template, script, extra, tokens, finish) in [
+        (
+            TEMPLATE,
+            "Hi.",
+            json!({"ignore_eos": true, "max_tokens": 6}),
+            6,
+            "length",
+        ),
+        (
+            TEMPLATE,
+            "<think>abcd",
+            json!({"ignore_eos": true, "max_tokens": 12}),
+            12,
+            "length",
+        ),
+        (
+            TEMPLATE,
+            "<think>abcdefghijkl",
+            json!({"reasoning_budget": 4}),
+            15,
+            "stop",
+        ),
+        (
+            QWEN38,
+            "abcdefghijkl",
+            json!({"reasoning_budget": 4}),
+            14,
+            "stop",
+        ),
+    ] {
+        let at = extra.to_string();
+        let body = with_tools(extra);
+        let watched = ask(template, script, &body);
+        let plain = ask(template, script, &common::unwatched(body));
+        assert_eq!(
+            watched["choices"][0]["message"], plain["choices"][0]["message"],
+            "{at}: {watched}"
+        );
+        assert_eq!(watched["usage"]["completion_tokens"], json!(tokens), "{at}");
+        assert_eq!(watched["choices"][0]["finish_reason"], finish, "{at}");
+    }
+    for (extra, part) in [
+        (json!({"ignore_eos": true}), "ignore_eos is not supported"),
+        (
+            json!({"reasoning_budget": 4}),
+            "reasoning_budget is not supported",
+        ),
+    ] {
+        let mut b = with_tools(extra.clone());
+        b["tool_choice"] = json!("required");
+        let r = post(start("Hi."), "/v1/chat/completions", &b);
+        assert_eq!(r.status, 400, "{extra}: {}", r.body);
+        let m = r.json()["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .to_owned();
+        assert!(m.contains(part), "{extra}: {m}");
+    }
+}
+
+/// An auto watch keeps the free-text sampling default: a request with tools
+/// and no `temperature` reports 0.8, as the same request with no watch (a
+/// tool the subset cannot compile) does, while a forced call, which starts
+/// its program at once, defaults to 0 (greedy). A `temperature` given wins on
+/// every one.
+/// Mutant: every constraint defaults to 0, and the watched requests report 0.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_an_auto_watch_keeps_the_free_text_temperature() {
+    let addr = start("Hi.");
+    let temperature = |watched: bool, extra: Value| {
+        let mut b = json!({"prompt": "Hi", "n_predict": 1, "tools": tools()});
+        if !watched {
+            b = common::unwatched(b);
+        }
+        b.as_object_mut()
+            .expect("a body")
+            .extend(extra.as_object().expect("extra").clone());
+        let r = post(addr, "/completion", &b);
+        assert_eq!(r.status, 200, "{extra}: {}", r.body);
+        r.json()["generation_settings"]["temperature"]
+            .as_f64()
+            .expect("a temperature")
+    };
+    let free = f64::from(0.8_f32);
+    for choice in [json!({}), json!({"tool_choice": "auto"})] {
+        assert_eq!(temperature(true, choice.clone()), free, "watched {choice}");
+        assert_eq!(
+            temperature(false, choice.clone()),
+            free,
+            "unwatched {choice}"
+        );
+    }
+    assert_eq!(temperature(true, json!({"tool_choice": "required"})), 0.0);
+    for watched in [true, false] {
+        assert_eq!(
+            temperature(watched, json!({"temperature": 0.5})),
+            f64::from(0.5_f32)
+        );
+    }
+}
+
+/// Under `tool_choice` auto (given or not) a tool whose schema is invalid is a
+/// 400 naming the field, as a forced choice answers it; a valid one the
+/// structured-output subset cannot compile is served, the reply the model's.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_an_invalid_tool_schema_is_a_400_under_auto_and_an_unservable_one_is_served() {
+    let addr = start("Hi.");
+    let with = |parameters: Value| {
+        let mut b = tool_body(false);
+        b["tools"] = json!([{"type": "function", "function": {"name": "note",
+            "parameters": parameters}}]);
+        b
+    };
+    for auto in [None, Some("auto")] {
+        let mut b = with(
+            json!({"type": "object", "properties": {"a": {"type": "string"}},
+            "required": ["b"], "additionalProperties": false}),
+        );
+        if let Some(c) = auto {
+            b["tool_choice"] = json!(c);
+        }
+        let r = post(addr, "/v1/chat/completions", &b);
+        assert_eq!(r.status, 400, "{}", r.body);
+        let e = &r.json()["error"];
+        assert_eq!(e["param"], "tools", "{}", r.body);
+        assert!(
+            e["message"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("tools[0].note.parameters: required names \"b\""),
+            "{}",
+            r.body
+        );
+    }
+    // A required name no keyword supplies is valid while `additionalProperties`
+    // is absent (JSON Schema's default allows any property): served unwatched.
+    for parameters in [
+        json!({"type": "object", "properties": {"tags": {"type": "array"}}}),
+        json!({"type": "object", "required": ["x"]}),
+    ] {
+        let r = post(addr, "/v1/chat/completions", &with(parameters.clone()));
+        assert_eq!(r.status, 200, "{parameters}: {}", r.body);
+        assert_eq!(
+            r.json()["choices"][0]["message"]["content"],
+            "Hi.",
+            "{parameters}: {}",
+            r.body
+        );
+    }
+}
+
+/// An invalid tool schema is a 400 under `tool_choice` auto whatever else the
+/// request holds: beside a keyword the subset does not serve on its own node
+/// (a text completion's request), and in a tool after one the subset cannot
+/// compile. Mutant: the compiler's order decides, and the request is served
+/// unwatched with a 200.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_an_invalid_tool_schema_is_a_400_beside_an_unservable_one() {
+    let addr = start("Hi.");
+    let invalid = json!({"type": "object", "properties": {"p": {"type": "str", "pattern": "a+"}}});
+    let r = post(
+        addr,
+        "/completion",
+        &json!({"prompt": "Hi", "n_predict": 4, "temperature": 0, "tool_choice": "auto",
+            "tools": [{"type": "function", "function": {"name": "f", "parameters": invalid}}]}),
+    );
+    assert_eq!(r.status, 400, "{}", r.body);
+    let e = &r.json()["error"];
+    assert_eq!(e["param"], "tools", "{}", r.body);
+    assert!(
+        e["message"].as_str().unwrap_or("").starts_with(
+            "tools[0].f.parameters.properties.p: type \"str\" is not a JSON Schema type"
+        ),
+        "{}",
+        r.body
+    );
+    // The tool the subset cannot compile first, then the invalid one.
+    let mut b = common::unwatched(tool_body(false));
+    b["tools"]
+        .as_array_mut()
+        .expect("tools")
+        .push(json!({"type": "function", "function": {"name": "bad",
+            "parameters": {"type": "object", "properties": {"n": {"type": "integr"}}}}}));
+    let r = post(addr, "/v1/chat/completions", &b);
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert!(
+        r.json()["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("tools[3].bad.parameters.properties.n: type \"integr\""),
+        "{}",
+        r.body
+    );
 }
 
 // ---------------------------------------------------------------- the span
@@ -694,9 +964,10 @@ fn hw_a_model_that_opens_no_span_answers_in_content() {
 }
 
 /// The budget caps a model-opened span: the opening tag spends nothing, the
-/// next four ids are the reasoning, the close id is forced as the sixth taken
-/// token (the answer it displaces never appears), and the split consumes the
-/// tags — `</think>` shows in neither field.
+/// next four ids are the reasoning, and the close id is forced after them —
+/// the scripted model's script holds none of it, so the text resumes where
+/// the script stood — and the split consumes the tags: `</think>` shows in
+/// neither field.
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_the_budget_caps_a_model_opened_span() {
@@ -714,13 +985,13 @@ fn hw_the_budget_caps_a_model_opened_span() {
         m["content"].as_str().unwrap_or(""),
     );
     assert_eq!(reasoning, "abcd", "{v}");
-    assert_eq!(content, "fghijkl", "{v}");
+    assert_eq!(content, "efghijkl", "{v}");
     assert!(
         !reasoning.contains("</think>") && !content.contains("</think>"),
         "{v}"
     );
-    // The script is 13 ids and the eos: 14 taken.
-    assert_eq!(v["usage"]["completion_tokens"], json!(14), "{v}");
+    // The script is 13 ids and the eos, beside the forced close: 15 taken.
+    assert_eq!(v["usage"]["completion_tokens"], json!(15), "{v}");
     assert_eq!(v["choices"][0]["finish_reason"], json!("stop"), "{v}");
 }
 
@@ -776,6 +1047,24 @@ fn hw_a_prompt_ending_think_newline_opens_the_span() {
     assert_eq!(m["content"], "Hello!", "{v}");
 }
 
+/// A `/completion` prompt that ends in `<think>` leaves the model inside the
+/// span under a watched call too, with no budget or loop guard asked: the
+/// opener the model writes in its reasoning starts no program, the text stays
+/// as the model wrote it, and the program waits for an opener past the close.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_a_watched_completion_waits_for_the_span_its_prompt_opened() {
+    let script = "mull <tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"location\": 5}}\n</tool_call> more</think>done";
+    let addr = start(script);
+    let r = post(
+        addr,
+        "/completion",
+        &json!({"prompt": "q<think>\n", "tools": tools(), "temperature": 0, "n_predict": 200}),
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(r.json()["content"], script, "{}", r.body);
+}
+
 /// A forced call on each template the server writes: `tool_choice` `required`
 /// or a named function answers one call of the listed tools, written in that
 /// template's markup and read back by its parser, whatever the rows favour
@@ -788,9 +1077,11 @@ fn hw_a_forced_call_is_served_on_every_template() {
         {"type": "function", "function": {"name": "get_weather", "parameters": {
             "type": "object", "properties": {
                 "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]},
-                "days": {"type": "integer", "enum": [1, 2, 3]}}}}},
+                "days": {"type": "integer", "enum": [1, 2, 3]}},
+            "required": ["unit", "days"]}}},
         {"type": "function", "function": {"name": "set_flag", "parameters": {
-            "type": "object", "properties": {"on": {"type": "boolean"}}}}},
+            "type": "object", "properties": {"on": {"type": "boolean"}},
+            "required": ["on"]}}},
     ]);
     let weather = json!({"unit": "celsius", "days": 1});
     for (template, label) in [
