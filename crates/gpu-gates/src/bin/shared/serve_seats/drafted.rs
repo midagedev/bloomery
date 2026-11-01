@@ -795,6 +795,9 @@ where
             Some(spec) => {
                 print_widths(spec);
                 let next = drafted(spec, s)?;
+                if s.slots() > 1 {
+                    spec.draft_mut().draft_mut().retain_prompt(s)?;
+                }
                 print_join(spec);
                 Ok(next)
             }

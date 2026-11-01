@@ -2229,6 +2229,38 @@ impl Body38 {
         self.mtp.as_ref()
     }
 
+    /// Preserve a shared prompt arena's final hidden row in this
+    /// sequence's step arena for its next draft walk.
+    pub fn retain_prompt_row(
+        &mut self,
+        gpu: &Gpu,
+        walk: TargetRows,
+        first: usize,
+        pos: u32,
+    ) -> Result<(), GpuError> {
+        let width = geo::STREAMS * geo::HIDDEN;
+        super::mtp38::check_target_rows(
+            WHAT,
+            walk,
+            (
+                self.wrote.of(walk),
+                self.wrote.final_of(walk),
+                self.final_streams(walk).len() / width,
+            ),
+            (first, 1),
+            pos,
+        )?;
+        let cur = final_res(&self.plans);
+        let source = match walk {
+            TargetRows::Ubatch => &self.wa.res[cur],
+            TargetRows::Pass => &self.a.res[cur],
+            TargetRows::Step => return Ok(()),
+        };
+        crate::draft::retain_hidden_row(gpu.stream(), source, first, width, &mut self.s.res[cur])?;
+        self.wrote.set(TargetRows::Step, pos - 1, 1, 1);
+        Ok(())
+    }
+
     /// The streams' buffer that holds the target's hidden rows after a walk
     /// of `walk`'s arena left them final ([`TargetRows`]): the walk's current
     /// buffer flips once at each PLE layer past layer 0.

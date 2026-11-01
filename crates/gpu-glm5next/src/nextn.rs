@@ -645,6 +645,37 @@ impl Src<'_> {
     }
 }
 
+/// Preserve the shared prompt's hidden row in the sequence's step arena.
+pub fn retain_prompt_row(
+    m: &mut GpuModel<Body>,
+    walk: GlmArena,
+    first: usize,
+    pos: u32,
+) -> Result<(), GpuError> {
+    let (gpu, _, body) = m.body_parts(WHAT)?;
+    let fin = crate::program::final_streams(body.cfg.len());
+    let width = HC_STREAMS * body.dims.embd;
+    let (source, rows) = body
+        .prompt
+        .final_streams(fin)
+        .ok_or_else(|| shape("prompt-batch rows before any batch buffers".to_string()))?;
+    if walk != GlmArena::Prefill {
+        return Err(shape(format!("a shared prompt arena, got {walk:?}")));
+    }
+    body.wrote
+        .prefill
+        .check_read(WHAT, walk, rows, (first, 1), pos)?;
+    bloomery_gpu::draft::retain_hidden_row(
+        gpu.stream(),
+        source,
+        first,
+        width,
+        &mut body.s.rows[0].streams[fin],
+    )?;
+    body.wrote.step = Held::at(pos - 1, 1);
+    Ok(())
+}
+
 /// The target's rows a walk of `want.m` rows of `want.n` values from
 /// `want.pos0` reads for `want.hidden`: `None` for rows from the host, else
 /// the arena's rows from `first` on, which must hold positions `pos0 − 1 ..

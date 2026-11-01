@@ -54,6 +54,16 @@ impl MtpBody for Body38 {
         Ok(m.body(WHAT)?.mtp().map_or(0, Mtp38::held))
     }
 
+    fn retain_prompt_row(
+        m: &mut Qwen38Model,
+        walk: TargetRows,
+        first: usize,
+        pos: u32,
+    ) -> Result<(), GpuError> {
+        let (gpu, _, body) = m.body_parts(WHAT)?;
+        body.retain_prompt_row(gpu, walk, first, pos)
+    }
+
     fn prompt_with(
         m: &mut Qwen38Model,
         ids: &[u32],

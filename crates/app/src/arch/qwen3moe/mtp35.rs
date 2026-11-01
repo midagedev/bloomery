@@ -72,6 +72,20 @@ impl MtpBody for Body35 {
         }
     }
 
+    /// This body's MTP load has one resident sequence, so its shared
+    /// prompt rows never need preservation for a sequence change.
+    fn retain_prompt_row(
+        _m: &mut Qwen35moeModel,
+        _walk: MtpArena,
+        _first: usize,
+        _pos: u32,
+    ) -> Result<(), GpuError> {
+        Err(GpuError::shape(
+            "qwen35moe MtpBody",
+            "an in-file MTP load supports one resident sequence",
+        ))
+    }
+
     /// [`prompt_with35`] on [`path35`] of `ids.len()`. The stored `path` is
     /// not the schedule: the undrafted prompt chooses per length.
     fn prompt_with(

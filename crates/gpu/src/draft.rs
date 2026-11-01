@@ -9,6 +9,25 @@ use crate::GpuError;
 use crate::media::CallRows;
 use crate::model::StepMode;
 
+/// Copy one final hidden row to row 0 of a sequence-owned arena, ordered on
+/// `stream`. The caller validates the source's position record first.
+pub fn retain_hidden_row(
+    stream: &cuda_core::CudaStream,
+    source: &cuda_core::DeviceBuffer<f32>,
+    first: usize,
+    width: usize,
+    target: &mut cuda_core::DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    let byte_off = first
+        .checked_mul(width)
+        .and_then(|n| n.checked_mul(size_of::<f32>()))
+        .ok_or_else(|| GpuError::shape("draft::retain_hidden_row", "hidden row offset overflow"))?;
+    let source = crate::tensor::Window::<f32>::of(source, byte_off, width)?;
+    let mut target = crate::tensor::WindowMut::<f32>::of_mut(target, 0, width)?;
+    target.copy_from_device_async(stream, &source)?;
+    Ok(())
+}
+
 /// How a walk runs: the program's own walk, or its chain of walks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WalkMode {

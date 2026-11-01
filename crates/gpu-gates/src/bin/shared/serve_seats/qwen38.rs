@@ -134,8 +134,8 @@
 //! prompt keeps it; each run is the ubatch walk, whose bits do not depend on
 //! where a call is cut. While another slot is busy generating, a prompt call
 //! of more than `CHECKPOINT_EVERY` ids runs as calls cut at its multiples,
-//! one a round between the busy slots' rounds (`Q38::prompt_quantum`; not
-//! under the MTP draft on more than one slot nor with `--mmproj`): each cut
+//! one a round between the busy slots' rounds (`Q38::prompt_quantum`; except
+//! with `--mmproj`): each cut
 //! is one of the call's own inner marks, so the cut prompt leaves the one
 //! call's checkpoints and bits. Every prefix a request keeps less of than it
 //! shares is a `cache reuse` record with the rule.
@@ -3054,15 +3054,6 @@ impl Q38 {
         }
     }
 
-    /// Whether the MTP draft serves more than one slot. A prompt call leaves
-    /// the draft's waiting row in the ubatch arena, whose record a slot
-    /// change clears (a slot parks only the step's and the pass's rows,
-    /// [`Seq38`]), so there a prompt ends with its last id stepped, which
-    /// leaves the row in the step's arena.
-    fn drafts_slots(&self) -> bool {
-        self.drafts.mtp() && self.s.slots() > 1
-    }
-
     /// The body's closing call on or off ([`Body38::set_close`]).
     fn set_close(&mut self, on: bool) -> Result<(), GateError> {
         let (_, _, body) = self.s.model_mut().body_parts("bloomery-serve-qwen38")?;
@@ -3390,7 +3381,6 @@ impl Seat for Q38 {
     /// less that id, then its step.
     fn prefill_next(&mut self, ids: &[u32], row: Option<&mut [f32]>) -> Result<u32, GateError> {
         if self.feed == Prompt38::Step
-            || self.drafts_slots()
             || !self.s.model_mut().closes_by_ubatch(ids.len(), self.feed)?
         {
             return prefill_then_step(self, ids, row);
@@ -3415,14 +3405,12 @@ impl Seat for Q38 {
     /// checkpoints, and a part that starts or ends on the grid runs as the
     /// ubatch walk whatever its length (`Body38::resolve_prompt`), as the one
     /// call's units there do; the walk leaves each position's bits a function
-    /// of its own inputs. None under the MTP draft on more than one slot,
-    /// where the busy slots' steps between the calls would clear the draft's
-    /// waiting row ([`Q38::drafts_slots`]), and with an image encoder
-    /// ([`Seat::media_model`]): a prompt whose image lies before its last
+    /// of its own inputs. None with an image encoder ([`Seat::media_model`]):
+    /// a prompt whose image lies before its last
     /// call would close that call by the fold, where the one call runs its
     /// image and steps its last id (`SeatEngine::prefill_next`).
     fn prompt_quantum(&self) -> Option<NonZeroUsize> {
-        if self.drafts_slots() || self.media_model().is_some() {
+        if self.media_model().is_some() {
             return None;
         }
         NonZeroUsize::new(CHECKPOINT_EVERY as usize)
