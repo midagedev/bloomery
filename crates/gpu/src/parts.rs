@@ -17,7 +17,7 @@ use gguf::{GgmlType, Place, Split, TensorInfo};
 use model::part::{Part, Planned, Source, Take, read_ahead};
 use model::placement::ctx_ask::Unpaged;
 use model::placement::workstation::{HostRead, host_available_read};
-use model::placement::{CardFormat, Device, ExpertList, Format, ModelTensor, Plan, Segment};
+use model::placement::{CardFormat, Device, ExpertList, Format, ModelTensor, Plan, Role, Segment};
 
 use crate::GpuError;
 use crate::upload::UploadRing;
@@ -531,13 +531,14 @@ impl InPlace {
 /// Card `card` of `plan` as a load from a part source reads it ([`load`]): each tensor the plan
 /// holds whole on that card, in the plan's card format and resident bytes, and the card's
 /// experts of a stack the plan splits between that card, other cards (a stage card and its
-/// expert tier card) and a host that reads the stack where a located header holds it
-/// ([`InPlace`]), in the plan's slot order; a tensor the plan uses nowhere, or reads by rows from
-/// the NVMe tier (a row-gathered table, which its own reader maps where the source stores it), is
-/// skipped, as is a tensor the plan holds on the host where a located header holds it in place,
-/// which the host reads there, and a tensor or stack of which this card holds nothing, which the
-/// other cards' loads read. A source fills no host set, so a tensor the plan splits otherwise, or
-/// holds on the host but the source alone makes, is refused by name.
+/// expert tier card), a host that reads the stack where a located header holds it
+/// ([`InPlace`]) and the NVMe expert tier, whose arena fills from the same place, in the plan's
+/// slot order; a tensor the plan uses nowhere, or reads by rows from the NVMe tier (a
+/// row-gathered table, which its own reader maps where the source stores it), is skipped, as is
+/// a tensor the plan holds on the host and the NVMe tier where a located header holds it in
+/// place, which they read there, and a tensor or stack of which this card holds nothing, which
+/// the other cards' loads read. A source fills no host set, so a tensor the plan splits
+/// otherwise, or holds off the cards but the source alone makes, is refused by name.
 #[derive(Clone, PartialEq)]
 pub struct OnCard {
     held: HashMap<String, OnThisCard>,
@@ -560,21 +561,28 @@ impl OnCard {
         OnCard::of_in_place(plan, card, &InPlace::default())
     }
 
-    /// [`OnCard::of`] whose host reads the tensors `in_place` names where they are stored: a
-    /// tensor the plan holds wholly on the host is skipped when `in_place` holds it, and refused
-    /// by name otherwise; of a stack `in_place` holds that the plan splits between this card and
-    /// the host, the card takes its segment's experts ([`OnCard::take`]). A plan that pages
-    /// routed experts to the NVMe expert tier, which a part source does not serve, is refused as
-    /// short on the host ([`Unpaged`]).
+    /// [`OnCard::of`] whose host and NVMe tier read the tensors `in_place` names where they are
+    /// stored: a tensor the plan holds wholly off the cards is skipped when `in_place` holds it,
+    /// and refused by name otherwise; of a stack `in_place` holds that the plan splits between
+    /// this card and the host or the tier, the card takes its segment's experts
+    /// ([`OnCard::take`]). A plan that pages a routed stack `in_place` does not hold, which the
+    /// tier's arena could fill from nowhere the folder stores it, is refused as short on the
+    /// host ([`Unpaged`]).
     pub fn of_in_place(
         plan: &Plan<'_>,
         card: usize,
         in_place: &InPlace,
     ) -> Result<OnCard, GpuError> {
-        if let Some(paged) = Unpaged::of(plan) {
+        let model = plan.model;
+        let made = plan.rows.iter().any(|row| {
+            row.segments.iter().any(|s| s.device == Device::Nvme)
+                && model.tensors.get(row.tensor).is_some_and(|t| {
+                    t.role == Role::RoutedExperts && in_place.stack(&t.name).is_none()
+                })
+        });
+        if let Some(paged) = Unpaged::of(plan).filter(|_| made) {
             return Err(GpuError::plan(WHAT, paged));
         }
-        let model = plan.model;
         let rows = plan.rows.iter().map(|row| {
             model
                 .tensors
@@ -640,16 +648,16 @@ impl OnCard {
                 segments if elsewhere_only(segments, card) => {
                     skipped.insert(t.name.clone());
                 }
-                segments
-                    if !segments.is_empty()
-                        && segments.iter().all(|s| s.device == Device::Host) =>
-                {
+                segments if !segments.is_empty() && segments.iter().all(off_cards) => {
                     if !in_place.holds(&t.name) {
-                        return Err(elsewhere(
-                            "on Host, where the host reads only a tensor a located header holds \
-                             in place (a file run or a stack), and the part source makes this one"
-                                .to_string(),
-                        ));
+                        let on: Vec<String> =
+                            segments.iter().map(|s| format!("{:?}", s.device)).collect();
+                        return Err(elsewhere(format!(
+                            "on {}, where the host and the NVMe tier read only a tensor a \
+                             located header holds in place (a file run or a stack), and the part \
+                             source makes this one",
+                            on.join(" and ")
+                        )));
                     }
                     skipped.insert(t.name.clone());
                 }
@@ -702,23 +710,27 @@ impl OnCard {
     }
 }
 
+/// Whether `s` is on the host or the NVMe expert tier, which read an in-place stack where the
+/// located header holds it.
+fn off_cards(s: &Segment) -> bool {
+    matches!(s.device, Device::Host | Device::Nvme)
+}
+
 /// Whether `segments` put something on a card other than `card` and nothing on `card`, the rest
-/// on the host: another card's load reads its segments, and the load of a card that holds a share
-/// checks the host's ([`card_share`]).
+/// on the host or the NVMe tier: another card's load reads its segments, and the load of a card
+/// that holds a share checks the rest ([`card_share`]).
 fn elsewhere_only(segments: &[Segment], card: usize) -> bool {
     let other = |s: &Segment| matches!(s.device, Device::Card(c) if c != card);
-    segments.iter().any(other)
-        && segments
-            .iter()
-            .all(|s| other(s) || s.device == Device::Host)
+    segments.iter().any(other) && segments.iter().all(|s| other(s) || off_cards(s))
 }
 
 /// The card's share of stack `t`, whose segments are `segments`, when the plan splits it between
-/// card `card`, other cards and the host and `in_place` holds it as a stack, which the host reads
-/// where the folder stores it: one segment on the card, in a card format, holding some of the
-/// stack's experts, every other segment on another card or the host. `None` for segments of any
-/// other split, which the caller refuses by name; a card expert past the located stack's
-/// matrices, and a card segment in no card format, are refused by name.
+/// card `card`, other cards, the host and the NVMe tier and `in_place` holds it as a stack, which
+/// the host reads and the tier's arena fills from where the folder stores it: one segment on the
+/// card, in a card format, holding some of the stack's experts, every other segment on another
+/// card, the host or the tier. `None` for segments of any other split, which the caller refuses
+/// by name; a card expert past the located stack's matrices, and a card segment in no card
+/// format, are refused by name.
 fn card_share(
     t: &ModelTensor,
     segments: &[Segment],
@@ -736,8 +748,8 @@ fn card_share(
     let Some(list) = s.experts.as_ref() else {
         return Ok(None);
     };
-    let card_or_host = |s: &Segment| matches!(s.device, Device::Card(_) | Device::Host);
-    if !elsewhere.clone().all(card_or_host) || elsewhere.count() == 0 {
+    let placed = |s: &Segment| matches!(s.device, Device::Card(_)) || off_cards(s);
+    if !elsewhere.clone().all(placed) || elsewhere.count() == 0 {
         return Ok(None);
     }
     let Format::Card(format) = s.format else {
@@ -1262,16 +1274,18 @@ mod tests {
     }
 
     /// Of a stack the located header holds in place that the plan splits between the card, other
-    /// cards (plan (b′)'s stage and expert tier cards) and the host, the card takes its segment's
-    /// experts in the plan's slot order, at that segment's card format and resident bytes, the
-    /// other cards' loads take theirs and the host reads the rest where the folder stores them;
-    /// a card that holds none of the stack skips it. Refused by name: a card expert past the
-    /// located stack's matrices, a card segment in no card format, the rest on the NVMe tier,
-    /// two segments on this card, and a split of a stack the header does not hold in place (a
-    /// GGUF's, or a folder's whose part source makes it). Red against the load before the split
-    /// arm, which refused every split "on Card(0) and Host"; mutant: other cards left out of
-    /// the split arm — the stage's share of a tiered split is refused "on Card(0) and Card(1)
-    /// and Host".
+    /// cards (plan (b′)'s stage and expert tier cards), the host and the NVMe tier, the card takes
+    /// its segment's experts in the plan's slot order, at that segment's card format and resident
+    /// bytes, the other cards' loads take theirs, and the host and the tier read the rest where
+    /// the folder stores them; a card that holds none of the stack skips it, also when the host
+    /// and the tier hold all of it. Refused by name: a card expert past the located stack's
+    /// matrices, a card segment in no card format, two segments on this card, and a split of a
+    /// stack the header does not hold in place (a GGUF's, or a folder's whose part source makes
+    /// it). Red against the load before the split arm, which refused every split "on Card(0)
+    /// and Host"; mutant: other cards left out of the split arm — the stage's share of a tiered
+    /// split is refused "on Card(0) and Card(1) and Host"; FAIL-first: a share beside the tier
+    /// was refused "on Card(0) and Host and Nvme", and a stack the host and the tier hold whole
+    /// "on Host and Nvme".
     #[test]
     fn on_card_takes_its_experts_of_a_stack_split_with_the_in_place_host() {
         let name = "stack.weight";
@@ -1358,6 +1372,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(on.take(name), Ok(Take::Skip));
+        let nvme = Format::NvmeFile;
+        let paged = || {
+            vec![
+                seg(Device::Card(0), card, &[1, 4], 8),
+                seg(Device::Host, host, &[0, 2, 3], 8),
+                seg(Device::Nvme, nvme, &[5, 6, 7], 8),
+            ]
+        };
+        let on = of(&stack, paged(), &in_place(8)).unwrap();
+        let want = ExpertList::new(vec![1, 4], 8).unwrap();
+        assert_eq!(on.take(name), Ok(Take::Experts(want)));
+        let off_cards = vec![
+            seg(Device::Host, host, &[0, 1, 2, 3], 8),
+            seg(Device::Nvme, nvme, &[4, 5, 6, 7], 8),
+        ];
+        let on = of(&stack, off_cards, &in_place(8)).unwrap();
+        assert_eq!(on.take(name), Ok(Take::Skip));
         for (segments, in_place, says) in [
             (
                 split(),
@@ -1372,14 +1403,9 @@ mod tests {
                 in_place(8),
                 "on the card as host_file",
             ),
-            (
-                vec![
-                    seg(Device::Card(0), card, &[1, 4, 6], 8),
-                    seg(Device::Nvme, Format::NvmeFile, &[0, 2, 3, 5, 7], 8),
-                ],
-                in_place(8),
-                "on Card(0) and Nvme",
-            ),
+            // PIN(2026-11-01): a located stack in place on the card and the NVMe tier ("on Card(0)
+            // and Nvme") is no longer refused: the tier reads the rest where the folder stores it.
+            (paged(), InPlace::default(), "on Card(0) and Host and Nvme"),
             (
                 vec![
                     seg(Device::Card(0), card, &[1, 4], 8),
@@ -1533,8 +1559,10 @@ mod tests {
     /// A plan that pages routed experts to the NVMe expert tier is refused as short on the host,
     /// so a context or slot search reads it as a plan to fit below: the paged bytes, the host
     /// need with them on the host, and the room the plan was made at. A plan that pages none is
-    /// not. Mutants: the paged stack refused by name only (no `Unpaged` in the chain); the need
-    /// left without the paged experts, under the room.
+    /// not, nor one whose paged stacks a located header holds in place, which the tier's arena
+    /// fills from where the folder stores them. Mutants: the paged stack refused by name only
+    /// (no `Unpaged` in the chain); the need left without the paged experts, under the room;
+    /// every paged plan refused, the in-place one too.
     #[test]
     fn a_paged_plan_is_short_on_the_host() {
         use model::placement::workstation::{self, HostNeed, HostRead};
@@ -1600,5 +1628,16 @@ mod tests {
         let short = refusal.short();
         assert!(short.need > short.room, "{refusal}");
         assert_eq!(unpaged(&plan), Some(refusal.to_string()));
+        let in_place = InPlace(
+            model
+                .tensors
+                .iter()
+                .map(|t| (t.name.clone(), Held::Stack(experts as usize)))
+                .collect(),
+        );
+        assert!(
+            OnCard::of_in_place(&plan, 0, &in_place).is_ok(),
+            "a plan that pages stacks held in place"
+        );
     }
 }
