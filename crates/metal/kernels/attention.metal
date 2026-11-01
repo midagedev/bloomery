@@ -37,6 +37,16 @@
 // nearest_int(v * id) with id = 127 / amax (0 when amax is 0 or id
 // overflows).
 //
+// The prologue has two compile-time axes (BLOOMERY_ATTN_QK_NORM,
+// BLOOMERY_ATTN_PAIRS_NORM). With no head norm no norm math runs at all: no
+// sum of squares, no gain. With NORM pairs the rope turns the neighbours
+// `2i, 2i + 1` instead of the NEOX halves `i, i + ROT/2`, by the same angle
+// table; a pair never leaves a lane (a lane's dims are even), so the lane
+// reads only its own writes, no barrier orders the prologue and the pair
+// loads as one `float2`. The head norm's sum-of-squares walks the NEOX pair
+// tree, so a head norm with NORM pairs and a norm-free NEOX prologue are no
+// entry of this file.
+//
 // The score is each lane's fmas in dim order, then 31 adds across the lanes
 // (the segmented flash's xor butterfly, the one-pass flash's SIMD-group sum,
 // whichever tree the language picks for it), then the scale (exact at head
@@ -111,10 +121,19 @@ static_assert(BLOOMERY_ATTN_LANES * BLOOMERY_ATTN_LANE_DIMS == BLOOMERY_ATTN_HEA
               "a lane's values cover the head");
 static_assert(BLOOMERY_ATTN_LANE_DIMS == 8u || BLOOMERY_ATTN_LANE_DIMS == 4u,
               "a lane word is 16 or 8 bytes of halves");
+static_assert(BLOOMERY_ATTN_QK_NORM == 0u || BLOOMERY_ATTN_QK_NORM == 1u,
+              "a layer's query and key heads are normed by their gains or they are not");
+static_assert(BLOOMERY_ATTN_PAIRS_NORM == 0u || BLOOMERY_ATTN_PAIRS_NORM == 1u,
+              "the rope pairs NEOX halves or it pairs neighbours");
+static_assert(!(BLOOMERY_ATTN_QK_NORM && BLOOMERY_ATTN_PAIRS_NORM),
+              "the head norm's sum-of-squares walks the NEOX pair tree; a head norm with "
+              "neighbour pairs is no entry of this file");
+#if !BLOOMERY_ATTN_PAIRS_NORM
 static_assert(BLOOMERY_ATTN_HEAD % 64u == 0u &&
                   (BLOOMERY_ATTN_ROT / 2u <= BLOOMERY_ATTN_LANES ||
                    BLOOMERY_ATTN_ROT == BLOOMERY_ATTN_HEAD),
               "the norm's pair tree: whole warps, the turning pairs in warp 0 or every value");
+#endif
 
 // A lane's word of halves: its BLOOMERY_ATTN_LANE_DIMS values of a cache row.
 #if BLOOMERY_ATTN_LANE_DIMS == 8
@@ -302,6 +321,7 @@ static float attn_dequant(uint word, ushort scale, uint dim) {
     return float(code) * attn_half(scale);
 }
 
+#if BLOOMERY_ATTN_QK_NORM
 // Sum of squares in the append's pair tree, f32. Every lane returns the
 // same sum. `scratch` holds the head's values. The tree is the CUDA
 // append's, over HEAD/2 threads of HEAD/64 warps; one SIMD group's 32 lanes
@@ -347,10 +367,14 @@ static float attn_rms_scale(float sum, float eps) {
     }
     return scale;
 }
+#endif
 
 // Norm then rope of the head in `scratch`, into `y` (this lane's dims). The
 // gain is HEAD values and the rope row ROT. `lane` owns dims
-// lane*LANE_DIMS .. +LANE_DIMS-1.
+// lane*LANE_DIMS .. +LANE_DIMS-1. The two axes of the file's header pick
+// the variant: the norm and the NEOX pairs, or the raw values and the
+// neighbour pairs.
+#if BLOOMERY_ATTN_QK_NORM
 static void attn_norm_rope(threadgroup float *scratch,
                            device float const *gain,
                            device float const *rope_row,
@@ -389,6 +413,36 @@ static void attn_norm_rope(threadgroup float *scratch,
         }
     }
 }
+#elif BLOOMERY_ATTN_PAIRS_NORM
+// The raw values roped as neighbours: no sum of squares, no gain read and
+// no barrier, the pair `2i, 2i + 1` of the lane's own dims turned by the
+// table row's pair `i` (its values sit at `2i, 2i + 1` of the row, and `i`
+// is even here, so the row loads beside its pair). `gain` and `eps` are the
+// norm variant's and go unread.
+static void attn_norm_rope(threadgroup float *scratch,
+                           device float const *gain,
+                           device float const *rope_row,
+                           uint lane,
+                           float eps,
+                           thread float y[BLOOMERY_ATTN_LANE_DIMS]) {
+    uint dim0 = lane * BLOOMERY_ATTN_LANE_DIMS;
+    for (uint d = 0u; d < BLOOMERY_ATTN_LANE_DIMS; d += 2u) {
+        uint i = dim0 + d;
+        if (i < BLOOMERY_ATTN_ROT) {
+            float2 n = *(threadgroup float2 const *)(scratch + i);
+            float c = rope_row[i];
+            float s = rope_row[i + 1u];
+            y[d] = fma(n.x, c, -(n.y * s));
+            y[d + 1u] = fma(n.x, s, n.y * c);
+        } else {
+            y[d] = scratch[i];
+            y[d + 1u] = scratch[i + 1u];
+        }
+    }
+}
+#else
+#error "an instance with no head norm and NEOX pairs is no entry of this file"
+#endif
 
 // The lane's values of a row, converted and stored: the row's values land
 // in one pass over the group's lanes, each value the same `f32_to_f16_bits`
@@ -1185,7 +1239,14 @@ kernel void attn_norm_rope_rows(device float const *k [[buffer(0)]],
                                 device atomic_uint *faults [[buffer(7)]],
                                 uint lane [[thread_index_in_threadgroup]],
                                 uint3 group [[threadgroup_position_in_grid]]) {
+#if BLOOMERY_ATTN_PAIRS_NORM
+    // The prologue loads each pair as one word, so the scratch holds whole
+    // pairs at a `float2`'s alignment.
+    threadgroup float2 pairs[BLOOMERY_ATTN_HEAD / 2u];
+    threadgroup float *const scratch = (threadgroup float *)pairs;
+#else
     threadgroup float scratch[BLOOMERY_ATTN_HEAD];
+#endif
     F16Cache cache;
     cache.k = cache_k;
     cache.v = cache_v;
@@ -1595,7 +1656,14 @@ kernel void attn_prefill_f16(device float const *q [[buffer(0)]],
                              uint3 group [[threadgroup_position_in_grid]],
                              uint3 tpg [[threadgroups_per_grid]] ATTN_HGATE_PARAM(8)) {
     threadgroup half shared[2u * PF_TILE_HALVES];
+#if BLOOMERY_ATTN_PAIRS_NORM
+    // The prologue loads each pair as one word, so the stage holds whole
+    // pairs at a `float2`'s alignment.
+    threadgroup float2 stage[BLOOMERY_ATTN_PF_POSITIONS * BLOOMERY_ATTN_HEAD / 2u];
+    threadgroup float *const scratch = (threadgroup float *)stage;
+#else
     threadgroup float scratch[BLOOMERY_ATTN_PF_POSITIONS * BLOOMERY_ATTN_HEAD];
+#endif
     threadgroup half *tile_k = shared;
     threadgroup half *tile_v = shared + PF_TILE_HALVES;
 

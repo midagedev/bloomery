@@ -82,6 +82,10 @@ host-qwen35moe-gqa4 = []
 # (`instance::LFM3_ATTN`): 16 heads over 4 key heads of 128 values, a window a launch names and a
 # per-head output gate; the kernel gate's row of those axes.
 host-lfm3-attn = []
+# The host launch geometry is Qwen3.6's with the attention of a dense Llama
+# (`instance::LLAMA_ATTN`): 32 heads over 8 key heads of 128 values, no q/k head norm and the rope
+# pairing neighbours; the kernel gate's row of the prologue's two axes.
+host-llama-attn = []
 
 [lints]
 workspace = true

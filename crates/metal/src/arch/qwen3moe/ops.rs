@@ -85,6 +85,14 @@ fn all<T: Elem>(b: &MetalBuffer<T>) -> Result<Window<'_, T, MetalDevice>, Device
     b.window(Elems(0), b.len())
 }
 
+/// The whole of an optional buffer: the gains of a layer whose flash norms
+/// each head, `None` on one that applies no head norm.
+fn gains(
+    b: &Option<MetalBuffer<f32>>,
+) -> Result<Option<Window<'_, f32, MetalDevice>>, DeviceError> {
+    b.as_ref().map(all).transpose()
+}
+
 /// The whole of `b`, written.
 fn all_mut<T: Elem>(b: &mut MetalBuffer<T>) -> Result<WindowMut<'_, T, MetalDevice>, DeviceError> {
     let len = b.len();
@@ -548,8 +556,8 @@ impl MetalOps<'_, '_> {
             q: part(proj, &a.q)?,
             k: part(proj, &a.k)?,
             v: part(proj, &a.v)?,
-            q_gain: all(&a.q_norm)?,
-            k_gain: all(&a.k_norm)?,
+            q_gain: gains(&a.q_norm)?,
+            k_gain: gains(&a.k_norm)?,
             rope: all(rope)?,
             cache: AttnCache::F16 {
                 k: all_mut(&mut a.k_cache)?,

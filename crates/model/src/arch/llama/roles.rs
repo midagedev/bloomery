@@ -1,15 +1,19 @@
 //! The role of every tensor in a dense llama file, by exact name: the three
 //! model-level names, then the per-layer stems. There is no prefix rule and no
 //! catch-all: a name the table does not hold — an attention or FFN bias, a
-//! merged `attn_qkv`, a rope frequency table, a router — fails the file with
-//! every such name listed, because this chain would not read it. The tensors
-//! the chain does read must all be in the file, at the dims the keys give, and
-//! the head is its own matrix: the description has no tied head.
+//! merged `attn_qkv`, a router — fails the file with every such name listed,
+//! because this chain would not read it. The rope's frequency factors are the
+//! one model-level tensor beside the three: read once by the load, no step's
+//! operand ([`rope_freqs_role`]). The tensors
+//! the chain does read must all be in the file, at the dims the keys give; the
+//! head is its own matrix when the file holds `output.weight` and the token
+//! embedding when it does not (a head tied to it, which every reader of
+//! [`Role::Head`] resolves the same way — no role of this table says which).
 
 use gguf::Split;
 
 use super::hparams::Hparams;
-use crate::arch::classify::{Counts, block_stem, classify_with, model_level_role};
+use crate::arch::classify::{Counts, block_stem, classify_with, model_level_role, rope_freqs_role};
 use crate::arch::{dims_agree, names, refuse_tensor_set};
 use crate::placement::{ModelTensors, PlacementError, Role};
 
@@ -46,7 +50,7 @@ fn layer_role(stem: &str) -> Option<Role> {
 /// A tensor's role and layer by its name; `None` when the table does not
 /// hold it, or its layer is past `n_layer`.
 fn role(name: &str, n_layer: usize) -> Option<(Role, Option<usize>)> {
-    if let Some(model_level) = model_level_role(name) {
+    if let Some(model_level) = model_level_role(name).or_else(|| rope_freqs_role(name)) {
         return Some(model_level);
     }
     let (layer, stem) = block_stem(name, n_layer)?;
@@ -91,19 +95,13 @@ fn layer_dims(hp: &Hparams) -> Vec<(&'static str, Vec<u64>)> {
     ]
 }
 
-/// The head is a matrix of its own, every tensor the chain reads is in the
-/// file, a layer's q and k norms come as a pair, and every tensor has the dims
-/// the keys give it; the first tensor that is not so, by name.
+/// Every tensor the chain reads is in the file, a layer's q and k norms come
+/// as a pair, and every tensor has the dims the keys give it; the first tensor
+/// that is not so, by name. `output.weight` is not among the tensors demanded:
+/// a file without it has its head tied to the token embedding, which the
+/// readers of [`Role::Head`] resolve, so the dims check passes it by the same
+/// rule.
 fn require(split: &Split, hp: &Hparams) -> Result<(), PlacementError> {
-    let head = names::output();
-    if split.find(&head).is_none() {
-        return Err(PlacementError::Tensor {
-            name: head,
-            detail: "is not in the file; the description has no tied head, and this chain runs \
-                     the head as a matrix of its own"
-                .to_string(),
-        });
-    }
     let missing: Vec<String> = [names::token_embd(), names::output_norm()]
         .into_iter()
         .chain((0..hp.n_layer).flat_map(|l| LAYER.map(|stem| names::blk(l, stem))))
@@ -148,6 +146,7 @@ mod tests {
         );
         assert_eq!(role("output.weight", 52), Some((Role::Head, None)));
         assert_eq!(role("output_norm.weight", 52), Some((Role::Head, None)));
+        assert_eq!(role("rope_freqs.weight", 52), Some((Role::Unread, None)));
         for stem in LAYER.into_iter().chain(QK_NORM) {
             let name = format!("blk.51.{stem}");
             assert!(
@@ -172,7 +171,6 @@ mod tests {
             "blk.0.ffn_gate_inp.weight",
             "blk.0.ffn_up_exps.weight",
             "blk.0.post_attention_norm.weight",
-            "rope_freqs.weight",
             "output.bias",
         ] {
             assert_eq!(role(name, 52), None, "{name}");

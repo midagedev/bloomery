@@ -4,7 +4,7 @@
 //! architecture's strings — and the counts it reads from its own `Hparams`;
 //! the walk is common ([`classify_with`]).
 
-use gguf::Split;
+use gguf::{GgmlType, Split};
 
 use crate::arch::stems::Stem;
 use crate::placement::{ModelTensor, ModelTensors, PlacementError, Role};
@@ -44,6 +44,33 @@ pub(crate) fn model_level_role(name: &str) -> Option<(Role, Option<usize>)> {
 /// The rope's per-pair frequency factors (llama.cpp's `rope_freqs`), a model-level tensor of
 /// `rope.dimension_count / 2` values that only a family whose rope divides by them reads.
 pub(crate) const ROPE_FREQS: &str = "rope_freqs.weight";
+
+/// Whether the file carries the rope's factors: `rope_freqs.weight`, one f32 for each of the
+/// `rope_dims / 2` pairs, or none. A table of another length or type is refused by name.
+pub(crate) fn rope_factors(split: &Split, rope_dims: usize) -> Result<bool, PlacementError> {
+    let Some((_, t)) = split.find(ROPE_FREQS) else {
+        return Ok(false);
+    };
+    let pairs = [(rope_dims / 2) as u64];
+    if t.dims != pairs {
+        return Err(PlacementError::Tensor {
+            name: ROPE_FREQS.to_string(),
+            detail: format!(
+                "has dims {:?}; the rope turns {rope_dims} values of a head, {} pairs, one factor \
+                 each ({pairs:?})",
+                t.dims,
+                rope_dims / 2
+            ),
+        });
+    }
+    if t.ty != GgmlType::F32 {
+        return Err(PlacementError::Tensor {
+            name: ROPE_FREQS.to_string(),
+            detail: format!("is {}; the rope's factors are f32", t.ty),
+        });
+    }
+    Ok(true)
+}
 
 /// The role of the rope's factors for a family that reads them: [`Role::Unread`], on no layer. The
 /// load reads its few values once, by name, into the rope table the layers turn by; no step reads

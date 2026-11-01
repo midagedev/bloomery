@@ -36,7 +36,8 @@ pub fn all(table: Table) -> Vec<(&'static Mutant, Program)> {
         Table::Shaped { kept, own }
         | Table::Delta { kept, own }
         | Table::Attention { kept, own }
-        | Table::Window { kept, own } => {
+        | Table::Window { kept, own }
+        | Table::Prologue { kept, own } => {
             if let Some(name) = kept.iter().find(|name| {
                 !MUTANTS
                     .iter()
@@ -605,6 +606,49 @@ pub const WINDOW_MUTANTS: &[Mutant] = &[
         name: "rope_exponent_64",
         clause: "attn_rope_factors",
         why: "the table's exponent runs over 64 dims, not the head's 128",
+        edits: &[],
+    },
+];
+
+/// The mutants of the other tables a prologue row keeps: none. The gain
+/// launches of the other clause files refuse an instance that applies no head
+/// norm, so the row runs only the clauses of `clauses_window`'s prologue
+/// table, which [`PROLOGUE_MUTANTS`] holds the mutants of.
+pub const PROLOGUE_KEPT: &[&str] = &[];
+
+/// The defects of the no-norm, neighbour-paired prologue, each red on the
+/// clause that holds those axes. The table-side mutant
+/// (`prologue_factors_ignored`) edits no kernel text: the clause reads its
+/// name from the gate's command line and builds the defect into the launch's
+/// table, so the oracle's table stays the recipe.
+pub const PROLOGUE_MUTANTS: &[Mutant] = &[
+    Mutant {
+        name: "prologue_norm_applied",
+        clause: "attn_prologue",
+        why: "the no-norm path rescales each value by the head's RMS scale, which no value of the layer takes",
+        edits: &[(
+            "float2 n = *(threadgroup float2 const *)(scratch + i);",
+            "float sum = 0.0f;\n            for (uint j = 0u; j < BLOOMERY_ATTN_HEAD; ++j) { \\
+                sum = fma(scratch[j], scratch[j], sum); \\
+            }\n            float2 n = *(threadgroup float2 const *)(scratch + i) * \\
+                (1.0f / sqrt(sum / float(BLOOMERY_ATTN_HEAD) + eps));",
+            1,
+        )],
+    },
+    Mutant {
+        name: "prologue_pairs_neox",
+        clause: "attn_prologue",
+        why: "the pair's second value sits half a head away (the NEOX offset), not beside its first",
+        edits: &[(
+            "float2 n = *(threadgroup float2 const *)(scratch + i);",
+            "float2 n = float2(scratch[i], scratch[i + BLOOMERY_ATTN_ROT / 2u]);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "prologue_factors_ignored",
+        clause: "attn_prologue",
+        why: "the table the launch reads is built with no factors: every pair rotates",
         edits: &[],
     },
 ];

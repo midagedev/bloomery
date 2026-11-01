@@ -15,8 +15,8 @@ use bloomery_metal::kernels::{
 
 use super::clauses_attention::{
     CTX, CacheBack, KIND_K, KIND_Q, KIND_V, Scene, Tables, Uploaded, cache_of_for, dequant_k_for,
-    dequant_v_for, gate_of, head_row_for, load_tables_for, plant_f16_for, read_cache, take_qg_for,
-    u, upload_cache,
+    dequant_v_for, gain_of, gate_of, head_row_for, load_tables_for, plant_f16_for, read_cache,
+    take_qg_for, u, upload_cache,
 };
 use super::clauses_delta::{Fixed, KEY_HEADS, Params, draw, fixed};
 use super::clauses_router;
@@ -833,8 +833,8 @@ fn attn_rows_run(
                 k_stride: kv_n,
                 v: b.v.window(Elems(0), Elems(inp.v.len()))?,
                 v_stride: kv_n,
-                q_gain: b.q_gain.window(Elems(0), Elems(attn.head))?,
-                k_gain: b.k_gain.window(Elems(0), Elems(attn.head))?,
+                q_gain: gain_of(attn, &b.q_gain, 0)?,
+                k_gain: gain_of(attn, &b.k_gain, 0)?,
                 rope: b.rope.window(Elems(0), Elems(ctx * attn.rot))?,
                 cache: cache_of_for(attn, &mut b.cache, ctx)?,
                 partials: b
@@ -886,8 +886,8 @@ fn attn_stepped_run(
                     q: b.q.window(Elems(r * q_n), Elems(q_n))?,
                     k: b.k.window(Elems(r * kv_n), Elems(kv_n))?,
                     v: b.v.window(Elems(r * kv_n), Elems(kv_n))?,
-                    q_gain: b.q_gain.window(Elems(0), Elems(attn.head))?,
-                    k_gain: b.k_gain.window(Elems(0), Elems(attn.head))?,
+                    q_gain: gain_of(attn, &b.q_gain, 0)?,
+                    k_gain: gain_of(attn, &b.k_gain, 0)?,
                     rope: b.rope.window(Elems(0), Elems(CTX * attn.rot))?,
                     cache: cache_of_for(attn, &mut b.cache, CTX)?,
                     partials: b
@@ -1051,8 +1051,8 @@ fn attn_prefill_run(
                 k_stride: kv_n,
                 v: b.v.window(Elems(0), Elems(inp.v.len()))?,
                 v_stride: kv_n,
-                q_gain: b.q_gain.window(Elems(0), Elems(attn.head))?,
-                k_gain: b.k_gain.window(Elems(0), Elems(attn.head))?,
+                q_gain: gain_of(attn, &b.q_gain, 0)?,
+                k_gain: gain_of(attn, &b.k_gain, 0)?,
                 rope: b.rope.window(Elems(0), Elems(ctx * attn.rot))?,
                 cache: cache_of_for(attn, &mut b.cache, ctx)?,
                 out: b.out.window_mut(Elems(0), Elems(case.rows * out_n))?,
@@ -1857,8 +1857,8 @@ fn attn_ref_launch(
                 k_stride: kv_n,
                 v: b.v.window(Elems(0), Elems(REF_ROWS * kv_n))?,
                 v_stride: kv_n,
-                q_gain: b.q_gain.window(Elems(0), Elems(attn.head))?,
-                k_gain: b.k_gain.window(Elems(0), Elems(attn.head))?,
+                q_gain: gain_of(attn, &b.q_gain, 0)?,
+                k_gain: gain_of(attn, &b.k_gain, 0)?,
                 rope: b.rope.window(Elems(0), Elems(CTX * attn.rot))?,
                 cache,
                 out: b.out.window_mut(Elems(0), Elems(o.out_len))?,
@@ -1885,8 +1885,8 @@ fn attn_ref_launch(
             k_stride: kv_n,
             v: b.v.window(Elems(0), Elems(REF_ROWS * kv_n))?,
             v_stride: kv_n,
-            q_gain: b.q_gain.window(Elems(0), Elems(attn.head))?,
-            k_gain: b.k_gain.window(Elems(0), Elems(attn.head))?,
+            q_gain: gain_of(attn, &b.q_gain, 0)?,
+            k_gain: gain_of(attn, &b.k_gain, 0)?,
             rope: b.rope.window(Elems(0), Elems(CTX * attn.rot))?,
             cache,
             partials: b.partials.window_mut(Elems(0), Elems(o.partials_len))?,

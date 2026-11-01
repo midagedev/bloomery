@@ -16,7 +16,8 @@
 //! weight 1 ([`FfnRoute::Dense`]): the routed FFN's launches without the
 //! router. A dense Llama's layers are [`MixerPlan::Gqa`] at head 128 turned
 //! by NORM pairs with no head norm ([`GqaKind::Head128`]), each followed by
-//! the same dense FFN. LFM3 interleaves [`MixerPlan::ShortConv`] (a gated
+//! the same dense FFN; its rope may divide by the file's frequency factors
+//! ([`GqaPlan::rope_freqs`]). LFM3 interleaves [`MixerPlan::ShortConv`] (a gated
 //! short conv over its own conv ring) with attention of head 128 that has an
 //! output gate of one value a head ([`GqaKind::HeadGate128`]), a window on
 //! some layers and the file's rope frequency factors on the others, each
@@ -94,6 +95,8 @@ pub enum GqaKind {
     /// A head of 128 values with no output gate and no key selection, the
     /// whole head turned by `pairs`: the q/k norm before the rope when
     /// `head_norm`, none otherwise. [`GqaKind::Neox128`] is `{ Neox, true }`.
+    /// A layer's rope may divide by the file's frequency factors
+    /// ([`GqaKind::rope_factors`]); it attends every position.
     Head128 { pairs: Pairs, head_norm: bool },
     /// LFM3: a head of 128 values, the whole head turned by NEOX, the q/k norm before the
     /// rope, and an output gate of its own: `attn_gate` projects the layer input to one value
@@ -121,6 +124,25 @@ impl GqaKind {
     pub fn head_gate(self) -> bool {
         matches!(self, GqaKind::HeadGate128)
     }
+
+    /// Whether a layer of the kind may have a rope that divides by the file's frequency factors
+    /// (the class table's row): the description says which layers do
+    /// ([`GqaPlan::rope_freqs`]).
+    #[must_use]
+    pub fn rope_factors(self) -> bool {
+        Self::CLASSES
+            .iter()
+            .any(|c| c.kind == self && c.rope_factors)
+    }
+
+    /// Which values of a head the kind's rope turns together.
+    #[must_use]
+    pub fn pairs(self) -> Pairs {
+        match self {
+            GqaKind::Neox128 | GqaKind::Gated256 | GqaKind::HeadGate128 => Pairs::Neox,
+            GqaKind::Head128 { pairs, .. } => pairs,
+        }
+    }
 }
 
 /// Which values of a head a rope turns together.
@@ -135,7 +157,8 @@ pub enum Pairs {
 impl GqaKind {
     /// Every class with the geometry that selects it: a head's width, the
     /// values of it the rope turns and how it pairs them, the head norm, and
-    /// where the output gate comes from.
+    /// where the output gate comes from; and what a layer of the class keeps
+    /// of its own: a window, rope factors.
     const CLASSES: [Class; 4] = [
         Class {
             kind: GqaKind::Neox128,
@@ -144,6 +167,8 @@ impl GqaKind {
             pairs: Pairs::Neox,
             head_norm: true,
             gate: OutGate::None,
+            window: false,
+            rope_factors: false,
         },
         Class {
             kind: GqaKind::Head128 {
@@ -155,6 +180,8 @@ impl GqaKind {
             pairs: Pairs::Norm,
             head_norm: false,
             gate: OutGate::None,
+            window: false,
+            rope_factors: true,
         },
         Class {
             kind: GqaKind::Gated256,
@@ -163,6 +190,8 @@ impl GqaKind {
             pairs: Pairs::Neox,
             head_norm: true,
             gate: OutGate::Packed,
+            window: false,
+            rope_factors: false,
         },
         Class {
             kind: GqaKind::HeadGate128,
@@ -171,6 +200,8 @@ impl GqaKind {
             pairs: Pairs::Neox,
             head_norm: true,
             gate: OutGate::ProjHead,
+            window: true,
+            rope_factors: true,
         },
     ];
 }
@@ -188,6 +219,12 @@ struct Class {
     head_norm: bool,
     /// Where the output gate comes from.
     gate: OutGate,
+    /// Whether a layer of the class may attend a window of the positions, which the description
+    /// says per layer.
+    window: bool,
+    /// Whether a layer of the class may divide its rope's pair frequencies by the file's
+    /// factors, which the description says per layer.
+    rope_factors: bool,
 }
 
 /// How the head-256 flash entries cover a key head's group of query heads:
@@ -553,14 +590,35 @@ fn card_fits(s: &LayerSpec) -> Result<(), String> {
             q35::HEAD_DIM
         ));
     }
-    if let Mixer::Gqa(g) = &s.mixer
-        && !CARD_KINDS.contains(&gqa_class(g)?)
-    {
-        return Err(format!(
-            "attention {g:?}; the card's kernels take the gated attention of heads of {} or \
-             heads of {HEAD_128} turned by NORM pairs with no head norm",
-            q35::HEAD_DIM
-        ));
+    if let Mixer::Gqa(g) = &s.mixer {
+        let kind = gqa_class(g)?;
+        if !CARD_KINDS.contains(&kind) {
+            return Err(format!(
+                "attention {g:?}; the card's kernels take the gated attention of heads of {} or \
+                 heads of {HEAD_128} turned by NORM pairs with no head norm",
+                q35::HEAD_DIM
+            ));
+        }
+        // The class table lets a layer keep what its description says (a window, rope factors),
+        // and the card's launches cut no window and divide by no factors.
+        if g.window.is_some() || g.rope.factors {
+            return Err(format!(
+                "attention {g:?}; the card's kernels attend every position and turn the rope by \
+                 its base alone"
+            ));
+        }
+        // The head-128 group of four is the head-gated window flash's block, which the card's
+        // launch lists do not hold for this class: its head-128 flash covers a group of eight
+        // or of seven.
+        if matches!(kind, GqaKind::Head128 { .. })
+            && select_gqa(AttnShape::of(g)).is_ok_and(|row| row.pack == 4)
+        {
+            return Err(format!(
+                "attention {}/{} heads of {HEAD_128}; the card's head-128 flash covers a group of \
+                 eight or of seven",
+                g.heads, g.kv_heads
+            ));
+        }
     }
     if let Ffn::Moe(m) = &s.ffn {
         card_router(m)?;
@@ -576,14 +634,13 @@ pub const HEAD_128: u32 = 128;
 /// table's row ([`GqaKind::CLASSES`]) of its head width, the values the rope
 /// turns, how it pairs them, its head norm and its output gate, with no yarn, output norm,
 /// key selection, sinks or value scale, and a window or rope factors only where the class
-/// keeps them per layer ([`GqaKind::head_gate`]).
+/// keeps them per layer (the row's `window` and `rope_factors`).
 pub(crate) fn gqa_class(g: &Gqa) -> Result<GqaKind, String> {
     let plain = g.rope.yarn.is_none()
         && !g.o_norm
         && g.select.is_none()
         && !g.sinks
         && g.value_scale.is_none();
-    let fixed = g.window.is_none() && !g.rope.factors;
     let pairs = if turns_as_neox(g.rope.mode, g.rope.dims) {
         Some(Pairs::Neox)
     } else if g.rope.mode == RopeMode::NormTail {
@@ -600,9 +657,9 @@ pub(crate) fn gqa_class(g: &Gqa) -> Result<GqaKind, String> {
                 && g.qk_norm == c.head_norm
                 && g.out_gate == c.gate
         })
-        .map(|c| c.kind);
+        .filter(|c| (g.window.is_none() || c.window) && (!g.rope.factors || c.rope_factors));
     match class {
-        Some(kind) if plain && (kind.head_gate() || fixed) => Ok(kind),
+        Some(c) if plain => Ok(c.kind),
         _ => {
             let classes: Vec<String> = GqaKind::CLASSES
                 .iter()
@@ -616,8 +673,9 @@ pub(crate) fn gqa_class(g: &Gqa) -> Result<GqaKind, String> {
                 .collect();
             Err(format!(
                 "attention {g:?}; the kernels take {} (NEOX by IMROPE sections covering them), \
-                 with no yarn, output norm, key selection, sinks or value scale, and a window or \
-                 rope factors only on the head with an output gate of its own",
+                 with no yarn, output norm, key selection, sinks or value scale, a window only on \
+                 the head with an output gate of its own, and rope factors only there and on the \
+                 head-128 NORM attention with no head norm",
                 classes.join(" or ")
             ))
         }
@@ -638,8 +696,9 @@ pub(crate) fn layer_gqa(s: &LayerSpec) -> Result<(&Gqa, GqaKind), String> {
 
 /// The class and the flash of `g` when it is an attention the kernels run:
 /// the shape table's row for its group ([`select_gqa`]), one of eight, of
-/// quads or pairs, the head-128 group of seven, or the head-gated head-128
-/// group of four.
+/// quads or pairs, the head-128 group of seven, or the head-128 group of four
+/// (with an output gate of its own or none): [`Flash::Group`] names the one
+/// block of a key head's group the row's pack makes.
 fn gqa_fits(g: &Gqa) -> Result<(GqaKind, Flash), String> {
     let kind = gqa_class(g)?;
     let row = select_gqa(AttnShape::of(g)).map_err(|e| e.to_string())?;
@@ -648,7 +707,7 @@ fn gqa_fits(g: &Gqa) -> Result<(GqaKind, Flash), String> {
         (_, 4, GroupRule::Packs) => Flash::Quads,
         (_, 2, GroupRule::Packs) => Flash::Pairs,
         (GqaKind::Head128 { .. }, 7, GroupRule::One) => Flash::Seven,
-        (GqaKind::HeadGate128, 4, GroupRule::One) => Flash::Group,
+        (GqaKind::HeadGate128 | GqaKind::Head128 { .. }, 4, GroupRule::One) => Flash::Group,
         _ => {
             return Err(format!(
                 "attention {}/{} heads of {} selects {}, which this body does not launch",
@@ -913,6 +972,44 @@ pub(crate) mod fixtures {
         }
     }
 
+    /// A head-128 attention turned by NORM pairs, with no head norm and no output gate, at
+    /// `heads`/`kv_heads`; its rope divides by the file's factors when `factors`.
+    pub fn head128_gqa(heads: u32, kv_heads: u32, factors: bool) -> Gqa {
+        Gqa {
+            heads,
+            kv_heads,
+            head_dim: 128,
+            value_dim: 128,
+            rope: Rope {
+                mode: RopeMode::NormTail,
+                dims: 128,
+                base: 5e5,
+                yarn: None,
+                factors,
+            },
+            qk_norm: false,
+            o_norm: false,
+            out_gate: OutGate::None,
+            select: None,
+            window: None,
+            sinks: false,
+            value_scale: None,
+        }
+    }
+
+    /// A layer of `mixer` over a dense SwiGLU FFN of 512 and the plain residual.
+    pub fn dense_layer(mixer: Mixer) -> LayerSpec {
+        LayerSpec {
+            mixer,
+            ffn: Ffn::Dense {
+                ff: 512,
+                act: Act::SwiGlu { limit: None },
+            },
+            residual: Residual::Plain,
+            extras: Vec::new(),
+        }
+    }
+
     /// LFM3's short conv of `taps` taps.
     pub fn lfm3_conv(taps: u32) -> Mixer {
         Mixer::ShortConv(ShortConv { taps })
@@ -961,7 +1058,8 @@ pub(crate) mod fixtures {
 #[cfg(test)]
 mod tests {
     use super::fixtures::{
-        delta, gqa, gqa_of, layer, lfm3_conv, lfm3_gqa, lfm3_layer, q30_gqa, q30_layer,
+        delta, dense_layer, gqa, gqa_of, head128_gqa, layer, lfm3_conv, lfm3_gqa, lfm3_layer,
+        q30_gqa, q30_layer,
     };
     use super::{
         Flash, GqaKind, Kind35, Pairs, gqa_class, kind_of, kind35, kinds_of, kinds35, moe_fits,
@@ -1379,5 +1477,113 @@ mod tests {
                 Ok(k) => panic!("{what}: the card accepted {k:?}"),
             }
         }
+    }
+    /// The head-128 NORM attention keeps what its description says of its rope, and a group of
+    /// four: the chain reads a layer whose rope divides by the file's factors and the group of
+    /// four (32 query heads over 8 key heads) as it reads the group of eight and of seven, one
+    /// block of the key head's group, and the card, whose launches cut no window, divide by no
+    /// factors and cover the head-128 groups of eight and seven, refuses each by name with the
+    /// layer; a layer with neither is the card's as before. A window and a NEOX turn with no head
+    /// norm stay no class. Mutants (each red at its line): the class row's `rope_factors` false
+    /// (the chain's), `gqa_fits` without the group-of-four arm (the chain's), `card_fits` without
+    /// its factors check or without its group-of-four check (the card's).
+    #[test]
+    fn a_head_128_norm_attention_reads_rope_factors_and_a_group_of_four_the_card_refuses() {
+        let norm = GqaKind::Head128 {
+            pairs: Pairs::Norm,
+            head_norm: false,
+        };
+        let layer_of = |heads: u32, kv_heads: u32, factors: bool| {
+            dense_layer(Mixer::Gqa(head128_gqa(heads, kv_heads, factors)))
+        };
+        // The group of four is 32 query heads over 8 key heads.
+        for (heads, kv_heads, factors, flash) in [
+            (32, 8, false, Flash::Group),
+            (32, 8, true, Flash::Group),
+            (64, 8, true, Flash::Group),
+            (56, 8, true, Flash::Seven),
+        ] {
+            let got = kind_of(&layer_of(heads, kv_heads, factors), 0)
+                .unwrap_or_else(|e| panic!("{heads}/{kv_heads} {factors}: {e}"));
+            assert_eq!(
+                got,
+                Kind35::Gqa(norm, flash),
+                "{heads}/{kv_heads} {factors}"
+            );
+        }
+        for (what, l, text) in [
+            (
+                "a group of four",
+                layer_of(32, 8, false),
+                "eight or of seven",
+            ),
+            (
+                "a group of four with factors",
+                layer_of(32, 8, true),
+                "attend every position",
+            ),
+            (
+                "factors at a group of eight",
+                layer_of(64, 8, true),
+                "attend every position",
+            ),
+            (
+                "factors at a group of seven",
+                layer_of(56, 8, true),
+                "attend every position",
+            ),
+        ] {
+            match kind35(&l, 3) {
+                Err(e) => {
+                    let e = e.to_string();
+                    assert!(e.contains("layer 3:") && e.contains(text), "{what}: {e}");
+                }
+                Ok(k) => panic!("{what}: the card accepted {k:?}"),
+            }
+        }
+        for (heads, kv_heads, flash) in [(64, 8, Flash::Group), (56, 8, Flash::Seven)] {
+            let got =
+                kind35(&layer_of(heads, kv_heads, false), 0).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(got, Kind35::Gqa(norm, flash), "{heads}/{kv_heads}");
+        }
+        let mut windowed = head128_gqa(64, 8, false);
+        windowed.window = Some(1024);
+        let mut neox = head128_gqa(64, 8, false);
+        neox.rope.mode = RopeMode::Neox;
+        for (what, g) in [
+            ("a window", windowed),
+            ("NEOX pairs with no head norm", neox),
+        ] {
+            match kind_of(&dense_layer(Mixer::Gqa(g)), 2) {
+                Err(e) => assert!(e.to_string().contains("layer 2:"), "{what}: {e}"),
+                Ok(k) => panic!("{what} accepted: {k:?}"),
+            }
+        }
+    }
+
+    /// What a kind keeps per layer is its class row's: rope factors on the head-128 NORM attention
+    /// and on the head with a gate of its own and on no other, and the pairing a kind reports is the
+    /// row's. Mutant: a kind's `pairs` arm that disagrees with its row.
+    #[test]
+    fn a_kind_reports_the_rope_its_class_row_says() {
+        for class in &GqaKind::CLASSES {
+            assert_eq!(class.kind.pairs(), class.pairs, "{:?}", class.kind);
+            assert_eq!(
+                class.kind.rope_factors(),
+                matches!(class.kind, GqaKind::HeadGate128 | GqaKind::Head128 { .. }),
+                "{:?}",
+                class.kind
+            );
+            assert_eq!(class.kind.head_norm(), class.head_norm, "{:?}", class.kind);
+            assert_eq!(class.window, class.kind.head_gate(), "{:?}", class.kind);
+        }
+        let neox_bare = GqaKind::Head128 {
+            pairs: Pairs::Neox,
+            head_norm: false,
+        };
+        assert!(
+            !neox_bare.rope_factors(),
+            "a kind no class row holds keeps none"
+        );
     }
 }

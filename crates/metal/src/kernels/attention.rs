@@ -29,7 +29,10 @@
 //! window the layer attends (the last `window` of its live keys; a layer with
 //! none attends every key) and, for an instance whose output gate is one value
 //! a query head, the gate's window. The launches without a layer argument
-//! launch [`AttnLayer::full`]. The keys of a windowed layer are the last
+//! launch [`AttnLayer::full`]. What differs instance to instance is whether
+//! the flash norms each query and key head ([`AttnGeom::qk_norm`]): one that
+//! does reads the q and k gains its launches bind, and one that does not
+//! binds no gain at all. The keys of a windowed layer are the last
 //! `window` of the live ones, so its split-K segments are those of
 //! [`segments_for_window`]: a segment holding no key of the window is never
 //! launched, and one a caller counts anyway is empty and skipped by the fold.
@@ -134,10 +137,12 @@ pub struct AttentionParams<'w> {
     pub k: Window<'w, f32, MetalDevice>,
     /// Values, one raw row per key head.
     pub v: Window<'w, f32, MetalDevice>,
-    /// Query RMS gain, one value per head value.
-    pub q_gain: Window<'w, f32, MetalDevice>,
-    /// Key RMS gain, one value per head value.
-    pub k_gain: Window<'w, f32, MetalDevice>,
+    /// Query RMS gain, one value per head value. Held exactly when the
+    /// instance's flash norms each head ([`AttnGeom::qk_norm`]); a no-norm
+    /// flash reads no gain and binds none.
+    pub q_gain: Option<Window<'w, f32, MetalDevice>>,
+    /// Key RMS gain, one value per head value, as `q_gain`.
+    pub k_gain: Option<Window<'w, f32, MetalDevice>>,
     /// Rope table, `ctx` rows of `AttnGeom::rot` interleaved `(cos, sin)`
     /// pairs.
     pub rope: Window<'w, f32, MetalDevice>,
@@ -288,6 +293,30 @@ fn refuse(detail: String) -> DeviceError {
     }
 }
 
+/// One RMS gain window of a launch, refused by name when the instance and
+/// the launch disagree about the head norm: a window where the flash applies
+/// none, or none where it norms each head, or one of another length than the
+/// head's values.
+fn check_gain(
+    what: &'static str,
+    g: &AttnGeom,
+    gain: &Option<Window<'_, f32, MetalDevice>>,
+    name: &str,
+) -> Result<(), DeviceError> {
+    match (gain, g.qk_norm) {
+        (Some(w), true) => check_window_len(what, name, w.len(), g.head),
+        (None, true) => Err(refuse_in(
+            what,
+            format!("the flash norms each head, the launch holds no {name} window"),
+        )),
+        (Some(_), false) => Err(refuse_in(
+            what,
+            format!("a {name} window, the flash applies no head norm"),
+        )),
+        (None, false) => Ok(()),
+    }
+}
+
 /// The window word `layer` launches, refused by name when the instance cannot
 /// take the layer: a window its flash row does not cut or of no keys, a
 /// per-head gate window the instance has none for, or none where it gates per
@@ -435,8 +464,8 @@ fn checked(
     check_window_len("attention", "q", p.q.len(), q_len)?;
     check_window_len("attention", "k", p.k.len(), kv_len)?;
     check_window_len("attention", "v", p.v.len(), kv_len)?;
-    check_window_len("attention", "q gain", p.q_gain.len(), g.head)?;
-    check_window_len("attention", "k gain", p.k_gain.len(), g.head)?;
+    check_gain("attention", g, &p.q_gain, "q gain")?;
+    check_gain("attention", g, &p.k_gain, "k gain")?;
     check_window_len("attention", "rope", p.rope.len(), rope_len)?;
     check_window_len("attention", "partials", p.partials.len(), partials)?;
     check_window_len("attention", "out", p.out.len(), out)?;
@@ -508,8 +537,12 @@ fn bind_flash(
     encoder.set_binding(0, Binding::of(&p.q)?)?;
     encoder.set_binding(1, Binding::of(&p.k)?)?;
     encoder.set_binding(2, Binding::of(&p.v)?)?;
-    encoder.set_binding(3, Binding::of(&p.q_gain)?)?;
-    encoder.set_binding(4, Binding::of(&p.k_gain)?)?;
+    if let Some(gain) = &p.q_gain {
+        encoder.set_binding(3, Binding::of(gain)?)?;
+    }
+    if let Some(gain) = &p.k_gain {
+        encoder.set_binding(4, Binding::of(gain)?)?;
+    }
     encoder.set_binding(5, Binding::of(&p.rope)?)?;
     match &p.cache {
         AttnCache::F16 { k, v } => {
@@ -643,10 +676,12 @@ pub struct AttentionRowsParams<'w> {
     pub v: Window<'w, f32, MetalDevice>,
     /// Elements between rows of `v`.
     pub v_stride: usize,
-    /// Query RMS gain, one value per head value.
-    pub q_gain: Window<'w, f32, MetalDevice>,
-    /// Key RMS gain, one value per head value.
-    pub k_gain: Window<'w, f32, MetalDevice>,
+    /// Query RMS gain, one value per head value. Held exactly when the
+    /// instance's flash norms each head ([`AttnGeom::qk_norm`]); a no-norm
+    /// flash reads no gain and binds none.
+    pub q_gain: Option<Window<'w, f32, MetalDevice>>,
+    /// Key RMS gain, one value per head value, as `q_gain`.
+    pub k_gain: Option<Window<'w, f32, MetalDevice>>,
     /// Rope table, `ctx` rows of `AttnGeom::rot` interleaved `(cos, sin)`
     /// pairs.
     pub rope: Window<'w, f32, MetalDevice>,
@@ -691,8 +726,8 @@ struct ChunkView<'a, 'w> {
     k_stride: usize,
     v: &'a Window<'w, f32, MetalDevice>,
     v_stride: usize,
-    q_gain: &'a Window<'w, f32, MetalDevice>,
-    k_gain: &'a Window<'w, f32, MetalDevice>,
+    q_gain: &'a Option<Window<'w, f32, MetalDevice>>,
+    k_gain: &'a Option<Window<'w, f32, MetalDevice>>,
     rope: &'a Window<'w, f32, MetalDevice>,
     cache: &'a AttnCache<'w>,
     out: &'a WindowMut<'w, f32, MetalDevice>,
@@ -785,8 +820,8 @@ fn check_chunk(g: &AttnGeom, c: &ChunkView<'_, '_>) -> Result<(), DeviceError> {
     check_strided(what, "k", c.k.len(), c.rows, c.k_stride, kv_len)?;
     check_strided(what, "v", c.v.len(), c.rows, c.v_stride, kv_len)?;
     check_strided(what, "out", c.out.len(), c.rows, c.out_stride, out)?;
-    check_window_len(what, "q gain", c.q_gain.len(), g.head)?;
-    check_window_len(what, "k gain", c.k_gain.len(), g.head)?;
+    check_gain(what, g, c.q_gain, "q gain")?;
+    check_gain(what, g, c.k_gain, "k gain")?;
     check_window_len(what, "rope", c.rope.len(), rope_len)?;
     match c.cache {
         AttnCache::F16 { k, v } => {
@@ -928,10 +963,12 @@ pub struct AttentionPrefillParams<'w> {
     pub v: Window<'w, f32, MetalDevice>,
     /// Elements between rows of `v`.
     pub v_stride: usize,
-    /// Query RMS gain, one value per head value.
-    pub q_gain: Window<'w, f32, MetalDevice>,
-    /// Key RMS gain, one value per head value.
-    pub k_gain: Window<'w, f32, MetalDevice>,
+    /// Query RMS gain, one value per head value. Held exactly when the
+    /// instance's flash norms each head ([`AttnGeom::qk_norm`]); a no-norm
+    /// flash reads no gain and binds none.
+    pub q_gain: Option<Window<'w, f32, MetalDevice>>,
+    /// Key RMS gain, one value per head value, as `q_gain`.
+    pub k_gain: Option<Window<'w, f32, MetalDevice>>,
     /// Rope table, `ctx` rows of `AttnGeom::rot` interleaved `(cos, sin)`
     /// pairs.
     pub rope: Window<'w, f32, MetalDevice>,
@@ -1018,7 +1055,9 @@ impl Kernels {
         encoder.set_pipeline(&self.attention.append_rows);
         encoder.set_binding(0, Binding::of(&p.k)?)?;
         encoder.set_binding(1, Binding::of(&p.v)?)?;
-        encoder.set_binding(2, Binding::of(&p.k_gain)?)?;
+        if let Some(gain) = &p.k_gain {
+            encoder.set_binding(2, Binding::of(gain)?)?;
+        }
         encoder.set_binding(3, Binding::of(&p.rope)?)?;
         encoder.set_binding(4, Binding::of_mut(cache_k)?)?;
         encoder.set_binding(5, Binding::of_mut(cache_v)?)?;
@@ -1039,7 +1078,9 @@ impl Kernels {
         };
         encoder.set_pipeline(pipeline);
         encoder.set_binding(0, Binding::of(&p.q)?)?;
-        encoder.set_binding(1, Binding::of(&p.q_gain)?)?;
+        if let Some(gain) = &p.q_gain {
+            encoder.set_binding(1, Binding::of(gain)?)?;
+        }
         encoder.set_binding(2, Binding::of(&p.rope)?)?;
         encoder.set_binding(3, Binding::of_mut(cache_k)?)?;
         encoder.set_binding(4, Binding::of_mut(cache_v)?)?;
@@ -1103,7 +1144,9 @@ impl Kernels {
         encoder.set_pipeline(&self.attention.append_rows);
         encoder.set_binding(0, Binding::of(&p.k)?)?;
         encoder.set_binding(1, Binding::of(&p.v)?)?;
-        encoder.set_binding(2, Binding::of(&p.k_gain)?)?;
+        if let Some(gain) = &p.k_gain {
+            encoder.set_binding(2, Binding::of(gain)?)?;
+        }
         encoder.set_binding(3, Binding::of(&p.rope)?)?;
         encoder.set_binding(4, Binding::of_mut(cache_k)?)?;
         encoder.set_binding(5, Binding::of_mut(cache_v)?)?;
@@ -1114,7 +1157,9 @@ impl Kernels {
         encoder.memory_barrier();
         encoder.set_pipeline(flash);
         encoder.set_binding(0, Binding::of(&p.q)?)?;
-        encoder.set_binding(1, Binding::of(&p.q_gain)?)?;
+        if let Some(gain) = &p.q_gain {
+            encoder.set_binding(1, Binding::of(gain)?)?;
+        }
         encoder.set_binding(2, Binding::of(&p.rope)?)?;
         encoder.set_binding(3, Binding::of_mut(cache_k)?)?;
         encoder.set_binding(4, Binding::of_mut(cache_v)?)?;

@@ -41,7 +41,7 @@
 use std::process::ExitCode;
 
 use bloomery_device::conformance::why;
-use bloomery_device::{Buffer, Device, DeviceError, Elems, FaultWord, Stream};
+use bloomery_device::{Buffer, Device, DeviceError, Elems, FaultWord, Stream, Window};
 use bloomery_metal::MetalStream;
 use bloomery_metal::attention_geom::{FLASH_THREADS, ONE_PASS_THREADS};
 use bloomery_metal::buffer::MetalBuffer;
@@ -137,6 +137,16 @@ const SPLIT_READS: [&str; 9] = [
 
 /// The bits whose set state skips a phase.
 const SKIP_BITS: u32 = PH_NO_FOLD | PH_NO_EPILOGUE | PH_NO_LOOP | PH_TICKET_ONLY;
+
+/// The gains a launch binds: the head's values where the flash norms each
+/// head, none where it applies no head norm (the buffer then goes unread).
+fn gains_of(
+    norm: bool,
+    gain: &MetalBuffer<f32>,
+) -> Result<Option<Window<'_, f32, MetalDevice>>, DeviceError> {
+    norm.then(|| gain.window(Elems(0), Elems(HEAD_DIM)))
+        .transpose()
+}
 
 /// The phase word an arm's name says. `full` is [`PH_FULL`] and `ticket_only`
 /// adds [`PH_TICKET_ONLY`]. `no_<phase>`, joined by `_no_`, turns each named
@@ -592,8 +602,8 @@ fn params<'w>(
             .window(Elems(0), Elems(qg_len().expect("the query length wraps")))?,
         k: b.k.window(Elems(0), Elems(KV_HEADS * HEAD_DIM))?,
         v: b.v.window(Elems(0), Elems(KV_HEADS * HEAD_DIM))?,
-        q_gain: b.q_gain.window(Elems(0), Elems(HEAD_DIM))?,
-        k_gain: b.k_gain.window(Elems(0), Elems(HEAD_DIM))?,
+        q_gain: gains_of(HOST.key.attn.qk_norm, &b.q_gain)?,
+        k_gain: gains_of(HOST.key.attn.qk_norm, &b.k_gain)?,
         rope: b.rope.window(Elems(0), Elems(CTX as usize * ROT))?,
         cache: AttnCache::F16 {
             k: b.cache_k.window_mut(Elems(0), Elems(cache_n))?,

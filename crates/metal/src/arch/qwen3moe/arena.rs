@@ -143,8 +143,10 @@ pub(super) struct AttnBufs {
     pub(super) window: Option<u32>,
     /// The layer's rope table, by place in [`Arena::ropes`].
     pub(super) rope: usize,
-    pub(super) q_norm: MetalBuffer<f32>,
-    pub(super) k_norm: MetalBuffer<f32>,
+    /// The query and key head norms' gains, on a layer whose flash norms each
+    /// head; a layer with none holds no gains.
+    pub(super) q_norm: Option<MetalBuffer<f32>>,
+    pub(super) k_norm: Option<MetalBuffer<f32>>,
     pub(super) out: MetalBuffer<u8>,
     pub(super) out_quant: Quant,
     pub(super) k_cache: MetalBuffer<u16>,
@@ -1333,8 +1335,8 @@ fn attention(load: &Loader<'_>, a: &AttnLayout) -> Result<AttnBufs, SessionError
         window: a.window,
         rope: a.rope,
         p1,
-        q_norm: load.values(&a.q_norm)?,
-        k_norm: load.values(&a.k_norm)?,
+        q_norm: a.q_norm.as_ref().map(|v| load.values(v)).transpose()?,
+        k_norm: a.k_norm.as_ref().map(|v| load.values(v)).transpose()?,
         out,
         out_quant: a.out.quant,
         k_cache: zeroed(device, a.cache)?,

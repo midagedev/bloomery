@@ -6,7 +6,7 @@
 
 use bloomery_device::conformance::{Clause, Verdict, why};
 use bloomery_device::fault::{Fault, FaultSite};
-use bloomery_device::{Buffer, Device, DeviceError, Elems};
+use bloomery_device::{Buffer, Device, DeviceError, Elems, Window};
 use bloomery_metal::attention_geom::TILE;
 use bloomery_metal::encode::{Binding, ComputeEncoder};
 use bloomery_metal::geom::AttnGeom;
@@ -384,6 +384,19 @@ fn upload_f32<'a>(
     Ok((buffer, host.len()))
 }
 
+/// The gain window a launch binds of a padded upload: the head's values on an
+/// instance whose flash norms each head, none on one that applies no head
+/// norm (the buffer then goes unread).
+pub(super) fn gain_of<'a>(
+    attn: &AttnGeom,
+    buf: &'a MetalBuffer<f32>,
+    pad: usize,
+) -> Result<Option<Window<'a, f32, MetalDevice>>, DeviceError> {
+    attn.qk_norm
+        .then(|| buf.window(Elems(pad), Elems(attn.head)))
+        .transpose()
+}
+
 pub(super) enum Uploaded {
     F16 {
         k: MetalBuffer<u16>,
@@ -569,8 +582,8 @@ fn launch(
             q: q_buf.window(Elems(VALUE_PAD), Elems(q_len))?,
             k: k_buf.window(Elems(VALUE_PAD), Elems(k_len))?,
             v: v_buf.window(Elems(VALUE_PAD), Elems(k_len))?,
-            q_gain: q_gain.window(Elems(VALUE_PAD), Elems(attn.head))?,
-            k_gain: k_gain.window(Elems(VALUE_PAD), Elems(attn.head))?,
+            q_gain: gain_of(attn, &q_gain, VALUE_PAD)?,
+            k_gain: gain_of(attn, &k_gain, VALUE_PAD)?,
             rope: rope.window(Elems(VALUE_PAD), Elems(ctx * attn.rot))?,
             cache: cache_of_for(attn, &mut uploaded, ctx)?,
             partials: partials.window_mut(Elems(0), Elems(partial_n))?,
@@ -1387,8 +1400,8 @@ fn refuse(
             q: b.q.window(Elems(0), Elems(a.q_window))?,
             k: b.k.window(Elems(0), Elems(attn.kv_heads * attn.head))?,
             v: b.v.window(Elems(0), Elems(attn.kv_heads * attn.head))?,
-            q_gain: b.q_gain.window(Elems(0), Elems(attn.head))?,
-            k_gain: b.k_gain.window(Elems(0), Elems(attn.head))?,
+            q_gain: gain_of(attn, &b.q_gain, 0)?,
+            k_gain: gain_of(attn, &b.k_gain, 0)?,
             rope: b.rope.window(Elems(0), Elems(CTX * attn.rot))?,
             cache: AttnCache::F16 {
                 k: b.k_cache.window_mut(Elems(0), Elems(cache_n))?,

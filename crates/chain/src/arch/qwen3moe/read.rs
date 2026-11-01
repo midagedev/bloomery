@@ -519,6 +519,11 @@ const ROPE_FREQS: &str = "rope_freqs.weight";
 /// read at the rows `d` names, which hold the kind's gate rows. A kind that
 /// keeps the layer's window and rope factors ([`GqaKind::head_gate`]) is
 /// refused by name: its plan reads them from the description ([`plan_gqa_of`]).
+/// A kind that keeps only rope factors ([`GqaKind::rope_factors`]) plans here as a
+/// layer without them: the caller is the card's, whose [`kind35`] refuses a layer
+/// that has them.
+///
+/// [`kind35`]: super::plan::kind35
 pub fn plan_gqa(
     file: &Split,
     what: &'static str,
@@ -541,9 +546,10 @@ pub fn plan_gqa(
 
 /// [`plan_gqa`] for the layer's own description `g`: besides the sites every kind has, a kind
 /// with an output gate of its own ([`GqaKind::head_gate`]) reads the gate's projection (one row
-/// a query head), the window `g` attends and, where `g`'s rope has factors, the file's table
-/// (F32, one value a pair of the rope's values). A kind that has none refuses a description
-/// with a window or factors by name.
+/// a query head) and the window `g` attends, and a kind that keeps rope factors
+/// ([`GqaKind::rope_factors`]) reads, where `g`'s rope has them, the file's table (F32, one
+/// value a pair of the rope's values). A kind that keeps none refuses a description with a
+/// window or factors by name.
 pub fn plan_gqa_of(
     file: &Split,
     what: &'static str,
@@ -555,25 +561,24 @@ pub fn plan_gqa_of(
 ) -> Result<GqaPlan, ChainError> {
     let refuse = |detail: String| ChainError::shape(what, format!("layer {l}: {detail}"));
     let mut plan = gqa_sites(file, what, d, l, (kind, flash), sites)?;
-    if !kind.head_gate() {
-        if g.window.is_some() || g.rope.factors {
-            return Err(refuse(format!(
-                "attention {kind:?} takes no window and no rope factors; the description has \
-                 window {:?} and factors {}",
-                g.window, g.rope.factors
-            )));
+    if (g.window.is_some() && !kind.head_gate()) || (g.rope.factors && !kind.rope_factors()) {
+        return Err(refuse(format!(
+            "attention {kind:?} takes no window and no rope factors; the description has \
+             window {:?} and factors {}",
+            g.window, g.rope.factors
+        )));
+    }
+    if kind.head_gate() {
+        if g.window == Some(0) {
+            return Err(refuse("a window of no position".to_string()));
         }
-        return Ok(plan);
+        let name = blk(l, "attn_gate.weight");
+        plan.gate = Some(HeadGate {
+            ty: ty_of(file, what, &name, g.heads as usize, d.hidden, sites.stacks)?,
+            name,
+        });
+        plan.window = g.window;
     }
-    if g.window == Some(0) {
-        return Err(refuse("a window of no position".to_string()));
-    }
-    let name = blk(l, "attn_gate.weight");
-    plan.gate = Some(HeadGate {
-        ty: ty_of(file, what, &name, g.heads as usize, d.hidden, sites.stacks)?,
-        name,
-    });
-    plan.window = g.window;
     if g.rope.factors {
         let pairs = g.rope.dims as usize / 2;
         let table = shaped(file, what, ROPE_FREQS, (1, pairs))?;
@@ -825,7 +830,8 @@ mod tests {
     };
     use crate::ChainError;
     use crate::arch::qwen3moe::plan::fixtures::{
-        delta, gqa, layer, lfm3_conv, lfm3_gqa, lfm3_layer, q30_gqa, q30_layer, spec,
+        delta, dense_layer, gqa, head128_gqa, layer, lfm3_conv, lfm3_gqa, lfm3_layer, q30_gqa,
+        q30_layer, spec,
     };
     use crate::arch::qwen3moe::plan::{Kind35, kinds_of, kinds35};
     use crate::linear::Ring;
@@ -1664,6 +1670,119 @@ mod tests {
         match plan_gqa(&header(t), "t", &pd, 0, kind, &Sites35::CARD) {
             Err(e) => assert!(e.to_string().contains("blk.0.attn_q.weight"), "{e}"),
             Ok(g) => panic!("an NVFP4 attention site read as {}", g.q_ty),
+        }
+    }
+    /// A head-128 NORM layer's file at a size a test can write: hidden 256, 16/4 heads of 128 (a
+    /// group of four), a dense FFN of 512, no q/k norm tensors, and the rope's factors as `table`
+    /// when given.
+    fn head128_tensors(table: Option<TensorDecl>) -> Vec<TensorDecl> {
+        let (h, ff, att, kv) = (256u64, 512u64, 2048u64, 512u64);
+        let mut t: Vec<TensorDecl> = table.into_iter().collect();
+        t.extend(gqa_header(0, h, (att, kv, att), Q4_K));
+        t.extend([
+            decl(blk(0, "attn_norm.weight"), &[h], F32),
+            decl(blk(0, "ffn_norm.weight"), &[h], F32),
+            decl(blk(0, "ffn_gate.weight"), &[h, ff], Q4_K),
+            decl(blk(0, "ffn_up.weight"), &[h, ff], Q4_K),
+            decl(blk(0, "ffn_down.weight"), &[ff, h], Q4_K),
+        ]);
+        t
+    }
+
+    /// The head-128 NORM attention reads the file's rope factors where its description says its
+    /// rope has them, and none where it does not: the plan names the table (F32, one value a
+    /// pair), a table of another length or type is refused by name with the layer, a description
+    /// whose rope has factors over a file with no table is refused by name, and a kind that keeps
+    /// no factors refuses a description that has them. Mutant: `plan_gqa_of` reading the table
+    /// only for the kind with a gate (the first assertion), or not checking the table's type (the
+    /// f16 table).
+    #[test]
+    fn a_head_128_norm_layer_reads_the_files_rope_factors() {
+        let table = || decl("rope_freqs.weight".to_string(), &[64], F32);
+        let plans = |tensors: Vec<TensorDecl>, factors: bool| {
+            let spec = spec(
+                vec![dense_layer(Mixer::Gqa(head128_gqa(16, 4, factors)))],
+                256,
+            );
+            let kinds = kinds_of(&spec.layers)?;
+            let pd = PlanDims::of(&spec, "t")?;
+            layer_plans(
+                &header(tensors),
+                "t",
+                &pd,
+                &kinds,
+                &spec.layers,
+                &Sites35::CARD,
+                Read35::Whole,
+            )
+        };
+        let got = plans(head128_tensors(Some(table())), true).unwrap_or_else(|e| panic!("{e}"));
+        let lines = describe(&got[0]);
+        assert_eq!(
+            lines[0],
+            "gqa Head128 { pairs: Norm, head_norm: false } Group"
+        );
+        assert_eq!(lines[8], "factors rope_freqs.weight");
+        let MixerPlan::Gqa(g) = &got[0].mixer else {
+            panic!("an attention layer")
+        };
+        assert!(g.window.is_none() && g.gate.is_none());
+        // A table in the file the description does not use is not read.
+        let got = plans(head128_tensors(Some(table())), false).unwrap_or_else(|e| panic!("{e}"));
+        let MixerPlan::Gqa(g) = &got[0].mixer else {
+            panic!("an attention layer")
+        };
+        assert_eq!(g.rope_freqs, None);
+        for (what, tensors, texts) in [
+            (
+                "no table",
+                head128_tensors(None),
+                &["rope_freqs.weight", "is not in the file"][..],
+            ),
+            (
+                "a table of 32",
+                head128_tensors(Some(decl("rope_freqs.weight".to_string(), &[32], F32))),
+                &["rope_freqs.weight", "of 64"][..],
+            ),
+            (
+                "an f16 table",
+                head128_tensors(Some(decl("rope_freqs.weight".to_string(), &[64], F16))),
+                &["layer 0:", "the rope's factors are f32"][..],
+            ),
+        ] {
+            match plans(tensors, true) {
+                Err(e) => {
+                    let e = e.to_string();
+                    for text in texts {
+                        assert!(e.contains(text), "{what}: {e}");
+                    }
+                }
+                Ok(_) => panic!("{what}: the plans were read"),
+            }
+        }
+        // A kind that keeps no factors refuses a description that has them.
+        let q30 = {
+            let mut g = q30_gqa();
+            g.rope.factors = true;
+            g
+        };
+        let layer = dense_layer(Mixer::Gqa(head128_gqa(16, 4, false)));
+        let pd = PlanDims::of(&spec(vec![layer], 256), "t").unwrap_or_else(|e| panic!("{e}"));
+        match plan_gqa_of(
+            &header(head128_tensors(Some(table()))),
+            "t",
+            &pd,
+            0,
+            (GqaKind::Neox128, Flash::Group),
+            &q30,
+            &Sites35::CARD,
+        ) {
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("takes no window and no rope factors"),
+                "{e}"
+            ),
+            Ok(_) => panic!("a NEOX layer read rope factors"),
         }
     }
 }

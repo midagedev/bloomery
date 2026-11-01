@@ -1,0 +1,33 @@
+{
+  "name": "llama-mlx",
+  "arch": "llama",
+  "source": "mlx-community/Llama-3.1-8B-Instruct-4bit",
+  "rev": "90215b22ec18e72f623dde2ea7af4097025160e2",
+  "expect": {"tensors": 743, "data_bytes": 4517404672},
+  "layers": [0, 1, 2, 3],
+  "layer_prefix": "model.layers.",
+  "keep": [
+    "model.embed_tokens.weight",
+    "model.embed_tokens.scales",
+    "model.embed_tokens.biases",
+    "lm_head.weight",
+    "lm_head.scales",
+    "lm_head.biases",
+    "model.norm.weight"
+  ],
+  "drop": [],
+  "copy": [
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "generation_config.json",
+    "chat_template.jinja"
+  ],
+  "widths": {},
+  "planes": [],
+  "config": {
+    "layer_count": "num_hidden_layers",
+    "widths": {},
+    "per_layer": [],
+    "layer_names": []
+  }
+}

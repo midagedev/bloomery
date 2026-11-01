@@ -1,9 +1,13 @@
-//! The window, per-head gate and rope clauses of the attention kernels, at the
-//! geometry of the row's instance. Each scene plants a cache, launches one of
-//! the three paths (the decode flash, the rows flash, the prefill flash) with
-//! the layer a case names, and holds every output of every query head to the
-//! f64 attention over the last `window` of its keys (`oracle_attention`), gated
-//! by the head's own value when the instance gates per head. The appended rows
+//! The window, per-head gate, rope and prologue clauses of the attention
+//! kernels, at the geometry of the row's instance. Each scene plants a cache,
+//! launches one of the three paths (the decode flash, the rows flash, the
+//! prefill flash) with the layer a case names, and holds every output of every
+//! query head to the f64 attention over the last `window` of its keys
+//! (`oracle_attention`), gated by the head's own value when the instance gates
+//! per head. A scene's
+//! prologue is the instance's own: each query and key head normed by its gains
+//! and turned as NEOX halves where the instance norms (`AttnGeom::qk_norm`),
+//! the raw values turned as neighbours where it does not. The appended rows
 //! are the oracle's f16 or q8_0 bits and every other cache word is the planted
 //! one. The cache rows before a layer's first window key are poisoned with the
 //! largest finite f16 in keys and values, so a read of one is red wherever the
@@ -30,8 +34,8 @@ use super::clauses_attention::{
 use super::common::{LAYER, first_diff, ratio};
 use super::oracle::sigmoid;
 use super::oracle_attention::{
-    attend, band, head_gate_row, norm_rope, pack_f16, pack_q8, prefill_band, rope_row_f64,
-    window_tail,
+    attend, band, head_gate_row, norm_rope, pack_f16, pack_q8, prefill_band, rope_norm_pairs,
+    rope_row_f64, window_tail,
 };
 use super::{ClauseCtx, ClauseRun, Harness, OUT_GUARD, SENTINEL_BITS, VALUE_PAD};
 
@@ -95,11 +99,11 @@ fn lfm3_factors(pairs: usize) -> Vec<f32> {
         .collect()
 }
 
-/// The tables of a scene: the gains, the table the launch reads and the one
-/// the oracle rotates with.
+/// The tables of a scene: the gains (the normed flash's alone), the table the
+/// launch reads and the one the oracle rotates with.
 struct Tables {
-    q_gain: Vec<f32>,
-    k_gain: Vec<f32>,
+    q_gain: Option<Vec<f32>>,
+    k_gain: Option<Vec<f32>>,
     rope: Vec<f32>,
     reference: Vec<f32>,
 }
@@ -113,9 +117,17 @@ impl Tables {
     /// `launch` is the recipe the kernel's table is built from, `reference`
     /// the one the oracle rotates with.
     fn of(attn: &AttnGeom, launch: &Rope, reference: &Rope) -> Result<Self, String> {
+        let (q_gain, k_gain) = if attn.qk_norm {
+            (
+                Some((0..attn.head).map(|d| gain_of(d, KIND_Q)).collect()),
+                Some((0..attn.head).map(|d| gain_of(d, KIND_K)).collect()),
+            )
+        } else {
+            (None, None)
+        };
         Ok(Self {
-            q_gain: (0..attn.head).map(|d| gain_of(d, KIND_Q)).collect(),
-            k_gain: (0..attn.head).map(|d| gain_of(d, KIND_K)).collect(),
+            q_gain,
+            k_gain,
             rope: launch.table(attn, CTX)?,
             reference: reference.table(attn, CTX)?,
         })
@@ -321,6 +333,23 @@ fn plant(attn: &AttnGeom, case: &Case) -> Result<CacheBack, String> {
     Ok(CacheBack::F16 { k, v })
 }
 
+/// The gain window a launch binds of a padded upload: the head's values on an
+/// instance whose flash norms each head, none on one that applies no head norm
+/// (the buffer then goes unread).
+fn gain_window<'a>(
+    attn: &AttnGeom,
+    buf: &'a Option<MetalBuffer<f32>>,
+) -> Result<Option<Window<'a, f32, MetalDevice>>, DeviceError> {
+    match (buf, attn.qk_norm) {
+        (Some(b), true) => Ok(Some(b.window(Elems(VALUE_PAD), Elems(attn.head))?)),
+        (None, false) => Ok(None),
+        (Some(_), false) | (None, true) => Err(DeviceError::Range {
+            what: "attention",
+            detail: "the scene's gains do not match the instance's head norm".to_string(),
+        }),
+    }
+}
+
 /// Rows `first..first + n` of the per-head gate buffer, when the instance has one.
 fn gate_window(
     buf: &Option<MetalBuffer<f32>>,
@@ -374,8 +403,8 @@ fn launch(
     let q_buf = up(&inp.q)?;
     let k_buf = up(&inp.k)?;
     let v_buf = up(&inp.v)?;
-    let q_gain = up(&tables.q_gain)?;
-    let k_gain = up(&tables.k_gain)?;
+    let q_gain = tables.q_gain.as_ref().map(|g| up(g)).transpose()?;
+    let k_gain = tables.k_gain.as_ref().map(|g| up(g)).transpose()?;
     let rope = up(&tables.rope)?;
     // The gate's buffer holds a query projection's worth of poison past it,
     // so a read of a per-channel index or the next head's lands on NaN.
@@ -417,8 +446,8 @@ fn launch(
                 q: q_buf.window(Elems(VALUE_PAD), Elems(q_n))?,
                 k: k_buf.window(Elems(VALUE_PAD), Elems(kv_n))?,
                 v: v_buf.window(Elems(VALUE_PAD), Elems(kv_n))?,
-                q_gain: q_gain.window(Elems(VALUE_PAD), Elems(attn.head))?,
-                k_gain: k_gain.window(Elems(VALUE_PAD), Elems(attn.head))?,
+                q_gain: gain_window(attn, &q_gain)?,
+                k_gain: gain_window(attn, &k_gain)?,
                 rope: rope.window(Elems(VALUE_PAD), Elems(ctx * attn.rot))?,
                 cache: cache_of_for(attn, &mut uploaded, ctx)?,
                 partials: partials.window_mut(Elems(0), Elems(partial_n))?,
@@ -449,8 +478,8 @@ fn launch(
                 k_stride: kv_n,
                 v: v_buf.window(Elems(VALUE_PAD), Elems(rows * kv_n))?,
                 v_stride: kv_n,
-                q_gain: q_gain.window(Elems(VALUE_PAD), Elems(attn.head))?,
-                k_gain: k_gain.window(Elems(VALUE_PAD), Elems(attn.head))?,
+                q_gain: gain_window(attn, &q_gain)?,
+                k_gain: gain_window(attn, &k_gain)?,
                 rope: rope.window(Elems(VALUE_PAD), Elems(ctx * attn.rot))?,
                 cache: cache_of_for(attn, &mut uploaded, ctx)?,
                 partials: partials.window_mut(Elems(0), Elems(rows * partial_n))?,
@@ -481,8 +510,8 @@ fn launch(
                         q: q_buf.window(Elems(VALUE_PAD + r * q_n), Elems(q_n))?,
                         k: k_buf.window(Elems(VALUE_PAD + r * kv_n), Elems(kv_n))?,
                         v: v_buf.window(Elems(VALUE_PAD + r * kv_n), Elems(kv_n))?,
-                        q_gain: q_gain.window(Elems(VALUE_PAD), Elems(attn.head))?,
-                        k_gain: k_gain.window(Elems(VALUE_PAD), Elems(attn.head))?,
+                        q_gain: gain_window(attn, &q_gain)?,
+                        k_gain: gain_window(attn, &k_gain)?,
                         rope: rope.window(Elems(VALUE_PAD), Elems(ctx * attn.rot))?,
                         cache: cache_of_for(attn, &mut uploaded, ctx)?,
                         partials: partials.window_mut(Elems(r * partial_n), Elems(partial_n))?,
@@ -516,8 +545,8 @@ fn launch(
                 k_stride: kv_n,
                 v: v_buf.window(Elems(VALUE_PAD), Elems(rows * kv_n))?,
                 v_stride: kv_n,
-                q_gain: q_gain.window(Elems(VALUE_PAD), Elems(attn.head))?,
-                k_gain: k_gain.window(Elems(VALUE_PAD), Elems(attn.head))?,
+                q_gain: gain_window(attn, &q_gain)?,
+                k_gain: gain_window(attn, &k_gain)?,
                 rope: rope.window(Elems(VALUE_PAD), Elems(ctx * attn.rot))?,
                 cache: cache_of_for(attn, &mut uploaded, ctx)?,
                 out: out_buf.window_mut(Elems(OUT_GUARD), Elems(rows * out_n))?,
@@ -545,6 +574,23 @@ fn launch(
         fault: h.fault()?,
         ticket: tickets,
     })
+}
+
+/// The prologue of one head in the kernel's f32 order: the norm and the NEOX
+/// pairs where the instance norms each head, the raw values turned as
+/// neighbours where it does not.
+fn prologue(
+    attn: &AttnGeom,
+    x: &[f32],
+    gain: &Option<Vec<f32>>,
+    eps: f32,
+    rope: &[f32],
+) -> Result<Vec<f32>, String> {
+    match (attn.qk_norm, gain) {
+        (true, Some(g)) => norm_rope(x, g, eps, rope),
+        (false, None) => rope_norm_pairs(x, rope),
+        _ => Err("the scene's gains do not match the instance's head norm".to_string()),
+    }
 }
 
 /// The first row of `got` that is not `want`'s, named.
@@ -581,7 +627,7 @@ fn expect_appended(
         .reference
         .get(pos * attn.rot..(pos + 1) * attn.rot)
         .ok_or("the rope row is past the table")?;
-    let key = norm_rope(&inp.k[at..at + attn.head], &tables.k_gain, EPS, rope)?;
+    let key = prologue(attn, &inp.k[at..at + attn.head], &tables.k_gain, EPS, rope)?;
     let value = &inp.v[at..at + attn.head];
     let row = kv * CTX + pos;
     match got {
@@ -704,7 +750,8 @@ fn check(
             .ok_or("the rope row is past the table")?;
         let q_row = &inp.q[r * q_n..(r + 1) * q_n];
         for head in 0..attn.query_heads {
-            let qn = norm_rope(
+            let qn = prologue(
+                attn,
                 take_qg_for(attn, q_row, head, 0)?,
                 &tables.q_gain,
                 EPS,
@@ -996,6 +1043,95 @@ fn expect_unrotated_tail(attn: &AttnGeom, reference: &Rope) -> Result<(), String
     Ok(())
 }
 
+/// Llama-3.1's `rope_freqs.weight`: the factors of the `llama3` scaling
+/// (factor 8, low 1, high 4, the original context 8192) for a head of `head`
+/// values at the base `base` — the pairs of a wavelength under
+/// `8192 / high` unfactored, those past `8192 / low` by 8, the ones between
+/// slid between — computed in f64 and rounded once to f32, as the folder map
+/// makes them.
+fn llama3_factors(head: usize, base: f64) -> Vec<f32> {
+    (0..head / 2)
+        .map(|i| {
+            let wavelength =
+                std::f64::consts::TAU * base.powf(f64::from(2 * i as u32) / f64::from(head as u32));
+            (if wavelength < 8192.0 / 4.0 {
+                1.0
+            } else if wavelength > 8192.0 {
+                8.0
+            } else {
+                let t = (8192.0 / wavelength - 1.0) / 3.0;
+                1.0 / ((1.0 - t) / 8.0 + t)
+            }) as f32
+        })
+        .collect()
+}
+
+/// The no-norm, neighbour-paired prologue at a Llama head (a 128-wide head
+/// over groups of four, the rope's `llama3` frequency factors): the appended
+/// rows and every output of every query head against the f64 oracle on the
+/// three paths — the decode flash (the one-pass flash of one segment, the
+/// split's fold at the rule's count and off it), the rows flash (one segment
+/// and split), the prefill flash — over the f16 and the q8_0 caches, at the
+/// llama3 factors, at factors that all differ and at the plain rope. A table
+/// defect named on the command line (`--mutant NAME`) is built into the
+/// launch's table only.
+pub fn attn_prologue(h: &Harness<'_>, mutant: Option<&str>) -> Clause {
+    let attn = &h.geom().attn;
+    if attn.qk_norm || !attn.norm_pairs {
+        return Ok(Verdict::Skip(
+            "the instance's prologue is not the raw values turned as neighbours".to_string(),
+        ));
+    }
+    let pairs = attn.rot / 2;
+    let llama3 = Rope {
+        base: 500_000.0,
+        dims: attn.rot,
+        factors: Some(llama3_factors(attn.rot, 500_000.0)),
+    };
+    let skew = Rope {
+        base: 500_000.0,
+        dims: attn.rot,
+        factors: Some((0..pairs).map(|i| 1.0 + i as f32 / 16.0).collect()),
+    };
+    let plain = Rope::plain(attn, 500_000.0);
+    let scenes = [
+        ("llama3 factors", llama3),
+        ("factors 1 + i/16", skew),
+        ("plain rope", plain),
+    ];
+    let mut worst = 0.0f64;
+    let mut parts = Vec::new();
+    for (name, reference) in scenes {
+        let mut launch_rope = reference.clone();
+        if mutant == Some("prologue_factors_ignored") {
+            launch_rope.factors = None;
+        }
+        let tables = Tables::of(attn, &launch_rope, &reference)?;
+        for case in [
+            Case::decode(1025, None),
+            Case::decode(300, None),
+            Case::decode(300, None).split(10),
+            Case::rows(Path::Rows, 250, 20, None),
+            Case::rows(Path::Rows, 250, 20, None).split(7),
+            Case::rows(Path::Prefill, 300, 9, None),
+            Case::rows(Path::Prefill, 37, 33, None),
+        ] {
+            let (_, w) = run(h, &tables, &case)?;
+            worst = worst.max(w);
+            parts.push(format!("{name} {:?}", case.path));
+        }
+        if reference.factors.is_some() && name.starts_with("llama3") {
+            let mut q8 = Case::decode(1025, None);
+            q8.q8 = true;
+            q8.label.push_str(" q8_0");
+            let (_, w) = run(h, &tables, &q8)?;
+            worst = worst.max(w);
+            parts.push(format!("{name} Decode q8_0"));
+        }
+    }
+    noted("scenes", &parts, worst)
+}
+
 /// The launches of a layer the instance cannot take are refused by name and
 /// write nothing: a window of no keys, a window where the flash cuts none, a
 /// gate window where there is no per-head gate, none or one of another length
@@ -1018,7 +1154,9 @@ pub fn attn_layer_refusals(h: &Harness<'_>) -> Clause {
             .map_err(why)
     };
     let (q_buf, k_buf, v_buf) = (up(&inp.q)?, up(&inp.k)?, up(&inp.v)?);
-    let (q_gain, k_gain, rope) = (up(&tables.q_gain)?, up(&tables.k_gain)?, up(&tables.rope)?);
+    let q_gain = tables.q_gain.as_ref().map(|g| up(g)).transpose()?;
+    let k_gain = tables.k_gain.as_ref().map(|g| up(g)).transpose()?;
+    let rope = up(&tables.rope)?;
     let gate_buf = up(&vec![0.5f32; heads + 1])?;
     let partial_n = attn.partials_len(1).ok_or("the partial length wraps")?;
     let mut partials = device.upload(stream, &vec![0f32; partial_n]).map_err(why)?;
@@ -1029,13 +1167,23 @@ pub fn attn_layer_refusals(h: &Harness<'_>) -> Clause {
     let mut out_buf = device.upload(stream, &out_host).map_err(why)?;
     let mut uploaded = upload_cache(device, stream, &planted)?;
     let mut refused = Vec::new();
-    for (what, needle, window, gate_len, plain) in [
+    // The gains a case's launch holds: the tables' own, or the mismatch the
+    // case names (a gain window where the flash applies no head norm, none
+    // where it norms each head).
+    #[derive(Clone, Copy)]
+    enum Gains {
+        Tables,
+        Held,
+        None,
+    }
+    for (what, needle, window, gate_len, plain, gains) in [
         (
             "a window of no keys",
             "window of 0",
             Some(0u32),
             Some(heads),
             false,
+            Gains::Tables,
         ),
         (
             "a window where the flash cuts none",
@@ -1043,6 +1191,7 @@ pub fn attn_layer_refusals(h: &Harness<'_>) -> Clause {
             Some(64),
             Some(heads),
             false,
+            Gains::Tables,
         ),
         (
             "a gate window where the instance has none",
@@ -1050,6 +1199,7 @@ pub fn attn_layer_refusals(h: &Harness<'_>) -> Clause {
             None,
             Some(heads),
             false,
+            Gains::Tables,
         ),
         (
             "no gate window where the gate is per head",
@@ -1057,6 +1207,7 @@ pub fn attn_layer_refusals(h: &Harness<'_>) -> Clause {
             None,
             None,
             false,
+            Gains::Tables,
         ),
         (
             "a gate window of another length",
@@ -1064,6 +1215,7 @@ pub fn attn_layer_refusals(h: &Harness<'_>) -> Clause {
             None,
             Some(heads + 1),
             false,
+            Gains::Tables,
         ),
         (
             "a launch with no layer argument",
@@ -1071,6 +1223,23 @@ pub fn attn_layer_refusals(h: &Harness<'_>) -> Clause {
             None,
             None,
             true,
+            Gains::Tables,
+        ),
+        (
+            "a gain window where the flash applies no head norm",
+            "applies no head norm",
+            None,
+            None,
+            false,
+            Gains::Held,
+        ),
+        (
+            "no gain window where the flash norms each head",
+            "no q gain window",
+            None,
+            None,
+            false,
+            Gains::None,
         ),
     ] {
         // A case is a refusal only on the instances it names: a window needs
@@ -1079,6 +1248,8 @@ pub fn attn_layer_refusals(h: &Harness<'_>) -> Clause {
             "window of 0" => attn.windowed,
             "cuts no window" => !attn.windowed,
             "no per-head gate" => !attn.head_gate,
+            "applies no head norm" => !attn.qk_norm,
+            "no q gain window" => attn.qk_norm,
             _ => attn.head_gate,
         };
         if !applies {
@@ -1098,8 +1269,12 @@ pub fn attn_layer_refusals(h: &Harness<'_>) -> Clause {
                 q: q_buf.window(Elems(VALUE_PAD), Elems(q_n))?,
                 k: k_buf.window(Elems(VALUE_PAD), Elems(kv_n))?,
                 v: v_buf.window(Elems(VALUE_PAD), Elems(kv_n))?,
-                q_gain: q_gain.window(Elems(VALUE_PAD), Elems(attn.head))?,
-                k_gain: k_gain.window(Elems(VALUE_PAD), Elems(attn.head))?,
+                q_gain: match gains {
+                    Gains::Tables => gain_window(&attn, &q_gain)?,
+                    Gains::Held => Some(rope.window(Elems(VALUE_PAD), Elems(attn.head))?),
+                    Gains::None => None,
+                },
+                k_gain: gain_window(&attn, &k_gain)?,
                 rope: rope.window(Elems(VALUE_PAD), Elems(CTX * attn.rot))?,
                 cache: cache_of_for(&attn, &mut uploaded, CTX)?,
                 partials: partials.window_mut(Elems(0), Elems(partial_n))?,
@@ -1166,6 +1341,23 @@ pub fn table<'a>(ctx: &'a ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<'a>)> {
         (
             "attn_layer_refusals",
             Box::new(move || attn_layer_refusals(h)),
+        ),
+    ]
+}
+
+/// The clauses of the instance whose prologue norms no head and pairs
+/// neighbours, in gate order.
+pub fn prologue_table<'a>(ctx: &'a ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<'a>)> {
+    let h = ctx.harness;
+    let mutant = super::flag(ctx.args, "--mutant");
+    vec![
+        (
+            "attn_prologue",
+            Box::new(move || attn_prologue(h, mutant)) as ClauseRun<'a>,
+        ),
+        (
+            "attn_layer_refusals",
+            Box::new(move || attn_layer_refusals(h)) as ClauseRun<'a>,
         ),
     ]
 }
