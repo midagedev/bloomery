@@ -31,8 +31,8 @@ use crate::placement::accepts::{program_of, routed_rule};
 use crate::placement::ctx_ask::{PlanRefusal, Short, Side};
 use crate::placement::workstation::{self, HostNeed, HostRead};
 use crate::placement::{
-    self, Card, CardTotals, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers,
-    Unimplemented, Violation, checked_beside, joined, kernels,
+    self, Card, CardFormat, CardTotals, KvBytes, Machine, ModelTensors, PlacementError, Plan,
+    PlanLevers, Unimplemented, Violation, checked_beside, joined, kernels,
 };
 
 // The prompt batch a window ring keeps room for is the batch the card walks the prompt in.
@@ -197,9 +197,10 @@ pub fn stream_ring_bytes(
 
 /// A slot of the expert stream: the widest layer's expert at its routed stacks' file bytes per
 /// expert (`stacks(l)`, the gate, up and down of layer `l` of `model`'s `n_expert`-expert stacks; a
-/// layer with none of the three streams nothing). The ring's card slots and the lane's pinned host
-/// staging slots are of these bytes. Refused by name: a layer that holds some of its three stacks
-/// and not all, and a stack that is not one of `n_expert` experts.
+/// layer with none of the three streams nothing), plus the four-byte f32 tensor scale an expert of
+/// each stack in [`CardFormat::Nvfp4Planes`] carries beside its planes. The ring's card slots and
+/// the lane's pinned host staging slots are of these bytes. Refused by name: a layer that holds
+/// some of its three stacks and not all, and a stack that is not one of `n_expert` experts.
 pub fn stream_slot_bytes(
     model: &ModelTensors,
     stacks: impl Fn(usize) -> [String; 3],
@@ -223,6 +224,9 @@ pub fn stream_slot_bytes(
                     .to_string(),
             })?;
             expert += placement::per_expert(t, n_expert)?.1;
+            if CardFormat::of_routed(t.ty) == Some(CardFormat::Nvfp4Planes) {
+                expert += 4;
+            }
         }
         slot = slot.max(expert);
     }

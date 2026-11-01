@@ -3197,12 +3197,13 @@ mod tests {
     }
 
     /// A qwen4exp file's stream slot is its widest routed expert, the gate, up and down at their
-    /// file bytes: three Q8_0 rows of 64 values, 68 B each, or three NVFP4 rows, 36 B each.
-    /// A load of every expert on the host streams nothing (slot 0), keeping
-    /// the need of the plan without staging. The lane's staging a plan reserves for the slot
-    /// (`workstation::reserve_stream_staging`) is the need's, pinned: 64 slots more than the plan
-    /// without it. FAIL-first: the qwen38 seat and the CLI planned the Qwen3.8 stream's staging
-    /// nowhere, then reserved it for a load of every expert on the host, which streams nothing.
+    /// file bytes: three Q8_0 rows of 64 values, 68 B each, or three NVFP4 rows, 36 B each, and
+    /// each NVFP4 stack's four-byte tensor scale. A load of every expert on the host streams
+    /// nothing (slot 0), keeping the need of the plan without staging. The lane's staging a plan
+    /// reserves for the slot (`workstation::reserve_stream_staging`) is the need's, pinned: 64
+    /// slots more than the plan without it, an NVFP4 slot's scales included. FAIL-first: the
+    /// qwen38 seat and the CLI planned the Qwen3.8 stream's staging nowhere, then reserved it for
+    /// a load of every expert on the host, which streams nothing.
     #[test]
     fn a_stream_slot_is_the_widest_routed_expert() {
         use crate::arch::qwen35moe::hparams::tests::{keys, tensors};
@@ -3235,10 +3236,11 @@ mod tests {
         let (card, host) = (super::Experts::Card, super::Experts::Host);
         let words = described("q4x-stream-slot", false);
         assert_eq!(words.stream_slot(card).unwrap(), 3 * 68);
-        // PIN(2026-11-01): NVFP4 planes stream as the file's blocks do (every ring pass reads the
-        // half in the card stacks' forms); a planes file's slot was 0, its load reserving none.
+        // PIN(2026-11-02): NVFP4 planes stream as the file's blocks do (every ring pass reads the
+        // half in the card stacks' forms), and a slot stages each stack's four-byte f32 tensor
+        // scale beside its planes; a planes file's slot was 0, then 3 * 36 without the scales.
         let planes = described("q4x-stream-planes", true);
-        assert_eq!(planes.stream_slot(card).unwrap(), 3 * 36);
+        assert_eq!(planes.stream_slot(card).unwrap(), 3 * 40);
         assert_eq!(planes.stream_slot(host).unwrap(), 0);
         let machine = super::machine(
             super::A6000,
@@ -3256,13 +3258,25 @@ mod tests {
             lock: false,
             arena_pinned: false,
         };
-        let pinned = |m, experts| {
-            let plan = words.plan_with(m, (4096, 512), &levers, experts).unwrap();
+        let pinned = |inputs: &super::PlanInputs, m, experts| {
+            let plan = inputs.plan_with(m, (4096, 512), &levers, experts).unwrap();
             let need = HostNeed::of(&plan, 0);
             need.classes(&plan, how).expect("the plan's need").pinned
         };
-        assert_eq!(pinned(&staged, card), pinned(&machine, card) + 64 * 3 * 68);
-        assert_eq!(pinned(&host_only, host), pinned(&machine, host));
+        assert_eq!(
+            pinned(&words, &staged, card),
+            pinned(&words, &machine, card) + 64 * 3 * 68
+        );
+        assert_eq!(
+            pinned(&words, &host_only, host),
+            pinned(&words, &machine, host)
+        );
+        let mut staged_planes = machine.clone();
+        workstation::reserve_stream_staging(&mut staged_planes, planes.stream_slot(card).unwrap());
+        assert_eq!(
+            pinned(&planes, &staged_planes, card),
+            pinned(&planes, &machine, card) + 64 * 3 * 40
+        );
     }
 
     /// One saved sequence state of Qwen3.8's 48 layers (36 GDN, every fourth
