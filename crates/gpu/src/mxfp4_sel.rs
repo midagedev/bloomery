@@ -74,7 +74,8 @@
 //!   tokens' slots can name one expert (a verify's rows of one sequence). The
 //!   first slot that names an expert reads its rows for every slot that
 //!   names it, one slot after the other, and the other slots' warps load no
-//!   weight; every slot's row is the one-token entry's bit for bit.
+//!   weight; a down warp takes four rows, so it reads each column unit once
+//!   for them. Every slot's row is the one-token entry's bit for bit.
 //!
 //! The rule of a dot is the FP4 owner's under [`Nvfp4`], then the warp
 //! butterfly, then one multiply by the expert's scale: the dense gemv's
@@ -89,7 +90,9 @@
 use crate::hybrid::HOST;
 use crate::kquant::act::{self, Act};
 use crate::kquant::{GateUpAct, SelDown};
-use crate::mxfp4::{self, Mxfp4, NV_BLOCK_VALUES, Nvfp4, Planes, lane_partial_file, lane_partials};
+use crate::mxfp4::{
+    self, Fp4, Mxfp4, NV_BLOCK_VALUES, Nvfp4, Planes, lane_partial_file, lane_partials,
+};
 use crate::q5::Q8Blocks32;
 use crate::{DeviceTensor, FaultSink, FaultSite, GpuError, Q8Act, launch_u32, q8_1_quant_block};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -113,6 +116,10 @@ const _: () = assert!(MAX_TOKENS == 8);
 
 /// Output rows a block computes: one per warp.
 const ROWS_PER_BLOCK: usize = BLOCK as usize / 32;
+
+/// Rows of one slot a warp of the multi-token NVFP4 down
+/// (`nvfp4_gemv_sel32_cols`) takes, so a column unit is read once for them.
+const DOWN_COLS_ROWS: usize = 4;
 
 // The entries' launch attributes spell the block as a literal.
 const _: () = assert!(BLOCK == 256);
@@ -1586,15 +1593,22 @@ mod nvfp4_sel_kernels {
         }
     }
 
-    /// `nvfp4_gemv_sel32` over slots of more than one token: thread row `n =
-    /// slot · rows_per_expert + r`. The warp of the first slot that names an
-    /// expert dots row `r` of the expert with the activation column of each
-    /// slot that names it, one slot after the other, and writes each one's
-    /// `y`; the other slots' warps return before any weight load. A slot's
-    /// row is `nvfp4_gemv_sel32`'s bit for bit. Ids: module doc.
+    /// `nvfp4_gemv_sel32` over slots of more than one token: warp `w` takes
+    /// rows `r0 .. r0 + DOWN_COLS_ROWS` (those below `rows_per_expert`) of
+    /// slot `w / ceil(rows_per_expert / DOWN_COLS_ROWS)`. The warp of the
+    /// first slot that names an expert dots those rows of the expert with the
+    /// activation column of each slot that names it, one slot after the
+    /// other, reading each unit of the column once for its rows, and writes
+    /// each one's `y`; the other slots' warps return before any weight load.
+    /// A slot's row is `nvfp4_gemv_sel32`'s bit for bit: the same units in
+    /// the same lanes and order, then the same butterfly. Ids: module doc.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[allow(
+        clippy::needless_range_loop,
+        reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
     )]
     #[kernel]
     #[launch_bounds(256, 4)]
@@ -1630,14 +1644,15 @@ mod nvfp4_sel_kernels {
         mut y: DisjointSlice<f32>,
     ) {
         let _ = iters;
-        let t = thread::index_1d().get() % BLOCK as usize;
-        let row = (thread::index_1d().get() / BLOCK as usize) * ROWS_PER_BLOCK + t / 32;
+        let w = thread::index_1d().get() / 32;
         let rpe = rows_per_expert as usize;
         let n_slots = n_slots as usize;
-        if row >= n_slots * rpe {
+        let per_slot = rpe.div_ceil(DOWN_COLS_ROWS);
+        if w >= n_slots * per_slot {
             return;
         }
-        let slot = row / rpe;
+        let slot = w / per_slot;
+        let r0 = (w % per_slot) * DOWN_COLS_ROWS;
         // SAFETY: slot < n_slots <= sel.len() by the launch contract; the
         // load is warp-uniform, so the returns below never diverge a warp.
         let id = unsafe { *sel.get_unchecked(slot) };
@@ -1657,8 +1672,11 @@ mod nvfp4_sel_kernels {
         let Some(qv) = as_vectors::<U32x4>(qs) else {
             return;
         };
-        let row_abs = id as usize * rpe + row % rpe;
         let n_units = 2 * n_blk as usize;
+        let q_stride = q_stride as usize;
+        // The warp's first row of the stack: rows row0 + j, j below `live`.
+        let row0 = id as usize * rpe + r0;
+        let live = (rpe - r0).min(DOWN_COLS_ROWS);
         // SAFETY: id < n_experts <= s.len() by the launch contract.
         let scale = unsafe { *s.get_unchecked(id as usize) };
         let mut i0 = slot;
@@ -1669,33 +1687,61 @@ mod nvfp4_sel_kernels {
             while hits != 0 {
                 let at = i0 + hits.trailing_zeros() as usize;
                 hits &= hits - 1;
-                // SAFETY: nvfp4_gemv_sel32's bounds for slot `at` < n_slots:
-                // the row's n_units vectors and n_blk scale words inside qs
-                // and e, column `at` at at · q_stride and its n_units scales
-                // at at · n_units inside q and d8; lane < 32.
-                let f = unsafe {
-                    lane_partials::<1, Nvfp4, 0>(
-                        qv,
-                        e,
-                        row_abs,
-                        n_units,
-                        q,
-                        d8,
-                        at * q_stride as usize,
-                        0,
-                        at * n_units,
-                        0,
-                        1,
-                        lane,
-                    )
-                }[0];
-                let sum = warp::reduce_sum_f32(f);
-                if lane == 0 {
-                    // SAFETY: at · rpe + r < n_slots · rows_per_expert <=
-                    // y.len() by the launch contract; slot `at` names this
-                    // warp's expert and this warp is its first slot, so lane
-                    // 0 here is the row's only writer.
-                    unsafe { *y.get_unchecked_mut(at * rpe + row % rpe) = sum * scale };
+                // lane_partials::<1, Nvfp4, 0> of each live row against
+                // column `at`, the column's unit read once for the rows.
+                let mut f = [0.0f32; DOWN_COLS_ROWS];
+                let mut b = lane;
+                while b < n_units {
+                    let qb = at * q_stride + 256 * (b >> 5) + (b & 31);
+                    // SAFETY: column `at` < n_slots starts at at · q_stride
+                    // with q_stride >= 256 · iters >= 256 · ceil(n_units/32)
+                    // words (the q, iters and q_stride bounds), so qb + 224
+                    // is inside it, inside q; b < n_units.
+                    let x = unsafe {
+                        [
+                            *q.get_unchecked(qb),
+                            *q.get_unchecked(qb + 32),
+                            *q.get_unchecked(qb + 64),
+                            *q.get_unchecked(qb + 96),
+                            *q.get_unchecked(qb + 128),
+                            *q.get_unchecked(qb + 160),
+                            *q.get_unchecked(qb + 192),
+                            *q.get_unchecked(qb + 224),
+                        ]
+                    };
+                    // SAFETY: column `at`'s n_units scales start at at ·
+                    // n_units inside d8 (the d8 bound) and b < n_units.
+                    let dx = unsafe { *d8.get_unchecked(at * n_units + b) };
+                    for j in 0..DOWN_COLS_ROWS {
+                        thread::__unroll_config::<0>();
+                        if j < live {
+                            let g = (row0 + j) * n_units + b;
+                            // SAFETY: row0 + j < (id + 1) · rows_per_expert
+                            // <= n_experts · rows_per_expert and b < n_units,
+                            // so vector g is inside qs (the stack bound).
+                            let v = unsafe { *qv.get_unchecked(g) };
+                            // SAFETY: vector g's scale word is inside e (the
+                            // stack bound; n_units is even, the units a scale
+                            // word covers); the repack took every scale byte.
+                            let ew = unsafe { *e.get_unchecked(Nvfp4::scale_word(g)) };
+                            f[j] = Nvfp4::fma(&Nvfp4::decode(v.0, ew, b), &x, dx, f[j]);
+                        }
+                    }
+                    b += 32;
+                }
+                for j in 0..DOWN_COLS_ROWS {
+                    thread::__unroll_config::<0>();
+                    if j < live {
+                        let sum = warp::reduce_sum_f32(f[j]);
+                        if lane == 0 {
+                            // SAFETY: at · rpe + r0 + j < n_slots ·
+                            // rows_per_expert <= y.len() by the launch
+                            // contract; slot `at` names this warp's expert,
+                            // this warp is its first slot and alone holds rows
+                            // r0 + j, so lane 0 here is the row's only writer.
+                            unsafe { *y.get_unchecked_mut(at * rpe + r0 + j) = sum * scale };
+                        }
+                    }
                 }
             }
             i0 += 32;
@@ -1784,7 +1830,7 @@ pub struct Nvfp4Down<'a> {
     pub n_slots: usize,
     pub rows_per_expert: usize,
     /// Slots per token. Multi-token runs compute matching slots' dots
-    /// serially in the first matching slot's warp for each expert row.
+    /// serially in the first matching slot's warp for each of its expert rows.
     pub slots_per_col: usize,
 }
 
@@ -1923,7 +1969,13 @@ impl Nvfp4SelKernels {
             y.len(),
         )?;
         let n_blk = k / NV_BLOCK_VALUES;
-        let grid = launch_u32(what, "grid", slot_rows.div_ceil(ROWS_PER_BLOCK))?;
+        let cols = n_slots > a.slots_per_col;
+        let warps = if cols {
+            n_slots * rpe.div_ceil(DOWN_COLS_ROWS)
+        } else {
+            slot_rows
+        };
+        let grid = launch_u32(what, "grid", warps.div_ceil(ROWS_PER_BLOCK))?;
         macro_rules! launch {
             ($prepare:ident, $entry:ident) => {{
                 let prep = self.module.$prepare(LaunchConfig1D::new(grid, BLOCK, 0))?;
@@ -1947,7 +1999,7 @@ impl Nvfp4SelKernels {
                 )?
             }};
         }
-        if n_slots > a.slots_per_col {
+        if cols {
             launch!(prepare_nvfp4_gemv_sel32_cols, nvfp4_gemv_sel32_cols);
         } else {
             launch!(prepare_nvfp4_gemv_sel32, nvfp4_gemv_sel32);
