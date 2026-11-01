@@ -260,6 +260,7 @@ use serve::media::MediaFeed;
 #[cfg(feature = "vision")]
 use vision_seat::{Opened, PleImage, TextFacts};
 
+use super::drafted::LOOKUP_ROWS;
 use super::served::{self, ServedDraft};
 use crate::draft::{Draft, open_dspark};
 use crate::{dspark, place};
@@ -596,9 +597,16 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let width = WidthMode::of(levers.mtp_width())?;
     let (slots, from) = slot_count(a.parallel, draft, levers.route_trace().is_some())?;
     // The rounds of several slots, decided once (the open takes it through
-    // `SeatArgs`): one pass of the busy rows with no draft, else the fallback
-    // loop ([`V41::one_pass`]).
-    let pass = Pass::of(slots.get(), draft == Draft::Off);
+    // `SeatArgs`) by what the body runs ([`Pass::of_body`]): one pass of the
+    // busy rows with no draft; a drafted round needs a body that verifies
+    // several slots' windows together, which this one does not (it keeps a
+    // pass's rows whole), so the fallback loop ([`V41::one_pass`]).
+    let window = match draft {
+        Draft::Off => None,
+        Draft::Lookup => Some(LOOKUP_ROWS),
+        Draft::Dspark => Some(PAIR_ROWS),
+    };
+    let pass = Pass::of_body::<Body>(slots.get(), true, window);
     // The draft's file is read before the target's load, which takes a minute.
     let draft_file = match draft {
         Draft::Dspark => Some(dspark::draft_hparams()?),
@@ -1064,11 +1072,12 @@ struct V41 {
     /// gate, the pair pass against the plain step).
     draft: ServedDraft<Body>,
     /// Whether a round of several slots runs as one pass of the busy rows
-    /// ([`V41::step_slots`]): a load of more than one resident slot with no
-    /// draft. Every other load keeps the fallback loop: one slot (a round of
-    /// several never runs), the DSpark draft (which serves one slot), and
-    /// the lookup draft (whose [`Seat::step`] feeds its tables, and whose
-    /// drafted rounds are [`Seat::pass_slots`] rounds).
+    /// ([`V41::step_slots`]): a load of more than one resident slot whose
+    /// shape the open decided by what the body runs ([`Pass::of_body`]):
+    /// with no draft. Every other load keeps the
+    /// fallback loop: one slot (a round of several never runs), the DSpark
+    /// draft (which serves one slot), and the lookup draft, whose windows
+    /// this body cannot verify together (it keeps a pass's rows whole).
     one_pass: bool,
     /// [`Seat::step_stats`]: the `BLOOMERY_STEP_STATS` the binary parsed.
     stats: bool,

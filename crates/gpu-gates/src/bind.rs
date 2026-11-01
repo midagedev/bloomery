@@ -63,6 +63,7 @@ use std::time::{Duration, Instant};
 use bloomery_gpu::GpuError;
 use bloomery_gpu::checkpoint::saved::{Pending as Saving, SeqView};
 use bloomery_gpu::checkpoint::staging::NoRoom;
+use bloomery_gpu::model::{SlotRows, slots_a_pass};
 use bloomery_levers::Levers;
 use gguf::Split;
 use model::placement::workstation::{self, DeviceId, HostRead};
@@ -598,6 +599,21 @@ impl Pass {
         }
     }
 
+    /// The shape of a load of `slots` slots on body `B`, by what the body
+    /// and the load can run, never by the draft's name: one pass of the busy
+    /// rows when the load leaves the body its pass of several slots
+    /// (`resident`: no expert tier card beside it, the seat's placement
+    /// fact) and, under a draft whose window verifies up to `window` rows,
+    /// the body verifies several slots' windows together
+    /// ([`verifies_slots`]); else [`Pass::Turns`]. `None` is a load that
+    /// drafts nothing.
+    pub fn of_body<B: SlotRows>(slots: usize, resident: bool, window: Option<usize>) -> Pass {
+        Pass::of(
+            slots,
+            resident && window.is_none_or(|rows| verifies_slots::<B>(rows)),
+        )
+    }
+
     /// Whether a round of `slots` slots runs as one pass of the busy rows:
     /// several slots, and the shape [`Pass::One`].
     pub fn together(self, slots: usize) -> bool {
@@ -611,6 +627,17 @@ impl Pass {
             Pass::Turns => "turns",
         }
     }
+}
+
+/// Whether body `B` verifies several slots' drafted windows of `rows` rows
+/// in one pass (`app::Session::verify_rounds`): it settles a partial keep
+/// of a pass's rows at the commit ([`SlotRows::SETTLES_PARTIAL_KEEP`],
+/// without which `GpuModel::verify_slots` refuses by name), and its pass
+/// holds two such windows ([`slots_a_pass`]). The one owner of the
+/// capability every seat's open reads ([`Pass::of_body`]), whatever draft
+/// fills the windows.
+pub const fn verifies_slots<B: SlotRows>(rows: usize) -> bool {
+    B::SETTLES_PARTIAL_KEEP && slots_a_pass::<B>(rows) > 1
 }
 
 /// The text of [`parallel_line`].

@@ -250,12 +250,12 @@ use app::mtp::{MtpBody, MtpDraft};
 use app::{OpenLog, RowsLog, Session, SessionError};
 use bloomery_gpu::checkpoint::saved::SaveLane;
 use bloomery_gpu::host::swap::Residency;
-use bloomery_gpu::model::{StepMode, slots_a_pass};
+use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{
     CacheRam, Cached, ChatSurface, Landing, Listen, Pass, PutBack, Seat, SeatEngine, SlotFlags,
     SlotPassRow, SlotStep, TemplateFile, Vocab, arm_screen, begin, bind_server, eprint_noted,
-    model_props, note_line, parallel_line, placement_of, put_back, slots_given,
+    model_props, note_line, parallel_line, placement_of, put_back, slots_given, verifies_slots,
 };
 use bloomery_gpu_gates::generate::{
     DraftYield, Lane, Place, draft_yield, lane_at, mode_name, with_cards,
@@ -353,27 +353,28 @@ const VERIFY_ROWS: usize = <Body as MtpBody>::VERIFY_ROWS;
 enum Rounds {
     /// A plain load: one pass of the busy rows' steps
     /// (`serve_seats::rounds::step_rows_one_pass`, cut at the body's
-    /// [`slots_a_pass`]).
+    /// `slots_a_pass`).
     Steps,
-    /// A NextN load whose body's pass of several slots holds two drafted
-    /// windows: one pass of the busy slots' windows
+    /// A NextN load whose body verifies several slots' drafted windows
+    /// together: one pass of the busy slots' windows
     /// (`serve_seats::rounds::pass_rows_one_pass`, cut between windows).
     Windows,
-    /// A NextN load whose body's pass does not: a select and a pass a row
+    /// A NextN load whose body does not: a select and a pass a row
     /// ([`pass_rows_in_turn`]).
     Turns,
 }
 
 impl Rounds {
     /// The shape of a load that drafts (`drafts`) or not: a drafted round
-    /// is one pass when the body's pass of several slots holds two windows
-    /// of the seat's depth — the token at a slot's position and its
-    /// proposal of [`MtpBody::WIDTH`] ids — so two slots' windows run
-    /// together; a body whose pass holds fewer rows keeps the fallback loop.
+    /// is one pass when the body verifies several slots' windows of the
+    /// seat's depth together (`bind::verifies_slots`: the token at a slot's
+    /// position and its proposal of [`MtpBody::WIDTH`] ids, two of them in
+    /// its pass of several slots, a partial keep settled at the commit); a
+    /// body that does not keeps the fallback loop.
     fn of(drafts: bool) -> Rounds {
         if !drafts {
             Rounds::Steps
-        } else if slots_a_pass::<Body>(1 + <Body as MtpBody>::WIDTH) > 1 {
+        } else if verifies_slots::<Body>(VERIFY_ROWS) {
             Rounds::Windows
         } else {
             Rounds::Turns
@@ -1332,14 +1333,7 @@ impl Glm {
     /// loop, whose pass steps a skipping slot plainly.
     fn off_skipping(&mut self, rows: &[SlotPassRow]) -> Result<(), GateError> {
         for r in rows {
-            let skips = self
-                .drafted
-                .round_mut()
-                .0
-                .get(r.slot)
-                .and_then(Option::as_ref)
-                .is_some_and(|spec| spec.draft().draft().skipping());
-            if skips && !self.drafted.is_off(r.slot) {
+            if self.drafted.skipping(r.slot) && !self.drafted.is_off(r.slot) {
                 self.drafted.turn_off(r.slot, SKIP_OFF_WHY)?;
             }
         }
@@ -1562,7 +1556,7 @@ impl Seat for Glm {
     /// One round of several slots ([`super::rounds::step_round`]): one pass
     /// of the busy rows on a plain load ([`Rounds::Steps`], through
     /// `serve_seats::rounds::step_rows_one_pass` — cut at the body's
-    /// [`slots_a_pass`], the rows' answers and lent logits rows from
+    /// `slots_a_pass`, the rows' answers and lent logits rows from
     /// the pass's own per-row heads, slot 0 left selected), then the call's
     /// `residency pass` records, else the seat's fallback — a select and a
     /// step a row — the NextN load's step round, whose body refuses a pass
@@ -1587,7 +1581,7 @@ impl Seat for Glm {
     /// `serve_seats::rounds::pass_rows_one_pass` — each slot's window over
     /// its own draft at the depth a one-slot pass proposes, the windows laid
     /// in slot order and cut between them at the body's
-    /// [`slots_a_pass`], slot 0 left selected), each slot whose draft
+    /// `slots_a_pass`, slot 0 left selected), each slot whose draft
     /// skips turned off first ([`Glm::off_skipping`]) and stepped alone,
     /// then the call's `residency pass` records; else the fallback (a select
     /// and a pass a row, which prints its own `slots round` record). A

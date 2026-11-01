@@ -35,12 +35,12 @@
 //! ([`SlotDrafts::lookup`]) and the served draft (`served::ServedDraft`)
 //! alike.
 
-use app::mtp::{MtpBody, MtpDraft, Parked, SlotWalks};
-use app::{Keep, Prompt, RowsLog, Session, SessionError};
+use app::mtp::{MtpBody, MtpDraft, Parked, SlotWalks, SlotWindow};
+use app::{Draw, Keep, Prompt, RoundWindow, RowsLog, Session, SessionError};
 use bloomery_gpu::GpuModel;
 use bloomery_gpu::best;
 use bloomery_gpu::checkpoint::bytes;
-use bloomery_gpu::model::{Rollback, Rows, Slots};
+use bloomery_gpu::model::{Rollback, Rows, SlotRows, Slots};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::record::{self, Record};
 use runtime::width::{Choosing, Chosen, Clock, Mode as WidthMode, Wall};
@@ -49,6 +49,8 @@ use runtime::{
     Speculative, Target, Verify, Want, WidthError, Widths, Window,
 };
 use serve::{DraftProps, Drafted, EngineProps, Sampler};
+
+use super::rounds::{RoundDrafts, RoundRow};
 
 /// The rows a lookup pass verifies: the token at the target's position and
 /// the lookup's one proposed id (its `WIDTH` + 1, which
@@ -95,6 +97,14 @@ trait LookupWindow<T> {
         take: Taking<'_>,
         out: &mut Vec<u32>,
     ) -> Result<Committed, GateError>;
+    /// The chooser's mode.
+    fn mode(&self) -> WidthMode;
+    /// The chooser's acceptance learned from whole-round windows
+    /// (`Choosing::batch_profile`).
+    fn batch_profile(&self) -> &[f64];
+    /// A round of several slots ran this slot's window, the chooser bypassed:
+    /// `rows` ran, `kept` were kept (`Choosing::round_ran`).
+    fn round_ran(&mut self, rows: usize, kept: usize);
     #[cfg(test)]
     fn gate_state(&self) -> runtime::width::GateState;
     /// The passes the chooser holds no record of yet, taken.
@@ -137,6 +147,18 @@ where
                 pass_in_turn(self, t, last, &mut SampleBest(|row: &[f32]| f(row)), out)
             }
         }?)
+    }
+
+    fn mode(&self) -> WidthMode {
+        self.draft().mode()
+    }
+
+    fn batch_profile(&self) -> &[f64] {
+        self.draft().batch_profile()
+    }
+
+    fn round_ran(&mut self, rows: usize, kept: usize) {
+        self.draft_mut().round_ran(rows, kept);
     }
 
     #[cfg(test)]
@@ -207,6 +229,9 @@ pub(crate) struct Lookups<T> {
     /// Each slot's window, by slot.
     windows: Vec<Box<dyn LookupWindow<T>>>,
     history: Option<History<T>>,
+    /// The width chooser of a round of several slots' windows verified
+    /// together ([`RoundDrafts`]), each slot's own chooser bypassed there.
+    batch: runtime::width::Batch,
 }
 
 impl<B: Prompt + Keep + Rows + Rollback> Lookups<Session<B>> {
@@ -238,7 +263,11 @@ impl<B: Prompt + Keep + Rows + Rollback> Lookups<Session<B>> {
         for _ in 1..slots {
             windows.push(Box::new(Speculative::<_, LOOKUP_ROWS>::new(choosing()?)));
         }
-        Ok(Lookups { windows, history })
+        Ok(Lookups {
+            windows,
+            history,
+            batch: runtime::width::Batch::default(),
+        })
     }
 }
 
@@ -303,7 +332,9 @@ impl<T: Target> Lookups<T> {
         Ok(next)
     }
 
-    /// The seat's plain step of `last` on `slot` took `next`.
+    /// The seat's plain step of `last` on `slot`, the target's selected
+    /// one, took `next` ([`Lookups::told`] at the position before the
+    /// target's).
     pub(crate) fn stepped(
         &mut self,
         t: &T,
@@ -312,6 +343,43 @@ impl<T: Target> Lookups<T> {
         next: u32,
     ) -> Result<(), GateError> {
         let pos = (t.pos() as usize).saturating_sub(1);
+        self.told(t, slot, pos, last, next)
+    }
+
+    /// A round of several slots' steps: `slot`'s row of `last` at position
+    /// `pos` took `next` ([`Lookups::told`]), whichever slot the target
+    /// selects after. Refused by name on a target that keeps its token
+    /// history: a context rebuilt there would read the selected slot's
+    /// history, not `slot`'s.
+    pub(crate) fn stepped_at(
+        &mut self,
+        t: &T,
+        slot: usize,
+        pos: usize,
+        last: u32,
+        next: u32,
+    ) -> Result<(), GateError> {
+        if self.history.is_some() {
+            return Err(format!(
+                "slot {slot}: a round's step on a lookup that rebuilds its context from the \
+                 selected slot's history"
+            )
+            .into());
+        }
+        self.told(t, slot, pos, last, next)
+    }
+
+    /// A plain step of `last` at `slot`'s position `pos` took `next`: the
+    /// slot's chooser closed for it, its context stood at `pos` and `next`
+    /// pushed.
+    fn told(
+        &mut self,
+        t: &T,
+        slot: usize,
+        pos: usize,
+        last: u32,
+        next: u32,
+    ) -> Result<(), GateError> {
         let l = self.before(t, slot, pos, Call::Moved)?;
         l.stand(pos, last);
         l.push(next);
@@ -488,10 +556,11 @@ where
 {
     /// Each slot's window over its own draft; empty without a draft. An
     /// entry is `None` only while a round holds its window out
-    /// ([`SlotDrafts::round_mut`]).
+    /// ([`RoundDrafts::run`]).
     specs: Vec<Option<Spec<B, M>>>,
+    /// The width chooser of a round of several slots' windows verified
+    /// together ([`RoundDrafts`]), each slot's own chooser bypassed there.
     batch: runtime::width::Batch,
-    widths: Vec<usize>,
     /// Why each slot's draft is off until the slot's next reset, and whether
     /// a record has said so since it was turned off; `None` while it drafts.
     off: Vec<Option<(&'static str, bool)>>,
@@ -509,7 +578,6 @@ where
         SlotDrafts {
             specs: Vec::new(),
             batch: runtime::width::Batch::default(),
-            widths: Vec::new(),
             off: Vec::new(),
             lookups: None,
         }
@@ -528,7 +596,6 @@ where
         Ok(SlotDrafts {
             specs: Vec::new(),
             batch: runtime::width::Batch::default(),
-            widths: Vec::new(),
             off: Vec::new(),
             lookups: Some(Lookups::open(s, slots, mode, log, None)?),
         })
@@ -567,7 +634,6 @@ where
         Ok(SlotDrafts {
             specs,
             batch: runtime::width::Batch::default(),
-            widths: Vec::new(),
             off: vec![None; slots],
             lookups: None,
         })
@@ -1106,18 +1172,208 @@ where
         }
     }
 
-    /// Every slot's window, by slot, for a round that drives several slots'
-    /// drafts at once (`serve_seats::rounds::pass_rows_one_pass`, which
-    /// takes each busy slot's window out and puts it back); empty without a
-    /// draft.
-    pub(crate) fn round_mut(
+    /// Whether `slot`'s MTP draft proposes nothing until the slot's next
+    /// reset ([`MtpDraft::skipping`]); false for a slot the table holds no
+    /// MTP draft of.
+    pub(crate) fn skipping(&self, slot: usize) -> bool {
+        self.specs
+            .get(slot)
+            .and_then(Option::as_ref)
+            .is_some_and(|spec| spec.draft().draft().skipping())
+    }
+
+    /// The lookup's table ([`SlotDrafts::lookup`]), for a round of several
+    /// slots' lookup windows (`serve_seats::rounds::pass_rows_lookup`);
+    /// `None` under the MTP draft or none.
+    pub(crate) fn lookups_mut(&mut self) -> Option<&mut Lookups<Session<B>>> {
+        self.lookups.as_mut()
+    }
+}
+
+/// The MTP table's round of several slots' windows: each busy slot's window
+/// taken out of the table for the round ([`app::mtp::pass_slots`], which
+/// proposes and verifies them) and put back after it, its chooser bypassed.
+impl<B, const M: usize> RoundDrafts<B> for SlotDrafts<B, M>
+where
+    B: MtpBody + SlotRows,
+    B::Seq: 'static,
+    Window<M>: Widths,
+{
+    /// `depth`, or 0 for a skipping draft; refused for a slot with no draft.
+    fn width(&self, slot: usize, depth: usize) -> Result<usize, GateError> {
+        match self.specs.get(slot) {
+            Some(Some(_)) if self.skipping(slot) => Ok(0),
+            Some(Some(_)) => Ok(depth),
+            _ => Err(format!("slot {slot}: the seat holds no draft of it").into()),
+        }
+    }
+
+    fn mode(&self, slot: usize) -> WidthMode {
+        self.specs
+            .get(slot)
+            .and_then(Option::as_ref)
+            .map_or(WidthMode::Fixed, |spec| spec.draft().mode())
+    }
+
+    fn choose(
         &mut self,
-    ) -> (
-        &mut [Option<Spec<B, M>>],
-        &mut runtime::width::Batch,
-        &mut Vec<usize>,
-    ) {
-        (&mut self.specs, &mut self.batch, &mut self.widths)
+        slots: &[usize],
+        widths: &mut [usize],
+        allowed: std::ops::RangeInclusive<usize>,
+        limits: (usize, usize),
+    ) -> Result<(), WidthError> {
+        let mode = self.mode(slots[0]);
+        let specs = &self.specs;
+        let profiles = slots.iter().map(|&slot| {
+            specs[slot]
+                .as_ref()
+                .map_or(&[][..], |spec| spec.draft().batch_profile())
+        });
+        self.batch.choose(mode, profiles, widths, allowed, limits)
+    }
+
+    fn run(
+        &mut self,
+        s: &mut Session<B>,
+        round: &mut [RoundRow<'_>],
+    ) -> Result<(Vec<Committed>, usize), GateError> {
+        let mut taken: Vec<_> = round.iter().map(|r| self.specs[r.slot].take()).collect();
+        let run = {
+            let mut windows = Vec::with_capacity(round.len());
+            let mut missing = None;
+            for (r, spec) in round.iter_mut().zip(&mut taken) {
+                let Some(spec) = spec.as_mut() else {
+                    missing = Some(r.slot);
+                    break;
+                };
+                windows.push(SlotWindow {
+                    slot: r.slot,
+                    draft: spec.draft_mut().draft_mut(),
+                    last: r.last,
+                    depth: r.width,
+                    out: &mut *r.out,
+                    draw: r.draw.as_mut().map(|d| Draw {
+                        take: &mut *d.take,
+                        best: d.best,
+                    }),
+                });
+            }
+            match missing {
+                Some(slot) => Err(format!("slot {slot}: the seat holds no draft of it").into()),
+                None => app::mtp::pass_slots(s, &mut windows).map_err(GateError::from),
+            }
+        };
+        for (r, spec) in round.iter().zip(taken) {
+            self.specs[r.slot] = spec;
+        }
+        run
+    }
+
+    fn ran(&mut self, slot: usize, rows: usize, kept: usize) {
+        if let Some(Some(spec)) = self.specs.get_mut(slot) {
+            spec.draft_mut().round_ran(rows, kept);
+        }
+    }
+
+    fn observe(&mut self, rows: &[usize], ms: f64) -> Result<(), WidthError> {
+        self.batch.observe(rows.iter().copied(), ms)
+    }
+}
+
+/// The lookup's round of several slots' windows: each busy slot's context
+/// stood at its slot's position and asked for its one id, then the windows
+/// verified together ([`Session::verify_rounds`]), each context given the
+/// ids its rows kept, as [`Draft::accept`] and [`Draft::stepped`] give them
+/// on one slot. Each slot's chooser is bypassed, as the MTP table's is.
+impl<B> RoundDrafts<B> for Lookups<Session<B>>
+where
+    B: SlotRows + Prompt + Keep + Rows + Rollback,
+    B::Seq: 'static,
+{
+    /// `depth`; refused for a slot past the table.
+    fn width(&self, slot: usize, depth: usize) -> Result<usize, GateError> {
+        match self.windows.get(slot) {
+            Some(_) => Ok(depth),
+            None => Err(format!(
+                "slot {slot}: the lookup draft holds {} slots",
+                self.windows.len()
+            )
+            .into()),
+        }
+    }
+
+    fn mode(&self, slot: usize) -> WidthMode {
+        self.windows
+            .get(slot)
+            .map_or(WidthMode::Fixed, |w| w.mode())
+    }
+
+    fn choose(
+        &mut self,
+        slots: &[usize],
+        widths: &mut [usize],
+        allowed: std::ops::RangeInclusive<usize>,
+        limits: (usize, usize),
+    ) -> Result<(), WidthError> {
+        let mode = self.mode(slots[0]);
+        let windows = &self.windows;
+        let profiles = slots.iter().map(|&slot| windows[slot].batch_profile());
+        self.batch.choose(mode, profiles, widths, allowed, limits)
+    }
+
+    fn run(
+        &mut self,
+        s: &mut Session<B>,
+        round: &mut [RoundRow<'_>],
+    ) -> Result<(Vec<Committed>, usize), GateError> {
+        let mut rows = Vec::with_capacity(round.len());
+        let mut firsts = Vec::with_capacity(round.len());
+        for r in round.iter() {
+            s.select_slot(r.slot)?;
+            let pos = s.pos();
+            let l = self.before(s, r.slot, pos as usize, Call::Pass)?;
+            l.stand(pos as usize, r.last);
+            let mut ids = vec![r.last];
+            if r.width > 0
+                && let Some(id) = Lookup::propose(l)
+            {
+                ids.push(id);
+            }
+            rows.push(ids);
+            firsts.push(pos);
+        }
+        let slots: Vec<usize> = round.iter().map(|r| r.slot).collect();
+        let mut windows: Vec<RoundWindow<'_>> = round
+            .iter_mut()
+            .zip(&rows)
+            .zip(&firsts)
+            .map(|((r, ids), &pos)| RoundWindow {
+                slot: r.slot,
+                pos,
+                rows: ids,
+                out: &mut *r.out,
+                draw: r.draw.as_mut().map(|d| Draw {
+                    take: &mut *d.take,
+                    best: d.best,
+                }),
+            })
+            .collect();
+        let contexts = &mut self.windows;
+        Ok(s.verify_rounds(&mut windows, |i, ids, kept| {
+            let l = contexts[slots[i]].lookup_mut();
+            ids[..kept].iter().for_each(|&id| l.push(id));
+            Ok(())
+        })?)
+    }
+
+    fn ran(&mut self, slot: usize, rows: usize, kept: usize) {
+        if let Some(w) = self.windows.get_mut(slot) {
+            w.round_ran(rows, kept);
+        }
+    }
+
+    fn observe(&mut self, rows: &[usize], ms: f64) -> Result<(), WidthError> {
+        self.batch.observe(rows.iter().copied(), ms)
     }
 }
 
@@ -1243,6 +1499,7 @@ mod tests {
         lookup_table.lookups = Some(Lookups {
             windows: Vec::new(),
             history: None,
+            batch: runtime::width::Batch::default(),
         });
         none.takes(None).expect("no draft takes no side");
         mtp_table.takes(Some(&mtp)).expect("MTP takes its own side");
@@ -1438,6 +1695,7 @@ mod tests {
         Lookups {
             windows: (0..slots).map(window).collect(),
             history: None,
+            batch: runtime::width::Batch::default(),
         }
     }
 

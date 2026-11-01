@@ -17,10 +17,11 @@
 //! the resident slots are erased, with the ids each gave re-run from the
 //! cache in its own slot. A third two-slot lookup server, under the
 //! width chooser's cost mode, runs the code and the prose requests
-//! together: their slots take turns at the passes, their ids are the
-//! draft-off server's, and each slot's chooser ends its warm-up
-//! ([`lookup_cost_turns`]). `plain` runs the main server with the
-//! draft off, then every clause of its own below. `drafted` runs the main
+//! together: both slots' windows are verified in one pass a round, never a
+//! slot at a time, their ids are the draft-off server's, and each slot's
+//! erase prints its request's width record ([`lookup_cost_rounds`]).
+//! `plain` runs the main server with the draft off, then every clause of
+//! its own below. `drafted` runs the main
 //! server with MTP and its drafted clauses alone, stopped before the one
 //! other server it starts, the slot-file clause's. These last two arms load
 //! their mains, the slots clause's two, the width chooser's one, the sampled
@@ -6201,7 +6202,7 @@ mod gate {
             println!("lookup {draft} server stopped: {}", served.stop()?);
         }
         let texts = [code.as_str(), prose];
-        ok &= lookup_cost_turns(
+        ok &= lookup_cost_rounds(
             dir,
             texts,
             [plain[1].tokens.as_slice(), plain[2].tokens.as_slice()],
@@ -6211,12 +6212,15 @@ mod gate {
 
     /// The lookup under the width chooser's cost mode, on `--parallel 2` with
     /// `BLOOMERY_STEP_STATS=1`, into `<dir>/cost`: the two `texts` (the arm's
-    /// code and prose requests) run together, so their slots take turns at
-    /// the passes (a `slots round` of two rows in two passes), and their ids
-    /// are `plain`, the draft-off server's. Each slot's chooser reads its own
-    /// passes, so both end their warm-up: erasing the two slots prints each
-    /// slot's `mtp width` record of its request, every width's cost read.
-    fn lookup_cost_turns(
+    /// code and prose requests) run together, so their slots' windows are
+    /// verified in one pass a round (a `slots round` of two rows in one
+    /// pass, `rounds::pass_rows_lookup`; none of two rows in two, the slot
+    /// at a time the body no longer needs), and their ids are `plain`, the
+    /// draft-off server's. The round's wall is read by the round's chooser
+    /// (`runtime::width::Batch`), each slot's own chooser counting the
+    /// round's rows: erasing the two slots prints each slot's `mtp width`
+    /// record of its request.
+    fn lookup_cost_rounds(
         dir: &Path,
         texts: [&str; 2],
         plain: [&[u32]; 2],
@@ -6258,17 +6262,34 @@ mod gate {
             );
         }
         let rounds = seat_log(&err_log)?.all(&record::SLOTS_ROUND)?;
-        let turns = rounds
-            .iter()
-            .filter(|r| {
-                r.word("cmd") == Ok("pass") && r.u64("rows") == Ok(2) && r.u64("passes") == Ok(2)
-            })
-            .count();
+        let of_two = |passes: u64| {
+            rounds
+                .iter()
+                .filter(|r| {
+                    r.word("cmd") == Ok("pass")
+                        && r.u64("rows") == Ok(2)
+                        && r.u64("passes") == Ok(passes)
+                })
+                .count()
+        };
+        let (together, turns) = (of_two(1), of_two(2));
         println!(
-            "lookup cost: {turns} of {} rounds both slots' passes in turn",
+            "lookup cost: {together} of {} rounds both slots' windows in one pass, {turns} in two",
             rounds.len()
         );
-        check(&mut ok, "lookup_cost_slots_take_turns", turns > 0);
+        check(
+            &mut ok,
+            "lookup_cost_slots_verify_together",
+            together > 0 && turns == 0,
+        );
+        // PIN(2026-11-01): the slots' lookup windows verify together, so the
+        // round's chooser (`runtime::width::Batch`) reads each round's wall
+        // and a slot's own chooser only counts its rows: its record's cost
+        // cells stay `-`. `lookup_cost_slots_verify_together` replaces
+        // `lookup_cost_slots_take_turns`, and this clause replaces
+        // `lookup_cost_warm_up_ends_on_both_slots` (two costs a slot), whose
+        // costs no longer exist. No serve clause pins the round chooser's
+        // costs; its own tests are `runtime::width`'s.
         let before = seat_log(&err_log)?.all(&record::MTP_WIDTH)?.len();
         for slot in 0..2 {
             let (st, body) = curl(
@@ -6278,22 +6299,14 @@ mod gate {
             )?;
             slot_erased(&json_of("lookup cost erase", st, &body)?, slot, CTX as u64)?;
         }
-        // Each erase prints its slot's record of the request. The warm-up's
-        // readings need a few proposals a slot, which a random-weight
-        // fixture need not make.
+        // Each erase prints its slot's record of the request.
         let widths = seat_log(&err_log)?.all(&record::MTP_WIDTH)?;
         println!("lookup cost: width records {widths:?}, {before} before the erases");
-        if tier::run_clause("lookup_cost_warm_up_ends_on_both_slots", Tag::FileBound)? {
-            check(
-                &mut ok,
-                "lookup_cost_warm_up_ends_on_both_slots",
-                widths.len() == before + 2
-                    && widths[before..].iter().all(|r| {
-                        r.csv("costs")
-                            .is_ok_and(|c| c.len() == 2 && !c.contains(&"-"))
-                    }),
-            );
-        }
+        check(
+            &mut ok,
+            "lookup_cost_erase_prints_both_slots",
+            widths.len() == before + 2,
+        );
         println!("lookup cost server stopped: {}", served.stop()?);
         Ok(ok)
     }
