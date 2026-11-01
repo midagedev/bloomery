@@ -47,7 +47,7 @@ pub mod tp;
 
 pub use body::nextn::{
     GlmArena, Nextn, WALK_ROWS, nextn_chain, nextn_hidden, nextn_logits, nextn_router, nextn_store,
-    nextn_target_streams, nextn_walk,
+    nextn_target_streams, nextn_walk, retain_prompt_row,
 };
 pub use body::prefill::{
     CHUNK, FfnTapRows, GEMM_FROM, GlmPromptSink, PrefillMode, PromptBytes, RouteTapRows,

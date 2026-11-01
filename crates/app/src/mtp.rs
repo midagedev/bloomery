@@ -219,6 +219,15 @@ pub trait MtpBody: Prompt + Keep + Rows + Rollback {
     /// start at or below it, never past it. The model's reset empties it.
     fn held(m: &GpuModel<Self>) -> Result<usize, GpuError>;
 
+    /// Copy a shared prompt arena's final hidden row `first`, at position
+    /// `pos - 1`, to the sequence's step arena row 0, including its record.
+    fn retain_prompt_row(
+        m: &mut GpuModel<Self>,
+        walk: Self::Arena,
+        first: usize,
+        pos: u32,
+    ) -> Result<(), GpuError>;
+
     /// The prompt call: `ids` from the model's position by `path`, and the
     /// argmax after the last. `sink` is called after each unit the call runs,
     /// whatever the path's unit is (a step, a pass, a ubatch), with the arena
@@ -917,6 +926,15 @@ impl<B: MtpBody + Slots> MtpDraft<B>
 where
     B::Seq: 'static,
 {
+    /// Preserve the prompt's waiting row before another resident sequence
+    /// can overwrite its shared arena. The target is never run again.
+    pub fn retain_prompt(&mut self, t: &mut Session<B>) -> Result<(), SessionError> {
+        let pos = t.pos();
+        Ok(self.policy.retain_prompt(pos, |walk, first, pos| {
+            B::retain_prompt_row(t.model_mut(), walk, first, pos)
+        })?)
+    }
+
     /// [`MtpDraft::before_step`] on the session's selected slot, its walk
     /// gathered into `walks` when it reads the slot's own step or verify
     /// arena. Shared prompt rows are walked immediately, before a slot

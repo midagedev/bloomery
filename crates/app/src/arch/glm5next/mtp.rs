@@ -54,6 +54,15 @@ impl MtpBody for Body {
             })
     }
 
+    fn retain_prompt_row(
+        m: &mut GpuModel<Body>,
+        walk: GlmArena,
+        first: usize,
+        pos: u32,
+    ) -> Result<(), GpuError> {
+        bloomery_gpu_glm5next::retain_prompt_row(m, walk, first, pos)
+    }
+
     fn prompt_with(
         m: &mut GpuModel<Body>,
         ids: &[u32],

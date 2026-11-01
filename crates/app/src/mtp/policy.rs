@@ -466,6 +466,33 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
         Ok(())
     }
 
+    /// Keep a prompt's last hidden row across a sequence change. Step and
+    /// verify arenas already belong to the sequence; a shared prompt arena
+    /// is copied to row 0 of the step arena before its record moves there.
+    pub(super) fn retain_prompt<E>(
+        &mut self,
+        pos: u32,
+        retain: impl FnOnce(A, usize, u32) -> Result<(), E>,
+    ) -> Result<(), E> {
+        if self.skip.is_some() {
+            return Ok(());
+        }
+        let kept = |walk| walk == self.shape.step || walk == self.shape.verify;
+        if let Some(r) = &mut self.next {
+            if !kept(r.walk) {
+                retain(r.walk, r.first, r.pos0)?;
+                r.walk = self.shape.step;
+                r.first = 0;
+            }
+        } else if let Some((walk, rows)) = self.last_unit
+            && !kept(walk)
+        {
+            retain(walk, rows - 1, pos)?;
+            self.last_unit = Some((self.shape.step, 1));
+        }
+        Ok(())
+    }
+
     /// The window's chain at the target's position `here` of a context of
     /// `ctx`, into `room` ids: the refresh taken, its last row `last`, the
     /// token at `here`, and the own walks the room and the verify's rows
@@ -821,6 +848,55 @@ mod tests {
         fn held(&mut self) -> Result<usize, String> {
             Ok(self.store)
         }
+    }
+
+    #[test]
+    fn retain_prompt_keeps_the_anchor_when_another_sequence_overwrites_the_prompt_arena() {
+        for begun in [false, true] {
+            let mut rig = Rig::new(64);
+            rig.prompt(&IDS, 4, Ar::Ubatch).unwrap();
+            if begun {
+                rig.begin().unwrap();
+            }
+            let pos = rig.c.pos;
+            let mut copied = 0;
+            rig.p
+                .retain_prompt(pos, |walk, first, at| {
+                    assert_eq!((walk, first, at), (Ar::Ubatch, 0, pos));
+                    let src = rig.c.arenas[walk as usize];
+                    assert_eq!(src.first + first as u32, pos - 1);
+                    rig.c.arenas[Ar::Step as usize] = Held {
+                        first: pos - 1,
+                        rows: 1,
+                    };
+                    copied += 1;
+                    Ok::<_, String>(())
+                })
+                .unwrap();
+            assert_eq!(copied, 1);
+            rig.p
+                .retain_prompt(pos, |_, _, _| -> Result<(), String> {
+                    panic!("the step arena already belongs to the sequence")
+                })
+                .unwrap();
+            rig.c.arenas[Ar::Ubatch as usize] = Held::default();
+            let parked = rig.p.park();
+            assert_eq!(parked.skip, None);
+            rig.p.restart();
+            rig.p.unpark(&parked);
+            if !begun {
+                rig.begin().unwrap();
+            }
+            let chain = rig.p.chain(pos, rig.c.ctx, rig.last, 4).unwrap().unwrap();
+            assert_eq!((chain.refresh.walk, chain.refresh.first), (Ar::Step, 0));
+            rig.c.walk(&chain.refresh.as_walk(STORE)).unwrap();
+        }
+        let mut rig = Rig::new(64);
+        rig.prompt(&IDS[..8], 4, Ar::Ubatch).unwrap();
+        let last = rig.p.last_unit;
+        let failed = rig.p.retain_prompt(rig.c.pos, |_, _, _| Err("copy failed"));
+        assert_eq!(failed, Err("copy failed"));
+        assert_eq!(rig.p.last_unit, last);
     }
 
     fn fail(f: Fail<String>) -> String {

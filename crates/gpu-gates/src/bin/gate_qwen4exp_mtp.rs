@@ -3059,7 +3059,52 @@ mod gate {
             drafted.tokens,
             verdict(same && rejoins)
         );
-        if ok && same && rejoins {
+        s.model_mut().add_slots(2)?;
+        s.reset()?;
+        spec.draft_mut().restart();
+        close_on(s.model_mut(), true)?;
+        let first = spec.prompt(&mut s, prompt);
+        close_on(s.model_mut(), false)?;
+        let first = first?;
+        let width = s.model().body("(cl)")?.mtp_tap_width();
+        let source = s.model().body("(cl)")?.target_streams(
+            s.model().gpu(),
+            TargetRows::Ubatch,
+            prompt.len() % UB_CLOSE,
+        )?;
+        spec.draft_mut().retain_prompt(&mut s)?;
+        let anchor = spec.draft().park();
+        s.model_mut().select_slot(1)?;
+        s.reset()?;
+        let other: Vec<u32> = prompt.iter().copied().rev().collect();
+        s.model_mut().prompt38(&other, Prompt38::Gemm)?;
+        s.model_mut().select_slot(0)?;
+        spec.draft_mut().unpark(&anchor);
+        let retained =
+            s.model()
+                .body("(cl)")?
+                .target_streams(s.model().gpu(), TargetRows::Step, 1)?;
+        let row_equal = retained
+            .iter()
+            .map(|v| v.to_bits())
+            .eq(source[source.len() - width..].iter().map(|v| v.to_bits()));
+        let active = !spec.draft().skipping();
+        let after_switch = runtime::generate(
+            &mut s,
+            &mut spec,
+            prompt,
+            first,
+            &runtime::Stop::new(8, CTX_CLOSE as u32)?,
+            &mut Kept::default(),
+        )?;
+        let preserved = row_equal && active && after_switch.tokens == drafted.tokens;
+        println!(
+            "(cl) close then another slot's prompt: retained_row_bits={row_equal} draft_active={active} \
+             greedy_equal={} {}",
+            after_switch.tokens == drafted.tokens,
+            verdict(preserved),
+        );
+        if ok && same && rejoins && preserved {
             Ok(())
         } else {
             Err(checks_failed())
