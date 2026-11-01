@@ -2624,20 +2624,20 @@ impl<H: HostExperts> HostTier<H> {
         }
     }
 
-    /// The tier census since load ([`census::TierCensus`]) of a load that
-    /// pages its host experts through `tier`, the NVMe tier's arena: the
-    /// services' picks, the host's reads by source, the arena's counters,
-    /// the residency machine's moves (none without one) and the pool's
-    /// dispatch waits. `None` with no tier or a host that does not count its
-    /// reads.
+    /// The tier census since load ([`census::TierCensus`]) of a load whose
+    /// host counts its reads, paging its host experts through `tier`, the
+    /// NVMe tier's arena, if any: the services' picks, the host's reads by
+    /// source, the arena's counters (none without a tier), the residency
+    /// machine's moves (none without one) and the pool's dispatch waits.
+    /// `None` for a host that does not count its reads.
     pub fn census(&self, tier: Option<&nvtier::NvTier>) -> Option<census::TierCensus> {
-        let (tier, reads) = (tier?, self.experts.reads()?);
+        let reads = self.experts.reads()?;
         Some(census::TierCensus::of(
             &self.stats(),
             self.step.boundary.layout.handoff().n_used,
             self.slots.layers().len(),
             reads,
-            &tier.stats(),
+            &tier.map(nvtier::NvTier::stats).unwrap_or_default(),
             self.swap
                 .as_ref()
                 .map_or((0, 0), swap::SwapMachine::moved_bytes),

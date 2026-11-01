@@ -214,6 +214,9 @@ struct Muse {
     /// The copy stream and pinned staging saved states are made on
     /// ([`Seat::snapshots_async`]); none with the cache off.
     lane: Option<SaveLane>,
+    /// The `tier census` records' span start ([`record::host_tier::CensusSpan`]): each
+    /// prompt prints the steps since the last one's, then its own.
+    census: record::host_tier::CensusSpan,
 }
 
 impl Muse {
@@ -299,16 +302,15 @@ impl Muse {
             .f("load_s", total.as_secs_f64())
             .eprint();
         record::eprint_load_phases(s.model(), total, opened);
-        record::eprint_nvtier(
-            s.model()
-                .body(NAME)?
-                .placed()
-                .and_then(|p| p.hybrid().nvme_tier()),
-        );
+        let hybrid = s.model().body(NAME)?.placed().map(|p| p.hybrid());
+        record::host_tier::eprint_nvtier(hybrid.and_then(|h| h.nvme_tier()));
+        let mut census = record::host_tier::CensusSpan::default();
+        census.mark("load", hybrid.and_then(record::census_of));
         Ok(Muse {
             s,
             ctx: a.ctx,
             lane,
+            census,
         })
     }
 }
@@ -322,16 +324,15 @@ impl Seat for Muse {
         self.ctx
     }
 
-    /// The prompt as passes (`app::Prompt for Body`), the argmax after the last.
+    /// The prompt as passes (`app::Prompt for Body`), the argmax after the last;
+    /// the `tier census` records of the steps since the last prompt and of
+    /// this one, then the `nvtier` record.
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
+        let placed = self.s.model().body(NAME)?.placed();
+        self.census.steps(placed.map(|p| p.hybrid()));
         let next = <Body as Prompt>::prompt(self.s.model_mut(), ids)?;
-        record::eprint_nvtier(
-            self.s
-                .model()
-                .body(NAME)?
-                .placed()
-                .and_then(|p| p.hybrid().nvme_tier()),
-        );
+        let placed = self.s.model().body(NAME)?.placed();
+        self.census.prompt(placed.map(|p| p.hybrid()));
         Ok(next)
     }
 

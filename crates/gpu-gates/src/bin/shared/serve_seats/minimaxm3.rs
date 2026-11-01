@@ -225,6 +225,9 @@ struct MiniMax {
     /// The copy stream and pinned staging saved states are made on
     /// ([`Seat::snapshots_async`]); none with the cache off.
     lane: Option<SaveLane>,
+    /// The `tier census` records' span start ([`record::host_tier::CensusSpan`]): each
+    /// prompt prints the steps since the last one's, then its own.
+    census: record::host_tier::CensusSpan,
 }
 
 impl MiniMax {
@@ -315,11 +318,15 @@ impl MiniMax {
             .f("load_s", total.as_secs_f64())
             .eprint();
         record::eprint_load_phases(s.model(), total, opened);
-        record::eprint_nvtier(s.model().body(NAME)?.hybrid().nvme_tier());
+        let hybrid = s.model().body(NAME)?.hybrid();
+        record::host_tier::eprint_nvtier(hybrid.nvme_tier());
+        let mut census = record::host_tier::CensusSpan::default();
+        census.mark("load", record::census_of(hybrid));
         Ok(MiniMax {
             s,
             ctx: a.ctx,
             lane,
+            census,
         })
     }
 }
@@ -344,10 +351,14 @@ impl Seat for MiniMax {
         Ok(self.s.select_slot(slot)?)
     }
 
-    /// The prompt in batches (`app::Prompt for Body`), the argmax after the last.
+    /// The prompt in batches (`app::Prompt for Body`), the argmax after the last;
+    /// the `tier census` records of the steps since the last prompt and of
+    /// this one, then the `nvtier` record.
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
+        self.census.steps(Some(self.s.model().body(NAME)?.hybrid()));
         let next = <Body as Prompt>::prompt(self.s.model_mut(), ids)?;
-        record::eprint_nvtier(self.s.model().body(NAME)?.hybrid().nvme_tier());
+        self.census
+            .prompt(Some(self.s.model().body(NAME)?.hybrid()));
         Ok(next)
     }
 

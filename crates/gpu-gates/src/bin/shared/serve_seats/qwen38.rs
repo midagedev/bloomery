@@ -448,7 +448,6 @@ use bloomery_gpu::arch::qwen3moe::{
 };
 use bloomery_gpu::checkpoint::bytes;
 use bloomery_gpu::checkpoint::saved::SaveLane;
-use bloomery_gpu::host::census::TierCensus;
 use bloomery_gpu::host::route_trace::RouteTrace;
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
@@ -2634,10 +2633,9 @@ struct Q38 {
     reads_ahead: bool,
     /// [`Seat::step_stats`]: the `BLOOMERY_STEP_STATS` the binary parsed.
     stats: bool,
-    /// The load's tier census as the last call left it, on a load whose plan
-    /// pages through the NVMe tier: each call prints its span
-    /// ([`Q38::print_census`]). `None` on a load with no tier.
-    census: Option<TierCensus>,
+    /// The load's tier census as the last call left it: each call prints its
+    /// span ([`Q38::print_census`]).
+    census: record::host_tier::CensusSpan,
     /// The branch the last keep query took ([`Q38::draft_keep`]), one a
     /// slot, printed at that slot's next call; a `RefCell` because the keep
     /// query runs on `&self` (the engine thread owns the seat, so the borrow
@@ -2795,7 +2793,7 @@ impl Q38 {
         // `generate_qwen3moe` prints, at load — the arena's budget, the
         // paged bytes and the counters (all zero this early). A load that
         // attached no tier prints nothing, as the CLI's honest absence.
-        record::eprint_nvtier(m.body(WHAT)?.nvme_tier());
+        record::host_tier::eprint_nvtier(m.body(WHAT)?.nvme_tier());
         for h in threads::helper::helpers() {
             record::helper(
                 &h.name,
@@ -2915,10 +2913,11 @@ impl Q38 {
         let (gpu, _, body) = s.model_mut().body_parts(WHAT)?;
         let line = xstream_rule(gpu, body, a.xstream, a.place.stage38(), a.residency)?;
         eprintln!("{line}");
-        let census = {
+        let mut census = record::host_tier::CensusSpan::default();
+        {
             let b = s.model().body(WHAT)?;
-            b.hybrid().census(b.nvme_tier().map(|t| &**t))
-        };
+            census.mark("call", record::census_of(b.hybrid()));
+        }
         let lane = match a.cache_ram {
             0 => None,
             ram => Some(s.model_mut().seq_lane(ram)?),
@@ -3144,27 +3143,13 @@ impl Q38 {
     /// The `tier census` record of the span since the last call's, phase
     /// `call`, on stderr: its picks by where they were served and the bytes
     /// it moved between the tiers, the dropper's calls and wall and the
-    /// pool's dispatch waits; then the load's cumulative `nvtier` record, so
-    /// the last one of a run holds the arena's counters at its end. Nothing
-    /// on a load with no tier.
+    /// pool's dispatch waits ([`record::host_tier::CensusSpan`]); then the load's
+    /// cumulative `nvtier` record, so the last one of a run holds the arena's
+    /// counters at its end, none on a load with no tier.
     fn print_census(&mut self) -> Result<(), GateError> {
-        let Some(last) = self.census else {
-            return Ok(());
-        };
         let b = self.s.model().body("bloomery-serve-qwen38")?;
-        let Some(now) = b.hybrid().census(b.nvme_tier().map(|t| &**t)) else {
-            return Ok(());
-        };
-        now.since(&last)
-            .fields()
-            .iter()
-            .fold(
-                Record::new(&record::TIER_CENSUS).w("phase", "call"),
-                |r, &(k, v)| r.u(k, v),
-            )
-            .eprint();
-        self.census = Some(now);
-        record::eprint_nvtier(b.nvme_tier());
+        self.census.mark("call", record::census_of(b.hybrid()));
+        record::host_tier::eprint_nvtier(b.nvme_tier());
         Ok(())
     }
 }

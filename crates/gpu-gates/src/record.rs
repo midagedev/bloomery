@@ -30,6 +30,10 @@ use model::placement::{Machine, Plan, arena_slots};
 
 use crate::GateError;
 
+/// Shared host-tier output for server loads and requests.
+#[cfg(feature = "gpu")]
+pub mod host_tier;
+
 pub use bloomery_record::{
     Field, Fields, Kind, Log, Part, ReadError, Record, Ty, VERSION, print_schema, require, schema,
     tee,
@@ -945,10 +949,12 @@ pub static NVTIER_SITTING: Kind = Kind {
     ],
 };
 
-/// One span's tier census on a paged load (`bloomery_gpu::host::census`): the
-/// span's phase, its tokens, the routed picks its host services saw and where
-/// each was served — the stage card (or a tier card), the NVMe tier's arena,
-/// the model file's mapping — the bytes it moved between the tiers (the
+/// One span's tier census on a load whose host serves routed experts
+/// (`bloomery_gpu::host::census`): the span's phase, its tokens, the routed
+/// picks its host services saw and where each was served — the stage card
+/// (or a tier card), and of those the ones a prompt's expert stream copied
+/// there, the NVMe tier's arena, the model file's mapping — the bytes it
+/// moved between the tiers (the
 /// arena's fills, the residency machine's promotions onto the card and its
 /// demotions to the host), the tier's drops of the mapping's pages and
 /// their wall, and the pool's dispatches that waited for another caller's
@@ -956,12 +962,13 @@ pub static NVTIER_SITTING: Kind = Kind {
 pub static TIER_CENSUS: Kind = Kind {
     name: "tier_census",
     head: "tier census",
-    doc: "One span of a paged load: its phase (a gate's prompt, steps or slots phase; a server's call), the tokens its host services carried, the routed picks they saw and of them those served by a card (the stage card, a tier card, a prompt's host slots left to the card route, or the NVMe tier's ids the step port's card leg read from the arena's slots), read from the NVMe tier's RAM arena, or read through the model file's mapping (card + arena + file = picks when every host slot was read once); the bytes the arena's fills read, the bytes of the experts the residency machine put on the stage card and sent back to the host; the tier's drops of the mapping's pages and their wall on the dropper's thread; and the worker pool's dispatches that waited for another caller's job, with their wait.",
+    doc: "One span of a load whose host serves routed experts: its phase (a gate's prompt, steps or slots phase; a server's call, or its prompt and the steps before it), the tokens its host services carried, the routed picks they saw and of them those served by a card (the stage card, a tier card, a prompt's host slots left to the card route, or the NVMe tier's ids the step port's card leg read from the arena's slots), of the card's those a prompt's host slots the expert stream copied onto the card (streamed; card - streamed the card's own hits), read from the NVMe tier's RAM arena (0 with no tier), or read through the model file's mapping (card + arena + file = picks when every host slot was read once); the bytes the arena's fills read, the bytes of the experts the residency machine put on the stage card and sent back to the host; the tier's drops of the mapping's pages and their wall on the dropper's thread; and the worker pool's dispatches that waited for another caller's job, with their wait.",
     parts: &[
         key("phase", Word, ""),
         key("tokens", U64, ""),
         key("picks", U64, ""),
         key("card", U64, ""),
+        key("streamed", U64, ""),
         key("arena", U64, ""),
         key("file", U64, ""),
         key("fill_bytes", U64, "B"),
@@ -2764,6 +2771,17 @@ pub mod groups {
         pub const LEVER: &[&Kind] = &[&RESIDENCY_LEVER];
     }
 
+    /// `record/host_tier.rs`.
+    pub mod host_tier {
+        use crate::record::{Kind, NVTIER, TIER_CENSUS};
+
+        /// A load's NVMe arena and counters (`host_tier::eprint_nvtier`).
+        pub const ARENA: &[&Kind] = &[&NVTIER];
+
+        /// A server's host picks over a request span (`CensusSpan::mark`).
+        pub const CENSUS: &[&Kind] = &[&TIER_CENSUS];
+    }
+
     /// `serve_seats/hybrid.rs` (the seats of the bodies that run one chain on
     /// one card).
     pub mod hybrid {
@@ -3025,9 +3043,9 @@ pub static BLOOMERY_SERVE_DS41: &[&Kind] = kinds![
         &HOST_POPULATE,
         &HOST_POPULATE_OFF,
         &HOST_LOCK,
-        &NVTIER,
-        &HELPER,
     ],
+    groups::host_tier::ARENA,
+    &[&HELPER],
     groups::ds41_draft::LOAD,
     &[&CAPTURE, &CAPTURE_PAIR],
     groups::vision_seat::RECORDS,
@@ -3080,7 +3098,10 @@ pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = kinds![
     ],
     groups::bind::SLOTS,
     groups::drafted::WIDTH,
-    &[&DRAFT_YIELD, &NVTIER, &TIER_CENSUS, &KV_ROOM],
+    &[&DRAFT_YIELD],
+    groups::host_tier::ARENA,
+    groups::host_tier::CENSUS,
+    &[&KV_ROOM],
 ];
 
 /// What the Qwen3 seat of `bloomery-serve` prints, all on stderr: the
@@ -3132,9 +3153,9 @@ pub static BLOOMERY_SERVE_MIMO2: &[&Kind] = kinds![
 /// placement and why (`place unset`), a `--hf` repo's resolve lines (printed by
 /// the server before the seat registers), the residency lever's word and why,
 /// the plan, the churn pool's share of the host under `mid`, the load and its
-/// phases, the address and each request's note of the prefix it kept less of
-/// than it shared (the KDA state keeps a prefix only where the sequence stands
-/// or at a checkpoint).
+/// phases, the NVMe tier's record and the tier census, the address and each
+/// request's note of the prefix it kept less of than it shared (the KDA state
+/// keeps a prefix only where the sequence stands or at a checkpoint).
 pub static BLOOMERY_SERVE_SOLAR2: &[&Kind] = kinds![
     groups::side_seat::SEAT,
     groups::tiered::LEVER,
@@ -3144,10 +3165,13 @@ pub static BLOOMERY_SERVE_SOLAR2: &[&Kind] = kinds![
     groups::fetch::FETCH,
     groups::fetch::SET,
     &[&LANE, &LOAD_SOLAR2, &LOAD_PHASES, &LISTENING_SOLAR2],
+    groups::host_tier::ARENA,
+    groups::host_tier::CENSUS,
     groups::bind::CACHE,
 ];
 
-/// The common hybrid seat's placement, residency, load, address and request records.
+/// The common hybrid seat's placement, residency, load, NVMe tier and tier census, address
+/// and request records.
 pub static BLOOMERY_SERVE_HYBRID: &[&Kind] = kinds![
     groups::side_seat::SEAT,
     groups::tiered::LEVER,
@@ -3157,6 +3181,8 @@ pub static BLOOMERY_SERVE_HYBRID: &[&Kind] = kinds![
     groups::fetch::FETCH,
     groups::fetch::SET,
     &[&LANE, &LOAD_HYBRID, &LOAD_PHASES, &LISTENING_HYBRID],
+    groups::host_tier::ARENA,
+    groups::host_tier::CENSUS,
     groups::bind::CACHE,
 ];
 
@@ -3164,9 +3190,9 @@ pub static BLOOMERY_SERVE_HYBRID: &[&Kind] = kinds![
 /// placement and why (`place unset`), a `--hf` repo's resolve lines (printed by
 /// the server before the seat registers), the residency lever's word and why,
 /// the plan, the churn pool's share of the host under `mid`, the load and its
-/// phases, the address and each request's note of the prefix it kept less of
-/// than it shared (every store is a plane of positions, so a cut keeps every
-/// held position).
+/// phases, the NVMe tier's record and the tier census, the address and each
+/// request's note of the prefix it kept less of than it shared (every store is
+/// a plane of positions, so a cut keeps every held position).
 pub static BLOOMERY_SERVE_MINIMAXM3: &[&Kind] = kinds![
     groups::side_seat::SEAT,
     groups::tiered::LEVER,
@@ -3176,14 +3202,17 @@ pub static BLOOMERY_SERVE_MINIMAXM3: &[&Kind] = kinds![
     groups::fetch::FETCH,
     groups::fetch::SET,
     &[&LANE, &LOAD_MINIMAXM3, &LOAD_PHASES, &LISTENING_MINIMAXM3],
+    groups::host_tier::ARENA,
+    groups::host_tier::CENSUS,
     groups::bind::CACHE,
 ];
 
 /// What the Muse Spark seat of `bloomery-serve` prints, all on stderr: the
 /// placement and why (`place unset`), a `--hf` repo's resolve lines (printed by
 /// the server before the seat registers), the residency lever, the plan, under
-/// `mid` the churn pool's host record, the load and its phases, the address and
-/// each request's note of the prefix it kept less of than it shared.
+/// `mid` the churn pool's host record, the load and its phases, the NVMe tier's
+/// record and the tier census, the address and each request's note of the
+/// prefix it kept less of than it shared.
 pub static BLOOMERY_SERVE_MUSESPARK: &[&Kind] = kinds![
     groups::side_seat::SEAT,
     groups::tiered::LEVER,
@@ -3193,21 +3222,24 @@ pub static BLOOMERY_SERVE_MUSESPARK: &[&Kind] = kinds![
     groups::fetch::FETCH,
     groups::fetch::SET,
     &[&LANE, &LOAD_MUSESPARK, &LOAD_PHASES, &LISTENING_MUSESPARK],
+    groups::host_tier::ARENA,
+    groups::host_tier::CENSUS,
     groups::bind::CACHE,
 ];
 
 /// What the nemotron_h seat of `bloomery-serve` prints, all on stderr: the
 /// placement and why (`place unset`), the embedding side seat when one is
 /// named, a `--hf` repo's resolve lines (printed by the server before the seat
-/// registers), the plan, the load and its phases, the address and each
-/// request's note of the prefix it kept less of than it shared (the Mamba-2
-/// state keeps a prefix only at the position it stands).
+/// registers), the plan, the load and its phases, the NVMe tier's record, the
+/// address and each request's note of the prefix it kept less of than it shared
+/// (the Mamba-2 state keeps a prefix only at the position it stands).
 pub static BLOOMERY_SERVE_NEMOTRON: &[&Kind] = kinds![
     groups::side_seat::SEAT,
     &[&PLACE_UNSET, &PLAN, &NEED],
     groups::fetch::FETCH,
     groups::fetch::SET,
     &[&LOAD_NEMOTRON, &LOAD_PHASES, &LISTENING_NEMOTRON],
+    groups::host_tier::ARENA,
     groups::bind::CACHE,
 ];
 
@@ -3251,7 +3283,9 @@ pub static BLOOMERY_SERVE_GLM: &[&Kind] = kinds![
         &HOST_POPULATE,
         &HOST_POPULATE_OFF,
         &HOST_LOCK,
-        &NVTIER,
+    ],
+    groups::host_tier::ARENA,
+    &[
         &LOAD_DRAFT_GLM,
         &LOAD_DRAFT_OFF_GLM,
         &CAPTURE,
@@ -3822,13 +3856,24 @@ pub fn lane(card: &str, rate: &bloomery_gpu::lane::LaneRate) -> Record {
         .w("pinned", rate.pinned)
 }
 
-/// The `nvtier` record ([`nvtier_of`]) of a server's load on stderr; nothing for a load that
-/// attached no tier.
+/// The `tier census` record of span `c`, phase `phase`.
 #[cfg(feature = "gpu")]
-pub fn eprint_nvtier(tier: Option<&std::sync::Arc<bloomery_gpu::host::nvtier::NvTier>>) {
-    if let Some(r) = nvtier_of(tier.map(|t| &**t)) {
-        r.eprint();
-    }
+pub fn census_record(phase: &str, c: &bloomery_gpu::host::census::TierCensus) -> Record {
+    c.fields()
+        .iter()
+        .fold(Record::new(&TIER_CENSUS).w("phase", phase), |r, &(k, v)| {
+            r.u(k, v)
+        })
+}
+
+/// The census since the load of `hybrid`, a host run's tier, over the NVMe tier its run reads
+/// (`HostTier::census`).
+#[cfg(feature = "gpu")]
+#[must_use]
+pub fn census_of(
+    hybrid: &bloomery_gpu::host::HostTier<bloomery_gpu::host::run::HostRun>,
+) -> Option<bloomery_gpu::host::census::TierCensus> {
+    hybrid.census(hybrid.nvme_tier().map(|t| &**t))
 }
 
 /// The `nvtier` record of a load's arena: its budget (the granted bytes), the
@@ -4511,8 +4556,9 @@ mod tests {
     #[test]
     fn every_binary_registers_the_groups_its_entries_require() {
         use groups::{
-            bind, drafted, ds41_draft, ds41_split, fetch, host_stats, hybrid, nvtier_family,
-            qwen3moe_place, residency38, serve_client, side_seat, tiered, vision_seat,
+            bind, drafted, ds41_draft, ds41_split, fetch, host_stats, host_tier, hybrid,
+            nvtier_family, qwen3moe_place, residency38, serve_client, side_seat, tiered,
+            vision_seat,
         };
         type Group = &'static [&'static Kind];
         let table: [(&str, Group, &[Group]); 18] = [
@@ -4521,6 +4567,7 @@ mod tests {
                 BLOOMERY_SERVE_DS41,
                 &[
                     side_seat::SEAT,
+                    host_tier::ARENA,
                     fetch::FETCH,
                     fetch::SET,
                     vision_seat::RECORDS,
@@ -4535,6 +4582,8 @@ mod tests {
                 BLOOMERY_SERVE_QWEN38,
                 &[
                     side_seat::SEAT,
+                    host_tier::ARENA,
+                    host_tier::CENSUS,
                     fetch::FETCH,
                     fetch::SET,
                     vision_seat::RECORDS,
@@ -4572,12 +4621,14 @@ mod tests {
                 ],
             ),
             (
-                "solar2 seat: residency_pick, residency_set, bind::spawn",
+                "solar2 seat: residency_pick, residency_set, hybrid::open_session, bind::spawn",
                 BLOOMERY_SERVE_SOLAR2,
                 &[
                     side_seat::SEAT,
                     tiered::LEVER,
                     residency38::HOST,
+                    host_tier::ARENA,
+                    host_tier::CENSUS,
                     fetch::FETCH,
                     fetch::SET,
                     bind::CACHE,
@@ -4592,39 +4643,51 @@ mod tests {
                     tiered::RUN,
                     residency38::HOST,
                     hybrid::GROUP,
+                    host_tier::ARENA,
+                    host_tier::CENSUS,
                     fetch::FETCH,
                     fetch::SET,
                     bind::CACHE,
                 ],
             ),
             (
-                "minimaxm3 seat: residency_pick, residency_set, bind::spawn",
+                "minimaxm3 seat: residency_pick, residency_set, MiniMax::open, bind::spawn",
                 BLOOMERY_SERVE_MINIMAXM3,
                 &[
                     side_seat::SEAT,
                     tiered::LEVER,
                     residency38::HOST,
+                    host_tier::ARENA,
+                    host_tier::CENSUS,
                     fetch::FETCH,
                     fetch::SET,
                     bind::CACHE,
                 ],
             ),
             (
-                "musespark seat: Side::seat, residency_pick, settle_pick, bind::spawn",
+                "musespark seat: Side::seat, residency_pick, settle_pick, Muse::open, bind::spawn",
                 BLOOMERY_SERVE_MUSESPARK,
                 &[
                     side_seat::SEAT,
                     tiered::LEVER,
                     residency38::HOST,
+                    host_tier::ARENA,
+                    host_tier::CENSUS,
                     fetch::FETCH,
                     fetch::SET,
                     bind::CACHE,
                 ],
             ),
             (
-                "nemotron seat: Side::seat, bind::spawn",
+                "nemotron seat: Side::seat, run, bind::spawn",
                 BLOOMERY_SERVE_NEMOTRON,
-                &[side_seat::SEAT, fetch::FETCH, fetch::SET, bind::CACHE],
+                &[
+                    side_seat::SEAT,
+                    host_tier::ARENA,
+                    fetch::FETCH,
+                    fetch::SET,
+                    bind::CACHE,
+                ],
             ),
             (
                 "raon1 seat: Side::seat, print_widths, bind::spawn",
@@ -4642,6 +4705,7 @@ mod tests {
                 BLOOMERY_SERVE_GLM,
                 &[
                     side_seat::SEAT,
+                    host_tier::ARENA,
                     fetch::FETCH,
                     fetch::SET,
                     vision_seat::RECORDS,

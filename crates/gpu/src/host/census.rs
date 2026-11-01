@@ -1,6 +1,7 @@
 //! The tier census ([`TierCensus`]): where a span's routed picks were
 //! served — the stage card, the NVMe tier's arena or the model file's
-//! mapping — and the bytes the span moved between the tiers: the arena's
+//! mapping, and of the card's those a prompt's expert stream copied there —
+//! and the bytes the span moved between the tiers: the arena's
 //! fills (file → arena), the residency machine's copies onto the card
 //! (promotions) and the experts it sent back to the host (demotions). Beside
 //! them, the tier's drops of the mapping's pages, and the pool's dispatches
@@ -71,6 +72,11 @@ pub struct TierCensus {
     /// arena's slots ([`super::nvtier::NvTierStats::card_ids`]), which the
     /// host computation never lists.
     pub card: u64,
+    /// Of the card's, a prompt's host slots its batch services left out for
+    /// the card route ([`super::HybridStats::batch_excluded_slots`]): the
+    /// experts the expert stream copied onto the card over the link, not
+    /// held there.
+    pub streamed: u64,
     /// Of those, the ones the host computation read from the arena's slots.
     pub arena: u64,
     /// Of those, the ones it read through the mapping.
@@ -113,6 +119,7 @@ impl TierCensus {
             tokens: cols / (layers.max(1) as u64),
             picks,
             card: picks.saturating_sub(stats.host_slots + stats.batch_host_slots),
+            streamed: stats.batch_excluded_slots,
             arena: reads.arena,
             file: reads.file,
             fill_bytes: tier.fill_bytes,
@@ -133,6 +140,7 @@ impl TierCensus {
             tokens: d(self.tokens, before.tokens),
             picks: d(self.picks, before.picks),
             card: d(self.card, before.card),
+            streamed: d(self.streamed, before.streamed),
             arena: d(self.arena, before.arena),
             file: d(self.file, before.file),
             fill_bytes: d(self.fill_bytes, before.fill_bytes),
@@ -154,11 +162,12 @@ impl TierCensus {
 
     /// The census's values in the `tier census` record's order, by name.
     #[must_use]
-    pub fn fields(&self) -> [(&'static str, u64); 12] {
+    pub fn fields(&self) -> [(&'static str, u64); 13] {
         [
             ("tokens", self.tokens),
             ("picks", self.picks),
             ("card", self.card),
+            ("streamed", self.streamed),
             ("arena", self.arena),
             ("file", self.file),
             ("fill_bytes", self.fill_bytes),
