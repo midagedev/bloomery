@@ -2167,6 +2167,102 @@ mod tests {
             t
         }
 
+        /// The table of a dense Qwen3 file (`qwen3`) — the 8B's 32 query heads over 8 or the
+        /// 32B's 64 — at the axes no registered row holds: every layer's q and k norms read,
+        /// the rope turning NEOX halves with no frequency factors, an untied head unless `tied`,
+        /// and a dense SwiGLU FFN. The chat template is the plainest the reader takes.
+        fn qwen3(heads: u64, tied: bool) -> Synthetic {
+            const VOCAB: u64 = 151_936;
+            const KV: u64 = 8;
+            const HEAD: u64 = 128;
+            const HIDDEN: u64 = 2048;
+            const FF: u64 = 512;
+            let u = |k: &str, v: u32| (format!("qwen3.{k}"), Value::U32(v));
+            let mut kvs = vec![
+                (
+                    gguf::GENERAL_ARCHITECTURE.to_owned(),
+                    Value::String("qwen3".to_owned()),
+                ),
+                (
+                    "tokenizer.ggml.model".to_owned(),
+                    Value::String("gpt2".to_owned()),
+                ),
+                (
+                    "tokenizer.ggml.pre".to_owned(),
+                    Value::String("qwen2".to_owned()),
+                ),
+                (
+                    "tokenizer.chat_template".to_owned(),
+                    Value::String("{{ messages }}".to_owned()),
+                ),
+                u("block_count", 2),
+                u("context_length", 40_960),
+                u(
+                    "embedding_length",
+                    u32::try_from(HIDDEN).expect("the width fits u32"),
+                ),
+                u(
+                    "feed_forward_length",
+                    u32::try_from(FF).expect("the width fits u32"),
+                ),
+                u(
+                    "vocab_size",
+                    u32::try_from(VOCAB).expect("the vocabulary fits u32"),
+                ),
+                u(
+                    "attention.head_count",
+                    u32::try_from(heads).expect("the heads fit u32"),
+                ),
+                u(
+                    "attention.head_count_kv",
+                    u32::try_from(KV).expect("the heads fit u32"),
+                ),
+                u(
+                    "attention.key_length",
+                    u32::try_from(HEAD).expect("the width fits u32"),
+                ),
+                u(
+                    "attention.value_length",
+                    u32::try_from(HEAD).expect("the width fits u32"),
+                ),
+                u("rope.dimension_count", u32::try_from(HEAD).expect("fits")),
+                ("qwen3.rope.freq_base".to_owned(), Value::F32(1_000_000.0)),
+                (
+                    "qwen3.attention.layer_norm_rms_epsilon".to_owned(),
+                    Value::F32(1e-6),
+                ),
+            ];
+            kvs.reserve(1);
+            let mut t = Synthetic {
+                kvs,
+                tensors: Vec::new(),
+                attn_layer: 1,
+            };
+            let q = GgmlType::Q4_K;
+            let query = heads * HEAD;
+            let key = KV * HEAD;
+            t.add("token_embd.weight", &[HIDDEN, VOCAB], GgmlType::Q5_K);
+            if !tied {
+                t.add("output.weight", &[HIDDEN, VOCAB], GgmlType::Q5_K);
+            }
+            t.add("output_norm.weight", &[HIDDEN], GgmlType::F32);
+            for l in 0..2 {
+                let b = |stem: &str| format!("blk.{l}.{stem}");
+                t.add(&b("attn_norm.weight"), &[HIDDEN], GgmlType::F32);
+                t.add(&b("attn_q.weight"), &[HIDDEN, query], q);
+                t.add(&b("attn_q_norm.weight"), &[HEAD], GgmlType::F32);
+                t.add(&b("attn_k.weight"), &[HIDDEN, key], q);
+                t.add(&b("attn_k_norm.weight"), &[HEAD], GgmlType::F32);
+                t.add(&b("attn_v.weight"), &[HIDDEN, key], q);
+                t.add(&b("attn_output.weight"), &[query, HIDDEN], q);
+                t.add(&b("ffn_norm.weight"), &[HIDDEN], GgmlType::F32);
+                t.add(&b("ffn_gate.weight"), &[HIDDEN, FF], q);
+                t.add(&b("ffn_up.weight"), &[HIDDEN, FF], q);
+                t.add(&b("ffn_down.weight"), &[FF, HIDDEN], q);
+            }
+            t
+        }
+
         fn add(&mut self, name: &str, dims: &[u64], ty: GgmlType) {
             self.tensors.push((name.to_owned(), dims.to_vec(), ty));
         }
@@ -2379,6 +2475,74 @@ mod tests {
         assert!(
             got.len() == 2 && got[1].contains("the kernels take heads of 128"),
             "the plan's kind refusal follows: {got:?}"
+        );
+    }
+
+    /// A dense Qwen3 file opens at an instance made at open with the normed, NEOX-paired
+    /// attention axes: the 8B's 32/8 heads take the pack-of-four flash row (the windowed
+    /// head-128 row a Llama file takes, launched with no window) and the 32B's 64/8 the
+    /// registered group-of-eight row, every layer's q and k norms read beside the projections,
+    /// and a tied one (no `output.weight`) reads the token embedding as the head. Mutant: the
+    /// map's family read as Llama's (the q/k norms are then no tensors of the file).
+    #[test]
+    fn a_dense_qwen3_opens_with_head_norms_on_the_neox_rope() {
+        let four = instance::LLAMA_ATTN.key.attn.row;
+        let eight = instance::QWEN3MOE_A3B.key.attn.row;
+        for (heads, tied, row) in [(32u32, false, four), (32, true, four), (64, false, eight)] {
+            let t = Synthetic::qwen3(u64::from(heads), tied);
+            let out = check(&t.split(), CTX);
+            assert!(
+                out.items.is_empty(),
+                "{heads} heads, tied {tied}: {:?}",
+                out.items
+            );
+            let checked = out.checked.expect("a checked file");
+            assert_eq!(checked.instance.name, instance::UNREGISTERED);
+            assert_eq!(checked.instance.key.attn.row, row, "{heads} heads");
+            assert!(checked.geom.attn.qk_norm && !checked.geom.attn.norm_pairs);
+            assert_eq!(
+                (
+                    checked.instance.key.attn.n_head,
+                    checked.instance.key.attn.n_kv
+                ),
+                (heads, 8)
+            );
+            let head_name = if tied {
+                "token_embd.weight"
+            } else {
+                "output.weight"
+            };
+            assert_eq!(checked.layout.head.name, head_name, "tied {tied}");
+            for layer in &checked.layout.layers {
+                let MixerLayout::Attention(a) = &layer.mixer else {
+                    panic!("tied {tied}: a layer mixes with another");
+                };
+                assert!(
+                    a.q_norm.is_some() && a.k_norm.is_some(),
+                    "tied {tied}: a layer holds no head norm gains"
+                );
+            }
+            let bytes = checked.bytes().expect("the bytes");
+            assert_eq!(
+                bytes.weights.requested,
+                t.weight_bytes(),
+                "tied {tied}: the weights"
+            );
+        }
+    }
+
+    /// A Qwen3 this backend's kernels do not take is refused by name at the instance, before any
+    /// plan: the 14B's 40/8 is a query-head group no flash row serves, and the refusal names the
+    /// group and the groups the rows take.
+    #[test]
+    fn a_qwen3_no_kernel_takes_is_refused_by_name_at_the_instance() {
+        let t = Synthetic::qwen3(40, false);
+        let got = texts(&t.split(), CTX);
+        let want = "attention 40/8 heads of 128: group 5; this head's flashes take exactly 8, \
+                    exactly 4";
+        assert!(
+            got.first().is_some_and(|text| text.contains(want)),
+            "a group of five: {got:?}"
         );
     }
 

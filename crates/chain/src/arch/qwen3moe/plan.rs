@@ -688,8 +688,9 @@ pub(crate) fn layer_gqa(s: &LayerSpec) -> Result<(&Gqa, GqaKind), String> {
 /// The class and the flash of `g` when it is an attention the kernels run:
 /// the shape table's row for its group ([`select_gqa`]), one of eight, of
 /// quads or pairs, the head-128 group of seven, or the head-128 group of four
-/// (with an output gate of its own or none): [`Flash::Group`] names the one
-/// block of a key head's group the row's pack makes.
+/// (with an output gate of its own, or none, or the NEOX normed attention):
+/// [`Flash::Group`] names the one block of a key head's group the row's pack
+/// makes.
 fn gqa_fits(g: &Gqa) -> Result<(GqaKind, Flash), String> {
     let kind = gqa_class(g)?;
     let row = select_gqa(AttnShape::of(g)).map_err(|e| e.to_string())?;
@@ -698,7 +699,9 @@ fn gqa_fits(g: &Gqa) -> Result<(GqaKind, Flash), String> {
         (_, 4, GroupRule::Packs) => Flash::Quads,
         (_, 2, GroupRule::Packs) => Flash::Pairs,
         (GqaKind::Head128 { .. }, 7, GroupRule::One) => Flash::Seven,
-        (GqaKind::HeadGate128 | GqaKind::Head128 { .. }, 4, GroupRule::One) => Flash::Group,
+        (GqaKind::HeadGate128 | GqaKind::Head128 { .. } | GqaKind::Neox128, 4, GroupRule::One) => {
+            Flash::Group
+        }
         _ => {
             return Err(format!(
                 "attention {}/{} heads of {} selects {}, which this body does not launch",
@@ -1259,6 +1262,69 @@ mod tests {
             match kinds35(&[dense(delta()), head_128(8 * group, 8, edit)]) {
                 Err(e) => assert!(e.to_string().contains("layer 1:"), "{what}: {e}"),
                 Ok(k) => panic!("{what} accepted: {k:?}"),
+            }
+        }
+    }
+
+    /// A dense Qwen3's attention — the whole head turned by NEOX with the q/k
+    /// norms — plans at the groups its flash rows cover: eight (the 32B's 64/8,
+    /// the row the routed Qwen3s take) and four (the 8B's 32/8, the head-128
+    /// group-of-four row), one block of a key head's group; a group no row of
+    /// the body launches (the 14B's five) is refused by name with the layer,
+    /// and the card, whose kernels take neither the normed NEOX attention nor
+    /// a group of four, refuses each by name. Mutants (each red at its line):
+    /// the group-of-four arm without `GqaKind::Neox128` (the 8B's), the arm
+    /// dropped (both).
+    #[test]
+    fn a_dense_qwen3_attention_plans_at_its_group_and_the_card_refuses_it() {
+        let neox = |heads: u32, kv_heads: u32| {
+            let mut g = q30_gqa();
+            g.heads = heads;
+            g.kv_heads = kv_heads;
+            g.rope.base = 1e6;
+            g
+        };
+        for (heads, kv_heads) in [(64u32, 8u32), (32, 8)] {
+            let l = dense_layer(Mixer::Gqa(neox(heads, kv_heads)));
+            let got = kind_of(&l, 0).unwrap_or_else(|e| panic!("{heads}/{kv_heads}: {e}"));
+            assert_eq!(
+                got,
+                Kind35::Gqa(GqaKind::Neox128, Flash::Group),
+                "{heads}/{kv_heads}"
+            );
+            assert_eq!(got, kind_of(&l, 0).unwrap());
+        }
+        for (what, heads, kv_heads, want) in [
+            (
+                "a group of five",
+                40u32,
+                8u32,
+                "which this body does not launch",
+            ),
+            (
+                "a group of three",
+                24,
+                8,
+                "group 3; this head's flashes take",
+            ),
+        ] {
+            let l = dense_layer(Mixer::Gqa(neox(heads, kv_heads)));
+            match kind_of(&l, 3) {
+                Err(e) => assert!(
+                    e.to_string().contains("layer 3:") && e.to_string().contains(want),
+                    "{what}: {e}"
+                ),
+                Ok(k) => panic!("{what} accepted: {k:?}"),
+            }
+        }
+        for (heads, kv_heads) in [(64u32, 8u32), (32, 8)] {
+            let l = dense_layer(Mixer::Gqa(neox(heads, kv_heads)));
+            match kind35(&l, 1) {
+                Err(e) => assert!(
+                    e.to_string().contains("layer 1:"),
+                    "{heads}/{kv_heads}: {e}"
+                ),
+                Ok(k) => panic!("{heads}/{kv_heads}: the card accepted {k:?}"),
             }
         }
     }

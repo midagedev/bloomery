@@ -87,7 +87,7 @@ crates/gpu-gates/src/bin/shared/routed_legs.rs	gemma	4	baseline P 5: MK2 program
 crates/gpu-gates/src/bin/shared/routed_legs.rs	glm	7	baseline P 8: MK2 program by body
 crates/gpu-gates/src/bin/shared/routed_legs.rs	mimo	4	baseline P 5: MK2 program by body
 crates/gpu-gates/src/bin/shared/routed_legs.rs	nemotron	4	baseline P 6: MK2 program by body
-crates/gpu-gates/src/bin/shared/routed_legs.rs	qwen	22	baseline P 24: MK2 program by body
+crates/gpu-gates/src/bin/shared/routed_legs.rs	qwen	23	PIN(2026-11-01) qwen: + 1 (was 22, baseline P 24), family_of matches every models::Arch exhaustively, so the dense Qwen3 trunk's variant has its line beside the dense Llama's, and no routed-legs adapter is registered for it; MK2 program by body
 crates/gpu-gates/src/bin/shared/serve_seats/decide.rs	clef	13	baseline S 13: MK9 seat by program
 crates/gpu-gates/src/bin/shared/serve_seats/decide.rs	qwen	11	baseline S 13: MK9 seat by program
 crates/gpu-gates/src/bin/shared/serve_seats/served.rs	qwen	1	baseline S 1: MK9 seat by program
@@ -169,7 +169,7 @@ crates/models/src/lib.rs	gemma	4	baseline A 4: MK1a/MK1b ArchRow registry
 crates/models/src/lib.rs	glm	3	baseline A 3: MK1a/MK1b ArchRow registry
 crates/models/src/lib.rs	mimo	2	baseline A 2: MK1a/MK1b ArchRow registry
 crates/models/src/lib.rs	nemotron	4	baseline A 4: MK1a/MK1b ArchRow registry
-crates/models/src/lib.rs	qwen	9	baseline A 9: MK1a/MK1b ArchRow registry
+crates/models/src/lib.rs	qwen	11	PIN(2026-11-01) qwen: + 2 (was 9, baseline A 9), ModelSpec.arch names the dense Qwen3 by an enum variant and its name arm; the variant stays until ModelSpec carries the registry's name instead
 crates/placement/src/accepts.rs	deepseek	14	PIN(2026-10-26) deepseek: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet; +4 are V4.1's leg arms (ds41_gate_up, ds41_down, ds41_pair and its routed_rule arm), held in the Program-keyed arm table beside qwen35's and qwen38's until a Program owns its arms
 crates/placement/src/accepts.rs	flint	5	PIN(2026-10-25) flint: the implemented body registers its Program variant, name, architecture selection, expert arms and routed rule in the existing exhaustive program owners
 crates/placement/src/accepts.rs	gemma	5	PIN(2026-10-21) gemma: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet

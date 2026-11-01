@@ -1,17 +1,21 @@
-//! Llama's Hugging Face checkpoint (`llama`: Llama-3.1-8B-Instruct and its siblings) as MLX's
-//! convert stores it, in the llama names, layouts and keys llama.cpp's converter (`LlamaModel`)
-//! writes into a GGUF. Every layer is grouped-query attention with no q/k norms over a dense
-//! SwiGLU block; the trunk's names, keys and checks are [`super::trunk`]'s.
+//! The dense GQA checkpoint families MLX's convert stores in the trunk's names, in the names,
+//! layouts and keys llama.cpp's converter writes into a GGUF: Llama-3 (`llama`:
+//! Llama-3.1-8B-Instruct and its siblings) and Qwen3 (`qwen3`: Qwen3-8B and its siblings, whose
+//! GGUF architecture is `qwen3`). Every layer is grouped-query attention over a dense SwiGLU
+//! block; the trunk's names, keys and checks are [`super::trunk`]'s, and the map is one owner:
+//! what a family's architecture facts force is [`Family`]'s data, never a second map.
 //!
-//! The converter moves two layouts, and so does the map. A query or key projection stores each
+//! The converter moves layouts a family's facts name. A query or key projection stores each
 //! head's rows as HF's rotary does, the first half of a head's values paired with the second
-//! (`rotate_half`); the file's rope pairs neighbours, so the map interleaves the rows of
-//! `q_proj` and `k_proj` head by head ([`Interleave`]), as the converter's `permute` does. The
-//! rope's frequency factors, which the converter writes as the tensor `rope_freqs.weight` for a
-//! `rope_scaling` of type `llama3`, are made of that block of the config ([`llama3_factors`],
-//! [`FolderMap::constants`]); a `rope_scaling` of another type is refused. The head is the
-//! folder's `lm_head` when it holds one and the embedding when `tie_word_embeddings` says so, and
-//! a folder whose flag and head disagree is refused ([`trunk::check_head`]).
+//! (`rotate_half`); Llama's file rope pairs neighbours, so the map interleaves the rows of
+//! `q_proj` and `k_proj` head by head ([`Interleave`]), as the converter's `permute` does, while
+//! Qwen3's rope is HF's own pairing and the rows stay as stored. Llama's rope frequency factors,
+//! which the converter writes as the tensor `rope_freqs.weight` for a `rope_scaling` of type
+//! `llama3`, are made of that block of the config ([`llama3_factors`], [`FolderMap::constants`]);
+//! a `rope_scaling` of another type, and Qwen3's unscaled rope beside a scaling block, are
+//! refused. Qwen3 norms each query and key head before the rope (`q_norm`, `k_norm`). The head is
+//! the folder's `lm_head` when it holds one and the embedding when `tie_word_embeddings` says so,
+//! and a folder whose flag and head disagree is refused ([`trunk::check_head`]).
 
 use std::collections::BTreeMap;
 
@@ -25,30 +29,121 @@ use super::section::Section;
 use super::trunk;
 use crate::folder::{Constant, Error, FolderMap, Mapped, Mapping, Origin, VocabSpec, refuse};
 
-const ARCHITECTURE: &str = "llama";
-
 /// Every layer's block is one dense SwiGLU of `intermediate_size`.
 const FFN: trunk::Ffn = trunk::Ffn::Dense;
 
 /// The output head a folder of an untied model holds.
 const HEAD: &str = "lm_head.weight";
 
-/// `config.json`'s keys beside [`trunk::KEYS`] and the dense block's: the checkpoint's class and
-/// type, MLX's `quantization` block (which `hf::quant_config` reads, with its verbatim copy), the
-/// rope's base and scaling, and the biases and tensor-parallel slicing that this map's tensors
-/// have none of. A table's first rule for a key decides, so the head rule is this one's, not
-/// [`trunk::KEYS`]'s.
-const ROOT: &Fields = &[
-    trunk::HEAD_EITHER,
+/// One family the map reads: the architecture facts that differ, as data. The trunk — its counts,
+/// tensors and header keys — is both families'; a family owns its `model_type` and class, the
+/// `general.architecture` its keys go under, its attention's per-head q/k norms, the pairing its
+/// rope turns by (Llama's rows move, Qwen3's stay), its rope scaling, and the pre-tokenizer row
+/// of its vocabulary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Family {
+    /// Llama-3: no head norms, NORM pairs (the rows interleaved), `llama3` rope scaling, the
+    /// llama-bpe split.
+    Llama,
+    /// Qwen3: per-head q and k norms, NEOX pairs as stored, an unscaled rope, Qwen's BPE.
+    Qwen3,
+}
+
+/// `config.json`'s keys beside [`trunk::KEYS`], the dense block's and [`ROOT`]'s that one family
+/// alone spells or reads otherwise: its class and type, and the values its architecture forces.
+const FAMILY_LLAMA: &Fields = &[
     ("architectures", Need(r#"[["LlamaForCausalLM"]]"#)),
     ("model_type", Need(r#"["llama"]"#)),
+    ("mlp_bias", Only("[false]")),
+    // HF's tensor-parallel slicing of a linear, which gives the same values.
+    ("pretraining_tp", Only("[1]")),
+];
+
+/// [`FAMILY_LLAMA`] for Qwen3: its window keys (attention is full), and its rope, which carries
+/// no scaling block — the family's rule decides over [`ROOT`]'s, which reads Llama's.
+const FAMILY_QWEN3: &Fields = &[
+    ("architectures", Need(r#"[["Qwen3ForCausalLM"]]"#)),
+    ("model_type", Need(r#"["qwen3"]"#)),
+    ("rope_scaling", Only("[null]")),
+    ("sliding_window", Only("[null]")),
+    ("use_sliding_window", Only("[false]")),
+    (
+        "max_window_layers",
+        Ignore(
+            Type::Number,
+            "the layers a sliding window applies to, and use_sliding_window is false",
+        ),
+    ),
+];
+
+impl Family {
+    /// The family a `config.json`'s `model_type` names; any other is refused by name.
+    fn of(root: &Section<'_, Error>) -> Result<Self, Error> {
+        match root.value.get("model_type").and_then(Json::as_str) {
+            Some("llama") => Ok(Family::Llama),
+            Some("qwen3") => Ok(Family::Qwen3),
+            other => Err(root.bad(
+                "model_type",
+                &format!("{other:?} is no family this map reads: llama, qwen3"),
+            )),
+        }
+    }
+
+    /// The family's own keys, the first table [`FolderMap::parse`] checks.
+    fn keys(self) -> &'static Fields {
+        match self {
+            Family::Llama => FAMILY_LLAMA,
+            Family::Qwen3 => FAMILY_QWEN3,
+        }
+    }
+
+    /// Whether each layer's attention holds the per-head q and k norms (`q_norm`, `k_norm`).
+    fn head_norms(self) -> bool {
+        matches!(self, Family::Qwen3)
+    }
+
+    /// Whether the query and key projections' rows move from HF's halves to the file's
+    /// neighbours ([`Interleave`]): Llama's rope pairs neighbours, Qwen3's is HF's own pairing.
+    fn interleaves(self) -> bool {
+        matches!(self, Family::Llama)
+    }
+
+    /// The `general.architecture` the family's keys go under, and its tensors' GGUF names.
+    fn architecture(self) -> &'static str {
+        match self {
+            Family::Llama => "llama",
+            Family::Qwen3 => "qwen3",
+        }
+    }
+
+    /// The row of `hf::vocab::PRE` the family's regex split is, as llama.cpp names it.
+    fn pre(self) -> &'static str {
+        match self {
+            Family::Llama => "llama-bpe",
+            Family::Qwen3 => "qwen2",
+        }
+    }
+
+    /// The family's word in a refusal.
+    fn word(self) -> &'static str {
+        match self {
+            Family::Llama => "Llama",
+            Family::Qwen3 => "Qwen3",
+        }
+    }
+}
+
+/// `config.json`'s keys beside [`trunk::KEYS`] and the dense block's, both families': MLX's
+/// `quantization` block (which `hf::quant_config` reads, with its verbatim copy), the rope's base
+/// and scaling (Llama's factors read it; Qwen3's family table holds its own rule), and the
+/// tie flag. A table's first rule for a key decides, so the head rule is this one's, not
+/// [`trunk::KEYS`]'s, and a family's table comes before this one.
+const ROOT: &Fields = &[
+    trunk::HEAD_EITHER,
     ("quantization", Read),
     ("quantization_config", Read),
     ("rope_theta", Read),
     ("rope_scaling", Read),
-    ("mlp_bias", Only("[false]")),
-    // HF's tensor-parallel slicing of a linear, which gives the same values.
-    ("pretraining_tp", Only("[1]")),
     (
         "torch_dtype",
         Ignore(
@@ -170,6 +265,8 @@ struct Target {
 /// The config values the map reads, checked, and the header keys they make.
 #[derive(Debug)]
 pub struct Checkpoint {
+    /// The family whose facts the map reads the folder at.
+    family: Family,
     layers: usize,
     hidden: u64,
     ffn: u64,
@@ -213,11 +310,12 @@ impl FolderMap for Checkpoint {
     /// The query and key projections' rows are the one move.
     type Step = Interleave;
 
-    const MODEL_TYPES: &'static [&'static str] = &["llama"];
+    const MODEL_TYPES: &'static [&'static str] = &["llama", "qwen3"];
 
     fn parse(config: &Json) -> Result<Self, Error> {
         let root = Section::<Error>::new(config, "config.json")?;
-        root.check(&[ROOT, trunk::KEYS, FFN.keys()])?;
+        let family = Family::of(&root)?;
+        root.check(&[family.keys(), ROOT, trunk::KEYS, FFN.keys()])?;
         let mut counts = BTreeMap::new();
         for &field in trunk::COUNTS.iter().chain(FFN.counts()) {
             // A head's width is `hidden_size / num_attention_heads` where the config does not
@@ -249,6 +347,7 @@ impl FolderMap for Checkpoint {
             Value::U32(n("head_dim")),
         ));
         Ok(Self {
+            family,
             layers: n("num_hidden_layers") as usize,
             hidden: wide("hidden_size"),
             ffn: wide("intermediate_size"),
@@ -257,8 +356,7 @@ impl FolderMap for Checkpoint {
             head_dim: n("head_dim") as usize,
             tied: trunk::tied(&root)?,
             rope_factors: Self::factors(&root, n("head_dim"), rope_base)?,
-            // Llama 3's regex split, the row llama.cpp names llama-bpe.
-            vocab: hf::vocab::Config::parse(config)?.with_pre("llama-bpe")?,
+            vocab: hf::vocab::Config::parse(config)?.with_pre(family.pre())?,
             keys,
         })
     }
@@ -289,7 +387,7 @@ impl FolderMap for Checkpoint {
             if let Some(prev) = out.insert(to, mapped) {
                 return Err(refuse(
                     &prev.sources[0],
-                    "maps to a llama name another tensor has",
+                    "maps to a trunk name another tensor has",
                 ));
             }
         }
@@ -311,7 +409,7 @@ impl FolderMap for Checkpoint {
     }
 
     fn architecture(&self) -> &'static str {
-        ARCHITECTURE
+        self.family.architecture()
     }
 
     fn header(
@@ -319,7 +417,7 @@ impl FolderMap for Checkpoint {
         _planned: &[(&str, &[u64])],
         _folder: &safetensors::Folder,
     ) -> Result<Vec<(String, Value)>, Error> {
-        Ok(trunk::header(ARCHITECTURE, &self.keys))
+        Ok(trunk::header(self.family.architecture(), &self.keys))
     }
 
     fn vocab(&self) -> &VocabSpec {
@@ -345,7 +443,7 @@ impl FolderMap for Checkpoint {
 
 impl Checkpoint {
     /// The program's tensor of the checkpoint tensor `name` and the role it is read in; a tensor
-    /// no Llama folder of MLX's has is refused with why.
+    /// no folder of this family has is refused with why.
     fn tensor(&self, name: &str) -> Result<Target, Error> {
         let bare = |(to, plain)| Target {
             to,
@@ -355,9 +453,8 @@ impl Checkpoint {
         if name == HEAD {
             return Ok(bare((common::output(), Plain::Q8_0)));
         }
-        let short = name
-            .strip_prefix("model.")
-            .ok_or_else(|| refuse(name, "not a Llama tensor"))?;
+        let not_ours = || refuse(name, format!("not a {} tensor", self.family.word()));
+        let short = name.strip_prefix("model.").ok_or_else(not_ours)?;
         if let Some(global) = trunk::global(short) {
             return Ok(bare(global));
         }
@@ -365,15 +462,21 @@ impl Checkpoint {
             .strip_prefix("layers.")
             .and_then(|r| r.split_once('.'))
             .and_then(|(l, rest)| Some((l.parse::<usize>().ok()?, rest)))
-            .ok_or_else(|| refuse(name, "not a Llama tensor"))?;
+            .ok_or_else(not_ours)?;
         if l >= self.layers {
             return Err(refuse(name, format!("layer {l} of {}", self.layers)));
         }
         if let Some((to, plain)) = trunk::projections(l, rest) {
-            let heads = match rest {
-                "self_attn.q_proj.weight" => Some(self.heads),
-                "self_attn.k_proj.weight" => Some(self.kv_heads),
-                _ => None,
+            // The query and key rows move where the family's rope pairs halves
+            // ([`Family::interleaves`]); the value and output rows never do.
+            let heads = if self.family.interleaves() {
+                match rest {
+                    "self_attn.q_proj.weight" => Some(self.heads),
+                    "self_attn.k_proj.weight" => Some(self.kv_heads),
+                    _ => None,
+                }
+            } else {
+                None
             };
             return Ok(Target {
                 to,
@@ -381,10 +484,15 @@ impl Checkpoint {
                 step: heads.map(|heads| Interleave { heads }),
             });
         }
+        if self.family.head_norms()
+            && let Some((to, plain)) = trunk::head_norms(l, rest)
+        {
+            return Ok(bare((to, plain)));
+        }
         trunk::block_norms(l, rest, common::ffn_norm)
             .or_else(|| trunk::dense_ffn(l, rest))
             .map(bare)
-            .ok_or_else(|| refuse(name, "not a Llama tensor"))
+            .ok_or_else(not_ours)
     }
 
     /// The ggml dims of the file's tensor `stem` (the name past `blk.N.`, or a model-level
@@ -401,14 +509,16 @@ impl Checkpoint {
             "attn_q.weight" => vec![hidden, query],
             "attn_k.weight" | "attn_v.weight" => vec![hidden, key],
             "attn_output.weight" => vec![query, hidden],
+            "attn_q_norm.weight" | "attn_k_norm.weight" => vec![self.head_dim as u64],
             "ffn_gate.weight" | "ffn_up.weight" => vec![hidden, ffn],
             "ffn_down.weight" => vec![ffn, hidden],
-            other => unreachable!("{other} is a tensor of no Llama file"),
+            other => unreachable!("{other} is a tensor of no {} file", self.family.word()),
         }
     }
 
     /// Every tensor the file holds is mapped, at the dims the config gives: the embedding, the
-    /// output norm, the head of an untied model, and each layer's nine.
+    /// output norm, the head of an untied model, and each layer's nine — eleven where the family
+    /// norms each query and key head.
     fn complete(&self, mapped: &BTreeMap<String, Mapped<Interleave>>) -> Result<(), Error> {
         const LAYER: [&str; 9] = [
             "attn_norm.weight",
@@ -421,16 +531,19 @@ impl Checkpoint {
             "ffn_up.weight",
             "ffn_down.weight",
         ];
+        const HEAD_NORMS: [&str; 2] = ["attn_q_norm.weight", "attn_k_norm.weight"];
+        let layer: Vec<&str> = if self.family.head_norms() {
+            LAYER.into_iter().chain(HEAD_NORMS).collect::<Vec<_>>()
+        } else {
+            LAYER.to_vec()
+        };
         let mut globals = vec!["token_embd.weight", "output_norm.weight"];
         if !self.tied {
             globals.push("output.weight");
         }
         let globals = globals.into_iter().map(|stem| (stem.to_string(), stem));
-        let layers = (0..self.layers).flat_map(|l| {
-            LAYER
-                .into_iter()
-                .map(move |stem| (common::blk(l, stem), stem))
-        });
+        let layers = (0..self.layers)
+            .flat_map(|l| layer.iter().map(move |&stem| (common::blk(l, stem), stem)));
         for (name, stem) in globals.chain(layers) {
             let m = mapped
                 .get(&name)
@@ -460,6 +573,10 @@ mod tests {
 
     const CONFIG: &str = "quant-configs/mlx-community__Llama-3.1-8B-Instruct-4bit__config.json.gz";
     const HEADER: &str = "checkpoint-headers/llama-3.1-8b-instruct-mlx-4bit-model.header.json.gz";
+    const Q8B_CONFIG: &str = "quant-configs/mlx-community__Qwen3-8B-4bit__config.json.gz";
+    const Q8B_HEADER: &str = "checkpoint-headers/qwen3-8b-mlx-4bit-model.header.json.gz";
+    const Q32B_CONFIG: &str = "quant-configs/mlx-community__Qwen3-32B-4bit__config.json.gz";
+    const Q32B_TENSORS: &str = "checkpoint-headers/qwen3-32b-mlx-4bit.tensors.json.gz";
 
     /// Llama-3.1-8B's `rope_scaling`: the frequencies of a wavelength past 8192 divided by 8, those
     /// under 2048 kept.
@@ -583,16 +700,7 @@ mod tests {
     fn real_tensors() -> Vec<(String, Vec<usize>)> {
         let mut header = json(HEADER);
         header.as_object_mut().unwrap().remove("__metadata__");
-        entries(&header)
-            .into_iter()
-            .filter(|(name, _, _)| name.ends_with(".weight"))
-            .map(|(name, dtype, mut shape)| {
-                if dtype == safetensors::Dtype::U32 {
-                    *shape.last_mut().unwrap() *= 8;
-                }
-                (name, shape)
-            })
-            .collect()
+        unpacked(&header)
     }
 
     fn map_of(
@@ -708,7 +816,7 @@ mod tests {
             ("mlp_bias", json!(true), "supported: [false]"),
             ("pretraining_tp", json!(2), "supported: [1]"),
             ("hidden_act", json!("gelu"), "supported: [\"silu\"]"),
-            ("model_type", json!("mistral"), "supported: [\"llama\"]"),
+            ("model_type", json!("mistral"), "no family this map reads"),
             (
                 "architectures",
                 json!(["MistralForCausalLM"]),
@@ -1035,6 +1143,328 @@ mod tests {
             assert_eq!(bytes.len(), rows * 36);
             for row in [0, 1, rows - 1] {
                 assert_eq!(bytes[row * 36..][..32], words(row)[..], "{name} row {row}");
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The real Qwen3-8B folder's tensors, as the map is handed them: the 8B header's form.
+    fn q8b_tensors() -> Vec<(String, Vec<usize>)> {
+        let mut header = json(Q8B_HEADER);
+        header.as_object_mut().unwrap().remove("__metadata__");
+        unpacked(&header)
+    }
+
+    /// The real Qwen3-32B folder's tensors, from the tensors file every shard's header makes.
+    fn q32b_tensors() -> Vec<(String, Vec<usize>)> {
+        unpacked(&json(Q32B_TENSORS))
+    }
+
+    /// The entries of a header or tensors fixture at the unpacked shapes the map reads them
+    /// (the packed U32 words hold eight 4-bit values), the `.weight` planes alone.
+    fn unpacked(fixture: &Json) -> Vec<(String, Vec<usize>)> {
+        entries(fixture)
+            .into_iter()
+            .filter(|(name, _, _)| name.ends_with(".weight"))
+            .map(|(name, dtype, mut shape)| {
+                if dtype == safetensors::Dtype::U32 {
+                    *shape.last_mut().unwrap() *= 8;
+                }
+                (name, shape)
+            })
+            .collect()
+    }
+
+    /// The real Qwen3 folders map through the Llama map's trunk at Qwen3's family facts: the
+    /// per-head q/k norms beside the projections (11 tensors a layer, the 8B's 399 and the 32B's
+    /// 707), no move on any tensor, the header's keys the same facts under `qwen3.`, and no
+    /// constant. Mutants (each red here): the family's pre row as llama-bpe, `interleaves` true
+    /// (the first steps assert), `head_norms` false (the count).
+    #[test]
+    fn the_real_qwen3_folders_map_to_the_files_tensors_and_keys() {
+        for (config, tensors, layers, heads, ffn, group) in [
+            (
+                Q8B_CONFIG,
+                q8b_tensors(),
+                36usize,
+                32usize,
+                12_288u64,
+                4usize,
+            ),
+            (Q32B_CONFIG, q32b_tensors(), 64, 64, 25_600, 8),
+        ] {
+            let checkpoint = Checkpoint::parse(&json(config)).unwrap();
+            assert_eq!(checkpoint.architecture(), "qwen3");
+            let mapping = map_of(&checkpoint, &tensors).unwrap();
+            assert_eq!(mapping.tensors.len(), 3 + layers * 11);
+            assert!(mapping.skipped.is_empty());
+            let get = |name: &str| &mapping.tensors[name];
+            let (hidden, head_dim, kv_heads, vocab) = (
+                if heads == 32 { 4096u64 } else { 5120 },
+                128u64,
+                8u64,
+                151_936u64,
+            );
+            assert_eq!(get("token_embd.weight").dims, [hidden, vocab]);
+            assert_eq!(get("output.weight").dims, [hidden, vocab]);
+            for (name, dims) in [
+                ("attn_norm.weight", vec![hidden]),
+                ("attn_q.weight", vec![hidden, heads as u64 * head_dim]),
+                ("attn_k.weight", vec![hidden, kv_heads * head_dim]),
+                ("attn_v.weight", vec![hidden, kv_heads * head_dim]),
+                ("attn_output.weight", vec![heads as u64 * head_dim, hidden]),
+                ("attn_q_norm.weight", vec![head_dim]),
+                ("attn_k_norm.weight", vec![head_dim]),
+                ("ffn_norm.weight", vec![hidden]),
+                ("ffn_gate.weight", vec![hidden, ffn]),
+                ("ffn_up.weight", vec![hidden, ffn]),
+                ("ffn_down.weight", vec![ffn, hidden]),
+            ] {
+                for l in [0, layers - 1] {
+                    let m = get(&format!("blk.{l}.{name}"));
+                    assert_eq!(m.dims, dims, "{l} {name}");
+                    assert!(m.steps.is_empty(), "{l} {name}: Qwen3 stores NEOX rows");
+                }
+            }
+            assert_eq!(
+                get("blk.0.attn_q_norm.weight").role,
+                Use::Matrix(Plain::F32)
+            );
+            assert_eq!(get("blk.0.attn_q.weight").role, Use::Matrix(Plain::Q8_0));
+            let keys: BTreeMap<&str, &Value> = checkpoint
+                .keys
+                .iter()
+                .map(|(k, v)| (k.as_str(), v))
+                .collect();
+            assert_eq!(keys.len(), 11);
+            for (key, want) in [
+                ("block_count", layers as u32),
+                ("context_length", 40_960),
+                ("embedding_length", u32::try_from(hidden).unwrap()),
+                ("attention.head_count", heads as u32),
+                ("attention.head_count_kv", 8),
+                ("attention.key_length", 128),
+                ("attention.value_length", 128),
+                ("feed_forward_length", u32::try_from(ffn).unwrap()),
+                ("rope.dimension_count", 128),
+            ] {
+                assert_eq!(*keys[key], Value::U32(want), "{key}");
+            }
+            assert_eq!(*keys["rope.freq_base"], Value::F32(1_000_000.0));
+            assert_eq!(*keys["attention.layer_norm_rms_epsilon"], Value::F32(1e-6));
+            assert!(checkpoint.constants().unwrap().is_empty());
+            // The query heads group by the key heads at the sizes the three folders hold.
+            assert_eq!(heads as u64 / kv_heads, group as u64);
+        }
+    }
+
+    /// A Qwen3 config the map does not read is refused by name: a window cut, a sliding flag, a
+    /// rope scaling block, the layers a window applies to as a string, another family's type,
+    /// Llama's class, and a key no table names; a `rope_scaling` of null (the spelling the three
+    /// real folders carry) reads as the plain rope. Mutants (each red at its line): the family
+    /// table without its rope rule, without the window keys.
+    #[test]
+    fn a_qwen3_config_the_map_does_not_read_is_refused_by_name() {
+        let real = json(Q8B_CONFIG);
+        let parse = |edit: &dyn Fn(&mut serde_json::Map<String, Json>)| {
+            let mut config = real.clone();
+            edit(config.as_object_mut().unwrap());
+            Checkpoint::parse(&config).map_err(|e| e.to_string())
+        };
+        for (key, value, want) in [
+            ("sliding_window", json!(4096), "supported: [null]"),
+            ("use_sliding_window", json!(true), "supported: [false]"),
+            ("max_window_layers", json!("all"), "is not a Number"),
+            ("mlp_bias", json!(true), "is not a key this converter reads"),
+        ] {
+            let e = parse(&|c| {
+                c.insert(key.to_string(), value.clone());
+            })
+            .unwrap_err();
+            assert!(e.contains(key) && e.contains(want), "{key}: {e}");
+        }
+        let e = parse(&|c| {
+            c.insert(
+                "rope_scaling".into(),
+                json!({"rope_type": "yarn", "factor": 4.0}),
+            );
+        })
+        .unwrap_err();
+        assert!(
+            e.contains("rope_scaling") && e.contains("supported: [null]"),
+            "{e}"
+        );
+        let e = parse(&|c| {
+            c.insert("model_type".into(), json!("qwen3_moe"));
+        })
+        .unwrap_err();
+        assert!(
+            e.contains("model_type") && e.contains("no family this map reads"),
+            "{e}"
+        );
+        let e = parse(&|c| {
+            c.insert("architectures".into(), json!(["LlamaForCausalLM"]));
+        })
+        .unwrap_err();
+        assert!(
+            e.contains("architectures") && e.contains("Qwen3ForCausalLM"),
+            "{e}"
+        );
+        // The spelling the real folders carry is the plain rope.
+        let plain = parse(&|c| {
+            c.insert("rope_scaling".into(), Json::Null);
+        })
+        .unwrap();
+        assert!(plain.rope_factors.is_none());
+    }
+
+    /// A tied Qwen3 (the 0.6B to 4B sizes) has no head beside the embedding, taken as Llama's
+    /// is: the flag and the folder's head must agree either way. Mutant: `complete` demanding
+    /// `output.weight` of a tied family.
+    #[test]
+    fn a_tied_qwen3_folder_has_no_head_beside_the_embedding() {
+        let mut config = json(Q8B_CONFIG);
+        config["tie_word_embeddings"] = json!(true);
+        let tied = Checkpoint::parse(&config).unwrap();
+        let mut t = q8b_tensors();
+        let e = map_of(&tied, &t).err().expect("refused");
+        assert!(e.contains("lm_head.weight") && e.contains("is true"), "{e}");
+        t.retain(|(n, _)| !n.starts_with("lm_head."));
+        let mapping = map_of(&tied, &t).unwrap();
+        assert_eq!(mapping.tensors.len(), 2 + 36 * 11);
+        assert!(!mapping.tensors.contains_key("output.weight"));
+    }
+
+    /// A folder of two layers of a Qwen3 as small as the groups allow (4 heads over 2 of 16
+    /// values, the per-head q/k norms, a hidden width of 64) opens as a qwen3 file: the engine's
+    /// own reader describes it through the registry (the NEOX rope with the norms, a dense
+    /// SwiGLU), and each tensor reads whole from the source, every matrix as stored — Qwen3's
+    /// rows are HF's own pairing, so nothing moves. Mutants (each red here): `interleaves` true
+    /// (the query rows), `head_norms` false (the tensor count).
+    #[test]
+    fn a_small_qwen3_folder_opens_as_a_qwen3_file() {
+        use model::arch::models::{Mixer, RopeMode};
+        use model::part::{Source, Take};
+
+        let quantization = json!({"group_size": 64, "bits": 4});
+        let config = json!({
+            "architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3",
+            "attention_bias": false, "tie_word_embeddings": false, "hidden_act": "silu",
+            "rope_scaling": null, "sliding_window": null, "use_sliding_window": false,
+            "max_window_layers": 2,
+            "bos_token_id": 0, "eos_token_id": [2, 3], "vocab_size": 8,
+            "num_hidden_layers": 2, "max_position_embeddings": 4096, "hidden_size": 64,
+            "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 16,
+            "intermediate_size": 128, "rms_norm_eps": 1e-6, "rope_theta": 1000000.0,
+            "quantization": quantization, "quantization_config": quantization,
+        });
+        let dir = temp_dir("qwen3-open");
+        let mut t: Vec<Stored> = vec![];
+        for stem in ["model.embed_tokens", "lm_head"] {
+            t.extend(mlx_linear(stem, 4, &[8], 64));
+        }
+        t.push(bf16_tensor("model.norm.weight", &[64], |_| 0x3fc0));
+        for l in 0..2 {
+            let m = format!("model.layers.{l}");
+            for (norm, bf16) in [
+                ("input_layernorm", 0x3fc0),
+                ("post_attention_layernorm", 0x3f80),
+            ] {
+                t.push(bf16_tensor(&format!("{m}.{norm}.weight"), &[64], |_| bf16));
+            }
+            for (proj, rows, k) in [
+                ("gate_proj", 128, 64),
+                ("up_proj", 128, 64),
+                ("down_proj", 64, 128),
+            ] {
+                t.extend(mlx_linear(&format!("{m}.mlp.{proj}"), 4, &[rows], k));
+            }
+            for (stem, rows) in [
+                ("q_proj", 64),
+                ("k_proj", 32),
+                ("v_proj", 32),
+                ("o_proj", 64),
+            ] {
+                t.extend(mlx_linear(&format!("{m}.self_attn.{stem}"), 4, &[rows], 64));
+            }
+            for norm in ["q_norm", "k_norm"] {
+                t.push(bf16_tensor(
+                    &format!("{m}.self_attn.{norm}.weight"),
+                    &[16],
+                    |_| 0x3e80,
+                ));
+            }
+        }
+        write_folder(&dir, &t, &config, &tokenizer("qwen2"));
+        let opened = folder::open(&dir).unwrap();
+        let named = folder::architecture(config.to_string().as_bytes()).unwrap();
+        assert_eq!(Some(named), opened.header.architecture());
+        assert_eq!(named, "qwen3");
+        let read = model::arch::spec(&opened.header).unwrap();
+        let spec = &read.spec;
+        assert_eq!((spec.layers.len(), spec.hidden, spec.vocab), (2, 64, 8));
+        for layer in &spec.layers {
+            let Mixer::Gqa(g) = &layer.mixer else {
+                panic!("a layer mixes with {:?}", layer.mixer);
+            };
+            assert_eq!((g.heads, g.kv_heads, g.head_dim), (4, 2, 16));
+            assert_eq!(
+                (g.rope.mode, g.rope.dims, g.rope.base),
+                (RopeMode::Neox, 16, 1_000_000.0)
+            );
+            assert!(g.qk_norm && !g.rope.factors);
+        }
+        let ty = |name: &str| opened.header.find(name).unwrap().1.ty;
+        assert_eq!(ty("blk.0.attn_q.weight"), GgmlType::MLX_A4);
+        assert_eq!(ty("blk.0.attn_q_norm.weight"), GgmlType::F32);
+        assert_eq!(
+            opened.header.iter_tensors().count(),
+            3 + 2 * 11,
+            "the head norms beside the trunk's tensors, and no rope factor table"
+        );
+        let planned = opened
+            .source
+            .plan(|_, _, _| Ok::<_, String>(Take::Whole))
+            .unwrap();
+        let read = |name: &str| -> Vec<u8> {
+            let p = planned.iter().find(|p| p.info.name == name).unwrap();
+            let part = opened.source.read(p).unwrap();
+            assert_eq!(part.spans().concat().len() as u64, p.info.nbytes, "{name}");
+            part.spans().concat()
+        };
+        // Every matrix reads as stored: no row moves (a Qwen3 folder keeps HF's pairing). A row
+        // of `k` values is its `k / 64` blocks — 8 code words, then the group's scale and bias
+        // (0.5, -0.25) — in the order the folder stores them.
+        let words = |at: usize| -> Vec<u8> {
+            let at = (at * 8) as u32;
+            (at..at + 8)
+                .flat_map(|i| i.wrapping_mul(0x9e37_79b9).to_le_bytes())
+                .collect()
+        };
+        for (name, rows, k) in [
+            ("blk.0.attn_q.weight", 64, 64),
+            ("blk.0.attn_k.weight", 32, 64),
+            ("blk.1.attn_output.weight", 64, 64),
+            ("blk.1.ffn_down.weight", 64, 128),
+        ] {
+            let bytes = read(name);
+            let groups = k / 64;
+            let row = groups * 36;
+            assert_eq!(bytes.len(), rows * row, "{name}");
+            for at in [0, 1, rows - 1] {
+                for g in 0..groups {
+                    let block = at * row + g * 36;
+                    assert_eq!(
+                        bytes[block..][..32],
+                        words(at * groups + g)[..],
+                        "{name} row {at} group {g}"
+                    );
+                    assert_eq!(
+                        bytes[block + 32..][..4],
+                        [0x00, 0x3f, 0x80, 0xbe],
+                        "{name} row {at} group {g}"
+                    );
+                }
             }
         }
         std::fs::remove_dir_all(&dir).unwrap();

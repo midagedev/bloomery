@@ -127,8 +127,9 @@ SERVES_VIA_FROM_NAME = {"glm": ("Glm5next",), "solar2": ("SolarOpen2",), "minima
 # PIN(2026-10-26): the mirror of qwen_seat.rs DECISION_LAYOUTS and its doctoring case are gone with the const: the seat
 # refuses a file by its header's `<arch>.decision.type` (model_file::refuse_decision_model), not by an architecture name.
 SERVES_BY_PROGRAM = {"qwen3": ("Qwen3moeBody", "Qwen35Body")}
-PROGRAM_OF = {"Qwen3Moe": "Qwen3moeBody", "Qwen35Moe": "Qwen35Body", "Qwen35": "Qwen35Body", "Llama": "Qwen35Body"}
-MODELS_ARCH_NAME = {"Qwen3Moe": "qwen3moe", "Qwen35Moe": "qwen35moe", "Qwen35": "qwen35", "Llama": "llama"}
+PROGRAM_OF = {"Qwen3Moe": "Qwen3moeBody", "Qwen35Moe": "Qwen35Body", "Qwen35": "Qwen35Body", "Llama": "Qwen35Body",
+              "Qwen3": "Qwen35Body"}
+MODELS_ARCH_NAME = {"Qwen3Moe": "qwen3moe", "Qwen35Moe": "qwen35moe", "Qwen35": "qwen35", "Llama": "llama", "Qwen3": "qwen3"}
 # crates/gpu-gates/src/bin/bloomery_serve.rs:Model::ALL and Model::word — the generative seats in the order
 # the refusal of an unserved file lists them; crates/serve/src/decide.rs:WORD is the decide seat's word.
 SEAT_ORDER = ("ds41", "qwen38", "glm", "qwen3", "mimo2", "solar2", "minimaxm3", "nemotron", "raon1", "musespark", "flint")
