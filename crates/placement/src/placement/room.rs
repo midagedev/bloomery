@@ -366,8 +366,9 @@ pub fn row_table_tier(
     } else {
         row_room(model, positions, page, source)?
     };
-    plan.host.reserve_bytes = host_arm
-        .reserves
+    // The plan's own reserves take the new room: the need's leave out the part reads
+    // (`workstation::PART_READS`, its `read_ahead`), which stay the plan's.
+    plan.host.reserve_bytes = (plan.host.reserve_bytes - old)
         .checked_add(new)
         .ok_or_else(|| past("the host's reserves with the row room"))?;
     plan.host.row_reserve_bytes = new;

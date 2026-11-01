@@ -3051,7 +3051,7 @@ mod tests {
     fn an_f8_ple_table_and_its_scale_describe() {
         use crate::arch::qwen35moe::hparams::tests::{keys, tensors};
         use crate::arch::synthetic::{Ty, V, header_typed};
-        use crate::placement::workstation::HostRead;
+        use crate::placement::workstation::{self, HostRead};
         use crate::placement::{self, PlanLevers, Role};
         use gguf::Split;
 
@@ -3160,6 +3160,22 @@ mod tests {
                     }
                 }
             }
+        }
+        // A folder's reserved part reads stay among the plan's host reserves where the table's
+        // tier sets its row room, so the need is the plan's.
+        let mut folder = machine;
+        workstation::reserve_part_reads(&mut folder, 17);
+        for input in [&inputs, &source] {
+            let plan = input
+                .plan_with(&folder, (4096, 512), &levers, super::Experts::Card)
+                .unwrap();
+            let need = workstation::HostNeed::of(&plan, 0);
+            assert_eq!(need.read_ahead, 17);
+            let how = workstation::Hosting {
+                lock: false,
+                arena_pinned: false,
+            };
+            need.classes(&plan, how).expect("the folder plan's need");
         }
         let _ = std::fs::remove_file(&path);
         let role = |name: &str| {
