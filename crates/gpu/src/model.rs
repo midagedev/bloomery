@@ -1928,8 +1928,10 @@ impl<B: ChainBody> GpuModel<B> {
     /// body runs one:
     /// - **call-end read** (qwen3moe's prefill): only the call's last pass
     ///   enqueues the head, so the word is read once, behind the head at the
-    ///   call's end; a fault an earlier pass raised is named there, and the
-    ///   passes between it and the end ran on the condemned state.
+    ///   call's end (a call that runs no head, `CallEnd::Unread`, reads the
+    ///   word itself at the end of its last pass); a fault an earlier pass
+    ///   raised is named there, and the passes between it and the end ran on
+    ///   the condemned state.
     /// - **group-end read** (deepseek41's prompt call): every group's pass
     ///   returns `true` only for the group that holds the call's last
     ///   position, and a group that fails is read behind at once

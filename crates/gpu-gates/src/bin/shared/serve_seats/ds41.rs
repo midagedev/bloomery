@@ -223,7 +223,8 @@ use bloomery_gpu_deepseek41::swap;
 use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{
     CacheRam, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotFlags, SlotStep, SlotsFrom,
-    TemplateFile, Vocab, arm_screen, bind_server, model_props, parallel_line, placement_of,
+    TemplateFile, Vocab, arm_screen, bind_server, call_token, model_props, parallel_line,
+    placement_of,
 };
 use bloomery_gpu_gates::generate::{DraftSeat, Lane, Place, lane_at, mode_name};
 use bloomery_gpu_gates::need;
@@ -241,6 +242,7 @@ use model::placement::ctx_ask::DEFAULT_SLOTS;
 use model::placement::workstation::{HostNeed, TierBatchBytes};
 use model::placement::{Machine, Plan, PlanLevers};
 use refset::arch::deepseek41::VERIFIED_POSITIONS;
+use runtime::prompt::CallEnd;
 use runtime::width::Mode as WidthMode;
 use runtime::{Target, Want};
 use serve::dsml::{Spelling, respell};
@@ -1317,8 +1319,16 @@ impl Seat for V41 {
     }
 
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
+        self.prompt_call(ids, CallEnd::Argmax)
+    }
+
+    /// The session's prompt call ending as `end` asks
+    /// ([`app::Session::prompt_call`]: the batched call runs no head when
+    /// unread), through the draft: the DSpark draft's own call runs its head
+    /// whatever the end, and the lookup takes the call's ids.
+    fn prompt_call(&mut self, ids: &[u32], end: CallEnd) -> Result<u32, GateError> {
         let next = self.draft.prefill(&mut self.s, ids, |s| {
-            Ok(s.prompt(ids, Want::Argmax)?.argmax())
+            call_token(end, s.prompt_call(ids, end)?)
         })?;
         self.print_passes()?;
         Ok(next)

@@ -82,6 +82,7 @@ use bloomery_gpu::checkpoint::bytes;
 use bloomery_gpu::media::{CallRows, MediaBody};
 use bloomery_gpu::model::{Rollback, Rows, SlotRows, Slots, StepMode};
 use bloomery_gpu::{GpuError, GpuModel};
+use runtime::prompt::CallEnd;
 use runtime::{Draft, TapNeed, Target};
 
 use crate::{Draw, Keep, Prompt, RoundWindow, Session, SessionError};
@@ -228,8 +229,13 @@ pub trait MtpBody: Prompt + Keep + Rows + Rollback {
         pos: u32,
     ) -> Result<(), GpuError>;
 
-    /// The prompt call: `ids` from the model's position by `path`, and the
-    /// argmax after the last. `sink` is called after each unit the call runs,
+    /// The prompt call: `ids` from the model's position by `path`, ending as
+    /// `end` asks ([`CallEnd`]): the argmax after the last when it runs the
+    /// head ([`CallEnd::head`]), `None` for [`CallEnd::Unread`]. A body asked
+    /// for [`CallEnd::Close`] runs the last id as the call's last row with the
+    /// checkpoints of the call less that id, or refuses it by name before
+    /// anything runs; a seat asks it only of a body that folds the id.
+    /// `sink` is called after each unit the call runs,
     /// whatever the path's unit is (a step, a pass, a ubatch), with the arena
     /// its rows' final hidden rows sit in, the unit's first position and its
     /// rows, before the next unit overwrites them: the window walks the draft
@@ -243,18 +249,9 @@ pub trait MtpBody: Prompt + Keep + Rows + Rollback {
         m: &mut GpuModel<Self>,
         ids: &[u32],
         path: Self::Path,
+        end: CallEnd,
         sink: Option<&mut UnitSink<'_, Self>>,
-    ) -> Result<u32, GpuError>;
-
-    /// A prompt call whose token is unused, with the same hidden-row sink.
-    fn prefill_with(
-        m: &mut GpuModel<Self>,
-        ids: &[u32],
-        path: Self::Path,
-        sink: Option<&mut UnitSink<'_, Self>>,
-    ) -> Result<(), GpuError> {
-        Self::prompt_with(m, ids, path, sink).map(|_| ())
-    }
+    ) -> Result<Option<u32>, GpuError>;
 
     /// Prepare a call's sequence state before the draft joins it, keep that state through
     /// `run`, and finish it on success or failure. Bodies with no per-call sequence state
@@ -724,15 +721,6 @@ impl<B: MtpBody> Exec<B::Arena> for Gather<'_, B> {
     }
 }
 
-impl<B: MtpBody> Session<B> {
-    /// Feed a prompt without producing a token, retaining the session's idle check.
-    pub fn prefill(&mut self, ids: &[u32], path: B::Path) -> Result<(), SessionError> {
-        self.idle("prefill")?;
-        let _busy = self.model().prompt_busy();
-        Ok(B::prefill_with(self.model_mut(), ids, path, None)?)
-    }
-}
-
 impl<B: MtpBody> MtpDraft<B> {
     /// Preserve the prompt's waiting row before another resident sequence
     /// can overwrite its shared arena. The target is never run again.
@@ -743,11 +731,18 @@ impl<B: MtpBody> MtpDraft<B> {
         })?)
     }
 
-    /// Feed prompt positions without requesting the target's head.
-    pub fn prefill(&mut self, t: &mut Session<B>, ids: &[u32]) -> Result<(), SessionError> {
+    /// [`Draft::prompt`] ending as `end` asks: the draft walked over the
+    /// call's units as they complete whatever its end, the argmax after the
+    /// last when the call runs the head.
+    pub fn prompt_call(
+        &mut self,
+        t: &mut Session<B>,
+        ids: &[u32],
+        end: CallEnd,
+    ) -> Result<Option<u32>, SessionError> {
         let path = self.path;
         Ok(self.prompt_joined(t.model_mut(), ids, None, |m, sink| {
-            B::prefill_with(m, ids, path, sink)
+            B::prompt_with(m, ids, path, end, sink)
         })?)
     }
     /// The draft over the model `m` loaded beside its target: the head the
@@ -1318,9 +1313,10 @@ impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
     /// before it, the last unit's last row left for `begin`. A draft that
     /// cannot join skips: the target's call alone.
     fn prompt(&mut self, t: &mut Session<B>, ids: &[u32]) -> Result<u32, SessionError> {
-        let path = self.path;
-        Ok(self.prompt_joined(t.model_mut(), ids, None, |m, sink| {
-            B::prompt_with(m, ids, path, sink)
+        let next = self.prompt_call(t, ids, CallEnd::Argmax)?;
+        Ok(next.ok_or(GpuError::State {
+            what: WHAT,
+            missing: "the head's token after the prompt",
         })?)
     }
 

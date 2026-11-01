@@ -30,6 +30,7 @@ use bloomery_levers::HostCfg;
 use gguf::Split;
 use model::arch::glm5next::place::{KdaLanes, NextnInputs, PlanInputs};
 use model::placement::{Machine, Plan, PlanLevers};
+use runtime::prompt::CallEnd;
 use runtime::seqstate::Kept;
 
 use crate::{Keep, Loaded, Open, OpenArgs, OpenLog, Prompt, Session, SessionError};
@@ -305,6 +306,18 @@ impl Prompt for Body {
     /// stores' positions is refused before anything runs.
     fn prompt(m: &mut GpuModel<Body>, ids: &[u32]) -> Result<u32, GpuError> {
         bloomery_gpu_glm5next::feed(m, ids)
+    }
+
+    /// [`Prompt::prompt`] ending as `end` asks
+    /// ([`bloomery_gpu_glm5next::prompt_with`] by the body's feed): the
+    /// batched call runs no head when unread.
+    fn prompt_call(
+        m: &mut GpuModel<Body>,
+        ids: &[u32],
+        end: CallEnd,
+    ) -> Result<Option<u32>, GpuError> {
+        let mode = bloomery_gpu_glm5next::prefill_mode(m)?;
+        bloomery_gpu_glm5next::prompt_with(m, ids, mode, end, None)
     }
 }
 

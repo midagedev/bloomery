@@ -315,6 +315,7 @@ mod gate {
     use refset::ik::Layout;
     use refset::mtpref::{Graph, MtpSet};
     use runtime::hc_gated::{Geometry, LO_BAND, MIXED_BAND, MixWeights, mix_ref};
+    use runtime::prompt::CallEnd;
     use runtime::width::Chosen as _;
     use runtime::{Advance, Committed, Draft, Out, PassSink, TapNeed, Target, Verify, Want};
 
@@ -2442,9 +2443,9 @@ mod gate {
             m.body_parts("completed rows")?.2.set_checkpoints(false);
             // Seed finite final streams before overwriting their arena without a reader.
             let mut sink = |_: &mut Qwen38Model, _, _, _| Ok(());
-            m.prefill38_with(ids, path, Some(&mut sink))?;
+            m.prompt38_call(ids, path, CallEnd::Unread, Some(&mut sink))?;
             m.reset()?;
-            m.prefill38_with(ids, path, None)?;
+            m.prompt38_call(ids, path, CallEnd::Unread, None)?;
             warm(m)?;
             ok &= refused(
                 &format!("{walk:?} unfinished first hidden row"),
@@ -2457,7 +2458,7 @@ mod gate {
                 "final hidden rows",
             );
             m.reset()?;
-            m.prefill38_with(ids, path, Some(&mut sink))?;
+            m.prompt38_call(ids, path, CallEnd::Unread, Some(&mut sink))?;
             warm(m)?;
             let ran = m.mtp_draft(feed(walk, 0, 1), h, e).is_ok();
             println!(
@@ -2471,7 +2472,7 @@ mod gate {
             m.body_parts("completed rows")?.2.plant_after_launch();
             ok &= refused(
                 &format!("{walk:?} tapped call failed past its launch"),
-                m.prefill38_with(ids, path, Some(&mut sink)),
+                m.prompt38_call(ids, path, CallEnd::Unread, Some(&mut sink)),
                 "planted failure after the launch",
             );
             warm(m)?;
@@ -3005,7 +3006,7 @@ mod gate {
     }
 
     /// (cl) A prompt's last id run as its last call's last row
-    /// ([`Body38::set_close`]), held to the prompt fed in one `Auto` call
+    /// ([`CallEnd::Close`]), held to the prompt fed in one `Auto` call
     /// ([`close_case`]): at 21 ids from a reset the last id leaves a delta
     /// chunk open, at 32 it completes one, which the call keeps out of the
     /// state; both fold into the last ubatch. At 5 the call is passes. Then a
@@ -3038,10 +3039,10 @@ mod gate {
         let (m, plain, _) = plain_to(m, prompt, Prompt38::Auto, 8)?;
         let (mut s, mut spec) = drafted_session(m, step_cfg(Prompt38::Auto), CTX_CLOSE as u32)?;
         s.model_mut().body_parts("(cl)")?.2.set_checkpoints(true);
-        close_on(s.model_mut(), true)?;
-        let first = spec.prompt(&mut s, prompt);
-        close_on(s.model_mut(), false)?;
-        let first = first?;
+        let first = spec
+            .draft_mut()
+            .prompt_call(&mut s, prompt, CallEnd::Close)?
+            .ok_or("the closing call read no token")?;
         let rejoins = s.model().body("(cl)")?.draft_rejoins(end);
         let drafted = runtime::generate(
             &mut s,
@@ -3062,10 +3063,10 @@ mod gate {
         s.model_mut().add_slots(2)?;
         s.reset()?;
         spec.draft_mut().restart();
-        close_on(s.model_mut(), true)?;
-        let first = spec.prompt(&mut s, prompt);
-        close_on(s.model_mut(), false)?;
-        let first = first?;
+        let first = spec
+            .draft_mut()
+            .prompt_call(&mut s, prompt, CallEnd::Close)?
+            .ok_or("the closing call read no token")?;
         let width = s.model().body("(cl)")?.mtp_tap_width();
         let source = s.model().body("(cl)")?.target_streams(
             s.model().gpu(),
@@ -3141,20 +3142,20 @@ mod gate {
         let end = u32::try_from(n - 1)?;
         m.body_parts(WHAT)?.2.set_checkpoints(true);
         m.reset()?;
-        let want = closed_run(m, ids, false)?;
+        let want = closed_run(m, ids, CallEnd::Argmax)?;
         m.reset()?;
         m.prompt38(&ids[..n - 1], Prompt38::Auto)?;
-        let cut = closed_run(m, &ids[n - 1..], false)?;
+        let cut = closed_run(m, &ids[n - 1..], CallEnd::Argmax)?;
         m.reset()?;
-        let whole = closed_run(m, ids, true)?;
+        let whole = closed_run(m, ids, CallEnd::Close)?;
         let body = m.body(WHAT)?;
         let rows = body.ubatch_split().map_or(0, |(a, b)| a + b);
         let points = body.checkpoints().positions();
         m.rollback(end)?;
-        let stepped = closed_run(m, &ids[n - 1..], false)?;
+        let stepped = closed_run(m, &ids[n - 1..], CallEnd::Argmax)?;
         m.reset()?;
         m.prompt38(&ids[..k], Prompt38::Auto)?;
-        let split = closed_run(m, &ids[k..], true)?;
+        let split = closed_run(m, &ids[k..], CallEnd::Close)?;
         m.body_parts(WHAT)?.2.set_checkpoints(false);
         m.reset()?;
         let marked = points.contains(&end) && !points.contains(&(end + 1));
@@ -3185,17 +3186,15 @@ mod gate {
     #[cfg(all(test, feature = "checkpoint"))]
     type Closed = (u32, Vec<u32>, Vec<(u32, Vec<u32>)>);
 
-    /// [`Closed`] of one `Auto` call, closing when `close`
-    /// ([`Body38::set_close`]).
+    /// [`Closed`] of one `Auto` call ending as `end` asks.
     #[cfg(all(test, feature = "checkpoint"))]
-    fn closed_run(m: &mut Qwen38Model, ids: &[u32], close: bool) -> Result<Closed, GateError> {
+    fn closed_run(m: &mut Qwen38Model, ids: &[u32], end: CallEnd) -> Result<Closed, GateError> {
         let bits = |m: &Qwen38Model| -> Result<Vec<u32>, GateError> {
             Ok(m.logits()?.iter().map(|v| v.to_bits()).collect())
         };
-        close_on(m, close)?;
-        let first = m.prompt38(ids, Prompt38::Auto);
-        close_on(m, false)?;
-        let first = first?;
+        let first = m
+            .prompt38_call(ids, Prompt38::Auto, end, None)?
+            .ok_or("the call read no token")?;
         let row = bits(m)?;
         let (mut steps, mut feed) = (Vec::new(), first);
         for _ in 0..3 {
@@ -3210,17 +3209,17 @@ mod gate {
     /// stand with their argmax and logits' bits.
     #[cfg(all(test, feature = "checkpoint"))]
     fn close_steps(m: &mut Qwen38Model, ids: &[u32]) -> Result<bool, GateError> {
-        let run = |m: &mut Qwen38Model, close: bool| -> Result<_, GateError> {
+        let run = |m: &mut Qwen38Model, end: CallEnd| -> Result<_, GateError> {
             m.reset()?;
-            close_on(m, close)?;
-            let next = m.prompt38(ids, Prompt38::Step);
-            close_on(m, false)?;
+            let next = m
+                .prompt38_call(ids, Prompt38::Step, end, None)?
+                .ok_or("the call read no token")?;
             let bits: Vec<u32> = m.logits()?.iter().map(|v| v.to_bits()).collect();
-            Ok((next?, m.pos(), bits))
+            Ok((next, m.pos(), bits))
         };
         m.body_parts("(cl)")?.2.set_checkpoints(true);
-        let plain = run(m, false)?;
-        let closed = run(m, true)?;
+        let plain = run(m, CallEnd::Argmax)?;
+        let closed = run(m, CallEnd::Close)?;
         let points = m.body("(cl)")?.checkpoints().positions();
         m.body_parts("(cl)")?.2.set_checkpoints(false);
         m.reset()?;
@@ -3237,13 +3236,6 @@ mod gate {
             verdict(ok)
         );
         Ok(ok)
-    }
-
-    /// The body's closing call on or off ([`Body38::set_close`]).
-    #[cfg(all(test, feature = "checkpoint"))]
-    fn close_on(m: &mut Qwen38Model, on: bool) -> Result<(), GateError> {
-        m.body_parts("(cl)")?.2.set_close(on);
-        Ok(())
     }
 
     /// (qc) The serve seat's prompt quantum (`Q38::prompt_quantum`, the inner
@@ -3296,7 +3288,7 @@ mod gate {
 
     /// One (qc) case, checkpoints on: after a reset and `ids[..k]` fed as a
     /// call, the rest as the serve seat feeds a prompt's calls (each but the
-    /// last `GpuModel::prefill38_with`, the last the closing call
+    /// last unread (`GpuModel::prompt38_call`), the last the closing call
     /// [`closed_run`], which the seat runs where its last id rides the ubatch
     /// walk, `GpuModel::closes_by_ubatch`), once as one call and once cut at
     /// every multiple of [`CHECKPOINT_EVERY`] inside it. The last call rides
@@ -3310,11 +3302,11 @@ mod gate {
             m.reset()?;
             let mut at = 0;
             for &c in [k].iter().chain(cuts).filter(|&&c| c > 0) {
-                m.prefill38_with(&ids[at..c], Prompt38::Auto, None)?;
+                m.prompt38_call(&ids[at..c], Prompt38::Auto, CallEnd::Unread, None)?;
                 at = c;
             }
             let folds = m.closes_by_ubatch(n - at, Prompt38::Auto)?;
-            let closed = closed_run(m, &ids[at..], true)?;
+            let closed = closed_run(m, &ids[at..], CallEnd::Close)?;
             Ok((closed, folds, m.body("(qc)")?.checkpoints().positions()))
         };
         let cuts: Vec<usize> = (k / e + 1..)

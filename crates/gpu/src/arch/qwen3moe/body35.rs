@@ -142,6 +142,7 @@ use model::arch::models::shape::MoeShape;
 use model::arch::models::{Ffn, LayerSpec, Mixer, ModelSpec, MtpDraft, OutGate};
 pub(super) use model::arch::names::blk;
 use model::placement::{CardFormat, Plan, WholeLoad};
+use runtime::prompt::CallEnd;
 use runtime::seqstate::{Kept, Price};
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
@@ -2343,22 +2344,49 @@ impl GpuModel<Body35> {
     /// be below the vocabulary; a prompt past the cache is refused before any
     /// launch.
     pub fn prefill_with(&mut self, tokens: &[u32], path: PrefillPath) -> Result<u32, GpuError> {
-        self.prefill_hooked(tokens, path, None)
+        let next = self.prefill_call(tokens, path, CallEnd::Argmax)?;
+        next.ok_or(GpuError::state(
+            "qwen35moe::prefill",
+            "a token read after the last unit",
+        ))
     }
 
-    /// [`GpuModel::prefill_with`], and with `unit` called after each unit
+    /// [`GpuModel::prefill_with`] ending as `end` asks ([`CallEnd`]): the
+    /// argmax after the last id, or for [`CallEnd::Unread`] no head at all,
+    /// the fault word read at each run's end in its place.
+    pub fn prefill_call(
+        &mut self,
+        tokens: &[u32],
+        path: PrefillPath,
+        end: CallEnd,
+    ) -> Result<Option<u32>, GpuError> {
+        self.prefill_hooked(tokens, path, None, end)
+    }
+
+    /// [`GpuModel::prefill_call`], and with `unit` called after each unit
     /// with the unit's first position and rows (the unit's walk enqueued, its
-    /// head read when it is the last): where [`GpuModel::prefill_tapped`]
-    /// reads its taps back.
+    /// head read when it is the call's last): where
+    /// [`GpuModel::prefill_tapped`] reads its taps back. A closing call
+    /// ([`CallEnd::Close`]) is refused by name before anything runs: a delta
+    /// layer keeps no state inside a unit, where the end mark before the
+    /// last id would stand.
     pub(super) fn prefill_hooked(
         &mut self,
         tokens: &[u32],
         path: PrefillPath,
         unit: Option<&mut UnitHook<'_>>,
-    ) -> Result<u32, GpuError> {
+        end: CallEnd,
+    ) -> Result<Option<u32>, GpuError> {
         const WHAT_P: &str = "qwen35moe::prefill";
         if tokens.is_empty() {
             return Err(GpuError::shape(WHAT_P, "empty token slice"));
+        }
+        if end == CallEnd::Close {
+            return Err(GpuError::shape(
+                WHAT_P,
+                "a closing call: a delta layer takes no checkpoint inside a unit, before the \
+                 call's last id",
+            ));
         }
         let pos0 = self.pos();
         self.body(WHAT_P)?.refuse_inside_image(WHAT_P, pos0)?;
@@ -2391,7 +2419,7 @@ impl GpuModel<Body35> {
             .is_some_and(|p| p.hybrid.call_history());
         let r = self
             .stream_begin(path, tokens.len(), history)
-            .and_then(|()| self.feed_marks(tokens, path, &marks, marked, unit));
+            .and_then(|()| self.feed_marks(tokens, path, &marks, marked, unit, end.head()));
         // The call's own error first: an end refused after a failed call is
         // its echo. A failed call's streaming ends with each layer back at
         // the set it started with too.
@@ -2401,9 +2429,10 @@ impl GpuModel<Body35> {
         Ok(next)
     }
 
-    /// [`GpuModel::prefill_with`]'s runs between its `marks` from where the
-    /// model stands, a checkpoint taken at each when `marked`: the argmax
-    /// after the last id.
+    /// [`GpuModel::prefill_call`]'s runs between its `marks` from where the
+    /// model stands, a checkpoint taken at each when `marked`: with `head`
+    /// the argmax after the last id, the head over the call's last row alone
+    /// (a run before a mark reads only the fault word at its end).
     fn feed_marks(
         &mut self,
         tokens: &[u32],
@@ -2411,14 +2440,17 @@ impl GpuModel<Body35> {
         marks: &[u32],
         marked: bool,
         mut unit: Option<&mut UnitHook<'_>>,
-    ) -> Result<u32, GpuError> {
+        head: bool,
+    ) -> Result<Option<u32>, GpuError> {
         const WHAT_M: &str = "qwen35moe::prefill";
         let pos0 = self.pos();
+        let end = pos0 + launch_u32(WHAT_M, "tokens", tokens.len())?;
         let (mut next, mut at) = (None, pos0);
         for &mark in marks {
             if mark > at {
                 let run = &tokens[(at - pos0) as usize..(mark - pos0) as usize];
-                next = Some(self.feed35(run, path, unit.as_deref_mut())?);
+                let headed = head && mark == end;
+                next = self.feed35(run, path, unit.as_deref_mut(), headed)?;
                 at = mark;
             }
             if marked {
@@ -2427,7 +2459,10 @@ impl GpuModel<Body35> {
                 body.take_mark(gpu.stream(), pos)?;
             }
         }
-        next.ok_or(GpuError::state(WHAT_M, "a token read after the last unit"))
+        if head && next.is_none() {
+            return Err(GpuError::state(WHAT_M, "a token read after the last unit"));
+        }
+        Ok(next)
     }
 
     /// Open the prompt call's streaming ([`PromptStream::begin`]) with the
@@ -2473,16 +2508,19 @@ impl GpuModel<Body35> {
         }
     }
 
-    /// One run of [`GpuModel::prefill_with`]'s call, from where the model
+    /// One run of [`GpuModel::prefill_call`]'s call, from where the model
     /// stands: the image written for the run's ids, then each unit of the
-    /// run's plan one walk, the last ending in its last row's head. The
-    /// argmax after the last id.
+    /// run's plan one walk, the last ending in its last row's head when
+    /// `head` asks for it (the argmax after the last id), else in a read of
+    /// the fault word, so a fault ends the call before a checkpoint copies a
+    /// store.
     fn feed35(
         &mut self,
         run: &[u32],
         path: PrefillPath,
         mut hook: Option<&mut UnitHook<'_>>,
-    ) -> Result<u32, GpuError> {
+        head: bool,
+    ) -> Result<Option<u32>, GpuError> {
         const WHAT_F: &str = "qwen35moe::prefill::run";
         let plan = self.prefill_plan(run.len(), path)?;
         {
@@ -2500,21 +2538,31 @@ impl GpuModel<Body35> {
             let unit = at..at + t;
             at += t;
             let first = self.pos();
-            next = self.run_rows(t, WHAT_F, |gpu, w, body, head, pos| {
-                let end = if last {
-                    UnitEnd::Head(head)
+            let headed = last && head;
+            next = self.run_rows(t, WHAT_F, |gpu, w, body, out, pos| {
+                let end = if headed {
+                    UnitEnd::Head(out)
                 } else {
                     UnitEnd::Pass
                 };
                 body.walk_unit(gpu, w, unit, pos, end)?;
                 body.stream.walk_done();
-                Ok(last)
+                if last
+                    && !headed
+                    && let Some(f) = gpu.fault()?
+                {
+                    return Err(GpuError::fault(WHAT_F, f));
+                }
+                Ok(headed)
             })?;
             if let Some(h) = hook.as_deref_mut() {
                 h(self, first, t)?;
             }
         }
-        next.ok_or(GpuError::state(WHAT_F, "a token read after the last unit"))
+        if head && next.is_none() {
+            return Err(GpuError::state(WHAT_F, "a token read after the last unit"));
+        }
+        Ok(next)
     }
 
     /// Feed `tokens` through the chain by the plan of `path`, as
