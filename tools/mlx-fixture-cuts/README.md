@@ -13,3 +13,11 @@ Each file is held to its source's real shard headers and `config.json` by a test
 | `qwen38d-mlx.json` | `mlx-community/Qwen3.8-27B-4bit` at `10c35caafbb80f7dc6a7a432cdd11af10a6d4818` | layers 0 to 3 (three delta layers, one full-attention layer), the embedding, the head and the final norm; no vision tower |
 | `llama-mlx.json` | `mlx-community/Llama-3.1-8B-Instruct-4bit` at `90215b22ec18e72f623dde2ea7af4097025160e2` | layers 0 to 3 (every layer alike: GQA, SwiGLU), the embedding, the untied head and the final norm |
 | `qwen3-mlx.json` | `mlx-community/Qwen3-8B-4bit` at `545dc4251c05440727734bcd94334791f6ab0192` | layers 0 to 3 (every layer alike: GQA with the per-head q/k norms, SwiGLU), the embedding, the untied head and the final norm |
+
+## The Metal e2e gate's pin of a cut
+
+A row of `crates/metal/src/bin/gate_metal_qwen35moe_e2e` that opens one of these cuts (`Model::Folder`) holds the session's logits to a committed dump of the same cut, `pins/<family>.txt` and `.f32`. The dump is mlx-lm's own modules in f32 over the exact dequant of the cut's 4-bit weights, written on a Mac with mlx-lm (the Metal gates run on the second M1 Pro, `/Users/d1-mac1/venv-mlx/bin/python`):
+
+    tools/mlx-logits.py dump $BLOOMERY_FIXTURE_ROOT/<family>-mlx <family> --ids ID,ID,… --positions 0,1,… --out DIR
+
+The two files go into `pins/`; a hand-written tail of provenance lines (the folder's revision, the command, the mlx-lm and mlx versions) follows the text's `argmax` line, which the gate's reader ignores. The row's band is derived in `row.rs` from the pin's largest logit and held under half the pin's smallest top-2 gap.

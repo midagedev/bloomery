@@ -1,0 +1,11 @@
+version 1
+family qwen3
+ids 0,785,6722,315
+steps 4
+n 151936
+fnv1a 68c9b0961a13e32c
+positions 0,1,2,3
+argmax 50994,91486,118042,113964
+folder mlx-community/Qwen3-8B-4bit at 545dc4251c05440727734bcd94334791f6ab0192 cut to layers 0 to 3 (tools/mlx-fixture-cuts/qwen3-mlx.json), the 4-bit affine folder
+made tools/mlx-logits.py dump qwen3-mlx qwen3 --ids 0,785,6722,315 --positions 0,1,2,3 through mlx-lm 0.32.0 on mlx 0.32.3, f32 over the exact dequant of the cut
+ids-from the four ids of the qwen3moe pin: id 0, then 785, 6722 and 315

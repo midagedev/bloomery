@@ -30,6 +30,9 @@ pub enum Mutants {
     /// Llama's: the prologue of the no-head-norm, NORM-pairs attention, which only the dense
     /// Llama instance compiles.
     Llama,
+    /// The dense Qwen3's: the head norm and the NEOX pairs of its group-of-four attention, which
+    /// the first position reads none of (one key, a rope angle of 0).
+    Qwen3,
     /// None: the row runs the kernels of another row's tables.
     None,
 }
@@ -172,6 +175,30 @@ const LLAMA_LOGIT_ABS: f64 = 0.014;
 const LLAMA_LOGIT_CAP: f64 = 0.19;
 
 const _: () = assert!(LLAMA_LOGIT_ABS <= LLAMA_LOGIT_CAP);
+
+/// PIN(2026-11-01): max |session − pin| on a logit of the 4-layer cut of Qwen3-8B's folder at each
+/// pinned step; the pin is mlx-lm's `qwen3` in f32 over the exact dequant of the folder's 4-bit
+/// weights. Derived from the pin's largest logit, 17.57 (step 0), and the folder's head norm gains,
+/// never fitted to a run: the Qwen band's error model, Δ = 2.8e-4 of a dot's rms a value rounded once
+/// into half, added in quadrature over the roundings on the cut's path. A layer rounds the shared input
+/// of q, k and v, the output projection's input, the shared input of gate and up, the down's, and the
+/// key and the value the cache stores in half; the head rounds its input once. Qwen3 norms each query
+/// and key head by its gain before the rope, so a score is the dot of two heads that each carry
+/// one: a rounding of q's or k's input or of the stored key moves a score by Δ of the heads'
+/// product scale (the rms of a layer's q_norm gain times the rms of its k_norm gain: 6.67, 3.23, 2.76
+/// and 3.24 in layers 0 to 3), and the softmax carries a score's error into the attention's output at
+/// that relative size. That is three roundings a layer at the product scale (the squares of those
+/// four scales sum to 73.1) and five at unit scale (the value's input share, the output projection's
+/// input, the gate-up's, the down's and the stored value), the head's one more, all taken as
+/// independent: √(3 · 73.1 + 4 · 5 + 1) = 15.5, so 15.5 · 2.8e-4 · 17.57 = 0.076 of a logit,
+/// rounded up. The norm's own f32 arithmetic and the sums' order are 1e-7 and left out. The Llama
+/// row's count of four roundings a layer carries no head norm and no cache rounding.
+const QWEN3_LOGIT_ABS: f64 = 0.08;
+
+/// Half the smallest top-2 gap of the pin's four rows, 0.4657 at step 1, rounded down.
+const QWEN3_LOGIT_CAP: f64 = 0.23;
+
+const _: () = assert!(QWEN3_LOGIT_ABS <= QWEN3_LOGIT_CAP);
 
 /// Qwen3.6-35B-A3B's fixture: the gated delta net beside the attention layers.
 pub static QWEN35MOE: Row = Row {
@@ -342,8 +369,67 @@ pub static LLAMA: Row = Row {
     ],
 };
 
+/// Qwen3-8B's checkpoint folder cut to its first four layers (the folder's own bits,
+/// `tools/mlx-fixture-cuts`): grouped-query attention of 32 heads over 8 key heads of 128 values
+/// with a q and a k head norm and the NEOX rope, a plain residual and a dense SwiGLU in every
+/// layer, and a head of its own. No `prepare` map reads the family, so the folder is the model.
+/// The prompt ids are Qwen3-30B-A3B's d1k set's: the two families share a vocabulary and a
+/// tokenizer; a generation starts at id 0, as that row's.
+///
+/// The count is four layers of seven groups, P1 (q, k and v are one type, so one dispatch), the
+/// flash (it norms and ropes the query and appends the normed, roped key itself, so the head norms
+/// add no group), the out projection (adding into the stream), a hand-on, the FFN's gate-up (a
+/// dense layer has no router), its down (adding into the stream) and a hand-on, and the embed's one
+/// group and the head's two: 4 · 7 + 3 = 31, each one dispatch. The plain residual hands on because
+/// every reader of a layer's two halves (the next layer's P1 of one weight type, the gate-up, the
+/// head) is a launch of a type other than F32 (`Arena::hands_on`): every projection of the folder
+/// is 4-bit with groups of 64. A cut of another layer count encodes 7 · layers + 3.
+pub static QWEN3: Row = Row {
+    name: "qwen3",
+    arch: "qwen3",
+    model: Model::Folder,
+    prompt: Prompt::D1k {
+        ik: &refset::arch::qwen3moe::fixture::IK,
+        set: refset::arch::qwen3moe::fixture::D1K,
+    },
+    seed: 0,
+    recurrent: false,
+    logit_abs: QWEN3_LOGIT_ABS,
+    deep_logit_abs: None,
+    count: Some(Count {
+        groups: 31,
+        dispatches: 31,
+    }),
+    mutants: Mutants::Qwen3,
+    skips: &[
+        (
+            "q_state",
+            "the clause compares a delta layer's state and conv ring and the file has no delta \
+             layer; q_chunk holds the pass's key and value rows",
+        ),
+        (
+            "q_mark",
+            "a pass's marks copy its delta stores and the file has none",
+        ),
+        (
+            "q_mark_cut",
+            "a cut back to a mark restores a delta store and the file has none",
+        ),
+        (
+            "p_profile",
+            "not on a dense FFN: the clause walks each layer's router picks and the experts' \
+             stack slices of the file's own tensors",
+        ),
+        (
+            "m_mlx_folder",
+            "the folder is every clause's model and there is no prepared split to tell it \
+             against; `m_logits` holds the folder's own logits to the pin",
+        ),
+    ],
+};
+
 /// Every row, the default first.
-pub static ROWS: [&Row; 5] = [&QWEN35MOE, &QWEN3MOE, &QWEN38D, &LFM3, &LLAMA];
+pub static ROWS: [&Row; 6] = [&QWEN35MOE, &QWEN3MOE, &QWEN38D, &LFM3, &LLAMA, &QWEN3];
 
 /// The row `--row` names.
 pub fn find(name: &str) -> Option<&'static Row> {

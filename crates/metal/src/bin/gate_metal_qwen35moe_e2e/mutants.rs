@@ -28,8 +28,9 @@
 //! slot, and of the dense prompt's SwiGLU; LFM3's are [`LFM3`], edits of the
 //! windowed flash's first key and of the short conv's step ring, which only its
 //! deep pin (`m_logits_deep`) reads; Llama's is [`LLAMA`], an edit of the NORM-pairs
-//! prologue that `m_logits` reads. The edits compile into the
-//! row's own instance's source (`program::source_at`), so they land in the
+//! prologue that `m_logits` reads; the dense Qwen3's are [`QWEN3`], edits of the head
+//! norm and of the NEOX pairs, which a first step reads none of. The edits compile into
+//! the row's own instance's source (`program::source_at`), so they land in the
 //! program the row runs.
 
 #[path = "../shared/mutants.rs"]
@@ -46,6 +47,7 @@ pub fn all(set: Mutants) -> impl Iterator<Item = (&'static Mutant, Program)> {
         Mutants::Dense => (DENSE, &[]),
         Mutants::Lfm3 => (LFM3, &[]),
         Mutants::Llama => (LLAMA, &[]),
+        Mutants::Qwen3 => (QWEN3, &[]),
         Mutants::None => (&[], &[]),
     };
     program::all(main, tensor)
@@ -55,7 +57,7 @@ pub fn all(set: Mutants) -> impl Iterator<Item = (&'static Mutant, Program)> {
 pub fn kept_of(set: Mutants) -> &'static [Mutant] {
     match set {
         Mutants::Routed => KEPT,
-        Mutants::Dense | Mutants::Lfm3 | Mutants::Llama | Mutants::None => &[],
+        Mutants::Dense | Mutants::Lfm3 | Mutants::Llama | Mutants::Qwen3 | Mutants::None => &[],
     }
 }
 
@@ -342,6 +344,36 @@ pub const LFM3: &[Mutant] = &[
         edits: &[(
             "slot_ring[sc_slot(p, args.ring_rows) * args.hidden + c] = sc_u(row, 0u, c, args);",
             "slot_ring[min(p, args.ring_rows - 1u) * args.hidden + c] = sc_u(row, 0u, c, args);",
+            1,
+        )],
+    },
+];
+
+/// The dense Qwen3's defects, edits of the flash prologue its group-of-four attention runs
+/// (`attn_norm_rope`, the one function that norms and ropes every query and key head). The first
+/// position reads neither: one key makes the softmax 1 and the rope angle is 0, so `m_logits`
+/// sees them at the pin's later steps.
+pub const QWEN3: &[Mutant] = &[
+    Mutant {
+        name: "qk_norm_skipped",
+        clause: "m_logits",
+        why: "a query and a key head go to the rope as the projection left them, with no RMS \
+              scale and no gain: the scores of two or more keys are another query's and key's",
+        edits: &[(
+            "nloc[d] = (scale * gain[i]) * scratch[i];",
+            "nloc[d] = scratch[i];",
+            1,
+        )],
+    },
+    Mutant {
+        name: "rope_pair_neighbour",
+        clause: "m_logits",
+        why: "the first half of a head pairs with its neighbour, not with the value half a \
+              head on (the NORM pairing, a Llama file's, read on a NEOX file): the rotated \
+              pair is no pair of the model's",
+        edits: &[(
+            "float n1 = scratch[i + pairs];",
+            "float n1 = scratch[i + 1u];",
             1,
         )],
     },
