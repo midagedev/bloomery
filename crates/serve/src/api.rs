@@ -8968,6 +8968,94 @@ mod tests {
             // PIN(2026-10-24): reset detection precedes release, so only the already blocked engine call may run.
             assert_eq!(called(), 1, "the request took another engine step");
         }
+
+        /// A greedy answer on an engine that launches each answer's step
+        /// before reading it back ([`Engine::next_ahead`]) is the plain
+        /// engine's at every end of a request: the end of text, a stop
+        /// string, the token limit, and a client that closes mid-stream (a
+        /// count the close's timing sets, so only its follow-up is compared).
+        /// After each, the slot's save holds what the engine holds (the save
+        /// refuses a count that differs) and a request that keeps the slot's
+        /// prefix and adds to it answers as on the plain engine.
+        #[cfg(unix)]
+        #[test]
+        fn an_answer_stepped_ahead_ends_as_a_plain_one() {
+            use std::io::{BufRead, BufReader};
+
+            let eos = crate::mock::SPECIALS[1];
+            let ended = [
+                (format!("abcd{eos}xabc"), r#""n_predict":16"#),
+                ("abcdefabc".to_owned(), r#""n_predict":16,"stop":["e"]"#),
+                ("abcabc".to_owned(), r#""n_predict":4"#),
+            ];
+            let dir = std::env::temp_dir().join(format!("bloomery-ahead-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("the slot files' directory");
+            let run = |engine: MockEngine| {
+                let mut config = testserve::mock_config();
+                config.slot_save_path = Some(dir.clone());
+                let (addr, state, _ended) = testserve::spawn(Box::new(engine), config);
+                let free = || relock(&state.shared.board).slots()[0].state == Use::Free;
+                let ask = |prompt: &str, rest: &str| {
+                    let body = format!(r#"{{"prompt":"{prompt}","temperature":0,{rest}}}"#);
+                    let (status, out) =
+                        testserve::roundtrip(addr, "POST", "/completion", &[], &body);
+                    assert_eq!(status, 200, "{out}");
+                    let v: serde_json::Value = serde_json::from_str(&out).expect("JSON");
+                    (
+                        v["content"].clone(),
+                        v["tokens_predicted"].clone(),
+                        v["stop_type"].clone(),
+                    )
+                };
+                let saved = |n: usize| {
+                    let body = format!(r#"{{"filename":"ahead-{n}.bin"}}"#);
+                    let (status, out) =
+                        testserve::roundtrip(addr, "POST", "/slots/0?action=save", &[], &body);
+                    assert_eq!(status, 200, "the slot holds what the engine holds: {out}");
+                    let v: serde_json::Value = serde_json::from_str(&out).expect("JSON");
+                    v["n_saved"].as_u64().expect("n_saved")
+                };
+                let (mut answers, mut held) = (Vec::new(), Vec::new());
+                for (n, (prompt, rest)) in ended.iter().enumerate() {
+                    let first = ask(prompt, rest);
+                    held.push(saved(n));
+                    let more = format!("{prompt}{}zy", first.0.as_str().expect("content"));
+                    answers.push((first, ask(&more, r#""n_predict":6"#)));
+                }
+                let client = testserve::send_request(
+                    addr,
+                    "POST",
+                    "/completion",
+                    &[],
+                    r#"{"prompt":"abab","temperature":0,"stream":true}"#,
+                );
+                let mut read = BufReader::new(client.try_clone().expect("the stream's reader"));
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(read.read_line(&mut line).expect("stream head or event"), 0);
+                    if line.starts_with("data: ") {
+                        break;
+                    }
+                }
+                drop(read);
+                reset(client);
+                wait_for("the closed stream's end", free);
+                saved(ended.len());
+                ((answers, ask("ababzy", r#""n_predict":6"#)), held)
+            };
+            let (plain, plain_held) = run(MockEngine::new(1 << 16));
+            let (ahead, ahead_held) = run(MockEngine::new(1 << 16).with_ahead());
+            let _ = std::fs::remove_dir_all(&dir);
+            assert_eq!(ahead, plain);
+            // The answer an end of text or a stop string ends on was stepped
+            // ahead and is held; the limit's last answer was not.
+            let more = |(p, a): (u64, u64)| a - p;
+            let held: Vec<u64> = plain_held.into_iter().zip(ahead_held).map(more).collect();
+            assert_eq!(held, [1, 1, 0]);
+            assert_eq!(plain.0[0].0.0, "d", "{plain:?}");
+            assert_eq!(plain.0[1].0.2, "word", "{plain:?}");
+            assert_eq!(plain.0[2].0.1, 4, "{plain:?}");
+        }
     }
 
     /// The orderly stop's wait on the engine thread — what it waits for (the

@@ -779,7 +779,8 @@ pub(crate) struct Slot {
     vocab: Arc<dyn Tokenizer>,
     /// Every id the selected slot has evaluated since its last reset, in
     /// order, and the image spans among them. The last generated id of a
-    /// request is not in it: it is never fed back.
+    /// request is not in it, as it is never fed back, unless the engine
+    /// stepped it ahead ([`Slot::next_ahead`]).
     held: Held,
     /// The other slots' held sequences; the selected slot's entry is empty.
     parked: Vec<Held>,
@@ -859,6 +860,11 @@ impl Slot {
     pub(crate) fn schema_jump(mut self, on: bool) -> Slot {
         self.jump = on;
         self
+    }
+
+    /// The slots the engine serves.
+    pub(crate) fn slots(&self) -> usize {
+        self.parked.len()
     }
 
     /// Makes `slot` the selected one, on the engine too when it changes.
@@ -1715,6 +1721,24 @@ impl Slot {
         Ok(g)
     }
 
+    /// [`Engine::next_ahead`] that books what the engine fed: `last` unless
+    /// the call before fed it ahead, and the answer when the engine launched
+    /// its step. What the slot holds is then what the engine holds, whatever
+    /// the next call is.
+    pub(crate) fn next_ahead(&mut self, last: u32, ahead: bool) -> Result<u32, EngineError> {
+        let held = std::mem::take(&mut self.held);
+        let r = self.engine.next_ahead(last, ahead);
+        self.held = held;
+        let (g, a) = r?;
+        if !a.took {
+            self.held.push(last);
+        }
+        if a.launched {
+            self.held.push(g);
+        }
+        Ok(g)
+    }
+
     /// [`Engine::next_after`] that books what it fed: `ids`, at least one.
     pub(crate) fn next_after(
         &mut self,
@@ -2507,6 +2531,21 @@ impl Gen {
             return None;
         }
         out(&mut self.logits)
+    }
+
+    /// How this request's [`Need::Step`] goes to the engine: `None` as an
+    /// [`Engine::next`]; `Some(ahead)` as an [`Engine::next_ahead`] for a
+    /// greedy request that reads no row, changes none, forces no id and
+    /// passes none, so the call that follows is the answer's step unless the
+    /// request stops there; `ahead` while it would feed the answer, the
+    /// budget and the cache holding one id past it.
+    pub(crate) fn step_ahead(&self) -> Option<bool> {
+        let k = &self.pick;
+        if k.reads_rows() || !k.bias.is_empty() || self.think.is_some() || self.rows > 1 {
+            return None;
+        }
+        let len = self.generated.len();
+        Some(len + 1 < self.budget && self.n + len < self.ctx_max)
     }
 
     /// The id the loop takes for an engine answer `g`: the next forced close id

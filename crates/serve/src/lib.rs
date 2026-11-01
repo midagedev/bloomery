@@ -67,8 +67,8 @@ pub use api::{
     MAX_CONNECTIONS, ServeError, Server, ServerConfig, VERSION, panic_text,
 };
 pub use engine::{
-    CacheNote, Decoder, DeviceProps, DraftProps, Drafted, Engine, EngineError, EngineProps, Flight,
-    Landed, ModelProps, Pending, PlacementProps, ResidencyReset, Sampler, SamplerFactory,
+    Ahead, CacheNote, Decoder, DeviceProps, DraftProps, Drafted, Engine, EngineError, EngineProps,
+    Flight, Landed, ModelProps, Pending, PlacementProps, ResidencyReset, Sampler, SamplerFactory,
     SamplerRefused, SamplingParams, SaveInFlight, Saved, SavedState, SharedPrefix, SlotDraw,
     SlotPass, SlotRow, StateError, Tokenizer, Waits,
 };

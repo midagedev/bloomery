@@ -1031,6 +1031,17 @@ impl HostFlags {
         // wait on them from running past that ([`MappedHost`]'s contract).
         unsafe { mem_batch(stream, &mut ops, "cuStreamBatchMemOp_v2 (host flag wait)") }
     }
+
+    /// Enqueue on `stream` the lowering of flag `i`: [`HostFlags::clear`]
+    /// done by the stream behind the work before it, for a launch enqueued
+    /// while a wait on the flag may still be ahead of it. Never captured.
+    pub fn enqueue_clear(&self, stream: &CudaStream, i: usize) -> Result<(), GpuError> {
+        self.word(i, "HostFlags::enqueue_clear")?;
+        let mut ops = [op_write(self.page.dev_at(i * FLAG_STRIDE), 0)];
+        // SAFETY: as `enqueue_wait`'s: flag `i`'s word lies in the page,
+        // 4-aligned, and the page outlives the stream's work on it.
+        unsafe { mem_batch(stream, &mut ops, "cuStreamBatchMemOp_v2 (host flag clear)") }
+    }
 }
 
 /// Rows the host writes after the launch of the graph that reads them: a
@@ -1044,7 +1055,10 @@ impl HostFlags {
 /// Contract: the host lowers a row's flag before the launch whose arrival it
 /// gates ([`StagedRows::clear`]) and writes the row only while its flag is
 /// lowered and no copy of the row is in flight, that is after the stream
-/// synchronized past the launch before. It raises the flag on every path
+/// synchronized past the launch before. A launch enqueued behind one whose
+/// arrival may not have run yet has the stream lower the flag between the
+/// two ([`StagedRows::enqueue_clear`]), and the host writes the row once it
+/// has seen the stream pass that lowering. It raises the flag on every path
 /// after the launch, an error included ([`StagedRows::deliver`]): a launched
 /// arrival waits until then, and the card then reads the row as the staging
 /// held it.
@@ -1081,6 +1095,12 @@ impl<T: DeviceCopy> StagedRows<T> {
     /// Lower row `row`'s flag, before the launch whose arrival it gates.
     pub fn clear(&self, row: usize) -> Result<(), GpuError> {
         self.flags.clear(row)
+    }
+
+    /// Have `stream` lower row `row`'s flag behind the work before it, ahead
+    /// of the launch whose arrival it gates ([`HostFlags::enqueue_clear`]).
+    pub fn enqueue_clear(&self, stream: &CudaStream, row: usize) -> Result<(), GpuError> {
+        self.flags.enqueue_clear(stream, row)
     }
 
     /// Row `row`'s staging written by `write`, then its flag raised. The

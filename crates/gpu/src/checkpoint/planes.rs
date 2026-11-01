@@ -127,11 +127,13 @@ pub fn head_major(
 
 /// What every save takes before its copy: the model's position as the state's
 /// positions, the stores lent for them, and `send` (the copy, on the engine
-/// stream or on a lane) run on them.
+/// stream or on a lane) run on them. A step launched ahead is read first
+/// ([`GpuModel::settle_ahead`]), its fault the save's error.
 fn take<B: PlaneBody, R>(
     m: &mut GpuModel<B>,
     send: impl FnOnce(&CudaStream, Identity, u32, &Lent<'_, '_, '_>) -> Result<R, GpuError>,
 ) -> Result<R, GpuError> {
+    m.settle_ahead(B::WHAT)?;
     if let Some(fault) = m.poisoned() {
         return Err(GpuError::Poisoned {
             what: B::WHAT,

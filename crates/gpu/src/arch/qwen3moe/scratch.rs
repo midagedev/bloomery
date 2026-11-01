@@ -2093,6 +2093,23 @@ impl StepParams {
         self.inbox.upload(stream, self.words)
     }
 
+    /// [`StepParams::write`] of a step at `pos` whose token is word 0 of
+    /// `token` on the card: the record's copy, then that word copied over
+    /// the record's token, both on `stream` behind the work that writes it.
+    pub(super) fn write_chained(
+        &mut self,
+        stream: &CudaStream,
+        token: &DeviceBuffer<u32>,
+        pos: u32,
+    ) -> Result<(), GpuError> {
+        self.write(stream, 0, pos)?;
+        // SAFETY: word 0 of `token`, which the caller holds for the call; the
+        // window lives for this enqueue.
+        let src = unsafe { param_view::<u32>(token, 0, 1) };
+        self.token.copy_from_device_async(&src, stream)?;
+        Ok(())
+    }
+
     /// The step's input, as its first launch reads it.
     pub(super) fn io(&self) -> Io<'_> {
         Io {

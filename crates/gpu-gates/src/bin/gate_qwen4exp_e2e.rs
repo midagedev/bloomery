@@ -2352,6 +2352,73 @@ mod gate {
         Ok(ok)
     }
 
+    /// A step `step_ahead` launched ahead, left unread when the generation
+    /// stops on its answer. Clean, a save leaves it to the next `step_ahead`
+    /// of that answer, which takes it. With a fault planted behind it
+    /// (`GpuModel::plant_fault`), each call that hands the sequence on
+    /// or moves it without a readback of its own (a save, a save on a lane,
+    /// a rollback, a reset) fails with that fault and is poisoned by it
+    /// before it saves or rewinds anything; the reset after it clears the
+    /// model.
+    fn ahead_fault(m: &mut Qwen38Model, toks: &[u32]) -> Result<bool, GateError> {
+        type Handoff = fn(
+            &mut Qwen38Model,
+            &bloomery_gpu::checkpoint::saved::SaveLane,
+        ) -> Result<(), GpuError>;
+        let want = Fault::at(LAYER_HEAD, FaultSite::Logit);
+        let input = *toks.first().ok_or("ahead fault: no input token")?;
+        m.set_mode(StepMode::Graph);
+        fresh(m)?;
+        let (answer, ahead) = m.step_ahead(input, 2)?;
+        let saved = m.seq_save().map(drop);
+        let bytes = m.seq_save_bytes()?;
+        let lane = m.seq_lane(bytes)?;
+        let (_, next) = m.step_ahead(answer, 2)?;
+        let mut ok = ahead.launched && saved.is_ok() && next.took;
+        println!(
+            "ahead fault: the step of {answer} launched ahead ({}), a save -> {}, then the \
+             step_ahead of {answer} took it ({}) (want launched, saved, taken) {}",
+            ahead.launched,
+            if saved.is_ok() { "saved" } else { "refused" },
+            next.took,
+            verdict(ok)
+        );
+        let handoffs: [(&str, Handoff); 4] = [
+            ("a save", |m, _| m.seq_save().map(drop)),
+            ("a save on a lane", |m, lane| {
+                match m.seq_save_async(lane)? {
+                    Ok((_, copy)) => copy.land().map(drop),
+                    Err(room) => Err(GpuError::shape("ahead fault", format!("{room:?}"))),
+                }
+            }),
+            ("a rollback", |m, _| m.rollback(1)),
+            ("a reset", |m, _| m.reset()),
+        ];
+        for (name, handoff) in handoffs {
+            fresh(m)?;
+            let (_, ahead) = m.step_ahead(input, 2)?;
+            m.plant_fault(want)?;
+            let got = handoff(m, &lane);
+            let named = matches!(&got, Err(GpuError::Fault { fault, .. }) if *fault == want)
+                && m.poisoned() == Some(want);
+            fresh(m)?;
+            let cleared = m.poisoned().is_none() && m.gpu().fault()?.is_none();
+            let pass = ahead.launched && named && cleared;
+            ok &= pass;
+            println!(
+                "ahead fault: a fault behind the step launched ahead ({}), then {name} -> {}, \
+                 then a reset clears it ({cleared}) (want the fault, poisoned by it) {}",
+                ahead.launched,
+                match &got {
+                    Ok(()) => "done".to_string(),
+                    Err(e) => format!("error \"{e}\""),
+                },
+                verdict(pass)
+            );
+        }
+        Ok(ok)
+    }
+
     // ------------------------------------------- (o) one owner of the position
 
     /// The calls (o) plants its failures on, each from position [`PREFIX`].
@@ -6065,6 +6132,8 @@ mod gate {
         let toks = toks.to_vec();
         tier::sc("(h) the head of m rows: finite rows, NaN faults")?;
         ok &= head_rows(&mut m, &toks)?;
+        tier::sc("(ha) a step launched ahead: read before a save, rollback or reset")?;
+        ok &= ahead_fault(&mut m, &toks)?;
         tier::sc("(p) one program: graph = eager = pass, reset clears")?;
         let (paths_ok, eager) = paths(&mut m, &toks)?;
         ok &= paths_ok;

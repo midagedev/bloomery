@@ -3448,6 +3448,24 @@ impl Seat for Q38 {
         Ok(next)
     }
 
+    /// [`Q38::step`] that may launch the answer's step before the answer is
+    /// read back ([`app::Session::step_ahead`]), on a load that drafts
+    /// nothing; a drafting load steps as `step` does. When it launched, the
+    /// answer's PLE rows were read with its step, so none is read ahead.
+    fn step_ahead(&mut self, last: u32, ahead: bool) -> Result<(u32, serve::Ahead), GateError> {
+        if self.drafts.drafts() {
+            return Ok((self.step(last)?, serve::Ahead::default()));
+        }
+        self.before_call();
+        let (next, did) = self.s.step_ahead(last, ahead)?;
+        if !did.launched {
+            self.read_ahead(&[next])?;
+        }
+        self.print_passes()?;
+        let (took, launched) = (did.took, did.launched);
+        Ok((next, serve::Ahead { took, launched }))
+    }
+
     fn logits_into(&self, row: &mut [f32]) -> Result<(), GateError> {
         Ok(self.s.model().logits_into(row)?)
     }
