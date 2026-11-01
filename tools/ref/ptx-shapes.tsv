@@ -334,12 +334,18 @@ generate_ds41   hc_gated_up_mix_4x320                    0           0
 # 615.71.09) on a tree that is main 62c507523 in crates/gpu: generate_ds41 now carries the entry PTX that
 # bloomery-serve's scans carry since dbdef417 (md5 a06fe16f, 13307 lines; 536/184 was its 12380-line PTX). cc 8.6 never
 # launches the entry.
-generate_ds41   hc_gated_up_mma_mix_4                  528         192
+# PIN(2026-11-01): spill 528 -> 752 B and cc 8.6 JIT local 192 -> 240 B, both measured by gate-ptx-spill (the A6000,
+# driver 615.71.09, sm_86 ptxas 13.3.73) on main e7a01d55b. The HC commits since the last pin (92997d0b7's column
+# split, 338d51c77, c2459100b) moved it; the GB10 table re-pinned them, a GB10 cannot measure cc 8.6. cc 8.6 never
+# launches the entry.
+generate_ds41   hc_gated_up_mma_mix_4                  752         240
 # PIN(2026-10-25): the new entry uses sm_86 ptxas 13.3.73 spill/stack (676/192). The cc 8.6 JIT was not measured (the
 # GB10 JIT reads 88 B of local for this PTX); this new entry's jit_local pin uses the measured ptxas stack frame.
 # PIN(2026-10-26): spill 676 -> 628 B and cc 8.6 JIT local 192 -> 200 B, both measured by gate-ptx-spill (sm_86 ptxas
 # 13.3.73, the RTX A6000's JIT): cuda-oxide moved to NVIDIA/cuda-rust 9df9e7cef561 with #1648, and the PTX moved with it.
-generate_ds41   hc_gated_up_mma_mix_4_bf16             628         200
+# PIN(2026-11-01): spill 628 -> 832 B and cc 8.6 JIT local 200 -> 280 B, measured with the row above, after the same
+# commits. cc 8.6 never launches the entry.
+generate_ds41   hc_gated_up_mma_mix_4_bf16             832         280
 generate_ds41   hc_gated_up_mix_bf16_1col                0           0
 generate_ds41   hc_gated_up_mix_bf16_4x320               0           0
 generate_ds41   hc_pre_q8_0                              0           0
