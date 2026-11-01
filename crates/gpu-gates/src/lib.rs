@@ -155,7 +155,8 @@ fn exit_status(
 }
 
 /// The stderr lines of a failed run's error `e`: `<name>: <error>`, each `source()` beneath it
-/// as `  caused by: ...`, and the need hook's `refusal` line when the error lost it. The text
+/// as `  caused by: ...` (one that says what the line above it says is not repeated), and the
+/// need hook's `refusal` line when the error lost it. The text
 /// every exit of a gate or a server prints before its status ([`exit_with`], `start::exit_serve`).
 pub(crate) fn print_refusal(name: &str, e: &GateError, refusal: Option<&str>) {
     let msg = e.to_string();
@@ -164,9 +165,14 @@ pub(crate) fn print_refusal(name: &str, e: &GateError, refusal: Option<&str>) {
     } else {
         eprintln!("{name}: {msg}");
     }
+    let mut above = msg.clone();
     let mut cause = e.source();
     while let Some(c) = cause {
-        eprintln!("  caused by: {c}");
+        let text = c.to_string();
+        if text != above {
+            eprintln!("  caused by: {text}");
+        }
+        above = text;
         cause = c.source();
     }
     if let Some(why) = refusal.filter(|why| !msg.contains(why)) {

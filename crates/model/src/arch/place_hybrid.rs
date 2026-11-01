@@ -275,7 +275,7 @@ pub struct PlanInputs<H> {
 #[derive(Debug, thiserror::Error)]
 pub enum PlaceError {
     /// The placement could not be built.
-    #[error(transparent)]
+    #[error("{0}")]
     Placement(#[from] PlacementError),
     /// A machine with an expert tier card: this program hangs no expert tier on its card experts.
     #[error(

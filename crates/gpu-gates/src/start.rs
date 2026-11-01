@@ -769,6 +769,34 @@ mod agent {
             assert!(message.contains(&text), "{message}");
         }
 
+        /// A placement refusal a family's error carries keeps its class: a host room under the
+        /// NVMe tier floor is no fit whichever shared plan, the nodes' plan or the load refused
+        /// it. Each architecture's own planner error carries it as its source the same way
+        /// (`model::arch`'s `a_family_placement_refusal_is_its_errors_source`).
+        #[test]
+        fn a_family_placement_refusal_keeps_its_class() {
+            use model::arch::{draft, hybrid, place_hybrid};
+            let floor = || PlacementError::HostRoomFloor {
+                room: 1,
+                floor: 2,
+                base: 0,
+                layer: 0,
+                need: 2,
+                arena: None,
+            };
+            let families: [GateError; 5] = [
+                Box::new(hybrid::PlaceError::from(floor())),
+                Box::new(place_hybrid::PlaceError::from(floor())),
+                Box::new(draft::DraftUsableError::from(floor())),
+                Box::new(model::placement::nodes::NodesError::from(floor())),
+                Box::new(model::ModelError::Placement(floor())),
+            ];
+            for e in families {
+                assert_eq!(class_of(&e), Some(Code::NoFit), "{e:?}");
+                assert_eq!(e.to_string(), floor().to_string(), "{e:?}");
+            }
+        }
+
         /// A seat that binds another address than the start bound is refused by name, and the
         /// listener that was bound is the one handed over.
         #[test]

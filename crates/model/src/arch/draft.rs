@@ -126,7 +126,7 @@ pub enum DraftUsableError {
     NoRule { arch: String },
     /// The set's plan cannot be described, or the draft file's checkpoint is
     /// not the set's.
-    #[error(transparent)]
+    #[error("{0}")]
     Placement(#[from] PlacementError),
     /// A qwen4exp set whose `token_embd` or `output` the draft cannot borrow.
     #[error(transparent)]

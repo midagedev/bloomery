@@ -1574,4 +1574,36 @@ mod tests {
             other => panic!("the first misplaced name: {other:?}"),
         }
     }
+
+    /// A family planner's error carries the placement refusal it wraps as its source, under the
+    /// same text: the start reads a refusal's class from the first [`PlacementError`] of the
+    /// chain, so a host room under the NVMe tier floor stays no fit whichever family refused it.
+    #[test]
+    fn a_family_placement_refusal_is_its_errors_source() {
+        use super::{PlacementError, deepseek41, glm5next, qwen3moe, qwen35moe};
+        use std::error::Error;
+        let floor = || PlacementError::HostRoomFloor {
+            room: 1,
+            floor: 2,
+            base: 0,
+            layer: 0,
+            need: 2,
+            arena: None,
+        };
+        let families: [Box<dyn Error>; 5] = [
+            Box::new(glm5next::place::PlaceError::from(floor())),
+            Box::new(qwen3moe::place::PlaceError::from(floor())),
+            Box::new(qwen35moe::place::PlaceError::from(floor())),
+            Box::new(deepseek41::place::PlaceError::from(floor())),
+            Box::new(deepseek41::plan::PlanError::from(floor())),
+        ];
+        for e in families {
+            let source = e.source().and_then(|s| s.downcast_ref::<PlacementError>());
+            assert!(
+                matches!(source, Some(PlacementError::HostRoomFloor { .. })),
+                "{e:?}"
+            );
+            assert_eq!(e.to_string(), floor().to_string(), "{e:?}");
+        }
+    }
 }

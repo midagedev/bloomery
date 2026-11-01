@@ -1477,9 +1477,9 @@ fn outcome_of(e: &(dyn StdError + 'static)) -> Outcome {
 }
 
 /// A family planner's error as an outcome: the first `P` in `e`'s chain as
-/// the family's `place_of` reads it, else [`outcome_of`]'s reading. A
-/// family error that wraps the placement's own transparently hides it from
-/// [`outcome_of`]'s walk, so a refusal the placement names would read red.
+/// the family's `place_of` reads it, else [`outcome_of`]'s reading. The
+/// family's own refusals (a context past its limit, a front over the card)
+/// are no [`PlacementError`], so [`outcome_of`]'s walk would read them red.
 fn outcome_by<P: StdError + 'static>(e: &GateError, place_of: fn(&P) -> Outcome) -> Outcome {
     let mut cur: Option<&(dyn StdError + 'static)> = Some(e.as_ref());
     while let Some(c) = cur {

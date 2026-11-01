@@ -795,7 +795,7 @@ pub enum NodesError {
     Budget(usize),
     #[error("node {}: {} B planned pass its pool {} B by {} B", .0.node, .0.need, .0.pool, .0.need - .0.pool)]
     PoolOver(PoolOver),
-    #[error(transparent)]
+    #[error("{0}")]
     Model(#[from] PlacementError),
     #[error("the nodes or the model have {0}: the plan is undefined")]
     Undefined(&'static str),

@@ -477,7 +477,7 @@ pub enum Experts {
 #[derive(Debug, thiserror::Error)]
 pub enum PlaceError {
     /// The placement could not be built.
-    #[error(transparent)]
+    #[error("{0}")]
     Placement(#[from] PlacementError),
     /// A machine with an expert tier card: the body runs every layer on its
     /// one card, so the tier would hold nothing.
