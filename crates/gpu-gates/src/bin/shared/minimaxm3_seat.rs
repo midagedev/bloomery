@@ -174,9 +174,14 @@ pub fn open_loaded(file: &Path, ctx: usize, arm: Arm) -> Result<Loaded, GateErro
 /// ([`route_trace`]). `BLOOMERY_XSTREAM`, when set, is the body's host streaming from the load on (`Body::set_xstream`);
 /// where it starts the stream (`split`, [`plans_ring`] at a gate's stage) the plan keeps the stream's room
 /// (`PlanInputs::with_stream`) and its lane staging on the host (`workstation::reserve_stream_staging`).
+/// `BLOOMERY_RESIDENCY` starts the body's residency machine; unset keeps the fixed slot map.
 fn load(file: &Path, ctx: usize, route_trace: bool, arm: Arm) -> Result<Loaded, GateError> {
-    let levers =
-        bloomery_levers::at_main(&[bloomery_levers::CARD_BUDGET, bloomery_levers::XSTREAM])?;
+    let levers = bloomery_levers::at_main(&[
+        bloomery_levers::CARD_BUDGET,
+        bloomery_levers::XSTREAM,
+        bloomery_levers::RESIDENCY,
+    ])?;
+    let residency = Residency::parse(levers.residency().unwrap_or("off"))?;
     let mode = levers.xstream().map(XMode::parse).transpose()?;
     let model = minimaxm3_folder::model_at(file)?;
     let inputs = described(model.header())?;
@@ -196,7 +201,15 @@ fn load(file: &Path, ctx: usize, route_trace: bool, arm: Arm) -> Result<Loaded, 
         route_trace,
         ..levers.host()
     };
-    let mut loaded = seated(Body::open_placed(model, &plan, &inputs, 0, host)?)?;
+    let mut loaded = seated(Body::open_placed_slots(
+        model,
+        &plan,
+        &inputs,
+        0,
+        host,
+        residency,
+        NonZeroUsize::MIN,
+    )?)?;
     if let Some(mode) = mode {
         let (gpu, _, body) = loaded.m.body_parts("minimaxm3 seat")?;
         body.set_xstream(gpu, mode)?;
