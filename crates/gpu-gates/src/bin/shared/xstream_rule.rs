@@ -11,9 +11,7 @@
 )]
 
 use bloomery_gpu::host::swap::Residency;
-use bloomery_gpu::host::xstream::{
-    XMode, XSTREAM_FORM, XSTREAM_NO_HOST, XSTREAM_ROOM, XStreamBody,
-};
+use bloomery_gpu::host::xstream::{XMode, XSTREAM_NO_HOST, XSTREAM_ROOM, XStreamBody};
 use bloomery_gpu::{Gpu, GpuError};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::generate::Place;
@@ -63,9 +61,8 @@ pub fn plans_ring(set: Option<&str>, stage: Stage, residency_off: bool) -> bool 
 /// `generate_qwen3moe` and the Qwen3.8 and Muse Spark serve seats alike, and
 /// the `xstream=` line the binary prints (the word, then why): `set` as given; unset,
 /// `split` at [`Stage::A`] with a residency machine (`admit` when the card
-/// has no room for the stream's ring or its ring pass does not read the
-/// card's stacks, `off` when the plan holds no host expert to stream, the
-/// refusal named on the line),
+/// has no room for the stream's ring, `off` when the plan holds no host
+/// expert to stream, the refusal named on the line),
 /// `admit` at [`Stage::Tiered`] with one (its expert tier the ring does not
 /// serve), `off` everywhere else. `admit` or `split` beside
 /// `BLOOMERY_RESIDENCY=off` is refused by name (the body's `set_xstream`).
@@ -91,14 +88,6 @@ pub fn xstream_rule<B: XStreamBody>(
                 ) => {
                     body.set_xstream(gpu, XMode::Admit)?;
                     format!("unset: split has no room: {e}")
-                }
-                Err(
-                    e @ GpuError::Shape {
-                        what: XSTREAM_FORM, ..
-                    },
-                ) => {
-                    body.set_xstream(gpu, XMode::Admit)?;
-                    format!("unset: the ring pass does not read the card's stacks: {e}")
                 }
                 Err(
                     e @ GpuError::State {

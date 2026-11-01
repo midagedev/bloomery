@@ -63,10 +63,12 @@
 //!
 //! A prompt walk that runs a unit's card slots through a route table reads
 //! each resident stack by the GEMM entry [`kernels::gemm`] names for its type
-//! ([`StackW::route`], [`LegStacks::routes`]); the table and the SwiGLU between
+//! ([`StackW::route`], [`LegStacks::block`]); the table and the SwiGLU between
 //! the launches stay with the walk, which runs the block as [`RouteBlock`]:
 //! the gate and up GEMMs, the SwiGLU into the form the down GEMM reads, and the
-//! down GEMM.
+//! down GEMM. The expert stream's ring holds a half of host experts in the
+//! card stacks' forms, and every family's ring pass reads it through
+//! [`with_ring`] as the same block.
 
 use crate::card_slots::{CardAcc, CardSlotKernels, CardSlots};
 use crate::expert_input::{Protection, Slots};
@@ -806,10 +808,11 @@ impl<'a> LegStacks<'a> {
     }
 
     /// The three stacks as a prompt walk's route GEMMs read them
-    /// ([`StackW::route`]), `[gate, up, down]`: each stack's own type through
-    /// the kernel table's GEMM entry. A stack no route GEMM reads is refused
-    /// by name.
-    pub(crate) fn routes(&self) -> Result<[RouteW<'a>; 3], GpuError> {
+    /// ([`StackW::route`]): each stack's own type through the kernel table's
+    /// GEMM entry, as one [`RouteBlock`] of `ff` rows a gate and up expert
+    /// and `hidden` a down expert. A stack no route GEMM reads is refused by
+    /// name.
+    pub(crate) fn block(&self, ff: usize, hidden: usize) -> Result<RouteBlock<'a>, GpuError> {
         let one = |st: &LegStack<'a>| {
             st.w.route(st.ty).ok_or_else(|| GpuError::Tensor {
                 what: WHAT,
@@ -817,7 +820,13 @@ impl<'a> LegStacks<'a> {
                 need: "a type some route GEMM reads (`kernels::gemm`)",
             })
         };
-        Ok([one(&self.gate)?, one(&self.up)?, one(&self.down)?])
+        Ok(RouteBlock {
+            gate: one(&self.gate)?,
+            up: one(&self.up)?,
+            down: one(&self.down)?,
+            ff,
+            hidden,
+        })
     }
 
     /// The stacks hold `n_card` experts of `shape` each: the gate's and up's
@@ -837,21 +846,25 @@ impl<'a> LegStacks<'a> {
     }
 }
 
-/// `f` over a layer's three stacks on a half of the expert stream's ring `r`,
-/// in the forms of the layer's card stacks `card` (`n_card` experts each,
-/// which give each expert's rows and each plane's row width): the half holds
-/// `r.half_slots` experts from each part's first slot ([`RingLayer::parts`]),
-/// a stack of words one part a matrix, an NVFP4 stack three (its codes, its
-/// block scales and its tensor scale). The windows are given back after `f`.
-/// Refused by name: a half whose parts are not the card stacks' form, a Q5_0
-/// stack (no ring holds one), and card stacks whose rows are not whole
-/// experts.
-pub fn with_ring<T>(
+/// `f` over a layer's three stacks on a half of the expert stream's ring `r`
+/// as the route GEMMs read them ([`LegStacks::block`], `ff` rows a gate and
+/// up expert, `hidden` a down expert), in the forms of the layer's card
+/// stacks `card` (`n_card` experts each, which give each expert's rows and
+/// each plane's row width): the half holds `r.half_slots` experts from each
+/// part's first slot ([`RingLayer::parts`]), a stack of words one part a
+/// matrix, an NVFP4 stack three (its codes, its block scales and its tensor
+/// scale). The one ring pass's view of the half for every family, whatever
+/// the card stacks' form; the windows are given back after `f`. Refused by
+/// name: a half whose parts are not the card stacks' form, a Q5_0 stack (no
+/// ring holds one), card stacks whose rows are not whole experts, and a stack
+/// no route GEMM reads.
+pub(crate) fn with_ring<T>(
     card: &LegStacks<'_>,
     n_card: usize,
     r: &RingLayer,
     ctx: &Arc<CudaContext>,
-    f: impl FnOnce(&LegStacks<'_>) -> Result<T, GpuError>,
+    (ff, hidden): (usize, usize),
+    f: impl FnOnce(&RouteBlock<'_>) -> Result<T, GpuError>,
 ) -> Result<T, GpuError> {
     let whole = |rows: usize| n_card > 0 && rows.is_multiple_of(n_card);
     let stacks = [&card.gate, &card.up, &card.down];
@@ -879,11 +892,12 @@ pub fn with_ring<T>(
                     DeviceTensor::<u32>::window(r.parts[2], rows(d), d.cols(), ctx),
                 ]
             };
-            let ran = f(&LegStacks {
+            let half = LegStacks {
                 gate: card.gate.with_w(StackW::Words(&ws[0])),
                 up: card.up.with_w(StackW::Words(&ws[1])),
                 down: card.down.with_w(StackW::Words(&ws[2])),
-            });
+            };
+            let ran = half.block(ff, hidden).and_then(|blk| f(&blk));
             for w in ws {
                 DeviceTensor::release(w);
             }
@@ -917,11 +931,12 @@ pub fn with_ring<T>(
                     scales: &scales[i],
                 })
             };
-            let ran = f(&LegStacks {
+            let half = LegStacks {
                 gate: card.gate.with_w(planes(0)),
                 up: card.up.with_w(planes(1)),
                 down: card.down.with_w(planes(2)),
-            });
+            };
+            let ran = half.block(ff, hidden).and_then(|blk| f(&blk));
             for w in qs {
                 DeviceTensor::release(w);
             }

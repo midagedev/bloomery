@@ -949,8 +949,8 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         default: Unset::Means(
             "Qwen3.8 (`generate_qwen3moe`, `bloomery-serve-qwen38`), and the Muse Spark and \
              MiniMax-M3.1 seats (`bloomery-serve`, MiniMax-M3.1's gates): `split` under `--place a` \
-             with a residency (`admit` when the card has no room for the ring or a Qwen3.8 card \
-             route reads NVFP4 planes), `admit` under `--place bp` with one, `off` everywhere else",
+             with a residency (`admit` when the card has no room for the ring), `admit` under \
+             `--place bp` with one, `off` everywhere else",
         ),
         doc: "Qwen3.8, Muse Spark and MiniMax-M3.1 prompt calls fed by ubatches or passes under adaptive residency \
               (`BLOOMERY_RESIDENCY=mid-…`): what each card layer's walk moves before its card \
@@ -969,16 +969,15 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               experts out. The prompt's bits are then the band's, not the decode steps'. `off` \
               keeps a prompt call bit for bit the decode steps' state, the same-binary arm. \
               Unset is `split` under `--place a` with a residency (`admit` when the card has no \
-              room for the ring or a Qwen3.8 card route reads NVFP4 planes, which its ring pass \
-              does not, the load line saying so), `admit` under `--place bp` (the ring serves no \
-              expert tier), `off` everywhere else; `admit` and `split` are refused by name beside \
-              `BLOOMERY_RESIDENCY=off` and on a qwen3moe or qwen35moe file, `split` on a load \
-              with an expert tier and on a Qwen3.8 load whose card route reads NVFP4 planes. The load line prints `xstream=`, \
-              every streamed layer an `xstream` record, every call `xstream end`. A MiniMax-M3.1 \
-              load (its gates' seat, `Body::set_xstream`) takes it through the common prompt walk: \
-              `split` streams the host experts the rule sends to the card into the ring's half and \
-              runs their slots there beside the card's stacks (NVFP4 planes staged from the \
-              checkpoint folder's parts).",
+              room for the ring, the load line saying so), `admit` under `--place bp` (the ring \
+              serves no expert tier), `off` everywhere else; `admit` and `split` are refused by \
+              name beside `BLOOMERY_RESIDENCY=off` and on a qwen3moe or qwen35moe file, `split` \
+              on a load with an expert tier. The load line prints `xstream=`, every streamed \
+              layer an `xstream` record, every call `xstream end`. Every family's ring pass reads \
+              the ring's half in its card stacks' forms, the file's blocks or NVFP4 planes \
+              (staged from a checkpoint folder's parts), and runs the streamed slots there beside \
+              the card's stacks; a MiniMax-M3.1 load (its gates' seat, `Body::set_xstream`) takes \
+              it through the common prompt walk.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

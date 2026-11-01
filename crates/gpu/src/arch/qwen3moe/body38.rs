@@ -161,7 +161,7 @@ use crate::host::served::{ResidencyParts, TierBody};
 use crate::host::swap::{CallPick, CallReport, PassReport, Residency};
 use crate::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
 use crate::host::tier::TierOpen;
-use crate::host::xstream::{Costs, XCfg, XLayer, XMode, XReport, XSTREAM_FORM};
+use crate::host::xstream::{Costs, XCfg, XLayer, XMode, XReport};
 use crate::host::{BatchLeg, PassKind, StepLeg, refuse_tier_count};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, SlotMap};
 use crate::linear::delta::{RecoveryStore, RecoveryTable, carry_fold_host};
@@ -2508,10 +2508,11 @@ impl Body38 {
     /// host price for [`XSTREAM_SHAPE`]) and arms the walk's card route for its ring; the stream then
     /// stays for the load's life, idle under `Admit` and `Off`. Refused by
     /// name: `Admit` or `Split` on a load that runs no residency machine,
-    /// `Split` on a load that hangs an expert tier, on one whose card route
-    /// reads NVFP4 planes ([`XSTREAM_FORM`]) or when the stream cannot start
-    /// (the card's room among the refusals), and any change while a call
-    /// streams.
+    /// `Split` on a load that hangs an expert tier or when the stream cannot
+    /// start (the card's room among the refusals), and any change while a
+    /// call streams. The ring pass reads the half in the card stacks' forms,
+    /// the file's blocks or NVFP4's planes ([`super::wide38`]'s
+    /// `CardRoute38::enqueue`).
     pub fn set_xstream(&mut self, gpu: &Gpu, mode: XMode) -> Result<(), GpuError> {
         const WHAT_S: &str = "Body38::set_xstream";
         if self.stream.streaming() {
@@ -2528,18 +2529,6 @@ impl Body38 {
                 "BLOOMERY_XSTREAM",
                 "split on a load with an expert tier: the stream's ring serves the stage card \
                  of a load with none",
-            ));
-        }
-        if mode == XMode::Split
-            && self
-                .card
-                .routed_types()
-                .any(|(gate_up, down)| gate_up == GgmlType::NVFP4 || down == GgmlType::NVFP4)
-        {
-            return Err(GpuError::shape(
-                XSTREAM_FORM,
-                "split on a load whose card route reads NVFP4 planes: the ring pass reads a \
-                 matrix the ring holds as words",
             ));
         }
         if mode == XMode::Split && self.hybrid.xstream().is_none() {

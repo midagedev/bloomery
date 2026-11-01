@@ -34,7 +34,8 @@
 //!   table's entry for the stack's type; the down `_sel` the table names for
 //!   the stack's type, [`DownArm`]: Q4_K, Q5_K or Q6_K), or the common card
 //!   leg's ([`CardLeg`]: every type its arms run, the unit's wide arm its
-//!   route GEMMs, [`RouteBlock`]) — the q8_1 of the card slots' rows, and on
+//!   route GEMMs, [`RouteBlock`](card_leg::RouteBlock)) — the q8_1 of the
+//!   card slots' rows, and on
 //!   Qwen3.6 the shared expert by its types ([`SharedFfn`]): on its own
 //!   stacks, a stack of one expert on a fixed route of expert 0, when the
 //!   same table runs all three parts, else as its own dense FFN at its site
@@ -93,7 +94,7 @@ use super::scratch::{Arena, Dims, Forms, Io};
 use super::tier_leg::{self, TierCombineArgs, TierJoin};
 use super::wide::{self, CardRoute, GEMV_COLS, HostSide, arena_bytes};
 use crate::card_leg::{
-    CardLeg, LegBufs, LegRun, LegShape, LegStacks, RouteBlock, RouteIo, RouteW, leg_bytes_for,
+    self, CardLeg, LegBufs, LegRun, LegShape, LegStacks, RouteIo, RouteW, leg_bytes_for,
 };
 use crate::gemm::{Gemm32Kernels, GemmRoute, GemmTile};
 use crate::host::costs::ExpertShape;
@@ -392,6 +393,24 @@ struct CommonWide {
     h: WideActs,
     g: DeviceBuffer<f32>,
     u: DeviceBuffer<f32>,
+}
+
+impl CommonWide {
+    /// The buffers as a routed block ([`RouteBlock`](card_leg::RouteBlock))
+    /// over a unit's slots reads and writes them: the normed rows' forms the
+    /// layer's gate and up read, the gate and up rows, the SwiGLU's forms and
+    /// the slots' down rows `y`.
+    fn io<'a>(&'a mut self, y: &'a mut DeviceBuffer<f32>) -> RouteIo<'a> {
+        RouteIo {
+            x128: self.x.q128.as_ref(),
+            x32: self.x.q32.as_ref(),
+            g: &mut self.g,
+            u: &mut self.u,
+            h128: self.h.q128.as_mut(),
+            h32: self.h.q32.as_mut(),
+            y,
+        }
+    }
 }
 
 impl CommonRows {
@@ -963,23 +982,16 @@ impl Placed {
     /// this device and host price for the routed expert's shape over the
     /// router's experts and routed slots) and arm the pass
     /// rows for its ring ([`PlacedRows::arm_ring`]); a started stream and
-    /// armed rows are left as they are. Refused by name: a pass arena of the
-    /// gemv arm alone (the ring pass is the wide arm's), a load that runs no
-    /// residency machine and the stream's refusals, the card's room among
-    /// them. Load-time only.
+    /// armed rows are left as they are. The ring pass reads a half in the
+    /// card stacks' forms, the dispatch's layers and the common leg's alike
+    /// ([`ring_pass`]). Refused by name: a pass arena of the gemv arm alone
+    /// (the ring pass is the wide arm's), a load that runs no residency
+    /// machine and the stream's refusals, the card's room among them.
+    /// Load-time only.
     ///
     /// [`HostTier::xstream_start`]: crate::host::HostTier::xstream_start
     pub(super) fn start_xstream(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         let shape = self.side.shape;
-        if let Some(l) = self.side.ffn.iter().position(|f| f.common().is_some()) {
-            return Err(GpuError::shape(
-                "BLOOMERY_XSTREAM",
-                format!(
-                    "split on a placed load whose layer {l} runs its card experts through the \
-                     common leg: the ring pass reads the dispatch's K-quant words only"
-                ),
-            ));
-        }
         if self.side.cap <= GEMV_COLS {
             return Err(GpuError::shape(
                 "BLOOMERY_XSTREAM",
@@ -1871,9 +1883,10 @@ fn common_shadow(
 /// Layer `c.layer`'s card experts through the common leg over `m` rows past
 /// the gemv arm's width: the layer's routed table through its map, the unit's
 /// normed rows in the form the gate and up route GEMMs read, and the routed
-/// block ([`RouteBlock`]: gate, up, the SwiGLU into the form the down reads,
-/// down) over the card's stacks, writing the slots' down rows into the arena's
-/// `down` as the dispatch's wide route does. The shared expert is the caller's.
+/// block ([`RouteBlock`](card_leg::RouteBlock): gate, up, the SwiGLU into
+/// the form the down reads, down) over the card's stacks, writing the slots'
+/// down rows into the arena's `down` as the dispatch's wide route does. The
+/// shared expert is the caller's.
 fn common_wide(
     c: &Ctx<'_>,
     side: &PlacedSide,
@@ -1885,15 +1898,14 @@ fn common_wide(
         WHAT,
         "the 32-value kernels of a side whose units run the wide arm",
     ))?;
-    let stack = common_stacks(c.w, f)?;
-    let [gate, up, down] = stack.routes()?;
-    let (gpu, stream) = (c.gpu, c.gpu.stream());
-    let CommonWide { x, h, g, u } = common.wide.as_mut().ok_or(GpuError::state(
-        WHAT,
-        "the wide arm's buffers of a load with a common-leg layer",
-    ))?;
     let d = s.dims;
     let slots = d.slots();
+    let blk = common_stacks(c.w, f)?.block(d.ff, d.hidden)?;
+    let (gpu, stream) = (c.gpu, c.gpu.stream());
+    let wide = common
+        .wide
+        .as_mut()
+        .ok_or(GpuError::state(WHAT, COMMON_WIDE))?;
     let Arena {
         normed,
         route,
@@ -1901,7 +1913,8 @@ fn common_wide(
         ..
     } = s;
     g32.enqueue_route_remap(stream, route.ids(), map, m * slots, table, c.sink)?;
-    match gate {
+    let x = &mut wide.x;
+    match blk.gate {
         RouteW::Grouped(..) => {
             let a = x.q128.as_mut().ok_or(GpuError::state(
                 WHAT,
@@ -1917,29 +1930,30 @@ fn common_wide(
             g32.enqueue_quantize_gemm32(stream, normed, m, a, c.sink)?;
         }
     }
-    let blk = RouteBlock {
-        gate,
-        up,
-        down,
-        ff: d.ff,
-        hidden: d.hidden,
-    };
     blk.enqueue(
         gpu,
         (&c.k.gemm, g32),
         (&*table, slots),
         m * slots,
-        RouteIo {
-            x128: x.q128.as_ref(),
-            x32: x.q32.as_ref(),
-            g,
-            u,
-            h128: h.q128.as_mut(),
-            h32: h.q32.as_mut(),
-            y: out,
-        },
+        wide.io(out),
         c.sink,
     )
+}
+
+/// What a refusal of a common-leg layer's wide arm without its buffers names.
+const COMMON_WIDE: &str = "the wide arm's buffers of a load with a common-leg layer";
+
+/// The common-leg layers' wide buffers of `common` as a routed block reads
+/// and writes them ([`CommonWide::io`]), the slots' down rows `y`; a load
+/// with none is refused by name.
+fn common_io<'a>(
+    common: Option<&'a mut CommonRows>,
+    y: &'a mut DeviceBuffer<f32>,
+) -> Result<RouteIo<'a>, GpuError> {
+    common
+        .and_then(|c| c.wide.as_mut())
+        .map(|w| w.io(y))
+        .ok_or(GpuError::state(WHAT, COMMON_WIDE))
 }
 
 /// Layer `c.layer`'s shared expert as a stack of one expert on a fixed route
@@ -2383,12 +2397,16 @@ fn card_wide(
 /// from the stream's union row read in place (the places read no id past a
 /// row's routed slots, so that row needs no shared entry), then one GEMM
 /// batch a landing batch of the stream — the batch's map widened
-/// ([`widen_map`]) and the half's stacks through it ([`wide::ffn_ring`]),
-/// each behind its own landed event. Returns the union's card places, the
-/// layer's card experts and the streamed ones (`n_card + r.n`), which the
-/// combine reads ([`StreamWalk`]'s back). Refused by name: rows the ring is
-/// not armed on, and a stream of more batches than the rows hold maps for or
-/// of more experts than its half.
+/// ([`widen_map`]), the routed table over the half through it, the engine
+/// stream waiting the batch's landed event, and the half's stacks in the
+/// card stacks' forms as one routed block (`card_leg::with_ring`) over the
+/// rows the card route quantized, writing the listed slots' down rows beside
+/// the card route's: the dispatch's layers over the arena's rows
+/// ([`wide::route_io`]), the common leg's over its own ([`CommonWide`]).
+/// Returns the union's card places, the layer's card experts and the
+/// streamed ones (`n_card + r.n`), which the combine reads ([`StreamWalk`]'s
+/// back). Refused by name: rows the ring is not armed on, and a stream of
+/// more batches than the rows hold maps for or of more experts than its half.
 fn ring_pass(
     c: &Ctx<'_>,
     side: &PlacedSide,
@@ -2398,12 +2416,17 @@ fn ring_pass(
     r: &RingLayer,
 ) -> Result<usize, GpuError> {
     let shape = side.shape;
-    let n_card = side
+    let f = side
         .ffn
         .get(c.layer)
-        .ok_or(GpuError::state(WHAT, "a placed FFN for every layer"))?
-        .n_card;
-    let ring = rows.ring.as_mut().ok_or(GpuError::state(
+        .ok_or(GpuError::state(WHAT, "a placed FFN for every layer"))?;
+    let n_card = f.n_card;
+    let g32 = side.k.g32.as_ref().ok_or(GpuError::state(
+        WHAT,
+        "the 32-value kernels of a side whose units run the wide arm",
+    ))?;
+    let PlacedRows { ring, common, .. } = rows;
+    let ring = ring.as_mut().ok_or(GpuError::state(
         WHAT,
         "pass rows armed for the expert stream's ring (Placed::start_xstream)",
     ))?;
@@ -2421,13 +2444,9 @@ fn ring_pass(
             ),
         ));
     }
-    let n = &c.p.ffn;
-    let (ctx, stream) = (c.gpu.context(), c.gpu.stream());
-    let cols = |name: &str| kq_weight(c.w, name).map(DeviceTensor::cols);
-    let (gate_cols, up_cols, down_cols) = (cols(&n.gate)?, cols(&n.up)?, cols(&n.down)?);
-    let rows = [shape.ff, shape.ff, shape.hidden];
-    let cols = [gate_cols, up_cols, down_cols];
-    wide::with_ring_windows(r, ctx, shape.n_expert, rows, cols, |union_map, stacks| {
+    let (gpu, ctx, stream) = (c.gpu, c.gpu.context(), c.gpu.stream());
+    let slots = s.dims.slots();
+    r.with_union(ctx, shape.n_expert, |union_map| {
         side.k.leg.enqueue_places(
             stream,
             &PlacesArgs {
@@ -2441,20 +2460,46 @@ fn ring_pass(
             },
             c.sink,
             &mut ring.union,
-        )?;
+        )
+    })?;
+    let card = common_stacks(c.w, f)?;
+    card_leg::with_ring(&card, n_card, r, ctx, (shape.ff, shape.hidden), |blk| {
         for (b, map) in r.batches.iter().zip(ring.maps.iter_mut()) {
             b.with_map(ctx, shape.n_expert, |row| {
                 widen_map(stream, (row, 0), shape.n_expert, map)
             })?;
-            wide::ffn_ring(c, n, s, m, map, &mut ring.route, b.event.as_deref(), stacks)?;
+            g32.enqueue_route_remap(
+                stream,
+                s.route.ids(),
+                map,
+                m * slots,
+                &mut ring.route,
+                c.sink,
+            )?;
+            if let Some(e) = b.event.as_deref() {
+                stream.wait(e)?;
+            }
+            let io = match f.common() {
+                Some(_) => common_io(common.as_mut(), &mut s.down)?,
+                None => wide::route_io(s)?,
+            };
+            blk.enqueue(
+                gpu,
+                (&c.k.gemm, g32),
+                (&ring.route, slots),
+                m * slots,
+                io,
+                c.sink,
+            )?;
         }
-        if let Some(checks) = ring.checks.as_mut() {
-            let maps = ring.maps.get(..r.batches.len()).unwrap_or_default();
-            let ids = s.route.ids();
-            checks.push(union_check(c, side, (ids, &ring.union), maps, m, n_card)?);
-        }
-        Ok(n_card + r.n)
-    })
+        Ok(())
+    })?;
+    if let Some(checks) = ring.checks.as_mut() {
+        let maps = ring.maps.get(..r.batches.len()).unwrap_or_default();
+        let ids = s.route.ids();
+        checks.push(union_check(c, side, (ids, &ring.union), maps, m, n_card)?);
+    }
+    Ok(n_card + r.n)
 }
 
 /// Layer `c.layer`'s union places of `m` rows (`union`, cut from the

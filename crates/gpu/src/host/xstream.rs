@@ -88,7 +88,6 @@ use super::{Drain, poll_drained};
 use crate::Gpu;
 use crate::GpuError;
 use crate::graph::{MappedHost, cu, mem_batch, op_wait_geq, op_write};
-use crate::tensor::DeviceTensor;
 
 /// The stream lever: `off`, `admit` (the residency machine's pick alone) or
 /// `split` (the pick, then the stream). The values a binary takes are the
@@ -319,16 +318,11 @@ impl LandBatch {
         experts: usize,
         f: impl FnOnce(&DeviceBuffer<u32>) -> Result<T, GpuError>,
     ) -> Result<T, GpuError> {
-        // SAFETY: the batch's map row is `experts` words of the pool's
-        // host-mapped rows ([`LandRows::row_dev`]), which stay in place for
-        // the stream's life; the window owns nothing and frees nothing. Its
-        // contents are the landing path's contract: filled before the
-        // launches `f` enqueues were issued, rewritten only once they have
-        // run.
-        let bmap = unsafe { crate::tensor::window::<u32>(self.map, experts, ctx) };
-        let ran = f(&bmap);
-        drop(std::mem::ManuallyDrop::into_inner(bmap).into_raw_parts());
-        ran
+        // The batch's map row is `experts` words of the pool's host-mapped
+        // rows ([`LandRows::row_dev`]); its contents are the landing path's
+        // contract: filled before the launches `f` enqueues were issued,
+        // rewritten only once they have run.
+        with_row(self.map, ctx, experts, f)
     }
 }
 
@@ -443,6 +437,42 @@ pub struct RingLayer {
     pub batches: Vec<LandBatch>,
 }
 
+impl RingLayer {
+    /// `f` over the layer's union row ([`XStream`]'s module doc) as a
+    /// non-owning window of `experts` words, the router's experts, given back
+    /// after `f` on every path: the card sum's places over the stack's
+    /// experts and the streamed ones. `f`'s error is returned whole.
+    pub fn with_union<T>(
+        &self,
+        ctx: &Arc<CudaContext>,
+        experts: usize,
+        f: impl FnOnce(&DeviceBuffer<u32>) -> Result<T, GpuError>,
+    ) -> Result<T, GpuError> {
+        // The union row is `experts` words of the stream's mapped host rows
+        // (`XStream::ring_layer`), written when the layer streams, before the
+        // card route that reads it is enqueued.
+        with_row(self.union_map, ctx, experts, f)
+    }
+}
+
+/// `f` over `experts` words of the stream's host-mapped rows at `row`
+/// ([`LandBatch::with_map`], [`RingLayer::with_union`]) as a non-owning
+/// window, given back after `f` on every path. `f`'s error is returned whole.
+fn with_row<T>(
+    row: sys::CUdeviceptr,
+    ctx: &Arc<CudaContext>,
+    experts: usize,
+    f: impl FnOnce(&DeviceBuffer<u32>) -> Result<T, GpuError>,
+) -> Result<T, GpuError> {
+    // SAFETY: `row` is `experts` words of the stream's mapped host rows, which
+    // stay in place for the stream's life, past the launches `f` enqueues; the
+    // window owns nothing and frees nothing.
+    let window = unsafe { crate::tensor::window::<u32>(row, experts, ctx) };
+    let ran = f(&window);
+    drop(std::mem::ManuallyDrop::into_inner(window).into_raw_parts());
+    ran
+}
+
 /// An expert's matrices: gate, up, down.
 pub const PARTS: usize = 3;
 
@@ -450,56 +480,6 @@ pub const PARTS: usize = 3;
 /// or in three planes, an NVFP4 planes expert's codes, block scales and
 /// tensor scale (`super::swap::Transform`).
 pub const MAX_PARTS: usize = 3 * PARTS;
-
-/// A half of the expert stream's ring as a family's routed launches read a
-/// layer's stacks ([`with_ring_windows`]): its gate, up and down, each a
-/// stack of the half's slots at the layer's own types and row words.
-pub struct RingStacks<'a> {
-    pub gate: &'a DeviceTensor<u32>,
-    pub up: &'a DeviceTensor<u32>,
-    pub down: &'a DeviceTensor<u32>,
-}
-
-/// Layer `r`'s stream on the card for the length of `f`: its union map of
-/// `n_expert` words, and its half's gate, up and down ([`RingStacks`]),
-/// `half_slots` experts of `rows[p]` rows of `cols[p]` words in each part
-/// `p`; the windows are given back after `f` on every path.
-pub fn with_ring_windows<T>(
-    r: &RingLayer,
-    ctx: &Arc<CudaContext>,
-    n_expert: usize,
-    rows: [usize; PARTS],
-    cols: [usize; PARTS],
-    f: impl FnOnce(&DeviceBuffer<u32>, &RingStacks<'_>) -> Result<T, GpuError>,
-) -> Result<T, GpuError> {
-    // SAFETY: the stream's union row is `n_expert` words of its mapped host
-    // rows, and its half holds `half_slots` experts of the layer's part bytes
-    // in each part from the half's first slot — its gate and up rows of the
-    // card stacks' words, its down rows likewise (`XStream::ring_layer`); all
-    // stay allocated while the stream lives, past `f`'s launches, and the
-    // windows are given back below.
-    let (union_map, gate, up, down) = unsafe {
-        (
-            crate::tensor::window::<u32>(r.union_map, n_expert, ctx),
-            DeviceTensor::<u32>::window(r.parts[0], r.half_slots * rows[0], cols[0], ctx),
-            DeviceTensor::<u32>::window(r.parts[1], r.half_slots * rows[1], cols[1], ctx),
-            DeviceTensor::<u32>::window(r.parts[2], r.half_slots * rows[2], cols[2], ctx),
-        )
-    };
-    let ran = f(
-        &union_map,
-        &RingStacks {
-            gate: &gate,
-            up: &up,
-            down: &down,
-        },
-    );
-    drop(std::mem::ManuallyDrop::into_inner(union_map).into_raw_parts());
-    for w in [gate, up, down] {
-        DeviceTensor::release(w);
-    }
-    ran
-}
 
 /// The card bytes a ring leaves free when it sizes itself: half the margin
 /// the placement's expert rule leaves (`placement::workstation::MARGIN`),
@@ -546,12 +526,6 @@ pub const XSTREAM_ROOM: &str = "XStream ring room";
 /// What the refusal of a stream on a map with no host expert on a layer with stage stacks names ([`XSTREAM_ROOM`]'s
 /// reader's twin): nothing streams where the card holds every expert.
 pub const XSTREAM_NO_HOST: &str = "XStream host experts";
-
-/// What the refusal of a ring whose stacks the family's ring pass does not
-/// read names ([`XSTREAM_ROOM`]'s reader's twin): the pass reads a matrix the
-/// ring holds whole as words, so a load whose card route reads NVFP4 planes
-/// streams nothing.
-pub const XSTREAM_FORM: &str = "XStream ring form";
 
 /// The ring's halves.
 const HALVES: usize = 2;

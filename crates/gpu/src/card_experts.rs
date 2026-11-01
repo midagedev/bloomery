@@ -37,8 +37,6 @@
 //! expert's weights read once a tile of up to 64 of its slots; the card's own
 //! slots stay on the leg's `_sel` launches, whose rows are the step's.
 
-use std::mem::ManuallyDrop;
-
 use cuda_core::{CudaStream, DeviceBuffer};
 use model::arch::models::{Ffn, LayerSpec};
 use model::arch::place_hybrid::RingForms;
@@ -46,9 +44,7 @@ use model::placement::accepts::{self, LegArms, Program};
 use model::placement::kernels::{self, DownAct, DownForms};
 
 use crate::card_leg::ExpertInput;
-use crate::card_leg::{
-    self, CardLeg, LegBufs, LegRun, LegShape, LegStacks, LegSum, RouteBlock, STACK_ROLES,
-};
+use crate::card_leg::{self, CardLeg, LegBufs, LegRun, LegShape, LegStacks, LegSum, STACK_ROLES};
 use crate::card_slots::{CardSlotKernels, Places};
 use crate::gemm::{Gemm32Kernels, GemmKernels};
 use crate::host::xstream::RingLayer;
@@ -790,20 +786,12 @@ impl CardExperts {
         };
         self.k.leg.enqueue(gpu, &mut bufs.leg, &card, None)?;
         rg.enqueue_rows(gpu, g32, io.normed, io.m, fault)?;
-        card_leg::with_ring(&stacks, layer.n_card, r, ctx, |half| {
-            let [gate, up, down] = half.routes()?;
-            let blk = RouteBlock {
-                gate,
-                up,
-                down,
-                ff: self.ff,
-                hidden: self.n,
-            };
+        card_leg::with_ring(&stacks, layer.n_card, r, ctx, (self.ff, self.n), |blk| {
             for b in &r.batches {
                 rg.enqueue_batch(
                     gpu,
                     (gemm.as_ref(), g32),
-                    &blk,
+                    blk,
                     b,
                     (ids, n_slots, n_used, n_expert),
                     (bufs.leg.down_mut(), rule),
@@ -812,29 +800,21 @@ impl CardExperts {
             }
             Ok(())
         })?;
-        // SAFETY: the union row is `n_expert` words of the stream's mapped
-        // rows (`XStream::ring_layer`), allocated while the stream lives, past
-        // these launches; the window is given back below.
-        let union_map = unsafe { crate::tensor::window::<u32>(r.union_map, n_expert, ctx) };
-        let ran = (|| {
-            places(&union_map, 0, &mut *sel)?;
-            let CardBufs { leg, acc, pre } = &mut *bufs;
-            let sum = LegSum {
-                w: io.weights,
-                acc: &mut *acc,
-            };
-            let n_card = layer.n_card + r.n;
-            self.k
-                .leg
-                .sum_rows(gpu, leg, &*sel, (l, io.m, n_card), sum)?;
-            if !self.k.add_base {
-                return Ok(());
-            }
-            gpu.elem()
-                .enqueue_add(stream, acc, io.x1, io.m * self.n, pre)
-        })();
-        drop(ManuallyDrop::into_inner(union_map).into_raw_parts());
-        ran
+        r.with_union(ctx, n_expert, |union_map| places(union_map, 0, &mut *sel))?;
+        let CardBufs { leg, acc, pre } = &mut *bufs;
+        let sum = LegSum {
+            w: io.weights,
+            acc: &mut *acc,
+        };
+        let n_card = layer.n_card + r.n;
+        self.k
+            .leg
+            .sum_rows(gpu, leg, &*sel, (l, io.m, n_card), sum)?;
+        if !self.k.add_base {
+            return Ok(());
+        }
+        gpu.elem()
+            .enqueue_add(stream, acc, io.x1, io.m * self.n, pre)
     }
 }
 

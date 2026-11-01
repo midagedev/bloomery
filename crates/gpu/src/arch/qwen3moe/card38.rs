@@ -194,6 +194,14 @@ impl LegLayer {
             down_ty: self.down_ty,
         })
     }
+
+    /// The layer's three routed stacks on this card, from `w`, as the common
+    /// card leg reads them ([`LegStacks::of`]): the leg's launches, and the
+    /// forms the expert stream's ring holds a half of host experts in for
+    /// the ubatch route's ring pass (`crate::card_leg::with_ring`).
+    pub(super) fn leg_stacks<'w>(&'w self, w: &'w Weights) -> Result<LegStacks<'w>, GpuError> {
+        LegStacks::of(w, [&self.gate, &self.up, &self.down])
+    }
 }
 
 /// A layer's card experts as the ubatch route reads them: their count, the
@@ -261,7 +269,7 @@ impl SelRun {
         sel: &DeviceBuffer<u32>,
         down: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
-        let stacks = LegStacks::of(w, [&cl.gate, &cl.up, &cl.down])?;
+        let stacks = cl.leg_stacks(w)?;
         stacks.check(cl.n_card, self.bufs.shape())?;
         let run = LegRun {
             layer: l,
@@ -586,20 +594,34 @@ impl Card38 {
             .map(|layer| (layer.gate_up_ty, layer.down_ty))
     }
 
+    /// Layer `l`'s card stacks as the common card leg reads them
+    /// ([`LegLayer::leg_stacks`]), refused by name on a layer with no card
+    /// experts.
+    pub(super) fn leg_stacks<'w>(
+        &'w self,
+        w: &'w Weights,
+        l: usize,
+    ) -> Result<LegStacks<'w>, GpuError> {
+        self.card_layer(l)?.leg_stacks(w)
+    }
+
     /// Layer `l`'s card experts for the ubatch route (`wide38`'s): their
     /// count, the three routed stacks the grouped GEMMs read (the gate and
     /// up at `n_card · FF` rows, the down at `n_card · HIDDEN`) and their
     /// types, refused by name as [`Card38::new`] refuses. The leg's own buffers are
     /// not touched — the route owns its own.
     pub(super) fn stacks<'w>(&self, w: &'w Weights, l: usize) -> Result<Stacks38<'w>, GpuError> {
-        self.layer(l)
-            .ok_or_else(|| {
-                GpuError::shape(
-                    WHAT,
-                    format!("a card route on layer {l}, which has no card experts"),
-                )
-            })?
-            .stacks(w)
+        self.card_layer(l)?.stacks(w)
+    }
+
+    /// Layer `l`'s card experts, refused by name on a layer with none.
+    fn card_layer(&self, l: usize) -> Result<&LegLayer, GpuError> {
+        self.layer(l).ok_or_else(|| {
+            GpuError::shape(
+                WHAT,
+                format!("a card route on layer {l}, which has no card experts"),
+            )
+        })
     }
 
     /// The card slots' weighted sum the last card layer enqueued wrote, a
