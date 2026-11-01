@@ -3,9 +3,9 @@
 //! [`Refusal::outside_subset`]). The compiler reads a schema only after this
 //! walk passed it, so it refuses what is outside the subset and nothing else,
 //! and a node outside the subset never hides an invalid one: the walk takes
-//! every node a schema holds through `properties`, `items`, `anyOf` and the
-//! target of a `$ref`, whatever the node's other keywords say, and each tool
-//! of a request before any is compiled.
+//! every node a schema holds through `properties`, `items`, `anyOf`,
+//! `additionalProperties` and the target of a `$ref`, whatever the node's
+//! other keywords say, and each tool of a request before any is compiled.
 //!
 //! What a node is held to, wherever it stands:
 //! - a schema is an object or a boolean;
@@ -127,6 +127,7 @@ enum Step<'a> {
     Property(&'a str),
     Items,
     AnyOf(usize),
+    AdditionalProperties,
     /// A `$ref`'s target stands where the `$ref` does.
     Ref,
 }
@@ -140,6 +141,7 @@ impl Step<'_> {
             }
             Step::Items => path.push_str(".items"),
             Step::AnyOf(i) => path.push_str(&format!(".anyOf[{i}]")),
+            Step::AdditionalProperties => path.push_str(".additionalProperties"),
             Step::Ref => {}
         }
     }
@@ -324,6 +326,10 @@ fn node<'a>(
             .map(|(key, s)| (Step::Property(key), s)),
     );
     children.extend(o.get("items").map(|s| (Step::Items, s)));
+    children.extend(
+        o.get("additionalProperties")
+            .map(|s| (Step::AdditionalProperties, s)),
+    );
     Ok(children)
 }
 

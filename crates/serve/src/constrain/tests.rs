@@ -3862,6 +3862,10 @@ fn an_invalid_tool_schema_under_auto_is_refused_and_one_outside_the_subset_is_un
             "additionalProperties": false}),
         json!({"type": "object", "allOf": [{"properties": {"x": {"type": "string"}}}],
             "required": [1]}),
+        json!({"type": "object", "additionalProperties": 5}),
+        json!({"type": "object", "additionalProperties": {"type": "str"}}),
+        prop(json!({"type": "object", "additionalProperties": 5})),
+        prop(json!({"type": "object", "additionalProperties": {"type": "str"}})),
     ];
     for parameters in &invalid {
         for format in [ToolFormat::Hermes, QWEN] {
@@ -3960,10 +3964,11 @@ fn an_invalid_tool_schema_under_auto_is_refused_and_one_outside_the_subset_is_un
 /// Whether a schema is invalid does not depend on what else the compiler
 /// would refuse: an invalid node is refused by name beside a keyword outside
 /// the subset on its own node, below an outside node (through `properties`,
-/// `items`, `anyOf` and a `$ref`'s target), and past an unresolved or boolean
-/// sibling, on every route that reads a schema: `tool_choice` auto, a forced
-/// call and `response_format`. Mutant: the compiler's own order decides, the
-/// outside refusal first (and under auto, the request served unwatched).
+/// `items`, `anyOf`, `additionalProperties` and a `$ref`'s target), and past an
+/// unresolved or boolean sibling, on every route that reads a schema:
+/// `tool_choice` auto, a forced call and `response_format`. Mutant: the
+/// compiler's own order decides, the outside refusal first (and under auto,
+/// the request served unwatched).
 #[test]
 fn an_invalid_node_is_refused_beside_an_outside_one() {
     let tok = bytes_tok();
@@ -4020,6 +4025,17 @@ fn an_invalid_node_is_refused_beside_an_outside_one() {
             json!({"type": "object", "minProperties": 1, "required": ["q"],
                 "additionalProperties": false}),
             "",
+        ),
+        (
+            json!({"type": "object", "minProperties": 1, "additionalProperties": 5}),
+            ".additionalProperties",
+        ),
+        (
+            prop(
+                json!({"type": "object", "additionalProperties": {"type": "str"},
+                "propertyNames": {"pattern": "a"}}),
+            ),
+            ".properties.p.additionalProperties",
         ),
     ];
     let refused = |e: Refusal, field: String, body: &Value| {
@@ -5274,11 +5290,15 @@ const SPLIT_OPENER: [&str; 3] = ["<tool_call", ">\n", ">x"];
 /// after it in the piece that ends it is the program's first: the call that
 /// follows is held to its schema. Text after the opener that the program
 /// does not start with is the named error, never free text inside a call,
-/// on a step and inside a pass alike — unless a stop word ends the request
-/// at the opener first: then it ends as a stop word ends it, the stop and
-/// the text after it left out.
+/// on a step and inside a pass alike, a token limit that ends the request on
+/// the id that wrote it included — unless a stop word ends the request at
+/// the opener first: then it ends as a stop word ends it, the stop and the
+/// text after it left out.
 /// Mutant: the opener's suffix is refused before the stop words are read,
-/// and the stopped request fails.
+/// and the stopped request fails; the limit is read before the refusal, and
+/// the refused text returns as a success; or a refusal drafted behind ids a
+/// pass kept is returned before they are taken, and a limit among them is
+/// lost.
 #[test]
 fn a_text_opener_split_over_pieces_opens_the_watch() {
     let tok: Arc<dyn Tokenizer> = Arc::new(Pieces(Arc::new(PieceTok(&SPLIT_OPENER))));
@@ -5321,22 +5341,25 @@ fn a_text_opener_split_over_pieces_opens_the_watch() {
         Some(build(&tok, QWEN, &body).expect("served")),
         ThinkEntry::Closed,
     );
-    let mut slot = Slot::new(Box::new(Rows {
-        tok: Arc::clone(&tok),
-        want: want.clone(),
-        k: 0,
-        read: Arc::new(Mutex::new(Vec::new())),
-    }))
-    .schema_jump(false);
-    let Err(e) = generate(
-        &mut slot,
-        &sampling::reference_factory(),
-        &tok.encode("hi"),
-        &p,
-        &mut |_| Ok(()),
-        &mut |_| {},
-        &mut Timings::default(),
-    ) else {
+    let by_steps = |p: &GenParams, want: &[u32]| {
+        let mut slot = Slot::new(Box::new(Rows {
+            tok: Arc::clone(&tok),
+            want: want.to_vec(),
+            k: 0,
+            read: Arc::new(Mutex::new(Vec::new())),
+        }))
+        .schema_jump(false);
+        generate(
+            &mut slot,
+            &sampling::reference_factory(),
+            &tok.encode("hi"),
+            p,
+            &mut |_| Ok(()),
+            &mut |_| {},
+            &mut Timings::default(),
+        )
+    };
+    let Err(e) = by_steps(&p, &want) else {
         panic!("text after the opener outside the program");
     };
     let refused = |e: &GenError| {
@@ -5350,7 +5373,35 @@ fn a_text_opener_split_over_pieces_opens_the_watch() {
         "a pass: {:?}",
         e.err()
     );
-    let mut stopped = p.clone();
+    // The refusal belongs to the id that wrote the text: a limit that ends the
+    // request on that id returns it, and a limit before the id leaves it
+    // unread, wherever the id falls among the three a pass keeps.
+    for lead in ["sure. ", "sure.. ", "sure... "] {
+        let mut want = ids(&tok, lead);
+        want.extend([piece("<tool_call"), piece(">x")]);
+        let mut limited = p.clone();
+        for n in 1..=want.len() {
+            limited.n_predict = i64::try_from(n).expect("a short script");
+            let by_pass = run_passes_with(&tok, &limited, &want, false, true).0;
+            for (arm, r) in [("steps", by_steps(&limited, &want)), ("a pass", by_pass)] {
+                if n == want.len() {
+                    assert!(
+                        r.as_ref().err().is_some_and(refused),
+                        "{arm} at limit {n} of {lead:?}: {:?}",
+                        r.err()
+                    );
+                } else {
+                    let o = r.unwrap_or_else(|e| panic!("{arm} at limit {n} of {lead:?}: {e}"));
+                    assert_eq!(
+                        (o.stop, o.tokens.len()),
+                        (StopKind::Limit, n),
+                        "{arm} at limit {n} of {lead:?}"
+                    );
+                }
+            }
+        }
+    }
+    let mut stopped = p;
     stopped.stop = vec!["<tool_call>".to_owned()];
     let (o, _) = run_read(&tok, &stopped, &want);
     assert_eq!(o.stop, StopKind::Word);
