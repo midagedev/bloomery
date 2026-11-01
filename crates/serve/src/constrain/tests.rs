@@ -75,54 +75,10 @@ impl PieceTok {
     }
 }
 
-struct PieceDecoder {
-    tok: Arc<PieceTok>,
-    held: Vec<u8>,
-}
-
-impl Decoder for PieceDecoder {
-    fn push(&mut self, id: u32) -> Option<String> {
-        self.held.extend(self.tok.bytes_of(id));
-        // The production rule (`crate::vocab`'s decoder): a hard invalid
-        // sequence becomes U+FFFD and the text after it streams, an
-        // incomplete tail is held. A special after an invalid byte keeps its
-        // whole text in its piece, so the loop can place its span.
-        let mut out = String::new();
-        loop {
-            match std::str::from_utf8(&self.held) {
-                Ok(text) => {
-                    out.push_str(text);
-                    self.held.clear();
-                    break;
-                }
-                Err(e) => {
-                    let valid = e.valid_up_to();
-                    // The first `valid` bytes were just checked.
-                    out.push_str(std::str::from_utf8(&self.held[..valid]).unwrap_or_default());
-                    match e.error_len() {
-                        None => {
-                            self.held.drain(..valid);
-                            break;
-                        }
-                        Some(bad) => {
-                            out.push(char::REPLACEMENT_CHARACTER);
-                            self.held.drain(..valid + bad);
-                        }
-                    }
-                }
-            }
-        }
-        (!out.is_empty()).then_some(out)
-    }
-    fn flush(&mut self) -> String {
-        String::from_utf8_lossy(&std::mem::take(&mut self.held)).into_owned()
-    }
-}
-
 /// A stop id besides the end of sequence, as a piece.
 const STOP_PIECE: &str = "[END]";
 
-/// A [`PieceTok`] the decoder can share.
+/// A [`PieceTok`] shared with the tests that name its ids.
 struct Pieces(Arc<PieceTok>);
 
 impl Tokenizer for Pieces {
@@ -190,11 +146,40 @@ impl Tokenizer for Pieces {
         let bytes: Vec<u8> = ids.iter().flat_map(|&i| self.0.bytes_of(i)).collect();
         String::from_utf8_lossy(&bytes).into_owned()
     }
+    /// The production decoder over a vocabulary of these pieces: a byte id is its
+    /// `<0xNN>` BYTE token, every other id a CONTROL token that renders its text, so
+    /// the UTF-8 rule under test is `crate::vocab`'s.
     fn decoder(&self) -> Box<dyn Decoder> {
-        Box::new(PieceDecoder {
-            tok: Arc::clone(&self.0),
-            held: Vec::new(),
-        })
+        use gguf::Value;
+
+        let (tokens, types): (Vec<_>, Vec<_>) = (0..self.n_vocab())
+            .map(|i| {
+                let id = u32::try_from(i).expect("an id");
+                let (text, kind) = if (BYTES..PIECES).contains(&id) {
+                    (format!("<0x{:02X}>", id - BYTES), 6)
+                } else {
+                    (
+                        String::from_utf8(self.0.bytes_of(id)).expect("a text piece"),
+                        3,
+                    )
+                };
+                (Value::String(text), Value::I32(kind))
+            })
+            .unzip();
+        let keys = [
+            ("model", Value::String("gpt2".into())),
+            ("pre", Value::String("qwen2".into())),
+            ("tokens", Value::Array(tokens)),
+            ("token_type", Value::Array(types)),
+            ("merges", Value::Array(Vec::new())),
+            ("bos_token_id", Value::U32(0)),
+            ("eos_token_id", Value::U32(1)),
+        ]
+        .map(|(key, value)| (format!("tokenizer.ggml.{key}"), value));
+        let tok = tokenizer::Tokenizer::from_keys(&keys).expect("unique byte and literal pieces");
+        crate::vocab::Vocab::new(tok)
+            .expect("the vocabulary names an EOS")
+            .decoder()
     }
     fn bos(&self) -> Option<u32> {
         Some(0)
