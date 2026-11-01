@@ -193,7 +193,10 @@ pub struct PlanInputs {
     /// The effective room is [`Plan::plan_at`]'s: the reading's plan room,
     /// capped by the machine's host room and unified pool.
     pub room: (u64, HostRead),
-    /// A part source's rows stay on NVMe, with room for each stored plane.
+    /// A part source's rows stay on NVMe, with room for each stored plane:
+    /// the PLE table of a split that does not hold it as one file run (a
+    /// header alone, or a checkpoint folder whose part source makes it),
+    /// which the host cannot read where the split stores it.
     pub row_source: placement::RowTableSource,
     /// The arena's bytes `BLOOMERY_NVTIER_BYTES` gave the split dial
     /// ([`workstation::nvtier_arena_given`]), `None` unset; the split takes it
@@ -506,10 +509,9 @@ impl PlanInputs {
             spec,
             kv,
             room,
-            row_source: if split.is_header_only() {
-                placement::RowTableSource::Parts
-            } else {
-                placement::RowTableSource::Split
+            row_source: match split.place(&names::per_layer_token_embd()) {
+                Some(gguf::Place::File { .. }) | None => placement::RowTableSource::Split,
+                Some(_) => placement::RowTableSource::Parts,
             },
             arena,
         })
@@ -3041,7 +3043,10 @@ mod tests {
     /// stacks are NVFP4 with an expert scale each describes with every scale
     /// beside its tensor (the shared walk's rule, no row of the family's
     /// table): the table's on the PLE site, each stack's on its layer, each
-    /// left in the file for the load to read by name.
+    /// left in the file for the load to read by name. The file's table is
+    /// read where it lies; a header's, and a checkpoint folder's whose part
+    /// source makes it, from the NVMe tier at every room. FAIL-first: the
+    /// located folder read its made table as the file's, on the host.
     #[test]
     fn an_f8_ple_table_and_its_scale_describe() {
         use crate::arch::qwen35moe::hparams::tests::{keys, tensors};
@@ -3104,6 +3109,16 @@ mod tests {
         assert!(header.is_header_only());
         let source = super::PlanInputs::describe_in(&header, (u64::MAX, HostRead::Given))
             .expect("the folder header describes");
+        let made = (0..split.tensor_count())
+            .map(|_| gguf::Place::Made)
+            .collect();
+        let located = Split::located(path.clone(), &layout, std::slice::from_ref(&path), made)
+            .expect("a folder whose part source makes every tensor");
+        assert!(!located.is_header_only());
+        let located = super::PlanInputs::describe_in(&located, (u64::MAX, HostRead::Given))
+            .expect("the located folder describes");
+        assert_eq!(located.row_source, placement::RowTableSource::Parts);
+        assert_eq!(inputs.row_source, placement::RowTableSource::Split);
         let machine = super::machine(
             super::A6000,
             crate::arch::qwen35moe::place::Stack::q8_blocks32(inputs.model.layers),
