@@ -377,7 +377,7 @@ fn start(script: &str) -> std::net::SocketAddr {
 fn tools() -> Value {
     json!([
         {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object",
-            "properties": {"city": {"type": "string"}}}}},
+            "properties": {"city": {"type": "string"}, "unit": {"type": "string"}}}}},
         {"type": "function", "function": {"name": "get_time", "parameters": {"type": "object",
             "properties": {}}}},
     ])
@@ -437,7 +437,11 @@ fn fold_stream(body: &str) -> Result<(Value, Value), String> {
 }
 
 /// One and two calls, streamed and not: `tool_calls` in OpenAI's shape with
-/// `finish_reason` `tool_calls`, the text before them the content.
+/// `finish_reason` `tool_calls`, the text before them the content. The
+/// request is watched (`tool_choice` auto holds a call to its schema from the
+/// opener on), so each script is a call [`tools`]' schemas accept: a key
+/// outside them would end the call at its last property and leave the rest of
+/// the script as content.
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_mistral_chat_tool_calls_stream_and_non_stream() {
@@ -494,7 +498,10 @@ fn hw_mistral_chat_tool_calls_stream_and_non_stream() {
 }
 
 /// Markup that does not parse is the request's named error: a 500 without a
-/// stream, an error event that ends a stream (no `[DONE]`).
+/// stream, an error event that ends a stream (no `[DONE]`). The request is
+/// unwatched ([`common::unwatched`]): a watched call's program holds the
+/// markup to its schema, so a malformed call is reachable only where no
+/// program reads the reply.
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_mistral_malformed_call_is_an_api_error() {
@@ -509,14 +516,22 @@ fn hw_mistral_malformed_call_is_an_api_error() {
         ),
     ] {
         let addr = start(script);
-        let r = post(addr, "/v1/chat/completions", &tool_body(false));
+        let r = post(
+            addr,
+            "/v1/chat/completions",
+            &common::unwatched(tool_body(false)),
+        );
         assert_eq!(r.status, 500, "{}", r.body);
         let m = r.json()["error"]["message"]
             .as_str()
             .unwrap_or("")
             .to_owned();
         assert!(m.starts_with(want), "{m}");
-        let r = post(addr, "/v1/chat/completions", &tool_body(true));
+        let r = post(
+            addr,
+            "/v1/chat/completions",
+            &common::unwatched(tool_body(true)),
+        );
         let e = fold_stream(&r.body).expect_err("an error event");
         assert!(e.starts_with(want), "{e}");
     }
