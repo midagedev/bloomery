@@ -606,6 +606,11 @@ mod tests {
                     read.defaults.iter().any(|d| d.starts_with(default)),
                     "{key}: no default recorded"
                 );
+                // A file with no softcap key runs no logit epilogue: the graph
+                // caps only on a nonzero bound.
+                if key == "final_logit_softcapping" {
+                    assert!(read.spec.logit_epilogue.is_none(), "{key}: a cap of 0");
+                }
                 continue;
             }
             // A file may carry no `vocab_size` (the token list's length
@@ -631,7 +636,9 @@ mod tests {
     }
 
     /// A key of a value the model cannot hold is refused by name: another
-    /// kv-head count, gating func, index head count or rope scaling, a value
+    /// kv-head count, gating func, index head count or rope scaling, a router
+    /// that does not renormalize or that scales, a YaRN multiplier of a net
+    /// magnitude other than 1, an original context past ggml's int, a value
     /// or key length the latent does not sum to, a q_lora, a shared first
     /// indexer, a KV source above its layer, itself a reader or of another
     /// rope-ness, a rope width past the head or the index head, a softcap
@@ -647,6 +654,26 @@ mod tests {
                 "the score kernel runs 32",
             ),
             ("rope.scaling.type", V::Str("none"), "YaRN"),
+            (
+                "rope.scaling.yarn_log_multiplier",
+                V::F32(2.0),
+                "the rope table applies none (net 1)",
+            ),
+            (
+                "rope.scaling.original_context_length",
+                V::U32(3_000_000_000),
+                "past ggml's int",
+            ),
+            (
+                "expert_weights_norm",
+                V::Bool(false),
+                "renormalizes the kept weights",
+            ),
+            (
+                "expert_weights_scale",
+                V::F32(2.0),
+                "the router applies no scale (1)",
+            ),
             ("attention.value_length", V::U32(32), "the kv_lora_rank 16"),
             (
                 "attention.key_length",

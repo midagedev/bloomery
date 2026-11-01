@@ -689,12 +689,12 @@ unsafe fn ln_var(x: &[f32], base: usize, k: usize, tid: usize, mean: f32) -> f64
     acc
 }
 
-/// The block's f64 sum of the warps' partials `v` (each lane's widened by the
-/// xor butterfly first): thread `tid` holds its warp's sum at lane 0, the
-/// first warp reduces the per-warp sums through the caller's shared `ws`
-/// ([`RMS_WARPS`] slots), and every thread reads the result — the value all
-/// threads need before the apply pass. The caller's barriers order the slots
-/// against both reads.
+/// The block's f64 sum of the warps' partials `v` (each lane's widened by
+/// [`crate::latent::warp_sum_f64`] first): lane 0 of each warp writes its
+/// warp's sum to the caller's shared `ws` ([`RMS_WARPS`] slots), and after a
+/// barrier every thread adds the slots in slot order, so every thread holds
+/// the same value — the one all threads need before the apply pass. A second
+/// barrier ends the reads, so a later call reuses the slots.
 ///
 /// # Safety
 /// `tid < RMS_THREADS` and `ws` points to this block's own [`RMS_WARPS`]
@@ -702,35 +702,24 @@ unsafe fn ln_var(x: &[f32], base: usize, k: usize, tid: usize, mean: f32) -> f64
 /// it converged.
 #[inline(always)]
 unsafe fn ln_block_tree(v: f64, tid: usize, ws: *mut f64) -> f64 {
-    let mut acc = v;
-    acc += warp::shuffle_xor_f64(acc, 16);
-    acc += warp::shuffle_xor_f64(acc, 8);
-    acc += warp::shuffle_xor_f64(acc, 4);
-    acc += warp::shuffle_xor_f64(acc, 2);
-    acc += warp::shuffle_xor_f64(acc, 1);
+    let acc = crate::latent::warp_sum_f64(v);
     // SAFETY: the caller's contract: the block's own slots, the whole block
-    // converged. Lane 0 of each warp writes its slot before the barrier, warp
-    // 0 alone reduces the slots, and the whole block reads slot 0 after the
-    // second barrier.
+    // converged. Every slot is written before the first barrier and read
+    // between the two, and no slot is written after the first barrier of
+    // this call or before the second one of the previous call.
     unsafe {
-        let (lane, wid) = (warp::lane_id() as usize, tid / 32);
-        if lane == 0 {
-            *ws.add(wid) = acc;
+        if warp::lane_id() == 0 {
+            *ws.add(tid / 32) = acc;
         }
         thread::sync_threads();
-        if wid == 0 {
-            let mut all = 0.0f64;
-            let mut w = 0usize;
-            while w < RMS_WARPS {
-                all += *ws.add(w);
-                w += 1;
-            }
-            if lane == 0 {
-                *ws.add(0) = all;
-            }
+        let mut all = 0.0f64;
+        let mut w = 0usize;
+        while w < RMS_WARPS {
+            all += *ws.add(w);
+            w += 1;
         }
         thread::sync_threads();
-        *ws.add(0)
+        all
     }
 }
 

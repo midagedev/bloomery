@@ -4855,7 +4855,7 @@ mod tests {
         }
     }
 
-    const ML4: &str = include_str!("../tests/fixtures/mistral-large4-chat-template.jinja");
+    const ML4: &str = include_str!("../../serve/tests/fixtures/mistral-large4-chat-template.jinja");
 
     /// Mistral Large 4's chat template renders a tool round trip as the template writes it,
     /// derived by reading the template: the BOS; the system message in `[SYSTEM_PROMPT]`; the

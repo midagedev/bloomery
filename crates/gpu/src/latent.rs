@@ -113,10 +113,11 @@ const PER_THREAD: usize = LATENT / BLOCK as usize;
 const PER_LANE: usize = INDEX_HEAD / 32;
 const _: () = assert!(PER_THREAD == 4 && PER_LANE == 4 && BLOCK == 128 && POOL == 4);
 
-/// The xor butterfly (16, 8, 4, 2, 1) over a warp in f64: every lane ends
-/// with the same sum.
+/// A warp's sum of one f64 a lane, the xor butterfly (16, 8, 4, 2, 1): every
+/// lane ends with the same sum. Every lane of the warp calls it (a warp
+/// collective).
 #[inline(always)]
-pub(crate) fn warp_sum_f64(v: f64) -> f64 {
+pub fn warp_sum_f64(v: f64) -> f64 {
     let mut acc = v;
     acc += warp::shuffle_xor_f64(acc, 16);
     acc += warp::shuffle_xor_f64(acc, 8);
