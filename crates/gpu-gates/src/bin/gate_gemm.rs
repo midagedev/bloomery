@@ -253,6 +253,21 @@
 //!   places buffer,
 //!   refused by name before any launch. `--case nvfp4_swiglu` runs it
 //!   alone, without the model file.
+//! - `g32_swiglu_epi`: the same SwiGLU epilogue (`swiglu32.rs`) on the other
+//!   up stacks that declare it, each against its up GEMM and quantizer:
+//!   Q4_K through the grouped GEMM (`gemm_q4k_swiglu` against `gemm_q4k`
+//!   and `swiglu_quant32_sel`) under `g32_nvfp4_swiglu`'s remapped route,
+//!   shapes, token counts and fault cases, token 0's column from 64 tokens
+//!   scaled under the F32 walk's activation scale floor so its tiles walk
+//!   again exactly; and Q8_0 planes over a dense one-expert table, every
+//!   slot (`gemm_q8_0p_swiglu_all` at 9 columns and its slab twin at a wave
+//!   of the slab entry, against `gemm_q8_0p` and `swiglu_quant32`), column 0
+//!   under the scale floor, clean, with a NaN gate value, and with a slot
+//!   refused by an out-of-range expert id (the route's own `ExpertId` read
+//!   apart, each side's NaN row raising `QuantColumn`). Every side's
+//!   planes and fault bit for bit the two launches', each graph of one node
+//!   replaying the eager run. `--case swiglu_epi` runs it alone, without
+//!   the model file.
 //! - `q5_0p_is_the_gemv`: the resident packed Q5_0 (`pack_q5_0`, the tensor
 //!   the gemv reads) in `gemm_q5_0p` over the dense table, at Nemotron's
 //!   `ssm_in` (17504 × 3136) and `ffn_up` (12544 × 3136) and at 272 rows of
@@ -2723,6 +2738,7 @@ mod gate {
                     | "mxfp8_w8a8"
                     | "nvfp4_native"
                     | "nvfp4_swiglu"
+                    | "swiglu_epi"
                     | "nvfp4_gate_up"
                     | "zgate"
             )
@@ -3801,7 +3817,7 @@ mod gate {
         fn nvfp4_gemm_arm(gpu: &bloomery_gpu::Gpu, arm: &str) -> Result<bool, GateError> {
             use bloomery_gpu::gemm::{
                 Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct32, GemmInput, GemmKernels,
-                GemmRoute,
+                GemmRoute, SwigluSlots,
             };
             use bloomery_gpu::mxfp4_sel::Nvfp4Stack;
             // `swiglu`: the up GEMM with the card slots' SwiGLU into the down's
@@ -3865,9 +3881,17 @@ mod gate {
                 };
                 match swiglu {
                     None => g32.enqueue_gemm32(s, up),
-                    Some(true) => {
-                        g32.enqueue_up_swiglu32(s, up, &g, &sel, experts, &mut out_act, sink)
-                    }
+                    Some(true) => g32.enqueue_up_swiglu32(
+                        s,
+                        up,
+                        &g,
+                        SwigluSlots::Card {
+                            sel: &sel,
+                            n_card: experts,
+                        },
+                        &mut out_act,
+                        sink,
+                    ),
                     Some(false) => {
                         g32.enqueue_gemm32(s, up)?;
                         g32.enqueue_swiglu_quant32_sel(
@@ -4085,8 +4109,8 @@ mod gate {
             synthetic, wanted,
         };
         use bloomery_gpu::gemm::{
-            GateUp32Args, Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct, GemmAct32, GemmArgs,
-            GemmInput, GemmKernels, GemmRoute, GemmWeight,
+            GEMM_BN, GateUp32Args, Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct, GemmAct32,
+            GemmArgs, GemmInput, GemmKernels, GemmRoute, GemmWeight, SwigluSlots,
         };
         use bloomery_gpu::hybrid::HOST;
         use bloomery_gpu::kquant::{Act, act::silu_ik};
@@ -6267,22 +6291,32 @@ mod gate {
             Ok(ok)
         }
 
-        /// One `g32_nvfp4_swiglu` comparison over the route's last fill: both
+        /// A SwiGLU pair's up GEMM as [`swiglu_sides`] launches it: a
+        /// 32-value stack over the 32-value rows, or a grouped one over the
+        /// q8_1 rows.
+        #[derive(Clone, Copy)]
+        enum UpW<'a> {
+            G32(Gemm32Weight<'a>, &'a GemmAct32),
+            Grouped(GemmWeight, &'a DeviceTensor<u32>, &'a GemmAct),
+        }
+
+        /// One SwiGLU epilogue comparison over the route's last fill: both
         /// activations seeded with the same planes, then the up GEMM and
-        /// `swiglu_quant32_sel` into `two` and `enqueue_up_swiglu32` into
-        /// `one`, then the fold captured into a graph and replayed into `one`
-        /// over a fresh seed; each run's planes and fault, and the graph's
-        /// node count.
+        /// `swiglu_quant32` (`slots` all) or `swiglu_quant32_sel` (card
+        /// slots) into `two` and the up launcher (`enqueue_up_swiglu32` of the
+        /// up's family) into `one`, then the launcher captured into a graph
+        /// and replayed into `one` over a fresh seed; each run's planes and
+        /// fault, and the graph's node count.
         /// Each run's planes and fault (two-launch, fold, graph), and the graph's node count.
         type Sides = ([(Planes32, Option<Fault>); 3], usize);
 
         #[allow(clippy::too_many_arguments, reason = "a gate helper's operands, named")]
         fn swiglu_sides(
             dev: &Dev<'_>,
-            nv: Nvfp4Stack<'_>,
+            up: UpW<'_>,
             (rows, input): (usize, GemmInput),
-            (x, route): (&GemmAct32, &GemmRoute),
-            (g, sel, n_card): (&DeviceBuffer<f32>, &DeviceBuffer<u32>, usize),
+            route: &GemmRoute,
+            (g, slots): (&DeviceBuffer<f32>, SwigluSlots<'_>),
             u: &mut DeviceBuffer<f32>,
             seed: &DeviceBuffer<f32>,
             (two, one): (&mut GemmAct32, &mut GemmAct32),
@@ -6294,11 +6328,11 @@ mod gate {
                 let cols = a.cols();
                 dev.g32.enqueue_quantize_gemm32(stream, seed, cols, a, sink)
             };
-            let fold = |s: &CudaStream, u: &mut DeviceBuffer<f32>, one: &mut GemmAct32| {
-                dev.g32.enqueue_up_swiglu32(
+            let fold = |s: &CudaStream, u: &mut DeviceBuffer<f32>, one: &mut GemmAct32| match up {
+                UpW::G32(w, x) => dev.g32.enqueue_up_swiglu32(
                     s,
                     Gemm32Args {
-                        w: Gemm32Weight::Nvfp4Planes(nv),
+                        w,
                         rows_per_expert: rows,
                         act: x,
                         route,
@@ -6306,11 +6340,27 @@ mod gate {
                         y: u,
                     },
                     g,
-                    sel,
-                    n_card,
+                    slots,
                     one,
                     sink,
-                )
+                ),
+                UpW::Grouped(ty, w, x) => dev.gk.enqueue_up_swiglu32(
+                    &dev.g32,
+                    s,
+                    GemmArgs {
+                        ty,
+                        w,
+                        rows_per_expert: rows,
+                        act: x,
+                        route,
+                        input,
+                        y: u,
+                    },
+                    g,
+                    slots,
+                    one,
+                    sink,
+                ),
             };
             let planes = |a: &GemmAct32| -> Result<Planes32, GateError> {
                 Ok((
@@ -6323,19 +6373,39 @@ mod gate {
             let mut folded_u = DeviceBuffer::from_host(stream, &poison)?;
             reseed(two)?;
             reseed(one)?;
-            dev.g32.enqueue_gemm32(
-                stream,
-                Gemm32Args {
-                    w: Gemm32Weight::Nvfp4Planes(nv),
-                    rows_per_expert: rows,
-                    act: x,
-                    route,
-                    input,
-                    y: &mut *u,
-                },
-            )?;
-            dev.g32
-                .enqueue_swiglu_quant32_sel(stream, g, u, sel, n_card, n_slots, two, sink)?;
+            match up {
+                UpW::G32(w, x) => dev.g32.enqueue_gemm32(
+                    stream,
+                    Gemm32Args {
+                        w,
+                        rows_per_expert: rows,
+                        act: x,
+                        route,
+                        input,
+                        y: &mut *u,
+                    },
+                )?,
+                UpW::Grouped(ty, w, x) => dev.gk.enqueue_gemm(
+                    stream,
+                    GemmArgs {
+                        ty,
+                        w,
+                        rows_per_expert: rows,
+                        act: x,
+                        route,
+                        input,
+                        y: &mut *u,
+                    },
+                )?,
+            }
+            match slots {
+                SwigluSlots::All => dev
+                    .g32
+                    .enqueue_swiglu_quant32(stream, g, u, n_slots, two, sink)?,
+                SwigluSlots::Card { sel, n_card } => dev
+                    .g32
+                    .enqueue_swiglu_quant32_sel(stream, g, u, sel, n_card, n_slots, two, sink)?,
+            }
             stream.synchronize()?;
             let f_two = gpu.take_fault()?;
             fold(stream, &mut folded_u, one)?;
@@ -6440,12 +6510,16 @@ mod gate {
                             stream, &ids_d, &map_d, n_slots, &mut route, sink,
                         )?;
                         let g = DeviceBuffer::from_host(stream, gh)?;
+                        let slots = SwigluSlots::Card {
+                            sel: &sel_d,
+                            n_card,
+                        };
                         let sides = swiglu_sides(
                             dev,
-                            nv,
+                            UpW::G32(Gemm32Weight::Nvfp4Planes(nv), &x),
                             (rows, input),
-                            (&x, &route),
-                            (&g, &sel_d, n_card),
+                            &route,
+                            (&g, slots),
                             &mut u,
                             &seed,
                             (&mut two, &mut one),
@@ -6564,12 +6638,17 @@ mod gate {
                     if invalid_place {
                         sel[n_slots - 1] = n_exp as u32;
                     }
+                    let sel_d = DeviceBuffer::from_host(stream, &sel)?;
+                    let slots = SwigluSlots::Card {
+                        sel: &sel_d,
+                        n_card: n_exp,
+                    };
                     let ([(want, f_want), (got, f_got), (rep, f_rep)], nodes) = swiglu_sides(
                         dev,
-                        nv,
+                        UpW::G32(Gemm32Weight::Nvfp4Planes(nv), &x),
                         (rows, GemmInput::PerSlot),
-                        (&x, &route),
-                        (&seed, &DeviceBuffer::from_host(stream, &sel)?, n_exp),
+                        &route,
+                        (&seed, slots),
                         &mut u,
                         &seed,
                         (&mut two, &mut one),
@@ -6627,8 +6706,10 @@ mod gate {
                         y: &mut u,
                     },
                     &g,
-                    &sel,
-                    n_exp,
+                    SwigluSlots::Card {
+                        sel: &sel,
+                        n_card: n_exp,
+                    },
                     &mut out,
                     sink,
                 );
@@ -6648,6 +6729,233 @@ mod gate {
             let pass = fault.is_none();
             println!(
                 "gemm32 case=g32_nvfp4_swiglu refusals_launched_nothing fault={fault:?} {}",
+                verdict(pass)
+            );
+            Ok(ok && pass)
+        }
+
+        /// The SwiGLU epilogue of the up stacks beside NVFP4 that declare one
+        /// against their two launches: module doc, `g32_swiglu_epi`.
+        fn swiglu_epi_case(dev: &Dev<'_>) -> Result<bool, GateError> {
+            if !wanted("g32_swiglu_epi") {
+                return Ok(true);
+            }
+            let gpu = dev.gpu;
+            let stream = gpu.stream();
+            let sink = gpu.unlabelled_sink();
+            let mut ok = true;
+            gpu.clear_fault()?;
+            let same =
+                |a: &Planes32, b: &Planes32| a.0 == b.0 && nan_bits_equal(&a.1, &b.1) && a.2 == b.2;
+            let k = 512usize;
+            // Q4_K over a remapped card route (`gemm_q4k_swiglu`): every third
+            // of 24 experts the host's, four slots a token sharing its column.
+            let (n_map, top_k) = (24usize, 4usize);
+            let map: Vec<u32> = (0..n_map)
+                .map(|x| if x % 3 == 2 { HOST } else { (x - x / 3) as u32 })
+                .collect();
+            let n_card = n_map - n_map / 3;
+            let map_d = DeviceBuffer::from_host(stream, &map)?;
+            let max_t = NV_MS[NV_MS.len() - 1];
+            let max_slots = max_t * top_k;
+            let n_sb = k / 256;
+            for rows in [640usize, 160] {
+                let n_rows = n_card * rows;
+                let words = bytes_to_words(&synthetic(
+                    GemmWeight::Q4K,
+                    n_rows * n_sb,
+                    0x5200 + rows as u64,
+                ));
+                let w = DeviceTensor::upload(stream, &words, n_rows, 36 * n_sb)?;
+                let mut route = GemmRoute::new(stream, max_slots, n_card)?;
+                let mut ids_d = DeviceBuffer::<u32>::zeroed(stream, max_slots)?;
+                let mut sel_d = DeviceBuffer::<u32>::zeroed(stream, max_slots)?;
+                let mut x = GemmAct::new(stream, max_t, k)?;
+                let mut u = DeviceBuffer::<f32>::zeroed(stream, max_slots * rows)?;
+                let seed = DeviceBuffer::from_host(stream, &activations(rows, max_slots, 9811))?;
+                let mut two = GemmAct32::new(stream, max_slots, rows)?;
+                let mut one = GemmAct32::new(stream, max_slots, rows)?;
+                for &t in &NV_MS {
+                    let n_slots = t * top_k;
+                    // From 64 tokens on, token 0's column is scaled under the
+                    // F32 walk's activation scale floor, so the tiles it lands
+                    // in walk again exactly.
+                    let tiny = t >= 64;
+                    let ids =
+                        route_ids(Routing::Uniform, t, top_k, n_map, 0x5b ^ (t + rows) as u64);
+                    let sel: Vec<u32> = ids.iter().map(|&i| map[i as usize]).collect();
+                    let mut xs = activations(k, t, 9910 + t as u32);
+                    if tiny {
+                        xs[..k].iter_mut().for_each(|v| *v *= 1e-25);
+                    }
+                    gpu.enqueue_quantize_gemm(
+                        &DeviceBuffer::from_host(stream, &xs)?,
+                        t,
+                        &mut x,
+                        sink,
+                    )?;
+                    let gh = activations(rows, n_slots, 9710 + t as u32);
+                    let mut run = |ids: &[u32], sel: &[u32], gh: &[f32]| {
+                        ids_d.copy_from_host(stream, &pad(ids, max_slots))?;
+                        sel_d.copy_from_host(stream, &pad(sel, max_slots))?;
+                        dev.g32.enqueue_route_remap(
+                            stream, &ids_d, &map_d, n_slots, &mut route, sink,
+                        )?;
+                        let g = DeviceBuffer::from_host(stream, gh)?;
+                        let slots = SwigluSlots::Card {
+                            sel: &sel_d,
+                            n_card,
+                        };
+                        swiglu_sides(
+                            dev,
+                            UpW::Grouped(GemmWeight::Q4K, &w, &x),
+                            (rows, GemmInput::Shared { top_k }),
+                            &route,
+                            (&g, slots),
+                            &mut u,
+                            &seed,
+                            (&mut two, &mut one),
+                        )
+                    };
+                    let ([(want, f_want), (got, f_got), (rep, f_rep)], nodes) =
+                        run(&ids, &sel, &gh)?;
+                    let replay = nodes == 1 && same(&rep, &got) && f_rep == f_got;
+                    let pass = same(&want, &got) && f_want.is_none() && f_got.is_none() && replay;
+                    println!(
+                        "gemm32 case=g32_swiglu_epi up=q4k slots=card rows={rows} K={k} T={t} \
+                         n_slots={n_slots} tiny_scale_col={tiny} planes_eq_two_launches={} \
+                         faults={f_want:?}/{f_got:?} replay_eq_eager={replay} act_fnv={:016x} {}",
+                        same(&want, &got),
+                        Fnv1a64::default().u32s(&got.0).value(),
+                        verdict(pass)
+                    );
+                    ok &= pass;
+                    if t != 64 {
+                        continue;
+                    }
+                    // Faults, each case alone: a NaN gate value in a card
+                    // column; then a slot the route refuses on a card place,
+                    // one on a place no side serves and a listed slot whose
+                    // place is in [n_card, HOST).
+                    let card: Vec<usize> =
+                        (0..n_slots).filter(|&s| sel[s] < n_card as u32).collect();
+                    for nan_gate in [true, false] {
+                        let (mut ids_f, mut sel_f, mut gh_f) =
+                            (ids.clone(), sel.clone(), gh.clone());
+                        let sites: &[FaultSite] = if nan_gate {
+                            gh_f[card[0] * rows + 7] = f32::NAN;
+                            &[FaultSite::QuantColumn]
+                        } else {
+                            ids_f[card[1]] = n_map as u32;
+                            ids_f[card[2]] = n_map as u32 + 5;
+                            sel_f[card[2]] = n_card as u32;
+                            sel_f[card[3]] = n_card as u32 + 1;
+                            &[FaultSite::ExpertId, FaultSite::QuantColumn]
+                        };
+                        let ([(want, f_want), (got, f_got), (rep, f_rep)], nodes) =
+                            run(&ids_f, &sel_f, &gh_f)?;
+                        let replay = nodes == 1 && same(&rep, &got) && f_rep == f_got;
+                        let raised = Some(Fault::of_sites(LAYER_NONE, sites));
+                        let pass =
+                            same(&want, &got) && f_want == raised && f_got == raised && replay;
+                        println!(
+                            "gemm32 case=g32_swiglu_epi up=q4k rows={rows} T={t} \
+                             nan_gate={nan_gate} planes_eq_two_launches={} fault_two={f_want:?} \
+                             fault_fold={f_got:?} replay_eq_eager={replay} {}",
+                            same(&want, &got),
+                            verdict(pass)
+                        );
+                        ok &= pass;
+                    }
+                }
+            }
+            // Q8_0 planes over a dense one-expert table, every slot
+            // (`gemm_q8_0p_swiglu_all` and, from a wave of the slab entry on,
+            // `gemm_q8_0p_slab_swiglu_all`).
+            let rows = 640usize;
+            let (wts, _) = weights(false, rows, k, 0x5300)?;
+            let res = Res::new(dev, &wts, false, rows)?;
+            let (qs, d) = res
+                .plane
+                .as_ref()
+                .ok_or("gate_gemm: a Q8_0 stack has planes")?;
+            let wave = dev.g32.q8_0p_wave() as usize;
+            let big = GEMM_BN * wave.div_ceil(rows.div_ceil(128));
+            let mut slabs = Vec::new();
+            for m in [9usize, big] {
+                // The slab entry's choice for this launch (`q8_0p_slab`): the
+                // grid is the route's row slabs times its most tiles.
+                let grid = rows.div_ceil(128) * (m / GEMM_BN + 1);
+                let slab = dev.g32.q8_0p_slab(grid as u32, m as u32, 1);
+                slabs.push(slab);
+                let mut route = GemmRoute::new(stream, m, 1)?;
+                dev.gk.enqueue_route_dense(stream, m, &mut route, sink)?;
+                let mut xs = activations(k, m, 9920 + m as u32);
+                xs[..k].iter_mut().for_each(|v| *v *= 1e-25);
+                let mut x = GemmAct32::new(stream, m, k)?;
+                dev.g32.enqueue_quantize_gemm32(
+                    stream,
+                    &DeviceBuffer::from_host(stream, &xs)?,
+                    m,
+                    &mut x,
+                    sink,
+                )?;
+                let mut u = DeviceBuffer::<f32>::zeroed(stream, m * rows)?;
+                let seed = DeviceBuffer::from_host(stream, &activations(rows, m, 9821))?;
+                let mut two = GemmAct32::new(stream, m, rows)?;
+                let mut one = GemmAct32::new(stream, m, rows)?;
+                for (nan_gate, refused) in [(false, false), (true, false), (false, true)] {
+                    // The route raises a refused slot's `ExpertId`; the GEMMs
+                    // over it write the slot's up row NaN, so either side
+                    // raises `QuantColumn` alone.
+                    let mut route_ok = true;
+                    if refused {
+                        let mut ids = vec![0u32; m];
+                        ids[m - 1] = 1;
+                        let ids = DeviceBuffer::from_host(stream, &ids)?;
+                        dev.gk.enqueue_route(stream, &ids, m, &mut route, sink)?;
+                        stream.synchronize()?;
+                        route_ok = gpu.take_fault()?
+                            == Some(Fault::of_sites(LAYER_NONE, &[FaultSite::ExpertId]));
+                    }
+                    let mut gh = activations(rows, m, 9720 + m as u32);
+                    if nan_gate {
+                        gh[(m - 1) * rows + 5] = f32::NAN;
+                    }
+                    let g = DeviceBuffer::from_host(stream, &gh)?;
+                    let ([(want, f_want), (got, f_got), (rep, f_rep)], nodes) = swiglu_sides(
+                        dev,
+                        UpW::G32(Gemm32Weight::Q8_0Plane { qs, d }, &x),
+                        (rows, GemmInput::PerSlot),
+                        &route,
+                        (&g, SwigluSlots::All),
+                        &mut u,
+                        &seed,
+                        (&mut two, &mut one),
+                    )?;
+                    let raised = (nan_gate || refused)
+                        .then(|| Fault::of_sites(LAYER_NONE, &[FaultSite::QuantColumn]));
+                    let replay = nodes == 1 && same(&rep, &got) && f_rep == f_got;
+                    let pass = route_ok
+                        && same(&want, &got)
+                        && f_want == raised
+                        && f_got == raised
+                        && replay;
+                    println!(
+                        "gemm32 case=g32_swiglu_epi up=q8_0p slots=all rows={rows} K={k} m={m} \
+                         slab={slab} nan_gate={nan_gate} refused={refused} route_ok={route_ok} \
+                         planes_eq_two_launches={} \
+                         faults={f_want:?}/{f_got:?} replay_eq_eager={replay} act_fnv={:016x} {}",
+                        same(&want, &got),
+                        Fnv1a64::default().u32s(&got.0).value(),
+                        verdict(pass)
+                    );
+                    ok &= pass;
+                }
+            }
+            let pass = slabs == [false, true];
+            println!(
+                "gemm32 case=g32_swiglu_epi q8_0p_entries slab={slabs:?} wave={wave} {}",
                 verdict(pass)
             );
             Ok(ok && pass)
@@ -10225,6 +10533,7 @@ mod gate {
             ok &= nvfp4_dense_case(&dev)?;
             ok &= nvfp4_routed_case(&dev)?;
             ok &= nvfp4_swiglu_case(&dev)?;
+            ok &= swiglu_epi_case(&dev)?;
             ok &= nvfp4_native_case(&dev)?;
             ok &= nvfp4_gate_up_case(&dev)?;
             ok &= q5_0p_case(&dev)?;

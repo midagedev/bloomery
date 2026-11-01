@@ -453,6 +453,82 @@ mod gemm_kernels {
         );
     }
 
+    /// [`gemm_q4k`] as the up GEMM of a card route's SwiGLU pair, its
+    /// products never stored: the SwiGLU epilogue (`swiglu32.rs`) over the
+    /// gate GEMM's rows `gate` (slot-major `n_slots · rows` f32) into the
+    /// down GEMM's q8 blocks of 32 `oq`, `od`, `os` (a `GemmAct32` of K =
+    /// `rows`, `oblocks` blocks and `osteps` steps a column, column = slot),
+    /// each slot's column the bytes and faults `swiglu_quant32_sel` gives it
+    /// from the stored `u` with `sel` and `n_card`. Every slot's place is
+    /// checked before the table's walk: a place in `[n_card, HOST)` raises
+    /// `ExpertId` even if the route omits it. A refused slot on a card place
+    /// gets the quantizer's refused blocks; a host slot is not touched.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            w.len() >= n_experts * rows * 36 * n_sb,
+            q6.len() >= act_cols * 128 * half_it,
+            s8.len() >= act_cols * 8 * n_sb,
+            d8.len() >= act_cols * 2 * n_sb,
+            cols.len() >= n_slots,
+            tiles.len() >= 2 * max_tiles,
+            n_tiles.len() >= 2,
+            gate.len() >= n_slots * rows,
+            sel.len() >= n_slots,
+            oblocks >= 1,
+            rows == 32 * oblocks,
+            2 * osteps >= oblocks,
+            oq.len() >= n_slots * 16 * osteps,
+            od.len() >= n_slots * 2 * osteps,
+            os.len() >= n_slots * 2 * osteps
+        )
+    )]
+    pub fn gemm_q4k_swiglu(
+        w: &[u32],
+        q6: &[u32],
+        s8: &[i32],
+        d8: &[f32],
+        cols: &[u32],
+        tiles: &[u32],
+        n_tiles: &[u32],
+        n_experts: u32,
+        rows: u32,
+        n_sb: u32,
+        half_it: u32,
+        act_cols: u32,
+        n_slots: u32,
+        max_tiles: u32,
+        slot_div: u32,
+        row_tiles: u32,
+        gate: &[f32],
+        sel: &[u32],
+        n_card: u32,
+        oblocks: u32,
+        osteps: u32,
+        mut oq: DisjointSlice<u32>,
+        mut od: DisjointSlice<f32>,
+        mut os: DisjointSlice<i32>,
+        fault: FaultSink,
+    ) {
+        swiglu32!(@places [gate, oblocks, osteps, oq, od, os, fault; card(sel, n_card)], n_slots);
+        gemm_block!(
+            dec: q4k_dec,
+            wst: wst_q4k(wt),
+            walk: split,
+            sb_units: Q4K_SB_WORDS,
+            params: (w, q6, s8, d8, cols, tiles, n_tiles, n_experts, rows, n_sb, half_it,
+                act_cols, n_slots, max_tiles, slot_div, row_tiles,
+                [swiglu(gate, oblocks, osteps, oq, od, os, fault; card(sel, n_card))]),
+        );
+    }
+
     /// [`gemm_q4k`] for a Q5_K stack: rows of `44 · n_sb` words.
     #[allow(
         clippy::too_many_arguments,

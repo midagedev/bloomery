@@ -49,6 +49,7 @@ use super::wide38::down_weight;
 use crate::card_leg::RouteW;
 use crate::gemm::{
     Gemm32Args, Gemm32Kernels, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmKernels, GemmRoute,
+    SwigluSlots,
 };
 use crate::host::node::{NodeFamily, NodeOpen};
 use crate::host::tier::{
@@ -460,27 +461,29 @@ impl BlockRoute38 {
                 sink,
             )?;
             gpu.enqueue_quantize_gemm(&x_w, m, &mut self.x, sink)?;
-            for (wt, y) in [(gate, &mut self.g), (up, &mut self.u)] {
-                self.gemm.enqueue_gemm(
-                    stream,
+            macro_rules! args {
+                ($w:expr, $y:expr) => {
                     GemmArgs {
                         ty: gate_up_ty,
-                        w: wt,
+                        w: $w,
                         rows_per_expert: geo::FF,
                         act: &self.x,
                         route: &self.routes[at],
                         input: GemmInput::Shared { top_k: n },
-                        y,
-                    },
-                )?;
+                        y: $y,
+                    }
+                };
             }
-            self.g32.enqueue_swiglu_quant32_sel(
+            self.gemm.enqueue_gemm(stream, args!(gate, &mut self.g))?;
+            self.gemm.enqueue_up_swiglu32(
+                &self.g32,
                 stream,
+                args!(up, &mut self.u),
                 &self.g,
-                &self.u,
-                &sel_w,
-                n_tier,
-                m * n,
+                SwigluSlots::Card {
+                    sel: &sel_w,
+                    n_card: n_tier,
+                },
                 &mut self.act,
                 sink,
             )?;

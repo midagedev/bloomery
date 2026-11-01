@@ -19,9 +19,10 @@
 # 595.84): the mix reads the normed streams as BF16 words, not F32 values.
 # PIN(2026-10-31): 252 -> 56 spill bytes, 64 -> 24 JIT local bytes (ptxas 13.3.73 sm_121a, GB10 driver 595.84):
 # the up-mix's passes split the warp's columns, so a mix step holds fewer stream values live.
+generate_ds41 hc_gated_up_mma_mix_4 56 24
+# PIN(2026-11-02): card_sum_join and card_sum_join_bf16: 0 spill and JIT local bytes measured on sm_121a, GB10 driver 595.84, ptxas 13.3.73.
 generate_ds41 card_sum_join 0 0
 generate_ds41 card_sum_join_bf16 0 0
-generate_ds41 hc_gated_up_mma_mix_4 56 24
 # PIN(2026-10-25): the HC up/mix entries that also write mixed's BF16 or MXFP8 form, spill and GB10 JIT local
 # measured with ptxas 13.3.73, driver 595.84, sm_121a.
 # PIN(2026-10-28): _bf16 348 -> 292 and _mxfp8 348 -> 276 spill bytes, both 88 -> 56 JIT local bytes (ptxas
@@ -235,6 +236,9 @@ generate_ds41 gemm_q3k 0 0
 generate_ds41 gemm_q3k_bf16 0 0
 generate_ds41 gemm_q4k 0 0
 generate_ds41 gemm_q4k_bf16 0 0
+# PIN(2026-11-01): gemm_q4k_swiglu 208 spill bytes, 64 JIT local bytes (ptxas 13.3.73 sm_121a, GB10 driver 595.84): the
+# SwiGLU epilogue holds a tile's cells across its quantizer rounds, as gemm_nvfp4p_swiglu does (64 -> 160).
+generate_ds41 gemm_q4k_swiglu 208 64
 generate_ds41 gemm_q5_0p 0 0
 generate_ds41 gemm_q5_0p_bf16 0 0
 generate_ds41 gemm_q5_1 0 0
@@ -251,6 +255,10 @@ generate_ds41 gemm_q8_0p 0 0
 generate_ds41 gemm_q8_0p_bf16 0 0
 generate_ds41 gemm_q8_0p_slab 0 0
 generate_ds41 gemm_q8_0p_slab_bf16 0 0
+# PIN(2026-11-01): gemm_q8_0p_slab_swiglu_all 8 spill bytes, 8 JIT local bytes (same scan and cause).
+generate_ds41 gemm_q8_0p_slab_swiglu_all 8 8
+# PIN(2026-11-02): gemm_q8_0p_swiglu_all: 0 spill and JIT local bytes measured on sm_121a, GB10 driver 595.84, ptxas 13.3.73.
+generate_ds41 gemm_q8_0p_swiglu_all 0 0
 generate_ds41 gemm_route 0 0
 generate_ds41 gemm_route_remap 0 0
 generate_ds41 gemm_swiglu_quant 0 0

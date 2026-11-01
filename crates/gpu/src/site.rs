@@ -80,7 +80,7 @@
 
 use crate::gemm::{
     Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmKernels,
-    GemmRoute, GemmWeight, MmaForm, ProductOut,
+    GemmRoute, GemmWeight, MmaForm, ProductOut, SwigluSlots,
 };
 use crate::kquant::{Act, SelDown};
 use crate::model::fit::{act_col_bytes, act32_col_bytes};
@@ -1432,15 +1432,32 @@ pub fn gemm(
     m: usize,
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
-    gemm_into(gpu, k, site, rows, x, table, m, y.into()).map(drop)
+    gemm_into(gpu, k, site, rows, x, table, m, SiteOut::Cells(y.into())).map(drop)
 }
 
-/// [`gemm`] into `y`'s cells. A BF16 `y` is stored by the product's BF16
-/// store, each cell the F32 product's rounded to nearest even: the K-quant
-/// grouped GEMM's, the 32-value GEMM's of Q8_0 and NVFP4 planes, and the
-/// dense MMA tile's (an MXFP8 site's W8A8 product and a BF16 site's product
-/// over its held BF16 form); false, with nothing launched, for a site whose
-/// product has no BF16 store. Always true for an F32 `y`.
+/// Where [`gemm_into`] writes a site's product: its cells, or, as a gated
+/// block's up, the SwiGLU of the gate GEMM's rows `g` and it in q8 blocks of
+/// 32 (`act`, every slot of the table): the up GEMM's SwiGLU epilogue where
+/// the site's type has one, else the up GEMM into the up rows' scratch `u`
+/// and the quantizer.
+enum SiteOut<'a> {
+    Cells(ProductOut<'a>),
+    Swiglu32 {
+        g: &'a DeviceBuffer<f32>,
+        u: &'a mut DeviceBuffer<f32>,
+        act: &'a mut GemmAct32,
+        fault: FaultSink,
+    },
+}
+
+/// [`gemm`] into `y` ([`SiteOut`]). A BF16 `y` is stored by the product's
+/// BF16 store, each cell the F32 product's rounded to nearest even: the
+/// K-quant grouped GEMM's, the 32-value GEMM's of Q8_0 and NVFP4 planes, and
+/// the dense MMA tile's (an MXFP8 site's W8A8 product and a BF16 site's
+/// product over its held BF16 form); a SwiGLU `y` by the up launcher of the
+/// K-quant grouped GEMM and the 32-value GEMM's of Q8_0 and NVFP4 planes;
+/// false, with nothing launched, for a site whose product has no such store.
+/// Always true for an F32 `y`.
 #[allow(
     clippy::too_many_arguments,
     reason = "one site's kernels, weight, rows, inputs, table, column rule, width and output (rust-quality R8)"
@@ -1453,14 +1470,24 @@ fn gemm_into(
     x: &WideIn<'_>,
     (route, input): (&GemmRoute, GemmInput),
     m: usize,
-    y: ProductOut<'_>,
+    y: SiteOut<'_>,
 ) -> Result<bool, GpuError> {
     const WHAT: &str = "site::gemm";
+    // `y`'s cells; a product with no SwiGLU store returns false, launching
+    // nothing, for a SwiGLU `y`.
+    macro_rules! cells {
+        ($y:expr) => {
+            match $y {
+                SiteOut::Cells(y) => y,
+                SiteOut::Swiglu32 { .. } => return Ok(false),
+            }
+        };
+    }
     // `y`'s F32 cells; a product with no BF16 store returns false, launching
     // nothing, for a BF16 `y`.
     macro_rules! f32_cells {
         ($y:expr) => {
-            match $y {
+            match cells!($y) {
                 ProductOut::F32(y) => y,
                 ProductOut::Bf16(_) => return Ok(false),
             }
@@ -1514,8 +1541,11 @@ fn gemm_into(
                 };
             }
             match y {
-                ProductOut::F32(y) => g32.enqueue_gemm32(stream, args!(y)),
-                ProductOut::Bf16(y) => g32.enqueue_gemm32_bf16(stream, args!(y)),
+                SiteOut::Cells(ProductOut::F32(y)) => g32.enqueue_gemm32(stream, args!(y)),
+                SiteOut::Cells(ProductOut::Bf16(y)) => g32.enqueue_gemm32_bf16(stream, args!(y)),
+                SiteOut::Swiglu32 { g, u, act, fault } => {
+                    g32.enqueue_up_swiglu32(stream, args!(u), g, SwigluSlots::All, act, fault)
+                }
             }
         }
         SiteTy::Q3K | SiteTy::Q4K | SiteTy::Q5K | SiteTy::Q6K | SiteTy::Iq4Xs => {
@@ -1540,8 +1570,20 @@ fn gemm_into(
                 };
             }
             match y {
-                ProductOut::F32(y) => k.gemm.enqueue_gemm(stream, args!(y)),
-                ProductOut::Bf16(y) => k.gemm.enqueue_gemm_bf16(stream, args!(y)),
+                SiteOut::Cells(ProductOut::F32(y)) => k.gemm.enqueue_gemm(stream, args!(y)),
+                SiteOut::Cells(ProductOut::Bf16(y)) => k.gemm.enqueue_gemm_bf16(stream, args!(y)),
+                SiteOut::Swiglu32 { g, u, act, fault } => k.gemm.enqueue_up_swiglu32(
+                    k.g32(
+                        WHAT,
+                        "the 32-value kernels a SwiGLU into q8 blocks of 32 runs on (this load holds none)",
+                    )?,
+                    stream,
+                    args!(u),
+                    g,
+                    SwigluSlots::All,
+                    act,
+                    fault,
+                ),
             }
         }
         SiteTy::Q8_0 | SiteTy::F32 | SiteTy::Mxfp8 | SiteTy::Fp8B128 | SiteTy::Bf16 => {
@@ -1572,8 +1614,20 @@ fn gemm_into(
                             };
                         }
                         match y {
-                            ProductOut::F32(y) => g32()?.enqueue_gemm32(stream, args!(y)),
-                            ProductOut::Bf16(y) => g32()?.enqueue_gemm32_bf16(stream, args!(y)),
+                            SiteOut::Cells(ProductOut::F32(y)) => {
+                                g32()?.enqueue_gemm32(stream, args!(y))
+                            }
+                            SiteOut::Cells(ProductOut::Bf16(y)) => {
+                                g32()?.enqueue_gemm32_bf16(stream, args!(y))
+                            }
+                            SiteOut::Swiglu32 { g, u, act, fault } => g32()?.enqueue_up_swiglu32(
+                                stream,
+                                args!(u),
+                                g,
+                                SwigluSlots::All,
+                                act,
+                                fault,
+                            ),
                         }
                     }
                     Planes::F32(t) => {
@@ -1581,7 +1635,7 @@ fn gemm_into(
                     }
                     Planes::E4m3(t) if gpu.q8f32().dense_mma => match (x.q32, f32_rows()?) {
                         (Some(act), rows) if crate::gemm::mxfp8_w8a8_reads(&t, act, rows, m) => {
-                            g32()?.enqueue_mxfp8_w8a8(stream, t, rows, act, m, y)
+                            g32()?.enqueue_mxfp8_w8a8(stream, t, rows, act, m, cells!(y))
                         }
                         (_, rows) => g32()?.enqueue_e4m3_mma(stream, t, rows, m, f32_cells!(y)),
                     },
@@ -1592,7 +1646,7 @@ fn gemm_into(
                         (Some(act), rows)
                             if gpu.q8f32().dense_mma && act.holds(MmaForm::Bf16, rows, m) =>
                         {
-                            g32()?.enqueue_bf16_mma_cols(stream, t, rows, act, m, y)
+                            g32()?.enqueue_bf16_mma_cols(stream, t, rows, act, m, cells!(y))
                         }
                         (_, rows) => {
                             gpu.q8f32()
@@ -1819,7 +1873,7 @@ fn wide_by_name(
 ) -> Result<bool, GpuError> {
     let ty = resident_type(w, "site::resident_gemm", src.name())?;
     let table = (route, GemmInput::PerSlot);
-    gemm_into(gpu, k, (ty, w, src), rows, x, table, m, y)
+    gemm_into(gpu, k, (ty, w, src), rows, x, table, m, SiteOut::Cells(y))
 }
 
 /// Whether a site of type `ty` copies its input's `form` on the dense MMA
@@ -2063,9 +2117,11 @@ pub struct GatedIo<'a> {
 /// over those `n_slots` columns into `io.y`. On a one-expert table
 /// `n_slots == m`; on an expert table it is the slots of the `m` columns.
 /// The launches are those of the sites' types ([`gemm`] and the SwiGLU's
-/// quantizer into the down's form); a form a site reads that `io` lacks is
-/// refused by name, and words a site cannot launch ([`SiteWeight`]) before
-/// the first launch.
+/// quantizer into the down's form); a down that reads the plain SwiGLU's q8
+/// blocks of 32 takes them from the up GEMM's SwiGLU epilogue where the up's
+/// type has one (`swiglu32.rs`), the same bytes, `io.up` then left
+/// unwritten. A form a site reads that `io` lacks is refused by name, and
+/// words a site cannot launch ([`SiteWeight`]) before the first launch.
 pub fn gated(
     gpu: &Gpu,
     k: &WideKernels<'_>,
@@ -2084,8 +2140,26 @@ pub fn gated(
     } = io;
     let table = (blk.route, blk.input);
     gemm(gpu, k, blk.at(blk.gate), blk.ff, x, table, m, gate)?;
-    gemm(gpu, k, blk.at(blk.up), blk.ff, x, table, m, up)?;
-    swiglu(gpu, k, blk, (&*gate, &*up), n_slots, &mut rows, fault)?;
+    // A down that reads the plain SwiGLU's q8 blocks of 32 takes them from the
+    // up GEMM's SwiGLU epilogue where the up's type has one.
+    let plain32 =
+        swiglu_launch((blk.down.0, blk.down.1.name()), blk.rule)? == SwigluLaunch::Q32Plain;
+    let fused = match rows.q32.as_deref_mut() {
+        Some(act) if plain32 => {
+            let y = SiteOut::Swiglu32 {
+                g: &*gate,
+                u: &mut *up,
+                act,
+                fault,
+            };
+            gemm_into(gpu, k, blk.at(blk.up), blk.ff, x, table, m, y)?
+        }
+        _ => false,
+    };
+    if !fused {
+        gemm(gpu, k, blk.at(blk.up), blk.ff, x, table, m, up)?;
+        swiglu(gpu, k, blk, (&*gate, &*up), n_slots, &mut rows, fault)?;
+    }
     let h = WideIn {
         q128: rows.q128.as_deref(),
         q32: rows.q32.as_deref(),
