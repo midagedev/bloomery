@@ -92,8 +92,8 @@
 //!   the clause with the draft off; its drafted half runs on the drafted
 //!   arm's main server, after that server's drafted clauses;
 //! - under the draft (`--arm drafted`, that arm's main server): a greedy
-//!   `/completion` gives the ids of the same server's steps (the request
-//!   one token a request, reusing the prefix; a plain load places
+//!   `/completion` gives the ids of the same server's steps (one token a
+//!   request, reusing the prefix; a plain load places
 //!   more target experts on the card, so its ids are no reference) with its
 //!   draft counts carried
 //!   (a draft changes which passes run, never a token; the fixture tier
@@ -105,7 +105,8 @@
 //!   server holds (`continued`): each keeps the held prefix (`cache_n`), a
 //!   prompt call past it prints one `mtp prompt` record — the draft caught
 //!   up at the kept position, nothing skipped — and none prints a skip, and
-//!   each drafts, with those steps' ids (the generated ones); the prompt
+//!   each drafts, with that greedy run's ids, which the independent steps
+//!   check after the cache clauses; the prompt
 //!   resent keeps its end by a cut that rejoins the draft, after which the
 //!   extension drafts from its join, with the same prompt's ids fed fresh;
 //!   and a sampled `/completion` (temperature 0.8, a fixed seed) drafts, its
@@ -1338,7 +1339,9 @@ mod gate {
     /// (`cache_prompt`), and the draft joins them — the rows an earlier
     /// request left waiting walked, the token the new request puts at their
     /// last position — so it drafts from the first window, with
-    /// `reference`'s ids (the server's steps). Three joins: after a request
+    /// `reference`'s ids (the drafted server's greedy run, which
+    /// `drafted_ids_are_its_steps` checks against its independent steps).
+    /// Three joins: after a request
     /// fed fresh that ended on its first step (`n_predict` 1), extended by the id it generated: its prompt call is
     /// empty, the join is its first step's, and no `mtp prompt` record says
     /// it skipped; after drafted windows (the held sequence is at most 11
