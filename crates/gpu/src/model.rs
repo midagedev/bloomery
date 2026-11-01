@@ -50,6 +50,7 @@ use crate::host::run::{HostRun, HostWidths};
 use crate::host::swap::{BoundaryAt, MachineCfg, Residency};
 use crate::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap};
+use crate::parts::PartsRead;
 use crate::watchdog;
 use crate::weights::{CardOf, HEAD_TENSOR, Weights, head_tensor};
 use crate::{Gpu, GpuError, Graph, NodeInfo};
@@ -556,6 +557,8 @@ pub struct LoadTimes {
     pub body: Duration,
     /// The output head, when the card carries it.
     pub head: Duration,
+    /// What the upload's part source read, for a load of one.
+    pub parts: Option<PartsRead>,
 }
 
 /// One resident model on one card. Everything `step` touches is allocated at
@@ -2549,7 +2552,7 @@ pub enum CardBytes<'a> {
 pub trait PartsLoad: Send {
     /// Plan within offered host room, including pinned upload staging.
     fn host_bytes(&self, plan: &Plan<'_>, card: usize, room: u64) -> Result<u64, GpuError>;
-    /// Load within the checked peak returned by host_bytes.
+    /// Load within the checked peak returned by host_bytes, with what its parts read.
     fn load(
         &self,
         stream: &CudaStream,
@@ -2557,7 +2560,7 @@ pub trait PartsLoad: Send {
         card: usize,
         release: bool,
         room: u64,
-    ) -> Result<Weights, GpuError>;
+    ) -> Result<(Weights, PartsRead), GpuError>;
 
     /// Every tensor the source makes on the card, each whole in the card format `card` gives it
     /// and in its type's own where `card` gives none: the load of a model that sits wholly on
@@ -2669,23 +2672,25 @@ fn placed_pre(
         .grant(&reading, least)
         .map_err(|e| GpuError::plan(what, format!("{e}{}", plan.host.room_clause())))?;
     let walk = || HostResidency::at_load_with(file, plan, |_| true, host, extra, known);
-    let card_side = || -> Result<(Gpu, Weights, [Duration; 3]), GpuError> {
+    let card_side = || -> Result<(Gpu, Weights, [Duration; 3], Option<PartsRead>), GpuError> {
         let t = Instant::now();
         let gpu = Gpu::with_device(ordinal)?;
         let context = t.elapsed();
         let t = Instant::now();
-        let mut weights = match bytes {
-            CardBytes::File => {
-                Weights::load_placed(gpu.stream(), file, plan, card, host.card_dontneed)?
-            }
+        let (mut weights, read) = match bytes {
+            CardBytes::File => (
+                Weights::load_placed(gpu.stream(), file, plan, card, host.card_dontneed)?,
+                None,
+            ),
             CardBytes::Parts(parts) => {
-                parts.load(gpu.stream(), plan, card, host.card_dontneed, room)?
+                let (w, read) = parts.load(gpu.stream(), plan, card, host.card_dontneed, room)?;
+                (w, Some(read))
             }
         };
         let upload = t.elapsed();
         let t = Instant::now();
         derive(gpu.stream(), file, layers.clone(), &mut weights)?;
-        Ok((gpu, weights, [context, upload, t.elapsed()]))
+        Ok((gpu, weights, [context, upload, t.elapsed()], read))
     };
     // `extra` is experts of card segments the host set also reads in and may
     // lock: their pages lie inside the segments the upload releases, so a walk
@@ -2700,7 +2705,7 @@ fn placed_pre(
         let host = card.is_ok().then(walk);
         (card, host, t.elapsed())
     };
-    let (gpu, weights, [context, upload, derived]) = card_side?;
+    let (gpu, weights, [context, upload, derived], parts) = card_side?;
     let residency = host_side
         .ok_or_else(|| GpuError::shape(what, "the host set's walk did not run"))??
         .with_arena(grant);
@@ -2719,6 +2724,7 @@ fn placed_pre(
                 host_set,
                 body: Duration::ZERO,
                 head: Duration::ZERO,
+                parts,
             },
         },
         residency,

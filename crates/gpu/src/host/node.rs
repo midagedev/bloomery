@@ -463,6 +463,7 @@ impl NodeOpen {
                             workstation::host_available().map_err(|e| GpuError::plan(WHAT, e))?;
                         let room = load.host_bytes(plan, self.card, available)?;
                         load.load(gpu.stream(), plan, self.card, card_dontneed, room)?
+                            .0
                     }
                 };
                 let experts = (family.experts)(&gpu, file, &tensors, &w, &self)?;
