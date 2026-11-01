@@ -307,7 +307,7 @@ fn tap(c: &Conv<'_>, channel: usize, d: u32) -> Ev {
         return Ev::zero();
     }
     let ring_rows = c.delta.ring_rows as u32;
-    let slot = (c.pos + ring_rows - d) % ring_rows;
+    let slot = (c.pos - d) % ring_rows;
     Ev::exact(c.ring[slot as usize * c.ch + channel])
 }
 
