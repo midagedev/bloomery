@@ -64,11 +64,11 @@ section. NVMe is recommended: a load streams the file to the card, and V4.1 read
 Ornith-1.5-35B's `Q4_K_M` plans the same weight bytes as Qwen3.6-35B's (21,311,258,624 B at the allocator's granules, `--plan` on both files), so its GPU and host RAM cells are Qwen3.6's; the 0.55 GB its file holds beyond is the next-token layer, which the load does not read.
 Sage-A1.5's `Q4_K_M` plans the same weight bytes as Qwen3.6-35B's too (21,311,258,624 B, `--plan` on both files). It passes the `qwen3` serve gate, and it answers with thinking on and off, calls tools on `/v1/chat/completions` and reads an image through its `mmproj`. `BLOOMERY_DRAFT=mtp` drafts its next-token layer on a whole-card load of one sequence; a media load, a placed load and `--parallel` above 1 refuse it by name.
 
-**The NVMe expert tier** (Qwen3.8, GLM-5.3, V4.1): when the host RAM cannot hold the experts the plan leaves on the
+**The NVMe expert tier** (Qwen3.8, GLM-5.3, V4.1, MiniMax-M3, Muse Spark, Solar-Open2, Flint and the Nemotron-H MoE models): when the host RAM cannot hold the experts the plan leaves on the
 host, the plan pages the overflow through a RAM arena filled from the model file on NVMe. The tokens equal the
 all-RAM load's where the host computes the arena's experts; where GLM-5.3's card computes them at decode, they can
 part from it ([Serving](serving.md)). The plan line and the
-`nvtier` record name the arena and the paged bytes. The limits of a paged load are in [Serving](serving.md#the-seats).
+`nvtier` record name the arena and the paged bytes. The limits of a paged load are in [Serving](serving.md#54-when-the-host-cannot-hold-the-experts-either).
 
 Qwen3.8's 28.8 GB PLE table is read from host RAM whatever the cards, so no number of cards holds the whole
 file. Qwen3.8's `UD-Q3_K_XL` (90.0 GB) runs: its IQ3_XXS, IQ4_XS and IQ4_NL expert stacks are on the card, and the
@@ -85,10 +85,9 @@ channels, 256 GB of RAM, an RTX A6000 48 GB, and an RTX 3090 24 GB beside it for
 by device, not by name; a list word such as `0+1` names cards by CUDA index (`CUDA_DEVICE_ORDER=PCI_BUS_ID`
 matches `nvidia-smi`'s numbering; the qwen38 seat takes `a`, `gate` or `bp` only).
 
-A DGX Spark (GB10, aarch64, sm_121) is a contributor's port ([`contrib/dgx-spark.md`](contrib/dgx-spark.md)): the
-plan treats its unified memory as one pool, and the recipes build `sm_121a` on it unless `BLOOMERY_ARCH` names another
-arch. It installs the release's GB10 archive where the release carries one, or builds from source (the README's
-[Install](../README.md#dgx-spark-and-other-gb10-machines)).
+A DGX Spark (GB10, aarch64) installs the release's GB10 archive (`sm_121a`), and the plan treats its unified memory
+as one pool. Serving on a Spark, Qwen3.8's checkpoint folders and the memory each start takes:
+[`dgx-spark.md`](dgx-spark.md). Building and porting work: [`contrib/dgx-spark.md`](contrib/dgx-spark.md).
 
 The machines that have run it are in the README's [Hardware](../README.md#hardware) section; an RTX 3060 12 GB under
 WSL2 ran Clef-Flash, its download and its cache. Other cards and drivers are untested: please open an issue with

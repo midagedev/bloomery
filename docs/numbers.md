@@ -86,8 +86,8 @@ defaults.
 Measured by [@juliankang4](https://github.com/juliankang4) on one DGX Spark at 0.3.10: `nvidia/Qwen3.8-Flash-Next-FP4-Local`
 and NVIDIA's NVFP4 folder as downloaded, the MTP draft from Unsloth's `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`, 128
 tokens, greedy, `cache_prompt` off, median of three rounds. Decode is 1000 / TPOT; prefill is prompt tokens / TTFT.
-Two and four requests at once on the FP4-Local folder, and the slots and context each folder's plan holds, are in
-[`contrib/dgx-spark.md`](contrib/dgx-spark.md#23-qwen38-on-one-spark-slots-mtp-and-memory), section 2.3.
+Two and four requests at once on the FP4-Local folder, and the slots and context each folder's plan held, are in the
+two sections after this one; the current numbers are in [`dgx-spark.md`](dgx-spark.md).
 
 | Prompt | Text | Decode, draft off | Decode, MTP on | First token, off / on | Prefill, draft off |
 |---|---|---|---|---|---|
@@ -95,6 +95,76 @@ Two and four requests at once on the FP4-Local folder, and the slots and context
 | 4K, FP4-Local | English prose | 29.8 | 39.9 | 2,078 / 2,078 ms | 1,971 |
 | 4K, NVFP4 | code | 22.7 | 47.9 | 2,112 / 2,215 ms | 1,939 |
 | 4K, NVFP4 | English prose | 22.7 | 33.4 | 2,068 / 2,192 ms | 1,981 |
+| 4K, `UD-Q4_K_XL` | code | not run | 50.0 | not run / 2.80 s | not run |
+| 4K, `UD-Q4_K_XL` | English prose | not run | 35.2 | not run / 2.75 s | not run |
+
+## DGX Spark, Qwen3.8-Flash-Next FP4-Local folder, one to four requests at once (`cb8d92eb`)
+
+Measured by [@juliankang4](https://github.com/juliankang4) at main `cb8d92eb` on DGX Sparks (GB10, driver 595.84, CUDA
+13.3 build, `sm_121a`), SM clock 2,424 to 2,476 MHz just after each server's requests. The MTP draft was the shared Q8_0
+draft `unsloth/Qwen3.8-Flash-Next-GGUF` publishes, `MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` (revision
+`766911a6`), set by `BLOOMERY_MTP_DRAFT`. The servers, one per request count:
+
+```sh
+# drafting off
+BLOOMERY_DRAFT=off BLOOMERY_HOST_ROOM=100G \
+  target/release/bloomery-serve -m <FP4-Local folder> --parallel 1 --ctx-size 33024
+# MTP on (BLOOMERY_MTP_WIDTH is unset, which is `cost`)
+BLOOMERY_DRAFT=mtp BLOOMERY_MTP_DRAFT=<draft>/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
+  target/release/bloomery-serve -m <FP4-Local folder> --parallel 1 --ctx-size 33024
+# two and four requests at once: --parallel 2 --ctx-size 16896, --parallel 4 --ctx-size 17408
+```
+
+The load held 78.4 to 79.2 GB on the card and took 44 to 52 s from the local NVMe drive. Each request went to
+`/v1/completions` with 4,096 token ids from a code corpus (`code-fn`) or an English prose corpus (`prose-en`),
+`max_tokens` 128, streaming with usage, `temperature` 0, `top_k` 1 and `cache_prompt` false; no two requests shared a
+prompt. Decode is the median over requests of 1000 / TPOT (ms), prefill the median of prompt tokens / TTFT, TTFT p50
+the nearest-rank median. Total is the tokens generated after each request's first token, over the time from the
+phase's first first token to its last token. Each value is the median of three rounds. Drafting off ran with
+`BLOOMERY_HOST_ROOM=100G` (at that commit the load was refused by 0.6 GB without it; since
+[#870](https://github.com/midagedev/bloomery/pull/870) the load reads fewer parts at once instead). The same
+drafting-off servers on two Sparks agreed within 1.5 % in every cell. tok/s unless named:
+
+| One request, 4,096-id prompt | Decode, off | Decode, MTP | TTFT p50 ms, off | TTFT p50 ms, MTP | Prefill, off | Prefill, MTP |
+|---|---:|---:|---:|---:|---:|---:|
+| `code-fn` | 30.4 | 55.7 | 1,916 | 2,003 | 2,135 | 2,045 |
+| `prose-en` | 30.1 | 39.1 | 1,881 | 1,967 | 2,176 | 2,082 |
+
+| Requests at once, 4,096-id prompts | Total, off | Total, MTP | Decode a request, off | Decode a request, MTP | TTFT p50 ms, off | TTFT p50 ms, MTP |
+|---|---:|---:|---:|---:|---:|---:|
+| 2, `code-fn` | 30.2 | 34.5 | 21.0 | 23.8 | 1,940 | 2,025 |
+| 2, `prose-en` | 30.7 | 31.7 | 21.1 | 21.1 | 1,863 | 1,928 |
+| 4, `code-fn` | 35.8 | 37.8 | 12.3 | 11.8 | 3,831 | 2,002 |
+| 4, `prose-en` | 36.6 | 36.4 | 12.6 | 11.5 | 3,763 | 1,948 |
+
+With MTP on and one request, a verify pass proposed 2.18 draft tokens on average and kept 58 % of them. The greedy
+answers with MTP on and off were the same, character for character, in all 205 requests compared.
+
+## DGX Spark, the slots and memory of Qwen3.8's folders (`--plan` at `0305ba7a`)
+
+`bloomery-serve --plan` at main `0305ba7a` on one Spark (GB10, driver 595.84, `sm_121a`) with 115.5 to 116.6 GiB
+`MemAvailable` before each plan. Need is the `need` record's bytes. The MTP draft stayed on in every row that did not
+set `BLOOMERY_DRAFT=off`. The current table is in [`dgx-spark.md`](dgx-spark.md#4-requests-at-once-context-and-memory).
+
+| Settings beside `-m <folder>` | FP4-Local: slots × context | FP4-Local: need | NVFP4: slots × context | NVFP4: need |
+|---|---|---:|---|---:|
+| none | 1 × 262,144 | 90.5 GB | 1 × 262,144 | 94.0 GB |
+| `--parallel 2` | 2 × 262,144 | 98.7 GB | 2 × 262,144 | 102.3 GB |
+| `--parallel 4` | 4 × 225,280 | 113.2 GB | 4 × 167,936 | 113.3 GB |
+| `--parallel auto --slot-ctx 131072` | 4 × 131,072 | 107.4 GB | 4 × 131,072 | 110.9 GB |
+| `--parallel auto --slot-ctx 65536` | 8 × 65,536 | 111.6 GB | 7 × 65,536 | 111.4 GB |
+| `--parallel auto --slot-ctx 32768` | 8 × 32,768 | 98.3 GB | 8 × 32,768 | 101.9 GB |
+| `BLOOMERY_DRAFT=off` | 1 × 262,144 | 88.5 GB | 1 × 262,144 | 90.9 GB |
+| `BLOOMERY_DRAFT=off --parallel 4` | 4 × 262,144 | 112.4 GB | 4 × 233,472 | 113.4 GB |
+
+## RTX 5090, Qwen3.6-35B-A3B whole on the card (0.3.10, by @juliankang4)
+
+Measured by [@juliankang4](https://github.com/juliankang4) at 0.3.10 on native Linux with 126 GB of RAM, one request
+at a time at the serving defaults, greedy, 128 tokens, median of three rounds.
+
+| Model | ~4K prompt: prefill tok/s, first token | Decode after it |
+|---|---|---|
+| Qwen3.6-35B-A3B `Q4_K_M`, whole on the card | 14,249, 287 ms code; 14,298, 286 ms prose | 344.1 code, 344.2 prose |
 
 ## Contributors' cards: RTX 5090, DGX Spark (0.3.0, by @juliankang4)
 

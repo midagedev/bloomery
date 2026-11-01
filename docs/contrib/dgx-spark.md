@@ -1,14 +1,15 @@
 # Porting bloomery to the NVIDIA DGX Spark
 
 This is the map for a contributor who owns a DGX Spark (GB10: an Arm CPU and a Blackwell GPU on one unified memory) and
-wants to build, run or extend bloomery on it. It says where the port stands, how to build and run a model on a Spark
-today, what was measured there, and which work is left and whose it is. The work is cut into phases P0 to P5
+wants to build or extend bloomery on it. It says where the port stands, how to build on a Spark, what was measured
+there, and which work is left and whose it is. To install the release and serve a model on a Spark, read
+[`../dgx-spark.md`](../dgx-spark.md) instead. The work is cut into phases P0 to P5
 (section 1). P0, P2 and P3 are done, P1 is not finished, and P4 and P5 are partly in.
 
-Today a Spark builds the tree from source for `sm_121a`, the target whose NVFP4 and FP4-Local prompt products run on
-the FP4 tensor cores (section 2.1). It runs a model that fits its memory whole on the card, NVIDIA's Qwen3.8 NVFP4 and
-FP4-Local checkpoint folders as downloaded among them; section 2.3 gives the commands for both on one Spark, the slots,
-context, MTP draft and memory each start takes, and FP4-Local's measured decode, prefill and first-token numbers. It
+Today a Spark installs the release's GB10 archive or builds the tree from source for `sm_121a`, the target whose
+NVFP4 and FP4-Local prompt products run on the FP4 tensor cores (section 2.1). It runs a model that fits its memory
+whole on the card, NVIDIA's Qwen3.8 NVFP4 and FP4-Local checkpoint folders as downloaded among them
+([`../dgx-spark.md`](../dgx-spark.md) gives the commands, the slots, context, draft and memory, and the speed). It
 runs the fixture-tier gates (the gates that run on small generated model files, section 4) in local mode, which runs a
 gate recipe on your own machine. What a Spark's memory and card change, and what was measured on them, is in sections
 3, 5, 6 and 7.
@@ -41,7 +42,7 @@ budget solver.
 | **P0** compiles on aarch64 | `cargo check` of the host chain passes on aarch64 Linux, then `cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe` on the Spark; on x86 nothing moved: `just ptx-scan` equal and `gate-qdot`, `gate-ops` green | done: [#14](https://github.com/midagedev/bloomery/pull/14), `d95c7ec9` (design R: `qdot` refuses its host-tier types off x86, answer 1) | nothing (the site map is Appendix A) |
 | **P1** fixture gates pass | the host gates whose inputs are in process or published, and the three fixture families' gates, are green or each red is a named, Arm-only clause; a first bit-gate pass on cc 12.1 | not done. In: design S of `qdot`, its scalar mirrors ([#15](https://github.com/midagedev/bloomery/pull/15), `021dab61`), local mode ([#38](https://github.com/midagedev/bloomery/pull/38)), timing mode ([#39](https://github.com/midagedev/bloomery/pull/39)), names for the Arm-only reds ([#43](https://github.com/midagedev/bloomery/pull/43)), the Arm memory-order audit ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6118769122)), `gate-engram`'s eviction clause (`86022f32`, answer 18). The contributor list on `697790c4`: 29 of 93 items green ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)); on `b289130a`, 30 of 98, and the contributor judged the host-tier protocol part closed ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6135340457)) | the V4.1 DSpark draft fixture, still unpublished (only a draft reader refuses, [#159](https://github.com/midagedev/bloomery/pull/159)). `glm5next/corpus-prose.ids`, `engram/corpus-prose.ids` and `fx_ref_glm5next_vis_taps` are on the refset dataset since 2026-10-14 ([#53](https://github.com/midagedev/bloomery/issues/53#issuecomment-6168041480)). The first cc 12.1 pass is section 6 |
 | **P2** a real model runs | Clef-Flash, Qwen3-30B-A3B and Qwen3.6-35B-A3B answer from `bloomery-serve` on the Spark with a clean plan and `PoolOver` holding; a placement unit gate holds Σ card + host ≤ pool | done: [#16](https://github.com/midagedev/bloomery/pull/16), `7507942c` (section 7). The Spark run's rows are the Spark's P2 tape ([#16](https://github.com/midagedev/bloomery/pull/16#issuecomment-6103154837)) | nothing |
-| **P3** Spark-specific speed | the section 5 term measured; a Spark table with its own ruler; `BLOOMERY_ARCH=sm_121` rows | done: the term ([#17](https://github.com/midagedev/bloomery/issues/17#issuecomment-6104914439)), the table ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6107847345)), the row prefetch ([#27](https://github.com/midagedev/bloomery/pull/27), `fed530d2`), the router top-k ([#35](https://github.com/midagedev/bloomery/pull/35), `81355f2f`), `sm_121` ([#42](https://github.com/midagedev/bloomery/issues/42)), ~~`crates/threads` P/E split~~ (not needed: no decode or prefill step on the default path uses the pool, [#41](https://github.com/midagedev/bloomery/issues/41)), the cc 12.1 `ptx-shapes` tables and the cc 12.x occupancy column (section 6). Since then: GB10 recipes build `sm_121a` by default ([#758](https://github.com/midagedev/bloomery/pull/758)), where routed NVFP4 and FP4-Local prompt products run W4A4 on the FP4 tensor cores ([#687](https://github.com/midagedev/bloomery/pull/687)) and MXFP8 prompt sites W8A8 ([#769](https://github.com/midagedev/bloomery/pull/769)); Qwen3.8's NVFP4 and FP4-Local folders serve as downloaded ([#635](https://github.com/midagedev/bloomery/pull/635), [#543](https://github.com/midagedev/bloomery/pull/543); section 2.3) | nothing |
+| **P3** Spark-specific speed | the section 5 term measured; a Spark table with its own ruler; `BLOOMERY_ARCH=sm_121` rows | done: the term ([#17](https://github.com/midagedev/bloomery/issues/17#issuecomment-6104914439)), the table ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6107847345)), the row prefetch ([#27](https://github.com/midagedev/bloomery/pull/27), `fed530d2`), the router top-k ([#35](https://github.com/midagedev/bloomery/pull/35), `81355f2f`), `sm_121` ([#42](https://github.com/midagedev/bloomery/issues/42)), ~~`crates/threads` P/E split~~ (not needed: no decode or prefill step on the default path uses the pool, [#41](https://github.com/midagedev/bloomery/issues/41)), the cc 12.1 `ptx-shapes` tables and the cc 12.x occupancy column (section 6). Since then: GB10 recipes build `sm_121a` by default ([#758](https://github.com/midagedev/bloomery/pull/758)), where routed NVFP4 and FP4-Local prompt products run W4A4 on the FP4 tensor cores ([#687](https://github.com/midagedev/bloomery/pull/687)) and MXFP8 prompt sites W8A8 ([#769](https://github.com/midagedev/bloomery/pull/769)); Qwen3.8's NVFP4 and FP4-Local folders serve as downloaded ([#635](https://github.com/midagedev/bloomery/pull/635), [#543](https://github.com/midagedev/bloomery/pull/543); section 2.3); 0.3.11 ships the GB10 archive and the linux/arm64 Docker image ([#878](https://github.com/midagedev/bloomery/pull/878), [#883](https://github.com/midagedev/bloomery/pull/883)) | nothing |
 | **P4** above the pool | a model larger than the pool (V4.1, GLM-5.3-Flash `UD-Q4_K_XL`) answers on one Spark with its overflow on the NVMe tier, the card computing the tier's experts from their slots | read rates measured (section 8). S7 is in: the pinned arena behind `BLOOMERY_NVTIER_MEM`, `device_slot` and the `devmap` tests (section 8). GLM and V4.1 load at serving defaults on one Spark and answer ([#100](https://github.com/midagedev/bloomery/pull/100), section 8). The card leg is in: on a pinned arena a decode step's arena experts are computed on the card from their slots, for GLM-5.3-Flash and for the bodies that open through the common hosted hybrid (8.2) | an arena at serving defaults; V4.1 on the card leg, whose load attaches none yet (section 8) |
 | **P5** several Sparks (×2, ×4) | a model plans and runs across N linked Sparks under the section 9 criteria, N = 2 first; the placement unit gate `nodes_scale` holds the criteria at N = 1, 2, 3 and 4 | the fabric and the protocol probe ran on two Sparks ([#44](https://github.com/midagedev/bloomery/pull/44), `de57867c`; section 9.6). The placement half's node plans and `nodes_scale` run on synthetic Sparks ([#94](https://github.com/midagedev/bloomery/pull/94), [#95](https://github.com/midagedev/bloomery/pull/95); section 9.9); section 10 lists where the gate differs from 9.9's words. Node 1's tier server, the load's plan from node 1's census, and both ends of a lost node run as two processes on one Spark over the loopback interface (9.5, items 5 and 6) | the placement half's engine side (contributor, answer 20): section 10 lists what is left; the protocol half, on the plan the maintainer agreed to in [#127](https://github.com/midagedev/bloomery/issues/127#issuecomment-6155272828) (contributor): the `Link` seam, the counter relay (section 9.5, item 2) and the RDMA link on one machine (items 1, 3, 4 and 7) are in. Private IPv4 node binds connect independent RDMA ends (9.5, item 5), with no channel authentication. Tensor parallel for GLM-5.3-Flash: `--place tp` plans its checkpoint folder over N ranks, each in its own node's pool ([#519](https://github.com/midagedev/bloomery/pull/519)); a rank reads its parts from a GGUF file or a folder ([#618](https://github.com/midagedev/bloomery/pull/618)); the rank body and the head's merge run on one card with the parts carried over a loopback ([#589](https://github.com/midagedev/bloomery/pull/589)); the link's all-gather of row spans among N ranks is in ([#501](https://github.com/midagedev/bloomery/pull/501); 9.4). This map records no N = 2 engine rate. Left: the independent-capacity load adapter, and the ranks' step over the link between nodes, which `--place tp` refuses by name after rank 0's load (`crates/gpu-gates/src/bin/generate_glm5next.rs:519-525` at `c21e3b81`) |
 
@@ -55,8 +56,7 @@ the RDMA end and the all-gather), the tier server (9.5, items 5 and 6), and the 
 
 A Spark installs the release's GB10 archive or builds from source (2.1), plans its one card against the unified pool,
 and serves any model that fits that pool whole on the card. 2.1 is the build, 2.2 the first placement and the models in
-the order to try them, and 2.3 the run path, the slots, the MTP draft, the memory and the measured numbers for Qwen3.8's
-two checkpoint folders.
+the order to try them, and 2.3 the contributor's notes on Qwen3.8's two checkpoint folders.
 
 ### 2.1 Build
 
@@ -85,7 +85,7 @@ card is compute capability 12.0 (the RTX 50 series) builds `sm_120a`, and other 
 The release's GB10 archive (`bloomery-<version>-linux-aarch64-cuda-sm121a.tar.gz`) is this build, packed: `sm_121a`
 and the features above, `checkpoint` among them. Its kernels are compiled for the GB10 when it is built (`oxart_jit
 --cubin` in `tools/release/build.sh`), so a first start compiles nothing; their PTX stays in the binary for a driver
-that refuses the compiled code. It needs no toolchain: where a release carries it,
+that refuses the compiled code. It needs no toolchain: from 0.3.11 the release carries it, and
 `tools/release/install.sh` picks it on a GB10 and links `bloomery-serve` into `~/.local/bin`. `just release-build
 <version>` makes it on a GB10, run there with `BLOOMERY_BOX_LOCAL=1`.
 
@@ -107,125 +107,20 @@ allows. A 64 GB Spark (section 3; announced, not yet shipping) holds only the fi
 
 ### 2.3 Qwen3.8 on one Spark: slots, MTP and memory
 
-NVIDIA publishes Qwen3.8-Flash-Next in two checkpoint folders that a Spark serves as downloaded, with no conversion
-step: `nvidia/Qwen3.8-Flash-Next-NVFP4` (132.7 GB on disk) and `nvidia/Qwen3.8-Flash-Next-FP4-Local` (102.3 GB at
-revision `b9ce18a6`; NVFP4 experts with compressed block scales, MXFP8 and FP8 dense weights,
-[#543](https://github.com/midagedev/bloomery/pull/543)). `bloomery-serve -m <folder>` (the GB10 archive or a build
-with the `checkpoint` feature, 2.1) serves either, and the first run needs the folder alone:
+How to serve NVIDIA's two Qwen3.8 checkpoint folders on one Spark, which to pick, the slots, context and memory each
+start takes, the MTP draft and the measured speed are the user page [`../dgx-spark.md`](../dgx-spark.md). Earlier
+measurements are in [`numbers.md`](../numbers.md). What a contributor needs beside it:
 
-```sh
-target/release/bloomery-serve -m <FP4-Local folder>
-```
-
-On the Spark of the table below, that start serves one request at a time at the trained 262,144 positions, with the
-MTP draft on. This section says what a start chooses and what changes it: the folder, the slot count and its context,
-the draft and the memory. The speed measured on FP4-Local closes it.
-
-**The two folders.** On that 128 GB Spark the plan put all 24,576 routed experts of either folder on the GB10, in every
-row of the table. On a smaller card either folder's experts also sit on the host, which takes the share the card does
-not hold ([`serving.md`](../serving.md#the-seats)). Both read the PLE table from
-the folder on the NVMe tier. FP4-Local takes 3.5 GB less of the pool at one slot (the table below) and decoded faster at
-0.3.10 ([`numbers.md`](../numbers.md#dgx-spark-qwen38-flash-next-on-the-fp4-local-and-nvfp4-folders-0310)), so it is
-the folder to start with. On the `sm_121a` build the routed experts' prompt products run W4A4 and the MXFP8 sites W8A8
-(2.1). The KV cache is f16 for either folder and for a GGUF file alike unless `--cache-type-k q8_0` asks
-(`crates/gpu/src/kv_format.rs`): on the GB10 q8_0's prompt pass ran slower than f16's. With q8_0, K
-and V take 17/16 B a value against f16's 2, and the attention store is 773,279,360 B against 967,921,280 B at 16,896
-positions on FP4-Local (the index keys stay f16). `setup` names the format as `cache=` and what chose it as
-`cache_from=`. The NVFP4 folder's gate,
-`gate-gpu-qwen4exp-nvfp4`, runs only on a card that holds every expert: set `BLOOMERY_CARD_ALL_EXPERTS=1` there; a
-smaller card defers it by name. `BLOOMERY_TIER=fixture just gate-gpu-qwen4exp-nvfp4-cut` runs its clauses on a four-layer
-cut of each folder, which any card holds.
-
-**Slots and their context.** The server has one slot unless `--parallel N` asks for N. With no `--ctx-size`, each slot
-asks the trained 262,144 positions and, where the GB10's one memory pool cannot hold that plan, takes the largest
-context under it, a multiple of 1,024, whose plan holds, so each count in the table starts without a context flag.
-`--parallel auto` serves the most slots, up to 8, whose plan holds one request's context: `--slot-ctx S` when set, else
-the context one slot takes with no flags ([`serving.md`](../serving.md#the-seats), "Concurrent requests"). On either
-folder `--parallel auto --cache-type-k q8_0` serves 3 slots of 262,144 (107.0 GB on FP4-Local, 110.5 GB on NVFP4). The table is `bloomery-serve --plan`, which prints a
-start's records and exits before it loads anything ([`serving.md`](../serving.md#flags-by-seat)), at main `0305ba7a` on
-one Spark (GB10, driver 595.84, `sm_121a`) with 115.5 to 116.6 GiB `MemAvailable` before each plan. A folder's cache was
-q8_0 there, so the table holds with `--cache-type-k q8_0` added; the unset f16
-cache takes 11,520 B more a position a slot, 3.0 GB more for a slot of 262,144 [derived from the store sizes above]. The plan reads its
-room from `MemAvailable` (7.2), so a Spark with less free memory fits less: `--plan` with the same flags reads your own.
-Need is the `need` record's bytes, what the load takes of the pool: the GB10's share, the slots' checkpoints in pinned
-host memory and file pages. The prompt cache's budget (`--cache-ram`; by default 8 GiB, or half of what the plan leaves
-where that is less) comes on top of it.
-
-| Settings beside `-m <folder>` | FP4-Local: slots × context | FP4-Local: need | NVFP4: slots × context | NVFP4: need |
-|---|---|---:|---|---:|
-| none | 1 × 262,144 | 90.5 GB | 1 × 262,144 | 94.0 GB |
-| `--parallel 2` | 2 × 262,144 | 98.7 GB | 2 × 262,144 | 102.3 GB |
-| `--parallel 4` | 4 × 225,280 | 113.2 GB | 4 × 167,936 | 113.3 GB |
-| `--parallel auto --slot-ctx 131072` | 4 × 131,072 | 107.4 GB | 4 × 131,072 | 110.9 GB |
-| `--parallel auto --slot-ctx 65536` | 8 × 65,536 | 111.6 GB | 7 × 65,536 | 111.4 GB |
-| `--parallel auto --slot-ctx 32768` | 8 × 32,768 | 98.3 GB | 8 × 32,768 | 101.9 GB |
-| `BLOOMERY_DRAFT=off` | 1 × 262,144 | 88.5 GB | 1 × 262,144 | 90.9 GB |
-| `BLOOMERY_DRAFT=off --parallel 4` | 4 × 262,144 | 112.4 GB | 4 × 233,472 | 113.4 GB |
-
-Only automatically reduced contexts report `rule=fitted` with shortage details; `--slot-ctx` reports `rule=set`.
-The MTP draft stayed on in every row that did not set `BLOOMERY_DRAFT=off`, and no row printed a `draft yield`
-record. Read off the table [derived]: a slot of 262,144 positions takes 8.3 GB of the pool on either folder, 4.2 GB of
-it the slot's checkpoints; the draft takes 2.0 GB on FP4-Local and 3.1 GB on NVFP4 at one slot, and at four slots it
-costs each slot 36,864 positions on FP4-Local and 65,536 on NVFP4. What one, two and four requests at once decode on
-FP4-Local is the measurement at the end of this section. A smaller `-ub` frees card bytes for a context or a slot count
-the default does not fit, and runs long prompts slower ([`serving.md`](../serving.md#flags-by-seat)).
-
-**The MTP draft.** With `BLOOMERY_MTP_DRAFT` unset, a folder's MTP draft is the checkpoint's own MTP layer, loaded in
-its stored formats ([#682](https://github.com/midagedev/bloomery/pull/682); `draft_file`,
-`crates/refset/src/arch/qwen4exp/mtp.rs:33-38` at `0305ba7a`). An unset `BLOOMERY_DRAFT` drafts with it on any slot
-count, an image load (`--mmproj`) included, unless the load prints a `load draft=off` or `draft yield` record. The
-draft goes off under `--place gate`, with stores shorter than one window, on a plan that pages experts, on a folder
-without the MTP layer, and when its card bytes would leave a slot half the context positions of the plan without it or
-fewer. `BLOOMERY_DRAFT=mtp` keeps it on whatever the context, and `BLOOMERY_DRAFT=off` serves without it
-(`crates/gpu-gates/src/bin/shared/serve_seats/qwen38.rs:44-47,229-235,297,306-323` at `0305ba7a`). Before its address
-the server prints one `setup` line with the draft and where it reads it (or, when a rule turned it off, why), the
-slots, the context each serves and whether it was set, the target or fitted, and the settings that change them.
-
-**Speed on FP4-Local.** The measurement below named a separate draft file instead: the shared Q8_0 draft that
-`unsloth/Qwen3.8-Flash-Next-GGUF` publishes, `MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` (revision `766911a6`), set
-by `BLOOMERY_MTP_DRAFT`. These are the servers the numbers below came from, one server per request count:
-
-```sh
-# drafting off
-BLOOMERY_DRAFT=off BLOOMERY_HOST_ROOM=100G \
-  target/release/bloomery-serve -m <FP4-Local folder> --parallel 1 --ctx-size 33024
-# MTP on (BLOOMERY_MTP_WIDTH is unset, which is `cost`)
-BLOOMERY_DRAFT=mtp BLOOMERY_MTP_DRAFT=<draft>/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
-  target/release/bloomery-serve -m <FP4-Local folder> --parallel 1 --ctx-size 33024
-# two and four requests at once: --parallel 2 --ctx-size 16896, --parallel 4 --ctx-size 17408
-```
-
-The load holds 78.4 to 79.2 GB on the card, by the context and slot count, and takes 44 to 52 s from the local NVMe
-drive (the server's `load` line). The client sends each request to `/v1/completions` with `prompt` as 4,096 token ids
-from a code corpus (`code-fn`) or an English prose corpus (`prose-en`), `max_tokens` 128, streaming with usage,
-`temperature` 0, `top_k` 1 and `cache_prompt` false; no two requests share a prompt. Decode is the median over
-requests of 1000 / TPOT (ms), prefill the median of prompt tokens / TTFT, and TTFT p50 the nearest-rank median. Total is the tokens generated after
-each request's first token, over the time from the phase's first first token to its last token. Each value is the
-median of three rounds; a round sends eight requests of each corpus one at a time, then runs the two- and
-four-request phases.
-
-Measured at main `cb8d92eb` on DGX Sparks (GB10, driver 595.84, CUDA 13.3 build, `sm_121a`), SM clock 2,424 to 2,476
-MHz just after each server's requests. Drafting off ran on one Spark with `BLOOMERY_HOST_ROOM=100G`, which sets the
-host room the plan reads instead of `MemAvailable` (at that commit the drafting-off load at `--ctx-size 33024` was
-refused at its part read-ahead by 0.6 GB without it; since [#870](https://github.com/midagedev/bloomery/pull/870) the
-load reads fewer parts at once instead). MTP on ran on a second Spark of the same model with the room read from
-`MemAvailable`. The same drafting-off servers measured on two Sparks agreed within 1.5 % in every cell. tok/s
-unless named:
-
-| One request, 4,096-id prompt | Decode, off | Decode, MTP | TTFT p50 ms, off | TTFT p50 ms, MTP | Prefill, off | Prefill, MTP |
-|---|---:|---:|---:|---:|---:|---:|
-| `code-fn` | 30.4 | 55.7 | 1,916 | 2,003 | 2,135 | 2,045 |
-| `prose-en` | 30.1 | 39.1 | 1,881 | 1,967 | 2,176 | 2,082 |
-
-| Requests at once, 4,096-id prompts | Total, off | Total, MTP | Decode a request, off | Decode a request, MTP | TTFT p50 ms, off | TTFT p50 ms, MTP |
-|---|---:|---:|---:|---:|---:|---:|
-| 2, `code-fn` | 30.2 | 34.5 | 21.0 | 23.8 | 1,940 | 2,025 |
-| 2, `prose-en` | 30.7 | 31.7 | 21.1 | 21.1 | 1,863 | 1,928 |
-| 4, `code-fn` | 35.8 | 37.8 | 12.3 | 11.8 | 3,831 | 2,002 |
-| 4, `prose-en` | 36.6 | 36.4 | 12.6 | 11.5 | 3,763 | 1,948 |
-
-With MTP on and one request, a verify pass proposed 2.18 draft tokens on average and kept 58 % of them (both corpora).
-The greedy answers with MTP on and off were the same, character for character, in all 205 requests compared.
+- The NVFP4 folder's gate, `gate-gpu-qwen4exp-nvfp4`, runs only on a card that holds every expert: set
+  `BLOOMERY_CARD_ALL_EXPERTS=1` there; a smaller card defers it by name. `BLOOMERY_TIER=fixture just
+  gate-gpu-qwen4exp-nvfp4-cut` runs its clauses on a four-layer cut of each folder, which any card holds.
+- The KV cache is f16 for either folder and for a GGUF file alike unless `--cache-type-k q8_0` asks
+  (`crates/gpu/src/kv_format.rs`): on the GB10, q8_0's prompt pass ran slower than f16's. With q8_0, K and V take
+  17/16 B a value against f16's 2. At main `0305ba7a` the attention store was 773,279,360 B against 967,921,280 B at
+  16,896 positions on FP4-Local (the index keys stay f16). `setup` names the format as `cache=` and what chose it as
+  `cache_from=`.
+- The unset draft's rule is `crates/gpu-gates/src/generate.rs` `draft_yield`, which the qwen38 and glm seats both
+  call; the user-facing words are in [`../serving.md`](../serving.md#4-speculative-decoding).
 
 ## 3. The machine
 
@@ -578,7 +473,10 @@ the user gives (`BLOOMERY_CARD_BUDGET`) is planned as given, and a card with mem
 **No arena at serving defaults.** Those default plans give the tier no RAM arena (`arena=0 arena_slots=0` in the `plan`
 line). Their room is above half of the host leg's routed-expert bytes, and there the split dial (`nvme_arena_of`) pages
 the overflow through the file mapping instead. So the default load reads no slot, and S7's pinned arena and the card
-leg are not on its path. How a plan on one Spark gets an arena is in section 10.
+leg are not on its path. How a plan on one Spark gets an arena is in section 10. Since
+[#1041](https://github.com/midagedev/bloomery/pull/1041) the dial steps at half the host leg plus the cards' share of
+the pool, so on a unified card it no longer counts that share as host room; whether GLM's and V4.1's default plans on
+one Spark now get an arena has not been read again `[unverified]`.
 
 **Today, on a machine with PCIe.** The NVMe tier's RAM arena is one anonymous mapping carved into slots, filled by
 `O_DIRECT` reads and "lent to the host leg through the model side's `TierSlots` seam" (`crates/gpu/src/host/nvtier.rs:1-9`):
@@ -1475,7 +1373,8 @@ Each open item; the owner is named where one is agreed. An item that a measureme
   refuses, after [#159](https://github.com/midagedev/bloomery/pull/159), so `gate-gpu-ds41-step` opens without it.
 
 **P4.**
-- An arena at serving defaults. The default plans of GLM-5.3-Flash and V4.1 on one Spark have none (section 8). A
+- An arena at serving defaults. The default plans of GLM-5.3-Flash and V4.1 on one Spark had none (section 8), and
+  whether they have one since [#1041](https://github.com/midagedev/bloomery/pull/1041) is `[unverified]`. A
   given `BLOOMERY_NVTIER_BYTES` alone is refused there: the lowered card budget leaves the room just above the NVMe
   tier's floor, and the arena's least on GLM `UD-Q4_K_XL` is 23,867,015,168 B. (GLM with `BLOOMERY_NVTIER_BYTES=24G`,
   on this change merged with #120's head `905e7ac5` before either reached main: a room of 120,021,311,488 B against
@@ -1511,7 +1410,7 @@ Each open item; the owner is named where one is agreed. An item that a measureme
   plans' card terms use the generic workstation card constants, not the program's `machine_for_experts` constants.
 - GLM's hit rates are assumptions; V4.1's come from a replay (9.7).
 - S₁ has a first reading on one Spark (9.7), at `v0.3.0` serving defaults with the MTP draft on. For the FP4-Local
-  folder a 4,096-id prompt reads 2,135 and 2,176 tok/s with drafting off at `cb8d92eb` (2.3).
+  folder a 4,096-id prompt reads 2,135 and 2,176 tok/s with drafting off at `cb8d92eb` ([`numbers.md`](../numbers.md#dgx-spark-qwen38-flash-next-fp4-local-folder-one-to-four-requests-at-once-cb8d92eb)).
 - Tensor parallel's step across machines: GLM-5.3-Flash's ranks plan, load and run on one machine, and the step over
   the link between nodes, the NextN draft and a prompt batch on the ranks are not built (9.4).
 - The switch hop: no switched Spark was measured (9.6).
