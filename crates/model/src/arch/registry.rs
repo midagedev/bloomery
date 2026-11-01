@@ -232,6 +232,16 @@ pub static ROWS: &[ArchRow] = &[
         fixture: None,
     },
     ArchRow {
+        // No `Arch` variant, and no family rows: the program that names the file is Qwen3.5's, whose
+        // common rows have none for the normed NEOX head, so `coverage::check` lists it.
+        arch: None,
+        names: &["qwen3"],
+        read: Some(llama::spec::read_qwen3),
+        draft: None,
+        coverage: None,
+        fixture: None,
+    },
+    ArchRow {
         // No `Arch` variant: no program runs the file yet.
         arch: None,
         names: &["lfm3"],
@@ -453,6 +463,7 @@ mod tests {
             a if QWEN35_BODY.contains(&a) => qwen35moe::spec::read,
             "glm5next" | GLM5_NEXT_LLAMA_CPP => glm5next::spec::read,
             "llama" => llama::spec::read,
+            "qwen3" => llama::spec::read_qwen3,
             "lfm3" => lfm3::spec::read,
             "mimo2" => mimo2::spec::read,
             "minimax-m3" => minimaxm3::spec::read,

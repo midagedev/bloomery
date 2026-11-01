@@ -87,6 +87,7 @@ fn family_of(arch: Arch) -> Option<&'static dyn Adapter> {
         Arch::Deepseek41 | Arch::Deepseek4 => Some(&deepseek41::Row),
         Arch::Qwen35
         | Arch::Llama
+        | Arch::Qwen3
         | Arch::Lfm3
         | Arch::MiniMaxM3
         | Arch::Raon1
@@ -105,7 +106,7 @@ fn family_of(arch: Arch) -> Option<&'static dyn Adapter> {
 /// no adapter plans is never planned as a model.
 fn skip_of(arch: Arch) -> &'static str {
     match arch {
-        Arch::Qwen35 | Arch::Llama | Arch::Lfm3 => "dense trunk",
+        Arch::Qwen35 | Arch::Llama | Arch::Qwen3 | Arch::Lfm3 => "dense trunk",
         Arch::GemmaEmbedding2 => "no routed expert",
         Arch::Qwen3Moe
         | Arch::Qwen35Moe

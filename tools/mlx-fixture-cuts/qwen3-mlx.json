@@ -1,0 +1,31 @@
+{
+  "name": "qwen3-mlx",
+  "arch": "qwen3",
+  "source": "mlx-community/Qwen3-8B-4bit",
+  "rev": "545dc4251c05440727734bcd94334791f6ab0192",
+  "expect": {"tensors": 907, "data_bytes": 4607731712},
+  "layers": [0, 1, 2, 3],
+  "layer_prefix": "model.layers.",
+  "keep": [
+    "model.embed_tokens.weight",
+    "model.embed_tokens.scales",
+    "model.embed_tokens.biases",
+    "lm_head.weight",
+    "lm_head.scales",
+    "lm_head.biases",
+    "model.norm.weight"
+  ],
+  "drop": [],
+  "copy": [
+    "tokenizer.json",
+    "tokenizer_config.json"
+  ],
+  "widths": {},
+  "planes": [],
+  "config": {
+    "layer_count": "num_hidden_layers",
+    "widths": {},
+    "per_layer": [],
+    "layer_names": []
+  }
+}

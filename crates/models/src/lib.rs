@@ -105,6 +105,9 @@ pub enum Arch {
     /// A dense Llama: GQA layers with the pairwise (NORM) rope and a SwiGLU
     /// feed-forward block of `feed_forward_length`, on an untied head.
     Llama,
+    /// A dense Qwen3: GQA layers with per-head q/k norms, the NEOX rope and a
+    /// SwiGLU feed-forward block, on a head of its own or tied to the embedding.
+    Qwen3,
     /// LFM3: gated short-conv layers and GQA layers (sliding or full) in one trunk, a dense
     /// SwiGLU block in every layer, sandwich norms, a tied head.
     Lfm3,
@@ -135,6 +138,7 @@ impl Arch {
             Arch::Flint => "flint",
             Arch::MuseSpark => "muse-spark",
             Arch::Llama => "llama",
+            Arch::Qwen3 => "qwen3",
             Arch::Lfm3 => "lfm3",
         }
     }

@@ -1,6 +1,7 @@
 //! The llama reader's [`ModelSpec`]: the file's [`Hparams`] and tensor roles
-//! as the typed model description. Every layer is a GQA layer on the pairwise
-//! rope (dividing by the file's frequency factors when it carries them) with a
+//! as the typed model description. Every layer is a GQA layer on the rope of
+//! the file's family — Llama's pairwise, Qwen3's NEOX halves (dividing by the
+//! file's frequency factors when it carries them) — with a
 //! SwiGLU feed-forward block of `feed_forward_length`, on a plain residual; the
 //! per-head q/k norm is what a layer's tensors say, and nothing gates or selects
 //! the attention.
@@ -22,10 +23,38 @@ use crate::placement::{ModelTensors, PlacementError};
 /// string is the architecture of several model families, so the chat surface's
 /// parsers are the ones the file's template teaches (`chat_from_template`).
 pub fn read(split: &Split) -> Result<Read, PlacementError> {
-    let hp = Hparams::read(split)?;
+    read_family(split, Family::LLAMA)
+}
+
+/// [`read`] for a `qwen3` file: the same trunk at Qwen3's family facts.
+pub fn read_qwen3(split: &Split) -> Result<Read, PlacementError> {
+    read_family(split, Family::QWEN3)
+}
+
+/// One family of this reader: the description's architecture and the rope
+/// pairing that tells it apart — the two facts a `qwen3` file differs by.
+struct Family {
+    arch: Arch,
+    pairing: HpRopeMode,
+}
+
+impl Family {
+    const LLAMA: Family = Family {
+        arch: Arch::Llama,
+        pairing: HpRopeMode::Norm,
+    };
+    const QWEN3: Family = Family {
+        arch: Arch::Qwen3,
+        pairing: HpRopeMode::Neox,
+    };
+}
+
+/// The body of [`read`] and [`read_qwen3`], at `family`'s facts.
+fn read_family(split: &Split, family: Family) -> Result<Read, PlacementError> {
+    let hp = Hparams::read(split, family.pairing)?;
     let tensors = roles::classify(split, &hp)?;
     let chat = chat_from_template(split)?;
-    let spec = spec_of(&hp, &tensors, chat)?;
+    let spec = spec_of(family.arch, &hp, &tensors, chat)?;
     let mut defaults = hp.defaults;
     defaults.extend(spm_pre_default(split));
     Ok(Read {
@@ -35,9 +64,10 @@ pub fn read(split: &Split) -> Result<Read, PlacementError> {
     })
 }
 
-/// The description of the file `hp` and `tensors` were read from, with the
-/// chat surface `chat`.
+/// The description of the file `hp` and `tensors` were read from, of the
+/// architecture `arch`, with the chat surface `chat`.
 pub(crate) fn spec_of(
+    arch: Arch,
     hp: &Hparams,
     tensors: &ModelTensors,
     chat: ChatSpec,
@@ -46,6 +76,7 @@ pub(crate) fn spec_of(
     let rope = Rope {
         mode: match hp.rope.mode {
             HpRopeMode::Norm => RopeMode::NormTail,
+            HpRopeMode::Neox => RopeMode::Neox,
         },
         dims: spec_u32("rope.dimension_count", hp.rope.dims)?,
         base: hp.rope.base,
@@ -83,7 +114,7 @@ pub(crate) fn spec_of(
         })
         .collect::<Vec<_>>();
     Ok(ModelSpec {
-        arch: Arch::Llama,
+        arch,
         hidden: spec_u32("embedding_length", hp.n_embd)?,
         vocab: spec_u32("vocab", hp.n_vocab)?,
         ctx_train: spec_u32("context_length", hp.n_ctx_train)?,
@@ -264,6 +295,57 @@ mod tests {
             Some((Role::TokenEmbedding, None))
         );
         assert_eq!((read.tensors.experts, read.tensors.experts_used), (0, 0));
+    }
+
+    /// A `qwen3` file's description is the same trunk at Qwen3's family facts:
+    /// the NEOX rope, the per-head q/k norm every layer's tensors carry, and
+    /// the architecture named `qwen3`. A byte-level BPE file's pre-tokenizer is
+    /// no rewrite, and the registry reaches the reader by the architecture
+    /// string. Mutant: `read_qwen3` pairing Norm (the first assert).
+    #[test]
+    fn a_qwen3_description_is_the_same_trunk_on_the_neox_rope() {
+        let mut t = tensors();
+        for l in 0..LAYERS {
+            t.push((format!("blk.{l}.attn_q_norm.weight"), vec![D]));
+            t.push((format!("blk.{l}.attn_k_norm.weight"), vec![D]));
+        }
+        let global = vec![
+            ("tokenizer.ggml.model", V::Str("gpt2")),
+            ("tokenizer.ggml.pre", V::Str("qwen2")),
+            ("tokenizer.chat_template", V::Str("{{ messages }}")),
+        ];
+        let read = verdict(
+            "llama-spec-qwen3-shape",
+            "qwen3",
+            &keys(),
+            &global,
+            &t,
+            read_qwen3,
+        )
+        .expect("the header reads");
+        let s = &read.spec;
+        assert_eq!((s.arch, s.arch.name()), (Arch::Qwen3, "qwen3"));
+        assert!(read.defaults.is_empty(), "{:?}", read.defaults);
+        for layer in &s.layers {
+            let Mixer::Gqa(g) = &layer.mixer else {
+                panic!("a layer mixes with {:?}", layer.mixer);
+            };
+            assert_eq!(g.rope.mode, RopeMode::Neox);
+            assert_eq!(g.rope.base, 500_000.0);
+            assert!(g.qk_norm && !g.rope.factors);
+        }
+        // The registry's row reads the same file through the architecture string.
+        let path = header_shaped("llama-spec-qwen3-registry", "qwen3", &keys(), &global, &t);
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let through = spec(&split).map(|r| (r.spec.arch, r.spec.layers[0].mixer.clone()));
+        drop(split);
+        std::fs::remove_file(&path).expect("remove the synthetic header");
+        let (arch, mixer) = through.expect("the registry reads a qwen3 file");
+        assert_eq!(arch, Arch::Qwen3);
+        let Mixer::Gqa(g) = &mixer else {
+            panic!("a layer mixes with {mixer:?}");
+        };
+        assert_eq!((g.rope.mode, g.qk_norm), (RopeMode::Neox, true));
     }
 
     /// A template that writes the Qwen XML call markup and opens a `<think>`

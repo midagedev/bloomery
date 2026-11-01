@@ -1,6 +1,9 @@
 //! Every hyperparameter the dense Llama decode step reads, resolved once at
 //! load from the file's metadata, and a refusal for every value this chain
-//! does not run. This is the one reader of `llama.*` keys.
+//! does not run. This is the one reader of the `llama.*` keys and of the
+//! `qwen3.*` keys, which spell the same facts under their own architecture's
+//! name; the one difference between the two families, how the rope pairs a
+//! head's values, is the reader's `pairing` argument.
 //!
 //! A key ik reads as optional keeps ik's reading of its absence, and the
 //! reading is recorded in [`Hparams::defaults`] with the place ik sets it: the
@@ -50,13 +53,17 @@ pub struct Hparams {
     pub defaults: Vec<String>,
 }
 
-/// How the rope pairs a head's values.
+/// How the rope pairs a head's values: the one fact the two families of this
+/// reader differ by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RopeMode {
     /// Value `2i` rotates with value `2i + 1` — `LLAMA_ROPE_TYPE_NORM`, ik's
     /// rope type for this architecture (`llama_rope_type`, src/llama.cpp: the
     /// group of architectures that "use what we call a normal RoPE").
     Norm,
+    /// Value `i` rotates with value `i + dims / 2` — `LLAMA_ROPE_TYPE_NEOX`,
+    /// ik's rope type for `qwen3` (`llama_rope_type`, src/llama.cpp).
+    Neox,
 }
 
 /// The rope ik's graph applies to every layer's Q and K: `ggml_rope_ext` with
@@ -77,8 +84,9 @@ pub struct Rope {
 
 impl Hparams {
     /// Read the file's hyperparameters, refusing every value this chain does
-    /// not run. Load-time only.
-    pub fn read(split: &Split) -> Result<Hparams, PlacementError> {
+    /// not run, its rope pairing `pairing` — the family whose keys the file
+    /// carries. Load-time only.
+    pub fn read(split: &Split, pairing: RopeMode) -> Result<Hparams, PlacementError> {
         let mut defaults = Vec::new();
         let n_layer = positive(split, "block_count")?;
         let n_embd = positive(split, "embedding_length")?;
@@ -136,7 +144,7 @@ impl Hparams {
             n_head,
             n_head_kv,
             head_dim: key,
-            rope: Rope::read(split, key, &mut defaults)?,
+            rope: Rope::read(split, key, pairing, &mut defaults)?,
             rms_eps: finite_positive(split, "attention.layer_norm_rms_epsilon")?,
             n_vocab: n_vocab(split)?,
             n_ctx_train: positive(split, "context_length")?,
@@ -184,6 +192,7 @@ impl Rope {
     fn read(
         split: &Split,
         head_dim: usize,
+        pairing: RopeMode,
         defaults: &mut Vec<String>,
     ) -> Result<Rope, PlacementError> {
         let dims = match optional_usize(split, "rope.dimension_count")? {
@@ -213,7 +222,7 @@ impl Rope {
             }
         };
         Ok(Rope {
-            mode: RopeMode::Norm,
+            mode: pairing,
             base,
             dims,
             factors: rope_factors(split, dims)?,
@@ -265,9 +274,19 @@ mod tests {
 
     /// A header-only llama file of `kv` (a two-token vocabulary), read.
     fn read(tag: &str, kv: &[(&str, V)]) -> Result<Hparams, String> {
-        let path = header(&format!("llama-hparams-{tag}"), "llama", kv, &[]);
+        read_as(tag, "llama", RopeMode::Norm, kv)
+    }
+
+    /// [`read`] at architecture `arch` and rope pairing `pairing`.
+    fn read_as(
+        tag: &str,
+        arch: &'static str,
+        pairing: RopeMode,
+        kv: &[(&str, V)],
+    ) -> Result<Hparams, String> {
+        let path = header(&format!("llama-hparams-{tag}"), arch, kv, &[]);
         let split = Split::open(&path).map_err(|e| e.to_string())?;
-        let hp = Hparams::read(&split).map_err(|e| e.to_string());
+        let hp = Hparams::read(&split, pairing).map_err(|e| e.to_string());
         let _ = std::fs::remove_file(&path);
         hp
     }
@@ -311,6 +330,48 @@ mod tests {
             let got = read(&format!("spelled{i}"), &with(k, v)).expect(k);
             assert_eq!(got, hp, "{k} spelled out as this chain runs it");
         }
+    }
+
+    /// A qwen3 file spells the same facts under its own architecture's name and
+    /// reads with the NEOX pairing, everything else the llama reading's: the
+    /// 8B's counts, and no key taken from an absence. Mutant: the pairing
+    /// argument dropped (the mode is the family's, not the file's).
+    #[test]
+    fn a_qwen3_file_reads_the_same_keys_with_the_neox_pairing() {
+        let qwen3_8b = vec![
+            ("block_count", V::U32(36)),
+            ("context_length", V::U32(40_960)),
+            ("embedding_length", V::U32(4096)),
+            ("feed_forward_length", V::U32(12_288)),
+            ("attention.head_count", V::U32(32)),
+            ("attention.head_count_kv", V::U32(8)),
+            ("rope.freq_base", V::F32(1_000_000.0)),
+            ("attention.layer_norm_rms_epsilon", V::F32(1e-6)),
+            ("attention.key_length", V::U32(128)),
+            ("attention.value_length", V::U32(128)),
+            ("vocab_size", V::U32(151_936)),
+            ("rope.dimension_count", V::U32(128)),
+        ];
+        let hp =
+            read_as("qwen3-8b", "qwen3", RopeMode::Neox, &qwen3_8b).expect("the 8B's keys read");
+        assert_eq!(hp.rope.mode, RopeMode::Neox);
+        assert_eq!(
+            (
+                hp.n_layer,
+                hp.n_embd,
+                hp.n_ff,
+                hp.n_head,
+                hp.n_head_kv,
+                hp.head_dim
+            ),
+            (36, 4096, 12_288, 32, 8, 128)
+        );
+        assert_eq!(
+            (hp.rope.base, hp.rope.dims, hp.rope.factors),
+            (1_000_000.0, 128, false)
+        );
+        assert_eq!(hp.group(), 4);
+        assert!(hp.defaults.is_empty(), "{:?}", hp.defaults);
     }
 
     /// A key ik reads as optional and the file leaves out takes ik's reading,
