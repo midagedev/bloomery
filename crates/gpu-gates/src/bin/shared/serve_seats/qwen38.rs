@@ -185,8 +185,11 @@
 //! leaves its waiting rows where its draft reads them,
 //! `Body38::enqueue_slots`). On a load that drafts nothing every request steps, and the
 //! round of the busy slots' steps runs as one pass of their rows (`GpuModel::step_slots`,
-//! each row bit for bit its step alone). A lookup load runs its rounds a
-//! select and a call a row. The
+//! each row bit for bit its step alone). A lookup load runs its rounds as
+//! one pass too: every busy slot's lookup window verified together
+//! (`rounds::pass_rows_lookup`, two rows a slot) and its plain rounds as
+//! one pass of their rows, each slot's context told of its row
+//! (`rounds::step_rows_lookup`). The
 //! sequences are switched by pointer exchange, and one draft is held a
 //! resident slot — its host state never moved, its device side parking
 //! with the sequence on every switch — so each request's tokens are its
@@ -500,7 +503,7 @@ use serve::{
 };
 use tokenizer::Tokenizer;
 
-use super::drafted::{ParkedDraft, SlotDrafts, lookup_props};
+use super::drafted::{LOOKUP_ROWS, ParkedDraft, SlotDrafts, lookup_props};
 
 #[path = "../qwen38_place.rs"]
 mod q38place;
@@ -2171,9 +2174,15 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     }
     eprint_noted(&cache.line());
     // The rounds of several slots, decided once (the open takes it through
-    // `SeatArgs`): one pass of the busy rows, a slot at a time beside an
-    // expert tier card ([`Place38::tiered`]).
-    let pass = Pass::of(slots, !a.place.tiered());
+    // `SeatArgs`) by what the body runs: one pass of the busy rows, a slot
+    // at a time beside an expert tier card ([`Place38::tiered`]), the
+    // draft's windows of its verify rows.
+    let window = match (mtp, lookup) {
+        (true, _) => Some(<Body38 as MtpBody>::VERIFY_ROWS),
+        (false, true) => Some(LOOKUP_ROWS),
+        (false, false) => None,
+    };
+    let pass = Pass::of_body::<Body38>(slots, !a.place.tiered(), window);
     // The slots the seat serves ([`Session::add_slots`]): the flag's, or
     // one — one drafted pass a slot a round, nothing parked.
     parallel_line(slots, rule.ctx, from, pass);
@@ -2602,21 +2611,20 @@ struct Q38 {
     /// Under the draft, its break-even at the seat's placement.
     break_even: Option<BreakEven>,
     /// Whether a round of several slots' drafted passes runs as one pass of
-    /// the busy rows ([`Q38::pass_slots`]): a drafted load of more than one
-    /// resident slot with no expert tier card — the body runs several slots'
-    /// rows as one pass ([`SlotRows`]) except beside a tier
-    /// ([`Place38::tiered`]), and a round of drafted rows only a drafting
-    /// server runs. A `--parallel 1` load, a plain one and a tiered one keep
-    /// the fallback loop.
+    /// the busy rows ([`Q38::pass_slots`]): a drafted load (the MTP draft or
+    /// the lookup) of more than one resident slot whose shape the open
+    /// decided by what the body runs ([`Pass::of_body`]: no expert tier
+    /// card beside it, [`Place38::tiered`], and a pass that verifies several
+    /// slots' windows of the draft's rows). A `--parallel 1` load, a plain
+    /// one and a tiered one keep the fallback loop.
     one_pass: bool,
     /// Whether a round of several slots' plain steps runs as one pass of the
     /// busy rows ([`Q38::step_slots`]): a load of more than one resident
-    /// slot with no expert tier card, plain or MTP-drafted. A drafted load's
+    /// slot whose shape is [`Pass::One`], plain or drafted. A drafted load's
     /// plain rounds (the steps of requests that take no pass) tell each row
     /// to its slot's draft around the pass
-    /// ([`super::rounds::step_rows_drafted`]). A lookup load keeps the
-    /// fallback loop: its contexts follow each step at the selected slot's
-    /// position.
+    /// ([`super::rounds::step_rows_drafted`],
+    /// [`super::rounds::step_rows_lookup`]).
     step_pass: bool,
     /// Whether a plain step reads the PLE rows of the id it answers ahead
     /// ([`Q38::read_ahead`]): the body's next call is then that slot's, on
@@ -2925,8 +2933,8 @@ impl Q38 {
             draft_path: a.draft_path,
             residency,
             break_even: a.mtp.then(|| break_even_of(a.place)),
-            one_pass: pass_of_slots && a.mtp,
-            step_pass: pass_of_slots && !a.lookup,
+            one_pass: pass_of_slots && (a.mtp || a.lookup),
+            step_pass: pass_of_slots,
             reads_ahead: a.pass == Pass::One,
             stats: a.stats,
             census,
@@ -3545,6 +3553,8 @@ impl Seat for Q38 {
                 }
                 if q.drafts.mtp() {
                     super::rounds::step_rows_drafted(&mut q.s, rows, &mut q.drafts)
+                } else if let Some(l) = q.drafts.lookups_mut() {
+                    super::rounds::step_rows_lookup(&mut q.s, rows, l)
                 } else {
                     super::rounds::step_rows_one_pass(&mut q.s, rows)
                 }
@@ -3581,13 +3591,16 @@ impl Seat for Q38 {
                 for r in rows.iter() {
                     q.before_call_at(r.slot);
                 }
-                super::rounds::pass_rows_one_pass(
-                    &mut q.s,
-                    rows,
-                    &mut q.drafts,
-                    <Body38 as MtpBody>::WIDTH,
-                    0..=<Body38 as MtpBody>::WIDTH,
-                )
+                match q.drafts.lookups_mut() {
+                    Some(l) => super::rounds::pass_rows_lookup(&mut q.s, rows, l),
+                    None => super::rounds::pass_rows_one_pass(
+                        &mut q.s,
+                        rows,
+                        &mut q.drafts,
+                        <Body38 as MtpBody>::WIDTH,
+                        0..=<Body38 as MtpBody>::WIDTH,
+                    ),
+                }
             },
             Q38::print_passes,
         )
@@ -3870,6 +3883,27 @@ mod tests {
     use super::parse_args;
     use super::ubatch_rule;
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
+
+    /// The open's round shape is the body's fact: Qwen3.8's body settles a
+    /// partial keep, so the MTP windows and the lookup's verify several slots
+    /// together, and a window its pass of several slots holds once does not.
+    /// Mutants: drop `SETTLES_PARTIAL_KEEP` from `bind::verifies_slots`, or
+    /// `> 1` as `>= 1`.
+    #[test]
+    fn drafted_rounds_are_one_pass_by_what_body38_verifies() {
+        use super::{Body38, LOOKUP_ROWS, MtpBody};
+        use bloomery_gpu::model::{SlotRows, slots_a_pass};
+        use bloomery_gpu_gates::bind::{Pass, verifies_slots};
+        for rows in [<Body38 as MtpBody>::VERIFY_ROWS, LOOKUP_ROWS] {
+            assert!(verifies_slots::<Body38>(rows), "{rows} rows");
+            assert_eq!(Pass::of_body::<Body38>(2, true, Some(rows)), Pass::One);
+            assert_eq!(Pass::of_body::<Body38>(2, false, Some(rows)), Pass::Turns);
+        }
+        let held_once = (1..=<Body38 as SlotRows>::MAX_ROWS)
+            .find(|&r| slots_a_pass::<Body38>(r) == 1)
+            .expect("a window of the pass's rows fills it");
+        assert!(!verifies_slots::<Body38>(held_once));
+    }
 
     /// Saved arena codes stay fixed; both parked arena fields refuse rows
     /// the state does not carry. Mutant: accept Ubatch in `arena_of`.

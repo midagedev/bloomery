@@ -779,6 +779,102 @@ where
         Ok(())
     }
 
+    /// One round of several slots' drafted windows verified together, the
+    /// one owner of a round of any draft's windows (the MTP draft's
+    /// [`mtp::pass_slots`], the lookup's): `windows` — each its slot's rows,
+    /// the token at its position then its proposal, already proposed — cut
+    /// between windows into passes of at most [`SlotRows::MAX_ROWS`] rows and
+    /// [`SlotRows::MAX_SLOTS`] sequences, the pass that holds slot 0 last
+    /// (`round_passes`), each pass run as one ([`Session::verify_slots`]),
+    /// each row bit for bit its step; then each window's ids taken row by
+    /// row in position order — the argmax, or a drawing window's draw from
+    /// that row's logits ([`Session::slots_row`], or [`Session::slots_best`]
+    /// for a draw that reads only the row's best) — up to the first that is
+    /// not the proposal's next (runtime's `Speculative::pass_picking`), those
+    /// rows kept, `heard` told of them (the window's index, the ids taken and
+    /// how many were kept) and the ids appended to its `out`, before the
+    /// commit of the pass's kept rows together ([`Session::commit_slots`]).
+    /// Returns each window's commit, in the windows' order, and the passes
+    /// run. The round leaves slot 0 selected. Refused by name as
+    /// `round_passes` refuses the windows' rows, for a pass that reads back
+    /// fewer ids than its rows, and as `heard` refuses.
+    pub fn verify_rounds(
+        &mut self,
+        windows: &mut [RoundWindow<'_>],
+        mut heard: impl FnMut(usize, &[u32], usize) -> Result<(), SessionError>,
+    ) -> Result<(Vec<runtime::Committed>, usize), SessionError> {
+        let cuts = round_passes(
+            windows.iter().map(|w| (w.slot, w.rows.len())),
+            (B::MAX_ROWS, B::MAX_SLOTS),
+        )?;
+        let mut kept = vec![0; windows.len()];
+        let mut taken = Vec::new();
+        for cut in &cuts {
+            let pass: Vec<(usize, &[u32])> = windows[cut.clone()]
+                .iter()
+                .map(|w| (w.slot, w.rows))
+                .collect();
+            let argmax = self.verify_slots(&pass)?.ids;
+            let (mut fetched, mut best_fetched) = (false, false);
+            let mut at = 0;
+            for (i, (w, k)) in windows[cut.clone()]
+                .iter_mut()
+                .zip(&mut kept[cut.clone()])
+                .enumerate()
+            {
+                let r = w.rows;
+                let got = argmax.get(at..at + r.len()).ok_or_else(|| {
+                    SessionError::Refused(format!(
+                        "a round of slots' windows: a pass of {} rows read back {} ids",
+                        at + r.len(),
+                        argmax.len()
+                    ))
+                })?;
+                let ids = match w.draw.as_mut() {
+                    None => {
+                        *k = runtime::accepted_rows(r, got);
+                        got
+                    }
+                    Some(draw) => {
+                        taken.clear();
+                        for j in 0..r.len() {
+                            let id = if draw.best {
+                                let row = self.slots_best(at + j, best_fetched)?;
+                                best_fetched = true;
+                                (draw.take)(row)
+                            } else {
+                                let row = self.slots_row(at + j, fetched)?;
+                                fetched = true;
+                                (draw.take)(row)
+                            };
+                            taken.push(id);
+                            if r.get(j + 1) != Some(&id) {
+                                break;
+                            }
+                        }
+                        *k = taken.len();
+                        &taken[..]
+                    }
+                };
+                heard(cut.start + i, ids, *k)?;
+                w.out.extend_from_slice(&ids[..*k]);
+                at += r.len();
+            }
+            self.commit_slots(&kept[cut.clone()])?;
+        }
+        let done = windows
+            .iter()
+            .zip(&kept)
+            .map(|(w, &k)| runtime::Committed {
+                pos: w.pos,
+                kept: k,
+                rows: w.rows.len(),
+                proposed: w.rows.len() > 1,
+            })
+            .collect();
+        Ok((done, cuts.len()))
+    }
+
     /// One round of several slots' steps as passes of [`GpuModel::step_slots`]
     /// — the round a seat serves whose body runs several slots' rows as one
     /// pass: the busy `rows` (one a slot there, the server's rounds being one
@@ -872,6 +968,28 @@ where
             }),
         })
     }
+}
+
+/// One busy slot's window of a round verified together
+/// ([`Session::verify_rounds`]): the slot, the position its rows run from,
+/// its rows (the token at that position, then the proposal: one row is a
+/// plain step), where its kept ids are appended, and for a request that
+/// draws, its draw. `None` takes each row's argmax.
+pub struct RoundWindow<'a> {
+    pub slot: usize,
+    pub pos: u32,
+    pub rows: &'a [u32],
+    pub out: &'a mut Vec<u32>,
+    pub draw: Option<Draw<'a>>,
+}
+
+/// A drawing window's draw ([`RoundWindow::draw`]): the id it takes from a
+/// row's logits, one call a taken id (`runtime::Sample`'s closure), and
+/// whether it reads only the row's best ([`Session::slots_best`]) in place
+/// of the whole row ([`Session::slots_row`]).
+pub struct Draw<'a> {
+    pub take: &'a mut dyn FnMut(&[f32]) -> u32,
+    pub best: bool,
 }
 
 /// Read and validate a requested row; an unrequested row touches no logits.

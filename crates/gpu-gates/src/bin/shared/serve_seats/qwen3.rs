@@ -142,9 +142,10 @@
 //! A `parallel` line on stderr before the load names the rule (`slots`), the
 //! slots, a slot's context, the total, what set the count (`from`: the
 //! `--parallel` flag, a set `--ctx`, the default) and the shape of a round of
-//! several slots (`pass`: `one`, or `turns` under the lookup draft, whose
-//! state is a slot's own, or beside an expert tier card, whose page is one
-//! column). `--queue-depth Q` bounds
+//! several slots (`pass`: `one`, or `turns` under the lookup draft on a
+//! body that keeps a pass's rows whole, so cannot verify several slots'
+//! windows together, `bind::verifies_slots`, or beside an expert tier card,
+//! whose page is one column). `--queue-depth Q` bounds
 //! the requests that wait for a slot; `--park-ram`
 //! is refused by name: the resident slots hold no parked state the flag
 //! could budget.
@@ -219,7 +220,7 @@ use bloomery_gpu::arch::qwen3moe::ubatch::{UBATCH_ENV, ubatch_size};
 use bloomery_gpu::arch::qwen3moe::{Body, Body35, KvQ8, Qwen35moeModel};
 use bloomery_gpu::dspark::DsparkBody;
 use bloomery_gpu::folder::Model;
-use bloomery_gpu::model::{GpuModel, MAX_PASS_ROWS, Slots, StepMode};
+use bloomery_gpu::model::{GpuModel, MAX_PASS_ROWS, SlotRows, StepMode};
 use bloomery_gpu::route_softmax::MAX_TOKENS;
 use bloomery_gpu::weights::{DevWeight, head_tensor};
 use bloomery_gpu::{Gpu, Qwen3moeModel};
@@ -250,7 +251,7 @@ use serve::media::{MediaFeed, SharedMediaModel};
 use serve::{CacheNote, DraftProps, Drafted, EngineProps, Saved, ServeError};
 use tokenizer::Tokenizer;
 
-use super::drafted::SlotDrafts;
+use super::drafted::{LOOKUP_ROWS, SlotDrafts};
 use super::served::{self, ServedDraft, Word};
 use super::{folder, qwen3_folder};
 use crate::draft::Draft;
@@ -309,6 +310,10 @@ fn seqs35(split: &Split, load: &Q3Load, parallel: usize) -> Result<Seqs, GateErr
 
 /// Why the seat takes no sequence state: it runs no prompt cache.
 const NO_CACHE: &str = "the qwen3 seat runs no prompt cache";
+
+/// The rows the DSpark draft's verify runs on this seat: the token at the
+/// target's position and its proposal.
+const DSPARK_ROWS: usize = 8;
 
 pub(crate) struct Args {
     host: String,
@@ -500,7 +505,7 @@ impl Weights {
 /// One of the two bodies the seat serves, opened as `generate_qwen3moe`
 /// opens it, its prompt schedule and its keep rule. Both hold resident
 /// sequences ([`Slots`]): the session adds and selects them alike.
-trait Body3: Slots<Seq: 'static> + app::Prompt + app::Keep + Sized + 'static {
+trait Body3: SlotRows<Seq: 'static> + app::Prompt + app::Keep + Sized + 'static {
     /// The body name in the default media refusal.
     const ARCH: &'static str;
     /// Whether an undrafted in-file MTP decision prints `load draft=off`.
@@ -926,7 +931,7 @@ impl Body3 for Body35 {
         // target's.
         s.model().gpu().context().bind_to_thread()?;
         let mut log = Quiet;
-        Ok(Some(ServedDraft::dspark::<_, 8>(
+        Ok(Some(ServedDraft::dspark::<_, DSPARK_ROWS>(
             s,
             draft,
             mode,
@@ -1057,11 +1062,12 @@ struct Q3<B: Body3> {
     s: app::Session<B>,
     ctx: usize,
     /// Whether a round of several slots runs as one pass of the busy rows
-    /// ([`Q3::step_slots`]): [`Body3::serves_one_pass`] on the load — a
-    /// whole-card load, and a placed load of `Body` or `Body35` with no
-    /// expert tier — and not the lookup draft. A body with no one pass of
-    /// its slots keeps the fallback loop, and a load of one slot never runs
-    /// a round of several.
+    /// ([`Q3::step_slots`]): the shape [`pass_of`] decided at the open —
+    /// [`Body3::serves_one_pass`] on the load (a whole-card load, and a
+    /// placed load of `Body` or `Body35` with no expert tier) and, under the
+    /// lookup draft, a body that verifies several slots' windows together,
+    /// which neither does. Any other load keeps the fallback loop, and a
+    /// load of one slot never runs a round of several.
     one_pass: bool,
     /// [`Seat::step_stats`]: the `BLOOMERY_STEP_STATS` the binary parsed.
     stats: bool,
@@ -1763,16 +1769,21 @@ impl Q3Load {
     }
 }
 
-/// The shape of a round of `slots` slots on body `B`: one pass of the busy
-/// rows when [`Body3::serves_one_pass`] says the load can (a whole-card
-/// load, and a placed load of `Body` or `Body35` whose plan hangs no expert
-/// tier holding an expert), else the fallback loop (a select and a step a
-/// slot). The lookup draft's state is a slot's own, so a round of several
-/// slots takes turns under it. The one owner of the rule, which the
+/// The shape of a round of `slots` slots on body `B`, by what the body
+/// runs ([`Pass::of_body`]): one pass of the busy rows when
+/// [`Body3::serves_one_pass`] says the load can (a whole-card load, and a
+/// placed load of `Body` or `Body35` whose plan hangs no expert tier holding
+/// an expert) and, under a draft, the body verifies several slots' windows
+/// of its rows together (`bind::verifies_slots`); else the fallback loop (a
+/// select and a step a slot). The one owner of the rule, which the
 /// `parallel` line names ahead of the load and the open holds the load to.
-/// The body's answer is [`Body3::serves_one_pass`].
 fn pass_of<B: Body3>(slots: usize, tiered: bool, draft: Draft) -> Pass {
-    Pass::of(slots, B::serves_one_pass(tiered) && draft != Draft::Lookup)
+    let window = match draft {
+        Draft::Off => None,
+        Draft::Lookup => Some(LOOKUP_ROWS),
+        Draft::Dspark => Some(DSPARK_ROWS),
+    };
+    Pass::of_body::<B>(slots, B::serves_one_pass(tiered), window)
 }
 
 /// What the `arch` file loads as at `total` positions for `parallel`
@@ -2712,6 +2723,18 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
 mod tests {
     use super::{Choice, folder_choice, parse_args};
     use model::placement::workstation::{A6000, RTX_3090};
+
+    /// The open's round shape is the body's fact: Qwen3.6's body keeps a
+    /// pass's rows whole, so a drafted load takes turns while a plain one runs
+    /// one pass, and one slot is one pass whatever the body does. Mutant:
+    /// drop `SETTLES_PARTIAL_KEEP` from `bind::verifies_slots`.
+    #[test]
+    fn a_drafted_qwen36_round_takes_turns_by_what_its_body_keeps() {
+        use super::{Body35, Draft, Pass, pass_of};
+        assert_eq!(pass_of::<Body35>(2, false, Draft::Lookup), Pass::Turns);
+        assert_eq!(pass_of::<Body35>(2, false, Draft::Off), Pass::One);
+        assert_eq!(pass_of::<Body35>(1, false, Draft::Lookup), Pass::One);
+    }
 
     /// The seat reads `--place` as the shared grammar and leaves a tier card
     /// to its plan: each word it took before parses to the placement it names,

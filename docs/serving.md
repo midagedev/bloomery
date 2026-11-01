@@ -719,10 +719,12 @@ inside the one model, switched by pointer exchange: nothing parks, and each roun
 token or one drafted pass. Where the body runs several slots' rows as one pass, the round reads the weights once for
 all of them: on a whole-card Qwen3-30B or Qwen3.6, on V4.1 and MiMo-V2.6-Flash (two slots' rows a pass), and on GLM-5.3 and Qwen3.8, where a greedy
 or sampled request's drafted verify window rides the same pass (two windows a pass; with the draft off, the plain rows).
+On Qwen3.8 the lookup draft's windows ride one pass the same way, two rows a slot. Which loads verify several slots'
+windows together is the body's fact, not the draft's: the body must keep part of a slot's verified rows at the commit.
 Qwen3.8 also batches plain steps on a drafting load, with every slot's draft brought up to date in one draft pass
 before the round's pass. A round that leaves slot 0 out runs as one pass too and keeps slot 0's waiting hidden rows
 intact. A
-placed Qwen3-30B or Qwen3.6 (`--place a`), V4.1 with the
+placed Qwen3-30B or Qwen3.6 (`--place a`), Qwen3.6 and V4.1 with the
 lookup draft, Qwen3.8 under `--place bp` and MiniMax-M3 step their slots in turn, a select and a step a slot each round. At a
 fixed expert placement each request answers the tokens of its run alone on the same server; under adaptive residency
 the placement follows every stream's passes (see [Limits](#limits)). Under more slots than one the context splits as
