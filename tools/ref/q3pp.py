@@ -36,7 +36,7 @@ gone is a named refusal, not a guess:
   - in the prompt: PrefillPlan::new(P, Auto, U) (arch/qwen3moe/prefill.rs): ubatches of U, a tail of
     at most MAX_TOKENS as one pass (decode flash again), a longer tail as one more ubatch. U is
     BLOOMERY_QWEN3_UBATCH, else the placement's UBATCH_PLANNED; the file's expert_used_count
-    also bounds U by GEMM_MAX_SLOTS / expert_used_count.
+    bounds the allocated rows (min(U, ctx)) by GEMM_MAX_SLOTS / expert_used_count.
   - per ubatch: one launch per layer, layers in order (ubatch.rs `Ubatch::enqueue` -> `attention` ->
     wide::neox_128_rows -> KvPlanes::prefill_head128, one head-128 flash).
   so skip = K x n_layer + layer, count 1.
@@ -296,11 +296,12 @@ def cmd_plan(argv):
         refuse(f"[derive] the file's key_length is {meta[f'{arch}.attention.key_length']}, the kernel's HEAD {c['head']}")
     if n_head != n_kv * c["group"]:
         refuse(f"[derive] {n_head} query heads over {n_kv} key heads, the kernel groups {c['group']}")
-    U = int(opt(argv, "--ubatch", c["ubatch_planned"]))
-    if not 1 <= U <= ubatch_max:
-        refuse(f"[derive] a ubatch of {U} tokens at {n_used} experts per token "
-               f"(the binary takes 1..={ubatch_max}); set --ubatch within that limit", 64)
     ctx = int(opt(argv, "--ctx", 0)) or None
+    U = int(opt(argv, "--ubatch", c["ubatch_planned"]))
+    rows = U if ctx is None else min(U, ctx)
+    if not 1 <= U <= c["ubatch_planned"] or rows > ubatch_max:
+        refuse(f"[derive] a ubatch of {U} tokens allocates {rows} rows at {n_used} experts per token "
+               f"(the arena takes 1..={ubatch_max} rows); set --ubatch within that limit", 64)
     if not 0 <= layer < n_layer:
         refuse(f"[derive] layer {layer} of {n_layer}", 64)
     if ctx is not None and P + 1 > ctx:
@@ -332,7 +333,7 @@ def cmd_plan(argv):
     print(f"[derive] source {tree}: KEY_TILE {c['key_tile']}, POSITIONS {c['positions']} (warps {c['warps']}, "
           f"threads {c['threads']}), HEAD {c['head']}, GROUP {c['group']}, MAX_TOKENS {c['max_tokens']}, "
           f"UBATCH_PLANNED {c['ubatch_planned']}, file expert_used_count {n_used}, "
-          f"ubatch limit {ubatch_max} (GEMM_MAX_SLOTS {c['gemm_max_slots']})")
+          f"allocated rows {rows}, arena row limit {ubatch_max} (GEMM_MAX_SLOTS {c['gemm_max_slots']})")
     print(f"[derive] file: {n_layer} layers, {n_head} query heads over {n_kv} key heads of {c['head']}")
     print(f"[derive] P = {P}, ubatch {U}: plan={plan_str(steps)}; the profiled unit is ubatch {k} of {len(ubs)} "
           f"(t = {t} rows at positions {p0}..{p0 + t - 1})")
@@ -714,9 +715,14 @@ def self_test():
         def test_model_dependent_slot_limit(self):
             p = self.plan(used=16, extra=("--ubatch", "2560"))
             self.assertEqual((p["ubatch"], p["t"], p["p0"]), ("2560", "1536", "2560"))
-            for extra in [(), ("--ubatch", "2561"), ("--ubatch", "0")]:
+            for ctx in ("768", "2560"):
+                with self.subTest(ctx=ctx):
+                    p = self.plan(used=16, tokens=512, extra=("--ctx", ctx))
+                    self.assertEqual((p["ubatch"], p["t"], p["p0"]), ("4096", "512", "0"))
+            for extra in [(), ("--ubatch", "2561"), ("--ubatch", "0"), ("--ctx", "2561"),
+                          ("--ubatch", "4097", "--ctx", "768"), ("--ubatch", "0", "--ctx", "768")]:
                 with self.subTest(extra=extra), self.assertRaises(SystemExit) as caught:
-                    self.plan(used=16, extra=extra)
+                    self.plan(used=16, tokens=512, extra=extra)
                 self.assertEqual(caught.exception.code, 64)
                 self.assertIn("1..=2560", self.last_error)
 
