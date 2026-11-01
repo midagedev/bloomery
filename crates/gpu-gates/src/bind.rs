@@ -71,7 +71,7 @@ use model::placement::{Device, Machine, ModelTensors, Plan, Role};
 use runtime::prompt::CallEnd;
 use serve::media::{MediaFeed, SharedMediaModel};
 use serve::{
-    CacheNote, DeviceProps, Drafted, Engine, EngineError, EngineProps, FATAL_LINGER, Flight,
+    Ahead, CacheNote, DeviceProps, Drafted, Engine, EngineError, EngineProps, FATAL_LINGER, Flight,
     Landed, ModelProps, Pending, PlacementProps, ResidencyReset, Saved, SavedState, ServeError,
     Server, ServerConfig, SharedPrefix, SlotConfig, StateError, Tokenizer, Waits,
 };
@@ -1195,6 +1195,13 @@ enum Cmd {
         last: u32,
         logits: Option<Vec<f32>>,
     },
+    /// A greedy step whose answer the caller feeds back unless it stops
+    /// ([`Seat::step_ahead`]): `ahead` when the answer's step may be launched
+    /// before it is read back.
+    NextAhead {
+        last: u32,
+        ahead: bool,
+    },
     /// `ids` and the step of the last ([`Seat::prefill_row`]), the logits
     /// buffer lent as a `Next`'s.
     NextAfter {
@@ -1344,6 +1351,8 @@ enum Extra {
     /// A `Pass`'s buffer, holding its kept tokens on success, and what its
     /// draft proposed and kept.
     Pass(Vec<u32>, Drafted),
+    /// What a `NextAhead` did besides answering.
+    Ahead(Ahead),
     /// A `PassSampled`'s buffer, holding its taken ids on success, what its
     /// draft proposed and kept, and the history and sampler it was sent.
     PassSampled {
@@ -1418,6 +1427,14 @@ pub trait Seat: 'static {
     }
     /// One step on `last` at `pos`, the draft fed its row; the argmax after it.
     fn step(&mut self, last: u32) -> Result<u32, GateError>;
+    /// [`Seat::step`] of a greedy request that feeds the answer back unless
+    /// it stops there ([`Engine::next_ahead`]): the answer and what the seat
+    /// did besides, the answer's step launched (only when `ahead`) before it
+    /// was read back leaving the seat past it. The default launches none.
+    fn step_ahead(&mut self, last: u32, ahead: bool) -> Result<(u32, Ahead), GateError> {
+        let _ = ahead;
+        Ok((self.step(last)?, Ahead::default()))
+    }
     /// The head's logits after the last step into `row` (`n_vocab` f32).
     fn logits_into(&self, row: &mut [f32]) -> Result<(), GateError>;
     /// One step on `last` at `pos` ([`Seat::step`]) and, into `row`, the
@@ -1804,7 +1821,11 @@ impl SeatEngine {
                 // seat's selection unspecified until the server selects again
                 // (`serve::Engine::step_slots`).
                 let mut selected = Some(0);
+                // The answer whose step the last call launched ahead: the
+                // seat stands past it.
+                let mut launched = None;
                 while let Ok(cmd) = receive_command(&cmds) {
+                    let ran_ahead = launched.take();
                     let call = one_slot_call(&cmd);
                     let select = match &cmd {
                         Cmd::Select(slot) => Some(*slot),
@@ -1824,6 +1845,24 @@ impl SeatEngine {
                         }
                         Cmd::Splits { first, end, marks } => {
                             (Ok(0), None, Extra::Splits(g.splits(first, end, &marks)))
+                        }
+                        Cmd::NextAhead { last, ahead } => {
+                            let at = g.pos() - usize::from(ran_ahead == Some(last));
+                            let r = if at >= g.ctx_max() {
+                                Err(format!(
+                                    "step at position {at}: step: the context {} is full",
+                                    g.ctx_max()
+                                ))
+                            } else {
+                                g.step_ahead(last, ahead)
+                                    .map_err(|e| format!("step at position {at}: {e}"))
+                            };
+                            let (next, did) = match r {
+                                Ok((next, did)) => (Ok(next), did),
+                                Err(e) => (Err(e), Ahead::default()),
+                            };
+                            launched = next.as_ref().ok().copied().filter(|_| did.launched);
+                            (next, None, Extra::Ahead(did))
                         }
                         Cmd::Pass { last, mut out } => {
                             let at = g.pos();
@@ -2178,6 +2217,20 @@ impl Link {
     /// copied out once it is back.
     fn next(&mut self, last: u32, logits_out: Option<&mut [f32]>) -> Result<u32, EngineError> {
         self.call_lent(|logits| Cmd::Next { last, logits }, logits_out)
+    }
+
+    /// A greedy step on the engine thread ([`Cmd::NextAhead`]): the answer
+    /// and what the seat did besides. A reply with no account of the step is
+    /// refused by name: a default would book no step launched ahead while
+    /// one may stand.
+    fn next_ahead(&mut self, last: u32, ahead: bool) -> Result<(u32, Ahead), EngineError> {
+        let reply = self.ask(Cmd::NextAhead { last, ahead })?;
+        let Extra::Ahead(did) = reply.extra else {
+            return Err(EngineError(
+                "the engine thread answered a step ahead with no account of its step".to_owned(),
+            ));
+        };
+        reply.result.map(|g| (g, did)).map_err(EngineError)
     }
 
     /// `ids` and the step of the last ([`Cmd::NextAfter`]); with
@@ -2615,6 +2668,7 @@ fn serve_cmd<S: Seat>(
         | Cmd::Share(..)
         | Cmd::SaveState(_)
         | Cmd::RestoreState(_)
+        | Cmd::NextAhead { .. }
         | Cmd::Pass { .. }
         | Cmd::PassSampled { .. }
         | Cmd::StepSlots(..)
@@ -2822,7 +2876,7 @@ pub fn pass_rows_in_turn<S: Seat + ?Sized>(
 /// command.
 fn one_slot_call(cmd: &Cmd) -> Option<&'static str> {
     match cmd {
-        Cmd::Next { .. } | Cmd::PrefillNext { .. } => Some("step"),
+        Cmd::Next { .. } | Cmd::NextAhead { .. } | Cmd::PrefillNext { .. } => Some("step"),
         Cmd::Pass { .. } => Some("pass"),
         Cmd::PassSampled { .. } => Some("sampled"),
         _ => None,
@@ -3349,6 +3403,10 @@ impl Engine for SeatEngine {
 
     fn next(&mut self, last: u32, logits_out: Option<&mut [f32]>) -> Result<u32, EngineError> {
         self.link.next(last, logits_out)
+    }
+
+    fn next_ahead(&mut self, last: u32, ahead: bool) -> Result<(u32, Ahead), EngineError> {
+        self.link.next_ahead(last, ahead)
     }
 
     /// One command on the engine thread ([`Seat::prefill_next`]) for a call

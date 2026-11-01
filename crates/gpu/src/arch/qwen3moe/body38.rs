@@ -5419,9 +5419,11 @@ impl GpuModel<Body38> {
     /// selected checkpoints below it, each with its PLE history.
     /// A waiting cut is carried out first. Refused by name on a poisoned
     /// model, while a verify waits for its commit, and after a call failed
-    /// past its launch.
+    /// past its launch; a step launched ahead is read first
+    /// ([`GpuModel::settle_ahead`]), its fault the save's error.
     pub fn seq_save(&mut self) -> Result<Seq38, GpuError> {
         const WHAT_S: &str = "qwen4exp snapshot";
+        self.settle_ahead(WHAT_S)?;
         self.refuse_if_poisoned(WHAT_S)?;
         let pos = self.pos();
         let (gpu, _, body) = self.body_parts(WHAT_S)?;
@@ -5511,6 +5513,7 @@ impl GpuModel<Body38> {
         lane: &SaveLane,
     ) -> Result<Result<(Seq38, Pending<History>), NoRoom>, GpuError> {
         const WHAT_S: &str = "qwen4exp snapshot";
+        self.settle_ahead(WHAT_S)?;
         self.refuse_if_poisoned(WHAT_S)?;
         let pos = self.pos();
         let (gpu, _, body) = self.body_parts(WHAT_S)?;
@@ -5828,6 +5831,56 @@ impl ChainBody for Body38 {
         self.launch(input.pos, 1, 1)?;
         self.ple_due = Some((input.pos, 1));
         Ok(())
+    }
+
+    /// The step at `pos` whose token is word 0 of `token` on the card, the
+    /// step before's argmax: refused where `decode_input` refuses a position,
+    /// staged with the PLE history where it stands, the arrival's flag
+    /// lowered by the stream behind the walk before (whose arrival may not
+    /// have run yet), the input record copied with that word over its token,
+    /// and launched ([`Body38::launch`]). Its PLE rows wait for
+    /// [`Body38::chained_token`].
+    fn refresh_chained(
+        &mut self,
+        stream: &CudaStream,
+        pos: u32,
+        token: &DeviceBuffer<u32>,
+    ) -> Result<bool, GpuError> {
+        self.refuse_inside_image("qwen4exp step", pos)?;
+        self.card_leg.refuse(Walk38::Step)?;
+        self.check_next(pos, 1)?;
+        planted(&mut self.plant, Plant::BeforeLaunch)?;
+        self.settle(stream)?;
+        let hist = self.ple.hist.clone();
+        self.stage(pos, 1, hist, None)?;
+        self.last_walk = TargetRows::Step;
+        self.ple_arrival.enqueue_clear(stream, 0)?;
+        self.sp.write_chained(stream, token, pos)?;
+        self.launch(pos, 1, 1)?;
+        Ok(true)
+    }
+
+    /// The chained step's token: its PLE rows named past the history (the
+    /// hash refuses here what `decode_input` refuses), the history moved
+    /// past them, and the rows due for
+    /// the replay's host service ([`Body38::deliver_ple`]). A refusal, or no
+    /// token, still raises the arrival's flag, so the launched walk ends.
+    fn chained_token(&mut self, token: Option<u32>) -> Result<(), GpuError> {
+        let pos = self.held - 1;
+        let named = token
+            .ok_or(GpuError::state(
+                WHAT,
+                "the chained step's token was not read back",
+            ))
+            .and_then(|t| self.ple.name_rows(pos, &[t], &[]));
+        match named {
+            Ok(hist) => {
+                self.ple.hist = hist;
+                self.ple_due = Some((pos, 1));
+                Ok(())
+            }
+            Err(e) => self.ple_arrival.deliver(0, |_| Err(e)),
+        }
     }
 
     /// The step's walk ([`Step38`]). An eager walk serves its host legs as

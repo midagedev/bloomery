@@ -39,7 +39,9 @@ use bloomery_gpu::host::PassKind;
 use bloomery_gpu::host::served::prompt_pass;
 use bloomery_gpu::host::swap::ResetReport;
 use bloomery_gpu::media::MediaBody;
-use bloomery_gpu::model::{ChainBody, Rollback, Rows, SlotRows, Slots, SlotsOut, StepMode};
+use bloomery_gpu::model::{
+    ChainBody, Rollback, Rows, SlotRows, Slots, SlotsOut, StepAhead, StepMode,
+};
 use bloomery_gpu::{Fault, GpuError, GpuModel};
 use gguf::Split;
 use model::placement::{Machine, Plan};
@@ -612,6 +614,15 @@ impl<B: ChainBody> Session<B> {
     /// See [`Session::model`].
     pub fn model_mut(&mut self) -> &mut GpuModel<B> {
         &mut self.model
+    }
+
+    /// One greedy step of `id` for a caller that feeds the answer back
+    /// unless it stops there: [`GpuModel::step_ahead`], the answer's step
+    /// launched when `ahead` and it lands inside the session's positions.
+    pub fn step_ahead(&mut self, id: u32, ahead: bool) -> Result<(u32, StepAhead), SessionError> {
+        self.idle("step")?;
+        let within = if ahead { self.ctx } else { 0 };
+        Ok(self.model.step_ahead(id, within)?)
     }
 
     /// Refused while a verify's rows, or a pass of several slots' verify

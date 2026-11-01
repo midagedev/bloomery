@@ -44,7 +44,7 @@ use crate::site::{self, Form, KGemvKernels, SiteTy};
 use crate::tensor::{DeviceTensor, Q8Act};
 use crate::token_major::TokenMajor;
 use crate::weights::{DevWeight, HEAD_TENSOR, Weights};
-use cuda_core::DeviceBuffer;
+use cuda_core::{CudaEvent, DeviceBuffer, PinnedHostBuffer};
 use model::arch::names::output_norm;
 use model::placement::kernels::{self, HeadEntry};
 
@@ -290,6 +290,11 @@ pub struct Head {
     /// pair, which no raise can store: `tokens` refuses that pair as an
     /// unwritten readback rather than decode it as a fault.
     token_out: DeviceBuffer<u32>,
+    /// `token_out`'s pinned twin and the event behind its last copy
+    /// ([`Head::copy_tokens`]): the readback of a run with later work queued
+    /// behind it.
+    copied: PinnedHostBuffer<u32>,
+    copied_at: CudaEvent,
     /// The ticket count of an f32-activation head of `m > 1` rows (its argmax's blocks
     /// each draw one), zero between launches; `None` for every other head.
     rows_done: Option<DeviceBuffer<u32>>,
@@ -450,6 +455,8 @@ impl Head {
             },
             logits: DeviceBuffer::zeroed(stream, m * n_vocab)?,
             token_out: DeviceBuffer::from_host(stream, &vec![0u32; m + 2])?,
+            copied: PinnedHostBuffer::zeroed(stream.context(), m + 2)?,
+            copied_at: stream.context().new_event(None)?,
             rows_done,
             q5k,
             nvfp4,
@@ -798,6 +805,48 @@ impl Head {
         Ok(self.tokens(gpu)?[0])
     }
 
+    /// The readback words on the card: the `m` argmax tokens, then the fault
+    /// words ([`Head::tokens`]). A step chained behind a run reads its token
+    /// from word 0.
+    #[must_use]
+    pub fn token_words(&self) -> &DeviceBuffer<u32> {
+        &self.token_out
+    }
+
+    /// Enqueue the copy of the last run's readback words to the host on the
+    /// card's stream, for [`Head::copied_token`]: the readback of a run with
+    /// later work queued behind it. Never inside a capture.
+    pub fn copy_tokens(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
+        let stream = gpu.stream();
+        // SAFETY: `copied` is this head's pinned twin of `token_out`, as long
+        // as it; the host reads it only once `copied_at`, recorded right
+        // below, has passed ([`Head::copied_token`]), and the head's drop
+        // waits for that event before freeing it.
+        unsafe {
+            self.token_out
+                .copy_to_pinned_host_async(stream, &mut self.copied)?
+        };
+        self.copied_at.record(stream)?;
+        Ok(())
+    }
+
+    /// The first row's argmax [`Head::copy_tokens`] copied, once the copy
+    /// lands (within [`crate::host::ENGINE_BOUND`], past it
+    /// [`GpuError::Stalled`]); a raised fault or a readback no argmax wrote
+    /// is refused as [`Head::tokens`] refuses it.
+    pub fn copied_token(&self) -> Result<u32, GpuError> {
+        crate::host::await_done("Head::copied_token", || self.copied_at.query())?;
+        let words = self.copied.as_slice();
+        let (Some(&token), [.., word, sites]) = (words.first(), words) else {
+            return Err(GpuError::state(
+                "Head::copied_token",
+                "the readback copy holds no fault words",
+            ));
+        };
+        refuse_readback_fault(*word, *sites)?;
+        Ok(token)
+    }
+
     /// The argmax tokens of the last run, one per row. Blocking read: the
     /// engine stream waited for within [`crate::host::ENGINE_BOUND`]
     /// ([`crate::host::await_done`], past it [`GpuError::Stalled`]), then
@@ -815,6 +864,14 @@ impl Head {
         };
         refuse_readback_fault(word, sites)?;
         Ok(out)
+    }
+}
+
+impl Drop for Head {
+    fn drop(&mut self) {
+        // The pinned twin outlives a copy still writing it. A failure on the
+        // drop path is unreportable and ignored.
+        let _ = self.copied_at.synchronize();
     }
 }
 

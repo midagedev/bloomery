@@ -588,12 +588,26 @@ pub(crate) fn serve(slot: Slot, sh: Arc<Shared>) {
 fn call_alone(slot: &mut Slot, a: &mut Active, need: Need) -> Result<(), EngineError> {
     slot.select(a.slot)?;
     match need {
-        Need::Step(t) => slot.next(t, a.job.logits_out()).map(|g| a.job.stepped(g)),
+        Need::Step(t) => step_alone(slot, a, t),
         Need::Advance(t) => slot.advance(t, a.job.kept_mut()).map(|d| a.job.advanced(d)),
         Need::Sampled(t) => a.job.advance_sampled(slot, t),
         Need::Fill => unreachable!("a round of fills alone makes no decode call"),
         Need::Done => unreachable!("a finished request left the running ones"),
     }
+}
+
+/// `a`'s step of `t` on its slot alone: on an engine of one slot, a request
+/// that feeds the answer back unless it stops ([`Gen::step_ahead`]) lets the
+/// engine launch the answer's step before the answer is read back
+/// ([`Slot::next_ahead`]); any other a plain step. Slots that take the engine
+/// in turns step plainly: a turn may end between two steps.
+fn step_alone(slot: &mut Slot, a: &mut Active, t: u32) -> Result<(), EngineError> {
+    let g = match a.job.step_ahead() {
+        Some(ahead) => slot.next_ahead(t, ahead && slot.slots() == 1)?,
+        None => slot.next(t, a.job.logits_out())?,
+    };
+    a.job.stepped(g);
+    Ok(())
 }
 
 /// The sink a request's generation writes to: its channel.

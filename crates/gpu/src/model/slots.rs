@@ -535,7 +535,9 @@ where
     /// slot's sequence ([`Slots::swap_seq`]), position and capture cache
     /// with its parked state. Selecting the live slot is a no-op; out of
     /// range is refused by name. Pointer moves only: nothing allocated,
-    /// captured, copied or synchronized.
+    /// captured, copied or synchronized, but for a step the live slot
+    /// launched ahead, read first ([`GpuModel::settle_ahead`]): its fault is
+    /// the call's error, the live slot poisoned by it and still selected.
     pub fn select_slot(&mut self, slot: usize) -> Result<(), GpuError> {
         const WHAT: &str = "GpuModel::select_slot";
         self.refuse_if_slots_wait(WHAT)?;
@@ -549,6 +551,7 @@ where
         if slot == self.selected {
             return Ok(());
         }
+        self.settle_ahead(WHAT)?;
         // The homes rule (module doc): bring the live slot's state home —
         // slot 0's into the live fields — then park it in the target's
         // entry. One of the two exchanges runs on every switch.
@@ -557,6 +560,7 @@ where
         // slot 0 (or the old slot) live and named, never a mix.
         self.one_pass = None;
         self.slot_rows = None;
+        self.ahead = None;
         if self.selected != 0 {
             self.swap_parked(self.selected - 1)?;
             self.selected = 0;

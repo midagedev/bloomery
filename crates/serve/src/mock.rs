@@ -57,7 +57,7 @@ use std::time::{Duration, Instant};
 use vision::{GridPlan, MediaModel, Patches, Prepared, Rgb8, VisionError};
 
 use crate::engine::{
-    Decoder, DraftProps, Drafted, Engine, EngineError, EngineProps, Flight, Landed, Pending,
+    Ahead, Decoder, DraftProps, Drafted, Engine, EngineError, EngineProps, Flight, Landed, Pending,
     ResidencyReset, Sampler, Saved, SavedState, SharedPrefix, SlotPass, StateError, Tokenizer,
     resume_bytes, snapshot_bytes,
 };
@@ -114,6 +114,12 @@ pub struct MockEngine {
     saves: Option<AsyncSaves>,
     /// Whether a slot takes another slot's prefix ([`MockEngine::with_shares`]).
     shares: bool,
+    /// Whether it steps a greedy answer ahead ([`MockEngine::with_ahead`]).
+    runs_ahead: bool,
+    /// The answer the last call stepped ahead ([`Engine::next_ahead`]), in
+    /// the context already: a `next_ahead` of it next takes it, and any
+    /// other call leaves it there.
+    stepped: Option<u32>,
 }
 
 /// The mock's copy stream: how long a copy takes, what the engine saw, and
@@ -264,6 +270,8 @@ impl MockEngine {
             media: None,
             saves: None,
             shares: false,
+            runs_ahead: false,
+            stepped: None,
         }
     }
 
@@ -429,7 +437,20 @@ impl MockEngine {
         }
     }
 
+    /// A mock that steps a greedy answer ahead when the caller lets it
+    /// ([`Engine::next_ahead`]): the answer enters the context before the
+    /// caller feeds it, as an engine that launches the answer's step before
+    /// reading it back stands past it.
+    #[must_use]
+    pub fn with_ahead(self) -> Self {
+        MockEngine {
+            runs_ahead: true,
+            ..self
+        }
+    }
+
     fn push(&mut self, id: u32) -> Result<(), EngineError> {
+        self.stepped = None;
         if self.ctx.len() >= self.ctx_max {
             return Err(EngineError(format!(
                 "mock: position {} is past ctx_max {}",
@@ -541,7 +562,10 @@ impl Engine for MockEngine {
         })
     }
 
+    /// A prompt call never takes an answer stepped ahead: that answer stays
+    /// in the context, and a fed id lands past it.
     fn prefill(&mut self, ids: &[u32]) -> Result<(), EngineError> {
+        self.stepped = None;
         if self.media.is_some()
             && let Some(at) = ids.iter().position(|&id| id == IMAGE_ID)
         {
@@ -557,6 +581,7 @@ impl Engine for MockEngine {
     /// every position the image token; the call is logged, and each span's
     /// positions enter the context as its key's letters.
     fn prefill_media(&mut self, ids: &[u32], media: &[MediaFeed]) -> Result<(), EngineError> {
+        self.stepped = None;
         let Some(log) = self.media.as_ref().map(Arc::clone) else {
             return Err(EngineError(
                 "mock: this mock takes no image input".to_owned(),
@@ -631,8 +656,25 @@ impl Engine for MockEngine {
         Ok(predicted)
     }
 
+    /// The mock's answer is the one `next` gives after the context it holds:
+    /// an id stepped ahead is popped and fed again, as `next` feeds it.
+    fn next_ahead(&mut self, last: u32, ahead: bool) -> Result<(u32, Ahead), EngineError> {
+        let took = self.stepped.take() == Some(last);
+        if took {
+            self.ctx.pop();
+        }
+        let g = self.next(last, None)?;
+        let launched = self.runs_ahead && ahead && self.ctx.len() < self.ctx_max;
+        if launched {
+            self.push(g)?;
+            self.stepped = Some(g);
+        }
+        Ok((g, Ahead { took, launched }))
+    }
+
     fn reset(&mut self) -> Result<(), EngineError> {
         self.rewrites();
+        self.stepped = None;
         self.ctx.clear();
         Ok(())
     }
@@ -649,6 +691,7 @@ impl Engine for MockEngine {
                 self.ctx.len()
             )));
         }
+        self.stepped = None;
         self.ctx.truncate(n);
         Ok(())
     }
@@ -677,6 +720,7 @@ impl Engine for MockEngine {
             )));
         }
         if slot != self.cur {
+            self.stepped = None;
             let parked = std::mem::take(&mut self.parked[slot]);
             self.parked[self.cur] = std::mem::replace(&mut self.ctx, parked);
             self.cur = slot;

@@ -280,6 +280,17 @@ pub trait Engine: Send {
     /// With `Some(out)` (length `n_vocab`) it also writes those logits; a
     /// greedy request passes `None` and the engine may skip reading them.
     fn next(&mut self, last: u32, logits_out: Option<&mut [f32]>) -> Result<u32, EngineError>;
+    /// [`Engine::next`] of a greedy request that reads no logits and feeds
+    /// the answer back unless its generation stops there: the answer, and
+    /// what the engine did besides ([`Ahead`]). With `ahead` the engine may
+    /// launch the answer's step before it reads the answer back, and then
+    /// stands past the answer: the next `next_ahead` of the answer takes
+    /// that step and feeds nothing, and any other call keeps the answer fed.
+    /// The default launches nothing.
+    fn next_ahead(&mut self, last: u32, ahead: bool) -> Result<(u32, Ahead), EngineError> {
+        let _ = ahead;
+        Ok((self.next(last, None)?, Ahead::default()))
+    }
     /// Evaluates `ids` (at least one) from the current position and returns
     /// the argmax of the position after the last, writing its logits to
     /// `logits_out` as [`Engine::next`] does: a run of an answer's ids and
@@ -814,6 +825,17 @@ pub(crate) fn advance_row<E: Engine + ?Sized>(
 pub struct Drafted {
     pub proposed: usize,
     pub accepted: usize,
+}
+
+/// What one [`Engine::next_ahead`] did besides answering.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ahead {
+    /// `last` was the answer whose step the call before launched: that step
+    /// was read back and nothing was fed.
+    pub took: bool,
+    /// The answer's step was launched before the answer was read back: the
+    /// engine stands past the answer.
+    pub launched: bool,
 }
 
 /// A saved engine state held by the prompt cache ([`Engine::snapshot`]).

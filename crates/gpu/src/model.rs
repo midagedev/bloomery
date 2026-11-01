@@ -111,6 +111,32 @@ pub trait ChainBody: Sized {
     /// and never inside a capture.
     fn refresh(&mut self, stream: &CudaStream, input: &Self::Input) -> Result<(), GpuError>;
 
+    /// [`ChainBody::decode_input`] and [`ChainBody::refresh`] of a step at
+    /// `pos` whose token is not yet known on the host: the step before's
+    /// argmax, word 0 of `token` on the card, copied into the step's input
+    /// on the stream behind that step. Whatever the step needs of its token
+    /// on the host waits for [`ChainBody::chained_token`], after the replay's
+    /// launch and before its host service. `Ok(false)` stages nothing: a
+    /// body that cannot take its input from the card (the default).
+    fn refresh_chained(
+        &mut self,
+        stream: &CudaStream,
+        pos: u32,
+        token: &DeviceBuffer<u32>,
+    ) -> Result<bool, GpuError> {
+        let _ = (stream, pos, token);
+        Ok(false)
+    }
+
+    /// The token of the step [`ChainBody::refresh_chained`] launched, once
+    /// the readback of the step before named it: what the step needs of it
+    /// on the host, done before its replay's host service. `None` when that
+    /// readback failed: the body lets the launched step end all the same.
+    fn chained_token(&mut self, token: Option<u32>) -> Result<(), GpuError> {
+        let _ = token;
+        Ok(())
+    }
+
     /// Enqueue the whole chain — every resident layer and then `head`.
     /// Asynchronous throughout: no allocation, no synchronization, no host
     /// round trip, so this is both the eager body and what the capture
@@ -415,6 +441,17 @@ pub enum StepMode {
     Graph,
 }
 
+/// What a [`GpuModel::step_ahead`] did besides answering.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StepAhead {
+    /// The token fed was the answer whose step the call before launched:
+    /// that step was read back and nothing was fed.
+    pub took: bool,
+    /// The answer's step was launched before the answer was read back: the
+    /// model stands past the answer.
+    pub launched: bool,
+}
+
 // ------------------------------------------------------------ graph cache
 
 /// The captured chains, one per key: the rows the chain runs — 1 for the
@@ -573,6 +610,12 @@ pub struct GpuModel<B: ChainBody> {
     /// The cache row the next `step` token lands in. Written only through
     /// [`GpuModel::stand_at`].
     pos: u32,
+    /// The answer whose step the last [`GpuModel::step_ahead`] launched
+    /// before reading it back, the model standing past it. Dropped by any
+    /// move of the position or of the slot; a call that makes one without a
+    /// readback of its own, or hands the sequence on, reads the step's fault
+    /// first ([`GpuModel::settle_ahead`]).
+    ahead: Option<u32>,
     /// The fault a call read back (crate::fault) and the slots it ran on:
     /// their caches and rings hold what it condemned, so every later call
     /// refuses until a `reset` of each of those slots.
@@ -637,6 +680,7 @@ impl<B: ChainBody> GpuModel<B> {
             mode: StepMode::Graph,
             selected: 0,
             pos: 0,
+            ahead: None,
             poisoned: None,
             load_times: None,
             reads: 0,
@@ -1028,6 +1072,7 @@ impl<B: ChainBody> GpuModel<B> {
     /// Stand at `pos`: the one write of the position.
     fn stand_at(&mut self, pos: u32) {
         self.pos = pos;
+        self.ahead = None;
     }
 
     /// How the chain submits ([`GpuModel::set_mode`]).
@@ -1089,10 +1134,15 @@ impl<B: ChainBody> GpuModel<B> {
     /// then. A caller that must not continue past one checks
     /// [`GpuModel::poisoned`] first.
     ///
+    /// A step launched ahead and not read back yet is read first
+    /// ([`GpuModel::settle_ahead`]): its fault is this reset's error, the
+    /// slot poisoned by it and not rewound, and the next reset clears it.
+    ///
     /// A residency machine's map stays where use has taken it
     /// ([`GpuModel::residency_reset`] is the explicit call).
     pub fn reset(&mut self) -> Result<(), GpuError> {
         let _busy = watchdog::busy(&self.watch, watchdog::RESET, self.reads);
+        self.settle_ahead("GpuModel::reset")?;
         // The body owns its row store, so it owns what "empty" means there.
         self.body.reset(&self.gpu)?;
         // Empty caches hold nothing a fault condemned — once every slot the
@@ -1233,19 +1283,28 @@ impl<B: ChainBody> GpuModel<B> {
     /// the whole chain.
     pub fn step(&mut self, tokens: &[u32]) -> Result<u32, GpuError> {
         let _busy = watchdog::busy(&self.watch, watchdog::STEP, self.reads);
-        self.refuse_if_poisoned("GpuModel::step")?;
-        self.refuse_if_slots_wait("GpuModel::step")?;
         if tokens.is_empty() {
             return Err(GpuError::shape("GpuModel::step", "empty token slice"));
         }
+        self.ready_step("GpuModel::step")?;
+        let token = self.run_tokens(tokens);
+        self.note_fault("GpuModel::step", token)
+    }
+
+    /// The checks of a one-token step, [`GpuModel::step`]'s and
+    /// [`GpuModel::step_ahead`]'s: refused by name on a poisoned model,
+    /// while a pass of several slots waits for its commit and with no head;
+    /// in graph mode the step captured on its first use.
+    fn ready_step(&mut self, what: &'static str) -> Result<(), GpuError> {
+        self.refuse_if_poisoned(what)?;
+        self.refuse_if_slots_wait(what)?;
         if self.heads.is_empty() {
-            return Err(no_head("GpuModel::step"));
+            return Err(no_head(what));
         }
         if self.mode == StepMode::Graph && self.graphs.get(1).is_none() {
             self.capture_step()?;
         }
-        let token = self.run_tokens(tokens);
-        self.note_fault("GpuModel::step", token)
+        Ok(())
     }
 
     /// [`GpuModel::step`]'s tokens once its checks have passed: each
@@ -1262,29 +1321,158 @@ impl<B: ChainBody> GpuModel<B> {
         self.one_pass = None;
         self.slot_rows = None;
         for &token in tokens {
-            let pos = self.pos;
-            self.check_pos(pos, "GpuModel::step")?;
-            self.refresh_params(token, pos)?;
-            let r = match self.mode {
-                StepMode::Eager => self
-                    .pass_boundary()
-                    .and_then(|()| self.enqueue_chain_step()),
-                StepMode::Graph => self.replay(1, Chain::Step),
-            };
-            self.name_host_refusal(r)?;
-            self.keep_rows(
-                runtime::swaprule::KeptRows::prefix(1),
-                crate::host::PassKind::Step,
-            )?;
-            self.boundary_at(BoundaryAt::Ahead { reads: self.reads })?;
-            self.stand_at(pos + 1);
-            watchdog::pass_done();
+            self.launch_token(token)?;
         }
         self.reads += 1;
         self.heads
             .first()
             .ok_or(no_head("GpuModel::step"))?
             .token(&self.gpu)
+    }
+
+    /// One position of [`GpuModel::run_tokens`]: `token`'s refresh and
+    /// chain at the model's position, its kept row, the next pass's boundary
+    /// made ahead, and the model one position on.
+    fn launch_token(&mut self, token: u32) -> Result<(), GpuError> {
+        let pos = self.pos;
+        self.check_pos(pos, "GpuModel::step")?;
+        self.refresh_params(token, pos)?;
+        let r = match self.mode {
+            StepMode::Eager => self
+                .pass_boundary()
+                .and_then(|()| self.enqueue_chain_step()),
+            StepMode::Graph => self.replay(1, Chain::Step),
+        };
+        self.name_host_refusal(r)?;
+        self.keep_rows(
+            runtime::swaprule::KeptRows::prefix(1),
+            crate::host::PassKind::Step,
+        )?;
+        self.boundary_at(BoundaryAt::Ahead { reads: self.reads })?;
+        self.stand_at(pos + 1);
+        watchdog::pass_done();
+        Ok(())
+    }
+
+    /// [`GpuModel::step`] of one token for a caller that feeds the answer
+    /// back unless its generation stops there: the step of `token` (taken as
+    /// it runs when it is the answer whose step the last call launched),
+    /// then, when the answer's position is below `within` (the positions the
+    /// caller holds; 0 for none) and the model can (graph mode, the position
+    /// inside the cache, a body that takes its input from the card,
+    /// [`ChainBody::refresh_chained`]), the step of the answer launched
+    /// before the answer is read back ([`GpuModel::launch_chained`]). When
+    /// it launched, the model stands past the answer: the next `step_ahead`
+    /// of it takes that step, and any other call keeps the answer fed and
+    /// follows it on the stream, a call that hands the sequence on or reads
+    /// nothing back reading the step's fault first
+    /// ([`GpuModel::settle_ahead`]).
+    pub fn step_ahead(&mut self, token: u32, within: u32) -> Result<(u32, StepAhead), GpuError> {
+        const WHAT: &str = "GpuModel::step_ahead";
+        let _busy = watchdog::busy(&self.watch, watchdog::STEP, self.reads);
+        self.ready_step(WHAT)?;
+        let r = self.run_ahead(token, within);
+        self.note_fault(WHAT, r)
+    }
+
+    /// [`GpuModel::step_ahead`] once its checks have passed.
+    fn run_ahead(&mut self, token: u32, within: u32) -> Result<(u32, StepAhead), GpuError> {
+        const WHAT: &str = "GpuModel::step_ahead";
+        let took = self.ahead.take() == Some(token);
+        if !took {
+            self.one_pass = None;
+            self.slot_rows = None;
+            self.launch_token(token)?;
+            self.reads += 1;
+        }
+        let pos = self.pos;
+        if pos < within
+            && self.mode == StepMode::Graph
+            && self.check_pos(pos, WHAT).is_ok()
+            && let Some(answer) = self.launch_chained(pos)?
+        {
+            let launched = true;
+            return Ok((answer, StepAhead { took, launched }));
+        }
+        let head = self.heads.first().ok_or(no_head(WHAT))?;
+        let launched = false;
+        Ok((head.token(&self.gpu)?, StepAhead { took, launched }))
+    }
+
+    /// The step at `pos` chained behind the one just launched, in graph
+    /// mode: its input from the head's argmax on the card
+    /// ([`ChainBody::refresh_chained`]), the head's readback copied behind
+    /// the step before ([`Head::copy_tokens`]), its replay launched, then the
+    /// answer read back and handed to the body ([`ChainBody::chained_token`])
+    /// before the replay's host service, its kept row and the next pass's
+    /// boundary; the model stands past it, marked as launched ahead. Returns
+    /// the answer, or `None` when the body stages nothing. Once the replay
+    /// is launched the body hears of the answer on every path, a failed
+    /// readback included, so the replay ends.
+    fn launch_chained(&mut self, pos: u32) -> Result<Option<u32>, GpuError> {
+        const WHAT: &str = "GpuModel::step_ahead";
+        let GpuModel {
+            graphs,
+            heads,
+            body,
+            gpu,
+            reads,
+            ..
+        } = self;
+        let head = heads.first_mut().ok_or(no_head(WHAT))?;
+        if !body.refresh_chained(gpu.stream(), pos, head.token_words())? {
+            return Ok(None);
+        }
+        head.copy_tokens(gpu)?;
+        let graph = graphs
+            .get(1)
+            .ok_or(GpuError::state(WHAT, "no captured chain"))?;
+        if let Some(host) = body.host() {
+            host.at_boundary(gpu.stream(), BoundaryAt::Launch { reads: *reads })?;
+        }
+        graph.launch(gpu.stream())?;
+        let answer = head.copied_token();
+        let named = body.chained_token(answer.as_ref().ok().copied());
+        let served = match body.host() {
+            Some(host) => host.serve_captured(Chain::Step),
+            None => Ok(()),
+        };
+        let answer = answer?;
+        named?;
+        self.name_host_refusal(served)?;
+        self.keep_rows(
+            runtime::swaprule::KeptRows::prefix(1),
+            crate::host::PassKind::Step,
+        )?;
+        self.boundary_at(BoundaryAt::Ahead { reads: self.reads })?;
+        self.stand_at(pos + 1);
+        self.reads += 1;
+        self.ahead = Some(answer);
+        watchdog::pass_done();
+        Ok(Some(answer))
+    }
+
+    /// The fault of the step [`GpuModel::step_ahead`] launched ahead while no
+    /// step has read it back: the engine stream waited for and the fault
+    /// word read ([`Gpu::fault`]). A call that hands the sequence on (a
+    /// save, [`GpuModel::reset`]) or moves it without a readback of its own
+    /// ([`GpuModel::rollback`], [`GpuModel::select_slot`]) runs this first,
+    /// so the step's fault is that call's error and poisons the slot it ran
+    /// on ([`GpuModel::note_fault`]), the step no longer pending. Nothing
+    /// when no step is launched ahead, so decode steps wait for nothing more;
+    /// a clean word leaves the step to the next `step_ahead` of its answer.
+    pub(crate) fn settle_ahead(&mut self, what: &'static str) -> Result<(), GpuError> {
+        if self.ahead.is_none() {
+            return Ok(());
+        }
+        let read = match self.gpu.fault() {
+            Ok(Some(fault)) => Err(GpuError::fault(what, fault)),
+            r => r.map(drop),
+        };
+        if read.is_err() {
+            self.ahead = None;
+        }
+        self.note_fault(what, read)
     }
 
     /// Launch the captured chain of `rows` rows and serve the host's share
@@ -1976,12 +2164,13 @@ impl<B: ChainBody> GpuModel<B> {
 }
 
 /// Launch `graph`, a capture of `body`'s, on the engine stream and serve the
-/// host's share of the replay, as `chain`, when the body has a host service:
-/// the only place a captured chain or pass is replayed (`GpuModel::replay`,
-/// a pass of several slots). The host service's residency boundary runs
-/// first, stamped with `reads` ([`HostServed::at_boundary`] at
-/// [`BoundaryAt::Launch`]): the caller has looked `graph` up, so the
-/// boundary runs once the chain is known to exist.
+/// host's share of the replay, as `chain`, when the body has a host service
+/// (`GpuModel::replay`, a pass of several slots). `GpuModel::launch_chained`
+/// replays the step in these steps by hand, reading the answer between the
+/// launch and the serve: a change to the order here is one there. The host
+/// service's residency boundary runs first, stamped with `reads`
+/// ([`HostServed::at_boundary`] at [`BoundaryAt::Launch`]): the caller has
+/// looked `graph` up, so the boundary runs once the chain is known to exist.
 fn launch_served<B: ChainBody>(
     graph: &Graph,
     body: &mut B,
@@ -2912,10 +3101,12 @@ const fn rows_fit<B: Rows>(m: usize) {
 
 impl<B: Rollback> GpuModel<B> {
     /// Take back the positions from `pos` on ([`Rollback::rollback`]): the
-    /// next step runs at `pos`.
+    /// next step runs at `pos`. A step launched ahead is read first
+    /// ([`GpuModel::settle_ahead`]): its fault is the call's error.
     pub fn rollback(&mut self, pos: u32) -> Result<(), GpuError> {
         let _busy = watchdog::busy(&self.watch, watchdog::ROLLBACK, self.reads);
         self.refuse_if_slots_wait("GpuModel::rollback")?;
+        self.settle_ahead("GpuModel::rollback")?;
         if pos > self.pos {
             return Err(GpuError::shape(
                 "GpuModel::rollback",
@@ -2960,6 +3151,7 @@ impl<B: Instrumented> GpuModel<B> {
             ));
         }
         let pos = crate::launch_u32("GpuModel::seed_depth", "rows", rows)?;
+        self.settle_ahead("GpuModel::seed_depth")?;
         self.body.seed_depth(&self.gpu, rows)?;
         self.stand_at(pos);
         Ok(())
