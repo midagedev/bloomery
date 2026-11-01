@@ -7,6 +7,7 @@
 use bloomery_device::conformance::{Clause, Verdict, why};
 use bloomery_device::fault::{Fault, FaultSite};
 use bloomery_device::{Buffer, Device, DeviceError, Elems};
+use bloomery_metal::attention_geom::TILE;
 use bloomery_metal::encode::{Binding, ComputeEncoder};
 use bloomery_metal::geom::AttnGeom;
 use bloomery_metal::kernels::{AttentionParams, AttnCache, ONE_PASS_KEYS, segments_for_keys};
@@ -51,6 +52,17 @@ const CODE_HOLE: u32 = 0x0BAD_0BAD;
 const SCALE_HOLE: u16 = 0x0BAD;
 /// The q8_0 scale a non-finite block stores.
 const Q8_NAN_SCALE: u16 = 0x7e00;
+/// The key count of the fold's underflow scene, which the rule splits into
+/// the cap's segments.
+const UNDERFLOW_KEYS: u32 = 1024;
+/// How far under the other keys' scores the planted segment's scores sit:
+/// past what an f32 weight reaches.
+const UNDERFLOW_DROP: f32 = 200.0;
+/// The least gap between the planted segment's scores and the other keys' at
+/// which an f32 weight of the segment is 0.
+const UNDERFLOW_GAP: f32 = 110.0;
+/// An f16 quiet NaN.
+const F16_NAN: u16 = 0x7e00;
 /// A q8_0 cache row's code words.
 fn q8_words(attn: &AttnGeom) -> usize {
     attn.head / 4
@@ -1211,6 +1223,97 @@ pub fn attn_fault(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     )))
 }
 
+/// The keys one segment holds: `attn_span`'s rule (attention.metal), the live
+/// keys over the segments, rounded up to a tile.
+fn segment_span(n_keys: usize, segments: usize) -> usize {
+    n_keys.div_ceil(segments).div_ceil(TILE) * TILE
+}
+
+/// A segment whose weights underflow still carries its values to the output.
+/// The second of the rule's segments holds only keys that score
+/// [`UNDERFLOW_DROP`] under the other keys of query head 0, so its fold
+/// factor is 0 in f32, and one value row of NaN: every output of key head 0
+/// is NaN, not the finite attention of the other segments.
+pub fn attn_fold_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
+    let attn = &h.geom().attn;
+    let tables = load_tables_for(attn, fixture)?;
+    let scene = scene_keys(UNDERFLOW_KEYS, false);
+    require_live_append(&scene)?;
+    let segments = scene.segments;
+    if segments < 3 {
+        return Err(format!(
+            "{UNDERFLOW_KEYS} keys split into {segments} segments, the scene needs 3"
+        ));
+    }
+    let n_keys =
+        usize::try_from(scene.n_keys).map_err(|_| "a key count does not fit".to_string())?;
+    let pos = usize::try_from(scene.pos).map_err(|_| "a position does not fit".to_string())?;
+    let span = segment_span(n_keys, segments);
+    let (lo, hi) = (span, 2 * span);
+    let nan_row = lo + span / 2;
+    let (q, k, v) = inputs(attn, &scene);
+    let mut planted = plant(attn, &scene)?;
+    let CacheBack::F16 {
+        k: k_rows,
+        v: v_rows,
+    } = &mut planted
+    else {
+        return Err("the f16 scene planted another format".to_string());
+    };
+    let rope = tables
+        .rope
+        .get(pos * attn.rot..(pos + 1) * attn.rot)
+        .ok_or("the rope row is past the table")?;
+    let qn = norm_rope(
+        take_qg_for(attn, &q, 0, 0)?,
+        &tables.q_gain,
+        tables.eps,
+        rope,
+    )?;
+    // Head 0's keys of the segment are one row against its query, scaled to
+    // the drop.
+    let norm: f32 = qn.iter().map(|x| x * x).sum();
+    let against: Vec<f32> = qn
+        .iter()
+        .map(|x| -(UNDERFLOW_DROP / attn.scale) * x / norm)
+        .collect();
+    let row = pack_f16(&against);
+    if row.iter().any(|&bits| !dequant_f16(bits).is_finite()) {
+        return Err("the segment's key row is past what f16 holds".to_string());
+    }
+    let score = |bits: &[u16]| -> f32 {
+        attn.scale
+            * qn.iter()
+                .zip(bits)
+                .map(|(a, &b)| a * dequant_f16(b))
+                .sum::<f32>()
+    };
+    for key in lo..hi {
+        k_rows[key * attn.head..(key + 1) * attn.head].copy_from_slice(&row);
+    }
+    v_rows[nan_row * attn.head..(nan_row + 1) * attn.head].fill(F16_NAN);
+    // The planted rows outside the segment bound the head's maximum from
+    // below (the append can only raise it).
+    let others = (0..scene.prefill)
+        .filter(|key| !(lo..hi).contains(key))
+        .map(|key| score(&k_rows[key * attn.head..(key + 1) * attn.head]))
+        .fold(f32::NEG_INFINITY, f32::max);
+    let gap = others - score(&row);
+    if gap.is_nan() || gap < UNDERFLOW_GAP {
+        return Err(format!(
+            "the segment scores {gap} under the other keys, not the {UNDERFLOW_GAP} an f32 weight needs"
+        ));
+    }
+    let seen = launch(h, &tables, &scene, &q, &k, &v, &planted)?;
+    expect_written_nan(&seen.out[..attn.gqa * attn.head]).map_err(|e| {
+        format!("a NaN value of a segment whose factor underflows did not reach key head 0's outputs: {e}")
+    })?;
+    Ok(Verdict::Noted(format!(
+        "{segments} segments of {span} keys, segment 1 scored {gap:.0} under the other keys on head 0, value row {nan_row} NaN: key head 0's {} heads are NaN",
+        attn.gqa
+    )))
+}
+
 /// The buffers of the refusal table.
 struct Bounds {
     q: MetalBuffer<f32>,
@@ -1403,6 +1506,7 @@ pub fn table<'a>(ctx: &'a super::ClauseCtx<'a>) -> Vec<(&'static str, super::Cla
             }),
         ),
         ("attn_fault", Box::new(|| ctx.with(attn_fault))),
+        ("attn_fold_nan", Box::new(|| ctx.with(attn_fold_nan))),
         ("attn_bounds", Box::new(|| ctx.with(attn_bounds))),
     ]
 }
