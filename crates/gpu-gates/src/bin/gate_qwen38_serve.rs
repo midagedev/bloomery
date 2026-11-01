@@ -544,7 +544,7 @@ mod gate {
     use bloomery_gpu_gates::serve_client::{
         LookupCompletion, PrefixRestore, agree, curl, ids_of, json_of, metric, parse_ids,
         prefix_restore, server_log, shared_system_prompt, slot_action, slot_erased,
-        stepped_completion, tokenized,
+        stepped_completion, stop_of, tokenized,
     };
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
@@ -3504,7 +3504,7 @@ mod gate {
         let (st, body) = curl(&url("/completion"), Some(&completion), false)?;
         let c = json_of("/completion", st, &body)?;
         let ids = ids_of(&c["tokens"])?;
-        let stop = c["stop_type"].as_str().unwrap_or("").to_owned();
+        let stop = stop_of(&c)?.to_owned();
         println!("width-cost tokens {ids:?} stop_type={stop}");
         // PIN(2026-10-30): this load's steps replace the plain run's ids: the draft's card
         // reserve moves target experts to the host, whose sums round another way; was
@@ -5286,7 +5286,7 @@ mod gate {
         let (st, body) = curl(&url("/completion"), Some(&completion), false)?;
         let c1 = json_of("/completion", st, &body)?;
         let first = ids_of(&c1["tokens"])?;
-        let stop = c1["stop_type"].as_str().unwrap_or("").to_owned();
+        let stop = stop_of(&c1)?.to_owned();
         println!(
             "completion tokens {first:?} stop_type={stop} content={}",
             c1["content"]
@@ -5461,7 +5461,7 @@ mod gate {
         let (st, body) = curl(&url("/completion"), Some(&completion), false)?;
         let c1 = json_of("/completion", st, &body)?;
         let first = ids_of(&c1["tokens"])?;
-        let stop = c1["stop_type"].as_str().unwrap_or("").to_owned();
+        let stop = stop_of(&c1)?.to_owned();
         println!(
             "completion tokens {first:?} stop_type={stop} content={}",
             c1["content"]

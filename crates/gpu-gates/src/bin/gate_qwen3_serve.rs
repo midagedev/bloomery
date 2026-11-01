@@ -551,7 +551,7 @@ mod gate {
     use bloomery_gpu_gates::serve_client::{
         self, Answer, PrefixTurns, Served, WholeTerms, agree, answered, chat_is_those_ids, check,
         curl, edit_and_extension, greedy_chat, ids_of, json_of, metric, rendered, scripted_call,
-        serve_cmd, server_log, tokenized, whole_terms,
+        serve_cmd, server_log, stop_of, tokenized, whole_terms,
     };
     use bloomery_gpu_gates::ubatch_pick;
     use bloomery_gpu_gates::vision_seat::{self, EncoderSeat};
@@ -3444,7 +3444,9 @@ mod gate {
                 "jump-jump.json"
             };
             std::fs::write(dir.join(name), &text)?;
-            json_of("/completion", st, &text)
+            let v = json_of("/completion", st, &text)?;
+            stop_of(&v)?;
+            Ok(v)
         };
         let jump = ask(false)?;
         let jt = ids_of(&jump["tokens"])?;

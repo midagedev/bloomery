@@ -313,7 +313,7 @@ mod gate {
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::serve_client::{
         self, Served, agree, curl, ids_of, json_of, metric, parse_ids, plan_run, server_log,
-        slot_action,
+        slot_action, stop_of,
     };
     use bloomery_gpu_gates::{GateError, checks_failed, data_dir, ref_model_path, verdict};
     use gguf::{Gguf, Split};
@@ -2632,7 +2632,7 @@ mod gate {
         let (st, body) = curl(&url("/completion"), Some(&completion), false)?;
         let c1 = json_of("/completion", st, &body)?;
         let ids = ids_of(&c1["tokens"])?;
-        let stop = c1["stop_type"].as_str().unwrap_or("").to_owned();
+        let stop = stop_of(&c1)?.to_owned();
         let t = &c1["timings"];
         println!("completion tokens {ids:?} stop_type={stop}");
         println!("plain server     {plain_ids:?}");
@@ -2954,7 +2954,7 @@ mod gate {
         let (st, body) = curl(&url("/completion"), Some(&completion), false)?;
         let c1 = json_of("/completion", st, &body)?;
         let ids = ids_of(&c1["tokens"])?;
-        let stop = c1["stop_type"].as_str().unwrap_or("").to_owned();
+        let stop = stop_of(&c1)?.to_owned();
         let t = &c1["timings"];
         println!("completion tokens {ids:?} stop_type={stop}");
         println!("generate_ds41    {reference:?}");
@@ -3111,7 +3111,7 @@ mod gate {
         let (st, body) = curl(&url("/completion"), Some(&completion), false)?;
         let c1 = json_of("/completion", st, &body)?;
         let first = ids_of(&c1["tokens"])?;
-        let stop = c1["stop_type"].as_str().unwrap_or("").to_owned();
+        let stop = stop_of(&c1)?.to_owned();
         println!(
             "completion tokens {first:?} stop_type={stop} content={}",
             c1["content"]

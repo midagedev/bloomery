@@ -296,7 +296,8 @@ mod gate {
     use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
     use bloomery_gpu_gates::serve_client::{
         self, PrefixRestore, agree, base64, beside, check, completion, curl, draft_counts, ids_of,
-        json_of, metric, parse_ids, plan_run, prefix_restore, rendered, server_log, tokenized,
+        json_of, metric, parse_ids, plan_run, prefix_restore, rendered, server_log, stop_of,
+        tokenized,
     };
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path};
@@ -1239,7 +1240,7 @@ mod gate {
         );
         let c = greedy(&url, ids, N_PREDICT, false)?;
         let got = ids_of(&c["tokens"])?;
-        let stop = c["stop_type"].as_str().unwrap_or("").to_owned();
+        let stop = stop_of(&c)?.to_owned();
         let t = &c["timings"];
         println!(
             "draft-only completion tokens {got:?} stop_type={stop} draft_n={} draft_n_accepted={}",
@@ -1263,7 +1264,7 @@ mod gate {
         let (st, text) = curl(&url("/completion"), Some(&top1), false)?;
         let k1 = json_of("/completion", st, &text)?;
         let sampled = ids_of(&k1["tokens"])?;
-        let k1_stop = k1["stop_type"].as_str().unwrap_or("").to_owned();
+        let k1_stop = stop_of(&k1)?.to_owned();
         println!(
             "draft-only top_k 1 sample tokens {sampled:?} stop_type={k1_stop} draft_n={}",
             k1["timings"]["draft_n"]
@@ -1317,7 +1318,7 @@ mod gate {
                 cache_n: c["timings"]["cache_n"].as_u64().unwrap_or(u64::MAX),
                 draft_n,
                 accepted,
-                stop: c["stop_type"].as_str().unwrap_or("").to_owned(),
+                stop: stop_of(&c)?.to_owned(),
                 lines: lines_from(err_log, from)?,
             })
         }
@@ -1816,7 +1817,7 @@ mod gate {
         let (mut alone, mut stops) = (Vec::new(), Vec::new());
         for ids in [&a_ids, &c_ids] {
             let v = greedy(&url, ids, SLOTS_PREDICT, false)?;
-            stops.push(v["stop_type"].as_str().unwrap_or("").to_owned());
+            stops.push(stop_of(&v)?.to_owned());
             alone.push(run(&v)?);
         }
         let busy = |decodes: f64| -> Result<f64, GateError> {
@@ -2036,7 +2037,7 @@ mod gate {
         // the turn and cuts to its prompt call's end.
         let first = greedy(url, ids[0], SLOTS_PREDICT, false)?;
         let reply = ids_of(&first["tokens"])?;
-        let stopped = first["stop_type"].as_str().unwrap_or("");
+        let stopped = stop_of(&first)?;
         if stopped != "limit" || reply.len() != SLOTS_PREDICT {
             return Err(format!(
                 "the skipping clause's first turn stopped at {} tokens ({stopped}): the clause \
@@ -2075,7 +2076,7 @@ mod gate {
             "slots skipping: the strip alone {} ids ({}) cache_n {:?} (the turn's end \
              {turn_end}) draft_n {}, skips {alone_skips:?}",
             alone_ids.len(),
-            alone["stop_type"].as_str().unwrap_or(""),
+            stop_of(&alone)?,
             cache_n(&alone),
             alone["timings"]["draft_n"],
         );
@@ -2499,7 +2500,7 @@ mod gate {
         check(&mut ok, "plain_chat_turn_served", st == 200);
         let c = greedy(&url, &ids, N_PREDICT, false)?;
         let got = ids_of(&c["tokens"])?;
-        let stop = c["stop_type"].as_str().unwrap_or("").to_owned();
+        let stop = stop_of(&c)?.to_owned();
         println!("plain completion tokens {got:?} stop_type={stop}");
         let (st, body) = curl(&url("/residency/reset"), Some(&json!({})), false)?;
         println!("plain residency reset: HTTP {st} {body}");
@@ -2554,7 +2555,7 @@ mod gate {
         let mut ok = true;
         let c = greedy(&url, ids, N_PREDICT, false)?;
         let got = ids_of(&c["tokens"])?;
-        let stop = c["stop_type"].as_str().unwrap_or("").to_owned();
+        let stop = stop_of(&c)?.to_owned();
         let t = &c["timings"];
         println!(
             "width-cost tokens {got:?} stop_type={stop} draft_n={} draft_n_accepted={}",
@@ -2649,7 +2650,7 @@ mod gate {
         let before = lines_from(&err_log, 0)?.len();
         let c = greedy(&url, &ids, N_PREDICT, false)?;
         let first = ids_of(&c["tokens"])?;
-        let stop = c["stop_type"].as_str().unwrap_or("").to_owned();
+        let stop = stop_of(&c)?.to_owned();
         let t = &c["timings"];
         println!(
             "drafted completion tokens {first:?} stop_type={stop} draft_n={} draft_n_accepted={}",
