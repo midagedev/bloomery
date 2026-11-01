@@ -579,14 +579,26 @@ struct Pick {
     /// ([`Gen::lend_out`]): the place among the pass's rows a refusal names.
     answered: usize,
     /// The program's refusal of a pick, with its row's place among its
-    /// pass's (`answered` then). A step's, or a pass's at its first row, the
-    /// next [`Gen::pump`] returns before it takes the token; one at a later
-    /// row is returned once the pass's ids before it are taken
-    /// ([`Gen::advanced`]). The refused pick and every id after it go
-    /// untaken. A watch's refusal of the text a free id wrote ([`Pick::read`])
-    /// names the row after that id's: the id is taken, its stop words read,
-    /// and the refusal follows it ([`Gen::answer`] holds a step's).
-    refused: Option<(usize, StepError)>,
+    /// pass's (`answered` then) and what it refuses. A step's, or a pass's at
+    /// its first row, the next [`Gen::pump`] returns before it takes the
+    /// token; one at a later row is returned once the pass's ids before it
+    /// are taken ([`Gen::advanced`]). The refused pick and every id after it
+    /// go untaken. A watch's refusal of the text a free id wrote
+    /// ([`Pick::read`]) names the row after that id's: the id is taken, its
+    /// stop words read, and the refusal follows it ([`Gen::answer`] holds a
+    /// step's).
+    refused: Option<(usize, StepError, Refuses)>,
+}
+
+/// What a [`Pick`]'s refusal refuses.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Refuses {
+    /// A pick the program does not allow: no id is taken for it, so a
+    /// request that ends on the ids before it never asks for it.
+    Row,
+    /// The text an id the watch took wrote: the id is taken, and the request
+    /// ending on it does not spare the refusal.
+    Text,
 }
 
 /// What a watch's pick reads of the ids it takes as free text, each as it
@@ -629,7 +641,7 @@ impl Pick {
         }
         self.answered += 1;
         if free && let Err(e) = self.read(id) {
-            self.refused = Some((self.answered, e));
+            self.refused = Some((self.answered, e, Refuses::Text));
         }
         id
     }
@@ -714,7 +726,7 @@ impl Pick {
                 None => walk.choose(row),
             };
             return picked.unwrap_or_else(|e| {
-                self.refused = Some((self.answered, e));
+                self.refused = Some((self.answered, e, Refuses::Row));
                 argmax(row)
             });
         }
@@ -2309,10 +2321,15 @@ pub(crate) struct Gen {
     /// The last pass's kept tokens, and how many of them the loop has taken.
     kept: Vec<u32>,
     taken: usize,
-    /// The program's refusal of a pass's row past its first, or a watch's
-    /// refusal of the text an id it took wrote, returned once the ids before
-    /// it, all `kept` holds, are taken; a stop among them drops it.
+    /// The program's refusal of a pass's row past its first, returned once
+    /// the ids before it, all `kept` holds, are taken and the loop asks for
+    /// that pick: a stop or a token limit among them leaves it unread.
     refused_after: Option<StepError>,
+    /// A watch's refusal of the text an id it took wrote, returned once that
+    /// id is taken, a token limit that ends the request on it included; one
+    /// drafted behind ids still to be taken waits for them, and a stop among
+    /// them drops it.
+    refused_text: Option<StepError>,
     /// The copy of the history a sampled pass lends the engine
     /// ([`Slot::advance_sampled`]), kept for its capacity.
     lent_history: Vec<u32>,
@@ -2478,6 +2495,7 @@ impl Gen {
             kept: Vec::with_capacity(rows),
             taken: 0,
             refused_after: None,
+            refused_text: None,
             lent_history: Vec::new(),
             tok: None,
             think: (p.reasoning_budget.is_some() || p.reasoning_loop || holds).then(|| {
@@ -2560,9 +2578,8 @@ impl Gen {
             .pick
             .answer(&self.logits, &self.history, forced, Some(g));
         self.count_picks();
-        let answered = self.pick.answered;
-        if let Some((_, e)) = self.pick.refused.take_if(|(at, _)| *at == answered) {
-            self.refused_after = Some(e);
+        if let Some((_, e, _)) = self.pick.refused.take_if(|(_, _, of)| *of == Refuses::Text) {
+            self.refused_text = Some(e);
         }
         id
     }
@@ -2926,7 +2943,7 @@ impl Gen {
         sink: &mut dyn FnMut(Event<'_>) -> io::Result<()>,
         tick: &mut dyn FnMut(&Timings),
     ) -> Result<Need, GenError> {
-        if let Some((_, e)) = self.pick.refused.take() {
+        if let Some((_, e, _)) = self.pick.refused.take() {
             return Err(e.into());
         }
         if let Some(span) = &self.span {
@@ -3007,7 +3024,7 @@ impl Gen {
             // the id is taken, a token limit that ends the request on it
             // included; one drafted behind ids still to be taken waits for them.
             if self.taken >= self.kept.len()
-                && let Some(e) = self.refused_after.take()
+                && let Some(e) = self.refused_text.take()
             {
                 return Err(e.into());
             }
@@ -3034,6 +3051,12 @@ impl Gen {
                 self.taken += 1;
                 self.tok = Some(t);
                 continue;
+            }
+            // The program's refusal of the pick after the ids a pass kept is
+            // asked for here only: a stop word or a token limit on them ends
+            // the request first.
+            if let Some(e) = self.refused_after.take() {
+                return Err(e.into());
             }
             let (n, len) = (self.n, self.generated.len());
             // Feeding `tok` takes position n + len - 1; the cache holds ctx_max.
@@ -3238,9 +3261,12 @@ impl Gen {
         self.tim.book(d);
         book_depths(&mut self.depths, d);
         self.tim.n_past = self.n + self.generated.len() + self.kept.len() - 1;
-        if let Some((at, e)) = self.pick.refused.take_if(|(at, _)| *at > 0) {
+        if let Some((at, e, of)) = self.pick.refused.take_if(|(at, _, _)| *at > 0) {
             self.kept.truncate(at);
-            self.refused_after = Some(e);
+            match of {
+                Refuses::Row => self.refused_after = Some(e),
+                Refuses::Text => self.refused_text = Some(e),
+            }
         }
         self.tok = Some(self.kept[0]);
         self.taken = 1;
