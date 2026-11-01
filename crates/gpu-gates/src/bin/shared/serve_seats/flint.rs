@@ -15,7 +15,7 @@ use super::hybrid::Family;
 
 const NAME: &str = "bloomery-serve-flint";
 const USAGE: &str = "usage: bloomery-serve --model flint [-m PATH | --hf <repo>[:<quant>]] \
-                     [--host H] [--port P] [--ctx C] [--parallel N] [--slot-ctx S] [--alias NAME] \
+                     [--host H] [--port P] [--ctx C] [--parallel N|auto] [--slot-ctx S] [--alias NAME] \
                      [--chat-template-file PATH] [--place W] [--plan] [--queue-depth Q] \
                      [--slot-save-path DIR] [--api-key KEY] [--api-key-file FNAME]";
 

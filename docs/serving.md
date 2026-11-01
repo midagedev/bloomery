@@ -337,20 +337,19 @@ downloads anything; `bloomery-serve --model <seat> --help` prints that usage.
 
 | Seat | `--parallel` | `--cache-ram` | `-ub`, `--ubatch-size` | `--mmproj` ¹ | Its own flags |
 |---|---|---|---|---|---|
-| `ds41` | N | yes | no | yes | |
-| `glm` | N | yes | no | yes | `--prefill batch\|steps` |
+| `ds41` | N or `auto` | yes | no | yes | |
+| `glm` | N or `auto` | yes | no | yes | `--prefill batch\|steps` |
 | `qwen38` | N or `auto` | yes | 1 to 4096 | yes ² | `--cache-type-k f16\|q8_0` |
-| `qwen3` | N | no | a file with no routed expert ³ | yes | `--cache-type-k f16\|q8_0` |
-| `mimo2` | N | yes | no | no | `--prefill batch\|steps` |
-| `minimaxm3` | N | yes | no | no | |
-| `flint` | N | no | no | no | |
+| `qwen3` | N or `auto` | no | a file with no routed expert ³ | yes | `--cache-type-k f16\|q8_0` |
+| `mimo2` | N or `auto` | yes | no | no | `--prefill batch\|steps` |
+| `minimaxm3` | N or `auto` | yes | no | no | |
+| `flint` | N or `auto` | no | no | no | |
 | `musespark` | 1 | yes | no | no | |
 | `solar2`, `nemotron`, `raon1` | 1 | no | no | no | |
 | `decide` | no (one request at a time) | no | yes | Clef only | `--head`, `--head-config`; it takes only `--host`, `--port`, `--ctx`, `-ub`, the key flags and the image flags |
 
-`N` is any count, 1 by default; `1` is the seat's one slot, and `--parallel` above 1 is refused by name. `auto`
-counts the slots from memory ("Concurrent requests" in [The seats](#the-seats)); every other seat refuses `--parallel auto`
-by name. `--mmproj`
+`N` is any count, 1 by default; `1` is the seat's one slot, and `--parallel` above 1 or `auto` is refused by name. `auto`
+counts the slots from memory ("Concurrent requests" in [The seats](#the-seats)). `--mmproj`
 stands for the image flags together (`--no-mmproj`, `--image-min-tokens`, `--image-max-tokens`; Image input, below).
 `--park-ram` is refused by name on every seat that reads it (ds41, glm, qwen3, qwen38): their slots are resident
 sequences. The short spellings `-c`, `-np`, `-ub`, `-a`, `-mm` and `-cram` are the long flags
@@ -747,13 +746,17 @@ rows, on V4.1 the same way; with no context named, each slot holds the default's
 line it replaces `LLAMA_ARG_CTX_SIZE` and a settings file's `ctx-size`, as `--ctx-size` does. Every seat that takes
 `--parallel` takes it.
 
-`--parallel auto` (the qwen38 seat) picks the count from memory: the most slots, up to 8, whose plan holds one
-request's context. That context is `--slot-ctx` when set. Unset, it is the context one slot's default takes, when
+`--parallel auto` picks the count from memory on every seat that serves several slots: the most slots, up to 8, whose
+plan holds one request's context. That context is `--slot-ctx` when set. Unset, it is the context one slot's default takes, when
 that is the model's limit; where one slot already has to fit under the limit, auto serves one slot. The placement and
 the draft are chosen at one slot first, so auto counts the slots that load holds. A `--slot-ctx` that not even one
 slot holds is refused by name, as `--parallel 1 --slot-ctx S` would be. `--parallel auto` beside `--ctx-size` (or its
-variable or file entry) is refused by name, and under `BLOOMERY_ROUTE_TRACE` it serves one slot. The `parallel` line names the count it chose
-with `from=auto`. The default stays one slot; auto is never chosen for you.
+variable or file entry) is refused by name. Where the load chosen at one slot serves one sequence, auto serves one
+slot: under `BLOOMERY_ROUTE_TRACE` (qwen38, ds41) and the DSpark draft (ds41, qwen3) the `parallel` line says so with
+`from=route-trace` or `from=dspark`; under the qwen3 seat's in-file MTP draft (unset or `BLOOMERY_DRAFT=mtp` on a file
+that carries the layer; `BLOOMERY_DRAFT=off` counts the slots) and beside an expert tier card on the mimo2 seat, a
+`parallel auto slots=1` line does. Otherwise the `parallel` line names the count with `from=auto`: the largest N for
+which `--parallel N` at the same slot context holds. The default stays one slot; auto is never chosen for you.
 The plan counts every slot, so the slots' caches together never pass what it holds, and `--park-ram` is refused by
 name. A new request's prompt runs in one call between rounds, and the other streams wait for it. On Qwen3.8, unless the
 MTP draft serves the slots or `--mmproj` loads an image encoder, a prompt with more than 4,096 ids past its cached

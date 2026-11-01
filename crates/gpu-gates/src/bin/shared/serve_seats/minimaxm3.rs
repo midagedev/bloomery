@@ -8,7 +8,7 @@
 //!     bloomery-serve --model minimaxm3 [-m PATH | --hf <repo>[:<quant>]]
 //!                    [--host 127.0.0.1] [--port 8080] [--ctx C] [--alias NAME]
 //!                    [--chat-template-file PATH] [--place W] [--plan]
-//!                    [--parallel N] [--slot-ctx S] [--cache-ram MIB] [--queue-depth Q]
+//!                    [--parallel N|auto] [--slot-ctx S] [--cache-ram MIB] [--queue-depth Q]
 //!                    [--slot-save-path DIR] [--api-key KEY] [--api-key-file FNAME]
 //!
 //! The server takes `-m`/`--hf` out before this seat parses (its module
@@ -181,7 +181,7 @@ const NAME: &str = "bloomery-serve-minimaxm3";
 
 const USAGE: &str = "usage: bloomery-serve --model minimaxm3 [-m PATH | --hf <repo>[:<quant>]] \
                      [--host H] [--port P] [--ctx C] [--alias NAME] [--chat-template-file PATH] \
-                     [--place W] [--plan] [--parallel N] [--slot-ctx S] [--cache-ram MIB] \
+                     [--place W] [--plan] [--parallel N|auto] [--slot-ctx S] [--cache-ram MIB] \
                      [--queue-depth Q] [--slot-save-path DIR] [--api-key KEY] [--api-key-file FNAME]";
 
 /// The levers this seat acts on: the plan's card budget and the host set's
