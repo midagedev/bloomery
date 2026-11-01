@@ -97,6 +97,8 @@ d1·d1n·d2는 라우터 추적이 쓴 산문 코퍼스 `/root/bloomery-data/eng
 
 2026-09-23 17:14부터는 그 위에 한 줄을 더 얹은 `db517b69`(T=1 인덱스 분기가 스레드마다 자기 헤드의 sink를 넘긴다 — 업스트림 ik#2511과 같은 줄)의 답이다. `49ef19d0`의 d-세트 다섯(`d1n`·`d1`·`d1_unfused`·`d2`·`d2_unfused`)은 iqk 층 2–39에서 스레드의 첫 헤드 몫이 아닌 헤드가 첫 헤드들의 sink를 접었다. 다시 뜬 세트에서 처음 달라지는 노드는 `fattn-2`이고(d1n), 5토큰 배치 세트와 `step4`는 바이트까지 같다 — 프리필과 인덱스가 없는 스텝은 그 분기를 타지 않는다. attn 게이트는 `# build`로 sink 규칙을 고른다(`c10fbbcc`·`49ef19d0`만 첫 헤드들의 sink). 옛 세트는 `/root/bloomery-data-pre-sinkfix/`에 하드링크로 두었다가 파동의 base를 잡은 뒤 지운다.
 
+`db517b69` 트리는 공개되어 있다: midagedev/ik_llama.cpp의 `oracle/db517b69` 브랜치(`v41/dspark` 위에 `49ef19d0`과 `db517b69` 두 커밋). 이 트리로 빌드해 뜬 세트는 `# build` 줄이 `db517b69`이므로 qwen4exp를 비롯한 refset 검사가 그대로 연다.
+
 ## 왜 `llama-eval-callback`이 아닌가
 
 그것은 값 3개 + `...` + 값 3개 + 합만 찍는 **요약 텍스트**다(2026-09-19 박스에서 확인).
