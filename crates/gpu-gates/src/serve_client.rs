@@ -925,6 +925,51 @@ pub fn completion(
     json_of("/completion", st, &text)
 }
 
+/// Greedy ids on the same loaded server without a speculative pass, and the
+/// reference requests' total draft count.
+pub fn stepped_completion(
+    url: &dyn Fn(&str) -> String,
+    ids: &[u32],
+    n: usize,
+) -> Result<(Vec<u32>, u64), GateError> {
+    let mut prefix = ids.to_vec();
+    let mut tokens = Vec::new();
+    let mut proposed = 0u64;
+    for i in 0..n {
+        // The first token ends each request before a speculative pass can
+        // start. Every later prompt feeds only the preceding answer's id.
+        let s = completion(url, &prefix, 1, i > 0)?;
+        if i > 0 {
+            let kept = u64::try_from(prefix.len() - 1)?;
+            if s["timings"]["cache_n"].as_u64() != Some(kept) {
+                return Err(format!(
+                    "step reference: expected {kept} cached positions before token {i}: {s}"
+                )
+                .into());
+            }
+        }
+        proposed = proposed
+            .checked_add(draft_counts(&s)?.0)
+            .ok_or("step reference: draft count overflow")?;
+        let ids: Vec<u32> = serde_json::from_value(s["tokens"].clone())
+            .map_err(|e| format!("step reference: tokens: {e}"))?;
+        match ids.as_slice() {
+            [id] => {
+                prefix.push(*id);
+                tokens.push(*id);
+            }
+            [] if s["stop_type"] == "eos" => break,
+            _ => return Err(format!("step reference: expected one token: {s}").into()),
+        }
+        match s["stop_type"].as_str() {
+            Some("limit") => {}
+            Some("eos") => break,
+            _ => return Err(format!("step reference: unexpected stop_type: {s}").into()),
+        }
+    }
+    Ok((tokens, proposed))
+}
+
 /// What the server answered for one prompt.
 pub struct Answer {
     pub prompt: Vec<u32>,
@@ -1384,8 +1429,49 @@ pub fn prefix_restore(
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{LookupCompletion, draft_counts, held_ms, slot_erased, together};
+    use super::{
+        LookupCompletion, completion, curl, draft_counts, held_ms, ids_of, slot_erased,
+        stepped_completion, together,
+    };
     use serde_json::json;
+
+    /// The step reference never runs a pass, even on a server that drafts
+    /// requests asking for probabilities. Mutant: one multi-token request
+    /// with `n_probs` as the reference.
+    #[test]
+    fn stepped_completion_never_drafts_on_a_drafting_load() {
+        let config = serve::ServerConfig {
+            model_alias: "mock".into(),
+            model_path: "mock.gguf".into(),
+            chat_template: include_str!("../../serve/tests/fixtures/v41-chat-template.jinja")
+                .into(),
+            chat_preparation: None,
+            sampler: None,
+            fatal_linger: serve::FATAL_LINGER,
+            slot_save_path: None,
+            api_keys: serve::flag::ApiKeys::default(),
+        };
+        let server = serve::Server::bind(
+            "127.0.0.1:0",
+            Box::new(serve::DraftMock::new(4096).with_sampled_draft(3, 2, 3)),
+            config,
+        )
+        .unwrap();
+        let addr = server.spawn().unwrap();
+        let url = |p: &str| format!("http://{addr}{p}");
+        let ids = [97, 98, 97];
+        let drafted = completion(&url, &ids, 16, false).unwrap();
+        assert!(draft_counts(&drafted).unwrap().0 > 0, "{drafted}");
+        let (steps, count) = stepped_completion(&url, &ids, 16).unwrap();
+        assert_eq!(count, 0, "the reference drafted {count} ids");
+        assert_eq!(steps, ids_of(&drafted["tokens"]));
+        assert_eq!(stepped_completion(&url, &ids, 0).unwrap(), (vec![], 0));
+        assert_eq!(stepped_completion(&url, &ids, 1).unwrap().0.len(), 1);
+        assert_eq!(
+            curl(&url("/shutdown"), Some(&json!({})), false).unwrap().0,
+            200
+        );
+    }
 
     /// The two requests of a round start together: the second is posted while the first still
     /// holds its slot, however short the body's whole run is, so the second starts within

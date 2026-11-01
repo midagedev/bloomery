@@ -93,7 +93,7 @@
 //!   arm's main server, after that server's drafted clauses;
 //! - under the draft (`--arm drafted`, that arm's main server): a greedy
 //!   `/completion` gives the ids of the same server's steps (the request
-//!   once more with `n_probs`, which drafts nothing; a plain load places
+//!   one token a request, reusing the prefix; a plain load places
 //!   more target experts on the card, so its ids are no reference) with its
 //!   draft counts carried
 //!   (a draft changes which passes run, never a token; the fixture tier
@@ -190,11 +190,10 @@
 //!   (`slots_drafted_sampled_rounds_run_one_pass`: the seat runs both
 //!   sampled windows as one pass) and each request's together ids are its
 //!   alone ones (`slots_drafted_sampled_together_alone`: each window's
-//!   draws its own); the same pair asking one probability a token, so each
-//!   steps: every together record `cmd=step` of `passes=1` carrying both
-//!   slots (`slots_drafted_probs_rounds_run_one_pass`: the seat runs a
-//!   drafted load's round of plain steps as one pass of its rows, each told
-//!   to its slot's draft) and the together ids the alone ones
+//!   draws its own); the same pair asking one probability a token also
+//!   drafts: every together record `cmd=pass` of `passes=1` carrying both
+//!   slots (`slots_drafted_probs_rounds_run_one_pass`: both windows share a
+//!   pass and collect their probabilities) and the together ids the alone ones
 //!   (`slots_drafted_probs_together_alone`); then the pair with no ban,
 //!   the second asking 8 ids: the first drafts beside it and then alone
 //!   from the state the shared passes left its draft, its draft
@@ -270,7 +269,7 @@
 //!   server's 501; a draft run with no chooser prints no `mtp width` record.
 //! - the width chooser's clause ([`width_cost`], a server of its own under
 //!   `BLOOMERY_DRAFT=mtp`, `BLOOMERY_RESIDENCY=off` and
-//!   `BLOOMERY_MTP_WIDTH=cost`): the prompt's steps (`n_probs`, no draft),
+//!   `BLOOMERY_MTP_WIDTH=cost`): the prompt's steps (one token a request),
 //!   one greedy request then the server's orderly stop, which prints the
 //!   request's record; its ids its steps', its draft counts carried, and the chooser's `mtp width` record
 //!   its own aggregate — windows the widths above 0,
@@ -543,6 +542,7 @@ mod gate {
     use bloomery_gpu_gates::serve_client::{
         LookupCompletion, PrefixRestore, curl, draft_counts, ids_of, json_of, metric, parse_ids,
         prefix_restore, server_log, shared_system_prompt, slot_action, slot_erased,
+        stepped_completion, tokenized,
     };
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
@@ -3178,9 +3178,9 @@ mod gate {
     /// banning the end ids, which draws in drafted passes alone and together
     /// on this drafted load, every together round one `pass` of both slots'
     /// windows ([`sampled_pair`], `slots_drafted_sampled_*`); the same pair
-    /// asking a probability a token, which steps on this drafted load, every
-    /// together round one `step` pass of both rows, each row told to its
-    /// slot's draft (`slots_drafted_probs_*`); then the pair with no ban,
+    /// asking a probability a token, which drafts on this load too, every
+    /// together round one `pass` of both windows (`slots_drafted_probs_*`);
+    /// then the pair with no ban,
     /// `ids[1]` asking [`DRAFTED_SAMPLED_SHORT`] ids, so `ids[0]` drafts
     /// beside it and then alone from the state its windows in the shared
     /// passes left its draft: its proposals an id past the short request's
@@ -3204,7 +3204,9 @@ mod gate {
             (true, 0),
             "pass",
         )?;
-        ok &= sampled_pair("slots_drafted_probs", addr, err_log, ids, (true, 1), "step")?;
+        // PIN(2026-11-01): probabilities are collected from verified rows,
+        // so asking for them no longer forces plain steps.
+        ok &= sampled_pair("slots_drafted_probs", addr, err_log, ids, (true, 1), "pass")?;
         let alone = answer(
             "slots-drafted-sampled",
             sampled_stream(addr, ids[0], SLOTS_PREDICT, false, 0)?,
@@ -3444,30 +3446,11 @@ mod gate {
         Ok(ok)
     }
 
-    /// The greedy ids of `prompt` on this server's own steps, and that
-    /// request's draft count ([`draft_counts`]): the request with `n_probs`,
-    /// which runs one row at a time and drafts nothing, fed fresh. The
-    /// reference a drafted load's greedy ids are held to: a plain load's ids
-    /// are none, for the draft's card bytes leave fewer target experts on the
-    /// card, and an expert served on the host rounds its sums another way, so
-    /// a greedy id can differ at a near tie (as the sampled ids do,
-    /// [`sampled_served`]). The drafted request that follows is fed fresh
-    /// too, so this one leaves no prefix it keeps.
-    fn steps_of(url: &dyn Fn(&str) -> String, prompt: &str) -> Result<(Vec<u32>, u64), GateError> {
-        let steps = json!({
-            "prompt": prompt, "n_predict": N_PREDICT, "temperature": 0, "n_probs": 2,
-            "return_tokens": true, "cache_prompt": false,
-        });
-        let (st, body) = curl(&url("/completion"), Some(&steps), false)?;
-        let s = json_of("/completion steps", st, &body)?;
-        Ok((ids_of(&s["tokens"]), draft_counts(&s)?.0))
-    }
-
     /// The width chooser's own server (the module header): the draft on,
     /// the residency off and `BLOOMERY_MTP_WIDTH=cost`, one greedy request
     /// of the gate's prompt then the server's orderly stop — the chooser's
     /// `mtp width` record of the slot's last request prints there, with no
-    /// later request to close it out, after its steps ([`steps_of`], which
+    /// later request to close it out, after its steps ([`stepped_completion`], which
     /// run no pass and so print no record) — holding: the request's
     /// ids its steps' (the chooser changes which rows a pass runs,
     /// never a token), its draft counts carried, and the record the
@@ -3514,7 +3497,8 @@ mod gate {
         };
         let url = |p: &str| format!("http://{addr}{p}");
         let mut ok = true;
-        let (reference, steps_draft_n) = steps_of(&url, prompt)?;
+        let (reference, steps_draft_n) =
+            stepped_completion(&url, &tokenized(&url, prompt)?, N_PREDICT)?;
         println!("width-cost steps {reference:?} draft_n={steps_draft_n}");
         check(
             &mut ok,
@@ -5476,7 +5460,7 @@ mod gate {
             .chain(SERVER_ARGS.iter().map(|s| (*s).to_owned()))
             .collect();
         ok &= props_engine(&url, &argv, served.child.id(), levers, &err_log, true)?;
-        let (reference, steps_draft_n) = steps_of(&url, prompt)?;
+        let (reference, steps_draft_n) = stepped_completion(&url, ids, N_PREDICT)?;
         println!("steps on the drafted server: tokens {reference:?} draft_n={steps_draft_n}");
         println!("generate_qwen3moe {generated:?} (another placement, not compared)");
         check(
