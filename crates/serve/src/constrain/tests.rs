@@ -3875,6 +3875,37 @@ fn an_invalid_tool_schema_under_auto_is_refused_and_one_outside_the_subset_is_un
             );
         }
     }
+    // A JSON response_format keeps its own program and no watch, and still
+    // refuses an invalid tool, `auto` given or not.
+    let schema = json!({"type": "json_schema", "json_schema": {"schema": {"type": "object"}}});
+    for format_field in [json!({"type": "json_object"}), schema] {
+        for choice in [Some("auto"), None] {
+            for parameters in &invalid {
+                let mut o = json!({"tools": [{"type": "function", "function": {"name": "f",
+                    "parameters": parameters}}], "response_format": format_field});
+                if let Some(c) = choice {
+                    o["tool_choice"] = json!(c);
+                }
+                let e = request(
+                    o.as_object().unwrap(),
+                    &Ask {
+                        tok: &*tok,
+                        vocab: &vocab,
+                        format: ToolFormat::Hermes,
+                        think: ThinkTags::THINK,
+                    },
+                )
+                .expect_err(&o.to_string());
+                assert!(!e.outside_subset && !e.unsupported, "{o}: {e}");
+                assert!(
+                    e.field
+                        .as_deref()
+                        .is_some_and(|f| f.starts_with("tools[0].f.parameters")),
+                    "{o}: {e}"
+                );
+            }
+        }
+    }
     let outside = [
         (
             ToolFormat::Hermes,
