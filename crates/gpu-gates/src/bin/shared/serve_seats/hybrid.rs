@@ -20,7 +20,6 @@ use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::host::served::TierBody;
 use bloomery_gpu::model::{ChainBody, StepMode};
 use bloomery_gpu_gates::GateError;
-use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{Seat, note_line};
 use bloomery_gpu_gates::generate::{Lane, Place};
 use bloomery_gpu_gates::record::{self, Record};
@@ -217,15 +216,10 @@ fn open_session<F: Family>(a: Open<()>) -> Result<Hybrid<F>, GateError> {
         lane: a.lane,
         _family: PhantomData,
     };
+    let machine = a.machine;
     let args = OpenArgs {
         place: a.place.name(),
-        machine: beside::with_reserve(
-            a.place.machine(None, a.tier_batch)?,
-            Beside {
-                image: None,
-                embedding: a.embedding,
-            },
-        ),
+        machine: move |_| machine.clone(),
         ctx: a.ctx,
         mode: StepMode::Graph,
         cfg: HybridCfg {

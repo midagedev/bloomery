@@ -21,7 +21,7 @@ use crate::arch::chat_of;
 use crate::arch::names::routed_stacks;
 use crate::arch::place_hybrid::{
     self, ring_forms_planned, ring_pass_bytes_in, route_bytes, stream_ring_bytes,
-    tier_places_bytes, wide_bytes,
+    stream_slot_bytes, tier_places_bytes, wide_bytes,
 };
 use crate::placement::PlacementError;
 use crate::placement::accepts::{self, Program};
@@ -180,11 +180,13 @@ pub fn stream_bytes(inputs: &PlanInputs) -> Result<u64, PlacementError> {
 impl PlanInputs {
     /// `self` for a load whose prompt calls stream their host experts (`BLOOMERY_XSTREAM=split`):
     /// the prompt reserve grows by [`stream_bytes`] ([`place_hybrid::PlanInputs::streaming`]), so
-    /// the stream's ring finds its room on a card the plan otherwise fills with experts. Refused by
-    /// name as [`stream_bytes`] refuses.
+    /// the stream's ring finds its room on a card the plan otherwise fills with experts, and a slot
+    /// is the widest routed layer's expert ([`stream_slot_bytes`]). Refused by name as
+    /// [`stream_bytes`] refuses.
     pub fn with_stream(self) -> Result<PlanInputs, PlacementError> {
         let ring = stream_bytes(&self)?;
-        Ok(self.streaming(ring))
+        let slot = stream_slot_bytes(&self.model, routed_stacks, self.hp.experts.n_expert as u64)?;
+        Ok(self.streaming(ring, slot))
     }
 
     /// [`PlanInputs::describe`], then the file refused with every feature the engine does not run
@@ -322,8 +324,9 @@ mod tests {
     /// 256 rows of 2 picks (512 slots): the rows' 32-value form 20,480 B, the gate and up rows
     /// 98,304 B, their SwiGLU's 32-value form 40,960 B and the route over 32 experts 2,376 B. At
     /// M3.1's widths (6,144 wide, 3,072 an expert, 4 picks) the pass is 31,068,552 B. A plan that
-    /// does not stream keeps none of it. Mutants: `with_stream` leaves the reserve as it was, the
-    /// ring counted at one half, the pass's gate and up rows left out.
+    /// does not stream keeps none of it; the streaming inputs name the slot, 18,432 B, which the
+    /// lane's host staging is made of. Mutants: `with_stream` leaves the reserve as it was, the
+    /// ring counted at one half, the pass's gate and up rows left out, the slot left 0.
     #[test]
     fn a_streaming_plan_keeps_the_streams_room() {
         let inputs = described("mm3-place-stream");
@@ -334,8 +337,13 @@ mod tests {
             stream_bytes(&inputs).expect("the routed stacks"),
             1_179_648 + pass as u64
         );
+        assert_eq!(
+            inputs.stream_slot, 0,
+            "a plan that does not stream names no slot"
+        );
         let streaming = inputs.with_stream().expect("the routed stacks");
         assert_eq!(streaming.prompt_reserve, base + 1_179_648 + pass as u64);
+        assert_eq!(streaming.stream_slot, 18_432);
         assert_eq!(
             ring_pass_bytes(PROMPT_ROWS, 4, 6_144, 3_072, 32),
             31_068_552
@@ -356,8 +364,8 @@ mod tests {
         let plain = runnable("mm3-place-plain");
         let ring = stream_bytes(&plain).expect("the routed stacks");
         assert_eq!(ring, 348_160 + 162_120);
-        let probe = runnable("mm3-place-probe").streaming(ring);
-        let open = runnable("mm3-place-open").streaming(ring);
+        let probe = runnable("mm3-place-probe").streaming(ring, 0);
+        let open = runnable("mm3-place-open").streaming(ring, 0);
         let room = |inputs: &PlanInputs| {
             inputs
                 .prompt_batch_bytes(&machine)

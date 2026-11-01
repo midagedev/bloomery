@@ -488,6 +488,22 @@ impl PlaceQ3 {
         })
     }
 
+    /// The load as one whose prompt calls stream host experts: its machine reserves
+    /// the lane's staging on the host (`workstation::reserve_stream_staging`) at a qwen35moe
+    /// file's ring slot ([`q35::PlanInputs::stream_slot`]); a qwen3moe file streams nothing.
+    #[allow(
+        dead_code,
+        reason = "the e2e gate's residency loads; the CLI and the seat stream none"
+    )]
+    pub fn streaming(mut self) -> Result<PlaceQ3, GateError> {
+        let slot = match &self.inputs {
+            Inputs::Qwen35(inputs) => inputs.stream_slot(q35::Experts::Card)?,
+            Inputs::Qwen3(_) => 0,
+        };
+        workstation::reserve_stream_staging(&mut self.machine, slot);
+        Ok(self)
+    }
+
     /// The plan at `ctx` positions under `levers` (the card budget), every
     /// refusal by name with its terms.
     pub fn plan(&self, ctx: usize, levers: &PlanLevers) -> Result<Plan<'_>, GateError> {

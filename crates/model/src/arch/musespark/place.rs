@@ -36,10 +36,10 @@ use models::ModelSpec;
 use super::hparams::Hparams;
 use super::names::{
     ATTN_GATE, ATTN_K, ATTN_OUTPUT, ATTN_Q, ATTN_V, FFN_DOWN_EXPS, FFN_GATE_EXPS, FFN_LATENT_DOWN,
-    FFN_LATENT_UP, FFN_UP_EXPS,
+    FFN_LATENT_UP,
 };
 use super::spec;
-use crate::arch::names::blk;
+use crate::arch::names::{blk, routed_stacks};
 use crate::arch::place_hybrid::{self, RingForms, ring_pass_bytes_in};
 use crate::moe::UNION_TAIL_MAX_COLS;
 use crate::placement::kernels::{self, SiteAct, q8_act_bytes};
@@ -339,10 +339,17 @@ pub const STREAM_HALF_SLOTS: u64 = 128;
 pub fn stream_ring_bytes(hp: &Hparams, model: &ModelTensors) -> Result<u64, PlacementError> {
     place_hybrid::stream_ring_bytes(
         model,
-        |l| [FFN_GATE_EXPS, FFN_UP_EXPS, FFN_DOWN_EXPS].map(|stem| blk(l, stem)),
+        routed_stacks,
         (hp.n_expert as u64, STREAM_HALF_SLOTS),
         0,
     )
+}
+
+/// A slot of the expert stream's ring, which the lane's pinned host staging is made of too: the
+/// widest layer's expert at its three routed stacks' file bytes per expert
+/// ([`place_hybrid::stream_slot_bytes`]). Refused as [`stream_ring_bytes`] refuses.
+pub fn stream_slot_bytes(hp: &Hparams, model: &ModelTensors) -> Result<u64, PlacementError> {
+    place_hybrid::stream_slot_bytes(model, routed_stacks, hp.n_expert as u64)
 }
 
 /// The card bytes a streaming plan keeps out of the expert budget (`BLOOMERY_XSTREAM=split`): the

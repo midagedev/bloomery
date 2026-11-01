@@ -931,7 +931,8 @@ stderr; a seat with a `--plan` flag prints both before it exits). It states what
 
 - `bytes` is the host need the load checks against `MemAvailable` (the plan's host terms, the churn pool and what the
   load keeps beside them, less the OS reserve `os`). `pinned`, `anon`, `cache`, `locked` and `unified` split it by what
-  can take a page back and sum to it: driver-pinned memory (ring shadows, the tier's rows, a pinned arena), anonymous
+  can take a page back and sum to it: driver-pinned memory (ring shadows, the tier's rows, a pinned arena, the expert
+  stream's staging under `BLOOMERY_XSTREAM=split`), anonymous
   pages (the NVMe tier's arena), file pages the kernel may reclaim, file pages `mlock`ed under `BLOOMERY_HOST_LOCK`
   (in place of the reclaimable ones), and an integrated device's share of its pool. `cache_ram` is the prompt cache of a
   server, beside `bytes`.

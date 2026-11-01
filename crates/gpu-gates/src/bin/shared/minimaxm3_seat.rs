@@ -32,6 +32,8 @@ use refset::arch::minimaxm3;
 use std::num::NonZeroUsize;
 use std::path::Path;
 
+use super::xstream_rule::{Stage, plans_ring};
+
 /// The seats' one owner of a checkpoint folder's open, which the MiniMax folder's open sits on.
 #[path = "serve_seats/folder.rs"]
 mod folder;
@@ -170,22 +172,24 @@ pub fn open_loaded(file: &Path, ctx: usize, arm: Arm) -> Result<Loaded, GateErro
 
 /// The body loaded by [`open`]'s plan of `arm`; `route_trace` makes the load one the host tier can write a route trace for
 /// ([`route_trace`]). `BLOOMERY_XSTREAM`, when set, is the body's host streaming from the load on (`Body::set_xstream`);
-/// under `split` the plan keeps the stream's room (`PlanInputs::with_stream`).
+/// where it starts the stream (`split`, [`plans_ring`] at a gate's stage) the plan keeps the stream's room
+/// (`PlanInputs::with_stream`) and its lane staging on the host (`workstation::reserve_stream_staging`).
 fn load(file: &Path, ctx: usize, route_trace: bool, arm: Arm) -> Result<Loaded, GateError> {
     let levers =
         bloomery_levers::at_main(&[bloomery_levers::CARD_BUDGET, bloomery_levers::XSTREAM])?;
     let mode = levers.xstream().map(XMode::parse).transpose()?;
     let model = minimaxm3_folder::model_at(file)?;
     let inputs = described(model.header())?;
-    let inputs = if mode == Some(XMode::Split) {
+    let inputs = if plans_ring(levers.xstream(), Stage::Other, false) {
         inputs.with_stream()?
     } else {
         inputs
     };
-    let machine = arm.machine(
+    let mut machine = arm.machine(
         inputs.model.layers,
         bloomery_gpu_minimaxm3::tier::tier_batch(&inputs)?,
     )?;
+    workstation::reserve_stream_staging(&mut machine, inputs.stream_slot);
     let place = PlanLevers::from_levers(&levers)?;
     let plan = inputs.plan(&machine, u64::try_from(ctx)?, &place)?;
     let host = HostCfg {

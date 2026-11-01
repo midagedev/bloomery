@@ -1,7 +1,8 @@
 //! The expert stream rule a load runs: `BLOOMERY_XSTREAM` set or unset by
 //! one rule ([`xstream_rule`]), over any body that implements
-//! [`XStreamBody`] — for `generate_qwen3moe`, the Qwen3.8 serve seat and
-//! the Muse Spark serve seat, each including this file. It lives beside the
+//! [`XStreamBody`] — for `generate_qwen3moe` and the Qwen3.8, MiniMax and
+//! Muse Spark serve seats, each including this file; the MiniMax gates' seat
+//! asks its [`plans_ring`]. It lives beside the
 //! bins, not in the lib, because it drives a load's body, whose own guards
 //! the trait carries.
 #![allow(
@@ -48,8 +49,9 @@ impl Stage {
 /// `set` is `split`, or unset at [`Stage::A`] beside a residency
 /// (`residency_off` is `BLOOMERY_RESIDENCY=off` as set; an unset word the plan
 /// turns `off` is read only after the plan, where the rule then ends at `off`).
-/// A body whose plan keeps the stream's ring out of its expert budget asks this
-/// before the plan.
+/// Every load asks this before its plan: one that streams reserves the lane's
+/// staging on the host (`workstation::reserve_stream_staging`), and a body whose
+/// plan keeps the stream's ring out of its expert budget plans the ring.
 pub fn plans_ring(set: Option<&str>, stage: Stage, residency_off: bool) -> bool {
     match set {
         Some(word) => word == "split",

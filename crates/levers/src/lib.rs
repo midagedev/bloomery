@@ -2306,6 +2306,14 @@ pub fn residency38_unset(at: Residency38At) -> Option<Residency38Pick> {
     Some(Residency38Pick::off(why))
 }
 
+/// Whether a Qwen3.8 load's [`RESIDENCY`] is `off` before its plan: `word` as
+/// set, or unset where [`residency38_unset`] turns it `off` at `at`. Such a
+/// load starts no expert stream, so it reserves no stream staging.
+#[must_use]
+pub fn residency38_off(word: Option<&str>, at: Residency38At) -> bool {
+    word.map_or_else(|| residency38_unset(at).is_some(), |word| word == "off")
+}
+
 /// [`RESIDENCY`] unset on plan (a), from the plan: `card_experts` its card
 /// experts a layer (a layer holding none left out), `host_experts` the
 /// routed experts it leaves on no card, `pool_bytes` the churn pool's bytes

@@ -160,7 +160,8 @@ pub struct XCfg {
     /// The fewest slots a half may have; a card with less room is refused
     /// by name.
     pub min_half: usize,
-    /// Fill threads and pinned staging slots.
+    /// Fill threads and pinned staging slots, the most: the stream pins at
+    /// most a half of them ([`XStream::new`]).
     pub fill_threads: usize,
     pub staging_slots: usize,
     /// The bound on every host wait.
@@ -504,10 +505,13 @@ pub const KEEP_FREE: u64 = 512 << 20;
 pub const MIN_HALF: usize = 8;
 
 /// Fill threads and pinned staging slots: four threads keep the copy
-/// engine fed from the source's pages, and a staging ring of 64 slots holds
-/// a layer's stream ahead of the copy stream.
+/// engine fed from the source's pages, and a staging ring of at most
+/// `workstation::STAGING_SLOTS` slots, and at most the ring's half
+/// ([`XStream::new`]), holds a layer's stream ahead of the copy stream. A
+/// plan reserves those slots on the host (`workstation::reserve_stream_staging`),
+/// the most a load pins.
 pub const FILL_THREADS: usize = 4;
-pub const STAGING_SLOTS: usize = 64;
+pub use model::placement::workstation::STAGING_SLOTS;
 
 /// The experts the load's lane probe streams.
 pub const PROBE: usize = 32;
@@ -898,7 +902,7 @@ impl XStream {
         stream: &CudaStream,
         source: Arc<dyn SwapSource>,
         layers: usize,
-        cfg: XCfg,
+        mut cfg: XCfg,
     ) -> Result<XStream, GpuError> {
         const WHAT: &str = "XStream::new";
         let mut widest: Vec<usize> = Vec::new();
@@ -984,6 +988,9 @@ impl XStream {
         };
         let used = new_events(HALVES)?;
         let land = LandRows::new(ctx, layers, cfg.experts)?;
+        // A layer's stream is at most a half of experts: the staging, pinned for the load's life,
+        // holds one stream and no more.
+        cfg.staging_slots = cfg.staging_slots.min(half);
         let lane = start_lane(ctx, source, slot_bytes, &cfg)?;
         let mut x = XStream {
             consts: Vec::new(),

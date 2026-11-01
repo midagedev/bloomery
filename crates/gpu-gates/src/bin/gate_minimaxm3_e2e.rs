@@ -48,6 +48,10 @@ fn main() -> std::process::ExitCode {
 mod gate_card;
 
 #[cfg(feature = "minimaxm3")]
+#[path = "shared/xstream_rule.rs"]
+mod xstream_rule;
+
+#[cfg(feature = "minimaxm3")]
 #[allow(
     dead_code,
     reason = "the shared runner serves several gates; each takes the helpers it reads"

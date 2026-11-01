@@ -50,7 +50,8 @@ use models::{
 
 use super::hparams::Kind;
 use super::{mtp, names};
-use crate::arch::{architecture_is, coverage};
+use crate::arch::names::routed_stacks;
+use crate::arch::{architecture_is, coverage, place_hybrid};
 use crate::placement::accepts::{
     Program, leg_card_format, leg_down_forms, program_of, qwen38_down, qwen38_gate_up, routed_rule,
 };
@@ -608,6 +609,22 @@ impl PlanInputs {
         } else {
             RouteForm::Rows
         }
+    }
+
+    /// One slot of the expert stream a load of the file under `experts` runs: the widest layer's
+    /// routed expert ([`place_hybrid::stream_slot_bytes`]); 0 where the load streams nothing:
+    /// under [`Experts::Host`], whose plan holds no card expert, so its residency is `off` and no
+    /// stream starts, and where a routed stack reaches the card route as NVFP4 planes, which the
+    /// ring pass does not read. A load that streams reserves the lane's staging of it before its
+    /// plan (`workstation::reserve_stream_staging`).
+    pub fn stream_slot(&self, experts: Experts) -> Result<u64, PlacementError> {
+        let planes = self.model.tensors.iter().any(|t| {
+            t.role == Role::RoutedExperts && card_routed(t.ty) == Some(CardFormat::Nvfp4Planes)
+        });
+        if experts == Experts::Host || planes {
+            return Ok(0);
+        }
+        place_hybrid::stream_slot_bytes(&self.model, routed_stacks, self.model.experts)
     }
 
     /// The placement of the file on `machine` at `ctx_max` positions with
@@ -3191,6 +3208,80 @@ mod tests {
         for s in stack_scales {
             assert_eq!(role(s), Some((Role::Unread, Some(2))), "{s}");
         }
+    }
+
+    /// A qwen4exp file's stream slot is its widest routed expert, the gate, up and down at their
+    /// file bytes: three Q8_0 rows of 64 values, 68 B each. A file whose layer 2 stacks are NVFP4
+    /// streams nothing (slot 0), nor does a load of every expert on the host, whose plan keeps
+    /// the need of the plan without staging. The lane's staging a plan reserves for the slot
+    /// (`workstation::reserve_stream_staging`) is the need's, pinned: 64 slots more than the plan
+    /// without it. FAIL-first: the qwen38 seat and the CLI planned the Qwen3.8 stream's staging
+    /// nowhere, then reserved it for a load of every expert on the host, which streams nothing.
+    #[test]
+    fn a_stream_slot_is_the_widest_routed_expert() {
+        use crate::arch::qwen35moe::hparams::tests::{keys, tensors};
+        use crate::arch::synthetic::{Ty, V, header_typed};
+        use crate::placement::PlanLevers;
+        use crate::placement::workstation::{self, HostNeed, HostRead, Hosting};
+
+        let described = |name: &str, nvfp4: bool| {
+            let typed: Vec<_> = tensors()
+                .into_iter()
+                .map(|(n, d)| {
+                    if n.contains(".ffn_") && n.ends_with("_exps.weight") {
+                        let ty = if nvfp4 && n.starts_with("blk.2.") {
+                            Ty::Nvfp4
+                        } else {
+                            Ty::Q8_0
+                        };
+                        (n, vec![64, 1, 8], ty)
+                    } else if n.ends_with(".attn_q.weight") {
+                        (n, vec![64, 128], Ty::F32)
+                    } else {
+                        (n, d, Ty::F32)
+                    }
+                })
+                .collect();
+            let pre = [("tokenizer.ggml.pre", V::Str("qwen35"))];
+            let path = header_typed(name, "qwen4exp", &keys(), &pre, &typed);
+            let split = gguf::Split::open(&path).expect("the synthetic header opens");
+            let inputs = super::PlanInputs::describe_in(&split, (u64::MAX, HostRead::Given))
+                .expect("the file describes");
+            let _ = std::fs::remove_file(&path);
+            inputs
+        };
+        let (card, host) = (super::Experts::Card, super::Experts::Host);
+        let words = described("q4x-stream-slot", false);
+        assert_eq!(words.stream_slot(card).unwrap(), 3 * 68);
+        assert_eq!(
+            described("q4x-stream-planes", true)
+                .stream_slot(card)
+                .unwrap(),
+            0
+        );
+        let machine = super::machine(
+            super::A6000,
+            crate::arch::qwen35moe::place::Stack::q8_blocks32(words.model.layers),
+            8,
+        );
+        let mut staged = machine.clone();
+        workstation::reserve_stream_staging(&mut staged, words.stream_slot(card).unwrap());
+        let mut host_only = machine.clone();
+        workstation::reserve_stream_staging(&mut host_only, words.stream_slot(host).unwrap());
+        let levers = PlanLevers {
+            card_budget_bytes: bloomery_levers::CardBudget::default(),
+        };
+        let how = Hosting {
+            lock: false,
+            arena_pinned: false,
+        };
+        let pinned = |m, experts| {
+            let plan = words.plan_with(m, (4096, 512), &levers, experts).unwrap();
+            let need = HostNeed::of(&plan, 0);
+            need.classes(&plan, how).expect("the plan's need").pinned
+        };
+        assert_eq!(pinned(&staged, card), pinned(&machine, card) + 64 * 3 * 68);
+        assert_eq!(pinned(&host_only, host), pinned(&machine, host));
     }
 
     /// One saved sequence state of Qwen3.8's 48 layers (36 GDN, every fourth
