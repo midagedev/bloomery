@@ -118,7 +118,7 @@ where
 
     fn close(&mut self) {
         print_widths(self);
-        self.draft_mut().prompt_by(|_| ());
+        self.draft_mut().forget_pass();
     }
 
     fn pass(
@@ -899,7 +899,7 @@ where
     /// [`SlotDrafts::before_row`], took `next`: under the draft the row told
     /// to it as a step is ([`MtpDraft::passed_plain`]: its hidden row the
     /// pass's), the chooser's pass in flight and batch acceptance dropped as
-    /// for every call of the caller's own (`Choosing::prompt_by`); nothing
+    /// for every call of the caller's own (`Choosing::forget_pass`); nothing
     /// while the draft is off. Refused as [`SlotDrafts::has`].
     pub(crate) fn after_row(
         &mut self,
@@ -910,8 +910,9 @@ where
     ) -> Result<(), GateError> {
         let drafting = !self.is_off(slot);
         if let Some(spec) = self.spec_mut(slot)?.filter(|_| drafting) {
-            spec.draft_mut()
-                .prompt_by(|d| d.passed_plain(p0, last, next))?;
+            let choosing = spec.draft_mut();
+            choosing.forget_pass();
+            choosing.draft_mut().passed_plain(p0, last, next)?;
         }
         Ok(())
     }
