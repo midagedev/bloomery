@@ -380,6 +380,7 @@ generate_ds41 mxfp8_gemv 0 0
 generate_ds41 mxfp8_gemv_ids 0 0
 generate_ds41 mxfp8_gemv_mcol 0 0
 generate_ds41 mxfp8_gemv_mcol_staged 0 0
+generate_ds41 mxfp8_gemv_mcol_staged_wide 0 0
 generate_ds41 mxfp8_mma_gemm 0 0
 generate_ds41 mxfp8_tile_gemm 0 0
 generate_ds41 nemotron_moe_router_240 0 0

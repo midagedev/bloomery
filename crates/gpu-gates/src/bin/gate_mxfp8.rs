@@ -148,14 +148,15 @@ mod gate {
     /// A latent attention's `attn_q_b` and `attn_output` and a KDA layer's
     /// `ssm_f_b` (`dims` 1,536 × 16,384, 16,384 × 4,096 and 128 × 8,192,
     /// `dims[0]` the row width): a short row, the row a lane walks in whole
-    /// trips, and the one-word-a-lane row. `attn_q_b`'s row is a multiple of
-    /// 512, so its four columns run MXFP8's staged walk.
+    /// trips, and the one-word-a-lane row. `attn_q_b`'s and `attn_output`'s
+    /// rows are multiples of 512, so their four, six and eight columns run
+    /// MXFP8's staged walks (four, and the wide stage past four).
     pub(crate) const SHAPES: [Shape; 3] = [
         Shape {
             stem: "blk.3.attn_q_b",
             rows: 16_384,
             k: 1536,
-            ms: &[1, 2, 3, 4, WIDE],
+            ms: &[1, 2, 3, 4, 6, WIDE],
             seed: 0x5eed_0801,
         },
         Shape {
@@ -179,7 +180,7 @@ mod gate {
 
     /// MXFP8 row counts that leave the last block of eight rows partly empty,
     /// at four columns: the staged walk (`k` a multiple of 512) and, at `k`
-    /// 384, the unstaged one.
+    /// 384, the unstaged one; nine rows also at seven columns, the wide stage.
     const TAILS: [Shape; 4] = [
         Shape {
             stem: "tail.r1",
@@ -199,7 +200,7 @@ mod gate {
             stem: "tail.r9",
             rows: 9,
             k: 512,
-            ms: &[4],
+            ms: &[4, 7],
             seed: 0x5eed_0872,
         },
         Shape {
