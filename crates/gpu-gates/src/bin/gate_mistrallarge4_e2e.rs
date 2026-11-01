@@ -36,6 +36,10 @@
 //!   (self-consistency): as `gate_musespark_e2e`'s, over a 40-token walk —
 //!   past the fixture's top-k 16, so every step past position 16 selects;
 //!   the carried state is the latent and index-key rows.
+//! - `seeded_replay` (self-consistency): a step graph captured before a
+//!   `seed_depth` and replayed after it — the seed refills the resident
+//!   caches the capture recorded, never new allocations — equals an eager
+//!   step at the seeded depth bit for bit.
 //! - `router_lane_nan` (self-consistency): as `gate_musespark_e2e`'s.
 //! - `selection_is_its_rule` (self-consistency): at every position past the
 //!   top-k of the walk, every full indexer layer's picked set equals the
@@ -198,6 +202,7 @@ mod gate {
             eager_equals_replay,
         ),
         ("reset_rewinds", Tag::SelfConsistency, reset_rewinds),
+        ("seeded_replay", Tag::SelfConsistency, seeded_replay),
         ("state_carries", Tag::SelfConsistency, state_carries),
         ("router_lane_nan", Tag::SelfConsistency, router_lane_nan),
         (
@@ -218,11 +223,17 @@ mod gate {
         ("fault_word_clean", Tag::SelfConsistency, fault_word_clean),
     ];
 
-    /// The relative distance of `got` to `want` over their common length:
-    /// the largest absolute difference against the row's own peak
-    /// (`max |want|`), the form every projection's rounding sits under — a
-    /// per-value division would blow up at the row's near-zero entries.
+    /// The relative distance of `got` to `want`: the largest absolute
+    /// difference against the row's own peak (`max |want|`), the form every
+    /// projection's rounding sits under — a per-value division would blow up
+    /// at the row's near-zero entries. A length mismatch or any non-finite
+    /// value on either side is an infinite distance: `f64::max` drops a NaN,
+    /// so a NaN tap would otherwise read as a perfect match, and `zip` would
+    /// pass a short row.
     fn rel(got: &[f32], want: &[f32]) -> f64 {
+        if got.len() != want.len() || got.iter().chain(want).any(|v| !v.is_finite()) {
+            return f64::INFINITY;
+        }
         let peak = want
             .iter()
             .map(|w| f64::from(w.abs()))
@@ -495,6 +506,49 @@ mod gate {
         let pass = same(&first, &second);
         println!(
             "{CLAUSE}: walk{PROMPT_LEN} twice, logits bit-identical {pass} {}",
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// A capture made before a `seed_depth` replays over the seeded rows:
+    /// the seed refills the resident caches the capture recorded instead of
+    /// replacing them, so the replayed step at the seeded depth equals an
+    /// eager one there bit for bit. The depth sits past the fixture's top-k
+    /// so the step selects its rows from the seeded pattern.
+    fn seeded_replay(m: &mut Model, case: &Case) -> Result<bool, GateError> {
+        const CLAUSE: &str = "seeded_replay";
+        let rows = PROMPT_LEN;
+        let token = case.walk[0];
+        m.set_mode(StepMode::Eager);
+        m.reset()?;
+        m.seed_depth(rows)?;
+        let Some(eager) = or_fault(
+            CLAUSE,
+            "the eager step at the seeded depth",
+            feed(m, &[token]),
+        )?
+        else {
+            return Ok(false);
+        };
+        m.set_mode(StepMode::Graph);
+        m.reset()?;
+        let nodes = m.capture_step()?;
+        m.seed_depth(rows)?;
+        let Some(replay) = or_fault(
+            CLAUSE,
+            "the replayed step over the seeded rows",
+            feed(m, &[token]),
+        )?
+        else {
+            return Ok(false);
+        };
+        let identical = same(&eager, &replay);
+        let pass = identical && finite(&eager);
+        println!(
+            "{CLAUSE}: depth {rows}, a {nodes}-node capture seeded after the record, the replay's \
+             token and logits bit-identical to the eager step's {identical}, finite {} {}",
+            finite(&eager),
             verdict(pass)
         );
         Ok(pass)
@@ -931,15 +985,19 @@ mod gate {
                                 .map(|&b| half_to_f32(b))
                                 .collect()
                         };
-                        // `kv_cmpr`'s two occurrences: the projection (`[latent |
-                        // rope]`, the file's own row) and its normed latent.
+                        // `kv_cmpr`'s two occurrences: the projection's latent
+                        // (the dump's occ-0 row is the latent alone, 512 wide;
+                        // the card's joined row is `[latent | rope]`, and the
+                        // rope span beside it is the `Kcur` row's) and its
+                        // normed latent. [`rel`] refuses a length mismatch, so
+                        // the tap must hand it the span the oracle holds.
                         let normed = if ropes {
                             node.kv_s[..latent].to_vec()
                         } else {
                             cache_row()
                         };
                         let taps: Vec<(&str, Vec<f32>, u32, f64)> = vec![
-                            ("kv_cmpr", node.kv_a.clone(), 0, DENSE_REL_BAND),
+                            ("kv_cmpr", node.kv_a[..latent].to_vec(), 0, DENSE_REL_BAND),
                             ("kv_cmpr", normed, 1, DENSE_REL_BAND),
                         ];
                         for (what, got, occ, band) in taps {
@@ -1301,7 +1359,8 @@ mod gate {
         }
         println!(
             "PASSED: {NAME} the captured step holds the entries its five layer kinds derive; \
-             eager and replay give bit-identical logits; a reset rewinds; the cache rows carry; a \
+             eager and replay give bit-identical logits; a reset rewinds; a capture seeded after \
+             the record replays over the seeded rows; the cache rows carry; a \
              NaN router lane raises the fault word and is picked by no slot; every full indexer \
              layer's list is the rule's own top-k and every shared layer's its source's; every \
              compared node keeps its band at every layer and position; the greedy continuation \

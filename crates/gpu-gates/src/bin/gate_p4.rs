@@ -543,12 +543,32 @@ fn run() -> Result<(), GateError> {
                 let s_dev = DeviceBuffer::from_host(stream, &s)?;
                 let b_dev = DeviceBuffer::from_host(stream, &b)?;
                 let mut y_dev = DeviceBuffer::from_host(stream, &x)?;
-                elem.enqueue_ssmax_rows(stream, &mut y_dev, &pos_dev, &s_dev, &b_dev, h, D, *t)?;
+                elem.enqueue_ssmax_rows(
+                    stream,
+                    &mut y_dev,
+                    &pos_dev,
+                    &s_dev,
+                    &b_dev,
+                    h,
+                    D,
+                    *t,
+                    gpu.unlabelled_sink(),
+                )?;
                 stream.synchronize()?;
                 let y = y_dev.to_host_vec(stream)?;
                 // In place: the rerun starts again from `x`.
                 y_dev = DeviceBuffer::from_host(stream, &x)?;
-                elem.enqueue_ssmax_rows(stream, &mut y_dev, &pos_dev, &s_dev, &b_dev, h, D, *t)?;
+                elem.enqueue_ssmax_rows(
+                    stream,
+                    &mut y_dev,
+                    &pos_dev,
+                    &s_dev,
+                    &b_dev,
+                    h,
+                    D,
+                    *t,
+                    gpu.unlabelled_sink(),
+                )?;
                 stream.synchronize()?;
                 let rerun = bits_equal(&y, &y_dev.to_host_vec(stream)?);
 
@@ -594,7 +614,17 @@ fn run() -> Result<(), GateError> {
         let one = DeviceBuffer::from_host(stream, &[1.0f32])?;
         let zero = DeviceBuffer::from_host(stream, &[0.0f32])?;
         let mut y_dev = DeviceBuffer::from_host(stream, &vec![1.0f32; m])?;
-        elem.enqueue_ssmax_rows(stream, &mut y_dev, &pos_dev, &one, &zero, 1, 1, m)?;
+        elem.enqueue_ssmax_rows(
+            stream,
+            &mut y_dev,
+            &pos_dev,
+            &one,
+            &zero,
+            1,
+            1,
+            m,
+            gpu.unlabelled_sink(),
+        )?;
         stream.synchronize()?;
         let y = y_dev.to_host_vec(stream)?;
         let want: Vec<f32> = pos.iter().map(|&p| basis_ref(p)).collect();
@@ -622,38 +652,108 @@ fn run() -> Result<(), GateError> {
         let refusals: [(&str, bool); 7] = [
             (
                 "m_zero",
-                elem.enqueue_ssmax_rows(stream, &mut x8, &pos1, &s2, &b2, 2, 4, 0)
-                    .is_err(),
+                elem.enqueue_ssmax_rows(
+                    stream,
+                    &mut x8,
+                    &pos1,
+                    &s2,
+                    &b2,
+                    2,
+                    4,
+                    0,
+                    gpu.unlabelled_sink(),
+                )
+                .is_err(),
             ),
             (
                 "h_zero",
-                elem.enqueue_ssmax_rows(stream, &mut x8, &pos1, &s2, &b2, 0, 4, 1)
-                    .is_err(),
+                elem.enqueue_ssmax_rows(
+                    stream,
+                    &mut x8,
+                    &pos1,
+                    &s2,
+                    &b2,
+                    0,
+                    4,
+                    1,
+                    gpu.unlabelled_sink(),
+                )
+                .is_err(),
             ),
             (
                 "d_zero",
-                elem.enqueue_ssmax_rows(stream, &mut x8, &pos1, &s2, &b2, 2, 0, 1)
-                    .is_err(),
+                elem.enqueue_ssmax_rows(
+                    stream,
+                    &mut x8,
+                    &pos1,
+                    &s2,
+                    &b2,
+                    2,
+                    0,
+                    1,
+                    gpu.unlabelled_sink(),
+                )
+                .is_err(),
             ),
             (
                 "x_short",
-                elem.enqueue_ssmax_rows(stream, &mut x8, &pos1, &s2, &b2, 2, 5, 1)
-                    .is_err(),
+                elem.enqueue_ssmax_rows(
+                    stream,
+                    &mut x8,
+                    &pos1,
+                    &s2,
+                    &b2,
+                    2,
+                    5,
+                    1,
+                    gpu.unlabelled_sink(),
+                )
+                .is_err(),
             ),
             (
                 "pos_short",
-                elem.enqueue_ssmax_rows(stream, &mut x8, &pos1, &s2, &b2, 2, 2, 2)
-                    .is_err(),
+                elem.enqueue_ssmax_rows(
+                    stream,
+                    &mut x8,
+                    &pos1,
+                    &s2,
+                    &b2,
+                    2,
+                    2,
+                    2,
+                    gpu.unlabelled_sink(),
+                )
+                .is_err(),
             ),
             (
                 "s_short",
-                elem.enqueue_ssmax_rows(stream, &mut x8, &pos1, &one, &b2, 2, 4, 1)
-                    .is_err(),
+                elem.enqueue_ssmax_rows(
+                    stream,
+                    &mut x8,
+                    &pos1,
+                    &one,
+                    &b2,
+                    2,
+                    4,
+                    1,
+                    gpu.unlabelled_sink(),
+                )
+                .is_err(),
             ),
             (
                 "b_short",
-                elem.enqueue_ssmax_rows(stream, &mut x8, &pos1, &s2, &zero, 2, 4, 1)
-                    .is_err(),
+                elem.enqueue_ssmax_rows(
+                    stream,
+                    &mut x8,
+                    &pos1,
+                    &s2,
+                    &zero,
+                    2,
+                    4,
+                    1,
+                    gpu.unlabelled_sink(),
+                )
+                .is_err(),
             ),
         ];
         for (why, refused) in refusals {
@@ -662,6 +762,80 @@ fn run() -> Result<(), GateError> {
                 verdict(refused)
             );
             ok &= refused;
+        }
+
+        // A value the rule leaves not finite raises the fault word and the
+        // write stays defined: a NaN scale (a corrupted ssmax bias makes the
+        // index queries it scales NaN), a finite value and scale whose
+        // product overflows, and a normal input that raises nothing.
+        let clean = gpu.take_fault()?;
+        let s_nan = DeviceBuffer::from_host(stream, &[f32::NAN])?;
+        let mut y1 = DeviceBuffer::from_host(stream, &[1.0f32])?;
+        elem.enqueue_ssmax_rows(
+            stream,
+            &mut y1,
+            &pos1,
+            &s_nan,
+            &zero,
+            1,
+            1,
+            1,
+            gpu.unlabelled_sink(),
+        )?;
+        stream.synchronize()?;
+        let nan = y1.to_host_vec(stream)?[0];
+        let nan_fault = gpu.take_fault()?;
+        let b_two = DeviceBuffer::from_host(stream, &[2.0f32])?;
+        let mut y2 = DeviceBuffer::from_host(stream, &[f32::MAX])?;
+        elem.enqueue_ssmax_rows(
+            stream,
+            &mut y2,
+            &pos1,
+            &one,
+            &b_two,
+            1,
+            1,
+            1,
+            gpu.unlabelled_sink(),
+        )?;
+        stream.synchronize()?;
+        let inf = y2.to_host_vec(stream)?[0];
+        let inf_fault = gpu.take_fault()?;
+        let mut y3 = DeviceBuffer::from_host(stream, &[1.0f32])?;
+        elem.enqueue_ssmax_rows(
+            stream,
+            &mut y3,
+            &pos1,
+            &one,
+            &one,
+            1,
+            1,
+            1,
+            gpu.unlabelled_sink(),
+        )?;
+        stream.synchronize()?;
+        let norm = y3.to_host_vec(stream)?[0];
+        let none_fault = gpu.take_fault()?;
+        let want = bloomery_gpu::Fault::at(
+            bloomery_gpu::LAYER_NONE,
+            bloomery_gpu::FaultSite::F32Product,
+        );
+        let pass = clean.is_none()
+            && nan_fault == Some(want)
+            && inf_fault == Some(want)
+            && none_fault.is_none()
+            && nan.is_nan()
+            && inf.is_infinite();
+        println!(
+            "shape op=ssmax non-finite products: word_before={clean:?} nan_scale fault=\"{}\" \
+             (want \"{want}\") overflow fault=\"{}\" normal fault={none_fault:?}, the writes stay \
+             defined (NaN {nan}, inf {inf}, normal {norm}) {}",
+            nan_fault.map_or_else(|| "none".to_owned(), |f| f.to_string()),
+            inf_fault.map_or_else(|| "none".to_owned(), |f| f.to_string()),
+            verdict(pass)
+        );
+        if !pass {
+            ok = false;
         }
     }
 

@@ -632,7 +632,7 @@ impl ToolFormat {
             framing().map_or(ToolFormat::Unparsed, ToolFormat::QwenXml)
         } else if source.contains(DSML) {
             ToolFormat::Dsml(Spelling::of_template(source))
-        } else if source.contains(mistral::CALL_OPEN) && source.contains(mistral::ARGS) {
+        } else if ::models::ToolFormat::of_template(source) == Some(::models::ToolFormat::Mistral) {
             ToolFormat::Mistral
         } else {
             ToolFormat::Unparsed

@@ -65,7 +65,7 @@ use crate::quant_sel::QuantSelKernels;
 use crate::rope_table::{Direction, RopeRows, RopeSpec, RopeTable};
 use crate::route_body::{sigmoid_16_8, sigmoid_256_8};
 use crate::site::{Form, KGemvKernels, SiteTy};
-use crate::tensor::{Q8ACT_MAX_K, dtod_2d};
+use crate::tensor::{Q8ACT_MAX_K, copy_row, dtod_2d};
 use crate::weights::{DevWeight, Weights};
 use crate::{Branch, DeviceTensor, Gpu, GpuError, Window};
 use bloomery_levers::{ChurnHosting, HostCfg};
@@ -1122,27 +1122,6 @@ fn enqueue_head(
         elem.enqueue_softcap_rows(gpu.stream(), logits, n_vocab, cap)?;
         elem.enqueue_argmax_fault(gpu.stream(), logits, n_vocab, fault, token_out)
     })
-}
-
-/// `n` f32 of `src` copied into `dst`, one row.
-fn copy_row(
-    stream: &CudaStream,
-    src: &DeviceBuffer<f32>,
-    dst: &mut DeviceBuffer<f32>,
-    n: usize,
-) -> Result<(), GpuError> {
-    let width = n * 4;
-    dtod_2d(
-        stream,
-        (src, 0),
-        (dst, 0),
-        crate::tensor::Pitched {
-            width,
-            rows: 1,
-            dev_pitch: width,
-            host_pitch: width,
-        },
-    )
 }
 
 /// Key head `h`'s row of `buf`, the view an append reads.

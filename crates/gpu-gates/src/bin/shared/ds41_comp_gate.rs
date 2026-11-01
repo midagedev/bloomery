@@ -1604,19 +1604,6 @@ fn idx_idle(cx: &Cx, label: &str, src: &Source) -> Result<bool, GateError> {
 /// `attention.layer_norm_epsilon`, 1e-6.
 const INPUT_EPS: f32 = 1e-6;
 
-/// An f64 sum of one value a lane, the xor butterfly (16, 8, 4, 2, 1): the
-/// sum every lane of the kernel's warp ends with.
-fn butterfly64(lanes: [f64; 32]) -> f64 {
-    let mut a = lanes;
-    for m in [16usize, 8, 4, 2, 1] {
-        let b = a;
-        for (l, v) in a.iter_mut().enumerate() {
-            *v = b[l] + b[l ^ m];
-        }
-    }
-    a[0]
-}
-
 /// The kernel's LayerNorm of one key, op for op (`index_key`'s module doc):
 /// the lane sums (lane `l` the values `4l ..`) in f64, the mean rounded to
 /// f32, the f32 deviations, the f32 squares added in f64, the variance, the
@@ -1625,9 +1612,9 @@ fn input_norm_host(x: &[f32], gain: &[f32], bias: &[f32], eps: f32) -> Vec<f32> 
     let lanes = |f: &dyn Fn(usize) -> f64| -> [f64; 32] {
         std::array::from_fn(|l| (0..4).fold(0.0f64, |a, j| a + f(4 * l + j)))
     };
-    let mean = (butterfly64(lanes(&|i| f64::from(x[i]))) / 128.0) as f32;
+    let mean = (butterfly(lanes(&|i| f64::from(x[i]))) / 128.0) as f32;
     let dev: Vec<f32> = x.iter().map(|&v| v - mean).collect();
-    let var = (butterfly64(lanes(&|i| f64::from(dev[i] * dev[i]))) / 128.0) as f32;
+    let var = (butterfly(lanes(&|i| f64::from(dev[i] * dev[i]))) / 128.0) as f32;
     let scale = if var.is_finite() {
         1.0 / (var + eps).sqrt()
     } else {
