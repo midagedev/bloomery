@@ -14,7 +14,7 @@
 //! groups' scale bytes, then 32 code bytes, group `s`'s value `j` in the low nibble of byte `8s + j`
 //! and value `j + 8` in its high nibble. The reader moves the nibbles into that order and copies
 //! the scale bytes as they are; the tensor scale becomes the f32 the GGUF file keeps beside the
-//! weight as `<stem>.scale`. A routed stack ([`Nvfp4Stack`]) has one tensor scale per expert, so its
+//! weight as `<stem>.scale`. A routed stack ([`Stack`]) has one tensor scale per expert, so its
 //! `.scale` holds one value per expert, in expert order.
 //!
 //! A scale byte UE4M3 does not define as a scale (bit 7 set, or `0x7F`) is refused by name, as the
@@ -73,18 +73,6 @@ pub enum Error {
     },
 }
 
-/// One NVFP4 tensor, or a routed stack of them, in GGUF's layout.
-#[derive(Debug, Default)]
-struct Nvfp4 {
-    /// The NVFP4 blocks, row-major, a stack expert by expert: `rows · k / 64` blocks of 36 bytes
-    /// an expert.
-    blocks: Vec<u8>,
-    /// ggml's dims: `[k, rows]`, or `[k, rows, n_expert]` for a stack.
-    dims: Vec<u64>,
-    /// The `<stem>.scale` values: the tensor scale, or one per expert for a stack.
-    scale: Vec<f32>,
-}
-
 /// What a role makes of a weight its checkpoint stores unquantized (BF16 or F32).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Plain {
@@ -129,10 +117,10 @@ pub struct Normal {
 ///
 /// | format | [`Use::Matrix`] | [`Use::Rows`] |
 /// |---|---|---|
-/// | NVFP4 (ModelOpt) | NVFP4 (40), `.scale` a tensor or an expert ([`Nvfp4Stack`]) | [`GgmlType::NVFP4_ROWS`], `.scale` the table's |
+/// | NVFP4 (ModelOpt) | NVFP4 (40), `.scale` a tensor or an expert ([`Stack`]) | [`GgmlType::NVFP4_ROWS`], `.scale` the table's |
 /// | NVFP4 with `csf` or `csf_32x2_v1` scales | as NVFP4, the scales decoded first ([`csf`]) | none |
 /// | NVFP4 compressed-tensors | as NVFP4, `.scale` the reciprocal of `weight_global_scale` | as NVFP4 |
-/// | F8_E4M3 with one scale a block (MXFP8's E8M0 a 32 values, an FP8 block format's), a row or the tensor | the card type the format is held in ([`Format::card_type`]): [`GgmlType::FP8_B128`] or [`GgmlType::MXFP8`], values as stored, each row block the scale of the checkpoint's block it lies in (`fp8`) | none |
+/// | F8_E4M3 with one scale a block (MXFP8's E8M0 a 32 values, an FP8 block format's), a row or the tensor | the card type the format is held in ([`Format::card_type`]): [`GgmlType::FP8_B128`] or [`GgmlType::MXFP8`], values as stored, each row block the scale of the checkpoint's block it lies in (`fp8_append`) | none |
 /// | MLX affine, 4 or 8 bits, groups of 64 | the card type the format is held in: [`GgmlType::MLX_A4`] or [`GgmlType::MLX_A8`] for BF16 scales and biases, [`GgmlType::MLX_A4H`] or [`GgmlType::MLX_A8H`] for F16 ones, each group's words, scale and bias as stored, a stack one tensor `[k, rows, n_expert]` (`mlx_affine`) | none |
 /// | BF16, F32 | Q8_0, F32 or BF16 as [`Plain`] says | none |
 /// | F16 | F32 only, each value widened exactly; Q8_0 and BF16 have no type for it | none |
@@ -241,7 +229,7 @@ pub fn format_of(sources: &[(&str, &Placed)]) -> Result<Format, Error> {
 /// # Errors
 ///
 /// A refusal of [`format_of`]; a pair [`type_of`] has no type for; a tensor `get` refuses or
-/// lacks; a refusal of NVFP4 normalization, `fp8`, `fp8_q8_0` or `mlx_affine`; a stack of a type other than
+/// lacks; a refusal of a [`Stack`]'s push, `fp8_q8_0` or `mlx_affine`; a stack of a type other than
 /// NVFP4 and FP8_B128 or of unquantized experts read other than as F32 or BF16, a stack of MLX
 /// tensors (its experts are one tensor), and one of experts of differing shapes; a shape or
 /// dtype the format does not hold; a non-finite value or scaled value; and a row a
@@ -260,8 +248,13 @@ pub fn normalize<'a>(
     };
     let type_id = type_of(format, role)
         .ok_or_else(|| refuse(format!("read as {role:?} has no GGUF type here")))?;
+    if let Some(mut stack) = Stack::of(format, role, sources.len()) {
+        for &source in sources {
+            stack.push(&get, source)?;
+        }
+        return stack.finish();
+    }
     match format {
-        Format::Nvfp4 | Format::Nvfp4Ct | Format::Nvfp4Csf | Format::Nvfp4Csf32 => {}
         Format::MlxAffine { .. } | Format::MlxAffineF16 { .. } => {
             let [source] = sources else {
                 return Err(refuse(format!(
@@ -269,36 +262,24 @@ pub fn normalize<'a>(
                     sources.len()
                 )));
             };
-            return mlx_affine(get, *source, type_id);
+            mlx_affine(get, *source, type_id)
         }
-        Format::Bf16 | Format::F32
-            if sources.len() > 1 && matches!(role, Use::Matrix(Plain::Bf16 | Plain::F32)) =>
-        {
-            return plain_stack(get, sources, role, type_id);
+        // A row table: [`Stack`] writes every NVFP4 matrix.
+        Format::Nvfp4 | Format::Nvfp4Ct => {
+            let [source] = sources else {
+                return Err(refuse("row tables need exactly one source".into()));
+            };
+            nvfp4_rows(get, *source, type_id)
         }
-        _ if sources.len() != 1 && type_id != GgmlType::FP8_B128.as_u32() => {
-            return Err(refuse(format!(
-                "in a stack of {}: only NVFP4 and FP8_B128 experts stack here",
-                sources.len()
-            )));
-        }
+        _ if sources.len() != 1 => Err(refuse(format!(
+            "in a stack of {}: only NVFP4 and FP8_B128 experts stack here",
+            sources.len()
+        ))),
         Format::Fp8Block { .. } | Format::Fp8Channel | Format::Fp8Tensor if role == Use::Q8_0 => {
-            return fp8_q8_0(get, sources, type_id);
+            fp8_q8_0(get, sources, type_id)
         }
-        Format::Mxfp8 | Format::Fp8Block { .. } | Format::Fp8Channel | Format::Fp8Tensor
-            if role != Use::Rows =>
-        {
-            return fp8(get, sources, type_id);
-        }
-        _ => return plain(get, name, placed, role, type_id),
-    };
-    if role == Use::Rows {
-        let [source] = sources else {
-            return Err(refuse("row tables need exactly one source".into()));
-        };
-        return nvfp4_rows(get, *source, type_id);
+        _ => plain(get, name, placed, role, type_id),
     }
-    nvfp4(get, sources)
 }
 
 /// [`normalize`] of the part of `sources` that holds the values `at` along dim `dim` of `dims`, the
@@ -682,34 +663,72 @@ fn decode_scales<'s, 'a>(
     Ok((decoded, places))
 }
 
-/// The NVFP4 `sources` (one linear, or a routed stack's experts) in GGUF's NVFP4 block.
-fn nvfp4<'a>(
-    get: impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
-    sources: &[(&str, &Placed)],
-) -> Result<Normal, Error> {
-    let mut stack = Nvfp4Stack::new(sources.len());
-    for &source in sources {
-        stack.push(&get, source)?;
-    }
-    stack.finish()
-}
-
-/// A stack normalized into one allocation, with only the current expert's decoded scales held.
-pub struct Nvfp4Stack {
-    out: Nvfp4,
+/// A tensor its type writes one source at a time, into one allocation reserved at its length on
+/// the first push: an NVFP4 linear or stack, an F8_E4M3 weight or stack in the block type its
+/// format is held in, and a stack of unquantized experts read as F32 or BF16. Each source is read
+/// only for its own push, an expert's decoded scales with it, so a reader may hold the sources of
+/// the next pushes alone ([`Stack::scratch`]); a stack of several sources is `[k, rows, n_expert]`.
+pub struct Stack {
+    writer: Writer,
+    out: Normal,
     experts: usize,
+    /// The first source pushed, which every later one matches in shape.
+    first: Option<String>,
+    pushed: usize,
 }
 
-impl Nvfp4Stack {
-    /// Reserve the shape of a stack of `experts` sources; its bytes are allocated on first push.
-    pub fn new(experts: usize) -> Self {
-        Self {
-            out: Nvfp4::default(),
+/// The format's append of one source to a [`Stack`].
+#[derive(Clone, Copy)]
+enum Writer {
+    Nvfp4,
+    /// The FP8 block type ([`fp8_append`]).
+    Fp8(GgmlType),
+    /// The values as [`Plain`] writes them ([`plain_values`]).
+    Plain(Plain),
+}
+
+impl Stack {
+    /// The stack of `experts` sources of `format` that `role` reads, when its type writes them
+    /// one at a time; `None` for a tensor [`normalize`] makes otherwise or refuses.
+    #[must_use]
+    pub fn of(format: Format, role: Use, experts: usize) -> Option<Stack> {
+        let type_id = type_of(format, role)?;
+        let writer = match (format, role) {
+            (
+                Format::Nvfp4 | Format::Nvfp4Ct | Format::Nvfp4Csf | Format::Nvfp4Csf32,
+                Use::Matrix(_),
+            ) => Writer::Nvfp4,
+            (
+                Format::Mxfp8 | Format::Fp8Block { .. } | Format::Fp8Channel | Format::Fp8Tensor,
+                Use::Matrix(_),
+            ) if experts == 1 || type_id == GgmlType::FP8_B128.as_u32() => {
+                Writer::Fp8(GgmlType::from_u32(type_id))
+            }
+            (Format::Bf16 | Format::F32, Use::Matrix(plain @ (Plain::Bf16 | Plain::F32)))
+                if experts > 1 =>
+            {
+                Writer::Plain(plain)
+            }
+            _ => return None,
+        };
+        Some(Stack {
+            writer,
+            out: Normal {
+                type_id,
+                ..Normal::default()
+            },
             experts,
-        }
+            first: None,
+            pushed: 0,
+        })
     }
 
-    /// Append one expert, decoding its compressed scales only for this call.
+    /// Append one source, of the first's shape.
+    ///
+    /// # Errors
+    ///
+    /// A source past the stack's count, one of another shape than the first, and every refusal
+    /// of its format's append, by name.
     pub fn push<'a>(
         &mut self,
         get: impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
@@ -717,29 +736,82 @@ impl Nvfp4Stack {
     ) -> Result<(), Error> {
         let left = self
             .experts
-            .checked_sub(self.out.scale.len())
+            .checked_sub(self.pushed)
             .filter(|&n| n > 0)
             .ok_or_else(|| Error::Shape {
                 name: source.0.into(),
                 what: "more experts than the stack holds".into(),
             })?;
-        let [rows, k] = append(&get, source, &mut self.out, left)?;
-        let dims = [k as u64, rows as u64];
-        if self.out.dims.is_empty() {
-            self.out.dims = dims.to_vec();
-        } else if self.out.dims != dims {
-            return Err(Error::Shape {
-                name: source.0.into(),
-                what: format!(
-                    "dims {dims:?}; the stack's first expert has {:?}",
-                    self.out.dims
-                ),
-            });
+        let [rows, k] = match self.writer {
+            Writer::Nvfp4 => append(&get, source, &mut self.out, left)?,
+            Writer::Fp8(ty) => fp8_append(&get, source, ty, &mut self.out.bytes, left)?,
+            Writer::Plain(plain) => plain_append(&get, source, plain, &mut self.out.bytes, left)?,
+        };
+        let dims = vec![k as u64, rows as u64];
+        match &self.first {
+            None => {
+                self.first = Some(source.0.to_string());
+                self.out.dims = dims;
+            }
+            Some(first) if self.out.dims != dims => {
+                return Err(Error::Format {
+                    name: source.0.to_string(),
+                    format: source.1.format,
+                    what: format!(
+                        "dims {dims:?}; the stack's first expert {first} has {:?}",
+                        self.out.dims
+                    ),
+                });
+            }
+            Some(_) => {}
         }
+        self.pushed += 1;
         Ok(())
     }
 
-    /// Finish the stack, refusing a missing expert; a single source remains a matrix.
+    /// The most bytes one push of `source` holds beside its stored inputs and the stack's
+    /// output, from the headers `get` gives: a compressed NVFP4 scale decoded and its companion
+    /// words widened, and an FP8 weight's block scales widened to the type's.
+    ///
+    /// # Errors
+    ///
+    /// A tensor `get` lacks, and bytes past u64, by name.
+    pub fn scratch<'a>(
+        &self,
+        get: impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
+        (weight, placed): (&str, &Placed),
+    ) -> Result<u64, Error> {
+        let over = || Error::Shape {
+            name: weight.into(),
+            what: "scratch bytes pass u64".into(),
+        };
+        let mut words = 0u64;
+        for n in &placed.companions {
+            let raw = get(n)?;
+            let (len, size) = (raw.bytes.len() as u64, raw.dtype.size() as u64);
+            let widened = match self.writer {
+                Writer::Nvfp4 if size > 1 => (len / size).checked_mul(4).ok_or_else(over)?,
+                // The scales as f32 values and as their bytes, both held while the second is made.
+                Writer::Fp8(_) => (len / size.max(1)).checked_mul(8).ok_or_else(over)?,
+                _ => 0,
+            };
+            words = words.checked_add(widened).ok_or_else(over)?;
+        }
+        match (self.writer, placed.format) {
+            (Writer::Nvfp4, Format::Nvfp4Csf | Format::Nvfp4Csf32) => {
+                let decoded = get(weight)?.bytes.len().div_ceil(8) as u64;
+                words.checked_add(decoded).ok_or_else(over)
+            }
+            (Writer::Nvfp4, _) => Ok(0),
+            _ => Ok(words),
+        }
+    }
+
+    /// The stack, refusing a missing expert; a single source remains a matrix.
+    ///
+    /// # Errors
+    ///
+    /// A stack of no source, and one short of its count.
     pub fn finish(mut self) -> Result<Normal, Error> {
         if self.experts == 0 {
             return Err(Error::Shape {
@@ -747,25 +819,16 @@ impl Nvfp4Stack {
                 what: "no expert".into(),
             });
         }
-        if self.out.scale.len() != self.experts {
+        if self.pushed != self.experts {
             return Err(Error::Shape {
                 name: "routed stack".into(),
-                what: format!(
-                    "{} experts, expected {}",
-                    self.out.scale.len(),
-                    self.experts
-                ),
+                what: format!("{} experts, expected {}", self.pushed, self.experts),
             });
         }
         if self.experts > 1 {
             self.out.dims.push(self.experts as u64);
         }
-        Ok(Normal {
-            type_id: GgmlType::NVFP4.as_u32(),
-            dims: self.out.dims,
-            bytes: self.out.blocks,
-            scale: self.out.scale,
-        })
+        Ok(self.out)
     }
 }
 
@@ -993,61 +1056,21 @@ fn nvfp4_rows<'a>(
     })
 }
 
-/// The F8_E4M3 weight `sources` (one weight, or a routed stack's experts in expert order) in
-/// `type_id`, the card type its format is held in ([`Format::card_type`]: MXFP8, else FP8_B128),
-/// its values unchanged: each row's blocks of the type in order, each the scale of the
-/// checkpoint's block it lies in ([`Format::fp8_scale_block`]: a block, a row or the tensor),
-/// then its value bytes as stored; a stack's experts one after another, as `[k, rows, n_expert]`.
+/// Appends the F8_E4M3 weight `source` in `ty`, the card type its format is held in
+/// ([`Format::card_type`]: MXFP8, else FP8_B128), to `out`, its values unchanged: each row's
+/// blocks of the type in order, each the scale of the checkpoint's block it lies in
+/// ([`Format::fp8_scale_block`]: a block, a row or the tensor), then its value bytes as stored.
 /// FP8_B128 writes the scale as an f32, widened from F32, BF16 or E8M0 (U8 or F8_E8M0); MXFP8 as
-/// its E8M0 byte. A block the type's check refuses ([`check_fp8_b128`], [`check_mxfp8`]: a scale
-/// that is not finite, an E4M3 NaN, a product past f32) is refused naming its row; an expert
-/// whose shape differs from the first's, by name.
-fn fp8<'a>(
-    get: impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
-    sources: &[(&str, &Placed)],
-    type_id: u32,
-) -> Result<Normal, Error> {
-    let ty = GgmlType::from_u32(type_id);
-    let mut bytes = Vec::new();
-    let mut shape = None;
-    for &source in sources {
-        let have = fp8_append(&get, source, ty, &mut bytes)?;
-        let first = *shape.get_or_insert(have);
-        if first != have {
-            return Err(Error::Format {
-                name: source.0.to_string(),
-                format: source.1.format,
-                what: format!(
-                    "rows and k {have:?}; the stack's first expert {} has {first:?}",
-                    sources[0].0
-                ),
-            });
-        }
-    }
-    let Some([rows, k]) = shape else {
-        return Err(Error::Shape {
-            name: "an FP8 tensor".into(),
-            what: "has no source".into(),
-        });
-    };
-    let mut dims = vec![k as u64, rows as u64];
-    if sources.len() > 1 {
-        dims.push(sources.len() as u64);
-    }
-    Ok(Normal {
-        type_id,
-        dims,
-        bytes,
-        scale: vec![],
-    })
-}
-
-/// Appends the `ty` blocks of the weight `source` ([`fp8`]) to `out`; returns its `[rows, k]`.
+/// its E8M0 byte. `out` holds room for the blocks of `left` weights of its shape (it and the ones
+/// after it) once it returns. A block the type's check refuses ([`check_fp8_b128`],
+/// [`check_mxfp8`]: a scale that is not finite, an E4M3 NaN, a product past f32) is refused naming
+/// its row. Returns `[rows, k]`.
 fn fp8_append<'a>(
     get: &impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
     (weight, placed): (&str, &Placed),
     ty: GgmlType,
     out: &mut Vec<u8>,
+    left: usize,
 ) -> Result<[usize; 2], Error> {
     let refuse = |what: String| Error::Format {
         name: weight.to_string(),
@@ -1122,8 +1145,9 @@ fn fp8_append<'a>(
     let c = k.div_ceil(b);
     let more = (rows * (k / blck))
         .checked_mul(blck + unit)
+        .and_then(|n| n.checked_mul(left))
         .ok_or_else(|| refuse("block bytes size overflow".into()))?;
-    out.try_reserve(more)
+    out.try_reserve_exact(more)
         .map_err(|e| refuse(format!("{more} block bytes: {e}")))?;
     os::advise_huge_within(out.spare_capacity_mut());
     for (row, values) in w.bytes.chunks_exact(k).enumerate() {
@@ -1162,7 +1186,7 @@ fn fp8_q8_0<'a>(
         what,
     };
     let mut blocks = Vec::new();
-    let [rows, k] = fp8_append(&get, (weight, placed), GgmlType::FP8_B128, &mut blocks)?;
+    let [rows, k] = fp8_append(&get, (weight, placed), GgmlType::FP8_B128, &mut blocks, 1)?;
     // `fp8_append` holds whole 128-value blocks of 132 bytes, so a row is `k / 128` of them and
     // `k` a multiple of 32.
     let row_bytes = k / 128 * 132;
@@ -1269,11 +1293,11 @@ fn plain<'a>(
     }
     finite(name, &raw)?;
     let bytes = match role {
-        Use::Matrix(Plain::Bf16) => raw.bytes.to_vec(),
-        Use::Matrix(Plain::F32) => safetensors::f32_values(name, &raw)?
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect(),
+        Use::Matrix(plain @ (Plain::Bf16 | Plain::F32)) => {
+            let mut bytes = Vec::new();
+            plain_values(name, &raw, plain, &mut bytes, 1)?;
+            bytes
+        }
         _ => {
             if !raw.shape.last().is_some_and(|k| k.is_multiple_of(32)) {
                 return Err(refuse(format!(
@@ -1305,35 +1329,88 @@ fn plain<'a>(
     })
 }
 
-/// Unquantized experts `sources`, each written as [`plain`] writes it, one after another as
-/// `[k, rows, n_expert]`; an expert that is not a matrix of the first's shape is refused by name.
-fn plain_stack<'a>(
-    get: impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
-    sources: &[(&str, &Placed)],
-    role: Use,
-    type_id: u32,
-) -> Result<Normal, Error> {
-    let mut out = Normal {
-        type_id,
-        ..Normal::default()
+/// Appends the values of the stored tensor `raw` named `name` as `plain` writes them to `out`:
+/// BF16 as stored, F32 as stored or widened exactly from BF16 or F16. `out` holds room for `left`
+/// tensors of their length (it and the ones after it) once it returns. Bytes that do not fill the
+/// shape, and a dtype `plain` is not written from, are refused by name; finiteness is the
+/// caller's to check.
+fn plain_values(
+    name: &str,
+    raw: &Raw<'_>,
+    plain: Plain,
+    out: &mut Vec<u8>,
+    left: usize,
+) -> Result<(), Error> {
+    let refuse = |what: String| Error::Shape {
+        name: name.to_string(),
+        what,
     };
-    for &(name, placed) in sources {
-        let n = plain(&get, name, placed, role, type_id)?;
-        if n.dims.len() != 2 || (!out.dims.is_empty() && out.dims != n.dims) {
-            return Err(Error::Format {
-                name: name.to_string(),
-                format: placed.format,
-                what: format!(
-                    "dims {:?}; the stack's first expert {} has {:?}",
-                    n.dims, sources[0].0, out.dims
-                ),
-            });
-        }
-        out.dims = n.dims;
-        out.bytes.extend(n.bytes);
+    let size = raw.dtype.size();
+    let filled = raw.shape.iter().try_fold(size, |n, &d| n.checked_mul(d));
+    if filled != Some(raw.bytes.len()) {
+        return Err(refuse(format!(
+            "shape {:?} does not match {} {} bytes",
+            raw.shape,
+            raw.bytes.len(),
+            raw.dtype.name()
+        )));
     }
-    out.dims.push(sources.len() as u64);
-    Ok(out)
+    let widen = match (plain, raw.dtype) {
+        (Plain::Bf16, Dtype::Bf16) | (Plain::F32, Dtype::F32) => 1,
+        (Plain::F32, Dtype::Bf16 | Dtype::F16) => 2,
+        _ => {
+            return Err(safetensors::Error::Dtype {
+                name: name.into(),
+                dtype: raw.dtype.name().into(),
+            }
+            .into());
+        }
+    };
+    let more = raw
+        .bytes
+        .len()
+        .checked_mul(widen)
+        .and_then(|n| n.checked_mul(left))
+        .ok_or_else(|| refuse("plain byte count overflows usize".into()))?;
+    out.try_reserve_exact(more)
+        .map_err(|e| refuse(format!("cannot reserve {more} bytes: {e}")))?;
+    let halves = raw.bytes.as_chunks::<2>().0;
+    match raw.dtype {
+        Dtype::Bf16 if widen == 2 => {
+            for b in halves {
+                out.extend_from_slice(&[0, 0, b[0], b[1]]);
+            }
+        }
+        Dtype::F16 => {
+            for b in halves {
+                out.extend(gguf::quant::half_to_f32(u16::from_le_bytes(*b)).to_le_bytes());
+            }
+        }
+        _ => out.extend_from_slice(raw.bytes),
+    }
+    Ok(())
+}
+
+/// Appends the unquantized expert `source`, a matrix, as [`plain_values`] writes it to `out`,
+/// which holds room for `left` experts of its shape once it returns; returns its `[rows, k]`.
+fn plain_append<'a>(
+    get: &impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
+    (name, placed): (&str, &Placed),
+    plain: Plain,
+    out: &mut Vec<u8>,
+    left: usize,
+) -> Result<[usize; 2], Error> {
+    let raw = get(name)?;
+    let &[rows, k] = raw.shape else {
+        return Err(Error::Format {
+            name: name.to_string(),
+            format: placed.format,
+            what: format!("shape {:?}, not [rows, k]", raw.shape),
+        });
+    };
+    finite(name, &raw)?;
+    plain_values(name, &raw, plain, out, left)?;
+    Ok([rows, k])
 }
 
 /// Reads the weight of `source` and the two scales its place names, and appends its blocks and
@@ -1343,7 +1420,7 @@ fn plain_stack<'a>(
 fn append<'a>(
     get: &impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
     (weight, placed): (&str, &Placed),
-    out: &mut Nvfp4,
+    out: &mut Normal,
     left: usize,
 ) -> Result<[usize; 2], Error> {
     let encoding = match placed.format {
@@ -1366,7 +1443,7 @@ fn append<'a>(
 fn append_plain<'a>(
     get: &impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
     (weight, placed): (&str, &Placed),
-    out: &mut Nvfp4,
+    out: &mut Normal,
     left: usize,
 ) -> Result<[usize; 2], Error> {
     let scales = scales_of(weight, placed)?;
@@ -1423,10 +1500,10 @@ fn append_plain<'a>(
         .and_then(|n| n.checked_mul(36))
         .and_then(|n| n.checked_mul(left))
         .ok_or_else(|| shape(&wname, "NVFP4 byte count overflows usize".into()))?;
-    out.blocks
+    out.bytes
         .try_reserve_exact(bytes)
         .map_err(|e| shape(&wname, format!("cannot reserve {bytes} NVFP4 bytes: {e}")))?;
-    os::advise_huge_within(out.blocks.spare_capacity_mut());
+    os::advise_huge_within(out.bytes.spare_capacity_mut());
     // Each scale byte's half value, worked out once; a byte that is no scale is refused below.
     let halves: [Option<f32>; 256] = std::array::from_fn(|b| ue4m3_to_f32_half(b as u8).ok());
     for (row, (w, s)) in w
@@ -1476,7 +1553,7 @@ fn append_plain<'a>(
             {
                 *o = nvfp4_group_to_block(g);
             }
-            out.blocks.extend_from_slice(&blocks);
+            out.bytes.extend_from_slice(&blocks);
         }
     }
     out.scale.push(scale);
@@ -1724,25 +1801,30 @@ mod tests {
     fn lin<'a>(
         get: impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
         stem: &str,
-    ) -> Result<Nvfp4, Error> {
+    ) -> Result<Normal, Error> {
         let (w, p) = own(stem);
-        nvfp4(get, &[(&w, &p)]).map(packed)
+        nvfp4(get, &[(&w, &p)])
     }
 
     fn stack<'a>(
         get: impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
         stems: &[&str],
-    ) -> Result<Nvfp4, Error> {
+    ) -> Result<Normal, Error> {
         let owned: Vec<_> = stems.iter().map(|s| own(s)).collect();
-        nvfp4(get, &sources(&owned)).map(packed)
+        nvfp4(get, &sources(&owned))
     }
 
-    fn packed(n: Normal) -> Nvfp4 {
-        Nvfp4 {
-            dims: n.dims,
-            blocks: n.bytes,
-            scale: n.scale,
+    /// The NVFP4 `sources` through their [`Stack`] alone.
+    fn nvfp4<'a>(
+        get: impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
+        sources: &[(&str, &Placed)],
+    ) -> Result<Normal, Error> {
+        let format = sources.first().map_or(Format::Nvfp4, |s| s.1.format);
+        let mut stack = Stack::of(format, Use::Matrix(Plain::F32), sources.len()).unwrap();
+        for &source in sources {
+            stack.push(&get, source)?;
         }
+        stack.finish()
     }
 
     /// The reference's row digests and tensor scale of `stem`.
@@ -1788,8 +1870,8 @@ mod tests {
             let k = t.dims[0] as usize;
             assert_eq!(t.dims, [k as u64, rows.len() as u64], "{stem}");
             assert_eq!(t.scale, [scale as f32], "{stem}");
-            assert_eq!(t.blocks.len(), rows.len() * k / 64 * 36, "{stem}");
-            assert_eq!(decoded(&t.blocks, k, t.scale[0]), rows, "{stem}");
+            assert_eq!(t.bytes.len(), rows.len() * k / 64 * 36, "{stem}");
+            assert_eq!(decoded(&t.bytes, k, t.scale[0]), rows, "{stem}");
         }
     }
 
@@ -1802,15 +1884,15 @@ mod tests {
     fn a_routed_stack_keeps_one_scale_an_expert() {
         let st = fixture();
         let three = stack(|n| st.raw(n), &[STEMS[0], STEMS[1], STEMS[0]]).unwrap();
-        assert_eq!(three.blocks.capacity(), three.blocks.len());
+        assert_eq!(three.bytes.capacity(), three.bytes.len());
         let t = stack(|n| st.raw(n), &STEMS).unwrap();
         assert_eq!(t.dims, [2560, 4, 2]);
-        let per = t.blocks.len() / 2;
+        let per = t.bytes.len() / 2;
         for (e, stem) in STEMS.iter().enumerate() {
             let (rows, scale) = reference(stem);
             assert_eq!(t.scale[e], scale as f32, "{stem}");
             assert_eq!(
-                decoded(&t.blocks[e * per..(e + 1) * per], 2560, t.scale[e]),
+                decoded(&t.bytes[e * per..(e + 1) * per], 2560, t.scale[e]),
                 rows,
                 "{stem}"
             );
@@ -1880,13 +1962,13 @@ mod tests {
         let first = lin(get, STEMS[0]).unwrap();
         assert_eq!(
             (one.type_id, &one.dims, &one.bytes, &one.scale),
-            (40, &first.dims, &first.blocks, &first.scale)
+            (40, &first.dims, &first.bytes, &first.scale)
         );
         let two = normalize(get, &both, m).unwrap();
         let exp = stack(get, &STEMS).unwrap();
         assert_eq!(
             (&two.dims, &two.bytes, &two.scale),
-            (&exp.dims, &exp.blocks, &exp.scale)
+            (&exp.dims, &exp.bytes, &exp.scale)
         );
         let bf16_first = placed(Format::Bf16, &[]);
         let e = normalize(get, &[("b.weight", &bf16_first), both[0]], m).unwrap_err();
@@ -2478,7 +2560,7 @@ mod tests {
         refused(
             &short,
             &[("f.weight", &p), ("g.weight", &g)],
-            "g.weight: FP8-block 128x128 rows and k [2, 256]; the stack's first expert f.weight has [130, 256]",
+            "g.weight: FP8-block 128x128 dims [256, 2]; the stack's first expert f.weight has [256, 130]",
         );
         let mut nan = grid;
         nan[3] = f32::NAN;
@@ -3142,8 +3224,8 @@ mod tests {
         let a = get(triple(64, &[0x38; 4], Some(0.25)));
         let b = get(triple(64, &[0x38; 4], Some(1e30)));
         let c = get(triple(64, &[0x38; 4], None));
-        assert_eq!((&a.blocks, &a.scale), (&b.blocks, &b.scale));
-        assert_eq!((&a.blocks, &a.scale), (&c.blocks, &c.scale));
+        assert_eq!((&a.bytes, &a.scale), (&b.bytes, &b.scale));
+        assert_eq!((&a.bytes, &a.scale), (&c.bytes, &c.scale));
     }
 
     /// A scale byte with bit 7 set, or `0x7F`, is refused naming the tensor, the row and the
@@ -3297,7 +3379,7 @@ mod tests {
         ));
         let owned: Vec<_> = STEMS.iter().map(|s| own(s)).collect();
         let two = sources(&owned);
-        let mut full = Nvfp4Stack::new(1);
+        let mut full = Stack::of(Format::Nvfp4, Use::Matrix(Plain::F32), 1).unwrap();
         full.push(|n| st.raw(n), two[0]).unwrap();
         let e = full.push(|n| st.raw(n), two[1]).unwrap_err();
         assert!(
@@ -3307,7 +3389,7 @@ mod tests {
         );
         let e = stack(|n| st.raw(n), &[STEMS[0], "synthetic"]).unwrap_err();
         assert!(
-            matches!(&e, Error::Shape { name, .. } if name == "synthetic.weight"),
+            matches!(&e, Error::Format { name, .. } if name == "synthetic.weight"),
             "{e:?}"
         );
     }
