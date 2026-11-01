@@ -14,8 +14,9 @@
 
 use std::path::Path;
 
-use bloomery_gpu::arch::qwen3moe::{Body38, KvQ8, Model38, Qwen38Model};
+use bloomery_gpu::arch::qwen3moe::{Body38, Model38, Qwen38Model};
 use bloomery_gpu::host::swap::Residency;
+use bloomery_gpu::kv_format::KvQ8;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::generate::stage_page;

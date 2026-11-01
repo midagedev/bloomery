@@ -60,7 +60,7 @@
 //! ([`HeadLaunches`]). A layer without a host leg
 //! ([`Card38::hostless`]) has no go and no wait.
 
-use super::body::{ATTN_SCALE_256, KvQ8};
+use super::body::ATTN_SCALE_256;
 use super::card38::{CARD_LAUNCHES, Card38, TIER_CARD_LAUNCHES};
 use super::plan38::{
     GDN, GDN_GATE, GdnPlan, HcSite, Layer38, Mixer38, PlePlan, QsaPlan, geo, head_site,
@@ -82,6 +82,7 @@ use crate::head::{Head, HeadLaunches};
 use crate::host::handoff::{Handoff, HandoffKernels, Places};
 use crate::host::run::HostRun;
 use crate::host::{BatchLeg, StepLeg};
+use crate::kv_format::KvQ8;
 use crate::linear::conv::{ConvArgs, ConvRows};
 use crate::linear::delta::{DeltaArgs, DeltaLanesArgs};
 use crate::linear::norm_gate::NormGateArgs;

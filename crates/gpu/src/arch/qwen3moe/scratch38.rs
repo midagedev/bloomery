@@ -13,7 +13,6 @@
 //! the load holds the stores it allocated to the rules' bytes
 //! ([`store_rule_bytes`]).
 
-use super::body::KvQ8;
 use super::body38::WHAT_SHARE;
 use super::plan38::{GDN, Layer38, geo};
 use super::scratch::{
@@ -22,6 +21,7 @@ use super::scratch::{
 use crate::GpuError;
 use crate::flash_gqa::{listed_partials_ms_len, listed_partials_v_len_256};
 use crate::hc_gated::HcScratch;
+use crate::kv_format::KvQ8;
 use crate::linear::{self, LinearShape};
 use crate::ple;
 use crate::qsa::{self, QsaScratch};

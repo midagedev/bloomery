@@ -131,11 +131,12 @@ mod gate {
     use crate::residency_clauses;
 
     use bloomery_gpu::arch::qwen3moe::{
-        Body38, KvQ8, Model38, Prompt38, Qwen38Model, RouteTap, TargetRows,
+        Body38, Model38, Prompt38, Qwen38Model, RouteTap, TargetRows,
     };
     use bloomery_gpu::draft::{DraftFeed, DraftHead, Feed, Hidden, WalkMode};
     use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader, TraceSet};
     use bloomery_gpu::host::swap::Residency;
+    use bloomery_gpu::kv_format::{KvChoice, KvQ8};
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::flip;
     use bloomery_gpu_gates::generate::Place;
@@ -905,7 +906,7 @@ mod gate {
         const LONG: usize = 16_384;
         const UB: usize = 512;
         let file = model_of(path)?;
-        let kv = KvQ8::of(path.is_dir());
+        let kv = KvChoice::choose(None, None)?.kv;
         let mut inputs = PlanInputs::describe(file.header())?;
         inputs.kv = inputs.kv.in_q8_if(kv == KvQ8::Q8);
         let gdn = inputs

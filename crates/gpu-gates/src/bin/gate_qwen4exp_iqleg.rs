@@ -70,8 +70,9 @@ mod gate {
 
     use crate::qwen38_open::Open38;
 
-    use bloomery_gpu::arch::qwen3moe::{KvQ8, Prompt38, Qwen38Model};
+    use bloomery_gpu::arch::qwen3moe::{Prompt38, Qwen38Model};
     use bloomery_gpu::host::swap::Residency;
+    use bloomery_gpu::kv_format::KvQ8;
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
     use gguf::{GgmlType, Split};
     use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_for_experts};

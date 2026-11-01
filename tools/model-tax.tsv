@@ -101,7 +101,7 @@ crates/gpu-gates/src/engine.rs	gemma	2	baseline R 2: MK1a one registry row per c
 crates/gpu-gates/src/engine.rs	glm	1	baseline R 1: MK1a one registry row per crate
 crates/gpu-gates/src/engine.rs	mimo	1	baseline R 1: MK1a one registry row per crate
 crates/gpu-gates/src/engine.rs	nemotron	2	baseline R 2: MK1a one registry row per crate
-crates/gpu-gates/src/engine.rs	qwen	11	baseline R 12: MK1a one registry row per crate
+crates/gpu-gates/src/engine.rs	qwen	10	baseline R 12: MK1a one registry row per crate
 crates/gpu-gates/src/iq_rows.rs	nemotron	1	baseline T 1: case-table row, a fixture label or default path
 crates/gpu-gates/src/llama_place.rs	deepseek	1	PIN(2026-10-23) deepseek: llama-server's -devd names the DSpark draft's card, which only the V4.1 seat opens on a named card; the seat word is the one line until a seat carries a placement-flag description field
 crates/gpu-gates/src/llama_place.rs	qwen	1	PIN(2026-10-23) qwen: llama-server's --cpu-moe maps onto the one lever that keeps every routed expert on the host, which only the Qwen3.8 seat acts on; the seat word and the lever are the one line until a seat carries a placement-flag description field

@@ -31,6 +31,7 @@ use crate::gemm::{Gemm32Kernels, GemmKernels};
 use crate::head::Head;
 use crate::host::StepLeg;
 use crate::host::swap_source::ResidencyGlue;
+use crate::kv_format::KvQ8;
 use crate::linear::LinearKernels;
 use crate::model::lookup::f32_gain;
 use crate::model::{
@@ -632,66 +633,6 @@ impl Body {
     #[must_use]
     pub fn placed(&self) -> Option<&Placed> {
         self.placed.as_ref()
-    }
-}
-
-/// The format a qwen3-family load holds its KV cache planes in: f16 (the
-/// format before the lever), or q8_0's two-plane layout — 17/16 bytes a
-/// value against f16's 2, both planes (K and V) quantized together by the
-/// one choice. `q8_0` is the opt-in arm ([`OpenOpts::kv`], the seat's
-/// `--cache-type-k` spelling): a cache half the f16 bytes wide, its rows the
-/// quantizing appends' and the q8 read paths'.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum KvQ8 {
-    /// `[n_kv][ctx][head]` f16 a side — the only format until the lever.
-    #[default]
-    F16,
-    /// Per side a codes plane of `head/4` u32 a row and a scales plane of
-    /// `head/32` u16 ([`rope_neox::q8_plane_lens`](crate::rope_neox)).
-    Q8,
-}
-
-impl KvQ8 {
-    /// The cache format selected by a layout's q8_0 bit.
-    #[must_use]
-    pub const fn of(q8: bool) -> KvQ8 {
-        if q8 { KvQ8::Q8 } else { KvQ8::F16 }
-    }
-
-    /// The flag's word, else the lever's, else the caller's default; any other word is refused
-    /// by name before the load.
-    pub fn choose(
-        flag: Option<&str>,
-        lever: Option<&str>,
-        default: KvQ8,
-    ) -> Result<KvQ8, GpuError> {
-        let word = flag.or(lever).unwrap_or(default.name());
-        KvQ8::parse(word).ok_or_else(|| {
-            GpuError::shape(
-                "KvQ8::choose",
-                format!("--cache-type-k takes f16 or q8_0, not {word:?}"),
-            )
-        })
-    }
-
-    /// The word the lever and `--cache-type-k` take (llama-server's
-    /// spelling), or `None` on any other.
-    #[must_use]
-    pub fn parse(word: &str) -> Option<KvQ8> {
-        match word {
-            "f16" => Some(KvQ8::F16),
-            "q8_0" => Some(KvQ8::Q8),
-            _ => None,
-        }
-    }
-
-    /// The word [`KvQ8::parse`] took.
-    #[must_use]
-    pub const fn name(self) -> &'static str {
-        match self {
-            KvQ8::F16 => "f16",
-            KvQ8::Q8 => "q8_0",
-        }
     }
 }
 
@@ -1574,49 +1515,10 @@ impl GpuModel<Body> {
 
 #[cfg(test)]
 mod tests {
-    use super::KvQ8;
-    use crate::GpuError;
     use crate::site::SiteTy;
     use gguf::quant::GgmlType;
     use model::placement::accepts::qwen3moe_dense;
     use model::placement::kernels;
-
-    /// The KV cache's format: `--cache-type-k`'s word wins over the lever's, the lever's over the
-    /// default, and unset a checkpoint folder runs q8_0 and a GGUF file f16; any other word is
-    /// refused by name, from the flag or the lever.
-    #[test]
-    fn the_cache_format_is_the_flags_then_the_levers_then_the_folders() {
-        let k = |flag, lever, folder| {
-            KvQ8::choose(flag, lever, KvQ8::of(folder)).expect("a cache word")
-        };
-        assert_eq!(k(None, None, true), KvQ8::Q8);
-        assert_eq!(k(None, None, false), KvQ8::F16);
-        assert_eq!(k(Some("f16"), None, true), KvQ8::F16);
-        assert_eq!(k(Some("q8_0"), None, false), KvQ8::Q8);
-        assert_eq!(k(None, Some("f16"), true), KvQ8::F16);
-        assert_eq!(k(Some("q8_0"), Some("f16"), false), KvQ8::Q8);
-        assert_eq!(k(Some("f16"), Some("fp8"), true), KvQ8::F16);
-        for (flag, lever) in [
-            (Some("q8"), None),
-            (None, Some("fp8")),
-            (Some("q4"), Some("f16")),
-            (Some(""), None),
-        ] {
-            let e: GpuError =
-                KvQ8::choose(flag, lever, KvQ8::Q8).expect_err("a word the flag does not take");
-            assert!(matches!(
-                &e,
-                GpuError::Shape {
-                    what: "KvQ8::choose",
-                    ..
-                }
-            ));
-            assert!(
-                e.to_string().contains("--cache-type-k takes f16 or q8_0"),
-                "{e}"
-            );
-        }
-    }
 
     /// A dense entry the qwen3moe body runs is the launch family of its file
     /// type: [`qwen3moe_dense`] maps the type to the entry,

@@ -78,7 +78,8 @@ mod greedy;
 #[cfg(feature = "gpu")]
 mod gate {
     use app::{RowsLog, Session, SessionError};
-    use bloomery_gpu::arch::qwen3moe::{Body35, KvQ8, Open35, PrefillPath, Qwen35moeModel};
+    use bloomery_gpu::arch::qwen3moe::{Body35, Open35, PrefillPath, Qwen35moeModel};
+    use bloomery_gpu::kv_format::KvQ8;
     use bloomery_gpu::model::{MAX_PASS_ROWS, StepMode};
     use bloomery_gpu::{Gpu, GpuError};
     use bloomery_gpu_gates::{GateError, checks_failed, open_split, prose_ids, verdict};

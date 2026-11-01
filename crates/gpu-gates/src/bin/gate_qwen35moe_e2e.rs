@@ -411,14 +411,15 @@ mod gate {
     use bloomery_gpu::NodeInfo;
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
     use bloomery_gpu::arch::qwen3moe::{
-        Body35, Delta35Run, Gqa35Run, KvQ8, LayerKind35, Mixer35Run, Open35, PrefillPath,
-        PrefillStep, Qwen35moeModel, StoreHost, WIDE_FROM, WideRoute,
+        Body35, Delta35Run, Gqa35Run, LayerKind35, Mixer35Run, Open35, PrefillPath, PrefillStep,
+        Qwen35moeModel, StoreHost, WIDE_FROM, WideRoute,
     };
     use bloomery_gpu::gemm::{GEMM_BN, GemmTile};
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::swap::{CallPick, CallReport, PassReport, Residency};
     use bloomery_gpu::host::xstream::{Costs, XLayer, XMode};
     use bloomery_gpu::hybrid::{HOST, SlotMap};
+    use bloomery_gpu::kv_format::KvQ8;
     use bloomery_gpu::linear::{Q_SCALE, RING_ROWS, expf_ik};
     use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu::route_core::sigmoid;

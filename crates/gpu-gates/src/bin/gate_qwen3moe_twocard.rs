@@ -75,7 +75,8 @@ mod gate {
     use std::path::{Path, PathBuf};
     use std::time::Instant;
 
-    use bloomery_gpu::arch::qwen3moe::{Body, Body35, FlashKind, KvQ8, Open35, OpenOpts, Placed};
+    use bloomery_gpu::arch::qwen3moe::{Body, Body35, FlashKind, Open35, OpenOpts, Placed};
+    use bloomery_gpu::kv_format::KvQ8;
     use bloomery_gpu::model::{ChainBody, GpuModel};
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::tier::{self, Tier};

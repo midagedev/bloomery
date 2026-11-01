@@ -53,10 +53,11 @@ mod gate {
 
     use app::Session;
     use app::dspark::CardDspark;
-    use bloomery_gpu::arch::qwen3moe::{Body35, KvQ8, Open35, Qwen35moeModel};
+    use bloomery_gpu::arch::qwen3moe::{Body35, Open35, Qwen35moeModel};
     use bloomery_gpu::dspark::dense::{DenseDims, DenseLayers};
     use bloomery_gpu::dspark::head::HeadTail;
     use bloomery_gpu::dspark::{DraftLayers, DsparkBody, HeadSource, Q8Rows};
+    use bloomery_gpu::kv_format::KvQ8;
     use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
     use bloomery_gpu::weights::q8_0_planes;
     use bloomery_gpu::{Gpu, GpuError};

@@ -25,7 +25,7 @@ mod gate {
     use std::process::Command;
     use std::time::Duration;
 
-    use bloomery_gpu::arch::qwen3moe::KvQ8;
+    use bloomery_gpu::kv_format::KvQ8;
     use bloomery_gpu_gates::beside::{self, Beside};
     use bloomery_gpu_gates::generate::{Place, SEAT_STEPS};
     use bloomery_gpu_gates::record::{self, Log};

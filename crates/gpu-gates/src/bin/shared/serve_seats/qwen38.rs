@@ -15,8 +15,8 @@
 //!                           [--cache-type-k f16|q8_0]
 //!
 //! `--cache-type-k` is the KV cache's format, llama-server's flag and words: a set word wins, then
-//! the `BLOOMERY_QWEN3_KV` lever's; unset, a checkpoint folder (FP4-Local) runs q8_0 and a GGUF
-//! file f16 ([`KvQ8::choose`]). `--cache-type-v` does not exist: both planes quantize together.
+//! the `BLOOMERY_QWEN3_KV` lever's; unset, f16, whatever the file's container
+//! ([`KvChoice::choose`]). `--cache-type-v` does not exist: both planes quantize together.
 //!
 //! `-ub N` (`--ubatch-size`, llama-server's spelling and its `LLAMA_ARG_UBATCH`) is the most
 //! prompt positions one ubatch walk runs, over `BLOOMERY_QWEN3_UBATCH`, else 4096; a size outside
@@ -443,13 +443,14 @@ use std::time::{Duration, Instant};
 use app::mtp::{MtpBody, MtpDraft};
 use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
 use bloomery_gpu::arch::qwen3moe::{
-    Body38, CHECKPOINT_EVERY, Folder38, KvQ8, Model38, Prompt38, Seq38, TargetRows,
-    checkpoint_budget38, checkpoint_price38, point_row_budget38, seq38_bytes,
+    Body38, CHECKPOINT_EVERY, Folder38, Model38, Prompt38, Seq38, TargetRows, checkpoint_budget38,
+    checkpoint_price38, point_row_budget38, seq38_bytes,
 };
 use bloomery_gpu::checkpoint::bytes;
 use bloomery_gpu::checkpoint::saved::SaveLane;
 use bloomery_gpu::host::route_trace::RouteTrace;
 use bloomery_gpu::host::swap::Residency;
+use bloomery_gpu::kv_format::{KvChoice, KvQ8};
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu::{Gpu, GpuError};
 use bloomery_gpu_gates::beside::{self, Beside};
@@ -1524,7 +1525,7 @@ pub(crate) struct Args {
     /// `-ub` / `--ubatch-size`: the most positions a ubatch walk runs, over
     /// `BLOOMERY_QWEN3_UBATCH` ([`ubatch_rule`]).
     ubatch: Option<usize>,
-    /// `--cache-type-k`: the KV cache's format ([`KvQ8::choose`]).
+    /// `--cache-type-k`: the KV cache's format ([`KvChoice::choose`]).
     cache_type_k: Option<String>,
     /// `--plan`: the records before the load, then exit.
     plan_only: bool,
@@ -1628,7 +1629,7 @@ pub(crate) fn check(
         } else {
             None
         };
-        KvQ8::choose(a.cache_type_k.as_deref(), kv_set, KvQ8::F16)?;
+        KvChoice::asked(a.cache_type_k.as_deref(), kv_set)?;
         if let Some(levers) = levers {
             check_draft_word(levers)?;
             let feed = Feed38::of(levers)?;
@@ -1797,11 +1798,8 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     };
     let mut inputs = PlanInputs::describe(&split)?;
     // The cache format, before any plan: every plan the seat asks counts its bytes.
-    let kv = KvQ8::choose(
-        a.cache_type_k.as_deref(),
-        levers.qwen3_kv_set(),
-        KvQ8::of(folder.is_some()),
-    )?;
+    let kv_cache = KvChoice::choose(a.cache_type_k.as_deref(), levers.qwen3_kv_set())?;
+    let kv = kv_cache.kv;
     inputs.kv = inputs.kv.in_q8_if(kv == KvQ8::Q8);
     // The slot count first: it shapes the draft's window condition, the
     // context choice itself, and every plan the seat asks for, each counting
@@ -2445,7 +2443,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         (mtp, lookup, draft_in_folder),
         off_why.as_ref(),
         (slots, ctx, ctx_rule),
-        kv,
+        kv_cache,
     )
     .eprint();
     Record::new(&record::LISTENING38)
@@ -2460,13 +2458,14 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
 
 /// The `setup` record of a server that drafts by `mtp` (its layer a checkpoint folder's when
 /// `in_folder`, else a draft file's) or `lookup`, or drafts nothing for the reason `off`, with
-/// `slots` resident sequences of `ctx` positions set by `rule` and its KV cache in `kv`: the
-/// choices, why the draft is off where a rule turned it off, and the settings that change them.
+/// `slots` resident sequences of `ctx` positions set by `rule` and its KV cache as `cache`
+/// chose it: the choices, why the draft is off where a rule turned it off, and the settings
+/// that change them.
 pub fn setup38(
     (mtp, lookup, in_folder): (bool, bool, bool),
     off: Option<&Draft38Off>,
     (slots, ctx, rule): (usize, usize, Rule),
-    kv: KvQ8,
+    cache: KvChoice,
 ) -> Record {
     let r = Record::new(&record::SETUP38);
     let (r, draft) = match (mtp, lookup) {
@@ -2496,7 +2495,8 @@ pub fn setup38(
     r.u("slots", slots)
         .u("ctx", ctx)
         .w("ctx_rule", rule.word())
-        .w("cache", kv.name())
+        .w("cache", cache.kv.name())
+        .w("cache_from", cache.from.word())
         .w(
             "change",
             format!(
@@ -2592,7 +2592,7 @@ struct SeatArgs {
     /// (`PlanInputs::room`): the engine thread plans from it, not from a
     /// reading of its own.
     room: (u64, HostRead),
-    /// The KV cache's format the main thread's plans counted ([`KvQ8::choose`]).
+    /// The KV cache's format the main thread's plans counted ([`KvChoice::choose`]).
     kv: KvQ8,
     /// The plan the main thread's rules and records read, which the load's
     /// plan is held to.
@@ -4052,7 +4052,7 @@ mod tests {
 
     /// `check` refuses a `--cache-type-k` word the cache does not take, before
     /// `--hf` fetches the model, and passes both words it takes.
-    /// FAIL-first: drop the `KvQ8::choose` call from `check` and `q4` passes.
+    /// FAIL-first: drop the `KvChoice::asked` call from `check` and `q4` passes.
     #[test]
     fn check_refuses_a_cache_word_before_the_model() {
         let check =

@@ -62,9 +62,10 @@ mod e2e;
 #[cfg(feature = "gpu")]
 mod gate {
     use bloomery_gpu::arch::qwen3moe::{
-        KvQ8, Mtp35, MtpArena, Open35, PrefillPath, Qwen35moeModel, addresses, mtp_chain, mtp_walk,
+        Mtp35, MtpArena, Open35, PrefillPath, Qwen35moeModel, addresses, mtp_chain, mtp_walk,
     };
     use bloomery_gpu::draft::{DraftHead, Feed, Hidden, WalkBounds, WalkMode};
+    use bloomery_gpu::kv_format::KvQ8;
     use bloomery_gpu::mtp::{MtpInputArgs, MtpKernels};
     use bloomery_gpu::{Gpu, GpuError};
     use bloomery_gpu_gates::rounding::{U, gamma};

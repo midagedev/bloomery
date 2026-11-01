@@ -79,7 +79,7 @@
 //! the spans inside it over the embeddings of their positions
 //! (`image::MediaRows`, the unit's front, `dispatch::unit_front`).
 
-use super::body::{Kernels, KvQ8, TapRows, f32_site};
+use super::body::{Kernels, TapRows, f32_site};
 use super::dispatch::{self, PassCtx};
 use super::draft_taps::DraftTaps;
 use super::head_argmax::HeadArgmaxState;
@@ -118,6 +118,7 @@ use crate::host::swap_source::{DEADLINE, LIVE_DELAY, ResidencySpec};
 use crate::host::xstream::{Costs, XLayer, XMode, XReport, XStreamBody};
 use crate::host::{BatchLeg, StepLeg};
 use crate::hybrid::{Chain, SlotMap};
+use crate::kv_format::KvQ8;
 use crate::linear;
 use crate::media::{ImageSpan, MediaBody, MediaSpan, RopeBase, SeqRope, kept_rule, rope_table};
 use crate::model::fit::{FIT_RESERVE, largest_fit};

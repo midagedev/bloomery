@@ -217,9 +217,10 @@ use app::mtp::{MtpBody, MtpDraft};
 use q3place::Seqs;
 
 use bloomery_gpu::arch::qwen3moe::ubatch::{UBATCH_ENV, ubatch_size};
-use bloomery_gpu::arch::qwen3moe::{Body, Body35, KvQ8, Qwen35moeModel};
+use bloomery_gpu::arch::qwen3moe::{Body, Body35, Qwen35moeModel};
 use bloomery_gpu::dspark::DsparkBody;
 use bloomery_gpu::folder::Model;
+use bloomery_gpu::kv_format::{KvChoice, KvQ8};
 use bloomery_gpu::model::{GpuModel, MAX_PASS_ROWS, SlotRows, StepMode};
 use bloomery_gpu::route_softmax::MAX_TOKENS;
 use bloomery_gpu::weights::{DevWeight, head_tensor};
@@ -322,7 +323,8 @@ pub(crate) struct Args {
     ctx: Option<usize>,
     place: Option<Place>,
     /// `--cache-type-k`: the K/V planes' format (llama-server's spelling),
-    /// over the `BLOOMERY_QWEN3_KV` lever's word when given.
+    /// over the `BLOOMERY_QWEN3_KV` lever's word when given; neither set, f16
+    /// ([`KvChoice::choose`]).
     cache_type_k: Option<String>,
     /// `--parallel`: the slots the server serves, resident sequences on
     /// either file's load; `None` takes one slot beside a set `--ctx`, else
@@ -1095,7 +1097,7 @@ impl<B: Body3> Q3<B> {
         pass: Pass,
         load: Q3Load,
         levers: &Levers,
-        (kv, vision): (KvQ8, Option<Opened>),
+        (cache, vision): (KvChoice, Option<Opened>),
         draft: Draft,
         dspark: Option<PathBuf>,
         width: WidthMode,
@@ -1122,7 +1124,7 @@ impl<B: Body3> Q3<B> {
             slots,
             load,
             levers,
-            (kv, vision.as_ref()),
+            (cache.kv, vision.as_ref()),
             draft != Draft::Off,
         )?;
         m.set_mode(StepMode::Graph);
@@ -1176,7 +1178,8 @@ impl<B: Body3> Q3<B> {
         Record::new(&record::LOAD_QWEN3)
             .w("arch", arch)
             .u("resident_bytes", s.model().resident_bytes())
-            .w("cache", kv.name())
+            .w("cache", cache.kv.name())
+            .w("cache_from", cache.from.word())
             .u("ctx", ctx)
             .u("slots", slots)
             .u("slot_ctx", ctx)
@@ -1486,7 +1489,7 @@ impl Q35Mtp {
         slots: usize,
         load: Q3Load,
         levers: &Levers,
-        (kv, vision): (KvQ8, Option<Opened>),
+        (cache, vision): (KvChoice, Option<Opened>),
         width: WidthMode,
     ) -> Result<Q35Mtp, GateError> {
         check_mtp_inputs(slots, vision.is_some())?;
@@ -1497,7 +1500,7 @@ impl Q35Mtp {
         let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let arch = file.architecture().unwrap_or("<missing>").to_owned();
         let opened = t.elapsed();
-        let o = load.open35(q3place::serve_open35(&file, ctx, kv, false)?);
+        let o = load.open35(q3place::serve_open35(&file, ctx, cache.kv, false)?);
         let mut m = match load {
             Q3Load::Whole(on) => {
                 vision_seat::print_seat(None);
@@ -1550,7 +1553,8 @@ impl Q35Mtp {
         Record::new(&record::LOAD_QWEN3)
             .w("arch", arch)
             .u("resident_bytes", s.model().resident_bytes())
-            .w("cache", kv.name())
+            .w("cache", cache.kv.name())
+            .w("cache_from", cache.from.word())
             .u("ctx", ctx)
             .u("slots", slots)
             .u("slot_ctx", ctx)
@@ -2359,10 +2363,9 @@ pub(crate) fn check(
             let a = parse_args(args)?;
             a.template_file.check()?;
             a.vision.check_before_model(from_repo)?;
-            KvQ8::choose(
+            KvChoice::asked(
                 a.cache_type_k.as_deref(),
                 levers.and_then(Levers::qwen3_kv_set),
-                KvQ8::F16,
             )?;
             if let Some(levers) = levers {
                 let word = served::word(levers)?;
@@ -2396,7 +2399,8 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     .run();
 
     arm_screen(levers.screen());
-    let kv = KvQ8::choose(a.cache_type_k.as_deref(), levers.qwen3_kv_set(), KvQ8::F16)?;
+    let cache = KvChoice::choose(a.cache_type_k.as_deref(), levers.qwen3_kv_set())?;
+    let kv = cache.kv;
     let path = ref_model_path()?;
     // A directory is a checkpoint folder, opened once here: its located header plans as a
     // split's first shard does, and the header and part source go to the engine thread.
@@ -2643,7 +2647,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
                     pass,
                     load,
                     &levers,
-                    (kv, vision),
+                    (cache, vision),
                     served,
                     draft_dir,
                     width,
@@ -2657,7 +2661,17 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             0,
         )?,
         (_, Some(Choice::InFile)) => SeatEngine::spawn(
-            move || Q35Mtp::open(&open, slot_ctx, slots, load, &levers, (kv, vision), width),
+            move || {
+                Q35Mtp::open(
+                    &open,
+                    slot_ctx,
+                    slots,
+                    load,
+                    &levers,
+                    (cache, vision),
+                    width,
+                )
+            },
             slot_ctx,
             vocab,
             device,
@@ -2673,7 +2687,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
                     pass,
                     load,
                     &levers,
-                    (kv, vision),
+                    (cache, vision),
                     Draft::Off,
                     None,
                     width,
@@ -2695,7 +2709,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
                     pass,
                     load,
                     &levers,
-                    (kv, vision),
+                    (cache, vision),
                     served,
                     draft_dir,
                     width,

@@ -5,7 +5,8 @@
 
 use bloomery_gpu::Gpu;
 use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
-use bloomery_gpu::arch::qwen3moe::{KvQ8, Open35, Qwen35moeModel};
+use bloomery_gpu::arch::qwen3moe::{Open35, Qwen35moeModel};
+use bloomery_gpu::kv_format::KvQ8;
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::beside;
 use bloomery_gpu_gates::generate::{Place, SEAT_STEPS};

@@ -32,9 +32,10 @@ use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bloomery_gpu::arch::qwen3moe::{
-    Body, Body35, KvQ8, Open35, OpenOpts, Qwen35moeModel, checkpoint_price35,
+    Body, Body35, Open35, OpenOpts, Qwen35moeModel, checkpoint_price35,
 };
 use bloomery_gpu::host::SERVED_TIERS;
+use bloomery_gpu::kv_format::KvQ8;
 use bloomery_gpu::linear::{KHeadMap, LinearShape};
 use bloomery_gpu::model::{GpuModel, Slots};
 use bloomery_gpu::{Gpu, Qwen3moeModel};

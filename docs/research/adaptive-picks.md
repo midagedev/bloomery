@@ -159,7 +159,8 @@ margin. With no measured gain past 2, the model gives it no workload term.
    accuracy opt-in" the default may take it, and σ against `exact_ref` stays a diagnostic. The flash gate pins the
    q8_0 read path (`crates/gpu-gates/src/bin/gate_qwen3moe_flash.rs:95-98`). This pass found no q8_0 arm of the e2e
    count pin. If there is none, a default flip also needs that arm and its reference run (S–M). Qwen3.8 supports
-   q8_0 for K and V and defaults to it on a checkpoint folder; its raw and pooled index keys stay f16.
+   q8_0 for K and V; its raw and pooled index keys stay f16. Unset, a checkpoint folder's cache is f16 like a GGUF
+   file's (`crates/gpu/src/kv_format.rs`).
 6. **Verdict.** Open `q3kvdepth`: one depth A/B (`tools/ref/depth-decode.sh`, `BLOOMERY_DEPTHS="1024 4096 16384"`,
    arms `QWEN3_KV=f16|q8_0`). If q8_0 is never slower, flip the default outright. If it loses shallow and wins deep,
    pick by the planned ctx at the measured crossover.

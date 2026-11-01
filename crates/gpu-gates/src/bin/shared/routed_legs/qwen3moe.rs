@@ -10,7 +10,7 @@
 
 use super::q3place;
 use super::{Adapter, Arm, Outcome, floor_or, outcome_of, view_of};
-use bloomery_gpu::arch::qwen3moe::KvQ8;
+use bloomery_gpu::kv_format::KvQ8;
 use bloomery_gpu_gates::generate::Place;
 use gguf::Split;
 use model::placement::PlanLevers;

@@ -312,10 +312,12 @@
 //!   counted before the planes went through the allocator is 95.9 MiB short
 //!   at that ctx on the Qwen3-30B file at a 2 MiB granule (every plane 1023
 //!   KiB under the granules it takes) and about 21.7 MiB on the Qwen3.6 one.
-//! - `ctx_never_passes_the_trained_context`, `default_load_names_f16` and
+//! - `ctx_never_passes_the_trained_context`, `default_load_names_the_kv_rule` and
 //!   `unset_place_is_the_rule`, the main server's default arm: `/props`'
-//!   `n_ctx` is at most the file's trained context, the load record names
-//!   the f16 planes, and the common rule's `place unset` record names `a`,
+//!   `n_ctx` is at most the file's trained context, the load record's
+//!   `cache` and `cache_from` are the common rule's format and what chose it
+//!   (`bloomery_gpu::kv_format::KvChoice`), and the common rule's
+//!   `place unset` record names `a`,
 //!   its why one card (or two the body serves no tier card of), and no
 //!   break-even, basis or tier count; and `ctx_default_is_the_largest_step_held`,
 //!   the same server, on either card: the default is a context an unset
@@ -537,7 +539,8 @@ mod gate {
     use std::time::Duration;
 
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size;
-    use bloomery_gpu::arch::qwen3moe::{Body35, KvQ8, Open35, Qwen35moeModel, checkpoint_budget35};
+    use bloomery_gpu::arch::qwen3moe::{Body35, Open35, Qwen35moeModel, checkpoint_budget35};
+    use bloomery_gpu::kv_format::{KvChoice, KvQ8};
     use bloomery_gpu::linear::{KHeadMap, LinearShape};
     use bloomery_gpu::route_softmax::MAX_TOKENS;
     use bloomery_gpu_gates::beside;
@@ -3268,9 +3271,22 @@ mod gate {
             "ctx_never_passes_the_trained_context",
             default_n <= trained,
         );
-        let cache = records.one(&record::LOAD_QWEN3)?.word("cache")?.to_owned();
-        println!("default arm: the load record's cache {cache}");
-        check(ok, "default_load_names_f16", cache == "f16");
+        // PIN(2026-11-02): the shared rule now owns default-format selection;
+        // this clause holds the seat's format and provenance to that owner,
+        // under the lever the server inherits.
+        let load = records.one(&record::LOAD_QWEN3)?;
+        let (cache, from) = (load.word("cache")?, load.word("cache_from")?);
+        let rule = KvChoice::choose(None, bloomery_levers::Levers::from_env()?.qwen3_kv_set())?;
+        println!(
+            "default arm: the load record's cache={cache} cache_from={from}, the rule's {} {}",
+            rule.kv.name(),
+            rule.from.word()
+        );
+        check(
+            ok,
+            "default_load_names_the_kv_rule",
+            cache == rule.kv.name() && from == rule.from.word(),
+        );
         // The common rule's record on the unset flag: a body with no tier
         // card runs `a`, on one card or two, names no break-even, basis or
         // tier count. FAIL-first: a seat that skips the record finds none;

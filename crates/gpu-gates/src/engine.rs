@@ -12,7 +12,7 @@
 
 #![cfg(feature = "gpu")]
 
-use bloomery_gpu::arch::qwen3moe::KvQ8;
+use bloomery_gpu::kv_format::KvQ8;
 use bloomery_gpu::model::Engine;
 use bloomery_gpu::{Deepseek2Model, Gpu, GpuError, Qwen3moeModel};
 use gguf::Split;

@@ -1913,7 +1913,7 @@ pub static LISTENING38: Kind = Kind {
 pub static SETUP38: Kind = Kind {
     name: "setup38",
     head: "setup",
-    doc: "The Qwen3.8 server's setup as its rules chose it, printed before its address: the draft (mtp, lookup or off) and, drafting, where its MTP layer comes from (folder, a checkpoint folder; file, a draft file), the resident slots and the context each serves with the rule that set it (set, the flag's; target, the model's limit; fitted, the largest under it the machine holds), the KV cache's format (f16 or q8_0), then, the draft off by a rule, why, and the settings that change them.",
+    doc: "The Qwen3.8 server's setup as its rules chose it, printed before its address: the draft (mtp, lookup or off) and, drafting, where its MTP layer comes from (folder, a checkpoint folder; file, a draft file), the resident slots and the context each serves with the rule that set it (set, the flag's; target, the model's limit; fitted, the largest under it the machine holds), the KV cache's format (f16 or q8_0) and what chose it (`cache_from`: flag, `--cache-type-k`; lever, `BLOOMERY_QWEN3_KV`; default, f16 with neither set), then, the draft off by a rule, why, and the settings that change them.",
     parts: &[
         key("draft", Word, ""),
         opt("draft_from", Word, ""),
@@ -1921,6 +1921,7 @@ pub static SETUP38: Kind = Kind {
         key("ctx", U64, "positions"),
         key("ctx_rule", Word, ""),
         key("cache", Word, ""),
+        key("cache_from", Word, ""),
         lit(" ("),
         pos("change", Text, ""),
         lit(")"),
@@ -1974,11 +1975,12 @@ pub static LISTENING_DECIDE: Kind = Kind {
 pub static LOAD_QWEN3: Kind = Kind {
     name: "load_qwen3",
     head: "load",
-    doc: "The Qwen3 seat's model on device 0: its architecture, resident bytes (every resident sequence's), the K/V planes' format, the cache rows the model was loaded with (`ctx`; `slot_ctx` the same number, each resident sequence's), the resident sequences it holds (`slots`; 1 when the server's slots take one sequence in turns), layers, the prompt ubatch and the step graph's nodes, and the load's wall.",
+    doc: "The Qwen3 seat's model on device 0: its architecture, resident bytes (every resident sequence's), the K/V planes' format and what chose it (`cache_from`: flag, lever or default, as `setup38`'s), the cache rows the model was loaded with (`ctx`; `slot_ctx` the same number, each resident sequence's), the resident sequences it holds (`slots`; 1 when the server's slots take one sequence in turns), layers, the prompt ubatch and the step graph's nodes, and the load's wall.",
     parts: &[
         key("arch", Word, ""),
         key("resident_bytes", U64, "B"),
         key("cache", Word, ""),
+        key("cache_from", Word, ""),
         key("ctx", U64, "positions"),
         key("slots", U64, ""),
         key("slot_ctx", U64, "positions"),
@@ -5236,7 +5238,8 @@ mod tests {
         churn_experts=2552 churn_bytes=38801506304 headroom=111730458624 \
         headroom_after=68550098944";
     const LOAD_QWEN3_LINE: &str = "load arch=qwen3moe resident_bytes=24165631476 cache=f16 \
-        ctx=23552 slots=2 slot_ctx=23552 layers=48 ubatch=4096 graph_nodes=604 in 1.5 s";
+        cache_from=default ctx=23552 slots=2 slot_ctx=23552 layers=48 ubatch=4096 \
+        graph_nodes=604 in 1.5 s";
     /// A `residency pass` line of an older text: the reread fields came after it.
     const PASS_OLD: &str = "residency pass pass=driver boundary=119 kept=1 landed=3 late=0 \
         made=0 in_flight=0 bytes=0 end_us=0 boundary_us=4 wait_us=0 issue_us=0 stage_us=0 \
