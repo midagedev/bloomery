@@ -359,7 +359,13 @@ mod soak {
 
         /// One request through curl, counted and logged; a transport error is
         /// counted and returns `None`.
-        fn send(&mut self, kind: &str, path: &str, body: Option<&Value>, stream: bool) -> Reply {
+        fn send(
+            &mut self,
+            kind: &str,
+            path: &str,
+            body: Option<&Value>,
+            stream: bool,
+        ) -> Result<Reply, GateError> {
             self.n.requests += 1;
             let t = Instant::now();
             let r = curl(&self.url(path), body, stream);
@@ -367,8 +373,9 @@ mod soak {
             match r {
                 Ok((st, text)) => {
                     self.status(st);
-                    if stream {
-                        self.n.sse_errors += sse_errors(&text);
+                    if stream && st == 200 {
+                        self.n.sse_errors +=
+                            sse_errors(&text).map_err(|e| format!("{path}: {e}"))?;
                     }
                     let note = if st == 200 {
                         String::new()
@@ -376,12 +383,12 @@ mod soak {
                         first_line(&text)
                     };
                     self.note(kind, path, &st.to_string(), ms, &note);
-                    Some((st, text))
+                    Ok(Some((st, text)))
                 }
                 Err(e) => {
                     self.n.transport += 1;
                     self.note(kind, path, "transport", ms, &first_line(&e.to_string()));
-                    None
+                    Ok(None)
                 }
             }
         }
@@ -393,7 +400,7 @@ mod soak {
             path: &str,
             body: Option<&Value>,
         ) -> Result<Option<Value>, GateError> {
-            served(path, self.send(kind, path, body, false))
+            served(path, self.send(kind, path, body, false)?)
         }
     }
 
@@ -418,11 +425,11 @@ mod soak {
 
     /// The text of a streamed chat answer, its events' `delta.content` in
     /// order. Refused by name: a stream with no `[DONE]`, an event that is no
-    /// JSON, an event with no `delta` object, and a `content` that is neither
-    /// absent, null nor a string.
+    /// JSON, an unreadable SSE frame, an event with no `delta` object, and a
+    /// `content` that is neither absent, null nor a string.
     fn streamed_text(sse: &str) -> Result<String, GateError> {
         const WHAT: &str = "/v1/chat/completions";
-        let chunks = events(sse);
+        let chunks = events(sse).map_err(|e| format!("{WHAT}: {e}"))?;
         if !chunks.contains(&"[DONE]") {
             return Err(format!("{WHAT}: stream has no [DONE]: {sse:?}").into());
         }
@@ -447,18 +454,23 @@ mod soak {
         s.lines().next().unwrap_or("").chars().take(200).collect()
     }
 
-    /// The `data:` payloads of an SSE body.
-    fn events(sse: &str) -> Vec<&str> {
+    /// The `data:` payloads of an SSE body; an unreadable frame is refused by name.
+    fn events(sse: &str) -> Result<Vec<&str>, GateError> {
         sse.split("\n\n")
-            .filter_map(|e| e.trim_start().strip_prefix("data: "))
+            .filter(|e| !e.trim().is_empty())
+            .map(|e| {
+                e.trim_start()
+                    .strip_prefix("data: ")
+                    .ok_or_else(|| format!("unreadable SSE frame {e:?}").into())
+            })
             .collect()
     }
 
-    fn sse_errors(sse: &str) -> u64 {
-        events(sse)
+    fn sse_errors(sse: &str) -> Result<u64, GateError> {
+        Ok(events(sse)?
             .iter()
             .filter(|e| serde_json::from_str::<Value>(e).is_ok_and(|v| v.get("error").is_some()))
-            .count() as u64
+            .count() as u64)
     }
 
     /// Refuses by name a request that would pass the position cap: the mix
@@ -551,16 +563,16 @@ mod soak {
             });
             self.c.n.generations += 1;
             let kind = if stream { "chat-stream" } else { "chat" };
-            let Some((st, text)) = self
-                .c
-                .send(kind, "/v1/chat/completions", Some(&body), stream)
+            let Some((st, text)) =
+                self.c
+                    .send(kind, "/v1/chat/completions", Some(&body), stream)?
             else {
                 self.conv.messages.pop();
                 return Ok(());
             };
             let answer = if st != 200 {
                 None
-            } else if stream && sse_errors(&text) > 0 {
+            } else if stream && sse_errors(&text)? > 0 {
                 // An engine failure's stream: its `error` event is counted, and it ends with no `[DONE]`.
                 None
             } else if stream {
@@ -598,7 +610,7 @@ mod soak {
             });
             self.c.n.generations += 1;
             let kind = if stream { "fresh-stream" } else { "fresh" };
-            self.c.send(kind, "/completion", Some(&body), stream);
+            self.c.send(kind, "/completion", Some(&body), stream)?;
             Ok(())
         }
 
@@ -711,7 +723,7 @@ mod soak {
             let mut deferred = false;
             for _ in 0..50 {
                 std::thread::sleep(Duration::from_millis(100));
-                if let Some(m) = self.c.send("pair", "/metrics", None, false).map(|r| r.1)
+                if let Some(m) = self.c.send("pair", "/metrics", None, false)?.map(|r| r.1)
                     && metric(&m, "requests_deferred").is_some_and(|d| d >= 1.0)
                 {
                     deferred = true;
@@ -749,7 +761,7 @@ mod soak {
         }
 
         /// One light endpoint, in turn.
-        fn light(&mut self) {
+        fn light(&mut self) -> Result<(), GateError> {
             let path = LIGHT[self.light_next % LIGHT.len()];
             self.light_next += 1;
             let text = "The soak asks the server for this sentence's ids.";
@@ -762,7 +774,8 @@ mod soak {
                 ),
                 _ => (true, Value::Null),
             };
-            self.c.send("light", path, (!get).then_some(&body), false);
+            self.c.send("light", path, (!get).then_some(&body), false)?;
+            Ok(())
         }
 
         fn run_kind(&mut self, k: Kind) -> Result<(), GateError> {
@@ -787,7 +800,7 @@ mod soak {
                 Kind::Pair => self.pair()?,
                 Kind::Probe => self.probe()?,
             }
-            self.light();
+            self.light()?;
             Ok(())
         }
 
@@ -819,7 +832,7 @@ mod soak {
             self.drop_stream((0.8, 3))?;
             self.pair()?;
             for _ in 0..LIGHT.len() {
-                self.light();
+                self.light()?;
             }
             Ok(())
         }
@@ -1085,7 +1098,7 @@ mod soak {
         /// `/metrics`, then the settled `/proc` reads, then the card.
         fn take(&mut self, c: &mut Client, phase: &'static str) -> Result<(), GateError> {
             let m = c
-                .send("sample", "/metrics", None, false)
+                .send("sample", "/metrics", None, false)?
                 .map(|r| r.1)
                 .unwrap_or_default();
             let get = |n: &str| metric(&m, n).map_or(0, |v| v as u64);
@@ -1399,7 +1412,7 @@ mod soak {
             light_next: 0,
         };
         let driven = drive(&mut mix, &mut sampler, &mut served, a.minutes);
-        let health = mix.c.send("end", "/health", None, false);
+        let health = mix.c.send("end", "/health", None, false)?;
         let end = Ending {
             alive: served.child.try_wait()?.is_none()
                 && health.as_ref().is_some_and(|h| h.0 == 200),
@@ -1423,7 +1436,7 @@ mod soak {
 
     #[cfg(test)]
     mod tests {
-        use super::{GateError, served, streamed_text, string_at};
+        use super::{GateError, served, sse_errors, streamed_text, string_at};
         use serde_json::json;
 
         fn refused<T: std::fmt::Debug>(r: Result<T, GateError>) -> String {
@@ -1463,8 +1476,23 @@ mod soak {
                 delta("b")
             );
             assert_eq!(streamed_text(&sse).unwrap(), "ab");
+            for prefix in ["data:", "data", "event: message\ndata:", "garbage: "] {
+                let frame = format!("{prefix}{}", delta("b"));
+                let skipped = format!("data: {}\n\n{frame}\n\ndata: [DONE]\n\n", delta("a"));
+                let error = refused(streamed_text(&skipped));
+                assert!(error.contains("/v1/chat/completions"), "{error}");
+                assert!(error.contains("unreadable SSE frame"), "{error}");
+                assert!(error.contains(&format!("{frame:?}")), "{error}");
+                assert!(refused(sse_errors(&skipped)).contains(&format!("{frame:?}")));
+            }
+
             assert!(refused(streamed_text(&format!("{sse}data: {{cut\n\n"))).contains("{cut"));
-            assert!(refused(streamed_text("<html>")).contains("no [DONE]"));
+            assert!(refused(streamed_text("<html>")).contains("<html>"));
+            assert!(
+                refused(streamed_text(&format!("data: {}\n\n", delta("a")))).contains("no [DONE]")
+            );
+            assert_eq!(sse_errors(&sse).unwrap(), 0);
+            assert_eq!(sse_errors("data: {\"error\": \"failed\"}\n\n").unwrap(), 1);
             let seven = r#"data: {"choices":[{"delta":{"content":7}}]}"#;
             assert!(
                 refused(streamed_text(&format!("{seven}\n\ndata: [DONE]\n\n")))

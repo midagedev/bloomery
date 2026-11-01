@@ -234,11 +234,16 @@ pub fn server_log(err_log: &Path, kinds: &[&'static Kind]) -> Result<Log, GateEr
 }
 
 /// The JSON of a 200 response; any other status is an error naming it.
+/// A `/completion` answer must also hold a stop the server emits.
 pub fn json_of(what: &str, status: u16, body: &str) -> Result<Value, GateError> {
     if status != 200 {
         return Err(format!("{what}: HTTP {status}: {body}").into());
     }
-    Ok(serde_json::from_str(body).map_err(|e| format!("{what}: {e}: {body}"))?)
+    let v: Value = serde_json::from_str(body).map_err(|e| format!("{what}: {e}: {body}"))?;
+    if what == "/completion" {
+        stop_of(&v)?;
+    }
+    Ok(v)
 }
 
 /// The ids of a JSON array of token ids. Refused by name: a value that is
@@ -934,9 +939,7 @@ pub fn completion(
     cache: bool,
 ) -> Result<Value, GateError> {
     let (st, text) = completion_raw(url, ids, n, cache)?;
-    let v = json_of("/completion", st, &text)?;
-    stop_of(&v)?;
-    Ok(v)
+    json_of("/completion", st, &text)
 }
 
 /// Greedy ids on the same loaded server without a speculative pass, and the
@@ -1443,8 +1446,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        LookupCompletion, agree, completion, curl, draft_counts, held_ms, ids_of, slot_erased,
-        stepped_completion, stop_of, together,
+        LookupCompletion, agree, completion, curl, draft_counts, held_ms, ids_of, json_of,
+        slot_erased, stepped_completion, stop_of, together,
     };
     use serde_json::json;
 
@@ -1663,7 +1666,7 @@ mod tests {
             bad["timings"]["cache_n"] = value;
             assert!(LookupCompletion::read(&bad, 2, 4096).is_err(), "{bad}");
         }
-        for stop in ["eos", "word", "limit"] {
+        for stop in ["eos", "word", "limit", "reasoning_loop"] {
             let mut valid = valid.clone();
             valid["stop_type"] = json!(stop);
             valid["id_slot"] = json!(1);
@@ -1684,10 +1687,18 @@ mod tests {
             let mut v = valid.clone();
             v["stop_type"] = json!(stop);
             assert_eq!(stop_of(&v).unwrap(), stop);
+            assert_eq!(json_of("/completion", 200, &v.to_string()).unwrap(), v);
         }
         let mut gone = valid.clone();
         gone.as_object_mut().unwrap().remove("stop_type");
         assert!(stop_of(&gone).is_err(), "{gone}");
+        assert!(
+            json_of("/completion", 200, &gone.to_string())
+                .unwrap_err()
+                .to_string()
+                .contains("stop_type")
+        );
+        assert_eq!(json_of("/tokenize", 200, &gone.to_string()).unwrap(), gone);
         for bad in [
             json!(null),
             json!(1),
@@ -1700,6 +1711,13 @@ mod tests {
             let mut v = valid.clone();
             v["stop_type"] = bad;
             assert!(stop_of(&v).is_err(), "{v}");
+            assert!(
+                json_of("/completion", 200, &v.to_string())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("stop_type"),
+                "{v}"
+            );
         }
     }
 
