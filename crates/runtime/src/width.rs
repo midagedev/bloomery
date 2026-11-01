@@ -78,6 +78,19 @@
 //! proposal shorter than the room it was handed (the context's end) moves
 //! neither the mean nor the gate.
 //!
+//! The rotation's readings are the start's, and the first passes after a
+//! start can run slower than the rest (the card and the host still
+//! settling), while a width the gate does not hold reads only once a probe,
+//! so its median would hold them for most of the run. Each width's median
+//! as the rotation left it is kept until the width's median rests on
+//! readings taken since, most of its ring. A median that does and has left
+//! the band of [`Rule::margin_close`] around the rotation's says the passes
+//! no longer cost what the rotation read: the rotation runs again, every
+//! width started over as a probe's is (that median's too, which still holds
+//! readings from before the change). The check runs once: it ends at that
+//! rotation, or without one once no median rests on the first one's
+//! readings.
+//!
 //! A draft proposes into the room the chooser hands it, and the pass
 //! verifies the front `k` ids. A draft that makes its whole proposal in one
 //! call is handed its whole width. A chain draft ([`Draft::CHAIN`]), whose
@@ -716,6 +729,18 @@ impl Kind {
     }
 }
 
+/// The rotation's readings, as the check that drops them sees them (the
+/// module).
+#[derive(Clone, Debug)]
+enum Start {
+    /// The rotation is running.
+    Warming,
+    /// Each width's median as the rotation left it, and its readings since.
+    Provisional(Vec<(Option<f64>, usize)>),
+    /// No median rests on the rotation's readings.
+    Settled,
+}
+
 /// The pass in flight since its proposal.
 #[derive(Clone, Copy, Debug)]
 struct Flight {
@@ -936,6 +961,9 @@ pub struct Choosing<D, C = Wall> {
     /// The widths whose readings are not all in: the warm-up's rotation,
     /// or a width a probe started over.
     warm: VecDeque<usize>,
+    /// The rotation's readings as the check that drops them sees them (the
+    /// module).
+    start: Start,
     /// The draft's proposal and its probabilities, reused: a pass allocates
     /// nothing.
     ids: Vec<u32>,
@@ -1027,6 +1055,7 @@ where
             fresh: vec![0; widths],
             dwelling: false,
             warm: (0..widths).rev().collect(),
+            start: Start::Warming,
             ids: vec![0; D::WIDTH],
             p: vec![0.0; D::WIDTH],
             a: vec![0.0; D::WIDTH],
@@ -1266,6 +1295,7 @@ impl<D, C: Clock> Choosing<D, C> {
         } else {
             None
         };
+        self.settle(k);
         let warming = !self.warm.is_empty();
         while let Some(&w) = self.warm.front()
             && self.costs[w].len() >= self.rule.min_timings
@@ -1273,6 +1303,9 @@ impl<D, C: Clock> Choosing<D, C> {
             self.warm.pop_front();
         }
         if warming && self.warm.is_empty() {
+            if matches!(self.start, Start::Warming) {
+                self.start = Start::Provisional(self.medians.iter().map(|&m| (m, 0)).collect());
+            }
             // The first probe comes a whole period after the warm-up; a
             // closed gate decides on the readings a probe started over,
             // which no shadow waits for.
@@ -1391,6 +1424,35 @@ impl<D, C: Clock> Choosing<D, C> {
         let moves = self.decision().is_some_and(|w| w != self.width);
         self.medians[k] = held;
         moves
+    }
+
+    /// Width `k`'s reading told the check of the rotation's readings (the
+    /// module): once `k`'s median rests on readings taken since the rotation
+    /// and has left the close band around the rotation's, every width starts
+    /// over, widest first as the rotation ran them; the check ends then, or
+    /// once no median rests on the rotation's readings.
+    fn settle(&mut self, k: usize) {
+        let Start::Provisional(warmed) = &mut self.start else {
+            return;
+        };
+        warmed[k].1 += 1;
+        let costs = &self.costs;
+        let renewed = |w: usize| 2 * warmed[w].1 > costs[w].len();
+        let band = self.rule.margin_close;
+        let moved = renewed(k)
+            && warmed[k]
+                .0
+                .zip(self.medians[k])
+                .is_some_and(|(then, now)| now > then * band || now * band < then);
+        if !moved && !(0..costs.len()).all(renewed) {
+            return;
+        }
+        self.start = Start::Settled;
+        if moved {
+            for w in (0..self.costs.len()).rev() {
+                self.start_over(w);
+            }
+        }
     }
 
     /// Width `k`'s readings started over: it runs until it holds
@@ -2531,6 +2593,73 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The passes after the start until every width's cost is its wall:
+    /// every step and verify wall `start` fifths of the rig's over the
+    /// rotation and the 74 passes after it and `then` fifths after, a prose
+    /// draft settled on 3.
+    fn read_again_after_a_slow_start<const C: bool>(start: u64, then: u64) -> Option<usize> {
+        let acc = [0.80, 0.8125, 0.846];
+        let mut r = Rig::<C>::build(
+            acc,
+            acc.map(|a| a as f32),
+            &LINEAR,
+            Mode::Cost,
+            Rule::DEFAULT,
+        );
+        let at = |fifths: u64| (STEP_US * fifths / 5, LINEAR.map(|us| us * fifths / 5));
+        let (step, rows) = at(start);
+        r.clock.step.set(step);
+        r.clock.verify_rows(&rows);
+        r.run(90);
+        assert_eq!(r.choosing().width(), 3, "settled elsewhere");
+        let (step, rows) = at(then);
+        r.clock.step.set(step);
+        r.clock.verify_rows(&rows);
+        let walk = |k: u64| if C { k * DRAFT_US } else { DRAFT_US };
+        let walls = [
+            step,
+            rows[0] + walk(1),
+            rows[1] + walk(2),
+            rows[2] + walk(3),
+        ];
+        (1..=1_000).find(|_| {
+            r.run(1);
+            let costs = r.choosing().gate_state().costs;
+            costs
+                .iter()
+                .zip(walls)
+                .all(|(ms, us)| ms.is_some_and(|ms| (ms * 1e3 / us as f64 - 1.0).abs() < 1e-6))
+        })
+    }
+
+    /// A slow start is read again once it ends, for a draft and a chain
+    /// draft: a start whose first two requests run slow while the card and
+    /// the host settle. The held 3 reads every pass, and its 4th reading
+    /// after the start (4 at 1 and 4 at 6/5, a median of 1.1 against the
+    /// rotation's 1.2) leaves the close band; it lands at the next proposal,
+    /// and the rotation runs again, each of the 4 widths `min_timings`
+    /// passes: 4 + 1 + 4 · 4 = 21 passes. [derived] Before, a width the gate
+    /// does not hold took one reading a probe, 3 probe periods apart, and
+    /// held the start's median until most of its ring was new: 951 passes.
+    /// A start faster than the passes after it (1 against 6/5) leaves the
+    /// band the other way and is read again the same.
+    #[test]
+    fn a_slow_start_is_read_again_once_it_ends() {
+        let rule = Rule::DEFAULT;
+        let bound = rule.min_timings + 1 + 4 * rule.min_timings;
+        let runs = [
+            read_again_after_a_slow_start::<false>(6, 5),
+            read_again_after_a_slow_start::<true>(6, 5),
+            read_again_after_a_slow_start::<false>(5, 6),
+            read_again_after_a_slow_start::<true>(5, 6),
+        ];
+        assert!(
+            runs.iter().all(|p| p.is_some_and(|p| p <= bound)),
+            "the passes after the start until every cost is its wall, a draft and a chain draft \
+             slow then fast and fast then slow: {runs:?}, the bound {bound}"
+        );
     }
 
     /// The gate a long run settles on, the passes by width, and the
