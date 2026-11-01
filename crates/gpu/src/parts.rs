@@ -263,18 +263,26 @@ fn read_staged<'s, 'p, S: Source + Sync>(
 }
 
 /// The least host bytes a load of card `card` of `plan` reads from `source`, whose located header
-/// holds `in_place` where the folder stores it, beside the plan's own terms: its parts one at a
-/// time with the staging ring, the peak of [`PlacedSource`]'s read at no room. A plan reserves
-/// them before its NVMe split (`workstation::reserve_part_reads`); the card's parts, and so these
-/// bytes, are the same at every host room.
-pub fn least_reads<S: Source>(
+/// is `header`, beside the plan's own terms: its parts one at a time with the staging ring, the
+/// peak of [`PlacedSource`]'s read at no room, as a folder's load asks it
+/// ([`crate::folder::Folder::least_reads`]) of a seat that holds the source and the header apart.
+/// A plan reserves them before its NVMe split (`workstation::reserve_part_reads`); the card's
+/// parts, and so these bytes, are the same at every host room.
+pub fn least_reads<S: Source + Sync>(
     source: &S,
-    in_place: &InPlace,
+    header: &Split,
     plan: &Plan<'_>,
     card: usize,
 ) -> Result<u64, GpuError> {
-    let on = OnCard::of_in_place(plan, card, in_place)?;
-    Ok(LoadPlan::reading(source, plan, &on, 0)?.host_bytes)
+    let placed = PlacedSource {
+        source: model::part::Filtered {
+            source,
+            keep: |_: &str| true,
+        },
+        in_place: InPlace::of(header),
+        last: Mutex::default(),
+    };
+    crate::model::PartsLoad::host_bytes(&placed, plan, card, 0)
 }
 
 /// A placed source shares one admission and upload implementation across model components.
@@ -1809,8 +1817,7 @@ mod tests {
         let (bare, room) = split(&small);
         assert!(bare.host.nvme_expert_bytes > 0, "the room pages experts");
         let short = load.host_need(&bare, 0, 0, room).expect("the need").0;
-        let reads = least_reads(&load.source, &load.in_place, &bare, 0).expect("the least reads");
-        assert_eq!(reads, load.host_bytes(&bare, 0, 0).expect("the reads"));
+        let reads = load.host_bytes(&bare, 0, 0).expect("the least reads");
         assert!(HostNeed::of(&bare, 0).bytes() <= room);
         assert!(short.bytes() > room, "{short:?} in a room of {room} B");
         let mut machine = small.clone();

@@ -80,20 +80,29 @@ pub fn model(header: Split, source: Source) -> Result<Model, GateError> {
     Ok(bloomery_gpu::folder::Folder::new(header, source).into())
 }
 
-/// The least host bytes a load of card `card` of `plan` reads from the folder `f`
-/// (`bloomery_gpu::parts::least_reads`): what its plan reserves on the host before the NVMe
-/// expert tier's split (`workstation::reserve_part_reads`).
+/// The least host bytes a load of card `card` of `plan` reads from a folder's part source
+/// `source` whose located header is `header` (`bloomery_gpu::parts::least_reads`): what its plan
+/// reserves on the host before the NVMe expert tier's split (`workstation::reserve_part_reads`).
 #[cfg(feature = "checkpoint")]
-pub fn least_reads(f: &Opened, plan: &Plan<'_>, card: usize) -> Result<u64, GateError> {
-    let in_place = bloomery_gpu::parts::InPlace::of(&f.header);
+pub fn least_reads(
+    header: &Split,
+    source: &Source,
+    plan: &Plan<'_>,
+    card: usize,
+) -> Result<u64, GateError> {
     Ok(bloomery_gpu::parts::least_reads(
-        &f.source, &in_place, plan, card,
+        source, header, plan, card,
     )?)
 }
 
 /// A build without the `checkpoint` feature opens no folder to read.
 #[cfg(not(feature = "checkpoint"))]
-pub fn least_reads(_f: &Opened, _plan: &Plan<'_>, _card: usize) -> Result<u64, GateError> {
+pub fn least_reads(
+    _header: &Split,
+    _source: &Source,
+    _plan: &Plan<'_>,
+    _card: usize,
+) -> Result<u64, GateError> {
     Err("a checkpoint folder is opened by a build with the checkpoint feature".into())
 }
 

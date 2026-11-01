@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn a_part_read_probe_covers_short_contexts() {
     use ctx_ask::{Ask, Limit, Probe, Steps};
-    use workstation::{HostNeed, PART_READ_CONTEXT, reserve_part_reads};
+    use workstation::{HostNeed, least_part_reads, reserve_part_reads};
 
     struct Kv;
     impl KvBytes for Kv {
@@ -23,10 +23,14 @@ fn a_part_read_probe_covers_short_contexts() {
     let levers = PlanLevers::default();
     let large = plan_host_routed(&model, &machine, 4096, &Kv, &levers).expect("a raw plan");
     assert!(ctx_ask::short_of(&large.violations()).is_some());
-    if let Ok(probe) = plan_host_routed(&model, &machine, PART_READ_CONTEXT, &Kv, &levers)
-        && probe.violations().is_empty()
-    {
-        let reads = probe.cards[0].dense_bytes;
+    let probed = least_part_reads(|ctx| {
+        let probe = plan_host_routed(&model, &machine, ctx, &Kv, &levers).ok()?;
+        probe
+            .violations()
+            .is_empty()
+            .then(|| Ok::<_, PlacementError>(probe.cards[0].dense_bytes))
+    });
+    if let Some(reads) = probed.expect("the probe's reads") {
         reserve_part_reads(&mut machine, reads);
     }
     let chosen = ctx_ask::choose(

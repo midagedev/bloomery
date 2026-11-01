@@ -138,8 +138,10 @@ impl<X> Folder<X> {
 
 impl<X> Folder<X> {
     /// The least host bytes a load of card `card` of `plan` reads beside the plan's own terms: its
-    /// parts one at a time, with the staging ring. The load's own check counts its read-ahead
-    /// (`HostNeed::read_ahead`) from the same parts at the room it reads, never under this.
+    /// parts one at a time, with the staging ring, the part source's read at no room (the one
+    /// owner of these bytes, which [`crate::parts::least_reads`] asks of a source and header held
+    /// apart). The load's own check counts its read-ahead (`HostNeed::read_ahead`) from the same
+    /// parts at the room it reads, never under this.
     pub fn least_reads(&self, plan: &Plan<'_>, card: usize) -> Result<u64, GpuError> {
         self.parts.host_bytes(plan, card, 0)
     }
