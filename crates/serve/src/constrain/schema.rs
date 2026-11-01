@@ -1147,6 +1147,11 @@ pub(crate) fn request(
     // program starts where the model opens a call itself. A request without
     // tools, a format no watch reads and a JSON `response_format` (which
     // keeps its own one program below) have none.
+    // A JSON reply keeps its own program, so no watch reads the tools; they
+    // are still held valid, as a watch or a forced choice holds them.
+    if forces.is_none() && !matches!(reply, Reply::Text) && parses_tools(o) {
+        valid::tools(o.get("tools").expect("parses_tools held a tools array"))?;
+    }
     if forces.is_none() && matches!(reply, Reply::Text) && parses_tools(o) {
         return watch(o, ask, &env);
     }
