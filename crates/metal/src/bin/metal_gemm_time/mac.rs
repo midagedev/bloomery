@@ -149,7 +149,7 @@ const ROWS: [usize; 4] = [32, 128, 512, 2048];
 const MLX_TILE: usize = 32;
 
 pub fn main() -> ExitCode {
-    match run() {
+    match run(std::env::args().skip(1).collect()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("metal_gemm_time: {e}");
@@ -410,8 +410,7 @@ impl Libs {
     }
 }
 
-fn run() -> Result<(), String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+fn run(args: Vec<String>) -> Result<(), String> {
     if args.iter().any(|a| a == "--help") {
         println!(
             "metal_gemm_time [--trials N] [--warmups N] [--gflop N] [--arm NAME]... \
@@ -1158,4 +1157,50 @@ fn fnv(h: u64, v: &[f32]) -> u64 {
     v.iter().fold(h, |h, w| {
         (h ^ u64::from(w.to_bits())).wrapping_mul(0x0000_0100_0000_01B3)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn shape_requires_exactly_three_whole_numbers() {
+        let overflow = format!("{}0", usize::MAX);
+        for shape in [
+            "1:bad:2:3",
+            "bad:1:2:3",
+            "1:2:3:bad",
+            "1::2:3",
+            "1:2:3:",
+            "1:2",
+            "1:2:3:4",
+            "1:bad:3",
+            "1:-2:3",
+            "1: 2:3",
+            &format!("1:{overflow}:2:3"),
+        ] {
+            let args = ["--shape", "4:5:6", "--shape", shape]
+                .map(String::from)
+                .to_vec();
+            assert_eq!(
+                super::run(args),
+                Err(format!("--shape takes N:K:R, not {shape}")),
+                "every component of every --shape value must parse"
+            );
+        }
+        let largest = format!("{}:2:3", usize::MAX);
+        let args = [
+            "--shape",
+            "1:2:3",
+            "--shape",
+            &largest,
+            "--dump-source",
+            "/dev/null",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(
+            super::run(args),
+            Ok(()),
+            "valid repeated shapes must reach the source-only exit without opening a device"
+        );
+    }
 }
