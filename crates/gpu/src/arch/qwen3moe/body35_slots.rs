@@ -695,7 +695,7 @@ impl ChainOps for Slots35<'_, '_> {
                     .lane
                     .ok_or(GpuError::state(WHAT, "a slot's lane word"))?,
                 rec: rec_of(&mut *q.stores, c.layer)?,
-                verify: None,
+                stamped: None,
             });
         }
         linear::seqs::enqueue_gdn_seqs(

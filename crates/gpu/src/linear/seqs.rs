@@ -2,8 +2,9 @@
 //! several sequences in one launch each (`crate::seq_rows`): the pass of
 //! resident slots of any body whose layers keep a delta store
 //! ([`RecStore`]). The conv runs over each sequence's ring; the delta step
-//! over each sequence's state, in place (`gdn_delta`) or, a verify, recorded
-//! into each sequence's record after its carry (`gdn_delta_recovery`). Each
+//! over each sequence's state, in place (`gdn_delta`, or `gdn_delta_lanes`
+//! over a stamped lane after its carry) or, a verify, recorded into each
+//! sequence's record after its carry (`gdn_delta_recovery`). Each
 //! sequence's rows are the launches of its rows alone, bit for bit, so a
 //! pass of `n` sequences runs these two launches once where one launch a
 //! sequence ran `2·n`.
@@ -15,18 +16,19 @@ use cuda_core::{CudaStream, DeviceBuffer};
 use crate::GpuError;
 use crate::fault::FaultSink;
 use crate::linear::conv::{ConvSeq, ConvSeqsArgs};
-use crate::linear::delta::{DeltaRecord, DeltaSeq, DeltaSeqsArgs};
+use crate::linear::delta::{DeltaSeq, DeltaSeqsArgs, DeltaStamped};
 use crate::linear::{LinearKernels, LinearShape};
 use crate::recur::RecStore;
 
 /// One sequence of [`enqueue_gdn_seqs`]: its rows of the launches, its lane
-/// word, its layer's store, and for a verify the store's stamps and record
-/// (`None`: the step in place).
+/// word, its layer's store, and a stamped store's stamps with, for a verify,
+/// its record (`None`: an unstamped store's step in place; no record: the
+/// stamped lane's step in place).
 pub(crate) struct GdnSeq<'a> {
     pub(crate) rows: Range<usize>,
     pub(crate) lane: &'a DeviceBuffer<u32>,
     pub(crate) rec: &'a mut RecStore,
-    pub(crate) verify: Option<(&'a mut DeviceBuffer<u32>, &'a mut DeviceBuffer<f32>)>,
+    pub(crate) stamped: Option<(&'a mut DeviceBuffer<u32>, Option<&'a mut DeviceBuffer<f32>>)>,
 }
 
 /// [`enqueue_gdn_seqs`]'s arguments over every sequence's rows: the conv's
@@ -127,10 +129,10 @@ pub(crate) fn enqueue_gdn_seqs(
             rows: q.rows.clone(),
             lane: q.lane,
             state: &mut q.rec.state,
-            verify: q.verify.as_mut().map(|(stamp, record)| DeltaRecord {
+            stamped: q.stamped.as_mut().map(|(stamp, record)| DeltaStamped {
                 carry: q.rec.carry.as_ref(),
                 stamp,
-                record,
+                record: record.as_deref_mut(),
             }),
         })
         .collect();

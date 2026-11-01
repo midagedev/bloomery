@@ -196,6 +196,8 @@ generate_ds41 gdn_conv_prep_bf16 0 0
 generate_ds41 gdn_conv_prep_seqs 0 0
 generate_ds41 gdn_delta 0 0
 generate_ds41 gdn_delta_lanes 0 0
+# PIN(2026-11-02): gdn_delta_lanes_seqs, a new entry: 0 spill and 0 JIT local bytes, measured (sm_121a, cc 12.1 JIT on GB10 driver 595.84, gate-ptx-spill).
+generate_ds41 gdn_delta_lanes_seqs 0 0
 generate_ds41 gdn_delta_recovery 0 0
 # PIN(2026-10-27): gdn_delta_recovery_layers, a new entry: 0 spill and 0 JIT local bytes (sm_121a ptxas 13.3.73, cc 12.1 JIT on GB10 driver 595.84, gate-ptx-spill).
 generate_ds41 gdn_delta_recovery_layers 0 0

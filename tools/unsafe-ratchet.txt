@@ -767,7 +767,11 @@ gguf 7 2 0
 # flight copies the head's readback words to their pinned twin (head.rs: Head::copy_tokens), copies the head's
 # argmax word into the step's input record on the card (scratch.rs: StepParams::write_chained's window), and has
 # the stream lower a host flag (graph.rs: HostFlags::enqueue_clear's batch op), each with its SAFETY line.
-gpu 2957 404 10
+# PIN(2026-11-02): gpu 2957 -> 2959 blocks, 404 -> 405 fns, a new kernel entry, not old code relaxed: the stamped
+# in-place step of several sequences gdn_delta_lanes_seqs (linear/delta.rs) and gdn_delta_recovery_seqs now share the
+# unsafe fn lanes_seqs_block (the recovery entry's three blocks moved there), each entry one block calling it, each
+# with its SAFETY line.
+gpu 2959 405 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
