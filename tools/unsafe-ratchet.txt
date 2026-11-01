@@ -763,7 +763,11 @@ gguf 7 2 0
 # PIN(2026-11-01): gpu 2951 -> 2954 blocks, new host cost code, not old code relaxed:
 # host/costs.rs reads the driver version and online CPU count and enqueues the one-byte memset probe,
 # each call in its own block with its SAFETY invariant. No kernel or unsafe fn changed.
-gpu 2954 404 10
+# PIN(2026-11-01): gpu 2954 -> 2957 blocks, new code, not old code relaxed: a step chained behind the one in
+# flight copies the head's readback words to their pinned twin (head.rs: Head::copy_tokens), copies the head's
+# argmax word into the step's input record on the card (scratch.rs: StepParams::write_chained's window), and has
+# the stream lower a host flag (graph.rs: HostFlags::enqueue_clear's batch op), each with its SAFETY line.
+gpu 2957 404 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
