@@ -133,7 +133,8 @@ mod gate {
 mod nv {
     use super::dense_e2e::{self, Bands, norms, rows_of, twin_of};
     use bloomery_gpu::Gpu;
-    use bloomery_gpu::arch::qwen3moe::{KvQ8, Open35, Qwen35moeModel};
+    use bloomery_gpu::arch::qwen3moe::{Open35, Qwen35moeModel};
+    use bloomery_gpu::kv_format::KvQ8;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::tier::{self, Tag};

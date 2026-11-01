@@ -1290,8 +1290,7 @@ impl Levers {
     }
 
     /// `BLOOMERY_QWEN3_KV` as set: the K/V planes' format, `f16` or `q8_0`;
-    /// `None` unset, which a load reads as `f16` and the Qwen3.8 seat as its
-    /// model's default (`q8_0` on a checkpoint folder).
+    /// `None` unset, which a load reads as `f16` (`bloomery_gpu::kv_format`).
     #[must_use]
     pub fn qwen3_kv_set(&self) -> Option<&'static str> {
         self.word(QWEN3_KV)

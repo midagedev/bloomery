@@ -41,7 +41,9 @@
 //!   each device's `bytes` the sum of its classes and equal to the plan's
 //!   card (dense + experts) and host (experts + tables) bytes; the cards' KV
 //!   bytes; no draft; `ctx_verified` the deepest reference set's
-//!   positions (`refset::arch::qwen4exp::VERIFIED_POSITIONS`);
+//!   positions (`refset::arch::qwen4exp::VERIFIED_POSITIONS`); the `setup`
+//!   record's `cache` and `cache_from` the common rule's format and what
+//!   chose it (`bloomery_gpu::kv_format::KvChoice`, `setup_names_the_kv_rule`);
 //! - `/completion` of `--prompt` at temperature 0 with `return_tokens`: its
 //!   ids are `generate_qwen3moe --tokens <--ids> -n 16`'s `tokens` line — all
 //!   16, or a prefix ending in the end-of-generation id when the server
@@ -535,9 +537,10 @@ mod gate {
     use app::mtp::MtpBody;
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for;
     use bloomery_gpu::arch::qwen3moe::{
-        Body38, CHECKPOINT_EVERY, KvQ8, Prompt38, checkpoint_budget38, seq38_bytes,
+        Body38, CHECKPOINT_EVERY, Prompt38, checkpoint_budget38, seq38_bytes,
     };
     use bloomery_gpu::host::xstream::XSTREAM_ROOM;
+    use bloomery_gpu::kv_format::{KvChoice, KvQ8};
     use bloomery_gpu_gates::ctx_ladder::{self, ctx_line, default_line_held, step_above};
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::record::{self, Fields, ReadError};
@@ -1050,6 +1053,21 @@ mod gate {
             &mut ok,
             "props_engine_vram_kv",
             e["placement"]["vram_kv_bytes"] == json!(kv),
+        );
+        // The format the server's cache holds is the common rule's, whatever
+        // the file's container, and the setup names what chose it.
+        let rule = KvChoice::choose(None, levers.qwen3_kv_set())?;
+        let setup = seat_log(err_log)?.one(&record::SETUP38)?;
+        let (cache, from) = (setup.word("cache")?, setup.word("cache_from")?);
+        println!(
+            "setup cache={cache} cache_from={from}; the rule's {} {}",
+            rule.kv.name(),
+            rule.from.word()
+        );
+        check(
+            &mut ok,
+            "setup_names_the_kv_rule",
+            cache == rule.kv.name() && from == rule.from.word(),
         );
         check(
             &mut ok,

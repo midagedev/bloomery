@@ -127,10 +127,11 @@ not hold ([`serving.md`](../serving.md#the-seats)). Both read the PLE table from
 the folder on the NVMe tier. FP4-Local takes 3.5 GB less of the pool at one slot (the table below) and decoded faster at
 0.3.10 ([`numbers.md`](../numbers.md#dgx-spark-qwen38-flash-next-on-the-fp4-local-and-nvfp4-folders-0310)), so it is
 the folder to start with. On the `sm_121a` build the routed experts' prompt products run W4A4 and the MXFP8 sites W8A8
-(2.1). Either folder's KV cache is q8_0 unless `--cache-type-k f16` says otherwise (a GGUF file's stays f16 unless
-`--cache-type-k q8_0` asks; `crates/gpu-gates/src/bin/shared/serve_seats/qwen38.rs:1751` at `0305ba7a`): K and V take
-17/16 B a value against f16's 2, and the attention store is 773,279,360 B against 967,921,280 B at 16,896 positions on
-FP4-Local (the index keys stay f16). `setup` names the format as `cache=`. The NVFP4 folder's gate,
+(2.1). The KV cache is f16 for either folder and for a GGUF file alike unless `--cache-type-k q8_0` asks
+(`crates/gpu/src/kv_format.rs`): on the GB10 q8_0's prompt pass ran slower than f16's. With q8_0, K
+and V take 17/16 B a value against f16's 2, and the attention store is 773,279,360 B against 967,921,280 B at 16,896
+positions on FP4-Local (the index keys stay f16). `setup` names the format as `cache=` and what chose it as
+`cache_from=`. The NVFP4 folder's gate,
 `gate-gpu-qwen4exp-nvfp4`, runs only on a card that holds every expert: set `BLOOMERY_CARD_ALL_EXPERTS=1` there; a
 smaller card defers it by name. `BLOOMERY_TIER=fixture just gate-gpu-qwen4exp-nvfp4-cut` runs its clauses on a four-layer
 cut of each folder, which any card holds.
@@ -140,9 +141,11 @@ asks the trained 262,144 positions and, where the GB10's one memory pool cannot 
 context under it, a multiple of 1,024, whose plan holds, so each count in the table starts without a context flag.
 `--parallel auto` serves the most slots, up to 8, whose plan holds one request's context: `--slot-ctx S` when set, else
 the context one slot takes with no flags ([`serving.md`](../serving.md#the-seats), "Concurrent requests"). On either
-folder `--parallel auto` alone serves 3 slots of 262,144 (107.0 GB on FP4-Local, 110.5 GB on NVFP4). The table is `bloomery-serve --plan`, which prints a
+folder `--parallel auto --cache-type-k q8_0` serves 3 slots of 262,144 (107.0 GB on FP4-Local, 110.5 GB on NVFP4). The table is `bloomery-serve --plan`, which prints a
 start's records and exits before it loads anything ([`serving.md`](../serving.md#flags-by-seat)), at main `0305ba7a` on
-one Spark (GB10, driver 595.84, `sm_121a`) with 115.5 to 116.6 GiB `MemAvailable` before each plan. The plan reads its
+one Spark (GB10, driver 595.84, `sm_121a`) with 115.5 to 116.6 GiB `MemAvailable` before each plan. A folder's cache was
+q8_0 there, so the table holds with `--cache-type-k q8_0` added; the unset f16
+cache takes 11,520 B more a position a slot, 3.0 GB more for a slot of 262,144 [derived from the store sizes above]. The plan reads its
 room from `MemAvailable` (7.2), so a Spark with less free memory fits less: `--plan` with the same flags reads your own.
 Need is the `need` record's bytes, what the load takes of the pool: the GB10's share, the slots' checkpoints in pinned
 host memory and file pages. The prompt cache's budget (`--cache-ram`; by default 8 GiB, or half of what the plan leaves

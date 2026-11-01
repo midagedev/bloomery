@@ -43,7 +43,7 @@ mod q3types;
 #[cfg(feature = "gpu")]
 mod gate {
     use super::q3types;
-    use bloomery_gpu::arch::qwen3moe::KvQ8;
+    use bloomery_gpu::kv_format::KvQ8;
     use bloomery_gpu::{Gpu, Qwen3moeModel};
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
     use bloomery_levers::HostCfg;

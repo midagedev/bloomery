@@ -14,7 +14,7 @@
 //! does.
 
 use bloomery_gpu::Qwen3moeModel;
-use bloomery_gpu::arch::qwen3moe::KvQ8;
+use bloomery_gpu::kv_format::KvQ8;
 use gguf::Split;
 use model::placement::PlanLevers;
 use model::placement::accepts::{self, Program};

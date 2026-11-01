@@ -14,7 +14,6 @@
 //! position ([`RopeRows`]) and appends it there, and the flash reads its
 //! live key count.
 
-use super::body::KvQ8;
 use super::image::MediaRows;
 use super::plan::Flash;
 use super::wide::{GEMV_COLS, Wide};
@@ -27,6 +26,7 @@ use crate::flash_gqa::{
 };
 use crate::flash_gqa_prefill::{FlashGqaPrefill, GqaPrefillArgs, GqaPrefillQ8Args, QueryNorm};
 use crate::gemm::GEMM_MAX_SLOTS;
+use crate::kv_format::KvQ8;
 use crate::linear::{self, LinearShape};
 use crate::route_softmax::{MAX_TOKENS, RouterDims, RouterOut};
 use crate::site::WideForms;

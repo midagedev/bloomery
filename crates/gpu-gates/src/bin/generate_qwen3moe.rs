@@ -447,14 +447,15 @@ mod cli {
     use bloomery_gpu::arch::nemotron_h_moe::{Body as BodyNhMoe, PASS_ROWS_MAX};
     use bloomery_gpu::arch::qwen3moe::ubatch::{ImageWrite, ubatch_for};
     use bloomery_gpu::arch::qwen3moe::{
-        Body, Body35, Body38, KvQ8, PrefillPath, PrefillPlan, PrefillStep, Prompt38,
-        Qwen35moeModel, Qwen38Model, SplitWalk,
+        Body, Body35, Body38, PrefillPath, PrefillPlan, PrefillStep, Prompt38, Qwen35moeModel,
+        Qwen38Model, SplitWalk,
     };
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::route_trace::RouteTrace;
     use bloomery_gpu::host::swap::{CallPick, CallReport, PassReport, Residency};
     use bloomery_gpu::host::xstream::{XLayer, XReport};
     use bloomery_gpu::hybrid::HybridStats;
+    use bloomery_gpu::kv_format::{KvChoice, KvQ8};
     use bloomery_gpu::model::{ChainBody, MAX_PASS_ROWS, SlotRows, StepMode};
     use bloomery_gpu::route_softmax::MAX_TOKENS;
     use bloomery_gpu::{Gpu, GpuModel, NemotronHModel, NemotronHMoeModel, Qwen3moeModel};
@@ -1341,7 +1342,7 @@ mod cli {
     /// one format the load allocates.
     fn inputs38(file: &Split, levers: &Levers) -> Result<PlanInputs, GateError> {
         let mut inputs = PlanInputs::describe(file)?;
-        let kv = KvQ8::choose(None, levers.qwen3_kv_set(), KvQ8::F16)?;
+        let kv = KvChoice::choose(None, levers.qwen3_kv_set())?.kv;
         inputs.kv = inputs.kv.in_q8_if(kv == KvQ8::Q8);
         Ok(inputs)
     }
@@ -1702,7 +1703,7 @@ mod cli {
         // The K/V planes' format, read once here: the loads below carry it
         // and the plan's KV term counts it (the lever's kind holds the word
         // to the two spellings).
-        let kv = KvQ8::choose(None, levers.qwen3_kv_set(), KvQ8::F16)?;
+        let kv = KvChoice::choose(None, levers.qwen3_kv_set())?.kv;
         // Unset, the lever is a qwen4exp plan's card experts and nothing on
         // another family's file; only a set `card` is refused there.
         let card_set = levers.qwen38_experts_set() == Some("card");

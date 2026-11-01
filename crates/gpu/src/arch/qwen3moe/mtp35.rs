@@ -44,7 +44,7 @@
 //! 0 replaces that count. The body's reset does not reach it.
 
 use super::PrefillPath;
-use super::body::{Kernels, KvQ8};
+use super::body::Kernels;
 use super::dispatch::{self, Ctx, PassCtx, embed_into};
 use super::mtp38::BorrowedPlanes;
 use super::plan::LayerPlan;
@@ -52,6 +52,7 @@ use super::program::{OneLayer, Program, Tail};
 use super::scratch::{Arena, Dims, Forms, KvPlanes, StepParams};
 use crate::draft::{self, DraftHead, Feed, Hidden, WalkBounds, WalkMode};
 use crate::head::{Head, HeadNorm};
+use crate::kv_format::KvQ8;
 use crate::model::lookup::f32_gain;
 use crate::mtp::{MtpInputArgs, MtpKernels};
 use crate::site::{self, SiteTy};

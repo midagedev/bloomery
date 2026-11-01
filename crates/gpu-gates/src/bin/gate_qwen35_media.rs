@@ -76,8 +76,9 @@ mod q3place;
 mod gate {
     use super::q3place::{self, Unplaced};
     use super::qwen35_open;
-    use bloomery_gpu::arch::qwen3moe::{Body35, KvQ8, Open35, PrefillPath, Qwen35moeModel};
+    use bloomery_gpu::arch::qwen3moe::{Body35, Open35, PrefillPath, Qwen35moeModel};
     use bloomery_gpu::host::PassKind;
+    use bloomery_gpu::kv_format::KvQ8;
     use bloomery_gpu::media::{ImageSpan, MediaBody, MediaSpan};
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::weights::DevWeight;

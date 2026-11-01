@@ -107,7 +107,6 @@
 //! apart from the plan's bytes ([`Mtp38::arena_bytes`]).
 
 use super::body::ATTN_SCALE_256;
-use super::body::KvQ8;
 use super::plan38::{HcSite, geo, router};
 use super::program38::{Ctx38, Kernels38, MMA};
 use super::router::gated;
@@ -130,6 +129,7 @@ use crate::hc_gated::{
     Before, HcMatrix, HcScratch, HcWideScratch, SiteWeights, Streams, WideMixArgs,
 };
 use crate::host::handoff::Places;
+use crate::kv_format::KvQ8;
 use crate::media::{CallRows, widen_bf16};
 use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::mtp::{ArgmaxPArgs, MtpInputArgs};

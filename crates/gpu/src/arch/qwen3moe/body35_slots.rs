@@ -35,7 +35,7 @@
 //! ([`SlotRows::SETTLES_PARTIAL_KEEP`] stays false): keeping a part of them
 //! would need the state after a kept row, which no lane holds.
 
-use super::body::{ATTN_SCALE, ATTN_SCALE_256, KvQ8};
+use super::body::{ATTN_SCALE, ATTN_SCALE_256};
 use super::body35::{Body35, Slot35};
 use super::delta;
 use super::dispatch::{self, PassCtx};
@@ -51,6 +51,7 @@ use crate::gated_quant::GateLayout;
 use crate::head::Head;
 use crate::host::StepLeg;
 use crate::hybrid::Chain;
+use crate::kv_format::KvQ8;
 use crate::linear::seqs::{GdnSeq, GdnSeqsArgs};
 use crate::linear::{
     self,

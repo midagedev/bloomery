@@ -66,7 +66,8 @@ pub mod rounds;
 // build in `bloomery-serve`, which includes it.
 #[cfg(all(test, feature = "gpu"))]
 mod tests {
-    use bloomery_gpu::arch::qwen3moe::{KvQ8, Prompt38};
+    use bloomery_gpu::arch::qwen3moe::Prompt38;
+    use bloomery_gpu::kv_format::{KvChoice, KvFrom, KvQ8};
     use bloomery_gpu_gates::GateError;
     use bloomery_levers::Draft38Off;
     use model::placement::workstation::{A6000, RTX_3090};
@@ -305,8 +306,9 @@ mod tests {
         }
     }
 
-    /// The `setup` line names the context's rule, and a draft a rule turned off with its reason:
-    /// the yield's card bytes and the positions a slot gets either way.
+    /// The `setup` line names the context's rule, the cache's format with what chose it, and a
+    /// draft a rule turned off with its reason: the yield's card bytes and the positions a slot
+    /// gets either way.
     #[test]
     fn setup_names_the_context_rule_and_why_the_draft_is_off() {
         use bloomery_levers::{Reserve, RungCost};
@@ -328,14 +330,17 @@ mod tests {
                 (false, false, false),
                 Some(&off),
                 (1, 69_632, fitted),
-                KvQ8::F16
+                KvChoice {
+                    kv: KvQ8::F16,
+                    from: KvFrom::Default
+                }
             )
             .line(),
             format!(
-                "setup draft=off slots=1 ctx=69632 ctx_rule=fitted cache=f16 (the draft is off, \
-                 unset: the draft's 2842413228 B on the card leave a slot 4096 positions; \
-                 without the draft a slot takes 69632; BLOOMERY_DRAFT=mtp drafts with the MTP \
-                 layer; {change})"
+                "setup draft=off slots=1 ctx=69632 ctx_rule=fitted cache=f16 \
+                 cache_from=default (the draft is off, unset: the draft's 2842413228 B on the \
+                 card leave a slot 4096 positions; without the draft a slot takes 69632; \
+                 BLOOMERY_DRAFT=mtp drafts with the MTP layer; {change})"
             )
         );
         assert_eq!(
@@ -343,13 +348,16 @@ mod tests {
                 (true, false, true),
                 None,
                 (1, 262_144, Rule::Target),
-                KvQ8::Q8
+                KvChoice {
+                    kv: KvQ8::Q8,
+                    from: KvFrom::Flag
+                }
             )
             .line(),
             format!(
                 "setup draft=mtp draft_from=folder slots=1 ctx=262144 ctx_rule=target cache=q8_0 \
-                  (BLOOMERY_DRAFT=off serves without the draft, BLOOMERY_MTP_DRAFT=FILE drafts \
-                  from a draft file; {change})"
+                 cache_from=flag (BLOOMERY_DRAFT=off serves without the draft, \
+                 BLOOMERY_MTP_DRAFT=FILE drafts from a draft file; {change})"
             )
         );
     }

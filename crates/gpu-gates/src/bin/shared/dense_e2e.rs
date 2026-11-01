@@ -32,7 +32,8 @@ use super::q35_clauses::{
     self as q35, Geometry35, PathRun, Slots35, fresh, lcg_ids, same_run, stores, uncut_call,
 };
 use super::qwen35_open;
-use bloomery_gpu::arch::qwen3moe::{Body35, KvQ8, Open35, Qwen35moeModel};
+use bloomery_gpu::arch::qwen3moe::{Body35, Open35, Qwen35moeModel};
+use bloomery_gpu::kv_format::KvQ8;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu::weights::part_format;
 use bloomery_gpu_gates::generate::Place;

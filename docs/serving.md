@@ -228,9 +228,11 @@ Your OpenAI client works unchanged. bloomery speaks llama-server's HTTP API and 
   and qwen38 seats; llama-server's spelling, also the `BLOOMERY_QWEN3_KV` lever; q8_0 nearly doubles the auto
   context on the same card for the qwen3 seat. On Qwen3.8 FP4-Local at 16,896 positions, the attention store is
   773,279,360 B against f16's 967,921,280 B; the index keys stay f16, and the default context and slot count did
-  not change there. Unset is f16, except a Qwen3.8 checkpoint folder,
-  whose seat runs q8_0 (FP4-Local's Spark default; `--cache-type-k f16` keeps f16); `--cache-type-v` does not
-  exist, both planes quantize together),
+  not change there. Unset, the format is f16 for a GGUF file and a checkpoint folder alike, one rule
+  (`crates/gpu/src/kv_format.rs`); a timed A/B ran q8_0's prompt pass slower than f16's with no faster decode
+  step on a GB10 (Qwen3.8) and an RTX 5090 (Qwen3.6). `setup` and the qwen3 seat's `load` line print the format
+  as `cache=` with `cache_from=flag|lever|default`;
+  `--cache-type-v` does not exist, both planes quantize together),
   `-ub/--ubatch-size N` (the qwen3 seat and the decide seat, on a file with no routed expert, whose only load is the
   whole one: that many tokens a prompt ubatch, or a refusal by name with the bytes it needs and a smaller size as
   the remedy; unset, the load takes the largest of 4096, 2048, 1024 and 512 the card holds at the asked context and

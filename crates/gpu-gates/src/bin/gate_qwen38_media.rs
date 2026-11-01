@@ -89,9 +89,10 @@ mod gate {
     use crate::gate_card;
     use crate::qwen38_open::{self, Open38};
     use crate::vision_taps::{K_TAP, band_check, dist_f32, floor, nudge, sens};
-    use bloomery_gpu::arch::qwen3moe::{Body38, KvQ8, Prompt38, Qwen38Model, TargetRows};
+    use bloomery_gpu::arch::qwen3moe::{Body38, Prompt38, Qwen38Model, TargetRows};
     use bloomery_gpu::host::served::prompt_pass;
     use bloomery_gpu::host::swap::Residency;
+    use bloomery_gpu::kv_format::KvQ8;
     use bloomery_gpu::media::{ImageShape, ImageSpan, MediaBody, MediaSpan};
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::{GpuError, capture_template};

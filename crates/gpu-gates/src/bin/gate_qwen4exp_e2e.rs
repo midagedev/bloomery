@@ -371,7 +371,7 @@ mod gate {
     use crate::qwen38_open::{Open38, Opened38, PlanFacts};
 
     use bloomery_gpu::arch::qwen3moe::{
-        Body38, KvQ8, LayerKind38, Prompt38, Qwen38Model, RouteTap, Seq38, SplitWalk, Store38Host,
+        Body38, LayerKind38, Prompt38, Qwen38Model, RouteTap, Seq38, SplitWalk, Store38Host,
         TargetRows, checkpoint_bytes, seq_positional_bytes, seq38_bytes,
     };
     use bloomery_gpu::head::Head;
@@ -381,6 +381,7 @@ mod gate {
     use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
     use bloomery_gpu::host::swap::{MachineCfg, Piece, Residency, SwapSource};
     use bloomery_gpu::hybrid::{HOST, Slot, SlotMap};
+    use bloomery_gpu::kv_format::KvQ8;
     use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu::qsa::POOL_TILE;
     use bloomery_gpu::{DeviceTensor, Fault, FaultSite, GpuError, LAYER_HEAD};

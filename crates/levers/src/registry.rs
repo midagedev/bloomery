@@ -1012,7 +1012,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         name: QWEN3_KV,
         class: Class::A,
         kind: Kind::Words(&["f16", "q8_0"]),
-        default: Unset::Means("`f16`, but `q8_0` on the Qwen3.8 seat's checkpoint folder"),
+        default: Unset::Means("`f16`, a GGUF file and a checkpoint folder alike"),
         doc: "Qwen3, Qwen3.6 and Qwen3.8 (`generate_qwen3moe`, `bloomery-serve --model qwen3`, \
               `bloomery-serve --model qwen38`): the format the load holds its K/V cache planes \
               in — `q8_0` the two-plane layout (17/16 B a value against f16's 2, both planes quantized together by the one \
@@ -1024,9 +1024,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               ladder probes counts the format's bytes. The seat's \
               `--cache-type-k` takes the same two words (llama-server's spelling) and \
               wins over the lever; `--cache-type-v` does not exist — both planes quantize \
-              together. Unset on the Qwen3.8 seat, a checkpoint folder (FP4-Local) runs \
-              `q8_0` and a GGUF file `f16`; its MTP draft's store takes the same format. The \
-              qwen3 seat's `load` line prints `cache=`, the Qwen3.8 seat's `setup` line.",
+              together. Unset, every one of these loads takes `f16` \
+              (`bloomery_gpu::kv_format`), whatever the file's container. The Qwen3.8 MTP \
+              draft's store takes the same format. The qwen3 seat's `load` \
+              line prints `cache=` and `cache_from=`, the Qwen3.8 seat's `setup` line.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

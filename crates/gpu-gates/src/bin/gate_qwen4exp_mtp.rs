@@ -281,12 +281,13 @@ mod gate {
 
     use bloomery_gpu::GpuError;
     use bloomery_gpu::arch::qwen3moe::{
-        Body38, CHECKPOINT_EVERY, KvQ8, MTP_GRAPH_ROWS, MTP_ROWS, MTP_STORE_ROWS, Mtp38, MtpNode,
+        Body38, CHECKPOINT_EVERY, MTP_GRAPH_ROWS, MTP_ROWS, MTP_STORE_ROWS, Mtp38, MtpNode,
         MtpTaps, Prompt38, Qwen38Model, Seq38, SplitWalk, Store38Host, TargetRows,
         checkpoint_bytes, seq_positional_bytes, seq38_bytes,
     };
     use bloomery_gpu::draft::{DraftFeed, DraftHead, Feed, Hidden, Proposal, WalkMode};
     use bloomery_gpu::fault::FaultSite;
+    use bloomery_gpu::kv_format::KvQ8;
     use bloomery_gpu::media::CallRows;
     use bloomery_gpu::weights::DevWeight;
     use bloomery_gpu_gates::act_rule::{Arm, site_rel};

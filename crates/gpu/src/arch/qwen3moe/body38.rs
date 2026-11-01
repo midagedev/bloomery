@@ -113,7 +113,6 @@
 //! recurrent stores one call on, so a call at that position is refused by
 //! name until `reset`: a delta layer keeps no earlier state to cut back to.
 
-use super::body::KvQ8;
 use super::card38::{Card38, MapCheck, Walk38};
 use super::image::{
     MediaCarrier, MediaRows, imrope_sections, media_call, section_order, window_spans,
@@ -164,6 +163,7 @@ use crate::host::tier::TierOpen;
 use crate::host::xstream::{Costs, XCfg, XLayer, XMode, XReport};
 use crate::host::{BatchLeg, PassKind, StepLeg, refuse_tier_count};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, SlotMap};
+use crate::kv_format::KvQ8;
 use crate::linear::delta::{RecoveryStore, RecoveryTable, carry_fold_host};
 use crate::media::{ImageSpan, MediaBody, MediaSpan, RopeBase, SeqRope, kept_rule, rope_table};
 use crate::model::slots::{kept_whole, slot_twice};

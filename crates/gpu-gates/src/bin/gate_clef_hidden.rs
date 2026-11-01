@@ -58,7 +58,8 @@ mod qwen35_open;
 mod gate {
     use super::qwen35_open;
     use bloomery_gpu::Gpu;
-    use bloomery_gpu::arch::qwen3moe::{KvQ8, Open35, PrefillPath, Qwen35moeModel};
+    use bloomery_gpu::arch::qwen3moe::{Open35, PrefillPath, Qwen35moeModel};
+    use bloomery_gpu::kv_format::KvQ8;
     use bloomery_gpu_gates::{
         GateError, RefManifest, checks_failed, data_dir, load_ref_in, quantile, ref_model_path,
         verdict,

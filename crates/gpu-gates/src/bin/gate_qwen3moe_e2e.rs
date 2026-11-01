@@ -324,8 +324,9 @@ mod gate {
     use super::taps;
     use app::Session;
     use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
-    use bloomery_gpu::arch::qwen3moe::{Body, KvQ8, KvQ8Host, PrefillPath, PrefillStep};
+    use bloomery_gpu::arch::qwen3moe::{Body, KvQ8Host, PrefillPath, PrefillStep};
     use bloomery_gpu::flash_gqa::HEAD;
+    use bloomery_gpu::kv_format::KvQ8;
     use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
     use bloomery_gpu::route_softmax::MAX_TOKENS;
