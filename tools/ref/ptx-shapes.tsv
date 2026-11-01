@@ -440,6 +440,8 @@ generate_ds41   mxfp8_gemv_ids                          60          24
 generate_ds41   mxfp8_gemv_mcol                          0           0
 # PIN(2026-10-27): mxfp8_gemv_mcol_staged, a new entry, at the sm_121a GB10 scan's 0 spill and 0 JIT local bytes.
 generate_ds41   mxfp8_gemv_mcol_staged                   0           0
+# PIN(2026-11-02): mxfp8_gemv_mcol_staged_wide, a new entry, at the sm_121a GB10 scan's 0 spill and 0 JIT local bytes.
+generate_ds41   mxfp8_gemv_mcol_staged_wide              0           0
 generate_ds41   mxfp8_mma_gemm                           0           0
 generate_ds41   mxfp8_tile_gemm                          0           0
 generate_ds41   nemotron_moe_router_240                  0           0
