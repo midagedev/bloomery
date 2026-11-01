@@ -685,7 +685,7 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
             let on = (staged, &plan_levers, n, place);
             ringed(
                 set,
-                plain.plan.host.experts > 0,
+                workstation::plan_streams(&plain.plan),
                 || plan_at(&split, asking, r, on),
                 || plan_at(&split, asking, &inputs, on),
             )

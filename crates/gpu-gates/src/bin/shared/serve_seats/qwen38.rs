@@ -746,7 +746,9 @@ impl Place38 {
 
     /// [`Self::machine`] and `read` of its plan ([`PlanInputs::plan_target`] at
     /// `ctx`), which the machine's own choice made, so the caller plans it no
-    /// more.
+    /// more. A placement whose load streams keeps the lane's staging only where
+    /// that plan has host experts to stream (`workstation::plan_streams`); one
+    /// that holds every expert on the card is the machine without it.
     fn machine_read<T>(
         self,
         inputs: &PlanInputs,
@@ -799,7 +801,7 @@ impl Place38 {
                 .reserves
                 .push((POINT_ROWS_RESERVE.to_owned(), pinned(slots, bytes)));
         }
-        Ok(widen_card_route(
+        let (machine, (streams, got)) = widen_card_route(
             machine,
             ub,
             form,
@@ -808,8 +810,13 @@ impl Place38 {
                     .plan_target(m, (ctx, ub), levers, experts, mtp, slots)
                     .map(|p| on(&p))
             },
-            read,
-        )?)
+            |p| (workstation::plan_streams(p), read(p)),
+        )?;
+        if self.stream > 0 && !streams {
+            let idle = Place38 { stream: 0, ..self };
+            return idle.machine_read(inputs, (ctx, ub), (experts, levers, mtp, slots), read);
+        }
+        Ok((machine, got))
     }
 }
 
@@ -1973,9 +1980,10 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         stream: 0,
     };
     // A load whose prompt calls stream pins the lane's staging for its life: every machine below
-    // reserves it, so the NVMe expert tier's split leaves it room and the need counts it pinned.
-    // A residency `off` before the plan (set, or unset under the route trace or the step feed)
-    // starts no stream.
+    // reserves it, so the NVMe expert tier's split leaves it room and the need counts it pinned,
+    // unless its plan holds every expert on the card ([`Place38::machine_read`]). A residency
+    // `off` before the plan (set, or unset under the route trace or the step feed) starts no
+    // stream.
     if plans_ring(
         levers.xstream(),
         a.place.stage38(),
@@ -4664,25 +4672,21 @@ mod tests {
     }
 
     /// A placement whose load streams carries the lane's staging on every machine it plans on:
-    /// the host reserve of 64 ring slots (`workstation::reserve_stream_staging`), none where it
-    /// streams nothing. FAIL-first: the seat's machines reserved no staging.
+    /// the host reserve of 64 ring slots (`workstation::reserve_stream_staging`) where the plan
+    /// leaves routed experts on the host, none where it streams nothing — a load that does not
+    /// stream, and a plan that holds every expert on the card or has none to route
+    /// (`workstation::plan_streams`). FAIL-first: the seat's machines reserved no staging; then a
+    /// plan with nothing on the host still set it aside.
     #[test]
     fn a_streaming_placement_reserves_its_staging() {
         use model::arch::qwen35moe::place::Experts;
-        use model::placement::PlanLevers;
         use model::placement::workstation::XSTREAM_STAGING_RESERVE;
+        use model::placement::{ModelTensor, PlanLevers, Role};
 
-        let (inputs, _, place) = seat_plan_inputs();
-        let staging = |place: super::Place38| {
+        let (mut inputs, _, place) = seat_plan_inputs();
+        let staging = |inputs: &super::PlanInputs, place: super::Place38, experts| {
             place
-                .machine(
-                    &inputs,
-                    (4096, 1),
-                    Experts::Host,
-                    &PlanLevers::default(),
-                    None,
-                    1,
-                )
+                .machine(inputs, (4096, 1), experts, &PlanLevers::default(), None, 1)
                 .expect("the machine")
                 .host()
                 .reserves
@@ -4691,13 +4695,45 @@ mod tests {
                 .map(|(_, bytes)| *bytes)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(staging(place), Vec::<u64>::new());
         let slot = 3 << 20;
         let streaming = super::Place38 {
             stream: slot,
             ..place
         };
-        assert_eq!(staging(streaming), [64 * slot]);
+        let none = Vec::<u64>::new();
+        assert_eq!(staging(&inputs, place, Experts::Host), none);
+        assert_eq!(
+            staging(&inputs, streaming, Experts::Host),
+            none,
+            "no routed expert"
+        );
+        // A Q4_K gate and up and a Q8_0 down: stacks the card leg runs, so `Experts::Card`
+        // places every expert of the layer on the card.
+        let (hidden, ff, experts) = (2560u64, 640, 8);
+        let (q4k, q8) = (gguf::GgmlType::Q4_K, gguf::GgmlType::Q8_0);
+        for (part, ty, dims, bytes) in [
+            ("gate", q4k, [hidden, ff, experts], 144 * hidden / 256),
+            ("up", q4k, [hidden, ff, experts], 144 * hidden / 256),
+            ("down", q8, [ff, hidden, experts], 34 * ff / 32),
+        ] {
+            inputs.model.tensors.push(ModelTensor {
+                name: format!("blk.0.ffn_{part}_exps.weight"),
+                shard: 0,
+                layer: Some(0),
+                role: Role::RoutedExperts,
+                ty,
+                dims: dims.to_vec(),
+                file_bytes: bytes * dims[1] * experts,
+                gathered_rows: None,
+            });
+        }
+        assert_eq!(staging(&inputs, place, Experts::Host), none);
+        assert_eq!(staging(&inputs, streaming, Experts::Host), [64 * slot]);
+        assert_eq!(
+            staging(&inputs, streaming, Experts::Card),
+            none,
+            "every expert on the card"
+        );
     }
 
     /// A checkpoint folder's plan holds its least part reads where its NVMe
