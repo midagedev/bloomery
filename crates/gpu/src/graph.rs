@@ -1117,11 +1117,30 @@ impl<T: DeviceCopy> StagedRows<T> {
         dst: &mut DeviceBuffer<T>,
         at: usize,
     ) -> Result<(), GpuError> {
+        self.enqueue_prefix(stream, row, self.width, dst, at)
+    }
+
+    /// [`StagedRows::enqueue`] of the row's first `len` values: the arrival
+    /// of a walk that reads fewer values than a row holds.
+    pub fn enqueue_prefix(
+        &self,
+        stream: &CudaStream,
+        row: usize,
+        len: usize,
+        dst: &mut DeviceBuffer<T>,
+        at: usize,
+    ) -> Result<(), GpuError> {
         const WHAT: &str = "StagedRows::enqueue";
         let width = self.width;
+        if len > width {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("{len} values of a row of {width}"),
+            ));
+        }
         let src = self
             .staging
-            .get(row * width..(row + 1) * width)
+            .get(row * width..row * width + len)
             .ok_or_else(|| {
                 let held = self.staging.len();
                 GpuError::shape(
@@ -1129,14 +1148,14 @@ impl<T: DeviceCopy> StagedRows<T> {
                     format!("row {row} of {width} values in a staging of {held}"),
                 )
             })?;
-        if at.checked_add(width).is_none_or(|end| end > dst.len()) {
+        if at.checked_add(len).is_none_or(|end| end > dst.len()) {
             return Err(GpuError::shape(
                 WHAT,
-                format!("a row of {width} values at {at} of {}", dst.len()),
+                format!("{len} values of a row at {at} of {}", dst.len()),
             ));
         }
         self.flags.enqueue_wait(stream, row)?;
-        // SAFETY: the destination is values `at .. at + width` of `dst`
+        // SAFETY: the destination is values `at .. at + len` of `dst`
         // (checked above), borrowed mutably for the enqueue; the source is
         // the row in page-locked memory this value owns, whose owner drops
         // the graphs that captured the copy before it, and the host writes

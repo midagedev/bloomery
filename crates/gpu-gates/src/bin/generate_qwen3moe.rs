@@ -466,7 +466,7 @@ mod cli {
     use bloomery_gpu_gates::llama_launch::{self, Launcher};
     use bloomery_gpu_gates::logit_rows::{ForcedFacts, ForcedRows};
     use bloomery_gpu_gates::need;
-    use bloomery_gpu_gates::nodes::count_kinds;
+    use bloomery_gpu_gates::nodes::step_census;
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::residency38::{CARD38, Lever38, Seqs, churn_bytes, residency38};
     use bloomery_gpu_gates::{Fnv1a64, GateError, gpu_census, ref_model_path};
@@ -474,7 +474,6 @@ mod cli {
         Draft38At, Draft38Off, Levers, PagedAt, Residency38At, ResidencyPick, ResidencyWhy,
         draft38_unset, paged_draft, residency38_off, residency38_unset,
     };
-    use cuda_core::sys;
     use gguf::Split;
     use model::arch::qwen35moe::head_list::head_rows_of;
     use model::arch::qwen35moe::place::{
@@ -3235,23 +3234,9 @@ mod cli {
         if m.mode() != StepMode::Graph {
             return Ok(());
         }
-        let (launches, memops) = m.body("generate_qwen3moe")?.step_launches();
+        let counts = m.body("generate_qwen3moe")?.step_launches();
         let nodes = m.capture_step()?;
-        let kernel = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL;
-        let memop = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP;
-        let ([k, b], other) = count_kinds(&m.step_graph_nodes()?, [kernel, memop]);
-        println!(
-            "capture graph_nodes={nodes} kernel={k} batch_mem_op={b} other={other} (the \
-             program counts {launches}, {memops} of them batch_mem_op)"
-        );
-        if nodes != launches || b != memops || k + b != nodes || other != 0 {
-            return Err(format!(
-                "the captured step is not the program's: {nodes} nodes ({k} kernel, {b} \
-                 batch_mem_op, {other} other) against {launches} launches, {memops} of them \
-                 batch_mem_op"
-            )
-            .into());
-        }
+        println!("{}", step_census(nodes, counts, &m.step_graph_nodes()?)?);
         Ok(())
     }
 

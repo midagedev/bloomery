@@ -60,6 +60,34 @@ pub fn count_kinds<const N: usize>(
     (counts, other)
 }
 
+/// A captured step of `nodes` nodes (`graph`, as the driver lists them) held
+/// to the program's count (`counts`: its launches, how many of them are
+/// stream memory-operation batches and how many are copies): the `capture
+/// graph_nodes=` line a gate prints, or the mismatch refused by name.
+pub fn step_census(
+    nodes: usize,
+    counts: (usize, usize, usize),
+    graph: &[NodeInfo],
+) -> Result<String, GateError> {
+    let (launches, memops, copies) = counts;
+    let kernel = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL;
+    let memop = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP;
+    let memcpy = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_MEMCPY;
+    let ([k, b, c], other) = count_kinds(graph, [kernel, memop, memcpy]);
+    if nodes != launches || b != memops || c != copies || k + b + c != nodes || other != 0 {
+        return Err(format!(
+            "the captured step is not the program's: {nodes} nodes ({k} kernel, {b} \
+             batch_mem_op, {c} memcpy, {other} other) against {launches} launches, \
+             {memops} of them batch_mem_op, {copies} memcpy"
+        )
+        .into());
+    }
+    Ok(format!(
+        "capture graph_nodes={nodes} kernel={k} batch_mem_op={b} memcpy={c} other={other} \
+         (the program counts {launches}, {memops} of them batch_mem_op, {copies} memcpy)"
+    ))
+}
+
 /// One node of a captured template, as a gate reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StepNode {

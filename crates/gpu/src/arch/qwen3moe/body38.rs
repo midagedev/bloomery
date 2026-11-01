@@ -644,9 +644,10 @@ pub enum LayerKind38 {
 /// One mapping of the table, two residencies: on the host the load's host
 /// set holds its pages and a fill gathers its rows from the split's mapping;
 /// on the NVMe tier a fill's rows are advised and copied off the step thread
-/// ([`RowRead`]). Either way the rows go to the card as read and the card
-/// decodes them ([`RowKernels::enqueue`]); a verify's rows, which its staging
-/// takes as values, are decoded here ([`RowFormat::decode`]).
+/// ([`RowRead`]). Either way a prompt's rows go to the card as read and the
+/// card decodes them ([`RowKernels::enqueue`]); a step's or a verify's rows,
+/// which the arrival's staging takes as values, are decoded here
+/// ([`RowFormat::decode`]).
 struct PleHost {
     hash: Hash,
     hist: History,
@@ -1142,13 +1143,11 @@ pub struct RouteTap {
 }
 
 /// A verify that waits for its commit: its first position, its tokens, and
-/// the PLE history as it stood before them; `ple_due` while its PLE rows'
-/// arrival is still to be delivered ([`Body38::deliver_ple`]).
+/// the PLE history as it stood before them.
 struct Pending38 {
     pos0: u32,
     tokens: Vec<u32>,
     hist: History,
-    ple_due: bool,
 }
 
 /// A call planned and not yet launched: its first position, its rows, the
@@ -1282,9 +1281,13 @@ pub struct Body38 {
     /// its commit.
     lane: LaneWord,
     pending: Option<Pending38>,
-    /// How a verify's PLE rows reach its walk after its launch: one staged
-    /// row of [`VERIFY_ROWS`] positions' values.
+    /// How a step's or a verify's PLE rows reach its walk after its launch:
+    /// one staged row of [`VERIFY_ROWS`] positions' values.
     ple_arrival: StagedRows<f32>,
+    /// The first position and the positions of the launched step or verify
+    /// whose PLE rows the arrival still waits for ([`Body38::deliver_ple`]);
+    /// `None` when none.
+    ple_due: Option<(u32, usize)>,
     /// Each layer's streams after it and its route, when a gate armed them.
     taps: Option<Taps38>,
     /// The launches the loaded `output`'s head records past its norm: the
@@ -2077,7 +2080,7 @@ impl Body38 {
                 gpu.context(),
                 1,
                 VERIFY_ROWS * geo::HIDDEN,
-                "cuMemAllocHost (a verify's PLE rows staging)",
+                "cuMemAllocHost (the PLE rows' arrival staging)",
             )?,
             taps: None,
             eps: spec.rms_eps,
@@ -2087,6 +2090,7 @@ impl Body38 {
             held: 0,
             staged: None,
             ple_late: false,
+            ple_due: None,
             slots_planned: planned,
             slots_made: 1,
             slot_in: (planned > 1).then(|| SlotIn::new(stream)).transpose()?,
@@ -2138,17 +2142,22 @@ impl Body38 {
             .unwrap_or_default()
     }
 
-    /// The captured step's launches ([`super::program38`]'s count), and how
-    /// many of them are stream memory-operation batches: the go and the wait
-    /// of each layer with a host leg ([`Card38::hostless`]).
+    /// The captured step's nodes ([`super::program38`]'s launches and the PLE
+    /// rows' arrival at each PLE site, [`StagedRows`]), how many of them are
+    /// stream memory-operation batches (the go and the wait of each layer
+    /// with a host leg, [`Card38::hostless`], and each arrival's wait), and
+    /// how many are copies (each arrival's row).
     #[must_use]
-    pub fn step_launches(&self) -> (usize, usize) {
+    pub fn step_launches(&self) -> (usize, usize, usize) {
         let served = (0..self.plans.len())
             .filter(|&l| !self.card.hostless(l))
             .count();
+        let sites = self.plans.iter().filter(|p| p.ple.is_some()).count();
         (
-            step_launches(&self.plans, &self.card, self.tier.as_ref(), self.head),
-            STEP_MEMOPS * served,
+            step_launches(&self.plans, &self.card, self.tier.as_ref(), self.head)
+                + sites * PLE_ARRIVAL_NODES,
+            STEP_MEMOPS * served + sites,
+            sites,
         )
     }
 
@@ -3928,11 +3937,14 @@ impl Body38 {
     /// The staged call of `rows` from `pos` launched: the stores' count past
     /// its rows, the PLE history past them, and a verify's commit waiting
     /// with the history as it stood before. Only the last `read` rows are
-    /// recorded as final hidden rows. Refused by name, moving nothing,
+    /// recorded as final hidden rows. No PLE rows are due until a step or a
+    /// verify that takes them through the arrival says so after this.
+    /// Refused by name, moving nothing else,
     /// when no call of those rows from there is staged. A launch that fails
     /// after this is counted as run: the refusal that follows is named,
     /// where a count left behind would run the rows twice.
     fn launch(&mut self, pos: u32, rows: usize, read: usize) -> Result<(), GpuError> {
+        self.ple_due = None;
         if read > rows {
             return Err(GpuError::shape(
                 WHAT,
@@ -3961,22 +3973,19 @@ impl Body38 {
                 pos0: s.pos,
                 tokens,
                 hist: before,
-                ple_due: false,
             });
         }
         Ok(())
     }
 
-    /// The waiting verify's PLE rows, when their arrival is due
+    /// The launched step's or verify's PLE rows, when their arrival is due
     /// ([`StagedRows`]): read on this thread and decoded
     /// ([`PleHost::read_named`]), staged, and the arrival's flag raised on
     /// every path, an error included.
     fn deliver_ple(&mut self) -> Result<(), GpuError> {
-        let Some(p) = self.pending.as_mut().filter(|p| p.ple_due) else {
+        let Some((pos, n)) = self.ple_due.take() else {
             return Ok(());
         };
-        p.ple_due = false;
-        let (pos, n) = (p.pos0, p.tokens.len());
         let ple = &mut self.ple;
         self.ple_arrival.deliver(0, |staging| {
             let held = staging.len();
@@ -5787,32 +5796,47 @@ impl ChainBody for Body38 {
 
     /// The step at `pos`, where the stores stand: the map check
     /// ([`MapCheck::refuse`], at every step: a planted map may change between
-    /// two replays of one capture), its PLE rows read from the file, staged
-    /// for the refresh's launch.
+    /// two replays of one capture), its PLE rows named
+    /// ([`PleHost::name_rows`]), staged for the refresh's launch.
     fn decode_input(&mut self, token: u32, pos: u32) -> Result<DecodeInput38, GpuError> {
         self.refuse_inside_image("qwen4exp step", pos)?;
         self.card_leg.refuse(Walk38::Step)?;
         self.check_next(pos, 1)?;
-        let hist = self.ple.fill(pos, &[token])?;
+        let hist = self.ple.name_rows(pos, &[token], &[])?;
         self.stage(pos, 1, hist, None)?;
         Ok(DecodeInput38 { token, pos })
     }
 
-    /// The step's input record (its position, its token, the lane word) and
-    /// its PLE rows: two copies ahead of the step's launches. Once they are
-    /// sent the step is launched ([`Body38::launch`]): what follows enqueues
-    /// or replays its chain.
+    /// The step's input record (its position, its token, the lane word), one
+    /// copy ahead of the step's launches, and the arrival's flag lowered
+    /// once the stream has passed every walk before, whose arrival may still
+    /// read the staging ([`StagedRows`]'s contract: a decode step's stream
+    /// stands drained by the readback of the step before; a run of several
+    /// tokens waits here for each step's walk). Once it is sent the step is
+    /// launched ([`Body38::launch`]) and its PLE rows are due: they arrive at
+    /// its PLE site, delivered once the walk is enqueued
+    /// ([`Body38::deliver_ple`]), so their read runs under the walk's launch
+    /// and the layers before the site. What follows enqueues or replays its
+    /// chain.
     fn refresh(&mut self, stream: &CudaStream, input: &DecodeInput38) -> Result<(), GpuError> {
         planted(&mut self.plant, Plant::BeforeLaunch)?;
         self.settle(stream)?;
         self.last_walk = TargetRows::Step;
-        let s = &mut self.s.ple;
-        self.ple.land(stream, &self.k.rows, s, 0, 1)?;
+        stream.synchronize()?;
+        self.ple_arrival.clear(0)?;
         self.sp.write(stream, input.token, input.pos)?;
-        self.launch(input.pos, 1, 1)
+        self.launch(input.pos, 1, 1)?;
+        self.ple_due = Some((input.pos, 1));
+        Ok(())
     }
 
+    /// The step's walk ([`Step38`]). An eager walk serves its host legs as
+    /// it enqueues them: its PLE rows are delivered first, so they arrive
+    /// before it.
     fn enqueue_chain(&mut self, gpu: &Gpu, w: &Weights, head: &mut Head) -> Result<(), GpuError> {
+        if !crate::capturing(gpu.stream())? {
+            self.deliver_ple()?;
+        }
         let io = Io {
             lane: Some(self.lane.word()),
             ..self.sp.io()
@@ -5834,6 +5858,7 @@ impl ChainBody for Body38 {
             eps,
             ctx,
             plant,
+            ple_arrival,
             ..
         } = self;
         let prog = Step38 {
@@ -5863,6 +5888,7 @@ impl ChainBody for Body38 {
                 each: false,
             },
             head,
+            arrival: &*ple_arrival,
         };
         let mut leg = StepLeg::new(gpu.stream(), hybrid);
         prog.walk(&mut leg)?;
@@ -6184,8 +6210,9 @@ impl TierBody for Body38 {
         })
     }
 
-    /// A launched verify's PLE rows delivered first ([`Body38::deliver_ple`]):
-    /// the host legs its walk serves come after its PLE site.
+    /// A launched step's or verify's PLE rows delivered first
+    /// ([`Body38::deliver_ple`]): the host legs its walk serves come after
+    /// its PLE site.
     fn serve_chain(&mut self, chain: Chain) -> Result<(), GpuError> {
         let delivered = self.deliver_ple();
         let served = self.hybrid.serve_captured_of(chain);
@@ -6242,9 +6269,7 @@ impl Body38 {
         self.stage(pos, n, hist, Some(tokens.to_vec()))?;
         planted(&mut self.plant, Plant::BeforeLaunch)?;
         self.launch(pos, n, n)?;
-        if let Some(p) = self.pending.as_mut() {
-            p.ple_due = true;
-        }
+        self.ple_due = Some((pos, n));
         Ok(())
     }
 

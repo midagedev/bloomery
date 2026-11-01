@@ -1220,7 +1220,9 @@ impl<B: ChainBody> GpuModel<B> {
     /// argmax of the LAST one — the greedy next token. Each token gets its
     /// own parameter refresh (outside any capture) and one body; only the
     /// argmax readback at the end synchronizes the stream, so a prompt of P
-    /// tokens is P bodies and one sync.
+    /// tokens is P bodies and one sync, unless the body's refresh waits for
+    /// the walk before (a step whose rows arrive after its launch: one sync
+    /// a token).
     ///
     /// Positions continue from wherever the model stands: a prompt then its
     /// continuation is `step(&prompt)` followed by one `step(&[tok])` per

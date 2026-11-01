@@ -561,6 +561,20 @@ fn tap(
 }
 
 impl Parts38<'_> {
+    /// On layer `l` with the PLE site, the walk's rows of `arrival`'s row 0
+    /// enqueued over the arena's PLE values ([`StagedRows::enqueue_prefix`]):
+    /// the rows the host delivers after the launch reach the site before it
+    /// reads them.
+    fn arrive(&mut self, arrival: Option<&StagedRows<f32>>, l: usize) -> Result<(), GpuError> {
+        if let Some(arrival) = arrival
+            && plan_of(self.plans, l)?.ple.is_some()
+        {
+            let len = self.m * geo::HIDDEN;
+            arrival.enqueue_prefix(self.c.gpu.stream(), 0, len, &mut self.s.ple.e, 0)?;
+        }
+        Ok(())
+    }
+
     /// Layer `l`'s front up to its feed-forward site: the embedding in front
     /// of layer 0, the attention site (with the PLE site on its layer), the
     /// mixer into `y`, one of its projections on `branch` (module doc). Each
@@ -1744,11 +1758,14 @@ unsafe fn kv_attend(
     )
 }
 
-/// The captured decode step's walk `(1, 1, Step)`, into `head`.
+/// The captured decode step's walk `(1, 1, Step)`, into `head`. Its PLE
+/// rows' `arrival` (one staged row's first position) is enqueued at its PLE
+/// site ([`StagedRows::enqueue`]), as a verify's is.
 pub(super) struct Step38<'a> {
     pub(super) branch: &'a mut Branch,
     pub(super) p: Parts38<'a>,
     pub(super) head: &'a mut Head,
+    pub(super) arrival: &'a StagedRows<f32>,
 }
 
 impl<'a> Step38<'a> {
@@ -1771,6 +1788,7 @@ impl<'a> LayerProgram for Step38<'a> {
     /// then the handoff into the page and the go.
     fn front(&mut self, port: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
+        self.p.arrive(Some(self.arrival), l)?;
         self.p.front(self.branch, l)?;
         let hy = port.hybrid();
         self.p.ffn_mix(l, Some(hy.boundary_mut().normed_mut()))?;
@@ -1828,7 +1846,7 @@ pub(super) struct Verify38<'a> {
     pub(super) arrival: Option<&'a StagedRows<f32>>,
 }
 
-/// The nodes a verify's PLE arrival adds to its capture
+/// The nodes a step's or a verify's PLE arrival adds to its capture
 /// ([`StagedRows::enqueue`]): the flag's wait (one batch memory operation)
 /// and the rows' copy.
 pub(super) const PLE_ARRIVAL_NODES: usize = 2;
@@ -1876,11 +1894,7 @@ impl<'a> LayerProgram for Verify38<'a> {
     /// in one launch and the go.
     fn front(&mut self, port: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
-        if let Some(arrival) = self.arrival
-            && plan_of(self.p.plans, l)?.ple.is_some()
-        {
-            arrival.enqueue(self.p.c.gpu.stream(), 0, &mut self.p.s.ple.e, 0)?;
-        }
+        self.p.arrive(self.arrival, l)?;
         self.p.front(self.branch, l)?;
         let hy = port.hybrid();
         self.p.ffn_mix(l, Some(hy.boundary_mut().normed_mut()))?;
