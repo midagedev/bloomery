@@ -694,15 +694,6 @@ mod tests {
         }
     }
 
-    /// The real 8B folder's tensors, as the map is handed them: each quantized weight at its
-    /// unpacked shape (the packed words hold eight 4-bit values), each norm as stored; the scales
-    /// and biases are the weights' companions.
-    fn real_tensors() -> Vec<(String, Vec<usize>)> {
-        let mut header = json(HEADER);
-        header.as_object_mut().unwrap().remove("__metadata__");
-        unpacked(&header)
-    }
-
     fn map_of(
         checkpoint: &Checkpoint,
         tensors: &[(String, Vec<usize>)],
@@ -725,7 +716,7 @@ mod tests {
     fn the_real_8b_folder_maps_to_the_files_tensors_and_keys() {
         let config = json(CONFIG);
         let checkpoint = Checkpoint::parse(&config).unwrap();
-        let mapping = map_of(&checkpoint, &real_tensors()).unwrap();
+        let mapping = map_of(&checkpoint, &unpacked(json(HEADER))).unwrap();
         assert_eq!(mapping.tensors.len(), 291);
         assert!(mapping.skipped.is_empty());
         let get = |name: &str| &mapping.tensors[name];
@@ -919,7 +910,7 @@ mod tests {
     #[test]
     fn the_map_refuses_what_it_does_not_read_by_name() {
         let checkpoint = Checkpoint::parse(&json(CONFIG)).unwrap();
-        let base = real_tensors();
+        let base = unpacked(json(HEADER));
         let refuse = |edit: &dyn Fn(&mut Tensors)| {
             let mut t = base.clone();
             edit(&mut t);
@@ -984,7 +975,7 @@ mod tests {
         let mut config = json(CONFIG);
         config["tie_word_embeddings"] = json!(true);
         let tied = Checkpoint::parse(&config).unwrap();
-        let mut t = real_tensors();
+        let mut t = unpacked(json(HEADER));
         let e = map_of(&tied, &t).err().expect("refused");
         assert!(e.contains("lm_head.weight") && e.contains("is true"), "{e}");
         t.retain(|(n, _)| n != "lm_head.weight");
@@ -1148,22 +1139,12 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// The real Qwen3-8B folder's tensors, as the map is handed them: the 8B header's form.
-    fn q8b_tensors() -> Vec<(String, Vec<usize>)> {
-        let mut header = json(Q8B_HEADER);
-        header.as_object_mut().unwrap().remove("__metadata__");
-        unpacked(&header)
-    }
-
-    /// The real Qwen3-32B folder's tensors, from the tensors file every shard's header makes.
-    fn q32b_tensors() -> Vec<(String, Vec<usize>)> {
-        unpacked(&json(Q32B_TENSORS))
-    }
-
-    /// The entries of a header or tensors fixture at the unpacked shapes the map reads them
-    /// (the packed U32 words hold eight 4-bit values), the `.weight` planes alone.
-    fn unpacked(fixture: &Json) -> Vec<(String, Vec<usize>)> {
-        entries(fixture)
+    /// A folder's tensors, as the map is handed them, from a header or tensors fixture (a
+    /// header's `__metadata__` dropped): the `.weight` planes alone, each quantized weight at
+    /// its unpacked shape (the packed U32 words hold eight 4-bit values), each norm as stored.
+    fn unpacked(mut fixture: Json) -> Vec<(String, Vec<usize>)> {
+        fixture.as_object_mut().unwrap().remove("__metadata__");
+        entries(&fixture)
             .into_iter()
             .filter(|(name, _, _)| name.ends_with(".weight"))
             .map(|(name, dtype, mut shape)| {
@@ -1185,13 +1166,13 @@ mod tests {
         for (config, tensors, layers, heads, ffn, group) in [
             (
                 Q8B_CONFIG,
-                q8b_tensors(),
+                unpacked(json(Q8B_HEADER)),
                 36usize,
                 32usize,
                 12_288u64,
                 4usize,
             ),
-            (Q32B_CONFIG, q32b_tensors(), 64, 64, 25_600, 8),
+            (Q32B_CONFIG, unpacked(json(Q32B_TENSORS)), 64, 64, 25_600, 8),
         ] {
             let checkpoint = Checkpoint::parse(&json(config)).unwrap();
             assert_eq!(checkpoint.architecture(), "qwen3");
@@ -1326,7 +1307,7 @@ mod tests {
         let mut config = json(Q8B_CONFIG);
         config["tie_word_embeddings"] = json!(true);
         let tied = Checkpoint::parse(&config).unwrap();
-        let mut t = q8b_tensors();
+        let mut t = unpacked(json(Q8B_HEADER));
         let e = map_of(&tied, &t).err().expect("refused");
         assert!(e.contains("lm_head.weight") && e.contains("is true"), "{e}");
         t.retain(|(n, _)| !n.starts_with("lm_head."));

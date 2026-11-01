@@ -2170,95 +2170,52 @@ mod tests {
         /// The table of a dense Qwen3 file (`qwen3`) — the 8B's 32 query heads over 8 or the
         /// 32B's 64 — at the axes no registered row holds: every layer's q and k norms read,
         /// the rope turning NEOX halves with no frequency factors, an untied head unless `tied`,
-        /// and a dense SwiGLU FFN. The chat template is the plainest the reader takes.
+        /// and a dense SwiGLU FFN. It is [`Synthetic::llama`]'s table with its keys renamed, its
+        /// frequency factors dropped, the Qwen3 vocabulary and `heads` set, and the norms added.
         fn qwen3(heads: u64, tied: bool) -> Synthetic {
             const VOCAB: u64 = 151_936;
-            const KV: u64 = 8;
-            const HEAD: u64 = 128;
-            const HIDDEN: u64 = 2048;
-            const FF: u64 = 512;
-            let u = |k: &str, v: u32| (format!("qwen3.{k}"), Value::U32(v));
-            let mut kvs = vec![
-                (
-                    gguf::GENERAL_ARCHITECTURE.to_owned(),
-                    Value::String("qwen3".to_owned()),
-                ),
-                (
-                    "tokenizer.ggml.model".to_owned(),
-                    Value::String("gpt2".to_owned()),
-                ),
-                (
-                    "tokenizer.ggml.pre".to_owned(),
-                    Value::String("qwen2".to_owned()),
-                ),
-                (
-                    "tokenizer.chat_template".to_owned(),
-                    Value::String("{{ messages }}".to_owned()),
-                ),
-                u("block_count", 2),
-                u("context_length", 40_960),
-                u(
-                    "embedding_length",
-                    u32::try_from(HIDDEN).expect("the width fits u32"),
-                ),
-                u(
-                    "feed_forward_length",
-                    u32::try_from(FF).expect("the width fits u32"),
-                ),
-                u(
-                    "vocab_size",
-                    u32::try_from(VOCAB).expect("the vocabulary fits u32"),
-                ),
-                u(
-                    "attention.head_count",
-                    u32::try_from(heads).expect("the heads fit u32"),
-                ),
-                u(
-                    "attention.head_count_kv",
-                    u32::try_from(KV).expect("the heads fit u32"),
-                ),
-                u(
-                    "attention.key_length",
-                    u32::try_from(HEAD).expect("the width fits u32"),
-                ),
-                u(
-                    "attention.value_length",
-                    u32::try_from(HEAD).expect("the width fits u32"),
-                ),
-                u("rope.dimension_count", u32::try_from(HEAD).expect("fits")),
-                ("qwen3.rope.freq_base".to_owned(), Value::F32(1_000_000.0)),
-                (
-                    "qwen3.attention.layer_norm_rms_epsilon".to_owned(),
-                    Value::F32(1e-6),
-                ),
-            ];
-            kvs.reserve(1);
-            let mut t = Synthetic {
-                kvs,
-                tensors: Vec::new(),
-                attn_layer: 1,
-            };
-            let q = GgmlType::Q4_K;
-            let query = heads * HEAD;
-            let key = KV * HEAD;
-            t.add("token_embd.weight", &[HIDDEN, VOCAB], GgmlType::Q5_K);
-            if !tied {
-                t.add("output.weight", &[HIDDEN, VOCAB], GgmlType::Q5_K);
+            let mut t = Synthetic::llama(tied);
+            let hidden = t.tensor("token_embd.weight").1[0];
+            // The frequency factors are half a head wide.
+            let head = t.tensor("rope_freqs.weight").1[0] * 2;
+            for (key, _) in &mut t.kvs {
+                if let Some(suffix) = key.strip_prefix("llama.") {
+                    *key = format!("qwen3.{suffix}");
+                }
             }
-            t.add("output_norm.weight", &[HIDDEN], GgmlType::F32);
+            t = t
+                .drop("rope_freqs.weight")
+                .kv(
+                    gguf::GENERAL_ARCHITECTURE,
+                    Value::String("qwen3".to_owned()),
+                )
+                .kv("tokenizer.ggml.model", Value::String("gpt2".to_owned()))
+                .kv("tokenizer.ggml.pre", Value::String("qwen2".to_owned()))
+                .kv("qwen3.context_length", Value::U32(40_960))
+                .kv(
+                    "qwen3.vocab_size",
+                    Value::U32(u32::try_from(VOCAB).expect("the vocabulary fits u32")),
+                )
+                .kv(
+                    "qwen3.attention.head_count",
+                    Value::U32(u32::try_from(heads).expect("the heads fit u32")),
+                )
+                .kv("qwen3.rope.freq_base", Value::F32(1_000_000.0))
+                .kv("qwen3.attention.layer_norm_rms_epsilon", Value::F32(1e-6))
+                .dims("token_embd.weight", &[hidden, VOCAB]);
+            if !tied {
+                t = t.dims("output.weight", &[hidden, VOCAB]);
+            }
             for l in 0..2 {
-                let b = |stem: &str| format!("blk.{l}.{stem}");
-                t.add(&b("attn_norm.weight"), &[HIDDEN], GgmlType::F32);
-                t.add(&b("attn_q.weight"), &[HIDDEN, query], q);
-                t.add(&b("attn_q_norm.weight"), &[HEAD], GgmlType::F32);
-                t.add(&b("attn_k.weight"), &[HIDDEN, key], q);
-                t.add(&b("attn_k_norm.weight"), &[HEAD], GgmlType::F32);
-                t.add(&b("attn_v.weight"), &[HIDDEN, key], q);
-                t.add(&b("attn_output.weight"), &[query, HIDDEN], q);
-                t.add(&b("ffn_norm.weight"), &[HIDDEN], GgmlType::F32);
-                t.add(&b("ffn_gate.weight"), &[HIDDEN, FF], q);
-                t.add(&b("ffn_up.weight"), &[HIDDEN, FF], q);
-                t.add(&b("ffn_down.weight"), &[FF, HIDDEN], q);
+                t = t
+                    .dims(&format!("blk.{l}.attn_q.weight"), &[hidden, heads * head])
+                    .dims(
+                        &format!("blk.{l}.attn_output.weight"),
+                        &[heads * head, hidden],
+                    );
+                for stem in ["attn_q_norm.weight", "attn_k_norm.weight"] {
+                    t.add(&format!("blk.{l}.{stem}"), &[head], GgmlType::F32);
+                }
             }
             t
         }

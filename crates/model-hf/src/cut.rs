@@ -3293,20 +3293,27 @@ pub(crate) mod tests {
         assert_eq!(matrices, 4 * 7 + 2);
     }
 
-    /// The llama spec over the real 8B `config.json` edits the one field that
+    /// The llama and qwen3 specs over their real 8B `config.json` edit the one field that
     /// names the layers and nothing else: `num_hidden_layers` 4.
     #[test]
-    fn the_llama_spec_edits_the_real_8b_config_to_four_layers() {
-        let spec = llama_spec();
-        let real = String::from_utf8(gunzipped(
-            "quant-configs/mlx-community__Llama-3.1-8B-Instruct-4bit__config.json.gz",
-        ))
-        .unwrap();
-        let before: Value = serde_json::from_str(&real).unwrap();
-        let edited: Value = serde_json::from_str(&edit_config(&spec, &real).unwrap()).unwrap();
-        let mut want = before;
-        want["num_hidden_layers"] = json!(4);
-        assert_eq!(edited, want);
+    fn the_dense_specs_edit_the_real_8b_configs_to_four_layers() {
+        for (spec, fixture) in [
+            (
+                llama_spec(),
+                "quant-configs/mlx-community__Llama-3.1-8B-Instruct-4bit__config.json.gz",
+            ),
+            (
+                qwen3_spec(),
+                "quant-configs/mlx-community__Qwen3-8B-4bit__config.json.gz",
+            ),
+        ] {
+            let real = String::from_utf8(gunzipped(fixture)).unwrap();
+            let before: Value = serde_json::from_str(&real).unwrap();
+            let edited: Value = serde_json::from_str(&edit_config(&spec, &real).unwrap()).unwrap();
+            let mut want = before;
+            want["num_hidden_layers"] = json!(4);
+            assert_eq!(edited, want, "{fixture}");
+        }
     }
 
     /// The qwen3 spec over the real 8B folder's one shard header (907 tensors,
@@ -3423,21 +3430,5 @@ pub(crate) mod tests {
                 "{name}"
             );
         }
-    }
-
-    /// The qwen3 spec over the real 8B `config.json` edits the one field that
-    /// names the layers and nothing else: `num_hidden_layers` 4.
-    #[test]
-    fn the_qwen3_spec_edits_the_real_8b_config_to_four_layers() {
-        let spec = qwen3_spec();
-        let real = String::from_utf8(gunzipped(
-            "quant-configs/mlx-community__Qwen3-8B-4bit__config.json.gz",
-        ))
-        .unwrap();
-        let before: Value = serde_json::from_str(&real).unwrap();
-        let edited: Value = serde_json::from_str(&edit_config(&spec, &real).unwrap()).unwrap();
-        let mut want = before;
-        want["num_hidden_layers"] = json!(4);
-        assert_eq!(edited, want);
     }
 }
