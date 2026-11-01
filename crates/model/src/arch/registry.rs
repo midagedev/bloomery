@@ -382,13 +382,33 @@ pub static ROWS: &[ArchRow] = &[
 ];
 
 /// Every profile's cut fixture, in table order.
-pub static PROFILE_CUTS: &[ProfileCut] = &[ProfileCut {
-    // The dense Qwen3.8 NVFP4 checkpoint: only the NVFP4 gate clauses read it, and `qwen35` keeps its
-    // `self` row for the K-quant gates.
-    profile: "qwen38d",
-    arch: "qwen35",
-    cut: CutRow { family: "qwen38nv" },
-}];
+pub static PROFILE_CUTS: &[ProfileCut] = &[
+    ProfileCut {
+        // The dense Qwen3.8 NVFP4 checkpoint: only the NVFP4 gate clauses read it, and `qwen35`
+        // keeps its `self` row for the K-quant gates.
+        profile: "qwen38d",
+        arch: "qwen35",
+        cut: CutRow { family: "qwen38nv" },
+    },
+    ProfileCut {
+        // The Qwen3.8-Flash-Next NVFP4 checkpoint: only the NVFP4 gate reads it, and `qwen4exp`
+        // keeps its K-quant GGUF fixture for the other gates.
+        profile: "qwen4exp-nvfp4",
+        arch: "qwen4exp",
+        cut: CutRow {
+            family: "qwen38nvfp4",
+        },
+    },
+    ProfileCut {
+        // The same layers of the FP4-Local checkpoint, whose routed stacks store `csf` block
+        // scales: the NVFP4 gate's fixture tier loads it beside the NVFP4 cut.
+        profile: "qwen4exp-fp4l",
+        arch: "qwen4exp",
+        cut: CutRow {
+            family: "qwen38fp4l",
+        },
+    },
+];
 
 /// The row whose strings include `arch`.
 pub fn row_of(arch: &str) -> Option<&'static ArchRow> {

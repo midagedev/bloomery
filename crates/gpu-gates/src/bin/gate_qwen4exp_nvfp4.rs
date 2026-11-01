@@ -48,9 +48,20 @@
 //! actual arrays and fit the planned bound; the row reserve must equal the
 //! reader's columns, including both NVFP4 planes.
 //!
-//! Real-only: the fixture holds no NVFP4 stack. Loads the whole file on the card.
-//! `BLOOMERY_REF_MODEL` selects a split outside the recipe's model folder, or the checkpoint folder
-//! itself, which the load reads as stored (`qwen38_folder::open`, a build with the `checkpoint` feature).
+//! The real tier loads the whole file on the card. `BLOOMERY_REF_MODEL` selects a split outside the
+//! profile's model path, or the checkpoint folder itself, which the load reads as stored
+//! (`qwen38_folder::open`, a build with the `checkpoint` feature).
+//!
+//! The fixture tier runs the same clauses on the `qwen4exp-nvfp4` profile's cut (four layers of the
+//! checkpoint in their stored bits, `tools/fixture-cuts/qwen38nvfp4.json`) against the oracle's
+//! sets of that cut (refset `fx-hf-qwen4exp-nvfp4`), each oracle clause the fixture-oracle clause
+//! of its name `on the cut`. Every plan is made under the card budget the cut records
+//! (`BLOOMERY_CARD_BUDGET`), which holds every routed expert, so the plan is the same on any card
+//! of that budget; (s) falls short of (l)'s card bytes by an eighth of them instead of
+//! `SPLIT_HOST`. Then the `qwen4exp-fp4l` profile's cut (the same layers of
+//! `nvidia/Qwen3.8-Flash-Next-FP4-Local`, whose routed stacks keep their `csf` block scales and
+//! whose dense projections are MXFP8) is loaded under the same budget: no oracle set holds its
+//! forward, so (l), the route taps' self-consistency of (c) and (rt) run on it.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -128,24 +139,35 @@ mod gate {
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::flip;
     use bloomery_gpu_gates::generate::Place;
+    use bloomery_gpu_gates::tier::{self, Tag, Tier};
     use bloomery_gpu_gates::{
         GateError, RefManifest, checks_failed, data_dir, ref_model_path, verdict,
     };
-    use bloomery_levers::HostCfg;
+    use bloomery_levers::{CardBudget, HostCfg};
     use gguf::GgmlType;
     use model::arch::models::headpick::HeadSet;
     use model::arch::qwen35moe::names;
     use model::arch::qwen35moe::place::{Experts, PlanInputs};
     use model::placement::{ModelTensors, PlanLevers, Role};
-    use refset::arch::qwen4exp::nvfp4::{BATCH, BATCH_BF16, D3K, D3K_BF16, HF};
+    use refset::arch::qwen4exp::nvfp4::{BATCH, BATCH_BF16, D3K, D3K_BF16, FX, HF, PROFILE};
     use runtime::Advance;
 
     /// Cache rows: D3K's step at position 3,000, with room.
     const CTX: usize = 3072;
 
-    /// The card bytes (s)'s budget falls short of (l)'s plan by: a few of each layer's routed
-    /// experts.
+    /// The gate's name: its first line and the `what` of its refusals.
+    const GATE: &str = "gate_qwen4exp_nvfp4";
+
+    /// The card bytes the real tier's (s) budget falls short of (l)'s plan by: a few of each
+    /// layer's routed experts.
     const SPLIT_HOST: u64 = 8 << 30;
+
+    /// The clauses judged against the oracle's sets: the real file's in the real tier, the cut's
+    /// in the fixture tier ([`oracle_clause`]).
+    const ORACLE: [&str; 6] = ["(c)", "(p)", "(g)", "(t)", "(s)", "(rs)"];
+
+    /// The model profile of the FP4-Local cut (`tools/fixture-dirs.tsv`).
+    const FP4L_PROFILE: &str = "qwen4exp-fp4l";
 
     /// What the clauses read of the file's header: the trunk's layers, a layer output's values
     /// (every stream of the hidden width), the routed experts and the slots a token takes, and
@@ -179,11 +201,50 @@ mod gate {
         routes: Vec<Vec<RouteTap>>,
     }
 
-    /// The set `name` of the family, checked against it.
+    /// The set `name` of [`HF`] in the real tier, its twin on the cut (`fx_<name>` of [`FX`]) in
+    /// the fixture tier, checked against its family.
     fn set(name: &str) -> Result<RefManifest, GateError> {
-        let man = RefManifest::open(&HF.path_in(&data_dir(), name), &HF)?;
-        refset::arch::qwen4exp::check_inputs(&man, name)?;
+        let (name, family, path) = match Tier::from_env()? {
+            Tier::Real => (name.to_string(), &HF, HF.path_in(&data_dir(), name)),
+            Tier::Fixture => {
+                let fx = format!("fx_{name}");
+                let path = tier::fixture_set(&fx, &FX, &fx)?;
+                (fx, &FX, path)
+            }
+        };
+        let man = RefManifest::open(&path, family)?;
+        refset::arch::qwen4exp::check_inputs(&man, &name)?;
         Ok(man)
+    }
+
+    /// The fixture-oracle name of the oracle clause `clause`.
+    fn on_cut(clause: &str) -> String {
+        format!("{clause} on the cut")
+    }
+
+    /// Whether this tier runs the oracle clause `clause`: in the real tier against the real
+    /// file's sets, in the fixture tier as the fixture-oracle clause [`on_cut`].
+    fn oracle_clause(clause: &str) -> Result<bool, GateError> {
+        match Tier::from_env()? {
+            Tier::Real => tier::run_clause(clause, Tag::Oracle),
+            Tier::Fixture => tier::run_clause(&on_cut(clause), Tag::FixtureOracle),
+        }
+    }
+
+    /// The levers every plan is made under: none in the real tier; in the fixture tier the card
+    /// budget the cut records, which the tier exports as `BLOOMERY_CARD_BUDGET`.
+    fn plan_levers(levers: &bloomery_levers::Levers) -> Result<PlanLevers, GateError> {
+        match (Tier::from_env()?, levers.card_budget()) {
+            (Tier::Real, _) => Ok(PlanLevers::default()),
+            (Tier::Fixture, CardBudget::Every(b)) => Ok(PlanLevers {
+                card_budget_bytes: CardBudget::Every(b),
+            }),
+            (Tier::Fixture, other) => Err(format!(
+                "{GATE}: BLOOMERY_CARD_BUDGET is {other:?}; the fixture tier sets it to the one \
+                 byte count the cut records"
+            )
+            .into()),
+        }
     }
 
     /// The model at `path`: a split of architecture `qwen4exp` ([`open_split`]), or the checkpoint
@@ -196,12 +257,12 @@ mod gate {
         open_split(path).map(Model38::from)
     }
 
-    /// (l): the plan on the one visible card, every routed expert on it, and the load under
-    /// `host`.
+    /// (l): the plan on the one visible card under `plan_levers`, every routed expert on it, and
+    /// the load under `host`.
     fn open(
         path: &Path,
         d: &Dims,
-        levers: &bloomery_levers::Levers,
+        (levers, plan_levers): (&bloomery_levers::Levers, &PlanLevers),
         host: HostCfg,
     ) -> Result<(Qwen38Model, bool), GateError> {
         let file = model_of(path)?;
@@ -211,7 +272,6 @@ mod gate {
         };
         let t = Instant::now();
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
-        let plan_levers = PlanLevers::default();
         if levers.draft() == Some("mtp") {
             let inputs = PlanInputs::describe(file.header())?;
             let draft = qwen38_folder::draft(path)?;
@@ -230,7 +290,7 @@ mod gate {
             let plan = inputs.plan_mtp_with_slots(
                 &machine,
                 (CTX as u64, u64::try_from(ub)?),
-                &plan_levers,
+                plan_levers,
                 &mtp,
                 Experts::Card,
                 1,
@@ -254,7 +314,7 @@ mod gate {
             ub,
             experts: Experts::Card,
             slots: 1,
-            plan_levers: &plan_levers,
+            plan_levers,
             host,
             room: None,
             residency: Residency::Off,
@@ -307,6 +367,17 @@ mod gate {
         Ok(r)
     }
 
+    /// The route taps of `r` that are not the top `n_used` of their own `n_expert` logits.
+    fn inconsistent_routes(r: &Run, d: &Dims) -> usize {
+        r.routes
+            .iter()
+            .flatten()
+            .filter(|t| {
+                t.logits.len() != d.n_expert || !flip::picks_its_top(&t.ids, &t.logits, d.n_used)
+            })
+            .count()
+    }
+
     /// (c) on `man`: the route taps' self-consistency, the layer outputs and flips against the
     /// oracle's, and the last argmax; the verdict, or `true` with the lines printed only when
     /// `judged` is false.
@@ -318,14 +389,7 @@ mod gate {
         judged: bool,
     ) -> Result<bool, GateError> {
         let arm = man.dir.display().to_string();
-        let inconsistent = r
-            .routes
-            .iter()
-            .flatten()
-            .filter(|t| {
-                t.logits.len() != d.n_expert || !flip::picks_its_top(&t.ids, &t.logits, d.n_used)
-            })
-            .count();
+        let inconsistent = inconsistent_routes(r, d);
         let table = layer_table(man, &r.taps, d.row, d.n_layer)?;
         let routes = (0..d.n_layer)
             .map(|l| IkRoute::read(man, l, d.n_expert, d.n_used))
@@ -554,12 +618,12 @@ mod gate {
     fn traced(
         path: &Path,
         d: &Dims,
-        levers: &bloomery_levers::Levers,
+        levers: (&bloomery_levers::Levers, &PlanLevers),
         (toks, want): (&[u32], &[Vec<f32>]),
     ) -> Result<bool, GateError> {
         let host = HostCfg {
             route_trace: true,
-            ..levers.host()
+            ..levers.0.host()
         };
         let mut m = match open(path, d, levers, host) {
             Ok((m, _)) => m,
@@ -626,7 +690,7 @@ mod gate {
     fn split(
         path: &Path,
         d: &Dims,
-        levers: &bloomery_levers::Levers,
+        (levers, whole): (&bloomery_levers::Levers, &PlanLevers),
         (batch, toks, card): (&RefManifest, &[u32], &[Vec<f32>]),
         vocab: usize,
     ) -> Result<bool, GateError> {
@@ -635,21 +699,24 @@ mod gate {
             return Err(format!("--place a resolved to {} cards, not one", specs.len()).into());
         };
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
-        let whole = PlanLevers::default();
         let mut open = Open38 {
             card: spec,
             ctx: CTX,
             ub,
             experts: Experts::Card,
             slots: 1,
-            plan_levers: &whole,
+            plan_levers: whole,
             host: levers.host(),
             room: None,
             residency: Residency::Off,
             kv: KvQ8::F16,
         };
         let card_bytes = open.plan(model_of(path)?)?.facts().card_bytes;
-        let budget_bytes = (card_bytes + spec.margin()).saturating_sub(SPLIT_HOST);
+        let short = match Tier::from_env()? {
+            Tier::Real => SPLIT_HOST,
+            Tier::Fixture => card_bytes / 8,
+        };
+        let budget_bytes = (card_bytes + spec.margin()).saturating_sub(short);
         let budget = PlanLevers {
             card_budget_bytes: Some(budget_bytes).into(),
         };
@@ -694,7 +761,8 @@ mod gate {
             verdict(ok)
         );
         drop(m);
-        let staged = reseeded(open, path, &n_l, d, (batch, toks), vocab)?;
+        let staged =
+            !oracle_clause("(rs)")? || reseeded(open, path, &n_l, d, (batch, toks), vocab)?;
         Ok(ok && staged)
     }
 
@@ -909,10 +977,14 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let levers = bloomery_levers::at_main(&[
-            bloomery_levers::DRAFT,
-            bloomery_gpu::arch::qwen3moe::ubatch::UBATCH_ENV,
-        ])?;
+        let tier = Tier::from_env()?;
+        let levers = bloomery_levers::at_main(&tier::acts_in(
+            tier,
+            &[
+                bloomery_levers::DRAFT,
+                bloomery_gpu::arch::qwen3moe::ubatch::UBATCH_ENV,
+            ],
+        ))?;
         if let Some(word) = levers.draft()
             && !matches!(word, "off" | "mtp")
         {
@@ -920,7 +992,10 @@ mod gate {
                 format!("BLOOMERY_DRAFT={word:?}: this gate supports only off or mtp").into(),
             );
         }
-        let path = ref_model_path()?;
+        let path = match tier {
+            Tier::Real => ref_model_path()?,
+            Tier::Fixture => tier::cut(PROFILE)?,
+        };
         let args: Vec<_> = std::env::args().skip(1).collect();
         if args == ["--placement"] {
             return placement(&path, &levers);
@@ -928,12 +1003,13 @@ mod gate {
         if !args.is_empty() {
             return Err("expected no arguments or --placement".into());
         }
+        let plan = plan_levers(&levers)?;
         println!("model {}", path.display());
         let d = dims(&path)?;
         if levers.draft() == Some("mtp") {
             let batch = set(d.dense.batch.0)?;
             let (_, toks, _) = batch.step()?;
-            let (m, mut ok) = open(&path, &d, &levers, levers.host())?;
+            let (m, mut ok) = open(&path, &d, (&levers, &plan), levers.host())?;
             ok &= mtp(m, toks)?;
             return if ok { Ok(()) } else { Err(checks_failed()) };
         }
@@ -967,31 +1043,91 @@ mod gate {
             }
         }
         let (_, toks, _) = batch.step()?;
-        let (mut m, mut ok) = open(&path, &d, &levers, levers.host())?;
+        tier::sc("(l)")?;
+        let (mut m, mut ok) = open(&path, &d, (&levers, &plan), levers.host())?;
         let vocab = m.body("run")?.vocab();
         m.reset()?;
         let r = run_steps(&mut m, toks)?;
-        ok &= free(&batch, &r, &d, vocab, true)?;
-        ok &= free(&batch_other, &r, &d, vocab, false)?;
-        ok &= batch_by(
-            &mut m,
-            toks,
-            vocab,
-            ("p", Prompt38::Pass, "one pass"),
-            &batch,
-        )?;
-        ok &= batch_by(
-            &mut m,
-            toks,
-            vocab,
-            ("g", Prompt38::Gemm, "one ubatch"),
-            &batch,
-        )?;
-        ok &= d3k_step(&mut m, &d, vocab, (d3k_name, &d3k), (other_d3k, &d3k_other))?;
+        if oracle_clause("(c)")? {
+            ok &= free(&batch, &r, &d, vocab, true)?;
+            ok &= free(&batch_other, &r, &d, vocab, false)?;
+        }
+        if oracle_clause("(p)")? {
+            ok &= batch_by(
+                &mut m,
+                toks,
+                vocab,
+                ("p", Prompt38::Pass, "one pass"),
+                &batch,
+            )?;
+        }
+        if oracle_clause("(g)")? {
+            ok &= batch_by(
+                &mut m,
+                toks,
+                vocab,
+                ("g", Prompt38::Gemm, "one ubatch"),
+                &batch,
+            )?;
+        }
+        if oracle_clause("(t)")? {
+            ok &= d3k_step(&mut m, &d, vocab, (d3k_name, &d3k), (other_d3k, &d3k_other))?;
+        }
         drop(m);
-        ok &= split(&path, &d, &levers, (&batch, toks, &r.logits), vocab)?;
-        ok &= traced(&path, &d, &levers, (toks, &r.logits))?;
+        if oracle_clause("(s)")? {
+            ok &= split(
+                &path,
+                &d,
+                (&levers, &plan),
+                (&batch, toks, &r.logits),
+                vocab,
+            )?;
+        }
+        tier::sc("(rt)")?;
+        ok &= traced(&path, &d, (&levers, &plan), (toks, &r.logits))?;
+        match tier {
+            Tier::Real => {
+                for clause in ORACLE {
+                    tier::run_clause(&on_cut(clause), Tag::FixtureOracle)?;
+                }
+            }
+            Tier::Fixture => ok &= fp4_local((&levers, &plan), toks)?,
+        }
+        tier::expect_fixture_oracle(GATE, ORACLE.len())?;
+        println!("{}", tier::tally_line());
         if ok { Ok(()) } else { Err(checks_failed()) }
+    }
+
+    /// The FP4-Local cut under `levers`' plan, which holds every routed expert on the card (the
+    /// host does not read a `csf` block scale): (l), `toks` by eager steps with every route tap
+    /// the top of its own logits and every logit finite, and (rt) against those steps.
+    fn fp4_local(
+        levers: (&bloomery_levers::Levers, &PlanLevers),
+        toks: &[u32],
+    ) -> Result<bool, GateError> {
+        let path = tier::cut(FP4L_PROFILE)?;
+        println!("FP4-Local cut {}", path.display());
+        let d = dims(&path)?;
+        tier::sc("(l) FP4-Local")?;
+        let (mut m, mut ok) = open(&path, &d, levers, levers.0.host())?;
+        m.reset()?;
+        let r = run_steps(&mut m, toks)?;
+        drop(m);
+        tier::sc("(c) FP4-Local route taps")?;
+        let inconsistent = inconsistent_routes(&r, &d);
+        let finite = r.logits.iter().flatten().all(|v| v.is_finite());
+        let held = inconsistent == 0 && finite;
+        println!(
+            "(c) FP4-Local: {} steps, route taps not the top {} of their own logits {inconsistent}, \
+             every logit finite {finite} {}",
+            toks.len(),
+            d.n_used,
+            verdict(held)
+        );
+        ok &= held;
+        tier::sc("(rt) FP4-Local")?;
+        ok &= traced(&path, &d, levers, (toks, &r.logits))?;
+        Ok(ok)
     }
 
     #[cfg(test)]

@@ -221,13 +221,8 @@ mod nv {
         };
         // A profile's cut is read only by the clauses that name it (tools/fixture-dirs.tsv): the folder is the table's
         // cut of NV_PROFILE, not the model path the tier resolves by architecture (qwen35 has no fixture of its own).
-        let first = refset::fixture::first_shard(NV_PROFILE)?;
-        let folder = Path::new(&first)
-            .parent()
-            .ok_or_else(|| format!("{GATE}: the cut's first shard {first} has no folder"))?
-            .to_path_buf();
+        let folder = tier::cut(NV_PROFILE)?;
         println!("{GATE} (fixture tier): the cut {}", folder.display());
-        println!("  {}", refset::fixture::line(Path::new(&first))?.trim_end());
         let twin = Path::new(NV_TWIN);
         if !twin.is_file() {
             return Err(format!(

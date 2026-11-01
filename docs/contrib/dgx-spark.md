@@ -132,7 +132,8 @@ the folder to start with. On the `sm_121a` build the routed experts' prompt prod
 17/16 B a value against f16's 2, and the attention store is 773,279,360 B against 967,921,280 B at 16,896 positions on
 FP4-Local (the index keys stay f16). `setup` names the format as `cache=`. The NVFP4 folder's gate,
 `gate-gpu-qwen4exp-nvfp4`, runs only on a card that holds every expert: set `BLOOMERY_CARD_ALL_EXPERTS=1` there; a
-smaller card defers it by name.
+smaller card defers it by name. `BLOOMERY_TIER=fixture just gate-gpu-qwen4exp-nvfp4-cut` runs its clauses on a four-layer
+cut of each folder, which any card holds.
 
 **Slots and their context.** The server has one slot unless `--parallel N` asks for N. With no `--ctx-size`, each slot
 asks the trained 262,144 positions and, where the GB10's one memory pool cannot hold that plan, takes the largest

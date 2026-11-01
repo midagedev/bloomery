@@ -175,6 +175,7 @@ gate-gpu-qwen4exp-mtp	family	qwen4exp	draft	drafts_mtp
 gate-gpu-qwen4exp-mtp-share	family	qwen4exp	draft	drafts_mtp
 gate-gpu-qwen4exp-mtp-input	family	qwen4exp	by-hand	drafts_mtp
 gate-gpu-qwen4exp-nvfp4	family	qwen4exp	by-hand	quant_mxfp4
+gate-gpu-qwen4exp-nvfp4-cut	family	qwen4exp	e2e	checkpoint_folder+quant_mxfp4+residency
 gate-gpu-radio-tower	family	nemotron_h	media	serve_media
 gate-gpu-routed-legs	common		tier	tier_legs+placement_sizing
 gate-gpu-rope-writers	common		kernel	attn_gqa
