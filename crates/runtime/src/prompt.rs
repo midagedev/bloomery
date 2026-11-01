@@ -2,7 +2,7 @@
 //! batches decides the same way, once — the feed's two modes
 //! ([`PrefillMode`]), what a call's last row is for ([`CallEnd`]), how a
 //! call is cut into batches ([`batches`], [`call_batches`]), units
-//! ([`call_units`], [`fold_units`]) and chunks ([`chunks`]), how a call's batches are walked together ([`group_sets`], [`groups`],
+//! ([`call_units`], [`fold_units`], [`fold_marks`]) and chunks ([`chunks`]), how a call's batches are walked together ([`group_sets`], [`groups`],
 //! [`check_group`], [`refuse_dense_after_routed`]) and the call's end
 //! ([`end_of`], [`call_end`]).
 //!
@@ -161,12 +161,19 @@ pub fn call_units(from: u32, n: usize, width: usize, marks: &[u32]) -> Vec<(usiz
 /// inside the unit.
 #[must_use]
 pub fn fold_units(from: u32, n: usize, width: usize, marks: &[u32]) -> Option<Vec<(usize, bool)>> {
-    let (&end, inner) = marks.split_last()?;
-    if end as usize + 1 != from as usize + n {
-        return None;
-    }
-    let units = call_units(from, n, width, inner);
+    let units = call_units(from, n, width, fold_marks(from, n, marks)?);
     units.last().is_some_and(|&(m, _)| m >= 2).then_some(units)
+}
+
+/// The marks a closing call ([`CallEnd::Close`]) of `n` ids from `from`
+/// takes before its last unit when that id folds into it: `marks` (the
+/// call's less its last id, ascending) without the last, when that one is
+/// the last id's position. `None` otherwise. Which units can take the end
+/// mark inside them is the body's ([`fold_units`] for units of `width`).
+#[must_use]
+pub fn fold_marks(from: u32, n: usize, marks: &[u32]) -> Option<&[u32]> {
+    let (&end, inner) = marks.split_last()?;
+    (end as usize + 1 == from as usize + n).then_some(inner)
 }
 
 /// The chunks of a batch of `t` tokens: runs of `chunk` from its first, the

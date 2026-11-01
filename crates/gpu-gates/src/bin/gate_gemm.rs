@@ -318,10 +318,12 @@
 //!   the eager bits, an input value or a weight scale byte the tensor cores
 //!   cannot take sending its column or row to the exact tile, and stale or
 //!   misplaced forms refused by name.
-//! - `zgate`: the BF16 and (native build) MXFP8 W8A8 projections' sigmoid
+//! - `zgate`: the BF16 and (native build) MXFP8 W8A8 projections' gated
 //!   norm epilogue against the separate product and norm, bit for bit at
 //!   M=1/8/9/129/4095, including exact replay of a refused column or weight
-//!   row, non-finite inputs, graph replay, sentinel tails and a token-unit cut.
+//!   row, non-finite inputs, graph replay, sentinel tails and a token-unit cut,
+//!   under the sigmoid gate and the SiLU gate (M=1/9/129 and a NaN norm input)
+//!   the tail names.
 //!   `--bench-kernels --bench-arm zgate` prices both arms of each form at 48
 //!   heads of 128, K=2560 and M=4095 through the shared burst and graph timing
 //!   owner.
@@ -8136,25 +8138,36 @@ mod gate {
             let mut ok = true;
             for &form in forms {
                 let mx = form == MmaForm::Mxfp8;
-                let cases: &[(usize, usize, usize, &str)] = if timed {
-                    &[(6144, 2560, 4095, "normal")]
+                // The gate is the model's (Qwen3.8 sigmoid, Qwen3.5/3.6
+                // SiLU): the epilogue gates by the tail's, so the SiLU rows
+                // equal the split SiLU norm as the sigmoid ones do.
+                // FAIL-first: an epilogue that gates by sigmoid alone.
+                let (sig, silu) = (GdnGate::Sigmoid, GdnGate::Silu);
+                let cases: &[(usize, usize, usize, &str, GdnGate)] = if timed {
+                    &[(6144, 2560, 4095, "normal", sig)]
                 } else {
                     &[
-                        (128, 64, 1, "normal"),
-                        (256, 128, 8, "normal"),
-                        (256, 128, 9, "normal"),
-                        (256, 192, 129, "normal"),
-                        (6144, 2560, 4095, "normal"),
-                        (256, 128, 9, "nan_x"),
-                        (256, 128, 9, "range_x"),
-                        (256, 128, 9, "overflow_z"),
-                        (256, 128, 9, "nan_o"),
-                        (256, 128, 9, "square_overflow"),
-                        (256, 128, 9, "nan_gain"),
-                        (256, 128, 9, "big_gain"),
+                        (128, 64, 1, "normal", sig),
+                        (256, 128, 8, "normal", sig),
+                        (256, 128, 9, "normal", sig),
+                        (256, 192, 129, "normal", sig),
+                        (6144, 2560, 4095, "normal", sig),
+                        (256, 128, 9, "nan_x", sig),
+                        (256, 128, 9, "range_x", sig),
+                        (256, 128, 9, "overflow_z", sig),
+                        (256, 128, 9, "nan_o", sig),
+                        (256, 128, 9, "square_overflow", sig),
+                        (256, 128, 9, "nan_gain", sig),
+                        (256, 128, 9, "big_gain", sig),
+                        // PIN(2026-11-02): the epilogue gates by SiLU too; these SiLU cases
+                        // replace the refusal of a SiLU gate.
+                        (128, 64, 1, "normal", silu),
+                        (256, 128, 9, "normal", silu),
+                        (256, 192, 129, "normal", silu),
+                        (256, 128, 9, "nan_o", silu),
                     ]
                 };
-                for &(rows, k, n, edge) in cases {
+                for &(rows, k, n, edge, gate) in cases {
                     // An MXFP8 column holds whole 128-value scale words.
                     let k = if mx { k.next_multiple_of(128) } else { k };
                     // MXFP8: random E4M3 codes (no NaN code) on block scales
@@ -8262,7 +8275,7 @@ mod gate {
                         let tail = NormGateTail {
                             o,
                             w: &gain,
-                            gate: GdnGate::Sigmoid,
+                            gate,
                             eps: 1e-6,
                             fault: sink,
                             y,
@@ -8294,7 +8307,7 @@ mod gate {
                             o: &o,
                             z: &z,
                             w: &gain,
-                            gate: GdnGate::Sigmoid,
+                            gate,
                             eps: 1e-6,
                             n_v: rows / 128,
                             m: n,
@@ -8427,7 +8440,7 @@ mod gate {
                         && fault_ok
                         && overflow_reached;
                     println!(
-                        "zgate form={form:?} rows={rows} K={k} M={n} edge={edge} split_bits={same} out_form_bits={form_bits} eager_graph={graph_bits} scratch_kept={scratch_kept} unit_cut={cut_bits} scratch_reuse={reuse_bits} fault_ok={fault_ok} overflow_reached={overflow_reached} {}",
+                        "zgate form={form:?} gate={gate:?} rows={rows} K={k} M={n} edge={edge} split_bits={same} out_form_bits={form_bits} eager_graph={graph_bits} scratch_kept={scratch_kept} unit_cut={cut_bits} scratch_reuse={reuse_bits} fault_ok={fault_ok} overflow_reached={overflow_reached} {}",
                         verdict(pass)
                     );
                     ok &= pass;
@@ -8537,29 +8550,6 @@ mod gate {
                     y: &mut y,
                 },
             ));
-            // The epilogue's norm gates by sigmoid alone: a whole head under
-            // a SiLU tail is refused by name, and the site runs that norm
-            // apart.
-            let head = DeviceTensor::upload(stream, &vec![0x3f80_3f80u32; 128 * 32], 128, 32)?;
-            let silu = says(
-                g32.enqueue_bf16_mma_norm_gate(
-                    stream,
-                    &head,
-                    &x,
-                    &act,
-                    1,
-                    &mut z,
-                    NormGateTail {
-                        o: &o,
-                        w: &gain,
-                        gate: GdnGate::Silu,
-                        eps: 1e-6,
-                        fault: sink,
-                        y: &mut y,
-                    },
-                ),
-                "gates by sigmoid",
-            );
             // The MXFP8 entry refuses as the product entry does: a partial
             // head, a misaligned value plane, other scales and a stale form;
             // and an output scratch of another K or without the MXFP8 form.
@@ -8679,10 +8669,10 @@ mod gate {
                 fault: sink, y: &mut y,
             }), Err(e) if e.to_string().contains("overflows"));
             println!(
-                "zgate native={native} partial_head_refused={partial_head} silu_refused={silu} size_overflow_refused={overflow} {}",
-                verdict(partial_head && silu && overflow)
+                "zgate native={native} partial_head_refused={partial_head} size_overflow_refused={overflow} {}",
+                verdict(partial_head && overflow)
             );
-            Ok(ok && partial_head && silu && overflow && mx_refused && cols_ok)
+            Ok(ok && partial_head && overflow && mx_refused && cols_ok)
         }
 
         /// Ragged dense MMA tiles, tails, repeatability and graph replay.

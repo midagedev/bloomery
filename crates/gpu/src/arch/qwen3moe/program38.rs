@@ -84,9 +84,8 @@ use crate::host::run::HostRun;
 use crate::host::{BatchLeg, StepLeg};
 use crate::kv_format::KvQ8;
 use crate::linear::conv::{ConvArgs, ConvRows};
-use crate::linear::delta::{DeltaArgs, DeltaLanesArgs};
 use crate::linear::norm_gate::NormGateArgs;
-use crate::linear::seqs::{GdnSeq, GdnSeqsArgs};
+use crate::linear::seqs::{GdnCall, GdnRun, GdnSeq, GdnSeqsArgs};
 use crate::linear::{self, LinearKernels};
 use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::mtp::MtpKernels;
@@ -95,6 +94,7 @@ use crate::q38::{CardSharedAddArgs, EmbedIo, Q38Kernels, SharedAddArgs};
 use crate::qsa::{
     KeyAppendArgs, PoolArgs, PoolSeqsArgs, QsaKernels, QsaSeq, SelectArgs, SelectSeqsArgs,
 };
+use crate::recur::RecStore;
 use crate::rope_neox::{PartialNeoxSeqsArgs, RopeNeoxKernels};
 use crate::rows::RowKernels;
 use crate::site::{self, ByName, ByNameKernels, Out};
@@ -485,19 +485,11 @@ fn rows_mut<'b, T>(
     WindowMut::of_mut(parent, r.start * width * size_of::<T>(), r.len() * width)
 }
 
-/// A delta store's state and ring, stamps and verify record, lent for one
-/// launch.
-type RecOf<'a> = (
-    &'a mut super::scratch::RecStore,
-    &'a mut DeviceBuffer<u32>,
-    &'a mut DeviceBuffer<f32>,
-);
-
-/// Layer `l`'s delta store of `stores`: its state, ring, stamps and verify
-/// record.
-fn rec_of(stores: &mut [Store38], l: usize) -> Result<RecOf<'_>, GpuError> {
+/// Layer `l`'s delta store of `stores`: its state, ring, stamps, carry and
+/// verify record.
+fn rec_of(stores: &mut [Store38], l: usize) -> Result<&mut RecStore, GpuError> {
     match stores.get_mut(l) {
-        Some(Store38::Rec { rec, stamp, record }) => Ok((rec, stamp, record)),
+        Some(Store38::Rec(rec)) => Ok(rec),
         Some(Store38::Qsa { .. }) => Err(GpuError::shape(
             WHAT,
             format!("layer {l}'s plan and store are of two kinds"),
@@ -521,7 +513,7 @@ fn qsa_of(
 > {
     match stores.get_mut(l) {
         Some(Store38::Qsa { kv, ring, pooled }) => Ok((&mut **kv, ring, &mut **pooled)),
-        Some(Store38::Rec { .. }) => Err(GpuError::shape(
+        Some(Store38::Rec(_)) => Err(GpuError::shape(
             WHAT,
             format!("layer {l}'s plan and store are of two kinds"),
         )),
@@ -1117,12 +1109,11 @@ fn gdn(
             Seqs38::Slots(seqs) => {
                 let mut recs = Vec::with_capacity(seqs.len());
                 for q in seqs.iter_mut() {
-                    let (rec, stamp, record) = rec_of(q.stores, l)?;
                     recs.push(GdnSeq {
                         rows: q.rows.clone(),
                         lane: lane_of(&q.io)?,
-                        rec,
-                        stamped: Some((stamp, each.then_some(record))),
+                        rec: rec_of(q.stores, l)?,
+                        verify: each,
                     });
                 }
                 let (b, a) = beta_alpha_rows(&g.ba, m)?;
@@ -1216,11 +1207,11 @@ pub(super) fn beta_alpha_rows(
 /// A delta layer's launches bound to one sequence, over `io`'s `m` rows:
 /// the conv over the store's ring `r.ring`, then the delta step over its
 /// state, its lane's stamp and the lane word `lane`: in place, or a verify
-/// recorded into the store's record when `each`.
+/// recorded into the store's record when `each` (`linear::seqs::enqueue_gdn`).
 fn gdn_seq(
     c: &Ctx38<'_>,
     gp: &GdnPlan,
-    ((r, stamp, record), lane): (RecOf<'_>, &DeviceBuffer<u32>),
+    (r, lane): (&mut RecStore, &DeviceBuffer<u32>),
     io: GdnIo<'_>,
     (m, each): (usize, bool),
     sink: FaultSink,
@@ -1258,31 +1249,19 @@ fn gdn_seq(
             ring: &mut r.ring,
         },
     )?;
-    let args = DeltaLanesArgs {
-        delta: DeltaArgs {
-            qkv: conv,
-            beta,
-            decay,
-            lane,
-            lane_at: 0,
-            lanes: r.lanes,
-            shape: GDN,
-            m,
-            fault: sink,
-            o,
-            state: &mut r.state,
-        },
-        each,
+    let call = GdnCall {
+        qkv: conv,
+        beta,
+        decay,
+        lane,
         pos,
-        stamp,
+        shape: GDN,
+        m,
+        fault: sink,
+        o,
     };
-    if each {
-        lin.delta
-            .enqueue_delta_recovery(stream, args, r.carry.as_ref(), record)
-    } else {
-        lin.delta
-            .enqueue_delta_lanes(stream, args, r.carry.as_ref())
-    }
+    let run = if each { GdnRun::Verify } else { GdnRun::Step };
+    linear::seqs::enqueue_gdn(lin, stream, call, r, run)
 }
 
 /// A delta layer's gated norm and output projection over every row, into

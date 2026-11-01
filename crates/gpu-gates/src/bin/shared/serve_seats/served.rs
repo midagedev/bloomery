@@ -373,6 +373,17 @@ where
     B: Prompt + Keep + Slots + 'static,
     B::Seq: 'static,
 {
+    /// The lookup's table, for a round of several slots' lookup windows
+    /// (`serve_seats::rounds::pass_rows_lookup`); `None` under the DSpark
+    /// draft or none.
+    #[allow(
+        dead_code,
+        reason = "the qwen3 seat's lookup rounds read it; the V4.1 binary that includes this file serves no such seat"
+    )]
+    pub(crate) fn lookups_mut(&mut self) -> Option<&mut Lookups<Session<B>>> {
+        self.lookup.as_mut()
+    }
+
     /// No draft: every call is the seat's plain one.
     pub fn off() -> Self {
         ServedDraft {

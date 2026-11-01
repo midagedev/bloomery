@@ -176,7 +176,7 @@ generate_ds41   gdn_delta_recovery                       0           0
 generate_ds41   gdn_delta_recovery_layers                0           0
 generate_ds41   gdn_delta_recovery_seqs                  0           0
 generate_ds41   gdn_delta_prepared                       0           0
-generate_ds41   gdn_delta_seqs                           0           0
+# PIN(2026-11-02): gdn_delta_seqs removed; every sequence caller uses a stamped store.
 generate_ds41   gdn_norm_gate                            0           0
 generate_ds41   gdn_norm_gate_sigmoid                    0           0
 # PIN(2026-11-01): gdn_norm_gate_q32 and _q128 are gdn_norm_gate_sigmoid's body with a quantizer's store, pinned at its values until a scan on this table's arch and capability.

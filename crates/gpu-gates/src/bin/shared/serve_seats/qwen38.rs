@@ -458,7 +458,7 @@ use bloomery_gpu_gates::bind::{
     AutoSlots, CacheRam, Cached, ChatSurface, Landing, Listen, Pass, PutBack, Seat, SeatEngine,
     SlotFlags, SlotPassRow, SlotStep, SlotsFrom, TemplateFile, Vocab, arm_screen, begin,
     bind_server, eprint_noted, model_props, note_line, parallel_line, place_word, placement_of,
-    prefill_then_step, put_back, seat_failure, slots_of,
+    prefill_closing, put_back, seat_failure, slots_of,
 };
 use bloomery_gpu_gates::generate::{
     BreakEven, DraftYield, FloorShort, Lane, Place, draft_yield, lane_of,
@@ -3339,14 +3339,9 @@ impl Seat for Q38 {
     /// A call of passes, a last ubatch that would hold that id alone and
     /// `BLOOMERY_PREFILL=steps` take the call less that id, then its step.
     fn prefill_next(&mut self, ids: &[u32], row: Option<&mut [f32]>) -> Result<u32, GateError> {
-        if self.feed == Prompt38::Step || !self.s.model().closes_by_ubatch(ids.len(), self.feed)? {
-            return prefill_then_step(self, ids, row);
-        }
-        let next = self.prompt_call(ids, CallEnd::Close)?;
-        if let Some(row) = row {
-            self.logits_into(row)?;
-        }
-        Ok(next)
+        let closes =
+            self.feed != Prompt38::Step && self.s.model().closes_by_ubatch(ids.len(), self.feed)?;
+        prefill_closing(self, ids, row, closes)
     }
 
     /// The resident encoder's media description ([`vision_seat::Resident::media`]); `None`

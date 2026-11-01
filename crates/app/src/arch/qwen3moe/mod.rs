@@ -157,14 +157,20 @@ impl Prompt for Body35 {
     }
 
     /// [`Prompt::prompt`] by the body's `prefill_call`: no head at all for an
-    /// unread call. A closing call is refused by name
-    /// there: a delta layer takes no checkpoint inside a unit.
+    /// unread call, and a closing call's last id folded into its last unit
+    /// where [`Prompt::closes`] says so.
     fn prompt_call(
         m: &mut Qwen35moeModel,
         ids: &[u32],
         end: CallEnd,
     ) -> Result<Option<u32>, GpuError> {
         prompt_pass(m, |m| m.prefill_call(ids, path35(ids.len()), end))
+    }
+
+    /// [`Qwen35moeModel::closes_by_ubatch`] on the path a call of `n` ids
+    /// runs ([`path35`]).
+    fn closes(m: &Qwen35moeModel, n: usize) -> Result<bool, GpuError> {
+        m.closes_by_ubatch(n, path35(n))
     }
 }
 
@@ -190,8 +196,8 @@ impl Keep for Body35 {
     }
 
     /// [`Body35::kept`]: what a cut keeps and why — a checkpoint's
-    /// position, a waiting verify's row (the commit moves the lane word and
-    /// copies nothing), or nothing with the reason a delta layer holds no
+    /// position, a waiting verify's row (the commit replays the kept rows'
+    /// records), or nothing with the reason a delta layer holds no
     /// earlier state but a copy.
     fn kept(m: &Qwen35moeModel, n: u32) -> Kept {
         m.body(WHAT)
@@ -200,7 +206,7 @@ impl Keep for Body35 {
 
     /// Back to empty at 0 — a reset; else the model's rollback
     /// ([`Rollback`](bloomery_gpu::model::Rollback)): the checkpoint at
-    /// `n`, a row of the verify waiting on a load of several lanes (its
+    /// `n`, a row of the verify waiting on a load that verifies (its
     /// commit), any other position refused by name.
     fn cut(m: &mut Qwen35moeModel, n: u32) -> Result<(), GpuError> {
         cut_positions(m, n)

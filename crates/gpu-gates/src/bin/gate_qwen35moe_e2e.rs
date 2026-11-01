@@ -554,6 +554,7 @@ mod gate {
     const REAL_Q6_QKV: usize = 14;
     const REAL_Q6_V: usize = 6;
     const C: usize = 8192;
+    const N_K: usize = 16;
     const N_V: usize = 32;
     const HEAD_V: usize = 128;
     const Q_ROWS: usize = 8192;
@@ -941,8 +942,9 @@ mod gate {
 
     /// The layer stores' bytes at [`CTX`] rows, derived from the header:
     /// each attention layer's K and V planes, `2 · n_kv · ctx · 256` f16;
-    /// each delta layer's state, `32 · 128 · 128` f32 (one lane), and conv
-    /// ring, `RING_ROWS · 8192` f32.
+    /// each delta layer's state, `32 · 128 · 128` f32 (one lane), conv ring,
+    /// `RING_ROWS · 8192` f32, and carry, and its lane's u32 stamp
+    /// (`Geometry35::store_bytes`).
     fn store_bytes() -> usize {
         geometry().store_bytes(CTX)
     }
@@ -2696,8 +2698,8 @@ mod gate {
         let mut ok = true;
 
         // One checkpoint's bytes and slots against their derivation: each
-        // delta layer's state (N_V heads of HEAD_V x HEAD_V f32) and conv
-        // ring (RING_ROWS rows of C), and the slots the load's budget holds.
+        // delta layer's state (N_V heads of HEAD_V x HEAD_V f32), conv ring
+        // (RING_ROWS rows of C) and carry, and the slots the load's budget holds.
         // PIN(2026-10-11): the slots were "at least 9" of the fixed 4 GiB
         // budget; the budget now follows the load's context: the points one
         // prompt call over KCTX takes at the ubatch's spacing (its multiples
@@ -2713,7 +2715,7 @@ mod gate {
         let points_ok = c.bytes() == want_bytes as u64 && c.capacity() == want_slots;
         println!(
             "checkpoints: one copy {} bytes (want {want_bytes}, derived: a delta layer's state \
-             {} f32 and ring {} f32), {} slots of one copy at {KCTX} positions (want \
+             {} f32, ring {} f32 and carry), {} slots of one copy at {KCTX} positions (want \
              {want_slots}: a call over them at the ubatch {every}'s spacing and the call before's \
              end) {}",
             c.bytes(),
@@ -2827,6 +2829,7 @@ mod gate {
             n_delta: n_delta(),
             n_kv: N_KV,
             head: HEAD,
+            n_k: N_K,
             n_v: N_V,
             head_v: HEAD_V,
             conv_c: C,

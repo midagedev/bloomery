@@ -37,7 +37,7 @@
 //! state intact. Both calls first fold the same prompt carry.
 //! [`DeltaKernels::enqueue_delta_seqs`] runs the step of several sequences in
 //! one launch, each over its own rows, lane word and state (`crate::seq_rows`):
-//! `gdn_delta_seqs` in place over one unstamped lane, `gdn_delta_lanes_seqs`
+//! `gdn_delta_lanes_seqs`
 //! in place over each sequence's stamped lane after its carry, and
 //! `gdn_delta_recovery_seqs` a verify recorded into each sequence's record
 //! after its carry.
@@ -1032,79 +1032,6 @@ mod delta_kernels {
                 fault,
                 o,
                 state,
-            );
-        }
-    }
-
-    /// [`gdn_delta`] over several sequences' rows (`crate::seq_rows`):
-    /// blocks `s·per .. (s + 1)·per`, `per = 8·n_v`, are sequence `s`'s
-    /// launch, block `b − s·per` of it, over its rows `lead .. lead + m_s` of
-    /// `qkv`, `beta`, `decay` and `o` and its own words: the lane word and
-    /// the state of `lanes` lanes, in that order.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
-    )]
-    #[kernel]
-    #[launch_bounds(128)]
-    #[launch_contract(
-        domain = 1,
-        block = (128, 1, 1),
-        requires = (
-            qkv.len() >= rows * (2 * n_k + n_v) * 128,
-            beta.len() >= rows * n_v,
-            decay.len() >= rows * n_v,
-            lanes >= 1,
-            o.len() >= rows * n_v * 128
-        )
-    )]
-    pub fn gdn_delta_seqs(
-        qkv: &[f32],
-        beta: &[f32],
-        decay: &[f32],
-        lanes: u32,
-        n_k: u32,
-        n_v: u32,
-        grouped: u32,
-        rows: u32,
-        fault: FaultSink,
-        mut o: DisjointSlice<f32>,
-        #[grid_constant] seqs: &SeqRows,
-    ) {
-        // rows only bounds the lengths in the launch contract.
-        let _ = rows;
-        let per = n_v as usize * (HEAD / COLUMNS_PER_BLOCK);
-        let s = thread::blockIdx_x() as usize / per;
-        if s >= seqs.len() {
-            return; // block-uniform
-        }
-        let (ch, nv) = ((2 * n_k + n_v) as usize * HEAD, n_v as usize);
-        // SAFETY: s < the table's sequences. Its rows lead .. lead + m lie
-        // inside the launch's `rows` (the table tiles them), so each window
-        // holds the m rows `gdn_delta`'s contract names, `qkv` 16-byte
-        // aligned at a row (the launcher checked its base, and a row is a
-        // multiple of 4 f32). The launcher put the sequence's own lane word
-        // (one u32) and state (`lanes` lanes, 16-byte aligned, borrowed by
-        // this launch alone) at its words, so the body runs over them as the
-        // sequence's own launch's block b − s·per.
-        unsafe {
-            let (lead, m) = seqs.span(s);
-            let lane = seqs.word(s, 0) as usize as *const u32;
-            delta_body::<DECAY_HEAD>(
-                thread::blockIdx_x() as usize - s * per,
-                qkv.get_unchecked(lead * ch..),
-                beta.get_unchecked(lead * nv..),
-                decay.get_unchecked(lead * nv..),
-                core::slice::from_raw_parts(lane, 1),
-                0,
-                lanes,
-                n_k,
-                n_v,
-                grouped,
-                m as u32,
-                fault,
-                o.as_mut_ptr().add(lead * nv * HEAD),
-                seqs.word(s, 1) as usize as *mut f32,
             );
         }
     }
@@ -2332,13 +2259,12 @@ pub struct DeltaArgs<'a> {
 }
 
 /// One sequence of [`DeltaKernels::enqueue_delta_seqs`]: its rows of the
-/// launch, its lane word (`lane[0]`), its state, and a stamped store's own
-/// buffers (`None`: an unstamped state's step in place, `gdn_delta`'s).
+/// launch, its lane word (`lane[0]`), its state, and its stamped store's buffers.
 pub(crate) struct DeltaSeq<'a> {
     pub(crate) rows: Range<usize>,
     pub(crate) lane: &'a DeviceBuffer<u32>,
     pub(crate) state: &'a mut DeviceBuffer<f32>,
-    pub(crate) stamped: Option<DeltaStamped<'a>>,
+    pub(crate) stamped: DeltaStamped<'a>,
 }
 
 /// A stamped sequence's own buffers: its carry (`None` on a store whose
@@ -2353,8 +2279,6 @@ pub(crate) struct DeltaStamped<'a> {
 /// The entry a sequence of [`DeltaKernels::enqueue_delta_seqs`] runs.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SeqLaunch {
-    /// `gdn_delta_seqs`: an unstamped state's step in place.
-    Unstamped,
     /// `gdn_delta_lanes_seqs`: a stamped lane's step in place.
     InPlace,
     /// `gdn_delta_recovery_seqs`: a verify recorded into its record.
@@ -2363,12 +2287,9 @@ enum SeqLaunch {
 
 impl SeqLaunch {
     fn of(q: &DeltaSeq<'_>) -> SeqLaunch {
-        match &q.stamped {
-            None => SeqLaunch::Unstamped,
-            Some(DeltaStamped { record: None, .. }) => SeqLaunch::InPlace,
-            Some(DeltaStamped {
-                record: Some(_), ..
-            }) => SeqLaunch::Verify,
+        match q.stamped.record {
+            None => SeqLaunch::InPlace,
+            Some(_) => SeqLaunch::Verify,
         }
     }
 }
@@ -2719,12 +2640,117 @@ pub const fn read_lane(c: u32, row: u32, lanes: u32) -> u32 {
     if row == 0 { c } else { (c + row - 1) % lanes }
 }
 
+/// One row's inputs to a [`delta_lanes_body`] thread's rule: its keys and
+/// queries, its per-key decays (`DECAY_KEY`, else zeros), and the row's
+/// value, β and head decay (`DECAY_HEAD`, else zero).
+#[derive(Clone, Copy)]
+struct LaneRow {
+    k: [f32; KEYS_PER_LANE],
+    q: [f32; KEYS_PER_LANE],
+    dk: [f32; KEYS_PER_LANE],
+    vt: f32,
+    bt: f32,
+    dh: f32,
+}
+
+impl LaneRow {
+    /// The row a replay, which reads its record instead, never uses.
+    const ZERO: Self = Self {
+        k: [0.0; KEYS_PER_LANE],
+        q: [0.0; KEYS_PER_LANE],
+        dk: [0.0; KEYS_PER_LANE],
+        vt: 0.0,
+        bt: 0.0,
+        dh: 0.0,
+    };
+}
+
+/// Where a [`delta_lanes_body`] thread reads a call's rows: `qkv` rows of
+/// `ch` words (its key head at `k_at`, query head at `q_at`, value column
+/// at `v_at`), `beta` and `decay` rows of `n_v` heads, for value head `h`
+/// and lane `j` of its column.
+#[derive(Clone, Copy)]
+struct LaneRows<'a> {
+    qkv: &'a [f32],
+    beta: &'a [f32],
+    decay: &'a [f32],
+    ch: usize,
+    k_at: usize,
+    q_at: usize,
+    v_at: usize,
+    n_v: usize,
+    h: usize,
+    j: usize,
+}
+
+impl LaneRows<'_> {
+    /// Row `t`'s [`LaneRow`] for `DECAY`.
+    ///
+    /// # Safety
+    ///
+    /// `t < m` of a call whose slices hold [`delta_lanes_body`]'s lengths;
+    /// no launch writes them while this one runs.
+    #[inline(always)]
+    unsafe fn row<const DECAY: u32>(self, t: usize) -> LaneRow {
+        let Self {
+            qkv,
+            beta,
+            decay,
+            ch,
+            k_at,
+            q_at,
+            v_at,
+            n_v,
+            h,
+            j,
+        } = self;
+        let row_at = t * ch;
+        let qkv_g = global_addr(qkv.as_ptr());
+        // SAFETY: this aligned key head lies inside qkv's row t < m.
+        let k = unsafe { lane_keys::<true>(qkv_g + 4 * (row_at + k_at) as u64, j) };
+        // SAFETY: this aligned query head lies inside qkv's row t < m.
+        let q = unsafe { lane_keys::<true>(qkv_g + 4 * (row_at + q_at) as u64, j) };
+        let dk = if DECAY == DECAY_HEAD {
+            [0.0f32; KEYS_PER_LANE]
+        } else {
+            // SAFETY: the per-key decay row (t·n_v + h)·HEAD .. + HEAD is
+            // inside decay's m·n_v·HEAD values for DECAY_KEY, a multiple of
+            // four floats from an aligned base.
+            unsafe {
+                lane_keys::<true>(
+                    global_addr(decay.as_ptr()) + 4 * ((t * n_v + h) * HEAD) as u64,
+                    j,
+                )
+            }
+        };
+        // SAFETY: row_at + v_at < m * ch, inside qkv.
+        let vt = unsafe { *qkv.get_unchecked(row_at + v_at) };
+        // SAFETY: t * n_v + h < m * n_v, inside beta.
+        let bt = unsafe { *beta.get_unchecked(t * n_v + h) };
+        let dh = if DECAY == DECAY_HEAD {
+            // SAFETY: t * n_v + h < m * n_v, inside per-head decay.
+            unsafe { *decay.get_unchecked(t * n_v + h) }
+        } else {
+            0.0
+        };
+        LaneRow {
+            k,
+            q,
+            dk,
+            vt,
+            bt,
+            dh,
+        }
+    }
+}
+
 /// The loop of one block of `gdn_delta_lanes` and `kda_delta_lanes` (module
 /// doc): [`delta_body`]'s loop for `DECAY` over lane [`read_lane`]`(c, row)`,
 /// `c = lane[lane_at] mod lanes`, as the call's block `b` (head `b / 8`),
 /// with the stamp check and writes and the carry's count check on block 0's
-/// thread 0 and the state stored per row
-/// (`each != 0`) or once after the last token. For `DECAY_HEAD` with `carried`, the rows `carry` holds for
+/// thread 0 (the stamp read before the rows, checked and written after
+/// them) and the state stored per row (`each != 0`) or once after the last
+/// token. For `DECAY_HEAD` with `carried`, the rows `carry` holds for
 /// `pos[0]` come first, their outputs not written (module doc, "Carry").
 ///
 /// # Safety
@@ -2813,34 +2839,16 @@ unsafe fn delta_lanes_body<const DECAY: u32, const RECOVERY: bool>(
         }
     }
     let rin = if row == 0 { c } else { (c + row - 1) % lanes };
-    if b == 0 && tid == 0 {
+    let books = b == 0 && tid == 0;
+    // The stamp is read here and checked and written after the rows, so its
+    // load stays off the block's path to the state.
+    let stamped = if books {
         // SAFETY: rin < lanes, inside the stamps; only this thread reads
         // or writes stamps, and it reads the input before writing.
-        let stamped = unsafe { *stamp.add(rin as usize) };
-        if stamped != p0 {
-            fault.raise(FaultSite::DeltaStamp);
-        }
-        if !RECOVERY || each == 0 {
-            if each != 0 {
-                let mut t = 0u32;
-                while (t as usize) < m {
-                    let at = (c + row + t) % lanes;
-                    // SAFETY: at < lanes, and this thread owns the stamps.
-                    unsafe { *stamp.add(at as usize) = p0.wrapping_add(t + 1) };
-                    t += 1;
-                }
-            } else {
-                // SAFETY: target < lanes, and this thread owns the stamps.
-                unsafe { *stamp.add(target as usize) = p0.wrapping_add(m as u32) };
-            }
-        }
-        if DECAY == DECAY_HEAD && carried != 0 {
-            // SAFETY: the carry holds the launch-wide header checked by the launcher.
-            if unsafe { carried_rows(carry, p0) }.is_none() {
-                fault.raise(FaultSite::LinearDelta);
-            }
-        }
-    }
+        unsafe { *stamp.add(rin as usize) }
+    } else {
+        p0
+    };
     if h >= n_v {
         return; // block-uniform
     }
@@ -2856,12 +2864,31 @@ unsafe fn delta_lanes_body<const DECAY: u32, const RECOVERY: bool>(
     let v_at = 2 * n_k * HEAD + h * HEAD + col;
     let col_at = (b * COLUMNS_PER_BLOCK + tid / LANES_PER_COLUMN) * HEAD;
     let s_at = rin as usize * lane_len + col_at;
+    let rows = LaneRows {
+        qkv,
+        beta,
+        decay,
+        ch,
+        k_at,
+        q_at,
+        v_at,
+        n_v,
+        h,
+        j,
+    };
+    // Row 0's loads depend on neither the lane word nor the carry's header,
+    // so they issue before the state's load and the carry's loop.
+    let first = if RECOVERY && each == 0 {
+        LaneRow::ZERO
+    } else {
+        // SAFETY: m >= 1 (the launcher refuses m = 0), so row 0 is the call's.
+        unsafe { rows.row::<DECAY>(0) }
+    };
 
-    // SAFETY: as in `delta_body`: the rows read are inside qkv and the
-    // column inside lane rin of the state (`rin < lanes`), 16-byte aligned;
-    // the state is read before this thread writes its keys of any lane, and
-    // no other thread touches them.
-    let (qkv_g, state_g) = (global_addr(qkv.as_ptr()), global_addr(state.cast_const()));
+    // SAFETY: as in `delta_body`: the column inside lane rin of the state
+    // (`rin < lanes`), 16-byte aligned; the state is read before this
+    // thread writes its keys of any lane, and no other thread touches them.
+    let state_g = global_addr(state.cast_const());
     let record_g = global_addr(record.cast_const());
     // SAFETY: s_at + HEAD <= lanes·n_v·HEAD·HEAD, the column inside state.
     let mut s = unsafe { lane_keys::<false>(state_g + 4 * s_at as u64, j) };
@@ -2869,7 +2896,11 @@ unsafe fn delta_lanes_body<const DECAY: u32, const RECOVERY: bool>(
         let kv = (n_k + n_v) * HEAD;
         let carry_g = global_addr(carry.as_ptr());
         // SAFETY: the carry's header, by the contract.
-        let held = unsafe { carried_rows(carry, p0) }.unwrap_or(0);
+        let held = unsafe { carried_rows(carry, p0) };
+        if books && held.is_none() {
+            fault.raise(FaultSite::LinearDelta);
+        }
+        let held = held.unwrap_or(0);
         let mut t = 0usize;
         while t < held {
             let at = carry_row(t, kv);
@@ -2903,34 +2934,18 @@ unsafe fn delta_lanes_body<const DECAY: u32, const RECOVERY: bool>(
             t += 1;
             continue;
         }
-        let row_at = t * ch;
-        // SAFETY: this aligned key head lies inside qkv's row t < m.
-        let k = unsafe { lane_keys::<true>(qkv_g + 4 * (row_at + k_at) as u64, j) };
-        // SAFETY: this aligned query head lies inside qkv's row t < m.
-        let q = unsafe { lane_keys::<true>(qkv_g + 4 * (row_at + q_at) as u64, j) };
-        let dk = if DECAY == DECAY_HEAD {
-            [0.0f32; KEYS_PER_LANE]
+        let LaneRow {
+            k,
+            q,
+            dk,
+            vt,
+            bt,
+            dh,
+        } = if t == 0 {
+            first
         } else {
-            // SAFETY: the per-key decay row (t·n_v + h)·HEAD .. + HEAD is
-            // inside decay's m·n_v·HEAD values for DECAY_KEY, a multiple of
-            // four floats from an aligned base, and no launch writes it
-            // while this one runs.
-            unsafe {
-                lane_keys::<true>(
-                    global_addr(decay.as_ptr()) + 4 * ((t * n_v + h) * HEAD) as u64,
-                    j,
-                )
-            }
-        };
-        // SAFETY: row_at + v_at < m * ch, inside qkv.
-        let vt = unsafe { *qkv.get_unchecked(row_at + v_at) };
-        // SAFETY: t * n_v + h < m * n_v, inside beta.
-        let bt = unsafe { *beta.get_unchecked(t * n_v + h) };
-        let dh = if DECAY == DECAY_HEAD {
-            // SAFETY: t * n_v + h < m * n_v, inside per-head decay.
-            unsafe { *decay.get_unchecked(t * n_v + h) }
-        } else {
-            0.0
+            // SAFETY: t < m, a row of the call.
+            unsafe { rows.row::<DECAY>(t) }
         };
         let (next, u) = rule_update::<DECAY>(s, k, dk, dh, (vt, bt));
         s = next;
@@ -2972,6 +2987,25 @@ unsafe fn delta_lanes_body<const DECAY: u32, const RECOVERY: bool>(
             }
         }
         t += 1;
+    }
+    if books {
+        if stamped != p0 {
+            fault.raise(FaultSite::DeltaStamp);
+        }
+        if !RECOVERY || each == 0 {
+            if each != 0 {
+                let mut t = 0u32;
+                while (t as usize) < m {
+                    let at = (c + row + t) % lanes;
+                    // SAFETY: at < lanes, and this thread owns the stamps.
+                    unsafe { *stamp.add(at as usize) = p0.wrapping_add(t + 1) };
+                    t += 1;
+                }
+            } else {
+                // SAFETY: target < lanes, and this thread owns the stamps.
+                unsafe { *stamp.add(target as usize) = p0.wrapping_add(m as u32) };
+            }
+        }
     }
     if each == 0 {
         let out_at = target as usize * lane_len + col_at;
@@ -3475,8 +3509,7 @@ impl DeltaKernels {
     /// when every sequence brings its stamps and record, each recorded into
     /// its own after its carry; [`DeltaKernels::enqueue_delta_lanes`]' step
     /// in place when every sequence brings its stamps and no record, each
-    /// over its stamped lane after its carry; [`DeltaKernels::enqueue_delta`]'s
-    /// step in place at lane 0 of the lane word when none brings stamps.
+    /// over its stamped lane after its carry.
     /// Refused by name: what that launch refuses over each sequence's rows,
     /// sequences of two kinds, and rows that do not tile the launch from row
     /// 0 ([`SeqRows::new`]). Asynchronous and capturable; builds its sequence
@@ -3501,21 +3534,11 @@ impl DeltaKernels {
         shape.check(WHAT)?;
         let nv = shape.n_v;
         let overflow = || GpuError::shape(WHAT, "GDN launch size overflows usize");
-        let launch = seqs.first().map_or(SeqLaunch::Unstamped, SeqLaunch::of);
+        let launch = seqs.first().map_or(SeqLaunch::InPlace, SeqLaunch::of);
         if seqs.iter().any(|q| SeqLaunch::of(q) != launch) {
             return Err(GpuError::shape(
                 WHAT,
-                "sequences that each verify, each step a stamped lane in place, or each step an \
-                 unstamped state in place",
-            ));
-        }
-        if launch == SeqLaunch::Unstamped && lanes != 1 {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "lanes={lanes}: an unstamped step in place takes one state lane, as \
-                     `enqueue_delta`"
-                ),
+                "sequences that each verify or each step a stamped lane in place",
             ));
         }
         let state_len = lanes
@@ -3530,20 +3553,14 @@ impl DeltaKernels {
                 ("lane", q.lane.len(), 1),
                 ("state", q.state.len(), state_len),
             ];
-            let carry = q.stamped.as_ref().and_then(|st| st.carry);
-            let stamp = q
-                .stamped
-                .as_ref()
-                .map(|st| ("stamp", st.stamp.len(), lanes));
-            let kept = q
-                .stamped
-                .as_ref()
-                .and_then(|st| st.record.as_ref())
-                .map(|r| ("record", r.len(), record));
+            let st = &q.stamped;
+            let carry = st.carry;
+            let stamp = ("stamp", st.stamp.len(), lanes);
+            let kept = st.record.as_ref().map(|r| ("record", r.len(), record));
             if let Some((name, got, need)) = lens
                 .into_iter()
                 .chain(carry.map(|c| ("carry", c.len(), shape.carry_len())))
-                .chain(stamp)
+                .chain([stamp])
                 .chain(kept)
                 .find(|(_, got, need)| got < need)
             {
@@ -3555,18 +3572,13 @@ impl DeltaKernels {
             check_vector_bases(WHAT, qkv, q.state, carry)?;
             let mut word = [0; SEQ_WORDS];
             word[0] = q.lane.cu_deviceptr();
-            match &q.stamped {
-                Some(st) => {
-                    if let Some(r) = &st.record {
-                        check_alignment::<U32x4, _>(WHAT, "record", &**r)?;
-                        word[4] = r.cu_deviceptr();
-                    }
-                    word[1] = carry.map_or(0, DeviceBuffer::cu_deviceptr);
-                    word[2] = q.state.cu_deviceptr();
-                    word[3] = st.stamp.cu_deviceptr();
-                }
-                None => word[1] = q.state.cu_deviceptr(),
+            if let Some(r) = &st.record {
+                check_alignment::<U32x4, _>(WHAT, "record", &**r)?;
+                word[4] = r.cu_deviceptr();
             }
+            word[1] = carry.map_or(0, DeviceBuffer::cu_deviceptr);
+            word[2] = q.state.cu_deviceptr();
+            word[3] = st.stamp.cu_deviceptr();
             words.push((q.rows.clone(), word));
         }
         let table = SeqRows::new(WHAT, &words)?;
@@ -3589,8 +3601,8 @@ impl DeltaKernels {
             launch_u32(WHAT, "n_v", nv)?,
             launch_u32(WHAT, "rows", m)?,
         );
-        // SAFETY: each sequence's words are its own lane word, state and, for
-        // a stamped store, carry and stamps, and a verify's record, of the
+        // SAFETY: each sequence's words are its own lane word, state, carry
+        // and stamps, and a verify's record, of the
         // lengths and alignment checked above; the state, stamps and record
         // are borrowed mutably while this enqueue runs, so no other sequence's
         // words name them, and a graph that captures the launch replays it
@@ -3628,21 +3640,6 @@ impl DeltaKernels {
                     rows,
                     pos,
                     launch_u32(WHAT, "carry_len", shape.carry_len())?,
-                    fault,
-                    o,
-                    table,
-                )?,
-                SeqLaunch::Unstamped => k.gdn_delta_seqs(
-                    stream,
-                    &k.prepare_gdn_delta_seqs(cfg)?,
-                    qkv,
-                    beta,
-                    decay,
-                    launch_u32(WHAT, "lanes", lanes)?,
-                    n_k,
-                    n_v,
-                    grouped_arg(shape.map),
-                    rows,
                     fault,
                     o,
                     table,

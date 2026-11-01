@@ -16,7 +16,7 @@
 use super::body38::WHAT_SHARE;
 use super::plan38::{GDN, Layer38, geo};
 use super::scratch::{
-    Dims, IN_IDS, IN_POS0, Inbox, Io, KvPlanes, LANE, RecStore, fresh_stamps, param_view, put_input,
+    Dims, IN_IDS, IN_POS0, Inbox, Io, KvPlanes, LANE, RecStore, param_view, put_input,
 };
 use crate::GpuError;
 use crate::flash_gqa::{listed_partials_ms_len, listed_partials_v_len_256};
@@ -96,11 +96,7 @@ pub(super) const VERIFY_ROWS: usize = stores::DELTA_VERIFY_ROWS;
 /// room whose pages are backed as far as the sequence's positions reach
 /// ([`Store38::fit`]).
 pub(super) enum Store38 {
-    Rec {
-        rec: RecStore,
-        stamp: DeviceBuffer<u32>,
-        record: DeviceBuffer<f32>,
-    },
+    Rec(RecStore),
     Qsa {
         kv: Roomed<KvPlanes>,
         ring: DeviceBuffer<u16>,
@@ -112,21 +108,14 @@ impl Store38 {
     /// A zeroed delta store of [`LANES`] lane with a carry and a record,
     /// the lane stamped at position 0.
     pub(super) fn rec(stream: &CudaStream) -> Result<Store38, GpuError> {
-        Ok(Store38::Rec {
-            rec: RecStore::carried(stream, GDN.lens(LANES), LANES, GDN.carry_len())?,
-            stamp: DeviceBuffer::from_host(stream, &fresh_stamps(LANES))?,
-            record: DeviceBuffer::zeroed(
-                stream,
-                linear::delta::recovery_record_len(GDN, VERIFY_ROWS),
-            )?,
-        })
+        Ok(Store38::Rec(RecStore::gdn(stream, GDN, VERIFY_ROWS)?))
     }
 
     /// A delta store's stamp back to a fresh store's: the lane at position
     /// 0. Never inside a capture.
     pub(super) fn restamp(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
-        if let Store38::Rec { stamp, .. } = self {
-            stamp.copy_from_host(stream, &fresh_stamps(LANES))?;
+        if let Store38::Rec(rec) = self {
+            rec.restamp(stream)?;
         }
         Ok(())
     }
@@ -152,9 +141,7 @@ impl Store38 {
     /// Device bytes the store's layout takes: what the plan counts it at.
     pub(super) fn bytes(&self) -> usize {
         match self {
-            Store38::Rec { rec, stamp, record } => {
-                rec.bytes() + stamp.num_bytes() + record.num_bytes()
-            }
+            Store38::Rec(rec) => rec.bytes(),
             Store38::Qsa { kv, ring, pooled } => kv.bytes() + ring.num_bytes() + pooled.num_bytes(),
         }
     }
@@ -163,7 +150,7 @@ impl Store38 {
     /// hold; none for a delta store.
     pub(super) fn mapped(&self) -> usize {
         match self {
-            Store38::Rec { .. } => 0,
+            Store38::Rec(_) => 0,
             Store38::Qsa { kv, pooled, .. } => kv.mapped() + pooled.mapped(),
         }
     }
@@ -172,7 +159,7 @@ impl Store38 {
     /// none for a delta store.
     pub(super) fn whole(&self) -> usize {
         match self {
-            Store38::Rec { .. } => 0,
+            Store38::Rec(_) => 0,
             Store38::Qsa { kv, pooled, .. } => kv.whole() + pooled.whole(),
         }
     }
@@ -181,7 +168,7 @@ impl Store38 {
     /// rows by position.
     fn rooms(&mut self) -> impl Iterator<Item = &mut Room> {
         let qsa = match self {
-            Store38::Rec { .. } => None,
+            Store38::Rec(_) => None,
             Store38::Qsa { kv, pooled, .. } => Some((kv, pooled)),
         };
         qsa.into_iter().flat_map(|(kv, pooled)| {
@@ -215,7 +202,7 @@ impl Store38 {
         positions: usize,
     ) -> Result<SharedPages, GpuError> {
         match (self, from) {
-            (Store38::Rec { .. }, Store38::Rec { .. }) => Ok(SharedPages::default()),
+            (Store38::Rec(_), Store38::Rec(_)) => Ok(SharedPages::default()),
             (
                 Store38::Qsa { kv, pooled, .. },
                 Store38::Qsa {
@@ -235,7 +222,7 @@ impl Store38 {
     /// maps too; none for a delta store.
     pub(super) fn shared(&self) -> usize {
         match self {
-            Store38::Rec { .. } => 0,
+            Store38::Rec(_) => 0,
             Store38::Qsa { kv, pooled, .. } => kv.shared() + pooled.shared(),
         }
     }

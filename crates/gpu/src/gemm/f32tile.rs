@@ -60,8 +60,8 @@ use super::gemm32::{GEMM32_GROUP, raster32};
 use super::kernels32::Gemm32Kernels;
 use super::{GemmAct32, MmaForm};
 use crate::fault::FaultSink;
-use crate::linear::norm_gate::{NormGateTail, norm_gate_values};
-use crate::linear::{GATE_SIGMOID, HEAD};
+use crate::linear::norm_gate::{NormGateTail, gate_act, norm_gate_values};
+use crate::linear::{GATE_SIGMOID, GATE_SILU, HEAD};
 use crate::q8f32::{Bf16Words, ByteBlocks, E4m3Scales, E4m3Weight};
 use crate::tensor::DeviceTensor;
 use crate::{GpuError, launch_u32};
@@ -2138,7 +2138,8 @@ pub(crate) unsafe fn refuse_or(refused: *mut u32, c: usize, fits: bool) {
 }
 
 /// Dense prompt product ([`bf16_mma_body`]'s, BF16 or block-scaled E4M3)
-/// followed by the shared sigmoid norm, its output also in `form`. Normal
+/// followed by the shared gated norm under the launch's gate word `act`
+/// ([`GATE_SILU`], else sigmoid), its output also in `form`. Normal
 /// tiles exchange z through the retired staging allocation; exceptional
 /// tiles finish through the exact product owner first. K counts values; a
 /// scaled tile's units are value pairs.
@@ -2167,7 +2168,7 @@ pub(crate) unsafe fn bf16_mma_norm_gate_body<W: MmaRows, X: MmaCols, F: OutForm>
     n: u32,
     o: &[f32],
     gain: &[f32],
-    eps: f32,
+    (eps, act): (f32, u32),
     fault: FaultSink,
     z: &mut DisjointSlice<f32>,
     y: &mut DisjointSlice<f32>,
@@ -2238,7 +2239,13 @@ pub(crate) unsafe fn bf16_mma_norm_gate_body<W: MmaRows, X: MmaCols, F: OutForm>
                         unsafe { *sh.add((c - start) * HEAD + at) }
                     };
                 }
-                let values = norm_gate_values::<GATE_SIGMOID>(ov, zv, wv, eps, fault);
+                // The gate is the launch's (`act`, uniform), each arm the
+                // shared norm's own values.
+                let values = if act == GATE_SILU {
+                    norm_gate_values::<GATE_SILU>(ov, zv, wv, eps, fault)
+                } else {
+                    norm_gate_values::<GATE_SIGMOID>(ov, zv, wv, eps, fault)
+                };
                 for i in 0..4 {
                     thread::__unroll_config::<0>();
                     // SAFETY: this warp owns c, each lane four disjoint values.
@@ -2397,7 +2404,7 @@ impl Gemm32Kernels {
         Ok(())
     }
 
-    /// The BF16 prompt product and shared sigmoid norm in one launch. z is
+    /// The BF16 prompt product and shared gated norm in one launch. z is
     /// scratch for exceptional exact replay only; ordinary tiles never write it.
     #[allow(
         clippy::too_many_arguments,
@@ -2416,7 +2423,6 @@ impl Gemm32Kernels {
         let what = "Gemm32Kernels::enqueue_bf16_mma_norm_gate";
         let t = bf16_mma_launch(what, w, x, n, z)?;
         tail.check_rows(what, w.rows(), n, z.len())?;
-        tail.check_sigmoid(what)?;
         let form = held_form(what, act, MmaForm::Bf16, x, &t)?;
         let prep =
             self.module
@@ -2434,6 +2440,7 @@ impl Gemm32Kernels {
             tail.o,
             tail.w,
             tail.eps,
+            gate_act(tail.gate),
             tail.fault,
             z,
             tail.y,
@@ -2479,7 +2486,7 @@ impl Gemm32Kernels {
         Err(GpuError::state(what, NATIVE_BUILD))
     }
 
-    /// [`Self::enqueue_mxfp8_w8a8`] and the shared sigmoid norm in one
+    /// [`Self::enqueue_mxfp8_w8a8`] and the shared gated norm in one
     /// kernel launch, as [`Self::enqueue_bf16_mma_norm_gate`] finishes a BF16
     /// product: z is scratch for exceptional exact replay only. The kernel
     /// also writes the MXFP8 form of the norm's output `tail.y` into `out`,
@@ -2509,7 +2516,6 @@ impl Gemm32Kernels {
         } = a;
         let t = mxfp8_mma_launch(what, w, x, n, z)?;
         tail.check_rows(what, t.rows as usize, n, z.len())?;
-        tail.check_sigmoid(what)?;
         let form = held_form(what, act, MmaForm::Mxfp8, x, &t)?;
         let y = tail.y.cu_deviceptr();
         let into = out.out_planes(stream, what, MmaForm::Mxfp8, (t.rows as usize, n))?;

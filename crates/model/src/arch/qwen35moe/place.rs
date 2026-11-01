@@ -518,22 +518,19 @@ impl PlanInputs {
         })
     }
 
-    /// The inputs of a load whose GDN layers keep `lanes` stamped lanes of
-    /// state ([`KvLayout::of_spec_lanes`]): a Qwen3.6 load that verifies drafted
-    /// rows asks for `MAX_PASS_ROWS` of them, and the plan, the whole-fit
-    /// verdict and the sequences' stores all price the one count. The layout's
-    /// q8_0 form ([`KvLayout::in_q8`]) is kept.
+    /// The inputs of a load that verifies drafted rows or not (`verifies`,
+    /// [`KvLayout::of_spec_verifying`]): a Qwen3.6 load that verifies keeps
+    /// a verify record of [`PASS_ROWS`] rows beside each GDN layer's lane,
+    /// and the plan, the whole-fit verdict and the sequences' stores all
+    /// price the one layout. The layout's q8_0 form ([`KvLayout::in_q8`]) is
+    /// kept.
     ///
     /// # Errors
     ///
-    /// The layout's refusal of the description ([`KvLayout::of_spec_lanes`]).
-    ///
-    /// # Panics
-    ///
-    /// On no lane, by name.
-    pub fn with_lanes(mut self, lanes: usize) -> Result<PlanInputs, PlacementError> {
+    /// The layout's refusal of the description ([`KvLayout::of_spec_verifying`]).
+    pub fn verifying(mut self, verifies: bool) -> Result<PlanInputs, PlacementError> {
         let q8 = self.kv.q8;
-        self.kv = KvLayout::of_spec_lanes(&self.spec, lanes)?;
+        self.kv = KvLayout::of_spec_verifying(&self.spec, verifies)?;
         self.kv.q8 = q8;
         Ok(self)
     }
@@ -746,16 +743,13 @@ impl PlanInputs {
     /// beside them ([`slot_resident_bytes`]) and its delta replay table.
     #[must_use]
     pub fn seq_terms<'a>(&'a self, mtp: Option<&'a MtpInputs>) -> SeqTerms<'a> {
-        let replay = if program_of(self.spec.arch) == Some(PROGRAM) {
-            self.kv
-                .kinds
-                .iter()
-                .filter(|&&k| k == Kind::DeltaRule)
-                .count() as u64
-                * runtime::stores::DELTA_REPLAY_BYTES
-        } else {
-            0
-        };
+        let replay = self
+            .kv
+            .kinds
+            .iter()
+            .filter(|&&k| k == Kind::DeltaRule)
+            .count() as u64
+            * self.kv.replay;
         SeqTerms {
             layers: Stores {
                 kv: &self.kv,
@@ -1948,12 +1942,13 @@ fn check_draft_reserve(machine: &Machine, want: Option<u64>) -> Result<(), Place
 /// - a GDN layer: its recurrent state (`v_heads` heads of `state × state`
 ///   f32) and its conv ring (`conv − 1 + PASS_ROWS` rows of the conv's
 ///   channels, `2·k_heads·state + v_heads·state`, in f32), both fixed by the
-///   file; on a qwen4exp file its one state lane is stamped
-///   (`runtime::stores::delta_lane_bytes`) and beside it are a carry
-///   (`runtime::stores::delta_carry_bytes`) and a verify record of
-///   `runtime::stores::DELTA_VERIFY_ROWS` rows
-///   (`runtime::stores::delta_record_bytes`); a qwen35moe load that verifies
-///   drafted rows asks for its own lane count ([`KvLayout::of_spec_lanes`]);
+///   file; its one state lane is stamped
+///   (`runtime::stores::delta_lane_bytes`) and beside it are the chunked
+///   prompt rule's carry (`runtime::stores::delta_carry_bytes`) and a verify
+///   record (`runtime::stores::delta_record_bytes`) of
+///   `runtime::stores::DELTA_VERIFY_ROWS` rows on a qwen4exp file, of
+///   [`PASS_ROWS`] on a qwen35moe load that verifies drafted rows and none
+///   on a plain one ([`KvLayout::of_spec_verifying`]);
 /// - the PLE site's layer, beside that: the PLE conv ring
 ///   (`(taps − 1)·dilation + PASS_ROWS` rows of `streams · n_embd` f32);
 /// - an attention layer: a position's K and V (`2 · kv_heads · head_dim`
@@ -1970,9 +1965,10 @@ pub struct KvLayout {
     kinds: Vec<Kind>,
     /// A GDN layer's state and conv ring, in bytes.
     recurrent: u64,
-    /// What one checkpoint copies of a GDN layer: the committed state lane
-    /// and the conv ring ([`recurrent_bytes`], without the other lanes), and
-    /// the carry on a qwen4exp file.
+    /// The replay table beside one delta store, zero when it has no verify record.
+    replay: u64,
+    /// What one checkpoint copies of a GDN layer: the state lane, the conv
+    /// ring ([`recurrent_bytes`]) and the carry.
     copy: u64,
     /// The PLE site's layer and its conv ring's bytes.
     ple: Option<(usize, u64)>,
@@ -1991,39 +1987,29 @@ pub struct KvLayout {
 }
 
 impl KvLayout {
-    /// The layout `spec` describes, its GDN layers keeping one lane: under
-    /// [`PROGRAM`] a verify records its rows beside the lane, and under the
-    /// Qwen3.5 body a load that verifies drafted rows asks for more lanes
-    /// ([`KvLayout::of_spec_lanes`]).
+    /// The layout `spec` describes for a load that does not verify drafted
+    /// rows ([`KvLayout::of_spec_verifying`]).
     ///
     /// # Errors
     ///
-    /// The layout's refusal of the description ([`KvLayout::of_spec_lanes`]).
+    /// The layout's refusal of the description ([`KvLayout::of_spec_verifying`]).
     pub fn of_spec(spec: &ModelSpec) -> Result<KvLayout, PlacementError> {
-        KvLayout::of_spec_lanes(spec, 1)
+        KvLayout::of_spec_verifying(spec, false)
     }
 
-    /// The layout `spec` describes with every GDN layer keeping `lanes`
-    /// stamped lanes of state (`runtime::stores::delta_lane_bytes`): one lane
-    /// is the state in place with no stamps, more are a verify's rows, one
-    /// lane a row. The lane count is an input of the layout, whichever model.
-    /// A layer is a GQA layer (a plane of every position, or the token-pool
-    /// selector's pooled keys) or a gated-delta-rule layer; the layers of one
-    /// kind share one shape.
+    /// The layout `spec` describes, every GDN layer keeping one stamped lane
+    /// of state, the carry and a verify record ([`gdn_bytes`]): under
+    /// [`PROGRAM`] of `DELTA_VERIFY_ROWS` rows on every load, under the
+    /// Qwen3.5 body of [`PASS_ROWS`] rows on a load that verifies drafted
+    /// rows (`verifies`) and none otherwise. A layer is a GQA layer (a plane
+    /// of every position, or the token-pool selector's pooled keys) or a
+    /// gated-delta-rule layer; the layers of one kind share one shape.
     ///
     /// # Errors
     ///
     /// A layer whose stores this layout does not size, or whose shape is not
     /// its kind's first, by layer ([`PlacementError::Unimplemented`]).
-    ///
-    /// # Panics
-    ///
-    /// On no lane, by name.
-    pub fn of_spec_lanes(spec: &ModelSpec, lanes: usize) -> Result<KvLayout, PlacementError> {
-        assert!(
-            lanes >= 1,
-            "KvLayout::of_spec_lanes: a state of at least one lane"
-        );
+    pub fn of_spec_verifying(spec: &ModelSpec, verifies: bool) -> Result<KvLayout, PlacementError> {
         let mut kinds = Vec::with_capacity(spec.layers.len());
         let mut pools = Vec::with_capacity(spec.layers.len());
         let mut gdn: Option<&DeltaRule> = None;
@@ -2064,36 +2050,32 @@ impl KvLayout {
                 other => return Err(refuse(other.what())),
             }
         }
+        let record_rows = if program_of(spec.arch) == Some(PROGRAM) {
+            DELTA_VERIFY_ROWS
+        } else if verifies {
+            PASS_ROWS
+        } else {
+            0
+        };
         let (recurrent, copy) = gdn.map_or((0, 0), |d| {
             gdn_bytes(
                 d.v_heads as usize,
                 d.k_heads as usize,
                 d.d as usize,
                 d.conv as usize,
-                lanes,
+                record_rows,
             )
-        });
-        // The Qwen3.8 body's chunked prompt rule keeps a chunk's rows beside
-        // each GDN layer's lane; a checkpoint copies them with the state. Its
-        // verify record and the lane's stamp stay on the card.
-        let program = gdn.filter(|_| program_of(spec.arch) == Some(PROGRAM));
-        let carry = program.map_or(0, |d| {
-            delta_carry_bytes(d.v_heads as usize, d.k_heads as usize, d.d as usize)
-        });
-        let record = program.map_or(0, |d| {
-            let (v, s) = (d.v_heads as usize, d.d as usize);
-            delta_record_bytes(v, s, DELTA_VERIFY_ROWS)
-                + if lanes == 1 {
-                    delta_lane_bytes(v, s, 1)
-                } else {
-                    0
-                }
         });
         let (kv_heads, head_dim, idx_dim) = attn.unwrap_or((0, 0, None));
         Ok(KvLayout {
             kinds,
-            recurrent: recurrent + carry + record,
-            copy: copy + carry,
+            recurrent,
+            replay: if record_rows > 0 {
+                runtime::stores::DELTA_REPLAY_BYTES
+            } else {
+                0
+            },
+            copy,
             ple: ple_site(spec)?,
             kv_heads: kv_heads as usize,
             head_dim: head_dim as usize,
@@ -2132,7 +2114,7 @@ impl KvLayout {
     ///
     /// # Errors
     ///
-    /// The layout's refusal of the description ([`KvLayout::of_spec_lanes`]).
+    /// The layout's refusal of the description ([`KvLayout::of_spec_verifying`]).
     pub fn trunk_bytes(spec: &ModelSpec, ctx_max: u64, q8: bool) -> Result<u64, PlacementError> {
         let layout = KvLayout::of_spec(spec)?.in_q8_if(q8);
         Ok((0..spec.layers.len())
@@ -2141,29 +2123,24 @@ impl KvLayout {
     }
 }
 
-/// A GDN layer's resident bytes and what one checkpoint of it copies, for
-/// `lanes` lanes of state: `(recurrent, copy)`. One lane is the state in
-/// place ([`recurrent_bytes`], no stamps); more add
-/// [`delta_lane_bytes`] — the other lanes and a stamp a lane.
-///
-/// # Panics
-///
-/// On no lane, by name.
+/// A GDN layer's resident bytes and what one checkpoint of it copies, with a
+/// verify record of `record_rows` rows: `(recurrent, copy)`. A checkpoint
+/// copies the state lane, the conv ring ([`recurrent_bytes`]) and the carry
+/// ([`delta_carry_bytes`]); beside them the card holds the lane's stamp
+/// ([`delta_lane_bytes`] at one lane) and the record
+/// ([`delta_record_bytes`]).
 fn gdn_bytes(
     v_heads: usize,
     k_heads: usize,
     state: usize,
     conv: usize,
-    lanes: usize,
+    record_rows: usize,
 ) -> (u64, u64) {
-    assert!(lanes >= 1, "gdn_bytes: a state of at least one lane");
-    let copy = recurrent_bytes(v_heads, k_heads, state, conv);
-    let lane_bytes = if lanes > 1 {
-        delta_lane_bytes(v_heads, state, lanes)
-    } else {
-        0
-    };
-    (copy + lane_bytes, copy)
+    let copy =
+        recurrent_bytes(v_heads, k_heads, state, conv) + delta_carry_bytes(v_heads, k_heads, state);
+    let beside =
+        delta_lane_bytes(v_heads, state, 1) + delta_record_bytes(v_heads, state, record_rows);
+    (copy + beside, copy)
 }
 
 /// The refusal of layer `layer`, whose `what` this layout does not size.
@@ -2246,10 +2223,9 @@ impl KvLayout {
     fn attention_bytes(&self, layer: usize, ctx_max: u64) -> (u64, u64) {
         match &self.select {
             Some((idx_dim, pools)) => {
-                let pool =
-                    pools.get(layer).copied().filter(|&p| p > 0).expect(
-                        "KvLayout: an attention layer's pool (of_spec_lanes refuses 0 there)",
-                    );
+                let pool = pools.get(layer).copied().filter(|&p| p > 0).expect(
+                    "KvLayout: an attention layer's pool (of_spec_verifying refuses 0 there)",
+                );
                 let ctx = usize::try_from(ctx_max).expect("KvLayout: a context of usize");
                 (
                     selecting_rows_bytes(
@@ -2932,9 +2908,9 @@ mod tests {
     };
 
     use super::{
-        DELTA_VERIFY_ROWS, Ffn, Kind, KvBytes, KvLayout, Mixer, ModelSpec, OutGate, PlacementError,
-        delta_carry_bytes, delta_lane_bytes, delta_record_bytes, gdn_bytes, ple_ring_bytes,
-        recurrent_bytes, refuse_other_program,
+        DELTA_VERIFY_ROWS, Ffn, Kind, KvBytes, KvLayout, Mixer, ModelSpec, OutGate, PASS_ROWS,
+        PlacementError, delta_carry_bytes, delta_lane_bytes, delta_record_bytes, gdn_bytes,
+        ple_ring_bytes, recurrent_bytes, refuse_other_program,
     };
 
     /// A GQA mixer of `kv_heads` key heads of 256 values, rotating `rope_dims` values of
@@ -3021,6 +2997,7 @@ mod tests {
     fn qwen38_layer_bytes() {
         let kv = KvLayout {
             kinds: vec![Kind::DeltaRule, Kind::DeltaRule, Kind::Attention],
+            replay: runtime::stores::DELTA_REPLAY_BYTES,
             recurrent: recurrent_bytes(48, 16, 128, 4)
                 + delta_lane_bytes(48, 128, 1)
                 + delta_record_bytes(48, 128, DELTA_VERIFY_ROWS)
@@ -3298,6 +3275,7 @@ mod tests {
                     }
                 })
                 .collect(),
+            replay: runtime::stores::DELTA_REPLAY_BYTES,
             recurrent: recurrent_bytes(48, 16, 128, 4)
                 + delta_lane_bytes(48, 128, 1)
                 + delta_record_bytes(48, 128, DELTA_VERIFY_ROWS)
@@ -3329,32 +3307,33 @@ mod tests {
         assert_eq!(kv.state_bytes(16_384), rows + 5 * checkpoint);
     }
 
-    /// The lane term ([`gdn_bytes`], the layout's one rule): Qwen3.6's 30 GDN
-    /// layers (32 value heads of 128, 16 key heads, a 4-tap conv) at one
-    /// lane are the state in place with no stamp; at eight each holds seven
-    /// more lanes of 2,097,152 B and a stamp a lane, so 30 layers add 420 MiB
-    /// and 960 B [derived]. A checkpoint copies one lane whatever the count.
-    /// The layer's bytes follow the term.
+    /// The record term ([`gdn_bytes`], the layout's one rule): a Qwen3.6 GDN
+    /// layer (32 value heads of 128, 16 key heads, a 4-tap conv) copies its
+    /// lane, ring and carry, 2,457,600 + 397,328 B, and holds a stamp of 4 B
+    /// beside them; a load that verifies adds a record of 8 rows of
+    /// 32 · 3 · 128 f32, 393,216 B, so its 30 GDN layers hold 11,796,480 B
+    /// more than a plain load's [derived]. A checkpoint copies the same
+    /// bytes whatever the record. The layer's bytes follow the term.
     #[test]
-    fn the_lane_count_is_the_layouts_input() {
-        let one = gdn_bytes(32, 16, 128, 4, 1);
-        let eight = gdn_bytes(32, 16, 128, 4, 8);
-        assert_eq!(
-            one,
-            (
-                recurrent_bytes(32, 16, 128, 4),
-                recurrent_bytes(32, 16, 128, 4)
-            )
-        );
-        assert_eq!(one.0, 2_097_152 + 360_448);
-        assert_eq!(eight.1, one.1, "a checkpoint copies one lane");
-        assert_eq!(eight.0 - one.0, 7 * 2_097_152 + 8 * 4);
-        assert_eq!(30 * (eight.0 - one.0), 420 * (1 << 20) + 960);
+    fn the_record_rows_are_the_layouts_input() {
+        let plain = gdn_bytes(32, 16, 128, 4, 0);
+        let verify = gdn_bytes(32, 16, 128, 4, PASS_ROWS);
+        let copy = recurrent_bytes(32, 16, 128, 4) + delta_carry_bytes(32, 16, 128);
+        assert_eq!(plain, (copy + 4, copy));
+        assert_eq!(copy, 2_097_152 + 360_448 + 397_328);
+        assert_eq!(verify.1, plain.1, "a checkpoint copies no record");
+        assert_eq!(verify.0 - plain.0, 393_216);
+        assert_eq!(30 * (verify.0 - plain.0), 11_796_480);
         let kinds = vec![Kind::DeltaRule, Kind::Attention];
-        let layout = |lanes| KvLayout {
+        let layout = |rows| KvLayout {
             kinds: kinds.clone(),
-            recurrent: gdn_bytes(32, 16, 128, 4, lanes).0,
-            copy: gdn_bytes(32, 16, 128, 4, lanes).1,
+            replay: if rows > 0 {
+                runtime::stores::DELTA_REPLAY_BYTES
+            } else {
+                0
+            },
+            recurrent: gdn_bytes(32, 16, 128, 4, rows).0,
+            copy: gdn_bytes(32, 16, 128, 4, rows).1,
             ple: None,
             kv_heads: 2,
             head_dim: 256,
@@ -3362,11 +3341,11 @@ mod tests {
             q8: false,
             rope_row: 64 * 4,
         };
-        assert_eq!(layout(1).layer_bytes(0, 4096), one.0);
-        assert_eq!(layout(8).layer_bytes(0, 4096), eight.0);
+        assert_eq!(layout(0).layer_bytes(0, 4096), plain.0);
+        assert_eq!(layout(PASS_ROWS).layer_bytes(0, 4096), verify.0);
         assert_eq!(
-            layout(8).layer_bytes(1, 4096),
-            layout(1).layer_bytes(1, 4096)
+            layout(PASS_ROWS).layer_bytes(1, 4096),
+            layout(0).layer_bytes(1, 4096)
         );
     }
 
@@ -3378,6 +3357,7 @@ mod tests {
         let plain = KvLayout {
             kinds: vec![Kind::Attention],
             recurrent: 0,
+            replay: 0,
             copy: 0,
             ple: None,
             kv_heads: 4,
@@ -3394,6 +3374,7 @@ mod tests {
         let selecting = KvLayout {
             kinds: vec![Kind::Attention],
             recurrent: 0,
+            replay: 0,
             copy: 0,
             ple: None,
             kv_heads: 2,
@@ -4642,11 +4623,21 @@ mod tests {
         /// `SeqTerms::plan_kv` of the slots.
         #[test]
         fn slot_plans_count_every_term_per_slot() {
+            let mut verifying = inputs();
             let (inputs, machine) = (inputs(), machine());
             assert_eq!(
                 inputs.seq_terms(None).beside,
                 slot_resident_bytes(&inputs.spec) + 120
             );
+            verifying.spec.arch = Arch::Qwen35Moe;
+            for verifies in [false, true] {
+                verifying.kv = KvLayout::of_spec_verifying(&verifying.spec, verifies).unwrap();
+                assert_eq!(
+                    verifying.seq_terms(None).beside - slot_resident_bytes(&verifying.spec),
+                    if verifies { 120 } else { 0 },
+                    "each verifying delta store holds one replay table"
+                );
+            }
             let mtp =
                 MtpInputs::from_parts(draft(HeadSet::Full), &file()).expect("the draft's inputs");
             let levers = PlanLevers::default();

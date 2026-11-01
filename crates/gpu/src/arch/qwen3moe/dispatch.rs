@@ -256,7 +256,7 @@ pub(super) fn enqueue_pass(
 /// embedding is followed by the unit's dense route table, and a layer is
 /// its mixer — the gated attention's norm, quantizer, three GEMMs, rope,
 /// prefill flash, gated quantizer, output GEMM and residual add, 10; the
-/// delta rule's 12 ([`delta::launches`]) — and the FFN's norm, quantizer,
+/// delta rule's 13 ([`delta::launches`]) — and the FFN's norm, quantizer,
 /// router logits and routing, route table, gate, up, SwiGLU quantizer, down
 /// and combine, 10; with the shared expert kept apart, the norm, the
 /// router's two, the card list, the routed table, the routed four, the
@@ -265,7 +265,9 @@ pub(super) fn enqueue_pass(
 /// up, SwiGLU quantizer, down and combine, 7. A wide input is quantized once
 /// for each form its sites read ([`wide_quants`]: none for F32 sites alone, two for
 /// a K-quant beside a Q8_0 or an NVFP4), and a gated output projection not of a K-quant
-/// takes the f32 out gate and its own quantizer in place of the gated one.
+/// takes the f32 out gate and its own quantizer in place of the gated one, except
+/// where the gated flash stores the gated rows (`wide::flash_gates`): there the
+/// quantizer alone, none for F32.
 pub(super) fn pass_launches(plans: &[LayerPlan], m: usize) -> usize {
     let wide = m > GEMV_COLS;
     let many = usize::from(m > 1);
@@ -273,8 +275,9 @@ pub(super) fn pass_launches(plans: &[LayerPlan], m: usize) -> usize {
     let per_layer = |p: &LayerPlan| {
         let mixer = match &p.mixer {
             MixerPlan::Gqa(g) if wide => {
-                let out = if g.o_ty.kquant() {
-                    1
+                // The gated flash stores the gated rows: the quantizer alone.
+                let out = if g.o_ty.kquant() || wide::flash_gates(g) {
+                    wide_quants(&[g.o_ty])
                 } else {
                     1 + wide_quants(&[g.o_ty])
                 };

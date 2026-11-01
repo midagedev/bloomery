@@ -35,12 +35,14 @@
 //! `add_bos_token` asks for one; no chat template) and prints the generated text after the ids.
 //!
 //! `--last-step` (a qwen3moe or qwen35moe file, refused by name on any
-//! other and beside `--time` and `--seed-depth`) feeds the prompt
-//! less its last id by `--prefill`, then the last id as one step, whose
-//! argmax is generated token 0: the server's cut (`bloomery-serve --model
-//! qwen3` prefills a request's prompt less its last id, then steps it), so
-//! the two print the same greedy ids past eight prompt ids, where the
-//! ubatch and the step compute the last position by different arms.
+//! other and beside `--time` and `--seed-depth`) feeds the prompt as the
+//! server's last call does: where the body folds the last id into the call
+//! (`app::Prompt::closes`), one closing call; else the prompt less its last
+//! id by `--prefill`, then the last id as one step, whose argmax is
+//! generated token 0, the server's cut (`bloomery-serve --model qwen3`
+//! prefills a request's prompt less its last id, then steps it). So the two
+//! print the same greedy ids past eight prompt ids, where the ubatch and the
+//! step compute the last position by different arms.
 //!
 //! The prompt is prefilled (`Qwen3moeModel::prefill_with` by the `--prefill`
 //! path: `auto` takes one pass for a prompt of up to eight ids and GEMM
@@ -412,8 +414,8 @@ fn a_dense_header_plans_through_qwen35_on() {
 
 #[cfg(all(test, feature = "gpu"))]
 #[test]
-fn a_drafted_verdict_prices_the_engines_lanes() {
-    q3place::tests::a_drafted_verdict_prices_the_engines_lanes();
+fn a_drafted_verdict_prices_the_engines_records() {
+    q3place::tests::a_drafted_verdict_prices_the_engines_records();
 }
 
 #[cfg(feature = "gpu")]
@@ -760,6 +762,18 @@ mod cli {
             Ok(None)
         }
 
+        /// The server's last call of `ids` where the body folds the last id
+        /// into it ([`app::Prompt::closes`]): one closing call, its argmax and
+        /// the units it ran; `None` where the body does not, whose server
+        /// feeds the call less that id, then its step.
+        fn closing(
+            _m: &mut GpuModel<Self>,
+            _ids: &[u32],
+            _path: Self::Path,
+        ) -> Result<Option<(u32, Units)>, GateError> {
+            Ok(None)
+        }
+
         /// Mark a prompt call of `n` ids from cache position `pos` on the
         /// host tier's route trace (`Hybrid::route_prompt`), before the ids
         /// run; nothing for a body with no host tier.
@@ -1067,6 +1081,28 @@ mod cli {
                 next = Some(pass35(m, rows)?);
             }
             next.ok_or_else(|| "the prompt has no ids".into())
+        }
+
+        /// A closing call on the selected path, where the body folds the
+        /// last id into its final wide unit.
+        fn closing(
+            m: &mut Qwen35moeModel,
+            ids: &[u32],
+            path: PrefillPath,
+        ) -> Result<Option<(u32, Units)>, GateError> {
+            let path = match path {
+                PrefillPath::Auto => PrefillPath::Wide,
+                other => other,
+            };
+            if !m.closes_by_ubatch(ids.len(), path)? {
+                return Ok(None);
+            }
+            let plan = Self::plan(m, ids.len(), path)?;
+            let next = bloomery_gpu::host::served::prompt_pass(m, |m| {
+                m.prefill_call(ids, path, runtime::prompt::CallEnd::Close)
+            })?
+            .ok_or("the closing call read no token")?;
+            Ok(Some((next, plan)))
         }
 
         /// The prompt call's image when a ubatch of `units` ran, its
@@ -1614,7 +1650,8 @@ mod cli {
         /// `BLOOMERY_MTP_WIDTH`, as the levers hold it: the width chooser's
         /// mode (`cost`) or the fixed window (`fixed`).
         width: WidthMode,
-        /// `--last-step`: the prompt's last id is a step of its own.
+        /// `--last-step`: the prompt's last call is the server's (a closing
+        /// call where the body folds the last id, else that id a step).
         last_step: bool,
         /// `BLOOMERY_GEN_SLOTS`: the streams an arm decodes in one pass.
         slots: usize,
@@ -2000,8 +2037,8 @@ mod cli {
             && (!matches!(family, Family::Qwen3 | Family::Qwen35) || timed || seed_depth.is_some())
         {
             return Err(format!(
-                "--last-step feeds a qwen3moe or qwen35moe prompt's last id as a step, the server's \
-                 cut; it is refused on a {} file and beside --time and --seed-depth",
+                "--last-step feeds a qwen3moe or qwen35moe prompt's last call as the server does; \
+                 it is refused on a {} file and beside --time and --seed-depth",
                 family.name()
             )
             .into());
@@ -3814,14 +3851,20 @@ mod cli {
         B::mark_prompt(m, m.pos(), ids.len())?;
         let plan = B::plan(m, fed.len().max(1), path)?;
         let t = Instant::now();
-        let mut next = match (fed.is_empty(), last) {
-            (false, None) => B::prefill(m, fed, path)?,
-            (false, Some(l)) => {
+        // A row dump keeps the prompt call and the step it records.
+        let closed = match run.last_step {
+            true if logit_rows.is_none() => B::closing(m, ids, path)?,
+            _ => None,
+        };
+        let (mut next, plan) = match (closed, fed.is_empty(), last) {
+            (Some(ran), ..) => ran,
+            (None, false, None) => (B::prefill(m, fed, path)?, plan),
+            (None, false, Some(l)) => {
                 B::prefill(m, fed, path)?;
-                m.step(&[l])?
+                (m.step(&[l])?, plan)
             }
-            (true, Some(l)) => m.step(&[l])?,
-            (true, None) => return Err("the prompt has no ids".into()),
+            (None, true, Some(l)) => (m.step(&[l])?, plan),
+            (None, true, None) => return Err("the prompt has no ids".into()),
         };
         let prefill_wall = t.elapsed();
         if let Some(rows) = &mut logit_rows {
@@ -4164,6 +4207,71 @@ mod cli {
 
         fn options(args: &[&str]) -> Options {
             Options::parse(args.iter().map(|s| (*s).to_owned())).unwrap()
+        }
+
+        /// The CLI's closing hook must keep the selected pass schedule, also when
+        /// a row dump keeps the final step separate. Forcing Wide in the hook
+        /// makes the no-dump arm report kind=gemm and fails the assertion.
+        #[test]
+        #[ignore = "needs a CUDA device and the qwen35moe model; `just gate-gpu-qwen35moe-e2e` runs it"]
+        fn hw_last_step_keeps_pass_path() {
+            use bloomery_gpu_gates::record::{Log, TIME_PROMPT};
+            use std::process::Command;
+            let exe = std::env::current_exe().expect("the test executable");
+            let cli = exe
+                .parent()
+                .and_then(|p| p.parent())
+                .expect("target/release/deps")
+                .join("generate_qwen3moe");
+            let ids = ["760"; 128].join(",");
+            let dump =
+                std::env::temp_dir().join(format!("generate-prefill-{}.rows", std::process::id()));
+            let forced = dump.with_extension("ids");
+            std::fs::write(&forced, "0\n").expect("the forced id file");
+            for rows in [false, true] {
+                let mut cmd = Command::new(&cli);
+                cmd.args([
+                    "--tokens",
+                    &ids,
+                    "--ctx",
+                    "256",
+                    "-n",
+                    "1",
+                    "--prefill",
+                    "pass",
+                    "--last-step",
+                ])
+                .env(
+                    bloomery_levers::FORCE_IDS,
+                    format!("{}:0", forced.display()),
+                );
+                if rows {
+                    cmd.arg("--logit-rows").arg(&dump);
+                }
+                let out = cmd.output().expect("run the CLI");
+                let stdout = String::from_utf8(out.stdout).expect("CLI stdout is UTF-8");
+                let stderr = String::from_utf8(out.stderr).expect("CLI stderr is UTF-8");
+                assert!(out.status.success(), "rows={rows}: {stdout}\n{stderr}");
+                let prompt = Log::of(&stdout, &[&TIME_PROMPT])
+                    .one(&TIME_PROMPT)
+                    .expect("exactly one complete prompt record");
+                assert_eq!(prompt.u64("n").unwrap(), 128, "rows={rows}");
+                assert_eq!(prompt.u64("passes").unwrap(), 16, "rows={rows}");
+                assert_eq!(
+                    prompt.word("kind").unwrap(),
+                    "prefill",
+                    "rows={rows}: {stdout}"
+                );
+                if rows {
+                    assert!(
+                        std::fs::metadata(&dump)
+                            .expect("the logit dump exists")
+                            .len()
+                            > 0
+                    );
+                }
+                println!("last-step pass: rows={rows} n=128 passes=16 kind=prefill");
+            }
         }
 
         #[test]

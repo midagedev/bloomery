@@ -43,7 +43,9 @@ use super::body35::Body35;
 use super::dispatch::{Ctx, PassCtx};
 use super::experts::CombineArgs;
 use super::hostleg::{HostCombineArgs, HostLegKernels};
-use super::plan::{DeltaPlan, FfnPlan, FfnRoute, GqaKind, GqaPlan, Pairs, SharedPlan, SiteTy};
+use super::plan::{
+    DeltaPlan, FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, Pairs, SharedPlan, SiteTy,
+};
 use super::program::{Program, Tail};
 use super::scratch::{
     ApartForms, Append128, Append256, AppendNorm, Arena, Dims, Forms, GdnArena, KvPlanes,
@@ -52,6 +54,7 @@ use super::scratch::{
 use super::taps35::Ffn35Run;
 use crate::card_leg::RouteIo;
 use crate::flash_gqa::{HEAD, HEAD_256, partials_ms_len, partials_v_len, partials_v_len_256};
+use crate::flash_gqa_prefill::QueryNorm;
 use crate::gated_quant::GateLayout;
 use crate::gemm::{GEMM_MAX_SLOTS, Gemm32Kernels, GemmInput, GemmRoute};
 use crate::hybrid::HOST;
@@ -472,12 +475,24 @@ fn gated_256_in(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Result<(),
     gemm(c, (n.v_ty, &n.attn_v), d.kv_len(), &hid, table, m, v)
 }
 
-/// The head-256 half's middle ([`attn_core`]): the q/k norm and the turn of
-/// the first 64 values with the cache append, the queries read out of the
-/// `[q | gate]` rows into their own buffer; the prefill flash; then the flash
-/// rows times σ(gate) — quantized in one launch for a K-quant `attn_output`,
-/// for any other type the out gate into the arena's gated rows (`q_out` keeps
-/// the queries the flash read), quantized as that projection takes them.
+/// Whether the head-256 half's prompt flash takes the `[q | gate]` rows
+/// itself ([`gated_256_core`]): where the shape table's row is the pack of
+/// four, which the gated flash entry serves; another row keeps its own flash.
+pub(super) fn flash_gates(n: &GqaPlan) -> bool {
+    n.kind == GqaKind::Gated256 && n.flash == Flash::Quads
+}
+
+/// The head-256 half's middle ([`attn_core`]). Where the gated flash serves
+/// the heads ([`flash_gates`]): the k norm and the turn of its first 64
+/// values with the cache append, then one prompt flash over the `[q | gate]`
+/// rows that norms and turns each query in its staging and stores each value
+/// times σ(gate) (`QueryNorm`), the rows quantized as `attn_output` takes
+/// them. Else: the q/k norm and turn with the append, the queries read out of
+/// the `[q | gate]` rows into their own buffer; the prefill flash; then the
+/// flash rows times σ(gate) — quantized in one launch for a K-quant
+/// `attn_output`, for any other type the out gate into the arena's gated rows
+/// (`q_out` keeps the queries the flash read), quantized as that projection
+/// takes them.
 fn gated_256_core(
     c: &Ctx<'_>,
     n: &GqaPlan,
@@ -506,6 +521,8 @@ fn gated_256_core(
         WHAT_GATED,
         "the arena's buffer of gated queries",
     ))?;
+    let gates = flash_gates(n);
+    let gq = f32_gain(w, &n.attn_q_norm)?;
     // SAFETY: the layer program embeds consecutive positions before attention;
     // saturation is outside the cache. Each call uses one sequence's row window
     // and its own cache planes, not the combined positions of different slots.
@@ -518,12 +535,13 @@ fn gated_256_core(
                 q: q_out,
                 k: kr,
                 v,
-                gq: f32_gain(w, &n.attn_q_norm)?,
+                gq,
                 gk: f32_gain(w, &n.attn_k_norm)?,
                 table: c.table,
                 pos,
                 eps: c.eps,
-                n_head: d.n_head,
+                // The gated flash norms and turns the query heads it reads.
+                n_head: if gates { 0 } else { d.n_head },
                 n_kv: d.n_kv,
                 ctx: d.ctx,
                 m,
@@ -531,6 +549,32 @@ fn gated_256_core(
             },
         )
     }?;
+    if gates {
+        kv.prefill_256_gated(
+            &k.prefill,
+            stream,
+            PrefillFlash {
+                q,
+                n_keys,
+                scale: ATTN_SCALE_256,
+                n_head: d.n_head,
+                n_kv: d.n_kv,
+                ctx: d.ctx,
+                t: m,
+                fault: c.sink,
+                y: &mut *attn,
+            },
+            QueryNorm {
+                gain: gq,
+                table: c.table,
+                pos,
+                eps: c.eps,
+            },
+        )?;
+        return wd
+            .act_attn
+            .quantize(gpu, &wide_kernels(k), c.sink, attn, m, &[n.o_ty]);
+    }
     kv.prefill_256(
         &k.prefill,
         stream,
@@ -586,8 +630,8 @@ fn gated_256_core(
 
 /// The head-256 half's output side ([`attn_out`]): `ffn_inp = x + W_o ·
 /// (flash ⊙ σ(gate))`, the projection reading the gated rows' forms
-/// [`gated_256_core`] wrote — the flash rows' for a K-quant, the arena's
-/// gated rows' for any other type.
+/// [`gated_256_core`] wrote — the flash rows' where the gated flash ran or
+/// for a K-quant, the arena's gated rows' for any other type.
 fn gated_256_out(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Result<(), GpuError> {
     let d = s.dims;
     let Arena {
@@ -604,7 +648,7 @@ fn gated_256_out(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Result<()
         attn_o,
         ..
     } = wide_of(wide, WHAT_GATED)?;
-    let gated: &DeviceBuffer<f32> = if n.o_ty.kquant() {
+    let gated: &DeviceBuffer<f32> = if n.o_ty.kquant() || flash_gates(n) {
         attn
     } else {
         gated_rows
@@ -868,9 +912,10 @@ fn neox_128_out(
 }
 
 /// A delta layer's input half at `m` rows: `x` normed and quantized into the
-/// forms its projections read, then its four projections — `attn_qkv`,
-/// `attn_gate`, β and α — into the arena's `[x | z | b | a]` blocks, each a
-/// GEMM of its type.
+/// forms its projections read, then three of its projections — `attn_qkv`,
+/// β and α — into the arena's `x`, `b` and `a` blocks, each a GEMM of its
+/// type; `attn_gate` runs after the delta step with the gated norm
+/// ([`delta_gate`]).
 pub(super) fn delta_in(
     c: &Ctx<'_>,
     d: &DeltaPlan,
@@ -910,15 +955,48 @@ pub(super) fn delta_in(
         &[d.qkv_ty, d.gate_ty, d.beta_ty, d.alpha_ty],
     )?;
     let (a, t) = (wd.act_hid.input(normed), (&wd.dense, GemmInput::PerSlot));
-    let (ch, zl, nv) = (d.shape.channels(), d.shape.n_v * linear::HEAD, d.shape.n_v);
+    let (ch, nv) = (d.shape.channels(), d.shape.n_v);
     gemm(c, (d.qkv_ty, &d.qkv), ch, &a, t, m, &mut g.x)?;
-    gemm(c, (d.gate_ty, &d.gate), zl, &a, t, m, &mut g.z)?;
     gemm(c, (d.beta_ty, &d.beta), nv, &a, t, m, &mut g.b)?;
     gemm(c, (d.alpha_ty, &d.alpha), nv, &a, t, m, &mut g.a)
 }
 
-/// A delta layer's output half at `m` rows: the gated norm's rows (the
-/// arena's `attn`) quantized into the form `ssm_out` reads, `ssm_out`, then
+/// A delta layer's gate projection and gated norm at `m` rows over the
+/// normed input's forms [`delta_in`] wrote: `attn_gate` into `z`, then the
+/// norm of the delta output under the layer's SiLU gate (`tail`) into the
+/// arena's `attn`, in the forms `ssm_out` reads, through the shared site owner
+/// (`site::resident_gemm_norm_gate`).
+pub(super) fn delta_gate(
+    c: &Ctx<'_>,
+    d: &DeltaPlan,
+    (normed, wide): (&DeviceBuffer<f32>, &mut Option<Wide>),
+    (norm, z, tail): (
+        &crate::linear::norm_gate::NormGateKernels,
+        &mut DeviceBuffer<f32>,
+        crate::linear::norm_gate::NormGateTail<'_>,
+    ),
+    m: usize,
+) -> Result<(), GpuError> {
+    let Wide {
+        act_hid,
+        act_attn,
+        dense,
+        ..
+    } = wide_of(wide, "qwen3moe::wide::delta_gate")?;
+    site::resident_gemm_norm_gate(
+        c.gpu,
+        &wide_kernels(c.k),
+        (c.w, &d.gate),
+        &act_hid.input(normed),
+        dense,
+        m,
+        (norm, z, tail),
+        (&[&d.ssm_out], act_attn.views_mut()),
+    )
+}
+
+/// A delta layer's output half at `m` rows: `ssm_out` over the forms of the
+/// gated norm's rows (the arena's `attn`) [`delta_gate`] wrote, then
 /// `ffn_inp = x + ssm_out(·)`.
 pub(super) fn delta_out(
     c: &Ctx<'_>,
@@ -938,8 +1016,6 @@ pub(super) fn delta_out(
         ..
     } = s;
     let wd = wide_of(wide, WHAT_OUT)?;
-    wd.act_attn
-        .quantize(c.gpu, &wide_kernels(c.k), c.sink, attn, m, &[d.out_ty])?;
     let Wide {
         act_attn,
         dense,

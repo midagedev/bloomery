@@ -2,8 +2,10 @@
 
 use crate::{GateError, bits_equal, verdict};
 use bloomery_gpu::flash_gqa_prefill::GqaPrefillArgs;
+use bloomery_gpu::model::GpuModel;
 use bloomery_gpu::{Gpu, GpuError, Window};
 use cuda_core::{CudaStream, DeviceBuffer};
+use runtime::prompt::CallEnd;
 
 /// Host values of the f16 cache planes.
 pub struct HostCache {
@@ -186,4 +188,28 @@ pub fn window_refusals(
         ok &= named;
     }
     Ok(ok)
+}
+
+/// The argmax after a prompt call, the logits' bits, and three greedy
+/// steps' ids and logits' bits.
+pub type Closed = (u32, Vec<u32>, Vec<(u32, Vec<u32>)>);
+
+/// [`Closed`] of `ids` fed from where `m` stands by its body's prompt
+/// schedule ([`app::Prompt::prompt_call`]), ending as `end` asks.
+pub fn closed_run<B: app::Prompt>(
+    m: &mut GpuModel<B>,
+    ids: &[u32],
+    end: CallEnd,
+) -> Result<Closed, GateError> {
+    let bits = |m: &GpuModel<B>| -> Result<Vec<u32>, GateError> {
+        Ok(m.logits()?.iter().map(|v| v.to_bits()).collect())
+    };
+    let first = B::prompt_call(m, ids, end)?.ok_or("the call read no token")?;
+    let row = bits(m)?;
+    let (mut steps, mut feed) = (Vec::new(), first);
+    for _ in 0..3 {
+        feed = m.step(&[feed])?;
+        steps.push((feed, bits(m)?));
+    }
+    Ok((first, row, steps))
 }

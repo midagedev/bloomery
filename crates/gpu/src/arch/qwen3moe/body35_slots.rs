@@ -30,10 +30,12 @@
 //! A pass takes no checkpoint: those are a prompt call's. A cut waiting on
 //! a slot is carried out on that slot's stores before the pass's launches,
 //! as its step's refresh carries it out ([`Body35::stand_held`]), so no
-//! restore lands over rows a pass wrote. A pass writes its rows' states in
-//! place into each slot's one lane, so it keeps its rows whole
-//! ([`SlotRows::SETTLES_PARTIAL_KEEP`] stays false): keeping a part of them
-//! would need the state after a kept row, which no lane holds.
+//! restore lands over rows a pass wrote. On a plain load a pass writes its
+//! rows' states in place into each slot's one lane and keeps its rows whole.
+//! On a load that verifies ([`Body35::verifies`]) each slot's rows are a
+//! verify recorded into its stores' records, waiting for that slot's
+//! commit, which keeps any `1..=m` of them by a replay of their records
+//! ([`SlotRows::keep_slot`], [`SlotRows::SETTLES_PARTIAL_KEEP`]).
 
 use super::body::{ATTN_SCALE, ATTN_SCALE_256};
 use super::body35::{Body35, Slot35};
@@ -87,6 +89,10 @@ impl SlotRows for Body35 {
     /// One head of every row: the pass's rows read the lm_head once.
     const HEADS: RowHeads = RowHeads::One;
 
+    /// A load that verifies settles a partial keep: each slot's commit
+    /// replays its kept rows' records ([`SlotRows::keep_slot`]).
+    const SETTLES_PARTIAL_KEEP: bool = true;
+
     /// The chain the placed replay serves ([`slot_chain`]). A whole-card
     /// load has no host service of the pass.
     fn chain_of(rows: &[SlotRange]) -> Chain {
@@ -96,16 +102,16 @@ impl SlotRows for Body35 {
     /// Plan the pass of `rows` (the busy slots' ranges in pass order, any
     /// slot's first) over `ids` (every row's token), `parked`
     /// every busy slot's sequence but slot 0's — the live one — in `rows`
-    /// order. Refused by name before anything moves: a load that verifies
-    /// drafted rows, the
+    /// order. Refused by name before anything moves: the
     /// layer taps armed, ranges that do not tile the pass from row 0, a
     /// parked count other than the ranges past slot
     /// 0, an id count other than the rows, and for each slot on its own
     /// sequence stores that do not stand at its first position (a call
-    /// there failed past its launch, [`Body35::stores_at`]) or an id past
-    /// the vocabulary. Then each slot on its own sequence: its waiting cut
-    /// carried out and its stores counted past its rows
-    /// ([`Body35::stand_held`]); and the slots' input records written.
+    /// there failed past its launch, [`Body35::stores_at`]), a verify
+    /// waiting, or an id past the vocabulary. Then each slot on its own
+    /// sequence: its waiting cut carried out and its stores counted past its
+    /// rows ([`Body35::stand_held`]), on a load that verifies its rows a
+    /// verify waiting for its commit; and the slots' input records written.
     fn plan_slots(
         &mut self,
         stream: &CudaStream,
@@ -114,7 +120,6 @@ impl SlotRows for Body35 {
         ids: &[u32],
     ) -> Result<(), GpuError> {
         self.slots_planned = None;
-        self.refuse_verify()?;
         if self.taps.is_some() {
             return Err(GpuError::state(
                 WHAT,
@@ -138,7 +143,9 @@ impl SlotRows for Body35 {
             b.check_slot(r, r.ids(WHAT, ids)?)
         })?;
         for_slots(self, parked, rows, |b, r| {
-            b.stand_held(stream, r.pos0, r.rows.len())
+            b.stand_held(stream, r.pos0, r.rows.len())?;
+            b.hold_verify(r.pos0, r.rows.len());
+            Ok(())
         })?;
         self.slot_in.write(stream, rows, ids)?;
         self.slots_planned = Some(rows.to_vec());
@@ -150,8 +157,8 @@ impl SlotRows for Body35 {
     /// live stores, every other slot's over its parked sequence's. An eager
     /// pass needs the plan of these very ranges; a capture records the
     /// launches only. A placed load runs the FFN as one pass of the rows
-    /// ([`walk_placed`]). Refused by name: a load that verifies drafted rows,
-    /// ranges as the plan refuses them, more rows than the pass arena
+    /// ([`walk_placed`]). Refused by name: ranges as the plan refuses them,
+    /// more rows than the pass arena
     /// holds, any other heads.
     fn enqueue_slots(
         &mut self,
@@ -161,7 +168,6 @@ impl SlotRows for Body35 {
         parked: &mut [&mut Slot35],
         rows: &[SlotRange],
     ) -> Result<(), GpuError> {
-        self.refuse_verify()?;
         let total = SlotRowOrder::Any.admit(WHAT, rows, parked.len())?;
         if total > self.a.rows {
             return Err(GpuError::shape(
@@ -197,6 +203,7 @@ impl SlotRows for Body35 {
             slot_in,
             slot_lane,
             placed,
+            verifies,
             ..
         } = self;
         let live = rope_table(rope, seq_rope.as_ref());
@@ -244,10 +251,52 @@ impl SlotRows for Body35 {
                 seqs: &mut seqs,
                 s: a,
                 head: Some((head, head_state)),
+                verify: *verifies,
             };
             return Walk::new(&mut ops, c.plans, total).run(rows);
         };
         walk_placed(&c, &mut seqs, a, total, (head, head_state), placed)
+    }
+
+    /// The slot of `r` keeps its first `kept` rows: on a load that verifies,
+    /// the commit of its waiting verify ([`Body35::commit`]: the kept rows'
+    /// records replayed into its lanes) on `seq` — a parked slot's
+    /// sequence, exchanged in and back out — or on the live sequence; on a
+    /// plain load every row is kept already (`refuse_verify` refuses a
+    /// verify pass there).
+    fn keep_slot(
+        &mut self,
+        gpu: &Gpu,
+        seq: Option<&mut Slot35>,
+        r: &SlotRange,
+        kept: usize,
+    ) -> Result<(), GpuError> {
+        if !self.verifies() {
+            return Ok(());
+        }
+        let at = r.pos0 + crate::launch_u32(WHAT, "kept rows", kept)?;
+        match seq {
+            None => self.commit(gpu, at),
+            Some(seq) => {
+                self.exchange(seq);
+                let out = self.commit(gpu, at);
+                self.exchange(seq);
+                out
+            }
+        }
+    }
+
+    /// A verify pass refused by name on a plain load, whose pass keeps its
+    /// rows whole.
+    fn refuse_verify(&self) -> Result<(), GpuError> {
+        if self.verifies() {
+            return Ok(());
+        }
+        Err(GpuError::shape(
+            WHAT,
+            "a verify of several slots on a plain load: its pass writes every row in place \
+             (GpuModel::open_verifying)",
+        ))
     }
 }
 
@@ -278,27 +327,16 @@ impl Body35 {
             .unwrap_or_default()
     }
 
-    /// Refused by name on a load that verifies drafted rows, whose delta
-    /// stores keep their lanes for one sequence's verify.
-    fn refuse_verify(&self) -> Result<(), GpuError> {
-        if self.lanes() > 1 {
-            return Err(GpuError::shape(
-                WHAT,
-                "a pass of several slots on a load that verifies drafted rows: its delta stores \
-                 keep their lanes for one sequence's verify",
-            ));
-        }
-        Ok(())
-    }
-
     /// Refused by name unless the live sequence takes `tokens` from `r.pos0`
-    /// as slot `r.slot`'s rows of a pass: its stores stand there, the
-    /// position is not inside an image its table holds
+    /// as slot `r.slot`'s rows of a pass: its stores stand there, no verify
+    /// of its waits for its commit, the position is not inside an image its
+    /// table holds
     /// ([`MediaCarrier::refuse_inside_image`]), and every id is below the
     /// vocabulary.
     fn check_slot(&self, r: &SlotRange, tokens: &[u32]) -> Result<(), GpuError> {
         let named = |e: GpuError| GpuError::shape(WHAT, format!("slot {}: {e}", r.slot));
         self.stores_at(r.pos0).map_err(named)?;
+        self.refuse_pending(WHAT, r.pos0).map_err(named)?;
         self.refuse_inside_image(WHAT, r.pos0).map_err(named)?;
         super::refuse_past_vocab(WHAT, tokens, self.vocab).map_err(named)
     }
@@ -346,6 +384,8 @@ struct Slots35<'a, 'q> {
     seqs: &'a mut [SlotSeq35<'q>],
     s: &'a mut Arena,
     head: Option<(&'a mut Head, &'a mut HeadArgmaxState)>,
+    /// Whether each slot's delta step is a verify ([`Body35::verifies`]).
+    verify: bool,
 }
 
 /// A placed load's pass (module doc): each layer's front through the
@@ -390,6 +430,7 @@ impl ColsMix for Mix35<'_, '_> {
             seqs: &mut *self.seqs,
             s,
             head: None,
+            verify: false,
         };
         walk::front(&mut ops, cx)
     }
@@ -675,10 +716,12 @@ impl ChainOps for Slots35<'_, '_> {
     }
 
     /// Every slot's conv and delta step over its rows, its conv ring and its
-    /// state at the slot's lane word, one launch each over every slot
-    /// (`linear::seqs`), then the gated norm over every row.
+    /// state at the slot's lane word — in place, or a verify recorded into
+    /// the slot's records on a load that verifies —, one launch each over
+    /// every slot (`linear::seqs`), then the gated norm over every row.
     fn delta_core(&mut self, l: LayerCtx<'_>, d: &DeltaPlan) -> Result<(), GpuError> {
         let (c, seqs, s, m) = (&layer_ctx(self.c, l)?, &mut *self.seqs, &mut *self.s, l.m);
+        let verify = self.verify;
         let (gpu, w) = (c.gpu, c.w);
         let lin = &c.k.q35(WHAT)?.linear;
         let stream = gpu.stream();
@@ -696,7 +739,7 @@ impl ChainOps for Slots35<'_, '_> {
                     .lane
                     .ok_or(GpuError::state(WHAT, "a slot's lane word"))?,
                 rec: rec_of(&mut *q.stores, c.layer)?,
-                stamped: None,
+                verify,
             });
         }
         linear::seqs::enqueue_gdn_seqs(

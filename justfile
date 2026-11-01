@@ -1571,7 +1571,7 @@ gate-gpu-qwen35moe-moe *ARGS:
 # step4·d1k 세트는 ik의 프리필 상태(cache_s·cache_k·cache_v)를 실어 한 스텝을 댄다.
 [group('pool')]
 gate-gpu-qwen35moe-e2e:
-    BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_e2e'
+    BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_e2e --bin generate_qwen3moe && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_e2e && bash tools/gate.sh --gpu --oxide -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe -- --ignored hw_last_step_keeps_pass_path --nocapture'
 
 # Qwen3.6's placed load on the common card leg's types (`gate_qwen35moe_e2e --common-placed-only`, clause (o9)): the file planned
 # with no card expert (the host tier's chain) and at (o)'s budget, the card running every layer's experts by the leg its types name
@@ -1583,12 +1583,12 @@ gate-gpu-qwen35moe-e2e:
 gate-gpu-qwen35moe-leg:
     BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_e2e --common-placed-only'
 
-# The Qwen3.6 verify gate (one card): a load opened to verify drafted rows (`open_verifying`: 8 stamped lanes a delta layer)
-# commits every `accepted` in 1..=m of a verify of m = 4 and 8 rows with no re-feed and no copy, and the 16 steps after it
-# give the plain load's ids and last logits bit for bit (graph and eager, a chain of commits too); a lookup draft over
-# `Session<Body35>` emits the plain run's 64 ids with partial commits; the plain load's store bytes, plan layout bytes and
-# graph node counts equal their header derivation and the verifying load adds exactly the lanes (420 MiB + 960 B of
-# stamps); a cut to a checkpoint after a commit; the refusals by name. The real Qwen3.6 file.
+# The Qwen3.6 verify gate (one card): a load opened to verify drafted rows (`open_verifying`: a verify record of 8 rows
+# beside each delta layer's lane) commits every `accepted` in 1..=m of a verify of m = 4 and 8 rows with no re-feed and no
+# copy, and the 16 steps after it give the plain load's ids and last logits bit for bit (graph and eager, a chain of
+# commits too); a lookup draft over `Session<Body35>` emits the plain run's 64 ids with partial commits; the plain load's
+# store bytes, plan layout bytes and graph node counts equal their header derivation and the verifying load adds exactly
+# the records (11,796,480 B); a cut to a checkpoint after a commit; the refusals by name. The real Qwen3.6 file.
 [group('pool')]
 gate-gpu-qwen35moe-verify:
     BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen35moe-verify && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_verify && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_verify'

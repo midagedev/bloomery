@@ -221,7 +221,7 @@ use app::mtp::{MtpBody, MtpDraft};
 use q3place::Seqs;
 
 use bloomery_gpu::arch::qwen3moe::ubatch::{UBATCH_ENV, ubatch_size};
-use bloomery_gpu::arch::qwen3moe::{Body, Body35, Qwen35moeModel};
+use bloomery_gpu::arch::qwen3moe::{Body, Body35, PLACED_NO_VERIFY, Qwen35moeModel};
 use bloomery_gpu::dspark::DsparkBody;
 use bloomery_gpu::folder::Model;
 use bloomery_gpu::kv_format::{KvChoice, KvQ8};
@@ -231,8 +231,8 @@ use bloomery_gpu::weights::{DevWeight, head_tensor};
 use bloomery_gpu::{Gpu, Qwen3moeModel};
 use bloomery_gpu_gates::beside::Beside;
 use bloomery_gpu_gates::bind::{
-    self, AutoSlots, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotFlags, SlotStep, SlotsFrom,
-    TemplateFile, Vocab, arm_screen, bind_server, call_token, note_line, parallel_line,
+    self, AutoSlots, ChatSurface, Listen, Pass, Seat, SeatEngine, SlotFlags, SlotPassRow, SlotStep,
+    SlotsFrom, TemplateFile, Vocab, arm_screen, bind_server, call_token, note_line, parallel_line,
     placement_of, slots_given,
 };
 use bloomery_gpu_gates::generate::Place;
@@ -260,7 +260,7 @@ use serve::media::{MediaFeed, SharedMediaModel};
 use serve::{CacheNote, DraftProps, Drafted, EngineProps, Saved, ServeError};
 use tokenizer::Tokenizer;
 
-use super::drafted::{LOOKUP_ROWS, SlotDrafts};
+use super::drafted::{LOOKUP_ROWS, Lookups, SlotDrafts};
 use super::served::{self, ServedDraft, Word};
 use super::{folder, qwen3_folder};
 use crate::draft::Draft;
@@ -615,6 +615,30 @@ trait Body3: SlotRows<Seq: 'static> + app::Prompt + app::Keep + Sized + 'static 
     ) -> Result<usize, GateError> {
         let _ = (s, rows);
         Err("a round of several slots as one pass: this body runs its slots in turns".into())
+    }
+    /// [`Body3::one_pass_round`] on a lookup load, each slot's lookup
+    /// context told of its row ([`super::rounds::step_rows_lookup`]).
+    /// Refused by the default: only `Body35` verifies several slots' lookup
+    /// windows together (`bind::verifies_slots`), so only its lookup load
+    /// runs one pass.
+    fn lookup_step_round(
+        s: &mut app::Session<Self>,
+        rows: &mut [SlotStep],
+        lookups: &mut Lookups<app::Session<Self>>,
+    ) -> Result<usize, GateError> {
+        let _ = (s, rows, lookups);
+        Err("a lookup round of several slots as one pass: this body runs its slots in turns".into())
+    }
+    /// One round of several slots' lookup windows as passes of
+    /// `GpuModel::verify_slots` ([`super::rounds::pass_rows_lookup`]).
+    /// Refused by the default, as [`Body3::lookup_step_round`] is.
+    fn lookup_pass_round(
+        s: &mut app::Session<Self>,
+        rows: &mut [SlotPassRow],
+        lookups: &mut Lookups<app::Session<Self>>,
+    ) -> Result<usize, GateError> {
+        let _ = (s, rows, lookups);
+        Err("a lookup round of several slots as one pass: this body runs its slots in turns".into())
     }
     /// One prompt call of `ids` with the `encoded` rows of the call's images spliced in, each
     /// span carrying its image's token grid ([`vision_seat::SpanRows::image_spans`]); the greedy
@@ -1028,6 +1052,27 @@ impl Body3 for Body35 {
         super::rounds::step_rows_one_pass(s, rows)
     }
 
+    /// The busy rows as one pass, each slot's lookup context told of its row
+    /// ([`super::rounds::step_rows_lookup`]).
+    fn lookup_step_round(
+        s: &mut app::Session<Body35>,
+        rows: &mut [SlotStep],
+        lookups: &mut Lookups<app::Session<Body35>>,
+    ) -> Result<usize, GateError> {
+        super::rounds::step_rows_lookup(s, rows, lookups)
+    }
+
+    /// Every slot's lookup window verified together
+    /// ([`super::rounds::pass_rows_lookup`]): the body settles each slot's
+    /// partial keep at the commit (`SlotRows::keep_slot`).
+    fn lookup_pass_round(
+        s: &mut app::Session<Body35>,
+        rows: &mut [SlotPassRow],
+        lookups: &mut Lookups<app::Session<Body35>>,
+    ) -> Result<usize, GateError> {
+        super::rounds::pass_rows_lookup(s, rows, lookups)
+    }
+
     /// The session's media call ([`vision_seat::Encoded::prompt`]): each image's span of the call
     /// takes its rows in place of its positions' embeddings and shifts the sequence's rotation
     /// table by its grid, an `(nx, ny)` of positions in raster order. The grid is the span's own
@@ -1080,7 +1125,7 @@ struct Q3<B: Body3> {
     /// [`Body3::serves_one_pass`] on the load (a whole-card load, and a
     /// placed load of `Body` or `Body35` with no expert tier) and, under the
     /// lookup draft, a body that verifies several slots' windows together,
-    /// which neither does. Any other load keeps the fallback loop, and a
+    /// which `Body35` does. Any other load keeps the fallback loop, and a
     /// load of one slot never runs a round of several.
     one_pass: bool,
     /// [`Seat::step_stats`]: the `BLOOMERY_STEP_STATS` the binary parsed.
@@ -1250,6 +1295,18 @@ impl<B: Body3> Seat for Q3<B> {
         })
     }
 
+    /// A prompt's last call with its last id the call's last row: one
+    /// closing call ([`CallEnd::Close`]) where the body folds that id
+    /// ([`app::Prompt::closes`]), the target's row read after it. A call the
+    /// DSpark draft takes (its call feeds the draft's rows besides the
+    /// target's) and one the body does not fold take the call less that id,
+    /// then its step ([`bind::prefill_then_step`]).
+    fn prefill_next(&mut self, ids: &[u32], row: Option<&mut [f32]>) -> Result<u32, GateError> {
+        let closes =
+            self.draft.rows() == 1 && <B as app::Prompt>::closes(self.s.model(), ids.len())?;
+        bind::prefill_closing(self, ids, row, closes)
+    }
+
     /// The resident encoder's media description ([`vision_seat::Resident::media`]); `None`
     /// without `--mmproj`, a seat that takes no image.
     #[cfg(feature = "vision")]
@@ -1393,17 +1450,44 @@ impl<B: Body3> Seat for Q3<B> {
     /// One round of several slots ([`super::rounds::step_round`]): one pass
     /// of the busy rows while the open decided so ([`Q3::one_pass`], through
     /// [`Body3::one_pass_round`] — the rows' answers and lent logits rows
-    /// from the pass's own per-row heads, slot 0 left selected), else the
-    /// seat's fallback — a select and a step a row — the lookup draft's
-    /// round and every round of a body with no one pass of its slots, and
-    /// the round a load of one slot never runs.
+    /// from the pass's own per-row heads, slot 0 left selected — or on a
+    /// lookup load [`Body3::lookup_step_round`]), else the seat's fallback —
+    /// a select and a step a row — every round of a body with no one pass of
+    /// its slots, and the round a load of one slot never runs.
     fn step_slots(&mut self, rows: &mut [SlotStep]) -> Result<(), String> {
         let one_pass = self.one_pass;
         super::rounds::step_round(
             self,
             one_pass,
             rows,
-            |q, rows| B::one_pass_round(&mut q.s, rows),
+            |q, rows| match q.draft.lookups_mut() {
+                Some(l) => B::lookup_step_round(&mut q.s, rows, l),
+                None => B::one_pass_round(&mut q.s, rows),
+            },
+            |_| Ok(()),
+        )
+    }
+
+    /// One round of several slots' drafted passes
+    /// ([`super::rounds::pass_round`]): on a lookup load the open decided to
+    /// run as one pass ([`Q3::one_pass`]), every slot's window verified
+    /// together ([`Body3::lookup_pass_round`]); else the fallback loop (a
+    /// select and a pass a row). The DSpark draft serves one slot, so no
+    /// other drafted load runs a round of several.
+    fn pass_slots(&mut self, rows: &mut [SlotPassRow]) -> Result<(), String> {
+        let one_pass = self.one_pass;
+        super::rounds::pass_round(
+            self,
+            one_pass,
+            rows,
+            |q, rows| match q.draft.lookups_mut() {
+                Some(l) => B::lookup_pass_round(&mut q.s, rows, l),
+                None => Err(
+                    "a drafted round of several slots as one pass: only the lookup \
+                             draft serves several slots"
+                        .into(),
+                ),
+            },
             |_| Ok(()),
         )
     }
@@ -1619,12 +1703,19 @@ impl Seat for Q35Mtp {
     }
 
     /// The draft's prompt call ([`SlotDrafts::prompt_call`]), the target's
-    /// head run only when `end` reads it. A delta layer takes no checkpoint
-    /// inside a unit, so the seat folds no last id
-    /// ([`Seat::prefill_next`]'s default).
+    /// head run only when `end` reads it.
     fn prompt_call(&mut self, ids: &[u32], end: CallEnd) -> Result<u32, GateError> {
         let sel = self.s.selected();
         self.drafted.prompt_call(&mut self.s, sel, ids, end)
+    }
+
+    /// A prompt's last call with its last id the call's last row: one
+    /// closing call ([`CallEnd::Close`]) where the body folds that id
+    /// ([`app::Prompt::closes`]), the target's row read after it; else the
+    /// call less that id, then its step ([`bind::prefill_then_step`]).
+    fn prefill_next(&mut self, ids: &[u32], row: Option<&mut [f32]>) -> Result<u32, GateError> {
+        let closes = <Body35 as app::Prompt>::closes(self.s.model(), ids.len())?;
+        bind::prefill_closing(self, ids, row, closes)
     }
 
     /// Answer positions take no checkpoints. The prompt calls keep theirs.
@@ -1849,15 +1940,16 @@ fn choice_line(word: &str, r: q3place::Reads) {
 }
 
 /// The context `slots` slots serve and the load made at it
-/// ([`q3place::serve_choice_lanes`], at `lanes` delta lanes — the seat's,
-/// [`verdict_lanes`]), its choice line printed.
+/// ([`q3place::serve_choice_records`], with `record_rows` verify record
+/// rows a delta store — the seat's, [`verdict_records`]), its choice line
+/// printed.
 fn ctx_and_load(
     split: &Split,
     (set, slots): (Option<usize>, usize),
     o: q3place::ServeOpts<'_>,
-    lanes: usize,
+    record_rows: usize,
 ) -> Result<Chosen<Q3Load>, GateError> {
-    let (chosen, reads) = q3place::serve_choice_lanes(split, (set, slots), o, lanes)?;
+    let (chosen, reads) = q3place::serve_choice_records(split, (set, slots), o, record_rows)?;
     choice_line(if set.is_some() { "set" } else { "default" }, reads);
     Ok(chosen)
 }
@@ -1867,16 +1959,16 @@ fn ctx_and_load(
 /// makes holds ([`q3place::serve_probe`], whole or placed), the served draft runs on it
 /// ([`serves_on`]) and a qwen35 family load's checkpoints fit ([`q3place::checkpoints_fit`]). The file's own MTP layer
 /// drafts one sequence, so a load that may draft it serves one slot: the `mtp` word, and the
-/// unset one where the one slot's verdict prices the draft's lanes ([`verdict_lanes`]).
+/// unset one where the one slot's verdict prices the draft's verify record ([`verdict_records`]).
 fn auto_slots(
     auto: AutoSlots,
     (split, arch, word): (&Split, Family, Word),
     o: q3place::ServeOpts<'_>,
-    lanes: usize,
+    record_rows: usize,
 ) -> Result<(usize, Option<usize>), GateError> {
     let mtp = match word {
         Word::Mtp => true,
-        Word::Off => lanes > 1,
+        Word::Off => record_rows > 0,
         Word::Lookup | Word::Dspark => false,
     };
     if mtp {
@@ -1884,12 +1976,12 @@ fn auto_slots(
     }
     let census = q3place::census()?;
     let one = |set| {
-        let one = ctx_and_load(split, (set, 1), o, lanes)?;
+        let one = ctx_and_load(split, (set, 1), o, record_rows)?;
         Ok((usize::try_from(one.slot_ctx)?, one.rule, ()))
     };
     let holds = |(): &(), n: usize, ctx: usize| -> Result<bool, GateError> {
         let at = (u64::try_from(ctx)?, n);
-        let Probe::Holds(load) = q3place::serve_probe((split, &census), at, o, lanes)? else {
+        let Probe::Holds(load) = q3place::serve_probe((split, &census), at, o, record_rows)? else {
             return Ok(false);
         };
         let placed = load.placed_body();
@@ -2134,14 +2226,10 @@ fn whole_card_refusal(word: &str, name: &str, (placement, why): (String, String)
     .into()
 }
 
-/// The body's words for a placed load ([`Body35::build`]'s doc and its lane
-/// refusal): a placed load runs no verify.
+/// The body's words for a placed load ([`Body35::build`]'s refusal): a
+/// placed load runs no verify.
 fn placed_no_verify() -> String {
-    let lanes = Body35::VERIFY_LANES;
-    format!(
-        "a placed load runs no verify; {lanes} lanes a delta store: a load keeps 1, or {lanes} \
-         on a whole-card load that verifies drafted rows"
-    )
+    PLACED_NO_VERIFY.to_owned()
 }
 
 /// [`Body35::new_seq`]: the draft's K/V is one cache on the body.
@@ -2286,19 +2374,19 @@ fn decide_q35(
     }
 }
 
-/// The delta lanes the seat's whole-card load of a qwen35 family file keeps:
-/// [`Body35::VERIFY_LANES`] on a load that verifies drafted rows
-/// (`GpuModel::open_verifying`, `GpuModel::open_mtp`), one on a plain load —
-/// the count its whole-fit verdict prices the load at
-/// ([`q3place::serve_choice_lanes`]), decided before the load is. The draft
+/// The verify record rows each delta store of the seat's whole-card load of
+/// a qwen35 family file keeps: [`Body35::VERIFY_ROWS`] on a load that
+/// verifies drafted rows (`GpuModel::open_verifying`, `GpuModel::open_mtp`),
+/// none on a plain load — the rows its whole-fit verdict prices the load
+/// with ([`q3place::serve_choice_records`]), decided before the load is. The draft
 /// word decides ahead of it: `dspark` and `lookup` verify a whole-card load
 /// whatever the file; `mtp` and an unset word draft the file's own
 /// next-token layer ([`layer_choice`]), which needs one text sequence on
 /// place `a` with no route trace. [`decide_q35`] keeps the load's own half —
 /// a placed load drafts nothing, and its refusals stand — so where this pick
 /// cannot know the load it takes the wider side: the verdict it feeds never
-/// under-counts the lanes of the load the seat opens.
-fn verdict_lanes(
+/// under-counts the stores of the load the seat opens.
+fn verdict_records(
     levers: &Levers,
     word: Word,
     file: &Split,
@@ -2319,7 +2407,7 @@ fn verdict_lanes(
                 && in_file
         }
     };
-    if drafted { Body35::VERIFY_LANES } else { 1 }
+    if drafted { Body35::VERIFY_ROWS } else { 0 }
 }
 
 /// [`Word`] from `BLOOMERY_DRAFT` for the `arch` file at `path`, `name` its
@@ -2538,11 +2626,11 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // The DSpark draft's window is one sequence's: several slots are refused by name.
     // `mtp` decides no count here.
     let (slots, from) = served::draft_slots(a.parallel, served, true)?.unwrap_or((slots, from));
-    // The delta lanes the seat's whole-card qwen35 family load keeps
-    // ([`verdict_lanes`]): every whole-fit verdict below prices the load at
-    // them, before the load is known.
-    let lanes = match arch {
-        Family::Qwen35moe | Family::Qwen35 => verdict_lanes(
+    // The verify record rows the seat's whole-card qwen35 family load keeps
+    // ([`verdict_records`]): every whole-fit verdict below prices the load
+    // with them, before the load is known.
+    let record_rows = match arch {
+        Family::Qwen35moe | Family::Qwen35 => verdict_records(
             &levers,
             word,
             split,
@@ -2550,7 +2638,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             vision.is_some(),
             slots,
         ),
-        Family::Qwen3moe => 1,
+        Family::Qwen3moe => 0,
     };
     // A projector the `--hf` repo picked stays only where the load gives the text model the same
     // experts and context with the encoder as without ([`vision_seat::kept`]).
@@ -2560,7 +2648,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             split,
             (a.ctx, slots),
             serve_opts((a.place, &plan_levers), (kv, a.ubatch), (v, embedding)),
-            lanes,
+            record_rows,
         )?;
         let cost_ctx = asked.total;
         Ok(match asked.plan {
@@ -2589,9 +2677,9 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     );
     let (slots, ctx) = match a.auto.filter(|_| from == SlotsFrom::Auto) {
         None => (slots, a.ctx),
-        Some(auto) => auto_slots(auto, (split, arch, word), opts, lanes)?,
+        Some(auto) => auto_slots(auto, (split, arch, word), opts, record_rows)?,
     };
-    let asked = ctx_and_load(split, (ctx, slots), opts, lanes)?;
+    let asked = ctx_and_load(split, (ctx, slots), opts, record_rows)?;
     let (_, image) = vision_seat::images_of(vision.as_ref());
     eprintln!(
         "{}{}",
@@ -2821,14 +2909,18 @@ mod tests {
     use super::{Choice, folder_choice, parse_args};
     use model::placement::workstation::{A6000, RTX_3090};
 
-    /// The open's round shape is the body's fact: Qwen3.6's body keeps a
-    /// pass's rows whole, so a drafted load takes turns while a plain one runs
-    /// one pass, and one slot is one pass whatever the body does. Mutant:
-    /// drop `SETTLES_PARTIAL_KEEP` from `bind::verifies_slots`.
+    /// The open's round shape is the body's fact: Qwen3.6's body settles a
+    /// partial keep of each slot's rows (`SlotRows::keep_slot`), so a lookup
+    /// load runs one pass as a plain one does, and one slot is one pass
+    /// whatever the body does. FAIL-first: on main's body, which kept a
+    /// pass's rows whole, the lookup line is `Pass::Turns`. Mutant: set
+    /// Body35's `SETTLES_PARTIAL_KEEP` back to false.
+    // PIN(2026-11-02): Body35 settles a partial keep by replaying its records, so a
+    // lookup round is `Pass::One` where it was `Pass::Turns`.
     #[test]
-    fn a_drafted_qwen36_round_takes_turns_by_what_its_body_keeps() {
+    fn a_drafted_qwen36_round_runs_one_pass_by_what_its_body_keeps() {
         use super::{Body35, Draft, Pass, pass_of};
-        assert_eq!(pass_of::<Body35>(2, false, Draft::Lookup), Pass::Turns);
+        assert_eq!(pass_of::<Body35>(2, false, Draft::Lookup), Pass::One);
         assert_eq!(pass_of::<Body35>(2, false, Draft::Off), Pass::One);
         assert_eq!(pass_of::<Body35>(1, false, Draft::Lookup), Pass::One);
     }
