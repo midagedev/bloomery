@@ -5294,11 +5294,12 @@ class Reach:
         if k >= 0:
             facts = self.facts(rk, f)
             u = facts.units[k]
+            bases = self.bases(rk, f) or [()]
             sites, idents = list(u.sites), set(u.idents)
             # a macro_rules body is unhygienic for items: its names resolve where it expands, here too
             seen_macros: set[Hit] = set()
             todo = [h for name in u.macro_calls for h in ((rk, g, i) for g, i in self.macros(rk).get(name, ()))]
-            for b in self.bases(rk, f) or [()]:
+            for b in bases:
                 todo += [h for path in u.sites for h in self.resolve(rk, b + u.ctx, path) if h[2] >= 0
                          and self.facts(h[0], h[1]).units[h[2]].kind == "macro_rules!"]
             while todo:
@@ -5310,19 +5311,24 @@ class Reach:
                 sites += mu.sites
                 idents |= mu.idents
                 todo += [(h[0], g, i) for name in mu.macro_calls for g, i in self.macros(h[0]).get(name, ())]
-            for ident in sorted(idents):
+            names = sorted(idents)
+            paths = [(path, "::".join(path)) for path in dict.fromkeys(sites)]
+            for ident in names:
                 hits += [((rk, f, i), ident) for i in facts.named.get((u.ctx, ident), ())]
-            for b in self.bases(rk, f) or [()]:
+            for b in bases:
                 mod = b + u.ctx
-                for path in sites:
-                    hits += [(h, "::".join(path)) for h in self.resolve(rk, mod, path)]
+                for path, how in paths:
+                    hits += [(h, how) for h in self.resolve(rk, mod, path)]
                 for c, bp, name, _ in facts.binds:
                     if bp[-1] != "*" and name in idents:
-                        hits += [(h, f"{name} (use {'::'.join(bp)})") for h in self.resolve(rk, b + c, bp)]
+                        how = f"{name} (use {'::'.join(bp)})"
+                        hits += [(h, how) for h in self.resolve(rk, b + c, bp)]
                 for c, bp in facts.globs:
+                    how = f" (use {'::'.join(bp)})"
                     for grk, gmod in self.module(rk, b + c, bp[:-1]):
-                        for ident in sorted(idents):
-                            hits += [(h, f"{ident} (use {'::'.join(bp)})") for h in self.walk(grk, gmod, (ident,), True)]
+                        for ident in names:
+                            label = ident + how
+                            hits += [(h, label) for h in self.walk(grk, gmod, (ident,), True)]
             for h, methods, how in self.in_scope(rk, f):
                 named = idents & methods
                 if named:
