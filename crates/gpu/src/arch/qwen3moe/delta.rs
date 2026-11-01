@@ -10,16 +10,22 @@
 //!    in another; a Q6_K `attn_qkv` in its own gemv (and at more than one
 //!    row its token-major copy) and `attn_gate`, β and α in one launch —
 //!    and with any other types each projection by its type
-//!    (`dispatch::site_gemv`);
+//!    (`dispatch::site_gemv`); past [`GEMV_COLS`] rows `attn_gate` waits
+//!    for 5;
 //! 3. the conv and prep ([`crate::linear::conv`]) over the layer's conv ring
 //!    by the rows' positions;
-//! 4. the delta step ([`crate::linear::delta`]) over the state lane the
-//!    record's lane word names — on a load whose stores keep a lane per
-//!    verify row, `gdn_delta_lanes` over the committed lane the body's lane
-//!    word names ([`LaneRun`]), in place for a step and a prompt unit and in
-//!    row mode for a verify;
+//! 4. the delta step over the store's lane the record's lane word names
+//!    (`linear::seqs::enqueue_gdn`): in place for a step, a pass and a
+//!    pass-path prompt unit, the chunked prompt form for a wide prompt unit
+//!    (past [`GEMV_COLS`] rows, its work in the q·k·v rows the conv read, its
+//!    last chunk kept in the carry on a closing call's last unit,
+//!    `Arena::keep_last`), a
+//!    verify recorded into the store's record on a pass of a load
+//!    that verifies ([`GdnArena::verify`](super::scratch::GdnArena));
 //! 5. the gated norm ([`crate::linear::norm_gate`]) into the arena's
-//!    attention rows;
+//!    attention rows; past [`GEMV_COLS`] rows with `attn_gate` before it and
+//!    the rows' forms `ssm_out` reads, through the shared site owner
+//!    (`wide::delta_gate`): a norm whose reader takes one q8 form writes it;
 //! 6. a Q4_K output projection: the rows' q8_1 quantizer and the
 //!    projection with the residual add; another K-quant: the quantizer, the
 //!    projection and the add; any other type: the projection on the f32 rows
@@ -37,35 +43,37 @@
 //! Past [`GEMV_COLS`] rows the input half (1–2) and the output half (6) are
 //! the wide arm's (`wide::delta_in`, `wide::delta_out`: the norm and the
 //! quantizer, each projection a GEMM, the residual add a launch of its own);
-//! the conv, the delta step and the gated norm (3–5) are the same launches.
+//! the conv and the delta step (3–4) are the same launches, and the gated
+//! norm (5) follows the gate projection (`wide::delta_gate`).
 
 use super::dispatch::{self, Ctx, site_launches};
 use super::plan::{DeltaPlan, SiteTy, input_fused, out_fused};
 use super::proj::{OResidArgs, QkvArgs};
-use super::scratch::{Arena, Io, LaneRun, RecStore};
+use super::scratch::{Arena, Io, RecStore};
 use super::wide::{self, GEMV_COLS};
 use crate::GpuError;
 use crate::linear;
 use crate::linear::conv::{ConvArgs, ConvRows};
-use crate::linear::delta::{DeltaArgs, DeltaLanesArgs};
-use crate::linear::norm_gate::{GdnGate, NormGateArgs};
+use crate::linear::norm_gate::{GdnGate, NormGateArgs, NormGateTail};
+use crate::linear::seqs::{GdnCall, GdnRun, enqueue_gdn};
 use crate::model::lookup::{f32_gain, kq_weight};
+use crate::tensor::WindowMut;
 
 /// The launches [`delta`] makes at `m` rows: eight, plus a Q6_K q·k·v
 /// projection's token-major copy at more than one row; projections of other
 /// types each their own ([`site_launches`]); an output projection not of
 /// Q4_K its quantizer (a K-quant), the projection and the add. Past
 /// [`GEMV_COLS`] rows: the norm, one quantizer for each form the four
-/// projections read, the four, the three middle launches, the output's
-/// quantizer (none for F32), the output projection and the residual add —
-/// twelve for K-quants.
+/// projections read, the four, the five middle launches (the conv, the
+/// prompt form's three and the gated norm writing the one q8 form the output
+/// projection reads), the output projection and the residual add — thirteen
+/// for K-quants.
 pub(super) fn launches(d: &DeltaPlan, m: usize) -> usize {
     if m > GEMV_COLS {
         return 1
             + dispatch::wide_quants(&[d.qkv_ty, d.gate_ty, d.beta_ty, d.alpha_ty])
             + 4
-            + 3
-            + dispatch::wide_quants(&[d.out_ty])
+            + 5
             + 2;
     }
     let input = if input_fused(d) {
@@ -119,8 +127,9 @@ pub(super) fn delta_in(
 /// The mixer's middle at `m` rows (module doc, 3–5), the same launches at
 /// every `m`: the conv and prep over the layer's ring by the rows' positions
 /// (the arena's `pos`, which the embedding launch wrote), the delta step over
-/// the state lane the word `io.lane` holds, the gated norm into the arena's
-/// attention rows.
+/// the store's lane the word `io.lane` names, in place, in the prompt form
+/// on an arena with the prompt rule's work, or a verify (`GdnArena::verify`),
+/// the gated norm into the arena's attention rows.
 pub(super) fn delta_core(
     c: &Ctx<'_>,
     d: &DeltaPlan,
@@ -133,7 +142,14 @@ pub(super) fn delta_core(
     let (gpu, w, k) = (c.gpu, c.w, c.k);
     let q35 = k.q35(WHAT)?;
     let stream = gpu.stream();
-    let Arena { pos, attn, gdn, .. } = s;
+    let Arena {
+        pos,
+        attn,
+        gdn,
+        normed,
+        wide,
+        ..
+    } = s;
     let g = gdn
         .as_mut()
         .ok_or(GpuError::state(WHAT, "the arena's delta intermediates"))?;
@@ -159,69 +175,61 @@ pub(super) fn delta_core(
             ring: &mut r.ring,
         },
     )?;
-    match (g.lanes.as_ref(), r.stamp.as_mut()) {
-        (None, None) => {
-            let lane = io.lane.ok_or(GpuError::state(
-                WHAT,
-                "the record's lane word (a chain with delta layers carries one)",
-            ))?;
-            lin.delta.enqueue_delta(
-                stream,
-                DeltaArgs {
-                    qkv: &g.conv,
-                    beta: &g.beta,
-                    decay: &g.decay,
-                    lane,
-                    lane_at: 0,
-                    lanes: r.lanes,
-                    shape: d.shape,
-                    m,
-                    fault: c.sink,
-                    o: &mut g.o,
-                    state: &mut r.state,
-                },
-            )?;
+    let lane = io.lane.ok_or(GpuError::state(
+        WHAT,
+        "the record's lane word (a chain with delta layers carries one)",
+    ))?;
+    // A wide unit (past `GEMV_COLS` rows) runs the chunked prompt form, its
+    // chunk records in the q·k·v rows the conv has read; a pass-path unit and
+    // a step keep the step's sequential bits.
+    let len = g.x.len();
+    let mut work;
+    let run = if g.verify {
+        GdnRun::Verify
+    } else if m > GEMV_COLS {
+        work = WindowMut::<u32>::of_mut(&mut *g.x, 0, len)?;
+        GdnRun::Prompt {
+            work: &mut work,
+            keep: g.keep,
         }
-        (Some(LaneRun { word, each }), Some(stamp)) => lin.delta.enqueue_delta_lanes(
-            stream,
-            DeltaLanesArgs {
-                delta: DeltaArgs {
-                    qkv: &g.conv,
-                    beta: &g.beta,
-                    decay: &g.decay,
-                    lane: word,
-                    lane_at: 0,
-                    lanes: r.lanes,
-                    shape: d.shape,
-                    m,
-                    fault: c.sink,
-                    o: &mut g.o,
-                    state: &mut r.state,
-                },
-                each: *each,
-                pos,
-                stamp,
-            },
-            r.carry.as_ref(),
-        )?,
-        (run, stamp) => {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "the arena's lane run and the layer's stamps both present or both absent \
-                     (the arena has {}, the store {})",
-                    if run.is_some() { "a run" } else { "none" },
-                    if stamp.is_some() { "stamps" } else { "none" },
-                ),
-            ));
-        }
+    } else {
+        GdnRun::Step
+    };
+    enqueue_gdn(
+        lin,
+        stream,
+        GdnCall {
+            qkv: &g.conv,
+            beta: &g.beta,
+            decay: &g.decay,
+            lane,
+            pos,
+            shape: d.shape,
+            m,
+            fault: c.sink,
+            o: &mut g.o,
+        },
+        r,
+        run,
+    )?;
+    let gain = f32_gain(w, &d.ssm_norm)?;
+    if m > GEMV_COLS {
+        let tail = NormGateTail {
+            o: &g.o,
+            w: gain,
+            gate: GdnGate::Silu,
+            eps: c.eps,
+            fault: c.sink,
+            y: attn,
+        };
+        return wide::delta_gate(c, d, (normed, wide), (&lin.norm_gate, &mut g.z, tail), m);
     }
     lin.norm_gate.enqueue_norm_gate(
         stream,
         NormGateArgs {
             o: &g.o,
             z: &g.z,
-            w: f32_gain(w, &d.ssm_norm)?,
+            w: gain,
             gate: GdnGate::Silu,
             eps: c.eps,
             n_v: d.shape.n_v,

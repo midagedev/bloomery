@@ -13,9 +13,9 @@
 //!   steps. The verify's row argmaxes, the 16 steps' ids and the last step's
 //!   logits equal a plain load's run from the same prompt, bit for bit. A
 //!   chain of commits (`m, accepted` = 4/3, 8/5, 8/8, 2/1, 8/2, 3/3, 8/1)
-//!   walks the lane word round and past the lane count, then 16 steps do the
-//!   same. On the base (one lane) every `accepted < m` is refused at commit;
-//!   the plain load here prints that refusal (a1) and holds it.
+//!   replays every kept count from the records, then 16 steps do the same.
+//!   On a plain load every `accepted < m` is refused at commit; the plain
+//!   load here prints that refusal (a1) and holds it.
 //! - (b) a lookup draft (`runtime::lookup::Lookup`) driven over
 //!   `Session<Body35>` (`Session::with_draft`, a verify of two rows) for 64
 //!   tokens on three prompts with repeats emits the plain run's ids; the
@@ -25,18 +25,42 @@
 //!   bytes equal the derivation of the file's header ([`BASE_STORE`]), its
 //!   captured decode step holds [`NODES_DECODE`] nodes and a pass of `m`
 //!   rows [`NODES_PASS`] + 4m (the e2e gate's pins), and the verifying load
-//!   holds the same node counts and exactly 30 · `delta_lane_bytes(32, 128,
-//!   8)` = [`LANE_EXTRA`] more store bytes [derived: 420 MiB of lanes and 960
-//!   B of stamps], which the plan's layout (`PlanInputs::with_lanes`) prices
-//!   to the byte.
+//!   holds the same node counts and exactly 30 · `delta_record_bytes(32,
+//!   128, 8)` = [`RECORD_EXTRA`] more store bytes [derived: 11,796,480 B of
+//!   verify records], which the plan's layout (`PlanInputs::verifying`)
+//!   prices to the byte.
 //! - (d) a cut behind a commit: a marked prompt of 210 ids, a verify and a
-//!   commit of three rows that move the committed lane to lane 2, a cut back
-//!   to the mark at 192 (the checkpoint's copy lands in lane 2, which is
-//!   restamped), and the replay equal the plain load's cut and replay, bit
-//!   for bit.
+//!   commit of three rows, a cut back to the mark at 192 (the checkpoint's
+//!   copy lands in the lane, which is restamped), and the replay equal the
+//!   plain load's cut and replay, bit for bit.
 //! - (e) refusals by name: a step or a pass while a verify waits for its
-//!   commit, and a second resident sequence on the verifying load; the
-//!   refused call leaves the verify committable.
+//!   commit; the refused call leaves the verify committable.
+//! - (f) an unread prompt call (`CallEnd::Unread`, no head) over a fault
+//!   planted in the card's fault word returns that fault by name and leaves
+//!   the model poisoned with it, and a reset clears it (the prompt after it
+//!   gives the plain run's argmax). FAIL-first: without the fault read after
+//!   a headless last unit (`Body35::feed35`) the call returns `Ok`.
+//! - (g) a second resident sequence opens on the verifying load (each slot
+//!   keeps its own records), run last so the slot stays resident. Then, taps
+//!   off, both slots at the end of the (a) prompt and slot 1's verify of two
+//!   rows waiting: a pass of slot 0 then slot 1 is refused by name for slot
+//!   1 before any slot moves, so slot 0 steps on to the plain run's id, and
+//!   slot 1's commit of both rows and its step give the plain run's ids too.
+//!   FAIL-first: without the pass's check of a waiting verify
+//!   (`check_slot`'s `refuse_pending`) slot 0 holds a verify of its own after
+//!   the refusal and its step is refused.
+//! - (h) a closing call (`CallEnd::Close`) by the body's prompt schedule
+//!   (`app::Prompt`, `prefill_gate::closed_run`), marks on: at 150 and 160
+//!   ids from a reset the wide path, its last id folded into the last ubatch
+//!   (rows 128..n, a chunk left open at 150 and completed at 160, which the
+//!   call keeps out of the lanes), at 5 ids passes, the last id a run of its
+//!   own (`closes_by_ubatch` says which). The call's argmax
+//!   and logits equal the one call's of the same ids, and so do three greedy
+//!   steps' ids and logits where no chunk was kept; its end mark stands at
+//!   `n − 1` and not at `n`; the last id stepped from that mark (a rollback
+//!   there) gives the call less that id and its step bit for bit. FAIL-first:
+//!   a point whose carries keep the row past the mark (`recur::close_point`
+//!   not run) steps from position `n`.
 //! - the draft taps (`Tapped + TappedPrompt for Session<Body35>`: the rows
 //!   entering the layers [`TAP_LAYERS`], 0 and the last among them, which a
 //!   block draft reads), set on the verifying load:
@@ -81,13 +105,15 @@ mod gate {
     use bloomery_gpu::arch::qwen3moe::{Body35, Open35, PrefillPath, Qwen35moeModel};
     use bloomery_gpu::kv_format::KvQ8;
     use bloomery_gpu::model::{MAX_PASS_ROWS, StepMode};
-    use bloomery_gpu::{Gpu, GpuError};
+    use bloomery_gpu::{Fault, FaultSite, Gpu, GpuError, LAYER_HEAD};
+    use bloomery_gpu_gates::prefill_gate::closed_run;
     use bloomery_gpu_gates::{GateError, checks_failed, open_split, prose_ids, verdict};
     use gguf::quant::dequant_row;
     use model::arch::Arch;
     use model::arch::qwen35moe::place::PlanInputs;
     use model::placement::KvBytes;
-    use runtime::stores::delta_lane_bytes;
+    use runtime::prompt::CallEnd;
+    use runtime::stores::{DELTA_REPLAY_BYTES, delta_carry_bytes, delta_record_bytes};
     use runtime::{
         Advance, Lookup, RowLogits, Speculative, Tapped, TappedPrompt, Target, Verify, Want,
     };
@@ -129,21 +155,33 @@ mod gate {
     const V_HEADS: usize = 32;
     const STATE: usize = 128;
 
-    /// One delta layer's state (`32·128·128` f32) and conv ring (`11` rows of
-    /// `8192` channels, f32), and one attention layer's K and V a position
+    /// One delta layer's state (`32·128·128` f32), conv ring (`11` rows of
+    /// `8192` channels, f32), the lane's u32 stamp and the chunked prompt
+    /// rule's carry (4 words and 16 rows of `(16 + 32)·128 + 2·32` f32,
+    /// 397,328 B), and one attention layer's K and V a position
     /// (`2 · 2 · 256` f16).
-    const REC_BYTES: usize = V_HEADS * STATE * STATE * 4 + 11 * 8192 * 4;
+    const CARRY_BYTES: usize = (4 + 16 * ((16 + V_HEADS) * STATE + 2 * V_HEADS)) * 4;
+    // PIN(2026-11-02): one stamped lane, its carry and a verify record replace the
+    // verifying load's lanes, so the store bytes count the stamp and the carry.
+    const REC_BYTES: usize = V_HEADS * STATE * STATE * 4 + 11 * 8192 * 4 + 4 + CARRY_BYTES;
     const KV_ROW_BYTES: usize = 2 * 2 * 256 * 2;
 
-    /// [derived] The store bytes of a plain load at [`CTX`]: `30 · 2,457,600 +
+    /// [derived] The store bytes of a plain load at [`CTX`]: `30 · 2,854,932 +
     /// 10 · 512 · 2,048`. The plan's layout sums to it, and so does the
     /// load's own `store_bytes`.
     const BASE_STORE: usize = N_DELTA * REC_BYTES + N_ATTN * CTX * KV_ROW_BYTES;
 
-    /// [derived] What the lanes add on the verifying load: 30 layers of the
-    /// seven more lanes (2,097,152 B each) and a u32 stamp for each of the
-    /// eight, 440,402,880 B = 420 MiB + 960 B.
-    const LANE_EXTRA: usize = N_DELTA * (7 * V_HEADS * STATE * STATE * 4 + 8 * 4);
+    /// [derived] What the records add on the verifying load: 30 layers of a
+    /// record of 8 rows of `32 · 3 · 128` f32 (393,216 B), 11,796,480 B.
+    const RECORD_EXTRA: usize = N_DELTA * MAX_PASS_ROWS * V_HEADS * 3 * STATE * 4;
+
+    /// [derived] The commit's replay table on the verifying load: a row of
+    /// five u64 words a delta layer, 1,200 B.
+    const TABLE_BYTES: usize = N_DELTA * 5 * 8;
+    const _: () = assert!(
+        CARRY_BYTES as u64 == delta_carry_bytes(V_HEADS, 16, STATE)
+            && TABLE_BYTES as u64 == N_DELTA as u64 * DELTA_REPLAY_BYTES
+    );
 
     /// The e2e gate's pins of the plain load's captured graphs (decode step
     /// 520 nodes, a pass of `m` rows 537 + 4m), which the verifying load
@@ -181,10 +219,10 @@ mod gate {
         } else {
             Qwen35moeModel::open(gpu, file, o)?
         };
-        let lanes = m.body(WHAT)?.lanes();
+        let verifies = m.body(WHAT)?.verifies();
         println!(
-            "load verifying={verifying} lanes={lanes} resident_bytes={} store_bytes={} ctx={CTX} \
-             ubatch={UBATCH}",
+            "load verifying={verifying} verifies={verifies} resident_bytes={} store_bytes={} \
+             ctx={CTX} ubatch={UBATCH}",
             m.resident_bytes(),
             m.body(WHAT)?.store_bytes()
         );
@@ -253,7 +291,7 @@ mod gate {
                 format!("the prompt's argmax {first}, the plain run's {}", r[0]),
             ));
         }
-        let (mut idx, mut lane) = (0, 0u32);
+        let mut idx = 0;
         for &(m, accepted) in stages {
             match stage(s, r, idx, (m, accepted)) {
                 Ok(out) => {
@@ -270,17 +308,6 @@ mod gate {
                 Err(e) => return Ok((false, format!("verify {m}/{accepted} refused: {e}"))),
             }
             idx += accepted;
-            // The lane word after a commit: the lane row `accepted − 1` wrote,
-            // `(c + accepted − 1) mod lanes`, written here from the rule's
-            // statement and not from the code that applies it.
-            lane = (lane + u32::try_from(accepted - 1)?) % u32::try_from(MAX_PASS_ROWS)?;
-            let got = s.model().body(WHAT)?.committed_lane();
-            if got != Some(lane) {
-                return Ok((
-                    false,
-                    format!("after verify {m}/{accepted} the lane word is {got:?}, want {lane}"),
-                ));
-            }
         }
         let mut last_row = Vec::new();
         for i in 0..STEPS_AFTER {
@@ -339,14 +366,10 @@ mod gate {
     }
 
     /// The plan's layout bytes of the file at [`CTX`]: every layer's
-    /// recurrent and positional bytes, with `lanes` lanes when asked.
-    fn plan_bytes(lanes: Option<usize>) -> Result<usize, GateError> {
+    /// recurrent and positional bytes, of a load that verifies or not.
+    fn plan_bytes(verifies: bool) -> Result<usize, GateError> {
         let file = open_split(Arch::Qwen35moe, RECIPE)?;
-        let inputs = PlanInputs::describe(&file)?;
-        let inputs = match lanes {
-            Some(l) => inputs.with_lanes(l)?,
-            None => inputs,
-        };
+        let inputs = PlanInputs::describe(&file)?.verifying(verifies)?;
         let sum: u64 = (0..inputs.spec.layers.len())
             .map(|l| inputs.kv.layer_bytes(l, CTX as u64))
             .sum();
@@ -355,8 +378,8 @@ mod gate {
 
     /// (c) (module doc).
     fn untouched(plain: &Facts, verifying: &Facts) -> Result<bool, GateError> {
-        let plan_plain = plan_bytes(None)?;
-        let plan_ver = plan_bytes(Some(MAX_PASS_ROWS))?;
+        let plan_plain = plan_bytes(false)?;
+        let plan_ver = plan_bytes(true)?;
         let nodes = |f: &Facts| {
             f.decode == NODES_DECODE
                 && f.pass5 == NODES_PASS + 4 * 5
@@ -376,23 +399,23 @@ mod gate {
             plain.resident,
             verdict(plain_ok)
         );
-        // 4 B more: the lane word.
+        // The replay table more: one row a delta layer.
         let ver_ok = nodes(verifying)
-            && verifying.stores == BASE_STORE + LANE_EXTRA
-            && plan_ver == BASE_STORE + LANE_EXTRA
-            && verifying.resident == plain.resident + LANE_EXTRA + 4;
+            && verifying.stores == BASE_STORE + RECORD_EXTRA
+            && plan_ver == BASE_STORE + RECORD_EXTRA
+            && verifying.resident == plain.resident + RECORD_EXTRA + TABLE_BYTES;
         println!(
             "verifying load: graph nodes decode {} pass5 {} pass8 {}; store bytes {} and plan \
-             layout bytes {plan_ver} (want {}: the plain bytes and {LANE_EXTRA} B of lanes and \
-             stamps, 30 · delta_lane_bytes(32, 128, 8) = {}); resident {} (want {}) {}",
+             layout bytes {plan_ver} (want {}: the plain bytes and {RECORD_EXTRA} B of records, \
+             30 · delta_record_bytes(32, 128, 8) = {}); resident {} (want {}) {}",
             verifying.decode,
             verifying.pass5,
             verifying.pass8,
             verifying.stores,
-            BASE_STORE + LANE_EXTRA,
-            30 * delta_lane_bytes(V_HEADS, STATE, MAX_PASS_ROWS),
+            BASE_STORE + RECORD_EXTRA,
+            30 * delta_record_bytes(V_HEADS, STATE, MAX_PASS_ROWS),
             verifying.resident,
-            plain.resident + LANE_EXTRA + 4,
+            plain.resident + RECORD_EXTRA + TABLE_BYTES,
             verdict(ver_ok)
         );
         Ok(plain_ok && ver_ok)
@@ -464,9 +487,9 @@ mod gate {
             .collect::<Result<Vec<_>, _>>()?;
         let prompt_d = lcg(PROMPT_D, 248_000);
         let d = cut_run(&mut s, &prompt_d, false)?;
-        // (a1) the base: one lane keeps no state behind the verify's rows, so a
-        // commit of fewer than the verify's rows is refused by name and the
-        // whole verify commits.
+        // (a1) the base: a plain load's verify runs in place and records no
+        // rows, so a commit of fewer than the verify's rows is refused by name
+        // and the whole verify commits.
         s.reset()?;
         s.prompt(&prompt_a, Want::Argmax)?;
         s.verify::<4>(std::array::from_fn(|j| a.0[j]))?;
@@ -620,8 +643,8 @@ mod gate {
         let ids = got.0 == refs.d.0;
         let bits = same_bits(&got.1, &refs.d.1);
         println!(
-            "(d) cut to {MARK_D} after a commit of 3/4 (lane 2), replay: {} ids equal the plain \
-             cut's {ids}, last logits bit for bit {bits} {}",
+            "(d) cut to {MARK_D} after a commit of 3/4, replay: {} ids equal the plain cut's \
+             {ids}, last logits bit for bit {bits} {}",
             got.0.len(),
             verdict(ids && bits)
         );
@@ -656,18 +679,142 @@ mod gate {
             r[3],
             verdict(committable)
         );
+        Ok(waits && committable)
+    }
+
+    /// (f) (module doc).
+    fn unread_fault(s: &mut Seat, refs: &Refs) -> Result<bool, GateError> {
+        s.reset()?;
+        let fault = Fault::at(LAYER_HEAD, FaultSite::QuantColumn);
+        s.model().plant_fault(fault)?;
+        let call = s
+            .model_mut()
+            .prefill_call(&refs.prompt_a, PrefillPath::Wide, CallEnd::Unread);
+        let poisoned = s.model().poisoned();
+        let named = matches!(&call, Err(GpuError::Fault { fault: f, .. }) if *f == fault);
+        s.reset()?;
+        let clean = s.model().poisoned().is_none()
+            && s.prompt(&refs.prompt_a, Want::Argmax)?.argmax() == refs.a.0[0];
+        let pass = named && poisoned == Some(fault) && clean;
+        println!(
+            "(f) an unread prompt call over a planted fault: {}, poisoned {poisoned:?}, after reset \
+             a clean prompt {clean} {}",
+            match &call {
+                Ok(_) => "returned".to_owned(),
+                Err(e) => format!("refused \"{e}\""),
+            },
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// (h)'s calls: ids, whether the last id folds into the last ubatch.
+    // PIN(2026-11-02): Wide borrows its short tail, so 136 ids close; the exact Gemm cut is checked below.
+    const CLOSE_CASES: [(usize, bool); 4] = [(136, true), (150, true), (160, true), (5, false)];
+
+    /// (h) (module doc).
+    fn close_fold(s: &mut Seat, refs: &Refs) -> Result<bool, GateError> {
+        let ids = &refs.prompt_d;
+        let mut ok = true;
+        // Gemm keeps its eight-row ubatch; Wide borrows a short tail up to
+        // nine rows. The strict cut applies before a closing call chooses
+        // the chunked rule. Changing > to >= makes the eight-row case red.
+        for (n, want) in [(8, false), (9, true)] {
+            s.reset()?;
+            let got = s.model().closes_by_ubatch(n, PrefillPath::Gemm)?;
+            let pass = got == want;
+            println!(
+                "(h) Gemm {n} ids: folds {got} (want {want}) {}",
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        for (n, folds) in CLOSE_CASES {
+            let (ids, end) = (&ids[..n], u32::try_from(n - 1)?);
+            let (head, last) = (&ids[..n - 1], &ids[n - 1..]);
+            s.reset()?;
+            let rides = s.model().closes_by_ubatch(n, PrefillPath::Wide)?;
+            let want = closed_run(s.model_mut(), ids, CallEnd::Argmax)?;
+            s.reset()?;
+            s.model_mut()
+                .prefill_call(head, PrefillPath::Wide, CallEnd::Unread)?;
+            let cut = closed_run(s.model_mut(), last, CallEnd::Argmax)?;
+            s.reset()?;
+            let whole = closed_run(s.model_mut(), ids, CallEnd::Close)?;
+            let points = s.model().body(WHAT)?.checkpoints().positions();
+            s.model_mut().rollback(end)?;
+            let stepped = closed_run(s.model_mut(), last, CallEnd::Argmax)?;
+            let marked = points.contains(&end) && !points.contains(&(end + 1));
+            let kept = n.is_multiple_of(bloomery_gpu::linear::CHUNK_ROWS);
+            let first = (whole.0, &whole.1) == (want.0, &want.1);
+            let like = first && (kept || whole == want);
+            let pass = like && stepped == cut && marked && rides == folds;
+            println!(
+                "(h) {n} ids: the closing call = the one call's argmax and logits {first}, its \
+                 steps' bits {} (held {}); its last id stepped from the end mark = the call \
+                 less it and its step {}; points {points:?}; folds {rides} (want {folds}) {}",
+                whole.2 == want.2,
+                !kept,
+                stepped == cut,
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        s.reset()?;
+        Ok(ok)
+    }
+
+    /// (g) (module doc).
+    // PIN(2026-11-02): each slot holds its own records, so a second resident
+    // sequence opens on the verifying load where it was refused.
+    fn second_slot(s: &mut Seat, refs: &Refs) -> Result<bool, GateError> {
         let slots = match s.model_mut().add_slots(2) {
-            Err(GpuError::Shape { .. }) => true,
-            other => {
-                println!("(e) a second resident sequence: {other:?}");
+            Ok(()) => true,
+            Err(e) => {
+                println!("(g) a second resident sequence: {e}");
                 false
             }
         };
         println!(
-            "(e) a second resident sequence is refused by name {}",
+            "(g) a second resident sequence opens on the verifying load {}",
             verdict(slots)
         );
-        Ok(waits && committable && slots)
+        Ok(slots && pass_beside_a_verify(s, refs)?)
+    }
+
+    /// (g)'s pass beside a waiting verify (module doc).
+    fn pass_beside_a_verify(s: &mut Seat, refs: &Refs) -> Result<bool, GateError> {
+        let r = &refs.a.0;
+        let n = u32::try_from(refs.prompt_a.len())?;
+        s.set_taps(&[])?;
+        for slot in [0, 1] {
+            s.model_mut().select_slot(slot)?;
+            s.reset()?;
+            s.prompt(&refs.prompt_a, Want::Argmax)?;
+        }
+        s.model_mut().step_rows::<2>([r[0], r[1]])?;
+        s.model_mut().select_slot(0)?;
+        let refused = match s.model_mut().step_slots(&[(0, &[r[0]]), (1, &[r[2]])]) {
+            Err(e) => e.to_string(),
+            Ok(out) => format!("ran: {:?}", out.ids),
+        };
+        let named = refused.contains("slot 1") && refused.contains("waits for its commit");
+        s.model_mut().select_slot(0)?;
+        let zero = s.model_mut().step(&[r[0]]).map_err(|e| e.to_string());
+        s.model_mut().select_slot(1)?;
+        s.model_mut().rollback(n + 2)?;
+        let one = s.model_mut().step(&[r[2]]).map_err(|e| e.to_string());
+        s.model_mut().select_slot(0)?;
+        let pass = named && zero == Ok(r[1]) && one == Ok(r[3]);
+        println!(
+            "(g) a pass while slot 1's verify waits: {refused}; then slot 0 steps to {zero:?} \
+             (the plain run's {}), slot 1 commits both rows and steps to {one:?} (the plain \
+             run's {}) {}",
+            r[1],
+            r[3],
+            verdict(pass)
+        );
+        Ok(pass)
     }
 
     /// The tapped layers of (td)–(ti): a spread of the 40 layers with the
@@ -1191,6 +1338,10 @@ mod gate {
         ok &= clause("(d)", &mut s, r);
         let r = refusals(&mut s, &refs);
         ok &= clause("(e)", &mut s, r);
+        let r = unread_fault(&mut s, &refs);
+        ok &= clause("(f)", &mut s, r);
+        let r = close_fold(&mut s, &refs);
+        ok &= clause("(h)", &mut s, r);
         // The taps clauses: Qwen3.6 as a block draft's target.
         s.set_taps(&TAP_LAYERS)?;
         let r = taps_nodes(&mut s);
@@ -1203,6 +1354,9 @@ mod gate {
         ok &= clause("(tg)", &mut s, r);
         let r = taps_refusals(&mut s);
         ok &= clause("(ti)", &mut s, r);
+        // Last: the second slot stays resident.
+        let r = second_slot(&mut s, &refs);
+        ok &= clause("(g)", &mut s, r);
         println!("{WHAT}: {}", verdict(ok));
         if ok { Ok(()) } else { Err(checks_failed()) }
     }

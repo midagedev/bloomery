@@ -24,22 +24,22 @@
 //!
 //! A step's and a pass's record, and the prompt image, carry the lane word:
 //! the state lane every delta launch reads and writes, a device word and
-//! never a launch argument, so one capture serves every position. A plain
-//! load holds one lane, and the word is [`LANE`] in every record. `reset`
-//! zeroes every lane and every conv ring: the recurrence is written in
-//! place, so the next sequence would read the previous one's state.
+//! never a launch argument, so one capture serves every position. Every
+//! delta layer keeps the one store layout of `linear::seqs`
+//! ([`RecStore::gdn`]): one state lane stamped with the position it stands
+//! at and the carry, and on a load that verifies a verify record of
+//! [`Body35::VERIFY_ROWS`] rows, so the word is [`LANE`] in every record. `reset` zeroes the lane, the conv ring
+//! and the carry: the recurrence is written in place, so the next sequence
+//! would read the previous one's state.
 //!
-//! A load that verifies drafted rows ([`GpuModel::open_verifying`]) holds
-//! [`Body35::VERIFY_LANES`] lanes a delta layer, each stamped with the position its
-//! state stands at, and runs `gdn_delta_lanes` over the committed lane the
-//! body's one lane word names ([`LaneWord`]; the records' words are unread):
-//! a step and a prompt unit write the state after their last row back in
-//! place, and a verify of `m` rows writes row `j`'s state into lane `(c + j)
-//! mod lanes`. Its commit of `accepted` rows moves the word to the lane row
-//! `accepted − 1` wrote ([`LaneWord::keep`]) and copies nothing; a step, a
-//! pass or a prompt unit is refused by name while a verify waits for its
-//! commit, and a cut behind the verify's first position is a cut to a
-//! checkpoint of the committed lane, as on a plain load.
+//! A load that verifies drafted rows ([`GpuModel::open_verifying`]) runs a
+//! pass's delta step as a verify: each row recorded into the store's record
+//! beside the lane, which the verify leaves as it stood. Its commit of
+//! `accepted` rows replays the kept records into the lane, every delta layer
+//! in one launch (`linear::seqs::recovery_table`), and copies nothing; a
+//! step, a pass or a prompt unit is refused by name while a verify waits for
+//! its commit, and a cut behind the verify's first position is a cut to a
+//! checkpoint, as on a plain load.
 //!
 //! The prompt call ([`GpuModel::prefill_with`]) cuts a prompt by
 //! [`PrefillPlan`] and walks each unit through the layer program over the
@@ -100,8 +100,8 @@ use super::plan::{
 use super::prefill::{PrefillPath, PrefillPlan, PrefillStep, WIDE_FROM};
 use super::program::{Program, Tail};
 use super::scratch::{
-    ApartForms, Arena, Dims, Forms, KvPlanes, LANE, LaneWord, LayerStore, PassRecord, RecStore,
-    RopeRows, StepParams,
+    ApartForms, Arena, Dims, Forms, KvPlanes, LANE, LayerStore, PassRecord, RecStore, RopeRows,
+    StepParams,
 };
 use super::slot_pass::SlotIn;
 use super::swap35;
@@ -120,6 +120,7 @@ use crate::host::{BatchLeg, StepLeg};
 use crate::hybrid::{Chain, SlotMap};
 use crate::kv_format::KvQ8;
 use crate::linear;
+use crate::linear::delta::RecoveryTable;
 use crate::media::{ImageSpan, MediaBody, MediaSpan, RopeBase, SeqRope, kept_rule, rope_table};
 use crate::model::fit::{FIT_RESERVE, largest_fit};
 use crate::model::{
@@ -129,7 +130,7 @@ use crate::model::{
 use crate::rope_table::{RopeSpec, RopeTable};
 use crate::route_softmax::RouterDims;
 use crate::site::{self, Order, file_site};
-use crate::tensor::{WindowMut, host_filled};
+use crate::tensor::host_filled;
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, launch_u32};
 use bloomery_levers::{ChurnHosting, HostCfg};
@@ -143,7 +144,7 @@ use model::arch::models::shape::MoeShape;
 use model::arch::models::{Ffn, LayerSpec, Mixer, ModelSpec, MtpDraft, OutGate};
 pub(super) use model::arch::names::blk;
 use model::placement::{CardFormat, Plan, WholeLoad};
-use runtime::prompt::CallEnd;
+use runtime::prompt::{CallEnd, fold_marks};
 use runtime::seqstate::{Kept, Price};
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
@@ -230,15 +231,17 @@ fn checkpoint_every(asked: usize, d: &Dims) -> Result<u32, GpuError> {
 }
 
 /// The f32s of each store one checkpoint copies, in [`Copied35`]'s order:
-/// each delta layer's committed state lane, then its conv ring — one lane's
-/// state whatever the load's lane count. The one derivation of what a
-/// checkpoint holds, read by the sequences' `Checkpoints` and by
-/// [`checkpoint_price35`].
+/// each delta layer's state lane, its conv ring, then its carry. The one
+/// derivation of what a checkpoint holds, read by the sequences'
+/// `Checkpoints` and by [`checkpoint_price35`].
 fn checkpoint_lens(kinds: &[Kind35]) -> Vec<usize> {
     kinds
         .iter()
         .filter_map(|k| match k {
-            Kind35::Delta(shape) => Some(shape.lens(PLAIN_LANES)),
+            Kind35::Delta(shape) => {
+                let [state, ring] = shape.lens(1);
+                Some([state, ring, shape.carry_len()])
+            }
             Kind35::Gqa(..) => None,
             Kind35::ShortConv(_) => {
                 panic!("qwen35moe::checkpoint_lens: a short-conv layer, which `kinds35` refuses")
@@ -344,9 +347,13 @@ fn ubatch_arena(
     Ok(a)
 }
 
-/// Lanes of every recurrent store on a plain load: one, read and written in
-/// place.
-const PLAIN_LANES: usize = 1;
+// The plan prices a verifying load's records at `runtime::stores::PASS_ROWS` rows.
+const _: () = assert!(Body35::VERIFY_ROWS == runtime::stores::PASS_ROWS);
+
+/// Why a placed load is refused a verify: its host tier serves no pass of
+/// several rows of one sequence.
+pub const PLACED_NO_VERIFY: &str =
+    "a placed load runs no verify: its passes run in place, the host tier serving each row";
 
 /// A verify of drafted rows still waiting for its commit: the position of its
 /// first row and its row count.
@@ -418,15 +425,16 @@ pub struct Body35 {
     /// The file's own next-token layer ([`GpuModel::open_mtp`]); `None` on a
     /// load that did not ask for it.
     pub(super) mtp: Option<Mtp35>,
-    /// Lanes of every delta store: 1 on a plain load, [`Body35::VERIFY_LANES`]
-    /// on a load that verifies drafted rows ([`GpuModel::open_verifying`],
-    /// [`GpuModel::open_mtp`]).
-    lanes: usize,
-    /// The word naming the committed lane of every delta launch's walk; `Some`
-    /// iff `lanes > 1`. The arenas hold views of it ([`Arena::run_lanes`]).
-    lane: Option<LaneWord>,
-    /// The verify waiting for its commit (`lanes > 1` only).
+    /// Whether a pass's delta step is a verify recorded beside the lanes,
+    /// kept by its commit ([`GpuModel::open_verifying`],
+    /// [`GpuModel::open_mtp`]); else a pass runs in place.
+    pub(super) verifies: bool,
+    /// The live sequence's verify waiting for its commit (a load that
+    /// verifies only).
     pending: Option<Pending35>,
+    /// The live sequence's commit replay over its delta stores
+    /// ([`recovery_of`]); `None` on a chain of no delta layer.
+    recovery: Option<RecoveryTable>,
     /// Positions the recurrent stores hold: a call's end once its launches
     /// are enqueued (the step, a pass, a prompt unit). The next position is
     /// the model's (`GpuModel::pos`); the two differ only after a call
@@ -462,56 +470,88 @@ pub struct Slot35 {
     pub(super) stores: Vec<LayerStore>,
     held: u32,
     ckpt: Checkpoints,
+    pending: Option<Pending35>,
+    recovery: Option<RecoveryTable>,
     /// The sequence's rotation table on a media load ([`Body35::seq_rope`]).
     pub(super) rope: Option<SeqRope>,
 }
 
+/// A prompt call's marks, each with whether a checkpoint is taken there,
+/// whether its last unit keeps its last chunk out of the lanes, and a closing
+/// call's end mark taken inside that unit ([`GpuModel::call_marks`]).
+type CallMarks = (Vec<(u32, bool)>, bool, Option<u32>);
+
 /// The delta layers' stores a checkpoint copies, lent for one call: each
-/// layer's state lane `lane` (the committed one) as a window of its lanes,
-/// and its conv ring.
+/// layer's state lane, its conv ring and its carry.
 struct Copied35<'a> {
-    lanes: Vec<WindowMut<'a, f32>>,
-    rings: Vec<&'a mut DeviceBuffer<f32>>,
+    stores: Vec<&'a mut DeviceBuffer<f32>>,
 }
 
 impl<'a> Copied35<'a> {
-    /// The stores of `stores` a checkpoint copies. Refused by name for a lane
-    /// the stores do not hold.
-    fn of(stores: &'a mut [LayerStore], lane: u32) -> Result<Copied35<'a>, GpuError> {
-        let mut c = Copied35 {
-            lanes: Vec::new(),
-            rings: Vec::new(),
-        };
+    /// The stores of `stores` a checkpoint copies. Refused by name for a
+    /// delta store without its carry.
+    fn of(stores: &'a mut [LayerStore]) -> Result<Copied35<'a>, GpuError> {
+        let mut c = Copied35 { stores: Vec::new() };
         for s in stores {
             if let LayerStore::Rec(r) = s {
                 let RecStore {
-                    state, ring, lanes, ..
+                    state, ring, carry, ..
                 } = r;
-                if lane as usize >= *lanes {
-                    return Err(GpuError::shape(
-                        "qwen35moe::Body35::copied",
-                        format!("lane {lane} of {lanes} lanes"),
-                    ));
-                }
-                let len = state.len() / *lanes;
-                let byte = lane as usize * len * size_of::<f32>();
-                c.lanes.push(WindowMut::of_mut(state, byte, len)?);
-                c.rings.push(ring);
+                let carry = carry.as_mut().ok_or(GpuError::state(
+                    "qwen35moe::Body35::copied",
+                    "a delta store's carry (RecStore::gdn keeps one)",
+                ))?;
+                c.stores.extend([state, ring, carry]);
             }
         }
         Ok(c)
     }
 
     /// The stores in [`Checkpoints::sequence`]'s order: each delta layer's
-    /// lane, then its ring.
+    /// lane, its ring, then its carry.
     fn list(&mut self) -> Vec<&mut DeviceBuffer<f32>> {
-        let mut out: Vec<&mut DeviceBuffer<f32>> = Vec::new();
-        for (l, r) in self.lanes.iter_mut().zip(self.rings.iter_mut()) {
-            out.push(&mut **l);
-            out.push(&mut **r);
-        }
-        out
+        self.stores.iter_mut().map(|b| &mut **b).collect()
     }
+}
+
+/// The commit's replay table over the delta stores among `stores`, each
+/// under its own layer's fault, of the one shape `plans` give every delta
+/// layer (`linear::seqs::recovery_table`); `None` on a load that does not
+/// verify (`verifies`) or a chain of no delta layer. Load-time only.
+fn recovery_of(
+    stream: &CudaStream,
+    plans: &[LayerPlan],
+    stores: &[LayerStore],
+    verifies: bool,
+) -> Result<Option<RecoveryTable>, GpuError> {
+    if !verifies {
+        return Ok(None);
+    }
+    let mut shape = None;
+    for (l, p) in plans.iter().enumerate() {
+        if let MixerPlan::Delta(d) = &p.mixer
+            && *shape.get_or_insert(d.shape) != d.shape
+        {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("layer {l}: delta layers of two shapes"),
+            ));
+        }
+    }
+    let Some(shape) = shape else {
+        return Ok(None);
+    };
+    let recs = stores.iter().enumerate().filter_map(|(l, s)| match s {
+        LayerStore::Rec(r) => Some((l, r)),
+        LayerStore::Kv(_) => None,
+    });
+    // SAFETY: the stores are the sequence's own, allocated once and moved
+    // only with the table beside them (`Body35::exchange`), never replaced
+    // while it lives; the commit's replay is the only launch on them while
+    // it runs (the stream orders the rest).
+    Ok(Some(unsafe {
+        linear::seqs::recovery_table(stream, (shape, Body35::VERIFY_ROWS), recs)
+    }?))
 }
 
 /// The types the embedding and the head read (`crate::site`): the embedding
@@ -1145,7 +1185,7 @@ impl GpuModel<Body35> {
     /// type no launch reads refused by name before any upload. The model
     /// takes the file.
     pub fn open(gpu: Gpu, file: impl Into<Model>, o: Open35) -> Result<GpuModel<Body35>, GpuError> {
-        GpuModel::open_lanes(gpu, file.into(), o, PLAIN_LANES, false)
+        GpuModel::open_whole(gpu, file.into(), o, false, false)
     }
 
     /// [`GpuModel::open`] with the file's own next-token layer resident
@@ -1156,46 +1196,40 @@ impl GpuModel<Body35> {
     /// `model::arch::draft::draft_usable`'s, before any upload — and a media
     /// load, whose rotation tables are per sequence, is refused by name.
     ///
-    /// The load holds [`Body35::VERIFY_LANES`] lanes a delta store, as
-    /// [`GpuModel::open_verifying`]'s does, with its refusals: the layer's
+    /// The load verifies as [`GpuModel::open_verifying`]'s does: the layer's
     /// every proposal is verified by a pass of several rows, whose commit
-    /// keeps any `1..=m` of them, and one lane holds only the last row's
-    /// state. A checkpoint folder is refused by name: its map leaves the
-    /// next-token layer's tensors out ([`whole_origin`]).
+    /// keeps any `1..=m` of them. A checkpoint folder is refused by name:
+    /// its map leaves the next-token layer's tensors out ([`whole_origin`]).
     pub fn open_mtp(
         gpu: Gpu,
         file: impl Into<Model>,
         o: Open35,
     ) -> Result<GpuModel<Body35>, GpuError> {
-        GpuModel::open_lanes(gpu, file.into(), o, Body35::VERIFY_LANES, true)
+        GpuModel::open_whole(gpu, file.into(), o, true, true)
     }
 
     /// [`GpuModel::open`] for a load that will verify drafted rows
-    /// ([`Rows`]): each delta layer keeps [`Body35::VERIFY_LANES`] stamped
-    /// lanes of state, so a verify of up to that many rows keeps any `1..=m`
-    /// of them at its commit without a re-feed or a copy (module doc). The
-    /// plan prices the lanes through `KvLayout::of_spec_lanes` at the same count
-    /// (`model::arch::qwen35moe::place::PlanInputs::with_lanes`); the load's
-    /// delta layers' stores, with their stamps, are held to those bytes by
-    /// name ([`Body35::store_bytes`]). A plain [`GpuModel::open`] keeps its one lane
-    /// and its `gdn_delta` launch, byte for byte. Refused by name past
-    /// [`GpuModel::open`]'s refusals: resident slots beyond the live
-    /// sequence ([`Slots::new_seq`]) and a pass of several slots.
+    /// ([`Rows`], [`SlotRows`]): a pass of up to [`Body35::VERIFY_ROWS`] rows
+    /// records each row into every delta store's record, and its commit
+    /// keeps any `1..=m` of them by a replay of the kept records, without a
+    /// re-feed or a copy (module doc). The stores are a plain load's and
+    /// that record ([`RecStore::gdn`]), which the plan prices
+    /// (`PlanInputs::verifying`).
     pub fn open_verifying(
         gpu: Gpu,
         file: impl Into<Model>,
         o: Open35,
     ) -> Result<GpuModel<Body35>, GpuError> {
-        GpuModel::open_lanes(gpu, file.into(), o, Body35::VERIFY_LANES, false)
+        GpuModel::open_whole(gpu, file.into(), o, true, false)
     }
 
-    /// The whole-card load with `lanes` lanes a delta store, and the file's
-    /// next-token layer when `mtp`.
-    fn open_lanes(
+    /// The whole-card load, whose passes verify when `verifies`, and the
+    /// file's next-token layer when `mtp`.
+    fn open_whole(
         gpu: Gpu,
         file: Model,
         o: Open35,
-        lanes: usize,
+        verifies: bool,
         mtp: bool,
     ) -> Result<GpuModel<Body35>, GpuError> {
         let (file, origin) = whole_origin(file, mtp)?;
@@ -1230,7 +1264,7 @@ impl GpuModel<Body35> {
                         Mtp35::open(gpu, w, &draft, layer, (d, o.kv))
                     })
                     .transpose()?;
-                let mut body = Body35::load(gpu, w, pre, o, lanes)?;
+                let mut body = Body35::load(gpu, w, pre, o, verifies)?;
                 body.mtp = mtp;
                 Ok(body)
             },
@@ -1399,7 +1433,7 @@ impl GpuModel<Body35> {
                     rows: PLACED_ROWS,
                 };
                 let mut body =
-                    Body35::build(gpu, w, pre, (o, asked, PLAIN_LANES), Some((open, counted)))?;
+                    Body35::build(gpu, w, pre, (o, asked, false), Some((open, counted)))?;
                 // Last: the machine empties each layer's spare slots, and
                 // every piece above sized itself from the load's map.
                 if let Some(placed) = body.placed.as_mut() {
@@ -1420,12 +1454,12 @@ impl Body35 {
         w: &mut Weights,
         pre: Pre35,
         o: Open35,
-        lanes: usize,
+        verifies: bool,
     ) -> Result<Body35, GpuError> {
         for (l, plan) in pre.plans.iter().enumerate() {
             join_ffn(gpu.stream(), w, &plan.ffn, l)?;
         }
-        Body35::build(gpu, w, pre, (o, o.ubatch, lanes), None)
+        Body35::build(gpu, w, pre, (o, o.ubatch, verifies), None)
     }
 
     /// The body over the resident weights `w` of `pre`'s description: the
@@ -1435,25 +1469,18 @@ impl Body35 {
     /// card's free bytes, and the placed side ([`Placed::new`]). The
     /// checkpoints' spacing is the ubatch size the load was asked for
     /// (`asked`: [`checkpoint_every`]), whether or not a placed load walks
-    /// its prompt at it. `lanes` is the delta stores' lane count: one, or
-    /// [`Body35::VERIFY_LANES`] on a load that verifies drafted rows (whole
-    /// card only; a placed load runs no verify).
+    /// its prompt at it. A load that `verifies` runs each pass as a verify
+    /// waiting for its commit (whole card only; a placed load runs no
+    /// verify, refused by name).
     fn build(
         gpu: &Gpu,
         w: &Weights,
         pre: Pre35,
-        (o, asked, lanes): (Open35, usize, usize),
+        (o, asked, verifies): (Open35, usize, bool),
         placed: Option<(PlacedOpen<'_>, u64)>,
     ) -> Result<Body35, GpuError> {
-        if lanes != PLAIN_LANES && (lanes != Body35::VERIFY_LANES || placed.is_some()) {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "{lanes} lanes a delta store: a load keeps 1, or {} on a whole-card load that \
-                     verifies drafted rows",
-                    Body35::VERIFY_LANES
-                ),
-            ));
+        if verifies && placed.is_some() {
+            return Err(GpuError::shape(WHAT, PLACED_NO_VERIFY));
         }
         let Pre35 {
             vocab,
@@ -1476,11 +1503,8 @@ impl Body35 {
             check_resident(w, &d, plan, placed.is_none())?;
             stores.push(match *kind {
                 Kind35::Gqa(..) => LayerStore::Kv(KvPlanes::new(stream, &d, o.kv)?),
-                Kind35::Delta(shape) if lanes > PLAIN_LANES => {
-                    LayerStore::Rec(RecStore::stamped(stream, shape.lens(lanes), lanes)?)
-                }
                 Kind35::Delta(shape) => {
-                    LayerStore::Rec(RecStore::new(stream, shape.lens(lanes), lanes)?)
+                    LayerStore::Rec(RecStore::gdn(stream, shape, Body35::record_rows(verifies))?)
                 }
                 Kind35::ShortConv(_) => {
                     return Err(GpuError::shape(
@@ -1503,13 +1527,8 @@ impl Body35 {
         };
         let every = checkpoint_every(asked, &d)?;
         let ckpt = sequence_checkpoints(gpu.context(), checkpoint_lens(&kinds), ctx, every)?;
-        let (lane, views) = if lanes > PLAIN_LANES {
-            let (word, views) = LaneWord::with_views(stream, lanes, 3)?;
-            (Some(word), views)
-        } else {
-            (None, Vec::new())
-        };
-        let mut s = Arena::with(stream, d, 1, forms)?;
+        let recovery = recovery_of(stream, &plans, &stores, verifies)?;
+        let s = Arena::with(stream, d, 1, forms)?;
         let sp = StepParams::new(stream, true)?;
         let mut a = Arena::with(stream, d, MAX_PASS_ROWS, forms)?;
         let rp = PassRecord::new(stream)?;
@@ -1537,13 +1556,7 @@ impl Body35 {
             .media
             .then(|| MediaRows::new(stream, d.hidden))
             .transpose()?;
-        if let Ok([step, prompt, pass]) = <[_; 3]>::try_from(views) {
-            // The step and the prompt units write the state back in place;
-            // the pass is the verify, a lane a row.
-            s.run_lanes(step, false)?;
-            u.run_lanes(prompt, false)?;
-            a.run_lanes(pass, true)?;
-        }
+        a.verify_delta(verifies);
         Ok(Body35 {
             vocab,
             eps,
@@ -1569,9 +1582,9 @@ impl Body35 {
             draft: None,
             placed,
             mtp: None,
-            lanes,
-            lane,
+            verifies,
             pending: None,
+            recovery,
             held: 0,
             ckpt,
             every,
@@ -1651,30 +1664,27 @@ impl Body35 {
         self.seq_rope.as_ref().map_or(0, |r| r.table().num_bytes())
     }
 
-    /// Lanes of a delta store on a load that verifies drafted rows
-    /// ([`GpuModel::open_verifying`], [`GpuModel::open_mtp`]): a lane for
-    /// each of a pass's [`MAX_PASS_ROWS`] rows, which is the count the plan
-    /// prices (`KvLayout::of_spec_lanes`).
-    pub const VERIFY_LANES: usize = MAX_PASS_ROWS;
+    /// Rows a delta store's verify record holds: a pass's [`MAX_PASS_ROWS`],
+    /// the count the plan prices (`runtime::stores::PASS_ROWS`).
+    pub const VERIFY_ROWS: usize = MAX_PASS_ROWS;
 
-    /// Lanes of every delta store: 1, or [`Body35::VERIFY_LANES`] on a load
-    /// that verifies drafted rows.
-    #[must_use]
-    pub fn lanes(&self) -> usize {
-        self.lanes
+    /// Rows of each delta store's verify record: [`Body35::VERIFY_ROWS`] on
+    /// a load that verifies, none on a plain load.
+    fn record_rows(verifies: bool) -> usize {
+        if verifies { Body35::VERIFY_ROWS } else { 0 }
     }
 
-    /// The lane that holds the committed state on a load of several lanes;
-    /// `None` on a plain load (its one lane is lane 0).
+    /// Whether a pass is a verify waiting for its commit
+    /// ([`GpuModel::open_verifying`], [`GpuModel::open_mtp`]).
     #[must_use]
-    pub fn committed_lane(&self) -> Option<u32> {
-        self.lane.as_ref().map(LaneWord::lane)
+    pub fn verifies(&self) -> bool {
+        self.verifies
     }
 
     /// What a cut to at most `n` positions of a model standing at `pos`
     /// keeps, and why: with a verify waiting, `n` when it lies past the
-    /// verify's first position (`Rule`: its commit moves the lane word and
-    /// copies nothing) and every position when `n` reaches them (`Current`);
+    /// verify's first position (`Rule`: its commit replays the kept rows'
+    /// records) and every position when `n` reaches them (`Current`);
     /// else every position, the empty model at 0, or the nearest checkpoint
     /// at or below `n`, nothing (`Missed`) when none lies there — a delta
     /// layer keeps no earlier state but a copy. After a call failed past its
@@ -1849,9 +1859,8 @@ impl Body35 {
     }
 
     /// A call at `pos` is refused by name while a verify waits for its
-    /// commit: its rows' states sit in lanes the committed lane word does
-    /// not name yet.
-    fn refuse_pending(&self, what: &'static str, pos: u32) -> Result<(), GpuError> {
+    /// commit: its rows sit in the records, not yet in the lanes.
+    pub(super) fn refuse_pending(&self, what: &'static str, pos: u32) -> Result<(), GpuError> {
         match &self.pending {
             None => Ok(()),
             Some(p) => Err(GpuError::shape(
@@ -1865,41 +1874,30 @@ impl Body35 {
         }
     }
 
-    /// The committed lane: the lane word's on a load of several lanes, lane
-    /// [`LANE`] otherwise.
-    fn committed(&self) -> u32 {
-        self.lane.as_ref().map_or(LANE, LaneWord::lane)
-    }
-
     /// The waiting cut carried out ([`Checkpoints::apply`]): every delta
-    /// layer's committed state lane and conv ring from the point's slot, or
-    /// each zeroed — and, on a load of several lanes, the committed lane
-    /// stamped at the position the cut left (`held`) and every other lane
-    /// never written. Nothing when no cut waits. Waits for the copies; never
+    /// layer's state lane, conv ring and carry from the point's slot, or
+    /// each zeroed, and the lane stamped at the position the cut left
+    /// (`held`). Nothing when no cut waits. Waits for the copies; never
     /// inside a capture (a cut has no stream of its own).
     fn settle(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
         if !self.ckpt.pending() {
             return Ok(());
         }
-        let lane = self.committed();
         {
             let Body35 { ckpt, stores, .. } = &mut *self;
-            let mut c = Copied35::of(stores, lane)?;
+            let mut c = Copied35::of(stores)?;
             ckpt.apply(stream, &mut c.list())?;
         }
-        self.restamp(stream, lane)
+        self.restamp(stream)
     }
 
-    /// Every stamped delta store's stamps: lane `lane` at the held position,
-    /// every other never written. Nothing on a plain load. Never inside a
-    /// capture.
-    fn restamp(&mut self, stream: &CudaStream, lane: u32) -> Result<(), GpuError> {
+    /// Every delta store's lane stamped at the held position. Never inside
+    /// a capture.
+    fn restamp(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
         let at = self.held;
         for s in &mut self.stores {
-            if let LayerStore::Rec(r) = s
-                && r.stamp.is_some()
-            {
-                r.restamp_at(stream, lane, at)?;
+            if let LayerStore::Rec(r) = s {
+                r.restamp_at(stream, LANE, at)?;
             }
         }
         Ok(())
@@ -1927,7 +1925,7 @@ impl Body35 {
     }
 
     /// A checkpoint at `pos`, where the stores stand, after any waiting cut:
-    /// the delta layers' committed lane and conv ring copied to a host slot,
+    /// the delta layers' lane, conv ring and carry copied to a host slot,
     /// or nothing where one stands or at 0. Refused by name when the stores
     /// hold another position or a verify waits for its commit. Waits for the
     /// copies.
@@ -1935,11 +1933,52 @@ impl Body35 {
         self.stores_at(pos)?;
         self.refuse_pending("qwen35moe::Body35::take_mark", pos)?;
         self.settle(stream)?;
-        let lane = self.committed();
         let Body35 { ckpt, stores, .. } = self;
-        let mut c = Copied35::of(stores, lane)?;
+        let mut c = Copied35::of(stores)?;
         ckpt.take(stream, pos, &mut c.list())?;
         Ok(())
+    }
+
+    /// A closing call's end mark at `at`, a row before where its fold left
+    /// the stores ([`GpuModel::prefill_call`]): the stores copied as
+    /// [`Body35::take_mark`] copies them, each delta layer's carry in the
+    /// point giving back the row past `at` its last unit kept there
+    /// (`recur::close_point`). Refused by name, the take forgotten, as
+    /// [`Body35::take_mark`] refuses and when a carry does not stand a row
+    /// past `at` with a row in it. Waits for the copies.
+    fn take_close_mark(&mut self, stream: &CudaStream, at: u32) -> Result<(), GpuError> {
+        const WHAT_X: &str = "qwen35moe::Body35::take_close_mark";
+        self.stores_at(at + 1)?;
+        self.refuse_pending(WHAT_X, at + 1)?;
+        self.settle(stream)?;
+        let delta = (self.stores.iter())
+            .filter(|s| matches!(s, LayerStore::Rec(_)))
+            .count();
+        let Body35 { ckpt, stores, .. } = self;
+        let mut c = Copied35::of(stores)?;
+        let mut list = c.list();
+        let Some(mut open) = ckpt.open_take(stream, at, &mut list)? else {
+            return Ok(());
+        };
+        for (i, store) in list.iter().enumerate() {
+            if let Err(e) = ckpt.copy(stream, &mut open, i, store) {
+                ckpt.abandon(stream, open)?;
+                return Err(e);
+            }
+        }
+        ckpt.seal_with(stream, open, |point| {
+            crate::recur::close_point(point, delta, at)
+        })
+    }
+
+    /// Whether a run of `n` ids on `path` ends in a wide unit
+    /// ([`PrefillPlan`]: a ubatch past [`GEMV_COLS`] rows), whose prompt form
+    /// can keep its last chunk out of the lanes ([`Arena::keep_last`]); false
+    /// for a run the path refuses.
+    fn ends_wide(&self, n: usize, path: PrefillPath) -> bool {
+        PrefillPlan::new(n, path, self.ubatch).is_ok_and(
+            |plan| matches!(plan.steps.last(), Some(&PrefillStep::Ubatch(t)) if t > GEMV_COLS),
+        )
     }
 
     /// A cut to `pos`, behind the stores' position: the point at `pos`
@@ -1965,15 +2004,15 @@ impl Body35 {
     }
 
     /// Keep the first `pos − pos0` rows of the verify waiting for its commit
-    /// and take the rest back, on a load of several lanes: the lane word to
-    /// the last kept row's lane ([`LaneWord::keep`]), nothing copied, the
-    /// stores held at `pos`. A position at or below the verify's first (or
+    /// and take the rest back: the kept rows' records replayed into every
+    /// delta store's lane in one launch ([`recovery_of`]), nothing copied,
+    /// the stores held at `pos`. A position at or below the verify's first (or
     /// with no verify waiting, behind the stores) is a cut to the checkpoint
     /// there ([`Body35::cut`]); `pos` at the stores' position with no verify
     /// waiting takes nothing. A `pos` past the verify's rows is refused by
     /// name, the verify left waiting. What is taken is [`Body35::kept`]'s
     /// rule.
-    fn commit(&mut self, stream: &CudaStream, pos: u32) -> Result<(), GpuError> {
+    pub(super) fn commit(&mut self, gpu: &Gpu, pos: u32) -> Result<(), GpuError> {
         const WHAT_K: &str = "qwen35moe::Body35::commit";
         let Some(p) = self.pending.filter(|p| pos > p.pos0) else {
             if pos == self.held && self.pending.is_none() {
@@ -1992,26 +2031,44 @@ impl Body35 {
             ));
         }
         let kept = (pos - p.pos0) as usize;
-        self.lane
-            .as_mut()
-            .ok_or(GpuError::state(
-                WHAT_K,
-                "a lane word (a load of several lanes)",
-            ))?
-            .keep(stream, kept)?;
+        if let Some(table) = &self.recovery {
+            self.k
+                .q35(WHAT_K)?
+                .linear
+                .delta
+                .enqueue_delta_recovery_layers(
+                    gpu.stream(),
+                    (&self.slot_lane, 0),
+                    kept,
+                    table,
+                    gpu.unlabelled_sink(),
+                )?;
+        }
         self.pending = None;
         self.held = pos;
         Ok(())
     }
 
+    /// On a load that verifies, the live sequence's `rows` rows from `pos0`
+    /// a verify waiting for its commit ([`Body35::commit`]); nothing on a
+    /// plain load, whose passes run in place.
+    pub(super) fn hold_verify(&mut self, pos0: u32, rows: usize) {
+        if self.verifies {
+            self.pending = Some(Pending35 { pos0, rows });
+        }
+    }
+
     /// Exchange the live sequence with `seq`: its stores, the positions they
-    /// hold, its checkpoints and its rotation table, pointer moves only
+    /// hold, its checkpoints, its verify waiting with the replay table over
+    /// its stores, and its rotation table, pointer moves only
     /// ([`Slots::swap_seq`], and a pass of several slots' per-slot work,
     /// `body35_slots`).
     pub(super) fn exchange(&mut self, seq: &mut Slot35) {
         std::mem::swap(&mut self.stores, &mut seq.stores);
         std::mem::swap(&mut self.held, &mut seq.held);
         std::mem::swap(&mut self.ckpt, &mut seq.ckpt);
+        std::mem::swap(&mut self.pending, &mut seq.pending);
+        std::mem::swap(&mut self.recovery, &mut seq.recovery);
         std::mem::swap(&mut self.seq_rope, &mut seq.rope);
     }
 }
@@ -2304,6 +2361,67 @@ impl GpuModel<Body35> {
         PrefillPlan::new(tokens, path, body.ubatch)
     }
 
+    /// The marks of a prompt call of `n` ids on `path` from where the model
+    /// stands, ending as `end` asks, each with whether a checkpoint is taken
+    /// there ([`Body35::marked`]; the call's end alone, taken nowhere, on a
+    /// load that takes none); whether the call's last unit keeps its last
+    /// chunk out of the lanes; and a closing call's fold: the end mark a row
+    /// before the call's end, taken inside that unit. A closing call
+    /// ([`CallEnd::Close`]) takes the marks of the call less its last id;
+    /// where the last of them is that id's position and the run it closes
+    /// ends in a wide unit ([`Body35::ends_wide`]), the id folds into that
+    /// run ([`fold_marks`]), else the mark cuts the call there and the id is
+    /// a run of its own. A closing call whose last unit is wide keeps its
+    /// last chunk whether or not the load takes checkpoints, so it leaves the
+    /// same state either way.
+    fn call_marks(&self, n: usize, path: PrefillPath, end: CallEnd) -> Result<CallMarks, GpuError> {
+        const WHAT_K: &str = "qwen35moe::prefill";
+        let body = self.body(WHAT_K)?;
+        let pos0 = self.pos();
+        let to = pos0 + launch_u32(WHAT_K, "tokens", n)?;
+        let close = end == CallEnd::Close;
+        if !body.takes_checkpoints() {
+            let keep = close && body.ends_wide(n, path);
+            return Ok((vec![(to, false)], keep, None));
+        }
+        if !close {
+            let marks = body.marked(pos0, to).into_iter().map(|m| (m, true));
+            return Ok((marks.collect(), false, None));
+        }
+        let marks = body.marked(pos0, to - 1);
+        let folded = match fold_marks(pos0, n, &marks) {
+            Some(inner) => {
+                let from = inner.last().copied().unwrap_or(pos0);
+                body.ends_wide((to - from) as usize, path)
+                    .then_some(inner.len())
+            }
+            None => None,
+        };
+        let taken = &marks[..folded.unwrap_or(marks.len())];
+        let mut out: Vec<(u32, bool)> = taken.iter().map(|&m| (m, true)).collect();
+        out.push((to, false));
+        Ok((out, folded.is_some(), folded.map(|_| to - 1)))
+    }
+
+    /// Whether a closing call ([`CallEnd::Close`]) of `n` ids on `path` from
+    /// where the model stands runs its last id in a wide unit: the call's
+    /// last unit is one ([`Body35::ends_wide`]) and the call takes no
+    /// checkpoint, or its end mark folds into that unit
+    /// ([`GpuModel::call_marks`]). Otherwise the mark before the last id
+    /// would leave it a run of its own, which a step runs faster; a serve
+    /// seat then feeds the call less that id and steps it.
+    pub fn closes_by_ubatch(&self, n: usize, path: PrefillPath) -> Result<bool, GpuError> {
+        const WHAT_C: &str = "qwen35moe closing call";
+        if n == 0 {
+            return Ok(false);
+        }
+        let body = self.body(WHAT_C)?;
+        if !body.takes_checkpoints() {
+            return Ok(body.ends_wide(n, path));
+        }
+        Ok(self.call_marks(n, path, CallEnd::Close)?.2.is_some())
+    }
+
     /// The last prompt image the prompt call wrote; `None` before one.
     pub fn prompt_image(&self) -> Result<Option<ImageWrite>, GpuError> {
         Ok(self.body("qwen35moe::prompt_image")?.img.last)
@@ -2348,9 +2466,10 @@ impl GpuModel<Body35> {
     /// with the unit's first position and rows (the unit's walk enqueued, its
     /// head read when it is the call's last): where
     /// [`GpuModel::prefill_tapped`] reads its taps back. A closing call
-    /// ([`CallEnd::Close`]) is refused by name before anything runs: a delta
-    /// layer keeps no state inside a unit, where the end mark before the
-    /// last id would stand.
+    /// ([`CallEnd::Close`]) takes the checkpoints of the call less its last
+    /// id ([`GpuModel::call_marks`]): folded into the last unit where its
+    /// end mark can stand inside it, else the mark cuts the call there and
+    /// the last id is a run of its own.
     pub(super) fn prefill_hooked(
         &mut self,
         tokens: &[u32],
@@ -2362,18 +2481,11 @@ impl GpuModel<Body35> {
         if tokens.is_empty() {
             return Err(GpuError::shape(WHAT_P, "empty token slice"));
         }
-        if end == CallEnd::Close {
-            return Err(GpuError::shape(
-                WHAT_P,
-                "a closing call: a delta layer takes no checkpoint inside a unit, before the \
-                 call's last id",
-            ));
-        }
         let pos0 = self.pos();
         self.body(WHAT_P)?.refuse_inside_image(WHAT_P, pos0)?;
         let n = launch_u32(WHAT_P, "tokens", tokens.len())?;
         self.check_pos(pos0 + n - 1, WHAT_P)?;
-        let marked = {
+        {
             let (_, _, body) = self.body_parts(WHAT_P)?;
             if body.taps.is_some() {
                 return Err(GpuError::state(
@@ -2383,13 +2495,8 @@ impl GpuModel<Body35> {
             }
             super::refuse_past_vocab(WHAT_P, tokens, body.vocab)?;
             body.prompt_walks = 0;
-            body.takes_checkpoints()
-        };
-        let marks = if marked {
-            self.body(WHAT_P)?.marked(pos0, pos0 + n)
-        } else {
-            vec![pos0 + n]
-        };
+        }
+        let (marks, keep, fold) = self.call_marks(tokens.len(), path, end)?;
         // A call before a decode history ends with each layer back at the
         // set it started with; without one (a fresh sequence) the call's
         // placement stays. Read once, here: the call keeps no row.
@@ -2400,7 +2507,7 @@ impl GpuModel<Body35> {
             .is_some_and(|p| p.hybrid.call_history());
         let r = self
             .stream_begin(path, tokens.len(), history)
-            .and_then(|()| self.feed_marks(tokens, path, &marks, marked, unit, end.head()));
+            .and_then(|()| self.feed_marks(tokens, path, (&marks, keep, fold), unit, end.head()));
         // The call's own error first: an end refused after a failed call is
         // its echo. A failed call's streaming ends with each layer back at
         // the set it started with too.
@@ -2411,15 +2518,17 @@ impl GpuModel<Body35> {
     }
 
     /// [`GpuModel::prefill_call`]'s runs between its `marks` from where the
-    /// model stands, a checkpoint taken at each when `marked`: with `head`
-    /// the argmax after the last id, the head over the call's last row alone
-    /// (a run before a mark reads only the fault word at its end).
+    /// model stands, a checkpoint taken at each mark that asks for one: with
+    /// `head` the argmax after the last id, the head over the call's last row
+    /// alone (a run before a mark reads only the fault word at its end). With
+    /// `keep` the call's last unit keeps its last chunk out of the lanes; a
+    /// closing call's `fold`, the end mark a row before the call's end, is
+    /// taken once that unit has walked ([`Body35::take_close_mark`]).
     fn feed_marks(
         &mut self,
         tokens: &[u32],
         path: PrefillPath,
-        marks: &[u32],
-        marked: bool,
+        (marks, keep, fold): (&[(u32, bool)], bool, Option<u32>),
         mut unit: Option<&mut UnitHook<'_>>,
         head: bool,
     ) -> Result<Option<u32>, GpuError> {
@@ -2427,18 +2536,22 @@ impl GpuModel<Body35> {
         let pos0 = self.pos();
         let end = pos0 + launch_u32(WHAT_M, "tokens", tokens.len())?;
         let (mut next, mut at) = (None, pos0);
-        for &mark in marks {
+        for &(mark, take) in marks {
             if mark > at {
                 let run = &tokens[(at - pos0) as usize..(mark - pos0) as usize];
-                let headed = head && mark == end;
-                next = self.feed35(run, path, unit.as_deref_mut(), headed)?;
+                let (headed, keep) = (head && mark == end, keep && mark == end);
+                next = self.feed35(run, path, unit.as_deref_mut(), (headed, keep))?;
                 at = mark;
             }
-            if marked {
+            if take {
                 let pos = self.pos();
                 let (gpu, _, body) = self.body_parts(WHAT_M)?;
                 body.take_mark(gpu.stream(), pos)?;
             }
+        }
+        if let Some(e) = fold {
+            let (gpu, _, body) = self.body_parts(WHAT_M)?;
+            body.take_close_mark(gpu.stream(), e)?;
         }
         if head && next.is_none() {
             return Err(GpuError::state(WHAT_M, "a token read after the last unit"));
@@ -2494,13 +2607,14 @@ impl GpuModel<Body35> {
     /// run's plan one walk, the last ending in its last row's head when
     /// `head` asks for it (the argmax after the last id), else in a read of
     /// the fault word, so a fault ends the call before a checkpoint copies a
-    /// store.
+    /// store. With `keep` the last unit keeps its last chunk out of the
+    /// lanes ([`Arena::keep_last`]).
     fn feed35(
         &mut self,
         run: &[u32],
         path: PrefillPath,
         mut hook: Option<&mut UnitHook<'_>>,
-        head: bool,
+        (head, keep): (bool, bool),
     ) -> Result<Option<u32>, GpuError> {
         const WHAT_F: &str = "qwen35moe::prefill::run";
         let plan = self.prefill_plan(run.len(), path)?;
@@ -2526,7 +2640,10 @@ impl GpuModel<Body35> {
                 } else {
                     UnitEnd::Pass
                 };
-                body.walk_unit(gpu, w, unit, pos, end)?;
+                body.u.keep_last(keep && last);
+                let walked = body.walk_unit(gpu, w, unit, pos, end);
+                body.u.keep_last(false);
+                walked?;
                 body.stream.walk_done();
                 if last
                     && !headed
@@ -2758,13 +2875,11 @@ impl ChainBody for Body35 {
         enqueue_chain(gpu, w, self, head)
     }
 
-    /// Every delta layer's state lanes and conv ring back to zero, the
-    /// checkpoints dropped, the rotation table of a media load back to its
-    /// text rows and the stores counted at 0 — the live
-    /// sequence's, the selected slot's; a parked one keeps its own — and
-    /// the records' lane word to [`LANE`] (on a load of several lanes the
-    /// committed lane to lane 0, the stamps fresh and no verify waiting),
-    /// after a placed load's host tier
+    /// Every delta layer's state lane, conv ring and carry back to zero, the
+    /// stamps fresh, no verify waiting, the checkpoints dropped, the rotation
+    /// table of a media load back to its text rows and the stores counted at
+    /// 0 — the live sequence's, the selected slot's; a parked one keeps its
+    /// own —, after a placed load's host tier
     /// reset — the load's, whichever slot resets: a refused input's poison
     /// lifted, the words checked at rest. The K/V planes need nothing: the
     /// flash never loads a key row at or past the live count, and every row
@@ -2777,21 +2892,12 @@ impl ChainBody for Body35 {
         for s in &mut self.stores {
             if let LayerStore::Rec(r) = s {
                 r.clear(stream)?;
+                r.restamp(stream)?;
             }
         }
         self.ckpt.clear();
         self.held = 0;
         self.pending = None;
-        if let Some(word) = self.lane.as_mut() {
-            word.set(stream, LANE)?;
-        }
-        for s in &mut self.stores {
-            if let LayerStore::Rec(r) = s
-                && r.stamp.is_some()
-            {
-                r.restamp(stream)?;
-            }
-        }
         if let Some(rope) = self.seq_rope.as_mut() {
             rope.restore(stream, MropeSeq::new())?;
         }
@@ -2814,7 +2920,7 @@ impl ChainBody for Body35 {
             + self.rp.bytes()
             + self.slot_in.bytes()
             + self.slot_lane.num_bytes()
-            + self.lane.as_ref().map_or(0, LaneWord::bytes)
+            + self.recovery.as_ref().map_or(0, RecoveryTable::bytes)
             + self.u.bytes()
             + self.img.bytes()
             + self.head_state.bytes()
@@ -2860,16 +2966,6 @@ impl Slots for Body35 {
                 "an in-file MTP load supports one resident sequence",
             ));
         }
-        if self.lanes > PLAIN_LANES {
-            return Err(GpuError::shape(
-                WHAT_N,
-                format!(
-                    "a second resident sequence on a load that verifies drafted rows ({} lanes a \
-                     delta layer, one lane word): its slots keep one lane each",
-                    self.lanes
-                ),
-            ));
-        }
         let stream = gpu.stream();
         let d = self.s.dims;
         let stores =
@@ -2881,7 +2977,7 @@ impl Slots for Body35 {
                         Ok(LayerStore::Kv(KvPlanes::new(stream, &d, planes.format())?))
                     }
                     (MixerPlan::Delta(dp), LayerStore::Rec(_)) => Ok(LayerStore::Rec(
-                        RecStore::new(stream, dp.shape.lens(PLAIN_LANES), PLAIN_LANES)?,
+                        RecStore::gdn(stream, dp.shape, Body35::record_rows(self.verifies))?,
                     )),
                     _ => Err(GpuError::state(
                         WHAT_N,
@@ -2896,10 +2992,13 @@ impl Slots for Body35 {
             .as_ref()
             .map(|b| b.seq(stream, d.ctx))
             .transpose()?;
+        let recovery = recovery_of(stream, &self.plans, &stores, self.verifies)?;
         Ok(Slot35 {
             stores,
             held: 0,
             ckpt,
+            pending: None,
+            recovery,
             rope,
         })
     }
@@ -2917,12 +3016,15 @@ impl Slots for Body35 {
     }
 
     /// Device bytes one sequence holds: its layers' stores
-    /// ([`Body35::store_bytes`]) and its rotation table
-    /// ([`Body35::rope_bytes`]). Its checkpoints are host bytes, left out:
-    /// pinned slots its prompt calls make as they take points, up to
+    /// ([`Body35::store_bytes`]), its rotation table
+    /// ([`Body35::rope_bytes`]) and, on a load that verifies, its commit's
+    /// replay table ([`recovery_of`]). Its checkpoints are host bytes, left
+    /// out: pinned slots its prompt calls make as they take points, up to
     /// [`checkpoint_budget35`] a sequence and none at [`Slots::new_seq`].
     fn seq_bytes(&self) -> usize {
-        self.store_bytes() + self.rope_bytes()
+        self.store_bytes()
+            + self.rope_bytes()
+            + self.recovery.as_ref().map_or(0, RecoveryTable::bytes)
     }
 }
 
@@ -2991,7 +3093,7 @@ impl Rollback for Body35 {
     /// the next call to carry out ([`Body35::settle`]), any other position
     /// behind the stores refused by name. A text load has no device work in
     /// it; a media load's table is cut on the card
-    /// ([`Rollback::rollback_on`]), and a load of several lanes commits a
+    /// ([`Rollback::rollback_on`]), and a load that verifies commits a
     /// verify on the card ([`Body35::commit`]), so both are refused here by
     /// name.
     fn rollback(&mut self, pos: u32) -> Result<(), GpuError> {
@@ -3004,13 +3106,12 @@ impl Rollback for Body35 {
                 ),
             ));
         }
-        if self.lanes > PLAIN_LANES {
+        if self.verifies {
             return Err(GpuError::shape(
                 "qwen35moe::Body35::rollback",
                 format!(
-                    "back to position {pos} without the card: a load of {} lanes commits a \
-                     verify by a copy of its lane word (GpuModel::rollback)",
-                    self.lanes
+                    "back to position {pos} without the card: a load that verifies commits a \
+                     verify by a replay of its records (GpuModel::rollback)"
                 ),
             ));
         }
@@ -3018,8 +3119,8 @@ impl Rollback for Body35 {
     }
 
     /// [`Rollback::rollback`] with the card at hand: the cut of the stores
-    /// ([`Body35::cut`]) — on a load of several lanes the commit of the
-    /// verify waiting ([`Body35::commit`]), any `1..=m` rows of it kept —,
+    /// ([`Body35::cut`]) — on a load that verifies the commit of the verify
+    /// waiting ([`Body35::commit`]), any `1..=m` rows of it kept —,
     /// and on a media load the rotation table's: the
     /// images from `pos` on go and the rows after `pos` take the positions
     /// the kept images leave ([`SeqRope::cut`]). A cut inside an image is
@@ -3034,8 +3135,8 @@ impl Rollback for Body35 {
                 .cut(row)
                 .map_err(|e| GpuError::shape(WHAT_R, e.to_string()))?;
         }
-        if self.lanes > PLAIN_LANES {
-            self.commit(gpu.stream(), pos)?;
+        if self.verifies {
+            self.commit(gpu, pos)?;
         } else {
             self.cut(pos)?;
         }
@@ -3059,12 +3160,7 @@ impl Rows for Body35 {
         if let Some(d) = self.draft.as_mut() {
             d.plan(tokens.len());
         }
-        if self.lanes > PLAIN_LANES {
-            self.pending = Some(Pending35 {
-                pos0: pos,
-                rows: tokens.len(),
-            });
-        }
+        self.hold_verify(pos, tokens.len());
         Ok(())
     }
 
@@ -3103,11 +3199,8 @@ impl Instrumented for Body35 {
         stream.synchronize()?;
         self.held = u32::try_from(rows)
             .map_err(|_| GpuError::shape(WHAT, format!("a depth of {rows} positions past u32")))?;
-        if self.lanes > PLAIN_LANES {
-            let lane = self.committed();
-            self.restamp(stream, lane)?;
-            stream.synchronize()?;
-        }
+        self.restamp(stream)?;
+        stream.synchronize()?;
         Ok(())
     }
 }
@@ -3191,12 +3284,13 @@ mod tests {
 
     /// A checkpoint of Qwen3.6-35B-A3B's trunk — 30 delta layers of 16 key
     /// and 32 value heads among 10 attention layers — copies each delta
-    /// layer's state (2,097,152 B) and conv ring (360,448 B): 73,728,000 B,
-    /// spaced at the 4,096-token default ubatch, so a slot of 2,048 positions
-    /// pins one point and one of 10,240 three. The lengths are the stores'
-    /// own ([`LinearShape::lens`]), in [`Copied35`]'s order.
+    /// layer's state (2,097,152 B), conv ring (360,448 B) and carry
+    /// (397,328 B): 85,647,840 B, spaced at the 4,096-token default ubatch,
+    /// so a slot of 2,048 positions pins one point and one of 10,240 three.
+    /// The lengths are the stores' own ([`LinearShape::lens`],
+    /// [`LinearShape::carry_len`]), in [`Copied35`]'s order.
     #[test]
-    fn a_checkpoint_copies_each_delta_layers_state_and_ring() {
+    fn a_checkpoint_copies_each_delta_layers_state_ring_and_carry() {
         let delta = Kind35::Delta(LinearShape {
             n_k: 16,
             n_v: 32,
@@ -3212,11 +3306,29 @@ mod tests {
             })
             .collect();
         let lens = checkpoint_lens(&kinds);
-        assert_eq!(lens.len(), 60);
-        assert!(lens.chunks(2).all(|c| c == [32 * 128 * 128, 11 * 8192]));
-        assert_eq!(point_bytes(&lens), 73_728_000);
+        // PIN(2026-11-02): checkpoints now copy each delta layer's carry beside its state and ring.
+        assert_eq!(lens.len(), 90, "three buffers per delta layer");
+        assert!(
+            lens.as_chunks::<3>().0.iter().all(|c| {
+                *c == [
+                    32 * 128 * 128,
+                    11 * 8192,
+                    4 + 16 * ((16 + 32) * 128 + 2 * 32),
+                ]
+            }),
+            "each checkpoint copies state, ring and carry in that order"
+        );
+        assert_eq!(point_bytes(&lens), 85_647_840, "thirty delta layers");
         let price = price(&lens, 4_096);
-        assert_eq!(price.budget(2_048), Ok(2 * 73_728_000));
-        assert_eq!(price.budget(10_240), Ok(4 * 73_728_000));
+        assert_eq!(
+            price.budget(2_048),
+            Ok(2 * 85_647_840),
+            "the checkpoint budget includes its spare point"
+        );
+        assert_eq!(
+            price.budget(10_240),
+            Ok(4 * 85_647_840),
+            "the checkpoint budget includes its spare point"
+        );
     }
 }

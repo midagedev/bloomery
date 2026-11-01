@@ -21,6 +21,7 @@ pub struct Geometry35 {
     pub n_delta: usize,
     pub n_kv: usize,
     pub head: usize,
+    pub n_k: usize,
     pub n_v: usize,
     pub head_v: usize,
     /// The conv ring's row width: `(2 · k_heads + v_heads) · head_v`.
@@ -39,7 +40,7 @@ impl Geometry35 {
         let spec = model::arch::spec(split)
             .map_err(|e| format!("the header: {e}"))?
             .spec;
-        let (mut attn, mut delta): (Option<[usize; 3]>, Option<[usize; 3]>) = (None, None);
+        let (mut attn, mut delta): (Option<[usize; 4]>, Option<[usize; 4]>) = (None, None);
         let (mut n_attn, mut n_delta) = (0, 0);
         for (l, layer) in spec.layers.iter().enumerate() {
             let (slot, got, n) = match &layer.mixer {
@@ -47,7 +48,7 @@ impl Geometry35 {
                     let a = AttnShape::of(g);
                     (
                         &mut attn,
-                        [a.n_kv as usize, a.head as usize, 0],
+                        [a.n_kv as usize, a.head as usize, 0, 0],
                         &mut n_attn,
                     )
                 }
@@ -57,6 +58,7 @@ impl Geometry35 {
                         d.v_heads as usize,
                         d.d as usize,
                         ((2 * d.k_heads + d.v_heads) * d.d) as usize,
+                        d.k_heads as usize,
                     ],
                     &mut n_delta,
                 ),
@@ -70,35 +72,43 @@ impl Geometry35 {
             *slot = Some(got);
             *n += 1;
         }
-        let Some([n_kv, head, _]) = attn else {
+        let Some([n_kv, head, _, _]) = attn else {
             return Err("the file holds no attention layer".into());
         };
-        let [n_v, head_v, conv_c] = delta.unwrap_or([0; 3]);
+        let [n_v, head_v, conv_c, n_k] = delta.unwrap_or([0; 4]);
         Ok(Geometry35 {
             n_attn,
             n_delta,
             n_kv,
             head,
+            n_k,
             n_v,
             head_v,
             conv_c,
         })
     }
 
-    /// One delta layer's state and conv ring, f32 values.
+    /// One delta layer's state, conv ring and carry, f32 values. The carry is the chunked prompt rule's: four head
+    /// words and 16 rows of the key and value heads and each row's β and decay a value head,
+    /// `4 + 16 · ((n_k + n_v) · head_v + 2 · n_v)`.
     fn delta_values(&self) -> usize {
-        self.n_v * self.head_v * self.head_v + RING_ROWS * self.conv_c
+        self.n_v * self.head_v * self.head_v
+            + RING_ROWS * self.conv_c
+            + 4
+            + 16 * ((self.n_k + self.n_v) * self.head_v + 2 * self.n_v)
     }
 
-    /// One checkpoint's bytes: every delta layer's state and ring.
+    /// One checkpoint's bytes: every delta layer's state, ring and carry.
     pub fn checkpoint_bytes(&self) -> usize {
         self.n_delta * self.delta_values() * 4
     }
 
-    /// The layer stores' bytes at `ctx` rows: each attention layer's K and V planes (`2 · n_kv · ctx · head` f16) and
-    /// each delta layer's state and ring.
+    /// The layer stores' bytes at `ctx` rows on a load that does not verify: each attention layer's K and V planes
+    /// (`2 · n_kv · ctx · head` f16) and each delta layer's state, ring and carry and its lane's u32 stamp.
     pub fn store_bytes(&self, ctx: usize) -> usize {
-        self.n_attn * 2 * self.n_kv * ctx * self.head * 2 + self.checkpoint_bytes()
+        self.n_attn * 2 * self.n_kv * ctx * self.head * 2
+            + self.checkpoint_bytes()
+            + self.n_delta * 4
     }
 }
 
@@ -445,7 +455,8 @@ impl SlotsAdapter for Slots35 {
         Ok(Derived {
             bytes: g.store_bytes(self.ctx),
             terms: format!(
-                "{} x K/V planes of 2 x {} x {} x {} f16 + {} x (state {} x {} x {} + ring {RING_ROWS} x {}) f32",
+                "{} x K/V planes of 2 x {} x {} x {} f16 + {} x (state {} x {} x {} + ring {RING_ROWS} x {} + carry) \
+                 f32 and a u32 stamp",
                 g.n_attn, g.n_kv, self.ctx, g.head, g.n_delta, g.n_v, g.head_v, g.head_v, g.conv_c
             ),
         })

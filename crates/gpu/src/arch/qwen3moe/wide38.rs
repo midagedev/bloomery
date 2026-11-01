@@ -190,7 +190,7 @@ use super::plan38::{GDN, GDN_GATE, GdnPlan, HcSite, Layer38, Mixer38, QsaPlan, g
 use super::program38::{BA_PITCH, Ctx38, beta_alpha_rows};
 use super::router::gated;
 use super::scratch::{Append256, Io, KvPlanes, PrefillFlash, RecStore, cells_view, param_view};
-use super::scratch38::{Arena38, Ple38, ROUTE_ROWS, Store38, final_res, no_carry};
+use super::scratch38::{Arena38, Ple38, ROUTE_ROWS, Store38, final_res};
 use super::tier38::TierSide38;
 use crate::GpuError;
 use crate::card_leg::{RouteBlock, RouteW, StackW, with_ring};
@@ -211,7 +211,7 @@ use crate::host::run::HostRun;
 use crate::host::xstream::{GROUP_WALK_ORDER, LandBatch, RingLayer};
 use crate::kquant::Act;
 use crate::linear::conv::{ConvArgs, ConvRows};
-use crate::linear::delta::{DeltaArgs, DeltaLanesArgs};
+use crate::linear::seqs::{GdnCall, GdnRun, enqueue_gdn};
 use crate::model::lookup::{f32_gain, f32_tensor};
 use crate::ple::{PleConvArgs, PleGateArgs};
 use crate::prompt_timing::Mark;
@@ -2116,13 +2116,13 @@ impl WideParts<'_> {
             .get_mut(l)
             .ok_or(GpuError::state(WHAT, "a store for every layer"))?;
         match (&p.mixer, store) {
-            (Mixer38::Gdn(g), Store38::Rec { rec, stamp, .. }) => {
+            (Mixer38::Gdn(g), Store38::Rec(rec)) => {
                 let lane = self.io.lane.ok_or(GpuError::state(
                     WHAT,
                     "the record's lane word (a chain with delta layers carries one)",
                 ))?;
                 let chunk = self.keep && u.r0 + u.m == self.m;
-                gdn(c, g, (rec, stamp, lane), (s, &mut *x), (u, chunk), sink)?;
+                gdn(c, g, (rec, lane), (s, &mut *x), (u, chunk), sink)?;
                 narrow(c, x, u, keep)
             }
             (Mixer38::Qsa(q), Store38::Qsa { kv, ring, pooled }) => {
@@ -2480,15 +2480,15 @@ impl WideParts<'_> {
     }
 }
 
-/// A delta layer's mixer over unit `u`'s rows and its store `r`, its lanes'
-/// stamps and the lane word, the committed lane in place, the unit's last
+/// A delta layer's mixer over unit `u`'s rows, its store `r` and the lane
+/// word, the committed lane in place, the unit's last
 /// chunk kept out of the state when `keep` (the walk's last unit of a
 /// closing call, [`WideParts::keep`]); the attention
 /// site's mix in `s.mixed`, its output projection into the unit's `y`.
 fn gdn(
     c: &Ctx38<'_>,
     gp: &GdnPlan,
-    (r, stamp, lane): (&mut RecStore, &mut DeviceBuffer<u32>, &DeviceBuffer<u32>),
+    (r, lane): (&mut RecStore, &DeviceBuffer<u32>),
     (s, x): (&mut Arena38, &mut Wide38),
     (u, keep): (&mut UnitRows38, bool),
     sink: FaultSink,
@@ -2548,30 +2548,25 @@ fn gdn(
     // their room.
     let len = g.x.len();
     let mut work = WindowMut::<u32>::of_mut(&mut g.x, 0, len)?;
-    let carry = r.carry.as_mut().ok_or_else(no_carry)?;
-    lin.delta.enqueue_delta_prompt(
+    enqueue_gdn(
+        lin,
         stream,
-        DeltaLanesArgs {
-            delta: DeltaArgs {
-                qkv: &g.conv,
-                beta: &g.beta,
-                decay: &g.decay,
-                lane,
-                lane_at: 0,
-                lanes: r.lanes,
-                shape: GDN,
-                m,
-                fault: sink,
-                o: &mut g.o,
-                state: &mut r.state,
-            },
-            each: false,
+        GdnCall {
+            qkv: &g.conv,
+            beta: &g.beta,
+            decay: &g.decay,
+            lane,
             pos: &u.pos,
-            stamp,
+            shape: GDN,
+            m,
+            fault: sink,
+            o: &mut g.o,
         },
-        carry,
-        &mut work,
-        keep,
+        r,
+        GdnRun::Prompt {
+            work: &mut work,
+            keep,
+        },
     )?;
     site::resident_gemm_norm_gate(
         c.gpu,
@@ -2592,7 +2587,7 @@ fn gdn(
                 y: &mut *attn,
             },
         ),
-        (&[&gp.ssm_out], x.act_attn.out()),
+        (&[&gp.ssm_out], x.act_attn.views_mut()),
     )?;
     let act = (&*attn, &x.act_attn, m);
     dense_gemm(c, &gp.ssm_out, act, dense, &mut u.y)

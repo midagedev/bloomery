@@ -217,6 +217,15 @@ pub trait Prompt: ChainBody {
         let _ = end;
         Self::prompt(m, ids).map(Some)
     }
+
+    /// Whether a closing call ([`CallEnd::Close`]) of `n` ids from where the
+    /// model stands folds its last id into the call's last unit, its end mark
+    /// before that id: a seat asks the closing call only then, and otherwise
+    /// feeds the call less that id and steps it. The default is false.
+    fn closes(m: &GpuModel<Self>, n: usize) -> Result<bool, GpuError> {
+        let _ = (m, n);
+        Ok(false)
+    }
 }
 
 /// Which cuts a body's caches keep. gpumodel's [`Rollback`] takes positions

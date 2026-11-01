@@ -57,8 +57,9 @@
 //!   which a model's next ids follow more loosely than a chat answer, so a
 //!   prompt call fed other ids moves them sooner), gives for each the ids
 //!   `generate_qwen3moe --arm <ids>/N --ctx <the server's loaded context>
-//!   … --last-step` prints for the same file (the server's cut: the prompt
-//!   less its last id, then a step). The CLI's own default context plans a
+//!   … --last-step` prints for the same file (the server's last call: a
+//!   closing call where the body folds the last id, else the prompt less
+//!   that id, then a step). The CLI's own default context plans a
 //!   different split of the routed experts, and the card leg and the host
 //!   leg sum in different orders, so the ids are the server's context's —
 //!   all of them, or a prefix ending at an end-of-generation id, and the
@@ -215,8 +216,9 @@
 //!   (`slots_parallel_line_names_one_pass`,
 //!   `placed_slots_parallel_line_names_one_pass`): a placed load serves
 //!   several slots' rows as one pass (`Body3::serves_one_pass`), and a
-//!   printed plan does not name turns. The lookup draft stays turns in
-//!   `pass_of` and is not this clause. FAIL-first: the word `turns`, red
+//!   printed plan does not name turns. The lookup draft's rounds are one pass
+//!   too on a qwen35 family file (`pass_of`) and are their own clause
+//!   (`lookup_slots_verify_together`). FAIL-first: the word `turns`, red
 //!   on that arm. A server
 //!   of `--parallel 2` under `BLOOMERY_STEP_STATS=1` prints a `slots round`
 //!   record a round of several slots — two greedy streamed requests of the
@@ -498,6 +500,10 @@
 //! `bloomery_placement::placement::ctx_ask`'s tests; a set share past the
 //! file's limit, by `bloomery_placement::placement::ctx`'s.
 //!
+//! - `lookup_slots_verify_together` and `lookup_slots_together_alone`, on a
+//!   qwen35 family file: a lookup server of `--parallel 2` runs a round of
+//!   both slots as one pass and keeps each request's alone ids
+//!   ([`lookup_slots_verify_together`]).
 //! - `mtp_ids_match_the_plain_path`: on a file whose header carries the in-file
 //!   next-token layer, greedy output under `BLOOMERY_DRAFT=mtp` equals the same
 //!   prompt under `BLOOMERY_DRAFT=off` for [`MTP_N`] tokens, and the drafted
@@ -541,6 +547,7 @@ mod gate {
     use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size;
     use bloomery_gpu::arch::qwen3moe::{Body35, Open35, Qwen35moeModel, checkpoint_budget35};
     use bloomery_gpu::kv_format::{KvChoice, KvQ8};
+    use bloomery_gpu::linear::delta::recovery_record_len;
     use bloomery_gpu::linear::{KHeadMap, LinearShape};
     use bloomery_gpu::route_softmax::MAX_TOKENS;
     use bloomery_gpu_gates::beside;
@@ -1524,7 +1531,7 @@ mod gate {
         // The whole load's need at `ctx` positions, the line's other terms kept.
         let granule = serve_granule()?;
         let need_at = |ctx: u64| -> Result<u64, GateError> {
-            let planes = cache_planes(model, split, ctx, default_lanes(split))?;
+            let planes = cache_planes(model, split, ctx, default_records(split))?;
             rest.checked_add(model::placement::allocator_bytes(granule, planes))
                 .ok_or_else(|| format!("the whole load's need at {ctx} passes u64 bytes").into())
         };
@@ -1628,8 +1635,8 @@ mod gate {
     /// either way — and the clause reads the line's cache bytes and holds
     /// them equal to `allocator_bytes` over the file's own planes at the
     /// card's granule: f16's `k` and `v` a plain-attention layer, a
-    /// qwen35moe file's recurrent layers' `state` and `ring`
-    /// (`LinearShape`'s lengths, one lane as `Body35` allocates them).
+    /// qwen35moe file's recurrent layers' stores as `RecStore::gdn`
+    /// allocates them ([`cache_planes`]).
     /// FAIL-first: the raw sum the verdict counted before the planes went
     /// through the allocator is 95.9 MiB short at this ctx on the Qwen3-30B
     /// file at a 2 MiB granule (every plane 1023 KiB under the granules it
@@ -1642,7 +1649,7 @@ mod gate {
         ok: &mut bool,
     ) -> Result<(), GateError> {
         let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
-        let planes = cache_planes(model, &split, GRANULE_CTX as u64, default_lanes(&split))?;
+        let planes = cache_planes(model, &split, GRANULE_CTX as u64, default_records(&split))?;
         let expected = model::placement::allocator_bytes(serve_granule()?, planes.iter().copied());
         let raw: u64 = planes.iter().sum();
         let d = dir.join("ctx-granule");
@@ -1696,32 +1703,33 @@ mod gate {
         Ok(())
     }
 
-    /// The lanes a delta store of the seat's default load holds on `split`: a
-    /// file that carries a usable next-token layer serves the MTP draft with
-    /// the draft unset (one slot, the whole load, no media), and that load
-    /// verifies on [`Body35::VERIFY_LANES`] lanes; any other file one lane.
-    fn default_lanes(split: &Split) -> usize {
+    /// The verify record rows a delta store of the seat's default load holds
+    /// on `split`: a file that carries a usable next-token layer serves the
+    /// MTP draft with the draft unset (one slot, the whole load, no media),
+    /// and that load records [`Body35::VERIFY_ROWS`] rows; any other file
+    /// none.
+    fn default_records(split: &Split) -> usize {
         if matches!(in_file(split), Ok(InFile::Draft(_))) {
-            Body35::VERIFY_LANES
+            Body35::VERIFY_ROWS
         } else {
-            1
+            0
         }
     }
 
     /// The cache planes the body allocates for one sequence of `ctx` rows of
     /// `model`'s file (`split`), in its allocation order — the order the
     /// allocator's shared granules are counted in: f16's `k` and `v` a
-    /// plain-attention layer, a qwen35moe file's recurrent layers' `state`
-    /// and `ring` (`LinearShape`'s lengths), which no context moves: the
-    /// state `lanes` times, and a load of more than one lane a word a lane
-    /// past the ring (`RecStore`'s stamps), as `Body35` allocates them. A
+    /// plain-attention layer, a qwen35moe file's recurrent layers' one-lane
+    /// `state`, `ring`, the lane's stamp word, the `carry` (`LinearShape`'s
+    /// lengths) and, for `record_rows` past 0, the verify record of that
+    /// many rows, which no context moves, as `RecStore::gdn` allocates them. A
     /// qwen35moe file's layers are the description's trunk: a next-token
     /// layer past the trunk holds no sequence plane.
     fn cache_planes(
         model: &Path,
         split: &Split,
         ctx: u64,
-        lanes: usize,
+        record_rows: usize,
     ) -> Result<Vec<u64>, GateError> {
         let num = |key: &str| -> Result<u64, GateError> {
             split
@@ -1758,10 +1766,12 @@ mod gate {
                 for (l, layer) in trunk.layers.iter().enumerate() {
                     match &layer.mixer {
                         Mixer::DeltaRule(_) => {
-                            planes.push(4 * lanes as u64 * shape.state_len() as u64);
+                            planes.push(4 * shape.state_len() as u64);
                             planes.push(4 * shape.ring_len() as u64);
-                            if lanes > 1 {
-                                planes.push(4 * lanes as u64);
+                            planes.push(4);
+                            planes.push(4 * shape.carry_len() as u64);
+                            if record_rows > 0 {
+                                planes.push(4 * recovery_record_len(shape, record_rows) as u64);
                             }
                         }
                         Mixer::Gqa(_) => {
@@ -1993,6 +2003,9 @@ mod gate {
     /// One streamed request's answer: the final event's tokens.
     struct Streamed {
         tokens: Vec<u32>,
+        /// The final event's `timings.draft_n`: the ids a draft proposed (0
+        /// when it proposed none).
+        drafted: u64,
     }
 
     /// A streamed request's answer channel: what its reader thread sends
@@ -2027,14 +2040,15 @@ mod gate {
                 if status != 200 {
                     return Err(format!("curl {url}: HTTP {status}: {sse}"));
                 }
-                let mut tokens = Vec::new();
+                let (mut tokens, mut drafted) = (Vec::new(), 0);
                 for e in sse_events(&sse).map_err(|e| format!("curl {url}: {e}"))? {
                     let v = sse_event(e).map_err(|e| format!("curl {url}: {e}"))?;
                     if v.get("tokens").is_some() {
                         tokens = ids_of(&v["tokens"]).map_err(|e| format!("curl {url}: {e}"))?;
+                        drafted = serve_client::draft_counts(&v).map_err(|e| e.to_string())?.0;
                     }
                 }
-                Ok(Streamed { tokens })
+                Ok(Streamed { tokens, drafted })
             })();
             let _ = tx.send(run);
         })
@@ -2373,8 +2387,8 @@ mod gate {
         let granule = serve_granule()?;
         let need2 = |x: u64| -> Result<u64, GateError> {
             let rows = x / 2;
-            let mut planes = cache_planes(model, &split, rows, 1)?;
-            planes.extend(cache_planes(model, &split, rows, 1)?);
+            let mut planes = cache_planes(model, &split, rows, 0)?;
+            planes.extend(cache_planes(model, &split, rows, 0)?);
             rest.checked_add(model::placement::allocator_bytes(granule, planes))
                 .ok_or_else(|| {
                     format!("the two-slot whole load's need at {x} passes u64 bytes").into()
@@ -2504,8 +2518,8 @@ mod gate {
         let log = std::fs::read_to_string(&err_log)?;
         // PIN(2026-10-22): a placed load of `Body` or `Body35` serves
         // several slots' rows as one pass. A printed plan is that load
-        // and names `one`, the same as a whole-card load. Lookup stays
-        // turns in `pass_of` and is not an arm here.
+        // and names `one`, the same as a whole-card load. Lookup rounds are
+        // `lookup_slots_verify_together`, not an arm here.
         // FAIL-first: the word `turns`, or a together record of `passes=rows`.
         let plan = routed_split(&seat_records(&log, &err_log))?;
         println!(
@@ -2834,9 +2848,9 @@ mod gate {
         // at the slot ctx held, one slot's planes at no position reserved
         // (named only where not 0), the count its KV term plus that reserve.
         let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
-        let fixed: u64 = cache_planes(model, &split, 0, 1)?.iter().sum();
+        let fixed: u64 = cache_planes(model, &split, 0, 0)?.iter().sum();
         let both = match slot {
-            Some(s) => Some(2 * cache_planes(model, &split, s, 1)?.iter().sum::<u64>()),
+            Some(s) => Some(2 * cache_planes(model, &split, s, 0)?.iter().sum::<u64>()),
             None => None,
         };
         let (kv, reserve) = (num("(its KV term "), num(" reserve "));
@@ -4189,7 +4203,7 @@ mod gate {
         let rows = total / slots;
         let mut planes = Vec::new();
         for _ in 0..slots {
-            planes.extend(cache_planes(model, &split, rows, 1)?);
+            planes.extend(cache_planes(model, &split, rows, 0)?);
             planes.push(rows * rope * 4);
         }
         let want = model::placement::allocator_bytes(serve_granule()?, planes);
@@ -4481,6 +4495,134 @@ mod gate {
         }
     }
 
+    /// `lookup_slots_verify_together`: a qwen35 family file's lookup load of
+    /// `--parallel 2` at `--ctx 4096`, which the card holds whole
+    /// (`BLOOMERY_DRAFT=lookup`, `BLOOMERY_STEP_STATS=1`), runs a round of
+    /// both slots as one pass (`Pass::of_body`: `Body35` settles each slot's
+    /// partial keep at the commit, `SlotRows::keep_slot`, so the body
+    /// verifies both slots' windows together and the open decides one pass):
+    /// two greedy streamed requests of prompts that repeat (the prose twice,
+    /// its first half three times), each first run alone and then together,
+    /// keep their alone ids (`lookup_slots_together_alone`), and the together
+    /// window holds a drafted `slots round` of both slots (`cmd=pass`,
+    /// `rows=2`) in `passes=1` and none in more, the together requests
+    /// drafting (`timings.draft_n` above 0). The requests are greedy without
+    /// `ignore_eos`, which would make them draw and so step. FAIL-first: on a
+    /// body that settles no partial keep (`SlotRows::SETTLES_PARTIAL_KEEP`
+    /// false) the lookup load takes turns, `passes=2`; with the seat's lookup
+    /// word served as no draft, the rounds are plain steps and nothing is
+    /// drafted.
+    fn lookup_slots_verify_together(
+        model: &Path,
+        dir: &Path,
+        ok: &mut bool,
+    ) -> Result<(), GateError> {
+        let d = dir.join("lookup-rounds");
+        std::fs::create_dir_all(&d)?;
+        let err_log = d.join("server.err");
+        let mut cmd = stats_cmd()?;
+        cmd.env("BLOOMERY_DRAFT", "lookup");
+        let m = model.to_str().ok_or("the model path is not UTF-8")?;
+        let args = [
+            "--model",
+            "qwen3",
+            "--port",
+            "0",
+            "--parallel",
+            "2",
+            "--ctx",
+            "4096",
+            "-m",
+            m,
+        ];
+        let mut s = Served::spawn_cmd(cmd, &args, &d)?;
+        let addr = s.address(&err_log, 600, Duration::from_secs(1))?;
+        let url = |p: &str| format!("http://{addr}{p}");
+        // Prompts that repeat, so the lookup proposes: the prose twice, and
+        // its first half three times.
+        let prose = tokenized(&url, PROSE)?;
+        let half = &prose[..prose.len() / 2];
+        let ids = [prose.repeat(2), half.repeat(3)];
+        // Greedy with the stop ids kept: `ignore_eos` changes the rows, so a
+        // request under it draws, and this seat drafts no request that draws.
+        let greedy = |ids: &[u32]| {
+            streamed_body(
+                &addr,
+                json!({
+                    "prompt": ids, "n_predict": SLOTS_PREDICT, "temperature": 0,
+                    "return_tokens": true, "cache_prompt": false, "stream": true,
+                }),
+            )
+        };
+        let mut alone = Vec::new();
+        for i in &ids {
+            let (h, rx) = greedy(i)?;
+            h.join()
+                .map_err(|_| "lookup rounds: an alone request's thread panicked")?;
+            alone.push(
+                rx.recv()
+                    .map_err(|_| "lookup rounds: an alone request gave no answer")??
+                    .tokens,
+            );
+        }
+        let before = seat_log(&err_log)?.all(&record::SLOTS_ROUND)?.len();
+        let runs = [greedy(&ids[0])?, greedy(&ids[1])?];
+        let (mut together, mut drafted) = (Vec::new(), 0);
+        for (h, rx) in runs {
+            h.join()
+                .map_err(|_| "lookup rounds: a together request's thread panicked")?;
+            let ans = rx
+                .recv()
+                .map_err(|_| "lookup rounds: a together request gave no answer")??;
+            drafted += ans.drafted;
+            together.push(ans.tokens);
+        }
+        println!("lookup rounds: alone {alone:?}, together {together:?}, drafted {drafted}");
+        check(
+            ok,
+            "lookup_slots_together_alone",
+            alone.iter().all(|a| !a.is_empty()) && alone == together,
+        );
+        let rounds = seat_log(&err_log)?.all(&record::SLOTS_ROUND)?;
+        let window = &rounds[before.min(rounds.len())..];
+        // A drafted round of both slots (`rows` counts the slots a round
+        // serves): one pass where the load runs them together.
+        let both = |one_pass: bool| {
+            window
+                .iter()
+                .filter(|r| {
+                    r.word("cmd") == Ok("pass")
+                        && r.u64("rows") == Ok(2)
+                        && r.u64("slots") == Ok(2)
+                        && matches!(r.u64("passes"), Ok(p) if (p == 1) == one_pass)
+                })
+                .count()
+        };
+        let (one, two) = (both(true), both(false));
+        let shapes: std::collections::BTreeSet<_> = window
+            .iter()
+            .map(|r| {
+                (
+                    r.word("cmd").unwrap_or("?"),
+                    r.u64("rows").unwrap_or(0),
+                    r.u64("passes").unwrap_or(0),
+                )
+            })
+            .collect();
+        println!(
+            "lookup rounds: {one} of {} records a drafted round of both slots in one pass, {two} \
+             in more; (cmd, rows, passes) {shapes:?}",
+            window.len()
+        );
+        check(
+            ok,
+            "lookup_slots_verify_together",
+            drafted > 0 && one > 0 && two == 0,
+        );
+        println!("lookup rounds server stopped: {}", s.stop()?);
+        Ok(())
+    }
+
     /// Greedy drafted ids equal the plain path's, and the drafted completion
     /// accepted at least one token. A file with no in-file next-token layer
     /// prints the pin and starts no server; the pinned path with no layer is red.
@@ -4725,6 +4867,11 @@ mod gate {
                 placed_answers_a_prompt_past_the_gemm_walk(model, &dir, &mut ok)?;
             }
             mtp_ids_match_the_plain_path(model, &dir, &mut ok)?;
+            if seat == qwen_seat::Family::Qwen3moe {
+                println!("n/a lookup_slots_* (a qwen3moe file refuses the lookup draft by name)");
+            } else {
+                lookup_slots_verify_together(model, &dir, &mut ok)?;
+            }
             if a.images {
                 images(model, &dir, &mut ok)?;
             }

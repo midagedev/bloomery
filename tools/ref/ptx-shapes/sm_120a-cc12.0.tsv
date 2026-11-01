@@ -12,7 +12,9 @@ generate_ds41 card_sum_join_bf16 0 0
 # PIN(2026-10-31): the first cc 12.0 scan of these entries (ptxas 13.3.73 sm_120a, RTX 5090 driver 595.99.02): ptxas spills
 # or the driver JIT keeps local memory for each row of this block.
 generate_ds41 raon_hc_route 0 112
-generate_ds41 bf16_mma_norm_gate 644 168
+# PIN(2026-11-02): the shared SiLU/sigmoid norm epilogue adds its gate selection; ptxas 13.3.73 sm_120a
+# spills 700 B, RTX 5090 driver 595.99.02 JIT local stays 168 B. gate_gemm --case zgate checks both gates.
+generate_ds41 bf16_mma_norm_gate 700 168
 generate_ds41 cand_select 8 8
 generate_ds41 ds41_attn_seg 40 0
 generate_ds41 ds41_attn_seg_sel 48 24
@@ -45,7 +47,9 @@ generate_ds41 kq_gate_up_act_q5k_tiles 848 136
 generate_ds41 mxfp8_w8a8_gemm 0 8
 # PIN(2026-10-31): mxfp8_w8a8_gemm_bf16 JIT local 8 B, spill 0 (sm_120a ptxas 13.3.73, cc 12.0 JIT on RTX 5090 driver 595.99.02), as mxfp8_w8a8_gemm's: the same tile and a BF16 store.
 generate_ds41 mxfp8_w8a8_gemm_bf16 0 8
-generate_ds41 mxfp8_w8a8_norm_gate 340 64
+# PIN(2026-11-02): the shared SiLU/sigmoid norm epilogue at ptxas 13.3.73 sm_120a spills 288 B;
+# RTX 5090 driver 595.99.02 JIT local stays 64 B. gate_gemm --case zgate checks both gates.
+generate_ds41 mxfp8_w8a8_norm_gate 288 64
 generate_ds41 q4k_gemv_tiles 696 184
 generate_ds41 q5k_gemv_tiles 420 104
 generate_ds41 softmax_router_norm_m 32 8
@@ -194,7 +198,7 @@ generate_ds41 gdn_delta_lanes_seqs 0 0
 generate_ds41 gdn_delta_recovery 0 0
 generate_ds41 gdn_delta_recovery_layers 0 0
 generate_ds41 gdn_delta_recovery_seqs 0 0
-generate_ds41 gdn_delta_seqs 0 0
+# PIN(2026-11-02): gdn_delta_seqs removed; every sequence caller uses a stamped store.
 generate_ds41 gdn_norm_gate 0 0
 generate_ds41 gdn_norm_gate_sigmoid 0 0
 # PIN(2026-11-01): gdn_norm_gate_q32 and _q128 are gdn_norm_gate_sigmoid's body with a quantizer's store, pinned at its values until a scan on this table's arch and capability.

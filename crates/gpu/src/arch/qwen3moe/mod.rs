@@ -58,7 +58,8 @@ mod wide38;
 
 pub use body::{Body, DecodeInput, FlashKind, OpenOpts};
 pub use body35::{
-    Body35, DecodeInput35, LayerKind35, Open35, checkpoint_budget35, checkpoint_price35,
+    Body35, DecodeInput35, LayerKind35, Open35, PLACED_NO_VERIFY, checkpoint_budget35,
+    checkpoint_price35,
 };
 pub use body38::{
     ALLOWED, Body38, CHECKPOINT_EVERY, DecodeInput38, Folder38, LayerKind38, Model38, Prompt38,

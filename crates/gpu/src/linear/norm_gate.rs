@@ -462,19 +462,15 @@ pub struct NormGateTail<'a> {
     pub y: &'a mut DeviceBuffer<f32>,
 }
 
-impl NormGateTail<'_> {
-    /// Refused by name as `what`'s unless the tail gates by sigmoid: a
-    /// product epilogue's norm, whose entries carry that gate alone.
-    pub(crate) fn check_sigmoid(&self, what: &'static str) -> Result<(), GpuError> {
-        match self.gate {
-            GdnGate::Sigmoid => Ok(()),
-            GdnGate::Silu => Err(GpuError::shape(
-                what,
-                "the epilogue's norm gates by sigmoid; a SiLU gate runs the norm apart",
-            )),
-        }
+/// The kernels' word of `gate`: [`GATE_SILU`] or [`GATE_SIGMOID`].
+pub(crate) fn gate_act(gate: GdnGate) -> u32 {
+    match gate {
+        GdnGate::Silu => GATE_SILU,
+        GdnGate::Sigmoid => GATE_SIGMOID,
     }
+}
 
+impl NormGateTail<'_> {
     pub(crate) fn check_rows(
         &self,
         what: &'static str,
@@ -632,10 +628,7 @@ impl NormGateKernels {
         let k = n_v * HEAD;
         let grid = launch_u32(what, "grid", (m * n_v).div_ceil(4))?;
         let cfg = LaunchConfig1D::new(grid, BLOCK, 0);
-        let act = match gate {
-            GdnGate::Silu => GATE_SILU,
-            GdnGate::Sigmoid => GATE_SIGMOID,
-        };
+        let act = gate_act(gate);
         let (n_v32, m32) = (launch_u32(what, "n_v", n_v)?, launch_u32(what, "m", m)?);
         match out {
             NormOut::Q32(a) => {

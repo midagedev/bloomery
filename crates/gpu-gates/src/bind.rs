@@ -2832,6 +2832,26 @@ pub fn prefill_then_step<S: Seat + ?Sized>(
     }
 }
 
+/// [`Seat::prefill_next`] of a seat whose body may fold a prompt's last id
+/// into its call: where `closes`, one closing call ([`CallEnd::Close`]) with
+/// the row read after it ([`Seat::logits_into`]); else
+/// [`prefill_then_step`].
+pub fn prefill_closing<S: Seat + ?Sized>(
+    g: &mut S,
+    ids: &[u32],
+    row: Option<&mut [f32]>,
+    closes: bool,
+) -> Result<u32, GateError> {
+    if !closes {
+        return prefill_then_step(g, ids, row);
+    }
+    let next = g.prompt_call(ids, CallEnd::Close)?;
+    if let Some(row) = row {
+        g.logits_into(row)?;
+    }
+    Ok(next)
+}
+
 /// `ids` and the step of the last by `call` ([`Seat::prefill_row`] or
 /// [`Seat::prefill_next`]), checked as a prefill's feed and a step's row are:
 /// a row of the wrong length or a feed past the context is refused before the

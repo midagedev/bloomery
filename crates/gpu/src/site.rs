@@ -1703,14 +1703,15 @@ pub(crate) fn resident_gemm_bf16(
 }
 
 /// A resident gate projection followed by the shared gated norm under the
-/// model's gate `tail.gate`, its output `tail.y` then quantized for the
-/// resident sites `readers` into `out` ([`resident_quantize`]). BF16 and
-/// native W8A8 MXFP8 tensor-core sites finish a sigmoid-gated norm in their
-/// product's store epilogue; on another site a norm whose readers take one
-/// q8 form of its rows and no MMA form writes that form in its own launch
-/// (`NormGateKernels::enqueue_norm_gate_into`). The MXFP8
-/// epilogue also writes the output's MXFP8 form, so it runs only when that
-/// form is all the readers take from `out` ([`only_form`]).
+/// model's gate `tail.gate` (sigmoid or SiLU), its output `tail.y` then
+/// quantized for the resident sites `readers` into the forms `out` holds
+/// ([`quantize_readers`]). BF16 and native W8A8 MXFP8 tensor-core sites
+/// finish the norm in their product's store epilogue; on another site a norm
+/// whose readers take one q8 form of its rows and no MMA form writes that
+/// form in its own launch (`NormGateKernels::enqueue_norm_gate_into`). The
+/// MXFP8 epilogue also writes the output's MXFP8 form, so it runs only when
+/// that form is all the readers take from `out`'s q8 blocks of 32
+/// ([`only_form`]).
 #[allow(
     clippy::too_many_arguments,
     reason = "the projection's operands, its norm tail and the output's readers"
@@ -1727,9 +1728,10 @@ pub(crate) fn resident_gemm_norm_gate(
         &mut DeviceBuffer<f32>,
         crate::linear::norm_gate::NormGateTail<'_>,
     ),
-    (readers, (q128, out)): (&[&str], (Option<&mut GemmAct>, &mut GemmAct32)),
+    (readers, out): (&[&str], WideActsMut<'_>),
 ) -> Result<(), GpuError> {
-    use crate::linear::norm_gate::{GdnGate, NormGateArgs, NormGateTail, NormOut};
+    use crate::linear::norm_gate::{NormGateArgs, NormGateTail, NormOut};
+    let WideActsMut { q128, q32: mut out } = out;
     let what = "site::resident_gemm_norm_gate";
     let weight = w.resident(what, name)?;
     let rows = weight.rows();
@@ -1749,8 +1751,7 @@ pub(crate) fn resident_gemm_norm_gate(
         fault,
         y: &mut *y,
     };
-    // The product epilogues' norm gates by sigmoid alone.
-    let epilogue = gpu.q8f32().dense_mma && gate == GdnGate::Sigmoid;
+    let epilogue = gpu.q8f32().dense_mma;
     let mxfp8 = match weight {
         DevWeight::Mxfp8 { .. } => Some(w.e4m3(what, name)?),
         _ => None,
@@ -1764,9 +1765,12 @@ pub(crate) fn resident_gemm_norm_gate(
         }
         (_, Some(planes), Some(act), Some(input))
             if epilogue
-                && only_form(gpu, w, readers, out) == Some(MmaForm::Mxfp8)
+                && out
+                    .as_deref()
+                    .is_some_and(|o| only_form(gpu, w, readers, o) == Some(MmaForm::Mxfp8))
                 && crate::gemm::mxfp8_w8a8_reads(&planes, act, input, m) =>
         {
+            let out = out.ok_or(GpuError::state(what, "the readers' q8 blocks of 32"))?;
             return k
                 .g32(what, "the MXFP8 prompt kernels")?
                 .enqueue_mxfp8_w8a8_norm_gate(
@@ -1799,26 +1803,33 @@ pub(crate) fn resident_gemm_norm_gate(
             // A norm whose readers take one q8 form of its rows, and no MMA
             // or native FP4 form, writes that form itself.
             let wants = resident_wants(w, readers);
-            let mma = [MmaForm::Bf16, MmaForm::Mxfp8]
-                .into_iter()
-                .any(|f| out.has(f) && reads_form(gpu, w, readers, f));
+            let mma = out.as_deref().is_some_and(|o| {
+                [MmaForm::Bf16, MmaForm::Mxfp8]
+                    .into_iter()
+                    .any(|f| o.has(f) && reads_form(gpu, w, readers, f))
+            });
             let stream = gpu.stream();
-            match (wants.q128, wants.q32, q128) {
-                (true, false, Some(a)) if !mma => {
+            match (wants.q128, wants.q32, q128, out.as_deref_mut()) {
+                (true, false, Some(a), _) if !mma => {
                     norm.enqueue_norm_gate_into(stream, args, NormOut::Q128(a))?;
                 }
-                (false, true, _) if !mma && !out.has_native_form() => {
-                    norm.enqueue_norm_gate_into(stream, args, NormOut::Q32(&mut *out))?;
+                (false, true, _, Some(o)) if !mma && !o.has_native_form() => {
+                    norm.enqueue_norm_gate_into(stream, args, NormOut::Q32(&mut *o))?;
                 }
-                (_, _, q128) => {
+                (_, _, q128, _) => {
                     norm.enqueue_norm_gate(stream, args)?;
-                    return resident_quantize(gpu, k, (w, readers), (&*y, m), (q128, out), fault);
+                    let out = WideActsMut { q128, q32: out };
+                    return quantize_readers(gpu, k, (w, readers), (&*y, m), out, fault);
                 }
             }
-            return write_forms(k, stream, (&*y, m), out, |_| false);
+            return match out {
+                Some(o) => write_forms(k, stream, (&*y, m), o, |_| false),
+                None => Ok(()),
+            };
         }
     }
-    resident_quantize(gpu, k, (w, readers), (&*y, m), (q128, out), fault)
+    let out = WideActsMut { q128, q32: out };
+    quantize_readers(gpu, k, (w, readers), (&*y, m), out, fault)
 }
 
 /// [`resident_gemm`] over rows `at .. at + n` of the resident weight `name`
@@ -1892,14 +1903,31 @@ pub fn resident_quantize(
     (q128, q32): (Option<&mut GemmAct>, &mut GemmAct32),
     sink: FaultSink,
 ) -> Result<(), GpuError> {
-    WideActsMut {
+    let out = WideActsMut {
         q128,
-        q32: Some(&mut *q32),
+        q32: Some(q32),
+    };
+    quantize_readers(gpu, k, (w, names), (x, m), out, sink)
+}
+
+/// [`resident_quantize`] into the forms `out` holds: a reader's q8 form
+/// `out` lacks is refused by name ([`WideActsMut::quantize`]), and with no q8
+/// blocks of 32 there is no MMA form to write.
+fn quantize_readers(
+    gpu: &Gpu,
+    k: &WideKernels<'_>,
+    (w, names): (&Weights, &[&str]),
+    (x, m): (&DeviceBuffer<f32>, usize),
+    mut out: WideActsMut<'_>,
+    sink: FaultSink,
+) -> Result<(), GpuError> {
+    out.quantize(gpu, k, sink, x, m, resident_wants(w, names))?;
+    match out.q32 {
+        Some(q32) => write_forms(k, gpu.stream(), (x, m), q32, |f| {
+            reads_form(gpu, w, names, f)
+        }),
+        None => Ok(()),
     }
-    .quantize(gpu, k, sink, x, m, resident_wants(w, names))?;
-    write_forms(k, gpu.stream(), (x, m), q32, |f| {
-        reads_form(gpu, w, names, f)
-    })
 }
 
 /// The one [`MmaForm`] the sites of the resident weights `readers` take
@@ -1984,6 +2012,14 @@ impl DenseActs {
     /// The quantized forms as [`resident_quantize`] writes them.
     pub fn out(&mut self) -> (Option<&mut GemmAct>, &mut GemmAct32) {
         (self.q128.as_mut(), &mut self.q32)
+    }
+
+    /// The quantized forms as views ([`resident_gemm_norm_gate`]'s output).
+    pub(crate) fn views_mut(&mut self) -> WideActsMut<'_> {
+        WideActsMut {
+            q128: self.q128.as_mut(),
+            q32: Some(&mut self.q32),
+        }
     }
 }
 

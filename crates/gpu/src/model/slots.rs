@@ -175,6 +175,14 @@ pub trait SlotRows: Slots {
         let _ = ranges;
         Ok(())
     }
+
+    /// A `verify_slots` pass on this load refused by name when this load's
+    /// pass keeps its rows whole though the body settles a partial keep on
+    /// another load ([`SlotRows::SETTLES_PARTIAL_KEEP`]). Default: nothing
+    /// refused.
+    fn refuse_verify(&self) -> Result<(), GpuError> {
+        Ok(())
+    }
 }
 
 /// One busy slot's rows in a pass of several slots: the slot, the range of
@@ -1154,8 +1162,9 @@ where
             (B::MAX_ROWS, B::MAX_SLOTS),
             what,
         )?;
-        if pass == SlotPass::Kept {
-            self.body.refuse_kept(&ranges)?;
+        match pass {
+            SlotPass::Kept => self.body.refuse_kept(&ranges)?,
+            SlotPass::Verify => self.body.refuse_verify()?,
         }
         let ids: Vec<u32> = rows
             .iter()

@@ -292,6 +292,8 @@ mod gate {
     use bloomery_gpu::weights::DevWeight;
     use bloomery_gpu_gates::act_rule::{Arm, site_rel};
     use bloomery_gpu_gates::flip::{self, Flip};
+    #[cfg(all(test, feature = "checkpoint"))]
+    use bloomery_gpu_gates::prefill_gate::{Closed, closed_run};
     use bloomery_gpu_gates::q38_fixture::{Shape, key_ring_live};
     use bloomery_gpu_gates::rounding::{U, gamma, q8_32_rel};
     use bloomery_gpu_gates::slots_gate;
@@ -3180,29 +3182,6 @@ mod gate {
             verdict(ok)
         );
         Ok(ok)
-    }
-
-    /// The argmax after `ids` fed from where a model stands, the logits'
-    /// bits, and three greedy steps' ids and logits' bits.
-    #[cfg(all(test, feature = "checkpoint"))]
-    type Closed = (u32, Vec<u32>, Vec<(u32, Vec<u32>)>);
-
-    /// [`Closed`] of one `Auto` call ending as `end` asks.
-    #[cfg(all(test, feature = "checkpoint"))]
-    fn closed_run(m: &mut Qwen38Model, ids: &[u32], end: CallEnd) -> Result<Closed, GateError> {
-        let bits = |m: &Qwen38Model| -> Result<Vec<u32>, GateError> {
-            Ok(m.logits()?.iter().map(|v| v.to_bits()).collect())
-        };
-        let first = m
-            .prompt38_call(ids, Prompt38::Auto, end, None)?
-            .ok_or("the call read no token")?;
-        let row = bits(m)?;
-        let (mut steps, mut feed) = (Vec::new(), first);
-        for _ in 0..3 {
-            feed = m.step(&[feed])?;
-            steps.push((feed, bits(m)?));
-        }
-        Ok((first, row, steps))
     }
 
     /// (cl) A closing call fed by steps, checkpoints on: it runs every id, its

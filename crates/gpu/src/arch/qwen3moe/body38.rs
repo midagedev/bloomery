@@ -126,9 +126,7 @@ use super::program38::{
     Ctx38, Kernels38, PLE_ARRIVAL_NODES, Parts38, Pass38, RowsCopy, STEP_MEMOPS, Seqs38, SlotSeq38,
     Step38, Verify38, seq_launches, step_launches, verify_launches,
 };
-use super::scratch::{
-    Io, KvPlanes, LANE, LaneWord, PassRecord, RecStore, RopeRows, StepParams, stamps_at,
-};
+use super::scratch::{Io, KvPlanes, LANE, LaneWord, PassRecord, RecStore, RopeRows, StepParams};
 use super::scratch38::{
     Arena38, LANES, PASS_ROWS, Ple38, Store38, Taps38, VERIFY_ROWS, WideRecord, dims, final_res,
     no_carry, store_rule_bytes,
@@ -164,7 +162,8 @@ use crate::host::xstream::{Costs, XCfg, XLayer, XMode, XReport};
 use crate::host::{BatchLeg, PassKind, StepLeg, refuse_tier_count};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, SlotMap};
 use crate::kv_format::KvQ8;
-use crate::linear::delta::{RecoveryStore, RecoveryTable, carry_fold_host};
+use crate::linear;
+use crate::linear::delta::{RecoveryTable, carry_fold_host};
 use crate::media::{ImageSpan, MediaBody, MediaSpan, RopeBase, SeqRope, kept_rule, rope_table};
 use crate::model::slots::{kept_whole, slot_twice};
 use crate::model::{
@@ -482,7 +481,7 @@ const _: () = assert!((qsa::RING_ROWS * geo::IDX_DIM).is_multiple_of(2));
 fn checkpoint_lens_of(stores: &[Store38]) -> Vec<usize> {
     let gdn = stores
         .iter()
-        .filter(|s| matches!(s, Store38::Rec { .. }))
+        .filter(|s| matches!(s, Store38::Rec(_)))
         .count();
     checkpoint_lens(gdn, stores.len() - gdn)
 }
@@ -499,26 +498,16 @@ fn checkpoint_owners(delta: impl Iterator<Item = bool> + Clone, site: usize) -> 
 }
 
 /// The commit's replay table over the delta layers among `stores`, each
-/// under its own layer's fault.
+/// under its own layer's fault (`linear::seqs::recovery_table`).
 fn recovery_table(stream: &CudaStream, stores: &[Store38]) -> Result<RecoveryTable, GpuError> {
-    let rows: Vec<RecoveryStore<'_>> = stores
-        .iter()
-        .enumerate()
-        .filter_map(|(layer, s)| match s {
-            Store38::Rec { rec, stamp, record } => Some(RecoveryStore {
-                layer,
-                state: &rec.state,
-                stamp,
-                carry: rec.carry.as_ref(),
-                record,
-            }),
-            Store38::Qsa { .. } => None,
-        })
-        .collect();
+    let recs = stores.iter().enumerate().filter_map(|(layer, s)| match s {
+        Store38::Rec(rec) => Some((layer, rec)),
+        Store38::Qsa { .. } => None,
+    });
     // SAFETY: the stores live in the body beside the table and are never
     // replaced or reallocated after the load, and the commit's replay is
     // the only launch on them while it runs (the stream orders the rest).
-    unsafe { RecoveryTable::new(stream, GDN, (LANES, VERIFY_ROWS), &rows) }
+    unsafe { linear::seqs::recovery_table(stream, (GDN, VERIFY_ROWS), recs) }
 }
 
 /// The bytes one checkpoint of a load of `gdn` delta layers and `qsa`
@@ -2143,7 +2132,7 @@ impl Body38 {
             .iter()
             .find_map(|s| match s {
                 Store38::Qsa { kv, .. } => Some(kv.format()),
-                Store38::Rec { .. } => None,
+                Store38::Rec(_) => None,
             })
             .unwrap_or_default()
     }
@@ -2723,7 +2712,7 @@ impl Body38 {
             .iter()
             .map(|s| {
                 Ok(match s {
-                    Store38::Rec { rec, .. } => Store38Host::Rec {
+                    Store38::Rec(rec) => Store38Host::Rec {
                         state: lane_of(rec.state.to_host_vec(stream)?, self.lane.lane())?,
                         ring: rec.ring.to_host_vec(stream)?,
                         carry: rec
@@ -2926,10 +2915,9 @@ impl Body38 {
     /// Every delta layer's stamps: lane `lane` at position `at`, every other
     /// never written. Synchronizes; never inside a capture.
     fn restamp(&mut self, stream: &CudaStream, lane: u32, at: u32) -> Result<(), GpuError> {
-        let st = stamps_at(LANES, lane, at)?;
         for s in &mut self.stores {
-            if let Store38::Rec { stamp, .. } = s {
-                stamp.copy_from_host(stream, &st)?;
+            if let Store38::Rec(rec) = s {
+                rec.restamp_at(stream, lane, at)?;
             }
         }
         Ok(())
@@ -3078,7 +3066,7 @@ impl Body38 {
             WHAT,
             "the PLE site the ring's copy waits for",
         ))?;
-        let delta = (self.stores.iter()).map(|s| matches!(s, Store38::Rec { .. }));
+        let delta = (self.stores.iter()).map(|s| matches!(s, Store38::Rec(_)));
         let owners = checkpoint_owners(delta, site);
         let lane = self.lane.lane();
         let mut c = Copied::of(&mut self.stores, &mut self.ple_ring, lane, None, None)?;
@@ -3153,32 +3141,10 @@ impl Body38 {
             return Ok(());
         };
         let delta = (self.stores.iter())
-            .filter(|s| matches!(s, Store38::Rec { .. }))
+            .filter(|s| matches!(s, Store38::Rec(_)))
             .count();
         self.seal_end_mark(stream, at, open, hist, |stores| {
-            for i in (0..delta).map(|j| 3 * j + 2) {
-                let carry = stores
-                    .get_mut(i)
-                    .filter(|c| c.len() >= 2)
-                    .ok_or(GpuError::state(
-                        WHAT,
-                        "each delta layer's carry in the point",
-                    ))?;
-                let (rows, past) = (carry[0].to_bits(), carry[1].to_bits());
-                if rows == 0 || past != at + 1 {
-                    return Err(GpuError::shape(
-                        WHAT,
-                        format!(
-                            "the closing mark at {at}: store {i}'s carry holds {rows} rows \
-                             standing at {past}, not a row standing at {}",
-                            at + 1
-                        ),
-                    ));
-                }
-                carry[0] = f32::from_bits(rows - 1);
-                carry[1] = f32::from_bits(at);
-            }
-            Ok(())
+            crate::recur::close_point(stores, delta, at)
         })
     }
 
@@ -5752,7 +5718,7 @@ impl ChainBody for Body38 {
         self.hybrid.settle(stream)?;
         crate::host::await_done(WHAT, || stream.query()).map_err(|e| self.hybrid.noted(e))?;
         for s in &mut self.stores {
-            if let Store38::Rec { rec, .. } = s {
+            if let Store38::Rec(rec) = s {
                 rec.clear(stream)?;
             }
             s.restamp(stream)?;
@@ -6437,7 +6403,7 @@ impl<'a> Copied<'a> {
         };
         for s in stores {
             match s {
-                Store38::Rec { rec, .. } => {
+                Store38::Rec(rec) => {
                     let RecStore {
                         state, ring, carry, ..
                     } = rec;

@@ -32,7 +32,7 @@ use crate::route_softmax::{MAX_TOKENS, RouterDims, RouterOut};
 use crate::site::WideForms;
 use chain::arch::qwen3moe::router::ubatch_at;
 
-pub(super) use crate::recur::{RecStore, fresh_stamps, stamps_at};
+pub(super) use crate::recur::RecStore;
 use crate::room::{Roomed, Run, Views};
 use crate::rope_neox::{
     NeoxArgs, NeoxQ8Args, NeoxRowsArgs, PartialNeoxArgs, PartialNeoxQ8Args, RopeNeoxKernels,
@@ -1805,20 +1805,13 @@ pub(super) struct GdnArena {
     pub(super) beta: DeviceBuffer<f32>,
     pub(super) decay: DeviceBuffer<f32>,
     pub(super) o: DeviceBuffer<f32>,
-    /// The lanes the walks over this arena run their delta launches by
-    /// ([`LaneRun`]); `None` on a load whose stores keep one lane in place.
-    pub(super) lanes: Option<LaneRun>,
-}
-
-/// How the delta launches of the walks over one arena use the stamped lanes
-/// of a load that verifies drafted rows: the body's lane word (a
-/// non-owning view of [`LaneWord`]'s device word, so a walk reads the
-/// committed lane whatever its input record holds) and whether the walk is
-/// a verify, whose row `j` writes lane `(c + j) mod lanes` (`each`), or one
-/// that writes the state after its last row back into lane `c`.
-pub(super) struct LaneRun {
-    pub(super) word: WindowMut<'static, u32>,
-    pub(super) each: bool,
+    /// Whether the walks over this arena run their delta step as a verify
+    /// recorded into each store's record ([`Arena::verify_delta`]); else in
+    /// place.
+    pub(super) verify: bool,
+    /// Whether the next wide walk's prompt form keeps its last chunk out of
+    /// each lane, in the carry ([`Arena::keep_last`]).
+    pub(super) keep: bool,
 }
 
 impl GdnArena {
@@ -1858,7 +1851,8 @@ impl GdnArena {
             beta: f(rows * nv)?,
             decay: f(rows * nv)?,
             o: f(rows * zl)?,
-            lanes: None,
+            verify: false,
+            keep: false,
         })
     }
 
@@ -1878,12 +1872,8 @@ impl GdnArena {
     }
 }
 
-/// Non-owning views of a [`LaneWord`]'s device word ([`LaneWord::with_views`]).
-pub(super) type LaneViews = Vec<WindowMut<'static, u32>>;
-
-/// The lane word every delta launch of a verifying load's walks reads: the
-/// lane that holds the committed state, which only a verify's commit moves
-/// (`linear::delta::kept_lane`) and a reset sets back to 0. One device word
+/// The lane word every delta launch of a sequence's walks reads: the lane
+/// that holds its state, which a reset sets back to 0. One device word
 /// written by an asynchronous copy ahead of the launches that read it, over
 /// `lanes` lanes.
 pub(super) struct LaneWord {
@@ -1896,40 +1886,17 @@ pub(super) struct LaneWord {
 impl LaneWord {
     /// Lane 0 of `lanes` lanes. Load-time only.
     pub(super) fn new(stream: &CudaStream, lanes: usize) -> Result<LaneWord, GpuError> {
-        Ok(LaneWord::with_views(stream, lanes, 0)?.0)
-    }
-
-    /// Lane 0 of `lanes` lanes, and `views` non-owning views of its device
-    /// word for the arenas whose walks read it ([`Arena::run_lanes`]). A view
-    /// must not outlive the word, nor be used after the struct is dropped:
-    /// the body that holds both keeps them together. Load-time only.
-    pub(super) fn with_views(
-        stream: &CudaStream,
-        lanes: usize,
-        views: usize,
-    ) -> Result<(LaneWord, LaneViews), GpuError> {
         let inbox = Inbox::new(stream, 1)?;
-        // SAFETY: word 0 of the inbox's one device word for each window, and
-        // the inbox moves into the struct beside the first of them (a move of
-        // the handle, not of the allocation), where it outlives it; the views
-        // are the caller's to keep inside that lifetime (above).
-        let (word, views) = unsafe {
-            (
-                param_view::<u32>(inbox.dev(), 0, 1),
-                (0..views)
-                    .map(|_| param_view::<u32>(inbox.dev(), 0, 1))
-                    .collect(),
-            )
-        };
-        Ok((
-            LaneWord {
-                word,
-                inbox,
-                lane: 0,
-                lanes,
-            },
-            views,
-        ))
+        // SAFETY: word 0 of the inbox's one device word, and the inbox moves
+        // into the struct beside it (a move of the handle, not of the
+        // allocation), where it outlives it.
+        let word = unsafe { param_view::<u32>(inbox.dev(), 0, 1) };
+        Ok(LaneWord {
+            word,
+            inbox,
+            lane: 0,
+            lanes,
+        })
     }
 
     /// Set the word to `lane` (below the word's lanes, else refused by name)
@@ -1945,29 +1912,6 @@ impl LaneWord {
         self.inbox.upload(stream, 1)?;
         self.lane = lane;
         Ok(())
-    }
-
-    /// The word after a verify from the committed lane keeps its first `k`
-    /// rows: the lane row `k − 1` wrote ([`linear::delta::kept_lane`]),
-    /// enqueued as [`LaneWord::set`] does. A `k` outside `1..=lanes` is
-    /// refused by name, the word where it was.
-    pub(super) fn keep(&mut self, stream: &CudaStream, k: usize) -> Result<(), GpuError> {
-        let lanes = u32::try_from(self.lanes).map_err(|_| {
-            GpuError::shape(
-                "qwen3moe::LaneWord::keep",
-                format!("{} lanes past u32", self.lanes),
-            )
-        })?;
-        let k = u32::try_from(k)
-            .ok()
-            .filter(|k| (1..=lanes).contains(k))
-            .ok_or_else(|| {
-                GpuError::shape(
-                    "qwen3moe::LaneWord::keep",
-                    format!("{k} kept rows of a verify over {lanes} lanes (1..={lanes})"),
-                )
-            })?;
-        self.set(stream, linear::delta::kept_lane(self.lane, k, lanes))
     }
 
     /// The lane the word holds.
@@ -2386,21 +2330,24 @@ impl Arena {
         }
     }
 
-    /// Run the delta launches of the walks over this arena by the stamped
-    /// lanes ([`LaneRun`]): `word` the body's lane word, `each` whether the
-    /// walk is a verify. Refused by name on an arena with no delta
-    /// intermediates. Load-time only.
-    pub(super) fn run_lanes(
-        &mut self,
-        word: WindowMut<'static, u32>,
-        each: bool,
-    ) -> Result<(), GpuError> {
-        let g = self.gdn.as_mut().ok_or(GpuError::state(
-            "qwen3moe::Arena::run_lanes",
-            "an arena with delta intermediates",
-        ))?;
-        g.lanes = Some(LaneRun { word, each });
-        Ok(())
+    /// Run the delta step of the walks over this arena as a verify
+    /// (`verify`), each row recorded into its store's record, or in place;
+    /// nothing on an arena of a chain with no delta layer. Load-time only.
+    pub(super) fn verify_delta(&mut self, verify: bool) {
+        if let Some(g) = self.gdn.as_mut() {
+            g.verify = verify;
+        }
+    }
+
+    /// Keep the last chunk of the wide walks over this arena out of each
+    /// delta lane, in its carry (`keep`), or fold every chunk in: a closing
+    /// call's last unit, whose end mark stands a row before the walk's end
+    /// (`recur::close_point`). Nothing on an arena of a chain with no delta
+    /// layer.
+    pub(super) fn keep_last(&mut self, keep: bool) {
+        if let Some(g) = self.gdn.as_mut() {
+            g.keep = keep;
+        }
     }
 
     /// `m − 1`, the index of the `m`-column activations a gemv arm of `m`
@@ -2470,7 +2417,7 @@ mod tests {
     use std::sync::Arc;
 
     /// The views over the input words and the arena rows give back the
-    /// context handles they take: an upload, a lane word with its views, a
+    /// context handles they take: an upload, a lane word, a
     /// pass record, the layer taps and a row view leave the context's count
     /// where it was.
     #[test]
@@ -2482,7 +2429,7 @@ mod tests {
         let before = Arc::strong_count(&ctx);
         inbox.upload(&stream, 4).expect("an upload");
         {
-            let _lane = LaneWord::with_views(&stream, 2, 3).expect("a lane word with three views");
+            let _lane = LaneWord::new(&stream, 2).expect("a lane word");
             let _record = PassRecord::<3>::new(&stream).expect("a pass record");
             let mut taps = None;
             TapRows::set(&mut taps, &stream, 3, 4, true).expect("three layer taps");

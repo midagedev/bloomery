@@ -11,7 +11,7 @@ use super::f32tile::{
 };
 use super::{GemmAct32, GemmRoute};
 use crate::GpuError;
-use crate::linear::norm_gate::NormGateTail;
+use crate::linear::norm_gate::{NormGateTail, gate_act};
 use crate::q8f32::{E4m3Weight, Mxfp8Bytes};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::barrier::Barrier;
@@ -2237,7 +2237,7 @@ mod native {
         unsafe { mma_tile_store(tile, w, cols, (rows, k, n), y, sh) };
     }
 
-    /// [`mxfp8_w8a8_gemm`] as a gate projection with the shared sigmoid norm
+    /// [`mxfp8_w8a8_gemm`] as a gate projection with the shared gated norm
     /// at its store (`f32tile.rs`'s `bf16_mma_norm_gate_body`), which also
     /// writes the output's MXFP8 form (`yq`, `ye`, `yrefused` zero before
     /// the launch) for the site that reads it.
@@ -2278,6 +2278,7 @@ mod native {
         o: &[f32],
         gain: &[f32],
         eps: f32,
+        act: u32,
         fault: crate::fault::FaultSink,
         mut z: DisjointSlice<f32>,
         mut y: DisjointSlice<f32>,
@@ -2309,7 +2310,19 @@ mod native {
         // block's aligned MMA_STAGES·STAGE_FLOATS floats.
         unsafe {
             bf16_mma_norm_gate_body(
-                w, cols, rows, k, n, o, gain, eps, fault, &mut z, &mut y, form, sh,
+                w,
+                cols,
+                rows,
+                k,
+                n,
+                o,
+                gain,
+                (eps, act),
+                fault,
+                &mut z,
+                &mut y,
+                form,
+                sh,
             )
         };
     }
@@ -2825,7 +2838,7 @@ impl Kernels {
         Ok(())
     }
 
-    /// [`Self::mxfp8_w8a8`] with the shared sigmoid norm `a.tail` at its
+    /// [`Self::mxfp8_w8a8`] with the shared norm `a.tail` under its gate at its
     /// store and the MXFP8 form of its output into `a.out`, which has room
     /// for it ([`native::mxfp8_w8a8_norm_gate`]); `a.z` is the exact
     /// replay's scratch.
@@ -2848,8 +2861,27 @@ impl Kernels {
         let (qs, e) = (w.qs.buf(), w.e.buf());
         let (xq, xe, refused) = (&form.words, &form.scales, &form.refused);
         self.module.mxfp8_w8a8_norm_gate(
-            stream, &prep, qs, e, x, xq, xe, refused, t.rows, t.k, t.n, tail.o, tail.w, tail.eps,
-            tail.fault, z, tail.y, yq, ye, yrefused,
+            stream,
+            &prep,
+            qs,
+            e,
+            x,
+            xq,
+            xe,
+            refused,
+            t.rows,
+            t.k,
+            t.n,
+            tail.o,
+            tail.w,
+            tail.eps,
+            gate_act(tail.gate),
+            tail.fault,
+            z,
+            tail.y,
+            yq,
+            ye,
+            yrefused,
         )?;
         Ok(())
     }

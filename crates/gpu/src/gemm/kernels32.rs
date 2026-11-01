@@ -1878,7 +1878,7 @@ mod gemm32_kernels {
         unsafe { bf16_mma_body(Bf16Rows(w), cols, rows, k, n, &mut y, sh) };
     }
 
-    /// BF16 prompt gate projection with a shared sigmoid norm at its store.
+    /// BF16 prompt gate projection with a shared gated norm at its store.
     #[allow(clippy::too_many_arguments, reason = "flat kernel ABI")]
     #[kernel]
     #[launch_bounds(256)]
@@ -1909,6 +1909,7 @@ mod gemm32_kernels {
         o: &[f32],
         gain: &[f32],
         eps: f32,
+        act: u32,
         fault: FaultSink,
         mut z: DisjointSlice<f32>,
         mut y: DisjointSlice<f32>,
@@ -1935,7 +1936,7 @@ mod gemm32_kernels {
                 n,
                 o,
                 gain,
-                eps,
+                (eps, act),
                 fault,
                 &mut z,
                 &mut y,

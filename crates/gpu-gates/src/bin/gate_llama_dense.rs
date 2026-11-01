@@ -45,6 +45,7 @@ mod gate {
         n_delta: 0,
         n_kv: 8,
         head: 128,
+        n_k: 0,
         n_v: 0,
         head_v: 0,
         conv_c: 0,

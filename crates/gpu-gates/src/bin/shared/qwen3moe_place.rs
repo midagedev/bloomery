@@ -36,6 +36,7 @@ use bloomery_gpu::arch::qwen3moe::{
 };
 use bloomery_gpu::host::SERVED_TIERS;
 use bloomery_gpu::kv_format::KvQ8;
+use bloomery_gpu::linear::delta::recovery_record_len;
 use bloomery_gpu::linear::{KHeadMap, LinearShape};
 use bloomery_gpu::model::{GpuModel, Slots};
 use bloomery_gpu::{Gpu, Qwen3moeModel};
@@ -185,13 +186,13 @@ pub struct PlaceQ3 {
     /// The cache format this load counts in — the same choice `inputs.kv`
     /// carries, kept beside it for the plane list [`kv_bytes`] splits.
     kv: KvQ8,
-    /// The delta lanes this load's whole-fit verdict prices a qwen35 family
-    /// file's delta layers at ([`delta_planes`]): one on a plain load, the
-    /// load's verify lanes on a load that verifies drafted rows
+    /// The verify record rows this load's whole-fit verdict prices a qwen35
+    /// family file's delta layers with ([`delta_planes`]): none on a plain
+    /// load, `Body35::VERIFY_ROWS` on a load that verifies drafted rows
     /// (`GpuModel::open_verifying`, `GpuModel::open_mtp`) — the serve seat's,
     /// from its draft word. A qwen3moe file has no delta layer, and the
     /// CLI's and the gates' loads are plain.
-    lanes: usize,
+    record_rows: usize,
     /// The sequences the load holds, whose rows every machine of it carries
     /// ([`laid`]).
     seqs: Seqs,
@@ -400,7 +401,7 @@ impl PlaceQ3 {
             arch: "qwen3moe",
             inputs,
             kv,
-            lanes: 1,
+            record_rows: 0,
             seqs: Seqs::ONE,
             media,
             machine,
@@ -432,20 +433,20 @@ impl PlaceQ3 {
         seqs: Seqs,
         beside: Beside,
     ) -> Result<PlaceQ3, GateError> {
-        PlaceQ3::qwen35_lanes(file, place, census, o, seqs, beside, 1)
+        PlaceQ3::qwen35_records(file, place, census, o, seqs, beside, 0)
     }
 
-    /// [`PlaceQ3::qwen35_on`] with the delta lanes (`lanes`, at least one)
-    /// its whole-fit verdict prices a delta layer at ([`delta_planes`]): the
-    /// serve seat's, which opens loads that verify drafted rows.
-    fn qwen35_lanes(
+    /// [`PlaceQ3::qwen35_on`] with the verify record rows (`record_rows`)
+    /// its whole-fit verdict prices a delta layer with ([`delta_planes`]):
+    /// the serve seat's, which opens loads that verify drafted rows.
+    fn qwen35_records(
         file: &Split,
         place: Place,
         census: &[DeviceInfo],
         o: Open35,
         seqs: Seqs,
         beside: Beside,
-        lanes: usize,
+        record_rows: usize,
     ) -> Result<PlaceQ3, GateError> {
         let mut inputs = q35::PlanInputs::describe(file)?;
         let arch = Family::of_spec(&inputs.spec).map_or(Program::Qwen35Body.name(), Family::name);
@@ -482,7 +483,7 @@ impl PlaceQ3 {
             arch,
             inputs,
             kv: o.kv,
-            lanes,
+            record_rows,
             seqs,
             media,
             machine,
@@ -599,7 +600,7 @@ impl PlaceQ3 {
             &layers,
             &self.inputs,
             (self.kv, self.media),
-            (self.lanes, card.granule_bytes),
+            (self.record_rows, card.granule_bytes),
             slots,
             ctx,
         );
@@ -708,7 +709,7 @@ impl PlaceQ3 {
 /// card's allocation granule ([`placement::allocator_bytes`]) — the engine allocates
 /// each plane its own buffer per layer (`KvPlanes::new`, mirrored by
 /// [`layer_planes`], and a delta layer's `RecStore`, mirrored by
-/// [`delta_planes`] at the load's `lanes`) and each added slot repeats the set
+/// [`delta_planes`] with the load's `record_rows`) and each added slot repeats the set
 /// ([`Slots::new_seq`]), so the verdict counts the granules those
 /// allocations round to, not the raw sum a `KvBytes` layer gives. One slot
 /// is the one-sequence load, plus that rounding. `slots` is at least one;
@@ -718,7 +719,7 @@ fn kv_bytes(
     layers: &std::ops::Range<usize>,
     inputs: &Inputs,
     (kv, media): (KvQ8, Media),
-    (lanes, granule): (usize, NonZeroU64),
+    (record_rows, granule): (usize, NonZeroU64),
     slots: usize,
     ctx: u64,
 ) -> u64 {
@@ -757,7 +758,7 @@ fn kv_bytes(
                                 n_v: d.v_heads as usize,
                                 map: KHeadMap::Tiled,
                             },
-                            lanes,
+                            record_rows,
                         );
                     }
                     Some(other) => panic!(
@@ -777,22 +778,20 @@ fn kv_bytes(
     placement::allocator_bytes(granule, planes)
 }
 
-/// The plane bytes a delta layer of `shape` holds at `lanes` lanes onto
-/// `planes`: the two buffers `RecStore::new` zeroes — the state, a lane, and
-/// the conv ring once (`LinearShape::lens`) — and, on a load that keeps a
-/// lane a verify row, the `lanes` u32 stamps its stamped store holds
-/// (`RecStore::stamped`); the engine's layout prices the same count
-/// (`KvLayout::of_spec_lanes`, `runtime::stores`'s terms).
-///
-/// # Panics
-///
-/// On no lane, by name.
-fn delta_planes(planes: &mut Vec<u64>, shape: LinearShape, lanes: usize) {
-    assert!(lanes >= 1, "delta_planes: a state of at least one lane");
-    planes.push(4 * lanes as u64 * shape.state_len() as u64);
+/// The plane bytes a delta layer of `shape` holds onto `planes`, in the
+/// buffers `RecStore::gdn` allocates: the state's one lane, the conv ring
+/// (`LinearShape::lens`), the lane's u32 stamp, the carry
+/// (`LinearShape::carry_len`) and, for `record_rows` past 0, the verify
+/// record of that many rows (`recovery_record_len`); the engine's layout
+/// prices the same bytes (`KvLayout::of_spec_verifying`, `runtime::stores`'s
+/// terms).
+fn delta_planes(planes: &mut Vec<u64>, shape: LinearShape, record_rows: usize) {
+    planes.push(4 * shape.state_len() as u64);
     planes.push(4 * shape.ring_len() as u64);
-    if lanes > 1 {
-        planes.push(4 * lanes as u64);
+    planes.push(4);
+    planes.push(4 * shape.carry_len() as u64);
+    if record_rows > 0 {
+        planes.push(4 * recovery_record_len(shape, record_rows) as u64);
     }
 }
 
@@ -1103,39 +1102,39 @@ pub fn unplaced_qwen35_slots(
     seqs: Seqs,
     beside: Beside,
 ) -> Result<Unplaced, GateError> {
-    unplaced_qwen35_lanes(file, census, o, seqs, beside, 1)
+    unplaced_qwen35_records(file, census, o, seqs, beside, 0)
 }
 
-/// [`unplaced_qwen35_slots`] with the delta lanes (`lanes`, at least one)
-/// its whole-fit verdict prices a delta layer at ([`delta_planes`]): the
+/// [`unplaced_qwen35_slots`] with the verify record rows (`record_rows`)
+/// its whole-fit verdict prices a delta layer with ([`delta_planes`]): the
 /// serve seat's, which opens loads that verify drafted rows.
-fn unplaced_qwen35_lanes(
+fn unplaced_qwen35_records(
     file: &Split,
     census: &[DeviceInfo],
     o: &Open35,
     seqs: Seqs,
     beside: Beside,
-    lanes: usize,
+    record_rows: usize,
 ) -> Result<Unplaced, GateError> {
     if attention_only(&model::arch::spec(file)?.spec) {
         return whole_dense(
             (file, census),
             (o, seqs.slots, beside),
-            lanes,
+            record_rows,
             None,
             Rule::Open,
         )
         .map(|(card, _)| Unplaced::Whole(card));
     }
     let at = share(o, o.ctx, seqs.slots);
-    let probe = PlaceQ3::qwen35_lanes(
+    let probe = PlaceQ3::qwen35_records(
         file,
         PlaceQ3::unplaced_on(census)?,
         census,
         at,
         seqs,
         beside,
-        lanes,
+        record_rows,
     )?;
     let whole = probe.whole_at(u64::try_from(o.ctx)?, seqs.slots, qwen35_whole(file, at))?;
     probe.unplaced(o.ctx, &whole)
@@ -1272,7 +1271,7 @@ fn attention_only(spec: &ModelSpec) -> bool {
 /// whole-fit verdict at `o.ctx` positions for `slots` resident sequences takes it at the size
 /// `rule` settles ([`settle`]), each size priced with the checkpoints its spacing sets (a trunk of
 /// attention layers alone has no recurrent store to copy, so its sequences take none:
-/// [`seqs_qwen35`]) and its delta layers at `lanes` lanes ([`delta_planes`]), else the verdict's
+/// [`seqs_qwen35`]) and its delta layers with `record_rows` record rows ([`delta_planes`]), else the verdict's
 /// refusal with its terms. The verdict's line goes to stderr, as [`PlaceQ3::unplaced`] prints it.
 ///
 /// # Errors
@@ -1281,7 +1280,7 @@ fn attention_only(spec: &ModelSpec) -> bool {
 fn whole_dense(
     (file, census): (&Split, &[DeviceInfo]),
     (o, slots, beside): (&Open35, usize, Beside),
-    lanes: usize,
+    record_rows: usize,
     place: Option<Place>,
     rule: Rule,
 ) -> Result<(CardSpec, usize), GateError> {
@@ -1294,14 +1293,14 @@ fn whole_dense(
     };
     let (ubatch, whole, probe) = settle(rule, (o.ubatch, o.ctx, slots), |u| {
         let at = share(&Open35 { ubatch: u, ..*o }, o.ctx, slots);
-        let probe = PlaceQ3::qwen35_lanes(
+        let probe = PlaceQ3::qwen35_records(
             file,
             place,
             census,
             at,
             seqs_qwen35(file, u, slots)?,
             beside,
-            lanes,
+            record_rows,
         )?;
         let whole = probe.whole_at(u64::try_from(o.ctx)?, slots, qwen35_whole(file, at))?;
         Ok((whole, probe))
@@ -1368,10 +1367,10 @@ pub fn whole_card_attention(
 /// The serve seat's load of `slots` resident sequences at `total` positions,
 /// decided on one census reading: under `--place`, the placed plan there;
 /// unset, the whole model while the whole-fit verdict takes it, else the
-/// placed plan ([`unplaced_qwen3_slots`], [`unplaced_qwen35_lanes`]). The
+/// placed plan ([`unplaced_qwen3_slots`], [`unplaced_qwen35_records`]). The
 /// file's family is its description's program ([`Family::of`]). The
-/// verdict prices a qwen35 family file's delta layers at `lanes` lanes
-/// (at least one): one on a plain load, the load's verify lanes on a load
+/// verdict prices a qwen35 family file's delta layers with `record_rows`
+/// verify record rows: none on a plain load, `Body35::VERIFY_ROWS` on a load
 /// that verifies drafted rows — the seat's, from its draft word. A file
 /// with no routed expert has only the whole load, and its verdict settles
 /// the ubatch the open takes: the user's (`o.ubatch`, else
@@ -1389,7 +1388,7 @@ pub fn serve_load(
     (split, census): (&Split, &[DeviceInfo]),
     (total, slots): (usize, usize),
     o: ServeOpts<'_>,
-    lanes: usize,
+    record_rows: usize,
 ) -> Result<ServeLoad, GateError> {
     let unplaced = match (Family::of(split)?, o.place) {
         (Family::Qwen35moe | Family::Qwen35, Some(p)) => {
@@ -1401,7 +1400,7 @@ pub fn serve_load(
                 let (card, ubatch) = whole_dense(
                     (split, census),
                     (&open, slots, o.beside),
-                    lanes,
+                    record_rows,
                     Some(p),
                     rule,
                 )?;
@@ -1412,7 +1411,7 @@ pub fn serve_load(
             }
             refuse_flag(o.ubatch, "a file placed by the plan")?;
             let at = share(&open, total, slots);
-            let q = PlaceQ3::qwen35_lanes(split, p, census, at, seqs, o.beside, lanes)?;
+            let q = PlaceQ3::qwen35_records(split, p, census, at, seqs, o.beside, record_rows)?;
             let plan = q.plan(total, o.levers)?;
             let whole = q.whole_card_qwen35(split, &plan, (total, slots), at)?;
             return Ok(ServeLoad::Placed {
@@ -1428,15 +1427,20 @@ pub fn serve_load(
             let read = model::arch::spec(split)?;
             if dense_ffn(&read.spec) {
                 let rule = ubatch_rule(o.ubatch)?;
-                let (card, ubatch) =
-                    whole_dense((split, census), (&open, slots, o.beside), lanes, None, rule)?;
+                let (card, ubatch) = whole_dense(
+                    (split, census),
+                    (&open, slots, o.beside),
+                    record_rows,
+                    None,
+                    rule,
+                )?;
                 return Ok(ServeLoad::Whole(WholeOn {
                     card,
                     ubatch: Some(ubatch),
                 }));
             }
             refuse_flag(o.ubatch, "a routed file")?;
-            unplaced_qwen35_lanes(split, census, &open, seqs, o.beside, lanes)?
+            unplaced_qwen35_records(split, census, &open, seqs, o.beside, record_rows)?
         }
         (Family::Qwen3moe, Some(p)) => {
             refuse_flag(o.ubatch, "a qwen3moe file")?;
@@ -1485,22 +1489,22 @@ pub fn serve_choice(
     (set, slots): (Option<usize>, usize),
     o: ServeOpts<'_>,
 ) -> Result<(Chosen<ServeLoad>, Reads), GateError> {
-    serve_choice_lanes(split, (set, slots), o, 1)
+    serve_choice_records(split, (set, slots), o, 0)
 }
 
-/// [`serve_choice`] with the delta lanes (`lanes`, at least one) the
-/// whole-fit verdict prices a qwen35 family file's delta layers at
+/// [`serve_choice`] with the verify record rows (`record_rows`) the
+/// whole-fit verdict prices a qwen35 family file's delta layers with
 /// ([`delta_planes`]): the serve seat's, which opens loads that verify
 /// drafted rows.
 #[allow(
     dead_code,
     reason = "the serve seat reads it; the routed legs and the types gate read the plain count, and the CLI and the e2e gates include the planner without it"
 )]
-pub fn serve_choice_lanes(
+pub fn serve_choice_records(
     split: &Split,
     (set, slots): (Option<usize>, usize),
     o: ServeOpts<'_>,
-    lanes: usize,
+    record_rows: usize,
 ) -> Result<(Chosen<ServeLoad>, Reads), GateError> {
     let before = census_reads();
     let census = census()?;
@@ -1519,12 +1523,12 @@ pub fn serve_choice_lanes(
                 ..o
             };
             let total = usize::try_from(c)?.saturating_mul(slots);
-            match serve_load((split, &census), (total, slots), at, lanes) {
+            match serve_load((split, &census), (total, slots), at, record_rows) {
                 Ok(_) => Ok(true),
                 Err(e) => short_or(e).map(|_| false),
             }
         };
-        let probe = serve_probe((split, &census), (c, slots), o, lanes)?;
+        let probe = serve_probe((split, &census), (c, slots), o, record_rows)?;
         named_size(probe, asked, (c, slots), fits)
     };
     let chosen = choose_ctx(split, (set, slots), (None, None), plan_at)?;
@@ -1545,10 +1549,10 @@ pub fn serve_probe(
     (split, census): (&Split, &[DeviceInfo]),
     (c, slots): (u64, usize),
     o: ServeOpts<'_>,
-    lanes: usize,
+    record_rows: usize,
 ) -> Result<Probe<ServeLoad>, GateError> {
     let total = usize::try_from(c)?.saturating_mul(slots);
-    let load = match serve_load((split, census), (total, slots), o, lanes) {
+    let load = match serve_load((split, census), (total, slots), o, record_rows) {
         Ok(load) => load,
         Err(e) => return short_or(e),
     };
@@ -1868,19 +1872,20 @@ pub(super) mod tests {
     use bloomery_gpu_gates::generate::choose_ctx_of;
     use model::placement::ModelTensor;
 
-    /// A drafted verdict's delta bytes are the engine's lane formula
+    /// A drafted verdict's delta bytes are the engine's store formula
     /// ([`delta_planes`]): at Qwen3.6's shape (32 value heads of 128, 16 key
-    /// heads, a 4-tap conv) one lane is the state in place with the ring and
-    /// no stamp, and `Body35::VERIFY_LANES` lanes hold the other lanes and a
-    /// u32 stamp a lane — `runtime::stores`'s own terms, the ones
-    /// `KvLayout::of_spec_lanes` sums and the load's stamped stores hold
-    /// (`RecStore::stamped`).
+    /// heads, a 4-tap conv) a plain load's store is the lane, the ring, a
+    /// u32 stamp and the carry, and a load that verifies adds a record of
+    /// `Body35::VERIFY_ROWS` rows — `runtime::stores`'s own terms, the ones
+    /// `KvLayout::of_spec_verifying` sums and `RecStore::gdn` allocates.
     #[allow(
         dead_code,
         reason = "`generate_qwen3moe`'s test calls it; every other bin that includes this file leaves it unused"
     )]
-    pub(crate) fn a_drafted_verdict_prices_the_engines_lanes() {
-        use runtime::stores::{U32_BYTES, delta_lane_bytes, recurrent_bytes};
+    pub(crate) fn a_drafted_verdict_prices_the_engines_records() {
+        use runtime::stores::{
+            delta_carry_bytes, delta_lane_bytes, delta_record_bytes, recurrent_bytes,
+        };
         const V: usize = 32;
         const K: usize = 16;
         const D: usize = 128;
@@ -1890,32 +1895,27 @@ pub(super) mod tests {
             n_v: V,
             map: KHeadMap::Tiled,
         };
-        let sum = |lanes: usize| {
+        let sum = |rows: usize| {
             let mut planes = Vec::new();
-            delta_planes(&mut planes, shape, lanes);
+            delta_planes(&mut planes, shape, rows);
             planes.iter().sum::<u64>()
         };
-        // The engine's bytes at the same count: `gdn_bytes`'s own terms, the
-        // ones `KvLayout::of_spec_lanes` puts in a delta layer's `recurrent`.
-        let engine = |lanes: usize| {
+        // The engine's bytes at the same rows: `gdn_bytes`'s own terms, the
+        // ones `KvLayout::of_spec_verifying` puts in a delta layer's `recurrent`.
+        let engine = |rows: usize| {
             recurrent_bytes(V, K, D, CONV)
-                + if lanes > 1 {
-                    delta_lane_bytes(V, D, lanes)
-                } else {
-                    0
-                }
+                + delta_carry_bytes(V, K, D)
+                + delta_lane_bytes(V, D, 1)
+                + delta_record_bytes(V, D, rows)
         };
-        let lanes = Body35::VERIFY_LANES;
-        assert_eq!(sum(1), engine(1), "one lane: the state in place, no stamp");
+        let rows = Body35::VERIFY_ROWS;
+        assert_eq!(sum(0), engine(0), "a plain load: lane, ring, stamp, carry");
         assert_eq!(
-            sum(lanes),
-            engine(lanes),
-            "the verdict prices every lane a drafted load's store holds"
+            sum(rows),
+            engine(rows),
+            "the verdict prices the record a drafted load's store holds"
         );
-        assert_eq!(
-            sum(lanes) - sum(1),
-            (lanes as u64 - 1) * 4 * V as u64 * D as u64 * D as u64 + U32_BYTES * lanes as u64
-        );
+        assert_eq!(sum(rows) - sum(0), 3 * 4 * (rows * V * D) as u64);
     }
 
     #[allow(
