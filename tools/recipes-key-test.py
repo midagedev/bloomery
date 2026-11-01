@@ -741,6 +741,55 @@ print("stable source hash reused; same-size/mtime edit invalidated its consumer"
 '''
         ws.run(sys.executable, "-c", driver, str(ws.manifest))
 
+    def test_snapshot_paths_keep_symlink_referents_and_recheck_parents(self):
+        ws = Workspace(self, runtime_files())
+        driver = r'''
+import os
+from pathlib import Path
+import sys
+from types import SimpleNamespace
+from unittest.mock import patch
+sys.path.insert(0, str(Path.cwd() / "tools"))
+from bloomery import reach_cache
+root = Path.cwd()
+for directory in ("left", "right"):
+    (root / directory).mkdir()
+    for name in ("a.rs", "b.rs"):
+        (root / directory / name).write_text("same contents\n")
+(root / "parent").symlink_to("left", target_is_directory=True)
+(root / "leaf.rs").symlink_to("parent/a.rs")
+tree = SimpleNamespace(root=str(root))
+saw = {("r", "parent/a.rs"): ("same contents\n",),
+       ("r", "parent/b.rs"): ("same contents\n",),
+       ("r", "leaf.rs"): ("same contents\n",),
+       ("f", "parent/absent.rs"): False,
+       ("d", "parent/../right"): True}
+before = reach_cache._observed(tree, saw)
+for _, rel, value in before:
+    actual = value[0] if isinstance(value[0], str) else value[1]
+    assert actual == os.path.realpath(root / rel), (rel, actual)
+(root / "next").symlink_to("right", target_is_directory=True)
+os.replace(root / "next", root / "parent")
+after = reach_cache._observed(tree, saw)
+assert before != after, "retargeting a parent with identical contents must change provenance"
+read = reach_cache._bytes
+def retarget(path):
+    data = read(path)
+    if path == str(root / "parent/b.rs"):
+        (root / "next").symlink_to("left", target_is_directory=True)
+        os.replace(root / "next", root / "parent")
+    return data
+with patch.object(reach_cache, "_bytes", retarget):
+    try:
+        reach_cache._observed(tree, saw)
+    except OSError as error:
+        assert "source parent changed" in str(error), error
+    else:
+        raise AssertionError("parent retargeted during a snapshot was accepted")
+print("symlink referents, missing probes, parent retarget and mid-snapshot retarget checked")
+'''
+        ws.run(sys.executable, "-c", driver)
+
     def test_analysis_code_edited_after_import_never_emits_a_skippable_key(self):
         for relative in ("tools/recipes.py", "tools/bloomery/reach_cache.py", "tools/bloomery/fixture_dirs.py"):
             with self.subTest(analysis=relative):

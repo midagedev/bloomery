@@ -7,6 +7,7 @@ pickle, dynamic imports or arbitrary object construction enter the cache protoco
 from __future__ import annotations
 
 import dataclasses
+import contextlib
 import hashlib
 import functools
 import json
@@ -47,8 +48,27 @@ def _bytes(path):
     return data
 
 
-def _file(path, cache):
-    return [os.path.realpath(path), cache.sha(path)]
+@contextlib.contextmanager
+def _paths():
+    """Share parent resolution within one snapshot, then check every parent again before using it."""
+    parents = {}
+
+    def resolve(path):
+        parent, name = os.path.split(path)
+        if name in ("", ".", "..") or os.path.islink(path):
+            return os.path.realpath(path)
+        if parent not in parents:
+            parents[parent] = os.path.realpath(parent)
+        return os.path.join(parents[parent], name)
+
+    yield resolve
+    for parent, real in parents.items():
+        if os.path.realpath(parent) != real:
+            raise OSError("source parent changed during reach snapshot: " + parent)
+
+
+def _file(path, cache, realpath):
+    return [realpath(path), cache.sha(path)]
 
 
 def _corpus(tree):
@@ -60,26 +80,27 @@ def _corpus(tree):
     cache = tree._reach_hashes
     cache.t0_ns = time.time_ns()
     rows = []
-    for base, dirs, files in os.walk(tree.root, followlinks=False):
-        dirs[:] = sorted(d for d in dirs if d not in (".git", "target", "__pycache__"))
-        relbase = os.path.relpath(base, tree.root)
-        rows.append([relbase, dirs[:], sorted(files)])
-        for name in sorted(files):
-            if name.endswith((".rs", ".toml", ".py")) or name == "Cargo.lock":
+    with _paths() as realpath:
+        for base, dirs, files in os.walk(tree.root, followlinks=False):
+            dirs[:] = sorted(d for d in dirs if d not in (".git", "target", "__pycache__"))
+            relbase = os.path.relpath(base, tree.root)
+            rows.append([relbase, dirs[:], sorted(files)])
+            for name in sorted(files):
+                if name.endswith((".rs", ".toml", ".py")) or name == "Cargo.lock":
+                    path = os.path.join(base, name)
+                    rows.append([os.path.relpath(path, tree.root), _file(path, cache, realpath)])
+            # Walk symlinked source directories separately, following each real directory only once.
+            for name in dirs[:]:
                 path = os.path.join(base, name)
-                rows.append([os.path.relpath(path, tree.root), _file(path, cache)])
-        # Walk symlinked source directories separately, following each real directory only once.
-        for name in dirs[:]:
-            path = os.path.join(base, name)
-            if os.path.islink(path):
-                rows.append([os.path.relpath(path, tree.root), _linked(path, cache)])
+                if os.path.islink(path):
+                    rows.append([os.path.relpath(path, tree.root), _linked(path, cache, realpath)])
     return _digest(_json(rows))
 
 
-def _linked(root, cache):
+def _linked(root, cache, realpath):
     rows, seen = [], set()
     def visit(path, rel):
-        real = os.path.realpath(path)
+        real = realpath(path)
         if os.path.isdir(path):
             if real in seen:
                 rows.append([rel, real, "cycle"])
@@ -90,7 +111,7 @@ def _linked(root, cache):
             for name in names:
                 visit(os.path.join(path, name), rel + "/" + name)
         elif os.path.isfile(path):
-            rows.append([rel, _file(path, cache)])
+            rows.append([rel, _file(path, cache, realpath)])
         else:
             rows.append([rel, real, "absent"])
     visit(root, "")
@@ -134,38 +155,40 @@ def _identity(tree):
 
 def _observed(tree, saw):
     rows = []
-    for (kind, rel), was in sorted(saw.items()):
-        path = os.path.join(tree.root, rel)
-        if kind == "r":
-            # Tree.read uses text-mode universal newlines; the digest still covers the raw bytes.
-            data = _bytes(path)
-            text = data.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
-            if text != was[0]:
-                raise OSError("source changed during reach analysis: " + rel)
-            rows.append([kind, rel, [os.path.realpath(path), _digest(data)]])
-        else:
-            now = os.path.isfile(path) if kind == "f" else os.path.isdir(path)
-            if now != was:
-                raise OSError("source probe changed during reach analysis: " + rel)
-            rows.append([kind, rel, [now, os.path.realpath(path)]])
+    with _paths() as realpath:
+        for (kind, rel), was in sorted(saw.items()):
+            path = os.path.join(tree.root, rel)
+            if kind == "r":
+                # Tree.read uses text-mode universal newlines; the digest still covers the raw bytes.
+                data = _bytes(path)
+                text = data.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+                if text != was[0]:
+                    raise OSError("source changed during reach analysis: " + rel)
+                rows.append([kind, rel, [realpath(path), _digest(data)]])
+            else:
+                now = os.path.isfile(path) if kind == "f" else os.path.isdir(path)
+                if now != was:
+                    raise OSError("source probe changed during reach analysis: " + rel)
+                rows.append([kind, rel, [now, realpath(path)]])
     return rows
 
 
 def _holds(tree, rows):
     if not isinstance(rows, list):
         return False
-    for row in rows:
-        if not isinstance(row, list) or len(row) != 3:
-            return False
-        kind, rel, was = row
-        if kind not in ("r", "f", "d") or not isinstance(rel, str):
-            return False
-        path = os.path.join(tree.root, rel)
-        if kind == "r":
-            if _file(path, tree._reach_hashes) != was:
+    with _paths() as realpath:
+        for row in rows:
+            if not isinstance(row, list) or len(row) != 3:
                 return False
-        elif [(os.path.isfile(path) if kind == "f" else os.path.isdir(path)), os.path.realpath(path)] != was:
-            return False
+            kind, rel, was = row
+            if kind not in ("r", "f", "d") or not isinstance(rel, str):
+                return False
+            path = os.path.join(tree.root, rel)
+            if kind == "r":
+                if _file(path, tree._reach_hashes, realpath) != was:
+                    return False
+            elif [(os.path.isfile(path) if kind == "f" else os.path.isdir(path)), realpath(path)] != was:
+                return False
     return True
 
 
@@ -183,14 +206,16 @@ def _encode(value):
     if isinstance(value, (list, tuple, set, frozenset)):
         return [type(value).__name__, [v if v is None or type(v) in _SCALARS else _encode(v) for v in value]]
     if isinstance(value, dict):
-        return ["dict", [[_encode(k), _encode(v)] for k, v in value.items()]]
+        return ["dict", [[k if k is None or type(k) in _SCALARS else _encode(k),
+                          v if v is None or type(v) in _SCALARS else _encode(v)] for k, v in value.items()]]
     name = type(value).__name__
     if name == "RustFacts":
         return [name, _encode([list(value.units[:value.uses]), list(value.binds), value.exported])]
     if name == "RuleSet":
         return [name, _encode(value.rules)]
     if name in ("Unit", "ImplHead", "Dispatch"):
-        return [name, {f.name: _encode(getattr(value, f.name)) for f in dataclasses.fields(value)}]
+        return [name, {f: v if (v := getattr(value, f)) is None or type(v) in _SCALARS else _encode(v)
+                       for f in _record_types(type(value))}]
     raise ValueError("unsupported Reach field " + name)
 
 
