@@ -303,15 +303,12 @@ fn card_experts_with(
 
 /// The machine the Qwen3.8 gates plan a file on at [`BUDGET_CTX`]
 /// positions: `card` laid out by `machine_for_experts` with the ubatch such a
-/// load runs, the routed experts where [`place::Experts::Card`] says. The
-/// recorded fixture budgets were planned with the walk holding the q8 blocks
-/// of 32 of every row ([`place::Stack::q8_blocks32`]); counting the file's
-/// own forms ([`place::PlanInputs::stack`]) picks other card experts, so it
-/// waits for the fixture sets' next regeneration.
+/// load runs, the routed experts where [`place::Experts::Card`] says. Its
+/// activation forms come from the load's own [`place::PlanInputs::stack`].
 fn budget_machine(card: CardSpec, inputs: &place::PlanInputs) -> Machine {
     place::machine_for_experts(
         card,
-        place::Stack::q8_blocks32(inputs.spec.layers.len()),
+        inputs.stack(),
         place::UBATCH_PLANNED.min(BUDGET_CTX),
         place::Experts::Card,
     )
@@ -840,10 +837,59 @@ impl DraftRules for QwenMtp {
 
 #[cfg(test)]
 mod tests {
-    use super::{FIXTURE_INTERVAL, HIDDEN, Qwen38, check_kinds, shexp_gate, spec};
+    use super::{
+        BUDGET_CTX, FIXTURE_INTERVAL, HIDDEN, Qwen38, budget_machine, check_kinds, place,
+        shexp_gate, spec,
+    };
     use crate::arch::qwen35moe::hparams::tests::{keys, tensors};
-    use crate::arch::synthetic::{V, header_shaped};
+    use crate::arch::synthetic::{Ty, V, header_shaped, header_typed};
     use crate::fixture::Family;
+    use crate::placement::workstation::{CardSpec, RTX_3090};
+    use gguf::Split;
+
+    /// The recorded budget and its card adjustment reserve the load's own activation forms.
+    #[test]
+    fn the_budget_machine_uses_the_loads_stack() {
+        for ty in [Ty::F32, Ty::Q4K, Ty::Q8_0] {
+            let typed: Vec<_> = tensors()
+                .into_iter()
+                .map(|(name, dims)| {
+                    if name.ends_with(".attn_q.weight") {
+                        (name, vec![256, 128], ty)
+                    } else {
+                        (name, dims, Ty::F32)
+                    }
+                })
+                .collect();
+            let path = header_typed(
+                "q38-budget-stack",
+                "qwen4exp",
+                &keys(),
+                &[("tokenizer.ggml.pre", V::Str("qwen35"))],
+                &typed,
+            );
+            let split = Split::open(&path).unwrap();
+            let inputs = place::PlanInputs::describe(&split).unwrap();
+            for integrated in [false, true] {
+                let card = CardSpec {
+                    integrated,
+                    free_bytes: Some(RTX_3090.total_bytes),
+                    ..RTX_3090
+                };
+                let load = place::machine_for_experts(
+                    card,
+                    inputs.stack(),
+                    place::UBATCH_PLANNED.min(BUDGET_CTX),
+                    place::Experts::Card,
+                );
+                assert_eq!(
+                    budget_machine(card, &inputs).cards[0].set_aside_bytes(),
+                    load.cards[0].set_aside_bytes(),
+                    "the file's dense type {ty:?}, integrated={integrated}"
+                );
+            }
+        }
+    }
 
     /// Qwen3.8's 1-D fills: each name's value, and the shared expert's gate
     /// vector `1/√2560` equal, bit for bit, to the literal `0.019_764_235` the
