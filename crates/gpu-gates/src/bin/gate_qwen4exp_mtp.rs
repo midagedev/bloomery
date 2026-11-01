@@ -281,11 +281,11 @@ mod gate {
 
     use bloomery_gpu::GpuError;
     use bloomery_gpu::arch::qwen3moe::{
-        Body38, CHECKPOINT_EVERY, KvQ8, MTP_GRAPH_ROWS, MTP_ROWS, MTP_STORE_ROWS, Mtp38, MtpDraft,
-        MtpNode, MtpTaps, Prompt38, Qwen38Model, Seq38, SplitWalk, Store38Host, TargetRows,
+        Body38, CHECKPOINT_EVERY, KvQ8, MTP_GRAPH_ROWS, MTP_ROWS, MTP_STORE_ROWS, Mtp38, MtpNode,
+        MtpTaps, Prompt38, Qwen38Model, Seq38, SplitWalk, Store38Host, TargetRows,
         checkpoint_bytes, seq_positional_bytes, seq38_bytes,
     };
-    use bloomery_gpu::draft::{DraftFeed, DraftHead, Feed, Hidden, WalkMode};
+    use bloomery_gpu::draft::{DraftFeed, DraftHead, Feed, Hidden, Proposal, WalkMode};
     use bloomery_gpu::fault::FaultSite;
     use bloomery_gpu::media::CallRows;
     use bloomery_gpu::weights::DevWeight;
@@ -742,7 +742,7 @@ mod gate {
 
     /// A walk's readback: the draft, the streams and the logits.
     struct Walk {
-        draft: MtpDraft,
+        draft: Proposal,
         l_out: Vec<f32>,
         logits: Vec<f32>,
         rows: usize,
@@ -2543,7 +2543,7 @@ mod gate {
             REFRESH,
         );
         refresh(m, prompt[0])?;
-        m.mtp_store_slots(
+        m.draft_store_slots(
             &[(
                 0,
                 Feed {
@@ -2969,7 +2969,7 @@ mod gate {
                     media: None,
                 };
                 if entry == "slots" {
-                    m.mtp_store_slots(&[(0, feed)], DraftHead::Rows)?;
+                    m.draft_store_slots(&[(0, feed)], DraftHead::Rows)?;
                 } else {
                     let mode = match entry {
                         "eager" => WalkMode::Eager,

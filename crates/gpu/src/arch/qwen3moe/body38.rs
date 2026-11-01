@@ -119,8 +119,8 @@ use super::image::{
     MediaCarrier, MediaRows, imrope_sections, media_call, section_order, window_spans,
 };
 use super::mtp38::{
-    CHAIN_PAIRS, ChainBlock, DraftRows38, DraftSeq38, MTP_ROWS, Mtp38, MtpCtx, MtpDraft, MtpTaps,
-    Target38, TargetRows, chain_spans, check_target_rows,
+    CHAIN_PAIRS, DraftRows38, DraftSeq38, Mtp38, MtpCtx, MtpTaps, StoreBlock, Target38, TargetRows,
+    check_target_rows,
 };
 use super::plan38::{self, GDN, Kind38, Layer38, Shape38, beta_alpha, geo, router};
 use super::program38::{
@@ -148,7 +148,9 @@ use crate::checkpoint::saved::{
 };
 use crate::checkpoint::staging::NoRoom;
 use crate::checkpoint::{self, Checkpoints};
-use crate::draft::{DraftFeed, DraftHead, Feed, Held, Hidden, WalkMode};
+use crate::draft::{
+    ChainBlock, DraftFeed, DraftHead, Feed, Held, Hidden, Proposal, SlotDraft, WalkMode,
+};
 use crate::folder::{Folder, Model};
 use crate::head::{Head, HeadLaunches, HeadNorm};
 use crate::host::costs::ExpertShape;
@@ -166,8 +168,8 @@ use crate::linear::delta::{RecoveryStore, RecoveryTable, carry_fold_host};
 use crate::media::{ImageSpan, MediaBody, MediaSpan, RopeBase, SeqRope, kept_rule, rope_table};
 use crate::model::slots::slot_twice;
 use crate::model::{
-    CardBytes, ChainBody, GpuModel, HostServed, MAX_PASS_ROWS, Rollback, RowHeads, Rows, SlotRange,
-    SlotRowOrder, SlotRows, Slots,
+    CardBytes, ChainBody, GpuModel, HostServed, Rollback, RowHeads, Rows, SlotRange, SlotRowOrder,
+    SlotRows, Slots,
 };
 use crate::prompt_timing::{PromptStats, PromptTiming, nanos};
 use crate::rope_table::{RopeSpec, RopeTable};
@@ -2285,7 +2287,7 @@ impl Body38 {
         feed: DraftFeed<'_, TargetRows>,
         head: DraftHead,
         mode: WalkMode,
-    ) -> Result<MtpDraft, GpuError> {
+    ) -> Result<Proposal, GpuError> {
         let Body38 {
             mtp,
             k,
@@ -2387,7 +2389,7 @@ impl Body38 {
         own: usize,
         head: DraftHead,
         mode: WalkMode,
-    ) -> Result<MtpDraft, GpuError> {
+    ) -> Result<Proposal, GpuError> {
         let Body38 {
             mtp,
             k,
@@ -2414,70 +2416,6 @@ impl Body38 {
             head,
             mode,
         )
-    }
-
-    /// One round of several slots' chains ([`GpuModel::mtp_chain_slots`])
-    /// beside this body, the homes canonical: `chains`' `(slot, refresh,
-    /// own)`, each sequence the live one (`None`) or `parked`'s entry its
-    /// `seqs` index names. Each chain is checked and staged with its
-    /// sequence live ([`Mtp38::stage_chain`]), then each walk runs once over
-    /// every chain it reaches, each chain's attention with its sequence live
-    /// ([`on_seq`]), and the round is read back once ([`Mtp38::read_chains`]).
-    fn mtp_chain_round(
-        &mut self,
-        gpu: &Gpu,
-        w: &Weights,
-        parked: &mut [&mut Slot38],
-        (chains, seqs): (&[SlotChain38<'_>], &[Option<usize>]),
-        head: DraftHead,
-        mode: WalkMode,
-    ) -> Result<Vec<MtpDraft>, GpuError> {
-        let stream = gpu.stream();
-        let mut blocks: Vec<ChainBlock> = Vec::with_capacity(chains.len());
-        let (mut at, mut pair) = (0, 0);
-        for (block, (&(_, feed, own), &seq)) in chains.iter().zip(seqs).enumerate() {
-            let seq = seq.map(|i| &mut *parked[i]);
-            let b = on_seq(self, seq, |body| {
-                let Body38 {
-                    mtp,
-                    plans,
-                    s,
-                    a,
-                    wa,
-                    wrote,
-                    ..
-                } = body;
-                let d = mtp.as_mut().ok_or(GpuError::state(
-                    WHAT,
-                    "an MTP draft (Body38::open_placed_mtp)",
-                ))?;
-                let target = mtp_target(plans, [s, a, wa], wrote, DraftFeed::Rows(feed));
-                d.stage_chain(stream, target, feed, (own, head, mode), (block, at, pair))
-            })?;
-            at += b.m();
-            pair += b.pairs();
-            blocks.push(b);
-        }
-        self.draft_mut()?.upload_chains(stream)?;
-        let walks = blocks.iter().map(|b| b.pairs()).max().unwrap_or(0);
-        for j in 0..walks {
-            self.mtp_with(gpu, w, |d, c| d.chain_in(c, &blocks, j))?;
-            for (block, at, m) in chain_spans(&blocks, j) {
-                let seq = seqs[block].map(|i| &mut *parked[i]);
-                on_seq(self, seq, |body| {
-                    body.mtp_with(gpu, w, |d, c| d.attend(c, at, m))
-                })?;
-            }
-            self.mtp_with(gpu, w, |d, c| d.chain_out(c, &blocks, j, head))?;
-        }
-        for (b, &seq) in blocks.iter().zip(seqs) {
-            let seq = seq.map(|i| &mut *parked[i]);
-            on_seq(self, seq, |body| {
-                body.draft_mut()?.end_chain(b);
-                Ok(())
-            })?;
-        }
-        self.draft_ref()?.read_chains(stream, &blocks)
     }
 
     /// Tokens of the vocabulary.
@@ -5155,10 +5093,6 @@ fn mtp_ctx<'a>(
 pub type Prompt38Sink<'a> =
     dyn FnMut(&mut GpuModel<Body38>, TargetRows, u32, usize) -> Result<(), GpuError> + 'a;
 
-/// One slot's chain of a round of several slots' chains
-/// ([`GpuModel::mtp_chain_slots`]): the slot, the refresh, the own walks.
-pub type SlotChain38<'a> = (usize, Feed<'a, TargetRows>, usize);
-
 /// The MTP draft's calls ([`Mtp38::run`]); each is refused by name on a load
 /// without a draft.
 impl GpuModel<Body38> {
@@ -5171,7 +5105,7 @@ impl GpuModel<Body38> {
         feed: DraftFeed<'_, TargetRows>,
         head: DraftHead,
         mode: WalkMode,
-    ) -> Result<MtpDraft, GpuError> {
+    ) -> Result<Proposal, GpuError> {
         const WHAT_D: &str = "qwen4exp mtp_draft";
         self.refuse_if_poisoned(WHAT_D)?;
         let (gpu, w, body) = self.body_parts(WHAT_D)?;
@@ -5195,85 +5129,6 @@ impl GpuModel<Body38> {
         let (gpu, w, body) = self.body_parts(WHAT_D)?;
         let r = body.mtp_run_walk(gpu, w, feed, head, mode).map(|_| ());
         self.note_fault(WHAT_D, r)
-    }
-
-    /// One store walk of several resident sequences' rows (module doc of
-    /// `mtp38`): each `(slot, feed)`'s rows checked and staged on its slot as
-    /// [`GpuModel::mtp_walk`] checks a store walk there, then the walk's
-    /// launches once over every slot's rows, the embedding and the append a
-    /// slot, each slot's into its own store. Each slot's store and the
-    /// positions it holds come out bit for bit as its own store walk leaves
-    /// them, and the selected slot stays selected. Refused by name: a slot
-    /// named twice, rows past the store walk's
-    /// [`MTP_STORE_ROWS`](super::mtp38::MTP_STORE_ROWS), a poisoned
-    /// model, and as `mtp_walk` refuses each slot's walk, before anything but
-    /// the walk's scratch moves. A fault a launch raises stays on the card's
-    /// fault word, which the next readback names.
-    pub fn mtp_store_slots(
-        &mut self,
-        walks: &[(usize, Feed<'_, TargetRows>)],
-        head: DraftHead,
-    ) -> Result<(), GpuError> {
-        const WHAT_D: &str = "qwen4exp mtp_store_slots";
-        self.refuse_if_poisoned(WHAT_D)?;
-        if let Some((i, &(slot, _))) = walks
-            .iter()
-            .enumerate()
-            .find(|&(i, (slot, _))| walks[..i].iter().any(|(s, _)| s == slot))
-        {
-            return Err(GpuError::shape(
-                WHAT_D,
-                format!("slot {slot} named again at walk {i}: one walk a slot"),
-            ));
-        }
-        let home = self.selected();
-        let r = self.store_slots_at(walks, head);
-        let back = self.select_slot(home);
-        self.note_fault(WHAT_D, r.and(back))
-    }
-
-    /// [`GpuModel::mtp_store_slots`]'s walk, its checks done: every slot's
-    /// rows staged with that slot selected, the launches over all of them,
-    /// then each slot's append with that slot selected.
-    fn store_slots_at(
-        &mut self,
-        walks: &[(usize, Feed<'_, TargetRows>)],
-        head: DraftHead,
-    ) -> Result<(), GpuError> {
-        const WHAT_D: &str = "qwen4exp mtp_store_slots";
-        let mut blocks = Vec::with_capacity(walks.len());
-        let mut ids = Vec::new();
-        for &(slot, feed) in walks {
-            self.select_slot(slot)?;
-            let (gpu, _, body) = self.body_parts(WHAT_D)?;
-            let Body38 {
-                mtp,
-                plans,
-                s,
-                a,
-                wa,
-                wrote,
-                ..
-            } = body;
-            let d = mtp.as_mut().ok_or(GpuError::state(
-                WHAT_D,
-                "an MTP draft (Body38::open_placed_mtp)",
-            ))?;
-            let target = mtp_target(plans, [s, a, wa], wrote, DraftFeed::Rows(feed));
-            blocks.push(d.stage_store(gpu.stream(), target, feed, head, ids.len())?);
-            ids.extend_from_slice(feed.tokens);
-        }
-        if blocks.is_empty() {
-            return Ok(());
-        }
-        let (gpu, w, body) = self.body_parts(WHAT_D)?;
-        body.mtp_with(gpu, w, |d, c| d.store_rows(c, &ids, &blocks, false))?;
-        for (&(slot, _), &b) in walks.iter().zip(&blocks) {
-            self.select_slot(slot)?;
-            let (gpu, w, body) = self.body_parts(WHAT_D)?;
-            body.mtp_with(gpu, w, |d, c| d.append_store(c, b))?;
-        }
-        Ok(())
     }
 
     /// Fill the draft walk's scratch with NaNs without changing its inbox or stored state.
@@ -5302,7 +5157,7 @@ impl GpuModel<Body38> {
         own: usize,
         head: DraftHead,
         mode: WalkMode,
-    ) -> Result<MtpDraft, GpuError> {
+    ) -> Result<Proposal, GpuError> {
         const WHAT_D: &str = "qwen4exp mtp_chain";
         self.refuse_if_poisoned(WHAT_D)?;
         let (gpu, w, body) = self.body_parts(WHAT_D)?;
@@ -5310,79 +5165,6 @@ impl GpuModel<Body38> {
         // A fault a walk of the chain raised poisons the model as the
         // target's would.
         self.note_fault(WHAT_D, r)
-    }
-
-    /// Several slots' window chains of the draft at once, one readback a
-    /// round: each `(slot, refresh, own)` the chain [`GpuModel::mtp_chain`]
-    /// runs on that slot, the chains' walks of each depth run as one walk
-    /// over every slot's rows — its attention each slot's over its own
-    /// store — and each slot's proposal, probabilities and store come out
-    /// as its own chain leaves them, each launch computing a row from that
-    /// row's inputs alone. Chains past one walk's rows or readback run in
-    /// rounds of them, in order, and more chains than one call binds
-    /// ([`MAX_PASS_ROWS`]) in calls of that many. Every walk runs launch by
-    /// launch: one walk's launches address every slot's store. The model
-    /// stands with slot 0 selected (`GpuModel::on_slots`). Refused by name:
-    /// a slot named twice, a poisoned model, and as `mtp_chain` refuses each
-    /// chain, before its round's first walk. Earlier chains in the round may
-    /// already be staged, and rounds before it have run. A fault any walk
-    /// raised poisons every slot its call named.
-    pub fn mtp_chain_slots(
-        &mut self,
-        chains: &[SlotChain38<'_>],
-        head: DraftHead,
-        mode: WalkMode,
-    ) -> Result<Vec<MtpDraft>, GpuError> {
-        const WHAT_D: &str = "qwen4exp mtp_chain_slots";
-        self.refuse_if_poisoned(WHAT_D)?;
-        for (i, &(slot, ..)) in chains.iter().enumerate() {
-            if chains[..i].iter().any(|&(seen, ..)| seen == slot) {
-                return Err(slot_twice(WHAT_D, slot));
-            }
-        }
-        if chains.len() > MAX_PASS_ROWS {
-            let mut out = Vec::with_capacity(chains.len());
-            for part in chains.chunks(MAX_PASS_ROWS) {
-                out.extend(self.mtp_chain_slots(part, head, mode)?);
-            }
-            return Ok(out);
-        }
-        let slots: Vec<usize> = chains.iter().map(|&(slot, ..)| slot).collect();
-        self.on_slots(&slots, WHAT_D, |gpu, w, body, parked| {
-            let mut seqs = Vec::with_capacity(chains.len());
-            let mut next = 0..parked.len();
-            for &(slot, ..) in chains {
-                seqs.push(match slot {
-                    0 => None,
-                    _ => Some(next.next().ok_or(GpuError::state(
-                        WHAT_D,
-                        "a parked sequence for every slot but slot 0",
-                    ))?),
-                });
-            }
-            let mut out = Vec::with_capacity(chains.len());
-            let mut start = 0;
-            while start < chains.len() {
-                let (mut rows, mut pairs, mut end) = (0, 0, start);
-                while let Some((_, feed, own)) = chains.get(end) {
-                    let (r, p) = (feed.tokens.len(), 1 + own);
-                    if end > start && (rows + r > MTP_ROWS || pairs + p > CHAIN_PAIRS) {
-                        break;
-                    }
-                    (rows, pairs, end) = (rows + r, pairs + p, end + 1);
-                }
-                out.extend(body.mtp_chain_round(
-                    gpu,
-                    w,
-                    parked,
-                    (&chains[start..end], &seqs[start..end]),
-                    head,
-                    mode,
-                )?);
-                start = end;
-            }
-            Ok(out)
-        })
     }
 
     /// The last draft walk's taps ([`Mtp38::taps`]). Blocking.
@@ -6205,7 +5987,125 @@ impl Slots for Body38 {
     }
 }
 
+/// The MTP draft's walks of several resident sequences' rows (module doc of
+/// `mtp38`): each phase one call into [`Mtp38`] beside the body's arenas.
+/// Every walk of a round of chains runs launch by launch, whatever mode it
+/// names: one walk's launches address every slot's store.
+impl SlotDraft<TargetRows> for Body38 {
+    type Program = Mtp38;
+    const ROUND_PAIRS: usize = CHAIN_PAIRS;
+
+    type StoreBlock<'f> = StoreBlock<'f>;
+
+    fn stage_store<'f>(
+        &mut self,
+        gpu: &Gpu,
+        _: &Weights,
+        feed: Feed<'f, TargetRows>,
+        head: DraftHead,
+        at: usize,
+    ) -> Result<StoreBlock<'f>, GpuError> {
+        let (d, target) = self.draft_beside(feed)?;
+        d.stage_store(gpu.stream(), target, feed, head, at)
+    }
+
+    fn store_rows(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        ids: &[u32],
+        blocks: &[StoreBlock<'_>],
+    ) -> Result<(), GpuError> {
+        self.mtp_with(gpu, w, |d, c| d.store_rows(c, ids, blocks, false))
+    }
+
+    fn append_store(&mut self, gpu: &Gpu, w: &Weights, b: StoreBlock<'_>) -> Result<(), GpuError> {
+        self.mtp_with(gpu, w, |d, c| d.append_store(c, b))
+    }
+
+    fn stage_chain(
+        &mut self,
+        gpu: &Gpu,
+        _: &Weights,
+        refresh: Feed<'_, TargetRows>,
+        walk: (usize, DraftHead, WalkMode),
+        at: (usize, usize, usize),
+    ) -> Result<ChainBlock, GpuError> {
+        let (d, target) = self.draft_beside(refresh)?;
+        d.stage_chain(gpu.stream(), target, refresh, walk, at)
+    }
+
+    fn upload_chains(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
+        self.draft_mut()?.upload_chains(gpu.stream())
+    }
+
+    fn chain_in(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        blocks: &[ChainBlock],
+        j: usize,
+    ) -> Result<(), GpuError> {
+        self.mtp_with(gpu, w, |d, c| d.chain_in(c, blocks, j))
+    }
+
+    fn attend(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        _: &ChainBlock,
+        (at, m): (usize, usize),
+    ) -> Result<(), GpuError> {
+        self.mtp_with(gpu, w, |d, c| d.attend(c, at, m))
+    }
+
+    fn chain_out(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        blocks: &[ChainBlock],
+        j: usize,
+        head: DraftHead,
+    ) -> Result<(), GpuError> {
+        self.mtp_with(gpu, w, |d, c| d.chain_out(c, blocks, j, head))
+    }
+
+    fn end_chain(&mut self, b: &ChainBlock) -> Result<(), GpuError> {
+        self.draft_mut()?.end_chain(b);
+        Ok(())
+    }
+
+    fn read_chains(&mut self, gpu: &Gpu, blocks: &[ChainBlock]) -> Result<Vec<Proposal>, GpuError> {
+        self.draft_ref()?.read_chains(gpu.stream(), blocks)
+    }
+}
+
 impl Body38 {
+    /// The draft and the target rows `feed`'s rows read ([`mtp_target`]),
+    /// beside this body's live sequence.
+    fn draft_beside<'b>(
+        &'b mut self,
+        feed: Feed<'_, TargetRows>,
+    ) -> Result<(&'b mut Mtp38, Option<Target38<'b>>), GpuError> {
+        let Body38 {
+            mtp,
+            plans,
+            s,
+            a,
+            wa,
+            wrote,
+            ..
+        } = self;
+        let d = mtp.as_mut().ok_or(GpuError::state(
+            WHAT,
+            "an MTP draft (Body38::open_placed_mtp)",
+        ))?;
+        Ok((
+            d,
+            mtp_target(plans, [s, a, wa], wrote, DraftFeed::Rows(feed)),
+        ))
+    }
+
     /// Exchange every per-sequence piece of the live sequence with `seq`'s:
     /// pointer moves only — each is a buffer handle or a host value the body
     /// holds by value. [`Slots::swap_seq`]'s exchange after its refusals,

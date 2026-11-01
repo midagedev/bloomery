@@ -52,9 +52,10 @@
 //! target's next readback names.
 
 use bloomery_gpu::draft::{
-    DraftFeed, DraftHead, Feed, Held, Hidden, WalkBounds, WalkMode, refuse_own, refuse_rows,
+    ChainBlock, DraftFeed, DraftHead, Feed, Held, Hidden, Proposal, SlotDraft, WalkBounds,
+    WalkMode, chain_rows, refuse_own, refuse_rows,
 };
-use bloomery_gpu::head::{Head, HeadNorm};
+use bloomery_gpu::head::{Head, HeadNorm, read_tokens};
 use bloomery_gpu::host::BatchLeg;
 use bloomery_gpu::host::shell::TierShell;
 use bloomery_gpu::latent::{
@@ -89,6 +90,10 @@ const WHAT: &str = "glm5next NextN";
 /// The program's [`WalkBounds::WALK_ROWS`] and [`WalkBounds::STORE_ROWS`]: the
 /// m-column kernels' width.
 pub const WALK_ROWS: usize = COL_GROUP;
+
+/// The most chains one round of several sequences' chains reads back: a
+/// chain walks one row at least, so a round's walk holds at most this many.
+const ROUND_PAIRS: usize = WALK_ROWS;
 
 impl WalkBounds for Nextn {
     const WALK_ROWS: usize = WALK_ROWS;
@@ -155,6 +160,10 @@ struct Arena {
     out: DeviceBuffer<f32>,
     /// The host's routed sum the batch port uploads.
     hsum: DeviceBuffer<f32>,
+    /// A round of several sequences' chains' readback, laid out as the
+    /// head's argmax words ([`Head::token_words`]): a chain's proposal at
+    /// its pair, then the round's last fault word and site mask.
+    round: DeviceBuffer<u32>,
 }
 
 impl Arena {
@@ -179,6 +188,7 @@ impl Arena {
             moe: z(n)?,
             out: z(n)?,
             hsum: z(n)?,
+            round: DeviceBuffer::zeroed(stream, ROUND_PAIRS + 2)?,
         })
     }
 
@@ -202,6 +212,7 @@ impl Arena {
         .sum::<usize>()
             + self.pos.num_bytes()
             + self.cnt.num_bytes()
+            + self.round.num_bytes()
     }
 }
 
@@ -391,6 +402,19 @@ impl Nextn {
         std::mem::swap(&mut self.pooled, &mut s.pooled);
         std::mem::swap(&mut self.held, &mut s.held);
         std::mem::swap(&mut self.pair0, &mut s.pair0);
+    }
+
+    /// `n` of the head's argmax words ([`Head::token_words`]) from word
+    /// `from`, copied on `stream` to words `to ..` of a round's readback.
+    fn keep_words(
+        &mut self,
+        stream: &CudaStream,
+        (from, to): (usize, usize),
+        n: usize,
+    ) -> Result<(), GpuError> {
+        span_mut(WHAT, &mut self.a.round, to, n)?
+            .copy_from_device_async(&*span(WHAT, self.head.token_words(), from, n)?, stream)?;
+        Ok(())
     }
 
     /// Device bytes one sequence's side holds: the store and the row-0 copy.
@@ -729,9 +753,9 @@ fn hidden_src<'a>(
     Ok(Some((src, first)))
 }
 
-/// The walk's `m` hidden rows into `a.hn`, normed as the target's head
-/// norms them: copied from the host, or each target row's streams' mean
-/// then the RMS by the target's `output_norm` (`norm`).
+/// The walk's `m` hidden rows into `a.hn` from its row `at`, normed as the
+/// target's head norms them: copied from the host, or each target row's
+/// streams' mean then the RMS by the target's `output_norm` (`norm`).
 #[allow(
     clippy::too_many_arguments,
     reason = "the card, the target's weights and its norm's name, the kernels and widths, the feed's source resolved and its rows, and the arena (rust-quality R8)"
@@ -744,28 +768,28 @@ fn enqueue_hidden(
     d: &Dims,
     hidden: Hidden<'_, GlmArena>,
     src: Option<(Src<'_>, usize)>,
-    m: usize,
+    (at, m): (usize, usize),
     a: &mut Arena,
 ) -> Result<(), GpuError> {
     let stream = gpu.stream();
     let n = d.embd;
     match (hidden, src) {
         (Hidden::Host(v), _) => {
-            span_mut(WHAT, &mut a.hn, 0, m * n)?.copy_from_host(stream, v)?;
+            span_mut(WHAT, &mut a.hn, at * n, m * n)?.copy_from_host(stream, v)?;
         }
         (Hidden::Target { .. }, Some((src, first))) => {
             for t in 0..m {
                 let rowv = src.row(first + t, HC_STREAMS * n)?;
-                k.hc.enqueue_mean(stream, &rowv, n, t * n, &mut a.hid)?;
+                k.hc.enqueue_mean(stream, &rowv, n, (at + t) * n, &mut a.hid)?;
             }
             gpu.elem().enqueue_rms_norm(
                 stream,
-                &a.hid,
+                &*span(WHAT, &a.hid, at * n, m * n)?,
                 f32v(tw, norm)?,
                 d.rms_eps,
                 n,
                 m,
-                &mut a.hn,
+                &mut *span_mut(WHAT, &mut a.hn, at * n, m * n)?,
             )?;
         }
         (Hidden::Target { .. }, None) => {
@@ -973,13 +997,11 @@ impl Body {
     }
 
     /// One NextN walk of `feed` in `mode` (module doc), with no readback;
-    /// `tw` the target's weights (the head's projection, `output_norm`).
-    /// Refused by name before anything moves: a load without the layer, a
-    /// captured walk, rows outside 1..=[`WALK_ROWS`], a token past the
-    /// vocabulary, rows past the store, a walk from past [`Nextn::held`], a
-    /// hidden slice of other than the rows' values, media rows of another
-    /// width than the model's, target rows the arena does not hold at the
-    /// walk's positions ([`Wrote`]).
+    /// `tw` the target's weights (the head's projection, `output_norm`):
+    /// its rows staged ([`Body::nextn_stage`]), the row-wise launches
+    /// ([`Body::nextn_front`]), the store's append ([`Body::nextn_append`])
+    /// and, but in [`WalkMode::Store`], the full part of the last row
+    /// through the head ([`Body::nextn_full`]).
     fn nextn_run(
         &mut self,
         gpu: &Gpu,
@@ -987,12 +1009,38 @@ impl Body {
         feed: Feed<'_, GlmArena>,
         mode: WalkMode,
     ) -> Result<(), GpuError> {
+        let m = self.nextn_stage(gpu, tw, feed, mode, 0)?;
+        self.nextn_front(gpu, m)?;
+        self.nextn_append(gpu, (0, m), feed.pos0)?;
+        if mode == WalkMode::Store {
+            return Ok(());
+        }
+        let p = u32::try_from(feed.pos0 as usize + m - 1)
+            .expect("a walk's positions are under the store's rows");
+        self.nextn_full(gpu, tw, m - 1, p)
+    }
+
+    /// `feed`'s rows staged at rows `at ..` of the walk's arena, on the live
+    /// sequence: their embedding rows, positions and counts uploaded, their
+    /// hidden rows gathered and normed; how many. Refused by name before
+    /// anything moves: a load without the layer, a captured walk, rows
+    /// outside 1..=[`WALK_ROWS`] or past the arena's from `at`, a token past
+    /// the vocabulary, rows past the store, a walk from past
+    /// [`Nextn::held`], a hidden slice of other than the rows' values, media
+    /// rows of another width than the model's, target rows the arena does
+    /// not hold at the walk's positions ([`Wrote`]).
+    fn nextn_stage(
+        &mut self,
+        gpu: &Gpu,
+        tw: &Weights,
+        feed: Feed<'_, GlmArena>,
+        mode: WalkMode,
+        at: usize,
+    ) -> Result<usize, GpuError> {
         let layers = self.cfg.len();
         let Body {
-            shell: TierShell { hybrid, .. },
             dims,
             k,
-            branch,
             s,
             prompt,
             embd,
@@ -1000,9 +1048,7 @@ impl Body {
             wrote,
             ..
         } = self;
-        let nx = nextn
-            .as_deref_mut()
-            .ok_or_else(|| shape("a walk on a load without the NextN layer".to_string()))?;
+        let nx = layer(nextn)?;
         if mode == WalkMode::Graph {
             // Refused by name: the walk's host union call sits between its launches.
             return Err(shape(
@@ -1016,6 +1062,11 @@ impl Body {
         let m = feed.tokens.len();
         let pos0 = feed.pos0 as usize;
         refuse_rows::<Nextn>(WHAT, mode, m)?;
+        if at + m > WALK_ROWS {
+            return Err(shape(format!(
+                "{m} rows from row {at} of a walk of at most {WALK_ROWS} rows"
+            )));
+        }
         if pos0 + m > nx.ctx {
             return Err(shape(format!(
                 "{m} rows from position {pos0} in a store of {}",
@@ -1055,43 +1106,59 @@ impl Body {
         };
         let src = hidden_src(s, prompt, &nx.pair0, wrote, layers, want)?;
         let stream = gpu.stream();
-        let fault = gpu.layer_sink(nx.index)?;
-        let Nextn {
-            w,
-            names: nm,
-            latent,
-            index_rows,
-            pooled,
-            s: row,
-            a,
-            by_name,
-            head,
-            limit,
-            block,
-            block_ff,
-            bias,
-            held,
-            index,
-            ..
-        } = nx;
+        let Nextn { names, a, .. } = nx;
         // The rows' embeddings and positions.
         for t in 0..m {
             let p = u32::try_from(pos0 + t).expect("a walk's positions are under the store's rows");
-            let e = &mut a.e_host[t * n..(t + 1) * n];
+            let r = at + t;
+            let e = &mut a.e_host[r * n..(r + 1) * n];
             match feed.media.and_then(|rows| rows.row(p)) {
                 Some(row) => widen_bf16(row, e),
                 None => embd.row_into(feed.tokens[t], e)?,
             }
-            a.pos_host[t] = p;
-            a.cnt_host[t] = p + 1;
+            a.pos_host[r] = p;
+            a.cnt_host[r] = p + 1;
         }
-        span_mut(WHAT, &mut a.emb, 0, m * n)?.copy_from_host(stream, &a.e_host[..m * n])?;
-        span_mut(WHAT, &mut a.pos, 0, m)?.copy_from_host(stream, &a.pos_host[..m])?;
-        span_mut(WHAT, &mut a.cnt, 0, m)?.copy_from_host(stream, &a.cnt_host[..m])?;
-        enqueue_hidden(gpu, tw, &nm.output_norm, k, &d, feed.hidden, src, m, a)?;
+        let rows = at..at + m;
+        span_mut(WHAT, &mut a.emb, at * n, m * n)?
+            .copy_from_host(stream, &a.e_host[at * n..(at + m) * n])?;
+        span_mut(WHAT, &mut a.pos, at, m)?.copy_from_host(stream, &a.pos_host[rows.clone()])?;
+        span_mut(WHAT, &mut a.cnt, at, m)?.copy_from_host(stream, &a.cnt_host[rows])?;
+        enqueue_hidden(
+            gpu,
+            tw,
+            &names.output_norm,
+            k,
+            &d,
+            feed.hidden,
+            src,
+            (at, m),
+            a,
+        )?;
+        Ok(m)
+    }
+
+    /// The walk's row-wise launches over the arena's rows `0 .. rows`
+    /// ([`Body::nextn_stage`] staged them): each row's `[enorm(e) |
+    /// hnorm(h)]`, `eh_proj` over the columns, `attn_norm` and the joined
+    /// projection. Each row's values are its inputs' alone.
+    fn nextn_front(&mut self, gpu: &Gpu, rows: usize) -> Result<(), GpuError> {
+        let Body { dims, k, nextn, .. } = self;
+        let nx = layer(nextn)?;
+        let d = *dims;
+        let n = d.embd;
+        let stream = gpu.stream();
+        let Nextn {
+            w,
+            names: nm,
+            a,
+            by_name,
+            index,
+            ..
+        } = nx;
         // Each row's [enorm(e) | hnorm(h)], then eh_proj over the columns.
         let (enorm, hnorm) = (f32v(w, &nm.enorm)?, f32v(w, &nm.hnorm)?);
-        for t in 0..m {
+        for t in 0..rows {
             let e = span(WHAT, &a.emb, t * n, n)?;
             let h = span(WHAT, &a.hn, t * n, n)?;
             gpu.elem().enqueue_rms_norm(
@@ -1118,21 +1185,20 @@ impl Body {
             k,
             by_name,
             (w, &nm.eh, *index),
-            &*span(WHAT, &a.pack, 0, m * 2 * n)?,
-            m,
+            &*span(WHAT, &a.pack, 0, rows * 2 * n)?,
+            rows,
             Out::whole(&mut a.x),
         )?;
-        // The store: the joined projection's rows, the latent and index rows
-        // at the rows' positions, the pools they complete.
+        // The joined projection's rows, from which each row's latent and
+        // index rows are appended.
         let ln = &nm.latent;
-        let stride = d.stack();
         gpu.elem().enqueue_rms_norm(
             stream,
             &a.x,
             f32v(w, &ln.norm)?,
             d.rms_eps,
             n,
-            m,
+            rows,
             &mut a.xn,
         )?;
         project_joined(
@@ -1140,61 +1206,119 @@ impl Body {
             k,
             by_name,
             (w, &ln.stack, *index),
-            &*span(WHAT, &a.xn, 0, m * n)?,
-            m,
+            &*span(WHAT, &a.xn, 0, rows * n)?,
+            rows,
             &mut a.stack,
-        )?;
-        // From the first append on, rows from pos0 may be overwritten: a
-        // failure before the last leaves the store holding positions below
-        // pos0 alone.
+        )
+    }
+
+    /// The arena's rows `at .. at + m`, which [`Body::nextn_front`] ran,
+    /// appended to the live sequence's store at positions `pos0 ..`: the
+    /// latent and index rows and the pools they complete. From the first
+    /// append on, rows from `pos0` may be overwritten: a failure before the
+    /// last leaves the store holding positions below `pos0` alone.
+    fn nextn_append(
+        &mut self,
+        gpu: &Gpu,
+        (at, m): (usize, usize),
+        pos0: u32,
+    ) -> Result<(), GpuError> {
+        let Body { dims, k, nextn, .. } = self;
+        let nx = layer(nextn)?;
+        let d = *dims;
+        let stream = gpu.stream();
+        let fault = gpu.layer_sink(nx.index)?;
+        let Nextn {
+            w,
+            names: nm,
+            latent,
+            index_rows,
+            pooled,
+            a,
+            held,
+            ..
+        } = nx;
+        let ln = &nm.latent;
+        let stride = d.stack();
+        let pos0 = pos0 as usize;
         *held = (*held).min(pos0);
-        {
-            let rows = span(WHAT, &a.stack, 0, m * stride)?;
-            let pos = span(WHAT, &a.pos, 0, m)?;
-            k.latent.enqueue_latent_append(
-                stream,
-                LatentAppendArgs {
-                    rows: Rows {
-                        x: &rows,
-                        stride,
-                        m,
-                    },
-                    off: d.q_lora,
-                    gain: f32v(w, &ln.kv_a_norm)?,
-                    pos: &pos,
-                    eps: d.rms_eps,
-                    fault,
-                    cache: latent,
+        let rows = span(WHAT, &a.stack, at * stride, m * stride)?;
+        let pos = span(WHAT, &a.pos, at, m)?;
+        k.latent.enqueue_latent_append(
+            stream,
+            LatentAppendArgs {
+                rows: Rows {
+                    x: &rows,
+                    stride,
+                    m,
                 },
-            )?;
-            k.latent.enqueue_index_key_append(
-                stream,
-                IndexKeyArgs {
-                    rows: Rows {
-                        x: &rows,
-                        stride,
-                        m,
-                    },
-                    k_off: d.q_lora + LATENT,
-                    g_off: d.q_lora + LATENT + d.index_d,
-                    w: f32v(w, &ln.index_norm)?,
-                    b: f32v(w, &ln.index_norm_bias)?,
-                    pos: &pos,
-                    eps: d.norm_eps,
-                    fault,
-                    cache: index_rows,
+                off: d.q_lora,
+                gain: f32v(w, &ln.kv_a_norm)?,
+                pos: &pos,
+                eps: d.rms_eps,
+                fault,
+                cache: latent,
+            },
+        )?;
+        k.latent.enqueue_index_key_append(
+            stream,
+            IndexKeyArgs {
+                rows: Rows {
+                    x: &rows,
+                    stride,
+                    m,
                 },
-            )?;
-            let cnt = span(WHAT, &a.cnt, 0, m)?;
-            mla::pool(stream, w, k, &ln.sel, index_rows, &cnt, m, fault, pooled)?;
-        }
+                k_off: d.q_lora + LATENT,
+                g_off: d.q_lora + LATENT + d.index_d,
+                w: f32v(w, &ln.index_norm)?,
+                b: f32v(w, &ln.index_norm_bias)?,
+                pos: &pos,
+                eps: d.norm_eps,
+                fault,
+                cache: index_rows,
+            },
+        )?;
+        let cnt = span(WHAT, &a.cnt, at, m)?;
+        mla::pool(stream, w, k, &ln.sel, index_rows, &cnt, m, fault, pooled)?;
         *held = pos0 + m;
-        if mode == WalkMode::Store {
-            return Ok(());
-        }
-        // The full part, the last row alone.
-        let r = m - 1;
-        let p = u32::try_from(pos0 + r).expect("a walk's positions are under the store's rows");
+        Ok(())
+    }
+
+    /// The full part of the arena's row `r`, at position `p`, over the live
+    /// sequence's store (module doc): the latent mixer on the one-row
+    /// buffers, the residual, the routed block under the host's union call,
+    /// the shared head norm, and the head's projection and argmax.
+    fn nextn_full(&mut self, gpu: &Gpu, tw: &Weights, r: usize, p: u32) -> Result<(), GpuError> {
+        let Body {
+            shell: TierShell { hybrid, .. },
+            dims,
+            k,
+            branch,
+            nextn,
+            ..
+        } = self;
+        let nx = layer(nextn)?;
+        let d = *dims;
+        let n = d.embd;
+        let stream = gpu.stream();
+        let fault = gpu.layer_sink(nx.index)?;
+        let Nextn {
+            w,
+            names: nm,
+            latent,
+            index_rows,
+            pooled,
+            s: row,
+            a,
+            head,
+            limit,
+            block,
+            block_ff,
+            bias,
+            index,
+            ..
+        } = nx;
+        let ln = &nm.latent;
         row.x
             .copy_from_device_async(&*span(WHAT, &a.x, r * n, n)?, stream)?;
         row.pos.copy_from_host(stream, &[p])?;
@@ -1290,6 +1414,182 @@ impl Body {
     }
 }
 
+/// One sequence's rows of a store walk of several sequences' rows
+/// ([`SlotDraft::stage_store`]): the arena's rows `at .. at + m`, at
+/// positions `pos0 ..` of their sequence.
+#[derive(Clone, Copy, Debug)]
+pub struct NextnStore {
+    at: usize,
+    m: usize,
+    pos0: u32,
+}
+
+/// The NextN layer, refused by name on a load without it.
+fn layer(nextn: &mut Option<Box<Nextn>>) -> Result<&mut Nextn, GpuError> {
+    nextn
+        .as_deref_mut()
+        .ok_or_else(|| shape("a walk on a load without the NextN layer".to_string()))
+}
+
+/// The NextN walks of several resident sequences' rows (module doc): each
+/// sequence's rows staged at their own arena rows, the row-wise launches once
+/// over all of them ([`Body::nextn_front`]), each sequence's append and full
+/// part over its own store, and a round's proposals read back once. A
+/// proposal holds one id, so a round is one walk.
+impl SlotDraft<GlmArena> for Body {
+    type Program = Nextn;
+    const ROUND_PAIRS: usize = ROUND_PAIRS;
+
+    type StoreBlock<'f> = NextnStore;
+
+    fn stage_store<'f>(
+        &mut self,
+        gpu: &Gpu,
+        tw: &Weights,
+        feed: Feed<'f, GlmArena>,
+        head: DraftHead,
+        at: usize,
+    ) -> Result<NextnStore, GpuError> {
+        head.check_opened(WHAT, false)?;
+        let m = self.nextn_stage(gpu, tw, feed, WalkMode::Store, at)?;
+        Ok(NextnStore {
+            at,
+            m,
+            pos0: feed.pos0,
+        })
+    }
+
+    fn store_rows(
+        &mut self,
+        gpu: &Gpu,
+        _: &Weights,
+        _: &[u32],
+        blocks: &[NextnStore],
+    ) -> Result<(), GpuError> {
+        let rows = blocks.last().map_or(0, |b| b.at + b.m);
+        self.nextn_front(gpu, rows)
+    }
+
+    fn append_store(&mut self, gpu: &Gpu, _: &Weights, b: NextnStore) -> Result<(), GpuError> {
+        self.nextn_append(gpu, (b.at, b.m), b.pos0)
+    }
+
+    fn stage_chain(
+        &mut self,
+        gpu: &Gpu,
+        tw: &Weights,
+        refresh: Feed<'_, GlmArena>,
+        (own, head, mode): (usize, DraftHead, WalkMode),
+        (block, at, pair): (usize, usize, usize),
+    ) -> Result<ChainBlock, GpuError> {
+        check_chain(refresh, own, mode)?;
+        head.check_opened(WHAT, false)?;
+        if pair >= ROUND_PAIRS {
+            return Err(shape(format!(
+                "a chain's readback at pair {pair} of a round that reads back {ROUND_PAIRS}"
+            )));
+        }
+        let m = self.nextn_stage(gpu, tw, refresh, mode, at)?;
+        Ok(ChainBlock {
+            block,
+            at,
+            m,
+            pos0: refresh.pos0,
+            own,
+            pair,
+        })
+    }
+
+    /// Nothing: each sequence's rows went up as it was staged.
+    fn upload_chains(&mut self, _: &Gpu) -> Result<(), GpuError> {
+        Ok(())
+    }
+
+    fn chain_in(
+        &mut self,
+        gpu: &Gpu,
+        _: &Weights,
+        blocks: &[ChainBlock],
+        j: usize,
+    ) -> Result<(), GpuError> {
+        let rows = chain_rows(blocks, j).last().map_or(0, |(_, at, m)| at + m);
+        self.nextn_front(gpu, rows)
+    }
+
+    /// The block's append, then its last row's full part through the head,
+    /// whose argmax word is copied to the block's pair of the round's
+    /// readback.
+    fn attend(
+        &mut self,
+        gpu: &Gpu,
+        tw: &Weights,
+        b: &ChainBlock,
+        (at, m): (usize, usize),
+    ) -> Result<(), GpuError> {
+        self.nextn_append(gpu, (at, m), b.pos0)?;
+        let p = u32::try_from(b.end() - 1).expect("a walk's positions are under the store's rows");
+        self.nextn_full(gpu, tw, at + m - 1, p)?;
+        layer(&mut self.nextn)?.keep_words(gpu.stream(), (0, b.pair), 1)
+    }
+
+    /// The last head's fault word and site mask closing the round's
+    /// readback: the word is the card's own, so a fault any walk of the
+    /// round raised is on it.
+    fn chain_out(
+        &mut self,
+        gpu: &Gpu,
+        _: &Weights,
+        _: &[ChainBlock],
+        _: usize,
+        _: DraftHead,
+    ) -> Result<(), GpuError> {
+        layer(&mut self.nextn)?.keep_words(gpu.stream(), (1, ROUND_PAIRS), 2)
+    }
+
+    /// Nothing: the block's append left the store holding the sequence
+    /// through its refresh.
+    fn end_chain(&mut self, _: &ChainBlock) -> Result<(), GpuError> {
+        Ok(())
+    }
+
+    fn read_chains(&mut self, gpu: &Gpu, blocks: &[ChainBlock]) -> Result<Vec<Proposal>, GpuError> {
+        let ids = read_tokens(gpu, &layer(&mut self.nextn)?.a.round)?;
+        blocks
+            .iter()
+            .map(|b| {
+                let &t = ids
+                    .get(b.pair)
+                    .ok_or_else(|| shape(format!("pair {} of the round's readback", b.pair)))?;
+                Ok(Proposal {
+                    tokens: vec![t],
+                    p: Vec::new(),
+                })
+            })
+            .collect()
+    }
+}
+
+/// Refused by name before anything moves: a chain of own walks past its
+/// refresh (a proposal holds one id), media rows in the refresh, and a
+/// store walk's mode.
+fn check_chain(refresh: Feed<'_, GlmArena>, own: usize, mode: WalkMode) -> Result<(), GpuError> {
+    if own != 0 {
+        return Err(refuse_own(WHAT, &format!("a chain of {own} own walks")));
+    }
+    if refresh.media.is_some() {
+        return Err(shape(
+            "a chain whose refresh holds media rows: only a prompt call's walks read them"
+                .to_string(),
+        ));
+    }
+    if mode == WalkMode::Store {
+        return Err(shape(
+            "a chain in the store walk's mode: it reads the head".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// One NextN walk of `feed` into `head` in `mode`, with no readback
 /// ([`Body::nextn_run`]'s refusals, a poisoned model's, a row-list head — the
 /// load opens the full head alone — and the draft's own row, which this
@@ -1326,21 +1626,8 @@ pub fn nextn_chain(
     mode: WalkMode,
     out: &mut [u32],
 ) -> Result<usize, GpuError> {
-    if own != 0 {
-        return Err(refuse_own(WHAT, &format!("a chain of {own} own walks")));
-    }
     let refresh = refresh.target_rows(WHAT)?;
-    if refresh.media.is_some() {
-        return Err(shape(
-            "a chain whose refresh holds media rows: only a prompt call's walks read them"
-                .to_string(),
-        ));
-    }
-    if mode == WalkMode::Store {
-        return Err(shape(
-            "a chain in the store walk's mode: it reads the head".to_string(),
-        ));
-    }
+    check_chain(refresh, own, mode)?;
     let place = out
         .first_mut()
         .ok_or_else(|| shape("a proposal of 1 id into 0 places".to_string()))?;
@@ -1402,7 +1689,7 @@ pub fn nextn_hidden(
         &d,
         hidden,
         src,
-        rows,
+        (0, rows),
         &mut nx.a,
     )?;
     let mut v = nx.a.hn.to_host_vec(gpu.stream())?;

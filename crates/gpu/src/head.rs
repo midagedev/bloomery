@@ -807,7 +807,8 @@ impl Head {
 
     /// The readback words on the card: the `m` argmax tokens, then the fault
     /// words ([`Head::tokens`]). A step chained behind a run reads its token
-    /// from word 0.
+    /// from word 0; a round of several runs copies them on the stream into one
+    /// buffer of that layout and reads it back once ([`read_tokens`]).
     #[must_use]
     pub fn token_words(&self) -> &DeviceBuffer<u32> {
         &self.token_out
@@ -847,24 +848,32 @@ impl Head {
         Ok(token)
     }
 
-    /// The argmax tokens of the last run, one per row. Blocking read: the
-    /// engine stream waited for within [`crate::host::ENGINE_BOUND`]
-    /// ([`crate::host::await_done`], past it [`GpuError::Stalled`]), then
-    /// the words copied back; a raised fault is [`GpuError::Fault`], and a
-    /// readback no argmax ever wrote a state error, as [`Head::token`].
+    /// The argmax tokens of the last run, one per row ([`read_tokens`] of
+    /// [`Head::token_words`]).
     pub fn tokens(&self, gpu: &Gpu) -> Result<Vec<u32>, GpuError> {
-        let stream = gpu.stream();
-        crate::host::await_done("Head::tokens", || stream.query())?;
-        let mut out = self.token_out.to_host_vec(stream)?;
-        let (Some(sites), Some(word)) = (out.pop(), out.pop()) else {
-            return Err(GpuError::state(
-                "Head::tokens",
-                "the readback buffer holds no fault words",
-            ));
-        };
-        refuse_readback_fault(word, sites)?;
-        Ok(out)
+        read_tokens(gpu, &self.token_out)
     }
+}
+
+/// The tokens of `words`, a buffer laid out as a head's argmax words
+/// ([`Head::token_words`]): tokens, then the fault word and its site mask.
+/// Blocking read: the engine stream waited for within
+/// [`crate::host::ENGINE_BOUND`] ([`crate::host::await_done`], past it
+/// [`GpuError::Stalled`]), then the words copied back; a raised fault is
+/// [`GpuError::Fault`], and a readback no argmax ever wrote a state error,
+/// as [`Head::token`].
+pub fn read_tokens(gpu: &Gpu, words: &DeviceBuffer<u32>) -> Result<Vec<u32>, GpuError> {
+    let stream = gpu.stream();
+    crate::host::await_done("Head::tokens", || stream.query())?;
+    let mut out = words.to_host_vec(stream)?;
+    let (Some(sites), Some(word)) = (out.pop(), out.pop()) else {
+        return Err(GpuError::state(
+            "Head::tokens",
+            "the readback buffer holds no fault words",
+        ));
+    };
+    refuse_readback_fault(word, sites)?;
+    Ok(out)
 }
 
 impl Drop for Head {
