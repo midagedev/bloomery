@@ -92,8 +92,11 @@
 //! through [`Draft::held`], but every [`Rule::shadow_every`]th: that
 //! proposal runs as a shadow, scored against
 //! the target's own next tokens and never verified, keeping the calibration
-//! current so the chooser can open again. A proposal no row of which a pass
-//! verifies (a shadow, a cut to 0) is [`Draft::unproposed`].
+//! current so the chooser can open again. A prompt call on a closed gate
+//! drops the windows of the generations before it and runs its first
+//! [`Rule::min_timings`] passes as shadows, so the gate decides on that
+//! generation's own windows ([`Choosing::prompt_by`]). A proposal no row of
+//! which a pass verifies (a shadow, a cut to 0) is [`Draft::unproposed`].
 //!
 //! A round of several sequences' windows runs the widths [`Batch`] chooses
 //! for the whole round, priced by the round's rows and wall. Each window is
@@ -884,6 +887,9 @@ pub struct Choosing<D, C = Wall> {
     closed_period: u32,
     /// Closed plain passes since the last shadow.
     since_shadow: u32,
+    /// Shadows a request that began on a closed gate still owes before the
+    /// gate decides on its windows ([`Rule::min_timings`] of them).
+    opening: usize,
     passes: u64,
     /// The calibration `g_i`, one a proposal index.
     gains: Vec<f64>,
@@ -996,6 +1002,7 @@ where
             since_probe: 0,
             closed_period: rule.first_closed_probe(),
             since_shadow: 0,
+            opening: 0,
             passes: 0,
             gains: vec![1.0; D::WIDTH],
             batch_gains: vec![1.0; D::WIDTH],
@@ -1052,10 +1059,27 @@ impl<D, C: Clock> Choosing<D, C> {
     /// flight before it is read as a pass of this one. [`Draft::prompt`] is this call with the
     /// draft's own prompt; a call with another shape of prompt (a media prompt: the draft's
     /// prompt over the same ids with spans spliced in) goes through it, so the two have one owner.
+    ///
+    /// On a closed gate the generation is judged on its own windows: the earlier generations'
+    /// windows are dropped and its first [`Rule::min_timings`] passes run as shadows, the gate
+    /// deciding once they are in. A closed gate hears of a generation only through its shadows,
+    /// one in [`Rule::shadow_every`] passes, and would otherwise hold the windows of one that paid
+    /// less for as long as those take to age out.
     pub fn prompt_by<R>(&mut self, f: impl FnOnce(&mut D) -> R) -> R {
+        self.forget_pass();
+        if self.mode != Mode::Fixed && self.width == 0 && self.warm.is_empty() {
+            (self.recent_len, self.recent_at) = (0, 0);
+            self.opening = self.rule.min_timings;
+        }
+        f(&mut self.draft)
+    }
+
+    /// The pass in flight, a pending shadow and the round's acceptance forgotten, for a call of
+    /// the caller's own outside the chooser's passes (a row of a pass of several slots, a
+    /// closed generation): nothing outside the passes is read as one.
+    pub fn forget_pass(&mut self) {
         self.drop_flight();
         self.reset_batch();
-        f(&mut self.draft)
     }
 
     /// The chooser's mode.
@@ -1529,7 +1553,9 @@ impl<D, C: Clock> Choosing<D, C> {
         self.calibrate(n, j);
         if n == self.gains.len() {
             self.learn(n);
-            self.gate();
+            if self.opening == 0 {
+                self.gate();
+            }
         }
     }
 
@@ -1647,15 +1673,17 @@ where
             (None, false)
         };
         if forced == Some(0) || (forced.is_none() && self.width == 0) {
-            let shadow = forced.is_none() && {
-                self.since_shadow += 1;
-                self.since_shadow >= self.rule.shadow_every
-            };
+            let shadow = forced.is_none()
+                && (self.opening > 0 || {
+                    self.since_shadow += 1;
+                    self.since_shadow >= self.rule.shadow_every
+                });
             if !shadow {
                 self.draft.before_plain(t, last)?;
                 return Ok(self.plain(Kind::Step, pos, at, probe));
             }
             self.since_shadow = 0;
+            self.opening = self.opening.saturating_sub(1);
             let n = self
                 .draft
                 .propose_p(t, last, &mut self.ids[..room], &mut self.p)?;
@@ -2969,6 +2997,89 @@ mod tests {
         assert_eq!(r.choosing().width(), 3, "a decision before the readings");
         r.run(64);
         assert_eq!(r.choosing().width(), 1, "the winner did not take over");
+    }
+
+    /// A request whose prompt call finds the gate closed is judged on its own
+    /// windows: a draft that lost the last request closes, the next request's
+    /// draft keeps nearly every id, and the gate is open within the passes a
+    /// closed gate runs before its first shadow, not after the last request's
+    /// windows age out one shadow at a time.
+    #[test]
+    fn a_request_on_a_closed_gate_opens_on_its_own_windows() {
+        let rule = Rule::DEFAULT;
+        let mut r = Rig::with(
+            [0.20, 0.10, 0.05],
+            [0.3, 0.2, 0.1],
+            &LINEAR,
+            Mode::Cost,
+            rule,
+        );
+        r.run(400);
+        assert_eq!(r.choosing().width(), 0, "the losing draft did not close");
+        r.acc.set([0.95; 3]);
+        r.choosing().draft().p.set([0.95; 3]);
+        r.last = r.spec.prompt(&mut r.t, &[r.last]).unwrap();
+        let within = usize::try_from(rule.shadow_every).unwrap();
+        let opened = (1..=within).find(|_| {
+            r.run(1);
+            r.choosing().width() > 0
+        });
+        assert!(
+            opened.is_some(),
+            "the gate stayed closed {within} passes into a request that pays: {:?}",
+            r.choosing().gate_state()
+        );
+        assert!(
+            opened >= Some(rule.min_timings),
+            "the gate decided at pass {opened:?}, before the request's {} shadows",
+            rule.min_timings
+        );
+    }
+
+    /// A width-one draft reports certainty throughout: only acceptance changes
+    /// between requests, so reopening depends on calibrating the new request.
+    /// The kept gains adapt over a recent-window horizon at the shadow cadence.
+    #[test]
+    fn a_probability_one_request_reopens_on_its_own_windows() {
+        let rule = Rule::DEFAULT;
+        let mut r = PairRig::with(0.2, rule);
+        for _ in 0..400 {
+            r.pass();
+        }
+        assert_eq!(r.spec.draft().width(), 0, "the losing draft did not close");
+        let gain = r.spec.draft().gains()[0];
+        let draws = r.spec.draft().draft().draws;
+        r.acc.set(0.95);
+        r.last = r.spec.prompt(&mut r.t, &[r.last]).unwrap();
+        assert_eq!(
+            r.spec.draft().gains()[0],
+            gain,
+            "the prompt keeps calibration"
+        );
+        for _ in 0..rule.min_timings {
+            r.pass();
+        }
+        assert_eq!(
+            r.spec.draft().draft().draws - draws,
+            u64::try_from(rule.min_timings).unwrap(),
+            "the new request must supply every opening shadow"
+        );
+        assert!(
+            r.spec.draft().gains()[0] > gain,
+            "the new request's shadows must recalibrate the certainty draft"
+        );
+        let within = rule.recent() * usize::try_from(rule.shadow_every).unwrap();
+        let opened = (1..=within).find(|_| r.pass().0 > 0);
+        assert!(
+            opened.is_some(),
+            "the certainty draft stayed closed {within} passes into a request that pays: {:?}",
+            r.spec.draft_mut().gate_state()
+        );
+        assert_eq!(
+            r.spec.draft_mut().stats().unwrap().mean,
+            [1.0],
+            "the draft reports certainty before and after the prompt"
+        );
     }
 
     /// While closed the chooser shadows the draft's proposals: a shadow is
