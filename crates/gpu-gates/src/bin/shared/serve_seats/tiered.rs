@@ -586,6 +586,19 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
         },
     );
     let n = NonZeroUsize::new(slots).ok_or("--parallel 0: the server serves no slot")?;
+    // A folder's load reads its card's parts before its host set: the plan reserves the least of
+    // those reads on the host, read from the plan at the least context a seat asks (the most
+    // card tensors any context holds), so the NVMe expert tier's split leaves them room and the
+    // load holds the plan's need. A plan the floor cannot make is refused by the choice below.
+    #[cfg(feature = "checkpoint")]
+    if let Some(source) = &source
+        && let Ok(probe) =
+            inputs.plan_with_slots(&machine, workstation::PART_READ_CONTEXT, &plan_levers, n)
+    {
+        let in_place = bloomery_gpu::parts::InPlace::of(&split);
+        let reads = bloomery_gpu::parts::least_reads(source, &in_place, &probe, 0)?;
+        model::placement::workstation::reserve_part_reads(&mut machine, reads);
+    }
     // The context, then the plan of every slot around it (`choose_ctx`, every seat's): a tier
     // card, a second card, a context the card cannot hold, a host room that cannot hold the host
     // experts and a budget that binds are refused here by name, before any load; the load plans

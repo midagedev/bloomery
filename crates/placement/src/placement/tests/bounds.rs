@@ -1,6 +1,60 @@
 use super::*;
 
 #[test]
+fn a_part_read_probe_covers_short_contexts() {
+    use ctx_ask::{Ask, Limit, Probe, Steps};
+    use workstation::{HostNeed, PART_READ_CONTEXT, reserve_part_reads};
+
+    struct Kv;
+    impl KvBytes for Kv {
+        fn layer_bytes(&self, _: usize, ctx: u64) -> u64 {
+            ctx
+        }
+    }
+    let model = layered(1);
+    let mut machine = Machine {
+        cards: vec![bytes_card("stage", HEAD + 1024, 0..1)],
+        tiers: Vec::new(),
+        nodes: vec![Node {
+            host: host(),
+            unified: None,
+        }],
+    };
+    let levers = PlanLevers::default();
+    let large = plan_host_routed(&model, &machine, 4096, &Kv, &levers).expect("a raw plan");
+    assert!(ctx_ask::short_of(&large.violations()).is_some());
+    if let Ok(probe) = plan_host_routed(&model, &machine, PART_READ_CONTEXT, &Kv, &levers)
+        && probe.violations().is_empty()
+    {
+        let reads = probe.cards[0].dense_bytes;
+        reserve_part_reads(&mut machine, reads);
+    }
+    let chosen = ctx_ask::choose(
+        Ask::Set { total: 512 },
+        1,
+        Limit {
+            positions: 4096,
+            source: "trained",
+        },
+        Steps {
+            floor: 4096,
+            step: 1024,
+        },
+        |ctx| {
+            plan_host_routed(&model, &machine, ctx, &Kv, &levers).map(
+                |plan| match ctx_ask::short_of(&plan.violations()) {
+                    Some(short) => Probe::Short(short),
+                    None => Probe::Holds(plan),
+                },
+            )
+        },
+    )
+    .expect("an explicit short context fits below the default search floor");
+    assert_eq!(chosen.slot_ctx, 512);
+    assert_eq!(HostNeed::of(&chosen.plan, 0).read_ahead, HEAD);
+}
+
+#[test]
 fn a_node_host_projection_keeps_non_routed_rows_on_node_zero() {
     let model = layered(3);
     let machine = Machine {
@@ -940,13 +994,15 @@ fn a_held_card_plans_within_its_free_bytes() {
 /// lock moves the host set, the tables and the churn pool to the locked
 /// class and leaves the row cache and the run-ahead window in the page
 /// cache; a pinned arena moves from the anonymous class to the pinned one.
-/// A reserve with no class, a need whose OS reserve is not the host's and
-/// one whose reserves are under the host's own are refused by name.
+/// A folder's part reads are counted once, as its read-ahead (a need that
+/// also kept them among its reserves would put them in the run-ahead window
+/// too). A reserve with no class, a need whose OS reserve is not the host's
+/// and one whose reserves are under the host's own are refused by name.
 #[test]
 fn a_host_need_is_held_by_page_class() {
     use workstation::{
         CHECKPOINTS_RESERVE, HostNeed, Hosting, NeedClassError, NeedClasses, NeedTerm, OS_RESERVE,
-        POINT_ROWS_RESERVE, PageClass, TIER_BATCH_HOST_RESERVE,
+        PART_READS, POINT_ROWS_RESERVE, PageClass, TIER_BATCH_HOST_RESERVE,
     };
     let model = layered(3);
     let machine_with = |reserves: Vec<(String, u64)>| Machine {
@@ -1076,6 +1132,30 @@ fn a_host_need_is_held_by_page_class() {
     assert_eq!(
         HostNeed::of(&odd_plan, 0).classes(&odd_plan, loose),
         Err(NeedClassError::Reserve("a new reserve".to_string()))
+    );
+    // A folder's reserved part reads are the need's read-ahead, classed as a load's reads are.
+    let bare = machine_with(vec![(OS_RESERVE.to_string(), 100)]);
+    let folder = machine_with(vec![
+        (OS_RESERVE.to_string(), 100),
+        (PART_READS.to_string(), 17),
+    ]);
+    let bare_plan = plan_with(&model, &bare, 4096, &NoKv, None).expect("plans");
+    let folder_plan = plan_with(&model, &folder, 4096, &NoKv, None).expect("plans");
+    let reads = HostNeed::of(&folder_plan, 0);
+    assert_eq!(reads.read_ahead, 17);
+    let without = HostNeed::of(&bare_plan, 0)
+        .classes(&bare_plan, loose)
+        .expect("a plan's need");
+    let with = reads
+        .classes(&folder_plan, loose)
+        .expect("a folder plan's need");
+    assert_eq!(with.bytes(), reads.bytes());
+    assert_eq!(
+        with,
+        NeedClasses {
+            anon: without.anon + 17,
+            ..without
+        }
     );
     // A need that is not the plan's.
     let other_os = HostNeed { os: 1, ..need };

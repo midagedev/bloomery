@@ -2350,7 +2350,8 @@ pub trait PartsLoad: Send {
     fn load_whole(&self, stream: &CudaStream, card: CardOf<'_>) -> Result<Weights, GpuError>;
 
     /// The host admission and exact read peak to pass to load: the reads planned within the room
-    /// the need's other terms leave them, `extra` out ([`HostNeed::read_room`]).
+    /// the need's other terms leave them, `extra` out ([`HostNeed::read_room`]), in place of the
+    /// least reads the plan reserved (`workstation::PART_READS`).
     fn host_need(
         &self,
         plan: &Plan<'_>,
@@ -2360,6 +2361,7 @@ pub trait PartsLoad: Send {
     ) -> Result<(HostNeed, u64), GpuError> {
         let mut need = HostNeed::of(plan, extra);
         let peak = self.host_bytes(plan, card, need.read_room(available))?;
+        need.read_ahead = 0;
         if peak > 0 {
             let ring = crate::upload::UploadRing::HOST_MAX;
             need.read_ahead = peak.checked_sub(ring).ok_or_else(|| {

@@ -777,6 +777,8 @@ plan's stream: stderr in the server and stdout in the generation CLI.
 **When the host cannot hold its experts either.** A Qwen3.8, GLM-5.3, V4.1, MiniMax-M3, Muse Spark, Solar-Open2,
 Flint or Nemotron-H MoE plan whose host need passes the host's available RAM pages the overflow on the NVMe tier and
 serves it from a RAM arena filled from the file. MiMo's refuses that room by name: its host run attaches no tier.
+A checkpoint folder's plan counts the host bytes its load reads the card's parts in among its host terms (the
+`need` record's `bytes`), so the tier pages what they take instead of the load refusing the room.
 Who computes the arena's experts decides whether the tokens equal the all-RAM load's:
 - On an anonymous arena (`BLOOMERY_NVTIER_MEM=anon`, the default on a card with its own memory) the host computes
   them, and the tokens equal the all-RAM load's.

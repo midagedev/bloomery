@@ -245,6 +245,21 @@ fn read_staged<'s, 'p, S: Source + Sync>(
     }
 }
 
+/// The least host bytes a load of card `card` of `plan` reads from `source`, whose located header
+/// holds `in_place` where the folder stores it, beside the plan's own terms: its parts one at a
+/// time with the staging ring, the peak of [`PlacedSource`]'s read at no room. A plan reserves
+/// them before its NVMe split (`workstation::reserve_part_reads`); the card's parts, and so these
+/// bytes, are the same at every host room.
+pub fn least_reads<S: Source>(
+    source: &S,
+    in_place: &InPlace,
+    plan: &Plan<'_>,
+    card: usize,
+) -> Result<u64, GpuError> {
+    let on = OnCard::of_in_place(plan, card, in_place)?;
+    Ok(LoadPlan::reading(source, plan, &on, 0)?.host_bytes)
+}
+
 /// A placed source shares one admission and upload implementation across model components.
 pub(crate) struct PlacedSource<S> {
     pub(crate) source: S,
@@ -1639,5 +1654,122 @@ mod tests {
             OnCard::of_in_place(&plan, 0, &in_place).is_ok(),
             "a plan that pages stacks held in place"
         );
+    }
+
+    /// A folder's plan that pages experts holds its load's need: the plan reserves the least its
+    /// card's parts read ([`least_reads`] as `workstation::PART_READS`), the split keeps them
+    /// room, and at a 4 GiB room (an emulated small host, its experts in place on the host and
+    /// the NVMe tier, a dense head on the card) the load's need, its read-ahead counted at the
+    /// room it reads, is the plan's to the byte and within the room. The same plan made without
+    /// the reserve pages less and its load is short of the room by the reads. FAIL-first: the
+    /// plan's need left out the reads, so every paged folder load was refused ("part read-ahead").
+    #[test]
+    fn a_paged_folder_plan_holds_its_loads_reads() {
+        use model::placement::workstation::{self, HostNeed, HostRead};
+        use model::placement::{ModelTensors, PlanLevers, expert_nvme_tier, plan_host_routed};
+
+        use crate::model::PartsLoad;
+
+        // Twelve layers of 256 Q8_0 experts, 5.3 GB on the host; the head, 285 MB, on the card.
+        let (k, rows, experts, layers) = (640, 2560, 256, 12);
+        let stack = k * rows * experts / 32 * 34;
+        let head = ModelTensor {
+            name: "output.weight".into(),
+            shard: 0,
+            layer: None,
+            role: Role::Head,
+            ty: GgmlType::Q8_0,
+            dims: vec![4096, 65536],
+            file_bytes: 4096 * 65536 / 32 * 34,
+            gathered_rows: None,
+        };
+        let model = ModelTensors {
+            tensors: (0..layers)
+                .map(|l| ModelTensor {
+                    name: format!("layer.{l}.routed.weight"),
+                    shard: 0,
+                    layer: Some(l),
+                    role: Role::RoutedExperts,
+                    ty: GgmlType::Q8_0,
+                    dims: vec![k, rows, experts],
+                    file_bytes: stack,
+                    gathered_rows: None,
+                })
+                .chain([head.clone()])
+                .collect(),
+            layers,
+            experts,
+            experts_used: 2,
+            bf16_words: |_| false,
+        };
+        struct Head(TensorInfo);
+        impl Source for Head {
+            type Error = std::io::Error;
+            fn plan<E: std::fmt::Display>(
+                &self,
+                rule: impl Fn(&str, GgmlType, &[u64]) -> Result<Take, E>,
+            ) -> Result<Vec<Planned>, Self::Error> {
+                rule(&self.0.name, self.0.ty, &self.0.dims)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                Ok(vec![Planned {
+                    at: None,
+                    info: self.0.clone(),
+                }])
+            }
+            fn read_bytes(&self, p: &Planned) -> Result<u64, Self::Error> {
+                Ok(p.info.nbytes)
+            }
+            fn read(&self, _: &Planned) -> Result<model::part::Part<'_>, Self::Error> {
+                Err(std::io::Error::other("no read"))
+            }
+        }
+        let source = Head(TensorInfo {
+            name: head.name.clone(),
+            ty: head.ty,
+            dims: head.dims.clone(),
+            offset: 0,
+            nbytes: head.file_bytes,
+        });
+        let in_place = InPlace(
+            (0..layers)
+                .map(|l| {
+                    (
+                        format!("layer.{l}.routed.weight"),
+                        Held::Stack(experts as usize),
+                    )
+                })
+                .collect(),
+        );
+        let given = (4 << 30, HostRead::Given);
+        let split = |machine| {
+            let mut plan = plan_host_routed(&model, machine, 4096, &NoKv, &PlanLevers::default())
+                .expect("plans");
+            let room = plan.plan_at(&given);
+            expert_nvme_tier(&mut plan, room, None).expect("the split");
+            (plan, room)
+        };
+        let load = PlacedSource {
+            source,
+            in_place,
+            last: Mutex::default(),
+        };
+        let small = workstation::plan_on(workstation::A6000, layers);
+        let (bare, room) = split(&small);
+        assert!(bare.host.nvme_expert_bytes > 0, "the room pages experts");
+        let short = load.host_need(&bare, 0, 0, room).expect("the need").0;
+        let reads = least_reads(&load.source, &load.in_place, &bare, 0).expect("the least reads");
+        assert_eq!(reads, load.host_bytes(&bare, 0, 0).expect("the reads"));
+        assert!(HostNeed::of(&bare, 0).bytes() <= room);
+        assert!(short.bytes() > room, "{short:?} in a room of {room} B");
+        let mut machine = small.clone();
+        workstation::reserve_part_reads(&mut machine, reads);
+        let (plan, room) = split(&machine);
+        let planned = HostNeed::of(&plan, 0);
+        let (need, peak) = load.host_need(&plan, 0, 0, room).expect("the need");
+        assert_eq!(planned.read_ahead, reads);
+        assert_eq!(peak, reads);
+        assert_eq!(need.bytes(), planned.bytes());
+        assert!(need.bytes() <= room, "{need:?} in a room of {room} B");
+        assert!(plan.host.nvme_expert_bytes > bare.host.nvme_expert_bytes);
     }
 }

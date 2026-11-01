@@ -486,7 +486,7 @@ use model::arch::qwen35moe::place::{
 use model::placement::churn::ChurnPool;
 use model::placement::ctx_ask::{AUTO_MOST, DEFAULT_SLOTS, Rule, card_experts_floor, most_slots};
 use model::placement::workstation::{
-    CardSpec, HostNeed, HostRead, POINT_ROWS_RESERVE, host_available_read,
+    self, CardSpec, HostNeed, HostRead, POINT_ROWS_RESERVE, host_available_read,
 };
 use model::placement::{ArenaFloor, Machine, Plan, PlanLevers};
 use refset::arch::qwen4exp::VERIFIED_POSITIONS;
@@ -620,6 +620,10 @@ pub(crate) struct Place38 {
     /// The load is a media load (`--mmproj`): every sequence holds a rotation table of its own,
     /// which every machine of the placement counts ([`Place38::machine`]).
     media: bool,
+    /// The least host bytes a checkpoint folder's load reads before its host set
+    /// ([`Folder38::least_reads`]), which every machine of the placement reserves on the host
+    /// (`workstation::reserve_part_reads`); 0 for a file.
+    reads: u64,
 }
 
 impl Place38 {
@@ -630,6 +634,7 @@ impl Place38 {
         embedding: None,
         image: None,
         media: false,
+        reads: 0,
     };
 
     /// The seat's reading of a `--place` word: the shared grammar
@@ -667,6 +672,7 @@ impl Place38 {
             embedding: None,
             image: None,
             media: false,
+            reads: 0,
         }
     }
 
@@ -774,6 +780,9 @@ impl Place38 {
             ));
         }
         reserve_checkpoints(&mut machine, seqs38(inputs, slots), ctx)?;
+        if self.reads > 0 {
+            model::placement::workstation::reserve_part_reads(&mut machine, self.reads);
+        }
         if mtp.is_some() {
             let (gdn, qsa) = layer_counts(inputs);
             let bytes = point_row_budget38(gdn, qsa, ctx)?;
@@ -1941,7 +1950,30 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         embedding: side_seat.as_ref().and_then(|s| s.reserve),
         image: None,
         media: false,
+        reads: 0,
     };
+    // A folder's load reads its card's parts before its host set: every machine below reserves
+    // the least of those reads, read from the plans at the least context a seat asks with and
+    // without the draft (the most card tensors either holds), so the NVMe expert tier's split
+    // leaves them room and the load holds the plan's need. A plan the floor cannot make reads
+    // nothing here; the choices below refuse it by name.
+    if let Some(folder) = &folder {
+        let mut reads = 0;
+        for mtp in [None, mtp_inputs.as_ref()] {
+            if let Ok((_, least)) = a.place.machine_read(
+                &inputs,
+                (
+                    workstation::PART_READ_CONTEXT,
+                    workstation::PART_READ_CONTEXT,
+                ),
+                (experts, &plan_levers, mtp, slots),
+                |plan| folder.least_reads(plan, CARD38),
+            ) {
+                reads = reads.max(least?);
+            }
+        }
+        a.place.reads = reads;
+    }
     // What a default context leaves the unset residency, decided once for every plan below.
     let floor = default_floor(a.place, feed, experts, set);
     // Plan (b′)'s tier cards held too, and the room read again: every plan

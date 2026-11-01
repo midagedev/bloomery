@@ -121,7 +121,7 @@ use model::arch::Arch;
 use model::arch::nemotron_h::place as nemotron_place;
 use model::arch::nemotron_h_moe::place::{self as moe_place, Experts, PlanInputs};
 use model::placement::ctx_ask::{DEFAULT_SLOTS, probe_of};
-use model::placement::workstation::DeviceId;
+use model::placement::workstation::{self, DeviceId};
 use model::placement::{Machine, PlanLevers};
 use serve::{CacheNote, EngineProps, Saved, ServeError};
 use tokenizer::Tokenizer;
@@ -490,13 +490,28 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let placed = weights.is_folder()
         || (arch == Arch::NemotronHMoe
             && inputs.plan(&whole, SEAT_STEPS.floor, &plan_levers).is_err());
-    let (machine, experts) = if placed {
+    let (mut machine, experts) = if placed {
         let mut machine = place.machine_placed()?(layers);
         beside::reserve_on(&mut machine, held);
         (machine, Experts::Placed)
     } else {
         (whole, Experts::Card)
     };
+    // A folder's load reads its card's parts before its host set: the plan reserves the least of
+    // those reads on the host, read from the plan at the least context a seat asks (the most
+    // card tensors any context holds), so the NVMe expert tier's split leaves them room and the
+    // load holds the plan's need. A plan the floor cannot make is refused by the choice below.
+    if let Weights::Folder(f) = &weights
+        && let Ok(probe) = inputs.plan_with(
+            &machine,
+            workstation::PART_READ_CONTEXT,
+            &plan_levers,
+            experts,
+        )
+    {
+        let reads = folder::least_reads(f, &probe, 0)?;
+        workstation::reserve_part_reads(&mut machine, reads);
+    }
     // The context, then the plan around it (`choose_ctx`, every seat's): a
     // tier card, a second card, a context the card cannot hold and a budget
     // that binds are refused here by name, before any load.

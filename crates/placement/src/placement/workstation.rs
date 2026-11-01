@@ -187,6 +187,38 @@ pub const ROW_PAGE: u64 = 4096;
 /// process held when [`HOST_USABLE`] was measured.
 pub const OS_RESERVE: &str = "OS and other";
 
+/// What a host reserve set by [`reserve_part_reads`] is called: the least a
+/// load from a part source reads before its host set, its parts one at a
+/// time with the upload's staging ring. [`HostNeed`] counts it as the plan's
+/// [`HostNeed::read_ahead`], not among the reserves.
+pub const PART_READS: &str = "part read-ahead";
+
+/// The context used to bound a part source's card reads before choosing the serving context:
+/// the smallest nonzero slot share (`ctx_ask::choose`), which leaves the most parts on the card.
+/// An explicit context may be below the default context search's floor.
+pub const PART_READ_CONTEXT: u64 = 1;
+
+/// Set `bytes` aside on `machine`'s host as a part source's least reads
+/// ([`PART_READS`]), in place of any set before: a plan made on it counts
+/// them in its host need ([`HostNeed::read_ahead`]), so the NVMe expert
+/// tier's split ([`super::expert_nvme_tier`]) keeps them room and the load,
+/// which counts its own read-ahead at the room it reads, holds the plan's
+/// need. The caller reads `bytes` from the plan's card parts
+/// (`bloomery_gpu::parts::least_reads`), which no host term moves.
+pub fn reserve_part_reads(machine: &mut Machine, bytes: u64) {
+    machine
+        .host_mut()
+        .reserves
+        .retain(|(name, _)| name != PART_READS);
+    machine
+        .reserve(Reserve {
+            on: Device::Host,
+            name: PART_READS,
+            bytes,
+        })
+        .expect("a machine has a host");
+}
+
 /// The serving context the plans are made for.
 pub const CTX_MAX: u64 = 32_768;
 
@@ -1024,7 +1056,8 @@ pub struct HostNeed {
     pub reserves: u64,
     pub extra: u64,
     /// Owned part results and their concurrent read/normalization scratch during loading, never
-    /// held beside `extra`.
+    /// held beside `extra`: a plan's [`PART_READS`] reserve, the least a load from a part source
+    /// reads; a load's own read-ahead at the room it reads (`PartsLoad::host_need`).
     pub read_ahead: u64,
     /// The plan's NVMe expert tier arena (`HostTotals::nvme_arena_bytes`):
     /// the bytes the tier's slots fill beside these terms, anonymous or
@@ -1060,13 +1093,14 @@ impl HostNeed {
     /// the plan that carries them is built.
     #[must_use]
     pub fn of_totals(host: &Host, totals: &HostTotals, card_budget: bool, extra: u64) -> HostNeed {
+        let reads = named_reserve(host, PART_READS);
         HostNeed {
             experts: totals.expert_bytes,
             tables: totals.table_bytes,
             shadows: totals.shadow_bytes,
-            reserves: totals.reserve_bytes,
+            reserves: totals.reserve_bytes.saturating_sub(reads),
             extra,
-            read_ahead: 0,
+            read_ahead: reads,
             arena: totals.nvme_arena_bytes,
             cards: totals.pool_card_bytes,
             os: os_reserve(host),
@@ -1251,9 +1285,14 @@ impl ArenaGrant {
 
 /// The bytes of `host`'s reserves named [`OS_RESERVE`].
 fn os_reserve(host: &Host) -> u64 {
+    named_reserve(host, OS_RESERVE)
+}
+
+/// The bytes of `host`'s reserves called `name`.
+fn named_reserve(host: &Host, name: &str) -> u64 {
     host.reserves
         .iter()
-        .filter(|(name, _)| name == OS_RESERVE)
+        .filter(|(n, _)| n == name)
         .map(|(_, b)| b)
         .sum()
 }
@@ -1572,7 +1611,8 @@ impl HostNeed {
         let mut classes = NeedClasses::default();
         let mut add = |term: NeedTerm, bytes: u64| classes.add(term.class(how), bytes);
         let mut named: u128 = 0;
-        for (name, bytes) in &host.reserves {
+        // The part reads' reserve is the need's `read_ahead` ([`PART_READS`]), classed below.
+        for (name, bytes) in host.reserves.iter().filter(|(name, _)| name != PART_READS) {
             named += u128::from(*bytes);
             if let Some(term) = reserve_term(name)? {
                 add(term, *bytes);
