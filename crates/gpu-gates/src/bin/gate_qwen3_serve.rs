@@ -531,7 +531,7 @@ mod gate {
     use std::collections::BTreeMap;
     use std::num::NonZeroU64;
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Stdio};
+    use std::process::Command;
     use std::sync::{OnceLock, mpsc};
     use std::thread::JoinHandle;
     use std::time::Duration;
@@ -551,7 +551,7 @@ mod gate {
     use bloomery_gpu_gates::serve_client::{
         self, Answer, PrefixTurns, Served, WholeTerms, agree, answered, chat_is_those_ids, check,
         curl, edit_and_extension, greedy_chat, ids_of, json_of, metric, rendered, scripted_call,
-        serve_cmd, server_log, tokenized, whole_terms,
+        serve_cmd, server_log, sse_event, sse_events, tokenized, whole_terms,
     };
     use bloomery_gpu_gates::ubatch_pick;
     use bloomery_gpu_gates::vision_seat::{self, EncoderSeat};
@@ -1997,7 +1997,7 @@ mod gate {
     type StreamedRx = mpsc::Receiver<Result<Streamed, String>>;
 
     /// `/completion` of `ids` at temperature 0, streamed: a helper thread of
-    /// its own runs `curl -N` and reads the SSE lines as they land. The
+    /// its own runs [`curl`] and reads its SSE body ([`sse_events`]). The
     /// final event carries the tokens.
     fn streamed(
         addr: &str,
@@ -2019,52 +2019,17 @@ mod gate {
         let url = format!("http://{addr}/completion");
         let (h, _) = spawn_helper("slots-request", Placement::Float, move || {
             let run = (|| -> Result<Streamed, String> {
-                use std::io::{BufRead, BufReader, Write};
-                let mut child = Command::new("curl")
-                    .args([
-                        "-sS",
-                        "-N",
-                        "--max-time",
-                        "600",
-                        "-H",
-                        "Content-Type: application/json",
-                        "--data-binary",
-                        "@-",
-                    ])
-                    .arg(&url)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .map_err(|e| format!("curl {url}: {e}"))?;
-                let mut stdin = child
-                    .stdin
-                    .take()
-                    .ok_or_else(|| format!("curl {url}: no stdin"))?;
-                stdin
-                    .write_all(body.to_string().as_bytes())
-                    .map_err(|e| format!("curl {url}: {e}"))?;
-                drop(stdin);
-                let out = child
-                    .stdout
-                    .take()
-                    .ok_or_else(|| format!("curl {url}: no stdout"))?;
+                let (status, sse) =
+                    curl(&url, Some(&body), true).map_err(|e| format!("curl {url}: {e}"))?;
+                if status != 200 {
+                    return Err(format!("curl {url}: HTTP {status}: {sse}"));
+                }
                 let mut tokens = Vec::new();
-                for line in BufReader::new(out).lines() {
-                    let line = line.map_err(|e| format!("curl {url}: {e}"))?;
-                    let Some(v) = line
-                        .strip_prefix("data: ")
-                        .and_then(|d| serde_json::from_str::<Value>(d).ok())
-                    else {
-                        continue;
-                    };
+                for e in sse_events(&sse).map_err(|e| format!("curl {url}: {e}"))? {
+                    let v = sse_event(e).map_err(|e| format!("curl {url}: {e}"))?;
                     if v.get("tokens").is_some() {
                         tokens = ids_of(&v["tokens"]).map_err(|e| format!("curl {url}: {e}"))?;
                     }
-                }
-                let status = child.wait().map_err(|e| format!("curl {url}: {e}"))?;
-                if !status.success() {
-                    return Err(format!("curl {url}: {status}"));
                 }
                 Ok(Streamed { tokens })
             })();

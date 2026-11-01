@@ -543,8 +543,8 @@ mod gate {
     use bloomery_gpu_gates::record::{self, Fields, ReadError};
     use bloomery_gpu_gates::serve_client::{
         LookupCompletion, PrefixRestore, agree, curl, ids_of, json_of, metric, parse_ids,
-        prefix_restore, server_log, shared_system_prompt, slot_action, slot_erased,
-        stepped_completion, stop_of, tokenized,
+        prefix_restore, server_log, shared_system_prompt, slot_action, slot_erased, sse_event,
+        sse_events, stepped_completion, stop_of, tokenized,
     };
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
@@ -1956,7 +1956,7 @@ mod gate {
     }
 
     /// `/completion` of the streamed request `body`: a helper thread of its
-    /// own runs `curl -N` and reads the SSE lines as they land. The final
+    /// own runs [`curl`] and reads its SSE body ([`sse_events`]). The final
     /// event carries the tokens and the request's timings, its draft counts
     /// among them.
     fn streamed_with(addr: &str, body: Value) -> Result<(JoinHandle<()>, StreamedRx), GateError> {
@@ -1964,46 +1964,15 @@ mod gate {
         let url = format!("http://{addr}/completion");
         let (h, _) = spawn_helper("slots-request", Placement::Float, move || {
             let run = (|| -> Result<Streamed, String> {
-                use std::io::{BufRead, BufReader, Write};
-                let mut child = Command::new("curl")
-                    .args([
-                        "-sS",
-                        "-N",
-                        "--max-time",
-                        "600",
-                        "-H",
-                        "Content-Type: application/json",
-                        "--data-binary",
-                        "@-",
-                    ])
-                    .arg(&url)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .map_err(|e| format!("curl {url}: {e}"))?;
-                let mut stdin = child
-                    .stdin
-                    .take()
-                    .ok_or_else(|| format!("curl {url}: no stdin"))?;
-                stdin
-                    .write_all(body.to_string().as_bytes())
-                    .map_err(|e| format!("curl {url}: {e}"))?;
-                drop(stdin);
-                let out = child
-                    .stdout
-                    .take()
-                    .ok_or_else(|| format!("curl {url}: no stdout"))?;
+                let (status, sse) =
+                    curl(&url, Some(&body), true).map_err(|e| format!("curl {url}: {e}"))?;
+                if status != 200 {
+                    return Err(format!("curl {url}: HTTP {status}: {sse}"));
+                }
                 let mut tokens = Vec::new();
                 let mut drafts = (0, 0);
-                for line in BufReader::new(out).lines() {
-                    let line = line.map_err(|e| format!("curl {url}: {e}"))?;
-                    let Some(v) = line
-                        .strip_prefix("data: ")
-                        .and_then(|d| serde_json::from_str::<Value>(d).ok())
-                    else {
-                        continue;
-                    };
+                for e in sse_events(&sse).map_err(|e| format!("curl {url}: {e}"))? {
+                    let v = sse_event(e).map_err(|e| format!("curl {url}: {e}"))?;
                     if let (Some(n), Some(a)) = (
                         v["timings"]["draft_n"].as_u64(),
                         v["timings"]["draft_n_accepted"].as_u64(),
@@ -2013,10 +1982,6 @@ mod gate {
                     if v.get("tokens").is_some() {
                         tokens = ids_of(&v["tokens"]).map_err(|e| format!("curl {url}: {e}"))?;
                     }
-                }
-                let status = child.wait().map_err(|e| format!("curl {url}: {e}"))?;
-                if !status.success() {
-                    return Err(format!("curl {url}: {status}"));
                 }
                 Ok(Streamed { tokens, drafts })
             })();

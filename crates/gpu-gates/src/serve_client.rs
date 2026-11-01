@@ -234,7 +234,9 @@ pub fn server_log(err_log: &Path, kinds: &[&'static Kind]) -> Result<Log, GateEr
 }
 
 /// The JSON of a 200 response; any other status is an error naming it.
-/// A `/completion` answer must also hold a stop the server emits.
+/// `what` names the endpoint in the errors and selects one more check: when
+/// it is `"/completion"`, the answer must also hold a stop the server emits
+/// ([`stop_of`]).
 pub fn json_of(what: &str, status: u16, body: &str) -> Result<Value, GateError> {
     if status != 200 {
         return Err(format!("{what}: HTTP {status}: {body}").into());
@@ -242,6 +244,67 @@ pub fn json_of(what: &str, status: u16, body: &str) -> Result<Value, GateError> 
     let v: Value = serde_json::from_str(body).map_err(|e| format!("{what}: {e}: {body}"))?;
     if what == "/completion" {
         stop_of(&v)?;
+    }
+    Ok(v)
+}
+
+/// The string at `pointer` of a served answer, refused by name when the
+/// answer holds none there.
+pub fn string_at(what: &str, v: &Value, pointer: &str) -> Result<String, GateError> {
+    v.pointer(pointer)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{what}: no string at {pointer} in {v}").into())
+}
+
+/// The `data: ` payloads of an SSE body, its frames split at blank lines. A
+/// frame of any other shape is refused by name, never skipped.
+pub fn sse_events(sse: &str) -> Result<Vec<&str>, GateError> {
+    sse.split("\n\n")
+        .filter(|e| !e.trim().is_empty())
+        .map(|e| {
+            e.trim_start()
+                .strip_prefix("data: ")
+                .ok_or_else(|| format!("unreadable SSE frame {e:?}").into())
+        })
+        .collect()
+}
+
+/// One SSE payload other than `[DONE]` as JSON, refused by name when it is
+/// none. A native `/completion` stream's terminal event (`stop: true`) must
+/// also hold a stop the server emits, an event carrying `tokens` must be
+/// that terminal event, a chat chunk's every choice must hold a `delta`
+/// object whose `content` is absent, null or a string, and a payload with no
+/// `error`, `choices` or boolean `stop` is refused.
+pub fn sse_event(e: &str) -> Result<Value, GateError> {
+    const WHAT: &str = "unreadable SSE event";
+    let v = json_of(WHAT, 200, e)?;
+    let terminal = v["stop"].as_bool() == Some(true);
+    if v.get("tokens").is_some() && !terminal {
+        return Err(format!("{WHAT}: tokens without a terminal stop in {v}").into());
+    }
+    if terminal {
+        stop_of(&v)?;
+    }
+    if v.get("error").is_none() && v.get("choices").is_none() && v["stop"].as_bool().is_none() {
+        return Err(format!("{WHAT}: no error, chat choices or completion stop in {v}").into());
+    }
+    if let Some(choices) = v.get("choices") {
+        let choices = choices
+            .as_array()
+            .ok_or_else(|| format!("{WHAT}: no choices array in {v}"))?;
+        for choice in choices {
+            let delta = choice
+                .get("delta")
+                .and_then(Value::as_object)
+                .ok_or_else(|| format!("{WHAT}: no delta object in {v}"))?;
+            if !matches!(
+                delta.get("content"),
+                None | Some(Value::Null | Value::String(_))
+            ) {
+                return Err(format!("{WHAT}: delta.content is no string in {v}").into());
+            }
+        }
     }
     Ok(v)
 }
@@ -317,6 +380,9 @@ impl LookupCompletion {
             return Err("lookup completion: tokens is empty".into());
         }
         let stop = stop_of(answer).map_err(|e| format!("lookup completion: {e}"))?;
+        if stop == "reasoning_loop" {
+            return Err("lookup completion: stop_type is reasoning_loop".into());
+        }
         let slot = answer["id_slot"]
             .as_u64()
             .filter(|&n| n < slots)
@@ -810,14 +876,25 @@ fn cut_of(status: u16, body: &str, stream: bool) -> Cut {
         cut.error = format!("HTTP {status}: {body}");
         return cut;
     }
-    let events: Vec<Value> = if stream {
-        body.split("\n\n")
-            .filter_map(|e| e.strip_prefix("data: "))
-            .filter(|e| *e != "[DONE]")
-            .filter_map(|e| serde_json::from_str(e).ok())
-            .collect()
+    let read: Result<Vec<Value>, GateError> = if stream {
+        sse_events(body).and_then(|es| {
+            es.into_iter()
+                .filter(|e| *e != "[DONE]")
+                .map(sse_event)
+                .collect()
+        })
     } else {
-        serde_json::from_str(body).into_iter().collect()
+        json_of("/v1/chat/completions", status, body).and_then(|v| {
+            string_at("/v1/chat/completions", &v, "/choices/0/message/content")?;
+            Ok(vec![v])
+        })
+    };
+    let events = match read {
+        Ok(events) => events,
+        Err(e) => {
+            cut.error = format!("unreadable answer: {e}");
+            return cut;
+        }
     };
     for v in &events {
         if let Some(e) = v["error"]["message"].as_str() {
@@ -1446,8 +1523,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        LookupCompletion, agree, completion, curl, draft_counts, held_ms, ids_of, json_of,
-        slot_erased, stepped_completion, stop_of, together,
+        LookupCompletion, agree, completion, curl, cut_of, draft_counts, held_ms, ids_of, json_of,
+        slot_erased, sse_event, sse_events, stepped_completion, stop_of, together,
     };
     use serde_json::json;
 
@@ -1671,7 +1748,8 @@ mod tests {
             valid["stop_type"] = json!(stop);
             valid["id_slot"] = json!(1);
             valid["timings"] = json!({"cache_n": 0});
-            assert!(LookupCompletion::read(&valid, 2, 4096).is_ok());
+            let read = LookupCompletion::read(&valid, 2, 4096);
+            assert_eq!(read.is_ok(), stop != "reasoning_loop", "{stop}");
         }
     }
 
@@ -1719,6 +1797,96 @@ mod tests {
                 "{v}"
             );
         }
+    }
+
+    /// An SSE body is read frame by frame, each frame one `data: ` payload; a
+    /// frame or payload the readers cannot read is refused by name, and a chat
+    /// answer holding one is a [`cut_of`] error. Mutant: the old
+    /// `filter_map(strip_prefix)` and `from_str(..).ok()`, which skipped it.
+    #[test]
+    fn sse_readers_refuse_what_they_cannot_read() {
+        let chat = |t: &str| json!({"choices": [{"delta": {"content": t}}]});
+        let good = format!(
+            "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+            chat("a"),
+            chat("b")
+        );
+        assert_eq!(sse_events(&good).unwrap().len(), 3);
+        assert_eq!(cut_of(200, &good, true).content, "ab");
+        let native = r#"{"content":"","stop":true,"stop_type":"limit"}"#;
+        assert_eq!(sse_event(native).unwrap()["stop_type"], "limit");
+        let two_lines = format!("data: {}\ndata: {}\n\n", chat("a"), chat("b"));
+        for (body, error) in [
+            (format!("data:{}\n\n", chat("a")), "unreadable SSE frame"),
+            (
+                format!("event: x\ndata: {}\n\n", chat("a")),
+                "unreadable SSE frame",
+            ),
+            ("<html>".to_owned(), "unreadable SSE frame"),
+            ("data: {cut\n\n".to_owned(), "unreadable SSE event"),
+            (two_lines, "unreadable SSE event"),
+            ("data: {\"stop\":true}\n\n".to_owned(), "stop_type"),
+            (
+                format!(
+                    "data: {}\n\ndata: {{\"choices\":[{{\"delta\":{{\"content\":7}}}}]}}\n\ndata: {}\n\n",
+                    chat("a"),
+                    chat("b")
+                ),
+                "delta.content is no string",
+            ),
+            ("data: {\"choices\":[{}]}\n\n".to_owned(), "no delta object"),
+            (
+                format!(
+                    "data: {}\n\ndata: null\n\ndata: {}\n\n",
+                    chat("a"),
+                    chat("b")
+                ),
+                "no error, chat choices or completion stop",
+            ),
+            (
+                "data: {}\n\n".to_owned(),
+                "no error, chat choices or completion stop",
+            ),
+            (
+                "data: [1]\n\n".to_owned(),
+                "no error, chat choices or completion stop",
+            ),
+            (
+                "data: \"a\"\n\n".to_owned(),
+                "no error, chat choices or completion stop",
+            ),
+            (
+                "data: {\"tokens\":[5,6,7]}\n\n".to_owned(),
+                "tokens without a terminal stop",
+            ),
+            (
+                "data: {\"tokens\":[5,6,7],\"stop\":null}\n\n".to_owned(),
+                "tokens without a terminal stop",
+            ),
+            (
+                "data: {\"tokens\":[5,6,7],\"stop\":\"true\"}\n\n".to_owned(),
+                "tokens without a terminal stop",
+            ),
+        ] {
+            let read = sse_events(&body)
+                .and_then(|es| es.into_iter().try_for_each(|e| sse_event(e).map(drop)));
+            assert!(read.unwrap_err().to_string().contains(error), "{body}");
+            assert!(cut_of(200, &body, true).error.contains(error), "{body}");
+        }
+        assert!(
+            cut_of(200, "<html>", false)
+                .error
+                .contains("unreadable answer")
+        );
+        let numeric = json!({"choices": [{"finish_reason": "length", "message": {
+            "content": 7,
+            "tool_calls": [{"function": {"name": "get_weather", "arguments": "{"}}],
+        }}]});
+        assert!(
+            cut_of(200, &numeric.to_string(), false)
+                .error
+                .contains("no string at /choices/0/message/content")
+        );
     }
 
     #[test]
