@@ -185,7 +185,7 @@ impl HermesScan {
 }
 
 /// The first characters of `s`, for an error.
-fn quote(s: &str) -> String {
+pub(crate) fn quote(s: &str) -> String {
     s.chars().take(QUOTE).collect()
 }
 
