@@ -1999,17 +1999,14 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     if let Some(folder) = &folder {
         let mut reads = 0;
         for mtp in [None, mtp_inputs.as_ref()] {
-            if let Ok((_, least)) = a.place.machine_read(
-                &inputs,
-                (
-                    workstation::PART_READ_CONTEXT,
-                    workstation::PART_READ_CONTEXT,
-                ),
-                (experts, &plan_levers, mtp, slots),
-                |plan| folder.least_reads(plan, CARD38),
-            ) {
-                reads = reads.max(least?);
-            }
+            let least = workstation::least_part_reads(|ctx| {
+                let on = (experts, &plan_levers, mtp, slots);
+                let read = a.place.machine_read(&inputs, (ctx, ctx), on, |plan| {
+                    folder.least_reads(plan, CARD38)
+                });
+                read.ok().map(|(_, least)| least)
+            })?;
+            reads = reads.max(least.unwrap_or(0));
         }
         a.place.reads = reads;
     }

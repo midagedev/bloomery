@@ -502,14 +502,13 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // card tensors any context holds), so the NVMe expert tier's split leaves them room and the
     // load holds the plan's need. A plan the floor cannot make is refused by the choice below.
     if let Weights::Folder(f) = &weights
-        && let Ok(probe) = inputs.plan_with(
-            &machine,
-            workstation::PART_READ_CONTEXT,
-            &plan_levers,
-            experts,
-        )
+        && let Some(reads) = workstation::least_part_reads(|ctx| {
+            let probe = inputs
+                .plan_with(&machine, ctx, &plan_levers, experts)
+                .ok()?;
+            Some(folder::least_reads(&f.header, &f.source, &probe, 0))
+        })?
     {
-        let reads = folder::least_reads(f, &probe, 0)?;
         workstation::reserve_part_reads(&mut machine, reads);
     }
     // The context, then the plan around it (`choose_ctx`, every seat's): a

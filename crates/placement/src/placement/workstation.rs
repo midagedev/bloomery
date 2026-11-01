@@ -198,6 +198,19 @@ pub const PART_READS: &str = "part read-ahead";
 /// An explicit context may be below the default context search's floor.
 pub const PART_READ_CONTEXT: u64 = 1;
 
+/// The least host bytes a folder's load reads before its host set, its card's
+/// parts one at a time ([`PART_READS`]), as `reads_at` reads them of the plan
+/// a seat makes at [`PART_READ_CONTEXT`], the least context it asks (the most
+/// card tensors any context holds): `reads_at(ctx)` plans at `ctx` and reads
+/// that plan's parts, `None` where the plan is refused, which reads none here
+/// and which the seat's context choice then refuses by name. Every seat's
+/// probe; the caller sets the bytes aside ([`reserve_part_reads`]).
+pub fn least_part_reads<E>(
+    reads_at: impl FnOnce(u64) -> Option<Result<u64, E>>,
+) -> Result<Option<u64>, E> {
+    reads_at(PART_READ_CONTEXT).transpose()
+}
+
 /// Set `bytes` aside on `machine`'s host as a part source's least reads
 /// ([`PART_READS`]), in place of any set before: a plan made on it counts
 /// them in its host need ([`HostNeed::read_ahead`]), so the NVMe expert

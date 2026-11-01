@@ -654,11 +654,13 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
     // load holds the plan's need. A plan the floor cannot make is refused by the choice below.
     #[cfg(feature = "checkpoint")]
     if let Some(source) = &source
-        && let Ok(probe) =
-            inputs.plan_with_slots(&machine, workstation::PART_READ_CONTEXT, &plan_levers, n)
+        && let Some(reads) = workstation::least_part_reads(|ctx| {
+            let probe = inputs
+                .plan_with_slots(&machine, ctx, &plan_levers, n)
+                .ok()?;
+            Some(super::folder::least_reads(&split, source, &probe, 0))
+        })?
     {
-        let in_place = bloomery_gpu::parts::InPlace::of(&split);
-        let reads = bloomery_gpu::parts::least_reads(source, &in_place, &probe, 0)?;
         workstation::reserve_part_reads(&mut machine, reads);
     }
     // A load that streams pins the stream's lane staging for its life: its plan reserves it on
