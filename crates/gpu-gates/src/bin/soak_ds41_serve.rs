@@ -467,10 +467,20 @@ mod soak {
     }
 
     fn sse_errors(sse: &str) -> Result<u64, GateError> {
-        Ok(events(sse)?
-            .iter()
-            .filter(|e| serde_json::from_str::<Value>(e).is_ok_and(|v| v.get("error").is_some()))
-            .count() as u64)
+        let chunks = events(sse)?;
+        let mut errors = 0;
+        for e in &chunks {
+            if *e == "[DONE]" {
+                continue;
+            }
+            let v: Value = serde_json::from_str(e)
+                .map_err(|err| format!("unreadable SSE event {e:?}: {err}"))?;
+            errors += u64::from(v.get("error").is_some());
+        }
+        if errors == 0 && !chunks.contains(&"[DONE]") {
+            return Err(format!("stream has no [DONE]: {sse:?}").into());
+        }
+        Ok(errors)
     }
 
     /// Refuses by name a request that would pass the position cap: the mix
@@ -610,7 +620,10 @@ mod soak {
             });
             self.c.n.generations += 1;
             let kind = if stream { "fresh-stream" } else { "fresh" };
-            self.c.send(kind, "/completion", Some(&body), stream)?;
+            let reply = self.c.send(kind, "/completion", Some(&body), stream)?;
+            if !stream {
+                served("/completion", reply)?;
+            }
             Ok(())
         }
 
@@ -1436,8 +1449,16 @@ mod soak {
 
     #[cfg(test)]
     mod tests {
-        use super::{GateError, served, sse_errors, streamed_text, string_at};
+        use super::{
+            Client, Conversation, Corpus, Counts, GateError, Mix, Rng, served, sse_errors,
+            streamed_text, string_at,
+        };
         use serde_json::json;
+        use std::fs::OpenOptions;
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+        use threads::helper::{Placement, spawn_helper};
 
         fn refused<T: std::fmt::Debug>(r: Result<T, GateError>) -> String {
             r.expect_err("refused").to_string()
@@ -1471,9 +1492,11 @@ mod soak {
             );
             let delta = |t: &str| json!({"choices": [{"delta": {"content": t}}]});
             let sse = format!(
-                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                json!({"choices": [{"delta": {"role": "assistant"}}]}),
                 delta("a"),
-                delta("b")
+                delta("b"),
+                json!({"choices": [{"delta": {"content": null}}]})
             );
             assert_eq!(streamed_text(&sse).unwrap(), "ab");
             for prefix in ["data:", "data", "event: message\ndata:", "garbage: "] {
@@ -1491,6 +1514,9 @@ mod soak {
             assert!(
                 refused(streamed_text(&format!("data: {}\n\n", delta("a")))).contains("no [DONE]")
             );
+            assert!(refused(sse_errors("data: {cut\n\n")).contains("unreadable SSE event"));
+            assert!(refused(sse_errors("data: {}\n\n")).contains("no [DONE]"));
+            assert!(refused(sse_errors("")).contains("no [DONE]"));
             assert_eq!(sse_errors(&sse).unwrap(), 0);
             assert_eq!(sse_errors("data: {\"error\": \"failed\"}\n\n").unwrap(), 1);
             let seven = r#"data: {"choices":[{"delta":{"content":7}}]}"#;
@@ -1500,6 +1526,82 @@ mod soak {
             );
             let bare = "data: {\"choices\":[{}]}\n\ndata: [DONE]\n\n";
             assert!(refused(streamed_text(bare)).contains("no delta"));
+
+            for (stream, body, error, errors) in [
+                (false, "<html>", Some("/completion"), 0),
+                (false, r#"{"tokens":[1]}"#, Some("stop_type"), 0),
+                (false, r#"{"tokens":[1],"stop_type":"limit"}"#, None, 0),
+                (true, "data: {cut\n\n", Some("unreadable SSE event"), 0),
+                (true, "data: {}\n\n", Some("no [DONE]"), 0),
+                (true, "data: {}\n\ndata: [DONE]\n\n", None, 0),
+                (true, "data: {\"error\":\"failed\"}\n\n", None, 1),
+            ] {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap();
+                let (peer, _) = spawn_helper("soak-reader-response", Placement::Float, move || {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    socket
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut request = BufReader::new(&mut socket);
+                    let mut line = String::new();
+                    request.read_line(&mut line).unwrap();
+                    assert!(line.starts_with("POST /completion HTTP/"), "{line}");
+                    let mut length = 0;
+                    loop {
+                        line.clear();
+                        assert!(request.read_line(&mut line).unwrap() > 0);
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some(n) = line.strip_prefix("Content-Length: ") {
+                            length = n.trim().parse().unwrap();
+                        }
+                    }
+                    request.read_exact(&mut vec![0; length]).unwrap();
+                    write!(
+                        socket,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                })
+                .unwrap();
+                let mut mix = Mix {
+                    c: Client {
+                        base: format!("http://{addr}"),
+                        t0: Instant::now(),
+                        log: OpenOptions::new().write(true).open("/dev/null").unwrap(),
+                        n: Counts::default(),
+                    },
+                    rng: Rng(1),
+                    corpus: Corpus {
+                        prose: vec![],
+                        code: vec![1, 2],
+                    },
+                    conv: Conversation {
+                        messages: vec![],
+                        held: 0,
+                    },
+                    probe: None,
+                    probes: 0,
+                    probes_equal: 0,
+                    light_next: 0,
+                };
+                let result = mix.fresh(1, stream, (0.0, 1));
+                peer.join().unwrap();
+                if let Some(name) = error {
+                    assert!(refused(result).contains(name), "{body}");
+                } else {
+                    result.unwrap();
+                }
+                assert_eq!(mix.c.n.requests, 1);
+                assert_eq!(
+                    mix.c.n.transport + mix.c.n.other_status + mix.c.n.server_5xx,
+                    0
+                );
+                assert_eq!(mix.c.n.sse_errors, errors);
+            }
         }
     }
 }
