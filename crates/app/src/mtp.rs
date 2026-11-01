@@ -734,6 +734,15 @@ impl<B: MtpBody> Session<B> {
 }
 
 impl<B: MtpBody> MtpDraft<B> {
+    /// Preserve the prompt's waiting row before another resident sequence
+    /// can overwrite its shared arena. The target is never run again.
+    pub fn retain_prompt(&mut self, t: &mut Session<B>) -> Result<(), SessionError> {
+        let pos = t.pos();
+        Ok(self.policy.retain_prompt(pos, |walk, first, pos| {
+            B::retain_prompt_row(t.model_mut(), walk, first, pos)
+        })?)
+    }
+
     /// Feed prompt positions without requesting the target's head.
     pub fn prefill(&mut self, t: &mut Session<B>, ids: &[u32]) -> Result<(), SessionError> {
         let path = self.path;
@@ -926,15 +935,6 @@ impl<B: MtpBody + Slots> MtpDraft<B>
 where
     B::Seq: 'static,
 {
-    /// Preserve the prompt's waiting row before another resident sequence
-    /// can overwrite its shared arena. The target is never run again.
-    pub fn retain_prompt(&mut self, t: &mut Session<B>) -> Result<(), SessionError> {
-        let pos = t.pos();
-        Ok(self.policy.retain_prompt(pos, |walk, first, pos| {
-            B::retain_prompt_row(t.model_mut(), walk, first, pos)
-        })?)
-    }
-
     /// [`MtpDraft::before_step`] on the session's selected slot, its walk
     /// gathered into `walks` when it reads the slot's own step or verify
     /// arena. Shared prompt rows are walked immediately, before a slot
