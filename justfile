@@ -96,7 +96,7 @@ mac-test:
 # selects it. The mutants step runs every registered instance's mutants in one process under one bound; 2026-10-27 it
 # took 945 s on an M1 Pro (16-core GPU) at two instances and 220 mutants, over the 900 s default, so it runs at 1800.
 lab-metal:
-    cargo test -p bloomery-metal --lib && cargo test -p bloomery-metal --features pipeline-scan --bin metal_scan && cargo test -p bloomery-metal --bin metal_attention_time --bin generate_metal && cargo build --release -p bloomery-metal --bin gate_metal_device --bin gate_metal_qwen35moe_kernels && ./tools/mac-gate.sh gate_metal_device && ./tools/mac-gate.sh gate_metal_qwen35moe_kernels && BLOOMERY_GATE_BOUND=1800 ./tools/mac-gate.sh gate_metal_qwen35moe_kernels --mutants-all
+    cargo test -p bloomery-metal --lib && cargo test -p bloomery-metal --features pipeline-scan --bin metal_scan && cargo test -p bloomery-metal --bin metal_attention_time --bin metal_gemm_time --bin generate_metal && cargo build --release -p bloomery-metal --bin gate_metal_device --bin gate_metal_qwen35moe_kernels && ./tools/mac-gate.sh gate_metal_device && ./tools/mac-gate.sh gate_metal_qwen35moe_kernels && BLOOMERY_GATE_BOUND=1800 ./tools/mac-gate.sh gate_metal_qwen35moe_kernels --mutants-all
 
 # The Metal session's e2e gate on an Apple Silicon Mac, run by tools/mac-gate.sh over six rows (`--row`): the qwen35moe
 # MLX split, then the qwen3moe MLX split (attention layers only, no shared expert, no recurrent store; the clauses that
