@@ -45,8 +45,9 @@
 # file that is no scan or trace); 1 a build or a run failed (named, with its log); 64 usage; 78 not an Apple Silicon Mac.
 # A trace compare has its own codes (metal_scan --compare-trace), shown in the summary line as `trace depth ... rc`: 0 identical,
 # 6 identical up to buffer numbering (a binding names its buffer by allocation order, so a change that allocates one more buffer
-# shifts every later id; the compare renumbers each side by first use and finds the same program: the pairs are printed), 3 differ,
-# 2 refused. The run's codes above do not change: a trace rc 6 counts as identical, and the summary line keeps the 6.
+# shifts every later id; the compare renumbers each side by first use and finds the same binding pattern: the pairs are printed), 3
+# differ, 2 refused. A trace rc 6 counts as a difference for the run's code: the trace holds no identity of a buffer but its order,
+# so a swap of two buffers' roles at every use also renumbers the same; the summary line keeps the 6 for the reader.
 # Runs no gate and takes no lock: it opens this Mac's GPU, which nothing it does changes.
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -304,8 +305,8 @@ case $pipe_rc in
   3 | 4 | 5) rc=$pipe_rc ;;
   *) die 1 "metal_scan --compare ended rc $pipe_rc" ;;
 esac
-# a trace rc 6 is the same program under another buffer numbering (metal_scan --compare-trace): identical for this run's code
-trace_differs() { [ "$1" != 0 ] && [ "$1" != 6 ]; }
+# a trace rc 6 (the same binding pattern under another buffer numbering) is a diagnostic: it differs for this run's code
+trace_differs() { [ "$1" != 0 ]; }
 if trace_differs "$t0_rc" || trace_differs "$t6_rc" || [ "$ids_differ" != 0 ]; then
   case $rc in 0 | 3) rc=3 ;; *) ;; esac
 fi

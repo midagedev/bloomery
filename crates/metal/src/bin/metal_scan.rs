@@ -97,9 +97,12 @@
 //! When the lines differ, each side's buffer ids are renumbered by first use
 //! (the first buffer a binding names is buffer 0, the next new one buffer 1)
 //! and the traces compared again with every other field as text: equal
-//! renumbered traces are one program under a bijection of the two sides'
-//! buffers (exit 6, the pairs printed), anything else is a real difference
-//! (exit 3, the first differing event printed with both sides' raw lines).
+//! renumbered traces bind their slots in the same pattern under a bijection of
+//! the two sides' buffers (exit 6, the pairs printed), anything else is a real
+//! difference (exit 3, the first differing event printed with both sides' raw
+//! lines). Exit 6 is a diagnostic, not a proof: a trace names a buffer by its
+//! allocation order only, so two buffers of one length whose roles are
+//! swapped at every use renumber the same.
 
 use std::process::ExitCode;
 
@@ -1640,10 +1643,8 @@ mod compare {
             dispatches(&b),
             buffers(&b)
         );
-        let Some(raw_at) = first_difference(&a, &b) else {
-            println!("identical");
-            return 0;
-        };
+        // Every line is read before any verdict, so two equal traces with a
+        // line this cannot read are refused, not identical.
         let (ra, rb) = match (renumber(&a), renumber(&b)) {
             (Ok(ra), Ok(rb)) => (ra, rb),
             (ra, rb) => {
@@ -1654,6 +1655,10 @@ mod compare {
                 }
                 return 2;
             }
+        };
+        let Some(raw_at) = first_difference(&a, &b) else {
+            println!("identical");
+            return 0;
         };
         let Some(at) = first_difference(&ra.lines, &rb.lines) else {
             let moved: Vec<String> = ra
@@ -2211,16 +2216,8 @@ mod compare {
         /// A scan row of a pipeline whose archive is `slice`, with the text column.
         #[cfg(target_os = "macos")]
         fn row_of_v3(slice: &[u8]) -> String {
-            use gguf::digest::sha256_hex;
-            let exec = crate::macho::exec(slice).expect("a slice the scan reads");
             let text = crate::macho::text(slice).expect("a slice the scan reads");
-            format!(
-                "main\tp\t-\ty\t{}\t{}\t{}\t0\t1024\t32\t0\t{}\t{text}",
-                sha256_hex(slice),
-                sha256_hex(slice),
-                slice.len(),
-                exec.sha256
-            )
+            format!("{}\t{text}", row_of(slice))
         }
 
         #[cfg(target_os = "macos")]
@@ -2402,6 +2399,7 @@ mod compare {
             for bind in unreadable {
                 let head = program(&[bind]);
                 assert_eq!(trace_rc(&base, &head), 2, "{bind}");
+                assert_eq!(trace_rc(&head, &head), 2, "{bind}");
                 assert!(
                     renumber(&head)
                         .err()
