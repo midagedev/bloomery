@@ -95,17 +95,24 @@
 //!   2) and this server's is 1: the group the body holds after the open (`Body::prefill_group`),
 //!   not the one the seat was asked for. FAIL-first: a seat that does not set the body's group
 //!   after the capture leaves it at the 1 the load made, and the default server's record reads 1.
-//! - `slots_keep_their_own_rows`: prompt P and an unrelated prompt Q each take a slot (`id_slot`
-//!   differs); P plus its answer then returns to its slot keeping all but its last id
-//!   (`timings.cache_n`) and answers the ids an uncached request answers. FAIL-first: a seat whose
-//!   select exchanges nothing (`Slots::swap_seq`) lets Q write over P's rows and the continuation's
-//!   ids differ.
-//! - `slot_file_restores_equal_bits`: a prompt on a slot, its state saved to a file, that slot
-//!   erased and the file restored into the other slot (`n_restored` the positions saved; the other
-//!   slot holds other prompts' rows), then the prompt plus its answer, which that other slot takes
-//!   (`id_slot`), keeps all but its last id and answers an uncached request's ids. FAIL-first: a
-//!   save that leaves a layer's rows out restores stale rows into the other slot and the ids
-//!   differ.
+//! - `slots_keep_their_own_rows`: prompt P, then P plus its answer on P's slot with no request
+//!   between (the truth), then an unrelated prompt Q on the other slot (`id_slot` differs); P plus
+//!   its answer then returns to its slot keeping all but its last id (`timings.cache_n`) and
+//!   answers the truth's ids, which the same calls over the same rows write bit for bit. FAIL-first:
+//!   a seat whose select exchanges nothing (`Slots::swap_seq`) lets Q write over P's rows and the
+//!   continuation's ids differ.
+//! - `slot_file_restores_equal_bits`: a prompt on a slot, its state saved to a file, the prompt
+//!   plus its answer on that slot (the truth: the rows the file holds, then the same calls), that
+//!   slot erased and the file restored into the other slot (`n_restored` the positions saved; the
+//!   other slot holds other prompts' rows), then the prompt plus its answer, which that other slot
+//!   takes (`id_slot`), keeps all but its last id and answers the truth's ids. FAIL-first: a save
+//!   that leaves a layer's rows out restores stale rows into the other slot and the ids differ.
+//!
+//! Both clauses also run the continuation uncached and, in the real tier, want its ids. The prompt
+//! batch is the steps' within a band and not bit for bit (`gate_mistrallarge4_prefill`), so an
+//! uncached request writes other bits than the steps that answered before it; the real file's
+//! top-1 margins hold its greedy ids over that band, and the fixture's near ties do not, so the
+//! fixture tier prints those ids and judges the truth's alone.
 //! - `tool_calls_follow_the_template` (`Tag::FileBound`: the file's template teaches the markup
 //!   and its model writes it): a chat request with a `get_weather` tool is a 200 whose `finish_reason`
 //!   is `tool_calls` with one `get_weather` call whose `city` argument is a string. FAIL-first: a
@@ -783,8 +790,12 @@ mod gate {
     }
 
     /// `slots_keep_their_own_rows` and `slot_file_restores_equal_bits` (the module header), on the
-    /// server of two slots at `url`.
-    fn slot_clauses(url: &dyn Fn(&str) -> String, dir: &Path) -> Result<bool, GateError> {
+    /// server of two slots at `url`; `real` judges the uncached ids as well.
+    fn slot_clauses(
+        url: &dyn Fn(&str) -> String,
+        dir: &Path,
+        real: bool,
+    ) -> Result<bool, GateError> {
         let mut ok = true;
         let (p, q, r) = (
             tokenized(url, P_TEXT)?,
@@ -793,32 +804,47 @@ mod gate {
         );
         unrelated(&[p.as_slice(), q.as_slice(), r.as_slice()])?;
         let d = dir.join("two-slots");
-        // P, then Q on the other slot, then P plus its answer back on its own slot.
+        // P, then P plus its answer on its slot with nothing between (the truth), then Q on the
+        // other slot, then P plus its answer back on its own slot.
         let (a1, v1) = greedy(url, p.clone(), N, &d, "slot_p", true)?;
-        let (_, v2) = greedy(url, q, N, &d, "slot_q", true)?;
         let cont: Vec<u32> = p.iter().chain(&a1.tokens).copied().collect();
+        let kept = (cont.len() - 1) as u64;
+        let (alone, va) = greedy(url, cont.clone(), N, &d, "slot_p_alone", true)?;
+        let (_, v2) = greedy(url, q, N, &d, "slot_q", true)?;
         let (back, vb) = greedy(url, cont.clone(), N, &d, "slot_p_back", true)?;
         let (fresh, _) = greedy(url, cont.clone(), N, &d, "slot_p_fresh", false)?;
         let apart = slot_of(&v1)? != slot_of(&v2)?;
-        let returned = slot_of(&vb)? == slot_of(&v1)?
-            && back.cache_n == (cont.len() - 1) as u64
-            && back.tokens == fresh.tokens;
+        let returned = slot_of(&va)? == slot_of(&v1)?
+            && alone.cache_n == kept
+            && slot_of(&vb)? == slot_of(&v1)?
+            && back.cache_n == kept
+            && back.tokens == alone.tokens;
+        let uncached = back.tokens == fresh.tokens;
         println!(
             "slots: P on slot {} and Q on slot {} apart {apart}; P back on slot {} kept {} of {} ids, \
-             ids {:?} against the uncached {:?} {returned}",
+             ids {:?} against the truth's {:?} (P plus its answer before Q, kept {}) {returned}; the \
+             uncached {:?} {uncached}{}",
             slot_of(&v1)?,
             slot_of(&v2)?,
             slot_of(&vb)?,
             back.cache_n,
             cont.len(),
             back.tokens,
-            fresh.tokens
+            alone.tokens,
+            alone.cache_n,
+            fresh.tokens,
+            judged(real)
         );
-        check(&mut ok, "slots_keep_their_own_rows", apart && returned);
+        check(
+            &mut ok,
+            "slots_keep_their_own_rows",
+            apart && returned && (uncached || !real),
+        );
 
-        // R on a slot, its state saved, that slot erased, the file restored into the other slot
-        // (which holds other prompts' rows, so a restore that wrote none reads as other ids), then R
-        // plus its answer, which the slot with the restored state takes.
+        // R on a slot, its state saved, R plus its answer on that slot (the truth), that slot
+        // erased, the file restored into the other slot (which holds other prompts' rows, so a
+        // restore that wrote none reads as other ids), then R plus its answer, which the slot with
+        // the restored state takes.
         let (g, vr) = greedy(url, r.clone(), N, &d, "file_r", true)?;
         let slot = slot_of(&vr)?;
         if slot > 1 {
@@ -826,32 +852,55 @@ mod gate {
         }
         let other = u64::from(slot == 0);
         let file = json!({ "filename": SLOT_FILE });
+        let cont: Vec<u32> = r.iter().chain(&g.tokens).copied().collect();
+        let positions = (cont.len() - 1) as u64;
         let (st_save, saved) = slot_action(url, slot, "save", &file)?;
+        let (alone, va) = greedy(url, cont.clone(), N, &d, "file_r_alone", true)?;
         let (st_erase, _) = slot_action(url, slot, "erase", &json!({}))?;
         let (st_restore, restored) = slot_action(url, other, "restore", &file)?;
-        let cont: Vec<u32> = r.iter().chain(&g.tokens).copied().collect();
         let (back, vback) = greedy(url, cont.clone(), N, &d, "file_r_back", true)?;
         let (fresh, _) = greedy(url, cont.clone(), N, &d, "file_r_fresh", false)?;
-        let positions = (cont.len() - 1) as u64;
         let held = st_save == 200
             && saved["n_saved"] == json!(positions)
+            && slot_of(&va)? == slot
+            && alone.cache_n == positions
             && st_erase == 200
             && st_restore == 200
             && restored["n_restored"] == json!(positions)
             && restored["n_read"] == saved["n_written"]
             && slot_of(&vback)? == other
             && back.cache_n == positions
-            && back.tokens == fresh.tokens;
+            && back.tokens == alone.tokens;
+        let uncached = back.tokens == fresh.tokens;
         println!(
             "slot file: {positions} positions saved from slot {slot} and restored into slot {other}; \
-             the continuation on slot {} kept {} ids with {:?} against the uncached {:?} {held}",
+             the continuation on slot {} kept {} ids with {:?} against the truth's {:?} (on slot {} \
+             before the erase, kept {}) {held}; the uncached {:?} {uncached}{}",
             slot_of(&vback)?,
             back.cache_n,
             back.tokens,
-            fresh.tokens
+            alone.tokens,
+            slot_of(&va)?,
+            alone.cache_n,
+            fresh.tokens,
+            judged(real)
         );
-        check(&mut ok, "slot_file_restores_equal_bits", held);
+        check(
+            &mut ok,
+            "slot_file_restores_equal_bits",
+            held && (uncached || !real),
+        );
         Ok(ok)
+    }
+
+    /// How a slot clause's line names the uncached comparison: judged in the real tier, printed in
+    /// the fixture tier (the module header).
+    fn judged(real: bool) -> &'static str {
+        if real {
+            ""
+        } else {
+            " (printed, not judged: the fixture's near ties part the ids under the batch's band)"
+        }
     }
 
     /// `tool_calls_follow_the_template` (the module header).
@@ -955,7 +1004,7 @@ mod gate {
         let url = |p: &str| format!("http://{addr}{p}");
         ok &= two_slots_load(c, &err_log)?;
         ok &= prefill_group_is_honoured(c, dir, &err_log)?;
-        ok &= slot_clauses(&url, dir)?;
+        ok &= slot_clauses(&url, dir, tier::Tier::from_env()? == tier::Tier::Real)?;
         ok &= tool_calls_follow_the_template(&url, dir)?;
         if mmproj.is_some() {
             ok &= image_request_is_served(c, &url, &err_log)?;

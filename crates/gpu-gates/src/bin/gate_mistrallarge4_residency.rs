@@ -31,8 +31,9 @@
 //! - `residency_started`: the `off` load runs no machine and no source; the `mid` load runs a machine whose source holds
 //!   parts for every layer the plan gives a card expert and whose seed of each layer is the plan's card experts less the
 //!   spares, in id order (mutant: `resid::spec` dropping the lever);
-//! - `residency_passes`: the history's boundaries end none, the prompt call (0 rows kept) and each step (1 kept) (mutant: a
-//!   prompt call ending as a step's kind);
+//! - `residency_passes`: a `mid` history's boundaries end none, the prompt call (0 rows kept) and each step (1 kept) (mutant: a
+//!   prompt call ending as a step's kind); an `off` history (arm `bp` on the fixture's plan) ends no boundary, its load
+//!   running no machine though the gate's log is armed (mutant: the machine-less glue logging a boundary);
 //! - `residency_c1`: the history twice gives the same tokens, logits bits and flips, and in the real tier flips land (the
 //!   fixture's routing has no skew, so none need) (mutant: a reset that keeps the rule's heat; real tier);
 //! - `residency_c7`: the reset brings every seed layer's live set back to its seed, its diff 0, and lets go of no host byte
@@ -562,9 +563,10 @@ mod gate {
             return Err(checks_failed());
         }
         println!(
-            "PASSED: {NAME} the unset word is a mid word on each serving plan and off beside a fixed placement and the step feed, a \
-             load under it runs a machine seeded by the plan and decodes the off load's ids (or parts at a near tie), its \
-             boundaries end none, the prompt call and each step, the history repeats bit for bit and the reset restores the \
+            "PASSED: {NAME} the unset word is a mid word on each serving plan that holds host experts (off on one that holds \
+             none) and off beside a fixed placement and the step feed, a mid load runs a machine seeded by the plan and decodes \
+             the off load's ids (or parts at a near tie), its boundaries end none, the prompt call and each step (an off load's \
+             none), the history repeats bit for bit and the reset restores the \
              seed, the expert tier's slot map stays, and the windows' tier census records count the steps' picks"
         );
         Ok(())
@@ -644,6 +646,18 @@ mod gate {
         Ok((pass, off))
     }
 
+    /// `residency_passes` of an `off` history: its load runs no machine (`ResidencyGlue::off`, whose boundary calls do
+    /// nothing), so the log [`open`] armed holds no boundary.
+    fn no_passes(passes: &[(PassKind, usize)]) -> bool {
+        let none = passes.is_empty();
+        println!(
+            "passes: an off load runs no machine, so its history ends no boundary: {} boundaries, same {none}: {}",
+            passes.len(),
+            verdict(none)
+        );
+        none
+    }
+
     /// Arm `bp` (module doc): the load under the word the rule gives the plan with an expert tier card: `mid` where the plan
     /// holds host experts, else `off` (the fixture's plan), whose load runs no machine.
     fn arm_bp(
@@ -690,7 +704,11 @@ mod gate {
         pass &= ids_ok;
 
         tier::sc("residency_passes")?;
-        pass &= passes_clause(&r.passes, STEPS);
+        pass &= if mid {
+            passes_clause(&r.passes, STEPS)
+        } else {
+            no_passes(&r.passes)
+        };
         tier::sc("residency_hit_record")?;
         pass &= hit_record(&format!("bp_{name}_d6"), &r, routed.len(), mid, share);
 
