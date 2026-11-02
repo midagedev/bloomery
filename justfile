@@ -195,9 +195,9 @@ lab-metal-e2e:
 # serializes each into a binary archive and hashes it (what the device compiler makes of each kernel, one row per pipeline), and
 # `generate_metal --encode-trace` writes every dispatch, binding, `setBytes` value, barrier and commit/wait/event at depth ~0 and at depth 600.
 # Prints both tables (`metal_scan --compare`, `--compare-trace`: the first differing dispatch). Exit 0 only when every pipeline hash, both
-# traces (equal after numbering each side's buffers by first use counts) and the generated ids are identical; 3 something existing
-# moved or a trace differs, 4 a pipeline was removed, 5 both, 6 only pipelines were added, 2 a side refused by name (no instrument and
-# none applies), 1 a build or run failed. A side older than the commit
+# traces and the generated ids are identical; 3 something existing moved or a trace differs (a trace equal only after numbering each
+# side's buffers by first use is said so, and still differs), 4 a pipeline was removed, 5 both, 6 only pipelines were added, 2 a side
+# refused by name (no instrument and none applies), 1 a build or run failed. A side older than the commit
 # that added the instrument gets it laid over. Runs no gate and takes no lock; the owner is tools/metal-compare.sh.
 [arg("HEAD", long="head")]
 [arg("HERE", long="here")]
