@@ -250,7 +250,7 @@ release or commit it was measured on; 0.3.11's own rows, Qwen3.8-27B's among the
 
 **DGX Spark (GB10, 128 GB)**, measured by [@juliankang4](https://github.com/juliankang4) on their own machine at
 `TBD-SITTING` (commit): NVIDIA's FP4-Local and NVFP4 folders as downloaded and Unsloth's GGUFs with their MTP drafts, the serving defaults, 512 and 4,096-id prompts
-(code and English prose), 128 greedy tokens, median of three rounds. Earlier Spark rows are in
+(code, English prose and Korean prose), 128 greedy tokens, median of three rounds. Earlier Spark rows are in
 [`docs/numbers.md`](docs/numbers.md#dgx-spark-qwen38-flash-next-on-the-fp4-local-and-nvfp4-folders-0310).
 
 | Model | Prefill tok/s, 512 / 4,096 ids | Decode tok/s, 512 / 4,096 ids | Time to first token, 512 / 4,096 ids |
@@ -261,7 +261,7 @@ release or commit it was measured on; 0.3.11's own rows, Qwen3.8-27B's among the
 | Qwen3.6-35B-A3B `UD-Q4_K_M`, MTP on | TBD-SITTING | TBD-SITTING | TBD-SITTING |
 
 **RTX 5090 32 GB**, measured by [@juliankang4](https://github.com/juliankang4) on native Linux at `TBD-SITTING`
-(commit), one request at a time at the serving defaults, 512 and 4,096-id prompts, 128 greedy tokens, median of three rounds.
+(commit), one request at a time at the serving defaults, 512 and 4,096-id prompts (code, English prose and Korean prose), 128 greedy tokens, median of three rounds.
 Earlier RTX 5090 rows are in [`docs/numbers.md`](docs/numbers.md#rtx-5090-qwen36-35b-a3b-with-its-mtp-draft-by-juliankang4).
 
 | Model | Prefill tok/s, 512 / 4,096 ids | Decode tok/s, 512 / 4,096 ids | Time to first token, 512 / 4,096 ids |
