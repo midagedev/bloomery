@@ -33,6 +33,7 @@ use super::clauses_experts::{
     N_EXPERTS, PAIR_COLS, PairIn, PairWeights, launch_pair, synthetic_norm, synthetic_pair_for,
 };
 use super::clauses_rows::same_bits;
+use super::clauses_synth::gain;
 use super::common::{self, BadArg, LAYER};
 use super::oracle;
 use super::synthetic;
@@ -426,14 +427,6 @@ fn x_rows(rows: usize, cols: usize, seed: u64) -> Vec<f32> {
     out
 }
 
-/// A positive synthetic gain, as the other synthetic clauses take.
-fn gain(cols: usize, seed: u64) -> Vec<f32> {
-    oracle::activations(cols, seed, 0.5)
-        .iter()
-        .map(|g| 1.0 + g.abs())
-        .collect()
-}
-
 /// Activation row `at`'s outputs against the 1-row kernel's on that row's
 /// input alone: every word the same bits.
 fn row_diff(got: &[f32], want: &[f32], at: usize) -> Result<(), String> {
@@ -632,26 +625,9 @@ fn pair_row(
         h,
         PairIn {
             x: &x[row * cols..(row + 1) * cols],
-            ..pair_in_of(launch)
+            ..*launch
         },
     )
-}
-
-/// A copy of `launch`'s borrowed fields, for the struct update syntax.
-fn pair_in_of<'a>(launch: &PairIn<'a>) -> PairIn<'a> {
-    PairIn {
-        quant: launch.quant,
-        shared_quant: launch.shared_quant,
-        n_experts: launch.n_experts,
-        ids: launch.ids,
-        gate: launch.gate,
-        up: launch.up,
-        shared_gate: launch.shared_gate,
-        shared_up: launch.shared_up,
-        x: launch.x,
-        norm: launch.norm,
-        y0: launch.y0,
-    }
 }
 
 /// The hand-on of one stream row by the 1-row launch, the step's own: the
@@ -953,7 +929,7 @@ pub fn pair_scaled(h: &Harness<'_>) -> Clause {
     bad_ids[bad_slot] = N_EXPERTS as i32;
     let bad_launch = PairIn {
         ids: &bad_ids,
-        ..pair_in_of(&launch)
+        ..launch
     };
     let x = x_rows(M, cols, 0x522E);
     let xn = hand_on_rows(h, &x, cols, &norm.gain)?;

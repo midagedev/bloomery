@@ -57,15 +57,23 @@ pub struct SegParams<'w> {
 
 /// One segment, as the kernel's argument block holds it.
 #[derive(Clone, Copy)]
-struct SegArg {
+pub(super) struct SegArg {
     /// The segment's output rows.
-    rows: u32,
+    pub(super) rows: u32,
     /// The segment's first row's block offset in the weights.
-    weight_blocks: u32,
+    pub(super) weight_blocks: u32,
     /// The segment's first row's element offset in the output.
-    out: u32,
+    pub(super) out: u32,
     /// The first threadgroup of the segment.
-    first_group: u32,
+    pub(super) first_group: u32,
+}
+
+impl SegArg {
+    /// The segment's four words of the argument block, in the order the
+    /// kernel reads them.
+    pub(super) fn words(self) -> [u32; 4] {
+        [self.rows, self.weight_blocks, self.out, self.first_group]
+    }
 }
 
 /// The shape of a segmented launch, once its windows were checked against it.
@@ -209,13 +217,7 @@ fn args_words(shape: &Shape, layer: u32, eps: f32) -> [u32; 4 + 4 * MAX_SEGMENTS
     words[1] = layer;
     words[2] = eps.to_bits();
     words[3] = shape.nseg;
-    for (i, s) in shape.segments.iter().enumerate() {
-        let at = 4 + 4 * i;
-        words[at] = s.rows;
-        words[at + 1] = s.weight_blocks;
-        words[at + 2] = s.out;
-        words[at + 3] = s.first_group;
-    }
+    words[4..].copy_from_slice(shape.segments.map(SegArg::words).as_flattened());
     words
 }
 

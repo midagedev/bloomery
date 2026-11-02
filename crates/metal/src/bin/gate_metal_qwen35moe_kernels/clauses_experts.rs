@@ -410,6 +410,7 @@ pub fn fold_weights_for(
     Ok(weights)
 }
 
+#[derive(Clone, Copy)]
 pub struct PairIn<'a> {
     pub quant: Quant,
     /// The type of the shared gate and up: `quant`, or the second of a pair

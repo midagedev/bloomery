@@ -148,7 +148,11 @@ fn refuse_fold(detail: impl Into<String>) -> DeviceError {
     super::range(FOLD, detail)
 }
 
-fn refuse_slots(g: &ExpertsGeom, what: &'static str, slots: usize) -> Result<(), DeviceError> {
+pub(super) fn refuse_slots(
+    g: &ExpertsGeom,
+    what: &'static str,
+    slots: usize,
+) -> Result<(), DeviceError> {
     if slots == g.slots {
         return Ok(());
     }
@@ -158,7 +162,7 @@ fn refuse_slots(g: &ExpertsGeom, what: &'static str, slots: usize) -> Result<(),
     ))
 }
 
-fn refuse_k(g: &ExpertsGeom, what: &'static str, k: usize) -> Result<(), DeviceError> {
+pub(super) fn refuse_k(g: &ExpertsGeom, what: &'static str, k: usize) -> Result<(), DeviceError> {
     if k == g.k {
         return Ok(());
     }
@@ -168,14 +172,14 @@ fn refuse_k(g: &ExpertsGeom, what: &'static str, k: usize) -> Result<(), DeviceE
     ))
 }
 
-fn refuse_stack(what: &'static str, n_experts: usize) -> Result<(), DeviceError> {
+pub(super) fn refuse_stack(what: &'static str, n_experts: usize) -> Result<(), DeviceError> {
     if n_experts == 0 {
         return Err(super::range(what, "the expert stack is empty"));
     }
     Ok(())
 }
 
-fn refuse_ids(what: &'static str, ids: Elems) -> Result<(), DeviceError> {
+pub(super) fn refuse_ids(what: &'static str, ids: Elems) -> Result<(), DeviceError> {
     if ids.get() == 0 {
         return Err(super::range(what, "the id list is empty"));
     }

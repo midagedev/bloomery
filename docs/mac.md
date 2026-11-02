@@ -132,7 +132,7 @@ pass's wall beside the step's, and under `cost` the chooser's gate (`draft_gate`
 `draft_a`, `draft_rates`), development-loop numbers. A pass that verifies no proposal is a host-fed step, so no token a
 chained step ran ahead is dropped by a verify that follows. With `--profile [N]` the run adds the verify's own profile:
 `vprof` lines (each group of N two-row verifies on a command buffer of its own, GPU time and bytes, `--profile-layers`
-a layer each), `vtimes` lines (N verifies as the session runs them, a command buffer a layer: the buffers, the host's
+a layer each), `vtimes` lines (N verifies as the session runs them, one command buffer per verify: the buffers, the host's
 waits, the GPU's gaps between buffers and the wall split by what ran in it) and one `vcompare` line.
 
 To learn whether a model opens before it loads: `generate_metal [-m PATH | --hf REPO] --plan [--ctx C]` reads only the

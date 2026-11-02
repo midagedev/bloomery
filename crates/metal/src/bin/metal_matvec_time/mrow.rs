@@ -39,8 +39,8 @@ use bloomery_metal::kernels::{
 };
 
 use super::{
-    Arm, Run, WARMUPS, arms_of, dispatch_count, heat_of, print_fail, print_row, spread,
-    time_dispatches,
+    Run, WARMUPS, arms_of, dispatch_count, heat_of, print_fail, print_row, spread, time_dispatches,
+    window_arm,
 };
 
 /// The 27B's residual width, dense FFN width and vocabulary.
@@ -314,15 +314,16 @@ pub(super) fn main(run: &Run) -> ExitCode {
                 }
             }
         }
-        if let Some(fault) = device
-            .fault_word()
-            .read(device.stream())
-            .map_err(why)
-            .ok()
-            .flatten()
-        {
-            println!("mrow {label}: FAIL (a kernel raised {fault})");
-            failed = true;
+        match device.fault_word().read(device.stream()).map_err(why) {
+            Ok(None) => {}
+            Ok(Some(fault)) => {
+                println!("mrow {label}: FAIL (a kernel raised {fault})");
+                failed = true;
+            }
+            Err(e) => {
+                println!("mrow {label}: FAIL (the fault word: {e})");
+                failed = true;
+            }
         }
     }
 
@@ -723,15 +724,6 @@ fn pair_halves<'w>(w: &Weights<'w>) -> Result<(Weights<'w>, Weights<'w>), String
         w.sub(Elems(0), Elems(half)).map_err(|e| e.to_string())?,
         w.sub(Elems(half), Elems(half)).map_err(|e| e.to_string())?,
     ))
-}
-
-fn window_arm() -> Arm {
-    Arm {
-        name: "window",
-        dispatches: None,
-        concurrent: false,
-        barrier: false,
-    }
 }
 
 #[cfg(test)]

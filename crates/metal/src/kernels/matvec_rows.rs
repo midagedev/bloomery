@@ -31,7 +31,7 @@ use crate::library::{Library, Pipeline};
 
 use super::head::{HEAD_SIMD_GROUPS, HEAD_THREADS, MAX_ROWS};
 use super::matvec::{LoadNorm, Quant};
-use super::seg::Segment;
+use super::seg::{SegArg, Segment};
 use super::{Kernels, MAX_SEGMENTS, args_bytes, check_weights_align, check_window_len, pack, word};
 
 pub use crate::geometry::MROWS;
@@ -297,15 +297,6 @@ fn check_matvec(
     })
 }
 
-/// One segment, as the kernel's argument block holds it.
-#[derive(Clone, Copy)]
-struct SegArg {
-    rows: u32,
-    weight_blocks: u32,
-    out: u32,
-    first_group: u32,
-}
-
 struct SegMShape {
     nblocks: u32,
     segments: [SegArg; MAX_SEGMENTS],
@@ -435,13 +426,7 @@ fn seg_m_args(shape: &SegMShape, layer: u32, eps: f32) -> [u32; 5 + 4 * MAX_SEGM
     words[2] = eps.to_bits();
     words[3] = shape.nseg;
     words[4] = shape.out_end;
-    for (i, s) in shape.segments.iter().enumerate() {
-        let at = 5 + 4 * i;
-        words[at] = s.rows;
-        words[at + 1] = s.weight_blocks;
-        words[at + 2] = s.out;
-        words[at + 3] = s.first_group;
-    }
+    words[5..].copy_from_slice(shape.segments.map(SegArg::words).as_flattened());
     words
 }
 
@@ -480,24 +465,10 @@ fn check_pair(
             ),
         ));
     }
-    if p.slots != g.slots {
-        return Err(refuse(
-            PAIR,
-            format!("a launch runs {} slots, not {}", g.slots, p.slots),
-        ));
-    }
-    if p.k != g.k {
-        return Err(refuse(
-            PAIR,
-            format!("the expert width is {}, not {}", p.k, g.k),
-        ));
-    }
-    if p.n_experts == 0 {
-        return Err(refuse(PAIR, "the expert stack is empty"));
-    }
-    if p.ids.len().get() == 0 {
-        return Err(refuse(PAIR, "the id list is empty"));
-    }
+    super::experts::refuse_slots(g, PAIR, p.slots)?;
+    super::experts::refuse_k(g, PAIR, p.k)?;
+    super::experts::refuse_stack(PAIR, p.n_experts)?;
+    super::experts::refuse_ids(PAIR, p.ids.len())?;
     if p.out_stride < g.k {
         return Err(refuse(PAIR, "the slot outputs overlap"));
     }

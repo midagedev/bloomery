@@ -33,7 +33,12 @@
 //!   walls it reads), over 64 tokens pick the plain greedy run's ids; the
 //!   scripted draft drives both commits and the steps between them, and the
 //!   lookup's accept counts and the passes the cost gate ran closed are
-//!   printed.
+//!   printed. A run of the loop both share (`greedy_with`) whose budget falls
+//!   between the two rows of a pass that keeps both, with the id of the second
+//!   row as the end-of-generation id, ends as the plain run does: the same ids
+//!   and the count as the reason, and the sink hears no id past it. A file
+//!   whose runs pick no new id from their third on has no id for the case, and
+//!   the verdict says so with the ids.
 //! - `v_cut`: a commit then `cut` keeps the cut's contract: after a verify and its
 //!   commit, a cut back to the prompt's mark or its end leaves what a fresh run
 //!   of the ids leaves, and the plain steps from it are the plain run's.
@@ -48,7 +53,7 @@ use std::path::Path;
 
 use bloomery_device::conformance::{Clause, Verdict};
 use bloomery_metal::arch::qwen3moe::count::{Layer, verify_count};
-use bloomery_metal::arch::qwen3moe::generate::{greedy, greedy_lookup};
+use bloomery_metal::arch::qwen3moe::generate::{greedy, greedy_lookup, greedy_with};
 use bloomery_metal::arch::qwen3moe::session::{
     Node, Session, SessionError, StepMode, StepStats, VerifyTrace,
 };
@@ -58,7 +63,7 @@ use bloomery_metal::kernels::ONE_PASS_KEYS;
 use bloomery_metal::library::Library;
 use runtime::prompt::PrefillMode;
 use runtime::width::Mode as WidthMode;
-use runtime::{Advance, Draft, Speculative, TapNeed, Target, Verify, Want};
+use runtime::{Advance, Draft, Speculative, StopReason, TapNeed, Target, Verify, Want};
 
 use super::chain::{bits_equal, moved, prompt};
 use super::{keep, row, says, sets};
@@ -586,14 +591,21 @@ pub fn v_segments(device: &MetalDevice, library: &Library, path: &Path) -> Claus
     )))
 }
 
-/// The draft of the clause's second part: a proposal that is the plain run's
-/// next id, then a wrong one, then the next id again, then none, then the next
-/// id, so a pass keeps both rows, one row and takes a step in turn.
+/// The draft of the clause's second part: `turn` names what each pass, by its
+/// index, proposes — 0 the plain run's next id, 1 a wrong one, 3 none.
+/// [`CYCLE`] runs the next id, a wrong one, the next id, none, the next id in
+/// turn, so a pass keeps both rows, one row and takes a step.
 struct Scripted<'a> {
     want: &'a [u32],
     vocab: usize,
+    turn: fn(usize) -> usize,
     emitted: usize,
     pass: usize,
+}
+
+/// The five-pass cycle of the scripted draft's run.
+fn cycle(pass: usize) -> usize {
+    pass % 5
 }
 
 impl Draft<Session> for Scripted<'_> {
@@ -607,7 +619,7 @@ impl Draft<Session> for Scripted<'_> {
     }
 
     fn propose(&mut self, _: &mut Session, _: u32, out: &mut [u32]) -> Result<usize, SessionError> {
-        let turn = self.pass % 5;
+        let turn = (self.turn)(self.pass);
         self.pass += 1;
         let Some(&next) = self.want.get(self.emitted) else {
             return Ok(0);
@@ -659,6 +671,7 @@ fn scripted_run(
     let mut spec: Speculative<Scripted, 2> = Speculative::new(Scripted {
         want,
         vocab: s.vocab(),
+        turn: cycle,
         emitted: 0,
         pass: 0,
     });
@@ -680,6 +693,84 @@ fn scripted_run(
     Ok((tokens, counts))
 }
 
+/// The budget case in a run of the `plain` ids: the first id from the third on
+/// that the run has not picked before, the budget that ends just before it, and
+/// whether the scripted draft takes one step first. With every later proposal
+/// the plain run's next id, every pass after that keeps both rows, so a pass
+/// starts after the budget's ids less one and keeps that id past the budget: a
+/// pass from an odd count of ids needs no step, one from an even count one.
+fn boundary(plain: &[u32]) -> Option<(usize, u32, bool)> {
+    (2..plain.len())
+        .find(|&j| !plain[..j].contains(&plain[j]))
+        .map(|j| (j, plain[j], (j - 1) % 2 == 0))
+}
+
+/// The run at `budget` with `eog` the crossing pass's second id, through
+/// [`greedy_with`] (the loop [`greedy`] and [`greedy_lookup`] run) under the
+/// scripted draft that proposes the plain run's next id, after one step
+/// when the case needs it: its ids and stop are the plain run's at that
+/// budget, the sink hears those ids and no more, and the run crosses the
+/// budget with a pass of two rows, which is the case.
+fn at_the_budget(
+    s: &mut Session,
+    name: &str,
+    prompt: &[u32],
+    plain: &[u32],
+    (budget, eog, step_first): (usize, u32, bool),
+) -> Result<(), String> {
+    s.reset().map_err(says)?;
+    let want = greedy(s, prompt, budget, &[eog], |_| {}).map_err(|e| e.to_string())?;
+    if want.ids != plain[..budget] || want.stop != StopReason::Length {
+        return Err(format!(
+            "{name}: the plain run at budget {budget} with end-of-generation id {eog} picked {} \
+             ids and stopped at {}, where the {GEN}-id run's first {budget} ids and the count \
+             are expected",
+            want.ids.len(),
+            want.stop.name()
+        ));
+    }
+    s.reset().map_err(says)?;
+    let mut spec: Speculative<Scripted, 2> = Speculative::new(Scripted {
+        want: plain,
+        vocab: s.vocab(),
+        turn: if step_first {
+            |p| if p == 0 { 3 } else { 0 }
+        } else {
+            |_| 0
+        },
+        emitted: 0,
+        pass: 0,
+    });
+    let mut heard = Vec::new();
+    let got = greedy_with(s, &mut spec, prompt, budget, &[eog], |id| heard.push(id))
+        .map_err(|e| format!("{name}: the scripted draft at budget {budget}: {e}"))?;
+    if got.ids != want.ids || got.stop != want.stop {
+        return Err(format!(
+            "{name}: the scripted draft at budget {budget} with end-of-generation id {eog} ended \
+             with {} ids and stop {}, the plain run's {} ids and stop {}",
+            got.ids.len(),
+            got.stop.name(),
+            want.ids.len(),
+            want.stop.name()
+        ));
+    }
+    if heard != got.ids {
+        return Err(format!(
+            "{name}: the scripted draft at budget {budget} handed its sink {} ids, the run's {}",
+            heard.len(),
+            got.ids.len()
+        ));
+    }
+    let ran = 1 + got.commits.iter().map(|c| c.kept).sum::<usize>();
+    if ran != budget + 1 {
+        return Err(format!(
+            "{name}: the scripted draft at budget {budget} ran {ran} ids, not the one past the \
+             budget the case is"
+        ));
+    }
+    Ok(())
+}
+
 /// (b): the drafts' ids are the plain run's.
 pub fn v_lookup(device: &MetalDevice, library: &Library, path: &Path) -> Clause {
     let mut s = Session::open(device, library, path, LOOKUP_CTX).map_err(says)?;
@@ -693,6 +784,9 @@ pub fn v_lookup(device: &MetalDevice, library: &Library, path: &Path) -> Clause 
         ("four", seg[..16].repeat(4)),
     ];
     let mut lines = Vec::new();
+    let mut at_budget = Vec::new();
+    // Each prompt's first plain ids, which a missing budget case names.
+    let mut heads = Vec::new();
     let (mut proposals, mut accepted, mut rejected) = (0usize, 0usize, 0usize);
     let (mut script_both, mut script_one, mut script_step) = (0usize, 0usize, 0usize);
     for (name, p) in &prompts {
@@ -759,6 +853,14 @@ pub fn v_lookup(device: &MetalDevice, library: &Library, path: &Path) -> Clause 
             ));
         }
         lines.push(format!("{name} ({} ids): {}", p.len(), modes.join("; ")));
+        heads.push(format!(
+            "{name}: {:?}",
+            &plain.ids[..plain.ids.len().min(12)]
+        ));
+        if let Some(case) = boundary(&plain.ids) {
+            at_the_budget(&mut s, name, p, &plain.ids, case)?;
+            at_budget.push(format!("{name}: budget {} and id {}", case.0, case.1));
+        }
     }
     // The lookup's proposals and accepts (counted under the fixed width, which verifies every
     // one) come from the model's own repeats, so a cut whose greedy run repeats one id takes no
@@ -771,11 +873,24 @@ pub fn v_lookup(device: &MetalDevice, library: &Library, path: &Path) -> Clause 
             lines.join("; ")
         ));
     }
+    // A file whose runs pick no new id from their third on (a fixture whose
+    // greedy run repeats one id) has no end-of-generation id for the case: the
+    // verdict names it and the ids, and another file's row holds the case.
+    if at_budget.is_empty() {
+        at_budget.push(format!(
+            "none on this file: no prompt's plain run picks an id from its third on that it had \
+             not picked before (first ids: {})",
+            heads.join("; ")
+        ));
+    }
     Ok(Verdict::Noted(format!(
         "{GEN} ids of each prompt equal the plain greedy run's through the scripted draft \
          ({script_both} passes kept both rows, {script_one} one row, {script_step} stepped) and \
-         through the lookup under both widths, the cost gate's closed passes counted: {}",
-        lines.join("; ")
+         through the lookup under both widths, the cost gate's closed passes counted: {}; a \
+         budget between the rows of a two-row pass, with the second row's id the end-of-generation \
+         id, ends as the plain run does ({})",
+        lines.join("; "),
+        at_budget.join("; ")
     )))
 }
 
