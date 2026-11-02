@@ -702,15 +702,18 @@ mod gate {
         };
         let levers = stage_budget(&inputs, &flat, ctx, tier_now)?;
         if tier_now == Tier::Fixture {
-            // The fixture's experts fit the tier card whole, and a split needs host experts: the
-            // tier card keeps free half the expert bytes it would plan, so the rest goes to the host.
+            // The fixture's experts fit the tier card whole with room to spare, and a split needs
+            // host experts: the tier card keeps free its headroom and half the expert bytes it
+            // would plan, so it holds half of them and the rest goes to the host.
             let full = inputs.plan(&two, ctx, &levers)?;
-            let held = full.cards.get(1).map_or(0, |c| c.expert_bytes);
+            let (held, headroom) = full.cards.get(1).map_or((0, 0), |c| {
+                (c.expert_bytes, u64::try_from(c.headroom_bytes).unwrap_or(0))
+            });
             let tier_card = two
                 .tiers
                 .first_mut()
                 .ok_or("arm bp: the bp machine has no tier card")?;
-            tier_card.margin_bytes += held / 2;
+            tier_card.margin_bytes += headroom + held / 2;
         }
         let plan = inputs.plan(&two, ctx, &levers)?;
         if plan.host.experts == 0 {
