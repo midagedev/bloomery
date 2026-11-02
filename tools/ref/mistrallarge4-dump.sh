@@ -11,7 +11,7 @@
 # The harness is the shared one: tools/ref/cb_dump.cpp is the dumper, tools/ref/cb-dump.sh the build and the
 # run (staging, lease, install); this file is Mistral Large 4's part of them, the tree, the taps and the prompts.
 # `bash tools/ref/mistrallarge4-dump.sh --build` links the dumper against the ml4 tree
-# (tools/ref/mistrallarge4-dump-build.sh is that call).
+# (`just build-ref-mistrallarge4` is that call).
 #
 # The ids are tokens of the ml4 tree's llama-tokenize on the file, taken once and kept in
 # tools/ref/data/mistrallarge4 beside their text (a.txt and b.txt hold no final newline: one would be an id);

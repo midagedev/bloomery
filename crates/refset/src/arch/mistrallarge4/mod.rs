@@ -24,10 +24,6 @@
 
 pub mod fixture;
 
-/// The tables beside the node dumps are every mainline-API family's
-/// ([`super::prompt_tables`]); the path stays the family's for its gate.
-pub use super::prompt_tables as read;
-
 #[cfg(test)]
 mod tests;
 
@@ -52,7 +48,7 @@ pub const MODEL: &str =
 
 /// The build every mistrallarge4 set names: llama.cpp [`COMMIT`] and the first 12 hex digits of
 /// the md5 of the `libllama.so` built from it (`/home/user/llama.cpp-ml4`, the tree the
-/// profile's `LCPP` names; `tools/ref/mistrallarge4-dump-build.sh` records the whole md5 beside
+/// profile's `LCPP` names; `tools/ref/mistrallarge4-dump.sh --build` records the whole md5 beside
 /// the binary and the run refuses a library that moved).
 // PIN(2026-10-31): the merge of PR 31376 and the libllama md5 its first build on the box
 // recorded. A rebuild of the tree moves the build and the sets are dumped again.

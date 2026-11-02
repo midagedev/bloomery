@@ -12,10 +12,8 @@
 //! renormalized; the first layer is dense and every other layer routes with
 //! one shared expert; the head softcaps its logits.
 //!
-//! The chat surface: the pre-tokenizer `tekken-num3` (the tokenizer row
-//! itself is another round's — this reader names the string only), the file's
-//! own template, and no tool parser yet (a request with tools is refused by
-//! the server; the family's parser is another round's).
+//! The chat surface uses the `tekken-num3` pre-tokenizer and the file's
+//! template. The server recognizes its `[TOOL_CALLS]` and `[ARGS]` markup.
 
 use gguf::Split;
 use models::{
@@ -47,9 +45,8 @@ pub fn read(split: &Split) -> Result<Read, PlacementError> {
     })
 }
 
-/// `split`'s chat surface: the file's pre-tokenizer and template, no parsers
-/// of this tree yet. A pre-tokenizer other than [`PRE`], or none, is refused
-/// by name.
+/// `split`'s chat surface: the file's pre-tokenizer and template. A
+/// pre-tokenizer other than [`PRE`], or none, is refused by name.
 fn chat(split: &Split) -> Result<ChatSpec, PlacementError> {
     let chat = chat_of(split, None, None)?;
     if chat.pre != PRE {
