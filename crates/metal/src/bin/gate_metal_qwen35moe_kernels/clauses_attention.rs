@@ -9,7 +9,7 @@ use bloomery_device::fault::{Fault, FaultSite};
 use bloomery_device::{Buffer, Device, DeviceError, Elems, Window};
 use bloomery_metal::attention_geom::TILE;
 use bloomery_metal::encode::{Binding, ComputeEncoder};
-use bloomery_metal::geom::AttnGeom;
+use bloomery_metal::geom::{AttnGeom, Prologue};
 use bloomery_metal::kernels::{AttentionParams, AttnCache, ONE_PASS_KEYS, segments_for_keys};
 use bloomery_metal::library::Library;
 use bloomery_metal::{MetalBuffer, MetalDevice};
@@ -19,7 +19,7 @@ use super::common::{self, BadArg, LAYER, expect_fault, first_diff};
 use super::fixture::Fixture;
 use super::oracle::sigmoid;
 use super::oracle_attention::{
-    attend, band, dequant_f16, dequant_q8, norm_rope, pack_f16, pack_q8,
+    attend, band, dequant_f16, dequant_q8, norm_rope, pack_f16, pack_q8, rope_neox, rope_norm_pairs,
 };
 use super::{Harness, OUT_GUARD, SENTINEL_BITS, VALUE_PAD};
 
@@ -384,6 +384,29 @@ fn upload_f32<'a>(
     Ok((buffer, host.len()))
 }
 
+/// A head `x` through the instance's prologue in the kernel's f32 order, one
+/// oracle function to a [`Prologue`]: the norm by `gain` and the NEOX pairs
+/// where the instance norms each head, the raw values turned as neighbours
+/// where it pairs NORM, the raw values turned as NEOX halves where it does
+/// neither. The `gain` of an instance that norms none is unread. A head norm
+/// over NORM pairs is no prologue: an error.
+pub(super) fn prologue_of(
+    attn: &AttnGeom,
+    x: &[f32],
+    gain: &[f32],
+    eps: f32,
+    table_row: &[f32],
+) -> Result<Vec<f32>, String> {
+    match attn.prologue() {
+        Some(Prologue::NormedNeox) => norm_rope(x, gain, eps, table_row),
+        Some(Prologue::RawNorm) => rope_norm_pairs(x, table_row),
+        Some(Prologue::RawNeox) => rope_neox(x, table_row),
+        None => {
+            Err("a head norm over NORM pairs is no prologue the flash is built for".to_string())
+        }
+    }
+}
+
 /// The gain window a launch binds of a padded upload: the head's values on an
 /// instance whose flash norms each head, none on one that applies no head
 /// norm (the buffer then goes unread).
@@ -738,7 +761,13 @@ fn expect_append_row(
         .rope
         .get(pos * attn.rot..(pos + 1) * attn.rot)
         .ok_or("the rope row is past the table")?;
-    let key = norm_rope(take_head(attn, k, kv)?, &tables.k_gain, tables.eps, rope)?;
+    let key = prologue_of(
+        attn,
+        take_head(attn, k, kv)?,
+        &tables.k_gain,
+        tables.eps,
+        rope,
+    )?;
     let value = take_head(attn, v, kv)?;
     match cache {
         CacheBack::F16 { k, v } => {
@@ -864,7 +893,8 @@ fn check_head(inp: &QueryIn<'_>, head: usize) -> Result<f64, String> {
         .rope
         .get(pos * attn.rot..(pos + 1) * attn.rot)
         .ok_or("the rope row is past the table")?;
-    let qn = norm_rope(
+    let qn = prologue_of(
+        attn,
         take_qg_for(attn, q, head, 0)?,
         &tables.q_gain,
         tables.eps,
@@ -1107,11 +1137,19 @@ fn cache_same(planted: &CacheBack, got: &CacheBack) -> Result<(), String> {
     }
 }
 
+/// Row `row` of the q8_0 key planes after a launch whose key held a value that
+/// is not finite. `key` is the oracle's key through the prologue: each 32-value
+/// block of it that holds a value that is not finite is a NaN scale and zero
+/// codes, and every other block is the host quantizer's. An instance that
+/// norms each head spreads the value over the whole head, so every block is a
+/// NaN; one that turns pairs with no norm leaves the blocks the pair's values
+/// are not in whole (the neighbours share a block, the NEOX halves sit in two).
 fn expect_nan_q8_row(
     attn: &AttnGeom,
     codes: &[u32],
     scales: &[u16],
     row: usize,
+    key: &[f32],
 ) -> Result<(), String> {
     let (words, blocks) = (q8_words(attn), q8_scales(attn));
     let scale = scales
@@ -1120,18 +1158,37 @@ fn expect_nan_q8_row(
     let code = codes
         .get(row * words..(row + 1) * words)
         .ok_or("the bad q8_0 row's codes are past the cache")?;
-    for (i, &bits) in scale.iter().enumerate() {
-        if bits != Q8_NAN_SCALE {
+    for b in 0..blocks {
+        let values = key
+            .get(b * 32..(b + 1) * 32)
+            .ok_or("the oracle's key is shorter than the q8_0 row")?;
+        let (block_codes, block_scale) = (&code[b * 8..(b + 1) * 8], scale[b]);
+        if values.iter().all(|v| v.is_finite()) {
+            let (want_codes, want_scale) = pack_q8(values);
+            if block_scale != want_scale[0] {
+                return Err(format!(
+                    "k row {row} scale {b} is {block_scale:#x}, gguf::quant::quantize_q8_0 has {:#x}",
+                    want_scale[0]
+                ));
+            }
+            if let Some((i, g, w)) = first_diff(block_codes, &want_codes) {
+                return Err(format!(
+                    "k row {row} block {b} code {i} is {g:#x}, gguf::quant::quantize_q8_0 has {w:#x}"
+                ));
+            }
+            continue;
+        }
+        if block_scale != Q8_NAN_SCALE {
             return Err(format!(
-                "k row {row} scale {i} is {bits:#x}, a non-finite block stores {Q8_NAN_SCALE:#x}"
+                "k row {row} scale {b} is {block_scale:#x}, a non-finite block stores {Q8_NAN_SCALE:#x}"
             ));
         }
-    }
-    for (i, &word) in code.iter().enumerate() {
-        if word != 0 {
-            return Err(format!(
-                "k row {row} code {i} is {word:#x}, a non-finite block stores zero codes"
-            ));
+        for (i, &word) in block_codes.iter().enumerate() {
+            if word != 0 {
+                return Err(format!(
+                    "k row {row} block {b} code {i} is {word:#x}, a non-finite block stores zero codes"
+                ));
+            }
         }
     }
     Ok(())
@@ -1195,7 +1252,18 @@ pub fn attn_fault(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         return Err("the q8_0 fault read back another format".to_string());
     };
     let row = 63;
-    expect_nan_q8_row(attn, k_codes, k_scales, row)?;
+    let rope = tables
+        .rope
+        .get(row * attn.rot..(row + 1) * attn.rot)
+        .ok_or("the rope row is past the table")?;
+    let key = prologue_of(
+        attn,
+        take_head(attn, &k, 0)?,
+        &tables.k_gain,
+        tables.eps,
+        rope,
+    )?;
+    expect_nan_q8_row(attn, k_codes, k_scales, row, &key)?;
     let (vc, vs) = pack_q8(take_head(attn, &v, 0)?);
     expect_q8_row(v_codes, v_scales, row, &vc, &vs, "v")?;
     for kv in 1..attn.kv_heads {
@@ -1278,7 +1346,8 @@ pub fn attn_fold_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         .rope
         .get(pos * attn.rot..(pos + 1) * attn.rot)
         .ok_or("the rope row is past the table")?;
-    let qn = norm_rope(
+    let qn = prologue_of(
+        attn,
         take_qg_for(attn, &q, 0, 0)?,
         &tables.q_gain,
         tables.eps,

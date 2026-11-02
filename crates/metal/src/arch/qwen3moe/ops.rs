@@ -47,10 +47,10 @@ use crate::device::MetalDevice;
 use crate::encode::ComputeEncoder;
 use crate::kernels::router::RouterParams;
 use crate::kernels::{
-    AttentionParams, AttnCache, AttnLayer, DeltaParams, EmbedParams, FoldParams, HEAD_SIMD_GROUPS,
-    HeadNormParams, HeadParams, Kernels, LoadNorm, MatvecParams, Mode, NormAddNextParams,
-    NormAddRowsParams, NormNextParams, NormRowsParams, PASS_ROWS, PairParams, Quant, SegParams,
-    SharedPlan, ShortConvStepParams, segments_for_window,
+    AttentionParams, AttnCache, AttnLayer, BiasRowsParams, DeltaParams, EmbedParams, FoldParams,
+    HEAD_SIMD_GROUPS, HeadNormParams, HeadParams, Kernels, LoadNorm, MatvecParams, Mode,
+    NormAddNextParams, NormAddRowsParams, NormNextParams, NormRowsParams, PASS_ROWS, PairParams,
+    Quant, SegParams, SharedPlan, ShortConvStepParams, segments_for_window,
 };
 
 /// The half of a layer a sandwich joins: the mixer's, then the FFN's, the
@@ -343,6 +343,13 @@ impl<'a, 'e> MetalOps<'a, 'e> {
     }
 }
 
+/// The refusal of a bias op on a layer whose file held no biases.
+fn no_bias(l: usize) -> SessionError {
+    refuse(format!(
+        "layer {l}: the plan has q, k and v biases and the layer's buffers hold none"
+    ))
+}
+
 /// The layer's delta buffers, or a named refusal for a layer of another mixer.
 macro_rules! delta_of {
     ($layers:expr, $l:expr) => {
@@ -588,6 +595,39 @@ fn rope_of(
 }
 
 impl MetalOps<'_, '_> {
+    /// Layer `l`'s P1 over the unit's rows: the step's one row, or the pass's.
+    pub(super) fn attn_p1(&mut self, l: LayerCtx<'_>) -> Result<(), SessionError> {
+        match self.arm(l.m)? {
+            Arm::Step => self.p1(l.layer),
+            Arm::Rows => self.rows_p1(l.layer, l.m),
+        }
+    }
+
+    /// Layer `l`'s q, k and v biases added to the rows its P1 wrote, one
+    /// group: the flash then reads the biased rows. A layer with no bias
+    /// buffers is refused by name.
+    pub(super) fn attn_bias(&mut self, l: LayerCtx<'_>) -> Result<(), SessionError> {
+        if self.arm(l.m)? == Arm::Rows {
+            return self.rows_attn_bias(l.layer, l.m);
+        }
+        let Arena { proj, layers, .. } = &mut *self.arena;
+        let a = attention_of!(layers, l.layer);
+        let bias = a.bias.as_ref().ok_or_else(|| no_bias(l.layer))?;
+        let cols = bias.len().get();
+        self.kernels.bias_rows(
+            self.enc,
+            BiasRowsParams {
+                rows: 1,
+                cols,
+                y: proj.window_mut(Elems(a.q.start), Elems(cols))?,
+                y_stride: cols,
+                bias: all(bias)?,
+            },
+        )?;
+        self.close();
+        Ok(())
+    }
+
     /// Layer `l`'s flash group: the attention over the keys the layer attends
     /// (the last `window` of the `pos + 1` live keys, or all of them), in the
     /// segments those keys take, this position's keys stored first. Live keys
@@ -1054,11 +1094,12 @@ impl ChainOps for MetalOps<'_, '_> {
         Ok(())
     }
 
-    fn attn_in(&mut self, l: LayerCtx<'_>, _: &GqaPlan) -> Result<(), SessionError> {
-        match self.arm(l.m)? {
-            Arm::Step => self.p1(l.layer),
-            Arm::Rows => self.rows_p1(l.layer, l.m),
+    fn attn_in(&mut self, l: LayerCtx<'_>, g: &GqaPlan) -> Result<(), SessionError> {
+        self.attn_p1(l)?;
+        if g.bias.is_some() {
+            self.attn_bias(l)?;
         }
+        Ok(())
     }
 
     fn attn_core(&mut self, l: LayerCtx<'_>, _: &GqaPlan) -> Result<(), SessionError> {

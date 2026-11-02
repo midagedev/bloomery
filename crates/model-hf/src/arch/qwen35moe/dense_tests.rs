@@ -328,7 +328,7 @@ pub(super) fn config_rows() -> Vec<Row> {
         ["", "temperature", 0.6, "x", "temperature"],
         ["", "top_k", 40, "x", "top_k"],
         ["", "top_p", 0.8, "x", "top_p"],
-        ["", "tie_word_embeddings", false, true, "tie_word_embeddings"],
+        ["", "tie_word_embeddings", false, "x", "tie_word_embeddings"],
         ["/text_config", "model_type", "qwen3_5_text", "qwen3_5_moe_text", "model_type"],
         ["/text_config", "full_attention_interval", 4, "x", "full_attention_interval"],
         ["/text_config", "attn_output_gate", true, false, "attn_output_gate"],
@@ -336,7 +336,7 @@ pub(super) fn config_rows() -> Vec<Row> {
         ["/text_config", "mlp_only_layers", [], [3], "mlp_only_layers"],
         ["/text_config", "intermediate_size", "$", 0, "intermediate_size"],
         ["/text_config", "hidden_act", "silu", "gelu", "hidden_act"],
-        ["/text_config", "tie_word_embeddings", false, true, "tie_word_embeddings"],
+        ["/text_config", "tie_word_embeddings", false, "x", "tie_word_embeddings"],
         ["/text_config", "mtp_num_hidden_layers", 1, "x", "mtp_num_hidden_layers"],
         ["/text_config", "mtp_use_dedicated_embeddings", false, "x", "mtp_use_dedicated_embeddings"],
         ["/text_config", "num_experts", null, 8, "num_experts"],
@@ -526,6 +526,92 @@ fn the_dense_map_refuses_what_it_does_not_read_by_name() {
         e.contains("mtp.zzz.weight") && e.contains("next-token layer this map names"),
         "{e}"
     );
+}
+
+/// A dense folder whose head is the embedding (`tie_word_embeddings` true in the root and in
+/// `text_config`, no `lm_head` in the folder) plans the 27B's tensors but for `output.weight`,
+/// which the split then lacks: the session reads the embedding as the head. A config that holds
+/// the flag in the root alone reads the same (MLX's untied 9B holds it there only). The flag and
+/// the folder are held to each other, each mismatch refused by name: a head beside a tied
+/// embedding, no head under an untied flag, and a root and a text model that disagree. Mutants
+/// (each red at its line): `check_head` returning `Ok` for either mismatch, `tied_of` taking the
+/// text model's flag over a root that disagrees, `HEAD_EITHER` of the dense families read as
+/// `HEAD_OWN`.
+#[test]
+fn a_dense_folder_whose_head_is_the_embedding_plans_without_an_output() {
+    let untied = json(CONFIG_38);
+    let tie = |root: Option<bool>, text: Option<bool>| {
+        let mut c = untied.clone();
+        for (at, flag) in [("", root), ("/text_config", text)] {
+            let object = c.pointer_mut(at).unwrap().as_object_mut().unwrap();
+            match flag {
+                Some(f) => object.insert("tie_word_embeddings".into(), json!(f)),
+                None => object.remove("tie_word_embeddings"),
+            };
+        }
+        c
+    };
+    let with_head = real_entries();
+    let mut headless = with_head.clone();
+    headless.retain(|(n, _, _)| !n.starts_with("language_model.lm_head."));
+    assert_eq!(
+        with_head.len() - headless.len(),
+        3,
+        "weight, scales, biases"
+    );
+    let plan = |c: &Json, e: &Entries| {
+        let checkpoint = Checkpoint::parse(c)?;
+        planning(&checkpoint, c, e).map(|p| {
+            p.planned
+                .iter()
+                .map(|p| p.decl.name.clone())
+                .collect::<Vec<_>>()
+        })
+    };
+    let base = plan(&untied, &with_head).expect("the untied folder plans");
+    assert!(base.contains(&"output.weight".to_string()));
+    for flags in [
+        (Some(true), Some(true)),
+        (Some(true), None),
+        (None, Some(true)),
+    ] {
+        let got = plan(&tie(flags.0, flags.1), &headless)
+            .unwrap_or_else(|e| panic!("{flags:?}: a tied folder is refused: {e}"));
+        let want: Vec<&String> = base.iter().filter(|n| *n != "output.weight").collect();
+        assert_eq!(got.iter().collect::<Vec<_>>(), want, "{flags:?}");
+    }
+    for flags in [
+        (Some(false), Some(false)),
+        (Some(false), None),
+        (None, None),
+    ] {
+        let got = plan(&tie(flags.0, flags.1), &with_head).expect("an untied folder plans");
+        assert_eq!(got, base, "{flags:?}");
+    }
+    let refused = |c: &Json, e: &Entries| plan(c, e).expect_err("refused").to_string();
+    let e = refused(&tie(Some(true), Some(true)), &with_head);
+    assert!(
+        e.contains("language_model.lm_head.weight") && e.contains("is a head beside the embedding"),
+        "{e}"
+    );
+    for flags in [(Some(false), Some(false)), (None, None)] {
+        let e = refused(&tie(flags.0, flags.1), &headless);
+        assert!(
+            e.contains("tie_word_embeddings is false, and the folder holds no head"),
+            "{flags:?}: {e}"
+        );
+    }
+    for (flags, entries) in [
+        ((Some(true), Some(false)), &headless),
+        ((Some(false), Some(true)), &with_head),
+    ] {
+        let e = refused(&tie(flags.0, flags.1), entries);
+        assert!(
+            e.contains("text_config.tie_word_embeddings is")
+                && e.contains("where config.tie_word_embeddings is"),
+            "{flags:?}: {e}"
+        );
+    }
 }
 
 /// The distinguishable weights of an MLX linear: `mlx_linear`'s words, each byte xor `seed`.

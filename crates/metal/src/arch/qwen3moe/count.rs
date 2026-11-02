@@ -23,9 +23,11 @@ pub enum Layer {
         ffn: FfnKind,
         residual: Residual,
     },
-    /// A gated attention layer. Live keys past 64 add the memory dispatch.
+    /// A gated attention layer. Live keys past 64 add the memory dispatch. A
+    /// `bias` adds one group of one dispatch after P1.
     Attention {
         v: Projection,
+        bias: bool,
         ffn: FfnKind,
         residual: Residual,
     },
@@ -63,6 +65,10 @@ pub enum Residual {
 
 /// The groups of a layer's mixer: P1, the core, its out.
 const MIXER_GROUPS: u32 = 3;
+
+/// The groups an attention layer's q, k and v biases add: one dispatch after
+/// P1, whose output the flash then reads.
+const BIAS_GROUPS: u32 = 1;
 
 /// The groups of the embed and of the head: the embed's one, and the head's
 /// two, the logits and the pick.
@@ -111,21 +117,25 @@ impl Layer {
         }
     }
 
-    /// The groups the layer encodes: its mixer's three, its FFN's two and a
-    /// router's ahead of them, and a sandwich's two joins or a plain
-    /// residual's two hand-ons.
+    /// The groups the layer encodes: its mixer's three and an attention
+    /// layer's bias group, its FFN's two and a router's ahead of them, and a
+    /// sandwich's two joins or a plain residual's two hand-ons.
     #[must_use]
     pub const fn groups(&self) -> u32 {
         let router = match self.ffn() {
             FfnKind::Routed => 1,
             FfnKind::Dense => 0,
         };
+        let bias = match self {
+            Layer::Attention { bias: true, .. } => BIAS_GROUPS,
+            _ => 0,
+        };
         let joins = match self.residual() {
             Residual::Plain => 0,
             Residual::PlainHandOn => HANDON_GROUPS,
             Residual::Sandwich => JOIN_GROUPS,
         };
-        MIXER_GROUPS + FFN_GROUPS + router + joins
+        MIXER_GROUPS + bias + FFN_GROUPS + router + joins
     }
 }
 
@@ -196,7 +206,7 @@ pub struct TokenCount {
 /// the router, the gate-up and the down, so six; a layer of a dense FFN has no
 /// router, so five; a sandwich adds a join after the mixer's out and one after
 /// the down, and a plain residual that hands on a hand-on after each, so
-/// seven. Those already include the flash — the attention's fold
+/// seven; an attention layer with biases adds the bias group after P1. Those already include the flash — the attention's fold
 /// runs inside it, so past the segment rule's waterline the count is the
 /// same — and the FFN norm, which the router and the gate-up each apply as
 /// they load the residual (a dense layer's gate-up alone). A projection of
@@ -243,6 +253,8 @@ pub enum GroupKind {
     Embed,
     /// An attention layer's P1: the norm on load and its projections.
     AttnP1,
+    /// An attention layer's q, k and v biases, added to the P1 output.
+    AttnBias,
     /// The attention core: the flash over the live keys, which past one
     /// segment also folds its partials.
     AttnFlash,
@@ -288,6 +300,7 @@ impl GroupKind {
         match self {
             GroupKind::Embed => "embed",
             GroupKind::AttnP1 => "attn_p1",
+            GroupKind::AttnBias => "attn_bias",
             GroupKind::AttnFlash => "attn_flash",
             GroupKind::AttnOut => "attn_out",
             GroupKind::DeltaP1 => "delta_p1",
@@ -308,9 +321,10 @@ impl GroupKind {
 }
 
 /// Every kind, in the token's walk order: the order a profile's lines print.
-pub const KINDS: [GroupKind; 17] = [
+pub const KINDS: [GroupKind; 18] = [
     GroupKind::Embed,
     GroupKind::AttnP1,
+    GroupKind::AttnBias,
     GroupKind::AttnFlash,
     GroupKind::AttnOut,
     GroupKind::DeltaP1,
@@ -369,6 +383,7 @@ mod tests {
     fn routed_attention(v: Projection) -> Layer {
         Layer::Attention {
             v,
+            bias: false,
             ffn: FfnKind::Routed,
             residual: Residual::Plain,
         }
@@ -384,8 +399,11 @@ mod tests {
                     ffn: FfnKind::Dense,
                     residual,
                 },
-                Layer::Attention { v, residual, .. } => Layer::Attention {
+                Layer::Attention {
+                    v, bias, residual, ..
+                } => Layer::Attention {
                     v,
+                    bias,
                     ffn: FfnKind::Dense,
                     residual,
                 },
@@ -414,6 +432,7 @@ mod tests {
                 },
                 'F' | 'S' => Layer::Attention {
                     v: Projection::ONE,
+                    bias: false,
                     ffn: FfnKind::Dense,
                     residual: Residual::Sandwich,
                 },
@@ -635,8 +654,9 @@ mod tests {
                     ffn,
                     residual: Residual::Plain,
                 },
-                Layer::Attention { v, ffn, .. } => Layer::Attention {
+                Layer::Attention { v, bias, ffn, .. } => Layer::Attention {
                     v,
+                    bias,
                     ffn,
                     residual: Residual::Plain,
                 },
@@ -695,6 +715,38 @@ mod tests {
                 dispatches: 451
             }
         );
+    }
+
+    /// Qwen2.5-Coder-7B's four-layer cut over a dense FFN and a plain
+    /// residual that hands on: seven groups a layer (the mixer's three, the
+    /// FFN's two, two hand-ons), an attention layer's bias group one more,
+    /// and the ends' three, 35 groups and 35 dispatches against the unbiased
+    /// cut's 31. Mutant: `BIAS_GROUPS` is 0, or `Layer::groups` reads the
+    /// bias of a layer that has none.
+    #[test]
+    fn an_attention_layers_biases_add_one_group_and_one_dispatch() {
+        let layer = |bias| Layer::Attention {
+            v: Projection::ONE,
+            bias,
+            ffn: FfnKind::Dense,
+            residual: Residual::PlainHandOn,
+        };
+        let count = |bias| token_count(&[layer(bias); 4], LiveKeys::Within64, Ticket::Folded);
+        assert_eq!(
+            count(false),
+            TokenCount {
+                groups: 31,
+                dispatches: 31
+            }
+        );
+        assert_eq!(
+            count(true),
+            TokenCount {
+                groups: 35,
+                dispatches: 35
+            }
+        );
+        assert_eq!(layer(true).groups(), layer(false).groups() + 1);
     }
 
     #[test]

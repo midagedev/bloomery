@@ -101,6 +101,34 @@ pub struct AttnGeom {
     pub norm_pairs: bool,
 }
 
+/// How an attention layer's query and key heads reach their rope: the
+/// variants the flash is compiled for, one `attn_norm_rope` of
+/// attention.metal each. The gate's oracle has one function per variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Prologue {
+    /// Each head RMS-normed by the file's gains, then turned as NEOX halves.
+    NormedNeox,
+    /// The raw values turned as neighbours `2i, 2i + 1` (GGUF's NORM pairing).
+    RawNorm,
+    /// The raw values turned as NEOX halves `i, i + rot / 2`.
+    RawNeox,
+}
+
+impl AttnGeom {
+    /// The prologue the two axes name, or `None` for a head norm over NORM
+    /// pairs: the norm's sum of squares walks the NEOX pair tree, so no
+    /// kernel is compiled for that combination.
+    #[must_use]
+    pub const fn prologue(&self) -> Option<Prologue> {
+        match (self.qk_norm, self.norm_pairs) {
+            (true, false) => Some(Prologue::NormedNeox),
+            (false, true) => Some(Prologue::RawNorm),
+            (false, false) => Some(Prologue::RawNeox),
+            (true, true) => None,
+        }
+    }
+}
+
 /// The numbers of the gated delta step for one instance: its own axes, or the
 /// axes its kernels are compiled at when its files have no delta layer
 /// ([`Instance::delta_built`]).
@@ -136,7 +164,8 @@ pub struct RouterGeom {
     pub rows: usize,
     /// One when the router has a shared expert's row, else zero.
     pub shared: usize,
-    /// The columns of every row: the hidden width.
+    /// The columns of every row: the hidden width of a routed FFN, and the columns a dense
+    /// FFN's unlaunched router is compiled at ([`router_geom::k`]).
     pub k: usize,
     /// The partials of one launch.
     pub partials: usize,
@@ -260,11 +289,11 @@ impl Geometry {
                 experts: router.router.experts as usize,
                 rows,
                 shared: router.router.rule.gated as usize,
-                k: hidden,
+                k: router_geom::k(inst),
                 partials: router_geom::partials(inst),
                 groups: router_geom::groups(inst),
                 top_k_max: router.top_k as usize,
-                float4s: router_geom::float4s(hidden),
+                float4s: router_geom::float4s(router_geom::k(inst)),
                 logit_stride: router_geom::logit_stride(rows),
             },
             experts: ExpertsGeom {
@@ -318,10 +347,13 @@ mod tests {
         inst.key.ffn = FfnAxes::Routed(axes);
     }
 
-    /// Attention of `n_head` heads of `head` values over the shape table's
-    /// row of a group of eight.
+    /// Attention of `n_head` heads of `head` values over the first row of a
+    /// group of eight, at the width `head`.
     fn attention(inst: &mut Instance, head: u32, n_head: u32) {
-        inst.key.attn.row = shape::gqa_row(head, 8).expect("the shape table has the row");
+        let mut row = shape::gqa_row(128, 8).expect("the shape table has the row");
+        row.head = head;
+        row.value = head;
+        inst.key.attn.row = row;
         inst.key.attn.n_head = n_head;
     }
 
@@ -377,7 +409,9 @@ mod tests {
                 |i| moe(i, |m| m.expert_ff = 700),
                 ("experts", "expert ff", "700"),
             ),
-            (|i| attention(i, 64, 16), ("attention", "head", "64")),
+            // PIN(2026-11-02): head 64 is a width the kernels take (a lane of two values), so the
+            // head case moves to 96, which the kernels' lane words have no width for.
+            (|i| attention(i, 96, 16), ("attention", "head", "96")),
             (
                 |i| i.key.attn.row.value = 192,
                 ("attention", "value width", "192"),
@@ -460,7 +494,18 @@ mod tests {
         assert_eq!(inst.router_built(), built);
         assert_eq!(g.router.experts, built.router.experts as usize);
         assert_eq!(g.router.top_k_max, built.top_k as usize);
-        assert_eq!(g.router.k, 5120);
+        // PIN(2026-11-02): the unlaunched router's columns, was the residual's 5,120: a dense FFN
+        // launches no router, and its kernels compile at the columns every instance of no router
+        // compiles them at, so no residual width meets the router's rules (derivation: the
+        // Qwen3-4B and Qwen2.5-7B residuals, 2,560 and 3,584, are no multiple of 1,024).
+        assert_eq!(g.router.k, router_geom::UNLAUNCHED_K);
+        assert_eq!(g.router.k, QWEN35MOE_A3B.key.hidden as usize);
+        for hidden in [2560u32, 3584, 5120] {
+            let g = Geometry::of(&dense(hidden, 9728));
+            assert_eq!(g.check(), Ok(()), "a dense FFN over a residual of {hidden}");
+            assert_eq!(g.hidden, hidden as usize);
+            assert_eq!(g.router.k, router_geom::UNLAUNCHED_K, "hidden {hidden}");
+        }
         // A width the fold's blocks do not divide is refused by name.
         let got = Geometry::of(&dense(5120, 17_400)).check();
         let Err(why) = &got else {

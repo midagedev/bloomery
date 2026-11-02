@@ -147,6 +147,9 @@ pub(super) struct AttnBufs {
     /// head; a layer with none holds no gains.
     pub(super) q_norm: Option<MetalBuffer<f32>>,
     pub(super) k_norm: Option<MetalBuffer<f32>>,
+    /// The query, key and value biases in one vector, laid as the P1 output's
+    /// `q`, `k` and `v` ranges, on a layer whose file holds them.
+    pub(super) bias: Option<MetalBuffer<f32>>,
     pub(super) out: MetalBuffer<u8>,
     pub(super) out_quant: Quant,
     pub(super) k_cache: MetalBuffer<u16>,
@@ -476,6 +479,34 @@ impl<'a> Loader<'a> {
             }
         }
         Ok(values)
+    }
+
+    /// The query, key and value biases `b` as one buffer laid as the P1
+    /// output's `ranges` (the query's, the key's and the value's, which must
+    /// be neighbours of those lengths): a bias that is not finite is refused
+    /// by name, where the values are read.
+    fn bias(
+        &self,
+        b: &[Values; 3],
+        ranges: [&Range<usize>; 3],
+    ) -> Result<MetalBuffer<f32>, SessionError> {
+        let mut joined = Vec::with_capacity(b.iter().map(|v| v.len).sum());
+        for (v, range) in b.iter().zip(ranges) {
+            if range.len() != v.len || range.start != ranges[0].start + joined.len() {
+                return Err(refuse(format!(
+                    "{}: {} values over the P1 rows {range:?}; the biases follow the q, k and v rows",
+                    v.name, v.len
+                )));
+            }
+            let values = self.host_values(v)?;
+            if let Some(i) = values.iter().position(|x| !x.is_finite()) {
+                return Err(refuse(format!("{}: value {i} is not finite", v.name)));
+            }
+            joined.extend(values);
+        }
+        let mut buffer = self.device.buffer(Elems(joined.len()))?;
+        buffer.write(&joined)?;
+        Ok(buffer)
     }
 
     /// The rope table `r` describes, `ctx` positions of `rot` values: the
@@ -844,6 +875,7 @@ impl Arena {
                     },
                     MixerBufs::Attention(a) => Layer::Attention {
                         v: a.p1.projection(),
+                        bias: a.bias.is_some(),
                         ffn,
                         residual,
                     },
@@ -968,6 +1000,22 @@ impl Arena {
                     // The residual read (or the join's normed input and its
                     // scale), the projection's output written.
                     acts: f32s(self.hidden) + f32s(out_end) + self.scale_word(Reader::P1(layer)),
+                    state: 0,
+                })
+            }
+            GroupKind::AttnBias => {
+                no_ids()?;
+                let a = attn_of(bufs()?, layer, kind)?;
+                let bias = a.bias.as_ref().ok_or_else(|| {
+                    refuse(format!(
+                        "{kind:?}: layer {layer} holds no q, k and v biases"
+                    ))
+                })?;
+                Ok(GroupBytes {
+                    // The biases, read.
+                    weights: bytes_of(bias),
+                    // The P1's q, k and v rows, read and written in place.
+                    acts: 2 * bytes_of(bias),
                     state: 0,
                 })
             }
@@ -1337,6 +1385,11 @@ fn attention(load: &Loader<'_>, a: &AttnLayout) -> Result<AttnBufs, SessionError
         p1,
         q_norm: a.q_norm.as_ref().map(|v| load.values(v)).transpose()?,
         k_norm: a.k_norm.as_ref().map(|v| load.values(v)).transpose()?,
+        bias: a
+            .bias
+            .as_ref()
+            .map(|b| load.bias(b, [&ranges[0], &ranges[1], &ranges[2]]))
+            .transpose()?,
         out,
         out_quant: a.out.quant,
         k_cache: zeroed(device, a.cache)?,

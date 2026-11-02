@@ -385,6 +385,7 @@ pub(super) fn attn_in(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Resu
             neox_128_in(env, (c.eps, c.sink), n, (&d, m), &mut neox_rows(s)?)
         }
         GqaKind::HeadGate128 => Err(head_gate_refused()),
+        GqaKind::Head64 { .. } => Err(head_64_refused()),
     }
 }
 
@@ -409,6 +410,7 @@ pub(super) fn attn_core(
             neox_128_core(env, at, (n, kv), (&d, m), &mut neox_rows(s)?)
         }
         GqaKind::HeadGate128 => Err(head_gate_refused()),
+        GqaKind::Head64 { .. } => Err(head_64_refused()),
     }
 }
 
@@ -423,6 +425,7 @@ pub(super) fn attn_out(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Res
             neox_128_out((c.gpu, c.w, c.k), n, (&d, m), &mut neox_rows(s)?)
         }
         GqaKind::HeadGate128 => Err(head_gate_refused()),
+        GqaKind::Head64 { .. } => Err(head_64_refused()),
     }
 }
 
@@ -794,6 +797,15 @@ fn neox_128_in(
         gemm_site((gpu, w, k), (ty, name), rows, &input, one, t, y)?;
     }
     Ok(())
+}
+
+/// The refusal of the head-64 attention, which no launch here serves: the card's kernels are built
+/// for heads of 128 and 256, and `kind35` refuses the kind before a layer reaches an op.
+pub(super) fn head_64_refused() -> GpuError {
+    GpuError::shape(
+        WHAT_GATED,
+        "a head-64 attention, which no launch here serves",
+    )
 }
 
 /// The head-128 half's middle at `t` rows over `b`'s views: the turn with the

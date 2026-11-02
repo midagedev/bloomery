@@ -220,6 +220,7 @@ pub const SITES: Sites35 = Sites35 {
     gate_up: LAUNCHED,
     down: LAUNCHED,
     shared: LAUNCHED,
+    bias: true,
 };
 
 /// How long a profiled group's stamps wait for the completed status its
@@ -2633,7 +2634,11 @@ impl ChainOps for Profiler<'_> {
     }
 
     fn attn_in(&mut self, l: LayerCtx<'_>, g: &GqaPlan) -> Result<(), SessionError> {
-        self.one(GroupKind::AttnP1, Some(l.layer), |o| o.attn_in(l, g))
+        self.one(GroupKind::AttnP1, Some(l.layer), |o| o.attn_p1(l))?;
+        if g.bias.is_some() {
+            self.one(GroupKind::AttnBias, Some(l.layer), |o| o.attn_bias(l))?;
+        }
+        Ok(())
     }
 
     fn attn_core(&mut self, l: LayerCtx<'_>, _: &GqaPlan) -> Result<(), SessionError> {

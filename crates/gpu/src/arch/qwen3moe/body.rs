@@ -402,6 +402,7 @@ fn parts_of(l: usize) -> (GqaPlan, FfnPlan) {
         window: None,
         gate: None,
         rope_freqs: None,
+        bias: None,
     };
     let f = FfnPlan {
         ffn_norm: names::ffn_norm(l),

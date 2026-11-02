@@ -309,6 +309,221 @@ pub const LLAMA_ATTN: Instance = Instance {
     opens: false,
 };
 
+/// A flash row of this backend's kernels at `head` values: one threadgroup of
+/// `group` SIMD groups a key head, no window, sinks or value multiplier, the
+/// kernel the row's `at` names.
+const fn flash_row(head: u32, group: u32, at: &'static str) -> GqaInst {
+    GqaInst {
+        head,
+        value: head,
+        pack: group,
+        group: shape::GroupRule::One,
+        window: false,
+        sinks: false,
+        value_scale: false,
+        at,
+    }
+}
+
+/// Qwen3.6's shape with the attention layers of Qwen3-1.7B: 16 heads over 8
+/// key heads of 128 values turned whole by NEOX pairs after the q and k head
+/// norms (two query heads a key head), a plain query. The kernel gate's row of
+/// a group of two at head 128; every other axis is the one its clauses have a
+/// fixture for. A file of Qwen3-0.6B or Qwen3-1.7B selects this row's flash
+/// ([`Key::of`]); its dense FFN has no row, so it opens an instance made at
+/// open.
+pub const QWEN3_ATTN_GQA2: Instance = Instance {
+    name: "qwen3_attn_gqa2",
+    key: Key {
+        attn: AttnAxes {
+            row: flash_row(
+                128,
+                2,
+                "metal/kernels/attention.metal (two SIMD groups a key head)",
+            ),
+            n_head: 16,
+            n_kv: 8,
+            rot: 128,
+            q_gate: false,
+            head_gate: false,
+            qk_norm: true,
+            norm_pairs: false,
+        },
+        ..QWEN35MOE_A3B.key
+    },
+    host_feature: Some("host-qwen3-attn-gqa2"),
+    opens: false,
+};
+
+/// Qwen3.6's shape with the attention layers of Llama-3.2-3B: 24 heads over 8
+/// key heads of 128 values turned whole, no q/k head norm and the rope pairing
+/// neighbours (three query heads a key head). The kernel gate's row of a group
+/// of three at head 128; every other axis is the one its clauses have a
+/// fixture for. A file of Llama-3.2-3B selects this row's flash ([`Key::of`]);
+/// its dense FFN has no row, so it opens an instance made at open.
+pub const LLAMA_ATTN_GQA3: Instance = Instance {
+    name: "llama_attn_gqa3",
+    key: Key {
+        attn: AttnAxes {
+            row: flash_row(
+                128,
+                3,
+                "metal/kernels/attention.metal (three SIMD groups a key head)",
+            ),
+            n_head: 24,
+            n_kv: 8,
+            rot: 128,
+            q_gate: false,
+            head_gate: false,
+            qk_norm: false,
+            norm_pairs: true,
+        },
+        ..QWEN35MOE_A3B.key
+    },
+    host_feature: Some("host-llama-attn-gqa3"),
+    opens: false,
+};
+
+/// Qwen3.6's shape with the attention layers of Llama-3.2-1B: 32 heads over 8
+/// key heads of 64 values turned whole, no q/k head norm and the rope pairing
+/// neighbours (four query heads a key head). The kernel gate's row of the
+/// head-64 axis, where a lane holds two values; every other axis is the one
+/// its clauses have a fixture for. A file of Llama-3.2-1B selects this row's
+/// flash ([`Key::of`]); its dense FFN has no row, so it opens an instance made
+/// at open.
+pub const LLAMA_ATTN_H64: Instance = Instance {
+    name: "llama_attn_h64",
+    key: Key {
+        attn: AttnAxes {
+            row: flash_row(
+                64,
+                4,
+                "metal/kernels/attention.metal (four SIMD groups a key head, two values a lane)",
+            ),
+            n_head: 32,
+            n_kv: 8,
+            rot: 64,
+            q_gate: false,
+            head_gate: false,
+            qk_norm: false,
+            norm_pairs: true,
+        },
+        ..QWEN35MOE_A3B.key
+    },
+    host_feature: Some("host-llama-attn-h64"),
+    opens: false,
+};
+
+/// Qwen3.6's shape with the attention flash of Qwen2.5-14B: 40 heads over 8
+/// key heads of 128 values turned whole, five query heads a key head, with
+/// no q/k head norm and the NEOX halves. A threadgroup of the 8 key heads'
+/// five SIMD groups is 1280 threads, past the thread limit the split flash
+/// declares its maximum for, so this row runs the kernel the compiler
+/// allocates alone. The kernel gate's row of a group of five at head 128.
+pub const NEOX_ATTN_GQA5: Instance = Instance {
+    name: "neox_attn_gqa5",
+    key: Key {
+        attn: AttnAxes {
+            row: flash_row(
+                128,
+                5,
+                "metal/kernels/attention.metal (five SIMD groups a key head)",
+            ),
+            n_head: 40,
+            n_kv: 8,
+            rot: 128,
+            q_gate: false,
+            head_gate: false,
+            qk_norm: false,
+            norm_pairs: false,
+        },
+        ..QWEN35MOE_A3B.key
+    },
+    host_feature: Some("host-neox-attn-gqa5"),
+    opens: false,
+};
+
+/// Qwen3.6's shape with the attention flash of Qwen2.5-1.5B: 12 heads over 2
+/// key heads of 128 values turned whole, six query heads a key head, with
+/// no q/k head norm and the NEOX halves. The kernel gate's row of a group
+/// of six at head 128.
+pub const NEOX_ATTN_GQA6: Instance = Instance {
+    name: "neox_attn_gqa6",
+    key: Key {
+        attn: AttnAxes {
+            row: flash_row(
+                128,
+                6,
+                "metal/kernels/attention.metal (six SIMD groups a key head)",
+            ),
+            n_head: 12,
+            n_kv: 2,
+            rot: 128,
+            q_gate: false,
+            head_gate: false,
+            qk_norm: false,
+            norm_pairs: false,
+        },
+        ..QWEN35MOE_A3B.key
+    },
+    host_feature: Some("host-neox-attn-gqa6"),
+    opens: false,
+};
+
+/// Qwen3.6's shape with the attention flash of Qwen2.5-7B: 28 heads over 4
+/// key heads of 128 values turned whole, seven query heads a key head, with
+/// no q/k head norm and the NEOX halves. The kernel gate's row of a group
+/// of seven at head 128.
+pub const NEOX_ATTN_GQA7: Instance = Instance {
+    name: "neox_attn_gqa7",
+    key: Key {
+        attn: AttnAxes {
+            row: flash_row(
+                128,
+                7,
+                "metal/kernels/attention.metal (seven SIMD groups a key head)",
+            ),
+            n_head: 28,
+            n_kv: 4,
+            rot: 128,
+            q_gate: false,
+            head_gate: false,
+            qk_norm: false,
+            norm_pairs: false,
+        },
+        ..QWEN35MOE_A3B.key
+    },
+    host_feature: Some("host-neox-attn-gqa7"),
+    opens: false,
+};
+
+/// Qwen3.6's shape with the attention flash of Qwen2.5-0.5B: 14 heads over 2
+/// key heads of 64 values turned whole, seven query heads a key head and two
+/// values a lane, with no q/k head norm and the NEOX halves. The kernel gate's
+/// row of a group of seven at head 64.
+pub const NEOX_ATTN_H64_GQA7: Instance = Instance {
+    name: "neox_attn_h64_gqa7",
+    key: Key {
+        attn: AttnAxes {
+            row: flash_row(
+                64,
+                7,
+                "metal/kernels/attention.metal (seven SIMD groups a key head, two values a lane)",
+            ),
+            n_head: 14,
+            n_kv: 2,
+            rot: 64,
+            q_gate: false,
+            head_gate: false,
+            qk_norm: false,
+            norm_pairs: false,
+        },
+        ..QWEN35MOE_A3B.key
+    },
+    host_feature: Some("host-neox-attn-h64-gqa7"),
+    opens: false,
+};
+
 /// Every instance `build.rs` writes and compiles. A shape with no row here
 /// is compiled at open when every kernel family takes its geometry
 /// ([`select`]), from the source; a row here is the route to its metallib
@@ -321,6 +536,13 @@ pub const REGISTERED: &[Instance] = &[
     QWEN35MOE_GQA4,
     LFM3_ATTN,
     LLAMA_ATTN,
+    QWEN3_ATTN_GQA2,
+    LLAMA_ATTN_GQA3,
+    LLAMA_ATTN_H64,
+    NEOX_ATTN_GQA5,
+    NEOX_ATTN_GQA6,
+    NEOX_ATTN_GQA7,
+    NEOX_ATTN_H64_GQA7,
 ];
 
 /// The name of an instance made at open for a shape no row registers. No
@@ -335,14 +557,27 @@ pub const UNREGISTERED: &str = "unregistered";
 /// `host-qwen35moe-gdn48`, the six-query-head group's under
 /// `host-qwen35moe-gqa6`, the four-query-head group's under `host-qwen35moe-gqa4`,
 /// the windowed, per-head gated head-128 attention's under `host-lfm3-attn`,
-/// the norm-free neighbour-paired head-128 attention's under `host-llama-attn`.
+/// the norm-free neighbour-paired head-128 attention's under `host-llama-attn`
+/// (a group of four), `host-llama-attn-gqa3` (three) and, at head 64,
+/// `host-llama-attn-h64` (four), the head-normed NEOX head-128 attention of two
+/// query heads a key head under `host-qwen3-attn-gqa2`, and the norm-free NEOX
+/// attention of Qwen2 under `host-neox-attn-gqa5`, `host-neox-attn-gqa6` and
+/// `host-neox-attn-gqa7` (head 128, groups of five, six and seven) and
+/// `host-neox-attn-h64-gqa7` (head 64, seven).
 #[cfg(not(any(
     feature = "host-qwen3moe-a3b",
     feature = "host-qwen35moe-gdn48",
     feature = "host-qwen35moe-gqa6",
     feature = "host-qwen35moe-gqa4",
     feature = "host-lfm3-attn",
-    feature = "host-llama-attn"
+    feature = "host-llama-attn",
+    feature = "host-qwen3-attn-gqa2",
+    feature = "host-llama-attn-gqa3",
+    feature = "host-neox-attn-gqa5",
+    feature = "host-neox-attn-gqa6",
+    feature = "host-neox-attn-gqa7",
+    feature = "host-llama-attn-h64",
+    feature = "host-neox-attn-h64-gqa7"
 )))]
 pub const HOST: Instance = QWEN35MOE_A3B;
 
@@ -361,6 +596,34 @@ pub const HOST: Instance = LFM3_ATTN;
 /// The instance the host is written at (see the default build's).
 #[cfg(feature = "host-llama-attn")]
 pub const HOST: Instance = LLAMA_ATTN;
+
+/// The instance the host is written at (see the default build's).
+#[cfg(feature = "host-qwen3-attn-gqa2")]
+pub const HOST: Instance = QWEN3_ATTN_GQA2;
+
+/// The instance the host is written at (see the default build's).
+#[cfg(feature = "host-llama-attn-gqa3")]
+pub const HOST: Instance = LLAMA_ATTN_GQA3;
+
+/// The instance the host is written at (see the default build's).
+#[cfg(feature = "host-llama-attn-h64")]
+pub const HOST: Instance = LLAMA_ATTN_H64;
+
+/// The instance the host is written at (see the default build's).
+#[cfg(feature = "host-neox-attn-gqa5")]
+pub const HOST: Instance = NEOX_ATTN_GQA5;
+
+/// The instance the host is written at (see the default build's).
+#[cfg(feature = "host-neox-attn-gqa6")]
+pub const HOST: Instance = NEOX_ATTN_GQA6;
+
+/// The instance the host is written at (see the default build's).
+#[cfg(feature = "host-neox-attn-gqa7")]
+pub const HOST: Instance = NEOX_ATTN_GQA7;
+
+/// The instance the host is written at (see the default build's).
+#[cfg(feature = "host-neox-attn-h64-gqa7")]
+pub const HOST: Instance = NEOX_ATTN_H64_GQA7;
 
 /// The instance the host is written at (see the default build's).
 #[cfg(feature = "host-qwen3moe-a3b")]
@@ -1413,9 +1676,149 @@ mod tests {
         );
     }
 
+    /// The dense small models' attention shapes select the row of their own
+    /// group and width, and each file's key opens an instance made at open at
+    /// them (no row registers a dense FFN): Qwen3-0.6B and Qwen3-1.7B's
+    /// 16 heads over 8 of 128 (a group of two, head norms, NEOX), Llama-3.2-3B's
+    /// 24 over 8 of 128 (a group of three, NORM pairs, no head norm) and
+    /// Llama-3.2-1B's 32 over 8 of 64 (a group of four, a lane of two values).
+    /// Mutant: `served_rows` leaves a registered row out, or `Key::of` reads
+    /// the rows of the card's table.
+    #[test]
+    fn the_small_dense_models_select_the_rows_of_their_group_and_width() {
+        type Case = (&'static str, Instance, (u32, u32, u32, u32), RopeMode, bool);
+        let cases: [Case; 4] = [
+            (
+                "Qwen3-0.6B",
+                QWEN3_ATTN_GQA2,
+                (1024, 3072, 16, 128),
+                RopeMode::Neox,
+                true,
+            ),
+            (
+                "Qwen3-1.7B",
+                QWEN3_ATTN_GQA2,
+                (2048, 6144, 16, 128),
+                RopeMode::Neox,
+                true,
+            ),
+            (
+                "Llama-3.2-3B",
+                LLAMA_ATTN_GQA3,
+                (3072, 8192, 24, 128),
+                RopeMode::NormTail,
+                false,
+            ),
+            (
+                "Llama-3.2-1B",
+                LLAMA_ATTN_H64,
+                (2048, 8192, 32, 64),
+                RopeMode::NormTail,
+                false,
+            ),
+        ];
+        for (name, inst, (hidden, ff, heads, head), mode, qk_norm) in cases {
+            let a = inst.key.attn;
+            let layers: Vec<(Mixer, Ffn)> = (0..2)
+                .map(|_| {
+                    (
+                        gqa_axes(heads, 8, head, head, OutGate::None, mode, qk_norm),
+                        dense_ffn(ff),
+                    )
+                })
+                .collect();
+            let k = key(hidden, &layers).expect("this backend's rows serve the attention");
+            assert_eq!(k.attn, a, "{name}");
+            assert!(of_key(k).is_err(), "{name}: no row registers a dense FFN");
+            let opened = open_key(k).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(opened.name, UNREGISTERED, "{name}");
+            assert_eq!(opened.key.attn, a, "{name}");
+            assert_eq!(Geometry::of(opened).check(), Ok(()), "{name}");
+            assert!(
+                a.row.at.starts_with("metal/kernels/attention.metal") && !a.row.window,
+                "{name}: {}",
+                a.row.at
+            );
+        }
+    }
+
+    /// The attention of Qwen2.5 (NEOX pairs, no head norm) selects the flash
+    /// row of its group and width and opens an instance made at open at the
+    /// rows' own attention axes (no row registers a dense FFN): 40 heads over 8
+    /// of 128 (Qwen2.5-14B, a group of five), 12 over 2 (1.5B, six), 28 over 4
+    /// (7B, seven) and 14 over 2 of 64 (0.5B, seven at head 64). Mutant:
+    /// `served_rows` leaves out the group of five, six or seven, or `Key::of`
+    /// reads the rope mode of no layer. The hidden width is one the router
+    /// takes (a multiple of 1024); the files' own (896, 1536, 3584) are the
+    /// router's refusal, which this test does not pin.
+    #[test]
+    fn qwen2_attention_selects_its_row_and_opens_with_the_raw_neox_prologue() {
+        const HIDDEN: u32 = 2048;
+        let cases = [
+            ("Qwen2.5-14B", 40, 8, 128, NEOX_ATTN_GQA5),
+            ("Qwen2.5-1.5B", 12, 2, 128, NEOX_ATTN_GQA6),
+            ("Qwen2.5-7B", 28, 4, 128, NEOX_ATTN_GQA7),
+            ("Qwen2.5-0.5B", 14, 2, 64, NEOX_ATTN_H64_GQA7),
+        ];
+        for (name, heads, kv, head, inst) in cases {
+            let layers = vec![(
+                gqa_axes(heads, kv, head, head, OutGate::None, RopeMode::Neox, false),
+                dense_ffn(8960),
+            )];
+            let k = key(HIDDEN, &layers).expect("this backend's rows serve the group");
+            assert_eq!(k.attn, inst.key.attn, "{name}");
+            assert!(!k.attn.qk_norm && !k.attn.norm_pairs, "{name}");
+            assert!(of_key(k).is_err(), "{name}: no row registers a dense FFN");
+            let opened = open_key(k).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(opened.name, UNREGISTERED, "{name}");
+            assert_eq!(Geometry::of(opened).check(), Ok(()), "{name}");
+        }
+    }
+
+    /// A group or a head width no registered row serves is still refused by
+    /// name, with the groups the head's rows take, in the order they are
+    /// preferred: Llama-2-7B's 32 heads over 32 of 128 (a group of one) and
+    /// SmolLM2-135M's 9 over 3 of 64 (a group of three).
+    #[test]
+    fn a_group_no_row_takes_is_refused_with_the_groups_its_head_serves() {
+        let refused = |heads: u32, kv: u32, head: u32| {
+            let layers = vec![(
+                gqa_axes(
+                    heads,
+                    kv,
+                    head,
+                    head,
+                    OutGate::None,
+                    RopeMode::NormTail,
+                    false,
+                ),
+                dense_ffn(1536),
+            )];
+            match key(576, &layers) {
+                Err(Refused::Row { layer: 0, why }) => why.why,
+                got => panic!("not a row's refusal at layer 0: {got:?}"),
+            }
+        };
+        let take = |groups: &[u32]| groups.iter().map(|g| format!("exactly {g}")).collect();
+        assert_eq!(
+            refused(32, 32, 128),
+            Refusal::GqaGroup {
+                group: 1,
+                served: take(&[8, 7, 6, 5, 4, 3, 2])
+            }
+        );
+        assert_eq!(
+            refused(9, 3, 64),
+            Refusal::GqaGroup {
+                group: 3,
+                served: take(&[7, 4])
+            }
+        );
+    }
+
     /// A flash no registered row serves is refused by name at its layer, with
     /// what this backend's rows serve: the widths are the registered rows',
-    /// not the card's table's (which lists heads 64 and 192 too), and a window
+    /// not the card's table's (which lists head 192 too), and a window
     /// or sinks the selected row has no column for are that row's refusals.
     /// Mutant: `Key::of` selects over `shape::GQA`, or the row's window column
     /// is read as true.
@@ -1429,10 +1832,11 @@ mod tests {
             .into_iter()
             .map(|(_, f)| (gqa_gated(16, 2, 160, 128, OutGate::None), f))
             .collect();
+        // PIN(2026-11-02): head 64 joined the served widths with its row (`llama_attn_h64`).
         assert_eq!(
             refused(&wide),
             Refusal::HeadWidth {
-                served: vec![128, 256]
+                served: vec![64, 128, 256]
             }
         );
         let edit = |apply: fn(&mut Gqa)| -> Vec<(Mixer, Ffn)> {

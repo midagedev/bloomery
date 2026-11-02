@@ -81,6 +81,7 @@ const WIDEST: Sites35 = Sites35 {
     gate_up: ANY,
     down: ANY,
     shared: ANY,
+    bias: true,
 };
 
 fn refuse(detail: impl Into<String>) -> SessionError {
@@ -304,6 +305,9 @@ pub(super) struct AttnLayout {
     /// and holds no gains.
     pub(super) q_norm: Option<Values>,
     pub(super) k_norm: Option<Values>,
+    /// The query, key and value biases, added to the P1 output's rows, on a
+    /// layer whose file holds them.
+    pub(super) bias: Option<[Values; 3]>,
     /// The elements of one cache plane.
     pub(super) cache: usize,
     /// The output gate of one value a query head is the P1's fourth segment,
@@ -1208,11 +1212,28 @@ fn attention_checks(
         Some((q, k)) => (Some(q?), Some(k?)),
         None => (None, None),
     };
+    // The biases are the q, k and v rows' own: a layer with an output gate
+    // keeps its gate rows beside the query's, which no bias covers.
+    let bias = g.bias.as_ref().map(|b| {
+        if g.gate.is_some() {
+            at.push(refuse("a layer with an output gate has q, k and v biases"));
+            return None;
+        }
+        let q = at.ok(t.f32s(&b.q, q_rows?))?;
+        let k = at.ok(t.f32s(&b.k, kv_rows))?;
+        let v = at.ok(t.f32s(&b.v, kv_rows))?;
+        Some([q, k, v])
+    });
+    let bias = match bias {
+        Some(b) => Some(b?),
+        None => None,
+    };
     Some(AttnLayout {
         p1: p1?,
         out: out?,
         q_norm,
         k_norm,
+        bias,
         cache: cache?,
         gate: g.gate.is_some(),
         window: g.window,
@@ -1648,6 +1669,10 @@ impl Checked {
                     b.weights.add(a.out.bytes());
                     for v in [&a.q_norm, &a.k_norm].into_iter().flatten() {
                         b.weights.add(f32s(v.len));
+                    }
+                    // The arena holds the q, k and v biases as one buffer.
+                    if let Some(bias) = &a.bias {
+                        b.weights.add(f32s(bias.iter().map(|v| v.len).sum()));
                     }
                     b.kv.add(count(a.cache) * 2);
                     b.kv.add(count(a.cache) * 2);
@@ -2167,6 +2192,33 @@ mod tests {
             t
         }
 
+        /// The table of a dense Llama file at head 64 (Llama-3.2-1B: 32 query heads over 8 key
+        /// heads of 64 values): [`Synthetic::llama`] with its head halved, the rope turning the
+        /// whole head and its frequency factors a pair a value pair.
+        fn llama_h64(tied: bool) -> Synthetic {
+            const HEADS: u64 = 32;
+            const KV: u64 = 8;
+            const HEAD: u64 = 64;
+            let mut t = Synthetic::llama(tied);
+            let hidden = t.tensor("token_embd.weight").1[0];
+            t = t
+                .kv("llama.attention.key_length", Value::U32(64))
+                .kv("llama.attention.value_length", Value::U32(64))
+                .kv("llama.rope.dimension_count", Value::U32(64))
+                .dims("rope_freqs.weight", &[HEAD / 2]);
+            for l in 0..2 {
+                t = t
+                    .dims(&format!("blk.{l}.attn_q.weight"), &[hidden, HEADS * HEAD])
+                    .dims(&format!("blk.{l}.attn_k.weight"), &[hidden, KV * HEAD])
+                    .dims(&format!("blk.{l}.attn_v.weight"), &[hidden, KV * HEAD])
+                    .dims(
+                        &format!("blk.{l}.attn_output.weight"),
+                        &[HEADS * HEAD, hidden],
+                    );
+            }
+            t
+        }
+
         /// The table of a dense Qwen3 file (`qwen3`) — the 8B's 32 query heads over 8 or the
         /// 32B's 64 — at the axes no registered row holds: every layer's q and k norms read,
         /// the rope turning NEOX halves with no frequency factors, an untied head unless `tied`,
@@ -2409,6 +2461,110 @@ mod tests {
         }
     }
 
+    /// A dense Llama file whose layers hold the three attention biases opens with them: each
+    /// layer's layout names its three F32 vectors of the query's, the key's and the value's rows,
+    /// and a layer with none holds none. A bias of another length, or two of the three, is
+    /// refused by name with the tensor. Mutant: `attention_checks` reading no bias (the first
+    /// assertion).
+    #[test]
+    fn a_llama_file_with_qkv_biases_reads_them_as_the_layers_rows() {
+        let biased = |len: u64, all: bool| {
+            let mut t = Synthetic::llama(false);
+            for l in 0..2 {
+                let b = |stem: &str| format!("blk.{l}.{stem}");
+                t.add(&b("attn_q.bias"), &[len], GgmlType::F32);
+                t.add(&b("attn_k.bias"), &[1024], GgmlType::F32);
+                if all {
+                    t.add(&b("attn_v.bias"), &[1024], GgmlType::F32);
+                }
+            }
+            t
+        };
+        let t = biased(4096, true);
+        let out = check(&t.split(), CTX);
+        assert!(out.items.is_empty(), "{:?}", out.items);
+        let checked = out.checked.expect("a checked file");
+        for (l, layer) in checked.layout.layers.iter().enumerate() {
+            let MixerLayout::Attention(a) = &layer.mixer else {
+                panic!("a layer mixes with another");
+            };
+            let bias = a.bias.as_ref().expect("the layer's biases");
+            let names: Vec<&str> = bias.iter().map(|v| v.name.as_str()).collect();
+            assert_eq!(
+                names,
+                [
+                    format!("blk.{l}.attn_q.bias"),
+                    format!("blk.{l}.attn_k.bias"),
+                    format!("blk.{l}.attn_v.bias")
+                ]
+            );
+            assert_eq!(
+                bias.iter().map(|v| v.len).collect::<Vec<_>>(),
+                [4096, 1024, 1024]
+            );
+        }
+        let plain = check(&Synthetic::llama(false).split(), CTX);
+        let plain = plain.checked.expect("a checked file");
+        assert!(plain.layout.layers.iter().all(|layer| matches!(
+            &layer.mixer,
+            MixerLayout::Attention(a) if a.bias.is_none()
+        )));
+        for (what, t, needle) in [
+            (
+                "a short query bias",
+                biased(4095, true),
+                "blk.0.attn_q.bias",
+            ),
+            ("no value bias", biased(4096, false), "blk.0.attn_v.bias"),
+        ] {
+            let got = texts(&t.split(), CTX);
+            assert!(
+                got.first().is_some_and(|text| text.contains(needle)),
+                "{what}: {got:?}"
+            );
+        }
+    }
+
+    /// A dense Llama file of 64-value heads (Llama-3.2-1B's 32/8) opens at the head-64 flash
+    /// row of its group of four, an instance made at open with the no-norm, neighbour-paired
+    /// axes and the file's frequency factors: its layers hold no q/k norm gains and a tied one
+    /// reads the token embedding as the head. Mutant: the head-64 class row dropped from the
+    /// chain's table, or `holds` refusing a lane of two values.
+    #[test]
+    fn a_dense_llama_of_head_64_opens_at_the_head_64_row() {
+        for tied in [false, true] {
+            let t = Synthetic::llama_h64(tied);
+            let out = check(&t.split(), CTX);
+            assert!(out.items.is_empty(), "tied {tied}: {:?}", out.items);
+            let checked = out.checked.expect("a checked file");
+            assert_eq!(checked.instance.name, instance::UNREGISTERED);
+            assert_eq!(checked.instance.key.attn, instance::LLAMA_ATTN_H64.key.attn);
+            assert_eq!(checked.geom.attn.lane_dims, 2);
+            assert!(!checked.geom.attn.qk_norm && checked.geom.attn.norm_pairs);
+            let head_name = if tied {
+                "token_embd.weight"
+            } else {
+                "output.weight"
+            };
+            assert_eq!(checked.layout.head.name, head_name, "tied {tied}");
+            for layer in &checked.layout.layers {
+                let MixerLayout::Attention(a) = &layer.mixer else {
+                    panic!("tied {tied}: a layer mixes with another");
+                };
+                assert!(
+                    a.q_norm.is_none() && a.k_norm.is_none(),
+                    "tied {tied}: a layer holds head norm gains"
+                );
+            }
+            let bytes = checked.bytes().expect("the bytes");
+            assert_eq!(
+                bytes.weights.requested,
+                t.weight_bytes(),
+                "tied {tied}: the weights"
+            );
+        }
+    }
+
     /// The same file with each layer's q and k norms is a head norm over the
     /// neighbour pairs, a combination no kernel takes: refused by name at the
     /// instance, before any arena rule.
@@ -2437,15 +2593,27 @@ mod tests {
 
     /// A dense Qwen3 file opens at an instance made at open with the normed, NEOX-paired
     /// attention axes: the 8B's 32/8 heads take the pack-of-four flash row (the windowed
-    /// head-128 row a Llama file takes, launched with no window) and the 32B's 64/8 the
-    /// registered group-of-eight row, every layer's q and k norms read beside the projections,
-    /// and a tied one (no `output.weight`) reads the token embedding as the head. Mutant: the
-    /// map's family read as Llama's (the q/k norms are then no tensors of the file).
+    /// head-128 row a Llama file takes, launched with no window), the 32B's 64/8 the
+    /// registered group-of-eight row, and the groups of two (the 0.6B's and 1.7B's 16/8), three,
+    /// five (the 14B's 40/8), six and seven the rows of their own group, every layer's q and k
+    /// norms read beside the projections, and a tied one (no `output.weight`) reads the token
+    /// embedding as the head. Mutant: the map's family read as Llama's (the q/k norms are then
+    /// no tensors of the file).
     #[test]
     fn a_dense_qwen3_opens_with_head_norms_on_the_neox_rope() {
         let four = instance::LLAMA_ATTN.key.attn.row;
         let eight = instance::QWEN3MOE_A3B.key.attn.row;
-        for (heads, tied, row) in [(32u32, false, four), (32, true, four), (64, false, eight)] {
+        let by = |inst: instance::Instance| inst.key.attn.row;
+        for (heads, tied, row) in [
+            (32u32, false, four),
+            (32, true, four),
+            (64, false, eight),
+            (16, true, by(instance::QWEN3_ATTN_GQA2)),
+            (24, false, by(instance::LLAMA_ATTN_GQA3)),
+            (40, false, by(instance::NEOX_ATTN_GQA5)),
+            (48, false, by(instance::NEOX_ATTN_GQA6)),
+            (56, false, by(instance::NEOX_ATTN_GQA7)),
+        ] {
             let t = Synthetic::qwen3(u64::from(heads), tied);
             let out = check(&t.split(), CTX);
             assert!(
@@ -2489,17 +2657,17 @@ mod tests {
     }
 
     /// A Qwen3 this backend's kernels do not take is refused by name at the instance, before any
-    /// plan: the 14B's 40/8 is a query-head group no flash row serves, and the refusal names the
-    /// group and the groups the rows take.
+    /// plan: 128 query heads over 8 key heads is a group of sixteen no flash row serves, and the
+    /// refusal names the group and the groups the rows take.
     #[test]
     fn a_qwen3_no_kernel_takes_is_refused_by_name_at_the_instance() {
-        let t = Synthetic::qwen3(40, false);
+        let t = Synthetic::qwen3(128, false);
         let got = texts(&t.split(), CTX);
-        let want = "attention 40/8 heads of 128: group 5; this head's flashes take exactly 8, \
-                    exactly 4";
+        let want = "attention 128/8 heads of 128: group 16; this head's flashes take exactly 8, \
+                    exactly 7, exactly 6, exactly 5, exactly 4, exactly 3, exactly 2";
         assert!(
             got.first().is_some_and(|text| text.contains(want)),
-            "a group of five: {got:?}"
+            "a group of sixteen: {got:?}"
         );
     }
 

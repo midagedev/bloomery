@@ -33,6 +33,8 @@ pub enum Mutants {
     /// The dense Qwen3's: the head norm and the NEOX pairs of its group-of-four attention, which
     /// the first position reads none of (one key, a rope angle of 0).
     Qwen3,
+    /// The dense Qwen2's: the bias add after P1, which every other row's layers have none of.
+    Qwen2,
     /// None: the row runs the kernels of another row's tables.
     None,
 }
@@ -199,6 +201,39 @@ const QWEN3_LOGIT_ABS: f64 = 0.08;
 const QWEN3_LOGIT_CAP: f64 = 0.23;
 
 const _: () = assert!(QWEN3_LOGIT_ABS <= QWEN3_LOGIT_CAP);
+
+/// PIN(2026-11-02): max |session − pin| on a logit of the 4-layer cut of Qwen3-4B-Instruct-2507's
+/// folder at each pinned step (`pins/qwen3t.txt`); the pin is mlx-lm's `qwen3` in f32 over the
+/// exact dequant of the folder's 4-bit weights, its head the embedding table. Derived like
+/// `QWEN3_LOGIT_ABS`, from the pin's largest logit, 17.56 (step 2), and the folder's head norm
+/// gains: the rms of a layer's q_norm gain times the rms of its k_norm gain is 8.60, 3.46, 2.84
+/// and 3.25 in layers 0 to 3, the squares of those four scales sum to 104.5, so
+/// √(3 · 104.5 + 4 · 5 + 1) = 18.3, and 18.3 · 2.8e-4 · 17.56 = 0.090 of a logit, rounded up. The
+/// tied head reads the embedding's 4-bit rows as its matrix: the head's one input rounding is the
+/// same as an untied head's, and the table's bits are the pin's own.
+const QWEN3T_LOGIT_ABS: f64 = 0.09;
+
+/// Half the smallest top-2 gap of the pin's four rows, 0.3450 at step 2, rounded down.
+const QWEN3T_LOGIT_CAP: f64 = 0.17;
+
+const _: () = assert!(QWEN3T_LOGIT_ABS <= QWEN3T_LOGIT_CAP);
+
+/// PIN(2026-11-02): max |session − pin| on a logit of the 4-layer cut of Qwen2.5-Coder-7B-Instruct's
+/// folder at each pinned step (`pins/qwen2.txt`; the pin is mlx-lm's `qwen2` in f32 over the exact
+/// dequant of the folder's 4-bit weights, its q, k and v biases added in f32). The summed rule of
+/// [`QWEN3_LOGIT_ABS`] takes each score's rounding at the product of the q and k rms, and Qwen2's k
+/// bias puts that product at 103 in layer 0: the sum, √(3 · 10766 + 4 · 5 + 1) · 2.8e-4 · 20.75 =
+/// 1.1, passes the cap. The band is the same rounding rule simulated, not summed, as
+/// [`LFM3_DEEP_LOGIT_ABS`]'s: `tools/mlx-logits.py simulate` runs the pin's model in f32 with the
+/// input of every projection and of the head, and the K and V the cache stores, rounded once into
+/// half. Its worst against the pin is 1.96e-2 at step 1 (0 with no rounding, 1.63e-2 with the
+/// stored keys alone), rounded up.
+const QWEN2_LOGIT_ABS: f64 = 0.02;
+
+/// Half the smallest top-2 gap of the pin's four rows, 0.3054 at step 3, rounded down.
+const QWEN2_LOGIT_CAP: f64 = 0.15;
+
+const _: () = assert!(QWEN2_LOGIT_ABS <= QWEN2_LOGIT_CAP);
 
 /// Qwen3.6-35B-A3B's fixture: the gated delta net beside the attention layers.
 pub static QWEN35MOE: Row = Row {
@@ -369,6 +404,33 @@ pub static LLAMA: Row = Row {
     ],
 };
 
+/// The clauses a dense Qwen3 folder's row skips, with each reason.
+const QWEN3_SKIPS: &[(&str, &str)] = &[
+    (
+        "q_state",
+        "the clause compares a delta layer's state and conv ring and the file has no delta \
+             layer; q_chunk holds the pass's key and value rows",
+    ),
+    (
+        "q_mark",
+        "a pass's marks copy its delta stores and the file has none",
+    ),
+    (
+        "q_mark_cut",
+        "a cut back to a mark restores a delta store and the file has none",
+    ),
+    (
+        "p_profile",
+        "not on a dense FFN: the clause walks each layer's router picks and the experts' \
+             stack slices of the file's own tensors",
+    ),
+    (
+        "m_mlx_folder",
+        "the folder is every clause's model and there is no prepared split to tell it \
+             against; `m_logits` holds the folder's own logits to the pin",
+    ),
+];
+
 /// Qwen3-8B's checkpoint folder cut to its first four layers (the folder's own bits,
 /// `tools/mlx-fixture-cuts`): grouped-query attention of 32 heads over 8 key heads of 128 values
 /// with a q and a k head norm and the NEOX rope, a plain residual and a dense SwiGLU in every
@@ -401,35 +463,71 @@ pub static QWEN3: Row = Row {
         dispatches: 31,
     }),
     mutants: Mutants::Qwen3,
-    skips: &[
-        (
-            "q_state",
-            "the clause compares a delta layer's state and conv ring and the file has no delta \
-             layer; q_chunk holds the pass's key and value rows",
-        ),
-        (
-            "q_mark",
-            "a pass's marks copy its delta stores and the file has none",
-        ),
-        (
-            "q_mark_cut",
-            "a cut back to a mark restores a delta store and the file has none",
-        ),
-        (
-            "p_profile",
-            "not on a dense FFN: the clause walks each layer's router picks and the experts' \
-             stack slices of the file's own tensors",
-        ),
-        (
-            "m_mlx_folder",
-            "the folder is every clause's model and there is no prepared split to tell it \
-             against; `m_logits` holds the folder's own logits to the pin",
-        ),
-    ],
+    skips: QWEN3_SKIPS,
+};
+
+/// Qwen3-4B-Instruct-2507's checkpoint folder cut to its first four layers (`tools/mlx-fixture-cuts`),
+/// the dense Qwen3 of the `qwen3` row at hidden width 2560 and with its head tied to the embedding:
+/// the cut keeps no `lm_head` tensor and the config's `tie_word_embeddings` true, so the session's
+/// head reads the embedding's table (`check::head_tensor`). The prompt ids and the generation's
+/// first id are the `qwen3` row's.
+///
+/// The count is the `qwen3` row's: four layers of seven groups and the ends' three, 4 · 7 + 3 = 31,
+/// each one dispatch. The tied head adds none: it is the head's logits and pick, over the table.
+pub static QWEN3T: Row = Row {
+    name: "qwen3t",
+    arch: "qwen3t",
+    model: Model::Folder,
+    prompt: Prompt::D1k {
+        ik: &refset::arch::qwen3moe::fixture::IK,
+        set: refset::arch::qwen3moe::fixture::D1K,
+    },
+    seed: 0,
+    recurrent: false,
+    logit_abs: QWEN3T_LOGIT_ABS,
+    deep_logit_abs: None,
+    count: Some(Count {
+        groups: 31,
+        dispatches: 31,
+    }),
+    mutants: Mutants::Qwen3,
+    skips: QWEN3_SKIPS,
+};
+
+/// Qwen2.5-Coder-7B-Instruct's checkpoint folder cut to its first four layers
+/// (`tools/mlx-fixture-cuts/qwen2-mlx.json`): grouped-query attention of 28 heads over 4 key
+/// heads of 128 values (a group of seven) with a bias on the q, k and v projections, the NEOX rope
+/// and no head norm, a plain residual and a dense SwiGLU in every layer, and a head of its own,
+/// at hidden width 3584. The prompt ids and the generation's first id are the `qwen3` row's.
+///
+/// The count is the `qwen3` row's with one group a layer for the biases: four layers of eight
+/// groups (P1, the bias add, the flash, the out projection, a hand-on after the mixer, the
+/// gate-up, the down, a hand-on after the FFN) and the ends' three, 4 · 8 + 3 = 35, each one
+/// dispatch (the biases are added to the rows in one launch).
+pub static QWEN2: Row = Row {
+    name: "qwen2",
+    arch: "qwen2",
+    model: Model::Folder,
+    prompt: Prompt::D1k {
+        ik: &refset::arch::qwen3moe::fixture::IK,
+        set: refset::arch::qwen3moe::fixture::D1K,
+    },
+    seed: 0,
+    recurrent: false,
+    logit_abs: QWEN2_LOGIT_ABS,
+    deep_logit_abs: None,
+    count: Some(Count {
+        groups: 35,
+        dispatches: 35,
+    }),
+    mutants: Mutants::Qwen2,
+    skips: QWEN3_SKIPS,
 };
 
 /// Every row, the default first.
-pub static ROWS: [&Row; 6] = [&QWEN35MOE, &QWEN3MOE, &QWEN38D, &LFM3, &LLAMA, &QWEN3];
+pub static ROWS: [&Row; 8] = [
+    &QWEN35MOE, &QWEN3MOE, &QWEN38D, &LFM3, &LLAMA, &QWEN3, &QWEN3T, &QWEN2,
+];
 
 /// The row `--row` names.
 pub fn find(name: &str) -> Option<&'static Row> {

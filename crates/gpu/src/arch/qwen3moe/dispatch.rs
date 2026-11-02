@@ -634,6 +634,7 @@ pub(super) fn attn_core(
         GqaKind::Gated256 => gated_256(c, n, kv, s, m),
         // The head-128 NORM turn: `attn_append` refused every other kind.
         GqaKind::Head128 { .. } | GqaKind::HeadGate128 => norm_128(c, n, kv, s, m),
+        GqaKind::Head64 { .. } => Err(wide::head_64_refused()),
     }
 }
 
@@ -741,6 +742,7 @@ pub(super) fn attn_append(
             "qwen3moe::attention",
             "a head-128 attention with an output gate of its own, which no launch here serves",
         )),
+        GqaKind::Head64 { .. } => Err(wide::head_64_refused()),
     }
 }
 
@@ -878,6 +880,7 @@ pub(super) fn attn_out(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Res
                 "a head-128 attention with an output gate of its own, which no launch here serves",
             ));
         }
+        GqaKind::Head64 { .. } => return Err(wide::head_64_refused()),
     };
     out_resid(
         c,

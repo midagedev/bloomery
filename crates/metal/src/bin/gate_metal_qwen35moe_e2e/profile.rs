@@ -64,7 +64,8 @@ fn live_of(n_keys: usize) -> LiveKeys {
 }
 
 /// The kinds one token's groups are tagged with, as the file's own layer plans
-/// derive them: a mixer's three groups (P1, core, out), a join after the mixer
+/// derive them: a mixer's three groups (P1, core, out; an attention layer with biases adds the
+/// bias group after P1), a join after the mixer
 /// and another after the FFN where the layer's residual is a sandwich, or a
 /// hand-on after each where the session's layer hands its plain residual on
 /// (`layers`, the session's own reading: the plans hold no reader types), the
@@ -96,8 +97,11 @@ fn kinds_expected(plans: &[LayerPlan], layers: &[Layer]) -> Result<Vec<GroupKind
             }
         };
         match &plan.mixer {
-            MixerPlan::Gqa(_) => {
+            MixerPlan::Gqa(g) => {
                 out.push(GroupKind::AttnP1);
+                if g.bias.is_some() {
+                    out.push(GroupKind::AttnBias);
+                }
                 out.push(GroupKind::AttnFlash);
                 out.push(GroupKind::AttnOut);
             }

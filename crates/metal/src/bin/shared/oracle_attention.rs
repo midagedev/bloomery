@@ -208,10 +208,25 @@ pub fn norm_rope(x: &[f32], gain: &[f32], eps: f32, table_row: &[f32]) -> Result
             scaled_gain * x[i]
         })
         .collect();
-    let mut y = n.clone();
+    rope_neox(&n, table_row)
+}
+
+/// Rope of one head with no head norm, in the kernel's f32 order: the raw
+/// values turned as NEOX halves, pair `i` the values `i, i + rot / 2` by the
+/// table row's pair `i`, the values past the turned width passed through.
+pub fn rope_neox(x: &[f32], table_row: &[f32]) -> Result<Vec<f32>, String> {
+    let head = x.len();
+    let rot = table_row.len();
+    check_head(head)?;
+    if rot == 0 || !rot.is_multiple_of(2) || rot > head {
+        return Err(format!(
+            "a rope row holds {rot} values, which do not turn pairs of a head of {head}"
+        ));
+    }
+    let mut y = x.to_vec();
     for i in 0..rot / 2 {
-        let n0 = n[i];
-        let n1 = n[i + rot / 2];
+        let n0 = x[i];
+        let n1 = x[i + rot / 2];
         let c = table_row[2 * i];
         let s = table_row[2 * i + 1];
         y[i] = n0.mul_add(c, -(n1 * s));

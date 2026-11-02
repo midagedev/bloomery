@@ -540,7 +540,7 @@ fn root_rows() -> Vec<Row> {
         ["", "image_token_id", 248056, "x", "image_token_id"],
         ["", "language_model_only", false, "x", "language_model_only"],
         ["", "dtype", "bfloat16", 7, "dtype"],
-        ["", "tie_word_embeddings", false, true, "tie_word_embeddings"]
+        ["", "tie_word_embeddings", false, "x", "tie_word_embeddings"]
     ]"#,
     )
     .unwrap()

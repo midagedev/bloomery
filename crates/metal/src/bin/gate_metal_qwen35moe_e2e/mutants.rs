@@ -29,7 +29,8 @@
 //! windowed flash's first key and of the short conv's step ring, which only its
 //! deep pin (`m_logits_deep`) reads; Llama's is [`LLAMA`], an edit of the NORM-pairs
 //! prologue that `m_logits` reads; the dense Qwen3's are [`QWEN3`], edits of the head
-//! norm and of the NEOX pairs, which a first step reads none of. The edits compile into
+//! norm and of the NEOX pairs, which a first step reads none of; Qwen2's is [`QWEN2`], an edit of the
+//! bias add after P1, which the Llama row's layers have none of. The edits compile into
 //! the row's own instance's source (`program::source_at`), so they land in the
 //! program the row runs.
 
@@ -48,6 +49,7 @@ pub fn all(set: Mutants) -> impl Iterator<Item = (&'static Mutant, Program)> {
         Mutants::Lfm3 => (LFM3, &[]),
         Mutants::Llama => (LLAMA, &[]),
         Mutants::Qwen3 => (QWEN3, &[]),
+        Mutants::Qwen2 => (QWEN2, &[]),
         Mutants::None => (&[], &[]),
     };
     program::all(main, tensor)
@@ -57,7 +59,12 @@ pub fn all(set: Mutants) -> impl Iterator<Item = (&'static Mutant, Program)> {
 pub fn kept_of(set: Mutants) -> &'static [Mutant] {
     match set {
         Mutants::Routed => KEPT,
-        Mutants::Dense | Mutants::Lfm3 | Mutants::Llama | Mutants::Qwen3 | Mutants::None => &[],
+        Mutants::Dense
+        | Mutants::Lfm3
+        | Mutants::Llama
+        | Mutants::Qwen3
+        | Mutants::Qwen2
+        | Mutants::None => &[],
     }
 }
 
@@ -303,6 +310,20 @@ pub const LLAMA: &[Mutant] = &[Mutant {
     edits: &[(
         "float s = rope_row[i + 1u];",
         "float s = -rope_row[i + 1u];",
+        1,
+    )],
+}];
+
+/// Qwen2's defect `m_logits` must catch: the layer's q, k and v biases not added. The kernel adds
+/// a bias to every row of the P1 output, the step's and the pass's, so a layer that runs without
+/// one reads the projections alone.
+pub const QWEN2: &[Mutant] = &[Mutant {
+    name: "bias_skipped",
+    clause: "m_logits",
+    why: "the launch adds a zero where the layer's bias is, so a biased layer runs as an unbiased one",
+    edits: &[(
+        "y[gid.y * args.stride4 + gid.x] += bias[gid.x];",
+        "y[gid.y * args.stride4 + gid.x] += float4(0.f) * bias[gid.x];",
         1,
     )],
 }];

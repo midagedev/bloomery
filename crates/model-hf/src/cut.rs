@@ -3024,6 +3024,24 @@ pub(crate) mod tests {
         .unwrap()
     }
 
+    /// The qwen3t spec: the Metal-only MLX fixture cut of the dense 4B folder, whose head is its
+    /// embedding.
+    fn qwen3t_spec() -> Spec {
+        Spec::parse(include_str!(
+            "../../../tools/mlx-fixture-cuts/qwen3t-mlx.json"
+        ))
+        .unwrap()
+    }
+
+    /// The qwen2 spec: the Metal-only MLX fixture cut of the Qwen2.5-Coder 7B folder, whose
+    /// attention projections carry a bias.
+    fn qwen2_spec() -> Spec {
+        Spec::parse(include_str!(
+            "../../../tools/mlx-fixture-cuts/qwen2-mlx.json"
+        ))
+        .unwrap()
+    }
+
     /// The tensors of an MLX folder from its one committed shard header
     /// (`model.safetensors`), each tensor's first byte where the file holds it.
     fn one_file_source(fixture: &str) -> Vec<Src> {
@@ -3397,8 +3415,9 @@ pub(crate) mod tests {
         assert_eq!(matrices, 4 * 7 + 2);
     }
 
-    /// The llama and qwen3 specs over their real 8B `config.json` edit the one field that
-    /// names the layers and nothing else: `num_hidden_layers` 4.
+    /// The llama, qwen3, qwen3t and qwen2 specs over their real `config.json` edit the one field
+    /// that names the layers and nothing else: `num_hidden_layers` 4. The qwen3t folder's config
+    /// keeps `tie_word_embeddings` true, so the cut stays tied.
     #[test]
     fn the_dense_specs_edit_the_real_8b_configs_to_four_layers() {
         for (spec, fixture) in [
@@ -3409,6 +3428,14 @@ pub(crate) mod tests {
             (
                 qwen3_spec(),
                 "quant-configs/mlx-community__Qwen3-8B-4bit__config.json.gz",
+            ),
+            (
+                qwen3t_spec(),
+                "quant-configs/mlx-community__Qwen3-4B-Instruct-2507-4bit__config.json.gz",
+            ),
+            (
+                qwen2_spec(),
+                "quant-configs/mlx-community__Qwen2.5-Coder-7B-Instruct-4bit__config.json.gz",
             ),
         ] {
             let real = String::from_utf8(gunzipped(fixture)).unwrap();
@@ -3534,5 +3561,203 @@ pub(crate) mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// The qwen3t spec over the real 4B folder's one shard header (904 tensors, 2,262,920,192
+    /// bytes) plans the four-layer fixture: every layer of the trunk alike (25 tensors, as the
+    /// qwen3 cut's), with the embedding and the final norm and no head, which the 4B does not
+    /// have (its `tie_word_embeddings` is true, and the cut's config keeps it); every tensor whole
+    /// in its stored bits, one shard, no layer split. From the header: 104 tensors and
+    /// 445,918,208 bytes (the four unlayered tensors 218,792,960; each kept layer 56,781,312), and
+    /// the 800 tensors of layers 4 to 35 dropped.
+    #[test]
+    fn the_qwen3t_spec_plans_the_four_layer_tied_fixture_from_the_real_4b_header() {
+        let spec = qwen3t_spec();
+        let src = one_file_source(
+            "checkpoint-headers/qwen3-4b-instruct-2507-mlx-4bit-model.header.json.gz",
+        );
+        Source {
+            dir: PathBuf::new(),
+            tensors: src.clone(),
+        }
+        .check_identity(&spec)
+        .unwrap();
+        assert!(
+            !src.iter().any(|t| t.name.starts_with("lm_head.")),
+            "the 4B folder holds no head"
+        );
+        let p = plan(&spec, &src, DEFAULT_SHARD_BYTES).unwrap();
+        assert_eq!(p.tensors.len(), 104);
+        assert_eq!(
+            p.tensors.iter().map(|t| t.view.len()).sum::<u64>(),
+            445_918_208
+        );
+        assert_eq!(p.shards, 1);
+        assert_eq!(p.dropped_tensors, 32 * 25);
+        assert_eq!(p.dropped_bytes, 2_262_920_192 - 445_918_208);
+        let in_layer = |t: &Planned, l: usize| t.name.starts_with(&format!("model.layers.{l}."));
+        let layer_bytes = |l: usize| {
+            p.tensors
+                .iter()
+                .filter(|t| in_layer(t, l))
+                .map(|t| t.view.len())
+                .sum::<u64>()
+        };
+        let mut unlayered: Vec<&str> = p
+            .tensors
+            .iter()
+            .filter(|t| !t.name.contains(".layers."))
+            .map(|t| t.name.as_str())
+            .collect();
+        unlayered.sort_unstable();
+        assert_eq!(
+            unlayered,
+            [
+                "model.embed_tokens.biases",
+                "model.embed_tokens.scales",
+                "model.embed_tokens.weight",
+                "model.norm.weight"
+            ]
+        );
+        assert_eq!(
+            p.tensors
+                .iter()
+                .filter(|t| !t.name.contains(".layers."))
+                .map(|t| t.view.len())
+                .sum::<u64>(),
+            218_792_960
+        );
+        assert_eq!((0..4).map(layer_bytes).collect::<Vec<_>>(), [56_781_312; 4]);
+        for l in 0..4 {
+            let n = p.tensors.iter().filter(|t| in_layer(t, l)).count();
+            assert_eq!(n, 25, "layer {l}");
+        }
+        // The 4B's attention is 32 heads over 8 of 128 values: q_proj holds 4,096 rows, k and v
+        // 1,024, whatever the hidden width of 2,560.
+        let by_name: HashMap<&str, &Planned> =
+            p.tensors.iter().map(|t| (t.name.as_str(), t)).collect();
+        for (name, shape) in [
+            ("model.layers.0.self_attn.q_proj.weight", [4096usize, 320]),
+            ("model.layers.3.self_attn.k_proj.weight", [1024, 320]),
+            ("model.embed_tokens.weight", [151_936, 320]),
+        ] {
+            assert_eq!(by_name[name].shape.as_slice(), shape, "{name}");
+        }
+    }
+
+    /// The qwen2 spec over the real Qwen2.5-Coder 7B folder's one shard header (735 tensors,
+    /// 4,284,263,424 bytes) plans the four-layer fixture: every layer of the trunk alike (26
+    /// tensors: the 25 of the qwen3 cut less the two head norms, plus the query's, key's and
+    /// value's own `bias`, F16 vectors of 3,584, 512 and 512 values beside the planes of their
+    /// projections), with the embedding, the untied head and the final norm; every tensor whole
+    /// in its stored bits, one shard, no layer split. From the header: 111 tensors and
+    /// 1,137,576,960 bytes (the seven unlayered tensors 613,129,216; each kept layer
+    /// 131,111,936), and the 624 tensors of layers 4 to 27 dropped.
+    #[test]
+    fn the_qwen2_spec_plans_the_four_layer_fixture_from_the_real_7b_header() {
+        let spec = qwen2_spec();
+        let src = one_file_source(
+            "checkpoint-headers/qwen2.5-coder-7b-instruct-mlx-4bit-model.header.json.gz",
+        );
+        Source {
+            dir: PathBuf::new(),
+            tensors: src.clone(),
+        }
+        .check_identity(&spec)
+        .unwrap();
+        let p = plan(&spec, &src, DEFAULT_SHARD_BYTES).unwrap();
+        assert_eq!(p.tensors.len(), 111);
+        assert_eq!(
+            p.tensors.iter().map(|t| t.view.len()).sum::<u64>(),
+            1_137_576_960
+        );
+        assert_eq!(p.shards, 1);
+        assert_eq!(p.dropped_tensors, 24 * 26);
+        assert_eq!(p.dropped_bytes, 4_284_263_424 - 1_137_576_960);
+        let in_layer = |t: &Planned, l: usize| t.name.starts_with(&format!("model.layers.{l}."));
+        let layer_bytes = |l: usize| {
+            p.tensors
+                .iter()
+                .filter(|t| in_layer(t, l))
+                .map(|t| t.view.len())
+                .sum::<u64>()
+        };
+        assert_eq!(
+            p.tensors
+                .iter()
+                .filter(|t| !t.name.contains(".layers."))
+                .map(|t| t.view.len())
+                .sum::<u64>(),
+            613_129_216
+        );
+        assert_eq!(
+            (0..4).map(layer_bytes).collect::<Vec<_>>(),
+            [131_111_936; 4]
+        );
+        for l in 0..4 {
+            let names: Vec<&str> = p
+                .tensors
+                .iter()
+                .filter(|t| in_layer(t, l))
+                .map(|t| t.name.as_str())
+                .collect();
+            assert_eq!(names.len(), 26, "layer {l}");
+            for part in [
+                "self_attn.q_proj.bias",
+                "self_attn.k_proj.bias",
+                "self_attn.v_proj.bias",
+            ] {
+                assert!(
+                    names.iter().any(|n| n.ends_with(part)),
+                    "layer {l}: no {part}"
+                );
+            }
+            assert!(
+                !names
+                    .iter()
+                    .any(|n| n.contains("_norm.") && n.contains("self_attn")),
+                "layer {l}: a head norm"
+            );
+        }
+        let by_name: HashMap<&str, &Planned> =
+            p.tensors.iter().map(|t| (t.name.as_str(), t)).collect();
+        let source_of: HashMap<&str, &Src> = src.iter().map(|t| (t.name.as_str(), t)).collect();
+        for t in &p.tensors {
+            let s = source_of[t.src_name.as_str()];
+            assert_eq!(t.view, View::whole(s.start, s.len), "{}", t.name);
+            assert_eq!((&t.shape, t.dtype), (&s.shape, s.dtype), "{}", t.name);
+        }
+        for (name, width) in [
+            ("model.layers.0.self_attn.q_proj.bias", 3584usize),
+            ("model.layers.3.self_attn.k_proj.bias", 512),
+            ("model.layers.2.self_attn.v_proj.bias", 512),
+            ("model.norm.weight", 3584),
+        ] {
+            let t = by_name[name];
+            assert_eq!(
+                (t.dtype, t.shape.as_slice()),
+                (Dtype::F16, &[width][..]),
+                "{name}"
+            );
+        }
+        // Every quantized matrix keeps its two F16 planes beside its U32 codes: seven a layer
+        // and the two unlayered ones. The bias is one vector, not a plane.
+        let mut matrices = 0;
+        for t in p.tensors.iter().filter(|t| t.dtype == Dtype::U32) {
+            let stem = t.name.strip_suffix(".weight").expect("a code plane");
+            let groups = [t.shape[0], t.shape[1] / 8];
+            for plane in ["scales", "biases"] {
+                let c = by_name
+                    .get(format!("{stem}.{plane}").as_str())
+                    .unwrap_or_else(|| panic!("{stem}: no {plane} beside its codes"));
+                assert_eq!(
+                    (c.dtype, c.shape.as_slice()),
+                    (Dtype::F16, groups.as_slice()),
+                    "{stem}.{plane}"
+                );
+            }
+            matrices += 1;
+        }
+        assert_eq!(matrices, 4 * 7 + 2);
     }
 }

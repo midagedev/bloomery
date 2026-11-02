@@ -29,16 +29,17 @@ use super::super::arena::{Arena, MixerBufs, lane_of, layer_word, slot_of};
 use super::super::rows::FfnRows;
 use super::super::session::SessionError;
 use super::{
-    Half, MetalOps, WHAT, all, all_mut, conv_bufs, gains, head_params, post_gain, refuse, rope_of,
+    Half, MetalOps, WHAT, all, all_mut, conv_bufs, gains, head_params, no_bias, post_gain, refuse,
+    rope_of,
 };
 use crate::buffer::MetalBuffer;
 use crate::device::MetalDevice;
 use crate::kernels::{
-    AttentionPrefillParams, AttnCache, AttnLayer, CombineParams, DeltaRowStrides, DeltaRowsParams,
-    DeltaSnaps, EmbedParams, F32GemmParams, GemmMode, GemmParams, GemmSegParams, GemmXParams,
-    HeadNormRowsParams, NormAddRowsParams, NormRowsParams, Operand, Quant, RouteSelectParams,
-    RouteTableParams, RoutedKind, RoutedParams, Segment, ShortConvRowsParams, SwigluRowsParams,
-    route_table_words, route_tiles,
+    AttentionPrefillParams, AttnCache, AttnLayer, BiasRowsParams, CombineParams, DeltaRowStrides,
+    DeltaRowsParams, DeltaSnaps, EmbedParams, F32GemmParams, GemmMode, GemmParams, GemmSegParams,
+    GemmXParams, HeadNormRowsParams, NormAddRowsParams, NormRowsParams, Operand, Quant,
+    RouteSelectParams, RouteTableParams, RoutedKind, RoutedParams, Segment, ShortConvRowsParams,
+    SwigluRowsParams, route_table_words, route_tiles,
 };
 
 /// The operand type the pass's GEMMs compute in.
@@ -320,6 +321,35 @@ impl MetalOps<'_, '_> {
                 )?;
             }
         }
+        self.enc.memory_barrier();
+        Ok(())
+    }
+
+    /// Layer `l`'s q, k and v biases added to the pass's `m` P1 rows: one
+    /// dispatch over the rows' `proj_stride` apart, one group.
+    pub(super) fn rows_attn_bias(&mut self, l: usize, m: usize) -> Result<(), SessionError> {
+        let Some(ctx) = self.rows.as_mut() else {
+            return Self::no_rows();
+        };
+        let rows = &mut *ctx.arena;
+        let MixerBufs::Attention(a) = &self.arena.layers[l].mixer else {
+            return Err(refuse(format!("layer {l}: a bias op on another mixer")));
+        };
+        let bias = a.bias.as_ref().ok_or_else(|| no_bias(l))?;
+        let cols = bias.len().get();
+        let stride = rows.proj_stride;
+        self.kernels.bias_rows(
+            self.enc,
+            BiasRowsParams {
+                rows: m,
+                cols,
+                y: rows
+                    .proj
+                    .window_mut(Elems(a.q.start), Elems(strided_len(m, stride, cols)))?,
+                y_stride: stride,
+                bias: all(bias)?,
+            },
+        )?;
         self.enc.memory_barrier();
         Ok(())
     }

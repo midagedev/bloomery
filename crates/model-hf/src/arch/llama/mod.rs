@@ -1,7 +1,8 @@
 //! The dense GQA checkpoint families MLX's convert stores in the trunk's names, in the names,
 //! layouts and keys llama.cpp's converter writes into a GGUF: Llama-3 (`llama`:
-//! Llama-3.1-8B-Instruct and its siblings) and Qwen3 (`qwen3`: Qwen3-8B and its siblings, whose
-//! GGUF architecture is `qwen3`). Every layer is grouped-query attention over a dense SwiGLU
+//! Llama-3.1-8B-Instruct and its siblings), Qwen3 (`qwen3`: Qwen3-8B and its siblings, whose
+//! GGUF architecture is `qwen3`) and Qwen2 (`qwen2`: Qwen2.5-Coder-7B and its siblings, written
+//! as a `llama` file: see [`Family::Qwen2`]). Every layer is grouped-query attention over a dense SwiGLU
 //! block; the trunk's names, keys and checks are [`super::trunk`]'s, and the map is one owner:
 //! what a family's architecture facts force is [`Family`]'s data, never a second map.
 //!
@@ -13,7 +14,9 @@
 //! which the converter writes as the tensor `rope_freqs.weight` for a `rope_scaling` of type
 //! `llama3`, are made of that block of the config ([`llama3_factors`], [`FolderMap::constants`]);
 //! a `rope_scaling` of another type, and Qwen3's unscaled rope beside a scaling block, are
-//! refused. Qwen3 norms each query and key head before the rope (`q_norm`, `k_norm`). The head is
+//! refused. Qwen3 norms each query and key head before the rope (`q_norm`, `k_norm`); Qwen2
+//! adds a bias to the query, key and value projections (`attn_q.bias`, `attn_k.bias`,
+//! `attn_v.bias`), moved with its projection's rows. The head is
 //! the folder's `lm_head` when it holds one and the embedding when `tie_word_embeddings` says so,
 //! and a folder whose flag and head disagree is refused ([`trunk::check_head`]).
 
@@ -47,6 +50,13 @@ enum Family {
     Llama,
     /// Qwen3: per-head q and k norms, NEOX pairs as stored, an unscaled rope, Qwen's BPE.
     Qwen3,
+    /// Qwen2 (Qwen2.5 and Qwen2.5-Coder): no head norms, a bias on the query, key and value
+    /// projections, an unscaled rope, Qwen's BPE. HF's rope pairs halves, as Qwen3's does, but
+    /// the card's flash has no entry for halves without a head norm, so the map moves the rows
+    /// of `q_proj` and `k_proj` and of their biases as it does for Llama's NORM pairs, and the
+    /// file is a `llama` file with biases: llama.cpp's own `llama` reads `attn_q.bias`,
+    /// `attn_k.bias` and `attn_v.bias` where a file holds them, on the pairing it moves to.
+    Qwen2,
 }
 
 /// `config.json`'s keys beside [`trunk::KEYS`], the dense block's and [`ROOT`]'s that one family
@@ -57,6 +67,30 @@ const FAMILY_LLAMA: &Fields = &[
     ("mlp_bias", Only("[false]")),
     // HF's tensor-parallel slicing of a linear, which gives the same values.
     ("pretraining_tp", Only("[1]")),
+];
+
+/// [`FAMILY_LLAMA`] for Qwen2: its window keys (attention is full: `use_sliding_window` is false,
+/// so the window's width and the layers it would apply to read nothing), and its rope, which
+/// carries no scaling block.
+const FAMILY_QWEN2: &Fields = &[
+    ("architectures", Need(r#"[["Qwen2ForCausalLM"]]"#)),
+    ("model_type", Need(r#"["qwen2"]"#)),
+    ("rope_scaling", Only("[null]")),
+    ("use_sliding_window", Only("[false]")),
+    (
+        "sliding_window",
+        Ignore(
+            Type::Number,
+            "the window a model with use_sliding_window true attends, and use_sliding_window is false",
+        ),
+    ),
+    (
+        "max_window_layers",
+        Ignore(
+            Type::Number,
+            "the layers a sliding window applies to, and use_sliding_window is false",
+        ),
+    ),
 ];
 
 /// [`FAMILY_LLAMA`] for Qwen3: its window keys (attention is full), and its rope, which carries
@@ -82,9 +116,10 @@ impl Family {
         match root.value.get("model_type").and_then(Json::as_str) {
             Some("llama") => Ok(Family::Llama),
             Some("qwen3") => Ok(Family::Qwen3),
+            Some("qwen2") => Ok(Family::Qwen2),
             other => Err(root.bad(
                 "model_type",
-                &format!("{other:?} is no family this map reads: llama, qwen3"),
+                &format!("{other:?} is no family this map reads: llama, qwen3, qwen2"),
             )),
         }
     }
@@ -94,6 +129,7 @@ impl Family {
         match self {
             Family::Llama => FAMILY_LLAMA,
             Family::Qwen3 => FAMILY_QWEN3,
+            Family::Qwen2 => FAMILY_QWEN2,
         }
     }
 
@@ -102,16 +138,22 @@ impl Family {
         matches!(self, Family::Qwen3)
     }
 
+    /// Whether each layer's query, key and value projections hold a bias of their own.
+    fn qkv_bias(self) -> bool {
+        matches!(self, Family::Qwen2)
+    }
+
     /// Whether the query and key projections' rows move from HF's halves to the file's
-    /// neighbours ([`Interleave`]): Llama's rope pairs neighbours, Qwen3's is HF's own pairing.
+    /// neighbours ([`Interleave`]): Llama's rope pairs neighbours, Qwen3's is HF's own pairing,
+    /// and Qwen2's moves to Llama's so that its attention is the head-128 NORM flash.
     fn interleaves(self) -> bool {
-        matches!(self, Family::Llama)
+        matches!(self, Family::Llama | Family::Qwen2)
     }
 
     /// The `general.architecture` the family's keys go under, and its tensors' GGUF names.
     fn architecture(self) -> &'static str {
         match self {
-            Family::Llama => "llama",
+            Family::Llama | Family::Qwen2 => "llama",
             Family::Qwen3 => "qwen3",
         }
     }
@@ -120,7 +162,7 @@ impl Family {
     fn pre(self) -> &'static str {
         match self {
             Family::Llama => "llama-bpe",
-            Family::Qwen3 => "qwen2",
+            Family::Qwen3 | Family::Qwen2 => "qwen2",
         }
     }
 
@@ -129,6 +171,7 @@ impl Family {
         match self {
             Family::Llama => "Llama",
             Family::Qwen3 => "Qwen3",
+            Family::Qwen2 => "Qwen2",
         }
     }
 }
@@ -218,12 +261,12 @@ pub struct Interleave {
 
 impl Interleave {
     /// The rows of the tensor `t` (ggml dims `[k, heads · head_dim]`, each row whole in the
-    /// type's blocks) moved, head by head. A tensor of another rank or row count, or of rows that
-    /// are not whole, is refused with why (the caller names the tensor), and `t` is then as it
-    /// was.
+    /// type's blocks; or a bias, the one dim `[heads · head_dim]` whose rows are values) moved,
+    /// head by head. A tensor of another rank or row count, or of rows that are not whole, is
+    /// refused with why (the caller names the tensor), and `t` is then as it was.
     pub fn apply(&self, t: &mut Normal, head_dim: usize) -> Result<(), String> {
-        let [_, rows] = t.dims[..] else {
-            return Err(format!("{:?} is not a matrix", t.dims));
+        let ([_, rows] | [rows]) = t.dims[..] else {
+            return Err(format!("{:?} is neither a matrix nor a vector", t.dims));
         };
         let rows = usize::try_from(rows).map_err(|_| format!("{rows} rows do not fit usize"))?;
         if head_dim == 0 || !head_dim.is_multiple_of(2) || rows != self.heads * head_dim {
@@ -310,7 +353,7 @@ impl FolderMap for Checkpoint {
     /// The query and key projections' rows are the one move.
     type Step = Interleave;
 
-    const MODEL_TYPES: &'static [&'static str] = &["llama", "qwen3"];
+    const MODEL_TYPES: &'static [&'static str] = &["llama", "qwen3", "qwen2"];
 
     fn parse(config: &Json) -> Result<Self, Error> {
         let root = Section::<Error>::new(config, "config.json")?;
@@ -489,10 +532,38 @@ impl Checkpoint {
         {
             return Ok(bare((to, plain)));
         }
+        if self.family.qkv_bias()
+            && let Some((to, heads)) = self.qkv_bias(l, rest)
+        {
+            // A bias moves with the rows of its projection: output `i` of the projection and
+            // value `i` of its bias are one unit.
+            return Ok(Target {
+                to,
+                plain: Plain::F32,
+                step: self
+                    .family
+                    .interleaves()
+                    .then_some(heads)
+                    .flatten()
+                    .map(|heads| Interleave { heads }),
+            });
+        }
         trunk::block_norms(l, rest, common::ffn_norm)
             .or_else(|| trunk::dense_ffn(l, rest))
             .map(bare)
             .ok_or_else(not_ours)
+    }
+
+    /// The program's bias of the checkpoint tensor `rest` of layer `l` and the heads its rows
+    /// make where the rope's pairs move them (the query's and the key's; the value's never
+    /// moves), `None` for any other name.
+    fn qkv_bias(&self, l: usize, rest: &str) -> Option<(String, Option<usize>)> {
+        Some(match rest {
+            "self_attn.q_proj.bias" => (common::blk(l, "attn_q.bias"), Some(self.heads)),
+            "self_attn.k_proj.bias" => (common::blk(l, "attn_k.bias"), Some(self.kv_heads)),
+            "self_attn.v_proj.bias" => (common::blk(l, "attn_v.bias"), None),
+            _ => return None,
+        })
     }
 
     /// The ggml dims of the file's tensor `stem` (the name past `blk.N.`, or a model-level
@@ -510,6 +581,8 @@ impl Checkpoint {
             "attn_k.weight" | "attn_v.weight" => vec![hidden, key],
             "attn_output.weight" => vec![query, hidden],
             "attn_q_norm.weight" | "attn_k_norm.weight" => vec![self.head_dim as u64],
+            "attn_q.bias" => vec![query],
+            "attn_k.bias" | "attn_v.bias" => vec![key],
             "ffn_gate.weight" | "ffn_up.weight" => vec![hidden, ffn],
             "ffn_down.weight" => vec![ffn, hidden],
             other => unreachable!("{other} is a tensor of no {} file", self.family.word()),
@@ -518,7 +591,7 @@ impl Checkpoint {
 
     /// Every tensor the file holds is mapped, at the dims the config gives: the embedding, the
     /// output norm, the head of an untied model, and each layer's nine — eleven where the family
-    /// norms each query and key head.
+    /// norms each query and key head, twelve where it biases the three projections.
     fn complete(&self, mapped: &BTreeMap<String, Mapped<Interleave>>) -> Result<(), Error> {
         const LAYER: [&str; 9] = [
             "attn_norm.weight",
@@ -532,11 +605,14 @@ impl Checkpoint {
             "ffn_down.weight",
         ];
         const HEAD_NORMS: [&str; 2] = ["attn_q_norm.weight", "attn_k_norm.weight"];
-        let layer: Vec<&str> = if self.family.head_norms() {
-            LAYER.into_iter().chain(HEAD_NORMS).collect::<Vec<_>>()
-        } else {
-            LAYER.to_vec()
-        };
+        const QKV_BIAS: [&str; 3] = ["attn_q.bias", "attn_k.bias", "attn_v.bias"];
+        let mut layer = LAYER.to_vec();
+        if self.family.head_norms() {
+            layer.extend(HEAD_NORMS);
+        }
+        if self.family.qkv_bias() {
+            layer.extend(QKV_BIAS);
+        }
         let mut globals = vec!["token_embd.weight", "output_norm.weight"];
         if !self.tied {
             globals.push("output.weight");
@@ -577,6 +653,10 @@ mod tests {
     const Q8B_HEADER: &str = "checkpoint-headers/qwen3-8b-mlx-4bit-model.header.json.gz";
     const Q32B_CONFIG: &str = "quant-configs/mlx-community__Qwen3-32B-4bit__config.json.gz";
     const Q32B_TENSORS: &str = "checkpoint-headers/qwen3-32b-mlx-4bit.tensors.json.gz";
+    const Q2_CONFIG: &str =
+        "quant-configs/mlx-community__Qwen2.5-Coder-7B-Instruct-4bit__config.json.gz";
+    const Q2_HEADER: &str =
+        "checkpoint-headers/qwen2.5-coder-7b-instruct-mlx-4bit-model.header.json.gz";
 
     /// Llama-3.1-8B's `rope_scaling`: the frequencies of a wavelength past 8192 divided by 8, those
     /// under 2048 kept.
@@ -666,15 +746,18 @@ mod tests {
                 "8 rows are not 3 heads of 4",
             ),
             ("an odd head", rows(9), 3, 3, "an even width"),
+            // PIN(2026-11-02): a tensor of three dims, was one: a vector of rows is now a bias
+            // (`a_small_qwen2_folder_opens_as_a_llama_file_with_biases` moves one), so the rank
+            // the move refuses is the first beyond a matrix.
             (
                 "a tensor of a rank",
                 Normal {
-                    dims: vec![3],
+                    dims: vec![2, 2, 2],
                     ..rows(8)
                 },
                 2,
                 4,
-                "is not a matrix",
+                "neither a matrix nor a vector",
             ),
             (
                 "rows that are not whole",
@@ -1447,6 +1530,348 @@ mod tests {
                     );
                 }
             }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A folder's `.weight` planes and `.bias` vectors, as [`unpacked`] hands them.
+    fn unpacked_with_biases(mut fixture: Json) -> Vec<(String, Vec<usize>)> {
+        fixture.as_object_mut().unwrap().remove("__metadata__");
+        entries(&fixture)
+            .into_iter()
+            .filter(|(name, _, _)| name.ends_with(".weight") || name.ends_with(".bias"))
+            .map(|(name, dtype, mut shape)| {
+                if dtype == safetensors::Dtype::U32 {
+                    *shape.last_mut().unwrap() *= 8;
+                }
+                (name, shape)
+            })
+            .collect()
+    }
+
+    /// The real Qwen2.5-Coder-7B folder maps through the Llama map's trunk at Qwen2's family
+    /// facts: no head norm, the projections' biases beside them (12 tensors a layer, 339 in all
+    /// with the untied head), the query's and key's rows and biases moved to neighbours as
+    /// Llama's, the value's and the output's as stored, the file a `llama` file under the
+    /// `qwen2` pre-tokenizer row, no rope factors (28 heads over 4 key heads, a group of seven).
+    /// Mutants (each red here): `qkv_bias` false (the count), the bias moved by the key's heads
+    /// for the query's, the value's bias moved.
+    #[test]
+    fn the_real_qwen2_folder_maps_to_the_files_tensors_and_keys() {
+        let checkpoint = Checkpoint::parse(&json(Q2_CONFIG)).unwrap();
+        assert_eq!(checkpoint.architecture(), "llama");
+        let mapping = map_of(&checkpoint, &unpacked_with_biases(json(Q2_HEADER))).unwrap();
+        assert_eq!(mapping.tensors.len(), 3 + 28 * 12);
+        assert!(mapping.skipped.is_empty());
+        let get = |name: &str| &mapping.tensors[name];
+        for l in [0, 27] {
+            for (stem, dims, steps) in [
+                ("attn_q.weight", vec![3584u64, 3584], 28usize),
+                ("attn_k.weight", vec![3584, 512], 4),
+                ("attn_v.weight", vec![3584, 512], 0),
+                ("attn_q.bias", vec![3584], 28),
+                ("attn_k.bias", vec![512], 4),
+                ("attn_v.bias", vec![512], 0),
+                ("attn_output.weight", vec![3584, 3584], 0),
+            ] {
+                let m = get(&format!("blk.{l}.{stem}"));
+                assert_eq!(m.dims, dims, "{l} {stem}");
+                let want: Vec<Interleave> = (steps > 0)
+                    .then_some(Interleave { heads: steps })
+                    .into_iter()
+                    .collect();
+                assert_eq!(m.steps, want, "{l} {stem}");
+            }
+            assert_eq!(
+                get(&format!("blk.{l}.attn_q.bias")).role,
+                Use::Matrix(Plain::F32)
+            );
+        }
+        assert_eq!(get("token_embd.weight").dims, [3584, 152_064]);
+        assert_eq!(get("output.weight").dims, [3584, 152_064]);
+        let keys: BTreeMap<&str, &Value> = checkpoint
+            .keys
+            .iter()
+            .map(|(k, v)| (k.as_str(), v))
+            .collect();
+        for (key, want) in [
+            ("block_count", 28u32),
+            ("context_length", 32_768),
+            ("embedding_length", 3584),
+            ("attention.head_count", 28),
+            ("attention.head_count_kv", 4),
+            ("attention.key_length", 128),
+            ("feed_forward_length", 18_944),
+            ("rope.dimension_count", 128),
+        ] {
+            assert_eq!(*keys[key], Value::U32(want), "{key}");
+        }
+        assert_eq!(*keys["rope.freq_base"], Value::F32(1_000_000.0));
+        assert!(checkpoint.constants().unwrap().is_empty());
+        // The folder's bias is the family's: a folder with none of the three is refused by name,
+        // and so is a bias another family's map does not name.
+        let mut t = unpacked_with_biases(json(Q2_HEADER));
+        t.retain(|(n, _)| n != "model.layers.5.self_attn.v_proj.bias");
+        let e = map_of(&checkpoint, &t).err().expect("refused");
+        assert!(
+            e.contains("blk.5.attn_v.bias") && e.contains("is missing from the folder"),
+            "{e}"
+        );
+        let mut t = unpacked_with_biases(json(Q2_HEADER));
+        t.push(("model.layers.3.self_attn.o_proj.bias".into(), vec![3584]));
+        let e = map_of(&checkpoint, &t).err().expect("refused");
+        assert!(
+            e.contains("model.layers.3.self_attn.o_proj.bias") && e.contains("not a Qwen2 tensor"),
+            "{e}"
+        );
+        let llama = Checkpoint::parse(&json(CONFIG)).unwrap();
+        let e = map_of(&llama, &unpacked_with_biases(json(HEADER))).unwrap();
+        assert_eq!(e.tensors.len(), 291, "Llama holds no bias and still maps");
+        let mut t = unpacked(json(HEADER));
+        t.push(("model.layers.0.self_attn.q_proj.bias".into(), vec![4096]));
+        let e = map_of(&llama, &t).err().expect("refused");
+        assert!(e.contains("not a Llama tensor"), "{e}");
+    }
+
+    /// The real Qwen2.5-Coder-7B folder's tensors plan as the llama file's: 339 tensors, the
+    /// projections' biases F32 vectors of their projections' rows beside the 4-bit matrices
+    /// (F16 vectors in the folder), the move on the query's and the key's rows and biases alone.
+    /// Mutant: `qkv_bias` false (the count).
+    #[test]
+    fn the_real_qwen2_folder_plans_the_biases_as_f32_vectors() {
+        let config = json(Q2_CONFIG);
+        let checkpoint = Checkpoint::parse(&config).unwrap();
+        let mut header = json(Q2_HEADER);
+        header.as_object_mut().unwrap().remove("__metadata__");
+        let planning = folder::plan_tensors(
+            &checkpoint,
+            &hf::quant_config::Config::parse(&config, None).unwrap(),
+            &entries(&header),
+            false,
+            folder::Keep::InPlace,
+        )
+        .unwrap();
+        assert!(
+            planning.plan.refused.is_empty(),
+            "{:?}",
+            planning.plan.refused
+        );
+        assert_eq!(planning.planned.len(), 3 + 28 * 12);
+        let decl = |name: &str| {
+            &planning
+                .planned
+                .iter()
+                .find(|p| p.decl.name == name)
+                .unwrap_or_else(|| panic!("{name} is not planned"))
+                .decl
+        };
+        for (name, rows) in [
+            ("blk.0.attn_q.bias", 3584u64),
+            ("blk.27.attn_k.bias", 512),
+            ("blk.13.attn_v.bias", 512),
+        ] {
+            let d = decl(name);
+            assert_eq!(
+                (GgmlType::from_u32(d.type_id), d.dims.as_slice()),
+                (GgmlType::F32, &[rows][..]),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            GgmlType::from_u32(decl("blk.0.attn_q.weight").type_id),
+            GgmlType::MLX_A4H
+        );
+    }
+
+    /// A Qwen2 config the map does not read is refused by name: a sliding window in use, a rope
+    /// scaling block, Qwen3's type and Llama's class, a window width that is no number, and a key
+    /// no table names; the spelling the real folder carries (no `rope_scaling`, a window width
+    /// beside `use_sliding_window` false) reads. Mutants (each red at its line): the family table
+    /// without its window rule, without its rope rule.
+    #[test]
+    fn a_qwen2_config_the_map_does_not_read_is_refused_by_name() {
+        let real = json(Q2_CONFIG);
+        let parse = |edit: &dyn Fn(&mut serde_json::Map<String, Json>)| {
+            let mut config = real.clone();
+            edit(config.as_object_mut().unwrap());
+            Checkpoint::parse(&config).map_err(|e| e.to_string())
+        };
+        parse(&|_| {}).expect("the real config reads");
+        for (key, value, want) in [
+            ("use_sliding_window", json!(true), "supported: [false]"),
+            ("sliding_window", json!("all"), "is not a Number"),
+            ("max_window_layers", json!("all"), "is not a Number"),
+            ("mlp_bias", json!(true), "is not a key this converter reads"),
+            ("attention_bias", json!(true), "supported: [false]"),
+        ] {
+            let e = parse(&|c| {
+                c.insert(key.to_string(), value.clone());
+            })
+            .unwrap_err();
+            assert!(e.contains(key) && e.contains(want), "{key}: {e}");
+        }
+        let e = parse(&|c| {
+            c.insert(
+                "rope_scaling".into(),
+                json!({"rope_type": "yarn", "factor": 4.0}),
+            );
+        })
+        .unwrap_err();
+        assert!(
+            e.contains("rope_scaling") && e.contains("supported: [null]"),
+            "{e}"
+        );
+        let e = parse(&|c| {
+            c.insert("architectures".into(), json!(["Qwen3ForCausalLM"]));
+        })
+        .unwrap_err();
+        assert!(
+            e.contains("architectures") && e.contains("Qwen2ForCausalLM"),
+            "{e}"
+        );
+        let e = parse(&|c| {
+            c.insert("model_type".into(), json!("qwen2_moe"));
+        })
+        .unwrap_err();
+        assert!(
+            e.contains("model_type") && e.contains("no family this map reads"),
+            "{e}"
+        );
+    }
+
+    /// A folder of two layers of a Qwen2 as small as the groups allow (4 heads over 2 of 16
+    /// values, a hidden width of 64, the three projection biases of each layer) opens as a llama
+    /// file: the engine's own reader describes it (the pairwise rope, no head norm, a dense
+    /// SwiGLU), the biases are tensors of the header (F32), and each reads whole from the source:
+    /// the query's and the key's moved to neighbours with their rows, head by head, the value's
+    /// as stored. Mutants (each red here): the query's bias left as stored, the value's bias
+    /// moved, the key's bias moved by the query's heads.
+    #[test]
+    fn a_small_qwen2_folder_opens_as_a_llama_file_with_biases() {
+        use model::arch::models::{Mixer, RopeMode};
+        use model::part::{Source, Take};
+
+        let quantization = json!({"group_size": 64, "bits": 4});
+        let config = json!({
+            "architectures": ["Qwen2ForCausalLM"], "model_type": "qwen2",
+            "tie_word_embeddings": false, "hidden_act": "silu",
+            "sliding_window": 4096, "use_sliding_window": false, "max_window_layers": 2,
+            "bos_token_id": 0, "eos_token_id": 2, "vocab_size": 8,
+            "num_hidden_layers": 2, "max_position_embeddings": 4096, "hidden_size": 64,
+            "num_attention_heads": 4, "num_key_value_heads": 2, "intermediate_size": 128,
+            "rms_norm_eps": 1e-6, "rope_theta": 1000000.0,
+            "quantization": quantization,
+        });
+        let dir = temp_dir("qwen2-open");
+        let mut t: Vec<Stored> = vec![];
+        for stem in ["model.embed_tokens", "lm_head"] {
+            t.extend(mlx_linear(stem, 4, &[8], 64));
+        }
+        t.push(bf16_tensor("model.norm.weight", &[64], |_| 0x3fc0));
+        for l in 0..2 {
+            let m = format!("model.layers.{l}");
+            for (norm, bf16) in [
+                ("input_layernorm", 0x3fc0),
+                ("post_attention_layernorm", 0x3f80),
+            ] {
+                t.push(bf16_tensor(&format!("{m}.{norm}.weight"), &[64], |_| bf16));
+            }
+            for (proj, rows, k) in [
+                ("gate_proj", 128, 64),
+                ("up_proj", 128, 64),
+                ("down_proj", 64, 128),
+            ] {
+                t.extend(mlx_linear(&format!("{m}.mlp.{proj}"), 4, &[rows], k));
+            }
+            for (stem, rows) in [
+                ("q_proj", 64),
+                ("k_proj", 32),
+                ("v_proj", 32),
+                ("o_proj", 64),
+            ] {
+                t.extend(mlx_linear(&format!("{m}.self_attn.{stem}"), 4, &[rows], 64));
+            }
+            // Element `i` of the layer's bias `stem` is 1 + (i + offset) / 128 in bf16.
+            for (stem, rows, offset) in [
+                ("q_proj", 64usize, 0u16),
+                ("k_proj", 32, 64),
+                ("v_proj", 32, 96),
+            ] {
+                t.push(bf16_tensor(
+                    &format!("{m}.self_attn.{stem}.bias"),
+                    &[rows],
+                    move |i| 0x3f80 + i as u16 + offset,
+                ));
+            }
+        }
+        write_folder(&dir, &t, &config, &tokenizer("qwen2"));
+        let opened = folder::open(&dir).unwrap();
+        let named = folder::architecture(config.to_string().as_bytes()).unwrap();
+        assert_eq!(Some(named), opened.header.architecture());
+        assert_eq!(named, "llama");
+        let read = model::arch::spec(&opened.header).unwrap();
+        let spec = &read.spec;
+        assert_eq!((spec.layers.len(), spec.hidden, spec.vocab), (2, 64, 8));
+        for layer in &spec.layers {
+            let Mixer::Gqa(g) = &layer.mixer else {
+                panic!("a layer mixes with {:?}", layer.mixer);
+            };
+            assert_eq!((g.heads, g.kv_heads, g.head_dim), (4, 2, 16));
+            assert_eq!(
+                (g.rope.mode, g.rope.dims, g.rope.base),
+                (RopeMode::NormTail, 16, 1_000_000.0)
+            );
+            assert!(!g.rope.factors && !g.qk_norm);
+        }
+        let ty = |name: &str| opened.header.find(name).unwrap().1.ty;
+        assert_eq!(ty("blk.0.attn_q.weight"), GgmlType::MLX_A4);
+        for stem in ["attn_q", "attn_k", "attn_v"] {
+            assert_eq!(ty(&format!("blk.1.{stem}.bias")), GgmlType::F32, "{stem}");
+        }
+        assert_eq!(
+            opened.header.iter_tensors().count(),
+            3 + 2 * 12,
+            "the biases beside the trunk's tensors, and no rope factor table"
+        );
+        let planned = opened
+            .source
+            .plan(|_, _, _| Ok::<_, String>(Take::Whole))
+            .unwrap();
+        let f32s = |name: &str| -> Vec<f32> {
+            let p = planned.iter().find(|p| p.info.name == name).unwrap();
+            let part = opened.source.read(p).unwrap();
+            let bytes = part.spans().concat();
+            assert_eq!(bytes.len() as u64, p.info.nbytes, "{name}");
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
+                .collect()
+        };
+        // The stored value of element `i` of a bias with `offset`, as bf16 widens it.
+        let stored =
+            |i: usize, offset: u16| f32::from_bits((u32::from(0x3f80 + i as u16 + offset)) << 16);
+        for l in 0..2 {
+            // A projection of heads of 16 values: the file's `2i` is the stored `i` and `2i + 1`
+            // the stored `8 + i` of the head.
+            let moved = |rows: usize, offset: u16| -> Vec<f32> {
+                (0..rows)
+                    .map(|row| {
+                        let (head, at) = (row / 16, row % 16);
+                        let source = head * 16 + if at % 2 == 0 { at / 2 } else { 8 + at / 2 };
+                        stored(source, offset)
+                    })
+                    .collect()
+            };
+            assert_eq!(f32s(&format!("blk.{l}.attn_q.bias")), moved(64, 0), "q {l}");
+            assert_eq!(
+                f32s(&format!("blk.{l}.attn_k.bias")),
+                moved(32, 64),
+                "k {l}"
+            );
+            let v: Vec<f32> = (0..32).map(|i| stored(i, 96)).collect();
+            assert_eq!(f32s(&format!("blk.{l}.attn_v.bias")), v, "v {l}");
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }

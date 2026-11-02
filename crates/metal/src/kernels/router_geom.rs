@@ -2,7 +2,7 @@ use models::{RouterNorm, Score};
 
 use crate::geom::{Geometry, KernelRefused, yes_no};
 use crate::geometry;
-use crate::instance::{HOST, Instance};
+use crate::instance::{FfnAxes, HOST, Instance};
 
 /// The routed rows, and the id of the shared expert. A shim: the build's host
 /// instance's router row (`Geometry::router`'s `experts`). Callers left: the
@@ -26,10 +26,25 @@ pub const ROWS: usize = rows(&HOST);
 /// Callers left: the arch, the kernel gate, its oracles and the probes.
 pub const SHARED: usize = HOST.router_built().router.rule.gated as usize;
 
-/// The columns of every row: the hidden width. A shim: the build's host
-/// instance's. Callers left: the arch, the kernel gate, its oracles and the
-/// probes.
-pub const K: usize = HOST.key.hidden as usize;
+/// The columns of every row of `inst`'s router: the hidden width of a routed FFN. A dense FFN
+/// launches no router, so the router's kernels it carries stay at the columns of the instance of
+/// no router's own ([`UNLAUNCHED_K`]), and the residual's width meets none of the router's rules.
+#[must_use]
+pub const fn k(inst: &Instance) -> usize {
+    match inst.key.ffn {
+        FfnAxes::Routed(_) => inst.key.hidden as usize,
+        FfnAxes::Dense { .. } => UNLAUNCHED_K,
+    }
+}
+
+/// The columns an instance of a dense FFN compiles its router's kernels at: the hidden width of
+/// the routed instance whose axes they carry (`Instance::router_built`), which a test holds to
+/// that instance's key.
+pub const UNLAUNCHED_K: usize = 2048;
+
+/// The columns of every row. A shim: the build's host instance's. Callers left: the arch, the
+/// kernel gate, its oracles and the probes.
+pub const K: usize = k(&HOST);
 
 /// The splits of one row. One: a SIMD group owns its row's whole width, so
 /// the input and its norm are read once per threadgroup, not once per row.
