@@ -715,11 +715,17 @@ class Refusals(unittest.TestCase):
             (good + " bloomery.fixture.ff=%d" % INTER, "once"),
             (good + " layers=0", "key=value"),
             ("# fixture\tbloomery.fixture.rev=deadbeef", "states"),
-            ("# fixture\tbloomery.fixture.ff=%d" % INTER, "names revision"),
+            (good.replace(" bloomery.fixture.layers=0,1,2", ""), "bloomery.fixture.layers=nothing"),
+            ("# fixture\tbloomery.fixture.rev=" + dump_tf.REV, "states"),
+            (good.replace(dump_tf.REV, "deadbeef"), "bloomery.fixture.rev=deadbeef"),
+            (good + " bloomery.fixture.card_budget=30000000000", "bloomery.fixture.card_budget=30000000000"),
         ):
             with self.assertRaisesRegex(dump_tf.Refusal, why, msg=bad):
                 dump_tf.fixture_line(cut, bad)
         rc = dump(folder, self.ids, os.path.join(self.tmp, "o-bad-line"), ["--sets", "a", "--phase", "prefill", "--fixture-line", good.replace("ff=%d" % INTER, "ff=999")], line=False)
+        self.assertEqual(rc, 65)
+        # a line naming only the revision would leave a resumed run's identity equal across a regenerated cut
+        rc = dump(folder, self.ids, os.path.join(self.tmp, "o-partial-line"), ["--sets", "a", "--phase", "prefill", "--fixture-line", "# fixture\tbloomery.fixture.rev=" + dump_tf.REV], line=False)
         self.assertEqual(rc, 65)
 
     def test_kind_names_the_vendors_folder_and_a_cut_and_refuses_the_rest(self):
@@ -806,6 +812,20 @@ class Refusals(unittest.TestCase):
                 open(os.path.join(whole, "ref_minimaxm31_a", name), "rb").read(),
                 name,
             )
+
+    def test_resume_refuses_state_of_another_cut_generation(self):
+        folder = os.path.join(self.tmp, "resume-cut")
+        make_folder(folder)
+        out = os.path.join(self.tmp, "resume-cut-out")
+        self.assertEqual(dump(folder, self.ids, out, ["--sets", "a", "--phase", "prefill", "--until", "1"]), 0)
+        # the cut regenerated from other layers: the same tensors, index and config, another fixture line
+        from safetensors.torch import load_file
+
+        path = os.path.join(folder, "model-00001-of-00002.safetensors")
+        before = dump_tf.Folder(folder).index_sha256
+        save_file(load_file(path), path, metadata={"format": "pt", **CUT_KEYS, "bloomery.fixture.layers": "0,1,3"})
+        self.assertEqual(dump_tf.Folder(folder).index_sha256, before)
+        self.assertEqual(dump(folder, self.ids, out, ["--sets", "a", "--phase", "prefill", "--resume"]), 65)
 
     def test_greedy_without_a_prefill_is_refused(self):
         folder = os.path.join(self.tmp, "no-prefill")
