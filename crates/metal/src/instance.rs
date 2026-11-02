@@ -1748,9 +1748,9 @@ mod tests {
     /// of 128 (Qwen2.5-14B, a group of five), 12 over 2 (1.5B, six), 28 over 4
     /// (7B, seven) and 14 over 2 of 64 (0.5B, seven at head 64). Mutant:
     /// `served_rows` leaves out the group of five, six or seven, or `Key::of`
-    /// reads the rope mode of no layer. The hidden width is one the router
-    /// takes (a multiple of 1024); the files' own (896, 1536, 3584) are the
-    /// router's refusal, which this test does not pin.
+    /// reads the rope mode of no layer. A dense FFN launches no router: its
+    /// router compiles at `UNLAUNCHED_K`, so the hidden width meets none of
+    /// the router's rules.
     #[test]
     fn qwen2_attention_selects_its_row_and_opens_with_the_raw_neox_prologue() {
         const HIDDEN: u32 = 2048;

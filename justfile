@@ -94,7 +94,7 @@ mac-test:
 # gate, then the qwen35moe kernels' gate (the qwen35moe fixture under $BLOOMERY_FIXTURE_ROOT, or --fixture), then that
 # gate's mutants, each of which its clause must catch. A lab-* recipe, not a gate-* one: the box has no Metal device, so no landing batch
 # selects it. The gate and its mutants step each run every registered instance in one process under one bound;
-# 2026-11-02 on an M1 Pro (16-core GPU) at fourteen instances the gate took 1185 s and the mutants step (780 mutants)
+# PIN(2026-11-02): on an M1 Pro (16-core GPU) at fourteen instances the gate took 1185 s and the mutants step (780 mutants)
 # 5461 s, over the 900 s default, so they run at 1800 and 8400 (each about 1.5 times its wall).
 lab-metal:
     cargo test -p bloomery-metal --lib && cargo test -p bloomery-metal --features pipeline-scan --bin metal_scan && cargo test -p bloomery-metal --bin metal_attention_time --bin metal_gemm_time --bin generate_metal && cargo build --release -p bloomery-metal --bin gate_metal_device --bin gate_metal_qwen35moe_kernels && ./tools/mac-gate.sh gate_metal_device && BLOOMERY_GATE_BOUND=1800 ./tools/mac-gate.sh gate_metal_qwen35moe_kernels && BLOOMERY_GATE_BOUND=8400 ./tools/mac-gate.sh gate_metal_qwen35moe_kernels --mutants-all

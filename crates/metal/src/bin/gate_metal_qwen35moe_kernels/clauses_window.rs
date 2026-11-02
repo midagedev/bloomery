@@ -29,13 +29,12 @@ use bloomery_metal::{MetalBuffer, MetalDevice};
 
 use super::clauses_attention::{
     CacheBack, KIND_K, KIND_Q, KIND_V, cache_of_for, dequant_k_for, dequant_v_for, gate_of,
-    head_row_for, read_cache, take_qg_for, u, upload_cache,
+    head_row_for, prologue_of, read_cache, take_qg_for, u, upload_cache,
 };
 use super::common::{LAYER, first_diff, ratio};
 use super::oracle::sigmoid;
 use super::oracle_attention::{
-    attend, band, head_gate_row, norm_rope, pack_f16, pack_q8, prefill_band, rope_neox,
-    rope_norm_pairs, rope_row_f64, window_tail,
+    attend, band, head_gate_row, pack_f16, pack_q8, prefill_band, rope_row_f64, window_tail,
 };
 use super::{ClauseCtx, ClauseRun, Harness, OUT_GUARD, SENTINEL_BITS, VALUE_PAD};
 
@@ -576,9 +575,9 @@ fn launch(
     })
 }
 
-/// The prologue of one head in the kernel's f32 order: the norm and the NEOX
-/// pairs where the instance norms each head, the raw values turned as
-/// neighbours where it pairs NORM, as NEOX halves where it does neither.
+/// The prologue of one head in the kernel's f32 order, the one mapping of
+/// [`prologue_of`]; the scene's gain is held to the instance's head norm
+/// here: present where the instance norms each head, absent where it does not.
 fn prologue(
     attn: &AttnGeom,
     x: &[f32],
@@ -586,15 +585,10 @@ fn prologue(
     eps: f32,
     rope: &[f32],
 ) -> Result<Vec<f32>, String> {
-    match (attn.prologue(), gain) {
-        (Some(Prologue::NormedNeox), Some(g)) => norm_rope(x, g, eps, rope),
-        (Some(Prologue::RawNorm), None) => rope_norm_pairs(x, rope),
-        (Some(Prologue::RawNeox), None) => rope_neox(x, rope),
-        (None, _) => {
-            Err("a head norm over NORM pairs is no prologue the flash is built for".to_string())
-        }
-        _ => Err("the scene's gains do not match the instance's head norm".to_string()),
+    if attn.prologue().is_some() && attn.qk_norm != gain.is_some() {
+        return Err("the scene's gains do not match the instance's head norm".to_string());
     }
+    prologue_of(attn, x, gain.as_deref().unwrap_or(&[]), eps, rope)
 }
 
 /// The first row of `got` that is not `want`'s, named.

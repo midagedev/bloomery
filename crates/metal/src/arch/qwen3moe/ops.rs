@@ -596,6 +596,8 @@ fn rope_of(
 
 impl MetalOps<'_, '_> {
     /// Layer `l`'s P1 over the unit's rows: the step's one row, or the pass's.
+    /// Any mixer's: which weights it reads is the layer's buffers', and the
+    /// attention layer's bias group is [`Self::attn_bias`]'s, after it.
     pub(super) fn attn_p1(&mut self, l: LayerCtx<'_>) -> Result<(), SessionError> {
         match self.arm(l.m)? {
             Arm::Step => self.p1(l.layer),
@@ -1118,10 +1120,7 @@ impl ChainOps for MetalOps<'_, '_> {
     }
 
     fn delta_in(&mut self, l: LayerCtx<'_>, _: &DeltaPlan) -> Result<(), SessionError> {
-        match self.arm(l.m)? {
-            Arm::Step => self.p1(l.layer),
-            Arm::Rows => self.rows_p1(l.layer, l.m),
-        }
+        self.attn_p1(l)
     }
 
     fn delta_core(&mut self, l: LayerCtx<'_>, _: &DeltaPlan) -> Result<(), SessionError> {
@@ -1186,10 +1185,7 @@ impl ChainOps for MetalOps<'_, '_> {
     }
 
     fn conv_in(&mut self, l: LayerCtx<'_>, _: &ShortConvPlan) -> Result<(), SessionError> {
-        match self.arm(l.m)? {
-            Arm::Step => self.p1(l.layer),
-            Arm::Rows => self.rows_p1(l.layer, l.m),
-        }
+        self.attn_p1(l)
     }
 
     fn conv_core(&mut self, l: LayerCtx<'_>, _: &ShortConvPlan) -> Result<(), SessionError> {

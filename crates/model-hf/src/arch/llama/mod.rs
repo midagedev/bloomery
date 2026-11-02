@@ -1223,13 +1223,14 @@ mod tests {
     }
 
     /// A folder's tensors, as the map is handed them, from a header or tensors fixture (a
-    /// header's `__metadata__` dropped): the `.weight` planes alone, each quantized weight at
-    /// its unpacked shape (the packed U32 words hold eight 4-bit values), each norm as stored.
+    /// header's `__metadata__` dropped): the `.weight` planes and the `.bias` vectors (a Llama or
+    /// Qwen3 folder has none), each quantized weight at its unpacked shape (the packed U32 words
+    /// hold eight 4-bit values), each norm and bias as stored.
     fn unpacked(mut fixture: Json) -> Vec<(String, Vec<usize>)> {
         fixture.as_object_mut().unwrap().remove("__metadata__");
         entries(&fixture)
             .into_iter()
-            .filter(|(name, _, _)| name.ends_with(".weight"))
+            .filter(|(name, _, _)| name.ends_with(".weight") || name.ends_with(".bias"))
             .map(|(name, dtype, mut shape)| {
                 if dtype == safetensors::Dtype::U32 {
                     *shape.last_mut().unwrap() *= 8;
@@ -1534,21 +1535,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A folder's `.weight` planes and `.bias` vectors, as [`unpacked`] hands them.
-    fn unpacked_with_biases(mut fixture: Json) -> Vec<(String, Vec<usize>)> {
-        fixture.as_object_mut().unwrap().remove("__metadata__");
-        entries(&fixture)
-            .into_iter()
-            .filter(|(name, _, _)| name.ends_with(".weight") || name.ends_with(".bias"))
-            .map(|(name, dtype, mut shape)| {
-                if dtype == safetensors::Dtype::U32 {
-                    *shape.last_mut().unwrap() *= 8;
-                }
-                (name, shape)
-            })
-            .collect()
-    }
-
     /// The real Qwen2.5-Coder-7B folder maps through the Llama map's trunk at Qwen2's family
     /// facts: no head norm, the projections' biases beside them (12 tensors a layer, 339 in all
     /// with the untied head), the query's and key's rows and biases moved to neighbours as
@@ -1560,7 +1546,7 @@ mod tests {
     fn the_real_qwen2_folder_maps_to_the_files_tensors_and_keys() {
         let checkpoint = Checkpoint::parse(&json(Q2_CONFIG)).unwrap();
         assert_eq!(checkpoint.architecture(), "llama");
-        let mapping = map_of(&checkpoint, &unpacked_with_biases(json(Q2_HEADER))).unwrap();
+        let mapping = map_of(&checkpoint, &unpacked(json(Q2_HEADER))).unwrap();
         assert_eq!(mapping.tensors.len(), 3 + 28 * 12);
         assert!(mapping.skipped.is_empty());
         let get = |name: &str| &mapping.tensors[name];
@@ -1610,14 +1596,14 @@ mod tests {
         assert!(checkpoint.constants().unwrap().is_empty());
         // The folder's bias is the family's: a folder with none of the three is refused by name,
         // and so is a bias another family's map does not name.
-        let mut t = unpacked_with_biases(json(Q2_HEADER));
+        let mut t = unpacked(json(Q2_HEADER));
         t.retain(|(n, _)| n != "model.layers.5.self_attn.v_proj.bias");
         let e = map_of(&checkpoint, &t).err().expect("refused");
         assert!(
             e.contains("blk.5.attn_v.bias") && e.contains("is missing from the folder"),
             "{e}"
         );
-        let mut t = unpacked_with_biases(json(Q2_HEADER));
+        let mut t = unpacked(json(Q2_HEADER));
         t.push(("model.layers.3.self_attn.o_proj.bias".into(), vec![3584]));
         let e = map_of(&checkpoint, &t).err().expect("refused");
         assert!(
@@ -1625,7 +1611,7 @@ mod tests {
             "{e}"
         );
         let llama = Checkpoint::parse(&json(CONFIG)).unwrap();
-        let e = map_of(&llama, &unpacked_with_biases(json(HEADER))).unwrap();
+        let e = map_of(&llama, &unpacked(json(HEADER))).unwrap();
         assert_eq!(e.tensors.len(), 291, "Llama holds no bias and still maps");
         let mut t = unpacked(json(HEADER));
         t.push(("model.layers.0.self_attn.q_proj.bias".into(), vec![4096]));
