@@ -249,13 +249,14 @@ release or commit it was measured on; 0.3.11's own rows, Qwen3.8-27B's among the
 ² the first round after a load read 1,440.33, the next three 1,735 to 1,739.
 
 **DGX Spark (GB10, 128 GB)**, measured by [@juliankang4](https://github.com/juliankang4) on their own machine at
-`TBD-SITTING` (commit): NVIDIA's FP4-Local folder as downloaded and Unsloth's GGUFs with their MTP drafts, the serving defaults, 512 and 4,096-id prompts
+`TBD-SITTING` (commit): NVIDIA's FP4-Local and NVFP4 folders as downloaded and Unsloth's GGUFs with their MTP drafts, the serving defaults, 512 and 4,096-id prompts
 (code and English prose), 128 greedy tokens, median of three rounds. Earlier Spark rows are in
 [`docs/numbers.md`](docs/numbers.md#dgx-spark-qwen38-flash-next-on-the-fp4-local-and-nvfp4-folders-0310).
 
 | Model | Prefill tok/s, 512 / 4,096 ids | Decode tok/s, 512 / 4,096 ids | Time to first token, 512 / 4,096 ids |
 |---|---|---|---|
 | Qwen3.8-Flash-Next, FP4-Local folder, MTP on | TBD-SITTING | TBD-SITTING | TBD-SITTING |
+| Qwen3.8-Flash-Next, NVFP4 folder, MTP on | TBD-SITTING | TBD-SITTING | TBD-SITTING |
 | Qwen3.8-Flash-Next `UD-Q4_K_XL`, MTP on | TBD-SITTING | TBD-SITTING | TBD-SITTING |
 | Qwen3.6-35B-A3B `UD-Q4_K_M`, MTP on | TBD-SITTING | TBD-SITTING | TBD-SITTING |
 
@@ -266,6 +267,7 @@ Earlier RTX 5090 rows are in [`docs/numbers.md`](docs/numbers.md#rtx-5090-qwen36
 | Model | Prefill tok/s, 512 / 4,096 ids | Decode tok/s, 512 / 4,096 ids | Time to first token, 512 / 4,096 ids |
 |---|---|---|---|
 | Qwen3.8-Flash-Next, FP4-Local folder, MTP on | TBD-SITTING | TBD-SITTING | TBD-SITTING |
+| Qwen3.8-Flash-Next, NVFP4 folder, MTP on | TBD-SITTING | TBD-SITTING | TBD-SITTING |
 | Qwen3.8-Flash-Next `UD-Q4_K_XL`, MTP on | TBD-SITTING | TBD-SITTING | TBD-SITTING |
 | Qwen3.6-35B-A3B `UD-Q4_K_M`, MTP on | TBD-SITTING | TBD-SITTING | TBD-SITTING |
 
