@@ -1,0 +1,14 @@
+# Mistral Large 4 (UD-IQ1_S) release rows on the A6000 through bloomery-serve: decode and prompt rate at 512 and 4096
+# ids, plain and with the DSpark draft. Decode band from the paper step, 56..85 ms (host DRAM reading the host
+# experts is the wall; derived from the ML4 placement rounds' terms, not measured as a step). The DSpark arm is read
+# beside it with no band of its own: its gain is the term this sitting measures.
+kind: baseline
+question: what decode and prompt rates does Mistral Large 4 UD-IQ1_S serve on one A6000, plain and with DSpark?
+term: tg tok/s @ D = 512, bloomery-serve default (place a), RTX A6000
+unit: tok/s
+predict: 11.8..17.9
+condition: one lease, the A6000, BLOOMERY_AB_ROUNDS=4; arms bloomery-land9:512 bloomery-land9:4096 and the same with env=BLOOMERY_DRAFT=dspark
+reason: 1000 / (56..85 ms) per step from the ML4 placement paper; pp and DSpark rows are read beside it, not predicted.
+decide-in: the release rows take the measured means with their intervals
+decide-below: under 11.8: a term of the step is missing; read the step's nsys split before publishing a number
+decide-above: beyond 17.9: the host expert share is smaller than planned; check the plan line before crediting
