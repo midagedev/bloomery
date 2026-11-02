@@ -70,9 +70,6 @@ class Resume(unittest.TestCase):
         self.root = Path(tmp.name)
         self.cut = self.root / "cut"
         self.cut.mkdir()
-        meta = {"bloomery.fixture.version": "1", "bloomery.fixture.source": self.oracle.REPO,
-                "bloomery.fixture.rev": self.oracle.MODEL_REV}
-        (self.cut / "model-00001-of-00002.safetensors").write_text(json.dumps(meta))
         # The config a cut of layers [0, 1, 2, 3] and one of [0, 1, 6, 7] both write.
         (self.cut / "config.json").write_text(json.dumps({"text_config": {"num_hidden_layers": 4, "vocab_size": 64}}))
         self.prose = self.root / "prose.txt"
@@ -80,6 +77,15 @@ class Resume(unittest.TestCase):
         self.out = self.root / "out"
         self.out.mkdir()
         (self.out / "resume.pt").write_bytes(b"")
+
+    def generation(self, layers):
+        """Write the cut's first shard as the cut of `layers` writes it; its `# fixture` line, as refset prints it."""
+        meta = {"bloomery.fixture.version": "1", "bloomery.fixture.source": self.oracle.REPO,
+                "bloomery.fixture.rev": self.oracle.MODEL_REV, "bloomery.fixture.layers": layers,
+                "bloomery.fixture.card_budget": "30000000000"}
+        (self.cut / "model-00001-of-00002.safetensors").write_text(json.dumps(meta))
+        return "# fixture\t" + " ".join(
+            "%s=%s" % (k, meta[k]) for k in sorted(meta) if k != "bloomery.fixture.card_budget")
 
     def resume(self, line, saved):
         """Resume the paused run on the cut whose `# fixture` line is `line`, with `saved` its state's identity."""
@@ -90,16 +96,31 @@ class Resume(unittest.TestCase):
             self.oracle.main()
 
     def test_a_resume_continues_only_the_cut_generation_it_paused_on(self):
-        first, regenerated = "# fixture\tlayers=0,1,2,3", "# fixture\tlayers=0,1,6,7"
+        first = self.generation("0,1,2,3")
         paused = Capture()
         with self.assertRaises(SystemExit) as captured:
             self.resume(first, paused)
         self.assertIn("resume.pt", str(captured.exception))
         with self.assertRaises(Accepted):
             self.resume(first, paused.seen)
+        regenerated = self.generation("0,1,6,7")
         with self.assertRaises(SystemExit) as refused:
             self.resume(regenerated, paused.seen)
         self.assertIn("resume.pt", str(refused.exception))
+
+    def test_the_fixture_line_is_held_to_the_cut_it_names(self):
+        first = self.generation("0,1,2,3")
+        paused = Capture()
+        with self.assertRaises(SystemExit):
+            self.resume(first, paused)
+        self.generation("0,1,6,7")
+        with self.assertRaises(SystemExit) as stale:
+            self.resume(first, paused.seen)
+        self.assertIn("bloomery.fixture.layers=0,1,2,3", str(stale.exception))
+        partial = first.replace("bloomery.fixture.layers=0,1,2,3 ", "")
+        with self.assertRaises(SystemExit) as missing:
+            self.resume(partial, paused.seen)
+        self.assertIn("bloomery.fixture.layers=nothing", str(missing.exception))
 
 
 def self_test():

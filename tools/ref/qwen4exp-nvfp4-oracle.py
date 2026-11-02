@@ -179,7 +179,9 @@ def q8_name(name):
 
 def cut_shard(folder, line):
     """The first shard of `folder`, as `folder` names it, when the folder is a cut of REPO at MODEL_REV and `line` its
-    `# fixture` line; None for the checkpoint folder itself, which must be at MODEL_REV and take no line."""
+    `# fixture` line; None for the checkpoint folder itself, which must be at MODEL_REV and take no line. The line must
+    state every `bloomery.fixture.*` key of the shard but the card budget, each once with the shard's value, as
+    `refset-check --fixture-line` prints it: a line of another generation of the cut is refused."""
     first = glob.glob(os.path.join(folder, "*-00001-of-*.safetensors"))
     if len(first) != 1:
         raise SystemExit("%s: %d first shards, want one" % (folder, len(first)))
@@ -195,6 +197,17 @@ def cut_shard(folder, line):
         raise SystemExit("%s is a cut of %s@%s, not of %s@%s" % (first[0], source[0], source[1], REPO, MODEL_REV))
     if line is None or not line.startswith("# fixture\t") or "\n" in line:
         raise SystemExit("%s is a cut: --fixture-line gives its one `# fixture` line" % folder)
+    held = {}
+    for token in line[len("# fixture\t"):].split(" "):
+        k, sep, v = token.partition("=")
+        if not sep or not k.startswith("bloomery.fixture.") or k in held:
+            raise SystemExit("--fixture-line: %r is not one bloomery.fixture.* key=value, once" % token)
+        held[k] = v
+    keys = {k: v for k, v in meta.items() if k.startswith("bloomery.fixture.") and k != "bloomery.fixture.card_budget"}
+    for k in sorted(set(keys) | set(held)):
+        if held.get(k) != keys.get(k):
+            raise SystemExit("--fixture-line states %s=%s, the first shard %s has %s" % (
+                k, held.get(k, "nothing"), first[0], keys.get(k, "nothing")))
     return first[0]
 
 
