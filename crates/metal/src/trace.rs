@@ -21,7 +21,7 @@
 //! ```text
 //! cb N begin | cb N wait-event NAME=V | cb N signal NAME=V | cb N commit
 //! enc N.M open serial|concurrent | enc N.M end
-//! dispatch N.M.K LABEL grid=GXxGY tpg=T max=… width=… tg_static=… b0=… b1=…
+//! dispatch N.M.K LABEL max=… width=… tg_static=… grid=GXxGY tpg=T b0=… b1=…
 //! barrier N.M
 //! host settle V | host sync
 //! ```
