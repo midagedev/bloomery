@@ -24,7 +24,8 @@ class-table family (`<family> (F family)`), every other gate under the family of
          (the manifest, through tools/box.sh) and only when some gate is stale by date. When it cannot, every gate stale by date is
          listed as due with `key unknown` and the reason on stderr: the batch's own ledger check skips any that is green at its key.
   check  rc 1 naming each family whose gates (the same set) have no green ledger row newer than N days. tools/release/publish.sh runs it
-         before a release is published and stops on rc 1.
+         before a release is published and stops on rc 1. A family of needs-env gates alone is printed `env` and not counted: it
+         runs only on a machine that sets its variable, which this ledger's batches defer by name.
 
 The ledger and the times file are the ones gate-batch.sh reads: BLOOMERY_GATE_LEDGER and BLOOMERY_GATE_TIMES, else
 ~/.cache/bloomery/. `--classes FILE` reads a saved `tools/gate-batch.sh --tier fixture --classes` (the classifier is slow: every
@@ -475,6 +476,12 @@ def check_families(gates: list[Gate], last: dict[str, dt.datetime], now: dt.date
     return out
 
 
+def env_only(gates: list[Gate]) -> bool:
+    """A family whose every gate is a needs-env gate: it runs only on a machine that sets its variable, which the lead's batches
+    defer by name, so no row of this ledger can make it green; `check` names it apart instead of counting it red."""
+    return bool(gates) and all(g.kind == "needs-env" for g in gates)
+
+
 def cmd_check(args: argparse.Namespace, now: dt.datetime | None = None, rs: dict | None = None, f_gates: dict[str, str] | None = None) -> int:
     now = now or dt.datetime.now().astimezone()
     gates = load_gates(args, rs, f_gates)
@@ -484,6 +491,10 @@ def cmd_check(args: argparse.Namespace, now: dt.datetime | None = None, rs: dict
         when = "no green row" if newest is None else f"newest green row {int((now - newest).total_seconds() // 86400)} d ago"
         if ok:
             print(f"ok   {fam}: {len(gs)} gate(s), {when}")
+        elif env_only(gs):
+            print(f"env  {fam}: {len(gs)} gate(s), {when}; each waits for a machine that sets "
+                  f"{' '.join(sorted({g.env for g in gs}))} (a batch defers it by name elsewhere), so this ledger cannot hold it: "
+                  f"{' '.join(g.name for g in gs[:8])}" + (" …" if len(gs) > 8 else ""))
         else:
             red += 1
             print(f"RED  {fam}: {len(gs)} gate(s), {when}; none is newer than {args.days:g} d: {' '.join(g.name for g in gs[:8])}" + (" …" if len(gs) > 8 else ""))
@@ -725,6 +736,10 @@ def self_test() -> int:
             with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
                 rc = cmd_check(argsc, now, rs2, {})
             expect(rc == 0 and "RED" not in buf.getvalue(), f"cmd_check: rc 0 when every family has a row newer than N days: {rc} {buf.getvalue()}")
+            env_g = Gate("gate-e", "needs-env", False, "fe", "NEEDS_VAR")
+            real_g = Gate("gate-r", "real-only", False, "fe", "")
+            expect(env_only([env_g]) and not env_only([env_g, real_g]) and not env_only([]),
+                   "env_only: a family of needs-env gates alone is named apart; one other gate keeps it countable")
 
             # The F families. A landing runs an F family's gate only on its family's change, so the rotation schedules it, from the class
             # tables' set (`f_gates` stands for recipes.f_family_gates): gate-fx-old green 8 d ago and gate-fx-new never (family fx), gate-fz
