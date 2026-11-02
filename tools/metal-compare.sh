@@ -36,10 +36,17 @@
 # build.log, pipelines.tsv and pipelines-2.tsv, trace-d0.txt, trace-d600.txt, ids-*.txt and the runs' logs; compare.txt is the
 # printed tables.
 #
-# Exit codes: 0 every pipeline row and both traces and both id lists identical; 3 an existing pipeline moved or a trace or an id
-# list differs; 4 a pipeline was removed; 5 both; 6 nothing existing moved but the head builds pipelines the base does not (the add
+# Exit codes: 0 every pipeline row and both traces and both id lists identical (a pipeline row whose archive moved and whose
+# `exec_sha256`, the hash of the GPU slice's sections but the AIR, did not is `relinked`: the AIR moved, the device code is the same,
+# and it counts as identical; a side built before that column is judged on `code_sha256`, and the compare says so; a changed row
+# whose `text_sha256`, the instruction stream inside the device binary, is equal says so on its line and stays changed); 3 an existing
+# pipeline moved or a trace or an id list differs; 4 a pipeline was removed; 5 both; 6 nothing existing moved but the head builds pipelines the base does not (the add
 # class: its rows are listed); 2 a side refused by name (no instrument and none applies, two scans of different environments, a
 # file that is no scan or trace); 1 a build or a run failed (named, with its log); 64 usage; 78 not an Apple Silicon Mac.
+# A trace compare has its own codes (metal_scan --compare-trace), shown in the summary line as `trace depth ... rc`: 0 identical,
+# 6 identical up to buffer numbering (a binding names its buffer by allocation order, so a change that allocates one more buffer
+# shifts every later id; the compare renumbers each side by first use and finds the same program: the pairs are printed), 3 differ,
+# 2 refused. The run's codes above do not change: a trace rc 6 counts as identical, and the summary line keeps the 6.
 # Runs no gate and takes no lock: it opens this Mac's GPU, which nothing it does changes.
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -297,7 +304,9 @@ case $pipe_rc in
   3 | 4 | 5) rc=$pipe_rc ;;
   *) die 1 "metal_scan --compare ended rc $pipe_rc" ;;
 esac
-if [ "$t0_rc" != 0 ] || [ "$t6_rc" != 0 ] || [ "$ids_differ" != 0 ]; then
+# a trace rc 6 is the same program under another buffer numbering (metal_scan --compare-trace): identical for this run's code
+trace_differs() { [ "$1" != 0 ] && [ "$1" != 6 ]; }
+if trace_differs "$t0_rc" || trace_differs "$t6_rc" || [ "$ids_differ" != 0 ]; then
   case $rc in 0 | 3) rc=3 ;; *) ;; esac
 fi
 if [ "$rc" = 0 ] && [ "${added:-0}" != 0 ]; then rc=6; fi
