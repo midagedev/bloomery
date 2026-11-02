@@ -322,7 +322,9 @@ runners; a fixture-only gate stays ([`dgx-spark.md`](dgx-spark.md) section 11, a
 base with `HEAD`, so it needs a git clone with that history. `--no-box` keeps `affected` from reading the box's build
 information over ssh. Without an SSH client on `PATH`, `affected` exits 2 with a named error and the `--no-box`
 workaround; it does not silently omit dep-info. The dry run touches neither the box nor an output directory, and prints
-one `lane` line per item.
+one `lane` line per item. Under `BLOOMERY_BOX_LOCAL=1` a batch runs one lane unless `--lanes 2` asks for two, because
+the one local gate lock holds the machine's cards, and its pack sums against this machine's `MemAvailable`
+(`tools/gate-batch.sh`, "Lanes").
 A line `lane -  <item>` followed by `deferred to the real tier (<kind>)` is an item the fixture tier does not run:
 real-only, real-file, or of a family with no fixture. A line `lane A`, `lane B` or `lane X` is an item it runs, with its
 command. Your list is the items of the second kind. Keep `gate-ptx-spill` on it only where its tables pin your PTX

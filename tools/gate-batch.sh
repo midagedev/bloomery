@@ -28,8 +28,10 @@
 # item, ARGS given to a recipe with no parameters, or an empty list is a named error before anything
 # runs.
 #
-# Lanes (--lanes 2, the default), read from each recipe's text and attributes in `just --dump` (and
-# its dependencies'), and from the scripts that text runs, followed transitively (walk() below):
+# Lanes (--lanes 2, the default: the box's two cards, each a gate lock of its own), read from each recipe's text and attributes in
+# `just --dump` (and its dependencies'), and from the scripts that text runs, followed transitively (walk() below). Under
+# BLOOMERY_BOX_LOCAL=1 the default is --lanes 1: tools/box.sh's local mode runs every gate under the one gate lock that holds the
+# machine's cards (tools/gpu-gate.sh), so a second lane's gates would only queue on it; --lanes 2 there still runs two lanes.
 #   A  fixed, the 3090: a tools/gpu-gate.sh call, in the recipe or a script it runs, without
 #      BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} (V4.1 `--place gate` gates, which this lane keeps on
 #      the 3090; gate-gpu-hybrid, whose host tier spins the worker pool on the cores a V4.1 gate's pool
@@ -517,7 +519,9 @@ CHAIN_SOLO_REAL='gate-gpu-ds41-residency-a gate-gpu-glm5next-e2e gate-gpu-glm5ne
 # serve logs) less a 1 GiB margin for a reading lower than train028b's lowest = 262,185,889,800 B.
 # A set of loads whose HostNeeds sum within it each pass their own check (crates/gpu/src/model.rs,
 # host_available: a neighbour's populated page cache counts as available; its locked bytes do not).
-# BLOOMERY_PACK_BUDGET overrides it (bytes, a positive integer; the self-test's numbers).
+# Under BLOOMERY_BOX_LOCAL=1 the loads run on this machine, so a two-lane batch's budget is its own MemAvailable, read once
+# as the batch starts (/proc/meminfo), less the same 1 GiB margin. BLOOMERY_PACK_BUDGET overrides either (bytes, a positive integer; the
+# self-test's numbers).
 PACK_BUDGET=262185889800
 
 USAGE="usage: tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--tier real|fixture] [--ledger [--trust-rounds] [--no-gpu-hold] | --round-ledger] [--rerun] [--over-budget-ok] [--no-canary] [--red-main-check] [--wait-hold [SECONDS]] | --classes | --self-test [--part K|all]"
@@ -751,6 +755,7 @@ self_test() {
     return 1
   }
   unset BLOOMERY_TIER # the tier of a case is the case's own
+  unset BLOOMERY_BOX_LOCAL # the lanes and the pack budget of a case are the box's unless it names local mode
   unset BLOOMERY_BATCH_START_HOOK # a case that wants a hook sets it; the caller's own must not run on the fixture
   self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
   t=$(mktemp -d "${TMPDIR:-/tmp}/gate-batch-test.XXXXXX") || { echo "gate-batch: self-test: no temporary directory" >&2; return 70; }
@@ -2344,6 +2349,20 @@ HK
   out=$(env BLOOMERY_GATE_TIMES=$t/times-pkpred.tsv BLOOMERY_PACK_BUDGET=10000 "${gb[@]}" --dry-run pk-a pk-b 2>&1) || fail 'pack: the dry run names the takes' "$out"
   if [ "$(grep -c 'the pack takes it at [0-9]*s' <<< "$out")" = 2 ]; then pass 'pack: the dry run names each X item'"'"'s simulated take'
   else fail 'pack: the dry run names each X item'"'"'s simulated take' "$(grep 'lane X' <<< "$out")"; fi
+  # Local mode (BLOOMERY_BOX_LOCAL=1): one lane by default, two when asked, and the pack's budget this machine's MemAvailable
+  # less 1 GiB (Linux: /proc/meminfo), not the box's figure.
+  check 'local mode: one lane by default (the one local gate lock)' 0 'dry run .*, lanes 1, ' \
+    env BLOOMERY_BOX_LOCAL=1 BLOOMERY_GATE_TIMES="$t/times-pkpred.tsv" "${gb[@]}" --dry-run pk-a pk-b
+  if [ -r /proc/meminfo ]; then
+    out=$(env BLOOMERY_BOX_LOCAL=1 BLOOMERY_GATE_TIMES="$t/times-pkpred.tsv" "${gb[@]}" --dry-run --lanes 2 pk-a pk-b 2>&1) ||
+      fail 'local mode: the --lanes 2 dry run exits 0' "$out"
+    got=$(sed -n 's/.*the \([0-9]*\) B host budget.*/\1/p' <<< "$out" | head -n 1)
+    avail=$(awk '/^MemAvailable:/ { printf "%.0f\n", $2 * 1024 - 1073741824 }' /proc/meminfo)
+    if grep -q 'dry run .*, lanes 2, ' <<< "$out" && [ -n "$got" ] && [ "$got" != 262185889800 ] &&
+      awk -v g="$got" -v a="$avail" 'BEGIN { d = g - a; exit !(d < 536870912 && d > -536870912) }'; then
+      pass 'local mode: --lanes 2 packs against this machine'"'"'s MemAvailable less 1 GiB'
+    else fail 'local mode: --lanes 2 packs against this machine'"'"'s MemAvailable less 1 GiB' "budget ${got:-none}, MemAvailable less 1 GiB $avail: $(grep -E 'lanes|budget' <<< "$out")"; fi
+  fi
   # (6) the fixture tier reads no bytes: a pair over any budget packs there.
   rc=$(AWAIT='gen_pg=gen_pg2 gen_pg2=gen_pg' BLOOMERY_PACK_BUDGET=1 steal_case pk-fx "pk-big	A	3090	3	$d" "pk-big2	B	a6000	3	$d" \
     -- --tier fixture pk-big@FAKE_SLEEP=3 pk-big2@FAKE_SLEEP=3)
@@ -4329,7 +4348,7 @@ if [ "${1:-}" = --self-test ]; then
     *) die "--self-test takes nothing else, or --part K|all; $USAGE" ;;
   esac
 fi
-OUT='' OUT_AUTO=0 SRC='' LIST='' DRY=0 LANES=2 LEDGER=0 RERUN=0 LMODE='' TRUST=0 TIER_FLAG='' NOHOLD=0 BUDGET_OK=0 WAIT_HOLD=''
+OUT='' OUT_AUTO=0 SRC='' LIST='' DRY=0 LANES='' LEDGER=0 RERUN=0 LMODE='' TRUST=0 TIER_FLAG='' NOHOLD=0 BUDGET_OK=0 WAIT_HOLD=''
 CANARY=1 RED_MAIN=0
 ITEMS=()
 while [ $# -gt 0 ]; do
@@ -4379,11 +4398,24 @@ HOLD_ON=0 HOLD_UP=0 HOLD_OWNER='' HOLD_BEAT=${BLOOMERY_GPU_HOLD_BEAT:-60}
 case $HOLD_BEAT in
   '' | 0 | *[!0-9]*) die "BLOOMERY_GPU_HOLD_BEAT is whole seconds from 1 (the heartbeat's period, default 60; the box calls a hold stale after 300), got '$HOLD_BEAT'" ;;
 esac
+# The lanes and the pack's budget are this machine's under local mode (the header's «Lanes» and PACK_BUDGET above).
+LOCAL_RUN=0
+[ "${BLOOMERY_BOX_LOCAL:-0}" != 1 ] || LOCAL_RUN=1
+if [ -z "$LANES" ]; then
+  LANES=2
+  [ "$LOCAL_RUN" = 0 ] || LANES=1
+fi
 if [ -n "${BLOOMERY_PACK_BUDGET+x}" ]; then
   case $BLOOMERY_PACK_BUDGET in
     '' | 0 | *[!0-9]*) die "BLOOMERY_PACK_BUDGET is the pack's byte budget, a positive integer (the header's «pack»), got '$BLOOMERY_PACK_BUDGET'" ;;
   esac
   PACK_BUDGET=$BLOOMERY_PACK_BUDGET
+elif [ "$LOCAL_RUN" = 1 ] && [ "$LANES" = 2 ]; then
+  avail=$(awk '/^MemAvailable:/ { printf "%.0f\n", $2 * 1024 - 1073741824 }' /proc/meminfo 2> /dev/null) || avail=''
+  case $avail in
+    '' | 0 | -* | *[!0-9]*) die "BLOOMERY_BOX_LOCAL=1 packs against this machine's MemAvailable (/proc/meminfo) less 1 GiB, and it reads '${avail:-nothing}': set BLOOMERY_PACK_BUDGET" ;;
+  esac
+  PACK_BUDGET=$avail
 fi
 if [ "$LMODE" = lead ] && [ "$NOHOLD" = 0 ]; then
   HOLD_ON=1
