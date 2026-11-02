@@ -1698,3 +1698,71 @@ fn mistrallarge4_context_scratch() {
         bad.join("\n  ")
     );
 }
+
+/// The DSpark draft's card bytes (3,686,891,560 B: the real draft's `card_bytes_of`, pinned in
+/// `arch::mistrallarge4::dspark`'s unit tests) are a reserve of the stage card's plan at every
+/// context, ahead of the experts and of the context's fit: the plan with the draft counts exactly
+/// that many reserve bytes more than the plan without it at 4,096 and at 262,144 positions, holds
+/// the same cache and position rows, and holds no more card experts. A position costs the card
+/// 82,928 B (its cache 82,688 B and its indexer scores [`SCORES_PER_POSITION`], read from the two
+/// plans), so the draft takes 44,459 positions of the card's room [derived: ⌈3,686,891,560 ÷
+/// 82,928⌉]. Mutant: a seat that plans without the reserve leaves the two plans equal and the
+/// clause red; the serve gate's `dspark_plan_holds_the_draft` is that seat's own.
+#[test]
+fn mistrallarge4_draft_reserve() {
+    use model::arch::mistrallarge4::place::PlanInputs;
+    use model::placement::PlanLevers;
+    use model::placement::workstation::{self, HostRead};
+
+    const DRAFT: u64 = 3_686_891_560;
+    let mut bad = Vec::new();
+    let split = header_of("draft-reserve", KV, TENSORS);
+    let mut inputs = PlanInputs::describe(&split).unwrap_or_else(|e| panic!("describe: {e}"));
+    inputs.room = (workstation::PLAN_ROOM, HostRead::Given);
+    let plain_machine = workstation::plan_a(72);
+    let drafted_machine = workstation::plan_a_draft(72, Some(DRAFT))
+        .unwrap_or_else(|e| panic!("the stage card holds the draft: {e}"));
+    let mut per_position = Vec::new();
+    for ctx in [4_096u64, 262_144] {
+        let plain = inputs
+            .plan(&plain_machine, ctx, &PlanLevers::default())
+            .unwrap_or_else(|e| panic!("plan a at {ctx}: {e}"));
+        let drafted = inputs
+            .plan(&drafted_machine, ctx, &PlanLevers::default())
+            .unwrap_or_else(|e| panic!("plan a with the draft at {ctx}: {e}"));
+        let (p, d) = (&plain.cards[0], &drafted.cards[0]);
+        if d.reserve_bytes != p.reserve_bytes + DRAFT
+            || (d.kv_bytes, d.stage_rows_bytes) != (p.kv_bytes, p.stage_rows_bytes)
+            || d.experts > p.experts
+        {
+            bad.push(format!(
+                "ctx {ctx}: reserve {} B beside the plain plan's {} B (the draft's {DRAFT} B more), \
+                 cache {} B and rows {} B beside {} B and {} B, experts {} beside {}",
+                d.reserve_bytes,
+                p.reserve_bytes,
+                d.kv_bytes,
+                d.stage_rows_bytes,
+                p.kv_bytes,
+                p.stage_rows_bytes,
+                d.experts,
+                p.experts
+            ));
+        }
+        per_position.push(p.kv_bytes + p.stage_rows_bytes);
+    }
+    let a_position = (per_position[1] - per_position[0]) / (262_144 - 4_096);
+    if a_position != KV_PER_POSITION + SCORES_PER_POSITION || DRAFT.div_ceil(a_position) != 44_459 {
+        bad.push(format!(
+            "a position costs the card {a_position} B, derived {} B; the draft takes {} positions, \
+             derived 44,459",
+            KV_PER_POSITION + SCORES_PER_POSITION,
+            DRAFT.div_ceil(a_position.max(1))
+        ));
+    }
+    assert!(
+        bad.is_empty(),
+        "{} pin(s) differ:\n  {}",
+        bad.len(),
+        bad.join("\n  ")
+    );
+}

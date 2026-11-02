@@ -560,8 +560,10 @@ slots and memory each start takes, is [`dgx-spark.md`](dgx-spark.md).
   `BLOOMERY_DRAFT=lookup` serves the n-gram lookup draft on the same whole-card load.
 - **The mistrallarge4 seat.** `BLOOMERY_DRAFT=lookup` serves the n-gram draft, one context a slot. `BLOOMERY_DRAFT=dspark`
   serves the DSpark draft of `BLOOMERY_DSPARK_MODEL` on the card `BLOOMERY_DSPARK_CARD` names (else the common placement
-  rule picks), from one slot: `--parallel` above 1 and an image under it are refused by name. Unset serves the plain
-  path.
+  rule picks), from one slot: `--parallel` above 1 and an image under it are refused by name. The draft's card bytes (its
+  weights, the target's `output` it copies, its rings and a scratch allowance) are a reserve of the plan on its card
+  before the context is fitted: the unset context is the largest that leaves the draft its room, and a `--ctx` that
+  leaves none is refused by name with the largest that fits. Unset serves the plain path.
 
 ### 9.4 Nemotron
 

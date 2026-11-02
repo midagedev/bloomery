@@ -508,7 +508,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               n-gram lookup draft, one context a resident slot, and `dspark` the DSpark draft \
               (`$BLOOMERY_DSPARK_MODEL`, the file whose `target_layers` the target taps) on \
               one slot, each through the body's two-row verify pass, the DSpark draft's bytes \
-              held to its card's free room alone; the qwen3 seat of `bloomery-serve` on a \
+              reserved on its card by the plan before the context is fitted; the qwen3 seat of `bloomery-serve` on a \
               qwen35moe or qwen35 file: `dspark` serves the HF DSpark draft \
               (`$BLOOMERY_DSPARK_MODEL`) on a whole-card load of one slot, and `lookup` serves \
               the n-gram lookup draft on the same whole-card verifying load, one context a \

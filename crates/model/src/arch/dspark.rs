@@ -729,7 +729,9 @@ pub struct DraftCardBytes {
     pub kv: u64,
     /// The allocator's granules past `weights + kv`.
     pub rounding: u64,
-    /// [`SCRATCH_ALLOWANCE`].
+    /// [`SCRATCH_ALLOWANCE`], and beside it the working buffers a family's
+    /// formula states where they are more than the allowance holds (the
+    /// Mistral Large 4 draft's inbox of the window's tapped rows).
     pub scratch: u64,
 }
 
@@ -867,7 +869,7 @@ fn mxfp4_planes(t: &DraftTensor) -> Result<[u64; 2], PlacementError> {
 
 /// `rows` rows of the first dim of `dims`, in `format`: the buffers the
 /// upload allocates, or the refusal naming `name`.
-fn format_buffers(
+pub(crate) fn format_buffers(
     name: &str,
     format: Option<CardFormat>,
     ty: GgmlType,

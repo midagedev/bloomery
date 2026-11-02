@@ -15,8 +15,8 @@ use bloomery_gpu_gates::generate::{DraftSeat, Place};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_levers::Levers;
 use gguf::Split;
-use model::arch::dspark::DraftHparams;
-use model::placement::workstation::GRANULE;
+use model::arch::dspark::{DraftCardBytes, DraftHeld, DraftHparams};
+use model::placement::workstation::{CardSpec, GRANULE};
 
 use crate::dspark;
 
@@ -97,19 +97,15 @@ pub fn open_dspark(
         Arc::clone(&target),
         (card.name, card.device),
     )?;
-    dspark::plan_bytes(draft_split, &target)?.check_held(d.held(), GRANULE, card.name)?;
-    let (free, total) = d.mem_info()?;
     let resident = d.resident_bytes() as u64;
-    if resident > reserve.bytes {
-        return Err(format!(
-            "the DSpark draft holds {resident} B on {}, past the {} B its plan reserved there \
-             under --place {}",
-            card.name,
-            reserve.bytes,
-            place.name()
-        )
-        .into());
-    }
+    hold_load(
+        &dspark::plan_bytes(draft_split, &target)?,
+        d.held(),
+        resident,
+        seat,
+        (place, &card),
+    )?;
+    let (free, total) = d.mem_info()?;
     let b = loaded.model().body(what)?;
     let r = Record::new(&record::LOAD_DRAFT)
         .w("draft", "dspark")
@@ -125,4 +121,30 @@ pub fn open_dspark(
         .u("draft_card_total", total)
         .f("load_s", t.elapsed().as_secs_f64());
     Ok((d, r))
+}
+
+/// A draft's load held to its plan, whichever family's draft it is: the
+/// buffers the load counted of itself against the formula `planned` term by
+/// term ([`DraftCardBytes::check_held`]), and its `resident` bytes against
+/// what `seat`'s plan reserved for it on `card` under `place`. A draft whose
+/// resident bytes are more would sit in the card's margin: refused by name.
+pub fn hold_load(
+    planned: &DraftCardBytes,
+    held: &DraftHeld,
+    resident: u64,
+    seat: DraftSeat,
+    (place, card): (Place, &CardSpec),
+) -> Result<(), GateError> {
+    planned.check_held(held, GRANULE, card.name)?;
+    if resident > seat.reserve.bytes {
+        return Err(format!(
+            "the DSpark draft holds {resident} B on {}, past the {} B its plan reserved there \
+             under --place {}",
+            card.name,
+            seat.reserve.bytes,
+            place.name()
+        )
+        .into());
+    }
+    Ok(())
 }

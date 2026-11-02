@@ -66,9 +66,13 @@
 //! of `$BLOOMERY_DSPARK_MODEL` on the card `$BLOOMERY_DSPARK_CARD` names (the common placement
 //! rule otherwise), one slot. The target's feature tap for the draft file's `target_layers` is
 //! attached before the step is captured (`bloomery_gpu_mistrallarge4::features`), so the step
-//! and the verify pass lay the rows the draft reads; the draft's bytes are not a term of the
-//! plan, and its load is held to the card's free room alone. An image under `dspark` is refused
-//! by name. Unset, the seat serves the plain path.
+//! and the verify pass lay the rows the draft reads. Under `dspark` the draft's card bytes (its
+//! weights, the target's `output` it copies, its rings and the scratch allowance,
+//! [`draft_file::card_bytes`]) are a reserve of every plan of the run, on the card the draft sits
+//! on and ahead of the context's fit, so the unset context is the largest that leaves the draft
+//! its room, a set `--ctx` that leaves none is refused by name with the largest that fits, and
+//! the load is held to the bytes the plan set aside. An image under `dspark` is refused by name.
+//! Unset, the seat serves the plain path.
 //!
 //! `--mmproj FILE` gives the seat image input (behind the `vision` feature): the Pixtral tower
 //! (`pixtral`, Mistral Large 4's mmproj) held against the text model — its row width, and its
@@ -147,11 +151,13 @@ use bloomery_gpu_mistrallarge4::prefill::set_prefill_group;
 use bloomery_levers::Levers;
 use gguf::Split;
 use model::arch::Arch;
+use model::arch::dspark::DraftCardBytes;
+use model::arch::mistrallarge4::dspark as draft_file;
 use model::arch::mistrallarge4::hparams::Hparams;
 use model::arch::mistrallarge4::place::{self, PlanInputs as Ml4Inputs};
 use model::arch::place_hybrid::PlanInputs;
-use model::placement::workstation::TierBatchBytes;
-use model::placement::{PlacementError, Plan};
+use model::placement::workstation::{GRANULE, TierBatchBytes};
+use model::placement::{Machine, PlacementError, Plan};
 use runtime::Target as _;
 use runtime::width::Mode as WidthMode;
 #[cfg(feature = "vision")]
@@ -260,13 +266,22 @@ impl SparkFile {
     }
 }
 
+/// The DSpark draft's card bytes from the two files' headers ([`draft_file::card_bytes`]): what
+/// the plan reserves for it before the context is fitted, and what its load is held to.
+fn spark_bytes(spark: &Split, target: &Split) -> Result<DraftCardBytes, GateError> {
+    draft_file::card_bytes(spark, target, GRANULE)
+        .map_err(|e| format!("the DSpark draft's card bytes: {e}").into())
+}
+
 /// The DSpark draft of `spark` on the card the placement rule names
 /// ([`crate::dspark::draft_card`]) for the target `s` loaded from `target` under `place`, behind
-/// the width chooser of `width`, its `load draft=dspark` record printed. The draft's bytes are
-/// held to the card's free room by the load; the plan sets none aside for it.
+/// the width chooser of `width`, its `load draft=dspark` record printed. The plan set the draft's
+/// bytes aside on that card (`machine` holds the reserve, else the open is refused by name before
+/// any allocation), and the load is held to them, term by term and in all
+/// ([`crate::draft::hold_load`]).
 fn open_dspark(
     s: &mut Session<Body>,
-    (target, place): (&Path, Place),
+    (target, place, machine): (&Path, Place, &Machine),
     spark: SparkFile,
     width: WidthMode,
 ) -> Result<ServedDraft<Body>, GateError> {
@@ -274,6 +289,10 @@ fn open_dspark(
     let on = crate::dspark::draft_card(place)?;
     let target_file =
         Arc::new(Split::open(target).map_err(|e| format!("open {}: {e}", target.display()))?);
+    let planned = spark_bytes(&spark.split, &target_file)?;
+    let seat = on.seat(planned.total());
+    place.check_draft_card(seat, &on)?;
+    seat.check_planned(machine)?;
     let context = Arc::clone(s.model().gpu().context());
     let mut d = dspark::open_draft::<Body>(
         context,
@@ -281,6 +300,8 @@ fn open_dspark(
         target_file,
         (on.spec.name, on.spec.device),
     )?;
+    let resident = d.resident_bytes() as u64;
+    crate::draft::hold_load(&planned, d.held(), resident, seat, (place, &on.spec))?;
     let (free, total) = d.mem_info()?;
     let tapped = s.model().body(NAME)?;
     Record::new(&record::LOAD_DRAFT)
@@ -292,8 +313,9 @@ fn open_dspark(
         )
         .list("target_layers", tapped.feature_layers().unwrap_or_default())
         .u("feature_width", tapped.feature_width())
-        .u("resident", d.resident_bytes())
+        .u("resident", resident)
         .u("working", d.held().working)
+        .u("reserve", seat.reserve.bytes)
         .u("taken", d.taken_bytes())
         .u("draft_card_free", free)
         .u("draft_card_total", total)
@@ -384,7 +406,7 @@ impl MistralLarge4 {
                     width,
                 }),
                 Some(spark),
-            ) => open_dspark(&mut s, (&a.path, a.place), spark, width)?,
+            ) => open_dspark(&mut s, (&a.path, a.place, &machine), spark, width)?,
             (Some(_), _) => {
                 return Err("the draft the run parsed has no file to open".into());
             }
@@ -735,6 +757,13 @@ impl Tiered for MistralLarge4 {
         flags.cache.budget(plan, pool, slot_ctx, |n| {
             seq_bytes(&inputs.kv, inputs.model.layers, n)
         })
+    }
+
+    /// The DSpark draft's card bytes beside the target `split` ([`spark_bytes`] over
+    /// `$BLOOMERY_DSPARK_MODEL`'s header), which every plan of the run reserves on the draft's
+    /// card.
+    fn dspark_bytes(split: &Split) -> Result<DraftCardBytes, GateError> {
+        spark_bytes(&SparkFile::read()?.split, split)
     }
 
     /// The tier's prompt-batch bytes of the file's widths and down forms ([`place::tier_batch`]),

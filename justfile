@@ -596,10 +596,13 @@ gate-gpu-mistrallarge4-xstream:
 # they replaced]: the fixture tier about 2 min; the real tier about 11 min (two loads of about 3 min each, the shared clauses' prompts and answers
 # at 70 ms a step, the slot clauses' eight-token answers, a tool call of at most 192 tokens, the 271-row image 9 to 14 s); the bound is 1800 s.
 # The one-slot server runs the residency default, which holds the host set and the churn pool: the host need is the residency row's.
+# With the DSpark draft file in place (the profile's DSPARK, the real tier only) the gate also plans the draft's card bytes before the
+# context's fit and serves one more server under BLOOMERY_DRAFT=dspark at the default context (about a minute more [derived: three
+# plans, one load of 10 to 15 s and a short completion]).
 [group('solo-real')]
 [group('v41-load')]
 gate-gpu-mistrallarge4-serve:
-    BLOOMERY_MODEL=mistral-large4 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_mistrallarge4_serve && D=target/mistrallarge4-serve-gate && rm -rf $D && mkdir -p $D && M=/models/Mistral-Large-4-1T-A52B-UD-IQ1_S/mmproj-BF16.gguf && if test -f $M; then P="--mmproj $M"; else P=""; fi && BLOOMERY_GATE_BOUND=1800 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_mistrallarge4_serve --dir $D $P'
+    BLOOMERY_MODEL=mistral-large4 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_mistrallarge4_serve && D=target/mistrallarge4-serve-gate && rm -rf $D && mkdir -p $D && M=/models/Mistral-Large-4-1T-A52B-UD-IQ1_S/mmproj-BF16.gguf && if test -f $M; then P="--mmproj $M"; else P=""; fi && . tools/ref/ref-paths.sh && if test -f "$DSPARK"; then P="$P --draft $DSPARK"; fi && BLOOMERY_GATE_BOUND=1800 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_mistrallarge4_serve --dir $D $P'
 
 # Mistral Large 4's adaptive expert residency (gate_mistrallarge4_residency's doc, `BLOOMERY_RESIDENCY`): three placed loads in turn.
 # Plan (a) (the A6000 alone) under `off` and under the word the unset rule resolves on its plan (`mid-p0-s1` where the plan has room),

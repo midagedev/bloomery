@@ -141,7 +141,7 @@ use bloomery_gpu::model::{ChainBody, StepMode};
 use bloomery_gpu::{GpuError, GpuModel};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::bind::{Seat, note_line};
-use bloomery_gpu_gates::generate::{Place, TierRule};
+use bloomery_gpu_gates::generate::{DraftSeat, Place, TierRule};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::side_seat;
 use bloomery_levers::Levers;
@@ -452,8 +452,14 @@ impl Tiered for Muse {
     fn machine(
         place: Place,
         tier_batch: Option<TierBatchBytes>,
+        draft: Option<DraftSeat>,
         layers: usize,
     ) -> Result<Machine, GateError> {
+        if draft.is_some() {
+            return Err(
+                "the Muse Spark seat serves no draft: its plan was handed a seat for one".into(),
+            );
+        }
         if place.tier_cards().is_empty() {
             return Ok(place.machine_placed()?(layers));
         }

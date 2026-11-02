@@ -89,8 +89,9 @@ use model::embed::EmbedTable;
 const WHAT: &str = "mistrallarge4::draft";
 
 /// Rows of one block pass and of one append group: the Q8_0 row kernel's
-/// column bound.
-const ROWS: usize = 8;
+/// column bound, and the rows each ring keeps past the window in the plan's
+/// formula ([`file::card_bytes_of`]).
+const ROWS: usize = file::PASS_ROWS;
 
 /// The draft on its card: the common owner over [`Ml4Layers`].
 pub type Ml4Draft = DsparkBody<Ml4Layers>;

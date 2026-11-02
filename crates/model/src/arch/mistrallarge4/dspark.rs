@@ -34,20 +34,29 @@
 //! This module reads the file and does not run it: [`Hparams::read`] takes
 //! every key it needs, [`names`] owns the model-level tensor names and
 //! [`tensors`] states the shape and type of every tensor; [`check`] holds the
-//! file to that statement and [`fit`] holds it to a target. The taps are the
-//! file's `target_layers` as they stand.
+//! file to that statement and [`fit`] holds it to a target. [`card_bytes`]
+//! states what the draft takes on its card before any load, in the common
+//! draft's terms ([`DraftCardBytes`]). The taps are the file's `target_layers`
+//! as they stand.
+
+use std::num::NonZeroU64;
 
 use gguf::{GgmlType, Split, Value};
 use runtime::dspark::{DraftVocab, DsparkShape, HeadKind};
 
 use super::hparams::{Hparams as Target, YarnKeys};
 use super::names as stem;
-use crate::arch::names::blk;
+use crate::arch::dspark::{DraftCardBytes, SCRATCH_ALLOWANCE, format_buffers};
+use crate::arch::names::{blk, output};
 use crate::arch::{
     DFLASH, is_dflash, meta_arr, meta_bool, meta_f32, meta_str, meta_usize, metadata, n_vocab,
     positive, unread_keys_of,
 };
-use crate::placement::PlacementError;
+use crate::placement::{CardFormat, PlacementError, allocator_bytes};
+
+/// Rows one block pass and one append group take, the Q8_0 row kernel's
+/// column bound: each stage's ring keeps this many rows past the window.
+pub const PASS_ROWS: usize = 8;
 
 /// The key whose presence makes a `dflash` file an MLA draft: V4.1's draft
 /// has a query latent and no kv latent rank, DFlash2's neither.
@@ -555,11 +564,121 @@ pub fn fit(hp: &Hparams, target: &Target) -> Result<(), PlacementError> {
     Ok(())
 }
 
+/// The draft's resident bytes on its card from the two files' headers,
+/// before any load: `draft` held to its statement ([`check`]) and to the
+/// target ([`fit`]), the target's `output` read from `target`, then
+/// [`card_bytes_of`].
+pub fn card_bytes(
+    draft: &Split,
+    target: &Split,
+    granule: NonZeroU64,
+) -> Result<DraftCardBytes, PlacementError> {
+    let hp = Hparams::read(draft)?;
+    check(draft, &hp)?;
+    fit(&hp, &Target::read(target)?)?;
+    let name = output();
+    let (_, head) = target.find(&name).ok_or_else(|| PlacementError::Tensor {
+        name: name.clone(),
+        detail: "is not in the target file".to_string(),
+    })?;
+    card_bytes_of(&hp, &head.dims, head.ty, granule)
+}
+
+/// The draft's resident bytes on a card of allocation granule `granule`,
+/// from its hyperparameters `hp` and the target's `output` of dims `head` and
+/// type `head_ty` (which the head's row kernel reads as Q6_K): the load's
+/// buffers in its allocation order (the stages' weights, `fc`, the head's
+/// norm, the target's `output` copied to the card, the Markov tables, then
+/// the rings: [`tensors`] in order, less `mask_embd`, whose rows sit in the
+/// block's input buffer) through the plan's allocator model, and the scratch:
+/// the working buffers ([`working_bytes`]) beside [`SCRATCH_ALLOWANCE`]. A ring
+/// does not grow with the serving context: it holds the window and
+/// [`PASS_ROWS`] rows of `kv_lora + rope` f16 values. A type the load has no
+/// card buffers for is refused by name.
+pub fn card_bytes_of(
+    hp: &Hparams,
+    head: &[u64],
+    head_ty: GgmlType,
+    granule: NonZeroU64,
+) -> Result<DraftCardBytes, PlacementError> {
+    let rows_of = |dims: &[u64]| dims.iter().skip(1).product::<u64>();
+    let mut weights: Vec<u64> = Vec::new();
+    for t in tensors(hp) {
+        if t.name == names::mask_embd() {
+            continue;
+        }
+        let (format, ty, rows) = match t.ty {
+            Ty::F32 => (CardFormat::F32, GgmlType::F32, 1),
+            Ty::Q8_0 => (CardFormat::Q8_0Planes, GgmlType::Q8_0, rows_of(&t.dims)),
+        };
+        weights.extend(format_buffers(&t.name, Some(format), ty, &t.dims, rows)?);
+        if t.name == names::output_norm() {
+            let name = output();
+            if head_ty != GgmlType::Q6_K {
+                return Err(PlacementError::Tensor {
+                    name,
+                    detail: format!("is {head_ty}; the draft head's row kernel reads Q6_K"),
+                });
+            }
+            weights.extend(format_buffers(
+                &name,
+                Some(CardFormat::KQuant),
+                head_ty,
+                head,
+                rows_of(head),
+            )?);
+        }
+    }
+    let ring = (hp.window + PASS_ROWS) as u64 * (hp.kv_lora + hp.rope_dims) as u64 * 2;
+    let rings = vec![ring; hp.n_layer];
+    let (w, kv): (u64, u64) = (weights.iter().sum(), rings.iter().sum());
+    let taken = allocator_bytes(granule, weights.into_iter().chain(rings));
+    Ok(DraftCardBytes {
+        weights: w,
+        kv,
+        rounding: taken - w - kv,
+        scratch: SCRATCH_ALLOWANCE + working_bytes(hp),
+    })
+}
+
+/// The working buffers the load allocates beside the weights and rings, from `hp`, each of
+/// 4-byte elements: the common owner's (`x` of the window's rows, `fc_out`, the tapped rows'
+/// inbox of the window's rows of `taps · n_embd` values and the block's one-word inbox), the
+/// stages' scratch and images of [`PASS_ROWS`] rows, and the head's logits, Markov correction
+/// and normed rows. The head's quantized rows and words are left to [`SCRATCH_ALLOWANCE`]: the
+/// load holds its working buffers to the sum of both ([`DraftCardBytes::check_held`]). The
+/// window's rows are the inbox's, not the ring's: it holds `window` rows of every tapped layer,
+/// which is the draft's largest working buffer.
+#[must_use]
+pub fn working_bytes(hp: &Hparams) -> u64 {
+    let u = |v: usize| v as u64;
+    let (rows, e, heads) = (u(PASS_ROWS), u(hp.n_embd), u(hp.n_head));
+    let (rope, lat, vocab) = (u(hp.rope_dims), u(hp.kv_lora), u(hp.n_vocab));
+    let width = rope + lat;
+    let capacity = u(hp.window).div_ceil(rows) * rows;
+    let owner = capacity.max(rows) * e + rows * e + capacity * u(hp.target_layers.len()) * e + 1;
+    let scratch = rows
+        * (3 * e
+            + 2 * heads * u(hp.head_k)
+            + heads * width
+            + 3 * width
+            + heads * lat
+            + heads * u(hp.head_v)
+            + 3 * u(hp.n_ff))
+        + 2 * rows * heads * rope;
+    let images = rows * rope + rows + 1 + rows * e + capacity * rope + capacity;
+    let head = rows * vocab + vocab + rows * e;
+    4 * (owner + scratch + images + head)
+}
+
 #[cfg(test)]
 mod tests {
-    use gguf::Split;
+    use gguf::{GgmlType, Split};
 
-    use super::{Hparams, Ty, check, names, tensors};
+    use super::{
+        Hparams, PASS_ROWS, SCRATCH_ALLOWANCE, Tensor, Ty, card_bytes_of, check, names, tensors,
+        working_bytes,
+    };
     use crate::arch::mistrallarge4::hparams::YarnKeys;
     use crate::arch::synthetic::{self, Ty as Written, V};
 
@@ -652,6 +771,77 @@ mod tests {
         assert_eq!(hp.nope(), 64);
         assert_eq!(hp.fc_in(), 30_720);
         assert_eq!(hp.joint_in(), 7168);
+    }
+
+    /// The real draft's card bytes from its statement alone: the 41 tensors less `mask_embd` (whose
+    /// rows sit in the block's input buffer), the target's Q6_K `output` (210 bytes a 256-value
+    /// block, 204,800 rows of 24 blocks) between the head's norm and the Markov tables, three
+    /// rings of `window + PASS_ROWS` f16 rows of `kv_lora + rope`, and the allocator model over
+    /// the 69 weight buffers and the 3 rings in load order (Q8_0 as its two planes), run by hand
+    /// [derived: 32,359,424 B of 2 MiB granules past the 3,263,549,440 + 7,105,536 B the buffers
+    /// hold], and the scratch: the working buffers the owner, the stages and the head make for
+    /// 8 rows (the tapped rows' inbox of 2,048 rows of 5 · 6,144 f32 the largest, 251,658,240 B;
+    /// 316,768,296 B in all [derived]; the load's own count is 317,505,440 B [measured at the
+    /// draft's load]) beside the 64 MiB allowance. No term reads the serving
+    /// context.
+    #[test]
+    fn the_real_draft_takes_its_card_bytes() {
+        let hp = real();
+        let granule = crate::placement::workstation::GRANULE;
+        let b = card_bytes_of(&hp, &[6144, 204_800], GgmlType::Q6_K, granule)
+            .unwrap_or_else(|e| panic!("the real draft: {e}"));
+        let file: u64 = tensors(&hp)
+            .iter()
+            .filter(|t| t.name != names::mask_embd())
+            .map(Tensor::bytes)
+            .sum();
+        let head = 210 * (6144 / 256) * 204_800;
+        assert_eq!(b.weights, file + head);
+        assert_eq!(b.weights, 3_263_549_440);
+        assert_eq!(b.kv, 3 * (2048 + PASS_ROWS as u64) * (512 + 64) * 2);
+        assert_eq!(b.kv, 7_105_536);
+        assert_eq!(b.rounding, 32_359_424);
+        assert_eq!(b.buffers() % granule.get(), 0);
+        assert_eq!(working_bytes(&hp), 316_768_296);
+        assert_eq!(b.scratch, SCRATCH_ALLOWANCE + 316_768_296);
+        assert_eq!(b.total(), 3_686_891_560);
+    }
+
+    /// The tiny draft: every buffer shares one granule, so the allocator takes one and the
+    /// rounding is what the buffers leave of it; the head's `output` is 96 rows of two Q6_K blocks
+    /// (420 bytes, 105 words, a row).
+    #[test]
+    fn a_small_draft_shares_one_granule() {
+        let hp = tiny();
+        let granule = crate::placement::workstation::GRANULE;
+        let b = card_bytes_of(&hp, &[512, 96], GgmlType::Q6_K, granule)
+            .unwrap_or_else(|e| panic!("the tiny draft: {e}"));
+        let file: u64 = tensors(&hp)
+            .iter()
+            .filter(|t| t.name != names::mask_embd())
+            .map(Tensor::bytes)
+            .sum();
+        assert_eq!(b.weights, file + 420 * 96);
+        assert_eq!(b.kv, 2 * (16 + PASS_ROWS as u64) * (32 + 8) * 2);
+        assert_eq!(b.buffers(), granule.get());
+        assert_eq!(b.rounding, granule.get() - b.weights - b.kv);
+    }
+
+    /// A target `output` the head's row kernel does not read, or one off the Q6_K block, is
+    /// refused naming the tensor.
+    #[test]
+    fn a_head_the_row_kernel_cannot_read_is_named() {
+        let hp = real();
+        let granule = crate::placement::workstation::GRANULE;
+        let name = crate::arch::names::output();
+        let q8 = card_bytes_of(&hp, &[6144, 204_800], GgmlType::Q8_0, granule)
+            .expect_err("a Q8_0 head")
+            .to_string();
+        assert!(q8.contains(&name) && q8.contains("Q6_K"), "{q8}");
+        let off = card_bytes_of(&hp, &[6000, 204_800], GgmlType::Q6_K, granule)
+            .expect_err("a head off the block")
+            .to_string();
+        assert!(off.contains(&name), "{off}");
     }
 
     /// The real file's shape: a block of 3 rows drafting from row 0, the

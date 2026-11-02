@@ -178,3 +178,62 @@ fn mistrallarge4_dspark_header() {
         bad.join("\n")
     );
 }
+
+/// What the draft takes on its card, from the two files' own headers ([`dspark::card_bytes`] over
+/// the checked-in tables of the draft's and the target's real headers): the 41 tensors' file bytes
+/// less `mask_embd`'s 13,056 (its rows sit in the block's input buffer) and the target's Q6_K
+/// `output` (204,800 rows of 24 blocks of 210 bytes, 1,032,192,000 bytes) make 3,263,549,440
+/// bytes of weight buffers; the rings are three stages of 2,056 rows of 576 f16, 7,105,536 bytes;
+/// the allocator model over the 69 weight buffers and 3 rings in load order takes 32,359,424 bytes
+/// of 2 MiB granules more; the scratch is the working buffers (316,768,296 bytes, the tapped
+/// rows' inbox of 2,048 rows of 30,720 f32 the largest) and the allowance of 67,108,864. All
+/// derived by hand from the header and the allocator model [derived], 3,686,891,560 bytes in all.
+/// A target whose `output` is not Q6_K is refused by name.
+#[test]
+fn mistrallarge4_dspark_card_bytes() {
+    use model::placement::workstation::GRANULE;
+
+    let split = header_tables::header_of("dspark-card", KV, TENSORS);
+    let target = header_tables::header_of("dspark-card-target", TARGET_KV, TARGET_TENSORS);
+    let b = dspark::card_bytes(&split, &target, GRANULE)
+        .unwrap_or_else(|e| panic!("the real draft's card bytes: {e}"));
+    let mut bad: Vec<String> = Vec::new();
+    let mut pin = |what: &str, got: u64, derived: u64| {
+        if got != derived {
+            bad.push(format!("{what}: {got} B, derived {derived} B"));
+        }
+    };
+    pin("weights", b.weights, 3_263_549_440);
+    pin("rings", b.kv, 7_105_536);
+    pin("rounding", b.rounding, 32_359_424);
+    pin("scratch", b.scratch, 316_768_296 + 67_108_864);
+    pin("total", b.total(), 3_686_891_560);
+    println!(
+        "mistral-large4 dspark card bytes weights={} rings={} rounding={} scratch={} total={}",
+        b.weights,
+        b.kv,
+        b.rounding,
+        b.scratch,
+        b.total()
+    );
+    let q8_target = header_tables::header_of(
+        "dspark-card-q8",
+        TARGET_KV,
+        &TARGET_TENSORS.replacen("output.weight\tQ6_K", "output.weight\tQ8_0", 1),
+    );
+    let q8 = dspark::card_bytes(&split, &q8_target, GRANULE)
+        .err()
+        .map(|e| e.to_string());
+    if !q8
+        .as_deref()
+        .is_some_and(|e| e.contains("output.weight") && e.contains("Q6_K"))
+    {
+        bad.push(format!("a Q8_0 output is refused naming it: {q8:?}"));
+    }
+    assert!(
+        bad.is_empty(),
+        "{} pin(s) differ:\n{}",
+        bad.len(),
+        bad.join("\n")
+    );
+}

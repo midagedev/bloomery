@@ -35,7 +35,7 @@ use bloomery_gpu_gates::bind::{
     CacheRam, ChatSurface, Pass, Seat, SeatEngine, SeatFlags, SlotsFrom, Vocab, arm_screen,
     eprint_noted, model_props, parallel_line, placement_of, slots_given, slots_of,
 };
-use bloomery_gpu_gates::generate::{Lane, Place, TierRule, choose_ctx, lane_at};
+use bloomery_gpu_gates::generate::{DraftSeat, Lane, Place, TierRule, choose_ctx, lane_at};
 use bloomery_gpu_gates::need;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency;
@@ -50,6 +50,7 @@ use bloomery_levers::{
 };
 use gguf::Split;
 use model::arch::Arch;
+use model::arch::dspark::DraftCardBytes;
 use model::arch::place_hybrid::{PlaceError, PlanInputs};
 use model::placement::ctx_ask::{Chosen, DEFAULT_SLOTS, probe_of};
 use model::placement::workstation::{self, HostNeed, TierBatchBytes};
@@ -309,15 +310,27 @@ pub trait Tiered: Seat + Sized + 'static {
 
     /// The machine the plan of a file of `layers` layers runs over on `place`, the run's, which
     /// the open plans on ([`Open::machine`]): the placement's ([`Place::machine`]: the token
-    /// embedding on the host, a row gathered a token, and `tier_batch` on a tier card) by default. A body that reads its
+    /// embedding on the host, a row gathered a token, `tier_batch` on a tier card and `draft`,
+    /// the DSpark draft's seat, reserved on the card it sits on) by default. A body that reads its
     /// token embedding from a table on its card plans a placed load's machine instead
-    /// ([`Place::machine_placed`]).
+    /// ([`Place::machine_placed`]), and a seat that serves no draft ([`Tiered::DRAFTS`]) is handed
+    /// none.
     fn machine(
         place: Place,
         tier_batch: Option<TierBatchBytes>,
+        draft: Option<DraftSeat>,
         layers: usize,
     ) -> Result<Machine, GateError> {
-        Ok(place.machine(None, tier_batch)?(layers))
+        Ok(place.machine(draft, tier_batch)?(layers))
+    }
+
+    /// The DSpark draft's card bytes beside the target `split`, from the two files' headers
+    /// (`$BLOOMERY_DSPARK_MODEL` names the draft's): what the plan of every placement reserves on
+    /// the draft's card before it fits the context, so the draft loads into room the plan left
+    /// ([`Tiered::machine`]). A seat that serves the DSpark draft ([`Tiered::DRAFTS`]) overrides
+    /// it; the default refuses by name.
+    fn dspark_bytes(_split: &Split) -> Result<DraftCardBytes, GateError> {
+        Err(format!("the {} seat serves no DSpark draft", Self::FAMILY).into())
     }
 
     /// The family's input to the common unset rule ([`Place::choose`]): the tier cards its body
@@ -502,11 +515,29 @@ fn tier_experts<S: Tiered>(
     inputs: &PlanInputs<S::H>,
     levers: &PlanLevers,
     ctx: Option<usize>,
+    spark: Option<&DraftCardBytes>,
 ) -> Result<u64, GateError> {
-    let machine = S::machine(offer, S::tier_batch(offer, inputs)?, inputs.model.layers)?;
+    let draft = draft_seat(offer, spark)?;
+    let machine = S::machine(
+        offer,
+        S::tier_batch(offer, inputs)?,
+        draft,
+        inputs.model.layers,
+    )?;
     let ctx = ctx.map_or(Ok(1), u64::try_from)?;
     let plan = inputs.plan(&machine, ctx, levers)?;
     Ok(plan.tier_n_l.iter().flatten().sum())
+}
+
+/// The seat of the DSpark draft of card bytes `spark` on `place`'s plan, on the card the
+/// placement rule names ([`crate::dspark::draft_card`]); `None` where no DSpark draft is served.
+fn draft_seat(
+    place: Place,
+    spark: Option<&DraftCardBytes>,
+) -> Result<Option<DraftSeat>, GateError> {
+    spark
+        .map(|bytes| Ok(crate::dspark::draft_card(place)?.seat(bytes.total())))
+        .transpose()
 }
 
 /// `place` beside `slots` resident slots, refused by name when it names a tier card and the body
@@ -721,6 +752,16 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
             Ok(slots_of(a.parallel, a.ctx.is_some(), DEFAULT_SLOTS)?)
         }
     })?;
+    // The DSpark draft's bytes, read from its file's header beside the target's, before the
+    // placement is chosen: every plan below reserves them on the card the draft sits on, so the
+    // context the plan fits leaves the draft its room.
+    let spark = match draft {
+        Some(Drafting {
+            word: Draft::Dspark,
+            ..
+        }) => Some(S::dspark_bytes(&split)?),
+        _ => None,
+    };
     // The common unset rule, once, on one census reading.
     let census = gpu_census::census()?;
     let chosen = if S::TIER_RULE.tiers == 0 {
@@ -728,7 +769,7 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
     } else {
         Place::choose(a.place, &census, S::TIER_RULE, |offer| {
             refuse_tier_slots::<S>(offer, slots)?;
-            tier_experts::<S>(offer, &inputs, &plan_levers, a.ctx)
+            tier_experts::<S>(offer, &inputs, &plan_levers, a.ctx, spark.as_ref())
         })?
     };
     refuse_tier_slots::<S>(chosen.place, slots)?;
@@ -754,7 +795,12 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
         Some(lane_at(place)?)
     };
     let tier_batch = S::tier_batch(place, &inputs)?;
-    let mut machine = S::machine(place, tier_batch, inputs.model.layers)?;
+    let mut machine = S::machine(
+        place,
+        tier_batch,
+        draft_seat(place, spark.as_ref())?,
+        inputs.model.layers,
+    )?;
     beside::reserve_on(
         &mut machine,
         Beside {

@@ -5,10 +5,12 @@
 //! tags, keeps each resident sequence's rows apart, saves and restores a slot's state, parses a
 //! tool call by the file's template and answers an image request.
 //!
-//!     gate_mistrallarge4_serve --dir <dir> [--mmproj <file>]
+//!     gate_mistrallarge4_serve --dir <dir> [--mmproj <file>] [--draft <file>]
 //!
 //! `--mmproj` is the Pixtral projector of the file's repo; without it the image clauses are
-//! skipped by name. Every server is `bloomery-serve --model mistrallarge4 -m <file> …` beside this
+//! skipped by name. `--draft` is the DSpark draft of the file's repo
+//! (`dspark-Mistral-Large-4-1T-A52B-Q8_0.gguf`); without it the draft clauses are skipped by
+//! name. Every server is `bloomery-serve --model mistrallarge4 -m <file> …` beside this
 //! binary, `BLOOMERY_REF_MODEL` removed from its environment. Logs per server in `<dir>/<name>/`
 //! (`server.err`, the answers).
 //!
@@ -59,6 +61,15 @@
 //!   flag, each with no `plan` record. FAIL-first: a seat that takes no image flag is read as an
 //!   unknown argument, which does not name the file, and the clause is red.
 //!
+//! - `dspark_plan_holds_the_draft` (with `--draft`; `Tag::FileBound`: the draft is the real file's,
+//!   its Markov tables and head the real vocabulary wide, so the fixture tier defers it): the plan
+//!   under `BLOOMERY_DRAFT=dspark` (`BLOOMERY_DSPARK_MODEL` the draft) at no `--ctx` fits a smaller
+//!   context than the plain plan, the draft's card bytes ([`draft_file::card_bytes`]) set aside
+//!   before the fit; the context the plain plan chose, asked of the drafted plan, is refused by
+//!   name with the largest context that fits (the drafted default's), and that context plans and
+//!   exits 0. FAIL-first: a seat whose plan leaves the draft's bytes out fits the one context
+//!   either way, exits 0 on the plain plan's context, and the clause is red.
+//!
 //! One server as a user starts it, `--port 0` and `--ctx` [`CTX`] (shared, `shared/serve_gate.rs`):
 //! `load_and_listen`, `chat_answers_a_turn`, `chat_splits_the_reasoning_at_the_models_tags` and
 //! `chat_ends_at_the_turn_end` (the last two are `Tag::FileBound`), `live_slot_keeps_the_prefix` and
@@ -95,6 +106,16 @@
 //!   stays under the slack, the fixture tier's budget, holds the load there either way); a body
 //!   buffer that grows with the context and is not in the formula moves the part, and the clause
 //!   is red on any card.
+//!
+//! - `default_ctx_serves_the_dspark_draft` (with `--draft`; `Tag::FileBound`): one more server as a
+//!   user starts it with `BLOOMERY_DRAFT=dspark`, `--port 0` and no `--ctx`: it listens at the
+//!   context the drafted plan fitted (its `ctx` line, `load` and `listening` records, the plan
+//!   clause's), which is under the plain default's, its `load draft=dspark` record's `reserve` is
+//!   the formula's bytes and its `resident` is within them, and a greedy `/completion` of
+//!   [`DRAFT_TOKENS`] tokens answers them with the draft's window in the loop
+//!   (`timings.draft_n` above 0). FAIL-first: a plan that leaves the draft's bytes out fits the
+//!   plain context and the draft's load runs the card out of memory (`DriverError(2, "out of
+//!   memory")`): the server never listens and the clause is red.
 //!
 //! One server of two slots (`--parallel 2`, `--ctx` 2·[`CTX`], `--slot-save-path <dir>/save`),
 //! with `BLOOMERY_RESIDENCY=off`: the residency machine moves experts between the tiers by the
@@ -179,6 +200,8 @@ mod gate {
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, gpu_census, ref_model_path};
     use gguf::Split;
+    use model::arch::dspark::DraftCardBytes;
+    use model::arch::mistrallarge4::dspark as draft_file;
     use model::arch::mistrallarge4::place::{self, PlanInputs};
     use model::placement::workstation;
     use serde_json::{Value, json};
@@ -219,6 +242,12 @@ mod gate {
     /// The tokens the slot clauses' requests answer.
     const N: usize = 8;
 
+    /// The tokens the DSpark server's completion answers.
+    const DRAFT_TOKENS: usize = 16;
+
+    /// The lever the DSpark clauses set beside `BLOOMERY_DRAFT`: the draft's file.
+    const DSPARK_MODEL: &str = "BLOOMERY_DSPARK_MODEL";
+
     /// The prompts of the slot clauses, three conversations that share no first id.
     const P_TEXT: &str = "The capital of France is Paris, and the capital of Italy is";
     const Q_TEXT: &str = "Zebras run across the open plain while the lions watch from the";
@@ -241,11 +270,13 @@ mod gate {
     struct Args {
         dir: PathBuf,
         mmproj: Option<PathBuf>,
+        draft: Option<PathBuf>,
     }
 
     fn args() -> Result<Args, GateError> {
-        const USAGE: &str = "usage: gate_mistrallarge4_serve --dir <dir> [--mmproj <file>]";
-        let (mut dir, mut mmproj) = (None, None);
+        const USAGE: &str =
+            "usage: gate_mistrallarge4_serve --dir <dir> [--mmproj <file>] [--draft <file>]";
+        let (mut dir, mut mmproj, mut draft) = (None, None, None);
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
             let v = it
@@ -254,12 +285,14 @@ mod gate {
             match flag.as_str() {
                 "--dir" => dir = Some(PathBuf::from(v)),
                 "--mmproj" => mmproj = Some(PathBuf::from(v)),
+                "--draft" => draft = Some(PathBuf::from(v)),
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             }
         }
         Ok(Args {
             dir: dir.ok_or(USAGE)?,
             mmproj,
+            draft,
         })
     }
 
@@ -668,6 +701,195 @@ mod gate {
             && rest == first_rest
             && rest.is_some_and(|r| r <= workstation::SCRATCH);
         check(&mut ok, "default_ctx_loads", held);
+        Ok(ok)
+    }
+
+    /// The levers of a server that serves the DSpark draft `draft`.
+    fn dspark_levers(draft: &str) -> [(&str, Option<&str>); 2] {
+        [
+            (bloomery_levers::DRAFT, Some("dspark")),
+            (DSPARK_MODEL, Some(draft)),
+        ]
+    }
+
+    /// The plan's `ctx` line's context in `text`.
+    fn planned_ctx(text: &str) -> Option<u64> {
+        ctx_line(text).and_then(|l| field(l, "ctx"))
+    }
+
+    /// The draft's card bytes beside the gate's target ([`draft_file::card_bytes`]).
+    fn draft_bytes(draft: &Path) -> Result<DraftCardBytes, GateError> {
+        let file = ref_model_path()?;
+        let target = Split::open(&file).map_err(|e| format!("open {}: {e}", file.display()))?;
+        let spark = Split::open(draft).map_err(|e| format!("open {}: {e}", draft.display()))?;
+        Ok(draft_file::card_bytes(
+            &spark,
+            &target,
+            workstation::GRANULE,
+        )?)
+    }
+
+    /// `dspark_plan_holds_the_draft` (the module header). Returns the clause and the context the
+    /// drafted plan chose, which the server clause holds its load to.
+    fn dspark_plan_holds_the_draft(
+        c: &serve_gate::Clauses,
+        dir: &Path,
+        draft: &Path,
+    ) -> Result<(bool, Option<u64>), GateError> {
+        let mut ok = true;
+        let file = ref_model_path()?;
+        let draft_str = draft.to_str().ok_or("the --draft path is not UTF-8")?;
+        let plain_levers = [(bloomery_levers::DRAFT, None), (DSPARK_MODEL, None)];
+        let (plain_status, _, plain) =
+            seat(c).plan_under((dir, "plan-dspark-plain"), &file, &[], &plain_levers)?;
+        let (status, log, drafted) = seat(c).plan_under(
+            (dir, "plan-dspark-default"),
+            &file,
+            &[],
+            &dspark_levers(draft_str),
+        )?;
+        let (plain_ctx, drafted_ctx) = (planned_ctx(&plain), planned_ctx(&drafted));
+        let bytes = draft_bytes(draft)?;
+        let shrinks = plain_status.success()
+            && status.success()
+            && log.first(&record::PLAN)?.is_some()
+            && matches!((plain_ctx, drafted_ctx), (Some(a), Some(b)) if b < a);
+        // The plain plan's context asked of the drafted plan is refused with the largest context
+        // that fits, the drafted default's; that context plans.
+        let mut refused = false;
+        let mut fits = false;
+        if let (Some(a), Some(b)) = (plain_ctx, drafted_ctx) {
+            let (status, log, text) = seat(c).plan_under(
+                (dir, "plan-dspark-plain-ctx"),
+                &file,
+                &["--ctx", &a.to_string()],
+                &dspark_levers(draft_str),
+            )?;
+            refused = !status.success()
+                && log.first(&record::PLAN)?.is_none()
+                && text.contains(&format!("a slot holds at most {b} here"));
+            let (status, log, _) = seat(c).plan_under(
+                (dir, "plan-dspark-fitted-ctx"),
+                &file,
+                &["--ctx", &b.to_string()],
+                &dspark_levers(draft_str),
+            )?;
+            fits = status.success() && log.first(&record::PLAN)?.is_some();
+        }
+        println!(
+            "dspark plan: the draft's card bytes {} B (weights {}, rings {}, rounding {}, scratch \
+             {}); the plain plan's context {plain_ctx:?}, the drafted plan's {drafted_ctx:?} \
+             (smaller, exit 0, plan record {shrinks}); the plain context asked of the drafted \
+             plan is refused naming the largest that fits {refused}; the largest plans {fits}",
+            bytes.total(),
+            bytes.weights,
+            bytes.kv,
+            bytes.rounding,
+            bytes.scratch
+        );
+        check(
+            &mut ok,
+            "dspark_plan_holds_the_draft",
+            shrinks && refused && fits,
+        );
+        Ok((ok, drafted_ctx))
+    }
+
+    /// `default_ctx_serves_the_dspark_draft` (the module header), over the context `planned` the
+    /// drafted plan chose.
+    fn default_ctx_serves_the_dspark_draft(
+        c: &serve_gate::Clauses,
+        dir: &Path,
+        draft: &Path,
+        planned: Option<u64>,
+    ) -> Result<bool, GateError> {
+        let mut ok = true;
+        let d = dir.join("default-ctx-dspark");
+        std::fs::create_dir_all(&d)?;
+        let file = ref_model_path()?;
+        let (mut cmd, mut all) = seat(c).command(&file)?;
+        cmd.env(bloomery_levers::DRAFT, "dspark");
+        cmd.env(DSPARK_MODEL, draft);
+        all.extend(["--port", "0"].iter().map(|a| (*a).to_owned()));
+        let all: Vec<&str> = all.iter().map(String::as_str).collect();
+        let mut s = Served::spawn_cmd(cmd, &all, &d)?;
+        let err_log = d.join("server.err");
+        let addr = match s.address(&err_log, LISTEN_POLLS, Duration::from_secs(1)) {
+            Ok(addr) => addr,
+            Err(e) => {
+                println!("default-ctx-dspark: the server never listened: {e}");
+                check(&mut ok, "default_ctx_serves_the_dspark_draft", false);
+                return Ok(ok);
+            }
+        };
+        let text = std::fs::read_to_string(&err_log)
+            .map_err(|e| format!("read {}: {e}", err_log.display()))?;
+        let records = server_log(&err_log, c.kinds)?;
+        let load = records.one(c.load)?;
+        let listen = records.one(c.listening)?;
+        let spark = records.one(&record::LOAD_DRAFT)?;
+        let bytes = draft_bytes(draft)?;
+        let named = planned_ctx(&text);
+        let plain = std::fs::read_to_string(dir.join("default-ctx").join("server.err"))
+            .ok()
+            .and_then(|t| planned_ctx(&t));
+        let url = |p: &str| format!("http://{addr}{p}");
+        let ids = tokenized(&url, P_TEXT)?;
+        let (answer, v) = greedy(&url, ids, DRAFT_TOKENS, &d, "dspark_completion", false)?;
+        let drafted = v["timings"]["draft_n"].as_u64().unwrap_or(0);
+        let stopped = s.stop()?;
+        let (reserve, resident) = (spark.u64("reserve")?, spark.u64("resident")?);
+        println!(
+            "default-ctx-dspark: ctx line {named:?} (the drafted plan's {planned:?}, the plain \
+             default's {plain:?}); load record ctx {}, listening record ctx {}; draft record: \
+             reserve {reserve} B (the formula's {} B), resident {resident} B, working {} B; a \
+             completion of {} tokens, stop {}, {drafted} drafted; {stopped}",
+            load.u64("ctx")?,
+            listen.u64("ctx")?,
+            bytes.total(),
+            spark.u64("working")?,
+            answer.tokens.len(),
+            answer.stop
+        );
+        let held = named.is_some()
+            && named == planned
+            && named == Some(load.u64("ctx")?)
+            && named == Some(listen.u64("ctx")?)
+            && plain.is_some_and(|p| named.is_some_and(|n| n < p))
+            && reserve == bytes.total()
+            && resident <= reserve
+            && answer.tokens.len() == DRAFT_TOKENS
+            && drafted > 0;
+        check(&mut ok, "default_ctx_serves_the_dspark_draft", held);
+        Ok(ok)
+    }
+
+    /// The DSpark draft's clauses ([`dspark_plan_holds_the_draft`] and
+    /// [`default_ctx_serves_the_dspark_draft`]), run where the tier and `--draft` allow, each
+    /// deferred or skipped by name.
+    fn dspark_clauses(
+        c: &serve_gate::Clauses,
+        dir: &Path,
+        draft: Option<&Path>,
+    ) -> Result<bool, GateError> {
+        let mut ok = true;
+        let plan = tier::run_clause("dspark_plan_holds_the_draft", Tag::FileBound)?;
+        let serve = tier::run_clause("default_ctx_serves_the_dspark_draft", Tag::FileBound)?;
+        let Some(draft) = draft else {
+            if plan || serve {
+                println!("the dspark clauses: skipped, no --draft");
+            }
+            return Ok(ok);
+        };
+        let mut planned = None;
+        if plan {
+            let (held, ctx) = dspark_plan_holds_the_draft(c, dir, draft)?;
+            ok &= held;
+            planned = ctx;
+        }
+        if serve {
+            ok &= default_ctx_serves_the_dspark_draft(c, dir, draft, planned)?;
+        }
         Ok(ok)
     }
 
@@ -1102,13 +1324,14 @@ mod gate {
              file before the plan, loads at the context it was asked for and, with none asked, \
              at the context the plan fitted, and at the prompt group the lever names, answers a chat turn with its reasoning split at the file's tags, \
              keeps each slot's rows apart, restores a slot file bit for bit, parses a tool call \
-             by the file's template and serves an image request"
+             by the file's template, serves an image request and, with --draft, plans the DSpark \
+             draft's bytes before the context's fit and serves a completion beside it"
         );
         Ok(())
     }
 
     pub fn run() -> Result<(), GateError> {
-        let Args { dir, mmproj } = args()?;
+        let Args { dir, mmproj, draft } = args()?;
         let c = clauses()?;
         std::fs::create_dir_all(&dir)?;
         let two = gpu_census::census()?.len() >= 2;
@@ -1122,6 +1345,7 @@ mod gate {
         ok &= xstream_line_follows_the_rule(&c, &dir)?;
         ok &= load_holds_the_plan(&c, &dir)?;
         ok &= default_ctx_loads(&c, &dir)?;
+        ok &= dspark_clauses(&c, &dir, draft.as_deref())?;
         ok &= two_slot_clauses(&c, &dir, mmproj.as_deref())?;
         finish(ok)
     }

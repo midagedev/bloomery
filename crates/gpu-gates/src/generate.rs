@@ -3346,6 +3346,38 @@ impl DraftCard {
     }
 }
 
+impl DraftSeat {
+    /// Refuse a `machine` whose plan did not set this seat's bytes aside on the seat's card: the
+    /// draft's load is held to the room its plan left it, so a load whose plan never counted the
+    /// draft is refused by name, before any allocation, not by the driver.
+    pub fn check_planned(&self, machine: &Machine) -> Result<(), GateError> {
+        let Device::Card(at) = self.reserve.on else {
+            return Err(format!(
+                "the DSpark draft's seat is on {:?}, which is no card of the plan",
+                self.reserve.on
+            )
+            .into());
+        };
+        let reserved = machine.all_cards().nth(at).and_then(|card| {
+            card.reserves
+                .iter()
+                .find(|(name, _)| name == self.reserve.name)
+                .map(|&(_, bytes)| bytes)
+        });
+        if reserved == Some(self.reserve.bytes) {
+            return Ok(());
+        }
+        Err(format!(
+            "the DSpark draft needs {} B on card {at} of the plan and the plan set aside {}: the \
+             plan was made without the draft's bytes, and the card would run out of memory at its \
+             load",
+            self.reserve.bytes,
+            reserved.map_or("none".to_owned(), |b| format!("{b} B"))
+        )
+        .into())
+    }
+}
+
 /// The DSpark draft's card, by device.
 impl Place {
     /// The card a DSpark draft loads on under this placement, on `census`, by
