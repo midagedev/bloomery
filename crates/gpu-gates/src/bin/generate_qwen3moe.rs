@@ -4245,6 +4245,11 @@ mod cli {
                     bloomery_levers::FORCE_IDS,
                     format!("{}:0", forced.display()),
                 );
+                // The run names no `--place`, so the placed levers the fixture tier
+                // exports (its card budget) would be refused by name.
+                for name in crate::q3place::PLACED_LEVERS {
+                    cmd.env_remove(name);
+                }
                 if rows {
                     cmd.arg("--logit-rows").arg(&dump);
                 }
