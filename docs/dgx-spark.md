@@ -51,19 +51,19 @@ Start with FP4-Local.
 | `nvidia/Qwen3.8-Flash-Next-FP4-Local` | 102.3 GB (revision `b9ce18a6`) | NVFP4 experts with compressed block scales, MXFP8 and FP8 dense weights |
 | `nvidia/Qwen3.8-Flash-Next-NVFP4` | 132.7 GB | NVFP4 experts |
 
-FP4-Local takes less of the Spark's memory at the same settings (section 4) and decoded faster when the two were
-measured side by side ([`numbers.md`](numbers.md#dgx-spark-qwen38-flash-next-on-the-fp4-local-and-nvfp4-folders-0310)).
+FP4-Local takes less of the Spark's memory at the same settings (section 4) and was faster in every cell of the speed
+table (section 6).
 On the GB10's `sm_121a` build, both folders' routed expert prompt products run on the FP4 tensor cores (weights and
 activations in FP4), and the MXFP8 sites on the FP8 tensor cores.
 
-Both folders keep the KV cache as q8_0, and FP4-Local needs a writable scale store; both are in
-[`serving.md`](serving.md#92-qwen38-checkpoint-folders).
+FP4-Local needs a writable scale store ([`serving.md`](serving.md#92-qwen38-checkpoint-folders)). The KV cache is
+f16 for both folders unless `--cache-type-k q8_0` asks ([`serving.md`](serving.md#6-memory-beside-the-weights)).
 
 ## 4. Requests at once, context and memory
 
-With no context flag a slot asks the trained 262,144 positions and takes less where the Spark's memory cannot hold
-that plan; `--parallel auto` counts the slots from memory. The rules are
-[`serving.md`](serving.md#3-slots-and-context).
+With no context flag each slot asks the trained 262,144 positions, and `--parallel auto` counts the slots from
+memory; the rules are in [`serving.md`](serving.md#3-slots-and-context). On a 128 GB Spark every row of the tables
+below kept the context it asked for.
 
 The GB10 and the CPU share one memory pool, so the plan reads its room from the host's `MemAvailable`, not from the
 GPU driver's free-memory figure. A Spark with more running beside the server fits less. Read your own numbers with
@@ -73,21 +73,41 @@ the same flags and `--plan`, which prints the plan and exits before it loads any
 bloomery-serve -m /path/to/Qwen3.8-Flash-Next-FP4-Local --parallel auto --slot-ctx 65536 --plan
 ```
 
-The table is `--plan` on one Spark at `TBD-SITTING` (commit), with `TBD-SITTING` of `MemAvailable` before each plan.
-Need is the `need` record's bytes: what the load takes of the pool (the GB10's share, the slots' checkpoints in
-pinned host memory and file pages). The prompt cache's budget (`--cache-ram`; by default 8 GiB, or half of what the
-plan leaves where that is less) comes on top.
+The tables are `--plan` on one 128 GB Spark at main `e7180ea9` (GB10, driver 595.84), with 115.3 to 116.5 GiB of
+`MemAvailable` before each plan. With every routed expert on the GB10, one slot of the full 262,144 positions needs
+104.0 GB on FP4-Local and 107.5 GB on NVFP4. Where more slots do not fit beside every expert, the plan keeps the
+context and moves routed experts to the host tier instead: the `plan` line's `host_experts` counts them, out of the
+model's 24,576. Need is the `need` record's bytes, what the load takes of the pool (the GB10's share, the slots'
+checkpoints in pinned host memory and file pages). The prompt cache is the `need` record's `cache_ram`, its budget on
+top of that (by default 8 GiB, or half of what the plan leaves where that is less); a row with 0 runs no prompt cache.
 
-| Settings beside `-m <folder>` | FP4-Local: slots × context | FP4-Local: need | NVFP4: slots × context | NVFP4: need |
-|---|---|---:|---|---:|
-| none | TBD-SITTING | TBD-SITTING | TBD-SITTING | TBD-SITTING |
-| `--parallel 2` | TBD-SITTING | TBD-SITTING | TBD-SITTING | TBD-SITTING |
-| `--parallel 4` | TBD-SITTING | TBD-SITTING | TBD-SITTING | TBD-SITTING |
-| `--parallel auto --slot-ctx 131072` | TBD-SITTING | TBD-SITTING | TBD-SITTING | TBD-SITTING |
-| `--parallel auto --slot-ctx 65536` | TBD-SITTING | TBD-SITTING | TBD-SITTING | TBD-SITTING |
-| `--parallel auto --slot-ctx 32768` | TBD-SITTING | TBD-SITTING | TBD-SITTING | TBD-SITTING |
-| `BLOOMERY_DRAFT=off` | TBD-SITTING | TBD-SITTING | TBD-SITTING | TBD-SITTING |
-| `BLOOMERY_DRAFT=off --parallel 4` | TBD-SITTING | TBD-SITTING | TBD-SITTING | TBD-SITTING |
+FP4-Local:
+
+| Settings beside `-m <folder>` | Slots | Context a slot | Routed experts on the host | Need GB | Prompt cache GiB |
+|---|---:|---:|---:|---:|---:|
+| none | 1 | 262,144 | 0 | 104.0 | 8.0 |
+| `--parallel 2` | 2 | 262,144 | 0 | 115.5 | 3.9 |
+| `--parallel 4` | 4 | 262,144 | 5,878 | 123.5 | 0.0 |
+| `--parallel auto --slot-ctx 131072` | 8 | 131,072 | 12,576 | 123.6 | 0.0 |
+| `--parallel auto --slot-ctx 65536` | 8 | 65,536 | 1,934 | 123.6 | 0.0 |
+| `--parallel auto --slot-ctx 32768` | 8 | 32,768 | 0 | 111.6 | 5.8 |
+| `BLOOMERY_DRAFT=off` | 1 | 262,144 | 0 | 101.8 | 8.0 |
+| `BLOOMERY_DRAFT=off --parallel 4` | 4 | 262,144 | 4,435 | 123.6 | 0.0 |
+
+NVFP4:
+
+| Settings beside `-m <folder>` | Slots | Context a slot | Routed experts on the host | Need GB | Prompt cache GiB |
+|---|---:|---:|---:|---:|---:|
+| none | 1 | 262,144 | 0 | 107.5 | 7.7 |
+| `--parallel 2` | 2 | 262,144 | 0 | 119.0 | 2.4 |
+| `--parallel 4` | 4 | 262,144 | 7,140 | 123.7 | 0.0 |
+| `--parallel auto --slot-ctx 131072` | 8 | 131,072 | 13,774 | 123.7 | 0.0 |
+| `--parallel auto --slot-ctx 65536` | 8 | 65,536 | 3,209 | 123.7 | 0.0 |
+| `--parallel auto --slot-ctx 32768` | 8 | 32,768 | 0 | 115.1 | 4.3 |
+| `BLOOMERY_DRAFT=off` | 1 | 262,144 | 0 | 104.1 | 8.0 |
+| `BLOOMERY_DRAFT=off --parallel 4` | 4 | 262,144 | 5,182 | 123.7 | 0.0 |
+
+The MTP draft stayed on in every row that did not set `BLOOMERY_DRAFT=off`, and no row printed a `draft yield` record.
 
 A context the plan cut to fit prints `rule=fitted` with what it was short of; a context set by `--slot-ctx` or
 `--ctx-size` prints `rule=set`. To fit a context or a slot count the default does not, a smaller `-ub` frees GPU
@@ -104,36 +124,29 @@ rule in [`serving.md`](serving.md#4-speculative-decoding). `BLOOMERY_DRAFT=mtp` 
 
 ## 6. Speed
 
-Measured at `TBD-SITTING` (commit) on a DGX Spark (GB10, driver `TBD-SITTING`, `sm_121a`), on the FP4-Local folder
-at the serving defaults beside the flags named. The client sends each request to `/v1/completions` with a 4,096-id
-prompt from a code corpus (`code-fn`) or an English prose corpus (`prose-en`), `max_tokens` 128, `temperature` 0 and
-`cache_prompt` false; no two requests share a prompt. Decode is 1000 / TPOT, prefill the prompt tokens over TTFT, and total the tokens generated after each request's
-first token over the time from the first first token to the last token. Each
-value is the median of three rounds after one warm-up round; a round sends eight requests of each corpus one at a
-time, then the two-request phase. tok/s unless named.
+The [README's Spark table](../README.md#status-0311) holds the values and the request conditions for both checkpoint
+folders at main `e7180ea9` on a DGX Spark (GB10, driver 595.84, `sm_121a`). On a 4,096-id prompt with the MTP draft on,
+FP4-Local prefilled 2,840 to 2,894 tok/s and decoded 39 to 70 tok/s, and NVFP4 was slower in every cell.
 
-| One request | Decode, off | Decode, MTP | TTFT ms, off | TTFT ms, MTP | Prefill, off | Prefill, MTP |
-|---|---:|---:|---:|---:|---:|---:|
-| `code-fn` | TBD-SITTING | TBD-SITTING | TBD-SITTING | TBD-SITTING | TBD-SITTING | TBD-SITTING |
-| `prose-en` | TBD-SITTING | TBD-SITTING | TBD-SITTING | TBD-SITTING | TBD-SITTING | TBD-SITTING |
-
-| Two requests at once | Total, off | Total, MTP | Decode a request, off | Decode a request, MTP | TTFT ms, off | TTFT ms, MTP |
-|---|---:|---:|---:|---:|---:|---:|
-| `code-fn` | TBD-SITTING | TBD-SITTING | TBD-SITTING | TBD-SITTING | TBD-SITTING | TBD-SITTING |
-| `prose-en` | TBD-SITTING | TBD-SITTING | TBD-SITTING | TBD-SITTING | TBD-SITTING | TBD-SITTING |
-
-The servers:
+Decode depends on how many draft tokens the model keeps, so it differs by prompt more than prefill does. These are the
+servers the README table came from, one per folder:
 
 ```sh
-TBD-SITTING
+BLOOMERY_DRAFT=mtp BLOOMERY_HOST_ROOM=96G BLOOMERY_MTP_WIDTH=cost \
+  bloomery-serve -m /path/to/Qwen3.8-Flash-Next-FP4-Local --host 127.0.0.1 --port 18731 --parallel 1 --ctx-size 16896
+BLOOMERY_DRAFT=mtp BLOOMERY_HOST_ROOM=96G BLOOMERY_MTP_WIDTH=cost \
+  bloomery-serve -m /path/to/Qwen3.8-Flash-Next-NVFP4 --host 127.0.0.1 --port 18731 --parallel 1 --ctx-size 16896
 ```
 
-Earlier Spark measurements, with their releases, are in [`numbers.md`](numbers.md).
+`BLOOMERY_DRAFT=mtp` keeps the draft on (section 5), and `cost` is what an unset `BLOOMERY_MTP_WIDTH` means. The
+context and `BLOOMERY_HOST_ROOM` were the same in every round. Earlier Spark measurements, with their releases,
+are in [`numbers.md`](numbers.md).
 
 ## 7. Other models on a Spark
 
 Any model that fits the pool whole runs on the GB10 with no host tier. In the order to try them (sizes from
-[`models.md`](models.md)): Clef-Flash 4.8 to 9.7 GB, Qwen3-30B-A3B `Q4_K_M` 18.6 GB, Qwen3.6-35B-A3B `Q4_K_M`
+[`models.md`](models.md#what-each-model-needs), the GLM file's from
+[`contrib/dgx-spark.md`](contrib/dgx-spark.md#22-first-placement-and-the-models-to-try) section 2.2): Clef-Flash 4.8 to 9.7 GB, Qwen3-30B-A3B `Q4_K_M` 18.6 GB, Qwen3.6-35B-A3B `Q4_K_M`
 21.2 GB, then the Qwen3.8 folders above, Qwen3.8 `UD-Q4_K_XL` 111.3 GB and GLM-5.3-Flash `UD-Q2_K_XL` 101.3 GiB. A
 64 GB Spark holds only the first three.
 
