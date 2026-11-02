@@ -103,7 +103,7 @@ pub(super) static MODELS: &[Model] = &[
                 format: Format::Nvfp4,
                 bytes: Some(132_700_000_000),
                 status: Status::Verified {
-                    evidence: "README Use table; gate-gpu-qwen4exp-nvfp4 runs this folder; revision from crates/hf/tests/fixtures/quant-configs/README.md, size from docs/contrib/dgx-spark.md (rounded to 0.1 GB)",
+                    evidence: "README Use table; gate-gpu-qwen4exp-nvfp4 runs this folder; revision from crates/hf/tests/fixtures/quant-configs/README.md, size from docs/dgx-spark.md (rounded to 0.1 GB)",
                 },
             },
             Row {
@@ -114,7 +114,7 @@ pub(super) static MODELS: &[Model] = &[
                 format: Format::Fp4Local,
                 bytes: Some(102_300_000_000),
                 status: Status::Verified {
-                    evidence: "README Use table; revision from crates/hf/tests/fixtures/quant-configs/README.md, size from docs/contrib/dgx-spark.md (rounded to 0.1 GB)",
+                    evidence: "README Use table; revision from crates/hf/tests/fixtures/quant-configs/README.md, size from docs/dgx-spark.md (rounded to 0.1 GB)",
                 },
             },
             Row {
