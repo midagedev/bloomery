@@ -21,7 +21,7 @@ use model::arch::deepseek41::hparams::Hparams;
 use model::arch::deepseek41::place::PlanInputs;
 use model::arch::deepseek41::plan::KERNEL_POSITIONS;
 use model::placement::PlanLevers;
-use model::placement::ctx_ask::{Chosen, PlanRefusal, Probe};
+use model::placement::ctx_ask::{Chosen, Probe, probe_of};
 use model::placement::workstation::TierBatchBytes;
 
 /// The expert tier cards the V4.1 body serves: the host tier's count
@@ -79,9 +79,7 @@ pub fn with_cards(
 /// A serving slot's context by the seats' common choice
 /// (`generate::choose_ctx`): the limit is the file's trained context within
 /// [`KERNEL_POSITIONS`], and a probe is the load's plan of every slot at
-/// a slot context on `place`'s machine with `reserve` (the DSpark draft's),
-/// `tier_batch` and `held` (the stage card's reserves), its refusal
-/// read for the memory it was short of. `set` is the total the slots split.
+/// a slot context ([`probe`]). `set` is the total the slots split.
 #[allow(
     dead_code,
     reason = "generate_ds41 and bloomery-chat include this module and never call it"
@@ -102,17 +100,39 @@ pub fn ctx_choice(
         // assumed the seat could not serve past it, and an unset
         // context served 262,144 on two cards before it.
         (Some((KERNEL_POSITIONS, "KERNEL_POSITIONS")), None),
-        |c| -> Result<Probe<()>, GateError> {
-            let mut machine = place.machine(reserve, tier_batch)?(inputs.model.layers);
-            beside::reserve_on(&mut machine, held);
-            reserve_checkpoints(&mut machine, Seqs::none(slots.get()), c)?;
-            match inputs.plan_with_slots(&machine, c, levers, slots) {
-                Ok(_) => Ok(Probe::Holds(())),
-                Err(e) => match PlanRefusal::short(&e) {
-                    Some(short) => Ok(Probe::Short(short)),
-                    None => Err(e.into()),
-                },
-            }
+        |c| {
+            probe(
+                inputs,
+                place,
+                (reserve, tier_batch, held),
+                (c, slots),
+                levers,
+            )
         },
     )
+}
+
+/// The load's plan of `slots` sequences of `ctx` positions on `place`'s machine with `reserve`
+/// (the DSpark draft's), `tier_batch` and `held` (the stage card's reserves), as the context
+/// choice and `--parallel auto`'s count read it: a refusal short of a memory is
+/// [`Probe::Short`], any other the error.
+#[allow(
+    dead_code,
+    reason = "generate_ds41 and bloomery-chat include this module and never call it"
+)]
+pub fn probe(
+    inputs: &PlanInputs,
+    place: Place,
+    (reserve, tier_batch, held): (Option<DraftSeat>, Option<TierBatchBytes>, Beside),
+    (ctx, slots): (u64, NonZeroUsize),
+    levers: &PlanLevers,
+) -> Result<Probe<()>, GateError> {
+    let mut machine = place.machine(reserve, tier_batch)?(inputs.model.layers);
+    beside::reserve_on(&mut machine, held);
+    reserve_checkpoints(&mut machine, Seqs::none(slots.get()), ctx)?;
+    Ok(probe_of(
+        inputs
+            .plan_with_slots(&machine, ctx, levers, slots)
+            .map(|_| ()),
+    )?)
 }

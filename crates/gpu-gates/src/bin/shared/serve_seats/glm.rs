@@ -6,7 +6,7 @@
 //!
 //!     [--host 127.0.0.1] [--port 8080] [--place a|gate|bp|<stage>[+<tier>…]] [--ctx C]
 //!     [--alias NAME] [--cache-ram MIB] [--slot-save-path DIR] [--chat-template-file PATH]
-//!     [--prefill batch|steps] [--parallel N] [--slot-ctx S] [--queue-depth Q] [--plan]
+//!     [--prefill batch|steps] [--parallel N|auto] [--slot-ctx S] [--queue-depth Q] [--plan]
 //!     [--mmproj FILE | --no-mmproj] [--image-min-tokens N] [--image-max-tokens N]
 //!
 //! `--ctx` is also spelled `--ctx-size` and `-c`, as llama-server spells it
@@ -118,7 +118,10 @@
 //! ([`SlotDrafts`]), so each request's tokens are its solo run's;
 //! `--parallel 1` is the one-sequence server and `--parallel 0` is refused
 //! by name. `--parallel` naming no count, the seat serves one slot; a count
-//! the flags set is never lowered. The round's shape the open decided once, from the load and the
+//! the flags set is never lowered. `--parallel auto` counts the slots once the
+//! placement and the draft are chosen at one slot (`bind::AutoSlots::count`):
+//! the most, up to `ctx_ask::AUTO_MOST`, whose plan holds one request's context
+//! (`--slot-ctx`, or the default's where that is the model's limit). The round's shape the open decided once, from the load and the
 //! body's row and sequence limits (`SlotRows::MAX_ROWS`, `SlotRows::MAX_SLOTS`):
 //! a plain load (no NextN draft) runs a round of
 //! steps as passes of the busy rows
@@ -253,9 +256,10 @@ use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{
-    CacheRam, Cached, ChatSurface, Landing, Listen, Pass, PutBack, Seat, SeatEngine, SlotFlags,
-    SlotPassRow, SlotStep, TemplateFile, Vocab, arm_screen, begin, bind_server, eprint_noted,
-    model_props, note_line, parallel_line, placement_of, put_back, slots_given, verifies_slots,
+    AutoSlots, CacheRam, Cached, ChatSurface, Landing, Listen, Pass, PutBack, Seat, SeatEngine,
+    SlotFlags, SlotPassRow, SlotStep, TemplateFile, Vocab, arm_screen, begin, bind_server,
+    eprint_noted, model_props, note_line, parallel_line, placement_of, put_back, slots_given,
+    verifies_slots,
 };
 use bloomery_gpu_gates::generate::{
     DraftYield, Lane, Place, draft_yield, lane_at, mode_name, with_cards,
@@ -281,7 +285,7 @@ use bloomery_levers::{
 use gguf::Split;
 use model::arch::glm5next::place::{KdaLanes, NextnInputs, PROMPT_GROUP, PlaceError, PlanInputs};
 use model::placement::churn::ChurnPool;
-use model::placement::ctx_ask::DEFAULT_SLOTS;
+use model::placement::ctx_ask::{DEFAULT_SLOTS, Probe, Rule};
 use model::placement::slots::{SplitError, split_ctx};
 use model::placement::workstation::{HostNeed, TierBatchBytes};
 use model::placement::{Machine, Plan, PlanLevers};
@@ -307,7 +311,7 @@ const WHAT: &str = "bloomery-serve-glm";
 const USAGE: &str = "usage: bloomery-serve [--model glm] [--host H] [--port P] \
                      [--place a|gate|bp|<stage>[+<tier>…]] \
                      [--ctx C] [--alias NAME] [--cache-ram MIB] [--slot-save-path DIR] \
-                     [--chat-template-file PATH] [--prefill batch|steps] [--parallel N] \
+                     [--chat-template-file PATH] [--prefill batch|steps] [--parallel N|auto] \
                      [--slot-ctx S] [--queue-depth Q] [--plan] [--mmproj FILE | --no-mmproj] \
                      [--image-min-tokens N] [--image-max-tokens N] [--api-key KEY] \
                      [--api-key-file FNAME]";
@@ -499,11 +503,30 @@ struct Placed {
     place: Place,
     tier_batch: Option<TierBatchBytes>,
     machine: Machine,
-    /// The context a slot gets and the choice's `ctx` line ([`glm_place::serve_ctx`]).
+    /// The stage card's reserves the machine carries: the encoder's and the side model's.
+    held: Beside,
+    /// The context a slot gets, the rule that set it and the choice's `ctx` line
+    /// ([`glm_place::serve_ctx`]).
     ctx: usize,
+    rule: Rule,
     line: String,
     tier_experts: u64,
     vision: Option<Opened>,
+}
+
+/// `place`'s machine for `slots` sequences of `ctx` positions: its checkpoints reserved at the
+/// load's `price` ([`glm_machine`]) and the stage card's reserves `held` on it.
+fn machine_of(
+    (place, tier_batch): (Place, Option<TierBatchBytes>),
+    inputs: &PlanInputs,
+    (slots, ctx): (usize, u64),
+    price: Price,
+    held: Beside,
+) -> Result<Machine, GateError> {
+    Ok(beside::with_reserve(
+        glm_machine(place, tier_batch, slots, price, ctx)?,
+        held,
+    )(inputs.model.layers))
 }
 
 impl Placed {
@@ -530,19 +553,14 @@ impl Placed {
         // A projector the `--hf` repo picked stays only where the plan gives the text model the
         // same experts and context with its reserve as without ([`vision_seat::kept`]).
         let cost = |v: Option<&Opened>| -> Result<vision_seat::Cost, GateError> {
-            let reserve = v.and_then(|v| v.seat.reserve);
-            let machine_at = |ctx: u64| -> Result<Machine, GateError> {
-                Ok(beside::with_reserve(
-                    glm_machine(place, tier_batch, slots, price, ctx)?,
-                    Beside {
-                        image: reserve,
-                        embedding,
-                    },
-                )(inputs.model.layers))
+            let held = Beside {
+                image: v.and_then(|v| v.seat.reserve),
+                embedding,
             };
-            let ctx = u64::try_from(
-                glm_place::serve_ctx(inputs, &machine_at, levers, nextn, (set, slots))?.0,
-            )?;
+            let machine_at =
+                |ctx: u64| machine_of((place, tier_batch), inputs, (slots, ctx), price, held);
+            let ctx =
+                glm_place::serve_ctx(inputs, &machine_at, levers, nextn, (set, slots))?.slot_ctx;
             let machine = machine_at(ctx)?;
             let plan = plan_of(inputs, &machine, ctx, levers, nextn, slots)?;
             Ok(vision_seat::Cost::of(&plan, ctx))
@@ -552,15 +570,10 @@ impl Placed {
             image: vision.as_ref().and_then(|v| v.seat.reserve),
             embedding,
         };
-        let machine_at = |ctx: u64| -> Result<Machine, GateError> {
-            Ok(beside::with_reserve(
-                glm_machine(place, tier_batch, slots, price, ctx)?,
-                held,
-            )(inputs.model.layers))
-        };
-        let (slot_ctx, line) =
-            glm_place::serve_ctx(inputs, &machine_at, levers, nextn, (set, slots))?;
-        let ctx = u64::try_from(slot_ctx)?;
+        let machine_at =
+            |ctx: u64| machine_of((place, tier_batch), inputs, (slots, ctx), price, held);
+        let chosen = glm_place::serve_ctx(inputs, &machine_at, levers, nextn, (set, slots))?;
+        let ctx = chosen.slot_ctx;
         let machine = machine_at(ctx)?;
         // `glm_place::tier_experts` plans on a machine of its own, which carries no reserve: a
         // stage-reserve seat counts its tier on the machine the plan runs by.
@@ -577,11 +590,34 @@ impl Placed {
             place,
             tier_batch,
             machine,
-            ctx: slot_ctx,
-            line,
+            held,
+            ctx: usize::try_from(ctx)?,
+            rule: chosen.rule,
+            line: chosen.line(),
             tier_experts,
             vision,
         })
+    }
+
+    /// Whether `slots` sequences of `ctx` positions hold on this placement with its reserves
+    /// ([`glm_place::probe`]): `--parallel auto`'s count over the one-slot placement.
+    fn holds(
+        &self,
+        inputs: &PlanInputs,
+        levers: &PlanLevers,
+        nextn: Option<&NextnInputs>,
+        (slots, ctx): (usize, usize),
+    ) -> Result<bool, GateError> {
+        let ctx = u64::try_from(ctx)?;
+        let machine = machine_of(
+            (self.place, self.tier_batch),
+            inputs,
+            (slots, ctx),
+            checkpoint_price(inputs)?,
+            self.held,
+        )?;
+        let probe = glm_place::probe(inputs, &machine, (ctx, slots), levers, nextn)?;
+        Ok(matches!(probe, Probe::Holds(())))
     }
 }
 
@@ -689,6 +725,9 @@ pub(crate) struct Args {
     /// `--parallel`: the resident sequences the seat serves; `None` takes
     /// one slot beside a set `--ctx`, else `ctx_ask::DEFAULT_SLOTS` (one).
     parallel: Option<usize>,
+    /// `--parallel auto`: the seat counts the slots from its plans ([`AutoSlots::count`]);
+    /// `parallel` is unset beside it and `ctx` is `--slot-ctx`.
+    auto: Option<AutoSlots>,
     queue_depth: Option<usize>,
     /// The image-input flags: `--mmproj` is GLM's own encoder file, whose
     /// images the seat serves; none serves no image.
@@ -711,6 +750,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         prefill: PrefillMode::Batch,
         plan_only: false,
         parallel: None,
+        auto: None,
         queue_depth: None,
         vision: vision_seat::Flags::default(),
         api_keys: serve::flag::ApiKeys::default(),
@@ -758,7 +798,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
         }
     }
-    (a.ctx, a.parallel) = slots.given(a.ctx)?;
+    (a.ctx, a.parallel, a.auto) = slots.asked(a.ctx)?;
     if a.ctx == Some(0) {
         return Err("--ctx 0: the stores hold no position".into());
     }
@@ -833,7 +873,7 @@ pub(crate) fn check(
             if levers.draft() == Some("off") {
                 bloomery_gpu_gates::bind::refuse_plain_width(levers, Some("BLOOMERY_DRAFT=off"))?;
             }
-            let (slots, _) = slots_given(a.parallel, a.ctx, DEFAULT_SLOTS)?;
+            let (slots, _) = slots_given(a.parallel, a.ctx, a.auto.is_some(), DEFAULT_SLOTS)?;
             checked_ctx(&a, slots, levers)?;
         }
         Ok(a)
@@ -901,7 +941,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // where a window fits, and never refuses). The slot count itself: a set
     // `--ctx` with no `--parallel` is one request's context — one slot at
     // the whole of it (`bind::slots_of`).
-    let (slots, from) = slots_given(a.parallel, a.ctx, DEFAULT_SLOTS)?;
+    let (slots, from) = slots_given(a.parallel, a.ctx, a.auto.is_some(), DEFAULT_SLOTS)?;
     let ctx_share = |slots| checked_ctx(&a, slots, &levers);
     let set = ctx_share(slots)?;
     // The unset rule's window bound reads a slot's floor context — a default
@@ -951,24 +991,34 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     } else {
         Some(lane_at(chosen.place)?)
     };
+    // `--parallel auto`'s count ([`AutoSlots::count`]) over the placement and the draft chosen
+    // at one slot: a drafted default that holds no context at one slot is the yield's below.
+    let (slots, asked) = match a.auto {
+        None => (slots, a.ctx),
+        Some(auto) => auto.count::<PlaceError, _>(
+            nextn.is_some(),
+            |set| plan_place(chosen.place, (set, 1)).map(|p| (p.ctx, p.rule, p)),
+            |one, n, ctx| one.holds(&inputs, &plan_levers, nextn.as_ref(), (n, ctx)),
+        )?,
+    };
     // An unset draft yields when the plain load serves twice the positions or more.
     // A set context can yield if only its plain plan holds; a set draft never yields.
     // The selected placement and slot count stay fixed.
-    let drafted = plan_place(chosen.place, (a.ctx, slots));
+    let drafted = plan_place(chosen.place, (asked, slots));
     // The draft is unset, so it yields to the context, set or not: the
     // context comes first (`generate::draft_yield`).
     let asks_yield = draft_off.is_none() && levers.draft().is_none();
     let chosen_draft = draft_yield::<PlaceError, _, _>(
         asks_yield,
         drafted,
-        |d| d.line.starts_with("ctx rule=fitted ").then_some(d.ctx),
+        |d| matches!(d.rule, Rule::Fitted { .. }).then_some(d.ctx),
         || {
             let plain = Placed::of(
                 chosen.place,
                 &inputs,
                 &plan_levers,
                 None,
-                (a.ctx, slots),
+                (asked, slots),
                 (&images, side.as_ref()),
             )?;
             let bytes = nextn

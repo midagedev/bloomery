@@ -1775,15 +1775,8 @@ models (the --model word is optional with a model file: the file's architecture 
                     e.contains("--parallel") || e.contains("slots"),
                     "{word:?}: {e}"
                 );
-                // `--parallel auto` is the qwen38 seat's; `--slot-ctx` beside `--ctx-size`,
-                // and auto beside it, name both flags on every seat.
-                if word != qwen38 {
-                    let e = refusal(word, "--hf o/r --parallel auto");
-                    assert!(
-                        e.contains("--parallel auto: this seat serves"),
-                        "{word:?}: {e}"
-                    );
-                }
+                // `--slot-ctx` beside `--ctx-size`, and `--parallel auto` beside it, name both
+                // flags on every seat.
                 for (s, why) in [
                     (
                         "--hf o/r --slot-ctx 8192 -c 8192",
@@ -1802,12 +1795,17 @@ models (the --model word is optional with a model file: the file's architecture 
             // check names, where the same number read as the total would leave each none.
             let e = refusal(ds41, "--hf o/r --parallel 4 --slot-ctx 1");
             assert!(e.contains("each of the 4 slots serves 1 positions"), "{e}");
-            for s in [
-                "--hf o/r --parallel auto",
-                "--hf o/r --parallel auto --slot-ctx 32768",
-                "--hf o/r -np auto",
-            ] {
-                early(qwen38, &line(s), []).expect(s);
+            // `--parallel auto` is every seat's that serves resident slots; a seat of one
+            // sequence refuses it by name (below).
+            let seats = [Model::Mimo2, Model::MinimaxM3, Model::Flint].map(|m| Some(Word::Seat(m)));
+            for word in [qwen38, ds41, qwen3, glm].into_iter().chain(seats) {
+                for s in [
+                    "--hf o/r --parallel auto",
+                    "--hf o/r --parallel auto --slot-ctx 32768",
+                    "--hf o/r -np auto",
+                ] {
+                    early(word, &line(s), []).unwrap_or_else(|e| panic!("{word:?} {s}: {e}"));
+                }
             }
             let nemotron = Some(Word::Seat(Model::Nemotron));
             for (seat, body) in [
@@ -1815,11 +1813,15 @@ models (the --model word is optional with a model file: the file's architecture 
                 (Model::Raon1, "raon1"),
                 (Model::MuseSpark, "musespark"),
             ] {
-                let e = refusal(Some(Word::Seat(seat)), "--hf o/r --parallel 2");
-                assert!(
-                    e.contains(&format!("--parallel 2: the {body} body holds one sequence")),
-                    "{e}"
-                );
+                for n in ["2", "auto"] {
+                    let e = refusal(Some(Word::Seat(seat)), &format!("--hf o/r --parallel {n}"));
+                    assert!(
+                        e.contains(&format!(
+                            "--parallel {n}: the {body} body holds one sequence"
+                        )),
+                        "{e}"
+                    );
+                }
             }
             for s in [
                 "--hf o/r --parallel 1",

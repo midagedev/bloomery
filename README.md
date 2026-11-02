@@ -208,8 +208,8 @@ These seats serve a file or a checkpoint folder on disk (`-m PATH`):
 The server has one slot unless `--parallel N` asks for N, so a second request waits for the first. Unset,
 `--ctx-size` gives each slot the largest context its plan holds; a set `--ctx-size` is the total the slots share,
 and one slot takes it whole. `--slot-ctx S` names one request's context instead, so `--parallel 4 --slot-ctx 32768`
-gives each of four slots 32,768 positions. On Qwen3.8, `--parallel auto` serves the most slots, up to 8, that memory
-holds at that context. `--config FILE` reads the flags from one JSON file. A flag on the command line wins over
+gives each of four slots 32,768 positions. `--parallel auto` serves the most slots, up to 8, that memory holds at that
+context. `--config FILE` reads the flags from one JSON file. A flag on the command line wins over
 the file's, and both win over the flag's `LLAMA_ARG_*` variable and the `BLOOMERY_*` lever it stands for. A request
 field the server does not know is ignored, as in llama-server, so a misspelled sampling field runs at its default. Which flags each seat takes, which setting wins and what a request's fields do:
 [`docs/serving.md`](docs/serving.md#settings).

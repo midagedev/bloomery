@@ -67,7 +67,7 @@ use bloomery_gpu::model::{SlotRows, slots_a_pass};
 use bloomery_levers::Levers;
 use gguf::Split;
 use model::placement::workstation::{self, DeviceId, HostRead};
-use model::placement::{Device, Machine, ModelTensors, Plan, Role};
+use model::placement::{Device, Machine, ModelTensors, Plan, Role, ctx_ask};
 use runtime::prompt::CallEnd;
 use serve::media::{MediaFeed, SharedMediaModel};
 use serve::{
@@ -77,6 +77,7 @@ use serve::{
 };
 
 use crate::GateError;
+use crate::generate::{FloorShort, holds_no_ctx, short_in};
 use crate::record::Record;
 use crate::side_seat::SideEngine;
 
@@ -223,12 +224,87 @@ pub enum SlotAsk {
 }
 
 /// `--parallel auto`: the most slots, up to `ctx_ask::AUTO_MOST`, whose plan holds one
-/// request's context.
+/// request's context ([`AutoSlots::count`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AutoSlots {
     /// `--slot-ctx`; unset, the context one slot's default takes.
     pub slot_ctx: Option<usize>,
 }
+
+impl AutoSlots {
+    /// `--parallel auto`'s count over a seat's plans and the `--ctx-size` total it asks, the one
+    /// owner every seat of resident slots calls once it chose its placement and draft at one
+    /// slot: the most slots, up to [`ctx_ask::AUTO_MOST`], whose plan holds one request's
+    /// context ([`ctx_ask::most_slots`]; `holds` is the seat's plan of `n` slots at a slot's
+    /// context, given what its one-slot ask `T` keeps).
+    /// `one` is that ask, at `--slot-ctx` or at the seat's default: the context a slot takes, the
+    /// rule that set it and `T`. At `--slot-ctx` the total is that times the count, and one slot
+    /// short of it serves one, whose ask the seat refuses by name as a set context. Unset, the
+    /// count runs at the default's context where that is the target (the model's limit), with no
+    /// total, so the default asks the target again over every slot. A default fitted under the
+    /// target serves one, as does one short at its floor ([`FloorShort`]), or a `drafted` one
+    /// that holds no context ([`holds_no_ctx`]): the default's draft yield answers both, and a
+    /// draft that cannot yield keeps the refusal. A refusal of `holds` that the family's `E`
+    /// reads as short ([`short_in`]), or one that holds no context ([`holds_no_ctx`]: a host or
+    /// arena floor a slot count raises), is a count that does not hold.
+    ///
+    /// # Errors
+    /// `one`'s refusal of any other kind, a refusal of `holds` that is not short, and a total
+    /// past `usize`.
+    pub fn count<E, T>(
+        self,
+        drafted: bool,
+        one: impl FnOnce(Option<usize>) -> Result<(usize, ctx_ask::Rule, T), GateError>,
+        mut holds: impl FnMut(&T, usize, usize) -> Result<bool, GateError>,
+    ) -> Result<(usize, Option<usize>), GateError>
+    where
+        E: ctx_ask::PlanRefusal + std::error::Error + 'static,
+    {
+        let no_ctx = |e: &GateError| match self.slot_ctx {
+            Some(_) => holds_no_ctx::<E>(e),
+            None => e.is::<FloorShort>() || drafted && holds_no_ctx::<E>(e),
+        };
+        let (ctx, kept) = match one(self.slot_ctx) {
+            Ok((ctx, ctx_ask::Rule::Set | ctx_ask::Rule::Target, kept)) => (ctx, kept),
+            Ok((ctx, _, _)) => {
+                eprintln!(
+                    "parallel auto slots=1: the default context is fitted below the model limit (ctx={ctx})"
+                );
+                return Ok((1, None));
+            }
+            Err(e) if no_ctx(&e) => {
+                eprintln!("parallel auto slots=1: one slot does not hold ({e})");
+                return Ok((1, self.slot_ctx));
+            }
+            Err(e) => return Err(e),
+        };
+        let n = ctx_ask::most_slots(ctx_ask::AUTO_MOST, |n| match holds(&kept, n, ctx) {
+            Err(e) if short_in::<E>(&e).is_some() || holds_no_ctx::<E>(&e) => Ok(false),
+            held => held,
+        })?
+        .unwrap_or(1);
+        let total = self
+            .slot_ctx
+            .map(|s| {
+                s.checked_mul(n)
+                    .ok_or_else(|| format!("--slot-ctx {s} over {n} slots: the total passes usize"))
+            })
+            .transpose()?;
+        Ok((n, total))
+    }
+
+    /// `--parallel auto` on a load that serves one sequence (`why`, a seat's fact: a draft or
+    /// a tier card that serves one), one line on stderr: one slot at `--slot-ctx`.
+    #[must_use]
+    pub fn one(self, why: &str) -> (usize, Option<usize>) {
+        eprintln!("parallel auto slots=1: {why}");
+        (1, self.slot_ctx)
+    }
+}
+
+/// [`SlotFlags::asked`]: the `--ctx` total (or `--slot-ctx` under auto), the `--parallel`
+/// count and `--parallel auto`.
+pub type Asked = (Option<usize>, Option<usize>, Option<AutoSlots>);
 
 impl SlotFlags {
     /// Takes `flag` with its value `v` when it is a slot flag (`Ok(true)`); `Ok(false)` leaves
@@ -284,15 +360,15 @@ impl SlotFlags {
         }
     }
 
-    /// [`SlotFlags::ask`] for a seat that serves the count `--parallel` names: the `--ctx`
-    /// total and the count, `--parallel auto` refused by name.
-    pub fn given(self, ctx: Option<usize>) -> Result<(Option<usize>, Option<usize>), GateError> {
-        match self.ask(ctx)? {
-            SlotAsk::Given { ctx, parallel } => Ok((ctx, parallel)),
-            SlotAsk::Auto(_) => Err("--parallel auto: this seat serves the count --parallel \
-                 names; the qwen38 seat counts its slots from memory"
-                .into()),
-        }
+    /// [`SlotFlags::ask`] as a seat keeps it: the `--ctx` total, the `--parallel` count, and
+    /// `--parallel auto`, beside which the context is `--slot-ctx` and the count unset: the
+    /// one-slot ask the seat chooses its placement and draft at before auto counts the slots
+    /// ([`AutoSlots::count`]).
+    pub fn asked(self, ctx: Option<usize>) -> Result<Asked, GateError> {
+        Ok(match self.ask(ctx)? {
+            SlotAsk::Given { ctx, parallel } => (ctx, parallel, None),
+            SlotAsk::Auto(auto) => (auto.slot_ctx, None, Some(auto)),
+        })
     }
 }
 
@@ -337,12 +413,18 @@ pub fn slots_of(
 /// The slots a seat serves and what set the count (`from`, as [`slots_of`]
 /// returns it); a set `--ctx` with no
 /// `--parallel` prints the one line that says the flag is one request's
-/// context ([`one_request_line`]).
+/// context ([`one_request_line`]). Under `--parallel auto` (`auto`) it is one
+/// slot at `ctx`, the one-slot ask the seat counts the slots from
+/// ([`AutoSlots::count`], [`SlotsFrom::Auto`]).
 pub fn slots_given(
     parallel: Option<usize>,
     ctx: Option<usize>,
+    auto: bool,
     default: usize,
 ) -> Result<(usize, SlotsFrom), GateError> {
+    if auto {
+        return Ok((1, SlotsFrom::Auto));
+    }
     let (slots, from) = slots_of(parallel, ctx.is_some(), default)?;
     if from == SlotsFrom::Ctx {
         eprintln!(
@@ -430,6 +512,9 @@ pub struct SeatFlags {
     /// `--plan`: the records before the load, then exit.
     pub plan_only: bool,
     pub parallel: Option<usize>,
+    /// `--parallel auto` ([`SlotFlags::asked`]): `parallel` is unset beside it and `ctx` is
+    /// `--slot-ctx`.
+    pub auto: Option<AutoSlots>,
     pub queue_depth: Option<usize>,
     /// `--api-key`/`--api-key-file`: the keys every request is checked
     /// against ([`serve::flag::ApiKeys`]).
@@ -443,8 +528,7 @@ impl SeatFlags {
     /// The flags of `args`. A flag that is not one of the common set goes to
     /// `own` with its value: `Ok(true)` took it, `Ok(false)` is an unknown
     /// argument, refused by name with `usage`. `--help` returns `usage` as
-    /// the error; `--ctx 0`, `--parallel 0` and `--parallel auto` are refused by name
-    /// ([`SlotFlags::given`]).
+    /// the error; `--ctx 0` and `--parallel 0` are refused by name ([`SlotFlags::asked`]).
     pub fn parse(
         args: &[String],
         usage: &str,
@@ -459,6 +543,7 @@ impl SeatFlags {
             template_file: TemplateFile::default(),
             plan_only: false,
             parallel: None,
+            auto: None,
             queue_depth: None,
             api_keys: serve::flag::ApiKeys::default(),
             slot_save_path: None,
@@ -494,7 +579,7 @@ impl SeatFlags {
                 }
             }
         }
-        (a.ctx, a.parallel) = slots.given(a.ctx)?;
+        (a.ctx, a.parallel, a.auto) = slots.asked(a.ctx)?;
         if a.ctx == Some(0) {
             return Err("--ctx 0: the stores hold no position".into());
         }
@@ -504,7 +589,7 @@ impl SeatFlags {
     }
 
     /// The common flags of `args` alone ([`SeatFlags::parse`]) for a seat whose `body` holds one
-    /// sequence and serves no expert tier card: `--parallel` above one
+    /// sequence and serves no expert tier card: `--parallel` above one or `auto`
     /// ([`SeatFlags::one_sequence`]) and a `--place` list with tier cards are refused by name.
     pub fn parse_one_sequence(
         args: &[String],
@@ -519,9 +604,16 @@ impl SeatFlags {
         Ok(a)
     }
 
-    /// `--parallel` above one, refused by name for a seat whose `body` holds one sequence and no
-    /// resident slots.
+    /// `--parallel` above one or `auto`, refused by name for a seat whose `body` holds one
+    /// sequence and no resident slots.
     pub fn one_sequence(&self, body: &str) -> Result<(), GateError> {
+        if self.auto.is_some() {
+            return Err(format!(
+                "--parallel auto: the {body} body holds one sequence and no resident slots; the \
+                 seat serves --parallel 1"
+            )
+            .into());
+        }
         match self.parallel.filter(|&n| n > 1) {
             Some(n) => Err(format!(
                 "--parallel {n}: the {body} body holds one sequence and no resident slots; the \
@@ -4198,9 +4290,10 @@ mod tests {
     }
 
     /// The slot flags beside `--ctx`: `--slot-ctx S` asks `S x N` over `--parallel N` (one
-    /// slot with no count), `--parallel auto` keeps its slot context for the seat, and each
-    /// conflict or zero is refused by name; a seat that serves a count refuses auto.
-    /// Mutants: `--slot-ctx` read as the total, auto beside `--ctx-size` taken as a total.
+    /// slot with no count), `--parallel auto` keeps its slot context for the seat as the
+    /// one-slot ask's context, and each conflict or zero is refused by name; a seat of one
+    /// sequence refuses auto. Mutants: `--slot-ctx` read as the total, auto beside
+    /// `--ctx-size` taken as a total, auto's context dropped or its count kept.
     #[test]
     fn slot_flags_ask_rows() {
         use super::{AutoSlots, SlotAsk, SlotFlags};
@@ -4258,11 +4351,111 @@ mod tests {
         assert!(!slots.take("--ctx-size", "8").expect("not a slot flag"));
         assert!(slots.take("--parallel", "two").is_err());
         slots.take("--parallel", "auto").expect("auto");
-        let e = slots.given(None).expect_err("auto refused").to_string();
+        slots.take("--slot-ctx", "8192").expect("a slot's context");
+        let auto = Some(AutoSlots {
+            slot_ctx: Some(8192),
+        });
+        assert_eq!(slots.asked(None).expect("auto"), (Some(8192), None, auto));
+        let args = ["-np", "auto"].map(str::to_owned);
+        let flags = super::SeatFlags::parse(&args, "usage", |_, _| Ok(false)).expect("auto");
+        assert_eq!(flags.auto, Some(AutoSlots { slot_ctx: None }));
+        let e = flags.one_sequence("nemotron").expect_err("auto refused");
         assert!(
-            e.contains("--parallel auto: this seat serves the count"),
+            e.to_string()
+                .starts_with("--parallel auto: the nemotron body holds one sequence"),
             "{e}"
         );
+    }
+
+    /// `--parallel auto`'s count over a seat's plans ([`super::AutoSlots::count`]), on a card
+    /// that holds `fits` slots: at `--slot-ctx` the most that hold up to `AUTO_MOST` and the
+    /// total over them, one slot short of it serving one; unset, the count at the default's
+    /// target with no total, and one slot where the default is fitted, short at its floor or,
+    /// drafted, holds no context. A host floor a count raises is short; a refusal of any other
+    /// kind is the error, from the ask or the count. Mutants: a fitted default counted, the
+    /// one-slot ask's `T` not handed to the count, a host floor read as the error, the total
+    /// left at a slot's context.
+    #[test]
+    fn auto_counts_the_seats_slots_from_the_one_slot_ask() {
+        use model::placement::ctx_ask::{Probe, Rule, Short, Side};
+
+        use model::arch::place_hybrid::PlaceError as Family;
+
+        use model::placement::PlacementError;
+
+        use super::AutoSlots;
+        use crate::GateError;
+        let short = Short {
+            on: Side::Card,
+            need: 2,
+            room: 1,
+        };
+        let floor =
+            || -> GateError { Box::new(PlacementError::DraftHostRoom { room: 1, draft: 2 }) };
+        let count = |slot_ctx, drafted, one: Result<(usize, Rule), GateError>, fits| {
+            AutoSlots { slot_ctx }
+                .count::<Family, _>(
+                    drafted,
+                    |set| {
+                        assert_eq!(set, slot_ctx, "the ask is the flag's");
+                        one.map(|(ctx, rule)| (ctx, rule, ctx))
+                    },
+                    |&kept, n, ctx| {
+                        assert_eq!(kept, ctx, "the count runs at the ask's context");
+                        match n {
+                            n if n <= fits => Ok(true),
+                            5 => Err(floor()),
+                            _ => Ok(false),
+                        }
+                    },
+                )
+                .map_err(|e| e.to_string())
+        };
+        let set = || Ok((8192, Rule::Set));
+        assert_eq!(count(Some(8192), false, set(), 4), Ok((4, Some(32_768))));
+        assert_eq!(count(Some(8192), false, set(), 9), Ok((8, Some(65_536))));
+        assert_eq!(
+            count(None, false, Ok((65_536, Rule::Target)), 2),
+            Ok((2, None))
+        );
+        let fitted = Rule::Fitted {
+            from: 65_536,
+            short,
+        };
+        assert_eq!(count(None, true, Ok((32_768, fitted)), 8), Ok((1, None)));
+        assert_eq!(
+            count(Some(8192), false, Err(floor()), 8),
+            Ok((1, Some(8192)))
+        );
+        let floor_short = crate::generate::choose_ctx_of(65_536, (None, 1), (None, None), |_| {
+            Ok::<_, GateError>(Probe::<()>::Short(short))
+        });
+        let floor_short = floor_short.err().expect("short at the floor");
+        assert_eq!(count(None, false, Err(floor_short), 8), Ok((1, None)));
+        assert_eq!(count(None, true, Err(floor()), 8), Ok((1, None)));
+        assert!(count(None, false, Err(floor()), 8).is_err());
+        assert!(count(None, true, Err("a seat's error".into()), 8).is_err());
+        let refused = AutoSlots { slot_ctx: None }.count::<Family, _>(
+            false,
+            |_| Ok((65_536, Rule::Target, ())),
+            |(), n, _| match n {
+                1 => Ok(true),
+                _ => Err("a seat's error".into()),
+            },
+        );
+        assert_eq!(
+            refused.map_err(|e| e.to_string()),
+            Err("a seat's error".to_owned())
+        );
+        let past = AutoSlots {
+            slot_ctx: Some(usize::MAX),
+        }
+        .count::<Family, _>(
+            false,
+            |s| Ok((s.unwrap_or(1), Rule::Set, ())),
+            |_, _, _| Ok(true),
+        );
+        assert!(past.is_err_and(|e| e.to_string().contains("passes usize")));
     }
 
     /// The context flag the parser reads, settings-file values included, is the one

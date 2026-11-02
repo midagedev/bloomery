@@ -199,7 +199,7 @@ fn fit(
             nextn,
             (None, slots),
         )
-        .and_then(|(ctx, _)| Ok(u64::try_from(ctx)?)),
+        .map(|chosen| chosen.slot_ctx),
     )
     .map_err(|e| outcome_by(&e, place_of))?;
     Ok((machine(place, inputs, ctx, slots)?, ctx))
