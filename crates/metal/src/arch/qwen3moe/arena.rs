@@ -398,8 +398,71 @@ fn at_layer(l: usize, e: SessionError) -> SessionError {
 /// still refuses is a tensor whose bytes the model file cannot give.
 struct Loader<'a> {
     device: Alloc<'a>,
-    weights: &'a Weights<'a>,
+    source: Source<'a>,
     geom: &'a Geometry,
+}
+
+/// Tensor bytes a loader reads that no model file holds: a tensor by the name
+/// a layout gives it, in the type and dims the layout asks for, made by its
+/// owner.
+pub(super) trait PartSource: Sync {
+    fn part(&self, name: &str) -> Result<Part<'static>, SessionError>;
+}
+
+/// Where a loader reads a tensor's bytes from.
+#[derive(Clone, Copy)]
+enum Source<'a> {
+    /// The model file the session opens.
+    Model(&'a Weights<'a>),
+    /// A source of its own ([`PartSource`]): the MTP sidecar's.
+    Other(&'a dyn PartSource),
+}
+
+/// One layer's buffers from `layout`, its tensors read from `source` by the
+/// names the layout gives them: what the open makes of a layer of the file,
+/// for a layer the file does not hold.
+pub(super) fn load_layer(
+    device: Alloc<'_>,
+    source: &dyn PartSource,
+    geom: &Geometry,
+    layout: &LayerLayout,
+) -> Result<LayerBufs, SessionError> {
+    Loader {
+        device,
+        source: Source::Other(source),
+        geom,
+    }
+    .layer(layout)
+}
+
+/// Site `s` as its own buffer, read from `source`.
+pub(super) fn load_site(
+    device: Alloc<'_>,
+    source: &dyn PartSource,
+    geom: &Geometry,
+    s: &Site,
+) -> Result<MetalBuffer<u8>, SessionError> {
+    Loader {
+        device,
+        source: Source::Other(source),
+        geom,
+    }
+    .site(s)
+}
+
+/// The f32 values `v` names, read from `source`.
+pub(super) fn load_values(
+    device: Alloc<'_>,
+    source: &dyn PartSource,
+    geom: &Geometry,
+    v: &Values,
+) -> Result<MetalBuffer<f32>, SessionError> {
+    Loader {
+        device,
+        source: Source::Other(source),
+        geom,
+    }
+    .values(v)
 }
 
 /// `spans` joined into one run: one span as it is, several copied together.
@@ -426,10 +489,13 @@ impl<'a> Loader<'a> {
     /// whether the file is a GGUF split (the mapped bytes, lent) or a
     /// checkpoint folder (the bytes its source makes of the stored planes).
     fn part(&self, name: &str) -> Result<Part<'a>, SessionError> {
-        self.weights.bytes(name).map_err(|e| match e {
-            WeightError::Unknown { .. } => refuse(format!("the file has no tensor {name}")),
-            e => refuse(format!("{name}: {e}")),
-        })
+        match self.source {
+            Source::Model(weights) => weights.bytes(name).map_err(|e| match e {
+                WeightError::Unknown { .. } => refuse(format!("the file has no tensor {name}")),
+                e => refuse(format!("{name}: {e}")),
+            }),
+            Source::Other(source) => source.part(name),
+        }
     }
 
     /// The f32 values of `v`: an F32 tensor as it is, or MLX's affine 8-bit
@@ -814,7 +880,7 @@ impl Arena {
         let (hidden, vocab, ctx) = (g.hidden, g.vocab, g.ctx);
         let load = Loader {
             device,
-            weights,
+            source: Source::Model(weights),
             geom,
         };
         let Loads {

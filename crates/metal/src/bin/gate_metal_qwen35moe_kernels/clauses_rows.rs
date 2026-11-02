@@ -1365,7 +1365,7 @@ fn norm_rows_run(
 }
 
 /// [`norm_rows_run`] over rows of `k` columns.
-fn norm_rows_run_at(
+pub(super) fn norm_rows_run_at(
     h: &Harness<'_>,
     x: &[f32],
     gain: &[f32],

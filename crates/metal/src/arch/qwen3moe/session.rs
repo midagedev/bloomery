@@ -130,8 +130,10 @@ use crate::stream::{
 };
 use objc2_metal::MTLDevice;
 
+mod mtp;
 mod verify;
 
+pub use mtp::{DraftTimes, Drafted, MtpOpened};
 pub use verify::{BufferStamp, TraceSummary, VerifyTrace};
 
 pub(super) const WHAT: &str = "qwen35moe session";
@@ -748,6 +750,11 @@ pub struct Session {
     pending: Option<lanes::Verify>,
     /// How long the open's parts took.
     open_split: OpenSplit,
+    /// What the file's first attention layer with a dense FFN asks of a draft
+    /// layer shaped after it: none for a file with no such layer.
+    seed: Option<mtp::Seed>,
+    /// The MTP draft layer, once [`Session::open_mtp`] opened a sidecar.
+    mtp: Option<mtp::Mtp>,
 }
 
 /// When a session opens the copies a pass leaves after rows inside it
@@ -954,6 +961,7 @@ impl Session {
             rows_t,
             residency_t,
         } = loaded?;
+        let seed = mtp::Seed::of(&checked.layout);
         let plans = checked.plans;
         let ctx_positions = u32::try_from(arena.ctx).map_err(|_| {
             refuse(format!(
@@ -999,6 +1007,8 @@ impl Session {
                 residency: residency_t,
                 pipelines,
             },
+            seed,
+            mtp: None,
         })
     }
 

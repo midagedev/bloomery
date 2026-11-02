@@ -51,6 +51,7 @@ const WHAT: &str = "norm rows";
 const WHAT_ADD: &str = "norm add rows";
 const WHAT_NEXT: &str = "norm add next";
 const WHAT_PLAIN: &str = "norm next";
+const WHAT_JOIN: &str = "mtp join";
 
 /// The argument words both norm kernels take: cols, layer, eps and the two
 /// strides.
@@ -129,11 +130,105 @@ pub struct NormNextParams<'w> {
     pub fault: &'w MetalFaultWord,
 }
 
+/// The hidden row a draft step joins, and what the join does with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HiddenRow {
+    /// The row as the target's last layer left it, before the output norm.
+    Pre,
+    /// The row after the target's output norm: the join norms the row by the
+    /// output norm's gain first.
+    Post,
+}
+
+/// The draft's input join: `y = [ norm_ge(e) | norm_gh(h') ]`, `h'` the hidden
+/// row `h` or, for [`HiddenRow::Post`], `norm_go(h)`, each norm the bits of
+/// [`Kernels::norm_rows`] over one row.
+pub struct MtpJoinParams<'w> {
+    /// Values in each half: a multiple of four.
+    pub cols: usize,
+    /// The token's embedding row, `cols` values.
+    pub emb: Window<'w, f32, MetalDevice>,
+    /// The hidden row, `cols` values.
+    pub hid: Window<'w, f32, MetalDevice>,
+    /// The embedding half's gain (`pre_fc_norm_embedding`), `cols` values.
+    pub gain_emb: Window<'w, f32, MetalDevice>,
+    /// The hidden half's gain (`pre_fc_norm_hidden`), `cols` values.
+    pub gain_hid: Window<'w, f32, MetalDevice>,
+    /// The target's output norm gain, `cols` values; read for
+    /// [`HiddenRow::Post`] only.
+    pub gain_out: Window<'w, f32, MetalDevice>,
+    /// Which hidden row the draft was given.
+    pub hidden: HiddenRow,
+    /// The output: the embedding half, then the hidden half, `2 * cols` values.
+    pub y: WindowMut<'w, f32, MetalDevice>,
+    /// The epsilon added to the mean of the squares.
+    pub eps: f32,
+    /// The fault word a raise lands in.
+    pub fault: &'w MetalFaultWord,
+    /// The layer a raise is recorded in.
+    pub layer: u32,
+}
+
 fn refuse(what: &'static str, detail: impl Into<String>) -> DeviceError {
     super::range(what, detail)
 }
 
 impl Kernels {
+    /// Encode the draft's input join: one dispatch, one threadgroup. A width
+    /// that is not whole float4s, a window that is not the shape or not on a
+    /// 16-byte boundary, and a non-finite epsilon are refused by name and
+    /// nothing is encoded.
+    #[must_use = "a refused launch encoded nothing"]
+    pub fn mtp_join(
+        &self,
+        encoder: &mut ComputeEncoder<'_>,
+        p: MtpJoinParams<'_>,
+    ) -> Result<(), DeviceError> {
+        let what = WHAT_JOIN;
+        if p.cols == 0 || !p.cols.is_multiple_of(4) {
+            return Err(refuse(
+                what,
+                format!("cols {} is not a multiple of four, whole float4s", p.cols),
+            ));
+        }
+        if !p.eps.is_finite() {
+            return Err(refuse(what, format!("the epsilon {} is not finite", p.eps)));
+        }
+        for (name, len) in [
+            ("emb", p.emb.len()),
+            ("hid", p.hid.len()),
+            ("gain_emb", p.gain_emb.len()),
+            ("gain_hid", p.gain_hid.len()),
+            ("gain_out", p.gain_out.len()),
+        ] {
+            check_window_len(what, name, len, p.cols)?;
+        }
+        check_window_len(what, "y", p.y.len(), 2 * p.cols)?;
+        for (name, start) in [
+            ("emb", p.emb.byte_range()?.start.get()),
+            ("hid", p.hid.byte_range()?.start.get()),
+            ("gain_emb", p.gain_emb.byte_range()?.start.get()),
+            ("gain_hid", p.gain_hid.byte_range()?.start.get()),
+            ("gain_out", p.gain_out.byte_range()?.start.get()),
+            ("y", p.y.byte_range()?.start.get()),
+        ] {
+            check_weights_align(what, name, start, WeightAlign::Float4)?;
+        }
+        let post = u32::from(p.hidden == HiddenRow::Post);
+        let args = args_bytes([word(what, "cols", p.cols)?, p.layer, p.eps.to_bits(), post]);
+        encoder.set_pipeline(&self.mtp_join);
+        let mut slot = Bindings::new(encoder);
+        slot.set(Binding::of(&p.emb)?)?;
+        slot.set(Binding::of(&p.hid)?)?;
+        slot.set(Binding::of(&p.gain_emb)?)?;
+        slot.set(Binding::of(&p.gain_hid)?)?;
+        slot.set(Binding::of(&p.gain_out)?)?;
+        slot.set(Binding::of_mut(&p.y)?)?;
+        slot.set(Binding::bytes(args.as_flattened())?)?;
+        slot.set(p.fault.binding())?;
+        slot.dispatch_groups(1, 1, self.router_threads())
+    }
+
     /// Encode the norm of a chunk of rows: one dispatch, a threadgroup a row.
     /// A shape the kernel does not take or a window that is not that shape is
     /// refused by name and nothing is encoded.

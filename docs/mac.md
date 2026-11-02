@@ -166,6 +166,10 @@ flag, `--parallel`, `-ngl`, `--mmproj` and `--flash-attn` among them, is refused
 - One slot: the server runs one sequence. A request keeps the prefix it shares with the slot back to the last
   checkpoint of the model's recurrent state; a checkpoint is taken at each message start, so a follow-up turn reads
   only its new messages. Any other prompt runs from position 0.
+`generate_metal --mtp SIDECAR` (off by default) opens the MTP draft layer of a Qwen3.5-family file beside the model: the folder of
+`mlx-community/Qwen3.8-27B-MTP-4bit` (MLX's folders strip `mtp.*`, so it is a separate download of 239 MB). `--draft-step-times [N]` times N
+draft steps, and `--mtp-check DIR/FAMILY` holds the draft step to a `tools/mlx-logits.py mtp-dump` reference; no draft policy runs yet.
+
 - A long prompt runs in batched passes (flash attention over the pass, the experts over its rows); decode runs one id a
   step.
 - No saved prompt cache across slots, no slot files, no image input (MiniCPM-V's `mmproj` is not read), no speculative
