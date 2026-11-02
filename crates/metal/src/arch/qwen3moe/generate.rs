@@ -259,7 +259,7 @@ pub fn greedy<F>(
 where
     F: FnMut(u32),
 {
-    run(s, &mut Plain, prompt, budget, eog, on_id)
+    greedy_with(s, &mut Plain, prompt, budget, eog, on_id)
 }
 
 /// [`greedy`] over the lookup draft behind the width chooser
@@ -300,16 +300,21 @@ where
     let chained = s.argmax_mode();
     s.set_argmax_mode(StepMode::HostFed)?;
     let mut spec: Speculative<Choosing<Lookup>, 2> = Speculative::new(draft);
-    let out = run(s, &mut spec, prompt, budget, eog, on_id);
+    let out = greedy_with(s, &mut spec, prompt, budget, eog, on_id);
     s.set_argmax_mode(chained)?;
     let mut out = out?;
     out.width = Some(WidthAccount::read(spec.draft_mut(), &out.commits)?);
     Ok(out)
 }
 
-/// The loop of both: `advance`'s prompt call, then the runtime's generation
-/// loop with this module's sink.
-fn run<A, F>(
+/// The loop of every advance over the session — [`greedy`]'s plain step,
+/// [`greedy_lookup`]'s chosen lookup, any draft's `runtime::Speculative`:
+/// `advance`'s prompt call, then the runtime's generation loop with this
+/// module's sink, the ids and the stop cut at `budget` as [`greedy`]'s are.
+///
+/// # Errors
+/// As [`greedy`], and the advance's own.
+pub fn greedy_with<A, F>(
     s: &mut Session,
     advance: &mut A,
     prompt: &[u32],
@@ -338,14 +343,10 @@ where
     };
     let t1 = Instant::now();
     let outcome = runtime::generate(s, advance, prompt, first, &stop.with_eog(eog), &mut sink)?;
-    // A pass of two rows kept at the count's edge may keep one token past it:
-    // the run's ids are the budget's, as the plain run's, and the sink heard
-    // no more.
-    let mut ids = outcome.tokens;
-    ids.truncate(budget);
+    let (ids, stop) = within_budget(outcome.tokens, outcome.stop, budget);
     Ok(Generated {
         ids,
-        stop: outcome.stop,
+        stop,
         prompt_wall,
         decode_wall: t1.elapsed(),
         passes: outcome.passes,
@@ -353,6 +354,21 @@ where
         commits,
         width: None,
     })
+}
+
+/// The ids and the stop a run reports at `budget`, from the loop's `tokens`
+/// and `stop`. A pass of two rows kept at the count's edge may keep one token
+/// past it: the ids are cut to the budget, as the plain run's are, and the
+/// run ended at the count, as the plain run did, whatever the cut id was. The
+/// loop cut its tokens at the first end-of-generation id, so a run over the
+/// budget has none before its last token, and the plain run stops at the
+/// budget before it would pick that one.
+fn within_budget(mut tokens: Vec<u32>, stop: StopReason, budget: usize) -> (Vec<u32>, StopReason) {
+    if tokens.len() > budget {
+        tokens.truncate(budget);
+        return (tokens, StopReason::Length);
+    }
+    (tokens, stop)
 }
 
 /// The caller's sink as the loop's [`PassSink`]: every token a pass keeps,
@@ -483,6 +499,39 @@ mod tests {
                 steps: 1,
                 ..PassTally::default()
             }
+        );
+    }
+
+    /// A run that kept a token past the budget reports the plain run's ids and
+    /// stop: the ids cut to the budget and the count as the reason, whether the
+    /// cut-off token was an end-of-generation id or not; a run at or under the
+    /// budget keeps the loop's own stop, an end-of-generation id at the last id
+    /// included.
+    ///
+    /// Mutant: the loop's stop kept after the cut (`[a, b, eog]` at budget 2
+    /// reported as `eog`), or the cut left off.
+    #[test]
+    fn a_run_past_the_budget_stops_at_the_count_as_the_plain_run_does() {
+        const EOG: u32 = 9;
+        assert_eq!(
+            within_budget(vec![1, 2, EOG], StopReason::Eog, 2),
+            (vec![1, 2], StopReason::Length)
+        );
+        assert_eq!(
+            within_budget(vec![1, 2, 3], StopReason::Length, 2),
+            (vec![1, 2], StopReason::Length)
+        );
+        assert_eq!(
+            within_budget(vec![1, EOG], StopReason::Eog, 2),
+            (vec![1, EOG], StopReason::Eog)
+        );
+        assert_eq!(
+            within_budget(vec![1, 2], StopReason::Length, 2),
+            (vec![1, 2], StopReason::Length)
+        );
+        assert_eq!(
+            within_budget(vec![1, 2], StopReason::Ctx, 4),
+            (vec![1, 2], StopReason::Ctx)
         );
     }
 
