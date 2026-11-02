@@ -572,7 +572,8 @@ fn qwen36_q8_bp_on_a6000_is_idle() {
 fn qwen36_q8_bp_on_two_3090s() {
     assert_eq!(
         qwen36_tier(rtx(0), rtx(1)).expect("two 3090s plan a tier"),
-        (4_580, 0, 5_660),
+        // PIN(2026-11-02): was (4_580, 0, 5_660); each GDN layer's carry and lane stamp are on the card.
+        (4_578, 0, 5_662),
         "stage, host, tier"
     );
 }
