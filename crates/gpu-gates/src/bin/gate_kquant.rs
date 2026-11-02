@@ -102,6 +102,11 @@
 //!     sum kept; its launcher refuses a shared gate among the routed slots
 //!     or past the pitch. No token, short weights and a short output are covered
 //!     by `card_slots::tests::hw_the_card_sum_launchers_refuse_invalid_shapes`.
+//!     A tier layer's join (`q38_card_tier_acc`), the three host slots on an
+//!     expert tier, their F32 rows packed at the ranks `q38_tier_rank` gives,
+//!     is the card sum of all ten slots on one card (the union's), bit for
+//!     bit, no fault: over BF16 card rows (`_bf16`) the union's sum over the
+//!     BF16 rows, over F32 card rows over the F32 rows.
 //! 11. q8_0_sel32: the Q8_0 down `_sel` of 32-value blocks
 //!     (`bloomery_gpu::q8_0_sel32`, the file's `block_q8_0` bytes resident as
 //!     one word stream) over clause 7's seven experts and ten slots, at the
@@ -2402,6 +2407,7 @@ mod gate {
         );
         ok &= check_q38_card_places(c, &mut leg, &h)?;
         ok &= leg.check_hostless(c)?;
+        ok &= leg.check_tier_join(c)?;
         ok &= check_q38_card_host_contract(c, &mut leg)?;
         Ok(ok)
     }

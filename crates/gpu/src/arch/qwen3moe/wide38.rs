@@ -38,8 +38,10 @@
 //!   layer with card experts (`q38_card_shared_add`); on a layer without a
 //!   host leg the shared expert runs first and each run's card sum is the
 //!   block's output with its gated rows added (`card_sum_join`),
-//!   no acc, no host sum and nothing left for the back; when every layer
-//!   runs so, the down rows of every down type are BF16 (`Down38`);
+//!   no acc, no host sum and nothing left for the back; when every expert
+//!   of every layer runs on a card, the stage card's or the tier's, and no
+//!   host leg is kept, the down rows of every down type are BF16 (`Down38`,
+//!   `card_slots::DownStore`);
 //! - the selecting layer's rows the prefill flash while `qsa::scored` says a
 //!   row selects nothing (every key below its count), the selection and the
 //!   prefill flash over each row's list in runs of the arena's selection rows
@@ -133,10 +135,12 @@
 //! unit and sums nothing; the back, once the host has seen the tier's service
 //! complete ([`BatchLeg::join_tiered`]), ranks the same places
 //! (`q38_tier_rank`) and sums the card's and the tier's slots in slot order
-//! (`q38_card_tier_acc`),
-//! then the host sums are uploaded and combined as on any card layer. With
-//! the union of both cards' experts on one card the same launches read the
-//! same values in the same order, so the two loads agree bit for bit. A slot
+//! (`q38_card_tier_acc`, the tier's F32 rows rounded to BF16 there when the
+//! card's are BF16), then the host sums are uploaded and combined as on any
+//! card layer. With the union of both cards' experts on one card the same
+//! launches read the same values in the same order, so the two loads agree
+//! bit for bit: the down rows' form is read from the whole map
+//! (`card_slots::DownStore`), which the two loads share. A slot
 //! map with an expert on a tier card on a load that hung no tier is refused
 //! by name at the walk's entry (`card38`), before anything moves.
 //!
@@ -190,7 +194,7 @@ use super::scratch38::{Arena38, Ple38, ROUTE_ROWS, Store38, final_res, no_carry}
 use super::tier38::TierSide38;
 use crate::GpuError;
 use crate::card_leg::{RouteBlock, RouteW, StackW, with_ring};
-use crate::card_slots::{CardAcc, CardJoin, DownRows, SharedJoin};
+use crate::card_slots::{CardAcc, CardJoin, DownRows, DownStore, SharedJoin};
 use crate::fault::{FaultSink, LAYER_HEAD};
 use crate::flash_gqa::GqaListArgs;
 use crate::flash_gqa_prefill::QueryNorm;
@@ -833,10 +837,12 @@ pub(super) enum CardSum<'b> {
     },
 }
 
-/// A card route's down rows ([`CardRoute38`]'s): BF16 bits on a load whose
-/// every layer runs without a host leg, which the down product of every type
-/// stores (`enqueue_gemm32_bf16`) and the block's card sum reads
-/// (`card_sum_join_bf16`); F32 on any other load.
+/// A card route's down rows ([`CardRoute38`]'s), in the load's
+/// [`Card38::down_store`]: BF16 bits on a load whose every expert runs on a
+/// card and that keeps no host leg, which the down product of every type
+/// stores (`enqueue_gemm32_bf16`) and the block's card sum
+/// (`card_sum_join_bf16`) and a tier layer's join (`q38_card_tier_acc_bf16`)
+/// read; F32 on any other load.
 enum Down38 {
     F32(DeviceBuffer<f32>),
     Bf16(DeviceBuffer<u16>),
@@ -1052,7 +1058,7 @@ impl CardRoute38 {
                 card.routed_types().map(|(_, down)| down),
             )?
         };
-        let bf16_down = !tiered && card.all_hostless();
+        let bf16_down = card.down_store() == DownStore::Bf16;
         let fused = act.has_native_form() && card.blocks32_gate_up() && all_nvfp4;
         let product_cells = if fused { 0 } else { slots * geo::FF };
         Ok(CardRoute38 {
@@ -1497,7 +1503,9 @@ impl CardRoute38 {
     /// their ranks, which `q38_tier_rank` takes first over the same places
     /// the tier ranked — in slot order by the router's `weights` (eleven a
     /// token) into the unit's `acc`, which the back's combine reads as it
-    /// reads the card sum. Two launches. A route made for no tier is refused
+    /// reads the card sum. Over BF16 card rows the tier's rows are read
+    /// rounded as the card's store rounds them (`q38_card_tier_acc_bf16`).
+    /// Two launches. A route made for no tier is refused
     /// by name.
     #[allow(
         clippy::too_many_arguments,
@@ -1525,7 +1533,7 @@ impl CardRoute38 {
         c.k.q38.enqueue_card_tier_acc(
             stream,
             CardTierAccArgs {
-                down: self.down.rows().f32(WHAT)?,
+                down: self.down.rows(),
                 trows,
                 w: weights,
                 sel: &self.sel,
