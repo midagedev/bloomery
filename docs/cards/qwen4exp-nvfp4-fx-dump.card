@@ -1,0 +1,28 @@
+# The Qwen3.8-Flash-Next NVFP4 oracle's dump of the fixture cut (/models/fixtures/qwen38nvfp4, four layers) through
+# `just dump-ref-qwen4exp-nvfp4 IDS` in the fixture tier (tools/ref/qwen4exp-nvfp4-oracle.py), run inside tools/ref/lease-hold.sh
+# so a CPU-bound torch f32 forward on every core never shares the box with a timed run. It writes the four sets of refset
+# family fx-hf-qwen4exp-nvfp4 (fx_hf-qwen4exp-nvfp4/hf_qwen4exp_nvfp4{,_d3k,_bf16,_d3k_bf16}), none of which is on the box yet.
+# Predicted wall [derived from the config of the cut, text_config of its config.json: hidden 2560, 512 routed experts of 640
+# with 10 a token, one shared expert of 640, layers linear, linear, linear, full; the rates are the term derivation does not fix]:
+#   read     the cut's layers hold 2.52 G routed values each at 0.5 B plus scales, ~1.4 GB a layer, ~5.7 GB over four layers, the
+#            embedding and head 2.5 GB, the PLE rows only the ones the ids hash to (the 52.8 GB shard is the PLE table, never
+#            read whole): ~9 GB from /models (nvme0) at 3-5 GB/s: 2-3 s, under the compute
+#   dequant  2.52 G values a layer: 0.5-1.9 s a layer at 1.3-5 G values/s (the rate the mm31 dump's card names), twice at most (the
+#            q8 and bf16 arms) over four layers: 4-15 s
+#   gemm     3,001-token d3k arms (two) and the 5-token batch arms: ~110-180 MMAC a token a layer (routed 49, shared 4.9, router
+#            1.3, the layer's mixer or attention 50-60, scores up to 18) = 0.66-1.1 TFLOP a layer and arm, x 4 layers x 2 arms
+#            = 5.3-8.6 TFLOP; the routed share is a loop of ~59-token gemms (3,001 x 10 / 512) at a lower rate; the all-position
+#            logits metric 3,000 x 0.64 G MAC = 3.8 TFLOP an arm x 2 = 7.6 TFLOP: ~13-16 TFLOP at 0.3-1.5 TFLOP/s: 10-50 s
+#   other    transformers' torch fallback of the gated delta rule (a Python loop over 47 chunks of 64, 48 heads) in the three
+#            linear layers, the hyper-connection mixer over four streams, the taps' rows written: the term under the margin below
+#   total    1.5-6 min derived, 2-15 min held (the margin is the transformers eager paths, the one term not fixed).
+# What the run guarantees: the lease held through the oracle's life, the python is /home/user/nvfp4ref-venv's (transformers at
+# 4c414256, the oracle's TRANSFORMERS_REV), the ids file is the 3,001 ids of ref_qwen4exp_d3k's own `# tokens` line, and the
+# sets are written under a directory that is not there yet (the oracle writes a set's MANIFEST.tsv last, with its `# complete`
+# trailer).
+kind: exclusive
+reason: the oracle runs a torch f32 forward on every CPU core (the dequantized weights of one layer, 10 GB, resident) and
+  reads the cut through the page cache; beside a timed run or a gate batch it would take their cores and evict their page
+  cache, so it holds the lease; why now: the four sets of fx-hf-qwen4exp-nvfp4 are not on the box, and gate-refset is red on
+  each of them
+minutes: 2..15
