@@ -675,6 +675,7 @@ impl<'s> PassProgram<'s> {
         } = &mut *self.b;
         let rows = RoutedRows {
             probs,
+            logits: None,
             ids: &mut *ids,
             weights: &mut *weights,
         };

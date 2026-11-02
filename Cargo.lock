@@ -87,6 +87,7 @@ dependencies = [
  "bloomery-gpu-glm5next",
  "bloomery-gpu-mimo2",
  "bloomery-gpu-minimaxm3",
+ "bloomery-gpu-mistrallarge4",
  "bloomery-gpu-solar2",
  "bloomery-levers",
  "bloomery-model",
@@ -349,7 +350,7 @@ dependencies = [
  "bloomery-gpu-deepseek41",
  "bloomery-levers",
  "bloomery-model",
- "bloomery-models",
+ "bloomery-runtime",
  "cuda-core",
 ]
 

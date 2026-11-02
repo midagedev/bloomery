@@ -124,6 +124,14 @@ gate-gpu-nemotron-h-moe-e2e	family	nemotron_h_moe	e2e	graph_fault+recur_mamba2+q
 gate-gpu-nemotron-h-moe-serve	family	nemotron_h_moe	serve	seats_serve_engine
 gate-gpu-musespark-e2e	family	muse-spark	e2e	graph_fault+attn_gqa+moe_route+quant_iq+elem_kernels+tier_legs+placement_sizing
 gate-gpu-mistrallarge4-e2e	family	mistral-large4	e2e	graph_fault+attn_latent_mla+attn_ds41_csa_hca+moe_route+quant_iq+elem_kernels+tier_legs+placement_sizing
+gate-gpu-mistrallarge4-load	family	mistral-large4	load	weights_load+placement_sizing+tier_legs
+gate-gpu-mistrallarge4-dspark	family	mistral-large4	draft	drafts_dspark
+gate-gpu-mistrallarge4-prefill	family	mistral-large4	e2e	prompt_walks
+gate-gpu-mistrallarge4-verify	family	mistral-large4	draft	drafts_mtp+tier_legs
+gate-gpu-mistrallarge4-serve	family	mistral-large4	serve	seats_serve_engine
+gate-gpu-mistrallarge4-twocard	family	mistral-large4	tier	tier_legs+placement_sizing
+gate-gpu-mistrallarge4-residency	family	mistral-large4	residency	residency+tier_legs+placement_sizing
+gate-gpu-mistrallarge4-xstream	family	mistral-large4	residency	residency+prompt_walks+tier_legs+placement_sizing
 gate-gpu-musespark-prefill	family	muse-spark	e2e	prompt_walks
 gate-gpu-musespark-load	family	muse-spark	load	weights_load+placement_sizing+tier_legs
 gate-gpu-musespark-serve	family	muse-spark	serve	seats_serve_engine
@@ -144,6 +152,7 @@ gate-gpu-p6	common		kernel	moe_route
 gate-gpu-p8	family	deepseek2	e2e	graph_fault+moe_route+weights_load
 gate-gpu-p8b	family	deepseek2	e2e	graph_fault+moe_route+weights_load
 gate-gpu-p9	common		kernel	moe_route
+gate-gpu-pixtral-tower	family	mistral-large4	media	serve_media
 gate-gpu-ple	common		kernel	ple_embed
 gate-gpu-q4k-sel	common		kernel	quant_q4k
 gate-gpu-q6k-ids	common		kernel	quant_q6k

@@ -1,6 +1,7 @@
 //! The image-input oracle sets of the seats whose tower llama.cpp mainline's mtmd runs
 //! (`tools/ref/clefvis/dump_mtmd.cpp`): the Qwen3-VL seats' `qwen3vl_merger` (Clef-Flash's qwen35 on
-//! its Q8_0 file, Qwen3.6's qwen35moe, Qwen3.8's qwen4exp) and GLM-5.3-Flash's `glm5v`, each with its
+//! its Q8_0 file, Qwen3.6's qwen35moe, Qwen3.8's qwen4exp), GLM-5.3-Flash's `glm5v`, Nemotron 3.5 Bolt's
+//! `nemotron_omni` and Mistral Large 4's `pixtral`, each with its
 //! text model, written in the node-dump set format (`tools/ref/dump_ref.cpp`), so a family's identity
 //! check ([`crate::arch::qwen35::clefvis`], [`crate::arch::qwen35moe::vis`],
 //! [`crate::arch::qwen4exp::vis`], [`crate::arch::glm5next::vis`], through [`RefManifest::open`])
@@ -23,7 +24,7 @@
 //!   [`tap_names`], and `<name>/embd`, the final embeddings `[n_embd, tokens]`;
 //!   a set tapped [`TapScope::Final`] holds `embd` and the layout's output-end nodes
 //!   ([`ProjectorKind::final_taps`]: [`POST_LN`], or [`VIT_OUT`], [`AFTER_FC_PROJ`] and
-//!   [`AFTER_FFN_PROJ`]) of every image.
+//!   [`AFTER_FFN_PROJ`], or [`PIXTRAL_VIT_OUT`]) of every image.
 //! - [`Kind::Hidden`], [`Kind::Prose`] and [`Kind::Bf16Rows`] (sets C, C′, C″):
 //!   one prompt's `result_norm` of every position `[n_embd, ids]` and the
 //!   positions the decode was fed, `mrope_pos` `[3, ids]` (t, y, x) or, under `# positions normal`,
@@ -116,6 +117,10 @@ pub enum ProjectorKind {
     /// no output-end nodes but [`EMBD`]; a tower tapped in full holds [`RADIO_POS`] and the `cb()` nodes of
     /// [`RADIO_TAP_BLOCKS`], whose rows are the class and register rows ([`RADIO_PREFIX_ROWS`]) and then the patches.
     NemotronOmni,
+    /// mtmd's `pixtral` (Mistral Large 4's Pixtral tower): patch-size times merge-size pixel tokens, normal positions, an
+    /// `[IMG_BREAK]` row after each row of tokens but the last among an image's rows ([`ProjectorKind::rows`]), the
+    /// [`PIXTRAL_VIT_OUT`] output end.
+    Pixtral,
 }
 
 /// How the decoder numbers the rows of a prompt.
@@ -145,6 +150,7 @@ impl ProjectorKind {
             ProjectorKind::Qwen3vlMerger => "qwen3vl_merger",
             ProjectorKind::Glm5v => "glm5v",
             ProjectorKind::NemotronOmni => "nemotron_omni",
+            ProjectorKind::Pixtral => "pixtral",
         }
     }
 
@@ -153,7 +159,9 @@ impl ProjectorKind {
     pub fn positions(self) -> PositionKind {
         match self {
             ProjectorKind::Qwen3vlMerger => PositionKind::Mrope,
-            ProjectorKind::Glm5v | ProjectorKind::NemotronOmni => PositionKind::Normal,
+            ProjectorKind::Glm5v | ProjectorKind::NemotronOmni | ProjectorKind::Pixtral => {
+                PositionKind::Normal
+            }
         }
     }
 
@@ -163,6 +171,19 @@ impl ProjectorKind {
             ProjectorKind::Qwen3vlMerger => "<|image_pad|>",
             ProjectorKind::Glm5v => "<|image|>",
             ProjectorKind::NemotronOmni => "<image>",
+            ProjectorKind::Pixtral => "[IMG]",
+        }
+    }
+
+    /// The rows an image of `nx` by `ny` tokens hands the text model: its tokens, and in a `pixtral` tower the
+    /// `[IMG_BREAK]` row after each of its `ny` rows of tokens but the last (mtmd's `p_total + p_y - 1`).
+    #[must_use]
+    pub fn rows(self, nx: usize, ny: usize) -> usize {
+        match self {
+            ProjectorKind::Pixtral => nx * ny + ny.saturating_sub(1),
+            ProjectorKind::Qwen3vlMerger | ProjectorKind::Glm5v | ProjectorKind::NemotronOmni => {
+                nx * ny
+            }
         }
     }
 
@@ -173,6 +194,7 @@ impl ProjectorKind {
             ProjectorKind::Qwen3vlMerger => &[POST_LN],
             ProjectorKind::Glm5v => &[VIT_OUT, AFTER_FC_PROJ, AFTER_FFN_PROJ],
             ProjectorKind::NemotronOmni => &[],
+            ProjectorKind::Pixtral => &[PIXTRAL_VIT_OUT],
         }
     }
 
@@ -191,7 +213,7 @@ impl ProjectorKind {
         match self {
             ProjectorKind::Qwen3vlMerger => tap_names(),
             ProjectorKind::NemotronOmni => radio_tap_names(),
-            ProjectorKind::Glm5v => Vec::new(),
+            ProjectorKind::Glm5v | ProjectorKind::Pixtral => Vec::new(),
         }
     }
 }
@@ -219,11 +241,11 @@ impl Projector {
         image_max_pixels: None,
     };
 
-    /// How far an image of `nx` by `ny` tokens advances the decoder's position.
+    /// How far an image of `nx` by `ny` tokens advances the decoder's position: one a row under normal positions.
     fn n_pos(&self, nx: usize, ny: usize) -> usize {
         match self.kind.positions() {
             PositionKind::Mrope => nx.max(ny),
-            PositionKind::Normal => nx * ny,
+            PositionKind::Normal => self.kind.rows(nx, ny),
         }
     }
 }
@@ -274,6 +296,10 @@ pub const AFTER_FC_PROJ: &str = "after_fc_proj";
 
 /// The `glm5v` tower's output end, `[n_embd, tokens]`.
 pub const AFTER_FFN_PROJ: &str = "after_ffn_proj";
+
+/// The `pixtral` tower's last block output (`layer_out` of block 29, before the projector's input norm),
+/// `[vit width, merge² x tokens]`, patches in the raster order of the patch grid.
+pub const PIXTRAL_VIT_OUT: &str = "layer_out-29";
 
 /// The final embeddings of the clean pass (`mtmd_get_output_embd`).
 pub const EMBD: &str = "embd";
@@ -904,7 +930,7 @@ impl ClefvisSet {
             if !seen.insert(&i.name) {
                 return Err(RefError::malformed(&at, format!("image {} twice", i.name)));
             }
-            if i.nx * i.ny != i.n_tokens
+            if self.projector.kind.rows(i.nx, i.ny) != i.n_tokens
                 || i.best_w != i.nx * self.projector.align
                 || i.best_h != i.ny * self.projector.align
                 || i.n_pos != self.projector.n_pos(i.nx, i.ny)
@@ -1019,11 +1045,13 @@ impl ClefvisSet {
         })
     }
 
-    /// Node `n` of image `i` has the shape its layout gives it: a whole row per patch in a `qwen3vl_merger` tower, and
-    /// in a `glm5v` one `merge * merge` rows a token for [`VIT_OUT`] and `[n_embd, tokens]` for the merged nodes.
+    /// Node `n` of image `i` has the shape its layout gives it: a whole row per patch in a `qwen3vl_merger` tower, in a
+    /// `glm5v` one `merge * merge` rows a token for [`VIT_OUT`] and `[n_embd, tokens]` for the merged nodes, and in a
+    /// `pixtral` one `merge * merge` rows a token of the `nx` by `ny` grid (its break rows are no patches') for
+    /// [`PIXTRAL_VIT_OUT`].
     fn check_tap_shape(&self, i: &Image, n: &str, ne: [u64; 4]) -> Result<(), RefError> {
         let tokens = i.n_tokens as u64;
-        let patches = (self.projector.merge as u64).pow(2) * tokens;
+        let patches = (self.projector.merge as u64).pow(2) * (i.nx * i.ny) as u64;
         let n_embd = self.profile.n_embd as u64;
         let (ok, refusal) = match (self.projector.kind, n) {
             (ProjectorKind::Qwen3vlMerger, _) => (
@@ -1048,6 +1076,14 @@ impl ClefvisSet {
                     "want {RADIO_WIDTH} values for each of the {} rows ({RADIO_PREFIX_ROWS} prefix rows and {patches} patches)",
                     patches + RADIO_PREFIX_ROWS
                 ),
+            ),
+            (ProjectorKind::Pixtral, PIXTRAL_VIT_OUT) => (
+                ne[1..] == [patches, 1, 1],
+                format!("want [width, {patches}, 1, 1]"),
+            ),
+            (ProjectorKind::Pixtral, _) => (
+                ne == [n_embd, tokens, 1, 1],
+                format!("want [{n_embd}, {tokens}, 1, 1]"),
             ),
         };
         if ok {
@@ -1299,9 +1335,10 @@ fn read_projector(man: &RefManifest) -> Result<Option<Projector>, RefError> {
         "qwen3vl_merger" => ProjectorKind::Qwen3vlMerger,
         "glm5v" => ProjectorKind::Glm5v,
         "nemotron_omni" => ProjectorKind::NemotronOmni,
+        "pixtral" => ProjectorKind::Pixtral,
         other => {
             return Err(bad(&format!(
-                "{other:?} is none of qwen3vl_merger, glm5v and nemotron_omni"
+                "{other:?} is none of qwen3vl_merger, glm5v, nemotron_omni and pixtral"
             )));
         }
     };

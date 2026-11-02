@@ -22,7 +22,8 @@
 //! F32 product's body (`crate::gemm`'s `f32_tile_body`, which keeps every
 //! lane sum and the butterfly of the row walk) over the router's rows, so
 //! the two ubatch launches leave each token's logits, ids and weights bit
-//! for bit what the fused launch leaves for it. The
+//! for bit what the fused launch leaves for it; over a prompt unit's
+//! [`RoutedRows`] they run as [`RouterKernels::enqueue_rows`]. The
 //! fused gemv is `q8f32::f32_gemv`'s row body — one warp per expert row,
 //! `f32_lane_partials`' sum (at one token the same sum through
 //! `f32_lane_partial_1col_w32`, which keeps 32 chunks' loads in flight) and
@@ -61,20 +62,23 @@ use crate::cores::l2_prefetch;
 use crate::elem::{RMS_THREADS, RMS_WARPS, rms_partial_sq, rms_scale, rms_warp_tree};
 use crate::fault::{FaultSink, FaultSite, quad_finite};
 use crate::gemm::{
-    F32Rows, F32T_THREADS_U32, GEMM_MAX_SLOTS, STAGE_FLOATS, STAGES, f32_tile_body, tile_launch,
+    F32Rows, F32T_THREADS_U32, GEMM_MAX_SLOTS, Gemm32Kernels, STAGE_FLOATS, STAGES, f32_tile_body,
+    tile_launch,
 };
 use crate::q8_1_quant_vals;
 use crate::q8f32::{f32_lane_partial_1col_w32, f32_lane_partials, gemv_lane_sums};
 use crate::route_core::take;
+use crate::routed_block::{RouteIn, RoutedRows, RouterEntry};
 use crate::tensor::{DeviceTensor, Q8Act};
-use crate::{GpuError, launch_u32, store_cols};
+use crate::{Gpu, GpuError, launch_u32, short, store_cols};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
 use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, threadfence, warp,
 };
 use cuda_host::cuda_module;
-use model::arch::models::shape::{self, RouterBody, RouterInst, rules};
+use model::arch::models::Score;
+use model::arch::models::shape::{self, MoeShape, RouterBody, RouterInst, rules};
 use std::sync::Arc;
 
 pub use chain::router::RouterDims;
@@ -1354,18 +1358,39 @@ impl RouterBufs {
         body: RouterBody,
         per_lane: Option<u32>,
     ) -> Result<u32, GpuError> {
-        let inst = self.dims.inst();
-        if inst.body != body || per_lane.is_some_and(|w| w != inst.per_lane()) {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "buffers cut for {}; this launch runs another router",
-                    inst.at
-                ),
-            ));
-        }
-        launch_u32(what, "used", self.dims.used())
+        used_of(self.dims, what, (body, per_lane))
     }
+}
+
+/// `dims`' picks as the launch argument, after its body is `body` (and, when
+/// `per_lane` is given, its width): a launcher's refusal of dims cut for
+/// another router, named `what`.
+fn used_of(
+    dims: RouterDims,
+    what: &'static str,
+    (body, per_lane): (RouterBody, Option<u32>),
+) -> Result<u32, GpuError> {
+    let inst = dims.inst();
+    if inst.body != body || per_lane.is_some_and(|w| w != inst.per_lane()) {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "buffers cut for {}; this launch runs another router",
+                inst.at
+            ),
+        ));
+    }
+    launch_u32(what, "used", dims.used())
+}
+
+/// The buffers of a ubatch's two launches: the logits the first writes and
+/// the second reads, and the probabilities, ids and weights the second
+/// writes. [`RouterBufs`]' or a unit's [`RoutedRows`].
+struct RowBufs<'a> {
+    logits: &'a mut DeviceBuffer<f32>,
+    probs: &'a mut DeviceBuffer<f32>,
+    ids: &'a mut DeviceBuffer<u32>,
+    weights: &'a mut DeviceBuffer<f32>,
 }
 
 /// The loaded router module. Owns no stream: each enqueue takes the engine
@@ -1481,6 +1506,86 @@ impl RouterKernels {
                 ),
             ));
         }
+        self.enqueue_logits(stream, what, (w, x, n), &mut out.logits)?;
+        self.enqueue_route(stream, n, fault, out)
+    }
+
+    /// Enqueue the router of a prompt unit's `n` rows into `rows` in the two
+    /// launches of [`RouterKernels::enqueue_ubatch`], over the unit's buffers
+    /// instead of [`RouterBufs`]: `w` the router weight as f32 ([`WIDTH`]
+    /// rows of `k`, `k` a positive multiple of 64), `x` the rows' `n` columns
+    /// of `k` normed activations, both 16-byte aligned, `dims` the router's
+    /// (a softmax row of [`WIDTH`] experts). The logits go to `rows.logits`
+    /// (refused by name when `None`), each row's probabilities, ids and
+    /// weights to the rows of `rows` where `n` one-token
+    /// [`RouterKernels::enqueue_fused`] launches write them, bit for bit; a
+    /// buffer shorter than `n` rows is refused by name and the rows past `n`
+    /// are untouched. A row with a non-finite logit raises
+    /// [`FaultSite::Router`] on `fault`. Asynchronous, allocation-free,
+    /// capturable.
+    pub fn enqueue_rows(
+        &self,
+        stream: &CudaStream,
+        (w, x, n): (&DeviceTensor<f32>, &DeviceBuffer<f32>, usize),
+        dims: RouterDims,
+        fault: FaultSink,
+        rows: RoutedRows<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "route_softmax::enqueue_rows";
+        let used = used_of(dims, what, (RouterBody::Softmax, Some(PER_LANE as u32)))?;
+        let RoutedRows {
+            probs,
+            logits,
+            ids,
+            weights,
+        } = rows;
+        let logits = logits.ok_or(GpuError::State {
+            what,
+            missing: "the rows' logits buffer (RoutedRows::logits)",
+        })?;
+        launch_u32(what, "n", n)?;
+        if n == 0 || w.rows() != WIDTH {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "router weight is {} x {}, want {WIDTH} rows; {n} rows, at least one",
+                    w.rows(),
+                    w.cols()
+                ),
+            ));
+        }
+        // `n` fits `u32`, so the products below fit `usize`.
+        short(
+            what,
+            &[
+                ("logits", logits.len(), n * WIDTH),
+                ("probs", probs.len(), n * WIDTH),
+                ("ids", ids.len(), n * used as usize),
+                ("weights", weights.len(), n * used as usize),
+            ],
+        )?;
+        self.enqueue_logits(stream, what, (w, x, n), logits)?;
+        let bufs = RowBufs {
+            logits,
+            probs,
+            ids,
+            weights,
+        };
+        self.enqueue_pick(stream, what, (n, used), fault, bufs)
+    }
+
+    /// `softmax_router_logits` over the first `n` columns of `x` into
+    /// `logits`, named `what`: the launch's checks the caller has not made —
+    /// `w` 16-byte aligned, `k` a positive multiple of 64, `x` holding `n`
+    /// columns of `k` 16-byte aligned, `logits` holding `n` rows. The caller
+    /// has checked `w` is [`WIDTH`] rows and `n` positive.
+    fn enqueue_logits(
+        &self,
+        stream: &CudaStream,
+        what: &'static str,
+        (w, x, n): (&DeviceTensor<f32>, &DeviceBuffer<f32>, usize),
+        logits: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
         let w_at = w.buf().cu_deviceptr();
         if !w_at.is_multiple_of(16) {
             return Err(GpuError::shape(
@@ -1488,13 +1593,44 @@ impl RouterKernels {
                 format!("router weight at {w_at:#x} must be 16-byte aligned"),
             ));
         }
-        let t = tile_launch(what, WIDTH, k, x, n, &out.logits)?;
+        let t = tile_launch(what, WIDTH, w.cols(), x, n, &*logits)?;
         let prep = self
             .module
             .prepare_softmax_router_logits(LaunchConfig1D::new(t.grid, F32T_THREADS_U32, 0))?;
         self.module
-            .softmax_router_logits(stream, &prep, w.buf(), x, t.k, t.n, &mut out.logits)?;
-        self.enqueue_route(stream, n, fault, out)
+            .softmax_router_logits(stream, &prep, w.buf(), x, t.k, t.n, logits)?;
+        Ok(())
+    }
+
+    /// `softmax_router_route` over the first `n` tokens' logits in
+    /// `bufs.logits`, `used` picks a token, named `what`: warp `w` of block
+    /// `b` routes token `8·b + w`. The caller has checked `used` and that
+    /// `bufs` hold `n` tokens.
+    fn enqueue_pick(
+        &self,
+        stream: &CudaStream,
+        what: &'static str,
+        (n, used): (usize, u32),
+        fault: FaultSink,
+        bufs: RowBufs<'_>,
+    ) -> Result<(), GpuError> {
+        let n_tok = launch_u32(what, "n", n)?;
+        let grid = launch_u32(what, "grid", n.div_ceil(FUSED_WARPS))?;
+        let prep = self
+            .module
+            .prepare_softmax_router_route(LaunchConfig1D::new(grid, FUSED_THREADS_U32, 0))?;
+        self.module.softmax_router_route(
+            stream,
+            &prep,
+            &*bufs.logits,
+            n_tok,
+            used,
+            bufs.probs,
+            bufs.ids,
+            bufs.weights,
+            fault,
+        )?;
+        Ok(())
     }
 
     /// Enqueue the routing alone of the first `n` (1..=`out.tokens()`)
@@ -1519,23 +1655,13 @@ impl RouterKernels {
                 format!("{n} tokens into buffers for {}", out.tokens),
             ));
         }
-        let n_tok = launch_u32(what, "n", n)?;
-        let grid = launch_u32(what, "grid", n.div_ceil(FUSED_WARPS))?;
-        let prep = self
-            .module
-            .prepare_softmax_router_route(LaunchConfig1D::new(grid, FUSED_THREADS_U32, 0))?;
-        self.module.softmax_router_route(
-            stream,
-            &prep,
-            &out.logits,
-            n_tok,
-            used,
-            &mut out.probs,
-            &mut out.ids,
-            &mut out.weights,
-            fault,
-        )?;
-        Ok(())
+        let bufs = RowBufs {
+            logits: &mut out.logits,
+            probs: &mut out.probs,
+            ids: &mut out.ids,
+            weights: &mut out.weights,
+        };
+        self.enqueue_pick(stream, what, (n, used), fault, bufs)
     }
 
     /// Enqueue the FFN norm and the router of one token in one launch
@@ -1776,5 +1902,398 @@ impl RouterKernels {
             )?;
         }
         Ok(())
+    }
+}
+
+/// The softmax router as the common routed block takes it ([`RouterEntry`]):
+/// [`WIDTH`] experts, the top `USED` by softmax probability with the kept
+/// probabilities renormalized to sum one, no selection bias and no scale. A
+/// token's launch is [`RouterKernels::enqueue_fused`], a unit's rows'
+/// [`RouterKernels::enqueue_rows`] over [`RoutedRows::logits`]. A layer that
+/// gives a bias, or a file whose scale is not one, is refused by name at the
+/// launch: the body applies neither.
+pub struct SoftmaxEntry<const USED: usize> {
+    kernels: RouterKernels,
+    dims: RouterDims,
+}
+
+impl<const USED: usize> SoftmaxEntry<USED> {
+    /// The router's dims, [`WIDTH`] experts and the top `USED`; a pick count
+    /// the body does not serve is refused as `what`.
+    fn dims(what: &'static str) -> Result<RouterDims, GpuError> {
+        RouterDims::of(MoeShape {
+            rule: rules::SOFTMAX_NORM,
+            experts: WIDTH as u32,
+            top_k: USED as u32,
+        })
+        .map_err(|e| GpuError::plan(what, e))
+    }
+
+    /// The launch's refusal of a bias or a scale the body does not apply,
+    /// named `what`.
+    fn refuse_unapplied(what: &'static str, r: &RouteIn<'_>) -> Result<(), GpuError> {
+        if r.bias.is_some() {
+            return Err(GpuError::shape(
+                what,
+                "the softmax router selects by probability alone; the layer gives a selection bias",
+            ));
+        }
+        if r.scale.to_bits() != 1.0f32.to_bits() {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "the softmax router applies no scale; the file's is {}",
+                    r.scale
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl<const USED: usize> RouterEntry for SoftmaxEntry<USED> {
+    const N_EXPERT: usize = WIDTH;
+    const N_USED: usize = USED;
+    const OPTIONAL_BIAS: bool = true;
+    const SCORE: Score = Score::Softmax;
+    const ROW_LOGITS: bool = true;
+    type Out = RouterOut;
+
+    fn load(ctx: &Arc<CudaContext>) -> Result<Self, GpuError> {
+        Ok(SoftmaxEntry {
+            kernels: RouterKernels::load(ctx)?,
+            dims: Self::dims("route_softmax::SoftmaxEntry::load")?,
+        })
+    }
+
+    fn new_out(stream: &CudaStream) -> Result<RouterOut, GpuError> {
+        let dims = Self::dims("route_softmax::SoftmaxEntry::new_out")?;
+        RouterBufs::with_tokens(stream, dims, 1)
+    }
+
+    fn out_ids(out: &RouterOut) -> &DeviceBuffer<u32> {
+        &out.ids
+    }
+
+    fn out_weights(out: &RouterOut) -> &DeviceBuffer<f32> {
+        &out.weights
+    }
+
+    fn out_bytes(out: &RouterOut) -> usize {
+        out.bytes()
+    }
+
+    fn route(
+        &self,
+        stream: &CudaStream,
+        x: &DeviceBuffer<f32>,
+        r: &RouteIn<'_>,
+        out: &mut RouterOut,
+    ) -> Result<(), GpuError> {
+        Self::refuse_unapplied("route_softmax::SoftmaxEntry::route", r)?;
+        self.kernels.enqueue_fused(stream, r.w, x, 1, r.fault, out)
+    }
+
+    /// The rows in the ubatch's two launches over the unit's buffers
+    /// ([`RouterKernels::enqueue_rows`]): the logits to `rows.logits`, which
+    /// a call without is refused by name.
+    fn route_rows(
+        &self,
+        (stream, _, _): (&CudaStream, &Gpu, &Gemm32Kernels),
+        x: &DeviceBuffer<f32>,
+        r: &RouteIn<'_>,
+        t: usize,
+        rows: RoutedRows<'_>,
+    ) -> Result<(), GpuError> {
+        Self::refuse_unapplied("route_softmax::SoftmaxEntry::route_rows", r)?;
+        self.kernels
+            .enqueue_rows(stream, (r.w, x, t), self.dims, r.fault, rows)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const K: usize = 256;
+
+    /// The next seeded value in [-1, 1).
+    fn draw(s: &mut u32) -> f32 {
+        *s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (*s >> 8) as f32 / 8_388_608.0 - 1.0
+    }
+
+    /// The rule's picks for one token on the host in f64: the top `used` of
+    /// the softmax over the logits, ties to the smaller id, and their
+    /// probabilities over the kept sum.
+    fn host_picks(w: &[f32], x: &[f32], used: usize) -> (Vec<u32>, Vec<f64>) {
+        let logits: Vec<f64> = w
+            .chunks(K)
+            .map(|row| {
+                row.iter()
+                    .zip(x)
+                    .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                    .sum()
+            })
+            .collect();
+        let max = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let probs: Vec<f64> = logits.iter().map(|l| (l - max).exp()).collect();
+        let mut order: Vec<usize> = (0..probs.len()).collect();
+        order.sort_by(|&a, &b| probs[b].total_cmp(&probs[a]).then(a.cmp(&b)));
+        let ids: Vec<u32> = order[..used].iter().map(|&i| i as u32).collect();
+        let kept: f64 = order[..used].iter().map(|&i| probs[i]).sum();
+        let weights = order[..used].iter().map(|&i| probs[i] / kept).collect();
+        (ids, weights)
+    }
+
+    /// The entry as the common routed block calls it, at the shape Mistral
+    /// Large 4 routes (128 experts, top 4): a token's picks are the rule's on
+    /// 24 seeded tokens, in rank order, their weights the kept probabilities
+    /// over their sum within f32's rounding; a layer that gives a selection
+    /// bias, a file whose scale is not one, and a rows launch without a
+    /// logits buffer or with one shorter than its rows are refused by name.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_softmax_entry_routes_the_rule_at_128_top_4() {
+        type Entry = SoftmaxEntry<4>;
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let stream = gpu.stream();
+        let entry = Entry::load(gpu.context()).expect("the entry");
+        let mut out = Entry::new_out(stream).expect("the buffers");
+        assert_eq!(
+            (Entry::N_EXPERT, Entry::N_USED, out.dims().used()),
+            (WIDTH, 4, 4)
+        );
+        let mut s = 0x1234_5678u32;
+        let w: Vec<f32> = (0..WIDTH * K).map(|_| draw(&mut s) * 0.25).collect();
+        let w_dev = DeviceTensor::upload(stream, &w, WIDTH, K).expect("router weight");
+        fn route_in<'a>(
+            gpu: &Gpu,
+            w: &'a DeviceTensor<f32>,
+            (bias, scale): (Option<&'a DeviceBuffer<f32>>, f32),
+        ) -> RouteIn<'a> {
+            RouteIn {
+                w,
+                bias,
+                scale,
+                fault: gpu.layer_sink(0).expect("a fault sink"),
+            }
+        }
+        let route = |bias, scale| route_in(&gpu, &w_dev, (bias, scale));
+        let (mut id_misses, mut worst) = (0usize, 0.0f64);
+        for token in 0..24 {
+            let x: Vec<f32> = (0..K).map(|_| draw(&mut s)).collect();
+            let x_dev = DeviceBuffer::from_host(stream, &x).expect("x");
+            entry
+                .route(stream, &x_dev, &route(None, 1.0), &mut out)
+                .expect("route");
+            let ids = Entry::out_ids(&out).to_host_vec(stream).expect("ids");
+            let weights = Entry::out_weights(&out)
+                .to_host_vec(stream)
+                .expect("weights");
+            let (want_ids, want_w) = host_picks(&w, &x, 4);
+            assert_eq!(ids.len(), 4, "token {token}: one id a pick");
+            if ids != want_ids {
+                id_misses += 1;
+                eprintln!("token {token}: ids {ids:?}, the rule's {want_ids:?}");
+                continue;
+            }
+            for (got, want) in weights.iter().zip(&want_w) {
+                worst = worst.max((f64::from(*got) - want).abs() / want);
+            }
+        }
+        println!(
+            "softmax entry: 24 tokens, {id_misses} id mismatches, worst weight rel {worst:.2e}"
+        );
+        assert_eq!(id_misses, 0, "the picks are the rule's top 4");
+        assert!(
+            worst < 1e-5,
+            "weights within f32 rounding of the rule: {worst:e}"
+        );
+        let bias = DeviceBuffer::from_host(stream, &[0.0f32; WIDTH]).expect("bias");
+        let x_dev = DeviceBuffer::from_host(stream, &[0.5f32; K]).expect("x");
+        for (what, r) in [
+            ("a selection bias", route(Some(&bias), 1.0)),
+            ("a scale of one half", route(None, 0.5)),
+        ] {
+            let e = entry.route(stream, &x_dev, &r, &mut out).expect_err(what);
+            assert!(
+                matches!(
+                    e,
+                    GpuError::Shape {
+                        what: "route_softmax::SoftmaxEntry::route",
+                        ..
+                    }
+                ),
+                "{what}: {e}"
+            );
+        }
+        let g32 = Gemm32Kernels::load(gpu.context()).expect("the wide gemm");
+        let mut probs = DeviceBuffer::<f32>::zeroed(stream, WIDTH).expect("probs");
+        let mut ids = DeviceBuffer::<u32>::zeroed(stream, 4).expect("ids");
+        let mut weights = DeviceBuffer::<f32>::zeroed(stream, 4).expect("weights");
+        let mut narrow = DeviceBuffer::<f32>::zeroed(stream, WIDTH - 1).expect("narrow logits");
+        fn rows_of<'a>(
+            (probs, ids, weights): (
+                &'a mut DeviceBuffer<f32>,
+                &'a mut DeviceBuffer<u32>,
+                &'a mut DeviceBuffer<f32>,
+            ),
+            logits: Option<&'a mut DeviceBuffer<f32>>,
+        ) -> RoutedRows<'a> {
+            RoutedRows {
+                probs,
+                logits,
+                ids,
+                weights,
+            }
+        }
+        let e = entry
+            .route_rows(
+                (stream, &gpu, &g32),
+                &x_dev,
+                &route(None, 1.0),
+                1,
+                rows_of((&mut probs, &mut ids, &mut weights), None),
+            )
+            .expect_err("a rows launch without a logits buffer");
+        assert!(
+            matches!(
+                e,
+                GpuError::State {
+                    what: "route_softmax::enqueue_rows",
+                    ..
+                }
+            ),
+            "{e}"
+        );
+        let e = entry
+            .route_rows(
+                (stream, &gpu, &g32),
+                &x_dev,
+                &route(None, 1.0),
+                1,
+                rows_of((&mut probs, &mut ids, &mut weights), Some(&mut narrow)),
+            )
+            .expect_err("a logits buffer shorter than a row");
+        assert!(
+            matches!(
+                e,
+                GpuError::Shape {
+                    what: "route_softmax::enqueue_rows",
+                    ..
+                }
+            ),
+            "{e}"
+        );
+        let e = entry
+            .route_rows(
+                (stream, &gpu, &g32),
+                &x_dev,
+                &route(Some(&bias), 1.0),
+                1,
+                rows_of((&mut probs, &mut ids, &mut weights), None),
+            )
+            .expect_err("a rows launch with a selection bias");
+        assert!(
+            matches!(
+                e,
+                GpuError::Shape {
+                    what: "route_softmax::SoftmaxEntry::route_rows",
+                    ..
+                }
+            ),
+            "{e}"
+        );
+    }
+
+    /// The f32 bits of `v`: the comparison is bit for bit, not within a band.
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// `softmax_route_rows_is_ubatch`: the rows launch of the common routed
+    /// block ([`SoftmaxEntry::route_rows`]) over `m` rows of seeded tokens
+    /// (one, a warp short, a warp over, two column tiles) leaves each row's
+    /// logits, probabilities, ids and weights bit for bit what the one-token
+    /// route ([`SoftmaxEntry::route`]) leaves for that token, and leaves the
+    /// rows past `m` of buffers that hold one row more untouched.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_softmax_route_rows_is_ubatch() {
+        type Entry = SoftmaxEntry<4>;
+        const TOKENS: usize = 40;
+        const CAP: usize = TOKENS + 1;
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let stream = gpu.stream();
+        let entry = Entry::load(gpu.context()).expect("the entry");
+        let g32 = Gemm32Kernels::load(gpu.context()).expect("the wide gemm");
+        let mut s = 0x2468_ace1u32;
+        let w: Vec<f32> = (0..WIDTH * K).map(|_| draw(&mut s) * 0.25).collect();
+        let w_dev = DeviceTensor::upload(stream, &w, WIDTH, K).expect("router weight");
+        let r = RouteIn {
+            w: &w_dev,
+            bias: None,
+            scale: 1.0,
+            fault: gpu.layer_sink(0).expect("a fault sink"),
+        };
+        let xs: Vec<f32> = (0..TOKENS * K).map(|_| draw(&mut s)).collect();
+
+        // The one-token routes: per token its logits, probabilities, ids and weights.
+        let mut out = Entry::new_out(stream).expect("the buffers");
+        let mut single = Vec::with_capacity(TOKENS);
+        for x in xs.chunks(K) {
+            let x_dev = DeviceBuffer::from_host(stream, x).expect("x");
+            entry.route(stream, &x_dev, &r, &mut out).expect("route");
+            single.push((
+                out.logits.to_host_vec(stream).expect("logits"),
+                out.probs.to_host_vec(stream).expect("probs"),
+                Entry::out_ids(&out).to_host_vec(stream).expect("ids"),
+                Entry::out_weights(&out)
+                    .to_host_vec(stream)
+                    .expect("weights"),
+            ));
+        }
+
+        for m in [1, 7, 8, 9, TOKENS] {
+            let x_dev = DeviceBuffer::from_host(stream, &xs[..m * K]).expect("x");
+            let mut logits = DeviceBuffer::<f32>::zeroed(stream, CAP * WIDTH).expect("logits");
+            let mut probs = DeviceBuffer::<f32>::zeroed(stream, CAP * WIDTH).expect("probs");
+            let mut ids = DeviceBuffer::<u32>::zeroed(stream, CAP * Entry::N_USED).expect("ids");
+            let mut weights =
+                DeviceBuffer::<f32>::zeroed(stream, CAP * Entry::N_USED).expect("weights");
+            let rows = RoutedRows {
+                probs: &mut probs,
+                logits: Some(&mut logits),
+                ids: &mut ids,
+                weights: &mut weights,
+            };
+            entry
+                .route_rows((stream, &gpu, &g32), &x_dev, &r, m, rows)
+                .expect("route_rows");
+            let got = (
+                logits.to_host_vec(stream).expect("logits"),
+                probs.to_host_vec(stream).expect("probs"),
+                ids.to_host_vec(stream).expect("ids"),
+                weights.to_host_vec(stream).expect("weights"),
+            );
+            for (t, (l, p, i, wt)) in single[..m].iter().enumerate() {
+                let (at, used) = (
+                    t * WIDTH..(t + 1) * WIDTH,
+                    t * Entry::N_USED..(t + 1) * Entry::N_USED,
+                );
+                assert_eq!(bits(&got.0[at.clone()]), bits(l), "m {m} token {t}: logits");
+                assert_eq!(bits(&got.1[at]), bits(p), "m {m} token {t}: probabilities");
+                assert_eq!(&got.2[used.clone()], i.as_slice(), "m {m} token {t}: ids");
+                assert_eq!(bits(&got.3[used]), bits(wt), "m {m} token {t}: weights");
+            }
+            let untouched = got.0[m * WIDTH..]
+                .iter()
+                .chain(&got.1[m * WIDTH..])
+                .chain(&got.3[m * Entry::N_USED..])
+                .all(|v| v.to_bits() == 0)
+                && got.2[m * Entry::N_USED..].iter().all(|&v| v == 0);
+            assert!(untouched, "m {m}: the rows past m were written");
+        }
     }
 }

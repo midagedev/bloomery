@@ -1,0 +1,58 @@
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -22,6 +22,21 @@
+ #include <random>
+ #include <cinttypes>
+ 
++// bloomery's DSpark oracle dump (tools/ref/dump-ml4-dspark.sh): under LLAMA_DSPARK_DUMP=<dir>, the
++// rows the draft is fed (taps.f32, positions in taps.pos) and each draft call (calls.tsv).
++static FILE * dspark_dump_open(const char * name, const char * mode) {
++    const char * dir = getenv("LLAMA_DSPARK_DUMP");
++    if (!dir || !*dir) {
++        return nullptr;
++    }
++    const std::string path = std::string(dir) + "/" + name;
++    FILE * f = fopen(path.c_str(), mode);
++    if (!f) {
++        GGML_ABORT("LLAMA_DSPARK_DUMP: cannot open %s", path.c_str());
++    }
++    return f;
++}
++
+ #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+ #define SPC_TRC(fmt, ...) LOG_TRC("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+ #define SPC_INF(fmt, ...) LOG_INF("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+@@ -1245,7 +1260,18 @@
+                         float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                         const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
+                         std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
++                    }
++                }
++
++                if (FILE * ft = dspark_dump_open("taps.f32", "ab")) {
++                    FILE * fp = dspark_dump_open("taps.pos", "ab");
++                    for (int32_t i = 0; i < n_chunk; ++i) {
++                        const uint32_t p = (uint32_t) batch_in.tokens[i_batch_beg[seq_id] + offset + i].pos[0];
++                        fwrite(&p, sizeof(p), 1, fp);
+                     }
++                    fwrite(features_buf.data(), sizeof(float), (size_t) n_chunk * n_embd_enc, ft);
++                    fclose(fp);
++                    fclose(ft);
+                 }
+ 
+                 batch_inject.clear();
+@@ -1449,6 +1475,14 @@
+                     common_sampler_accept(smpl, id, true);
+ 
+                     result.push_back(id);
++                }
++                if (FILE * fc = dspark_dump_open("calls.tsv", "a")) {
++                    fprintf(fc, "%d\t%d", (int) dp.pos0, (int) dp.id_last);
++                    for (size_t k = 0; k < result.size(); ++k) {
++                        fprintf(fc, "%s%d", k == 0 ? "\t" : ",", (int) result[k]);
++                    }
++                    fprintf(fc, "\n");
++                    fclose(fc);
+                 }
+             } else {
+                 // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1

@@ -1,10 +1,10 @@
 //! The generic host dot (`qdot::generic`): one block decoder per type, one kernel per activation
 //! form.
 //!
-//! The proof types are three that already have hand kernels, one per family: Q2_K (a K-quant,
+//! The proof types are four that already have hand kernels, one per family: Q2_K (a K-quant,
 //! scale and min per 16 values, Q8_K), IQ4_XS (an i-quant through a 16-entry codebook, a 6-bit
-//! scale per 32 values, Q8_K) and IQ4_NL (the same codebook in 32-value blocks, Q8_2_X4). What
-//! the clauses pin:
+//! scale per 32 values, Q8_K), IQ4_NL (the same codebook in 32-value blocks, Q8_2_X4) and IQ1_M
+//! (the 1-bit codes `8·grid ± 1`, a 3-bit scale per 16 values, Q8_K). What the clauses pin:
 //!
 //! - each decoder is the type's own dequant: `(d·scale)·code − dmin·min` reproduces
 //!   `gguf::quant::dequant_row` bit for bit, and its codes stay in `-127..=127`;
@@ -22,11 +22,12 @@
 //! - every row of `gguf::QROWS` that names a quantized activation form has a kernel of that
 //!   form, and a row that names none has no kernel.
 //!
-//! IQ2_S and IQ1_M are the listed types (`qdot::generic::ENTRIES`), with no hand kernel to
-//! be equal to: the decode, vector, bound, refusal and entry clauses above hold them, a dispatch
-//! clause holds every entry point to the generic kernels, and `gate-quant` holds their dots to
-//! mainline's `vec_dot`. IQ1_S's decoder is held by the same decode, vector and bound clauses
-//! (its hand kernel owns the dispatch; `tests/qdot.rs` holds that kernel to its mirror).
+//! IQ2_S is the listed type (`qdot::generic::ENTRIES`), with no hand kernel to be equal to: the
+//! decode, vector, bound, refusal and entry clauses above hold it, a dispatch clause holds
+//! every entry point to the generic kernels, and `gate-quant` holds its dot to mainline's
+//! `vec_dot`. The decoders of IQ1_S and IQ1_M are held by the same decode, vector and bound
+//! clauses (their hand kernels own the dispatch; `tests/qdot.rs` holds those kernels to their
+//! mirrors, and the dot clause above holds IQ1_M's to the generic dot).
 
 #![cfg(target_arch = "x86_64")]
 
@@ -355,9 +356,11 @@ fn generic_dot_is_the_hand_dot_bit_for_bit() {
     check_dot::<Q2k>(&Q8K_KS);
     check_dot::<Iq4Xs>(&Q8K_KS);
     check_dot::<Iq4Nl>(&Q82X4_KS);
+    check_dot::<Iq1m>(&Q8K_KS);
     check_dot::<Plain<Q2k>>(&Q8K_KS);
     check_dot::<Plain<Iq4Xs>>(&Q8K_KS);
     check_dot::<Plain<Iq4Nl>>(&Q82X4_KS);
+    check_dot::<Plain<Iq1m>>(&Q8K_KS);
 }
 
 /// A type with no hand kernel reaches its generic kernels through every entry point and nothing
@@ -430,8 +433,10 @@ fn check_dispatch<D: HostDecode>(ks: &[usize]) {
 fn a_type_with_no_hand_kernel_reaches_its_generic_kernels() {
     // PIN(2026-10-31): IQ1_S left this clause when its hand kernel took its dispatch; tests/qdot.rs holds that
     // kernel to its mirror and its column tile to the one-column dot.
+    // PIN(2026-11-02): IQ1_M left this clause the same way; `generic_dot_is_the_hand_dot_bit_for_bit` holds its
+    // hand dot to the generic one, and tests/qdot.rs holds its kernel to its mirror and its column tile to the
+    // one-column dot.
     check_dispatch::<Iq2s>(&Q8K_KS);
-    check_dispatch::<Iq1m>(&Q8K_KS);
 }
 
 /// The quantized column's blocks as `(dy, codes)`: one Q8_K block of 256 values, or one Q8_2

@@ -773,10 +773,9 @@ impl<T> Drop for TensorWindow<'_, T> {
     }
 }
 
-/// The largest K a [`Q8Act`] takes: the widest K-quant input of the models
-/// this engine runs — a dense FFN down of 22,016 values; DeepSeek-V4.1's
-/// `hc_{attn,ffn}_fn`, which read all four residual streams, take 4 × 5120.
-pub(crate) const Q8ACT_MAX_K: usize = 22_016;
+/// The largest K a [`Q8Act`] takes: the planner's cap on a q8_1 column
+/// ([`model::placement::kernels::Q8_ACT_MAX_K`]).
+pub(crate) const Q8ACT_MAX_K: usize = model::placement::kernels::Q8_ACT_MAX_K;
 
 /// The most columns a per-slot [`Q8Act`] takes ([`Q8Act::with_slots`]):
 /// every routed slot of a prompt batch — the host union's `UNION_MAX_COLS`
@@ -795,8 +794,10 @@ pub(crate) const TIER_ACT_MAX_COLS: usize = 4096;
 /// (gate·up, q·kv_a) share one (decision 2, as the CPU engine does).
 ///
 /// `k` is a multiple of 256 with 256 <= k <= [`Q8ACT_MAX_K`]. The cap is a
-/// sanity bound, not a layout limit: no kernel stages a K-sized array, and
-/// every index the layout computes stays far inside u32 at the cap. With
+/// sanity bound, not a layout limit: every index the layout computes stays far
+/// inside u32 at the cap, and the one kernel that stages a K-sized array
+/// (`swiglu_nvfp4_32`'s dynamic shared Q8 cache) holds its byte count at the
+/// cap in its launch contract (`gemm/nvfp4mma.rs`). With
 /// n_sb = k/256 super-blocks per row, buffer sizes in elements per column
 /// are: q3 `64 * ceil(n_sb/2)` u64, q4 `256 * ceil(n_sb/4)` u32,
 /// q6 `128 * ceil(n_sb/2)` u32, s8 `8 * n_sb` i32, d8 `2 * n_sb` f32.

@@ -1,8 +1,9 @@
 //! What every tower's chain over card buffers does the same way: reading a weight tensor out of
 //! the encoder file and uploading it, the tap sink a gate hands an encode to read intermediate
-//! tensors, the rows an encode returns, and the branch GEMM a tap needs without its fused
-//! epilogue. A tower's own file ([`crate::encoder`], [`crate::qwen3vl`]) holds what its
-//! architecture forces: the order of its launches and the names of its taps.
+//! tensors and a block of columns of them, the rows an encode returns, a linear layer with its
+//! residual epilogue, and the branch GEMM a tap needs without its fused epilogue. A tower's own
+//! file ([`crate::encoder`], [`crate::qwen3vl`]) holds what its architecture forces: the order of
+//! its launches and the names of its taps.
 
 use crate::gemm_bf16::{Epilogue, GemmArgs, GemmKernels};
 use bloomery_gpu::{GpuError, TensorWindow, Window};
@@ -130,6 +131,60 @@ pub(crate) fn side(
         },
     )?;
     tap(stream, taps, name, c, m, n)
+}
+
+/// One linear layer `c = a · wᵀ (+ bias)`, with the block's residual added when `resid` is given.
+pub(crate) fn linear(
+    gemm: &GemmKernels,
+    stream: &CudaStream,
+    (a, w, bias): (
+        &DeviceBuffer<u16>,
+        &DeviceBuffer<u16>,
+        Option<&DeviceBuffer<f32>>,
+    ),
+    (m, n, k): (usize, usize, usize),
+    resid: Option<&DeviceBuffer<u16>>,
+    c: &mut DeviceBuffer<u16>,
+) -> Result<(), GpuError> {
+    gemm.enqueue(
+        stream,
+        GemmArgs {
+            a,
+            b: w,
+            bias,
+            epilogue: if resid.is_some() {
+                Epilogue::Residual
+            } else {
+                Epilogue::None
+            },
+            resid,
+            m,
+            n,
+            k,
+            c,
+        },
+    )
+}
+
+/// Tap the columns `c0 .. c0 + width` of the first `n` rows of `buf`, which has `row_width`
+/// columns, when the sink wants them.
+pub(crate) fn tap_cols(
+    stream: &CudaStream,
+    taps: &mut dyn TapSink,
+    name: &str,
+    buf: &DeviceBuffer<u16>,
+    (n, row_width): (usize, usize),
+    (c0, width): (usize, usize),
+) -> Result<(), GpuError> {
+    if taps.wants(name) {
+        let all = to_host(stream, buf, n * row_width)?;
+        let cols: Vec<u16> = all
+            .chunks_exact(row_width)
+            .flat_map(|r| r[c0..c0 + width].iter().copied())
+            .collect();
+        taps.take(name, width, cols);
+    }
+    Ok(())
 }
 
 pub(crate) fn tensor_bytes<'a>(

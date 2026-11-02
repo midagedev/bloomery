@@ -176,8 +176,7 @@ fn architecture_is(is: &str) -> PlacementError {
 }
 
 /// An architecture a file's `general.architecture` names, when this crate has
-/// a reader or a program for it. Flint has a reader and no executable program;
-/// `muse-spark` and `mistral-large4` have a reader and no program.
+/// a reader or a program for it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Arch {
     Deepseek2,

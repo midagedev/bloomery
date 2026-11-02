@@ -45,6 +45,15 @@ pub enum HeadKind {
     /// `rank` values, and the row's argmax is its id (serial over the rows).
     /// `confidence` says the file carries a confidence head.
     Markov { rank: usize, confidence: bool },
+    /// Mistral Large 4's gated Markov recurrence: a state of `rank` values,
+    /// zero at the block's first row, carried down the rows. Row `i`'s
+    /// `joint_proj` over `[state | markov_w1[prev] | normed row]` gives a
+    /// gate, a candidate and a correction vector; the state becomes `cand +
+    /// gate · (state − cand)` and `markov_w2 · tanh(correction)` is added to
+    /// the row's logits after the projection's soft cap. The row's argmax is
+    /// its id and the next row's `prev` (serial over the rows). Row 0
+    /// drafts: its `prev` is the block's first id.
+    MarkovRnn { rank: usize },
     /// DFlash2's selector: every row after the anchor keeps the `top_k` ids
     /// its logits rank highest and scores each against each id the row
     /// before kept through factors of `rank` values
@@ -79,6 +88,8 @@ pub enum DsparkError {
     Zero(&'static str),
     /// A selector head over a shape that cannot host it.
     Selector(&'static str),
+    /// A recurrent Markov head over a shape that cannot host it.
+    Rnn(&'static str),
     /// A selector keeping more ids than the head scores.
     TopK { top_k: usize, rows: usize },
     /// A reduced map whose id `index` is `id`, past the target's `n_target`
@@ -106,6 +117,7 @@ impl fmt::Display for DsparkError {
             DsparkError::Taps(t) => write!(f, "dspark: taps {t:?}: at least one, strictly rising"),
             DsparkError::Zero(what) => write!(f, "dspark: a {what} of 0"),
             DsparkError::Selector(why) => write!(f, "dspark: a selector head {why}"),
+            DsparkError::Rnn(why) => write!(f, "dspark: a recurrent Markov head {why}"),
             DsparkError::TopK { top_k, rows } => write!(
                 f,
                 "dspark: a selector keeping {top_k} ids of a head that scores {rows}"
@@ -183,8 +195,8 @@ impl DsparkShape {
     pub fn rows(&self, width: usize) -> usize {
         match self.head {
             HeadKind::Selector { .. } => self.block,
-            HeadKind::Markov { .. } if self.row0_drafts => width,
-            HeadKind::Markov { .. } => width + 1,
+            HeadKind::Markov { .. } | HeadKind::MarkovRnn { .. } if self.row0_drafts => width,
+            HeadKind::Markov { .. } | HeadKind::MarkovRnn { .. } => width + 1,
         }
     }
 
@@ -208,6 +220,19 @@ impl DsparkShape {
         match self.head {
             HeadKind::Markov { rank: 0, .. } => return Err(DsparkError::Zero("Markov rank")),
             HeadKind::Markov { .. } => {}
+            HeadKind::MarkovRnn { rank: 0 } => return Err(DsparkError::Zero("Markov rank")),
+            HeadKind::MarkovRnn { .. } => {
+                if !self.row0_drafts {
+                    return Err(DsparkError::Rnn(
+                        "drafts from row 0: its state starts at the block's first id",
+                    ));
+                }
+                if matches!(self.vocab, DraftVocab::Reduced { .. }) {
+                    return Err(DsparkError::Rnn(
+                        "scores target ids: its tables are the target's vocabulary",
+                    ));
+                }
+            }
             HeadKind::Selector { rank: 0, .. } => {
                 return Err(DsparkError::Zero("selector rank"));
             }
@@ -406,6 +431,28 @@ mod tests {
         assert_eq!((markov.rows(3), markov.first_row()), (4, 1));
         markov.row0_drafts = true;
         assert_eq!((markov.rows(3), markov.first_row()), (3, 0));
+    }
+
+    /// A recurrent Markov head runs one row per id like the bigram head, and
+    /// is refused by name with a rank of 0, a row 0 that does not draft, or
+    /// a reduced vocabulary.
+    #[test]
+    fn a_recurrent_head_runs_a_row_an_id_and_is_checked_by_name() {
+        let mut rnn = shape(3, DraftVocab::Full { n: 64 });
+        rnn.head = HeadKind::MarkovRnn { rank: 512 };
+        assert_eq!(rnn.check(), Ok(()));
+        assert_eq!((rnn.rows(3), rnn.first_row(), rnn.width(8)), (3, 0, 3));
+        let mut zero = rnn.clone();
+        zero.head = HeadKind::MarkovRnn { rank: 0 };
+        assert_eq!(zero.check(), Err(DsparkError::Zero("Markov rank")));
+        let mut anchor = rnn.clone();
+        anchor.row0_drafts = false;
+        assert!(matches!(anchor.check(), Err(DsparkError::Rnn(_))));
+        rnn.vocab = DraftVocab::Reduced {
+            to_target: vec![0, 7, 3],
+            n_target: 64,
+        };
+        assert!(matches!(rnn.check(), Err(DsparkError::Rnn(_))));
     }
 
     /// Each selector field is refused by name: a width of 0, a row 0 that

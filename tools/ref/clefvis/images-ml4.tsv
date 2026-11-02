@@ -1,0 +1,11 @@
+# name	w	h	branch of mtmd pixtral preprocessing (align 28, 6272..802816 pixels = 8..1024 tokens, bicubic onto black PAD_CEIL); the file is images/<name>.png
+# The mistral-large4 seat's tower arm follows this file. The sizes, grids and rows (nx * ny tokens and ny - 1 break rows) below are derived from the preprocess source (calc_size_preserved_ratio); the set's own `# image` lines are the measured ones.
+free-448x448	448	448	a multiple of 28 in the budget: 16x16 = 256 tokens, 271 rows, no resize (the image the tower gate's op rules run on)
+free-640x480	640	480	rounds to 644x476: 23x17 = 391 tokens, 407 rows, resized onto black
+free-1024x768	1024	768	rounds to 1036x756: 37x27 = 999 tokens, 1025 rows, resized onto black
+min-96x64	96	64	below min_pixels: scaled up to 112x84, 4x3 = 12 tokens, 14 rows
+small-200x200	200	200	rounds to 196x196: 7x7 = 49 tokens, 55 rows, scaled down
+pad-1000x700	1000	700	rounds to 1008x700: 36x25 = 900 tokens, 924 rows, resized onto black
+pad-777x513	777	513	rounds to 784x504: 28x18 = 504 tokens, 521 rows, resized onto black
+max-2600x1800	2600	1800	above max_pixels: scaled down to 1064x728, 38x26 = 988 tokens, 1013 rows (the largest image of the set)
+strip-1000x1	1000	1	one row of tokens: 1008x28, 36x1 = 36 tokens, 36 rows and no break row (the extreme aspect)

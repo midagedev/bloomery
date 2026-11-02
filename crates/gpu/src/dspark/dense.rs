@@ -483,6 +483,39 @@ impl Q8Rows {
         Self::gguf_rows(gpu, split, name, &Take::all(rows, k, &|r| r))
     }
 
+    /// Tensor `name` of `split`, a Q8_0 tensor of ggml shape `dims` (any rank) whose values are
+    /// `rows` rows of `k` in file order, on the card as [`Q8Rows::from_gguf`] puts a matrix: a
+    /// stack of per-head matrices read as one matrix of every head's rows. Another element count
+    /// is refused by name, as a missing tensor, another type and another shape are.
+    pub fn from_gguf_dims(
+        gpu: &Gpu,
+        split: &Split,
+        name: &str,
+        dims: &[usize],
+        rows: usize,
+        k: usize,
+    ) -> Result<Q8Rows, GpuError> {
+        if k == 0 || !k.is_multiple_of(32) || dims.iter().product::<usize>() != rows * k {
+            return Err(shape_err(format!(
+                "{name}: {dims:?} as {rows} Q8_0 rows of {k} values"
+            )));
+        }
+        let bytes = gguf_tensor(split, name, GgmlType::Q8_0, dims)?;
+        let blocks: Vec<Q8Block> = bytes
+            .as_chunks::<34>()
+            .0
+            .iter()
+            .map(Q8Block::from_bytes)
+            .collect();
+        if blocks.len() != rows * (k / 32) {
+            return Err(shape_err(format!(
+                "{name}: {} bytes as {rows} Q8_0 rows of {k} values",
+                bytes.len()
+            )));
+        }
+        upload_blocks(gpu, &blocks, rows, k)
+    }
+
     /// [`Q8Rows::from_gguf`] of the rows `take` names.
     fn gguf_rows(
         gpu: &Gpu,
@@ -527,7 +560,7 @@ fn upload_blocks(gpu: &Gpu, blocks: &[Q8Block], rows: usize, k: usize) -> Result
 
 /// Tensor `name` of `split`'s bytes, refused by name when it is missing or is not of type `ty` and
 /// shape `dims` (ggml's `ne` order).
-fn gguf_tensor<'a>(
+pub fn gguf_tensor<'a>(
     split: &'a Split,
     name: &str,
     ty: GgmlType,

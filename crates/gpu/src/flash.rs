@@ -38,6 +38,13 @@
 //! partials and no merge; that choice is made from the cache height when the
 //! launch is enqueued, never per key count.
 //!
+//! A selection list's rows can be read in place: [`flash_latent_mma_sel`] and
+//! [`flash_merge_sel`] are the same pair for `tokens` query tokens at once,
+//! token `t` over the cache rows `list[t·stride + i]`, `i < counts[t]`. A
+//! token's result is the gathered launch's — `kv_gather_sel` into a
+//! `stride`-row scratch, then `flash_latent_mma` and `flash_merge` over it —
+//! bit for bit, with no scratch and one launch pair for all the tokens.
+//!
 //! Merge order is fixed (ascending segment), so reruns and graph replays are
 //! bit-identical. The split launch rounds the query rows and the products to
 //! f16 and the single-block form does not, so the two sit inside a band of
@@ -1236,6 +1243,194 @@ mod flash_kernels {
         }
     }
 
+    /// [`flash_latent_mma`] over the rows a selection list picks, with no
+    /// gather: the segment pass of `tokens` query tokens at once, token `t`'s
+    /// keys the cache rows `list[t·stride + i]` for `i < counts[t]` — the
+    /// list's order is the key order — read in place. A token's partials are
+    /// the ones `kv_gather_sel` followed by [`flash_latent_mma`] over the
+    /// gathered scratch of `stride` rows writes for it: the same group cut
+    /// (`seg_span` of the token's count, over [`segments_for`]`(stride)`
+    /// segments), the same staged tiles and the same
+    /// [`mma_segment_walk`](crate::mma_segment_walk) — only the key's source
+    /// row is the list's load, not the key itself — so [`flash_merge_sel`]
+    /// over them is that token's gather, walk and merge, bit for bit, at every
+    /// count.
+    ///
+    /// A group is [`MMA_ROWS`] query rows of one token (the host requires
+    /// `n_heads % MMA_ROWS == 0`), so every row of it shares the token's count
+    /// as its limit, and the grid is `tokens · n_heads / MMA_ROWS` groups times
+    /// `segs` segments. A count past `stride` names list entries that do not
+    /// exist: it raises [`FaultSite::KeyCount`] on `fault` and the token walks
+    /// `stride` keys; a count of 0 names no key, where a causal row always
+    /// sees itself: it raises [`FaultSite::KeyCount`] as well and the token's
+    /// rows are the walk's zero. A list entry at or past `cache_rows` names no row: it
+    /// raises [`FaultSite::CachePos`] before the walk, from the thread whose
+    /// key it is, and the key stages row 0 so the access stays inside the
+    /// cache — the step that reads the fault back is refused, so no value
+    /// built on it is used. List entries at or past a token's count are never
+    /// read, and a segment wholly past the count writes the neutral partial
+    /// and reads no key row, as the dense entry's does.
+    #[kernel]
+    #[launch_bounds(512)]
+    #[launch_contract(
+        domain = 1,
+        block = (512, 1, 1),
+        dynamic_shared = 56064,
+        requires = (
+            segs >= 1,
+            q.len() >= tokens * n_heads * (rope_dims + latent),
+            kv.len() >= cache_rows * (rope_dims + latent),
+            list.len() >= tokens * stride,
+            counts.len() >= tokens,
+            part_v.len() >= tokens * n_heads * segs * latent,
+            part_ms.len() >= tokens * n_heads * segs * 2
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    pub fn flash_latent_mma_sel(
+        q: &[f32],
+        kv: &[u16],
+        list: &[u32],
+        counts: &[u32],
+        scale: f32,
+        tokens: u32,
+        n_heads: u32,
+        rope_dims: u32,
+        latent: u32,
+        cache_rows: u32,
+        stride: u32,
+        segs: u32,
+        seg_keys: u32,
+        mut part_v: DisjointSlice<f32>,
+        mut part_ms: DisjointSlice<f32>,
+        fault: FaultSink,
+    ) {
+        // Per head, the tile's scaled logits and then its weights.
+        static mut KLOG: SharedArray<f32, MMA_TILE> = SharedArray::UNINIT;
+        static mut KW: SharedArray<f32, MMA_TILE> = SharedArray::UNINIT;
+        // Per head, the tile's max-bump rescale and the token's key limit.
+        static mut VMS: SharedArray<f32, MMA_ROWS> = SharedArray::UNINIT;
+        static mut LIM: SharedArray<u32, MMA_ROWS> = SharedArray::UNINIT;
+
+        let b = thread::blockIdx_x() as usize;
+        let tid = thread::threadIdx_x() as usize;
+        let heads = n_heads as usize;
+        let rows = tokens as usize * heads;
+        let n_seg = segs as usize;
+        // The host requires `heads % MMA_ROWS == 0`: a group is sixteen heads
+        // of one token and every row of it is live.
+        let groups = rows / MMA_ROWS;
+        if b >= groups * n_seg {
+            return; // block-uniform: no barrier and no warp collective is skipped
+        }
+        let seg = b / groups;
+        let grp = b - seg * groups;
+        let base_row = grp * MMA_ROWS;
+        let t = base_row / heads;
+        let rope = rope_dims as usize;
+        let lat = latent as usize;
+        let width = rope + lat;
+        let cap = stride as usize;
+        // SAFETY: t < tokens <= counts.len() (launch contract).
+        let count = unsafe { *counts.get_unchecked(t) } as usize;
+        // A count past the list's width names entries that do not exist, and a
+        // count of 0 no key of a causal row: one thread raises, and the walk
+        // stays inside the list.
+        if (count == 0 || count > cap) && tid == 0 {
+            fault.raise(FaultSite::KeyCount);
+        }
+        let limit = count.min(cap);
+        let span = seg_span(limit, n_seg, seg_keys as usize);
+        let lo = seg * span;
+        if lo >= limit {
+            if tid < MMA_ROWS {
+                let idx = (base_row + tid) * n_seg + seg;
+                // SAFETY: base_row + tid < rows and seg < segs, so both slots
+                // are inside part_ms (launch contract).
+                unsafe {
+                    *part_ms.get_unchecked_mut(2 * idx) = f32::NEG_INFINITY;
+                    *part_ms.get_unchecked_mut(2 * idx + 1) = 0.0;
+                }
+            }
+            return; // block-uniform, and no key row of this segment is read
+        }
+        let hi_max = (lo + span).min(limit);
+
+        // A list entry past the cache raises before the walk, from the
+        // thread that owns its key, with no barrier: the walk's row load
+        // below keeps its access inside the cache, so no value built on the
+        // raise is read. The span may exceed the block (a `seg_keys` lever),
+        // so the threads stride over it.
+        let mut ck = lo + tid;
+        while ck < hi_max {
+            // SAFETY: t < tokens and ck < limit <= stride put the load inside
+            // list (launch contract).
+            if unsafe { *list.get_unchecked(t * cap + ck) } >= cache_rows {
+                fault.raise(FaultSite::CachePos);
+            }
+            ck += MMA_BLOCK;
+        }
+
+        // The group's query rows and the tile's key rows as f16, both in the
+        // block's dynamic shared memory: the query tile first, the key tile
+        // at its end. The launch contract declares exactly
+        // [`MMA_DYN_BYTES`], which is the two word counts.
+        // SAFETY: each pointer below is this block's own shared allocation;
+        // every access is bounded by the declared word count and ordered by
+        // `sync_threads`.
+        let (qs, kt, klog, kw, vms_sh, lim_sh) = unsafe {
+            (
+                DynamicSharedArray::<u32, 16>::get(),
+                DynamicSharedArray::<u32, 16>::offset(MMA_QWORDS * 4),
+                SharedArray::as_raw_mut_ptr(&raw mut KLOG),
+                SharedArray::as_raw_mut_ptr(&raw mut KW),
+                SharedArray::as_raw_mut_ptr(&raw mut VMS),
+                SharedArray::as_raw_mut_ptr(&raw mut LIM),
+            )
+        };
+        // The cache row pair-wise. `width` and `rope` are even and the
+        // buffer is device-allocated, so every u32 read below is aligned.
+        let kvw = kv.as_ptr().cast::<u32>();
+
+        // Every head of the group is one token's, so all share its limit.
+        if tid < MMA_ROWS {
+            // SAFETY: tid < MMA_ROWS bounds the store.
+            unsafe {
+                *lim_sh.add(tid) = limit as u32;
+            }
+        }
+        crate::mma_segment_walk! {
+            width: MMA_WIDTH,
+            q: q,
+            kvw: kvw,
+            key: key => {
+                // SAFETY: t < tokens and key < hi_max <= limit <= stride put
+                // the load inside list (launch contract).
+                let r = unsafe { *list.get_unchecked(t * cap + key) } as usize;
+                // The check pass has raised for an entry past the cache; row
+                // 0 keeps the access inside it.
+                if r < cache_rows as usize { r } else { 0 }
+            },
+            scratch: (qs, kt, klog, kw, vms_sh, lim_sh),
+            rows: rows,
+            base_row: base_row,
+            n_seg: n_seg,
+            seg: seg,
+            lo: lo,
+            hi: hi_max,
+            width_rt: width,
+            rope: rope,
+            lat: lat,
+            scale: scale,
+            tid: tid,
+            part_v: part_v,
+            part_ms: part_ms,
+        }
+    }
+
     /// The merge pass of the split launch: one block per query row, one
     /// thread per latent dim, folding the row's partials by the standard
     /// online-softmax rescale in ascending segment order — a fixed order, so
@@ -1285,6 +1480,59 @@ mod flash_kernels {
             let v = merge_row(
                 n_keys_buf, m, n_heads, dst_rows, segs, seg_keys, part_v, part_ms, row, tid, lat,
             );
+            *y.get_unchecked_mut(row * lat + tid) = v;
+        }
+    }
+
+    /// [`flash_merge`] for [`flash_latent_mma_sel`]'s partials: one block per
+    /// query row, folding the row's segments in ascending order through the
+    /// same [`merge_fold`], at the token's own count `min(counts[t], stride)`
+    /// in place of the dense launch's causal limit. `segs` is
+    /// [`segments_for`]`(stride)`, the segment pass's, so the cut is the one
+    /// the token's gathered launch has.
+    #[kernel]
+    #[launch_bounds(512)]
+    #[launch_contract(
+        domain = 1,
+        block = (512, 1, 1),
+        requires = (
+            segs >= 1,
+            counts.len() >= tokens,
+            part_v.len() >= tokens * n_heads * segs * latent,
+            part_ms.len() >= tokens * n_heads * segs * 2,
+            y.len() >= tokens * n_heads * latent
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    pub fn flash_merge_sel(
+        counts: &[u32],
+        tokens: u32,
+        n_heads: u32,
+        latent: u32,
+        stride: u32,
+        segs: u32,
+        seg_keys: u32,
+        part_v: &[f32],
+        part_ms: &[f32],
+        mut y: DisjointSlice<f32>,
+    ) {
+        let row = thread::blockIdx_x() as usize;
+        let tid = thread::threadIdx_x() as usize;
+        if row >= tokens as usize * n_heads as usize {
+            return; // block-uniform
+        }
+        let t = row / n_heads as usize;
+        let lat = latent as usize;
+        // SAFETY: t < tokens <= counts.len() (launch contract).
+        let limit = (unsafe { *counts.get_unchecked(t) } as usize).min(stride as usize);
+        // SAFETY: row < tokens * n_heads and tid < LATENT = latent
+        // (host-validated), so the store is inside y's row segment and the
+        // partial reads are inside theirs (launch contract).
+        unsafe {
+            let v = merge_fold(limit, segs, seg_keys, part_v, part_ms, row, tid, lat);
             *y.get_unchecked_mut(row * lat + tid) = v;
         }
     }
@@ -1396,9 +1644,8 @@ mod flash_kernels {
     /// One query row's fold over its segments' partials, the standard
     /// online-softmax rescale in ascending segment order — the shared body
     /// of [`flash_merge`] and [`flash_merge_q8`], so the two cannot drift.
-    /// Returns this thread's final latent value. The partials are loaded
-    /// sixteen segments at a time ahead of their folds; the folds and their
-    /// order are the one-at-a-time walk's.
+    /// Returns this thread's final latent value: [`merge_fold`] at the row's
+    /// causal limit.
     ///
     /// SAFETY: `row < q_rows`, `tid < latent`, `segs >= 1`, and the partial
     /// buffers hold `q_rows * segs * latent` / `q_rows * segs * 2` elements.
@@ -1418,6 +1665,33 @@ mod flash_kernels {
         lat: usize,
     ) -> f32 {
         let limit = causal_limit(n_keys_buf, dst_rows, row, n_heads, m);
+        // SAFETY: `merge_fold`'s contract is this function's.
+        unsafe { merge_fold(limit, segs, seg_keys, part_v, part_ms, row, tid, lat) }
+    }
+
+    /// The fold of a query row whose live key count is `limit`: every merge
+    /// entry's body ([`merge_row`] for the causal limit of a decode or prefill
+    /// launch, [`flash_merge_sel`] for a selected row's own count), so the
+    /// entries cannot drift. The partials are loaded sixteen segments at a
+    /// time ahead of their folds; the folds and their order are the
+    /// one-at-a-time walk's.
+    ///
+    /// SAFETY: `row` is a query row of the partial buffers, `tid < lat`,
+    /// `segs >= 1`, and the buffers hold `rows * segs * lat` / `rows * segs *
+    /// 2` elements for the `rows` they were written for; `limit` is at most
+    /// the key count the segment pass cut the row's group at.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    unsafe fn merge_fold(
+        limit: usize,
+        segs: u32,
+        seg_keys: u32,
+        part_v: &[f32],
+        part_ms: &[f32],
+        row: usize,
+        tid: usize,
+        lat: usize,
+    ) -> f32 {
         // The row's live segments under its own cut. The segment pass cut the
         // row's group at the group's widest limit, a span at least this one
         // (the span rises with the count), so every partial holding this
@@ -1790,7 +2064,8 @@ pub struct PlaneAppend<'a> {
 
 /// The loaded P5 device module: `kv_append`, `kv_append_pos_buf`,
 /// `flash_latent`, the tensor-core segment pass `flash_latent_mma`,
-/// `flash_merge` and the q8 twins. Owns no context and no stream — every
+/// `flash_merge`, their selected-row forms `flash_latent_mma_sel` and
+/// `flash_merge_sel`, and the q8 twins. Owns no context and no stream — every
 /// enqueue takes the engine stream (`Gpu::stream()`), so launches order with
 /// the rest of the step and are capturable.
 pub struct FlashKernels {
@@ -1874,6 +2149,40 @@ pub struct FlashMergeQ8Args<'a> {
     pub lo: &'a mut Q8Act,
     pub hi: &'a mut Q8Act,
     pub fault: FaultSink,
+}
+
+/// [`FlashKernels::enqueue_flash_latent_mma_sel`]'s arguments: `geom.tokens`
+/// query tokens, token `t`'s picked cache rows at `list[t·stride ..]` and its
+/// count at `counts[t]` (at most `stride`), the cache `kv` the list indexes
+/// (`[rows x rope_dims + latent_dims]` f16, in place — no gathered scratch),
+/// and the partials [`partials_v_len`] / [`partials_ms_len`] size for
+/// `tokens · heads` rows over `stride` cache rows. `fault` takes a count past
+/// `stride` or of 0 ([`FaultSite::KeyCount`]) and a list entry past the cache
+/// ([`FaultSite::CachePos`]).
+pub struct FlashSelArgs<'a> {
+    pub q: &'a DeviceBuffer<f32>,
+    pub kv: &'a DeviceTensor<u16>,
+    pub list: &'a DeviceBuffer<u32>,
+    pub counts: &'a DeviceBuffer<u32>,
+    pub stride: usize,
+    pub kq_scale: f32,
+    pub geom: FlashGeom,
+    pub part_v: &'a mut DeviceBuffer<f32>,
+    pub part_ms: &'a mut DeviceBuffer<f32>,
+    pub fault: FaultSink,
+}
+
+/// [`FlashKernels::enqueue_flash_merge_sel`]'s arguments: `stride` is the list
+/// width the partials were written for, `counts` the segment pass's.
+pub struct FlashMergeSelArgs<'a> {
+    pub counts: &'a DeviceBuffer<u32>,
+    pub stride: usize,
+    pub tokens: usize,
+    pub heads: usize,
+    pub latent_dims: usize,
+    pub part_v: &'a DeviceBuffer<f32>,
+    pub part_ms: &'a DeviceBuffer<f32>,
+    pub y: &'a mut DeviceBuffer<f32>,
 }
 
 impl FlashKernels {
@@ -2259,6 +2568,172 @@ impl FlashKernels {
         Ok(())
     }
 
+    /// The tensor-core segment pass over a selection list's rows, with no
+    /// gather — [`FlashKernels::enqueue_flash_latent_mma`] for `tokens` query
+    /// tokens whose keys are the cache rows `list[t·stride + i]`, `i <
+    /// counts[t]`: a grid of `tokens · heads / MMA_ROWS` groups times
+    /// `segments_for(stride)` segments of [`MMA_BLOCK`] threads. Each token's
+    /// partials are those of `kv_gather_sel` into a `stride`-row scratch and
+    /// [`FlashKernels::enqueue_flash_latent_mma`] over it, so
+    /// [`FlashKernels::enqueue_flash_merge_sel`] after this is that token's
+    /// gather, walk and merge bit for bit. The counts and lists are read on
+    /// the device, so a captured graph replays at any of them.
+    ///
+    /// Refused before the launch: no token, no head or a head count that is
+    /// not a multiple of [`MMA_ROWS`] (a group would span two tokens' lists),
+    /// a latent that is not [`LATENT`], a `rope_dims + latent` row other than
+    /// [`MMA_WIDTH`] or a cache of another width or no row, a `stride` of 0,
+    /// a `seg_keys` that is not whole tiles, and short `q`, `list`, `counts`
+    /// or partials. A count past `stride` or of 0 raises [`FaultSite::KeyCount`] and
+    /// a list entry past the cache [`FaultSite::CachePos`], on `a.fault`.
+    pub fn enqueue_flash_latent_mma_sel(
+        &self,
+        stream: &CudaStream,
+        a: FlashSelArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let FlashSelArgs {
+            q,
+            kv,
+            list,
+            counts,
+            stride,
+            kq_scale: scale,
+            geom,
+            part_v,
+            part_ms,
+            fault,
+        } = a;
+        let FlashGeom {
+            tokens,
+            heads: n_heads,
+            rope_dims,
+            latent_dims: latent,
+        } = geom;
+        let what = "enqueue_flash_latent_mma_sel";
+        let (q_rows, segs) = check_sel(what, (tokens, n_heads, latent), stride, counts.len())?;
+        let width = rope_dims + latent;
+        if width != MMA_WIDTH || kv.cols() != width || kv.rows() == 0 {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "rope_dims + latent = {width} over a {}x{} cache — this kernel's staged \
+                     tiles are sized for {MMA_WIDTH}-wide rows, and the cache needs a row",
+                    kv.rows(),
+                    kv.cols()
+                ),
+            ));
+        }
+        if q.len() < q_rows * width || list.len() < tokens * stride {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "q.len() {} (need {}), list.len() {} (need tokens * stride = {})",
+                    q.len(),
+                    q_rows * width,
+                    list.len(),
+                    tokens * stride
+                ),
+            ));
+        }
+        check_partials(what, part_v.len(), part_ms.len(), q_rows, segs, latent)?;
+        if !seg_keys().is_multiple_of(MMA_KEYS) {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "seg_keys {} is not a multiple of the {MMA_KEYS}-key tile",
+                    seg_keys()
+                ),
+            ));
+        }
+        let grid = launch_u32(what, "grid", mma_groups(q_rows) * segs)?;
+        let tokens = launch_u32(what, "tokens", tokens)?;
+        let n_heads = launch_u32(what, "heads", n_heads)?;
+        let rope_dims = launch_u32(what, "rope_dims", rope_dims)?;
+        let latent = launch_u32(what, "latent_dims", latent)?;
+        let cache_rows = launch_u32(what, "kv.rows()", kv.rows())?;
+        let stride = launch_u32(what, "stride", stride)?;
+        let segs = launch_u32(what, "segs", segs)?;
+        let seg_keys = launch_u32(what, "seg_keys", seg_keys())?;
+        let prep = self
+            .module
+            .prepare_flash_latent_mma_sel(LaunchConfig1D::new(
+                grid,
+                MMA_BLOCK_U32,
+                MMA_DYN_BYTES_U32,
+            ))?;
+        self.module.flash_latent_mma_sel(
+            stream,
+            &prep,
+            q,
+            kv.buf(),
+            list,
+            counts,
+            scale,
+            tokens,
+            n_heads,
+            rope_dims,
+            latent,
+            cache_rows,
+            stride,
+            segs,
+            seg_keys,
+            part_v,
+            part_ms,
+            fault,
+        )?;
+        Ok(())
+    }
+
+    /// The merge pass of [`FlashKernels::enqueue_flash_latent_mma_sel`]: one
+    /// block per query row, each token folded at its own count
+    /// `min(counts[t], stride)` over the `segments_for(stride)` segments the
+    /// segment pass wrote. Refused before the launch on the same geometry as
+    /// the segment pass, and on a short `counts`, partials or `y`.
+    pub fn enqueue_flash_merge_sel(
+        &self,
+        stream: &CudaStream,
+        a: FlashMergeSelArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let FlashMergeSelArgs {
+            counts,
+            stride,
+            tokens,
+            heads,
+            latent_dims: latent,
+            part_v,
+            part_ms,
+            y,
+        } = a;
+        let what = "enqueue_flash_merge_sel";
+        let (q_rows, segs) = check_sel(what, (tokens, heads, latent), stride, counts.len())?;
+        check_partials(what, part_v.len(), part_ms.len(), q_rows, segs, latent)?;
+        if y.len() < q_rows * latent {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "y.len() {} < tokens*heads*latent = {}",
+                    y.len(),
+                    q_rows * latent
+                ),
+            ));
+        }
+        let tokens = launch_u32(what, "tokens", tokens)?;
+        let n_heads = launch_u32(what, "heads", heads)?;
+        let grid = launch_u32(what, "q_rows", q_rows)?;
+        let latent = launch_u32(what, "latent_dims", latent)?;
+        let stride = launch_u32(what, "stride", stride)?;
+        let segs = launch_u32(what, "segs", segs)?;
+        let seg_keys = launch_u32(what, "seg_keys", seg_keys())?;
+        let prep = self
+            .module
+            .prepare_flash_merge_sel(LaunchConfig1D::new(grid, LATENT_U32, 0))?;
+        self.module.flash_merge_sel(
+            stream, &prep, counts, tokens, n_heads, latent, stride, segs, seg_keys, part_v,
+            part_ms, y,
+        )?;
+        Ok(())
+    }
+
     /// [`FlashKernels::enqueue_flash_merge`] that also writes the q8_1 form
     /// of the merged rows into `lo` and `hi`: the rows below `lo.m()` fill
     /// `lo`'s columns in order, the rest `hi`'s. The bytes are the ones the
@@ -2443,6 +2918,47 @@ fn check_side_quant(
         ));
     }
     Ok((lo.m(), lo.n_sb()))
+}
+
+/// The geometry the selected entries share (the segment pass and its merge):
+/// at least one token, a head count that is a whole number of [`MMA_ROWS`]
+/// groups (a group's rows share one token's list and count), the latent tail
+/// [`LATENT`], a list of at least one entry, and a count per token. Returns
+/// the query rows and the segment count, [`segments_for`]`(stride)`.
+fn check_sel(
+    what: &'static str,
+    (tokens, heads, latent): (usize, usize, usize),
+    stride: usize,
+    counts_len: usize,
+) -> Result<(usize, usize), GpuError> {
+    if tokens == 0 || stride == 0 {
+        return Err(GpuError::shape(
+            what,
+            format!("need tokens >= 1 and stride >= 1, got tokens={tokens} stride={stride}"),
+        ));
+    }
+    if heads == 0 || !heads.is_multiple_of(MMA_ROWS) {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "a group of {MMA_ROWS} query rows is one token's heads, need heads a positive \
+                 multiple of {MMA_ROWS}, got {heads}"
+            ),
+        ));
+    }
+    if latent != LATENT {
+        return Err(GpuError::shape(
+            what,
+            format!("this family's latent tail is {LATENT}, got {latent}"),
+        ));
+    }
+    if counts_len < tokens {
+        return Err(GpuError::shape(
+            what,
+            format!("counts.len() {counts_len} < tokens {tokens}"),
+        ));
+    }
+    Ok((tokens * heads, segments_for(stride)))
 }
 
 /// The partials both split launches share.

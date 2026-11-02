@@ -96,19 +96,26 @@ fn bench(ty: GgmlType, k: usize, row_bytes: usize, rows: usize) {
 }
 
 /// The tile kernel's rate: `rows` weight rows each dotted against `cols` columns through
-/// `dot_row_cols`, single-threaded, as the host union walks a run of columns. Prints the
+/// `dot_row_cols` (through `dot_row_cols_wide` under `wide`, up to `WIDE_COLS` columns),
+/// single-threaded, as the host union walks a run of columns. Prints the
 /// weight bytes streamed per second and the time per (row, column) dot, the number
-/// `dot_row`'s line gives as bytes over time for one column. MXFP4 and Q6_K only, the types
-/// whose filler is written: MXFP4's E8M0 byte in its `bench` range, and Q6_K's f16 `d` (bytes
+/// `dot_row`'s line gives as bytes over time for one column. MXFP4, Q6_K and IQ1_S only, the
+/// types whose filler is written: MXFP4's E8M0 byte in its `bench` range, Q6_K's f16 `d` (bytes
 /// 208..210 of the 210 B block, after ql[128], qh[64] and the 16 i8 scales) at a fixed normal
 /// exponent (2^-5) with two random mantissa bits, since random bytes make it a NaN or an
-/// infinity in 2 blocks of 64 on average. Any other type is refused by name.
-fn bench_tile(ty: GgmlType, k: usize, row_bytes: usize, rows: usize, cols: usize) {
+/// infinity in 2 blocks of 64 on average, and IQ1_S's f16 `d` (the block's first two bytes)
+/// with its exponent's top bit masked, as `bench` masks IQ3_S's. Any other type is refused by
+/// name.
+fn bench_tile(ty: GgmlType, k: usize, row_bytes: usize, rows: usize, cols: usize, wide: bool) {
     assert!(
-        matches!(ty, GgmlType::MXFP4 | GgmlType::Q6_K),
-        "bench_tile fills MXFP4 and Q6_K blocks only, got {ty:?}"
+        matches!(ty, GgmlType::MXFP4 | GgmlType::Q6_K | GgmlType::IQ1_S),
+        "bench_tile fills MXFP4, Q6_K and IQ1_S blocks only, got {ty:?}"
     );
     assert!(qdot::has_tile(ty), "{ty:?} has no tile kernel on this CPU");
+    assert!(
+        !wide || qdot::has_wide(ty),
+        "{ty:?} has no wide kernel on this CPU"
+    );
     let mut s = 0x9E3779B97F4A7C15u64;
     let mut next = || {
         s ^= s >> 12;
@@ -120,14 +127,23 @@ fn bench_tile(ty: GgmlType, k: usize, row_bytes: usize, rows: usize, cols: usize
     for c in w.as_chunks_mut::<8>().0 {
         c.copy_from_slice(&next().to_le_bytes());
     }
-    if ty == GgmlType::MXFP4 {
-        for b in w.as_chunks_mut::<17>().0 {
-            b[0] = 0x70 | (b[0] & 0x0f);
+    match ty {
+        GgmlType::MXFP4 => {
+            for b in w.as_chunks_mut::<17>().0 {
+                b[0] = 0x70 | (b[0] & 0x0f);
+            }
         }
-    } else {
-        for b in w.as_chunks_mut::<210>().0 {
-            b[209] = 0x28 | (b[209] & 0x03);
+        GgmlType::Q6_K => {
+            for b in w.as_chunks_mut::<210>().0 {
+                b[209] = 0x28 | (b[209] & 0x03);
+            }
         }
+        GgmlType::IQ1_S => {
+            for b in w.as_chunks_mut::<50>().0 {
+                b[1] &= 0x7b;
+            }
+        }
+        other => unreachable!("bench_tile's type check admits no {other:?}"),
     }
     let cb = qdot::col_bytes(ty, k);
     let acols: Vec<Vec<u8>> = (0..cols)
@@ -143,24 +159,34 @@ fn bench_tile(ty: GgmlType, k: usize, row_bytes: usize, rows: usize, cols: usize
     let refs: Vec<&[u8]> = acols.iter().map(Vec::as_slice).collect();
     let mut out = vec![0.0f32; cols];
 
+    let dot = |row: &[u8], out: &mut [f32]| {
+        let r = if wide {
+            qdot::dot_row_cols_wide(ty, row, &refs, k, out)
+        } else {
+            qdot::dot_row_cols(ty, row, &refs, k, out)
+        };
+        r.unwrap();
+    };
+
     let mut acc = 0.0f32;
     for r in 0..rows.min(4096) {
-        qdot::dot_row_cols(ty, &w[r * row_bytes..], &refs, k, &mut out).unwrap();
+        dot(&w[r * row_bytes..], &mut out);
         acc += out.iter().sum::<f32>();
     }
     let passes = 6u32;
     let t0 = Instant::now();
     for _ in 0..passes {
         for r in 0..rows {
-            qdot::dot_row_cols(ty, &w[r * row_bytes..], &refs, k, &mut out).unwrap();
+            dot(&w[r * row_bytes..], &mut out);
             acc += out.iter().sum::<f32>();
         }
     }
     let dt = t0.elapsed();
     let bytes = rows as f64 * row_bytes as f64 * passes as f64;
     let dots = rows as f64 * cols as f64 * passes as f64;
+    let kind = if wide { "wide" } else { "tile" };
     println!(
-        "{ty:?} tile C={cols}  k={k} rows {rows} x {row_bytes} B x {passes} passes in {:.3?} = {:.1} GB/s weights, {:.2} ns per row-column (sum {acc:.3})",
+        "{ty:?} {kind} C={cols}  k={k} rows {rows} x {row_bytes} B x {passes} passes in {:.3?} = {:.1} GB/s weights, {:.2} ns per row-column (sum {acc:.3})",
         dt,
         bytes / dt.as_secs_f64() / 1e9,
         dt.as_secs_f64() * 1e9 / dots
@@ -308,15 +334,35 @@ fn main() {
     // The C = 8 tile at MXFP4's two shapes, the host union's run of eight columns: a full run only.
     if only.is_empty() {
         for k in [2048, 4096] {
-            bench_tile(GgmlType::MXFP4, k, (k / 32) * 17, rows, qdot::TILE_COLS);
+            bench_tile(
+                GgmlType::MXFP4,
+                k,
+                (k / 32) * 17,
+                rows,
+                qdot::TILE_COLS,
+                false,
+            );
         }
         // The Q6_K tile at C = 4 and C = 8 at k = 2048 and k = 512, beside C = 1 on the same
         // filler: `dot_row_cols` with one column runs `dot_row`, the one-column kernel, so the
         // tile's ratio reads against C = 1, never against `ROWS`' random-`d` Q6_K lines.
         for k in [2048, 512] {
             for cols in [1, 4, qdot::TILE_COLS] {
-                bench_tile(GgmlType::Q6_K, k, (k / 256) * 210, rows, cols);
+                bench_tile(GgmlType::Q6_K, k, (k / 256) * 210, rows, cols, false);
             }
+        }
+        // The IQ1_S column tile at C = 1 and C = 8 (`dot_row_cols`) and the wide kernel at
+        // C = 8, 16 and 32 (`dot_row_cols_wide`) at the ML4 host experts' shape (k = 6144), on
+        // one filler: the wide rows' ns per row-column read against the tile's C = 8 line.
+        let (k, row_bytes) = (6144, (6144 / 256) * 50);
+        for (cols, wide) in [
+            (1, false),
+            (qdot::TILE_COLS, false),
+            (qdot::TILE_COLS, true),
+            (16, true),
+            (qdot::WIDE_COLS, true),
+        ] {
+            bench_tile(GgmlType::IQ1_S, k, row_bytes, rows, cols, wide);
         }
     }
 }

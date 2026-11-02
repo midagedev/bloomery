@@ -1,11 +1,16 @@
-//! The Mistral Large 4 whole-card body: one [`Body`] behind [`ChainBody`],
-//! every tensor resident on one card, the step one token's. The launch order
-//! is the reference graph's (`src/models/mistral-large4.cpp`, PR #31376):
+//! The Mistral Large 4 placed body: one [`Body`] behind [`ChainBody`], the
+//! plan's tensors on one stage card and the routed experts the card does not
+//! hold on the host tier, with the plan's expert tier card beside the stage
+//! card holding each layer's next ids ([`Body::open_placed`]), the step one
+//! token's walk over the layers (`crate::step`). The launch order is the
+//! reference graph's (`src/models/mistral-large4.cpp`):
 //!
-//! 1. the embedding row of the token (`embed_rows_q6k`), the running row the
-//!    whole chain reads;
-//! 2. `attn_norm` and its q8_1 form in one launch (`norm_quant`);
-//! 3. `attn_q` (Q6_K) of the normed row — a head's `[nope | rope]` values —
+//! 1. the embedding row of the token, read from the file's table on the host
+//!    (the plan keeps the table off the card) and copied into the running row
+//!    before the step;
+//! 2. `attn_norm`, with its q8_1 form in the same launch (`norm_quant`) where
+//!    `attn_q` reads the q8_1 rows, else alone (`rms_norm`);
+//! 3. `attn_q` of the normed row — a head's `[nope | rope]` values —
 //!    and the rope of every 64-value column of it (`rope`; a rotated nope
 //!    column is never read);
 //! 4. on a layer that owns its cache, `attn_kv_a_mqa` (Q8_0) of the normed
@@ -14,7 +19,7 @@
 //!    row appended at the position — a NoPE owner appends its bare latent
 //!    (`latent_append`), and a reader layer appends nothing;
 //! 5. on a full-indexer layer, the lightning indexer: the LayerNorm of the
-//!    normed row (`ln_rows`) and `indexer.attn_q_b` (Q6_K) of it, the file's
+//!    normed row (`ln_rows`) and `indexer.attn_q_b` of it, the file's
 //!    `[rope | nope]` head rows moved to the kernel's tail order by the
 //!    permutation of the projection's output (`gather_pairs`; the weight
 //!    itself stays as the file holds it), the index queries' SSMax
@@ -39,33 +44,40 @@
 //!    `flash_merge`), the scale `1/√key_length_mla`; a NoPE layer runs the
 //!    512-wide walk over its cache through the list (`ds41_attn_seg_sel`,
 //!    `ds41_attn_merge`) with no window and a −∞ sink a head;
-//! 8. `attn_v_b` (Q8_0) up-projects each head's latent output
-//!    (`q8_0_gemv_heads`), `attn_output` (Q6_K) projects the heads' values,
-//!    and the residual add makes `ffn_inp`;
-//! 9. `ffn_norm`, then the dense lead's gate·up·down (Q8_0, `swiglu`) or the
-//!    routed block: the router's logits (`f32_gemv` of `ffn_gate_inp`'s rows
-//!    — a file of fewer experts than the routing body's 128 lanes carries
-//!    the pads it never picks, `f32::MIN`, written once at load) and the
-//!    softmax top-k routing (`softmax_router_route`: the kept weights
-//!    renormalized, the chosen probabilities divided by their sum), the
-//!    i-quant gate·up and down of the picked experts
-//!    (`*_gate_up_sel`, `*_gemv_sel` at the file's own type), their weighted
-//!    sum, and the shared expert's gate·up·down beside it, then the two
-//!    residual adds;
-//! 10. the head: the final RMS norm, the Q6_K `output` projection, the
-//!     tanh softcap of the file's bound and the argmax
-//!     (`Head::enqueue_with_tail`).
+//! 8. `attn_v_b` up-projects each head's latent output (`q8_0_gemv_heads` over
+//!    Q8_0 planes, else the down `_sel` entry of the file's type with the
+//!    heads as the experts), `attn_output` projects the heads' values, and
+//!    the residual add makes `ffn_inp`;
+//! 9. the feed-forward half through the common routed block
+//!    ([`crate::ffn::Routed`]): the dense lead's `ffn_norm` and gate·up·down
+//!    with its residual add; on a routed layer the front (`ffn_norm` into the
+//!    host boundary, the softmax top-4 router over the file's 128 experts in
+//!    one launch, the handoff and the go), the shadow under the host leg (the
+//!    shared expert and the card's slots of the picked experts), then the
+//!    back (the wait and one join: the host's sum plus the card's, plus the
+//!    shared output, plus `ffn_inp`, mainline's association); on a layer the
+//!    expert tier card holds experts of, the card's sum is over the stage
+//!    card's slots and the tier's in slot order, the sum a card holding both
+//!    would make;
+//! 10. the head: the final RMS norm, the `output` projection of the file's
+//!     type, the tanh softcap of the file's bound and the argmax
+//!     (`Head::enqueue_with_epilogue`).
 //!
 //! Every count the chain reads — the position, the live rows, the list's
 //! width, the walk's visible pair, the rope row — lives in one of five small
-//! device buffers the host refreshes before a replay (the indexer's own
-//! `n_vis` word written by the embedding launch itself), so one capture
-//! serves every position. The router's pad lanes keep their load-time value:
-//! the launches never write them.
+//! device buffers the host refreshes before a replay, beside the running
+//! row, so one capture serves every position.
 //!
-//! The taps (`set_taps`) hold a copy of every compared value a layer leaves,
+//! The taps (`arm_taps`) hold a copy of every compared value a layer leaves,
 //! read back by a gate; they refuse a captured graph, which would not hold
-//! the copies.
+//! the copies. A routed layer's `ffn_moe_out` exists in no buffer of the
+//! step (the join sums it in its launch): its tap adds the join's own terms
+//! ([`crate::ffn::JoinTerms`]) in the join's order. A tier layer's card sum
+//! is made inside the join over both cards' slots, so a load with an expert
+//! tier card refuses the taps by name.
+
+use std::ops::Range;
+use std::sync::Arc;
 
 use bloomery_gpu::arch::hybrid::{Acts, DecodeInput, GqaCx};
 use bloomery_gpu::flash::{FlashKernels, FlashMergeArgs, FlashSegArgs, segments_for};
@@ -73,52 +85,78 @@ use bloomery_gpu::flash_gqa::FlashGqaKernels;
 use bloomery_gpu::fused::FusedKernels;
 use bloomery_gpu::gemm::Gemm32Kernels;
 use bloomery_gpu::head::{Head, HeadNorm};
-use bloomery_gpu::iq_sel::IqGateUp;
-use bloomery_gpu::kquant::{Act as GateAct, SelDown};
+use bloomery_gpu::host::leg_tier::{Hang, LegOpen, TierSide};
+use bloomery_gpu::host::refuse_tier_count;
+use bloomery_gpu::host::run::{HostRun, HostWidths};
+use bloomery_gpu::host::served::{ResidencyParts, TierBody};
+use bloomery_gpu::host::shell::TierShell;
+use bloomery_gpu::host::swap::Residency;
+use bloomery_gpu::host::swap_source::ResidencyGlue;
+use bloomery_gpu::host::tier::TierOpen;
+use bloomery_gpu::hybrid::{Chain, HostResidency, Hybrid, SlotMap};
+use bloomery_gpu::kquant::SelDown;
 use bloomery_gpu::latent::{KvGatherSelArgs, LatentAppendArgs, LatentKernels, Rows as LatentRows};
-use bloomery_gpu::model::{ChainBody, GpuModel, Q8_0GemvHeadsArgs, StepKernels};
+use bloomery_gpu::model::{
+    CardBytes, ChainBody, GpuModel, HostServed, Q8_0GemvHeadsArgs, StepKernels,
+    hosted_hybrid_tiered, refuse_scratch_past, stage_run,
+};
+use bloomery_gpu::q6k_sel::Q6kSelKernels;
 use bloomery_gpu::quant_sel::QuantSelKernels;
 use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
-use bloomery_gpu::route_softmax::{RouterBufs, RouterDims, RouterKernels};
-use bloomery_gpu::site::KGemvKernels;
+use bloomery_gpu::route_softmax::RouterOut;
+use bloomery_gpu::routed_block::{RouteIn, RouterEntry};
+use bloomery_gpu::site::{Form, KGemvKernels};
 use bloomery_gpu::weights::{DevWeight, Weights};
-use bloomery_gpu::{DeviceTensor, FaultSink, FaultSite, Gpu, GpuError, Q8Act, Window, copy_row};
+use bloomery_gpu::{DeviceTensor, FaultSink, FaultSite, Gpu, GpuError, Q8Act, copy_row};
 use bloomery_gpu_deepseek41::attn::{AttnArgs, AttnKernels, SelectedRows, segments};
 use bloomery_gpu_deepseek41::index_key::{IndexKeyInputArgs, IndexKeyKernels};
 use bloomery_gpu_deepseek41::indexer::{IndexerArgs, IndexerKernels, IndexerScratch};
+use bloomery_gpu_deepseek41::prompt_walk::{self, BatchBufs};
+use bloomery_gpu_deepseek41::transpose::TransposeKernels;
+use bloomery_levers::HostCfg;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use gguf::quant::GgmlType;
+use model::arch::mistrallarge4::host;
 use model::arch::mistrallarge4::hparams::Hparams;
-use model::arch::names::token_embd;
-use models::shape::{MoeShape, rules};
-use std::ops::Range;
+use model::arch::mistrallarge4::place::{PROMPT_ROWS, PlanInputs};
+use model::arch::mistrallarge4::sites::SelUp;
+use model::arch::names;
+use model::embed::EmbedTable;
+use model::placement::Plan;
+use runtime::layer::{Layer as LayerKind, hosted};
 
-use crate::tensors::{self, Ffn, Kind, Layer};
+use crate::features::FeatureTap;
+use crate::ffn::{self, Routed, RoutedDims, Router};
+use crate::prefill::{Prefill, T_MAX};
+use crate::resid;
+use crate::tensors::{self, Kind, Layer, VUp};
+use crate::tier;
 
-const WHAT: &str = "mistrallarge4::Body::load";
-const STEP: &str = "mistrallarge4::Body::enqueue_chain";
+/// The sequence a server saves, parks and cuts, and the media rows a prompt takes
+/// (`seat.rs`, a child module for the stores it reads).
+#[path = "seat.rs"]
+pub mod seat;
 
-/// The experts the routing body softmaxes over: the softmax instance's own
-/// width (`route_softmax::ROW`), the real file's expert count. A file of
-/// fewer experts (the fixture's 16) routes through it on pad lanes the picks
-/// never reach.
-const ROUTE_WIDTH: usize = bloomery_gpu::route_softmax::ROW.experts() as usize;
+/// The verify of several rows behind `Rows` (`rows.rs`, a child module for
+/// the step's buffers it binds per row).
+#[path = "rows.rs"]
+pub mod rows;
 
-/// The f32 that fills the routing body's pad lanes: finite, and its
-/// probability `exp(f32::MIN − max)` is exactly zero, so a pad lane never
-/// enters the top-k — every real lane's probability is at least zero at a
-/// smaller id, and the tie rule keeps the smaller id.
-const ROUTE_PAD: f32 = f32::MIN;
+pub(crate) const WHAT: &str = "mistrallarge4::Body::load";
+pub(crate) const STEP: &str = "mistrallarge4::Body::enqueue_chain";
+
+/// The placed model.
+pub type MistralLarge4Model = GpuModel<Body>;
 
 /// The step's word buffers, refreshed before a replay: the position (read at
-/// word 0 by every launch that takes a position), the indexer's counts
-/// (`n_vis` written by the embedding launch, `top_k` once at load, the token
-/// beside them), the walk's visible pair and the selected attention's count.
+/// word 0 by every launch that takes a position), the indexer's counts (the
+/// live rows and the list's width), the walk's visible pair and the selected
+/// attention's count.
 mod words {
     /// The position, word 0 of its own buffer.
     pub(crate) const POS: usize = 0;
-    /// `ints[0]`: the live rows, the embedding launch's own `n_keys` write.
+    /// `ints[0]`: the live rows, `pos + 1`.
     pub(crate) const N_VIS: usize = 0;
     /// `ints[1]`: the list's width, written once at load.
     pub(crate) const TOP_K: usize = 1;
@@ -126,23 +164,28 @@ mod words {
     pub(crate) const N_KEYS: usize = 0;
 }
 
-/// The kernels the step launches beyond the `Gpu`'s own.
-struct Kernels {
-    fused: FusedKernels,
-    latent: LatentKernels,
-    flash: FlashKernels,
-    attn: AttnKernels,
-    index_key: IndexKeyKernels,
+/// The kernels the step launches beyond the `Gpu`'s own and the routed
+/// block's.
+pub(crate) struct Kernels {
+    pub(crate) fused: FusedKernels,
+    pub(crate) latent: LatentKernels,
+    pub(crate) flash: FlashKernels,
+    pub(crate) attn: AttnKernels,
+    pub(crate) index_key: IndexKeyKernels,
     /// The lightning indexer at the file's two rope widths: a roped layer's
     /// `rope.dimension_count`, and 0 on a NoPE layer's index head.
-    indexer_rope: IndexerKernels,
-    indexer_nope: IndexerKernels,
-    router: RouterKernels,
+    pub(crate) indexer_rope: IndexerKernels,
+    pub(crate) indexer_nope: IndexerKernels,
+    /// The prompt batch's layout change before an indexer launch: its rows' index queries and
+    /// head weights, written a row a token, into the score pass's token per column.
+    pub(crate) transpose: TransposeKernels,
     iq: QuantSelKernels,
     step: StepKernels,
-    kgemv: KGemvKernels,
-    g32: Gemm32Kernels,
-    flash_gqa: FlashGqaKernels,
+    pub(crate) kgemv: KGemvKernels,
+    pub(crate) g32: Gemm32Kernels,
+    pub(crate) flash_gqa: FlashGqaKernels,
+    /// The Q6_K down `_sel`, the heads' up-projection of a Q6_K `attn_v_b`.
+    q6: Q6kSelKernels,
 }
 
 impl Kernels {
@@ -157,65 +200,57 @@ impl Kernels {
             index_key: IndexKeyKernels::load(ctx)?,
             indexer_rope: IndexerKernels::with_shape(ctx, heads, dim, rope)?,
             indexer_nope: IndexerKernels::with_shape(ctx, heads, dim, 0)?,
-            router: RouterKernels::load(ctx)?,
+            transpose: TransposeKernels::load(ctx)?,
             iq: QuantSelKernels::load(ctx, gpu.fault_word())?,
             step: StepKernels::load(ctx)?,
             kgemv: KGemvKernels::load(gpu)?,
             g32: Gemm32Kernels::load(ctx)?,
             flash_gqa: FlashGqaKernels::load(ctx)?,
+            q6: Q6kSelKernels::load(ctx, gpu.fault_word())?,
         })
     }
 }
 
 /// The widths the step's buffers are cut for, from the file's own keys.
 #[derive(Clone, Copy)]
-struct Shape {
-    hidden: usize,
-    heads: usize,
+pub(crate) struct Shape {
+    pub(crate) hidden: usize,
+    pub(crate) heads: usize,
     /// `attention.key_length_mla`: a query head's whole width.
-    head_k: usize,
-    head_v: usize,
+    pub(crate) head_k: usize,
+    pub(crate) head_v: usize,
     /// `attention.kv_lora_rank`: the cached latent's width.
-    latent: usize,
+    pub(crate) latent: usize,
     /// `rope.dimension_count`.
-    rope: usize,
+    pub(crate) rope: usize,
     /// `attention.indexer.head_count` and `key_length`: the lightning
     /// indexer's own heads of values.
-    idx_heads: usize,
-    idx_d: usize,
+    pub(crate) idx_heads: usize,
+    pub(crate) idx_d: usize,
     /// `attention.indexer.top_k`: the list's width.
-    top_k: usize,
-    experts: usize,
-    used: usize,
-    ff: usize,
-    /// The dense lead's width, the widest gate·up the step runs.
-    dense_ff: usize,
-    n_shared: usize,
-    eps: f32,
+    pub(crate) top_k: usize,
+    pub(crate) experts: usize,
+    pub(crate) used: usize,
+    pub(crate) ff: usize,
+    pub(crate) eps: f32,
     /// The indexer's LayerNorms' own epsilon.
-    idx_eps: f32,
-    ctx: usize,
-    n_layer: usize,
-    softcap: f32,
-}
-
-impl Shape {
-    /// The rope part of a cache row: a roped layer's `rope`, none on NoPE.
-    fn pe(&self, rope_layer: bool) -> usize {
-        if rope_layer { self.rope } else { 0 }
-    }
+    pub(crate) idx_eps: f32,
+    pub(crate) ctx: usize,
+    pub(crate) n_layer: usize,
+    pub(crate) softcap: f32,
 }
 
 /// A full indexer layer's stores.
-struct IdxStore {
-    keys: DeviceTensor<u16>,
+pub(crate) struct IdxStore {
+    pub(crate) keys: DeviceTensor<u16>,
     list: DeviceBuffer<u32>,
     scratch: IndexerScratch,
 }
 
 /// The step's own buffers, allocated once at load.
-struct Scratch {
-    xn: DeviceBuffer<f32>,
+pub(crate) struct Scratch {
+    /// The attention's normed row, and the dense lead's.
+    pub(crate) xn: DeviceBuffer<f32>,
     x_ln: DeviceBuffer<f32>,
     q: DeviceBuffer<f32>,
     q_rope: DeviceBuffer<f32>,
@@ -232,28 +267,21 @@ struct Scratch {
     kidx: DeviceBuffer<f32>,
     kidx_moved: DeviceBuffer<f32>,
     att: DeviceBuffer<f32>,
+    /// The heads' latent outputs in the q8_1 form a down `_sel` v_b reads,
+    /// one column a head, and the ids that make each head its own expert.
+    v_act: Q8Act,
+    v_ids: DeviceBuffer<u32>,
     av: DeviceBuffer<f32>,
-    r: DeviceBuffer<f32>,
-    ffn_inp: DeviceBuffer<f32>,
-    /// The dense lead's and the shared expert's gate, up and rule output,
-    /// the widest of the two.
-    g: DeviceBuffer<f32>,
-    u: DeviceBuffer<f32>,
-    act: DeviceBuffer<f32>,
-    up: DeviceBuffer<f32>,
-    rows: DeviceBuffer<f32>,
-    moe: DeviceBuffer<f32>,
-    sh: DeviceBuffer<f32>,
-    ffn_out: DeviceBuffer<f32>,
+    /// The attention's output projection, the residual's delta.
+    pub(crate) r: DeviceBuffer<f32>,
+    /// The attention residual (mainline's `ffn_inp`), the routed block's
+    /// input.
+    pub(crate) ffn_inp: DeviceBuffer<f32>,
+    /// The dense lead's block output.
+    pub(crate) ffn_out: DeviceBuffer<f32>,
     /// The rope layer's gathered cache rows, `top_k` of the cache's width.
     gathered: DeviceTensor<u16>,
     pos: DeviceBuffer<u32>,
-    /// The token's own word, the embedding lookup's id.
-    token: DeviceBuffer<u32>,
-    /// The embedding's redundant position write (`pos0 + first`, the same
-    /// value the refresh wrote), kept out of `pos` so the launch reads one
-    /// and writes the other.
-    pos_out: DeviceBuffer<u32>,
     ints: DeviceBuffer<u32>,
     vis: DeviceBuffer<u32>,
     n_keys: DeviceBuffer<u32>,
@@ -267,7 +295,6 @@ struct Scratch {
     part_ms: DeviceBuffer<f32>,
     sinks: DeviceBuffer<f32>,
     host_pos: Vec<u32>,
-    host_token: Vec<u32>,
     host_ints: Vec<u32>,
     host_vis: Vec<u32>,
     host_n_keys: Vec<u32>,
@@ -280,7 +307,7 @@ struct Scratch {
 /// index head's `[rope | nope]` file order as the kernels' `[nope | rope]`
 /// tail order, one table the queries' projection width and one the key's,
 /// and the flash row's rope spans out of the roped columns.
-struct Perm {
+pub(crate) struct Perm {
     /// `(src, dst)` over the queries' projection, a head's block at a time.
     q: (DeviceBuffer<u32>, DeviceBuffer<u32>),
     /// The key projection's own, one head.
@@ -325,7 +352,7 @@ pub struct LayerNodes {
     pub moe: Vec<f32>,
     pub sh: Vec<f32>,
     pub ffn_out: Vec<f32>,
-    /// The routing of a routed layer: the real lanes' logits, the kept ids,
+    /// The routing of a routed layer: the experts' logits, the kept ids,
     /// their probabilities and their renormalized weights.
     pub route_logits: Vec<f32>,
     pub route_ids: Vec<u32>,
@@ -333,43 +360,112 @@ pub struct LayerNodes {
     pub route_weights: Vec<f32>,
 }
 
+/// The body: the shape, each layer's tensors and stores, the kernels, the
+/// activation forms, the step's buffers, the routed blocks and the host tier.
 pub struct Body {
-    sh: Shape,
-    layers: Vec<Layer>,
-    stores: Vec<LayerStore>,
-    k: Kernels,
-    acts: Acts,
-    perm: Perm,
-    /// The routed layers' routing results, in layer order.
-    routes: Vec<Option<RouterBufs>>,
-    /// The experts' own activation forms: the normed row a token (the
-    /// gate·up's input) and the gate·up output a kept slot.
-    act_hidden: Q8Act,
-    act_ff: Q8Act,
-    s: Scratch,
-    table: RopeTable,
-    taps: Option<Taps>,
+    pub(crate) sh: Shape,
+    pub(crate) layers: Vec<Layer>,
+    /// Each layer's kind as the walk reads it: a dense lead runs whole in its
+    /// front, a routed layer has a host leg.
+    pub(crate) cfg: Vec<LayerKind>,
+    pub(crate) stores: Vec<LayerStore>,
+    pub(crate) k: Kernels,
+    pub(crate) acts: Acts,
+    pub(crate) perm: Perm,
+    pub(crate) s: Scratch,
+    /// The running row: the embedding, then each layer's output but the
+    /// last's, which goes to the head's input.
+    pub(crate) x: DeviceBuffer<f32>,
+    pub(crate) table: RopeTable,
+    pub(crate) taps: Option<Taps>,
+    /// The list a gate forces into a layer's selection at the last position of a call, until it
+    /// clears it.
+    pub(crate) forced: Option<Forced>,
+    /// The rows a block draft reads, when its tap is attached
+    /// ([`crate::features::attach_features`]).
+    pub(crate) feat: Option<FeatureTap>,
+    pub(crate) ffn: Routed,
+    pub(crate) shell: TierShell<HostRun>,
+    /// The slot map's card copy the routed blocks and the residency read.
+    slots: Arc<DeviceTensor<u32>>,
+    /// The token embedding, read on the host, and the step's row of it.
+    pub(crate) embed: EmbedTable,
+    row: Vec<f32>,
+    /// What the served body carries beside the step ([`seat::State`]).
+    seat: seat::State,
+    /// The buffers of a verify's rows past row 0, bound in row 0's place for
+    /// their parts of the walk ([`rows::RowSet`]).
+    pub(crate) pass_rows: rows::RowSet,
+    /// The prompt batch's units of a group (the common walk's) and its own buffers
+    /// ([`crate::prefill`]), within the plan's prompt reserve.
+    pub(crate) units: BatchBufs,
+    pub(crate) prefill: Prefill,
+    pub(crate) prompt_reserve: u64,
 }
 
 /// A layer's stores: its latent cache (an owner's), the index-key cache, the
 /// list and the scratch (a full indexer's own).
-struct LayerStore {
+pub(crate) struct LayerStore {
     /// `[ctx × (latent + pe)]` f16, `None` on a reader layer.
-    latent: Option<DeviceTensor<u16>>,
-    idx: Option<IdxStore>,
+    pub(crate) latent: Option<DeviceTensor<u16>>,
+    pub(crate) idx: Option<IdxStore>,
 }
 
-/// The per-layer staging a gate's taps read, one a layer.
-struct Taps {
-    layers: Vec<LayerTap>,
+impl LayerStore {
+    /// The layer's list, on a full indexer layer.
+    pub(crate) fn list(&self) -> Option<&DeviceBuffer<u32>> {
+        self.idx.as_ref().map(|i| &i.list)
+    }
+
+    /// The layer's latent cache, on a layer that owns one.
+    pub(crate) fn latent(&self) -> Option<&DeviceTensor<u16>> {
+        self.latent.as_ref()
+    }
+
+    /// The K/V planes the plan counts: the latent rows and the index keys.
+    fn kv_bytes(&self) -> usize {
+        self.latent.as_ref().map_or(0, |c| c.buf().num_bytes())
+            + self.idx.as_ref().map_or(0, |i| i.keys.buf().num_bytes())
+    }
+
+    /// The rest, the step's scratch: the list and the indexer's scores.
+    fn scratch_bytes(&self) -> usize {
+        self.idx
+            .as_ref()
+            .map_or(0, |i| i.list.num_bytes() + i.scratch.device_bytes())
+    }
+}
+
+/// The per-layer staging a gate's taps read, one a layer, and the router the
+/// taps rerun for a routed layer's logits and probabilities (the step's
+/// launch over the step's normed row: the same bits).
+pub(crate) struct Taps {
+    pub(crate) layers: Vec<LayerTap>,
     /// The rows that replace the running row ahead of their layer, at most
     /// one a layer.
-    inject: Vec<(usize, DeviceBuffer<f32>)>,
-    span: Option<Range<usize>>,
+    pub(crate) inject: Vec<(usize, DeviceBuffer<f32>)>,
+    pub(crate) span: Option<Range<usize>>,
+    pub(crate) router: Router,
+    pub(crate) route: RouterOut,
+}
+
+impl Taps {
+    /// Whether the chain runs layer `l`: every layer but those outside the
+    /// span.
+    pub(crate) fn runs(&self, l: usize) -> bool {
+        self.span.as_ref().is_none_or(|s| s.contains(&l))
+    }
+}
+
+/// A list a gate forces into a full layer's selection ([`Body::force_selection`]): the layer
+/// and the `top_k` rows that stand for its pick at a call's last position.
+pub(crate) struct Forced {
+    pub(crate) layer: usize,
+    pub(crate) list: DeviceBuffer<u32>,
 }
 
 /// One layer's compared values, copied as the layer leaves them.
-struct LayerTap {
+pub(crate) struct LayerTap {
     attn_norm: DeviceBuffer<f32>,
     q_cur: DeviceBuffer<f32>,
     ffn_inp: DeviceBuffer<f32>,
@@ -396,100 +492,124 @@ struct LayerTap {
     /// The heads' values up-projected (`heads × head_v`, the reference's
     /// `fattn_mla`).
     av: DeviceBuffer<f32>,
+    /// A routed layer's routed sum and shared output, made from the join's
+    /// terms; the block's output (the dense lead's own).
     moe: DeviceBuffer<f32>,
     sh: DeviceBuffer<f32>,
     ffn_out: DeviceBuffer<f32>,
+    /// A routed layer's routing: the logits, the probabilities, the kept ids
+    /// and their weights; `None` on the dense lead.
+    route: Option<RouteTap>,
     /// The layer ropes: its index taps copy the moved rows, a NoPE layer's
     /// the projections as written.
     rope: bool,
 }
 
-impl Body {
-    /// The whole model of `file` resident on `gpu`, plus the output head:
-    /// every tensor in its kernels' device format, the latent and index-key
-    /// caches of `ctx` rows, the lists, the routers' results, the rope table
-    /// and the step's buffers. Refused by name: a context past the trained
-    /// one, a head or key width the kernels do not take, an expert
-    /// count past the routing body's lanes, and every tensor-shape refusal
-    /// the sites and stacks make.
-    pub fn open(gpu: Gpu, file: Split, ctx: usize) -> Result<GpuModel<Body>, GpuError> {
-        let n_layer = Hparams::read(&file)
-            .map_err(|e| GpuError::plan(WHAT, e))?
-            .n_layer;
-        GpuModel::load_blocks(gpu, &file, ctx, 0..n_layer, true, |gpu, w| {
-            Body::load(gpu, &file, w, ctx)
-        })
-    }
+/// A routed layer's copy of its routing.
+struct RouteTap {
+    logits: DeviceBuffer<f32>,
+    probs: DeviceBuffer<f32>,
+    ids: DeviceBuffer<u32>,
+    weights: DeviceBuffer<f32>,
 }
 
 impl Body {
-    /// The body of a whole-card load.
-    fn load(gpu: &Gpu, file: &Split, w: &Weights, ctx: usize) -> Result<Body, GpuError> {
-        let hp = Hparams::read(file).map_err(|e| GpuError::plan(WHAT, e))?;
+    /// The placed load of `file` by `plan` on its card `card`: the plan's
+    /// segments resident on that card, the routed experts it keeps on the host
+    /// served by the host tier under `host`, the stores of the plan's context
+    /// and the step's buffers. One stage card runs every layer and the head;
+    /// the plan's expert tier card, when it names one, holds each routed
+    /// layer's ids after the stage's prefix and is hung under the host tier
+    /// (the tier layers' join is the common routed block's). Both files of
+    /// the family load through this one path.
+    ///
+    /// # Errors
+    /// A plan of other than one stage card, more expert tier cards than the
+    /// host tier serves, a context past the trained one, a head, key or
+    /// expert width the kernels do not take, stores or scratch past the
+    /// plan's terms, and every refusal the sites, the routed blocks, the host
+    /// tier and the expert tier's open make.
+    pub fn open_placed(
+        file: Split,
+        plan: &Plan<'_>,
+        inputs: &PlanInputs,
+        card: usize,
+        host: HostCfg,
+    ) -> Result<MistralLarge4Model, GpuError> {
+        Body::open_placed_with(file, plan, inputs, card, host, Residency::Off)
+    }
+
+    /// [`Body::open_placed`] under `lever`: [`Residency::Off`] keeps the load's slot map for the
+    /// model's life; a [`Residency::Mid`] also holds each layer's churn pool in the host set and
+    /// starts the machine over the slot map once the body's pieces are sized, which the prompt
+    /// calls' host streaming ([`Body::set_xstream`]) runs on. The host set is read in
+    /// (`HostCfg::populate`) for the machine's source to stage from.
+    ///
+    /// # Errors
+    /// Those of [`Body::open_placed`], and the machine's own at its start.
+    pub fn open_placed_with(
+        file: Split,
+        plan: &Plan<'_>,
+        inputs: &PlanInputs,
+        card: usize,
+        host: HostCfg,
+        lever: Residency,
+    ) -> Result<MistralLarge4Model, GpuError> {
+        let tiers = TierOpen::of_machine(plan.machine)?;
+        refuse_tier_count(WHAT, tiers.len())?;
+        stage_run(WHAT, plan, card, inputs.spec.layers.len())?;
+        let run = hosted(&inputs.spec.layers).map_err(|e| GpuError::shape(WHAT, e.to_string()))?;
+        let residency = resid::spec(lever, inputs, run.len())?;
+        GpuModel::load_placed_with(
+            file,
+            plan,
+            card,
+            host,
+            residency,
+            |_, _, _, _| Ok(()),
+            |gpu, file, w, set, glue| {
+                Body::load(
+                    gpu,
+                    file,
+                    w,
+                    (plan, inputs, card),
+                    host,
+                    (set, glue),
+                    &tiers,
+                )
+            },
+        )
+    }
+
+    /// The body of a placed load (`open_placed`'s arguments as the loader
+    /// hands them on).
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the checked load: the shape's refusals, the stores against the plan, the routed blocks, the host tier, the rope table"
+    )]
+    fn load(
+        gpu: &Gpu,
+        file: &Arc<Split>,
+        w: &Weights,
+        (plan, inputs, card): (&Plan<'_>, &PlanInputs, usize),
+        host_cfg: HostCfg,
+        (set, glue): (HostResidency, ResidencyGlue),
+        tiers: &[TierOpen],
+    ) -> Result<Body, GpuError> {
+        gpu.context().bind_to_thread()?;
+        let split: &Split = file;
+        let spec = &inputs.spec;
+        let hp = &inputs.hp;
+        let (_, ctx) = stage_run(WHAT, plan, card, spec.layers.len())?;
         // The context bound is the reader's own rule: the trained context
         // (the selected attention serves past the indexer's top-k).
-        let read =
-            model::arch::mistrallarge4::spec::read(file).map_err(|e| GpuError::plan(WHAT, e))?;
-        model::arch::mistrallarge4::spec::serve_ctx(ctx as u64, &read.spec)
+        model::arch::mistrallarge4::spec::serve_ctx(ctx as u64, spec)
             .map_err(|e| GpuError::plan(WHAT, e))?;
-        let sh = Shape {
-            hidden: hp.n_embd,
-            heads: hp.n_head,
-            head_k: hp.head_k,
-            head_v: hp.head_v,
-            latent: hp.kv_lora,
-            rope: hp.rope_dims,
-            idx_heads: hp.indexer_heads,
-            idx_d: hp.indexer_d,
-            top_k: hp.indexer_top_k,
-            experts: hp.n_expert,
-            used: hp.n_used,
-            ff: hp.expert_ff,
-            dense_ff: hp.dense_ff,
-            n_shared: hp.n_shared,
-            eps: hp.rms_eps,
-            idx_eps: hp.idx_norm_eps,
-            ctx,
-            n_layer: hp.n_layer,
-            softcap: hp.softcap,
-        };
-        // The lightning indexer's own head counts are the kernel's.
-        if sh.idx_heads != bloomery_gpu_deepseek41::indexer::HEADS
-            || sh.idx_d != bloomery_gpu_deepseek41::indexer::HEAD_DIM
-        {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "the indexer has {} heads of {}, the kernels run {} of {}",
-                    sh.idx_heads,
-                    sh.idx_d,
-                    bloomery_gpu_deepseek41::indexer::HEADS,
-                    bloomery_gpu_deepseek41::indexer::HEAD_DIM
-                ),
-            ));
-        }
-        if hp.n_expert > ROUTE_WIDTH {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "the file routes {} experts, the routing body serves at most {ROUTE_WIDTH}",
-                    hp.n_expert
-                ),
-            ));
-        }
-        if sh.top_k == 0 || sh.used == 0 || sh.used > sh.top_k {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "the list's width {} and the router's {} picks: at least one pick, at most \
-                     the list's width",
-                    sh.top_k, sh.used
-                ),
-            ));
-        }
+        let sh = Shape::of(hp, ctx)?;
+        tensors::globals(split)?;
         let stream = gpu.stream();
         let layers = (0..hp.n_layer)
-            .map(|l| tensors::layer((file, w), &hp, stream, l))
+            .map(|l| tensors::layer((split, w), hp, stream, l))
             .collect::<Result<Vec<_>, _>>()?;
         let stores = layers
             .iter()
@@ -514,41 +634,29 @@ impl Body {
                 })
             })
             .collect::<Result<Vec<_>, GpuError>>()?;
+        // The stores are the plan's K/V term to the byte: the latent rows of
+        // the layers that own a cache and the index keys of the full ones.
+        let held: usize = stores.iter().map(LayerStore::kv_bytes).sum();
+        let planned = inputs.kv.bytes(0..sh.n_layer, plan.ctx_max);
+        if held as u64 != planned {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("the stores hold {held} bytes; the plan counts {planned}"),
+            ));
+        }
         let k = Kernels::load(gpu, &sh)?;
         let acts = Acts::new(stream, layers.iter().flat_map(tensors::sites))?;
-        let act_hidden = Q8Act::with_k(stream, 1, sh.hidden)?;
-        let act_ff = Q8Act::with_slots(stream, sh.used, sh.ff)?;
-        // The routers' buffers, one a routed layer, its pad lanes written
-        // once: the launches never touch them.
-        let dims = RouterDims::of(MoeShape {
-            rule: rules::SOFTMAX_NORM,
-            experts: ROUTE_WIDTH as u32,
-            top_k: sh.used as u32,
-        })
-        .map_err(|e| GpuError::plan(WHAT, e))?;
-        let mut routes = Vec::with_capacity(layers.len());
-        let pad: Vec<f32> = std::iter::repeat_n(0.0, sh.experts)
-            .chain(std::iter::repeat_n(ROUTE_PAD, ROUTE_WIDTH - sh.experts))
-            .collect();
-        for a in &layers {
-            if matches!(a.ffn, Ffn::Moe { .. }) {
-                let mut route = RouterBufs::with_tokens(stream, dims, 1)?;
-                route.logits.copy_from_host(stream, &pad)?;
-                routes.push(Some(route));
-            } else {
-                routes.push(None);
-            }
-        }
         let mut s = Scratch::new(stream, &sh)?;
         let perm = Perm::new(stream, &sh)?;
-        // The counts that never move: the list's width, beside the live rows
-        // the embedding launch writes and the token.
-        s.ints.copy_from_host(stream, &[0, sh.top_k as u32])?;
+        // The list's width never moves; the live rows beside it the refresh
+        // writes.
+        s.host_ints[words::TOP_K] = sh.top_k as u32;
+        s.ints.copy_from_host(stream, &s.host_ints)?;
         // The rope table: YaRN at the LeRoPE factors, the attention factor
         // the form computes cancelling ggml's own magnitude scale (the
         // reader's `Yarn.magnitude` states the net, 1). The factors are the
         // file's own global tensor.
-        let spec = RopeSpec::yarn(
+        let rope = RopeSpec::yarn(
             hp.rope_base,
             hp.yarn.factor,
             hp.yarn.orig_ctx as i32,
@@ -556,174 +664,260 @@ impl Body {
             hp.yarn.beta_slow,
             sh.rope,
         )
-        .with_factors(&tensors::file_f32(file, "rope_freqs.weight", sh.rope / 2)?)
+        .with_factors(&tensors::file_f32(split, "rope_freqs.weight", sh.rope / 2)?)
         .map_err(|e| GpuError::plan(WHAT, e))?;
-        let table = RopeTable::new(&spec).map_err(|e| GpuError::plan(WHAT, e))?;
-        Ok(Body {
-            sh,
+        let table = RopeTable::new(&rope).map_err(|e| GpuError::plan(WHAT, e))?;
+        // The routed run: the layers past the dense lead, each with a host
+        // share and the card's prefix of its ids the plan keeps.
+        let cfg: Vec<LayerKind> = spec.layers.iter().map(LayerKind::of).collect();
+        let run = hosted(&spec.layers).map_err(|e| GpuError::shape(WHAT, e.to_string()))?;
+        let tier_cards: Vec<usize> = tiers.iter().map(|t| t.card).collect();
+        let map = SlotMap::of_plan_tiers(plan, card, &tier_cards, run.clone(), ffn::N_EXPERT)?;
+        let slots = Arc::new(DeviceTensor::upload(
+            stream,
+            &map.stage_view(),
+            run.len(),
+            ffn::N_EXPERT,
+        )?);
+        let mut routed = Routed::new_configured(
+            gpu,
+            split,
+            w,
+            (&spec.layers, &map, &slots),
+            RoutedDims {
+                embd: sh.hidden,
+                rms_eps: sh.eps,
+                batch_rows: T_MAX,
+            },
+            ffn::CARD,
+            ffn::CONFIG,
+        )?;
+        // The step's routed buffers, the host boundary and the expert tier's
+        // page hold a verify's rows in flight.
+        routed.arm_rows(gpu, &map, rows::PASS_ROWS)?;
+        // The plan reserves the tier's batch legs for blocks of the plan's prompt
+        // rows (`PROMPT_ROWS`, which is the prompt batch's unit `T_MAX`), so the hang
+        // makes them at that width: the reserve is checked against what the hang holds.
+        let hang = Hang {
+            tiers,
+            family: &tier::NODE_FAMILY,
+            open: LegOpen {
+                n_expert: ffn::N_EXPERT,
+                layers: cfg.len(),
+                hidden: sh.hidden,
+                n_used: ffn::N_USED,
+                rows: rows::PASS_ROWS,
+            },
+            cols: PROMPT_ROWS,
+            card_dontneed: host_cfg.card_dontneed,
+            bytes: CardBytes::File,
+        };
+        let mut hybrid = hosted_hybrid_tiered(
+            (gpu, file, plan),
+            (run.clone(), map),
+            (host_cfg, set, &glue),
+            (
+                HostWidths {
+                    embd: sh.hidden,
+                    ff: sh.ff,
+                    n_used: sh.used,
+                },
+                rows::PASS_ROWS,
+            ),
+            Some(&hang),
+            |src| host::routed_layers(src, hp, spec, run.clone()),
+        )?;
+        prompt_walk::prepare_host(gpu, &mut hybrid, T_MAX)?;
+        let embed = EmbedTable::new(Arc::clone(file), &names::token_embd(), sh.hidden)?;
+        if embed.n_vocab() != hp.n_vocab {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the embedding holds {} rows, the vocabulary {}",
+                    embed.n_vocab(),
+                    hp.n_vocab
+                ),
+            ));
+        }
+        let prompt_reserve = inputs
+            .prompt_batch_bytes(plan.machine)
+            .map_err(|e| GpuError::plan(WHAT, e))?;
+        let prefill = Prefill::new(gpu, &sh, &layers)?;
+        let pass_rows = rows::RowSet::new(stream, &sh, &stores)?;
+        let mut units = BatchBufs::new(gpu, sh.hidden, T_MAX, 1)?;
+        units.set_softcap(sh.softcap)?;
+        let mut body = Body {
             layers,
+            cfg,
             stores,
             k,
             acts,
             perm,
-            routes,
-            act_hidden,
-            act_ff,
             s,
+            x: DeviceBuffer::zeroed(stream, sh.hidden)?,
             table,
             taps: None,
-        })
+            forced: None,
+            feat: None,
+            ffn: routed,
+            shell: TierShell::new(hybrid, glue, sh.hidden, WHAT),
+            slots,
+            embed,
+            row: vec![0.0; sh.hidden],
+            seat: seat::State::of_load(gpu, file, plan, card, (planned, ctx))?,
+            pass_rows,
+            units,
+            prefill,
+            prompt_reserve,
+            sh,
+        };
+        refuse_scratch_past(
+            WHAT,
+            plan,
+            card,
+            body.scratch_bytes(),
+            "step rows, a verify's rows, activation forms, permutations, lists and index scores, \
+             the prompt batch's index scores, routed blocks, host boundary and slot map",
+        )?;
+        body.check_prompt_reserve(1)?;
+        body.start_residency(gpu)?;
+        Ok(body)
     }
 
-    /// The whole chain (the module doc's ten stages): the embedding, every
-    /// layer of the span the taps hold (all of them when none does), the
-    /// head when the span ends at the model's end.
-    fn enqueue(&mut self, gpu: &Gpu, w: &Weights, head: &mut Head) -> Result<(), GpuError> {
-        let Body {
-            sh,
-            layers,
-            stores,
-            k,
-            acts,
-            perm,
-            routes,
-            act_hidden,
-            act_ff,
-            s,
-            table: _,
-            taps,
-        } = self;
-        let sh = *sh;
-        let cx = GqaCx {
-            what: STEP,
-            gpu,
-            w,
-            kgemv: &k.kgemv,
-            g32: &k.g32,
-            flash: &k.flash_gqa,
-            mma: false,
-            out_gate: None,
-            hidden: sh.hidden,
-            eps: sh.eps,
-            n_kv: 1,
-            ctx: sh.ctx,
+    /// The step's device buffers beside the stores and the weights, and the
+    /// prompt batch's index scores (sized by the context, not the prompt
+    /// reserve's rows): what the plan's scratch term holds the load to.
+    #[must_use]
+    pub fn scratch_bytes(&self) -> usize {
+        self.s.bytes()
+            + self.x.num_bytes()
+            + self.acts.bytes()
+            + self.perm.bytes()
+            + self
+                .stores
+                .iter()
+                .map(LayerStore::scratch_bytes)
+                .sum::<usize>()
+            + self.ffn.bytes()
+            + self.shell.hybrid.boundary().device_bytes()
+            + self.slots.buf().num_bytes()
+            + self.prefill.scratch_bytes()
+            + self.pass_rows.bytes()
+    }
+
+    /// The K/V planes the stores hold: the plan's K/V term.
+    #[must_use]
+    pub fn store_bytes(&self) -> usize {
+        self.stores.iter().map(LayerStore::kv_bytes).sum()
+    }
+
+    /// The layers whose experts the card holds a prefix of (a gate's
+    /// instrument).
+    #[must_use]
+    pub fn card_layers(&self) -> Vec<usize> {
+        (0..self.cfg.len())
+            .filter(|&l| self.ffn.card_has(l))
+            .collect()
+    }
+
+    /// The routed experts the expert tier card holds of each layer (a gate's
+    /// instrument): 0 on a layer off the tier and on every layer of a load
+    /// with no tier card.
+    #[must_use]
+    pub fn tier_experts(&self) -> Vec<usize> {
+        (0..self.cfg.len()).map(|l| self.ffn.tier_k(l)).collect()
+    }
+
+    /// The host tier.
+    #[must_use]
+    pub fn hybrid(&self) -> &Hybrid<HostRun> {
+        self.shell.hybrid()
+    }
+}
+
+impl Shape {
+    /// The widths of `hp`'s file at `ctx` positions, refused by name where the
+    /// kernels or the router do not take them: the lightning indexer's own
+    /// heads and width, an expert count other than the router's, a pick count
+    /// other than the router's or past the list's width.
+    fn of(hp: &Hparams, ctx: usize) -> Result<Shape, GpuError> {
+        let sh = Shape {
+            hidden: hp.n_embd,
+            heads: hp.n_head,
+            head_k: hp.head_k,
+            head_v: hp.head_v,
+            latent: hp.kv_lora,
+            rope: hp.rope_dims,
+            idx_heads: hp.indexer_heads,
+            idx_d: hp.indexer_d,
+            top_k: hp.indexer_top_k,
+            experts: hp.n_expert,
+            used: hp.n_used,
+            ff: hp.expert_ff,
+            eps: hp.rms_eps,
+            idx_eps: hp.idx_norm_eps,
+            ctx,
+            n_layer: hp.n_layer,
+            softcap: hp.softcap,
         };
-        let stream = gpu.stream();
-        let elem = gpu.elem();
-        // 1. the embedding row, the position and the live count the
-        //    launches below read (the position written back unchanged, the
-        //    count the indexer's own `n_vis` word).
+        // The lightning indexer's own head counts are the kernel's.
+        if sh.idx_heads != bloomery_gpu_deepseek41::indexer::HEADS
+            || sh.idx_d != bloomery_gpu_deepseek41::indexer::HEAD_DIM
         {
-            let DevWeight::KQuant {
-                ty: GgmlType::Q6_K,
-                w: table,
-                ..
-            } = w.resident(STEP, &token_embd())?
-            else {
-                return Err(GpuError::tensor(
-                    STEP,
-                    token_embd(),
-                    "a Q6_K embedding table",
-                ));
-            };
-            let ids = Window::<u32>::of(&s.token, 0, 1)?;
-            elem.enqueue_embed_rows_kquant(
-                stream,
-                GgmlType::Q6_K,
-                bloomery_gpu::elem::EmbedRowsArgs {
-                    w: table,
-                    ids: &ids,
-                    pos0: &s.pos,
-                    first: 0,
-                    y: head.input_mut(),
-                    pos: &mut s.pos_out,
-                    n_keys: &mut s.ints,
-                },
-            )?;
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the indexer has {} heads of {}, the kernels run {} of {}",
+                    sh.idx_heads,
+                    sh.idx_d,
+                    bloomery_gpu_deepseek41::indexer::HEADS,
+                    bloomery_gpu_deepseek41::indexer::HEAD_DIM
+                ),
+            ));
         }
-        let span = taps
-            .as_ref()
-            .and_then(|t| t.span.clone())
-            .unwrap_or(0..sh.n_layer);
-        for l in span.clone() {
-            if let Some((_, row)) = taps
-                .as_ref()
-                .and_then(|t| t.inject.iter().find(|(at, _)| *at == l))
-            {
-                copy_row(stream, row, head.input_mut(), sh.hidden)?;
-            }
-            attention(
-                gpu,
-                w,
-                k,
-                sh,
-                &cx,
-                &layers[l],
-                l,
-                stores,
-                acts,
-                perm,
-                s,
-                head.input(),
-                gpu.layer_sink(l)?,
-            )?;
-            // The attention's norm row: the ffn's own `rms_norm` reuses the
-            // same scratch, so its tap copies before the ffn runs.
-            if let Some(t) = taps.as_mut() {
-                t.layers[l].snap_attention(stream, s, sh)?;
-            }
-            ffn(
-                gpu,
-                k,
-                sh,
-                &cx,
-                (&layers[l], l),
-                routes,
-                acts,
-                (act_hidden, act_ff),
-                s,
-                head.input_mut(),
-            )?;
-            if let Some(t) = taps.as_mut() {
-                let list = stores[layers[l].kind.indexer]
-                    .idx
-                    .as_ref()
-                    .map(|st| &st.list);
-                let cache = (layers[l].kind.cache == l)
-                    .then(|| stores[l].latent.as_ref())
-                    .flatten();
-                t.layers[l].snap(stream, s, head.input(), list, cache, sh)?;
-            }
+        if (sh.experts, sh.used) != (ffn::N_EXPERT, ffn::N_USED) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the file routes {} experts and picks {}, the router serves exactly {} and {}",
+                    sh.experts,
+                    sh.used,
+                    ffn::N_EXPERT,
+                    ffn::N_USED
+                ),
+            ));
         }
-        if span.end == sh.n_layer {
-            let softcap = sh.softcap;
-            let n_vocab = head.n_vocab();
-            head.enqueue_with_tail(gpu, w, |act, out_w, fault, logits, token_out| {
-                gpu.enqueue_gemv_q6k(out_w, act, logits)?;
-                // 0 is no cap: the reference graph caps only on a nonzero bound.
-                if softcap > 0.0 {
-                    elem.enqueue_softcap_rows(gpu.stream(), logits, n_vocab, softcap)?;
-                }
-                elem.enqueue_argmax_fault(gpu.stream(), logits, n_vocab, fault, token_out)
-            })?;
+        if sh.top_k == 0 || sh.used > sh.top_k {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the list's width {} and the router's {} picks: at most the list's width",
+                    sh.top_k, sh.used
+                ),
+            ));
         }
-        Ok(())
+        Ok(sh)
+    }
+
+    /// The rope part of a cache row: a roped layer's `rope`, none on NoPE.
+    pub(crate) fn pe(&self, rope_layer: bool) -> usize {
+        if rope_layer { self.rope } else { 0 }
     }
 }
 
 impl Scratch {
     /// The step's buffers, `hidden`-wide rows and the attention partials at
-    /// the wider of the flash's segments over the scratch and the walk's
-    /// over the context.
+    /// the wider of the flash's segments and the walk's over the one-row
+    /// window and the selected list (the walk reads `top_k` rows of the
+    /// cache, whatever the context).
     fn new(stream: &CudaStream, sh: &Shape) -> Result<Scratch, GpuError> {
         let z = |n: usize| -> Result<DeviceBuffer<f32>, GpuError> {
             Ok(DeviceBuffer::zeroed(stream, n)?)
         };
         let width = sh.latent + sh.rope;
         let (idx_q, idx_d) = (sh.idx_heads * sh.idx_d, sh.idx_d);
-        let wide_ff = sh.dense_ff.max(sh.n_shared * sh.ff);
         let q_rows = sh.heads;
-        let segs = segments_for(sh.top_k).max(segments(0, sh.ctx));
+        let segs = segments_for(sh.top_k).max(segments(1, sh.top_k));
         let sinks: Vec<f32> = std::iter::repeat_n(f32::NEG_INFINITY, sh.heads).collect();
         Ok(Scratch {
             xn: z(sh.hidden)?,
@@ -740,21 +934,14 @@ impl Scratch {
             kidx: z(idx_d)?,
             kidx_moved: z(idx_d)?,
             att: z(sh.heads * sh.latent)?,
+            v_act: Q8Act::with_slots(stream, sh.heads, sh.latent)?,
+            v_ids: DeviceBuffer::from_host(stream, &(0..sh.heads as u32).collect::<Vec<u32>>())?,
             av: z(sh.heads * sh.head_v)?,
             r: z(sh.hidden)?,
             ffn_inp: z(sh.hidden)?,
-            g: z(wide_ff)?,
-            u: z(wide_ff)?,
-            act: z(wide_ff)?,
-            up: z(sh.used * sh.ff)?,
-            rows: z(sh.used * sh.hidden)?,
-            moe: z(sh.hidden)?,
-            sh: z(sh.hidden)?,
             ffn_out: z(sh.hidden)?,
             gathered: DeviceTensor::zeroed(stream, sh.top_k, width)?,
             pos: DeviceBuffer::zeroed(stream, 1)?,
-            token: DeviceBuffer::zeroed(stream, 1)?,
-            pos_out: DeviceBuffer::zeroed(stream, 1)?,
             ints: DeviceBuffer::zeroed(stream, 2)?,
             vis: DeviceBuffer::zeroed(stream, 2)?,
             n_keys: DeviceBuffer::zeroed(stream, 1)?,
@@ -765,7 +952,6 @@ impl Scratch {
             part_ms: z(q_rows * segs * 2)?,
             sinks: DeviceBuffer::from_host(stream, &sinks)?,
             host_pos: vec![0; 1],
-            host_token: vec![0; 1],
             host_ints: vec![0, 0],
             host_vis: vec![0; 2],
             host_n_keys: vec![0; 1],
@@ -826,29 +1012,74 @@ impl Perm {
         )?;
         Ok(Perm { q, k, f_rope })
     }
+    /// The tables' device bytes.
+    fn bytes(&self) -> usize {
+        [&self.q, &self.k, &self.f_rope]
+            .into_iter()
+            .map(|(src, dst)| src.num_bytes() + dst.num_bytes())
+            .sum()
+    }
 }
 
 /// The attention's logit scale: `1/√key_length_mla`, the reference's own
 /// (`kq_scale` of its graph — YaRN without magnitude scaling).
-fn kq_scale(sh: Shape) -> f32 {
+pub(crate) fn kq_scale(sh: Shape) -> f32 {
     1.0 / (sh.head_k as f32).sqrt()
 }
 
 /// The resident i-quant stack `name`'s word tensor.
-fn stack<'w>(w: &'w Weights, name: &str) -> Result<&'w DeviceTensor<u32>, GpuError> {
+pub(crate) fn stack<'w>(w: &'w Weights, name: &str) -> Result<&'w DeviceTensor<u32>, GpuError> {
     match w.resident(STEP, name)? {
         DevWeight::KQuant { w: t, .. } => Ok(t),
         _ => Err(GpuError::tensor(STEP, name, "an i-quant stack")),
     }
 }
 
+/// The down `_sel` of `family` over `down`'s stack, for the heads' up-projection:
+/// the launcher the table's entry for the stack's type names (`ty` is the file's
+/// type, which the i-quant launcher takes).
+pub(crate) fn up_sel(
+    gpu: &Gpu,
+    k: &Kernels,
+    (family, ty): (SelUp, GgmlType),
+    down: &SelDown<'_>,
+    fault: FaultSink,
+    y: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    let stream = gpu.stream();
+    match family {
+        SelUp::Q4k => gpu.q4k_sel().enqueue_gemv_q4k_sel(
+            stream,
+            down.w,
+            down.act,
+            down.sel,
+            down.n_slots,
+            down.rows_per_expert,
+            y,
+        ),
+        SelUp::Q5k => k.iq.enqueue_gemv_q5k_sel(stream, down, fault, y),
+        SelUp::Q6k => k.q6.enqueue_gemv_q6k_sel(
+            stream,
+            down.w,
+            down.act,
+            down.sel,
+            down.n_slots,
+            down.rows_per_expert,
+            y,
+        ),
+        SelUp::IQuant => k.iq.enqueue_gemv_sel(stream, ty, down, fault, y),
+    }
+}
+
 /// The attention half of layer `l` (the module doc's stages 2–8): `x` in,
-/// the residual's delta into `s.r`.
+/// the residual's delta into `s.r`; the residual add is the caller's. A
+/// `forced` list replaces the pick of a full layer's top-k before the
+/// attention reads it.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the half's launches: its card, weights and kernels, the shape, the site context, the layer and its number, the stores, the activation forms, the permutations, the buffers, the running row and the fault sink (rust-quality R8)"
+    reason = "the half's launches: its card, weights and kernels, the shape, the site context, the layer and its number, the stores, the activation forms, the permutations, the buffers, the running row, a gate's forced list and the fault sink (rust-quality R8)"
 )]
-fn attention(
+pub(crate) fn attention(
     gpu: &Gpu,
     w: &Weights,
     k: &Kernels,
@@ -861,25 +1092,27 @@ fn attention(
     perm: &Perm,
     s: &mut Scratch,
     x: &DeviceBuffer<f32>,
+    forced: Option<&DeviceBuffer<u32>>,
     fault: FaultSink,
 ) -> Result<(), GpuError> {
     let stream = gpu.stream();
     let elem = gpu.elem();
     let (rope, pe) = (a.kind.rope, sh.pe(a.kind.rope));
     let width = sh.latent + pe;
-    // 2. the norm and its q8_1 form, one launch.
-    let act = acts.q8_1_at(STEP, sh.hidden, 1)?;
-    k.fused.enqueue_norm_quant(
-        stream,
-        x,
-        w.f32_buf(STEP, &a.attn_norm)?,
-        sh.eps,
-        act,
-        &mut s.xn,
-        fault,
-    )?;
-    // 3. the query projection and the rope of its columns.
-    a.q.kgemv(cx, act, l, &mut s.q)?;
+    // 2. the norm, and 3. the query projection: a site that reads the q8_1
+    //    rows takes the norm and its q8_1 form in one launch, any other
+    //    quantizes its own form from the normed row.
+    let gain = w.f32_buf(STEP, &a.attn_norm)?;
+    if a.q.reads() == Form::Q8x128 {
+        let act = acts.q8_1_at(STEP, sh.hidden, 1)?;
+        k.fused
+            .enqueue_norm_quant(stream, x, gain, sh.eps, act, &mut s.xn, fault)?;
+        a.q.kgemv(cx, act, l, &mut s.q)?;
+    } else {
+        elem.enqueue_rms_norm(stream, x, gain, sh.eps, sh.hidden, 1, &mut s.xn)?;
+        a.q.project(cx, acts, l, &s.xn, &mut s.q)?;
+    }
+    // The rope of the query's columns.
     if rope {
         elem.enqueue_rope(
             stream,
@@ -1034,6 +1267,10 @@ fn attention(
         };
         indexer.enqueue_score(stream, &mut args)?;
         indexer.enqueue_topk(stream, &mut args, &s.ints, words::N_VIS, words::TOP_K)?;
+        // A gate's forced list stands for the pick the top-k just made.
+        if let Some(list) = forced {
+            st.list.copy_from_device_async(list, stream)?;
+        }
     }
     // 6. the absorbed query: each head's nope slice dotted into the latent
     //    width, a rope layer's flash row `[q_rope | q_nope2]` assembled and
@@ -1179,137 +1416,52 @@ fn attention(
         r?;
     }
     // 8. the heads' values up-projected, the output projection.
-    let (qs, dd) = w.q8_planes(STEP, &a.v_b)?;
-    k.step.enqueue_q8_0_gemv_heads(
-        stream,
-        Q8_0GemvHeadsArgs {
-            qs,
-            d: dd,
-            x: &s.att,
-            rows_per_head: sh.head_v,
-            x_head_stride: sh.latent,
-            y_head_stride: sh.head_v,
-            y_off: 0,
-            y: &mut s.av,
-        },
-    )?;
-    a.o.project(cx, acts, l, &s.av, &mut s.r)
-}
-
-/// The feed-forward half of layer `l` (stage 9): `s.r` and the residual `x`
-/// in, the block's output added to the residual into `x` itself.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the half's launches: its card and kernels, the shape, the site context, the layer and its number, the routing results, the activation forms, the buffers and the residual (rust-quality R8)"
-)]
-fn ffn(
-    gpu: &Gpu,
-    k: &Kernels,
-    sh: Shape,
-    cx: &GqaCx<'_>,
-    (a, l): (&Layer, usize),
-    routes: &mut [Option<RouterBufs>],
-    acts: &mut Acts,
-    (act_hidden, act_ff): (&mut Q8Act, &mut Q8Act),
-    s: &mut Scratch,
-    x: &mut DeviceBuffer<f32>,
-) -> Result<(), GpuError> {
-    let stream = gpu.stream();
-    let elem = gpu.elem();
-    let fault = gpu.layer_sink(l)?;
-    // The block's input is the residual first — the reference's `ffn_inp` —
-    // and the block runs on its norm.
-    elem.enqueue_add(stream, x, &s.r, sh.hidden, &mut s.ffn_inp)?;
-    elem.enqueue_rms_norm(
-        stream,
-        &s.ffn_inp,
-        cx.w.f32_buf(STEP, &a.ffn_norm)?,
-        sh.eps,
-        sh.hidden,
-        1,
-        &mut s.xn,
-    )?;
-    match &a.ffn {
-        Ffn::Dense(d) => {
-            d.gate.project(cx, acts, l, &s.xn, &mut s.g)?;
-            d.up.project(cx, acts, l, &s.xn, &mut s.u)?;
-            elem.enqueue_swiglu(stream, &s.g, &s.u, sh.dense_ff, &mut s.act)?;
-            d.down.project(cx, acts, l, &s.act, &mut s.ffn_out)?;
+    match &a.v_b {
+        VUp::Planes(name) => {
+            let (qs, dd) = w.q8_planes(STEP, name)?;
+            k.step.enqueue_q8_0_gemv_heads(
+                stream,
+                Q8_0GemvHeadsArgs {
+                    qs,
+                    d: dd,
+                    x: &s.att,
+                    rows_per_head: sh.head_v,
+                    x_head_stride: sh.latent,
+                    y_head_stride: sh.head_v,
+                    y_off: 0,
+                    y: &mut s.av,
+                },
+            )?;
         }
-        Ffn::Moe {
-            router,
-            gate,
-            up,
-            down,
-            ty,
-            ty_down,
-            shared,
-        } => {
-            let route = routes[l].as_mut().ok_or_else(|| GpuError::State {
-                what: STEP,
-                missing: "the layer's routing results",
-            })?;
-            let w_router = cx.w.f32_tensor(STEP, router)?;
-            gpu.q8f32()
-                .enqueue_f32_gemv(stream, w_router, &s.xn, 1, &mut route.logits)?;
-            k.router.enqueue_route(stream, 1, fault, route)?;
-            gpu.enqueue_quantize_q8_1_layer(&s.xn, act_hidden, l)?;
-            k.iq.enqueue_gate_up(
-                stream,
-                &IqGateUp {
-                    ty: *ty,
-                    wg: stack(cx.w, gate)?,
-                    wu: stack(cx.w, up)?,
-                    act: act_hidden,
-                    sel: &route.ids,
-                    n_slots: sh.used,
-                    rows_per_expert: sh.ff,
-                    slots_per_col: sh.used,
-                    rule: GateAct::SiluMul,
-                },
-                fault,
-                &mut s.up,
-            )?;
-            gpu.enqueue_quantize_q8_1_layer(&s.up, act_ff, l)?;
-            k.iq.enqueue_gemv_sel(
-                stream,
-                *ty_down,
-                &SelDown {
-                    w: stack(cx.w, down)?,
-                    act: act_ff,
-                    sel: &route.ids,
-                    n_slots: sh.used,
-                    rows_per_expert: sh.hidden,
-                },
-                fault,
-                &mut s.rows,
-            )?;
-            elem.enqueue_weighted_sum(
-                stream,
-                &s.rows,
-                &route.weights,
-                sh.hidden,
-                sh.used as u32,
-                1,
-                &mut s.moe,
-            )?;
-            shared.gate.project(cx, acts, l, &s.xn, &mut s.g)?;
-            shared.up.project(cx, acts, l, &s.xn, &mut s.u)?;
-            let shared_ff = sh.n_shared * sh.ff;
-            elem.enqueue_swiglu(stream, &s.g, &s.u, shared_ff, &mut s.act)?;
-            shared.down.project(cx, acts, l, &s.act, &mut s.sh)?;
-            elem.enqueue_add(stream, &s.moe, &s.sh, sh.hidden, &mut s.ffn_out)?;
+        // The heads are the experts of the stack, each reading its own column
+        // of the latent outputs: slot `h` writes head `h`'s `head_v` values
+        // where the per-head gemv would.
+        VUp::Sel { name, ty, family } => {
+            gpu.enqueue_quantize_q8_1_layer(&s.att, &mut s.v_act, l)?;
+            let down = SelDown {
+                w: stack(w, name)?,
+                act: &s.v_act,
+                sel: &s.v_ids,
+                n_slots: sh.heads,
+                rows_per_expert: sh.head_v,
+            };
+            up_sel(gpu, k, (*family, *ty), &down, fault, &mut s.av)?;
         }
     }
-    // The block's output back into the running row.
-    elem.enqueue_add(stream, &s.ffn_inp, &s.ffn_out, sh.hidden, x)
+    a.o.project(cx, acts, l, &s.av, &mut s.r)
 }
 
 impl LayerTap {
     /// The tap's buffers, sized by the layer's kind (a rope layer's flash
     /// row is the cache's width, a NoPE layer's the latent alone; a shared
-    /// layer keeps no indexer taps).
-    fn new(stream: &CudaStream, sh: &Shape, kind: Kind) -> Result<LayerTap, GpuError> {
+    /// layer keeps no indexer taps); a routed layer's routing copy as wide as
+    /// the router's buffers and the step's ids, `route`.
+    fn new(
+        stream: &CudaStream,
+        sh: &Shape,
+        kind: Kind,
+        route: Option<(&RouterOut, &DeviceBuffer<u32>)>,
+    ) -> Result<LayerTap, GpuError> {
         let z = |n: usize| -> Result<DeviceBuffer<f32>, GpuError> {
             Ok(DeviceBuffer::zeroed(stream, n)?)
         };
@@ -1335,6 +1487,16 @@ impl LayerTap {
             moe: z(sh.hidden)?,
             sh: z(sh.hidden)?,
             ffn_out: z(sh.hidden)?,
+            route: route
+                .map(|(out, ids)| -> Result<RouteTap, GpuError> {
+                    Ok(RouteTap {
+                        logits: z(out.logits.len())?,
+                        probs: z(out.probs.len())?,
+                        ids: DeviceBuffer::zeroed(stream, ids.len())?,
+                        weights: z(out.weights.len())?,
+                    })
+                })
+                .transpose()?,
             rope: kind.rope,
         })
     }
@@ -1361,6 +1523,12 @@ impl LayerTap {
             self.moe.num_bytes(),
             self.sh.num_bytes(),
             self.ffn_out.num_bytes(),
+            self.route.as_ref().map_or(0, |r| {
+                r.logits.num_bytes()
+                    + r.probs.num_bytes()
+                    + r.ids.num_bytes()
+                    + r.weights.num_bytes()
+            }),
         ]
         .into_iter()
         .sum()
@@ -1368,11 +1536,11 @@ impl LayerTap {
 
     /// Copy the layer's compared values as the layer leaves them (the
     /// module doc's): the scaled query, the two residuals, the key path's
-    /// three forms, the indexer's queries, key and weights and the block's
-    /// outputs, beside the list the layer read. Pure copies, ordered on the
-    /// engine stream; the attention's own norm row is
-    /// [`LayerTap::snap_attention`]'s.
-    fn snap(
+    /// three forms, the indexer's queries, key and weights, beside the list
+    /// the layer read. Pure copies, ordered on the engine stream; the
+    /// attention's own norm row is [`LayerTap::snap_attention`]'s, the
+    /// block's outputs [`LayerTap::snap_dense`]'s or [`LayerTap::snap_join`]'s.
+    pub(crate) fn snap(
         &mut self,
         stream: &CudaStream,
         s: &Scratch,
@@ -1406,9 +1574,6 @@ impl LayerTap {
         copy_row(stream, qi_at, &mut self.qi, qi)?;
         copy_row(stream, kidx_at, &mut self.kidx, kidx)?;
         copy_row(stream, &s.wi, &mut self.wi, wi)?;
-        copy_row(stream, &s.moe, &mut self.moe, sh.hidden)?;
-        copy_row(stream, &s.sh, &mut self.sh, sh.hidden)?;
-        copy_row(stream, &s.ffn_out, &mut self.ffn_out, sh.hidden)?;
         if let Some(list) = list {
             self.list.copy_from_device_async(list, stream)?;
         }
@@ -1421,8 +1586,8 @@ impl LayerTap {
     }
 
     /// The attention block's own norm row, copied between the attention and
-    /// the ffn: the ffn's `rms_norm` writes the same scratch.
-    fn snap_attention(
+    /// the ffn: the dense lead's `rms_norm` writes the same scratch.
+    pub(crate) fn snap_attention(
         &mut self,
         stream: &CudaStream,
         s: &Scratch,
@@ -1431,11 +1596,67 @@ impl LayerTap {
         copy_row(stream, &s.xn, &mut self.attn_norm, sh.hidden)
     }
 
-    /// The tap's values, the scratch copies and the list the layer read (the
-    /// routing is read where it lives, at [`Body::nodes`]); it synchronizes
-    /// the stream.
+    /// The dense lead's block output.
+    pub(crate) fn snap_dense(
+        &mut self,
+        stream: &CudaStream,
+        s: &Scratch,
+        sh: Shape,
+    ) -> Result<(), GpuError> {
+        copy_row(stream, &s.ffn_out, &mut self.ffn_out, sh.hidden)
+    }
+
+    /// A routed layer's outputs from its join's terms, in the join's order:
+    /// the routed sum `host + card` (mainline's `ffn_moe_out`), the shared
+    /// output, and the block's output, their sum. Each an f32 add the join
+    /// itself makes, so the copies are its bits.
+    pub(crate) fn snap_join(
+        &mut self,
+        gpu: &Gpu,
+        t: &ffn::JoinTerms<'_>,
+        sh: Shape,
+    ) -> Result<(), GpuError> {
+        let (stream, elem, n) = (gpu.stream(), gpu.elem(), sh.hidden);
+        match t.card {
+            Some(card) => elem.enqueue_add(stream, t.host, card, n, &mut self.moe)?,
+            None => copy_row(stream, t.host, &mut self.moe, n)?,
+        }
+        copy_row(stream, t.shared, &mut self.sh, n)?;
+        elem.enqueue_add(stream, &self.moe, &self.sh, n, &mut self.ffn_out)
+    }
+
+    /// A routed layer's routing: the taps' router's logits, probabilities and
+    /// weights, and the ids the step's own router picked.
+    pub(crate) fn snap_route(
+        &mut self,
+        stream: &CudaStream,
+        out: &RouterOut,
+        ids: &DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        let r = self.route.as_mut().ok_or(GpuError::State {
+            what: STEP,
+            missing: "the routing tap of a routed layer",
+        })?;
+        r.logits.copy_from_device_async(&out.logits, stream)?;
+        r.probs.copy_from_device_async(&out.probs, stream)?;
+        r.weights.copy_from_device_async(&out.weights, stream)?;
+        r.ids.copy_from_device_async(ids, stream)?;
+        Ok(())
+    }
+
+    /// The tap's values, the scratch copies, the list the layer read and a
+    /// routed layer's routing; it synchronizes the stream.
     fn to_host(&self, stream: &CudaStream) -> Result<LayerNodes, GpuError> {
         let v = |b: &DeviceBuffer<f32>| b.to_host_vec(stream);
+        let (route_logits, route_ids, route_probs, route_weights) = match &self.route {
+            None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+            Some(r) => (
+                v(&r.logits)?,
+                r.ids.to_host_vec(stream)?,
+                v(&r.probs)?,
+                v(&r.weights)?,
+            ),
+        };
         Ok(LayerNodes {
             attn_norm: v(&self.attn_norm)?,
             q_cur: v(&self.q_cur)?,
@@ -1456,33 +1677,36 @@ impl LayerTap {
             moe: v(&self.moe)?,
             sh: v(&self.sh)?,
             ffn_out: v(&self.ffn_out)?,
-            route_logits: Vec::new(),
-            route_ids: Vec::new(),
-            route_probs: Vec::new(),
-            route_weights: Vec::new(),
+            route_logits,
+            route_ids,
+            route_probs,
+            route_weights,
         })
     }
 }
 
 impl ChainBody for Body {
     type Input = DecodeInput;
-    type Host = bloomery_gpu::model::NoHost;
+    type Host = Body;
     const UNHOSTED_POOL: bloomery_levers::UnhostedPool = bloomery_levers::UnhostedPool::NotCarried;
 
     fn arch() -> model::arch::Arch {
         model::arch::Arch::MistralLarge4
     }
 
+    /// The token's embedding row, read from the file's table on the host.
     fn decode_input(&mut self, token: u32, pos: u32) -> Result<DecodeInput, GpuError> {
+        self.embed.row_into(token, &mut self.row)?;
         Ok(DecodeInput { token, pos })
     }
 
-    /// The step's words, each in one copy: the position, the token, the
-    /// walk's visible pair, the selected attention's count and the rope row
-    /// (its f32 values and their bits for the score pass's table).
+    /// The running row and the step's words, each in one copy: the
+    /// embedding row, the position, the live rows, the walk's visible pair,
+    /// the selected attention's count and the rope row (its f32 values and
+    /// their bits for the score pass's table).
     fn refresh(&mut self, stream: &CudaStream, input: &DecodeInput) -> Result<(), GpuError> {
         const WHAT: &str = "mistrallarge4::Body::refresh";
-        let DecodeInput { token, pos } = *input;
+        let DecodeInput { pos, .. } = *input;
         let sh = self.sh;
         if pos as usize >= sh.ctx {
             return Err(GpuError::shape(
@@ -1492,10 +1716,7 @@ impl ChainBody for Body {
         }
         let n = (pos + 1) as usize;
         self.s.host_pos[words::POS] = pos;
-        // `n_vis` (word 0) is the embedding launch's own write; the width
-        // beside it never moves, so the host copy carries it every step.
-        self.s.host_ints[words::TOP_K] = sh.top_k as u32;
-        self.s.host_token[0] = token;
+        self.s.host_ints[words::N_VIS] = pos + 1;
         self.s.host_vis[0] = 0;
         self.s.host_vis[1] = n.min(sh.top_k) as u32;
         self.s.host_n_keys[words::N_KEYS] = n.min(sh.top_k) as u32;
@@ -1511,9 +1732,8 @@ impl ChainBody for Body {
         self.s
             .host_table_words
             .extend(self.s.host_cs.iter().map(|f| f.to_bits()));
+        self.x.copy_from_host(stream, &self.row)?;
         self.s.pos.copy_from_host(stream, &self.s.host_pos)?;
-        self.s.token.copy_from_host(stream, &self.s.host_token)?;
-        // `n_vis` the embedding launch rewrites; the width beside it stays.
         self.s.ints.copy_from_host(stream, &self.s.host_ints)?;
         self.s.vis.copy_from_host(stream, &self.s.host_vis)?;
         self.s.n_keys.copy_from_host(stream, &self.s.host_n_keys)?;
@@ -1524,20 +1744,23 @@ impl ChainBody for Body {
         self.s
             .table_words
             .copy_from_host(stream, &self.s.host_table_words)?;
+        // The step lays one row in the feature tap, whatever replays it.
+        if let Some(f) = self.feat.as_mut() {
+            f.step.plan(1);
+        }
         Ok(())
     }
 
     fn enqueue_chain(&mut self, gpu: &Gpu, w: &Weights, head: &mut Head) -> Result<(), GpuError> {
-        self.enqueue(gpu, w, head)
+        crate::step::enqueue(gpu, w, self, head)
     }
 
     /// Rewind every store to empty: each store is a plane of positions the
     /// launches read only below the position's own live count, and every
     /// step writes its position's row before it reads it, so nothing a
-    /// later call reads survives a cut. The routers' pad lanes are the
-    /// load's own and no launch writes them.
-    fn reset(&mut self, _gpu: &Gpu) -> Result<(), GpuError> {
-        Ok(())
+    /// later call reads survives a cut. The host tier settles its exchange.
+    fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
+        self.shell.hybrid.settle(gpu.stream())
     }
 
     fn head_eps(&self) -> f32 {
@@ -1549,38 +1772,46 @@ impl ChainBody for Body {
     }
 
     fn resident_bytes(&self) -> usize {
-        let stores: usize = self
-            .stores
-            .iter()
-            .map(|st| {
-                st.latent.as_ref().map_or(0, |c| c.buf().num_bytes())
-                    + st.idx.as_ref().map_or(0, |i| {
-                        i.keys.buf().num_bytes() + i.list.num_bytes() + i.scratch.device_bytes()
-                    })
-            })
-            .sum();
-        stores
-            + self
-                .routes
-                .iter()
-                .map(|r| r.as_ref().map_or(0, RouterBufs::bytes))
-                .sum::<usize>()
-            + self.acts.bytes()
-            + self.act_hidden.device_bytes()
-            + self.act_ff.device_bytes()
-            + self.s.bytes()
+        self.store_bytes()
+            + self.scratch_bytes()
+            + self.prompt_bytes()
+            + self.prefill_tap_bytes()
+            + self.feature_bytes()
             + self
                 .taps
                 .as_ref()
-                .map_or(0, |t| t.layers.iter().map(|a| a.bytes()).sum::<usize>())
+                .map_or(0, |t| t.layers.iter().map(LayerTap::bytes).sum::<usize>())
+            + self.forced.as_ref().map_or(0, |f| f.list.num_bytes())
     }
 
     fn layers(&self) -> Range<usize> {
         0..self.layers.len()
     }
 
-    fn host(&mut self) -> Option<&mut Self::Host> {
-        None
+    fn host(&mut self) -> Option<&mut Body> {
+        Some(self)
+    }
+}
+
+impl TierBody for Body {
+    type Experts = HostRun;
+    fn hybrid(&self) -> &Hybrid<HostRun> {
+        self.shell.hybrid()
+    }
+    fn hybrid_mut(&mut self) -> &mut Hybrid<HostRun> {
+        self.shell.hybrid_mut()
+    }
+    fn residency_parts(&mut self) -> Option<ResidencyParts<'_, HostRun>> {
+        self.shell.residency_parts(&self.slots)
+    }
+    fn serve_chain(&mut self, chain: Chain) -> Result<(), GpuError> {
+        self.shell.hybrid.serve_captured_of(chain)
+    }
+}
+
+impl Drop for Body {
+    fn drop(&mut self) {
+        self.shell.hybrid.stop_swap();
     }
 }
 
@@ -1659,24 +1890,18 @@ impl Scratch {
             self.kidx.num_bytes(),
             self.kidx_moved.num_bytes(),
             self.att.num_bytes(),
+            self.v_act.device_bytes(),
+            self.v_ids.num_bytes(),
             self.av.num_bytes(),
             self.r.num_bytes(),
             self.ffn_inp.num_bytes(),
-            self.g.num_bytes(),
-            self.u.num_bytes(),
-            self.act.num_bytes(),
-            self.up.num_bytes(),
-            self.rows.num_bytes(),
-            self.moe.num_bytes(),
-            self.sh.num_bytes(),
             self.ffn_out.num_bytes(),
             self.gathered.buf().num_bytes(),
             self.pos.num_bytes(),
-            self.token.num_bytes(),
-            self.pos_out.num_bytes(),
             self.ints.num_bytes(),
             self.vis.num_bytes(),
             self.n_keys.num_bytes(),
+            self.flash_n.num_bytes(),
             self.cs.num_bytes(),
             self.table_words.num_bytes(),
             self.part_v.num_bytes(),
@@ -1697,16 +1922,37 @@ impl Body {
             self.taps = None;
             return Ok(());
         }
+        if self.feat.is_some() {
+            return Err(GpuError::shape(
+                "mistrallarge4::arm_taps",
+                "a body with a feature tap: the taps' span and injected rows would leave the \
+                 feature tap's copies standing on rows the walk did not enter",
+            ));
+        }
+        // A tier layer's card sum is made inside its join, in no buffer the
+        // taps could copy: the instrument is the single-stage load's.
+        if self.ffn.tier().is_some_and(TierSide::any) {
+            return Err(GpuError::shape(
+                "mistrallarge4::arm_taps",
+                "a load with an expert tier card: a tier layer's routed sum is made inside the \
+                 join, which the taps do not copy",
+            ));
+        }
         let stream = gpu.stream();
         let sh = self.sh;
+        let router = Router::load(gpu.context())?;
+        let route = Router::new_out(stream)?;
         let mut layers = Vec::with_capacity(sh.n_layer);
-        for a in &self.layers {
-            layers.push(LayerTap::new(stream, &sh, a.kind)?);
+        for (a, kind) in self.layers.iter().zip(&self.cfg) {
+            let routed = kind.host_leg().then(|| (&route, self.ffn.route_ids()));
+            layers.push(LayerTap::new(stream, &sh, a.kind, routed)?);
         }
         self.taps = Some(Taps {
             layers,
             inject: Vec::new(),
             span: None,
+            router,
+            route,
         });
         Ok(())
     }
@@ -1793,8 +2039,8 @@ impl Body {
     }
 
     /// The armed taps' values of `layers`, read back (a gate's instrument;
-    /// it synchronizes the stream), beside each layer's routing. Refused by
-    /// name: a range past the model's layers.
+    /// it synchronizes the stream), each routed layer's routing among them.
+    /// Refused by name: a range past the model's layers.
     pub fn nodes(&mut self, gpu: &Gpu, layers: Range<usize>) -> Result<Vec<LayerNodes>, GpuError> {
         const WHAT: &str = "mistrallarge4::nodes";
         let stream = gpu.stream();
@@ -1809,28 +2055,7 @@ impl Body {
             what: WHAT,
             missing: "the per-layer taps (arm_taps)",
         })?;
-        let mut out = Vec::with_capacity(layers.len());
-        for l in layers {
-            let t = taps.layers[l].to_host(stream)?;
-            let route = self.routes[l].as_ref();
-            let (logits, ids, probs, weights) = match route {
-                None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
-                Some(r) => (
-                    r.logits.to_host_vec(stream)?,
-                    r.ids.to_host_vec(stream)?,
-                    r.probs.to_host_vec(stream)?,
-                    r.weights.to_host_vec(stream)?,
-                ),
-            };
-            out.push(LayerNodes {
-                route_logits: logits,
-                route_ids: ids,
-                route_probs: probs,
-                route_weights: weights,
-                ..t
-            });
-        }
-        Ok(out)
+        layers.map(|l| taps.layers[l].to_host(stream)).collect()
     }
 
     pub fn index_scores(&mut self, gpu: &Gpu, l: usize) -> Result<Vec<f32>, GpuError> {
@@ -1882,21 +2107,77 @@ impl Body {
         }
     }
 
-    /// One routing launch of layer `layer`'s own buffers over a planted
-    /// weight whose expert 0 row is NaN and the rest finite and strictly
-    /// descending, at a one-hot input: a NaN lane must raise
-    /// [`FaultSite::Router`] on the fault word and be picked by no slot
-    /// (a gate's instrument; it synchronizes the stream).
+    /// Read `list`, the `top_k` rows another path picked, as full layer
+    /// `layer`'s selection at the last position of the calls that follow (a
+    /// step's position, the prompt batch's last row) in place of the pick the
+    /// layer's top-k makes, until [`Body::clear_forced_selection`]: the
+    /// instrument that runs a position again on the other path's list, to
+    /// tell an exchange at a near tie of the index scores from a defect. The
+    /// layer's scores stay its own; the shared layers after it read the
+    /// forced list as the layer's. The caller holds the graph rule. A verify
+    /// pass refuses by name while the list stands: it is the step's one pick's.
+    ///
+    /// # Errors
+    /// Refused by name: the per-layer taps unarmed, a layer that is not a
+    /// full indexer's, a list that is not `top_k` rows of the context.
+    pub fn force_selection(
+        &mut self,
+        gpu: &Gpu,
+        layer: usize,
+        list: &[u32],
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "mistrallarge4::force_selection";
+        if self.taps.is_none() {
+            return Err(GpuError::State {
+                what: WHAT,
+                missing: "the per-layer taps (arm_taps): the force is their own instrument",
+            });
+        }
+        if !self.layers.get(layer).is_some_and(|a| a.kind.full) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("layer {layer} is not a full indexer of the model"),
+            ));
+        }
+        let (top_k, ctx) = (self.sh.top_k, self.sh.ctx);
+        if list.len() != top_k || list.iter().any(|&r| r as usize >= ctx) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a list of {} rows, each inside the context's {ctx}, where the layer picks {top_k}",
+                    list.len()
+                ),
+            ));
+        }
+        self.forced = Some(Forced {
+            layer,
+            list: DeviceBuffer::from_host(gpu.stream(), list)?,
+        });
+        Ok(())
+    }
+
+    /// Drop the forced list ([`Body::force_selection`]): every layer's top-k
+    /// picks its own again.
+    pub fn clear_forced_selection(&mut self) {
+        self.forced = None;
+    }
+
+    /// One launch of the router entry the step runs, over a planted weight
+    /// whose expert 0 row is NaN and the rest finite and strictly
+    /// descending, at a one-hot input, raising on layer `layer`'s sink: a
+    /// NaN lane must raise [`FaultSite::Router`] on the fault word and be
+    /// picked by no slot (a gate's instrument; it synchronizes the stream).
     pub fn router_lane_nan(&mut self, gpu: &Gpu, layer: usize) -> Result<(bool, bool), GpuError> {
         const WHAT: &str = "mistrallarge4::router_lane_nan";
         gpu.context().bind_to_thread()?;
         let stream = gpu.stream();
         let (hidden, n_expert, used) = (self.sh.hidden, self.sh.experts, self.sh.used);
-        let route = self
-            .routes
-            .get_mut(layer)
-            .and_then(|r| r.as_mut())
-            .ok_or_else(|| GpuError::shape(WHAT, format!("layer {layer} is not a routed one")))?;
+        if !self.cfg.get(layer).is_some_and(|k| k.host_leg()) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("layer {layer} is not a routed one"),
+            ));
+        }
         let mut w = vec![0.0f32; n_expert * hidden];
         w[..hidden].fill(f32::NAN);
         for (r, logit) in w.chunks_mut(hidden).enumerate().skip(1) {
@@ -1906,11 +2187,19 @@ impl Body {
         x[0] = 1.0;
         let w_dev = DeviceTensor::upload(stream, &w, n_expert, hidden)?;
         let x_dev = DeviceBuffer::from_host(stream, &x)?;
-        gpu.q8f32()
-            .enqueue_f32_gemv(stream, &w_dev, &x_dev, 1, &mut route.logits)?;
-        self.k
-            .router
-            .enqueue_route(stream, 1, gpu.layer_sink(layer)?, route)?;
+        let router = Router::load(gpu.context())?;
+        let mut route = Router::new_out(stream)?;
+        router.route(
+            stream,
+            &x_dev,
+            &RouteIn {
+                w: &w_dev,
+                bias: None,
+                scale: 1.0,
+                fault: gpu.layer_sink(layer)?,
+            },
+            &mut route,
+        )?;
         let ids = route.ids.to_host_vec(stream)?;
         let weights = route.weights.to_host_vec(stream)?;
         let raised = gpu

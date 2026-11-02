@@ -16,13 +16,18 @@
 //  - topk.tsv: the last position's 40 largest logits and their log-softmax in f64 (rank, id, logit, logprob), ties to the
 //    lower id;
 //  - greedy.tsv: GREEDY argmax tokens continued from the prompt, each with the margin between its logit and the runner-up's
-//    (logit units), the first being the prompt's own argmax. The continuation runs without the callback.
+//    (logit units), the first being the prompt's own argmax. The continuation runs without the callback;
+//  - a decode-step prompt (--prompt NAME:IDS:NODES:GREEDY:step): every id but the last runs first without the callback, in
+//    llama_decode calls of at most -b ids, and the last id is the one step the nodes are dumped at, one row a node and
+//    position n - 1 in the cache. The manifest names it as dump_ref's decode-step sets do (`# prefill n - 1`,
+//    `# decode_pos n - 1`), so a reader takes the step and the ids before it from `# tokens` (refset's RefManifest::step).
+//    A prompt longer than -b is possible only this way.
 // Tokens come in as integers (one id a line), never as text: the tokenizer is not what the gates test.
 //
 // CPU only (the runner hides CUDA and this tool asks for no GPU layers): the reference is a CPU reduction order, as dump.sh's
-// is. n_batch 2048 (-b: a prompt is one llama_decode, so it must fit) and n_ubatch 512, the ubatch the card engine's prompt
-// unit (T_MAX) is. -fa on|off sets flash attention (a graph that needs it, MiniMax's sparse attention, says so; unset it is
-// the library's auto and `# flags` does not name it).
+// is. n_batch 2048 (-b: a prompt, or a decode-step prompt's last id, is one llama_decode, so it must fit) and n_ubatch 512,
+// the ubatch the card engine's prompt unit (T_MAX) is. -fa on|off sets flash attention (a graph that needs it, MiniMax's
+// sparse attention, says so; unset it is the library's auto and `# flags` does not name it).
 //
 // Build: tools/ref/cb-dump.sh (cb_dump_build)   Run: tools/ref/cb-dump.sh (cb_dump_run)
 
@@ -53,6 +58,7 @@ struct Prompt {
     std::vector<llama_token> ids;
     std::vector<std::string> nodes;
     int                      greedy = 0;
+    bool                     step   = false;  // a decode-step prompt: all ids but the last run without the callback
 };
 
 struct Dump {
@@ -229,17 +235,19 @@ static bool read_ids(const std::string & path, std::vector<llama_token> & ids) {
     return !ids.empty();
 }
 
-// NAME:IDS:NODES:GREEDY, NODES joined by `+` (empty: logits only through the tool's own result_output).
+// NAME:IDS:NODES:GREEDY[:step], NODES joined by `+` (empty: logits only through the tool's own result_output); `step` makes
+// the prompt a decode-step one.
 static bool parse_prompt(const std::string & spec, Prompt & p) {
     std::vector<std::string> f;
     size_t from = 0;
     for (size_t at; (at = spec.find(':', from)) != std::string::npos; from = at + 1) f.push_back(spec.substr(from, at - from));
     f.push_back(spec.substr(from));
-    if (f.size() != 4 || f[0].empty()) {
-        fprintf(stderr, "%s: --prompt wants NAME:IDS:NODES:GREEDY, got %s\n", g_who, spec.c_str());
+    if ((f.size() != 4 && f.size() != 5) || f[0].empty() || (f.size() == 5 && f[4] != "step")) {
+        fprintf(stderr, "%s: --prompt wants NAME:IDS:NODES:GREEDY or NAME:IDS:NODES:GREEDY:step, got %s\n", g_who, spec.c_str());
         return false;
     }
     p.name = f[0];
+    p.step = f.size() == 5;
     long long g = 0;
     if (!parse_i64(g_who, "--prompt GREEDY", f[3].c_str(), 0, 4096, g)) return false;
     p.greedy = (int) g;
@@ -250,7 +258,13 @@ static bool parse_prompt(const std::string & spec, Prompt & p) {
         from2 = at + 1;
     }
     p.nodes.push_back("result_output");
-    return read_ids(f[1], p.ids);
+    if (!read_ids(f[1], p.ids)) return false;
+    if (p.step && p.ids.size() < 2) {
+        fprintf(stderr, "%s: a decode-step prompt wants at least two ids (the step and one before it), %s holds %zu\n", g_who,
+                f[1].c_str(), p.ids.size());
+        return false;
+    }
+    return true;
 }
 
 struct Top {
@@ -344,7 +358,9 @@ int main(int argc, char ** argv) {
         return 2;
     }
     for (const Prompt & p : prompts) {
-        if (p.ids.size() > (size_t) n_batch) {
+        // A decode-step prompt's quiet ids go in calls of at most -b; its last id is the one call the nodes are asked in.
+        const size_t whole = p.step ? 1 : p.ids.size();
+        if (whole > (size_t) n_batch) {
             fprintf(stderr, "%s: prompt %s has %zu ids, one llama_decode takes at most -b %d\n", g_who, p.name.c_str(),
                     p.ids.size(), n_batch);
             return 2;
@@ -398,11 +414,25 @@ int main(int argc, char ** argv) {
         mkdir(d.dir.c_str(), 0755);
         const std::string final_path = d.dir + "/MANIFEST.tsv", partial = final_path + ".partial";
 
-        // The prompt, the callback on: every ubatch asks for its nodes.
+        // The prompt, the callback on: every ubatch asks for its nodes. A decode-step prompt first runs all its ids but the last
+        // with the callback off (no node is asked for, so none is written and the graph is not split for one), then the last
+        // alone with it on.
         std::vector<llama_token> ids = p.ids;
+        const size_t n_quiet = p.step ? ids.size() - 1 : 0;
+        const auto t_quiet = std::chrono::steady_clock::now();
+        for (size_t at = 0; at < n_quiet;) {
+            const int n = (int) std::min<size_t>((size_t) n_batch, n_quiet - at);
+            if (llama_decode(ctx, llama_batch_get_one(ids.data() + at, n)) != 0) {
+                fprintf(stderr, "%s: the quiet prefill of %s failed at id %zu of %zu\n", g_who, p.name.c_str(), at, n_quiet);
+                return 1;
+            }
+            at += (size_t) n;
+            printf("%s: %s: quiet prefill %zu/%zu ids (%.1f s)\n", g_who, p.name.c_str(), at, n_quiet, since(t_quiet));
+            fflush(stdout);
+        }
         d.quiet = false;
         const auto t_prompt = std::chrono::steady_clock::now();
-        const int rc = llama_decode(ctx, llama_batch_get_one(ids.data(), (int) ids.size()));
+        const int rc = llama_decode(ctx, llama_batch_get_one(ids.data() + n_quiet, (int) (ids.size() - n_quiet)));
         d.quiet = true;
         if (rc != 0 || d.failed) {
             fprintf(stderr, "%s: decode of %s failed (rc %d, failed %d)\n", g_who, p.name.c_str(), rc, (int) d.failed);
@@ -452,6 +482,12 @@ int main(int argc, char ** argv) {
         appendf(text, "# tokens\t");
         for (size_t i = 0; i < p.ids.size(); ++i) appendf(text, "%s%d", i ? "," : "", p.ids[i]);
         appendf(text, "\n# flags\t%s\n", flags.c_str());
+        if (p.step) {
+            appendf(text, "# prefill\t%zu\n# decode_pos\t%zu\n", n_quiet, n_quiet);
+            appendf(text, "# prefill_schedule\tquiet — the first %zu ids ran as llama_decode calls of at most %d ids with no node "
+                          "asked for, so the nodes below are the last id's alone, at position %zu\n",
+                    n_quiet, n_batch, n_quiet);
+        }
         appendf(text, "# topk\ttopk.tsv\t40\n# greedy\tgreedy.tsv\t%d\n", p.greedy);
         appendf(text, "# kind\tname\toccurrence\ttype\tne0\tne1\tne2\tne3\tbytes\tsum\top\tcontig\tlogical\tsrc0\tsrc1\n");
         if (d.ints) appendf(text, "# int\tname\toccurrence\tof\ttype\ttwin\tlayout\tcount\tbytes\tsum\tabsmax\tfile\n");
@@ -461,8 +497,9 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "%s: cannot install %s\n", g_who, final_path.c_str());
             return 1;
         }
-        printf("%s: %s: %zu ids, argmax %d logprob %.6f, %d nodes written, %d skipped, %d greedy (prompt %.1f s, greedy %.1f s)\n",
-               g_who, p.name.c_str(), p.ids.size(), top[0].id, top[0].logprob, d.written, d.skipped, p.greedy, s_prompt,
+        printf("%s: %s: %zu ids (%zu quiet), argmax %d logprob %.6f, %d nodes written, %d skipped, %d greedy (prompt %.1f s, "
+               "greedy %.1f s)\n",
+               g_who, p.name.c_str(), p.ids.size(), n_quiet, top[0].id, top[0].logprob, d.written, d.skipped, p.greedy, s_prompt,
                s_greedy);
         fflush(stdout);
     }

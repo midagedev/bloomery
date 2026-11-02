@@ -4016,6 +4016,9 @@ fn tile_units(ty: GgmlType) -> Option<(u64, u64)> {
         // The IQ1_S tile packs a super-block's grid and sign lookups once (`qdot::iq1s_pack`),
         // then each column runs its `iq1s_block_step` onto its own sum.
         GgmlType::IQ1_S => Some((252, 94)),
+        // The IQ1_M tile packs a super-block's grid lookups, its delta signs and its scale vector once
+        // (`qdot::iq1m_pack`), then each column runs its `iq1m_block_step` onto its own sum.
+        GgmlType::IQ1_M => Some((330, 52)),
         // Per 32-value block (`qdot::k_granularity`): a quarter of an x4 group's instructions.
         GgmlType::Q5_1 => Some((34, 17)),
         GgmlType::Q8_0 => Some((14, 16)),
@@ -7473,7 +7476,7 @@ mod tests {
     #[test]
     fn tile_units_has_a_row_for_exactly_the_types_qdot_tiles() {
         // The types of `qdot::tile_kind`.
-        const TILED: [GgmlType; 15] = [
+        const TILED: [GgmlType; 16] = [
             GgmlType::Q2_K,
             GgmlType::Q3_K,
             GgmlType::Q4_K,
@@ -7484,6 +7487,7 @@ mod tests {
             GgmlType::IQ2_XS,
             GgmlType::IQ2_XXS,
             GgmlType::IQ1_S,
+            GgmlType::IQ1_M,
             GgmlType::IQ3_XXS,
             GgmlType::IQ3_S,
             GgmlType::IQ4_XS,

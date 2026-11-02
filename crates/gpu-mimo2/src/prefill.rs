@@ -987,6 +987,7 @@ impl PromptProgram<'_> {
         let (b, ub) = (&mut *self.b, &self.u[at.unit]);
         let rows = RoutedRows {
             probs: &mut b.probs,
+            logits: None,
             ids: &mut b.ids,
             weights: &mut b.weights,
         };

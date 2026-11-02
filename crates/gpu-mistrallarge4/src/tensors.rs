@@ -1,8 +1,12 @@
-//! Each layer's tensors, built at load from the file's own arrays: the kind
-//! every array gives the layer (its rope, its indexer's, its cache's owner,
-//! the dense lead), then the projections as [`Site`]s (the gemv machinery's
-//! own type check), the f32 vectors as resident names and the two vectors the
-//! load-time row move rewrites as the moved device buffers themselves.
+//! Each layer's attention tensors, built at load from the file's own arrays:
+//! the kind every array gives the layer (its rope, its indexer's, its cache's
+//! owner), then the projections as [`Site`]s (the gemv machinery's own type
+//! check), the f32 vectors as resident names and the two vectors the
+//! load-time row move rewrites as the moved device buffers themselves. Every
+//! tensor's type is the file's own, read per tensor and per layer from the
+//! common tables; a type with no entry is refused by name at load. The
+//! feed-forward half's tensors are the common routed block's
+//! ([`crate::ffn::Routed`]).
 
 use bloomery_gpu::GpuError;
 use bloomery_gpu::arch::hybrid::Site;
@@ -14,14 +18,12 @@ use gguf::Split;
 use gguf::quant::GgmlType;
 use model::arch::mistrallarge4::hparams::Hparams;
 use model::arch::mistrallarge4::names as stems;
+use model::arch::mistrallarge4::sites::{
+    SelUp, UpProj, k_b as k_b_entry, launch, v_b as v_b_entry,
+};
 use model::arch::names::blk;
 
-/// The site types the K-quant projections read: Q6_K through the q8_1 kgemv.
-const KQ_TYPES: &[SiteTy] = &[SiteTy::Q6K];
-/// The site types the q8_0 projections read: the f32 rows gemv.
-const Q8_TYPES: &[SiteTy] = &[SiteTy::Q8_0];
-/// The site types the f32 projections read.
-const F32_TYPES: &[SiteTy] = &[SiteTy::F32];
+const WHAT: &str = "mistrallarge4 tensors";
 
 /// What the file's own arrays make a layer: the kind the whole step keys on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,8 +39,6 @@ pub(crate) struct Kind {
     /// The layer whose index keys and list this layer reads (itself on a
     /// full layer).
     pub indexer: usize,
-    /// The layer is the dense lead (`leading_dense_block_count`).
-    pub dense: bool,
 }
 
 impl Kind {
@@ -50,35 +50,8 @@ impl Kind {
             full,
             cache: if hp.owns_cache(l) { l } else { hp.kv_source[l] },
             indexer: if full { l } else { hp.prev_full_indexer(l) },
-            dense: l < hp.dense_lead,
         }
     }
-}
-
-/// A gated feed-forward block's three projections.
-pub(crate) struct GateUpDown {
-    pub gate: Site,
-    pub up: Site,
-    pub down: Site,
-}
-
-/// The feed-forward block: the dense lead's, or the routed stacks with the
-/// router and the shared expert.
-pub(crate) enum Ffn {
-    Dense(GateUpDown),
-    Moe {
-        /// `ffn_gate_inp`, the file's F32 rows.
-        router: String,
-        /// The routed stacks' names, read by the `_sel` entries, the
-        /// gate·up's one i-quant type and the down's own (a file may mix
-        /// them between the stacks).
-        gate: String,
-        up: String,
-        down: String,
-        ty: GgmlType,
-        ty_down: GgmlType,
-        shared: GateUpDown,
-    },
 }
 
 /// A full indexer layer's own tensors and stores.
@@ -102,6 +75,22 @@ pub(crate) struct Idx {
     pub ssmax_b: String,
 }
 
+/// How `attn_v_b` up-projects each head's latent output, by the file's type
+/// ([`UpProj`]).
+pub(crate) enum VUp {
+    /// The file's Q8_0 planes, `heads · head_v` rows of the latent's width,
+    /// through the per-head q8_0 gemv.
+    Planes(String),
+    /// A stack of `heads · head_v` rows, the heads its experts, through the
+    /// down `_sel` launch of `family` (`ty` the file's type, which the
+    /// i-quant launch takes).
+    Sel {
+        name: String,
+        ty: GgmlType,
+        family: SelUp,
+    },
+}
+
 /// One layer's tensors, by name and site; the stores (the caches, the lists,
 /// the scratch) live in the body, which sizes them.
 pub(crate) struct Layer {
@@ -116,18 +105,16 @@ pub(crate) struct Layer {
     /// `attn_kv_a_mqa` and its norm, on a layer that owns its cache.
     pub kv_a: Option<Site>,
     pub kv_a_norm: Option<String>,
-    /// `attn_k_b` and `attn_v_b`, the per-head up-projections, q8_0 planes.
+    /// `attn_k_b`, the per-head absorption into the latent: q8_0 planes.
     pub k_b: String,
-    pub v_b: String,
+    /// `attn_v_b`, the per-head up-projection of the latent to the values.
+    pub v_b: VUp,
     /// `attn_output`.
     pub o: Site,
     pub idx: Option<Idx>,
-    /// `ffn_norm`.
-    pub ffn_norm: String,
-    pub ffn: Ffn,
 }
 
-/// The sites of layer `l`'s projections, for the load's activation forms.
+/// The sites of layer `l`'s attention projections, for the load's activation forms.
 pub(crate) fn sites(layer: &Layer) -> Vec<&Site> {
     let mut out = vec![&layer.q, &layer.o];
     if let Some(kv_a) = &layer.kv_a {
@@ -137,13 +124,6 @@ pub(crate) fn sites(layer: &Layer) -> Vec<&Site> {
         out.push(&idx.q_b);
         out.push(&idx.k);
         out.push(&idx.proj);
-    }
-    match &layer.ffn {
-        Ffn::Dense(d) | Ffn::Moe { shared: d, .. } => {
-            out.push(&d.gate);
-            out.push(&d.up);
-            out.push(&d.down);
-        }
     }
     out
 }
@@ -176,6 +156,18 @@ pub(crate) fn file_f32(file: &Split, name: &str, want: usize) -> Result<Vec<f32>
         .collect())
 }
 
+/// The model-level tensors' launches, refused by name at load: the embedding
+/// rows and the head of the file's own types.
+pub(crate) fn globals(file: &Split) -> Result<(), GpuError> {
+    for name in [stems::token_embd(), stems::output()] {
+        let (_, t) = file
+            .find(&name)
+            .ok_or_else(|| GpuError::shape(WHAT, format!("{name} is not in the model file")))?;
+        launch(&name, t.ty).map_err(|e| GpuError::shape(WHAT, e))?;
+    }
+    Ok(())
+}
+
 /// The k-norm pair of layer `l`, its head's leading rope rows moved to the
 /// tail (`model::arch::mistrallarge4::rows::rope_rows_to_tail` — the one
 /// model-only fact of the family, run here at load): the file lays each
@@ -200,9 +192,10 @@ fn moved_k_norm(
     ))
 }
 
-/// Layer `l`'s tensors: its kind from `hp`'s arrays, every projection a site
-/// of the type the file holds (refused by name where it holds another), the
-/// f32 vectors resident names and the k-norm pair moved.
+/// Layer `l`'s attention tensors: its kind from `hp`'s arrays, every projection a site
+/// of the type the file holds (refused by name where the common site table has
+/// no entry for it), the per-head pair through its own entries, the f32
+/// vectors resident names and the k-norm pair moved.
 #[allow(clippy::too_many_lines, reason = "one branch a tensor, nothing shared")]
 pub(crate) fn layer(
     (file, w): (&Split, &Weights),
@@ -210,19 +203,26 @@ pub(crate) fn layer(
     stream: &CudaStream,
     l: usize,
 ) -> Result<Layer, GpuError> {
-    const WHAT: &str = "mistrallarge4 tensors";
     let kind = Kind::of(hp, l);
     let (hidden, heads, head_k, head_v, kv_lora) =
         (hp.n_embd, hp.n_head, hp.head_k, hp.head_v, hp.kv_lora);
     let pe = hp.pe(l);
-    let site = |stem: &str, rows: usize, k: usize, allowed: &[SiteTy]| {
-        Site::of_file((file, w), WHAT, blk(l, stem), (rows, k), allowed)
+    // A site takes every family the card's dense table names, so the file's
+    // type alone picks the launch.
+    let site = |stem: &str, rows: usize, k: usize| {
+        Site::of_file((file, w), WHAT, blk(l, stem), (rows, k), SiteTy::ALL)
     };
     let vec_name = |stem: &str, len: usize| vector(w, WHAT, blk(l, stem), len);
-    let q8_planes = |stem: &str, rows: usize, k: usize| -> Result<String, GpuError> {
-        let name = blk(l, stem);
-        match w.resident(WHAT, &name)? {
-            DevWeight::Q8_0 { d, .. } if d.rows() == rows && d.cols() * 32 == k => Ok(name),
+    let file_ty = |name: &str| -> Result<GgmlType, GpuError> {
+        file.find(name)
+            .map(|(_, t)| t.ty)
+            .ok_or_else(|| GpuError::shape(WHAT, format!("{name} is not in the model file")))
+    };
+    let q8_planes = |name: &str, rows: usize, k: usize| -> Result<String, GpuError> {
+        match w.resident(WHAT, name)? {
+            DevWeight::Q8_0 { d, .. } if d.rows() == rows && d.cols() * 32 == k => {
+                Ok(name.to_string())
+            }
             _ => Err(GpuError::shape(
                 WHAT,
                 format!("{name} is not a q8_0 weight of {rows} rows of {k} values"),
@@ -238,61 +238,43 @@ pub(crate) fn layer(
                 stems::INDEXER_ATTN_Q_B,
                 hp.indexer_heads * hp.indexer_d,
                 hidden,
-                KQ_TYPES,
             )?,
-            k: site(stems::INDEXER_ATTN_K, hp.indexer_d, hidden, Q8_TYPES)?,
+            k: site(stems::INDEXER_ATTN_K, hp.indexer_d, hidden)?,
             k_norm_w,
             k_norm_b,
-            proj: site(stems::INDEXER_PROJ, hp.indexer_heads, hidden, F32_TYPES)?,
+            proj: site(stems::INDEXER_PROJ, hp.indexer_heads, hidden)?,
             ssmax_w: vec_name(stems::INDEXER_SSMAX_W, hp.indexer_heads)?,
             ssmax_b: vec_name(stems::INDEXER_SSMAX_B, hp.indexer_heads)?,
         })
     } else {
         None
     };
-    let ffn = if kind.dense {
-        Ffn::Dense(GateUpDown {
-            gate: site(stems::FFN_GATE, hp.dense_ff, hidden, Q8_TYPES)?,
-            up: site(stems::FFN_UP, hp.dense_ff, hidden, Q8_TYPES)?,
-            down: site(stems::FFN_DOWN, hidden, hp.dense_ff, Q8_TYPES)?,
-        })
-    } else {
-        let stack = |stem: &str, rows: usize, k: usize| -> Result<(String, GgmlType), GpuError> {
-            let name = blk(l, stem);
-            match w.resident(WHAT, &name)? {
+    // The per-head pair: k_b reads Q8_0 planes alone, v_b planes or a down
+    // `_sel` stack of the heads.
+    let k_b = {
+        let name = blk(l, stems::ATTN_K_B);
+        k_b_entry(&name, file_ty(&name)?).map_err(|e| GpuError::shape(WHAT, e))?;
+        q8_planes(&name, heads * kv_lora, head_k - pe)?
+    };
+    let v_b = {
+        let name = blk(l, stems::ATTN_V_B);
+        let (rows, k) = (heads * head_v, kv_lora);
+        match v_b_entry(&name, file_ty(&name)?).map_err(|e| GpuError::shape(WHAT, e))? {
+            UpProj::Planes => VUp::Planes(q8_planes(&name, rows, k)?),
+            UpProj::Sel(family) => match w.resident(WHAT, &name)? {
                 DevWeight::KQuant { ty, w: t, k: got } if t.rows() == rows && *got == k => {
-                    Ok((name, *ty))
+                    VUp::Sel {
+                        ty: *ty,
+                        family,
+                        name,
+                    }
                 }
-                _ => Err(GpuError::shape(
-                    WHAT,
-                    format!("{name} is not an i-quant weight of {rows} rows of {k} values"),
-                )),
-            }
-        };
-        let (gate, gate_ty) = stack(stems::FFN_GATE_EXPS, hp.n_expert * hp.expert_ff, hidden)?;
-        let (up, up_ty) = stack(stems::FFN_UP_EXPS, hp.n_expert * hp.expert_ff, hidden)?;
-        let (down, down_ty) = stack(stems::FFN_DOWN_EXPS, hp.n_expert * hidden, hp.expert_ff)?;
-        if gate_ty != up_ty {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "blk.{l}'s gate stack is {gate_ty} and its up stack {up_ty}: the gate·up entry \
-                     takes one type"
-                ),
-            ));
-        }
-        let shared_ff = hp.n_shared * hp.expert_ff;
-        Ffn::Moe {
-            router: blk(l, stems::FFN_GATE_INP),
-            gate,
-            up,
-            down,
-            ty: gate_ty,
-            ty_down: down_ty,
-            shared: GateUpDown {
-                gate: site(stems::FFN_GATE_SHEXP, shared_ff, hidden, Q8_TYPES)?,
-                up: site(stems::FFN_UP_SHEXP, shared_ff, hidden, Q8_TYPES)?,
-                down: site(stems::FFN_DOWN_SHEXP, hidden, shared_ff, Q8_TYPES)?,
+                _ => {
+                    return Err(GpuError::shape(
+                        WHAT,
+                        format!("{name} is not a down `_sel` weight of {rows} rows of {k} values"),
+                    ));
+                }
             },
         }
     };
@@ -301,9 +283,9 @@ pub(crate) fn layer(
         attn_norm: vec_name(stems::ATTN_NORM, hidden)?,
         ssmax_w: vec_name(stems::ATTN_SSMAX_W, heads)?,
         ssmax_b: vec_name(stems::ATTN_SSMAX_B, heads)?,
-        q: site(stems::ATTN_Q, heads * head_k, hidden, KQ_TYPES)?,
+        q: site(stems::ATTN_Q, heads * head_k, hidden)?,
         kv_a: if hp.owns_cache(l) {
-            Some(site(stems::ATTN_KV_A_MQA, kv_lora + pe, hidden, Q8_TYPES)?)
+            Some(site(stems::ATTN_KV_A_MQA, kv_lora + pe, hidden)?)
         } else {
             None
         },
@@ -312,11 +294,9 @@ pub(crate) fn layer(
         } else {
             None
         },
-        k_b: q8_planes(stems::ATTN_K_B, heads * kv_lora, head_k - pe)?,
-        v_b: q8_planes(stems::ATTN_V_B, heads * head_v, kv_lora)?,
-        o: site(stems::ATTN_OUTPUT, hidden, heads * head_v, KQ_TYPES)?,
+        k_b,
+        v_b,
+        o: site(stems::ATTN_OUTPUT, hidden, heads * head_v)?,
         idx,
-        ffn_norm: vec_name(stems::FFN_NORM, hidden)?,
-        ffn,
     })
 }

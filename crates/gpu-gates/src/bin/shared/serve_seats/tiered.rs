@@ -14,6 +14,11 @@
 //! plan for a seat that saves states in host RAM, whose copy lane the open makes of
 //! [`Open::cache_ram`] bytes); the default is 0 and prints nothing.
 //!
+//! A seat that takes images ([`Tiered::vision`]) has its `--mmproj` encoder held against the text
+//! model and seated before the plan ([`vision_seat::open_seat`], [`vision_seat::kept`]): a tower on
+//! the stage card is a reserve of the plan's machine, the opened encoder goes to the engine thread
+//! ([`Open::vision`]), and the `vision_seat` record follows the `plan` record.
+//!
 //! A model path is a GGUF split, or a checkpoint folder where the seat reads one
 //! ([`Tiered::read_model`]): the common run opens the folder once, plans by its located header,
 //! serves its tokenizer and hands the header and the part source to the engine thread
@@ -27,8 +32,8 @@ use std::sync::Arc;
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{
-    CacheRam, ChatSurface, Pass, Seat, SeatEngine, SeatFlags, Vocab, arm_screen, eprint_noted,
-    model_props, parallel_line, placement_of, slots_given, slots_of,
+    CacheRam, ChatSurface, Pass, Seat, SeatEngine, SeatFlags, SlotsFrom, Vocab, arm_screen,
+    eprint_noted, model_props, parallel_line, placement_of, slots_given, slots_of,
 };
 use bloomery_gpu_gates::generate::{Lane, Place, TierRule, choose_ctx, lane_at};
 use bloomery_gpu_gates::need;
@@ -38,6 +43,7 @@ use bloomery_gpu_gates::residency38::{
     checkpoints_reserved, churn_bytes, residency_room, residency_set,
 };
 use bloomery_gpu_gates::side_seat;
+use bloomery_gpu_gates::vision_seat::{self, Cost, Opened, TextFacts};
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_levers::{
     ChurnHosting, HostCfg, Levers, ResidencyAt, ResidencyPick, ResidencyWhy, UnhostedPool,
@@ -48,9 +54,53 @@ use model::arch::place_hybrid::{PlaceError, PlanInputs};
 use model::placement::ctx_ask::{Chosen, DEFAULT_SLOTS, probe_of};
 use model::placement::workstation::{self, HostNeed, TierBatchBytes};
 use model::placement::{Machine, PlacementError, Plan, PlanLevers};
+use runtime::width::Mode as WidthMode;
 use serve::reasoning::ThinkTags;
 use serve::{EngineProps, ServeError};
 use tokenizer::Tokenizer;
+
+use super::served;
+use crate::draft::Draft;
+
+/// The draft a seat serves and the width chooser behind it ([`Tiered::DRAFTS`]): `BLOOMERY_DRAFT`
+/// as `lookup` or `dspark`, and `BLOOMERY_MTP_WIDTH`'s mode.
+#[derive(Clone, Copy)]
+pub struct Drafting {
+    /// The served draft; never [`Draft::Off`].
+    pub word: Draft,
+    /// The width a drafted window verifies.
+    pub width: WidthMode,
+}
+
+/// `BLOOMERY_DRAFT` and `BLOOMERY_MTP_WIDTH` as a drafting seat reads them: `None` for the plain
+/// path (unset). A width set beside no draft is refused by name, as the V4.1 seat refuses it.
+fn drafting_of(levers: &Levers) -> Result<Option<Drafting>, GateError> {
+    let word = Draft::check_levers(levers)?;
+    let width = WidthMode::of(levers.mtp_width())?;
+    bloomery_gpu_gates::bind::refuse_plain_width(
+        levers,
+        (word == Draft::Off).then_some("BLOOMERY_DRAFT is unset"),
+    )?;
+    Ok((word != Draft::Off).then_some(Drafting { word, width }))
+}
+
+/// The resident slots and what named the count: the DSpark draft's one sequence
+/// ([`served::draft_slots`], which refuses `--parallel` above 1 under it by name), else
+/// `given`, the seat's own rule.
+fn slots_under(
+    drafting: Option<Drafting>,
+    parallel: Option<usize>,
+    given: impl FnOnce() -> Result<(usize, SlotsFrom), GateError>,
+) -> Result<(usize, SlotsFrom), GateError> {
+    let decided = match drafting {
+        Some(d) => served::draft_slots(parallel, d.word, true)?,
+        None => None,
+    };
+    match decided {
+        Some(decided) => Ok(decided),
+        None => given(),
+    }
+}
 
 /// What the common run hands the engine thread: the placement and the plan's levers, the
 /// context, the file, the side model's reserve, the plan's residency and the seat's own flags.
@@ -88,6 +138,11 @@ pub struct Open<F> {
     /// The checkpoint folder `path` is, opened once by the common run ([`Tiered::read_model`]);
     /// `None` for a file, which the engine thread opens again.
     pub folder: Option<Folder>,
+    /// The image encoder `--mmproj` seated for the plan ([`Tiered::vision`]); `None` serves no
+    /// image.
+    pub vision: Option<Opened>,
+    /// The draft the seat serves ([`Tiered::DRAFTS`]); `None` the plain path.
+    pub draft: Option<Drafting>,
     /// The seat's flags beside the common ones ([`SeatFlags`]).
     pub flags: F,
 }
@@ -210,6 +265,13 @@ pub trait Tiered: Seat + Sized + 'static {
     /// The pool support of the body this seat loads.
     const UNHOSTED_POOL: UnhostedPool = UnhostedPool::NotCarried;
 
+    /// Whether the seat serves a draft (`BLOOMERY_DRAFT` `lookup` or `dspark`, behind
+    /// `BLOOMERY_MTP_WIDTH`'s width chooser): the run then parses the two levers, which the seat's
+    /// [`Tiered::ACTS_ON`] names, hands the word to the open ([`Open::draft`]) and gives the DSpark
+    /// draft its one slot. The default serves none, and the levers are refused by name as
+    /// unacted.
+    const DRAFTS: bool = false;
+
     /// Whether `arch` is a file this seat serves.
     fn accepts(arch: Arch) -> bool;
 
@@ -296,6 +358,21 @@ pub trait Tiered: Seat + Sized + 'static {
             Self::FAMILY
         )
         .into())
+    }
+
+    /// The seat's image-input flags; `None` (the default) is a seat that takes no image.
+    fn vision(_flags: &Self::Flags) -> Option<&vision_seat::Flags> {
+        None
+    }
+
+    /// The projector types the text model can run (`clip.projector_type`), for a seat that takes
+    /// images.
+    const PROJECTORS: &'static [&'static str] = &[];
+
+    /// What the projector is held against: the text model's width and rope, for a seat that
+    /// takes images ([`Tiered::vision`]).
+    fn text_facts(_inputs: &PlanInputs<Self::H>) -> Result<TextFacts, GateError> {
+        Err(format!("the {} seat takes no image", Self::FAMILY).into())
     }
 
     /// The think tags the model's description names, if the family splits its reasoning on them.
@@ -572,6 +649,17 @@ pub fn check<S: Tiered>(
         }
         if let Some(levers) = levers {
             check_residency_feed(levers, S::prefill_steps(&a.1), S::UNHOSTED_POOL)?;
+            if S::DRAFTS
+                && let Some(d) = drafting_of(levers)?
+            {
+                served::draft_slots(a.0.parallel, d.word, true)?;
+            }
+        }
+        // The check before the fetch cannot know whether an `--hf` repo will supply the
+        // projector a limit bounds: it assumes one does, and the start holds the flags to the
+        // real source ([`vision_seat::open_seat`]).
+        if let Some(vision) = S::vision(&a.1) {
+            vision.check_before_model(true)?;
         }
         Ok(a)
     })
@@ -590,7 +678,7 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
     let path = ref_model_path()?;
     let Read {
         split,
-        tokenizer,
+        mut tokenizer,
         source,
     } = S::read_model(&path)?;
     let first = split
@@ -620,12 +708,19 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
     let plan_levers = PlanLevers::from_levers(&levers)?;
     // The slot count and what named it (`from` on the `parallel` line); a seat of one sequence
     // reads `--parallel` as the one slot it holds, with no note about a count it cannot offer.
-    // Under `--parallel auto` the placement is chosen at one slot, and the count below.
-    let (slots, from) = if S::RESIDENT {
-        slots_given(a.parallel, a.ctx, a.auto.is_some(), DEFAULT_SLOTS)?
+    let draft = if S::DRAFTS {
+        drafting_of(&levers)?
     } else {
-        slots_of(a.parallel, a.ctx.is_some(), DEFAULT_SLOTS)?
+        None
     };
+    // Under `--parallel auto` the placement is chosen at one slot, and the count below.
+    let (slots, from) = slots_under(draft, a.parallel, || {
+        if S::RESIDENT {
+            slots_given(a.parallel, a.ctx, a.auto.is_some(), DEFAULT_SLOTS)
+        } else {
+            Ok(slots_of(a.parallel, a.ctx.is_some(), DEFAULT_SLOTS)?)
+        }
+    })?;
     // The common unset rule, once, on one census reading.
     let census = gpu_census::census()?;
     let chosen = if S::TIER_RULE.tiers == 0 {
@@ -639,10 +734,13 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
     refuse_tier_slots::<S>(chosen.place, slots)?;
     chosen.record().eprint();
     let place = chosen.place;
-    // The plan's inputs on this placement where the seat streams, read again from the headers: the
+    // The plan's inputs on this placement where the seat streams, read again from the headers and
+    // priced for the prompt group as `inputs` are (the ring's bytes join the group's reserve): the
     // stream's ring out of the expert budget. Whether the load keeps them is settled below.
     let ring_inputs = if S::ring(&levers, place) {
-        Some(S::with_ring(S::read(&split)?)?)
+        let mut read = S::read(&split)?;
+        S::configure(&mut read, levers.prefill_group())?;
+        Some(S::with_ring(read)?)
     } else {
         None
     };
@@ -665,6 +763,66 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
         },
     );
     let n = NonZeroUsize::new(slots).ok_or("--parallel 0: the server serves no slot")?;
+    let asking = (a.ctx, slots);
+    // The encoder `--mmproj` names, or the `--hf` repo's projector, held against the text model's
+    // width and vocabulary and seated for this placement, before anything is planned: its refusal
+    // is read here by name, not as the plan's. The vocabulary is built here only for a start that
+    // has an encoder.
+    let image_file = match S::vision(&flags) {
+        Some(v) => v.encoder(true)?,
+        None => None,
+    };
+    let early_vocab = if image_file.is_some() {
+        let tokenizer = match tokenizer.take() {
+            Some(tokenizer) => tokenizer,
+            None => Tokenizer::from_gguf(&path)?,
+        };
+        Some(Arc::new(Vocab::new(tokenizer)?))
+    } else {
+        None
+    };
+    let image = match S::vision(&flags) {
+        None => None,
+        Some(v) => {
+            let facts = S::text_facts(&inputs)?;
+            let token = |id: u32| {
+                early_vocab
+                    .as_ref()
+                    .and_then(|vocab| vocab.tokenizer().text(id))
+                    .map(str::to_owned)
+            };
+            let seat = vision_seat::open_seat(
+                v,
+                image_file.as_deref(),
+                place,
+                S::PROJECTORS,
+                &facts,
+                &token,
+            )?;
+            // A projector the `--hf` repo picked stays only where the plan gives the text model
+            // the same experts and context with its reserve as without ([`vision_seat::kept`]).
+            let cost = |o: Option<&Opened>| -> Result<Cost, GateError> {
+                let mut m = machine.clone();
+                beside::reserve_on(
+                    &mut m,
+                    Beside {
+                        image: o.and_then(|o| o.seat.reserve),
+                        embedding: None,
+                    },
+                );
+                let chosen = plan_at(&split, asking, &inputs, (&m, &plan_levers, n, place))?;
+                Ok(Cost::of(&chosen.plan, chosen.slot_ctx))
+            };
+            vision_seat::kept(seat, v, cost)?
+        }
+    };
+    beside::reserve_on(
+        &mut machine,
+        Beside {
+            image: image.as_ref().and_then(|o| o.seat.reserve),
+            embedding: None,
+        },
+    );
     // A folder's load reads its card's parts before its host set: the plan reserves the least of
     // those reads on the host, read from the plan at the least context a seat asks (the most
     // card tensors any context holds), so the NVMe expert tier's split leaves them room and the
@@ -770,6 +928,9 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
     let slot_ctx = usize::try_from(asked.slot_ctx)?;
     let plan = asked.plan;
     record::plan(place.name(), plan.machine, &plan).eprint();
+    if let Some(v) = &image {
+        vision_seat::seat_record(v).eprint();
+    }
     let (residency, extra) = match pick {
         Some(pick) => S::settle(&plan, pick)?,
         None => (Residency::Off, 0),
@@ -800,11 +961,16 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
             None
         }
     };
-    let tokenizer = match tokenizer {
-        Some(tokenizer) => tokenizer,
-        None => Tokenizer::from_gguf(&path)?,
+    let vocab = match early_vocab {
+        Some(vocab) => vocab,
+        None => {
+            let tokenizer = match tokenizer {
+                Some(tokenizer) => tokenizer,
+                None => Tokenizer::from_gguf(&path)?,
+            };
+            Arc::new(Vocab::new(tokenizer)?)
+        }
     };
-    let vocab = Arc::new(Vocab::new(tokenizer)?);
     let open = Open {
         place,
         lane,
@@ -821,6 +987,8 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
         xstream: levers.xstream(),
         ring,
         folder,
+        vision: image,
+        draft,
         flags,
     };
     let engine = SeatEngine::spawn(

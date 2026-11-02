@@ -510,3 +510,292 @@ impl Rope72Kernels {
         Ok(())
     }
 }
+
+// ------------------------------------------------------ heads of 128 (the Pixtral tower)
+
+pub use crate::attn_h128::HEAD_DIM_128;
+/// Pairs one such head turns: half the head, each pair `(x[j], x[j + 64])`.
+pub const PAIRS_128: usize = HEAD_DIM_128 / 2;
+/// Pairs per axis: the rows take the first `PER_AXIS_128`, the columns the rest.
+const PER_AXIS_128: usize = PAIRS_128 / 2;
+
+/// The value of the file's head of 128 that value `r` of the card's head holds. llama.cpp's
+/// `build_rope_2d` turns a head in two NORM-mode halves, adjacent pairs `(2i, 2i + 1)` of values
+/// `0..64` by the row and of values `64..128` by the column; the kernel turns pairs
+/// `(j, j + 64)`. So the card's value `j` holds the first of a pair and `j + 64` the second, the
+/// row half's pair `j` for `j < 32` and the column half's pair `j − 32` above. The query and key
+/// rows are permuted by it at load (the same permutation on both leaves `q · k` unchanged, and
+/// the value rows are not touched), and [`RopeTable128::interleaved`] orders its pairs to match.
+#[must_use]
+pub const fn rope_source_128(r: usize) -> usize {
+    let (pair, second) = (r % PAIRS_128, r / PAIRS_128);
+    let (half, i) = (pair / PER_AXIS_128, pair % PER_AXIS_128);
+    half * PAIRS_128 + 2 * i + second
+}
+
+/// Per patch, the `(cos, sin)` of its [`PAIRS_128`] angles, in the order of the patches the table
+/// was built over: pair `j` of patch `p` at `cs[2·(p·PAIRS_128 + j) ..]`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RopeTable128 {
+    pub n_h: usize,
+    pub n_w: usize,
+    pub cs: Vec<f32>,
+}
+
+impl RopeTable128 {
+    /// The table of the patches `coords` (each `(row, column)` of an `n_h × n_w` grid) at RoPE
+    /// base `theta`, as llama.cpp's `build_rope_2d` with interleaved frequencies builds it on the
+    /// CPU in f32: two `ggml_rope_ext` calls of 64 values each (`ggml_rope_cache_init`),
+    /// `theta_scale = theta^(−2/64)`; the angle of pair `k` of an axis is the running angle (the
+    /// position, multiplied by `theta_scale` once per pair) times the call's `freq_scale` in f32 —
+    /// 1 for the row's half, `theta^(−2/128)` for the column's (the odd frequencies); `cos` and
+    /// `sin` of that f32 angle, correctly rounded. Pair `j < 32` is the row's pair `j`, pair
+    /// `32 + j` the column's pair `j`: [`rope_source_128`]'s order.
+    #[must_use]
+    pub fn interleaved(
+        n_h: usize,
+        n_w: usize,
+        coords: impl IntoIterator<Item = (usize, usize)>,
+        theta: f32,
+    ) -> RopeTable128 {
+        let theta_scale = f64::from(theta).powf(f64::from(-2.0f32 / PAIRS_128 as f32)) as f32;
+        let odd = f64::from(theta).powf(f64::from(-2.0f32 / HEAD_DIM_128 as f32)) as f32;
+        let mut cs = Vec::with_capacity(n_h * n_w * 2 * PAIRS_128);
+        for (y, x) in coords {
+            for (pos, freq_scale) in [(y, 1.0f32), (x, odd)] {
+                let mut angle = pos as f32;
+                for _ in 0..PER_AXIS_128 {
+                    let a = freq_scale * angle;
+                    cs.push(f64::from(a).cos() as f32);
+                    cs.push(f64::from(a).sin() as f32);
+                    angle *= theta_scale;
+                }
+            }
+        }
+        RopeTable128 { n_h, n_w, cs }
+    }
+
+    /// Patches the table covers.
+    #[must_use]
+    pub fn patches(&self) -> usize {
+        self.cs.len() / (2 * PAIRS_128)
+    }
+}
+
+/// The host rule over a whole `[patches, row_width]` bf16 buffer, in place, for heads of 128:
+/// every head `h` of `n_heads` at column `col0 + h·128` of every row turned by its patch's table
+/// row, pairs `(j, j + 64)`.
+pub fn rope_128_ref(
+    x: &mut [u16],
+    row_width: usize,
+    col0: usize,
+    n_heads: usize,
+    table: &RopeTable128,
+) {
+    for p in 0..table.patches() {
+        for h in 0..n_heads {
+            let base = p * row_width + col0 + h * HEAD_DIM_128;
+            for j in 0..PAIRS_128 {
+                let (c, s) = (
+                    table.cs[2 * (p * PAIRS_128 + j)],
+                    table.cs[2 * (p * PAIRS_128 + j) + 1],
+                );
+                let (y1, y2) = rope_pair_ref(x[base + j], x[base + j + PAIRS_128], c, s);
+                x[base + j] = y1;
+                x[base + j + PAIRS_128] = y2;
+            }
+        }
+    }
+}
+
+#[cuda_module]
+mod rope2d_128_kernels {
+    use super::*;
+
+    /// `vis_rope2d`'s rule for heads of 128 values (64 pairs): turn the query and key heads of a
+    /// `[n, row_width]` bf16 buffer in place, the `n_heads` heads at columns `q0 + h·128` and
+    /// those at `k0 + h·128` of every row, pair `j` of patch `p` by table entry
+    /// `cs[2·(p·64 + j) ..]`. One thread per (patch, q-or-k, head, pair). A new entry for the fact
+    /// no existing one covers — heads of 128 — not a parameter of `vis_rope2d_h72`, whose PTX is
+    /// the Qwen3-VL tower's and is held (docs/upstream/nvlabs-ledger.md row 39).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (x.len() >= n * row_width, cs.len() >= n * 128)
+    )]
+    pub fn vis_rope2d_h128(
+        cs: &[f32],
+        n: u32,
+        row_width: u32,
+        q0: u32,
+        k0: u32,
+        n_heads: u32,
+        mut x: DisjointSlice<u16>,
+    ) {
+        let i = thread::index_1d().get();
+        let per_patch = 2 * n_heads as usize * PAIRS_128;
+        if i >= n as usize * per_patch {
+            return;
+        }
+        let p = i / per_patch;
+        let r = i - p * per_patch;
+        let which = r / (n_heads as usize * PAIRS_128); // 0 query, 1 key
+        let r = r - which * n_heads as usize * PAIRS_128;
+        let h = r / PAIRS_128;
+        let j = r - h * PAIRS_128;
+        let col0 = if which == 0 { q0 } else { k0 } as usize;
+        let a = p * row_width as usize + col0 + h * HEAD_DIM_128 + j;
+        let t = 2 * (p * PAIRS_128 + j);
+        // SAFETY: p < n and j < 64 put t + 1 below 128·n <= cs.len() (contract).
+        let (c, s) = unsafe { (*cs.get_unchecked(t), *cs.get_unchecked(t + 1)) };
+        // SAFETY: p < n and col0 + h·128 + 128 <= row_width (host-checked) bound a and a + 64
+        // below n·row_width <= x.len(); this thread is the only one touching them.
+        let (x1, x2) = unsafe {
+            (
+                bf16_to_f32(*x.get_unchecked_mut(a)),
+                bf16_to_f32(*x.get_unchecked_mut(a + PAIRS_128)),
+            )
+        };
+        let y1 = add_rn_f32(mul_rn_f32(x1, c), -mul_rn_f32(x2, s));
+        let y2 = add_rn_f32(mul_rn_f32(x2, c), mul_rn_f32(x1, s));
+        // SAFETY: the same two positions as the reads.
+        unsafe {
+            *x.get_unchecked_mut(a) = f32_to_bf16_rne(y1);
+            *x.get_unchecked_mut(a + PAIRS_128) = f32_to_bf16_rne(y2);
+        }
+    }
+}
+
+/// The loaded RoPE module for heads of 128.
+pub struct Rope128Kernels {
+    module: rope2d_128_kernels::LoadedModule,
+}
+
+impl Rope128Kernels {
+    /// Load this file's device bundle into `ctx`. Load-time only.
+    pub fn load(ctx: &Arc<CudaContext>) -> Result<Rope128Kernels, GpuError> {
+        // SAFETY: this crate owns the embedded device bundle produced for the module above; the
+        // launcher checks its launch contract.
+        let module = unsafe { bloomery_gpu::shared_module!(rope2d_128_kernels, ctx)? };
+        Ok(Rope128Kernels { module })
+    }
+
+    /// Enqueue the 2D RoPE of the query and key heads of 128 values in place ([`RopeArgs`], its
+    /// `cs` the uploaded [`RopeTable128::cs`]). Asynchronous.
+    pub fn enqueue(&self, stream: &CudaStream, args: RopeArgs<'_>) -> Result<(), GpuError> {
+        let what = "Rope128Kernels::enqueue";
+        let RopeArgs {
+            cs,
+            n,
+            row_width,
+            q0,
+            k0,
+            n_heads,
+            x,
+        } = args;
+        let span = n_heads * HEAD_DIM_128;
+        if n == 0 || q0 + span > row_width || k0 + span > row_width {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!(
+                    "{n_heads} heads of {HEAD_DIM_128} at columns {q0} and {k0} do not fit rows of {row_width} (n={n})"
+                ),
+            });
+        }
+        if x.len() < n * row_width || cs.len() < n * 2 * PAIRS_128 {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!(
+                    "x.len() {} (need {}), cs.len() {} (need {})",
+                    x.len(),
+                    n * row_width,
+                    cs.len(),
+                    n * 2 * PAIRS_128
+                ),
+            });
+        }
+        let grid = launch_u32(
+            what,
+            "grid",
+            (n * 2 * n_heads * PAIRS_128).div_ceil(BLOCK as usize),
+        )?;
+        let prep = self
+            .module
+            .prepare_vis_rope2d_h128(LaunchConfig1D::new(grid, BLOCK, 0))?;
+        self.module.vis_rope2d_h128(
+            stream,
+            &prep,
+            cs,
+            launch_u32(what, "n", n)?,
+            launch_u32(what, "row_width", row_width)?,
+            launch_u32(what, "q0", q0)?,
+            launch_u32(what, "k0", k0)?,
+            launch_u32(what, "n_heads", n_heads)?,
+            x,
+        )?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests_128 {
+    use super::{HEAD_DIM_128, PAIRS_128, RopeTable128, rope_128_ref, rope_source_128};
+
+    /// The permutation is a bijection of a head's 128 values that sends each NORM-mode pair
+    /// `(2i, 2i + 1)` of either half to one kernel pair `(j, j + 64)`.
+    #[test]
+    fn the_permutation_maps_ggmls_pairs_onto_the_kernels() {
+        let mut seen = [false; HEAD_DIM_128];
+        for r in 0..HEAD_DIM_128 {
+            let src = rope_source_128(r);
+            assert!(!seen[src], "value {src} twice");
+            seen[src] = true;
+        }
+        for j in 0..PAIRS_128 {
+            let (a, b) = (rope_source_128(j), rope_source_128(j + PAIRS_128));
+            assert_eq!((a % 2, b, a / 64), (0, a + 1, j / 32), "pair {j}");
+        }
+    }
+
+    /// Turning the permuted head with the table is ggml's NORM-mode turn of the file's head
+    /// (`x0·c − x1·s`, `x0·s + x1·c`, each product and sum rounded in f32), bit for bit: the row's
+    /// half at the row's angles, the column's at the column's.
+    #[test]
+    fn the_permuted_turn_is_ggmls_turn() {
+        let (y, x) = (3usize, 5usize);
+        let table = RopeTable128::interleaved(4, 6, [(y, x)], 10_000.0);
+        let file: Vec<u16> = (0..HEAD_DIM_128)
+            .map(|i| crate::f32_bf16(((i * 37 % 101) as f32 - 50.0) / 16.0))
+            .collect();
+        let mut card: Vec<u16> = (0..HEAD_DIM_128)
+            .map(|r| file[rope_source_128(r)])
+            .collect();
+        rope_128_ref(&mut card, HEAD_DIM_128, 0, 1, &table);
+        let theta_scale = 10_000f64.powf(f64::from(-2.0f32 / 64.0)) as f32;
+        let odd = 10_000f64.powf(f64::from(-2.0f32 / 128.0)) as f32;
+        let mut want = file.clone();
+        for (half, pos, freq_scale) in [(0usize, y, 1.0f32), (1, x, odd)] {
+            let mut angle = pos as f32;
+            for i in 0..32 {
+                let a = freq_scale * angle;
+                let (c, s) = (f64::from(a).cos() as f32, f64::from(a).sin() as f32);
+                let (x0, x1) = (
+                    crate::bf16_f32(file[half * 64 + 2 * i]),
+                    crate::bf16_f32(file[half * 64 + 2 * i + 1]),
+                );
+                want[half * 64 + 2 * i] = crate::f32_bf16(x0 * c - x1 * s);
+                want[half * 64 + 2 * i + 1] = crate::f32_bf16(x0 * s + x1 * c);
+                angle *= theta_scale;
+            }
+        }
+        for (r, &got) in card.iter().enumerate() {
+            assert_eq!(got, want[rope_source_128(r)], "value {r}");
+        }
+    }
+}

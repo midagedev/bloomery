@@ -21,6 +21,7 @@ pub mod conv;
 pub mod dense;
 pub mod head;
 pub mod ring;
+pub mod rnn;
 pub mod selector;
 pub mod stage;
 

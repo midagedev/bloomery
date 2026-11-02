@@ -518,6 +518,25 @@ impl Head {
         self.enqueue_over(gpu, w, w)
     }
 
+    /// [`Head::enqueue`] with `epilogue` run over the logits between the
+    /// projection and the argmax, for a chain whose logits take a function of
+    /// their own (a softcap): the projection and the argmax are those of the
+    /// file's `output.weight` type, and the argmax reads what `epilogue`
+    /// leaves. The logits are `n_vocab · m` values as the projection writes
+    /// them. Allocation-free and asynchronous when `epilogue` is, so capture
+    /// records the same body.
+    pub fn enqueue_with_epilogue<E>(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        mut epilogue: E,
+    ) -> Result<(), GpuError>
+    where
+        E: FnMut(&mut DeviceBuffer<f32>) -> Result<(), GpuError>,
+    {
+        self.enqueue_over_with(gpu, w, w, &mut epilogue)
+    }
+
     /// [`Head::enqueue`] with the norm's gain read from `gain` and the
     /// projection from `out`: the two sets [`Head::with_gain`] was made over.
     pub fn enqueue_over(
@@ -525,6 +544,18 @@ impl Head {
         gpu: &Gpu,
         gain: &Weights,
         out: &Weights,
+    ) -> Result<(), GpuError> {
+        self.enqueue_over_with(gpu, gain, out, &mut |_: &mut DeviceBuffer<f32>| Ok(()))
+    }
+
+    /// The one body of the head's launches past the input row: the norm, the
+    /// projection of `out`'s type, `epilogue` over the logits, the argmax.
+    fn enqueue_over_with(
+        &mut self,
+        gpu: &Gpu,
+        gain: &Weights,
+        out: &Weights,
+        epilogue: &mut dyn FnMut(&mut DeviceBuffer<f32>) -> Result<(), GpuError>,
     ) -> Result<(), GpuError> {
         let stream = gpu.stream();
         let shape = (self.eps, self.hidden, self.m);
@@ -536,11 +567,14 @@ impl Head {
             &self.x,
         )?;
         let fault = gpu.fault_sink(LAYER_HEAD);
-        match head_out_w(out)?.0 {
+        // Whether the projection read f32 rows, whose argmax refuses a
+        // non-finite logit.
+        let finite_argmax = match head_out_w(out)?.0 {
             OutW::Q6K(out_w) => {
                 let act = held(&mut self.act)?;
                 gpu.enqueue_quantize_q8_1_head(rows, act)?;
                 gpu.enqueue_gemv_q6k(out_w, &*act, &mut self.logits)?;
+                false
             }
             OutW::Q5K(out_w) => {
                 let act = held(&mut self.act)?;
@@ -578,11 +612,13 @@ impl Head {
                         )?;
                     }
                 }
+                false
             }
             OutW::Q4K(out_w) => {
                 let act = held(&mut self.act)?;
                 gpu.enqueue_quantize_q8_1_head(rows, act)?;
                 gpu.enqueue_gemv_q4k(out_w, &*act, &mut self.logits)?;
+                false
             }
             OutW::Nvfp4 { form, .. } => {
                 let q = self.nvfp4.as_mut().ok_or_else(|| {
@@ -621,11 +657,12 @@ impl Head {
                         &mut self.logits,
                     )?;
                 }
+                false
             }
             OutW::Q8_0 { qs, d } => {
                 gpu.q8f32()
                     .enqueue_q8_0_gemv(stream, qs, d, rows, self.m, &mut self.logits)?;
-                return self.argmax_finite(gpu, fault);
+                true
             }
             OutW::E4m3(w) => {
                 gpu.q8f32().enqueue_e4m3_gemv(
@@ -638,13 +675,17 @@ impl Head {
                         y: &mut self.logits,
                     },
                 )?;
-                return self.argmax_finite(gpu, fault);
+                true
             }
             OutW::Bf16(out_w) => {
                 gpu.q8f32()
                     .enqueue_bf16_gemv(stream, out_w, rows, self.m, &mut self.logits)?;
-                return self.argmax_finite(gpu, fault);
+                true
             }
+        };
+        epilogue(&mut self.logits)?;
+        if finite_argmax {
+            return self.argmax_finite(gpu, fault);
         }
         if self.m == 1 {
             gpu.elem().enqueue_argmax_fault(
@@ -701,8 +742,9 @@ impl Head {
     /// `enqueue`'s gemv and argmax do; [`Head::token`] and
     /// [`Head::logits_to_host`] are unchanged.
     /// Pure enqueues, so the same body is what a capture records. Public
-    /// because an architecture crate's chain writes its own tail (a logit
-    /// epilogue the shared one holds no launch of).
+    /// because an architecture crate's chain writes its own tail (a fused
+    /// projection the shared one holds no launch of); a logit epilogue over
+    /// the head's own projection is [`Head::enqueue_with_epilogue`]'s.
     pub fn enqueue_with_tail<F>(&mut self, gpu: &Gpu, w: &Weights, tail: F) -> Result<(), GpuError>
     where
         F: FnOnce(

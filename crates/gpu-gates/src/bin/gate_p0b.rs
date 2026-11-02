@@ -22,7 +22,10 @@
 //! pair past f32 (`F32Product`), and a finite value past f16 in the tail or
 //! under a large latent gain (`CacheValue`), each written as computed, and a
 //! tail pair with both (one output past f32, the other finite past f16) that
-//! names both sites.
+//! names both sites. The rows entry, `kv_norm_rope_append_rows`, takes the
+//! dump's six tokens in one launch, each at its own position and rope table
+//! (`key_rows_is_one_row_each`): `kv_s`, `kvr` and the cache bit for bit the
+//! six one-row launches', and one row at the cache's height refused alone.
 //! Printed, never asserted: `ik_rel` of
 //! y against dump `l_out-0`'s last column and of h against `ffn_up_gate-0`'s
 //! (the block-layer bands are pinned by the lead from these numbers, not
@@ -970,6 +973,123 @@ fn run() -> Result<(), GateError> {
         if !latent_pass {
             ok = false;
         }
+
+        // ---- `key_rows_is_one_row_each`: one launch of the rows entry over
+        // the dump's six tokens, each at its own cache row and its own rope
+        // table, is six launches of the one-row entry — `kv_s`, `kvr` and the
+        // cache bit for bit. A row whose position is at the cache's height is
+        // refused alone: the named `CachePos` fault, no cache row written for
+        // it, every other row as before.
+        const ROW_POS: [u32; TOKENS] = [5, 2, 9, 0, 7, 3];
+        let mut refused_pos = ROW_POS;
+        refused_pos[2] = CACHE_ROWS as u32;
+        let kv_all_dev = DeviceBuffer::from_host(stream, &kv_all)?;
+        for (label, positions, want_fault) in [
+            ("distinct_positions", ROW_POS, None),
+            (
+                "row_at_cache_height",
+                refused_pos,
+                Some(Fault::at(LAYER_NONE, FaultSite::CachePos)),
+            ),
+        ] {
+            // The reference: the one-row entry once per token, each at its
+            // own position and rope table, into one cache.
+            let mut cache_ref = DeviceTensor::<u16>::zeroed(stream, CACHE_ROWS, width)?;
+            let (mut kv_s_ref, mut kvr_ref) = (Vec::new(), Vec::new());
+            gpu.clear_fault()?;
+            for (r, &p) in positions.iter().enumerate() {
+                let kv_r = DeviceBuffer::from_host(stream, &kv_all[r * width..(r + 1) * width])?;
+                let cs_r = DeviceBuffer::from_host(stream, &mla.rope.cache(p))?;
+                let pos_r = DeviceBuffer::from_host(stream, &[p])?;
+                let mut kv_s_r = DeviceBuffer::<f32>::zeroed(stream, width)?;
+                let mut kvr_r = DeviceBuffer::<f32>::zeroed(stream, width)?;
+                fused.enqueue_kv_norm_rope_append(
+                    stream,
+                    &kv_r,
+                    &kv_gain_dev,
+                    &cs_r,
+                    &pos_r,
+                    mla.eps,
+                    latent,
+                    rope,
+                    &mut kv_s_r,
+                    &mut kvr_r,
+                    &mut cache_ref,
+                    gpu.unlabelled_sink(),
+                )?;
+                stream.synchronize()?;
+                kv_s_ref.extend(kv_s_r.to_host_vec(stream)?);
+                kvr_ref.extend(kvr_r.to_host_vec(stream)?);
+            }
+            let ref_fault = gpu.take_fault()?;
+
+            // The rows entry: all six tokens in one launch.
+            let cs_all: Vec<f32> = positions.iter().flat_map(|&p| mla.rope.cache(p)).collect();
+            let cs_all_dev = DeviceBuffer::from_host(stream, &cs_all)?;
+            let pos_all_dev = DeviceBuffer::from_host(stream, &positions)?;
+            let mut kv_s_rows = DeviceBuffer::<f32>::zeroed(stream, TOKENS * width)?;
+            let mut kvr_rows = DeviceBuffer::<f32>::zeroed(stream, TOKENS * width)?;
+            let mut cache_batch = DeviceTensor::<u16>::zeroed(stream, CACHE_ROWS, width)?;
+            gpu.clear_fault()?;
+            fused.enqueue_kv_norm_rope_append_rows(
+                stream,
+                &kv_all_dev,
+                &kv_gain_dev,
+                &cs_all_dev,
+                &pos_all_dev,
+                mla.eps,
+                latent,
+                rope,
+                TOKENS,
+                &mut kv_s_rows,
+                &mut kvr_rows,
+                &mut cache_batch,
+                gpu.unlabelled_sink(),
+            )?;
+            stream.synchronize()?;
+            let rows_fault = gpu.take_fault()?;
+            let (kv_s_got, kvr_got) = (
+                kv_s_rows.to_host_vec(stream)?,
+                kvr_rows.to_host_vec(stream)?,
+            );
+            let cache_got = cache_batch.buf().to_host_vec(stream)?;
+            let cache_want = cache_ref.buf().to_host_vec(stream)?;
+
+            // Every live row landed at its own position, and nothing else
+            // was written: as many non-zero cache rows as live positions.
+            let live = positions
+                .iter()
+                .filter(|&&p| (p as usize) < CACHE_ROWS)
+                .count();
+            let landed = cache_got
+                .chunks(width)
+                .filter(|row| row.iter().any(|&h| h != 0))
+                .count();
+            let (kv_s_same, kvr_same) = (
+                bits_equal(&kv_s_got, &kv_s_ref),
+                bits_equal(&kvr_got, &kvr_ref),
+            );
+            let cache_same = cache_got == cache_want;
+            let rows_pass = kv_s_same
+                && kvr_same
+                && cache_same
+                && landed == live
+                && ref_fault == want_fault
+                && rows_fault == want_fault;
+            println!(
+                "key rows {label} positions={positions:?} rows={TOKENS} \
+                 kv_s_bit_identical={kv_s_same} kvr_bit_identical={kvr_same} \
+                 cache_bit_identical={cache_same} cache_rows_written={landed} want_written={live} \
+                 one_row_fault=\"{}\" rows_fault=\"{}\" want=\"{}\" {}",
+                shown(ref_fault),
+                shown(rows_fault),
+                shown(want_fault),
+                verdict(rows_pass)
+            );
+            if !rows_pass {
+                ok = false;
+            }
+        }
     }
 
     // ---- printed, never asserted: distance to the CUDA oracle's own
@@ -999,7 +1119,9 @@ fn run() -> Result<(), GateError> {
         "PASSED: gate_p0b fused 4-launch block-0 FFN bit-identical to the 8-launch op path \
          (Q8Act, f32 normed, h, y, reruns, graph replays); node counts 8 and 4. The MLA key \
          path fused to 1 launch bit-identical to its 4 (kv_s, kvr, cache row, rerun, replay, \
-         second position), and an overflowing latent refused as the op path refuses it"
+         second position), and an overflowing latent refused as the op path refuses it; the rows \
+         entry over six tokens at their own positions is six one-row launches bit for bit, and a \
+         row at the cache's height is refused alone"
     );
     Ok(())
 }

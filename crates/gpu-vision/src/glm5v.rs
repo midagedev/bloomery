@@ -55,10 +55,11 @@
 
 use crate::attn::{AttnArgs, AttnKernels, QkvLayout};
 use crate::chain::{
-    Encoded, NoTaps, TapSink, read_bf16_narrowed, read_f32, side, tap, to_host, up_f32,
+    Encoded, NoTaps, TapSink, linear, read_bf16_narrowed, read_f32, side, tap, tap_cols, to_host,
+    up_f32,
 };
 use crate::gelu_tanh::{GeluKind, GeluTanhKernels};
-use crate::gemm_bf16::{Epilogue, GemmArgs, GemmKernels};
+use crate::gemm_bf16::GemmKernels;
 use crate::layer_norm::LayerNormKernels;
 use crate::mlp::MlpKernels;
 use crate::norm::{HEAD, HeadNormArgs, NormKernels};
@@ -235,60 +236,6 @@ fn ggml_rope_table(
         }
     }
     RopeTable { n_h, n_w, cs }
-}
-
-/// One linear layer `c = a · wᵀ (+ bias)`, with the block's residual added when `resid` is given.
-fn linear(
-    gemm: &GemmKernels,
-    stream: &CudaStream,
-    (a, w, bias): (
-        &DeviceBuffer<u16>,
-        &DeviceBuffer<u16>,
-        Option<&DeviceBuffer<f32>>,
-    ),
-    (m, n, k): (usize, usize, usize),
-    resid: Option<&DeviceBuffer<u16>>,
-    c: &mut DeviceBuffer<u16>,
-) -> Result<(), GpuError> {
-    gemm.enqueue(
-        stream,
-        GemmArgs {
-            a,
-            b: w,
-            bias,
-            epilogue: if resid.is_some() {
-                Epilogue::Residual
-            } else {
-                Epilogue::None
-            },
-            resid,
-            m,
-            n,
-            k,
-            c,
-        },
-    )
-}
-
-/// Tap the columns `c0 .. c0 + width` of the first `n` rows of `buf`, which has `row_width`
-/// columns, when the sink wants them.
-fn tap_cols(
-    stream: &CudaStream,
-    taps: &mut dyn TapSink,
-    name: &str,
-    buf: &DeviceBuffer<u16>,
-    (n, row_width): (usize, usize),
-    (c0, width): (usize, usize),
-) -> Result<(), GpuError> {
-    if taps.wants(name) {
-        let all = to_host(stream, buf, n * row_width)?;
-        let cols: Vec<u16> = all
-            .chunks_exact(row_width)
-            .flat_map(|r| r[c0..c0 + width].iter().copied())
-            .collect();
-        taps.take(name, width, cols);
-    }
-    Ok(())
 }
 
 impl Encoder {

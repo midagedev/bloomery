@@ -24,6 +24,14 @@
 //! probabilities of a proposal ([`Head::enqueue_p`]) are one launch of their
 //! own, enqueued only for a caller that asks.
 //!
+//! # The recurrent Markov loop
+//!
+//! A recurrent head ([`HeadTail::MarkovRnn`], Mistral Large 4's) caps the
+//! projection's logits first when its file states a soft cap, then runs
+//! [`super::rnn`]'s loop: a state carried down the rows, the correction
+//! from it, the argmax; six launches a row, the module doc's order. Its
+//! tables are Q8_0 rows over the target's vocabulary; it takes no map.
+//!
 //! Three heads run: the target's Q6_K matrix over the target's vocabulary
 //! (V4.1's draft), the draft's own Q8_0 rows over the same vocabulary, and
 //! the draft's own rows over a reduced one. A reduced head scores `n_head`
@@ -105,8 +113,9 @@ use std::sync::Arc;
 use runtime::dspark::{DraftVocab, HeadKind};
 use runtime::selector::{Lattice, SelectorError, walk_p};
 
+use super::rnn::{self, RnnInputArgs, RnnKernels};
 use super::selector::{self, SelectArgs, Selector, SelectorTail};
-use super::{HeadSource, TargetHead};
+use super::{HeadSource, Q8Rows, TargetHead};
 
 const WHAT: &str = "dspark::head";
 /// What the owner's checks name.
@@ -130,6 +139,107 @@ pub enum HeadTail {
     Markov(MarkovTail),
     /// DFlash2's selector head.
     Selector(SelectorTail),
+    /// Mistral Large 4's recurrent Markov head.
+    MarkovRnn(RnnTail),
+}
+
+/// The recurrent Markov head's tables on the card ([`super::rnn`]), over the
+/// target's vocabulary.
+pub struct RnnTail {
+    /// `markov_w1`: one Q8_0 row of `rank` values per target id (the previous
+    /// token).
+    pub w1: Q8Rows,
+    /// `markov_w2`: one Q8_0 row of `rank` values per head id.
+    pub w2: Q8Rows,
+    /// `joint_proj`: `3 · rank` Q8_0 rows over `2 · rank + hidden` values.
+    pub joint: Q8Rows,
+    /// `joint_proj.bias`: `3 · rank` values.
+    pub joint_b: DeviceBuffer<f32>,
+    /// The soft cap on the projection's logits, which the correction does
+    /// not take; `None` for a file that states none.
+    pub softcap: Option<f32>,
+}
+
+impl RnnTail {
+    /// The state's values: `markov_w1`'s row length.
+    #[must_use]
+    pub fn rank(&self) -> usize {
+        self.w1.d.cols() * 32
+    }
+
+    /// Refuse by name tables the loop has no launch for, over a head of
+    /// `n_head` ids and rows of `hidden` values: both Markov tables a row per
+    /// id of `rank` values, `joint_proj` and its bias of `3 · rank` rows over
+    /// `2 · rank + hidden`, a soft cap that is finite and not 0.
+    fn check(&self, n_head: usize, hidden: usize) -> Result<(), GpuError> {
+        let refuse = |detail: String| GpuError::shape(WHAT, detail);
+        let rank = self.rank();
+        let q8 = |q: &Q8Rows| (q.d.rows(), q.d.cols() * 32, q.qs.rows(), q.qs.cols());
+        for (name, t, rows, k) in [
+            ("markov_w1", &self.w1, n_head, rank),
+            ("markov_w2", &self.w2, n_head, rank),
+            ("joint_proj", &self.joint, 3 * rank, 2 * rank + hidden),
+        ] {
+            let (d_rows, d_k, qs_rows, qs_cols) = q8(t);
+            if rank == 0 || d_rows != rows || d_k != k || qs_rows != rows || qs_cols != k / 4 {
+                return Err(refuse(format!(
+                    "{name} is {d_rows} rows of {d_k} values ({qs_rows} x {qs_cols} words); a                      recurrent head of rank {rank} over {n_head} ids and rows of {hidden} needs                      {rows} rows of {k}"
+                )));
+            }
+        }
+        if self.joint_b.len() != 3 * rank {
+            return Err(refuse(format!(
+                "a joint_proj bias of {} values; rank {rank} needs {}",
+                self.joint_b.len(),
+                3 * rank
+            )));
+        }
+        if let Some(cap) = self.softcap
+            && (!cap.is_finite() || cap == 0.0)
+        {
+            return Err(refuse(format!(
+                "a logit soft cap of {cap}: finite and not 0"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The device bytes of each table buffer, as allocated: `markov_w1`'s
+    /// quants and scales, `markov_w2`'s, `joint_proj`'s, then its bias.
+    fn weight_buffers(&self) -> Vec<u64> {
+        let mut out = Vec::with_capacity(7);
+        for q in [&self.w1, &self.w2, &self.joint] {
+            out.push(q.qs.buf().num_bytes() as u64);
+            out.push(q.d.buf().num_bytes() as u64);
+        }
+        out.push(self.joint_b.num_bytes() as u64);
+        out
+    }
+}
+
+/// The recurrent loop's kernels and its buffers, a recurrent head's alone.
+struct Rnn {
+    k: RnnKernels,
+    /// The joint input, `2 · rank + hidden` values.
+    x: DeviceBuffer<f32>,
+    /// `joint_proj`'s output, `3 · rank`.
+    joint: DeviceBuffer<f32>,
+    /// The state, `rank`.
+    state: DeviceBuffer<f32>,
+    /// The correction vector, `rank`.
+    e: DeviceBuffer<f32>,
+    /// The correction, one value per head id.
+    delta: DeviceBuffer<f32>,
+}
+
+impl Rnn {
+    fn bytes(&self) -> u64 {
+        (self.x.num_bytes()
+            + self.joint.num_bytes()
+            + self.state.num_bytes()
+            + self.e.num_bytes()
+            + self.delta.num_bytes()) as u64
+    }
 }
 
 /// The Markov head's tables on the card.
@@ -153,7 +263,7 @@ impl HeadTail {
     fn map(&self) -> Option<&DeviceBuffer<u32>> {
         match self {
             HeadTail::Markov(t) => t.to_target.as_ref(),
-            HeadTail::Selector(_) => None,
+            HeadTail::Selector(_) | HeadTail::MarkovRnn(_) => None,
         }
     }
 }
@@ -216,6 +326,7 @@ impl HeadWeights {
                 rank: 4 * t.pred.qs.cols(),
                 top_k: t.top_k,
             },
+            HeadTail::MarkovRnn(t) => HeadKind::MarkovRnn { rank: t.rank() },
         }
     }
 
@@ -289,8 +400,26 @@ impl HeadWeights {
                     )),
                 }
             }
+            (HeadTail::MarkovRnn(t), HeadKind::MarkovRnn { rank }) => {
+                if *rank != t.rank() {
+                    return Err(refuse(format!(
+                        "a recurrent Markov rank of {rank} over tables of rank {}",
+                        t.rank()
+                    )));
+                }
+                match vocab {
+                    DraftVocab::Full { .. } => Ok(()),
+                    DraftVocab::Reduced { .. } => Err(refuse(
+                        "a recurrent head over a reduced vocabulary: its tables are the target's"
+                            .into(),
+                    )),
+                }
+            }
             (HeadTail::Markov(_), kind) => Err(refuse(format!(
                 "a shape with a {kind:?} head over Markov weights"
+            ))),
+            (HeadTail::MarkovRnn(_), kind) => Err(refuse(format!(
+                "a shape with a {kind:?} head over recurrent Markov weights"
             ))),
             (HeadTail::Selector(_), kind) => Err(refuse(format!(
                 "a shape with a {kind:?} head over selector weights"
@@ -745,6 +874,8 @@ pub struct Head {
     n_head: usize,
     /// The selector's launches and buffers: the selector kind's alone.
     sel: Option<Selector>,
+    /// The recurrent loop's kernels and buffers: the recurrent kind's alone.
+    rnn: Option<Rnn>,
 }
 
 impl Head {
@@ -812,13 +943,29 @@ impl Head {
             )));
         }
         let s = gpu.stream();
-        let sel = match &w.tail {
+        let (sel, rnn) = match &w.tail {
             HeadTail::Markov(t) => {
                 t.check(s, n_head)?;
-                None
+                (None, None)
             }
-            HeadTail::Selector(t) => {
-                Some(Selector::new(gpu.context(), s, t, n_head, hidden, rows)?)
+            HeadTail::Selector(t) => (
+                Some(Selector::new(gpu.context(), s, t, n_head, hidden, rows)?),
+                None,
+            ),
+            HeadTail::MarkovRnn(t) => {
+                t.check(n_head, hidden)?;
+                let rank = t.rank();
+                (
+                    None,
+                    Some(Rnn {
+                        k: RnnKernels::load(gpu.context())?,
+                        x: DeviceBuffer::zeroed(s, 2 * rank + hidden)?,
+                        joint: DeviceBuffer::zeroed(s, 3 * rank)?,
+                        state: DeviceBuffer::zeroed(s, rank)?,
+                        e: DeviceBuffer::zeroed(s, rank)?,
+                        delta: DeviceBuffer::zeroed(s, n_head)?,
+                    }),
+                )
             }
         };
         let acts = match &w.source {
@@ -841,6 +988,7 @@ impl Head {
             rows,
             n_head,
             sel,
+            rnn,
             w,
         })
     }
@@ -875,6 +1023,9 @@ impl Head {
             HeadTail::Markov(_) => Head::launches(m),
             HeadTail::Selector(_) if m == 1 => Head::LOGIT_LAUNCHES,
             HeadTail::Selector(_) => Head::LOGIT_LAUNCHES + selector::LAUNCHES,
+            HeadTail::MarkovRnn(t) => {
+                Head::LOGIT_LAUNCHES + usize::from(t.softcap.is_some()) + rnn::ROW_LAUNCHES * m
+            }
         }
     }
 
@@ -917,6 +1068,7 @@ impl Head {
                 out.extend(t.conf.iter().map(|(c, _)| c.buf().num_bytes() as u64));
             }
             HeadTail::Selector(t) => out.extend(Selector::weight_buffers(t)),
+            HeadTail::MarkovRnn(t) => out.extend(t.weight_buffers()),
         }
         out
     }
@@ -934,6 +1086,7 @@ impl Head {
             + self.done.num_bytes()
             + self.no_map.num_bytes()) as u64
             + self.sel.as_ref().map_or(0, Selector::scratch_bytes)
+            + self.rnn.as_ref().map_or(0, Rnn::bytes)
     }
 
     /// Refuse a row count the head holds no scratch for.
@@ -1005,6 +1158,7 @@ impl Head {
     ) -> Result<(), GpuError> {
         match (&self.w.tail, self.sel.as_mut()) {
             (HeadTail::Markov(_), _) => self.enqueue_markov(gpu, m, first),
+            (HeadTail::MarkovRnn(_), _) => self.enqueue_rnn(gpu, m, first),
             // A block of the anchor alone has no row to select from.
             (HeadTail::Selector(_), Some(_)) if m == 1 => Ok(()),
             (HeadTail::Selector(t), Some(sel)) => sel.enqueue(
@@ -1042,7 +1196,7 @@ impl Head {
         let HeadTail::Markov(t) = &self.w.tail else {
             return Err(GpuError::shape(
                 WHAT,
-                "the Markov loop on a selector head: it has no Markov tables",
+                "the bigram Markov loop on a head of another kind: it has no bigram tables",
             ));
         };
         match &t.to_target {
@@ -1085,6 +1239,89 @@ impl Head {
                     )?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Enqueue the recurrent loop over the `m` rows' logits ([`super::rnn`]),
+    /// row 0's previous token `first[0]` (a target id), after the soft cap
+    /// when the tail carries one: that cap's launch, then `m` rows of
+    /// [`rnn::ROW_LAUNCHES`]. A head of another kind is refused by name.
+    /// Asynchronous, allocation-free, capturable.
+    pub fn enqueue_rnn(
+        &mut self,
+        gpu: &Gpu,
+        m: usize,
+        first: &DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        self.check(m)?;
+        let Head {
+            w,
+            rnn,
+            normed,
+            logits,
+            tok,
+            hidden,
+            n_head,
+            ..
+        } = self;
+        let (HeadTail::MarkovRnn(t), Some(r)) = (&w.tail, rnn.as_mut()) else {
+            return Err(GpuError::shape(
+                WHAT,
+                "the recurrent Markov loop on a head of another kind: it has no recurrent tables",
+            ));
+        };
+        let (s, n_head, hidden, rank) = (gpu.stream(), *n_head, *hidden, t.rank());
+        let fault = gpu.unlabelled_sink();
+        if let Some(cap) = t.softcap {
+            gpu.elem()
+                .enqueue_softcap_rows(s, logits, n_head * m, cap)?;
+        }
+        for row in 0..m {
+            r.k.enqueue_input(
+                s,
+                RnnInputArgs {
+                    w1_qs: t.w1.qs.buf(),
+                    w1_d: t.w1.d.buf(),
+                    n_prev: t.w1.d.rows(),
+                    rank,
+                    first,
+                    tok: &*tok,
+                    state: &r.state,
+                    normed: &*normed,
+                    hidden,
+                    m,
+                    row,
+                    fault,
+                    x: &mut r.x,
+                },
+            )?;
+            gpu.q8f32().enqueue_q8_0_gemv_mcol(
+                s,
+                Q8_0GemvMcolArgs {
+                    qs: &t.joint.qs,
+                    d: &t.joint.d,
+                    x: &r.x,
+                    m: 1,
+                    out: GemvOut::RowMajor,
+                    y: &mut r.joint,
+                },
+            )?;
+            r.k.enqueue_gate(s, &r.joint, &t.joint_b, &r.x, rank, &mut r.state, &mut r.e)?;
+            gpu.q8f32().enqueue_q8_0_gemv_mcol(
+                s,
+                Q8_0GemvMcolArgs {
+                    qs: &t.w2.qs,
+                    d: &t.w2.d,
+                    x: &r.e,
+                    m: 1,
+                    out: GemvOut::RowMajor,
+                    y: &mut r.delta,
+                },
+            )?;
+            r.k.enqueue_add(s, &r.delta, n_head, m, row, logits)?;
+            gpu.elem()
+                .enqueue_argmax_rows_fault(s, &*logits, n_head, m, fault, tok)?;
         }
         Ok(())
     }

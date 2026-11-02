@@ -34,6 +34,15 @@
 //! ([`PromptStream::end_walk`]). The guards every family's `set_xstream`
 //! shares are [`PromptStream::check_mode`]'s, and the stream's start at a
 //! first `split` is [`PromptStream::start_split`].
+//!
+//! Under `split` a unit's card route runs the streamed experts' slots over
+//! the layer's ring beside the stage card's and tells the stream how many it
+//! ran ([`PromptStream::unit_read`]); the unit's back takes that count
+//! ([`PromptStream::unit_join`]) and sums the layer's card slots by the
+//! stream's union places: the stage's below its `n_card`, the `i`-th
+//! streamed expert at `n_card + i`. On a layer an expert tier holds experts
+//! of, that union is what the tier's join reads beside the tier's slots, so
+//! a load with a tier streams as one without.
 
 use cuda_core::CudaStream;
 use runtime::sched::At;
@@ -97,6 +106,13 @@ pub struct PromptStream {
     /// The walk's first unit's pick of a layer, held for its later units'
     /// card routes ([`PromptStream::unit_pick`]).
     held: Option<Held>,
+    /// The streamed experts a unit's card route ran over its layer's ring
+    /// ([`PromptStream::unit_read`]), until the unit's back takes them
+    /// ([`PromptStream::unit_join`]).
+    join: Option<(At, usize)>,
+    /// Per back of the call that took a join, its walk, its layer and the
+    /// streamed experts it summed the layer's card slots by.
+    joined: Vec<(usize, usize, usize)>,
 }
 
 /// The first unit's pick of a layer, for the walk's later units' card
@@ -122,15 +138,15 @@ impl PromptStream {
     }
 
     /// The guards every family's `set_xstream` runs before it sets `mode`
-    /// ([`PromptStream::set_mode`]), `tier_refused` whether the load hangs an
-    /// expert tier whose layers the family's card route runs no ring beside
-    /// (a route that sums a tier layer's card slots only in the tier's join).
-    /// Refused by name: any change while a call streams, `Admit` or `Split`
-    /// on a tier with no residency machine, and `Split` where `tier_refused`.
+    /// ([`PromptStream::set_mode`]). A load that hangs an expert tier takes
+    /// `split` as one without: a tier layer's join reads the stream's union
+    /// beside the tier's slots ([`PromptStream::unit_join`]). Refused by
+    /// name: any change while a call streams, and `Admit` or `Split` on a
+    /// tier with no residency machine.
     pub fn check_mode<H: HostExperts>(
         &self,
         tier: &HostTier<H>,
-        (mode, tier_refused): (XMode, bool),
+        mode: XMode,
     ) -> Result<(), GpuError> {
         if self.on {
             return Err(GpuError::state(
@@ -142,13 +158,6 @@ impl PromptStream {
             return Err(GpuError::state(
                 "BLOOMERY_XSTREAM",
                 "a residency machine (BLOOMERY_RESIDENCY=mid-p<P>-s<S>) for admit or split",
-            ));
-        }
-        if mode == XMode::Split && tier_refused {
-            return Err(GpuError::shape(
-                "BLOOMERY_XSTREAM",
-                "split on a load with an expert tier: this family's ring serves the stage card \
-                 of a load with none",
             ));
         }
         Ok(())
@@ -293,6 +302,8 @@ impl PromptStream {
         self.ubatch = 0;
         self.owed = None;
         self.held = None;
+        self.join = None;
+        self.joined.clear();
         self.returning = returns && !self.return_at_end;
         self.call_end = end;
         let mode = self.mode();
@@ -606,29 +617,73 @@ impl PromptStream {
 
     /// Under host streaming, after unit `at.unit`'s card route of layer
     /// `at.layer` over what [`PromptStream::unit_pick`] gave it (`land`, and
-    /// whether the layer streams): the pick held for the walk's next unit
+    /// `joined` the streamed experts the route ran over the layer's ring,
+    /// `None` where it ran none): the join the unit's back takes
+    /// ([`PromptStream::unit_join`]), the pick held for the walk's next unit
     /// unless this is the last of `units`, then the unit's read
     /// ([`PromptStream::read`]), the last unit's the layer's last read of
-    /// its slots. Nothing when no call streams.
+    /// its slots. Refused by name: a join while another unit's waits for its
+    /// back. Nothing when no call streams.
     pub fn unit_read<H: HostExperts>(
         &mut self,
         port: &mut BatchLeg<'_, H>,
         (at, units): (At, usize),
-        (land, streams): (Vec<LandBatch>, bool),
+        (land, joined): (Vec<LandBatch>, Option<usize>),
         card: impl Fn(usize) -> bool,
     ) -> Result<(), GpuError> {
         if !self.on {
             return Ok(());
+        }
+        if let Some(n) = joined {
+            if let Some((w, _)) = self.join {
+                return Err(GpuError::protocol(
+                    WHAT,
+                    format!(
+                        "unit {}'s card route of layer {} ran the ring while unit {}'s join of \
+                         layer {} waits for its back",
+                        at.unit, at.layer, w.unit, w.layer
+                    ),
+                ));
+            }
+            self.join = Some((at, n));
         }
         let last = at.unit + 1 == units;
         if !last {
             self.held = Some(Held {
                 layer: at.layer,
                 land,
-                streams,
+                streams: joined.is_some(),
             });
         }
         self.read(port, at.layer, last, card)
+    }
+
+    /// At unit `at.unit`'s back of layer `at.layer`: the streamed experts its
+    /// card route ran over the layer's ring ([`PromptStream::unit_read`]),
+    /// which the back sums the layer's card slots by — the stream's union
+    /// places, the stage's below its `n_card` and the `i`-th streamed expert
+    /// at `n_card + i`, so a streamed expert's rows join the card's sum where
+    /// a host expert's would, and on a layer an expert tier holds experts of
+    /// the tier's join reads that union beside the tier's slots. `None` when
+    /// the unit's card route ran no ring there. Taken, and recorded for
+    /// [`PromptStream::take_join_records`]. Refused by name: a join that
+    /// waits for another unit's or another layer's back.
+    pub fn unit_join(&mut self, at: At) -> Result<Option<usize>, GpuError> {
+        match self.join {
+            None => Ok(None),
+            Some((w, n)) if w == at => {
+                self.join = None;
+                self.joined.push((self.ubatch, at.layer, n));
+                Ok(Some(n))
+            }
+            Some((w, _)) => Err(GpuError::protocol(
+                WHAT,
+                format!(
+                    "unit {}'s back of layer {} while unit {}'s join of layer {} waits",
+                    at.unit, at.layer, w.unit, w.layer
+                ),
+            )),
+        }
     }
 
     /// After unit `at.unit`'s back of layer `at.layer` in a walk of `units`
@@ -642,8 +697,9 @@ impl PromptStream {
     }
 
     /// After a walk: refused by name while a layer's pick is still held (a
-    /// later unit's card route did not read it); then the return of the
-    /// walk's last returned layer, which no shadow follows
+    /// later unit's card route did not read it) or a unit's join still waits
+    /// (its back did not take it); then the return of the walk's last
+    /// returned layer, which no shadow follows
     /// ([`PromptStream::return_owed`]).
     pub fn end_walk<H: HostExperts>(
         &mut self,
@@ -656,6 +712,15 @@ impl PromptStream {
                 format!(
                     "layer {}'s pick held past the walk: a unit's card route did not read it",
                     h.layer
+                ),
+            ));
+        }
+        if let Some((w, _)) = self.join.take() {
+            return Err(GpuError::protocol(
+                WHAT,
+                format!(
+                    "unit {}'s join of layer {} past the walk: its back did not take it",
+                    w.unit, w.layer
                 ),
             ));
         }
@@ -680,5 +745,14 @@ impl PromptStream {
     /// read is empty.
     pub fn take_pick_records(&mut self) -> (Vec<(usize, CallPick)>, Option<CallReport>) {
         (std::mem::take(&mut self.picks), self.end.take())
+    }
+
+    /// The last streaming call's joins ([`PromptStream::unit_join`]): per
+    /// unit back that took one, its walk, its layer and the streamed experts
+    /// it summed the layer's card slots by — each unit of a walk takes its
+    /// own. Empty after a call that did not stream under `split`. Taken: a
+    /// second read is empty. A gate's instrument.
+    pub fn take_join_records(&mut self) -> Vec<(usize, usize, usize)> {
+        std::mem::take(&mut self.joined)
     }
 }

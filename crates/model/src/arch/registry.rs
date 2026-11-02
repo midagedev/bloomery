@@ -388,7 +388,7 @@ pub static ROWS: &[ArchRow] = &[
         draft: None,
         coverage: None,
         fixture: Some(Fixture::Gguf(FixtureRow {
-            family: "mistrallarge4",
+            family: "mistrallarge4-e128",
             repo: "unsloth/Mistral-Large-4-1T-A52B-GGUF",
             quant: "UD-IQ1_S",
             rev: None,

@@ -10,7 +10,10 @@
 //! - (c) the argmax: the device token equals the oracle's argmax over
 //!   `result_output`'s last row (both proven against the pinned ik token) and
 //!   equals the host argmax of our own logits under the kernel's tie rule —
-//!   strictly greater replaces, so equal values keep the LOWER index.
+//!   strictly greater replaces, so equal values keep the LOWER index;
+//! - (d) `enqueue_with_epilogue` with the logits negated: the readback is the
+//!   projection's negated bit for bit and the token the argmax of the
+//!   negated row.
 //!
 //! The head's input is the dump's `l_out-26` (occurrence 0, the residual ADD,
 //! `{2048, 1}`) — the same tensor the CPU head gate feeds
@@ -200,6 +203,25 @@ fn run() -> Result<(), GateError> {
         verdict(rerun_same)
     );
     if !rerun_same {
+        ok = false;
+    }
+
+    // ---- (d) an epilogue runs between the projection and the argmax: the
+    // logits negated in place, so the readback is the projection's negated bit
+    // for bit and the token the lowest logit's index under the tie rule.
+    head.set_input(&gpu, &x_in)?;
+    let n = head.n_vocab() * head.m();
+    head.enqueue_with_epilogue(&gpu, &w, |logits| {
+        gpu.elem().enqueue_scale_rows(gpu.stream(), logits, n, -1.0)
+    })?;
+    let negated: Vec<f32> = logits1.iter().map(|x| -x).collect();
+    let epilogue_ok = bits_equal(&negated, &head.logits_to_host(&gpu)?)
+        && head.token(&gpu)? as usize == argmax_low(&negated);
+    println!(
+        "epilogue negated_logits_and_argmax_of_the_negated={epilogue_ok} {}",
+        verdict(epilogue_ok)
+    );
+    if !epilogue_ok {
         ok = false;
     }
 

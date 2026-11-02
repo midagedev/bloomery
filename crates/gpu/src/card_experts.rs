@@ -35,7 +35,10 @@
 //! (`card_leg::RouteBlock`, the 32-value GEMM over the half's planes), one
 //! GEMM batch a landing batch of the stream behind that batch's copies, each
 //! expert's weights read once a tile of up to 64 of its slots; the card's own
-//! slots stay on the leg's `_sel` launches, whose rows are the step's.
+//! slots stay on the leg's `_sel` launches, whose rows are the step's. On a
+//! tier layer the run sums nothing: the card's and the streamed slots' downs
+//! stay in the leg's rows under the stream's union places, which the layer's
+//! join reads beside the tier's rows.
 
 use cuda_core::{CudaStream, DeviceBuffer};
 use model::arch::models::{Ffn, LayerSpec};
@@ -229,6 +232,15 @@ fn card_downs(downs: DownForms) -> DownForms {
 
 /// Layer `l`'s card experts of `layers`, refused by name (`what`) on a layer
 /// with none.
+/// The refusal of step row `row` past the `armed` rows
+/// ([`CardExperts::arm_step_rows`]).
+fn past_step_rows(what: &'static str, row: usize, armed: usize) -> GpuError {
+    GpuError::Shape {
+        what,
+        detail: format!("step row {row} of {armed} armed (CardExperts::arm_step_rows)"),
+    }
+}
+
 fn layer_of<'a>(
     what: &'static str,
     layers: &'a [Option<CardLayer>],
@@ -267,8 +279,13 @@ pub struct CardExperts {
     /// has no route GEMM.
     ring_forms: Option<RingForms>,
     expert_input: ExpertInput,
-    /// The one-token step's buffers.
+    /// The one-token step's buffers: row 0's of a step whose rows run one
+    /// layer apart.
     step: CardBufs,
+    /// The step's buffers of rows 1.. of a pass whose rows run one layer
+    /// apart, each row a one-token run of its own ([`CardExperts::arm_step_rows`]);
+    /// none on a load that runs one row.
+    rows: Vec<CardBufs>,
     /// The buffers of a pass of several rows, on a load that runs one.
     pass: Option<CardBufs>,
 }
@@ -396,6 +413,7 @@ impl CardExperts {
             ring_forms: ring_forms.flatten(),
             expert_input: ExpertInput::Direct,
             step: CardBufs::new(gpu.stream(), &family, (n, ff, 1), downs)?,
+            rows: Vec::new(),
             pass: (rows > 1)
                 .then(|| CardBufs::new(gpu.stream(), &family, (n, ff, rows), downs))
                 .transpose()?,
@@ -405,6 +423,9 @@ impl CardExperts {
     /// Select the loaded down-input policy before making prompt batches or captures.
     pub fn set_expert_input(&mut self, gpu: &Gpu, policy: ExpertInput) -> Result<(), GpuError> {
         self.step.leg.set_expert_input(gpu, policy)?;
+        for row in &mut self.rows {
+            row.leg.set_expert_input(gpu, policy)?;
+        }
         if let Some(pass) = &mut self.pass {
             pass.leg.set_expert_input(gpu, policy)?;
         }
@@ -484,6 +505,73 @@ impl CardExperts {
         self.step.join(sel)
     }
 
+    /// Buffers for `rows` rows of the step in flight at once: a pass whose
+    /// rows run one layer apart, each row a one-token run of its own. Row 0's
+    /// are the step's; the others are made here, in the loaded down-input
+    /// policy. A second call of the same rows is nothing; another count, or
+    /// none, is refused by name. Load-time only, before any capture.
+    pub fn arm_step_rows(&mut self, gpu: &Gpu, rows: usize) -> Result<(), GpuError> {
+        let what = self.family.what;
+        let made = self.rows.len() + 1;
+        if rows == 0 || (made > 1 && made != rows) {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!("the step's rows armed at {made}, asked for {rows}"),
+            });
+        }
+        for _ in made..rows {
+            let mut bufs =
+                CardBufs::new(gpu.stream(), &self.family, (self.n, self.ff, 1), self.downs)?;
+            bufs.leg.set_expert_input(gpu, self.expert_input)?;
+            self.rows.push(bufs);
+        }
+        Ok(())
+    }
+
+    /// Row `row`'s step buffers: row 0's the step's own, a row past the
+    /// armed ones refused by name ([`CardExperts::arm_step_rows`]).
+    fn step_row(&self, row: usize) -> Result<&CardBufs, GpuError> {
+        let (what, armed) = (self.family.what, self.rows.len() + 1);
+        match row {
+            0 => Ok(&self.step),
+            r => self
+                .rows
+                .get(r - 1)
+                .ok_or_else(|| past_step_rows(what, row, armed)),
+        }
+    }
+
+    /// [`CardExperts::step_row`], to write.
+    fn step_row_mut(&mut self, row: usize) -> Result<&mut CardBufs, GpuError> {
+        let (what, armed) = (self.family.what, self.rows.len() + 1);
+        match row {
+            0 => Ok(&mut self.step),
+            r => self
+                .rows
+                .get_mut(r - 1)
+                .ok_or_else(|| past_step_rows(what, row, armed)),
+        }
+    }
+
+    /// [`CardExperts::pre`] of step row `row`.
+    pub fn pre_of(&self, row: usize) -> Result<&DeviceBuffer<f32>, GpuError> {
+        Ok(&self.step_row(row)?.pre)
+    }
+
+    /// [`CardExperts::acc`] of step row `row`.
+    pub fn acc_of(&self, row: usize) -> Result<&DeviceBuffer<f32>, GpuError> {
+        Ok(&self.step_row(row)?.acc)
+    }
+
+    /// [`CardExperts::step_join`] over step row `row`'s buffers.
+    pub fn step_join_of<'a>(
+        &'a mut self,
+        row: usize,
+        sel: &'a DeviceBuffer<u32>,
+    ) -> Result<TierJoin<'a>, GpuError> {
+        Ok(self.step_row_mut(row)?.join(sel))
+    }
+
     /// The sum plus the base of the last card layer a pass enqueued, one row
     /// a token of the pass.
     pub fn pass_pre(&self) -> Result<&DeviceBuffer<f32>, GpuError> {
@@ -496,7 +584,9 @@ impl CardExperts {
     /// Device bytes of the step's buffers and a pass's.
     #[must_use]
     pub fn bytes(&self) -> usize {
-        self.step.bytes() + self.pass.as_ref().map_or(0, CardBufs::bytes)
+        self.step.bytes()
+            + self.rows.iter().map(CardBufs::bytes).sum::<usize>()
+            + self.pass.as_ref().map_or(0, CardBufs::bytes)
     }
 
     /// The buffers for prompt batches of up to `cap` tokens. Load-time or
@@ -588,17 +678,34 @@ impl CardExperts {
         io: &Io<'_>,
         sel: &DeviceBuffer<u32>,
     ) -> Result<(), GpuError> {
-        let layer = layer_of(self.family.what, &self.layers, l)?;
+        self.enqueue_step_of(gpu, w, (l, 0), rule, io, sel)
+    }
+
+    /// [`CardExperts::enqueue_step`] into step row `row`'s buffers
+    /// ([`CardExperts::pre_of`]): the same launches over the row's own
+    /// buffers, so each row of a pass whose rows run one layer apart is its
+    /// one-token step's bits.
+    pub fn enqueue_step_of(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        (l, row): (usize, usize),
+        rule: Act,
+        io: &Io<'_>,
+        sel: &DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        let (what, armed) = (self.family.what, self.rows.len() + 1);
+        let layer = layer_of(what, &self.layers, l)?;
         let tiered = self.tier_k(l) > 0;
-        self.k.enqueue(
-            gpu,
-            w,
-            &mut self.step,
-            (l, layer, self.n),
-            (rule, tiered),
-            io,
-            sel,
-        )
+        let bufs = match row {
+            0 => &mut self.step,
+            r => self
+                .rows
+                .get_mut(r - 1)
+                .ok_or_else(|| past_step_rows(what, row, armed))?,
+        };
+        self.k
+            .enqueue(gpu, w, bufs, (l, layer, self.n), (rule, tiered), io, sel)
     }
 
     /// Layer `l`'s card slots of a pass of `io.m` rows (module doc), the
@@ -695,11 +802,12 @@ impl CardExperts {
     /// experts, a token's slots in slot order — plus the base into `cb`'s
     /// `pre`. A batch's GEMMs run while the copies of the batches after it
     /// land. The places share `cb`'s, each written after the run before it on
-    /// the one stream. Refused by name: a layer an expert tier holds experts
-    /// of (the ring serves the stage card of a load with no tier), a half
-    /// holding more experts than its slots, a batch whose ring pass buffers
-    /// were not armed ([`CardExperts::arm_ring`]) or were armed for another
-    /// half.
+    /// the one stream. On a layer an expert tier holds experts of the run ends
+    /// at the union row's places: the slots' downs stay in the leg's rows for
+    /// the layer's join ([`CardBatch::join`]), which sums them with the tier's
+    /// rows over `n_card + r.n` places. Refused by name: a half holding more
+    /// experts than its slots, a batch whose ring pass buffers were not armed
+    /// ([`CardExperts::arm_ring`]) or were armed for another half.
     pub fn enqueue_rows_ring(
         &self,
         (gpu, w, g32): (&Gpu, &Weights, &Gemm32Kernels),
@@ -717,14 +825,7 @@ impl CardExperts {
                 detail: format!("a batch of {} tokens in buffers of {}", io.m, cb.bufs.cap()),
             });
         }
-        if self.tier.get(l).is_some_and(|&k| k > 0) {
-            return Err(GpuError::shape(
-                what,
-                format!(
-                    "layer {l}: the expert stream's ring on a layer the expert tier holds experts of"
-                ),
-            ));
-        }
+        let tiered = self.tier_k(l) > 0;
         if r.n > r.half_slots {
             return Err(GpuError::shape(
                 what,
@@ -801,6 +902,9 @@ impl CardExperts {
             Ok(())
         })?;
         r.with_union(ctx, n_expert, |union_map| places(union_map, 0, &mut *sel))?;
+        if tiered {
+            return Ok(());
+        }
         let CardBufs { leg, acc, pre } = &mut *bufs;
         let sum = LegSum {
             w: io.weights,

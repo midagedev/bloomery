@@ -8,6 +8,18 @@
 # greedy.tsv (the argmax tokens with their margins). Set names are the family's
 # (crates/refset/src/arch/mistrallarge4).
 #
+# The variant `d3k` (`bash tools/ref/mistrallarge4-dump.sh d3k`, `just dump-ref-mistrallarge4 d3k`) dumps the deep set past the
+# lightning indexer's top-k (2,048 positions, so the selection is a cut and not every position):
+#   ref_mistrallarge4_d3k  3,001 ids of prose, a decode-step set: the first 3,000 ids run as a quiet prefill (no node asked for)
+#                          and the nodes below are dumped at the one step on the 3,001st id, at position 3,000 (`# prefill 3000`,
+#                          `# decode_pos 3000`; refset's RefManifest::step reads it), the same taps one row a node and no greedy
+#                          continuation. The step's selection is 2,048 of 3,001 positions on every full indexer layer.
+# The ids are the first D3K_IDS of the tokenizer oracle's prose under this vocabulary (`just dump-ref-tokenizer mistrallarge4`,
+# $BLOOMERY_DATA/ref-tokenizer-mistrallarge4/prose.nps.ids: the same text the other families' d3k sets take, no BOS as a.ids and
+# b.ids), written to $BLOOMERY_DATA/mistrallarge4/d3k.ids for the dumper (the set's `# tokens` line is their record); D3K_IDS
+# is refset's D3K_POSITION + 1. MISTRALLARGE4_TAG=mix256g names the Mix-256G file's ref_mistrallarge4_mix256g_d3k. The real
+# files only: the fixture's top-k is 16 and its walk past it is the e2e gate's own.
+#
 # The harness is the shared one: tools/ref/cb_dump.cpp is the dumper, tools/ref/cb-dump.sh the build and the
 # run (staging, lease, install); this file is Mistral Large 4's part of them, the tree, the taps and the prompts.
 # `bash tools/ref/mistrallarge4-dump.sh --build` links the dumper against the ml4 tree
@@ -59,7 +71,9 @@
 #
 # Wall [derived, docs/cards/mistrallarge4-dump.card]: the 223 GB file is mapped, and this tree's CPU backend
 # repacks none of its types on this AVX2 CPU (IQ1_S, IQ2_XXS, Q6_K and Q8_0 stay page-cache reads; they fit the
-# 251 GB box); the first run pages in what 60 ids and 64 greedy tokens route to.
+# 251 GB box); the first run pages in what 60 ids and 64 greedy tokens route to. The d3k variant's wall is
+# docs/cards/mistrallarge4-d3k-dump.card's (and the Mix-256G file's, mistrallarge4-mix256g-d3k-dump.card): six ubatches of 512
+# ids touch every expert, so the whole file is paged in once, then the prefill is CPU-bound.
 set -euo pipefail
 export BLOOMERY_MODEL=mistral-large4
 # shellcheck source=tools/ref/ref-paths.sh
@@ -68,6 +82,9 @@ source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 source "${BASH_SOURCE[0]%/*}/cb-dump.sh"
 
 CB_FAMILY=mistrallarge4
+# The fixture tier's sets name the cut they were dumped from, fx_ref_mistrallarge4e128_{a,b} (refset's fixture::A and fixture::B): the
+# 128-expert fixture (/models/fixtures/mistrallarge4-e128) and a cut with another expert count never share a set path.
+[ "${BLOOMERY_TIER:-real}" != fixture ] || CB_SET_FAMILY=mistrallarge4e128
 CB_ENV=MISTRALLARGE4
 CB_SCRIPT=mistrallarge4-dump.sh
 CB_TREE=$LCPP
@@ -76,9 +93,45 @@ CB_ARCH=mistral-large4
 CB_TITLE="mistrallarge4-dump — mainline llama.cpp's intermediate tensors, raw f32, little-endian"
 CB_IDS=mistrallarge4
 TAPS=attn_norm+indexer_q_ssmax+indexer_k+indexer_weights+top_k+Qcur_ssmax+kv_cmpr+Kcur+fattn_mla+ffn_inp+ffn_moe_logits+ffn_moe_probs+ffn_moe_topk+ffn_moe_weights+ffn_moe_weights_norm+ffn_moe_out+ffn_shexp+ffn_out+l_out+result_norm
-# name:ids:nodes:greedy — nodes joined by `+`.
-CB_PROMPTS=("a:a:$TAPS:32" "b:b:$TAPS:32")
+# name:ids:nodes:greedy — nodes joined by `+`. MISTRALLARGE4_TAG=mix256g names the sets of the Mix-256G file
+# (BLOOMERY_REF_MODEL, `just dump-ref-mistrallarge4-mix256g`) ref_mistrallarge4_mix256g_{a,b}, over the same ids.
+tag=${MISTRALLARGE4_TAG:+${MISTRALLARGE4_TAG}_}
+CB_PROMPTS=("${tag}a:a:$TAPS:32" "${tag}b:b:$TAPS:32")
 CB_FLAGS=()
+
+# The deep set's ids: D3K_IDS = refset's D3K_POSITION + 1 (the step's own id on top of the prefill).
+D3K_IDS=3001
+D3K_CORPUS=$BLOOMERY_DATA/ref-tokenizer-mistrallarge4/prose.nps.ids
+D3K_FILE=$BLOOMERY_DATA/mistrallarge4/d3k.ids
+
+# d3k_ids: the first D3K_IDS ids of the tokenizer oracle's prose as the dumper's ids file. The oracle's set must be finished
+# (its `# complete` trailer), hold at least D3K_IDS ids and have an id on each of those lines; anything else ends the dump by
+# name. A dry run (DUMP_DRY=1) reads the same and writes nothing. The ids file's sha256 is printed, the log's record of the slice.
+d3k_ids() {
+  local man=${D3K_CORPUS%/*}/MANIFEST.tsv have
+  grep -q '^# complete' "$man" 2>/dev/null || {
+    echo "mistrallarge4-dump.sh: $man is missing or has no completion trailer — run: just dump-ref-tokenizer mistrallarge4 (exit 66)" >&2
+    exit 66
+  }
+  [ -r "$D3K_CORPUS" ] || { echo "mistrallarge4-dump.sh: no $D3K_CORPUS (exit 66)" >&2; exit 66; }
+  have=$(wc -l < "$D3K_CORPUS")
+  [ "$have" -ge "$D3K_IDS" ] || {
+    echo "mistrallarge4-dump.sh: $D3K_CORPUS holds $have ids, the deep set wants $D3K_IDS (exit 65)" >&2
+    exit 65
+  }
+  head -n "$D3K_IDS" "$D3K_CORPUS" | awk '$0 !~ /^[0-9]+$/ { bad = NR } END { exit bad ? 1 : 0 }' || {
+    echo "mistrallarge4-dump.sh: a line among the first $D3K_IDS of $D3K_CORPUS is not an id (exit 65)" >&2
+    exit 65
+  }
+  if [ "${DUMP_DRY:-0}" = 1 ]; then
+    printf '[dry] d3k ids\t%s first %s of %s (not written)\n' "$D3K_FILE" "$D3K_IDS" "$D3K_CORPUS"
+    return 0
+  fi
+  mkdir -p "${D3K_FILE%/*}"
+  head -n "$D3K_IDS" "$D3K_CORPUS" > "$D3K_FILE.tmp.$$"
+  mv -f "$D3K_FILE.tmp.$$" "$D3K_FILE"
+  echo "d3k ids: $D3K_IDS of $D3K_CORPUS, sha256 $(sha256sum < "$D3K_FILE" | cut -d' ' -f1)"
+}
 
 case ${1:-} in
   --build) cb_dump_build ;;
@@ -87,5 +140,17 @@ case ${1:-} in
     source "${BASH_SOURCE[0]%/*}/lease.sh"
     cb_dump_run
     ;;
-  *) echo "mistrallarge4-dump.sh: no argument (the dump) or --build, got $1" >&2; exit 64 ;;
+  d3k)
+    [ "${BLOOMERY_TIER:-real}" != fixture ] || {
+      echo "mistrallarge4-dump.sh: d3k is the real files' deep set (the fixture's top-k is 16: its walk past it is the e2e gate's own), BLOOMERY_TIER=fixture does not dump it (exit 64)" >&2
+      exit 64
+    }
+    d3k_ids
+    # One prompt: the ids file by absolute path, every tap, no greedy continuation, a decode step after a quiet prefill.
+    CB_PROMPTS=("${tag}d3k:$D3K_FILE:$TAPS:0:step")
+    # shellcheck source=tools/ref/lease.sh
+    source "${BASH_SOURCE[0]%/*}/lease.sh"
+    cb_dump_run
+    ;;
+  *) echo "mistrallarge4-dump.sh: no argument (the dump), d3k or --build, got $1" >&2; exit 64 ;;
 esac

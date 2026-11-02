@@ -58,7 +58,7 @@ use model::placement::workstation::{CardSpec, DeviceInfo};
 use vision::arch::card::CardBytes;
 use vision::arch::minicpmv::{self, Group};
 pub(crate) use vision::arch::qwen3vl::TokenLimits;
-use vision::arch::{deepseek41v, gemma4v, glm5v, qwen3vl};
+use vision::arch::{deepseek41v, gemma4v, glm5v, pixtral, qwen3vl};
 use vision::mrope::Canvas;
 use vision::{EncoderInput, MediaModel, Patches, Prepared, VisionError};
 
@@ -294,6 +294,21 @@ pub fn rules() -> &'static [Rule] {
             out_dim: |f| Ok(minicpmv::Hparams::read(f)?.out_dim),
             // The tower is sized for [`MINICPM_TILE_TOKENS`]. Flags do not steer it.
             default_limits: |_| TokenLimits::new(1, MINICPM_TILE_TOKENS),
+            cap: |_, limits| Ok(limits.max()),
+        },
+        Rule {
+            projector: pixtral::PROJECTOR_TYPE,
+            // The break rows between grid rows are the tower's own, so the prompt holds neither
+            // `[IMG_BREAK]` nor any id but the image token (expanded to one copy per row) and
+            // the ordinary `[IMG_END]` after it.
+            ids: &[
+                (pixtral::media::IMAGE_TOKEN_ID, "[IMG]"),
+                (pixtral::media::IMAGE_END_ID, "[IMG_END]"),
+            ],
+            text_rope: None,
+            takes_limits: true,
+            out_dim: |f| Ok(pixtral::Hparams::read(f)?.out_dim),
+            default_limits: |f| pixtral::Hparams::read(f)?.default_limits(),
             cap: |_, limits| Ok(limits.max()),
         },
         Rule {
@@ -889,12 +904,13 @@ fn span_rows<'a, T: bloomery_gpu_vision::Tower + ?Sized, K>(
     tower: &mut T,
     stream: &Arc<cuda_core::CudaStream>,
     images: impl IntoIterator<Item = Image<'a>>,
-    width: usize,
+    (width, kept): (usize, Kept),
     splice: impl FnMut(&[u16], &Patches) -> Result<(Vec<u16>, Vec<K>), GateError>,
 ) -> Result<SpanRows<K>, GateError> {
-    span_rows_of(
+    span_rows_by(
         images,
         width,
+        kept,
         |patches| {
             let encoded = tower.encode(patches).map_err(|e| e.to_string())?;
             bloomery_gpu::to_host(stream, encoded.rows.buf()).map_err(|e| e.to_string())
@@ -965,9 +981,16 @@ impl Resident {
     fn span_rows<'a, K>(
         &mut self,
         images: impl IntoIterator<Item = Image<'a>>,
+        kept: Kept,
         splice: impl FnMut(&[u16], &Patches) -> Result<(Vec<u16>, Vec<K>), GateError>,
     ) -> Result<SpanRows<K>, GateError> {
-        span_rows(&mut *self.tower, &self.stream, images, self.n_embd, splice)
+        span_rows(
+            &mut *self.tower,
+            &self.stream,
+            images,
+            (self.n_embd, kept),
+            splice,
+        )
     }
 
     /// Step (e) of a seat's media call: `images` encoded and read back as the rows the prompt call
@@ -981,7 +1004,23 @@ impl Resident {
         images: impl IntoIterator<Item = Image<'a>>,
         splice: impl FnMut(&[u16], &Patches) -> Result<(Vec<u16>, Vec<K>), GateError>,
     ) -> Result<Encoded<K>, GateError> {
-        let rows = on_encoder_card(model, || self.span_rows(images, splice))?;
+        let rows = on_encoder_card(model, || self.span_rows(images, Kept::Cells, splice))?;
+        Ok(Encoded { rows })
+    }
+
+    /// [`Resident::encode_with`] of a tower that writes each span whole ([`Kept::Span`]): the
+    /// rows as the tower wrote them, one position a row of the image's span, nothing around them.
+    pub fn encode_whole<'a>(
+        &mut self,
+        model: &CudaContext,
+        images: impl IntoIterator<Item = Image<'a>>,
+    ) -> Result<Encoded, GateError> {
+        let width = self.n_embd;
+        let rows = on_encoder_card(model, || {
+            self.span_rows(images, Kept::Span, |rows, _| {
+                Ok((rows.to_vec(), vec![(); rows.len() / width]))
+            })
+        })?;
         Ok(Encoded { rows })
     }
 
@@ -1103,6 +1142,28 @@ impl<K> Encoded<K> {
 pub fn span_rows_of<'a, K, E: Display>(
     images: impl IntoIterator<Item = Image<'a>>,
     width: usize,
+    encode: impl FnMut(&Patches) -> Result<Vec<u16>, E>,
+    splice: impl FnMut(&[u16], &Patches) -> Result<(Vec<u16>, Vec<K>), GateError>,
+) -> Result<SpanRows<K>, GateError> {
+    span_rows_by(images, width, Kept::Cells, encode, splice)
+}
+
+/// Which of a tower's encoded rows a span keeps ([`span_rows_by`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kept {
+    /// The first row of each cell of the plan's grid: the tower writes one row a cell and the
+    /// seat's splice adds what goes around them.
+    Cells,
+    /// The first `span_len` rows the image's prepare named: a tower that writes the whole span
+    /// itself, its break rows between grid rows included (`pixtral`).
+    Span,
+}
+
+/// [`span_rows_of`] keeping the rows `kept` names of each image's encoded rows.
+pub fn span_rows_by<'a, K, E: Display>(
+    images: impl IntoIterator<Item = Image<'a>>,
+    width: usize,
+    kept: Kept,
     mut encode: impl FnMut(&Patches) -> Result<Vec<u16>, E>,
     mut splice: impl FnMut(&[u16], &Patches) -> Result<(Vec<u16>, Vec<K>), GateError>,
 ) -> Result<SpanRows<K>, GateError> {
@@ -1122,7 +1183,10 @@ pub fn span_rows_of<'a, K, E: Display>(
             .map_err(|e| format!("the image at {at}: {e}"))?;
         let (h, w) = (patches.plan.n_llm_h, patches.plan.n_llm_w);
         let all = encode(patches).map_err(|e| format!("the image at {at}: {e}"))?;
-        let want = h * w * width;
+        let want = match kept {
+            Kept::Cells => h * w,
+            Kept::Span => span_len,
+        } * width;
         let image = all.get(..want).ok_or_else(|| {
             format!(
                 "the image at {at}: {} encoded values for a {h}x{w} grid, want {want}",

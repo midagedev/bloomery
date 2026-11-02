@@ -86,6 +86,11 @@ pub enum Identity {
     /// names [`crate::fixture::first_shard`], and `# fixture` equals
     /// [`crate::fixture::line`] of that file.
     FixtureNemotronLogits,
+    /// `# model\t<path>` and `# draft_model\t<path>` in a llama.cpp draft-calls
+    /// set's `MANIFEST.tsv` (`tools/ref/dump-ml4-dspark.sh`), with `# build` naming the
+    /// tree's commit and patch and `# arch` the target's: the draft's calls on each
+    /// prompt and the rows it was fed ([`crate::lcppdspark`]).
+    LcppDsparkCalls,
 }
 
 impl Identity {
@@ -159,9 +164,9 @@ pub struct Family {
     /// It can fail: a fixture family's file is found by a directory listing,
     /// which finds none or several.
     pub runs: Option<fn() -> Result<String, RefError>>,
-    /// The draft file the tree runs, for [`Identity::ManifestAndDraft`] and
-    /// an [`Identity::MtpManifest`] or [`Identity::FixtureMtpManifest`] family
-    /// whose draft is its own file.
+    /// The draft file the tree runs, for [`Identity::ManifestAndDraft`],
+    /// [`Identity::LcppDsparkCalls`] and an [`Identity::MtpManifest`] or
+    /// [`Identity::FixtureMtpManifest`] family whose draft is its own file.
     pub draft_runs: Option<fn() -> Result<String, RefError>>,
     /// The gate recipes that read the family.
     pub consumers: &'static [&'static str],
@@ -361,8 +366,8 @@ impl Family {
 pub struct Provenance {
     /// The model file (or, for a checkpoint family, the checkpoint) it states.
     pub dumped_from: String,
-    /// The draft file, for [`Identity::ManifestAndDraft`] and an MTP family
-    /// with one.
+    /// The draft file, for [`Identity::ManifestAndDraft`], [`Identity::LcppDsparkCalls`]
+    /// and an MTP family with one.
     pub draft: Option<String>,
     /// The ik build it names, where the family's sets record one.
     pub build: Option<String>,
@@ -498,6 +503,14 @@ impl Family {
                 Ok(Provenance {
                     dumped_from: stated(set.model.as_deref()),
                     draft: None,
+                    build: set.build,
+                })
+            }
+            Identity::LcppDsparkCalls => {
+                let set = crate::lcppdspark::DsparkSet::open(path, self)?;
+                Ok(Provenance {
+                    dumped_from: stated(set.model.as_deref()),
+                    draft: set.draft_model,
                     build: set.build,
                 })
             }

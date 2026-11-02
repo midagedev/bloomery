@@ -22,6 +22,8 @@
 //!   `MANIFEST.tsv` and the files its rows name.
 //! - [`dsref`]: ik's DSpark draft sets (`tools/ref/dump_draft.cpp`).
 //! - [`mtpref`]: ik's MTP draft sets (`tools/ref/dump_mtp.cpp`).
+//! - [`lcppdspark`]: llama.cpp's DSpark draft calls and the rows the draft was fed
+//!   (`tools/ref/dump-ml4-dspark.sh`).
 //! - [`greedy`]: ik's greedy continuations (`tools/ref/argmax_ref.cpp`).
 //! - [`kld`]: ik's KL-divergence base runs (`tools/ref/ik-ppl.sh`).
 //! - [`vision`]: the vision encoder's oracle (`tools/ref/vision/dump_vision.py`).
@@ -64,6 +66,7 @@ pub mod greedy;
 pub mod hfmap;
 pub mod ik;
 pub mod kld;
+pub mod lcppdspark;
 mod md5;
 pub mod mtpref;
 pub mod nemotron;

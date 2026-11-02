@@ -1,9 +1,11 @@
 //! The taps a block draft reads: the rows entering the layers it names (HF's
 //! `hidden_states[L]`), laid by a body's walks into one device buffer and
-//! read back by its session. A body holds one [`DraftTaps`], copies each
-//! tapped layer's rows in with [`DraftTaps::enter`] (launched in a capture
-//! as in an eager walk), and plans what a read may ask for where the host
-//! plans the walk ([`DraftTaps::plan`]).
+//! read back by its session. A body holds one [`DraftTaps`] a kind of walk,
+//! copies each tapped layer's rows in with [`DraftTaps::enter`] (launched in
+//! a capture as in an eager walk), and plans what a read may ask for where
+//! the host plans the walk ([`DraftTaps::plan`]). `n_layer` is the count of
+//! hidden states the body can lay in: the layers' when the last layer's
+//! output is not one, one more when it is.
 //!
 //! The buffer is `[tap][row][hidden]` f32, `rows_cap` rows a tap, so one
 //! tapped layer's rows of a walk are one contiguous device copy; the
@@ -62,7 +64,7 @@ fn buffer_len(
 }
 
 /// The tapped layers and their buffer.
-pub(crate) struct DraftTaps {
+pub struct DraftTaps {
     layers: Vec<usize>,
     hidden: usize,
     rows_cap: usize,
@@ -77,7 +79,7 @@ impl DraftTaps {
     /// `n_layer`) of a body of `hidden` values a row and walks of up to
     /// `rows_cap` rows, against `free` device bytes with [`FIT_RESERVE`]
     /// left ([`buffer_len`]).
-    pub(crate) fn new(
+    pub fn new(
         stream: &CudaStream,
         layers: &[usize],
         n_layer: usize,
@@ -95,27 +97,32 @@ impl DraftTaps {
     }
 
     /// The tapped layers, in the order they were named.
-    pub(crate) fn layers(&self) -> &[usize] {
+    #[must_use]
+    pub fn layers(&self) -> &[usize] {
         &self.layers
     }
 
     /// Floats one position's tapped row holds.
-    pub(crate) fn width(&self) -> usize {
+    #[must_use]
+    pub fn width(&self) -> usize {
         self.layers.len() * self.hidden
     }
 
-    pub(crate) fn bytes(&self) -> usize {
+    /// Device bytes of the taps' buffer.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
         self.buf.num_bytes()
     }
 
     /// The tap slot of `layer`, if it is tapped.
-    pub(crate) fn slot(&self, layer: usize) -> Option<usize> {
+    #[must_use]
+    pub fn slot(&self, layer: usize) -> Option<usize> {
         self.layers.iter().position(|&l| l == layer)
     }
 
     /// The walk about to run lays in `rows` rows: what [`DraftTaps::read`]
     /// may ask for until the next walk is planned.
-    pub(crate) fn plan(&mut self, rows: usize) {
+    pub fn plan(&mut self, rows: usize) {
         self.last = rows;
     }
 
@@ -127,7 +134,7 @@ impl DraftTaps {
     /// Enqueue the copy of the first `m` rows of `x`, the rows entering the
     /// layer of `slot`, into the slot's rows. One device copy, launched in a
     /// capture as in an eager walk.
-    pub(crate) fn enter(
+    pub fn enter(
         &mut self,
         stream: &CudaStream,
         slot: usize,
@@ -139,7 +146,7 @@ impl DraftTaps {
 
     /// [`DraftTaps::enter`] into the slot's rows from `at`: the chunk of a
     /// walk planned over several, whose rows are `at ..` of the plan.
-    pub(crate) fn enter_at(
+    pub fn enter_at(
         &mut self,
         stream: &CudaStream,
         slot: usize,
@@ -167,7 +174,7 @@ impl DraftTaps {
     /// Rows `from .. from + rows` of the last walk, one [`DraftTaps::width`]
     /// row each, a position's taps in the order the layers were named.
     /// Blocking. Refused by name past the rows the last walk laid in.
-    pub(crate) fn read(
+    pub fn read(
         &self,
         stream: &CudaStream,
         from: usize,

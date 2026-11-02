@@ -23,7 +23,7 @@ use std::num::NonZeroUsize;
 use std::ops::Range;
 
 use bloomery_placement::slots::{SeqTerms, Stores};
-use models::{DeltaRule, Gqa, Mixer, ModelSpec, RopeMode, Selector};
+use models::{DeltaRule, Gqa, IndexKeys, Latent, Mixer, ModelSpec, RopeMode, Selector, Source};
 use runtime::stores::{self, Rows};
 
 use crate::arch::coverage;
@@ -622,12 +622,16 @@ pub(crate) fn card_terms(t: &CardTotals) -> u64 {
 enum Hold {
     /// A GQA layer: K and V of `row` bytes a position, over its `window` positions when it has one,
     /// and `index` bytes of index key a position over every position (0: the layer selects nothing).
-    /// A latent layer: its cached row of `row` bytes a position, no index, no window.
+    /// A latent layer: its cached row of `row` bytes a position and `index` bytes of index key a
+    /// position (0: the layer's indexer writes none of its own), no window.
     Attention {
         row: u64,
         index: u64,
         window: Option<u64>,
     },
+    /// A latent layer that reads the rows another layer wrote ([`Source::From`]): no cached row of
+    /// its own, and `index` bytes of index key a position when its indexer writes keys of its own.
+    Reader { index: u64 },
     /// A delta-rule layer: its first state lane and conv ring (`fixed` bytes), and the lanes'
     /// stamps and the lanes past the first over `v_heads` heads of `d × d` f32, whatever the
     /// context.
@@ -645,9 +649,14 @@ enum Hold {
 /// [`runtime::stores::ring_rows`] rows under [`Rows::Ring`]; each row is the layer's key heads' key
 /// and value rows in f16. A GQA layer that selects blocks ([`Selector::BlockMax`]) attends every
 /// position it holds (it has no window) and keeps, beside its planes, one f16 index key of the
-/// selector's `d` values for every position. A delta-rule layer holds a state of `v_heads` heads of
-/// `d × d` f32 in each of its stamped lanes, and the conv ring (`runtime::stores::recurrent_bytes`,
-/// `delta_lane_bytes`): one lane, or the lanes of a load that verifies ([`KvLayout::with_lanes`]).
+/// selector's `d` values for every position. A latent layer holds one f16 row of the latent and
+/// the key values beside it for every position, none when another layer wrote the rows it reads
+/// ([`Source::From`]), and, when its indexer projects keys of its own ([`Selector::StreamTopK`]
+/// over [`IndexKeys::FromInput`]), one f16 index key of the selector's `d` values for every
+/// position, which a layer that reads another's keys does not keep. A delta-rule layer holds a
+/// state of `v_heads` heads of `d × d` f32 in each of its stamped lanes, and the conv ring
+/// (`runtime::stores::recurrent_bytes`, `delta_lane_bytes`): one lane, or the lanes of a load that
+/// verifies ([`KvLayout::with_lanes`]).
 #[derive(Clone, Debug)]
 pub struct KvLayout {
     /// Per trunk layer.
@@ -667,9 +676,9 @@ pub struct KvLayout {
 
 impl KvLayout {
     /// The layout of the trunk layers `mixers` name, window layers on the ring; a mixer whose store
-    /// this owner does not size (a Mamba-2 layer, a latent layer that compresses, selects or windows,
-    /// a GQA layer with a selector other than the block selector or with a window beside it) is refused
-    /// by name with its layer.
+    /// this owner does not size (a Mamba-2 layer, a latent layer that compresses or windows or whose
+    /// selector is not the stream top-k over keys of the layer input, a GQA layer with a selector
+    /// other than the block selector or with a window beside it) is refused by name with its layer.
     pub fn of<'a>(mixers: impl IntoIterator<Item = &'a Mixer>) -> Result<KvLayout, PlacementError> {
         let mut holds = Vec::new();
         let mut ropes: Vec<(u32, u32)> = Vec::new();
@@ -702,15 +711,21 @@ impl KvLayout {
                         window: g.window.map(u64::from),
                     }
                 }
-                // A latent layer that compresses, selects or windows nothing holds a plane of one
-                // row a position, the latent and the key values beside it, in f16.
-                Mixer::Latent(a)
-                    if a.compress.is_none() && a.select.is_none() && a.window.is_none() =>
-                {
-                    Hold::Attention {
-                        row: (u64::from(a.latent) + u64::from(a.pe)) * stores::F16_BYTES,
-                        index: 0,
-                        window: None,
+                // A latent layer that compresses and windows nothing holds a plane of one row a
+                // position, the latent and the key values beside it, in f16 — none when another
+                // layer wrote the rows it reads — and the index keys its own indexer writes.
+                Mixer::Latent(a) if a.compress.is_none() && a.window.is_none() => {
+                    let index = match latent_index_row(a) {
+                        Ok(index) => index,
+                        Err(what) => return Err(unsized_store(layer, what)),
+                    };
+                    match a.cache {
+                        Source::Own(()) => Hold::Attention {
+                            row: (u64::from(a.latent) + u64::from(a.pe)) * stores::F16_BYTES,
+                            index,
+                            window: None,
+                        },
+                        Source::From(_) => Hold::Reader { index },
                     }
                 }
                 Mixer::DeltaRule(d) => Hold::State {
@@ -795,13 +810,43 @@ fn index_row(g: &Gqa) -> Result<u64, &'static str> {
     }
 }
 
+/// The bytes of index key a position a latent layer keeps: 0 for a layer that selects nothing or
+/// reads the keys another layer wrote, one f16 key of the selector's `d` values for a layer whose
+/// indexer projects keys of its own from the layer input. A selector of another kind, or one that
+/// ranks a candidate pool first or pools its keys from rows, is `Err` with the words a refusal
+/// names the mixer by.
+fn latent_index_row(a: &Latent) -> Result<u64, &'static str> {
+    match &a.select {
+        None => Ok(0),
+        Some(Selector::StreamTopK {
+            candidates: Some(_),
+            ..
+        }) => Err("a latent mixer whose selector ranks a candidate pool first"),
+        Some(Selector::StreamTopK {
+            keys: Source::From(_),
+            ..
+        }) => Ok(0),
+        Some(Selector::StreamTopK {
+            d,
+            keys: Source::Own(IndexKeys::FromInput { .. }),
+            ..
+        }) => Ok(u64::from(*d) * stores::F16_BYTES),
+        Some(Selector::StreamTopK {
+            keys: Source::Own(_),
+            ..
+        }) => Err("a latent mixer whose index keys are pooled from rows"),
+        Some(_) => Err("a latent mixer with a selector other than the stream top-k"),
+    }
+}
+
 /// The refusal of layer `layer`, a mixer this owner does not size (`what` names it).
 fn unsized_store(layer: usize, what: &str) -> PlacementError {
     PlacementError::Unimplemented(vec![Unimplemented {
         layer: Some(layer),
         feature: format!(
-            "{what}: this plan sizes the stores of a GQA layer (plain, or selecting blocks), a plain \
-             latent layer and a delta-rule layer"
+            "{what}: this plan sizes the stores of a GQA layer (plain, or selecting blocks), a latent \
+             layer (plain, or selecting by the stream top-k over keys of the layer input) and a \
+             delta-rule layer"
         ),
     }])
 }
@@ -820,6 +865,7 @@ impl KvBytes for KvLayout {
                 .rows_at(layer, ctx_max)
                 .saturating_mul(*row)
                 .saturating_add(ctx_max.saturating_mul(*index)),
+            Some(Hold::Reader { index }) => ctx_max.saturating_mul(*index),
             Some(Hold::State { fixed, v_heads, d }) => {
                 fixed + stores::delta_lane_bytes(*v_heads, *d, self.lanes.get())
             }
@@ -835,7 +881,10 @@ impl KvBytes for KvLayout {
 #[cfg(test)]
 mod tests {
     use gguf::GgmlType;
-    use models::{DeltaKind, Gqa, KdaGate, Mamba2, OutGate, PoolRule, Rope};
+    use models::{
+        Candidates, Compress, Compressor, DeltaKind, Gqa, IndexKeys, KdaGate, Latent, LatentOut,
+        LatentUp, Mamba2, OutGate, PoolRule, Rope,
+    };
     use runtime::stores::ring_rows;
 
     use super::*;
@@ -1042,6 +1091,141 @@ mod tests {
             assert_eq!(kv.layer_bytes(3, 9), 0);
         }
         assert_eq!(ring.bytes(0..3, 9), 9 * 96 + 9 * 120 + 9 * 96);
+    }
+
+    /// A latent layer of 16 latent values and `pe` key values beside them (a cached row of
+    /// `(16 + pe) × 2` B), reading the cache `cache` names, selecting by `select`.
+    fn latent(pe: u32, cache: Source<()>, select: Option<Selector>) -> Mixer {
+        Mixer::Latent(Latent {
+            heads: 4,
+            q_lora: 0,
+            latent: 16,
+            up: LatentUp::Absorbed { qk: 8, v: 8 },
+            rope: None,
+            q_head_norm: false,
+            ssmax: false,
+            pe,
+            cache,
+            out_gate: OutGate::None,
+            out: LatentOut::Plain,
+            window: None,
+            sinks: false,
+            compress: None,
+            select,
+        })
+    }
+
+    /// A stream top-k of index keys of `d` values, written as `keys` says.
+    fn stream(d: u32, keys: Source<IndexKeys>, candidates: Option<Candidates>) -> Selector {
+        Selector::StreamTopK {
+            heads: 2,
+            d,
+            k: 4,
+            keys,
+            list: Source::Own(()),
+            candidates,
+        }
+    }
+
+    /// A latent layer holds one f16 row a position of its latent and key values (here 16 + 4
+    /// values, 40 B) unless another layer wrote the rows it reads, and one f16 index key a position
+    /// of the selector's `d` values (here 12, 24 B) unless it reads another layer's keys, the two
+    /// independent: layer 0 selects nothing (9 × 40 B at 9 positions), layer 1 owns its rows and its
+    /// keys (9 × 64), layer 2 reads another's rows beside keys of its own (9 × 24, no rows), layer 3
+    /// owns its rows and reads keys (9 × 40), layer 4 reads both (nothing). A layer of the same
+    /// widths with neither fact plans the bytes it did before the stream selector was sized.
+    /// Mutant: a cache reader counted a row, a key reader counted its keys, or an owner's rows left
+    /// out of a selecting layer.
+    #[test]
+    fn a_latent_layer_holds_its_rows_and_keys_unless_it_reads_them() {
+        let own = Source::Own(());
+        let from = Source::From(1);
+        let own_keys = Source::Own(IndexKeys::FromInput { norm_eps: 1e-6 });
+        let mixers = [
+            latent(4, own, None),
+            latent(4, own, Some(stream(12, own_keys, None))),
+            latent(4, from, Some(stream(12, own_keys, None))),
+            latent(4, own, Some(stream(12, Source::From(1), None))),
+            latent(4, from, Some(stream(12, Source::From(1), None))),
+        ];
+        let kv = KvLayout::of(&mixers).expect("latent layers are sized");
+        let at = |ctx| (0..5).map(|l| kv.layer_bytes(l, ctx)).collect::<Vec<_>>();
+        assert_eq!(at(9), [9 * 40, 9 * 64, 9 * 24, 9 * 40, 0]);
+        assert_eq!(at(4096), [4096 * 40, 4096 * 64, 4096 * 24, 4096 * 40, 0]);
+        assert_eq!(kv.bytes(0..5, 9), 9 * (40 + 64 + 24 + 40));
+        for l in 0..5 {
+            assert_eq!(
+                kv.rows_at(l, 9),
+                if l == 2 || l == 4 { 0 } else { 9 },
+                "layer {l}"
+            );
+        }
+        assert_eq!(kv.stage_position_bytes(9), 0);
+    }
+
+    /// A latent layer whose store this owner does not size is refused by name with its layer: one
+    /// that compresses or windows, a selector that is not the stream top-k, a stream top-k that
+    /// ranks a candidate pool first and one whose keys are pooled from rows. Mutant: the
+    /// candidate pool or the pooled keys sized as keys of the layer input.
+    #[test]
+    fn a_latent_layer_the_owner_does_not_size_is_refused() {
+        let own = Source::Own(());
+        let keys = Source::Own(IndexKeys::FromInput { norm_eps: 1e-6 });
+        let compressor = Compressor {
+            gated: true,
+            ape: false,
+            overlap: false,
+        };
+        let candidates = Candidates {
+            source: 0,
+            blocks: 4,
+            block: 8,
+        };
+        let Mixer::Latent(base) = latent(4, own, None) else {
+            unreachable!("a latent layer")
+        };
+        let with = |f: &dyn Fn(&mut Latent)| {
+            let mut a = base.clone();
+            f(&mut a);
+            Mixer::Latent(a)
+        };
+        let refused = [
+            with(&|a| {
+                a.compress = Some(Compress {
+                    ratio: 4,
+                    rows: Source::Own(compressor),
+                })
+            }),
+            with(&|a| a.window = Some(8)),
+            with(&|a| a.select = Some(stream(12, keys, Some(candidates)))),
+            with(&|a| a.select = Some(stream(12, Source::Own(IndexKeys::FromRows), None))),
+            with(&|a| {
+                a.select = Some(stream(
+                    12,
+                    Source::Own(IndexKeys::Compressor(compressor)),
+                    None,
+                ))
+            }),
+            with(&|a| {
+                a.select = Some(Selector::TokenPool {
+                    heads: 2,
+                    d: 12,
+                    top_k: 8,
+                    pool: 4,
+                    rule: PoolRule::Learned { key_eps: 1e-6 },
+                })
+            }),
+        ];
+        for (l, mixer) in refused.iter().enumerate() {
+            let plain = latent(4, own, None);
+            match KvLayout::of([&plain, mixer]) {
+                Err(PlacementError::Unimplemented(items)) => {
+                    assert_eq!(items.len(), 1, "case {l}");
+                    assert_eq!(items[0].layer, Some(1), "case {l}");
+                }
+                other => panic!("case {l}: {other:?}, not the refusal of layer 1"),
+            }
+        }
     }
 
     /// MiniMax-M3's cache at the released file's widths: 4 key heads of 128 are 2,048 B of f16 K and

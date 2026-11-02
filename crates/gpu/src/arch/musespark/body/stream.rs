@@ -9,9 +9,9 @@
 //! stream's rule sends to the card land in a half of its ring, in landing batches, and the serve leaves them out. The
 //! card's route then runs the layer's stage slots through the IQ2_XXS `_sel` launches, and the ring's slots batch by
 //! batch, each batch behind its own landed event, as the common route GEMM over the half's stacks
-//! ([`RingPass`], [`RingGemm`]); the back sums the card's slots by the stream's union places (`n_card + i` for the
-//! `i`-th streamed expert), so a streamed expert's row joins the sum where a host expert's would, before the host's
-//! sums add.
+//! ([`RingPass`], [`RingGemm`]); the back takes the count the stream kept for it ([`PromptStream::unit_join`]) and
+//! sums the card's slots by the stream's union places (`n_card + i` for the `i`-th streamed expert), so a streamed
+//! expert's row joins the sum where a host expert's would, before the host's sums add.
 //!
 //! The IQ2_XXS stacks are the file's blocks on the card, so the machine stages each part as the file holds it
 //! ([`crate::host::swap::Transform::Identity`]): the stage slots, the ring's slots and the host read the same bytes.
@@ -52,11 +52,6 @@ pub(super) struct XSide {
     pub(super) stream: PromptStream,
     /// The ring pass's places and route GEMM buffers, from the first `split` on.
     ring: Option<RingPlaces>,
-    /// Per ring pass of the last streaming call, its walk, its layer and the streamed experts its slots joined into
-    /// the card's sum: what a gate holds the stream's records to ([`Body::take_stream_joined`]).
-    joined: Vec<(usize, usize, usize)>,
-    /// The walk the call runs, from 0: the joined entries' walk, as the records name theirs.
-    walk: usize,
     /// The card bytes the ring may take past the stream's keep-free: the ring's part of what a streaming plan reserves
     /// ([`stream_ring_bytes`](model::arch::musespark::place::stream_ring_bytes); the plan keeps the ring pass's buffers
     /// beside it, [`stream_bytes`](model::arch::musespark::place::stream_bytes)), so a ring never takes the card's
@@ -109,20 +104,7 @@ impl XSide {
             union: DeviceBuffer::zeroed(gpu.stream(), rows * top_k)?,
             gemm: RingGemm::new(gpu, (rows, top_k, latent, ff), half_slots, forms)?,
         });
-        self.joined.reserve(64);
         Ok(())
-    }
-
-    /// A call opens: the joined record and the walk index start over.
-    pub(super) fn begin_call(&mut self) {
-        self.joined.clear();
-        self.walk = 0;
-    }
-
-    /// A pass's walk ran ([`PromptStream::walk_done`] beside it).
-    pub(super) fn walk_done(&mut self) {
-        self.stream.walk_done();
-        self.walk += 1;
     }
 
     /// Layer `layer`'s ring pass over `r` with `acc_k`'s places: the armed buffers lent to it. Refused by name: a
@@ -152,11 +134,6 @@ impl XSide {
             "the ring pass's places (the first split arms them)",
         ))
     }
-
-    /// The ring pass of layer `layer` joined `n` streamed experts into the card's sum, in the current walk.
-    pub(super) fn joined(&mut self, layer: usize, n: usize) {
-        self.joined.push((self.walk, layer, n));
-    }
 }
 
 impl Body {
@@ -182,10 +159,10 @@ impl Body {
         self.xs.stream.take_pick_records()
     }
 
-    /// The last streaming call's ring passes: each one's walk, layer and the streamed experts its slots joined into
-    /// the card's sum. Taken: a second read is empty. A gate's instrument.
+    /// The last streaming call's ring passes: each one's walk, layer and the streamed experts its back summed the
+    /// card's slots by ([`PromptStream::take_join_records`]). Taken: a second read is empty. A gate's instrument.
     pub fn take_stream_joined(&mut self) -> Vec<(usize, usize, usize)> {
-        std::mem::take(&mut self.xs.joined)
+        self.xs.stream.take_join_records()
     }
 
     /// Open the prompt call's streaming over `n` ids ending at `end`, returning to its start when `returns`
@@ -202,7 +179,6 @@ impl Body {
         let Some(p) = self.placed.as_mut() else {
             return Ok(());
         };
-        self.xs.begin_call();
         self.xs.stream.begin(
             &mut p.hybrid,
             stream,
@@ -258,7 +234,7 @@ impl XStreamBody for Body {
                 "a placed load (the host tier the stream serves)",
             ));
         };
-        self.xs.stream.check_mode(&p.hybrid, (mode, false))?;
+        self.xs.stream.check_mode(&p.hybrid, mode)?;
         if mode == XMode::Split
             && let Some(half) = PromptStream::start_split(&mut p.hybrid, gpu, || {
                 // PIN(2026-11-01): `a_load_starts_from_the_row_of_its_experts_widths` went with the

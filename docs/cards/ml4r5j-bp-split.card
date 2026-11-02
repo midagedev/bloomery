@@ -1,0 +1,42 @@
+# Round ml4r5j: Mistral Large 4's prompt pass on plan (b′) (`--place bp`: the A6000 the stage, the 3090 an expert
+# tier, the host the rest), the expert stream's ring beside the tier through the common join against the serving
+# default. Same binary, two lever arms, both under the residency machine the stream needs (the seat's residency
+# default, mid-p0-s1 on a and bp, or the word set): BLOOMERY_RESIDENCY=mid-p<P>-s<S> unset-xstream (the common
+# rule's admit at bp) and the same with BLOOMERY_XSTREAM=split (a tier layer's join sums the stage card's, the
+# streamed and the tier's slots by the stream's union places, PromptStream::unit_join).
+# Inputs [derived, ml4r5x §1, ml4r5f]: a host slot 71.6..123.7 us, so u = 1.15..1.98 ms an expert at 16 columns of a
+# 512-row unit; an expert 23.55 MB at the A6000's pinned 26.28 GB/s = 0.90 ms (rig-log 09-25#m2-h2d-a6000); the card
+# front F = 10 ms (15 ms at G = 2); bp keeps ~100 host experts a layer beside the stage and the tier.
+# Base arm per unit and layer [derived]: host CPU, the union 100 x u = 115..198 ms (the bound); stage SM front 10 ms;
+# the tier card's ~1..3 ms on its own link under the union (0); PCIe the rows and sums < 1 ms; NVMe 0.
+# 10 + 115..198 ms x 71 layers: pp512 36..60 (ml4r5f's band).
+# Split arm per unit and layer [derived]: balanced at (100 - S) x u = S x 0.90 ms: S = 56..69 streamed, the host
+# 31..44 at 51..62 ms, the lane 50..62 ms (the bound with the union, overlapped); the card's ring GEMM 5..12 ms, the
+# shadow 3 ms and the tier join ~1 ms under the lane (0); DRAM 3 passes x S x 23.55 MB + the union = 77..83 GB/s of
+# 115..137. F + max = 61..72 ms x 71: pp512 100..119; G = 2 (pp4096): S = 72..82, 162..181.
+# Effect: 100..119 over 36..60 at the same u = +100..+180 % (the lane at a held 20.41 GB/s, staging's three DRAM
+# passes: 87..106, +77..+145 %, inside the band's low side).
+# Sitting (on the lead's go, needs the ML4 seat in the tree, both cards in the timing witness, ~15 min: 2 arms x 3
+# rounds, a fresh server each, load 60..120 s):
+#   BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/ml4r5j-bp-split.card BLOOMERY_TIMING_CARDS=a6000+3090
+#     DEPTH_SERVE_CTX=4224' tools/ref/depth-serve.sh <this tree>:512@BLOOMERY_RESIDENCY=mid-p<P>-s<S>
+#     env=BLOOMERY_RESIDENCY=mid-p<P>-s<S>;BLOOMERY_XSTREAM=split:<this tree>:512
+kind: ab
+question: does the expert stream's ring beside the expert tier (BLOOMERY_XSTREAM=split through the common tier join)
+  raise the Mistral Large 4 seat's prompt rate on plan (b′) over the serving default's admit?
+term: pp tok/s @ P = 512, bloomery-serve --model mistrallarge4 at the serving defaults with the residency machine set
+  (place unset -> bp), A6000 + 3090 + host, depth-serve rows (timings.prompt_per_second) — (split - unset) / unset,
+  paired by round
+unit: %
+predict: +100..+180
+rounds: 3
+condition: depth-serve under BLOOMERY_TIMING_CARDS=a6000+3090 in its own lease, one fresh server an arm and a round,
+  the arm order rotated every round; each server's `place unset` record names bp and its `plan` record a tier0 card
+  holding experts; the unset arm's `xstream=` line names admit and the split arm's split, else the row is void; the
+  witness (both cards, mem, pgmajfault) shows no other model load and no row carries [cpu-busy] or [other-busy]
+decide-in: turn the unset rule's bp arm to split for the families whose tier layers join the stream (the common
+  path), land, and write the row beside plan (a)'s
+decide-below: read the split arm's stream records (streamed experts a tier layer against S = 56..69, the lane's rate
+  against 26.28 GB/s); a slower lane is the staging's DRAM passes, fewer streamed is the rule's balance
+decide-above: re-derive the base: the union's per-expert cost at bp or the admits the base arm's picks made are not
+  the counted ones; read the base arm's pick records before any further lever

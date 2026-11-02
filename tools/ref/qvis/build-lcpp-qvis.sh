@@ -19,6 +19,10 @@
 #   LCPP_BUILD_CUDA     the CUDA toolkit nvcc comes from (default /usr/local/cuda-13.3)
 #   LCPP_BUILD_CPU_ONLY 1 builds the CPU backend alone (GGML_CUDA=OFF, GGML_NATIVE=ON, no nvcc); 0, the default, the CUDA
 #                       build above; any other value is refused (rc 64). Mistral Large 4's oracle tree is the CPU-only one
+#   LCPP_BUILD_PATCH    a patch in this repository (a path from its root) applied to the tree after its checkout: a dump
+#                       hook the commit lacks (tools/ref/ml4-dspark-dump.patch). Unset, the default, the tree is the
+#                       commit's. An existing tree's tracked changes must then be exactly that patch's (its files, and
+#                       the patch reverses cleanly), else refused (rc 65); the log prints the patch's sha256
 #
 # A clone of the box's local clone /home/user/llama.cpp (objects shared, `git clone --shared`) at the tree, the pin fetched from
 # GitHub and checked out detached. Every git and build step runs as the trees' owner `user` when the script runs as root (the
@@ -70,15 +74,31 @@ lease_free || case $? in
   1) fail "the timing lease is held (a sitting is running); start again after it" 75 ;;
   *) fail "the timing lease cannot be tested (above); not starting" 70 ;;
 esac
+PATCH=
+if [ -n "${LCPP_BUILD_PATCH:-}" ]; then
+  PATCH=$(cd "$HERE/../../.." && pwd)/$LCPP_BUILD_PATCH
+  [ -f "$PATCH" ] || fail "LCPP_BUILD_PATCH='$LCPP_BUILD_PATCH' names no file in the repository" 64
+  echo "build-lcpp-qvis: patch $LCPP_BUILD_PATCH sha256 $(sha256sum < "$PATCH" | cut -d' ' -f1)"
+fi
 if [ -d "$TREE/.git" ] || [ -f "$TREE/.git" ]; then
   have=$(ugit rev-parse HEAD) || fail "$TREE is not a git tree"
   [ "$have" = "$PIN" ] || fail "$TREE is at $have, the pin is $PIN: move it by hand, knowing which sets came from which" 65
-  dirty=$(ugit status --porcelain --untracked-files=no) || fail "cannot inspect tracked changes in $TREE"
-  [ -z "$dirty" ] || fail "$TREE has tracked changes; the oracle is the commit's build" 65
+  dirty=$(ugit diff --name-only) || fail "cannot inspect tracked changes in $TREE"
+  if [ -z "$PATCH" ]; then
+    [ -z "$dirty" ] || fail "$TREE has tracked changes; the oracle is the commit's build" 65
+  else
+    # Read by this shell, so a tree owner who cannot enter the repository still applies it.
+    want=$(grep '^+++ b/' "$PATCH" | cut -c7- | sort -u)
+    [ "$dirty" = "$want" ] || fail "$TREE changes [$dirty], the patch [$want]" 65
+    ugit apply --check -R - < "$PATCH" || fail "$TREE's changes are not $LCPP_BUILD_PATCH" 65
+  fi
 else
   as_user git clone --shared --no-checkout "$SRC" "$TREE" || fail "clone of $SRC failed"
   ugit fetch --no-tags https://github.com/ggml-org/llama.cpp "$PIN" || fail "fetch of $PIN failed"
   ugit checkout --detach "$PIN" || fail "checkout of $PIN failed"
+  if [ -n "$PATCH" ]; then
+    ugit apply - < "$PATCH" || fail "$LCPP_BUILD_PATCH does not apply at $PIN" 65
+  fi
 fi
 echo "build-lcpp-qvis: HEAD $(ugit log -1 --format='%H %cI %s')"
 echo "build-lcpp-qvis: short $(ugit rev-parse --short=9 HEAD)"

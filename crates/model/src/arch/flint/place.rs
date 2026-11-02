@@ -169,6 +169,7 @@ pub fn routed_batch(
             input_scales: true,
         }),
         tiered,
+        router_logits: false,
     })
 }
 

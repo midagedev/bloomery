@@ -273,7 +273,7 @@ else
   for b in "${BINS[@]}"; do bin_args+=(--bin "$b"); done
   [ -z "$CUBIN" ] || bin_args+=(--bin oxart_jit)
   # The commit goes to cargo alone: the serve build script reads it, and a running binary never does.
-  BLOOMERY_GIT_COMMIT="$COMMIT" cargo oxide build --arch "$ARCH" -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,gemma-embedding2,hf,checkpoint --release "${bin_args[@]}"
+  BLOOMERY_GIT_COMMIT="$COMMIT" cargo oxide build --arch "$ARCH" -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,mistrallarge4,gemma-embedding2,hf,checkpoint --release "${bin_args[@]}"
 fi
 
 fail=0

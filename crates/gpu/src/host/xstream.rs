@@ -230,11 +230,15 @@ pub trait XStreamBody {
 }
 
 /// What one layer of a unit streamed ([`XStream::layer`]), for the
-/// `xstream` record.
+/// `xstream` record. The column counts are the ones the rule priced: the
+/// unit's own routing, or — where a walk's units share the layer's pick
+/// ([`super::prompt_stream::PromptStream::pick`]) — the first unit's routing
+/// at the walk's width, each routed id counted once a unit of the walk.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct XLayer {
     pub layer: usize,
-    /// The unit's columns.
+    /// The columns the rule priced: the unit's, or the walk's under a
+    /// shared pick.
     pub cols: usize,
     /// Host experts the unit routes at the layer after the pick.
     pub host: usize,
@@ -243,10 +247,13 @@ pub struct XLayer {
     /// Of those, the ones that stream: the rule's set cut at the ring's half
     /// and at the balance, in rank order.
     pub streamed: usize,
-    /// Columns the streamed experts take off the host: the serve's excluded
-    /// slots of the layer.
+    /// Columns the streamed experts take off the host, as priced: the
+    /// serve's excluded slots of the layer for a unit that picks alone, and
+    /// under a shared pick the walk's units times the first unit's excluded
+    /// slots — each later unit leaves out its own routing's slots of the
+    /// same experts, which no record counts.
     pub streamed_columns: u64,
-    /// Columns the host union keeps.
+    /// Columns the host union keeps, as priced.
     pub host_columns: u64,
     /// Bytes the stream copies.
     pub bytes: u64,
@@ -1248,7 +1255,8 @@ impl XStream {
 
     /// Layer `unit.layer` of the unit `unit` (the batch walk's key of the
     /// layer's serve) of `cols` columns: `counts` one count per
-    /// router expert (the unit's routed picks), `host` the layer's host
+    /// router expert (the unit's routed picks; under a walk's shared pick
+    /// the first unit's at the walk's width, [`XLayer`]), `host` the layer's host
     /// experts after the pick (any order), `admitted` the pick's admits,
     /// `stage` the layer's stage map row (a card place, else [`HOST`]) and
     /// `n_card` the stage stacks' experts. The rule's set

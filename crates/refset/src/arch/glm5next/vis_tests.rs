@@ -675,7 +675,7 @@ fn a_projector_line_the_reader_does_not_know_is_refused() {
         (
             "# projector\tglm5v",
             "# projector\tgemma3",
-            "\"gemma3\" is none of qwen3vl_merger, glm5v and nemotron_omni",
+            "\"gemma3\" is none of qwen3vl_merger, glm5v, nemotron_omni and pixtral",
         ),
         (
             "\talign 28\t",

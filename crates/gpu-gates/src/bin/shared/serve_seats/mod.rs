@@ -3,7 +3,7 @@
 //! behind [`bloomery_gpu_gates::bind::Seat`], with a `run(&args)` a binary
 //! calls once. The per-model binaries (`bloomery-serve-ds41`,
 //! `bloomery-serve-qwen38`) include their one seat directly; the one-binary
-//! server (`bloomery-serve --model ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|musespark|nemotron`)
+//! server (`bloomery-serve --model ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|musespark|mistrallarge4|nemotron`)
 //! includes this registry and is one call into the seat the model names.
 //!
 //! A seat's module is its contract's owner: read it for the flags, the
@@ -16,7 +16,10 @@
 //! experts the card does not hold on the host, opened as `gate_solar2_e2e`
 //! opens it; [`minimaxm3`] the MiniMax-M3 seat, `--parallel N` sequences on
 //! one card served in turn, with the routed experts the card does not hold on
-//! the host; [`musespark`] the Muse Spark seat, one sequence on one card with the
+//! the host; [`mistrallarge4`] the Mistral Large 4 seat, `--parallel N` sequences on
+//! one card served in turn (an expert tier card beside it on two cards), with the
+//! routed experts the card does not hold on the host and an optional Pixtral image
+//! input; [`musespark`] the Muse Spark seat, one sequence on one card with the
 //! routed experts the card does not hold on the host, whose chat surface is
 //! the recipient protocol; [`nemotron`] the Nemotron 3 Nano seat, one
 //! sequence on one card, opened as `gate_nemotron_e2e` opens it.
@@ -48,8 +51,8 @@ mod served;
 // as its per-model binary's doc says.
 #[cfg(feature = "deepseek41")]
 pub mod qwen38;
-// The expert stream's rule the qwen38, minimaxm3 and musespark seats run; `bloomery-serve-qwen38`
-// declares it beside its seat the same way.
+// The expert stream's rule the qwen38, minimaxm3, musespark and mistrallarge4 seats run;
+// `bloomery-serve-qwen38` declares it beside its seat the same way.
 #[cfg(feature = "deepseek41")]
 #[path = "../xstream_rule.rs"]
 pub mod xstream_rule;
@@ -87,6 +90,10 @@ pub mod minimaxm3_folder;
 // it serves is in the gpu crate, so it needs no feature of its own.
 #[cfg(feature = "deepseek41")]
 pub mod musespark;
+// The mistrallarge4 seat sits behind `deepseek41` for the same reason: the server surface it binds
+// through is scoped to it, and it runs no V4.1 code. Its body is in `bloomery-gpu-mistrallarge4`.
+#[cfg(all(feature = "deepseek41", feature = "mistrallarge4"))]
+pub mod mistrallarge4;
 // The seat of a body that runs one chain on one card, fed in prompt batches
 // (`solar2`): its open, its load record, its calls and its think tags.
 #[cfg(all(feature = "deepseek41", any(feature = "solar2", feature = "flint")))]

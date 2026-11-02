@@ -32,15 +32,14 @@ const FACTS: StreamFacts = StreamFacts {
 
 impl Body {
     /// What the next prompt calls move (`BLOOMERY_XSTREAM`): the walk's
-    /// [`bloomery_gpu_deepseek41::prompt_walk::BatchBufs::set_xstream`] with the family's facts,
-    /// `tiered` whether the load hangs an expert tier. Refused by name as there: `admit` or `split`
-    /// with no residency machine, `split` on a load with an expert tier or when the stream cannot
-    /// start (the card's room for the ring among them), and any change while a call streams.
+    /// [`bloomery_gpu_deepseek41::prompt_walk::BatchBufs::set_xstream`] with the family's facts.
+    /// Refused by name as there: `admit` or `split` with no residency machine, `split` when the
+    /// stream cannot start (the card's room for the ring among them), and any change while a call
+    /// streams.
     pub fn set_xstream(&mut self, gpu: &Gpu, mode: XMode) -> Result<(), GpuError> {
         let hybrid = self.shell.hybrid_mut();
-        let tiered = !hybrid.tiers().is_empty();
         self.units
-            .set_xstream::<RouterKernels>(gpu, (hybrid, &mut self.ffn), (mode, tiered), FACTS)
+            .set_xstream::<RouterKernels>(gpu, (hybrid, &mut self.ffn), mode, FACTS)
     }
 
     /// The load line's `xstream=` word ([`bloomery_gpu::host::prompt_stream::PromptStream::word`]).

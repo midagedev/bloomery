@@ -1,6 +1,7 @@
 //! The routed block around the host leg, common to every program whose
-//! routed layers run a sigmoid router (a selection bias, the top picks, the
-//! weights from the unbiased scores normalized and scaled), hand the picks to
+//! routed layers run a router that scores the experts (sigmoid with a
+//! selection bias, or softmax; [`RouterEntry::SCORE`]), pick the top ones with
+//! the weights from the kept scores normalized, hand the picks to
 //! the host tier and compute the experts the slot map puts on the card in the
 //! host leg's shadow. A family's file keeps what its architecture forces (the
 //! shared expert, the base the card sum is added to, the layer program that
@@ -27,7 +28,7 @@
 //! ([`RouteBlock::card_rows`]).
 //!
 //! What differs between families is data: the router instance
-//! ([`RouterEntry`], one per `sigmoid_router_instance!`), each layer's tensor
+//! ([`RouterEntry`], one per router instance), each layer's tensor
 //! names and slot-map row ([`RouteLayer`]), the dims ([`RouteDims`]), and the
 //! base a family adds the card sum to.
 
@@ -61,12 +62,19 @@ pub struct RouteIn<'a> {
 /// a row), the picks' ids and their weights ([`RouterEntry::N_USED`] a row).
 pub struct RoutedRows<'a> {
     pub probs: &'a mut DeviceBuffer<f32>,
+    /// The rows' logits ([`RouterEntry::N_EXPERT`] a row), for a router with
+    /// [`RouterEntry::ROW_LOGITS`]: its scores are not the logits' scalar
+    /// over themselves, so they need a buffer beside `probs`. `None` for a
+    /// router that scores the logits in place in `probs`; a router with
+    /// `ROW_LOGITS` refuses `None` by name.
+    pub logits: Option<&'a mut DeviceBuffer<f32>>,
     pub ids: &'a mut DeviceBuffer<u32>,
     pub weights: &'a mut DeviceBuffer<f32>,
 }
 
-/// One instance of the sigmoid router (`sigmoid_router_instance!`): its
-/// counts, its kernels and the launches the routed block makes of them.
+/// One instance of a router (`sigmoid_router_instance!`, the softmax
+/// instance of `route_softmax`): its counts, its kernels and the launches the
+/// routed block makes of them.
 pub trait RouterEntry: Sized {
     /// Experts the router scores.
     const N_EXPERT: usize;
@@ -74,8 +82,14 @@ pub trait RouterEntry: Sized {
     const N_USED: usize;
     /// Whether an absent selection bias is a native binding, not a zero buffer.
     const OPTIONAL_BIAS: bool = false;
+    /// The score function this compiled binding applies to the router's logits.
+    const SCORE: model::arch::models::Score = model::arch::models::Score::Sigmoid;
     /// The selected-score normalization implemented by this compiled binding.
     const NORM: model::arch::models::RouterNorm = model::arch::models::RouterNorm::SelectedSum;
+    /// Whether the rows launch reads its logits from a buffer of their own,
+    /// [`RoutedRows::logits`], and writes the scores to `probs`; false: the
+    /// logits are scored in place in `probs`.
+    const ROW_LOGITS: bool = false;
     /// Where one token's launch leaves its results.
     type Out;
 
@@ -378,6 +392,21 @@ impl<R: RouterEntry> RouteBlock<R> {
         (hybrid, l): (&mut Hybrid<HostRun>, usize),
         tier: Option<&mut TierSide>,
     ) -> Result<(), GpuError> {
+        self.front_tiered_of((gpu, w), bufs, x1, (hybrid, l, 0), tier)
+    }
+
+    /// [`RouteBlock::front_tiered`] of row `row` of a pass whose rows run
+    /// one layer apart: the handoff into the boundary's row `row` (and the
+    /// tier side's), the go on that row's words, the row's own `bufs`.
+    /// Refused by name past the boundary's rows or the tier side's.
+    pub fn front_tiered_of(
+        &self,
+        (gpu, w): (&Gpu, &Weights),
+        bufs: &mut RouteBufs<R>,
+        x1: &DeviceBuffer<f32>,
+        (hybrid, l, row): (&mut Hybrid<HostRun>, usize, usize),
+        tier: Option<&mut TierSide>,
+    ) -> Result<(), GpuError> {
         let layer = self.layer(l)?;
         let r = self.route_in(w, l, gpu)?;
         let stream = gpu.stream();
@@ -401,11 +430,11 @@ impl<R: RouterEntry> RouteBlock<R> {
         };
         match tier.filter(|t| t.k(l) > 0) {
             Some(side) => {
-                let (places, tsel) = side.handoff_parts(0)?;
+                let (places, tsel) = side.handoff_parts(row)?;
                 let sels = (&mut bufs.sel, tsel);
-                handoff_go_tier(gpu, &self.handoff, &h, places, hybrid, (l, 0), sels)
+                handoff_go_tier(gpu, &self.handoff, &h, places, hybrid, (l, row), sels)
             }
-            None => handoff_go(gpu, &self.handoff, &h, hybrid, (l, 0), &mut bufs.sel),
+            None => handoff_go(gpu, &self.handoff, &h, hybrid, (l, row), &mut bufs.sel),
         }
     }
 
@@ -480,6 +509,21 @@ impl<R: RouterEntry> RouteBlock<R> {
         (boundary, l): (&Boundary, usize),
         (base, rule): (&DeviceBuffer<f32>, Act),
     ) -> Result<(), GpuError> {
+        self.shadow_of((gpu, w), card, bufs, (boundary, l, 0), (base, rule))
+    }
+
+    /// [`RouteBlock::shadow`] of row `row` of a pass whose rows run one layer
+    /// apart, after that row's [`RouteBlock::front_tiered_of`]: its `bufs`,
+    /// the card sum into the card experts' row `row`
+    /// ([`CardExperts::pre_of`]).
+    pub fn shadow_of(
+        &self,
+        (gpu, w): (&Gpu, &Weights),
+        card: &mut CardExperts,
+        bufs: &RouteBufs<R>,
+        (boundary, l, row): (&Boundary, usize, usize),
+        (base, rule): (&DeviceBuffer<f32>, Act),
+    ) -> Result<(), GpuError> {
         if !card.has(l) {
             return Ok(());
         }
@@ -489,7 +533,7 @@ impl<R: RouterEntry> RouteBlock<R> {
             x1: base,
             m: 1,
         };
-        card.enqueue_step(gpu, w, l, rule, &io, &bufs.sel)
+        card.enqueue_step_of(gpu, w, (l, row), rule, &io, &bufs.sel)
     }
 
     /// Enqueue layer `l`'s card experts over a prompt batch of `m` rows in the
@@ -525,7 +569,8 @@ impl<R: RouterEntry> RouteBlock<R> {
     /// [`RouteBlock::card_rows`] with the expert stream's ring `ring` of
     /// layer `l` beside the card's stacks ([`CardExperts::enqueue_rows_ring`]):
     /// the card sum over the card's and the streamed experts' slots plus
-    /// `base` into `cb`'s `pre`, the streamed slots' GEMMs (`g32`) one batch a
+    /// `base` into `cb`'s `pre` (on a tier layer the union's places for the
+    /// layer's join instead), the streamed slots' GEMMs (`g32`) one batch a
     /// landing batch of the ring, each behind its own batch's copies. A layer
     /// with no card experts or no `cb` is refused by name: the stream rides a
     /// layer the card route runs.
@@ -571,8 +616,22 @@ impl<R: RouterEntry> RouteBlock<R> {
         l: usize,
         (base, dest): (&DeviceBuffer<f32>, &mut DeviceBuffer<f32>),
     ) -> Result<(), GpuError> {
-        let shadowed = if card.has(l) { card.pre() } else { base };
-        wait_add(gpu, hybrid, (l, 0), (shadowed, self.dims.embd), dest)
+        self.back_of(gpu, hybrid, card, (l, 0), (base, dest))
+    }
+
+    /// [`RouteBlock::back`] of row `row` of a pass whose rows run one layer
+    /// apart: the wait on the boundary's row `row`, then the add of that
+    /// row's host sum and the card experts' row `row`.
+    pub fn back_of(
+        &self,
+        gpu: &Gpu,
+        hybrid: &Hybrid<HostRun>,
+        card: &CardExperts,
+        (l, row): (usize, usize),
+        (base, dest): (&DeviceBuffer<f32>, &mut DeviceBuffer<f32>),
+    ) -> Result<(), GpuError> {
+        let shadowed = if card.has(l) { card.pre_of(row)? } else { base };
+        wait_add(gpu, hybrid, (l, row), (shadowed, self.dims.embd), dest)
     }
 }
 

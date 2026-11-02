@@ -5,9 +5,10 @@
 //! measures rows/call scaling at T=32 with barrier resynchronization.
 //!
 //! The shapes are the [`SHAPES`] table, keyed by (type, k); `--only TYPE[,TYPE…]` runs the
-//! named rows alone (a name no row takes is refused by name), and `--iq1s-generic` runs the
-//! IQ1_S row through the generic decoder (`generic::dot_avx2::<Iq1s>`), the path IQ1_S rows
-//! took before their hand kernel — the generic-vs-hand comparison arm.
+//! named rows alone (a name no row takes is refused by name), and `--iq1s-generic` /
+//! `--iq1m-generic` run the IQ1_S / IQ1_M row through the generic decoder
+//! (`generic::dot_avx2::<Iq1s>` / `<Iq1m>`), the path those rows took before their hand
+//! kernels — the generic-vs-hand comparison arms, one per run.
 //!
 //! `--pin` runs thread `i` of T pinned to physical-core primary `i` — the pool's own
 //! placement (`threads::pinned_cpus`), one cpu a core — refused by name when the host has
@@ -43,7 +44,7 @@ struct Shape {
 
 /// The shapes table, keyed by (type, k): each row is a dispatch site's type and width, its
 /// block bytes as the row size, and the row count that holds the buffer near 2.5 GB.
-const SHAPES: [Shape; 7] = [
+const SHAPES: [Shape; 8] = [
     Shape {
         ty: GgmlType::Q3_K,
         k: 2048,
@@ -87,6 +88,13 @@ const SHAPES: [Shape; 7] = [
         site: "ML4 host experts IQ1_S (k=6144, 1200 B/row)",
     },
     Shape {
+        ty: GgmlType::IQ1_M,
+        k: 6144,
+        row_bytes: (6144 / 256) * 56, // 1344
+        rows: 18 * 102_400,           // 2.48 GB
+        site: "ML4 host experts IQ1_M (k=6144, 1344 B/row)",
+    },
+    Shape {
         ty: GgmlType::IQ2_XXS,
         k: 6144,
         row_bytes: (6144 / 256) * 66, // 1584
@@ -125,8 +133,8 @@ fn acol(ty: GgmlType, k: usize) -> Vec<u8> {
 
 // ---------------------------------------------------------------- mode 1
 
-/// The row dot a cell runs: `qdot::dot_row`, or — under `--iq1s-generic` — the generic IQ1_S
-/// decode, the path IQ1_S rows took before their hand kernel.
+/// The row dot a cell runs: `qdot::dot_row`, or — under `--iq1s-generic` / `--iq1m-generic` —
+/// the generic decode of that type, the path its rows took before their hand kernel.
 type Dot = fn(GgmlType, &[u8], &[u8], usize) -> f32;
 
 /// The fused kernel the dispatch picks.
@@ -134,11 +142,12 @@ fn dot_fused(ty: GgmlType, w: &[u8], a: &[u8], k: usize) -> f32 {
     qdot::dot_row(ty, w, a, k).unwrap()
 }
 
-/// The generic IQ1_S decode, the pre-hand-kernel path.
-fn dot_iq1s_generic(ty: GgmlType, w: &[u8], a: &[u8], k: usize) -> f32 {
+/// The generic decode of `D`, the pre-hand-kernel path.
+fn dot_generic<D: qdot::generic::HostDecode>(ty: GgmlType, w: &[u8], a: &[u8], k: usize) -> f32 {
     assert!(
-        ty == GgmlType::IQ1_S,
-        "the generic arm runs IQ1_S only, got {ty:?}"
+        ty == D::TY,
+        "the generic arm runs {:?} only, got {ty:?}",
+        D::TY
     );
     #[cfg(target_arch = "x86_64")]
     {
@@ -148,7 +157,7 @@ fn dot_iq1s_generic(ty: GgmlType, w: &[u8], a: &[u8], k: usize) -> f32 {
             "the generic arm needs the vector decode's AVX2+FMA"
         );
         // SAFETY: asserted just above; the shape sized `w` and `a` for k/256 blocks.
-        unsafe { qdot::generic::dot_avx2::<qdot::generic::Iq1s>(w, a, k / 256) }
+        unsafe { qdot::generic::dot_avx2::<D>(w, a, k / D::VALUES) }
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -364,7 +373,18 @@ fn selected(only: Option<&str>) -> Vec<&'static Shape> {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let gran = args.iter().any(|a| a == "--granularity");
-    let generic = args.iter().any(|a| a == "--iq1s-generic");
+    let generic: Vec<(&str, GgmlType)> = [
+        ("--iq1s-generic", GgmlType::IQ1_S),
+        ("--iq1m-generic", GgmlType::IQ1_M),
+    ]
+    .into_iter()
+    .filter(|(flag, _)| args.iter().any(|a| a == flag))
+    .collect();
+    assert!(
+        generic.len() <= 1,
+        "--iq1s-generic and --iq1m-generic are one arm each: run them apart"
+    );
+    let generic = generic.first().copied();
     let pin = args.iter().any(|a| a == "--pin");
     let only = args
         .iter()
@@ -381,17 +401,18 @@ fn main() {
         None => "no pinning".to_string(),
     };
     let mut shapes = selected(only);
-    if generic {
-        shapes = shapes
-            .into_iter()
-            .filter(|sh| sh.ty == GgmlType::IQ1_S)
-            .collect::<Vec<_>>();
+    if let Some((flag, ty)) = generic {
+        shapes.retain(|sh| sh.ty == ty);
         assert!(
             !shapes.is_empty(),
-            "--iq1s-generic needs the IQ1_S row (check --only)"
+            "{flag} needs the {ty:?} row (check --only)"
         );
     }
-    let dot: Dot = if generic { dot_iq1s_generic } else { dot_fused };
+    let dot: Dot = match generic {
+        None => dot_fused,
+        Some((_, GgmlType::IQ1_S)) => dot_generic::<qdot::generic::Iq1s>,
+        Some(_) => dot_generic::<qdot::generic::Iq1m>,
+    };
     if gran {
         println!(
             "qdot-rate-mt --granularity: T=32, std::sync::Barrier resync per R rows/call (characterizes the Barrier, NOT the pool — see the header caveat); {pin_note}"
@@ -401,9 +422,9 @@ fn main() {
             "qdot-rate-mt: MT streaming ceiling, zero orchestration (std::thread::scope, no pool, {pin_note})"
         );
     }
-    if generic {
+    if let Some((flag, ty)) = generic {
         println!(
-            "qdot-rate-mt --iq1s-generic: IQ1_S through the generic decode (the pre-hand-kernel path)"
+            "qdot-rate-mt {flag}: {ty:?} through the generic decode (the pre-hand-kernel path)"
         );
     }
     for sh in shapes {

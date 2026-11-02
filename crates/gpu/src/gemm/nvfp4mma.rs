@@ -352,7 +352,12 @@ unsafe fn arrive(p: *mut u32) -> u32 {
 const fn act_shared_bytes(k: u32) -> u32 {
     (k / 4 + k / 32 + 2) * 4
 }
-const _: () = assert!(act_shared_bytes(crate::tensor::Q8ACT_MAX_K as u32) == 24776);
+// `#[launch_contract(dynamic_shared_range = ...)]` takes literals: the two SwiGLU kernel entries
+// spell out the cap's byte count, and this is the three agreeing.
+// PIN(2026-11-02): 27_656 = (24_576 / 4 + 24_576 / 32 + 2) * 4 = (6_144 + 768 + 2) * 4, the cap
+// raised from 22_016 (24_776) for Mistral Large 4's lead-layer FFN down (K = 24_576); well inside
+// the 48 KiB default, so no opt-in.
+const _: () = assert!(act_shared_bytes(crate::tensor::Q8ACT_MAX_K as u32) == 27_656);
 
 /// Bytes of [`native::mxfp8_w8a8_gemm`]'s stages in its dynamic shared
 /// memory; the stage barriers follow them.
@@ -1273,7 +1278,7 @@ mod native {
     )]
     #[kernel]
     #[launch_bounds(64)]
-    #[launch_contract(domain = 1, block = (64, 1, 1), dynamic_shared_range = (80, 24776))]
+    #[launch_contract(domain = 1, block = (64, 1, 1), dynamic_shared_range = (80, 27656))]
     pub fn swiglu_nvfp4_32(
         g: &[f32],
         u: &[f32],
@@ -1300,7 +1305,7 @@ mod native {
     )]
     #[kernel]
     #[launch_bounds(64)]
-    #[launch_contract(domain = 1, block = (64, 1, 1), dynamic_shared_range = (80, 24776))]
+    #[launch_contract(domain = 1, block = (64, 1, 1), dynamic_shared_range = (80, 27656))]
     pub fn swiglu_nvfp4_32_sel(
         g: &[f32],
         u: &[f32],

@@ -29,6 +29,7 @@ use std::sync::Arc;
 use cuda_core::CudaStream;
 use model::arch::place_hybrid::KvLayout;
 
+use super::bytes::{Fail, Put, Take};
 use super::saved::{Identity, Lent, Pending, SaveLane, SeqState, SeqView, Spans, Streams};
 use super::staging::NoRoom;
 use crate::model::ChainBody;
@@ -90,6 +91,12 @@ impl<B> PlaneSeq<B> {
     #[must_use]
     pub fn keep_point(&self, n: u32) -> u32 {
         self.state.keep_point(n)
+    }
+
+    /// The state in the byte form of [`super::bytes`] ([`SeqState::put`]), which
+    /// [`seq_take`] reads back: refused by name while its copy has not landed.
+    pub fn put(&self, w: &mut Put<'_>) -> Result<(), Fail> {
+        self.state.put(w)
     }
 }
 
@@ -171,6 +178,14 @@ pub fn seq_save<B: PlaneBody>(m: &mut GpuModel<B>) -> Result<PlaneSeq<B>, GpuErr
         SeqState::save_rows(stream, who, pos, lent)
     })?;
     Ok(PlaneSeq::new(Arc::new(state)))
+}
+
+/// The state [`PlaneSeq::put`] wrote, read for `m`'s load and the model untouched: refused by
+/// name for a state of another model, card or context ([`Identity`]) and for a stream that is
+/// not one. The layout against the model's own stores is [`seq_resume_prefix`]'s to check.
+pub fn seq_take<B: PlaneBody>(m: &GpuModel<B>, r: &mut Take<'_>) -> Result<PlaneSeq<B>, Fail> {
+    let body = m.body(B::WHAT).map_err(Fail::Refused)?;
+    SeqState::<()>::take(r, body.who()).map(|state| PlaneSeq::new(Arc::new(state)))
 }
 
 /// The host bytes a sequence save would hold, without reading the card.

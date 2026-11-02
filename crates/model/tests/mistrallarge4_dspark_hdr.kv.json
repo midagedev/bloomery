@@ -1,0 +1,111 @@
+{
+ "general.architecture": "dflash",
+ "general.type": "model",
+ "general.sampling.top_p": 0.949999988079071,
+ "general.sampling.temp": 1.0,
+ "general.name": "Mistral-Large-4-1T-A52B-DSpark",
+ "general.description": "Meet Mistral Large 4, aka Le Chonk.",
+ "general.size_label": "2.1B",
+ "dflash.block_count": 3,
+ "dflash.context_length": 1048576,
+ "dflash.embedding_length": 6144,
+ "dflash.feed_forward_length": 24576,
+ "dflash.attention.head_count": 64,
+ "dflash.attention.head_count_kv": 1,
+ "dflash.attention.key_length": 576,
+ "dflash.attention.value_length": 512,
+ "dflash.attention.key_length_mla": 128,
+ "dflash.attention.value_length_mla": 128,
+ "dflash.attention.kv_lora_rank": 512,
+ "dflash.rope.dimension_count": 64,
+ "dflash.rope.freq_base": 10000.0,
+ "dflash.attention.layer_norm_rms_epsilon": 9.999999747378752e-06,
+ "dflash.rope.scaling.type": "yarn",
+ "dflash.rope.scaling.factor": 2048.0,
+ "dflash.rope.scaling.yarn_beta_fast": 32.0,
+ "dflash.rope.scaling.yarn_beta_slow": 1.0,
+ "dflash.rope.scaling.yarn_log_multiplier": 1.0,
+ "dflash.rope.scaling.original_context_length": 512,
+ "dflash.attention.sliding_window": 2048,
+ "dflash.final_logit_softcapping": 30.0,
+ "dflash.block_size": 3,
+ "dflash.target_layers": [
+  2,
+  19,
+  37,
+  55,
+  72
+ ],
+ "dflash.sample_from_anchor": true,
+ "dflash.has_confidence_head": false,
+ "general.file_type": 7,
+ "general.quantization_version": 2,
+ "tokenizer.ggml.model": "gpt2",
+ "tokenizer.ggml.pre": "tekken-num3",
+ "tokenizer.ggml.merges": {
+  "array_len": 423969,
+  "head": [
+   "Ġ Ġ",
+   "Ġ ĠĠĠ",
+   "ĠĠ ĠĠ",
+   "ĠĠĠ Ġ",
+   "e r",
+   "e n",
+   "i n",
+   "Ġ d"
+  ]
+ },
+ "tokenizer.ggml.bos_token_id": 1,
+ "tokenizer.ggml.eos_token_id": 2,
+ "tokenizer.ggml.unknown_token_id": 0,
+ "tokenizer.ggml.padding_token_id": 11,
+ "tokenizer.ggml.tokens": {
+  "array_len": 204800,
+  "head": [
+   "<unk>",
+   "<s>",
+   "</s>",
+   "[INST]",
+   "[/INST]",
+   "[AVAILABLE_TOOLS]",
+   "[/AVAILABLE_TOOLS]",
+   "[TOOL_RESULTS]"
+  ]
+ },
+ "tokenizer.ggml.scores": {
+  "array_len": 204800,
+  "head": [
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0
+  ]
+ },
+ "tokenizer.ggml.token_type": {
+  "array_len": 204800,
+  "head": [
+   3,
+   3,
+   3,
+   3,
+   3,
+   3,
+   3,
+   3
+  ]
+ },
+ "dflash.vocab_size": 204800,
+ "tokenizer.ggml.add_bos_token": true,
+ "tokenizer.ggml.add_eos_token": false,
+ "tokenizer.ggml.mask_token_id": 0,
+ "general.basename": "Mistral-Large-4-DSpark",
+ "general.quantized_by": "Unsloth",
+ "general.repo_url": "https://huggingface.co/unsloth",
+ "general.tags": [
+  "unsloth"
+ ]
+}

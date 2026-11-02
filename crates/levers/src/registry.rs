@@ -199,18 +199,21 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
             trim: false,
         },
         default: Unset::Is("2"),
-        doc: "V4.1, GLM-5.3 and MiMo-V2.6-Flash: the batches a prompt group runs layer by \
-              layer, each layer-batch's route enqueued ahead of the previous one's host \
-              serve; 1 runs each batch alone, the same-binary arm, and both write the same \
-              bits. The `load` line prints `group=`. GLM-5.3's plan reserves the units a \
-              group of 2 holds (each about two stream buffers); a group past 2 takes its \
-              further units out of the card's margin, refused by name past its free bytes; \
-              the `prefill units` line prints what they took and what stayed free. \
-              MiMo-V2.6-Flash's plan reserves none: every unit of its group, the default's \
-              too, comes out of the card's margin and is refused by name past its free \
-              bytes. GLM-5.3 and MiMo-V2.6-Flash change it between calls through \
-              `set_prefill_group`; V4.1 fixes it at load, so the row's phase is `load` until \
-              every family carries a setter.",
+        doc: "V4.1, GLM-5.3, MiMo-V2.6-Flash, MiniMax-M3 and Mistral Large 4: the batches a \
+              prompt group runs layer by layer, each layer-batch's route enqueued ahead of \
+              the previous one's host serve; 1 runs each batch alone, the same-binary arm, \
+              and both write the same bits. The `load` line prints `group=`. GLM-5.3's plan \
+              reserves the units a group of 2 holds (each about two stream buffers); a group \
+              past 2 takes its further units out of the card's margin, refused by name past \
+              its free bytes; the `prefill units` line prints what they took and what stayed \
+              free. MiMo-V2.6-Flash's plan reserves none: every unit of its group, the \
+              default's too, comes out of the card's margin and is refused by name past its \
+              free bytes. MiniMax-M3's plan reserves the first unit's buffers; a group past 1 \
+              takes its further units out of the card's margin. Mistral Large 4's plan \
+              reserves the units, records and lists of the group asked, and a group past that \
+              reserve is refused by name. GLM-5.3, MiMo-V2.6-Flash, MiniMax-M3 and Mistral \
+              Large 4 change it between calls through `set_prefill_group`; V4.1 fixes it at \
+              load, so the row's phase is `load` until every family carries a setter.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,
@@ -501,7 +504,11 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         ),
         doc: "`generate_ds41` and `bloomery-serve-ds41`: `lookup` serves an n-gram lookup \
               draft, `dspark` the DSpark draft (`$BLOOMERY_DSPARK_MODEL`), through the skewed \
-              two-row pass; the qwen3 seat of `bloomery-serve` on a \
+              two-row pass; the Mistral Large 4 seat of `bloomery-serve`: `lookup` serves the \
+              n-gram lookup draft, one context a resident slot, and `dspark` the DSpark draft \
+              (`$BLOOMERY_DSPARK_MODEL`, the file whose `target_layers` the target taps) on \
+              one slot, each through the body's two-row verify pass, the DSpark draft's bytes \
+              held to its card's free room alone; the qwen3 seat of `bloomery-serve` on a \
               qwen35moe or qwen35 file: `dspark` serves the HF DSpark draft \
               (`$BLOOMERY_DSPARK_MODEL`) on a whole-card load of one slot, and `lookup` serves \
               the n-gram lookup draft on the same whole-card verifying load, one context a \
@@ -815,7 +822,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
              `--place a` and `off` under `gate`; the GLM seat of `bloomery-serve` `mid-p0-s1` \
              under `--place a` or `bp` where the plan has room, `off` under `gate` \
              (`bloomery_levers::glm_unset`, `glm_residency_at_plan`), with a `residency unset` \
-             record; `off` in every other binary",
+             record; the Mistral Large 4 loads (`Body::open_placed_with`, the gates' seats) by the \
+             same pair rule as V4.1 (`bloomery_levers::residency_unset`, `residency_at_plan`): \
+             `mid-p0-s1` under `--place a` and `bp` where the plan holds a card expert and a host \
+             expert and its fewest card experts a layer leave room (a pinned count they leave, or \
+             the first whose churn pool the host takes), `off` under `gate` and beside the step \
+             feed; `off` in every other binary",
         ),
         doc: "Adaptive expert residency (`host::swap`): `off` keeps the load's slot map for the \
               model's life; `mid-p<P>-s<S>` runs the residency rule's `mid` parameters over the \
@@ -896,6 +908,17 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               a refusal. Running `mid-…` each call \
               prints its `residency pass` records, a request's reset keeps the residency, and \
               `POST /residency/reset` moves it back to the seed with a `residency reset` record. \
+              Mistral Large 4 (`Body::open_placed_with`, `gate_mistrallarge4_residency`): the \
+              word runs as given over the stage card's routed stacks, each layer's file blocks \
+              moving as the card's stack holds them (every stack type of both files, one path); \
+              the churn pool is hosted, so a word asking for it unhosted is refused by name. An \
+              expert tier card's experts (`--place bp`) stay where the plan put them, and a layer \
+              the plan gives no card slot (a Mix-256G layer whose gate and up stacks differ in \
+              type) takes no part. A prompt call is one pass that keeps no row, so only the decode \
+              steps train the rule (`BLOOMERY_XSTREAM=admit` also trains it from a prompt call's \
+              picks). A binary that logs the boundaries (`Body::log_residency`) prints `residency pass`; the `tier \
+              census` record's `picks`, `card`, `promote_bytes` and `demote_bytes` read the hit \
+              rate and the bytes the machine moved over a span. \
               Every other binary refuses it set, by name.",
         site: Site::Parsed {
             left: &[],
@@ -935,8 +958,8 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               prompt call bit for bit the decode steps' state, the same-binary arm. Unset follows \
               the residency: on under one, off without one. `on` is refused by name at the load \
               beside `BLOOMERY_RESIDENCY=off`. Every pick prints `call \
-              stream`, every call `call stream end`. A Qwen3.8 load refuses it set by name and \
-              reads `BLOOMERY_XSTREAM`.",
+              stream`, every call `call stream end`. A Qwen3.8 load and a Mistral Large 4 load \
+              refuse it set by name and read `BLOOMERY_XSTREAM`.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,
@@ -947,12 +970,13 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         class: Class::A,
         kind: Kind::Words(&["off", "admit", "split"]),
         default: Unset::Means(
-            "Qwen3.8 (`generate_qwen3moe`, `bloomery-serve-qwen38`), and the Muse Spark and \
-             MiniMax-M3.1 seats (`bloomery-serve`, MiniMax-M3.1's gates): `split` under `--place a` \
-             with a residency (`admit` when the ring has no room or cannot hold the stack layout), `admit` under \
-             `--place bp` with one, `off` everywhere else",
+            "Qwen3.8 (`generate_qwen3moe`, `bloomery-serve-qwen38`), and the Muse Spark, \
+             MiniMax-M3.1 and Mistral Large 4 seats (`bloomery-serve`, MiniMax-M3.1's and \
+             Mistral Large 4's gates): `split` under `--place a` with a residency (`admit` when \
+             the ring has no room or cannot hold the stack layout), `admit` under `--place bp` \
+             with one, `off` everywhere else",
         ),
-        doc: "Qwen3.8, Muse Spark and MiniMax-M3.1 prompt calls fed by ubatches or passes under adaptive residency \
+        doc: "Qwen3.8, Muse Spark, MiniMax-M3.1 and Mistral Large 4 prompt calls fed by ubatches or passes under adaptive residency \
               (`BLOOMERY_RESIDENCY=mid-…`): what each card layer's walk moves before its card \
               route. `admit` moves the residency's pool toward the ubatch's hottest host experts \
               (`host::swap` call mode, a count of at least the walk's floor), and the call's picks \
@@ -969,15 +993,20 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               experts out. The prompt's bits are then the band's, not the decode steps'. `off` \
               keeps a prompt call bit for bit the decode steps' state, the same-binary arm. \
               Unset is `split` under `--place a` with a residency (`admit` when the card has no \
-              room for the ring or it cannot hold the stack layout, the load line saying so), `admit` under `--place bp` (the ring \
-              serves no expert tier), `off` everywhere else; `admit` and `split` are refused by \
-              name beside `BLOOMERY_RESIDENCY=off` and on a qwen3moe or qwen35moe file, `split` \
-              on a load with an expert tier. The load line prints `xstream=`, every streamed \
-              layer an `xstream` record, every call `xstream end`. Every family's ring pass reads \
-              the ring's half in its card stacks' forms, the file's blocks or NVFP4 planes \
-              (staged from a checkpoint folder's parts), and runs the streamed slots there beside \
-              the card's stacks; a MiniMax-M3.1 load (its gates' seat, `Body::set_xstream`) takes \
-              it through the common prompt walk.",
+              room for the ring or it cannot hold the stack layout, the load line saying so), \
+              `admit` under `--place bp` (the ring serves no expert tier), `off` everywhere else; \
+              `admit` and `split` are refused by name beside `BLOOMERY_RESIDENCY=off` and on a \
+              qwen3moe or qwen35moe file, `split` on a Qwen3.8 load with an expert tier. The load \
+              line prints `xstream=`, every streamed layer an `xstream` record, every call \
+              `xstream end`. Every family's ring pass reads the ring's half in its card stacks' \
+              forms, the file's blocks or NVFP4 planes (staged from a checkpoint folder's parts), \
+              and runs the streamed slots there beside the card's stacks; a MiniMax-M3.1 or \
+              Mistral Large 4 load (the gates' seats, `Body::set_xstream`) takes it through the \
+              common prompt walk. Mistral Large 4 is the lever's host streaming (`admit`, V4.1's \
+              `BLOOMERY_HOSTSTREAM` under another name) and its expert stream (`split`). Beside an \
+              expert tier card (`--place bp`) the Muse Spark, MiniMax-M3.1 and Mistral Large 4 \
+              loads take `split` set: a tier layer's join sums the streamed experts beside the \
+              tier's slots.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,
@@ -1578,13 +1607,14 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         class: Class::C,
         kind: Kind::Text,
         default: Unset::Means("the tier card under `bp`, else the smallest visible card"),
-        doc: "`generate_ds41` and `bloomery-serve-ds41` under `BLOOMERY_DRAFT=dspark`: the \
+        doc: "`generate_ds41`, `bloomery-serve-ds41` and the Mistral Large 4 seat of \
+              `bloomery-serve` under `BLOOMERY_DRAFT=dspark`: the \
               card the DSpark draft loads on, one card as a `--place` list word names it (a \
               CUDA ordinal, `1` or `cuda1`, or a card name exactly one visible device \
               carries); it may be the target's own card. Unset, the placement's first expert \
               tier card where it has one (`--place bp`), else the visible device of the \
-              fewest usable bytes. The plan sets the draft's bytes aside on that card before \
-              its experts: on a card of the placement at its place in the plan, on any other \
+              fewest usable bytes. The V4.1 plan sets the draft's bytes aside on that card before \
+              its experts (the Mistral Large 4 seat's plan sets none aside): on a card of the placement at its place in the plan, on any other \
               visible device as a card that joins the plan to hold the draft and no expert. \
               A word no visible device answers, a name two carry, and a list are refused by \
               name.",

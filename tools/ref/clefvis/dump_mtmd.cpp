@@ -28,6 +28,12 @@
 //                   direct bicubic resize, no pad); the tower arm taps the `cb()` nodes of build_vit (`--taps full` only:
 //                   `inp_pos` and, for blocks 0, 1, 15 and 31, layer_inp_normed, Qcur, attn_out, ffn_inp, ffn_out and
 //                   layer_out, a node's rows the 10 class and register rows and then the patches).
+//   pixtral         Mistral Large 4's Pixtral tower: normal positions as glm5v (n_pos == n_tokens, the canvas read from `inp_raw`),
+//                   the image token `[IMG]`, the plan of mtmd's dyn_size (align patch_size * spatial_merge_size, PAD_CEIL bicubic
+//                   resize on black, 8 to 1,024 tokens: the file states no pixel bounds, so the `# projector` line carries
+//                   mtmd's); an image's rows are its nx * ny tokens and an `[IMG_BREAK]` row after each of its ny rows of tokens
+//                   but the last (n_tokens = nx * ny + ny - 1); the tower arm taps the last block's `layer_out` (`--taps final`
+//                   only: the ViT's output before the projector's norm, patches in raster order).
 // A set of a Qwen seat is byte-identical to what this tool wrote before the glm5v seat existed.
 //
 //   dump_mtmd tower  --mmproj <gguf> -m <text gguf> --image <name>=<png> ... [--out-preproc <dir>] --out-taps <dir>
@@ -230,9 +236,16 @@ static const seat_t SEATS[] = {
     {"glm5v",          "<|image|>",     false, false},
     {"minicpmv4_7",    "<unk>",         true,  true},
     {"nemotron_omni",  "<image>",       false, false},
+    {"pixtral",        "[IMG]",         false, false},
 };
 static const seat_t * g_seat  = nullptr;
 static int            g_align = 32;
+
+static bool is_pixtral() { return g_seat && strcmp(g_seat->projector, "pixtral") == 0; }
+
+// The rows mtmd hands the text model for a grid of nx x ny tokens: the tokens, and for the pixtral seat the `[IMG_BREAK]`
+// row after each of its rows but the last (clip_n_output_tokens: n_patches + n_patches_y - 1).
+static long grid_rows(long nx, long ny) { return is_pixtral() ? nx * ny + ny - 1 : nx * ny; }
 
 static std::string gguf_str(const std::string & path, const std::string & key, bool required) {
     gguf_init_params gp = {true, nullptr};
@@ -429,9 +442,9 @@ static void encode_image(mtmd_context * ctx, const image_chunk & ic, int n_embd,
 }
 
 // A normal-position seat's grid: the planned canvas W x H (the tower's graph input `inp_raw`: each side aligned to g_align)
-// holds the chunk's tokens, nx = W / align and ny = H / align.
+// holds the chunk's rows (grid_rows), nx = W / align and ny = H / align.
 static void set_canvas(image_chunk & ic, int W, int H, const std::string & name) {
-    if (W % g_align != 0 || H % g_align != 0 || (long) (W / g_align) * (H / g_align) != ic.n_tokens) {
+    if (W % g_align != 0 || H % g_align != 0 || grid_rows(W / g_align, H / g_align) != ic.n_tokens) {
         DIE("%s: inp_raw %d x %d is not %d tokens of %d x %d", name.c_str(), W, H, ic.n_tokens, g_align, g_align);
     }
     ic.nx = W / g_align;
@@ -458,8 +471,15 @@ static void probe_canvas(mtmd_context * tapc, tap_state & taps, const image_arg 
     set_canvas(ic, (int) inp.ne[0], (int) inp.ne[1], a.name);
 }
 
+// A pixel bound of the `# projector` line: the file's key, or for a pixtral file, which states none, mtmd's
+// set_limit_image_tokens(8, 1024) of the projector (the run's --image-min/max-tokens in its place when given) in pixels.
+static uint64_t pixel_bound(const std::string & mmproj, const std::string & key, int tokens, int dflt) {
+    if (!is_pixtral()) return gguf_u32(mmproj, key);
+    return (uint64_t) (tokens > 0 ? tokens : dflt) * g_align * g_align;
+}
+
 // The seat's lines every set carries beyond the common header (a Qwen seat has none: its sets are as they were).
-static void seat_lines(set_writer & w, const std::string & text_model, const std::string & mmproj) {
+static void seat_lines(set_writer & w, const std::string & text_model, const std::string & mmproj, int min_tokens, int max_tokens) {
     if (g_seat->canvas) {
         const std::string tarch = gguf_arch(text_model);
         w.line(std::string("# projector\t") + g_seat->projector + "\tpatch_size " + std::to_string(gguf_u32(mmproj, "clip.vision.patch_size")) +
@@ -473,8 +493,8 @@ static void seat_lines(set_writer & w, const std::string & text_model, const std
     if (g_seat->mrope) return;
     w.line(std::string("# projector\t") + g_seat->projector + "\tpatch_size " + std::to_string(gguf_u32(mmproj, "clip.vision.patch_size")) +
            "\tspatial_merge_size " + std::to_string(merge_size(mmproj)) + "\talign " + std::to_string(g_align) +
-           "\timage_min_pixels " + std::to_string(gguf_u32(mmproj, "clip.vision.image_min_pixels")) + "\timage_max_pixels " +
-           std::to_string(gguf_u32(mmproj, "clip.vision.image_max_pixels")));
+           "\timage_min_pixels " + std::to_string(pixel_bound(mmproj, "clip.vision.image_min_pixels", min_tokens, 8)) +
+           "\timage_max_pixels " + std::to_string(pixel_bound(mmproj, "clip.vision.image_max_pixels", max_tokens, 1024)));
     if (!g_fixture_line.empty()) w.line(g_fixture_line);
     const std::string src = gguf_str(text_model, "bloomery.respell.source", false);
     if (!g_respell_expect.empty() && src != g_respell_expect) {
@@ -510,7 +530,7 @@ static void header_common(set_writer & w, const std::string & kind, const std::s
     w.line("# flash_attn\tenabled\tclip warmup off");
     w.line("# image_tokens\tmin\t" + (min_tokens > 0 ? std::to_string(min_tokens) : std::string("default")) + "\tmax\t" +
            (max_tokens > 0 ? std::to_string(max_tokens) : std::string("default")));
-    seat_lines(w, text_model, mmproj);
+    seat_lines(w, text_model, mmproj, min_tokens, max_tokens);
 }
 
 static void image_lines(set_writer & w, const std::vector<image_info> & infos) {
@@ -564,6 +584,10 @@ static int run_tower(const std::string & mmproj, const std::string & text_model,
         if (taps_final) DIE("--taps final is the output-end taps of the Qwen and GLM seats; the %s seat taps its blocks: --taps full", g_seat->projector);
         wanted.push_back("inp_pos");
         for (int b : BOLT_TAP_BLOCKS) for (const char * n : BOLT_TAP_NODES) wanted.push_back(std::string(n) + "-" + std::to_string(b));
+    } else if (is_pixtral()) {
+        // the last block's `layer_out` (build_vit's cb, `-<block>`): the ViT's output before the projector's input norm
+        if (!taps_final) DIE("--taps full is the Qwen seats' per-block taps; the %s seat taps its ViT's output: --taps final", g_seat->projector);
+        wanted = {"layer_out-" + std::to_string(gguf_u32(mmproj, "clip.vision.block_count") - 1)};
     } else if (g_seat->mrope) {
         if (!taps_final) wanted.push_back("inp_pos_emb");
         wanted.push_back("norm_b-27");
@@ -649,8 +673,9 @@ static int run_tower(const std::string & mmproj, const std::string & text_model,
     header_common(tw, "taps", mmproj, arch, text_model, mmproj, cpu, threads, min_tokens, max_tokens, flags,
                   std::string("dump_mtmd tower — mtmd's ") + g_seat->projector + " graph nodes and final embeddings, raw f32, little-endian");
     if (taps_final) {
-        tw.line(g_seat->mrope ? "# taps\tnorm_b-27 (the post-LN output) of every image; embd (the clean pass)"
-                              : "# taps\tvit_out after_fc_proj after_ffn_proj of every image; embd (the clean pass)");
+        tw.line(is_pixtral()    ? "# taps\t" + wanted[0] + " (the last block's output, patches in raster order) of every image; embd (the clean pass)"
+                : g_seat->mrope ? std::string("# taps\tnorm_b-27 (the post-LN output) of every image; embd (the clean pass)")
+                                : std::string("# taps\tvit_out after_fc_proj after_ffn_proj of every image; embd (the clean pass)"));
     } else {
         tw.line("# tap_patches\t" + std::to_string(tap_patches));
         tw.line(is_bolt() ? "# taps\tinp_pos; blocks 0,1,15,31 of layer_inp_normed Qcur attn_out ffn_inp ffn_out layer_out (10 prefix rows, then the patches); embd (the clean pass)"

@@ -220,8 +220,8 @@ placement flag is refused.
 
 ### 5.4 When the host cannot hold the experts either
 
-A Qwen3.8, GLM-5.3, V4.1, MiniMax-M3, Muse Spark, Solar-Open2, Flint or Nemotron-H MoE plan whose host need passes the
-host's available RAM pages the overflow on the NVMe tier and serves it from a RAM arena filled from the file. MiMo's
+A Qwen3.8, GLM-5.3, V4.1, MiniMax-M3, Muse Spark, Mistral Large 4, Solar-Open2, Flint or Nemotron-H MoE plan whose host
+need passes the host's available RAM pages the overflow on the NVMe tier and serves it from a RAM arena filled from the file. MiMo's
 plan refuses that room by name: its host run attaches no tier. A checkpoint folder's plan counts the host bytes its load
 reads the card's parts in, so the tier pages what they take instead of the load refusing the room. The load prints an
 `nvtier` record with the arena's budget, the paged bytes and its counters.
@@ -267,18 +267,19 @@ choice print none. The records go to stderr in the server.
 
 ## 6. Memory beside the weights
 
-**The prompt cache** (V4.1, Qwen3.8, GLM-5.3, MiMo, MiniMax-M3, Muse Spark). `--cache-ram` (MiB; `0` turns it off)
-keeps saved sequence states in host RAM, so a request that shares a prefix with an earlier one restores it, even after
-another request used the slot. By default the budget is the lesser of 8 GiB and half the host RAM the plan leaves, with
-every slot's checkpoints and the residency's churn pool counted in. llama-server's `-1` (no limit) is refused: the cache
-is host memory beside the load, so it always has a budget.
+**The prompt cache** (V4.1, Qwen3.8, GLM-5.3, MiMo, MiniMax-M3, Muse Spark, Mistral Large 4). `--cache-ram` (MiB; `0`
+turns it off) keeps saved sequence states in host RAM, so a request that shares a prefix with an earlier one restores
+it, even after another request used the slot. By default the budget is the lesser of 8 GiB and half the host RAM the
+plan leaves, with every slot's checkpoints and the residency's churn pool counted in. llama-server's `-1` (no limit) is
+refused: the cache is host memory beside the load, so it always has a budget.
 
 - A request that continues an earlier conversation restores that state. A request that shares only part of an earlier
   prompt restores too: a saved state keeps checkpoints at 512 × 2^i positions below its end and the last one, and a
   shared prefix restores at the largest of them inside it. On Qwen3.8 the card's own checkpoints are 4,096 positions
   apart, so there a shared prefix shorter than 4,096 tokens does not restore.
-- On MiniMax-M3 and Muse Spark a saved state is the K and V rows of the held positions (and MiniMax's index keys), with
-  no checkpoints, so any shared prefix restores.
+- On MiniMax-M3, Muse Spark and Mistral Large 4 a saved state is the rows of the held positions (K and V, or Mistral
+  Large 4's latent rows; the index keys of MiniMax-M3 and Mistral Large 4), with no checkpoints, so any shared prefix
+  restores.
 - The qwen3 seat keeps only the longest prefix the live slot holds and runs no saved prompt cache. For Qwen3.5 and
   Qwen3.6, when the vocabulary and chat template both carry `<|im_start|>`, it cuts prompt calls at message starts, so
   a shared system prompt stays in the live slot for another question.
@@ -505,6 +506,7 @@ last two. A flag the seat does not take is refused by name with the seat's usage
 | `qwen3` | N or `auto` | on a whole-card load; a placed load steps in turn | no | a file with no routed expert | yes | `--cache-type-k f16\|q8_0` |
 | `mimo2` | N or `auto` | yes, two slots' rows a pass | yes | no | no | `--prefill batch\|steps` |
 | `minimaxm3` | N or `auto` | no, slots step in turn | yes | no | no | |
+| `mistrallarge4` | N or `auto` | no, slots step in turn | yes | no | yes (Pixtral) | |
 | `flint` | N or `auto` | | no | no | no | |
 | `musespark` | 1 | | yes | no | no | |
 | `solar2`, `nemotron`, `raon1` | 1 | | no | no | no | |
@@ -556,6 +558,10 @@ slots and memory each start takes, is [`dgx-spark.md`](dgx-spark.md).
   place. The draft fits a target by its shapes, not its name, so fine-tunes with Qwen3.6's shapes (Sage-A1.5,
   Ornith-1.5) take it. A draft whose ids, mask or taps do not fit is refused before a weight is read.
   `BLOOMERY_DRAFT=lookup` serves the n-gram lookup draft on the same whole-card load.
+- **The mistrallarge4 seat.** `BLOOMERY_DRAFT=lookup` serves the n-gram draft, one context a slot. `BLOOMERY_DRAFT=dspark`
+  serves the DSpark draft of `BLOOMERY_DSPARK_MODEL` on the card `BLOOMERY_DSPARK_CARD` names (else the common placement
+  rule picks), from one slot: `--parallel` above 1 and an image under it are refused by name. Unset serves the plain
+  path.
 
 ### 9.4 Nemotron
 

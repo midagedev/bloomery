@@ -58,10 +58,20 @@
 //! NaN: that column's blocks stored with a NaN scale and zero codes, the
 //! named `QuantColumn` fault, every other column the finite run's bits.
 //!
+//! The selected-row pair, `flash_latent_mma_sel` and `flash_merge_sel`, reads a
+//! selection list's rows in place for many tokens at once
+//! (`latent_sel_is_gather_then_walk`): at 1, 7, 16 and 17 tokens, 16 and 32
+//! heads, over lists of mixed lengths (a full list, one key, a segment edge
+//! and one past it, none), each token's output rows are the bits of its own
+//! `kv_gather_sel`, `flash_latent_mma` and `flash_merge`, with no fault raised
+//! and the list entries past a token's count never read; a list entry past
+//! the cache raises `CachePos` and a count past the list's width raises
+//! `KeyCount` with the clamped run's output.
+//!
 //! One shape check joins them, read off the device code this binary carries
 //! rather than off a clock: every flash entry — the single-block
-//! `flash_latent`, the split pair `flash_latent_mma`/`flash_merge`, and both
-//! appends — must compile with no local depot.
+//! `flash_latent`, the split pair `flash_latent_mma`/`flash_merge`, their
+//! selected-row forms, and both appends — must compile with no local depot.
 //! A per-thread accumulator array the backend cannot hold in registers is
 //! spilled to local memory, and every accumulate becomes a dependent local
 //! round trip — a defect that changes no output and no band, so nothing else
@@ -70,8 +80,8 @@
 #[cfg(feature = "gpu")]
 use bloomery_gpu::flash::{
     FlashGeom, FlashInputs, FlashKernels, FlashLatentArgs, FlashLatentQ8Args, FlashMergeArgs,
-    FlashMergeQ8Args, FlashSplitArgs, f32_to_f16_bits, mma_groups, partials_ms_len, partials_v_len,
-    seg_keys, segments_for,
+    FlashMergeQ8Args, FlashMergeSelArgs, FlashSegArgs, FlashSelArgs, FlashSplitArgs,
+    f32_to_f16_bits, mma_groups, partials_ms_len, partials_v_len, seg_keys, segments_for,
 };
 #[cfg(feature = "gpu")]
 use bloomery_gpu::flash_gqa::{SEGMENTS, seg_span};
@@ -173,7 +183,9 @@ fn run() -> Result<(), GateError> {
     ok &= bloomery_gpu_gates::no_local_depot(&[
         "flash_latent",
         "flash_latent_mma",
+        "flash_latent_mma_sel",
         "flash_merge",
+        "flash_merge_sel",
         "kv_append",
         "kv_append_pos_buf",
     ])?;
@@ -274,6 +286,7 @@ fn run() -> Result<(), GateError> {
             println!("kv_gather_sel FAIL");
         }
     }
+    ok &= latent_sel_is_gather_then_walk(&gpu, &flash, dims)?;
 
     if !ok {
         return Err(bloomery_gpu_gates::checks_failed());
@@ -286,7 +299,9 @@ fn run() -> Result<(), GateError> {
          of the reference past the 64-key cut to 262,144 keys; reruns bit-identical; \
          padded NaN rows never read; one captured graph replays bit-identically at every \
          key count; the split grid is the same at two cache heights; every token of a \
-         multi-token launch is its one-token launch; the flash kernels compile with no \
+         multi-token launch is its one-token launch; the selected-row pair is gather, walk and \
+         merge bit for bit for every token at 1, 7, 16 and 17 tokens, and refuses a list \
+         entry past the cache and a count past the list; the flash kernels compile with no \
          local depot"
     );
     Ok(())
@@ -1232,6 +1247,269 @@ fn deep_counts(gpu: &Gpu, flash: &FlashKernels, dims: Dims, band: f32) -> Result
         );
         ok &= same;
     }
+    Ok(ok)
+}
+
+// ------------------------------------------------------- selected rows
+
+/// Rows of the selected-row clause's cache.
+#[cfg(feature = "gpu")]
+const SEL_CACHE_ROWS: usize = 300;
+
+/// The list width of the clause's tokens: past `seg_keys()`, so a full list
+/// spans several segments.
+#[cfg(feature = "gpu")]
+const SEL_STRIDE: usize = 160;
+
+/// The live counts the tokens cycle through (token `t` takes entry `5t mod 7`,
+/// so seven tokens take each once): a full list, one key, one past a 64-key
+/// segment, two keys, an odd tile tail, exactly one segment, and a count in
+/// the second segment (a count of 0 is its own case: `KeyCount`).
+#[cfg(feature = "gpu")]
+const SEL_COUNTS: [usize; 7] = [160, 1, 65, 2, 33, 64, 97];
+
+/// A fault as a gate line prints it: its text, or `none`.
+#[cfg(feature = "gpu")]
+fn fault_text(f: Option<Fault>) -> String {
+    f.map_or_else(|| "none".to_owned(), |f| f.to_string())
+}
+
+/// Token `t`'s list of `stride` entries for the live counts `counts`: distinct
+/// cache rows below the count, and above it a row past the cache — an entry a
+/// kernel that read it would raise on.
+#[cfg(feature = "gpu")]
+fn sel_lists(counts: &[u32], stride: usize) -> Vec<u32> {
+    let mut list = Vec::with_capacity(counts.len() * stride);
+    for (t, &count) in counts.iter().enumerate() {
+        for i in 0..stride {
+            list.push(if i < count as usize {
+                ((7 * i + 11 * t) % SEL_CACHE_ROWS) as u32
+            } else {
+                u32::MAX
+            });
+        }
+    }
+    list
+}
+
+/// One `flash_latent_mma_sel` and `flash_merge_sel` launch pair over
+/// `counts.len()` tokens of `dims.heads` heads, the list width
+/// `list.len() / counts.len()`: the output rows and the fault word the pair
+/// left.
+#[cfg(feature = "gpu")]
+fn sel_pair(
+    gpu: &Gpu,
+    flash: &FlashKernels,
+    dims: Dims,
+    cache: &DeviceTensor<u16>,
+    queries: &[f32],
+    list: &[u32],
+    counts: &[u32],
+) -> Result<(Vec<f32>, Option<Fault>), GateError> {
+    let stream = gpu.stream();
+    let (tokens, heads, latent) = (counts.len(), dims.heads, dims.latent_dims);
+    let stride = list.len() / tokens;
+    let q_dev = DeviceBuffer::from_host(stream, queries)?;
+    let list_dev = DeviceBuffer::from_host(stream, list)?;
+    let counts_dev = DeviceBuffer::from_host(stream, counts)?;
+    let mut part = Partials::zeroed(stream, tokens * heads, stride)?;
+    let mut y = DeviceBuffer::<f32>::zeroed(stream, tokens * heads * latent)?;
+    gpu.clear_fault()?;
+    flash.enqueue_flash_latent_mma_sel(
+        stream,
+        FlashSelArgs {
+            q: &q_dev,
+            kv: cache,
+            list: &list_dev,
+            counts: &counts_dev,
+            stride,
+            kq_scale: dims.kq_scale,
+            geom: dims.geom(tokens),
+            part_v: &mut part.v,
+            part_ms: &mut part.ms,
+            fault: gpu.unlabelled_sink(),
+        },
+    )?;
+    flash.enqueue_flash_merge_sel(
+        stream,
+        FlashMergeSelArgs {
+            counts: &counts_dev,
+            stride,
+            tokens,
+            heads,
+            latent_dims: latent,
+            part_v: &part.v,
+            part_ms: &part.ms,
+            y: &mut y,
+        },
+    )?;
+    stream.synchronize()?;
+    let fault = gpu.take_fault()?;
+    Ok((y.to_host_vec(stream)?, fault))
+}
+
+/// The selected-row clause (module doc): per token, the pair's output rows are
+/// the bits of `kv_gather_sel` into a `stride`-row scratch, `flash_latent_mma`
+/// and `flash_merge` over it at the token's own count, at 1, 7, 16 and 17
+/// tokens of 16 and 32 heads (a head count of two groups a token checks the
+/// group-to-token map); then a list entry past the cache and a count past the
+/// list's width.
+#[cfg(feature = "gpu")]
+fn latent_sel_is_gather_then_walk(
+    gpu: &Gpu,
+    flash: &FlashKernels,
+    dims: Dims,
+) -> Result<bool, GateError> {
+    use bloomery_gpu::latent::{KvGatherSelArgs, LatentKernels};
+
+    let stream = gpu.stream();
+    let gather = LatentKernels::load(gpu.context())?;
+    let (width, latent, stride) = (dims.width, dims.latent_dims, SEL_STRIDE);
+    let bits: Vec<u16> = activations(width, SEL_CACHE_ROWS, 50029)
+        .iter()
+        .map(|&v| f32_to_f16_bits(v))
+        .collect();
+    let cache = DeviceTensor::upload(stream, &bits, SEL_CACHE_ROWS, width)?;
+    let mut ok = true;
+    for heads in [dims.heads, 2 * dims.heads] {
+        let dims = Dims { heads, ..dims };
+        for m in [1usize, 7, 16, 17] {
+            let counts: Vec<u32> = (0..m)
+                .map(|t| SEL_COUNTS[(5 * t) % SEL_COUNTS.len()] as u32)
+                .collect();
+            let list = sel_lists(&counts, stride);
+            let queries = activations(width, m * heads, 60019);
+            let (got, sel_fault) = sel_pair(gpu, flash, dims, &cache, &queries, &list, &counts)?;
+
+            // The reference: each token's own gather, segment pass and merge.
+            let mut same = true;
+            for (t, &count) in counts.iter().enumerate() {
+                let q_t = DeviceBuffer::from_host(
+                    stream,
+                    &queries[t * heads * width..(t + 1) * heads * width],
+                )?;
+                let list_t = DeviceBuffer::from_host(stream, &list[t * stride..(t + 1) * stride])?;
+                let n_t = DeviceBuffer::from_host(stream, &[count])?;
+                let mut gathered = DeviceTensor::<u16>::zeroed(stream, stride, width)?;
+                gather.enqueue_kv_gather_sel(
+                    stream,
+                    KvGatherSelArgs {
+                        list: &list_t,
+                        n: &n_t,
+                        stride,
+                        src: &cache,
+                        fault: gpu.unlabelled_sink(),
+                        dst: &mut gathered,
+                    },
+                )?;
+                let mut part_t = Partials::zeroed(stream, heads, stride)?;
+                let mut y_t = DeviceBuffer::<f32>::zeroed(stream, heads * latent)?;
+                flash.enqueue_flash_latent_mma(
+                    stream,
+                    FlashSegArgs {
+                        inputs: FlashInputs {
+                            q: &q_t,
+                            kv: &gathered,
+                            n_keys_buf: &n_t,
+                            kq_scale: dims.kq_scale,
+                            geom: dims.geom(1),
+                        },
+                        part_v: &mut part_t.v,
+                        part_ms: &mut part_t.ms,
+                    },
+                )?;
+                flash.enqueue_flash_merge(
+                    stream,
+                    FlashMergeArgs {
+                        n_keys_buf: &n_t,
+                        cache_rows: stride,
+                        tokens: 1,
+                        heads,
+                        latent_dims: latent,
+                        part_v: &part_t.v,
+                        part_ms: &part_t.ms,
+                        y: &mut y_t,
+                    },
+                )?;
+                stream.synchronize()?;
+                same &= bits_equal(
+                    &got[t * heads * latent..(t + 1) * heads * latent],
+                    &y_t.to_host_vec(stream)?,
+                );
+            }
+            let ref_fault = gpu.take_fault()?;
+            let pass = same && sel_fault.is_none() && ref_fault.is_none();
+            println!(
+                "latent_sel heads={heads} m={m} stride={stride} counts={counts:?} \
+                 each_token_gather_then_walk={same} sel_fault=\"{}\" gather_walk_fault=\"{}\" {}",
+                fault_text(sel_fault),
+                fault_text(ref_fault),
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+    }
+
+    // A list entry past the cache: `CachePos`, and the run still ends inside
+    // the cache (the key stages row 0), every output finite.
+    let counts = [stride as u32, 4];
+    let mut list = sel_lists(&counts, stride);
+    list[3] = (SEL_CACHE_ROWS + 1) as u32;
+    let queries = activations(width, 2 * dims.heads, 60019);
+    let (y, fault) = sel_pair(gpu, flash, dims, &cache, &queries, &list, &counts)?;
+    let want = Some(Fault::at(LAYER_NONE, FaultSite::CachePos));
+    let finite = y.iter().all(|v| v.is_finite());
+    let pass = fault == want && finite;
+    println!(
+        "latent_sel past_rows: fault=\"{}\" want=\"{}\" outputs_finite={finite} {}",
+        fault_text(fault),
+        fault_text(want),
+        verdict(pass)
+    );
+    ok &= pass;
+
+    // A count past the list's width: `KeyCount`, and the token walks the
+    // `stride` entries the list has — the clamped run's bits.
+    let list = sel_lists(&[stride as u32], stride);
+    let queries = activations(width, dims.heads, 60019);
+    let (y, fault) = sel_pair(
+        gpu,
+        flash,
+        dims,
+        &cache,
+        &queries,
+        &list,
+        &[stride as u32 + 5],
+    )?;
+    let (y_clamped, clean) = sel_pair(gpu, flash, dims, &cache, &queries, &list, &[stride as u32])?;
+    let want = Some(Fault::at(LAYER_NONE, FaultSite::KeyCount));
+    let pass = fault == want && clean.is_none() && bits_equal(&y, &y_clamped);
+    println!(
+        "latent_sel count_past_stride: fault=\"{}\" want=\"{}\" clamped_run_fault=\"{}\" \
+         bits_equal_to_clamped_run={} {}",
+        fault_text(fault),
+        fault_text(want),
+        fault_text(clean),
+        bits_equal(&y, &y_clamped),
+        verdict(pass)
+    );
+    ok &= pass;
+
+    // A count of 0: no key, where a causal row always sees itself — `KeyCount`,
+    // every output finite.
+    let list = sel_lists(&[1], stride);
+    let queries = activations(width, dims.heads, 60019);
+    let (y, fault) = sel_pair(gpu, flash, dims, &cache, &queries, &list, &[0])?;
+    let want = Some(Fault::at(LAYER_NONE, FaultSite::KeyCount));
+    let finite = y.iter().all(|v| v.is_finite());
+    let pass = fault == want && finite;
+    println!(
+        "latent_sel count_zero: fault=\"{}\" want=\"{}\" outputs_finite={finite} {}",
+        fault_text(fault),
+        fault_text(want),
+        verdict(pass)
+    );
+    ok &= pass;
     Ok(ok)
 }
 

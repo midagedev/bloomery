@@ -1,18 +1,21 @@
 //! The Mistral Large 4 family of the fixture tier: mainline's node dumps on the fixture file
-//! ([`crate::fixture::first_shard`]), mirroring [`super::LCPP`] with the same tree, the same
-//! consumers and set names that carry the `fx_` prefix. The identity is the fixture's: its first
-//! shard and its `# fixture` line ([`crate::family::Identity::FixtureManifest`]), so a set dumped
-//! from the real file is stale for it and a set dumped from the fixture is stale for the real
-//! family, each by the `# model` line it states.
+//! ([`crate::fixture::first_shard`]), mirroring [`super::LCPP`] with the same tree and the same
+//! consumers. The set names carry the `fx_` prefix and the fixture's cut: the file keeps all 128
+//! of the real file's experts (`tools/fixture-dirs.tsv`, directory `mistrallarge4-e128`), so its
+//! sets are `fx_ref_mistrallarge4e128_{a,b}`, never a path a cut of another width dumps to. The
+//! identity is the fixture's: its first shard and its `# fixture` line
+//! ([`crate::family::Identity::FixtureManifest`]), so a set dumped from the real file is stale for
+//! it and a set dumped from the fixture is stale for the real family, each by the `# model` line
+//! it states.
 
 use super::{ARCH, LCPP_BUILD};
 use crate::RefError;
 use crate::family::{Build, Family, Identity};
 
 /// [`super::A`] on the fixture.
-pub const A: &str = "fx_ref_mistrallarge4_a";
+pub const A: &str = "fx_ref_mistrallarge4e128_a";
 /// [`super::B`] on the fixture.
-pub const B: &str = "fx_ref_mistrallarge4_b";
+pub const B: &str = "fx_ref_mistrallarge4e128_b";
 
 /// The fixture file the tree runs, as a family's `runs`.
 fn runs() -> Result<String, RefError> {

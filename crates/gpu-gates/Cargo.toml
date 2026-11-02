@@ -167,7 +167,7 @@ minimaxm3 = ["gpu", "dep:bloomery-gpu-minimaxm3", "bloomery-app/minimaxm3"]
 flint = ["gpu", "dep:bloomery-gpu-flint", "bloomery-app/flint"]
 gemma-embedding2 = ["gpu", "gemma4a", "dep:bloomery-gpu-vision", "dep:bloomery-gpu-gemma-embedding2", "dep:bloomery-serve"]
 gemma4a = ["gpu", "dep:bloomery-gpu-gemma4a", "dep:bloomery-vision"]
-mistrallarge4 = ["gpu", "dep:bloomery-gpu-deepseek41", "dep:bloomery-gpu-mistrallarge4"]
+mistrallarge4 = ["gpu", "dep:bloomery-gpu-deepseek41", "dep:bloomery-gpu-mistrallarge4", "bloomery-app/mistrallarge4"]
 
 [[bin]]
 name = "gate_gemma4a"
@@ -185,7 +185,7 @@ required-features = ["deepseek41"]
 [[bin]]
 name = "bloomery-serve"
 path = "src/bin/bloomery_serve.rs"
-required-features = ["glm5next", "clef", "mimo2", "solar2", "minimaxm3", "flint", "gemma-embedding2", "hf"]
+required-features = ["glm5next", "clef", "mimo2", "solar2", "minimaxm3", "flint", "mistrallarge4", "gemma-embedding2", "hf"]
 
 [[bin]]
 name = "bloomery-serve-ds41"
@@ -510,6 +510,38 @@ name = "gate_mistrallarge4_e2e"
 required-features = ["mistrallarge4"]
 
 [[bin]]
+name = "gate_mistrallarge4_load"
+required-features = ["mistrallarge4"]
+
+[[bin]]
+name = "gate_mistrallarge4_dspark"
+required-features = ["mistrallarge4"]
+
+[[bin]]
+name = "gate_mistrallarge4_prefill"
+required-features = ["mistrallarge4"]
+
+[[bin]]
+name = "gate_mistrallarge4_verify"
+required-features = ["mistrallarge4"]
+
+[[bin]]
+name = "gate_mistrallarge4_twocard"
+required-features = ["mistrallarge4"]
+
+[[bin]]
+name = "gate_mistrallarge4_residency"
+required-features = ["mistrallarge4"]
+
+[[bin]]
+name = "gate_mistrallarge4_xstream"
+required-features = ["mistrallarge4"]
+
+[[bin]]
+name = "gate_mistrallarge4_serve"
+required-features = ["deepseek41", "mistrallarge4"]
+
+[[bin]]
 name = "gate_musespark_prefill"
 required-features = ["gpu"]
 
@@ -770,6 +802,10 @@ name = "gate_radio_tower"
 required-features = ["vision"]
 
 [[bin]]
+name = "gate_pixtral_tower"
+required-features = ["vision"]
+
+[[bin]]
 name = "gate_minicpmv_tower"
 required-features = ["vision"]
 
@@ -783,7 +819,7 @@ required-features = ["hf"]
 
 [[test]]
 name = "serve_preflight"
-required-features = ["glm5next", "clef", "mimo2", "solar2", "minimaxm3", "flint", "gemma-embedding2", "hf"]
+required-features = ["glm5next", "clef", "mimo2", "solar2", "minimaxm3", "flint", "mistrallarge4", "gemma-embedding2", "hf"]
 
 [[bin]]
 name = "gate_qwen38_media"

@@ -34,6 +34,8 @@ pub mod glm5next;
 pub mod mimo2;
 #[cfg(feature = "minimaxm3")]
 pub mod minimaxm3;
+#[cfg(feature = "mistrallarge4")]
+pub mod mistrallarge4;
 /// The muse-spark family's session pieces: the body lives in the gpu crate's
 /// own musespark arch, so they need no feature of their own.
 pub mod musespark;

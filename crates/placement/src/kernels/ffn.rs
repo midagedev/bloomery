@@ -101,17 +101,23 @@ pub struct RoutedBatch {
     pub dense: Option<WideBlock>,
     pub card: Option<TierLegScratch>,
     pub tiered: bool,
+    /// The router keeps its rows' logits in a buffer of their own beside the scores (the router
+    /// entry's `ROW_LOGITS`): `experts` more values a row.
+    pub router_logits: bool,
 }
 
 impl RoutedBatch {
-    /// Norm/router/shared/base rows, narrow activation rows, optional dense/card/wide/tier buffers.
+    /// Norm/router (scores, and logits when `router_logits`)/shared/base rows, narrow activation rows,
+    /// optional dense/card/wide/tier buffers.
     #[must_use]
     pub fn bytes(self, rows: u64) -> Option<u64> {
         let dense_ff = self.dense.map_or(0, |d| d.ff);
+        let logits = if self.router_logits { self.experts } else { 0 };
         let mut values = self
             .hidden
             .checked_mul(3)?
             .checked_add(self.experts)?
+            .checked_add(logits)?
             .checked_add(self.used.checked_mul(2)?)?
             .checked_add(self.shared.ff.max(dense_ff))?;
         if self.dense.is_some() {
@@ -190,6 +196,7 @@ mod tests {
             dense: None,
             card: None,
             tiered: false,
+            router_logits: false,
         };
         assert_eq!(batch.bytes(8), Some(8 * 4 * (3 * 256 + 8 + 4 + 256)));
         assert_eq!(
@@ -217,6 +224,43 @@ mod tests {
         };
         assert_eq!(q32.bytes(9).unwrap() - wide.bytes(9).unwrap(), 9 * 4 * 80);
         assert_eq!(batch.bytes(u64::MAX), None);
+    }
+
+    #[test]
+    fn router_logits_are_one_more_row_of_experts() {
+        let wide = WideBlock {
+            hidden: 256,
+            ff: 256,
+            input: WideForms::default().with(SiteAct::F32),
+            down: WideForms::default().with(SiteAct::F32),
+        };
+        let plain = RoutedBatch {
+            hidden: 256,
+            experts: 128,
+            used: 4,
+            shared: wide,
+            dense: None,
+            card: None,
+            tiered: false,
+            router_logits: false,
+        };
+        let kept = RoutedBatch {
+            router_logits: true,
+            ..plain
+        };
+        assert_eq!(plain.bytes(8), Some(8 * 4 * (3 * 256 + 128 + 2 * 4 + 256)));
+        assert_eq!(
+            kept.bytes(8),
+            Some(8 * 4 * (3 * 256 + 2 * 128 + 2 * 4 + 256))
+        );
+        for rows in [1, 8, 9, 512] {
+            assert_eq!(
+                kept.bytes(rows).unwrap() - plain.bytes(rows).unwrap(),
+                rows * 128 * 4,
+                "{rows} rows"
+            );
+        }
+        assert_eq!(kept.bytes(u64::MAX), None);
     }
 
     #[test]

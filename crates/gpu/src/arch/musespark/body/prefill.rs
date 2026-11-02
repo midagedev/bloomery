@@ -1331,16 +1331,13 @@ enum Sum {
 /// hosted one in its three parts around the host's union. The pass is one
 /// walk of one unit of the call's host streaming (`xs`, [`super::stream`]),
 /// ending at `walk_end`: a hosted layer's shadow picks, its card route reads
-/// what the pick landed and the layer's stream, and its back owes the
-/// layer's return.
+/// what the pick landed and the layer's stream, and its back sums by the
+/// stream's join and owes the layer's return.
 struct PlacedPass<'a, 'b> {
     walk: PassWalk<'a>,
     side: &'b mut PlacedSide,
     xs: &'b mut XSide,
     walk_end: usize,
-    /// The union's place count of the layer whose shadow streamed, until its
-    /// back sums by it.
-    streamed: Option<usize>,
 }
 
 /// Layer `l` of the pass picks at its shadow: the pass runs it, the host
@@ -1370,7 +1367,8 @@ impl<'a> LayerProgram for PlacedPass<'a, '_> {
     /// A hosted layer's pick ([`PromptStream::unit_pick`](crate::host::prompt_stream::PromptStream::unit_pick):
     /// nothing when no call streams), its card route behind the pick's
     /// landings over the stage slots and the layer's stream, and the unit's
-    /// read of the layer.
+    /// read of the layer, which keeps the streamed experts the ring pass
+    /// joined for the back.
     fn shadow(&mut self, leg: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
         let PlacedPass {
@@ -1378,7 +1376,6 @@ impl<'a> LayerProgram for PlacedPass<'a, '_> {
             side,
             xs,
             walk_end,
-            streamed,
         } = self;
         if !(side.hosted[l] && walk.runs(l)) {
             return Ok(());
@@ -1387,33 +1384,31 @@ impl<'a> LayerProgram for PlacedPass<'a, '_> {
         let (ring, land) = xs
             .stream
             .unit_pick(leg, at, (m, 1), *walk_end, |k| picks(walk, side, k))?;
-        *streamed = None;
-        if walk.layers[l].n_card > 0 {
-            let n_card = walk.layers[l].n_card;
+        let joined = if walk.layers[l].n_card > 0 {
             let ring = match ring {
                 Some(r) => Some(xs.ring_pass(r, &side.acc_k)?),
                 None => None,
             };
-            if let Some(n) = walk.card_route(side, l, &land, ring)? {
-                xs.joined(l, n);
-                *streamed = Some(n_card + n);
-            }
-        }
-        let streams = streamed.is_some();
+            walk.card_route(side, l, &land, ring)?
+        } else {
+            None
+        };
         xs.stream
-            .unit_read(leg, (at, 1), (land, streams), |k| picks(walk, side, k))
+            .unit_read(leg, (at, 1), (land, joined), |k| picks(walk, side, k))
     }
 
     /// A hosted layer's back, summed by the stream's union places when its
-    /// shadow streamed; then the layer's return, owed in a returning call's
-    /// last walk.
+    /// shadow streamed (the stage's `n_card` and the streamed experts the
+    /// stream's join hands it,
+    /// [`PromptStream::unit_join`](crate::host::prompt_stream::PromptStream::unit_join));
+    /// then the layer's return, owed in a returning call's last walk.
     fn back(&mut self, leg: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
         if !(self.side.hosted[l] && self.walk.runs(l)) {
             return Ok(());
         }
-        let union = match self.streamed.take() {
-            Some(n) => Some((self.xs.union_places()?, n)),
+        let union = match self.xs.stream.unit_join(at)? {
+            Some(n) => Some((self.xs.union_places()?, self.walk.layers[l].n_card + n)),
             None => None,
         };
         self.walk.hosted_back(&*self.side, leg, (at, union))?;
@@ -1606,11 +1601,10 @@ impl Body {
                     side,
                     xs: &mut self.xs,
                     walk_end: pos as usize + m,
-                    streamed: None,
                 };
                 sched::walk(o, n, &mut leg, &mut pass)?;
                 pass.xs.stream.end_walk(leg.hybrid(), stream)?;
-                pass.xs.walk_done();
+                pass.xs.stream.walk_done();
                 walk = pass.walk;
             }
         }

@@ -87,6 +87,17 @@ pub struct ForcedRow {
     pub out: Vec<f32>,
 }
 
+/// What a path picked on one layer at the last position of its last call, for a body whose layer attends to picked rows (an
+/// indexer's top-k): the layer, the rows in the order the attention read them, and the index scores they were picked from.
+pub struct Selection {
+    /// The layer the selection is of: the first one, whose input both paths read as the embedding.
+    pub layer: usize,
+    /// The layer's list as it stands: its first `min(visible rows, width)` entries are the pick.
+    pub list: Vec<u32>,
+    /// The index scores over the visible rows, a value a row.
+    pub scores: Vec<f32>,
+}
+
 /// One loaded body on the gate card, as a gate drives it. The contract of each call is the body's, fixed here so the gates and
 /// the body are written against one text:
 /// - [`Seat::prompt`] runs `ids` from the seat's position by the prompt batch and answers the last id's logits row;
@@ -94,7 +105,9 @@ pub struct ForcedRow {
 /// - [`Seat::taps`] is `layers * embd` values, layer `l`'s output at the last position of the last call at `[l * embd..]`,
 ///   whichever path ran it;
 /// - [`Seat::stores`] names every store the written positions fill with a 64-bit digest of its bytes ([`fnv1a`]), in layer order;
-/// - [`Seat::fault`] is `Ok` while the fault word is clean and the model not poisoned.
+/// - [`Seat::fault`] is `Ok` while the fault word is clean and the model not poisoned;
+/// - [`Seat::selection`] is the first layer's pick at the last position of the last call, and [`Seat::force_selection`] arms the
+///   next prompt or step call to read a given list in its place.
 ///
 /// A body without a prompt batch refuses [`Seat::prompt`], [`Seat::set_group`] and [`Seat::stores`] by name and its gate's
 /// descriptor says [`Gate::has_prefill`] is false. A body that does not run a layer alone refuses [`Seat::forced_row`] by name
@@ -151,6 +164,19 @@ pub trait Seat {
     /// its logits row. A seat whose model does not run the head alone refuses by name.
     fn head_row(&mut self, _x: &[f32]) -> Result<Vec<f32>, GateError> {
         Err("this seat has no head row: its model does not run the head alone".into())
+    }
+
+    /// The first layer's pick at the last position of the last call, whichever path ran it. `None` for a seat whose body picks no
+    /// rows.
+    fn selection(&mut self) -> Result<Option<Selection>, GateError> {
+        Ok(None)
+    }
+
+    /// The next prompt or step call, and only that call, reads `list` as layer `layer`'s pick at its last position in place of
+    /// the one the layer makes: a gate runs a position again on the other path's list. A seat whose body picks no rows refuses by
+    /// name.
+    fn force_selection(&mut self, _layer: usize, _list: &[u32]) -> Result<(), GateError> {
+        Err("this seat has no selection to force: its body picks no rows".into())
     }
 }
 

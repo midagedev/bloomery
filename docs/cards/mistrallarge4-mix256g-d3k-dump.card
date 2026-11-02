@@ -1,0 +1,23 @@
+# The Mistral Large 4 Mix-256G file's deep node dump (232.9 GB in six shards,
+# /models/Mistral-Large-4-1T-A52B-Mix-256G), `just dump-ref-mistrallarge4-mix256g d3k`: the UD-IQ1_S file's deep dump
+# (docs/cards/mistrallarge4-d3k-dump.card) on the other real file, the same 3,001 ids, into ref_mistrallarge4_mix256g_d3k.
+# One load; the phases run one after the other. Predicted wall [derived], seconds:
+#   load      232.9 GB mmapped (4.4 % over UD-IQ1_S's 223 GB), every expert touched by the six ubatches, so the whole file is read
+#             once at ~2-3 GB/s when the page cache holds none of it: 78-117 s; the CPU backend repacks a Q4_K tensor only if
+#             this tree's AVX2 build has the rows for it, a copy of at most the 5 GB of Q4_K tensors beside the mmap, inside
+#             the 251 GB box: 30-110 s on top
+#   prefill   3,000 ids at 0.10-0.22 s an id: the UD-IQ1_S card's rate range with its top widened by a tenth for this file's
+#             other expert types, whose CPU kernels in this tree are not measured here: 300-660 s
+#   step      one token reading ~18 GB (6.9 GB of routed experts, 11.1 GB dense, header sums) over ~57-120 GB/s, the callback
+#             asked for ~20 nodes a layer: 1-3 s
+#   writes    ~0.3-0.5 GB of taps and cached-key views: 1-2 s
+#   total     6-14 min (the lower sum 380 s rounds up to the card's minute), bound 1800 s, which covers a prefill rate to ~0.4 s
+#             an id after a cold load and a repack; the log prints the quiet prefill's wall after each chunk of 2,048 ids.
+# What the run guarantees: CUDA hidden, the CPU lease held, the staging set installed only when its manifest carries the
+# `# complete` trailer, the ids the UD-IQ1_S dump's (the finished tokenizer oracle's prose.nps.ids, first 3,001).
+kind: exclusive
+reason: mistrallarge4_dump runs mainline llama.cpp on 32 CPU threads over a 233 GB mmap for the prefill of 3,000 ids; beside a
+  timed run or a gate batch it would take their cores and their page cache, so it holds the lease; why now: the Mix-256G
+  file's deep oracle set, the one the end-to-end gate's selection and node clauses past the top-k 2,048 read when that file is
+  in view
+minutes: 6..14

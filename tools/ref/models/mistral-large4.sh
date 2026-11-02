@@ -11,6 +11,10 @@
 #           BLOOMERY_REF_MODEL moves it; a caller's own MODEL= is ignored. The path is the family's identity
 #           (refset::arch::mistrallarge4::MODEL): a set names its file's full path, so the file is not moved or
 #           deleted before its sets are re-dumped.
+#   DSPARK  the DSpark draft (unsloth/Mistral-Large-4-1T-A52B-GGUF's dspark-Mistral-Large-4-1T-A52B-Q8_0.gguf), the file
+#           gate-gpu-mistrallarge4-dspark and its set (tools/ref/dump-ml4-dspark.sh) read; BLOOMERY_REF_DSPARK moves it. Its
+#           path is the draft family's identity (refset::arch::mistrallarge4::dspark::DRAFT), as MODEL's is the target's:
+#           the gate refuses a draft at another path by name.
 #   LCPP    mainline llama.cpp at PR 31376's merge, 78feec062d50ec9e8940244cac918ac4480b60cb
 #           (/home/user/llama.cpp-ml4, the CPU backend alone, built by `just build-ml4-lcpp`):
 #           src/models/mistral-large4.cpp is mainline's own graph, so the oracle (tools/ref/mistrallarge4-dump.sh)
@@ -32,3 +36,4 @@ MODEL_NAME=mistral-large4
 : "${IK:=/home/user/ik-idxkey}"
 : "${LCPP:=/home/user/llama.cpp-ml4}"
 MODEL=${BLOOMERY_REF_MODEL:-/models/Mistral-Large-4-1T-A52B-UD-IQ1_S/Mistral-Large-4-1T-A52B-UD-IQ1_S-00001-of-00006.gguf}
+DSPARK=${BLOOMERY_REF_DSPARK:-/models/Mistral-Large-4-1T-A52B-UD-IQ1_S/dspark-Mistral-Large-4-1T-A52B-Q8_0.gguf}

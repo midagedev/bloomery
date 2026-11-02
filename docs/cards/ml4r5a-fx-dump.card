@@ -1,0 +1,19 @@
+# The Mistral Large 4 gate fixture's CPU node dumps (five real layers on a mini of hidden 1024 and all 128 experts x 256, IQ1_S and
+# IQ2_XXS stacks, 494 MB of tensor data in one shard [measured: fixture plan], /models/fixtures/mistrallarge4-e128),
+# `BLOOMERY_TIER=fixture just dump-ref-mistrallarge4`: the two prompts of the real file's dump (18 and 42 ids) from ONE load, into
+# fx_ref_mistrallarge4e128_{a,b}. The phases run one after the other.
+# Predicted wall [derived], seconds:
+#   load      0.5 GB from the page cache (written minutes before), nothing repacked on this AVX2 CPU (IQ1_S, IQ2_XXS, Q6_K, Q8_0): 1-2 s
+#   prefill   60 ids x 2 x ~0.25 G MACs (five layers of ~15 M MACs: the MLA and indexer projections at 1024, the top-4 of 128 experts at
+#             256 x 1024 x 3, the shared expert, the router 1024 x 128; the head 1024 x 204,800 = 0.21 G MACs on every row) = ~30 GFLOP
+#             at an effective 0.5-1.0 TFLOP/s: 1-3 s
+#   greedy    64 tokens reading ~0.2 GB a token (the head's Q6_K rows dominate) over ~120 GB/s: 1 s
+#   writes    a's and b's taps (the router's 128-wide probs and logits are the widest rows): under 1 s
+#   total     4-8 s, bound 1800 s.
+# What the run guarantees: CUDA hidden, the CPU lease held, the staging set installed only when each prompt's manifest carries its
+# `# complete` trailer.
+kind: exclusive
+reason: mistrallarge4_dump runs mainline llama.cpp on 32 CPU threads; beside a timed run or a gate batch it would take their cores,
+  so it holds the lease; why now: the 128-expert fixture's oracle sets gate_mistrallarge4_e2e reads, which the old 16-expert sets no
+  longer match (round ml4r5a)
+minutes: 1..2

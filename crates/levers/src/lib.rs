@@ -565,8 +565,8 @@ pub(crate) struct InPlace {
 ///
 /// A lever that several model families parse is Runtime only when every
 /// family that parses it has the setter: `BLOOMERY_PREFILL_GROUP` is Load
-/// today — the `set_prefill_group` of GLM-5.3 and MiMo-V2.6-Flash beside a
-/// V4.1 load that fixes it.
+/// today — the `set_prefill_group` of GLM-5.3, MiMo-V2.6-Flash, MiniMax-M3 and
+/// Mistral Large 4 beside a V4.1 load that fixes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Phase {
     /// The effect is fixed when the model is loaded or the process starts.
@@ -1172,8 +1172,9 @@ impl Levers {
         Levers::defaulted(PREFILL, self.word(PREFILL))
     }
 
-    /// `BLOOMERY_PREFILL_GROUP`: batches a V4.1, GLM-5.3 or MiMo-V2.6-Flash
-    /// prompt group holds, 1 to [`PREFILL_GROUP_MAX`].
+    /// `BLOOMERY_PREFILL_GROUP`: batches a V4.1, GLM-5.3, MiMo-V2.6-Flash,
+    /// MiniMax-M3 or Mistral Large 4 prompt group holds, 1 to
+    /// [`PREFILL_GROUP_MAX`].
     #[must_use]
     pub fn prefill_group(&self) -> usize {
         let n = Levers::defaulted(PREFILL_GROUP, self.count(PREFILL_GROUP));

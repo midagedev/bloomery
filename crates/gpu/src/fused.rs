@@ -2,7 +2,8 @@
 //! to the eight-launch op path, plus the two attention-chain fusions built
 //! on the same rule — `norm_quant`'s f32 side-output (the norm's two
 //! consumers from one launch) and the MLA key path's `rope + rms_norm +
-//! gather + kv_append` as one launch.
+//! gather + kv_append` as one launch, which has a rows form for a prompt's
+//! tokens: block `r` is the one-row body at its own row, table and position.
 
 use crate::GpuError;
 use crate::cores::q3k_row_dot;
@@ -56,6 +57,181 @@ const NORM_QUANT_WARPS: usize = NORM_QUANT_THREADS / 32;
 // The sum of squares runs on the block's first RMS_THREADS threads; the
 // kernel's `launch_bounds` and `launch_contract` spell the width out.
 const _: () = assert!(NORM_QUANT_THREADS >= RMS_THREADS && NORM_QUANT_THREADS == 1024);
+
+/// The MLA key path's body for one row, written once and expanded by
+/// [`fused_kernels::kv_norm_rope_append`] (row 0 of a one-row launch) and
+/// [`fused_kernels::kv_norm_rope_append_rows`] (row `r` in block `r`): the
+/// latent norm, the rope of the tail, the `[k_rope | kv_compressed]`
+/// permutation and the f16 cache append, in the order the one-row entry
+/// documents. A macro, not a function: the body holds the block's shared sum
+/// and its `sync_threads`, which each entry keeps in its own text as
+/// [`crate::mma_segment_walk`] does.
+///
+/// Arguments: the kernel's own buffers and scalars by name (`kv_a`, `gain`,
+/// `cs`, `eps`, `latent`, `rope`, `dst_rows`, `kv_s`, `kvr`, `cache`,
+/// `fault`); `row`, the row of `kv_a`, `cs`, `kv_s` and `kvr` the block owns
+/// (`kv_a`, `kv_s` and `kvr` rows are `latent + rope` wide, `cs` rows `rope`);
+/// `pos`, the cache row to append, evaluated once the norm's scale is known
+/// and outside any `unsafe` block, so a device load in it keeps its own
+/// `SAFETY`.
+///
+/// The expansion's `unsafe` blocks rest on the caller's contract: the launch
+/// contract bounds `kv_a`, `kv_s` and `kvr` at `(row + 1) · (latent + rope)`,
+/// `cs` at `(row + 1) · rope`, `gain` at `latent` and `cache` at `dst_rows ·
+/// (latent + rope)`; the block is [`RMS_THREADS`] threads and the only one
+/// that owns `row`; every thread of the block runs the expansion, which holds
+/// a barrier. `latent` is a positive multiple of 32 and `rope` even and at
+/// most `2 · RMS_THREADS` (the launcher checks both).
+macro_rules! kv_norm_rope_row {
+    (
+        kv_a: $kv_a:ident,
+        gain: $gain:ident,
+        cs: $cs:ident,
+        eps: $eps:ident,
+        latent: $latent:ident,
+        rope: $rope:ident,
+        dst_rows: $dst_rows:ident,
+        kv_s: $kv_s:ident,
+        kvr: $kvr:ident,
+        cache: $cache:ident,
+        fault: $fault:ident,
+        row: $row:expr,
+        pos: $pos:expr $(,)?
+    ) => {{
+        static mut WSUM: SharedArray<f32, RMS_WARPS> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x() as usize;
+        let lane = warp::lane_id() as usize;
+        let k = $latent as usize;
+        let nd = $rope as usize;
+        let width = k + nd;
+        let row: usize = $row;
+        // The row's first value in the f32 buffers, and its rope table.
+        let base = row * width;
+        let cbase = row * nd;
+
+        // Phase A: `elem::rms_norm`'s sum of squares over the latent head.
+        // SAFETY: WSUM is this block's own shared allocation; the raw form is
+        // the only way to reach it without a reference to a `static mut`.
+        // Every access is below RMS_WARPS and ordered by `sync_threads`.
+        let ws = unsafe { SharedArray::as_raw_mut_ptr(&raw mut WSUM) };
+        // SAFETY: base + latent <= (row + 1) * (latent + rope) <=
+        // kv_a.len() (the caller's contract); tid < RMS_THREADS, the
+        // contract's exact block width.
+        let part = warp::reduce_sum_f32(unsafe { rms_partial_sq($kv_a, base, k, tid) });
+        if lane == 0 {
+            // SAFETY: tid / 32 < RMS_WARPS; one lane per warp writes its slot.
+            unsafe {
+                *ws.add(tid / 32) = part;
+            }
+        }
+        thread::sync_threads();
+        // SAFETY: every slot was written above and is visible past the
+        // barrier.
+        let sums = unsafe {
+            [
+                *ws.add(0),
+                *ws.add(1),
+                *ws.add(2),
+                *ws.add(3),
+                *ws.add(4),
+                *ws.add(5),
+                *ws.add(6),
+                *ws.add(7),
+            ]
+        };
+        // A latent whose sum of squares is not finite (non-finite values, or
+        // finite ones whose squares overflow the sum) raises, as
+        // `elem::rms_norm` does, and leaves NaN in `kv_s`, `kvr` and the
+        // cache row, not the zeros an infinite sum would scale them to.
+        let scale = rms_scale_checked(rms_warp_tree(sums), $latent, $eps, $fault, tid == 0);
+
+        let pos: usize = $pos;
+        // The append's own bound: `pos` comes from device memory, so a row
+        // at or past the cache's height is refused, not clamped. Row
+        // uniform — every thread reads the same slot.
+        let live = pos < $dst_rows as usize;
+        if !live && tid == 0 {
+            $fault.raise(FaultSite::CachePos);
+        }
+        let crow = pos * width;
+
+        // The latent half, on `elem::rms_norm`'s own loop order. Each value
+        // lands in `kv_s` (the norm's output), at `kvr`'s permuted slot and,
+        // rounded once, in the cache row.
+        let mut not_finite = false;
+        let mut past_f16 = false;
+        let mut it = tid;
+        while it < k {
+            // SAFETY: it < k bounds the gain and kv_a reads by the caller's
+            // contract; the kv_s slot is base + it < (row + 1) * width <=
+            // kv_s.len(), the kvr slot is base + nd + it < (row + 1) * width
+            // <= kvr.len(), and the cache slot is crow + nd + it < (pos + 1) *
+            // width <= dst_rows * width <= cache.len() because `live` bounds
+            // pos below dst_rows. Each slot is this thread's alone: `it` is
+            // its own stride of the block that owns the row.
+            unsafe {
+                let g = *$gain.get_unchecked(it);
+                let v = *$kv_a.get_unchecked(base + it);
+                let nv = (scale * g) * v;
+                *$kv_s.get_unchecked_mut(base + it) = nv;
+                *$kvr.get_unchecked_mut(base + nd + it) = nv;
+                not_finite |= !nv.is_finite();
+                if live {
+                    let h = f32_to_f16_bits(nv);
+                    *$cache.get_unchecked_mut(crow + nd + it) = h;
+                    past_f16 |= nv.is_finite() & !f16_finite(h);
+                }
+            }
+            it += RMS_THREADS;
+        }
+
+        // The rope tail: one thread per pair of the last 64-value column,
+        // which `elem::rope` addresses as column `width/nd - 1` of the row's
+        // token — so its cos/sin slots are `cs[d]`, `cs[d + 1]` of the row's
+        // table.
+        if 2 * tid < nd {
+            let d = 2 * tid;
+            // SAFETY: d + 1 < nd, so the kv_a reads stay below base + k + nd
+            // <= kv_a.len(), the cs reads below cbase + nd <= cs.len(), the
+            // kv_s slots below base + width <= kv_s.len(), the kvr slots
+            // below base + nd <= kvr.len(), and the cache slots below (pos +
+            // 1) * width <= cache.len() under `live`; the pair is this
+            // thread's alone in the block that owns the row.
+            unsafe {
+                let x0 = *$kv_a.get_unchecked(base + k + d);
+                let x1 = *$kv_a.get_unchecked(base + k + d + 1);
+                let c = *$cs.get_unchecked(cbase + d);
+                let s = *$cs.get_unchecked(cbase + d + 1);
+                let (y0, y1) = rope_pair_core(x0, x1, c, s);
+                *$kv_s.get_unchecked_mut(base + k + d) = y0;
+                *$kv_s.get_unchecked_mut(base + k + d + 1) = y1;
+                *$kvr.get_unchecked_mut(base + d) = y0;
+                *$kvr.get_unchecked_mut(base + d + 1) = y1;
+                let (finite0, finite1) = (y0.is_finite(), y1.is_finite());
+                not_finite |= !(finite0 & finite1);
+                if live {
+                    let (h0, h1) = (f32_to_f16_bits(y0), f32_to_f16_bits(y1));
+                    *$cache.get_unchecked_mut(crow + d) = h0;
+                    *$cache.get_unchecked_mut(crow + d + 1) = h1;
+                    // Per value: a pair with one value past f32 and the other
+                    // finite past f16 raises both sites.
+                    past_f16 |= (finite0 & !f16_finite(h0)) | (finite1 & !f16_finite(h1));
+                }
+            }
+        }
+
+        // Every value is written as computed; one that is not finite, or a
+        // finite one the cache's f16 cannot hold, is named, never left to
+        // read as a plausible key.
+        if not_finite {
+            $fault.raise(FaultSite::F32Product);
+        }
+        if past_f16 {
+            $fault.raise(FaultSite::CacheValue);
+        }
+    }};
+}
 
 #[cuda_module]
 mod fused_kernels {
@@ -311,8 +487,6 @@ mod fused_kernels {
         mut cache: DisjointSlice<u16>,
         fault: FaultSink,
     ) {
-        static mut WSUM: SharedArray<f32, RMS_WARPS> = SharedArray::UNINIT;
-
         // One block: the kernel has no row index — every block would write the
         // same `kv_s`, `kvr` and cache cells. The launcher's grid is exactly 1,
         // so this fires only on a larger grid, whose extra blocks it keeps off
@@ -320,131 +494,91 @@ mod fused_kernels {
         if thread::blockIdx_x() != 0 {
             return;
         }
-        let tid = thread::threadIdx_x() as usize;
-        let lane = warp::lane_id() as usize;
-        let k = latent as usize;
-        let nd = rope as usize;
-        let width = k + nd;
-
-        // Phase A: `elem::rms_norm`'s sum of squares over the latent head.
-        // SAFETY: WSUM is this block's own shared allocation; the raw form is
-        // the only way to reach it without a reference to a `static mut`.
-        // Every access is below RMS_WARPS and ordered by `sync_threads`.
-        let ws = unsafe { SharedArray::as_raw_mut_ptr(&raw mut WSUM) };
-        // SAFETY: 0 + latent <= latent + rope <= kv_a.len() (the
-        // launcher-checked `requires`); tid < RMS_THREADS, the contract's
-        // exact block width.
-        let part = warp::reduce_sum_f32(unsafe { rms_partial_sq(kv_a, 0, k, tid) });
-        if lane == 0 {
-            // SAFETY: tid / 32 < RMS_WARPS; one lane per warp writes its slot.
-            unsafe {
-                *ws.add(tid / 32) = part;
-            }
+        kv_norm_rope_row! {
+            kv_a: kv_a,
+            gain: gain,
+            cs: cs,
+            eps: eps,
+            latent: latent,
+            rope: rope,
+            dst_rows: dst_rows,
+            kv_s: kv_s,
+            kvr: kvr,
+            cache: cache,
+            fault: fault,
+            row: 0usize,
+            // SAFETY: pos_buf.len() >= 1 by the launch contract.
+            pos: unsafe { *pos_buf.get_unchecked(0) } as usize,
         }
-        thread::sync_threads();
-        // SAFETY: every slot was written above and is visible past the
-        // barrier.
-        let sums = unsafe {
-            [
-                *ws.add(0),
-                *ws.add(1),
-                *ws.add(2),
-                *ws.add(3),
-                *ws.add(4),
-                *ws.add(5),
-                *ws.add(6),
-                *ws.add(7),
-            ]
-        };
-        // A latent whose sum of squares is not finite (non-finite values, or
-        // finite ones whose squares overflow the sum) raises, as
-        // `elem::rms_norm` does, and leaves NaN in `kv_s`, `kvr` and the
-        // cache row, not the zeros an infinite sum would scale them to.
-        let scale = rms_scale_checked(rms_warp_tree(sums), latent, eps, fault, tid == 0);
+    }
 
-        // SAFETY: pos_buf.len() >= 1 by the launch contract.
-        let pos = unsafe { *pos_buf.get_unchecked(0) } as usize;
-        // The append's own bound: `pos` comes from device memory, so a row
-        // at or past the cache's height is refused, not clamped. Launch
-        // uniform — every thread reads the same slot.
-        let live = pos < dst_rows as usize;
-        if !live && tid == 0 {
-            fault.raise(FaultSite::CachePos);
+    /// [`kv_norm_rope_append`] over `rows` tokens in one launch: block `r` is
+    /// that kernel's body — the same macro, so the same statements in the
+    /// same order — on row `r` of `kv_a` (`rows` rows of `latent + rope` f32,
+    /// token-major), with its own rope table `cs[r·rope ..]` and its own
+    /// cache row `pos_buf[r]`, writing row `r` of `kv_s` and `kvr`. A row's
+    /// outputs are therefore the one-row launch's bits at that row's input
+    /// and position, whatever the other rows hold. A position at or past the
+    /// cache's height refuses that row alone, as the one-row entry does
+    /// ([`FaultSite::CachePos`], no cache row written, the norm's outputs
+    /// still written); the rows of one launch land in distinct cache rows
+    /// (the caller's positions), since two blocks writing one row would race.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            kv_a.len() >= rows * (latent + rope),
+            gain.len() >= latent,
+            cs.len() >= rows * rope,
+            pos_buf.len() >= rows,
+            kv_s.len() >= rows * (latent + rope),
+            kvr.len() >= rows * (latent + rope),
+            cache.len() >= dst_rows * (latent + rope)
+        )
+    )]
+    pub fn kv_norm_rope_append_rows(
+        kv_a: &[f32],
+        gain: &[f32],
+        cs: &[f32],
+        pos_buf: &[u32],
+        eps: f32,
+        latent: u32,
+        rope: u32,
+        rows: u32,
+        dst_rows: u32,
+        mut kv_s: DisjointSlice<f32>,
+        mut kvr: DisjointSlice<f32>,
+        mut cache: DisjointSlice<u16>,
+        fault: FaultSink,
+    ) {
+        // Block `r` owns row `r`. A block past the rows leaves before any
+        // access or barrier, block-uniform.
+        let r = thread::blockIdx_x() as usize;
+        if r >= rows as usize {
+            return;
         }
-        let crow = pos * width;
-
-        // The latent half, on `elem::rms_norm`'s own loop order. Each value
-        // lands in `kv_s` (the norm's output), at `kvr`'s permuted slot and,
-        // rounded once, in the cache row.
-        let mut not_finite = false;
-        let mut past_f16 = false;
-        let mut it = tid;
-        while it < k {
-            // SAFETY: it < k bounds the gain and kv_a reads by the contract;
-            // the kv_s slot is it < k < width <= kv_s.len(), the kvr slot is
-            // nd + it < width <= kvr.len(), and the cache slot is
-            // crow + nd + it < (pos + 1) * width <= dst_rows * width <=
-            // cache.len() because `live` bounds pos below dst_rows. Each slot
-            // is this thread's alone: `it` is its own stride of the grid's one
-            // block (the guard above).
-            unsafe {
-                let g = *gain.get_unchecked(it);
-                let v = *kv_a.get_unchecked(it);
-                let nv = (scale * g) * v;
-                *kv_s.get_unchecked_mut(it) = nv;
-                *kvr.get_unchecked_mut(nd + it) = nv;
-                not_finite |= !nv.is_finite();
-                if live {
-                    let h = f32_to_f16_bits(nv);
-                    *cache.get_unchecked_mut(crow + nd + it) = h;
-                    past_f16 |= nv.is_finite() & !f16_finite(h);
-                }
-            }
-            it += RMS_THREADS;
-        }
-
-        // The rope tail: one thread per pair of the last 64-value column,
-        // which `elem::rope` addresses as column `width/nd - 1` of token 0 —
-        // so its cos/sin slots are `cs[d]`, `cs[d + 1]`.
-        if 2 * tid < nd {
-            let d = 2 * tid;
-            // SAFETY: d + 1 < nd, so the kv_a reads stay below k + nd <=
-            // kv_a.len(), the cs reads below nd <= cs.len(), the kv_s slots
-            // below width, the kvr slots below nd <= width, and the cache
-            // slots below (pos + 1) * width <= cache.len() under `live`; the
-            // pair is this thread's alone in the grid's one block (the guard
-            // above).
-            unsafe {
-                let x0 = *kv_a.get_unchecked(k + d);
-                let x1 = *kv_a.get_unchecked(k + d + 1);
-                let c = *cs.get_unchecked(d);
-                let s = *cs.get_unchecked(d + 1);
-                let (y0, y1) = rope_pair_core(x0, x1, c, s);
-                *kv_s.get_unchecked_mut(k + d) = y0;
-                *kv_s.get_unchecked_mut(k + d + 1) = y1;
-                *kvr.get_unchecked_mut(d) = y0;
-                *kvr.get_unchecked_mut(d + 1) = y1;
-                let (finite0, finite1) = (y0.is_finite(), y1.is_finite());
-                not_finite |= !(finite0 & finite1);
-                if live {
-                    let (h0, h1) = (f32_to_f16_bits(y0), f32_to_f16_bits(y1));
-                    *cache.get_unchecked_mut(crow + d) = h0;
-                    *cache.get_unchecked_mut(crow + d + 1) = h1;
-                    // Per value: a pair with one value past f32 and the other
-                    // finite past f16 raises both sites.
-                    past_f16 |= (finite0 & !f16_finite(h0)) | (finite1 & !f16_finite(h1));
-                }
-            }
-        }
-
-        // Every value is written as computed; one that is not finite, or a
-        // finite one the cache's f16 cannot hold, is named, never left to
-        // read as a plausible key.
-        if not_finite {
-            fault.raise(FaultSite::F32Product);
-        }
-        if past_f16 {
-            fault.raise(FaultSite::CacheValue);
+        kv_norm_rope_row! {
+            kv_a: kv_a,
+            gain: gain,
+            cs: cs,
+            eps: eps,
+            latent: latent,
+            rope: rope,
+            dst_rows: dst_rows,
+            kv_s: kv_s,
+            kvr: kvr,
+            cache: cache,
+            fault: fault,
+            row: r,
+            // SAFETY: r < rows <= pos_buf.len() by the guard above and the
+            // launch contract.
+            pos: unsafe { *pos_buf.get_unchecked(r) } as usize,
         }
     }
 
@@ -579,6 +713,90 @@ mod fused_kernels {
     }
 }
 
+/// What the buffers of one key-path launch hold, as [`check_key_path`] reads
+/// them: lengths in elements, and the cache's row width.
+struct KeyLens {
+    kv_a: usize,
+    gain: usize,
+    cs: usize,
+    pos: usize,
+    kv_s: usize,
+    kvr: usize,
+    cache_cols: usize,
+}
+
+/// The shape checks of both key-path launchers, for `rows` rows of one launch
+/// at `(latent, rope)`: the norm's and the rope tail's geometry, the cache's
+/// row width, and every buffer holding its `rows` rows.
+fn check_key_path(
+    what: &'static str,
+    lens: &KeyLens,
+    (latent, rope): (usize, usize),
+    rows: usize,
+) -> Result<(), GpuError> {
+    let width = latent + rope;
+    if latent == 0 || !latent.is_multiple_of(32) {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "the norm's geometry needs a positive multiple of \
+                 32, got latent {latent}"
+            ),
+        ));
+    }
+    if rope < 2 || !rope.is_multiple_of(2) || rope > 2 * RMS_THREADS {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "the rope tail is one pair per thread of the one \
+                 {RMS_THREADS}-thread block, so rope must be even and at most {}, got {rope}",
+                2 * RMS_THREADS
+            ),
+        ));
+    }
+    if lens.cache_cols != width {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "cache rows are {} wide, the kvr row is \
+                 latent + rope = {width}",
+                lens.cache_cols
+            ),
+        ));
+    }
+    if lens.kv_a < rows * width || lens.gain < latent || lens.cs < rows * rope {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "kv_a.len() {} (need {}), gain.len() {} \
+                 (need {latent}), cs.len() {} (need {})",
+                lens.kv_a,
+                rows * width,
+                lens.gain,
+                lens.cs,
+                rows * rope
+            ),
+        ));
+    }
+    if lens.kv_s < rows * width || lens.kvr < rows * width {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "kv_s.len() {} and kvr.len() {} vs {rows} rows of width \
+                 {width}",
+                lens.kv_s, lens.kvr
+            ),
+        ));
+    }
+    if lens.pos < rows {
+        return Err(GpuError::shape(
+            what,
+            format!("pos_buf must hold {rows} u32"),
+        ));
+    }
+    Ok(())
+}
+
 /// The loaded P0b device module and its enqueue API. Owns no context and no
 /// stream — every enqueue takes the engine stream (`Gpu::stream()`), so
 /// launches order with the rest of the step and are capturable.
@@ -702,65 +920,20 @@ impl FusedKernels {
         cache: &mut DeviceTensor<u16>,
         fault: FaultSink,
     ) -> Result<(), GpuError> {
-        let width = latent + rope;
-        if latent == 0 || !latent.is_multiple_of(32) {
-            return Err(GpuError::shape(
-                "enqueue_kv_norm_rope_append",
-                format!(
-                    "the norm's geometry needs a positive multiple of \
-                 32, got latent {latent}"
-                ),
-            ));
-        }
-        if rope < 2 || !rope.is_multiple_of(2) || rope > 2 * RMS_THREADS {
-            return Err(GpuError::shape(
-                "enqueue_kv_norm_rope_append",
-                format!(
-                    "the rope tail is one pair per thread of the one \
-                 {RMS_THREADS}-thread block, so rope must be even and at most {}, got {rope}",
-                    2 * RMS_THREADS
-                ),
-            ));
-        }
-        if cache.cols() != width {
-            return Err(GpuError::shape(
-                "enqueue_kv_norm_rope_append",
-                format!(
-                    "cache rows are {} wide, the kvr row is \
-                 latent + rope = {width}",
-                    cache.cols()
-                ),
-            ));
-        }
-        if kv_a.len() < width || gain.len() < latent || cs.len() < rope {
-            return Err(GpuError::shape(
-                "enqueue_kv_norm_rope_append",
-                format!(
-                    "kv_a.len() {} (need {width}), gain.len() {} \
-                 (need {latent}), cs.len() {} (need {rope})",
-                    kv_a.len(),
-                    gain.len(),
-                    cs.len()
-                ),
-            ));
-        }
-        if kv_s.len() < width || kvr.len() < width {
-            return Err(GpuError::shape(
-                "enqueue_kv_norm_rope_append",
-                format!(
-                    "kv_s.len() {} and kvr.len() {} vs the row width \
-                 {width}",
-                    kv_s.len(),
-                    kvr.len()
-                ),
-            ));
-        }
-        if pos_buf.is_empty() {
-            return Err(GpuError::shape(
-                "enqueue_kv_norm_rope_append",
-                "pos_buf must hold 1 u32",
-            ));
-        }
+        check_key_path(
+            "enqueue_kv_norm_rope_append",
+            &KeyLens {
+                kv_a: kv_a.len(),
+                gain: gain.len(),
+                cs: cs.len(),
+                pos: pos_buf.len(),
+                kv_s: kv_s.len(),
+                kvr: kvr.len(),
+                cache_cols: cache.cols(),
+            },
+            (latent, rope),
+            1,
+        )?;
         let what = "enqueue_kv_norm_rope_append";
         let latent = launch_u32(what, "latent", latent)?;
         let rope = launch_u32(what, "rope", rope)?;
@@ -779,6 +952,80 @@ impl FusedKernels {
             latent,
             rope,
             rows,
+            kv_s,
+            kvr,
+            cache.buf_mut(),
+            fault,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue the MLA key path of `rows` tokens as one launch: row `r` of
+    /// `kv_a` (`rows` rows of `latent + rope` f32, token-major) normed,
+    /// roped by its own table `cs[r·rope ..]` and appended at its own row
+    /// `pos_buf[r]` of `cache`, into row `r` of `kv_s` and `kvr` — each row
+    /// the bits [`FusedKernels::enqueue_kv_norm_rope_append`] writes for that
+    /// row's input and position. `cache` rows are `latent + rope` wide; a
+    /// position at or past its height refuses that row alone (no cache row
+    /// written, [`FaultSite::CachePos`] on `fault`), and the positions of one
+    /// launch must be distinct. Asynchronous, allocation-free, capturable.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "host launcher; folding these into a *Args struct is the R8 round"
+    )]
+    pub fn enqueue_kv_norm_rope_append_rows(
+        &self,
+        stream: &CudaStream,
+        kv_a: &DeviceBuffer<f32>,
+        gain: &DeviceBuffer<f32>,
+        cs: &DeviceBuffer<f32>,
+        pos_buf: &DeviceBuffer<u32>,
+        eps: f32,
+        latent: usize,
+        rope: usize,
+        rows: usize,
+        kv_s: &mut DeviceBuffer<f32>,
+        kvr: &mut DeviceBuffer<f32>,
+        cache: &mut DeviceTensor<u16>,
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_kv_norm_rope_append_rows";
+        if rows == 0 {
+            return Err(GpuError::shape(what, "need rows >= 1"));
+        }
+        check_key_path(
+            what,
+            &KeyLens {
+                kv_a: kv_a.len(),
+                gain: gain.len(),
+                cs: cs.len(),
+                pos: pos_buf.len(),
+                kv_s: kv_s.len(),
+                kvr: kvr.len(),
+                cache_cols: cache.cols(),
+            },
+            (latent, rope),
+            rows,
+        )?;
+        let latent = launch_u32(what, "latent", latent)?;
+        let rope = launch_u32(what, "rope", rope)?;
+        let rows = launch_u32(what, "rows", rows)?;
+        let dst_rows = launch_u32(what, "cache.rows()", cache.rows())?;
+        let prep = self
+            .module
+            .prepare_kv_norm_rope_append_rows(LaunchConfig1D::new(rows, RMS_THREADS_U32, 0))?;
+        self.module.kv_norm_rope_append_rows(
+            stream,
+            &prep,
+            kv_a,
+            gain,
+            cs,
+            pos_buf,
+            eps,
+            latent,
+            rope,
+            rows,
+            dst_rows,
             kv_s,
             kvr,
             cache.buf_mut(),

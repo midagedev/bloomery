@@ -1,0 +1,32 @@
+The capital of France is
+Once upon a time, in a small village by the sea, there lived an old fisherman who
+The three laws of thermodynamics can be summarized as follows:
+def fibonacci(n):\n    """Return the n-th Fibonacci number."""\n
+#include <stdio.h>\n\nint main(void) {\n
+In 1969, Neil Armstrong became the first person to
+The quick brown fox jumps over the lazy dog. The quick brown fox
+Here is a list of the planets in our solar system, in order from the sun: Mercury, Venus,
+fn main() {\n    let v: Vec<u32> = (0..10).collect();\n
+Photosynthesis is the process by which green plants
+The French Revolution began in 1789 and led to
+SELECT name, COUNT(*) FROM orders GROUP BY name ORDER BY
+To make a simple tomato sauce, first heat olive oil in a pan, then
+The derivative of x squared with respect to x is
+Machine learning models are trained by minimizing a loss function, which
+Paris, London, Berlin, Madrid, Rome, Vienna,
+The mitochondria is often called the powerhouse of the cell because
+import numpy as np\n\nx = np.linspace(0, 1, 100)\ny =
+Water boils at 100 degrees Celsius at sea level, but at higher altitudes
+The Great Wall of China was built over many centuries to
+Dear hiring manager, I am writing to apply for the position of
+1, 2, 3, 5, 8, 13, 21, 34,
+The theory of general relativity, published by Albert Einstein in 1915,
+class Stack:\n    def __init__(self):\n        self.items = []\n
+The best way to learn a new language is to
+Shakespeare wrote many plays, including Hamlet, Macbeth, and
+The stock market fell sharply on Monday after
+In the beginning God created the heaven and the earth. And the earth was
+Rust's ownership model guarantees memory safety without a garbage collector by
+The recipe calls for two cups of flour, one cup of sugar, and
+A binary search tree is a data structure in which each node
+서울은 대한민국의 수도이며,

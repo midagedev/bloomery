@@ -7,8 +7,9 @@
 //! What every projector type does the same way has one owner here, and a module holds its tables
 //! as data: [`header`] (the key checks and their refusals), [`naming`] (the tensor-name scheme)
 //! and [`table`] (the tensor table and the check of a file against it). The tower's bytes on its
-//! card take one shape ([`card::CardBytes`]), and the narrowing of a tensor to bf16 on upload one
-//! rule ([`narrow`]). [`open`] picks the module by projector type.
+//! card take one shape ([`card::CardBytes`]), the narrowing of a tensor to bf16 on upload one rule
+//! ([`narrow`]), and the K order of a 2×2 merger built as a GEMM over `im2col` rows one rule
+//! ([`merger`]). [`open`] picks the module by projector type.
 //! [`gemma4a`] owns the host preprocessing of decoded audio; it opens no encoder file.
 
 pub mod card;
@@ -17,9 +18,11 @@ pub mod gemma4a;
 pub mod gemma4v;
 pub mod glm5v;
 pub(crate) mod header;
+pub mod merger;
 pub mod minicpmv;
 pub(crate) mod naming;
 pub mod narrow;
+pub mod pixtral;
 pub mod qwen3vl;
 pub mod radio;
 pub mod table;
@@ -42,10 +45,11 @@ pub type Opened = (CardBytes, Arc<dyn MediaModel + Send + Sync>);
 /// Open an encoder file by its projector type: read the header, refuse by name any value or
 /// projector this crate does not run, and state the tower's bytes on its card and the model's
 /// image input. `limits` bound an image's tokens for the projectors whose plan they steer
-/// (`qwen3vl_merger`, `glm5v`, `nemotron_omni`); V4.1's plan is the file's own. A caller with no
-/// limit given takes them from the projector: [`TokenLimits::DEFAULT`] for `qwen3vl_merger`, the
-/// file's own budget ([`glm5v::Hparams::default_limits`], [`radio::Hparams::default_limits`]) for
-/// `glm5v` and `nemotron_omni`.
+/// (`qwen3vl_merger`, `glm5v`, `nemotron_omni`, `pixtral`); V4.1's plan is the file's own. A
+/// caller with no limit given takes them from the projector: [`TokenLimits::DEFAULT`] for
+/// `qwen3vl_merger`, the file's own budget ([`glm5v::Hparams::default_limits`],
+/// [`radio::Hparams::default_limits`]) for `glm5v` and `nemotron_omni`, mtmd's
+/// ([`pixtral::Hparams::default_limits`]) for `pixtral`.
 ///
 /// A `minicpmv4_7` file is read (its header refused by name when it is not the one this crate
 /// runs) and then refused: its group's ids come from the text model's tokenizer, which the
@@ -87,6 +91,11 @@ pub fn open(file: &Gguf, limits: TokenLimits) -> Result<Opened, VisionError> {
             let media = radio::Media::new(hp.size_rule(limits)?, hp.stats);
             Ok((radio::card::of(&hp, limits), Arc::new(media)))
         }
+        Projector::Pixtral => {
+            let hp = pixtral::Hparams::read(file)?;
+            let media = pixtral::Media::new(hp.size_rule(limits)?, hp.stats);
+            Ok((pixtral::card::of(&hp, limits), Arc::new(media)))
+        }
         Projector::Minicpmv47 => {
             minicpmv::Hparams::read(file)?;
             Err(refusal(
@@ -124,6 +133,7 @@ enum Projector {
     Qwen3vl,
     Minicpmv47,
     NemotronOmni,
+    Pixtral,
 }
 
 /// The file's `clip.projector_type`, refused by name when it is a tower this crate does not run.
@@ -136,15 +146,17 @@ fn projector(m: &impl Meta) -> Result<Projector, VisionError> {
         Some(qwen3vl::PROJECTOR_TYPE) => Ok(Projector::Qwen3vl),
         Some(minicpmv::PROJECTOR_TYPE) => Ok(Projector::Minicpmv47),
         Some(radio::PROJECTOR_TYPE) => Ok(Projector::NemotronOmni),
+        Some(pixtral::PROJECTOR_TYPE) => Ok(Projector::Pixtral),
         Some(other) => Err(refusal(
             KEY_PROJECTOR,
             format!(
-                "is \"{other}\"; this crate reads \"{}\", \"{}\", \"{}\", \"{}\", \"{}\" and \"{}\"",
+                "is \"{other}\"; this crate reads \"{}\", \"{}\", \"{}\", \"{}\", \"{}\", \"{}\" and \"{}\"",
                 deepseek41v::PROJECTOR_TYPE,
                 gemma4v::PROJECTOR_TYPE,
                 glm5v::PROJECTOR_TYPE,
                 minicpmv::PROJECTOR_TYPE,
                 radio::PROJECTOR_TYPE,
+                pixtral::PROJECTOR_TYPE,
                 qwen3vl::PROJECTOR_TYPE
             ),
         )),
@@ -195,11 +207,12 @@ mod tests {
             projector(&table("nemotron_omni")).unwrap(),
             Projector::NemotronOmni
         );
+        assert_eq!(projector(&table("pixtral")).unwrap(), Projector::Pixtral);
         assert_eq!(
             projector(&table("qwen2vl_merger")).unwrap_err().to_string(),
             "metadata clip.projector_type: is \"qwen2vl_merger\"; this crate reads \
-             \"deepseek41v\", \"gemma4v\", \"glm5v\", \"minicpmv4_7\", \"nemotron_omni\" and \
-             \"qwen3vl_merger\""
+             \"deepseek41v\", \"gemma4v\", \"glm5v\", \"minicpmv4_7\", \"nemotron_omni\", \
+             \"pixtral\" and \"qwen3vl_merger\""
         );
         assert_eq!(
             projector(&clef().with("clip.projector_type", Value::U32(7)))
@@ -263,6 +276,31 @@ mod tests {
             assert_eq!(media.image_token(), Some(18));
             assert_eq!(media.part_join(), PartJoin::LlamaServer);
         }
+    }
+
+    /// Mistral Large 4's file opens to its own card figure at the limits it is opened with, to
+    /// `[IMG]` as its image token and to llama-server's join rule; an image's span is its tokens
+    /// and the break rows between their grid rows.
+    #[test]
+    fn an_ml4_file_opens_to_its_figures() {
+        let limits = |min, max| TokenLimits::new(min, max).expect("limits");
+        let t = crate::arch::pixtral::hparams::tests::ml4();
+        let file = t.write("clip");
+        let hp = crate::arch::pixtral::Hparams::read(&Gguf::open(&file.0).expect("opens"))
+            .expect("read");
+        for max in [1024, 256] {
+            let (card, media) = open_at(&t, "clip", limits(8, max)).expect("open");
+            let want = crate::arch::pixtral::card::of(&hp, limits(8, max));
+            assert_eq!((card.weights, card.scratch), (want.weights, want.scratch));
+            assert_eq!(media.image_token(), Some(10));
+            assert_eq!(media.part_join(), PartJoin::LlamaServer);
+        }
+        let (_, media) = open_at(&t, "clip", limits(8, 1024)).expect("open");
+        let image = crate::Rgb8::filled(448, 448, [90, 120, 30]);
+        assert_eq!(
+            media.prepare(&image).expect("prepare").span_len,
+            16 * 16 + 15
+        );
     }
 
     /// GLM's file opens to its own card figure at the limits it is opened with — the tower's
@@ -356,8 +394,8 @@ mod tests {
         assert_eq!(
             refused(&table("qwen2vl_merger"), "clip"),
             "metadata clip.projector_type: is \"qwen2vl_merger\"; this crate reads \
-             \"deepseek41v\", \"gemma4v\", \"glm5v\", \"minicpmv4_7\", \"nemotron_omni\" and \
-             \"qwen3vl_merger\""
+             \"deepseek41v\", \"gemma4v\", \"glm5v\", \"minicpmv4_7\", \"nemotron_omni\", \
+             \"pixtral\" and \"qwen3vl_merger\""
         );
         assert!(refused(&table("qwen3vl_merger"), "llama").starts_with("metadata architecture:"));
         let huge = TokenLimits::new(16, 3_000_000).expect("limits");

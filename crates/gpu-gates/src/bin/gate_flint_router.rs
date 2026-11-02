@@ -154,6 +154,7 @@ mod gate {
             TOKENS,
             RoutedRows {
                 probs: &mut probs,
+                logits: None,
                 ids: &mut ids,
                 weights: &mut weights,
             },
@@ -282,6 +283,7 @@ mod gate {
                 TOKENS,
                 RoutedRows {
                     probs: &mut probs,
+                    logits: None,
                     ids: &mut ids,
                     weights: &mut weights,
                 },
@@ -349,6 +351,7 @@ mod gate {
             2,
             RoutedRows {
                 probs: &mut probs,
+                logits: None,
                 ids: &mut ids,
                 weights: &mut weights,
             },

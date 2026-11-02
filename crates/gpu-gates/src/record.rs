@@ -2179,6 +2179,44 @@ pub static LISTENING_MUSESPARK: Kind = Kind {
     ],
 };
 
+/// The Mistral Large 4 seat's load.
+pub static LOAD_MISTRALLARGE4: Kind = Kind {
+    name: "load_mistrallarge4",
+    head: "load",
+    doc: "The Mistral Large 4 seat's model on its card: its architecture, resident bytes, the cache rows each slot was loaded with (`ctx`), the resident sequences it holds (`slots`), layers, the routed experts the plan keeps on the host and on the card, the step graph's nodes, how a prompt is fed (`prompt`: `batch`, in batches of rows through the common walk), the batches a prompt group runs layer by layer (`group`: `BLOOMERY_PREFILL_GROUP`, the row's default when unset), `BLOOMERY_PIN_MAIN`'s ask (`pin_main`) and whether the engine thread's pin took (`pinned`), and the load's wall.",
+    parts: &[
+        key("arch", Word, ""),
+        key("resident_bytes", U64, "B"),
+        key("ctx", U64, "positions"),
+        key("slots", U64, ""),
+        key("layers", U64, ""),
+        key("host_experts", U64, "experts"),
+        key("card_experts", U64, "experts"),
+        key("graph_nodes", U64, ""),
+        key("prompt", Word, ""),
+        key("group", U64, "batches"),
+        key("pin_main", Word, ""),
+        key("pinned", Bool, ""),
+        lit(" in "),
+        pos("load_s", F64(1), "s"),
+        lit(" s"),
+    ],
+};
+
+/// The Mistral Large 4 seat's address.
+pub static LISTENING_MISTRALLARGE4: Kind = Kind {
+    name: "listening_mistrallarge4",
+    head: "bloomery-serve-mistrallarge4:",
+    doc: "The Mistral Large 4 seat's placement, the context each slot serves, the slots it serves and the address it listens on.",
+    parts: &[
+        key("place", Word, ""),
+        key("ctx", U64, "positions"),
+        key("slots", U64, ""),
+        lit(" listening on http://"),
+        pos("addr", Word, ""),
+    ],
+};
+
 /// The nemotron_h seat's load.
 pub static LOAD_NEMOTRON: Kind = Kind {
     name: "load_nemotron",
@@ -3232,6 +3270,38 @@ pub static BLOOMERY_SERVE_MUSESPARK: &[&Kind] = kinds![
     groups::host_tier::ARENA,
     groups::host_tier::CENSUS,
     groups::bind::CACHE,
+];
+
+/// What the Mistral Large 4 seat of `bloomery-serve` prints, all on stderr: the
+/// placement and why (`place unset`), a `--hf` repo's resolve lines (printed by
+/// the server before the seat registers), the residency lever's word and why,
+/// the plan, the image encoder's seat under `--mmproj`, the churn pool's share
+/// of the host under `mid`, the `xstream=` line, the load and its phases, the
+/// NVMe tier's record and the tier census, the DSpark draft's load and the lookup's and the
+/// width chooser's records under `BLOOMERY_DRAFT`, the address and each request's note
+/// of the prefix it kept less of than it shared (every store is a plane of
+/// positions, so a cut keeps every held position).
+pub static BLOOMERY_SERVE_MISTRALLARGE4: &[&Kind] = kinds![
+    groups::side_seat::SEAT,
+    groups::tiered::LEVER,
+    &[&PLACE_UNSET],
+    groups::tiered::RUN,
+    groups::residency38::HOST,
+    groups::fetch::FETCH,
+    groups::fetch::SET,
+    groups::vision_seat::RECORDS,
+    &[
+        &LANE,
+        &LOAD_MISTRALLARGE4,
+        &LOAD_PHASES,
+        &LISTENING_MISTRALLARGE4
+    ],
+    groups::host_tier::ARENA,
+    groups::host_tier::CENSUS,
+    groups::bind::CACHE,
+    groups::drafted::PROMPT,
+    groups::drafted::WIDTH,
+    groups::ds41_draft::LOAD,
 ];
 
 /// What the nemotron_h seat of `bloomery-serve` prints, all on stderr: the
@@ -4579,7 +4649,7 @@ mod tests {
             vision_seat,
         };
         type Group = &'static [&'static Kind];
-        let table: [(&str, Group, &[Group]); 18] = [
+        let table: [(&str, Group, &[Group]); 19] = [
             (
                 "ds41 seat: Flags::encoder, Draft::from_levers, print_widths, bind::spawn",
                 BLOOMERY_SERVE_DS41,
@@ -4694,6 +4764,23 @@ mod tests {
                     fetch::FETCH,
                     fetch::SET,
                     bind::CACHE,
+                ],
+            ),
+            (
+                "mistrallarge4 seat: Side::seat, Flags::encoder, MistralLarge4::open, open_dspark, \
+                 ServedDraft, bind::spawn",
+                BLOOMERY_SERVE_MISTRALLARGE4,
+                &[
+                    side_seat::SEAT,
+                    host_tier::ARENA,
+                    host_tier::CENSUS,
+                    fetch::FETCH,
+                    fetch::SET,
+                    vision_seat::RECORDS,
+                    bind::CACHE,
+                    drafted::PROMPT,
+                    drafted::WIDTH,
+                    ds41_draft::LOAD,
                 ],
             ),
             (

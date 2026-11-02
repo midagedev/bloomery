@@ -1,0 +1,27 @@
+# The Mistral Large 4 UD-IQ1_S file's deep node dump (223 GB in six shards,
+# /models/Mistral-Large-4-1T-A52B-UD-IQ1_S), `just dump-ref-mistrallarge4 d3k`: 3,001 ids of the tokenizer oracle's prose,
+# the first 3,000 run as a quiet prefill and the nodes dumped at the one step on the last, position 3,000 (past the indexer's
+# top-k 2,048), into ref_mistrallarge4_d3k. One load; the phases run one after the other. Predicted wall [derived], seconds:
+#   load      223 GB mmapped; six ubatches of 512 ids route to every expert of every layer ((1 - 4/128)^512 = 1e-7 of an
+#             expert unused), so the whole file is read once, from the root drive at ~2-3 GB/s when the page cache holds none
+#             of it (the card of the two-prompt dump: 20-100 s for the ~90 of 128 experts it touches): 75-112 s cold, ~0 when
+#             the UD-IQ1_S dump of the same session left it in the 251 GB box's cache
+#   prefill   3,000 ids at 0.10-0.20 s an id, the CPU-bound rate: the Muse dump's measured ~0.1 s an id for 42B active scaled
+#             to the 52B active of this model (x1.24: 0.124 s), plus the attention at depth (2,048 selected rows of 576 wide
+#             per head, 64 heads, 72 layers: ~14 GFLOP an id averaged over the positions against ~104 GFLOP of weights, on a
+#             ggml CPU flash path less efficient than the matmuls) and the 44 indexer layers' scores (~0.5 GFLOP an id), against
+#             the larger ubatch's better weight reuse: 300-600 s. The weights' DRAM stream (223 GB a ubatch over
+#             ~60-120 GB/s, 2-4 s) sits under the compute, worth 0
+#   step      one token reading ~24 GB over ~57-120 GB/s (0.2-0.4 s), the callback asked for ~20 nodes a layer: 1-3 s
+#   writes    the step's taps, one row a node, plus the indexer's cached-key views (n_kv wide, 44 layers): ~0.3-0.5 GB, 1-2 s
+#   total     5-13 min (the lower sum 301 s rounds up to the card's minute), bound 1800 s, which covers a prefill rate to ~0.45 s
+#             an id after a cold load; the log prints the quiet prefill's wall after each chunk of 2,048 ids.
+# What the run guarantees: CUDA hidden, the CPU lease held, the staging set installed only when its manifest carries the
+# `# complete` trailer, the ids the first 3,001 of the finished tokenizer oracle's prose.nps.ids (the script's sha256 line
+# is their record).
+kind: exclusive
+reason: mistrallarge4_dump runs mainline llama.cpp on 32 CPU threads over a 223 GB mmap for the prefill of 3,000 ids; beside a
+  timed run or a gate batch it would take their cores and their page cache, so it holds the lease; why now: the real tier's
+  deep oracle set, the one the end-to-end gate's selection and node clauses past the top-k 2,048 read (without it the release
+  carries an off cell for the cut)
+minutes: 5..13

@@ -4,6 +4,8 @@
 # Solar-Open2 and MiniMax-M3 oracles share. Sourced by a family's <family>-dump.sh after ref-paths.sh and lease.sh; it only
 # defines functions. The family sets, before calling cb_dump_build or cb_dump_run:
 #   CB_FAMILY   the binary's and the sets' name: $BLOOMERY_DATA/bin/<family>_dump, the sets ref_<family>_<prompt>
+#   CB_SET_FAMILY  optional: the family word of the set names alone (ref_<set family>_<prompt>), for a fixture cut whose sets must not
+#               share a path with the real file's twin or another cut's; the binary and the staging keep CB_FAMILY
 #   CB_ENV      the prefix of its overrides: <ENV>_BIN (the binary), <ENV>_OUT (where the build puts it), <ENV>_THREADS
 #   CB_SCRIPT   its script's file name, as the messages and fixture_dump_tier name it
 #   CB_TREE     the llama.cpp tree the binary links (include/, ggml/include/, build/bin/libllama.so); not rebuilt here, since a
@@ -12,7 +14,9 @@
 #               unset for an unpatched tree, whose tracked files must then be clean and whose library md5 names the build
 #   CB_ARCH     the general.architecture the file must state;  CB_TITLE  the manifest's first comment line
 #   CB_IDS      the directory of the prompts' ids (tools/ref/data/<family>)
-#   CB_PROMPTS  array of name:ids:nodes:greedy, nodes joined by `+` (the graph's cb() names)
+#   CB_PROMPTS  array of name:ids:nodes:greedy[:step], nodes joined by `+` (the graph's cb() names); ids is a file name under CB_IDS
+#               (without `.ids`) or an absolute path of an ids file; a trailing `step` makes it a decode-step prompt (the dumper runs
+#               every id but the last quietly and dumps that one step, tools/ref/cb_dump.cpp)
 #   CB_FLAGS    array of further dumper arguments (-b, -fa)
 # Output of the build: $BLOOMERY_DATA/bin/<family>_dump and <family>_dump.build beside it, the record cb_dump_run compares: the
 # source sha256 (cb_dump.cpp, ref_io.h, ref_tensor_io.h) and the tree's identity (cb_tree_record).
@@ -50,6 +54,11 @@ cb_tree_build() {
   fi
 }
 
+# cb_set_name <prompt>: the set a prompt is installed as, behind the tier's SET_PREFIX (fixture_dump_tier).
+cb_set_name() {
+  printf '%sref_%s_%s' "$SET_PREFIX" "${CB_SET_FAMILY:-$CB_FAMILY}" "$1"
+}
+
 # The sha256 of the dumper's source, the order the record keeps: the cpp, then the shared headers.
 cb_source_sha() {
   cat "$HERE/tools/ref/cb_dump.cpp" "$HERE/tools/ref/ref_io.h" "$HERE/tools/ref/ref_tensor_io.h" | sha256sum | cut -d' ' -f1
@@ -81,7 +90,7 @@ cb_dump_build() {
 }
 
 cb_dump_run() {
-  local bin_var=${CB_ENV}_BIN thr_var=${CB_ENV}_THREADS BIN REC want tree build stage fixture_line_text dump_bound p name ids nodes greedy dest
+  local bin_var=${CB_ENV}_BIN thr_var=${CB_ENV}_THREADS BIN REC want tree build stage fixture_line_text dump_bound p name ids nodes greedy step dest ids_path spec
   fixture_dump_tier "$CB_SCRIPT"
   BIN=${!bin_var:-$BLOOMERY_DATA/bin/${CB_FAMILY}_dump}
   REC=$BIN.build
@@ -106,13 +115,19 @@ cb_dump_run() {
     ${CB_FLAGS[@]+"${CB_FLAGS[@]}"})
   [ -z "$fixture_line_text" ] || args+=(--fixture-line "$fixture_line_text")
   for p in "${CB_PROMPTS[@]}"; do
-    IFS=: read -r name ids nodes greedy <<< "$p"
-    args+=(--prompt "$name:$HERE/tools/ref/data/$CB_IDS/$ids.ids:$nodes:$greedy")
+    IFS=: read -r name ids nodes greedy step <<< "$p"
+    case $ids in
+      /*) ids_path=$ids ;;
+      *) ids_path=$HERE/tools/ref/data/$CB_IDS/$ids.ids ;;
+    esac
+    spec="$name:$ids_path:$nodes:$greedy"
+    [ -z "$step" ] || spec+=":$step"
+    args+=(--prompt "$spec")
   done
 
   if [ "${DUMP_DRY:-0}" = 1 ]; then
     printf '[dry] tier\t%s\tprofile %s\n' "${BLOOMERY_TIER:-real}" "$MODEL_NAME"
-    for p in "${CB_PROMPTS[@]}"; do printf '[dry] set\t%sref_%s_%s\n' "$SET_PREFIX" "$CB_FAMILY" "${p%%:*}"; done
+    for p in "${CB_PROMPTS[@]}"; do printf '[dry] set\t%s\n' "$(cb_set_name "${p%%:*}")"; done
     printf '[dry] # model\t%s\n[dry] # build\t%s\n[dry] dumper\t%s\n' "$MODEL" "$build" "$BIN"
     [ -z "$fixture_line_text" ] || printf '[dry] %s\n' "$fixture_line_text"
     printf '[dry] argv\t%q' "$BIN"
@@ -153,7 +168,7 @@ cb_dump_run() {
   done
   for p in "${CB_PROMPTS[@]}"; do
     name=${p%%:*}
-    dest="$BLOOMERY_DATA/${SET_PREFIX}ref_${CB_FAMILY}_$name"
+    dest="$BLOOMERY_DATA/$(cb_set_name "$name")"
     rm -rf "$dest.old"
     if [ -d "$dest" ]; then mv "$dest" "$dest.old"; fi
     mv "$STAGE/$name" "$dest"

@@ -1105,6 +1105,18 @@ pub trait HostBytes: Sized {
     fn take(r: &mut Take<'_>) -> Result<Self, Fail>;
 }
 
+/// A state with no host value beside its positions (a body whose every store is a plane of
+/// positions): nothing to write and nothing to read.
+impl HostBytes for () {
+    fn put(&self, _w: &mut Put<'_>) -> Result<(), Fail> {
+        Ok(())
+    }
+
+    fn take(_r: &mut Take<'_>) -> Result<(), Fail> {
+        Ok(())
+    }
+}
+
 impl<T: HostBytes> SeqState<T> {
     /// The state in the byte form (the module doc). Refused by name while
     /// its copy has not landed.

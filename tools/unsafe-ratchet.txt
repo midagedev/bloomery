@@ -794,7 +794,12 @@ gguf 7 2 0
 # PIN(2026-11-01): gpu 2967 -> 2981 blocks, 409 -> 412 fns, new code, not old code relaxed: Mistral Large 4's
 # card entries: ln_rows (elem.rs: its mean, variance and block-tree helpers, the shared basis and sums) and
 # kv_gather_sel (latent.rs: the count and list reads, the row copy), each with its SAFETY line.
-gpu 2981 412 10
+# PIN(2026-11-02): gpu 2981 -> 3000 blocks, 412 -> 413 fns, new code, not old code relaxed: Mistral Large 4's
+# batched-prefill entries `kv_norm_rope_append_rows`, `flash_latent_mma_sel` and `flash_merge_sel` (their launches and
+# kernel bodies) and `merge_fold`, the merge body the three merge entries share (10 blocks, 1 fn); the recurrent Markov
+# head's three entries (`dspark/rnn.rs`: `dspark_rnn_input`, `dspark_rnn_gate`, `dspark_rnn_add`, their loads and
+# launches, 9 blocks). Each with its SAFETY line.
+gpu 3000 413 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -966,7 +971,11 @@ gpu-solar2 0 0 0
 # PIN(2026-10-18): gpu-vision 127 -> 148 blocks, new code, not old code relaxed: the RADIO tower's three new kernel entries read
 # and write their buffers through the same raw places as the others, each block with its SAFETY line — vis_attn_h80 16 (the
 # h72 entry's shape), vis_pos_half 3 (its loader and two reads), vis_relu_sq 2 (its loader and the in-place store).
-gpu-vision 148 0 0
+# PIN(2026-11-02): gpu-vision 148 -> 170 blocks, new code, not old code relaxed: the Pixtral tower's two new kernel entries
+# read and write their buffers through the same raw places as the others, each block with its SAFETY line — vis_attn_h128
+# 18 (its loader, the shared tile, the query, key and value staging reads and stores, the fragment loads and MMAs, the
+# output store), vis_rope2d_h128 4 (its table read, its pair read and store, its loader).
+gpu-vision 170 0 0
 # PIN(2026-10-13): hf 0 -> 2 blocks, new code, not old code relaxed: the DSpark draft's 1.9 GB safetensors file is read
 # through a read-only mapping (Safetensors::open) instead of into memory, and a bf16 tensor's bytes are viewed as u16
 # (Safetensors::bf16, a misaligned file refused), each block with its SAFETY line.
@@ -1128,7 +1137,10 @@ placement 0 0 0
 # PIN(2026-11-01): qdot 269 -> 271 blocks, 124 -> 126 fns, new code, not old code relaxed: the IQ2_XXS kernel's whole-block
 # pack splits into ik's three steps (`iq2xxs_new_block`, `iq2xxs_prepare`, `iq2xxs_multiply_add`, each
 # #[target_feature] with its SAFETY line) in place of `iq2xxs_pack`.
-qdot 271 126 0
+# PIN(2026-11-02): qdot 271 -> 281 blocks, 126 -> 132 fns, new code, not old code relaxed: the IQ1_M x Q8_K port of
+# ik's mul_mat_iq1_m_q8_K (its pack, block step, one-column dot and column tile, each a target_feature AVX2 fn) and
+# the IQ1_S wide tile (its group walk and the column-pointer fill it shares with IQ2_XXS's).
+qdot 281 132 0
 record 0 0 0
 refset 0 0 0
 runtime 0 0 0

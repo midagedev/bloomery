@@ -153,8 +153,12 @@ generate_ds41   f32_gemv                                 0           0
 generate_ds41   f32_tile_gemm                            0           0
 generate_ds41   flash_latent                             0           0
 generate_ds41   flash_latent_mma                         0           0
+# PIN(2026-11-02): flash_latent_mma_sel measured on sm_86 by gate-ptx-spill on the batched-prefill tree (ptxas 13.3.73): 0 spill, 0 JIT local.
+generate_ds41   flash_latent_mma_sel                     0           0
 generate_ds41   flash_latent_q8                          0           0
 generate_ds41   flash_merge                              0           0
+# PIN(2026-11-02): flash_merge_sel measured on sm_86 by gate-ptx-spill on the batched-prefill tree (ptxas 13.3.73): 0 spill, 0 JIT local.
+generate_ds41   flash_merge_sel                          0           0
 generate_ds41   flash_merge_q8                           0           0
 generate_ds41   fp8_b128_gemv                            0           0
 generate_ds41   fp8_b128_gemv_mcol                       0           0
@@ -416,6 +420,9 @@ generate_ds41   kv_append                                0           0
 generate_ds41   kv_append_pos_buf                        0           0
 generate_ds41   kv_gather_sel                            0           0
 generate_ds41   kv_norm_rope_append                      0           0
+# PIN(2026-11-02): kv_norm_rope_append_rows measured on sm_86 by gate-ptx-spill on the batched-prefill tree (ptxas 13.3.73): 0 spill, 0 JIT local.
+# PIN(2026-11-02): vis_attn_h128 and vis_rope2d_h128 (the Pixtral tower's head of 128) measured on sm_86 by gate-ptx-spill on the ML4 vision tree (ptxas 13.3.73): 0 spill, 0 JIT local.
+generate_ds41   kv_norm_rope_append_rows                 0           0
 generate_ds41   latent_extra_rms_append                  0           0
 generate_ds41   latent_rms_append                        0           0
 generate_ds41   ln_rows                                  0           0
@@ -655,6 +662,7 @@ gate_qwen3vl_tower   vis_attn                           0           0
 gate_qwen3vl_tower   vis_attn_group                     0           0
 gate_qwen3vl_tower   vis_attn_h72                       0           0
 gate_qwen3vl_tower   vis_attn_h80                       0           0
+gate_qwen3vl_tower   vis_attn_h128                       0           0
 gate_qwen3vl_tower   vis_clamp_f32                      0           0
 gate_qwen3vl_tower   vis_gelu_erf                       0           0
 gate_qwen3vl_tower   vis_gelu_tanh                      0           0
@@ -672,6 +680,7 @@ gate_qwen3vl_tower   vis_rms_norm                       0           0
 gate_qwen3vl_tower   vis_rms_norm_f32                   0           0
 gate_qwen3vl_tower   vis_rope2d                         0           0
 gate_qwen3vl_tower   vis_rope2d_h72                     0           0
+gate_qwen3vl_tower   vis_rope2d_h128                     0           0
 gate_qwen3vl_tower   vis_row_op                         0           0
 gate_qwen3vl_tower   vis_silu_mul                       0           0
 gate_qwen3vl_tower   vis_silu_mul_clamp                 0           0

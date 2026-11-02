@@ -4,9 +4,16 @@
 //!
 //! The clauses are self-consistency: the engine's two paths (the prompt batch and the one-token steps) are compared
 //! to each other, so both tiers run them and no oracle is read.
+//!
+//! A body that picks the rows a layer attends to (an indexer's top-k) can pick another row on the two paths where two scores are
+//! a rounding apart, and one row exchanged moves the layer's output past what the rounding of the dense sites alone moves it.
+//! Where the seat reads the first layer's pick ([`Seat::selection`]) and the free run exchanged rows with the steps' at a near
+//! tie of the scores (the steps' gap at the list's edge inside twice the largest move of a score), the free run's layer outputs
+//! are not judged: the position runs again with the steps' list forced into that layer ([`Seat::force_selection`]) and that run is
+//! judged at the same ceilings, the free run's reading printed beside it. An exchange past a near tie is red.
 
 use crate::e2e::{rel, top_ids, walk};
-use crate::lcpp_e2e::Seat;
+use crate::lcpp_e2e::{Seat, Selection};
 use bloomery_gpu_gates::prompts::{k_of, log_softmax, sigma_lp};
 use bloomery_gpu_gates::tier::{self, Tag, Tier};
 use bloomery_gpu_gates::{GateError, bits_equal, checks_failed, verdict};
@@ -41,12 +48,14 @@ pub struct Case {
     pub tier: Tier,
 }
 
-/// What a path left behind after a prompt: the last logits row, every layer's output and every store's digest.
+/// What a path left behind after a prompt: the last logits row, every layer's output and every store's digest, and the first
+/// layer's pick when the seat reads it.
 struct Left {
     logits: Vec<f32>,
     taps: Vec<f32>,
     stores: Vec<(String, u64)>,
     pos: u32,
+    sel: Option<Selection>,
 }
 
 type Clause = fn(&mut dyn Seat, &Case) -> Result<bool, GateError>;
@@ -72,11 +81,19 @@ pub const CLAUSES: &[(&str, Tag, Clause)] = &[
 ];
 
 fn left(seat: &mut dyn Seat, logits: Vec<f32>) -> Result<Left, GateError> {
+    let mut got = left_unstored(seat, logits)?;
+    got.stores = seat.stores()?;
+    Ok(got)
+}
+
+/// What a run left, with no store digests: for a run the clause does not compare store by store.
+fn left_unstored(seat: &mut dyn Seat, logits: Vec<f32>) -> Result<Left, GateError> {
     Ok(Left {
         logits,
         taps: seat.taps()?,
-        stores: seat.stores()?,
+        stores: Vec::new(),
         pos: seat.pos(),
+        sel: seat.selection()?,
     })
 }
 
@@ -90,11 +107,35 @@ fn by_steps(seat: &mut dyn Seat, ids: &[u32]) -> Result<Left, GateError> {
     left(seat, row)
 }
 
-/// A reset, then `ids` as one prompt call.
-fn by_prompt(seat: &mut dyn Seat, ids: &[u32]) -> Result<Left, GateError> {
+/// A reset, then `ids` as one prompt call, with the steps' list forced into the call's pick when `forcing` names an exchange.
+fn by_prompt(
+    seat: &mut dyn Seat,
+    ids: &[u32],
+    forcing: Option<&Exchange<'_>>,
+) -> Result<Left, GateError> {
     seat.reset()?;
+    if let Some(x) = forcing {
+        x.force(seat)?;
+    }
     let row = seat.prompt(ids)?;
     left(seat, row)
+}
+
+/// A reset, then `ids[..p]` as one prompt call and `ids[p]` as a step, with the steps' list forced into the step's pick when
+/// `forcing` names an exchange.
+fn by_prompt_then_step(
+    seat: &mut dyn Seat,
+    ids: &[u32],
+    p: usize,
+    forcing: Option<&Exchange<'_>>,
+) -> Result<Left, GateError> {
+    seat.reset()?;
+    seat.prompt(&ids[..p])?;
+    if let Some(x) = forcing {
+        x.force(seat)?;
+    }
+    let row = seat.step(ids[p])?;
+    left_unstored(seat, row)
 }
 
 /// The batch's row `b` against the steps' row `s` over the steps' top [`TOP`] ids: whether every id's
@@ -134,8 +175,8 @@ fn logprobs_near(s: &[f32], b: &[f32], bound: Option<f64>, sigma_logit: f64) -> 
 }
 
 /// The batch's layer outputs `b` against the steps' `s` (`embd` values a layer) by relative distance: whether every
-/// layer is within the case's ceiling, and the line that says so.
-fn layers_near(s: &[f32], b: &[f32], case: &Case) -> (bool, String) {
+/// layer is within the case's ceiling, and the reading that says so, with no verdict.
+fn layers_reading(s: &[f32], b: &[f32], case: &Case) -> (bool, String) {
     let table: Vec<f64> = s
         .chunks(case.embd)
         .zip(b.chunks(case.embd))
@@ -158,12 +199,149 @@ fn layers_near(s: &[f32], b: &[f32], case: &Case) -> (bool, String) {
         .map(|l| format!("L{l} {:.2e}", table[l]))
         .collect();
     let line = format!(
-        "layer outputs worst {worst:.2e} at layer {at} ({}), {}, first past it {first:?} {}",
+        "layer outputs worst {worst:.2e} at layer {at} ({}), {}, first past it {first:?}",
         probe.join(", "),
         (case.tap_ceils)(case.tier),
-        verdict(pass)
     );
     (pass, line)
+}
+
+/// [`layers_reading`] with its verdict.
+fn layers_near(s: &[f32], b: &[f32], case: &Case) -> (bool, String) {
+    let (pass, line) = layers_reading(s, b, case);
+    (pass, format!("{line} {}", verdict(pass)))
+}
+
+/// The rows the free run's pick holds that the steps' does not, and what bounds how far rounding of the scores moves a pick:
+/// the largest move of a score between the two runs and the steps' gap between the last row picked and the first left out.
+struct Exchange<'a> {
+    layer: usize,
+    /// The steps' list, which the second run reads in place of its own pick.
+    list: &'a [u32],
+    rows: usize,
+    moved: f32,
+    gap: f32,
+}
+
+impl Exchange<'_> {
+    fn describe(&self) -> String {
+        format!(
+            "gap {:.2e}, move {:.2e}, {} rows exchanged",
+            self.gap, self.moved, self.rows
+        )
+    }
+
+    /// Arm the seat's next call to read the steps' list as the layer's pick.
+    fn force(&self, seat: &mut dyn Seat) -> Result<(), GateError> {
+        seat.force_selection(self.layer, self.list)
+    }
+}
+
+/// How the free run's pick stands to the steps' at the last position.
+enum Tie<'a> {
+    /// The seat reads no pick, every visible row is read (nothing is picked), or both picked the same rows.
+    Same,
+    /// Rows exchanged with the steps' gap at the list's edge inside twice the largest move of a score: two rounded scores cross
+    /// there, so the exchange is the scores' rounding and not a defect.
+    Near(Exchange<'a>),
+    /// Rows exchanged that no rounding of the scores reaches, or picks that cannot be compared.
+    Far(String),
+}
+
+fn tie<'a>(steps: Option<&'a Selection>, free: Option<&Selection>) -> Tie<'a> {
+    let (s, b) = match (steps, free) {
+        (None, None) => return Tie::Same,
+        (Some(s), Some(b)) => (s, b),
+        _ => return Tie::Far("one path read a pick and the other none".to_string()),
+    };
+    if s.layer != b.layer || s.list.len() != b.list.len() || s.scores.len() != b.scores.len() {
+        return Tie::Far(format!(
+            "the picks differ in shape: layer {} against {}, {} against {} rows, {} against {} scores",
+            s.layer,
+            b.layer,
+            s.list.len(),
+            b.list.len(),
+            s.scores.len(),
+            b.scores.len()
+        ));
+    }
+    let k = s.list.len();
+    if s.scores.len() <= k {
+        return Tie::Same;
+    }
+    let rows = b.list.iter().filter(|r| !s.list.contains(r)).count();
+    if rows == 0 {
+        return Tie::Same;
+    }
+    // A NaN move is the largest.
+    let moved = s.scores.iter().zip(&b.scores).fold(0.0f32, |w, (&x, &y)| {
+        let d = (x - y).abs();
+        if d.is_nan() || d > w { d } else { w }
+    });
+    let mut desc = s.scores.clone();
+    desc.sort_by(|x, y| y.total_cmp(x));
+    let gap = match (k.checked_sub(1).and_then(|i| desc.get(i)), desc.get(k)) {
+        (Some(x), Some(y)) => x - y,
+        _ => f32::NAN,
+    };
+    let x = Exchange {
+        layer: s.layer,
+        list: &s.list,
+        rows,
+        moved,
+        gap,
+    };
+    // A NaN on either side compares false.
+    if gap < 2.0 * moved {
+        Tie::Near(x)
+    } else {
+        Tie::Far(x.describe())
+    }
+}
+
+/// A position's layer outputs judged, and the lines that say so: the free run's against the steps', or, where the free run's pick
+/// exchanged rows at a near tie, the run `again` makes with the steps' list forced in (it arms the force before the call it
+/// forces), the free run's reading marked deferred. An exchange past a near tie is red.
+fn layers_judged(
+    seat: &mut dyn Seat,
+    case: &Case,
+    (steps, free): (&Left, &Left),
+    again: impl FnOnce(&mut dyn Seat, &Exchange<'_>) -> Result<Left, GateError>,
+) -> Result<(bool, Vec<String>), GateError> {
+    match tie(steps.sel.as_ref(), free.sel.as_ref()) {
+        Tie::Same => {
+            let (pass, line) = layers_near(&steps.taps, &free.taps, case);
+            Ok((pass, vec![line]))
+        }
+        Tie::Far(why) => {
+            let (_, line) = layers_near(&steps.taps, &free.taps, case);
+            Ok((
+                false,
+                vec![
+                    line,
+                    format!(
+                        "selection exchange past a near tie ({why}) {}",
+                        verdict(false)
+                    ),
+                ],
+            ))
+        }
+        Tie::Near(x) => {
+            let (_, reading) = layers_reading(&steps.taps, &free.taps, case);
+            let forced = again(seat, &x)?;
+            let (pass, line) = layers_near(&steps.taps, &forced.taps, case);
+            Ok((
+                pass,
+                vec![
+                    format!(
+                        "{reading}, deferred: near-tie selection exchange ({})",
+                        x.describe()
+                    ),
+                    format!("with the steps' list forced into layer {}: {line}", x.layer),
+                ],
+            ))
+        }
+    }
 }
 
 /// Whether two store lists name the same stores in the same order, and how many of their digests differ.
@@ -193,10 +371,12 @@ fn prefill_near_steps(seat: &mut dyn Seat, case: &Case) -> Result<bool, GateErro
     let mut ok = true;
     for p in &case.lengths {
         let ids = walk(*p, case.vocab);
-        let (s, b) = (by_steps(seat, &ids)?, by_prompt(seat, &ids)?);
+        let (s, b) = (by_steps(seat, &ids)?, by_prompt(seat, &ids, None)?);
         let (logits, l_line) =
             logprobs_near(&s.logits, &b.logits, case.logit_bound, case.sigma_logit);
-        let (layers, t_line) = layers_near(&s.taps, &b.taps, case);
+        let (layers, t_lines) = layers_judged(seat, case, (&s, &b), |seat, x| {
+            by_prompt(seat, &ids, Some(x))
+        })?;
         let (same, differ) = store_lists(&s.stores, &b.stores);
         let pass = logits && layers && same && s.pos == b.pos && b.pos == u32::try_from(*p)?;
         println!(
@@ -207,7 +387,9 @@ fn prefill_near_steps(seat: &mut dyn Seat, case: &Case) -> Result<bool, GateErro
             verdict(pass)
         );
         println!("  {l_line}");
-        println!("  {t_line}");
+        for line in &t_lines {
+            println!("  {line}");
+        }
         ok &= pass;
     }
     Ok(ok)
@@ -218,13 +400,16 @@ fn prefill_then_step_near_steps(seat: &mut dyn Seat, case: &Case) -> Result<bool
     for p in &case.lengths {
         let ids = walk(p + 1, case.vocab);
         let steps = by_steps(seat, &ids)?;
-        seat.reset()?;
-        seat.prompt(&ids[..*p])?;
-        let row = seat.step(ids[*p])?;
-        let taps = seat.taps()?;
-        let (logits, l_line) =
-            logprobs_near(&steps.logits, &row, case.logit_bound, case.sigma_logit);
-        let (layers, t_line) = layers_near(&steps.taps, &taps, case);
+        let free = by_prompt_then_step(seat, &ids, *p, None)?;
+        let (logits, l_line) = logprobs_near(
+            &steps.logits,
+            &free.logits,
+            case.logit_bound,
+            case.sigma_logit,
+        );
+        let (layers, t_lines) = layers_judged(seat, case, (&steps, &free), |seat, x| {
+            by_prompt_then_step(seat, &ids, *p, Some(x))
+        })?;
         let pass = logits && layers;
         println!(
             "prefill_then_step_near_steps: P={p}: the step after the prompt against {} steps {}",
@@ -232,7 +417,9 @@ fn prefill_then_step_near_steps(seat: &mut dyn Seat, case: &Case) -> Result<bool
             verdict(pass)
         );
         println!("  {l_line}");
-        println!("  {t_line}");
+        for line in &t_lines {
+            println!("  {line}");
+        }
         ok &= pass;
     }
     Ok(ok)
@@ -242,9 +429,9 @@ fn prefill_group_is_group_one(seat: &mut dyn Seat, case: &Case) -> Result<bool, 
     let group = case.group;
     let p = *case.lengths.last().unwrap_or(&1);
     let ids = walk(p, case.vocab);
-    let one = by_prompt(seat, &ids)?;
+    let one = by_prompt(seat, &ids, None)?;
     seat.set_group(group)?;
-    let b = by_prompt(seat, &ids);
+    let b = by_prompt(seat, &ids, None);
     seat.set_group(1)?;
     let b = b?;
     let differ = store_diff(&one.stores, &b.stores);

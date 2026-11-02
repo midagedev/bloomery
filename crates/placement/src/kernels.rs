@@ -119,6 +119,13 @@ pub fn host_stack(ty: GgmlType, k: usize) -> Result<(), qdot::QdotError> {
     Ok(())
 }
 
+/// The widest K of a q8_1 activation column ([`DownAct::Q8Act`], [`SiteAct::Q8x128`]): the widest
+/// K-quant input of the models this engine runs, a dense FFN down of 24,576 values (Mistral Large
+/// 4's lead layer); DeepSeek-V4.1's `hc_{attn,ffn}_fn`, which read all four residual streams, take
+/// 4 × 5120. The one owner: the card's `Q8Act` refuses a width past it at load, and a header
+/// check reads the same number.
+pub const Q8_ACT_MAX_K: usize = 24_576;
+
 /// The card bytes of the q8_1 activation of `cols` columns of `k` values
 /// ([`DownAct::Q8Act`], [`SiteAct::Q8x128`]): the five planes at `n_sb = k / 256`
 /// super-blocks a column — the codes at the q3 (`8 · 64 · ceil(n_sb / 2)`

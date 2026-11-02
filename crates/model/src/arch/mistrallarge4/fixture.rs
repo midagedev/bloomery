@@ -21,17 +21,18 @@
 //!
 //! What it keeps: the latent 512, the rope width 64 and with it the head's `key_length_mla` 128
 //! and both cache-row widths (576 on a roped layer, 512 on a NoPE one), the index heads 32 × 128
-//! (the score kernel's own constant), the router's top-4 over its rivals, the shared expert, the
-//! YaRN keys and the LeRoPE factors' 32 values, the head's softcap, and the real vocabulary: the
-//! globals keep their second axis, and the tokenizer tables are the source's copied ones, so the
-//! fixture's tokenizer is the file's. Every (tensor stem, type) pair of the five real layers is
-//! kept — Q6_K `attn_q`, `attn_output`, `indexer.attn_q_b` and `output`/`token_embd`, Q8_0 the
-//! latent, its up-projections, the indexer's key, the dense lead and the shared expert, IQ2_XXS
-//! and IQ1_S the routed stacks as the layer's own — and F32 the norms, the SSMax pairs, the
-//! router and the indexer's head weights.
+//! (the score kernel's own constant), the router's top-4 over all 128 experts of every routed
+//! layer (the width the common softmax router runs: no pad lane, no dropped expert), the shared
+//! expert, the YaRN keys and the LeRoPE factors' 32 values, the head's softcap, and the real
+//! vocabulary: the globals keep their second axis, and the tokenizer tables are the source's
+//! copied ones, so the fixture's tokenizer is the file's. Every (tensor stem, type) pair of the
+//! five real layers is kept — Q6_K `attn_q`, `attn_output`, `indexer.attn_q_b` and
+//! `output`/`token_embd`, Q8_0 the latent, its up-projections, the indexer's key, the dense lead
+//! and the shared expert, IQ2_XXS and IQ1_S the routed stacks as the layer's own — and F32 the
+//! norms, the SSMax pairs, the router and the indexer's head weights.
 //!
-//! What it minifies: the hidden (1,024), the head count (16), the routed experts (16 of width
-//! 256, whose shared expert is one of the same width), the dense lead's width (4,096, the real
+//! What it minifies: the hidden (1,024), the head count (16), the routed experts' width (256,
+//! whose shared expert is one of the same width), the dense lead's width (4,096, the real
 //! file's 4 × hidden) and the indexer's `top_k` (16), which the reader serves a context up to
 //! ([`super::spec::serve_ctx`]): a prompt past it selects, where the real file's 2,048 selects
 //! past a context of that length. Every width is a whole block of every type its tensors hold.
@@ -47,8 +48,8 @@
 //! indexer's LayerNorm biases and the SSMax pairs are spreads ([`LN_BIAS_HALF_WIDTH`],
 //! [`SSMAX_HALF_WIDTH`]), per element, so a body that broadcasts one value or skips one fails.
 //!
-//! The fixture is one shard of 119 tensors: 415,962,880 bytes of tensor data, 344,068,224 of it
-//! the four globals and the rest the five layers, in a file of 430,204,832 bytes [measured:
+//! The fixture is one shard of 119 tensors: 493,950,720 bytes of tensor data, 344,068,224 of it
+//! the four globals and the rest the five layers, in a file of 508,192,672 bytes [measured:
 //! `fixture plan`; the 14,241,952 header bytes are the source's tokenizer tables and the keys].
 //!
 //! The card budget is fixed, not planned: the architecture has no program yet, so no plan of the
@@ -73,8 +74,8 @@ pub const LAYER_MAP: [usize; 5] = [0, 1, 17, 35, 39];
 pub const HIDDEN: u64 = 1024;
 /// The query heads the mini writes; the head's width stays the real file's 128.
 pub const HEADS: u64 = 16;
-/// The routed experts the mini writes: `expert_count`.
-pub const EXPERTS: u64 = 16;
+/// The routed experts the mini writes: `expert_count`, the real file's, every one of them kept.
+pub const EXPERTS: u64 = 128;
 /// One routed expert's width the mini writes: `expert_feed_forward_length`, which the shared
 /// expert's (`expert_shared_count` of them) shares, whole blocks of every type of its tensors.
 pub const FF: u64 = 256;

@@ -1,5 +1,5 @@
 //! `bloomery-serve` — one server binary, one seat a model: `--model
-//! ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|nemotron|raon1|musespark|flint|decide` picks the seat
+//! ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|nemotron|raon1|musespark|flint|mistrallarge4|decide` picks the seat
 //! (`serve_seats`, the shared seat modules), every other flag the seat's own,
 //! parsed by the seat's own parser, so each seat's flag set is exactly its
 //! per-model binary's. The
@@ -7,7 +7,7 @@
 //! picks the seat, and a bare start or `--help` prints [`drive::MODELS`],
 //! one line a seat with a working `--hf` example.
 //!
-//!     bloomery-serve [--model ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|nemotron|raon1|musespark|flint|decide]
+//!     bloomery-serve [--model ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|nemotron|raon1|musespark|flint|mistrallarge4|decide]
 //!                    [-m PATH | --model-file PATH | --hf <repo>[@<rev>][:<quant>]]
 //!                    [--head <weights> [--head-config <file>]]
 //!                    [--config FILE] <the seat's own flags>
@@ -46,7 +46,7 @@
 //! the qwen3 seat, mimo2 the mimo2 seat, solar-open2 the solar2 seat, minimax-m3
 //! the minimaxm3 seat,
 //! nemotron_h and nemotron_h_moe the nemotron seat, raon1 the raon1 seat, muse-spark the musespark seat,
-//! and flint the flint seat;
+//! flint the flint seat and mistral-large4 the mistrallarge4 seat;
 //! a dense qwen35 file a generative seat serves generates with or without
 //! `--model qwen3`. With no model word a file keeps the decision selection rules: a file with no head
 //! that no generative seat serves is refused by name, saying what would seat it (`--head`, a row's `--hf`
@@ -204,10 +204,7 @@ mod drive {
     use serve::exit::Code;
     use serve::listener::{Phase, Progress};
 
-    use crate::serve_seats::{
-        decide, ds41, flint, glm, mimo2, minimaxm3, musespark, nemotron, qwen3, qwen38, raon1,
-        solar2,
-    };
+    use crate::serve_seats::decide;
 
     const NAME: &str = "bloomery-serve";
 
@@ -217,7 +214,7 @@ mod drive {
                         machine can serve, then `bloomery-serve --model NAME` to start it \
                         (docs/agents.md)";
 
-    const USAGE: &str = "usage: bloomery-serve [--model NAME[:VARIANT]|ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|nemotron|raon1|musespark|flint|decide] \
+    const USAGE: &str = "usage: bloomery-serve [--model NAME[:VARIANT]|ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|nemotron|raon1|musespark|flint|mistrallarge4|decide] \
                          [--config FILE] [--revision REV] [--recommend] [--dry-run] [--json] \
                          [-m PATH | --model-file PATH | --hf <repo>[@<rev>][:<quant>]] [--head <weights> \
                          [--head-config <file>]] [--embd-model FILE | --embd-hf \
@@ -225,7 +222,7 @@ mod drive {
                          --embd-no-mmproj] [--embd-image-min-tokens N] [--embd-image-max-tokens N] \
                          <the chosen seat's own flags, as \
                          bloomery-serve-ds41, bloomery-serve-qwen38, the glm, the qwen3, the \
-                         mimo2, the solar2, the minimaxm3, the nemotron, the raon1, the musespark, the flint or the decide seat takes \
+                         mimo2, the solar2, the minimaxm3, the nemotron, the raon1, the musespark, the flint, the mistrallarge4 or the decide seat takes \
                          them> [llama-server's placement flags: -dev, -sm, -mg, -ts, -ngl, \
                          --cpu-moe, -fit, -fitt, -devd] | --list-devices | --version";
 
@@ -246,6 +243,7 @@ models (the --model word is optional with a model file: the file's architecture 
   raon1   Raon-1-mini                  -m <path>
   musespark Muse Spark Open 816B       -m <path>
   flint   Flint                       -m <path>
+  mistrallarge4 Mistral Large 4 1T-A52B -m <path>
   decide  a decision model by its head --hf bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M
   decide  a decision model in its file --hf ggml-org/lev-GGUF:Q4_K_M";
 
@@ -272,6 +270,7 @@ models (the --model word is optional with a model file: the file's architecture 
         Raon1,
         MuseSpark,
         Flint,
+        MistralLarge4,
     }
 
     /// A `--model` word: a generative seat's, or the decide seat's.
@@ -295,9 +294,10 @@ models (the --model word is optional with a model file: the file's architecture 
                 "raon1" => Ok(Word::Seat(Model::Raon1)),
                 "musespark" => Ok(Word::Seat(Model::MuseSpark)),
                 "flint" => Ok(Word::Seat(Model::Flint)),
+                "mistrallarge4" => Ok(Word::Seat(Model::MistralLarge4)),
                 serve::decide::WORD => Ok(Word::Decide),
                 other => Err(format!(
-                    "--model is ds41, qwen38, glm, qwen3, mimo2, solar2, minimaxm3, nemotron, raon1, musespark, flint or {}, not {other}",
+                    "--model is ds41, qwen38, glm, qwen3, mimo2, solar2, minimaxm3, nemotron, raon1, musespark, flint, mistrallarge4 or {}, not {other}",
                     serve::decide::WORD
                 )
                 .into()),
@@ -314,7 +314,7 @@ models (the --model word is optional with a model file: the file's architecture 
 
     impl Model {
         /// Every generative seat.
-        const ALL: [Model; 11] = [
+        const ALL: [Model; 12] = [
             Model::Ds41,
             Model::Qwen38,
             Model::Glm,
@@ -326,6 +326,7 @@ models (the --model word is optional with a model file: the file's architecture 
             Model::Raon1,
             Model::MuseSpark,
             Model::Flint,
+            Model::MistralLarge4,
         ];
 
         /// The seat's word, as errors and the usage name it.
@@ -342,6 +343,7 @@ models (the --model word is optional with a model file: the file's architecture 
                 Model::Raon1 => "raon1",
                 Model::MuseSpark => "musespark",
                 Model::Flint => "flint",
+                Model::MistralLarge4 => "mistrallarge4",
             }
         }
 
@@ -373,6 +375,7 @@ models (the --model word is optional with a model file: the file's architecture 
                 Model::Raon1 => matches!(Arch::from_name(arch), Ok(Arch::Raon1)),
                 Model::MuseSpark => matches!(Arch::from_name(arch), Ok(Arch::MuseSpark)),
                 Model::Flint => matches!(Arch::from_name(arch), Ok(Arch::Flint)),
+                Model::MistralLarge4 => matches!(Arch::from_name(arch), Ok(Arch::MistralLarge4)),
             })
         }
     }
@@ -469,8 +472,8 @@ models (the --model word is optional with a model file: the file's architecture 
                     Code::Usage,
                     format!(
                         "--model needs a value (a catalog model's name, or ds41, qwen38, glm, \
-                         qwen3, mimo2, solar2, minimaxm3, nemotron, raon1, musespark, flint or \
-                         {}): {USAGE}",
+                         qwen3, mimo2, solar2, minimaxm3, nemotron, raon1, musespark, flint, \
+                         mistrallarge4 or {}): {USAGE}",
                         serve::decide::WORD
                     ),
                 )
@@ -1230,13 +1233,13 @@ models (the --model word is optional with a model file: the file's architecture 
     fn entries(seat: Model) -> (Run, Check) {
         macro_rules! entry {
             ($seat:ident, source) => {
-                ($seat::run, |args, read, from_repo| {
-                    $seat::check(args, read, from_repo).map(drop)
+                (crate::serve_seats::$seat::run, |args, read, from_repo| {
+                    crate::serve_seats::$seat::check(args, read, from_repo).map(drop)
                 })
             };
             ($seat:ident) => {
-                ($seat::run, |args, read, _| {
-                    $seat::check(args, read).map(drop)
+                (crate::serve_seats::$seat::run, |args, read, _| {
+                    crate::serve_seats::$seat::check(args, read).map(drop)
                 })
             };
         }
@@ -1252,6 +1255,7 @@ models (the --model word is optional with a model file: the file's architecture 
             Model::Raon1 => entry!(raon1),
             Model::MuseSpark => entry!(musespark),
             Model::Flint => entry!(flint),
+            Model::MistralLarge4 => entry!(mistrallarge4),
         }
     }
 

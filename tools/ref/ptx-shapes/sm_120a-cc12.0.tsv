@@ -22,6 +22,8 @@ generate_ds41 ds41_attn_seg_sel_stage 56 32
 generate_ds41 ds41_attn_seg_stage 32 24
 generate_ds41 ds41_expert_gate_up_tiles 676 152
 generate_ds41 flash_latent_mma 24 8
+# PIN(2026-11-02): flash_latent_mma_sel shares flash_latent_mma's body (the same walk macro or row body, a per-token key list or row position), pinned at flash_latent_mma's cc 12.0 value here (24 spill, 8 JIT local) until a cc 12.0 scan runs; sm_86 measured 0/0.
+generate_ds41 flash_latent_mma_sel 24 8
 generate_ds41 gdn_delta_prepared 172 64
 generate_ds41 gemm_iq2s 24 8
 generate_ds41 gemm_iq3s 24 16
@@ -180,6 +182,8 @@ generate_ds41 ffn_handoff_6_tier 0 0
 generate_ds41 flash_latent 0 0
 generate_ds41 flash_latent_q8 0 0
 generate_ds41 flash_merge 0 0
+# PIN(2026-11-02): flash_merge_sel shares flash_merge's body (the same walk macro or row body, a per-token key list or row position), pinned at flash_merge's cc 12.0 value here (0 spill, 0 JIT local) until a cc 12.0 scan runs; sm_86 measured 0/0.
+generate_ds41 flash_merge_sel 0 0
 generate_ds41 flash_merge_q8 0 0
 generate_ds41 fp8_b128_gemv 0 0
 generate_ds41 fp8_b128_gemv_mcol 0 0
@@ -371,6 +375,9 @@ generate_ds41 kq_gate_up_act_q8_0 0 0
 generate_ds41 kv_append 0 0
 generate_ds41 kv_append_pos_buf 0 0
 generate_ds41 kv_norm_rope_append 0 0
+# PIN(2026-11-02): kv_norm_rope_append_rows shares kv_norm_rope_append's body (the same walk macro or row body, a per-token key list or row position), pinned at kv_norm_rope_append's cc 12.0 value here (0 spill, 0 JIT local) until a cc 12.0 scan runs; sm_86 measured 0/0.
+# PIN(2026-11-02): vis_attn_h128 and vis_rope2d_h128 share vis_attn_h80's and vis_rope2d_h72's bodies (the head size a const), pinned at their 0/0 [derived: the same body], not measured at this arch until a scan there.
+generate_ds41 kv_norm_rope_append_rows 0 0
 generate_ds41 latent_extra_rms_append 0 0
 generate_ds41 latent_rms_append 0 0
 generate_ds41 mamba2_conv_rows 0 0
@@ -575,6 +582,7 @@ gate_qwen3vl_tower vis_attn 0 0
 gate_qwen3vl_tower vis_attn_group 0 0
 gate_qwen3vl_tower vis_attn_h72 0 0
 gate_qwen3vl_tower vis_attn_h80 0 0
+gate_qwen3vl_tower vis_attn_h128 0 0
 gate_qwen3vl_tower vis_clamp_f32 0 0
 gate_qwen3vl_tower vis_gelu_erf 0 0
 gate_qwen3vl_tower vis_gelu_tanh 0 0
@@ -592,6 +600,7 @@ gate_qwen3vl_tower vis_rms_norm 0 0
 gate_qwen3vl_tower vis_rms_norm_f32 0 0
 gate_qwen3vl_tower vis_rope2d 0 0
 gate_qwen3vl_tower vis_rope2d_h72 0 0
+gate_qwen3vl_tower vis_rope2d_h128 0 0
 gate_qwen3vl_tower vis_row_op 0 0
 gate_qwen3vl_tower vis_silu_mul 0 0
 gate_qwen3vl_tower vis_silu_mul_clamp 0 0

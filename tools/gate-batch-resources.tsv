@@ -38,6 +38,26 @@
 #              HostNeed with every routed file tensor on the host is 24,168,079,360 B;
 #              four histories of 75 * (49 * 2048 + 150144) f32 bound retained readbacks and temporaries,
 #              300,595,200 B. Sequential model loads: total ceiling 24,468,674,560 B, not measured RSS.
+#   mistrallarge4 --place gate: the plan's host experts (UD-IQ1_S 209.52e9 B, Mix-256G 209.87e9 B, the meta test's plan
+#              line) plus the token embedding that stays on the host (Q6_K 1.03e9 B, Q3_K 0.54e9 B), the larger 210.55e9 B,
+#              rounded up to 211e9 [derived]; the load gate opens the same plan.
+#   mistrallarge4-twocard --place bp under gate_mistrallarge4_twocard's card budget: the cards hold more routed experts than the
+#              gate plan's card (the stage's 2 GiB beside the tier's share), so the host holds fewer than the gate plan's
+#              209.52e9 B; the e2e row's 211e9 is the upper bound [derived], read the plan line of the first real run and
+#              replace it. The two loads run one after the other.
+#   mistrallarge4-xstream --place a under gate_mistrallarge4_xstream's card budget (the stage keeps the stream's ring and 8 GiB of
+#              routed experts, so the host holds the gate plan's 209.52e9 B less what the stage holds more) and --place bp under the
+#              two-card gate's budget: the e2e row's 211e9 is the upper bound of both [derived], read the plan lines of the first
+#              real run and replace it. The two loads run one after the other, each reading its host set in (`HostCfg::populate`).
+#   mistrallarge4-serve: the one-slot server runs the seat's residency default (`mid-p0-s1` at the unset placement, `a`), so
+#              its host set holds every routed expert once, as the residency row's loads do: 222e9 B [derived from the
+#              residency row's figure]; the two-slot server runs `BLOOMERY_RESIDENCY=off` and holds the experts the cards do not,
+#              at most the e2e row's 211e9 B [derived]. The two servers run one after the other, so the ceiling is one load's.
+#   mistrallarge4-residency --place a and --place bp under the real tier's default plans (the fixture's stage keeps half its experts): a
+#              load under a `mid` word holds the host's experts and the churn pool, the stage card's experts, in its host set, so the
+#              host holds every routed expert once: UD-IQ1_S 213.99e9 B plus the Q6_K embedding 1.03e9 B, Mix-256G 221.28e9 B plus the Q3_K
+#              0.54e9 B, the larger 221.82e9 B, rounded up to 222e9 [derived from the meta tests' plan lines]; the three loads (`off`, `mid`
+#              on plan a, `mid` on plan bp) run one after the other.
 gate-gpu-flint-twocard	-	24468674560
 gate-gpu-ds41-callstream	-	237600000000
 gate-gpu-ds41-long	m	237600000000
@@ -82,7 +102,14 @@ gate-gpu-glm5next-stagger	-	173015891968
 gate-gpu-serve-start-glm	-	8600000000
 gate-gpu-serve-start-ds41	-	15000000000
 gate-gpu-musespark-e2e	-	204000000000
-gate-gpu-mistrallarge4-e2e	-	1073741824
+gate-gpu-mistrallarge4-e2e	-	211000000000
+gate-gpu-mistrallarge4-load	-	211000000000
+gate-gpu-mistrallarge4-prefill	-	211000000000
+gate-gpu-mistrallarge4-verify	-	211000000000
+gate-gpu-mistrallarge4-serve	-	222000000000
+gate-gpu-mistrallarge4-twocard	-	211000000000
+gate-gpu-mistrallarge4-residency	-	222000000000
+gate-gpu-mistrallarge4-xstream	-	211000000000
 gate-gpu-musespark-prefill	-	204000000000
 gate-gpu-musespark-load	-	204000000000
 gate-gpu-musespark-serve	-	203000000000

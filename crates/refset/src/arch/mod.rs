@@ -146,6 +146,11 @@ mod tests {
     /// those by name. Each is checked in its own module.
     const STANDALONE: [&str; 1] = ["fx-ik-qwen3moe"];
 
+    /// The word a fixture cut adds to its sets' family word, the real twin's name without it:
+    /// `fx_ref_mistrallarge4e128_a` twins `ref_mistrallarge4_a`. The cut keeps all 128 experts
+    /// of the real file, and its name keeps its sets off a cut of another width's paths.
+    const CUT_WORDS: [&str; 1] = ["e128"];
+
     /// One row an architecture: `families` answers with the first row of a name, so a second row would hide its families.
     #[test]
     fn each_architecture_has_one_row() {
@@ -369,6 +374,7 @@ mod tests {
                         .unwrap_or_else(|| panic!("{name}: {set} has no fx_ prefix"))
                         .to_string(),
                 };
+                let twin = CUT_WORDS.iter().fold(twin, |t, w| t.replace(w, ""));
                 assert!(
                     real.sets.contains(&twin.as_str()),
                     "{name}: {set} twins {twin}, which {real_name} does not hold"
