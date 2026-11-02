@@ -219,6 +219,10 @@ def stop_group(sig):
         os.killpg(proc.pid, sig)
     except ProcessLookupError:
         pass  # the group is already gone
+    except PermissionError:
+        # Darwin answers EPERM, not ESRCH, for a group whose last member is exiting. Every member is ours
+        # (same uid, no setuid), so no live member can refuse the signal.
+        pass
 
 
 limit = time.monotonic() + bound
