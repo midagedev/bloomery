@@ -296,9 +296,10 @@ BLOOMERY_BOX_LOCAL=1 BLOOMERY_BOX_ENV='BLOOMERY_TIER=fixture BLOOMERY_GATE_BOUND
   `tools/ref/drive-read.sh`: `findmnt --nofsroot` removes a bind mount's bracketed root, then `lsblk` resolves the
   whole-disk parent or kernel name. The container must expose readable `/sys/block/<disk>/stat` counters.
   A mount or counter that cannot be read is a named exit 2 before timing, not a guessed device or a weaker witness.
-- **Card names.** A Spark's card is named neither 3090 nor A6000, and local mode takes the one local card without a name
-  match. `--place gate` plans the 3090's bytes on the smallest visible card with the room for them, the GB10 here, and local mode refuses the
-  two-card recipes (rc 64) ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)). Which
+- **Card names.** A Spark's card is named neither 3090 nor A6000, and local mode takes the cards in view without a name
+  match (`cards_view`, `tools/ref/cards.sh`). `--place gate` plans the 3090's bytes on the smallest visible card with the room for them, the GB10 here,
+  and with its one card in view local mode refuses the two-card recipes (rc 64)
+  ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)). Which
   fixture gates open on a card with no box name is in `local-check.md` section 3. `nvidia-smi` prints `[N/A]` for
   GB10's memory fields `[#13]`; the census reads the driver API (`gpu/src/lib.rs:1789`).
 - **`gate-ptx-spill`** runs on GB10 at `sm_86`, `sm_121` and `sm_121a`, against the cc 12.1 tables (section 6).
@@ -1687,7 +1688,7 @@ result bullets, lines 197 to 200). Their line numbers are stale; the citations h
 | `sparkprep` S1: cfg guards on the x86 bodies | `qdot`, `deepseek2/attn`, one bin | done in [#14](https://github.com/midagedev/bloomery/pull/14) (P0): every AVX2 item under `cfg(target_arch = "x86_64")`, design R off it |
 | `sparkprep` S2: per-triple `extra-rustflags` | `tools/oxide-host.sh` | done: `.cargo/config.toml` carries `znver3` for x86_64 and `native` for aarch64; `tools/oxide-host.sh` writes the flat `.cargo/cuda-oxide.toml` cargo-oxide reads for the triple a build is for, and `tools/check-rustflags.sh` holds both triples (the fork patch that did this is gone with the fork) |
 | `sparkprep` S3 / `archkey`: one owner of `--arch` | 139 recipe lines | done: the justfile's `arch` variable reads `BLOOMERY_ARCH` (unset: `sm_121a` on a GB10, `sm_120a` when every card is cc 12.0 and `sm_86` elsewhere), the tools that run on the box read it through `tools/arch.sh`, `tools/box.sh` forwards it, and `tools/check-recipes.sh` fails on an arch literal. `just narrow` and `ptx-compare` build both sides at that arch and `release-build` refuses an arch it has no archive for; `ptx-scan` also takes `sm_120` and `sm_121`, and `gate-ptx-spill` reads a table per arch and card capability (section 6) |
-| `sparkprep` S4: tools for N cards | `cards.sh`, `timing-card.sh`, `gpu-gate.sh` | ~~not done: `tools/ref/cards.sh:31-35` names two cards~~ partly: local mode ([#38](https://github.com/midagedev/bloomery/pull/38)) and the single-card timing mode ([#39](https://github.com/midagedev/bloomery/pull/39)) run on one local card; `tools/ref/cards.sh:33-34` still names the box's two |
+| `sparkprep` S4: tools for N cards | `cards.sh`, `timing-card.sh`, `gpu-gate.sh` | ~~not done: `tools/ref/cards.sh:31-35` names two cards~~ partly: local mode ([#38](https://github.com/midagedev/bloomery/pull/38)) and the single-card timing mode ([#39](https://github.com/midagedev/bloomery/pull/39)) read the cards in view (`cards_view`, `tools/ref/cards.sh`), and local `both` runs on two or more of them under the one local gate lock; the names in `tools/ref/cards.sh` are the box's two, and the two-card timing mode is the box's |
 | `isarefuse`: CPU check at `main` | x86-64-v3 refusal | partly: `crates/serve/src/preflight.rs` and `crates/gpu-gates/src/bin/bloomery_serve.rs:70-71` (`cpu_gate`, x86-only); no other bin calls it |
 
 Order inside P0, as it was done: gate the import and the 39 functions first (the crate then compiles with every call

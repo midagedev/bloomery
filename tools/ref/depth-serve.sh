@@ -1069,7 +1069,8 @@ WRAP
       for kv in ${ST_ENV[@]+"${ST_ENV[@]}"}; do export "$kv"; done
       if [ -n "$ST_LOCAL" ]; then
         export BLOOMERY_BOX_CARD=local BLOOMERY_LOCK_DIR=$C/locks BLOOMERY_LEASE_TRACE=$C/trace PATH=$T/local:$PATH
-        unset BLOOMERY_LEASE_LOCK BLOOMERY_LEASE_HELD
+        # The source at the top pinned this shell's CUDA_VISIBLE_DEVICES in box mode; a local run starts from the caller's view.
+        unset BLOOMERY_LEASE_LOCK BLOOMERY_LEASE_HELD CUDA_VISIBLE_DEVICES
         command -v flock > /dev/null || PATH=$HERE/card-tests/bin:$PATH
         mkdir -p "$C/locks"
         # shellcheck source=tools/ref/timing-card.sh

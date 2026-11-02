@@ -64,11 +64,13 @@
 #                             BLOOMERY_LOCK_DIR (a path from /, default ~/.cache/bloomery/locks, made when missing),
 #                             exported to the command, so the guard reads this machine's lease and holds; the environment
 #                             file or BLOOMERY_BOX_ENV moving it after the guard is refused (64), and so is an environment
-#                             file's BLOOMERY_ARCH that is not the one the recipe expanded. The card is what this machine
-#                             shows: the box side sees BLOOMERY_BOX_CARD=local (tools/gpu-gate.sh's one local lock), any
-#                             BLOOMERY_CARD but `both` runs on it, `both` is refused (64), and CUDA_VISIBLE_DEVICES is the
-#                             caller's, or the environment file's when it sets one (a timing runner then pins its timing
-#                             card: tools/ref/timing-card.sh). CUDA_OXIDE_BACKEND is unset after the
+#                             file's BLOOMERY_ARCH that is not the one the recipe expanded. The cards are the ones in view,
+#                             no card's name: CUDA_VISIBLE_DEVICES is the caller's, then the environment file's and
+#                             BLOOMERY_BOX_ENV's when either sets one; unset shows every card the machine has (tools/ref/cards.sh's cards_view, the one
+#                             selector). The box side sees BLOOMERY_BOX_CARD=local (tools/gpu-gate.sh's one local lock,
+#                             which holds the machine's cards), BLOOMERY_CARD 3090 and a6000 run on the cards in view, and
+#                             `both` runs when two or more are in view, read after the environment file and BLOOMERY_BOX_ENV, else 64 naming
+#                             what is in view (a timing runner pins its timing card: tools/ref/timing-card.sh). CUDA_OXIDE_BACKEND is unset after the
 #                             environment file; tools/oxide-host.sh selects the patched backend tools/oxide-backend.sh
 #                             installed, and refuses one that is missing. BLOOMERY_REMOTE names no
 #                             directory here and adds no CARGO_BUILD_JOBS. What box.sh reads on this side, its own outputs
@@ -1273,12 +1275,13 @@ if [ "$QLANE" = any ]; then
 esac"
   BOXCARD='"$SIGNALBOX_CARD"'
 fi
+# Local mode names no card: the command runs on the cards in view (tools/ref/cards.sh's cards_view, read after the environment
+# file and BLOOMERY_BOX_ENV), and `both` asks that they be two or more.
 if [ "$LOCAL" = 1 ]; then
-  if [ "$CARD" = both ]; then
-    echo "box.sh: BLOOMERY_CARD=both puts the box's two cards in view, and BLOOMERY_BOX_LOCAL=1 runs on what this machine shows: a two-card run is the box's" >&2
-    exit 64
-  fi
   PICK=":" BOXCARD=local
+  if [ "$CARD" = both ]; then
+    PICK="BLOOMERY_BOX_CARD=local . $DIR/tools/ref/cards.sh && cards_view && [ \"\$CARDS_VIEW_N\" -ge 2 ] || { echo \"box.sh: BLOOMERY_CARD=both runs on two or more cards in view, and \${CARDS_VIEW_WHY:-this machine has \$CARDS_VIEW_N in view: \$CARDS_VIEW}\" >&2; exit 64; }"
+  fi
 fi
 # The model the gates and GPU binaries open (BLOOMERY_REF_MODEL) is a property of the tool profile:
 # every command runs with it exported from tools/ref/ref-paths.sh, and an unknown profile stops the
@@ -1403,6 +1406,11 @@ if [ "$COMMIT" != unknown ]; then
   st=$(git -C "$HERE" status --porcelain 2>/dev/null) && st_rc=0 || st_rc=$?
   [ "$st_rc" = 0 ] || { echo "box.sh: git status in $HERE failed (git exit $st_rc): the tree's changes could not be read, so the version commit would export without its -dirty mark; repair the tree first" >&2; exit 70; }
   [ -z "$st" ] || COMMIT="$COMMIT-dirty"
+fi
+if [ "$LOCAL" = 1 ]; then
+  ENVS="$ENVS{ $PICK
+} && "
+  PICK=:
 fi
 REMOTE_CMD="source $ENVF && { $PICK
 } && cd $DIR && $V41 && $TIERX$VARX$FWD$PROFILE && $DATA && export BLOOMERY_GIT_COMMIT=$COMMIT BLOOMERY_BOX_CARD=$BOXCARD && $GATEX$OXIDE$ARCHX$ENVS$OXCHECK$LOCALX$*"

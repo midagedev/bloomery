@@ -29,8 +29,6 @@ assert_fresh_binary "$LEASE_TREE/target/release/tier_server"
 MODEL=${BLOOMERY_REF_MODEL:?set BLOOMERY_REF_MODEL}
 MODEL_NAME=qwen4exp
 WITNESS=(head-open indent card gpu-apps model busiest)
-cards=$(lease_bounded "$LEASE_ARM_BOUND" nvidia-smi --query-gpu=uuid --format=csv,noheader)
-[ "$(printf '%s\n' "$cards" | wc -l)" -eq 1 ] || { echo 'tier-cost: needs one visible physical GPU' >&2; exit 64; }
 out=$(mktemp -d "${TMPDIR:-/tmp}/tier-cost.XXXXXX")
 echo "logs=$out"
 "$BIN" --records-schema > "$out/schema.jsonl"

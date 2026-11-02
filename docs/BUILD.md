@@ -2,7 +2,7 @@
 
 This page is for building and running bloomery on your own Linux host.
 
-The `just` recipes and `tools/box.sh` are the maintainers' tooling for one remote workstation. `tools/box.sh` copies the tree there over ssh and runs the recipe's command inside the quotes. Those commands take lock files under `/root` (a gate lock per card, a machine-wide timing lease), check the cards first and source an environment file of that machine, so they do not run on your host as written. This page gives the direct commands instead: `cargo oxide build …`, then `target/release/<bin>` with the model file named in an environment variable or a flag.
+The `just` recipes and `tools/box.sh` are the maintainers' tooling for one remote workstation. `tools/box.sh` copies the tree there over ssh and runs the recipe's command inside the quotes. Those commands take lock files under `/root` (a gate lock per card, a machine-wide timing lease), check the cards first and source an environment file of that machine. On a Linux host with a card of its own, `BLOOMERY_BOX_LOCAL=1` runs the same recipes there instead, on the cards in view and with the locks in a directory of yours ([`contrib/local-check.md`](contrib/local-check.md), section 3). This page gives the direct commands: `cargo oxide build …`, then `target/release/<bin>` with the model file named in an environment variable or a flag.
 
 ## Toolchain
 
