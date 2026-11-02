@@ -98,6 +98,10 @@ pub struct Row {
     /// The groups and dispatches a token encodes where the row derives them
     /// from the layer list on paper, held beside the count model's own.
     pub count: Option<Count>,
+    /// The groups and dispatches a verify of two rows encodes where the row
+    /// derives them on paper from the layer list, held beside the count
+    /// model's own (`count::verify_count`).
+    pub verify: Option<Count>,
     /// The kernel mutants that edit this row's program.
     pub mutants: Mutants,
     /// The clauses the row does not run, each with the contract it lacks.
@@ -249,6 +253,7 @@ pub static QWEN35MOE: Row = Row {
     logit_abs: QWEN_LOGIT_ABS,
     deep_logit_abs: None,
     count: None,
+    verify: None,
     mutants: Mutants::Routed,
     skips: &[],
 };
@@ -267,6 +272,7 @@ pub static QWEN3MOE: Row = Row {
     logit_abs: QWEN_LOGIT_ABS,
     deep_logit_abs: None,
     count: None,
+    verify: None,
     mutants: Mutants::None,
     skips: &[
         (
@@ -288,6 +294,17 @@ pub static QWEN3MOE: Row = Row {
 /// Qwen3.8-27B's fixture: the gated delta net beside the attention layers and
 /// a dense FFN in every layer, no router and no experts. The prompt ids are
 /// Qwen3.6's d1k set's: the two families share a vocabulary and a tokenizer.
+///
+/// The verify's count is derived on paper from the four layers (three delta
+/// layers and an attention layer, each over a plain residual that hands on):
+/// a delta layer is P1 (1 group, 1 dispatch), the core (3 groups, 4
+/// dispatches: the prep, the ring and the scan, the post), the out (1 group, a
+/// dispatch a row, 2), two hand-ons, the pair and the down, 9 groups and 11
+/// dispatches; an attention layer is P1, the flash (2 groups, 2 dispatches:
+/// the append, the flash), the out, two hand-ons, the pair and the down, 8 and
+/// 8; the embed 1 and 1, and the head 2 groups (the logits, the picks) of 1 +
+/// 2 dispatches: 1 + 3 · 9 + 8 + 2 = 38 groups, 1 + 3 · 11 + 8 + 3 = 45
+/// dispatches, 37 barriers.
 pub static QWEN38D: Row = Row {
     name: "qwen38d",
     arch: "qwen38d",
@@ -301,6 +318,10 @@ pub static QWEN38D: Row = Row {
     logit_abs: QWEN_LOGIT_ABS,
     deep_logit_abs: None,
     count: None,
+    verify: Some(Count {
+        groups: 38,
+        dispatches: 45,
+    }),
     mutants: Mutants::Dense,
     skips: &[(
         "p_profile",
@@ -337,6 +358,7 @@ pub static LFM3: Row = Row {
         groups: 171,
         dispatches: 171,
     }),
+    verify: None,
     mutants: Mutants::Lfm3,
     skips: &[(
         "m_mlx_folder",
@@ -376,6 +398,7 @@ pub static LLAMA: Row = Row {
         groups: 31,
         dispatches: 31,
     }),
+    verify: None,
     mutants: Mutants::Llama,
     skips: &[
         (
@@ -446,6 +469,11 @@ const QWEN3_SKIPS: &[(&str, &str)] = &[
 /// every reader of a layer's two halves (the next layer's P1 of one weight type, the gate-up, the
 /// head) is a launch of a type other than F32 (`Arena::hands_on`): every projection of the folder
 /// is 4-bit with groups of 64. A cut of another layer count encodes 7 · layers + 3.
+///
+/// The verify's count is four attention layers of 8 groups and 8 dispatches (P1, the flash's
+/// append and its flash, the out, two hand-ons, the pair, the down), the embed's 1 and 1 and the
+/// head's 2 groups of 1 + 2 dispatches: 1 + 4 · 8 + 2 = 35 groups, 1 + 4 · 8 + 3 = 36 dispatches,
+/// 34 barriers.
 pub static QWEN3: Row = Row {
     name: "qwen3",
     arch: "qwen3",
@@ -461,6 +489,10 @@ pub static QWEN3: Row = Row {
     count: Some(Count {
         groups: 31,
         dispatches: 31,
+    }),
+    verify: Some(Count {
+        groups: 35,
+        dispatches: 36,
     }),
     mutants: Mutants::Qwen3,
     skips: QWEN3_SKIPS,
@@ -490,6 +522,7 @@ pub static QWEN3T: Row = Row {
         groups: 31,
         dispatches: 31,
     }),
+    verify: None,
     mutants: Mutants::Qwen3,
     skips: QWEN3_SKIPS,
 };
@@ -520,6 +553,7 @@ pub static QWEN2: Row = Row {
         groups: 35,
         dispatches: 35,
     }),
+    verify: None,
     mutants: Mutants::Qwen2,
     skips: QWEN3_SKIPS,
 };

@@ -1,10 +1,12 @@
-//! The groups and the dispatches one qwen35moe token encodes.
+//! The groups and the dispatches one qwen35moe token encodes
+//! ([`token_count`]), and one verify of two or more rows
+//! ([`verify_count`]).
 //!
 //! The caller passes the layers it has. An empty list is the embed and the
 //! head's two groups, not a hidden default trunk.
 //!
-//! The token encoder is the caller: the e2e gate holds what one token
-//! encodes to this count.
+//! The token encoder is the caller: the e2e gate holds what one token, and
+//! one verify, encodes to these counts.
 
 use core::num::NonZeroU32;
 
@@ -237,6 +239,71 @@ fn fit(what: &str, n: Option<u32>) -> u32 {
         Some(n) => n,
         None => panic!("token count: the {what} count does not fit u32"),
     }
+}
+
+/// The groups and dispatches of a delta layer's core over a verify's rows
+/// (`Kernels::delta_rows_ring`): the prep, a barrier, the conv ring's commit
+/// and the delta scan, a barrier, the post: three groups, four dispatches.
+const VERIFY_DELTA_CORE: (u32, u32) = (3, 4);
+
+/// The groups and dispatches of one launch of an attention layer's flash over
+/// a verify's rows (`Kernels::attention_rows_layer`): the append of the rows'
+/// keys and values, a barrier, the flash.
+const VERIFY_FLASH: (u32, u32) = (2, 2);
+
+/// The groups of the verify's head: the logits, a barrier, the picks.
+const VERIFY_HEAD_GROUPS: u32 = 2;
+
+/// The groups and the dispatches one verify of `rows` rows encodes for
+/// `layers`, the encoder's own count (`EncodeCount`): a group is the run of
+/// dispatches between two barriers, so a verify has one barrier fewer than
+/// its groups, the head's picks being its last group.
+///
+/// The verify's groups are not the token's: its delta core is three groups of
+/// four dispatches and its flash two of two for each of `flash_launches`
+/// launches (one while its rows share a segment count), the delta layers' out
+/// projection one group of a dispatch a row, and the head two groups, the
+/// logits and then a pick a row. The embed is one group; P1, the attention's
+/// out, the gate-up, the down, an attention layer's biases and each of a plain
+/// residual's two hand-ons are one group of one dispatch each, P1 of its
+/// dispatches. What the verify does not serve (a short conv layer, a routed
+/// FFN, a sandwich) panics by name, as a count that does not fit `u32` does.
+pub fn verify_count(layers: &[Layer], rows: u32, flash_launches: u32) -> TokenCount {
+    let (mut groups, mut dispatches) = (1u32, 1u32);
+    let mut add = |g: u32, d: u32| {
+        groups = fit("verify group", groups.checked_add(g));
+        dispatches = fit("verify dispatch", dispatches.checked_add(d));
+    };
+    for layer in layers {
+        match *layer {
+            Layer::Delta { qkv, .. } => {
+                add(1, qkv.dispatches());
+                add(VERIFY_DELTA_CORE.0, VERIFY_DELTA_CORE.1);
+                add(1, rows);
+            }
+            Layer::Attention { v, bias, .. } => {
+                add(1, v.dispatches());
+                if bias {
+                    add(BIAS_GROUPS, BIAS_GROUPS);
+                }
+                let launches = |n: u32| fit("verify flash", n.checked_mul(flash_launches));
+                add(launches(VERIFY_FLASH.0), launches(VERIFY_FLASH.1));
+                add(1, 1);
+            }
+            Layer::ShortConv { .. } => panic!("verify count: a short conv layer is not served"),
+        }
+        match layer.ffn() {
+            FfnKind::Dense => add(FFN_GROUPS, FFN_GROUPS),
+            FfnKind::Routed => panic!("verify count: a routed FFN is not served"),
+        }
+        match layer.residual() {
+            Residual::Plain => {}
+            Residual::PlainHandOn => add(HANDON_GROUPS, HANDON_GROUPS),
+            Residual::Sandwich => panic!("verify count: a sandwich residual is not served"),
+        }
+    }
+    add(VERIFY_HEAD_GROUPS, rows.saturating_add(1));
+    TokenCount { groups, dispatches }
 }
 
 /// What one group of a token runs: the kinds a profiled token's groups are
@@ -747,6 +814,149 @@ mod tests {
             }
         );
         assert_eq!(layer(true).groups(), layer(false).groups() + 1);
+    }
+
+    /// The verify's layers over a dense FFN and a plain residual that hands
+    /// on, `kinds` a delta (`d`) or an attention (`a`) layer of one P1
+    /// dispatch each, an attention layer with biases when `bias`.
+    fn verify_layers(kinds: &str, bias: bool) -> Vec<Layer> {
+        kinds
+            .chars()
+            .map(|c| match c {
+                'd' => Layer::Delta {
+                    qkv: Projection::ONE,
+                    ffn: FfnKind::Dense,
+                    residual: Residual::PlainHandOn,
+                },
+                'a' => Layer::Attention {
+                    v: Projection::ONE,
+                    bias,
+                    ffn: FfnKind::Dense,
+                    residual: Residual::PlainHandOn,
+                },
+                other => panic!("no layer kind {other}"),
+            })
+            .collect()
+    }
+
+    /// A verify of two rows encodes what the layers' ops do, not the token's
+    /// one group an op: a delta layer is P1, a core of three groups and four
+    /// dispatches, an out of a dispatch a row, two hand-ons, the pair and the
+    /// down, 9 groups and 11 dispatches; an attention layer is P1, a flash of
+    /// two groups and two dispatches, the out, two hand-ons, the pair and the
+    /// down, 8 and 8; the embed is one of each and the head two groups of
+    /// 1 + 2 dispatches. Qwen3.8-27B's four-layer cut (three delta layers and
+    /// an attention layer) is 38 groups (1 + 3 · 9 + 8 + 2) and 45 dispatches
+    /// (1 + 3 · 11 + 8 + 3), Qwen3's four attention layers 35 and 36, and the
+    /// 27B's 48 delta and 16 attention layers 563 and 660, where its profile's
+    /// 498 groups count a core as one and a delta out as a group a row.
+    ///
+    /// Mutant: `VERIFY_DELTA_CORE` is (1, 1), the delta out one dispatch, the
+    /// head's picks one dispatch, or a plain residual's hand-ons not counted.
+    #[test]
+    fn a_verify_encodes_the_ops_groups_not_the_tokens() {
+        let count = |kinds: &str| verify_count(&verify_layers(kinds, false), 2, 1);
+        assert_eq!(
+            count("ddda"),
+            TokenCount {
+                groups: 38,
+                dispatches: 45
+            }
+        );
+        assert_eq!(
+            count("aaaa"),
+            TokenCount {
+                groups: 35,
+                dispatches: 36
+            }
+        );
+        assert_eq!(
+            count(&"ddda".repeat(16)),
+            TokenCount {
+                groups: 563,
+                dispatches: 660
+            }
+        );
+        assert_eq!(
+            count(""),
+            TokenCount {
+                groups: 3,
+                dispatches: 4
+            }
+        );
+    }
+
+    /// The rows add a dispatch each to a delta layer's out and to the head's
+    /// picks, never a group; the flash's launches add two groups and two
+    /// dispatches each to an attention layer; the biases add one of each.
+    ///
+    /// Mutant: the delta out or the head's picks count a dispatch a launch
+    /// and not a row, `flash_launches` is not multiplied, or `BIAS_GROUPS` is
+    /// 0.
+    #[test]
+    fn a_verifys_rows_flash_launches_and_biases_move_its_count() {
+        let at = |kinds: &str, bias: bool, rows: u32, launches: u32| {
+            verify_count(&verify_layers(kinds, bias), rows, launches)
+        };
+        let base = at("da", false, 2, 1);
+        assert_eq!(
+            base,
+            TokenCount {
+                groups: 20,
+                dispatches: 23
+            }
+        );
+        // Two more rows: a delta out dispatch each and a pick each.
+        assert_eq!(
+            at("da", false, 4, 1),
+            TokenCount {
+                groups: base.groups,
+                dispatches: base.dispatches + 4
+            }
+        );
+        // A second launch of the flash.
+        assert_eq!(
+            at("da", false, 2, 2),
+            TokenCount {
+                groups: base.groups + 2,
+                dispatches: base.dispatches + 2
+            }
+        );
+        // The attention layer's biases.
+        assert_eq!(
+            at("da", true, 2, 1),
+            TokenCount {
+                groups: base.groups + 1,
+                dispatches: base.dispatches + 1
+            }
+        );
+    }
+
+    /// A routed FFN is refused by name.
+    #[test]
+    #[should_panic(expected = "a routed FFN is not served")]
+    fn a_verify_count_refuses_a_routed_ffn() {
+        let _ = verify_count(&[routed_delta(Projection::ONE)], 2, 1);
+    }
+
+    /// A short conv layer is refused by name.
+    #[test]
+    #[should_panic(expected = "a short conv layer is not served")]
+    fn a_verify_count_refuses_a_short_conv_layer() {
+        let _ = verify_count(&lfm3_target()[..1], 2, 1);
+    }
+
+    /// A sandwich residual is refused by name.
+    #[test]
+    #[should_panic(expected = "a sandwich residual is not served")]
+    fn a_verify_count_refuses_a_sandwich() {
+        let layer = Layer::Attention {
+            v: Projection::ONE,
+            bias: false,
+            ffn: FfnKind::Dense,
+            residual: Residual::Sandwich,
+        };
+        let _ = verify_count(&[layer], 2, 1);
     }
 
     #[test]

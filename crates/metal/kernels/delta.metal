@@ -52,6 +52,20 @@
 // before gdn_ring_rows overwrites the slots. A copy is the bits a chunk ending
 // at its row leaves; the chunk's own outputs do not move.
 //
+// The lane ring (gdn_rows_ring). The lanes of the state are a ring addressed by
+// position: with `w` the lane the word at `lane_at` names, row r of the chunk
+// writes its end state, the state at position pos + r + 1, to lane
+// (w + r + 1) mod lanes, and the word at `lane_to` names the last row's lane.
+// Keeping the first a rows of the chunk is then standing at position pos + a,
+// whose lane holds the state after row a - 1. A chunk of at most `lanes` rows
+// writes that many distinct lanes, and writes the lane it read only with its
+// last row, when it has `lanes` rows. Each thread loads its own sixteen values
+// of lane w before the first row and writes the same sixteen cells of the other
+// lanes, cells no other thread reads or writes, so a write to the lane the
+// chunk read is no race. The host refuses a chunk of more rows than lanes,
+// whose rows would end in one lane; a `lane_to` word that is not the last row's
+// lane raises the lane site and writes nothing.
+//
 // The state is read from the lane the word at `lane_at` names and written to
 // the lane the word at `lane_to` names. The two words may name one lane: the
 // step then updates it in place. Two lanes apart, the step leaves the lane it
@@ -752,6 +766,9 @@ kernel void gdn_prep_rows(device const float *x [[buffer(0)]],
 // `snaps`, the registers after each row it names land in that copy's lane of
 // `snap`, as the lane write after the last row would land them: a copy is the
 // state a chunk ending at its row leaves, and no output of the chunk moves.
+// With `RING`, the registers after every row but the last land in the lane ring
+// (see the header), and the last by the final write.
+template <bool RING>
 inline void gdn_rows_run(device const float *prep, device const uint *lane_buf,
                          device float *state, device float *g, constant DeltaRowsArgs &args,
                          device atomic_uint *faults, device float *snap,
@@ -764,6 +781,11 @@ inline void gdn_rows_run(device const float *prep, device const uint *lane_buf,
     uint word = lane_buf[args.step.lane_at];
     uint word_to = lane_buf[args.step.lane_to];
     bool lane_ok = word < args.step.lanes && word_to < args.step.lanes;
+    if (RING) {
+        // The last row's lane is word + rows, mod lanes: the lane the write word
+        // names. The host has refused more rows than lanes.
+        lane_ok = lane_ok && word_to == (word + args.rows) % args.step.lanes;
+    }
     uint base = ((word * n_v + seat.h) * head + seat.col) * head;
     uint base_to = ((word_to * n_v + seat.h) * head + seat.col) * head;
     uint cell = (seat.h * head + seat.col) * head;
@@ -814,6 +836,17 @@ inline void gdn_rows_run(device const float *prep, device const uint *lane_buf,
             }
             ++copy;
         }
+        if (RING) {
+            // The registers after row r are the state at position pos + r + 1:
+            // the lane of that position, the last row's by the final write.
+            if (r + 1u < args.rows && lane_ok) {
+                uint at_row = (word + r + 1u) % args.step.lanes;
+                device float *ring_lane = state + ((at_row * n_v + seat.h) * head + seat.col) * head;
+                for (uint i = 0u; i < 16u; ++i) {
+                    ring_lane[key_of(seat.j, i)] = st[i];
+                }
+            }
+        }
     }
     if (lane_ok) {
         for (uint i = 0u; i < 16u; ++i) {
@@ -832,8 +865,24 @@ kernel void gdn_rows(device const float *prep [[buffer(0)]],
                      uint3 tpt [[thread_position_in_threadgroup]],
                      ushort tiisg [[thread_index_in_simdgroup]],
                      ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    gdn_rows_run(prep, lane_buf, state, g, args, faults, nullptr, nullptr, tgp, tpt, tiisg,
-                 sgitg);
+    gdn_rows_run<false>(prep, lane_buf, state, g, args, faults, nullptr, nullptr, tgp, tpt, tiisg,
+                        sgitg);
+}
+
+// gdn_rows that leaves the lane ring: row r's end state in lane
+// (lane_at's lane + r + 1) mod lanes, the last row's by the final write.
+kernel void gdn_rows_ring(device const float *prep [[buffer(0)]],
+                          device const uint *lane_buf [[buffer(1)]],
+                          device float *state [[buffer(2)]],
+                          device float *g [[buffer(3)]],
+                          constant DeltaRowsArgs &args [[buffer(4)]],
+                          device atomic_uint *faults [[buffer(5)]],
+                          uint3 tgp [[threadgroup_position_in_grid]],
+                          uint3 tpt [[thread_position_in_threadgroup]],
+                          ushort tiisg [[thread_index_in_simdgroup]],
+                          ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    gdn_rows_run<true>(prep, lane_buf, state, g, args, faults, nullptr, nullptr, tgp, tpt, tiisg,
+                       sgitg);
 }
 
 // gdn_rows with the copies `snaps` names: copy k's lane is `lane_len` floats
@@ -850,7 +899,8 @@ kernel void gdn_rows_snap(device const float *prep [[buffer(0)]],
                           uint3 tpt [[thread_position_in_threadgroup]],
                           ushort tiisg [[thread_index_in_simdgroup]],
                           ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    gdn_rows_run(prep, lane_buf, state, g, args, faults, snap, &snaps, tgp, tpt, tiisg, sgitg);
+    gdn_rows_run<false>(prep, lane_buf, state, g, args, faults, snap, &snaps, tgp, tpt, tiisg,
+                        sgitg);
 }
 
 // The numerators and the partial sums of a chunk of rows, from the column

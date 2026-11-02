@@ -43,6 +43,13 @@
 //!   [`SNAPS`] copies: a further mark ends the pass there. A mark out of
 //!   order or outside the call is refused by name before any step runs.
 //!
+//! - `verify` and `commit`, [`runtime::Verify`]: `M` ids of 2 to
+//!   [`VERIFY_ROWS`] as one pass whose row `r` is the step at the position
+//!   after `r` rows (`session/verify.rs`), and the commit that keeps the first
+//!   rows of it by moving the position: no launch, no copy. The session waits
+//!   for the commit; the token a chain step ran ahead is dropped when the
+//!   verify starts.
+//!
 //! What it refuses:
 //!
 //! - a prompt of no ids, one that would pass the cache's last row, and
@@ -50,12 +57,17 @@
 //! - a cut where no checkpoint stands between 0 and the position (the
 //!   ledger's refusal, by name); a cut to the position does nothing and a
 //!   cut to 0 resets;
-//! - every mutating call of a session a fault poisoned, until `reset`.
+//! - every mutating call of a session a fault poisoned, until `reset`;
+//! - a step, a prompt, a pass, a second verify, a cut and a checkpoint while a
+//!   verify waits for its commit, a commit of none or of more than its rows,
+//!   and a verify of a file whose layers the pass does not serve
+//!   ([`Session::verify_serves`]).
 
 use runtime::prompt::{PrefillMode, call_batches};
 use runtime::seqstate::Kept;
-use runtime::{Out, Target, Want};
+use runtime::{Out, Target, Verify, Want};
 
+use super::lanes::VERIFY_ROWS;
 use super::session::{PassOut, Session, SessionError, StateOut, StepMode};
 use crate::kernels::{PASS_ROWS, SNAPS};
 
@@ -168,10 +180,11 @@ impl Target for Session {
 
     fn step(&mut self, id: u32, want: Want) -> Result<Out<'_>, SessionError> {
         // The mode by the read-back asked: the pick a greedy loop feeds back
-        // is the id a chained token embeds ahead; a Logits call's row must
-        // be this token's, and a token ahead would overwrite it.
+        // is the id a chained token embeds ahead, unless the caller chose
+        // host-fed picks ([`Session::set_argmax_mode`]); a Logits call's row
+        // must be this token's, and a token ahead would overwrite it.
         let mode = match want {
-            Want::Argmax => StepMode::Chain,
+            Want::Argmax => Session::argmax_mode(self),
             Want::Logits => StepMode::HostFed,
         };
         let pick = Session::step(self, id, mode)?.id;
@@ -192,6 +205,26 @@ impl Target for Session {
 
     fn reset(&mut self) -> Result<(), SessionError> {
         Session::reset(self)
+    }
+}
+
+impl Verify for Session {
+    const MAX_ROWS: usize = VERIFY_ROWS;
+
+    fn verify<const M: usize>(&mut self, rows: [u32; M]) -> Result<[u32; M], SessionError> {
+        const {
+            assert!(
+                M >= 2 && M <= VERIFY_ROWS,
+                "a verify of the Metal session takes 2 to VERIFY_ROWS rows"
+            );
+        }
+        let mut picks = [0u32; M];
+        Session::verify_rows(self, &rows, &mut picks)?;
+        Ok(picks)
+    }
+
+    fn commit(&mut self, accepted: usize) -> Result<(), SessionError> {
+        Session::commit_rows(self, accepted)
     }
 }
 

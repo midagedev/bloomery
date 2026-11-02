@@ -7,7 +7,7 @@
 //! same blocks with an f64 dot, held to the band `oracle.rs` derives.
 //! `--list` prints the clause names in the order the gate runs them: the
 //! mat-vec clauses, then the A4 ones and the requantized A8, A4H and A8H
-//! ones, then the token's kernels
+//! ones, then the M-row family's, then the token's kernels
 //! (delta, router, experts, attention, head), then the prompt pass's, then
 //! the tensor-op GEMMs' (`clauses_tensor.rs`).
 //!
@@ -81,6 +81,8 @@ mod clauses_handon;
 mod clauses_head;
 #[path = "clauses_matvec.rs"]
 mod clauses_matvec;
+#[path = "clauses_mrows.rs"]
+mod clauses_mrows;
 #[path = "clauses_norm.rs"]
 mod clauses_norm;
 #[path = "clauses_q5k.rs"]
@@ -1163,6 +1165,7 @@ fn clause_table<'a>(
                 "f32_seg",
                 Box::new(|| clauses_f32::f32_seg(ctx.harness)) as ClauseRun,
             )))
+            .chain(clauses_mrows::table(ctx.harness))
             .chain(clauses_sites::table(ctx.harness))
             .chain(clauses_gemm::table(ctx.harness, ctx.fixture, mlx))
             .chain(clauses_requant::gemm_table(ctx.harness, mlx))
@@ -1316,5 +1319,33 @@ pub fn main() -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every mutant of every row's table edits the row's instance source as
+    /// many times as it names: a kernel file that adds a copy of a text a
+    /// mutant finds turns the mutant into an error by name on the device, and
+    /// a clause whose control is a mutant (`row_tail_reads`) into a red one.
+    /// No device is opened.
+    #[test]
+    fn every_mutant_finds_its_text_as_often_as_it_names() {
+        let mut bad = Vec::new();
+        for row in INSTANCE_ROWS {
+            for (mutant, program) in mutants::all(row.table) {
+                if let Err(e) = mutants::source_at(row.instance, mutant, program) {
+                    bad.push(format!("[{}] {e}", row.instance.name));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "{} mutants do not apply:\n{}",
+            bad.len(),
+            bad.join("\n")
+        );
     }
 }

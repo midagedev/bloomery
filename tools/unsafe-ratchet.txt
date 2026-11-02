@@ -1010,7 +1010,10 @@ levers 0 0 0
 # and a slot. session.rs's checkpoint reads each delta layer's state lane and ring as slices of their shared pages
 # with the stream idle (as logits_row does), and checkpoint.rs's restore reads a slot's pages, which no device work
 # binds, straight into the stores; each with its SAFETY line.
-metal 27 7 12
+# PIN(2026-11-03): metal 27 -> 28 blocks, new code, not old code relaxed: session/verify.rs's verify_row_logits reads
+# a verify row's logits as a slice of the head's shared pages with the stream idle and the verify waiting for its
+# commit (as logits_row does for a step), with its SAFETY line.
+metal 28 7 12
 # PIN(2026-10-02): model 112 -> 114 blocks, 29 -> 30 fns, new code, not old code relaxed: the union's row lanes
 # (ops.rs PairWork::compute_lanes, the one unsafe fn) read the pass's quantized columns and write their output
 # cells, two blocks, each with its SAFETY line.

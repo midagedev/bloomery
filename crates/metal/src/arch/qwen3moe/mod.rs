@@ -10,6 +10,7 @@ pub mod check;
 pub mod count;
 #[cfg(target_os = "macos")]
 pub mod generate;
+pub mod lanes;
 #[cfg(target_os = "macos")]
 mod ops;
 #[cfg(target_os = "macos")]

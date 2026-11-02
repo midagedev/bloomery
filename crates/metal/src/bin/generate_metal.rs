@@ -7,7 +7,7 @@
 //!                    (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C]
 //!                    [--print-ids] [--ignore-eos] [--repeat N] [--profile [N]]
 //!                    [--profile-layers] [--step-times [N]] [--prefill batch|steps]
-//!                    [--pass-times U] [--logits-hash [N]]
+//!                    [--pass-times U] [--logits-hash [N]] [--draft lookup]
 //!     generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
 //!
 //! The model is a GGUF file's first shard or a checkpoint folder (an MLX
@@ -34,6 +34,64 @@
 //! end-of-generation id equal the run without the flag. A decode timed at a
 //! depth of real text then is not cut short; the summary prints
 //! `ignore_eos=true`.
+//!
+//! `--draft lookup` (off by default; `lookup` is the one draft) runs the loop
+//! over the lookup draft (`runtime::Speculative` of `runtime::Lookup` behind
+//! the width chooser, `runtime::width::Choosing`, as the CUDA family runs it):
+//! a pass proposes the one id the context's n-grams name and the chooser
+//! verifies it with the token at the position in one pass of two rows
+//! (`Session::verify_rows`), keeping the rows the session's own argmax agrees
+//! with, or runs one step in its place while the verify's wall over the
+//! step's says the proposals keep too few rows to repay it; a pass with no
+//! verified proposal is one host-fed step (a chained step's token ahead would
+//! be dropped by a verify that follows). `BLOOMERY_MTP_WIDTH=cost` (unset, as
+//! the CUDA family's) is the chooser deciding by the walls it reads off the
+//! host clock; `BLOOMERY_MTP_WIDTH=fixed` verifies every proposal, the
+//! same-binary arm. The ids are the plain run's, bit for bit, in
+//! both modes (a verify row is the bits of the step at its position), so
+//! `--print-ids` of the runs is one compare. The file's layers must be ones the
+//! verify pass serves (a dense A4 FFN, attention and delta layers:
+//! `Session::verify_serves`); any other file is refused by name before the
+//! run. `BLOOMERY_MTP_WIDTH` set beside no `--draft` is refused by name. Each run's summary
+//! block adds, after `stop=`:
+//!
+//!     draft=lookup draft_width=<cost|fixed> draft_proposals=<passes that
+//!     verified a proposal> draft_accepted=<drafts the argmax kept>
+//!     draft_partial=<proposals that kept one row> draft_steps=<passes that
+//!     verified no proposal: none was made, or the gate was closed>
+//!     draft_verify_ms=<the verify passes' mean wall>
+//!     draft_verify_after_verify_ms=<that of those that follow a verify>
+//!     draft_verify_after_step_ms=<that of those that follow a step, which waits
+//!     out the token the step ran ahead> draft_step_ms=<the step passes' mean
+//!     wall> draft_verify_over_step=<the verify-after-verify wall over the step
+//!     wall>
+//!     draft_gate=<under cost: 0 when the chooser's gate ended closed, 1
+//!     open> draft_closed=<the passes the chooser ran with the gate closed,
+//!     its probes among them> draft_costs=<the step's and the verify's cost
+//!     median in ms, `-` while fewer than four readings> draft_a=<the mean
+//!     acceptance of a proposal's id, the chooser's calibration of it>
+//!     draft_rates=<the gate's rate of the step and of the verify, positions
+//!     a millisecond>
+//!     discarded_ahead=<tokens a chain step ran ahead that a verify dropped,
+//!     the session's count so far; the lookup's own steps run none>
+//!
+//! `--profile [N]` with `--draft lookup` adds the verify's own profile after the
+//! step's, N verifies of two rows each way, each verify keeping both rows. The
+//! `vprof` lines are the step profile's, a command buffer a group, waited: the
+//! groups' GPU time and bytes a verify (`--profile-layers` a layer each), the
+//! delta layers' out projection a group a row. The `vtimes` lines are the
+//! verify as the session runs it, one command buffer, stamped on the host and
+//! the GPU: how many buffers, the host's waits, the wall split into `lead` (the
+//! call to the first buffer's GPU start: the whole verify's encode comes
+//! first), `gpu` (the buffers' seconds), `gaps` (the GPU's idle between
+//! buffers, none for one) and `tail`, the buffers a slow host held up
+//! (`host_late`), the host's encode, and what the buffer encoded (`encoded`: the
+//! groups, dispatches and barriers). `vcompare` sets the groups' sum beside the
+//! buffers' sum and the wall.
+//!
+//! The two means leave out the run's first pass, which carries what the prompt
+//! left behind; a kind with no pass past it prints `none`. They are
+//! development-loop numbers, as the walls above are.
 //!
 //! `--repeat N` (default 1) runs the prompt N times on the one open, the
 //! session reset before each run after the first (the reset the server's
@@ -62,8 +120,9 @@
 //!     decode_rest_ms=<the mean of the others> resident_bytes=<the
 //!     residency set's bytes> residency_requests=<its requests>
 //!
-//! The decode rate is the loop's passes over its wall: generated token 0
-//! comes from the prompt call and is in `decode_tokens`, not in the rate. A
+//! The decode rate is the loop's tokens over its wall: generated token 0
+//! comes from the prompt call and is in `decode_tokens`, not in the rate (a plain
+//! pass keeps one token, so there it is the passes over the wall). A
 //! run of one token has no pass, and its rate prints `none`.
 //!
 //! `--pass-times U[,U…]` times, for each U, the ops of one pass of U prompt
@@ -142,17 +201,21 @@ mod cli {
     use bloomery_metal::arch::qwen3moe::{
         check,
         count::{GroupKind, KINDS},
-        generate::{Generated, greedy},
+        generate::{Generated, greedy, greedy_lookup},
         plan,
-        session::{Op, PassOut, PassSample, ProfileGroup, Session, StateOut, StepMode},
+        session::{
+            Op, PassOut, PassSample, ProfileGroup, Session, StateOut, StepMode, VerifyTrace,
+        },
     };
     use bloomery_metal::device::MetalDevice;
+    use bloomery_metal::encode::EncodeCount;
     use bloomery_metal::kernels::PASS_ROWS;
     use bloomery_metal::model_arg;
     use hf::source::Source;
     use model_hf::ModelFile;
     use runtime::prompt::PrefillMode;
-    use runtime::{Out, Target, Want};
+    use runtime::width::Mode as WidthMode;
+    use runtime::{Out, Target, Verify, Want};
 
     /// The model file, as the CUDA generate CLIs name it.
     const MODEL_ENV: &str = "BLOOMERY_REF_MODEL";
@@ -180,7 +243,7 @@ mod cli {
     const CTX_DEFAULT: usize = 4096;
 
     const USAGE: &str = "\
-generate_metal [-m PATH | --hf REPO] (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids] [--ignore-eos] [--repeat N] [--profile [N]] [--profile-layers] [--step-times [N]] [--prefill batch|steps] [--pass-times U[,U…]] [--logits-hash [N]]
+generate_metal [-m PATH | --hf REPO] (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids] [--ignore-eos] [--repeat N] [--profile [N]] [--profile-layers] [--step-times [N]] [--prefill batch|steps] [--pass-times U[,U…]] [--logits-hash [N]] [--draft lookup]
 generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
   the model is a GGUF file (its first shard) or a checkpoint folder, named by -m,
   by --hf (fetched into the cache) or by $BLOOMERY_REF_MODEL; defaults N 32, --ctx the smaller of 4096
@@ -189,8 +252,14 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
   room (exit 0 opens, 3 refused, 64 a header it cannot read); --print-ids prints the ids, not the text;
   --ignore-eos stops nothing at an end-of-generation id (the picks stay the device's argmax, unmasked);
   --repeat N runs the prompt N times on one open, each run with its own summary block;
+  --draft lookup runs the loop over the lookup draft, two rows a verify, the same ids as
+  the plain run and the accept counts and the verify's wall beside the step's printed;
+  BLOOMERY_MTP_WIDTH=cost (unset) lets the width chooser verify a proposal only while its kept rows
+  repay the verify's wall, =fixed verifies every proposal (it needs --draft);
   --profile [N] (default 32) steps N more tokens after the summary, each
-  group's GPU time and bytes printed; --profile-layers adds a layer each;
+  group's GPU time and bytes printed (with --draft lookup, N two-row verifies
+  after them, each group's, then each buffer's and the gaps between);
+  --profile-layers adds a layer each;
   --step-times [N] (default 32) steps N more tokens in each mode, the step
   clock's phases a mode printed; --prefill steps feeds the prompt a step an
   id, batch (the default) in passes; --pass-times U[,U…] times the ops of one
@@ -209,6 +278,7 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         "--prefill",
         "--pass-times",
         "--repeat",
+        "--draft",
         #[cfg(feature = "encode-trace")]
         "--encode-trace",
     ];
@@ -229,6 +299,23 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
     enum Prompt {
         Text(String),
         Ids(Vec<u32>),
+    }
+
+    /// The draft a run's loop proposes with: none, or the lookup's.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Draft {
+        None,
+        Lookup,
+    }
+
+    impl Draft {
+        /// The draft `--draft`'s value names, or why it names none.
+        fn from_name(s: &str) -> Result<Draft, String> {
+            match s {
+                "lookup" => Ok(Draft::Lookup),
+                _ => Err(format!("--draft {s}: lookup is the one draft")),
+            }
+        }
     }
 
     /// What `--profile` asked: how many tokens to step past the summary,
@@ -253,6 +340,11 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         /// `--logits-hash [N]`: the tokens whose logits are hashed.
         logits_hash: Option<usize>,
         prefill: PrefillMode,
+        /// `--draft lookup`: the loop proposes with the lookup draft.
+        draft: Draft,
+        /// `BLOOMERY_MTP_WIDTH`: the width chooser's mode behind the draft;
+        /// `Cost` unset, as the CUDA family's.
+        width: WidthMode,
         /// `--pass-times U[,U…]`: the rows of each pass whose ops are timed
         /// alone.
         pass_times: Option<Vec<usize>>,
@@ -348,7 +440,7 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
             .map(|(_, n)| n.unwrap_or(PROFILE_DEFAULT))
     }
 
-    fn parse() -> Result<Args, String> {
+    fn parse(width: Option<&str>) -> Result<Args, String> {
         if let Some(name) = unknown_flag() {
             return Err(format!("{name} is not a flag of this CLI"));
         }
@@ -445,6 +537,20 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
             Some(s) => PrefillMode::from_name(&s)
                 .ok_or_else(|| format!("--prefill {s}: batch or steps"))?,
         };
+        let draft = match flag("--draft")? {
+            None => Draft::None,
+            Some(s) => Draft::from_name(&s)?,
+        };
+        if let Some(w) = width
+            && draft == Draft::None
+        {
+            return Err(format!(
+                "{}={w}: it picks the width a drafted window verifies; give --draft lookup",
+                bloomery_levers::MTP_WIDTH
+            ));
+        }
+        let width = WidthMode::of(width)
+            .map_err(|_| format!("{}: cost or fixed", bloomery_levers::MTP_WIDTH))?;
         let model = model_source()?;
         Ok(Args {
             prompt,
@@ -457,6 +563,8 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
             step_times,
             logits_hash,
             prefill,
+            draft,
+            width,
             pass_times,
             #[cfg(feature = "encode-trace")]
             encode_trace,
@@ -586,6 +694,27 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
             s.pos() - steps as u32,
             s.pos() - 1
         );
+        let total = print_acc("prof", &acc, layers, steps, p.layers);
+        eprintln!(
+            "prof total groups={:.2} gpu_ms={:.3} bytes={:.0} gbps={:.1} decode_ms={}",
+            total.groups as f64 / steps as f64,
+            total.gpu_s / steps as f64 * 1e3,
+            total.bytes as f64 / steps as f64,
+            if total.gpu_s > 0.0 {
+                total.bytes as f64 / total.gpu_s / 1e9
+            } else {
+                0.0
+            },
+            decode_ms.map_or_else(|| "none".to_owned(), |ms| format!("{ms:.3}")),
+        );
+        Ok(())
+    }
+
+    /// The lines of an accumulated profile, `per` tokens (or verifies) deep:
+    /// one `{tag} op=` line a kind and, under `with_layers`, a line a layer of
+    /// the kind, the kinds in the token's walk order. The total of the kinds,
+    /// as the caller prints it.
+    fn print_acc(tag: &str, acc: &[Acc], layers: usize, per: usize, with_layers: bool) -> Acc {
         let kind_total = |kind: GroupKind| -> Acc {
             let mut t = Acc::default();
             for l in 0..=layers {
@@ -597,10 +726,10 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
             t
         };
         let line = |op: &str, layer: Option<usize>, a: &Acc| {
-            let n = steps as f64;
+            let n = per as f64;
             let at = layer.map_or_else(String::new, |l| format!(" layer={l}"));
             eprintln!(
-                "prof op={op}{at} groups={:.2} gpu_ms={:.3} bytes={:.0} gbps={:.1}",
+                "{tag} op={op}{at} groups={:.2} gpu_ms={:.3} bytes={:.0} gbps={:.1}",
                 a.groups as f64 / n,
                 a.gpu_s / n * 1e3,
                 a.bytes as f64 / n,
@@ -621,7 +750,7 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
             total.groups += t.groups;
             total.gpu_s += t.gpu_s;
             total.bytes += t.bytes;
-            if p.layers {
+            if with_layers {
                 for l in 0..layers {
                     let a = &acc[kind_index(kind) * (layers + 1) + l];
                     if a.groups != 0 {
@@ -630,17 +759,174 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
                 }
             }
         }
+        total
+    }
+
+    /// The rows of a profiled verify: the lookup draft's two.
+    const VERIFY_PROFILE_ROWS: usize = 2;
+
+    /// The `vprof` and `vtimes` lines after the step profile of a
+    /// `--draft lookup` run: `p.n` verifies of two rows with every group on a
+    /// command buffer of its own (the groups' GPU seconds and bytes, as the
+    /// step's `prof` lines), then `p.n` verifies as the session runs them
+    /// (one command buffer), the buffer stamped on the host and the GPU: the
+    /// buffers, the host's waits, the GPU's gaps between buffers and the
+    /// host's encode, with the wall split by what ran in it, and what the
+    /// buffer encoded; one `vcompare` line sets the groups' sum beside the
+    /// buffers' and the wall.
+    /// Each verify keeps both rows, so the session stands two positions on
+    /// each; the second row's id is the first's. A group's bytes are the step
+    /// group's at the verify's first position: the weights once, so a group
+    /// the verify runs a row at a time (the delta layers' out projection)
+    /// counts each launch's.
+    fn profile_verify_run(s: &mut Session, p: &Profile, mut id: u32) -> Result<(), String> {
+        let m = VERIFY_PROFILE_ROWS;
+        let rows = s.ctx() - s.pos() as usize;
+        let n = p.n.min(rows / (2 * m));
+        if n == 0 {
+            return Err(format!(
+                "vprof: the cache holds {rows} rows past position {}, fewer than two sets of \
+                 {m}-row verifies need; give --ctx more rows",
+                s.pos()
+            ));
+        }
+        let layers = s.layer_count();
+        let first = s.pos();
+        let mut acc: Vec<Acc> = vec![Acc::default(); KINDS.len() * (layers + 1)];
+        let mut groups: Vec<ProfileGroup> = Vec::new();
+        let mut picks = [0u32; VERIFY_PROFILE_ROWS];
+        let mut ids: Vec<Vec<u32>> = Vec::with_capacity(layers);
+        for _ in 0..n {
+            let pos = s.pos();
+            s.verify_profile(&[id; VERIFY_PROFILE_ROWS], &mut picks, &mut groups)
+                .map_err(|e| e.to_string())?;
+            Verify::commit(s, m).map_err(|e| e.to_string())?;
+            let probe = s.probe().map_err(|e| e.to_string())?;
+            ids.clear();
+            for l in 0..layers {
+                ids.push(probe.router_ids(l).map_err(|e| e.to_string())?);
+            }
+            for g in &groups {
+                let none: &[u32] = &[];
+                let routed = match g.kind {
+                    GroupKind::GateUp | GroupKind::Down => &ids[g.layer.unwrap_or(0)],
+                    _ => none,
+                };
+                let bytes = s
+                    .group_bytes(g, pos, routed)
+                    .map_err(|e| e.to_string())?
+                    .total();
+                let a = &mut acc[kind_index(g.kind) * (layers + 1) + g.layer.unwrap_or(layers)];
+                a.groups += 1;
+                a.gpu_s += g.gpu_s;
+                a.bytes += bytes;
+            }
+            id = picks[m - 1];
+        }
+        let mid = s.pos();
+        let mut trace = VerifyTrace::default();
+        let mut encoded: Option<EncodeCount> = None;
+        let (mut waits, mut sums) = (0u64, [0.0f64; 10]);
+        let (mut gap_max, mut encode_max) = (f64::NEG_INFINITY, 0.0f64);
+        for _ in 0..n {
+            s.verify_traced(&[id; VERIFY_PROFILE_ROWS], &mut picks, &mut trace)
+                .map_err(|e| e.to_string())?;
+            Verify::commit(s, m).map_err(|e| e.to_string())?;
+            let t = trace.summary().ok_or("a traced verify stamped no buffer")?;
+            waits += trace.waits;
+            for (sum, v) in sums.iter_mut().zip([
+                t.wall,
+                t.lead,
+                t.gpu,
+                t.gaps,
+                t.tail,
+                t.host_late as f64,
+                t.host_late_s,
+                t.encode,
+                t.overlapped as f64,
+                t.buffers as f64,
+            ]) {
+                *sum += v;
+            }
+            gap_max = gap_max.max(t.gap_max);
+            encode_max = encode_max.max(t.encode_max);
+            if encoded.is_some_and(|c| c != trace.count) {
+                return Err("the traced verifies encoded different counts".into());
+            }
+            encoded = Some(trace.count);
+            id = picks[m - 1];
+        }
+        let nf = n as f64;
         eprintln!(
-            "prof total groups={:.2} gpu_ms={:.3} bytes={:.0} gbps={:.1} decode_ms={}",
-            total.groups as f64 / steps as f64,
-            total.gpu_s / steps as f64 * 1e3,
-            total.bytes as f64 / steps as f64,
+            "vprof verifies={n} rows={m} at {first}..={} (development-loop numbers: one command \
+             buffer a group, waited; the real verify's buffers are not this; bytes are the step \
+             group's at the verify's first position, the weights once a launch)",
+            mid - 1
+        );
+        let total = print_acc("vprof", &acc, layers, n, p.layers);
+        let ops_s = total.gpu_s / nf;
+        eprintln!(
+            "vprof total groups={:.2} gpu_ms={:.3} bytes={:.0} gbps={:.1}",
+            total.groups as f64 / nf,
+            ops_s * 1e3,
+            total.bytes as f64 / nf,
             if total.gpu_s > 0.0 {
                 total.bytes as f64 / total.gpu_s / 1e9
             } else {
                 0.0
             },
-            decode_ms.map_or_else(|| "none".to_owned(), |ms| format!("{ms:.3}")),
+        );
+        let [
+            wall,
+            lead,
+            gpu,
+            gaps,
+            tail,
+            late,
+            late_s,
+            encode,
+            overlapped,
+            buffers,
+        ] = sums.map(|v| v / nf);
+        eprintln!(
+            "vtimes verifies={n} rows={m} at {mid}..={} (development-loop numbers: the verify as \
+             the session runs it, one command buffer, waited once)",
+            s.pos() - 1
+        );
+        eprintln!(
+            "vtimes buffers={buffers:.0} host_waits={:.2} wall_ms={:.3} lead_ms={:.3} \
+             gpu_ms={:.3} gaps_ms={:.3} tail_ms={:.3} (wall = lead + gpu + gaps + tail)",
+            waits as f64 / nf,
+            wall * 1e3,
+            lead * 1e3,
+            gpu * 1e3,
+            gaps * 1e3,
+            tail * 1e3
+        );
+        eprintln!(
+            "vtimes gap_us_mean={:.1} gap_us_max={:.1} overlapped={overlapped:.2} \
+             host_late={late:.2} host_late_ms={:.3} encode_us_mean={:.1} encode_us_max={:.1} \
+             encode_ms={:.3}",
+            gaps / (buffers - 1.0).max(1.0) * 1e6,
+            gap_max * 1e6,
+            late_s * 1e3,
+            encode / buffers * 1e6,
+            encode_max * 1e6,
+            encode * 1e3
+        );
+        let c = encoded.ok_or("no traced verify ran")?;
+        eprintln!(
+            "vtimes encoded groups={} dispatches={} barriers={}",
+            c.groups, c.dispatches, c.barriers
+        );
+        eprintln!(
+            "vcompare ops_gpu_ms={:.3} buffers_gpu_ms={:.3} wall_ms={:.3} buffers_over_ops={:.3} \
+             wall_over_ops={:.3}",
+            ops_s * 1e3,
+            gpu * 1e3,
+            wall * 1e3,
+            gpu / ops_s,
+            wall / ops_s
         );
         Ok(())
     }
@@ -857,16 +1143,21 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
     }
 
     pub(super) fn run() -> ExitCode {
-        // No lever row acts on this CLI; startup still refuses a retired
-        // name that is set, and a bare `--levers` prints the table.
-        if let Err(e) = bloomery_levers::at_main_with_flags(&[], has_flag) {
-            eprintln!("generate_metal: {e}");
-            return ExitCode::from(1);
-        }
+        // `BLOOMERY_MTP_WIDTH` is the one lever row this CLI acts on; startup
+        // refuses a retired name that is set, and a bare `--levers` prints the
+        // table.
+        let levers =
+            match bloomery_levers::at_main_with_flags(&[bloomery_levers::MTP_WIDTH], has_flag) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("generate_metal: {e}");
+                    return ExitCode::from(1);
+                }
+            };
         if has_flag("--plan") {
             return plan_run();
         }
-        let a = match parse() {
+        let a = match parse(levers.mtp_width()) {
             Ok(a) => a,
             Err(e) => {
                 eprintln!("generate_metal: {e}");
@@ -992,6 +1283,7 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         prompt_ids: usize,
         run: Option<usize>,
         ignore_eos: bool,
+        draft: Draft,
         session: &Session,
     ) {
         let prompt_s = out.prompt_wall.as_secs_f64();
@@ -1007,7 +1299,12 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         if out.passes == 0 {
             eprintln!("decode_tok_s=none");
         } else {
-            eprintln!("decode_tok_s={:.1}", out.passes as f64 / decode_s);
+            // The tokens the loop produced, which a pass of the draft may keep
+            // two of; a plain pass keeps one, so the two counts are equal there.
+            eprintln!(
+                "decode_tok_s={:.1}",
+                out.tokens().saturating_sub(1) as f64 / decode_s
+            );
         }
         if ignore_eos {
             eprintln!("ignore_eos=true");
@@ -1020,7 +1317,65 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
                 eprintln!("decode_rest_ms={:.2}", mean * 1e3);
             }
         }
+        if draft == Draft::Lookup {
+            print_draft(out, session);
+        }
         eprintln!("residency_requests={}", session.residency().requests);
+    }
+
+    /// The `draft_*` lines of a `--draft lookup` run: what its passes were
+    /// ([`Generated::tally`]), the verify's mean wall beside the step's and
+    /// the width chooser's account ([`Generated::width`]).
+    fn print_draft(out: &Generated, session: &Session) {
+        let t = out.tally();
+        let ms = |d: Option<Duration>| {
+            d.map_or_else(
+                || "none".to_string(),
+                |d| format!("{:.2}", d.as_secs_f64() * 1e3),
+            )
+        };
+        eprintln!("draft=lookup");
+        if let Some(w) = &out.width {
+            eprintln!("draft_width={}", w.mode.word());
+        }
+        eprintln!("draft_proposals={}", t.proposals);
+        eprintln!("draft_accepted={}", t.accepted);
+        eprintln!("draft_partial={}", t.partial);
+        eprintln!("draft_steps={}", t.steps);
+        eprintln!("draft_verify_ms={}", ms(t.verify_wall));
+        eprintln!(
+            "draft_verify_after_verify_ms={}",
+            ms(t.verify_after_verify_wall)
+        );
+        eprintln!(
+            "draft_verify_after_step_ms={}",
+            ms(t.verify_after_step_wall)
+        );
+        eprintln!("draft_step_ms={}", ms(t.step_wall));
+        match (t.verify_after_verify_wall, t.step_wall) {
+            (Some(v), Some(s)) if !s.is_zero() => {
+                eprintln!(
+                    "draft_verify_over_step={:.3}",
+                    v.as_secs_f64() / s.as_secs_f64()
+                );
+            }
+            _ => eprintln!("draft_verify_over_step=none"),
+        }
+        if let Some(c) = out.width.as_ref().and_then(|w| w.counted.as_ref()) {
+            let list = |v: &[Option<f64>], places: usize| {
+                v.iter()
+                    .map(|x| x.map_or_else(|| "-".to_string(), |x| format!("{x:.places$}")))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            let a: Vec<Option<f64>> = c.gate.a.iter().map(|&a| Some(a)).collect();
+            eprintln!("draft_gate={}", c.gate.width);
+            eprintln!("draft_closed={}", c.tally.closed);
+            eprintln!("draft_costs={}", list(&c.gate.costs, 2));
+            eprintln!("draft_a={}", list(&a, 3));
+            eprintln!("draft_rates={}", list(&c.gate.rates, 6));
+        }
+        eprintln!("discarded_ahead={}", session.stats().discarded);
     }
 
     fn generate(a: &Args) -> Result<(), String> {
@@ -1073,8 +1428,13 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
             let mut stream = Stream {
                 decoder: (!a.print_ids).then(|| tokenizer::Decoder::new(&tok, true)),
             };
-            let out = greedy(session, &prompt, a.n, eog, |id| stream.id(id))
-                .map_err(|e| e.to_string())?;
+            let out = match a.draft {
+                Draft::None => greedy(session, &prompt, a.n, eog, |id| stream.id(id)),
+                Draft::Lookup => {
+                    greedy_lookup(session, &prompt, a.n, eog, a.width, |id| stream.id(id))
+                }
+            }
+            .map_err(|e| e.to_string())?;
             #[cfg(feature = "encode-trace")]
             if let Some(path) = &a.encode_trace {
                 let mut text = bloomery_metal::trace::finish();
@@ -1119,13 +1479,20 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         eprintln!("rows_arena_bytes={}", session.rows_arena_bytes());
         eprintln!("prompt_ids={}", prompt.len());
         let first = (a.repeat > 1).then_some(1);
-        print_run(&out, prompt.len(), first, a.ignore_eos, &session);
+        print_run(&out, prompt.len(), first, a.ignore_eos, a.draft, &session);
         let first_ids = out.ids.clone();
         for run in 2..=a.repeat {
             session.reset().map_err(|e| e.to_string())?;
             out = run_once(&mut session)?;
             same_ids(&first_ids, &out.ids, run)?;
-            print_run(&out, prompt.len(), Some(run), a.ignore_eos, &session);
+            print_run(
+                &out,
+                prompt.len(),
+                Some(run),
+                a.ignore_eos,
+                a.draft,
+                &session,
+            );
         }
         let decode_s = out.decode_wall.as_secs_f64();
         if let Some(p) = &a.profile {
@@ -1135,6 +1502,13 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
                 .ok_or("a profile of no token: the run picked none")?;
             let decode_ms = (out.passes > 0).then(|| decode_s / out.passes as f64 * 1e3);
             profile_run(&mut session, p, id, decode_ms)?;
+            if a.draft == Draft::Lookup {
+                let id = *out
+                    .ids
+                    .last()
+                    .ok_or("a verify profile of no token: the run picked none")?;
+                profile_verify_run(&mut session, p, id)?;
+            }
         }
         if let Some(us) = &a.pass_times {
             for &u in us {

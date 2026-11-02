@@ -68,6 +68,9 @@
 //! LFM3's instance, with the diagnostic rows and source cuts that split the
 //! gap to MLX's `qmv` into terms. It runs no other row. `--only d27` times
 //! Qwen3.8-27B's the same way (`d27.rs`), with each normed row's scaled twin.
+//! `--only mrow` times the M-row mat-vec family beside the 1-row launches at
+//! the 27B's shapes (`mrow.rs`), with a ratio row a shape and the step-weighted
+//! mean.
 //!
 //! `--geometry rows=N,sg=M,router_sg=K` compiles the kernels' own source with
 //! other values of the geometry constants — the rows a SIMD group owns
@@ -117,6 +120,9 @@ mod lfm3;
 
 #[path = "d27.rs"]
 mod d27;
+
+#[path = "mrow.rs"]
+mod mrow;
 
 /// The probe's working set, window, warm-up and trial counts.
 const WORKING_SET_BYTES: usize = 1 << 30;
@@ -1673,7 +1679,11 @@ us_p90, gbps.
                          `sweep` times each row under the geometry variants
                          of lfm3.rs too, `overlap` adds an arm of the window
                          in a concurrent encoder with no barrier. `d27` runs
-                         Qwen3.8-27B's rows the same way (d27.rs).
+                         Qwen3.8-27B's rows the same way (d27.rs), `mrow` the
+                         M-row mat-vec family beside the 1-row launches at
+                         those rows' shapes (mrow.rs): two arms a shape (the
+                         1-row launch and M = 2) over the same buffers, a
+                         `ratio` row a shape and the step-weighted `mean`.
   --trials N             timed command buffers per arm (default 16)
   --chain N              also time N back-to-back dispatches: arm lone (one
                          dispatch), serial and concurrent (a memory barrier
@@ -1917,6 +1927,9 @@ pub fn main() -> ExitCode {
     }
     if d27::selected(&run.only) {
         return d27::main(&run);
+    }
+    if mrow::selected(&run.only) {
+        return mrow::main(&run);
     }
 
     let device = match MetalDevice::open(&HOST) {

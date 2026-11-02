@@ -14,6 +14,8 @@
 //   load<LOAD>   its input load — plain, the norm on load (the gain and the
 //                sum of squares), or the route-weight form
 //   partial      the dot of one block against the loaded input
+//   partial_rows the dot of one block against M loaded inputs, the block's
+//                unpack shared (the M-row mat-vecs; A4's own today)
 //   fold_blocks, the folded down's K' in the quant's blocks, and the slot
 //   fold_slot    a block of K' belongs to; `head_scales`, `sums_finite` and
 //                `partial_head` serve the head-normed row loop, `value` the
@@ -667,6 +669,49 @@ struct A4T {
         }
     }
 
+    // `load` for M activation rows at once, the rows `row_span` apart: the
+    // gain's float4 of a step is read once for every row, and the loop runs
+    // the steps outside and the rows inside, so one gain vector is live at a
+    // time and not four. Each row takes `load`'s own operations in `load`'s
+    // own order (its squares and its input sum step by step), so the row's
+    // registers and sum are `load`'s bits.
+    template <LoadMode LOAD, short M>
+    static inline void load_rows(thread Lane * lanes,
+                                 device const float * block,
+                                 long row_span,
+                                 device const float * gain,
+                                 thread float * sum_sq) {
+        const int base = input_offset(lanes[0]);
+        FOR_UNROLL (short m = 0; m < M; ++m) {
+            lanes[m].sumy = 0.f;
+        }
+        FOR_UNROLL (short l = 0; l < 4; ++l) {
+            float4 gq = float4(1.f);
+            if (LOAD == LOAD_NORM) {
+                gq = act4(gain + base + 4 * l);
+            }
+            FOR_UNROLL (short m = 0; m < M; ++m) {
+                const float4 xq = act4(block + (long)m * row_span + base + 4 * l);
+                float a0 = xq.x;
+                float a1 = xq.y;
+                float a2 = xq.z;
+                float a3 = xq.w;
+                if (LOAD == LOAD_NORM) {
+                    sum_sq[m] += (a0 * a0 + a1 * a1) + (a2 * a2 + a3 * a3);
+                    a0 *= gq.x;
+                    a1 *= gq.y;
+                    a2 *= gq.z;
+                    a3 *= gq.w;
+                }
+                lanes[m].yl[4 * l + 0] = a0;
+                lanes[m].yl[4 * l + 1] = a1;
+                lanes[m].yl[4 * l + 2] = a2;
+                lanes[m].yl[4 * l + 3] = a3;
+                lanes[m].sumy += (a0 + a1) + (a2 + a3);
+            }
+        }
+    }
+
     static inline bool sums_finite(const thread Lane &lane) {
         return isfinite(lane.sumy);
     }
@@ -703,6 +748,65 @@ struct A4T {
         return Pair::scale_of_word(sb) * ((acc[0] + 1.f/16.f * acc[1]) +
                                           (1.f/256.f * acc[2] + 1.f/4096.f * acc[3]))
              + Pair::bias_of_word(sb) * lane.sumy;
+    }
+
+    // The reads `partial` makes of one group, taken apart: the lane's two code
+    // words and the scale-and-bias word. The M-row loop loads every weight
+    // row's words first and dots them into every input row, so the weight
+    // reads are all in flight before the first is used.
+    struct Words {
+        uint32_t w0;
+        uint32_t w1;
+        uint32_t sb;
+    };
+
+    static inline Words words_of(device const Block & blk, const thread Lane & lane) {
+        device const uint32_t * q = blk.qs + 2 * lane.iq;
+        Words wd;
+        wd.sb = *(device const uint32_t *)&blk.scale;
+        wd.w0 = q[0];
+        wd.w1 = q[1];
+        return wd;
+    }
+
+    // The M-row form of `partial`: one group's contribution to N loaded
+    // inputs at once, the group's code words masked and widened once and
+    // shared, the per-input products the only work the sharing adds. Each
+    // input's accumulator takes `partial`'s own value order (the words in
+    // order, each lane's four nibble terms) and the finishing expression is
+    // `partial`'s own, so the M-row row loop's row m is the 1-row kernel's
+    // bits on row m's input; THIS ORDER IS THE GATE. A code, a nibble masked
+    // in place, is `(float)(word & mask)`, widened as the float whose bits
+    // are the mask under the exponent of 2^23, less 2^23: the same exact
+    // value (a mask is under 2^23) with no integer-to-float conversion, the
+    // high half of the register constant under the 16-bit mask. `lanes[m]`
+    // holds input m's loaded share; `sum[m]` is the caller's running sum.
+    template <short N>
+    static inline void partial_rows(const thread Words & wd,
+                                    const thread Lane * lanes,
+                                    thread float * sum) {
+        const uint32_t words[4] = {wd.w0 & 0xFFFFu, wd.w0 >> 16, wd.w1 & 0xFFFFu, wd.w1 >> 16};
+        float4 acc[N];
+        FOR_UNROLL (short m = 0; m < N; ++m) {
+            acc[m] = float4(0.f, 0.f, 0.f, 0.f);
+        }
+        FOR_UNROLL (short w = 0; w < 4; ++w) {
+            const float4 code = float4(as_type<float>((words[w] & 0x000Fu) | 0x4B000000u) - 8388608.f,
+                                       as_type<float>((words[w] & 0x00F0u) | 0x4B000000u) - 8388608.f,
+                                       as_type<float>((words[w] & 0x0F00u) | 0x4B000000u) - 8388608.f,
+                                       as_type<float>((words[w] & 0xF000u) | 0x4B000000u) - 8388608.f);
+            FOR_UNROLL (short m = 0; m < N; ++m) {
+                acc[m][0] += lanes[m].yl[4 * w + 0] * code[0];
+                acc[m][1] += lanes[m].yl[4 * w + 1] * code[1];
+                acc[m][2] += lanes[m].yl[4 * w + 2] * code[2];
+                acc[m][3] += lanes[m].yl[4 * w + 3] * code[3];
+            }
+        }
+        FOR_UNROLL (short m = 0; m < N; ++m) {
+            sum[m] += Pair::scale_of_word(wd.sb) * ((acc[m][0] + 1.f/16.f * acc[m][1]) +
+                                                    (1.f/256.f * acc[m][2] + 1.f/4096.f * acc[m][3]))
+                   + Pair::bias_of_word(wd.sb) * lanes[m].sumy;
+        }
     }
 
     // A 64-value group sits whole inside one 128-column value head, so the

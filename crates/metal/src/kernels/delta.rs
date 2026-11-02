@@ -14,7 +14,9 @@
 //! in parallel. The ring commit follows the state-free half, which is the last
 //! reader of the pre-chunk slots. A launch may also leave copies after rows
 //! inside its chunk ([`DeltaSnaps`]): each the state lane and the ring a chunk
-//! ending at that row leaves, the chunk's own outputs unmoved.
+//! ending at that row leaves, the chunk's own outputs unmoved, or leave the
+//! lane ring ([`Kernels::delta_rows_ring`]): each row's end state in the lane
+//! of the position after it, so keeping the first rows is moving the position.
 
 use bloomery_device::{DeviceError, Window, WindowMut};
 
@@ -25,7 +27,7 @@ use crate::fault::MetalFaultWord;
 use crate::geom::{DeltaGeom, HOST_GEOMETRY};
 use crate::library::{Library, Pipeline};
 
-use super::delta_geom::SNAPS;
+use super::delta_geom::{SNAPS, ring_fits};
 use super::geometry::VALUE_HEADS;
 use super::rows::check_strided;
 use super::{Kernels, check_window_len, pack, word};
@@ -549,8 +551,9 @@ pub struct DeltaRowsParams<'w> {
 }
 
 /// The pipelines of the rows launch: the state-free half, the recurrence, the
-/// numerators and partials, and the ring commit; and the recurrence and the
-/// ring's copy of a launch that leaves copies.
+/// numerators and partials, and the ring commit; the recurrence and the
+/// ring's copy of a launch that leaves copies; and the recurrence of a launch
+/// that leaves the lane ring.
 pub(crate) struct RowsPipelines {
     prep: Pipeline,
     rows: Pipeline,
@@ -558,6 +561,7 @@ pub(crate) struct RowsPipelines {
     ring: Pipeline,
     rows_snap: Pipeline,
     ring_snap: Pipeline,
+    rows_ring: Pipeline,
 }
 
 impl RowsPipelines {
@@ -569,6 +573,7 @@ impl RowsPipelines {
             ring: library.pipeline("gdn_ring_rows")?,
             rows_snap: library.pipeline("gdn_rows_snap")?,
             ring_snap: library.pipeline("gdn_ring_snap")?,
+            rows_ring: library.pipeline("gdn_rows_ring")?,
         })
     }
 }
@@ -650,6 +655,19 @@ fn check_rows(g: &DeltaGeom, p: &DeltaRowsParams<'_>) -> Result<(), DeviceError>
     Ok(())
 }
 
+/// What a lane-ring launch refuses beyond a rows launch: copies (its lanes are
+/// the copies), more rows than lanes (two rows would end in one lane), and
+/// more rows than the conv ring rolls back (a slot a kept row reads would hold
+/// a dropped row's input).
+fn check_ring(p: &DeltaRowsParams<'_>) -> Result<(), DeviceError> {
+    if p.snaps.is_some() {
+        return Err(refuse(
+            "a lane-ring launch takes no copies: its lanes are the copies",
+        ));
+    }
+    ring_fits(p.rows, p.lanes).map_err(|e| refuse(e.to_string()))
+}
+
 /// The copies of a chunk of `rows` rows whose ring is `ring` values: one to
 /// [`SNAPS`] rows, ascending, inside the chunk, and a lane and a ring a copy.
 fn check_snaps(
@@ -723,8 +741,45 @@ impl Kernels {
         encoder: &mut ComputeEncoder<'_>,
         p: DeltaRowsParams<'_>,
     ) -> Result<(), DeviceError> {
+        self.rows_launch(encoder, p, false)
+    }
+
+    /// [`Kernels::delta_rows`] that leaves the lane ring: with `w` the lane
+    /// the word at `lane_at` names, row `r`'s end state lands in lane
+    /// `(w + r + 1) mod lanes`, and the word at `lane_to` names the last
+    /// row's lane. Keeping the first `a` rows is standing at position
+    /// `pos + a`, which reads lane `(w + a) mod lanes`: the state after row
+    /// `a - 1`. The numerators, partials and conv ring are the rows launch's,
+    /// and the launch encodes the dispatches of a rows launch with no copies.
+    ///
+    /// A launch of `rows` rows needs `rows` lanes, and the conv ring, whose
+    /// slots are addressed by position, rolls back at most
+    /// [`PASS_ROWS`](super::delta_geom::PASS_ROWS) positions. A launch with
+    /// copies, with more rows than lanes or with more than the roll-back is
+    /// refused by name before it encodes anything. A `lane_to` word that is
+    /// not the last row's lane raises the lane site on the device and writes
+    /// no lane. The caller keeps the position bookkeeping
+    /// (`arch::qwen3moe::lanes`).
+    #[must_use = "a refused launch encoded nothing"]
+    pub fn delta_rows_ring(
+        &self,
+        encoder: &mut ComputeEncoder<'_>,
+        p: DeltaRowsParams<'_>,
+    ) -> Result<(), DeviceError> {
+        self.rows_launch(encoder, p, true)
+    }
+
+    fn rows_launch(
+        &self,
+        encoder: &mut ComputeEncoder<'_>,
+        p: DeltaRowsParams<'_>,
+        ring_lanes: bool,
+    ) -> Result<(), DeviceError> {
         let g = &self.geom.delta;
         check_rows(g, &p)?;
+        if ring_lanes {
+            check_ring(&p)?;
+        }
         let ch = g.channels(p.n_k).expect("check_rows fitted the channels");
         let layout = PrepLayout::of(g, p.n_k).expect("check_rows fitted the prepared row");
         let st = p.strides;
@@ -808,9 +863,10 @@ impl Kernels {
             RING_THREADS,
         )?;
 
-        let rows = match &snap {
-            Some(_) => &self.delta_rows.rows_snap,
-            None => &self.delta_rows.rows,
+        let rows = match (&snap, ring_lanes) {
+            (Some(_), _) => &self.delta_rows.rows_snap,
+            (None, true) => &self.delta_rows.rows_ring,
+            (None, false) => &self.delta_rows.rows,
         };
         encoder.set_pipeline(rows);
         let mut slot = Bindings::new(encoder);
