@@ -40,7 +40,7 @@ const _: () = assert!(HEAD_THREADS == 32 * HEAD_SIMD_GROUPS);
 
 /// The most rows a launch takes: the pick's loop steps a thread's row index
 /// four threadgroup widths at a time, and that sum stays a 32-bit word.
-const MAX_ROWS: usize = u32::MAX as usize - 4 * HEAD_THREADS;
+pub(super) const MAX_ROWS: usize = u32::MAX as usize - 4 * HEAD_THREADS;
 
 /// One head launch.
 pub struct HeadParams<'w> {

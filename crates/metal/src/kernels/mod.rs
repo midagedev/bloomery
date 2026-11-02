@@ -13,7 +13,10 @@
 //! Three mat-vecs live here, one concept each: the plain mat-vec of one
 //! tensor ([`matvec`]), the segmented mat-vec of up to four tensors of one
 //! type and one width in one dispatch ([`seg`]), and the head-normed residual
-//! mat-vec of a gated delta net's out projection ([`headnorm`]).
+//! mat-vec of a gated delta net's out projection ([`headnorm`]). A fourth
+//! family multiplies one weight read into several activation rows at once
+//! ([`matvec_rows`]): the plain and segmented mat-vecs, the gate-up pair and
+//! the head, each row the 1-row kernel's bits.
 //! The dense GEMM of R activation rows ([`gemm`]) is one more family, plain
 //! and segmented the same way: `kernels/gemm.metal`.
 //! The router ([`router`]) is one more pipeline: `kernels/router.metal`, its ticket `kernels/ticket.metal`.
@@ -25,7 +28,9 @@
 //! sandwich residual is `kernels/norm.metal`'s `norm_add_rows`, and the one-row join that
 //! hands its next launch the normed input is each type's `<q>_norm_add_next`
 //! ([`Kernels::norm_add_next`]), read by the scaled seg, pair and head entries ([`LoadNorm`]);
-//! a plain residual hands the same input on with `<q>_norm_next` ([`Kernels::norm_next`]).
+//! a plain residual hands the same input on with `<q>_norm_next` ([`Kernels::norm_next`]); the
+//! M-row family reads it in the scaled seg, pair and head entries too (the pair and the head
+//! take no other form) and hands it on over M rows ([`Kernels::norm_next_m`]).
 //! An attention layer's q, k and v biases are added to its P1 output in one dispatch ([`bias`]):
 //! `kernels/bias.metal`.
 
@@ -42,6 +47,7 @@ use crate::geometry;
 mod head;
 mod headnorm;
 mod matvec;
+mod matvec_rows;
 mod norm;
 mod routed;
 pub mod router;
@@ -90,6 +96,9 @@ pub use geometry::{
 pub use head::{HEAD_K, HEAD_SIMD_GROUPS, HEAD_THREADS, HeadParams};
 pub use headnorm::HeadNormParams;
 pub use matvec::{LoadNorm, MatvecParams, Mode, NormOnLoad, Quant};
+pub use matvec_rows::{
+    HeadMParams, MROWS, MatvecMParams, NormNextMParams, PairMParams, SegMParams,
+};
 pub use norm::NormRowsParams;
 pub use norm::{NormAddNextParams, NormAddRowsParams, NormNextParams};
 pub use routed::{
@@ -216,6 +225,12 @@ pub struct Kernels {
     /// `gemm_routed.metal`).
     routed: routed::RoutedPipelines,
     experts: experts::Pipelines,
+    /// The M-row mat-vec family (`matvec_rows.metal`): the A4 entries of
+    /// [`MROWS`] activation rows. Built at open with every other family, not
+    /// on a first verify: the pipeline scan reads the pipelines `Kernels`
+    /// builds, a missing entry is a named error at open, and the first verify
+    /// then pays no compile inside its own wall.
+    matvec_rows: matvec_rows::Pipelines,
     /// The gated delta step.
     delta: Pipeline,
     /// The gated delta step over rows, and the ring commit after it.
@@ -528,6 +543,7 @@ impl Kernels {
             shortconv: shortconv::Pipelines::new(library)?,
             routed: routed::RoutedPipelines::new(library)?,
             experts: experts::Pipelines::new(library, count)?,
+            matvec_rows: matvec_rows::Pipelines::new(library, count)?,
             delta: library.pipeline("gdn_step")?,
             delta_rows: delta::RowsPipelines::new(library)?,
             attention: attention::AttentionPipelines::new(library)?,

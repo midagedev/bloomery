@@ -20,8 +20,8 @@
 //! Two tokens may be committed at once, the second reading what the first
 //! writes. What the second would overwrite before the first is done is held
 //! twice: the step record (the head's id and the fault word) has a slot per
-//! position parity, and so does the delta state, whose lanes a token reads by
-//! its position's parity and writes by the next position's.
+//! position parity, and the delta state has its lanes ([`super::lanes`]): a
+//! token reads its position's lane and writes the next position's.
 
 use core::ops::Range;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -40,6 +40,8 @@ use super::check::{
     PostLayout, RopeLayout, Site, Values,
 };
 use super::count::{FfnKind, GroupBytes, GroupKind, Layer, Projection, Residual};
+use super::lanes::LANE_WORDS;
+pub(super) use super::lanes::{LANES, lane_of};
 use super::ops::Half;
 use super::session::SessionError;
 use crate::buffer::MetalBuffer;
@@ -53,14 +55,6 @@ const WHAT: &str = "qwen35moe arena";
 /// The most threads one open loads with: enough reads in flight to keep the
 /// drive at its streaming rate, each beside its own repack and copy.
 const LOAD_WORKERS: usize = 8;
-
-/// Lanes of the delta state: the token at `pos` reads lane [`lane_of`]`(pos)`
-/// and writes the next position's, so a token that ran and was not taken
-/// leaves the lane its replacement reads as it was.
-pub(super) const LANES: usize = 2;
-
-/// The lane words: word `i` names lane `i`.
-const LANE_WORDS: [u32; LANES] = [0, 1];
 
 /// Step record slots: the token at `pos` writes its id and raises its fault
 /// word in slot [`slot_of`]`(pos)`, so the host reads one token's record
@@ -76,11 +70,6 @@ pub(super) fn slot_of(pos: u32) -> usize {
 /// fed on the device embeds.
 pub(super) fn slot_before(pos: u32) -> usize {
     (pos as usize + RECORD_SLOTS - 1) % RECORD_SLOTS
-}
-
-/// The delta lane the token at `pos` reads; it writes `lane_of(pos + 1)`.
-pub(super) fn lane_of(pos: u32) -> usize {
-    pos as usize % LANES
 }
 
 /// One P1 dispatch: the segments of one weight type, in one buffer.
@@ -1295,7 +1284,7 @@ impl Arena {
     }
 
     /// Every store a token sequence writes back to its state at rest: the
-    /// caches, the recurrent states (both lanes) and rings, the tickets, the
+    /// caches, the recurrent states (every lane) and rings, the tickets, the
     /// id slots, the lane words. The fault words are the session's to clear,
     /// on its stream.
     pub(super) fn clear_stores(&mut self) -> Result<(), SessionError> {

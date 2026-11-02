@@ -38,7 +38,7 @@ use super::arena::{Arena, MixerBufs};
 use super::session::SessionError;
 use crate::buffer::MetalBuffer;
 use crate::geom::Geometry;
-use crate::kernels::{SNAPS, route_table_words};
+use crate::kernels::{SEGMENT_CAP, SNAPS, route_table_words};
 use crate::residency::Alloc;
 
 /// The widest a row of the delta numerator, the attention output or a short
@@ -136,6 +136,8 @@ pub(super) struct RowsArena {
     pub(super) bytes: u64,
     /// The copies of the delta layers' stores, once a pass has taken one.
     pub(super) snaps: Option<SnapBufs>,
+    /// What a verify holds beside the pass's buffers, once one has run.
+    pub(super) verify: Option<VerifyBufs>,
 }
 
 /// Where one delta layer's copies sit: its [`SNAPS`] lanes from `lane` in
@@ -201,6 +203,71 @@ impl SnapBufs {
             ring,
             at,
             holds: [None; SNAPS],
+        })
+    }
+}
+
+/// What an M-row verify holds beside the pass's buffers ([`RowsArena`]): the
+/// M rows of logits its head writes and the pick of each row, the rows the
+/// hand-ons write for the readers that take them scaled, and the attention
+/// rows launch's partials and tickets, a row each. A session that
+/// never verifies never opens them: the first verify does
+/// ([`VerifyBufs::open`]), so the open's bytes and the pass's are the ones
+/// they were.
+pub(super) struct VerifyBufs {
+    /// `rows` rows of the vocabulary's logits.
+    pub(super) logits: MetalBuffer<f32>,
+    /// The head's pick of each row, one word a row.
+    pub(super) picks: MetalBuffer<u32>,
+    /// The flash's split-K partials, `rows` rows of the cache's widest
+    /// segment count: a launch takes the prefix its rows and segments need.
+    pub(super) partials: MetalBuffer<f32>,
+    /// The flash folds' tickets, `rows` rows of one word a key head. Held
+    /// zeroed: each fold resets its word.
+    pub(super) ticket: MetalBuffer<u32>,
+    /// What a hand-on over the verify's rows writes for the reader after it:
+    /// `rows` rows of the hidden width (the stream times the reader's gain),
+    /// then one scale word a row.
+    pub(super) xn: MetalBuffer<f32>,
+}
+
+/// The element counts of a verify's buffers for `rows` rows over `arena`:
+/// logits, picks, partials, tickets and the hand-on rows with their scale
+/// words, each refused by name when it does not fit.
+pub(super) fn verify_lens(arena: &Arena, rows: usize) -> Result<[usize; 5], SessionError> {
+    let partials_row = arena
+        .geom
+        .attn
+        .partials_len(SEGMENT_CAP)
+        .ok_or_else(|| refuse("a verify's partials do not fit"))?;
+    Ok([
+        product(rows, arena.vocab, "the verify's logits rows")?,
+        rows,
+        product(rows, partials_row, "the verify's partials rows")?,
+        product(rows, arena.geom.attn.kv_heads, "the verify's ticket rows")?,
+        product(rows, arena.hidden, "the verify's hand-on rows")?
+            .checked_add(rows)
+            .ok_or_else(|| refuse("the verify's hand-on rows do not fit"))?,
+    ])
+}
+
+impl VerifyBufs {
+    /// The buffers of a verify of up to `rows` rows over `arena`, opened on
+    /// `device`.
+    pub(super) fn open(
+        device: Alloc<'_>,
+        arena: &Arena,
+        rows: usize,
+    ) -> Result<VerifyBufs, SessionError> {
+        let [logits, picks, partials, ticket, xn] = verify_lens(arena, rows)?;
+        let mut ticket = device.buffer::<u32>(Elems(ticket))?;
+        ticket.zero();
+        Ok(VerifyBufs {
+            logits: device.buffer(Elems(logits))?,
+            picks: device.buffer(Elems(picks))?,
+            partials: device.buffer(Elems(partials))?,
+            ticket,
+            xn: device.buffer(Elems(xn))?,
         })
     }
 }
@@ -466,6 +533,7 @@ impl RowsArena {
             xh,
             bytes,
             snaps: None,
+            verify: None,
         })
     }
 }

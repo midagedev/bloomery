@@ -318,11 +318,11 @@ struct NextNormArgs {
 static_assert(sizeof(NextNormArgs) == 8, "NextNormArgs is 8 bytes: the host packs two words");
 
 // The next launch's scale over the stream's row ROW of COLS values, into
-// `xn[COLS]`: SIMD group 0's walk, in quant Q's lane order, the one sum both
-// hand-ons write. A macro, not a function, so each kernel's program is the
+// `xn[SLOT]` (the stream's `COLS` values on, for the one-row hand-ons): SIMD
+// group 0's walk, in quant Q's lane order, the one sum every hand-on writes. A macro, not a function, so each kernel's program is the
 // walk written in place. It reads `lane`, `next_gain`, `next`, `xn` and
 // `faults` from the kernel's own names.
-#define NEXT_NORM_SCALE(Q, ROW, COLS)                                                   \
+#define NEXT_NORM_SCALE(Q, ROW, COLS, SLOT)                                             \
     typename Q::Lane walk = Q::lane_of((ushort)lane);                                   \
     const int nb = (int)(COLS / (uint)Q::values_per_block());                           \
     float sum_sq = 0.f;                                                                 \
@@ -337,10 +337,10 @@ static_assert(sizeof(NextNormArgs) == 8, "NextNormArgs is 8 bytes: the host pack
     const float scale = rms_scale(sum_squares, (uint)nb * Q::values_per_block(), next.eps); \
     if (lane == 0u) {                                                                   \
         if (rms_usable(sum_squares, scale)) {                                           \
-            xn[COLS] = scale;                                                           \
+            xn[SLOT] = scale;                                                           \
         } else {                                                                        \
             raise(faults, next.layer, BLOOMERY_FAULT_SITE_NORM_QUANT);                  \
-            xn[COLS] = NAN;                                                             \
+            xn[SLOT] = NAN;                                                             \
         }                                                                               \
     }
 
@@ -364,7 +364,7 @@ kernel void norm_add_next_kernel(device const float *x [[buffer(0)]],
     if (sg != 0u) {
         return;
     }
-    NEXT_NORM_SCALE(Q, y, args.norm.cols)
+    NEXT_NORM_SCALE(Q, y, args.norm.cols, args.norm.cols)
 }
 
 // A plain residual's hand-on: the stream the out projection already added
@@ -398,7 +398,7 @@ kernel void norm_next_kernel(device const float *x [[buffer(0)]],
         return;
     }
     constant NextNormArgs &next = args.next;
-    NEXT_NORM_SCALE(Q, x, args.cols)
+    NEXT_NORM_SCALE(Q, x, args.cols, args.cols)
 }
 
 // Each type's scaled segmented entry and the two hand-ons that feed it, the

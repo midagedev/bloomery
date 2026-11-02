@@ -22,6 +22,55 @@ pub const fn ring_rows(taps: usize) -> usize {
 /// the arch, the e2e and kernel gates and their oracles.
 pub const RING_ROWS: usize = ring_rows(CONV_TAPS);
 
+/// Why a lane-ring launch of some rows over some lanes cannot be taken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RingRefusal {
+    /// No rows.
+    NoRows,
+    /// More rows than lanes: two rows would end in one lane.
+    Lanes { rows: usize, lanes: usize },
+    /// More rows than the conv ring rolls back ([`PASS_ROWS`]): a slot a kept
+    /// row reads would hold a dropped row's input.
+    RollBack { rows: usize },
+}
+
+impl core::fmt::Display for RingRefusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            Self::NoRows => write!(f, "a lane ring of no rows"),
+            Self::Lanes { rows, lanes } => write!(
+                f,
+                "a lane ring of {rows} rows needs {rows} lanes; the state holds {lanes}"
+            ),
+            Self::RollBack { rows } => write!(
+                f,
+                "a lane ring of {rows} rows; the conv ring rolls back at most {PASS_ROWS}"
+            ),
+        }
+    }
+}
+
+/// Whether a lane ring of `rows` rows fits `lanes` lanes: each row ends in a
+/// lane of its own, and the conv ring, whose slots are addressed by position,
+/// rolls back at most [`PASS_ROWS`] positions. The one owner of the rule: the
+/// launch and the verify's bookkeeping both ask it.
+///
+/// # Errors
+///
+/// [`RingRefusal`] naming what the lanes or the conv ring cannot serve.
+pub const fn ring_fits(rows: usize, lanes: usize) -> Result<(), RingRefusal> {
+    if rows == 0 {
+        return Err(RingRefusal::NoRows);
+    }
+    if rows > lanes {
+        return Err(RingRefusal::Lanes { rows, lanes });
+    }
+    if rows > PASS_ROWS {
+        return Err(RingRefusal::RollBack { rows });
+    }
+    Ok(())
+}
+
 /// Copies of the state lane and the conv ring one rows launch may take after
 /// rows inside it: a prompt call's first and last message start.
 pub const SNAPS: usize = 2;
@@ -60,4 +109,45 @@ pub fn holds(g: &Geometry) -> Result<(), KernelRefused> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_lane_ring_fits_as_many_rows_as_lanes_up_to_the_roll_back() {
+        for lanes in 1..=PASS_ROWS + 2 {
+            for rows in 0..=PASS_ROWS + 3 {
+                let want = if rows == 0 {
+                    Err(RingRefusal::NoRows)
+                } else if rows > lanes {
+                    Err(RingRefusal::Lanes { rows, lanes })
+                } else if rows > PASS_ROWS {
+                    Err(RingRefusal::RollBack { rows })
+                } else {
+                    Ok(())
+                };
+                assert_eq!(
+                    ring_fits(rows, lanes),
+                    want,
+                    "{rows} rows over {lanes} lanes"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_refused_lane_ring_names_the_rows_and_the_lanes() {
+        let lanes = ring_fits(3, 2).unwrap_err().to_string();
+        assert!(
+            lanes.contains("needs 3 lanes") && lanes.contains("holds 2"),
+            "{lanes}"
+        );
+        let roll = ring_fits(PASS_ROWS + 1, PASS_ROWS + 1)
+            .unwrap_err()
+            .to_string();
+        assert!(roll.contains("rolls back at most 8"), "{roll}");
+        assert_eq!(PASS_ROWS, 8, "the text above names the roll-back");
+    }
 }

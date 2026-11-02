@@ -20,7 +20,7 @@
 //! its faults land and its head writes its pick, is its last row's: the pass
 //! is the token at its last position as far as the record goes.
 
-use bloomery_device::{Buffer, Elems, WindowMut};
+use bloomery_device::{Buffer, DeviceError, Elems, WindowMut};
 use chain::ChainError;
 use chain::arch::qwen3moe::ops::LayerCtx;
 use chain::arch::qwen3moe::plan::ResidualPlan;
@@ -34,10 +34,11 @@ use super::{
 };
 use crate::buffer::MetalBuffer;
 use crate::device::MetalDevice;
+use crate::encode::ComputeEncoder;
 use crate::kernels::{
     AttentionPrefillParams, AttnCache, AttnLayer, BiasRowsParams, CombineParams, DeltaRowStrides,
     DeltaRowsParams, DeltaSnaps, EmbedParams, F32GemmParams, GemmMode, GemmParams, GemmSegParams,
-    GemmXParams, HeadNormRowsParams, NormAddRowsParams, NormRowsParams, Operand, Quant,
+    GemmXParams, HeadNormRowsParams, Kernels, NormAddRowsParams, NormRowsParams, Operand, Quant,
     RouteSelectParams, RouteTableParams, RoutedKind, RoutedParams, Segment, ShortConvRowsParams,
     SwigluRowsParams, route_table_words, route_tiles,
 };
@@ -81,9 +82,10 @@ fn strided_len(rows: usize, stride: usize, width: usize) -> usize {
 }
 
 impl MetalOps<'_, '_> {
-    /// The pass's step record slot: its last row's.
-    fn pass_slot(&self, m: usize) -> usize {
-        slot_of(self.pos + u32::try_from(m).expect("a pass's rows fit u32") - 1)
+    /// The step record slot of a unit of `m` rows (a pass's or a verify's):
+    /// its last row's.
+    pub(super) fn rows_slot(&self, m: usize) -> usize {
+        slot_of(self.pos + u32::try_from(m).expect("a unit's rows fit u32") - 1)
     }
 
     fn no_rows<T>() -> Result<T, SessionError> {
@@ -109,7 +111,7 @@ impl MetalOps<'_, '_> {
     /// The embedding of the pass's ids, which the host wrote to the rows
     /// arena before the walk.
     pub(super) fn rows_embed(&mut self, m: usize) -> Result<(), SessionError> {
-        let slot = self.pass_slot(m);
+        let slot = self.rows_slot(m);
         let Some(ctx) = self.rows.as_mut() else {
             return Self::no_rows();
         };
@@ -144,7 +146,7 @@ impl MetalOps<'_, '_> {
     /// flash reads a row's gate contiguous, so the gate's segment leaves its
     /// dispatch and has a GEMM of its own into the pass's gate rows.
     pub(super) fn rows_p1(&mut self, l: usize, m: usize) -> Result<(), SessionError> {
-        let slot = self.pass_slot(m);
+        let slot = self.rows_slot(m);
         let Some(ctx) = self.rows.as_mut() else {
             return Self::no_rows();
         };
@@ -358,7 +360,7 @@ impl MetalOps<'_, '_> {
     /// chunk's keys and values and runs every row against the cache, over the
     /// layer's window of keys and with its per-head gate where it has them.
     pub(super) fn rows_attn_core(&mut self, l: usize, m: usize) -> Result<(), SessionError> {
-        let slot = self.pass_slot(m);
+        let slot = self.rows_slot(m);
         let from = self.pos;
         let Some(ctx) = self.rows.as_mut() else {
             return Self::no_rows();
@@ -433,7 +435,7 @@ impl MetalOps<'_, '_> {
     /// Layer `l`'s attention output projection, added into the residual, or
     /// stored for the join on a sandwich.
     pub(super) fn rows_attn_out(&mut self, l: LayerCtx<'_>, m: usize) -> Result<(), SessionError> {
-        let slot = self.pass_slot(m);
+        let slot = self.rows_slot(m);
         let Some(ctx) = self.rows.as_mut() else {
             return Self::no_rows();
         };
@@ -502,7 +504,7 @@ impl MetalOps<'_, '_> {
     /// dispatch, a barrier, the commit). The ring's copy after a row inside
     /// the pass is not run: a pass that asks for one is refused by name.
     pub(super) fn rows_conv_core(&mut self, l: usize, m: usize) -> Result<(), SessionError> {
-        let slot = self.pass_slot(m);
+        let slot = self.rows_slot(m);
         let from = self.pos;
         let Some(ctx) = self.rows.as_mut() else {
             return Self::no_rows();
@@ -549,7 +551,7 @@ impl MetalOps<'_, '_> {
     /// Layer `l`'s short conv output projection over the pass's mixer rows,
     /// added into the residual, or stored for the join on a sandwich.
     pub(super) fn rows_conv_out(&mut self, l: LayerCtx<'_>, m: usize) -> Result<(), SessionError> {
-        let slot = self.pass_slot(m);
+        let slot = self.rows_slot(m);
         let Some(ctx) = self.rows.as_mut() else {
             return Self::no_rows();
         };
@@ -606,7 +608,7 @@ impl MetalOps<'_, '_> {
         let ResidualPlan::Sandwich(s) = &l.plan.residual else {
             return Ok(());
         };
-        let slot = self.pass_slot(m);
+        let slot = self.rows_slot(m);
         let Some(ctx) = self.rows.as_mut() else {
             return Self::no_rows();
         };
@@ -643,9 +645,41 @@ impl MetalOps<'_, '_> {
     /// with the pass's copies, the lane and the ring after each row they
     /// name, into the layer's copies.
     pub(super) fn rows_delta_core(&mut self, l: usize, m: usize) -> Result<(), SessionError> {
-        let slot = self.pass_slot(m);
         let from = self.pos;
         let to = from + u32::try_from(m).expect("a pass's rows fit u32");
+        let Some(ctx) = self.rows.as_ref() else {
+            return Self::no_rows();
+        };
+        let stride = ctx.arena.proj_stride;
+        self.delta_rows_launch(
+            l,
+            m,
+            stride,
+            (lane_of(from), lane_of(to)),
+            Kernels::delta_rows,
+        )
+    }
+
+    /// The rows launch of layer `l`'s delta step over `m` rows from the unit's
+    /// position, run by `launch` ([`Kernels::delta_rows`], or the verify's
+    /// [`Kernels::delta_rows_ring`]), and the barrier after it: the P1 rows
+    /// `stride` values apart, and the launch's lane words, the lane it reads
+    /// and the lane after the last row. The copies after rows are the ops'
+    /// own (`RowsCtx::after`: a pass's, none for a verify's).
+    pub(super) fn delta_rows_launch(
+        &mut self,
+        l: usize,
+        m: usize,
+        stride: usize,
+        (lane_at, lane_to): (usize, usize),
+        launch: fn(
+            &Kernels,
+            &mut ComputeEncoder<'_>,
+            DeltaRowsParams<'_>,
+        ) -> Result<(), DeviceError>,
+    ) -> Result<(), SessionError> {
+        let slot = self.rows_slot(m);
+        let from = self.pos;
         let Some(ctx) = self.rows.as_mut() else {
             return Self::no_rows();
         };
@@ -670,7 +704,6 @@ impl MetalOps<'_, '_> {
             what: WHAT,
             detail: format!("{} key heads do not fit", d.n_k),
         })?;
-        let stride = rows.proj_stride;
         let strides = DeltaRowStrides {
             x: stride,
             z: stride,
@@ -699,7 +732,8 @@ impl MetalOps<'_, '_> {
                 ring: c.ring.window_mut(Elems(at.ring), Elems(n * at.ring_len))?,
             })
         };
-        self.kernels.delta_rows(
+        launch(
+            self.kernels,
             self.enc,
             DeltaRowsParams {
                 x: rows.proj.window(Elems(d.qkv.start), tail(d.qkv.start))?,
@@ -729,8 +763,8 @@ impl MetalOps<'_, '_> {
                 n_k: d.n_k,
                 map: d.map,
                 lanes: super::super::arena::LANES,
-                lane_at: lane_of(from),
-                lane_to: lane_of(to),
+                lane_at,
+                lane_to,
                 layer: layer_word(l),
                 rows: m,
                 pos: from,
@@ -746,7 +780,7 @@ impl MetalOps<'_, '_> {
     /// Layer `l`'s delta out projection: the head norm's scale applied to
     /// the numerator, then the GEMM added into the residual.
     pub(super) fn rows_delta_out(&mut self, l: usize, m: usize) -> Result<(), SessionError> {
-        let slot = self.pass_slot(m);
+        let slot = self.rows_slot(m);
         let Some(ctx) = self.rows.as_mut() else {
             return Self::no_rows();
         };
@@ -824,7 +858,7 @@ impl MetalOps<'_, '_> {
     /// (the routed rows, then the shared expert's gate when the layer has
     /// one), every row's picks and the route table.
     pub(super) fn rows_route(&mut self, l: usize, m: usize) -> Result<(), SessionError> {
-        let slot = self.pass_slot(m);
+        let slot = self.rows_slot(m);
         let Some(ctx) = self.rows.as_mut() else {
             return Self::no_rows();
         };
@@ -943,7 +977,7 @@ impl MetalOps<'_, '_> {
     /// Layer `l`'s experts over the rows: the pair and the down over the
     /// route table's tiles, and the combine into the residual.
     pub(super) fn rows_experts(&mut self, l: usize, m: usize) -> Result<(), SessionError> {
-        let slot = self.pass_slot(m);
+        let slot = self.rows_slot(m);
         let Some(ctx) = self.rows.as_mut() else {
             return Self::no_rows();
         };
@@ -1056,7 +1090,7 @@ impl MetalOps<'_, '_> {
         m: usize,
     ) -> Result<(), SessionError> {
         let l = cx.layer;
-        let slot = self.pass_slot(m);
+        let slot = self.rows_slot(m);
         let Some(ctx) = self.rows.as_mut() else {
             return Self::no_rows();
         };
@@ -1177,7 +1211,7 @@ impl MetalOps<'_, '_> {
     /// The head over the pass's last row: the logits, a barrier that closes
     /// their group, and the pick.
     pub(super) fn rows_head(&mut self, m: usize) -> Result<(), SessionError> {
-        let slot = self.pass_slot(m);
+        let slot = self.rows_slot(m);
         let hidden = self.arena.hidden;
         let Some(ctx) = self.rows.as_mut() else {
             return Self::no_rows();

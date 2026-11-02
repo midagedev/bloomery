@@ -31,7 +31,7 @@ const PROMPT_AFTER_SEED: [u32; 3] = [1000, 2000, 3000];
 const RESUME_AT: usize = 8;
 
 /// The prompt host-fed, the session reset first; the last pick is returned.
-fn prompt(s: &mut Session) -> Result<u32, String> {
+pub(super) fn prompt(s: &mut Session) -> Result<u32, String> {
     s.reset().map_err(says)?;
     let mut pick = 0;
     let seed = super::row::current().seed;
@@ -62,7 +62,7 @@ fn greedy_n(s: &mut Session, mut id: u32, mode: StepMode, n: usize) -> Result<Ve
     Ok(picks)
 }
 
-fn bits_equal(a: &[f32], b: &[f32]) -> bool {
+pub(super) fn bits_equal(a: &[f32], b: &[f32]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
 }
 

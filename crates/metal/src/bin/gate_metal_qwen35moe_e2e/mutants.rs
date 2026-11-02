@@ -19,8 +19,13 @@
 //! copies). `q_layers`'s defects — a pass that
 //! commits a command buffer an op, one buffer for the whole pass, and a layer's
 //! buffer that skips the token boundary's wait — are the host's too and have
-//! no kernel side. The host edits themselves are one-off edits recorded in the
-//! round that proves the clause.
+//! no kernel side. `v_forced`'s host defects, a commit that keeps one row too many,
+//! one that leaves the position at the verify's end, a rows launch whose `from` is one
+//! position early and the picks read back in the other order, are source edits of the
+//! session too; the `verify_*` rows of [`DENSE`] are the kernel side of the same
+//! observables. `v_count`'s host defects, a verify that commits a command buffer a
+//! layer again and one that waits a buffer, are source edits of the session too. The host
+//! edits themselves are one-off edits recorded in the round that proves the clause.
 //!
 //! A row names which tables its program takes (`row::Mutants`): the routed
 //! rows' are [`MUTANTS`], [`KEPT`] and [`TENSOR_MUTANTS`]; the dense row's
@@ -293,6 +298,54 @@ pub const DENSE: &[Mutant] = &[
         edits: &[(
             "gate[at] = pair_swiglu(gate[at], up[at]);",
             "gate[at] = pair_swiglu(up[at], gate[at]);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "verify_rope_row_minus_one",
+        clause: "v_forced",
+        why: "the rows launch's row r runs at position from + r - 1, one before its own: the \
+              keys and values of a verify's rows land one row early and each row ropes and \
+              attends as the position before (the edit is the line the prompt pass's flash \
+              shares, so the pass's clauses turn red with it)",
+        edits: &[(
+            "a.pos = args.from + row;",
+            "a.pos = args.from + row - 1u;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "verify_lane_ring_off_by_one",
+        clause: "v_forced",
+        why: "the delta rows launch writes row j's end state to the lane of position pos + j, one \
+              lane before the lane of the position after the row: a commit stands on a lane that \
+              holds another position's state",
+        edits: &[(
+            "uint at_row = (word + r + 1u) % args.step.lanes;",
+            "uint at_row = (word + r) % args.step.lanes;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "verify_rows_read_first",
+        clause: "v_forced",
+        why: "every activation row of the M-row mat-vecs reads the first row's input: the verify's \
+              row 1 is row 0 again",
+        edits: &[(
+            "                const float4 xq = act4(block + (long)m * row_span + base + 4 * l);",
+            "                const float4 xq = act4(block + base + 4 * l);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "verify_head_rows_swapped",
+        clause: "v_forced",
+        why: "the M-row head stores activation row m's logits in row M - 1 - m's place (the \
+              head's launch alone: the logits take no row raise), so each row's argmax is the \
+              other row's",
+        edits: &[(
+            "                    y[(ulong)m * out_stride + (uint)(first_row + row)] = sum_all;",
+            "                    y[(ulong)(ROW_RAISE ? m : (M - 1 - m)) * out_stride + (uint)(first_row + row)] = sum_all;",
             1,
         )],
     },

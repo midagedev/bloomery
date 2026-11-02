@@ -24,8 +24,8 @@ use super::{
     ACT_PAD, Harness, OUT_GUARD, SENTINEL_BITS, VALUE_PAD, WEIGHT_TAIL, check_guards, padded,
     weight_pad,
 };
-const N_EXPERTS: usize = 4;
-const PAIR_COLS: usize = 2048;
+pub const N_EXPERTS: usize = 4;
+pub const PAIR_COLS: usize = 2048;
 pub const FOLD_ROWS: usize = 2048;
 /// The ids of a launch: one per pick, over the stack's four experts.
 const IDS: [i32; 8] = [0, 1, 2, 3, 1, 2, 3, 0];

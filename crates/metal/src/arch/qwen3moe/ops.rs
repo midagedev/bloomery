@@ -55,7 +55,7 @@ use crate::kernels::{
 
 /// The half of a layer a sandwich joins: the mixer's, then the FFN's, the
 /// order of `SandwichPlan`'s gains and scales.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Half {
     Mixer,
     Ffn,
@@ -69,6 +69,9 @@ impl Half {
 }
 
 mod rows;
+mod verify;
+
+pub(super) use verify::{Part, VerifyOps, serves};
 
 const WHAT: &str = "qwen35moe ops";
 

@@ -27,6 +27,9 @@ use super::oracle::sigmoid;
 use super::oracle_attention::{attend, band, prefill_band};
 use super::{ClauseCtx, ClauseRun, Harness};
 
+#[path = "clauses_lanes.rs"]
+mod lanes;
+
 /// The delta layer's key heads.
 const N_K: usize = KEY_HEADS;
 
@@ -247,7 +250,7 @@ fn run_rows_copied(
                 taps: delta.conv_taps,
                 n_k: N_K,
                 map: HeadMap::Tiled,
-                lanes: LANES,
+                lanes: c.lane_words.len(),
                 lane_at: c.lane_at,
                 lane_to: c.lane_to,
                 layer: LAYER,
@@ -324,7 +327,7 @@ fn run_stepped(h: &Harness<'_>, fx: &Fixed, c: &Chunk) -> Result<Out, String> {
                     taps: delta.conv_taps,
                     n_k: N_K,
                     map: HeadMap::Tiled,
-                    lanes: LANES,
+                    lanes: c.lane_words.len(),
                     lane_at,
                     lane_to: c.lane_to,
                     layer: LAYER,
@@ -2351,6 +2354,18 @@ pub fn table<'a>(ctx: &'a ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<'a>)> {
             "delta_rows_snap",
             Box::new(|| ctx.with_params(delta_rows_snap)),
         ),
+        (
+            "delta_rows_lanes",
+            Box::new(|| ctx.with_params(lanes::delta_rows_lanes)),
+        ),
+        (
+            "delta_rows_lanes_commit",
+            Box::new(|| ctx.with_params(lanes::delta_rows_lanes_commit)),
+        ),
+        (
+            "delta_rows_lanes_refused",
+            Box::new(|| ctx.with_params(lanes::delta_rows_lanes_refused)),
+        ),
     ];
     clauses.extend(shaped(ctx));
     clauses
@@ -2369,6 +2384,18 @@ pub fn wide<'a>(ctx: &'a ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<'a>)> {
         (
             "delta_rows_snap",
             Box::new(|| delta_rows_snap(h, Params::Drawn)),
+        ),
+        (
+            "delta_rows_lanes",
+            Box::new(|| lanes::delta_rows_lanes(h, Params::Drawn)),
+        ),
+        (
+            "delta_rows_lanes_commit",
+            Box::new(|| lanes::delta_rows_lanes_commit(h, Params::Drawn)),
+        ),
+        (
+            "delta_rows_lanes_refused",
+            Box::new(|| lanes::delta_rows_lanes_refused(h, Params::Drawn)),
         ),
     ]
 }

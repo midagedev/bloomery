@@ -37,8 +37,8 @@
 //! returns the fault by name, decoded to its layer and sites, and every later
 //! step is refused by name until [`Session::reset`].
 //!
-//! A checkpoint copies each delta layer's state lane at the position's parity
-//! and its whole conv ring, and each short conv layer's whole ring.
+//! A checkpoint copies each delta layer's state lane of the position and its
+//! whole conv ring, and each short conv layer's whole ring.
 //! [`Session::checkpoint`] takes one at the position the session stands at,
 //! with no token ahead and the stream idle; [`Session::checkpoint_copy`] takes
 //! one at a position inside the last pass, from the copies that pass left
@@ -63,6 +63,14 @@
 //! the state the pass held after that row, and the pass's own bits do not
 //! move. A file with a short conv layer takes no such copies: a pass that asks
 //! for one is refused by name.
+//!
+//! [`Session::verify_rows`] (`session/verify.rs`) runs two or more ids as one pass
+//! whose row `r` is the bits of the step at the position after `r` rows: the M-row
+//! mat-vecs and the flash's rows launch over the rows arena, the delta layers'
+//! states left in a lane each. The session stands the verify's rows on and
+//! waits for [`Session::commit_rows`], which keeps the first `accepted` of them
+//! and launches nothing; until then a step, a pass, another verify, a cut and a
+//! checkpoint are refused by name.
 //!
 //! Every buffer the kernels bind is registered into the stream's residency
 //! set when the session allocates it, and the open waits for the set to be
@@ -104,12 +112,13 @@ use runtime::seqstate::Kept;
 use super::arena::{Arena, LANES, LayerBufs, MixerBufs, lane_of, slot_of};
 use super::check;
 use super::count::{GroupBytes, GroupKind, Layer};
+use super::lanes;
 use super::ops::{Feed, Half, MetalOps, RowsCtx};
 use super::rows::{RowsArena, SnapBufs};
 use crate::buffer::MetalBuffer;
 use crate::checkpoint::{self, Checkpoints, Restore};
 use crate::device::MetalDevice;
-use crate::encode::EncodeCount;
+use crate::encode::{ComputeEncoder, EncodeCount};
 use crate::geom::Geometry;
 use crate::handle::Handle;
 use crate::instance::Instance;
@@ -120,6 +129,10 @@ use crate::stream::{
     GpuInterval, GpuStamps, MetalStream, Parked, Settled, Signalled, TokenRecording, host_secs,
 };
 use objc2_metal::MTLDevice;
+
+mod verify;
+
+pub use verify::{BufferStamp, TraceSummary, VerifyTrace};
 
 pub(super) const WHAT: &str = "qwen35moe session";
 
@@ -275,6 +288,14 @@ impl From<DeviceError> for SessionError {
 impl From<ChainError> for SessionError {
     fn from(e: ChainError) -> Self {
         SessionError::Plan(e)
+    }
+}
+
+/// A width chooser's refusal is the session's, by name: the draft behind
+/// `runtime::width::Choosing` runs on this session as its target.
+impl From<runtime::WidthError> for SessionError {
+    fn from(e: runtime::WidthError) -> Self {
+        refuse(e.to_string())
     }
 }
 
@@ -720,6 +741,11 @@ pub struct Session {
     rows: RowsArena,
     /// How a prompt call feeds its ids.
     prefill: PrefillMode,
+    /// How the target steps for a caller that wants the pick alone.
+    argmax: StepMode,
+    /// The verify that waits for its commit: until it commits, every call
+    /// that would run or move the session is refused by name.
+    pending: Option<lanes::Verify>,
     /// How long the open's parts took.
     open_split: OpenSplit,
 }
@@ -965,6 +991,8 @@ impl Session {
             device: device.handle().clone(),
             rows,
             prefill,
+            argmax: StepMode::Chain,
+            pending: None,
             open_split: OpenSplit {
                 load,
                 rows: rows_t,
@@ -1093,11 +1121,13 @@ impl Session {
         self.poisoned
     }
 
-    /// A step may run: the session is not poisoned and the cache has a row.
+    /// A step may run: the session is not poisoned, no verify waits for its
+    /// commit, and the cache has a row.
     fn ready(&self) -> Result<(), SessionError> {
         if let Some(fault) = self.poisoned {
             return Err(SessionError::Poisoned(fault));
         }
+        self.not_pending("a step, a pass or a verify")?;
         if self.pos as usize >= self.arena.ctx {
             return Err(refuse(format!(
                 "a step at position {}: the cache holds {} rows",
@@ -1156,7 +1186,7 @@ impl Session {
                 if let Some(a) = ahead {
                     self.drop_ahead(a)?;
                 }
-                self.commit(id, self.pos, Feed::Host, head)?
+                self.commit_token(id, self.pos, Feed::Host, head)?
             }
         };
         // On an error past this point the token at `pos` is waited for and
@@ -1233,6 +1263,33 @@ impl Session {
     /// oracle's).
     pub fn set_prefill(&mut self, mode: PrefillMode) {
         self.prefill = mode;
+    }
+
+    /// How the target steps a call that wants the pick alone
+    /// ([`runtime::Want::Argmax`]): [`StepMode::Chain`], the default, or
+    /// [`StepMode::HostFed`].
+    #[must_use]
+    pub fn argmax_mode(&self) -> StepMode {
+        self.argmax
+    }
+
+    /// Step the target's pick-only calls chained ([`StepMode::Chain`], the
+    /// default: the next token is committed before this one is waited) or
+    /// host-fed ([`StepMode::HostFed`]: nothing runs ahead). A caller whose
+    /// next pass may be a verify wants host-fed steps: a verify drops the token
+    /// ahead of a chained step, and its device time is spent for nothing. An
+    /// ahead step names the id after it, which a pick-only call does not know:
+    /// it is refused by name.
+    pub fn set_argmax_mode(&mut self, mode: StepMode) -> Result<(), SessionError> {
+        match mode {
+            StepMode::Chain | StepMode::HostFed => {
+                self.argmax = mode;
+                Ok(())
+            }
+            StepMode::Ahead { .. } => Err(refuse(
+                "a pick-only step is chained or host-fed: an ahead step names the id after it",
+            )),
+        }
     }
 
     /// The most rows a pass of this session holds: the family's ubatch rule,
@@ -1376,14 +1433,16 @@ impl Session {
         let cap_rows = rows.cap;
         let (count, settled) = match profile {
             None => {
-                let mut ops = PassLayers {
+                let mut ops = Layered {
                     buffers: LayerBuffers::new(&self.stream),
-                    kernels: &self.kernels,
-                    arena: &mut self.arena,
-                    rows,
-                    after,
-                    from,
-                    head,
+                    arms: PassArms {
+                        kernels: &self.kernels,
+                        arena: &mut self.arena,
+                        rows,
+                        after,
+                        from,
+                        head,
+                    },
                 };
                 let walked = Walk::new(&mut ops, &self.plans, m)
                     .run(cap_rows)
@@ -1469,7 +1528,7 @@ impl Session {
                 .pages()
                 .store(slot_of(self.pos), id, Ordering::Relaxed)?;
         }
-        let (signalled, count) = self.commit(embeds, at, Feed::Device, head)?;
+        let (signalled, count) = self.commit_token(embeds, at, Feed::Device, head)?;
         self.stats.ahead += 1;
         self.ahead = Some(Ahead {
             signalled,
@@ -1485,7 +1544,7 @@ impl Session {
     /// host id slot, which `id` is written into first, or the record slot of
     /// the token before it, and it carries the head only when `head` — a
     /// step whose pick nobody reads skips it.
-    fn commit(
+    fn commit_token(
         &mut self,
         id: u32,
         pos: u32,
@@ -1544,7 +1603,7 @@ impl Session {
     }
 
     /// Encode the host-fed token at `pos`, with its head, and park it for
-    /// the call that names its id ([`Session::commit`] takes it). Its embed
+    /// the call that names its id ([`Session::commit_token`] takes it). Its embed
     /// reads the host id slot, which that call writes before the commit; the
     /// token this step waits for has read the slot by then.
     fn prime(&mut self, pos: u32) -> Result<(), SessionError> {
@@ -1715,6 +1774,7 @@ impl Session {
     /// token running ahead is still writing the arena, so a probe is refused
     /// by name while one runs: a host-fed step drops it.
     pub fn probe(&self) -> Result<Probe<'_>, SessionError> {
+        self.not_pending("a probe")?;
         if self.ahead.is_some() {
             return Err(refuse(format!(
                 "a probe at position {}: the token at it runs ahead; a host-fed step drops it",
@@ -1732,6 +1792,7 @@ impl Session {
     /// head wrote, zero copy. Refused while a token runs ahead, as a probe
     /// is: its head would overwrite the row while the caller reads it.
     pub fn logits_row(&self) -> Result<&[f32], SessionError> {
+        self.not_pending("the logits row of the last step")?;
         if self.ahead.is_some() {
             return Err(refuse(format!(
                 "the logits row at position {}: the token at it runs ahead; a host-fed step \
@@ -1766,6 +1827,11 @@ impl Session {
         }
         self.pos = 0;
         self.poisoned = None;
+        self.pending = None;
+        if let Some(verify) = self.rows.verify.as_mut() {
+            // A verify the fault cut short may have left a fold's ticket set.
+            verify.ticket.zero();
+        }
         if let Some(c) = self.checkpoints.as_mut() {
             c.clear();
         }
@@ -1840,8 +1906,8 @@ impl Session {
     }
 
     /// A checkpoint at the position, the stream idle: the token ahead is
-    /// waited out and dropped first, then each delta layer's state lane at
-    /// the position's parity and its ring, and each short conv layer's ring,
+    /// waited out and dropped first, then each delta layer's state lane of
+    /// the position and its ring, and each short conv layer's ring,
     /// are copied once, from the shared pages straight into the point's slot.
     /// A file of no recurrent store has nothing to copy: its caches hold the
     /// position. Refused while the session is poisoned.
@@ -1872,13 +1938,14 @@ impl Session {
     }
 
     /// The point at `at` from each recurrent layer's live stores (`copy` none:
-    /// a delta layer's lane at `at`'s parity, `at` the position, and each
+    /// a delta layer's lane of position `at`, `at` the position, and each
     /// ring) or from the last pass's copy `copy`, after the stream is idle. A
     /// short conv layer has no pass copy. Refused while poisoned.
     fn take_point(&mut self, at: u32, copy: Option<usize>) -> Result<(), SessionError> {
         if let Some(fault) = self.poisoned {
             return Err(SessionError::Poisoned(fault));
         }
+        self.not_pending("a checkpoint")?;
         self.quiesce()?;
         let lane_len = held_lane_len(&self.arena)?;
         let live = lane_of(at)
@@ -1966,6 +2033,7 @@ impl Session {
         if n == 0 {
             return self.reset();
         }
+        self.not_pending("a cut")?;
         if n == self.pos {
             return Ok(());
         }
@@ -1976,8 +2044,9 @@ impl Session {
             .ok_or_else(|| refuse("a delta state lane's offset overflowed"))?;
         let recurrent = has_recurrent_store(&self.arena);
         // The lane `lane_of(n)` of each delta state and the whole ring of
-        // each delta and short conv layer. The other lane is the one the next
-        // token writes, so it is left as it is.
+        // each delta and short conv layer. No other lane holds a position the
+        // session keeps: the next token writes the lane after it, so they are
+        // left as they are.
         let mut dst = Vec::new();
         for layer in &mut self.arena.layers {
             match &mut layer.mixer {
@@ -2063,7 +2132,7 @@ enum Held {
     /// An attention layer: its caches hold every position below the one the
     /// session stands at.
     Caches,
-    /// A delta layer: its state (both lanes) and its conv ring.
+    /// A delta layer: its state (every lane) and its conv ring.
     Delta { state: usize, ring: usize },
     /// A short conv layer: its ring.
     Conv { ring: usize },
@@ -2114,7 +2183,7 @@ fn held_lane_len(arena: &Arena) -> Result<usize, SessionError> {
 
 /// The f32s of each store a checkpoint copies, in the order every layer lists
 /// them: a delta layer's state lane then its ring, a short conv layer's ring.
-/// None for a file with no recurrent store. The state buffer is both lanes; a
+/// None for a file with no recurrent store. The state buffer is every lane; a
 /// checkpoint copies one.
 fn store_lens_of(
     layers: impl IntoIterator<Item = Held>,
@@ -2263,12 +2332,31 @@ where
     }
 }
 
-/// The pass's ops: [`MetalOps`]'s rows, encoded a layer to a command buffer.
-/// The embed rides with layer 0 and the head with the last layer, so the
-/// pass commits exactly its layer count of buffers and the longest is one
-/// layer's work.
-struct PassLayers<'s> {
+/// How a walk makes its ops: over the encoder of the buffer an op opens, from
+/// the state the walk holds. The ops are lent as a [`ChainOps`] object, so
+/// [`Layered`] forwards the walk's ops once for every walk.
+trait Arms {
+    /// `f` over this walk's ops, made on `enc`.
+    fn with_ops<R>(
+        &mut self,
+        enc: &mut ComputeEncoder<'_>,
+        f: impl FnOnce(&mut dyn ChainOps<Error = SessionError>) -> R,
+    ) -> R;
+}
+
+/// A walk's ops encoded on the command buffers `buffers` opens: a pass's
+/// [`MetalOps`] rows, a layer to a buffer, with the embed riding with layer 0
+/// and the head with the last layer, so the pass commits exactly its layer
+/// count of buffers and the longest is one layer's work; a verify's
+/// `VerifyOps`, every op on the one buffer. The embed and the head name no
+/// layer: they encode on the buffer open.
+struct Layered<'s, A> {
     buffers: LayerBuffers<'s>,
+    arms: A,
+}
+
+/// The state a pass's ops are made from.
+struct PassArms<'s> {
     kernels: &'s Kernels,
     arena: &'s mut Arena,
     rows: &'s mut RowsArena,
@@ -2278,32 +2366,40 @@ struct PassLayers<'s> {
     head: bool,
 }
 
-impl PassLayers<'_> {
+impl Arms for PassArms<'_> {
+    fn with_ops<R>(
+        &mut self,
+        enc: &mut ComputeEncoder<'_>,
+        f: impl FnOnce(&mut dyn ChainOps<Error = SessionError>) -> R,
+    ) -> R {
+        f(&mut MetalOps::rows(
+            enc,
+            self.arena,
+            RowsCtx {
+                arena: self.rows,
+                after: self.after,
+            },
+            self.kernels,
+            self.from,
+            self.head,
+        ))
+    }
+}
+
+impl<A: Arms> Layered<'_, A> {
     /// `f` over the ops of the buffer `layer` encodes on. The embed and the
     /// head name no layer: they encode on the buffer open.
     fn one(
         &mut self,
         layer: Option<usize>,
-        f: impl FnOnce(&mut MetalOps<'_, '_>) -> Result<(), SessionError>,
+        f: impl FnOnce(&mut dyn ChainOps<Error = SessionError>) -> Result<(), SessionError>,
     ) -> Result<(), SessionError> {
         let open = self.buffers.at(layer)?;
-        open.encoder(|encoder| {
-            f(&mut MetalOps::rows(
-                encoder,
-                self.arena,
-                RowsCtx {
-                    arena: self.rows,
-                    after: self.after,
-                },
-                self.kernels,
-                self.from,
-                self.head,
-            ))
-        })
+        open.encoder(|encoder| self.arms.with_ops(encoder, f))
     }
 }
 
-impl ChainOps for PassLayers<'_> {
+impl<A: Arms> ChainOps for Layered<'_, A> {
     type Error = SessionError;
 
     fn embed(&mut self, m: usize) -> Result<(), SessionError> {
@@ -2363,20 +2459,28 @@ impl ChainOps for PassLayers<'_> {
     }
 }
 
-/// The command buffers of a pass, one a layer: the buffer being encoded, and
-/// the signal of the last one committed. A buffer is committed with a signal
-/// and not waited when the walk reaches the next layer, so the host encodes a
-/// layer while the card runs the one before it; each buffer opens at the
-/// stream's token boundary, which the buffer ahead signals at its end, so it
-/// sees what that one wrote. The pass settles the last signal once.
+/// The command buffers of a walk: the buffer being encoded, and the signal of
+/// the last one committed. A pass takes one a layer ([`LayerBuffers::new`]): a
+/// buffer is committed with a signal and not waited when the walk reaches the
+/// next layer, so the host encodes a layer while the card runs the one before
+/// it; each buffer opens at the stream's token boundary, which the buffer
+/// ahead signals at its end, so it sees what that one wrote. A verify takes
+/// one for the whole walk ([`LayerBuffers::whole`]), as a step does: the groups
+/// close with barriers, so a boundary between layers orders nothing more and
+/// costs the card an idle gap each. The walk settles the last signal once.
 struct LayerBuffers<'s> {
     stream: &'s MetalStream,
+    /// Whether every op encodes on the one buffer, whatever its layer.
+    whole: bool,
     /// The buffer being encoded, not yet committed.
     open: Option<OpenLayer<'s>>,
     /// The last committed buffer's signal.
     last: Option<Signalled>,
     /// What the committed buffers encoded.
     count: EncodeCount,
+    /// Each committed buffer's host stamps and its GPU stamps handle, when a
+    /// caller traces the walk ([`LayerBuffers::traced`]); `None` reads no clock.
+    trace: Option<Vec<Traced>>,
 }
 
 /// A layer's buffer being encoded.
@@ -2384,24 +2488,56 @@ struct OpenLayer<'s> {
     /// The layer its ops name; the embed opens a buffer before one does.
     layer: Option<usize>,
     recording: TokenRecording<'s>,
+    /// The host clock when the buffer began, read only in a traced walk.
+    opened: Option<f64>,
+}
+
+/// A committed buffer of a traced walk: the host clock at its begin and at
+/// its commit's return, and the handle its GPU stamps are read through once
+/// the walk settles.
+struct Traced {
+    opened: f64,
+    committed: f64,
+    stamps: GpuStamps,
 }
 
 impl<'s> LayerBuffers<'s> {
+    /// A buffer a layer.
     fn new(stream: &'s MetalStream) -> Self {
         Self {
             stream,
+            whole: false,
             open: None,
             last: None,
             count: EncodeCount::default(),
+            trace: None,
         }
     }
 
-    /// The buffer an op of `layer` encodes on. The open one when it is
-    /// `layer`'s, or when either names no layer; otherwise the open buffer is
-    /// committed and the next one opened.
+    /// One buffer for the whole walk.
+    fn whole(stream: &'s MetalStream) -> Self {
+        Self {
+            whole: true,
+            ..Self::new(stream)
+        }
+    }
+
+    /// These buffers, stamping every buffer they commit.
+    fn traced(self) -> Self {
+        Self {
+            trace: Some(Vec::new()),
+            ..self
+        }
+    }
+
+    /// The buffer an op of `layer` encodes on. The open one when the walk is
+    /// one buffer, when it is `layer`'s, or when either names no layer;
+    /// otherwise the open buffer is committed and the next one opened.
     fn at(&mut self, layer: Option<usize>) -> Result<&mut TokenRecording<'s>, SessionError> {
         let open = match self.open.take() {
-            Some(mut open) if layer.is_none() || open.layer.is_none() || open.layer == layer => {
+            Some(mut open)
+                if self.whole || layer.is_none() || open.layer.is_none() || open.layer == layer =>
+            {
                 open.layer = open.layer.or(layer);
                 open
             }
@@ -2409,9 +2545,11 @@ impl<'s> LayerBuffers<'s> {
                 if let Some(behind) = behind {
                     self.commit(behind)?;
                 }
+                let opened = self.trace.is_some().then(host_secs);
                 OpenLayer {
                     layer,
                     recording: self.stream.begin()?.open_token_encoder()?,
+                    opened,
                 }
             }
         };
@@ -2420,11 +2558,22 @@ impl<'s> LayerBuffers<'s> {
 
     /// Commit `open` with a signal, unwaited.
     fn commit(&mut self, open: OpenLayer<'s>) -> Result<(), SessionError> {
-        let (recording, count) = open.recording.finish();
+        let OpenLayer {
+            recording, opened, ..
+        } = open;
+        let (recording, count) = recording.finish();
+        let stamps = opened.map(|opened| (opened, recording.stamps()));
         // A buffer's own failure is named at the last signal's settle: the
         // driver reports a failed buffer there, whichever buffer it was.
         self.last = Some(self.stream.submit_signalled(recording)?);
         self.count += count;
+        if let (Some(trace), Some((opened, stamps))) = (self.trace.as_mut(), stamps) {
+            trace.push(Traced {
+                opened,
+                committed: host_secs(),
+                stamps,
+            });
+        }
         Ok(())
     }
 
@@ -2776,7 +2925,7 @@ mod tests {
         assert!(store_lens_of([Held::Caches; 4], 0).unwrap().is_empty());
     }
 
-    /// A ring of no values, and a delta state that is not both lanes, are
+    /// A ring of no values, and a delta state that is not every lane, are
     /// refused by name: a store the checkpoint could not copy is no store.
     ///
     /// Mutant: delete the `ring == 0` refusal of `Held::Conv`, or the

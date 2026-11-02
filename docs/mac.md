@@ -119,6 +119,22 @@ argmax, so a decode timed on real text is not cut short), and `--repeat N` runs 
 reset the server takes between runs), each run with its own summary block; a run whose ids differ from the first's ends
 the process with a named error.
 
+`generate_metal --draft lookup` (off by default) runs the loop over the lookup draft: a pass proposes the one id the
+context's n-grams name and verifies it with the token at the position in one pass of two rows, keeping the rows the
+model's own argmax agrees with. The draft runs behind the width chooser the CUDA family's lookup runs behind
+(`runtime::width::Choosing`): `BLOOMERY_MTP_WIDTH=cost` (unset) reads each step's and each verify's wall off the host clock
+and verifies a proposal only while the rows the proposals keep repay the verify's extra wall, a step in its place
+otherwise; `BLOOMERY_MTP_WIDTH=fixed` verifies every proposal, the same-binary arm. The ids are the plain run's, bit for bit, in
+both modes, so `--print-ids` of the runs is one compare. Only a dense model whose layers the two-row pass serves takes
+it (a dense feed-forward block, attention and delta layers, 4-bit weights); any other file is refused by name before the
+run, and `BLOOMERY_MTP_WIDTH` set beside no `--draft` is refused by name. The run's summary adds the accept counts and the verify
+pass's wall beside the step's, and under `cost` the chooser's gate (`draft_gate`, `draft_closed`, `draft_costs`,
+`draft_a`, `draft_rates`), development-loop numbers. A pass that verifies no proposal is a host-fed step, so no token a
+chained step ran ahead is dropped by a verify that follows. With `--profile [N]` the run adds the verify's own profile:
+`vprof` lines (each group of N two-row verifies on a command buffer of its own, GPU time and bytes, `--profile-layers`
+a layer each), `vtimes` lines (N verifies as the session runs them, a command buffer a layer: the buffers, the host's
+waits, the GPU's gaps between buffers and the wall split by what ran in it) and one `vcompare` line.
+
 To learn whether a model opens before it loads: `generate_metal [-m PATH | --hf REPO] --plan [--ctx C]` reads only the
 header and tensor table, a folder's or a GGUF file's. It prints every refusal, not only the first, the bytes the open
 would allocate, the device's working set and the host's free memory. It exits 0 when the header's checks pass, 3 when it

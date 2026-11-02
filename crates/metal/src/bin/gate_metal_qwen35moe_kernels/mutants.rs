@@ -9,8 +9,8 @@
 //! modules, whose defect is a source edit of `crates/metal/src/kernels/*.rs`:
 //! the module is compiled into this gate's own binary, so each such defect is
 //! a one-off edit recorded in the round that proves it, not a mutant here.
-//! `matvec_refusals`, `delta_bounds`, `experts_bounds`, `fold_type` and
-//! `handon_refusals` are wholly host-side; `seg_bounds`, `router_bounds`,
+//! `matvec_refusals`, `delta_bounds`, `experts_bounds`, `fold_type`,
+//! `handon_refusals` and `mrows_refusals` are wholly host-side; `seg_bounds`, `router_bounds`,
 //! `head_bounds` and `attn_bounds` also have a kernel-side contract, and the
 //! kernel mutants below pin that side. The gate's refusal loop turns red on a deleted launch
 //! check; a table that stayed green on one would be wrong.
@@ -903,6 +903,11 @@ pub const GDN48_KEPT: &[&str] = &[
     "rows_ring_slot",
     "snap_row_late",
     "snap_ring_dropped",
+    "lanes_ring_off_by_one",
+    "lanes_ring_unmoved",
+    "lanes_ring_last_only",
+    "lanes_ring_unchecked",
+    "lanes_commit_reads_write_lane",
     "rows_lane_parity",
     "rows_ring_inner",
     "rows_lane_unchecked",
@@ -1000,7 +1005,7 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[(
             "raise(faults, layer, BLOOMERY_FAULT_SITE_NORM_QUANT);",
             "",
-            2,
+            4,
         )],
     },
     Mutant {
@@ -1052,13 +1057,13 @@ pub const MUTANTS: &[Mutant] = &[
         name: "tail_read",
         clause: "row_tail_reads",
         why: "the rows past the last read past the weights window",
-        edits: &[(ROW_POINTER, ROW_POINTER_RAW, 1), (EARLY_RETURN, "", 1)],
+        edits: &[(ROW_POINTER, ROW_POINTER_RAW, 2), (EARLY_RETURN, "", 2)],
     },
     Mutant {
         name: "seg_weight_offset",
         clause: "seg_bit",
         why: "a segment reads the weights of the first segment",
-        edits: &[("W + (ulong)args.segs[s].wblocks,", "W,", 1)],
+        edits: &[("W + (ulong)args.segs[s].wblocks,", "W,", 2)],
     },
     Mutant {
         name: "seg_last_segment",
@@ -1067,7 +1072,7 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[(
             "for (uint i = 0; i < args.nseg; ++i) {",
             "for (uint i = 0; i < 3 && i < args.nseg; ++i) {",
-            1,
+            2,
         )],
     },
     Mutant {
@@ -1262,7 +1267,7 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[(
             "device const uint32_t * q = blk.qs + 2 * lane.iq;",
             "device const uint32_t * q = blk.qs + lane.iq;",
-            1,
+            2,
         )],
     },
     Mutant {
@@ -1365,13 +1370,13 @@ pub const MUTANTS: &[Mutant] = &[
         name: "a4_norm_gain",
         clause: "a4_norm",
         why: "the A4 norm load drops the gain of a value",
-        edits: &[("a0 *= gq.x;", "a0 *= 1.f;", 1)],
+        edits: &[("a0 *= gq.x;", "a0 *= 1.f;", 2)],
     },
     Mutant {
         name: "a4_seg_weights",
         clause: "a4_seg",
         why: "a segment reads the weights of the first segment",
-        edits: &[("W + (ulong)args.segs[s].wblocks,", "W,", 1)],
+        edits: &[("W + (ulong)args.segs[s].wblocks,", "W,", 2)],
     },
     Mutant {
         name: "a4_pair_sum_sq",
@@ -1400,7 +1405,7 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[(
             "gq = act4(gain + base + 4 * l);",
             "gq = act4(gain + base + 4 * ((l + 1) & 3));",
-            1,
+            2,
         )],
     },
     Mutant {
@@ -1914,6 +1919,56 @@ pub const MUTANTS: &[Mutant] = &[
         )],
     },
     Mutant {
+        name: "lanes_ring_off_by_one",
+        clause: "delta_rows_lanes",
+        why: "the lane ring writes row j's end state to the lane of position pos + j, one lane before the lane of the position after the row",
+        edits: &[(
+            "uint at_row = (word + r + 1u) % args.step.lanes;",
+            "uint at_row = (word + r) % args.step.lanes;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "lanes_ring_unmoved",
+        clause: "delta_rows_lanes",
+        why: "the lane ring counts its rows' lanes from lane 0, not from the lane the launch read: the ring does not move with the position, so a commit stands on a lane that holds another position's state",
+        edits: &[(
+            "uint at_row = (word + r + 1u) % args.step.lanes;",
+            "uint at_row = (r + 1u) % args.step.lanes;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "lanes_ring_last_only",
+        clause: "delta_rows_lanes",
+        why: "the lane ring writes only the last row's end state: the lanes of the rows before it are never written, so a commit of fewer rows stands on a stale lane",
+        edits: &[(
+            "if (r + 1u < args.rows && lane_ok) {",
+            "if (r + 1u > args.rows && lane_ok) {",
+            1,
+        )],
+    },
+    Mutant {
+        name: "lanes_ring_unchecked",
+        clause: "delta_rows_lanes_refused",
+        why: "the lane ring takes a write word that is not the lane of the position after the last row, and writes the last row's state there, where no commit reads it",
+        edits: &[(
+            "lane_ok = lane_ok && word_to == (word + args.rows) % args.step.lanes;",
+            "lane_ok = lane_ok && word_to < args.step.lanes;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "lanes_commit_reads_write_lane",
+        clause: "delta_rows_lanes_commit",
+        why: "the token after a commit reads the lane it writes, not the lane the commit names: the position moved and the state did not follow it",
+        edits: &[(
+            "uint word = lane_buf[args.lane_at];",
+            "uint word = lane_buf[args.lane_to];",
+            1,
+        )],
+    },
+    Mutant {
         name: "rows_lane_parity",
         clause: "delta_rows",
         why: "the rows launch writes the state to the lane it read, not the lane the write word names",
@@ -2249,7 +2304,7 @@ pub const MUTANTS: &[Mutant] = &[
         name: "handon_nan_scale_finite",
         clause: "handon_nan",
         why: "a next norm that cannot take the stream hands on its zero scale, a finite value",
-        edits: &[("xn[COLS] = NAN;", "xn[COLS] = scale;", 1)],
+        edits: &[("xn[SLOT] = NAN;", "xn[SLOT] = scale;", 1)],
     },
     Mutant {
         name: "handon_nan_xg_stays",
@@ -2705,7 +2760,7 @@ pub const MUTANTS: &[Mutant] = &[
         name: "q8_0_seg_weights",
         clause: "q8_0_seg",
         why: "a segment reads the weights of the first segment",
-        edits: &[("W + (ulong)args.segs[s].wblocks,", "W,", 1)],
+        edits: &[("W + (ulong)args.segs[s].wblocks,", "W,", 2)],
     },
     Mutant {
         name: "q8_0_head_scale",
@@ -2817,7 +2872,7 @@ pub const MUTANTS: &[Mutant] = &[
         name: "q5k_seg_weights",
         clause: "q5k_seg",
         why: "a segment reads the weights of the first segment",
-        edits: &[("W + (ulong)args.segs[s].wblocks,", "W,", 1)],
+        edits: &[("W + (ulong)args.segs[s].wblocks,", "W,", 2)],
     },
     Mutant {
         name: "q5k_head_halves",
@@ -3042,6 +3097,189 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "attn_f16",
         why: "the one-pass flash scores this position's key against the value's halves it holds in threadgroup memory",
         edits: &[("a = kp[lane];", "a = vp[lane];", 1)],
+    },
+    Mutant {
+        name: "mrows_rows_swapped",
+        clause: "mrows_matvec",
+        why: "the M-row residual stores activation row m's outputs in row M - 1 - m's place",
+        edits: &[(
+            "                    y[(ulong)m * out_stride + (uint)(first_row + row)] += sum_all;",
+            "                    y[(ulong)(M - 1 - m) * out_stride + (uint)(first_row + row)] += sum_all;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mrows_row_reads_first",
+        clause: "mrows_seg",
+        why: "every activation row reads the first row's input: the row span of the load drops",
+        edits: &[(
+            "Q::template load_rows<NORM ? LOAD_NORM : LOAD_PLAIN, M>(lanes, xp, row_span, gp, sum_sq);",
+            "Q::template load_rows<NORM ? LOAD_NORM : LOAD_PLAIN, M>(lanes, xp, 0, gp, sum_sq);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mrows_out_stride",
+        clause: "mrows_seg",
+        why: "the store writes each activation row's outputs a word past its stride",
+        edits: &[(
+            "                    y[(ulong)m * out_stride + (uint)(first_row + row)] = sum_all;",
+            "                    y[(ulong)m * (out_stride + 1u) + (uint)(first_row + row)] = sum_all;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mrows_dot_order",
+        clause: "mrows_pair_scaled",
+        why: "rows past the first join their four nibble terms one after another, ((a0 + a1/16) + a2/256) + a3/4096: the same sum to within an ulp and other bits in some groups, which a banded clause passes",
+        edits: &[(
+            concat!(
+                "            sum[m] += Pair::scale_of_word(wd.sb) * ((acc[m][0] + 1.f/16.f * acc[m][1]) +\n",
+                "                                                    (1.f/256.f * acc[m][2] + 1.f/4096.f * acc[m][3]))\n",
+            ),
+            concat!(
+                "            sum[m] += Pair::scale_of_word(wd.sb) * (m > 0 ?\n",
+                "                (((acc[m][0] + 1.f/16.f * acc[m][1]) + 1.f/256.f * acc[m][2]) + 1.f/4096.f * acc[m][3]) :\n",
+                "                ((acc[m][0] + 1.f/16.f * acc[m][1]) + (1.f/256.f * acc[m][2] + 1.f/4096.f * acc[m][3])))\n",
+            ),
+            1,
+        )],
+    },
+    Mutant {
+        name: "mrows_bias_first_row",
+        clause: "mrows_pair_scaled",
+        why: "rows past the first take the first row's input sum in their bias term: the groups' biases are live, so the bits move",
+        edits: &[(
+            "                   + Pair::bias_of_word(wd.sb) * lanes[m].sumy;",
+            "                   + Pair::bias_of_word(wd.sb) * lanes[0].sumy;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mrows_pair_reads_first",
+        clause: "mrows_pair_scaled",
+        why: "every activation row of the M-row pair reads the first row's input: the row span of the load drops",
+        edits: &[(
+            "Q::template load_rows<LOAD_PLAIN, M>(lanes, xp, row_span, nullptr, nullptr);",
+            "Q::template load_rows<LOAD_PLAIN, M>(lanes, xp, 0, nullptr, nullptr);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mrows_pair_pitch",
+        clause: "mrows_pair_scaled",
+        why: "the M-row pair pitches its activation rows one slot's span apart, not the slots' whole span",
+        edits: &[(
+            "                y[pitch * (ulong)m + (ulong)slot * args.stride + (uint)(row0 + o)] =\n",
+            "                y[(ulong)args.stride * (ulong)m + (ulong)slot * args.stride + (uint)(row0 + o)] =\n",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mrows_head_stride",
+        clause: "mrows_head_scaled",
+        why: "the M-row head's logits rows sit four words closer than the row count: row m's logits overlap row m + 1's",
+        edits: &[(
+            "(int)args.rows, args.stride, tiisg);",
+            "(int)args.rows, args.stride - 4u, tiisg);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mrows_norm_gain",
+        clause: "mrows_seg",
+        why: "the M-row norm load drops the gain of a value",
+        edits: &[(
+            "sum_sq[m] += (a0 * a0 + a1 * a1) + (a2 * a2 + a3 * a3);\n                    a0 *= gq.x;",
+            "sum_sq[m] += (a0 * a0 + a1 * a1) + (a2 * a2 + a3 * a3);\n                    a0 *= 1.f;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mrows_seg_weights",
+        clause: "mrows_seg",
+        why: "a segment of the M-row launch reads the weights of the first segment",
+        edits: &[(
+            "matvec_rows_m<Q, M, !SCALED, false, true, SCALED>(W + (ulong)args.segs[s].wblocks, x,",
+            "matvec_rows_m<Q, M, !SCALED, false, true, SCALED>(W, x,",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mrows_tail_store",
+        clause: "mrows_matvec",
+        why: "the last SIMD group of the M-row launch stores its dead rows, past the rows' count",
+        edits: &[(
+            "        if (first_row + row >= rows) {\n            break;\n        }\n        FOR_UNROLL (short m = 0; m < M; ++m) {\n            if (NORM && isnan(scale[m])) {",
+            "        FOR_UNROLL (short m = 0; m < M; ++m) {\n            if (NORM && isnan(scale[m])) {",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mrows_nan_spreads",
+        clause: "mrows_seg",
+        why: "a row the norm cannot take makes every row's scale NaN, so the rows before it skip their stores",
+        edits: &[(
+            "                scale[m] = NAN;\n",
+            "                for (short k = 0; k < M; ++k) {\n                    scale[k] = NAN;\n                }\n",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mrows_scaled_scale_first",
+        clause: "mrows_seg_scaled",
+        why: "every activation row of the scaled M-row launches takes the first row's scale word",
+        edits: &[(
+            "        scale[m] = SCALED ? gain[m] : 1.f;",
+            "        scale[m] = SCALED ? gain[0] : 1.f;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mrows_scaled_pair_scale_first",
+        clause: "mrows_pair_scaled",
+        why: "every activation row of the scaled M-row pair takes the first row's scale word",
+        edits: &[("in_scale[m] = gain[m];", "in_scale[m] = gain[0];", 1)],
+    },
+    Mutant {
+        name: "mrows_scaled_head_scale_ignored",
+        clause: "mrows_head_scaled",
+        why: "the scaled M-row head's logits skip the scale words: the rows are the unscaled sums",
+        edits: &[(
+            "matvec_rows_m<Q, M, false, false, false, true>(weights, x, logits, (int)args.nblocks,",
+            "matvec_rows_m<Q, M, false, false, false, false>(weights, x, logits, (int)args.nblocks,",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mrows_next_row_stride",
+        clause: "mrows_next",
+        why: "the M-row hand-on writes row r's values a vector past its row's place",
+        edits: &[(
+            "device float *xn_row = xn + (ulong)row * args.cols;",
+            "device float *xn_row = xn + (ulong)row * (args.cols + 4u);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mrows_next_scale_slot",
+        clause: "mrows_next",
+        why: "every row of the M-row hand-on writes its scale into the first scale word",
+        edits: &[(
+            "NEXT_NORM_SCALE(Q, x_row, args.cols, (ulong)args.rows * args.cols + row)",
+            "NEXT_NORM_SCALE(Q, x_row, args.cols, (ulong)args.rows * args.cols)",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mrows_next_reads_first",
+        clause: "mrows_next",
+        why: "every row of the M-row hand-on reads the first row of the stream",
+        edits: &[(
+            "device const float *x_row = x + (ulong)row * args.cols;",
+            "device const float *x_row = x;",
+            1,
+        )],
     },
 ];
 
