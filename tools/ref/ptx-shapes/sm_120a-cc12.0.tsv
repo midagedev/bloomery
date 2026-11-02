@@ -166,6 +166,10 @@ generate_ds41 ds41_shexp_gate_up_q3k_mcol 0 0
 generate_ds41 ds41_shexp_gate_up_q5k 0 0
 generate_ds41 ds41_shexp_gate_up_q8_0_mcol 0 0
 generate_ds41 ds41_tap_means 0 0
+# PIN(2026-11-02): the DSpark recurrent head's three entries (gpu::dspark::rnn) at 0 spill and 0 JIT local, [derived: the sm_86 scan's 0/0 of the same source; no local arrays and no indexed register array in the bodies], not measured at this arch until a scan there.
+generate_ds41 dspark_rnn_add 0 0
+generate_ds41 dspark_rnn_gate 0 0
+generate_ds41 dspark_rnn_input 0 0
 generate_ds41 embed_rows 0 0
 generate_ds41 embed_rows_bf16 0 0
 generate_ds41 embed_rows_q3k 0 0

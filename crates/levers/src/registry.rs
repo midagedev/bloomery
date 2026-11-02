@@ -1959,6 +1959,14 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          `tools/ref/dump.sh` and `dump-draft.sh` hand them.",
     ),
     path(
+        "BLOOMERY_REF_DSPARK",
+        Some("ref/models/mistral-large4.sh"),
+        "The Mistral Large 4 DSpark draft file: the profile's `DSPARK` \
+         (`tools/ref/models/mistral-large4.sh`), which `tools/ref/dump-ml4-dspark.sh` and \
+         `gate-gpu-mistrallarge4-dspark` read; the path is the draft family's identity, so a \
+         set dumped from another file is refused by name.",
+    ),
+    path(
         "BLOOMERY_REF_MODEL",
         Some("box.sh"),
         "The model file the gates and the GPU binaries open: `tools/box.sh` exports the \

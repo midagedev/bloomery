@@ -19,6 +19,8 @@ set -uo pipefail
 HERE=$(cd "${BASH_SOURCE[0]%/*}" && pwd)
 # shellcheck source=tools/ref/ref-paths.sh
 source "$HERE/ref-paths.sh"
+# shellcheck source=tools/gate-bound.sh
+source "$HERE/../gate-bound.sh"
 [ "$MODEL_NAME" = mistral-large4 ] || { echo "dump-ml4-dspark: the profile is $MODEL_NAME, not mistral-large4" >&2; exit 64; }
 TREE=/home/user/llama.cpp-ml4dspark
 BIN=$TREE/build/bin/llama-speculative-simple
@@ -43,7 +45,8 @@ while IFS= read -r line; do
   d=$OUT/$(printf 'p%02d' "$n")
   mkdir -p "$d" || exit 2
   rc=0
-  LLAMA_DSPARK_DUMP=$d timeout --kill-after=10 900 "$BIN" -m "$MODEL" -md "$DSPARK" --spec-type draft-dspark \
+  export LLAMA_DSPARK_DUMP=$d
+  run_bounded timeout --kill-after=10 900 "$BIN" -m "$MODEL" -md "$DSPARK" --spec-type draft-dspark \
     --spec-draft-n-max "$N_MAX" --spec-draft-n-min 0 --spec-draft-p-min 0 -p "$prompt" -n 16 --temp 0 --seed 0 -c 4096 \
     -ngl 999 -ngld 999 -ot 'exps=CPU' < /dev/null > "$d/out.txt" 2> "$d/err.txt" || rc=$?
   [ "$rc" = 0 ] || { echo "dump-ml4-dspark: prompt $n ended rc $rc; its stderr is $d/err.txt" >&2; exit 1; }
