@@ -378,7 +378,7 @@ where
     /// draft or none.
     #[allow(
         dead_code,
-        reason = "the qwen3 seat's lookup rounds read it; the V4.1 binary that includes this file serves no such seat"
+        reason = "the lookup rounds of a seat that drafts by lookup read it; the V4.1 binary that includes this file serves no such seat"
     )]
     pub(crate) fn lookups_mut(&mut self) -> Option<&mut Lookups<Session<B>>> {
         self.lookup.as_mut()
