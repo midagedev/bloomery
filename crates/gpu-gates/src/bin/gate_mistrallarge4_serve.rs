@@ -859,7 +859,7 @@ mod gate {
         let (st_erase, _) = slot_action(url, slot, "erase", &json!({}))?;
         let (st_restore, restored) = slot_action(url, other, "restore", &file)?;
         let (back, vback) = greedy(url, cont.clone(), N, &d, "file_r_back", true)?;
-        let (fresh, _) = greedy(url, cont.clone(), N, &d, "file_r_fresh", false)?;
+        let (fresh, _) = greedy(url, cont, N, &d, "file_r_fresh", false)?;
         let held = st_save == 200
             && saved["n_saved"] == json!(positions)
             && slot_of(&va)? == slot
