@@ -248,12 +248,18 @@ lock stubs, checking both the exit status and whether the command ran.
    when it was not. The install command is in `docs/BUILD.md` ("Toolchain").
 3. **The lock directory.** `BLOOMERY_LOCK_DIR`, an absolute path, default `~/.cache/bloomery/locks`, made when missing.
    It holds the timing lease, the holds and the gate locks. `tools/gpu-gate.sh` takes one lock there,
-   `bloomery-gate-local.lock`, for whatever card the machine shows, so on a machine with several cards the gates run one
-   at a time.
-4. **The card.** `BLOOMERY_CARD` unset, `3090` or `a6000` runs on your card, and the command sees
-   `BLOOMERY_BOX_CARD=local`. `tools/box.sh` reads `BLOOMERY_CARD` before its local branch, so any other value is
-   refused (below). `CUDA_VISIBLE_DEVICES` is yours, or the environment file's when it sets one. A recipe's own
-   `BLOOMERY_GATE_CARD`, the card it asks `tools/gpu-gate.sh` for, may be unset, `3090`, `a6000` or `any` in local mode.
+   `bloomery-gate-local.lock`, which holds every card the machine has, so on a machine with several cards the gates run
+   one at a time.
+4. **The cards.** A command runs on the cards in view, and no card is found by its name. `CUDA_VISIBLE_DEVICES`
+   selects them: yours, then the environment file's and `BLOOMERY_BOX_ENV`'s when either sets one; unset, every card
+   `nvidia-smi` lists. The card check reads that final view. An entry is a card's UUID, a unique UUID prefix, or its index
+   in `nvidia-smi`'s list; whitespace and empty entries are refused. Indices need `CUDA_DEVICE_ORDER=PCI_BUS_ID` unless they alone name
+   every card, because CUDA's default order is fastest first and `nvidia-smi` lists by PCI bus. `cards_view` in
+   `tools/ref/cards.sh` reads them, and `tools/box.sh`, `tools/gpu-gate.sh` and the timing runners (section 5) take the
+   cards from it. The recipes' card words are the box's: `BLOOMERY_CARD` unset, `3090` or `a6000` runs on the cards in view, and `both`, the two-card recipes' word,
+   runs when two or more cards are in view. The command sees `BLOOMERY_BOX_CARD=local`. A recipe's own
+   `BLOOMERY_GATE_CARD`, the card it asks `tools/gpu-gate.sh` for, may be unset, `3090`, `a6000` or `any`, and `both`
+   with two or more cards in view.
 5. **The CPU flag, on x86_64.** The cargo files build for Zen 3 (`znver3`) on x86_64, and local mode does not change
    that, so on another x86_64 CPU a gate binary may stop with an illegal instruction. Set
    `RUSTFLAGS='-C target-cpu=native'` in your shell or the environment file. Plain `cargo` then takes it in place of
@@ -298,8 +304,9 @@ A *variant item* runs a recipe on a variant fixture: the family's fixture requan
 `llama-quantize`; without the variant fixture the item stops with exit 66. Its reference sets are not published
 (section 6).
 
-**Refused (exit 64):** a host that is not Linux (a Mac runs `just mac-static`); a `BLOOMERY_CARD` other than `3090` or
-`a6000`: `both`, so every two-card recipe, and any other name; `BLOOMERY_BOX_QUEUE=1`; a relative `BLOOMERY_LOCK_DIR`,
+**Refused (exit 64):** a host that is not Linux (a Mac runs `just mac-static`); a `BLOOMERY_CARD` other than `3090`,
+`a6000` or `both`; `both` with fewer than two cards in view, so every two-card recipe on a one-card machine, named with
+the cards in view; `BLOOMERY_BOX_QUEUE=1`; a relative `BLOOMERY_LOCK_DIR`,
 or one that is `/root`; an environment file that moves the lock directory or sets a `BLOOMERY_ARCH` other than the one
 the recipe expanded; and the box itself.
 
@@ -335,7 +342,7 @@ In both runs, the one gate that stopped on the card's name was `gate-gpu-qwen38-
 RTX 3090 by name at those commits. `gate` plans the 3090's bytes on the smallest visible card with the room for them
 (`ALIASES` in `crates/placement/src/placement/devices.rs`), so the item opens on any such card. A recipe outside these
 two lists may still open a card by name. `gate-gpu-ds41-dspark-loop` also passes `--place gate`, but only at the real
-tier; at the fixture tier it runs `--place a`. The two-card recipes stop at the `BLOOMERY_CARD` refusal above. Every other closed GPU item stopped
+tier; at the fixture tier it runs `--place a`. The two-card recipes stop at the `both` refusal above on a one-card machine. Every other closed GPU item stopped
 on an input the machine did not have, except `gate-gpu-kquant` on the RTX 5090.
 
 ## 4. Fixtures and reference sets
@@ -421,12 +428,13 @@ variant directory aside first; `fixture-requant` refuses an existing directory.
 
 ## 5. Timing on your own card
 
-Local mode also times your card, with two runners. Under `BLOOMERY_BOX_CARD=local`, `tools/ref/timing-card.sh` times the
-one card `nvidia-smi` lists, picked by UUID, or among several cards the one `BLOOMERY_TIMING_GPU` names
+Local mode also times your card. Under `BLOOMERY_BOX_CARD=local`, `tools/ref/timing-card.sh` times the one card in view
+(section 3, "The cards"), picked by UUID, or among several cards in view the one `BLOOMERY_TIMING_GPU` names
 ([#39](https://github.com/midagedev/bloomery/pull/39)). The lease and its trace, `bloomery-sittings.log`, sit in
 `BLOOMERY_LOCK_DIR`.
 
-- **The runners.** Two runners opt in. `tools/ref/depth-qwen3moe.sh` runs through `just depth-gpu-qwen3moe`,
+- **The runners.** Four runners opt in: `tools/ref/nsys-gpu.sh` (the `nsys-gpu-*` recipes), `tools/ref/tier-cost.sh`
+  ([`dgx-spark.md`](dgx-spark.md) section 9.5) and the two below. `tools/ref/depth-qwen3moe.sh` runs through `just depth-gpu-qwen3moe`,
   `depth-gpu-qwen35moe` and `depth-gpu-qwen4exp`. `tools/ref/depth-serve.sh` times any model's decode and prompt rate
   through `bloomery-serve`: `BLOOMERY_MODEL=<profile> just depth-serve <tree>:<D> ...`, each arm the `bloomery-serve`
   of `~/repo/<tree>` on the first D ids of the profile's prose corpus (the runner's header has the arms). The recipe
@@ -500,8 +508,8 @@ The design listed what a run off the box must bypass. This table keeps that list
 | 1 | Commands run on the maintainers' workstation after an rsync of the tree and `source ~/bloomery-env.sh` | `tools/box.sh` | **Built** ([#38](https://github.com/midagedev/bloomery/pull/38)): section 3; its tests are in `tools/ref/card-tests/run.sh` |
 | 2 | The box's environment file (nightly, LLVM 21, CUDA 13.3) | `tools/box.sh` header | **Not built:** an example file from the toolchain block of `docs/BUILD.md`; what it exports is in section 3 |
 | 3 | A timing lease and holds under `/root` gate every command | `tools/ref/lease-probe.sh:17` | **Built** (#38): one `BLOOMERY_LOCK_DIR` moves the lease and the holds (section 3) |
-| 4 | Gate locks per card name at `/root/bloomery-gate*.lock`, the V4.1 load lock, the batch hold | `tools/gpu-gate.sh:86-89` | **Built** (#38): every lock under `BLOOMERY_LOCK_DIR`, and one local lock for the machine's card (section 3) |
-| 5 | Cards are found by exact name, `NVIDIA GeForce RTX 3090` and `NVIDIA RTX A6000` | `tools/ref/cards.sh:33-34`; the card pick in `tools/box.sh` | **Built** (#38): the `BLOOMERY_CARD` values that run and the ones refused, and the gates the name still closes, are in section 3 |
+| 4 | Gate locks per card name at `/root/bloomery-gate*.lock`, the V4.1 load lock, the batch hold | `tools/gpu-gate.sh:86-89` | **Built** (#38): every lock under `BLOOMERY_LOCK_DIR`, and one local lock that holds the machine's cards (section 3) |
+| 5 | Cards are found by exact name, `NVIDIA GeForce RTX 3090` and `NVIDIA RTX A6000` | `tools/ref/cards.sh`; the card pick in `tools/box.sh` | **Built** (#38): local mode finds no card by name. The cards in view come from `cards_view` in `tools/ref/cards.sh`, and the names are the box's alone; the `BLOOMERY_CARD` values that run and the ones refused, and the gates the name still closes, are in section 3 |
 | 6 | The device arch was `sm_86` in 139 `justfile` lines and `tools/gate.sh` | the justfile's `arch` variable, `tools/arch.sh` | **Done:** `BLOOMERY_ARCH` (unset: `sm_120a` when every card is cc 12.0, `sm_121a` when every one is cc 12.1, else `sm_86`), read by the justfile and by the tools on the box, forwarded by `box.sh`; `check-recipes` fails on a literal. `gate-ptx-spill` reads a table per PTX arch and card capability (`tools/ref/ptx-shapes.tsv` is sm_86 on cc 8.6; sm_120a on cc 12.0 and sm_86, sm_121 and sm_121a on cc 12.1 sit in `tools/ref/ptx-shapes/`), `ptx-scan` takes sm_86, sm_120 and sm_121, `just narrow` and `ptx-compare` build both sides at the selected arch, and `release-build` refuses an arch it has no archive for |
 | 7 | The cuda-oxide backend is a prebuilt `.so` per rev, and `cargo oxide` refuses (rc 70) without it | `tools/box.sh` | **Built** (#38): local mode lets `cargo-oxide` build its own backend (section 3) |
 | 8 | The CPU flag `znver3` in both cargo files | `.cargo/config.toml`, `tools/oxide-host.sh` | **aarch64 done** (`f0139df3`): `.cargo/config.toml` has a table per target triple, `target-cpu=native` for aarch64, and `tools/oxide-host.sh` writes the `cargo oxide` file for the triple a build is for from it. **x86_64:** the table stays `znver3`, and a caller's `RUSTFLAGS` reaches both plain `cargo` and `cargo oxide` builds (measured, section 3) |
@@ -522,7 +530,7 @@ outside comments name `tools/box.sh` at `3bc2a172` (`grep -vE '^\s*#' justfile |
    listed length (section 4).
 3. **Answered:** local mode lives in `box.sh` as `BLOOMERY_BOX_LOCAL=1` ([`dgx-spark.md`](dgx-spark.md) section 11,
    answer 10), and it is built (section 3).
-4. Local mode refuses a two-card recipe with exit 64, a usage error, while T2's design counts a named refusal with exit 66
+4. Local mode refuses a two-card recipe with fewer than two cards in view with exit 64, a usage error, while T2's design counts a named refusal with exit 66
    as `DEFER`. On a one-card machine a two-card gate is "cannot run here" rather than a caller's mistake, so a T2 runner
    would count these recipes red. Should the code be 66, 69 or another
    ([#38](https://github.com/midagedev/bloomery/pull/38), question 2)?

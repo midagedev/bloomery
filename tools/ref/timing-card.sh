@@ -10,9 +10,10 @@
 #   `card` field of the witness block, which lease.sh owns); what to do when the other card is
 #   busy; and the refusal that keeps a runner from timing a binary older than its sources.
 #
-# Timed numbers are taken on the A6000 and this overrides the 3090 pin in the box env file.
+# On the box, timed numbers are taken on the A6000 and this overrides the 3090 pin in the box env file.
 # The 3090 is the gate-and-build card. Numbers from the two cards never belong in one table,
-# which is why the first witness line names the card and its power limit.
+# which is why the first witness line names the card and its power limit. Any other machine runs
+# local mode (below), which times the card in view and names no card.
 #
 # The two-card mode (AGENTS.md, user 2026-09-28): a model that does not fit one card may carry a
 # second table, "A6000+3090", its own and never the A6000's. BLOOMERY_TIMING_CARDS=a6000+3090 turns it
@@ -31,19 +32,21 @@
 #
 # Local mode (tools/box.sh's BLOOMERY_BOX_LOCAL=1, which passes BLOOMERY_BOX_CARD=local): a contributor's
 # machine times its own card, under the lease in BLOOMERY_LOCK_DIR, in a runner that opts in (TIMING_LOCAL_RUNNER=1
-# before it sources this file: depth-qwen3moe.sh, depth-serve.sh). The timing card is the one card
-# nvidia-smi lists by UUID, or among several the one BLOOMERY_TIMING_GPU names, and CUDA_VISIBLE_DEVICES is
-# that UUID, over the caller's that box.sh's local mode passes on; no other card is watched (OTHER_GPU
-# empty) and there is no two-card mode. The run is refused (TIMING_CARDS_WHY, so lease_take ends it at 64)
-# on the box (/root/bloomery-cpu.lock exists), when the lock directory is /root, when
-# BLOOMERY_TIMING_CARDS is set, in a runner that does not opt in, and when nvidia-smi fails or lists no
-# card, lists several and BLOOMERY_TIMING_GPU is unset, or does not list BLOOMERY_TIMING_GPU. The witness's
+# before it sources this file: depth-qwen3moe.sh, depth-serve.sh, nsys-gpu.sh, tier-cost.sh). The timing card is the
+# one card in view (tools/ref/cards.sh's cards_view: the caller's CUDA_VISIBLE_DEVICES, which box.sh's local mode passes
+# on, else every card nvidia-smi lists), or among several the one BLOOMERY_TIMING_GPU names, and CUDA_VISIBLE_DEVICES is
+# then that UUID; no other card is watched (OTHER_GPU empty) and there is no two-card mode. The run is refused
+# (TIMING_CARDS_WHY, so lease_take ends it at 64) on the box (/root/bloomery-cpu.lock exists), when the lock directory is
+# /root, when BLOOMERY_TIMING_CARDS is set, in a runner that does not opt in, and when the cards in view cannot be read
+# (cards_view's reason), are several and BLOOMERY_TIMING_GPU is unset, or do not hold BLOOMERY_TIMING_GPU. The witness's
 # `card` field is witness_local. The Xid reader runs as in the two-card mode and counts the machine's Xid
 # lines, every card's: timing_cards_precheck refuses a kernel journal that does not answer, or that shows a
 # user other than root no line (69), and after each arm timing_cards_arm fails the arm's row on an NVRM Xid
 # since the last arm or a card that stopped answering.
 # shellcheck source=tools/ref/cards.sh
 source "${BASH_SOURCE[0]%/*}/cards.sh"
+# The caller's CUDA_VISIBLE_DEVICES, before the box's timing card replaces it below: local mode's cards in view.
+TIMING_VIEW_SET=${CUDA_VISIBLE_DEVICES+1} TIMING_VIEW=${CUDA_VISIBLE_DEVICES-}
 # now(), the lease and the witness block. guard_other below prints a witness block on its abort path.
 # shellcheck source=tools/ref/lease.sh
 source "${BASH_SOURCE[0]%/*}/lease.sh"
@@ -118,26 +121,16 @@ if [ "${BLOOMERY_BOX_CARD:-}" = local ]; then
   elif [ "${TIMING_LOCAL_RUNNER:-}" != 1 ]; then
     TIMING_CARDS_WHY="BLOOMERY_BOX_CARD=local, and ${0##*/} has no local mode (a runner opts in with TIMING_LOCAL_RUNNER=1): its arms would go unchecked for an Xid or a lost card"
   else
-    # Bounded as the witness's queries are (__witness_smi, lease.sh).
-    __witness_smi --query-gpu=uuid --format=csv,noheader
-    __local_rc=$__witness_rc __local_uuids=$__witness_out
-    if [ "$__local_rc" = 0 ]; then
-      # A warning nvidia-smi prints beside the list is not a card.
-      __local_uuids=$(grep '^GPU-' <<< "$__local_uuids" || true)
-    fi
-    __local_n=$(grep -c . <<< "$__local_uuids" || true)
-    if [ "$__local_rc" != 0 ]; then
-      TIMING_CARDS_WHY="local mode: nvidia-smi --query-gpu=uuid failed (rc $__local_rc): ${__local_uuids%%$'\n'*}"
-    elif [ "$__local_n" = 0 ]; then
-      TIMING_CARDS_WHY='local mode: nvidia-smi --query-gpu=uuid lists no card'
-    elif [ -z "$TIMING_GPU" ] && [ "$__local_n" = 1 ]; then
-      TIMING_GPU=$__local_uuids
+    if [ -n "$TIMING_VIEW_SET" ]; then export CUDA_VISIBLE_DEVICES=$TIMING_VIEW; else unset CUDA_VISIBLE_DEVICES; fi
+    if ! cards_view; then
+      TIMING_CARDS_WHY="local mode: $CARDS_VIEW_WHY"
+    elif [ -z "$TIMING_GPU" ] && [ "$CARDS_VIEW_N" = 1 ]; then
+      TIMING_GPU=$CARDS_VIEW
     elif [ -z "$TIMING_GPU" ]; then
-      TIMING_CARDS_WHY="local mode: nvidia-smi lists $__local_n cards ($(paste -sd' ' - <<< "$__local_uuids")): name one by UUID in BLOOMERY_TIMING_GPU"
-    elif ! grep -qxF -- "$TIMING_GPU" <<< "$__local_uuids"; then
-      TIMING_CARDS_WHY="local mode: BLOOMERY_TIMING_GPU=$TIMING_GPU is not a card nvidia-smi lists ($(paste -sd' ' - <<< "$__local_uuids"))"
+      TIMING_CARDS_WHY="local mode: $CARDS_VIEW_N cards in view ($CARDS_VIEW): narrow CUDA_VISIBLE_DEVICES to one, or name one by UUID in BLOOMERY_TIMING_GPU"
+    elif [[ " $CARDS_VIEW " != *" $TIMING_GPU "* ]]; then
+      TIMING_CARDS_WHY="local mode: BLOOMERY_TIMING_GPU=$TIMING_GPU is not a card in view ($CARDS_VIEW)"
     fi
-    unset __local_rc __local_uuids __local_n
   fi
   [ -n "$TIMING_CARDS_WHY" ] || export CUDA_VISIBLE_DEVICES=$TIMING_GPU
 fi

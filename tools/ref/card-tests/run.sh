@@ -734,6 +734,10 @@ B=$tmp/boxtree
 mkdir -p "$B/tools" "$tmp/stub"
 printf '%s\n' '#!/bin/sh' 'printf "%s\n" 8.6' > "$tmp/stub/nvidia-smi"
 chmod +x "$tmp/stub/nvidia-smi"
+# The same stub with a card list: its uuid query lists STUB_UUIDS, the cards tools/ref/cards.sh's cards_view reads as in view.
+mkdir -p "$tmp/uuids"
+printf '%s\n' '#!/bin/sh' 'case "$*" in *--query-gpu=uuid\ *) printf "%s\n" $STUB_UUIDS ;; *) printf "%s\n" 8.6 ;; esac' > "$tmp/uuids/nvidia-smi"
+chmod +x "$tmp/uuids/nvidia-smi"
 # The copy under test has its drop wait and its sync wait shrunk (box.sh's constants' lines): a retried drop would wait 5 s a time.
 sed -e 's/^DROP_WAIT=5 /DROP_WAIT=0 /' -e 's/^SYNC_WAIT=120 /SYNC_WAIT=1 /' -e 's/^SYNC_POLL=2 /SYNC_POLL=0.2 /' "$ROOT/tools/box.sh" > "$B/tools/box.sh"
 chmod +x "$B/tools/box.sh"
@@ -1255,7 +1259,7 @@ inlog 'box.sh job: the quoted command ends the output the same way' "$tmp/out" '
 # gets the files the command reads (the guard's lease-probe.sh, the profiles), the environment file is a stub that says it ran,
 # the locks live in a directory of the test's own, and a stub uname says Linux (STUB_UNAME names another system).
 mkdir -p "$B/tools/ref/models" "$tmp/home" "$tmp/uname"
-cp "$ROOT/tools/ref/lease-probe.sh" "$ROOT/tools/ref/ref-paths.sh" "$ROOT/tools/ref/dspark-path.sh" "$B/tools/ref/"
+cp "$ROOT/tools/ref/lease-probe.sh" "$ROOT/tools/ref/ref-paths.sh" "$ROOT/tools/ref/dspark-path.sh" "$ROOT/tools/ref/cards.sh" "$B/tools/ref/"
 cp "$ROOT"/tools/ref/models/*.sh "$B/tools/ref/models/"
 printf 'echo "[env] sourced"\n' > "$tmp/local-env.sh"
 printf '#!/bin/sh\necho "${STUB_UNAME:-Linux}"\n' > "$tmp/uname/uname"
@@ -1263,7 +1267,7 @@ chmod +x "$tmp/uname/uname"
 L=$tmp/locks-local
 SHOW='echo "pwd=$PWD card=$BLOOMERY_BOX_CARD locks=$BLOOMERY_LOCK_DIR oxide=${CUDA_OXIDE_BACKEND-unset} data=$BLOOMERY_DATA jobs=${CARGO_BUILD_JOBS-unset}"'
 boxl() {
-  box env -u CUDA_OXIDE_BACKEND -u CARGO_BUILD_JOBS PATH="$tmp/uname:$tmp/stub:$PATH" BLOOMERY_BOX_LOCAL=1 \
+  box env -u CUDA_OXIDE_BACKEND -u CARGO_BUILD_JOBS -u CUDA_VISIBLE_DEVICES -u CUDA_DEVICE_ORDER PATH="$tmp/uname:$tmp/stub:$PATH" BLOOMERY_BOX_LOCAL=1 \
     BLOOMERY_ENV_FILE="$tmp/local-env.sh" BLOOMERY_LOCK_DIR="$L" BLOOMERY_DATA="$tmp/data" "$@"
 }
 unreached() {
@@ -1311,9 +1315,24 @@ else
     boxl BLOOMERY_ENV_FILE="$tmp/lockdir-env.sh" "$B/tools/box.sh" "$SHOW"
   if grep -q '^pwd=' "$tmp/out"; then fail 'box.sh: that refusal ran no command' 'the command ran' "$tmp/out"; else pass 'box.sh: that refusal ran no command'; fi
   run 'box.sh: local mode runs BLOOMERY_CARD=a6000 on the local card' 0 ' card=local ' boxl BLOOMERY_CARD=a6000 "$B/tools/box.sh" "$SHOW"
-  run 'box.sh: local mode refuses BLOOMERY_CARD=both' 64 "BLOOMERY_CARD=both puts the box's two cards in view, and BLOOMERY_BOX_LOCAL=1 runs on what this machine shows" \
-    boxl BLOOMERY_CARD=both "$B/tools/box.sh" "$SHOW"
+  # BLOOMERY_CARD=both: two or more cards in view (tools/ref/cards.sh), read after the environment file.
+  run 'box.sh: local mode refuses BLOOMERY_CARD=both with one card in view' 64 \
+    'BLOOMERY_CARD=both runs on two or more cards in view, and this machine has 1 in view: GPU-1$' \
+    boxl PATH="$tmp/uuids:$tmp/uname:$tmp/stub:$PATH" STUB_UUIDS=GPU-1 BLOOMERY_CARD=both "$B/tools/box.sh" "$SHOW"
   if grep -q '^pwd=' "$tmp/out"; then fail 'box.sh: the refusal of both ran no command' 'the command ran' "$tmp/out"; else pass 'box.sh: the refusal of both ran no command'; fi
+  run 'box.sh: local mode runs BLOOMERY_CARD=both on two cards in view' 0 ' card=local ' \
+    boxl PATH="$tmp/uuids:$tmp/uname:$tmp/stub:$PATH" STUB_UUIDS='GPU-1 GPU-2' BLOOMERY_CARD=both "$B/tools/box.sh" "$SHOW"
+  run "box.sh: local mode checks both after BLOOMERY_BOX_ENV narrows the view" 64 'and this machine has 1 in view: GPU-1$' \
+    boxl PATH="$tmp/uuids:$tmp/uname:$tmp/stub:$PATH" STUB_UUIDS='GPU-1 GPU-2' BLOOMERY_CARD=both \
+    BLOOMERY_BOX_ENV=CUDA_VISIBLE_DEVICES=GPU-1 "$B/tools/box.sh" "$SHOW"
+  if grep -q '^pwd=' "$tmp/out"; then fail 'box.sh: the narrowed view ran no command' 'the command ran' "$tmp/out"; else pass 'box.sh: the narrowed view ran no command'; fi
+  run "box.sh: local mode checks both after BLOOMERY_BOX_ENV widens the view" 0 '^view=GPU-1,GPU-2 card=local$' \
+    boxl PATH="$tmp/uuids:$tmp/uname:$tmp/stub:$PATH" STUB_UUIDS='GPU-1 GPU-2' CUDA_VISIBLE_DEVICES=GPU-1 BLOOMERY_CARD=both \
+    BLOOMERY_BOX_ENV=CUDA_VISIBLE_DEVICES=GPU-1,GPU-2 "$B/tools/box.sh" 'echo "view=$CUDA_VISIBLE_DEVICES card=$BLOOMERY_BOX_CARD"'
+  printf 'export CUDA_VISIBLE_DEVICES=GPU-2\n' > "$tmp/one-card-env.sh"
+  run "box.sh: local mode reads both's cards after the environment file" 64 'and this machine has 1 in view: GPU-2$' \
+    boxl PATH="$tmp/uuids:$tmp/uname:$tmp/stub:$PATH" STUB_UUIDS='GPU-1 GPU-2' BLOOMERY_ENV_FILE="$tmp/one-card-env.sh" BLOOMERY_CARD=both \
+    "$B/tools/box.sh" "$SHOW"
   L2="$tmp/lock dir;x"
   mkdir -p "$L2" && touch "$L2/bloomery-aa-hold"
   run 'box.sh: the local guard reads the holds in the lock directory, a path with a space and a ; whole' 75 "hold $L2/bloomery-aa-hold owner=aa " \
@@ -1359,10 +1378,10 @@ run 'box.sh: BLOOMERY_BOX_LOCAL takes 1 or 0' 64 'BLOOMERY_BOX_LOCAL is 1 \(run 
 G=$tmp/gatetree
 mkdir -p "$G/tools/ref" "$G/target/release"
 cp "$ROOT/tools/gpu-gate.sh" "$ROOT/tools/gate-bound.sh" "$G/tools/"
-cp "$ROOT/tools/ref/lease-probe.sh" "$G/tools/ref/"
+cp "$ROOT/tools/ref/lease-probe.sh" "$ROOT/tools/ref/cards.sh" "$G/tools/ref/"
 printf '#!/bin/sh\nexit 0\n' > "$G/target/release/x"
 chmod +x "$G/target/release/x"
-gg() { (cd "$G" && env -u BLOOMERY_GATE_CARD -u BLOOMERY_BOX_CARD -u BLOOMERY_GATE_BOUND -u BLOOMERY_LOCK_DIR "$@" bash tools/gpu-gate.sh x); }
+gg() { (cd "$G" && env -u BLOOMERY_GATE_CARD -u BLOOMERY_BOX_CARD -u BLOOMERY_GATE_BOUND -u BLOOMERY_LOCK_DIR -u CUDA_VISIBLE_DEVICES -u CUDA_DEVICE_ORDER "$@" bash tools/gpu-gate.sh x); }
 run 'gpu-gate.sh: both cards in view refuse the 3090 lock alone' 64 'box.sh put both cards in view \(BLOOMERY_CARD=both\), and BLOOMERY_GATE_CARD=3090 names another lock' \
   gg BLOOMERY_BOX_CARD=both BLOOMERY_GATE_CARD=3090
 run 'gpu-gate.sh: both cards in view refuse any' 64 'box.sh put both cards in view' gg BLOOMERY_BOX_CARD=both BLOOMERY_GATE_CARD=any
@@ -1380,8 +1399,11 @@ if [ -e /root/bloomery-cpu.lock ]; then
   run 'gpu-gate.sh: on the box, a lock directory other than /root is refused' 64 "BLOOMERY_LOCK_DIR=$tmp/ld on the machine whose lease is /root/bloomery-cpu\\.lock" \
     gg BLOOMERY_LOCK_DIR="$tmp/ld"
 else
-  run "gpu-gate.sh: box.sh's local mode refuses both" 64 "BLOOMERY_GATE_CARD=both names the box's two cards" \
-    gg BLOOMERY_BOX_CARD=local BLOOMERY_LOCK_DIR="$tmp/ld" BLOOMERY_GATE_CARD=both
+  run "gpu-gate.sh: box.sh's local mode refuses both with one card in view" 64 \
+    'BLOOMERY_GATE_CARD=both runs on two or more cards in view, and this machine has 1 in view: GPU-1$' \
+    gg PATH="$tmp/uuids:$PATH" STUB_UUIDS=GPU-1 BLOOMERY_BOX_CARD=local BLOOMERY_LOCK_DIR="$tmp/ld" BLOOMERY_GATE_CARD=both
+  run "gpu-gate.sh: box.sh's local mode takes both on two cards in view to its one lock" 69 "cannot open $tmp/no such;dir/bloomery-gate-local\\.lock" \
+    gg PATH="$tmp/uuids:$PATH" STUB_UUIDS='GPU-1 GPU-2' BLOOMERY_BOX_CARD=local BLOOMERY_LOCK_DIR="$tmp/no such;dir" BLOOMERY_GATE_CARD=both
   run "gpu-gate.sh: box.sh's local mode refuses the lock directory /root" 64 'keeps its lock under BLOOMERY_LOCK_DIR, and that is /root \(unset: /root\)' \
     gg BLOOMERY_BOX_CARD=local
   run 'gpu-gate.sh: BLOOMERY_LOCK_DIR holds the gate locks' 69 "cannot open $tmp/no-such-dir/bloomery-gate\\.lock" gg BLOOMERY_LOCK_DIR="$tmp/no-such-dir"
@@ -1636,8 +1658,8 @@ chmod +x "$C/local/nvidia-smi" "$C/local/journalctl" "$C/local/timeout"
 locx() { # <name> <rc> <pattern> <commands after the source> [NAME=value…]: the tree's timing-card.sh in local mode
   local name=$1 want=$2 pat=$3 body=$4
   shift 4
-  run "$name" "$want" "$pat" env -u BLOOMERY_TIMING_GPU -u BLOOMERY_TIMING_CARDS -u BLOOMERY_DRAFT -u STUB_UUID_RC -u STUB_UUID_WARN \
-    -u STUB_GONE -u STUB_JOURNAL PATH="$C/local:$PATH" BLOOMERY_BOX_CARD=local BLOOMERY_LOCK_DIR="$tmp/ld" TIMING_LOCAL_RUNNER=1 \
+  run "$name" "$want" "$pat" env -u BLOOMERY_TIMING_GPU -u BLOOMERY_TIMING_CARDS -u BLOOMERY_DRAFT -u STUB_UUID_RC -u STUB_UUID_WARN -u CUDA_VISIBLE_DEVICES \
+    -u CUDA_DEVICE_ORDER -u STUB_GONE -u STUB_JOURNAL PATH="$C/local:$PATH" BLOOMERY_BOX_CARD=local BLOOMERY_LOCK_DIR="$tmp/ld" TIMING_LOCAL_RUNNER=1 \
     STUB_UUIDS="$FAKE_GB10" "$@" bash -c "set -euo pipefail; source \"\$1\"; $body" _ "$ROOT/tools/ref/timing-card.sh"
 }
 loc() { # <name> <pattern> [NAME=value…]: the card, CUDA_VISIBLE_DEVICES and the refusal after the source
@@ -1656,13 +1678,47 @@ else
     '^gpu=\[\] cvd=\[\] local=\[1\] why=\[local mode: nvidia-smi --query-gpu=uuid failed \(rc 9\): NVIDIA-SMI has failed \(stub\)\]$' STUB_UUID_RC=9
   loc 'timing-card.sh local: no card listed is refused' '^gpu=\[\] cvd=\[\] local=\[1\] why=\[local mode: nvidia-smi --query-gpu=uuid lists no card\]$' \
     STUB_UUIDS=
-  loc 'timing-card.sh local: two cards and no BLOOMERY_TIMING_GPU are refused' \
-    "^gpu=\\[\\] cvd=\\[\\] local=\\[1\\] why=\\[local mode: nvidia-smi lists 2 cards \\($FAKE_GB10 $FAKE_A6000\\): name one by UUID in BLOOMERY_TIMING_GPU\\]\$" \
+  loc 'timing-card.sh local: two cards in view and no BLOOMERY_TIMING_GPU are refused' \
+    "^gpu=\\[\\] cvd=\\[\\] local=\\[1\\] why=\\[local mode: 2 cards in view \\($FAKE_GB10 $FAKE_A6000\\): narrow CUDA_VISIBLE_DEVICES to one, or name one by UUID in BLOOMERY_TIMING_GPU\\]\$" \
     STUB_UUIDS="$FAKE_GB10 $FAKE_A6000"
+  loc "timing-card.sh local: the caller's CUDA_VISIBLE_DEVICES puts one card in view" "^gpu=\\[$FAKE_A6000\\] cvd=\\[$FAKE_A6000\\] local=\\[1\\] why=\\[\\]\$" \
+    STUB_UUIDS="$FAKE_GB10 $FAKE_A6000" CUDA_VISIBLE_DEVICES="$FAKE_A6000"
+  loc "timing-card.sh local: an index in CUDA_VISIBLE_DEVICES is nvidia-smi's under PCI_BUS_ID" "^gpu=\\[$FAKE_A6000\\] cvd=\\[$FAKE_A6000\\] local=\\[1\\] why=\\[\\]\$" \
+    STUB_UUIDS="$FAKE_GB10 $FAKE_A6000" CUDA_VISIBLE_DEVICES=1 CUDA_DEVICE_ORDER=PCI_BUS_ID
+  loc "timing-card.sh local: an index that leaves a card out is refused in CUDA's default order" \
+    "^gpu=\\[\\] cvd=\\[\\] local=\\[1\\] why=\\[local mode: CUDA_VISIBLE_DEVICES=1: an index picks among 2 cards in CUDA's order, .*name the cards by UUID, or set CUDA_DEVICE_ORDER=PCI_BUS_ID\\]\$" \
+    STUB_UUIDS="$FAKE_GB10 $FAKE_A6000" CUDA_VISIBLE_DEVICES=1
+  loc "timing-card.sh local: an index beside a UUID is refused in CUDA's default order" \
+    "^gpu=\\[\\] cvd=\\[\\] local=\\[1\\] why=\\[local mode: CUDA_VISIBLE_DEVICES=0,$FAKE_A6000: an index picks among 2 cards in CUDA's order, .*\\]\$" \
+    STUB_UUIDS="$FAKE_GB10 $FAKE_A6000" CUDA_VISIBLE_DEVICES="0,$FAKE_A6000" BLOOMERY_TIMING_GPU="$FAKE_GB10"
+  loc "timing-card.sh local: the indices of every card are taken in CUDA's default order" \
+    "^gpu=\\[$FAKE_GB10\\] cvd=\\[$FAKE_GB10\\] local=\\[1\\] why=\\[\\]\$" \
+    STUB_UUIDS="$FAKE_GB10 $FAKE_A6000" CUDA_VISIBLE_DEVICES=1,0 BLOOMERY_TIMING_GPU="$FAKE_GB10"
+  loc "timing-card.sh local: a UUID prefix that names two cards is refused" \
+    "^gpu=\\[\\] cvd=\\[\\] local=\\[1\\] why=\\[local mode: CUDA_VISIBLE_DEVICES=GPU-2222: 'GPU-2222' names 2 of the cards nvidia-smi lists .*\\]\$" \
+    STUB_UUIDS="$FAKE_GB10 GPU-22222222-2222-2222-2222-999999999999" CUDA_VISIBLE_DEVICES=GPU-2222
+  loc 'timing-card.sh local: a unique UUID prefix selects the full UUID' "^gpu=\\[$FAKE_GB10\\] cvd=\\[$FAKE_GB10\\] local=\\[1\\] why=\\[\\]$" \
+    CUDA_VISIBLE_DEVICES=GPU-22222222
+  for bad in 'GPU-2222 2222' ' GPU-22222222' 'GPU-22222222 ' ' 0' '0 ' ',GPU-22222222' 'GPU-22222222,,0' 'GPU-22222222,'; do
+    loc "timing-card.sh local: malformed CUDA_VISIBLE_DEVICES '$bad' is refused" \
+      '^gpu=\[\] cvd=\[.*\] local=\[1\] why=\[local mode: CUDA_VISIBLE_DEVICES=.*names none of the cards nvidia-smi lists .*\]$' \
+      CUDA_VISIBLE_DEVICES="$bad"
+  done
+  loc 'timing-card.sh local: an empty CUDA_VISIBLE_DEVICES is refused' \
+    '^gpu=\[\] cvd=\[\] local=\[1\] why=\[local mode: CUDA_VISIBLE_DEVICES is set and empty: no card is in view\]$' CUDA_VISIBLE_DEVICES=
+  locx 'timing-card.sh local: a CUDA_VISIBLE_DEVICES with a newline is refused' 0 \
+    '^why=\[local mode: CUDA_VISIBLE_DEVICES holds a newline: its entries are one line, split by commas\] gpu=\[\]$' \
+    'printf "why=[%s] gpu=[%s]\n" "$TIMING_CARDS_WHY" "$TIMING_GPU"' CUDA_VISIBLE_DEVICES="$FAKE_GB10"$'\n'",$FAKE_3090"
+  loc "timing-card.sh local: a card named twice in CUDA_VISIBLE_DEVICES is refused" \
+    "^gpu=\\[\\] cvd=\\[\\] local=\\[1\\] why=\\[local mode: CUDA_VISIBLE_DEVICES=0,$FAKE_GB10: '$FAKE_GB10' names $FAKE_GB10, already in view\\]\$" \
+    STUB_UUIDS="$FAKE_GB10 $FAKE_A6000" CUDA_VISIBLE_DEVICES="0,$FAKE_GB10"
+  loc 'timing-card.sh local: a CUDA_VISIBLE_DEVICES entry that names no listed card is refused' \
+    "^gpu=\\[\\] cvd=\\[\\] local=\\[1\\] why=\\[local mode: CUDA_VISIBLE_DEVICES=$FAKE_3090: '$FAKE_3090' names none of the cards nvidia-smi lists \\($FAKE_GB10\\)\\]\$" \
+    CUDA_VISIBLE_DEVICES="$FAKE_3090"
   loc 'timing-card.sh local: BLOOMERY_TIMING_GPU picks a listed card' "^gpu=\\[$FAKE_A6000\\] cvd=\\[$FAKE_A6000\\] local=\\[1\\] why=\\[\\]\$" \
     STUB_UUIDS="$FAKE_GB10 $FAKE_A6000" BLOOMERY_TIMING_GPU="$FAKE_A6000"
-  loc 'timing-card.sh local: a BLOOMERY_TIMING_GPU nvidia-smi does not list is refused' \
-    "^gpu=\\[\\] cvd=\\[\\] local=\\[1\\] why=\\[local mode: BLOOMERY_TIMING_GPU=$FAKE_3090 is not a card nvidia-smi lists \\($FAKE_GB10\\)\\]\$" \
+  loc 'timing-card.sh local: a BLOOMERY_TIMING_GPU not in view is refused' \
+    "^gpu=\\[\\] cvd=\\[\\] local=\\[1\\] why=\\[local mode: BLOOMERY_TIMING_GPU=$FAKE_3090 is not a card in view \\($FAKE_GB10\\)\\]\$" \
     BLOOMERY_TIMING_GPU="$FAKE_3090"
   loc 'timing-card.sh local: BLOOMERY_TIMING_CARDS is refused' \
     '^gpu=\[\] cvd=\[\] local=\[1\] why=\[BLOOMERY_TIMING_CARDS=a6000\+3090 and BLOOMERY_BOX_CARD=local: ' BLOOMERY_TIMING_CARDS=a6000+3090
@@ -1743,7 +1799,7 @@ PY
     shift 3
     run "nsys local: $name" "$want" "$pat" env -u BLOOMERY_TIMING_GPU -u BLOOMERY_TIMING_CARDS -u BLOOMERY_DRAFT \
       -u STUB_GONE -u STUB_GONE_AFTER -u STUB_UUID_RC -u STUB_UUID_WARN -u STUB_JOURNAL -u STUB_BEFORE -u BLOOMERY_DRY \
-      -u STUB_MODEL_NAME -u STUB_PASSES -u CUDA_TOOLKIT_PATH \
+      -u STUB_MODEL_NAME -u STUB_PASSES -u CUDA_TOOLKIT_PATH -u CUDA_VISIBLE_DEVICES -u CUDA_DEVICE_ORDER \
       PATH="$C/local:$PATH" BLOOMERY_BOX_CARD=local BLOOMERY_LOCK_DIR="$tmp/ld" STUB_UUIDS="$FAKE_GB10" \
       BLOOMERY_NSYS_DEPTHS=9 BLOOMERY_NSYS_N=4 BLOOMERY_NSYS_MARKER=embed_rows_q4k BLOOMERY_NSYS_FORM= \
       BLOOMERY_NSYS_OUT="$P/$n-out" NSYS="$P/nsys" STUB_AFTER="$P/$n-after" STUB_DB="$P/good.sqlite" \
@@ -1777,7 +1833,7 @@ PY
   has 'nsys local: healthy seed last window contains only its kernels' '\[window 3 = depth 11 \(last decode replay\)\] 커널 2개 '
   prof 'healthy prefill window closes at the first replay' 0 '\[prefill window: P = 9, 1 unit\(s\) and the head\] kernels 2 ' BLOOMERY_NSYS_FORM=prefill
   has 'nsys local: healthy prefill control window contains only its kernels' '\[control: replay 3 of 3, the last decode step\] kernels 2 '
-  prof 'wrong GPU refuses before profiling' 64 'is not a card nvidia-smi lists' BLOOMERY_TIMING_GPU="$FAKE_3090"
+  prof 'wrong GPU refuses before profiling' 64 'is not a card in view' BLOOMERY_TIMING_GPU="$FAKE_3090"
   prof 'unreadable journal refuses before the lease' 69 'refused before the lease: journalctl -k does not answer' STUB_JOURNAL=fail
   prof 'Xid before an arm refuses the profile' 1 'invalid witness before.*NVRM Xid' STUB_JOURNAL=xid STUB_BEFORE=1
   prof 'Xid after an arm refuses the table' 1 'invalid witness after.*NVRM Xid' STUB_JOURNAL=xid

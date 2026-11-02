@@ -19,8 +19,8 @@ export BLOOMERY_ARCH := arch
 # the recipes (tools/recipes.py's bin check). A gate bin that needs other features goes on a cargo line of its own.
 # `just check-recipes` fails a recipe by name.
 
-# serve-qwen38's placement (a the A6000, gate the 3090) and the card it puts
-# in box.sh's view.
+# serve-qwen38's placement and the card it puts in box.sh's view on the box (a the A6000, gate the 3090). Local mode
+# (BLOOMERY_BOX_LOCAL=1) runs on the cards in view whatever the word (tools/box.sh).
 serve_place := env_var_or_default('SERVE_PLACE', 'a')
 serve_card := if serve_place == 'gate' { '3090' } else { 'a6000' }
 
@@ -3117,9 +3117,9 @@ gate-gpu-qwen3-serve:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3-serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_qwen3_serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe && D=target/qwen3-serve-gate && rm -rf $D && mkdir -p $D && Q36=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen35moe.sh) && test -n "$Q36" && Q38D=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen38d.sh) && test -n "$Q38D" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3_serve --model "$BLOOMERY_REF_MODEL" --model "$Q36" --model "$Q38D" --dir $D --images'
 
 # bloomery-serve-qwen38 on the box, for a person to attach a client to (toktape records from it): the A6000 by
-# default (SERVE_PLACE=gate for the 3090), the port 8080 unless SERVE_PORT, a four-hour gate bound unless
-# BLOOMERY_GATE_BOUND, further ARGS pass through (--alias, --ctx-size, --chat-template-file, and the Qwen3.8 levers
-# through the environment). gpu-gate.sh takes the card's gate lock, so no other gate lands on the card it serves
+# default (SERVE_PLACE=gate for the 3090), in local mode the cards in view, the port 8080 unless SERVE_PORT, a
+# four-hour gate bound unless BLOOMERY_GATE_BOUND, further ARGS pass through (--alias, --ctx-size,
+# --chat-template-file, and the Qwen3.8 levers through the environment). gpu-gate.sh takes the card's gate lock, so no other gate lands on the card it serves
 # from, and bounds the run; the address is on the server's stderr.
 serve-qwen38 *ARGS:
     BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD={{serve_card}} ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41,gemma-embedding2,hf --release --bin bloomery-serve-qwen38 && BLOOMERY_GATE_BOUND=${BLOOMERY_GATE_BOUND:-14400} bash tools/gpu-gate.sh bloomery-serve-qwen38 --port ${SERVE_PORT:-8080} --place {{serve_place}} {{ARGS}}'

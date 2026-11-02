@@ -29,10 +29,11 @@
 # BLOOMERY_BATCH_OWNER(letters, digits, _: the owner of the batch hold this run's batch put up — the batch hold paragraph below).
 # BLOOMERY_GATE_STACKS(초 — 설정하면 바이너리의 출력이 그만큼 멈출 때 tools/ref/stack-watch.sh가 스레드 스택을 뜨고 끝낸다).
 # BLOOMERY_LOCK_DIR: the directory of every lock and hold file named below, /root when unset (tools/ref/lease-probe.sh's LOCK_DIR).
-# BLOOMERY_BOX_CARD=local (tools/box.sh's local mode): the run takes one lock, bloomery-gate-local.lock, for the card(s) this
-# machine shows when BLOOMERY_GATE_CARD is unset, 3090, a6000 or any (`both` and other names: 64), and leaves
-# CUDA_VISIBLE_DEVICES as it finds it. A held timing lease is read as timing that card: the run waits as for its lock. Its
-# lock directory is never /root (64).
+# BLOOMERY_BOX_CARD=local (tools/box.sh's local mode): the run takes one lock, bloomery-gate-local.lock, which holds every card
+# this machine has, so it holds the cards in view whatever they are (tools/ref/cards.sh's cards_view), and leaves
+# CUDA_VISIBLE_DEVICES as it finds it. BLOOMERY_GATE_CARD may be unset, 3090, a6000 or any, and both when two or more cards are
+# in view (other names, and both with fewer: 64). A held timing lease is read as timing that card: the run waits as for its lock.
+# Its lock directory is never /root (64).
 # Where /root/bloomery-cpu.lock exists (the box, as lease_take reads it), BLOOMERY_BOX_CARD=local and a BLOOMERY_LOCK_DIR other
 # than /root are refused (64): the run would hold no lock the box's gates and sittings take.
 # BLOOMERY_GATE_GDB=1: the binary runs under gdb, which prints every thread's stack when a signal ends it.
@@ -2240,7 +2241,15 @@ case "$BOXC" in
     ASK=${BLOOMERY_GATE_CARD:-3090}
     case $ASK in
       3090 | a6000 | any) CARD=local ;;
-      *) echo "gpu-gate.sh: box.sh's local mode (BLOOMERY_BOX_CARD=local) runs on what this machine shows under one lock, and BLOOMERY_GATE_CARD=$ASK names $([ "$ASK" = both ] && echo "the box's two cards" || echo 'no card'): leave it unset" >&2; exit 64 ;;
+      both)
+        # shellcheck source=tools/ref/cards.sh
+        BLOOMERY_BOX_CARD=local . "${BASH_SOURCE[0]%/*}/ref/cards.sh"
+        cards_view && [ "$CARDS_VIEW_N" -ge 2 ] || {
+          echo "gpu-gate.sh: BLOOMERY_GATE_CARD=both runs on two or more cards in view, and ${CARDS_VIEW_WHY:-this machine has $CARDS_VIEW_N in view: $CARDS_VIEW}" >&2
+          exit 64
+        }
+        CARD=local ;;
+      *) echo "gpu-gate.sh: box.sh's local mode (BLOOMERY_BOX_CARD=local) runs on the cards in view under one lock, and BLOOMERY_GATE_CARD=$ASK names no card: leave it unset" >&2; exit 64 ;;
     esac ;;
   *) echo "gpu-gate.sh: BLOOMERY_BOX_CARD is 3090, a6000, both or local (box.sh sets it), got '$BOXC'" >&2; exit 64 ;;
 esac

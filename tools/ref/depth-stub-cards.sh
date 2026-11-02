@@ -1,8 +1,8 @@
 # shellcheck shell=bash
 # The stub tests' cards (depth-qwen3moe-stub.sh, depth-ds41-stub.sh, depth-glm5next-stub.sh): sourced with
-# T set to the stub tree, it writes the tree's cards.sh — two made-up UUIDs, STUB_GPU_A6000 and
-# STUB_GPU_3090, never the box's — and, unless STUB_CARDS_FILE_ONLY is set, three stubs into $T/bin. It
-# runs nothing else. STUB_GPU_GB10 is a third made-up UUID, the one card local mode lists.
+# T set to the stub tree, it writes the tree's cards.sh (two made-up UUIDs, STUB_GPU_A6000 and
+# STUB_GPU_3090, never the box's, and the tree's own cards_view, which reads the stub nvidia-smi) and,
+# unless STUB_CARDS_FILE_ONLY is set, three stubs into $T/bin. It runs nothing else. STUB_GPU_GB10 is a third made-up UUID, the one card local mode lists.
 #   nvidia-smi         the one-card queries answer as they always did in the stubs (any card's name is
 #                      the A6000's, no compute process, `stub` fields); a query that names a card by -i
 #                      and asks the two-card fields answers for that card: its name, power limit (the
@@ -24,12 +24,17 @@ STUB_GPU_A6000=GPU-00000000-0000-0000-0000-000000000000
 STUB_GPU_3090=GPU-11111111-1111-1111-1111-111111111111
 # shellcheck disable=SC2034 # read by depth-qwen3moe-stub.sh, which sources this file
 STUB_GPU_GB10=GPU-22222222-2222-2222-2222-222222222222
+# The tree's cards_view is the tree's own: its text, read with no nvidia-smi on PATH (the function is wanted, not the box's names).
+# shellcheck disable=SC2123 # PATH points nowhere on purpose
+stub_cards_view=$(PATH=/nonexistent && . "${BASH_SOURCE[0]%/*}/cards.sh" && declare -f cards_view)
 cat > "$T/tools/ref/cards.sh" << CARDSFILE
 # shellcheck shell=bash
 # The stub tree's cards: made-up UUIDs that the stub nvidia-smi answers to.
 GPU_3090=$STUB_GPU_3090
 GPU_A6000=$STUB_GPU_A6000
+$stub_cards_view
 CARDSFILE
+unset stub_cards_view
 [ -z "${STUB_CARDS_FILE_ONLY:-}" ] || return 0
 cat > "$T/bin/nvidia-smi" << 'SMI'
 #!/usr/bin/env bash
