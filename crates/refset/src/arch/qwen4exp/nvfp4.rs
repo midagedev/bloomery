@@ -22,9 +22,10 @@ pub const MODEL: &str =
 /// set's `# build` line.
 // PIN(2026-11-02): the writer at transformers 4c414256 that dequantizes one decoder layer at a
 // time, writes the route ids' logical copy and exact twins as ik's dumper does, and reads a cut
-// of the folder as the fixture tier's model, resuming only on the cut generation it paused on;
+// of the folder as the fixture tier's model only under the `# fixture` line of that cut's first
+// shard, resuming only on the cut generation it paused on;
 // `the_oracle_writer_pin_is_the_source_in_the_tree` holds it to the tree.
-pub const HARNESS: &str = "3e082b03401bc7720744f97b321e1205";
+pub const HARNESS: &str = "e4bbba503cde0f7b429026f6934cda05";
 
 /// The 5-token batch, every position.
 pub const BATCH: &str = "hf-qwen4exp-nvfp4/hf_qwen4exp_nvfp4";
