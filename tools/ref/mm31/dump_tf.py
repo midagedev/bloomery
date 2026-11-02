@@ -53,6 +53,7 @@ state with --resume). Exit 65 on an input this does not read, 64 on a usage erro
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -65,6 +66,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import transformers
+
+_spec = importlib.util.spec_from_file_location(
+    "manifest", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "bloomery", "manifest.py"))
+manifest = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(manifest)
 
 TRANSFORMERS = "5.12.1"
 ARCH = "minimax-m3"
@@ -1027,33 +1033,18 @@ def folder_kind(folder):
 
 def fixture_line(folder, given=None):
     """The `# fixture` text of a cut folder, or None for the vendor's own folder. The text is refset's, the one owner of the
-    line (`refset-check --fixture-line <first shard>`, passed as --fixture-line): it is held here only to the shard it names,
-    every bloomery.fixture.* key of the shard but the card budget, each once with the shard's value, so a line of another
-    cut, of part of one or of none is refused; a folder that is neither the vendor's nor a cut of its revision is too."""
+    line (`refset-check --fixture-line <first shard>`, passed as --fixture-line): it is held here only to the shard it names
+    by manifest.check_fixture_line, so a line of another cut, of part of one or of none is refused; a folder that is neither
+    the vendor's nor a cut of its revision is too."""
     if folder_kind(folder) == "folder":
         if given is not None:
             raise Refusal("%s: --fixture-line for a folder whose first shard has no %s* keys: the vendor's own folder has no fixture line" % (folder.path, FIXTURE_KEY))
         return None
-    keys = {k: v for k, v in folder.meta().items() if k.startswith(FIXTURE_KEY) and k != FIXTURE_KEY + "card_budget"}
     if given is None:
         raise Refusal(
             "%s: a cut of the revision, whose `# fixture` line is refset's: pass --fixture-line \"$(refset-check --fixture-line <first shard>)\"" % folder.path
         )
-    prefix = "# fixture\t"
-    if not given.startswith(prefix) or "\n" in given:
-        raise Refusal("--fixture-line %r is not one '# fixture<TAB>key=value ...' line" % given)
-    held = {}
-    for token in given[len(prefix):].split(" "):
-        k, sep, v = token.partition("=")
-        if not sep or not k.startswith(FIXTURE_KEY) or k in held:
-            raise Refusal("--fixture-line: %r is not one %s* key=value, once" % (token, FIXTURE_KEY))
-        held[k] = v
-    for k in sorted(set(keys) | set(held)):
-        if held.get(k) != keys.get(k):
-            raise Refusal(
-                "--fixture-line states %s=%s, refset's line of the first shard of %s has %s" % (k, held.get(k, "nothing"), folder.path, keys.get(k, "nothing"))
-            )
-    return given[len(prefix):]
+    return manifest.check_fixture_line(folder.meta(), given, os.path.join(folder.path, folder.first_shard), Refusal)
 
 
 def dequant_selftest(folder, cfg, stats):

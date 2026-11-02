@@ -51,6 +51,7 @@ numpy, safetensors and transformers at TRANSFORMERS_REV; reads about 13 GiB of t
 import argparse
 import glob
 import hashlib
+import importlib.util
 import json
 import os
 import threading
@@ -64,6 +65,11 @@ from safetensors import safe_open
 from transformers.masking_utils import create_causal_mask, create_recurrent_attention_mask
 from transformers.models.qwen4_exp import modeling_qwen4_exp as hf
 from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
+
+_spec = importlib.util.spec_from_file_location(
+    "manifest", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bloomery", "manifest.py"))
+manifest = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(manifest)
 
 TRANSFORMERS_REV = "4c414256ddce7b3c896cb624d55d1299ad963d20"
 REPO = "nvidia/Qwen3.8-Flash-Next-NVFP4"
@@ -179,9 +185,8 @@ def q8_name(name):
 
 def cut_shard(folder, line):
     """The first shard of `folder`, as `folder` names it, when the folder is a cut of REPO at MODEL_REV and `line` its
-    `# fixture` line; None for the checkpoint folder itself, which must be at MODEL_REV and take no line. The line must
-    state every `bloomery.fixture.*` key of the shard but the card budget, each once with the shard's value, as
-    `refset-check --fixture-line` prints it: a line of another generation of the cut is refused."""
+    `# fixture` line; None for the checkpoint folder itself, which must be at MODEL_REV and take no line. The line is
+    held to the shard by manifest.check_fixture_line: a line of another generation of the cut is refused."""
     first = glob.glob(os.path.join(folder, "*-00001-of-*.safetensors"))
     if len(first) != 1:
         raise SystemExit("%s: %d first shards, want one" % (folder, len(first)))
@@ -195,19 +200,9 @@ def cut_shard(folder, line):
     source = (meta.get("bloomery.fixture.source"), meta.get("bloomery.fixture.rev"))
     if source != (REPO, MODEL_REV):
         raise SystemExit("%s is a cut of %s@%s, not of %s@%s" % (first[0], source[0], source[1], REPO, MODEL_REV))
-    if line is None or not line.startswith("# fixture\t") or "\n" in line:
+    if line is None:
         raise SystemExit("%s is a cut: --fixture-line gives its one `# fixture` line" % folder)
-    held = {}
-    for token in line[len("# fixture\t"):].split(" "):
-        k, sep, v = token.partition("=")
-        if not sep or not k.startswith("bloomery.fixture.") or k in held:
-            raise SystemExit("--fixture-line: %r is not one bloomery.fixture.* key=value, once" % token)
-        held[k] = v
-    keys = {k: v for k, v in meta.items() if k.startswith("bloomery.fixture.") and k != "bloomery.fixture.card_budget"}
-    for k in sorted(set(keys) | set(held)):
-        if held.get(k) != keys.get(k):
-            raise SystemExit("--fixture-line states %s=%s, the first shard %s has %s" % (
-                k, held.get(k, "nothing"), first[0], keys.get(k, "nothing")))
+    manifest.check_fixture_line(meta, line, first[0], SystemExit)
     return first[0]
 
 
