@@ -23,9 +23,10 @@ pub const MODEL: &str =
 // PIN(2026-11-02): the writer at transformers 4c414256 that dequantizes one decoder layer at a
 // time, writes the route ids' logical copy and exact twins as ik's dumper does, and reads a cut
 // of the folder as the fixture tier's model only under the `# fixture` line of that cut's first
-// shard, resuming only on the cut generation it paused on;
+// shard (held to it by tools/bloomery/manifest.py's shared check), resuming only on the cut
+// generation it paused on;
 // `the_oracle_writer_pin_is_the_source_in_the_tree` holds it to the tree.
-pub const HARNESS: &str = "e4bbba503cde0f7b429026f6934cda05";
+pub const HARNESS: &str = "a6612dbf9b703308d86474a5963e426d";
 
 /// The 5-token batch, every position.
 pub const BATCH: &str = "hf-qwen4exp-nvfp4/hf_qwen4exp_nvfp4";

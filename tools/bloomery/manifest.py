@@ -13,6 +13,9 @@ line, a second column line of a kind or a second `# complete`, and a field a cal
 the line does not name or that does not parse are a ManifestError — a ValueError — naming the file
 and the line.
 
+A set written from a cut states the cut's `# fixture` line; check_fixture_line is the one rule the
+Python writers hold that line to.
+
 tools/ has no packages: a script imports this file by path,
 
     _spec = importlib.util.spec_from_file_location(
@@ -151,6 +154,29 @@ def dump_file_name(name, occurrence, of, layout, ext):
             f"{'.logical' if layout == 'logical' else ''}.{ext}")
 
 
+def check_fixture_line(meta, line, shard, refuse):
+    """Hold a cut's `# fixture` line, as `refset-check --fixture-line` prints it, to the metadata of the first shard
+    it names (`shard`, for the message): one line stating every bloomery.fixture.* key of the shard but the card
+    budget, each once with the shard's value. Anything else raises `refuse(message)`; the line's text after
+    `# fixture<TAB>` is returned."""
+    prefix = "# fixture\t"
+    if not line.startswith(prefix) or "\n" in line:
+        raise refuse("--fixture-line %r is not one '# fixture<TAB>key=value ...' line" % line)
+    keys = {k: v for k, v in meta.items()
+            if k.startswith("bloomery.fixture.") and k != "bloomery.fixture.card_budget"}
+    held = {}
+    for token in line[len(prefix):].split(" "):
+        k, sep, v = token.partition("=")
+        if not sep or not k.startswith("bloomery.fixture.") or k in held:
+            raise refuse("--fixture-line: %r is not one bloomery.fixture.* key=value, once" % token)
+        held[k] = v
+    for k in sorted(keys.keys() | held.keys()):
+        if held.get(k) != keys.get(k):
+            raise refuse("--fixture-line states %s=%s, the first shard %s has %s"
+                         % (k, held.get(k, "nothing"), shard, keys.get(k, "nothing")))
+    return line[len(prefix):]
+
+
 def self_test():
     """Rows read by name whatever their order, and each refusal by name."""
     kind = "# kind\tname\toccurrence\ttype\tne0\tne1\tne2\tne3\tbytes\tsum\top\tcontig\tlogical\tsrc0\tsrc1"
@@ -210,6 +236,20 @@ def self_test():
                         "attn_q_k_v-0.(view).0.input.logical.i32"),
                        (("l_out-3", 2, "tensor", "flat", "f32"), "l_out-3.2.f32")]:
         assert dump_file_name(*args) == want, (dump_file_name(*args), want)
+    meta = {"bloomery.fixture.rev": "r", "bloomery.fixture.layers": "0,1", "bloomery.fixture.card_budget": "9"}
+    good = "# fixture\tbloomery.fixture.layers=0,1 bloomery.fixture.rev=r"
+    assert check_fixture_line(meta, good, "s", ValueError) == good[len("# fixture\t"):]
+    assert check_fixture_line(meta, "# fixture\tbloomery.fixture.rev=r bloomery.fixture.layers=0,1", "s", ValueError)
+    for line, what in [(good.replace("0,1", "0,2"), "layers=0,2, the first shard s has 0,1"),
+                       ("# fixture\tbloomery.fixture.rev=r", "layers=nothing"),
+                       (good + " bloomery.fixture.card_budget=9", "card_budget=9, the first shard s has nothing"),
+                       (good + " bloomery.fixture.rev=r", "once"), (good + " x", "once"),
+                       (good.replace("# fixture", "# fixtur"), "not one"), (good + "\n", "not one")]:
+        try:
+            check_fixture_line(meta, line, "s", ValueError)
+            raise AssertionError(f"accepted: {line!r}")
+        except ValueError as e:
+            assert what in str(e), (what, str(e))
     print("manifest: self-test ok")
     return 0
 
