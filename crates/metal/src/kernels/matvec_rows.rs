@@ -34,8 +34,7 @@ use super::matvec::{LoadNorm, Quant};
 use super::seg::Segment;
 use super::{Kernels, MAX_SEGMENTS, args_bytes, check_weights_align, check_window_len, pack, word};
 
-/// The activation rows every launch of the family runs.
-pub const MROWS: usize = 2;
+pub use crate::geometry::MROWS;
 
 const MATVEC: &str = "matvec mrows";
 const SEG: &str = "matvec seg mrows";
