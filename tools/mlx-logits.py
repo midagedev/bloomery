@@ -3,6 +3,7 @@
 
     tools/mlx-logits.py dump <folder> <family> [--ids 0,1 | --ids-walk N:FIRST] [--positions P,P] [--out DIR]
     tools/mlx-logits.py layers <folder> <dir> [--split FIRST.gguf]
+    tools/mlx-logits.py scale <folder> [--ids ID,ID,…]
     tools/mlx-logits.py compare <ours-dir> <mlx-dir>
     tools/mlx-logits.py f64 <ours-dir> <mlx-dir> <split.gguf>
     tools/mlx-logits.py --self-test
@@ -40,6 +41,21 @@ rows. The gate's `m_logits_deep` reads such a pin from `pins/deep/`. `--out DIR`
 `DIR/<family>.txt` and `DIR/<family>.f32` (the f32 bytes themselves, not base64) in place of the two
 stdout blocks.
 
+`simulate` runs the same load and the same steps as `dump` against a written pin (an e2e gate's
+`pins/` directory: `<family>.txt` and `<family>.f32`, its fnv1a checked against its bytes) and
+prints, per pinned step, the max |simulated − pin| over the logits, a control line first (the same
+run with no rounding, which must reproduce the pin, 0 or within 1e-5 of f32 op order), and the
+simulation's own worst as the last line: `simulated worst W at step S`. The rule is the e2e row's
+rounding rule simulated, not summed: the model stays in f32 over the exact dequant, and the input
+of every `nn.Linear` (q, k, v, o, gate, up, down and the head; a tied head's
+`nn.Embedding.as_linear` too) and the keys and values the mlx-lm cache stores (after the k bias and
+the rope) are each rounded once into half and widened back, through wraps installed for the run
+only (`nn.Linear.__call__`, `nn.Embedding.as_linear`, `KVCache.update_and_fetch` and
+`RotatingKVCache.update_and_fetch`, the caches `make_prompt_cache` builds for the qwen2, llama and
+qwen3 models; a folder of another `model_type` is refused by name). The ids must be the pin's own,
+and `--positions`, when given, must be the pin's rows. `--round k` rounds the stored keys alone
+(the harness's sensitivity probe: the logits must move); `--round none` rounds nothing.
+
 An LFM3 folder (`model_type` `lfm3`) loads through mlx-vlm's `lfm3` instead, since mlx-lm has none:
 its language model alone runs, with the same floatize and the same two blocks. Before it loads, the
 folder's `config.json` and safetensors headers are held to what the Rust folder map reads (MLX's
@@ -53,13 +69,16 @@ converter writes, so the forward is the folder's layers.
 
 `--self-test` checks that checksum, a missing key, and that flipping the first logit moves
 the max-abs distance, the loader chosen by `model_type`, the LFM3 folder's checks over a header-only
-folder, and the logits taken from either module's output. No mlx and no model.
+folder, and the logits taken from either module's output, and the simulate round's argument parse
+and pin read. No mlx and no model.
 
 `layers` writes each layer's output residual and the final norm, plus the mixer inputs the
 modules return, through mlx-lm's own modules. It then replaces each quantized linear and
 embedding with its exact f32 dequant and widens every bf16 parameter (as `dump` does), and
 writes that forward under `<dir>/f32` when a module was replaced. `compare` prints max abs
-and rms of the f32 files both directories share. `f64` scores layer 0's input norm and its
+and rms of the f32 files both directories share. `scale` prints the rms of each layer's q, k and
+v projection outputs (bias in) over the ids and the sum over the layers of the squares of the q
+and k products, the product scale of a row's logit band. `f64` scores layer 0's input norm and its
 in-projections from the split, in f64, against both dumps. None of these edit mlx-lm.
 """
 
@@ -72,7 +91,10 @@ import sys
 USAGE = (
     "usage: tools/mlx-logits.py dump <folder> <family> [--ids 0,1 | --ids-walk N:FIRST]"
     " [--positions P,P] [--out DIR]"
+    " | simulate <folder> <family> [--ids 0,1 | --ids-walk N:FIRST] [--positions P,P]"
+    " --pin DIR [--round all|k|none]"
     " | layers <folder> <dir> [--split FIRST.gguf]"
+    " | scale <folder> [--ids ID,ID,…]"
     " | compare <ours-dir> <mlx-dir>"
     " | f64 <ours-dir> <mlx-dir> <split.gguf> | --self-test"
 )
@@ -443,6 +465,255 @@ def dump(
         print(f"mlx-logits: wrote {out}/{family}.txt and {out}/{family}.f32", file=sys.stderr)
 
 
+def read_pin(pins: str, family: str) -> dict:
+    """The `<family>.txt`/`<family>.f32` pair of a pin directory as a run's reference: the text's
+    fields, the bytes checksummed against the header (a pair that disagrees is refused by name),
+    and the row count the header names."""
+    import pathlib
+
+    root = pathlib.Path(pins)
+    text_path = root / f"{family}.txt"
+    raw_path = root / f"{family}.f32"
+    for path in (text_path, raw_path):
+        if not path.is_file():
+            raise SystemExit(f"mlx-logits: {path} is not there; {pins} holds no {family} pin")
+    fields = {}
+    keys = ("version", "family", "ids", "steps", "n", "fnv1a", "positions", "argmax")
+    for line in text_path.read_text().splitlines():
+        key, sep, value = line.partition(" ")
+        if sep and key in keys:
+            fields[key] = value
+    for key in ("family", "ids", "steps", "n", "fnv1a"):
+        if key not in fields:
+            raise SystemExit(f"mlx-logits: {text_path} has no {key} line")
+    if fields["version"] != "1":
+        raise SystemExit(f"mlx-logits: {text_path} is version {fields['version']!r}, not 1")
+    if fields["family"] != family:
+        raise SystemExit(f"mlx-logits: {text_path} names family {fields['family']!r}, not {family}")
+    raw = raw_path.read_bytes()
+    if fnv1a(raw) != int(fields["fnv1a"], 16):
+        raise SystemExit(f"mlx-logits: {raw_path} does not carry the fnv1a {text_path} names")
+    ids = parse_ids(fields["ids"])
+    steps = int(fields["steps"])
+    n = int(fields["n"])
+    if steps != len(ids):
+        raise SystemExit(f"mlx-logits: {text_path} names {steps} steps over {len(ids)} ids")
+    positions = None if "positions" not in fields else parse_positions(fields["positions"], steps)
+    rows = steps if positions is None else len(positions)
+    if len(raw) != rows * n * 4:
+        raise SystemExit(
+            f"mlx-logits: {raw_path} is {len(raw)} bytes, not the {rows} rows of {n} f32s "
+            f"{text_path} names"
+        )
+    return {"ids": ids, "steps": steps, "n": n, "positions": positions, "raw": raw}
+
+
+def pin_steps(pin: dict, ids: list[int], positions: list[int] | None, family: str) -> list[int]:
+    """The steps the pin holds rows for, refused by name unless the run's ids (and positions,
+    when given) are the pin's own."""
+    if pin["ids"] != ids:
+        raise SystemExit(
+            f"mlx-logits: the {family} pin holds ids {','.join(str(i) for i in pin['ids'])}; "
+            f"the run was given {','.join(str(i) for i in ids)}"
+        )
+    held = list(range(pin["steps"])) if pin["positions"] is None else pin["positions"]
+    if positions is not None and positions != held:
+        raise SystemExit(
+            f"mlx-logits: the {family} pin pins steps {','.join(str(p) for p in held)}; "
+            f"the run was given {','.join(str(p) for p in positions)}"
+        )
+    return held
+
+
+def parse_simulate(argv: list[str]):
+    """`simulate <folder> <family> [--ids ID,ID | --ids-walk N:FIRST] [--positions P,P]
+    --pin DIR [--round all|k|none]` as (folder, family, ids, positions, pins, mode), or None
+    (after the usage) when the arguments do not parse."""
+    if len(argv) < 2:
+        print(USAGE, file=sys.stderr)
+        return None
+    folder, family = argv[0], argv[1]
+    ids = None
+    positions_text = None
+    pins = None
+    mode = "all"
+    rest = argv[2:]
+    while rest:
+        if rest[0] in ("--ids", "--ids-walk") and len(rest) >= 2:
+            if ids is not None:
+                print("mlx-logits: --ids and --ids-walk name the ids once", file=sys.stderr)
+                return None
+            ids = parse_ids(rest[1]) if rest[0] == "--ids" else parse_walk(rest[1])
+            rest = rest[2:]
+        elif rest[0] == "--positions" and len(rest) >= 2:
+            positions_text = rest[1]
+            rest = rest[2:]
+        elif rest[0] == "--pin" and len(rest) >= 2:
+            pins = rest[1]
+            rest = rest[2:]
+        elif rest[0] == "--round" and len(rest) >= 2:
+            if rest[1] not in ("all", "k", "none"):
+                print(f"mlx-logits: --round {rest[1]!r} is not all, k or none", file=sys.stderr)
+                return None
+            mode = rest[1]
+            rest = rest[2:]
+        else:
+            print(USAGE, file=sys.stderr)
+            return None
+    if pins is None:
+        print("mlx-logits: simulate needs --pin DIR, the e2e pin directory", file=sys.stderr)
+        return None
+    if not family or "/" in family or family.startswith("."):
+        print(f"mlx-logits: {family!r} is not a family name", file=sys.stderr)
+        return None
+    if ids is None:
+        ids = [0]
+    positions = None if positions_text is None else parse_positions(positions_text, len(ids))
+    return folder, family, ids, positions, pins, mode
+
+
+def rounding(mode: str):
+    """The rounding rule's wraps, installed for the `with` block only: `nn.Linear.__call__` and a
+    tied head's `nn.Embedding.as_linear` round the projection's input, and the mlx-lm cache's
+    `update_and_fetch` (`KVCache` and `RotatingKVCache`, the caches `make_prompt_cache` builds for
+    the qwen2, llama and qwen3 models) rounds the keys and values it stores — each rounded once
+    into half and widened back, nothing else moved. Mode `k` rounds the stored keys alone; mode
+    `none` installs nothing."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def installed():
+        import mlx.core as mx
+        import mlx.nn as nn
+        from mlx_lm.models import cache as mlx_cache
+
+        def half(x):
+            return x.astype(mx.float16).astype(mx.float32)
+
+        patches = []
+
+        def install(owner, name, wrapped):
+            patches.append((owner, name, getattr(owner, name)))
+            setattr(owner, name, wrapped)
+
+        try:
+            if mode == "all":
+                linear_call = nn.Linear.__call__
+                as_linear = nn.Embedding.as_linear
+
+                def rounded_linear(self, x):
+                    return linear_call(self, half(x))
+
+                def rounded_as_linear(self, x):
+                    return as_linear(self, half(x))
+
+                install(nn.Linear, "__call__", rounded_linear)
+                install(nn.Embedding, "as_linear", rounded_as_linear)
+            if mode in ("all", "k"):
+                round_values = mode == "all"
+
+                def make_update(call):
+                    def update(self, keys, values):
+                        if round_values:
+                            values = half(values)
+                        return call(self, half(keys), values)
+
+                    return update
+
+                for name in ("KVCache", "RotatingKVCache"):
+                    cls = getattr(mlx_cache, name)
+                    install(cls, "update_and_fetch", make_update(cls.update_and_fetch))
+            yield
+        finally:
+            for owner, name, original in reversed(patches):
+                setattr(owner, name, original)
+
+    return installed()
+
+
+def simulate_main(argv: list[str]) -> int:
+    """`simulate <folder> <family> --pin DIR`: the load and the steps of `dump`, with the e2e
+    row's rounding rule installed ([`rounding`]), against the pin's own rows: a control line
+    (no rounding, which must reproduce the pin), the max |simulated − pin| per pinned step, and
+    the worst as the last line."""
+    args = parse_simulate(argv)
+    if args is None:
+        return 64
+    import mlx.core as mx
+    import numpy as np
+    from mlx_lm.utils import load
+
+    folder, family, ids, positions, pins, mode = args
+    kind = model_type_of(folder)
+    if kind not in ("qwen2", "llama", "qwen3"):
+        raise SystemExit(
+            "mlx-logits: simulate rounds the mlx-lm qwen2, llama and qwen3 modules; "
+            f"{folder} is model_type {kind!r}"
+        )
+    pin = read_pin(pins, family)
+    held = pin_steps(pin, ids, positions, family)
+    rules = {
+        "all": "the input of every linear and the head, and the keys and values the cache stores",
+        "k": "the keys the cache stores alone",
+        "none": "nothing",
+    }
+    print(
+        f"mlx-logits: simulate {family} rule {mode}: rounding {rules[mode]} once into half",
+        file=sys.stderr,
+    )
+    model, _tokenizer = load_folder(folder, load)
+    gather_embedding(model, ids)
+    note, replaced = floatize(model)
+    if replaced == 0 or "bf16 parameters left: 0" not in note:
+        raise SystemExit(f"mlx-logits: {folder} does not run in f32:\n{note}")
+    from mlx_lm.models import cache as mlx_cache
+
+    keep = set(held)
+
+    def forward():
+        rows = {}
+        prompt_cache = mlx_cache.make_prompt_cache(model)
+        for step, token in enumerate(ids):
+            y = mx.array([token])
+            logits = unwrap_logits(model(y[None], cache=prompt_cache))
+            logits = logits[:, -1, :]
+            row = np.ascontiguousarray(np.array(logits.astype(mx.float32)), dtype=np.float32)
+            if row.size != pin["n"]:
+                raise SystemExit(
+                    f"mlx-logits: step {step} (id {token}) has {row.size} logits; "
+                    f"the {family} pin has {pin['n']}"
+                )
+            if not np.isfinite(row).all():
+                raise SystemExit(f"mlx-logits: step {step} (id {token}) has a non-finite logit")
+            if step in keep:
+                rows[step] = row
+        return rows
+
+    def distances(rows):
+        out = []
+        for k, step in enumerate(held):
+            ref = np.frombuffer(pin["raw"], dtype="<f4", count=pin["n"], offset=k * pin["n"] * 4)
+            d = np.abs(rows[step] - ref)
+            out.append((float(d.max()) if np.isfinite(d).all() else float("inf"), step))
+        return out
+
+    control = distances(forward())
+    cw, cs = max(control)
+    print(f"control worst {cw:.4e} at step {cs}")
+    if cw > 1e-5:
+        raise SystemExit(
+            f"mlx-logits: the control run misses the {family} pin by {cw:.4e} at step {cs}; "
+            "the harness does not reproduce the pin"
+        )
+    with rounding(mode):
+        sim = distances(forward())
+    for w, step in sim:
+        print(f"step {step}: {w:.4e}")
+    sw, ss = max(sim)
+    print(f"simulated worst {sw:.4e} at step {ss}")
+    return 0
+
+
 def self_test() -> int:
     fails = 0
 
@@ -560,6 +831,7 @@ def self_test() -> int:
 
     fails += self_test_lfm3()
     fails += self_test_deep()
+    fails += self_test_simulate()
     if fails:
         print(f"mlx-logits self-test: {fails} failed", file=sys.stderr)
         return 1
@@ -742,6 +1014,116 @@ def self_test_lfm3() -> int:
         check(
             "a config with no model type is refused by name",
             refused(lambda: model_type_of(folder(bare, {conv: [4, 3, 1]})), "no model_type"),
+        )
+    return fails
+
+
+def self_test_simulate() -> int:
+    """The simulate round that needs no mlx and no model: the argument parse, and the pin read
+    against a written pin (its checksum, a missing half of the pair, the row count, and the
+    run-agreement refusals)."""
+    import pathlib
+    import tempfile
+
+    fails = 0
+
+    def check(name: str, ok: bool) -> None:
+        nonlocal fails
+        if not ok:
+            print(f"mlx-logits self-test FAIL: {name}", file=sys.stderr)
+            fails += 1
+
+    def refused(call, needle: str) -> bool:
+        try:
+            call()
+        except SystemExit as exc:
+            return needle in str(exc)
+        return False
+
+    args = parse_simulate(["folder", "qwen2", "--ids", "0,785", "--pin", "pins"])
+    check(
+        "simulate parse",
+        args == ("folder", "qwen2", [0, 785], None, "pins", "all"),
+    )
+    check("simulate needs a pin", parse_simulate(["f", "qwen2"]) is None)
+    check(
+        "simulate refuses an unknown flag",
+        parse_simulate(["f", "qwen2", "--pin", "p", "-x", "1"]) is None,
+    )
+    check("simulate round k", parse_simulate(["f", "qwen2", "--pin", "p", "--round", "k"])[5] == "k")
+    check(
+        "simulate round none",
+        parse_simulate(["f", "qwen2", "--pin", "p", "--round", "none"])[5] == "none",
+    )
+    check(
+        "simulate round refused",
+        parse_simulate(["f", "qwen2", "--pin", "p", "--round", "v"]) is None,
+    )
+    walk = parse_simulate(["f", "llama", "--ids-walk", "3:5", "--positions", "1,2", "--pin", "p"])
+    check("simulate walk", walk[2] == walk_ids(3, 5) and walk[3] == [1, 2] and walk[5] == "all")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        raw = struct.pack("<6f", 0.0, 1.0, 2.0, 3.0, 4.0, 5.0)
+        text = header("qwen2", [10, 11, 12, 13], 4, 3, raw, [1, 3], [2, 0])
+        emit("qwen2", text, raw, str(root))
+        pin = read_pin(str(root), "qwen2")
+        check(
+            "pin read",
+            pin["ids"] == [10, 11, 12, 13]
+            and pin["positions"] == [1, 3]
+            and pin["n"] == 3
+            and pin["steps"] == 4
+            and pin["raw"] == raw,
+        )
+        check("the pin's own steps", pin_steps(pin, [10, 11, 12, 13], [1, 3], "qwen2") == [1, 3])
+        check(
+            "steps without given positions",
+            pin_steps(pin, [10, 11, 12, 13], None, "qwen2") == [1, 3],
+        )
+        check(
+            "other ids are refused",
+            refused(lambda: pin_steps(pin, [0], None, "qwen2"), "the run was given 0"),
+        )
+        check(
+            "other positions are refused",
+            refused(lambda: pin_steps(pin, [10, 11, 12, 13], [0, 1], "qwen2"), "pins steps 1,3"),
+        )
+        (root / "qwen2.f32").write_bytes(struct.pack("<f", 9.0) + raw[4:])
+        check(
+            "a pair off its checksum is refused",
+            refused(lambda: read_pin(str(root), "qwen2"), "fnv1a"),
+        )
+        (root / "qwen2.f32").unlink()
+        check(
+            "a missing half of the pair is refused",
+            refused(lambda: read_pin(str(root), "qwen2"), "is not there"),
+        )
+        plain = root / "plain"
+        raw4 = struct.pack("<12f", *range(12))
+        emit("llama", header("llama", [5, 6, 7, 8], 4, 3, raw4), raw4, str(plain))
+        bare = read_pin(str(plain), "llama")
+        check("a pin without positions", bare["positions"] is None)
+        check(
+            "a pin without positions pins every step",
+            pin_steps(bare, [5, 6, 7, 8], None, "llama") == [0, 1, 2, 3],
+        )
+        check(
+            "given positions over a every-step pin are refused",
+            refused(lambda: pin_steps(bare, [5, 6, 7, 8], [0], "llama"), "pins steps 0,1,2,3"),
+        )
+        # A header of the tool's own shape whose n names more than the bytes hold: the checksum
+        # agrees, so the row count is what refuses it.
+        bad = root / "bad"
+        bad.mkdir()
+        (bad / "llama.txt").write_text(
+            "version 1\nfamily llama\nids 5,6,7,8\nsteps 4\nn 4\n"
+            f"fnv1a {fnv1a(raw4):016x}\n"
+        )
+        (bad / "llama.f32").write_bytes(raw4)
+        check(
+            "a pair of the wrong row count is refused",
+            refused(lambda: read_pin(str(bad), "llama"), "not the 4 rows of 4"),
         )
     return fails
 
@@ -1259,7 +1641,11 @@ def floatize(model) -> tuple[str, int]:
             skipped.append(f"{name}: dequantized ndim {weight.ndim}")
             return mod
         if name == "QuantizedLinear":
-            made = nn.Linear(weight.shape[1], weight.shape[0], bias=False)
+            # A linear's own bias (Qwen2's q, k and v) is a plain f32 add, apart from the quant biases.
+            has_bias = "bias" in mod
+            made = nn.Linear(weight.shape[1], weight.shape[0], bias=has_bias)
+            if has_bias:
+                made.bias = mod["bias"].astype(mx.float32)
         else:
             made = nn.Embedding(weight.shape[0], weight.shape[1])
         made.weight = weight
@@ -1897,9 +2283,66 @@ def compare_main(argv: list[str]) -> int:
     return 0
 
 
+def scale_main(argv: list[str]) -> int:
+    """`scale <folder> [--ids ID,ID,…]`: the rms of each layer's q, k and v projection outputs
+    (bias in) over the ids, through mlx-lm's own modules in f32 as `dump` runs them, and the sum
+    over the layers of the squares of the products of the q and k rms: the product scale of a
+    row's band in `crates/metal/src/bin/gate_metal_qwen35moe_e2e/row.rs`."""
+    import math
+
+    import mlx.core as mx
+    from mlx_lm.utils import load
+
+    ids = [0, 785, 6722, 315]
+    if not argv or (len(argv) > 1 and (argv[1] != "--ids" or len(argv) != 3)):
+        print(USAGE, file=sys.stderr)
+        return 64
+    if len(argv) == 3:
+        ids = parse_ids(argv[2])
+    model, _tokenizer = load_folder(argv[0], load)
+    gather_embedding(model, ids)
+    note, replaced = floatize(model)
+    if replaced == 0 or "bf16 parameters left: 0" not in note:
+        raise SystemExit(f"mlx-logits: {argv[0]} does not run in f32:\n{note}")
+    seen = {}
+
+    class Tap:
+        def __init__(self, module, key):
+            self.module, self.key = module, key
+
+        def __call__(self, x):
+            y = self.module(x)
+            seen[self.key] = y
+            return y
+
+    layers = model.model.layers
+    for i, layer in enumerate(layers):
+        for name in ("q_proj", "k_proj", "v_proj"):
+            setattr(layer.self_attn, name, Tap(getattr(layer.self_attn, name), (i, name)))
+    mx.eval(model(mx.array([ids])))
+    total = 0.0
+    for i in range(len(layers)):
+        rms = {}
+        for name in ("q_proj", "k_proj", "v_proj"):
+            y = seen[(i, name)].astype(mx.float32)
+            rms[name] = math.sqrt(float(mx.mean(y * y).item()))
+        product = rms["q_proj"] * rms["k_proj"]
+        total += product * product
+        print(
+            f"layer {i}: rms q {rms['q_proj']:.6g} k {rms['k_proj']:.6g} v {rms['v_proj']:.6g}"
+            f" product {product:.6g} square {product * product:.6g}"
+        )
+    print(f"sum of squares {total:.6g}")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     if argv == ["--self-test"]:
         return self_test()
+    if argv and argv[0] == "scale":
+        return scale_main(argv[1:])
+    if argv and argv[0] == "simulate":
+        return simulate_main(argv[1:])
     if argv and argv[0] == "layers":
         return layers_main(argv[1:])
     if argv and argv[0] == "f64":
