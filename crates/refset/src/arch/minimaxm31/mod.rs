@@ -34,10 +34,10 @@ pub const MODEL: &str = "/models/MiniMax-M3.1-Flash/model-00001-of-00048.safeten
 
 /// The build every minimaxm31 set names: transformers' and torch's release numbers and the first 12 hex digits of the md5 of
 /// `tools/ref/mm31/dump_tf.py`, the writer. `the_writer_pin_is_the_source_in_the_tree` holds it to the tree.
-// PIN(2026-10-23): the writer that streams one layer at a time through transformers 5.12.1's modeling code at torch 2.14.1
-// (the box's `/home/user/hfref-venv`) with the dequantization checked against compressed-tensors; an edit of the writer
-// moves the pin, and the sets are dumped again.
-pub const BUILD: &str = "transformers-5.12.1+torch-2.14.1+dump_tf-8c04e4e88124";
+// PIN(2026-11-02): the writer that streams one layer at a time through transformers 5.12.1's modeling code at torch 2.14.1
+// (the box's `/home/user/hfref-venv`) with the dequantization checked against compressed-tensors, and resumes only a run of
+// the same cut, named by refset's whole fixture line; an edit of the writer moves the pin, and the sets are dumped again.
+pub const BUILD: &str = "transformers-5.12.1+torch-2.14.1+dump_tf-afef8a515dfa";
 
 /// Prompt a: an English paragraph, 41 ids, every per-layer tap and 64 greedy tokens.
 pub const A: &str = "ref_minimaxm31_a";

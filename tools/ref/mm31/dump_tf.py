@@ -1028,12 +1028,13 @@ def folder_kind(folder):
 def fixture_line(folder, given=None):
     """The `# fixture` text of a cut folder, or None for the vendor's own folder. The text is refset's, the one owner of the
     line (`refset-check --fixture-line <first shard>`, passed as --fixture-line): it is held here only to the shard it names,
-    so a line of another cut, or of none, is refused; a folder that is neither the vendor's nor a cut of its revision is too."""
+    every bloomery.fixture.* key of the shard but the card budget, each once with the shard's value, so a line of another
+    cut, of part of one or of none is refused; a folder that is neither the vendor's nor a cut of its revision is too."""
     if folder_kind(folder) == "folder":
         if given is not None:
             raise Refusal("%s: --fixture-line for a folder whose first shard has no %s* keys: the vendor's own folder has no fixture line" % (folder.path, FIXTURE_KEY))
         return None
-    keys = {k: v for k, v in folder.meta().items() if k.startswith(FIXTURE_KEY)}
+    keys = {k: v for k, v in folder.meta().items() if k.startswith(FIXTURE_KEY) and k != FIXTURE_KEY + "card_budget"}
     if given is None:
         raise Refusal(
             "%s: a cut of the revision, whose `# fixture` line is refset's: pass --fixture-line \"$(refset-check --fixture-line <first shard>)\"" % folder.path
@@ -1047,11 +1048,11 @@ def fixture_line(folder, given=None):
         if not sep or not k.startswith(FIXTURE_KEY) or k in held:
             raise Refusal("--fixture-line: %r is not one %s* key=value, once" % (token, FIXTURE_KEY))
         held[k] = v
-    for k, v in held.items():
-        if keys.get(k) != v:
-            raise Refusal("--fixture-line states %s=%s, the first shard of %s has %r" % (k, v, folder.path, keys.get(k)))
-    if held.get(FIXTURE_KEY + "rev") != REV:
-        raise Refusal("--fixture-line names revision %r, the oracle is %s" % (held.get(FIXTURE_KEY + "rev"), REV))
+    for k in sorted(set(keys) | set(held)):
+        if held.get(k) != keys.get(k):
+            raise Refusal(
+                "--fixture-line states %s=%s, refset's line of the first shard of %s has %s" % (k, held.get(k, "nothing"), folder.path, keys.get(k, "nothing"))
+            )
     return given[len(prefix):]
 
 
@@ -1156,6 +1157,7 @@ class Run:
             self.md5,
             self.folder_arg,
             self.folder.index_sha256,
+            self.fixture,
             self.cfg_json,
             self.modeling_sha256,
             str(torch.__version__),
@@ -1302,7 +1304,7 @@ class Run:
 
     def restore(self, st):
         if st.get("identity") != self.identity:
-            raise Refusal("%s: the writer, folder, model code, torch or sets changed; start again without --resume" % self.state_dir)
+            raise Refusal("%s: the writer, folder, cut, model code, torch or sets changed; start again without --resume" % self.state_dir)
         for s in self.streams:
             s.h = st["h"][s.spec.name]
             s.steps = st["steps"][s.spec.name]
@@ -1396,7 +1398,7 @@ class Run:
                 raise Refusal("%s: no saved state for --resume" % gpath)
             g = torch.load(gpath, weights_only=False)
             if g.get("identity") != self.identity:
-                raise Refusal("%s: the writer, folder, model code, torch or sets changed; start again without --resume" % gpath)
+                raise Refusal("%s: the writer, folder, cut, model code, torch or sets changed; start again without --resume" % gpath)
             for s in todo:
                 s.steps = g["steps"][s.spec.name]
                 s.cache = restored_cache(cfg, g["caches"][s.spec.name])
