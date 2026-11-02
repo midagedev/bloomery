@@ -1417,10 +1417,10 @@ dump-ref-musespark:
 
 # Mistral Large 4 oracle: mistrallarge4_dump (the shared tools/ref/cb_dump.cpp) linked against the existing mainline
 # build (llama.cpp 78feec062, PR 31376's merge, CPU, no patch, /home/user/llama.cpp-ml4, `just build-ml4-lcpp`, whose
-# tracked files must be clean), which this does not rebuild (tools/ref/mistrallarge4-dump-build.sh); the binary and its
+# tracked files must be clean), which this does not rebuild (tools/ref/mistrallarge4-dump.sh --build); the binary and its
 # build record land in $BLOOMERY_DATA/bin.
 build-ref-mistrallarge4:
-    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=60 BLOOMERY_MODEL=mistral-large4 ./tools/box.sh 'bash tools/ref/mistrallarge4-dump-build.sh'
+    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=60 BLOOMERY_MODEL=mistral-large4 ./tools/box.sh 'bash tools/ref/mistrallarge4-dump.sh --build'
 
 # The Mistral Large 4 oracle sets (refset family lcpp-mistrallarge4; tools/ref/mistrallarge4-dump.sh has the layout and
 # the taps): mainline on the CPU over the two prompts of tools/ref/data/mistrallarge4 (18 and 42 ids, the text beside the

@@ -46,6 +46,10 @@
 //!   host's f64 top-k of the body's own index scores (ties to the lower
 //!   row, the kernel's own rule, named where they cut), and every shared
 //!   layer's list is its source's, entry for entry.
+//! - `layer_span_refusals` (self-consistency): with the taps armed,
+//!   `Body::set_layer_span` refuses an empty span, a reversed one and one
+//!   that ends or starts past the model's last layer by name (none of them
+//!   is the whole chain), and takes the spans that fit.
 //! - `nodes_near_mainlines` (fixture oracle, sets a and b): every compared
 //!   node at every layer and prompt position, one layer at a time, the prompt
 //!   teacher-forced from a reset: the span (`Body::set_layer_span`) runs the
@@ -88,7 +92,8 @@ mod e2e;
 #[cfg(feature = "mistrallarge4")]
 mod gate {
     use crate::e2e::{
-        argmax, cosine, feed, finite, fresh, histogram, or_fault, same, tap_at, walk,
+        argmax, cosine, feed, finite, fresh, histogram, or_fault, outcome, refused_by, same,
+        tap_at, walk,
     };
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::{Gpu, GpuModel};
@@ -211,6 +216,11 @@ mod gate {
             selection_is_its_rule,
         ),
         (
+            "layer_span_refusals",
+            Tag::SelfConsistency,
+            layer_span_refusals,
+        ),
+        (
             "nodes_near_mainlines",
             Tag::FixtureOracle,
             nodes_near_mainlines,
@@ -331,18 +341,6 @@ mod gate {
             .collect()
     }
 
-    /// A dump row of the file's `[rope | nope]` index-head order as the
-    /// kernel's tail order (the load-time move's own): within each head, the
-    /// nope part first.
-    fn head_moved(dump: &[f32], head: usize, rope: usize) -> Vec<f32> {
-        dump.chunks(head)
-            .flat_map(|h| {
-                let (r, nope) = h.split_at(rope);
-                nope.iter().chain(r).copied()
-            })
-            .collect()
-    }
-
     /// The k best rows of `scores` by the kernel's own rule: descending
     /// score, a tie to the lower row.
     fn rule_top(scores: &[f32], k: usize) -> Vec<usize> {
@@ -350,6 +348,51 @@ mod gate {
         ids.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
         ids.truncate(k);
         ids
+    }
+
+    /// One full layer's list against the rule at one position: the first `n`
+    /// rows of `list`, as a set (the kernel writes row order, the rule ranks),
+    /// are [`rule_top`]'s. A tie at the cut goes to the lower row, so a set
+    /// that differs is wrong whether or not the rows it took tie the k-th
+    /// score; the two sets come back as the refusal. `Ok(true)` names a cut
+    /// that ran through a tie the lower rows won.
+    fn selection_check(
+        rows: &[f32],
+        list: &[u32],
+        n: usize,
+    ) -> Result<bool, (Vec<usize>, Vec<usize>)> {
+        let rank = rule_top(rows, n);
+        let mut want = rank.clone();
+        let mut got: Vec<usize> = list[..n].iter().map(|&r| r as usize).collect();
+        got.sort_unstable();
+        want.sort_unstable();
+        if got != want {
+            return Err((got, want));
+        }
+        let Some(&last) = rank.last() else {
+            return Ok(false);
+        };
+        let kth = rows[last];
+        Ok(rows
+            .iter()
+            .enumerate()
+            .any(|(r, v)| v.total_cmp(&kth).is_eq() && want.binary_search(&r).is_err()))
+    }
+
+    /// [`selection_check`]'s own calibration, on a cut through 17 equal
+    /// scores at k = 16: the lower rows' list passes and names the tie, the
+    /// list of rows 1..=16 and a list of one row sixteen times are refused,
+    /// and a cut through no tie names none.
+    fn selection_check_holds() -> bool {
+        let tied = [1.0_f32; 17];
+        let lower: Vec<u32> = (0..16).collect();
+        let higher: Vec<u32> = (1..17).collect();
+        let repeated = [16_u32; 16];
+        let distinct = [3.0_f32, 1.0, 2.0];
+        selection_check(&tied, &lower, 16) == Ok(true)
+            && selection_check(&tied, &higher, 16).is_err()
+            && selection_check(&tied, &repeated, 16).is_err()
+            && selection_check(&distinct, &[0, 2], 2) == Ok(false)
     }
 
     // ------------------------------------------------------------ structure
@@ -607,6 +650,17 @@ mod gate {
         const CLAUSE: &str = "selection_is_its_rule";
         let hp = &case.hp;
         let (top_k, n_layer) = (hp.indexer_top_k, hp.n_layer);
+        // The check first: a walk read through a check that passes a tied cut
+        // the higher rows took means nothing.
+        let sound = selection_check_holds();
+        println!(
+            "{CLAUSE}: the check refuses a tied cut the higher rows took and names the one the \
+             lower rows won {}",
+            verdict(sound)
+        );
+        if !sound {
+            return Ok(false);
+        }
         m.set_mode(StepMode::Graph);
         let mut ok = true;
         let mut named = 0usize;
@@ -642,30 +696,15 @@ mod gate {
                 if KINDS[l].2 {
                     let scores = scores[l].as_ref().unwrap();
                     let rows = &scores[..(at + 1).min(scores.len())];
-                    let want = rule_top(rows, n);
-                    // The list is in row order (the kernel's own), the
-                    // rule's in rank order: the SET is the contract.
-                    let mut got: Vec<usize> = list[..n].iter().map(|&r| r as usize).collect();
-                    let mut want = want;
-                    got.sort_unstable();
-                    want.sort_unstable();
-                    if got != want {
-                        // A tie at the threshold cuts by row order; name it.
-                        let kth = rows[want[want.len() - 1]];
-                        let tied = rows
-                            .iter()
-                            .enumerate()
-                            .filter(|&(r, &v)| v == kth && !want.contains(&r))
-                            .count();
-                        if tied > 0 && got.iter().all(|g| rows[*g] == kth) {
-                            named += 1;
-                            continue;
+                    match selection_check(rows, list, n) {
+                        Ok(cut_a_tie) => named += usize::from(cut_a_tie),
+                        Err((got, want)) => {
+                            println!(
+                                "{CLAUSE}: layer {l} at position {at}: the sets differ: {got:?} \
+                                 vs {want:?} FAIL"
+                            );
+                            ok = false;
                         }
-                        println!(
-                            "{CLAUSE}: layer {l} at position {at}: the sets differ: {got:?} vs \
-                             {want:?} FAIL"
-                        );
-                        ok = false;
                     }
                 } else if list[..n] != lists[*src].1[..n] {
                     println!(
@@ -682,6 +721,55 @@ mod gate {
             PROMPT_LEN - top_k,
             verdict(ok)
         );
+        Ok(ok)
+    }
+
+    /// The layer span's refusals, with the taps armed: an empty span, a
+    /// reversed one and one that ends or starts past the model's last layer
+    /// are each refused by name (a span read as the whole chain would run a
+    /// node clause over layers it did not ask for), and the spans that fit
+    /// are taken.
+    fn layer_span_refusals(m: &mut Model, case: &Case) -> Result<bool, GateError> {
+        const CLAUSE: &str = "layer_span_refusals";
+        const WHAT: &str = "mistrallarge4::set_layer_span";
+        let n = case.hp.n_layer;
+        let last = n - 1;
+        m.set_mode(StepMode::Eager);
+        if m.has_capture() {
+            println!("{CLAUSE}: a capture exists FAIL");
+            return Ok(false);
+        }
+        let (gpu, b) = body_of(m)?;
+        b.arm_taps(gpu, true)?;
+        let mut ok = true;
+        let refused = [
+            ("empty", last..last, "empty or reversed"),
+            ("reversed", last..0, "empty or reversed"),
+            ("past-the-end", 0..n + 1, "past the model's"),
+            ("starting-past-the-end", n..n + 1, "past the model's"),
+        ];
+        for (what, span, says) in refused {
+            let r = b.set_layer_span(Some(span.clone()));
+            let pass = refused_by(&r, WHAT, says);
+            println!(
+                "{CLAUSE}: the {what} span {span:?}: {} {}",
+                outcome(&r),
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        // The last of these leaves the whole chain.
+        for span in [Some(0..1), Some(0..n), Some(last..n), None] {
+            let r = b.set_layer_span(span.clone());
+            let pass = r.is_ok();
+            println!(
+                "{CLAUSE}: the span {span:?}: {} {}",
+                outcome(&r),
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        b.arm_taps(gpu, false)?;
         Ok(ok)
     }
 
@@ -951,7 +1039,12 @@ mod gate {
                         ];
                         for (what, got) in taps {
                             let rope = if ropes { hp.rope_dims } else { 0 };
-                            let want = head_moved(&row(what, 0)?, hp.indexer_d, rope);
+                            let mut want = row(what, 0)?;
+                            model::arch::mistrallarge4::rows::rope_rows_to_tail(
+                                &mut want,
+                                hp.indexer_d,
+                                rope,
+                            );
                             let e = rel(&got, &want);
                             compared += 1;
                             if e > DENSE_REL_BAND {
@@ -1362,7 +1455,8 @@ mod gate {
              eager and replay give bit-identical logits; a reset rewinds; a capture seeded after \
              the record replays over the seeded rows; the cache rows carry; a \
              NaN router lane raises the fault word and is picked by no slot; every full indexer \
-             layer's list is the rule's own top-k and every shared layer's its source's; every \
+             layer's list is the rule's own top-k and every shared layer's its source's; a layer \
+             span that is empty, reversed or past the model is refused by name; every \
              compared node keeps its band at every layer and position; the greedy continuation \
              keeps the oracle's argmax above the band; the fault word stays clean"
         );

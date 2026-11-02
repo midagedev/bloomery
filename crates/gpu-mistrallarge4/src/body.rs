@@ -257,9 +257,8 @@ struct Scratch {
     ints: DeviceBuffer<u32>,
     vis: DeviceBuffer<u32>,
     n_keys: DeviceBuffer<u32>,
-    /// The gathered flash's own row count, `min(pos, top_k − 1)`: the flash
-    /// counts the current row on top of the word it reads, and the gathered
-    /// rows already hold it (the selection is of `pos + 1` keys).
+    /// The gathered flash's live row count, `min(pos + 1, top_k)`.
+    /// With one query token, `causal_limit` reads exactly this many rows.
     flash_n: DeviceBuffer<u32>,
     cs: DeviceBuffer<f32>,
     /// The rope row's f32 bits as u32 words, the score pass's own table.
@@ -793,19 +792,13 @@ impl Perm {
             ))
         };
         // Within each `idx_d`-value head, the file's `[rope | nope]` as the
-        // kernel's tail order: value `j` of the moved head reads the file's
-        // `j + rope` while it fits the nope part, else `j - (idx_d - rope)`.
+        // kernel's tail order: the load's own row move
+        // (`rows::rope_rows_to_tail`) over the head's value numbers, so value
+        // `dst` of the moved head reads the file's value `src`.
         let head_move = |head: usize, rope: usize| {
-            (0..head).map(move |j| {
-                (
-                    if j < head - rope {
-                        j + rope
-                    } else {
-                        j - (head - rope)
-                    },
-                    j,
-                )
-            })
+            let mut rows: Vec<usize> = (0..head).collect();
+            model::arch::mistrallarge4::rows::rope_rows_to_tail(&mut rows, head, rope);
+            rows.into_iter().enumerate().map(|(dst, src)| (src, dst))
         };
         let q = table(
             (0..sh.idx_heads)
@@ -1719,21 +1712,28 @@ impl Body {
     }
 
     /// Hold the chain to the layers of `span` (and the head only when the
-    /// span ends at the model's end), `None` the whole chain. The caller
-    /// holds the graph rule: a captured step replays the walk it recorded.
+    /// span ends at the model's end), `None` the whole chain. An empty or
+    /// reversed span and one that ends past the model's last layer are
+    /// refused by name: none of them is the whole chain. The caller holds
+    /// the graph rule: a captured step replays the walk it recorded.
     pub fn set_layer_span(&mut self, span: Option<Range<usize>>) -> Result<(), GpuError> {
         const WHAT: &str = "mistrallarge4::set_layer_span";
-        let want = span.filter(|s| s.start < s.end);
-        if let Some(s) = &want
-            && (s.start >= self.layers.len() || s.end > self.layers.len())
-        {
-            return Err(GpuError::shape(
-                WHAT,
-                format!("the span {s:?} is past the model's {}", self.layers.len()),
-            ));
+        if let Some(s) = &span {
+            if s.start >= s.end {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!("the span {s:?} is empty or reversed"),
+                ));
+            }
+            if s.end > self.layers.len() {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!("the span {s:?} is past the model's {}", self.layers.len()),
+                ));
+            }
         }
         match &mut self.taps {
-            Some(t) => t.span = want,
+            Some(t) => t.span = span,
             None => {
                 return Err(GpuError::State {
                     what: WHAT,
