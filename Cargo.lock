@@ -226,7 +226,7 @@ dependencies = [
 
 [[package]]
 name = "bloomery-gpu-gates"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "bloomery-app",
  "bloomery-chain",
@@ -552,7 +552,7 @@ version = "0.1.0"
 
 [[package]]
 name = "bloomery-serve"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "bloomery-decision",
  "bloomery-embed",
