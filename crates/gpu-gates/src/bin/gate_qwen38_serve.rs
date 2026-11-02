@@ -545,9 +545,9 @@ mod gate {
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::record::{self, Fields, ReadError};
     use bloomery_gpu_gates::serve_client::{
-        LookupCompletion, PrefixRestore, agree, curl, ids_of, json_of, metric, parse_ids,
-        prefix_restore, server_log, shared_system_prompt, slot_action, slot_erased, sse_event,
-        sse_events, stepped_completion, stop_of, tokenized,
+        LookupCompletion, PrefixRestore, agree, curl, draft_counts, ids_of, json_of, metric,
+        parse_ids, prefix_restore, server_log, shared_system_prompt, slot_action, slot_erased,
+        sse_event, sse_events, stepped_completion, stop_of, tokenized,
     };
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
@@ -1233,8 +1233,10 @@ mod gate {
                 Greedy {
                     ok: true,
                     tokens: ids_of(&v["tokens"])?,
-                    cache_n: v["timings"]["cache_n"].as_u64().unwrap_or(u64::MAX),
-                    draft_n: v["timings"]["draft_n"].as_u64().unwrap_or(0),
+                    cache_n: v["timings"]["cache_n"]
+                        .as_u64()
+                        .ok_or("/completion: missing or invalid timings.cache_n")?,
+                    draft_n: draft_counts(&v)?.0,
                     joins: Vec::new(),
                     offs: Vec::new(),
                     keeps: Vec::new(),
@@ -1991,11 +1993,8 @@ mod gate {
                 let mut drafts = (0, 0);
                 for e in sse_events(&sse).map_err(|e| format!("curl {url}: {e}"))? {
                     let v = sse_event(e).map_err(|e| format!("curl {url}: {e}"))?;
-                    if let (Some(n), Some(a)) = (
-                        v["timings"]["draft_n"].as_u64(),
-                        v["timings"]["draft_n_accepted"].as_u64(),
-                    ) {
-                        drafts = (n, a);
+                    if v.get("timings").is_some() {
+                        drafts = draft_counts(&v).map_err(|e| format!("curl {url}: {e}"))?;
                     }
                     if v.get("tokens").is_some() {
                         tokens = ids_of(&v["tokens"]).map_err(|e| format!("curl {url}: {e}"))?;
