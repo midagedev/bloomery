@@ -281,16 +281,13 @@ mod tests {
     fn a_cached_checkpoint_repo_is_its_folder_with_nothing_fetched() {
         let dir = scratch("folder");
         let repo = "mlx-community/Tiny-4bit";
-        let root = cached(
-            &dir,
-            repo,
-            &[
-                "config.json",
-                "model-00001-of-00002.safetensors",
-                "model-00002-of-00002.safetensors",
-                "model.safetensors.index.json",
-            ],
-        );
+        let paths = [
+            "config.json",
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+            "model.safetensors.index.json",
+        ];
+        let root = cached(&dir, repo, &paths);
         let r = RepoRef::parse(repo).unwrap();
         let mut lines = Vec::new();
         let model = fetch(&offline(root.clone()), &r, &mut |l| {
@@ -303,15 +300,10 @@ mod tests {
             lines[0].starts_with("hf offline repo=mlx-community/Tiny-4bit reason="),
             "{lines:?}"
         );
-        let bytes: u64 = [
-            "config.json",
-            "model-00001-of-00002.safetensors",
-            "model-00002-of-00002.safetensors",
-            "model.safetensors.index.json",
-        ]
-        .iter()
-        .map(|f| fs::metadata(root.join(repo).join(f)).unwrap().len())
-        .sum();
+        let bytes: u64 = paths
+            .iter()
+            .map(|f| fs::metadata(root.join(repo).join(f)).unwrap().len())
+            .sum();
         assert!(
             lines.contains(&format!(
                 "hf checkpoint repo=mlx-community/Tiny-4bit files=4 bytes={bytes}"
