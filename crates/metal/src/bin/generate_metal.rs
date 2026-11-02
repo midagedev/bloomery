@@ -8,6 +8,8 @@
 //!                    [--print-ids] [--ignore-eos] [--repeat N] [--profile [N]]
 //!                    [--profile-layers] [--step-times [N]] [--prefill batch|steps]
 //!                    [--pass-times U] [--logits-hash [N]] [--draft lookup]
+//!                    [--mtp SIDECAR [--mtp-hidden pre|post] [--draft-step-times [N]]]
+//!     generate_metal [-m PATH | --hf REPO] --mtp SIDECAR --mtp-check DIR/FAMILY [--ctx C]
 //!     generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
 //!
 //! The model is a GGUF file's first shard or a checkpoint folder (an MLX
@@ -164,6 +166,27 @@
 //! profiled token runs one command buffer a group, waited, which the real
 //! step's single buffer does not.
 //!
+//! `--mtp SIDECAR` opens the MTP draft layer of a Qwen3.5-family file beside the
+//! session (`mlx-community/Qwen3.8-27B-MTP-4bit`: a folder holding the
+//! sidecar's `config.json` and `model.safetensors`); the main file's open, its
+//! counts and its decode are the run's without the flag, and the line
+//! `mtp_open weight_bytes=… kv_bytes=… allocated_bytes=…` names what the
+//! sidecar added. A sidecar of another model is refused by name before a run.
+//! `--draft-step-times [N]` (default 32; needs `--mtp`) runs N draft steps
+//! after the run, each its own command buffer at one position over the hidden
+//! row of a settled step, and prints one `draft_step_times` line with the GPU
+//! and wall medians of the steps after three warm-ups. `--mtp-hidden pre|post`
+//! (default post) names whether the draft joins the row before the target's
+//! output norm or after it; the time does not depend on it.
+//!
+//! `--mtp-check DIR/FAMILY` (with `--mtp`; no prompt) runs the draft step against the
+//! reference dump `tools/mlx-logits.py mtp-dump … --out DIR` wrote (`DIR/FAMILY.txt` and
+//! `.f32`): each reading of the hidden row (pre and post the target's output norm) with the
+//! reference's own hidden rows injected, its logits held to the band derived in
+//! `arch::qwen3moe::mtp_check`, the clause that tells the readings apart, and each reading's
+//! agreement with the session's own next pick on the dump's ids. One `PASS`/`FAIL` line a
+//! clause and `INFO` lines for the agreement; exit 1 when a clause failed.
+//!
 //! `--plan` reads the file's header and tensor table alone (no weight byte, no
 //! device buffer) and prints, on stdout, what the open would find: the
 //! description, the room the device and the host report beside the bytes the
@@ -202,14 +225,15 @@ mod cli {
         check,
         count::{GroupKind, KINDS},
         generate::{Generated, greedy, greedy_lookup},
-        plan,
+        mtp_check, plan,
         session::{
-            Op, PassOut, PassSample, ProfileGroup, Session, StateOut, StepMode, VerifyTrace,
+            DraftTimes, Op, PassOut, PassSample, ProfileGroup, Session, StateOut, StepMode,
+            VerifyTrace,
         },
     };
     use bloomery_metal::device::MetalDevice;
     use bloomery_metal::encode::EncodeCount;
-    use bloomery_metal::kernels::PASS_ROWS;
+    use bloomery_metal::kernels::{HiddenRow, PASS_ROWS};
     use bloomery_metal::model_arg;
     use hf::source::Source;
     use model_hf::ModelFile;
@@ -243,7 +267,8 @@ mod cli {
     const CTX_DEFAULT: usize = 4096;
 
     const USAGE: &str = "\
-generate_metal [-m PATH | --hf REPO] (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids] [--ignore-eos] [--repeat N] [--profile [N]] [--profile-layers] [--step-times [N]] [--prefill batch|steps] [--pass-times U[,U…]] [--logits-hash [N]] [--draft lookup]
+generate_metal [-m PATH | --hf REPO] (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids] [--ignore-eos] [--repeat N] [--profile [N]] [--profile-layers] [--step-times [N]] [--prefill batch|steps] [--pass-times U[,U…]] [--logits-hash [N]] [--draft lookup] [--mtp SIDECAR [--mtp-hidden pre|post] [--draft-step-times [N]]]
+generate_metal [-m PATH | --hf REPO] --mtp SIDECAR --mtp-check DIR/FAMILY [--ctx C]
 generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
   the model is a GGUF file (its first shard) or a checkpoint folder, named by -m,
   by --hf (fetched into the cache) or by $BLOOMERY_REF_MODEL; defaults N 32, --ctx the smaller of 4096
@@ -265,7 +290,11 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
   id, batch (the default) in passes; --pass-times U[,U…] times the ops of one
   pass of the first U prompt ids, one command buffer at a time, beside the
   pass's own wall; --logits-hash [N] (default 32) runs the prompt again and
-  N − 1 tokens host-fed, one logits_hash line a token (FNV-1a 64 of its logits)";
+  N − 1 tokens host-fed, one logits_hash line a token (FNV-1a 64 of its logits);
+  --mtp SIDECAR opens the MTP draft layer's folder beside the model, --draft-step-times [N]
+  (default 32) times N draft steps over it, --mtp-hidden pre|post (default post) names the hidden
+  row the draft joins; --mtp-check DIR/FAMILY runs the draft step against the reference dump of
+  tools/mlx-logits.py mtp-dump (no prompt)";
 
     /// The flags that take a value.
     const VALUE_FLAGS: &[&str] = &[
@@ -279,6 +308,9 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         "--pass-times",
         "--repeat",
         "--draft",
+        "--mtp",
+        "--mtp-hidden",
+        "--mtp-check",
         #[cfg(feature = "encode-trace")]
         "--encode-trace",
     ];
@@ -345,6 +377,14 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         /// `BLOOMERY_MTP_WIDTH`: the width chooser's mode behind the draft;
         /// `Cost` unset, as the CUDA family's.
         width: WidthMode,
+        /// `--mtp SIDECAR`: the MTP draft layer's folder, opened beside the model.
+        mtp: Option<std::path::PathBuf>,
+        /// `--mtp-hidden pre|post`: the hidden row the draft joins.
+        mtp_hidden: HiddenRow,
+        /// `--mtp-check DIR/FAMILY`: the reference dump the draft step is held to.
+        mtp_check: Option<std::path::PathBuf>,
+        /// `--draft-step-times [N]`: the draft steps timed past the run.
+        draft_step_times: Option<usize>,
         /// `--pass-times U[,U…]`: the rows of each pass whose ops are timed
         /// alone.
         pass_times: Option<Vec<usize>>,
@@ -393,7 +433,12 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
     }
 
     /// The flags that stand alone or take a count.
-    const COUNT_FLAGS: [&str; 3] = ["--profile", "--step-times", "--logits-hash"];
+    const COUNT_FLAGS: [&str; 4] = [
+        "--profile",
+        "--step-times",
+        "--logits-hash",
+        "--draft-step-times",
+    ];
 
     /// The flag words among the arguments, in order, each with the count it
     /// took. A value flag's value is skipped, never read as a flag; a count
@@ -453,9 +498,12 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         if text.is_some() && tokens.is_some() {
             return Err("give --prompt or --tokens, not both".into());
         }
+        let mtp_check = flag("--mtp-check")?.map(std::path::PathBuf::from);
         let prompt = match (&text, &tokens) {
             (Some(t), _) => Prompt::Text(t.clone()),
             (_, Some(s)) => Prompt::Ids(ids_of(s)?),
+            // The check runs the dump's ids, not a prompt.
+            _ if mtp_check.is_some() => Prompt::Ids(vec![0]),
             _ => return Err("give one of --prompt or --tokens".to_string()),
         };
         let n_gen: usize = match flag("-n")? {
@@ -551,6 +599,28 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         }
         let width = WidthMode::of(width)
             .map_err(|_| format!("{}: cost or fixed", bloomery_levers::MTP_WIDTH))?;
+        let mtp = flag("--mtp")?.map(std::path::PathBuf::from);
+        let mtp_hidden = match flag("--mtp-hidden")?.as_deref() {
+            None | Some("post") => HiddenRow::Post,
+            Some("pre") => HiddenRow::Pre,
+            Some(s) => return Err(format!("--mtp-hidden {s}: pre or post")),
+        };
+        let draft_step_times = count_flag("--draft-step-times");
+        if draft_step_times == Some(0) {
+            return Err(
+                "--draft-step-times 0: a draft timing of no steps; drop the flag to run none"
+                    .into(),
+            );
+        }
+        if mtp.is_none()
+            && (draft_step_times.is_some()
+                || flag("--mtp-hidden")?.is_some()
+                || mtp_check.is_some())
+        {
+            return Err(
+                "--draft-step-times, --mtp-hidden and --mtp-check need --mtp SIDECAR".into(),
+            );
+        }
         let model = model_source()?;
         Ok(Args {
             prompt,
@@ -565,6 +635,10 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
             prefill,
             draft,
             width,
+            mtp,
+            mtp_hidden,
+            mtp_check,
+            draft_step_times,
             pass_times,
             #[cfg(feature = "encode-trace")]
             encode_trace,
@@ -1086,6 +1160,71 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         Ok(())
     }
 
+    /// `--mtp-check`: the dump at `stem` (`DIR/FAMILY`) read, the draft step held
+    /// to it, one line a clause; an error when a clause failed.
+    fn mtp_check_run(s: &mut Session, stem: &std::path::Path) -> Result<(), String> {
+        let family = stem
+            .file_name()
+            .and_then(|f| f.to_str())
+            .ok_or_else(|| format!("--mtp-check {}: no family name", stem.display()))?;
+        let dir = stem.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let dump = mtp_check::read(dir, family)?;
+        if dump.ids.len() > s.ctx() {
+            return Err(format!(
+                "--mtp-check: the dump holds {} ids and the cache {} rows; give --ctx more rows",
+                dump.ids.len(),
+                s.ctx()
+            ));
+        }
+        let checked = mtp_check::check(s, &dump)?;
+        for line in &checked.lines {
+            eprintln!("{line}");
+        }
+        if checked.ok {
+            Ok(())
+        } else {
+            Err("mtp_check: a clause failed".into())
+        }
+    }
+
+    /// The `draft_step_times` line: `n` draft steps past the run, each its own
+    /// command buffer and wait at the position of one settled host-fed step over
+    /// that step's hidden row, three warm-up steps first. Development-loop
+    /// numbers, like the summary's: the GPU time is the buffer's own stamps, the
+    /// wall the host's from encode to the settled wait.
+    fn draft_step_times_run(
+        s: &mut Session,
+        n: usize,
+        id: u32,
+        hidden: HiddenRow,
+    ) -> Result<(), String> {
+        const WARM: usize = 3;
+        // A settled host-fed step leaves the residual the draft joins.
+        s.step(id, StepMode::HostFed).map_err(|e| e.to_string())?;
+        s.tap_mtp_hidden().map_err(|e| e.to_string())?;
+        let pos = s.pos() - 1;
+        let t = s
+            .draft_step_times(id, pos, hidden, WARM + n)
+            .map_err(|e| e.to_string())?;
+        let (gpu, wall) = (&t.gpu_ms[WARM..], &t.wall_ms[WARM..]);
+        let min = |v: &[f64]| v.iter().copied().fold(f64::INFINITY, f64::min);
+        eprintln!(
+            "draft_step_times hidden={} pos={pos} steps={n} gpu_ms_median={:.3} gpu_ms_min={:.3} \
+             wall_ms_median={:.3} wall_ms_min={:.3} (development-loop numbers: no lease, no \
+             witness)",
+            if hidden == HiddenRow::Post {
+                "post"
+            } else {
+                "pre"
+            },
+            DraftTimes::median(gpu),
+            min(gpu),
+            DraftTimes::median(wall),
+            min(wall),
+        );
+        Ok(())
+    }
+
     /// The `step_times` lines: `n` tokens in each mode past the run —
     /// host-fed and chain greedy, ahead on one id throughout, so every token
     /// ahead is kept — the step clock's phases averaged a mode and printed
@@ -1421,6 +1560,17 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         // live device buffers this process holds; the arena keeps no sum of
         // its own.
         let allocated = device.allocated_bytes().map_err(|e| e.to_string())?;
+        if let Some(path) = &a.mtp {
+            let opened = session.open_mtp(path).map_err(|e| e.to_string())?;
+            let with = device.allocated_bytes().map_err(|e| e.to_string())?;
+            eprintln!(
+                "mtp_open weight_bytes={} kv_bytes={} allocated_bytes={with}",
+                opened.weight_bytes, opened.kv_bytes
+            );
+        }
+        if let Some(stem) = &a.mtp_check {
+            return mtp_check_run(&mut session, stem);
+        }
         // The picks stop at the vocabulary's end-of-generation set unless the run ignores it.
         let eog: &[u32] = if a.ignore_eos { &[] } else { tok.eog() };
         // One run of the prompt, its text or ids on stdout as they are picked.
@@ -1524,6 +1674,13 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
                 .last()
                 .ok_or("a step-times run of no token: the run picked none")?;
             step_times_run(&mut session, n, id)?;
+        }
+        if let Some(n) = a.draft_step_times {
+            let id = *out
+                .ids
+                .last()
+                .ok_or("a draft-step-times run of no token: the run picked none")?;
+            draft_step_times_run(&mut session, n, id, a.mtp_hidden)?;
         }
         if let Some(n) = a.logits_hash {
             logits_hash_run(&mut session, &prompt, n)?;

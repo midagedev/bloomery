@@ -4,6 +4,8 @@
     tools/mlx-logits.py dump <folder> <family> [--ids 0,1 | --ids-walk N:FIRST] [--positions P,P] [--out DIR]
     tools/mlx-logits.py layers <folder> <dir> [--split FIRST.gguf]
     tools/mlx-logits.py scale <folder> [--ids ID,ID,…]
+    tools/mlx-logits.py mtp-dump <folder> <sidecar> <family> (--ids ID,ID,… | --text FILE [--max-ids N])
+                         [--positions P,P] [--f32-target] --out DIR
     tools/mlx-logits.py compare <ours-dir> <mlx-dir>
     tools/mlx-logits.py f64 <ours-dir> <mlx-dir> <split.gguf>
     tools/mlx-logits.py --self-test
@@ -67,6 +69,32 @@ model's `full_attention_interval`. mlx-lm builds the layer kind from that interv
 two disagree, the load uses the interval `layer_types` implies, the same one the split's
 converter writes, so the forward is the folder's layers.
 
+`mtp-dump` is the MTP draft layer's reference (`session/mtp.rs` on Metal reads it). It runs the
+target `<folder>` over the ids (teacher-forced, one id a step) as mlx-lm runs it (4-bit weights,
+bf16 activations: a 27B does not fit in f32 on a 32 GB Mac; `--f32-target` runs a fixture folder in
+f32 as `dump` does), taps the hidden row of every step before the output norm and widens it to f32, and runs the draft step of the sidecar
+(`mlx-community/Qwen3.8-27B-MTP-4bit`: `fc`, the three norms and `layers.0`, MLX's 4-bit groups,
+every linear dequantized exactly to f32 and every norm gain as stored; the target's head dequantized
+to f32 in chunks of rows, its embedding rows to f32) on each pair (hidden row
+of step t, id of step t + 1) at position t, under both readings of the hidden row: **pre**, the row
+before the target's output norm (mlx-lm PR #990's text: "pre-norm hidden states"), and **post**, the
+row after it (the CUDA engine's `mtp35.rs` and mlx-vlm's `qwen3_5_mtp.py` / `qwen3_5/language.py`,
+whose language model returns `self.norm(h)`). Each reading runs its own draft K/V rows over the
+whole id sequence, since its rows differ. The step is `_forward_hidden` (lines 163-182 of mlx-vlm
+v0.7.11's `mlx_vlm/speculative/drafters/qwen3_5_mtp/qwen3_5_mtp.py`): `fc(concat(pre_fc_norm_embedding(
+embed(id)), pre_fc_norm_hidden(hidden)))`, the decoder layer (mlx-lm's own `DecoderLayer` of the
+target, built with `full_attention_interval=1`, so the gated attention with the sidecar's
+weights over a `KVCache` of its own whose offset is the position), `norm`, and the target's
+`lm_head`. `--text FILE` ids are the folder's tokenizer's over the file (real text, the draft's
+agreement with the target is then the acceptance rate's proxy); `--ids` teacher-forces ids given.
+`--out DIR` writes `DIR/<family>.txt` and `DIR/<family>.f32`: the hidden row before the norm of
+every pair t = 0 … steps − 2 (`hidden` f32 each: the draft's K/V rows are built from all of them),
+then for each kept position (0-based, increasing, below steps − 1; all by default) the draft logits
+under pre (`n` f32) and under post (`n` f32). The text names `ids`, `steps`, `n`,
+`hidden`, `positions` and, per kept position, `target` (the target's argmax after the id at
+t + 1), `pre` and `post` (each reading's draft argmax), then `agree_pre` and `agree_post`
+(positions where the draft's argmax is the target's) and the checksum over the f32 bytes.
+
 `--self-test` checks that checksum, a missing key, and that flipping the first logit moves
 the max-abs distance, the loader chosen by `model_type`, the LFM3 folder's checks over a header-only
 folder, and the logits taken from either module's output, and the simulate round's argument parse
@@ -95,6 +123,8 @@ USAGE = (
     " --pin DIR [--round all|k|none]"
     " | layers <folder> <dir> [--split FIRST.gguf]"
     " | scale <folder> [--ids ID,ID,…]"
+    " | mtp-dump <folder> <sidecar> <family> (--ids ID,ID,… | --text FILE [--max-ids N])"
+    " [--positions P,P] [--f32-target] --out DIR"
     " | compare <ours-dir> <mlx-dir>"
     " | f64 <ours-dir> <mlx-dir> <split.gguf> | --self-test"
 )
@@ -832,6 +862,7 @@ def self_test() -> int:
     fails += self_test_lfm3()
     fails += self_test_deep()
     fails += self_test_simulate()
+    fails += self_test_mtp()
     if fails:
         print(f"mlx-logits self-test: {fails} failed", file=sys.stderr)
         return 1
@@ -1126,6 +1157,434 @@ def self_test_simulate() -> int:
             refused(lambda: read_pin(str(bad), "llama"), "not the 4 rows of 4"),
         )
     return fails
+
+
+# The MTP draft's reference. The kinds a dump holds, and the order of a position's records.
+MTP_VERSION = 1
+MTP_READINGS = ("pre", "post")
+
+
+def mtp_header(
+    family: str,
+    ids: list[int],
+    n: int,
+    hidden: int,
+    positions: list[int],
+    target: list[int],
+    drafts: dict[str, list[int]],
+    raw: bytes,
+) -> str:
+    """The mtp dump's text. `positions` are the kept steps t (each below `len(ids) - 1`), `target`
+    the target's argmax after the id at t + 1, `drafts` each reading's argmax at t; the f32 bytes
+    hold the hidden row of every pair (`steps - 1` rows of `hidden` values: the draft's K/V rows are
+    built from all of them), then, per kept position, `n` values of each reading."""
+    steps = len(ids)
+    check_positions(positions, steps - 1)
+    for name, row in [("target", target)] + list(drafts.items()):
+        if len(row) != len(positions):
+            raise SystemExit(f"mlx-logits: {len(row)} {name} argmax values for {len(positions)} positions")
+    want = ((steps - 1) * hidden + len(positions) * len(MTP_READINGS) * n) * 4
+    if len(raw) != want:
+        raise SystemExit(
+            f"mlx-logits: {len(raw)} bytes is not {want}: {steps - 1} hidden rows and "
+            f"{len(positions)} positions of two logit rows"
+        )
+    agree = {name: sum(1 for a, b in zip(drafts[name], target) if a == b) for name in MTP_READINGS}
+    join = lambda v: ",".join(str(i) for i in v)
+    return (
+        f"version {MTP_VERSION}\n"
+        f"family {family}\n"
+        "kind mtp\n"
+        f"ids {join(ids)}\n"
+        f"steps {steps}\n"
+        f"n {n}\n"
+        f"hidden {hidden}\n"
+        f"positions {join(positions)}\n"
+        f"target {join(target)}\n"
+        f"pre {join(drafts['pre'])}\n"
+        f"post {join(drafts['post'])}\n"
+        f"agree_pre {agree['pre']}\n"
+        f"agree_post {agree['post']}\n"
+        f"fnv1a {fnv1a(raw):016x}\n"
+    )
+
+
+def mtp_read(text: str) -> dict:
+    """The fields of an mtp dump's text, the lists as lists of ints."""
+    out = {}
+    for line in text.splitlines():
+        key, _, value = line.partition(" ")
+        if key in ("ids", "positions", "target", "pre", "post"):
+            out[key] = [int(v) for v in value.split(",")] if value else []
+        elif key in ("version", "steps", "n", "hidden", "agree_pre", "agree_post"):
+            out[key] = int(value)
+        else:
+            out[key] = value
+    return out
+
+
+def mtp_sidecar_files(sidecar: str):
+    """The sidecar's `model.safetensors` and its config, from the folder (or the file)."""
+    import pathlib
+
+    root = pathlib.Path(sidecar)
+    if root.is_file():
+        return root, root.parent / "config.json"
+    for rel in ("model.safetensors", "mtp/model.safetensors"):
+        if (root / rel).is_file():
+            return root / rel, root / "config.json"
+    raise SystemExit(f"mlx-logits: no model.safetensors or mtp/model.safetensors in {sidecar}")
+
+
+# The tensors the sidecar holds: the fusion projection, the three norms and one attention layer
+# with a dense FFN. Any other name is another layer kind and is refused by name.
+MTP_LINEARS = (
+    "fc",
+    "layers.0.self_attn.q_proj",
+    "layers.0.self_attn.k_proj",
+    "layers.0.self_attn.v_proj",
+    "layers.0.self_attn.o_proj",
+    "layers.0.mlp.gate_proj",
+    "layers.0.mlp.up_proj",
+    "layers.0.mlp.down_proj",
+)
+MTP_VECTORS = (
+    "norm.weight",
+    "pre_fc_norm_embedding.weight",
+    "pre_fc_norm_hidden.weight",
+    "layers.0.input_layernorm.weight",
+    "layers.0.post_attention_layernorm.weight",
+    "layers.0.self_attn.q_norm.weight",
+    "layers.0.self_attn.k_norm.weight",
+)
+
+
+def mtp_sidecar_weights(sidecar: str):
+    """The sidecar's tensors as exact f32: each linear's `dequantize_f32` (its scales and biases
+    widened first, MLX's affine groups of 64 and 4 bits), each norm gain as stored (the sidecar's
+    gains are the runtime `x * w` gains: the extraction adds the `+ 1` mlx-lm's sanitize would)."""
+    import json
+
+    import mlx.core as mx
+
+    path, config = mtp_sidecar_files(sidecar)
+    cfg = json.loads(config.read_text())
+    if cfg.get("model_type") != "qwen3_5_mtp":
+        raise SystemExit(f"mlx-logits: {config}: model_type {cfg.get('model_type')!r}, not qwen3_5_mtp")
+    quant = cfg.get("quantization") or {}
+    if (quant.get("bits"), quant.get("group_size"), quant.get("mode")) != (4, 64, "affine"):
+        raise SystemExit(f"mlx-logits: {config}: quantization {quant}, not affine 4-bit groups of 64")
+    tensors = mx.load(str(path))
+    held = {f"{b}.{s}" for b in MTP_LINEARS for s in ("weight", "scales", "biases")} | set(MTP_VECTORS)
+    extra = sorted(set(tensors) - held)
+    missing = sorted(held - set(tensors))
+    if extra or missing:
+        raise SystemExit(
+            f"mlx-logits: {path}: tensors the draft layer does not have {extra[:4]}; missing {missing[:4]}"
+        )
+    out = {}
+    for base in MTP_LINEARS:
+        w = mx.dequantize(
+            tensors[f"{base}.weight"],
+            scales=tensors[f"{base}.scales"].astype(mx.float32),
+            biases=tensors[f"{base}.biases"].astype(mx.float32),
+            group_size=64,
+            bits=4,
+            mode="affine",
+        ).astype(mx.float32)
+        out[f"{base}.weight"] = w
+    for name in MTP_VECTORS:
+        out[name] = tensors[name].astype(mx.float32)
+    return out
+
+
+def mtp_layer(text, weights):
+    """The draft's decoder layer: mlx-lm's own `DecoderLayer` of the target's model, built as one
+    full-attention layer with a dense FFN (mlx-vlm's `replace(text_config, num_hidden_layers=1,
+    full_attention_interval=1)`), holding the sidecar's `layers.0` weights in f32."""
+    import dataclasses
+
+    from mlx.utils import tree_unflatten
+    from mlx_lm.models.qwen3_5 import DecoderLayer
+
+    args = dataclasses.replace(text.args, full_attention_interval=1)
+    layer = DecoderLayer(args, 0)
+    if layer.is_linear:
+        raise SystemExit("mlx-logits: the draft layer built as a gated delta layer")
+    prefix = "layers.0."
+    mine = [(k[len(prefix):], v) for k, v in weights.items() if k.startswith(prefix)]
+    layer.update(tree_unflatten(mine))
+    return layer
+
+
+def mtp_embedding_rows(model, ids: list[int]):
+    """The f32 rows of the target's embedding for `ids`, each `dequantize_f32` of its row of the
+    quantized `embed_tokens` (the rows `gather_embedding` would hold), as `(1, 1, hidden)` arrays
+    by id, with the target's embedding left as it is."""
+    import mlx.core as mx
+
+    text, inner = text_and_inner(model)
+    mod = inner.embed_tokens
+    if type(mod).__name__ != "QuantizedEmbedding":
+        raise SystemExit("mlx-logits: the target's embedding is not one quantized embed_tokens")
+    rows = {}
+    for token in sorted(set(ids)):
+        at = mx.array([token], dtype=mx.int32)
+        row = dequantize_f32(
+            mod,
+            mx.take(mod.weight, at, axis=0),
+            mx.take(mod.scales, at, axis=0),
+            None if mod.get("biases", None) is None else mx.take(mod.biases, at, axis=0),
+        )
+        mx.eval(row)
+        rows[token] = row.reshape(1, 1, -1)
+    return rows
+
+
+def mtp_head(text):
+    """The target's head as a function of an f32 `(1, 1, hidden)` row to its f32 logits. A floatized
+    head is one matmul; a quantized one is dequantized to f32 in chunks of rows, each chunk's
+    logits the dot of the same f32 row with the exact dequant, so the 27B's 4-bit head is never held
+    whole in f32."""
+    import mlx.core as mx
+
+    head = text.lm_head
+    if type(head).__name__ != "QuantizedLinear":
+        return lambda x: (x @ head.weight.astype(mx.float32).T)[0, -1, :]
+    chunk = 8192
+    rows = head.weight.shape[0]
+
+    def logits(x):
+        parts = []
+        for r0 in range(0, rows, chunk):
+            r1 = min(rows, r0 + chunk)
+            w = dequantize_f32(
+                head,
+                head.weight[r0:r1],
+                head.scales[r0:r1],
+                None if head.get("biases", None) is None else head.biases[r0:r1],
+            )
+            part = x @ w.T
+            mx.eval(part)
+            parts.append(part)
+        return mx.concatenate(parts, axis=-1)[0, -1, :]
+
+    return logits
+
+
+def mtp_dump(
+    folder: str,
+    sidecar: str,
+    family: str,
+    ids: list[int],
+    positions: list[int] | None,
+    out: str,
+    f32_target: bool,
+) -> None:
+    """The draft's reference. The target runs as mlx-lm runs it (4-bit weights, bf16 activations: a
+    27B does not fit in f32 on a 32 GB Mac), or in f32 over the exact dequant with `--f32-target`
+    (a fixture folder, as `dump` runs it); its hidden row is tapped before the output norm and
+    widened to f32, and the draft runs in f32 from there, so the draft's inputs are the same rows
+    whichever the target's arithmetic."""
+    import mlx.core as mx
+    import mlx.nn as nn
+    import numpy as np
+    from mlx_lm.models import cache as mlx_cache
+    from mlx_lm.utils import load
+
+    model, _tokenizer = load_folder(folder, load)
+    if f32_target:
+        gather_embedding(model, ids)
+        note, replaced = floatize(model)
+        if replaced == 0 or "bf16 parameters left: 0" not in note:
+            raise SystemExit(f"mlx-logits: {folder} does not run in f32:\n{note}")
+    text, inner = text_and_inner(model)
+    if not hasattr(text, "lm_head"):
+        raise SystemExit("mlx-logits: a target whose head is tied to the embedding has no draft head here")
+    embed_rows = None if f32_target else mtp_embedding_rows(model, ids)
+    embed = (lambda t: inner.embed_tokens(mx.array([[t]]))) if f32_target else (lambda t: embed_rows[t])
+    head = mtp_head(text)
+    weights = mtp_sidecar_weights(sidecar)
+    eps = float(text.args.rms_norm_eps)
+    hidden_size = int(text.args.hidden_size)
+    if weights["fc.weight"].shape != (hidden_size, 2 * hidden_size):
+        raise SystemExit(
+            f"mlx-logits: the sidecar's fc is {tuple(weights['fc.weight'].shape)}, the target's hidden "
+            f"size {hidden_size} needs {(hidden_size, 2 * hidden_size)}: a sidecar of another model"
+        )
+
+    class Tap(nn.Module):
+        """The target's output norm, holding the row it was given."""
+
+        def __init__(self, norm):
+            super().__init__()
+            self.norm = norm
+            self.held = None
+
+        def __call__(self, x):
+            self.held = x
+            return self.norm(x)
+
+    tap = Tap(inner.norm)
+    inner.norm = tap
+    cache = mlx_cache.make_prompt_cache(model)
+    hidden_rows, target = [], []
+    n = 0
+    for step, token in enumerate(ids):
+        logits = unwrap_logits(model(mx.array([[token]]), cache=cache))[:, -1, :]
+        mx.eval(logits, tap.held)
+        row = np.array(logits.astype(mx.float32))
+        n = row.size
+        hidden_rows.append(
+            np.ascontiguousarray(np.array(tap.held.reshape(-1).astype(mx.float32)), dtype=np.float32)
+        )
+        target.append(int(np.argmax(row)))
+        if not np.isfinite(row).all():
+            raise SystemExit(f"mlx-logits: step {step} (id {token}) has a non-finite logit")
+    if max(ids) >= n:
+        raise SystemExit(f"mlx-logits: id {max(ids)} is outside the vocabulary of {n}")
+    out_norm = tap.norm.weight.astype(mx.float32)
+    layer = mtp_layer(text, weights)
+    rms = lambda x, name: mx.fast.rms_norm(x, weights[name], eps)
+    keep = list(range(len(ids) - 1)) if positions is None else positions
+    check_positions(keep, len(ids) - 1)
+    kept = set(keep)
+    drafts: dict[str, list[int]] = {"pre": [], "post": []}
+    rows: dict[str, list[bytes]] = {"pre": [], "post": []}
+    hidden_all = b"".join(hidden_rows[t].tobytes() for t in range(len(ids) - 1))
+    for reading in MTP_READINGS:
+        draft_cache = [mlx_cache.KVCache()]
+        for t in range(len(ids) - 1):
+            h = mx.array(hidden_rows[t]).reshape(1, 1, -1)
+            if reading == "post":
+                h = mx.fast.rms_norm(h, out_norm, eps)
+            emb = embed(ids[t + 1]).astype(mx.float32)
+            # qwen3_5_mtp.py:163-170: concat(pre_fc_norm_embedding(e), pre_fc_norm_hidden(h)), fc.
+            joined = mx.concatenate(
+                [rms(emb, "pre_fc_norm_embedding.weight"), rms(h, "pre_fc_norm_hidden.weight")], axis=-1
+            )
+            x = joined @ weights["fc.weight"].T
+            # qwen3_5_mtp.py:173-182: the layer over its own cache (one token: no mask), then norm.
+            x = layer(x, mask=None, cache=draft_cache[0])
+            x = rms(x, "norm.weight")
+            logits = head(x)
+            mx.eval(logits)
+            row = np.ascontiguousarray(np.array(logits.astype(mx.float32)), dtype=np.float32)
+            if not np.isfinite(row).all():
+                raise SystemExit(f"mlx-logits: the {reading} draft at position {t} has a non-finite logit")
+            if t in kept:
+                drafts[reading].append(int(np.argmax(row)))
+                rows[reading].append(row.tobytes())
+    raw = hidden_all + b"".join(rows["pre"][i] + rows["post"][i] for i in range(len(keep)))
+    target_kept = [target[t + 1] for t in keep]
+    text_out = mtp_header(family, ids, n, hidden_size, keep, target_kept, drafts, raw)
+    import pathlib
+
+    root = pathlib.Path(out)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / f"{family}.txt").write_text(text_out)
+    (root / f"{family}.f32").write_bytes(raw)
+    parsed = mtp_read(text_out)
+    print(
+        f"mlx-logits: wrote {out}/{family}.txt and {out}/{family}.f32; the draft agrees with the "
+        f"target at {parsed['agree_pre']} of {len(keep)} positions reading the hidden row before the "
+        f"output norm (pre) and {parsed['agree_post']} of {len(keep)} after it (post)",
+        file=sys.stderr,
+    )
+
+
+def mtp_main(argv: list[str]) -> int:
+    if len(argv) < 3:
+        print(USAGE, file=sys.stderr)
+        return 64
+    folder, sidecar, family = argv[:3]
+    ids = None
+    text_file = None
+    max_ids = None
+    positions_text = None
+    out = None
+    f32_target = False
+    rest = argv[3:]
+    while rest:
+        if rest[0] == "--ids" and len(rest) >= 2:
+            ids = parse_ids(rest[1])
+        elif rest[0] == "--text" and len(rest) >= 2:
+            text_file = rest[1]
+        elif rest[0] == "--max-ids" and len(rest) >= 2 and rest[1].isdigit() and int(rest[1]) > 1:
+            max_ids = int(rest[1])
+        elif rest[0] == "--positions" and len(rest) >= 2:
+            positions_text = rest[1]
+        elif rest[0] == "--out" and len(rest) >= 2:
+            out = rest[1]
+        elif rest[0] == "--f32-target":
+            f32_target = True
+            rest = rest[1:]
+            continue
+        else:
+            print(USAGE, file=sys.stderr)
+            return 64
+        rest = rest[2:]
+    if (ids is None) == (text_file is None) or out is None:
+        print("mlx-logits: mtp-dump takes --ids or --text, and --out", file=sys.stderr)
+        return 64
+    if not family or "/" in family or family.startswith("."):
+        print(f"mlx-logits: {family!r} is not a family name", file=sys.stderr)
+        return 64
+    if text_file is not None:
+        import pathlib
+
+        from mlx_lm.utils import load_tokenizer
+
+        tokenizer = load_tokenizer(pathlib.Path(folder))
+        ids = list(tokenizer.encode(pathlib.Path(text_file).read_text()))
+        if max_ids is not None:
+            ids = ids[:max_ids]
+        if len(ids) < 2:
+            raise SystemExit(f"mlx-logits: {text_file} gives {len(ids)} ids; a draft step needs two")
+    positions = None if positions_text is None else parse_positions(positions_text, len(ids) - 1)
+    mtp_dump(folder, sidecar, family, ids, positions, out, f32_target)
+    return 0
+
+
+def self_test_mtp() -> int:
+    """The mtp dump's text: its header, its checksum over the f32 bytes, and its read; no mlx."""
+    fails = 0
+
+    def check(name: str, ok: bool) -> None:
+        nonlocal fails
+        if not ok:
+            print(f"mlx-logits self-test FAIL: mtp {name}", file=sys.stderr)
+            fails += 1
+
+    ids, n, hidden = [5, 6, 7, 8], 3, 2
+    positions = [0, 2]
+    floats = [float(i) for i in range((len(ids) - 1) * hidden + len(positions) * 2 * n)]
+    raw = struct.pack(f"<{len(floats)}f", *floats)
+    drafts = {"pre": [1, 2], "post": [0, 1]}
+    target = [1, 0]
+    text = mtp_header("x", ids, n, hidden, positions, target, drafts, raw)
+    got = mtp_read(text)
+    check("round trip", got["ids"] == ids and got["positions"] == positions and got["n"] == n)
+    check("hidden", got["hidden"] == hidden)
+    check("argmax lists", got["target"] == target and got["pre"] == [1, 2] and got["post"] == [0, 1])
+    check("agree pre", got["agree_pre"] == 1)
+    check("agree post", got["agree_post"] == 0)
+    check("checksum", got["fnv1a"] == f"{fnv1a(raw):016x}")
+    flipped = bytearray(raw)
+    flipped[0] ^= 1
+    check("a flipped byte moves the checksum", f"{fnv1a(bytes(flipped)):016x}" != got["fnv1a"])
+    for bad, what in [
+        (lambda: mtp_header("x", ids, n, hidden, positions, [1], drafts, raw), "a target row of the wrong length"),
+        (lambda: mtp_header("x", ids, n, hidden, [0, 3], target, drafts, raw), "a position past the pairs"),
+        (lambda: mtp_header("x", ids, n, hidden, positions, target, drafts, raw[:-4]), "short bytes"),
+    ]:
+        try:
+            bad()
+            check(what, False)
+        except SystemExit:
+            pass
+    return fails
+
 
 
 def save_f32(path, values) -> None:
@@ -2339,6 +2798,8 @@ def scale_main(argv: list[str]) -> int:
 def main(argv: list[str]) -> int:
     if argv == ["--self-test"]:
         return self_test()
+    if argv and argv[0] == "mtp-dump":
+        return mtp_main(argv[1:])
     if argv and argv[0] == "scale":
         return scale_main(argv[1:])
     if argv and argv[0] == "simulate":

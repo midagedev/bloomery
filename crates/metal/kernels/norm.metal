@@ -268,3 +268,108 @@ kernel void norm_add_rows(device const float *x [[buffer(0)]],
     norm_add_row(x + row * args.norm.x_stride, gain, y + row * args.norm.y_stride, args, faults,
                  nullptr, nullptr, tid, lane, sg, tg_sums);
 }
+
+// The MTP draft's input join, one threadgroup: the two halves of the fusion
+// projection's input, `y = [ (e · ge) · s_e | (h' · gh) · s_h ]`, `e` the
+// embedding row of the draft's token and `h'` the hidden row of the position
+// before it, each half normed by its own gain. With `post` set the hidden row
+// is first normed by the target's output norm, `h' = (h · go) · s_o`; with
+// it clear `h' = h`. Every sum is `norm_rows`' (the same float4s a thread, the
+// same SIMD-group sum, the groups' shares in group order, the same
+// `rms_scale`), and `h'` is the f32 value `norm_rows` would have written, so
+// the join is the bits of the norms it replaces launched one after the other.
+// The `post` hidden row is held in the output's second half until its own
+// norm reads it: a thread reads only the float4s it wrote.
+//
+// A half whose sum or scale is unusable (`rms_usable`) raises the norm site
+// and is NaN; the other half is unaffected.
+struct MtpJoinArgs {
+    uint cols;
+    uint layer;
+    float eps;
+    uint post;
+};
+
+static_assert(sizeof(MtpJoinArgs) == 16, "MtpJoinArgs is 16 bytes: the host packs four words");
+
+// The sum of squares of `cols / 4` float4s at `p`, `norm_rows`' order.
+inline float mtp_join_sum(device const float *p,
+                          uint f4s,
+                          uint tid,
+                          uint lane,
+                          uint sg,
+                          threadgroup float *tg_sums)
+{
+    float sum_sq = 0.f;
+    for (uint f4 = tid; f4 < f4s; f4 += NORM_ROWS_THREADS) {
+        float4 xv = norm_rows_load4(p, f4);
+        sum_sq += xv.x * xv.x + xv.y * xv.y + xv.z * xv.z + xv.w * xv.w;
+    }
+    sum_sq = simd_sum(sum_sq);
+    if (lane == 0u) {
+        tg_sums[sg] = sum_sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = 0.f;
+    for (uint g = 0u; g < NORM_ROWS_SG; ++g) {
+        total += tg_sums[g];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return total;
+}
+
+kernel void mtp_join(device const float *emb [[buffer(0)]],
+                     device const float *hid [[buffer(1)]],
+                     device const float *gain_e [[buffer(2)]],
+                     device const float *gain_h [[buffer(3)]],
+                     device const float *gain_o [[buffer(4)]],
+                     device float *y [[buffer(5)]],
+                     constant MtpJoinArgs &args [[buffer(6)]],
+                     device atomic_uint *faults [[buffer(7)]],
+                     uint tid [[thread_position_in_threadgroup]],
+                     uint lane [[thread_index_in_simdgroup]],
+                     uint sg [[simdgroup_index_in_threadgroup]])
+{
+    threadgroup float tg_sums[NORM_ROWS_SG];
+    const uint f4s = args.cols / 4u;
+    device float *ye = y;
+    device float *yh = y + args.cols;
+
+    const float total_e = mtp_join_sum(emb, f4s, tid, lane, sg, tg_sums);
+    const float scale_e = rms_scale(total_e, args.cols, args.eps);
+    const bool ok_e = rms_usable(total_e, scale_e);
+
+    bool ok_o = true;
+    float total_h;
+    if (args.post != 0u) {
+        const float total_o = mtp_join_sum(hid, f4s, tid, lane, sg, tg_sums);
+        const float scale_o = rms_scale(total_o, args.cols, args.eps);
+        ok_o = rms_usable(total_o, scale_o);
+        for (uint f4 = tid; f4 < f4s; f4 += NORM_ROWS_THREADS) {
+            *((device float4 *)(yh + f4 * 4u)) =
+                ok_o ? norm_rows_value(norm_rows_load4(hid, f4), norm_rows_load4(gain_o, f4), scale_o)
+                     : float4(NAN);
+        }
+        total_h = mtp_join_sum(yh, f4s, tid, lane, sg, tg_sums);
+    } else {
+        total_h = mtp_join_sum(hid, f4s, tid, lane, sg, tg_sums);
+    }
+    const float scale_h = rms_scale(total_h, args.cols, args.eps);
+    const bool ok_h = rms_usable(total_h, scale_h);
+
+    bool bad = !ok_e || !ok_h || !ok_o;
+    for (uint f4 = tid; f4 < f4s; f4 += NORM_ROWS_THREADS) {
+        const float4 value_e =
+            ok_e ? norm_rows_value(norm_rows_load4(emb, f4), norm_rows_load4(gain_e, f4), scale_e)
+                 : float4(NAN);
+        const float4 held = (args.post != 0u) ? norm_rows_load4(yh, f4) : norm_rows_load4(hid, f4);
+        const float4 value_h =
+            ok_h ? norm_rows_value(held, norm_rows_load4(gain_h, f4), scale_h) : float4(NAN);
+        bad = bad || !all(isfinite(value_e)) || !all(isfinite(value_h));
+        *((device float4 *)(ye + f4 * 4u)) = value_e;
+        *((device float4 *)(yh + f4 * 4u)) = value_h;
+    }
+    if (bad) {
+        norm_rows_raise(faults, args.layer);
+    }
+}

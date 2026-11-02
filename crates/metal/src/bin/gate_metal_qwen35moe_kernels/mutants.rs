@@ -2042,6 +2042,48 @@ pub const MUTANTS: &[Mutant] = &[
         )],
     },
     Mutant {
+        name: "mtp_join_skips_output_norm",
+        clause: "mtp_join",
+        why: "the draft's join writes the raw hidden row where the post-norm row belongs, so a draft fed the target's output-norm row joins the row before that norm",
+        edits: &[(
+            "const float4 held = (args.post != 0u) ? norm_rows_load4(yh, f4) : norm_rows_load4(hid, f4);",
+            "const float4 held = norm_rows_load4(hid, f4);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mtp_join_swaps_halves",
+        clause: "mtp_join",
+        why: "the join lays the hidden half first and the embedding half second, the fusion projection's columns the other way round",
+        edits: &[(
+            "device float *ye = y;\n    device float *yh = y + args.cols;",
+            "device float *ye = y + args.cols;\n    device float *yh = y;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mtp_join_swaps_gains",
+        clause: "mtp_join",
+        why: "the embedding half takes the hidden half's gain (pre_fc_norm_hidden) and the hidden half the embedding's",
+        edits: &[
+            (
+                "norm_rows_load4(gain_e, f4)",
+                "norm_rows_load4(gain_z, f4)",
+                1,
+            ),
+            (
+                "norm_rows_load4(gain_h, f4)",
+                "norm_rows_load4(gain_e, f4)",
+                1,
+            ),
+            (
+                "norm_rows_load4(gain_z, f4)",
+                "norm_rows_load4(gain_h, f4)",
+                1,
+            ),
+        ],
+    },
+    Mutant {
         name: "rows_norm_tail_dropped",
         clause: "norm_rows",
         why: "the threads write only the whole tiles of the router's thread count, so a row of a \

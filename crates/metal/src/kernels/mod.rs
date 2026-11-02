@@ -100,6 +100,7 @@ pub use matvec_rows::{
     HeadMParams, MROWS, MatvecMParams, NormNextMParams, PairMParams, SegMParams,
 };
 pub use norm::NormRowsParams;
+pub use norm::{HiddenRow, MtpJoinParams};
 pub use norm::{NormAddNextParams, NormAddRowsParams, NormNextParams};
 pub use routed::{
     CombineParams, F32GemmParams, HeadNormRowsParams, LOGIT_STRIDE, ROUTE_TILE, ROUTED_ROWS,
@@ -217,6 +218,9 @@ pub struct Kernels {
     norm_rows: Pipeline,
     /// The sandwich residual: the norm of rows added into the stream.
     norm_add_rows: Pipeline,
+    /// The MTP draft's input join: the token's embedding row and the hidden
+    /// row, each normed by its own gain, side by side.
+    mtp_join: Pipeline,
     /// An attention layer's q, k and v biases added to the P1 output's rows.
     bias_rows: Pipeline,
     /// The short conv: the step, a chunk's rows and the ring commit.
@@ -539,6 +543,7 @@ impl Kernels {
             router: library.pipeline("router35")?,
             norm_rows: library.pipeline("norm_rows")?,
             norm_add_rows: library.pipeline("norm_add_rows")?,
+            mtp_join: library.pipeline("mtp_join")?,
             bias_rows: library.pipeline("bias_rows")?,
             shortconv: shortconv::Pipelines::new(library)?,
             routed: routed::RoutedPipelines::new(library)?,

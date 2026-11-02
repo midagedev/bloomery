@@ -151,6 +151,10 @@ bloomery-model = { path = "../model" }
 # The model file a session opens, a GGUF split or a checkpoint folder behind one
 # owner (`ModelFile`, `Weights`): this crate parses no checkpoint of its own.
 bloomery-model-hf = { path = "../model-hf" }
+# The MTP sidecar's tensors (`arch/qwen3moe/session/mtp.rs`): the draft layer's
+# MLX folder holds no model file this crate's session opens through
+# `bloomery-model-hf`.
+bloomery-safetensors = { path = "../safetensors" }
 # `--hf REPO`: the hub's fetch into the cache, and the rule that a model is named once (`model_arg`).
 bloomery-hf = { path = "../hf" }
 # Where the fixture file sits (the one owner of the fixture root and layout),

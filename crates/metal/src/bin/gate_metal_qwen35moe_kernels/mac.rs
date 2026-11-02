@@ -83,6 +83,8 @@ mod clauses_head;
 mod clauses_matvec;
 #[path = "clauses_mrows.rs"]
 mod clauses_mrows;
+#[path = "clauses_mtp.rs"]
+mod clauses_mtp;
 #[path = "clauses_norm.rs"]
 mod clauses_norm;
 #[path = "clauses_q5k.rs"]
@@ -1166,6 +1168,7 @@ fn clause_table<'a>(
                 Box::new(|| clauses_f32::f32_seg(ctx.harness)) as ClauseRun,
             )))
             .chain(clauses_mrows::table(ctx.harness))
+            .chain(clauses_mtp::table(ctx.harness))
             .chain(clauses_sites::table(ctx.harness))
             .chain(clauses_gemm::table(ctx.harness, ctx.fixture, mlx))
             .chain(clauses_requant::gemm_table(ctx.harness, mlx))

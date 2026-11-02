@@ -224,6 +224,7 @@ impl Table<'_> {
 
 /// A weight matrix the loader copies into a buffer of its own: `rows` rows of
 /// `cols` values in the mat-vec type `quant`.
+#[derive(Clone)]
 pub(super) struct Site {
     pub(super) name: String,
     pub(super) cols: usize,
@@ -242,6 +243,7 @@ impl Site {
 
 /// A tensor the loader reads as `len` f32 values: F32 as it is, MLX's affine
 /// 8-bit dequantized at open.
+#[derive(Clone)]
 pub(super) struct Values {
     pub(super) name: String,
     pub(super) len: usize,
@@ -259,6 +261,7 @@ impl Values {
 }
 
 /// One dispatch of a layer's P1: the sites of one weight type, in one buffer.
+#[derive(Clone)]
 pub(super) struct Dispatch {
     pub(super) quant: Quant,
     /// The P1's sites it holds, by place in [`P1Layout::sites`].
@@ -269,6 +272,7 @@ pub(super) struct Dispatch {
 
 /// A layer's P1: the norm its load applies, and its sites in the order their
 /// outputs sit, grouped into one dispatch per weight type.
+#[derive(Clone)]
 pub(super) struct P1Layout {
     pub(super) norm: Values,
     pub(super) sites: Vec<Site>,
@@ -297,6 +301,7 @@ pub(super) struct DeltaLayout {
     pub(super) ring: usize,
 }
 
+#[derive(Clone)]
 pub(super) struct AttnLayout {
     pub(super) p1: P1Layout,
     pub(super) out: Site,
@@ -359,6 +364,7 @@ pub(super) struct RopeLayout {
 /// A layer's FFN half: the router's values and the experts' sites, the
 /// shared expert's apart from the routed stacks. A dense layer has no router:
 /// its three matrices are the one expert of the sites, picked every token.
+#[derive(Clone)]
 pub(super) struct FfnLayout {
     pub(super) norm: Values,
     /// The router's weight; none for a dense FFN.
@@ -375,6 +381,7 @@ pub(super) struct FfnLayout {
 /// A shared expert: its router row and its three sites, each of its own type
 /// (its stack's, or a pair of [`crate::kernels::APART_GATE_UP`] or
 /// [`crate::kernels::APART_DOWN`]).
+#[derive(Clone)]
 pub(super) struct SharedLayout {
     pub(super) gate_inp: Values,
     pub(super) gate: Site,
