@@ -119,7 +119,7 @@ use gguf::Split;
 use gguf::quant::GgmlType;
 use model::arch::mistrallarge4::host;
 use model::arch::mistrallarge4::hparams::Hparams;
-use model::arch::mistrallarge4::place::{PROMPT_ROWS, PlanInputs};
+use model::arch::mistrallarge4::place::{IDX_CHUNK, IDX_STEP_ROWS, PROMPT_ROWS, PlanInputs};
 use model::arch::mistrallarge4::sites::SelUp;
 use model::arch::names;
 use model::embed::EmbedTable;
@@ -434,6 +434,14 @@ impl LayerStore {
             .as_ref()
             .map_or(0, |i| i.list.num_bytes() + i.scratch.device_bytes())
     }
+
+    /// The indexer's scores over the context, a full layer's own: the part of the scratch the plan
+    /// counts by position.
+    fn scores_bytes(&self) -> usize {
+        self.idx
+            .as_ref()
+            .map_or(0, |i| i.scratch.scores.num_bytes())
+    }
 }
 
 /// The per-layer staging a gate's taps read, one a layer, and the router the
@@ -626,7 +634,7 @@ impl Body {
                         Some(IdxStore {
                             keys: DeviceTensor::zeroed(stream, ctx, sh.idx_d)?,
                             list: DeviceBuffer::zeroed(stream, sh.top_k)?,
-                            scratch: IndexerScratch::new(stream, 1, ctx)?,
+                            scratch: IndexerScratch::new(stream, IDX_STEP_ROWS, ctx)?,
                         })
                     } else {
                         None
@@ -771,6 +779,7 @@ impl Body {
             prompt_reserve,
             sh,
         };
+        refuse_scores_apart(plan, card, body.index_scores_bytes())?;
         refuse_scratch_past(
             WHAT,
             plan,
@@ -786,7 +795,8 @@ impl Body {
 
     /// The step's device buffers beside the stores and the weights, and the
     /// prompt batch's index scores (sized by the context, not the prompt
-    /// reserve's rows): what the plan's scratch term holds the load to.
+    /// reserve's rows): what the plan's scratch term and its position rows
+    /// hold the load to.
     #[must_use]
     pub fn scratch_bytes(&self) -> usize {
         self.s.bytes()
@@ -803,6 +813,20 @@ impl Body {
             + self.slots.buf().num_bytes()
             + self.prefill.scratch_bytes()
             + self.pass_rows.bytes()
+    }
+
+    /// The indexer's scores over the context, the step's row of each full
+    /// layer and the prompt batch's [`IDX_CHUNK`] rows: the part of
+    /// [`Body::scratch_bytes`] that grows with the context, which the plan
+    /// counts by position (`place::index_scores_row_bytes`) and the load
+    /// holds equal to it.
+    #[must_use]
+    pub fn index_scores_bytes(&self) -> usize {
+        self.stores
+            .iter()
+            .map(LayerStore::scores_bytes)
+            .sum::<usize>()
+            + self.prefill.index_scores_bytes()
     }
 
     /// The K/V planes the stores hold: the plan's K/V term.
@@ -833,6 +857,32 @@ impl Body {
     pub fn hybrid(&self) -> &Hybrid<HostRun> {
         self.shell.hybrid()
     }
+}
+
+/// Refused by name, as the body's, when the indexer's scores the load made, `made` device bytes,
+/// are not the bytes card `card` of `plan` counts by position for them
+/// (`CardTotals::stage_rows_bytes`, `place::index_scores_bytes` at the plan's context): the
+/// plan's flat scratch term holds none of them, so a buffer that grows with the context and is
+/// not in the formula, or a formula that is not the buffers, ends the load here instead of at a
+/// context the flat term happens to pass.
+fn refuse_scores_apart(plan: &Plan<'_>, card: usize, made: usize) -> Result<(), GpuError> {
+    let counted = plan
+        .cards
+        .get(card)
+        .map(|c| c.stage_rows_bytes)
+        .ok_or_else(|| GpuError::shape(WHAT, format!("the plan totals no card {card}")))?;
+    if made as u64 != counted {
+        return Err(GpuError::shape(
+            WHAT,
+            format!(
+                "the load's indexer scores hold {made} device bytes (an f32 over the context, \
+                 {IDX_STEP_ROWS} row on each full layer's step scratch and {IDX_CHUNK} on the \
+                 prompt batch's); card {card}'s plan counts {counted} for the stage's position \
+                 rows (`place::index_scores_row_bytes` a position)"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 impl Shape {

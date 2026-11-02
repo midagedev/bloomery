@@ -470,6 +470,17 @@ impl<H> PlanInputs<H> {
         }
     }
 
+    /// `self` for a body whose scratch holds `row` bytes a position of the context
+    /// ([`KvLayout::with_position_scratch`]): the plan counts them at the context it is fitted to,
+    /// beside the machine's flat scratch term.
+    #[must_use]
+    pub fn with_position_scratch(self, row: u64) -> PlanInputs<H> {
+        PlanInputs {
+            kv: self.kv.with_position_scratch(row),
+            ..self
+        }
+    }
+
     /// The card bytes the load of `machine` makes beside the plan's terms: the prompt batch's, and
     /// a tiered load's more. A machine that names an expert tier card where the body serves none
     /// is refused by name ([`PlaceError::Tier`]); a reserve-only member is no tier card.
@@ -670,6 +681,10 @@ pub struct KvLayout {
     /// row beside each index key, to a plane of the widest selector's key nothing reads and every
     /// selecting layer shares; 0 for a trunk that selects nothing.
     sink_row: u64,
+    /// The bytes a position of the context adds to the stage's scratch, beside the rows above: a
+    /// body's scratch sized by the context, one copy whatever the resident sequences
+    /// ([`KvLayout::with_position_scratch`]); 0 for a body whose scratch holds none.
+    scratch_row: u64,
     /// The lanes of a delta-rule layer's state.
     lanes: NonZeroUsize,
 }
@@ -745,6 +760,7 @@ impl KvLayout {
                 .map(|&(_, dims)| u64::from(dims) * stores::F32_BYTES)
                 .sum(),
             sink_row,
+            scratch_row: 0,
             lanes: NonZeroUsize::MIN,
         })
     }
@@ -753,6 +769,21 @@ impl KvLayout {
     #[must_use]
     pub fn with_rows(self, rows: Rows) -> KvLayout {
         KvLayout { rows, ..self }
+    }
+
+    /// The same layout with `row` bytes a position of the context in the stage's scratch: the
+    /// body's buffers that grow with the context (the indexer's scores rows), which the plan's
+    /// flat scratch term cannot hold at the context the plan is fitted to. The plan counts them
+    /// with the stage's position rows ([`KvBytes::stage_position_bytes`]): on the card that runs
+    /// layer 0, at the plan's context, one copy shared by every resident sequence, as the body makes
+    /// them. The family that makes the buffers owns the formula of `row`, and its body holds its
+    /// allocation to the same figure.
+    #[must_use]
+    pub fn with_position_scratch(self, row: u64) -> KvLayout {
+        KvLayout {
+            scratch_row: row,
+            ..self
+        }
     }
 
     /// The same layout with each delta-rule layer's state `lanes` lanes: a load that verifies
@@ -874,7 +905,7 @@ impl KvBytes for KvLayout {
     }
 
     fn stage_position_bytes(&self, ctx_max: u64) -> u64 {
-        (self.rope_row + self.sink_row) * ctx_max
+        (self.rope_row + self.sink_row + self.scratch_row) * ctx_max
     }
 }
 
@@ -1063,6 +1094,26 @@ mod tests {
         assert_eq!(rope([1e7, 1e7, 1e7]), 4 * 4 * 10);
         assert_eq!(rope([0.0, 0.0, 0.0]), 0);
         assert_eq!(rope([0.0, 1e7, 0.0]), 4 * 4 * 10);
+    }
+
+    /// A body's scratch sized by the context is `row` bytes a position beside the stage's rows,
+    /// counted once whatever the resident sequences (the body makes one copy): 7 B a position
+    /// beside one rope table of 4 f32 values (16 B) is 23 × 10 = 230 B at 10 positions, and the
+    /// same 230 B under three slots. The cache is the layout's own whatever the scratch. Mutant:
+    /// the row left out of the stage's bytes reads 160, counted per slot reads 370.
+    #[test]
+    fn a_position_scratch_is_one_copy_beside_the_stage_rows() {
+        let mixers = [gqa(1, (16, 8), None, Some((1e7, 4)))];
+        let plain = KvLayout::of(&mixers).expect("GQA layers are sized");
+        assert_eq!(plain.stage_position_bytes(10), 16 * 10);
+        let kv = plain.clone().with_position_scratch(7);
+        assert_eq!(kv.stage_position_bytes(10), (16 + 7) * 10);
+        assert_eq!(
+            kv.seq_terms().slots_of(3).stage_position_bytes(10),
+            (16 + 7) * 10
+        );
+        assert_eq!(kv.layer_bytes(0, 10), plain.layer_bytes(0, 10));
+        assert_eq!(kv.layer_bytes(0, 10), 10 * (16 + 8) * 2);
     }
 
     /// A layer that selects blocks keeps one f16 index key of the selector's `d` values for every

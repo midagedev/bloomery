@@ -810,6 +810,21 @@ const MIX_TENSORS: &str = include_str!("mistrallarge4_mix256_tensors.tsv");
 const PLAN_CTX: u64 = 4096;
 const KV_PER_POSITION: u64 = 82_688;
 
+/// The bytes of indexer scores a position of the context takes on the stage card, which the plan
+/// counts beside the machine's flat scratch term (the stage's position rows). The body makes a
+/// scores scratch of one f32 a row over the context on each of the 44 full indexer layers (one
+/// row, the step's) and one for the prompt batch (16 rows, an indexer launch's): (44 + 16) × 4 =
+/// 240 B. The load's whole scratch the box measured at the unset context of 360,448 positions on
+/// the A6000 is 103,160,160 B: 86,507,520 B of scores and 16,652,640 B that do not grow with the
+/// context, 50,456,224 B under the flat term's 67,108,864 B.
+///
+/// PIN(2026-11-02): the stage's position rows a plan of this header counts were 0 (the plan held
+/// no scratch that grows with the context, and the load of the unset context was refused: 103,160,160
+/// B of scratch against 67,108,864 B); they are the scores' bytes, [`SCORES_PER_POSITION`] a
+/// position [derived above]. FAIL-first: `describe` without `with_position_scratch` counts 0 rows,
+/// and `mistrallarge4_context_scratch` and every plan pin are red.
+const SCORES_PER_POSITION: u64 = 240;
+
 /// The types of the experts' stacks the common card leg runs: every stack of both files is one.
 const LEG_TYPES: [GgmlType; 4] = [
     GgmlType::IQ1_S,
@@ -834,7 +849,8 @@ const DGB: u64 = 100_000_000;
 
 /// One card of a plan against the terms the header derives. The card's terms are its dense bytes
 /// (everything but the routed stacks, the token embedding and the rope factors, which the plan
-/// keeps on the host), its cache, the machine's context and scratch; its allocator rounding is the
+/// keeps on the host), its cache, the machine's context and scratch, and on the stage the position
+/// rows the plan counts beside them (the indexer's scores); its allocator rounding is the
 /// allocator model over the device buffers `uploads` of its segments in the loader's order
 /// (`allocator_bytes`: a buffer of a granule or more takes whole granules, smaller ones share
 /// them); the load makes `reserve` bytes more on every card, the prompt batch's buffers and on a
@@ -847,7 +863,7 @@ fn card_terms_of(
     label: &str,
     card: &model::placement::CardTotals,
     spec: &model::placement::workstation::CardSpec,
-    (dense, kv, reserve): (u64, u64, u64),
+    (dense, kv, rows, reserve): (u64, u64, u64, u64),
     uploads: &[u64],
     expert_max: u64,
     bad: &mut Vec<String>,
@@ -863,11 +879,11 @@ fn card_terms_of(
         card.context_bytes,
         card.scratch_bytes,
         card.rounding_bytes,
-    ) != (dense, kv, 0, CONTEXT, SCRATCH, rounding)
+    ) != (dense, kv, rows, CONTEXT, SCRATCH, rounding)
     {
         bad.push(format!(
             "{label}: dense {} kv {} stage rows {} context {} scratch {} rounding {}, derived \
-             {dense} {kv} 0 {CONTEXT} {SCRATCH} {rounding}",
+             {dense} {kv} {rows} {CONTEXT} {SCRATCH} {rounding}",
             card.dense_bytes,
             card.kv_bytes,
             card.stage_rows_bytes,
@@ -988,6 +1004,7 @@ fn plan_pins(tag: &str, kv: &str, tensors: &str, want: &PlanWant) -> Vec<String>
         ));
     }
     let kv = KV_PER_POSITION * PLAN_CTX;
+    let scores = SCORES_PER_POSITION * PLAN_CTX;
     let levers = PlanLevers::default();
 
     // The gate plan and plan (b′), each card against the derived terms.
@@ -1103,9 +1120,9 @@ fn plan_pins(tag: &str, kv: &str, tensors: &str, want: &PlanWant) -> Vec<String>
                 })
                 .collect();
             let derived = if c == 0 {
-                (dense, kv, reserve)
+                (dense, kv, scores, reserve)
             } else {
-                (0, 0, reserve)
+                (0, 0, 0, reserve)
             };
             left.push(card_terms_of(
                 &format!("{tag} {label} card {c}"),
@@ -1584,6 +1601,96 @@ fn mistrallarge4_residency_plan_ud_iq1_s() {
 #[test]
 fn mistrallarge4_residency_plan_mix256() {
     let bad = residency_pins("mix-resid", MIX_KV, MIX_TENSORS, 33);
+    assert!(
+        bad.is_empty(),
+        "{} pin(s) differ:\n  {}",
+        bad.len(),
+        bad.join("\n  ")
+    );
+}
+
+/// The plan's scratch beside the context. The machine's scratch term is flat (67,108,864 B); the
+/// body's scratch is that flat part and the indexer's scores over the context, which the plan
+/// counts at its context with the stage's position rows: [`SCORES_PER_POSITION`] bytes a position,
+/// one copy whatever the slots. Derived on paper from the header: 44 full indexer layers each
+/// making a one-row scratch and the prompt batch a 16-row one, an f32 a score, (44 + 16) × 4 = 240 B
+/// a position, so 983,040 B at 4,096 positions, 62,914,560 B at 262,144 and 86,507,520 B at
+/// 360,448. The body's whole scratch is the scores and a part that does not grow with the
+/// context: the box measured 103,160,160 B at 360,448 (the refusal of the unset context on the
+/// A6000), so that part is 16,652,640 B, and the flat term holds it with 50,456,224 B
+/// to spare. At 4,096 positions the scores are 983,040 B and the whole scratch 17,635,680 B (the
+/// serve gate's server of that context prints it in its `load` record, `scratch_bytes`, the same
+/// 16,652,640 B beside the scores), inside the flat term alone, which is why the gates that load
+/// at small contexts passed; at 262,144 and past, the whole scratch (79,567,200 B [derived] and
+/// more) passes the flat term and only the counted scores hold it. The plan on the A6000 at 262,144 counts the rows and leaves
+/// the machine's scratch at the flat term. Mutant: `describe` without the position scratch counts
+/// 0 rows; a formula that counts the step's scores once, not on each full layer, reads 4 × (1 +
+/// 16) = 68 B a position.
+#[test]
+fn mistrallarge4_context_scratch() {
+    use model::arch::mistrallarge4::place::{
+        PlanInputs, index_scores_bytes, index_scores_row_bytes,
+    };
+    use model::placement::workstation::{self, HostRead, SCRATCH};
+    use model::placement::{KvBytes, PlanLevers};
+
+    // The whole scratch at the unset context, the box's measure.
+    const MEASURED: (u64, u64) = (360_448, 103_160_160);
+    let mut bad = Vec::new();
+    let split = header_of("ctx-scratch", KV, TENSORS);
+    let mut inputs = PlanInputs::describe(&split).unwrap_or_else(|e| panic!("describe: {e}"));
+    inputs.room = (workstation::PLAN_ROOM, HostRead::Given);
+
+    let full_layers = (0..72).filter(|&l| full(l)).count() as u64;
+    let row = index_scores_row_bytes(&inputs.hp);
+    if full_layers != 44 || row != 4 * (full_layers + 16) || row != SCORES_PER_POSITION {
+        bad.push(format!(
+            "{full_layers} full layers, the formula's {row} B a position, derived (44 + 16) × 4 = \
+             {SCORES_PER_POSITION} B"
+        ));
+    }
+    let fixed = MEASURED.1 - SCORES_PER_POSITION * MEASURED.0;
+    if fixed != 16_652_640 || fixed > SCRATCH {
+        bad.push(format!(
+            "the body's part that does not grow with the context is {fixed} B (wanted 16,652,640 B \
+             inside the flat term's {SCRATCH} B)"
+        ));
+    }
+    for (ctx, scores, whole) in [
+        (4096, 983_040, 17_635_680),
+        (262_144, 62_914_560, 79_567_200),
+        (360_448, 86_507_520, 103_160_160),
+    ] {
+        let rows = inputs.kv.stage_position_bytes(ctx);
+        let three = inputs.seq_terms().slots_of(3).stage_position_bytes(ctx);
+        let term = SCRATCH + rows;
+        // The flat term alone holds the whole scratch at 4,096 and not past it; the term with the
+        // counted scores holds it at every context.
+        let flat_holds = whole <= SCRATCH;
+        if (index_scores_bytes(&inputs.hp, ctx), rows, three) != (scores, scores, scores)
+            || fixed + scores != whole
+            || whole > term
+            || flat_holds != (ctx == 4096)
+        {
+            bad.push(format!(
+                "ctx {ctx}: formula {} B, rows {rows} B, rows under three slots {three} B, derived \
+                 {scores} B; the whole scratch {whole} B against the term {term} B (the flat term \
+                 holds it: {flat_holds})",
+                index_scores_bytes(&inputs.hp, ctx)
+            ));
+        }
+    }
+    let machine = workstation::plan_a(72);
+    let plan = inputs
+        .plan(&machine, 262_144, &PlanLevers::default())
+        .unwrap_or_else(|e| panic!("plan a at 262,144: {e}"));
+    let card = &plan.cards[0];
+    if (card.stage_rows_bytes, card.scratch_bytes) != (62_914_560, SCRATCH) {
+        bad.push(format!(
+            "plan a at 262,144: rows {} B and scratch {} B, derived 62,914,560 B and {SCRATCH} B",
+            card.stage_rows_bytes, card.scratch_bytes
+        ));
+    }
     assert!(
         bad.is_empty(),
         "{} pin(s) differ:\n  {}",

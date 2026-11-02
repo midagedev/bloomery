@@ -380,6 +380,13 @@ impl Prefill {
         self.scratch.device_bytes()
     }
 
+    /// The device bytes of the indexer's scores in [`Prefill::scratch_bytes`]: [`IDX_CHUNK`] rows
+    /// over the context, the part the plan counts by position.
+    #[must_use]
+    pub fn index_scores_bytes(&self) -> usize {
+        self.scratch.scores.num_bytes()
+    }
+
     /// The device bytes of the gate's selection taps, when armed.
     #[must_use]
     pub fn tap_bytes(&self) -> usize {

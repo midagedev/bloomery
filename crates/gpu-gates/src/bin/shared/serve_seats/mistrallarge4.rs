@@ -102,10 +102,10 @@
 //! `--mmproj`, under `mid` the `residency host` record of the churn pool, the `need` record, the
 //! `parallel` line (`rule=slots slots=N slot_ctx=C total=N*C from=<word> pass=one` for one slot
 //! and `pass=turns` for several); then the `xstream=` line (the word, then why), the `load` record
-//! (architecture, resident bytes, a slot's context, the slots, layers, the routed experts the plan
-//! keeps on the host and on the card, the step graph's nodes, how a prompt is fed, the batches a
-//! prompt group runs and the load's wall), the `nvtier` record (on a load whose plan paged routed
-//! experts), the `vision` record under `--mmproj` and, once the port is
+//! (architecture, resident bytes, the body's scratch, a slot's context, the slots, layers, the
+//! routed experts the plan keeps on the host and on the card, the step graph's nodes, how a prompt
+//! is fed, the batches a prompt group runs and the load's wall), the `nvtier` record (on a load
+//! whose plan paged routed experts), the `vision` record under `--mmproj` and, once the port is
 //! bound, the `listening` record (`record::BLOOMERY_SERVE_MISTRALLARGE4`). `--plan` ends the
 //! process after the `parallel` line, nothing loaded. An engine error ends the process with the
 //! crash block and exit code 70, as every seat's.
@@ -408,6 +408,7 @@ impl MistralLarge4 {
         Record::new(&record::LOAD_MISTRALLARGE4)
             .w("arch", <Body as ChainBody>::arch().name())
             .u("resident_bytes", s.model().resident_bytes())
+            .u("scratch_bytes", s.model().body(NAME)?.scratch_bytes())
             .u("ctx", a.ctx)
             .u("slots", a.slots.get())
             .u("layers", s.model().layers().len())

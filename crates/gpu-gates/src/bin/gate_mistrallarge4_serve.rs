@@ -80,6 +80,21 @@
 //!   one, over the same inputs (the prompt group's reserve and the ring's). FAIL-first: a run that
 //!   plans the ring on inputs priced for another prompt group than the open's prints a plan the
 //!   load does not hold, and the clause is red.
+//! - `default_ctx_loads`: one more server as a user starts it, `--port 0` and no `--ctx`: the
+//!   context its one `ctx` line names is the context the load makes, its `load` and `listening`
+//!   records name it, and the body's scratch the `load` record prints (`scratch_bytes`) is the
+//!   indexer's scores over that context ([`place::index_scores_bytes`]) and a part that does not
+//!   grow with the context: the part, the scratch less the scores, is the one the server of
+//!   [`CTX`] positions printed above (every byte the body makes by position is in the plan's
+//!   formula, on any card and in both tiers) and within the plan's flat scratch term
+//!   ([`workstation::SCRATCH`]). The unset context is the largest the card holds: on the A6000 the
+//!   scores ([`place::index_scores_row_bytes`] a position) pass the flat term's slack at a context
+//!   the card holds. FAIL-first: a plan that counts the scratch at the flat term alone fits that
+//!   context, the load refuses by name (`the load's scratch holds … device bytes`) and the server
+//!   never listens, so the clause is red on the A6000 in the real tier (a card whose unset context
+//!   stays under the slack, the fixture tier's budget, holds the load there either way); a body
+//!   buffer that grows with the context and is not in the formula moves the part, and the clause
+//!   is red on any card.
 //!
 //! One server of two slots (`--parallel 2`, `--ctx` 2·[`CTX`], `--slot-save-path <dir>/save`),
 //! with `BLOOMERY_RESIDENCY=off`: the residency machine moves experts between the tiers by the
@@ -154,6 +169,7 @@ mod gate {
     use std::process::ExitStatus;
     use std::time::Duration;
 
+    use bloomery_gpu_gates::ctx_ladder::{ctx_line, field};
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::serve_client::{
         SeatGate, Served, base64, chatted, check, curl, greedy, no_residency_host,
@@ -163,7 +179,8 @@ mod gate {
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, gpu_census, ref_model_path};
     use gguf::Split;
-    use model::arch::mistrallarge4::place::PlanInputs;
+    use model::arch::mistrallarge4::place::{self, PlanInputs};
+    use model::placement::workstation;
     use serde_json::{Value, json};
 
     use crate::serve_gate;
@@ -598,6 +615,62 @@ mod gate {
         Ok(ok)
     }
 
+    /// `default_ctx_loads` (the module header): the seat as a user starts it, no `--ctx`.
+    fn default_ctx_loads(c: &serve_gate::Clauses, dir: &Path) -> Result<bool, GateError> {
+        let mut ok = true;
+        let d = dir.join("default-ctx");
+        std::fs::create_dir_all(&d)?;
+        let file = ref_model_path()?;
+        let (cmd, mut all) = seat(c).command(&file)?;
+        all.extend(["--port", "0"].iter().map(|a| (*a).to_owned()));
+        let all: Vec<&str> = all.iter().map(String::as_str).collect();
+        let mut s = Served::spawn_cmd(cmd, &all, &d)?;
+        let err_log = d.join("server.err");
+        if let Err(e) = s.address(&err_log, LISTEN_POLLS, Duration::from_secs(1)) {
+            println!("default-ctx: the server never listened: {e}");
+            check(&mut ok, "default_ctx_loads", false);
+            return Ok(ok);
+        }
+        let text = std::fs::read_to_string(&err_log)
+            .map_err(|e| format!("read {}: {e}", err_log.display()))?;
+        let records = server_log(&err_log, c.kinds)?;
+        let load = records.one(c.load)?;
+        let listen = records.one(c.listening)?;
+        let named = ctx_line(&text).and_then(|l| field(l, "ctx"));
+        let made = load.u64("scratch_bytes")?;
+        // The part of a load's scratch that does not grow with the context: the scratch less the
+        // scores the plan counts by position.
+        let split = Split::open(&file).map_err(|e| format!("open {}: {e}", file.display()))?;
+        let hp = PlanInputs::describe(&split)?.hp;
+        let part = |ctx: u64, made: u64| made.checked_sub(place::index_scores_bytes(&hp, ctx));
+        let first = server_log(&dir.join("serve").join("server.err"), c.kinds)?;
+        let first = first.one(c.load)?;
+        let (first_ctx, first_made) = (first.u64("ctx")?, first.u64("scratch_bytes")?);
+        let (rest, first_rest) = (
+            named.and_then(|ctx| part(ctx, made)),
+            part(first_ctx, first_made),
+        );
+        let stopped = s.stop()?;
+        println!(
+            "default-ctx: ctx line {:?}; load record {:?}; listening record {:?}; the load's \
+             scratch {made} B at {named:?} positions, its part that does not grow with the \
+             context {rest:?} B, the server of {first_ctx} positions' {first_rest:?} B ({first_made} \
+             B), the flat term {} B; {stopped}",
+            ctx_line(&text),
+            load.line(),
+            listen.line(),
+            workstation::SCRATCH
+        );
+        let held = named.is_some()
+            && named == Some(load.u64("ctx")?)
+            && named == Some(listen.u64("ctx")?)
+            && rest.is_some()
+            && rest == first_rest
+            && rest.is_some_and(|r| r <= workstation::SCRATCH);
+        check(&mut ok, "default_ctx_loads", held);
+        Ok(ok)
+    }
+
     /// `xstream_line_follows_the_rule` (the module header), on the stderr of the server
     /// [`serve_gate::served_with`] ran in `<dir>/serve`.
     fn xstream_line_follows_the_rule(
@@ -1026,8 +1099,8 @@ mod gate {
              honours BLOOMERY_RESIDENCY (a set word as given, the serving word resolved by the \
              plan unset, off on gate) and BLOOMERY_XSTREAM (the ring planned out of the expert \
              budget, the word resolved by the common rule at the open), holds --mmproj to its \
-             file before the plan, loads at the context it was asked for and the prompt group \
-             the lever names, answers a chat turn with its reasoning split at the file's tags, \
+             file before the plan, loads at the context it was asked for and, with none asked, \
+             at the context the plan fitted, and at the prompt group the lever names, answers a chat turn with its reasoning split at the file's tags, \
              keeps each slot's rows apart, restores a slot file bit for bit, parses a tool call \
              by the file's template and serves an image request"
         );
@@ -1048,6 +1121,7 @@ mod gate {
         ok &= serve_gate::served_with(&c, &dir, ASK)?;
         ok &= xstream_line_follows_the_rule(&c, &dir)?;
         ok &= load_holds_the_plan(&c, &dir)?;
+        ok &= default_ctx_loads(&c, &dir)?;
         ok &= two_slot_clauses(&c, &dir, mmproj.as_deref())?;
         finish(ok)
     }

@@ -2183,10 +2183,11 @@ pub static LISTENING_MUSESPARK: Kind = Kind {
 pub static LOAD_MISTRALLARGE4: Kind = Kind {
     name: "load_mistrallarge4",
     head: "load",
-    doc: "The Mistral Large 4 seat's model on its card: its architecture, resident bytes, the cache rows each slot was loaded with (`ctx`), the resident sequences it holds (`slots`), layers, the routed experts the plan keeps on the host and on the card, the step graph's nodes, how a prompt is fed (`prompt`: `batch`, in batches of rows through the common walk), the batches a prompt group runs layer by layer (`group`: `BLOOMERY_PREFILL_GROUP`, the row's default when unset), `BLOOMERY_PIN_MAIN`'s ask (`pin_main`) and whether the engine thread's pin took (`pinned`), and the load's wall.",
+    doc: "The Mistral Large 4 seat's model on its card: its architecture, resident bytes, the body's scratch among them (`scratch_bytes`: the step's buffers, the prompt batch's index scores and the rest, within the plan's scratch term and its position scratch), the cache rows each slot was loaded with (`ctx`), the resident sequences it holds (`slots`), layers, the routed experts the plan keeps on the host and on the card, the step graph's nodes, how a prompt is fed (`prompt`: `batch`, in batches of rows through the common walk), the batches a prompt group runs layer by layer (`group`: `BLOOMERY_PREFILL_GROUP`, the row's default when unset), `BLOOMERY_PIN_MAIN`'s ask (`pin_main`) and whether the engine thread's pin took (`pinned`), and the load's wall.",
     parts: &[
         key("arch", Word, ""),
         key("resident_bytes", U64, "B"),
+        key("scratch_bytes", U64, "B"),
         key("ctx", U64, "positions"),
         key("slots", U64, ""),
         key("layers", U64, ""),

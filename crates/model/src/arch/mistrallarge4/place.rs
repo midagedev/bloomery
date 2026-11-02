@@ -13,6 +13,12 @@
 //! The prompt batch's card buffers are the plan's prompt reserve ([`prompt_reserve_bytes`] at
 //! [`PROMPT_ROWS`] rows, a group's units, records and lists by [`configure_group`]), kept out of
 //! the expert budget; the tier's places of a block of [`PROMPT_ROWS`] rows are its reserve.
+//!
+//! The body's scratch is a flat term of the machine and the indexer's scores over the context: a
+//! row of scores a position on the step's scratch of each full layer and on the prompt batch's
+//! one ([`index_scores_row_bytes`]). The plan counts those at the context it is fitted to, with
+//! the stage's position rows ([`PlanInputs::with_position_scratch`]), so a context the card holds
+//! its scores beside the other terms is the one the plan serves.
 
 use gguf::Split;
 use models::{Ffn, ModelSpec};
@@ -51,8 +57,34 @@ pub const ATTN_ROWS: usize = 8;
 
 /// Rows one indexer launch of the prompt batch scores. Their index queries and head weights are
 /// read a token per column, the score pass's layout, so the reserve holds this many rows of each
-/// in that layout; their scores over the context are the scratch term's.
+/// in that layout; their scores over the context are the plan's position scratch
+/// ([`index_scores_row_bytes`]).
 pub const IDX_CHUNK: usize = 16;
+
+/// Rows the step's indexer scores a launch: one token's scores over the context, on each full
+/// layer's own scratch.
+pub const IDX_STEP_ROWS: usize = 1;
+
+/// Bytes of one score, an f32.
+const SCORE_BYTES: u64 = 4;
+
+/// The bytes of indexer scores a position of the context takes on the card: one score a row of
+/// each scores scratch the body makes over the context, [`IDX_STEP_ROWS`] rows on each full layer
+/// (the step's) and [`IDX_CHUNK`] rows on the prompt batch's one. The plan counts them at its
+/// context ([`PlanInputs::with_position_scratch`]), one copy whatever the slots; the body holds
+/// its scores buffers equal to them at its load.
+#[must_use]
+pub fn index_scores_row_bytes(hp: &Hparams) -> u64 {
+    let full = hp.indexer_full.iter().filter(|&&f| f).count() as u64;
+    SCORE_BYTES * (IDX_STEP_ROWS as u64 * full + IDX_CHUNK as u64)
+}
+
+/// [`index_scores_row_bytes`] over `ctx` positions: what the plan counts for the indexer's scores
+/// at a context of `ctx`.
+#[must_use]
+pub fn index_scores_bytes(hp: &Hparams, ctx: u64) -> u64 {
+    index_scores_row_bytes(hp).saturating_mul(ctx)
+}
 
 /// The selected latent flash's segments past one segment's keys, and a segment's keys: the
 /// flash kernels' own (`flash::SEGMENTS`, `seg_keys`), which the body holds to this by name.
@@ -340,7 +372,9 @@ impl PlanInputs {
         let read = spec::read(split)?;
         let tier = place_hybrid::tier_places_bytes(PROMPT_ROWS, hp.n_used);
         let reserve = prompt_reserve_bytes(&hp, &read.spec, &read.tensors, PROMPT_ROWS as u64, 1)?;
+        let scores = index_scores_row_bytes(&hp);
         Ok(PlanInputs::new(ENGINE, hp, read.tensors, read.spec)?
+            .with_position_scratch(scores)
             .with_prompt_reserve(reserve)
             .with_tier_reserve(tier)
             .with_nvme_tier())
