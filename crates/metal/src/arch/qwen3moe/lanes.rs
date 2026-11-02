@@ -21,7 +21,7 @@
 use core::fmt;
 
 use crate::delta_geom::{PASS_ROWS, RingRefusal, ring_fits};
-use crate::kernels::MROWS;
+use crate::geometry::MROWS;
 
 /// The most rows a verify takes: the rows the M-row mat-vecs run. A verify of
 /// `m` rows ends `m` distinct lanes, so the delta state holds this many lanes.

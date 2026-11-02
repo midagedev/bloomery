@@ -15,6 +15,10 @@ pub const ROWS_PER_SIMD_GROUP: usize = 4;
 /// output head and the experts run their own counts of the same constant.
 pub const SIMD_GROUPS_PER_GROUP: usize = 2;
 
+/// The activation rows every launch of the M-row mat-vec family runs, and so
+/// the rows a verify pass carries.
+pub const MROWS: usize = 2;
+
 /// The output rows one threadgroup of a mat-vec owns.
 pub const ROWS_PER_GROUP: usize = ROWS_PER_SIMD_GROUP * SIMD_GROUPS_PER_GROUP;
 
