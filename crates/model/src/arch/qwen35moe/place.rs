@@ -3418,13 +3418,16 @@ mod tests {
 
     /// The cache of a trunk of one GDN layer and one GQA layer is the sum of its layers' bytes, the
     /// attention planes in q8_0's layout when the cache runs in it and the GDN layer's state the
-    /// same in both [derived: the layer's `recurrent_bytes(4, 2, 128, 4)`; the attention layer's `4096
-    /// · 2 · 2 · 256` values, 2 B each in f16, 17/16 B each in q8_0].
+    /// same in both [derived: the layer's state and conv ring, carry and lane stamp; the attention
+    /// layer's `4096 · 2 · 2 · 256` values, 2 B each in f16, 17/16 B each in q8_0].
     #[test]
     fn a_hybrid_trunk_prices_its_attention_planes_in_the_cache_format() {
         let spec = plain(Arch::Qwen35, vec![gdn(), gqa(2, 64)]);
         let ctx = 4096;
-        let state = recurrent_bytes(4, 2, 128, 4);
+        // PIN(2026-11-02): the shared delta store holds its carry and one lane stamp on plain loads too.
+        let state = recurrent_bytes(4, 2, 128, 4)
+            + delta_carry_bytes(4, 2, 128)
+            + delta_lane_bytes(4, 128, 1);
         let f16 = KvLayout::trunk_bytes(&spec, ctx, false).expect("a hybrid trunk is sized");
         let q8 = KvLayout::trunk_bytes(&spec, ctx, true).expect("a hybrid trunk is sized");
         assert_eq!(f16, state + ctx * 2 * 2 * 256 * 2);
