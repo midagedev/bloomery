@@ -57,7 +57,7 @@ use super::program38::Ctx38;
 use super::scratch38::PASS_ROWS;
 use super::swap38::Qwen38Stacks;
 use crate::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks, RouteW, StackW};
-use crate::card_slots::{CardAcc, CardJoin, DownRows, SharedJoin};
+use crate::card_slots::{CardAcc, CardJoin, DownRows, DownStore, SharedJoin};
 use crate::hybrid::SlotMap;
 use crate::kquant::Act;
 use crate::q38::{CardTierSharedAddArgs, SLOTS, W_PITCH};
@@ -301,6 +301,8 @@ pub(super) struct Card38 {
     /// Per layer, whether the step and the verify run it without a host leg
     /// ([`Card38::hostless`]).
     hostless: Vec<bool>,
+    /// [`Card38::down_store`].
+    down: DownStore,
     /// [`Card38::blocks32_gate_up`].
     blocks32_gate_up: bool,
     run: Option<CardRun>,
@@ -473,6 +475,7 @@ impl Card38 {
         Ok(Card38 {
             layers: per,
             hostless,
+            down: DownStore::of_load(map, keep_host),
             blocks32_gate_up,
             run,
         })
@@ -511,6 +514,14 @@ impl Card38 {
     /// Every layer of the load runs without a host leg ([`Card38::hostless`]).
     pub(super) fn all_hostless(&self) -> bool {
         self.hostless.iter().all(|&h| h)
+    }
+
+    /// The form the ubatch walk's card route stores its down rows in, read
+    /// from the load's whole map and `keep_host` ([`DownStore::of_load`]):
+    /// a load with an expert tier and the one-card load of its union take
+    /// the same form, whose tier layers' join reads the tier's rows in it.
+    pub(super) fn down_store(&self) -> DownStore {
+        self.down
     }
 
     /// Layer `l`'s card experts: 0 on a layer without them.

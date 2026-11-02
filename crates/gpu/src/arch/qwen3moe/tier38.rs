@@ -39,6 +39,9 @@
 //! GEMMs sum each (slot, row) in an order fixed by K, over the same q8_1
 //! bytes of the same f32 rows — so the stage's join over both cards' slots
 //! in slot order (`q38_card_tier_acc`) is the one-card sum over their union.
+//! The packed rows stay F32 whatever the stage stores: over the stage's BF16
+//! down rows (`crate::card_slots::DownStore`) the join reads each tier row
+//! rounded as that store rounds the same product (`q38_card_tier_acc_bf16`).
 
 use super::card38::{LegLayer, SelRun, leg_layers};
 use super::plan38::geo;

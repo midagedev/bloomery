@@ -2,14 +2,14 @@
 //! the one launch of a layer without a host leg (the common `card_sum_join`,
 //! on F32 and on BF16 down rows, gated by the router's last weight from the
 //! host list's zeros), the same launch ungated from the card sum itself
-//! (GLM-5.3's shared expert), their checks, and the refusals of both combine
-//! launchers.
+//! (GLM-5.3's shared expert), a tier layer's join against the one-card sum
+//! of the union, their checks, and the refusals of both combine launchers.
 
-use bloomery_gpu::card_slots::{CardJoin, DownRows, SharedJoin};
+use bloomery_gpu::card_slots::{CardAcc, CardJoin, DownRows, SharedJoin};
 use bloomery_gpu::hybrid::HOST;
-use bloomery_gpu::q38::{CardSharedAddArgs, SLOTS, W_PITCH};
+use bloomery_gpu::q38::{CardSharedAddArgs, CardTierAccArgs, SLOTS, W_PITCH};
 use bloomery_gpu::{Fault, FaultSite, GpuError, LAYER_NONE};
-use bloomery_gpu_gates::{GateError, bits_equal, verdict};
+use bloomery_gpu_gates::{GateError, activations, bits_equal, verdict};
 use cuda_core::DeviceBuffer;
 use cuda_device::convert::{bf16_to_f32, f32_to_bf16_rne};
 
@@ -181,6 +181,100 @@ impl Leg38 {
             verdict(pass),
             mismatch("first_mismatch", &y, &want, N38),
         );
+        Ok(ok)
+    }
+
+    /// Clause 10's tier layer join (`q38_card_tier_acc`) against the one-card
+    /// sum of the union: [`SEL38`]'s host slots on an expert tier, their rows
+    /// packed at the ranks `q38_tier_rank` gives, the other slots the card's.
+    /// With the card's rows in BF16 (`DownStore::Bf16`: every expert on a
+    /// card, the union's one-card load the same) the join over the tier's F32
+    /// rows is the card sum of every slot on one card over the BF16 rows; with
+    /// F32 rows the same over the F32 rows; bit for bit, no fault.
+    pub(crate) fn check_tier_join(&self, c: &Ctx) -> Result<bool, GateError> {
+        let stream = c.gpu.stream();
+        let rows = activations(N38, SLOTS * M38, 9104);
+        let tier: Vec<usize> = (0..SEL38.len()).filter(|&s| SEL38[s] == HOST).collect();
+        let mut tsel = vec![HOST; SEL38.len()];
+        let mut trows = vec![f32::NAN; rows.len()];
+        for (r, &s) in tier.iter().enumerate() {
+            tsel[s] = r as u32;
+            trows[r * N38..(r + 1) * N38].copy_from_slice(&rows[s * N38..(s + 1) * N38]);
+        }
+        let union: Vec<u32> = SEL38
+            .iter()
+            .map(|&p| if p == HOST { 0 } else { p })
+            .collect();
+        let bits: Vec<u16> = rows.iter().map(|&v| f32_to_bf16_rne(v)).collect();
+        let bf16: Vec<f32> = bits.iter().map(|&b| bf16_to_f32(b)).collect();
+        let (sel, union) = (
+            DeviceBuffer::from_host(stream, &SEL38)?,
+            DeviceBuffer::from_host(stream, &union)?,
+        );
+        let (tsel, trows) = (
+            DeviceBuffer::from_host(stream, &tsel)?,
+            DeviceBuffer::from_host(stream, &trows)?,
+        );
+        let mut trank = DeviceBuffer::from_host(stream, &vec![0u32; SEL38.len()])?;
+        self.q38
+            .enqueue_tier_rank(stream, &tsel, (SEL38.len(), tier.len()), &mut trank)?;
+        let card_sum = |down: &[f32]| -> Result<_, GateError> {
+            let down = DeviceBuffer::from_host(stream, down)?;
+            let mut acc = DeviceBuffer::from_host(stream, &vec![SENT; M38 * N38])?;
+            let a = CardAcc {
+                down: &down,
+                w: &self.w,
+                sel: &union,
+                n: N38,
+                m: M38,
+                n_card: E38,
+                n_used: SLOTS,
+                w_pitch: W_PITCH,
+                fault: c.gpu.unlabelled_sink(),
+            };
+            self.slots.enqueue_card_acc(stream, &a, &mut acc)?;
+            stream.synchronize()?;
+            Ok((acc.to_host_vec(stream)?, c.gpu.take_fault()?))
+        };
+        let join = |down: DownRows<'_>| -> Result<_, GateError> {
+            let mut acc = DeviceBuffer::from_host(stream, &vec![SENT; M38 * N38])?;
+            let a = CardTierAccArgs {
+                down,
+                trows: &trows,
+                w: &self.w,
+                sel: &sel,
+                tsel: &tsel,
+                trank: &trank,
+                n: N38,
+                m: M38,
+                n_card: E38,
+                n_tier: tier.len(),
+                fault: c.gpu.unlabelled_sink(),
+                acc: &mut acc,
+            };
+            self.q38.enqueue_card_tier_acc(stream, a)?;
+            stream.synchronize()?;
+            Ok((acc.to_host_vec(stream)?, c.gpu.take_fault()?))
+        };
+        let card_f32 = DeviceBuffer::from_host(stream, &rows)?;
+        let card_bf16 = DeviceBuffer::from_host(stream, &bits)?;
+        let mut ok = true;
+        for (form, (got, got_fault), (want, want_fault)) in [
+            ("bf16", join(DownRows::Bf16(&card_bf16))?, card_sum(&bf16)?),
+            ("f32", join(DownRows::F32(&card_f32))?, card_sum(&rows)?),
+        ] {
+            let same = bits_equal(&got, &want);
+            let pass = same && got_fault.is_none() && want_fault.is_none();
+            ok &= pass;
+            println!(
+                "q38_card_tier_join[{form}_rows, {} tier slots] is_union_card_sum={same} \
+                 fault=\"{}\" {}{}",
+                tier.len(),
+                shown(got_fault),
+                verdict(pass),
+                mismatch("first_mismatch", &got, &want, N38),
+            );
+        }
         Ok(ok)
     }
 

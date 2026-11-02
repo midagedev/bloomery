@@ -384,6 +384,14 @@ impl SlotMap {
         self.tiers
     }
 
+    /// Every expert of every layer runs on a card, the stage card or a tier
+    /// card: no entry is [`HOST`]. A map with a tier and the map of its union
+    /// (every tier set joined to the stage card's) hold it alike.
+    #[must_use]
+    pub(crate) fn all_on_cards(&self) -> bool {
+        self.slots.iter().all(|&e| e != HOST)
+    }
+
     /// Where layer `layer`'s expert `id` runs; `None` for a layer or an id
     /// the map has no entry for. The decoder every host reader goes through.
     #[must_use]

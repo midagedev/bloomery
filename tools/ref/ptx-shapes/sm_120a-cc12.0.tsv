@@ -414,6 +414,8 @@ generate_ds41 rows_f8 0 0
 generate_ds41 q2_k_rows 0 0
 generate_ds41 q38_card_shared_add 0 0
 generate_ds41 q38_card_tier_acc 0 0
+# PIN(2026-11-02): q38_card_tier_acc_bf16 at q38_card_tier_acc's values, its body (card_tier_acc_at) over BF16 card rows, until a scan on this table's arch and capability.
+generate_ds41 q38_card_tier_acc_bf16 0 0
 generate_ds41 q38_card_tier_shared_add 0 0
 generate_ds41 q38_shared_add 0 0
 generate_ds41 q38_tier_ids 0 0

@@ -35,7 +35,7 @@
 //! rows) keeps its own.
 
 use crate::fault::{FaultSink, FaultSite};
-use crate::hybrid::HOST;
+use crate::hybrid::{HOST, SlotMap};
 use crate::q8f32::RowValues;
 use crate::{GpuError, launch_u32, short};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -707,6 +707,50 @@ pub struct ColPlaces<'a> {
     pub n_expert: usize,
 }
 
+/// The form a load's card route stores its down rows in, which every card
+/// sum over them reads ([`DownRows`]), decided once a load from its whole
+/// slot map ([`DownStore::of_load`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DownStore {
+    F32,
+    /// BF16 bits, each product rounded to nearest even
+    /// (`enqueue_gemm32_bf16`); an expert tier's F32 rows are read rounded
+    /// the same way ([`TierRowsRne`]).
+    Bf16,
+}
+
+impl DownStore {
+    /// BF16 on a load whose map puts every expert of every layer on a card
+    /// ([`SlotMap::all_on_cards`]: the stage card's or an expert tier's) and
+    /// that keeps no host leg (`keep_host`: a residency machine or a route
+    /// trace), F32 on any other. Read from the whole map and never from one
+    /// card's share, so a load with a tier and the one-card load of its
+    /// union round the same rows.
+    #[must_use]
+    pub(crate) fn of_load(map: &SlotMap, keep_host: bool) -> DownStore {
+        if !keep_host && map.all_on_cards() {
+            DownStore::Bf16
+        } else {
+            DownStore::F32
+        }
+    }
+}
+
+/// An expert tier's F32 down rows read as the stage card's BF16 store holds
+/// its own ([`DownStore::Bf16`]): each value rounded to nearest even, then
+/// widened exactly, as `enqueue_gemm32_bf16` rounds the same product.
+#[derive(Clone, Copy)]
+pub(crate) struct TierRowsRne<'a>(pub(crate) &'a [f32]);
+
+impl RowValues for TierRowsRne<'_> {
+    #[inline(always)]
+    unsafe fn at(self, i: usize) -> f32 {
+        use cuda_device::convert::{bf16_to_f32, f32_to_bf16_rne};
+        // SAFETY: i is below the slice's length by this fn's contract.
+        bf16_to_f32(f32_to_bf16_rne(unsafe { *self.0.get_unchecked(i) }))
+    }
+}
+
 /// A card route's slot-major down rows as a card sum reads them: F32, or
 /// BF16 bits (a down product's BF16 store, `enqueue_gemm32_bf16`).
 #[derive(Clone, Copy)]
@@ -734,7 +778,7 @@ impl<'a> DownRows<'a> {
             Self::F32(d) => Ok(d),
             Self::Bf16(_) => Err(GpuError::state(
                 what,
-                "F32 down rows (BF16 rows feed the card sum's join alone)",
+                "F32 down rows (BF16 rows feed the joins alone)",
             )),
         }
     }
@@ -1040,6 +1084,27 @@ mod tests {
             std::array::from_fn(|j| w[t * w_pitch + j]),
             std::array::from_fn(|j| sel[t * N + j] < n_card),
         )
+    }
+
+    /// A load's down store is read from its whole map: stage and tier cards
+    /// holding every expert take BF16 as the one-card map of their union
+    /// does, a host expert F32 on both, and a kept host leg F32 on any map.
+    #[test]
+    fn a_tier_loads_down_store_is_its_unions() {
+        use crate::hybrid::{SlotMap, TIER};
+        let map = |rows: Vec<u32>| SlotMap::from_rows(0..2, 4, rows).expect("two rows of 4");
+        let two = map(vec![0, 1, TIER, TIER | 1, 1, TIER, 0, TIER | 1]);
+        let union = map(vec![0, 1, 2, 3, 1, 2, 0, 3]);
+        let hosted = map(vec![0, 1, TIER, HOST, 1, TIER, 0, TIER | 1]);
+        let hosted_union = map(vec![0, 1, 2, HOST, 1, 2, 0, 3]);
+        let store = DownStore::of_load;
+        assert_eq!(store(&two, false), DownStore::Bf16);
+        assert_eq!(store(&union, false), DownStore::Bf16);
+        assert_eq!(store(&hosted, false), DownStore::F32);
+        assert_eq!(store(&hosted_union, false), DownStore::F32);
+        for m in [&two, &union, &hosted, &hosted_union] {
+            assert_eq!(store(m, true), DownStore::F32);
+        }
     }
 
     /// Both card sum launchers refuse empty or overflowing geometry and

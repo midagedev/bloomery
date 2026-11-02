@@ -1437,7 +1437,8 @@ pub const CARD_ROUTE_ROWS: u64 = 2_048;
 /// 3,200 B a column (40 steps of 80 B); the gate and up f32 rows
 /// 2 · 10 · 640 · 4 = 51,200 B; the SwiGLU `GemmAct32` at K = 640, 800 B a
 /// column, 8,000 B; the down f32 rows 10 · 2,560 · 4 = 102,400 B (a load
-/// whose every layer runs without the host leg keeps them in BF16, half);
+/// whose every expert runs on a card with no host leg kept, an expert tier's
+/// load among them, keeps them in BF16, half);
 /// two route tables — the cols list 2 · 40 B, their tile words at the most
 /// experts 2 · 8 · (320 + 512) / 2,048 = 3.25 B, the counts; the identity
 /// map of the ids compression 512 words = 1 B: 170,272 + 87.6 + 1, rounded
@@ -1453,8 +1454,8 @@ pub const CARD_ROUTE_RUN_TOKEN_BYTES: u64 = 170_360;
 /// form alone, with the frames the gate and up launch writes it through,
 /// 408 B a column (codes 320, block scales 40, the column's scale 4, a
 /// frame a 64-value step 40, a tile's arrival word 4), 4,080 B; the down
-/// f32 rows 10 · 2,560 · 4 = 102,400 B (a load whose every layer runs
-/// without the host leg keeps them in BF16, half); two route tables — the
+/// f32 rows 10 · 2,560 · 4 = 102,400 B (a load whose every expert runs on a
+/// card with no host leg kept keeps them in BF16, half); two route tables — the
 /// cols list 2 · 40 B, the zero ids of a table over one expert 40 B, their
 /// tile words at the most experts 2 · 8 · (320 + 512) / 2,048 = 6.5 B, the
 /// counts; the identity map of the ids compression 512 words = 1 B:
@@ -1515,7 +1516,7 @@ pub const fn card_tier_join_bytes(u: u64) -> u64 {
 
 /// Card bytes a tier layer's join keeps a token of the unit past the card
 /// route's run: its card slots' down rows and places [derived:
-/// 10 · 2,560 · 4 + 10 · 4], which a run holds a run token too
+/// 10 · 2,560 · 4 + 10 · 4; BF16 rows hold half], which a run holds a run token too
 /// ([`route_token_bytes`]).
 const JOIN_TOKEN_BYTES: u64 = 102_440;
 

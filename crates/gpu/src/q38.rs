@@ -35,7 +35,10 @@
 //! - [`q38_kernels::q38_card_tier_acc`] — that join's sum alone, into the
 //!   card sum `q38_card_shared_add` combines: a ubatch's tier layer, whose
 //!   host sums are uploaded only after the tier's rows are joined; a tier
-//!   slot's row is read at its rank (`q38_tier_rank`).
+//!   slot's row is read at its rank (`q38_tier_rank`). `_bf16` reads the
+//!   card's BF16 down rows and each tier row rounded to BF16 as the card's
+//!   store rounds its own (`card_slots::DownStore`), so the join is the
+//!   union's one-card sum over BF16 rows.
 //! - [`q38_kernels::q38_tier_ids`] — one thread per slot, on the tier card:
 //!   a tier place as the remapped route's expert id, [`HOST`] as the one id
 //!   past the tier's experts, which the route's map sends to the host.
@@ -68,7 +71,7 @@
 //! hold, raises [`FaultSite::ExpertId`] as a card slot's does. Every value is
 //! written as computed.
 
-use crate::card_slots::join_value;
+use crate::card_slots::{DownRows, TierRowsRne, join_value};
 use crate::elem::EmbedRowsArgs;
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::half_bits_to_f32;
@@ -186,6 +189,75 @@ fn position_word(v: usize) -> u32 {
         u32::MAX
     } else {
         v as u32
+    }
+}
+
+/// The tier join entries' value `i` (the thread's), into `acc[i]`:
+/// [`q38_kernels::q38_card_tier_acc`]'s sum over the card's rows `down` and
+/// the tier's `trows`, each read as its form reads it.
+///
+/// # Safety
+///
+/// `down` and `trows` hold `10·n·m` values, `w` `11·m`, `sel`, `tsel` and
+/// `trank` `10·m`, and `acc` `n·m`.
+#[inline(always)]
+unsafe fn card_tier_acc_at(
+    i: usize,
+    (down, trows): (impl RowValues, impl RowValues),
+    (w, sel, tsel, trank): (&[f32], &[u32], &[u32], &[u32]),
+    (n, m, n_card, n_tier): (u32, u32, u32, u32),
+    fault: FaultSink,
+    acc: &mut DisjointSlice<f32>,
+) {
+    let (n, m) = (n as usize, m as usize);
+    if i >= n * m {
+        return;
+    }
+    let (t, d) = (i / n, i % n);
+    let mut a = 0.0f32;
+    for j in 0..SLOTS {
+        cuda_device::thread::__unroll_config::<0>();
+        let s = t * SLOTS + j;
+        // SAFETY: t < m and j < 10 put s below 10m <= sel.len() and
+        // tsel.len() by this fn's contract.
+        let (place, tplace) = unsafe { (*sel.get_unchecked(s), *tsel.get_unchecked(s)) };
+        // SAFETY: t < m and j < 10 put 11t + j below 11m <= w.len() by this
+        // fn's contract.
+        let ws = unsafe { *w.get_unchecked(t * W_PITCH + j) };
+        if place < n_card {
+            // SAFETY: s·n + d < 10nm, down's values by this fn's contract.
+            let ds = unsafe { down.at(s * n + d) };
+            a = ds.mul_add(ws, a);
+        } else if place != HOST {
+            if d == 0 {
+                fault.raise(FaultSite::ExpertId);
+            }
+            a = f32::NAN;
+        } else if tplace < n_tier {
+            // SAFETY: s < 10m <= trank.len() by this fn's contract.
+            let r = unsafe { *trank.get_unchecked(s) } as usize;
+            if r < SLOTS * m {
+                // SAFETY: r < 10m puts r·n + d below 10nm, trows' values by
+                // this fn's contract.
+                let ds = unsafe { trows.at(r * n + d) };
+                a = ds.mul_add(ws, a);
+            } else {
+                if d == 0 {
+                    fault.raise(FaultSite::ExpertId);
+                }
+                a = f32::NAN;
+            }
+        } else if tplace != HOST {
+            if d == 0 {
+                fault.raise(FaultSite::ExpertId);
+            }
+            a = f32::NAN;
+        }
+    }
+    // SAFETY: i < n·m <= acc.len() by this fn's contract; thread i is
+    // acc[i]'s only writer.
+    unsafe {
+        *acc.get_unchecked_mut(i) = a;
     }
 }
 
@@ -600,56 +672,68 @@ mod q38_kernels {
         fault: FaultSink,
         mut acc: DisjointSlice<f32>,
     ) {
-        let (n, m) = (n as usize, m as usize);
         let i = thread::index_1d().get();
-        if i >= n * m {
-            return;
-        }
-        let (t, d) = (i / n, i % n);
-        let mut a = 0.0f32;
-        for j in 0..SLOTS {
-            cuda_device::thread::__unroll_config::<0>();
-            let s = t * SLOTS + j;
-            // SAFETY: t < m and j < 10 put s below 10m <= sel.len() and
-            // tsel.len() by the launch contract.
-            let (place, tplace) = unsafe { (*sel.get_unchecked(s), *tsel.get_unchecked(s)) };
-            // SAFETY: t < m and j < 10 put 11t + j below 11m <= w.len() by
-            // the launch contract.
-            let ws = unsafe { *w.get_unchecked(t * W_PITCH + j) };
-            if place < n_card {
-                // SAFETY: s·n + d < 10nm <= down.len() by the launch contract.
-                let ds = unsafe { *down.get_unchecked(s * n + d) };
-                a = ds.mul_add(ws, a);
-            } else if place != HOST {
-                if d == 0 {
-                    fault.raise(FaultSite::ExpertId);
-                }
-                a = f32::NAN;
-            } else if tplace < n_tier {
-                // SAFETY: s < 10m <= trank.len() by the launch contract.
-                let r = unsafe { *trank.get_unchecked(s) } as usize;
-                if r < SLOTS * m {
-                    // SAFETY: r < 10m puts r·n + d below 10nm <= trows.len()
-                    // by the launch contract.
-                    let ds = unsafe { *trows.get_unchecked(r * n + d) };
-                    a = ds.mul_add(ws, a);
-                } else {
-                    if d == 0 {
-                        fault.raise(FaultSite::ExpertId);
-                    }
-                    a = f32::NAN;
-                }
-            } else if tplace != HOST {
-                if d == 0 {
-                    fault.raise(FaultSite::ExpertId);
-                }
-                a = f32::NAN;
-            }
-        }
-        // SAFETY: i < n·m <= acc.len() by the launch contract; thread i is
-        // acc[i]'s only writer.
+        // SAFETY: the launch contract's lengths, read as the body's.
         unsafe {
-            *acc.get_unchecked_mut(i) = a;
+            card_tier_acc_at(
+                i,
+                (down, trows),
+                (w, sel, tsel, trank),
+                (n, m, n_card, n_tier),
+                fault,
+                &mut acc,
+            )
+        }
+    }
+
+    /// [`q38_card_tier_acc`] over the card's BF16 down rows (each cell
+    /// widened exactly to F32) and the tier's F32 rows each rounded to
+    /// nearest even first, as the card's BF16 store rounds its own
+    /// (`card_slots::DownStore::Bf16`): the same sum and faults.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            down.len() >= 10 * n * m,
+            trows.len() >= 10 * n * m,
+            w.len() >= 11 * m,
+            sel.len() >= 10 * m,
+            tsel.len() >= 10 * m,
+            trank.len() >= 10 * m,
+            acc.len() >= n * m
+        )
+    )]
+    pub fn q38_card_tier_acc_bf16(
+        down: &[u16],
+        trows: &[f32],
+        w: &[f32],
+        sel: &[u32],
+        tsel: &[u32],
+        trank: &[u32],
+        n: u32,
+        m: u32,
+        n_card: u32,
+        n_tier: u32,
+        fault: FaultSink,
+        mut acc: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        // SAFETY: the launch contract's lengths, read as the body's.
+        unsafe {
+            card_tier_acc_at(
+                i,
+                (down, TierRowsRne(trows)),
+                (w, sel, tsel, trank),
+                (n, m, n_card, n_tier),
+                fault,
+                &mut acc,
+            )
         }
     }
 
@@ -904,9 +988,10 @@ pub struct CardTierSharedAddArgs<'a> {
 /// [`Q38Kernels::enqueue_card_tier_acc`]'s arguments: [`CardTierSharedAddArgs`]'s
 /// slots — the card's down outputs and the tier's rows, slot-major, the
 /// router's weights, the card and the tier places — over `m` tokens of `n`
-/// values, the sink and the sum.
+/// values, the sink and the sum. The card's rows in the load's form
+/// (`card_slots::DownStore`): over BF16 rows the tier's are read rounded.
 pub struct CardTierAccArgs<'a> {
-    pub down: &'a DeviceBuffer<f32>,
+    pub down: DownRows<'a>,
     pub trows: &'a DeviceBuffer<f32>,
     pub w: &'a DeviceBuffer<f32>,
     pub sel: &'a DeviceBuffer<u32>,
@@ -1319,7 +1404,8 @@ impl Q38Kernels {
     /// Enqueue a ubatch tier layer's join sum ([`CardTierAccArgs`],
     /// `q38_card_tier_acc`): the card's and the tier's slots in slot order
     /// into `acc`, which [`Q38Kernels::enqueue_card_shared_add`] then
-    /// combines. `down` and `trows` `SLOTS·n·m` values, `w` `W_PITCH·m`,
+    /// combines; over BF16 card rows `q38_card_tier_acc_bf16`, the tier's
+    /// rows rounded. `down` and `trows` `SLOTS·n·m` values, `w` `W_PITCH·m`,
     /// `sel`, `tsel` and `trank` `SLOTS·m`, `acc` `n·m`. A layer with no card or no
     /// tier expert is refused by name. One launch. Asynchronous,
     /// allocation-free, capturable.
@@ -1343,7 +1429,7 @@ impl Q38Kernels {
         short(
             what,
             &[
-                ("down", a.down.len(), SLOTS * nm),
+                ("down", a.down.cells(), SLOTS * nm),
                 ("trows", a.trows.len(), SLOTS * nm),
                 ("w", a.w.len(), W_PITCH * a.m),
                 ("sel", a.sel.len(), SLOTS * a.m),
@@ -1353,23 +1439,33 @@ impl Q38Kernels {
             ],
         )?;
         let cfg = grid(what, nm)?;
-        let prep = self.module.prepare_q38_card_tier_acc(cfg)?;
-        self.module.q38_card_tier_acc(
-            stream,
-            &prep,
-            a.down,
-            a.trows,
-            a.w,
-            a.sel,
-            a.tsel,
-            a.trank,
-            launch_u32(what, "n", a.n)?,
-            launch_u32(what, "m", a.m)?,
-            launch_u32(what, "n_card", a.n_card)?,
-            launch_u32(what, "n_tier", a.n_tier)?,
-            a.fault,
-            a.acc,
-        )?;
+        macro_rules! launch {
+            ($prepare:ident, $entry:ident, $down:expr) => {{
+                let prep = self.module.$prepare(cfg)?;
+                self.module.$entry(
+                    stream,
+                    &prep,
+                    $down,
+                    a.trows,
+                    a.w,
+                    a.sel,
+                    a.tsel,
+                    a.trank,
+                    launch_u32(what, "n", a.n)?,
+                    launch_u32(what, "m", a.m)?,
+                    launch_u32(what, "n_card", a.n_card)?,
+                    launch_u32(what, "n_tier", a.n_tier)?,
+                    a.fault,
+                    a.acc,
+                )?;
+            }};
+        }
+        match a.down {
+            DownRows::F32(d) => launch!(prepare_q38_card_tier_acc, q38_card_tier_acc, d),
+            DownRows::Bf16(d) => {
+                launch!(prepare_q38_card_tier_acc_bf16, q38_card_tier_acc_bf16, d)
+            }
+        }
         Ok(())
     }
 
