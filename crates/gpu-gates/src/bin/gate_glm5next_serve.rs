@@ -1315,7 +1315,9 @@ mod gate {
             let (draft_n, accepted) = draft_counts(&c)?;
             Ok(Turn {
                 tokens: ids_of(&c["tokens"])?,
-                cache_n: c["timings"]["cache_n"].as_u64().unwrap_or(u64::MAX),
+                cache_n: c["timings"]["cache_n"]
+                    .as_u64()
+                    .ok_or("/completion: missing or invalid timings.cache_n")?,
                 draft_n,
                 accepted,
                 stop: stop_of(&c)?.to_owned(),
@@ -2881,7 +2883,7 @@ mod gate {
         let completion = reply["usage"]["completion_tokens"].as_u64().unwrap_or(0);
         let skipped = skips_past(&err_log, after_load)?;
         let image_slots = called_slots(&err_log, after_load)?;
-        let image_drafted = reply["timings"]["draft_n"].as_u64().unwrap_or(0);
+        let image_drafted = draft_counts(&reply)?.0;
         println!(
             "media chat: HTTP {st}, {completion} completion tokens, {} chars of content and \
              reasoning_content, prompt tokens {}, draft_n={image_drafted} \
@@ -2910,7 +2912,7 @@ mod gate {
             "temperature": 0, "max_tokens": N_PREDICT, "cache_prompt": false,
         });
         let (st, reply) = media_post(&url, "text chat", &body);
-        let drafted = reply["timings"]["draft_n"].as_u64().unwrap_or(0);
+        let drafted = draft_counts(&reply)?.0;
         let text_slots = called_slots(&err_log, after_media)?;
         println!(
             "text chat: a prompt of {} ids, HTTP {st}, draft_n={drafted} draft_n_accepted={} \
