@@ -948,6 +948,25 @@ mod gate {
     /// incoherent].
     const SWIGLU_CARRY: f64 = 1.44;
 
+    /// The distance an engine's evaluation of its own SwiGLU rule over `n_in`
+    /// inputs and `n_mid` gate rows keeps from that rule in f64 (the sums'
+    /// order and the f32 products), a fraction of the row's peak: the term
+    /// left beside the two the host reads exactly where a shared expert passes
+    /// [`SWIGLU_CARRY`]'s band (the carried input and mainline's int8 rounding,
+    /// [`ffn_host`]). An f32 dot of `n` terms is off its exact sum by at most
+    /// `λ·√n·u·Σ|w·x|` (Higham and Mary's probabilistic bound, `λ = 6`), and a
+    /// Gaussian row's `Σ|w·x|` is `0.18·√n` of its output's peak (`2/π·n`
+    /// against a peak of 3.5 to 4 standard deviations), so a projection carries
+    /// `1.08·n·u` onto its output: the gate's and the up's onto the down's
+    /// input, which the down carries incoherently, and the down's own.
+    // PIN(2026-11-02): derived as above (λ = 6). Measured on the first
+    // real-tier run's 67 host-read rows (`e2e-real.log`): ours against its
+    // exact rule under 5e-5 of the peak, mainline's against its own rule at
+    // most 2e-4.
+    fn swiglu_own_rule(n_in: usize, n_mid: usize) -> f64 {
+        1.08 * U * (2 * n_in + n_mid) as f64
+    }
+
     /// The FFN's normed input on both engines (`ffn_norm` of each engine's
     /// `ffn_inp` at the file's gain) and what the derived bands read of it.
     struct FfnIn {
@@ -2127,6 +2146,84 @@ mod gate {
             .to_vec())
     }
 
+    /// The distance from the cut, in units of the exchange's own scale σ
+    /// ([`deep_tie`]), past which a moved row is no near tie.
+    // PIN(2026-11-02): derived, a Gaussian move passes 5σ with probability
+    // 5.7e-7 each way, so any of a deep step's 3,001 rows does with 1.7e-3.
+    const FAR_SIGMAS: f64 = 5.0;
+
+    /// How a deep step's list stands to the dump's where they differ ([`deep_tie`]).
+    struct DeepTie {
+        /// The between-engine move of a score the exchange implies, and the
+        /// rows a score unit holds at the cut it reads it from.
+        sigma: f64,
+        density: f64,
+        /// The widest distance of a moved row from the cut, and its rank
+        /// distance from it.
+        widest: f64,
+        deepest: usize,
+        /// The moved rows past [`FAR_SIGMAS`]: the row, whether the run took
+        /// it (the dump left it), its distance, its rank distance.
+        far: Vec<(u32, bool, f64, usize)>,
+    }
+
+    /// A deep step's exchange read on the run's own scores `live`: `outside`,
+    /// the dump's rows the run left, each at its distance below the run's
+    /// k-th score, and `inside`, the run's rows the dump left, each at its
+    /// distance above the first score left out. Mainline's scores are not in
+    /// view at depth (the deep set dumps neither its index scores nor the keys
+    /// of the walk's rows), so the move of a score between the engines is read
+    /// from the exchange itself: rounding of scale σ takes a row across the cut
+    /// with the probability that a `N(0, σ²)` move passes its distance from
+    /// it, so each side gives up `n = f·σ/√(2π)` rows at `f` rows a score unit
+    /// at the cut, and `σ = n·√(2π)/f`. `f` is read over the `4n` ranks on
+    /// each side of the cut (at least 8), where the moved rows sit. A moved
+    /// row past [`FAR_SIGMAS`]·σ is one no rounding of the exchange's scale
+    /// reaches: a defect of that row (its key, its score), not a tie.
+    fn deep_tie(live: &[f32], k: usize, outside: &[u32], inside: &[u32]) -> DeepTie {
+        let mut order: Vec<f64> = live.iter().map(|&v| f64::from(v)).collect();
+        order.sort_by(|a, b| b.total_cmp(a));
+        let last = order.len() - 1;
+        let (kth, next) = (order[k - 1], order[k.min(last)]);
+        let n = outside.len().max(inside.len());
+        let w = 4 * n.max(8);
+        let (lo, hi) = ((k - 1).saturating_sub(w), (k - 1 + w).min(last));
+        let span = order[lo] - order[hi];
+        let density = if span > 0.0 {
+            (hi - lo) as f64 / span
+        } else {
+            f64::INFINITY
+        };
+        let sigma = n as f64 * (2.0 * std::f64::consts::PI).sqrt() / density;
+        let rank = |v: f64| order.iter().take_while(|&&o| o > v).count();
+        let moved = outside
+            .iter()
+            .map(|&r| {
+                let v = f64::from(live[r as usize]);
+                (r, false, kth - v, rank(v).saturating_sub(k - 1))
+            })
+            .chain(inside.iter().map(|&r| {
+                let v = f64::from(live[r as usize]);
+                (r, true, v - next, k.saturating_sub(rank(v)))
+            }));
+        let (mut widest, mut deepest, mut far) = (0.0f64, 0usize, Vec::new());
+        for (r, ours, d, ranks) in moved {
+            if d > widest {
+                (widest, deepest) = (d, ranks);
+            }
+            if d.is_nan() || d > FAR_SIGMAS * sigma {
+                far.push((r, ours, d, ranks));
+            }
+        }
+        DeepTie {
+            sigma,
+            density,
+            widest,
+            deepest,
+            far,
+        }
+    }
+
     /// One layer's tapped values (`node`, read after the step at `at`)
     /// against the dump's rows at `at`, read against `bands`: every
     /// comparison counts into `tally` and the layer's `seen` (node, position,
@@ -2198,8 +2295,10 @@ mod gate {
         // indexer's own band (the k-th gap under the scores' peak
         // times it) excuses the attention-fed nodes at this position —
         // except in the deep step, whose cut moves a few rows at its
-        // threshold on any rounding: there the nodes stay compared and
-        // the moved count is the frontier line's.
+        // threshold on any rounding: there the nodes stay compared, the
+        // moved count is the frontier line's, and a list past the band is
+        // read on the exchange's own scale ([`deep_tie`]): red only for a
+        // moved row no rounding of that scale reaches.
         let mut idx_crossed = false;
         if at.pos + 1 > top_k {
             let tk = dumped_list(man, l, hp.n_layer)?;
@@ -2233,6 +2332,12 @@ mod gate {
                     b.index_scores(gpu, kind.indexer)?
                 };
                 let live = &scores[..at.pos + 1];
+                // The run's rows the dump's list lacks.
+                let inside: Vec<u32> = got
+                    .iter()
+                    .filter(|id| want.binary_search(id).is_err())
+                    .copied()
+                    .collect();
                 let peak = live.iter().fold(0.0_f32, |a, v| a.max(v.abs()));
                 let mut order = live.to_vec();
                 order.sort_by(|a, b| b.partial_cmp(a).unwrap());
@@ -2255,6 +2360,35 @@ mod gate {
                         band,
                         if deep { "stay compared" } else { "skip here" }
                     );
+                } else if deep {
+                    let t = deep_tie(live, top_k, &outside, &inside);
+                    let far: Vec<String> = t
+                        .far
+                        .iter()
+                        .map(|&(r, ours, d, ranks)| {
+                            let side = if ours { "the run's" } else { "the dump's" };
+                            format!("row {r} {side} {:.1}σ {ranks} ranks", d / t.sigma)
+                        })
+                        .collect();
+                    println!(
+                        "{clause}: top_k-{tk} p{p} {sets} at the cut, read on its own scale: σ \
+                         {:.2e} ({:.2e} of the scores' peak, {:.3e} rows a unit there), the widest \
+                         {:.2e} = {:.1}σ {} ranks from the cut; {} past {FAR_SIGMAS}σ{} {}",
+                        t.sigma,
+                        t.sigma / f64::from(peak).max(f64::MIN_POSITIVE),
+                        t.density,
+                        t.widest,
+                        t.widest / t.sigma,
+                        t.deepest,
+                        far.len(),
+                        if far.is_empty() {
+                            ": near ties, the attention-fed nodes stay compared".to_string()
+                        } else {
+                            format!(" [{}]", far.join(", "))
+                        },
+                        verdict(far.is_empty())
+                    );
+                    tally.ok &= far.is_empty();
                 } else {
                     println!("{clause}: top_k-{tk} p{p} {sets} FAIL");
                     tally.ok = false;
@@ -2679,13 +2813,20 @@ mod gate {
             // sum takes the routed constant at mainline's q8_K ratio of the
             // normed input, the shared expert the dense constant at its Q8_0
             // ratio, each plus the input's distance carried through the SwiGLU
-            // block ([`SWIGLU_CARRY`]). A shared expert past that band has its
-            // down's input read on the host ([`ffn_host`], mainline's rule on
-            // its own input): the band takes the louder of the two Q8_0 inputs'
-            // ratios, and the line beside it names each term — our block
-            // against its exact rule, mainline's against its own rule, the
-            // carried input, mainline's int8 rounding. The block's output is
-            // the two sums' add, so its band is theirs against its peak.
+            // block ([`SWIGLU_CARRY`]). A shared expert past that band is read
+            // on the host ([`ffn_host`]) and its band is the triangle of the
+            // terms the host reads exactly, each a widest difference against
+            // the dump's peak: the exact block on our input against it on
+            // mainline's (the carried input, which the real file's weights
+            // carry several times past [`SWIGLU_CARRY`]), mainline's
+            // rule on its input against the exact block there (its int8
+            // rounding of the input and of the down's input, which the down's
+            // conditioning carries past the constant at the ratio), and each
+            // engine's own rule ([`swiglu_own_rule`]). Our block against its
+            // exact rule past its own-rule term is ours moved, mainline's
+            // against its rule past it the oracle's; the line names both. The
+            // block's output is the two sums' add, so its band is theirs
+            // against its peak.
             let fin = ffn()?;
             let carry = fin.as_ref().map_or(0.0, |f| SWIGLU_CARRY * f.eps);
             let moe_band = fin
@@ -2727,20 +2868,36 @@ mod gate {
                         blk(l, stems::FFN_UP_SHEXP),
                         blk(l, stems::FFN_DOWN_SHEXP),
                     ];
+                    let first = sh_band;
                     let host = ffn_host(&case.weights, names, &f.x_o, &f.x_m)?;
                     let r_h = rounding_ratio(&host.h, Q8_0_RULES)?;
-                    sh_band = dense_band * f.r_q8.max(r_h) + carry;
+                    // Each term against the dump's peak, as `rel` reads `e`.
+                    let pw = peak(&want_sh).max(1e-3);
+                    let widest_of = |a: &[f64], b: &[f64]| {
+                        a.iter()
+                            .zip(b)
+                            .fold(0.0f64, |w, (x, y)| w.max((x - y).abs()))
+                            / pw
+                    };
+                    let carried = widest_of(&host.ours, &host.exact);
+                    let rounded = widest_of(&host.rule, &host.exact);
+                    let (own_ours, own_theirs) = (
+                        widest_of(&f64s(&node.sh), &host.ours),
+                        widest_of(&f64s(&want_sh), &host.rule),
+                    );
+                    let own = swiglu_own_rule(f.x_m.len(), host.h.len());
+                    sh_band = carried + rounded + 2.0 * own;
                     println!(
-                        "{clause}: ffn_shexp-{l} p{p} rel {e:.4}: input ratios {:.2} (gate, up) {r_h:.2} \
-                         (down), carried input {:.4}, band {sh_band:.4}; ours against its exact rule \
-                         {:.4}, mainline's against its own {:.4}, exact on the two inputs {:.4}, \
-                         mainline's int8 rounding {:.4}",
+                        "{clause}: ffn_shexp-{l} p{p} rel {e:.4} past the constant's {first:.4} \
+                         (input ratios {:.2} gate and up, {r_h:.2} down, input {:.4}): band \
+                         {sh_band:.4} = the carried input {carried:.4} (x{:.1} the input) + \
+                         mainline's int8 rounding {rounded:.4} + each engine's own rule {own:.1e}; \
+                         own rule shares ours {:.3}, mainline's {:.3}",
                         f.r_q8,
                         f.eps,
-                        rel64(&f64s(&node.sh), &host.ours),
-                        rel64(&f64s(&want_sh), &host.rule),
-                        rel64(&host.ours, &host.exact),
-                        rel64(&host.rule, &host.exact),
+                        carried / f.eps.max(f64::MIN_POSITIVE),
+                        own_ours / own,
+                        own_theirs / own,
                     );
                 }
                 judge(
