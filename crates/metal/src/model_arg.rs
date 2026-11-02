@@ -232,13 +232,26 @@ mod tests {
     }
 
     /// A cache root holding `repo`'s `files`, each beside a verified marker, so an offline client
-    /// finds them as a fetch left them.
+    /// finds them as a fetch left them. A safetensors index names every safetensors shard among
+    /// `files`, since the offline client resolves the shards from it.
     fn cached(dir: &Path, repo: &str, files: &[&str]) -> PathBuf {
         let root = dir.join("cache");
         let at = root.join(repo);
         fs::create_dir_all(&at).unwrap();
+        let shards: Vec<String> = files
+            .iter()
+            .filter(|f| f.ends_with(".safetensors"))
+            .enumerate()
+            .map(|(i, f)| format!("\"t{i}\":\"{f}\""))
+            .collect();
+        let index = format!("{{\"weight_map\":{{{}}}}}", shards.join(","));
         for f in files {
-            fs::write(at.join(f), b"stored").unwrap();
+            let body = if f.ends_with(".safetensors.index.json") {
+                index.as_bytes()
+            } else {
+                b"stored".as_slice()
+            };
+            fs::write(at.join(f), body).unwrap();
             fs::write(at.join(format!("{f}.verified")), format!("{:064x}\n", 7)).unwrap();
         }
         root
@@ -290,10 +303,19 @@ mod tests {
             lines[0].starts_with("hf offline repo=mlx-community/Tiny-4bit reason="),
             "{lines:?}"
         );
+        let bytes: u64 = [
+            "config.json",
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+            "model.safetensors.index.json",
+        ]
+        .iter()
+        .map(|f| fs::metadata(root.join(repo).join(f)).unwrap().len())
+        .sum();
         assert!(
-            lines.contains(
-                &"hf checkpoint repo=mlx-community/Tiny-4bit files=4 bytes=24".to_owned()
-            ),
+            lines.contains(&format!(
+                "hf checkpoint repo=mlx-community/Tiny-4bit files=4 bytes={bytes}"
+            )),
             "{lines:?}"
         );
         let files: Vec<&String> = lines.iter().filter(|l| l.starts_with("hf file ")).collect();
