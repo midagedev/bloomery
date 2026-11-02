@@ -2,7 +2,8 @@
 
 How a model is attached today, derived from the last three attaches: GLM-5.3-Flash (`glm5next`, 2026-09-27 to 10-02),
 Qwen3.8-Flash-Next (`qwen4exp`, 2026-09-27 to 10-08) and MiMo-V2.6-Flash (`mimo2`, 2026-10-07 to 10-09). Read from the
-tree at `6b630e5e`; every claim cites `path:line`, and `[unverified]` marks what I could not check. The ladder is
+tree at `6b630e5e`; every claim cites `path:line`, and `[unverified]` marks what I could not check. The shared owners
+added to steps 5 to 8 and to the common-owner table are read at `e7180ea9`, and their lines are that tree's. The ladder is
 long. A reader and a placement you can finish alone; the card body, the serve seat and every oracle need the
 maintainers' box today, and the last section says where they take over.
 
@@ -45,10 +46,10 @@ dumps, real-file gates, timed runs).
 | 2 | Tokenizer, chat template | `crates/tokenizer/src/pretok.rs:350`, `ChatSpec` `crates/models/src/lib.rs:589`, `chat_of` `arch/mod.rs:256`, tool parsers `crates/serve/src/{glmxml,qwenxml,dsml,hermes}.rs` | A for the code; the id oracle is B |
 | 3 | Refset family and its dump | `crates/refset/src/arch/<arch>/mod.rs` and the table `arch/mod.rs:17-28`; `tools/ref/models/<arch>.sh`, `tools/ref/build-ik-<arch>.sh`, `justfile:667` (`dump-ref-mimo2`) | A for the row's tests; the dump is B |
 | 4 | Fixture row | `crates/model/src/arch/<arch>/fixture.rs`, `FIXTURE_SPECS` and each row's `FixtureRow` in `crates/model/src/arch/registry.rs`, `crates/refset/src/fixture.rs:33`, `tools/ref/ref-paths.sh:73-79` | generate L; its `fx_` oracle sets B |
-| 5 | Card body | `crates/gpu-<arch>/` (or `crates/gpu/src/arch/...` for a variant); root `Cargo.toml:3`, `crates/gpu-gates/Cargo.toml` | G to build and run |
-| 6 | App session | `crates/app/src/arch/<arch>/mod.rs`, feature in `crates/app/Cargo.toml` | G (feature-gated); L for default-feature tests |
-| 7 | Serve seat | `crates/gpu-gates/src/bin/shared/serve_seats/<seat>.rs`, `serve_seats/mod.rs`, `bloomery_serve.rs:206-226` | G, then B for the seat gates |
-| 8 | Placement sizing | `crates/model/src/arch/<arch>/place.rs` over `plan_host_routed` in `crates/placement/src/placement.rs` | A (placement is pure) and L |
+| 5 | Card body | `crates/gpu-<arch>/` (or `crates/gpu/src/arch/...` for a variant); root `Cargo.toml:3`, `crates/gpu-gates/Cargo.toml`; it calls `site`, `card_leg`, `card_slots`, `rows`, `draft` and `kv_format` in `crates/gpu/src/` | G to build and run |
+| 6 | App session | `crates/app/src/arch/<arch>/mod.rs`, feature in `crates/app/Cargo.toml`; the prompt call plan in `crates/runtime/src/prompt.rs` | G (feature-gated); L for default-feature tests |
+| 7 | Serve seat | `crates/gpu-gates/src/bin/shared/serve_seats/<seat>.rs`, `serve_seats/mod.rs`, `bloomery_serve.rs:206-226`; `verifies_slots` and `AutoSlots` in `crates/gpu-gates/src/bind.rs` | G, then B for the seat gates |
+| 8 | Placement sizing | `crates/model/src/arch/<arch>/place.rs` over `plan_host_routed` in `crates/placement/src/placement.rs`; `host_stack` and `wide_act_bytes` in `crates/placement/src/kernels.rs` | A (placement is pure) and L |
 | 9 | Levers | `crates/levers/src/registry.rs` | A |
 | 10 | Gates and recipes | `justfile`, `tools/gate-paths.tsv`, `tools/gate-batch-resources.tsv`, `tools/ref/ptx-shapes.tsv`, `tools/unsafe-ratchet.txt` | A for `just check-recipes`; running the gates is G or B |
 
@@ -150,12 +151,44 @@ in `registry::ROWS`, so only a file of that row is checked against them), and a 
 counts each name. Build with `cargo oxide`, never plain `cargo` (`docs/BUILD.md:55`). `just mac-check` type-checks it
 without a card.
 
+The body calls these shared owners and passes its own facts to them as data:
+
+- **Dense sites.** Every dense projection of the wide prompt walk calls `site::gemm` (`crates/gpu/src/site.rs:1405`)
+  whatever its type, and a gated block such as a shared expert calls `site::gated` (`:2138`). The site's type comes
+  from the file's header, so the body never matches on `GgmlType`.
+- **Gated norm.** A gated delta (GDN) layer's norm gate is a spec fact, `GdnGate` (`crates/models/src/lib.rs:537`:
+  `Silu` or `Sigmoid`). The norm-gate kernel takes it in `NormGateArgs` (`crates/gpu/src/linear/norm_gate.rs:442`).
+- **Routed experts on the card.** The leg from the normed rows to the slots' down rows is `crates/gpu/src/card_leg.rs`.
+  `CardSlotKernels::enqueue_card_join` (`crates/gpu/src/card_slots.rs:1018`) sums the card slots and adds the shared
+  expert in one launch. The model passes the slot count and the weight pitch in `CardJoin` (`:823`) and its shared
+  gate column in `SharedJoin` (`:815`): `None` for an ungated shared expert (GLM-5.3-Flash), the router's column for a
+  gated one (Qwen3.8). A 32-value down type writes BF16 rows through `enqueue_gemm32_bf16`
+  (`crates/gpu/src/gemm/gemm32.rs:1733`).
+- **Row tables.** A table read by row ids, such as a per-layer embedding, goes through `crates/gpu/src/rows.rs`: it
+  reads the call's rows, uploads them as read and decodes them on the card. The row format comes from the table's type
+  (`RowFormat::of`, `:74`); the model names the rows and gives the values their meaning.
+- **Drafts.** An MTP or NextN draft implements `SlotDraft` (`crates/gpu/src/draft.rs:404`), and
+  `GpuModel::draft_store_slots` and `draft_chain_slots` (`:566`, `:638`) walk every slot. Qwen3.8's MTP and GLM's
+  NextN (`crates/gpu-glm5next/src/nextn.rs:1439`) both run on it.
+- **Resident slots.** The body implements `Slots` and `SlotRows` (`crates/gpu/src/model/slots.rs:53`, `:80`).
+  `SlotRows::SETTLES_PARTIAL_KEEP` (`:141`) states whether the body settles a partial keep of a pass's rows, which
+  the serve seat's verify reads (step 7).
+- **KV cache format.** A load that keeps the GQA cache layout takes its format from `KvChoice::choose`
+  (`crates/gpu/src/kv_format.rs:102`): `--cache-type-k`, else the `BLOOMERY_QWEN3_KV` lever, else f16. A model sets
+  no default of its own.
+
 ### 6. App session
 
 Three small traits behind `Session<B>`: `Open` (plan and load), `Prompt` (feed ids), `Keep` (what a cut keeps)
 (`crates/app/src/lib.rs:149,183,192`). MiMo's is 113 lines and feeds one id a step with no checkpoint
 (`crates/app/src/arch/mimo2/mod.rs:1-8`); GLM's has checkpoints and MTP (`glm5next/mod.rs`, 336 lines). Reuse
 `HostCfg` and `PlanLevers` (`mimo2/mod.rs:23-27`) rather than new options.
+
+A prompt call ends as `runtime::prompt::CallEnd` asks (`crates/runtime/src/prompt.rs:48`): `Unread`, `Argmax` or
+`Close`. `runtime::prompt` also cuts the call into units and batches, so a body writes no prompt loop of its own. A
+body whose prompt call can run without the head overrides `Prompt::prompt_call` (`crates/app/src/lib.rs:212`). A body
+that folds the last id into the call's last unit also overrides `Prompt::closes` (`:225`). `Session::verify_rounds`
+(`:873`) verifies several slots' drafted windows in one round, for MTP and lookup drafts alike.
 
 ### 7. Serve seat
 
@@ -165,6 +198,16 @@ the mirror in `tools/hf-arch-check.py` (its self-test greps `Model::serves`, `Ar
 the README's Use table (`README.md:83-84`). MiMo has none yet; take the shape from the GLM seat (`serve_seats/glm.rs`).
 Gate: `gate-gpu-glm5next-serve` (`justfile:2143`) is the pattern; it needs cards.
 
+The seat reads three shared owners in `crates/gpu-gates/src/bind.rs`:
+
+- `Seat::prompt_call` (`:1498`) is the server's one prompt call plan. A seat whose body runs a call without the head
+  overrides it, and only the seat's own `Seat::prefill_next` (`:1558`) asks `CallEnd::Close`.
+- `verifies_slots` (`:732`) decides from the body's `SlotRows` whether the load verifies several slots in one pass.
+  The draft's name does not enter it.
+- `--parallel auto` is `AutoSlots::count` (`:254`). The seat passes its one-slot ask and its plan of `n` slots, and
+  the count is the most slots, up to `ctx_ask::AUTO_MOST`, whose plan holds one request's context
+  (`ctx_ask::most_slots`, `crates/placement/src/placement/ctx_ask.rs:44`).
+
 ### 8. Placement sizing
 
 `place.rs` states which bytes go where on a machine: the reader's `PlanInputs`, the KV bytes per layer, and the common
@@ -172,6 +215,11 @@ planner (`plan_host_routed` in `crates/placement/src/placement.rs`, for a model 
 the host). MiMo's is 407 lines (`38b71576`). The machine description is `model::placement::workstation` (the cards and
 RAM of the maintainers' box, `crates/model/src/placement/workstation.rs`); a plan names what holds the bytes, never a
 copied shape from another card.
+
+Two rules in `crates/placement/src/kernels.rs` are shared by the plan and the load. `host_stack` (`:109`) says whether
+the host tier runs a routed stack of a type, so experts go to the host only where a host kernel runs them; the plan's
+split and the host tier's load both ask it. `wide_act_bytes` (`:205`) counts the activation forms the wide dense sites
+read, and the load allocates by the same rule.
 
 ### 9. Levers
 
@@ -228,18 +276,28 @@ MiMo's first card-expert design skipped two rows, with these results:
 - **The card leg.** The design planned a fourth copy of the leg, when three already existed (GLM's
   `crates/gpu-glm5next/src/ffn.rs:503`, Qwen3.8's `crates/gpu/src/arch/qwen3moe/card38.rs`, V4.1's
   `crates/gpu-deepseek41/src/chain/ffn/batch.rs`).
-- **Residency.** The design placed experts statically, by id. The common residency machine never ran:
-  `crates/gpu-mimo2/src/body.rs:961` still returns `None`. The predicted gain was smaller than it had to be.
+- **Residency.** The design placed experts statically, by id. The common residency machine never ran,
+  because the body's `residency_parts` returned `None`. The predicted gain was smaller than it had to be. At
+  `e7180ea9` the body returns the parts of the common tier shell (`crates/gpu/src/host/shell.rs:121`).
 
 | Owner | Where it lives | How a model attaches |
 |---|---|---|
 | Placement plan | `placement::plan_routed` in `crates/placement/src/placement.rs` | Pass the model's card rule; no model-owned planner |
 | Kernel table | The card columns of each type's `QROWS` row (`crates/gguf/src/qtype.rs`), read by operation in `crates/placement/src/kernels.rs` | A quant type gets its card columns in its row; the body dispatches through `kernels`, never by matching `GgmlType` itself |
-| Card expert leg | Each family's own today (the three files above) | Call an existing leg, or lift it to a common owner in `crates/gpu`; never add a copy |
+| Dense sites | `site::gemm` and `site::gated` in `crates/gpu/src/site.rs` | Call them for every dense projection; the site's type comes from the file |
+| Gated norm | `crates/gpu/src/linear/norm_gate.rs` | The spec names its `GdnGate`; the kernel takes it as data |
+| Card expert leg | `crates/gpu/src/card_leg.rs`; `CardSlotKernels` (`enqueue_card_acc`, `enqueue_card_join`) in `crates/gpu/src/card_slots.rs` | Call the leg and the join; pass the slot count, weight pitch and shared gate column in `CardJoin` and `SharedJoin`; never add a copy |
+| Row tables | `crates/gpu/src/rows.rs` | Name the rows; the format comes from the table's type (`RowFormat::of`) |
 | Residency (hot experts move to the card at run time) | `crates/gpu/src/host/served.rs` (`TierBody::residency_parts`, `ResidencyParts`) | The body's `residency_parts` returns `Some`; glue like GLM's `crates/gpu-glm5next/src/swap.rs` (72 lines) |
 | Expert tier (a second card holds experts) | `crates/gpu/src/host/tier.rs` | Glue like `crates/gpu-glm5next/src/tier.rs` or `crates/gpu/src/arch/qwen3moe/tier38.rs` |
-| Prompt walk | `crates/runtime/src/prompt.rs` | The body implements the walk's hooks; no per-model prompt loop |
-| Resident slots (`--parallel N`) | `crates/gpu/src/model/slots.rs` (`Slots`), `crates/placement/src/slots.rs` | `impl Slots` for the body |
+| Host experts | `placement::kernels::host_stack` | Nothing to add: the plan and the load place host experts only where a host kernel runs the stack's type |
+| Tiered body shell | `crates/gpu/src/host/shell.rs` (`TierShell`) | A body over a host tier holds one `TierShell` and forwards to it |
+| Prompt walk and call plan | `crates/runtime/src/prompt.rs` (`CallEnd`); `Prompt::prompt_call` in `crates/app/src/lib.rs`; `Seat::prompt_call` in `crates/gpu-gates/src/bind.rs` | The body implements the walk's hooks and says whether a call runs without the head; no per-model prompt loop |
+| Resident slots (`--parallel N`) | `crates/gpu/src/model/slots.rs` (`Slots`, `SlotRows`), `crates/placement/src/slots.rs` | `impl Slots` and `impl SlotRows` for the body |
+| `--parallel auto` | `bind::AutoSlots::count` over `placement::ctx_ask::most_slots` | The seat passes its one-slot ask and its plan of `n` slots |
+| Draft executor | `crates/gpu/src/draft.rs` (`SlotDraft`) | `impl SlotDraft` for the draft's steps; the executor walks the slots |
+| Verify round | `bind::verifies_slots`, `app::Session::verify_rounds` | Nothing to add: the body's `SlotRows` decides |
+| KV cache format | `gpu::kv_format` (`KvChoice::choose`) | Nothing to add: the flag, then the lever, else f16 |
 | Serve seat | `crates/gpu-gates/src/bin/shared/serve_seats/` | One seat file per model, shaped like `glm.rs` or `mimo2.rs` |
 | Timing | The lease runners in `tools/ref/` | Through the serve seat or an existing runner; no per-model timing driver |
 
