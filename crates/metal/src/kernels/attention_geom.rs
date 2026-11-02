@@ -1,6 +1,6 @@
 use core::fmt;
 
-use crate::geom::{Geometry, KernelRefused, yes_no};
+use crate::geom::{Geometry, KernelRefused, Prologue, yes_no};
 use crate::instance::{HOST, Instance};
 
 /// Values in one head. A shim: the build's host instance's. Callers left:
@@ -152,14 +152,15 @@ const _: () = {
 };
 
 /// The score's scale for a head of `head` values: ik's
-/// `1.0f/sqrtf(float(head))` in f32 (exact at 256; at 128 the f32 nearest,
-/// the delta net's own query scale). A head with no written scale has NaN,
-/// which [`holds`] refuses.
+/// `1.0f/sqrtf(float(head))` in f32 (exact at 256 and 64; at 128 the f32
+/// nearest, the delta net's own query scale). A head with no written scale
+/// has NaN, which [`holds`] refuses.
 #[must_use]
 pub const fn scale_of(head: usize) -> f32 {
     match head {
         256 => 0.0625,
         128 => f32::from_bits(0x3db5_04f3),
+        64 => 0.125,
         _ => f32::NAN,
     }
 }
@@ -208,15 +209,15 @@ pub fn holds(g: &Geometry) -> Result<(), KernelRefused> {
     let refuse = |axis, value: &dyn fmt::Display, needs| {
         Err(KernelRefused::new("attention", axis, value, needs))
     };
-    // A lane holds 8 values (a 16-byte word) or 4 (an 8-byte word), the
-    // norm's pair tree is head/64 warps, and the score's scale is written
-    // for those heads.
+    // A lane holds 8 values (a 16-byte word), 4 (an 8-byte word) or 2 (a
+    // 4-byte word), the norm's pair tree is head/64 warps, and the score's
+    // scale is written for those heads.
     if a.lane_dims * SIMD_WIDTH != a.head
-        || !matches!(a.lane_dims, 4 | 8)
+        || !matches!(a.lane_dims, 2 | 4 | 8)
         || !a.head.is_multiple_of(64)
         || scale_of(a.head).is_nan()
     {
-        return refuse("head", &a.head, "128 or 256 values");
+        return refuse("head", &a.head, "64, 128 or 256 values");
     }
     let row = &g.instance.key.attn.row;
     if row.value as usize != a.head {
@@ -247,11 +248,11 @@ pub fn holds(g: &Geometry) -> Result<(), KernelRefused> {
             "at most the one-pass flash's threads, its values in 32 KB",
         );
     }
-    // The prologue's two axes name the entries the kernels are: the head
-    // norm's sum-of-squares walks the NEOX pair tree, so a head norm with
-    // NORM pairs is no entry, and a norm-free prologue is compiled for the
-    // neighbour pairs alone.
-    if (a.qk_norm && a.norm_pairs) || (!a.qk_norm && !a.norm_pairs) {
+    // The prologue's two axes name the variants the kernels are (the file's
+    // three `attn_norm_rope`s); the head norm's sum of squares walks the NEOX
+    // pair tree, so a head norm over NORM pairs is the one combination none
+    // is compiled for.
+    let Some(prologue) = a.prologue() else {
         return refuse(
             "head norm and rope pairs",
             &format_args!(
@@ -259,15 +260,16 @@ pub fn holds(g: &Geometry) -> Result<(), KernelRefused> {
                 yes_no(a.qk_norm),
                 yes_no(a.norm_pairs)
             ),
-            "a head norm with NEOX pairs, or none with NORM pairs",
+            "a head norm with NEOX pairs, or none with either pairing",
         );
-    }
-    // The norm's pair tree (rope_neox's `owned_pair`): the turning pairs
-    // inside warp 0 or every value turning. The neighbour pairs turn within
-    // one lane, so they take no tree.
+    };
+    // The NEOX pairs' partial rope is built and gated where the turning pairs
+    // lie inside warp 0 (the head norm's pair tree walks them as rope_neox's
+    // `owned_pair` does) or every value turns. The neighbour pairs turn within
+    // one lane, so they take no such rule.
     if !a.rot.is_multiple_of(2)
         || a.rot > a.head
-        || (!a.norm_pairs && a.rot / 2 > SIMD_WIDTH && a.rot != a.head)
+        || (prologue != Prologue::RawNorm && a.rot / 2 > SIMD_WIDTH && a.rot != a.head)
     {
         return refuse(
             "rope dims",
@@ -400,6 +402,57 @@ mod tests {
         }
     }
 
+    /// The small dense models' attention rows: groups of two, three, five, six
+    /// and seven at head 128 and groups of four and seven at head 64, where a
+    /// lane holds two values and the score's scale is exact. The split flash
+    /// declares its thread maximum for the threadgroups of every key head
+    /// together only up to 1024 threads (`ATTN_FLASH_HOLD`), so the group of
+    /// five over eight key heads is the row with none. Mutant: `holds` refuses
+    /// a lane of two values, or `scale_of` has no head 64.
+    #[test]
+    fn the_flash_takes_the_groups_of_the_small_dense_models_at_head_128_and_head_64() {
+        use crate::instance::{
+            LLAMA_ATTN_GQA3, LLAMA_ATTN_H64, NEOX_ATTN_GQA5, NEOX_ATTN_GQA6, NEOX_ATTN_GQA7,
+            NEOX_ATTN_H64_GQA7, QWEN3_ATTN_GQA2,
+        };
+        for (inst, gqa, lane_dims, one_pass, held) in [
+            (QWEN3_ATTN_GQA2, 2usize, 4usize, 9856usize, true),
+            (LLAMA_ATTN_GQA3, 3, 4, 9856, true),
+            (NEOX_ATTN_GQA5, 5, 4, 9856, false),
+            (NEOX_ATTN_GQA6, 6, 4, 9856, true),
+            (NEOX_ATTN_GQA7, 7, 4, 9856, true),
+            (LLAMA_ATTN_H64, 4, 2, 4992, true),
+            (NEOX_ATTN_H64_GQA7, 7, 2, 4992, true),
+        ] {
+            let g = Geometry::of(&inst);
+            assert_eq!(holds(&g), Ok(()), "{}", inst.name);
+            let a = g.attn;
+            assert_eq!(
+                (a.gqa, a.simd_groups, a.flash_threads, a.lane_dims),
+                (gqa, gqa, SIMD_WIDTH * gqa, lane_dims),
+                "{}",
+                inst.name
+            );
+            assert_eq!(a.lane_dims * SIMD_WIDTH, a.head, "{}", inst.name);
+            assert_eq!(one_pass_bytes(a.head), one_pass, "{}", inst.name);
+            assert_eq!(
+                a.flash_threads * a.kv_heads <= 1024,
+                held,
+                "{}: {} threads",
+                inst.name,
+                a.flash_threads * a.kv_heads
+            );
+        }
+        assert_eq!(scale_of(64), 1.0f32 / 64f32.sqrt());
+        // A head of 96 values is a lane of three: no word holds it.
+        let mut odd = LLAMA_ATTN_H64;
+        odd.key.attn.row.head = 96;
+        odd.key.attn.row.value = 96;
+        let refused = holds(&Geometry::of(&odd)).expect_err("a head of 96 values");
+        assert_eq!((refused.kernel, refused.axis), ("attention", "head"));
+        assert!(refused.value.starts_with("96"), "{}", refused.value);
+    }
+
     #[test]
     fn the_flash_refuses_a_group_past_a_fragment_and_folds_any_key_heads() {
         let wide = Geometry::of(&shaped(20, 2));
@@ -435,35 +488,65 @@ mod tests {
         assert_eq!(a.rot, a.head);
     }
 
+    /// The two axes name the three prologue variants the flash is compiled for, and the fourth
+    /// combination, a head norm over NORM pairs, is refused by name. Mutant: `AttnGeom::prologue`
+    /// answering `None` for the raw NEOX variant or `Some` for the head norm over NORM pairs, or
+    /// `holds` taking a NEOX rope of 96 values in a head of 128.
     #[test]
-    fn the_prologues_two_axes_name_the_entries_and_the_mixes_are_refused() {
+    fn the_prologues_two_axes_name_three_variants_and_a_head_norm_over_neighbour_pairs_is_refused()
+    {
         // Qwen3.6's attention at the llama axes: the no-norm, neighbour-paired
         // prologue, which holds.
         let mut llama = crate::instance::LLAMA_ATTN;
         llama.key.hidden = 2048;
-        let g = Geometry::of(&llama);
-        assert_eq!(holds(&g), Ok(()));
-        assert!(g.attn.qk_norm == llama.key.attn.qk_norm && !g.attn.qk_norm);
-        assert!(g.attn.norm_pairs);
-        // A head norm over the neighbour pairs: the norm's sum-of-squares
-        // walks the NEOX pair tree, so the mix is no entry.
-        let mut mixed = llama;
-        mixed.key.attn.qk_norm = true;
-        let refused = holds(&Geometry::of(&mixed)).expect_err("a head norm with NORM pairs");
-        assert_eq!(
-            (refused.kernel, refused.axis),
-            ("attention", "head norm and rope pairs")
-        );
-        assert!(refused.value.starts_with("head norm yes, NORM pairs yes"));
-        // No head norm over the NEOX pairs: no entry either.
-        let mut mixed = llama;
-        mixed.key.attn.norm_pairs = false;
-        let refused = holds(&Geometry::of(&mixed)).expect_err("no head norm with NEOX pairs");
-        assert_eq!(
-            (refused.kernel, refused.axis),
-            ("attention", "head norm and rope pairs")
-        );
-        assert!(refused.value.starts_with("head norm no, NORM pairs no"));
+        for (qk_norm, norm_pairs, want) in [
+            (true, false, Some(Prologue::NormedNeox)),
+            (false, true, Some(Prologue::RawNorm)),
+            (false, false, Some(Prologue::RawNeox)),
+            (true, true, None),
+        ] {
+            let mut inst = llama;
+            inst.key.attn.qk_norm = qk_norm;
+            inst.key.attn.norm_pairs = norm_pairs;
+            let g = Geometry::of(&inst);
+            assert_eq!(g.attn.prologue(), want, "norm {qk_norm}, NORM {norm_pairs}");
+            match want {
+                Some(_) => assert_eq!(holds(&g), Ok(()), "norm {qk_norm}, NORM {norm_pairs}"),
+                None => {
+                    // The norm's sum-of-squares walks the NEOX pair tree, so
+                    // the mix is no entry.
+                    let refused = holds(&g).expect_err("a head norm with NORM pairs");
+                    assert_eq!(
+                        (refused.kernel, refused.axis),
+                        ("attention", "head norm and rope pairs")
+                    );
+                    assert!(refused.value.starts_with("head norm yes, NORM pairs yes"));
+                }
+            }
+        }
+        // The NEOX raw values (Qwen2's) turn whole or within warp 0 like the
+        // normed variant; the neighbour pairs take any even width.
+        for (norm_pairs, rot, holds_it) in [
+            (false, 128, true),
+            (false, 64, true),
+            (false, 96, false),
+            (true, 96, true),
+        ] {
+            let mut inst = llama;
+            inst.key.attn.norm_pairs = norm_pairs;
+            inst.key.attn.rot = rot;
+            let verdict = holds(&Geometry::of(&inst));
+            if holds_it {
+                assert_eq!(verdict, Ok(()), "NORM {norm_pairs}, rot {rot}");
+            } else {
+                let refused = verdict.expect_err("a partial rope past warp 0");
+                assert_eq!(
+                    (refused.kernel, refused.axis),
+                    ("attention", "rope dims"),
+                    "NORM {norm_pairs}, rot {rot}"
+                );
+            }
+        }
     }
 
     #[test]

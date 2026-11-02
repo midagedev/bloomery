@@ -45,8 +45,9 @@ use bloomery_device::conformance::{Clause, Report, Verdict, why};
 use bloomery_device::{Buffer, Device, DeviceError, Elems, FaultWord};
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::instance::{
-    self, Instance, LFM3_ATTN, LLAMA_ATTN, QWEN3MOE_A3B, QWEN35MOE_A3B, QWEN35MOE_GDN48,
-    QWEN35MOE_GQA4, QWEN35MOE_GQA6, REGISTERED,
+    self, Instance, LFM3_ATTN, LLAMA_ATTN, LLAMA_ATTN_GQA3, LLAMA_ATTN_H64, NEOX_ATTN_GQA5,
+    NEOX_ATTN_GQA6, NEOX_ATTN_GQA7, NEOX_ATTN_H64_GQA7, QWEN3_ATTN_GQA2, QWEN3MOE_A3B,
+    QWEN35MOE_A3B, QWEN35MOE_GDN48, QWEN35MOE_GQA4, QWEN35MOE_GQA6, REGISTERED,
 };
 use bloomery_metal::kernels::{
     Geometry, HeadNormParams, Kernels, LoadNorm, MatvecParams, Mode, NormOnLoad, Quant,
@@ -62,6 +63,8 @@ mod clauses_a4;
 mod clauses_apart;
 #[path = "clauses_attention.rs"]
 mod clauses_attention;
+#[path = "clauses_bias.rs"]
+mod clauses_bias;
 #[path = "clauses_delta.rs"]
 mod clauses_delta;
 #[path = "clauses_embed.rs"]
@@ -510,7 +513,7 @@ enum Table {
     /// those clauses in both tables (`kept`) and the instance's own (`own`).
     Shaped {
         kept: &'static [&'static str],
-        own: &'static [mutants::Mutant],
+        own: &'static [&'static [mutants::Mutant]],
     },
     /// The clauses of the kernels an instance's delta axes shape, on drawn
     /// parameters (the delta step and rows, the head-normed mat-vecs and
@@ -520,16 +523,21 @@ enum Table {
     /// own (`own`).
     Delta {
         kept: &'static [&'static str],
-        own: &'static [mutants::Mutant],
+        own: &'static [&'static [mutants::Mutant]],
     },
-    /// The clauses of the attention kernels an instance's group size shapes
-    /// (the decode flash, the rows flash and the prefill flash) on its own
-    /// geometry: an instance that is another registered instance's but for
-    /// its attention layers. The mutants of those clauses in both tables
-    /// (`kept`) and the instance's own (`own`).
+    /// The clauses of the attention kernels an instance's group size and head
+    /// width shape (the decode flash, the rows flash and the prefill flash, the
+    /// NaN and refusal clauses) on its own geometry: an instance that is another
+    /// registered instance's but for its attention layers, with a plain or a
+    /// gated query. The clauses' oracle is the instance's prologue
+    /// ([`bloomery_metal::geom::Prologue`]: the head norm and NEOX pairs,
+    /// neighbour pairs with no norm, or NEOX pairs with no norm); an instance
+    /// of neighbour pairs also runs the rope-factor scenes (`attn_prologue`).
+    /// The mutants of those clauses in both tables (`kept`) and the
+    /// instance's own (`own`).
     Attention {
         kept: &'static [&'static str],
-        own: &'static [mutants::Mutant],
+        own: &'static [&'static [mutants::Mutant]],
     },
     /// The clauses of the attention kernels an instance's window and
     /// per-head gate axes shape, with the rope table's: the instance's
@@ -538,7 +546,7 @@ enum Table {
     /// those clauses in both tables (`kept`) and the instance's own (`own`).
     Window {
         kept: &'static [&'static str],
-        own: &'static [mutants::Mutant],
+        own: &'static [&'static [mutants::Mutant]],
     },
     /// The clauses of the attention kernels an instance's head-norm and
     /// pairing axes shape: the instance's flash applies no head norm and
@@ -547,7 +555,7 @@ enum Table {
     /// (`kept`) and the instance's own (`own`).
     Prologue {
         kept: &'static [&'static str],
-        own: &'static [mutants::Mutant],
+        own: &'static [&'static [mutants::Mutant]],
     },
 }
 
@@ -571,7 +579,7 @@ const INSTANCE_ROWS: &[InstanceRow] = &[
         fixture: "qwen3moe",
         table: Table::Shaped {
             kept: mutants::Q30_KEPT,
-            own: mutants::Q30_MUTANTS,
+            own: &[mutants::Q30_MUTANTS],
         },
     },
     InstanceRow {
@@ -579,7 +587,7 @@ const INSTANCE_ROWS: &[InstanceRow] = &[
         fixture: "qwen35moe",
         table: Table::Delta {
             kept: mutants::GDN48_KEPT,
-            own: mutants::GDN48_MUTANTS,
+            own: &[mutants::GDN48_MUTANTS],
         },
     },
     InstanceRow {
@@ -587,7 +595,7 @@ const INSTANCE_ROWS: &[InstanceRow] = &[
         fixture: "qwen35moe",
         table: Table::Attention {
             kept: mutants::ATTN_KEPT,
-            own: mutants::GQA_MUTANTS,
+            own: &[mutants::GROUP_MUTANTS, mutants::FOLD_STRIDE_MUTANTS],
         },
     },
     InstanceRow {
@@ -595,7 +603,7 @@ const INSTANCE_ROWS: &[InstanceRow] = &[
         fixture: "qwen35moe",
         table: Table::Attention {
             kept: mutants::ATTN_KEPT,
-            own: mutants::GQA_MUTANTS,
+            own: &[mutants::GROUP_MUTANTS, mutants::FOLD_STRIDE_MUTANTS],
         },
     },
     InstanceRow {
@@ -603,7 +611,7 @@ const INSTANCE_ROWS: &[InstanceRow] = &[
         fixture: "qwen35moe",
         table: Table::Window {
             kept: mutants::WINDOW_KEPT,
-            own: mutants::WINDOW_MUTANTS,
+            own: &[mutants::WINDOW_MUTANTS],
         },
     },
     InstanceRow {
@@ -611,7 +619,91 @@ const INSTANCE_ROWS: &[InstanceRow] = &[
         fixture: "qwen35moe",
         table: Table::Prologue {
             kept: mutants::PROLOGUE_KEPT,
-            own: mutants::PROLOGUE_MUTANTS,
+            own: &[mutants::PROLOGUE_MUTANTS],
+        },
+    },
+    InstanceRow {
+        instance: &QWEN3_ATTN_GQA2,
+        fixture: "qwen3moe",
+        table: Table::Attention {
+            kept: mutants::PLAIN_ATTN_KEPT,
+            own: &[mutants::GROUP_MUTANTS, mutants::KV_MIRROR_MUTANTS],
+        },
+    },
+    InstanceRow {
+        instance: &LLAMA_ATTN_GQA3,
+        fixture: "qwen3moe",
+        table: Table::Attention {
+            kept: mutants::PLAIN_ATTN_KEPT,
+            own: &[
+                mutants::GROUP_MUTANTS,
+                mutants::KV_MIRROR_MUTANTS,
+                mutants::PROLOGUE_MUTANTS,
+            ],
+        },
+    },
+    InstanceRow {
+        instance: &LLAMA_ATTN_H64,
+        fixture: "qwen3moe",
+        table: Table::Attention {
+            kept: mutants::PLAIN_ATTN_KEPT,
+            own: &[
+                mutants::GROUP_MUTANTS,
+                mutants::KV_MIRROR_MUTANTS,
+                mutants::FOLD_STRIDE_MUTANTS,
+                mutants::HEAD64_MUTANTS,
+                mutants::PROLOGUE_MUTANTS,
+            ],
+        },
+    },
+    InstanceRow {
+        instance: &NEOX_ATTN_GQA5,
+        fixture: "qwen3moe",
+        table: Table::Attention {
+            kept: mutants::PLAIN_ATTN_KEPT,
+            own: &[
+                mutants::GROUP_MUTANTS,
+                mutants::KV_MIRROR_MUTANTS,
+                mutants::NEOX_RAW_MUTANTS,
+            ],
+        },
+    },
+    InstanceRow {
+        instance: &NEOX_ATTN_GQA6,
+        fixture: "qwen3moe",
+        table: Table::Attention {
+            kept: mutants::PLAIN_ATTN_KEPT,
+            own: &[
+                mutants::GROUP_MUTANTS,
+                mutants::KV_MIRROR_MUTANTS,
+                mutants::NEOX_RAW_MUTANTS,
+            ],
+        },
+    },
+    InstanceRow {
+        instance: &NEOX_ATTN_GQA7,
+        fixture: "qwen3moe",
+        table: Table::Attention {
+            kept: mutants::PLAIN_ATTN_KEPT,
+            own: &[
+                mutants::GROUP_MUTANTS,
+                mutants::KV_MIRROR_MUTANTS,
+                mutants::NEOX_RAW_MUTANTS,
+            ],
+        },
+    },
+    InstanceRow {
+        instance: &NEOX_ATTN_H64_GQA7,
+        fixture: "qwen3moe",
+        table: Table::Attention {
+            kept: mutants::PLAIN_ATTN_KEPT,
+            own: &[
+                mutants::GROUP_MUTANTS,
+                mutants::KV_MIRROR_MUTANTS,
+                mutants::FOLD_STRIDE_MUTANTS,
+                mutants::HEAD64_MUTANTS,
+                mutants::NEOX_RAW_MUTANTS,
+            ],
         },
     },
 ];
@@ -1035,6 +1127,15 @@ fn clause_table<'a>(
         Table::Attention { .. } => instances()
             .chain(clauses_attention::table(ctx))
             .chain(clauses_rows::attention(ctx))
+            .chain(
+                row.instance
+                    .key
+                    .attn
+                    .norm_pairs
+                    .then(|| clauses_window::prologue_factors(ctx))
+                    .into_iter()
+                    .flatten(),
+            )
             .chain(clauses_window::refusals(ctx))
             .collect(),
         Table::Window { .. } => instances().chain(clauses_window::table(ctx)).collect(),
@@ -1117,6 +1218,10 @@ fn front<'a>(ctx: &'a ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<'a>)> {
             }),
         ),
         ("embed", Box::new(|| ctx.with(clauses_embed::embed))),
+        (
+            "bias_rows",
+            Box::new(|| clauses_bias::bias_rows(ctx.harness)),
+        ),
         (
             "matvec_refusals",
             Box::new(|| clauses_matvec::matvec_refusals(ctx.harness)),

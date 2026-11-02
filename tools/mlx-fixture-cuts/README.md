@@ -13,6 +13,8 @@ Each file is held to its source's real shard headers and `config.json` by a test
 | `qwen38d-mlx.json` | `mlx-community/Qwen3.8-27B-4bit` at `10c35caafbb80f7dc6a7a432cdd11af10a6d4818` | layers 0 to 3 (three delta layers, one full-attention layer), the embedding, the head and the final norm; no vision tower |
 | `llama-mlx.json` | `mlx-community/Llama-3.1-8B-Instruct-4bit` at `90215b22ec18e72f623dde2ea7af4097025160e2` | layers 0 to 3 (every layer alike: GQA, SwiGLU), the embedding, the untied head and the final norm |
 | `qwen3-mlx.json` | `mlx-community/Qwen3-8B-4bit` at `545dc4251c05440727734bcd94334791f6ab0192` | layers 0 to 3 (every layer alike: GQA with the per-head q/k norms, SwiGLU), the embedding, the untied head and the final norm |
+| `qwen3t-mlx.json` | `mlx-community/Qwen3-4B-Instruct-2507-4bit` at `50d427756c6b1b2fe0c0a10f67fbda1fc8e82c1b` | layers 0 to 3 (every layer alike: GQA with the per-head q/k norms, SwiGLU), the embedding and the final norm; the head is the embedding (the folder has no `lm_head`, its config `tie_word_embeddings` true) |
+| `qwen2-mlx.json` | `mlx-community/Qwen2.5-Coder-7B-Instruct-4bit` at `019cc73c45c770444708a6dd8690c66243cc5c80` | layers 0 to 3 (every layer alike: GQA of 28 heads over 4 key heads of 128 values with a bias on the q, k and v projections and no head norm, SwiGLU), the embedding, the untied head and the final norm |
 
 ## The Metal e2e gate's pin of a cut
 

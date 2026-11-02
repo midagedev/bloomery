@@ -31,7 +31,9 @@ use crate::linear::{self, LinearShape, Ring};
 use crate::router::RouterDims;
 pub use model::arch::coverage::{DownEntry, GateUpEntry};
 use model::arch::coverage::{SiteEntry, qwen35_down, qwen35_gate_up, qwen35_shared, turns_as_neox};
-use model::arch::models::shape::{AttnShape, GroupRule, MoeShape, select_gqa};
+use model::arch::models::shape::{
+    AttnShape, GroupRule, MoeShape, Refusal, ShapeRefused, select_gqa,
+};
 use model::arch::models::{
     Act, DeltaKind, DeltaRule, Ffn, GdnGate, Gqa, KHeadMap, LayerSpec, Mixer, Moe, OutGate,
     Residual, RopeMode, ShortConv,
@@ -94,10 +96,15 @@ pub enum GqaKind {
     Gated256,
     /// A head of 128 values with no output gate and no key selection, the
     /// whole head turned by `pairs`: the q/k norm before the rope when
-    /// `head_norm`, none otherwise. [`GqaKind::Neox128`] is `{ Neox, true }`.
-    /// A layer's rope may divide by the file's frequency factors
-    /// ([`GqaKind::rope_factors`]); it attends every position.
+    /// `head_norm`, none otherwise. [`GqaKind::Neox128`] is `{ Neox, true }`; a dense Qwen2.5 is
+    /// `{ Neox, false }`. A layer's rope may divide by the file's frequency factors
+    /// ([`GqaKind::rope_factors`], the NORM class's only); it attends every position.
     Head128 { pairs: Pairs, head_norm: bool },
+    /// A head of 64 values with no output gate and no key selection, the whole head turned by
+    /// `pairs`: [`GqaKind::Head128`] at half the width (a dense Llama-3.2-1B is `{ Norm, false }`,
+    /// Qwen2.5-0.5B `{ Neox, false }`). A layer's rope may divide by the file's frequency factors
+    /// ([`GqaKind::rope_factors`], the NORM class's only); it attends every position.
+    Head64 { pairs: Pairs, head_norm: bool },
     /// LFM3: a head of 128 values, the whole head turned by NEOX, the q/k norm before the
     /// rope, and an output gate of its own: `attn_gate` projects the layer input to one value
     /// a query head, and the flash output of a head is multiplied by the sigmoid of its value
@@ -114,7 +121,7 @@ impl GqaKind {
     pub fn head_norm(self) -> bool {
         match self {
             GqaKind::Neox128 | GqaKind::Gated256 | GqaKind::HeadGate128 => true,
-            GqaKind::Head128 { head_norm, .. } => head_norm,
+            GqaKind::Head128 { head_norm, .. } | GqaKind::Head64 { head_norm, .. } => head_norm,
         }
     }
 
@@ -150,7 +157,7 @@ impl GqaKind {
     /// values of it the rope turns and how it pairs them, the head norm, and
     /// where the output gate comes from; and what a layer of the class keeps
     /// of its own: a window, rope factors.
-    const CLASSES: [Class; 4] = [
+    const CLASSES: [Class; 7] = [
         Class {
             kind: GqaKind::Neox128,
             head: HEAD_128,
@@ -173,6 +180,45 @@ impl GqaKind {
             gate: OutGate::None,
             window: false,
             rope_factors: true,
+        },
+        Class {
+            kind: GqaKind::Head64 {
+                pairs: Pairs::Norm,
+                head_norm: false,
+            },
+            head: HEAD_64,
+            rope: HEAD_64,
+            pairs: Pairs::Norm,
+            head_norm: false,
+            gate: OutGate::None,
+            window: false,
+            rope_factors: true,
+        },
+        Class {
+            kind: GqaKind::Head128 {
+                pairs: Pairs::Neox,
+                head_norm: false,
+            },
+            head: HEAD_128,
+            rope: HEAD_128,
+            pairs: Pairs::Neox,
+            head_norm: false,
+            gate: OutGate::None,
+            window: false,
+            rope_factors: false,
+        },
+        Class {
+            kind: GqaKind::Head64 {
+                pairs: Pairs::Neox,
+                head_norm: false,
+            },
+            head: HEAD_64,
+            rope: HEAD_64,
+            pairs: Pairs::Neox,
+            head_norm: false,
+            gate: OutGate::None,
+            window: false,
+            rope_factors: false,
         },
         Class {
             kind: GqaKind::Gated256,
@@ -264,6 +310,18 @@ pub struct GqaPlan {
     /// values), on a layer whose rope divides by them; a backend reads the values at load
     /// (`RopeSpec::with_factors`). Only a kind with its own gate has them.
     pub rope_freqs: Option<String>,
+    /// The layer's biases of `attn_q`, `attn_k` and `attn_v`, which the backend adds to the
+    /// projections' outputs before the flash; `None` for a layer whose file holds none. A kind
+    /// whose query rows hold a gate has none.
+    pub bias: Option<GqaBias>,
+}
+
+/// The names of a GQA layer's three projection biases, F32 vectors of one value a row of the
+/// projection they follow: the attention rows, and the key's and value's.
+pub struct GqaBias {
+    pub q: String,
+    pub k: String,
+    pub v: String,
 }
 
 /// An attention layer's output gate of its own: `attn_gate`, which projects the layer input to
@@ -598,11 +656,12 @@ fn card_fits(s: &LayerSpec) -> Result<(), String> {
                  its base alone"
             ));
         }
-        // The head-128 group of four is the head-gated window flash's block, which the card's
-        // launch lists do not hold for this class: its head-128 flash covers a group of eight
-        // or of seven.
+        // The card's head-128 flash covers a group of eight or of seven: the group of four is the
+        // head-gated window flash's block, which the card's launch lists do not hold for this
+        // class, and the card's table has no row (or one no launch here runs) for any other.
         if matches!(kind, GqaKind::Head128 { .. })
-            && select_gqa(AttnShape::of(g)).is_ok_and(|row| row.pack == 4)
+            && !select_gqa(AttnShape::of(g))
+                .is_ok_and(|row| matches!((row.pack, row.group), (7 | 8, GroupRule::One)))
         {
             return Err(format!(
                 "attention {}/{} heads of {HEAD_128}; the card's head-128 flash covers a group of \
@@ -620,6 +679,9 @@ fn card_fits(s: &LayerSpec) -> Result<(), String> {
 /// Values of the head the head-128 kernels are built for; the rope turns all
 /// of them.
 pub const HEAD_128: u32 = 128;
+
+/// Values of the head the head-64 attention is built for; the rope turns all of them.
+pub const HEAD_64: u32 = 64;
 
 /// The attention class `g`'s geometry selects, or why none does: the class
 /// table's row ([`GqaKind::CLASSES`]) of its head width, the values the rope
@@ -666,7 +728,7 @@ pub(crate) fn gqa_class(g: &Gqa) -> Result<GqaKind, String> {
                 "attention {g:?}; the kernels take {} (NEOX by IMROPE sections covering them), \
                  with no yarn, output norm, key selection, sinks or value scale, a window only on \
                  the head with an output gate of its own, and rope factors only there and on the \
-                 head-128 NORM attention with no head norm",
+                 NORM attention of head 128 or 64 with no head norm",
                 classes.join(" or ")
             ))
         }
@@ -690,18 +752,44 @@ pub(crate) fn layer_gqa(s: &LayerSpec) -> Result<(&Gqa, GqaKind), String> {
 /// quads or pairs, the head-128 group of seven, or the head-128 group of four
 /// (with an output gate of its own, or none, or the NEOX normed attention):
 /// [`Flash::Group`] names the one block of a key head's group the row's pack
-/// makes.
+/// makes. A head-128 or head-64 class takes every whole group (the card's table
+/// has no row for some, and a backend that compiles its own flash rows serves
+/// others): the flash is [`Flash::Group`] there, and the backend refuses the
+/// groups its own rows do not take by name (the card's: [`card_fits`]).
 fn gqa_fits(g: &Gqa) -> Result<(GqaKind, Flash), String> {
     let kind = gqa_class(g)?;
-    let row = select_gqa(AttnShape::of(g)).map_err(|e| e.to_string())?;
+    let wide = matches!(
+        kind,
+        GqaKind::Neox128 | GqaKind::Head128 { .. } | GqaKind::Head64 { .. }
+    );
+    let row = match select_gqa(AttnShape::of(g)) {
+        Ok(row) => row,
+        Err(ShapeRefused {
+            why: Refusal::GqaGroup { .. },
+            ..
+        }) if wide => return Ok((kind, Flash::Group)),
+        Err(e) => return Err(e.to_string()),
+    };
     let flash = match (kind, row.pack, row.group) {
         (_, 8, GroupRule::One) => Flash::Group,
         (_, 4, GroupRule::Packs) => Flash::Quads,
         (_, 2, GroupRule::Packs) => Flash::Pairs,
-        (GqaKind::Head128 { .. }, 7, GroupRule::One) => Flash::Seven,
+        (
+            GqaKind::Head128 {
+                pairs: Pairs::Norm,
+                head_norm: false,
+            },
+            7,
+            GroupRule::One,
+        ) => Flash::Seven,
         (GqaKind::HeadGate128 | GqaKind::Head128 { .. } | GqaKind::Neox128, 4, GroupRule::One) => {
             Flash::Group
         }
+        (
+            GqaKind::Neox128 | GqaKind::Head128 { .. } | GqaKind::Head64 { .. },
+            _,
+            GroupRule::One,
+        ) => Flash::Group,
         _ => {
             return Err(format!(
                 "attention {}/{} heads of {} selects {}, which this body does not launch",
@@ -991,6 +1079,21 @@ pub(crate) mod fixtures {
         }
     }
 
+    /// A dense Llama-3.2-1B's attention at `heads` over `kv_heads`: heads of 64 values turned
+    /// whole by NORM pairs, no head norm, no output gate ([`head128_gqa`] at half the width).
+    pub fn head64_gqa(heads: u32, kv_heads: u32, factors: bool) -> Gqa {
+        let wide = head128_gqa(heads, kv_heads, factors);
+        Gqa {
+            head_dim: 64,
+            value_dim: 64,
+            rope: Rope {
+                dims: 64,
+                ..wide.rope
+            },
+            ..wide
+        }
+    }
+
     /// A layer of `mixer` over a dense SwiGLU FFN of 512 and the plain residual.
     pub fn dense_layer(mixer: Mixer) -> LayerSpec {
         LayerSpec {
@@ -1052,8 +1155,8 @@ pub(crate) mod fixtures {
 #[cfg(test)]
 mod tests {
     use super::fixtures::{
-        delta, dense_layer, gqa, gqa_of, head128_gqa, layer, lfm3_conv, lfm3_gqa, lfm3_layer,
-        q30_gqa, q30_layer,
+        delta, dense_layer, gqa, gqa_of, head64_gqa, head128_gqa, layer, lfm3_conv, lfm3_gqa,
+        lfm3_layer, q30_gqa, q30_layer,
     };
     use super::{
         Flash, GqaKind, Kind35, Pairs, gqa_class, kind_of, kind35, kinds_of, kinds35, moe_fits,
@@ -1267,14 +1370,20 @@ mod tests {
     }
 
     /// A dense Qwen3's attention — the whole head turned by NEOX with the q/k
-    /// norms — plans at the groups its flash rows cover: eight (the 32B's 64/8,
-    /// the row the routed Qwen3s take) and four (the 8B's 32/8, the head-128
-    /// group-of-four row), one block of a key head's group; a group no row of
-    /// the body launches (the 14B's five) is refused by name with the layer,
-    /// and the card, whose kernels take neither the normed NEOX attention nor
-    /// a group of four, refuses each by name. Mutants (each red at its line):
-    /// the group-of-four arm without `GqaKind::Neox128` (the 8B's), the arm
-    /// dropped (both).
+    /// norms — plans at every whole group, one block of a key head's group: eight
+    /// (the 32B's 64/8, the row the routed Qwen3s take), four (the 8B's 32/8, the
+    /// head-128 group-of-four row), and those the card's table has no row for
+    /// (the 0.6B's and 1.7B's two, three) or a row no body launches (the 14B's
+    /// five, a group of seven and of sixteen). A shape whose heads are no whole
+    /// multiple of its key heads is refused by name with the layer, and the card,
+    /// whose kernels take no normed NEOX attention, refuses each by name.
+    /// PIN(2026-11-02): the 14B's group of five and the group of three were
+    /// refused here (`gqa_fits` named the card's table); the backends' own rows
+    /// serve them, so the refusal moved to the backend and `kind_of` takes them.
+    /// Mutants (each red at its line): the group-of-four arm without
+    /// `GqaKind::Neox128` (the 8B's), the arm dropped (both), the wide-kind arm
+    /// after the pack arms (groups 5, 7, 16), the `GqaGroup` fallback (groups 2,
+    /// 3, 6).
     #[test]
     fn a_dense_qwen3_attention_plans_at_its_group_and_the_card_refuses_it() {
         let neox = |heads: u32, kv_heads: u32| {
@@ -1284,7 +1393,16 @@ mod tests {
             g.rope.base = 1e6;
             g
         };
-        for (heads, kv_heads) in [(64u32, 8u32), (32, 8)] {
+        for (heads, kv_heads) in [
+            (64u32, 8u32),
+            (32, 8),
+            (16, 8),
+            (24, 8),
+            (40, 8),
+            (48, 8),
+            (56, 8),
+            (128, 8),
+        ] {
             let l = dense_layer(Mixer::Gqa(neox(heads, kv_heads)));
             let got = kind_of(&l, 0).unwrap_or_else(|e| panic!("{heads}/{kv_heads}: {e}"));
             assert_eq!(
@@ -1294,30 +1412,17 @@ mod tests {
             );
             assert_eq!(got, kind_of(&l, 0).unwrap());
         }
-        for (what, heads, kv_heads, want) in [
-            (
-                "a group of five",
-                40u32,
-                8u32,
-                "which this body does not launch",
-            ),
-            (
-                "a group of three",
-                24,
-                8,
-                "group 3; this head's flashes take",
-            ),
+        for (what, heads, kv_heads) in [
+            ("heads no multiple of the key heads", 20u32, 8u32),
+            ("no key heads", 16, 0),
         ] {
             let l = dense_layer(Mixer::Gqa(neox(heads, kv_heads)));
             match kind_of(&l, 3) {
-                Err(e) => assert!(
-                    e.to_string().contains("layer 3:") && e.to_string().contains(want),
-                    "{what}: {e}"
-                ),
+                Err(e) => assert!(e.to_string().contains("layer 3:"), "{what}: {e}"),
                 Ok(k) => panic!("{what} accepted: {k:?}"),
             }
         }
-        for (heads, kv_heads) in [(64u32, 8u32), (32, 8)] {
+        for (heads, kv_heads) in [(64u32, 8u32), (32, 8), (40, 8), (24, 8)] {
             let l = dense_layer(Mixer::Gqa(neox(heads, kv_heads)));
             match kind35(&l, 1) {
                 Err(e) => assert!(
@@ -1540,8 +1645,8 @@ mod tests {
     /// four (32 query heads over 8 key heads) as it reads the group of eight and of seven, one
     /// block of the key head's group, and the card, whose launches cut no window, divide by no
     /// factors and cover the head-128 groups of eight and seven, refuses each by name with the
-    /// layer; a layer with neither is the card's as before. A window and a NEOX turn with no head
-    /// norm stay no class. Mutants (each red at its line): the class row's `rope_factors` false
+    /// layer; a layer with neither is the card's as before. A window and a NEOX turn with the file's
+    /// rope factors stay no class. Mutants (each red at its line): the class row's `rope_factors` false
     /// (the chain's), `gqa_fits` without the group-of-four arm (the chain's), `card_fits` without
     /// its factors check or without its group-of-four check (the card's).
     #[test]
@@ -1605,11 +1710,11 @@ mod tests {
         }
         let mut windowed = head128_gqa(64, 8, false);
         windowed.window = Some(1024);
-        let mut neox = head128_gqa(64, 8, false);
+        let mut neox = head128_gqa(64, 8, true);
         neox.rope.mode = RopeMode::Neox;
         for (what, g) in [
             ("a window", windowed),
-            ("NEOX pairs with no head norm", neox),
+            ("NEOX pairs with rope factors", neox),
         ] {
             match kind_of(&dense_layer(Mixer::Gqa(g)), 2) {
                 Err(e) => assert!(e.to_string().contains("layer 2:"), "{what}: {e}"),
@@ -1618,27 +1723,244 @@ mod tests {
         }
     }
 
-    /// What a kind keeps per layer is its class row's: rope factors on the head-128 NORM attention
-    /// and on the head with a gate of its own and on no other.
+    /// The small dense models' NORM attention with no head norm plans at every whole group, one
+    /// block of a key head's group ([`Flash::Group`]; the head-128 group of seven keeps
+    /// [`Flash::Seven`]): head 128 at Llama-3.2-3B's group of three, the groups of five and six and
+    /// the 1B-class group of two, and head 64 ([`GqaKind::Head64`], Llama-3.2-1B's 32/8, with the
+    /// file's rope factors, and a group of seven). The card, whose head-128 flash covers a group of
+    /// eight or of seven and which has no head-64 kind, refuses each other shape by name with the
+    /// layer. Mutants (each red at its line): the `GqaGroup` fallback in `gqa_fits` (head 128's
+    /// groups 2, 3 and 6, head 64's 4 and 7), the wide-kind arm after the pack arms (head 128's
+    /// group 5, whose card row exists), the head-64 class row (every head-64 case), `card_fits`'
+    /// pack test left at `pack == 4` (the card accepts head 128's groups 3, 5 and 6).
+    #[test]
+    fn a_small_dense_norm_attention_plans_at_every_whole_group_and_the_card_refuses_it() {
+        let norm128 = GqaKind::Head128 {
+            pairs: Pairs::Norm,
+            head_norm: false,
+        };
+        let norm64 = GqaKind::Head64 {
+            pairs: Pairs::Norm,
+            head_norm: false,
+        };
+        let head128 = |heads: u32, kv_heads: u32, factors: bool| {
+            dense_layer(Mixer::Gqa(head128_gqa(heads, kv_heads, factors)))
+        };
+        let head64 = |heads: u32, kv_heads: u32, factors: bool| {
+            dense_layer(Mixer::Gqa(head64_gqa(heads, kv_heads, factors)))
+        };
+        // (what, layer, kind, flash, whether the card takes it)
+        let cases = [
+            (
+                "head 128, group 2",
+                head128(16, 8, false),
+                norm128,
+                Flash::Group,
+                false,
+            ),
+            (
+                "head 128, group 3 with factors",
+                head128(24, 8, true),
+                norm128,
+                Flash::Group,
+                false,
+            ),
+            (
+                "head 128, group 5",
+                head128(40, 8, false),
+                norm128,
+                Flash::Group,
+                false,
+            ),
+            (
+                "head 128, group 6",
+                head128(12, 2, false),
+                norm128,
+                Flash::Group,
+                false,
+            ),
+            (
+                "head 128, group 7",
+                head128(28, 4, false),
+                norm128,
+                Flash::Seven,
+                true,
+            ),
+            (
+                "head 128, group 8",
+                head128(64, 8, false),
+                norm128,
+                Flash::Group,
+                true,
+            ),
+            (
+                "head 64, group 4 with factors",
+                head64(32, 8, true),
+                norm64,
+                Flash::Group,
+                false,
+            ),
+            (
+                "head 64, group 7",
+                head64(14, 2, false),
+                norm64,
+                Flash::Group,
+                false,
+            ),
+            (
+                "head 64, group 8",
+                head64(16, 2, false),
+                norm64,
+                Flash::Group,
+                false,
+            ),
+        ];
+        for (what, l, kind, flash, card) in cases {
+            let got = kind_of(&l, 0).unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(got, Kind35::Gqa(kind, flash), "{what}");
+            match (kind35(&l, 4), card) {
+                (Ok(k), true) => assert_eq!(k, got, "{what}"),
+                (Err(e), false) => assert!(e.to_string().contains("layer 4:"), "{what}: {e}"),
+                (Ok(k), false) => panic!("{what}: the card accepted {k:?}"),
+                (Err(e), true) => panic!("{what}: the card refused: {e}"),
+            }
+        }
+        // The card names the group it covers for head 128 and the kinds it runs for head 64.
+        for (what, l, text) in [
+            (
+                "head 128, group 3",
+                head128(24, 8, false),
+                "eight or of seven",
+            ),
+            (
+                "head 128, group 5",
+                head128(40, 8, false),
+                "eight or of seven",
+            ),
+            (
+                "head 64, group 4",
+                head64(32, 8, false),
+                "the gated attention of heads of 256",
+            ),
+        ] {
+            match kind35(&l, 4) {
+                Err(e) => assert!(e.to_string().contains(text), "{what}: {e}"),
+                Ok(k) => panic!("{what}: the card accepted {k:?}"),
+            }
+        }
+        // A head of 64 with a head norm, or turned by NEOX pairs with the file's rope factors, is no
+        // class of this table.
+        let mut normed = head64_gqa(32, 8, false);
+        normed.qk_norm = true;
+        let mut neox = head64_gqa(32, 8, true);
+        neox.rope.mode = RopeMode::Neox;
+        for (what, g) in [("a head norm", normed), ("NEOX pairs with factors", neox)] {
+            match kind_of(&dense_layer(Mixer::Gqa(g)), 2) {
+                Err(e) => assert!(e.to_string().contains("layer 2:"), "{what}: {e}"),
+                Ok(k) => panic!("{what} accepted: {k:?}"),
+            }
+        }
+    }
+
+    /// What a kind keeps per layer is its class row's: rope factors on the NORM attention of head
+    /// 128 or 64 and on the head with a gate of its own and on no other.
     #[test]
     fn a_kind_reports_the_rope_its_class_row_says() {
         for class in &GqaKind::CLASSES {
             assert_eq!(
                 class.kind.rope_factors(),
-                matches!(class.kind, GqaKind::HeadGate128 | GqaKind::Head128 { .. }),
+                matches!(
+                    class.kind,
+                    GqaKind::HeadGate128
+                        | GqaKind::Head128 {
+                            pairs: Pairs::Norm,
+                            ..
+                        }
+                        | GqaKind::Head64 {
+                            pairs: Pairs::Norm,
+                            ..
+                        }
+                ),
                 "{:?}",
                 class.kind
             );
             assert_eq!(class.kind.head_norm(), class.head_norm, "{:?}", class.kind);
             assert_eq!(class.window, class.kind.head_gate(), "{:?}", class.kind);
         }
-        let neox_bare = GqaKind::Head128 {
+        let neox_normed = GqaKind::Head128 {
+            pairs: Pairs::Neox,
+            head_norm: true,
+        };
+        assert!(
+            !neox_normed.rope_factors(),
+            "a kind no class row holds keeps none"
+        );
+    }
+
+    /// The dense Qwen2.5 attention (NEOX pairs, no head norm, no rope factors) plans as its own
+    /// class at head 128 (the 14B's group of five, the 1.5B's six, the 7B's seven) and head 64 (the
+    /// 0.5B's seven), one block of a key head's group ([`Flash::Group`]; the group of seven keeps
+    /// no [`Flash::Seven`], the card's name for the NORM attention's), and the card refuses each
+    /// by name with the layer. Mutants (each red at its line): the two class rows dropped from
+    /// [`GqaKind::CLASSES`], the `Seven` arm left at any `Head128`.
+    #[test]
+    fn a_dense_neox_attention_with_no_head_norm_plans_at_every_whole_group_and_the_card_refuses_it()
+    {
+        let neox128 = GqaKind::Head128 {
             pairs: Pairs::Neox,
             head_norm: false,
         };
-        assert!(
-            !neox_bare.rope_factors(),
-            "a kind no class row holds keeps none"
-        );
+        let neox64 = GqaKind::Head64 {
+            pairs: Pairs::Neox,
+            head_norm: false,
+        };
+        let neox = |g: Gqa| {
+            dense_layer(Mixer::Gqa(Gqa {
+                rope: Rope {
+                    mode: RopeMode::Neox,
+                    ..g.rope
+                },
+                ..g
+            }))
+        };
+        for (what, l, kind) in [
+            (
+                "head 128, group 5",
+                neox(head128_gqa(40, 8, false)),
+                neox128,
+            ),
+            (
+                "head 128, group 6",
+                neox(head128_gqa(12, 2, false)),
+                neox128,
+            ),
+            (
+                "head 128, group 7",
+                neox(head128_gqa(28, 4, false)),
+                neox128,
+            ),
+            (
+                "head 128, group 8",
+                neox(head128_gqa(64, 8, false)),
+                neox128,
+            ),
+            ("head 64, group 7", neox(head64_gqa(14, 2, false)), neox64),
+        ] {
+            let got = kind_of(&l, 0).unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(got, Kind35::Gqa(kind, Flash::Group), "{what}");
+            match kind35(&l, 4) {
+                Err(e) => assert!(
+                    e.to_string().contains("layer 4:") && e.to_string().contains("the card's"),
+                    "{what}: {e}"
+                ),
+                Ok(k) => panic!("{what}: the card accepted {k:?}"),
+            }
+        }
+        // The class keeps no rope factors: a file that divides by them is no class of this table.
+        let with_factors = neox(head128_gqa(28, 4, true));
+        match kind_of(&with_factors, 1) {
+            Err(e) => assert!(e.to_string().contains("layer 1:"), "{e}"),
+            Ok(k) => panic!("NEOX pairs with factors accepted: {k:?}"),
+        }
     }
 }

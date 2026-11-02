@@ -423,6 +423,52 @@ mod tests {
         );
     }
 
+    /// A layer's q, k and v biases are what its tensors say: all three at the dims the keys give,
+    /// on a layer, are held (a Qwen2 folder's), two of the three are refused by name, a bias of
+    /// another width is refused by name, and the description is the plain trunk's (the chain's
+    /// plan reads the biases from the file). Mutant: `require`'s triple check dropped (the
+    /// second assert).
+    #[test]
+    fn qkv_bias_is_the_tensors_triple() {
+        let mut t = tensors();
+        for l in 0..LAYERS {
+            for (stem, rows) in [("q", HEADS * D), ("k", KV * D), ("v", KV * D)] {
+                t.push((format!("blk.{l}.attn_{stem}.bias"), vec![rows]));
+            }
+        }
+        let read = load("bias", &keys(), &global(), &t).expect("all three biases on every layer");
+        assert_eq!(read.spec.layers.len(), LAYERS);
+        assert_eq!(
+            read.tensors
+                .tensors
+                .iter()
+                .filter(|x| x.name.ends_with(".bias"))
+                .count(),
+            3 * LAYERS
+        );
+        let mut two = t.clone();
+        two.retain(|(n, _)| n != "blk.2.attn_v.bias");
+        let err = load("two-biases", &keys(), &global(), &two).expect_err("v missing");
+        assert!(
+            err.starts_with(
+                "tensor blk.2.attn_v.bias: is not in the file, and blk.2.attn_q.bias is;"
+            ),
+            "{err}"
+        );
+        let mut wide = t.clone();
+        wide.iter_mut()
+            .find(|(n, _)| n == "blk.1.attn_k.bias")
+            .expect("the key's bias")
+            .1 = vec![KV * D + 1];
+        let err = load("wide-bias", &keys(), &global(), &wide).expect_err("a wider k bias");
+        assert!(
+            err.starts_with(
+                "tensor blk.1.attn_k.bias: has other dims than the keys give the tensor"
+            ),
+            "{err}"
+        );
+    }
+
     /// The rope's factors are the file's own tensor, one value a pair, read once by the load
     /// (`Unread`, on no layer): a file with the table has a rope on every layer that divides by
     /// it and the description needs the factors, and a file without it has neither.
@@ -483,7 +529,11 @@ mod tests {
             ),
             (
                 plus("blk.0.attn_q.bias", vec![HEADS * D]),
-                "1 tensors have no role: blk.0.attn_q.bias",
+                "tensor blk.0.attn_k.bias: is not in the file, and blk.0.attn_q.bias is; a layer's q, k and v biases are all three tensors or none",
+            ),
+            (
+                plus("blk.0.attn_output.bias", vec![E]),
+                "1 tensors have no role: blk.0.attn_output.bias",
             ),
             (
                 plus("rope_freqs.weight", vec![D]),

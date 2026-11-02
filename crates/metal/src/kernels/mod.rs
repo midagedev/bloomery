@@ -26,9 +26,12 @@
 //! hands its next launch the normed input is each type's `<q>_norm_add_next`
 //! ([`Kernels::norm_add_next`]), read by the scaled seg, pair and head entries ([`LoadNorm`]);
 //! a plain residual hands the same input on with `<q>_norm_next` ([`Kernels::norm_next`]).
+//! An attention layer's q, k and v biases are added to its P1 output in one dispatch ([`bias`]):
+//! `kernels/bias.metal`.
 
 mod attention;
 use crate::attention_geom;
+mod bias;
 mod delta;
 use crate::delta_geom;
 mod embed;
@@ -56,6 +59,7 @@ pub use attention::{
     q8_scale_len, qg_len, segments_for_keys,
 };
 pub use attention::{AttnLayer, segments_for_window};
+pub use bias::BiasRowsParams;
 pub use delta::DeltaParams;
 pub use delta::DeltaRowStrides;
 pub use delta::DeltaRowsParams;
@@ -204,6 +208,8 @@ pub struct Kernels {
     norm_rows: Pipeline,
     /// The sandwich residual: the norm of rows added into the stream.
     norm_add_rows: Pipeline,
+    /// An attention layer's q, k and v biases added to the P1 output's rows.
+    bias_rows: Pipeline,
     /// The short conv: the step, a chunk's rows and the ring commit.
     shortconv: shortconv::Pipelines,
     /// The pass's routing, grouped experts and row glue (`route.metal`,
@@ -518,6 +524,7 @@ impl Kernels {
             router: library.pipeline("router35")?,
             norm_rows: library.pipeline("norm_rows")?,
             norm_add_rows: library.pipeline("norm_add_rows")?,
+            bias_rows: library.pipeline("bias_rows")?,
             shortconv: shortconv::Pipelines::new(library)?,
             routed: routed::RoutedPipelines::new(library)?,
             experts: experts::Pipelines::new(library, count)?,

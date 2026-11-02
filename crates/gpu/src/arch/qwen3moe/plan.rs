@@ -128,6 +128,7 @@ pub(super) mod fixtures {
                 window: None,
                 gate: None,
                 rope_freqs: None,
+                bias: None,
             }),
             ffn: FfnPlan {
                 ffn_norm: name("ffn_norm"),

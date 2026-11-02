@@ -1,0 +1,31 @@
+{
+  "name": "qwen2-mlx",
+  "arch": "qwen2",
+  "source": "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit",
+  "rev": "019cc73c45c770444708a6dd8690c66243cc5c80",
+  "expect": {"tensors": 735, "data_bytes": 4284263424},
+  "layers": [0, 1, 2, 3],
+  "layer_prefix": "model.layers.",
+  "keep": [
+    "model.embed_tokens.weight",
+    "model.embed_tokens.scales",
+    "model.embed_tokens.biases",
+    "lm_head.weight",
+    "lm_head.scales",
+    "lm_head.biases",
+    "model.norm.weight"
+  ],
+  "drop": [],
+  "copy": [
+    "tokenizer.json",
+    "tokenizer_config.json"
+  ],
+  "widths": {},
+  "planes": [],
+  "config": {
+    "layer_count": "num_hidden_layers",
+    "widths": {},
+    "per_layer": [],
+    "layer_names": []
+  }
+}

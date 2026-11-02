@@ -1,8 +1,9 @@
 //! The role of every tensor in a dense llama file, by exact name: the three
 //! model-level names, then the per-layer stems. There is no prefix rule and no
-//! catch-all: a name the table does not hold — an attention or FFN bias, a
+//! catch-all: a name the table does not hold — an output or FFN bias, a
 //! merged `attn_qkv`, a router — fails the file with every such name listed,
-//! because this chain would not read it. The rope's frequency factors are the
+//! because this chain would not read it. The query's, key's and value's own
+//! biases are held: a layer carries all three or none ([`QKV_BIAS`]). The rope's frequency factors are the
 //! one model-level tensor beside the three: read once by the load, no step's
 //! operand ([`rope_freqs_role`]). The tensors
 //! the chain does read must all be in the file, at the dims the keys give; the
@@ -34,13 +35,16 @@ const LAYER: [&str; 9] = [
 /// description's `qk_norm`.
 const QK_NORM: [&str; 2] = ["attn_q_norm.weight", "attn_k_norm.weight"];
 
+/// The query's, key's and value's own biases a layer carries all three of or none: a projection's
+/// output plus one value per row, added before the head norm and the rope.
+const QKV_BIAS: [&str; 3] = ["attn_q.bias", "attn_k.bias", "attn_v.bias"];
+
 /// The role of a per-layer stem.
 fn layer_role(stem: &str) -> Option<Role> {
     match stem {
         "attn_norm.weight" | "attn_q.weight" | "attn_k.weight" | "attn_v.weight"
-        | "attn_output.weight" | "attn_q_norm.weight" | "attn_k_norm.weight" => {
-            Some(Role::Attention)
-        }
+        | "attn_output.weight" | "attn_q_norm.weight" | "attn_k_norm.weight" | "attn_q.bias"
+        | "attn_k.bias" | "attn_v.bias" => Some(Role::Attention),
         "ffn_norm.weight" => Some(Role::FfnNorm),
         "ffn_gate.weight" | "ffn_up.weight" | "ffn_down.weight" => Some(Role::DenseFfn),
         _ => None,
@@ -88,6 +92,9 @@ fn layer_dims(hp: &Hparams) -> Vec<(&'static str, Vec<u64>)> {
         ("attn_output.weight", vec![q, e]),
         ("attn_q_norm.weight", vec![d]),
         ("attn_k_norm.weight", vec![d]),
+        ("attn_q.bias", vec![q]),
+        ("attn_k.bias", vec![kv]),
+        ("attn_v.bias", vec![kv]),
         ("ffn_norm.weight", vec![e]),
         ("ffn_gate.weight", vec![e, ff]),
         ("ffn_up.weight", vec![e, ff]),
@@ -96,7 +103,7 @@ fn layer_dims(hp: &Hparams) -> Vec<(&'static str, Vec<u64>)> {
 }
 
 /// Every tensor the chain reads is in the file, a layer's q and k norms come
-/// as a pair, and every tensor has the dims the keys give it; the first tensor
+/// as a pair and its q, k and v biases as a triple, and every tensor has the dims the keys give it; the first tensor
 /// that is not so, by name. `output.weight` is not among the tensors demanded:
 /// a file without it has its head tied to the token embedding, which the
 /// readers of [`Role::Head`] resolve, so the dims check passes it by the same
@@ -122,6 +129,22 @@ fn require(split: &Split, hp: &Hparams) -> Result<(), PlacementError> {
             });
         }
     }
+    for l in 0..hp.n_layer {
+        let names = QKV_BIAS.map(|stem| names::blk(l, stem));
+        let held: Vec<bool> = names.iter().map(|n| split.find(n).is_some()).collect();
+        if let (Some(present), Some(absent)) =
+            (held.iter().position(|&h| h), held.iter().position(|&h| !h))
+        {
+            return Err(PlacementError::Tensor {
+                name: names[absent].clone(),
+                detail: format!(
+                    "is not in the file, and {} is; a layer's q, k and v biases are all three \
+                     tensors or none",
+                    names[present]
+                ),
+            });
+        }
+    }
     dims_agree(
         split,
         hp.n_embd,
@@ -132,12 +155,16 @@ fn require(split: &Split, hp: &Hparams) -> Result<(), PlacementError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LAYER, QK_NORM, role};
+    use super::{LAYER, QK_NORM, QKV_BIAS, role};
     use crate::placement::Role;
 
     /// Every name of the table has its role on its layer; a name the table
     /// does not hold, or a layer past the model, has none, so `classify`
-    /// lists it.
+    /// lists it. PIN(2026-11-02): `attn_q.bias`, `attn_k.bias` and `attn_v.bias` hold a role, was
+    /// none: a Qwen2 folder's projections carry them, and the chain plans them
+    /// (`spec::tests::qkv_bias_is_the_tensors_triple` holds the pairing); `attn_qkv.bias`,
+    /// `attn_output.bias` and the FFN's stay unread. Mutant: the bias arm of `layer_role`
+    /// dropped (the loop over `QKV_BIAS`).
     #[test]
     fn the_table_is_exact() {
         assert_eq!(
@@ -147,7 +174,7 @@ mod tests {
         assert_eq!(role("output.weight", 52), Some((Role::Head, None)));
         assert_eq!(role("output_norm.weight", 52), Some((Role::Head, None)));
         assert_eq!(role("rope_freqs.weight", 52), Some((Role::Unread, None)));
-        for stem in LAYER.into_iter().chain(QK_NORM) {
+        for stem in LAYER.into_iter().chain(QK_NORM).chain(QKV_BIAS) {
             let name = format!("blk.51.{stem}");
             assert!(
                 matches!(role(&name, 52), Some((_, Some(51)))),
@@ -164,8 +191,9 @@ mod tests {
         );
         for name in [
             "blk.52.attn_q.weight",
+            "blk.52.attn_q.bias",
             "blk.0.attn_qkv.weight",
-            "blk.0.attn_q.bias",
+            "blk.0.attn_qkv.bias",
             "blk.0.attn_output.bias",
             "blk.0.ffn_up.bias",
             "blk.0.ffn_gate_inp.weight",

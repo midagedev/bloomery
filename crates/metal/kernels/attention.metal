@@ -3,16 +3,17 @@
 // a key head, BLOOMERY_ATTN_HEAD values a head. A threadgroup is one (key head,
 // segment) of BLOOMERY_ATTN_GQA SIMD groups; each SIMD group holds one query head, and
 // its 32 lanes split the head, BLOOMERY_ATTN_LANE_DIMS dims a lane (8 at
-// head 256, 4 at head 128). The segment's keys stream from the cache
-// straight into registers, one lane word a key a lane (16 bytes at 8 dims,
-// 8 at 4).
+// head 256, 4 at head 128, 2 at head 64). The segment's keys stream from the
+// cache straight into registers, one lane word a key a lane (16 bytes at 8
+// dims, 8 at 4, 4 at 2).
 //
 // The segment that owns the position appends that key and value. The whole
 // owning SIMD group builds each row: the K row is normed and roped through
 // threadgroup scratch, and every lane converts and stores its own values,
 // so the row lands in one pass instead of one lane's serial stores. The
 // q8_0 append shares the row out a lane group a 32-value block (a quad at 8
-// dims a lane, an octet at 4).
+// dims a lane, an octet at 4, 16 lanes at 2, where a lane's two codes are
+// half a code word).
 //
 // One segment is the flash alone: the epilogue normalizes, applies the gate
 // when the layer has one, and writes the output. More than one writes a
@@ -43,9 +44,10 @@
 // `2i, 2i + 1` instead of the NEOX halves `i, i + ROT/2`, by the same angle
 // table; a pair never leaves a lane (a lane's dims are even), so the lane
 // reads only its own writes, no barrier orders the prologue and the pair
-// loads as one `float2`. The head norm's sum-of-squares walks the NEOX pair
-// tree, so a head norm with NORM pairs and a norm-free NEOX prologue are no
-// entry of this file.
+// loads as one `float2`. The raw values with NEOX pairs (no head norm, the
+// halves) read the other lane's value of a pair, one barrier after the
+// lanes' writes. The head norm's sum-of-squares walks the NEOX pair tree, so
+// a head norm with NORM pairs is no entry of this file.
 //
 // The score is each lane's fmas in dim order, then 31 adds across the lanes
 // (the segmented flash's xor butterfly, the one-pass flash's SIMD-group sum,
@@ -119,8 +121,9 @@ static_assert(BLOOMERY_ATTN_THREADS == BLOOMERY_ATTN_LANES * BLOOMERY_ATTN_SG,
               "the flash threadgroup is the key head's SIMD groups");
 static_assert(BLOOMERY_ATTN_LANES * BLOOMERY_ATTN_LANE_DIMS == BLOOMERY_ATTN_HEAD,
               "a lane's values cover the head");
-static_assert(BLOOMERY_ATTN_LANE_DIMS == 8u || BLOOMERY_ATTN_LANE_DIMS == 4u,
-              "a lane word is 16 or 8 bytes of halves");
+static_assert(BLOOMERY_ATTN_LANE_DIMS == 8u || BLOOMERY_ATTN_LANE_DIMS == 4u ||
+                  BLOOMERY_ATTN_LANE_DIMS == 2u,
+              "a lane word is 16, 8 or 4 bytes of halves");
 static_assert(BLOOMERY_ATTN_QK_NORM == 0u || BLOOMERY_ATTN_QK_NORM == 1u,
               "a layer's query and key heads are normed by their gains or they are not");
 static_assert(BLOOMERY_ATTN_PAIRS_NORM == 0u || BLOOMERY_ATTN_PAIRS_NORM == 1u,
@@ -132,22 +135,36 @@ static_assert(!(BLOOMERY_ATTN_QK_NORM && BLOOMERY_ATTN_PAIRS_NORM),
 static_assert(BLOOMERY_ATTN_HEAD % 64u == 0u &&
                   (BLOOMERY_ATTN_ROT / 2u <= BLOOMERY_ATTN_LANES ||
                    BLOOMERY_ATTN_ROT == BLOOMERY_ATTN_HEAD),
-              "the norm's pair tree: whole warps, the turning pairs in warp 0 or every value");
+              "the NEOX pairs: whole warps, the turning pairs in warp 0 or every value (the head "
+              "norm's pair tree walks them; the norm-free arm is built at those shapes alone)");
 #endif
 
 // A lane's word of halves: its BLOOMERY_ATTN_LANE_DIMS values of a cache row.
 #if BLOOMERY_ATTN_LANE_DIMS == 8
 typedef uint4 attn_lane_word;
-#else
+#elif BLOOMERY_ATTN_LANE_DIMS == 4
 typedef uint2 attn_lane_word;
+#else
+typedef uint attn_lane_word;
 #endif
 
-// The q8_0 cache's row: code words, scales, the lanes of a 32-value block
-// and the code words a lane holds.
+// The q8_0 cache's row: code words, scales, the lanes of a 32-value block,
+// the code words a lane holds and the codes of the lane's last word. At two
+// values a lane the lane's word is the two codes of half a code word, and
+// ATTN_Q8_CODE_AT is that half, so a row's code words are written and read by
+// the lane that owns the half.
 #define ATTN_Q8_ROW_WORDS (BLOOMERY_ATTN_HEAD / 4u)
 #define ATTN_Q8_ROW_SCALES (BLOOMERY_ATTN_HEAD / 32u)
 #define ATTN_Q8_BLOCK_LANES (32u / BLOOMERY_ATTN_LANE_DIMS)
-#define ATTN_Q8_LANE_WORDS (BLOOMERY_ATTN_LANE_DIMS / 4u)
+#define ATTN_Q8_LANE_WORDS ((BLOOMERY_ATTN_LANE_DIMS + 3u) / 4u)
+#define ATTN_Q8_WORD_CODES (BLOOMERY_ATTN_LANE_DIMS < 4u ? BLOOMERY_ATTN_LANE_DIMS : 4u)
+#if BLOOMERY_ATTN_LANE_DIMS == 2
+#define ATTN_Q8_CODE_AT(codes, row, lane, w) \
+    (((device ushort *)(codes))[(row) * (ATTN_Q8_ROW_WORDS * 2u) + (lane)])
+#else
+#define ATTN_Q8_CODE_AT(codes, row, lane, w) \
+    ((codes)[(row) * ATTN_Q8_ROW_WORDS + (lane) * ATTN_Q8_LANE_WORDS + (w)])
+#endif
 
 // The fold's segment slots: lane s of a folding SIMD group holds segments s,
 // s + 32, ... of its head.
@@ -372,9 +389,10 @@ static float attn_rms_scale(float sum, float eps) {
 // Norm then rope of the head in `scratch`, into `y` (this lane's dims). The
 // gain is HEAD values and the rope row ROT. `lane` owns dims
 // lane*LANE_DIMS .. +LANE_DIMS-1. The two axes of the file's header pick
-// the variant: the norm and the NEOX pairs, or the raw values and the
-// neighbour pairs.
-#if BLOOMERY_ATTN_QK_NORM
+// the variant, one of three: the norm and the NEOX pairs, the raw values and
+// the neighbour pairs, or the raw values and the NEOX pairs. The fourth
+// combination, a head norm over neighbour pairs, is the `#error`.
+#if BLOOMERY_ATTN_QK_NORM && !BLOOMERY_ATTN_PAIRS_NORM
 static void attn_norm_rope(threadgroup float *scratch,
                            device float const *gain,
                            device float const *rope_row,
@@ -413,7 +431,7 @@ static void attn_norm_rope(threadgroup float *scratch,
         }
     }
 }
-#elif BLOOMERY_ATTN_PAIRS_NORM
+#elif !BLOOMERY_ATTN_QK_NORM && BLOOMERY_ATTN_PAIRS_NORM
 // The raw values roped as neighbours: no sum of squares, no gain read and
 // no barrier, the pair `2i, 2i + 1` of the lane's own dims turned by the
 // table row's pair `i` (its values sit at `2i, 2i + 1` of the row, and `i`
@@ -440,8 +458,42 @@ static void attn_norm_rope(threadgroup float *scratch,
         }
     }
 }
+#elif !BLOOMERY_ATTN_QK_NORM && !BLOOMERY_ATTN_PAIRS_NORM
+// The raw values roped as NEOX halves: no sum of squares, no gain and no
+// write back, the pair `i, i + ROT/2` of the head in `scratch` turned by the
+// table row's pair `i` as the normed variant turns it. The halves of a pair
+// sit in two lanes, so one barrier orders the lanes' writes before the reads.
+// `gain` and `eps` are the norm variant's and go unread.
+static void attn_norm_rope(threadgroup float *scratch,
+                           device float const *gain,
+                           device float const *rope_row,
+                           uint lane,
+                           float eps,
+                           thread float y[BLOOMERY_ATTN_LANE_DIMS]) {
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    uint dim0 = lane * BLOOMERY_ATTN_LANE_DIMS;
+    uint half_rot = BLOOMERY_ATTN_ROT / 2u;
+    for (uint d = 0u; d < BLOOMERY_ATTN_LANE_DIMS; ++d) {
+        uint i = dim0 + d;
+        if (i < half_rot) {
+            float r0 = scratch[i];
+            float r1 = scratch[i + half_rot];
+            float c = rope_row[2u * i];
+            float s = rope_row[2u * i + 1u];
+            y[d] = fma(r0, c, -(r1 * s));
+        } else if (i < BLOOMERY_ATTN_ROT) {
+            float r0 = scratch[i - half_rot];
+            float r1 = scratch[i];
+            float c = rope_row[2u * (i - half_rot)];
+            float s = rope_row[2u * (i - half_rot) + 1u];
+            y[d] = fma(r0, s, r1 * c);
+        } else {
+            y[d] = scratch[i];
+        }
+    }
+}
 #else
-#error "an instance with no head norm and NEOX pairs is no entry of this file"
+#error "an instance with a head norm and NORM pairs is no entry of this file"
 #endif
 
 // The lane's values of a row, converted and stored: the row's values land
@@ -490,7 +542,7 @@ static void attn_store_q8_lanes(thread float const row[BLOOMERY_ATTN_LANE_DIMS],
             scales[cache_row * ATTN_Q8_ROW_SCALES + block] = 0x7e00u;
         }
         for (uint w = 0u; w < ATTN_Q8_LANE_WORDS; ++w) {
-            codes[cache_row * ATTN_Q8_ROW_WORDS + lane * ATTN_Q8_LANE_WORDS + w] = 0u;
+            ATTN_Q8_CODE_AT(codes, cache_row, lane, w) = 0u;
         }
         if (lane % ATTN_Q8_BLOCK_LANES == 0u) {
             raise(faults, layer, BLOOMERY_FAULT_SITE_KV_QUANT);
@@ -507,12 +559,12 @@ static void attn_store_q8_lanes(thread float const row[BLOOMERY_ATTN_LANE_DIMS],
     }
     for (uint w = 0u; w < ATTN_Q8_LANE_WORDS; ++w) {
         uint word = 0u;
-        for (uint byte = 0u; byte < 4u; ++byte) {
+        for (uint byte = 0u; byte < ATTN_Q8_WORD_CODES; ++byte) {
             float v = row[w * 4u + byte];
             int code = clamp(attn_nearest_int(v * id), -128, 127);
             word |= (uint(code) & 0xffu) << (8u * byte);
         }
-        codes[cache_row * ATTN_Q8_ROW_WORDS + lane * ATTN_Q8_LANE_WORDS + w] = word;
+        ATTN_Q8_CODE_AT(codes, cache_row, lane, w) = word;
     }
 }
 
@@ -562,13 +614,19 @@ static void attn_widen(uint4 w, thread float out[8]) {
     out[6] = f1.z;
     out[7] = f1.w;
 }
-#else
+#elif BLOOMERY_ATTN_LANE_DIMS == 4
 static void attn_widen(uint2 w, thread float out[4]) {
     float4 f0 = float4(as_type<half4>(w));
     out[0] = f0.x;
     out[1] = f0.y;
     out[2] = f0.z;
     out[3] = f0.w;
+}
+#else
+static void attn_widen(uint w, thread float out[2]) {
+    float2 f0 = float2(as_type<half2>(w));
+    out[0] = f0.x;
+    out[1] = f0.y;
 }
 #endif
 
@@ -646,7 +704,7 @@ struct Q8Cache {
                          uint lane) {
         Word w;
         for (uint i = 0u; i < ATTN_Q8_LANE_WORDS; ++i) {
-            w.codes[i] = codes[row * ATTN_Q8_ROW_WORDS + lane * ATTN_Q8_LANE_WORDS + i];
+            w.codes[i] = ATTN_Q8_CODE_AT(codes, row, lane, i);
         }
         w.scale = scales[row * ATTN_Q8_ROW_SCALES + lane / ATTN_Q8_BLOCK_LANES];
         return w;
@@ -660,10 +718,11 @@ struct Q8Cache {
         return row_word(v_codes, v_scales, row, lane);
     }
 
-    // The lane's code words, then each word's four values in byte order.
+    // The lane's code words, then each word's four values in byte order (the
+    // two of a lane's half word at two values a lane).
     static void widen(Word w, thread float out[BLOOMERY_ATTN_LANE_DIMS]) {
         for (uint i = 0u; i < ATTN_Q8_LANE_WORDS; ++i) {
-            for (uint d = 0u; d < 4u; ++d) {
+            for (uint d = 0u; d < ATTN_Q8_WORD_CODES; ++d) {
                 out[4u * i + d] = attn_dequant(w.codes[i], w.scale, d);
             }
         }
@@ -1342,8 +1401,10 @@ static attn_lane_word attn_pack_lane(thread float const row[BLOOMERY_ATTN_LANE_D
     }
 #if BLOOMERY_ATTN_LANE_DIMS == 8
     return uint4(w[0], w[1], w[2], w[3]);
-#else
+#elif BLOOMERY_ATTN_LANE_DIMS == 4
     return uint2(w[0], w[1]);
+#else
+    return w[0];
 #endif
 }
 

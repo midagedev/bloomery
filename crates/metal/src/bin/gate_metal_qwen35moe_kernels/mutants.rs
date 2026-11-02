@@ -29,7 +29,8 @@ use super::Table;
 /// Every mutant of an instance's run (`table`, its row of the gate), with the
 /// program it edits: at an instance that runs the whole gate both tables; at
 /// one that runs its shaped kernels' clauses, the mutants of either table
-/// that name those clauses (`kept`) and the instance's own.
+/// that name those clauses (`kept`) and the instance's own (`own`: each set a
+/// row takes, so that rows with a defect in common hold it once).
 pub fn all(table: Table) -> Vec<(&'static Mutant, Program)> {
     match table {
         Table::Whole => program::all(MUTANTS, TENSOR_MUTANTS).collect(),
@@ -48,7 +49,7 @@ pub fn all(table: Table) -> Vec<(&'static Mutant, Program)> {
             }
             program::all(MUTANTS, TENSOR_MUTANTS)
                 .filter(|(m, _)| kept.contains(&m.name))
-                .chain(program::all(own, &[]))
+                .chain(own.iter().flat_map(|set| program::all(set, &[])))
                 .collect()
         }
     }
@@ -107,6 +108,7 @@ pub const Q30_KEPT: &[&str] = &[
     "rows_rope_relative",
     "rows_causal_plus1",
     "rows_norm_shared",
+    "rows_norm_tail_dropped",
     "rows_norm_no_raise",
     "rows_norm_plausible",
     "prefill_causal_plus1",
@@ -351,6 +353,8 @@ pub const ATTN_KEPT: &[&str] = &[
 
 /// The defects only a group size under eight or four key heads show: each
 /// edit is the same program at Qwen3.6's eight query heads over two key heads.
+/// They hold at every head width, so every row of a group of two to seven takes
+/// them.
 ///
 /// PIN(2026-11-02): `prefill_pad_rows_stored` is retired. A prefill fragment has
 /// no padded row: its rows are consecutive (position, query head) pairs, and a
@@ -358,7 +362,7 @@ pub const ATTN_KEPT: &[&str] = &[
 /// no store of it is a defect a clause can see. The row mapping's three
 /// defects (`prefill_row_position_by_8`, `prefill_row_head_by_8`,
 /// `prefill_sg_first_row`) replace it.
-pub const GQA_MUTANTS: &[Mutant] = &[
+pub const GROUP_MUTANTS: &[Mutant] = &[
     Mutant {
         name: "attn_gqa_read_as_8",
         clause: "attn_f16",
@@ -376,16 +380,6 @@ pub const GQA_MUTANTS: &[Mutant] = &[
         edits: &[(
             "uint kv = head / BLOOMERY_ATTN_GQA;",
             "uint kv = head / 8u;",
-            1,
-        )],
-    },
-    Mutant {
-        name: "fold_dim_stride_16",
-        clause: "attn_f16",
-        why: "the fold's lane owns the values from lane * 4, whatever the head divides the SIMD width into",
-        edits: &[(
-            "uint fold_dim0 = lane * BLOOMERY_ATTN_LANE_DIMS;",
-            "uint fold_dim0 = lane * 4u;",
             1,
         )],
     },
@@ -416,6 +410,132 @@ pub const GQA_MUTANTS: &[Mutant] = &[
         edits: &[(
             "    uint row = PF_ROW_OF(n);\n    AttnArgs a = attn_row_args(args, row);",
             "    uint row = PF_ROW_OF(n);\n    AttnArgs a = attn_row_args(args, PF_ROW_OF(sg_n0));",
+            1,
+        )],
+    },
+];
+
+/// The defect of a fold lane that owns a fixed four values: the same program at
+/// four values a lane (head 128), so only the rows of another width take it.
+pub const FOLD_STRIDE_MUTANTS: &[Mutant] = &[Mutant {
+    name: "fold_dim_stride_16",
+    clause: "attn_f16",
+    why: "the fold's lane owns the values from lane * 4, whatever the head divides the SIMD width into",
+    edits: &[(
+        "uint fold_dim0 = lane * BLOOMERY_ATTN_LANE_DIMS;",
+        "uint fold_dim0 = lane * 4u;",
+        1,
+    )],
+}];
+
+/// The mutants of the clauses a plain-query attention row of two or more key
+/// heads runs (the decode flash, the rows flash and the prefill flash):
+/// [`ATTN_KEPT`] less the gated epilogues (`attn_gate_s1`, `attn_gate_s1_q8`,
+/// `attn_gate_merge`), which the preprocessor removes from an ungated row, and
+/// the key head swap (`prefill_kv_head`: `1 - kv` wraps past two key heads, so
+/// [`KV_MIRROR_MUTANTS`] holds its mirrored form). The prologue is the row's own: the
+/// clauses' oracle norms and turns NEOX pairs, turns neighbours or turns the
+/// raw values as NEOX halves, as the instance does, so a row of any runs them.
+pub const PLAIN_ATTN_KEPT: &[&str] = &[
+    "attn_score_scale",
+    "attn_q8_id",
+    "attn_key_count",
+    "attn_no_fold",
+    "attn_f16_round",
+    "attn_s1_partials",
+    "attn_half",
+    "attn_bounds",
+    "attn_span_tile",
+    "attn_tile_dead_unmasked",
+    "attn_prefetch_stale",
+    "attn_fold_stage_l",
+    "attn_fold_empty_unskipped",
+    "attn_fold_underflow_skipped",
+    "attn_fold_one_ticket",
+    "attn_fold_kv_heads",
+    "attn_score_butterfly_half",
+    "attn_one_dead_unmasked",
+    "attn_one_chunk_rescale",
+    "attn_one_merge_unscaled",
+    "attn_one_store_owner",
+    "attn_one_local_key_swap",
+    "rows_rope_relative",
+    "rows_causal_plus1",
+    "prefill_causal_plus1",
+    "prefill_tile_relative",
+    "prefill_no_rescale",
+    "prefill_score_scale",
+    "prefill_overflow_no_raise",
+    "prefill_nan_plausible",
+    "prefill_block_last_row",
+    "prefill_bad_row_spreads",
+];
+
+/// The key head swap at any count of two or more key heads: the prefill reads
+/// the mirrored key head's rows (`prefill_kv_head`'s `1 - kv` wraps past two
+/// key heads).
+pub const KV_MIRROR_MUTANTS: &[Mutant] = &[Mutant {
+    name: "prefill_kv_head_reversed",
+    clause: "attn_prefill",
+    why: "the prefill reads the mirrored key head's rows for its query heads",
+    edits: &[(
+        "ulong at = ((ulong)kv * args.ctx + key) * PF_ROW_WORDS + c;",
+        "ulong at = ((ulong)(BLOOMERY_ATTN_KV - 1u - kv) * args.ctx + key) * PF_ROW_WORDS + c;",
+        1,
+    )],
+}];
+
+/// The defects of a lane that holds two values: each edit is a line only the
+/// head-64 flash compiles (the lane word of one `uint`, the q8_0 half code
+/// word), or the same program at head 128's width.
+pub const HEAD64_MUTANTS: &[Mutant] = &[
+    Mutant {
+        name: "attn_q8_half_word_lane",
+        clause: "attn_q8",
+        why: "two lanes store the same half of a q8_0 code word, so a row's other half is never written",
+        edits: &[(
+            "(((device ushort *)(codes))[(row) * (ATTN_Q8_ROW_WORDS * 2u) + (lane)])",
+            "(((device ushort *)(codes))[(row) * (ATTN_Q8_ROW_WORDS * 2u) + (lane) / 2u])",
+            1,
+        )],
+    },
+    Mutant {
+        name: "attn_widen_two_swapped",
+        clause: "attn_f16",
+        why: "a lane's two halves widen in the other order, so every key and value reads its pair swapped",
+        edits: &[(
+            "float2 f0 = float2(as_type<half2>(w));",
+            "float2 f0 = float2(as_type<half2>(w)).yx;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "attn_pack_lane_two_swapped",
+        clause: "attn_f16",
+        why: "the one-pass append packs a lane's two halves in the other order, so the cache row it stores is swapped",
+        edits: &[(
+            "#else\n    return w[0];\n#endif",
+            "#else\n    return (w[0] >> 16) | (w[0] << 16);\n#endif",
+            1,
+        )],
+    },
+    Mutant {
+        name: "q8_block_lanes_8",
+        clause: "attn_q8",
+        why: "a 32-value q8_0 block is eight lanes, whatever the lane holds, so a block of sixteen lanes at two values reduces and stores eight",
+        edits: &[(
+            "#define ATTN_Q8_BLOCK_LANES (32u / BLOOMERY_ATTN_LANE_DIMS)",
+            "#define ATTN_Q8_BLOCK_LANES 8u",
+            1,
+        )],
+    },
+    Mutant {
+        name: "prefill_row_words_16",
+        clause: "attn_prefill",
+        why: "a cache row is sixteen 16-byte words, head 128's, so a head of eight words loads misaddressed tiles",
+        edits: &[(
+            "#define PF_ROW_WORDS (BLOOMERY_ATTN_HEAD / 8u)",
+            "#define PF_ROW_WORDS 16u",
             1,
         )],
     },
@@ -648,6 +768,66 @@ pub const WINDOW_MUTANTS: &[Mutant] = &[
         clause: "attn_rope_factors",
         why: "the table's exponent runs over 64 dims, not the head's 128",
         edits: &[],
+    },
+];
+
+/// The defects of the norm-free NEOX prologue (`RawNeox`, Qwen2's attention),
+/// each red on the clause that holds the flash's appended cache rows against
+/// the oracle's (`attn_f16`): the variant's own lines, unique in the kernel
+/// text. Two turn the arm into another variant of the file, the neighbour-paired
+/// arm (`neox_raw_pairs_norm`) and the head-normed arm's norm (`neox_raw_norm_applied`).
+pub const NEOX_RAW_MUTANTS: &[Mutant] = &[
+    Mutant {
+        name: "neox_raw_norm_applied",
+        clause: "attn_f16",
+        why: "the raw-value path rescales every value by the head's RMS scale, as the head-normed variant does, which no value of the layer takes",
+        edits: &[
+            (
+                "uint half_rot = BLOOMERY_ATTN_ROT / 2u;\n    for (uint d = 0u; d < BLOOMERY_ATTN_LANE_DIMS; ++d) {\n        uint i = dim0 + d;\n        if (i < half_rot) {\n            float r0 = scratch[i];",
+                "uint half_rot = BLOOMERY_ATTN_ROT / 2u;\n    float sumsq = 0.0f;\n    for (uint j = 0u; j < BLOOMERY_ATTN_HEAD; ++j) {\n        sumsq = fma(scratch[j], scratch[j], sumsq);\n    }\n    float rms = 1.0f / sqrt(sumsq / float(BLOOMERY_ATTN_HEAD) + eps);\n    for (uint d = 0u; d < BLOOMERY_ATTN_LANE_DIMS; ++d) {\n        uint i = dim0 + d;\n        if (i < half_rot) {\n            float r0 = scratch[i];",
+                1,
+            ),
+            (
+                "y[d] = fma(r0, c, -(r1 * s));",
+                "y[d] = fma(r0, c, -(r1 * s)) * rms;",
+                1,
+            ),
+            (
+                "y[d] = fma(r0, s, r1 * c);",
+                "y[d] = fma(r0, s, r1 * c) * rms;",
+                1,
+            ),
+        ],
+    },
+    Mutant {
+        name: "neox_raw_pairs_norm",
+        clause: "attn_f16",
+        why: "the raw values turn as neighbours `2i, 2i + 1`, the NORM pairing, not as the NEOX halves",
+        edits: &[(
+            "        if (i < half_rot) {\n            float r0 = scratch[i];",
+            "        if (i < BLOOMERY_ATTN_ROT) {\n            uint p = i & ~1u;\n            float2 n = float2(scratch[p], scratch[p + 1u]);\n            float c = rope_row[p];\n            float s = rope_row[p + 1u];\n            y[d] = ((i & 1u) == 0u) ? fma(n.x, c, -(n.y * s)) : fma(n.x, s, n.y * c);\n            continue;\n        }\n        if (i < half_rot) {\n            float r0 = scratch[i];",
+            1,
+        )],
+    },
+    Mutant {
+        name: "neox_raw_first_half_sign",
+        clause: "attn_f16",
+        why: "the first half of a pair adds its partner's sine term, not subtracts it",
+        edits: &[(
+            "y[d] = fma(r0, c, -(r1 * s));",
+            "y[d] = fma(r0, c, r1 * s);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "neox_raw_second_half_sign",
+        clause: "attn_f16",
+        why: "the second half of a pair subtracts its cosine term, not adds it",
+        edits: &[(
+            "y[d] = fma(r0, s, r1 * c);",
+            "y[d] = fma(r0, s, -(r1 * c));",
+            1,
+        )],
     },
 ];
 
@@ -1775,6 +1955,47 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "attn_rows_v0",
         why: "every row of the chunk attends one key past its own position",
         edits: &[("a.keys = a.pos + 1u;", "a.keys = a.pos + 2u;", 1)],
+    },
+    Mutant {
+        name: "bias_skipped",
+        clause: "bias_rows",
+        why: "the launch adds a zero where the layer's bias is, so a biased layer runs as an unbiased one",
+        edits: &[(
+            "y[gid.y * args.stride4 + gid.x] += bias[gid.x];",
+            "y[gid.y * args.stride4 + gid.x] += float4(0.f) * bias[gid.x];",
+            1,
+        )],
+    },
+    Mutant {
+        name: "bias_row_stride",
+        clause: "bias_rows",
+        why: "a row starts a row's width after the one before it, not a stride, so rows apart by a stride past the row are added into the wrong values",
+        edits: &[(
+            "y[gid.y * args.stride4 + gid.x] += bias[gid.x];",
+            "y[gid.y * args.cols4 + gid.x] += bias[gid.x];",
+            1,
+        )],
+    },
+    Mutant {
+        name: "bias_tail_unguarded",
+        clause: "bias_rows",
+        why: "the threads past a row's last float4 add too, so the bias is read and a value written past the row",
+        edits: &[(
+            "if (gid.x < args.cols4) {\n        y[gid.y * args.stride4 + gid.x] += bias[gid.x];",
+            "if (gid.x < args.cols4 + 1u) {\n        y[gid.y * args.stride4 + gid.x] += bias[gid.x];",
+            1,
+        )],
+    },
+    Mutant {
+        name: "rows_norm_tail_dropped",
+        clause: "norm_rows",
+        why: "the threads write only the whole tiles of the router's thread count, so a row of a \
+              width its tile does not divide keeps its last float4s unwritten",
+        edits: &[(
+            "for (uint f4 = tid; f4 < f4s; f4 += NORM_ROWS_THREADS) {\n        float4 value = norm_rows_value(norm_rows_load4(xr, f4), norm_rows_load4(gain, f4), scale);\n        bad = bad || !all(isfinite(value));\n        *((device float4 *)(yr + f4 * 4u)) = value;",
+            "for (uint f4 = tid; f4 < (f4s / NORM_ROWS_THREADS) * NORM_ROWS_THREADS; f4 += NORM_ROWS_THREADS) {\n        float4 value = norm_rows_value(norm_rows_load4(xr, f4), norm_rows_load4(gain, f4), scale);\n        bad = bad || !all(isfinite(value));\n        *((device float4 *)(yr + f4 * 4u)) = value;",
+            1,
+        )],
     },
     Mutant {
         name: "rows_norm_shared",

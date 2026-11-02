@@ -6,8 +6,9 @@
 //! Each reader takes `what`, the loader's entry-point name its refusals are attributed to.
 
 use super::plan::{
-    DeltaPlan, FfnPlan, FfnRoute, Flash, GqaKind, GqaPlan, HeadGate, Kind35, LayerPlan, MixerPlan,
-    ResidualPlan, SandwichPlan, SharedPlan, SharedSites, ShortConvPlan, SiteTy, layer_gqa, q35,
+    DeltaPlan, FfnPlan, FfnRoute, Flash, GqaBias, GqaKind, GqaPlan, HeadGate, Kind35, LayerPlan,
+    MixerPlan, ResidualPlan, SandwichPlan, SharedPlan, SharedSites, ShortConvPlan, SiteTy,
+    layer_gqa, q35,
 };
 use crate::ChainError;
 use crate::linear::{self, LinearShape, Ring};
@@ -208,6 +209,10 @@ pub struct Sites35 {
     pub down: &'static [SiteTy],
     /// A shared expert kept apart: the types its own parts run at.
     pub shared: &'static [SiteTy],
+    /// Whether the backend adds an attention layer's query, key and value biases
+    /// (`attn_q.bias`, `attn_k.bias`, `attn_v.bias`) to their projections' outputs: a file whose
+    /// layer holds them is refused by name where it does not.
+    pub bias: bool,
 }
 
 impl Sites35 {
@@ -233,6 +238,7 @@ impl Sites35 {
             SiteTy::Mxfp8,
             SiteTy::Fp8B128,
         ],
+        bias: false,
     };
 }
 
@@ -627,7 +633,54 @@ fn gqa_sites(
         window: None,
         gate: None,
         rope_freqs: None,
+        bias: qkv_bias(file, what, d, l, kind, sites)?,
     })
+}
+
+/// Layer `l`'s query, key and value biases, which the file holds as all three F32 vectors of
+/// their projections' rows or none, `None` for none. A backend that adds none
+/// ([`Sites35::bias`]), a layer with only some of them and a kind whose query rows hold a gate
+/// beside each head's query are refused by name.
+fn qkv_bias(
+    file: &Split,
+    what: &'static str,
+    d: &PlanDims,
+    l: usize,
+    kind: GqaKind,
+    sites: &Sites35,
+) -> Result<Option<GqaBias>, ChainError> {
+    let names = ["attn_q.bias", "attn_k.bias", "attn_v.bias"].map(|s| blk(l, s));
+    let held: Vec<&String> = names.iter().filter(|n| file.find(n).is_some()).collect();
+    if held.is_empty() {
+        return Ok(None);
+    }
+    let refuse = |detail: String| ChainError::shape(what, format!("layer {l}: {detail}"));
+    if !sites.bias {
+        return Err(refuse(format!(
+            "{} is in the file; this backend's launches add no q, k or v bias",
+            held[0]
+        )));
+    }
+    if let Some(absent) = names.iter().find(|n| !held.contains(n)) {
+        return Err(ChainError::tensor(
+            what,
+            absent,
+            "in the file beside its layer's other biases",
+        ));
+    }
+    if matches!(kind, GqaKind::Gated256 | GqaKind::HeadGate128) {
+        return Err(refuse(format!(
+            "attention {kind:?} has a bias; the bias is added to rows that are the heads' alone"
+        )));
+    }
+    for (name, rows) in names.iter().zip([d.q_rows, d.kv_len, d.kv_len]) {
+        let bias = shaped(file, what, name, (1, rows))?;
+        if bias.ty != GgmlType::F32 {
+            return Err(refuse(format!("{name} is {}; a bias is f32", bias.ty)));
+        }
+    }
+    let [q, k, v] = names;
+    Ok(Some(GqaBias { q, k, v }))
 }
 
 /// Layer `l`'s gated short conv of `ring`, every projection's type from `file`'s header at a
@@ -1783,6 +1836,116 @@ mod tests {
                 "{e}"
             ),
             Ok(_) => panic!("a NEOX layer read rope factors"),
+        }
+    }
+
+    /// A layer's q, k and v biases are planned where the backend adds them and refused by name
+    /// where it does not, as a triple, as f32 vectors of the projections' rows, and not on a kind
+    /// with gate rows in its q projection. Mutant: `qkv_bias` not reading `sites.bias` (the card
+    /// refusal), not requiring the triple, not reading a bias's type or length, or not refusing
+    /// the gated kind.
+    #[test]
+    fn a_layers_qkv_bias_is_planned_where_the_backend_adds_it() {
+        let biased = Sites35 {
+            bias: true,
+            ..Sites35::CARD
+        };
+        let bias = |name: &str, rows: u64, ty: GgmlType| decl(blk(0, name), &[rows], ty);
+        let triple = |q: u64, ty: GgmlType| {
+            let mut t = head128_tensors(None);
+            t.extend([
+                bias("attn_q.bias", q, ty),
+                bias("attn_k.bias", 512, F32),
+                bias("attn_v.bias", 512, F32),
+            ]);
+            t
+        };
+        let plans = |tensors: Vec<TensorDecl>, sites: &Sites35| {
+            let spec = spec(
+                vec![dense_layer(Mixer::Gqa(head128_gqa(16, 4, false)))],
+                256,
+            );
+            let kinds = kinds_of(&spec.layers)?;
+            let pd = PlanDims::of(&spec, "t")?;
+            layer_plans(
+                &header(tensors),
+                "t",
+                &pd,
+                &kinds,
+                &spec.layers,
+                sites,
+                Read35::Whole,
+            )
+        };
+        let bias_of = |got: Vec<LayerPlan>| match got.into_iter().next().map(|p| p.mixer) {
+            Some(MixerPlan::Gqa(g)) => g.bias,
+            _ => panic!("an attention layer"),
+        };
+        let got = plans(triple(2048, F32), &biased).unwrap_or_else(|e| panic!("{e}"));
+        let named = bias_of(got).expect("the file's biases are planned");
+        assert_eq!(
+            [named.q, named.k, named.v],
+            [
+                "blk.0.attn_q.bias",
+                "blk.0.attn_k.bias",
+                "blk.0.attn_v.bias"
+            ]
+        );
+        let got = plans(head128_tensors(None), &biased).unwrap_or_else(|e| panic!("{e}"));
+        assert!(bias_of(got).is_none());
+        let refused =
+            |what: &str, tensors: Vec<TensorDecl>, sites: &Sites35, texts: &[&str]| match plans(
+                tensors, sites,
+            ) {
+                Err(e) => {
+                    let e = e.to_string();
+                    for text in texts {
+                        assert!(e.contains(text), "{what}: {e}");
+                    }
+                }
+                Ok(_) => panic!("{what}: the plans were read"),
+            };
+        refused(
+            "a backend with no bias add",
+            triple(2048, F32),
+            &Sites35::CARD,
+            &["layer 0:", "blk.0.attn_q.bias", "add no q, k or v bias"],
+        );
+        let mut two = triple(2048, F32);
+        two.pop();
+        refused(
+            "a pair",
+            two,
+            &biased,
+            &["blk.0.attn_v.bias", "beside its layer's other biases"],
+        );
+        refused(
+            "an f16 bias",
+            triple(2048, F16),
+            &biased,
+            &["blk.0.attn_q.bias", "a bias is f32"],
+        );
+        refused(
+            "a bias of the wrong length",
+            triple(1024, F32),
+            &biased,
+            &["blk.0.attn_q.bias", "it takes 1 rows of 2048"],
+        );
+        let spec = spec(
+            vec![dense_layer(Mixer::Gqa(head128_gqa(16, 4, false)))],
+            256,
+        );
+        let pd = PlanDims::of(&spec, "t").unwrap_or_else(|e| panic!("{e}"));
+        match plan_gqa(
+            &header(triple(2048, F32)),
+            "t",
+            &pd,
+            0,
+            (GqaKind::Gated256, Flash::Group),
+            &biased,
+        ) {
+            Err(e) => assert!(e.to_string().contains("Gated256 has a bias"), "{e}"),
+            Ok(_) => panic!("a gated layer read a bias"),
         }
     }
 }

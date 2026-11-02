@@ -15,8 +15,8 @@ use bloomery_metal::kernels::{
 
 use super::clauses_attention::{
     CTX, CacheBack, KIND_K, KIND_Q, KIND_V, Scene, Tables, Uploaded, cache_of_for, dequant_k_for,
-    dequant_v_for, gain_of, gate_of, head_row_for, load_tables_for, plant_f16_for, read_cache,
-    take_qg_for, u, upload_cache,
+    dequant_v_for, gain_of, gate_of, head_row_for, load_tables_for, plant_f16_for, prologue_of,
+    read_cache, take_qg_for, u, upload_cache,
 };
 use super::clauses_delta::{Fixed, KEY_HEADS, Params, draw, fixed};
 use super::clauses_router;
@@ -24,7 +24,7 @@ use super::common::{self, BadArg, Edit, LAYER};
 use super::fixture::Fixture;
 use super::oracle;
 use super::oracle::sigmoid;
-use super::oracle_attention::{attend, band, norm_rope, prefill_band};
+use super::oracle_attention::{attend, band, prefill_band};
 use super::{ClauseCtx, ClauseRun, Harness};
 
 /// The delta layer's key heads.
@@ -1131,7 +1131,13 @@ fn prefill_bands(
             }
             let kv = head / (attn.query_heads / attn.kv_heads);
             let qrow = &inp.q[r * q_n..(r + 1) * q_n];
-            let qn = norm_rope(take_qg_for(attn, qrow, head, 0)?, gain, tables.eps, rope)?;
+            let qn = prologue_of(
+                attn,
+                take_qg_for(attn, qrow, head, 0)?,
+                gain,
+                tables.eps,
+                rope,
+            )?;
             let gate = if attn.gated {
                 Some(take_qg_for(attn, qrow, head, attn.head)?)
             } else {
@@ -1309,15 +1315,23 @@ pub fn attn_prefill_nan(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     })
     .map_err(|e| format!("a non-finite query: {e}"))?;
 
-    // A query past f16's range (a gain of 1e5): the product site, every row NaN.
+    // A query past f16's range: the product site, every row NaN. A gain of 1e5
+    // where the instance norms each head; where it norms none the raw query is
+    // the rope's input, so the rows themselves are scaled.
+    let mut inp = attn_inputs(attn, case.rows)?;
+    let q_gain = if attn.qk_norm {
+        vec![1e5; attn.head]
+    } else {
+        inp.q.iter_mut().for_each(|x| *x *= 1e6);
+        tables.q_gain.clone()
+    };
     let big = Tables {
         eps: tables.eps,
-        q_gain: vec![1e5; attn.head],
+        q_gain,
         k_gain: tables.k_gain.clone(),
         rope: tables.rope.clone(),
         note: tables.note,
     };
-    let inp = attn_inputs(attn, case.rows)?;
     let pre = attn_prefill_run(h, &big, &case, &inp, PREFILL_CTX)?;
     if !only_site(pre.fault, FaultSite::F32Product) {
         return Err(format!(
@@ -1341,11 +1355,23 @@ fn norm_rows_run(
     x: &[f32],
     gain: &[f32],
     rows: usize,
+    strides: (usize, usize),
+    eps: f32,
+) -> Result<(Vec<f32>, Option<Fault>), String> {
+    norm_rows_run_at(h, x, gain, rows, h.geom().hidden, strides, eps)
+}
+
+/// [`norm_rows_run`] over rows of `k` columns.
+fn norm_rows_run_at(
+    h: &Harness<'_>,
+    x: &[f32],
+    gain: &[f32],
+    rows: usize,
+    k: usize,
     (x_stride, y_stride): (usize, usize),
     eps: f32,
 ) -> Result<(Vec<f32>, Option<Fault>), String> {
     let (device, stream) = (h.device, h.stream);
-    let k = h.geom().hidden;
     let sentinel = f32::from_bits(super::SENTINEL_BITS);
     let x_b = device.upload(stream, x).map_err(why)?;
     let gain_b = device.upload(stream, gain).map_err(why)?;
@@ -1429,10 +1455,82 @@ pub fn norm_rows(h: &Harness<'_>, fixture: &Fixture) -> Clause {
         }
         parts.push(rows.to_string());
     }
+    let wide = norm_rows_past_the_tile(h, eps)?;
     Ok(Verdict::Noted(format!(
-        "{} rows are the decode router's normed input, bit for bit",
+        "{} rows are the decode router's normed input, bit for bit; {wide}",
         parts.join(", ")
     )))
+}
+
+/// The width of the wide row: the instance's hidden width rounded up to the floats one pass of
+/// the norm's threads covers (a float4 a thread, the router's tile) and half a tile more, so the
+/// last pass is short whatever the instance's width.
+fn norm_wide_cols(h: &Harness<'_>) -> usize {
+    let tile = h.kernels.router_threads() * 4;
+    h.geom().hidden.next_multiple_of(tile) + tile / 2
+}
+
+/// The relative error a finished value of the norm may carry against the f64 norm of the same
+/// row, by the router oracle's rules (`oracle_router.rs`: `G(n) = nU / (1 - nU)`, one
+/// `simd_sum` at most 31 adds whatever its shape, the library `rsqrt` at `RSQRT_ULP`, the same
+/// unverified premise). Every term of the sum of squares is positive, so the sum's relative
+/// error is the roundings on its longest path: the square (1), the three adds of its float4 and
+/// the accumulation of the thread's later float4s (`per_thread - 1`), the SIMD group's sum
+/// (`SIMD_WIDTH - 1`) and the threadgroup's sequential sum of its groups (`groups - 1`). The
+/// mean's division and the epsilon's add are two roundings more, `t = G(n_sum + 2)`; the scale is
+/// off by at most `(1 - t)^(-1/2) - 1` plus the `rsqrt`'s, `theta_s`; each value is then two
+/// products, `g = G(2)`, and the factor is `theta_s + g + theta_s * g`. The norm's inputs are f32
+/// and exact in f64.
+fn norm_wide_band(cols: usize, threads: usize) -> f64 {
+    let per_thread = (cols / 4).div_ceil(threads);
+    let groups = threads / bloomery_metal::geometry::SIMD_WIDTH;
+    let n_sum = per_thread + 3 + (bloomery_metal::geometry::SIMD_WIDTH - 1) + (groups - 1);
+    let t = oracle::gamma_bound(n_sum + 2);
+    let theta_s = (1.0 - t).powf(-0.5) - 1.0 + oracle::RSQRT_ULP * 2.0 * oracle::U;
+    let g = oracle::gamma_bound(2);
+    theta_s + g + theta_s * g
+}
+
+/// A row of a width the router's tile does not divide: every value of it is the f64 norm of the
+/// row within [`norm_wide_band`], and no word past the row is written. The router has no such
+/// width, so the oracle is f64. A word the launch never wrote is the sentinel, a NaN, and no
+/// error that passes.
+fn norm_rows_past_the_tile(h: &Harness<'_>, eps: f32) -> Result<String, String> {
+    let cols = norm_wide_cols(h);
+    let band = norm_wide_band(cols, h.kernels.router_threads());
+    let rows = 5usize;
+    let gain: Vec<f32> = oracle::activations(cols, 0x40C0, 0.5)
+        .into_iter()
+        .map(|g| 1.0 + g)
+        .collect();
+    let data: Vec<Vec<f32>> = (0..rows)
+        .map(|r| oracle::activations(cols, 0x40D0 + r as u64, 3.7))
+        .collect();
+    let strides = (cols + 4, cols + 8);
+    let x = common::strided(&data, strides.0, f32::NAN);
+    let (y, fault) = norm_rows_run_at(h, &x, &gain, rows, cols, strides, eps)?;
+    if let Some(f) = fault {
+        return Err(format!("{rows} rows of {cols} raised {f}"));
+    }
+    let mut worst = 0f64;
+    for (r, row) in data.iter().enumerate() {
+        let total: f64 = row.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+        let scale = 1.0 / (total / cols as f64 + f64::from(eps)).sqrt();
+        for (i, (v, g)) in row.iter().zip(&gain).enumerate() {
+            let want = f64::from(*v) * f64::from(*g) * scale;
+            let got = f64::from(y[r * strides.1 + i]);
+            let err = (got - want).abs() / want.abs().max(1e-30);
+            worst = worst.max(err);
+            if err.is_nan() || err > band {
+                return Err(format!(
+                    "{rows} rows of {cols}: row {r} value {i} is {got}, the f64 norm {want} (relative {err:e}, band {band:e})"
+                ));
+            }
+        }
+    }
+    Ok(format!(
+        "{rows} rows of {cols} columns, past the router's tile, are the f64 norm within {band:.1e} (worst {worst:.1e})"
+    ))
 }
 
 /// A row the norm cannot take is NaN alone and raises the norm site; a gain
@@ -2170,8 +2268,12 @@ fn norm_refusals(h: &Harness<'_>) -> Result<usize, String> {
     let cases = vec![
         case("rows of 0", "rows of 0", |o| o.rows = 0),
         case("a column count of 0", "cols 0", |o| o.cols = 0),
-        case("columns the threads do not cover", "multiple of", |o| {
-            o.cols += 4;
+        // PIN(2026-11-02): was `cols + 4`, a width the router's tile does not divide. The launch
+        // no longer needs the tile to divide the row (the threads stride over any count of whole
+        // float4s, which the `norm_rows` clause's wide row holds), so the case is a width that is
+        // not whole float4s.
+        case("columns that are not whole float4s", "multiple of", |o| {
+            o.cols += 1;
         }),
         case(
             "an x stride that is not a float4 multiple",

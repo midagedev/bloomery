@@ -215,6 +215,16 @@ impl Family {
         name.starts_with(self.vision()) || self.next_token(name) != draft
     }
 
+    /// The family's rule for `tie_word_embeddings`, in the root and in `text_config`, ahead of
+    /// every table that names it: a dense family may tie its head to the embedding ([`tied_of`]
+    /// holds the flag against the folder's head), a routed one has a head of its own.
+    fn head(self) -> &'static Fields {
+        match self.ffn() {
+            trunk::Ffn::Routed => &[trunk::HEAD_OWN],
+            trunk::Ffn::Dense => &[trunk::HEAD_EITHER],
+        }
+    }
+
     /// The `config.json` keys the family has beside [`ROOT_SHARED`].
     fn root(self) -> &'static [&'static Fields] {
         match self {
@@ -229,7 +239,7 @@ impl Family {
     /// The `text_config` keys the family has: [`TEXT_SHARED`], the trunk's, its feed-forward
     /// block's, the shared expert's of a routed one, and its own.
     fn text_config(self) -> Vec<&'static Fields> {
-        let mut tables = vec![TEXT_SHARED, trunk::KEYS, self.ffn().keys()];
+        let mut tables = vec![self.head(), TEXT_SHARED, trunk::KEYS, self.ffn().keys()];
         if self.ffn() == trunk::Ffn::Routed {
             tables.push(SHARED_EXPERT);
         }
@@ -276,8 +286,6 @@ const ROOT_SHARED: &Fields = &[
     ("architectures", Read),
     ("text_config", Read),
     ("quantization_config", Read),
-    // The map needs a separate lm_head.
-    trunk::HEAD_OWN,
     (
         "transformers_version",
         Ignore(Type::String, "the version that wrote the file"),
@@ -494,6 +502,9 @@ pub struct Checkpoint {
     hidden: u32,
     /// The dense block's width, `intermediate_size`; `None` for a routed family.
     dense_ff: Option<u32>,
+    /// Whether the head is the embedding (`tie_word_embeddings`): the folder then holds no
+    /// `lm_head`, and the split no `output.weight`.
+    tied: bool,
     indexer_k: u32,
     metadata: Vec<(String, Value)>,
     ple: Option<Ple>,
@@ -573,7 +584,7 @@ impl Checkpoint {
                 "belongs to the multimodal class; a text-only config holds the text model's keys itself",
             ));
         }
-        let mut root_tables = vec![ROOT_SHARED];
+        let mut root_tables = vec![family.head(), ROOT_SHARED];
         root_tables.extend(family.root());
         let c = if family.text_only() {
             // A text-only checkpoint's config is the text model's own object: one object holds
@@ -587,6 +598,7 @@ impl Checkpoint {
             schema::check(c.value, "text_config", &family.text_config()).map_err(Error::Config)?;
             c
         };
+        let tied = trunk::tied_of(&root, &c)?;
         let vocab = hf::vocab::Config::parse(config).map_err(|e| Error::Config(e.to_string()))?;
         let mut counts = BTreeMap::new();
         for field in family.counts() {
@@ -868,6 +880,7 @@ impl Checkpoint {
             },
             hidden: n("hidden_size"),
             dense_ff: counts.get("intermediate_size").copied(),
+            tied,
             indexer_k: counts.get("indexer_head_dim").copied().unwrap_or(0),
             vocab,
             metadata,
@@ -881,6 +894,8 @@ impl Checkpoint {
         tensors: impl IntoIterator<Item = (&'a str, &'a [usize])>,
     ) -> Result<BTreeMap<String, Mapped>, Error> {
         let mapped = map(&self.geometry, tensors, false)?;
+        let head = mapped.get(&names::output()).map(|m| m.sources[0].as_str());
+        trunk::check_head(self.tied, head)?;
         for m in mapped.values() {
             for name in &m.sources {
                 if name.contains(".ple.")
@@ -909,10 +924,9 @@ impl Checkpoint {
                 ));
             }
         }
-        for name in [names::token_embd(), names::output()] {
-            let m = mapped
-                .get(&name)
-                .ok_or_else(|| refuse(&name, "is missing"))?;
+        let heads = [names::token_embd(), names::output()];
+        for name in &heads[..if self.tied { 1 } else { 2 }] {
+            let m = mapped.get(name).ok_or_else(|| refuse(name, "is missing"))?;
             if m.dims != [u64::from(self.hidden), u64::from(self.vocab.size())] {
                 return Err(refuse(
                     &m.sources[0],
@@ -2632,7 +2646,7 @@ mod tests {
             a.iter().chain(b).copied().collect()
         };
         let (root, text) = (
-            union(ROOT_SHARED, ROOT_38),
+            union(&union(Family::Qwen38.head(), ROOT_SHARED), ROOT_38),
             union(&union(TEXT_SHARED, SHARED_EXPERT), TEXT_38),
         );
         let objects = [

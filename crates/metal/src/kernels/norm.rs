@@ -1,6 +1,10 @@
 //! The RMS norm of a chunk of rows: `y = (x · gain) · scale` for each row, in
 //! the order of the router's norm. The kernel is `kernels/norm.metal`'s
-//! `norm_rows`: one threadgroup a row, the router's thread count.
+//! `norm_rows`: one threadgroup a row, the router's thread count, the threads
+//! striding over the row's float4s. At a width the router's tile (the floats
+//! one pass of the threads covers) divides, the sums are the router's bit for
+//! bit; at another width the last pass is short and the sums are the same walk
+//! over the float4s the row has.
 //!
 //! A row whose scale is unusable raises the norm site and is NaN, and the
 //! other rows are unaffected.
@@ -56,8 +60,7 @@ const SHARED_WORDS: usize = 5;
 pub struct NormRowsParams<'w> {
     /// Rows in the chunk. Zero is refused.
     pub rows: usize,
-    /// Values in a row. A multiple of four floats for every thread of the
-    /// router's threadgroup.
+    /// Values in a row: a multiple of four.
     pub cols: usize,
     /// The input, `x_stride` elements between rows.
     pub x: Window<'w, f32, MetalDevice>,
@@ -290,14 +293,10 @@ impl Kernels {
         if p.rows == 0 {
             return Err(refuse(what, "rows of 0"));
         }
-        let lanes = self.router_threads() * 4;
-        if p.cols == 0 || !p.cols.is_multiple_of(lanes) {
+        if p.cols == 0 || !p.cols.is_multiple_of(4) {
             return Err(refuse(
                 what,
-                format!(
-                    "cols {} is not a multiple of {lanes}, the float4s the norm's threads cover",
-                    p.cols
-                ),
+                format!("cols {} is not a multiple of four, whole float4s", p.cols),
             ));
         }
         for (name, stride) in [("x", p.x_stride), ("y", p.y_stride)] {

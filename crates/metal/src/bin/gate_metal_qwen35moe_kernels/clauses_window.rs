@@ -4,14 +4,14 @@
 //! prefill flash) with the layer a case names, and holds every output of every
 //! query head to the f64 attention over the last `window` of its keys
 //! (`oracle_attention`), gated by the head's own value when the instance gates
-//! per head. A scene's
-//! prologue is the instance's own: each query and key head normed by its gains
-//! and turned as NEOX halves where the instance norms (`AttnGeom::qk_norm`),
-//! the raw values turned as neighbours where it does not. The appended rows
-//! are the oracle's f16 or q8_0 bits and every other cache word is the planted
-//! one. The cache rows before a layer's first window key are poisoned with the
-//! largest finite f16 in keys and values, so a read of one is red wherever the
-//! kernel reaches it.
+//! per head. A scene's prologue is the instance's own
+//! (`AttnGeom::prologue`): each query and key head normed by its gains and
+//! turned as NEOX halves where the instance norms, the raw values turned as
+//! neighbours where it pairs NORM, and as NEOX halves where it does neither.
+//! The appended rows are the oracle's f16 or q8_0 bits and every other cache
+//! word is the planted one. The cache rows before a layer's first window key
+//! are poisoned with the largest finite f16 in keys and values, so a read of
+//! one is red wherever the kernel reaches it.
 //!
 //! The kernels read a host table of `(cos, sin)` a pair; the rope factors are
 //! that table's recipe ([`oracle_attention::rope_row_f64`]). The launch is given
@@ -21,7 +21,7 @@
 
 use bloomery_device::conformance::{Clause, Verdict, why};
 use bloomery_device::{Buffer, Device, DeviceError, Elems, Fault, Window};
-use bloomery_metal::geom::AttnGeom;
+use bloomery_metal::geom::{AttnGeom, Prologue};
 use bloomery_metal::kernels::{
     AttentionParams, AttentionPrefillParams, AttentionRowsParams, AttnLayer, segments_for_window,
 };
@@ -34,8 +34,8 @@ use super::clauses_attention::{
 use super::common::{LAYER, first_diff, ratio};
 use super::oracle::sigmoid;
 use super::oracle_attention::{
-    attend, band, head_gate_row, norm_rope, pack_f16, pack_q8, prefill_band, rope_norm_pairs,
-    rope_row_f64, window_tail,
+    attend, band, head_gate_row, norm_rope, pack_f16, pack_q8, prefill_band, rope_neox,
+    rope_norm_pairs, rope_row_f64, window_tail,
 };
 use super::{ClauseCtx, ClauseRun, Harness, OUT_GUARD, SENTINEL_BITS, VALUE_PAD};
 
@@ -578,7 +578,7 @@ fn launch(
 
 /// The prologue of one head in the kernel's f32 order: the norm and the NEOX
 /// pairs where the instance norms each head, the raw values turned as
-/// neighbours where it does not.
+/// neighbours where it pairs NORM, as NEOX halves where it does neither.
 fn prologue(
     attn: &AttnGeom,
     x: &[f32],
@@ -586,9 +586,13 @@ fn prologue(
     eps: f32,
     rope: &[f32],
 ) -> Result<Vec<f32>, String> {
-    match (attn.qk_norm, gain) {
-        (true, Some(g)) => norm_rope(x, g, eps, rope),
-        (false, None) => rope_norm_pairs(x, rope),
+    match (attn.prologue(), gain) {
+        (Some(Prologue::NormedNeox), Some(g)) => norm_rope(x, g, eps, rope),
+        (Some(Prologue::RawNorm), None) => rope_norm_pairs(x, rope),
+        (Some(Prologue::RawNeox), None) => rope_neox(x, rope),
+        (None, _) => {
+            Err("a head norm over NORM pairs is no prologue the flash is built for".to_string())
+        }
         _ => Err("the scene's gains do not match the instance's head norm".to_string()),
     }
 }
@@ -1066,8 +1070,8 @@ fn llama3_factors(head: usize, base: f64) -> Vec<f32> {
         .collect()
 }
 
-/// The no-norm, neighbour-paired prologue at a Llama head (a 128-wide head
-/// over groups of four, the rope's `llama3` frequency factors): the appended
+/// The no-norm, neighbour-paired prologue at a Llama head (the instance's
+/// width over its group, the rope's `llama3` frequency factors): the appended
 /// rows and every output of every query head against the f64 oracle on the
 /// three paths — the decode flash (the one-pass flash of one segment, the
 /// split's fold at the rule's count and off it), the rows flash (one segment
@@ -1077,7 +1081,7 @@ fn llama3_factors(head: usize, base: f64) -> Vec<f32> {
 /// launch's table only.
 pub fn attn_prologue(h: &Harness<'_>, mutant: Option<&str>) -> Clause {
     let attn = &h.geom().attn;
-    if attn.qk_norm || !attn.norm_pairs {
+    if attn.prologue() != Some(Prologue::RawNorm) {
         return Ok(Verdict::Skip(
             "the instance's prologue is not the raw values turned as neighbours".to_string(),
         ));
@@ -1345,21 +1349,23 @@ pub fn table<'a>(ctx: &'a ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<'a>)> {
     ]
 }
 
+/// The rope-factor scenes of an instance whose prologue norms no head and pairs
+/// neighbours.
+pub fn prologue_factors<'a>(ctx: &'a ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<'a>)> {
+    let h = ctx.harness;
+    let mutant = super::flag(ctx.args, "--mutant");
+    vec![(
+        "attn_prologue",
+        Box::new(move || attn_prologue(h, mutant)) as ClauseRun<'a>,
+    )]
+}
+
 /// The clauses of the instance whose prologue norms no head and pairs
 /// neighbours, in gate order.
 pub fn prologue_table<'a>(ctx: &'a ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<'a>)> {
-    let h = ctx.harness;
-    let mutant = super::flag(ctx.args, "--mutant");
-    vec![
-        (
-            "attn_prologue",
-            Box::new(move || attn_prologue(h, mutant)) as ClauseRun<'a>,
-        ),
-        (
-            "attn_layer_refusals",
-            Box::new(move || attn_layer_refusals(h)) as ClauseRun<'a>,
-        ),
-    ]
+    let mut clauses = prologue_factors(ctx);
+    clauses.extend(refusals(ctx));
+    clauses
 }
 
 /// The layer refusals alone: a row whose flash cuts no window and has no

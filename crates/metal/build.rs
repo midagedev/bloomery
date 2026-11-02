@@ -189,6 +189,7 @@ fn main() {
     for name in [
         "fault",
         "copy",
+        "bias",
         "probe",
         "norm",
         "quant",

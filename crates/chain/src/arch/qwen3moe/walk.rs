@@ -384,6 +384,7 @@ mod tests {
             window: None,
             gate: None,
             rope_freqs: None,
+            bias: None,
         }
     }
 

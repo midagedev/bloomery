@@ -31,6 +31,35 @@ pub(super) fn tied<E: From<String>>(c: &Section<'_, E>) -> Result<bool, E> {
         .ok_or_else(|| c.bad("tie_word_embeddings", "must be a bool"))
 }
 
+/// `tie_word_embeddings` where the object holds it, which must be a bool: `None` where it is
+/// absent, which a map reads as an untied model ([`check_head`] then refuses a folder with no
+/// head). A config of two objects that each may hold the flag takes it from the first, and the
+/// second must agree ([`tied_of`]).
+pub(super) fn tied_if_set<E: From<String>>(c: &Section<'_, E>) -> Result<Option<bool>, E> {
+    c.value
+        .get("tie_word_embeddings")
+        .map(|v| {
+            v.as_bool()
+                .ok_or_else(|| c.bad("tie_word_embeddings", "must be a bool"))
+        })
+        .transpose()
+}
+
+/// The model's tie flag of a config whose root and `text_config` each may hold it: the one
+/// that is set, an absent one untied, and two that disagree refused by name.
+pub(super) fn tied_of<E: From<String>>(
+    root: &Section<'_, E>,
+    text: &Section<'_, E>,
+) -> Result<bool, E> {
+    match (tied_if_set(root)?, tied_if_set(text)?) {
+        (Some(a), Some(b)) if a != b => Err(text.bad(
+            "tie_word_embeddings",
+            &format!("is {b}, where config.tie_word_embeddings is {a}"),
+        )),
+        (a, b) => Ok(a.or(b).unwrap_or(false)),
+    }
+}
+
 /// The flag `tied` held against the head the folder holds (its name, `None` for none): a tied
 /// model has no head beside the embedding, and one that is not tied has one. Either mismatch is
 /// refused, so no folder is read as the head it does not hold.
