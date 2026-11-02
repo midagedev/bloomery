@@ -20,6 +20,13 @@
 # is refset's D3K_POSITION + 1. MISTRALLARGE4_TAG=mix256g names the Mix-256G file's ref_mistrallarge4_mix256g_d3k. The real
 # files only: the fixture's top-k is 16 and its walk past it is the e2e gate's own.
 #
+# The variant `d3k-scores` (`just dump-ref-mistrallarge4 d3k-scores`) dumps the same deep step into its own set, with one tap more,
+# the lightning indexer's per-row score:
+#   ref_mistrallarge4_d3k_scores  `d3k`'s ids and taps plus `indexer_score`: each full indexer layer's score of every cached
+#                          row at the step, the values its `top_k` is cut from, so a gate reads mainline's own per-row score and
+#                          not a proxy of it. The UD-IQ1_S file only (a tag is refused): the Mix-256G file's deep set has no
+#                          score tap.
+#
 # The harness is the shared one: tools/ref/cb_dump.cpp is the dumper, tools/ref/cb-dump.sh the build and the
 # run (staging, lease, install); this file is Mistral Large 4's part of them, the tree, the taps and the prompts.
 # `bash tools/ref/mistrallarge4-dump.sh --build` links the dumper against the ml4 tree
@@ -40,6 +47,10 @@
 #   attn_norm                                   the layer input, normed
 #   indexer_q_ssmax, indexer_k, indexer_weights the lightning indexer's SSMax-scaled queries, its key at each
 #                                              stage and its head weights, on the 44 layers with a full indexer
+#   indexer_score                               the per-row score each full indexer layer cuts its list from
+#                                              (`d3k-scores` only): `n_kv` wide at a decode step, a row whose cache
+#                                              slot is padding masked to -inf; the fused op names one tensor a layer,
+#                                              the unfused path names five, the last of them the masked score
 #   top_k                                       the selected positions (an i32 node: the f32 file, its i32 twin
 #                                              and its `int` row), one tensor a full indexer layer. A layer that
 #                                              reuses the previous full layer's selection names the same tensor
@@ -97,6 +108,8 @@ TAPS=attn_norm+indexer_q_ssmax+indexer_k+indexer_weights+top_k+Qcur_ssmax+kv_cmp
 # (BLOOMERY_REF_MODEL, `just dump-ref-mistrallarge4-mix256g`) ref_mistrallarge4_mix256g_{a,b}, over the same ids.
 tag=${MISTRALLARGE4_TAG:+${MISTRALLARGE4_TAG}_}
 CB_PROMPTS=("${tag}a:a:$TAPS:32" "${tag}b:b:$TAPS:32")
+# The deep set with the per-row index score (`d3k-scores`).
+TAPS_SCORES=$TAPS+indexer_score
 CB_FLAGS=()
 
 # The deep set's ids: D3K_IDS = refset's D3K_POSITION + 1 (the step's own id on top of the prefill).
@@ -152,5 +165,20 @@ case ${1:-} in
     source "${BASH_SOURCE[0]%/*}/lease.sh"
     cb_dump_run
     ;;
-  *) echo "mistrallarge4-dump.sh: no argument (the dump), d3k or --build, got $1" >&2; exit 64 ;;
+  d3k-scores)
+    [ "${BLOOMERY_TIER:-real}" != fixture ] || {
+      echo "mistrallarge4-dump.sh: d3k-scores is the real file's deep set, BLOOMERY_TIER=fixture does not dump it (exit 64)" >&2
+      exit 64
+    }
+    [ -z "$tag" ] || {
+      echo "mistrallarge4-dump.sh: d3k-scores is the UD-IQ1_S file's set, MISTRALLARGE4_TAG=${MISTRALLARGE4_TAG} names another file's (exit 64)" >&2
+      exit 64
+    }
+    d3k_ids
+    CB_PROMPTS=("d3k_scores:$D3K_FILE:$TAPS_SCORES:0:step")
+    # shellcheck source=tools/ref/lease.sh
+    source "${BASH_SOURCE[0]%/*}/lease.sh"
+    cb_dump_run
+    ;;
+  *) echo "mistrallarge4-dump.sh: no argument (the dump), d3k, d3k-scores or --build, got $1" >&2; exit 64 ;;
 esac

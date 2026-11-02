@@ -12,7 +12,9 @@
 //! [`prompt_tables`](super::prompt_tables). Beside the two prompts each real file has a deep set,
 //! [`D3K`] (`just dump-ref-mistrallarge4 d3k`): a decode step at position [`D3K_POSITION`], past the
 //! lightning indexer's top-k, after a quiet prefill of the prose that precedes it, so the
-//! selection it dumps is a cut of the positions and not all of them ([`check_deep`]).
+//! selection it dumps is a cut of the positions and not all of them ([`check_deep`]). The same
+//! step is dumped again into [`D3K_SCORES`] (`just dump-ref-mistrallarge4 d3k-scores`) with one tap
+//! more, `indexer_score`, the per-row score each full indexer layer cuts its list from.
 //!
 //! The nodes the body gate compares, the graph's own `cb()` names: each layer's `attn_norm`;
 //! on the layers with a full indexer `indexer_q_ssmax` (the queries after the SSMax scale),
@@ -78,14 +80,19 @@ pub const B: &str = "ref_mistrallarge4_b";
 /// continuation. The step's selection is 2,048 of its 3,001 positions on every full indexer layer.
 pub const D3K: &str = "ref_mistrallarge4_d3k";
 
+/// The deep step of [`D3K`] again, with the lightning indexer's per-row score (`indexer_score-<l>`,
+/// a full indexer layer's score of every cached row at the step, `n_kv` wide) among its taps: the
+/// values each `top_k-<j>` is cut from. A set of its own: the UD-IQ1_S file's only.
+pub const D3K_SCORES: &str = "ref_mistrallarge4_d3k_scores";
+
 /// The deep sets' step position: the prefill's length, one past the ids it follows. It exceeds the
 /// indexer's top-k (2,048, the header's `attention.indexer.top_k`), which a gate reading the set
 /// states against the file in view; `tools/ref/mistrallarge4-dump.sh`'s `D3K_IDS` is this plus one.
 pub const D3K_POSITION: u32 = 3000;
 
 /// The prompt sets, in the order the dumps write them: the two prompts (`just dump-ref-mistrallarge4`),
-/// then the deep set (`just dump-ref-mistrallarge4 d3k`).
-pub const SETS: &[&str] = &[A, B, D3K];
+/// then the deep set (`just dump-ref-mistrallarge4 d3k`) and its scores twin (`d3k-scores`).
+pub const SETS: &[&str] = &[A, B, D3K, D3K_SCORES];
 
 /// Prompt a of the Mix-256G file: [`A`]'s ids, the Mix file's taps.
 pub const A_MIX256G: &str = "ref_mistrallarge4_mix256g_a";
@@ -139,7 +146,7 @@ pub static LCPP: Family = Family {
     name: "lcpp-mistrallarge4",
     sets: SETS,
     resolve: None,
-    recipe: "just dump-ref-mistrallarge4 [d3k]",
+    recipe: "just dump-ref-mistrallarge4 [d3k|d3k-scores]",
     identity: Identity::Manifest,
     arch: Some(ARCH),
     build: Some(Build::Is(LCPP_BUILD)),

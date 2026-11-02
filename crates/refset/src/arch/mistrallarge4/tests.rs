@@ -1,6 +1,6 @@
 use super::{
-    ARCH, D3K, D3K_MIX256G, D3K_POSITION, LCPP, LCPP_BUILD, LCPP_MIX256G, MODEL, MODEL_MIX256G,
-    SETS, SETS_MIX256G, check_deep, fixture,
+    ARCH, D3K, D3K_MIX256G, D3K_POSITION, D3K_SCORES, LCPP, LCPP_BUILD, LCPP_MIX256G, MODEL,
+    MODEL_MIX256G, SETS, SETS_MIX256G, check_deep, fixture,
 };
 use crate::RefError;
 use crate::arch::node_dump_contract::{self as contract, Row};
@@ -101,7 +101,7 @@ fn the_mix256g_family_refuses_a_set_without_its_trailer() -> Result<(), RefError
 }
 
 /// The sets the dump recipe writes, in its order (the two prompts, then the `d3k` variant's deep
-/// set), each under the name the family's recipe prints, and the two prompts' fixture twins (the
+/// set and the `d3k-scores` variant's), each under the name the family's recipe prints, and the two prompts' fixture twins (the
 /// real name with the fixture's cut, `e128`, in the family word; the fixture has no deep set); the
 /// shared fixture-family test (`arch::tests`) holds the rest of the mirror.
 #[test]
@@ -111,7 +111,8 @@ fn the_family_holds_the_dump_recipes_sets() {
         [
             "ref_mistrallarge4_a",
             "ref_mistrallarge4_b",
-            "ref_mistrallarge4_d3k"
+            "ref_mistrallarge4_d3k",
+            "ref_mistrallarge4_d3k_scores"
         ]
     );
     assert_eq!(LCPP.sets, SETS);
@@ -172,6 +173,8 @@ fn the_end_to_end_gate_is_the_consumer_of_both_real_families() {
 #[test]
 fn each_real_file_holds_its_own_deep_set() {
     assert_eq!(D3K, "ref_mistrallarge4_d3k");
+    assert_eq!(D3K_SCORES, "ref_mistrallarge4_d3k_scores");
+    assert!(LCPP.sets.contains(&D3K_SCORES) && !LCPP_MIX256G.sets.contains(&D3K_SCORES));
     assert_eq!(D3K_MIX256G, "ref_mistrallarge4_mix256g_d3k");
     assert!(LCPP.sets.contains(&D3K) && !LCPP.sets.contains(&D3K_MIX256G));
     assert!(LCPP_MIX256G.sets.contains(&D3K_MIX256G) && !LCPP_MIX256G.sets.contains(&D3K));

@@ -1,0 +1,20 @@
+# The Mistral Large 4 UD-IQ1_S file's deep node dump with the lightning indexer's per-row score,
+# `just dump-ref-mistrallarge4 d3k-scores`: docs/cards/mistrallarge4-d3k-dump.card's run (the same 3,001 ids, the same one load,
+# the same quiet prefill of 3,000 ids and the one step at position 3,000) into ref_mistrallarge4_d3k_scores, with one tap more,
+# `indexer_score`, which the callback asks for on the 44 full indexer layers of the step. Predicted wall [derived], seconds:
+#   load      223 GB mmapped, every expert touched by the six ubatches: 75-112 s cold, ~0 when the page cache holds the file
+#   prefill   3,000 ids at 0.10-0.20 s an id, the CPU-bound rate of the d3k card: 300-600 s
+#   step      one token, ~20 nodes a layer asked for: 1-3 s; the added tap is one n_kv-wide f32 row (3,001 to 3,072 values, ~12 KB)
+#             a layer on the fused op's one node (the unfused graph names five, the widest 64 heads wide: ~0.8 MB each), 44 layers:
+#             under 0.6 MB fused, ~180 MB unfused, one write each: under 2 s either way
+#   writes    ~0.3-0.5 GB of the d3k card's taps: 1-2 s
+#   total     5-13 min (the lower sum 301 s rounds up to the card's minute), bound 1800 s
+# What the run guarantees: CUDA hidden, the CPU lease held, the staging set installed only when its manifest carries the
+# `# complete` trailer, the ids the first 3,001 of the finished tokenizer oracle's prose.nps.ids (the script's sha256 line is their
+# record, equal to the d3k dump's), the set a new directory (ref_mistrallarge4_d3k_scores): ref_mistrallarge4_d3k stays as it is.
+kind: exclusive
+reason: mistrallarge4_dump runs mainline llama.cpp on 32 CPU threads over a 223 GB mmap for the prefill of 3,000 ids; beside a
+  timed run or a gate batch it would take their cores and their page cache, so it holds the lease; why now: the end-to-end
+  gate's deep clause reads mainline's own per-row index score of every cached row, which the d3k set does not hold, to judge a
+  list that differs from ours at the cut on measured scores and not on a proxy
+minutes: 5..13

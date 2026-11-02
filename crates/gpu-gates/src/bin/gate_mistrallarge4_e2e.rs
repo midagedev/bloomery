@@ -129,7 +129,21 @@
 //!   moved fraction is printed), with the step's logits row held to the real
 //!   tier's cosine floor against `result_output`. Bands: the real tier's
 //!   derived ones, [`DEEP_BANDS`], with the attention's cache-row term not in
-//!   view (the deep set holds the step's rows alone).
+//!   view (the deep set holds the step's rows alone). After the walk the same
+//!   ids run as one prompt call and the step again on the same inputs: layer
+//!   0's index keys at every walk position are the batch's within the dense
+//!   band (the walk wrote each row at its own slot). The UD-IQ1_S file's deep
+//!   set (`ref_mistrallarge4_d3k_scores`) holds mainline's own score of every
+//!   cached row at each full indexer layer, so the step's scores are read
+//!   against it row by row: layer 0's every row within the score's rounding
+//!   band (both engines' keys there come from the same embedding rows), every
+//!   layer's rows mostly within it ([`SCORE_ROWS_WITHIN`]), mainline's list the
+//!   top-k of its own scores, and a list that differs read on both engines'
+//!   scores of the rows that moved ([`deep_rows`]): a tie within the band of
+//!   both cuts, a diverged row (a router near tie broke apart upstream and the
+//!   row's keys with it), or red past [`SCORE_PEAKS_APART`] peaks. A deep set with no score tap
+//!   (the Mix-256G file's) reads the list on the cut's own scale and the two
+//!   paths' widest carried score distance ([`deep_tie`]).
 //! - `fault_word_clean` (self-consistency).
 
 #[cfg(feature = "mistrallarge4")]
@@ -180,7 +194,7 @@ mod gate {
     use refset::arch::mistrallarge4::{self as real_sets, fixture};
     use refset::arch::prompt_tables::{self, Greedy};
     use refset::family::Family;
-    use refset::ik::{Layout, RefManifest, RowKind, ref_ints};
+    use refset::ik::{Layout, RefManifest, RowKind, ref_ints, ref_tensor_logical_masked_in};
     use std::collections::BTreeMap;
 
     type Model = GpuModel<Body>;
@@ -2097,6 +2111,16 @@ mod gate {
         /// The step's position in the walk: the cache row it appended and the
         /// rows its selection ran over.
         pos: usize,
+        /// The deep step's carried score distance of each full layer
+        /// ([`BatchArm`]), empty elsewhere.
+        carried: &'a BTreeMap<usize, f64>,
+        /// The step's index scores of each full layer as read before another
+        /// call ran over the stores (the deep step's), empty where the body's
+        /// own are read.
+        scores: &'a BTreeMap<usize, Vec<f32>>,
+        /// Mainline's own per-row index scores of each full layer at the deep
+        /// step ([`mainline_scores`]), empty where the set holds none.
+        mainline: &'a BTreeMap<usize, Vec<f32>>,
     }
 
     impl At<'_> {
@@ -2150,6 +2174,8 @@ mod gate {
     /// ([`deep_tie`]), past which a moved row is no near tie.
     // PIN(2026-11-02): derived, a Gaussian move passes 5σ with probability
     // 5.7e-7 each way, so any of a deep step's 3,001 rows does with 1.7e-3.
+    // The cached rows' own carried distance is no Gaussian over the rows and
+    // stands beside it, measured on the run ([`BatchArm`], [`deep_tie`]).
     const FAR_SIGMAS: f64 = 5.0;
 
     /// How a deep step's list stands to the dump's where they differ ([`deep_tie`]).
@@ -2167,20 +2193,32 @@ mod gate {
         far: Vec<(u32, bool, f64, usize)>,
     }
 
-    /// A deep step's exchange read on the run's own scores `live`: `outside`,
-    /// the dump's rows the run left, each at its distance below the run's
-    /// k-th score, and `inside`, the run's rows the dump left, each at its
-    /// distance above the first score left out. Mainline's scores are not in
-    /// view at depth (the deep set dumps neither its index scores nor the keys
-    /// of the walk's rows), so the move of a score between the engines is read
-    /// from the exchange itself: rounding of scale σ takes a row across the cut
+    /// A deep step's exchange read on the run's own scores `live`, for a deep
+    /// set that holds no score tap ([`mainline_scores`] empty, the Mix-256G
+    /// file's): `outside`, the dump's rows the run left, each at its distance
+    /// below the run's k-th score, and `inside`, the run's rows the dump left,
+    /// each at its distance above the first score left out. Mainline's scores
+    /// are not in view there, so the move of a score between the engines is
+    /// read from the exchange itself: rounding of scale σ takes a row across the cut
     /// with the probability that a `N(0, σ²)` move passes its distance from
     /// it, so each side gives up `n = f·σ/√(2π)` rows at `f` rows a score unit
     /// at the cut, and `σ = n·√(2π)/f`. `f` is read over the `4n` ranks on
-    /// each side of the cut (at least 8), where the moved rows sit. A moved
-    /// row past [`FAR_SIGMAS`]·σ is one no rounding of the exchange's scale
-    /// reaches: a defect of that row (its key, its score), not a tie.
-    fn deep_tie(live: &[f32], k: usize, outside: &[u32], inside: &[u32]) -> DeepTie {
+    /// each side of the cut (at least 8), where the moved rows sit. That σ is
+    /// the score move of a row near the cut; a cached row also carries its
+    /// own walk's distance, which is not one Gaussian over the rows: a router
+    /// near tie the two roundings break apart at one of the row's earlier
+    /// layers moves that row's later keys far past σ, the rows after it
+    /// with it ([`BatchArm`]). So a moved row is far past [`FAR_SIGMAS`]·σ
+    /// plus `carried`, the widest score distance the cached rows of our own
+    /// two paths reach at this layer: one no rounding of the exchange's scale
+    /// and no walk's carried distance reaches, a defect of that row (its key,
+    /// its score), not a tie.
+    fn deep_tie(
+        live: &[f32],
+        k: usize,
+        (outside, inside): (&[u32], &[u32]),
+        carried: f64,
+    ) -> DeepTie {
         let mut order: Vec<f64> = live.iter().map(|&v| f64::from(v)).collect();
         order.sort_by(|a, b| b.total_cmp(a));
         let last = order.len() - 1;
@@ -2211,7 +2249,7 @@ mod gate {
             if d > widest {
                 (widest, deepest) = (d, ranks);
             }
-            if d.is_nan() || d > FAR_SIGMAS * sigma {
+            if d.is_nan() || carried.is_nan() || d > FAR_SIGMAS * sigma + carried {
                 far.push((r, ours, d, ranks));
             }
         }
@@ -2222,6 +2260,306 @@ mod gate {
             deepest,
             far,
         }
+    }
+
+    /// The relative size of the score's own rounding between the engines, the
+    /// band a moved row is a tie within ([`deep_rows`]) and a layer-0 row's
+    /// distance is held to ([`against_mainline`]), taken of mainline's peak
+    /// score of the layer.
+    // PIN(2026-11-02): derived, the step's scores are `Σ_h w_h·relu(q_h·k_r)`
+    // over 64 heads of a 128-long key; for a row whose key carries no upstream
+    // difference the engines differ in `q` and `w` by the dense site's rounding
+    // ([`DENSE_REL_BAND`], the bound the indexer's own band already uses), the
+    // key's f16 store is 2^-11 = 4.9e-4 relative, and the 128-long dot and the
+    // 64-head sum in f32 are under 1e-5, so the dense term decides the band
+    // (layer 0's 3,001 rows measure at most 0.5 % of the peak against its 3 %).
+    const SCORE_REL_BAND: f64 = DENSE_REL_BAND;
+
+    /// The share of a layer's rows that sit within [`SCORE_REL_BAND`] of
+    /// mainline's score, below which the layer's scores are no longer the
+    /// rounding of the same function: a defect that moves rows together (the
+    /// query's scale or rotation, the head weights, the key store of a layer)
+    /// moves most of them past the band, where the divergence a router near
+    /// tie carries on a few rows' keys does not.
+    // PIN(2026-11-02): provisional [measured on the d3k_scores run]: the 44
+    // full layers hold 87.2 % (layer 67, the worst) to 100 % of their 3,001
+    // rows within the band, the divergence being carried by the 0-13 % of rows
+    // whose earlier layers' routers broke apart; the floor is 75 %, 12 points
+    // under the worst. The share is no accuracy pin: a layer whose rows
+    // diverge more, the run's rounding being what it is, stays above it, and
+    // the share of every layer is printed.
+    const SCORE_ROWS_WITHIN: f64 = 0.75;
+
+    /// The widest distance, in units of mainline's peak score of the layer,
+    /// between the engines' scores of any one row.
+    // PIN(2026-11-02): derived, `|a − b| ≤ |a| + |b|`: mainline's score of a
+    // row is at most its peak by definition, and the run's is one more draw of
+    // the same function of a key the norm scales alike (a row whose router
+    // broke apart upstream has a key unrelated to mainline's, and its score
+    // anywhere in the layer's range, the widest measured 1.0 of the peak at
+    // layer 64), so a distance past two peaks and the band is no row's
+    // divergence but a score out of the function's range: garbage, a NaN or
+    // an unwritten row.
+    const SCORE_PEAKS_APART: f64 = 2.0;
+
+    /// How a deep step's list stands to the dump's where they differ, read on
+    /// mainline's own per-row scores ([`deep_rows`]).
+    struct DeepRows {
+        /// The score's rounding band and the peak it is taken of (mainline's).
+        band: f64,
+        peak: f64,
+        /// Moved rows within `band` of both engines' own cuts.
+        ties: usize,
+        /// Moved rows past that whose score is further than `band` from
+        /// mainline's: a row whose keys diverged upstream.
+        diverged: usize,
+        /// The moved rows whose distance is past [`SCORE_PEAKS_APART`] peaks
+        /// (plus the band) or NaN: the row, whether the run took it (the dump
+        /// left it), its distance between the engines, its distances to
+        /// mainline's cut and to the run's.
+        far: Vec<(u32, bool, f64, f64, f64)>,
+        /// The widest distance between the engines of any moved row.
+        widest: f64,
+    }
+
+    /// A deep step's exchange read on both engines' per-row scores: `ours`
+    /// the run's, `main` mainline's, over the same cached rows, `k` the list
+    /// length, `outside` the dump's rows the run left and `inside` the run's
+    /// rows the dump left. Each engine's list is the top-`k` of its own scores
+    /// (the selection rule, held for the run's by `selection_is_its_rule` and
+    /// for mainline's by [`against_mainline`]), so the exchange is a
+    /// consequence of the rows' score distances and holds nothing the distances
+    /// do not. A moved row is
+    /// - a tie when both engines put it within [`SCORE_REL_BAND`] of their own
+    ///   cut (the midpoint of the k-th and the next score): the rounding of
+    ///   the score alone takes it across;
+    /// - diverged when the engines' scores of it are further apart than the
+    ///   band: its key is not mainline's (a router near tie broken apart at an
+    ///   earlier layer moves the row's latent and keys, and the rows after it
+    ///   through the attention), which no band of the score's own rounding
+    ///   holds, and the same rows recur across the deep layers;
+    /// - far when its distance passes [`SCORE_PEAKS_APART`] peaks and the band,
+    ///   or is NaN: no divergence reaches it.
+    ///
+    /// Scores alone cannot tell one diverged row's key from a defect of that row
+    /// that lies inside the layer's score range: the walk's key writes are held
+    /// at layer 0, where no earlier layer carries a difference
+    /// ([`against_mainline`]), and the share of rows within the band at every
+    /// layer.
+    fn deep_rows(
+        ours: &[f32],
+        main: &[f32],
+        k: usize,
+        (outside, inside): (&[u32], &[u32]),
+    ) -> DeepRows {
+        let peak = main.iter().fold(0.0f64, |a, &v| a.max(f64::from(v).abs()));
+        let band = SCORE_REL_BAND * peak;
+        let cut = |x: &[f32]| {
+            let mut order: Vec<f64> = x.iter().map(|&v| f64::from(v)).collect();
+            order.sort_by(|a, b| b.total_cmp(a));
+            let last = order.len() - 1;
+            (order[k - 1] + order[k.min(last)]) / 2.0
+        };
+        let (cut_m, cut_o) = (cut(main), cut(ours));
+        let reach = SCORE_PEAKS_APART * peak + band;
+        let (mut ties, mut diverged, mut far, mut widest) = (0usize, 0usize, Vec::new(), 0.0f64);
+        for &r in outside.iter().chain(inside) {
+            let i = r as usize;
+            let gaps = (
+                (f64::from(main[i]) - cut_m).abs(),
+                (f64::from(ours[i]) - cut_o).abs(),
+            );
+            let d = (f64::from(ours[i]) - f64::from(main[i])).abs();
+            if d > widest {
+                widest = d;
+            }
+            if d.is_nan() || d > reach {
+                far.push((r, inside.binary_search(&r).is_ok(), d, gaps.0, gaps.1));
+            } else if gaps.0 <= band && gaps.1 <= band {
+                ties += 1;
+            } else if d > band {
+                diverged += 1;
+            } else {
+                ties += 1;
+            }
+        }
+        DeepRows {
+            band,
+            peak,
+            ties,
+            diverged,
+            far,
+            widest,
+        }
+    }
+
+    /// [`deep_rows`]'s own calibration, on 100 scores falling by one a row
+    /// and k = 60: a pair swapped across the cut inside the band is two ties,
+    /// a row dropped far from the cut by a divergence inside the score range
+    /// is a diverged row, a row whose score lands past two peaks from
+    /// mainline's is far, and so is a NaN score.
+    fn deep_rows_holds() -> bool {
+        let main: Vec<f32> = (0..100).map(|r| 100.0 - r as f32).collect();
+        let list = |x: &[f32]| -> Vec<u32> {
+            let mut l: Vec<u32> = rule_top(x, 60).iter().map(|&r| r as u32).collect();
+            l.sort_unstable();
+            l
+        };
+        let read = |ours: &[f32]| {
+            let (m, o) = (list(&main), list(ours));
+            let outside: Vec<u32> = m.iter().filter(|r| !o.contains(r)).copied().collect();
+            let inside: Vec<u32> = o.iter().filter(|r| !m.contains(r)).copied().collect();
+            deep_rows(ours, &main, 60, (&outside, &inside))
+        };
+        let mut swapped = main.clone();
+        (swapped[59], swapped[60]) = (40.2, 40.8);
+        let mut dropped = main.clone();
+        dropped[10] = 35.0;
+        let mut wild = main.clone();
+        wild[80] = 300.0;
+        let mut nan = main.clone();
+        nan[80] = f32::NAN;
+        let (s, d, w, n) = (read(&swapped), read(&dropped), read(&wild), read(&nan));
+        s.ties == 2
+            && s.diverged == 0
+            && s.far.is_empty()
+            && d.ties == 1
+            && d.diverged == 1
+            && d.far.is_empty()
+            && w.far.len() == 1
+            && w.far[0].0 == 80
+            && n.far.len() == 1
+    }
+
+    /// Mainline's per-row index scores of each full layer at the deep step
+    /// (`indexer_score-<l>`: the values the layer's `top_k` is cut from), the
+    /// first `rows` values of the last occurrence the dump holds of the name:
+    /// the fused op names one tensor a layer, the unfused graph names five, the
+    /// masked score the last. Empty where the set has no score tap (the
+    /// Mix-256G file's deep set); a tap on some full layers and not others, a
+    /// tensor shorter than `rows`, a non-finite visible score and a slot past
+    /// them that is not the mask's `-inf` end the gate by name.
+    fn mainline_scores(
+        man: &RefManifest,
+        hp: &Hparams,
+        rows: usize,
+    ) -> Result<BTreeMap<usize, Vec<f32>>, GateError> {
+        let mut out = BTreeMap::new();
+        for l in (0..hp.n_layer).filter(|&l| hp.indexer_full[l]) {
+            let name = format!("indexer_score-{l}");
+            let last = (0u32..)
+                .take_while(|&o| man.tensor(&name, o).is_ok())
+                .last();
+            let Some(occ) = last else {
+                if out.is_empty() {
+                    return Ok(out);
+                }
+                return Err(
+                    format!("the deep set holds no {name} beside the layers before it").into(),
+                );
+            };
+            let row = man.tensor(&name, occ)?;
+            let all = ref_tensor_logical_masked_in(&man.dir, row, rows)?;
+            let v = all.get(..rows).ok_or_else(|| {
+                format!(
+                    "{name} holds {} values, fewer than the step's {rows} rows",
+                    all.len()
+                )
+            })?;
+            out.insert(l, v.to_vec());
+        }
+        Ok(out)
+    }
+
+    /// Each full layer's scores over the context, by layer.
+    type LayerScores = BTreeMap<usize, Vec<f32>>;
+
+    /// The deep step's scores read against mainline's, every full layer: the
+    /// distance profile over the layer's rows (printed); mainline's own list
+    /// the top-k of its own scores (the dump's tap is the score its cut was
+    /// taken from); the share of rows within [`SCORE_REL_BAND`] of mainline's
+    /// score at least [`SCORE_ROWS_WITHIN`] (a defect that moves rows together
+    /// moves most of them); no NaN in the run's scores; and at layer 0, where
+    /// both engines' keys come from the same embedding rows and no layer before
+    /// it carries a difference, every row within the band: the walk's key
+    /// writes, the rope at each position and the score kernel over every row
+    /// against mainline's, not only against the batch's.
+    fn against_mainline(
+        man: &RefManifest,
+        hp: &Hparams,
+        (ours, main): (&LayerScores, &LayerScores),
+        pos: usize,
+        tally: &mut Tally,
+    ) -> Result<(), GateError> {
+        const CLAUSE: &str = "nodes_near_mainlines_deep";
+        let k = hp.indexer_top_k;
+        for (&l, m) in main {
+            let o = ours
+                .get(&l)
+                .and_then(|o| o.get(..=pos))
+                .ok_or_else(|| format!("no walk score of layer {l} over {} rows", pos + 1))?;
+            let m = &m[..=pos];
+            let mut d: Vec<f64> = o
+                .iter()
+                .zip(m)
+                .map(|(&a, &b)| (f64::from(a) - f64::from(b)).abs())
+                .collect();
+            let (at, wide) = widest(&d);
+            let peak = m.iter().fold(0.0f64, |a, &v| a.max(f64::from(v).abs()));
+            let band = SCORE_REL_BAND * peak;
+            let nan = d.iter().any(|x| x.is_nan());
+            let within = d.iter().filter(|&&x| x <= band).count() as f64 / d.len() as f64;
+            d.sort_by(|a, b| a.total_cmp(b));
+            let ok = !nan && within >= SCORE_ROWS_WITHIN;
+            tally.compared += 1;
+            tally.ok &= ok;
+            println!(
+                "{CLAUSE}: layer {l}'s scores against mainline's over {} rows: distance median \
+                 {:.2e} p99 {:.2e} widest {wide:.2e} at row {at}, mainline's peak {peak:.2e}, \
+                 {:.1} % of the rows within the band {band:.2e} (floor {:.0} %) {}",
+                d.len(),
+                d[d.len() / 2],
+                d[d.len() * 99 / 100],
+                100.0 * within,
+                100.0 * SCORE_ROWS_WITHIN,
+                verdict(ok)
+            );
+            let tk = dumped_list(man, l, hp.n_layer)?;
+            let name = format!("top_k-{tk}");
+            let all = ref_ints(man, &name, 0, RowKind::Tensor, Layout::Flat)?;
+            let list: Vec<u32> = all
+                .iter()
+                .map(|&v| u32::try_from(v).unwrap_or(u32::MAX))
+                .collect();
+            tally.compared += 1;
+            if let Err((got, want)) = selection_check(m, &list, k) {
+                println!(
+                    "{CLAUSE}: layer {l}: mainline's {name} is not the top-{k} of its own \
+                     indexer_score: {} rows of the list outside the rule's, {} of the rule's \
+                     outside the list FAIL",
+                    got.iter()
+                        .filter(|r| want.binary_search(r).is_err())
+                        .count(),
+                    want.iter()
+                        .filter(|r| got.binary_search(r).is_err())
+                        .count(),
+                );
+                tally.ok = false;
+            }
+            if l == 0 {
+                tally.compared += 1;
+                let ok = !nan && wide <= band;
+                println!(
+                    "{CLAUSE}: layer 0's scores at all {} rows against mainline's: widest \
+                     distance {wide:.2e} at row {at} (band {SCORE_REL_BAND}·peak {peak:.2e} = \
+                     {band:.2e}) {}",
+                    pos + 1,
+                    verdict(ok)
+                );
+                tally.ok &= ok;
+            }
+        }
+        Ok(())
     }
 
     /// One layer's tapped values (`node`, read after the step at `at`)
@@ -2328,8 +2666,12 @@ mod gate {
             ));
             if got != want {
                 let scores = {
-                    let (gpu, b) = body_of(m)?;
-                    b.index_scores(gpu, kind.indexer)?
+                    if let Some(s) = at.scores.get(&kind.indexer) {
+                        s.clone()
+                    } else {
+                        let (gpu, b) = body_of(m)?;
+                        b.index_scores(gpu, kind.indexer)?
+                    }
                 };
                 let live = &scores[..at.pos + 1];
                 // The run's rows the dump's list lacks.
@@ -2338,51 +2680,41 @@ mod gate {
                     .filter(|id| want.binary_search(id).is_err())
                     .copied()
                     .collect();
-                let peak = live.iter().fold(0.0_f32, |a, v| a.max(v.abs()));
-                let mut order = live.to_vec();
-                order.sort_by(|a, b| b.partial_cmp(a).unwrap());
-                let kth = order[top_k - 1];
-                let band = dense_band as f32 * peak;
-                let excused =
-                    !outside.is_empty() && outside.iter().all(|&r| kth - live[r as usize] <= band);
-                // The lists themselves where they are short enough to read.
-                let sets = if top_k <= 64 {
-                    format!("{got:?} != {want:?}")
+                // The deep step with mainline's own scores in view: the
+                // exchange is read on both engines' per-row scores
+                // ([`deep_rows`]), not on a proxy of mainline's.
+                let main = if deep {
+                    at.mainline.get(&kind.indexer)
                 } else {
-                    format!("{} of {top_k} rows moved", outside.len())
+                    None
                 };
-                if excused {
-                    idx_crossed = !deep;
-                    println!(
-                        "{clause}: top_k-{tk} p{p} {sets} inside the indexer's band (k-th gap \
-                         {:.2e} ≤ {:.2e}): the attention-fed nodes {}",
-                        kth - live[outside[0] as usize],
-                        band,
-                        if deep { "stay compared" } else { "skip here" }
-                    );
-                } else if deep {
-                    let t = deep_tie(live, top_k, &outside, &inside);
+                if let Some(main) = main {
+                    let t = deep_rows(live, &main[..at.pos + 1], top_k, (&outside, &inside));
                     let far: Vec<String> = t
                         .far
                         .iter()
-                        .map(|&(r, ours, d, ranks)| {
+                        .map(|&(r, ours, d, gm, go)| {
                             let side = if ours { "the run's" } else { "the dump's" };
-                            format!("row {r} {side} {:.1}σ {ranks} ranks", d / t.sigma)
+                            format!(
+                                "row {r} {side}: {d:.2e} between the engines, {gm:.2e} from \
+                                 mainline's cut, {go:.2e} from the run's"
+                            )
                         })
                         .collect();
                     println!(
-                        "{clause}: top_k-{tk} p{p} {sets} at the cut, read on its own scale: σ \
-                         {:.2e} ({:.2e} of the scores' peak, {:.3e} rows a unit there), the widest \
-                         {:.2e} = {:.1}σ {} ranks from the cut; {} past {FAR_SIGMAS}σ{} {}",
-                        t.sigma,
-                        t.sigma / f64::from(peak).max(f64::MIN_POSITIVE),
-                        t.density,
+                        "{clause}: top_k-{tk} p{p} {} of {top_k} rows moved, read on mainline's own \
+                         scores (peak {:.2e}, band {:.2e}): {} ties (both engines within the band \
+                         of their cut), {} diverged rows (the engines' scores further apart than \
+                         the band, the widest {:.2e}), {} past {SCORE_PEAKS_APART} peaks{} {}",
+                        outside.len(),
+                        t.peak,
+                        t.band,
+                        t.ties,
+                        t.diverged,
                         t.widest,
-                        t.widest / t.sigma,
-                        t.deepest,
-                        far.len(),
+                        t.far.len(),
                         if far.is_empty() {
-                            ": near ties, the attention-fed nodes stay compared".to_string()
+                            String::new()
                         } else {
                             format!(" [{}]", far.join(", "))
                         },
@@ -2390,8 +2722,65 @@ mod gate {
                     );
                     tally.ok &= far.is_empty();
                 } else {
-                    println!("{clause}: top_k-{tk} p{p} {sets} FAIL");
-                    tally.ok = false;
+                    let peak = live.iter().fold(0.0_f32, |a, v| a.max(v.abs()));
+                    let mut order = live.to_vec();
+                    order.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                    let kth = order[top_k - 1];
+                    let band = dense_band as f32 * peak;
+                    let excused = !outside.is_empty()
+                        && outside.iter().all(|&r| kth - live[r as usize] <= band);
+                    // The lists themselves where they are short enough to read.
+                    let sets = if top_k <= 64 {
+                        format!("{got:?} != {want:?}")
+                    } else {
+                        format!("{} of {top_k} rows moved", outside.len())
+                    };
+                    if excused {
+                        idx_crossed = !deep;
+                        println!(
+                            "{clause}: top_k-{tk} p{p} {sets} inside the indexer's band (k-th gap \
+                         {:.2e} ≤ {:.2e}): the attention-fed nodes {}",
+                            kth - live[outside[0] as usize],
+                            band,
+                            if deep { "stay compared" } else { "skip here" }
+                        );
+                    } else if deep {
+                        let carried = at.carried.get(&kind.indexer).copied().ok_or_else(|| {
+                            format!("no carried distance for layer {}'s list", kind.indexer)
+                        })?;
+                        let t = deep_tie(live, top_k, (&outside, &inside), carried);
+                        let far: Vec<String> = t
+                            .far
+                            .iter()
+                            .map(|&(r, ours, d, ranks)| {
+                                let side = if ours { "the run's" } else { "the dump's" };
+                                format!("row {r} {side} {:.1}σ {ranks} ranks", d / t.sigma)
+                            })
+                            .collect();
+                        println!(
+                            "{clause}: top_k-{tk} p{p} {sets} at the cut, read on its own scale: σ \
+                         {:.2e} ({:.2e} of the scores' peak, {:.3e} rows a unit there), the widest \
+                         {:.2e} = {:.1}σ {} ranks from the cut; {} past {FAR_SIGMAS}σ + carried \
+                         {carried:.2e}{} {}",
+                            t.sigma,
+                            t.sigma / f64::from(peak).max(f64::MIN_POSITIVE),
+                            t.density,
+                            t.widest,
+                            t.widest / t.sigma,
+                            t.deepest,
+                            far.len(),
+                            if far.is_empty() {
+                                ": near ties, the attention-fed nodes stay compared".to_string()
+                            } else {
+                                format!(" [{}]", far.join(", "))
+                            },
+                            verdict(far.is_empty())
+                        );
+                        tally.ok &= far.is_empty();
+                    } else {
+                        println!("{clause}: top_k-{tk} p{p} {sets} FAIL");
+                        tally.ok = false;
+                    }
                 }
             }
         }
@@ -3025,6 +3414,9 @@ mod gate {
                             rows: n_pos,
                             row: p,
                             pos: p,
+                            carried: &BTreeMap::new(),
+                            scores: &BTreeMap::new(),
+                            mainline: &BTreeMap::new(),
                         },
                         (false, &mut tally, &mut seen),
                     )?;
@@ -3074,6 +3466,173 @@ mod gate {
     ///
     /// The step's logits row is read against the dump's `result_output` at the
     /// real tier's cosine floor.
+    /// The deep step's inputs on (`on`) or off: the taps armed (the walk runs
+    /// without their copies) and every layer but the first on the deep set's
+    /// own input, mainline's `l_out` of the layer before.
+    fn deep_inputs(
+        m: &mut Model,
+        hp: &Hparams,
+        man: &RefManifest,
+        on: bool,
+    ) -> Result<(), GateError> {
+        let (gpu, b) = body_of(m)?;
+        if !on {
+            b.clear_input_override();
+            return Ok(b.arm_taps(gpu, false)?);
+        }
+        b.arm_taps(gpu, true)?;
+        for l in 1..hp.n_layer {
+            b.set_input_override(gpu, l, &l_out_row(man, hp.n_embd, l - 1, 0)?)?;
+        }
+        Ok(())
+    }
+
+    /// The ceiling of a layer-0 index key row's relative distance, the walk's
+    /// row against the batch's at the same position.
+    ///
+    /// [derived]: the row's input is the embedding's norm on both paths; the
+    /// key projection rounds apart at the dense site (the batch's GEMM reads
+    /// its input rounded to the site's form, the step's gemv the row as it
+    /// is), which [`DENSE_REL_BAND`] bounds ours against mainline's, a
+    /// superset; the norm, the rope, the transform and the f16 store are one
+    /// rule at the row's own position. A row written at another slot, twice,
+    /// or roped a position off is a distance of order one.
+    // PIN(2026-11-02): derived, gate_mistrallarge4_prefill's ROW_BAND, which
+    // pins the same rows over its 529 positions; here every one of the deep
+    // set's 3,000.
+    const KEY_ROW_BAND: f64 = DENSE_REL_BAND;
+
+    /// The prompt batch's side of the deep step ([`batch_arm`]): each full
+    /// layer's index scores over the deep step's rows and layer 0's index keys
+    /// over the walk's.
+    struct BatchArm {
+        scores: BTreeMap<usize, Vec<f32>>,
+        keys0: Vec<f32>,
+    }
+
+    /// The deep set's ids as one prompt call (the batch, `app::Prompt for
+    /// Body`), then the deep step on the inputs the walk's step runs on
+    /// ([`deep_inputs`]): the step's index queries and head weights are the
+    /// walk's bits, so a full layer's scores differ from the walk's by the
+    /// cached rows' keys alone. The batch rounds apart from the steps at the
+    /// dense sites (`gate_mistrallarge4_prefill`'s module doc), a subset of
+    /// the roundings ours and mainline's differ by; a router near tie those
+    /// roundings break apart at a row's layer is carried on in the row's
+    /// later keys and, through the attention, the rows after it. `None`: a
+    /// fault, printed.
+    fn batch_arm(
+        m: &mut Model,
+        hp: &Hparams,
+        man: &RefManifest,
+        (prefill, token, pos): (&[u32], u32, usize),
+    ) -> Result<Option<BatchArm>, GateError> {
+        const CLAUSE: &str = "nodes_near_mainlines_deep";
+        m.reset()?;
+        let t = std::time::Instant::now();
+        if or_fault(
+            CLAUSE,
+            "the batch",
+            <Body as app::Prompt>::prompt(m, prefill),
+        )?
+        .is_none()
+        {
+            return Ok(None);
+        }
+        let prompted = t.elapsed().as_secs_f64();
+        deep_inputs(m, hp, man, true)?;
+        let ran = or_fault(CLAUSE, "the batch's deep step", m.step(&[token]));
+        deep_inputs(m, hp, man, false)?;
+        if ran?.is_none() {
+            return Ok(None);
+        }
+        let (gpu, b) = body_of(m)?;
+        let mut scores = BTreeMap::new();
+        for l in (0..hp.n_layer).filter(|&l| hp.indexer_full[l]) {
+            let s = b.index_scores(gpu, l)?;
+            let s = s
+                .get(..pos)
+                .ok_or("the batch's scores hold fewer rows than the walk")?;
+            scores.insert(l, s.to_vec());
+        }
+        let keys0 = store_f16(b.store_rows(gpu, pos)?, "blk.0.index_keys")?;
+        println!(
+            "{CLAUSE}: the batch: {} ids as one prompt call in {prompted:.1} s (runtime value), \
+             the deep step on the walk's inputs",
+            prefill.len()
+        );
+        Ok(Some(BatchArm { scores, keys0 }))
+    }
+
+    /// One store's rows of [`Body::store_rows`], decoded from f16.
+    fn store_f16(rows: Vec<(String, Vec<u8>)>, name: &str) -> Result<Vec<f32>, GateError> {
+        let (_, bytes) = rows
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .ok_or_else(|| format!("no store {name}"))?;
+        Ok(bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| half_to_f32(u16::from_le_bytes(*b)))
+            .collect())
+    }
+
+    impl BatchArm {
+        /// The walk's deep step (its `scores` and layer-0 `keys0`) against
+        /// the batch's: layer 0's index keys at every walk position within
+        /// [`KEY_ROW_BAND`] (the walk's key writes), and each full layer's
+        /// carried score distance, the widest over the cached rows, which
+        /// [`deep_tie`] reads.
+        fn against_walk(
+            &self,
+            (scores, keys0): (&BTreeMap<usize, Vec<f32>>, &[f32]),
+            pos: usize,
+            tally: &mut Tally,
+        ) -> BTreeMap<usize, f64> {
+            const CLAUSE: &str = "nodes_near_mainlines_deep";
+            let width = keys0.len() / pos;
+            let (mut worst, mut at) = (0.0f64, 0usize);
+            for (r, (w, s)) in keys0
+                .chunks(width)
+                .zip(self.keys0.chunks(width))
+                .enumerate()
+            {
+                let d = rel(w, s);
+                if d.is_nan() || d > worst {
+                    (worst, at) = (d, r);
+                }
+            }
+            let keys_ok = worst <= KEY_ROW_BAND;
+            tally.compared += 1;
+            tally.ok &= keys_ok;
+            println!(
+                "{CLAUSE}: layer 0's index keys at all {pos} walk positions against the \
+                 batch's: worst rel {worst:.4} at row {at} (band {KEY_ROW_BAND}) {}",
+                verdict(keys_ok)
+            );
+            let mut carried = BTreeMap::new();
+            for (&l, batch) in &self.scores {
+                let walk = scores.get(&l).map_or(&[][..], Vec::as_slice);
+                let (mut c, mut row) = (f64::NAN, 0usize);
+                if walk.len() >= batch.len() {
+                    c = 0.0;
+                }
+                for (r, (&w, &s)) in walk.iter().zip(batch).enumerate() {
+                    let d = (f64::from(w) - f64::from(s)).abs();
+                    if d.is_nan() || d > c {
+                        (c, row) = (d, r);
+                    }
+                }
+                println!(
+                    "{CLAUSE}: layer {l}'s cached rows, the walk's against the batch's: \
+                     carried score distance {c:.2e} at row {row}"
+                );
+                carried.insert(l, c);
+            }
+            carried
+        }
+    }
+
     fn nodes_near_mainlines_deep(m: &mut Model, case: &Case) -> Result<bool, GateError> {
         const CLAUSE: &str = "nodes_near_mainlines_deep";
         let man = case
@@ -3082,7 +3641,7 @@ mod gate {
             .as_ref()
             .ok_or("the deep set is not open (the real tier opens it)")?;
         let hp = &case.hp;
-        let (top_k, hidden) = (hp.indexer_top_k, hp.n_embd);
+        let top_k = hp.indexer_top_k;
         let (pos, step, prefill) = man.step()?;
         let (pos, token) = (
             pos as usize,
@@ -3122,19 +3681,8 @@ mod gate {
         let walked = t.elapsed().as_secs_f64();
         // The step: the taps armed now (the walk ran without their copies) and
         // every layer but the first on mainline's own input.
-        {
-            let (gpu, b) = body_of(m)?;
-            b.arm_taps(gpu, true)?;
-            for l in 1..hp.n_layer {
-                b.set_input_override(gpu, l, &l_out_row(man, hidden, l - 1, 0)?)?;
-            }
-        }
-        let disarm = |m: &mut Model| -> Result<(), GateError> {
-            let (gpu, b) = body_of(m)?;
-            b.clear_input_override();
-            b.arm_taps(gpu, false)?;
-            Ok(())
-        };
+        deep_inputs(m, hp, man, true)?;
+        let disarm = |m: &mut Model| deep_inputs(m, hp, man, false);
         if or_fault(CLAUSE, "the deep step", m.step(&[token]))?.is_none() {
             disarm(m)?;
             return Ok(false);
@@ -3149,24 +3697,58 @@ mod gate {
             verdict(selection_ok)
         );
         let logits = m.logits()?;
+        // What the walk's deep step left, read before the batch runs over the
+        // same stores: every layer's taps, each full layer's scores and the
+        // walk's layer-0 index keys (a row the walk failed to write keeps
+        // what the stores held before, never the batch's row).
+        let walk = {
+            let (gpu, b) = body_of(m)?;
+            let nodes = b.nodes(gpu, 0..hp.n_layer)?;
+            let mut scores = BTreeMap::new();
+            for l in (0..hp.n_layer).filter(|&l| hp.indexer_full[l]) {
+                scores.insert(l, b.index_scores(gpu, l)?);
+            }
+            let keys0 = store_f16(b.store_rows(gpu, pos)?, "blk.0.index_keys")?;
+            (nodes, scores, keys0)
+        };
+        disarm(m)?;
+        let Some(arm) = batch_arm(m, hp, man, (prefill, token, pos))? else {
+            return Ok(false);
+        };
         let mut tally = Tally::new();
+        let sound = deep_rows_holds();
+        println!(
+            "{CLAUSE}: the exchange rule passes a tie and a diverged row and refuses a row past \
+             {SCORE_PEAKS_APART} peaks and a NaN score {}",
+            verdict(sound)
+        );
+        tally.ok &= sound;
+        let mainline = mainline_scores(man, hp, pos + 1)?;
+        if mainline.is_empty() {
+            println!(
+                "{CLAUSE}: the deep set holds no indexer_score tap: a list that differs is read \
+                 on the cut's own scale and the walk's carried distance"
+            );
+        } else {
+            against_mainline(man, hp, (&walk.1, &mainline), pos, &mut tally)?;
+        }
+        let carried = arm.against_walk((&walk.1, &walk.2), pos, &mut tally);
         for (l, kind) in layer_cases(hp).iter().enumerate() {
-            let nodes = {
-                let (gpu, b) = body_of(m)?;
-                b.nodes(gpu, l..l + 1)?
-            };
             let mut seen: Vec<(String, usize, f64)> = Vec::new();
             compare_layer(
                 m,
                 (CLAUSE, DEEP_BANDS),
                 case,
                 (l, kind),
-                &nodes[0],
+                &walk.0[l],
                 &At {
                     man,
                     rows: 1,
                     row: 0,
                     pos,
+                    carried: &carried,
+                    scores: &walk.1,
+                    mainline: &mainline,
                 },
                 (true, &mut tally, &mut seen),
             )?;
@@ -3177,7 +3759,6 @@ mod gate {
             );
             eprintln!("clause {CLAUSE}: layer {l} ({})", kind.name);
         }
-        disarm(m)?;
         // The step's logits at `topk.tsv`'s ids against the table's logits, as
         // the greedy clause reads a prompt's last row (the layers here on
         // mainline's input), and the whole row against the dump's
@@ -3675,7 +4256,7 @@ mod gate {
                 &real_sets::LCPP,
                 real_sets::A,
                 real_sets::B,
-                Some(real_sets::D3K),
+                Some(real_sets::D3K_SCORES),
             ),
         };
         let deep = match deep {

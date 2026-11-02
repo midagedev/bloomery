@@ -479,8 +479,8 @@ gate-gpu-musespark-e2e:
 # NaN router lane raises the fault word, the selection rule at every position past the fixture's top-k 16,
 # every compared node at every layer and position within the bands, and the greedy 32 of both sets above the
 # band. Real tier: the same chain on the file in view (~209e9 host bytes, alone) against its family's sets
-# (ref_mistrallarge4_{a,b,d3k} or ref_mistrallarge4_mix256g_{a,b,d3k}; `just dump-ref-mistrallarge4 d3k` writes the deep
-# set) at the real tier's bands, the deep set's clause (nodes_near_mainlines_deep) walking its 3,000 prefill ids on the
+# (ref_mistrallarge4_{a,b,d3k_scores} or ref_mistrallarge4_mix256g_{a,b,d3k}; `just dump-ref-mistrallarge4 d3k-scores` writes
+# the UD-IQ1_S file's deep set) at the real tier's bands, the deep set's clause (nodes_near_mainlines_deep) walking its 3,000 prefill ids on the
 # engine's own layers and reading the selection rule at every position past the indexer's top-k 2,048 and every layer
 # at the step on its last id. Wall [derived: the fixture loads in under a minute, ~900 eager steps of five layers, 10-15
 # min; the real file's load 1-5 min, then ~1,500 steps of 75-95 ms and the per-layer reads, 10-20 min, and the deep
@@ -1596,6 +1596,9 @@ build-ref-mistrallarge4:
 # first 3,000 ids of the tokenizer oracle's prose (`just dump-ref-tokenizer mistrallarge4` first) and the nodes of the one step
 # at position 3,000, past the indexer's top-k 2,048, so the e2e gate's real tier reads a selection that is a cut. Predicted wall
 # 5-13 min [derived: docs/cards/mistrallarge4-d3k-dump.card] (BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/mistrallarge4-d3k-dump.card').
+# `just dump-ref-mistrallarge4 d3k-scores` dumps the same step into ref_mistrallarge4_d3k_scores with the lightning indexer's
+# per-row score (`indexer_score`) among the taps, which the e2e gate's deep clause reads (BLOOMERY_LEASE_CARD=docs/cards/
+# mistrallarge4-d3k-scores-dump.card, 5-13 min [derived]).
 dump-ref-mistrallarge4 *VARIANT:
     BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S={{ if VARIANT == '' { '300' } else { '540' } }} BLOOMERY_MODEL=mistral-large4 ./tools/box.sh 'bash tools/ref/mistrallarge4-dump.sh {{VARIANT}}'
 
