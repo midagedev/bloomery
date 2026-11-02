@@ -1,6 +1,6 @@
 # Numbers
 
-The README's [Status](../README.md#status-0310) shows one table for each of three common machines. This page holds every
+The README's [Status](../README.md#status-0311) shows one table for each of four common machines. This page holds every
 other record. Every number here is a release check or a sitting of the runners in `tools/ref/`, with its machine and conditions.
 The reference engines' rows are on
 [rig-log's bench page](https://github.com/midagedev/rig-log/blob/main/docs/bloomery-bench.md) with their flags,
@@ -143,8 +143,8 @@ answers with MTP on and off were the same, character for character, in all 205 r
 ## DGX Spark, the slots and memory of Qwen3.8's folders (`--plan` at `0305ba7a`)
 
 `bloomery-serve --plan` at main `0305ba7a` on one Spark (GB10, driver 595.84, `sm_121a`) with 115.5 to 116.6 GiB
-`MemAvailable` before each plan. Need is the `need` record's bytes. The MTP draft stayed on in every row that did not
-set `BLOOMERY_DRAFT=off`. The current table is in [`dgx-spark.md`](dgx-spark.md#4-requests-at-once-context-and-memory).
+`MemAvailable` before each plan. Need is the `need` record's bytes. A folder's KV cache was q8_0 at that commit (it is
+f16 by default now). The MTP draft stayed on in every row that did not set `BLOOMERY_DRAFT=off`. The current table is in [`dgx-spark.md`](dgx-spark.md#4-requests-at-once-context-and-memory).
 
 | Settings beside `-m <folder>` | FP4-Local: slots × context | FP4-Local: need | NVFP4: slots × context | NVFP4: need |
 |---|---|---:|---|---:|

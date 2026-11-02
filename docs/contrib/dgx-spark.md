@@ -42,7 +42,7 @@ budget solver.
 | **P0** compiles on aarch64 | `cargo check` of the host chain passes on aarch64 Linux, then `cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe` on the Spark; on x86 nothing moved: `just ptx-scan` equal and `gate-qdot`, `gate-ops` green | done: [#14](https://github.com/midagedev/bloomery/pull/14), `d95c7ec9` (design R: `qdot` refuses its host-tier types off x86, answer 1) | nothing (the site map is Appendix A) |
 | **P1** fixture gates pass | the host gates whose inputs are in process or published, and the three fixture families' gates, are green or each red is a named, Arm-only clause; a first bit-gate pass on cc 12.1 | not done. In: design S of `qdot`, its scalar mirrors ([#15](https://github.com/midagedev/bloomery/pull/15), `021dab61`), local mode ([#38](https://github.com/midagedev/bloomery/pull/38)), timing mode ([#39](https://github.com/midagedev/bloomery/pull/39)), names for the Arm-only reds ([#43](https://github.com/midagedev/bloomery/pull/43)), the Arm memory-order audit ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6118769122)), `gate-engram`'s eviction clause (`86022f32`, answer 18). The contributor list on `697790c4`: 29 of 93 items green ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6124298082)); on `b289130a`, 30 of 98, and the contributor judged the host-tier protocol part closed ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6135340457)) | the V4.1 DSpark draft fixture, still unpublished (only a draft reader refuses, [#159](https://github.com/midagedev/bloomery/pull/159)). `glm5next/corpus-prose.ids`, `engram/corpus-prose.ids` and `fx_ref_glm5next_vis_taps` are on the refset dataset since 2026-10-14 ([#53](https://github.com/midagedev/bloomery/issues/53#issuecomment-6168041480)). The first cc 12.1 pass is section 6 |
 | **P2** a real model runs | Clef-Flash, Qwen3-30B-A3B and Qwen3.6-35B-A3B answer from `bloomery-serve` on the Spark with a clean plan and `PoolOver` holding; a placement unit gate holds Σ card + host ≤ pool | done: [#16](https://github.com/midagedev/bloomery/pull/16), `7507942c` (section 7). The Spark run's rows are the Spark's P2 tape ([#16](https://github.com/midagedev/bloomery/pull/16#issuecomment-6103154837)) | nothing |
-| **P3** Spark-specific speed | the section 5 term measured; a Spark table with its own ruler; `BLOOMERY_ARCH=sm_121` rows | done: the term ([#17](https://github.com/midagedev/bloomery/issues/17#issuecomment-6104914439)), the table ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6107847345)), the row prefetch ([#27](https://github.com/midagedev/bloomery/pull/27), `fed530d2`), the router top-k ([#35](https://github.com/midagedev/bloomery/pull/35), `81355f2f`), `sm_121` ([#42](https://github.com/midagedev/bloomery/issues/42)), ~~`crates/threads` P/E split~~ (not needed: no decode or prefill step on the default path uses the pool, [#41](https://github.com/midagedev/bloomery/issues/41)), the cc 12.1 `ptx-shapes` tables and the cc 12.x occupancy column (section 6). Since then: GB10 recipes build `sm_121a` by default ([#758](https://github.com/midagedev/bloomery/pull/758)), where routed NVFP4 and FP4-Local prompt products run W4A4 on the FP4 tensor cores ([#687](https://github.com/midagedev/bloomery/pull/687)) and MXFP8 prompt sites W8A8 ([#769](https://github.com/midagedev/bloomery/pull/769)); Qwen3.8's NVFP4 and FP4-Local folders serve as downloaded ([#635](https://github.com/midagedev/bloomery/pull/635), [#543](https://github.com/midagedev/bloomery/pull/543); section 2.3); 0.3.11 ships the GB10 archive and the linux/arm64 Docker image ([#878](https://github.com/midagedev/bloomery/pull/878), [#883](https://github.com/midagedev/bloomery/pull/883)) | nothing |
+| **P3** Spark-specific speed | the section 5 term measured; a Spark table with its own ruler; `BLOOMERY_ARCH=sm_121` rows | done: the term ([#17](https://github.com/midagedev/bloomery/issues/17#issuecomment-6104914439)), the table ([#13](https://github.com/midagedev/bloomery/issues/13#issuecomment-6107847345)), the row prefetch ([#27](https://github.com/midagedev/bloomery/pull/27), `fed530d2`), the router top-k ([#35](https://github.com/midagedev/bloomery/pull/35), `81355f2f`), `sm_121` ([#42](https://github.com/midagedev/bloomery/issues/42)), ~~`crates/threads` P/E split~~ (not needed: no decode or prefill step on the default path uses the pool, [#41](https://github.com/midagedev/bloomery/issues/41)), the cc 12.1 `ptx-shapes` tables and the cc 12.x occupancy column (section 6). Since then: GB10 recipes build `sm_121a` by default ([#758](https://github.com/midagedev/bloomery/pull/758)), where routed NVFP4 and FP4-Local prompt products run W4A4 on the FP4 tensor cores ([#687](https://github.com/midagedev/bloomery/pull/687)) and MXFP8 prompt sites W8A8 ([#769](https://github.com/midagedev/bloomery/pull/769)); Qwen3.8's NVFP4 and FP4-Local folders serve as downloaded ([#635](https://github.com/midagedev/bloomery/pull/635), [#543](https://github.com/midagedev/bloomery/pull/543); [`../dgx-spark.md`](../dgx-spark.md)); 0.3.11 ships the GB10 archive and the linux/arm64 Docker image ([#878](https://github.com/midagedev/bloomery/pull/878), [#883](https://github.com/midagedev/bloomery/pull/883)) | nothing |
 | **P4** above the pool | a model larger than the pool (V4.1, GLM-5.3-Flash `UD-Q4_K_XL`) answers on one Spark with its overflow on the NVMe tier, the card computing the tier's experts from their slots | read rates measured (section 8). S7 is in: the pinned arena behind `BLOOMERY_NVTIER_MEM`, `device_slot` and the `devmap` tests (section 8). GLM and V4.1 load at serving defaults on one Spark and answer ([#100](https://github.com/midagedev/bloomery/pull/100), section 8). The card leg is in: on a pinned arena a decode step's arena experts are computed on the card from their slots, for GLM-5.3-Flash and for the bodies that open through the common hosted hybrid (8.2) | an arena at serving defaults; V4.1 on the card leg, whose load attaches none yet (section 8) |
 | **P5** several Sparks (×2, ×4) | a model plans and runs across N linked Sparks under the section 9 criteria, N = 2 first; the placement unit gate `nodes_scale` holds the criteria at N = 1, 2, 3 and 4 | the fabric and the protocol probe ran on two Sparks ([#44](https://github.com/midagedev/bloomery/pull/44), `de57867c`; section 9.6). The placement half's node plans and `nodes_scale` run on synthetic Sparks ([#94](https://github.com/midagedev/bloomery/pull/94), [#95](https://github.com/midagedev/bloomery/pull/95); section 9.9); section 10 lists where the gate differs from 9.9's words. Node 1's tier server, the load's plan from node 1's census, and both ends of a lost node run as two processes on one Spark over the loopback interface (9.5, items 5 and 6) | the placement half's engine side (contributor, answer 20): section 10 lists what is left; the protocol half, on the plan the maintainer agreed to in [#127](https://github.com/midagedev/bloomery/issues/127#issuecomment-6155272828) (contributor): the `Link` seam, the counter relay (section 9.5, item 2) and the RDMA link on one machine (items 1, 3, 4 and 7) are in. Private IPv4 node binds connect independent RDMA ends (9.5, item 5), with no channel authentication. Tensor parallel for GLM-5.3-Flash: `--place tp` plans its checkpoint folder over N ranks, each in its own node's pool ([#519](https://github.com/midagedev/bloomery/pull/519)); a rank reads its parts from a GGUF file or a folder ([#618](https://github.com/midagedev/bloomery/pull/618)); the rank body and the head's merge run on one card with the parts carried over a loopback ([#589](https://github.com/midagedev/bloomery/pull/589)); the link's all-gather of row spans among N ranks is in ([#501](https://github.com/midagedev/bloomery/pull/501); 9.4). This map records no N = 2 engine rate. Left: the independent-capacity load adapter, and the ranks' step over the link between nodes, which `--place tp` refuses by name after rank 0's load (`crates/gpu-gates/src/bin/generate_glm5next.rs:519-525` at `c21e3b81`) |
 
@@ -100,7 +100,7 @@ that refuses the compiled code. It needs no toolchain: from 0.3.11 the release c
 `MemAvailable` (section 7.2), so it no longer needs a `drop_caches` before the load, as the first run did (section 3).
 
 Models by size, in the order to try them (`docs/models.md:45-52` at `c21e3b81`): Clef-Flash 4.8–9.7 GB, Qwen3-30B-A3B
-`Q4_K_M` 18.6 GB, Qwen3.6-35B-A3B `Q4_K_M` 21.2 GB; then NVIDIA's Qwen3.8 checkpoint folders (2.3), Qwen3.8
+`Q4_K_M` 18.6 GB, Qwen3.6-35B-A3B `Q4_K_M` 21.2 GB; then NVIDIA's Qwen3.8 checkpoint folders ([`../dgx-spark.md`](../dgx-spark.md)), Qwen3.8
 `UD-Q4_K_XL` 111.3 GB and GLM-5.3-Flash `UD-Q2_K_XL` 101.3 GiB (the size chosen "to fit a DGX Spark",
 https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan-ledger.md#L359) if the first `MemAvailable` reading
 allows. A 64 GB Spark (section 3; announced, not yet shipping) holds only the first three.
@@ -185,7 +185,7 @@ BLOOMERY_BOX_LOCAL=1 BLOOMERY_BOX_ENV='BLOOMERY_TIER=fixture BLOOMERY_GATE_BOUND
 
 - **Fixture paths.** `BLOOMERY_DATA` and the fixture root move by environment (`tools/ref/ref-paths.sh:67,88`), but a
   reference set's identity is the first shard's full path (`AGENTS.md`; a set's `# model` line,
-  `crates/refset/src/fixture.rs:19-20`). `/models/fixtures` stays the one legal root, so on a Spark it is a symlink
+  `crates/refset/src/fixture.rs:15`). `/models/fixtures` stays the one legal root, so on a Spark it is a symlink
   (answer 2).
 - **Container drive counters.** The depth, nvtier-read and engram-rate runners resolve a model's mount through
   `tools/ref/drive-read.sh`: `findmnt --nofsroot` removes a bind mount's bracketed root, then `lsblk` resolves the
@@ -234,7 +234,7 @@ Spark contributor therefore needs design S for `qdot` at P1 (scalar mirrors, cor
 
 **Timing.** Four runners opt in to the timing mode at `c21e3b81`: `tools/ref/depth-qwen3moe.sh`,
 `tools/ref/depth-serve.sh`, `tools/ref/tier-cost.sh` (9.5) and `tools/ref/nsys-gpu.sh` (`TIMING_LOCAL_RUNNER=1`,
-`tools/ref/timing-card.sh:33`); another runner refuses `BLOOMERY_BOX_CARD=local`. On GB10 the
+`tools/ref/timing-card.sh:121-122` at `e7180ea9`); another runner refuses `BLOOMERY_BOX_CARD=local`. On GB10 the
 witness reads `power.limit` as `[N/A]` and `scaling_cur_freq` from `cppc_cpufreq` `[#13]`. The Spark's own ruler comes
 from an A/A of one binary against itself, six rounds a sitting: decode 0.9987 ± 0.0065 at depth 6 and 1.0026 ± 0.0063 at
 depth 512, prefill 0.9971 ± 0.0024 at P = 512
@@ -427,7 +427,7 @@ with the pool read as `MemAvailable` (plus what the load will drop), not `cuMemG
 | Term | On the Spark |
 |---|---|
 | H2D promotion over PCIe (`cuMemcpyHtoDAsync`, `crates/gpu/src/host/xstream.rs:1223,1261` at `cce176c5`; the staging rings `:283,760,1614`) | vanishes as a PCIe cost; a copy from pageable memory into a `cudaMalloc` buffer is still a DRAM-to-DRAM copy at half the pool's rate (reads and writes both cross it: 21.2 GB in ~0.16 s `[derived]`), negligible beside the file read |
-| Router D2H handoff and the host service protocol (`host/mod.rs:1-60`) | unused when no layer has host experts; works on `cuMemHostAlloc` pages (`host/link.rs:364`, `xstream.rs:267`), the allocator NVIDIA recommends; correctness on Spark `[unverified]` |
+| Router D2H handoff and the host service protocol (`host/mod.rs:1-60`) | unused when no layer has host experts; works on `cuMemHostAlloc` pages (`crates/gpu/src/host/link.rs:439` at `e7180ea9`, `xstream.rs:267`), the allocator NVIDIA recommends; correctness on Spark `[unverified]` |
 | CPU expert compute | stays possible but pointless: 20 Arm cores against 48 SMs on the same bytes. It is the path the fixture tier exercises (section 4) |
 | The pool's bandwidth | stays, as the single term (section 5) |
 | Page cache of the model file plus the device copy | stays and doubles the footprint until dropped; `nvtier.rs:12-30` already drops pages after use (`MADV_DONTNEED`, the `release_union` path) for the NVMe tier |
@@ -475,8 +475,7 @@ line). Their room is above half of the host leg's routed-expert bytes, and there
 the overflow through the file mapping instead. So the default load reads no slot, and S7's pinned arena and the card
 leg are not on its path. How a plan on one Spark gets an arena is in section 10. Since
 [#1041](https://github.com/midagedev/bloomery/pull/1041) the dial steps at half the host leg plus the cards' share of
-the pool, so on a unified card it no longer counts that share as host room; whether GLM's and V4.1's default plans on
-one Spark now get an arena has not been read again `[unverified]`.
+the pool, so on a unified card it no longer counts that share as host room.
 
 **Today, on a machine with PCIe.** The NVMe tier's RAM arena is one anonymous mapping carved into slots, filled by
 `O_DIRECT` reads and "lent to the host leg through the model side's `TierSlots` seam" (`crates/gpu/src/host/nvtier.rs:1-9`):
@@ -783,9 +782,9 @@ the tree for GLM-5.3-Flash, written so that N, the rank count, is data and nothi
 (`all_gather_perf` per NVIDIA's NCCL playbook), and the fallback only if the probe of 9.6 shows our pump path slower
 than NCCL's point to point. Without GPUDirect NCCL stages through host bounce buffers with its proxy thread `[derived
 from the cuda.html line; NCCL internals unverified]`, and a send or receive kernel per message would occupy SMs. The
-handoff image already lives in `cuMemHostAlloc` pages (`crates/gpu/src/host/link.rs:364`), which is what 9.1's "what to
+handoff image already lives in `cuMemHostAlloc` pages (`crates/gpu/src/host/link.rs:439` at `e7180ea9`), which is what 9.1's "what to
 use instead" asks for, so the NIC reads the same LPDDR with no copy. The protocol stays `host/mod.rs`'s alone
-(`crates/gpu/src/host/mod.rs:56-58`), behind a `Link` seam (`crates/gpu/src/host/link.rs`). It has three impls: the
+(`crates/gpu/src/host/mod.rs:62-64` at `e7180ea9`), behind a `Link` seam (`crates/gpu/src/host/link.rs`). It has three impls: the
 shared page (PCIe and one Spark, identity), the loopback (two pages on one machine, a host pump thread between them,
 picked by `BLOOMERY_TIER_LINK=loopback`) and the RDMA link (`BLOOMERY_TIER_LINK=rdma`). The RDMA link is the
 loopback's two pages, each held by its own end with its own pump thread and queue pair, the two queue pairs connected
@@ -837,17 +836,17 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    `[derived, not run]`. Whether the responder executes a duplicate RDMA write again was not checked against the
    specification; if it does, the same bytes and generation land again, and a repeated generation delivers nothing.
    One range is rewritten while a write may read it: the tier's fault copy, which every done of the tier posts
-   (`crates/gpu/src/host/tier.rs:528`). In a pass of two rows (`crates/gpu/src/host/mod.rs:40-43`) the tier's end can
+   (`tier_fault_copy`, `crates/gpu/src/host/tier.rs:968` at `e7180ea9`). In a pass of two rows (`crates/gpu/src/host/mod.rs:46-49` at `e7180ea9`) the tier's end can
    deliver both rows' gos in one pass. The tier card then signals one row's done and, on the other row's go it already
-   holds, runs a layer whose fault copy rewrites the word (`tier.rs:1762-1779`) while that done may still be in flight.
+   holds, runs a layer whose fault copy rewrites the word (`tier_fault_copy`) while that done may still be in flight.
    The later done posts the word again, later on the same queue pair, which a resend of the earlier done sends again
    after it, and the host reads the copy only once the tier's progress counts every done (`wait_caught_up`, then
    `merged_fault`), which the reader's end adds only after a done's generation, the last write of its post, so it reads
    the last value `[derived, not run]`. Both arguments hold while every tier of a page posts through one end, so one
    queue pair; ends on two nodes (item 5) need them made again.
-   The host tier serves one tier card today (`refuse_tier_count`, `crates/gpu/src/host/mod.rs:150`). With two, each
+   The host tier serves one tier card today (`refuse_tier_count`, `crates/gpu/src/host/mod.rs:166` at `e7180ea9`). With two, each
    tier's copy-out copies the tier's whole buffer, the other tiers' slots included, to the row's rows
-   (`crates/gpu/src/host/tier.rs:1756-1761`), so a later tier's copy overwrites the slots an earlier tier wrote, on
+   (`TierRows`, `crates/gpu/src/host/tier.rs:1126` at `e7180ea9`), so a later tier's copy overwrites the slots an earlier tier wrote, on
    any link, the shared page included. No link argument for rows that two tiers write is made here.
    When no acknowledgement is lost or resent, and an end polls the completion of the post an answer is to before the
    answer arrives, the wait delays nothing `[derived, not run]`. A lost acknowledgement whose answer arrives first
@@ -859,7 +858,7 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    words, values, card operations and graphs.
 3. **A pump thread a node.** The card cannot post to the NIC. Each end's pump load-acquires the generation (Arm needs
    an explicit acquire: the memorder row) and checks its step before any byte of the message moves. The card's
-   system-scope barrier before go (`crates/gpu/src/host/mod.rs:20-24`) orders the image before the word.
+   system-scope barrier before go (`crates/gpu/src/host/mod.rs:20-24` at `e7180ea9`) orders the image before the word.
 4. **Data before flag across the NIC.** The pages are registered without `IBV_ACCESS_RELAXED_ORDERING`, so
    write-after-write order holds (the `ibv_reg_mr` row), with the generation last on the same QP. Every write of a
    message is signaled, so each has its own completion; a completion with an error stops the end by its status name,
@@ -911,7 +910,7 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    marked the node lost.
    A stopped node 0 that runs again finds its counters released when it settles the step, and fails the step with the
    tier lost instead of reading the rows node 1 served after the release.
-7. **Faults and sequence.** The tier's fault-word copy rides before its signal (`tier.rs:42-44`). A doubled image is
+7. **Faults and sequence.** The tier's fault-word copy rides before its signal (`crates/gpu/src/host/tier.rs:42-44` at `e7180ea9`). A doubled image is
    refused by the relay's step rule (item 2): a repeated generation delivers nothing, and a step above one stops the end
    by name. A stale image, bytes their generation overtook, is what item 4's order prevents, and `link_probe` counts it
    on the link's own ends: every 64-byte line carries its generation, and each card counts the lines that do not.
@@ -1238,7 +1237,7 @@ cannot it names why (`NodeIdle { node, why }`, a prompt-mode note). An unset `--
 10. **Host threads.** One pump thread a node posts every send, because no GPU path to the NIC works on GB10 (9.1, 9.5).
     Its cost, two wake-ups of 1–3 µs a layer, is inside λ, so criteria 2 and 6 hold it. No other host thread stands on
     the per-layer path. This replaces the earlier "no host thread" wording.
-11. **A lost node ends the request by name**, as a lost tier card does today (`tier.rs:49-54`): the go deadline names
+11. **A lost node ends the request by name**, as a lost tier card does today (`crates/gpu/src/host/tier.rs:50-55` at `e7180ea9`): the go deadline names
     it, and node 1's own deadline drains its streams (9.5, item 6). No failover.
 
 **Where each fires** `[derived]` from 9.7's first inputs (BW 219 GB/s, NVMe 6.77 GB/s, the assumed ρ), one row per model, N in {1, 2, 3, 4}, λ in {25, 70} µs, A low and high, and the prompt
@@ -1373,8 +1372,8 @@ Each open item; the owner is named where one is agreed. An item that a measureme
   refuses, after [#159](https://github.com/midagedev/bloomery/pull/159), so `gate-gpu-ds41-step` opens without it.
 
 **P4.**
-- An arena at serving defaults. The default plans of GLM-5.3-Flash and V4.1 on one Spark had none (section 8), and
-  whether they have one since [#1041](https://github.com/midagedev/bloomery/pull/1041) is `[unverified]`. A
+- An arena at serving defaults. The default plans of GLM-5.3-Flash and V4.1 on one Spark had none before
+  [#1041](https://github.com/midagedev/bloomery/pull/1041) (section 8). A
   given `BLOOMERY_NVTIER_BYTES` alone is refused there: the lowered card budget leaves the room just above the NVMe
   tier's floor, and the arena's least on GLM `UD-Q4_K_XL` is 23,867,015,168 B. (GLM with `BLOOMERY_NVTIER_BYTES=24G`,
   on this change merged with #120's head `905e7ac5` before either reached main: a room of 120,021,311,488 B against
@@ -1622,7 +1621,7 @@ is not a trap in the sites grepped.
 
 **Memory ordering.** NVIDIA's porting guide warns that "some reorderings cannot happen on x86_64 but can happen on ARM"
 (`.../porting/memorder.html`). The host tier's card/host protocol spins on host-mapped words (`crates/gpu/src/host/mod.rs:466`,
-`step.rs:1287`, `tier.rs:1951`, `lane.rs:513`, `xstream.rs:431`, `swap.rs:3761`: 6 `spin_loop` sites) and
+`step.rs:1287`, `tier.rs:1429`, `lane.rs:513`, `xstream.rs:431`, `swap.rs:3761` at `6b630e5e`: 6 `spin_loop` sites) and
 `crates/gpu/src/host/*.rs` holds 29 `Ordering::Relaxed` loads. ~~Not audited; it is a P1 risk for the host-tier gates, and
 irrelevant to a whole-on-card run that never starts a host service.~~ The audit found no site in the host tier that is
 correct only under x86's ordering, and no code change is needed

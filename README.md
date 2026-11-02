@@ -248,28 +248,52 @@ release or commit it was measured on; 0.3.11's own rows, Qwen3.8-27B's among the
 
 ² the first round after a load read 1,440.33, the next three 1,735 to 1,739.
 
-**DGX Spark (GB10, 128 GB)**, measured by [@juliankang4](https://github.com/juliankang4) on their own machine at
-`TBD-SITTING` (commit): NVIDIA's FP4-Local and NVFP4 folders as downloaded and Unsloth's GGUFs with their MTP drafts, the serving defaults, 512 and 4,096-id prompts
-(code, English prose and Korean prose), 128 greedy tokens, median of three rounds. Earlier Spark rows are in
+The DGX Spark and RTX 5090 tables were measured by [@juliankang4](https://github.com/juliankang4) at main
+`e7180ea9`, on the same four models with the MTP draft on: NVIDIA's FP4-Local and NVFP4 folders as downloaded (their
+own MTP layer), Unsloth's Qwen3.8 `UD-Q4_K_XL` with its shared Q8_0 draft file, and Unsloth's Qwen3.6 `UD-Q4_K_M` with
+its in-file MTP layer. Each server ran one slot of 16,896 positions (`--parallel 1 --ctx-size 16896`) with
+`BLOOMERY_HOST_ROOM=96G`. A row is one request of a 512 or 4,096-id prompt from a code, an English prose or a Korean
+prose corpus, sent as token ids to `/completion` with streaming, `cache_prompt` false, `temperature` 0, `top_k` 1 and
+128 tokens. Prefill and decode are the server's timings, and first token is the client's time from sending the request
+to the first streamed token. Each value is the median of three rounds; each round started a new server and sent two
+warm-up requests first.
+
+**DGX Spark (GB10, 128 GB)**, every model wholly on the GB10. Earlier Spark rows are in
 [`docs/numbers.md`](docs/numbers.md#dgx-spark-qwen38-flash-next-on-the-fp4-local-and-nvfp4-folders-0310).
 
-| Model | Prefill tok/s, 512 / 4,096 ids | Decode tok/s, 512 / 4,096 ids | Time to first token, 512 / 4,096 ids |
-|---|---|---|---|
-| Qwen3.8-Flash-Next, FP4-Local folder, MTP on | TBD-SITTING | TBD-SITTING | TBD-SITTING |
-| Qwen3.8-Flash-Next, NVFP4 folder, MTP on | TBD-SITTING | TBD-SITTING | TBD-SITTING |
-| Qwen3.8-Flash-Next `UD-Q4_K_XL`, MTP on | TBD-SITTING | TBD-SITTING | TBD-SITTING |
-| Qwen3.6-35B-A3B `UD-Q4_K_M`, MTP on | TBD-SITTING | TBD-SITTING | TBD-SITTING |
+| Model | Prompt | Prefill tok/s, 512 ids | Prefill tok/s, 4,096 ids | Decode tok/s, 512 ids | Decode tok/s, 4,096 ids | First token ms, 512 ids | First token ms, 4,096 ids |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Qwen3.8-Flash-Next, FP4-Local folder | Code | 1,317 | 2,840 | 59.1 | 69.6 | 393 | 1,448 |
+|  | English prose | 1,651 | 2,894 | 54.8 | 39.4 | 314 | 1,421 |
+|  | Korean prose | 1,447 | 2,850 | 49.4 | 49.5 | 359 | 1,443 |
+| Qwen3.8-Flash-Next, NVFP4 folder | Code | 1,225 | 2,544 | 45.3 | 54.8 | 423 | 1,615 |
+|  | English prose | 1,526 | 2,596 | 38.4 | 29.5 | 340 | 1,583 |
+|  | Korean prose | 1,334 | 2,558 | 36.0 | 33.8 | 388 | 1,607 |
+| Qwen3.8-Flash-Next `UD-Q4_K_XL` | Code | 824 | 1,708 | 46.4 | 48.8 | 626 | 2,403 |
+|  | English prose | 1,086 | 1,747 | 45.1 | 38.6 | 476 | 2,351 |
+|  | Korean prose | 929 | 1,718 | 47.3 | 41.6 | 556 | 2,390 |
+| Qwen3.6-35B-A3B `UD-Q4_K_M` | Code | 1,860 | 2,848 | 78.0 | 83.8 | 279 | 1,444 |
+|  | English prose | 2,189 | 2,828 | 84.4 | 68.0 | 238 | 1,454 |
+|  | Korean prose | 2,090 | 2,826 | 81.6 | 75.3 | 249 | 1,454 |
 
-**RTX 5090 32 GB**, measured by [@juliankang4](https://github.com/juliankang4) on native Linux at `TBD-SITTING`
-(commit), one request at a time at the serving defaults, 512 and 4,096-id prompts (code, English prose and Korean prose), 128 greedy tokens, median of three rounds.
-Earlier RTX 5090 rows are in [`docs/numbers.md`](docs/numbers.md#rtx-5090-qwen36-35b-a3b-with-its-mtp-draft-by-juliankang4).
+**RTX 5090 32 GB**, on native Linux. The Qwen3.8 models do not fit the card: it holds part of the routed experts and
+reads the rest from host RAM ("card + host RAM"). Qwen3.6 runs wholly on the card. Earlier RTX 5090 rows are in
+[`docs/numbers.md`](docs/numbers.md#rtx-5090-qwen36-35b-a3b-with-its-mtp-draft-by-juliankang4).
 
-| Model | Prefill tok/s, 512 / 4,096 ids | Decode tok/s, 512 / 4,096 ids | Time to first token, 512 / 4,096 ids |
-|---|---|---|---|
-| Qwen3.8-Flash-Next, FP4-Local folder, MTP on | TBD-SITTING | TBD-SITTING | TBD-SITTING |
-| Qwen3.8-Flash-Next, NVFP4 folder, MTP on | TBD-SITTING | TBD-SITTING | TBD-SITTING |
-| Qwen3.8-Flash-Next `UD-Q4_K_XL`, MTP on | TBD-SITTING | TBD-SITTING | TBD-SITTING |
-| Qwen3.6-35B-A3B `UD-Q4_K_M`, MTP on | TBD-SITTING | TBD-SITTING | TBD-SITTING |
+| Model | Prompt | Prefill tok/s, 512 ids | Prefill tok/s, 4,096 ids | Decode tok/s, 512 ids | Decode tok/s, 4,096 ids | First token ms, 512 ids | First token ms, 4,096 ids |
+|---|---|---:|---:|---:|---:|---:|---:|
+| Qwen3.8-Flash-Next, FP4-Local folder, card + host RAM | Code | 558 | 1,382 | 73.7 | 82.9 | 920 | 2,966 |
+|  | English prose | 659 | 1,522 | 53.7 | 52.3 | 780 | 2,694 |
+|  | Korean prose | 528 | 1,602 | 49.1 | 55.7 | 973 | 2,560 |
+| Qwen3.8-Flash-Next, NVFP4 folder, card + host RAM | Code | 554 | 1,187 | 59.5 | 63.9 | 927 | 3,454 |
+|  | English prose | 644 | 1,378 | 48.1 | 46.7 | 798 | 2,975 |
+|  | Korean prose | 523 | 1,476 | 46.0 | 46.4 | 981 | 2,779 |
+| Qwen3.8-Flash-Next `UD-Q4_K_XL`, card + host RAM | Code | 517 | 1,124 | 67.6 | 64.8 | 992 | 3,647 |
+|  | English prose | 616 | 1,284 | 49.1 | 44.9 | 833 | 3,193 |
+|  | Korean prose | 509 | 1,385 | 52.0 | 50.6 | 1,008 | 2,961 |
+| Qwen3.6-35B-A3B `UD-Q4_K_M` | Code | 7,922 | 11,223 | 273.8 | 294.3 | 67 | 368 |
+|  | English prose | 8,326 | 11,238 | 296.0 | 244.5 | 64 | 367 |
+|  | Korean prose | 8,182 | 11,245 | 274.9 | 275.0 | 65 | 367 |
 
 **M5 Ultra**, measured by [@avlp12](https://github.com/avlp12) at 0.3.9's Metal code
 ([#593](https://github.com/midagedev/bloomery/issues/593); conditions in [`docs/mac.md`](docs/mac.md#numbers)).
