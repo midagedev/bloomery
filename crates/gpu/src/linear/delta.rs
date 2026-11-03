@@ -101,10 +101,14 @@
 //! `(Dₜ/Dⱼ)·qₜ·kⱼ` (`j ≤ t`) and the decays. `gdn_delta_prepared`, two blocks
 //! a value head of 64 columns each, walks the chunks in order with its
 //! columns' state in f32 registers, read once and written once, under
-//! `gdn_delta_lanes`'s lane and stamp rules. Each F32 operand is represented
-//! by a BF16 high part and BF16 residual. Products accumulate high-high and
-//! both cross terms in F32, retaining low bits in the solved updates and in
-//! `v − Dₜ·Sᵀkₜ`. The sum order differs from `gdn_delta_lanes`:
+//! `gdn_delta_lanes`'s lane and stamp rules. Each F32 operand is three BF16
+//! parts, its high part and the BF16 of each remainder in turn
+//! ([`chunk_plane`]), so the parts hold all of its 24 bits. A product takes
+//! the six terms down to `2⁻¹⁶` of it ([`SPLIT_TERMS`]), the smallest first
+//! (`Sᵀk` and `Sᵀq` the same within each eight keys). The chunk's
+//! `Dₜ·Sᵀqₜ` and `D·S` seed the accumulators of the products they join, so
+//! a sum the one-token rule keeps finite stays finite while the terms
+//! cancel against them. The sum order differs from `gdn_delta_lanes`:
 //! `gate_linear`'s `prompt` clause holds `o` and the state within a band of
 //! [`delta_host`]. A non-finite `o`
 //! or state value raises [`FaultSite::LinearDelta`] once per thread; a
@@ -458,9 +462,9 @@ unsafe fn delta_body<const DECAY: u32>(
 }
 
 /// u32 words of one (chunk, value head) record `gdn_chunk_prepare` writes
-/// and `gdn_delta_prepared` reads: the BF16 high pairs of the inverse and of
-/// the causal product, then their BF16 residual pairs, each row-major with
-/// eight words a row; then the cumulative decays
+/// and `gdn_delta_prepared` reads: the f32 bits of the inverse, then of the
+/// causal product, each row-major with sixteen words a row; then the
+/// cumulative decays
 /// `Dₜ`, the β values and the factors `D/Dₜ` (`D` the chunk's last row's),
 /// sixteen f32 bits each.
 const CHUNK_WORDS: usize = 4 * CHUNK * CHUNK / 2 + 3 * CHUNK;
@@ -602,17 +606,31 @@ unsafe fn chunk_mma(a: *const u32, b: *const u32, mut c: [f32; 4]) -> [f32; 4] {
     c
 }
 
-/// BF16 residual pairs after rounding two F32 operands to BF16.
+/// BF16 parts of an F32 operand in the prompt form's products (module doc).
+const PLANES: usize = 3;
+
+/// The products' terms `(A's part, B's part)` of three-part operands, the
+/// smallest first: the four of order `2⁻¹⁶`, the two cross terms, then the
+/// high parts. The three terms below `2⁻¹⁶` are left out.
+const SPLIT_TERMS: [(usize, usize); 6] = [(1, 1), (2, 0), (0, 2), (1, 0), (0, 1), (0, 0)];
+
+/// Part `plane` of two F32 operands as a BF16 pair: part 0 rounds them to
+/// BF16, each later part the remainder the parts before it leave (each
+/// remainder is exact in f32).
 #[inline(always)]
-fn chunk_pair_low(a: f32, b: f32) -> u32 {
-    let high = chunk_pair(a, b);
-    chunk_pair(
-        a - f32::from_bits(high << 16),
-        b - f32::from_bits(high & 0xffff_0000),
-    )
+fn chunk_plane(mut a: f32, mut b: f32, plane: usize) -> u32 {
+    let mut pair = chunk_pair(a, b);
+    for _ in 0usize..plane {
+        cuda_device::thread::__unroll_config::<0>();
+        a -= f32::from_bits(pair << 16);
+        b -= f32::from_bits(pair & 0xffff_0000);
+        pair = chunk_pair(a, b);
+    }
+    pair
 }
 
-/// The high-high and two cross products of split BF16 operands.
+/// [`SPLIT_TERMS`]' products of three-part operands, `a` and `b` each part's
+/// tile.
 ///
 /// # Safety
 ///
@@ -620,43 +638,40 @@ fn chunk_pair_low(a: f32, b: f32) -> u32 {
 /// HEAD BF16 values, B eight columns of HEAD values, at stride PSTRIDE pairs.
 /// Every warp lane executes the call.
 #[inline(always)]
-unsafe fn chunk_product(
-    a: (*const u32, *const u32),
-    b: (*const u32, *const u32),
-    c: [f32; 4],
-) -> [f32; 4] {
-    // SAFETY: a.1 (A's residual) and b.0 (B's high) are initialized sixteen-row and eight-column
-    // tiles of HEAD BF16 values at the contract's stride; every lane executes the call.
-    let c = unsafe { chunk_mma(a.1, b.0, c) };
-    // SAFETY: a.0 (A's high) and b.1 (B's residual) are initialized tiles of the same shapes and
-    // stride; every lane executes the call.
-    let c = unsafe { chunk_mma(a.0, b.1, c) };
-    // SAFETY: a.0 and b.0 are the initialized high tiles of the same shapes and stride; every lane
-    // executes all three products.
-    unsafe { chunk_mma(a.0, b.0, c) }
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+)]
+unsafe fn chunk_product(a: [*const u32; PLANES], b: [*const u32; PLANES]) -> [f32; 4] {
+    let mut c = [0.0; 4];
+    for i in 0usize..SPLIT_TERMS.len() {
+        cuda_device::thread::__unroll_config::<0>();
+        let (pa, pb) = SPLIT_TERMS[i];
+        // SAFETY: part pa of A and part pb of B are initialized sixteen-row and eight-column
+        // tiles of HEAD BF16 values at the contract's stride; every lane executes the call.
+        c = unsafe { chunk_mma(a[pa], b[pb], c) };
+    }
+    c
 }
 
 /// The A fragment of a warp's 16 × 16 step from two accumulator tiles of
-/// eight columns each, `lo` then `hi`, as BF16 pairs (their residuals when
-/// `low`): an MMA's accumulator and the next MMA's A operand share rows
-/// `l / 4` and `l / 4 + 8` and columns `2·(l % 4)` and the next.
+/// eight columns each, `lo` then `hi`, as part `plane` of their BF16 pairs
+/// ([`chunk_plane`]): an MMA's accumulator and the next MMA's A operand
+/// share rows `l / 4` and `l / 4 + 8` and columns `2·(l % 4)` and the next.
 #[inline(always)]
-fn frag_a(lo: [f32; 4], hi: [f32; 4], low: bool) -> [u32; 4] {
-    if low {
-        [
-            chunk_pair_low(lo[0], lo[1]),
-            chunk_pair_low(lo[2], lo[3]),
-            chunk_pair_low(hi[0], hi[1]),
-            chunk_pair_low(hi[2], hi[3]),
-        ]
-    } else {
-        [
-            chunk_pair(lo[0], lo[1]),
-            chunk_pair(lo[2], lo[3]),
-            chunk_pair(hi[0], hi[1]),
-            chunk_pair(hi[2], hi[3]),
-        ]
-    }
+fn frag_a(lo: [f32; 4], hi: [f32; 4], plane: usize) -> [u32; 4] {
+    [
+        chunk_plane(lo[0], lo[1], plane),
+        chunk_plane(lo[2], lo[3], plane),
+        chunk_plane(hi[0], hi[1], plane),
+        chunk_plane(hi[2], hi[3], plane),
+    ]
+}
+
+/// [`frag_a`]'s three parts.
+#[inline(always)]
+fn frag_parts(lo: [f32; 4], hi: [f32; 4]) -> [[u32; 4]; PLANES] {
+    [frag_a(lo, hi, 0), frag_a(lo, hi, 1), frag_a(lo, hi, 2)]
 }
 
 /// A warp's 16 × 8 step `A·B + c` over 16 values: `a` a [`frag_a`]
@@ -675,22 +690,25 @@ unsafe fn frag_mma(a: [u32; 4], b: *const u32, c: [f32; 4]) -> [f32; 4] {
     unsafe { cuda_device::wmma::mma_m16n8k16_f32_bf16(c, a, bf) }
 }
 
-/// [`frag_mma`] over split operands, `a` (high, residual) and `b` (high,
-/// residual): high by residual, residual by high, then high by high,
-/// [`chunk_product`]'s terms in its order with the operands' roles
-/// exchanged.
+/// [`frag_mma`]'s [`SPLIT_TERMS`] over three-part operands onto `c`, `a`
+/// [`frag_parts`] and `b` each part's row.
 ///
 /// # Safety
 ///
-/// As [`frag_mma`]'s, for both of `b`'s rows.
+/// As [`frag_mma`]'s, for each of `b`'s rows.
 #[inline(always)]
-unsafe fn split_mma(a: ([u32; 4], [u32; 4]), b: (*const u32, *const u32), c: [f32; 4]) -> [f32; 4] {
-    // SAFETY: the caller's residual row.
-    let c = unsafe { frag_mma(a.0, b.1, c) };
-    // SAFETY: the caller's high row.
-    let c = unsafe { frag_mma(a.1, b.0, c) };
-    // SAFETY: the caller's high row.
-    unsafe { frag_mma(a.0, b.0, c) }
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+)]
+unsafe fn split_mma(a: [[u32; 4]; PLANES], b: [*const u32; PLANES], mut c: [f32; 4]) -> [f32; 4] {
+    for i in 0usize..SPLIT_TERMS.len() {
+        cuda_device::thread::__unroll_config::<0>();
+        let (pa, pb) = SPLIT_TERMS[i];
+        // SAFETY: the caller's row of part pb.
+        c = unsafe { frag_mma(a[pa], b[pb], c) };
+    }
+    c
 }
 
 /// One thread's eight 4-key pieces of a chunk's query rows (the first four)
@@ -732,8 +750,8 @@ unsafe fn chunk_qk_regs(
     v
 }
 
-/// Store [`chunk_qk_regs`]'s pieces as BF16 pairs (the residual when `low`):
-/// the Q tile at `packed`, the K tile [`PTILE`] words on.
+/// Store part `plane` of [`chunk_qk_regs`]'s pieces as BF16 pairs
+/// ([`chunk_plane`]): the Q tile at `packed`, the K tile [`PTILE`] words on.
 ///
 /// # Safety
 ///
@@ -744,22 +762,14 @@ unsafe fn chunk_qk_regs(
     clippy::needless_range_loop,
     reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
 )]
-unsafe fn chunk_qk_store(packed: *mut u32, v: [[f32; 4]; 8], low: bool) {
+unsafe fn chunk_qk_store(packed: *mut u32, v: [[f32; 4]; 8], plane: usize) {
     let tid = thread::threadIdx_x() as usize;
     for i in 0usize..8 {
         cuda_device::thread::__unroll_config::<0>();
         let t = tid / 32 + 4 * (i % 4);
         let at = if i < 4 { 0 } else { PTILE } + t * PSTRIDE + 2 * (tid % 32);
-        let p0 = if low {
-            chunk_pair_low(v[i][0], v[i][1])
-        } else {
-            chunk_pair(v[i][0], v[i][1])
-        };
-        let p1 = if low {
-            chunk_pair_low(v[i][2], v[i][3])
-        } else {
-            chunk_pair(v[i][2], v[i][3])
-        };
+        let p0 = chunk_plane(v[i][0], v[i][1], plane);
+        let p1 = chunk_plane(v[i][2], v[i][3], plane);
         // SAFETY: tid < 128 gives t < CHUNK and 2*(tid%32) < PSTRIDE; this thread owns this pair
         // inside the two tiles.
         unsafe { *packed.add(at) = p0 };
@@ -806,9 +816,10 @@ unsafe fn chunk_keys_by_time(packed: *mut u32, src: usize, dst: usize) {
 /// One thread's global reads of chunk `chunk`'s `count` rows for
 /// `gdn_delta_prepared` (value head `h` of `nv`, key head `kh`, the
 /// block's columns from `col0`): [`chunk_qk_regs`]'s pieces, two four-column
-/// pieces of the value tile (rows past `count` zero), and the record words
-/// `tid` of the inverse and causal planes and of their residuals, then,
-/// below `3·CHUNK`, word `tid` of the decays, β and final factors.
+/// pieces of the value tile (rows past `count` zero), and the record's
+/// inverse and causal cells `2·tid` and `2·tid + 1` (one BF16 pair word
+/// `tid` of each), then, below `3·CHUNK`, word `tid` of the decays, β and
+/// final factors.
 ///
 /// # Safety
 ///
@@ -844,19 +855,19 @@ unsafe fn prepared_reads(
         0
     };
     let words = [
-        work[rec + tid],
-        work[rec + 128 + tid],
-        work[rec + 256 + tid],
-        work[rec + 384 + tid],
+        work[rec + 2 * tid],
+        work[rec + 2 * tid + 1],
+        work[rec + 256 + 2 * tid],
+        work[rec + 256 + 2 * tid + 1],
         meta,
     ];
     (qk, vr, words)
 }
 
-/// Shared words of `gdn_delta_prepared`: the high Q and K tiles, their
-/// residuals, the high and residual keys by time, the record's four planes
-/// and its decays, β and final factors.
-const PREPARED_WORDS: usize = 4 * PTILE + 2 * HEAD * 8 + 4 * 128 + 3 * CHUNK;
+/// Shared words of `gdn_delta_prepared`: each part's Q and K tiles, each
+/// part's keys by time, each part's inverse and causal pairs, and the
+/// record's decays, β and final factors.
+const PREPARED_WORDS: usize = PLANES * (2 * PTILE + HEAD * 8 + 2 * 128) + 3 * CHUNK;
 
 /// Row stride of `gdn_delta_prepared`'s value tile: the four spare floats
 /// keep a warp's fragment reads off one bank.
@@ -1507,7 +1518,7 @@ mod delta_kernels {
         const D: usize = G + CHUNK * CHUNK;
         const B: usize = D + CHUNK;
         const DR: usize = B + CHUNK;
-        static mut PACKED: SharedArray<u32, { 4 * PTILE }> = SharedArray::UNINIT;
+        static mut PACKED: SharedArray<u32, { PLANES * 2 * PTILE }> = SharedArray::UNINIT;
         static mut SCRATCH: SharedArray<f32, { DR + CHUNK }> = SharedArray::UNINIT;
         let tid = thread::threadIdx_x() as usize;
         let warp = tid / 32;
@@ -1555,12 +1566,12 @@ mod delta_kernels {
         let sm = unsafe { SharedArray::as_raw_mut_ptr(&raw mut SCRATCH) };
         // SAFETY: the chunk's rows of the carry and qkv, by the contract.
         let qk = unsafe { chunk_qk_regs(rows, (start, count), kh) };
-        // SAFETY: the high Q and K tiles at 0 .. 2*PTILE of PACKED's 4*PTILE words, read by no
-        // thread before the following barrier.
-        unsafe { chunk_qk_store(packed, qk, false) };
-        // SAFETY: the residual Q and K tiles at 2*PTILE .. 4*PTILE of PACKED's 4*PTILE words, read
-        // by no thread before the following barrier.
-        unsafe { chunk_qk_store(packed.add(2 * PTILE), qk, true) };
+        for plane in 0usize..PLANES {
+            cuda_device::thread::__unroll_config::<0>();
+            // SAFETY: part plane's Q and K tiles, 2*PTILE words of PACKED's PLANES*2*PTILE from
+            // 2*PTILE*plane, read by no thread before the following barrier.
+            unsafe { chunk_qk_store(packed.add(2 * PTILE * plane), qk, plane) };
+        }
         if tid < CHUNK {
             let r = start + tid;
             let (d, b) = if tid >= count {
@@ -1605,17 +1616,12 @@ mod delta_kernels {
         thread::sync_threads();
         let a = if warp < 2 { PTILE } else { 0 };
         let half = warp % 2 * 8;
-        // SAFETY: the complete Q and K tiles.
-        let dots = unsafe {
-            chunk_product(
-                (packed.add(a), packed.add(2 * PTILE + a)),
-                (
-                    packed.add(PTILE + half * PSTRIDE),
-                    packed.add(3 * PTILE + half * PSTRIDE),
-                ),
-                [0.0; 4],
-            )
+        let part = |at: usize| {
+            let at = packed.cast_const().wrapping_add(at);
+            [at, at.wrapping_add(2 * PTILE), at.wrapping_add(4 * PTILE)]
         };
+        // SAFETY: each part's complete Q and K tiles.
+        let dots = unsafe { chunk_product(part(a), part(PTILE + half * PSTRIDE)) };
         for i in 0..4 {
             let row = r + i / 2 * 8;
             let col = half + c + i % 2;
@@ -1687,18 +1693,15 @@ mod delta_kernels {
         // barrier published the inverse.
         let i1 = unsafe { *sm.add(INV + t * 20 + j + 1) };
         let base = block * CHUNK_WORDS;
-        // SAFETY: block < chunks·nv owns this record of work and tid < 128 < CHUNK_WORDS; thread
-        // tid alone writes this inverse word.
-        unsafe { *work.add(base + tid) = chunk_pair(i0, i1) };
-        // SAFETY: block owns this record and 128+tid < CHUNK_WORDS; thread tid alone writes this
-        // causal product word.
-        unsafe { *work.add(base + 128 + tid) = chunk_pair(p[0], p[1]) };
-        // SAFETY: block owns this record and 256+tid < CHUNK_WORDS; thread tid alone writes this
-        // inverse residual word.
-        unsafe { *work.add(base + 256 + tid) = chunk_pair_low(i0, i1) };
-        // SAFETY: block owns this record and 384+tid < CHUNK_WORDS; thread tid alone writes this
-        // causal residual word.
-        unsafe { *work.add(base + 384 + tid) = chunk_pair_low(p[0], p[1]) };
+        let cells = [i0, i1, p[0], p[1]];
+        for i in 0usize..4 {
+            cuda_device::thread::__unroll_config::<0>();
+            let at = base + i / 2 * 256 + 2 * tid + i % 2;
+            // SAFETY: block < chunks·nv owns this record of work and i/2·256 + 2·tid + 1 < 512 <
+            // CHUNK_WORDS; thread tid alone writes the inverse's and the causal product's cells
+            // (row t, columns j and j + 1).
+            unsafe { *work.add(at) = cells[i].to_bits() };
+        }
         if tid < CHUNK {
             // SAFETY: tid < CHUNK bounds this D row; the preceding barriers published D.
             let d = unsafe { *sm.add(D + tid) };
@@ -1778,13 +1781,12 @@ mod delta_kernels {
         static mut PACKED: SharedArray<u32, PREPARED_WORDS> = SharedArray::UNINIT;
         static mut SCRATCH: SharedArray<f32, PREPARED_FLOATS> = SharedArray::UNINIT;
         // Offsets into PACKED, in the order PREPARED_WORDS counts them.
+        // Part p's Q and K tiles lie at 2·PTILE·p, its keys by time at KT +
+        // HEAD·8·p, its inverse and causal pairs at IP + 256·p.
         const COLS: usize = PREPARED_COLUMNS;
-        const Q_LOW: usize = 2 * PTILE;
-        const KT: usize = 4 * PTILE;
-        const KT_LOW: usize = KT + HEAD * 8;
-        const IP: usize = KT_LOW + HEAD * 8;
-        const IP_LOW: usize = IP + 256;
-        const D: usize = IP + 512;
+        const KT: usize = PLANES * 2 * PTILE;
+        const IP: usize = KT + PLANES * HEAD * 8;
+        const D: usize = IP + PLANES * 256;
         const B: usize = D + CHUNK;
         const END: usize = B + CHUNK;
         // SAFETY: PACKED is this block's own shared allocation.
@@ -1857,20 +1859,27 @@ mod delta_kernels {
             let (qk, vr, words) = next;
             // Past this barrier no warp reads the previous chunk's tiles.
             thread::sync_threads();
-            // SAFETY: the high Q and K tiles at 0 .. 2*PTILE, read by no
-            // thread before the following barrier.
-            unsafe { chunk_qk_store(packed, qk, false) };
-            // SAFETY: the residual Q and K tiles at Q_LOW .. Q_LOW + 2*PTILE,
-            // read by no thread before the following barrier.
-            unsafe { chunk_qk_store(packed.add(Q_LOW), qk, true) };
-            for i in 0usize..5 {
+            for plane in 0usize..PLANES {
                 cuda_device::thread::__unroll_config::<0>();
-                if i < 4 || tid < 3 * CHUNK {
-                    // SAFETY: IP + 128·i + tid < PREPARED_WORDS (D + tid for
-                    // the meta word, tid < 48); thread tid owns this word,
-                    // read only after the following barrier.
-                    unsafe { *packed.add(IP + 128 * i + tid) = words[i] };
-                }
+                // SAFETY: part plane's Q and K tiles at 2*PTILE*plane, read
+                // by no thread before the following barrier.
+                unsafe { chunk_qk_store(packed.add(2 * PTILE * plane), qk, plane) };
+                let cell = |i: usize| f32::from_bits(words[i]);
+                let inv = chunk_plane(cell(0), cell(1), plane);
+                let causal = chunk_plane(cell(2), cell(3), plane);
+                // SAFETY: IP + 256·plane + tid < D; thread tid owns pair word
+                // tid of part plane's inverse plane, read only after the
+                // following barrier.
+                unsafe { *packed.add(IP + 256 * plane + tid) = inv };
+                // SAFETY: IP + 256·plane + 128 + tid < D; thread tid owns pair
+                // word tid of part plane's causal plane, read only after the
+                // following barrier.
+                unsafe { *packed.add(IP + 256 * plane + 128 + tid) = causal };
+            }
+            if tid < 3 * CHUNK {
+                // SAFETY: D + tid < PREPARED_WORDS for tid < 48; thread tid
+                // owns this word, read only after the following barrier.
+                unsafe { *packed.add(D + tid) = words[4] };
             }
             for i in 0usize..2 {
                 cuda_device::thread::__unroll_config::<0>();
@@ -1882,33 +1891,36 @@ mod delta_kernels {
                 }
             }
             thread::sync_threads();
-            // SAFETY: the complete K tiles at PTILE and Q_LOW + PTILE; KT ..
-            // KT_LOW + HEAD*8 lies past them, read by no thread before the
-            // next barrier.
-            unsafe { chunk_keys_by_time(packed, PTILE, KT) };
-            // SAFETY: as above, for the residual keys.
-            unsafe { chunk_keys_by_time(packed, Q_LOW + PTILE, KT_LOW) };
+            for plane in 0usize..PLANES {
+                cuda_device::thread::__unroll_config::<0>();
+                // SAFETY: part plane's complete K tile; its keys by time at
+                // KT + HEAD*8*plane lie past every tile, read by no thread
+                // before the next barrier.
+                unsafe {
+                    chunk_keys_by_time(packed, 2 * PTILE * plane + PTILE, KT + HEAD * 8 * plane)
+                };
+            }
             thread::sync_threads();
             // From here a warp reads the chunk's tiles and writes only its
             // own registers and its own sixteen columns of `o`.
-            // Sᵀk and Sᵀq: the high state with the high keys, the residual
-            // state with them, then the high state with the residual keys,
-            // each over the keys in order; tile `tt` holds rows `8·tt ..`.
+            // Sᵀk and Sᵀq over the keys in order, each eight keys' SPLIT_TERMS
+            // terms of the state's parts by the keys' and queries' (one key
+            // block's parts live at a time); tile `tt` holds rows `8·tt ..`.
             let mut kp = [[0.0f32; 4]; 2];
             let mut qp = [[0.0f32; 4]; 2];
-            for part in 0usize..3 {
+            for kb in 0usize..8 {
                 cuda_device::thread::__unroll_config::<0>();
-                let at = if part == 2 { Q_LOW } else { 0 };
-                for kb in 0usize..8 {
+                let parts = frag_parts(st[2 * kb], st[2 * kb + 1]);
+                for term in 0usize..SPLIT_TERMS.len() {
                     cuda_device::thread::__unroll_config::<0>();
-                    let a = frag_a(st[2 * kb], st[2 * kb + 1], part == 1);
+                    let (ps, pk) = SPLIT_TERMS[term];
                     for tt in 0usize..2 {
                         cuda_device::thread::__unroll_config::<0>();
-                        let row = at + (8 * tt + g) * PSTRIDE + 8 * kb + q;
-                        // SAFETY: row 8·tt + g of the complete K tile.
-                        kp[tt] = unsafe { frag_mma(a, packed.add(PTILE + row), kp[tt]) };
-                        // SAFETY: the same row of the complete Q tile.
-                        qp[tt] = unsafe { frag_mma(a, packed.add(row), qp[tt]) };
+                        let row = 2 * PTILE * pk + (8 * tt + g) * PSTRIDE + 8 * kb + q;
+                        // SAFETY: row 8·tt + g of part pk's complete K tile.
+                        kp[tt] = unsafe { frag_mma(parts[ps], packed.add(PTILE + row), kp[tt]) };
+                        // SAFETY: the same row of part pk's complete Q tile.
+                        qp[tt] = unsafe { frag_mma(parts[ps], packed.add(row), qp[tt]) };
                     }
                 }
             }
@@ -1939,22 +1951,23 @@ mod delta_kernels {
                     rt[tt][i] = b * (v - d * kp[tt][i]);
                 }
             }
+            // Row 8·tt + g of each part's plane at `at` (the inverse at 0,
+            // the causal product at 128).
+            let planes = |at: usize, tt: usize| {
+                let row = packed
+                    .cast_const()
+                    .wrapping_add(IP + at + (8 * tt + g) * 8 + q);
+                [row, row.wrapping_add(256), row.wrapping_add(512)]
+            };
             // uᵀ = rᵀ·(I + A)⁻ᵀ.
-            let r_split = (frag_a(rt[0], rt[1], false), frag_a(rt[0], rt[1], true));
+            let r_split = frag_parts(rt[0], rt[1]);
             let mut ut = [[0.0f32; 4]; 2];
             for tt in 0usize..2 {
                 cuda_device::thread::__unroll_config::<0>();
-                let row = (8 * tt + g) * 8 + q;
                 // SAFETY: row 8·tt + g of the complete inverse planes.
-                ut[tt] = unsafe {
-                    split_mma(
-                        r_split,
-                        (packed.add(IP + row), packed.add(IP_LOW + row)),
-                        [0.0; 4],
-                    )
-                };
+                ut[tt] = unsafe { split_mma(r_split, planes(0, tt), [0.0; 4]) };
             }
-            let u_split = (frag_a(ut[0], ut[1], false), frag_a(ut[0], ut[1], true));
+            let u_split = frag_parts(ut[0], ut[1]);
             // oᵀ = Dₜ·Sᵀqₜ + uᵀ·Pᵀ, P the causal product.
             for tt in 0usize..2 {
                 cuda_device::thread::__unroll_config::<0>();
@@ -1965,15 +1978,8 @@ mod delta_kernels {
                     // SAFETY: row t of D, complete past the barrier.
                     acc[i] = unsafe { f32::from_bits(*packed.add(D + t)) } * qp[tt][i];
                 }
-                let row = (8 * tt + g) * 8 + q;
                 // SAFETY: row 8·tt + g of the complete causal product planes.
-                let y = unsafe {
-                    split_mma(
-                        u_split,
-                        (packed.add(IP + 128 + row), packed.add(IP_LOW + 128 + row)),
-                        acc,
-                    )
-                };
+                let y = unsafe { split_mma(u_split, planes(128, tt), acc) };
                 for i in 0usize..4 {
                     cuda_device::thread::__unroll_config::<0>();
                     let (col, t) = (wc + g + i / 2 * 8, 8 * tt + 2 * q + i % 2);
@@ -2006,24 +2012,23 @@ mod delta_kernels {
                     ut[tt][i] *= unsafe { f32::from_bits(*packed.add(END + t)) };
                 }
             }
-            let e_split = (frag_a(ut[0], ut[1], false), frag_a(ut[0], ut[1], true));
+            let e_split = frag_parts(ut[0], ut[1]);
             // SAFETY: the chunk's last row of D.
             let d = unsafe { f32::from_bits(*packed.add(D + CHUNK - 1)) };
             for kt in 0usize..16 {
                 cuda_device::thread::__unroll_config::<0>();
+                let row = packed.cast_const().wrapping_add(KT + (8 * kt + g) * 8 + q);
+                let keys = [
+                    row,
+                    row.wrapping_add(HEAD * 8),
+                    row.wrapping_add(2 * HEAD * 8),
+                ];
                 for i in 0usize..4 {
                     cuda_device::thread::__unroll_config::<0>();
                     st[kt][i] *= d;
                 }
-                let row = (8 * kt + g) * 8 + q;
-                // SAFETY: keys 8·kt + g of the complete keys by time.
-                st[kt] = unsafe {
-                    split_mma(
-                        e_split,
-                        (packed.add(KT + row), packed.add(KT_LOW + row)),
-                        st[kt],
-                    )
-                };
+                // SAFETY: keys 8·kt + g of each part's complete keys by time.
+                st[kt] = unsafe { split_mma(e_split, keys, st[kt]) };
                 if !quad_finite(st[kt]) && !raised {
                     fault.raise(FaultSite::LinearDelta);
                     raised = true;
