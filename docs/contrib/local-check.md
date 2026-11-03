@@ -67,7 +67,11 @@ and the host units from `python3 tools/recipes.py host-nightly`.
 workspaces. Called-source edits must invalidate a recorded green result even when size and mtime stay unchanged.
 Absolute paths and raw identifiers retain conservative owner/dependency bounds when structural resolution is
 uncertain; Cargo-selected roots and declared Rust modules are source regardless of their filename suffix.
-The persistent structural cache must preserve these inputs across fresh processes.
+The persistent structural cache must preserve these inputs across fresh processes. It keeps the reach's per-file parses
+by content (the file's bytes, cfg(test) and the analysis code) under `~/.cache/bloomery/reach-facts`, so every checkout with
+the same bytes shares an entry and an edit re-parses only the files it touched; the directory is held to 1 GiB, least
+recently used first (`python3 tools/bloomery/reach_cache.py stats` or `prune`), and a damaged entry is named on stderr and
+recomputed.
 Repeated input validation reuses stable source hashes within the process. Rewrites with the same size and
 modification time still invalidate their consumers; recently modified files are hashed again.
 The selected profiles of every box call remain inputs, including shell defaults and inherited model overrides.

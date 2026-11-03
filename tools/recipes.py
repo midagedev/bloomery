@@ -5058,7 +5058,9 @@ class Reach:
     def facts(self, rk: RootKey, f: str) -> RustFacts:
         key = (f, rk[2])
         if key not in self._facts:
-            self._facts[key] = rust_facts(self.text(f), rk[2])
+            from bloomery import reach_cache
+
+            self._facts[key] = reach_cache.facts(self, self.text(f), rk[2], rust_facts)
         return self._facts[key]
 
     def mods(self, rk: RootKey) -> dict[tuple[str, ...], str]:
