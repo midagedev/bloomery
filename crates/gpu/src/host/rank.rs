@@ -866,6 +866,48 @@ pub struct Control {
     wait: Duration,
 }
 
+/// The streams `listener` accepts within `deadline`, `want[i]` of rank `i + 1`: each blocking,
+/// with `deadline` as its read timeout, and naming its rank by `hello`. A stream that names a
+/// rank none is wanted from, and ranks whose streams have not all come by the deadline, are
+/// refused by name.
+fn accept_ranks(
+    listener: &TcpListener,
+    want: &[usize],
+    deadline: Duration,
+    hello: impl Fn(&mut TcpStream) -> Result<usize, String>,
+) -> Result<Vec<Vec<TcpStream>>, String> {
+    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let start = Instant::now();
+    let mut got: Vec<Vec<TcpStream>> = want.iter().map(|_| Vec::new()).collect();
+    while got.iter().zip(want).any(|(g, &w)| g.len() < w) {
+        match listener.accept() {
+            Ok((mut s, _)) => {
+                s.set_nonblocking(false)
+                    .and_then(|()| s.set_read_timeout(Some(deadline)))
+                    .map_err(|e| e.to_string())?;
+                let rank = hello(&mut s)?;
+                match got.get_mut(rank.wrapping_sub(1)) {
+                    Some(g) if g.len() < want[rank - 1] => g.push(s),
+                    _ => return Err(format!("a stream named itself rank {rank}")),
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if start.elapsed() > deadline {
+                    let missing: Vec<usize> = (1..=want.len())
+                        .filter(|&r| got[r - 1].len() < want[r - 1])
+                        .collect();
+                    return Err(format!(
+                        "ranks {missing:?} did not connect within {deadline:?}"
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(got)
+}
+
 impl Control {
     /// Rank 0 listens on its control address and takes one connection from
     /// every other rank, each naming its rank; every other rank dials rank 0
@@ -876,35 +918,12 @@ impl Control {
         let start = Instant::now();
         if me == 0 {
             let l = TcpListener::bind(at).map_err(|e| link(format!("listen on {at}: {e}")))?;
-            l.set_nonblocking(true).map_err(|e| link(e.to_string()))?;
-            let mut socks: Vec<Option<TcpStream>> = (1..list.len()).map(|_| None).collect();
-            while socks.iter().any(Option::is_none) {
-                match l.accept() {
-                    Ok((mut s, _)) => {
-                        s.set_nonblocking(false).map_err(|e| link(e.to_string()))?;
-                        s.set_read_timeout(Some(deadline))
-                            .map_err(|e| link(e.to_string()))?;
-                        let mut r = [0u8; 4];
-                        s.read_exact(&mut r).map_err(|e| link(e.to_string()))?;
-                        let r = u32::from_le_bytes(r) as usize;
-                        match socks.get_mut(r.wrapping_sub(1)) {
-                            Some(slot @ None) => *slot = Some(s),
-                            _ => return Err(link(format!("a rank named itself {r}"))),
-                        }
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        if start.elapsed() > deadline {
-                            let missing: Vec<usize> =
-                                (1..list.len()).filter(|r| socks[r - 1].is_none()).collect();
-                            return Err(link(format!(
-                                "ranks {missing:?} did not connect within {deadline:?}"
-                            )));
-                        }
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(e) => return Err(link(e.to_string())),
-                }
-            }
+            let socks = accept_ranks(&l, &vec![1; list.len() - 1], deadline, |s| {
+                let mut r = [0u8; 4];
+                s.read_exact(&mut r).map_err(|e| e.to_string())?;
+                Ok(u32::from_le_bytes(r) as usize)
+            })
+            .map_err(link)?;
             Ok(Control {
                 me,
                 socks: socks.into_iter().flatten().collect(),

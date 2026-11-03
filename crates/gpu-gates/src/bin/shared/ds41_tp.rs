@@ -24,14 +24,14 @@ use std::time::{Duration, Instant};
 
 use app::tp::greedy;
 use bloomery_gpu::Gpu;
-use bloomery_gpu::host::rank::dist::{self, ReadRange, SourceFile, Store};
+use bloomery_gpu::host::rank::dist::{self, ReadRange, SourceFile};
 use bloomery_gpu::host::rank::{Bootstrap, Fingerprint, RankList, RankSession};
 use bloomery_gpu_deepseek41::body::{self, OpenCfg, RankFrom};
 use bloomery_gpu_deepseek41::chain::join;
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_levers::Levers;
-use gguf::digest::{Sha256, hex};
+use gguf::digest::{Sha256, hex, unhex};
 use model::arch::deepseek41::hparams::Hparams;
 use model::arch::deepseek41::tp::{TpUnits, cut_of, rank_span};
 use model::placement::HEAD_TENSOR;
@@ -108,8 +108,9 @@ fn opts(args: &[String]) -> Result<Opts, GateError> {
     })
 }
 
-/// The source files of the folder at `dir`: every file its `SHA256SUMS` names (a path under
-/// `dir`), in name order, with its digest and length.
+/// The source files of the folder at `dir`: every file its `SHA256SUMS` names (a path inside
+/// `dir`), in name order, with its digest and length, each checked against its digest once
+/// (`dist::verify`, its record under `~/.cache/bloomery/verified`).
 fn source_files(dir: &Path) -> Result<Vec<SourceFile>, GateError> {
     let sums = dir.join("SHA256SUMS");
     let text = std::fs::read_to_string(&sums).map_err(|e| format!("{}: {e}", sums.display()))?;
@@ -121,77 +122,79 @@ fn source_files(dir: &Path) -> Result<Vec<SourceFile>, GateError> {
             .trim_start()
             .trim_start_matches('*')
             .trim_start_matches("./");
-        let digest: [u8; 32] = (0..32)
-            .map(|i| {
-                digest
-                    .get(2 * i..2 * i + 2)
-                    .and_then(|h| u8::from_str_radix(h, 16).ok())
-            })
-            .collect::<Option<Vec<u8>>>()
-            .and_then(|d| d.try_into().ok())
-            .ok_or_else(bad)?;
+        if !dist::inside(name) {
+            return Err(format!(
+                "{}: {name:?} is not a path inside the folder",
+                sums.display()
+            )
+            .into());
+        }
+        let digest = unhex(digest).ok_or_else(bad)?;
         let size = std::fs::metadata(dir.join(name))
             .map_err(|e| format!("{}: {e}", dir.join(name).display()))?
             .len();
-        files.insert(name.to_string(), (digest, size));
-    }
-    Ok(files
-        .into_iter()
-        .map(|(name, (digest, size))| SourceFile { name, digest, size })
-        .collect())
-}
-
-/// `reads` as ranges of `files`, by file name, the runs of one file whose gap is at most
-/// [`dist::GAP`] merged as the head sends them; the runs of a file `files` does not name (the
-/// folder's `SHA256SUMS` itself) are left out.
-fn ranges(files: &[SourceFile], reads: &[(PathBuf, std::ops::Range<u64>)]) -> Vec<ReadRange> {
-    let mut out: Vec<ReadRange> = Vec::new();
-    let mut at: Option<(&Path, usize)> = None;
-    for (path, run) in reads {
-        let file = match at {
-            Some((p, f)) if p == path.as_path() => Some(f),
-            _ => path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| files.iter().position(|f| f.name == n)),
-        };
-        let Some(file) = file else { continue };
-        at = Some((path.as_path(), file));
-        match out.last_mut() {
-            Some(last) if last.file == file && run.start <= last.offset + last.len + dist::GAP => {
-                last.len = (last.offset + last.len).max(run.end) - last.offset;
-            }
-            _ => out.push(ReadRange {
-                file,
-                offset: run.start,
-                len: run.end - run.start,
-            }),
+        if files.insert(name.to_string(), (digest, size)).is_some() {
+            return Err(format!("{}: {name:?} is listed twice", sums.display()).into());
         }
     }
-    out
+    let files: Vec<SourceFile> = files
+        .into_iter()
+        .map(|(name, (digest, size))| SourceFile { name, digest, size })
+        .collect();
+    let home = std::env::var_os("HOME")
+        .ok_or("HOME is not set: the head records its checked files under it")?;
+    let abs = std::fs::canonicalize(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mut h = Sha256::new();
+    h.update(abs.as_os_str().as_encoded_bytes());
+    let record = PathBuf::from(home)
+        .join(".cache/bloomery/verified")
+        .join(format!("{}.tsv", &hex(&h.finish())[..16]));
+    dist::verify(dir, &files, &record)?;
+    Ok(files)
+}
+
+/// `reads` of the folder `root` as ranges of `files` (`dist::read_ranges`), the folder's
+/// `SHA256SUMS` itself left out.
+fn ranges(
+    files: &[SourceFile],
+    root: &Path,
+    mut reads: Vec<(PathBuf, std::ops::Range<u64>)>,
+) -> Result<Vec<ReadRange>, GateError> {
+    let sums = root.join("SHA256SUMS");
+    reads.retain(|(p, _)| *p != sums);
+    Ok(dist::read_ranges(files, root, &reads)?)
 }
 
 /// A rank's folder: rank 0's own, every other rank's the view of its store, each file's name a
 /// link to its sparse copy, opened once the store covers every range the rank reads.
 fn rank_folder(o: &Opts, ranks: usize) -> Result<(Opened, Vec<SourceFile>), GateError> {
+    let start = Instant::now();
     if let Some(dir) = &o.folder {
         let files = source_files(dir)?;
+        let checked = start.elapsed().as_secs_f64();
         let opened = folder::open(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
         let reads = (1..ranks)
-            .map(|r| rank_reads(&opened, r, ranks).map(|reads| ranges(&files, &reads)))
+            .map(|r| ranges(&files, dir, rank_reads(&opened, r, ranks)?))
             .collect::<Result<Vec<_>, _>>()?;
+        let planned = start.elapsed().as_secs_f64();
         let served = dist::serve(&o.ranks, WAIT, dir, &files, &|r| reads[r - 1].clone())?;
         for s in served {
             eprintln!("tp: rank {} sent {} B, kept {} B", s.rank, s.sent, s.kept);
         }
+        eprintln!(
+            "tp: the head checked its files in {checked:.1} s, planned the reads in {:.1} s and \
+             sent them in {:.1} s",
+            planned - checked,
+            start.elapsed().as_secs_f64() - planned
+        );
         return Ok((opened, files));
     }
     let store_dir = o.store.as_deref().ok_or(USAGE)?;
     let fetched = dist::fetch(&o.ranks, o.rank, WAIT, store_dir)?;
-    let files: Vec<SourceFile> = fetched.files.iter().map(|(f, _)| f.clone()).collect();
+    let files: Vec<SourceFile> = fetched.files.iter().map(|(f, _, _)| f.clone()).collect();
     let view = store_dir.join(format!("view-{}", &hex(&source_digest(&files))[..16]));
     std::fs::create_dir_all(&view).map_err(|e| format!("{}: {e}", view.display()))?;
-    for (f, sparse) in &fetched.files {
+    for (f, sparse, _) in &fetched.files {
         // The link's target holds from the view's folder only when it is absolute.
         if !sparse.is_absolute() {
             return Err(
@@ -209,20 +212,20 @@ fn rank_folder(o: &Opts, ranks: usize) -> Result<(Opened, Vec<SourceFile>), Gate
         if let Some(parent) = link.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
         }
-        if std::fs::read_link(&link).ok().as_deref() != Some(sparse.as_path()) {
-            let _ = std::fs::remove_file(&link);
-            std::os::unix::fs::symlink(sparse, &link)
-                .map_err(|e| format!("{}: {e}", link.display()))?;
+        match std::fs::read_link(&link) {
+            Ok(to) if to == *sparse => continue,
+            Ok(_) => std::fs::remove_file(&link).map_err(|e| format!("{}: {e}", link.display()))?,
+            Err(_) if link.symlink_metadata().is_ok() => {
+                return Err(format!("{}: a file the view does not own", link.display()).into());
+            }
+            Err(_) => {}
         }
+        std::os::unix::fs::symlink(sparse, &link)
+            .map_err(|e| format!("{}: {e}", link.display()))?;
     }
     let opened = folder::open(&view).map_err(|e| format!("{}: {e}", view.display()))?;
-    let store = Store::open(store_dir)?;
-    let covering = files
-        .iter()
-        .map(|f| store.covering(&f.digest))
-        .collect::<Result<Vec<_>, _>>()?;
-    for r in ranges(&files, &rank_reads(&opened, o.rank, ranks)?) {
-        if !covering[r.file].holds(r.offset, r.len) {
+    for r in ranges(&files, &view, rank_reads(&opened, o.rank, ranks)?)? {
+        if !fetched.files[r.file].2.holds(r.offset, r.len) {
             return Err(format!(
                 "rank {}: the store holds no verified {} B at {} of {}",
                 o.rank, r.len, r.offset, files[r.file].name
@@ -230,6 +233,13 @@ fn rank_folder(o: &Opts, ranks: usize) -> Result<(Opened, Vec<SourceFile>), Gate
             .into());
         }
     }
+    eprintln!(
+        "tp: rank {} received {} B and kept {} B in {:.1} s",
+        o.rank,
+        fetched.sent,
+        fetched.kept,
+        start.elapsed().as_secs_f64()
+    );
     Ok((opened, files))
 }
 

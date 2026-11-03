@@ -29,8 +29,9 @@ crates/gpu/src/host/nvtier.rs 2 the drop-queue tests' drop and read threads, fro
 crates/gpu/src/host/xstream.rs 1 the fallback-copy test's thread that releases the copy stream's hold, from a libtest thread that is never pinned
 crates/gpu/src/host/step.rs 1 the scalar go-wait test's host tier thread, from a libtest thread that is never pinned
 crates/gpu/src/host/rank.rs 4 the group tests' ranks and the failure tests' roots, from a libtest thread that is never pinned
-# PIN(2026-11-03): rank 0's range senders read files and write sockets, so a one-cpu mask they inherit costs no compute.
-crates/gpu/src/host/rank/dist.rs 2 rank 0's range senders at load, one per rank, each only reading files and writing its socket; the distribution test's ranks, from a libtest thread that is never pinned
+# PIN(2026-11-04): the load's distribution threads run before any pool pins the binary's main thread, so they inherit
+# no one-cpu mask.
+crates/gpu/src/host/rank/dist.rs 11 the load's distribution threads, spawned from the binary's main thread before any pool pins it: the folder's hash checkers (verify, held), the control dials (reach), rank 0's stream senders and file readers (send) and its per-connection handlers (serve), a rank's relay server, piece recorder and stream takers (fetch); the distribution tests' ranks and relay server, from a libtest thread that is never pinned
 crates/gpu/src/linear/delta.rs 1 a host reference, called from tests only
 crates/gpu/src/parts.rs 1 a test's watchdog, from a libtest thread that is never pinned; a parts load's readers (Builder::spawn_scoped, borrowing the source) each set their own mask to the pool's cpus before they read
 crates/model/src/fixture/plan.rs 1 the gate fixture's builder, a gate-side tool
