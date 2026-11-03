@@ -211,7 +211,10 @@ generate_ds41 gdn_delta_recovery_layers 0 0
 generate_ds41 gdn_delta_recovery_seqs 0 0
 # PIN(2026-10-29): spill 0 -> 172 B, JIT local 0 -> 72 B (sm_121a ptxas 13.3.73, cc 12.1 JIT on GB10 driver 595.84,
 # gate-ptx-spill): gdn_delta_prepared keeps its state transposed in registers, beside the next chunk's prefetched rows.
-generate_ds41 gdn_delta_prepared 172 72
+# PIN(2026-11-03): spill 172 -> 0 B (sm_121a ptxas 13.3.73 scan), JIT local 72 -> 0 B, the cc 12.0 JIT's on the RTX 5090,
+# not measured on cc 12.1 until a GB10 scan runs: each eight keys' state parts are built once and live alone through
+# that block's products.
+generate_ds41 gdn_delta_prepared 0 0
 # PIN(2026-11-02): gdn_delta_seqs removed; every sequence caller uses a stamped store.
 generate_ds41 gdn_norm_gate 0 0
 generate_ds41 gdn_norm_gate_sigmoid 0 0

@@ -22,9 +22,12 @@ generate_ds41 ds41_attn_seg_sel_stage 56 32
 generate_ds41 ds41_attn_seg_stage 32 24
 generate_ds41 ds41_expert_gate_up_tiles 676 152
 generate_ds41 flash_latent_mma 24 8
-# PIN(2026-11-02): flash_latent_mma_sel shares flash_latent_mma's body (the same walk macro or row body, a per-token key list or row position), pinned at flash_latent_mma's cc 12.0 value here (24 spill, 8 JIT local) until a cc 12.0 scan runs; sm_86 measured 0/0.
-generate_ds41 flash_latent_mma_sel 24 8
-generate_ds41 gdn_delta_prepared 172 64
+# PIN(2026-11-03): flash_latent_mma_sel 24 -> 16 B spill, the first cc 12.0 scan of the entry (ptxas 13.3.73 sm_120a, RTX 5090
+# driver 595.99.02); its JIT local bytes read the 8 pinned from flash_latent_mma.
+generate_ds41 flash_latent_mma_sel 16 8
+# PIN(2026-11-03): gdn_delta_prepared 172/64 -> 0/0 (the same scan): each eight keys' state parts are built once and live
+# alone through that block's products, so the walk's state, accumulators and prefetched rows fit the registers.
+generate_ds41 gdn_delta_prepared 0 0
 generate_ds41 gemm_iq2s 24 8
 generate_ds41 gemm_iq3s 24 16
 generate_ds41 gemm_nvfp4p 64 32

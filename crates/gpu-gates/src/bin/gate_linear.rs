@@ -3553,14 +3553,17 @@ mod gate {
     }
 
     /// The prompt clause's band on `‖ours − rule‖ / ‖rule‖` for `o` and the
-    /// state: each operand the tensor cores take is a BF16 high part and its
-    /// BF16 residual, so what is left is the f32 sum order of the chunked form.
-    // PIN(2026-10-29): measured on GB10 at 5.4e-6 (16 rows), 6.6e-6 (1,000 and
-    // 4,096) and 2.2e-5 (4,096, keys near one direction) for `o` and 3.9e-6 to
-    // 2.2e-5 for the lane; one product without its residual terms is ~2⁻⁹ ≈
-    // 2e-3 relative [derived], so 2e-4, 9× the worst measured, keeps the
-    // residuals under test.
-    const PROMPT_BAND: f64 = 2e-4;
+    /// state: each operand the tensor cores take is three BF16 parts holding
+    /// all of its f32 bits, so what is left is the f32 sum order of the
+    /// chunked form.
+    // PIN(2026-11-03): measured on the RTX 5090 at 7.2e-7 (16 rows), 5.6e-7
+    // (1,000 and 4,096) and 1.1e-6 (4,096, keys near one direction) for `o`
+    // and 1.7e-7 to 6.6e-7 for the lane. Two BF16 parts, the form before,
+    // read 6.6e-6 and 2.2e-5 for `o` on GB10 and on the RTX 5090, and
+    // products that leave out one of the terms of order 2⁻¹⁶ read 3e-6 to
+    // 5e-6 in a host model of the chunked form [derived], so 2e-6, about 2×
+    // the worst measured, keeps every term under test.
+    const PROMPT_BAND: f64 = 2e-6;
 
     /// Clause 16: `enqueue_delta_prompt` against the one-lane rule.
     fn prompt_clauses(cx: &Ctx<'_>) -> Result<Vec<bool>, GateError> {
@@ -3695,6 +3698,54 @@ mod gate {
             );
             out.push(pass);
         }
+
+        // Updates that cancel against the decayed state: column 0 of each
+        // value head from S = (-1e38, 0) over four keys alternating
+        // (.5, .5) and (.5, -.5), the fourth row's query (1, 0). The rule's
+        // state and `o` peak near 3e38, while the chunk's corrections reach
+        // 4e38 unless they start from D·S and Dₜ·Sᵀqₜ.
+        let mut edge = st.slice(0, CHUNK_ROWS);
+        edge.qkv.fill(0.0);
+        edge.beta.fill(0.0);
+        edge.decay.fill(1.0);
+        let mut edge_lanes = vec![0.0; ROW_LANES * len];
+        for (t, row) in edge.qkv.chunks_mut(ch).take(4).enumerate() {
+            for kh in 0..K1_SHAPE.n_k {
+                let key = (K1_SHAPE.n_k + kh) * HEAD;
+                row[key] = 0.5;
+                row[key + 1] = if t % 2 == 0 { 0.5 } else { -0.5 };
+                if t == 3 {
+                    row[kh * HEAD] = 1.0;
+                }
+            }
+            for column in row[2 * K1_SHAPE.n_k * HEAD..].chunks_mut(HEAD) {
+                column[0] = if t < 2 { 1.5e38 } else { 2.5e38 };
+            }
+        }
+        edge.beta[..4 * nv].fill(1.0);
+        for head in edge_lanes[c * len..(c + 1) * len].chunks_mut(HEAD * HEAD) {
+            head[0] = -1e38;
+        }
+        let (d, _) = cx.delta_lanes(
+            unl,
+            &edge,
+            (&edge_lanes, &stamps),
+            prompt(CHUNK_ROWS),
+            CHUNK_ROWS,
+        )?;
+        let word = cx.gpu.take_fault()?;
+        let finite =
+            d.o.iter()
+                .chain(&lane_of(&d.state, c))
+                .all(|x| x.is_finite());
+        let pass = finite && word.is_none();
+        println!(
+            "prompt updates cancelling a state near f32's limit: o and state finite {finite}, no \
+             fault {} {}",
+            word.is_none(),
+            verdict(pass)
+        );
+        out.push(pass);
 
         out.extend(cut_clauses(cx, &st, (&lanes, stamps), call)?);
 
