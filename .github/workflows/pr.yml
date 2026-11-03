@@ -78,6 +78,10 @@ jobs:
       - name: contrib-check t0
         env:
           RUSTFLAGS: -C target-cpu=x86-64-v3
+          # PIN(2026-11-03): was the default 1200 s a unit. check-recipes alone read 820 to 1215 s on green runs of
+          # this job and 1230 s (killed) on #1144, a runner's spread around one unit's work; 2400 s keeps the job
+          # (t0's wall 1627 s with that unit at its bound) under the 60 min job timeout.
+          CONTRIB_UNIT_BOUND: "2400"
         run: just contrib-check --tier t0
 
   # The clippy ratchet: `tools/mac-check.sh lint` runs the `lint` recipe's own clippy command
