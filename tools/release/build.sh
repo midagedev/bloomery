@@ -13,8 +13,10 @@
 #     archive's build rebuilds the other's. A build machine with no cc 12.0 card cannot compile the PTX to cubins, so it
 #     stays PTX and the driver compiles it on the card's first start;
 #   - aarch64: bloomery-<v>-linux-aarch64-cuda-sm121a, sm_121a PTX (GB10's native FP4, which loads on cc 12.1 alone),
-#     host code for GB10's cores (rustc's `gb10`); built on a GB10 (BLOOMERY_BOX names one, or BLOOMERY_BOX_LOCAL=1 on the
-#     Spark itself) or cross on an x86_64 machine (BLOOMERY_RELEASE_TARGET=aarch64: the rust aarch64 target, the cross gcc
+#     host code for GB10's cores (rustc's `gb10`); built on a GB10 itself, natively (tools/box.sh's local mode there,
+#     BLOOMERY_BOX_LOCAL=1: box.sh's remote path is the x86_64 box's, with locks under /root and its cards picked by name; the
+#     toolchain is docs/BUILD.md's, CUDA 13.3's headers included, which a Spark's own CUDA 13.0 packages lack: bindgen ends
+#     E0425 on cuGraphNodeGetParams) or cross on an x86_64 machine (BLOOMERY_RELEASE_TARGET=aarch64: the rust aarch64 target, the cross gcc
 #     for the host code and aarch64 binutils, the cargo --target, the triple's bin dir and its own target dir; every missing
 #     tool, the rust target and, when qemu-aarch64 is on PATH, a QEMU_LD_PREFIX that is no aarch64 sysroot are refused by
 #     name, rc 69, before anything is built, and any other value is rc 64).

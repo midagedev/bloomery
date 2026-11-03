@@ -2362,6 +2362,13 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          release carries no GB10 archive.",
     ),
     runner(
+        "BLOOMERY_GB10_REMOTE",
+        Some("release/publish.sh"),
+        "Mac side: the directory on BLOOMERY_GB10_BOX that holds the GB10 archive's tree \
+         (`target/release-dist` under it), read by `tools/release/publish.sh` and `tools/release/pick.sh`. \
+         Unset: the box's directory, BLOOMERY_REMOTE.",
+    ),
+    runner(
         "BLOOMERY_GEN_CTX",
         Some("ref/depth-qwen3moe.sh"),
         "The Qwen3 depth, ncu and nsys runners: the context every arm of ours runs at.",

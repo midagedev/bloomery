@@ -36,7 +36,8 @@
 #      without the second one is published with --no-sm120a;
 #      the GB10 archive (linux-aarch64-cuda-sm121a) the same way on the GB10 that built
 #      it, named by BLOOMERY_GB10_BOX (unset: the release carries no GB10 archive, and
-#      step 6 says so);
+#      step 6 says so) over plain ssh, in the directory BLOOMERY_GB10_REMOTE names (an
+#      absolute path on that machine; default: BLOOMERY_REMOTE, the box's own);
 #   3a. the sitting's verdict (tools/release/sitting.sh): a `stage=portable` verdict, result=green, whose binary_sha256
 #      equals the tarball's <name>/bin/bloomery-serve — the release's headline rows come from the binary it ships. The
 #      box's target/release-dist/<name>.sitting is fetched, and every *.sitting in PUBLISH_SITTING_DIR (when set) is
@@ -226,21 +227,22 @@ built_commit() {
 # fail <message>: a refusal of the flow, named, rc 1.
 fail() { echo "publish.sh: $*" >&2; exit 1; }
 
-# linux_archive <box> <name> <arch>: <name>'s .sha256, build.sh --check (for the archive of <arch>) and --version on <box>; the
-# --version's commit is judged here (docs_delta: the tag's commit, or an ancestor with only docs paths between); then the tarball
-# and .sha256 fetched into $TMP and hashed here. Prints the sha256.
+# linux_archive <box> <name> <arch> [<remote dir>]: <name>'s .sha256, build.sh --check (for the archive of <arch>) and --version on
+# <box>, in <remote dir> there (default $REMOTE: the GB10's directory is its own, BLOOMERY_GB10_REMOTE); the --version's commit is
+# judged here (docs_delta: the tag's commit, or an ancestor with only docs paths between); then the tarball and .sha256 fetched
+# into $TMP and hashed here. Prints the sha256.
 linux_archive() {
-    local box=$1 name=$2 arch=$3 sha got f built delta
+    local box=$1 name=$2 arch=$3 remote=${4:-$REMOTE} sha got f built delta
     local verify=(ssh "$box")
     # The box's command goes behind its guard; the GB10's runs over plain ssh, as the account that built it (box.sh's
     # guard reads /root's lease, which that account need not reach).
     [ "$box" != "$BOX" ] || verify=(bash tools/box.sh)
-    BLOOMERY_BOX=$box "${verify[@]}" "$(verify_cmd "$REMOTE" "$VERSION" "$name" "$arch" "/tmp/pub-$VERSION")" 2>&1 | tee "$TMP/verify-$name.out" >&2 \
+    BLOOMERY_BOX=$box "${verify[@]}" "$(verify_cmd "$remote" "$VERSION" "$name" "$arch" "/tmp/pub-$VERSION")" 2>&1 | tee "$TMP/verify-$name.out" >&2 \
         || fail "$name failed verification on $box (just release-build $VERSION there first)"
     built=$(built_commit "$TMP/verify-$name.out") || fail "$name's --version on $box named no commit (no 'publish-version:' line)"
     delta=$(docs_delta "$ROOT" "$built" HEAD) || fail "$name was built at $built and cannot publish under $TAG's commit $COMMIT: just release-build $VERSION at that commit first"
     for f in "$name.tar.gz" "$name.tar.gz.sha256"; do
-        scp -q "$box:$REMOTE/target/release-dist/$f" "$TMP/$f" || fail "cannot fetch $f from $box"
+        scp -q "$box:$remote/target/release-dist/$f" "$TMP/$f" || fail "cannot fetch $f from $box"
     done
     sha=$(grep -o '[0-9a-f]\{64\}' "$TMP/$name.tar.gz.sha256" | head -1)
     [ -n "$sha" ] || fail "$name's .sha256 holds no digest"
@@ -637,18 +639,20 @@ if [ "${1:-}" = --self-test ]; then
     # of red cases is flow_fails. A third argument runs the Linux archive's cases or the Mac archive's alone.
     flow_cases() {
         local script=$1 ver="9.9.9-st$$" rem="$t/rem" arch="$t/arch" stubs="$t/stubbin" nm built group=${3:-all}
+        local remg="$t/rem-gb10" nmg="bloomery-9.9.9-st$$-linux-aarch64-cuda-sm121a"
         flow_loud=$2 flow_fails=0
         nm="bloomery-$ver-linux-x86_64-cuda-sm86"
         mkdir -p "$stubs" "$rem/target/release-dist" "$rem/tools/release" "$t/ftmp"
         printf '#!/bin/sh\nexit 0\n' > "$rem/tools/release/build.sh"
         command -v sha256sum > /dev/null || printf '#!/bin/sh\nexec shasum -a 256 "$@"\n' > "$stubs/sha256sum"
         chmod +x "$stubs"/* 2> /dev/null || true
-        flow_pack() { # flow_pack <the line its bloomery-serve --version prints>
-            rm -rf "$arch" && mkdir -p "$arch/$nm/bin"
-            printf '#!/bin/sh\necho "%s"\n' "$1" > "$arch/$nm/bin/bloomery-serve"
-            chmod +x "$arch/$nm/bin/bloomery-serve"
-            tar -czf "$rem/target/release-dist/$nm.tar.gz" -C "$arch" "$nm"
-            (cd "$rem/target/release-dist" && shasum -a 256 "$nm.tar.gz" > "$nm.tar.gz.sha256")
+        flow_pack() { # flow_pack <the line its bloomery-serve --version prints> [<archive name> <remote dir>: default the box's sm_86 one]
+            local pn=${2:-$nm} pd=${3:-$rem}
+            rm -rf "$arch" && mkdir -p "$arch/$pn/bin"
+            printf '#!/bin/sh\necho "%s"\n' "$1" > "$arch/$pn/bin/bloomery-serve"
+            chmod +x "$arch/$pn/bin/bloomery-serve"
+            tar -czf "$pd/target/release-dist/$pn.tar.gz" -C "$arch" "$pn"
+            (cd "$pd/target/release-dist" && shasum -a 256 "$pn.tar.gz" > "$pn.tar.gz.sha256")
         }
         flow_try() { # flow_try <case> <want rc> <want text> <text it must not hold or ''> <code to run after sourcing the copy>
             local name=$1 want_rc=$2 want=$3 unwanted=$4 out rc=0
@@ -682,6 +686,12 @@ if [ "${1:-}" = --self-test ]; then
             flow_try "archive: a binary that says another version" 1 "the packed binary says: bloomery-serve 0.0.0 (commit ${dM:0:12})" "built at" 'linux_archive gb "$nm" sm_86'
             flow_pack "bloomery-serve $ver (commit )"
             flow_try "archive: a --version line that names no commit" 1 "named no commit" "built at" 'linux_archive gb "$nm" sm_86'
+            # the GB10's archive is on its own machine, in its own directory (BLOOMERY_GB10_REMOTE), not the box's
+            mkdir -p "$remg/target/release-dist" "$remg/tools/release"
+            printf '#!/bin/sh\nexit 0\n' > "$remg/tools/release/build.sh"
+            flow_pack "$built" "$nmg" "$remg"
+            flow_try "archive: the GB10's, in the directory it names" 0 "built at ${dM:0:12} (same commit)" "" 'linux_archive gb "$nmg" sm_121a "$remg"'
+            flow_try "archive: the GB10's directory is no default: without it the box's is read" 1 "$nmg failed verification on gb" "built at" 'linux_archive gb "$nmg" sm_121a'
         fi
         if [ "$group" != linux ]; then
             printf 'llama-server HTTP API. Built from commit %s. Source\n' "$dM" > "$t/mac-readme"
@@ -694,12 +704,13 @@ if [ "${1:-}" = --self-test ]; then
             flow_try "mac: a README that names no commit" 1 "names no commit" "" 'mac_built_check "$t/mac-readme"'
         fi
         # the flow calls both steps (a step nobody calls holds nothing)
-        if ! grep -q '^SHA=\$(linux_archive "\$BOX" "\$NAME" sm_86) || exit 1$' "$script" || ! grep -q '^MAC_NOTE=\$(mac_built_check "\$TMP/mac/README.md") || exit 1$' "$script"; then
+        if ! grep -q '^SHA=\$(linux_archive "\$BOX" "\$NAME" sm_86) || exit 1$' "$script" \
+            || ! grep -q '^    GB10_SHA=\$(linux_archive "\$GB10_BOX" "\$GB10_NAME" sm_121a "\$GB10_REMOTE") || exit 1$' "$script" || ! grep -q '^MAC_NOTE=\$(mac_built_check "\$TMP/mac/README.md") || exit 1$' "$script"; then
             flow_fails=$((flow_fails + 1))
-            [ "$flow_loud" = 0 ] || echo "publish.sh self-test: the publish flow does not call linux_archive and mac_built_check" >&2
+            [ "$flow_loud" = 0 ] || echo "publish.sh self-test: the publish flow does not call linux_archive (the GB10's with its own directory) and mac_built_check" >&2
         fi
         [ "$flow_loud" = 0 ] || cases=$((cases + 1))
-        rm -rf "/tmp/pub-$ver"
+        rm -rf "/tmp/pub-$ver" "$remg"
     }
     # mutant_publish <name> <group> <old text> <new text>: this script with the first <old text> replaced; the cases of its group (tc,
     # crates, dd, linux or mac) must go red. Each <old text> is the code's own: the first occurrence in the file, or one with a newline
@@ -750,6 +761,8 @@ PY
     mutant_publish "the Linux archive is not judged" linux 'delta=$(docs_delta "$ROOT" "$built" HEAD) ||' 'delta=$(echo "same commit") ||'
     mutant_publish "the box does not look at the version" linux 'exit 1 ;; esac; \' ': ;; esac; \'
     mutant_publish "the flow never looks at the Linux archive" linux $'\nSHA=$(linux_archive "$BOX" "$NAME" sm_86) || exit 1\n' $'\nSHA=0\n'
+    mutant_publish "the GB10's directory is not used" linux 'remote=${4:-$REMOTE} sha' 'remote=$REMOTE sha'
+    mutant_publish "the flow verifies the GB10 archive in the box's directory" linux $'\n    GB10_SHA=$(linux_archive "$GB10_BOX" "$GB10_NAME" sm_121a "$GB10_REMOTE") || exit 1\n' $'\n    GB10_SHA=$(linux_archive "$GB10_BOX" "$GB10_NAME" sm_121a) || exit 1\n'
     mutant_publish "the flow never looks at the Mac archive" mac $'\nMAC_NOTE=$(mac_built_check "$TMP/mac/README.md") || exit 1\n' $'\nMAC_NOTE=ok\n'
     mutant_publish "the Mac archive is not judged" mac 'delta=$(docs_delta "$ROOT" "$built" HEAD) || fail "$MAC_NAME' 'delta=$(echo "same commit") || fail "$MAC_NAME'
     if [ "$fails" = 0 ]; then
@@ -819,6 +832,7 @@ REPO=midagedev/bloomery
 BOX=${BLOOMERY_BOX:-ws}
 REMOTE=${BLOOMERY_REMOTE:-"~/repo/$(basename "$ROOT")"}
 GB10_BOX=${BLOOMERY_GB10_BOX:-}
+GB10_REMOTE=${BLOOMERY_GB10_REMOTE:-$REMOTE}
 NAME="bloomery-$VERSION-linux-x86_64-cuda-sm86"
 BW_NAME="bloomery-$VERSION-linux-x86_64-cuda-sm120a"
 GB10_NAME="bloomery-$VERSION-linux-aarch64-cuda-sm121a"
@@ -891,7 +905,7 @@ if [ "$BW" = 1 ]; then
 fi
 GB10_SHA=
 if [ -n "$GB10_BOX" ]; then
-    GB10_SHA=$(linux_archive "$GB10_BOX" "$GB10_NAME" sm_121a) || exit 1
+    GB10_SHA=$(linux_archive "$GB10_BOX" "$GB10_NAME" sm_121a "$GB10_REMOTE") || exit 1
 fi
 
 # 3a. the sitting's verdict beside the tarball on the box: its absence is the check's warning, not an error here
@@ -939,7 +953,7 @@ tap_bump
 
 # 6. the lead's remainder
 echo "publish.sh: left to the lead:"
-[ -n "$GB10_SHA" ] || echo "  - no GB10 archive in this release: BLOOMERY_GB10_BOX names the GB10 that ran 'just release-build $VERSION'"
+[ -n "$GB10_SHA" ] || echo "  - no GB10 archive in this release: BLOOMERY_GB10_BOX names the GB10 that built it and BLOOMERY_GB10_REMOTE its directory"
 [ -n "$BW_SHA" ] || echo "  - no sm_120a archive in this release (--no-sm120a): the installer takes the sm_86 archive on an RTX 50 series card"
 [ -z "$BW_SHA" ] || echo "  - the sm_120a archive is install.sh's pick on a machine whose every GPU is compute capability 12.0 (sha256 $BW_SHA); Homebrew and the ghcr image stay on the sm_86 archive"
 echo "  - the next version on main (the tarballs built there before the next ask are that release's): tools/release/publish.sh --bump-next $VERSION, then the commit it prints"

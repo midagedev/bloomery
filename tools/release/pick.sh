@@ -16,7 +16,9 @@
 #   sitting              tools/release/sitting.sh --dry-run on --cells FILE: the sitting's predicted wall (without --cells, not priced)
 #   README and versions  tools/release/publish.sh --tree-check at W and at HEAD: the serve and gpu-gates crates say the release's
 #                        version and README.md names its status, tarball and link
-#   tarballs             the box's target/release-dist archives (BLOOMERY_BOX and BLOOMERY_REMOTE, as publish.sh reads them): each arch's
+#   tarballs             the box's target/release-dist archives (BLOOMERY_BOX and BLOOMERY_REMOTE, as publish.sh reads them) and, when
+#                        BLOOMERY_GB10_BOX names the GB10 that built it (BLOOMERY_GB10_REMOTE its directory there, default the box's
+#                        path; unset: the release carries no GB10 archive and the table has no gb10 row): each arch's
 #                        sha256 and the commit its VERSION file names, held to the picked commit: the same commit, or an ancestor
 #                        with only docs paths between (tools/release/publish.sh --docs-delta: README.md, README.ko.md, CHANGELOG*,
 #                        docs/**), so archives the follower built at W are ready for a HEAD that adds the docs commit
@@ -36,7 +38,7 @@
 # cannot be read.
 # Each tool is a hook, a command line split on blanks (no shell syntax) with the arguments appended: PICK_LATE, PICK_AFFECTED,
 # PICK_BATCH, PICK_SITTING, PICK_ROTATION, PICK_GH and PICK_TARBALLS (which prints `<arch> <sha256> <commit>` or `<arch> absent` a
-# line for sm86 and sm120a, and takes the version). Unset, each is the tool named above.
+# line for sm86 and sm120a, and gb10 when the release carries a GB10 archive, and takes the version). Unset, each is the tool named above.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -102,15 +104,22 @@ tree_row() {
   if [ "$rc" = 0 ]; then echo ok; else out=${out%%$'\n'*}; echo "${out#publish.sh: }"; fi
 }
 
-# tarball_rows <version>: the hook's lines, or the box's own archives over ssh.
+# tarball_rows <version>: the hook's lines, or the box's own archives over ssh and, when BLOOMERY_GB10_BOX is set, the GB10's.
 tarball_rows() {
-  local remote
+  local remote gremote
   if [ -z "${PICK_TARBALLS-}" ]; then
     remote=${BLOOMERY_REMOTE:-"~/repo/$(basename "$ROOT")"}
     # shellcheck disable=SC2029 # the version and the directory are expanded here on purpose
     ssh -o BatchMode=yes -o ConnectTimeout=10 "${BLOOMERY_BOX:-ws}" "cd $remote/target/release-dist 2> /dev/null || { echo 'sm86 absent'; echo 'sm120a absent'; exit 0; }
 for a in sm86 sm120a; do n=bloomery-$1-linux-x86_64-cuda-\$a; if [ -f \$n.tar.gz ] && [ -f \$n.tar.gz.sha256 ]; then
-echo \"\$a \$(cut -d' ' -f1 \$n.tar.gz.sha256) \$(tar -xzOf \$n.tar.gz \$n/VERSION 2> /dev/null | sed -n 2p)\"; else echo \"\$a absent\"; fi; done"
+echo \"\$a \$(cut -d' ' -f1 \$n.tar.gz.sha256) \$(tar -xzOf \$n.tar.gz \$n/VERSION 2> /dev/null | sed -n 2p)\"; else echo \"\$a absent\"; fi; done" || return $?
+    if [ -n "${BLOOMERY_GB10_BOX-}" ]; then
+      gremote=${BLOOMERY_GB10_REMOTE:-$remote}
+      # shellcheck disable=SC2029 # the version and the directory are expanded here on purpose
+      ssh -o BatchMode=yes -o ConnectTimeout=10 "$BLOOMERY_GB10_BOX" "cd $gremote/target/release-dist 2> /dev/null || { echo 'gb10 absent'; exit 0; }
+n=bloomery-$1-linux-aarch64-cuda-sm121a; if [ -f \$n.tar.gz ] && [ -f \$n.tar.gz.sha256 ]; then
+echo \"gb10 \$(cut -d' ' -f1 \$n.tar.gz.sha256) \$(tar -xzOf \$n.tar.gz \$n/VERSION 2> /dev/null | sed -n 2p)\"; else echo 'gb10 absent'; fi" || return $?
+    fi
   else
     run_hook PICK_TARBALLS "" "$1"
   fi
@@ -201,6 +210,29 @@ EOF
       PICK_SITTING="$t/stub/sitting" PICK_ROTATION="$t/stub/rotation" PICK_GH="$t/stub/gh" PICK_TARBALLS="$t/stub/tarballs" \
       STUB_BATCH_LOG="$t/batch.log" bash "$1" "${@:2}" 2>&1) && rc=0 || rc=$?
   }
+  # run_pick_ssh <extra env words…> -- <pick.sh args…>: run_pick with no tarballs hook and the stub ssh (it answers per host and logs each call)
+  mkdir -p "$t/sshbin"
+  cat > "$t/sshbin/ssh" << 'EOF'
+#!/bin/sh
+while [ "$1" = -o ]; do shift 2; done
+host=$1
+shift
+echo "$host $*" | tr '\n' ' ' >> "$STUB_SSH_LOG"
+echo >> "$STUB_SSH_LOG"
+case $host in
+  ws) printf 'sm86 abc %s\nsm120a def %s\n' "$STUB_SSH_HEAD" "$STUB_SSH_HEAD" ;;
+  *) if [ "${STUB_SSH_GB10:-}" = absent ]; then echo 'gb10 absent'; else echo "gb10 ghi $STUB_SSH_HEAD"; fi ;;
+esac
+EOF
+  chmod +x "$t/sshbin/ssh"
+  run_pick_ssh() {
+    local envs=()
+    while [ "$1" != -- ]; do envs+=("$1"); shift; done
+    shift
+    out=$(cd "$r" && env -u PICK_TARBALLS PATH="$t/sshbin:$PATH" STUB_SSH_LOG="$t/ssh.log" ${envs[@]+"${envs[@]}"} PICK_LATE="$t/stub/late" PICK_AFFECTED="$t/stub/affected" PICK_BATCH="$t/stub/batch" \
+      PICK_SITTING="$t/stub/sitting" PICK_ROTATION="$t/stub/rotation" PICK_GH="$t/stub/gh" \
+      STUB_BATCH_LOG="$t/batch.log" bash "$1" "${@:2}" 2>&1) && rc=0 || rc=$?
+  }
   # want <case> <want rc> <text it must hold>…: the last run_pick; a text starting with ! must be absent
   want() {
     local name=$1 want_rc=$2 s
@@ -265,6 +297,42 @@ EOF
     run_pick STUB_GATES="$g" STUB_WALL=1200 STUB_TARS="sm86_abc_${head:0:12} sm120a_def_${head:0:12}" -- "$p" --w-file "$t/follow-kv" --head "$head" --version 0.0.1
     want "tarballs: built at the pick itself" 0 "sm86 abc built at ${head:0:12}" "ready: yes" "!docs-only delta" "!archive built at another commit"
   }
+  cases_gb10() {
+    local h=${head:0:12}
+    run_pick STUB_GATES="$g" STUB_WALL=1200 STUB_TARS="sm86_abc_$h sm120a_def_$h gb10_ghi_$h" -- "$p" --w-file "$t/follow-kv" --head "$head" --version 0.0.1
+    want "GB10 row: built at the pick" 0 "gb10 ghi built at $h" "ready: yes" "!archive absent" "!archive built at another commit"
+    run_pick STUB_GATES="$g" STUB_WALL=1200 STUB_TARS="sm86_abc_$h sm120a_def_$h gb10_absent" -- "$p" --w-file "$t/follow-kv" --head "$head" --version 0.0.1
+    want "GB10 row: absent blocks ready" 0 "gb10 absent" "archive absent: gb10" "ready: no"
+    run_pick STUB_GATES="$g" STUB_WALL=1200 STUB_TARS="sm86_abc_$h sm120a_def_$h gb10_ghi_deadbeef0000" -- "$p" --w-file "$t/follow-kv" --head "$head" --version 0.0.1
+    want "GB10 row: built at another commit blocks ready" 0 "gb10 ghi built at deadbeef0000, not $h" "archive built at another commit: gb10" "ready: no"
+    run_pick STUB_GATES="$g" STUB_WALL=1200 STUB_TARS="sm86_abc_$h sm120a_def_$h gb10_ghi_$h" -- "$p" --w-file "$t/follow-kv" --head "$hd_docs" --version 0.0.1
+    want "GB10 row: built at W, the pick adds a docs commit" 0 "gb10 ghi built at $h, docs-only delta to ${hd_docs:0:12}" "ready: yes"
+    # the default read: no hook, the box's ssh and the GB10's (the stub ssh answers per host and logs each command)
+    : > "$t/ssh.log"
+    run_pick_ssh STUB_GATES="$g" STUB_WALL=1200 STUB_SSH_HEAD="$h" BLOOMERY_BOX=ws BLOOMERY_REMOTE='~/repo/x' BLOOMERY_GB10_BOX=spark BLOOMERY_GB10_REMOTE=/root/bloomery-gb10 -- "$p" --w-file "$t/follow-kv" --head "$head" --version 0.0.1
+    want "GB10 read: the box and the GB10 each asked once, in their own directories" 0 "sm86 abc built at $h" "gb10 ghi built at $h" "ready: yes"
+    cases=$((cases + 1))
+    if ! grep -q '^ws cd ~/repo/x/target/release-dist ' "$t/ssh.log" || ! grep -q '^spark cd /root/bloomery-gb10/target/release-dist .*bloomery-0.0.1-linux-aarch64-cuda-sm121a' "$t/ssh.log" \
+      || [ "$(grep -c . "$t/ssh.log")" != 2 ]; then
+      [ "$LOUD" = 0 ] || echo "pick self-test: the GB10 read: the ssh calls were: $(cat "$t/ssh.log")" >&2
+      BAD=$((BAD + 1))
+    fi
+    : > "$t/ssh.log"
+    run_pick_ssh STUB_GATES="$g" STUB_WALL=1200 STUB_SSH_HEAD="$h" BLOOMERY_BOX=ws BLOOMERY_REMOTE='~/repo/x' -- "$p" --w-file "$t/follow-kv" --head "$head" --version 0.0.1
+    want "GB10 read: with BLOOMERY_GB10_BOX unset the table has no gb10 row and the GB10 is not asked" 0 "sm86 abc built at $h" "!gb10" "ready: yes"
+    cases=$((cases + 1))
+    if grep -q '^spark ' "$t/ssh.log"; then
+      [ "$LOUD" = 0 ] || echo "pick self-test: the GB10 was asked with BLOOMERY_GB10_BOX unset: $(cat "$t/ssh.log")" >&2
+      BAD=$((BAD + 1))
+    fi
+    run_pick_ssh STUB_GATES="$g" STUB_WALL=1200 STUB_SSH_HEAD="$h" STUB_SSH_GB10=absent BLOOMERY_BOX=ws BLOOMERY_REMOTE='~/repo/x' BLOOMERY_GB10_BOX=spark -- "$p" --w-file "$t/follow-kv" --head "$head" --version 0.0.1
+    want "GB10 read: an archive the GB10 lacks is absent, and its directory defaults to the box's" 0 "gb10 absent" "archive absent: gb10" "ready: no"
+    cases=$((cases + 1))
+    grep -q '^spark cd ~/repo/x/target/release-dist ' "$t/ssh.log" || {
+      [ "$LOUD" = 0 ] || echo "pick self-test: the GB10's default directory is not the box's: $(cat "$t/ssh.log")" >&2
+      BAD=$((BAD + 1))
+    }
+  }
   cases_tags() {
     run_pick STUB_GATES="$g" STUB_WALL=1200 STUB_PRS=$'#41 a kernel\n#44 another' -- "$p" --w-file "$t/follow-kv" --version 0.0.1
     want "needs-gpu PRs listed" 0 "needs-gpu PRs        2 merged since v0.0.0" "#41 a kernel" "needs-gpu PRs: 2"
@@ -288,7 +356,7 @@ EOF
     run_pick -- "$p" --head no-such-rev
     want "a HEAD that is no commit" 64 "--head no-such-rev is no commit"
   }
-  # all_cases <pick.sh copy in the temp repo> <loud> [rule|rows|docs|tags]: the cases (all groups without the third argument); BAD counts the red ones
+  # all_cases <pick.sh copy in the temp repo> <loud> [rule|rows|docs|gb10|tags]: the cases (all groups without the third argument); BAD counts the red ones
   all_cases() {
     local p=$1 g="gate-a gate-b" group=${3:-all}
     LOUD=$2 BAD=0
@@ -297,6 +365,7 @@ EOF
     case $group in all | rule) cases_rule ;; esac
     case $group in all | rows) cases_rows ;; esac
     case $group in all | docs) cases_docs ;; esac
+    case $group in all | gb10) cases_gb10 ;; esac
     case $group in all | tags) cases_tags ;; esac
     [ "$group" != all ] || cases_rest
     return "$BAD"
@@ -330,6 +399,8 @@ PY
   mutant "an archive built before a crates change is ready" docs $'\n    elif [ -n "$tar_c" ] && tar_d=$(bash tools/release/publish.sh --docs-delta "$tar_c" "$PICK_FULL" 2> /dev/null < /dev/null); then\n' $'\n    elif [ -n "$tar_c" ] && tar_d=ok; then\n'
   mutant "an archive behind a docs commit is not ready" docs $'\n    elif [ -n "$tar_c" ] && tar_d=$(bash tools/release/publish.sh --docs-delta "$tar_c" "$PICK_FULL" 2> /dev/null < /dev/null); then\n' $'\n    elif false; then\n'
   mutant "the README is not looked at" rows $'\n[ "$W_OK" != 1 ] || W_TREE=$(tree_row "$W_FULL")\n' $'\nW_TREE=ok\n'
+  mutant "the GB10's directory is the box's" gb10 'gremote=${BLOOMERY_GB10_REMOTE:-$remote}' 'gremote=$remote'
+  mutant "the GB10 is never read" gb10 'if [ -n "${BLOOMERY_GB10_BOX-}" ]; then' 'if false; then'
   mutant "an archive of another commit is ready" rows $'\n    elif [ "${tar_c:0:12}" = "$pc" ] && [ -n "$tar_c" ]; then\n' $'\n    elif true; then\n'
   rm -rf "$t"
   if [ "$fails" = 0 ]; then
