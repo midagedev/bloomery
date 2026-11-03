@@ -4774,10 +4774,12 @@ mod gate {
         // The floor counts every slot's checkpoints: the gate's own floors
         // (the planner's, read off `HostRoomFloor` at a room of one byte, with
         // no checkpoint reserve) plus `pinned_checkpoints(slots)` are the
-        // server's, so the two-slot plan's floor at one position sits over the
-        // one-slot plan's at [`CTX`] — a band of rooms a set `--parallel 2`
-        // cannot clear. At its middle that server is refused by the floor, by
-        // name (its context choice's first plan fails before the `paged` rule).
+        // server's. The saved states the floor counts are the ones the context
+        // holds, so a smaller context lowers it: at one position, the floor of
+        // two slots sits over the floor of one, a band of rooms one slot clears
+        // at its smallest context and a set `--parallel 2` clears at none. At
+        // its middle that server is refused by the floor, by name (its context
+        // choice's first plan fails before the `paged` rule).
         // On a unified card the floors are read beside the card
         // ([`host_floor`]), and the band is not the rule: the cards and the
         // host read one pool, and a plan the floor refuses at the cards' full
@@ -4793,8 +4795,11 @@ mod gate {
         // PIN(2026-10-14): `paged_floor_fallback_serves_one_column` is gone with the
         // seat's floor fallback: it served a default of two slots as one, and the
         // default is one slot now (ctx-first, D2).
-        let (one_floor, one_share) = host_floor(levers, (CTX, 1), stage)?;
-        let one_floor = one_floor + pinned_checkpoints((CTX, 1))?;
+        // PIN(2026-11-03): the band's lower edge is the one-slot floor at one position, not at
+        // [`CTX`]: the saved-state reserve the floor counts follows the context, and the two-slot
+        // floor at one position fell under the one-slot floor at [`CTX`].
+        let (one_floor, one_share) = host_floor(levers, (1, 1), stage)?;
+        let one_floor = one_floor + pinned_checkpoints((1, 1))?;
         let (two_floor, two_share) = host_floor(levers, (1, 2), stage)?;
         let two_floor = two_floor + pinned_checkpoints((1, 2))?;
         // PIN(2026-10-31): a unified card's pool lowers the card budget, so the floor's
@@ -4806,7 +4811,7 @@ mod gate {
             one_floor + two_floor.saturating_sub(one_floor) / 2
         };
         println!(
-            "paged: floors beside the card with the checkpoints: one slot at {CTX} positions \
+            "paged: floors beside the card with the checkpoints: one slot at one position \
              {one_floor} B (card share {one_share} B), two slots at one position {two_floor} B \
              (card share {two_share} B); the server's room {room} B"
         );
