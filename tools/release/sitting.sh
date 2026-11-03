@@ -1153,7 +1153,7 @@ case_quiet() {
   # a box that stays busy: rc 75 naming them, once a minute's line more than once, nothing run, nothing written
   st_fresh
   printf '%s\n' 'rustc:101 cargo:100' > "$C/ps.seq"
-  ST_EXTRA=(SITTING_QUIET_WAIT=2)
+  ST_EXTRA=(SITTING_QUIET_WAIT=5)  # whole seconds: a 2 s bound can end after one, too short for six looks under load
   # shellcheck disable=SC2046
   st_run $(portable)
   want_rc 75
