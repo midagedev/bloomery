@@ -9,7 +9,7 @@
 //! The walks themselves are the executor's ([`Exec`]): a call issues them one
 //! at a time, in the order the window runs them, and the state the call
 //! mutates between two walks is the state the executor sees when the second
-//! one fails. The card's executor is `MtpDraft`'s (`super::Card`); the unit
+//! one fails. The card's executor is `MtpDraft`'s, in `bloomery_app`; the unit
 //! tests below run the same calls against a model of the body's arena and
 //! store records, with no card.
 
@@ -33,13 +33,13 @@ const PROMPT_ARENA: &str = "the rows waiting for the draft sat in a prompt call'
                             the verify's";
 
 /// Every reason the window skips for, in the order a parked draft's byte form
-/// codes them ([`Parked::put`](super::Parked::put)). Append only: a saved
+/// codes them (`ParkedBytes::put`, in `bloomery_app`). Append only: a saved
 /// file names each by its place here.
-pub(super) const SKIPS: [&str; 4] = [NOTHING_WAITS, ENDS_ELSEWHERE, STORE_BEHIND, PROMPT_ARENA];
+pub const SKIPS: [&str; 4] = [NOTHING_WAITS, ENDS_ELSEWHERE, STORE_BEHIND, PROMPT_ARENA];
 
 /// A call the window refuses, by name: the text the session reports.
 #[derive(Debug)]
-pub(super) struct Refused(pub(super) String);
+pub struct Refused(pub String);
 
 impl fmt::Display for Refused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -50,7 +50,7 @@ impl fmt::Display for Refused {
 /// How a call that runs walks ends when it fails: the window's refusal, or
 /// the executor's own error from a walk.
 #[derive(Debug)]
-pub(super) enum Fail<E> {
+pub enum Fail<E> {
     Refused(Refused),
     Exec(E),
 }
@@ -58,15 +58,15 @@ pub(super) enum Fail<E> {
 /// One walk of the draft with no readback, as the window decides it: `tokens`
 /// at positions `pos0 ..`, each beside its hidden row, run in `mode`.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct Walk<'a, A> {
-    pub(super) tokens: &'a [u32],
-    pub(super) pos0: u32,
-    pub(super) hidden: Hidden<'a, A>,
-    pub(super) mode: WalkMode,
+pub struct Walk<'a, A> {
+    pub tokens: &'a [u32],
+    pub pos0: u32,
+    pub hidden: Hidden<'a, A>,
+    pub mode: WalkMode,
 }
 
 /// What a call's walks run on, and the one question a join asks of it.
-pub(super) trait Exec<A> {
+pub trait Exec<A> {
     type Err;
 
     /// Run `w`; its error ends the call.
@@ -79,32 +79,32 @@ pub(super) trait Exec<A> {
 
 /// The window's constants as plain values: what the decisions read of a body.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct Shape<A> {
+pub struct Shape<A> {
     /// The arena a plain step leaves its row in.
-    pub(super) step: A,
+    pub step: A,
     /// The arena a verify leaves its rows in.
-    pub(super) verify: A,
+    pub verify: A,
     /// How the chains run. Every other walk runs through the store's append
     /// alone ([`WalkMode::Store`]): only a chain reads a head.
-    pub(super) mode: WalkMode,
+    pub mode: WalkMode,
     /// The most ids a proposal holds.
-    pub(super) width: usize,
+    pub width: usize,
     /// The most rows one store walk takes.
-    pub(super) store_rows: usize,
+    pub store_rows: usize,
     /// Values of one hidden row a walk reads: the width of the zero row
     /// position 0's walk is given.
-    pub(super) hidden_width: usize,
+    pub hidden_width: usize,
 }
 
 /// The refresh a window's chain opens with: its rows' tokens, their first
 /// position, and where their hidden rows sit — the arena `walk`'s rows
 /// `first` on, one row a walk row.
 #[derive(Clone, Debug)]
-pub(super) struct Refresh<A> {
-    pub(super) tokens: Vec<u32>,
-    pub(super) pos0: u32,
-    pub(super) walk: A,
-    pub(super) first: usize,
+pub struct Refresh<A> {
+    pub tokens: Vec<u32>,
+    pub pos0: u32,
+    pub walk: A,
+    pub first: usize,
 }
 
 impl<A: Copy> Refresh<A> {
@@ -120,33 +120,20 @@ impl<A: Copy> Refresh<A> {
             mode,
         }
     }
-
-    /// The refresh's feed.
-    pub(super) fn feed(&self) -> super::Feed<'_, A> {
-        super::Feed {
-            tokens: &self.tokens,
-            pos0: self.pos0,
-            hidden: Hidden::Target {
-                walk: self.walk,
-                first: self.first,
-            },
-            media: None,
-        }
-    }
 }
 
 /// A window's chain as decided: the refresh to walk, its last row the token
 /// at the target's position, then `own` walks, all in `mode`.
 #[derive(Debug)]
-pub(super) struct Chain<A> {
-    pub(super) refresh: Refresh<A>,
-    pub(super) own: usize,
-    pub(super) mode: WalkMode,
+pub struct Chain<A> {
+    pub refresh: Refresh<A>,
+    pub own: usize,
+    pub mode: WalkMode,
 }
 
 /// A prompt call's feed of the draft, one unit at a time ([`Policy::unit`]).
 #[derive(Debug)]
-pub(super) struct Call<'a> {
+pub struct Call<'a> {
     ids: &'a [u32],
     start: u32,
     end: u32,
@@ -155,7 +142,7 @@ pub(super) struct Call<'a> {
 
 /// The window's host policy (the module doc).
 #[derive(Debug)]
-pub(super) struct Policy<A> {
+pub struct Policy<A> {
     shape: Shape<A>,
     /// One zero hidden row: the row at position 0's input, the target
     /// holding nothing before it.
@@ -174,7 +161,7 @@ pub(super) struct Policy<A> {
 }
 
 impl<A: Copy + Eq + fmt::Debug> Policy<A> {
-    pub(super) fn new(shape: Shape<A>) -> Self {
+    pub fn new(shape: Shape<A>) -> Self {
         Policy {
             shape,
             zeros: vec![0.0; shape.hidden_width],
@@ -186,18 +173,18 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
     }
 
     /// Started over: no refresh waits, no skip.
-    pub(super) fn restart(&mut self) {
+    pub fn restart(&mut self) {
         self.next = None;
         self.last_unit = None;
         self.joined = None;
         self.skip = None;
     }
 
-    pub(super) fn skipping(&self) -> bool {
+    pub fn skipping(&self) -> bool {
         self.skip.is_some()
     }
 
-    pub(super) fn take_joined(&mut self) -> Option<Join> {
+    pub fn take_joined(&mut self) -> Option<Join> {
         self.joined.take()
     }
 
@@ -206,7 +193,7 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
     /// waiting for its next walk when they sit in the step's or the verify's
     /// arena, or why it proposes nothing — its own skip, or rows a prompt
     /// call's arena holds, which a sequence state does not keep.
-    pub(super) fn park(&self) -> Parked<A> {
+    pub fn park(&self) -> Parked<A> {
         let Shape { step, verify, .. } = self.shape;
         let kept = |walk: A| walk == step || walk == verify;
         let skipping = |why| Parked {
@@ -236,7 +223,7 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
     }
 
     /// `p`, which [`Policy::park`] took, back in place.
-    pub(super) fn unpark(&mut self, p: &Parked<A>) {
+    pub fn unpark(&mut self, p: &Parked<A>) {
         self.next = p.next.clone();
         self.last_unit = p.last_unit;
         self.skip = p.skip;
@@ -249,7 +236,7 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
     /// plain step at `pos - 1` leaves, the row at `pos` waiting with a
     /// placeholder id that the next call's id replaces (as any refresh's last
     /// row), no skip, and the join a new sequence's.
-    pub(super) fn rejoin(&mut self, pos: u32) {
+    pub fn rejoin(&mut self, pos: u32) {
         self.next = Some(Refresh {
             tokens: vec![0],
             pos0: pos,
@@ -269,7 +256,7 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
     /// before each of its steps, and the runtime's width chooser — whose
     /// held pass steps the target with no proposal of the draft's — before
     /// each pass it holds back.
-    pub(super) fn before_step<X: Exec<A>>(
+    pub fn before_step<X: Exec<A>>(
         &mut self,
         x: &mut X,
         pos: u32,
@@ -339,7 +326,7 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
     /// join skips. `Some` is the feed of the call's units ([`Policy::unit`]);
     /// `None` is a plain call of the target's, the draft untouched or
     /// skipping.
-    pub(super) fn prompt_start<'a, X: Exec<A>>(
+    pub fn prompt_start<'a, X: Exec<A>>(
         &mut self,
         x: &mut X,
         start: u32,
@@ -386,7 +373,7 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
     /// on. The unit's first row was walked by the unit before (or is position
     /// 0's zero-hidden row, or the join's last row), save the last unit's last
     /// row — the next window's anchor, [`Policy::begin`]'s.
-    pub(super) fn unit<X: Exec<A>>(
+    pub fn unit<X: Exec<A>>(
         &mut self,
         call: &mut Call<'_>,
         x: &mut X,
@@ -449,7 +436,7 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
     /// server's cut: the prompt less its last id, then the last id as a step,
     /// [`Policy::stepped`] recording the anchor the step's window proposes
     /// from).
-    pub(super) fn begin(&mut self, pos: u32, first: u32) -> Result<(), Refused> {
+    pub fn begin(&mut self, pos: u32, first: u32) -> Result<(), Refused> {
         if self.skip.is_some() || self.next.is_some() {
             return Ok(());
         }
@@ -469,7 +456,7 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
     /// Keep a prompt's last hidden row across a sequence change. Step and
     /// verify arenas already belong to the sequence; a shared prompt arena
     /// is copied to row 0 of the step arena before its record moves there.
-    pub(super) fn retain_prompt<E>(
+    pub fn retain_prompt<E>(
         &mut self,
         pos: u32,
         retain: impl FnOnce(A, usize, u32) -> Result<(), E>,
@@ -503,7 +490,7 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
     /// `ctx`, into `room` ids: the refresh taken, its last row `last`, the
     /// token at `here`, and the own walks the room and the verify's rows
     /// below `ctx` allow; `None` while the draft skips.
-    pub(super) fn chain(
+    pub fn chain(
         &mut self,
         here: u32,
         ctx: u32,
@@ -567,7 +554,7 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
     /// verify's row before it wrote, the last row the id the pass took after
     /// the last kept row — the argmax on a greedy pass, the draw on a sampled
     /// one.
-    pub(super) fn record(
+    pub fn record(
         &mut self,
         p0: u32,
         rows: &[u32],
@@ -607,7 +594,7 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
     /// holds a position past the target's, which a sequence state needs.
     /// Refused by name when the waiting rows read the step's own arena,
     /// which the step has overwritten.
-    pub(super) fn stepped<X: Exec<A>>(
+    pub fn stepped<X: Exec<A>>(
         &mut self,
         x: &mut X,
         pos: u32,
@@ -664,7 +651,6 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bloomery_gpu::checkpoint::bytes;
 
     /// The arena kinds of a body whose prompt runs through ubatches or
     /// passes, its verify through the pass arena and its plain step through
@@ -1588,141 +1574,6 @@ mod tests {
         let mut skipping = Rig::new(64);
         skipping.p.skip = Some(NOTHING_WAITS);
         assert_eq!(skipping.p.park().skip, Some(NOTHING_WAITS));
-    }
-
-    /// A parked draft goes to bytes and back whole, each arena by its code
-    /// and each reason the window skips for by its place: a refresh waiting
-    /// in the verify's arena, a last unit in the step's with a skip, and
-    /// nothing; unknown codes, empty refreshes and rows outside their
-    /// arena are refused by name, while rows ending at capacity pass.
-    #[test]
-    fn a_parked_draft_goes_to_bytes_and_back() {
-        let arena = |c| {
-            [Ar::Step, Ar::Pass, Ar::Ubatch]
-                .get(usize::from(c))
-                .copied()
-                .map(|a| (a, 8))
-        };
-        let put = |p: &Parked<Ar>| {
-            let mut out = Vec::new();
-            let mut w = bytes::Put::new(&mut out);
-            p.put(&mut w, |a| a as u8).unwrap();
-            w.flush().unwrap();
-            out
-        };
-        let take = |mut b: &[u8]| Parked::take(&mut bytes::Take::new(&mut b), arena);
-        let parks = [
-            Parked {
-                next: Some(Refresh {
-                    tokens: vec![4, 5, 0],
-                    pos0: 9,
-                    walk: Ar::Pass,
-                    first: 1,
-                }),
-                last_unit: None,
-                skip: None,
-            },
-            Parked {
-                next: None,
-                last_unit: Some((Ar::Step, 1)),
-                skip: Some(PROMPT_ARENA),
-            },
-            Parked {
-                next: None,
-                last_unit: None,
-                skip: None,
-            },
-        ];
-        for p in &parks {
-            let back = take(&put(p)).unwrap();
-            assert_eq!(format!("{back:?}"), format!("{p:?}"));
-        }
-        let mut p = parks[0].clone();
-        p.next.as_mut().unwrap().first = 5;
-        take(&put(&p)).expect("a refresh ending at capacity");
-        for first in [6, usize::MAX] {
-            p.next.as_mut().unwrap().first = first;
-            let why = take(&put(&p)).unwrap_err().to_string();
-            assert!(why.contains("refresh outside its arena"), "{why}");
-        }
-        p.next.as_mut().unwrap().tokens.clear();
-        p.next.as_mut().unwrap().first = 0;
-        let why = take(&put(&p)).unwrap_err().to_string();
-        assert!(why.contains("refresh outside its arena"), "{why}");
-        let mut p = parks[1].clone();
-        p.last_unit = Some((Ar::Step, 8));
-        take(&put(&p)).expect("a last unit filling its arena");
-        p.last_unit = Some((Ar::Step, 9));
-        let why = take(&put(&p)).unwrap_err().to_string();
-        assert!(why.contains("last unit past its arena"), "{why}");
-        let mut b = put(&parks[1]);
-        assert_eq!(
-            b.last(),
-            Some(&4),
-            "the code saved files hold for PROMPT_ARENA"
-        );
-        *b.last_mut().unwrap() = SKIPS.len() as u8 + 1;
-        let why = take(&b).unwrap_err().to_string();
-        assert!(why.contains("a parked draft's skip of code 5"), "{why}");
-        b = put(&parks[0]);
-        b[1 + 8 + 3 * 4 + 4] = 3;
-        let why = take(&b).unwrap_err().to_string();
-        assert!(why.contains("a parked draft's arena of code 3"), "{why}");
-        b = put(&parks[1]);
-        b[3..11].fill(0);
-        let why = take(&b).unwrap_err().to_string();
-        assert!(
-            why.contains("a parked draft's last unit of no rows"),
-            "{why}"
-        );
-    }
-
-    /// A parked draft is checked against the state it goes back on before
-    /// the put back: the refresh's ids and rows as its walk reads them, its
-    /// last row the state's next position, and a last unit's last row as the
-    /// join's walk at that position reads it; either check's refusal is the
-    /// check's.
-    #[test]
-    fn a_parked_draft_is_checked_against_its_state() {
-        let seen = std::cell::RefCell::new(Vec::new());
-        let ids = |ts: &[u32]| -> Result<(), bytes::Fail> {
-            seen.borrow_mut().push(format!("ids {ts:?}"));
-            Ok(())
-        };
-        let rows = |walk: Ar, (first, m): (usize, usize), pos0: u32| -> Result<(), bytes::Fail> {
-            seen.borrow_mut()
-                .push(format!("{walk:?} {first} {m} {pos0}"));
-            Ok(())
-        };
-        let mut p = Parked {
-            next: Some(Refresh {
-                tokens: vec![4, 5, 0],
-                pos0: 9,
-                walk: Ar::Pass,
-                first: 1,
-            }),
-            last_unit: None,
-            skip: None,
-        };
-        p.check(11, ids, rows).unwrap();
-        assert_eq!(*seen.borrow(), ["ids [4, 5, 0]", "Pass 1 3 9"]);
-        for pos in [10, 12] {
-            let why = p.check(pos, ids, rows).unwrap_err().to_string();
-            assert!(why.contains("refresh of 3 rows from position 9"), "{why}");
-        }
-        let why = p
-            .check(11, |_| Err(bytes::refused("an id")), rows)
-            .unwrap_err();
-        assert!(why.to_string().contains("an id"), "{why}");
-        let why = p
-            .check(11, ids, |_, _, _| Err(bytes::refused("a row")))
-            .unwrap_err();
-        assert!(why.to_string().contains("a row"), "{why}");
-        p.next = None;
-        p.last_unit = Some((Ar::Pass, 4));
-        seen.borrow_mut().clear();
-        p.check(7, ids, rows).unwrap();
-        assert_eq!(*seen.borrow(), ["Pass 3 1 7"]);
     }
 
     /// A walk that fails ends the call with the error, the target unmoved

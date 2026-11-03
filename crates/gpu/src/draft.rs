@@ -20,6 +20,10 @@ use crate::model::{GpuModel, MAX_PASS_ROWS, Slots, StepMode};
 use crate::weights::Weights;
 use crate::{Gpu, GpuError};
 
+/// How a walk runs and where its hidden rows come from: plain values of the
+/// MTP window's host policy, which the host-only runtime owns.
+pub use runtime::mtp::{Hidden, WalkMode};
+
 /// Copy one final hidden row to row 0 of a sequence-owned arena, ordered on
 /// `stream`. The caller validates the source's position record first.
 pub fn retain_hidden_row(
@@ -37,23 +41,6 @@ pub fn retain_hidden_row(
     let mut target = crate::tensor::WindowMut::<f32>::of_mut(target, 0, width)?;
     target.copy_from_device_async(&source, stream)?;
     Ok(())
-}
-
-/// How a walk runs: the program's own walk, or its chain of walks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WalkMode {
-    /// Enqueued launch by launch.
-    Eager,
-    /// Replayed from its capture, captured on first use.
-    Graph,
-    /// Enqueued launch by launch through the store's append and no further:
-    /// the rows' keys and values, which are all a later row reads of them (a
-    /// row's input is its token and the target's hidden row, never the
-    /// draft's output). No flash, feed-forward block or head, no readback
-    /// and no own row: the prompt's warmup. The store's bits are a
-    /// [`WalkMode::Eager`] walk's. A body with no such walk refuses it by
-    /// name; a chain never takes it.
-    Store,
 }
 
 impl From<StepMode> for WalkMode {
@@ -94,19 +81,6 @@ impl DraftHead {
         }
         Ok(())
     }
-}
-
-/// Where a walk's hidden rows come from; `A` is the arena kind the caller's
-/// body names.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Hidden<'a, A> {
-    /// Rows written from the host, as many values a row as the caller's body
-    /// says: the row at position 0 reads a zero row, the target holding
-    /// nothing before it.
-    Host(&'a [f32]),
-    /// The target's final hidden rows in the arena `walk`, from its row
-    /// `first` on, as the target's last call of that arena left them.
-    Target { walk: A, first: usize },
 }
 
 /// A walk's rows: `tokens` at positions `pos0 ..`, each beside its hidden
