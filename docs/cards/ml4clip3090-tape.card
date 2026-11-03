@@ -1,0 +1,9 @@
+# Mistral Large 4 (UD-IQ1_S) toktape tape on the RTX 3090 alone (250 W cap) for the 0.3.12 release film and the tape
+# site: the 0.3.12 release tarball's bloomery-serve at its serving defaults with only the 3090 in view, one Korean chat
+# prompt, 1500 tokens out, the server's default sampling, one discarded warm-up. The shards are read once before the
+# load. The tape is the film's evidence; the release rows stay the sitting's.
+kind: exclusive
+reason: a host set of the 1T model's experts plus a card load and one timed request; per-token times are the clip, so
+  the box must be quiet (a build or a load beside it moves them, and memory pressure re-reads the host experts);
+  why now: the user asked for a toktape of Mistral Large 4 on one RTX 3090 with a Korean question (2026-11-02)
+minutes: 6..25
