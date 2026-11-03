@@ -8016,7 +8016,7 @@ mod gate {
                 (
                     "f32_tile_short_x",
                     dev.g32.enqueue_f32_tile(stream, &w320, &short, 2, &mut y),
-                    "x.len() ",
+                    "x holds ",
                 ),
                 (
                     "f32_tile_x_unaligned",
@@ -8497,6 +8497,10 @@ mod gate {
                             print_arm(arm, n, 0, nodes, eager, graph);
                         }
                     }
+                    // The graph replay raises a faulting edge's fault again
+                    // after the take above: the case leaves the word clean
+                    // for the gate that runs next.
+                    gpu.clear_fault()?;
                 }
             }
             let x = DeviceBuffer::from_host(stream, &vec![1.0f32; 128])?;
