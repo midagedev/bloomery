@@ -76,9 +76,10 @@ blk_recipescheck() {
 blk_gateclass() {
   python3 "$(dirname "$0")/gate_class.py" check
 }
+# blk_selftest K: part K of the recipes.py self-test (its SELFTEST_PARTS parts hold every job once; plain --self-test runs them all).
 blk_selftest() {
-  if ! python3 "$(dirname "$0")/recipes.py" --self-test; then
-    echo "check-recipes: the recipes.py self-test failed" >&2
+  if ! python3 "$(dirname "$0")/recipes.py" --self-test --part "$1"; then
+    echo "check-recipes: the recipes.py self-test part $1 failed" >&2
     return 1
   fi
 }
@@ -1229,13 +1230,17 @@ blk_keyspec() {
     *) echo tree ;;
   esac
 }
-# units: the blocks as the scheduler runs them, one a line: gate-batch's self-test runs as its parts (`--part K`, the
-# count its SELFTEST_PARTS line holds) and pytools as its list check and one unit a tool, so the scheduler sees each one's
-# own wall and slot.
+# units: the blocks as the scheduler runs them, one a line: gate-batch's self-test and recipes.py's run as their parts
+# (`--part K`, the count the SELFTEST_PARTS line of each holds) and pytools as its list check and one unit a tool, so the
+# scheduler sees each one's own wall and slot.
 units() {
   local b k parts
   for b in "${BLOCKS[@]}"; do
-    if [ "$b" = pytools ]; then
+    if [ "$b" = selftest ]; then
+      parts=$(sed -n 's/^SELFTEST_PARTS = \([1-9][0-9]*\)$/\1/p' "$(dirname "$0")/recipes.py")
+      [ -n "$parts" ] || { echo "check-recipes: tools/recipes.py has no SELFTEST_PARTS line" >&2; return 70; }
+      for ((k = 1; k <= parts; k++)); do echo "selftest.$k"; done
+    elif [ "$b" = pytools ]; then
       echo pytools.list
       pytools_list
       for ((k = 1; k <= ${#selftests[@]}; k++)); do echo "pytools.$k"; done
@@ -1250,12 +1255,19 @@ units() {
 }
 # jobs: every unit as a line of tools/static-sched.py's JOBS, run from the repository root. procleg, the cpu-guard
 # live pair, runs alone.
+# jobs [SLOTS]: SLOTS is the scheduler's slot count the weights are drawn for (default: the cpu count, as tools/static-sched.py takes it).
 jobs() {
-  local u list
+  local u list attr attrs
   list=$(units) || return
+  # The weight of each recipes.py self-test part on that host (a part that loads the key graph peaks at 2.2 to 3.9 GiB resident; the comment at
+  # SELFTEST_GRAPH_PARTS in tools/recipes.py has the measurement and the rule).
+  attrs=$(python3 "$(dirname "$0")/recipes.py" selftest-attrs ${1:+--slots "$1"}) || return
   printf 'check-recipes.procleg\talone\t-\tbash tools/check-recipes.sh --block procleg\n'
   for u in $list; do
-    printf 'check-recipes.%s\t-\t%s\tbash tools/check-recipes.sh --block %s\n' "$u" "$(blk_keyspec "${u%%.*}")" "$u"
+    attr=-
+    case $u in selftest.*) attr=$(printf '%s\n' "$attrs" | awk -F'\t' -v k="${u#selftest.}" '$1 == k { print $2 }') ;; esac
+    [ -n "$attr" ] || { echo "check-recipes: tools/recipes.py selftest-attrs names no weight for $u" >&2; return 70; }
+    printf 'check-recipes.%s\t%s\t%s\tbash tools/check-recipes.sh --block %s\n' "$u" "$attr" "$(blk_keyspec "${u%%.*}")" "$u"
   done
 }
 # report DIR: the blocks' verdict from a tools/static-sched.py run's DIR, in this file's order, procleg first: a green
@@ -1291,8 +1303,8 @@ report() {
 
 case ${1:-} in
   --jobs)
-    [ $# = 1 ] || { echo "check-recipes.sh: --jobs takes nothing" >&2; exit 64; }
-    jobs
+    { [ $# = 1 ] || { [ $# = 3 ] && [ "$2" = --slots ]; }; } || { echo "check-recipes.sh: --jobs takes nothing, or --slots N" >&2; exit 64; }
+    jobs "${3:-}"
     exit 0
     ;;
   --block)
@@ -1311,7 +1323,7 @@ case ${1:-} in
     exit $?
     ;;
   '') ;;
-  *) echo "usage: tools/check-recipes.sh [--jobs | --block UNIT | --report DIR]" >&2; exit 64 ;;
+  *) echo "usage: tools/check-recipes.sh [--jobs [--slots N] | --block UNIT | --report DIR]" >&2; exit 64 ;;
 esac
 # Every block at once is ~60 processes, some of them parallel themselves: one scheduler, tools/static-sched.py, runs
 # them at most a cpu count at once, the longest recorded first (tools/mac-static.sh gives it this file's jobs beside its

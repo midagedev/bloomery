@@ -581,7 +581,7 @@ self_test() {
   done
   ! grep -q '^check-recipes	' <<< "$out" || fail "check-recipes is a job of its own, not its blocks"
   grep -q '^check-recipes\.cardtests	' <<< "$out" || fail "check-recipes' blocks are not jobs"
-  grep -q '^check-recipes\.gatebatch\.1	' <<< "$out" || fail "gate-batch's self-test parts are not jobs"
+  grep -q '^check-recipes\.gatebatch\.1	' <<< "$out" && grep -Eq '^check-recipes\.selftest\.1	(-|cpus=2)	' <<< "$out" || fail "gate-batch's and recipes.py's self-test parts are not jobs"
   grep -qx 'check-model-tax	-	tree,rev:origin/main	bash tools/check-model-tax.sh check --base origin/main' <<< "$out" \
     || fail "the model-tax job does not key the base revision: $(printf '%s\n' "$out" | grep '^check-model-tax')"
   # a job's command keeps its argument boundaries as the scheduler's `bash -c` reads it: a ledger path with a space reaches

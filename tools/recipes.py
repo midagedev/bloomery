@@ -29,6 +29,7 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
     python3 tools/recipes.py orphan-tests      # every #[test] no gate-* or lab-* recipe runs on the box
     python3 tools/recipes.py expand [--justfile F]  # every recipe as just runs it, each top-level variable replaced by its value in this environment
     python3 tools/recipes.py --self-test [--serial]  # its sections run as forked processes; --serial: one after another in this one
+    python3 tools/recipes.py --self-test --part K    # part K of SELFTEST_PARTS (check-recipes runs one scheduler job a part): its sections one child after another
 
 `affected` prints the gate-* recipes whose inputs a diff touches; nothing runs. BASE (default
 `main`) compares the working tree, uncommitted and untracked files included, with the merge base of
@@ -286,7 +287,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 
 _REACH_LOADED_CODE = sys._getframe().f_code
@@ -12526,11 +12527,23 @@ def key_detectors_self_test(expect, real: Side) -> None:
         expect(hit is None, f"the walk detector flags {hit}: every gate that runs it would be keyed on the whole tree")
 
 
-def key_self_test(expect, real: Side, section: str | None = None) -> None:
-    """Independent key contracts, each on its own scratch tree and manifest."""
+# The key contracts' pieces, in the order key_self_test runs them. A piece is independent of the others when it has a scratch tree and
+# manifest of its own: a call builds one and runs the pieces it is given on it, so they share its cold start (the first key of a fresh
+# tree reads the whole source corpus). Which pieces share a call is KEY_JOBS; all eight in one call is not a supported shape (its second
+# `inputs` block, which then runs after the `globals` ones, fails).
+KEY_PIECES = ("inputs", "globals.loop", "globals.member", "globals.bump", "globals.files", "fixtures", "variants", "scope")
+
+
+def key_self_test(expect, pieces: tuple[str, ...]) -> None:
+    """The key contracts of the given KEY_PIECES, on one scratch tree and manifest."""
     from unittest.mock import patch
 
-    assert section in (None, "inputs", "globals", "fixtures", "variants", "scope"), section
+    assert set(pieces) <= set(KEY_PIECES), pieces
+
+    def want(piece: str) -> bool:
+        assert piece in KEY_PIECES, piece
+        return piece in pieces
+
     meta = cargo_metadata(ROOT)
     settings = justfile_settings(os.path.join(ROOT, "justfile"))
     with tempfile.TemporaryDirectory(prefix="recipes-keytest-") as tmp, patch.dict(os.environ, {"HOME": tmp}):
@@ -12608,7 +12621,7 @@ def key_self_test(expect, real: Side, section: str | None = None) -> None:
         fx_file = f"model\t{FIXTURE_ROOT}/qwen38/q-00001-of-00001.gguf\t100\t1\t2\t3"
         fixture_free = [ln for ln in manifest[:-1] if not ln.startswith(f"model-dir\t{FIXTURE_ROOT}\t")]
 
-        if section is None or section == "inputs":
+        if want("inputs"):
             expect(keys(sa) == base, "the same inputs gave another key")
             # The same tree at a second absolute path: the copy renamed there and back (a symlink would not
             # do — Tree takes the realpath).
@@ -12629,43 +12642,45 @@ def key_self_test(expect, real: Side, section: str | None = None) -> None:
             cpu_lib = sorted(f for f in sa.graph.inputs("gate-sampler").files if f.startswith("crates/sampler/src/"))
             m = edit(cpu_lib[0], append("\n// key probe\n"))
             expect({"cpu", "mac", "fmt"} <= m and "gpu" not in m, f"{cpu_lib[0]} moves {sorted(m)}")
-        if section is None or section == "globals":
+        if want("globals.loop"):
             for g in KEY_GLOBALS:
                 m = edit(g, append("\n# key probe\n"))
                 expect(m == set(items), f"{g} moves {sorted(m)}, not every key")
-            # A workspace member's own version (its `[package]` table, its `[[package]]` entry in Cargo.lock) is a label no gate reads: a
-            # release's bump moves no key of an item whose reads are modeled and that reads no version out of a manifest, and the
-            # whole-tree keys (their reads are not modeled) still move. Any other edit of the same files moves every key, as the probes
-            # above. Added 2026-11-03 (relkey, after the 0.3.12 bump re-keyed all 212 items of the release batch); FAIL-first: on the
-            # code before it, the first clause below fails (every key moves).
-            def with_edits(edits: list[tuple[str, Callable[[str], str]]], fn):
-                saved: dict[str, str] = {}
-                try:
-                    for rel, change in edits:
-                        with open(os.path.join(roots[0], rel), encoding="utf-8") as fh:
-                            saved[rel] = fh.read()
-                        changed = change(saved[rel])
-                        expect(changed != saved[rel], f"the probe edit of {rel} changed nothing")
-                        with open(os.path.join(roots[0], rel), "w", encoding="utf-8") as fh:
-                            fh.write(changed)
-                    return fn()
-                finally:
-                    for rel, text in saved.items():
-                        with open(os.path.join(roots[0], rel), "w", encoding="utf-8") as fh:
-                            fh.write(text)
+        # A workspace member's own version (its `[package]` table, its `[[package]]` entry in Cargo.lock) is a label no gate reads: a
+        # release's bump moves no key of an item whose reads are modeled and that reads no version out of a manifest, and the
+        # whole-tree keys (their reads are not modeled) still move. Any other edit of the same files moves every key, as the probes
+        # above. Added 2026-11-03 (relkey, after the 0.3.12 bump re-keyed all 212 items of the release batch); FAIL-first: on the
+        # code before it, the first clause below fails (every key moves).
+        def with_edits(edits: list[tuple[str, Callable[[str], str]]], fn):
+            saved: dict[str, str] = {}
+            try:
+                for rel, change in edits:
+                    with open(os.path.join(roots[0], rel), encoding="utf-8") as fh:
+                        saved[rel] = fh.read()
+                    changed = change(saved[rel])
+                    expect(changed != saved[rel], f"the probe edit of {rel} changed nothing")
+                    with open(os.path.join(roots[0], rel), "w", encoding="utf-8") as fh:
+                        fh.write(changed)
+                return fn()
+            finally:
+                for rel, text in saved.items():
+                    with open(os.path.join(roots[0], rel), "w", encoding="utf-8") as fh:
+                        fh.write(text)
 
-            bump_toml = lambda t: re.sub(r'(?m)^version = "([^"]*)"', r'version = "\1-probe"', t, count=1)  # noqa: E731
-            bump_lock = lambda t: re.sub(r'(?m)^(name = "bloomery-gpu-gates"\nversion = "[^"]*)"', r'\1-probe"', t, count=1)  # noqa: E731
-            bump_ext = lambda t: re.sub(r'(?m)^(name = "[^"]*"\nversion = "[^"]*)("\nsource = )', r'\1-probe\2', t, count=1)  # noqa: E731
-            drop_dep = lambda t: re.sub(r'(?m)^(name = "bloomery-gpu-gates"\nversion = "[^"]*"\ndependencies = \[\n) "[^"]*",\n', r'\1', t, count=1)  # noqa: E731
-            read_version = lambda t: t + "\nsed -n 's/^version = \"\\(.*\\)\"/\\1/p' crates/gpu-gates/Cargo.toml\n"  # noqa: E731
-            modeled = {k: items[k] for k in ("gpu", "cpu", "args")}  # the items whose reads are modeled (the closure scope)
-            member = [("crates/gpu-gates/Cargo.toml", bump_toml), ("Cargo.lock", bump_lock)]
+        bump_toml = lambda t: re.sub(r'(?m)^version = "([^"]*)"', r'version = "\1-probe"', t, count=1)  # noqa: E731
+        bump_lock = lambda t: re.sub(r'(?m)^(name = "bloomery-gpu-gates"\nversion = "[^"]*)"', r'\1-probe"', t, count=1)  # noqa: E731
+        bump_ext = lambda t: re.sub(r'(?m)^(name = "[^"]*"\nversion = "[^"]*)("\nsource = )', r'\1-probe\2', t, count=1)  # noqa: E731
+        drop_dep = lambda t: re.sub(r'(?m)^(name = "bloomery-gpu-gates"\nversion = "[^"]*"\ndependencies = \[\n) "[^"]*",\n', r'\1', t, count=1)  # noqa: E731
+        read_version = lambda t: t + "\nsed -n 's/^version = \"\\(.*\\)\"/\\1/p' crates/gpu-gates/Cargo.toml\n"  # noqa: E731
+        modeled = {k: items[k] for k in ("gpu", "cpu", "args")}  # the items whose reads are modeled (the closure scope)
+        member = [("crates/gpu-gates/Cargo.toml", bump_toml), ("Cargo.lock", bump_lock)]
+        if want("globals.member"):
             m = with_edits(member, lambda: moved(keys(sa)))
             expect(m == {"mac", "fmt"}, f"a workspace member's version bump (manifest and lock) moves {sorted(m)}, not only the whole-tree keys")
             for edit_one in member:
                 m = with_edits([edit_one], lambda: moved(keys(sa, only=modeled)))
                 expect(not m, f"a workspace member's version bump in {edit_one[0]} alone moves {sorted(m)}")
+        if want("globals.bump"):
             for what, edits in (("a dependency's version in Cargo.lock", [("Cargo.lock", bump_ext)]),
                                 ("a dependency's version beside the member's", member + [("Cargo.lock", bump_ext)]),
                                 ("a member entry's dependency list in Cargo.lock", member + [("Cargo.lock", drop_dep)]),
@@ -12676,6 +12691,7 @@ def key_self_test(expect, real: Side, section: str | None = None) -> None:
             with_reader = with_edits([("tools/gpu-gate.sh", read_version)], lambda: keys(sa, only=modeled))
             m = with_edits([("tools/gpu-gate.sh", read_version)] + member, lambda: {k for k, v in keys(sa, only=modeled).items() if v != with_reader[k]})
             expect(m == set(modeled), f"a script that reads a manifest's version: the bump moves {sorted(m)}, not every key")
+        if want("globals.files"):
             # `key --files` (tools/gate-batch.sh's red-line attribution): the files an item's key reads, from no box manifest, the global parts
             # that name a file included, and a member's manifest and the lock marked blind where their digest leaves out its version. Added
             # 2026-11-03 (rf-follow); FAIL-first: on the code before it there is no files_only (KeyContext takes no such argument), and with the
@@ -12720,7 +12736,7 @@ def key_self_test(expect, real: Side, section: str | None = None) -> None:
             reads = lambda line: VERSION_READ.search(line) is not None  # noqa: E731
             expect(reads("v=$(sed -n 's/^version = \"\\(.*\\)\"/\\1/p' \"crates/$c/Cargo.toml\")") and reads("grep version Cargo.lock"), "VERSION_READ: a line that reads a version out of a manifest is not one")
             expect(not reads('meta=$(cargo metadata --format-version 1 --manifest-path "$ROOT/Cargo.toml")') and not reads("banner: LLVM version 21") and not reads("$ROOT/Cargo.toml"), "VERSION_READ: a line that names no version read is one")
-        if section is None or section == "inputs":
+        if want("inputs"):
             m = edit("justfile", append("\n# key probe\n"), side_fresh=True)
             expect(m == {"mac", "fmt"}, f"a justfile comment moves {sorted(m)}")
             m = edit("justfile", lambda s: s.replace("bash tools/gpu-gate.sh gate_q4k_sel'", "bash tools/gpu-gate.sh gate_q4k_sel '", 1), side_fresh=True)
@@ -12754,7 +12770,7 @@ def key_self_test(expect, real: Side, section: str | None = None) -> None:
                 st_real, _ = ledger_status(k_real, "gate-gpu-q4k-sel", items["gpu"], [], [Ledger(lp)])
                 st_fix, _ = ledger_status(k_fix, "gate-gpu-q4k-sel", items["gpu"], [], [Ledger(lp)])
             expect(st_real == "run" and st_fix == "skip", f"a fixture-tier green and the ledger: the real item {st_real}, the fixture one {st_fix}")
-        if section is None or section == "fixtures":
+        if want("fixtures"):
             # The fixture directory's rows belong to the fixture tier's keys alone: a real key does not move with them, a fixture key
             # does, and the row of a file inside a family's directory is one (the manifest lists below a subdirectory there).
             # PIN(2026-10-13): re-pinned, not loosened — a key holds its family's fixture directory (KeyContext.fixture_dirs), so a
@@ -12890,7 +12906,7 @@ def key_self_test(expect, real: Side, section: str | None = None) -> None:
             expect(fam_keys(fx_rows(sizes)) == kf, f"{FIXTURE_DIRS} restored keys another way")
             write_manifest(manifest)
             expect(keys(sa) == base, "the base manifest, restored after the family clauses, keys another way")
-        if section is None or section == "variants":
+        if want("variants"):
             # A fixture variant's files (VARIANT_ROOT, beside FIXTURE_ROOT) belong to the keys of the items that run under its tag: no other
             # item's key moves with them, an item under the tag moves with its own directory's rows and its table row, and not with another tag's.
             vdirs = lambda tag: [f"model\t{VARIANT_ROOT}/{tag}\tdir", f"model\t{VARIANT_ROOT}/{tag}/glm5next\tdir"]  # noqa: E731
@@ -12941,7 +12957,7 @@ def key_self_test(expect, real: Side, section: str | None = None) -> None:
                     fh.write(vtable_old)
                 write_manifest(manifest)
             expect(keys(sa) == base, "the base manifest, restored after the variant clauses, keys another way")
-        if section is None or section == "scope":
+        if want("scope"):
             for i in range(1, nfixed - 1):
                 mut = list(manifest)
                 mut[i] = mut[i] + "x"
@@ -14899,10 +14915,11 @@ def _expecting(fails: list[str]) -> Callable[[bool, str], None]:
     return expect
 
 
-def _forked(jobs: list[tuple[str, Callable[[list[str]], None]]], serial: bool = False) -> tuple[list[str], list[tuple[str, float]]]:
+def _forked(jobs: list[tuple[str, Callable[[list[str]], None]]], serial: bool = False, limit: int = 0) -> tuple[list[str], list[tuple[str, float]]]:
     """The failures of every job, in job order, and each job's wall seconds. Each job runs in a forked child of this process (`serial`: in this one), so
     the parsed real tree is shared copy-on-write while each job's temp directories, environment and working directory stay
-    its own. A job that raises reports its traceback as a failure; a child that ends without a report is a failure naming it."""
+    its own. `limit`: at most that many children at once (0: all at once; 1: one after another, each still in a child of its own). A job that raises
+    reports its traceback as a failure; a child that ends without a report is a failure naming it."""
     import multiprocessing
     import traceback
 
@@ -14924,8 +14941,22 @@ def _forked(jobs: list[tuple[str, Callable[[list[str]], None]]], serial: bool = 
             times.append((name, secs))
         return out, times
     ctx = multiprocessing.get_context("fork")
-    started = []
+
+    def collect(entry) -> None:
+        name, proc, recv = entry
+        try:
+            got, secs = recv.recv()
+            out.extend(got)
+            times.append((name, secs))
+        except EOFError:
+            proc.join()
+            out.append(f"{name}: its process ended without a report (exit code {proc.exitcode})")
+        proc.join()
+
+    started: list = []
     for name, job in jobs:
+        if limit and len(started) >= limit:
+            collect(started.pop(0))
         recv, send = ctx.Pipe(duplex=False)
 
         def child(name: str = name, job: Callable[[list[str]], None] = job, send=send) -> None:
@@ -14936,15 +14967,8 @@ def _forked(jobs: list[tuple[str, Callable[[list[str]], None]]], serial: bool = 
         proc.start()
         send.close()
         started.append((name, proc, recv))
-    for name, proc, recv in started:
-        try:
-            got, secs = recv.recv()
-            out.extend(got)
-            times.append((name, secs))
-        except EOFError:
-            proc.join()
-            out.append(f"{name}: its process ended without a report (exit code {proc.exitcode})")
-        proc.join()
+    for entry in started:
+        collect(entry)
     return out, times
 
 
@@ -15671,9 +15695,55 @@ def _st_mutations(fails: list[str], side: Side, part: int, parts: int) -> None:
 
 
 
+def selftest_parts_self_test(expect) -> None:
+    """The self-test's own scaffolding: the partition of its jobs, a part's job selection and the one-at-a-time child runner."""
+    names = ["a", "b", "c"]
+    check = lambda groups: selftest_partition_problems("job", names, groups)  # noqa: E731
+    expect(check([("a", "b"), ("c",)]) == [], f"parts: a partition is refused: {check([('a', 'b'), ('c',)])}")
+    expect(check([("a",), ("c",)]) == ["job 'b' is in no group"], f"parts: a job left in no part: {check([('a',), ('c',)])}")
+    expect(check([("a", "b"), ("b", "c")]) == ["job 'b' is in groups 1 and 2"], f"parts: a job in two parts: {check([('a', 'b'), ('b', 'c')])}")
+    expect(check([("a", "b", "c"), ("d",)]) == ["job group 2 names 'd', which is none"], f"parts: a part naming no job: {check([('a', 'b', 'c'), ('d',)])}")
+    expect(check([("a", "b", "c"), ()]) == ["job group 2 is empty"], f"parts: an empty part: {check([('a', 'b', 'c'), ()])}")
+    jobs = [(n, False, lambda f: None) for n in names]
+    expect([j[0] for j in selftest_part_jobs(jobs, (("c", "a"), ("b",)), 1)] == ["a", "c"], "parts: part 1 is not its jobs in run order")
+    expect([j[0] for j in selftest_part_jobs(jobs, (("c", "a"), ("b",)), 2)] == ["b"], "parts: part 2 is not its job")
+    for bad in (0, 3):
+        expect(_raises(lambda bad=bad: selftest_part_jobs(jobs, (("c", "a"), ("b",)), bad), "--part takes 1..2"), f"parts: part {bad} of 2 is not a named error")
+    # check-recipes.sh makes one scheduler job of each part, from the SELFTEST_PARTS line above
+    for slots in (4, SELFTEST_PARTS):
+        r = subprocess.run(["bash", os.path.join(ROOT, "tools", "check-recipes.sh"), "--jobs", "--slots", str(slots)], capture_output=True, text=True)
+        listed = [tuple(line.split("\t")[:2]) for line in r.stdout.splitlines() if line.startswith("check-recipes.selftest")]
+        want = [(f"check-recipes.selftest.{k}", selftest_attr(k, slots)) for k in range(1, SELFTEST_PARTS + 1)]
+        expect(listed == want, f"parts: check-recipes.sh --jobs --slots {slots} lists {listed} (rc {r.returncode}), not the {SELFTEST_PARTS} parts with their weights")
+    # a host with fewer slots than parts weighs the parts that load the key graph two slots each; a host with a slot a part does not
+    small, large = (tuple(selftest_attr(k, n) for k in range(1, SELFTEST_PARTS + 1)) for n in (4, SELFTEST_PARTS))
+    expect(small == ("cpus=2",) * SELFTEST_GRAPH_PARTS + ("-",) * (SELFTEST_PARTS - SELFTEST_GRAPH_PARTS), f"parts: weights on 4 slots: {small}")
+    expect(large == ("-",) * SELFTEST_PARTS, f"parts: weights on {SELFTEST_PARTS} slots: {large}")
+    # a limit of 1 runs the children one after another, whole: no child starts before the one before it has ended
+    with tempfile.TemporaryDirectory(prefix="recipes-forked-") as tmp:
+        def napper(k: int) -> Callable[[list[str]], None]:
+            def job(f: list[str]) -> None:
+                t0 = time.time()
+                time.sleep(0.2)
+                with open(os.path.join(tmp, str(k)), "w", encoding="utf-8") as fh:
+                    fh.write(f"{t0!r} {time.time()!r}")
+
+            return job
+
+        fails, times = _forked([(f"n{k}", napper(k)) for k in range(3)], limit=1)
+        spans = []
+        for k in range(3):
+            with open(os.path.join(tmp, str(k)), encoding="utf-8") as fh:
+                t0, t1 = (float(x) for x in fh.read().split())
+            spans.append((t0, t1))
+        expect(fails == [] and [n for n, _ in times] == ["n0", "n1", "n2"], f"parts: one-at-a-time children: {fails}, {times}")
+        expect(all(spans[k][1] <= spans[k + 1][0] for k in range(2)), f"parts: a child started before the one before it ended: {spans}")
+
+
 def _st_selection(fails: list[str], side: Side) -> None:
     expect = _expecting(fails)
     recipes = side.recipes
+    selftest_parts_self_test(expect)
 
     # a changed recipe text selects that recipe and no other
     import copy
@@ -16358,16 +16428,91 @@ def class_stage_self_test(fails: list[str]) -> None:
     print(f"class stage self-test: {'ok' if not fails else f'{len(fails)} failure(s)'} ({time.monotonic() - t0:.1f} s)")
 
 
-def self_test(serial: bool = False) -> int:
-    side = make_side(ROOT)
-    gates = [n for n in side.recipes if n.startswith(GATE_PREFIX)]
-    # The children inherit the real tree's input and reach memos copy-on-write.
-    for name in gates:
-        side.graph.inputs(name)
-        reach_of(side.tree).gate_files(side.graph, name)
+# The key contracts' jobs: each tuple is one call of key_self_test, so its pieces share one scratch tree's cold start. Every KEY_PIECES
+# name stands in exactly one tuple (selftest_partition_problems holds it).
+KEY_JOBS: tuple[tuple[str, ...], ...] = (
+    ("inputs",),
+    ("globals.loop",),
+    ("globals.member", "globals.files"),
+    ("globals.bump",),
+    ("fixtures", "variants"),
+    ("scope",),
+)
+
+# The self-test's parts. `--self-test --part K` runs the jobs of SELFTEST_TABLE[K - 1] one after another, each in a child process of its
+# own, and tools/check-recipes.sh makes one job of tools/static-sched.py of each part, so the scheduler sees each part's own wall and slot
+# (it reads the count from the next line). Plain `--self-test` runs every job at once. Every job stands in exactly one part
+# (selftest_partition_problems holds it). A part's cost is the sum of its jobs' and, when one reads the real tree, that tree's setup
+# once; a part line of the check-recipes log lists every job's seconds, setup included. The table packs the parts to one size (the
+# longest is a key job that cannot be cut further without another cold start); re-pack it when a job grows past the longest part.
+SELFTEST_PARTS = 8
+# Parts 1..SELFTEST_GRAPH_PARTS hold the key contracts. Each loads the reach cache's whole graph for a scratch tree of its own and peaks at
+# 2.2 to 3.9 GiB resident (`/usr/bin/time -l bash tools/check-recipes.sh --block selftest.K`, Mac, two runs). On a host with fewer slots
+# than parts, selftest_attr weighs each of them cpus=2: a 4-core, 16 GiB host runs two at once, not four beside other jobs. A host with a
+# slot a part starts every part together and keeps the one-wave wall (a 10-slot Mac at cpus=2 holds five key parts and waits a second wave:
+# 453 s against 284 s). tools/check-recipes.sh reads the part count from the next line.
+SELFTEST_GRAPH_PARTS = 6
+SELFTEST_TABLE: tuple[tuple[str, ...], ...] = (
+    ("key inputs",),
+    ("key globals.bump",),
+    ("key scope",),
+    ("key globals.member+globals.files",),
+    ("key globals.loop",),
+    ("key fixtures+variants",),
+    ("basics", "real tree", "pure crates", "host crates", "mutations 1/2", "mutations 2/2", "selection", "orphan-tests", "narrow", "class stage", "dispatch", "key detectors"),
+    ("narrow table", "small tools", "key reach"),
+)
+
+
+def selftest_attr(part: int, slots: int) -> str:
+    """The tools/static-sched.py attribute of part `part` on a scheduler of `slots` slots: `cpus=2` for a part that loads the key graph when
+    the host has fewer slots than parts, `-` otherwise."""
+    return "cpus=2" if part <= SELFTEST_GRAPH_PARTS and slots < SELFTEST_PARTS else "-"
+
+
+def cmd_selftest_attrs(args: argparse.Namespace) -> int:
+    if args.slots is not None and args.slots < 1:
+        raise RecipeError(f"selftest-attrs: --slots takes a positive whole number, not {args.slots}")
+    slots = args.slots or os.cpu_count()
+    if not slots:
+        raise RecipeError("selftest-attrs: no cpu count (os.cpu_count() is None); pass --slots")
+    for k in range(1, SELFTEST_PARTS + 1):
+        print(f"{k}\t{selftest_attr(k, slots)}")
+    return 0
+
+
+def selftest_partition_problems(what: str, items: list[str], groups: Sequence[Sequence[str]]) -> list[str]:
+    """What keeps `groups` from being a partition of `items`, each a line: an item in no group or in two, a group that names no item
+    and an empty group. No problem is a partition."""
+    problems: list[str] = []
+    seen: dict[str, int] = {}
+    for k, group in enumerate(groups, 1):
+        if not group:
+            problems.append(f"{what} group {k} is empty")
+        for item in group:
+            if item not in items:
+                problems.append(f"{what} group {k} names {item!r}, which is none")
+            elif item in seen:
+                problems.append(f"{what} {item!r} is in groups {seen[item]} and {k}")
+            else:
+                seen[item] = k
+    problems += [f"{what} {item!r} is in no group" for item in items if item not in seen]
+    return problems
+
+
+def selftest_part_jobs(jobs: list, table: Sequence[Sequence[str]], part: int) -> list:
+    """The jobs of part `part` (1-based) of `table`, in the jobs' run order."""
+    if not 1 <= part <= len(table):
+        raise RecipeError(f"--part takes 1..{len(table)}, not {part}")
+    return [job for job in jobs if job[0] in table[part - 1]]
+
+
+def _selftest_jobs(get_side: Callable[[], Side]) -> list[tuple[str, bool, Callable[[list[str]], None]]]:
+    """The self-test's jobs in run order, each `(name, whether it reads the real tree, the job)`. `get_side` is the real tree, parsed once per process."""
 
     def small(f: list[str]) -> None:
         expect = _expecting(f)
+        side = get_side()
         scan_set_self_test(expect, side)  # the scan set
         ships_self_test(expect)  # the shipped closure and the release feature list
         manifest_self_test(expect)  # a package manifest read by table
@@ -16390,36 +16535,77 @@ def self_test(serial: bool = False) -> int:
 
     def narrow(f: list[str]) -> None:
         expect = _expecting(f)
-        narrow_self_test(expect, side)  # affected --narrow
+        narrow_self_test(expect, get_side())  # affected --narrow
         lever_rows_self_test(expect)  # the lever registry read by row
         variant_items_self_test(expect)
 
     # Independent sections, each on the same parsed real tree: they run side by side, the wall is the longest one.
-    jobs: list[tuple[str, Callable[[list[str]], None]]] = [
-        ("basics", lambda f: _st_basics(f, side)),
-        ("real tree", lambda f: _st_real_tree(f, side)),
-        ("pure crates", lambda f: _st_pure_crates(f, side)),
-        ("host crates", lambda f: _st_host_crates(f, side)),
-        ("mutations 1/2", lambda f: _st_mutations(f, side, 0, 2)),
-        ("mutations 2/2", lambda f: _st_mutations(f, side, 1, 2)),
-        ("selection", lambda f: _st_selection(f, side)),
-        ("orphan-tests", lambda f: orphan_self_test(_expecting(f), side)),
-        ("narrow", narrow),
-        ("narrow table", lambda f: narrow_table_self_test(_expecting(f), side)),
-        ("dispatch", lambda f: dispatch_self_test(_expecting(f), side)),
-        ("class stage", lambda f: class_stage_self_test(f)),
-        ("small tools", small),
-        ("key detectors", lambda f: key_detectors_self_test(_expecting(f), side)),
-        *[(f"key {section}", lambda f, section=section: key_self_test(_expecting(f), side, section))
-          for section in ("inputs", "globals", "fixtures", "variants", "scope")],
-        ("key reach", lambda f: key_reach_self_test(_expecting(f), side)),
+    jobs: list[tuple[str, bool, Callable[[list[str]], None]]] = [
+        ("basics", True, lambda f: _st_basics(f, get_side())),
+        ("real tree", True, lambda f: _st_real_tree(f, get_side())),
+        ("pure crates", True, lambda f: _st_pure_crates(f, get_side())),
+        ("host crates", True, lambda f: _st_host_crates(f, get_side())),
+        ("mutations 1/2", True, lambda f: _st_mutations(f, get_side(), 0, 2)),
+        ("mutations 2/2", True, lambda f: _st_mutations(f, get_side(), 1, 2)),
+        ("selection", True, lambda f: _st_selection(f, get_side())),
+        ("orphan-tests", True, lambda f: orphan_self_test(_expecting(f), get_side())),
+        ("narrow", True, narrow),
+        ("narrow table", True, lambda f: narrow_table_self_test(_expecting(f), get_side())),
+        ("dispatch", True, lambda f: dispatch_self_test(_expecting(f), get_side())),
+        ("class stage", False, lambda f: class_stage_self_test(f)),
+        ("small tools", True, small),
+        ("key detectors", True, lambda f: key_detectors_self_test(_expecting(f), get_side())),
+        *[("key " + "+".join(group), False, lambda f, group=group: key_self_test(_expecting(f), group)) for group in KEY_JOBS],
+        ("key reach", True, lambda f: key_reach_self_test(_expecting(f), get_side())),
     ]
-    fails, times = _forked(jobs, serial)
+    return jobs
+
+
+def self_test(serial: bool = False, part: int | None = None) -> int:
+    held: list[Side] = []
+
+    def get_side() -> Side:
+        # The children inherit the real tree's input and reach memos copy-on-write.
+        if not held:
+            side = make_side(ROOT)
+            for name in [n for n in side.recipes if n.startswith(GATE_PREFIX)]:
+                side.graph.inputs(name)
+                reach_of(side.tree).gate_files(side.graph, name)
+            held.append(side)
+        return held[0]
+
+    jobs = _selftest_jobs(get_side)
+    names = [name for name, _, _ in jobs]
+    problems = selftest_partition_problems("self-test job", names, SELFTEST_TABLE)
+    problems += selftest_partition_problems("key piece", list(KEY_PIECES), KEY_JOBS)
+    if len(SELFTEST_TABLE) != SELFTEST_PARTS:
+        problems.append(f"SELFTEST_PARTS is {SELFTEST_PARTS}, SELFTEST_TABLE holds {len(SELFTEST_TABLE)} parts")
+    key_jobs = {"key " + "+".join(group) for group in KEY_JOBS}
+    graph_parts = {k for k, part in enumerate(SELFTEST_TABLE, 1) if key_jobs & set(part)}
+    if graph_parts != set(range(1, SELFTEST_GRAPH_PARTS + 1)):
+        problems.append(f"SELFTEST_GRAPH_PARTS is {SELFTEST_GRAPH_PARTS}, the parts that hold a key contract are {sorted(graph_parts)}")
+    if problems:
+        raise RecipeError("the self-test's parts do not hold each job once: " + "; ".join(problems))
+    label = "self-test"
+    if part is not None:
+        jobs = selftest_part_jobs(jobs, SELFTEST_TABLE, part)
+        label = f"self-test part {part}/{SELFTEST_PARTS}"
+    setup = 0.0
+    if any(needs for _, needs, _ in jobs):
+        t0 = time.monotonic()
+        get_side()
+        setup = time.monotonic() - t0
+    fails, times = _forked([(name, job) for name, _, job in jobs], serial, 1 if part is not None else 0)
     for f in fails:
         print(f"self-test FAIL: {f}", file=sys.stderr)
-    print("self-test: slowest sections: " + ", ".join(f"{n} {t:.0f} s" for n, t in sorted(times, key=lambda x: -x[1])[:3]))
-    print("self-test: key sections: " + ", ".join(f"{n} {t:.0f} s" for n, t in times if n.startswith("key")))
-    print(f"self-test: {'FAIL' if fails else 'ok'} ({len(gates)} gate recipes, {len(fails)} failures)")
+    if part is not None:
+        rows = sorted(times, key=lambda x: -x[1])
+        print(f"{label}: sections: " + ", ".join(f"{n} {t:.0f} s" for n, t in rows) + f"; setup {setup:.0f} s")
+    else:
+        print(f"{label}: slowest sections: " + ", ".join(f"{n} {t:.0f} s" for n, t in sorted(times, key=lambda x: -x[1])[:3]))
+        print(f"{label}: key sections: " + ", ".join(f"{n} {t:.0f} s" for n, t in times if n.startswith("key")))
+    gates = f"{len([n for n in held[0].recipes if n.startswith(GATE_PREFIX)])} gate recipes, " if held else ""
+    print(f"{label}: {'FAIL' if fails else 'ok'} ({len(jobs)} sections, {gates}{len(fails)} failures)")
     return 1 if fails else 0
 
 
@@ -16427,6 +16613,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--serial", action="store_true", help="with --self-test: run its sections one after another in this process (a debugger, a traceback in order)")
+    ap.add_argument("--part", type=int, metavar="K", help=f"with --self-test: only part K of {SELFTEST_PARTS}, its sections one after another (tools/check-recipes.sh runs each part as a job of its own)")
     sub = ap.add_subparsers(dest="cmd")
     c = sub.add_parser("check")
     c.add_argument("--justfile")
@@ -16459,6 +16646,8 @@ def build_parser() -> argparse.ArgumentParser:
     pcm.add_argument("head_log", metavar="HEAD_LOG")
     pcm.add_argument("--base-label", default="base")
     pcm.add_argument("--head-label", default="head")
+    sa = sub.add_parser("selftest-attrs", help="the self-test's parts and the tools/static-sched.py attribute of each on this host: K<TAB>attr (tools/check-recipes.sh --jobs)")
+    sa.add_argument("--slots", type=int, help="the scheduler's slot count (default: the cpu count, as static-sched.py takes it)")
     sb = sub.add_parser("ship-bins", help="the shipped bins and the release features: bin<TAB>features (tools/release/build.sh)")
     sb.add_argument("--rev", help="read build.sh at this commit; default the working tree")
     w = sub.add_parser("why", help="the gate-* recipes whose key holds each FILE and the edge that brought it in; --recipe R: R's shortest dependency chain to the file's crate, per cargo target")
@@ -16527,8 +16716,11 @@ def main(argv: list[str]) -> int:
     ap = build_parser()
     args = ap.parse_args(argv)
     try:
+        if args.part is not None and not args.self_test:
+            print("recipes.py: --part takes --self-test", file=sys.stderr)
+            return 64
         if args.self_test:
-            return self_test(args.serial)
+            return self_test(args.serial, args.part)
         if args.cmd == "check":
             return cmd_check(args)
         if args.cmd == "targets":
@@ -16573,6 +16765,8 @@ def main(argv: list[str]) -> int:
             return cmd_expand(args)
         if args.cmd == "rows":
             return cmd_rows(args)
+        if args.cmd == "selftest-attrs":
+            return cmd_selftest_attrs(args)
         if args.cmd == "release-list":
             return cmd_release_list(args)
         ap.print_help()
