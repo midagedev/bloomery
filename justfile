@@ -665,10 +665,14 @@ gate-gpu-musespark-load:
 # tier's, Tag::FileBound). Loads the whole model once, under the big-load
 # lock the V4.1 loads take. Predicted wall [derived: gate-gpu-minimaxm3-serve's fixture rows, 50 to 53 s]: about 1 min on the fixture; the real file
 # about 3 min (load 40 to 110 s, a 175-id prompt as steps at ~78 ms, the answer); the bound is 1800 s.
+# The A6000 by box.sh's pick (`BLOOMERY_CARD=a6000`): `stream_ring_is_planned` needs the ring's plan to fit, and at the real file's
+# context it takes 26,362,195,740 B, which the 3090's 25,073,352,704 B free cannot hold (the seat then plans without the ring, the unset
+# plan equals `off`, and the clause prints the seat's `xstream ring:` line saying so). Group solo-real, so the real tier keeps it alone
+# and the fixture tier fixes it to lane B, the A6000's.
 [group('solo-real')]
 [group('v41-load')]
 gate-gpu-musespark-serve:
-    BLOOMERY_MODEL=muse-spark ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_musespark_serve && D=target/musespark-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=1800 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_musespark_serve --dir $D'
+    BLOOMERY_MODEL=muse-spark BLOOMERY_CARD=a6000 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_musespark_serve && D=target/musespark-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=1800 bash tools/gpu-gate.sh gate_musespark_serve --dir $D'
 
 
 # Solar-Open2-250B end-to-end gate (gate_solar2_e2e's doc): the 36 KDA layers (beta = 2 sigmoid, softplus decay) and 12 NoPE gated GQA
@@ -2255,17 +2259,17 @@ gate-gpu-flint-router:
 gate-gpu-lfm3-kernels:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_lfm3_kernels && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_lfm3_kernels'
 
-# Full-file eager/captured, resident-slot and ring-retention consumer transitions. The complete Flint GGUF is BLOOMERY_MODEL
-# (tools/ref/needs-env.sh): a batch gives it as the item's `@BLOOMERY_MODEL=<path>`, else it defers the recipe by name.
+# Full-file eager/captured, resident-slot and ring-retention consumer transitions. The real file only: the complete Flint GGUF is the
+# flint profile's (tools/ref/models/flint.sh), which the test reads as BLOOMERY_MODEL, its name for a model path.
 gate-gpu-flint-lib:
-    ./tools/box.sh 'bash tools/ref/needs-env.sh gate-gpu-flint-lib BLOOMERY_MODEL && bash tools/gate.sh --gpu --oxide --release -p bloomery-gpu-flint --lib -- --include-ignored --exact tests::hw_full_file_capture_slots_reset_and_ring_boundary'
+    BLOOMERY_MODEL=flint ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-flint-lib && BLOOMERY_MODEL="$BLOOMERY_REF_MODEL" bash tools/gate.sh --gpu --oxide --release -p bloomery-gpu-flint --lib -- --include-ignored --exact tests::hw_full_file_capture_slots_reset_and_ring_boundary'
 
-# Real two-card top-six prompt/decode, union reference, capture and tier fault recovery. The complete Flint GGUF is
-# BLOOMERY_MODEL (tools/ref/needs-env.sh): a batch gives it as the item's `@BLOOMERY_MODEL=<path>`, else it defers the recipe by name.
+# Real two-card top-six prompt/decode, union reference, capture and tier fault recovery. The real file only: the complete Flint GGUF is
+# the flint profile's (tools/ref/models/flint.sh), which the test reads as BLOOMERY_MODEL, its name for a model path.
 [group('solo')]
 [group('v41-load')]
 gate-gpu-flint-twocard:
-    BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/needs-env.sh gate-gpu-flint-twocard BLOOMERY_MODEL && export BLOOMERY_GATE_V41_LOAD=1 && bash tools/gate.sh --gpu --oxide --release -p bloomery-gpu-flint --lib -- --include-ignored --exact two_card_tests::hw_two_card_full_file_union_capture_publication_fault_reset'
+    BLOOMERY_MODEL=flint BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-flint-twocard && export BLOOMERY_GATE_V41_LOAD=1 && BLOOMERY_MODEL="$BLOOMERY_REF_MODEL" bash tools/gate.sh --gpu --oxide --release -p bloomery-gpu-flint --lib -- --include-ignored --exact two_card_tests::hw_two_card_full_file_union_capture_publication_fault_reset'
 
 # Muse Spark's 256-expert top-8 sigmoid router (`sigmoid_256_8`). Model-free like the Flint one,
 # plus the bias clause: the selection follows the biased scores, the weights the unbiased ones.

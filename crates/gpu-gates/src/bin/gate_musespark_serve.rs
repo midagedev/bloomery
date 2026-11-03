@@ -63,7 +63,10 @@
 //!   clause reads the three plans equal. FAIL-first: a seat that does not plan its ring prints
 //!   the unset plan of the `off` plan's experts and the clause is red where host experts exist;
 //!   a seat that plans the ring under `admit` prints three plans of one kind and the pair is
-//!   red.
+//!   red. The ring needs room the card may lack (the real file at [`CTX`] on a 24 GB card): the
+//!   seat then plans without it and says so on stderr, and where the unset plan keeps no ring the
+//!   clause prints that `xstream ring:` line, so its red names the room that was missing. The
+//!   recipe runs this gate on the A6000, whose room holds the ring.
 //! - `xstream_line_follows_the_rule`: after the server of `load_and_listen` below has run, its
 //!   stderr carries one `xstream=` line, and the line is the rule's for the plan it loaded: `admit`
 //!   where the placement holds an expert tier card, `split` where the plan holds host experts on
@@ -390,7 +393,7 @@ mod gate {
         let sg = seat(c);
         let ctx = c.ctx.to_string();
         let args = ["--ctx", ctx.as_str(), "--place", "a"];
-        let (unset_status, unset, _) =
+        let (unset_status, unset, unset_err) =
             plan_under(&sg, dir, "plan-xstream", &file, &args, (None, None))?;
         let (off_status, off, _) = plan_under(
             &sg,
@@ -426,6 +429,23 @@ mod gate {
              the unset plan keeps the ring out ({} host experts) {ring}",
             if o_host == 0 { "no" } else { "the plan holds" }
         );
+        // Where host experts exist and the unset plan holds as many card experts as `off`, the plan
+        // kept no ring: the seat refused it on its stderr (`ringed`, shared/serve_seats/tiered.rs),
+        // naming the room it lacked.
+        if o_host > 0 && u_card >= o_card {
+            let refused: Vec<&str> = unset_err
+                .lines()
+                .filter(|l| l.starts_with("xstream ring:"))
+                .collect();
+            if refused.is_empty() {
+                println!(
+                    "the unset plan keeps no ring, and its stderr has no `xstream ring:` line"
+                );
+            }
+            for line in refused {
+                println!("the unset plan keeps no ring: {line}");
+            }
+        }
         check(&mut ok, "stream_ring_is_planned", exits && pair && ring);
         Ok(ok)
     }
