@@ -199,6 +199,19 @@ pub enum EngramError {
         rows: u64,
         row_bytes: u64,
     },
+    /// A table of two planes ([`rows::PlanarTable`]) whose rows are not MXFP8 blocks: values a
+    /// whole number of 32-value blocks with one scale byte each, both planes the same rows.
+    #[error(
+        "{name}: {value_rows} rows of {value_bytes} value B beside {scale_rows} rows of \
+         {scale_bytes} scale B are not MXFP8 rows of one scale byte a 32 values"
+    )]
+    PlanarRows {
+        name: String,
+        value_rows: u64,
+        value_bytes: u64,
+        scale_rows: u64,
+        scale_bytes: u64,
+    },
     #[error("{name}: data at {base}+{off} + {nbytes} B runs past the {len} B file {path}")]
     PastEndOfFile {
         name: String,
@@ -940,6 +953,12 @@ impl Engram {
     /// The row derivation, with this model's own constants.
     pub fn hash(&self) -> &Hash {
         &self.hash
+    }
+
+    /// The hash and the sites, for a reader that holds them apart.
+    #[must_use]
+    pub fn into_parts(self) -> (Hash, Vec<Site>) {
+        (self.hash, self.sites)
     }
 }
 

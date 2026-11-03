@@ -411,6 +411,23 @@ impl RunTable {
         }
     }
 
+    /// Row `id`'s bytes in its run's mapping; an id past the table is refused by name.
+    fn row(&self, id: u32) -> Result<&[u8], EngramError> {
+        let run = self.runs.partition_point(|r| r.2 <= u64::from(id));
+        if run == self.runs.len() {
+            return Err(EngramError::RowOutOfRange {
+                name: self.name.clone(),
+                id,
+                rows: self.rows(),
+            });
+        }
+        let first = run.checked_sub(1).map_or(0, |p| self.runs[p].2);
+        let rb = self.row_bytes as usize;
+        // Below the run's end, which `open` held inside u32.
+        let at = (u64::from(id) - first) as usize * rb;
+        Ok(&self.view(run).bytes[at..at + rb])
+    }
+
     /// `ids` cut into stretches that lie in one run, in order: each run, the stretch's ids as
     /// that run's own rows, and where the stretch starts in `ids`. An id past the table is
     /// refused by name.
@@ -501,9 +518,97 @@ impl RowTables for RunTable {
     }
 }
 
+/// A row-gathered MXFP8 table held where a checkpoint stores it, as two planes of its own (a
+/// DeepSeek V4.1 Engram table: F8_E4M3 values `[rows, k]` and F8_E8M0 scales `[rows, k/32]`),
+/// each read as a [`RunTable`] under the same advice. A row copies out as the
+/// `GgmlType::MXFP8` blocks of its values, each block its scale byte and then its 32 value
+/// bytes, every byte as stored; the rows keep the checkpoint's row ids.
+pub struct PlanarTable {
+    values: RunTable,
+    scales: RunTable,
+}
+
+impl PlanarTable {
+    /// The table `name` of `value_bytes`-byte value rows held as `values` beside its
+    /// `scale_bytes`-byte scale rows held as `scales`, both in row order ([`RunTable::open`]).
+    /// Values that are not whole 32-value blocks of one scale byte each, and planes of other row
+    /// counts, are refused by name.
+    pub fn open(
+        name: &str,
+        values: &[(PathBuf, Range<u64>)],
+        scales: &[(PathBuf, Range<u64>)],
+        value_bytes: u64,
+        scale_bytes: u64,
+        advice: PageAdvice,
+    ) -> Result<PlanarTable, EngramError> {
+        let values = RunTable::open(name, value_bytes, values, advice)?;
+        let scales = RunTable::open(name, scale_bytes, scales, advice)?;
+        if value_bytes != scale_bytes * 32 || values.rows() != scales.rows() {
+            return Err(EngramError::PlanarRows {
+                name: name.to_owned(),
+                value_rows: values.rows(),
+                value_bytes,
+                scale_rows: scales.rows(),
+                scale_bytes,
+            });
+        }
+        Ok(PlanarTable { values, scales })
+    }
+}
+
+impl RowTable for PlanarTable {
+    fn row_bytes(&self) -> u64 {
+        self.values.row_bytes + self.scales.row_bytes
+    }
+
+    fn prefetch(&self, ids: &[u32]) -> Result<(), EngramError> {
+        self.values.prefetch(ids)?;
+        self.scales.prefetch(ids)
+    }
+
+    fn populate(&self, ids: &[u32]) -> Result<(), EngramError> {
+        self.values.populate(ids)?;
+        self.scales.populate(ids)
+    }
+
+    /// The rows whose values are resident: the scale plane is 1/32 of the bytes.
+    fn resident_rows(&self, ids: &[u32]) -> Result<u64, EngramError> {
+        self.values.resident_rows(ids)
+    }
+
+    fn copy_rows(&self, ids: &[u32], out: &mut [u8]) -> Result<(), EngramError> {
+        let (vb, sb) = (
+            self.values.row_bytes as usize,
+            self.scales.row_bytes as usize,
+        );
+        if out.len() != ids.len() * (vb + sb) {
+            return Err(EngramError::OutBufferSize {
+                name: self.values.name.clone(),
+                rows: ids.len(),
+                want: ids.len() * (vb + sb),
+                got: out.len(),
+            });
+        }
+        for (&id, row) in ids.iter().zip(out.chunks_exact_mut(vb + sb)) {
+            let (values, scales) = (self.values.row(id)?, self.scales.row(id)?);
+            for ((block, v), &s) in row
+                .as_chunks_mut::<33>()
+                .0
+                .iter_mut()
+                .zip(values.as_chunks::<32>().0)
+                .zip(scales)
+            {
+                block[0] = s;
+                block[1..].copy_from_slice(v);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PageAdvice, RunTable};
+    use super::{PageAdvice, PlanarTable, RunTable};
     use crate::{EngramError, RowTable};
 
     /// Rows read across runs in two files come back in the ids' order, each run's own; an id
@@ -549,6 +654,54 @@ mod tests {
         assert!(matches!(past, Err(EngramError::PastEndOfFile { .. })));
         let torn = RunTable::open("t", 4, &[(a, 3..9)], PageAdvice::Random);
         assert!(matches!(torn, Err(EngramError::Untiled { .. })));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A planar table's row is its values' 33-byte MXFP8 blocks, each its scale byte then its
+    /// 32 value bytes as stored, rows read across runs by their checkpoint ids; planes of other
+    /// row counts or of other block widths are refused by name.
+    #[test]
+    fn a_planar_table_copies_rows_as_mxfp8_blocks() {
+        let dir = std::env::temp_dir().join(format!("engram-planar-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (v, s) = (dir.join("values"), dir.join("scales"));
+        // Five rows of 64 values (two blocks) after 7 bytes of something else, and their
+        // scales split over two runs.
+        let value = |row: usize, i: usize| (row * 64 + i) as u8;
+        let mut fv = vec![0xEEu8; 7];
+        fv.extend((0..5).flat_map(|r| (0..64).map(move |i| value(r, i))));
+        let fs: Vec<u8> = (0..10).map(|i| 200 + i as u8).collect();
+        std::fs::write(&v, &fv).unwrap();
+        std::fs::write(&s, &fs).unwrap();
+        let values = [(v, 7..7 + 5 * 64)];
+        let scales = [(s.clone(), 0..4), (s, 4..10)];
+        let t = PlanarTable::open("e", &values, &scales, 64, 2, PageAdvice::Random).unwrap();
+        assert_eq!(t.row_bytes(), 66);
+        let ids = [4, 0, 2];
+        let mut out = vec![0u8; ids.len() * 66];
+        t.copy_rows(&ids, &mut out).unwrap();
+        let want: Vec<u8> = ids
+            .iter()
+            .flat_map(|&r| {
+                let r = r as usize;
+                (0..2).flat_map(move |b| {
+                    std::iter::once(200 + (r * 2 + b) as u8)
+                        .chain((0..32).map(move |i| value(r, b * 32 + i)))
+                })
+            })
+            .collect();
+        assert_eq!(out, want);
+        let short = PlanarTable::open("e", &values, &scales[..1], 64, 2, PageAdvice::Random);
+        assert!(matches!(
+            short,
+            Err(EngramError::PlanarRows {
+                value_rows: 5,
+                scale_rows: 2,
+                ..
+            })
+        ));
+        let wide = PlanarTable::open("e", &values, &scales, 64, 1, PageAdvice::Random);
+        assert!(matches!(wide, Err(EngramError::PlanarRows { .. })));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -279,7 +279,7 @@ required-features = ["deepseek41"]
 
 [[bin]]
 name = "gate_deepseek41_tp"
-required-features = ["deepseek41"]
+required-features = ["deepseek41", "checkpoint"]
 
 [[bin]]
 name = "gate_ds41_serve"

@@ -451,6 +451,7 @@ pub(super) fn helper_rows(split: &Split) -> Result<bool, GateError> {
                 stats: helper,
             },
             cols,
+            None,
         )
     };
     let mut helper = open(true, all.clone())?;
