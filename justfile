@@ -2734,7 +2734,7 @@ gate-gpu-lib:
 # The lib runs with the `hf` feature, which adds the model file's fetch (model_file::fetch) and its tests.
 [group('canary')]
 gate-gpu-gates-lib:
-    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-gpu-gates --features hf --lib && bash tools/gate.sh --release -p bloomery-gpu-gates --bin probe_nvread'
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-gpu-gates --features hf --lib && bash tools/gate.sh --release -p bloomery-gpu-gates --bin probe_nvread && bash tools/gate.sh --release -p bloomery-gpu-gates --bin oxart_ptxas -- --include-ignored'
 
 # V4.1 오라클 세트 ref_deepseek41의 모든 행과 디코드 스텝 세트의 헤더를 하니스가 읽는지 본다. 호스트 전용이라 카드도
 # 게이트 락도 쓰지 않는다. 시험 둘의 출력이 섞이지 않게 한 스레드로 돈다.
