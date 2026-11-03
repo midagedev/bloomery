@@ -41,8 +41,8 @@ mod gate {
     use bloomery_gpu_gates::GateError;
     use bloomery_gpu_gates::logits_band::{self, Positions};
     use bloomery_levers::{CARD_BUDGET, ENGRAM_HELPER};
-    use model_hf::folder::{self, Opened};
     use model::arch::deepseek41::hparams::Hparams;
+    use model_hf::folder::{self, Opened};
 
     /// The greedy steps each run takes.
     const STEPS: usize = 24;
