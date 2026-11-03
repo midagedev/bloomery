@@ -1082,10 +1082,15 @@ mod tests {
         copied.extend(t.take());
         assert_eq!(copied, [Ev::Retain(Ar::Ubatch, 0, 9)]);
         let mut out = [0u32; 3];
-        d.propose(&mut t, first, &mut out).unwrap();
+        let n = d.propose(&mut t, first, &mut out).unwrap();
         assert!(d.keeps_windows());
+        assert!(d.windows.as_ref().unwrap().pending.is_some());
         d.unpark(&parked);
+        assert!(d.windows.as_ref().unwrap().pending.is_none());
+        d.proposed(&out[..n]);
+        assert!(d.windows.as_ref().unwrap().pending.is_some());
         d.restart();
+        assert!(d.windows.as_ref().unwrap().pending.is_none());
         assert!(d.take_windows().is_empty());
     }
 
