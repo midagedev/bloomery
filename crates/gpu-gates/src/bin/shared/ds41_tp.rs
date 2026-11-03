@@ -285,7 +285,7 @@ pub fn run(args: &[String], levers: &Levers) -> Result<(), GateError> {
         source: source_digest(&files),
         headers: headers_digest(&header, &u),
         form: FORM,
-        build: env!("CARGO_PKG_VERSION").to_string(),
+        build: bloomery_gpu_gates::rank_build()?,
         n: u16::try_from(ranks)?,
         rank: u16::try_from(o.rank)?,
     };
