@@ -89,22 +89,15 @@ impl From<Refused> for SessionError {
 
 /// A refresh's rows as a walk's feed: the card crate's [`Feed`] names the
 /// call's span rows, which the runtime's values do not know.
-trait RefreshFeed<A> {
-    /// The refresh's feed.
-    fn feed(&self) -> Feed<'_, A>;
-}
-
-impl<A: Copy> RefreshFeed<A> for Refresh<A> {
-    fn feed(&self) -> Feed<'_, A> {
-        Feed {
-            tokens: &self.tokens,
-            pos0: self.pos0,
-            hidden: Hidden::Target {
-                walk: self.walk,
-                first: self.first,
-            },
-            media: None,
-        }
+fn refresh_feed<A: Copy>(r: &Refresh<A>) -> Feed<'_, A> {
+    Feed {
+        tokens: &r.tokens,
+        pos0: r.pos0,
+        hidden: Hidden::Target {
+            walk: r.walk,
+            first: r.first,
+        },
+        media: None,
     }
 }
 
@@ -533,13 +526,12 @@ impl<B: MtpBody> Host for Session<B> {
     }
 
     fn walk(&mut self, w: &Walk<'_, B::Arena>, head: DraftHead) -> Result<(), GpuError> {
-        let feed = Feed {
-            tokens: w.tokens,
-            pos0: w.pos0,
-            hidden: w.hidden,
+        Card {
+            m: self.model_mut(),
+            head,
             media: None,
-        };
-        B::walk(self.model_mut(), feed, head, w.mode)
+        }
+        .walk(w)
     }
 
     fn chain(
@@ -551,7 +543,7 @@ impl<B: MtpBody> Host for Session<B> {
     ) -> Result<usize, GpuError> {
         B::chain(
             self.model_mut(),
-            c.refresh.feed(),
+            refresh_feed(&c.refresh),
             c.own,
             head,
             c.mode,
@@ -672,8 +664,10 @@ where
             return Ok(());
         };
         let walks = std::mem::take(&mut self.walks);
-        let feeds: Vec<(usize, Feed<'_, B::Arena>)> =
-            walks.iter().map(|(slot, r)| (*slot, r.feed())).collect();
+        let feeds: Vec<(usize, Feed<'_, B::Arena>)> = walks
+            .iter()
+            .map(|(slot, r)| (*slot, refresh_feed(r)))
+            .collect();
         let mut start = 0;
         let mut rows = 0;
         for (i, (_, f)) in feeds.iter().enumerate() {
@@ -968,7 +962,7 @@ where
     }
     let feeds: Vec<_> = batch
         .iter()
-        .map(|(i, c)| (windows[*i].slot, c.refresh.feed(), c.own))
+        .map(|(i, c)| (windows[*i].slot, refresh_feed(&c.refresh), c.own))
         .collect();
     let drafts = t.model_mut().draft_chain_slots(&feeds, head, mode)?;
     let lens = batch
