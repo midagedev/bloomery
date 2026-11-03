@@ -2663,7 +2663,7 @@ mod gate {
         let rotated = stores[0].0 != stores[1].0;
         let (mut session, mut spec) = drafted_session(m, step_cfg(Prompt38::Gemm), ctx)?;
         spec.prompt(&mut session, &PREFIX)?;
-        let first = spec.draft_mut().prompt_media(&mut session, &ids, &spans)?;
+        let first = app::mtp::prompt_media(spec.draft_mut(), &mut session, &ids, &spans)?;
         let got = store_of(session.model(), held)?;
         let same = same_rows(&got, &stores[1], held);
         let store_ok = same.iter().all(|&same| same);
@@ -4364,7 +4364,7 @@ mod gate {
         let mut m = m;
         m.reset()?;
         let mut s = app::Session::from_model(m, ctx);
-        let draft = app::mtp::MtpDraft::open(s.model(), cfg.prompt, cfg.draft)?;
+        let draft = app::mtp::open_draft(s.model(), cfg.prompt, cfg.draft)?;
         let spec = s.with_draft::<app::mtp::MtpDraft<Body38>, 4>(draft, &mut Quiet)?;
         Ok((s, spec))
     }
@@ -5173,7 +5173,7 @@ mod gate {
         let mut m = m;
         m.reset()?;
         let mut s = app::Session::from_model(m, ctx);
-        let mut draft = app::mtp::MtpDraft::open(
+        let mut draft = app::mtp::open_draft(
             s.model(),
             Prompt38::Auto,
             bloomery_gpu::model::StepMode::Graph,
@@ -5768,7 +5768,7 @@ mod gate {
         m.set_mode(bloomery_gpu::model::StepMode::Graph);
         let mut s = app::Session::from_model(m, ctx);
         let mut spec = s.with_draft::<app::mtp::MtpDraft<Body38>, 4>(
-            app::mtp::MtpDraft::open(
+            app::mtp::open_draft(
                 s.model(),
                 Prompt38::Auto,
                 bloomery_gpu::model::StepMode::Graph,
@@ -6296,7 +6296,7 @@ mod gate {
 
     /// A fresh draft of the drafted session's, keeping its windows.
     fn fresh_draft(s: &app::Session<Body38>) -> Result<app::mtp::MtpDraft<Body38>, GateError> {
-        let mut d = app::mtp::MtpDraft::open(
+        let mut d = app::mtp::open_draft(
             s.model(),
             Prompt38::Auto,
             bloomery_gpu::model::StepMode::Graph,
@@ -6741,7 +6741,7 @@ mod gate {
         let mut runs = Vec::new();
         for immediate in [true, false] {
             let mut drafts = [
-                app::mtp::MtpDraft::open(
+                app::mtp::open_draft(
                     s.model(),
                     Prompt38::Gemm,
                     bloomery_gpu::model::StepMode::Graph,

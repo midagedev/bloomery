@@ -9,9 +9,9 @@
 //! The walks themselves are the executor's ([`Exec`]): a call issues them one
 //! at a time, in the order the window runs them, and the state the call
 //! mutates between two walks is the state the executor sees when the second
-//! one fails. The card's executor is `MtpDraft`'s, in `bloomery_app`; the unit
-//! tests below run the same calls against a model of the body's arena and
-//! store records, with no card.
+//! one fails. A host's executor is what [`super::MtpDraft`] makes of its
+//! [`super::Host`]; the unit tests below run the same calls against a model of
+//! the body's arena and store records, with no card.
 
 use std::fmt;
 
@@ -53,6 +53,20 @@ impl fmt::Display for Refused {
 pub enum Fail<E> {
     Refused(Refused),
     Exec(E),
+}
+
+impl<E> Fail<E> {
+    /// The failure as the caller's own error: the executor's error and the
+    /// window's refusal both convert into it.
+    pub fn lift<T: From<Refused>>(self) -> T
+    where
+        E: Into<T>,
+    {
+        match self {
+            Fail::Refused(r) => r.into(),
+            Fail::Exec(e) => e.into(),
+        }
+    }
 }
 
 /// One walk of the draft with no readback, as the window decides it: `tokens`
@@ -373,7 +387,7 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
     /// on. The unit's first row was walked by the unit before (or is position
     /// 0's zero-hidden row, or the join's last row), save the last unit's last
     /// row — the next window's anchor, [`Policy::begin`]'s.
-    pub fn unit<X: Exec<A>>(
+    pub fn unit<X: Exec<A> + ?Sized>(
         &mut self,
         call: &mut Call<'_>,
         x: &mut X,
@@ -407,7 +421,7 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
     /// One run of the warmup: `tokens` at `pos0`, their hidden rows the arena
     /// `walk`'s from its row 0 on, walked through the store's append alone
     /// ([`WalkMode::Store`]) in runs of at most the body's store rows.
-    fn warm<X: Exec<A>>(
+    fn warm<X: Exec<A> + ?Sized>(
         &self,
         x: &mut X,
         walk: A,

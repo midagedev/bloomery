@@ -440,7 +440,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use app::mtp::{MtpBody, MtpDraft};
+use app::mtp::MtpBody;
 use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
 use bloomery_gpu::arch::qwen3moe::{
     Body38, CHECKPOINT_EVERY, Folder38, Model38, Prompt38, Seq38, TargetRows, checkpoint_budget38,
@@ -2874,7 +2874,7 @@ impl Q38 {
         }
         let drafts = match (a.mtp, a.lookup) {
             (true, _) => SlotDrafts::open(&mut s, a.slots, a.width, &mut Captures, |m| {
-                MtpDraft::open(m, Prompt38::Auto, StepMode::Graph)
+                app::mtp::open_draft(m, Prompt38::Auto, StepMode::Graph)
             })?,
             (false, true) => {
                 let drafts = SlotDrafts::lookup(&mut s, a.slots, a.width, &mut Captures)?;

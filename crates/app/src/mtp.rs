@@ -1,80 +1,31 @@
-//! The shared MTP window: [`MtpDraft<B>`], the runtime rule's `Draft` over
-//! a model's MTP layer, and the [`MtpBody`] adapter it drives that layer
-//! through, over the body a [`Session<B>`] wraps, with the
-//! model-independent types its calls take. Qwen3.8's adapter is
-//! `arch::qwen3moe`'s, over `Body38`.
+//! The shared MTP window on the card: [`MtpDraft`], the runtime's
+//! `runtime::mtp::MtpDraft` over a [`Session<B>`], and the [`MtpBody`] adapter
+//! the session's [`Host`] impl drives a body's draft layer through, over the
+//! body a [`Session<B>`] wraps, with the model-independent types its calls
+//! take. Qwen3.8's adapter is `arch::qwen3moe`'s, over `Body38`.
 //!
-//! An MTP layer's row at position `q` reads the token at `q` and the
-//! target's final hidden row at `q − 1`, and predicts the token at `q + 1`.
-//! The window drives it under the runtime's rule ([`runtime::Speculative`]
-//! over a [`runtime::Draft`] on the session): a proposal of up to
-//! [`MtpBody::WIDTH`] ids, one verify of up to [`MtpBody::VERIFY_ROWS`] rows,
-//! and the commit of the rows the target agrees with. Between those:
+//! The window — the proposal, the verify, the refresh, the prompt call's
+//! walks, the skips and the joins — is `runtime::mtp`'s (its module doc); the
+//! runtime's rule drives it as [`runtime::Speculative`] over a
+//! [`runtime::Draft`] on the session: a proposal of up to [`MtpBody::WIDTH`]
+//! ids, one verify of up to [`MtpBody::VERIFY_ROWS`] rows, and the commit of
+//! the rows the target agrees with. What only the card has lives here:
 //!
-//! - the prompt call ([`MtpDraft`'s `prompt`](Draft::prompt)) walks the
-//!   draft over the prompt as its units complete — a unit's arena holds its
-//!   rows' hidden rows until the next unit overwrites them — through the
-//!   store's append alone ([`WalkMode::Store`]), filling the draft's store
-//!   from position 0 (the row at 0 reads a zero hidden row: the target holds
-//!   nothing before it) and leaving the last unit's last row for
-//!   [`MtpDraft`'s `begin`](Draft::begin), whose walk is the next window's
-//!   anchor. A prompt that holds an image ([`MtpDraft::prompt_media`]) walks
-//!   the same way over the target's media call, a span's positions walked
-//!   like any other but for the embedding: the row the target consumed
-//!   there, the span's own, in place of the image token's ([`Feed::media`]);
-//! - each window's [`MtpDraft`'s `propose`](Draft::propose) runs one chain
-//!   ([`MtpBody::chain`], one readback): the refresh — the rows the target
-//!   kept, at the positions after the verify's first, each with the hidden
-//!   row the verify's row before it wrote, the last row the target's own
-//!   next token (the anchor, whose prediction is the first proposal) — then
-//!   own walks, each reading the walk before it on the card;
-//! - [`MtpDraft`'s `accept`](Draft::accept) records the refresh before the
-//!   commit takes the rejected rows back, the verify's arena
-//!   ([`MtpBody::VERIFY_ARENA`]) still holding every row's hidden row.
-//!
-//! A prompt call that continues a held sequence (a request that extends the
-//! one before it) first walks the rows the last call left waiting — the
-//! refresh a window or a step recorded, or a prompt call's anchor — their
-//! last row the call's first id, while their arena still holds their hidden
-//! rows; a first step that feeds the next id does the same before the step
-//! overwrites the step's arena ([`MtpDraft::before_step`]), and so does the
-//! width chooser before each pass it holds back ([`Draft::before_plain`]).
-//! Those walks run through the store's append alone ([`WalkMode::Store`]):
-//! no head reads them, the next chain walking its own refresh.
-//! When no such rows
-//! wait, or the store does not hold the positions below them, the draft
-//! skips: it proposes nothing, every pass a plain step, until a prompt call
-//! from position 0, a restart or a rejoin ([`MtpDraft::rejoin`]); the call's
-//! [`Join`] names why.
-//!
-//! Every decision of those calls — which rows wait, which walks a call runs
-//! and in which mode, the join checks, the refusals, what a park keeps — is
-//! the window's policy ([`Policy`]), over positions, the context, token
-//! ids and arena kinds alone; [`MtpDraft`] runs its walks on the card, and the
-//! policy's unit tests run the same calls against a model of the body's
-//! records with no card.
-//!
-//! A server that switches the target between sequences parks the draft's
-//! waiting rows with the sequence's state ([`MtpDraft::park`]) and puts them
-//! back with it ([`MtpDraft::unpark`]): the returning sequence's next call
-//! joins it as the call after no switch would.
-//!
-//! The proposal changes which passes run, never a token: every kept token is
-//! the target's own argmax, or the request's draw from that target row.
-//! The hidden rows never leave the card: a walk
-//! names them by the arena a target call left them in and the row they
-//! start at ([`Hidden::Target`]). [`runtime::Tapped`] on the session is the
-//! host's readback of the same rows, for the gates; the window does not read
-//! it.
+//! - the adapter ([`MtpBody`]) and the session's [`Host`] impl over it, the
+//!   executor of a call's walks ([`Card`]) among them;
+//! - a prompt that holds an image ([`prompt_media`]) walks the draft the same
+//!   way over the target's media call, a span's positions walked like any
+//!   other but for the embedding: the row the target consumed there, the
+//!   span's own, in place of the image token's ([`Feed::media`]);
+//! - a pass of several slots' windows ([`pass_slots`], [`SlotWalks`]), which
+//!   walks several resident sequences' rows at once ([`SlotDraft`]);
+//! - a parked draft's byte form ([`ParkedBytes`]).
 //!
 //! A partial accept is the body's own: the window calls
 //! [`runtime::Verify::commit`] with the rows kept and nothing else, and the
 //! session's commit takes the rest back through the body's
 //! [`Rollback::rollback_on`], which settles whatever recurrent state the body
-//! holds for the rows it drops. No rewind lives in the window, and no call
-//! here moves the target's position: the draft's walks write only the
-//! draft's store and arena, and the target's position moves by the rule's
-//! verify and commit alone.
+//! holds for the rows it drops.
 
 use std::fmt;
 
@@ -82,8 +33,8 @@ use bloomery_gpu::checkpoint::bytes;
 use bloomery_gpu::media::{CallRows, MediaBody};
 use bloomery_gpu::model::{Rollback, Rows, SlotRows, Slots, StepMode};
 use bloomery_gpu::{GpuError, GpuModel};
+use runtime::Target;
 use runtime::prompt::CallEnd;
-use runtime::{Draft, TapNeed, Target};
 
 use crate::{Draw, Keep, Prompt, RoundWindow, Session, SessionError};
 
@@ -93,8 +44,32 @@ use crate::{Draw, Keep, Prompt, RoundWindow, Session, SessionError};
 /// runtime's (`runtime::mtp`), which holds no card.
 pub use bloomery_gpu::draft::{DraftHead, Feed};
 use bloomery_gpu::draft::{Proposal, SlotDraft};
-use runtime::mtp::{Chain, Exec, Fail, Policy, Refresh, Refused, SKIPS, Shape, WHAT, Walk};
-pub use runtime::mtp::{Hidden, Join, Parked, WalkMode};
+use runtime::mtp::{Chain, Exec, Host, HostSink, Refresh, Refused, SKIPS, Unit, WHAT, Walk};
+pub use runtime::mtp::{Hidden, Join, Parked, WalkMode, WindowDraft};
+
+/// The MTP draft over a session: `runtime::mtp::MtpDraft` with the session as
+/// its [`Host`] ([`open_draft`] opens it). A caller drives it as
+/// `Speculative<MtpDraft<B>, M>` with `M` = [`MtpBody::VERIFY_ROWS`], which
+/// [`Session::with_draft`] holds to the draft's width.
+pub type MtpDraft<B> = runtime::mtp::MtpDraft<Session<B>>;
+
+/// The draft over the model `m` loaded beside its target: the head the load
+/// opened (a row list or the full vocabulary), the prompt fed by `path`, the
+/// chains run in `mode`. Load-time only.
+pub fn open_draft<B: MtpBody>(
+    m: &GpuModel<B>,
+    path: B::Path,
+    mode: StepMode,
+) -> Result<MtpDraft<B>, SessionError> {
+    let head = B::head(m)?;
+    let hidden_width = B::hidden_width(m)?;
+    Ok(runtime::mtp::MtpDraft::new(
+        path,
+        head,
+        WalkMode::from(mode),
+        hidden_width,
+    ))
+}
 
 /// A width chooser's refusal is the session's: the window's own refusal,
 /// by name.
@@ -129,17 +104,6 @@ impl<A: Copy> RefreshFeed<A> for Refresh<A> {
                 first: self.first,
             },
             media: None,
-        }
-    }
-}
-
-/// A call that ran walks ends as the walk's error, or as the window's
-/// refusal.
-impl From<Fail<GpuError>> for SessionError {
-    fn from(e: Fail<GpuError>) -> SessionError {
-        match e {
-            Fail::Refused(r) => r.into(),
-            Fail::Exec(e) => e.into(),
         }
     }
 }
@@ -390,28 +354,6 @@ pub fn write_proposal(
     Ok(n)
 }
 
-/// One drafted window as the draft saw it ([`MtpDraft::keep_windows`]): the
-/// target's position before its verify, the proposal's ids and each one's
-/// probability among the head's rows, how many of those ids the pass
-/// verified (the width chooser's cut; the proposal's whole length when
-/// nothing cut it) and how many of them the target kept.
-#[derive(Clone, Debug, PartialEq)]
-pub struct WindowDraft {
-    pub pos: u32,
-    pub ids: Vec<u32>,
-    pub p: Vec<f32>,
-    /// The ids the pass verified, at most the proposal's length.
-    pub width: usize,
-    pub accepted: usize,
-}
-
-/// What [`MtpDraft::keep_windows`] keeps: the last proposal until its
-/// accept, and every window since the last take.
-struct Windows {
-    pending: Option<(Vec<u32>, Vec<f32>)>,
-    kept: Vec<WindowDraft>,
-}
-
 /// What a draft holds of the target's sequence between two calls, kept
 /// apart while another sequence runs ([`MtpDraft::park`]) and put back with
 /// it ([`MtpDraft::unpark`]): the rows waiting for its next walk, or why it
@@ -568,27 +510,101 @@ impl<A: Copy> ParkedBytes for Parked<A> {
     }
 }
 
-/// The MTP draft over a body's loaded draft layer (the module doc): the host
-/// policy of the windows ([`Policy`]: which rows wait, which walks run, the
-/// refresh the next chain opens with) and its executor on the card — which
-/// head the load opened, how the prompt is fed, the walks themselves. A
-/// caller drives it as `Speculative<MtpDraft<B>, M>` with `M` =
-/// [`MtpBody::VERIFY_ROWS`], which [`Session::with_draft`] holds to the
-/// draft's width.
-pub struct MtpDraft<B: MtpBody> {
-    /// The prompt path.
-    path: B::Path,
+/// The session as the window's host: each call is one call into the body's
+/// own API ([`MtpBody`]), the walks of a text call with no span rows.
+impl<B: MtpBody> Host for Session<B> {
+    const WIDTH: usize = B::WIDTH;
+    const WALK_ROWS: usize = B::WALK_ROWS;
+    const STORE_ROWS: usize = B::STORE_ROWS;
+    const PROBS: bool = B::PROBS;
+    /// The body's own check, which also holds [`MtpBody::VERIFY_ROWS`] to the
+    /// proposal's width.
+    const FITS: () = B::FITS;
+
+    type Arena = B::Arena;
+    const STEP_ARENA: B::Arena = B::STEP_ARENA;
+    const VERIFY_ARENA: B::Arena = B::VERIFY_ARENA;
+    type Path = B::Path;
+    type Head = DraftHead;
+    type Cause = GpuError;
+
+    fn held(&self) -> Result<usize, GpuError> {
+        B::held(self.model())
+    }
+
+    fn walk(&mut self, w: &Walk<'_, B::Arena>, head: DraftHead) -> Result<(), GpuError> {
+        let feed = Feed {
+            tokens: w.tokens,
+            pos0: w.pos0,
+            hidden: w.hidden,
+            media: None,
+        };
+        B::walk(self.model_mut(), feed, head, w.mode)
+    }
+
+    fn chain(
+        &mut self,
+        c: &Chain<B::Arena>,
+        head: DraftHead,
+        out: &mut [u32],
+        p: Option<&mut [f32]>,
+    ) -> Result<usize, GpuError> {
+        B::chain(
+            self.model_mut(),
+            c.refresh.feed(),
+            c.own,
+            head,
+            c.mode,
+            out,
+            p,
+        )
+    }
+
+    fn prompt_with(
+        &mut self,
+        ids: &[u32],
+        path: B::Path,
+        end: CallEnd,
+        head: DraftHead,
+        sink: Option<&mut HostSink<'_, Self>>,
+    ) -> Result<Option<u32>, GpuError> {
+        let m = self.model_mut();
+        match sink {
+            None => B::prompt_with(m, ids, path, end, None),
+            Some(sink) => {
+                let mut unit = unit_sink::<B>(sink, head, None);
+                B::prompt_with(m, ids, path, end, Some(&mut unit))
+            }
+        }
+    }
+
+    fn retain_prompt_row(
+        &mut self,
+        walk: B::Arena,
+        first: usize,
+        pos: u32,
+    ) -> Result<(), GpuError> {
+        B::retain_prompt_row(self.model_mut(), walk, first, pos)
+    }
+
+    /// The engine watchdog's mark of a prompt call, held from the draft's join
+    /// through the call's last unit: the join's walk waits on the card for
+    /// the copy its inputs ride on.
+    fn prompt_scope<R>(&mut self, call: impl FnOnce(&mut Self) -> R) -> R {
+        let _busy = self.model().prompt_busy();
+        call(self)
+    }
+}
+
+/// A prompt call's sink ([`Unit`]) as the body's unit sink
+/// ([`MtpBody::prompt_with`]): each unit's walks run on a [`Card`] over the
+/// unit's model, `media` the call's span rows (`None` on a text call).
+fn unit_sink<'s, B: MtpBody>(
+    sink: &'s mut Unit<'_, B::Arena, GpuError>,
     head: DraftHead,
-    /// What the window knows between two calls, and every decision a call
-    /// makes of it.
-    policy: Policy<B::Arena>,
-    /// The windows kept under [`MtpDraft::keep_windows`]; `None`, nothing
-    /// is kept.
-    windows: Option<Windows>,
-    /// The last chain's probabilities, when it read them: a body whose
-    /// readback holds them ([`MtpBody::PROBS`]) behind the width chooser,
-    /// or the kept windows.
-    p: Vec<f32>,
+    media: Option<&'s CallRows<'s>>,
+) -> impl FnMut(&mut GpuModel<B>, B::Arena, u32, usize) -> Result<(), GpuError> + 's {
+    move |m, walk, first, rows| sink(&mut Card { m, head, media }, walk, first, rows)
 }
 
 /// The card's side of a call's walks ([`Exec`]): the model, the head the load
@@ -619,7 +635,7 @@ impl<B: MtpBody> Exec<B::Arena> for Card<'_, B> {
 }
 
 /// The waiting step and verify rows of several slots' drafts, gathered
-/// before a round's target call ([`MtpDraft::gather`]) and walked together
+/// before a round's target call ([`SlotWalks::gather`]) and walked together
 /// ([`SlotWalks::run`]): one store walk of every slot's rows
 /// ([`GpuModel::draft_store_slots`]) in place of one walk a slot. Rows
 /// gathered and never run are lost to their drafts, whose next call then
@@ -671,7 +687,7 @@ where
     }
 }
 
-/// The card's side of a gathered call ([`MtpDraft::gather`]): the positions
+/// The card's side of a gathered call ([`SlotWalks::gather`]): the positions
 /// the selected slot's draft store holds read from the model. Walks of its
 /// step and verify rows wait for [`SlotWalks::run`]; shared arenas are read
 /// before the selected slot changes.
@@ -721,239 +737,34 @@ impl<B: MtpBody> Exec<B::Arena> for Gather<'_, B> {
     }
 }
 
-impl<B: MtpBody> MtpDraft<B> {
-    /// Preserve the prompt's waiting row before another resident sequence
-    /// can overwrite its shared arena. The target is never run again.
-    pub fn retain_prompt(&mut self, t: &mut Session<B>) -> Result<(), SessionError> {
-        let pos = t.pos();
-        Ok(self.policy.retain_prompt(pos, |walk, first, pos| {
-            B::retain_prompt_row(t.model_mut(), walk, first, pos)
-        })?)
-    }
-
-    /// [`Draft::prompt`] ending as `end` asks: the draft walked over the
-    /// call's units as they complete whatever its end, the argmax after the
-    /// last when the call runs the head.
-    pub fn prompt_call(
-        &mut self,
-        t: &mut Session<B>,
-        ids: &[u32],
-        end: CallEnd,
-    ) -> Result<Option<u32>, SessionError> {
-        let path = self.path;
-        Ok(self.prompt_joined(t.model_mut(), ids, None, |m, sink| {
-            B::prompt_with(m, ids, path, end, sink)
-        })?)
-    }
-    /// The draft over the model `m` loaded beside its target: the head the
-    /// load opened (a row list or the full vocabulary), the prompt fed by
-    /// `path`, the chains run in `mode`. Load-time only.
-    pub fn open(m: &GpuModel<B>, path: B::Path, mode: StepMode) -> Result<Self, SessionError> {
-        let () = B::FITS;
-        let head = B::head(m)?;
-        let hidden_width = B::hidden_width(m)?;
-        Ok(MtpDraft {
-            path,
-            head,
-            policy: Policy::new(Shape {
-                step: B::STEP_ARENA,
-                verify: B::VERIFY_ARENA,
-                mode: WalkMode::from(mode),
-                width: B::WIDTH,
-                store_rows: B::STORE_ROWS,
-                hidden_width,
-            }),
-            windows: None,
-            p: vec![0.0; B::WIDTH],
-        })
-    }
-
-    /// Keep every drafted window from here on ([`WindowDraft`]): the chain
-    /// hands back each id's probability, which its one readback already
-    /// holds. Load-time only.
-    pub fn keep_windows(&mut self) {
-        self.windows = Some(Windows {
-            pending: None,
-            kept: Vec::new(),
-        });
-    }
-
-    /// The windows kept since the last take, in order; empty when
-    /// [`MtpDraft::keep_windows`] was never called.
-    pub fn take_windows(&mut self) -> Vec<WindowDraft> {
-        self.windows
-            .as_mut()
-            .map(|w| std::mem::take(&mut w.kept))
-            .unwrap_or_default()
-    }
-
-    /// The join of the last call that continued a held sequence, once: a
-    /// second take is `None` until another call joins.
-    pub fn take_joined(&mut self) -> Option<Join> {
-        self.policy.take_joined()
-    }
-
-    /// The head the load opened.
-    #[must_use]
-    pub fn head(&self) -> DraftHead {
-        self.head
-    }
-
-    /// The draft's own state started over: no refresh waits, no skip, the
-    /// model's reset having emptied the draft's store. The session's reset
-    /// calls it.
-    pub fn restart(&mut self) {
-        self.policy.restart();
-        if let Some(w) = &mut self.windows {
-            w.pending = None;
-        }
-    }
-
-    /// Whether the draft proposes nothing until the next prompt call from
-    /// position 0 or a restart ([`Join::skipped`] names why).
-    #[must_use]
-    pub fn skipping(&self) -> bool {
-        self.policy.skipping()
-    }
-
-    /// The next refresh recorded for a verify of `rows` that ran from
-    /// position `p0`, keeping its first `accepted` rows, `out` the id the
-    /// pass took at each ([`Draft::accept`]), before the commit takes the
-    /// rest back: the kept rows at the positions after the verify's first,
-    /// each with the hidden row the verify's row before it wrote
-    /// ([`MtpBody::VERIFY_ARENA`]), the last row the id the pass took after
-    /// the last kept row — the argmax on a greedy pass, the draw on a
-    /// sampled one. What [`Draft::accept`] records, `p0` given by the caller
-    /// that ran the verify.
-    pub fn record(
-        &mut self,
-        p0: u32,
-        rows: &[u32],
-        out: &[u32],
-        accepted: usize,
-    ) -> Result<(), SessionError> {
-        self.policy.record(p0, rows, out, accepted)?;
-        if let Some(w) = &mut self.windows {
-            let (ids, p) = w.pending.take().ok_or_else(|| {
-                SessionError::Refused(format!(
-                    "{WHAT}: an accept of a window whose proposal the draft did not keep"
-                ))
-            })?;
-            w.kept.push(WindowDraft {
-                pos: p0,
-                ids,
-                p,
-                width: rows.len() - 1,
-                accepted: accepted - 1,
-            });
-        }
-        Ok(())
-    }
-
-    /// What the draft holds of the target's sequence between two calls, for
-    /// the caller's sequence state ([`MtpDraft::unpark`] puts it back): the
-    /// rows waiting for its next walk when they sit in the step's or the
-    /// verify's arena ([`MtpBody::STEP_ARENA`], [`MtpBody::VERIFY_ARENA`]),
-    /// or why it proposes nothing — its own skip, or rows a prompt call's
-    /// arena holds, which a sequence state does not keep. The caller's
-    /// state keeps the draft's store and those two arenas' rows with the
-    /// positions they hold, so the walk after the put-back reads the rows it
-    /// would have read; a body whose walk does not refuse an arena that holds
-    /// other positions must not park.
-    #[must_use]
-    pub fn park(&self) -> Parked<B::Arena> {
-        self.policy.park()
-    }
-
-    /// `p`, which [`MtpDraft::park`] took, back in place once the target's
-    /// sequence stands where it stood then (the caller's state put back,
-    /// the draft's store and the two arenas with it): the next call walks
-    /// the waiting rows as it would have, or skips for the parked why, its
-    /// [`Join`] naming it.
-    pub fn unpark(&mut self, p: &Parked<B::Arena>) {
-        self.policy.unpark(p);
-        if let Some(w) = &mut self.windows {
-            w.pending = None;
-        }
-    }
-
-    /// The target cut back to `pos`, or a state put back as its first `pos`
-    /// positions, where the body rejoined the draft to the sequence: its
-    /// store holds every position below `pos` and the step's arena
-    /// ([`MtpBody::STEP_ARENA`]) the target's hidden row at `pos - 1`. The
-    /// next call walks that row with the id it feeds at `pos` and drafts on,
-    /// as after a plain step at `pos - 1`; nothing is skipped, and the next
-    /// [`Join`] is the first since.
-    pub fn rejoin(&mut self, pos: u32) {
-        self.policy.rejoin(pos);
-        if let Some(w) = &mut self.windows {
-            w.pending = None;
-        }
-    }
-
-    /// Before a plain step of `last` at the target's position: a refresh an
-    /// earlier step or window left waiting reads an arena the step may
-    /// overwrite (its own), so it is walked now, its last row `last` — a
-    /// first step that continues the held sequence joins it here. A draft
-    /// that cannot walk it skips, the [`Join`] naming why
-    /// ([`MtpDraft::take_joined`]). A prompt call's anchor is left for
-    /// [`Draft::stepped`]. A server seat calls it before each of its steps,
-    /// and the width chooser makes the same walk through
-    /// [`Draft::before_plain`] before each pass it holds back.
-    ///
-    /// # Errors
-    ///
-    /// The walk's.
-    pub fn before_step(&mut self, t: &mut Session<B>, last: u32) -> Result<(), SessionError> {
-        let pos = t.pos();
-        let mut card = Card {
-            m: t.model_mut(),
-            head: self.head,
-            media: None,
-        };
-        Ok(self.policy.before_step(&mut card, pos, last)?)
-    }
-
-    /// A plain row of `last` that a pass of several slots ran at the target's
-    /// position `p0`, `next` the id taken after it, its rows waiting walked
-    /// before the pass ([`MtpDraft::before_step`]): `next` at `p0 + 1`, with
-    /// the hidden row the pass's row wrote ([`MtpBody::VERIFY_ARENA`]), as
-    /// the next refresh, the refresh [`Draft::stepped`] records after a step
-    /// of its own arena. A window of depth zero in [`pass_slots`] and a
-    /// seat's round of plain steps run as one pass both end here.
-    pub fn passed_plain(&mut self, p0: u32, last: u32, next: u32) -> Result<(), SessionError> {
-        Ok(self.policy.record(p0, &[last], &[next], 1)?)
-    }
-}
-
-impl<B: MtpBody + Slots> MtpDraft<B>
+impl<B: MtpBody + Slots> SlotWalks<B>
 where
     B::Seq: 'static,
 {
-    /// [`MtpDraft::before_step`] on the session's selected slot, its walk
-    /// gathered into `walks` when it reads the slot's own step or verify
-    /// arena. Shared prompt rows are walked immediately, before a slot
-    /// change invalidates them. [`SlotWalks::run`] walks the gathered rows
-    /// together before the target's next call. Every decision (the rows
-    /// walked, a skip and its join) is made here as `before_step` makes it.
+    /// [`MtpDraft::before_step`] of `draft` on the session's selected slot, its
+    /// walk gathered here when it reads the slot's own step or verify arena.
+    /// Shared prompt rows are walked immediately, before a slot change
+    /// invalidates them. [`SlotWalks::run`] walks the gathered rows together
+    /// before the target's next call. Every decision (the rows walked, a skip
+    /// and its join) is made here as `before_step` makes it.
     ///
     /// # Errors
     ///
     /// The store's positions unread, or a walk `before_step` would not make.
     pub fn gather(
         &mut self,
+        draft: &mut MtpDraft<B>,
         t: &mut Session<B>,
         last: u32,
-        walks: &mut SlotWalks<B>,
     ) -> Result<(), SessionError> {
         let (slot, pos) = (t.selected(), t.pos());
         let mut g = Gather {
             m: t.model_mut(),
             slot,
-            head: self.head,
-            walks,
+            head: draft.head(),
+            walks: self,
         };
-        self.policy.before_step(&mut g, pos, last)
+        draft.policy_mut().before_step(&mut g, pos, last)
     }
 }
 
@@ -1006,7 +817,7 @@ pub struct SlotWindow<'a, B: MtpBody> {
 /// the draft is told nothing of, as its [`Draft::stepped`] would do nothing.
 /// Depth zero runs a plain row and keeps the draft ready for a later pass:
 /// each such draft's shared prompt rows are walked immediately, and its
-/// step and verify rows are gathered ([`MtpDraft::gather`]) and walked
+/// step and verify rows are gathered ([`SlotWalks::gather`]) and walked
 /// together before the first pass ([`SlotWalks::run`]).
 /// Returns each window's commit, in the windows' order, and the passes run.
 /// Refused by name: a draft that proposes nothing at a positive depth while
@@ -1030,11 +841,15 @@ where
         let pos = t.pos();
         let mut ids = vec![w.last; 1 + w.depth.min(B::WIDTH)];
         let n = if w.depth == 0 {
-            w.draft.gather(t, w.last, &mut plain)?;
+            plain.gather(w.draft, t, w.last)?;
             0
         } else {
-            let read_p = w.draft.windows.is_some();
-            match w.draft.policy.chain(pos, t.ctx(), w.last, ids.len() - 1)? {
+            let read_p = w.draft.keeps_windows();
+            match w
+                .draft
+                .policy_mut()
+                .chain(pos, t.ctx(), w.last, ids.len() - 1)?
+            {
                 None => 0,
                 Some(c) if c.refresh.walk == B::STEP_ARENA || c.refresh.walk == B::VERIFY_ARENA => {
                     batch.push((i, c));
@@ -1129,28 +944,24 @@ where
     let Some(&(first, ref c0)) = batch.first() else {
         return Ok(Vec::new());
     };
-    let (head, mode) = (windows[first].draft.head, c0.mode);
+    let (head, mode) = (windows[first].draft.head(), c0.mode);
     // One chain, or chains of drafts opened with different heads or walk
     // modes, run in turn: each slot selected, its arenas kept by the select.
     if batch.len() == 1
         || batch
             .iter()
-            .any(|(i, c)| windows[*i].draft.head != head || c.mode != mode)
+            .any(|(i, c)| windows[*i].draft.head() != head || c.mode != mode)
     {
         let mut lens = Vec::with_capacity(batch.len());
         for (i, c) in batch {
             let w = &mut windows[*i];
             t.select_slot(w.slot)?;
-            let read_p = w.draft.windows.is_some();
+            let read_p = w.draft.keeps_windows();
             lens.push(w.draft.run_chain(t, c, &mut rows[*i][1..], read_p)?);
         }
         return Ok(lens);
     }
-    if !B::PROBS
-        && batch
-            .iter()
-            .any(|(i, _)| windows[*i].draft.windows.is_some())
-    {
+    if !B::PROBS && batch.iter().any(|(i, _)| windows[*i].draft.keeps_windows()) {
         return Err(SessionError::Refused(format!(
             "{WHAT}: a chain's probabilities: this draft's readback holds its ids alone"
         )));
@@ -1165,8 +976,7 @@ where
         .zip(&drafts)
         .map(|((i, _), d)| {
             let w = &mut windows[*i];
-            let p = w.draft.windows.is_some().then_some(&mut w.draft.p[..]);
-            write_proposal(d, &mut rows[*i][1..], p)
+            write_proposal(d, &mut rows[*i][1..], w.draft.kept_probs())
         })
         .collect::<Result<Vec<_>, _>>()?;
     for ((i, _), &n) in batch.iter().zip(&lens) {
@@ -1175,258 +985,53 @@ where
     Ok(lens)
 }
 
-impl<B: MtpBody> MtpDraft<B> {
-    /// One chain, one readback (the module doc): the recorded refresh's
-    /// walk — its last row `last`, the token at the target's position, whose
-    /// prediction is the first proposal — then own walks while the verify of
-    /// the proposal fits the context and the proposal fits `out`: at most
-    /// `out.len()` ids, so a caller caps a window's depth by the room it
-    /// hands. No room is refused by name. The refresh's last row is `last`
-    /// whatever the call that recorded it took there: a step tells the draft
-    /// its argmax, and a sampled request feeds its draw. With `read_p`, each
-    /// id's probability as the same readback holds it, into the draft's own
-    /// `p`.
-    fn chain(
-        &mut self,
-        t: &mut Session<B>,
-        last: u32,
-        out: &mut [u32],
-        read_p: bool,
-    ) -> Result<usize, SessionError> {
-        match self.policy.chain(t.pos(), t.ctx(), last, out.len())? {
-            None => Ok(0),
-            Some(c) => self.run_chain(t, &c, out, read_p),
-        }
+/// [`runtime::Draft::prompt`] of `ids` with `spans` spliced in (the window's prompt call, the
+/// target's media call in place of its text call): the draft is walked over the call's
+/// units as they complete, a span's positions included. At a span's position the draft
+/// reads the span's row beside the target's hidden row there, the row the target consumed
+/// in place of the image token's embedding, widened exactly: the reference's feed (its MTP
+/// draft adds the target's vision row at an image position). The call is the body's own,
+/// one residency pass it opens ([`MtpBody::prompt_media_with`]), inside the prepared
+/// sequence state ([`MtpBody::media_frame`]) from the join through the last unit, so it
+/// never runs inside [`Session::prompt_media`]'s. Refused before anything runs as [`Session::prompt_media`]
+/// refuses ([`MediaBody::media_refusal`]), and for a span that is not whole rows of the
+/// embedding's width ([`MtpBody::embed_width`]) or that the others do not follow in order
+/// ([`CallRows::new`]).
+pub fn prompt_media<B: MtpBody + MediaBody>(
+    draft: &mut MtpDraft<B>,
+    t: &mut Session<B>,
+    ids: &[u32],
+    spans: &[<B as MediaBody>::Span<'_>],
+) -> Result<u32, SessionError> {
+    if let Some(why) = B::media_refusal(t.model(), spans.len()) {
+        return Err(SessionError::Refused(why));
     }
-
-    /// The chain `c` the policy decided, run on the session's selected
-    /// slot ([`MtpBody::chain`]) into `out`, with each id's probability into
-    /// the draft's own `p` when `read_p`, and kept ([`MtpDraft::proposed`]).
-    fn run_chain(
-        &mut self,
-        t: &mut Session<B>,
-        c: &Chain<B::Arena>,
-        out: &mut [u32],
-        read_p: bool,
-    ) -> Result<usize, SessionError> {
-        let n = B::chain(
-            t.model_mut(),
-            c.refresh.feed(),
-            c.own,
-            self.head,
-            c.mode,
-            out,
-            read_p.then_some(&mut self.p[..]),
-        )?;
-        self.proposed(&out[..n]);
-        Ok(n)
-    }
-
-    /// The proposal `ids` a chain made, its probabilities in the draft's
-    /// own `p`, kept until its accept under [`MtpDraft::keep_windows`].
-    fn proposed(&mut self, ids: &[u32]) {
-        if let Some(w) = &mut self.windows {
-            w.pending = Some((ids.to_vec(), self.p[..ids.len()].to_vec()));
-        }
-    }
-}
-
-impl<B: MtpBody> MtpDraft<B> {
-    /// The prompt call's one core ([`Draft::prompt`], [`MtpDraft::prompt_media`]): `call` is the
-    /// target's prompt call of `ids` on the model, handed the sink that walks the draft over
-    /// each unit as it completes, or `None` when the draft cannot join and the call is the
-    /// target's alone. `media` is the call's span rows ([`CallRows`], `None` on a text call):
-    /// the join's walk and every unit's walk read it.
-    fn prompt_joined<R>(
-        &mut self,
-        m: &mut GpuModel<B>,
-        ids: &[u32],
-        media: Option<&CallRows<'_>>,
-        call: impl FnOnce(&mut GpuModel<B>, Option<&mut UnitSink<'_, B>>) -> Result<R, GpuError>,
-    ) -> Result<R, GpuError> {
-        let head = self.head;
+    let rows = CallRows::new(
+        t.pos(),
+        B::embed_width(t.model())?,
+        spans.iter().map(|s| {
+            let s = B::media_span(s);
+            (&s.at, s.rows)
+        }),
+    )
+    .map_err(|r| SessionError::Refused(format!("{WHAT}: {r}")))?;
+    let head = draft.head();
+    Ok(B::media_frame(t.model_mut(), ids, spans, |m| {
         let start = m.pos();
         let _busy = m.prompt_busy();
-        let mut card = Card { m, head, media };
-        let Some(mut join) = self.policy.prompt_start(&mut card, start, ids)? else {
-            return call(m, None);
-        };
-        let policy = &mut self.policy;
-        let mut sink = |m: &mut GpuModel<B>,
-                        walk: B::Arena,
-                        first: u32,
-                        rows: usize|
-         -> Result<(), GpuError> {
-            let mut card = Card { m, head, media };
-            policy.unit(&mut join, &mut card, walk, first, rows)
-        };
-        call(m, Some(&mut sink))
-    }
-}
-
-impl<B: MtpBody + MediaBody> MtpDraft<B> {
-    /// [`Draft::prompt`] of `ids` with `spans` spliced in (the module doc's prompt call, the
-    /// target's media call in place of its text call): the draft is walked over the call's
-    /// units as they complete, a span's positions included. At a span's position the draft
-    /// reads the span's row beside the target's hidden row there, the row the target consumed
-    /// in place of the image token's embedding, widened exactly: the reference's feed (its MTP
-    /// draft adds the target's vision row at an image position). The call is the body's own,
-    /// one residency pass it opens ([`MtpBody::prompt_media_with`]), inside the prepared
-    /// sequence state ([`MtpBody::media_frame`]) from the join through the last unit, so it
-    /// never runs inside [`Session::prompt_media`]'s. Refused before anything runs as [`Session::prompt_media`]
-    /// refuses ([`MediaBody::media_refusal`]), and for a span that is not whole rows of the
-    /// embedding's width ([`MtpBody::embed_width`]) or that the others do not follow in order
-    /// ([`CallRows::new`]).
-    pub fn prompt_media(
-        &mut self,
-        t: &mut Session<B>,
-        ids: &[u32],
-        spans: &[<B as MediaBody>::Span<'_>],
-    ) -> Result<u32, SessionError> {
-        if let Some(why) = B::media_refusal(t.model(), spans.len()) {
-            return Err(SessionError::Refused(why));
-        }
-        let rows = CallRows::new(
-            t.pos(),
-            B::embed_width(t.model())?,
-            spans.iter().map(|s| {
-                let s = B::media_span(s);
-                (&s.at, s.rows)
-            }),
-        )
-        .map_err(|r| SessionError::Refused(format!("{WHAT}: {r}")))?;
-        Ok(B::media_frame(t.model_mut(), ids, spans, |m| {
-            self.prompt_joined(m, ids, Some(&rows), |m, sink| {
-                B::prompt_media_with(m, ids, spans, sink)
-            })
-        })?)
-    }
-}
-
-impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
-    /// The most ids a proposal holds: the body's [`MtpBody::WIDTH`].
-    const WIDTH: usize = B::WIDTH;
-    const TAPS: TapNeed = TapNeed::Final;
-    /// Each id past the first is one of the chain's own walks, which stop at
-    /// the room the proposal is handed.
-    const CHAIN: bool = true;
-
-    /// The prompt through the target's own call, the draft walked over its
-    /// units as they complete (the module doc): position 0 first — the
-    /// target holds no hidden row before it — or, for a call that continues
-    /// the held sequence, the rows the last call left waiting, the call's
-    /// first id their last ([`Join`]); then every unit's rows from its second
-    /// on, each with the hidden row its own arena holds for the position
-    /// before it, the last unit's last row left for `begin`. A draft that
-    /// cannot join skips: the target's call alone.
-    fn prompt(&mut self, t: &mut Session<B>, ids: &[u32]) -> Result<u32, SessionError> {
-        let next = self.prompt_call(t, ids, CallEnd::Argmax)?;
-        Ok(next.ok_or(GpuError::State {
-            what: WHAT,
-            missing: "the head's token after the prompt",
-        })?)
-    }
-
-    /// The next window's anchor: the target's own token `first` at the
-    /// prompt's end, with the hidden row the prompt's last position wrote —
-    /// unless a step since the prompt call already recorded one (the
-    /// server's cut: the prompt less its last id, then the last id as a
-    /// step, [`Draft::stepped`] recording the anchor the step's window
-    /// proposes from).
-    fn begin(&mut self, t: &Session<B>, _prompt: &[u32], first: u32) -> Result<(), SessionError> {
-        Ok(self.policy.begin(t.pos(), first)?)
-    }
-
-    /// One chain, one readback ([`MtpDraft::chain`]); each id's
-    /// probability read back only for the kept windows
-    /// ([`MtpDraft::keep_windows`]).
-    fn propose(
-        &mut self,
-        t: &mut Session<B>,
-        last: u32,
-        out: &mut [u32],
-    ) -> Result<usize, SessionError> {
-        self.chain(t, last, out, self.windows.is_some())
-    }
-
-    /// The same chain with each proposed id's probability among the head's
-    /// rows written to `p` beside it, from the readback that already holds
-    /// it ([`MtpBody::PROBS`]); a body whose readback holds none reports
-    /// certainty, every 1.
-    fn propose_p(
-        &mut self,
-        t: &mut Session<B>,
-        last: u32,
-        out: &mut [u32],
-        p: &mut [f32],
-    ) -> Result<usize, SessionError> {
-        let n = self.chain(t, last, out, B::PROBS || self.windows.is_some())?;
-        let places = p.len();
-        let p = p.get_mut(..n).ok_or_else(|| {
-            SessionError::Refused(format!(
-                "{WHAT}: a proposal of {n} ids into {places} probabilities"
-            ))
-        })?;
-        if B::PROBS {
-            p.copy_from_slice(&self.p[..n]);
-        } else {
-            p.fill(1.0);
-        }
-        Ok(n)
-    }
-
-    /// The last proposal was never verified: its kept window, if any, is
-    /// dropped, so the next accept records the window that ran.
-    fn unproposed(&mut self) {
-        if let Some(w) = &mut self.windows {
-            w.pending = None;
-        }
-    }
-
-    /// The next refresh recorded before the commit takes the rejected rows
-    /// back ([`MtpDraft::record`]), the verify's first position the one its
-    /// rows stood the target past.
-    fn accept(
-        &mut self,
-        t: &mut Session<B>,
-        rows: &[u32],
-        out: &[u32],
-        accepted: usize,
-    ) -> Result<(), SessionError> {
-        self.record(t.pos() - rows.len() as u32, rows, out, accepted)
-    }
-
-    /// A plain step on `last`: the rows that waited for the next chain —
-    /// the refresh an accept recorded, after a prompt call with no `begin`
-    /// the anchor (`last` at the prompt's end), or on a first step at
-    /// position 0 its row beside a zero hidden row — walked now, since
-    /// the step's row follows them and the store must hold every position
-    /// below the next chain's; then `next`, the id taken after the step, at
-    /// the position after it, with the hidden row the step wrote
-    /// ([`MtpBody::STEP_ARENA`]), as the next refresh, its rows left for
-    /// the call that walks them — the width chooser's hook
-    /// ([`Draft::before_plain`]) or a seat's step before the next plain
-    /// step, the next chain for its head, a continuing prompt's join — so
-    /// the store never holds a position past the target's, which a
-    /// sequence state needs. Refused by name when the waiting rows read
-    /// the step's own arena, which the step has overwritten.
-    fn stepped(&mut self, t: &mut Session<B>, last: u32, next: u32) -> Result<(), SessionError> {
-        let pos = t.pos();
         let mut card = Card {
-            m: t.model_mut(),
-            head: self.head,
-            media: None,
+            m,
+            head,
+            media: Some(&rows),
         };
-        Ok(self.policy.stepped(&mut card, pos, last, next)?)
-    }
-
-    /// The waiting rows walked before the chooser's held pass steps the
-    /// target ([`MtpDraft::before_step`]: the step would overwrite the
-    /// arena they read); nothing waits, and this does nothing, on every
-    /// pass that runs a proposal.
-    fn before_plain(&mut self, t: &mut Session<B>, last: u32) -> Result<(), SessionError> {
-        self.before_step(t, last)
-    }
+        draft.prompt_joined(&mut card, start, ids, |card, sink| match sink {
+            None => B::prompt_media_with(card.m, ids, spans, None),
+            Some(sink) => {
+                let mut unit = unit_sink::<B>(sink, head, Some(&rows));
+                B::prompt_media_with(card.m, ids, spans, Some(&mut unit))
+            }
+        })
+    })?)
 }
 
 #[cfg(test)]
