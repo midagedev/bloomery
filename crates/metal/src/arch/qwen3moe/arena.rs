@@ -1520,12 +1520,7 @@ mod in_order_tests {
     /// load makes them: job `j` makes `MADE[j]` of them, buffer `k` at
     /// `address(j, k)`.
     #[cfg(feature = "encode-trace")]
-    const MADE: [u64; 5] = [2, 1, 0, 3, 2];
-
-    #[cfg(feature = "encode-trace")]
-    fn address(j: usize, k: u64) -> usize {
-        0x10_0000 + j * 0x1000 + usize::try_from(k).expect("a small count") * 0x10
-    }
+    use crate::trace::testing::{MADE, MIXED, address};
 
     /// The names the trace gives after a load of [`MADE`]'s jobs on `workers`
     /// threads, one buffer made before it and one after; job `j` fails when
@@ -1574,17 +1569,7 @@ mod in_order_tests {
             }
         }
         assert_eq!(one, expected);
-        // The last jobs make their buffers first, the first jobs' last.
-        let script = Script::new(vec![
-            (4, 0),
-            (3, 0),
-            (0, 0),
-            (4, 1),
-            (1, 0),
-            (3, 1),
-            (0, 1),
-            (3, 2),
-        ]);
+        let script = Script::new(MIXED.to_vec());
         assert_eq!(loaded(4, Some(&script), None), one);
     }
 
