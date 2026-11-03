@@ -42,8 +42,10 @@ recipes whether or not the diff selected them: the variant's file lives outside 
 The lever registry (crates/levers/src/registry.rs) is read by row when every edit to it is a row (`LeverReads`): an added, changed or removed
 element of its REGISTRY array, or the `&str` const that names one. It selects the recipe that tests the registry and the recipes whose inputs
 hold a file outside crates/levers that names a moved row, by its variable or by a const that spells it; a recipe that links the crate and
-reads no such file is not selected. Code beside the rows (an item, a helper's body, a non-string const), a row the reader cannot name, rows in
-another order and a text it cannot lex keep the file whole, the `affected:` line saying why, and so does any other file of crates/levers.
+reads no such file is not selected. A row whose only edit is the string of its `doc:` field (tokens equal once that value is left out; a const,
+`concat!` or macro doc is not that) is counted as `doc` and selects no reader. Code beside the rows (an item, a helper's body, a non-string
+const), a row the reader cannot name, rows in another order and a text it cannot lex keep the file whole, the `affected:` line saying why, and
+so does any other file of crates/levers.
 
 A Rust file of a workspace crate whose two sides have the same tokens once comments and white space are left out selects no gate: both
 `select` and `narrow` skip it, `unmapped` and `narrow: file` print `comment-only, no gate reads it` (`layout-only` when no comment moved),
@@ -2549,7 +2551,9 @@ class TableReads:
 # Every bin links bloomery-levers, so the crate graph reads a one-row edit of its registry as a change to every gate. A row is
 # data: a name parsed only when set, whose readers name its const or its variable. `LeverReads` takes the registry apart on both
 # sides of a diff, and when the rows are all that moved it selects the recipe that tests the registry and the recipes whose
-# inputs hold a file naming a moved row; any text the reader cannot account for as rows leaves the file whole.
+# inputs hold a file naming a moved row; any text the reader cannot account for as rows leaves the file whole. A row whose only
+# edit is the string of its `doc:` field names no word: nothing reads that text but the table `markdown()` prints and the crate's
+# own tests, so it selects the recipe that tests the registry and no reader.
 
 LEVER_REGISTRY = "crates/levers/src/registry.rs"
 LEVER_CRATE = "crates/levers/"  # the registry crate's own files are read by its own gate, never as a reader of a row
@@ -2616,12 +2620,14 @@ def _rs_tokens(text: str, comments: list[tuple[int, str]] | None = None) -> list
 class LeverRows:
     """One side of the registry: its `&str` consts (identifier -> the string, None when it has an escape), the tokens that are not
     rows (the code before and after the array, those consts left out), and each row's text keyed by the variable it names, the
-    consts a row spells written out."""
+    consts a row spells written out. `bare` is each row's text with its `doc:` value left out (`_without_doc`), None for a row
+    whose doc cannot be taken out by parsing."""
 
     consts: dict[str, str | None]
     rest: list[str]
     order: list[str]
     rows: dict[str, str]
+    bare: dict[str, str | None]
 
 
 def _const_runs(toks: list[tuple[str, str]]) -> tuple[dict[str, str | None], list[tuple[str, str]]]:
@@ -2651,6 +2657,33 @@ def _const_runs(toks: list[tuple[str, str]]) -> tuple[dict[str, str | None], lis
             start = c - 1
         drop.update(range(start, j + 4))
     return consts, [t for i, t in enumerate(toks) if i not in drop]
+
+
+def _without_doc(elem: list[tuple[str, str]], spelled: list[str]) -> str | None:
+    """The text of a `LeverSpec { … }` row (`spelled`: its tokens with the consts written out, one per token of `elem`) without the
+    value of its `doc:` field, the one string literal, or run of literals, up to the field's closing `,` or the row's `}`. None
+    when the row is not that shape (a `path(…)`/`runner(…)` call has no `doc:` field), has no single `doc:` field at the row's top
+    level, or its value is anything but plain literals (a const, `concat!`, a macro, a method call): such a doc is no text to compare."""
+    if len(elem) < 4 or elem[:2] != [("id", "LeverSpec"), ("p", "{")] or elem[-1] != ("p", "}"):
+        return None
+    depth, fields = 0, []
+    for i, (kind, w) in enumerate(elem):
+        if kind == "p" and w in "([{":
+            depth += 1
+        elif kind == "p" and w in ")]}":
+            depth -= 1
+            if depth == 0 and i != len(elem) - 1:
+                return None  # the first brace closes before the row's last token: not one `LeverSpec { … }`
+        elif depth == 1 and (kind, w) == ("id", "doc") and elem[i - 1] in (("p", "{"), ("p", ",")) and elem[i + 1:i + 2] == [("p", ":")]:
+            fields.append(i + 2)
+    if depth != 0 or len(fields) != 1:
+        return None
+    start = end = fields[0]
+    while end < len(elem) and elem[end][0] == "str" and elem[end][1][0] in '"r':
+        end += 1
+    if end == start or elem[end] not in (("p", ","), ("p", "}")):
+        return None
+    return " ".join(spelled[:start] + spelled[end:])
 
 
 def parse_lever_rows(text: str) -> LeverRows:
@@ -2694,6 +2727,7 @@ def parse_lever_rows(text: str) -> LeverRows:
         elems.pop()
     order: list[str] = []
     rows: dict[str, str] = {}
+    bare: dict[str, str | None] = {}
     for elem in elems:
         if not elem:
             raise LeverDoubt("an empty element between two commas")
@@ -2712,22 +2746,26 @@ def parse_lever_rows(text: str) -> LeverRows:
             raise LeverDoubt(f"{name} names two rows")
         order.append(name)
         rows[name] = " ".join(w)
-    return LeverRows(consts, [t for _, t in outside], order, rows)
+        bare[name] = _without_doc(elem, w)
+    return LeverRows(consts, [t for _, t in outside], order, rows, bare)
 
 
 @dataclass(frozen=True)
 class LeverSubject:
     """What moved in the registry that a reader can name: a row (added, changed, removed) or a variable const, with the words
-    that name it in a file — its variable and every const identifier that spells it."""
+    that name it in a file — its variable and every const identifier that spells it. A row whose only edit is the string of its
+    `doc:` field is a `doc` subject: the field is printed by `markdown()` and checked by the levers crate's own tests, and no
+    engine path reads it, so it carries no words and no reader file names it."""
 
-    kind: str  # added | changed | removed | const
+    kind: str  # added | changed | doc | removed | const
     label: str
     words: frozenset[str]
 
 
 def diff_lever_rows(a: LeverRows, b: LeverRows) -> list[LeverSubject]:
     """What moved from `a` to `b`, or a LeverDoubt when anything but rows did: code outside the array (an item, a helper's body, a
-    non-string const), a different order of the rows both sides hold."""
+    non-string const), a different order of the rows both sides hold. A row both sides hold whose text differs is `doc` when the
+    two texts are equal once the plain-literal value of the `doc:` field is left out of each (`_without_doc`), else `changed`."""
     if a.rest != b.rest:
         i = next((i for i in range(min(len(a.rest), len(b.rest))) if a.rest[i] != b.rest[i]), min(len(a.rest), len(b.rest)))
         raise LeverDoubt(f"code outside the rows moved near `{' '.join((b.rest or a.rest)[max(0, i - 4):i + 2])}`")
@@ -2743,7 +2781,10 @@ def diff_lever_rows(a: LeverRows, b: LeverRows) -> list[LeverSubject]:
         if k not in a.rows:
             out.append(LeverSubject("added", k, frozenset({k} | spelled.get(k, set()))))
         elif a.rows[k] != b.rows[k]:
-            out.append(LeverSubject("changed", k, frozenset({k} | spelled.get(k, set()))))
+            if a.bare[k] is not None and a.bare[k] == b.bare[k]:
+                out.append(LeverSubject("doc", k, frozenset()))
+            else:
+                out.append(LeverSubject("changed", k, frozenset({k} | spelled.get(k, set()))))
     named = {w for subj in out for w in subj.words}
     for ident in sorted(set(a.consts) | set(b.consts)):
         old, new = a.consts.get(ident), b.consts.get(ident)
@@ -2757,8 +2798,8 @@ class LeverReads:
     """The lever registry of one diff, read by row (`TableReads` holds it; select and narrow ask it through `TableReads.hit`).
     When every edit to crates/levers/src/registry.rs is a row (parse_lever_rows on both sides, diff_lever_rows), a recipe is
     selected by the file when it tests the registry as its own target, or when its inputs hold a file outside the registry's
-    crate that names a moved row (its variable, or a const that spells it). Anything else is `why_whole`, and the file selects as
-    any source file does."""
+    crate that names a moved row (its variable, or a const that spells it); a row whose only edit is its `doc:` string is named by
+    no file. Anything else is `why_whole`, and the file selects as any source file does."""
 
     def __init__(self, changed: list[str], a: Side | None, b: Side):
         self.subjects: list[LeverSubject] = []
@@ -2778,8 +2819,8 @@ class LeverReads:
             self.by_rows = True
         except LeverDoubt as err:
             self.why_whole = str(err)
-        if self.subjects:
-            words = sorted({w for subj in self.subjects for w in subj.words}, key=len, reverse=True)
+        words = sorted({w for subj in self.subjects for w in subj.words}, key=len, reverse=True)
+        if words:  # a diff of doc rows alone names no word: no file is read for one
             self._needle = re.compile(rb"\b(?:" + b"|".join(re.escape(w.encode()) for w in words) + rb")\b")
 
     def reads(self, f: str) -> bool:
@@ -2832,12 +2873,12 @@ class LeverReads:
             self.own.add(n)
             return why, True
         found: dict[str, str] = {}
-        for rel in self._candidates(side, ri) if self.subjects else []:
+        for rel in self._candidates(side, ri) if self._needle is not None else []:
             for subj in self._names(side, rel):
                 found.setdefault(subj.label, rel)
                 self.readers.setdefault(subj.label, {}).setdefault(rel, set()).add(n)
         # A recipe's own command lines set levers too (`BLOOMERY_BOX_ENV='BLOOMERY_X=…'`): its text and its deps' are readers.
-        for r in self._recipe_chain(side, n) if self.subjects else []:
+        for r in self._recipe_chain(side, n) if self._needle is not None else []:
             assert self._needle is not None
             hits = {m.decode() for m in self._needle.findall(side.recipes[r].text.encode())}
             for subj in self.subjects:
@@ -2851,7 +2892,8 @@ class LeverReads:
 
     def counts(self) -> str:
         n = collections.Counter(subj.kind for subj in self.subjects)
-        return f"{n['added']} added, {n['changed']} changed, {n['removed']} removed" + (f", {n['const']} consts" if n["const"] else "")
+        doc = f"{n['doc']} doc, " if n["doc"] else ""
+        return f"{n['added']} added, {n['changed']} changed, {doc}{n['removed']} removed" + (f", {n['const']} consts" if n["const"] else "")
 
     def summary(self) -> str:
         """The clause of the `affected:` line: how the registry file was read."""
@@ -2862,11 +2904,14 @@ class LeverReads:
         return f"{LEVER_REGISTRY} read by row: {self.counts()}"
 
     def lines(self) -> list[str]:
-        """The `lever rows:` block of `affected`: each moved row and the recipes whose inputs name it."""
+        """The `lever rows:` block of `affected`: each moved row and the recipes whose inputs name it; a doc row names none."""
         if not self.by_rows:
             return []
         out = [f"lever rows ({LEVER_REGISTRY}): {self.counts()}; the recipe that tests the registry: {' '.join(sorted(self.own)) or 'none'}"]
         for subj in self.subjects:
+            if subj.kind == "doc":
+                out.append(f"  doc {subj.label}: the doc text only; no reader selected")
+                continue
             files = self.readers.get(subj.label, {})
             recipes = sorted({n for ns in files.values() for n in ns})
             shown = ", ".join(sorted(files)[:3]) + (f" (+{len(files) - 3})" if len(files) > 3 else "")
@@ -11193,11 +11238,12 @@ def lever_rows_self_test(expect) -> None:
     """The lever registry read by row, on a synthetic workspace (levers: a lib holding the registry; reader: a bin that names the
     const HOST_ROOM; plain: a bin that names no lever; solo: a bin that links no lever and runs a script naming BLOOMERY_GEN_CTX, and a recipe that sets BLOOMERY_SPIN in its
     command).
-    A diff whose only edits to the registry are rows selects gate-levers and the recipes that read a file naming the row; each
-    other shape of change (code beside the rows, a row the reader cannot name, rows reordered, lib.rs moved beside a row) keeps
-    the crate graph's whole selection, and --narrow follows the same split."""
-    host_row = "    LeverSpec {\n        name: HOST_ROOM,\n        doc: \"Room, (a comma) and [brackets] in a string \\\n              that continues.\",\n    },\n"
-    spin_row = "    LeverSpec {\n        name: SPIN,\n        at: &[OPS],\n        doc: \"Spin.\",\n    },\n"
+    A diff whose only edits to the registry are rows selects gate-levers and the recipes that read a file naming the row, except that
+    a row whose only edit is the string of its `doc:` field selects gate-levers alone; each other shape of change (code beside the
+    rows, a row the reader cannot name, rows reordered, lib.rs moved beside a row) keeps the crate graph's whole selection, and
+    --narrow follows the same split."""
+    host_row = "    LeverSpec {\n        name: HOST_ROOM,\n        default: \"8\",\n        doc: \"Room, (a comma) and [brackets] in a string \\\n              that continues.\",\n    },\n"
+    spin_row = "    LeverSpec {\n        name: SPIN,\n        at: &[OPS],\n        default: \"20000\",\n        doc: \"Spin.\",\n    },\n"
     runners = "    // ---------- the runners\n    runner(\"BLOOMERY_GEN_CTX\", \"The context.\"),\n    runner(\"BLOOMERY_OTHER_\", \"Other.\"),\n"
     rows = host_row + spin_row + runners
     lib = "mod registry;\n#[cfg(test)]\nmod tests;\npub use registry::{HOST_ROOM, SPIN};\n"
@@ -11268,11 +11314,20 @@ def lever_rows_self_test(expect) -> None:
             ("a new row nothing names", registry(rows + '    runner("BLOOMERY_NEW_", "New."),\n'), lib, {"gate-levers"}, None),
             ("a new row whose const a reader names", registry(rows + "    LeverSpec {\n        name: NEWC,\n        doc: \"New.\",\n    },\n", head=new_c), lib,
              {"gate-levers", "gate-reader"}, None),
-            ("a row edited that a reader names by its const", registry(rows.replace("Room,", "Rooms,")), lib, {"gate-levers", "gate-reader"}, None),
+            ("a row edited that a reader names by its const", registry(rows.replace('default: "8"', 'default: "9"')), lib, {"gate-levers", "gate-reader"}, None),
+            # a doc edit of a row names no reader: only gate-levers tests the registry
+            ("a multi-line doc edited that a reader names by its const", registry(rows.replace("Room,", "Rooms,")), lib, {"gate-levers"}, None),
+            ("a doc edited that a recipe sets in its command", registry(rows.replace('"Spin."', '"Spins."')), lib, {"gate-levers"}, None),
+            ("a doc and a default both moved", registry(rows.replace("Room,", "Rooms,").replace('default: "8"', 'default: "9"')), lib,
+             {"gate-levers", "gate-reader"}, None),
+            ("a doc given as a const", registry(rows.replace('doc: "Spin."', "doc: SPIN_DOC"), head='const SPIN_DOC: &str = "Spin, again.";\n'), lib,
+             {"gate-levers", "gate-envset"}, None),
+            ("a doc given by concat!", registry(rows.replace('doc: "Spin."', 'doc: concat!("Spin", "s.")')), lib, {"gate-levers", "gate-envset"}, None),
+            # a runner's or a path's doc is the third argument of a call, not a `doc:` field: its edit is a changed row
             ("a runner row edited that a script names by its variable", registry(rows.replace("The context.", "The context, bytes.")), lib,
              {"gate-levers", "gate-script"}, None),
             ("a row edited that nothing names", registry(rows.replace('"Other."', '"Others."')), lib, {"gate-levers"}, None),
-            ("a row edited that a recipe sets in its command", registry(rows.replace('"Spin."', '"Spins."')), lib, {"gate-levers", "gate-envset"}, None),
+            ("a row edited that a recipe sets in its command", registry(rows.replace('default: "20000"', 'default: "20001"')), lib, {"gate-levers", "gate-envset"}, None),
             ("a row removed that a reader names", registry(spin_row + runners), lib, {"gate-levers", "gate-reader"}, None),
             ("a row removed that nothing names", registry(rows.replace('    runner("BLOOMERY_OTHER_", "Other."),\n', "")), lib, {"gate-levers"}, None),
             ("a runner row removed that a script names by its variable", registry(rows.replace('    runner("BLOOMERY_GEN_CTX", "The context."),\n', "")), lib,
@@ -11282,7 +11337,7 @@ def lever_rows_self_test(expect) -> None:
             ("comments and layout only", registry(rows.replace("    // ---------- the runners\n", "    // ---------- the runners, again\n").replace(
                 '    runner("BLOOMERY_OTHER_", "Other."),', '    runner(\n        "BLOOMERY_OTHER_",\n        "Other.",\n    ),'), before="    // a note\n"),
              lib, {"gate-levers"}, None),
-            ("lib.rs moved beside a row", registry(rows.replace("Room,", "Rooms,")), lib + "fn f() {}\n", every, None),
+            ("lib.rs moved beside a row", registry(rows.replace('default: "8"', 'default: "9"')), lib + "fn f() {}\n", every, None),
             ("a pub const that is no name moved", registry(limit="9"), lib, every, "code outside the rows moved near `LIMIT : u64 = 9"),
             ("the row helper's body moved", registry(cls="A"), lib, every, "code outside the rows moved near"),
             ("a new item beside the rows", registry(head="fn helper() {}\n"), lib, every, "code outside the rows moved near"),
@@ -11312,6 +11367,43 @@ def lever_rows_self_test(expect) -> None:
         got = tables.levers.lines()
         expect(got == [f"lever rows ({reg_file}): 1 added, 0 changed, 0 removed; the recipe that tests the registry: gate-levers",
                        "  added BLOOMERY_NEWC_: named in crates/reader/src/main.rs -> gate-reader"], f"lever rows: the printed block: {got}")
+        # a doc-only diff: the count names its kind, one line a row says no reader is selected, and the file a reader names its const in
+        # is not read for it
+        b = build(registry(rows.replace("Room,", "Rooms,")))
+        tables = TableReads([reg_file], a, b)
+        select([reg_file], a, b, GATE_PREFIX, tables)
+        got = tables.levers.lines()
+        expect(got == [f"lever rows ({reg_file}): 0 added, 0 changed, 1 doc, 0 removed; the recipe that tests the registry: gate-levers",
+                       "  doc BLOOMERY_HOST_ROOM: the doc text only; no reader selected"] and tables.levers._needle is None,
+               f"lever rows: the printed block of a doc-only diff: {got}")
+        # `doc` is decided by parsing: only a plain string literal (or a run of them) is taken out of a `LeverSpec { … }` row's own `doc:`
+        # field, and the rest of the row must then be token for token the same
+        def kinds(old_row: str, new_row: str) -> list[str]:
+            got_rows = diff_lever_rows(parse_lever_rows(registry(old_row)), parse_lever_rows(registry(new_row)))
+            return [x.kind for x in got_rows]
+
+        row = "    LeverSpec {\n        name: SPIN,\n        default: \"1\",\n        doc: %s,\n    },\n"
+        kind_cases = [
+            ("a literal", row % '"a"', row % '"b"', ["doc"]),
+            ("a raw literal", row % 'r#"a "q" b"#', row % 'r#"a "q" c"#', ["doc"]),
+            ("a literal continued over lines", row % '"a \\\n            b"', row % '"a \\\n            c"', ["doc"]),
+            ("a doc last in the row, no trailing comma", "    LeverSpec { name: SPIN, doc: \"a\" },\n", "    LeverSpec { name: SPIN, doc: \"b\" },\n", ["doc"]),
+            ("a literal then a field edited", row % '"a"', (row % '"b"').replace('"1"', '"2"'), ["changed"]),
+            ("a field edited under one doc", row % '"a"', (row % '"a"').replace('"1"', '"2"'), ["changed"]),
+            ("a literal against a const", row % '"a"', row % "DOC", ["changed"]),
+            ("a literal against concat!", row % '"a"', row % 'concat!("a", "b")', ["changed"]),
+            ("a literal against a method call", row % '"a"', row % '"a".trim()', ["changed"]),
+            ("a literal against a byte string", row % '"a"', row % 'b"a"', ["changed"]),
+            ("the doc moved within the row", row % '"a"', "    LeverSpec {\n        name: SPIN,\n        doc: \"a\",\n        default: \"1\",\n    },\n", ["changed"]),
+            ("a doc beside a nested doc", row % '"a"', (row % '"a"').replace("    },\n", "        site: Site { doc: \"x\" },\n    },\n"), ["changed"]),
+            ("a nested doc only", "    LeverSpec {\n        name: SPIN,\n        site: Site { doc: \"a\" },\n    },\n",
+             "    LeverSpec {\n        name: SPIN,\n        site: Site { doc: \"b\" },\n    },\n", ["changed"]),
+            ("a shorthand doc", "    LeverSpec { name: SPIN, default: \"1\", doc },\n", "    LeverSpec { name: SPIN, default: \"2\", doc },\n", ["changed"]),
+            ("a call row", '    runner("BLOOMERY_OTHER_", "a"),\n', '    runner("BLOOMERY_OTHER_", "b"),\n', ["changed"]),
+        ]
+        for what, old_row, new_row, want_kinds in kind_cases:
+            got_kinds = kinds(old_row, new_row)
+            expect(got_kinds == want_kinds, f"lever rows: {what} reads {got_kinds}, not {want_kinds}")
         # the lexer: a raw string, a byte string, a char and a lifetime, a nested block comment and a line comment; a literal or comment
         # that never ends is a doubt, never a token that runs to the end of the file
         got = [t for _, t in _rs_tokens('a r#"x "y" z"# b"q" \'c\' &\'static /* o /* i */ o */ d // e\n f "g\\"h"')]
@@ -11336,6 +11428,17 @@ def lever_rows_self_test(expect) -> None:
         grown = real.rstrip("\n").removesuffix("];") + '    runner("BLOOMERY_LEVSEL_PROBE_", "Probe."),\n];\n'
         got = diff_lever_rows(parsed, parse_lever_rows(grown))
         expect([(x.kind, x.label) for x in got] == [("added", "BLOOMERY_LEVSEL_PROBE_")], f"lever rows: a runner row added to the real registry: {got}")
+        # the doc string of a real row is a doc row; the same row with its default also moved is a changed one
+        at = real.index("        name: MTP_WIDTH,\n")
+        doc_at = real.index('        doc: "', at) + len('        doc: "')
+        dflt_at = real.index('        default: Unset::Means("', at) + len('        default: Unset::Means("')
+        expect(dflt_at < doc_at, "lever rows: the real MTP_WIDTH row states its default before its doc")
+        doc_edit = real[:doc_at] + "x " + real[doc_at:]
+        got = diff_lever_rows(parsed, parse_lever_rows(doc_edit))
+        expect([(x.kind, x.label, x.words) for x in got] == [("doc", f"{LEVER_PREFIX}MTP_WIDTH", frozenset())], f"lever rows: a doc edited in the real registry: {got}")
+        both = real[:dflt_at] + "x " + real[dflt_at:doc_at] + "x " + real[doc_at:]
+        got = diff_lever_rows(parsed, parse_lever_rows(both))
+        expect([(x.kind, x.label) for x in got] == [("changed", f"{LEVER_PREFIX}MTP_WIDTH")], f"lever rows: a doc and a default edited in the real registry: {got}")
         last = list(parsed.rows)[-1]
         got = diff_lever_rows(parsed, parse_lever_rows(real.replace(f'"{last}"', f'"{last}_X"', 1)))
         expect(sorted((x.kind, x.label) for x in got) == sorted([("added", f"{last}_X"), ("removed", last)]), f"lever rows: a row renamed in the real registry: {got}")
@@ -11351,9 +11454,12 @@ def lever_rows_self_test(expect) -> None:
             fh.write("\n".join(lines) + "\n")
         pair = (read_scan(log), read_scan(log))
         star = [PathRow(1, reg_file, ["*"], "why", glob_regex(reg_file))]
-        nar = narrow([reg_file], a, build(registry(rows.replace("Room,", "Rooms,"))), [pair], star)
+        nar = narrow([reg_file], a, build(registry(rows.replace('default: "8"', 'default: "9"'))), [pair], star)
         expect(not nar.full and set(nar.picks) == {"gate-levers", "gate-reader"},
                f"lever rows: --narrow on a row edit gives full {nar.full}, picks {sorted(nar.picks)} (want gate-levers gate-reader)")
+        nar = narrow([reg_file], a, build(registry(rows.replace("Room,", "Rooms,"))), [pair], star)
+        expect(not nar.full and set(nar.picks) == {"gate-levers"},
+               f"lever rows: --narrow on a doc edit gives full {nar.full}, picks {sorted(nar.picks)} (want gate-levers)")
         nar = narrow([reg_file], a, build(registry(limit="9")), [pair], star)
         expect(nar.full and "maps to *" in nar.full[0], f"lever rows: --narrow on code beside the rows keeps the full list: {nar.full}")
 
