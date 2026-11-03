@@ -21,7 +21,10 @@
 //!
 //! `--greedy` is the argmax, and the run checks every choice against the
 //! engine's own argmax of the same step: the generated ids are then the ones
-//! `generate_ds41 --tokens <the prompt's ids>` prints on its `tokens` line.
+//! `BLOOMERY_PREFILL=steps generate_ds41 --tokens <the prompt's ids>` prints
+//! on its `tokens` line, the same feed of one step per id (its default
+//! batched feed is held to the steps within the prefill gate's logits band,
+//! not to their bits).
 //! It refuses the sampling flags beside it. A run's refusal names its run.
 //!
 //! `--then` starts another run on the same load. A list of more than one run

@@ -21,8 +21,10 @@
 //! run's records, `--plan` runs included.
 //!
 //! Greedy only, one token per generated step. The fed ids go in batches of
-//! up to `body::T_MAX` positions (`body::prefill`, bit for bit the steps'
-//! state); `BLOOMERY_PREFILL=steps` feeds them one real step per id instead,
+//! up to `body::T_MAX` positions (`body::prefill`: the default block's card
+//! experts run the grouped GEMM, so a batched call is held to its steps
+//! within the prefill gate's logits band, not to their bits);
+//! `BLOOMERY_PREFILL=steps` feeds them one real step per id instead,
 //! the same binary's timing arm, and the `load` line prints which one ran
 //! (`prefill=`, the mode the engine holds). The levers it acts on (`ACTS_ON`)
 //! are parsed once, at `main` (`bloomery_levers::at_main`), which refuses by
