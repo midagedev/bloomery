@@ -10,7 +10,10 @@
 //! driver's most queues, `CUDA_DEVICE_MAX_CONNECTIONS=32`, which its recipe sets.
 //!
 //! - (n1) one rank reads the folder whole and runs [`STEPS`] greedy steps from [`FIRST`]: every
-//!   logit is finite.
+//!   logit is finite. No one-card run is its reference: the one-card body reads a GGUF split and
+//!   does not open the folder. What only the folder's formats run is held elsewhere: the shared
+//!   gate and up of MXFP8 or BF16 by `chain::ffn`'s `hw_shared_rows_pair_is_two_gemvs_then_swiglu`
+//!   (`just gate-gpu-ds41-lib`), the routed stacks' card formats by `body`'s unit test.
 //! - (n2), (n4) two and four ranks over the same steps against (n1), within the logits band
 //!   (`logits_band::walk`): each sum over the ranks adds the ranks' parts of the same exact integer
 //!   block sums in another f32 order than one rank's whole pass, so the logits sit near one rank's,
