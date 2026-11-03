@@ -1832,10 +1832,12 @@ gate-gpu-qwen35moe-verify:
 # the draft's resident bytes against the plan's figure with the bf16 widening named, the target's token_embd and output
 # read in place at their addresses and copied nowhere, the input join at one stream against the host's rounding band and
 # its refused stream counts, the draft's token equal to the host argmax of its logits, the refusals on the live draft, and
-# a printed smoke of how often the draft's token is the target's own next token over a 64-id prompt. The real file only.
+# a printed smoke of how often the draft's token is the target's own next token over a 64-id prompt. The real file only: it needs
+# BLOOMERY_MTP_MODEL (tools/ref/needs-env.sh), which a batch gives as the item's `@BLOOMERY_MTP_MODEL=<path>`, else it defers the
+# recipe by name.
 [group('pool')]
 gate-gpu-qwen35moe-mtp:
-    BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen35moe-mtp && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_mtp && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_mtp'
+    BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/needs-env.sh gate-gpu-qwen35moe-mtp BLOOMERY_MTP_MODEL && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_mtp && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_mtp'
 
 # The qwen3 serve seat's served drafts: BLOOMERY_DRAFT=dspark on Qwen3.6, on its two fine-tunes (Sage-A1.5 and
 # Ornith-1.5, which the RedHat draft fits by their shapes, not by their names) and on MiniCPM-V 4.7 (its
@@ -2249,15 +2251,17 @@ gate-gpu-flint-router:
 gate-gpu-lfm3-kernels:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_lfm3_kernels && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_lfm3_kernels'
 
-# Full-file eager/captured, resident-slot and ring-retention consumer transitions.
+# Full-file eager/captured, resident-slot and ring-retention consumer transitions. The complete Flint GGUF is BLOOMERY_MODEL
+# (tools/ref/needs-env.sh): a batch gives it as the item's `@BLOOMERY_MODEL=<path>`, else it defers the recipe by name.
 gate-gpu-flint-lib:
-    ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-flint-lib && bash tools/gate.sh --gpu --oxide --release -p bloomery-gpu-flint --lib -- --include-ignored --exact tests::hw_full_file_capture_slots_reset_and_ring_boundary'
+    ./tools/box.sh 'bash tools/ref/needs-env.sh gate-gpu-flint-lib BLOOMERY_MODEL && bash tools/gate.sh --gpu --oxide --release -p bloomery-gpu-flint --lib -- --include-ignored --exact tests::hw_full_file_capture_slots_reset_and_ring_boundary'
 
-# Real two-card top-six prompt/decode, union reference, capture and tier fault recovery.
+# Real two-card top-six prompt/decode, union reference, capture and tier fault recovery. The complete Flint GGUF is
+# BLOOMERY_MODEL (tools/ref/needs-env.sh): a batch gives it as the item's `@BLOOMERY_MODEL=<path>`, else it defers the recipe by name.
 [group('solo')]
 [group('v41-load')]
 gate-gpu-flint-twocard:
-    BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-flint-twocard && export BLOOMERY_GATE_V41_LOAD=1 && bash tools/gate.sh --gpu --oxide --release -p bloomery-gpu-flint --lib -- --include-ignored --exact two_card_tests::hw_two_card_full_file_union_capture_publication_fault_reset'
+    BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/needs-env.sh gate-gpu-flint-twocard BLOOMERY_MODEL && export BLOOMERY_GATE_V41_LOAD=1 && bash tools/gate.sh --gpu --oxide --release -p bloomery-gpu-flint --lib -- --include-ignored --exact two_card_tests::hw_two_card_full_file_union_capture_publication_fault_reset'
 
 # Muse Spark's 256-expert top-8 sigmoid router (`sigmoid_256_8`). Model-free like the Flint one,
 # plus the bias clause: the selection follows the biased scores, the weights the unbiased ones.
@@ -3955,10 +3959,11 @@ gate-gpu-glm5next-tp:
 # encoded on it and spliced through the seat's own steps (`Resident::encode`, `Encoded::prompt`), held to
 # `prefill_media` called with spans put together from the images' sizes, the same argmax and a bit-identical last hidden row; a
 # control without the rows that lies away from it; and the tower's refusal by name of a grid past its cap. No oracle: the
-# numbers' quality is the tower's gate's and (im)'s. Fixture tier only: on the real tier the bin fails by name before any load
-# (0 clauses). Loads the fixture once, on either card.
+# numbers' quality is the tower's gate's and (im)'s. Fixture-only (tools/ref/fixture-only.sh): the real tier has no clauses for it, so a
+# real-tier batch defers the recipe by name; run by hand on the real tier, the bin fails by name before any load (0 clauses). Loads the
+# fixture once, on either card.
 gate-gpu-glm5next-media-seat:
-    BLOOMERY_MODEL=glm5next ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,vision --release --bin gate_glm5next_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_e2e --only media-seat'
+    BLOOMERY_MODEL=glm5next ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-glm5next-media-seat && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,vision --release --bin gate_glm5next_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm5next_e2e --only media-seat'
 
 # The same gate's long step sets (`--only main --step-sets long`): the load at CTX and its clauses, with the 1,024-position
 # set and the 3,070-position `--dsa` set, the only comparisons with ik past 4 positions and the only end-to-end run past
