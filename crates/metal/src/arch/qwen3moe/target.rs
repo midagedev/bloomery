@@ -68,7 +68,7 @@ use runtime::seqstate::Kept;
 use runtime::{Out, Target, Verify, Want};
 
 use super::lanes::VERIFY_ROWS;
-use super::session::{PassOut, Session, SessionError, StateOut, StepMode};
+use super::session::{MtpArena, PassOut, Session, SessionError, StateOut, StepMode};
 use crate::kernels::{PASS_ROWS, SNAPS};
 
 const WHAT: &str = "qwen35moe target";
@@ -102,79 +102,7 @@ impl Target for Session {
         marks: &[u32],
         want: Want,
     ) -> Result<Out<'_>, SessionError> {
-        if ids.is_empty() {
-            return Err(refuse(format!(
-                "a prompt of no ids at position {}",
-                Session::pos(self)
-            )));
-        }
-        let end = u64::from(Session::pos(self)) + ids.len() as u64;
-        if end > u64::from(Target::ctx(self)) {
-            return Err(refuse(format!(
-                "a prompt of {} ids at position {}: the cache holds {} rows",
-                ids.len(),
-                Session::pos(self),
-                Session::ctx(self)
-            )));
-        }
-        let from = Session::pos(self);
-        let to = u32::try_from(end).map_err(|_| {
-            refuse(format!(
-                "a prompt of {} ids at position {from} passes the u32 positions",
-                ids.len()
-            ))
-        })?;
-        let inside = marks.first().is_none_or(|&u| u > from)
-            && marks.last().is_none_or(|&u| u <= to)
-            && marks.windows(2).all(|w| w[0] < w[1]);
-        if !inside {
-            return Err(refuse(format!(
-                "a prompt of positions {from}..{to} marked at {marks:?}: marks go ascending, \
-                 past the call's start and at most its end"
-            )));
-        }
-        // The id at an inner point is stepped by the next span, after the take.
-        // With no recurrent store the call takes no checkpoint: its end is
-        // its one point, and a mark has nothing to copy.
-        let mut points = self.checkpoint_marks(from, to);
-        let marks = if points.is_empty() {
-            points.push(to);
-            &[][..]
-        } else {
-            marks
-        };
-        let call = Call {
-            ids,
-            from,
-            last: ids.len() - 1,
-            steps: Session::prefill(self) == PrefillMode::Steps,
-        };
-        let batch_rows = Session::pass_rows(self);
-        let mut at = from;
-        let mut last_pick = None;
-        for p in points {
-            // The runs between two points, each cut into batches: a pass or
-            // its ids' steps, with the marks inside it.
-            for batch in call_batches(at, p, &[p], batch_rows) {
-                let inner: Vec<u32> = marks
-                    .iter()
-                    .copied()
-                    .filter(|&u| batch.start < u && u < batch.end)
-                    .collect();
-                last_pick = Some(call.run(self, batch.start, batch.end, &inner)?);
-                if batch.end != p && marks.contains(&batch.end) {
-                    Session::checkpoint(self)?;
-                }
-            }
-            Session::checkpoint(self)?;
-            at = p;
-        }
-        let pick = last_pick.ok_or_else(|| {
-            refuse(format!(
-                "a prompt of {} ids at position {from} stepped no id",
-                ids.len()
-            ))
-        })?;
+        let pick = prompt_call(self, ids, marks, None)?;
         read(self, pick, want)
     }
 
@@ -228,6 +156,100 @@ impl Verify for Session {
     }
 }
 
+/// What a prompt call tells after each unit it ran: the arena the unit's final
+/// hidden rows sit in, the unit's first position and its rows.
+pub(super) type Unit<'a> =
+    dyn FnMut(&mut Session, MtpArena, u32, usize) -> Result<(), SessionError> + 'a;
+
+/// The prompt call of [`Target::prompt_marked`] with no mark of the caller's
+/// beyond `marks`, the pick after its last id returned; `unit`, when given, is
+/// called after each unit the call ran, before the next unit overwrites the
+/// unit's rows. A call with a unit steps every id that is not its last with no
+/// token ahead (the step arena's residual is that token's), where a call with
+/// none steps them one ahead each; the programs of a call with none are the
+/// call's alone.
+pub(super) fn prompt_call(
+    s: &mut Session,
+    ids: &[u32],
+    marks: &[u32],
+    mut unit: Option<&mut Unit<'_>>,
+) -> Result<u32, SessionError> {
+    if ids.is_empty() {
+        return Err(refuse(format!(
+            "a prompt of no ids at position {}",
+            Session::pos(s)
+        )));
+    }
+    let end = u64::from(Session::pos(s)) + ids.len() as u64;
+    if end > u64::from(Target::ctx(s)) {
+        return Err(refuse(format!(
+            "a prompt of {} ids at position {}: the cache holds {} rows",
+            ids.len(),
+            Session::pos(s),
+            Session::ctx(s)
+        )));
+    }
+    let from = Session::pos(s);
+    let to = u32::try_from(end).map_err(|_| {
+        refuse(format!(
+            "a prompt of {} ids at position {from} passes the u32 positions",
+            ids.len()
+        ))
+    })?;
+    let inside = marks.first().is_none_or(|&u| u > from)
+        && marks.last().is_none_or(|&u| u <= to)
+        && marks.windows(2).all(|w| w[0] < w[1]);
+    if !inside {
+        return Err(refuse(format!(
+            "a prompt of positions {from}..{to} marked at {marks:?}: marks go ascending, \
+             past the call's start and at most its end"
+        )));
+    }
+    // The id at an inner point is stepped by the next span, after the take.
+    // With no recurrent store the call takes no checkpoint: its end is
+    // its one point, and a mark has nothing to copy.
+    let mut points = s.checkpoint_marks(from, to);
+    let marks = if points.is_empty() {
+        points.push(to);
+        &[][..]
+    } else {
+        marks
+    };
+    let call = Call {
+        ids,
+        from,
+        last: ids.len() - 1,
+        steps: Session::prefill(s) == PrefillMode::Steps,
+    };
+    let batch_rows = Session::pass_rows(s);
+    let mut at = from;
+    let mut last_pick = None;
+    for p in points {
+        // The runs between two points, each cut into batches: a pass or
+        // its ids' steps, with the marks inside it.
+        for batch in call_batches(at, p, &[p], batch_rows) {
+            let inner: Vec<u32> = marks
+                .iter()
+                .copied()
+                .filter(|&u| batch.start < u && u < batch.end)
+                .collect();
+            last_pick = Some(call.run(s, batch.start, batch.end, &inner, unit.as_deref_mut())?);
+            if batch.end != p && marks.contains(&batch.end) {
+                Session::checkpoint(s)?;
+            }
+        }
+        Session::checkpoint(s)?;
+        at = p;
+    }
+    let pick = last_pick.ok_or_else(|| {
+        refuse(format!(
+            "a prompt of {} ids at position {from} stepped no id",
+            ids.len()
+        ))
+    })?;
+    Ok(pick)
+}
+
 /// A prompt call's ids, the position of its first, the index of its last
 /// and whether the session steps every id.
 struct Call<'a> {
@@ -243,31 +265,38 @@ impl Call<'_> {
     /// steps of each run between two marks; past [`SNAPS`] marks the span is
     /// cut at the next one, whose point the first part's end is. Returns the
     /// last pick.
-    fn run(&self, s: &mut Session, a: u32, e: u32, marks: &[u32]) -> Result<u32, SessionError> {
+    fn run(
+        &self,
+        s: &mut Session,
+        a: u32,
+        e: u32,
+        marks: &[u32],
+        mut unit: Option<&mut Unit<'_>>,
+    ) -> Result<u32, SessionError> {
         let i = |u: u32| (u - self.from) as usize;
         if self.steps || i(e) - i(a) <= PASS_ROWS {
             let mut from = a;
             for &u in marks {
-                step_batch(s, self.ids, i(from), i(u), self.last)?;
+                step_batch(s, self.ids, i(from), i(u), self.last, unit.as_deref_mut())?;
                 Session::checkpoint(s)?;
                 from = u;
             }
-            return step_batch(s, self.ids, i(from), i(e), self.last);
+            return step_batch(s, self.ids, i(from), i(e), self.last, unit);
         }
         if !marks.is_empty() && !s.copies_in_pass() {
             // No copy inside a pass: a pass to each mark, then its point.
             let mut from = a;
             for &u in marks {
-                self.run(s, from, u, &[])?;
+                self.run(s, from, u, &[], unit.as_deref_mut())?;
                 Session::checkpoint(s)?;
                 from = u;
             }
-            return self.run(s, from, e, &[]);
+            return self.run(s, from, e, &[], unit);
         }
         if let Some(&cut) = marks.get(SNAPS) {
-            self.run(s, a, cut, &marks[..SNAPS])?;
+            self.run(s, a, cut, &marks[..SNAPS], unit.as_deref_mut())?;
             Session::checkpoint(s)?;
-            return self.run(s, cut, e, &marks[SNAPS + 1..]);
+            return self.run(s, cut, e, &marks[SNAPS + 1..], unit);
         }
         let after: Vec<u32> = marks.iter().map(|&u| u - a - 1).collect();
         let out = if i(e) == self.ids.len() {
@@ -281,6 +310,9 @@ impl Call<'_> {
             out,
             StateOut { after_rows: &after },
         )?;
+        if let Some(unit) = unit {
+            unit(s, MtpArena::Rows, a, (e - a) as usize)?;
+        }
         for &u in marks {
             s.checkpoint_copy(u)?;
         }
@@ -292,28 +324,37 @@ impl Call<'_> {
 /// id is known and inner, none of them but the prompt's last carrying a
 /// head: every id but the batch's last steps the next id ahead, both tokens
 /// without the head, since no inner pick is read. The batch's last row
-/// commits nothing — the mark's take follows — and so does the row before the
-/// prompt's last (index `last`), whose next runs the head on its own commit,
+/// commits nothing ahead — the mark's take follows — and so does the row before
+/// the prompt's last (index `last`), whose next runs the head on its own commit,
 /// the one pick the caller reads. Returns the last step's pick.
+///
+/// With a `unit`, no id runs ahead: each is stepped with no head and no token
+/// ahead but the prompt's last (the one that reads its pick), and `unit` hears
+/// of each after its step settled, the step's row in the arena.
 fn step_batch(
     s: &mut Session,
     ids: &[u32],
     start: usize,
     end_i: usize,
     last: usize,
+    mut unit: Option<&mut Unit<'_>>,
 ) -> Result<u32, SessionError> {
     let mut pick = None;
     for i in start..end_i {
         let mode = if i == last {
             StepMode::HostFed
-        } else if i + 1 < end_i && i + 1 != last {
+        } else if unit.is_none() && i + 1 < end_i && i + 1 != last {
             StepMode::Ahead {
                 next: Some(ids[i + 1]),
             }
         } else {
             StepMode::Ahead { next: None }
         };
+        let at = Session::pos(s);
         pick = Some(Session::step(s, ids[i], mode)?.id);
+        if let Some(unit) = unit.as_deref_mut() {
+            unit(s, MtpArena::Step, at, 1)?;
+        }
     }
     pick.ok_or_else(|| refuse("a batch of no ids".to_string()))
 }

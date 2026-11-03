@@ -168,12 +168,14 @@ flag, `--parallel`, `-ngl`, `--mmproj` and `--flash-attn` among them, is refused
   only its new messages. Any other prompt runs from position 0.
 `generate_metal --mtp SIDECAR` (off by default) opens the MTP draft layer of a Qwen3.5-family file beside the model: the folder of
 `mlx-community/Qwen3.8-27B-MTP-4bit` (MLX's folders strip `mtp.*`, so it is a separate download of 239 MB). `--draft-step-times [N]` times N
-draft steps, and `--mtp-check DIR/FAMILY` holds the draft step to a `tools/mlx-logits.py mtp-dump` reference; no draft policy runs yet.
+draft steps, and `--mtp-check DIR/FAMILY` holds the draft step to a `tools/mlx-logits.py mtp-dump` reference. `--draft mtp` (with `--mtp`) runs
+the decode loop over that draft: the shared MTP window (`runtime::mtp`) with the session as its host behind the width chooser, one proposed
+id a pass, verified in a pass of two rows. The ids are the plain run's; the summary adds `draft_accept_rate` beside the lookup draft's lines.
 
 - A long prompt runs in batched passes (flash attention over the pass, the experts over its rows); decode runs one id a
   step.
-- No saved prompt cache across slots, no slot files, no image input (MiniCPM-V's `mmproj` is not read), no speculative
-  decoding.
+- No saved prompt cache across slots, no slot files, no image input (MiniCPM-V's `mmproj` is not read). The
+  server does no speculative decoding; `generate_metal --draft lookup|mtp` does.
 - On an M5 (Metal 4, GPU family 17 or newer) the device picks the neural accelerators' tensor-op GEMMs for prompts
   (`gemm_path=tensor` in the stats); M1 to M4 run the SIMD-group GEMMs (`gemm_path=simdgroup`). On an M5 Ultra the
   tensor path took a 2,048-row prompt pass's GEMM class from 203.51 to 92.73 ms (@avlp12, #593). Its sums run in another

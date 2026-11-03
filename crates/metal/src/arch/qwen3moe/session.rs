@@ -133,7 +133,7 @@ use objc2_metal::MTLDevice;
 mod mtp;
 mod verify;
 
-pub use mtp::{DraftTimes, Drafted, MtpOpened};
+pub use mtp::{DraftTimes, Drafted, MtpArena, MtpOpened};
 pub use verify::{BufferStamp, TraceSummary, VerifyTrace};
 
 pub(super) const WHAT: &str = "qwen35moe session";
@@ -297,6 +297,14 @@ impl From<ChainError> for SessionError {
 /// `runtime::width::Choosing` runs on this session as its target.
 impl From<runtime::WidthError> for SessionError {
     fn from(e: runtime::WidthError) -> Self {
+        refuse(e.to_string())
+    }
+}
+
+/// The MTP window's refusal is the session's, by name: the window drafts on
+/// this session as its host.
+impl From<runtime::mtp::Refused> for SessionError {
+    fn from(e: runtime::mtp::Refused) -> Self {
         refuse(e.to_string())
     }
 }
@@ -1838,6 +1846,9 @@ impl Session {
         self.pos = 0;
         self.poisoned = None;
         self.pending = None;
+        if let Some(mtp) = self.mtp.as_mut() {
+            mtp.emptied();
+        }
         if let Some(verify) = self.rows.verify.as_mut() {
             // A verify the fault cut short may have left a fold's ticket set.
             verify.ticket.zero();
@@ -2106,6 +2117,9 @@ impl Session {
             Err(e) => return Err(checkpoint_error(e)),
         }
         self.pos = n;
+        if let Some(mtp) = self.mtp.as_mut() {
+            mtp.cut_to(n);
+        }
         self.drop_copies();
         Ok(())
     }
