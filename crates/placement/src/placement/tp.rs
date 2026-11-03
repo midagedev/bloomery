@@ -17,6 +17,7 @@ use gguf::{GgmlType, TensorInfo};
 use models::Role;
 
 use super::devices::DeviceId;
+use super::machine::file_card_format;
 use super::workstation::{CardSpec, unified_of};
 use crate::kernels;
 
@@ -28,6 +29,10 @@ pub struct TpTensor {
     pub dims: Vec<u64>,
     /// The bytes that split with the values (the values and their block scales).
     pub bytes: u64,
+    /// The card type a rank loads its part in. A part then counts its own shape's resident bytes
+    /// in that type's card layout ([`file_card_format`]), each row's padding and scale words
+    /// included; `None` splits `bytes` evenly.
+    pub card: Option<GgmlType>,
     /// The bytes every rank holds whole beside its part (a tensor scale a matrix).
     pub whole_bytes: u64,
     /// The values a part keeps whole along dims 0 and 1: the format's block, along dim 0 at
@@ -373,12 +378,13 @@ pub fn plan_tp(pools: &[RankPool], tensors: &[TpTensor]) -> Result<Vec<Rank>, Tp
             whole_n += 1;
             continue;
         };
-        cut.part(&t.name, &t.dims, t.block, n)?;
-        let ranks = n as u64;
-        // Whole blocks a part: the bytes split evenly with the values.
-        split = split
-            .checked_add(t.bytes / ranks)
-            .ok_or(TpError::Overflow)?;
+        let part = cut.part(&t.name, &t.dims, t.block, n)?;
+        let bytes = match t.card {
+            Some(ty) => part_bytes(t, cut.dim, part, ty)?,
+            // Whole blocks a part: the bytes split evenly with the values.
+            None => t.bytes / n as u64,
+        };
+        split = split.checked_add(bytes).ok_or(TpError::Overflow)?;
         whole = whole.checked_add(t.whole_bytes).ok_or(TpError::Overflow)?;
         split_n += 1;
     }
@@ -409,6 +415,24 @@ pub fn plan_tp(pools: &[RankPool], tensors: &[TpTensor]) -> Result<Vec<Rank>, Tp
         .collect()
 }
 
+/// The resident bytes of `t`'s part of `part` values along `dim` in card type `ty`'s layout, as a
+/// rank's load allocates them; a shape past u64 or with no layout is refused.
+fn part_bytes(t: &TpTensor, dim: usize, part: u64, ty: GgmlType) -> Result<u64, TpError> {
+    let mut dims = t.dims.clone();
+    dims[dim] = part;
+    let k = dims[0];
+    let rows = dims[1..]
+        .iter()
+        .try_fold(1u64, |a, &b| a.checked_mul(b))
+        .ok_or(TpError::Overflow)?;
+    file_card_format(&t.name, ty, k)
+        .and_then(|f| f.resident_bytes(ty, k, rows))
+        .ok_or_else(|| TpError::Tensor {
+            name: t.name.clone(),
+            detail: format!("no resident card form for {ty} part {dims:?}"),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -432,6 +456,7 @@ mod tests {
             name: name.into(),
             dims: vec![k, rows],
             bytes: k * rows,
+            card: None,
             whole_bytes: 4,
             block,
             cut,
@@ -472,6 +497,42 @@ mod tests {
                 pool: need - 1
             }
         );
+    }
+
+    /// A part of a tensor with a card type counts its own rows' padding and scale words: K 2304
+    /// over 4 ranks leaves 576, which MXFP8 planes hold in 576 + 4 · ceil(576 / 128) = 596 bytes a
+    /// row and q5_1 in one 1024-value code window and 18 scale pairs, 1168, not a quarter of the
+    /// tensor's 594 and 912. A pool one byte short of that is refused. Mutant, the tensor's bytes
+    /// over N: 3,041,280 and 4,669,440 pass both pools.
+    #[test]
+    fn a_part_counts_its_own_rows_padding() {
+        const ROWS: u64 = 5120;
+        for (ty, whole, need) in [
+            (GgmlType::MXFP8, 12_165_120, 3_051_520),
+            (GgmlType::Q5_1, 18_677_760, 5_980_160),
+        ] {
+            let ts = [TpTensor {
+                name: "down".into(),
+                dims: vec![2304, ROWS],
+                bytes: whole,
+                card: Some(ty),
+                whole_bytes: 0,
+                block: [32, 1],
+                cut: Some(Cut { dim: 0, unit: 32 }),
+            }];
+            let plan = plan_tp(&pools(4, need), &ts).unwrap();
+            assert!(plan.iter().all(|r| r.bytes() == need), "{ty}: {plan:?}");
+            assert_eq!(
+                plan_tp(&pools(4, need - 1), &ts).unwrap_err(),
+                TpError::Over {
+                    rank: 0,
+                    node: "node0".into(),
+                    bytes: need,
+                    pool: need - 1
+                },
+                "{ty}"
+            );
+        }
     }
 
     /// A unified node's rank plans against its node's pool, a card's against its usable bytes
@@ -526,6 +587,7 @@ mod tests {
             name: "large".into(),
             dims: vec![1 << 62],
             bytes,
+            card: None,
             whole_bytes,
             block: [1, 1],
             cut,
@@ -602,16 +664,19 @@ mod tests {
         assert_eq!(plan_tp(&[], &[]).unwrap_err(), TpError::NoRank);
     }
 
-    /// A cut along K keeps the card layout's unit whole past the format's 32-value block: MXFP8
-    /// planes 128 values (K 4096 at N = 32 is 128 a rank, at N = 64 64), an MXFP4 stack 256 (K
-    /// 1024 at N = 4 is 256, at N = 8 128); a type whose block is its layout keeps its block.
+    /// A cut along K keeps the card layout's unit whole: MXFP8 planes and an MXFP4 routed down,
+    /// whose part reads the 32-value activation, keep their 32-value block (K 2304 at N = 8 is
+    /// 288 a rank, at N = 16 144); a type whose block is its layout keeps its block.
+    // PIN(2026-11-03): MXFP8 planes took 128 values and an MXFP4 stack 256 (K 4096 at N = 32
+    // and 1024 at N = 4 the last fits); both now take 32-value parts.
     #[test]
     fn a_cut_keeps_the_card_layouts_k_unit_whole() {
-        for (ty, k, fits, cuts) in [
-            (GgmlType::MXFP8, 4096, 32, 64),
-            (GgmlType::MXFP4, 1024, 4, 8),
+        for (ty, role) in [
+            (GgmlType::MXFP8, Role::DenseFfn),
+            (GgmlType::MXFP4, Role::RoutedExperts),
         ] {
-            let block = card_blocks(ty, [32, 1], Role::DenseFfn).unwrap();
+            let (k, fits, cuts) = (2304, 8, 16);
+            let block = card_blocks(ty, [32, 1], role).unwrap();
             let down = || t("down", k, 64, block, Some(Cut { dim: 0, unit: 1 }));
             assert!(plan_tp(&pools(fits, u64::MAX), &[down()]).is_ok(), "{ty}");
             assert!(
@@ -650,8 +715,8 @@ mod tests {
             Ok([256, 1])
         );
         assert_eq!(
-            card_blocks(GgmlType::MXFP8, [48, 128], Role::DenseFfn),
-            Ok([384, 128])
+            card_blocks(GgmlType::MXFP4, [48, 128], Role::RoutedExperts),
+            Ok([96, 128])
         );
         assert_eq!(
             card_blocks(GgmlType::MXFP4, [u64::MAX, 1], Role::RoutedExperts),
@@ -833,11 +898,12 @@ mod tests {
                 ranks: 2
             }
         );
-        // An MXFP4 stack's card layout keeps 256 values along K: 1024 into 4 ranks, not into 8.
+        // PIN(2026-11-03): an MXFP4 stack kept 256 values along K (1024 into 4 ranks, not 8, as a
+        // DenseFfn); a routed down keeps its 32-value block now: 1024 into 32 ranks, not into 64.
         let (mx, _) = tensor(GgmlType::MXFP4, &[1024, 4]);
         let k = Some(Cut { dim: 0, unit: 1 });
-        assert!(rank_part(&mx, k, Role::DenseFfn, 0, 4).is_ok());
-        assert!(rank_part(&mx, k, Role::DenseFfn, 0, 8).is_err());
+        assert!(rank_part(&mx, k, Role::RoutedExperts, 0, 32).is_ok());
+        assert!(rank_part(&mx, k, Role::RoutedExperts, 0, 64).is_err());
         let (nv, _) = tensor(GgmlType::NVFP4, &[1024, 64]);
         for role in [Role::Attention, Role::DenseFfn, Role::SharedExpert] {
             for n in [1, 2, 4] {

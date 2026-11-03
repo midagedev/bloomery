@@ -412,15 +412,13 @@ fn card_stacks<'w>(w: &'w Weights, cl: &'w CardLayer) -> Result<LegStacks<'w>, G
     )
 }
 
-/// The form `st`'s down entry reads ([`kernels::down`]); a down the table
-/// names no entry for, which the arms refuse first, is refused by name.
+/// The form `st`'s down is read over at its row width ([`LegStacks::down_act`]); a down the
+/// table names no entry for, which the arms refuse first, is refused by name.
 fn down_form(st: &LegStacks<'_>) -> Result<DownAct, GpuError> {
-    kernels::down(st.down_ty())
-        .map(|(_, act)| act)
-        .ok_or_else(|| GpuError::Shape {
-            what: CARD,
-            detail: format!("a down stack of {} with no entry", st.down_ty()),
-        })
+    st.down_act().ok_or_else(|| GpuError::Shape {
+        what: CARD,
+        detail: format!("a down stack of {} with no entry", st.down_ty()),
+    })
 }
 
 /// A routed layer's names, borrowed out of their [`FfnNames::Moe`].

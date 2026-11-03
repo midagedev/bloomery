@@ -17,6 +17,9 @@
 //! - BF16: `q8f32`'s `bf16_gemv` over the file's words and the f32 input
 //!   (each value widened as it is read, so exact), the compressor's and the
 //!   indexer's projections.
+//! - MXFP8: `q8f32`'s E4M3 gemv over the card's two planes, the dense site's
+//!   own entry, at any K of whole 32-value blocks (a tensor-parallel rank's
+//!   part of the shared down among them).
 //!
 //! Two shapes of their own, where the file's format is a K-quant:
 //! - `attn_output_a`'s block diagonal ([`DenseKernels::enqueue_q3k_heads`]):
@@ -48,6 +51,7 @@
 //! m columns the next projection quantizes.
 
 use bloomery_gpu::cores::{q3k_row_dot, q3k_row_dot_cols};
+use bloomery_gpu::q8f32::{E4m3GemvArgs, E4m3Weight, GemvOut};
 use bloomery_gpu::site::{self, SiteTy};
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{
@@ -791,6 +795,9 @@ pub enum Dense<'w> {
     Q5K(&'w DeviceTensor<u32>),
     /// BF16 as the file stores it, two values to a word.
     Bf16(&'w DeviceTensor<u32>),
+    /// MXFP8 in the card's two planes, the common E4M3 gemv's
+    /// (`site::gemv`'s MXFP8 entry), at any K of whole 32-value blocks.
+    Mxfp8(E4m3Weight<'w>),
 }
 
 impl<'w> Dense<'w> {
@@ -798,12 +805,13 @@ impl<'w> Dense<'w> {
     /// values onto `rows` rows at a site type this module runs (the type of
     /// its resident form, `site::resident_site`).
     pub fn of(w: &'w Weights, name: &str, k: usize, rows: usize) -> Result<Dense<'w>, GpuError> {
-        const TYS: [SiteTy; 5] = [
+        const TYS: [SiteTy; 6] = [
             SiteTy::Q8_0,
             SiteTy::Q3K,
             SiteTy::Q4K,
             SiteTy::Q5K,
             SiteTy::Bf16,
+            SiteTy::Mxfp8,
         ];
         let ty = site::resident_site(w, WHAT, name, (rows, k), &TYS)?;
         match (ty, w.resident(WHAT, name)?) {
@@ -812,6 +820,7 @@ impl<'w> Dense<'w> {
             (SiteTy::Q4K, DevWeight::KQuant { w: t, .. }) => Ok(Dense::Q4K(t)),
             (SiteTy::Q5K, DevWeight::KQuant { w: t, .. }) => Ok(Dense::Q5K(t)),
             (SiteTy::Bf16, DevWeight::Bf16 { w: t, .. }) => Ok(Dense::Bf16(t)),
+            (SiteTy::Mxfp8, DevWeight::Mxfp8 { .. }) => Ok(Dense::Mxfp8(w.e4m3(WHAT, name)?)),
             _ => Err(GpuError::tensor(
                 WHAT,
                 name,
@@ -890,6 +899,16 @@ impl DenseKernels {
             Dense::Q4K(w) => gpu.enqueue_gemv_q4k(w, act()?, y),
             Dense::Q5K(w) => self.enqueue_q5k(stream, w, x, m, y),
             Dense::Bf16(w) => gpu.q8f32().enqueue_bf16_gemv(stream, w, x, m, y),
+            Dense::Mxfp8(w) => gpu.q8f32().enqueue_e4m3_gemv(
+                stream,
+                E4m3GemvArgs {
+                    w,
+                    x,
+                    m,
+                    out: GemvOut::RowMajor,
+                    y,
+                },
+            ),
         }
     }
 
@@ -1549,5 +1568,90 @@ mod tests {
             .enqueue_f32_gemv(stream, &wf, &xd, M, &mut want)
             .expect("f32 gemv");
         assert_eq!(bits(&y, stream), bits(&want, stream));
+    }
+
+    /// An MXFP8 projection of 576 values a row (a four-rank part of the
+    /// shared down of 2,304: four whole scale words and half of a fifth) runs
+    /// the E4M3 gemv: at three tokens, `y[r·m + c]` is bit for bit the q8f32
+    /// byte-order rule over the file decode of row `r` and column `c`. As a
+    /// grouped wo_a of three groups of eight rows (`enqueue_mxfp8_gemv_heads`,
+    /// attn's MXFP8 arm), row `r` is that rule on window `r / 8` of the input.
+    /// Mutant: the window offset dropped reads window 0 for every group.
+    #[test]
+    #[ignore = "needs a CUDA card"]
+    fn hw_mxfp8_dense_is_the_byte_rule_at_a_k_tail() {
+        use bloomery_gpu::q8f32::{E4m3Scales, e4m3_planes};
+        use gguf::quant::{GgmlType, dequant_row};
+        use runtime::hc_gated::card::q8_dot;
+        const ROWS: usize = 24;
+        const K: usize = 576;
+        const M: usize = 3;
+        let gpu = Gpu::new().expect("card");
+        let stream = gpu.stream();
+        let dense = DenseKernels::load(gpu.context()).expect("dense");
+        // Scale bytes on 112..=136 and value bytes off E4M3's NaN (0x7F, 0xFF).
+        let bytes: Vec<u8> = f32s(ROWS * K / 32 * 33, 5)
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let b = ((v + 1.0) * 127.5) as u8;
+                if i % 33 == 0 {
+                    112 + b % 25
+                } else if b & 0x7F == 0x7F {
+                    b & 0xFE
+                } else {
+                    b
+                }
+            })
+            .collect();
+        let (qs, e) = e4m3_planes(E4m3Scales::Mxfp8, &bytes, ROWS, K).expect("planes");
+        let qs = DeviceTensor::upload(stream, &qs, ROWS, K / 4).expect("qs");
+        let e = DeviceTensor::upload(stream, &e, ROWS, K.div_ceil(128)).expect("e");
+        let w = E4m3Weight {
+            qs: &qs,
+            e: &e,
+            scales: E4m3Scales::Mxfp8,
+        };
+        let x = f32s(M * K, 6);
+        let xd = DeviceBuffer::from_host(stream, &x).expect("x");
+        let mut y = DeviceBuffer::zeroed(stream, M * ROWS).expect("y");
+        dense
+            .enqueue_m(&gpu, Dense::Mxfp8(w), &xd, None, M, &mut y)
+            .expect("mxfp8 dense");
+        let got = bits(&y, stream);
+        let row_bytes = K / 32 * 33;
+        for r in 0..ROWS {
+            let mut wr = vec![0f32; K];
+            dequant_row(
+                GgmlType::MXFP8,
+                &bytes[r * row_bytes..][..row_bytes],
+                &mut wr,
+            )
+            .expect("the file decode");
+            for c in 0..M {
+                let want = q8_dot(&wr, &x[c * K..][..K]).to_bits();
+                assert_eq!(got[r * M + c], want, "row {r} column {c}");
+            }
+        }
+        let mut heads = DeviceBuffer::zeroed(stream, ROWS).expect("heads");
+        gpu.q8f32()
+            .enqueue_mxfp8_gemv_heads(stream, w, &xd, (ROWS / M, K), &mut heads)
+            .expect("mxfp8 heads");
+        let heads = bits(&heads, stream);
+        for (r, &h) in heads.iter().enumerate() {
+            let mut wr = vec![0f32; K];
+            dequant_row(
+                GgmlType::MXFP8,
+                &bytes[r * row_bytes..][..row_bytes],
+                &mut wr,
+            )
+            .expect("the file decode");
+            let g = r / (ROWS / M);
+            assert_eq!(
+                h,
+                q8_dot(&wr, &x[g * K..][..K]).to_bits(),
+                "row {r} group {g}"
+            );
+        }
     }
 }

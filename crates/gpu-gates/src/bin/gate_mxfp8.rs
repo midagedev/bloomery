@@ -80,13 +80,21 @@
 //! An id past the stack writes its slot NaN and raises `ExpertId`, the other
 //! slot keeping its bits; an MXFP8 stack is refused by name.
 //!
+//! MXFP8 rows of a K that is no multiple of 128 (`ktail`): a tensor-parallel
+//! rank's part of DeepSeek-V4.1's shared down at four ranks (5,120 rows of
+//! 576) and at two (of 1,152), and 9 rows of 96. A row's scale words end in a
+//! word only partly its own (`e4m3_planes`, `ceil(k / 128)` words a row), so
+//! the gemv at one and more columns, the decode and the listed rows hold the
+//! `written`, `band` and `bits` checks there too; the wide tile reads whole
+//! 128-value records and refuses such a K by name (`plane-shape`).
+//!
 //! And the load's refusals, each naming the tensor: an MXFP8 scale byte 0xFF
-//! (E8M0's NaN), a value byte 0x7F (E4M3's NaN) of either type, an MXFP8 row
-//! of 96 values (no whole scale word), an FP8_B128 scale that is not finite,
-//! and an FP8_B128 scale a value times leaves f32's range. Both launchers
+//! (E8M0's NaN), a value byte 0x7F (E4M3's NaN) of either type, an FP8_B128
+//! scale that is not finite, and an FP8_B128 scale a value times leaves f32's
+//! range. Both launchers
 //! refuse malformed planes of either type with one diagnostic (`plane-shape`:
 //! K misaligned, a wrong scale-row count, a wrong scale width), and the tile
-//! a column count whose sizes overflow.
+//! a column count whose sizes overflow and an MXFP8 K tail.
 //!
 //! The band. Every term `w_j · x_j` enters its lane by one fused multiply-add
 //! of `w_j = v_j · d` rounded once to f32, as the host dequant `w` the band is
@@ -181,7 +189,11 @@ mod gate {
     /// MXFP8 row counts that leave the last block of eight rows partly empty,
     /// at four columns: the staged walk (`k` a multiple of 512) and, at `k`
     /// 384, the unstaged one; nine rows also at seven columns, the wide stage.
-    const TAILS: [Shape; 4] = [
+    /// Then the K tails (module doc, `ktail`), no wide column among them.
+    // PIN(2026-11-03): an MXFP8 row of 96 values was a load refusal (no whole
+    // scale word); its planes now pad the row's last scale word, so it joins
+    // the K tails beside 576 and 1,152.
+    const TAILS: [Shape; 7] = [
         Shape {
             stem: "tail.r1",
             rows: 1,
@@ -209,6 +221,27 @@ mod gate {
             k: 384,
             ms: &[4],
             seed: 0x5eed_0873,
+        },
+        Shape {
+            stem: "ktail.tp4_shexp_down",
+            rows: 5120,
+            k: 576,
+            ms: &[1, 3, 8],
+            seed: 0x5eed_0874,
+        },
+        Shape {
+            stem: "ktail.tp2_shexp_down",
+            rows: 5120,
+            k: 1152,
+            ms: &[1, 4, 8],
+            seed: 0x5eed_0875,
+        },
+        Shape {
+            stem: "ktail.r9k96",
+            rows: 9,
+            k: 96,
+            ms: &[1, 2],
+            seed: 0x5eed_0876,
         },
     ];
 
@@ -369,7 +402,6 @@ mod gate {
         let mut nan_value = mxfp8_bytes(8, 256, 8);
         nan_value[9 * 33 + 5] = 0x7F;
         decls.push(decl("nan_value.weight", mx, (8, 256), nan_value));
-        decls.push(decl("k96.weight", mx, (8, 96), mxfp8_bytes(8, 96, 9)));
         let b128 = GgmlType::FP8_B128;
         let mut inf_scale = fp8_b128_bytes(8, 256, 10);
         inf_scale[5 * 132..][..4].copy_from_slice(&f32::INFINITY.to_le_bytes());
@@ -473,7 +505,6 @@ mod gate {
         for (tag, name, want) in [
             ("mxfp8", "nan_scale.weight", "E8M0's NaN"),
             ("mxfp8", "nan_value.weight", "byte 0x7f"),
-            ("mxfp8", "k96.weight", "have no Mxfp8Planes layout"),
             ("fp8_b128", "b128_inf_scale.weight", "not finite"),
             ("fp8_b128", "b128_nan_value.weight", "byte 0xff"),
             ("fp8_b128", "b128_past_f32.weight", "leaves f32's range"),
@@ -650,7 +681,7 @@ mod gate {
             ("k-zero", 1, 0, 1, 0),
             ("rows-zero", 0, 32, 0, 1),
             ("k-overflow", 0, usize::MAX / 4 + 1, 0, 0),
-            ("k-alignment", 8, 40, 8, 1),
+            ("k-alignment", 8, 36, 8, 2),
             ("scale-rows", 8, 32, 9, 1),
             ("scale-width", 8, 32, 8, 2),
         ] {
@@ -738,7 +769,32 @@ mod gate {
             "{tag} clause=plane-shape case=column-overflow tile={tile:?} mma={mma:?} {}",
             verdict(pass)
         );
-        Ok(ok && pass)
+        ok &= pass;
+        if scales == E4m3Scales::Mxfp8 {
+            // A K tail (576: four whole scale words and half of a fifth) the
+            // gemv reads: the wide entries, which walk whole 128-value
+            // records, refuse it by name.
+            let qs = DeviceTensor::<u32>::zeroed(gpu.stream(), 8, 144)?;
+            let e = DeviceTensor::<u32>::zeroed(gpu.stream(), 8, 5)?;
+            let x = DeviceBuffer::<f32>::zeroed(gpu.stream(), 576)?;
+            let w = E4m3Weight {
+                qs: &qs,
+                e: &e,
+                scales,
+            };
+            let tile = g32.enqueue_e4m3_tile(gpu.stream(), w, &x, 1, &mut y);
+            let mma = g32.enqueue_e4m3_mma(gpu.stream(), w, &x, 1, &mut y);
+            let pass = [&tile, &mma].iter().all(|r| {
+                r.as_ref()
+                    .is_err_and(|e| e.to_string().contains("whole 128-value records"))
+            });
+            println!(
+                "{tag} clause=plane-shape case=k-tail-wide tile={tile:?} mma={mma:?} {}",
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        Ok(ok)
     }
 
     /// Parts of the E4M3 type `ty` joined into one weight, as a model joins

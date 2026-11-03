@@ -544,7 +544,8 @@ pub fn leg_runs(p: Program, [gate, up, down]: [GgmlType; 3]) -> Option<bool> {
 }
 
 /// The union of down activation forms of the complete routed layers that
-/// `p`'s placement rule admits, resolved from the file's descriptor at load.
+/// `p`'s placement rule admits, resolved from the file's descriptor at load: each down's
+/// [`kernels::down_act`] at its stack's K.
 #[must_use]
 pub fn leg_down_forms(p: Program, model: &crate::placement::ModelTensors) -> kernels::DownForms {
     use crate::placement::{ExpertPart, Role};
@@ -571,16 +572,16 @@ pub fn leg_down_forms(p: Program, model: &crate::placement::ModelTensors) -> ker
                 Some(ExpertPart::Down) => 2,
                 None => continue,
             };
-            parts[part] = Some(t.ty);
+            parts[part] = Some((t.ty, t.dims.first().copied().unwrap_or(0)));
         }
-        if let [Some(g), Some(u), Some(d)] = parts
+        if let [Some((g, _)), Some((u, _)), Some((d, k))] = parts
             && g == u
             && gate_up(g).is_some()
             && down(d).is_some()
             && pair.is_none_or(|pair| pair(g, d, false))
-            && let Some((_, act)) = kernels::down(d)
+            && kernels::down(d).is_some()
         {
-            forms = forms.with(act);
+            forms = forms.with(kernels::down_act(d, k));
         }
     }
     forms

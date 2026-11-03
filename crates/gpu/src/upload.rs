@@ -174,14 +174,7 @@ impl UploadRing {
     ) -> Result<(), GpuError> {
         let (what, name) = (codes.what, codes.name);
         let shape = |detail: String| GpuError::shape(what, format!("tensor {name}: {detail}"));
-        let row = row_recs
-            .checked_mul(format.record_bytes())
-            .filter(|&r| r > 0)
-            .ok_or_else(|| shape(format!("a {format:?} row of {row_recs} records")))?;
-        let (code_row, head_row) = (
-            row_recs * format.code_bytes(),
-            row_recs * format.head_bytes(),
-        );
+        let (row, code_row, head_row) = planes::row_widths(format, row_recs).map_err(shape)?;
         let held: usize = src.iter().map(|s| s.len()).sum();
         if held < take || !take.is_multiple_of(row) {
             return Err(shape(format!(
@@ -303,11 +296,10 @@ impl UploadRing {
             op: Some("cuEventSynchronize (an upload slot)"),
             source,
         })?;
-        let rows = piece.len() / (row_recs * format.record_bytes());
-        let (code_len, head_len) = (
-            rows * row_recs * format.code_bytes(),
-            rows * row_recs * format.head_bytes(),
-        );
+        let (row, code_row, head_row) = planes::row_widths(format, row_recs)
+            .map_err(|detail| GpuError::shape(what, format!("tensor {name}: {detail}")))?;
+        let rows = piece.len() / row;
+        let (code_len, head_len) = (rows * code_row, rows * head_row);
         let staging = &mut slot.host.as_mut_slice()[..code_len + head_len];
         if let Err(detail) = planes::fill_piece(format, row_recs, first, piece, staging) {
             // A piece before this one may still be copying into the caller's

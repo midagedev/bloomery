@@ -149,7 +149,9 @@ pub enum FaultSite {
     /// attention output under its sigmoid gate, the shared expert's gated sum)
     /// or Gemma4a's audio channel normalization, attention score or GLU met
     /// non-finite arithmetic; a gate-up's gate or up dot sum was not finite
-    /// before its activation (including an NVFP4 expert's tensor scale).
+    /// before its activation (including an NVFP4 expert's tensor scale); an
+    /// MXFP8 row decode (`elem::mxfp8_embed_value`) met a byte the format
+    /// leaves undefined or a product past f32.
     F32Product = 21,
     /// A head whose logits no quantizer checked before them (a Q8_0 lm_head
     /// over f32 rows) met a logit that is not finite in its argmax.

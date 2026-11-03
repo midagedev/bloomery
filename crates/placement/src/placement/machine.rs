@@ -325,7 +325,8 @@ impl Card {
     }
 }
 
-/// Routed down forms with their layers, before a placement selects any experts.
+/// Routed down forms with their layers, each at its stack's row width ([`crate::kernels::down_act`]),
+/// before a placement selects any experts.
 pub(super) fn routed_down_acts(
     model: &ModelTensors,
 ) -> impl Iterator<Item = (usize, crate::kernels::DownAct)> + '_ {
@@ -333,7 +334,8 @@ pub(super) fn routed_down_acts(
         if t.role != Role::RoutedExperts || ExpertPart::of_name(&t.name) != Some(ExpertPart::Down) {
             return None;
         }
-        Some((t.layer?, crate::kernels::down(t.ty)?.1))
+        crate::kernels::down(t.ty)?;
+        Some((t.layer?, crate::kernels::down_act(t.ty, *t.dims.first()?)))
     })
 }
 

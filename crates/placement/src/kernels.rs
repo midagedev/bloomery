@@ -449,28 +449,51 @@ pub const fn card_relu2_runs(ty: GgmlType) -> bool {
     card_sel32_runs(ty) || card_planes_runs(ty)
 }
 
+/// The values a [`DownAct::Q8Act`] column holds whole: its super-blocks of 256.
+pub const Q8_ACT_UNIT: u64 = 256;
+
+/// Whether the common card leg runs a routed down stack of type `ty` over the 32-value
+/// [`DownAct::Q8Blocks32`]: the entries of that form ([`down`]), and MXFP4, whose down reads
+/// either form (`mxfp4_gemv_sel` over a `Q8Act` or a `Q8Blocks32`).
+#[must_use]
+pub const fn down_reads_blocks32(ty: GgmlType) -> bool {
+    matches!(
+        down(ty),
+        Some((DownEntry::Mxfp4, _) | (_, DownAct::Q8Blocks32))
+    )
+}
+
+/// The activation form a routed down stack of type `ty` whose rows hold `k` values is read
+/// over: its entry's [`DownAct::Q8Act`] when `k` fills whole [`Q8_ACT_UNIT`]s, else the 32-value
+/// [`DownAct::Q8Blocks32`]. A part of an MXFP4 stack cut to a K off the 256 unit (a
+/// tensor-parallel rank's) so reads the 32-value form ([`down_reads_blocks32`]); a type of
+/// 256-value blocks has no such K, and a type the leg has no 32-value entry for is refused by
+/// the leg by name. Every card leg's buffers and its launch take the form from here.
+#[must_use]
+pub const fn down_act(ty: GgmlType, k: u64) -> DownAct {
+    match down(ty) {
+        Some((_, DownAct::Q8Act)) if k.is_multiple_of(Q8_ACT_UNIT) => DownAct::Q8Act,
+        _ => DownAct::Q8Blocks32,
+    }
+}
+
 /// The K unit a card tensor's layout and kernel keep whole, beyond its format block.
-/// MXFP4 stacks need 256 values and MXFP8 planes 128. Other entries follow their activation:
-/// Q8Act needs 256, Q8Blocks32 needs 32, and f32 has no block. The tensor's role selects the
-/// routed down or dense site entry, so NVFP4 needs 32 for routed down and 256 for a dense site.
-/// A tensor-parallel part keeps this unit whole ([`crate::placement::tp::card_blocks`]).
+/// A routed stack follows the narrowest form its down reads ([`down_act`]): 32 where it reads
+/// the 32-value [`DownAct::Q8Blocks32`] ([`down_reads_blocks32`], MXFP4 among them), else the
+/// [`Q8_ACT_UNIT`]. A dense site follows its activation: Q8x128 needs 256, Q8x32 and Q8Blocks32
+/// need 32, and the f32 rows add nothing to the format's block (MXFP8's planes take any K of
+/// whole 32-value blocks). The tensor's role selects the routed down or dense site entry, so
+/// NVFP4 needs 32 for routed down and 256 for a dense site. A tensor-parallel part keeps this
+/// unit whole ([`crate::placement::tp::card_blocks`]).
 #[must_use]
 pub const fn card_k_unit(ty: GgmlType, role: Role) -> u64 {
-    if matches!(gate_up(ty), Some(GateUpEntry::Mxfp4)) {
-        return 256;
-    }
-    if matches!(dense(ty), Some(SiteEntry::Mxfp8)) {
-        return 128;
-    }
     match role {
-        Role::RoutedExperts => match down(ty) {
-            Some((_, DownAct::Q8Act)) => 256,
-            Some((_, DownAct::Q8Blocks32)) => 32,
-            None => 1,
-        },
+        Role::RoutedExperts if down_reads_blocks32(ty) => 32,
+        Role::RoutedExperts if down(ty).is_some() => Q8_ACT_UNIT,
+        Role::RoutedExperts => 1,
         _ => match dense(ty) {
             Some(entry) => match entry.reads() {
-                SiteAct::Q8x128 => 256,
+                SiteAct::Q8x128 => Q8_ACT_UNIT,
                 SiteAct::Q8x32 | SiteAct::Q8Blocks32 => 32,
                 SiteAct::F32 => 1,
             },
@@ -787,6 +810,46 @@ mod tests {
                 (GgmlType::NVFP4_ROWS, DownAct::Q8Blocks32),
             ]
         );
+    }
+
+    /// A routed down is read over its entry's form at a K of whole 256-value super-blocks and
+    /// over the 32-value form at any other K; the routed K unit is 32 for the types whose down
+    /// reads that form, MXFP4 among them, and 256 for the others. A rank's part of 2,304
+    /// (576 at four ranks, 1,152 at two) is such a K.
+    #[test]
+    fn a_down_off_the_super_block_reads_the_32_value_form() {
+        for k in [2304, 1280] {
+            assert_eq!(down_act(GgmlType::MXFP4, k), DownAct::Q8Act, "{k}");
+        }
+        for k in [576, 1152, 32] {
+            assert_eq!(down_act(GgmlType::MXFP4, k), DownAct::Q8Blocks32, "{k}");
+        }
+        assert_eq!(down_act(GgmlType::NVFP4, 2304), DownAct::Q8Blocks32);
+        assert_eq!(down_act(GgmlType::Q4_K, 2304), DownAct::Q8Act);
+        let routed: Vec<_> = ALL
+            .iter()
+            .filter(|&&ty| down(ty).is_some())
+            .map(|&ty| (ty, card_k_unit(ty, Role::RoutedExperts)))
+            .filter(|&(_, unit)| unit == 32)
+            .map(|(ty, _)| ty)
+            .collect();
+        assert_eq!(
+            routed,
+            [
+                GgmlType::Q5_0,
+                GgmlType::Q5_1,
+                GgmlType::Q8_0,
+                GgmlType::MXFP4,
+                GgmlType::NVFP4,
+                GgmlType::IQ4_NL,
+                GgmlType::NVFP4_ROWS,
+            ]
+        );
+        assert_eq!(
+            card_k_unit(GgmlType::Q4_K, Role::RoutedExperts),
+            Q8_ACT_UNIT
+        );
+        assert_eq!(card_k_unit(GgmlType::MXFP8, Role::DenseFfn), 1);
     }
 
     /// An ungated up runs the down entries of the 32-value form, and no other:

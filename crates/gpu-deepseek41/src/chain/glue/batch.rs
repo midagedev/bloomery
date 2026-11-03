@@ -213,8 +213,14 @@ impl Glue {
             need(WHAT, "params", 4 * params.len(), at_byte + site_bytes)?;
             let at_byte = launch_u32(WHAT, "site rows", at_byte)?;
             let mut x = span_mut(WHAT, &mut b.x, t * rows_values, rows_values)?;
-            self.table
-                .enqueue(&self.module, stream, self.shape, (params, at_byte), &mut x)?;
+            self.table.enqueue(
+                &self.module,
+                stream,
+                self.shape,
+                (params, at_byte),
+                gpu.layer_sink(layer)?,
+                &mut x,
+            )?;
         }
         let wide = (HC_STREAMS + 1) * ROW;
         let wkv = Dense::of(w, &site.wkv, rows_values, wide)?;

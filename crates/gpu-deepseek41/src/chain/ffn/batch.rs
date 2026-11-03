@@ -1456,8 +1456,8 @@ pub struct FfnBatch {
     /// A chunk's scratch: the norm's
     /// f32 output a second time (discarded) and, per token count `m` (index
     /// `m − 1`), its q8_1 form; the HC_PRE mixes; the shared expert's SwiGLU
-    /// output (token-major), its q8_1 form per token count and its down
-    /// output row-major.
+    /// output (token-major), its q8_1 form per token count when a shared
+    /// down reads it ([`Reads`], else none) and its down output row-major.
     normed: DeviceBuffer<f32>,
     act_x: Vec<Q8Act>,
     mixes: DeviceBuffer<f32>,
@@ -1467,13 +1467,21 @@ pub struct FfnBatch {
     /// The block's card experts: per token the norm's q8_1 planes (q3 and
     /// d8, as the chunk's scratch lays out a column) and the tile path's
     /// scratch ([`Q3TileScratch`]) — both the streamed passes' — the default
-    /// block's GEMM scratch ([`GemmScratch`]) and the down output by slot,
-    /// which every path writes the same rows of.
+    /// block's GEMM scratch ([`GemmScratch`]), the two for a file with a fused
+    /// layer ([`Reads`], else none), the layer's map row as the block's route
+    /// fill reads it — the slot map lives outside the batch, so the route,
+    /// which holds it, copies the row (the row a pick moves is copied again by
+    /// the route that runs under it) — and the down output by slot, which
+    /// every path writes the same rows of.
     q3_all: DeviceBuffer<u64>,
     d8_all: DeviceBuffer<f32>,
     down_all: DeviceBuffer<f32>,
-    tile: Q3TileScratch,
-    gemm: GemmScratch,
+    tile: Option<Q3TileScratch>,
+    gemm: Option<GemmScratch>,
+    map_row: DeviceBuffer<u32>,
+    /// The activation forms the piece's layers read, which the scratch above
+    /// and the leg's buffers hold ([`FfnPiece::reads`]).
+    reads: Reads,
     /// With an expert tier, per token each slot's place in the tier's routed
     /// stacks, which the route writes and the tier computes by; and per
     /// batch of a group the shadow's copy of a tiered block's routing — the
@@ -1545,26 +1553,22 @@ impl Q3TileScratch {
 /// ([`enqueue_block_experts`]): the block's normed rows in the GEMM's q8_1
 /// form (a column a token — the route's norm quantized again, whose bytes
 /// the norm's fused launch defines equal to its own, bit for bit), the gate
-/// and up products (slot-major, `ff` a slot), the SwiGLU's q8_1 form (a
-/// column a slot) and the layer's map row as the block's route fill reads
-/// it — the slot map lives outside the batch, so the route, which holds it,
-/// copies the row (the row a pick moves is copied again by the route that
-/// runs under it).
+/// and up products (slot-major, `ff` a slot) and the SwiGLU's q8_1 form (a
+/// column a slot).
 struct GemmScratch {
     act_x: GemmAct,
     g: DeviceBuffer<f32>,
     u: DeviceBuffer<f32>,
     act_down: GemmAct,
-    map_row: DeviceBuffer<u32>,
 }
 
 impl GemmScratch {
     /// The scratch for blocks of up to `cap` tokens of `n_embd` through
-    /// experts of `ff` over `n_expert` experts, on `stream`'s card. Load-time
-    /// only; the shapes the GEMM family does not take are its named refusal.
+    /// experts of `ff`, on `stream`'s card. Load-time only; the shapes the
+    /// GEMM family does not take are its named refusal.
     fn new(
         stream: &CudaStream,
-        (cap, n_embd, ff, n_expert): (usize, usize, usize, usize),
+        (cap, n_embd, ff): (usize, usize, usize),
     ) -> Result<GemmScratch, GpuError> {
         let slots = cap * N_USED;
         Ok(GemmScratch {
@@ -1572,31 +1576,28 @@ impl GemmScratch {
             g: DeviceBuffer::zeroed(stream, slots * ff)?,
             u: DeviceBuffer::zeroed(stream, slots * ff)?,
             act_down: GemmAct::new(stream, slots, ff)?,
-            map_row: DeviceBuffer::zeroed(stream, n_expert)?,
         })
     }
 
     /// Device bytes of the scratch.
     fn bytes(&self) -> usize {
-        self.act_x.bytes()
-            + self.g.num_bytes()
-            + self.u.num_bytes()
-            + self.act_down.bytes()
-            + self.map_row.num_bytes()
+        self.act_x.bytes() + self.g.num_bytes() + self.u.num_bytes() + self.act_down.bytes()
     }
 }
 
 impl FfnBatch {
     /// The buffers for groups of up to `sets` batches of up to `cap` tokens
     /// (at most [`UNION_MAX_COLS`], the host union's columns) of rows of
-    /// `n_embd` through experts of `ff`, on `gpu`; with `tier`, the tier
-    /// places of a model with an expert tier.
-    pub fn new(
+    /// `n_embd` through experts of `ff`, on `gpu`, holding the activation
+    /// forms `reads` names and no other ([`FfnPiece::reads`]); with `tier`,
+    /// the tier places of a model with an expert tier.
+    pub(crate) fn new(
         gpu: &Gpu,
         n_embd: usize,
         ff: usize,
         [cap, sets]: [usize; 2],
         tier: bool,
+        reads: Reads,
     ) -> Result<FfnBatch, GpuError> {
         if cap == 0 || cap > UNION_MAX_COLS || sets == 0 {
             return Err(GpuError::Shape {
@@ -1637,15 +1638,27 @@ impl FfnBatch {
                 .collect::<Result<_, _>>()?,
             mixes: z(c * HC_MIX)?,
             sh_h: z(c * ff)?,
-            act_sh: counts
-                .map(|m| Q8Act::with_k(stream, m, ff))
-                .collect::<Result<_, _>>()?,
+            act_sh: if reads.sh_q8_1 {
+                counts
+                    .map(|m| Q8Act::with_k(stream, m, ff))
+                    .collect::<Result<_, _>>()?
+            } else {
+                Vec::new()
+            },
             sh_raw: z(c * n_embd)?,
             q3_all: DeviceBuffer::zeroed(stream, cap * 64 * n_sb.div_ceil(2))?,
             d8_all: z(cap * 2 * n_sb)?,
             down_all: z(slot_cols * n_embd)?,
-            tile: Q3TileScratch::new(stream, slot_cols, n_embd, ff)?,
-            gemm: GemmScratch::new(stream, (cap, n_embd, ff, N_EXPERT))?,
+            tile: reads
+                .fused
+                .then(|| Q3TileScratch::new(stream, slot_cols, n_embd, ff))
+                .transpose()?,
+            gemm: reads
+                .fused
+                .then(|| GemmScratch::new(stream, (cap, n_embd, ff)))
+                .transpose()?,
+            map_row: DeviceBuffer::zeroed(stream, N_EXPERT)?,
+            reads,
             tsel: if tier {
                 Some(DeviceBuffer::zeroed(stream, slot_cols)?)
             } else {
@@ -1738,7 +1751,8 @@ impl FfnBatch {
             n: self.n_embd,
             ff: self.ff,
         };
-        self.leg = Some((CardLeg::load(gpu)?, LegBufs::new(gpu.stream(), shape)?));
+        let bufs = LegBufs::for_downs(gpu.stream(), shape, self.reads.leg)?;
+        self.leg = Some((CardLeg::load(gpu)?, bufs));
         Ok(())
     }
 
@@ -1766,8 +1780,9 @@ impl FfnBatch {
             + self.ids.num_bytes()
             + self.sel.num_bytes()
             + self.q3_all.num_bytes()
-            + self.tile.device_bytes()
-            + self.gemm.bytes()
+            + self.tile.as_ref().map_or(0, Q3TileScratch::device_bytes)
+            + self.gemm.as_ref().map_or(0, GemmScratch::bytes)
+            + self.map_row.num_bytes()
             + self.tsel.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self.ssel.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self.leg.as_ref().map_or(0, |(_, b)| b.bytes())
@@ -2219,7 +2234,7 @@ impl FfnPiece {
             // row, which nothing but the blocks' route fills read, every one
             // of them behind this route in stream order.
             unsafe {
-                dtod(stream, &mut b.gemm.map_row, 0, &row, self.n_expert)?;
+                dtod(stream, &mut b.map_row, 0, &row, self.n_expert)?;
             }
         }
         Ok(picks + usize::from(c.n_card > 0))
@@ -2568,6 +2583,11 @@ impl FfnPiece {
             }
             match path {
                 CardPath::Gemm => {
+                    let gemm = b.gemm.as_mut().ok_or(GpuError::State {
+                        what: WHAT,
+                        missing: "the GEMM scratch of a batch whose file has a fused layer \
+                                  (FfnBatch::new)",
+                    })?;
                     let t = u - at;
                     let (gty, dty) = (
                         GemmWeight::from_ggml(s.gate_up_ty())?,
@@ -2576,25 +2596,25 @@ impl FfnPiece {
                     let table = self.gemm_route_at(layer, c.n_card)?;
                     let sink = gpu.layer_sink(layer)?;
                     let x = span(WHAT, &b.x, at * n, t * n)?;
-                    gpu.enqueue_quantize_gemm(&x, t, &mut b.gemm.act_x, sink)?;
+                    gpu.enqueue_quantize_gemm(&x, t, &mut gemm.act_x, sink)?;
                     let ids = span(WHAT, &b.ids, at * N_USED, slots_n)?;
                     enqueue_gemm_batch(
                         (&b.kernels.gemm, &b.kernels.g32),
                         gpu.stream(),
                         &ids,
-                        &b.gemm.map_row,
-                        GateUp::Grouped(gty, [s.gate, s.up], &b.gemm.act_x),
+                        &b.map_row,
+                        GateUp::Grouped(gty, [s.gate, s.up], &gemm.act_x),
                         DownW::Grouped(
                             dty,
                             s.down,
                             Act::SwigluClamp { limit: c.limit },
-                            &mut b.gemm.act_down,
+                            &mut gemm.act_down,
                             &mut down,
                         ),
                         (t, c.n_card),
                         (N_USED, ff, n),
                         sink,
-                        (&mut b.gemm.g, &mut b.gemm.u),
+                        (&mut gemm.g, &mut gemm.u),
                         (&*sel, &mut self.routes[table]),
                     )
                 }
@@ -2609,7 +2629,12 @@ impl FfnPiece {
                         layer,
                         limit: c.limit,
                     };
-                    enqueue_tiled_experts(gpu, &b.kernels, &t, &mut b.tile, &mut down)
+                    let tile = b.tile.as_mut().ok_or(GpuError::State {
+                        what: WHAT,
+                        missing: "the tile scratch of a batch whose file has a fused layer \
+                                  (FfnBatch::new)",
+                    })?;
+                    enqueue_tiled_experts(gpu, &b.kernels, &t, tile, &mut down)
                 }
             }
         } else {
@@ -2755,6 +2780,13 @@ impl FfnPiece {
             }
         }
         let act = if lw.sh_down.reads_q8_1() {
+            if b.act_sh.is_empty() {
+                return Err(GpuError::State {
+                    what: WHAT,
+                    missing: "the shared down's q8_1 scratch of a batch whose layers read it \
+                              (FfnBatch::new)",
+                });
+            }
             let act_sh = count_of(&mut b.act_sh, m)?;
             gpu.enqueue_quantize_q8_1_layer(&b.sh_h, act_sh, layer)?;
             Some(&b.act_sh[m - 1])
@@ -2933,6 +2965,42 @@ mod tests {
     use bloomery_gpu::hybrid::HOST;
     use bloomery_gpu::{FaultSite, Gpu, GpuError, Window};
     use cuda_core::DeviceBuffer;
+
+    /// A rank's part of V4.1's experts (ff 576 at four ranks, an MXFP4 routed
+    /// down and an MXFP8 shared down) makes its decode row and its prompt
+    /// batch, the leg's buffers included, holding the forms its downs read
+    /// and no other: no fused-layer scratch, no shared q8_1, the leg's 32-value
+    /// form alone. Mutant: an unconditional `Q8Act::with_k(.., ff)` in either
+    /// constructor is refused at 576.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-ds41-lib` runs it on the box"]
+    fn hw_a_ranks_ff_makes_only_the_forms_its_downs_read() {
+        use super::{FfnBatch, LEG_PIECE};
+        use crate::chain::ffn::{FfnRow, Reads};
+        use crate::router::N_USED;
+        use gguf::quant::GgmlType;
+        use model::placement::kernels::{self, DownAct, DownForms};
+        const N: usize = 512;
+        const FF: usize = 576;
+        let reads = Reads::default().with_layer(Some([GgmlType::MXFP4; 3]), GgmlType::MXFP8, FF);
+        assert!(!reads.fused && !reads.sh_q8_1, "{reads:?}");
+        assert_eq!(reads.leg, DownForms::of(DownAct::Q8Blocks32));
+        let gpu = Gpu::new().expect("card");
+        let row = FfnRow::new(gpu.stream(), N, FF, reads).expect("the decode row");
+        assert!(row.act_h.is_none() && row.act_sh.is_none());
+        let mut batch = FfnBatch::new(&gpu, N, FF, [8, 1], false, reads).expect("the prompt batch");
+        assert!(batch.act_sh.is_empty() && batch.tile.is_none() && batch.gemm.is_none());
+        batch.prepare_leg(&gpu).expect("the leg's buffers");
+        let (_, bufs) = batch.leg.as_ref().expect("the leg");
+        let want = kernels::leg_bytes(
+            LEG_PIECE as u64,
+            N_USED as u64,
+            N as u64,
+            FF as u64,
+            reads.leg,
+        );
+        assert_eq!(bufs.bytes() as u64, want);
+    }
 
     /// The handoff's places feed the production tier sum, not a readback
     /// alone: every routed row belongs to exactly one of host, card and

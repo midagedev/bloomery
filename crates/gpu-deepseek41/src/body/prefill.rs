@@ -1696,7 +1696,14 @@ impl Body {
         let tap_width = self.tap.as_ref().map_or(0, FeatureTap::width);
         let params = DeviceBuffer::zeroed(stream, sets * CHUNKS_MAX * words)?;
         let glue = self.glue.batch(gpu, image.layout())?;
-        let mut ffn = FfnBatch::new(gpu, n, hp.experts.ff, [T_MAX, sets], self.tier.is_some())?;
+        let mut ffn = FfnBatch::new(
+            gpu,
+            n,
+            hp.experts.ff,
+            [T_MAX, sets],
+            self.tier.is_some(),
+            self.ffn.reads(),
+        )?;
         if self.levers.hoststream {
             ffn.enable_stream(stream)?;
         }

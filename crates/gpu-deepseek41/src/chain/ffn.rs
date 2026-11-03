@@ -97,6 +97,8 @@ use model::arch::deepseek41::hparams::Hparams;
 use model::arch::deepseek41::{host, names};
 use model::moe::UNION_MAX_COLS;
 use model::placement::accepts::{self, LegArms, Program};
+use model::placement::kernels::{self, DownForms};
+use model::placement::{Role, tp};
 use runtime::combine::Slots;
 
 use crate::dense::{Dense, DenseKernels};
@@ -1042,17 +1044,19 @@ pub struct FfnTaps<'a> {
 /// One row's buffers: everything a layer's launches write, read back by its
 /// join or by a gate. A pass whose rows run one layer apart enqueues the
 /// other row's whole layer between a row's go and its join, so each row
-/// keeps its own.
+/// keeps its own. A row holds an activation form only where a layer of the
+/// piece reads it ([`Reads`]).
 struct FfnRow {
     act_x: Q8Act,
     rout: RouterOut,
     sel: DeviceBuffer<u32>,
     h: DeviceBuffer<f32>,
-    act_h: Q8Act,
+    /// The card slots' columns of `h` in q8_1, for the fused layer's down.
+    act_h: Option<Q8Act>,
     down: DeviceBuffer<f32>,
     sh_h: DeviceBuffer<f32>,
     /// `sh_h` in q8_1, for a K-quant shared down projection.
-    act_sh: Q8Act,
+    act_sh: Option<Q8Act>,
     sh_y: DeviceBuffer<f32>,
     y: DeviceBuffer<f32>,
     mixes: DeviceBuffer<f32>,
@@ -1062,18 +1066,80 @@ struct FfnRow {
     leg: Option<LegBufs>,
 }
 
+/// The activation forms of `h` a piece's layers read beside the f32 rows,
+/// from their types at load: each row holds these and no other.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Reads {
+    /// A fused layer ([`accepts::DS41_LEG`]): its down reads the card slots'
+    /// q8_1.
+    fused: bool,
+    /// A shared down of a K-quant reads `sh_h` in q8_1.
+    sh_q8_1: bool,
+    /// The forms the common card leg's downs read ([`kernels::down_act`] at
+    /// `ff`), for its buffers ([`FfnPiece::prepare_leg`]).
+    leg: DownForms,
+}
+
+impl Reads {
+    /// These forms and those a layer of routed stacks `routed` (`[gate, up,
+    /// down]`, none for a layer without them) and shared down `shared_down`
+    /// reads at `ff`.
+    fn with_layer(
+        mut self,
+        routed: Option<[GgmlType; 3]>,
+        shared_down: GgmlType,
+        ff: usize,
+    ) -> Reads {
+        if let Some(t) = routed {
+            if t == accepts::DS41_LEG {
+                self.fused = true;
+            } else if accepts::leg_runs(Program::Deepseek41Chain, t) == Some(true) {
+                self.leg = self.leg.with(kernels::down_act(t[2], ff as u64));
+            }
+        }
+        self.sh_q8_1 |= sh_down_reads_q8_1(shared_down);
+        self
+    }
+}
+
+/// Whether a shared down of type `ty` reads its input in q8_1: the K-quant
+/// downs.
+fn sh_down_reads_q8_1(ty: GgmlType) -> bool {
+    matches!(ty, GgmlType::Q3_K | GgmlType::Q4_K)
+}
+
+/// Whether a down of type `ty` in `role` reads rows of `ff` values: `ff` a
+/// whole number of the K unit a card part of it keeps ([`tp::card_blocks`] at
+/// its format block); else that unit, `None` for a type of no block.
+fn down_k_fits(ty: GgmlType, role: Role, ff: usize) -> Result<(), Option<u64>> {
+    let unit = ty
+        .blck_size()
+        .and_then(|b| tp::card_blocks(ty, [b, 1], role).ok())
+        .map(|[k, _]| k);
+    match unit {
+        Some(k) if (ff as u64).is_multiple_of(k) => Ok(()),
+        _ => Err(unit),
+    }
+}
+
 impl FfnRow {
-    fn new(stream: &CudaStream, n_embd: usize, ff: usize) -> Result<FfnRow, GpuError> {
+    fn new(
+        stream: &CudaStream,
+        n_embd: usize,
+        ff: usize,
+        reads: Reads,
+    ) -> Result<FfnRow, GpuError> {
         let z = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
+        let q8 = |on: bool, m: usize| on.then(|| Q8Act::with_k(stream, m, ff)).transpose();
         Ok(FfnRow {
             act_x: Q8Act::with_k(stream, 1, n_embd)?,
             rout: RouterOut::new(stream)?,
             sel: DeviceBuffer::zeroed(stream, N_USED)?,
             h: z(N_USED * ff)?,
-            act_h: Q8Act::with_k(stream, N_USED, ff)?,
+            act_h: q8(reads.fused, N_USED)?,
             down: z(N_USED * n_embd)?,
             sh_h: z(ff)?,
-            act_sh: Q8Act::with_k(stream, 1, ff)?,
+            act_sh: q8(reads.sh_q8_1, 1)?,
             sh_y: z(n_embd)?,
             y: z(n_embd)?,
             mixes: z(HC_MIX)?,
@@ -1100,8 +1166,8 @@ impl FfnRow {
             + self.rout.ids.num_bytes()
             + ROUTER_TICKET_BYTES
             + q8act_bytes(&self.act_x)
-            + q8act_bytes(&self.act_h)
-            + q8act_bytes(&self.act_sh)
+            + self.act_h.as_ref().map_or(0, q8act_bytes)
+            + self.act_sh.as_ref().map_or(0, q8act_bytes)
             + self.leg.as_ref().map_or(0, LegBufs::bytes)
     }
 }
@@ -1128,6 +1194,8 @@ pub struct FfnPiece {
     scale: f32,
     /// Per row, its buffers ([`FfnPiece::with_rows`]).
     rows: Vec<FfnRow>,
+    /// The activation forms the layers read, which the rows hold.
+    reads: Reads,
     /// The common card leg's launches, for the layers of types it runs
     /// ([`FfnPiece::prepare_leg`]).
     leg: Option<CardLeg>,
@@ -1173,9 +1241,9 @@ impl FfnPiece {
                 map.n_expert()
             )));
         }
-        if hp.hc.streams != HC_STREAMS || !ff.is_multiple_of(256) {
+        if hp.hc.streams != HC_STREAMS {
             return Err(refuse(format!(
-                "{} streams and ff {ff}: want {HC_STREAMS} streams and whole super-blocks",
+                "{} streams: want {HC_STREAMS}",
                 hp.hc.streams
             )));
         }
@@ -1187,11 +1255,25 @@ impl FfnPiece {
             )));
         }
         let mut cfg = Vec::with_capacity(layers.len());
+        let mut reads = Reads::default();
         for (i, l) in layers.clone().enumerate() {
             let kind = &hp.layers[l];
             if !kind.routed {
                 return Err(refuse(format!("layer {l} does not route")));
             }
+            let downs = [
+                kind.routed_types.map(|t| (t[2], Role::RoutedExperts)),
+                Some((kind.shared_down, Role::SharedExpert)),
+            ];
+            for (ty, role) in downs.into_iter().flatten() {
+                if let Err(unit) = down_k_fits(ty, role, ff) {
+                    return Err(refuse(format!(
+                        "layer {l}: ff {ff} is no whole number of the {ty} {role:?} down's K \
+                         unit {unit:?} (`kernels::card_k_unit`)"
+                    )));
+                }
+            }
+            reads = reads.with_layer(kind.routed_types, kind.shared_down, ff);
             cfg.push(LayerCfg {
                 norm: names::ffn_norm(l),
                 router: names::ffn_gate_inp(l),
@@ -1206,14 +1288,14 @@ impl FfnPiece {
                 row_off: i * map.n_expert(),
                 limit: kind.swiglu_limit,
                 limit_shared: kind.swiglu_limit_shared,
-                sh_down_q8_1: matches!(kind.shared_down, GgmlType::Q3_K | GgmlType::Q4_K),
+                sh_down_q8_1: sh_down_reads_q8_1(kind.shared_down),
                 fold: hp.layers.get(l + 1).is_some_and(|k| k.engram.is_none()),
             });
         }
         let ctx = gpu.context();
         let stream = gpu.stream();
         let rows = (0..rows)
-            .map(|_| FfnRow::new(stream, n_embd, ff))
+            .map(|_| FfnRow::new(stream, n_embd, ff, reads))
             .collect::<Result<Vec<_>, _>>()?;
         // The GEMM's route table holds the experts of one stack, so one table
         // a distinct card count; a block's fill passes its layer's count.
@@ -1243,6 +1325,7 @@ impl FfnPiece {
                 .map_err(|_| refuse(format!("{} Sinkhorn rounds", hp.hc.sinkhorn_iters)))?,
             scale: ex.routed_scale,
             rows,
+            reads,
             leg: None,
             routes,
             counts,
@@ -1263,6 +1346,13 @@ impl FfnPiece {
         })
     }
 
+    /// The activation forms the piece's layers read beside the f32 rows,
+    /// which a prompt batch over them holds too ([`FfnBatch::new`]).
+    #[must_use]
+    pub(crate) fn reads(&self) -> Reads {
+        self.reads
+    }
+
     /// The common card leg for the layers of types it runs
     /// ([`CardStacks::fused`] false): its launches and, per row, its buffers.
     /// A piece over a file whose card layers are all fused needs none, and an
@@ -1280,7 +1370,7 @@ impl FfnPiece {
         };
         let leg = CardLeg::load(gpu)?;
         for r in &mut self.rows {
-            r.leg = Some(LegBufs::new(gpu.stream(), shape)?);
+            r.leg = Some(LegBufs::for_downs(gpu.stream(), shape, self.reads.leg)?);
         }
         self.leg = Some(leg);
         Ok(())
@@ -1753,6 +1843,11 @@ impl FfnPiece {
         )?;
         match card {
             Some(s) if s.fused() => {
+                let act_h = r.act_h.as_mut().ok_or(GpuError::State {
+                    what: ENQUEUE,
+                    missing: "the q8_1 columns of a fused layer's down, which a piece of no \
+                              fused layer does not hold",
+                })?;
                 let args = ExpertGateUp {
                     wg: s.gate,
                     wu: s.up,
@@ -1771,16 +1866,12 @@ impl FfnPiece {
                     sel: &r.sel,
                     n_card: c.n_card,
                 };
-                gpu.q4k_sel().enqueue_quantize_sel(
-                    stream,
-                    &q,
-                    gpu.layer_sink(layer)?,
-                    &mut r.act_h,
-                )?;
+                gpu.q4k_sel()
+                    .enqueue_quantize_sel(stream, &q, gpu.layer_sink(layer)?, act_h)?;
                 gpu.q4k_sel().enqueue_gemv_q4k_sel(
                     stream,
                     s.down,
-                    &r.act_h,
+                    act_h,
                     &r.sel,
                     N_USED,
                     n,
@@ -1846,11 +1937,19 @@ impl FfnPiece {
                 "of the format the file's header names for it",
             ));
         }
-        let act = if lw.sh_down.reads_q8_1() {
-            gpu.enqueue_quantize_q8_1_layer(&r.sh_h, &mut r.act_sh, layer)?;
-            Some(&r.act_sh)
-        } else {
-            None
+        let act = match (lw.sh_down.reads_q8_1(), r.act_sh.as_mut()) {
+            (false, _) => None,
+            (true, Some(act_sh)) => {
+                gpu.enqueue_quantize_q8_1_layer(&r.sh_h, act_sh, layer)?;
+                Some(&*act_sh)
+            }
+            (true, None) => {
+                return Err(GpuError::State {
+                    what: ENQUEUE,
+                    missing: "the q8_1 form of a K-quant shared down's input, which a piece of \
+                              no such layer does not hold",
+                });
+            }
         };
         self.dense
             .enqueue(gpu, lw.sh_down, &r.sh_h, act, &mut r.sh_y)?;
@@ -1953,4 +2052,33 @@ pub fn host_run(
     HostRun::build(file, first, r8, host_widths(hp), |src| {
         host::layers(src, hp, first..layers.end)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A rank's part of the 2,304-wide experts (1,152 at two ranks, 576 at
+    /// four) opens where its downs read it: an MXFP4 routed down over the
+    /// 32-value form and an MXFP8 shared down; a down of 256-value
+    /// super-blocks, routed or shared, is refused at those widths and runs at
+    /// 2,304.
+    #[test]
+    fn a_ranks_ff_opens_where_its_downs_read_it() {
+        for ff in [576, 1152, 2304] {
+            assert_eq!(
+                down_k_fits(GgmlType::MXFP4, Role::RoutedExperts, ff),
+                Ok(())
+            );
+            assert_eq!(down_k_fits(GgmlType::MXFP8, Role::SharedExpert, ff), Ok(()));
+        }
+        for (ty, role) in [
+            (GgmlType::Q4_K, Role::RoutedExperts),
+            (GgmlType::Q3_K, Role::SharedExpert),
+            (GgmlType::Q5_K, Role::SharedExpert),
+        ] {
+            assert_eq!(down_k_fits(ty, role, 576), Err(Some(256)), "{ty}");
+            assert_eq!(down_k_fits(ty, role, 2304), Ok(()), "{ty}");
+        }
+    }
 }

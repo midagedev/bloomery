@@ -541,6 +541,7 @@ fn mapped_tp(g: Geometry, mapped: &HeldMap) -> Result<Vec<TpTensor>, Error> {
                 name: name.clone(),
                 dims,
                 bytes,
+                card: Some(ty),
                 whole_bytes: h.whole_bytes,
             })
         })
@@ -1025,11 +1026,11 @@ mod tests {
             .find(|t| t.name == "blk.3.attn_q_b.weight")
             .unwrap();
         assert_eq!(q_b.bytes, 16_384 * 1536 / 128 * 132);
-        // The MXFP8 projections cut along K keep the planes' 128 values a rank, past the 32 of
-        // the format's block.
+        // The MXFP8 projections cut along K keep the format's 32-value block a rank.
+        // PIN(2026-11-03): the planes took 128 values a rank.
         for name in ["blk.0.ffn_down.weight", "blk.0.attn_output.weight"] {
             let block = ts.iter().find(|t| t.name == name).map(|t| t.block);
-            assert_eq!(block, Some([128, 1]), "{name}");
+            assert_eq!(block, Some([32, 1]), "{name}");
         }
         let mut no_bias = table.clone();
         no_bias.retain(|(n, _, _)| !n.ends_with(".mlp.gate.e_score_correction_bias"));
@@ -1649,26 +1650,11 @@ mod tests {
         let ts = tp_tensors(g, &quant, &table).unwrap();
         let e = plan_tp(&pools(3), &ts).unwrap_err();
         assert!(matches!(&e, TpError::Unit { ranks: 3, .. }), "{e}");
-        // At 64 ranks the MXFP8 down's 192 values a rank are off its planes' 128, and the NVFP4
-        // experts' 32 off their 64-value block.
-        let e = plan_tp(&pools(64), &ts).unwrap_err();
+        // At 64 ranks the MXFP8 down's 192 values a rank are whole 32-value blocks, and the NVFP4
+        // experts' 32 are off their 64-value block.
+        // PIN(2026-11-03): the down's 192 were refused off the planes' 128.
         assert_eq!(
-            e,
-            TpError::Block {
-                name: "blk.0.ffn_down.weight".into(),
-                dim: 0,
-                extent: 12288,
-                ranks: 64,
-                block: 128
-            }
-        );
-        let exps: Vec<_> = ts
-            .iter()
-            .filter(|t| t.name == "blk.3.ffn_down_exps.weight")
-            .cloned()
-            .collect();
-        assert_eq!(
-            plan_tp(&pools(64), &exps).unwrap_err(),
+            plan_tp(&pools(64), &ts).unwrap_err(),
             TpError::Block {
                 name: "blk.3.ffn_down_exps.weight".into(),
                 dim: 0,

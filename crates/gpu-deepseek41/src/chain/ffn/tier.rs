@@ -710,14 +710,15 @@ fn enqueue_handoff_tier(
 /// The V4.1 tier card's computation ([`TierExperts`]): per tier layer the
 /// stage card's routed launches over the tier's stacks, into the tier's
 /// rows; over a prompt batch's block, the tile path. Its scratch — the
-/// slots' SwiGLU outputs and their q8_1, and the tile path's for a block of
-/// the host union's columns — is made at load.
+/// slots' SwiGLU outputs and, when a layer holds tier experts, their q8_1
+/// and the tile path's for a block of the host union's columns — is made at
+/// load.
 pub struct Ds41Tier {
     experts: ExpertKernels,
     h: DeviceBuffer<f32>,
-    act_h: Q8Act,
+    act_h: Option<Q8Act>,
     batch: FfnBatchKernels,
-    tile: Q3TileScratch,
+    tile: Option<Q3TileScratch>,
     layers: Range<usize>,
     /// Per layer of `layers`, the experts the tier holds and the layer's
     /// `swiglu_clamp_exp`.
@@ -793,11 +794,17 @@ impl Ds41Tier {
             cfg.push((k, kind.swiglu_limit));
         }
         let stream = gpu.stream();
-        let tile = Q3TileScratch::new(stream, UNION_MAX_COLS * N_USED, n, ff)?;
+        // Only a layer with tier experts runs (`tier_layer`), each a fused one.
+        let held = cfg.iter().any(|&(k, _)| k > 0);
+        let tile = held
+            .then(|| Q3TileScratch::new(stream, UNION_MAX_COLS * N_USED, n, ff))
+            .transpose()?;
         Ok(Ds41Tier {
             experts: ExpertKernels::load(gpu.context())?,
             h: DeviceBuffer::zeroed(stream, N_USED * ff)?,
-            act_h: Q8Act::with_k(stream, N_USED, ff)?,
+            act_h: held
+                .then(|| Q8Act::with_k(stream, N_USED, ff))
+                .transpose()?,
             batch: FfnBatchKernels::load(gpu.context())?,
             tile,
             layers,
@@ -828,7 +835,7 @@ impl TierExperts for Ds41Tier {
     /// The tile path's scratch, for blocks of up to [`UNION_MAX_COLS`]
     /// tokens.
     fn block_bytes(&self) -> usize {
-        self.tile.device_bytes()
+        self.tile.as_ref().map_or(0, Q3TileScratch::device_bytes)
     }
 
     fn enqueue_block(
@@ -855,7 +862,11 @@ impl TierExperts for Ds41Tier {
             layer,
             limit,
         };
-        enqueue_tiled_experts(gpu, &self.batch, &t, &mut self.tile, io.down)
+        let tile = self.tile.as_mut().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "the tile scratch of a tier with a tier layer (Ds41Tier::new)",
+        })?;
+        enqueue_tiled_experts(gpu, &self.batch, &t, tile, io.down)
     }
 
     fn enqueue_layer(
@@ -879,6 +890,10 @@ impl TierExperts for Ds41Tier {
                     .to_string(),
             });
         };
+        let act_h = self.act_h.as_mut().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "the slots' q8_1 scratch of a tier with a tier layer (Ds41Tier::new)",
+        })?;
         let stream = gpu.stream();
         let args = ExpertGateUp {
             wg: s.gate,
@@ -899,11 +914,11 @@ impl TierExperts for Ds41Tier {
             n_card: k,
         };
         gpu.q4k_sel()
-            .enqueue_quantize_sel(stream, &q, gpu.layer_sink(layer)?, &mut self.act_h)?;
+            .enqueue_quantize_sel(stream, &q, gpu.layer_sink(layer)?, act_h)?;
         gpu.q4k_sel().enqueue_gemv_q4k_sel(
             stream,
             s.down,
-            &self.act_h,
+            act_h,
             io.sel,
             N_USED,
             self.n_embd,
