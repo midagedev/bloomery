@@ -9152,6 +9152,9 @@ def cmd_orphan_tests(args: argparse.Namespace) -> int:
 #             (manifest_view: the shared tables and its own targets' entries, canonical JSON — a comment
 #             or another target's entry does not move it); one read whole is a `file` part
 #   global    Cargo.toml, Cargo.lock, rust-toolchain.toml, .cargo/*, the cuda-oxide pin rev
+#   A workspace member's own version (its `[package]` `version`, its Cargo.lock entry) is left out of the manifest, file
+#   and Cargo.lock parts of a closure-scoped item none of whose input files reads a version (KeyContext.version_read), a
+#   file the item names or walks excepted: MEMBER_VERSION stands in its place. A tree-scoped item keeps every byte.
 #   item      ARGS, the item's full BLOOMERY_BOX_ENV (the caller's, then the item's, then the lane's
 #             card), the card that env forces
 #   mac-env   the Mac-side variables tools/box.sh carries or reads (BLOOMERY_REMOTE is not one: it
@@ -9166,7 +9169,7 @@ def cmd_orphan_tests(args: argparse.Namespace) -> int:
 #             fixture directory (KeyContext.fixture_dirs; every file under it)
 # Not in it: the binary (its paths are per track) and the commit.
 
-KEY_VERSION = "bloomery-gate-key 2"
+KEY_VERSION = "bloomery-gate-key 3"
 MANIFEST_VERSION = "box-manifest 1"
 MAC_ENV = ("BLOOMERY_BOX", "BLOOMERY_CARD", "BLOOMERY_DATA", "BLOOMERY_FIXTURE_VARIANT", "BLOOMERY_MODEL", "BLOOMERY_REF_MODEL", "BLOOMERY_TIER", "BLOOMERY_V41_MODEL")
 # The fixture tier's files (tools/ref/ref-paths.sh: one directory a family under it). Its rows belong to the keys of fixture-tier
@@ -9956,6 +9959,103 @@ def oxide_rev(text: str) -> str:
     return "absent"
 
 
+# A workspace member's own `version` (its `[package]` table, its `[[package]]` entry in Cargo.lock) is a label: no gate's
+# verdict reads it (a bin prints it; `/props` and `--version` print the same constant the test compares with), so a release's
+# version bump moves no key of an item whose reads are modeled and that reads no version out of a manifest. The key holds
+# MEMBER_VERSION in its place; everything else of those files keeps moving the key as before (a dependency's version, a
+# feature, a dependency list, a package that is no member).
+MEMBER_VERSION = "<member>"
+# A line of a script or source that names a manifest or the lock and a standalone `version` (not `--format-version`): the
+# file reads a package's version out of it (tools/release/publish.sh's `sed` of `crates/$c/Cargo.toml`).
+VERSION_READ = re.compile(r"Cargo\.(?:toml|lock)[^\n]*(?<![-\w])version(?![-\w])|(?<![-\w])version(?![-\w])[^\n]*Cargo\.(?:toml|lock)")
+VERSION_READERS = (".sh", ".bash", ".py", ".rs")
+
+
+def key_view(view: dict) -> dict:
+    """A package manifest's `manifest_view` as the key holds it: the package's own `version` literal is MEMBER_VERSION. A
+    `version.workspace = true` table, or no `version`, stays what it is, so the form of the field is still part of the key."""
+    pkg = view.get("package")
+    if isinstance(pkg, dict) and isinstance(pkg.get("version"), str):
+        return {**view, "package": {**pkg, "version": MEMBER_VERSION}}
+    return view
+
+
+def manifest_member_blind(text: str) -> str:
+    """A package manifest's `text` with the literal `version` of its `[package]` table replaced by MEMBER_VERSION, every other
+    byte kept (a comment edit still moves the key of an item that reads the file whole). The text read back must be the
+    manifest with that one value replaced, else a named error: a layout this edit does not read is never keyed on a guess."""
+    import copy
+    import tomllib
+
+    try:
+        doc = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as err:
+        raise RecipeError(f"a package manifest does not parse as TOML ({err})") from err
+    pkg = doc.get("package")
+    if not isinstance(pkg, dict) or not isinstance(pkg.get("version"), str):
+        return text
+    want = copy.deepcopy(doc)
+    want["package"]["version"] = MEMBER_VERSION
+    lines = text.split("\n")
+    head = next((i for i, ln in enumerate(lines) if re.fullmatch(r"\[package\][ \t]*(#.*)?", ln)), None)
+    if head is not None:
+        end = next((i for i in range(head + 1, len(lines)) if lines[i].startswith("[")), len(lines))
+        for k in range(head + 1, end):
+            m = re.match(r"""(version[ \t]*=[ \t]*)("[^"\n]*"|'[^'\n]*')""", lines[k])
+            if m:
+                lines[k] = f'{m.group(1)}"{MEMBER_VERSION}"{lines[k][m.end():]}'
+                break
+    out = "\n".join(lines)
+    if tomllib.loads(out) != want:
+        raise RecipeError("a package manifest's `version` could not be read out of the file as that one value and nothing else; the key cannot leave it out")
+    return out
+
+
+def lock_member_blind(text: str, members: set[str]) -> str:
+    """Cargo.lock `text` with the `version` of each workspace member's own entry (a `[[package]]` named in `members` with no
+    `source` and no `checksum`: a path package) replaced by MEMBER_VERSION, and so in a `dependencies` string that names one
+    by `name version` (written only where the name alone is ambiguous). Every other byte stays, so any other edit of the
+    file moves the key as it did. The text read back must be the file's packages with exactly those versions replaced, else
+    a named error: a layout this edit does not read is never keyed on a guess."""
+    import copy
+    import tomllib
+
+    try:
+        old = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as err:
+        raise RecipeError(f"Cargo.lock does not parse as TOML ({err})") from err
+    own = {(p["name"], p["version"]) for p in old.get("package", []) if p["name"] in members and "source" not in p and "checksum" not in p}
+    want = copy.deepcopy(old)
+    for p in want.get("package", []):
+        if (p["name"], p["version"]) in own:
+            p["version"] = MEMBER_VERSION
+        if "dependencies" in p:
+            p["dependencies"] = [f"{d.split(' ')[0]} {MEMBER_VERSION}" if tuple(d.split(" ")) in own else d for d in p["dependencies"]]
+    lines = text.split("\n")
+    heads = [i for i, ln in enumerate(lines) if ln.startswith("[")]
+    for n, i in enumerate(heads):
+        if lines[i] != "[[package]]":
+            continue
+        end = heads[n + 1] if n + 1 < len(heads) else len(lines)
+        name = ver = None
+        for k in range(i + 1, end):
+            m = re.fullmatch(r'(name|version) = "([^"]*)"', lines[k])
+            if m and m.group(1) == "name" and name is None:
+                name = m.group(2)
+            elif m and m.group(1) == "version" and ver is None:
+                ver = (k, m.group(2))
+        if ver is not None and (name, ver[1]) in own and not any(ln.startswith(("source = ", "checksum = ")) for ln in lines[i + 1:end]):
+            lines[ver[0]] = f'version = "{MEMBER_VERSION}"'
+        for k in range(i + 1, end):
+            m = re.fullmatch(r'(\s+)"([^" ]+) ([^" ]+)"(,?)', lines[k])
+            if m and (m.group(2), m.group(3)) in own:
+                lines[k] = f'{m.group(1)}"{m.group(2)} {MEMBER_VERSION}"{m.group(4)}'
+    out = "\n".join(lines)
+    if tomllib.loads(out) != want:
+        raise RecipeError("Cargo.lock: the workspace members' versions could not be read out of the file as its packages and nothing else; the key cannot leave them out")
+    return out
+
+
 def load_manifest(path: str | None) -> tuple[list[str], dict[str, str], str | None]:
     """(content lines, header fields, error) of a box manifest file."""
     if not path:
@@ -9998,13 +10098,15 @@ class KeyContext:
         self._lit: dict[str, frozenset[str]] = {}
         self._tree: list[str] | None = None
         self._fixture_table: tuple[dict[str, str], str] | None = None
+        self._reads_version: dict[str, bool] = {}
 
     def tree_files(self) -> list[str]:
         if self._tree is None:
             self._tree = shipped_files(self.side.tree.root)
         return self._tree
 
-    def file_part(self, rel: str) -> str:
+    def file_part(self, rel: str, blind: bool = False) -> str:
+        """The part of a file the item reads whole. `blind`: a package manifest's digest leaves out its own version (manifest_member_blind)."""
         p = os.path.join(self.side.tree.root, rel)
         digest = sha256_file(p)
         self._sha[rel] = digest
@@ -10012,12 +10114,26 @@ class KeyContext:
         self._links[rel] = spelling
         if spelling is not None:
             return f"link\t{rel}\t{spelling}\t{digest}"
+        if blind:
+            with open(p, encoding="utf-8") as fh:
+                digest = sha256_text(manifest_member_blind(fh.read()))
         return f"file\t{rel}\t{digest}"
 
-    def view_part(self, rel: str, wants: frozenset[Entry]) -> str:
-        """The part of a manifest read by table: the sha256 of the item's view of it."""
+    def view_part(self, rel: str, wants: frozenset[Entry], blind: bool = False) -> str:
+        """The part of a manifest read by table: the sha256 of the item's view of it (`blind`: its own version left out, key_view)."""
         view = manifest_view(read_manifest(self.side.tree.root, rel), os.path.dirname(rel), wants)
-        return f"manifest\t{rel}\t{sha256_text(canon(view))}"
+        return f"manifest\t{rel}\t{sha256_text(canon(key_view(view) if blind else view))}"
+
+    def version_read(self, files: Iterable[str]) -> str | None:
+        """The first of `files` (a script or a source) that reads a package version out of a manifest or the lock, else None."""
+        for rel in sorted(files):
+            if rel.endswith(VERSION_READERS):
+                if rel not in self._reads_version:
+                    text = self.side.tree.read(rel)
+                    self._reads_version[rel] = "Cargo." in text and VERSION_READ.search(text) is not None
+                if self._reads_version[rel]:
+                    return rel
+        return None
 
     def literal_dirs(self, rel: str) -> frozenset[str]:
         if rel not in self._lit:
@@ -10102,7 +10218,9 @@ class KeyContext:
                 dirs.add(d)
         return dirs
 
-    def globals(self) -> list[str]:
+    def globals(self, member_blind: bool = False) -> list[str]:
+        """The global parts. `member_blind`: the lock's part leaves out the workspace members' own versions (lock_member_blind);
+        the caller says so only for an item whose reads are modeled and that does not name the lock."""
         root = self.side.tree.root
         names = list(KEY_GLOBALS)
         cdir = os.path.join(root, ".cargo")
@@ -10114,6 +10232,9 @@ class KeyContext:
             digest = sha256_file(p) if os.path.isfile(p) else "absent"
             if digest != "absent":
                 self._sha[g] = digest
+            if member_blind and g == "Cargo.lock" and digest != "absent":
+                with open(p, encoding="utf-8") as fh:
+                    digest = sha256_text(lock_member_blind(fh.read(), set(self.side.tree.packages)))
             out.append(f"global\t{g}\t{digest}")
         toml = os.path.join(root, "Cargo.toml")
         out.append(f"global\toxide-rev\t{oxide_rev(self.side.tree.read('Cargo.toml')) if os.path.isfile(toml) else 'absent'}")
@@ -10290,17 +10411,26 @@ class KeyContext:
             for u in tree.unresolved:
                 if u.split(": ", 1)[0] in self.side.graph.inputs(name).files:
                     return [], f"source walk: {u}", None, ""
+        # A workspace member's own version is left out of the manifest, file and lock parts of a closure-scoped item none of
+        # whose input files reads one (MEMBER_VERSION): a release's bump re-keys nothing it does not touch. A tree-scoped item's
+        # reads are not modeled, and a file the item names or walks is read as data: those keep every byte.
+        reader = self.version_read(files) if scope == "closure" else None
+        blind = scope == "closure" and reader is None
         for rel in sorted(files):
             # a package manifest the closure reads by table is keyed on that view (manifest_view, the reader
             # selection uses); one read whole, named by the item, or in a tree-scoped key, on its bytes
             wants = ri.manifests.entries(rel) if scope == "closure" and rel not in named else None
+            own = blind and rel in tree.manifest_paths and rel not in named
             try:
-                parts.append(self.file_part(rel) if wants is None else self.view_part(rel, wants))
+                if wants is None:
+                    parts.append(self.file_part(rel, own and not any(rel.startswith(d) for d in ri.prefixes)))
+                else:
+                    parts.append(self.view_part(rel, wants, own))
             except OSError as err:
                 return [], f"cannot read {rel}: {err.strerror}", None, ""
             except RecipeError as err:
                 return [], str(err), None, ""
-        parts += self.globals()
+        parts += self.globals(blind and "Cargo.lock" not in named)
         card = "none"
         for e in eff:
             k, _, v = e.partition("=")
@@ -10340,7 +10470,7 @@ class KeyContext:
         missing = sorted(need - listed)
         if missing:
             return [], f"the box manifest has no row for {missing[0]}, which {dirs[missing[0]]} names: the manifest was read from another tree or environment", None, ""
-        summary = f"scope=tree ({why})" if scope == "tree" else f"scope=closure ({why})"
+        summary = f"scope=tree ({why})" if scope == "tree" else f"scope=closure ({why}; member versions {'left out' if blind else 'kept: ' + str(reader) + ' reads one'})"
         return parts, None, never, summary
 
 
@@ -11584,8 +11714,8 @@ def lock_view_self_test(expect) -> None:
     tools/mac-gate.sh reads the same tables and lock for aarch64-apple-darwin: a macOS-only change selects it and no box
     recipe. A lock diff selects by package: a recipe whose closure holds none of the packages it moves (a package only
     user links, for a recipe that builds g) reads nothing of it, a member's own entry is such a package, and a lock the
-    reader cannot take apart is read whole with a note. The ledger key still moves for every case: it reads the manifests
-    and the lock whole."""
+    reader cannot take apart is read whole with a note. The ledger key still moves for every case but a member's own
+    version: it reads the manifests and the lock whole, a member's version aside."""
     import tomllib
 
     reg = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11796,7 +11926,13 @@ def lock_view_self_test(expect) -> None:
             got = {x.recipe for x in sels}
             expect(got == want, f"lock view: {what} selects {sorted(got)}, not {sorted(want)}")
             ka_p, kb_p = keys(base_side), keys(b)
-            expect(all(kb_p[n] != ka_p[n] for n in every), f"lock view: {what} leaves a ledger key where it was (the key reads the lock whole)")
+            if what.startswith("a member "):
+                # PIN(2026-11-03): re-pinned, not loosened — the key leaves a workspace member's own version out of the lock (lock_member_blind:
+                # MEMBER_VERSION stands in the entry), so the two member bumps below keep every key; before, they moved all of them. FAIL-first:
+                # on the code without lock_member_blind these two clauses fail (every key moves). Any other lock edit still moves every key.
+                expect(all(kb_p[n] == ka_p[n] for n in every), f"lock view: {what} moves a ledger key (a member's own version is left out of the key)")
+            else:
+                expect(all(kb_p[n] != ka_p[n] for n in every), f"lock view: {what} leaves a ledger key where it was (the key reads the lock whole)")
         expect("Cargo.lock: serde 1.0.0, serde 1.0.1 changed; 1 of 2 recipes' builds reach a package that moved" in notes_of["a bump of a package only user links"],
                f"lock view: the note of a package only user links is {notes_of['a bump of a package only user links']}")
         for what, text in (("the lock's format version", "a top-level key beside `package` moved"), ("a lock that does not parse", "does not parse as TOML"),
@@ -12347,6 +12483,74 @@ def key_self_test(expect, real: Side, section: str | None = None) -> None:
             for g in KEY_GLOBALS:
                 m = edit(g, append("\n# key probe\n"))
                 expect(m == set(items), f"{g} moves {sorted(m)}, not every key")
+            # A workspace member's own version (its `[package]` table, its `[[package]]` entry in Cargo.lock) is a label no gate reads: a
+            # release's bump moves no key of an item whose reads are modeled and that reads no version out of a manifest, and the
+            # whole-tree keys (their reads are not modeled) still move. Any other edit of the same files moves every key, as the probes
+            # above. Added 2026-11-03 (relkey, after the 0.3.12 bump re-keyed all 212 items of the release batch); FAIL-first: on the
+            # code before it, the first clause below fails (every key moves).
+            def with_edits(edits: list[tuple[str, Callable[[str], str]]], fn):
+                saved: dict[str, str] = {}
+                try:
+                    for rel, change in edits:
+                        with open(os.path.join(roots[0], rel), encoding="utf-8") as fh:
+                            saved[rel] = fh.read()
+                        changed = change(saved[rel])
+                        expect(changed != saved[rel], f"the probe edit of {rel} changed nothing")
+                        with open(os.path.join(roots[0], rel), "w", encoding="utf-8") as fh:
+                            fh.write(changed)
+                    return fn()
+                finally:
+                    for rel, text in saved.items():
+                        with open(os.path.join(roots[0], rel), "w", encoding="utf-8") as fh:
+                            fh.write(text)
+
+            bump_toml = lambda t: re.sub(r'(?m)^version = "([^"]*)"', r'version = "\1-probe"', t, count=1)  # noqa: E731
+            bump_lock = lambda t: re.sub(r'(?m)^(name = "bloomery-gpu-gates"\nversion = "[^"]*)"', r'\1-probe"', t, count=1)  # noqa: E731
+            bump_ext = lambda t: re.sub(r'(?m)^(name = "[^"]*"\nversion = "[^"]*)("\nsource = )', r'\1-probe\2', t, count=1)  # noqa: E731
+            drop_dep = lambda t: re.sub(r'(?m)^(name = "bloomery-gpu-gates"\nversion = "[^"]*"\ndependencies = \[\n) "[^"]*",\n', r'\1', t, count=1)  # noqa: E731
+            read_version = lambda t: t + "\nsed -n 's/^version = \"\\(.*\\)\"/\\1/p' crates/gpu-gates/Cargo.toml\n"  # noqa: E731
+            modeled = {k: items[k] for k in ("gpu", "cpu", "args")}  # the items whose reads are modeled (the closure scope)
+            member = [("crates/gpu-gates/Cargo.toml", bump_toml), ("Cargo.lock", bump_lock)]
+            m = with_edits(member, lambda: moved(keys(sa)))
+            expect(m == {"mac", "fmt"}, f"a workspace member's version bump (manifest and lock) moves {sorted(m)}, not only the whole-tree keys")
+            for edit_one in member:
+                m = with_edits([edit_one], lambda: moved(keys(sa, only=modeled)))
+                expect(not m, f"a workspace member's version bump in {edit_one[0]} alone moves {sorted(m)}")
+            for what, edits in (("a dependency's version in Cargo.lock", [("Cargo.lock", bump_ext)]),
+                                ("a dependency's version beside the member's", member + [("Cargo.lock", bump_ext)]),
+                                ("a member entry's dependency list in Cargo.lock", member + [("Cargo.lock", drop_dep)]),
+                                ("another edit of the member's manifest beside its version", member + [("crates/gpu-gates/Cargo.toml", lambda t: t.replace("publish = false", "publish = true", 1))])):
+                m = with_edits(edits, lambda: moved(keys(sa, only=modeled)))
+                expect(m == set(modeled), f"{what} moves {sorted(m)}, not every key")
+            # an item with an input that reads a version out of a manifest keeps it: the key with that reader in the tree moves with the bump
+            with_reader = with_edits([("tools/gpu-gate.sh", read_version)], lambda: keys(sa, only=modeled))
+            m = with_edits([("tools/gpu-gate.sh", read_version)] + member, lambda: {k for k, v in keys(sa, only=modeled).items() if v != with_reader[k]})
+            expect(m == set(modeled), f"a script that reads a manifest's version: the bump moves {sorted(m)}, not every key")
+            # an item that names the lock reads it as a file: its version is part of what the item reads
+            named_lock = "gate-gpu-q4k-sel@BLOOMERY_GATE_CARD=3090:./Cargo.lock"
+            expect(with_edits([("Cargo.lock", bump_lock)], lambda: one(named_lock)) != one(named_lock), "an item that names Cargo.lock is blind to a member's version in it")
+            lk = lambda own_v, ext_v, tail="": (  # noqa: E731
+                'version = 4\n\n[[package]]\nname = "a"\nversion = "0.1.0"\ndependencies = [\n'
+                f' "b {own_v}",\n "b {ext_v} (registry+https://x/index)",\n]\n\n[[package]]\nname = "b"\nversion = "{own_v}"{tail}\n\n'
+                f'[[package]]\nname = "b"\nversion = "{ext_v}"\nsource = "registry+https://x/index"\nchecksum = "{"0" * 64}"\n')
+            blind = lambda t, names={"a", "b"}: lock_member_blind(t, names)  # noqa: E731
+            expect(blind(lk("0.1.0", "0.2.0")) == blind(lk("0.1.1", "0.2.0")), "lock_member_blind: a member's version, in its entry and in a `name version` dependency, moves the text")
+            expect(blind(lk("0.1.0", "0.2.0")) != blind(lk("0.1.0", "0.2.1")), "lock_member_blind: a registry package of a member's name moves nothing")
+            expect('version = "0.2.0"' in blind(lk("0.1.0", "0.2.0")), "lock_member_blind: a registry package of a member's name lost its version")
+            expect(blind(lk("0.1.0", "0.2.0"), {"a"}) != blind(lk("0.1.1", "0.2.0"), {"a"}), "lock_member_blind: a package that is no member loses its version")
+            expect(_raises(lambda: blind(lk("0.1.0", "0.2.0", " # note")), "could not be read out of the file"), "lock_member_blind: a member entry it cannot rewrite (a comment on the version line) is not a named error")
+            expect(_raises(lambda: manifest_member_blind('package = { name = "x", version = "1" }\n'), "could not be read out of the file"), "manifest_member_blind: a version it cannot rewrite is not a named error")
+            pkg = lambda v, tail="": f'[package]\nname = "x"\nversion = {v}{tail}\n\n[dependencies]\ny = {{ version = "1", path = "../y" }}\n'
+            expect(manifest_member_blind(pkg('"0.1.0"')) == manifest_member_blind(pkg('"0.2.0"')), "manifest_member_blind: a package's version moves the text")
+            expect(manifest_member_blind(pkg('"0.1.0"')) != manifest_member_blind(pkg('"0.1.0"').replace('y = { version = "1"', 'y = { version = "2"')), "manifest_member_blind: a dependency's version moves nothing")
+            expect(manifest_member_blind(pkg('"0.1.0"', " # note")) != manifest_member_blind(pkg('"0.1.0"')), "manifest_member_blind: a comment edit moves nothing")
+            expect(manifest_member_blind(pkg('{ workspace = true }')) == pkg('{ workspace = true }'), "manifest_member_blind: the workspace form lost a byte")
+            expect(key_view({"package": {"name": "x", "version": "1"}}) == key_view({"package": {"name": "x", "version": "2"}}), "key_view: a package version moves the view")
+            expect(key_view({"package": {"name": "x", "version": "1"}}) != key_view({"package": {"name": "y", "version": "1"}}), "key_view: a package name does not move the view")
+            expect(key_view({"package": {"version": {"workspace": True}}}) != key_view({"package": {"version": "1"}}), "key_view: `version.workspace = true` and a literal are one view")
+            reads = lambda line: VERSION_READ.search(line) is not None  # noqa: E731
+            expect(reads("v=$(sed -n 's/^version = \"\\(.*\\)\"/\\1/p' \"crates/$c/Cargo.toml\")") and reads("grep version Cargo.lock"), "VERSION_READ: a line that reads a version out of a manifest is not one")
+            expect(not reads('meta=$(cargo metadata --format-version 1 --manifest-path "$ROOT/Cargo.toml")') and not reads("banner: LLVM version 21") and not reads("$ROOT/Cargo.toml"), "VERSION_READ: a line that names no version read is one")
         if section is None or section == "inputs":
             m = edit("justfile", append("\n# key probe\n"), side_fresh=True)
             expect(m == {"mac", "fmt"}, f"a justfile comment moves {sorted(m)}")
