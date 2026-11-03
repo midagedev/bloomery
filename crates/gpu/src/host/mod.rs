@@ -113,6 +113,7 @@ pub mod node;
 pub mod nvtier;
 pub mod page;
 pub mod prompt_stream;
+pub mod rank;
 pub mod residency;
 pub mod route_trace;
 pub mod run;
@@ -128,8 +129,8 @@ pub mod xstream;
 
 pub use leg::{BatchLeg, LegTimer, ServeNote, StepLeg};
 pub use link::{
-    Crossing, GatherLoop, GatherSet, GatherShape, Gathers, Peer, PostCols, RdmaEnd, Reader,
-    RemoteWire, Span, TcpEnd, TcpPeer, link_tail,
+    Crossing, GatherLoop, GatherSet, GatherShape, Gathers, Peer, PeerPath, PostCols, RdmaEnd,
+    Reader, RemoteWire, Span, TcpEnd, TcpPeer, link_tail, paths,
 };
 
 use crate::GpuError;

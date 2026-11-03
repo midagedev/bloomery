@@ -48,6 +48,7 @@
 //! it raises any.
 
 mod gather;
+mod path;
 mod pump;
 mod rdma;
 mod tcp;
@@ -66,6 +67,7 @@ use threads::helper::{HelperError, Placement, spawn_helper};
 use crate::GpuError;
 use crate::graph::{MappedHost, SHARED_PAGE, cu};
 pub use gather::{GatherLoop, GatherSet, GatherShape, Gathers};
+pub use path::{PeerPath, paths};
 pub use pump::{Crossing, PostCols, Reader, Span};
 use pump::{Half, Move, Page, TAIL_LINE, Wire};
 pub use rdma::RdmaEnd;
@@ -695,14 +697,14 @@ impl Link {
         let (dev, gid) = bloomery_verbs::first_roce_v2()
             .map_err(|e| GpuError::shape(what, format!("the RDMA link: {e}")))?;
         let post_cols = PostCols::default();
+        let path = PeerPath::port(dev, gid, std::net::Ipv4Addr::UNSPECIFIED.into());
         let open = |side, page: &Arc<MappedHost>| {
             RdmaEnd::new(
                 Arc::clone(page),
                 tail,
                 crossings.clone(),
                 side,
-                &dev,
-                gid,
+                &path,
                 post_cols.clone(),
             )
         };
@@ -855,8 +857,7 @@ impl Link {
             tail,
             crossings,
             side,
-            &dev,
-            gid,
+            &PeerPath::port(dev, gid, ip.into()),
             self.post_cols.clone(),
         )
     }
