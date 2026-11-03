@@ -2319,7 +2319,7 @@ impl Gemm32Kernels {
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         let what = "Gemm32Kernels::enqueue_e4m3_tile";
-        let (rows, k) = w.dimensions(what)?;
+        let (rows, k) = w.records(what)?;
         let t = tile_launch(what, rows, k, x, n, y)?;
         let cfg = LaunchConfig1D::new(t.grid, F32T_THREADS_U32, 0);
         let (qs, e, module) = (w.qs.buf(), w.e.buf(), &self.module);
@@ -2349,7 +2349,7 @@ impl Gemm32Kernels {
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         let what = "Gemm32Kernels::enqueue_e4m3_mma";
-        let (rows, k) = w.dimensions(what)?;
+        let (rows, k) = w.records(what)?;
         let t = mma_launch(what, rows, k, x, n, y)?;
         let cfg = LaunchConfig1D::new(t.grid, MMA_THREADS, 0);
         let (qs, e, module) = (w.qs.buf(), w.e.buf(), &self.module);
@@ -2621,7 +2621,7 @@ fn mxfp8_mma_launch<T>(
     n: usize,
     y: &DeviceBuffer<T>,
 ) -> Result<TileLaunch, GpuError> {
-    let (rows, k) = w.dimensions(what)?;
+    let (rows, k) = w.records(what)?;
     if w.scales != E4m3Scales::Mxfp8 {
         return Err(GpuError::shape(
             what,

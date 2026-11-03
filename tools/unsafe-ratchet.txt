@@ -803,7 +803,9 @@ gguf 7 2 0
 # product helper in place of one a term, and the chunk record's cells are written in one loop.
 # PIN(2026-11-03): gpu 2992 -> 2993 blocks: split_mma launches the high parts' term after the others and the seed, a
 # second block beside its loop's, with its SAFETY line.
-gpu 2993 413 10
+# PIN(2026-11-03): gpu 2993 -> 2995 blocks, 413 -> 414 fns, new code, not old code relaxed: `elem::mxfp8_embed_value`,
+# the MXFP8 row decode (the fn and its scale and value byte loads), each with its SAFETY line.
+gpu 2995 414 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -840,7 +842,9 @@ gpu 2993 413 10
 # PIN(2026-11-01): gpu-deepseek41 397 -> 402 blocks, new code, not old code relaxed: index_key.rs's
 # input-projected index key append (Mistral Large 4's): the position read, the row, gain, bias and rope-table
 # loads, and the store, each with its SAFETY line.
-gpu-deepseek41 402 44 0
+# PIN(2026-11-03): gpu-deepseek41 402 -> 404 blocks, new code, not old code relaxed: glue.rs's MXFP8 engram row
+# kernel `ds41_glue_engram_rows_mxfp8` (its decode call and its store), each with its SAFETY line.
+gpu-deepseek41 404 44 0
 # PIN(2026-10-24): gpu-flint starts at 2 blocks, 0 fns and 0 impls: step and prompt
 # call the checked common attention binding with staged distinct positions, each with SAFETY.
 gpu-flint 2 0 0

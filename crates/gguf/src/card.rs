@@ -613,8 +613,9 @@ pub enum CardFormat {
     Nvfp4Planes,
     /// bloomery's mxfp8 (`GgmlType::MXFP8`) in two planes
     /// (`crates/gpu/src/q8f32.rs`, `e4m3_planes`): a row's value bytes as
-    /// `k / 4` words, then its E8M0 scale bytes four to a word, `k / 128`
-    /// words — the file's 33 bytes a 32-value block, moved.
+    /// `k / 4` words, then its E8M0 scale bytes four to a word, `ceil(k / 128)`
+    /// words, the last zero past the row's blocks — the file's 33 bytes a
+    /// 32-value block, moved. `k` is any multiple of 32.
     Mxfp8Planes,
     /// bloomery's fp8_b128 (`GgmlType::FP8_B128`) in the same two planes
     /// (`e4m3_planes`): a row's value bytes as `k / 4` words, then its
@@ -698,11 +699,15 @@ impl CardFormat {
                 vec![rows.checked_mul(k / 2)?, rows.checked_mul(k / 16)?]
             }
             CardFormat::Mxfp8Planes => {
-                // Whole scale words a row: a row's four blocks a word.
-                if !k.is_multiple_of(128) {
+                // Whole 32-value blocks a row (a BF16 row's too), its scale
+                // bytes four to a word, the row's last word padded.
+                if !k.is_multiple_of(32) {
                     return None;
                 }
-                vec![rows.checked_mul(k)?, rows.checked_mul(k / 32)?]
+                vec![
+                    rows.checked_mul(k)?,
+                    rows.checked_mul(k.div_ceil(128).checked_mul(4)?)?,
+                ]
             }
             CardFormat::Fp8B128Planes => {
                 vec![

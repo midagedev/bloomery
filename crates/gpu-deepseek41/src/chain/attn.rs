@@ -38,8 +38,9 @@
 //!    whatever the other rows run between them;
 //! 7. the attention over the window ⧺ the stream's compressed rows read
 //!    through the list, then the inverse rope of its output;
-//! 8. wo_a, its groups in one launch (`q8_0_gemv_heads`, or the q8_1 form of
-//!    the heads and `dense`'s Q3_K block diagonal), and wo_b (with its
+//! 8. wo_a, its groups in one launch (`q8_0_gemv_heads`, the q8_1 form of
+//!    the heads and `dense`'s Q3_K block diagonal, `dense`'s Q5_K one, or
+//!    `mxfp8_gemv`'s block diagonal), and wo_b (with its
 //!    input's q8_1 form first when it is a K-quant);
 //! 9. HC_POST and the ffn's fold in one launch.
 //!
@@ -1824,11 +1825,18 @@ fn enqueue_output(cx: &Cx<'_>, lp: &LayerPlan, s: &mut Scratch) -> Result<(), Gp
             (d.o_lora_rank, d.group_k),
             &mut s.wo_a,
         )?,
+        Dense::Mxfp8(wa) => cx.gpu.q8f32().enqueue_mxfp8_gemv_heads(
+            stream,
+            wa,
+            &s.y,
+            (d.o_lora_rank, d.group_k),
+            &mut s.wo_a,
+        )?,
         _ => {
             return Err(GpuError::Tensor {
                 what: WHAT,
                 name: n.out_a.clone(),
-                need: "Q3_K, Q5_K or Q8_0",
+                need: "Q3_K, Q5_K, Q8_0 or MXFP8",
             });
         }
     }

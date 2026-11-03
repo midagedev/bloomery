@@ -801,6 +801,14 @@ impl<'a> LegStacks<'a> {
         self.down.ty
     }
 
+    /// The activation form the down is read over at its row width
+    /// ([`kernels::down_act`]); `None` for a down type the table names no
+    /// entry for.
+    #[must_use]
+    pub fn down_act(&self) -> Option<DownAct> {
+        kernels::down(self.down.ty).map(|_| kernels::down_act(self.down.ty, self.down.k as u64))
+    }
+
     /// The gate's, up's and down's words, for kernels over the file's blocks
     /// (the grouped tiles); a stack in another layout is refused by name.
     pub fn words(&self) -> Result<[&'a DeviceTensor<u32>; 3], GpuError> {
@@ -1273,7 +1281,7 @@ impl CardLeg {
             });
         }
         let st = run.stacks;
-        let Some((_, form)) = kernels::down(st.down.ty) else {
+        let Some(form) = st.down_act() else {
             return Err(st.down.unrun());
         };
         let mut act_h = act_h.of(form).ok_or_else(|| GpuError::Shape {
@@ -1430,6 +1438,16 @@ impl CardLeg {
                     rows_per_expert,
                 };
                 self.mxfp4.enqueue_down(stream, &d, fault, down)?;
+            }
+            (Some((DownEntry::Mxfp4, DownAct::Q8Act)), ActH::Blocks32(act)) => {
+                self.mxfp4.enqueue_down32(
+                    stream,
+                    (st.down.words()?, act),
+                    (sel, slots),
+                    rows_per_expert,
+                    fault,
+                    down,
+                )?;
             }
             (Some((DownEntry::Nvfp4, DownAct::Q8Blocks32)), ActH::Blocks32(act)) => {
                 let d = Nvfp4Down {

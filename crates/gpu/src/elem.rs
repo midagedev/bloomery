@@ -220,6 +220,33 @@ unsafe fn stream_byte(w: &[u32], x: usize) -> u32 {
     (unsafe { *w.get_unchecked(x >> 2) } >> (8 * (x & 3))) & 0xff
 }
 
+/// The f32 value of MXFP8 weight `v` (0..32) of the 33-byte block at byte
+/// `base` of the row stream `w`, bit-identical to `gguf::quant::dequant_row`:
+/// the F8_E4M3 byte `base + 1 + v` times `2^(E − 127)`, `E` the block's first
+/// byte, the decodes the MXFP8 gemv reads (`q8f32`'s `Mxfp8Bytes`). Each
+/// byte is loaded alone, so a block may start at any byte. A byte the format
+/// leaves undefined (scale `0xFF`, an E4M3 NaN value) or a product past f32
+/// raises [`FaultSite::F32Product`] into `fault` and gives NaN, the bytes
+/// the plane load refuses (`planes`' MXFP8 check).
+///
+/// # Safety
+///
+/// `base + 33 <= 4 * w.len()` and `v < 32`.
+#[inline(always)]
+pub unsafe fn mxfp8_embed_value(w: &[u32], base: usize, v: usize, fault: FaultSink) -> f32 {
+    use crate::q8f32::{ByteBlocks, Mxfp8Bytes};
+    // SAFETY: base < base + 33 <= 4 * w.len() by this fn's `# Safety`.
+    let e = unsafe { stream_byte(w, base) };
+    // SAFETY: base + 1 + v <= base + 32 < 4 * w.len() by this fn's `# Safety`.
+    let q = unsafe { stream_byte(w, base + 1 + v) };
+    let value = Mxfp8Bytes::value(q) * Mxfp8Bytes::scale(e, 0);
+    if e == 0xFF || q & 0x7F == 0x7F || !value.is_finite() {
+        fault.raise(FaultSite::F32Product);
+        return f32::NAN;
+    }
+    value
+}
+
 /// The f32 value of IQ4_NL weight `v` (0..32) of the 18-byte block at byte
 /// `base` of the row stream `w`, bit-identical to `gguf::quant::dequant_row`:
 /// `d · kvalues_iq4nl[code]`, `d` the f16 in the block's first two bytes and

@@ -131,8 +131,8 @@ pub enum DevWeight {
     },
     /// bloomery's MXFP8 file tensor (`GgmlType::MXFP8`) in the two planes of
     /// `q8f32::e4m3_planes` (`CardFormat::Mxfp8Planes`): `qs` rows × k/4
-    /// value words, `e` rows × k/128 scale words (four E8M0 bytes a word).
-    /// `k` is a multiple of 128.
+    /// value words, `e` rows × ceil(k/128) scale words (four E8M0 bytes a
+    /// word, a row's last word zero past its blocks). `k` is a multiple of 32.
     Mxfp8 {
         qs: DeviceTensor<u32>,
         e: DeviceTensor<u32>,
@@ -661,7 +661,7 @@ impl Weights {
                 return self.join_byte_rows(
                     stream,
                     (parts, joint),
-                    32,
+                    |k| k / 32,
                     |w| match w {
                         DevWeight::Q8_0 { qs, d, k } => Some((qs, d, *k)),
                         _ => None,
@@ -673,7 +673,7 @@ impl Weights {
                 return self.join_byte_rows(
                     stream,
                     (parts, joint),
-                    128,
+                    E4m3Scales::e_cols,
                     |w| match w {
                         DevWeight::Mxfp8 { qs, e, k } => Some((qs, e, *k)),
                         _ => None,
@@ -685,7 +685,7 @@ impl Weights {
                 return self.join_byte_rows(
                     stream,
                     (parts, joint),
-                    128,
+                    E4m3Scales::e_cols,
                     |w| match w {
                         DevWeight::Fp8B128 { qs, e, k } => Some((qs, e, *k)),
                         _ => None,
@@ -849,7 +849,7 @@ impl Weights {
 
     /// [`Weights::join_rows`] over parts in two planes, one byte a value
     /// (Q8_0, MXFP8 or FP8_B128): every part resident in the first part's format at its
-    /// width `k`, a `scale_values`-value scale an entry of the scale plane,
+    /// width `k`, `scale_cols(k)` entries a row of the scale plane,
     /// their rows one after another in each of the two planes (`qs` words,
     /// the scales), filed as `joint` in that format — every row the bits its
     /// own tensor holds. `planes` reads a part's planes and width, `None` for
@@ -860,7 +860,7 @@ impl Weights {
         &mut self,
         stream: &CudaStream,
         (parts, joint): (&[&str], String),
-        scale_values: usize,
+        scale_cols: fn(usize) -> usize,
         planes: PartPlanes<S>,
         wrap: fn(DeviceTensor<u32>, DeviceTensor<S>, usize) -> DevWeight,
     ) -> Result<(), GpuError> {
@@ -878,7 +878,7 @@ impl Weights {
             let want = *width.get_or_insert(k);
             if k != want
                 || qs.cols() != want / 4
-                || d.cols() != want / scale_values
+                || d.cols() != scale_cols(want)
                 || qs.rows() != d.rows()
             {
                 return Err(GpuError::shape(
@@ -905,15 +905,15 @@ impl Weights {
         let qs = unsafe { DeviceTensor::<u32>::unfilled(stream, rows, k / 4)? };
         // SAFETY: as the codes, each part's scales are copied whole below, so
         // every scale element is written; a failed copy drops it unread.
-        let d = unsafe { DeviceTensor::<S>::unfilled(stream, rows, k / scale_values)? };
+        let d = unsafe { DeviceTensor::<S>::unfilled(stream, rows, scale_cols(k))? };
         let (qs_base, d_base) = (qs.buf().cu_deviceptr(), d.buf().cu_deviceptr());
         let mut at = 0usize;
         for (part_qs, part_d) in found {
             let n = part_d.rows();
-            let (words, scales) = (n * (k / 4), n * (k / scale_values));
+            let (words, scales) = (n * (k / 4), n * scale_cols(k));
             let qs_off = u64::try_from(at * (k / 4) * size_of::<u32>())
                 .map_err(|_| GpuError::shape(WHAT, format!("row {at} passes u64")))?;
-            let d_off = u64::try_from(at * (k / scale_values) * size_of::<S>())
+            let d_off = u64::try_from(at * scale_cols(k) * size_of::<S>())
                 .map_err(|_| GpuError::shape(WHAT, format!("row {at} passes u64")))?;
             // SAFETY: rows `at .. at + n` of each plane lie inside the joint's
             // `rows` (the parts' rows sum to `rows`), and each window over the
@@ -1656,25 +1656,23 @@ fn upload_rows(
             } else {
                 E4m3Scales::Fp8B128
             };
+            let e_cols = E4m3Scales::e_cols(k);
             let (qs, e) = if t.ty == GgmlType::BF16 {
                 let (qs, e) = crate::q8f32::bf16_mxfp8_planes(&flat_of(src, take)?, rows, k)
                     .map_err(|err| GpuError::shape(what, format!("tensor {name}: {err}")))?;
                 (
                     upload_packed(stream, ring, what, name, &qs, rows, k / 4)?,
-                    upload_packed(stream, ring, what, name, &e, rows, k / 128)?,
+                    upload_packed(stream, ring, what, name, &e, rows, e_cols)?,
                 )
             } else {
-                let format = match scales {
-                    E4m3Scales::Mxfp8 => PlaneFormat::Mxfp8,
-                    E4m3Scales::Fp8B128 => PlaneFormat::Fp8B128,
-                };
+                let format = scales.planes();
                 upload_split(
                     stream,
                     ring,
                     (what, name),
-                    (format, k / 128),
+                    (format, k / format.code_bytes()),
                     (src, take),
-                    (rows, k / 4, k / 128),
+                    (rows, k / 4, e_cols),
                 )?
             };
             match scales {

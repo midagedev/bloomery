@@ -5,7 +5,9 @@
 //! records of `sub` blocks, each block its `head` scale bytes and then its
 //! `code` value bytes. The card layout keeps the two apart: a plane of the
 //! codes in record order and a plane of the scale bytes in record order, each
-//! the file's own bytes read as little-endian words. The split is a byte
+//! the file's own bytes read as little-endian words, a row's scale bytes padded
+//! with zeros to whole words where the format's rows do not fill them
+//! ([`Format::head_align`]). The split is a byte
 //! de-interleave with a validity check, never arithmetic, and [`Format`] names
 //! the record: [`split_rows`] is the one routine that does it, over whole rows,
 //! in 32 to 128 byte moves per block the compiler keeps as vector loads and
@@ -29,7 +31,8 @@ pub enum Format {
     Nvfp4,
     /// 17 bytes: the E8M0 scale byte, 16 code bytes (32 values).
     Mxfp4,
-    /// 132 bytes: four blocks of a scale byte and 32 codes (128 values).
+    /// 33 bytes: the E8M0 scale byte, 32 codes (32 values). A row's scale
+    /// plane is its blocks' bytes padded to whole words, `ceil(k / 128)` words.
     Mxfp8,
     /// 132 bytes: the f32 block scale, 128 codes.
     Fp8B128,
@@ -42,8 +45,20 @@ impl Format {
             Format::Q8_0 => (1, 2, 32),
             Format::Nvfp4 => (1, 4, 32),
             Format::Mxfp4 => (1, 1, 16),
-            Format::Mxfp8 => (4, 1, 32),
+            Format::Mxfp8 => (1, 1, 32),
             Format::Fp8B128 => (1, 4, 128),
+        }
+    }
+
+    /// The bytes a row's scale plane is padded to a whole number of: MXFP8's
+    /// four, so a row's scales are whole words of the `e` plane whatever its
+    /// block count; one for every other format, whose rows its kernels'
+    /// layouts keep whole.
+    #[must_use]
+    pub const fn head_align(self) -> usize {
+        match self {
+            Format::Mxfp8 => 4,
+            Format::Q8_0 | Format::Nvfp4 | Format::Mxfp4 | Format::Fp8B128 => 1,
         }
     }
 
@@ -70,8 +85,9 @@ impl Format {
 }
 
 /// `format`'s rows of `row_recs` records, the plane bytes of one row:
-/// `(file bytes, code bytes, scale bytes)`.
-fn row_widths(format: Format, row_recs: usize) -> Result<(usize, usize, usize), String> {
+/// `(file bytes, code bytes, scale bytes)`, the scale bytes padded to
+/// [`Format::head_align`].
+pub(crate) fn row_widths(format: Format, row_recs: usize) -> Result<(usize, usize, usize), String> {
     if row_recs == 0 {
         return Err(format!("a {format:?} row of no records"));
     }
@@ -83,7 +99,7 @@ fn row_widths(format: Format, row_recs: usize) -> Result<(usize, usize, usize), 
     Ok((
         wide(format.record_bytes())?,
         wide(format.code_bytes())?,
-        wide(format.head_bytes())?,
+        wide(format.head_bytes())?.next_multiple_of(format.head_align()),
     ))
 }
 
@@ -141,9 +157,9 @@ fn deinterleave<const SUB: usize, const HEAD: usize, const CODE: usize>(
 
 /// Rows `first_row ..` of `format`, `src` their whole file bytes (rows of
 /// `row_recs` records): row `r`'s code bytes into the next row's worth of
-/// `codes` and its scale bytes into `heads`. The first row a check refuses is
-/// the error, naming its row of the tensor; the planes of the rows before it
-/// are written.
+/// `codes` and its scale bytes into `heads`, the row's padding past them
+/// zeroed. The first row a check refuses is the error, naming its row of the
+/// tensor; the planes of the rows before it are written.
 pub(crate) fn split_rows(
     format: Format,
     row_recs: usize,
@@ -166,15 +182,17 @@ pub(crate) fn split_rows(
         .chunks_exact(row)
         .zip(codes.chunks_exact_mut(code_row))
         .zip(heads.chunks_exact_mut(head_row));
+    let held = row_recs * format.head_bytes();
     for (r, ((file, c), h)) in each.enumerate() {
         check_row(format, first_row + r, file)?;
         match format {
             Format::Q8_0 => deinterleave::<1, 2, 32>(file, c, h),
             Format::Nvfp4 => deinterleave::<1, 4, 32>(file, c, h),
             Format::Mxfp4 => deinterleave::<1, 1, 16>(file, c, h),
-            Format::Mxfp8 => deinterleave::<4, 1, 32>(file, c, h),
+            Format::Mxfp8 => deinterleave::<1, 1, 32>(file, c, h),
             Format::Fp8B128 => deinterleave::<1, 4, 128>(file, c, h),
         }
+        h[held..].fill(0);
     }
     Ok(())
 }
@@ -345,7 +363,7 @@ pub(crate) fn piece_rows(format: Format, row_recs: usize, slot_bytes: usize) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{Format, fill_piece, piece_rows, split_rows, split_vecs};
+    use super::{Format, fill_piece, piece_rows, row_widths, split_rows, split_vecs};
     use crate::weights::q8_0_planes;
     use gguf::quant::Q8Block;
 
@@ -398,8 +416,9 @@ mod tests {
 
     /// The scalar splitters the loader had before [`split_rows`], one per file
     /// format: the codes and scale bytes as the words (the Q8_0 scales as the
-    /// bytes of their u16s) of the planes they built.
-    fn reference(format: Format, src: &[u8]) -> (Vec<u32>, Vec<u8>) {
+    /// bytes of their u16s) of the planes they built, MXFP8's scales of a row
+    /// of `row_recs` blocks padded with zeros to whole words.
+    fn reference(format: Format, row_recs: usize, src: &[u8]) -> (Vec<u32>, Vec<u8>) {
         let le = |b: &[u8]| -> Vec<u32> {
             b.as_chunks::<4>()
                 .0
@@ -433,11 +452,12 @@ mod tests {
                 }
             }
             Format::Mxfp8 => {
-                for group in src.as_chunks::<132>().0 {
-                    for blk in group.as_chunks::<33>().0 {
+                for row in src.chunks_exact(33 * row_recs) {
+                    for blk in row.as_chunks::<33>().0 {
                         e.push(blk[0]);
                         qs.extend(le(&blk[1..]));
                     }
+                    e.resize(e.len().next_multiple_of(4), 0);
                 }
             }
             Format::Fp8B128 => {
@@ -460,15 +480,16 @@ mod tests {
         src: &[u8],
         slot: usize,
     ) -> (Vec<u8>, Vec<u8>) {
-        let row = row_recs * format.record_bytes();
+        let (row, code_row, head_row) = row_widths(format, row_recs).expect("a row");
         let n = piece_rows(format, row_recs, slot).expect("one row fits the slot");
         let (mut codes, mut heads) = (Vec::new(), Vec::new());
         let mut first = 0;
         for run in src.chunks(n * row) {
             let rows = run.len() / row;
-            let mut out = vec![0u8; rows * row_recs * (format.code_bytes() + format.head_bytes())];
+            // A stale slot: the split writes every byte of its rows' planes.
+            let mut out = vec![0xA5u8; rows * (code_row + head_row)];
             fill_piece(format, row_recs, first, run, &mut out).unwrap_or_else(|e| panic!("{e}"));
-            let (c, h) = out.split_at(rows * row_recs * format.code_bytes());
+            let (c, h) = out.split_at(rows * code_row);
             codes.extend_from_slice(c);
             heads.extend_from_slice(h);
             first += rows;
@@ -477,7 +498,8 @@ mod tests {
     }
 
     /// Every format's splitter gives the planes of the scalar splitter it
-    /// replaced, on random valid bytes: cut into the upload's slot-sized pieces
+    /// replaced, on random valid bytes, MXFP8 at rows of whole scale words
+    /// and at rows whose scale words a pad ends: cut into the upload's slot-sized pieces
     /// (the largest past the pool's threshold, so its tasks run on the
     /// workers), and, for the formats a host caller takes as words, whole.
     #[test]
@@ -496,11 +518,12 @@ mod tests {
             (Format::Nvfp4, 2, 3),
             (Format::Mxfp4, 8, 9000),
             (Format::Mxfp8, 32, 2500),
+            (Format::Mxfp8, 18, 2500),
             (Format::Mxfp8, 1, 7),
             (Format::Fp8B128, 32, 2500),
         ] {
             let src = file(format, row_recs, rows, 0x5eed + rows as u64);
-            let (want_q, want_e) = reference(format, &src);
+            let (want_q, want_e) = reference(format, row_recs, &src);
             if format != Format::Q8_0 {
                 let (q, e) = split_vecs("test", format, row_recs, rows, &src)
                     .unwrap_or_else(|e| panic!("{e}"));
@@ -542,10 +565,10 @@ mod tests {
         }
         let named = named.expect("a piece refused its row");
         assert!(named.starts_with(&want), "{named}");
-        let mut mx = file(Format::Mxfp8, 1, 4, 9);
+        let mut mx = file(Format::Mxfp8, 4, 4, 9);
         mx[132 + 33 + 1 + 3] = 0xFF;
         let (mut c, mut h) = (vec![0u8; 4 * 128], vec![0u8; 4 * 4]);
-        let err = split_rows(Format::Mxfp8, 1, 0, &mx, &mut c, &mut h).unwrap_err();
+        let err = split_rows(Format::Mxfp8, 4, 0, &mx, &mut c, &mut h).unwrap_err();
         assert!(err.starts_with("row 1:"), "{err}");
     }
 }

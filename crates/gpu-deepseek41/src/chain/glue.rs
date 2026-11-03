@@ -11,7 +11,7 @@
 //!   that fold is the row itself and does not run.
 //! - [`Glue::enqueue_engram_kv_at`], three launches per engram site (four
 //!   when `engram_wkv` is a K-quant), none of which reads a stream: the
-//!   site's gathered rows (the table's Q8_0, Q3_K or IQ4_NL bytes in the
+//!   site's gathered rows (the table's Q8_0, Q3_K, IQ4_NL or MXFP8 bytes in the
 //!   image) dequantized, `engram_wkv` over them ([`crate::dense`]: `q8_0_gemv`
 //!   on the f32 rows, or the rows' q8_1 form and the K-quant gemv), and the key
 //!   norm. They depend on the token alone and are first read by the site
@@ -47,7 +47,10 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use bloomery_gpu::elem::{EmbedSb, Q3kRows, Q5kRows, iq4nl_embed_value, q3k_embed_value};
+use bloomery_gpu::elem::{
+    EmbedSb, Q3kRows, Q5kRows, iq4nl_embed_value, mxfp8_embed_value, q3k_embed_value,
+};
+use bloomery_gpu::fault::FaultSink;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{Gpu, GpuError, Q8Act, StagedRows, launch_u32};
@@ -94,6 +97,11 @@ const Q5_K_BLOCK: usize = 256;
 /// two codes each.
 const IQ4_NL_BLOCK: usize = 32;
 const IQ4_NL_BYTES: usize = 18;
+
+/// Values of one MXFP8 block, and its bytes: an E8M0 scale, then one F8_E4M3
+/// byte a value.
+const MXFP8_BLOCK: usize = 32;
+const MXFP8_BYTES: usize = 33;
 
 /// How a token's embedding row sits in the image: `token_embd`'s type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -160,6 +168,9 @@ enum TableRows {
     /// IQ4_NL rows of whole blocks, packed at 18 bytes each: every other
     /// block starts on a half word.
     Iq4Nl,
+    /// MXFP8 rows of whole blocks, packed at 33 bytes each, read a byte at a
+    /// time: a block starts at any byte.
+    Mxfp8,
 }
 
 impl TableRows {
@@ -176,6 +187,9 @@ impl TableRows {
             GgmlType::IQ4_NL if key_len.is_multiple_of(IQ4_NL_BLOCK) => {
                 Some((TableRows::Iq4Nl, key_len / IQ4_NL_BLOCK * IQ4_NL_BYTES))
             }
+            GgmlType::MXFP8 if key_len.is_multiple_of(MXFP8_BLOCK) => {
+                Some((TableRows::Mxfp8, key_len / MXFP8_BLOCK * MXFP8_BYTES))
+            }
             _ => None,
         }
     }
@@ -183,18 +197,20 @@ impl TableRows {
     /// Whether the format's blocks start on a half word, not a word: the
     /// kernels read a block's f16 scale from one half of its covering word.
     fn on_half_words(self) -> bool {
-        self != TableRows::Q8_0
+        matches!(self, TableRows::Q3K | TableRows::Iq4Nl)
     }
 
     /// Enqueue the dequantization of `rows` gathered rows of `key_len`
     /// values (`row_bytes` bytes each, from image byte `at_byte`) of `params`
-    /// into `y`: one launch, a thread a value.
+    /// into `y`: one launch, a thread a value. An MXFP8 row's undefined byte
+    /// raises into `fault` (`mxfp8_embed_value`).
     fn enqueue(
         self,
         module: &glue_kernels::LoadedModule,
         stream: &CudaStream,
         shape: TableShape,
         (params, at_byte): (&DeviceBuffer<u32>, u32),
+        fault: FaultSink,
         y: &mut SpanMut<'_, f32>,
     ) -> Result<(), GpuError> {
         let TableShape {
@@ -239,6 +255,19 @@ impl TableRows {
                     at_byte,
                     rows,
                     key_len / IQ4_NL_BLOCK as u32,
+                    y,
+                )?;
+            }
+            TableRows::Mxfp8 => {
+                let prep = module.prepare_ds41_glue_engram_rows_mxfp8(cfg)?;
+                module.ds41_glue_engram_rows_mxfp8(
+                    stream,
+                    &prep,
+                    params,
+                    at_byte,
+                    rows,
+                    key_len / MXFP8_BLOCK as u32,
+                    fault,
                     y,
                 )?;
             }
@@ -563,6 +592,44 @@ pub(crate) mod glue_kernels {
         // thread per value.
         unsafe { *y.get_unchecked_mut(i) = v };
     }
+
+    /// One site's gathered MXFP8 rows, dequantized: thread `i` is value `v =
+    /// i % (32·n_blk)` of row `r = i / (32·n_blk)`, value `v % 32` of block
+    /// `v / 32` of the rows packed from image byte `at_byte` at `33·n_blk`
+    /// bytes each (`mxfp8_embed_value`, which raises an undefined byte into
+    /// `fault`).
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * params.len() >= at_byte + rows * 33 * n_blk,
+            y.len() >= rows * 32 * n_blk
+        )
+    )]
+    pub fn ds41_glue_engram_rows_mxfp8(
+        params: &[u32],
+        at_byte: u32,
+        rows: u32,
+        n_blk: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        let n_blk = n_blk as usize;
+        if i >= rows as usize * 32 * n_blk {
+            return;
+        }
+        let blk = i / 32;
+        // SAFETY: i < rows·32·n_blk (the guard above) gives blk < rows·n_blk,
+        // so the block ends at byte at_byte + 33·(blk + 1) <= at_byte +
+        // rows·33·n_blk <= 4·params.len() (the launch contract); i % 32 < 32.
+        let v = unsafe { mxfp8_embed_value(params, at_byte as usize + 33 * blk, i % 32, fault) };
+        // SAFETY: i < rows·32·n_blk <= y.len() by the launch contract; one
+        // thread per value.
+        unsafe { *y.get_unchecked_mut(i) = v };
+    }
 }
 
 // -------------------------------------------------------------- the piece
@@ -796,7 +863,7 @@ impl Glue {
     /// and each engram site's scratch. The kernels hold a stream row of
     /// [`ROW`] values and four streams; a step runs one token, and the image
     /// carries the embedding row as bf16, Q3_K or Q5_K and each site's rows as
-    /// Q8_0, Q3_K or IQ4_NL (the file's types, [`Hparams::rows`]). One row of
+    /// Q8_0, Q3_K, IQ4_NL or MXFP8 (the file's types, [`Hparams::rows`]). One row of
     /// site scratch.
     pub fn new(gpu: &Gpu, hp: &Hparams, layout: &ImageLayout) -> Result<Glue, GpuError> {
         Glue::with_rows(gpu, hp, layout, 1)
@@ -837,8 +904,8 @@ impl Glue {
         }) else {
             return Err(refuse(format!(
                 "engram rows of {} values of {}, {} bytes a token in the image: not {} sites of \
-                 {rows} Q8_0 rows in whole words, Q3_K rows of whole super-blocks or IQ4_NL rows of \
-                 whole blocks",
+                 {rows} Q8_0 rows in whole words, Q3_K rows of whole super-blocks, or IQ4_NL or \
+                 MXFP8 rows of whole blocks",
                 en.key_length,
                 table_ty,
                 dims.engram_bytes,
@@ -1039,8 +1106,14 @@ impl Glue {
                 0,
                 (self.shape.rows * self.shape.key_len) as usize,
             )?;
-            self.table
-                .enqueue(&self.module, stream, self.shape, (params, at_byte), &mut x)?;
+            self.table.enqueue(
+                &self.module,
+                stream,
+                self.shape,
+                (params, at_byte),
+                gpu.layer_sink(layer)?,
+                &mut x,
+            )?;
         }
         let wkv = Dense::of(w, wkv, site.x.len(), site.kv.len())?;
         let act = if wkv.reads_q8_1() {
@@ -1365,7 +1438,7 @@ impl StepRows {
         let (hash, en, table_ty) = (engram.hash(), hp.engram()?, hp.rows.engram()?);
         let (_, row_bytes) = TableRows::of(table_ty, en.key_length).ok_or_else(|| {
             refuse(format!(
-                "engram tables of {} rows of {} values: the card reads Q8_0, Q3_K and IQ4_NL rows",
+                "engram tables of {} rows of {} values: the card reads Q8_0, Q3_K, IQ4_NL and MXFP8 rows",
                 table_ty, en.key_length
             ))
         })?;
@@ -1696,6 +1769,7 @@ fn embd_rows_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bloomery_gpu::fault::{Fault, FaultSite, LAYER_NONE};
     use gguf::quant::dequant_row;
 
     /// A xorshift64 stream: the test's bytes, the same on every run.
@@ -1722,6 +1796,7 @@ mod tests {
         let scales: &[usize] = match ty {
             GgmlType::Q3_K => &[108],
             GgmlType::Q5_K => &[0, 2],
+            GgmlType::MXFP8 => return mxfp8_blocks(n_blocks, rng),
             _ => &[0],
         };
         let mut out = Vec::with_capacity(n_blocks * size);
@@ -1731,6 +1806,21 @@ mod tests {
                 b[at + 1] &= 0xbf;
             }
             out.extend(b);
+        }
+        out
+    }
+
+    /// `n_blocks` MXFP8 blocks of random bytes the file decode takes: each
+    /// scale byte on 112..=136 (`2^-15` to `2^9`, so a value times it stays a
+    /// finite f32) and no E4M3 NaN value (0x7F, 0xFF).
+    fn mxfp8_blocks(n_blocks: usize, rng: &mut Rng) -> Vec<u8> {
+        let mut out = rng.bytes(n_blocks * MXFP8_BYTES);
+        for (i, b) in out.iter_mut().enumerate() {
+            if i % MXFP8_BYTES == 0 {
+                *b = 112 + *b % 25;
+            } else if *b & 0x7F == 0x7F {
+                *b &= 0xFE;
+            }
         }
         out
     }
@@ -1769,7 +1859,10 @@ mod tests {
     /// Every row format the glue takes, decoded on the card out of an image,
     /// is the bits `gguf::quant::dequant_row` gives the same bytes: a token's
     /// embedding row into the four streams and the layer's input, and a
-    /// site's gathered table rows.
+    /// site's gathered table rows (Q8_0, Q3_K, IQ4_NL and MXFP8), none of
+    /// them raising; an MXFP8 byte the format leaves undefined decodes to NaN
+    /// under its named fault. Mutant: the decoder without its check gives
+    /// 480 for the E4M3 NaN.
     #[test]
     #[ignore = "needs a CUDA card"]
     fn hw_glue_rows_decode_as_the_file_decodes_them() {
@@ -1827,7 +1920,12 @@ mod tests {
             let got = input.to_host_vec(stream).expect("input");
             failures.extend(differs(&got, &want).map(|d| format!("{embd:?} input: {d}")));
         }
-        for ty in [GgmlType::Q8_0, GgmlType::Q3_K, GgmlType::IQ4_NL] {
+        for ty in [
+            GgmlType::Q8_0,
+            GgmlType::Q3_K,
+            GgmlType::IQ4_NL,
+            GgmlType::MXFP8,
+        ] {
             let (table, row_bytes) = TableRows::of(ty, KEY_LEN).expect("a table format");
             let n_blocks = ROWS * row_bytes / ty.type_size().expect("sized") as usize;
             let bytes = blocks(ty, n_blocks, &mut rng);
@@ -1838,9 +1936,14 @@ mod tests {
             {
                 dequant_row(ty, b, w).expect("the file decode");
             }
-            // Q8_0 rows are read by word; the other formats start on a half
-            // word, which this offset puts at 2 mod 4.
-            let at_byte = if table == TableRows::Q8_0 { 12 } else { 14 };
+            // Q8_0 rows are read by word; Q3_K and IQ4_NL start on a half
+            // word, which 14 puts at 2 mod 4; MXFP8 is read by byte, from an
+            // odd one.
+            let at_byte = match table {
+                TableRows::Q8_0 => 12,
+                TableRows::Mxfp8 => 13,
+                _ => 14,
+            };
             let params =
                 DeviceBuffer::from_host(stream, &image(at_byte, &bytes, &mut rng)).expect("image");
             let mut y = DeviceBuffer::<f32>::zeroed(stream, ROWS * KEY_LEN).expect("rows");
@@ -1852,11 +1955,62 @@ mod tests {
             {
                 let mut span = span_mut("test", &mut y, 0, ROWS * KEY_LEN).expect("rows");
                 table
-                    .enqueue(&module, stream, shape, (&params, at_byte as u32), &mut span)
+                    .enqueue(
+                        &module,
+                        stream,
+                        shape,
+                        (&params, at_byte as u32),
+                        gpu.unlabelled_sink(),
+                        &mut span,
+                    )
                     .expect("rows launch");
             }
             let got = y.to_host_vec(stream).expect("rows");
             failures.extend(differs(&got, &want).map(|d| format!("{table:?} rows: {d}")));
+            let fault = gpu.take_fault().expect("fault word");
+            failures.extend(fault.map(|f| format!("{table:?} rows raised {f:?}")));
+        }
+        // An MXFP8 byte the format leaves undefined, or a product past f32,
+        // decodes to NaN and raises its named fault: value 5 of block 0 at a
+        // NaN scale, an E4M3 NaN, and 448 at the top scale.
+        let (table, row_bytes) = TableRows::of(GgmlType::MXFP8, KEY_LEN).expect("MXFP8 rows");
+        for (case, scale, value) in [
+            ("scale", 0xFF, 0x10),
+            ("value", 127, 0x7F),
+            ("product", 0xFE, 0x7E),
+        ] {
+            let mut bytes = mxfp8_blocks(row_bytes / MXFP8_BYTES, &mut rng);
+            bytes[0] = scale;
+            bytes[1 + 5] = value;
+            let params =
+                DeviceBuffer::from_host(stream, &image(13, &bytes, &mut rng)).expect("image");
+            let mut y = DeviceBuffer::<f32>::zeroed(stream, KEY_LEN).expect("row");
+            let shape = TableShape {
+                rows: 1,
+                key_len: KEY_LEN as u32,
+                row_bytes: row_bytes as u32,
+            };
+            {
+                let mut span = span_mut("test", &mut y, 0, KEY_LEN).expect("row");
+                table
+                    .enqueue(
+                        &module,
+                        stream,
+                        shape,
+                        (&params, 13),
+                        gpu.unlabelled_sink(),
+                        &mut span,
+                    )
+                    .expect("row launch");
+            }
+            let got = y.to_host_vec(stream).expect("row");
+            if !got[5].is_nan() {
+                failures.push(format!("MXFP8 {case}: value 5 decoded to {}", got[5]));
+            }
+            let fault = gpu.take_fault().expect("fault word");
+            if fault != Some(Fault::at(LAYER_NONE, FaultSite::F32Product)) {
+                failures.push(format!("MXFP8 {case}: raised {fault:?}"));
+            }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
