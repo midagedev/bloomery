@@ -402,6 +402,10 @@ name = "cnode_probe"
 required-features = ["gpu"]
 
 [[bin]]
+name = "bench_picks"
+required-features = ["gpu"]
+
+[[bin]]
 name = "h2d_probe"
 required-features = ["gpu"]
 

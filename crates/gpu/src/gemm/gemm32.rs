@@ -1624,6 +1624,17 @@ macro_rules! launch_gemm32 {
     }};
 }
 
+/// The two entries a Q8_0-plane launch can run, for a caller that names one
+/// instead of taking [`Gemm32Kernels::q8_0p_slab`]'s rule
+/// ([`Gemm32Kernels::enqueue_gemm32_entry`]). Both give the same bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Q8_0pEntry {
+    /// `gemm_q8_0p`.
+    Plain,
+    /// `gemm_q8_0p_slab`.
+    Slab,
+}
+
 impl Gemm32Kernels {
     /// The slab entry's resident-block wave on this card, read at load.
     pub fn q8_0p_wave(&self) -> u32 {
@@ -1642,17 +1653,22 @@ impl Gemm32Kernels {
     }
 
     /// Whether a Q8_0-plane launch of `g` takes the slab entry
-    /// ([`Gemm32Kernels::q8_0p_slab`]), its code plane and, for the slab, its
-    /// scale plane checked 16-byte aligned as `what`'s.
+    /// ([`Gemm32Kernels::q8_0p_slab`], or `force` when a caller names one),
+    /// its code plane and, for the slab, its scale plane checked 16-byte
+    /// aligned as `what`'s.
     fn q8_0p_entry(
         &self,
         what: &'static str,
         (qs, d): (&DeviceTensor<u32>, &DeviceTensor<u16>),
         g: &Gemm32Launch,
+        force: Option<Q8_0pEntry>,
     ) -> Result<bool, GpuError> {
         use cuda_device::vector::U32x4;
         crate::tensor::check_alignment::<U32x4, _>(what, "Q8_0 code plane", qs.buf())?;
-        let slab = self.q8_0p_slab(g.grid, g.n_slots, g.n_experts);
+        let slab = force.map_or_else(
+            || self.q8_0p_slab(g.grid, g.n_slots, g.n_experts),
+            |e| e == Q8_0pEntry::Slab,
+        );
         if slab {
             crate::tensor::check_alignment::<U32x4, _>(what, "Q8_0 scale plane", d.buf())?;
         }
@@ -1666,7 +1682,27 @@ impl Gemm32Kernels {
     /// every row; a slot a remapped route left to the host
     /// ([`Gemm32Kernels::enqueue_route_remap`]) is not written.
     pub fn enqueue_gemm32(&self, stream: &CudaStream, a: Gemm32Args<'_>) -> Result<(), GpuError> {
+        self.enqueue_gemm32_entry(stream, a, None)
+    }
+
+    /// [`Gemm32Kernels::enqueue_gemm32`] with a Q8_0-plane weight's entry named
+    /// by `force` instead of [`Gemm32Kernels::q8_0p_slab`]'s rule: the same
+    /// bits, for the bench that times each entry on one shape. A `force` on
+    /// any other weight is a named `Shape` error. Asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue_gemm32_entry(
+        &self,
+        stream: &CudaStream,
+        a: Gemm32Args<'_>,
+        force: Option<Q8_0pEntry>,
+    ) -> Result<(), GpuError> {
         let g = Gemm32Launch::check("Gemm32Kernels::enqueue_gemm32", &a)?;
+        if force.is_some() && !matches!(a.w, Gemm32Weight::Q8_0Plane { .. }) {
+            return Err(GpuError::shape(
+                "Gemm32Kernels::enqueue_gemm32_entry",
+                "a forced Q8_0 entry on a weight that is not Q8_0 planes".to_string(),
+            ));
+        }
         let Gemm32Args {
             w, act, route, y, ..
         } = a;
@@ -1678,7 +1714,7 @@ impl Gemm32Kernels {
         }
         match w {
             Gemm32Weight::Q8_0Plane { qs, d } => {
-                if self.q8_0p_entry("Gemm32Kernels::enqueue_gemm32", (qs, d), &g)? {
+                if self.q8_0p_entry("Gemm32Kernels::enqueue_gemm32", (qs, d), &g, force)? {
                     launch!(prepare_gemm_q8_0p_slab, gemm_q8_0p_slab, qs.buf(), d.buf());
                 } else {
                     launch!(prepare_gemm_q8_0p, gemm_q8_0p, qs.buf(), d.buf());
@@ -1748,7 +1784,7 @@ impl Gemm32Kernels {
         }
         match w {
             Gemm32Weight::Q8_0Plane { qs, d } => {
-                if self.q8_0p_entry(what, (qs, d), &g)? {
+                if self.q8_0p_entry(what, (qs, d), &g, None)? {
                     launch!(
                         prepare_gemm_q8_0p_slab_bf16,
                         gemm_q8_0p_slab_bf16,
@@ -1870,7 +1906,7 @@ impl Gemm32Kernels {
                 );
             }
             (Gemm32Weight::Q8_0Plane { qs, d }, SwigluSlots::All) if !act_native => {
-                if self.q8_0p_entry(what, (qs, d), &l)? {
+                if self.q8_0p_entry(what, (qs, d), &l, None)? {
                     launch!(
                         prepare_gemm_q8_0p_slab_swiglu_all,
                         gemm_q8_0p_slab_swiglu_all,

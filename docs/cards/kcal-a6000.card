@@ -1,0 +1,20 @@
+# kcal on the A6000 (sm_86): the forced-candidate bench that sets the kernel-pick model against measured winners.
+# The one term the derivation cannot fix is R1's: both MXFP8 walks sit at the DRAM floor at four columns (41 us for the
+# 27 MB weight at 0.85 of 768 GB/s [derived, kernel-picks.md section 3.1]); the x traffic the walks add on chip is 67 B a
+# clock an SM against the L1/shared array's 128 [derived], so the ratio is 1 up to the staged walk's barrier a step and its
+# occupancy (5 blocks an SM against 3 for the plain walk). GB10's staged walk is 4 to 7 % faster at four columns
+# [measured: juliankang4, GB10, kernel-picks.md section 1]; sm_86 has no row.
+kind: profile
+question: does the staged MXFP8 walk beat the plain walk at four columns on sm_86, outside the A/A arm's spread?
+term: staged / plain mean us a launch ratio, mxfp8_10240x2560_m4, weights cycled over 512 MiB, graph replay, A6000 (bench_picks --time)
+unit: ratio
+predict: 0.95..1.03
+condition: bench-picks.sh holds the lease on the A6000 for the whole run; the witness blocks show no other compute process
+  on the A6000 and the SM clock and power counters; each pair's candidates gave equal bits on their first launch (a mismatch
+  ends the run); the pair's A/A arm lands within 1 % of 1 (read from the aa_over_plain column)
+decide-in: level on sm_86 at m = 4 (inside the spread of one A/A arm): keep the incumbent and read the remaining m and shape
+  rows for the crossover; the model's band claim stands for this pair
+decide-below: staged more than 5 % faster: the rule is right on sm_86 and the derived tie is wrong here; fit the chain term
+  (R3) from this row before judging the model
+decide-above: staged slower than plain by more than 3 %: the staged-at-four rule, tuned on GB10, loses on sm_86; send the
+  lead the row as sm_86's first measured loss of a picked walk

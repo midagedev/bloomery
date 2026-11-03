@@ -880,6 +880,19 @@ prof-gpu-p8:
 bench-gpu-kernels *ARGS:
     ./tools/box.sh '{{precheck}} && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_p8 --bin gate_gemm && bash tools/ref/time-gate.sh gate_p8 --bench-kernels && bash tools/ref/time-gate.sh gate_gemm --bench-kernels {{ARGS}}'
 
+# The kernel-pick calibration bench (lead-only; docs/research/kernel-picks.md section 6 step 0): each candidate of a pick pair
+# forced on the same real shape and timed against its partner and an A/A arm of itself, on the A6000 under the lease and a
+# prediction card (`BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/kcal-a6000.card'`). The pairs: the MXFP8 gemv's plain walk
+# against the staged walks, the Q8_0-plane GEMM's two entries, and the exact F32/BF16 tile against the gemv repeated. ARGS go to
+# the bin (default `--time`; `--arm PREFIX` keeps one label prefix); tools/ref/kernel-model.py reads its `kcal` rows. On a machine
+# with one card, run it under tools/box.sh's local mode: the runner takes the lease in BLOOMERY_LOCK_DIR.
+bench-picks *ARGS:
+    ./tools/box.sh '{{precheck}} && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin bench_picks && bash tools/ref/bench-picks.sh {{ARGS}}'
+
+# The bench's bit check alone, on any card and with no timing lease: every pair's candidates give the same bits.
+bench-picks-check *ARGS:
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin bench_picks && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh bench_picks --check {{ARGS}}'
+
 # The grouped GEMM's counters (ncu, A6000, under the lease, lead-only): gate_gemm --bench-kernels --bench-arm ARM (default
 # gemm_q4k_moe_t4096: 128 experts of 768 x 2048 Q4_K, top-8, T = 4096) runs that one arm, and ncu takes 16 of its eager
 # gemm_q4k launches after the 64-launch warm-up burst; the form and its levers are in the header of tools/ref/ncu-gpu.sh.
