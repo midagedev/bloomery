@@ -96,7 +96,7 @@ use bloomery_gpu::{
 };
 use bloomery_levers::{ChurnHosting, HostCfg, ResidencyAt};
 use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy, IntoResult, PinnedHostBuffer, sys};
-use gguf::{GgmlType, Split};
+use gguf::Split;
 use model::arch::Arch;
 use model::arch::deepseek41::host;
 use model::arch::deepseek41::hparams::Hparams;
@@ -104,8 +104,9 @@ use model::arch::deepseek41::names;
 use model::arch::deepseek41::place::PlanInputs;
 use model::arch::deepseek41::plan::{Planner, StepPlan};
 use model::arch::deepseek41::roles;
+use model::arch::deepseek41::tp::{self, TpUnits};
 use model::moe::UNION_MAX_COLS;
-use model::part::{Source, Take};
+use model::part::{Source, StoredRows, Take};
 use model::placement::{Machine, ModelTensor, ModelTensors, Plan, PlanLevers, Role};
 
 use crate::chain::attn::{
@@ -365,10 +366,20 @@ pub fn open_slots(
     Body::open_placed_slots(file, &plan, 0, tiers, &meta, slots)
 }
 
-/// Rank `rank` of `ranks` of a tensor-parallel load of `file` on `gpu`, at
+/// Where a rank of a tensor-parallel load reads ([`open_rank`]): the model's header `file`, the
+/// `source` of every tensor the card holds (a GGUF split's own bytes or a checkpoint folder's
+/// parts), and the row tables a checkpoint folder stores where they are (`stored`, by header
+/// name; `None` for a split's own engram tables).
+pub struct RankFrom<'a, S> {
+    pub file: Split,
+    pub source: &'a S,
+    pub stored: Option<&'a BTreeMap<String, StoredRows>>,
+}
+
+/// Rank `rank` of `ranks` of a tensor-parallel load on `gpu` read from `from`, at
 /// `ctx_max` positions under `levers`: every tensor the card holds read from
-/// `source` (a GGUF split's own bytes or a checkpoint folder's parts) as
-/// `take` gives the rank its part of it, every routed expert on the card at
+/// the source, the rank's part of it where the model's cut splits it
+/// (`model::arch::deepseek41::tp::rank_span`), every routed expert on the card at
 /// the rank's part of its inner width, no host tier, and the rank's side of
 /// the ranks' sums `sums` (`bloomery_gpu::host::rank::Sums`, of the slots
 /// [`crate::chain::join::shapes`] gives) when there is more than one: a
@@ -376,13 +387,15 @@ pub fn open_slots(
 /// hyperparameters are the file's with its parts of the query heads, the
 /// output groups and the experts' width ([`rank_hparams`]); its head projects
 /// its part of the vocabulary, and each engram site's rows are read in the
-/// rank's columns ([`rank_cols`]). A count the ranks do not divide is refused
+/// rank's columns (`model::arch::deepseek41::tp::engram_cols`). A count the ranks do not divide is refused
 /// by name before anything is uploaded.
-pub fn open_rank(
+pub fn open_rank<S: Source + Sync>(
     gpu: Gpu,
-    file: Split,
-    source: &(impl Source + Sync),
-    take: impl Fn(&str, GgmlType, &[u64]) -> Result<Take, GpuError>,
+    RankFrom {
+        file,
+        source,
+        stored,
+    }: RankFrom<'_, S>,
     (rank, ranks): (usize, usize),
     sums: Option<Sums>,
     ctx_max: usize,
@@ -397,7 +410,10 @@ pub fn open_rank(
     };
     let whole = Hparams::read(&file).map_err(|e| GpuError::plan(WHAT, e))?;
     let hp = rank_hparams(&whole, rank, ranks)?;
-    let cols = rank_cols(&whole, rank, ranks)?;
+    let units = TpUnits::of(&whole);
+    let cols = tp::engram_cols(&units, rank, ranks).map_err(|e| GpuError::plan(WHAT, e))?;
+    let cols = usize::try_from(cols.start).unwrap_or(usize::MAX)
+        ..usize::try_from(cols.end).unwrap_or(usize::MAX);
     let shapes = crate::chain::join::shapes(&hp)?;
     let fits = |s: &Sums| {
         let (layout, _) = s.link();
@@ -428,7 +444,11 @@ pub fn open_rank(
         gpu.stream(),
         source,
         |name, ty, dims| match card.get(name) {
-            Some(_) => take(name, ty, dims),
+            Some(_) => match tp::rank_span(name, ty, dims, &units, rank, ranks) {
+                Ok(Some((dim, at))) => Ok(Take::Part(dim, at)),
+                Ok(None) => Ok(Take::Whole),
+                Err(e) => Err(GpuError::plan(WHAT, e)),
+            },
             None => Ok(Take::Skip),
         },
         |t| {
@@ -448,6 +468,7 @@ pub fn open_rank(
         slots: 1,
         cols,
         join: sums,
+        stored,
     };
     let mut body = Body::assemble(
         &gpu,
@@ -507,21 +528,6 @@ pub fn rank_hparams(hp: &Hparams, rank: usize, ranks: usize) -> Result<Hparams, 
     r.o_groups = part("output groups", hp.o_groups)?;
     r.experts.ff = part("expert width", hp.experts.ff)?;
     Ok(r)
-}
-
-/// The columns of each engram site's rows rank `rank` of `ranks` reads: its
-/// run of the site's `rows_per_token`, in order. A count the ranks do not
-/// divide is refused by name.
-pub fn rank_cols(hp: &Hparams, rank: usize, ranks: usize) -> Result<Range<usize>, GpuError> {
-    let n = hp.engram()?.rows_per_token();
-    if rank >= ranks || !n.is_multiple_of(ranks) {
-        return Err(GpuError::shape(
-            "deepseek41 rank_cols",
-            format!("rank {rank} of {ranks}: {n} engram columns over the ranks"),
-        ));
-    }
-    let c = n / ranks;
-    Ok(rank * c..(rank + 1) * c)
 }
 
 /// A placement that puts the layers on other than one card, refused by name
@@ -2699,6 +2705,7 @@ impl Body {
             slots: planned.get(),
             cols: 0..hp.engram()?.rows_per_token(),
             join: None,
+            stored: None,
         };
         Body::assemble(
             gpu,
@@ -2741,7 +2748,7 @@ impl Body {
         gpu: &Gpu,
         file: &Arc<Split>,
         meta: &BodyMeta,
-        at: Assembly,
+        at: Assembly<'_>,
         (map, host): (SlotMap, HostRun),
         residency_glue: ResidencyGlue,
         tiers: impl FnOnce(&Gpu, &mut Hybrid<HostRun>) -> Result<Option<TierPiece>, GpuError>,
@@ -2755,6 +2762,7 @@ impl Body {
             slots: planned,
             cols,
             join,
+            stored,
         } = at;
         let stream = gpu.stream();
         let planner =
@@ -2762,7 +2770,7 @@ impl Body {
         let seq = Seq::new(gpu, hp, layers.clone(), ctx_max, planner.stream_ratios())?;
         let row_bytes = engram_row_bytes(file, hp)?;
         let n_cols = cols.len();
-        let rows = StepRows::open(file, hp, STEP_TOKENS, cfg.rows, cols)?;
+        let rows = StepRows::open(file, hp, STEP_TOKENS, cfg.rows, cols, stored)?;
         if rows.row_bytes() != row_bytes {
             return Err(refuse(format!(
                 "the engram tables' rows are {row_bytes} bytes, the step's host half reads {}",
@@ -2869,12 +2877,14 @@ impl Body {
 /// the card runs, the positions its stores hold, the resident sequences it
 /// counts, the columns of each engram site's rows a step reads, and on a rank
 /// of a tensor-parallel load its side of the ranks' sums.
-struct Assembly {
+struct Assembly<'a> {
     layers: Range<usize>,
     ctx_max: usize,
     slots: usize,
     cols: Range<usize>,
     join: Option<Sums>,
+    /// A checkpoint folder's stored row tables ([`RankFrom::stored`]).
+    stored: Option<&'a BTreeMap<String, StoredRows>>,
 }
 
 /// Where a placed load lands besides its plan ([`Body::load_placed`]): the

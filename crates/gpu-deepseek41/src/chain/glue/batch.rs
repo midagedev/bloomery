@@ -293,7 +293,7 @@ fn check_tokens(what: &'static str, b: &GlueBatch, m: usize) -> Result<(), GpuEr
 /// in flight beside every other's rather than behind the one before it. The
 /// bytes are the table's, as [`StepRows`] reads them for a step.
 pub struct PromptRows {
-    engram: Arc<Engram>,
+    engram: Arc<Tables>,
     embd: RowLayout,
     embd_bytes: usize,
     n_cols: usize,
@@ -319,7 +319,7 @@ impl StepRows {
     /// tokens: every buffer a fill writes allocated here.
     #[must_use]
     pub fn prompt_rows(&self, cap: usize) -> PromptRows {
-        let sites = self.engram.sites().len();
+        let sites = self.engram.count();
         PromptRows {
             engram: Arc::clone(&self.engram),
             embd: self.embd.clone(),
@@ -374,7 +374,7 @@ impl PromptRows {
             });
         }
         let is_media = |k: usize| media.get(k).copied().unwrap_or(false);
-        let sites = self.engram.sites().len();
+        let sites = self.engram.count();
         let token_ids = sites * self.n_cols;
         let mut t = 0;
         for plan in plans {
@@ -415,7 +415,7 @@ impl PromptRows {
                 list.extend_from_slice(&self.ids[(k * sites + s) * self.n_cols..][..self.n_cols]);
             }
         }
-        for (site, list) in self.engram.sites().iter().zip(&self.site_ids) {
+        for (site, list) in self.engram.sites().zip(&self.site_ids) {
             site.prefetch(list).map_err(|e| GpuError::plan(WHAT, e))?;
         }
         let site_bytes = self.n_cols * self.row_bytes;
@@ -428,7 +428,6 @@ impl PromptRows {
             for ((site, ids), dst) in self
                 .engram
                 .sites()
-                .iter()
                 .zip(self.ids[k * token_ids..][..token_ids].chunks_exact(self.n_cols))
                 .zip(out.chunks_exact_mut(site_bytes))
             {
@@ -448,7 +447,7 @@ impl PromptRows {
     /// Tokens `range` of the last fill's engram rows: per token, every site's
     /// rows in site order.
     pub fn engram(&self, range: std::ops::Range<usize>) -> Result<&[u8], GpuError> {
-        let token = self.engram.sites().len() * self.n_cols * self.row_bytes;
+        let token = self.engram.count() * self.n_cols * self.row_bytes;
         self.rows_of(&self.engram_rows, token, range)
     }
 

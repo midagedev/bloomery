@@ -2987,12 +2987,13 @@ gate-gpu-ple:
 gate-gpu-ds41-step *ARGS='--structure --sets --select --skew-structure --skew-sets --skew-api':
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_step && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step {{ARGS}} && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step --slots && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step --feed'
 
-# The tensor-parallel V4.1 body (`body::open_rank`), its ranks each a context of its own on the one visible card:
-# one rank against the one-card body, every token and logit bit for bit (the bin's doc lists the clauses). The fixture's
-# card budget is unset: the one-card body holds every expert on the card, as a rank does. Fixture-only
-# (tools/ref/fixture-only.sh): the real file's ranks are loaded across nodes, not on one card.
+# The tensor-parallel V4.1 body (`body::open_rank`) on the original-format fixture folder, one, two and four ranks a
+# thread each on the one visible card (the bin's doc lists the clauses). The ranks share the card's primary context, so
+# each rank's stream needs a hardware queue of its own: CUDA_DEVICE_MAX_CONNECTIONS=32. The card budget is unset: a rank
+# holds every expert on the card. Fixture-only (tools/ref/fixture-only.sh): the real file's ranks are loaded across
+# nodes, not on one card.
 gate-gpu-ds41-tp:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-ds41-tp && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_tp && unset BLOOMERY_CARD_BUDGET && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_tp'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-ds41-tp && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41,checkpoint --release --bin gate_deepseek41_tp && unset BLOOMERY_CARD_BUDGET && CUDA_DEVICE_MAX_CONNECTIONS=32 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_tp'
 
 # V4.1 전문가 층(host/tier.rs, twoeng R3)의 루프백: 스테이지와 층을 한 카드(3090, 게이트 배치)의 Gpu 둘에 올린다.
 # The gate plan puts each layer's id prefix [0, n_l) on the card; the tier plan moves its last 23 ids (n_l−23 … n_l) to
