@@ -8,7 +8,7 @@
 Three tables, one row a thing:
 
   tools/gate-class.tsv  recipe<TAB>class<TAB>family<TAB>topic<TAB>owners
-  tools/families.tsv    family<TAB>rep<TAB>globs<TAB>rotation_days<TAB>fixture
+  tools/families.tsv    family<TAB>rep<TAB>tier<TAB>globs<TAB>rotation_days<TAB>fixture
   tools/owners.tsv      owner<TAB>kind<TAB>globs
 
 `class` is `common` (family-agnostic: a synthetic input or a shape-generic owner), `family` (one family's own weights
@@ -18,14 +18,16 @@ tools/ref/needs-env.sh, which tools/gate-batch.sh reads to defer the item by nam
 `family` is the registry's canonical name (tools/arch-registry.tsv column 1, the first name of a comma list) or a
 declared non-arch group; a `common` or a `tooling` row names none. `owners` is the `+` list of the owners the gate
 tests, names from tools/owners.tsv, or `-`. `rep` is `R` (a representative family, run whole on a landing) or `F` (a
-fixture family, run on its own change and in the rotation). `globs` are the family's own files and the owner's files; a
-glob matches a file or the round is red.
+fixture family, run on its own change and in the rotation). `tier` is `main` (the real tier runs its gates daily and at a
+release) or `other` (the fixture tier at its landing, the real tier once a month or on a user report); a family new in a
+release (`new_families`) runs the real tier daily and at that release whatever its tier. `globs` are the family's own
+files and the owner's files; a glob matches a file or the round is red.
 
 `check` runs the checks of the design (§4.4): every `gate-*` recipe has a row and every row names a recipe that
 exists; the families of both tables are the registry's canonical names plus the declared non-arch groups; every
 glob of both tables matches a file in the tree; the `by-hand` rows are exactly the recipes that call
 tools/ref/needs-env.sh, in their own text or through a dependency. One line per finding, rc 1 when there is one. A
-table that does not load is a named error, rc 2.
+table that does not load is a named error, rc 2: a family row with no `tier`, or one the tiers do not name, is such an error.
 
 The class stage of `just affected` and the release list read the tables (tools/recipes.py `class_tables`), and so does the rotation
 (tools/rotation.py, for the F families' gates); this tool checks them. The justfile's recipe names are read through tools/recipes.py,
@@ -38,6 +40,7 @@ import argparse
 import dataclasses
 import os
 import sys
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # `python3 -I` drops the script's directory
@@ -46,8 +49,16 @@ import recipes  # noqa: E402
 ROOT = recipes.ROOT
 CLASSES = ("common", "family", "tooling")
 REPS = ("R", "F")
+# The tiers of a family and the days its gates may go unrun before the rotation asks for them (the `rotation_days` column
+# holds the same number; `check` holds them together). A gate no family owns (common, tooling) runs on the main tier's days.
+# PIN(2026-11-03): other 30 d. The maintainer's risk-based scope: the real tier runs daily and at a release for the main
+# families (deepseek41, glm5next, qwen4exp), the families new in the release and the common and tooling gates; every other
+# family is fixture-tier at its landing and real-tier once a month or on a user report. Derivation: of the 9,173 s of item time in
+# lane X of the 0.3.12 release batch (rows of gate-times.tsv, 06:11-10:11), the other families held 6,702 s, Muse Spark 3,843 s and
+# Mistral Large 4 2,469 s of it, and 13 of that batch's 14 reds were also red on main before it.
+TIERS = ("main", "other")
+TIER_DAYS = {"main": 7, "other": 30}
 GATE_PREFIX = recipes.GATE_PREFIX
-DEFAULT_ROTATION_DAYS = 7
 # The topic of a gate that only a person runs, and the script whose call in a recipe makes it one.
 BY_HAND = "by-hand"
 NEEDS_ENV_SCRIPT = "tools/ref/needs-env.sh"
@@ -81,6 +92,7 @@ class GateRow:
 class FamilyRow:
     family: str
     rep: str
+    tier: str
     globs: tuple[str, ...]
     rotation_days: int
     fixture: bool
@@ -140,21 +152,27 @@ def load_owners(root: Path) -> dict[str, OwnerRow]:
 
 
 def load_families(root: Path) -> dict[str, FamilyRow]:
-    """tools/families.tsv: the family, its rep, its own files, its rotation period and whether it has a fixture."""
+    """tools/families.tsv: the family, its rep, its tier, its own files, its rotation period and whether it has a fixture."""
     path = root / "tools" / "families.tsv"
     if not path.exists():
         raise GateClassError(f"tools/families.tsv does not exist under {root}")
     families: dict[str, FamilyRow] = {}
     for n, f in _rows(path):
-        if len(f) != 5:
-            raise GateClassError(f"{_where(path, n)}: a row is not `family, rep, globs, rotation_days, fixture` (tab-separated): {'\\t'.join(f)[:100]!r}")
-        name, rep, globs, days, fixture = f[0].strip(), f[1].strip(), f[2].split(), f[3].strip(), f[4].strip()
+        if len(f) == 5:
+            raise GateClassError(f"{_where(path, n)}: a row has no `tier` (main or other): a row is `family, rep, tier, globs, rotation_days, fixture`: {'\\t'.join(f)[:100]!r}")
+        if len(f) != 6:
+            raise GateClassError(f"{_where(path, n)}: a row is not `family, rep, tier, globs, rotation_days, fixture` (tab-separated): {'\\t'.join(f)[:100]!r}")
+        name, rep, tier, globs, days, fixture = f[0].strip(), f[1].strip(), f[2].strip(), f[3].split(), f[4].strip(), f[5].strip()
         if not name:
             raise GateClassError(f"{_where(path, n)}: a row has no family name")
         if rep not in REPS:
             raise GateClassError(f"{_where(path, n)}: unknown rep {rep!r} (one of {', '.join(REPS)})")
+        if tier == "":
+            raise GateClassError(f"{_where(path, n)}: the family {name} has no `tier` (one of {', '.join(TIERS)})")
+        if tier not in TIERS:
+            raise GateClassError(f"{_where(path, n)}: unknown tier {tier!r} (one of {', '.join(TIERS)})")
         if days == "":
-            days_s = DEFAULT_ROTATION_DAYS
+            days_s = TIER_DAYS[tier]
         elif days.isdigit() and int(days) > 0:
             days_s = int(days)
         else:
@@ -163,7 +181,7 @@ def load_families(root: Path) -> dict[str, FamilyRow]:
             raise GateClassError(f"{_where(path, n)}: `fixture` is {fixture!r} (yes or no)")
         if name in families:
             raise GateClassError(f"{_where(path, n)}: the family {name} is listed twice")
-        families[name] = FamilyRow(family=name, rep=rep, globs=tuple(globs), rotation_days=days_s, fixture=fixture == "yes")
+        families[name] = FamilyRow(family=name, rep=rep, tier=tier, globs=tuple(globs), rotation_days=days_s, fixture=fixture == "yes")
     if not families:
         raise GateClassError("tools/families.tsv names no family")
     return families
@@ -251,6 +269,80 @@ def registry_families(root: Path) -> set[str]:
     return out
 
 
+# ---------------------------------------------------------------------------------------------- the scope
+
+
+OTHER_REASON = "other family: monthly rotation"
+
+
+@dataclasses.dataclass(frozen=True)
+class GateScope:
+    """What the real tier owes a gate: the class-table family it belongs to (empty for a common or a tooling gate), its tier
+    (`main`, `other`, or the gate's class where it has no family) and the days it may go unrun."""
+
+    family: str
+    tier: str
+    days: int
+
+
+def gate_scope(tables: Tables, name: str, profile_family: str = "") -> GateScope:
+    """The scope of a recipe: its class-table row names the family. A recipe with no row (a `weekly-*` recipe, `refset-check`)
+    belongs to the family of the profile its box call sets (`profile_family`) when families.tsv names that family, else it is a
+    common gate. A common or a tooling gate runs on the main tier's days."""
+    row = tables.gates.get(name)
+    if row is not None and row.cls == "family":
+        fam = tables.families[row.family]
+        return GateScope(row.family, fam.tier, fam.rotation_days)
+    if row is not None:
+        return GateScope("", row.cls, TIER_DAYS["main"])
+    fam = tables.families.get(profile_family)
+    if fam is not None:
+        return GateScope(profile_family, fam.tier, fam.rotation_days)
+    return GateScope("", "common", TIER_DAYS["main"])
+
+
+def left_out(scope: GateScope, new: set[str] | frozenset[str]) -> str:
+    """Why the real tier of a daily pass or a release leaves a gate out: its family is not main and is not new in the
+    release. Empty when the gate is in scope."""
+    if scope.tier == "other" and scope.family not in new:
+        return OTHER_REASON
+    return ""
+
+
+def partition(names: list[str], scope_of: Callable[[str], GateScope], new: set[str] | frozenset[str]) -> tuple[list[str], dict[str, tuple[str, GateScope]]]:
+    """(the names in scope in their order, the names left out as name -> (reason, scope))."""
+    kept: list[str] = []
+    out: dict[str, tuple[str, GateScope]] = {}
+    for n in names:
+        sc = scope_of(n)
+        why = left_out(sc, new)
+        if why:
+            out[n] = (why, sc)
+        else:
+            kept.append(n)
+    return kept, out
+
+
+def own_files(families: dict[str, FamilyRow], files: Iterable[str]) -> dict[str, list[str]]:
+    """The files each family owns: matched by one of its globs and by no other family's glob (a glob may serve several
+    families, and a file of such a glob tells nothing of any one of them)."""
+    pats = {name: [(recipes.glob_prefix(g), recipes.class_glob(g)) for g in fam.globs] for name, fam in families.items()}
+    own: dict[str, list[str]] = {name: [] for name in families}
+    for f in files:
+        hits = [name for name, ps in pats.items() if any(f.startswith(pre) and pat.match(f) for pre, pat in ps)]
+        if len(hits) == 1:
+            own[hits[0]].append(f)
+    return own
+
+
+def new_families(families: dict[str, FamilyRow], base_files: Iterable[str], head_files: Iterable[str]) -> set[str]:
+    """The families new in a release: one with a file of its own (own_files) in the tree at the head and none in the tree at
+    the base, the last release tag's. Pure: the two trees come in as file lists."""
+    at_base = own_files(families, base_files)
+    at_head = own_files(families, head_files)
+    return {name for name in families if at_head[name] and not at_base[name]}
+
+
 # ---------------------------------------------------------------------------------------------- the checks
 
 
@@ -301,6 +393,18 @@ def check(root: Path, tables: Tables) -> list[str]:
     # A family with no gate row of its own is not a finding (a registry row may have no gate yet); the summary names
     # it, and the loader refuses a gate row that names a family families.tsv does not hold.
 
+    # The rotation period is the tier's, and a family owns a file no other family's glob matches (a release tells a new
+    # family by its own files).
+    for fam in sorted(tables.families):
+        row = tables.families[fam]
+        if row.rotation_days != TIER_DAYS[row.tier]:
+            findings.append(f"families.tsv: the family {fam} is tier {row.tier}, whose rotation is {TIER_DAYS[row.tier]} d, and its rotation_days is {row.rotation_days}")
+    listing = sorted({str(p.relative_to(root)) for fam in tables.families.values() for g in fam.globs for p in matching_files(root, g)})
+    owned = own_files(tables.families, listing)
+    for fam in sorted(tables.families):
+        if not owned[fam]:
+            findings.append(f"families.tsv: the family {fam} owns no file that no other family's glob matches, so a release cannot tell when it is new")
+
     # Every glob matches a file.
     for owner in sorted(tables.owners):
         for g in tables.owners[owner].globs:
@@ -330,9 +434,9 @@ def summary(tables: Tables) -> str:
     out = ["per class:"]
     for c in CLASSES:
         out.append(f"  {c:<8} {per_class[c]:>4}")
-    out.append("per family (rep, gates):")
+    out.append("per family (rep, tier, gates):")
     for f in sorted(tables.families):
-        out.append(f"  {f:<16} {tables.families[f].rep}  {per_family[f]:>4}")
+        out.append(f"  {f:<16} {tables.families[f].rep}  {tables.families[f].tier:<5} {per_family[f]:>4}")
     out.append("per owner (gates):")
     for o in sorted(per_owner):
         out.append(f"  {o:<20} {per_owner[o]:>4}")
@@ -360,12 +464,14 @@ def _tree(tmp: Path) -> Path:
     _write(root / "tools" / "arch-registry.tsv", "# the registry's rows\nnames\tvariant\tread\tdraft\tfixture\nfam-a\tFamA\tno\tno\t-\nfam-b,FamB\tFamB\tyes\tno\t-\n")
     _write(root / "crates" / "fam-a" / "a.rs", "// a\n")
     _write(root / "crates" / "fam-b" / "b.rs", "// b\n")
+    for g in DECLARED_GROUPS:
+        _write(root / "crates" / g / "g.rs", "// g\n")
     _write(root / "tools" / "owners.tsv", "# owner\tkind\tglobs\nown-a\tkernel\tcrates/fam-a/a.rs\n")
-    groups = "".join(f"{g}\tF\tcrates/fam-b/b.rs\t7\tno\n" for g in DECLARED_GROUPS)
+    groups = "".join(f"{g}\tF\tother\tcrates/{g}/**\t30\tno\n" for g in DECLARED_GROUPS)
     _write(root / "tools" / "families.tsv",
-           "# family\trep\tglobs\trotation_days\tfixture\n"
-           f"fam-a\tR\tcrates/fam-a/**\t7\tno\n"
-           f"fam-b\tF\tcrates/fam-b/**\t7\tyes\n" + groups)
+           "# family\trep\ttier\tglobs\trotation_days\tfixture\n"
+           f"fam-a\tR\tmain\tcrates/fam-a/**\t7\tno\n"
+           f"fam-b\tF\tother\tcrates/fam-b/**\t30\tyes\n" + groups)
     _write(root / "tools" / "gate-class.tsv",
            "# recipe\tclass\tfamily\ttopic\towners\n"
            "gate-a\tfamily\tfam-a\tkernel\town-a\n"
@@ -395,7 +501,8 @@ def self_test() -> int:
         tables = load(root)
         expect(sorted(tables.gates) == ["gate-a", "gate-b"], f"load: the tree's two gate rows: {sorted(tables.gates)}")
         expect(tables.gates["gate-a"].owners == ("own-a",), f"load: the owner of gate-a: {tables.gates['gate-a'].owners}")
-        expect(tables.families["fam-b"].rotation_days == 7 and tables.families["fam-b"].fixture, "load: the family's rep days and fixture flag")
+        expect(tables.families["fam-b"].rotation_days == 30 and tables.families["fam-b"].tier == "other" and tables.families["fam-b"].fixture,
+               "load: the family's tier, rotation days and fixture flag")
         expect(check(root, tables) == [], f"check: the tree's tables are green: {check(root, tables)}")
 
         # A malformed row, an unknown class, an unknown rep, an unknown owner, an unknown family, a duplicate row.
@@ -417,7 +524,7 @@ def self_test() -> int:
 
         def fam_text(*rows: str) -> str:
             """The tree's families.tsv with these rows and the declared groups, which every tree must hold."""
-            return "\n".join(["# h", *rows, *(f"{g}\tF\tcrates/fam-b/b.rs\t7\tno" for g in DECLARED_GROUPS)]) + "\n"
+            return "\n".join(["# h", *rows, *(f"{g}\tF\tother\tcrates/{g}/**\t30\tno" for g in DECLARED_GROUPS)]) + "\n"
 
         bad = "\n".join(["# h", "gate-a\tfamily\tfam-a\tkernel\town-a", "gate-b\tcommon\thost"]) + "\n"
         expect(raises(with_gate(bad), "gate-class.tsv:3: a row is not"), "load: a short row is a named error with the file and the line")
@@ -433,11 +540,11 @@ def self_test() -> int:
         expect(raises(with_gate(bad), "a `common` row names a family"), "load: a common row with a family is a named error")
         bad = "\n".join(["# h", "gate-a\tfamily\t\tkernel\town-a"]) + "\n"
         expect(raises(with_gate(bad), "a `family` row names no family"), "load: a family row with no family is a named error")
-        bad = fam_text("fam-a\tR\tcrates/fam-a/**\t7\tno", "fam-b\tX\tcrates/fam-b/**\t7\tyes")
+        bad = fam_text("fam-a\tR\tmain\tcrates/fam-a/**\t7\tno", "fam-b\tX\tother\tcrates/fam-b/**\t30\tyes")
         expect(raises(with_fam(bad), "unknown rep 'X'"), "load: an unknown rep is a named error")
-        bad = fam_text("fam-a\tR\tcrates/fam-a/**\t7\tno", "fam-b\tF\tcrates/fam-b/**\t0\tyes")
+        bad = fam_text("fam-a\tR\tmain\tcrates/fam-a/**\t7\tno", "fam-b\tF\tother\tcrates/fam-b/**\t0\tyes")
         expect(raises(with_fam(bad), "`rotation_days` is not a number of days"), "load: a bad rotation period is a named error")
-        bad = fam_text("fam-a\tR\tcrates/fam-a/**\t7\tno", "fam-b\tF\tcrates/fam-b/**\t7\tmaybe")
+        bad = fam_text("fam-a\tR\tmain\tcrates/fam-a/**\t7\tno", "fam-b\tF\tother\tcrates/fam-b/**\t30\tmaybe")
         expect(raises(with_fam(bad), "`fixture` is 'maybe'"), "load: a bad fixture flag is a named error")
         bad = "\n".join(["# h", "own-a\tkernel\tcrates/fam-a/a.rs", "own-a\tkernel\tcrates/fam-a/a.rs"]) + "\n"
         expect(raises(with_owner(bad), "the owner own-a is listed twice"), "load: an owner twice is a named error")
@@ -474,11 +581,11 @@ def self_test() -> int:
         expect(raises(lambda: load(root), "the family fam-z is not in families.tsv"),
                "load: a family the gate table names and families.tsv does not is a named error")
         _write(root / "tools" / "gate-class.tsv", "\n".join(gate_rows) + "\n")
-        no_fam = fam_text("fam-a\tR\tcrates/fam-a/**\t7\tno")
+        no_fam = fam_text("fam-a\tR\tmain\tcrates/fam-a/**\t7\tno")
         _write(root / "tools" / "families.tsv", no_fam)
         found = check(root, load(root))
         expect(any("fam-b" in f for f in found), f"check: a family of the registry with no row is red: {found}")
-        extra = fam_text("fam-a\tR\tcrates/fam-a/**\t7\tno", "fam-b\tF\tcrates/fam-b/**\t7\tyes", "fam-z\tF\tcrates/fam-z/**\t7\tno")
+        extra = fam_text("fam-a\tR\tmain\tcrates/fam-a/**\t7\tno", "fam-b\tF\tother\tcrates/fam-b/**\t30\tyes", "fam-z\tF\tother\tcrates/fam-z/**\t30\tno")
         _write(root / "tools" / "families.tsv", extra)
         found = check(root, load(root))
         expect(any("fam-z" in f for f in found), f"check: a family the registry does not name is red: {found}")
@@ -490,7 +597,7 @@ def self_test() -> int:
         found = check(root, load(root))
         expect(any("nothing.rs" in f for f in found), f"check: an owner glob that matches no file is red: {found}")
         _write(root / "tools" / "owners.tsv", "\n".join(owner_rows) + "\n")
-        nofile = fam_text("fam-a\tR\tcrates/fam-a/**\t7\tno", "fam-b\tF\tcrates/fam-b/nothing/**\t7\tyes")
+        nofile = fam_text("fam-a\tR\tmain\tcrates/fam-a/**\t7\tno", "fam-b\tF\tother\tcrates/fam-b/nothing/**\t30\tyes")
         _write(root / "tools" / "families.tsv", nofile)
         found = check(root, load(root))
         expect(any("nothing" in f for f in found), f"check: a family glob that matches no file is red: {found}")
@@ -522,6 +629,63 @@ def self_test() -> int:
         expect(any("gate-b is declared by-hand and its recipe calls no" in f for f in found), f"check: a by-hand row whose recipe calls no needs-env.sh is red: {found}")
         _write(root / "justfile", "gate-a:\n    echo a\n\ngate-b:\n    echo b\n\nother:\n    echo o\n")
         _write(root / "tools" / "gate-class.tsv", base_gates)
+
+        # The tier column: a row without it (the five-column rows of the old table), with it empty or with a word the tiers do not
+        # name is a named error; the days column left empty is the tier's.
+        old_row = "fam-b\tF\tcrates/fam-b/**\t30\tyes"
+        expect(raises(with_fam(fam_text("fam-a\tR\tmain\tcrates/fam-a/**\t7\tno", old_row)), "a row has no `tier`"),
+               "load: a five-column family row (no tier) is a named error")
+        bad = fam_text("fam-a\tR\tmain\tcrates/fam-a/**\t7\tno", "fam-b\tF\t\tcrates/fam-b/**\t30\tyes")
+        expect(raises(with_fam(bad), "the family fam-b has no `tier`"), "load: an empty tier is a named error")
+        bad = fam_text("fam-a\tR\tmain\tcrates/fam-a/**\t7\tno", "fam-b\tF\tweekly\tcrates/fam-b/**\t30\tyes")
+        expect(raises(with_fam(bad), "unknown tier 'weekly'"), "load: a tier the tiers do not name is a named error")
+        days_rows = with_fam(fam_text("fam-a\tR\tmain\tcrates/fam-a/**\t\tno", "fam-b\tF\tother\tcrates/fam-b/**\t\tyes"))
+        days_tables = days_rows()
+        expect(days_tables.families["fam-a"].rotation_days == 7 and days_tables.families["fam-b"].rotation_days == 30,
+               f"load: an empty rotation_days is the tier's days: {days_tables.families['fam-a'].rotation_days} {days_tables.families['fam-b'].rotation_days}")
+        # The rule's days: a main family at 30 d and an other family at 7 d are findings; so is a family whose every file another
+        # family's glob also matches (a release cannot tell it is new).
+        found = check(root, days_rows())
+        expect(found == [], f"check: the tier's days in the column are green: {found}")
+        for fam_a_days, fam_b_days, who in (("30", "30", "fam-a"), ("7", "7", "fam-b")):
+            found = check(root, with_fam(fam_text(f"fam-a\tR\tmain\tcrates/fam-a/**\t{fam_a_days}\tno", f"fam-b\tF\tother\tcrates/fam-b/**\t{fam_b_days}\tyes"))())
+            expect(any(who in f and "whose rotation is" in f for f in found), f"check: {who} off its tier's days is red: {found}")
+        shared = fam_text("fam-a\tR\tmain\tcrates/fam-a/**\t7\tno", "fam-b\tF\tother\tcrates/fam-b/**\t30\tyes").replace("qwen38d\tF\tother\tcrates/qwen38d/**", "qwen38d\tF\tother\tcrates/fam-b/**")
+        found = check(root, with_fam(shared)())
+        expect(any("fam-b owns no file" in f for f in found) and any("qwen38d owns no file" in f for f in found)
+               and not any("fam-a owns no file" in f for f in found), f"check: two families on one glob own no file each: {found}")
+        _write(root / "tools" / "families.tsv", "\n".join(fam_rows) + "\n")
+
+        # The scope of a gate: its row's family and that family's tier, a recipe with no row by its profile's family, else common.
+        sc = {n: gate_scope(tables, n, prof) for n, prof in (("gate-a", ""), ("gate-b", ""), ("weekly-x", "fam-b"), ("weekly-y", "fam-a"), ("weekly-z", "nobody"), ("refset-check", ""))}
+        expect(sc["gate-a"] == GateScope("fam-a", "main", 7), f"gate_scope: a family row is the family's tier and days: {sc['gate-a']}")
+        expect(sc["gate-b"] == GateScope("", "common", 7), f"gate_scope: a common row has no family and the main days: {sc['gate-b']}")
+        expect(sc["weekly-x"] == GateScope("fam-b", "other", 30) and sc["weekly-y"] == GateScope("fam-a", "main", 7),
+               f"gate_scope: a recipe with no row belongs to its profile's family: {sc['weekly-x']} {sc['weekly-y']}")
+        expect(sc["weekly-z"] == GateScope("", "common", 7) and sc["refset-check"] == GateScope("", "common", 7),
+               f"gate_scope: a recipe with no row and no family of its profile is common: {sc['weekly-z']} {sc['refset-check']}")
+        tooling = Tables(gates={"gate-t": GateRow("gate-t", "tooling", "", "host", ())}, families=tables.families, owners=tables.owners)
+        expect(gate_scope(tooling, "gate-t") == GateScope("", "tooling", 7), "gate_scope: a tooling row keeps its class as the tier")
+        # The real tier leaves an other family's gate out unless the family is new; a main family, a common and a tooling gate stay.
+        expect(left_out(sc["weekly-x"], set()) == OTHER_REASON, "left_out: a gate of an other family is left out of the real tier")
+        expect(left_out(sc["weekly-x"], {"fam-b"}) == "", "left_out: the same family new in the release is in")
+        expect(left_out(sc["gate-a"], set()) == "" and left_out(sc["gate-b"], set()) == "" and left_out(GateScope("", "tooling", 7), set()) == "",
+               "left_out: a main family's gate, a common and a tooling gate stay")
+        kept, out = partition(["gate-a", "weekly-x", "gate-b"], lambda n: sc[n], set())
+        expect(kept == ["gate-a", "gate-b"] and list(out) == ["weekly-x"] and out["weekly-x"][0] == OTHER_REASON and out["weekly-x"][1].family == "fam-b",
+               f"partition: the names in scope in order, the others with their reason and family: {kept} {out}")
+
+        # The families new in a release: a file of its own at the head and none at the base. A new file of an old family is not it;
+        # a glob two families share tells nothing of either.
+        fr = lambda n, *globs: FamilyRow(n, "F", "other", tuple(globs), 30, False)  # noqa: E731
+        fams = {"x": fr("x", "shared/**", "x/**"), "y": fr("y", "shared/**", "y/**"), "z": fr("z", "shared/**"), "w": fr("w", "w/**")}
+        base = ["shared/s.rs", "x/a.rs", "w/a.rs"]
+        expect(own_files(fams, base) == {"x": ["x/a.rs"], "y": [], "z": [], "w": ["w/a.rs"]}, f"own_files: a file of a shared glob is nobody's: {own_files(fams, base)}")
+        expect(new_families(fams, base, base + ["y/b.rs"]) == {"y"}, "new_families: the first file of a family is it")
+        expect(new_families(fams, base, base + ["x/new.rs", "w/new.rs", "shared/new.rs"]) == set(),
+               "new_families: a new file of a family that had one, or of a shared glob, is not")
+        expect(new_families(fams, base, base) == set(), "new_families: nothing added is nothing new")
+        expect(new_families(fams, base, base + ["x/b.rs", "y/b.rs"]) == {"y"}, "new_families: only the family with no file at the base")
 
         # The tree's own tables: they load and they are green.
         try:

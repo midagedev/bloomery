@@ -90,9 +90,12 @@ reference; what follows is the contract.
   both cards, checked byte for byte; solo) is never selected: a change to `crates/model/src/placement.rs`,
   `placement/{workstation,host_lock}.rs`, `crates/gpu/src/{hybrid,weights}.rs` or `gate_load_v41.rs` runs it by name.
   `just weekly` also runs the rotation (`tools/rotation.py due`): every gate a fixture-tier landing defers (real-only,
-  real-file, no-fixture, needs-env) and every gate of an F family that has no green row at its current key and none in
-  7 days; `just rotation-due` prints it. The release list leaves the F families' gates to it, and
-  `tools/release/publish.sh` stops while `tools/rotation.py check` (an F family with no green row in 7 days) is red.
+  real-file, no-fixture, needs-env) and every gate of a family that has no green row at its current key and none in
+  its `rotation_days` (7 for a `main` family, 30 for an `other`); `just rotation-due` prints it. The real tier at a
+  release and in the daily pass (`tools/rotation.py follow-list`, `tools/recipes.py release-list`) runs the common and
+  tooling gates, the `main` families' (deepseek41, glm5next, qwen4exp) and the families new since the last tag, and
+  leaves every other family to the rotation by name; `tools/release/publish.sh` stops while `tools/rotation.py check`
+  (a family with no green row in its `rotation_days`) is red.
 - `just gate` excludes the measure targets (they need a quiet machine and a lock) and `just deny`. Build artifacts land
   in the workspace root `target/`; the measure runners read only from there.
 
@@ -198,7 +201,7 @@ forced_exact count pin, the reference gates).
   run them.
 - **Every `gate-*` recipe has a class row** in `tools/gate-class.tsv` (common, family or tooling; its family; the
   common owners it covers, named in `tools/owners.tsv`), and every family a row in `tools/families.tsv` (rep R or F,
-  its own-file globs). `tools/gate_class.py check` (in `just check-recipes`) holds them to the justfile and the arch
+  tier `main` or `other`, its own-file globs). `tools/gate_class.py check` (in `just check-recipes`) holds them to the justfile and the arch
   registry. A new model's gates are `family` rows of an F family.
 - **Record lines have one owner:** a `Kind` (the card binaries' kinds in `crates/gpu-gates/src/record.rs`), rendered by
   `Record` (`crates/record`, the core), which panics by name on a value out of order, missing or of another type

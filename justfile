@@ -2682,7 +2682,8 @@ smoke *ARGS:
 # The weekly tier and the rotation: every `weekly-*` recipe (a gate taken out of the landing batch; `just affected`
 # selects only `gate-*`, and names a weekly recipe when a file one of its trigger rows in tools/gate-paths.tsv matches
 # changes), then every gate the fixture tier defers (real-only, real-file, no-fixture, needs-env) that has no green row
-# at its current key and none newer than 7 days (tools/rotation.py due), and every gate of an F family likewise, in one sitting through
+# at its current key and none newer than its family's rotation (7 days for a main family and for a common or tooling gate, 30 for any other
+# family: tools/families.tsv; tools/rotation.py due), and every gate of an F family likewise, in one sitting through
 # tools/gate-batch.sh, on the lead's ledger. `just affected` never selects the rotation.
 # ARGS go to the batch (--dry-run, --out DIR, --rerun).
 weekly *ARGS:
@@ -2694,9 +2695,18 @@ weekly *ARGS:
 rotation-due *ARGS:
     python3 tools/rotation.py due {{ARGS}}
 
-# The release batch's `--list`: every S0 gate, every gate of an R family, the class-staged `affected` since TAG without the gates of
-# the F families (the rotation holds those; each is named on stderr with its last green date) and the rotation's due list, one recipe a
-# line; the counts per part (and with --wall the predicted wall) on stderr.
+# The real tier a daily pass runs (the follower), as a `--list` file for tools/gate-batch.sh: every common and tooling gate, every gate of a
+# main family (tools/families.tsv tier) or of a family new since the last release tag, and the weekly and check recipes of those; every other
+# family is left out by name (monthly rotation: `rotation-due` and tools/rotation.py check hold it to 30 days). The release list is this list
+# plus the diff. The third line of the file is its predicted wall. It reads no box.
+# ARGS go to tools/rotation.py follow-list (--base REV, --out FILE, --classes FILE, --ledger PATH).
+follow-list *ARGS:
+    python3 tools/rotation.py follow-list {{ARGS}}
+
+# The release batch's `--list`: the real tier (every common and tooling gate, every gate of a main family or of a family new since TAG, and
+# their weekly and check recipes), the class-staged `affected` since TAG and every CUDA gate on a GGUF input, the last two in scope; every
+# other family's gates are left out by name (monthly rotation: each family is named on stderr with its last green date), one recipe a
+# line; the counts per part (and with --wall the predicted wall of the real tier's medians) on stderr.
 release-list TAG *ARGS:
     python3 tools/recipes.py release-list {{TAG}} {{ARGS}}
 

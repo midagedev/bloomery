@@ -534,10 +534,10 @@ def fake_tree(tmp: Path) -> tuple[Path, dict[str, tuple[str, str]]]:
         "own-a\tkernel\tcrates/a/a.rs crates/a/b.rs\n"
         "own-b\tkernel\tcrates/b/c.rs\n",
     )
-    groups = "".join(f"{g}\tF\tcrates/b/c.rs\t7\tno\n" for g in gate_class.DECLARED_GROUPS)
+    groups = "".join(f"{g}\tF\tother\tcrates/b/c.rs\t30\tno\n" for g in gate_class.DECLARED_GROUPS)
     _write(
         root / "tools" / "families.tsv",
-        "# family\trep\tglobs\trotation_days\tfixture\nfam-a\tR\tcrates/a/**\t7\tno\n" + groups,
+        "# family\trep\ttier\tglobs\trotation_days\tfixture\nfam-a\tR\tmain\tcrates/a/**\t7\tno\n" + groups,
     )
     _write(
         root / "tools" / "gate-class.tsv",
