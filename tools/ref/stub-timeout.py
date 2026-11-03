@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""A stand-in timeout for the GPU gate, stack watcher, load-group, lease and timing-card self-tests
-where the host has none (the Mac), copied in as `timeout`. It takes
+"""The monitor tools/gate-bound.sh's bound_timeout runs where no other keeps GNU timeout's exit codes (no `timeout`,
+or uutils' with no gnutimeout or gtimeout beside it), and a stand-in some self-tests copy in as `timeout`. It takes
 coreutils' `timeout [--kill-after=K] S COMMAND...` and keeps its timing and exit codes: S 0 is no bound; otherwise at
 S seconds COMMAND's process group gets a TERM, as it does when a TERM is sent here. K seconds after the first of the
 two the group gets a KILL if COMMAND is still there (K 0 or none: no KILL). The exit is 124 when S ran out, 137 when
@@ -21,7 +21,7 @@ kill_after = 0.0
 note = os.environ.get('STUB_TIMEOUT_BOUND_NOTE')
 args = []
 for a in sys.argv[1:]:
-    if a.startswith('--kill-after='):
+    if not args and a.startswith('--kill-after='):
         kill_after = float(a.split('=', 1)[1])
     else:
         args.append(a)

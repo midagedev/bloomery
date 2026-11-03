@@ -34,8 +34,8 @@
 # Output: a header (commit, host, CPU features, toolchain, RUSTFLAGS), one line per unit `<name> rc=<N> <secs>s` (a red unit then names its
 # failing tests and its first red lines, then prints that unit's log whole — the CI step keeps this stdout, and the file
 # under target/ is not uploaded), a `DONE tier=… total=… red=… wall=…s` line; each unit's full log is also in
-# target/contrib-check/<time>.<unique>/<name>.log. A host without GNU `timeout` (macOS) runs units unbounded, and the header says so;
-# the bound elsewhere is CONTRIB_UNIT_BOUND seconds a unit (default 1200), BLOOMERY_GATE_BOUND for tools/gate.sh.
+# target/contrib-check/<time>.<unique>/<name>.log. The bound is CONTRIB_UNIT_BOUND seconds a unit (default 1200), under
+# tools/gate-bound.sh's bound_timeout monitor, which the header names; BLOOMERY_GATE_BOUND for tools/gate.sh.
 # CONTRIB_INJECT_FAIL=1 adds one deliberately failing unit, `inject-fail`: the red path end to end.
 #
 # Exit: 0 every unit green; 1 a unit red; 64 usage (a tier this host cannot run included; `--tier t2`); 69 a prerequisite is
@@ -158,15 +158,9 @@ fi
 
 BOUND=${CONTRIB_UNIT_BOUND:-1200}
 case $BOUND in '' | *[!0-9]* | 0) say "contrib-check: CONTRIB_UNIT_BOUND must be a positive whole number of seconds, got '$BOUND'"; exit 64 ;; esac
-TIMEOUT_NOTE="timeout ${BOUND}s a unit"
-if command -v timeout > /dev/null; then
-  UNIT_TIMEOUT=timeout
-elif command -v gtimeout > /dev/null; then
-  UNIT_TIMEOUT=gtimeout
-else
-  UNIT_TIMEOUT=
-  TIMEOUT_NOTE="no GNU timeout on this host: units run unbounded"
-fi
+bound_timeout
+UNIT_TIMEOUT=$BOUND_TIMEOUT
+TIMEOUT_NOTE="${UNIT_TIMEOUT##*/} ${BOUND}s a unit"
 unset BLOOMERY_BOX_ENV BLOOMERY_DATA
 
 # ---- the units: lists from their owners, never copied ----

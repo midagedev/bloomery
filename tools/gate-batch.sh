@@ -1809,7 +1809,7 @@ JF
   rc_ok 'chain: two any-form members end green' ch-excl 4
   if no_overlap "$t/fake-state/seq.log" gen_x gen_ge; then pass 'chain: no two members overlap (the mutex)'
   else fail 'chain: no two members overlap (the mutex)' "$(awk '$0 ~ /gen_x$|gen_ge$/' "$t/fake-state/ran.log" | tr '\n' ' ')"; fi
-  mutant_of ch-nomutex 's|^  mkdir "$CHAIN_MUTEX" 2> /dev/null \|\| return 1$|  true # MUTANT ch-nomutex|' '# MUTANT ch-nomutex$'
+  mutant_of ch-nomutex 's|^  mkdir_lock "$CHAIN_MUTEX" \|\| return 1$|  true # MUTANT ch-nomutex|' '# MUTANT ch-nomutex$'
   # The e2e member starts 6 s late, longer than any 5 s slice: each member is held for the other's start line, so the overlap shows
   # however late a process starts.
   rc=$(AWAIT='gen_x=gen_ge gen_ge=gen_x' DELAY='gen_ge=6' MTAG=ch-nomutex steal_case ch-exclm "steal-fix	A	3090	5	$d" "plain-any	B	a6000	5	$d" "v41-any	B	a6000	5	$d" "gate-gpu-glm5next-e2e	B	a6000	5	$d" \
@@ -2466,7 +2466,7 @@ HK
   rc_ok 'pool: two pool items in two lanes end green' pool-lanes 2
   if no_overlap "$t/fake-state/seq.log" gen_pl gen_p2; then pass 'pool: two pool items never overlap (the mutex)'
   else fail 'pool: two pool items never overlap (the mutex)' "the intervals crossed"; fi
-  mutant_of pk-nopool 's|^pool_take() { until mkdir "\$POOL_MUTEX" 2> /dev/null; do sleep 1; done; }$|pool_take() { true; } # MUTANT pk-nopool|' '# MUTANT pk-nopool$'
+  mutant_of pk-nopool 's|^pool_take() { until mkdir_lock "\$POOL_MUTEX"; do sleep 1; done; }$|pool_take() { true; } # MUTANT pk-nopool|' '# MUTANT pk-nopool$'
   rc=$(AWAIT='gen_pl=gen_p2 gen_p2=gen_pl' MTAG=pk-nopool steal_case pool-lanesm "pool-any	A	3090	4	$d" "pool-two	B	a6000	4	$d" \
     -- pool-any@FAKE_SLEEP=4 pool-two@FAKE_SLEEP=4)
   printf '%s' "$rc" > "$t/rc-pool-lanesm"
@@ -7469,7 +7469,7 @@ stealable() { # $1 = plan index, $2 = lane
 }
 
 # The chain (class C, the header): one member at a time batch-wide, both lanes feeding it.
-CHAIN_MUTEX=$OUT/chain.lock # taken (mkdir) before a member's run, released (rmdir) when it returns
+CHAIN_MUTEX=$OUT/chain.lock # taken (mkdir_lock, tools/nightly/units.sh) before a member's run, released (rmdir) when it returns
 tagged_neighbour() { # $1 = plan index: a pool or big-host item (D5's groups)
   case " ${P_TAG[$1]:-} " in *' pool '*|*' big-host '*) return 0 ;; *) return 1 ;; esac
 }
@@ -7480,7 +7480,7 @@ tagged_neighbour() { # $1 = plan index: a pool or big-host item (D5's groups)
 # (bounded by the running item's BLOOMERY_GATE_BOUND).
 POOL_MUTEX=$OUT/pool.lock
 pool_tagged() { case " ${P_TAG[$1]:-} " in *' pool '*) return 0 ;; *) return 1 ;; esac; }
-pool_take() { until mkdir "$POOL_MUTEX" 2> /dev/null; do sleep 1; done; }
+pool_take() { until mkdir_lock "$POOL_MUTEX"; do sleep 1; done; }
 pool_rel() { rmdir "$POOL_MUTEX" 2> /dev/null || true; }
 run_pooled() { # $1 = plan index, $2..: run the item under the pool mutex when it is pool-tagged
   local i=$1
@@ -7539,7 +7539,7 @@ chain_skip_take() { # $1 = lane: a member green on a candidate's key skips at 0 
 chain_take() { # $1 = lane: the mutex first (a lane that loses it holds no claim it must honour), then
   # the member D3 gives this lane's card, its placement rewritten onto it (as a steal's is), run, release
   local lane=$1 i card cards
-  mkdir "$CHAIN_MUTEX" 2> /dev/null || return 1
+  mkdir_lock "$CHAIN_MUTEX" || return 1
   i=''
   i=$(chain_next "$lane") || { rmdir "$CHAIN_MUTEX" 2> /dev/null || true; return 1; }
   claim_item "$i" "chain-$lane" || { rmdir "$CHAIN_MUTEX" 2> /dev/null || true; return 1; }

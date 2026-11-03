@@ -5,8 +5,8 @@
 # tools/gate.sh's cargo build may take before it is ended, BLOOMERY_GATE_BUILD_BOUND, 2700 when unset (a
 # build that waits on the build-directory lock and compiles a cold cone is not a hang), and
 # run_bounded, which runs the bounded command so that an ended runner takes it with it (also
-# tools/ref/lease.sh's lease_bounded, under a bound of its own), and lease_stop, the process-group
-# stop shared by run_bounded and the lease runners. Sourced, never executed; one parser, so the
+# tools/ref/lease.sh's lease_bounded, under a bound of its own), bound_timeout, the monitor it runs, and lease_stop, the
+# process-group stop shared by run_bounded and the lease runners. Sourced, never executed; one parser, so the
 # three runners take and refuse the same values.
 #
 # Each value is a base-10 whole number from 1 up, with no sign and no leading zero; anything else is
@@ -148,14 +148,46 @@ group_clear() {
   return 70
 }
 
+# bound_timeout: BOUND_TIMEOUT, the monitor the bounded forms below start where their command says `timeout`. They read
+# GNU coreutils timeout's exit codes: after a TERM from outside, the child's status, and 124 only for a bound that ran
+# out. uutils coreutils timeout (Ubuntu 26.04's `timeout`, 0.10.0) returns 124 after a TERM from outside when it was
+# given --kill-after, so a cancelled command would read as one cut off at its bound. The monitor is the `timeout` on
+# PATH unless its --version names a coreutils other than GNU's (macOS's own timeout and a self-test's stand-in name
+# none), else gnutimeout (Ubuntu's GNU coreutils), else gtimeout (Homebrew's), else tools/ref/stub-timeout.py, which
+# keeps GNU's codes. It is chosen again when PATH changes, so a stand-in a caller puts first on PATH is the one used.
+case ${BASH_SOURCE[0]} in
+  /*) __BOUND_STUB=${BASH_SOURCE[0]%/*}/ref/stub-timeout.py ;;
+  */*) __BOUND_STUB=$PWD/${BASH_SOURCE[0]%/*}/ref/stub-timeout.py ;;
+  *) __BOUND_STUB=$PWD/ref/stub-timeout.py ;;
+esac
+bound_timeout() {
+  local v c
+  if [ -n "${BOUND_TIMEOUT:-}" ] && [ "${__BOUND_TIMEOUT_PATH-}" = "$PATH" ]; then return 0; fi
+  __BOUND_TIMEOUT_PATH=$PATH
+  BOUND_TIMEOUT=timeout
+  if command -v timeout > /dev/null; then
+    v=$(timeout --version < /dev/null 2> /dev/null) || :
+    v=${v%%$'\n'*}
+    case $v in *coreutils*) ;; *) return 0 ;; esac
+    case $v in *'GNU coreutils'*) return 0 ;; esac
+  fi
+  for c in gnutimeout gtimeout; do
+    if command -v "$c" > /dev/null; then
+      BOUND_TIMEOUT=$c
+      return 0
+    fi
+  done
+  BOUND_TIMEOUT=$__BOUND_STUB
+}
+
 # run_bounded [--clear] <command…>: the bounded command (`timeout … <binary>`) as a child the runner waits for,
 # returning a nonzero child status or, when the child succeeds, any cleanup failure. With --clear, nothing of the
 # child's process group lives when it returns, by any path: group_clear KILLs what the command left there, while
 # this trap still holds a signal for the caller (tools/nightly/units.sh's run_unit). Without it, a process the
 # command leaves in its group lives on (tools/ref/lease-hold.sh reports one that keeps the lease).
-# The status contract is GNU coreutils timeout's: after a TERM from outside it returns the child's code.
-# uutils coreutils timeout 0.8.0 returns 143 there instead, so under it a cancelled run reports 143. GNU timeout
-# before 9.5 does too when the TERM comes before its fork returns, without signalling the child; the TERM to the
+# The status contract is GNU coreutils timeout's: after a TERM from outside it returns the child's code. A command that
+# starts with `timeout` runs under bound_timeout's monitor, which keeps that contract. GNU timeout before 9.5 returns
+# 143 when the TERM comes before its fork returns, without signalling the child; the TERM to the
 # group below ends that child.
 # timeout runs the binary in a process group of its own, which a signal to the runner's group never
 # reaches. So a TERM or HUP to the runner (an INT too, unless the runner was started with & by a shell,
@@ -179,6 +211,10 @@ run_bounded() {
   if [ "${1:-}" = --clear ]; then
     clear=1
     shift
+  fi
+  if [ "${1:-}" = timeout ]; then
+    bound_timeout
+    set -- "$BOUND_TIMEOUT" "${@:2}"
   fi
   # shellcheck disable=SC2034 # the caller reads it
   BIN_SIGNAL=
@@ -367,6 +403,7 @@ bounded_bg() {
     echo "[bound] bounded_bg: BG_OUT and BG_OUT_APPEND both set" >&2
     return 64
   fi
+  bound_timeout
   if [ -z "$BG_HANDLES" ]; then
     BG_TRAPS='' BG_SIGNAL='' BG_FAIL=''
     for bg_s in TERM INT HUP; do
@@ -383,7 +420,7 @@ bounded_bg() {
     [ -z "$BG_IN" ] || exec < "$BG_IN" || exit 70
     [ -z "$BG_OUT" ] || exec > "$BG_OUT" 2>&1 || exit 70
     [ -z "$BG_OUT_APPEND" ] || exec >> "$BG_OUT_APPEND" 2>&1 || exit 70
-    LEASE_STOP_GRACE=$((bg_grace / 2)) exec timeout --kill-after="$bg_grace" "$bg_bound" "$@"
+    LEASE_STOP_GRACE=$((bg_grace / 2)) exec "$BOUND_TIMEOUT" --kill-after="$bg_grace" "$bg_bound" "$@"
   ) <&0 &
   bg_pid=$!
   printf -v "BG_PID$bg_sfx" %s "$bg_pid"
@@ -549,6 +586,8 @@ bounded_bg_get() {
 #                      that exits still runs the capture directory's cleanup
 #   stop-pid-guard     lease_stop and group_clear: a pid that is no number from 2 up (1, 0, 01, none, a word) is refused (70) with
 #                      nothing signalled; kill is a recorder in the case, since a pid of 1 reaches init and its group every process
+#   monitor-choice     bound_timeout: GNU's `timeout`, a stand-in's, else gnutimeout or gtimeout beside a uutils one, else the
+#                      tree's stub-timeout.py; run_bounded, bounded and bounded_bg start it, and a new PATH chooses again
 #   two-handles        BG_NAME: two commands up at once, the default handle beside a named one too. Each stops by its handle
 #                      and leaves the other up; bounded_bg_stop_all and a TERM to the runner stop both and give the caller's
 #                      traps back; a command cut at its bound leaves the other up; a TERM during one's explicit stop stops
@@ -1126,6 +1165,27 @@ time.sleep(60)' "$t/ended.pg" &
       echo "signals=$(grep -c . "$LOG")"' _ "$self" "$p" 2>&1)
     check "stop-pid-guard-[$p]" "$(grep -E '^(stop|clear) rc=|^signals=' <<< "$out" | tr '\n' ' ')" 'stop rc=70 clear rc=70 signals=0 '
   done
+  # monitor-choice: bound_timeout's monitor for a PATH that holds only the case's commands, and the one the bounded forms
+  # start (each stand-in prints its name and arguments), chosen again when PATH changes. LEASE_STOP_GRACE is set: under a
+  # runner (contrib-check's run_unit) the inherited one is half the runner's, and it is the forms' --kill-after.
+  for tag in gnu:timeout uutils:gnutimeout uutils-g:gtimeout uutils-only:stub-timeout.py stand-in:timeout none:stub-timeout.py; do
+    path=$t/mc-${tag%%:*}
+    mkdir "$path"
+    case ${tag%%:*} in
+      gnu) printf '#!/bin/sh\necho "timeout (GNU coreutils) 9.4"\n' > "$path/timeout" ;;
+      uutils*) printf '#!/bin/sh\necho "timeout (uutils coreutils) 0.10.0"\n' > "$path/timeout" ;;
+      stand-in) printf '#!/bin/sh\nexit 1\n' > "$path/timeout" ;;
+    esac
+    case ${tag%%:*} in uutils | uutils-g) printf '#!/bin/sh\necho "gtimeout $*"\n' > "$path/gtimeout" ;; esac
+    case ${tag%%:*} in gnu | uutils | stand-in) printf '#!/bin/sh\necho "gnutimeout $*"\n' > "$path/gnutimeout" ;; esac
+    chmod +x "$path"/* 2> /dev/null
+    out=$(PATH=$path "$BASH" -c 'source "$1"; bound_timeout; [ -x "$BOUND_TIMEOUT" ] || command -v "$BOUND_TIMEOUT" > /dev/null &&
+      echo "${BOUND_TIMEOUT##*/}"' _ "$self" 2>&1)
+    check "monitor-choice-${tag%%:*}" "$out" "${tag#*:}"
+  done
+  out=$(PATH=$t/mc-uutils LEASE_STOP_GRACE=4 "$BASH" -c 'source "$1"; run_bounded timeout --kill-after=1 5 true; bounded 5 true; unset BOUND_TIMEOUT
+    bounded_bg 5 true; bounded_bg_wait; PATH=$2; bound_timeout; echo "$BOUND_TIMEOUT"' _ "$self" "$t/mc-gnu" 2>&1)
+  check monitor-choice-forms "$(tr '\n' ' ' <<< "$out")" 'gnutimeout --kill-after=1 5 true gnutimeout --kill-after=4 5 true gnutimeout --kill-after=4 5 true timeout '
   # build-bound: gate_build_bound takes what gate_bound takes (a base-10 whole number from 1 up) and names its own variable in the
   # refusal; unset is 2700; the two bounds do not read each other's variable.
   for p in '' 0 00 007 +5 -1 ' 5' '5 ' 5x abc 1e3; do

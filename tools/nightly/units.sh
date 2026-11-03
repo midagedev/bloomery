@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The one unit runner and the one commit label: a library, sourced by tools/nightly/run.sh (the nightly host run) and
 # tools/contrib-check.sh (a contributor's off-box check), and, for the label alone, by tools/gate-batch.sh,
-# tools/ptx-compare.sh and tools/narrow-scan.sh. Output directory ownership is shared by gate-batch.sh and batch-replay.sh.
+# tools/ptx-compare.sh and tools/narrow-scan.sh. Output directory ownership is shared by gate-batch.sh and batch-replay.sh,
+# and gate-batch.sh takes its mutexes with mkdir_lock.
 # A unit is a `name<TAB>command` line of `python3 tools/recipes.py
 # host-nightly`, or any command a caller names; this file runs one and reads its outcome, and a caller decides what to do
 # with it.
@@ -23,8 +24,8 @@
 #       UNIT_SECS   its wall time in whole seconds
 #       UNIT_KIND   `cargo` when CMD runs tools/gate.sh, else `script`
 #       UNIT_P, UNIT_F, UNIT_I   the sums of the log's `test result:` passed, failed and ignored counts
-#     UNIT_TIMEOUT names the bounding command (default `timeout`); a host without it (macOS has no GNU timeout) sets it to
-#     the empty string, and the unit then runs unbounded, in a process group of its own: the caller says so.
+#     UNIT_TIMEOUT names the bounding command (default `timeout`, which run_bounded runs as tools/gate-bound.sh's
+#     bound_timeout monitor); the empty string runs the unit unbounded, in a process group of its own: the caller says so.
 #   unit_failure NAME RC LOG BOUND
 #     prints what a red unit's `failed` file holds: one `NAME: <test>` line per libtest `... FAILED` line, or else one
 #     `NAME: <why>` line (timeout, a filter that matched no test, a build failure, the rc) and the first few red lines (a rustfmt
@@ -47,11 +48,25 @@
 #     the zero padding of its last block, and git dies of SIGPIPE (rc 141) on an archive tar read whole. Sets ARCHIVE_GIT_RC
 #     and ARCHIVE_TAR_RC (`-` when tar did not run) and returns 0 when both are 0, else 1 (70 when it has no temporary file).
 #
+#   mkdir_lock DIR
+#     makes DIR and returns 0, or returns 1 when it exists or cannot be made (that one named on stderr): the lock a caller
+#     takes by making a directory and drops with rmdir. One mkdir(2), whose EEXIST is a loss. uutils coreutils mkdir (Ubuntu
+#     26.04's) reads a directory another process made between its own check and its mkdir(2) as made, so two takers could
+#     both win.
+#
 # The callers stay in step by sharing this code: a change to how a unit's counts or failures are read, or to how a tree is
 # labelled or archived, lands here once.
 
 # shellcheck disable=SC2034  # the UNIT_*, TREE_* and ARCHIVE_* variables are this library's result interface, read by the sourcing script
 UNIT_TIMEOUT=${UNIT_TIMEOUT-timeout}
+
+mkdir_lock() {
+  python3 -c 'import os, sys
+try:
+    os.mkdir(sys.argv[1])
+except FileExistsError:
+    sys.exit(1)' "$1"
+}
 
 # output_dir_take DIR reserves a caller's output namespace until output_dir_drop.
 # A marker left by an interrupted owner is refused rather than guessed stale.
@@ -62,7 +77,7 @@ output_dir_take() {
     echo "output directory: cannot write $dir" >&2
     return 73
   }
-  mkdir "$dir/.run-owner" 2> /dev/null || {
+  mkdir_lock "$dir/.run-owner" || {
     echo "output directory: $dir already has an owner (.run-owner)" >&2
     return 73
   }
