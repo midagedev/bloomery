@@ -1174,6 +1174,22 @@ pub static LINK_GATHER: Kind = Kind {
     ],
 };
 
+/// One rank's path to a peer in `link_probe`.
+pub static LINK_PATH: Kind = Kind {
+    name: "link_path",
+    head: "link path",
+    doc: "One rank's RDMA path to a peer in link_probe: the two ranks, the local and the peer's fabric address the two ends agreed on, the RoCE device and GID index of the local address, and the flow label its packets carry.",
+    parts: &[
+        key("rank", U64, ""),
+        key("peer", U64, ""),
+        key("local", Word, ""),
+        key("remote", Word, ""),
+        key("dev", Word, ""),
+        key("gid_index", U64, ""),
+        key("flow_label", U64, ""),
+    ],
+};
+
 pub static TIME_PROMPT: Kind = Kind {
     name: "time_prompt",
     head: "time prompt",
@@ -3612,8 +3628,9 @@ pub static PROBE_NVREAD: &[&Kind] = &[&NVREAD];
 /// The readback result that `h2d_probe` prints.
 pub static H2D_PROBE: &[&Kind] = &[&H2D_READBACK];
 
-/// The record `link_probe` prints under `--gather`: one line a rank.
-pub static LINK_PROBE: &[&Kind] = &[&LINK_GATHER];
+/// The records `link_probe` prints: a line a peer path, and under `--gather`
+/// one line a rank.
+pub static LINK_PROBE: &[&Kind] = &[&LINK_PATH, &LINK_GATHER];
 
 /// The width chooser's state on `r`, a `draft summary` or an `mtp width`
 /// record: the gate's width, each width's cost median in ms (`-` while

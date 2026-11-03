@@ -16,26 +16,26 @@
 //! part of the sum over heads or over the inner width: the ranks gather their parts and each
 //! adds them in rank order (`bloomery_gpu::host::Gathers`), so every rank holds the same bits,
 //! and `hc_post` runs on the sum. Two gathers a layer. Each rank's head picks its part's argmax,
-//! and the step's token is their merge ([`head::merge`]). At N = 1 there is no gather and the
+//! and the step's token is their merge (`bloomery_gpu::head::merge`). At N = 1 there is no gather and the
 //! launches are the one-card step's with every expert on the card.
 //!
 //! The ranks' launches go out a sub-layer at a time, every rank's before the next sub-layer's
 //! ([`step`]), so no rank's stream holds more than one sub-layer's work queued behind a wait.
 //! The NextN layer and a prompt batch are not run here.
 
-mod head;
 mod source;
 
 use std::sync::Arc;
 
 use bloomery_gpu::head::Head;
-use bloomery_gpu::host::{GatherLoop, GatherSet, GatherShape, Gathers};
+use bloomery_gpu::host::rank::{Sums, alike, at_pos, streams_at};
+use bloomery_gpu::host::{GatherLoop, GatherShape, Gathers};
 use bloomery_gpu::hybrid::SlotMap;
 use bloomery_gpu::weights::{Weights, block_index};
-use bloomery_gpu::{Branch, DeviceTensor, Gpu, GpuError, MappedHost, WindowMut, mem_batch};
+use bloomery_gpu::{Branch, DeviceTensor, Gpu, GpuError, MappedHost};
 use bloomery_gpu_deepseek41::hc::HC_STREAMS;
 use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED};
-use cuda_core::{CudaStream, DeviceBuffer, sys};
+use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::glm5next::names::Sub;
 use model::arch::glm5next::place::{KdaLanes, PlanInputs};
@@ -44,8 +44,8 @@ use runtime::layer::{FfnKind, MixerKind};
 
 use crate::body::pair::write_row;
 use crate::body::{
-    Body, Dims, Embedding, Kernels, LayerCfg, Parts, Scratch, Store, check_ctx, check_pos, dims_of,
-    host_run, layer_cfg, store, trunk_plans,
+    Body, Dims, Embedding, Kernels, LayerCfg, Parts, Scratch, Store, check_ctx, dims_of, host_run,
+    layer_cfg, store, trunk_plans,
 };
 use crate::ffn::{CardExperts, block_names};
 use crate::program::{hc_in, hc_out};
@@ -56,15 +56,6 @@ pub use source::RankOf;
 
 /// What the errors name.
 const WHAT: &str = "glm5next tp rank";
-
-/// A rank's side of the load's gathers: its page's layout, the page, each span set's post and
-/// wait operations on the page, and the gathers it has run, which alternate the span sets.
-struct RankLink {
-    layout: Gathers,
-    page: Arc<MappedHost>,
-    ops: [Vec<sys::CUstreamBatchMemOpParams>; Gathers::SETS],
-    gathered: usize,
-}
 
 /// One rank of a tensor-parallel load (module doc): its parts of the weights, the one-card
 /// step's buffers and stores at its widths, its card experts and its head. Its stores take each
@@ -97,7 +88,7 @@ pub struct Rank {
     /// Each layer's streams and each routed layer's picks after the last step, when armed.
     taps: Option<Vec<DeviceBuffer<f32>>>,
     routes: Option<Vec<Option<RouteTap>>>,
-    link: Option<RankLink>,
+    link: Option<Sums>,
 }
 
 /// A routed layer's tap: the router's chosen ids and its scores after the last step.
@@ -179,31 +170,12 @@ impl Rank {
                 inputs.hp.n_vocab
             )));
         }
+        let shape = GatherShape {
+            rows: 1,
+            width: dims.embd,
+        };
         let link = (n > 1)
-            .then(|| -> Result<RankLink, GpuError> {
-                let shape = GatherShape {
-                    rows: 1,
-                    width: dims.embd,
-                };
-                let layout = Gathers::new(0, n, at.rank(), &[shape])?;
-                let page = MappedHost::new(gpu.context(), layout.page_bytes(), "tp gather page")?;
-                let ops = std::array::from_fn(|set| {
-                    let at = GatherSet {
-                        dev: page.dev_at(0),
-                        slot: 0,
-                        set,
-                    };
-                    let mut ops = layout.post(at).to_vec();
-                    ops.extend(layout.wait(at));
-                    ops
-                });
-                Ok(RankLink {
-                    layout,
-                    page: Arc::new(page),
-                    ops,
-                    gathered: 0,
-                })
-            })
+            .then(|| Sums::new(gpu.context(), at.rank(), n, &[shape]))
             .transpose()?;
         Ok(Rank {
             at,
@@ -233,7 +205,7 @@ impl Rank {
     /// loopback's, `bloomery_gpu::host::GatherLoop`); `None` at one rank.
     #[must_use]
     pub fn link(&self) -> Option<(&Gathers, &Arc<MappedHost>)> {
-        self.link.as_ref().map(|l| (&l.layout, &l.page))
+        self.link.as_ref().map(Sums::link)
     }
 
     /// Keep every layer's streams and every routed layer's picks after each step, or stop. Taps
@@ -360,7 +332,6 @@ impl Rank {
             routes,
             link,
             cur,
-            at,
             ..
         } = self;
         on_card(gpu)?;
@@ -393,7 +364,7 @@ impl Rank {
             }
         }
         if let Some(link) = link {
-            gather(gpu, link, at.rank(), &mut p.s.out)?;
+            link.join(gpu, 0, &mut p.s.out)?;
         }
         *cur = hc_out(gpu, &mut p, *cur)?;
         if sub == Sub::Ffn {
@@ -423,20 +394,13 @@ impl Rank {
         on_card(gpu)?;
         let id = self.head.token(gpu)?;
         let logits = self.head.logits_to_host(gpu)?;
-        let v = *logits.get(id as usize).ok_or_else(|| {
-            shape(format!(
-                "the head's pick {id} past its {} rows",
-                logits.len()
-            ))
-        })?;
-        let off = self
+        let at = self
             .at
             .rank()
             .checked_mul(self.head.n_vocab())
             .and_then(|o| u32::try_from(o).ok())
-            .and_then(|o| o.checked_add(id))
-            .ok_or_else(|| shape(format!("rank {}'s pick {id} past u32", self.at.rank())))?;
-        Ok((v, off))
+            .ok_or_else(|| shape(format!("rank {}'s part past u32", self.at.rank())))?;
+        bloomery_gpu::head::local_pick(&logits, id, at)
     }
 }
 
@@ -455,7 +419,7 @@ pub fn step(
     pos: u32,
 ) -> Result<u32, GpuError> {
     let n = ranks.len();
-    let layers = alike(
+    let (layers, _, _) = alike(
         ranks
             .iter()
             .map(|(_, r)| (r.cfg.len(), r.dims.embd, r.head.n_vocab())),
@@ -510,63 +474,11 @@ pub fn step(
         .iter()
         .map(|(gpu, r)| r.pick(gpu))
         .collect::<Result<Vec<_>, _>>()?;
-    let token = head::merge(&picks)?;
+    let token = bloomery_gpu::head::merge(&picks)?;
     for (_, r) in ranks.iter_mut() {
         r.next_pos = Some(pos + 1);
     }
     Ok(token)
-}
-
-/// Each rank uses its opener's stream, distinct from every earlier rank's.
-fn streams_at<'a, T: 'a>(
-    rank: usize,
-    opened: &Arc<T>,
-    offered: &T,
-    prior: impl IntoIterator<Item = &'a Arc<T>>,
-) -> Result<(), GpuError> {
-    if !std::ptr::eq(offered, opened.as_ref()) {
-        return Err(shape(format!("rank {rank}: use the GPU that opened it")));
-    }
-    if prior.into_iter().any(|p| Arc::ptr_eq(p, opened)) {
-        return Err(shape(format!(
-            "rank {rank}: each rank must use a distinct stream"
-        )));
-    }
-    Ok(())
-}
-
-/// The layer count of ranks whose trunks are `(layers, embedding width, head rows)` each, which
-/// one step joins: refused by name for no rank, or a rank whose trunk is unlike rank 0's.
-fn alike(trunks: impl IntoIterator<Item = (usize, usize, usize)>) -> Result<usize, GpuError> {
-    let mut trunks = trunks.into_iter();
-    let first = trunks
-        .next()
-        .ok_or_else(|| shape("a step over no ranks".into()))?;
-    for (r, t) in trunks.enumerate() {
-        if t != first {
-            return Err(shape(format!(
-                "rank {}'s (layers, width, head rows) {t:?} unlike rank 0's {first:?}",
-                r + 1
-            )));
-        }
-    }
-    Ok(first.0)
-}
-
-/// Refused by name unless stores of `ctx` positions that stand at `next` (a rank's
-/// `next_pos`) take a step at `pos`: inside them ([`check_pos`]), and the position they stand at.
-fn at_pos(next: Option<u32>, ctx: usize, pos: u32) -> Result<(), GpuError> {
-    check_pos(pos, ctx)?;
-    match next {
-        Some(p) if p == pos => Ok(()),
-        Some(p) => Err(shape(format!(
-            "position {pos}, where the stores hold {p} positions"
-        ))),
-        None => Err(shape(format!(
-            "position {pos}: a step failed once its launches went out, so the stores hold part \
-             of it; open the rank again"
-        ))),
-    }
 }
 
 /// Refused by name unless stores that stand at `next` (a rank's `next_pos`) have taken no step,
@@ -579,30 +491,6 @@ fn arm_at(next: Option<u32>) -> Result<(), GpuError> {
             missing: "taps armed before the first step (open the rank again)",
         }),
     }
-}
-
-/// The rank's part `out` of a sub-layer's output posted to the other ranks, their parts waited
-/// for, and the parts' rank-order sum into `out`, on the link's next span set.
-fn gather(
-    gpu: &Gpu,
-    link: &mut RankLink,
-    rank: usize,
-    out: &mut DeviceBuffer<f32>,
-) -> Result<(), GpuError> {
-    let stream = gpu.stream();
-    let set = link.gathered % Gathers::SETS;
-    link.gathered += 1;
-    let dev = link.page.dev_at(0);
-    let at = GatherSet { dev, slot: 0, set };
-    let own = dev + link.layout.part(0, set, rank).start as u64;
-    // SAFETY: the part's values lie in the rank's own page, mapped in this context, which the
-    // rank holds until its drop has waited for every launch it enqueued.
-    let mut part = unsafe { WindowMut::<f32>::from_raw(own, out.len(), gpu.context()) };
-    part.copy_from_device_async(out, stream)?;
-    // SAFETY: every counter the operations name lies in the rank's page, held as above.
-    unsafe { mem_batch(stream, &mut link.ops[set], "glm5next tp gather")? };
-    // SAFETY: `dev` is the rank's page of this layout, mapped in this context and held as above.
-    unsafe { link.layout.enqueue_sum(gpu.elem(), stream, at, 1, out) }
 }
 
 impl Drop for Rank {
@@ -656,23 +544,7 @@ fn shape(detail: String) -> GpuError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    #[test]
-    fn ranks_use_their_openers_distinct_streams() {
-        let a = Arc::new(0u8);
-        let b = Arc::new(0u8);
-        assert!(super::streams_at(0, &a, &a, []).is_ok());
-        assert!(super::streams_at(1, &b, &b, [&a]).is_ok());
-        for (opened, offered, prior, want) in [
-            (&a, &b, &b, "use the GPU that opened it"),
-            (&a, &a, &a, "each rank must use a distinct stream"),
-        ] {
-            let e = super::streams_at(1, opened, offered, [prior]).unwrap_err();
-            assert!(e.to_string().contains(want), "{e}");
-        }
-    }
-    use super::{alike, arm_at, at_pos, check_ctx};
+    use super::{arm_at, check_ctx};
     use model::arch::glm5next::place::ORACLE_POSITIONS;
 
     /// A load of no positions or past the reference sets' positions is refused.
@@ -681,48 +553,6 @@ mod tests {
         let max = usize::try_from(ORACLE_POSITIONS).unwrap();
         assert!(check_ctx(1).is_ok() && check_ctx(max).is_ok());
         assert!(check_ctx(0).is_err() && check_ctx(max + 1).is_err());
-    }
-
-    /// Stores take the position they stand at, inside them; any other position, the one past
-    /// them and every position after a failed step are refused.
-    #[test]
-    fn a_step_takes_only_the_position_its_stores_stand_at() {
-        assert!(at_pos(Some(0), 4, 0).is_ok() && at_pos(Some(3), 4, 3).is_ok());
-        for (next, pos) in [
-            (Some(0), 1),
-            (Some(2), 1),
-            (Some(4), 4),
-            (None, 0),
-            (None, 2),
-        ] {
-            assert!(at_pos(next, 4, pos).is_err(), "{next:?} at {pos}");
-        }
-    }
-
-    /// A step joins ranks of one trunk, at N = 1, 2 and 4; no rank, and a rank of another layer
-    /// count, width or head part, are refused.
-    #[test]
-    fn a_step_joins_only_ranks_of_one_trunk() {
-        let t = (3, 64, 8);
-        for n in [1, 2, 4] {
-            assert_eq!(alike(vec![t; n]).unwrap(), 3, "{n} ranks");
-        }
-        let mut accepted = Vec::new();
-        if alike([]).is_ok() {
-            accepted.push(("no ranks", 0, t));
-        }
-        for other in [(2, 64, 8), (4, 64, 8), (3, 32, 8), (3, 64, 16)] {
-            for n in [2, 4] {
-                let mut trunks = vec![t; n];
-                trunks[n - 1] = other;
-                let refused = alike(trunks)
-                    .is_err_and(|e| e.to_string().contains(&format!("rank {}'s", n - 1)));
-                if !refused {
-                    accepted.push(("last rank unlike", n, other));
-                }
-            }
-        }
-        assert!(accepted.is_empty(), "not refused by name: {accepted:?}");
     }
 
     /// Taps arm only on stores that have taken no step; after a step or a failed one, arming is

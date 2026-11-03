@@ -1043,7 +1043,7 @@ fn read_peer_reply(body: &[u8]) -> Result<Peer, String> {
 
 /// A TCP end's address, as 16 bytes (an IPv4 address IPv6-mapped), its
 /// port and its nonce.
-fn write_tcp_peer(t: &TcpPeer, out: &mut Out) {
+pub fn write_tcp_peer(t: &TcpPeer, out: &mut Out) {
     let ip = match t.addr.ip() {
         std::net::IpAddr::V4(a) => a.to_ipv6_mapped(),
         std::net::IpAddr::V6(a) => a,
@@ -1056,7 +1056,7 @@ fn write_tcp_peer(t: &TcpPeer, out: &mut Out) {
 /// [`write_tcp_peer`]'s fields, an IPv6-mapped address read back as the
 /// IPv4 address it maps; an unspecified address or a port of 0 or past
 /// `u16` is refused by name.
-fn read_tcp_peer(i: &mut In<'_>) -> Result<TcpPeer, String> {
+pub fn read_tcp_peer(i: &mut In<'_>) -> Result<TcpPeer, String> {
     let octets: [u8; 16] = i
         .bytes("TCP address")?
         .try_into()
@@ -1073,7 +1073,7 @@ fn read_tcp_peer(i: &mut In<'_>) -> Result<TcpPeer, String> {
     }
 }
 
-fn write_endpoint(e: &bloomery_verbs::Endpoint, out: &mut Out) {
+pub(super) fn write_endpoint(e: &bloomery_verbs::Endpoint, out: &mut Out) {
     out.u32(e.qpn)
         .u32(e.psn)
         .bytes(&e.gid.raw)
@@ -1081,7 +1081,7 @@ fn write_endpoint(e: &bloomery_verbs::Endpoint, out: &mut Out) {
         .u32(e.rkey);
 }
 
-fn read_endpoint(i: &mut In<'_>) -> Result<bloomery_verbs::Endpoint, String> {
+pub(super) fn read_endpoint(i: &mut In<'_>) -> Result<bloomery_verbs::Endpoint, String> {
     let qpn = i.u32("queue pair")?;
     let psn = i.u32("packet sequence")?;
     let gid = bloomery_verbs::Gid {

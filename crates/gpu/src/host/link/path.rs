@@ -1,6 +1,5 @@
 //! The path a rank's RDMA end takes to each other rank of a group
-//! ([`PeerPath`]): the peer's control address, the fabric address this node
-//! reaches it at, the local address the kernel sends from toward it, the RoCE
+//! ([`PeerPath`]): the fabric address this node reaches it at, the local address the kernel sends from toward it, the RoCE
 //! device and GID index of that local address, and the flow label the
 //! fabric's relays need on its packets.
 //!
@@ -10,44 +9,42 @@
 //! packet leaves with the peer's own MAC. A route through a gateway is a RoCE
 //! path only on a fabric whose relays forward packets that carry a flow label
 //! the fabric's manifest names (`flow_label_base`); such a peer's queue pair
-//! sends with that label. Every other end sends with label 0. A peer none of
-//! whose addresses is a path is refused by name: a link whose packets would
-//! be dropped on the wire never opens.
+//! sends with that label. Every other end sends with label 0. The two ends
+//! of a queue pair take one address pair ([`paths`]); a peer with none both
+//! ends carry is refused by name: a link whose packets would be dropped on
+//! the wire never opens.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::path::Path;
 
 use crate::GpuError;
-use crate::host::rank::RankList;
+use crate::host::rank::{Control, RankList};
 
 const WHAT: &str = "the peer path";
 
-/// How this rank reaches rank `peer`: its control address, the fabric
-/// address `remote` from the local address `local` on RoCE device `dev` at
-/// GID index `gid`, every packet carrying `flow_label`.
+/// How this rank reaches rank `peer`: the fabric address `remote` from the
+/// local address `local` on RoCE device `dev` at GID index `gid`, every
+/// packet carrying `flow_label`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerPath {
     pub peer: usize,
-    pub control: SocketAddr,
-    pub local: IpAddr,
-    pub remote: IpAddr,
+    pub local: Ipv4Addr,
+    pub remote: Ipv4Addr,
     pub dev: String,
     pub gid: u8,
     pub flow_label: u32,
 }
 
 impl PeerPath {
-    /// A path from `local` over RoCE device `dev` at GID index `gid` that
-    /// needs no relay mark, to an end that is not a rank of a group (the
-    /// other end of a one-machine link, a tier node): it names no peer
-    /// address, the queue pair's endpoint exchange carries it.
-    pub(crate) fn port(dev: String, gid: u8, local: IpAddr) -> PeerPath {
-        let none = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0));
+    /// A path over RoCE device `dev` at GID index `gid` that needs no relay
+    /// mark, to an end that is not a rank of a group (the other end of a
+    /// one-machine link, a tier node): it names no address, the queue pair's
+    /// endpoint exchange carries them.
+    pub(crate) fn port(dev: String, gid: u8) -> PeerPath {
         PeerPath {
             peer: 0,
-            control: none,
-            local,
-            remote: none.ip(),
+            local: Ipv4Addr::UNSPECIFIED,
+            remote: Ipv4Addr::UNSPECIFIED,
             dev,
             gid,
             flow_label: 0,
@@ -58,12 +55,17 @@ impl PeerPath {
 /// The path to every other rank of `ranks` from rank `me`, in rank order,
 /// read from this node's main routing table and RoCE GID tables, and the
 /// relay flow label from the fabric manifest at `fabric` when one is given.
-/// A rank past the list, an unreadable manifest or table, or a peer with no
-/// RoCE path is refused by name. Load-time only.
+/// A queue pair sends to the address its peer's end sends from, so the two
+/// ends of a pair take one address pair: each rank sends every peer, over
+/// `control`, the pairs it can carry (its source, the peer's address), and
+/// both ends take the first pair in the lower rank's order that the higher
+/// rank carries mirrored. A rank past the list, an unreadable manifest or
+/// table, or a peer with no common pair is refused by name. Load-time only.
 pub fn paths(
     ranks: &RankList,
     me: usize,
     fabric: Option<&Path>,
+    control: &mut Control,
 ) -> Result<Vec<PeerPath>, GpuError> {
     if me >= ranks.len() {
         return Err(GpuError::shape(
@@ -75,44 +77,130 @@ pub fn paths(
     let table = std::fs::read_to_string("/proc/net/route")
         .map_err(|e| GpuError::link(WHAT, format!("/proc/net/route: {e}")))?;
     let routes = Route::table(&table)?;
-    (0..ranks.len())
-        .filter(|&p| p != me)
-        .map(|peer| {
-            let addr = ranks.rank(peer);
-            let mut tried = Vec::new();
-            for &remote in &addr.data {
-                let Some(flow_label) = lane(&routes, remote, mark) else {
-                    tried.push(format!("{remote}: no route without a gateway"));
-                    continue;
-                };
-                let local = match source(remote) {
-                    Ok(local) => local,
-                    Err(e) => {
-                        tried.push(format!("{remote}: {e}"));
-                        continue;
-                    }
-                };
-                match bloomery_verbs::roce_v2_at(local) {
-                    Ok((dev, gid)) => {
-                        return Ok(PeerPath {
-                            peer,
-                            control: addr.control,
-                            local: IpAddr::V4(local),
-                            remote: IpAddr::V4(remote),
-                            dev,
-                            gid,
-                            flow_label,
-                        });
-                    }
-                    Err(e) => tried.push(format!("{remote} from {local}: {e}")),
-                }
-            }
-            Err(GpuError::link(
-                WHAT,
-                format!("rank {peer}: no RoCE path ({})", tried.join("; ")),
-            ))
+    let peers: Vec<usize> = (0..ranks.len()).filter(|&p| p != me).collect();
+    let (mine, skipped): (Vec<Vec<PeerPath>>, Vec<Vec<String>>) = peers
+        .iter()
+        .map(|&peer| carried(ranks, peer, &routes, mark))
+        .unzip();
+    let out: Vec<(usize, Vec<u8>)> = peers
+        .iter()
+        .zip(&mine)
+        .map(|(&peer, c)| (peer, encode_pairs(c)))
+        .collect();
+    let theirs = control.swap(&out)?;
+    peers
+        .iter()
+        .zip(mine)
+        .zip(&theirs)
+        .zip(&skipped)
+        .map(|(((&peer, mine), theirs), skipped)| {
+            let theirs = decode_pairs(theirs)?;
+            let own: Vec<(Ipv4Addr, Ipv4Addr)> = mine.iter().map(|p| (p.local, p.remote)).collect();
+            let (local, remote) = pair_for(me, peer, &own, &theirs).ok_or_else(|| {
+                GpuError::link(
+                    WHAT,
+                    format!(
+                        "rank {peer}: no address pair both ends carry (here {own:?}, rank \
+                         {peer} {theirs:?}, each as (source, peer address); not carried here: \
+                         {})",
+                        skipped.join("; ")
+                    ),
+                )
+            })?;
+            Ok(mine
+                .into_iter()
+                .find(|p| (p.local, p.remote) == (local, remote))
+                .expect("a pair this rank carries"))
         })
         .collect()
+}
+
+/// Every path from this node to rank `peer` of `ranks`, in the order of the
+/// peer's addresses: those a RoCE path reaches (see the module comment) from
+/// a local address with a RoCE v2 GID; and why each other address is not one.
+fn carried(
+    ranks: &RankList,
+    peer: usize,
+    routes: &[Route],
+    mark: Option<u32>,
+) -> (Vec<PeerPath>, Vec<String>) {
+    let addr = ranks.rank(peer);
+    let (mut carried, mut skipped) = (Vec::new(), Vec::new());
+    for &remote in &addr.data {
+        let Some(flow_label) = lane(routes, remote, mark) else {
+            skipped.push(format!("{remote}: no route without a gateway"));
+            continue;
+        };
+        let at = source(remote).and_then(|local| {
+            bloomery_verbs::roce_v2_at(local)
+                .map(|(dev, gid)| (local, dev, gid))
+                .map_err(|e| format!("from {local}: {e}"))
+        });
+        match at {
+            Ok((local, dev, gid)) => carried.push(PeerPath {
+                peer,
+                local,
+                remote,
+                dev,
+                gid,
+                flow_label,
+            }),
+            Err(e) => skipped.push(format!("{remote}: {e}")),
+        }
+    }
+    (carried, skipped)
+}
+
+/// Rank `me`'s pair `(source, peer address)` to rank `peer` from its own
+/// pairs `own` and the peer's `theirs`: the lower rank's first pair the
+/// higher rank carries mirrored, seen from `me`'s end.
+fn pair_for(
+    me: usize,
+    peer: usize,
+    own: &[(Ipv4Addr, Ipv4Addr)],
+    theirs: &[(Ipv4Addr, Ipv4Addr)],
+) -> Option<(Ipv4Addr, Ipv4Addr)> {
+    if me < peer {
+        common(own, theirs)
+    } else {
+        common(theirs, own).map(|(a, b)| (b, a))
+    }
+}
+
+/// The first pair `(a, b)` of `lower`'s, each its source `a` and the
+/// higher rank's address `b`, that `higher` carries as `(b, a)`.
+fn common(
+    lower: &[(Ipv4Addr, Ipv4Addr)],
+    higher: &[(Ipv4Addr, Ipv4Addr)],
+) -> Option<(Ipv4Addr, Ipv4Addr)> {
+    lower
+        .iter()
+        .copied()
+        .find(|&(a, b)| higher.contains(&(b, a)))
+}
+
+fn encode_pairs(paths: &[PeerPath]) -> Vec<u8> {
+    paths
+        .iter()
+        .flat_map(|p| [p.local.octets(), p.remote.octets()].concat())
+        .collect()
+}
+
+fn decode_pairs(b: &[u8]) -> Result<Vec<(Ipv4Addr, Ipv4Addr)>, GpuError> {
+    if !b.len().is_multiple_of(8) {
+        return Err(GpuError::link(
+            WHAT,
+            format!("a pair list of {} bytes", b.len()),
+        ));
+    }
+    Ok(b.as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| {
+            let at = |i: usize| Ipv4Addr::new(c[i], c[i + 1], c[i + 2], c[i + 3]);
+            (at(0), at(4))
+        })
+        .collect())
 }
 
 /// The flow label the manifest at `path` names for relayed packets, or
@@ -141,9 +229,14 @@ fn mark_in(text: &str) -> Result<Option<u32>, String> {
         .strip_prefix(':')
         .map(str::trim_start)
         .ok_or_else(|| format!("{KEY} is not a member"))?;
-    let digits = &value[..value
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(value.len())];
+    let (digits, rest) = value.split_at(
+        value
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(value.len()),
+    );
+    if !rest.trim_start().starts_with([',', '}']) {
+        return Err(format!("{KEY} {value:.20?}: want a whole number"));
+    }
     digits
         .parse::<u32>()
         .ok()
@@ -219,7 +312,7 @@ impl Route {
 
 #[cfg(test)]
 mod tests {
-    use super::{Route, lane, mark_in};
+    use super::{Route, lane, mark_in, pair_for};
     use std::net::Ipv4Addr;
 
     /// A `/proc/net/route` line for `dest/len` via `gw` (0.0.0.0 for none).
@@ -276,14 +369,11 @@ mod tests {
         );
     }
 
-    // The deployed fabric document tags relayed packets by destination and names no label; a
-    // manifest whose relays forward by flow label names it once.
+    // A fabric whose relays tag packets by destination names no label; a manifest whose relays
+    // forward by flow label names it once.
     #[test]
     fn a_manifest_names_its_relay_label_once_or_not_at_all() {
-        assert_eq!(
-            mark_in(r#"{"schema": "sparkring-fabric/v1", "size": 4}"#),
-            Ok(None)
-        );
+        assert_eq!(mark_in(r#"{"schema": "fabric/v1", "size": 4}"#), Ok(None));
         assert_eq!(
             mark_in(r#"{"flow_label_base": 16383, "x": 1}"#),
             Ok(Some(16383))
@@ -292,8 +382,31 @@ mod tests {
             r#"{"flow_label_base": 1048576}"#,
             r#"{"flow_label_base": "16383"}"#,
             r#"{"flow_label_base": 1, "flow_label_base": 2}"#,
+            r#"{"flow_label_base": 1e3}"#,
+            r#"{"flow_label_base": 16383.5}"#,
         ] {
             assert!(mark_in(bad).is_err(), "{bad}");
         }
+    }
+
+    // Opposite ranks of a four-node ring reach each other through different relays, each from
+    // the port its own route leaves by; the pair is the lower rank's first that the higher rank
+    // carries mirrored, the same on both ends, and none when no pair matches.
+    #[test]
+    fn two_ends_take_one_address_pair() {
+        let a = |d: u8, h: u8| Ipv4Addr::new(198, 18, d, h);
+        let low = [(a(6, 2), a(4, 1)), (a(0, 1), a(2, 2))];
+        let high = [(a(2, 2), a(0, 1)), (a(4, 1), a(6, 2))];
+        // Rank 0's end and rank 2's end of one queue pair, each from its own side.
+        let ends = |low: &[_], high: &[_]| (pair_for(0, 2, low, high), pair_for(2, 0, high, low));
+        assert_eq!(
+            ends(&low, &high),
+            (Some((a(6, 2), a(4, 1))), Some((a(4, 1), a(6, 2))))
+        );
+        assert_eq!(
+            ends(&low, &high[..1]),
+            (Some((a(0, 1), a(2, 2))), Some((a(2, 2), a(0, 1))))
+        );
+        assert_eq!(ends(&low[..1], &high[..1]), (None, None));
     }
 }

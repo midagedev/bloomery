@@ -697,7 +697,7 @@ impl Link {
         let (dev, gid) = bloomery_verbs::first_roce_v2()
             .map_err(|e| GpuError::shape(what, format!("the RDMA link: {e}")))?;
         let post_cols = PostCols::default();
-        let path = PeerPath::port(dev, gid, std::net::Ipv4Addr::UNSPECIFIED.into());
+        let path = PeerPath::port(dev, gid);
         let open = |side, page: &Arc<MappedHost>| {
             RdmaEnd::new(
                 Arc::clone(page),
@@ -857,7 +857,7 @@ impl Link {
             tail,
             crossings,
             side,
-            &PeerPath::port(dev, gid, ip.into()),
+            &PeerPath::port(dev, gid),
             self.post_cols.clone(),
         )
     }
