@@ -32,6 +32,7 @@ pub mod hc_gated;
 pub mod layer;
 mod lookup;
 pub mod msa;
+pub mod mtp;
 pub mod prompt;
 pub mod qsa;
 pub mod savemap;

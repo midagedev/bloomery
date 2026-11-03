@@ -49,7 +49,7 @@
 //!
 //! Every decision of those calls — which rows wait, which walks a call runs
 //! and in which mode, the join checks, the refusals, what a park keeps — is
-//! the window's policy (`policy::Policy`), over positions, the context, token
+//! the window's policy ([`Policy`]), over positions, the context, token
 //! ids and arena kinds alone; [`MtpDraft`] runs its walks on the card, and the
 //! policy's unit tests run the same calls against a model of the body's
 //! records with no card.
@@ -87,17 +87,14 @@ use runtime::{Draft, TapNeed, Target};
 
 use crate::{Draw, Keep, Prompt, RoundWindow, Session, SessionError};
 
-/// The types a draft walk is given, owned by the card crate (`bloomery_gpu`):
-/// how a walk runs, where its hidden rows come from and the rows it walks.
-pub use bloomery_gpu::draft::{DraftHead, Feed, Hidden, WalkMode};
+/// The types a draft walk is given: which head it runs and the rows it walks
+/// are the card crate's (`bloomery_gpu`); how it runs, where its hidden rows
+/// come from and how a call joined the draft to a held sequence are the
+/// runtime's (`runtime::mtp`), which holds no card.
+pub use bloomery_gpu::draft::{DraftHead, Feed};
 use bloomery_gpu::draft::{Proposal, SlotDraft};
-
-mod policy;
-
-use policy::{Exec, Fail, Policy, Refresh, Refused, Shape, Walk};
-
-/// The window's name in its refusals.
-const WHAT: &str = "MTP window";
+use runtime::mtp::{Chain, Exec, Fail, Policy, Refresh, Refused, SKIPS, Shape, WHAT, Walk};
+pub use runtime::mtp::{Hidden, Join, Parked, WalkMode};
 
 /// A width chooser's refusal is the session's: the window's own refusal,
 /// by name.
@@ -112,6 +109,27 @@ impl From<runtime::WidthError> for SessionError {
 impl From<Refused> for SessionError {
     fn from(e: Refused) -> SessionError {
         SessionError::Refused(e.0)
+    }
+}
+
+/// A refresh's rows as a walk's feed: the card crate's [`Feed`] names the
+/// call's span rows, which the runtime's values do not know.
+trait RefreshFeed<A> {
+    /// The refresh's feed.
+    fn feed(&self) -> Feed<'_, A>;
+}
+
+impl<A: Copy> RefreshFeed<A> for Refresh<A> {
+    fn feed(&self) -> Feed<'_, A> {
+        Feed {
+            tokens: &self.tokens,
+            pos0: self.pos0,
+            hidden: Hidden::Target {
+                walk: self.walk,
+                first: self.first,
+            },
+            media: None,
+        }
     }
 }
 
@@ -397,22 +415,50 @@ struct Windows {
 /// What a draft holds of the target's sequence between two calls, kept
 /// apart while another sequence runs ([`MtpDraft::park`]) and put back with
 /// it ([`MtpDraft::unpark`]): the rows waiting for its next walk, or why it
-/// proposes nothing.
-#[derive(Clone, Debug)]
-pub struct Parked<A> {
-    next: Option<Refresh<A>>,
-    last_unit: Option<(A, usize)>,
-    skip: Option<&'static str>,
-}
+/// proposes nothing ([`Parked`], the runtime's values). The byte form and the
+/// check against a state are this crate's, over the checkpoint's bytes
+/// ([`bytes`]).
+pub trait ParkedBytes: Sized {
+    /// The arena kind the parked rows name.
+    type Arena: Copy;
 
-impl<A: Copy> Parked<A> {
     /// Its byte form ([`bytes`]), `code` naming each arena it holds rows of:
     /// the refresh waiting (u8: 0 none, 1 then its tokens as an array, its
     /// first position, u32, its arena's code, u8, and its first row, a
     /// count); the last prompt unit (u8: 0 none, 1 then its arena's code and
     /// its rows, a count); the skip, by its place in the window's reasons
     /// ([`bytes::Put::named`]).
-    pub fn put(&self, w: &mut bytes::Put<'_>, code: impl Fn(A) -> u8) -> Result<(), bytes::Fail> {
+    fn put(
+        &self,
+        w: &mut bytes::Put<'_>,
+        code: impl Fn(Self::Arena) -> u8,
+    ) -> Result<(), bytes::Fail>;
+
+    /// What [`ParkedBytes::put`] wrote, `arena` the kind and row capacity of each
+    /// code; refused by name for an unknown code or reason, an empty refresh,
+    /// rows outside their arena, or a last unit of no rows.
+    fn take(
+        r: &mut bytes::Take<'_>,
+        arena: impl Fn(u8) -> Option<(Self::Arena, usize)>,
+    ) -> Result<Self, bytes::Fail>;
+
+    /// Refused by name unless the rows waiting can be walked on a state of
+    /// `pos` positions, before the state is put back: the refresh's ids by
+    /// `ids`, its last row the one at `pos`, and each walk's target rows (its
+    /// arena, its first row and rows, its first position) by `rows`; the last
+    /// unit read as the join's walk at `pos` reads it.
+    fn check(
+        &self,
+        pos: u32,
+        ids: impl Fn(&[u32]) -> Result<(), bytes::Fail>,
+        rows: impl Fn(Self::Arena, (usize, usize), u32) -> Result<(), bytes::Fail>,
+    ) -> Result<(), bytes::Fail>;
+}
+
+impl<A: Copy> ParkedBytes for Parked<A> {
+    type Arena = A;
+
+    fn put(&self, w: &mut bytes::Put<'_>, code: impl Fn(A) -> u8) -> Result<(), bytes::Fail> {
         match &self.next {
             None => w.one(0u8)?,
             Some(r) => {
@@ -431,13 +477,10 @@ impl<A: Copy> Parked<A> {
                 w.count(rows)?;
             }
         }
-        w.named(self.skip, &policy::SKIPS, "a parked draft's skip")
+        w.named(self.skip, &SKIPS, "a parked draft's skip")
     }
 
-    /// What [`Parked::put`] wrote, `arena` the kind and row capacity of each
-    /// code; refused by name for an unknown code or reason, an empty refresh,
-    /// rows outside their arena, or a last unit of no rows.
-    pub fn take(
+    fn take(
         r: &mut bytes::Take<'_>,
         arena: impl Fn(u8) -> Option<(A, usize)>,
     ) -> Result<Parked<A>, bytes::Fail> {
@@ -494,16 +537,11 @@ impl<A: Copy> Parked<A> {
         Ok(Parked {
             next,
             last_unit,
-            skip: r.named(&policy::SKIPS, "a parked draft's skip")?,
+            skip: r.named(&SKIPS, "a parked draft's skip")?,
         })
     }
 
-    /// Refused by name unless the rows waiting can be walked on a state of
-    /// `pos` positions, before the state is put back: the refresh's ids by
-    /// `ids`, its last row the one at `pos`, and each walk's target rows (its
-    /// arena, its first row and rows, its first position) by `rows`; the last
-    /// unit read as the join's walk at `pos` reads it.
-    pub fn check(
+    fn check(
         &self,
         pos: u32,
         ids: impl Fn(&[u32]) -> Result<(), bytes::Fail>,
@@ -528,20 +566,6 @@ impl<A: Copy> Parked<A> {
         }
         Ok(())
     }
-}
-
-/// How a prompt call that continues a held sequence joined the draft to it
-/// ([`MtpDraft::take_joined`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Join {
-    /// The call's first position.
-    pub start: u32,
-    /// The rows the draft walked before the call to hold every position
-    /// below it.
-    pub caught_up: usize,
-    /// Why the draft proposes nothing for the call's generation; `None`
-    /// when it drafts.
-    pub skipped: Option<&'static str>,
 }
 
 /// The MTP draft over a body's loaded draft layer (the module doc): the host
@@ -1096,7 +1120,7 @@ fn slot_chains<B>(
     t: &mut Session<B>,
     windows: &mut [SlotWindow<'_, B>],
     rows: &mut [Vec<u32>],
-    batch: &[(usize, policy::Chain<B::Arena>)],
+    batch: &[(usize, Chain<B::Arena>)],
 ) -> Result<Vec<usize>, SessionError>
 where
     B: MtpBody + SlotDraft<<B as MtpBody>::Arena>,
@@ -1181,7 +1205,7 @@ impl<B: MtpBody> MtpDraft<B> {
     fn run_chain(
         &mut self,
         t: &mut Session<B>,
-        c: &policy::Chain<B::Arena>,
+        c: &Chain<B::Arena>,
         out: &mut [u32],
         read_p: bool,
     ) -> Result<usize, SessionError> {
@@ -1407,9 +1431,20 @@ impl<B: MtpBody> Draft<Session<B>> for MtpDraft<B> {
 
 #[cfg(test)]
 mod tests {
-    use super::write_proposal;
+    use super::{Parked, ParkedBytes, Refresh, SKIPS, write_proposal};
     use bloomery_gpu::GpuError;
+    use bloomery_gpu::checkpoint::bytes;
     use bloomery_gpu::draft::Proposal;
+
+    /// The arena kinds of a body whose prompt runs through ubatches or
+    /// passes, its verify through the pass arena and its plain step through
+    /// the step's: the shape Qwen3.8's window has.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Ar {
+        Step = 0,
+        Pass = 1,
+        Ubatch = 2,
+    }
 
     /// A proposal fills the front of its rooms; room short of it, and
     /// probabilities asked of a readback that holds none, are refused by name.
@@ -1446,5 +1481,140 @@ mod tests {
             write_proposal(&ids_alone, &mut out, None).expect("ids alone"),
             1
         );
+    }
+
+    /// A parked draft goes to bytes and back whole, each arena by its code
+    /// and each reason the window skips for by its place: a refresh waiting
+    /// in the verify's arena, a last unit in the step's with a skip, and
+    /// nothing; unknown codes, empty refreshes and rows outside their
+    /// arena are refused by name, while rows ending at capacity pass.
+    #[test]
+    fn a_parked_draft_goes_to_bytes_and_back() {
+        let arena = |c| {
+            [Ar::Step, Ar::Pass, Ar::Ubatch]
+                .get(usize::from(c))
+                .copied()
+                .map(|a| (a, 8))
+        };
+        let put = |p: &Parked<Ar>| {
+            let mut out = Vec::new();
+            let mut w = bytes::Put::new(&mut out);
+            p.put(&mut w, |a| a as u8).unwrap();
+            w.flush().unwrap();
+            out
+        };
+        let take = |mut b: &[u8]| Parked::take(&mut bytes::Take::new(&mut b), arena);
+        let parks = [
+            Parked {
+                next: Some(Refresh {
+                    tokens: vec![4, 5, 0],
+                    pos0: 9,
+                    walk: Ar::Pass,
+                    first: 1,
+                }),
+                last_unit: None,
+                skip: None,
+            },
+            Parked {
+                next: None,
+                last_unit: Some((Ar::Step, 1)),
+                skip: Some(SKIPS[3]),
+            },
+            Parked {
+                next: None,
+                last_unit: None,
+                skip: None,
+            },
+        ];
+        for p in &parks {
+            let back = take(&put(p)).unwrap();
+            assert_eq!(format!("{back:?}"), format!("{p:?}"));
+        }
+        let mut p = parks[0].clone();
+        p.next.as_mut().unwrap().first = 5;
+        take(&put(&p)).expect("a refresh ending at capacity");
+        for first in [6, usize::MAX] {
+            p.next.as_mut().unwrap().first = first;
+            let why = take(&put(&p)).unwrap_err().to_string();
+            assert!(why.contains("refresh outside its arena"), "{why}");
+        }
+        p.next.as_mut().unwrap().tokens.clear();
+        p.next.as_mut().unwrap().first = 0;
+        let why = take(&put(&p)).unwrap_err().to_string();
+        assert!(why.contains("refresh outside its arena"), "{why}");
+        let mut p = parks[1].clone();
+        p.last_unit = Some((Ar::Step, 8));
+        take(&put(&p)).expect("a last unit filling its arena");
+        p.last_unit = Some((Ar::Step, 9));
+        let why = take(&put(&p)).unwrap_err().to_string();
+        assert!(why.contains("last unit past its arena"), "{why}");
+        let mut b = put(&parks[1]);
+        assert_eq!(
+            b.last(),
+            Some(&4),
+            "the code saved files hold for PROMPT_ARENA"
+        );
+        *b.last_mut().unwrap() = SKIPS.len() as u8 + 1;
+        let why = take(&b).unwrap_err().to_string();
+        assert!(why.contains("a parked draft's skip of code 5"), "{why}");
+        b = put(&parks[0]);
+        b[1 + 8 + 3 * 4 + 4] = 3;
+        let why = take(&b).unwrap_err().to_string();
+        assert!(why.contains("a parked draft's arena of code 3"), "{why}");
+        b = put(&parks[1]);
+        b[3..11].fill(0);
+        let why = take(&b).unwrap_err().to_string();
+        assert!(
+            why.contains("a parked draft's last unit of no rows"),
+            "{why}"
+        );
+    }
+
+    /// A parked draft is checked against the state it goes back on before
+    /// the put back: the refresh's ids and rows as its walk reads them, its
+    /// last row the state's next position, and a last unit's last row as the
+    /// join's walk at that position reads it; either check's refusal is the
+    /// check's.
+    #[test]
+    fn a_parked_draft_is_checked_against_its_state() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let ids = |ts: &[u32]| -> Result<(), bytes::Fail> {
+            seen.borrow_mut().push(format!("ids {ts:?}"));
+            Ok(())
+        };
+        let rows = |walk: Ar, (first, m): (usize, usize), pos0: u32| -> Result<(), bytes::Fail> {
+            seen.borrow_mut()
+                .push(format!("{walk:?} {first} {m} {pos0}"));
+            Ok(())
+        };
+        let mut p = Parked {
+            next: Some(Refresh {
+                tokens: vec![4, 5, 0],
+                pos0: 9,
+                walk: Ar::Pass,
+                first: 1,
+            }),
+            last_unit: None,
+            skip: None,
+        };
+        p.check(11, ids, rows).unwrap();
+        assert_eq!(*seen.borrow(), ["ids [4, 5, 0]", "Pass 1 3 9"]);
+        for pos in [10, 12] {
+            let why = p.check(pos, ids, rows).unwrap_err().to_string();
+            assert!(why.contains("refresh of 3 rows from position 9"), "{why}");
+        }
+        let why = p
+            .check(11, |_| Err(bytes::refused("an id")), rows)
+            .unwrap_err();
+        assert!(why.to_string().contains("an id"), "{why}");
+        let why = p
+            .check(11, ids, |_, _, _| Err(bytes::refused("a row")))
+            .unwrap_err();
+        assert!(why.to_string().contains("a row"), "{why}");
+        p.next = None;
+        p.last_unit = Some((Ar::Pass, 4));
+        seen.borrow_mut().clear();
+        p.check(7, ids, rows).unwrap();
+        assert_eq!(*seen.borrow(), ["Pass 3 1 7"]);
     }
 }
