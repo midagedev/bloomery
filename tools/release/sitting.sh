@@ -33,11 +33,17 @@
 # round's other cells anyway, and round 2 then runs the cells whose round 1 was green and names the others not run: a red
 # cell costs its own two runs, which a --resume re-runs.
 #
-# Fold. --fold depths (the default) gives depth-serve DEPTH_SERVE_FOLD=depths: a cell's round has one server for all its depths
-# (the first request of a server is a fresh server's; each later one ends ` [shared]` in its ROW and the means print a fold audit
-# of shared against first), so a cell loads twice, not once a depth and round. --fold off is one fresh server a depth and a
-# round. The fold is part of the cell (a cell line ends fold=<mode>, and a --resume of another fold is refused), and the
-# verdict's header names it. A server's round 2 is always its own: round 1's carries the checks.
+# Fold. --fold off (the default) is one fresh server a depth and a round, the form the release's headline rows are read in.
+# --fold depths gives depth-serve DEPTH_SERVE_FOLD=depths: a cell's round has one server for all its depths (the first request
+# of a server is a fresh server's; each later one ends ` [shared]` in its ROW and the means print a fold audit of shared against
+# first), so a cell loads twice, not once a depth and round. It is for iteration sittings: a shared row is a warm server's, and a
+# fresh server's first request can read slower than it. The fold is part of the cell (a cell line ends fold=<mode>, and a --resume
+# of another fold is refused), and the verdict's header names it. A server's round 2 is always its own: round 1's carries the checks.
+# The audit lives over the two rounds, not in a depth-serve call: a call is one round, so the depth that is second on its server
+# has no first row in the call's own tables. Round 2 rotates the arms by one place, which makes each of a cell's two depths the
+# first request of one round and a shared one of the other; fold_audit pairs them over both rounds, prints the pairs on the
+# console after the last round and in the verdict, and names every depth that has none (a round not run, a red run, a [cold] row).
+# A folded cell therefore has at most two depths (a third would be first in neither round); a cell of more takes fold=off.
 #
 # Red. A cell's run is red when its depth-serve call exits other than 0, prints fewer ROW lines than the cell has
 # arms, tags a row [cpu-busy] (a co-tenant voided it), or, with checks, has no HOOK line of rc 0 and a SESSION line, or
@@ -169,6 +175,7 @@ US = "\037"
 HEADER = ["file/profile", "place", "cards", "ctx", "D", "checks"]
 OPTIONAL = ["load_s", "pp", "tg", "fold"]
 PLACE_RANK = {"bp": 0, "a": 1, "-": 2}
+SITTING_ROUNDS = 2
 LONG_TOKENS = 5855
 CHAT_TOKENS = 128
 
@@ -231,6 +238,12 @@ for line, text in rows[1:]:
     load_s, pp, tg, fold = opt
     if fold not in ("", "off", "depths"):
         fail(line, f"fold is off or depths (empty: the sitting's --fold), got '{fold}'")
+    # A folded depth is first on its server only in a round the rotation gives it (round r puts depth (r - 1) mod n first),
+    # so the audit's first-request row of every depth needs a round each.
+    if (fold or default_fold) == "depths" and len(dl) > SITTING_ROUNDS:
+        fail(line, f"fold=depths with {len(dl)} depths ({deps}): the sitting runs {SITTING_ROUNDS} rounds, so only {SITTING_ROUNDS} depths "
+                   f"are ever the first request of a folded server and the fold audit has no first row for the rest; "
+                   f"give this cell fold=off or {SITTING_ROUNDS} depths")
     if load_s:
         positive(load_s, "load_s", line)
     if pp:
@@ -313,7 +326,7 @@ usage() {
 
 # ---- the run ---------------------------------------------------------------------------------------------------------
 
-STAGE='' CELLS='' TARBALL='' VERSION='' TREE='' OUT='' OWNER='' KEEP=0 DRY=0 FOLD=depths
+STAGE='' CELLS='' TARBALL='' VERSION='' TREE='' OUT='' OWNER='' KEEP=0 DRY=0 FOLD=off
 WORK='' HOLD_FILE='' FINISHED='' RESULT=red REASON='the sitting ended before its last run' STARTED=''
 BIN='' BIN_SHA='' BIN_VERSION='' TB_SHA='' TB_MEMBER='' TB_MEMBER_SHA='' GPU_3090='' CARDS_ERROR='' DS='' CHECKS_RUN='' CHECKS_PY=''
 CELLREC=() REDS=() NOTRUN=()
@@ -749,13 +762,27 @@ write_blocks() {
   done
 }
 
-# fold_audit: the fold's own term over the whole sitting. A row ending [shared] followed another request on its server; for each
-# cell and depth with both kinds of warm row ([cold] rows out) it is set against the first request's, in percent of the first, and
-# the pairs are pooled (the mean and its 95 % interval over pairs: card.py's t table, n - 1 degrees of freedom). One pair has no
-# spread, but a sitting has a pair for every depth of every folded cell, and the cells are independent loads. Prints nothing when
-# no row of the sitting is shared.
+# fold_cells: the folded cells with their depths, `idx=D,D` words, for fold_audit.
+fold_cells() {
+  local rec out=''
+  for rec in "${CELLREC[@]}"; do
+    cell_fields "$rec"
+    [ "$CF_FOLD" != depths ] || out+="${out:+ }$CF_IDX=$CF_DEPS"
+  done
+  echo "$out"
+}
+
+# fold_audit: the fold's own term over the whole sitting, which is where a first-request row and a shared one of a depth meet:
+# a depth-serve call is one round, so in its own tables the depth that is second on the server has no first row. A row ending
+# [shared] followed another request on its server; for each depth of each folded cell with both kinds of warm row ([cold] rows
+# out) it is set against the first request's, in percent of the first, and the pairs are pooled (the mean and its 95 % interval
+# over pairs: card.py's t table, n - 1 degrees of freedom). One pair has no spread, but a sitting has a pair for every depth of
+# every folded cell, and the cells are independent loads. A depth with no pair is named with the rows it has: a round that was not
+# run or ended red, a [cold] row (the cold rule's, not the fold's). Prints nothing when no folded cell has a second depth.
 fold_audit() {
-  python3 -I - "$HERE/card.py" "$WORK" << 'PY'
+  local -a cellw
+  read -r -a cellw <<< "$(fold_cells)"
+  python3 -I - "$HERE/card.py" "$WORK" ${cellw[@]+"${cellw[@]}"} << 'PY'
 import glob
 import importlib.util
 import math
@@ -767,28 +794,43 @@ spec = importlib.util.spec_from_file_location('card', sys.argv[1])
 card = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(card)
 ROW = re.compile(r'^ROW r\d+ \S+ D=(\d+) \| tg_tok/s (\S+) \| pp_tok/s (\S+) \| load_s \d+ \| majflt \d+(.*)$')
+folded = {}
+for word in sys.argv[3:]:
+    idx, deps = word.split('=')
+    if len(deps.split(',')) > 1:
+        folded[int(idx)] = sorted(int(d) for d in deps.split(','))
+if not folded:
+    sys.exit(0)
 rows = {}
 for path in sorted(glob.glob(sys.argv[2] + '/block-r*-c*.txt')):
     idx = int(re.search(r'-c(\d+)\.txt$', path).group(1))
+    if idx not in folded:
+        continue
     for line in open(path, errors='replace'):
         m = ROW.match(line.rstrip('\n'))
-        if not m or '[cold]' in m.group(4):
+        if not m:
             continue
         kind = 'shared' if '[shared]' in m.group(4) else 'first'
-        rows.setdefault((idx, int(m.group(1))), {'first': [], 'shared': []})[kind].append((float(m.group(2)), float(m.group(3))))
-if not any(d['shared'] for d in rows.values()):
-    sys.exit(0)
+        d = rows.setdefault((idx, int(m.group(1))), {'first': [], 'shared': [], 'first_cold': 0, 'shared_cold': 0})
+        if '[cold]' in m.group(4):
+            d[kind + '_cold'] += 1
+        else:
+            d[kind].append((float(m.group(2)), float(m.group(3))))
 print('== fold audit over the sitting: a [shared] row followed another request on its server; per cell and depth, shared against first, % of first, [cold] rows out')
 pairs = []
-for (idx, dep), d in sorted(rows.items()):
-    if not d['shared']:
-        continue
-    if not d['first']:
-        print(f'fold cell {idx} D={dep} | no pair: every warm row of the arm is [shared]')
-        continue
-    pct = [100 * (statistics.mean(x[k] for x in d['shared']) / statistics.mean(x[k] for x in d['first']) - 1) for k in (0, 1)]
-    pairs.append(pct)
-    print(f'fold cell {idx} D={dep} | tg {pct[0]:+.2f} % | pp {pct[1]:+.2f} %')
+for idx in sorted(folded):
+    for dep in folded[idx]:
+        d = rows.get((idx, dep), {'first': [], 'shared': [], 'first_cold': 0, 'shared_cold': 0})
+        if not d['first'] or not d['shared']:
+            if not (d['first'] or d['shared'] or d['first_cold'] or d['shared_cold']):
+                print(f'fold cell {idx} D={dep} | no pair: no row of this depth (no run of the cell printed one)')
+            else:
+                print(f"fold cell {idx} D={dep} | no pair: first rows {len(d['first'])} warm + {d['first_cold']} [cold], "
+                      f"shared rows {len(d['shared'])} warm + {d['shared_cold']} [cold]")
+            continue
+        pct = [100 * (statistics.mean(x[k] for x in d['shared']) / statistics.mean(x[k] for x in d['first']) - 1) for k in (0, 1)]
+        pairs.append(pct)
+        print(f'fold cell {idx} D={dep} | tg {pct[0]:+.2f} % | pp {pct[1]:+.2f} %')
 if len(pairs) < 2:
     print(f'fold pooled over {len(pairs)} pair(s): no interval')
     sys.exit(0)
@@ -855,6 +897,7 @@ write_verdict() {
       bash "$REAL_DS" --summary "$rows" 2>&1 || echo "(depth-serve.sh --summary exited $?)"
     done
     audit=$(fold_audit 2>&1) || audit="(the fold audit exited $?: $audit)"
+    FOLD_AUDIT=$audit
     if [ -n "$audit" ]; then
       echo
       echo "$audit"
@@ -1049,7 +1092,7 @@ order_records() {
 
 # run_round <round> <record>...: the cells in the order given. A red cell ends the sitting there unless --keep-going;
 # what is left is named in NOTRUN. ROUND_RED is 1 when any cell of the round was red.
-STOPPED='' ROUND_RED=0
+STOPPED='' ROUND_RED=0 FOLD_AUDIT=''
 run_round() {
   local r=$1 rec pos=0 total
   shift
@@ -1276,6 +1319,12 @@ main() {
     RESULT=red REASON=$(printf '%s; ' ${REDS[@]+"${REDS[@]}"})
   fi
   write_verdict
+  # The audit is the fold's evidence and its pairs span the two rounds, so the console of the sitting carries it as well as the
+  # verdict: each depth-serve call above prints only its own round's tables.
+  if [ -n "$FOLD_AUDIT" ]; then
+    echo
+    echo "$FOLD_AUDIT"
+  fi
   echo
   echo "sitting: result=$RESULT stage=$STAGE cells=$total reds=${#REDS[@]}"
   for rec in ${REDS[@]+"${REDS[@]}"}; do echo "sitting: red: $rec"; done
@@ -1295,8 +1344,8 @@ st_stubs() {
 #!/usr/bin/env bash
 # The self-test's depth-serve.sh: what it was given goes to $STUB_CALLS, and it prints a call's lines (the hook's before
 # the last arm's row, one ROW an arm). The profile's name picks a fault: red* fails, slow* waits for $STUB_RELEASE, drift*
-# prints another context on its second call, busy* tags a row, short* prints one row, nohook* never runs the hook, flaky* is red on
-# its first call only. Under DEPTH_SERVE_FOLD=depths every row after the first ends [shared] and reads 19 tok/s against 20. Each call line names the box hold, the GPU hold (with the cards it names) and the baseline it was given.
+# prints another context on its second call, busy* tags a row, cold* tags the first request of a server [cold], short* prints one row,
+# nohook* never runs the hook, flaky* is red on its first call only. Under DEPTH_SERVE_FOLD=depths every row after the first ends [shared] and reads 19 tok/s against 20. Each call line names the box hold, the GPU hold (with the cards it names) and the baseline it was given.
 set -u
 prof=$BLOOMERY_MODEL
 n=$(cat "$STUB_COUNT.$prof" 2> /dev/null || echo 0)
@@ -1339,6 +1388,7 @@ for arm in "$@"; do
   tag=
   case $prof in
     busy*) [ "$k" != 1 ] || tag=' [cpu-busy]' ;;
+    cold*) [ "$k" != 1 ] || tag=' [cold]' ;;
     short*) [ "$k" = 1 ] || continue ;;
   esac
   if [ "$k" = "$#" ] && [ -n "${DEPTH_SERVE_AFTER:-}" ] && [ "${prof#nohook}" = "$prof" ]; then
@@ -1822,11 +1872,18 @@ case_dry() {
   want_out 'round 1 (family-major'
   want_out 'round 2 (the reverse order'
   want_out '[plan]   1. cell 1: pa=/m/a.gguf place=a cards=3090'
-  want_out 'predicted wall = 399 s (~7 min)'
+  # cell 1 (4 servers a depth and a round): 4 x (5 + 10) + 2 x (512/100 + 127/20 + 4096/100 + 127/20) = 60 + 117.56; cell 2 (2 servers):
+  # 2 x (5 + 20) + 2 x (512/50 + 127/10) + 5855/50 + 3 x 128/10 = 50 + 45.88 + 155.5; the sum 428.94
+  want_out 'predicted wall = 429 s (~7 min)'
   want_out '[dry] no hold up, no call, no verdict'
   no_calls
   no_hold
   [ ! -e "$C/v.sitting" ] || fault "a dry run wrote a verdict"
+  # --fold depths: cell 1 loads twice (2 x (5 + 10) = 30 + 117.56), cell 2 as before: 147.56 + 251.38 = 398.94
+  # shellcheck disable=SC2046
+  st_run $(portable) --dry-run --fold depths
+  want_rc 0
+  want_out 'predicted wall = 399 s (~7 min)'
   { echo "$HDR"; echo 'pa|a|3090||512|--client toktape'; } | st_cells
   # shellcheck disable=SC2046
   st_run $(portable) --dry-run
@@ -1878,9 +1935,9 @@ case_env() {
   # shellcheck disable=SC2046
   st_run $(portable)
   want_rc 0
-  calls_seq '1s/ arms=.*//p' 'call profile=pa ref=/m/a.gguf refprof=unset place=unset ctx=unset cards=a6000+3090 gpu=unset tarball='"$C"'/tb/'"$TBN"'.tar.gz after=unset rounds=1 userplan=unset hold=up gpuhold=up:3090,a6000 membase=GPU-bbbb=100,GPU-aaaa=100 fold=depths'
-  calls_seq '2s/ arms=.*//p' 'call profile=pb ref=unset refprof=unset place=a ctx=4300 cards=unset gpu=GPU-bbbb tarball='"$C"'/tb/'"$TBN"'.tar.gz after=unset rounds=1 userplan=note hold=up gpuhold=up:3090,a6000 membase=GPU-bbbb=100,GPU-aaaa=100 fold=depths'
-  calls_seq '3s/ arms=.*//p' 'call profile=pc ref=unset refprof=unset place=a ctx=unset cards=unset gpu=unset tarball='"$C"'/tb/'"$TBN"'.tar.gz after=unset rounds=1 userplan=note hold=up gpuhold=up:3090,a6000 membase=GPU-bbbb=100,GPU-aaaa=100 fold=depths'
+  calls_seq '1s/ arms=.*//p' 'call profile=pa ref=/m/a.gguf refprof=unset place=unset ctx=unset cards=a6000+3090 gpu=unset tarball='"$C"'/tb/'"$TBN"'.tar.gz after=unset rounds=1 userplan=unset hold=up gpuhold=up:3090,a6000 membase=GPU-bbbb=100,GPU-aaaa=100 fold=off'
+  calls_seq '2s/ arms=.*//p' 'call profile=pb ref=unset refprof=unset place=a ctx=4300 cards=unset gpu=GPU-bbbb tarball='"$C"'/tb/'"$TBN"'.tar.gz after=unset rounds=1 userplan=note hold=up gpuhold=up:3090,a6000 membase=GPU-bbbb=100,GPU-aaaa=100 fold=off'
+  calls_seq '3s/ arms=.*//p' 'call profile=pc ref=unset refprof=unset place=a ctx=unset cards=unset gpu=unset tarball='"$C"'/tb/'"$TBN"'.tar.gz after=unset rounds=1 userplan=note hold=up gpuhold=up:3090,a6000 membase=GPU-bbbb=100,GPU-aaaa=100 fold=off'
   [ -z "$WHY" ]
 }
 
@@ -1904,7 +1961,7 @@ case_fold() {
   local hdr='file/profile|place|cards|ctx|D|checks|load_s|pp|tg|fold'
   { echo "$hdr"; echo 'fa|bp|both||512,4096|-||||'; echo 'fb|a|3090||512,4096|-||||off'; echo 'fc|a|3090||512,4096|-||||depths'; } | st_cells
   # shellcheck disable=SC2046
-  st_run $(portable)
+  st_run $(portable) --fold depths
   want_rc 0
   calls_seq 's/.* fold=\([^ ]*\) .*/\1/p' 'depths off depths depths off depths'
   grep -qx 'fold=depths' "$C/v.sitting" || fault "the verdict's header lacks fold=depths"
@@ -1923,9 +1980,9 @@ case_fold() {
   want_v 'cell 3: fc place=a cards=3090 ctx=unset D=512,4096 checks=- fold=depths'
   want_v 'fold pooled over 2 pairs'
   grep -q 'fold cell 1 ' "$C/v.sitting" && fault "a cell under --fold off is in the fold audit"
-  # the plan: 8 loads with the default fold (fa 2, fb 4, fc 2), 12 with every fold off, and 10 under --fold off (fc's own stays)
+  # the plan: 8 loads under --fold depths (fa 2, fb 4, fc 2), 12 with every fold off, and 10 under --fold off (fc's own stays)
   # shellcheck disable=SC2046
-  st_run $(portable) --dry-run
+  st_run $(portable) --dry-run --fold depths
   want_rc 0
   want_out '[plan] loads: 8 servers (a cell with fold=depths loads one a round for all its depths; 12 with every cell'"'"'s fold off)'
   # shellcheck disable=SC2046
@@ -1940,6 +1997,81 @@ case_fold() {
   st_run $(portable)
   want_rc 64
   want_out "fold is off or depths (empty: the sitting's --fold), got 'maybe'"
+  # a third depth would be the first request of neither round, so a folded cell has two at most: refused by name, whether the
+  # cell says fold=depths or takes the sitting's --fold depths; fold=off keeps any number of depths, and so does the default
+  { echo "$hdr"; echo 'fa|bp|both||512,2048,4096|-||||depths'; } | st_cells
+  # shellcheck disable=SC2046
+  st_run $(portable) --dry-run
+  want_rc 64
+  want_out "fold=depths with 3 depths (512,2048,4096): the sitting runs 2 rounds, so only 2 depths are ever the first request of a folded server"
+  { echo "$hdr"; echo 'fa|bp|both||512,2048,4096|-||||'; } | st_cells
+  # shellcheck disable=SC2046
+  st_run $(portable) --dry-run --fold depths
+  want_rc 64
+  want_out "fold=depths with 3 depths"
+  # shellcheck disable=SC2046
+  st_run $(portable) --dry-run --fold off
+  want_rc 0
+  # shellcheck disable=SC2046
+  st_run $(portable) --dry-run
+  want_rc 0
+  { echo "$hdr"; echo 'fa|bp|both||512,2048,4096|-||||off'; } | st_cells
+  # shellcheck disable=SC2046
+  st_run $(portable) --dry-run
+  want_rc 0
+  [ -z "$WHY" ]
+}
+
+# The default is no fold: the release's headline rows are fresh servers' first requests. No --fold flag gives every cell without
+# a fold column of its own fold=off in the call and in the verdict, and a cell's own fold=depths still wins.
+case_folddefault() {
+  st_case "folddefault$SUF"
+  local hdr='file/profile|place|cards|ctx|D|checks|load_s|pp|tg|fold'
+  { echo "$hdr"; echo 'fa|bp|both||512,4096|-||||'; echo 'fb|a|3090||512,4096|-||||'; echo 'fc|a|3090||512,4096|-||||depths'; } | st_cells
+  # shellcheck disable=SC2046
+  st_run $(portable)
+  want_rc 0
+  calls_seq 's/.* fold=\([^ ]*\) .*/\1/p' 'off off depths depths off off'
+  grep -qx 'fold=off' "$C/v.sitting" || fault "the verdict's header lacks fold=off"
+  want_v 'cell 1: fa place=bp cards=both ctx=unset D=512,4096 checks=- fold=off'
+  want_v 'cell 3: fc place=a cards=3090 ctx=unset D=512,4096 checks=- fold=depths'
+  want_v 'fold pooled over 2 pairs'
+  grep -q 'fold cell 1 ' "$C/v.sitting" && fault "a cell on the default fold is in the fold audit"
+  # shellcheck disable=SC2046
+  st_run $(portable) --dry-run
+  want_out '[plan] loads: 10 servers'
+  [ -z "$WHY" ]
+}
+
+# The fold audit in the shape of the 0.3.13 validation sitting: two depths a cell, one round a depth-serve call, two sitting
+# rounds. A call's own tables hold no first row of the depth that is second on its server, and the sitting printed nothing else;
+# round 2 rotates the arms, so each depth is first in one round and shared in the other, and the audit pairs them over the rounds.
+# The pairs are on the console as well as in the verdict. A depth without a pair is named with the rows it has: fa pairs both
+# depths; cold1's first requests are [cold]; fb is red in round 1 (a check FAIL, its rows printed) so its round 2 did not run; red1
+# is red before any row; fc has one depth, so nothing of it was shared.
+case_foldshape() {
+  st_case "foldshape$SUF"
+  { echo "$HDR"; echo 'fa|bp|both||512,4096|-'; echo 'cold1|a|3090||512,4096|-'; echo 'fb|a|3090||512,4096|--stub-failline'; echo 'red1|a|3090||512,4096|-'; echo 'fc|bp|both||512|-'; } | st_cells
+  # shellcheck disable=SC2046
+  st_run $(portable) --fold depths --keep-going
+  want_rc 1
+  calls_seq '1s/.* arms=//p' 'stubtree@portable:512 stubtree@portable:4096'
+  calls_seq '$s/.* arms=//p' 'stubtree@portable:4096 stubtree@portable:512'
+  local line
+  for line in '== fold audit over the sitting' \
+    'fold cell 1 D=512 | tg -5.00 % | pp +0.00 %' 'fold cell 1 D=4096 | tg -5.00 % | pp +0.00 %' \
+    'fold cell 2 D=512 | no pair: first rows 0 warm + 1 [cold], shared rows 1 warm + 0 [cold]' \
+    'fold cell 2 D=4096 | no pair: first rows 0 warm + 1 [cold], shared rows 1 warm + 0 [cold]' \
+    'fold cell 3 D=512 | no pair: first rows 1 warm + 0 [cold], shared rows 0 warm + 0 [cold]' \
+    'fold cell 3 D=4096 | no pair: first rows 0 warm + 0 [cold], shared rows 1 warm + 0 [cold]' \
+    'fold cell 4 D=512 | no pair: no row of this depth (no run of the cell printed one)' \
+    'fold cell 4 D=4096 | no pair: no row of this depth (no run of the cell printed one)' \
+    'fold pooled over 2 pairs | tg -5.00 % ± 0.00 % (sd 0.00 %) [clears 0] | pp +0.00 % ± 0.00 % (sd 0.00 %) [holds 0]'; do
+    want_out "$line"
+    want_v "$line"
+  done
+  grep -q 'fold cell 5 ' "$C/out" "$C/v.sitting" && fault "a folded cell of one depth is in the fold audit"
+  want_before '== fold audit over the sitting' 'sitting: result='
   [ -z "$WHY" ]
 }
 
@@ -2306,7 +2438,7 @@ case_resumeguard() {
   no_calls
   { echo "$HDR"; echo 'ok1|bp|both||512|-'; echo 'red1|bp|both||512|-'; } | st_cells
   # shellcheck disable=SC2046
-  st_run $(portable) --resume "$C/first.sitting" --fold off
+  st_run $(portable) --resume "$C/first.sitting" --fold depths
   want_rc 64
   want_out "and the --fold it was run with"
   no_calls
@@ -2466,7 +2598,7 @@ selftest() {
   trap st_cleanup EXIT
   trap 'exit 143' TERM
   trap 'exit 130' INT
-  for cs in order redstop keepgoing verdict tree noportable mismatch checks hold quiet dry cellserr env drift fold busy rows dryenv relpaths archive \
+  for cs in order redstop keepgoing verdict tree noportable mismatch checks hold quiet dry cellserr env drift fold busy rows dryenv relpaths archive folddefault foldshape \
     gpuhold baseline cardlook resume resumeguard resumedrift resumedry; do
     JOBS_KIND+=(case) JOBS_ARG+=("$cs")
   done
@@ -2484,6 +2616,12 @@ selftest() {
   mutant fold-default fold 'fold=fold or default_fold))' 'fold=fold or "off"))'
   mutant fold-audit-called fold '    audit=$(fold_audit 2>&1) || audit="(the fold audit exited $?: $audit)"' '    audit='
   mutant fold-audit-math fold "pct = [100 * (statistics.mean(x[k] for x in d['shared']) / statistics.mean(x[k] for x in d['first']) - 1) for k in (0, 1)]" "pct = [100 * (statistics.mean(x[k] for x in d['first']) / statistics.mean(x[k] for x in d['shared']) - 1) for k in (0, 1)]"
+  mutant fold-audit-console foldshape '  if [ -n "$FOLD_AUDIT" ]; then' '  if false; then'
+  mutant fold-audit-no-pair foldshape "        if not d['first'] or not d['shared']:" "        if False:"
+  mutant fold-audit-folded-cells fold '    [ "$CF_FOLD" != depths ] || out+=' '    out+='
+  mutant fold-audit-one-depth foldshape "    if len(deps.split(',')) > 1:" '    if True:'
+  mutant fold-depths-cap fold 'and len(dl) > SITTING_ROUNDS:' 'and False:'
+  mutant fold-default-off folddefault 'KEEP=0 DRY=0 FOLD=off' 'KEEP=0 DRY=0 FOLD=depths'
   mutant fold-header fold '    echo "fold=$FOLD"' ':'
   mutant fold-flag fold '          off | depths) FOLD=$2 ;;' '          off | depths | *) FOLD=$2 ;;'
   mutant fold-column fold '    if fold not in ("", "off", "depths"):' '    if False:'

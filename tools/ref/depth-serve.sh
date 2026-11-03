@@ -47,7 +47,11 @@
 #      readings (room, plan_room, card_free, read) — must equal those of the first load of the arm's group (the
 #      arms of one label, whatever their D), else the arm fails `plan drifted`. A first load's plan must also be
 #      the one `<binary> --plan` prints in the user's environment (no CUDA_VISIBLE_DEVICES), probed under the lease
-#      before round 1: the timed key is then the user's key (DEPTH_SERVE_USER_PLAN);
+#      before round 1: the timed key is then the user's key (DEPTH_SERVE_USER_PLAN). A whole-card load opens with no plan
+#      (its seat says so), so its log holds no plan record: its place and context are those of its `ready` event, the
+#      row ends ` [no-plan: place and ctx from the ready event]`, the key is the two of them, and a probe's are the `place
+#      unset` record and the `ctx rule=` line of its `--plan`. A log with neither a plan record nor that seat line, or that
+#      line without the event, fails by name;
 #   3. one /completion of the D ids, temperature 0, `n_predict` N, ignore_eos, cache_prompt off (lcpp-warm.sh's
 #      lcpp_srv_request: it fails on a response with no `timings`, a prompt_n other than D, a cache_n above 0 and a
 #      predicted_n other than N), the witness blocks and the major-fault count (pgmajfault) around it;
@@ -88,9 +92,11 @@
 # measured, so its ROW ends ` [shared]`, and the tables print a fold audit: per arm, the [shared] rows against the first
 # requests (mean difference with the same interval as the arm differences). Nothing is dropped from the means: they cover
 # both kinds of row, and the audit is the check that the fold may stand. The rotation puts each depth first in some rounds
-# and shared in others. A server's rows are published together after it has stopped and its card was checked; a failure
-# after the first request leaves none of that server's rows. BLOOMERY_ARM_BOUND bounds the whole server, its load, every
-# request and the hook. Default off: one fresh server a row.
+# and shared in others, in a call of at least as many rounds as the group has depths. A call of fewer (the release sitting's,
+# one round each) holds a depth that is shared in every round it has; its table says so, and the pair is in the rows of the
+# calls together (tools/release/sitting.sh's fold_audit). A server's rows are published together after it has stopped and its
+# card was checked; a failure after the first request leaves none of that server's rows. BLOOMERY_ARM_BOUND bounds the whole
+# server, its load, every request and the hook. Default off: one fresh server a row.
 #
 # Knobs (each reaches the box through BLOOMERY_BOX_ENV). None is a BLOOMERY_ name, which would have to be a row of the lever
 # registry (tools/check-levers.sh) though no binary reads it; a BLOOMERY_SERVE_ variable set in the environment is refused
@@ -144,7 +150,7 @@
 # (rc 65), ids missing or short, a DEPTH_SERVE_CTX that does not hold D + N - 1, a place or a mode that is none of
 # the words above. After the lease an arm fails (rc 1, the server stopped, its log's tail printed) on a server that
 # exits or does not answer /health within its bound, a listening line with another port or ctx (or, DEPTH_SERVE_CTX
-# unset, a context that does not hold D + N - 1), a log with no plan record, a plan that drifted from the group's
+# unset, a context that does not hold D + N - 1), a log with no plan record that is not a whole-card load's, a plan that drifted from the group's
 # first, a user-environment plan that is not the timing plan, a port or a card the last server still holds, a card whose
 # memory did not return, or a request that fails (no timings among them). Contention is the lease's and the guards' (rc 75). BLOOMERY_DRY=1 prints the plan (arms, order, commands, predicted wall) and the binaries' state, takes no
 # lease and starts nothing; the recipe builds nothing under it.
@@ -237,12 +243,13 @@ spec = importlib.util.spec_from_file_location('card', sys.argv[1])
 card = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(card)
 ROW = re.compile(r'^ROW r(\d+) (\S+) D=(\d+) \| tg_tok/s (\S+) \| pp_tok/s (\S+) \| load_s (\d+) \| majflt (\d+)(.*)$')
-arms, order = {}, []
+arms, order, rounds = {}, [], set()
 for line in open(sys.argv[2], errors='replace'):
     m = ROW.match(line.rstrip('\n'))
     if not m:
         continue
-    _, label, dep, tg, pp, load, maj, tags = m.groups()
+    rnd, label, dep, tg, pp, load, maj, tags = m.groups()
+    rounds.add(int(rnd))
     key = (label, int(dep))
     if key not in arms:
         arms[key] = []
@@ -326,7 +333,17 @@ if has_shared:
         if not late:
             continue
         if not base:
-            print(f'fold {label} D={dep} | no audit: every warm row of the arm is [shared]')
+            # The arm is first on its server only in the rounds the rotation gives it: a log of fewer rounds than the group has
+            # depths holds a depth that is second in every one (a release sitting's calls are one round each), and its pair is
+            # in the rows of the calls together.
+            firsts = [x for x in arms[(label, dep)] if '[shared]' not in x['tags']]
+            groups = len({d for (lab, d) in order if lab == label})
+            if firsts:
+                why = f'its {len(firsts)} first-request row(s) are [cold]'
+            else:
+                why = (f'no first-request row of this depth ({len(rounds)} round(s) of {groups} depths a server: a depth is first on its '
+                       "server only in the rounds the rotation gives it; pool the rows of the calls, as tools/release/sitting.sh's verdict does)")
+            print(f'fold {label} D={dep} | no audit in this log: {why}')
             continue
         parts = []
         for name in ('tg', 'pp'):
@@ -656,10 +673,22 @@ ds_fail() {
 # same ones.
 RECORDS_PY=$ROOT/tools/bloomery/records.py
 
-# ds_plan_py <records.py> <log>: the python of ds_plan_read, a function so that no here-document sits in a substitution.
+# A whole-card load opens with no plan, so it prints no plan record, and the seat says so (stderr, qwen3 seat:
+# `/props leaves the placement out: a whole-card load opens with no plan`). What it does print of its placement is its `ready`
+# event (stdout, `"place"` the word and `"ctx"` the context it listens on, crates/serve/src/event.rs), and `--plan` ends
+# before any load, so a probe's are the `place unset` record and the one `ctx rule=` line (crates/gpu-gates/src/ctx_ladder.rs).
+# The row names which of these a placement came from; a log with a plan record never reads them, a log with neither a plan
+# record nor the seat's whole-card line is a refusal, and so is a whole-card line without the event.
+WHOLE_CARD_LINE='a whole-card load opens with no plan'
+
+# ds_plan_py <records.py> <log> load|probe: the python of ds_plan_read, a function so that no here-document sits in a
+# substitution. Prints the place, the context, where they came from (`plan`, `ready event`, `place unset record and ctx line`)
+# and the key; exits 1 with an ERR line when the log names no placement.
 ds_plan_py() {
-  python3 -I - "$1" "$2" << 'PY'
+  python3 -I - "$1" "$2" "$3" "$WHOLE_CARD_LINE" << 'PY'
 import importlib.util
+import json
+import re
 import sys
 
 spec = importlib.util.spec_from_file_location('records', sys.argv[1])
@@ -667,31 +696,72 @@ records = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(records)
 READINGS = ('room', 'plan_room', 'card_free', 'read')
 lines = open(sys.argv[2], errors='replace').read().splitlines()
+mode, whole = sys.argv[3], sys.argv[4]
 for name in ('generate_ds41', 'generate_qwen3moe'):
     plans = [r for r in records.read(lines, name) if r.kind in ('plan', 'plan38') and not r.loose]
     if plans:
         r = plans[0]
         print(r.raw['place'])
         print(r.raw['ctx_max'])
+        print('plan')
         print('\t'.join('%s=%s' % (k, v) for k, v in r.raw.items() if k not in READINGS))
         sys.exit(0)
-print('ERR the log holds no plan record that tools/bloomery/records.py reads whole (kinds plan and plan38 of generate_ds41 and generate_qwen3moe)')
+
+
+def whole_card(place, ctx, source):
+    """The key of a placement no plan record states: the two words it can be held to, and that it is not a plan's."""
+    ok = isinstance(place, str) and re.fullmatch(r'\w+', place) and isinstance(ctx, int) and not isinstance(ctx, bool) and ctx > 0
+    if not ok:
+        return False
+    print(place)
+    print(ctx)
+    print(source)
+    print('place=%s\tctx_max=%d\twhole_card=1' % (place, ctx))
+    return True
+
+
+if mode == 'load' and any(whole in line for line in lines):
+    ready = None
+    for line in lines:
+        try:
+            event = json.loads(line) if line.lstrip().startswith('{') else None
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get('event') == 'ready':
+            ready = event
+            break
+    if ready is not None and whole_card(ready.get('place'), ready.get('ctx'), 'ready event'):
+        sys.exit(0)
+    print("ERR the log says the load is whole-card ('%s') but holds no ready event naming its place and ctx (%s)"
+          % (whole, 'no ready event' if ready is None else 'the event reads place=%r ctx=%r' % (ready.get('place'), ready.get('ctx'))))
+    sys.exit(1)
+if mode == 'probe':
+    places = [r for r in records.read(lines, 'generate_qwen3moe') if r.kind == 'place_unset' and not r.loose]
+    ctxs = [m.group(1) for m in (re.match(r'ctx rule=\S+ ctx=(\d+)(?: |$)', line) for line in lines) if m]
+    if len(places) == 1 and len(ctxs) == 1 and whole_card(places[0].raw['place'], int(ctxs[0]), 'place unset record and ctx line'):
+        sys.exit(0)
+print('ERR the log holds no plan record that tools/bloomery/records.py reads whole (kinds plan and plan38 of generate_ds41 and generate_qwen3moe)'
+      + (", and no whole-card load ('%s' with a ready event)" % whole if mode == 'load' else ''))
 sys.exit(1)
 PY
 }
 
-# ds_plan_read <log>: PLAN_PLACE, PLAN_CTX (the plan's ctx_max) and PLAN_KEY (the decisions, tab-separated name=value) of
-# the log's first plan record; 1 with PLAN_WHY when the log holds none.
+# ds_plan_read <log> [probe]: PLAN_PLACE, PLAN_CTX (the plan's ctx_max, or a whole-card load's ctx), PLAN_SRC (where they came from),
+# PLAN_TAG (the row's tag for a source that is not a plan record) and PLAN_KEY (the decisions, tab-separated name=value) of the
+# log's first plan record, or of the whole-card load that opens with none (above); 1 with PLAN_WHY when the log holds neither.
 ds_plan_read() {
   local out rest
-  PLAN_PLACE='' PLAN_CTX='' PLAN_KEY='' PLAN_WHY=''
-  out=$(ds_plan_py "$RECORDS_PY" "$1" 2> /dev/null) || {
+  PLAN_PLACE='' PLAN_CTX='' PLAN_KEY='' PLAN_WHY='' PLAN_SRC='' PLAN_TAG=''
+  out=$(ds_plan_py "$RECORDS_PY" "$1" "${2:-load}" 2> /dev/null) || {
     PLAN_WHY=${out#ERR }
     [ -n "$PLAN_WHY" ] || PLAN_WHY="tools/bloomery/records.py could not read $1"
     return 1
   }
   PLAN_PLACE=${out%%$'\n'*} rest=${out#*$'\n'}
-  PLAN_CTX=${rest%%$'\n'*} PLAN_KEY=${rest#*$'\n'}
+  PLAN_CTX=${rest%%$'\n'*} rest=${rest#*$'\n'}
+  PLAN_SRC=${rest%%$'\n'*} PLAN_KEY=${rest#*$'\n'}
+  [ "$PLAN_SRC" = plan ] || PLAN_TAG=" [no-plan: place and ctx from the $PLAN_SRC]"
+  return 0
 }
 
 # ds_plan_diff <key> <key>: the fields that differ, `name old -> new`, comma-separated.
@@ -742,7 +812,7 @@ ds_user_plan_probe() {
     why=''
     if [ "$rc" != 0 ]; then
       why="--plan without CUDA_VISIBLE_DEVICES exited $rc ($out): $(tail -n 1 "$out")"
-    elif ! ds_plan_read "$out"; then
+    elif ! ds_plan_read "$out" probe; then
       why="--plan without CUDA_VISIBLE_DEVICES: $PLAN_WHY ($out)"
     fi
     if [ -n "$why" ]; then
@@ -754,7 +824,7 @@ ds_user_plan_probe() {
       exit 1
     fi
     UP_KEY[i]=$PLAN_KEY
-    echo "[user-plan] ${A_LABEL[i]}: --plan without CUDA_VISIBLE_DEVICES prints place=$PLAN_PLACE ctx_max=$PLAN_CTX (the probe took $((SECONDS - t0)) s)"
+    echo "[user-plan] ${A_LABEL[i]}: --plan without CUDA_VISIBLE_DEVICES prints place=$PLAN_PLACE ctx_max=$PLAN_CTX${PLAN_TAG:+ (no plan record: from the $PLAN_SRC)} (the probe took $((SECONDS - t0)) s)"
   done
 }
 
@@ -980,6 +1050,11 @@ ds_server_start() {
   fi
   ds_need_check "$r" "$i"
   ds_plan_read "$SRV_LOG" || ds_fail "$r" "$i" "$PLAN_WHY: the placement and the context the plan picked are not proven"
+  if [ "$PLAN_SRC" != plan ]; then
+    # The ready event's context is the one the listening line names; a pair that differs is not one load's.
+    [ "$PLAN_CTX" = "$SRV_CTX" ] || ds_fail "$r" "$i" "the $PLAN_SRC names ctx=$PLAN_CTX, the listening line ctx=$SRV_CTX"
+    echo "[plan-source] r$r $label D=$dep: the log holds no plan record (a whole-card load opens with none): place=$PLAN_PLACE ctx=$PLAN_CTX from the $PLAN_SRC"
+  fi
   ds_plan_group "$r" "$i"
 }
 
@@ -1016,7 +1091,7 @@ ds_serve_request() {
   if ! awk -v v="$tg" 'BEGIN { exit !(v > 0) }'; then
     ds_fail "$r" "$i" "timings.predicted_per_second is '$SRV_PRED_TPS', not a rate"
   fi
-  ROWS_PENDING+=("ROW r$r $row D=$dep | tg_tok/s $tg | pp_tok/s $pp | load_s $LOAD_S | majflt $maj${CPU_BUSY_TAG:-}${OTHER_BUSY_TAG:-}${COLD_TAG:-}$shared")
+  ROWS_PENDING+=("ROW r$r $row D=$dep | tg_tok/s $tg | pp_tok/s $pp | load_s $LOAD_S | majflt $maj${CPU_BUSY_TAG:-}${OTHER_BUSY_TAG:-}${COLD_TAG:-}${PLAN_TAG:-}$shared")
   if [ -n "$AFTER" ] && [ "$r" = 1 ] && [ "${A_HOOK[$i]}" = 1 ]; then ds_hook_run "$r" "$i"; fi
 }
 
@@ -1247,8 +1322,28 @@ card=Stub
 [ -n "$probe" ] && [ -z "${CUDA_VISIBLE_DEVICES:-}" ] && card=${ST_PLAN_USER_CARD:-Stub}
 exp=$(pick "${ST_EXPSEQ:-}" "$k" 1063)
 room=$((263890399232 + n * 4096))
-echo "plan place=$place card=$card ctx_max=$ctx card_experts=$exp (33857090004 B) host_experts=6233 (198524141568 B) host_shadow=0 B n_l=18..19 on 57 layers card_budget=none paged=0 arena=0 arena_slots=0 room=$room plan_room=$((room - 1000)) card_free=$((50668240896 - n * 512)) devices=[stage:$card:cuda0:50952404992] cuda_order=cuda0" >&2
+# ST_WHOLE: a whole-card load, which prints no plan record: 1 the placement rule's record, the ctx line, the seat's line and the
+# ready event; nomarker no seat's line; noready no event; nullplace an event with no place; readyctx an event whose context is
+# not the listening line's; none only the first two; bare nothing of its placement. A probe's ctx line names ST_PROBE_CTX when it is set.
+case ${ST_WHOLE:-} in
+  '') echo "plan place=$place card=$card ctx_max=$ctx card_experts=$exp (33857090004 B) host_experts=6233 (198524141568 B) host_shadow=0 B n_l=18..19 on 57 layers card_budget=none paged=0 arena=0 arena_slots=0 room=$room plan_room=$((room - 1000)) card_free=$((50668240896 - n * 512)) devices=[stage:$card:cuda0:50952404992] cuda_order=cuda0" >&2 ;;
+  bare) ;;
+  *)
+    pctx=$ctx
+    [ -z "$probe" ] || pctx=${ST_PROBE_CTX:-$ctx}
+    echo "place unset place=$place why=set" >&2
+    echo "ctx rule=fitted ctx=$pctx slots=1 total=$pctx limit=262144 (trained) from=262144 card-short need=$((pctx + 1)) room=$pctx" >&2
+    ;;
+esac
 [ -z "$probe" ] || exit 0
+case ${ST_WHOLE:-} in
+  1 | noready | nullplace | readyctx) echo "bloomery-serve-qwen3: /props leaves the placement out: a whole-card load opens with no plan" >&2 ;;
+esac
+case ${ST_WHOLE:-} in
+  1 | nomarker) echo "{\"schema\":\"bloomery.event/1\",\"event\":\"ready\",\"url\":\"http://127.0.0.1:1\",\"model\":\"m\",\"ctx\":$ctx,\"slots\":1,\"place\":\"$place\"}" ;;
+  nullplace) echo "{\"schema\":\"bloomery.event/1\",\"event\":\"ready\",\"url\":\"http://127.0.0.1:1\",\"model\":\"m\",\"ctx\":$ctx,\"slots\":1,\"place\":null}" ;;
+  readyctx) echo "{\"schema\":\"bloomery.event/1\",\"event\":\"ready\",\"url\":\"http://127.0.0.1:1\",\"model\":\"m\",\"ctx\":$((ctx + 1)),\"slots\":1,\"place\":\"$place\"}" ;;
+esac
 tps=$(pick "${ST_TPSSEQ:-}" "$n" "$TPS")
 exec env STUB_SRV_TPS=$tps STUB_SRV_LISTEN_CTX=argv $EXTRA python3 "$STUB" "$@" $ctxarg
 WRAP
@@ -1742,6 +1837,67 @@ time.sleep(60)  # port-holder' "$ST_PORT" "$C/listener-pid" &
   st_absent user-plan-off-no-probe "[user-plan]"
   if compgen -G "$C/envprobe.*" > /dev/null; then bad user-plan-off-starts-no-probe "a probe ran"; else ok user-plan-off-starts-no-probe; fi
 
+  # --- a whole-card load opens with no plan (0.3.13's sitting: nanbeige43 a and the 27B NVFP4 file with --place unset were red
+  # on a healthy server for "no plan record"). Its place and context are its ready event's, the row says so, and a probe's are
+  # the `place unset` record and the ctx line; a log that prints neither, or the seat's line without the event, is a refusal.
+  st_case wholecard
+  st_tree wc 20
+  ST_ENV=(BLOOMERY_AB_ROUNDS=2 ST_WHOLE=1)
+  st_run wc:6
+  st_check whole-card-row-from-the-ready-event 0 "[plan-source] r1 wc D=6: the log holds no plan record (a whole-card load opens with none): place=a ctx=16384 from the ready event" \
+    "ROW r1 wc/place=a/ctx=16384 D=6 | tg_tok/s 20.00 | pp_tok/s " "[no-plan: place and ctx from the ready event]"
+  st_check whole-card-user-plan-compared 0 "[user-plan] wc: --plan without CUDA_VISIBLE_DEVICES prints place=a ctx_max=16384 (no plan record: from the place unset record and ctx line)" \
+    "[user-plan] wc: the user's environment prints the plan the timing environment loads"
+  st_absent whole-card-no-plan-refusal "no plan record that"
+  [ "$(grep -c '^ROW r[12] wc/place=a/ctx=16384 D=6 .*\[no-plan: place and ctx from the ready event\]$' "$C/out")" = 2 ] && ok whole-card-every-row-names-its-source || bad whole-card-every-row-names-its-source "not both rows carry the tag"
+  # A load that prints a plan record keeps it: no tag, no source line.
+  st_case wholecard-plan
+  st_tree wc 20
+  ST_ENV=(BLOOMERY_AB_ROUNDS=1)
+  st_run wc:6
+  st_absent whole-card-plan-record-wins "[no-plan:" "[plan-source]"
+  # The user's environment sees another context than the timing one (a card the timing environment does not see): named.
+  st_case wholecard-drift
+  st_tree wc 20
+  ST_ENV=(BLOOMERY_AB_ROUNDS=1 ST_WHOLE=1 ST_PROBE_CTX=262144)
+  st_run wc:6
+  st_check refuse-whole-card-user-plan-differs 1 "FAIL r1 wc D=6: the plan the user's environment prints (no CUDA_VISIBLE_DEVICES) is not the plan the timing environment loads: ctx_max 262144 -> 16384"
+  st_case wholecard-ctx
+  st_tree wc 20
+  ST_ENV=(BLOOMERY_AB_ROUNDS=1 ST_WHOLE=readyctx DEPTH_SERVE_USER_PLAN=off)
+  st_run wc:6
+  st_check refuse-ready-event-ctx-is-not-the-listening-line 1 "FAIL r1 wc D=6: the ready event names ctx=16385, the listening line ctx=16384"
+  # Neither a plan record nor the seat's line: the refusal, naming the whole-card way it did not take.
+  st_case wholecard-none
+  st_tree wc 20
+  ST_ENV=(BLOOMERY_AB_ROUNDS=1 ST_WHOLE=none DEPTH_SERVE_USER_PLAN=off)
+  st_run wc:6
+  st_check refuse-no-plan-and-no-whole-card-line 1 "FAIL r1 wc D=6: the log holds no plan record that tools/bloomery/records.py reads whole" "and no whole-card load ('a whole-card load opens with no plan' with a ready event)" \
+    "the placement and the context the plan picked are not proven"
+  st_absent refuse-no-plan-no-row "ROW "
+  st_servers refuse-no-plan-server-stopped 1
+  st_case wholecard-nomarker
+  st_tree wc 20
+  ST_ENV=(BLOOMERY_AB_ROUNDS=1 ST_WHOLE=nomarker DEPTH_SERVE_USER_PLAN=off)
+  st_run wc:6
+  st_check refuse-ready-event-without-the-seats-line 1 "FAIL r1 wc D=6: the log holds no plan record that tools/bloomery/records.py reads whole" "and no whole-card load ('a whole-card load opens with no plan' with a ready event)"
+  st_case wholecard-noready
+  st_tree wc 20
+  ST_ENV=(BLOOMERY_AB_ROUNDS=1 ST_WHOLE=noready DEPTH_SERVE_USER_PLAN=off)
+  st_run wc:6
+  st_check refuse-whole-card-without-the-ready-event 1 "FAIL r1 wc D=6: the log says the load is whole-card ('a whole-card load opens with no plan') but holds no ready event naming its place and ctx (no ready event)"
+  st_case wholecard-nullplace
+  st_tree wc 20
+  ST_ENV=(BLOOMERY_AB_ROUNDS=1 ST_WHOLE=nullplace DEPTH_SERVE_USER_PLAN=off)
+  st_run wc:6
+  st_check refuse-whole-card-ready-event-without-a-place 1 "the event reads place=None ctx=16384"
+  st_case wholecard-bare
+  st_tree wc 20
+  ST_ENV=(BLOOMERY_AB_ROUNDS=1 ST_WHOLE=bare)
+  st_run wc:6
+  st_check refuse-probe-with-no-placement 1 "FAIL user-plan wc: --plan without CUDA_VISIBLE_DEVICES: the log holds no plan record that tools/bloomery/records.py reads whole"
+  st_absent refuse-probe-with-no-placement-no-server "[server]"
+
   # --- the cold tag: 0.3.10's speed sitting read its first row at 34323 major faults (78.50 against 99.83 tok/s) into a
   # mean of two; the row is [cold], out of the headline mean and counted in its line (cold-blocks.sh's rule).
   st_case cold
@@ -1896,6 +2052,27 @@ ROWS
   st_check fold-audit-by-hand 0 "fold a D=6 | shared - first (n=2 against 2) | tg -1.00 tok/s (-4.76 %) ± 6.09 tok/s (± 28.98 %) [holds 0] | pp +4.00 tok/s (+4.00 %) ± 0.00 tok/s (± 0.00 %) [clears 0]" \
     "fold a D=12 | shared - first (n=1 against 2) | tg -2.00 tok/s (-9.52 %), no interval: 1 shared rows against 2 first | pp +4.00 tok/s (+4.08 %), no interval: 1 shared rows against 2 first" \
     "mean a D=12 | tg 20.33 tok/s (sd 1.15 = 5.68 %, [19.00..21.00], n=3)" "[cold 1/4]"
+
+  # The release sitting's call: one round, two depths on one server. The depth that is second has no first row in this log, and
+  # its table says so and where the pair is (0.3.13's sitting printed "every warm row of the arm is [shared]" for 12 of 12).
+  st_case foldcall
+  st_tree a 20
+  ST_ENV=(BLOOMERY_AB_ROUNDS=1 DEPTH_SERVE_FOLD=depths DEPTH_SERVE_CTX=4160)
+  st_run a:6 a:12
+  st_check fold-one-round-names-the-missing-first-row 0 "fold a/place=a/ctx=4160 D=12 | no audit in this log: no first-request row of this depth (1 round(s) of 2 depths a server" \
+    "pool the rows of the calls, as tools/release/sitting.sh's verdict does)"
+  st_absent fold-one-round-has-no-old-line "every warm row of the arm is [shared]"
+  # First-request rows that are all [cold] are named as that, not as a missing round.
+  st_case foldtables-cold-first
+  cat > "$C/rows" << 'ROWS'
+ROW r1 a D=6 | tg_tok/s 20.00 | pp_tok/s 100.00 | load_s 41 | majflt 40000 [cold]
+ROW r1 a D=12 | tg_tok/s 19.00 | pp_tok/s 102.00 | load_s 41 | majflt 0 [shared]
+ROW r2 a D=12 | tg_tok/s 21.00 | pp_tok/s 98.00 | load_s 40 | majflt 40000 [cold]
+ROW r2 a D=6 | tg_tok/s 19.00 | pp_tok/s 104.00 | load_s 40 | majflt 0 [shared]
+ROWS
+  RC=0
+  bash "$HERE/depth-serve.sh" --summary "$C/rows" > "$C/out" 2>&1 || RC=$?
+  st_check fold-cold-first-rows-named 0 "fold a D=6 | no audit in this log: its 1 first-request row(s) are [cold]" "fold a D=12 | no audit in this log: its 1 first-request row(s) are [cold]"
 
   # --- the memory between servers: the next load starts when the card's used memory is back at the sitting's baseline.
   st_case mem
