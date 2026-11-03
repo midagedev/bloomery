@@ -78,6 +78,11 @@ impl LogitsBand {
     /// the reference's values. Both rows are f32 bits; the top two are
     /// [`crate::kld::top2`]'s, ties to the lower id.
     pub fn add(&mut self, got: &[u32], want: &[u32]) {
+        self.add_at(got, want, MARGIN_FLOOR);
+    }
+
+    /// [`LogitsBand::add`] with the clarity margin `floor` in place of `MARGIN_FLOOR`.
+    pub fn add_at(&mut self, got: &[u32], want: &[u32], floor: f32) {
         if got.len() != want.len() || got.len() < 2 {
             self.aligned = false;
             return;
@@ -86,7 +91,7 @@ impl LogitsBand {
         let want: Vec<f32> = want.iter().copied().map(f32::from_bits).collect();
         let (got_id, _, _, _) = crate::kld::top2(&got);
         let (want_id, top1, _, top2) = crate::kld::top2(&want);
-        let clear = top1 - top2 >= MARGIN_FLOOR;
+        let clear = top1 - top2 >= floor;
         self.clear += usize::from(clear);
         self.disagree += usize::from(clear && got_id != want_id);
         for (&g, &w) in got.iter().zip(&want) {
@@ -156,6 +161,17 @@ pub struct Walk {
 /// # Panics
 /// A run whose tokens and rows are not as many as each other.
 pub fn walk(what: &str, want: Positions<'_>, got: Positions<'_>) -> Walk {
+    walk_at(what, want, got, MARGIN_FLOOR)
+}
+
+/// [`walk`] with the clarity margin `floor` in place of `MARGIN_FLOOR`: a position is clear when
+/// the reference's top1−top2 is at least `floor`, and only a clear one's flipped top-1 is a
+/// disagree. A gate whose two orders differ by more than the e2e clarity rule assumes passes the
+/// floor its own measured gap shift derives.
+///
+/// # Panics
+/// As [`walk`].
+pub fn walk_at(what: &str, want: Positions<'_>, got: Positions<'_>, floor: f32) -> Walk {
     for (name, run) in [("reference", want), ("compared run", got)] {
         assert_eq!(
             run.tokens.len(),
@@ -175,7 +191,7 @@ pub fn walk(what: &str, want: Positions<'_>, got: Positions<'_>) -> Walk {
         .zip(got.tokens.iter().zip(got.rows));
     for (i, ((wt, wr), (gt, gr))) in runs.enumerate() {
         let (clear, disagree) = (band.clear, band.disagree);
-        band.add(&bits(gr), &bits(wr));
+        band.add_at(&bits(gr), &bits(wr), floor);
         compared += 1;
         if wt != gt {
             apart_clear = band.clear > clear;
@@ -229,8 +245,8 @@ pub fn walk(what: &str, want: Positions<'_>, got: Positions<'_>) -> Walk {
     };
     println!(
         "{} {what}: {compared} of the reference's {} positions compared{left}: band clear top-1 \
-         {} of {} (pin {LOGITS_CLEAR_PIN}), max |Δlogit| {:.3e} (pin {LOGITS_MAX_PIN}), rms \
-         {:.3e} (pin {LOGITS_RMS_PIN}){}",
+         {} of {} (pin {LOGITS_CLEAR_PIN}, clear = margin >= {floor}), max |Δlogit| {:.3e} (pin \
+         {LOGITS_MAX_PIN}), rms {:.3e} (pin {LOGITS_RMS_PIN}){}",
         if ok { "ok" } else { "FAIL" },
         want.tokens.len(),
         band.disagree,
@@ -249,6 +265,30 @@ pub fn walk(what: &str, want: Positions<'_>, got: Positions<'_>) -> Walk {
         agreed,
         ok,
     }
+}
+
+/// What the leading passes of a DSpark run kept: how many passes lie inside the compared span and
+/// how many of them kept every row (the draft's proposal was the target's next token).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Accepts {
+    pub passes: usize,
+    pub accepted: usize,
+}
+
+/// The passes of `kept` (rows kept a pass, in order, the first pass starting after position 0)
+/// that end within the first `agreed` positions of [`walk`]: a pass past them ran on contexts the
+/// walk found apart. `full` is the rows a pass keeps when the proposal is right.
+pub fn accepts_in(kept: &[usize], full: usize, agreed: usize) -> Accepts {
+    let (mut end, mut passes, mut accepted) = (1, 0, 0);
+    for &k in kept {
+        end += k;
+        if end > agreed {
+            break;
+        }
+        passes += 1;
+        accepted += usize::from(k == full);
+    }
+    Accepts { passes, accepted }
 }
 
 /// An f32 row as the bits [`LogitsBand::add`] takes.
@@ -303,6 +343,60 @@ mod tests {
         let got = [row(1, true), row(0, true)];
         let w = walk("clear", run(&[1, 2], &want), run(&[1, 0], &got));
         assert!(!w.ok && w.compared == 2 && w.agreed == 1 && w.band.disagree == 1);
+    }
+
+    /// A four-wide row whose top-1 is `top`, `gap` over every other value.
+    fn gapped(top: usize, gap: f32) -> Vec<f32> {
+        let mut r = vec![0.0; 4];
+        r[top] = gap;
+        r
+    }
+
+    /// A flip at a margin over `MARGIN_FLOOR` and under a wider floor is a disagree for `walk` and
+    /// none for `walk_at` at that floor, which ends the walk there without a red; a flip over the
+    /// wider floor is red for both.
+    #[test]
+    fn walk_at_reads_clarity_at_its_own_floor() {
+        let floor = 4.0;
+        let want = [gapped(1, 3.0)];
+        let got = [gapped(2, 3.0)];
+        let (tw, tg) = ([1u32], [2u32]);
+        assert!(!walk("floor", run(&tw, &want), run(&tg, &got)).ok);
+        let near = walk_at("floor", run(&tw, &want), run(&tg, &got), floor);
+        assert!(near.ok && near.band.clear == 0 && near.band.disagree == 0);
+        let want = [gapped(1, 5.0)];
+        let got = [gapped(2, 5.0)];
+        let far = walk_at("floor", run(&tw, &want), run(&tg, &got), floor);
+        assert!(!far.ok && far.band.clear == 1 && far.band.disagree == 1);
+    }
+
+    /// The passes counted are the ones ending inside the span, and an accept is a pass that kept
+    /// every row.
+    #[test]
+    fn accepts_in_counts_the_passes_inside_the_span() {
+        let kept = [2, 1, 2, 2, 1];
+        assert_eq!(
+            accepts_in(&kept, 2, 100),
+            Accepts {
+                passes: 5,
+                accepted: 3
+            }
+        );
+        // Positions 0..8 agree: the passes end at 3, 4, 6, 8, 9; the last is outside.
+        assert_eq!(
+            accepts_in(&kept, 2, 8),
+            Accepts {
+                passes: 4,
+                accepted: 3
+            }
+        );
+        assert_eq!(
+            accepts_in(&kept, 2, 2),
+            Accepts {
+                passes: 0,
+                accepted: 0
+            }
+        );
     }
 
     /// A run that ends first while the tokens agree, and rows of another

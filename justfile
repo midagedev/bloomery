@@ -2974,10 +2974,11 @@ gate-gpu-ds41-tier *ARGS='--union --fault --two --batch --batch2 --bfault --bfea
 # The reference is the same plan with every tier set joined to the stage card's (one card, no tier code); --loopback, by
 # name only, adds the plan with the tier on the A6000 beside the stage (two Gpus on one card). The draft is on the 3090
 # in every load; the plans are made under a card budget so the A6000 holds both sets; the stage keeps each layer's id
-# prefix and the tier the next ids. --union: the prose prompt (32 ids) step by step, 48 greedy steps, then the prompt
+# prefix and the tier the next ids. --union: the prose prompt (32 ids, from the corpus id the gate pins) step by step, 48 greedy steps, then the prompt
 # through the draft and 16 DSpark passes: the stepped part's tokens and logits rows bit for bit the reference's, the call and
-# passes within the logits band (logits_band::walk; the tier's experts run tiles, the reference's the GEMM) and their kept
-# counts equal over the walked passes, the stage graph's node count the reference's; precondition: every tier layer sent a routed slot, the passes kept and rejected a proposal.
+# passes within the logits band (logits_band::walk_at; the tier's experts run tiles, the reference's the GEMM) and their accepted
+# proposals within a pin of the reference's over the walked passes, the stage graph's node count the reference's; precondition: every tier layer sent 3 or more routed slots, the passes kept and rejected a proposal.
+# --windows N: no clause, the evidence for the pinned corpus id: the first N starts at stride 1024, each one's per-layer hits and clause numbers.
 # --lost: the tier's stream held behind a host flag, the step named as a lost card within the deadline, no token,
 # CardLost, the next step refused; not in the landing run: weekly-gpu-ds41-lost runs it. Two loads, one after the
 # other. Both cards (BLOOMERY_CARD=both: both gate locks), alone in a batch.

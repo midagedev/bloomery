@@ -34,28 +34,40 @@
 //! routing, which the run checks.
 //!
 //! - `--union`: from a reset, the first [`PROMPT`] ids of the prose prompt
-//!   one decode step per id and [`STEPS`] greedy steps, every position's
+//!   (the corpus from [`PROMPT_FROM`]) one decode step per id and [`STEPS`]
+//!   greedy steps, every position's
 //!   argmax and logits read; then from a reset with the draft started over,
 //!   the first [`CALL_PROMPT`] ids as one prompt call through the draft's
 //!   (one batch, the draft fed the call's feature rows) and [`PASSES`] DSpark
-//!   passes, each pass's kept tokens and the logits of the rows it kept read.
+//!   passes (more, on each load, until a pass has rejected a proposal, up to
+//!   [`PASSES_MAX`]), each pass's kept tokens and the logits of the rows it
+//!   kept read.
 //!   The stepped part, every token and logits vector of the decode steps, of
 //!   the two-card run (and of the loopback) is bit for bit the reference's,
 //!   the stage's step graph of the reference's node count. The call and the
 //!   passes after it are walked in order against the reference's
-//!   (`logits_band::walk`): the call's stage experts run the grouped GEMM and
+//!   (`logits_band::walk_at`, a position clear from a margin of
+//!   [`CLEAR_MARGIN`]): the call's stage experts run the grouped GEMM and
 //!   its tier's the tile path, the reference's all on the GEMM, so their
 //!   logits sit within the logits band of the reference's, not on its bits.
 //!   The tokens agree until a position the reference was not clear about
 //!   (clear top-1 equality is the band's hard clause), after which the
-//!   contexts differ and the rest is not compared; the passes' kept counts
-//!   are equal over the passes the walk compared. Preconditions: every layer
-//!   the tier holds experts of was sent at least one routed slot over the
-//!   two-card run (the tier's per-layer hits), and by the prompt call alone, whose batch the tier
-//!   served (its batch services); the pair passes kept and rejected a
+//!   contexts differ and the rest is not compared; the positions both loads
+//!   hold are walked, since how many rows the passes keep follows the draft's
+//!   proposals, and the passes' accepted proposals are within [`KEPT_PIN`] of
+//!   the reference's over the passes the walk compared. Preconditions: every
+//!   layer the tier holds experts of was sent at least [`MIN_SLOTS`] routed
+//!   slots over the two-card run (the tier's per-layer hits), and by the prompt
+//!   call alone, whose batch the tier served (its batch services); the pair
+//!   passes kept and rejected a
 //!   proposal each at least once (a property of the draft file's content, so the fixture
 //!   tier defers it: its random draft keeps none); or the run proves nothing and fails by
 //!   name.
+//! - `--windows N`: the evidence for [`PROMPT_FROM`], no clause: over the first N starts at
+//!   [`WINDOW_STRIDE`] of the prose corpus, each window's prompt call and passes on the
+//!   reference, then on the two-card load (one load of each, the decode steps left out). Per window
+//!   it prints the tier layers' call hits, the call's band walk and the passes' kept counts, then
+//!   a `pos` line per compared position.
 //! - `--lost`: on the two-card model, the tier's stream held behind a host
 //!   flag before a step — the tier stops signalling: within the go deadline
 //!   and its grace the step fails naming the lost card, no token comes out,
@@ -105,6 +117,7 @@ mod gate {
         Body, BodyMeta, DECODE_INPUT, Deepseek41Model, OpenCfg, PAIR_ROWS, PrefillMode,
     };
     use bloomery_gpu_gates::generate::Place;
+    use bloomery_gpu_gates::kld;
     use bloomery_gpu_gates::logits_band::{self, Positions};
     use bloomery_gpu_gates::{GateError, checks_failed, prose_ids, ref_model_path};
     use bloomery_levers::{CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, R8};
@@ -132,10 +145,44 @@ mod gate {
     /// routing must reach every tier layer, and 128 positions left a layer's
     /// ten tier experts with no slot on the prose prompt.
     const CALL_PROMPT: usize = 512;
+    /// The routed slots every tier layer must be sent, over the two-card run and by the prompt
+    /// call alone: a layer's tier experts are routed to rarely, and a layer sent fewer has
+    /// no tier row for the clause to compare.
+    const MIN_SLOTS: u64 = 3;
+    /// The distance between the corpus starts a prompt window is chosen among.
+    const WINDOW_STRIDE: usize = 1024;
+    /// The corpus id the prompts start at: the first multiple of [`WINDOW_STRIDE`] at which every
+    /// tier layer is sent [`MIN_SLOTS`] or more routed slots by the prompt call. The preconditions
+    /// are the rule and decide nothing else: no other clause's result picks the window, and
+    /// `--windows N` prints each start's per-layer hits and every clause's numbers.
+    // PIN(2026-11-03): `--windows 74` on the real file: start 0 sends layer 6 no slot (the
+    // precondition's red since the grouped IMMA of the default prompt block moved routing
+    // near-ties); start 1024 sends every tier layer 6 or more, layer 39 the least. The routing
+    // moves with the engine, so a start whose least hits fall under the rule fails by name.
+    const PROMPT_FROM: usize = 1024;
     /// Greedy steps after the prompt.
     const STEPS: usize = 48;
-    /// DSpark passes after the prompt.
+    /// DSpark passes after the prompt, and more until a pass has rejected a proposal, up to
+    /// [`PASSES_MAX`]: a load whose draft has rejected nothing leaves the reject path unrun.
     const PASSES: usize = 16;
+    /// The most passes a load runs looking for a rejected proposal.
+    const PASSES_MAX: usize = 48;
+    /// What the reference's top1−top2 must be at a position for a flipped top-1 there to be the
+    /// band's red: the distance the tier's tile order moves a top-two gap, doubled. The e2e rule's
+    /// `MARGIN_FLOOR` is set for one order's rounding and sits inside this gate's.
+    // PIN(2026-11-03): `--windows 74` on the real file, 1893 compared positions: the two-card
+    // order moved the reference's top-two gap by 0.49 rms and 3.13 at most, and by more than 0.5
+    // at 7.9 % of the positions. The flips at a margin of 0.5 or more (five windows) sat at 0.52
+    // to 1.28. Twice 3.13, rounded up; 55 % of the positions are still clear.
+    const CLEAR_MARGIN: f32 = 6.5;
+    /// The accepted proposals the two loads' passes may differ by, over the passes the walk
+    /// compared. The draft reads the target's tap rows, which differ by the tier's f32 order, and
+    /// its argmax flips at a near-tie, so a pass keeps one row on one load and two on the other.
+    // PIN(2026-11-03): `--windows 74` on the real file: the pass-by-pass equality parted at a pass
+    // in 16 of 74 windows (1.8 % of 904 compared passes, 0.24 flips a window), and the accepted
+    // counts over the 981 compared passes differed by 0 in 64 windows and by 1 in 10. A Poisson
+    // tail of 0.24 puts a difference of 5 or more at 5e-6 a window [derived].
+    const KEPT_PIN: usize = 4;
     /// The go deadline and the grace a lost card is named within, plus room.
     const LOST_BOUND_S: f64 = 25.0;
 
@@ -143,24 +190,41 @@ mod gate {
         union: bool,
         loopback: bool,
         lost: bool,
+        /// `--windows N`: the prompt windows to print the evidence of.
+        windows: Option<usize>,
     }
 
     fn parse_args() -> Result<Args, GateError> {
-        const USAGE: &str = "usage: gate_deepseek41_twocard [--union [--loopback]] [--lost]";
+        const USAGE: &str =
+            "usage: gate_deepseek41_twocard [--union [--loopback]] [--lost] | --windows N";
         let mut a = Args {
             union: false,
             loopback: false,
             lost: false,
+            windows: None,
         };
-        for arg in std::env::args().skip(1) {
+        let mut args = std::env::args().skip(1);
+        while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--union" => a.union = true,
                 "--loopback" => a.loopback = true,
                 "--lost" => a.lost = true,
+                "--windows" => {
+                    let n = args.next().ok_or(USAGE)?;
+                    let n = n.parse::<usize>().ok().filter(|&n| n > 0).ok_or_else(|| {
+                        format!("--windows {n:?} is not a count of 1 or more: {USAGE}")
+                    })?;
+                    a.windows = Some(n);
+                }
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             }
         }
-        if !(a.union || a.lost) || (a.loopback && !a.union) {
+        let valid = if a.windows.is_some() {
+            !(a.union || a.lost || a.loopback)
+        } else {
+            (a.union || a.lost) && (a.union || !a.loopback)
+        };
+        if !valid {
             return Err(USAGE.into());
         }
         Ok(a)
@@ -412,6 +476,16 @@ mod gate {
         stats: TierBatchStats,
     }
 
+    impl Sent {
+        /// The routed slots layer `l` was sent; 0 for a layer the tier holds nothing of.
+        fn hit(&self, l: usize) -> u64 {
+            l.checked_sub(self.first)
+                .and_then(|i| self.hits.get(i))
+                .copied()
+                .unwrap_or(0)
+        }
+    }
+
     /// The tier's per-layer hits and batch counters since load; `None`
     /// without a tier.
     fn tier_counts(m: &Deepseek41Model) -> Result<Option<Sent>, GateError> {
@@ -461,15 +535,26 @@ mod gate {
             run.logits.push(s.model().logits()?);
         }
         run.stepped = run.tokens.len();
+        called(o, &prompt[..CALL_PROMPT], &mut run)?;
+        Ok(run)
+    }
+
+    /// The DSpark run (module header) of `prompt`, [`CALL_PROMPT`] ids, from a reset with the draft
+    /// started over, appended to `run`: [`PASSES`] passes, and more until a proposal was rejected,
+    /// up to [`PASSES_MAX`].
+    fn called(o: &mut Opened, prompt: &[u32], run: &mut Run) -> Result<(), GateError> {
+        let Opened { s, spec } = o;
         s.reset()?;
         spec.draft_mut().restart()?;
         let before = tier_counts(s.model())?;
-        let mut last = spec.draft_mut().feed_call(s, &prompt[..CALL_PROMPT])?;
+        let mut last = spec.draft_mut().feed_call(s, prompt)?;
         run.call = sent_between(before, tier_counts(s.model())?);
         run.tokens.push(last);
         run.logits.push(s.model().logits()?);
         let mut out = Vec::with_capacity(PAIR_ROWS);
-        for _ in 0..PASSES {
+        let mut done = 0;
+        while done < PASSES || (run.rejects == 0 && done < PASSES_MAX) {
+            done += 1;
             out.clear();
             let c = Advance::pass(spec, s, last, &mut out)?;
             run.kept.push(c.kept);
@@ -500,24 +585,40 @@ mod gate {
             last = *out.last().ok_or("a pass kept no token")?;
         }
         spec.draft_mut().check_fault()?;
-        Ok(run)
+        Ok(())
     }
 
     /// Whether `got`, run `what`, is `want`: the stepped part bit for bit, the call and the passes
-    /// after it within the logits band of `want`'s ([`logits_band::walk`]), and the passes' kept
-    /// counts equal over the passes the walk compared. The call's stage experts run the grouped
+    /// after it within the logits band of `want`'s ([`walk_called`]), and the passes' accepted
+    /// proposals within [`KEPT_PIN`] over the passes the walk compared. The call's stage experts run the grouped
     /// GEMM and its tier's the tile path where the reference's all run the GEMM, so the same exact
     /// integer block sums fold in more than one f32 order and the logits are near the reference's,
     /// not on its bits. Prints each part's line.
     fn same(what: &str, want: &Run, got: &Run) -> bool {
         let stepped = same_stepped(what, want, got);
-        let walk = logits_band::walk(
-            &format!("{what} (the call and its passes)"),
-            want.called(),
-            got.called(),
-        );
+        let walk = walk_called(what, want, got);
         let kept = same_kept(what, want, got, walk.agreed);
         stepped && walk.ok && kept
+    }
+
+    /// The call's last position and the passes' rows of `got` walked against `want`'s at
+    /// [`CLEAR_MARGIN`], over the positions both hold: how many rows the passes keep follows the
+    /// draft's proposals ([`same_kept`]), so one load can hold more than the other.
+    fn walk_called(what: &str, want: &Run, got: &Run) -> logits_band::Walk {
+        let (w, g) = (want.called(), got.called());
+        let n = w.tokens.len().min(g.tokens.len());
+        fn cut(p: Positions<'_>, n: usize) -> Positions<'_> {
+            Positions {
+                tokens: &p.tokens[..n],
+                rows: &p.rows[..n],
+            }
+        }
+        logits_band::walk_at(
+            &format!("{what} (the call and its passes)"),
+            cut(w, n),
+            cut(g, n),
+            CLEAR_MARGIN,
+        )
     }
 
     /// Whether `got`'s decode steps, run `what`, are `want`'s bit for bit; prints the first
@@ -553,30 +654,25 @@ mod gate {
         true
     }
 
-    /// Whether `got`'s passes kept the rows `want`'s did, over the passes whose kept tokens all lie
-    /// among the first `agreed` positions of [`Run::called`] (the call's last position, then each
-    /// pass's kept rows): a pass past them ran on contexts the walk found apart. Prints the count.
+    /// Whether the accepted proposals of `got`'s passes are within [`KEPT_PIN`] of `want`'s, over
+    /// the passes that end within the first `agreed` positions of [`Run::called`] (the call's last
+    /// position, then each pass's kept rows): a pass past them ran on contexts the walk found
+    /// apart. Prints both counts.
     fn same_kept(what: &str, want: &Run, got: &Run, agreed: usize) -> bool {
-        // The call's position is position 0; pass `k` ends at `end` positions.
-        let (mut want_end, mut got_end, mut compared) = (1, 1, 0);
-        for (k, (&w, &g)) in want.kept.iter().zip(&got.kept).enumerate() {
-            want_end += w;
-            got_end += g;
-            if want_end > agreed || got_end > agreed {
-                break;
-            }
-            if w != g {
-                println!("FAIL {what} (the passes): pass {k} kept {g} rows, the reference's {w}");
-                return false;
-            }
-            compared = k + 1;
-        }
+        let at = |r: &Run| logits_band::accepts_in(&r.kept, PAIR_ROWS, agreed);
+        let (w, g) = (at(want), at(got));
+        let apart = w.accepted.abs_diff(g.accepted);
+        let ok = apart <= KEPT_PIN;
         println!(
-            "ok {what} (the passes): kept counts equal over {compared} of the reference's {} passes, \
-             the ones the walk compared",
-            want.kept.len()
+            "{} {what} (the passes): {} of {} passes kept every row, the reference's {} of {}: apart \
+             by {apart} (pin {KEPT_PIN}), over the passes the walk compared",
+            if ok { "ok" } else { "FAIL" },
+            g.accepted,
+            g.passes,
+            w.accepted,
+            w.passes,
         );
-        true
+        ok
     }
 
     pub fn run() -> Result<(), GateError> {
@@ -666,7 +762,27 @@ mod gate {
                 .into());
             }
         }
-        let prompt = prose_ids("engram", PROMPT.max(CALL_PROMPT))?;
+        if let Some(n) = args.windows {
+            if !pass {
+                return Err(checks_failed());
+            }
+            let scan = Scan {
+                path: &path,
+                plan: &plan,
+                hp: &inputs.hp,
+                cfg: &cfg,
+                draft: &draft,
+                tier_layers: &tier_layers,
+                tier_n,
+            };
+            return scan.run(bp, n);
+        }
+        let prompt =
+            prose_ids("engram", PROMPT_FROM + PROMPT.max(CALL_PROMPT))?.split_off(PROMPT_FROM);
+        println!(
+            "prompt: corpus ids {PROMPT_FROM}.. (the first start at which every tier layer is \
+             sent {MIN_SLOTS} or more routed slots by the prompt call)"
+        );
         if args.union {
             crate::ds41_tier::sc(
                 "--union: two cards (and the loopback) are the union reference, the steps bit for \
@@ -701,7 +817,7 @@ mod gate {
             let got = union_run(&mut o, &prompt)?;
             drop(o);
             pass &= same("loopback", want, &got);
-            pass &= call_sent_every("loopback", got.call.as_ref(), &tier_layers);
+            pass &= call_sent_every("loopback", got.call.as_ref(), &tier_layers, tier_n);
         }
         let mut o = open(&path, bp, &cfg, &draft, workstation::RTX_3090.name)?;
         if let Some(want) = &reference {
@@ -759,25 +875,27 @@ mod gate {
             let missing: Vec<usize> = tier_layers
                 .iter()
                 .copied()
-                .filter(|&l| hits(l) == 0)
+                .filter(|&l| hits(l) < MIN_SLOTS)
                 .collect();
             println!(
-                "tier: {} layers asked, {} settles ({} early), hits per layer {:?}",
+                "tier: {} layers asked, {} settles ({} early), per layer (layer: tier experts/hits) {}",
                 st.issued,
                 st.settles,
                 st.settle_early,
-                tier_layers.iter().map(|&l| hits(l)).collect::<Vec<_>>()
+                layer_counts(&tier_layers, tier_n, hits)
             );
             if missing.is_empty() {
-                println!("ok precondition: every tier layer was sent a routed slot");
+                println!(
+                    "ok precondition: every tier layer was sent {MIN_SLOTS} or more routed slots"
+                );
             } else {
                 println!(
-                    "FAIL precondition: tier layers {missing:?} were sent no routed slot; the \
-                     union clause proves nothing there"
+                    "FAIL precondition: tier layers {missing:?} were sent fewer than {MIN_SLOTS} \
+                     routed slots; the union clause proves little there"
                 );
                 pass = false;
             }
-            pass &= call_sent_every("two cards", got.call.as_ref(), &tier_layers);
+            pass &= call_sent_every("two cards", got.call.as_ref(), &tier_layers, tier_n);
         }
         if args.lost {
             pass &= lost_case(o.s.model_mut(), &prompt)?;
@@ -791,48 +909,147 @@ mod gate {
         Ok(())
     }
 
+    /// Each tier layer as `layer: experts/hits`: the experts the tier holds of it (`tier_n`, from
+    /// layer 0) and the routed slots it was sent, comma separated.
+    fn layer_counts(tier_layers: &[usize], tier_n: &[u64], hit: impl Fn(usize) -> u64) -> String {
+        tier_layers
+            .iter()
+            .map(|&l| format!("{l}: {}/{}", tier_n.get(l).copied().unwrap_or(0), hit(l)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// The prompt call's precondition on the load `what`: the call alone
-    /// sent every layer of `tier_layers` at least one routed slot and the
+    /// sent every layer of `tier_layers` at least [`MIN_SLOTS`] routed slots and the
     /// tier served its batch; prints its counters.
-    fn call_sent_every(what: &str, sent: Option<&Sent>, tier_layers: &[usize]) -> bool {
+    fn call_sent_every(
+        what: &str,
+        sent: Option<&Sent>,
+        tier_layers: &[usize],
+        tier_n: &[u64],
+    ) -> bool {
         let Some(sent) = sent else {
             println!("FAIL {what} call precondition: the load holds no tier card");
             return false;
         };
-        let hit = |l: usize| {
-            l.checked_sub(sent.first)
-                .and_then(|i| sent.hits.get(i))
-                .copied()
-                .unwrap_or(0)
-        };
         let missing: Vec<usize> = tier_layers
             .iter()
             .copied()
-            .filter(|&l| hit(l) == 0)
+            .filter(|&l| sent.hit(l) < MIN_SLOTS)
             .collect();
         let st = sent.stats;
         println!(
             "{what} call tier: {CALL_PROMPT} positions, {} batch services, {} settles ({} early, \
-             {:.2} ms waited), hits per layer {:?}",
+             {:.2} ms waited), per layer (layer: tier experts/hits) {}",
             st.served,
             st.settles,
             st.settle_early,
             st.settle_ns as f64 / 1e6,
-            tier_layers.iter().map(|&l| hit(l)).collect::<Vec<_>>()
+            layer_counts(tier_layers, tier_n, |l| sent.hit(l))
         );
         if missing.is_empty() && st.served > 0 {
             println!(
-                "ok {what} call precondition: the prompt batch sent every tier layer a routed \
-                 slot, the tier served it"
+                "ok {what} call precondition: the prompt batch sent every tier layer \
+                 {MIN_SLOTS} or more routed slots, the tier served it"
             );
             true
         } else {
             println!(
-                "FAIL {what} call precondition: tier layers {missing:?} were sent no routed slot \
-                 by the prompt call, {} batch services; the batched clause proves nothing there",
+                "FAIL {what} call precondition: tier layers {missing:?} were sent fewer than \
+                 {MIN_SLOTS} routed slots by the prompt call, {} batch services; the batched \
+                 clause proves little there",
                 st.served
             );
             false
+        }
+    }
+
+    /// What `--windows N` reads (module header): the plan's facts, the files and the layers.
+    struct Scan<'a> {
+        path: &'a Path,
+        plan: &'a Plan<'a>,
+        hp: &'a Hparams,
+        cfg: &'a OpenCfg,
+        draft: &'a (Split, DraftHparams),
+        tier_layers: &'a [usize],
+        tier_n: &'a [u64],
+    }
+
+    impl Scan<'_> {
+        /// The first `n` windows' prompt calls and passes on the reference, then on the two-card
+        /// load; per window, the lines of [`Scan::window`]. No clause: the window's start is read
+        /// off the minimum of its call hits.
+        fn run(&self, bp: impl Fn(usize) -> Machine, n: usize) -> Result<(), GateError> {
+            let corpus = prose_ids("engram", (n - 1) * WINDOW_STRIDE + CALL_PROMPT)?;
+            let prompt = |w: usize| &corpus[w * WINDOW_STRIDE..][..CALL_PROMPT];
+            let uplan = union_plan(self.plan)?;
+            let mut o = open_union(self.path, &uplan, self.hp, self.cfg, self.draft)?;
+            let mut want = Vec::with_capacity(n);
+            for w in 0..n {
+                let mut run = Run::default();
+                called(&mut o, prompt(w), &mut run)?;
+                want.push(run);
+            }
+            drop(o);
+            let mut o = open(
+                self.path,
+                bp,
+                self.cfg,
+                self.draft,
+                workstation::RTX_3090.name,
+            )?;
+            for (w, want) in want.iter().enumerate() {
+                let mut got = Run::default();
+                called(&mut o, prompt(w), &mut got)?;
+                self.window(w * WINDOW_STRIDE, want, &got)?;
+            }
+            Ok(())
+        }
+
+        /// The window at `start`: its tier layers' call hits and the least of them, the walk of the
+        /// two-card call and passes against the reference's, the kept counts of both arms and the
+        /// proposals each kept and rejected, then one `pos` line per compared position: the
+        /// reference's top1-top2 margin, how far the two-card order closed that gap (the margin
+        /// less the two-card logits' gap between the reference's top two ids; a value over the
+        /// margin is a flipped top-1), and whether the tokens part there.
+        fn window(&self, start: usize, want: &Run, got: &Run) -> Result<(), GateError> {
+            let sent = got.call.as_ref().ok_or("the two-card load sent no call")?;
+            let least = self
+                .tier_layers
+                .iter()
+                .map(|&l| (sent.hit(l), l))
+                .min()
+                .ok_or("no tier layer")?;
+            println!(
+                "window {start}: call hits least {} (layer {}) of {MIN_SLOTS} wanted, per layer \
+                 (layer: tier experts/hits) {}",
+                least.0,
+                least.1,
+                layer_counts(self.tier_layers, self.tier_n, |l| sent.hit(l))
+            );
+            let walk = walk_called(&format!("window {start}"), want, got);
+            same_kept(&format!("window {start}"), want, got, walk.agreed);
+            println!(
+                "window {start}: kept reference {:?} two cards {:?}; two cards kept {} proposals \
+                 and rejected {}, the reference {} and {}",
+                want.kept, got.kept, got.accepts, got.rejects, want.accepts, want.rejects
+            );
+            let (w, g) = (want.called(), got.called());
+            for i in 0..walk.compared {
+                let (wr, gr) = (&w.rows[i], &g.rows[i]);
+                let (first, top1, second, top2) = kld::top2(wr);
+                let margin = top1 - top2;
+                let moved = margin - (gr[first] - gr[second]);
+                println!(
+                    "pos {start} {i} margin {margin:.4} moved {moved:.4}{}",
+                    if w.tokens[i] == g.tokens[i] {
+                        ""
+                    } else {
+                        " tokens-apart"
+                    }
+                );
+            }
+            Ok(())
         }
     }
 
