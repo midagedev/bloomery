@@ -298,8 +298,12 @@ pub struct PromptRows {
     embd_bytes: usize,
     n_cols: usize,
     row_bytes: usize,
+    /// The columns of each site's rows read, as [`StepRows`] reads them.
+    cols: Range<usize>,
     cap: usize,
     ctx: Vec<u64>,
+    /// One token's ids of every column of every site.
+    all: Vec<u32>,
     /// `[token][site][n_cols]` for the batch's tokens, and per site the same
     /// ids in token order, the site's one prefetch.
     ids: Vec<u32>,
@@ -322,8 +326,10 @@ impl StepRows {
             embd_bytes: self.embd_bytes,
             n_cols: self.n_cols,
             row_bytes: self.row_bytes,
+            cols: self.cols.clone(),
             cap,
             ctx: vec![0; self.ctx.len()],
+            all: vec![0; self.all.len()],
             ids: vec![0; cap * sites * self.n_cols],
             site_ids: (0..sites)
                 .map(|_| Vec::with_capacity(cap * self.n_cols))
@@ -393,7 +399,13 @@ impl PromptRows {
                     continue;
                 }
                 let ids = &mut self.ids[(t + k) * token_ids..][..token_ids];
-                token_rows(&self.engram, &mut self.ctx, window, ids, self.n_cols)?;
+                token_rows(
+                    &self.engram,
+                    (&mut self.ctx, window),
+                    &mut self.all,
+                    ids,
+                    &self.cols,
+                )?;
             }
             t += m;
         }

@@ -90,6 +90,7 @@ use model::arch::deepseek41::names;
 use model::arch::deepseek41::plan::Planner;
 
 use crate::attn::{self as attn_op, AttnArgs, AttnKernels, CommitArgs, SelectedRows, Staged};
+use crate::chain::join::{JoinSlot, RankJoin};
 use crate::compress::{
     self, CompGeom, CompressKernels, PoolArgs, RowsArgs, W_GROUPS, W_PERSISTS, w_persist, w_read,
     w_row,
@@ -1348,11 +1349,13 @@ impl AttnChain {
         layer: usize,
         io: AttnIo<'_>,
     ) -> Result<(), GpuError> {
-        self.enqueue_layer_of(gpu, w, layer, 0, io)
+        self.enqueue_layer_of(gpu, w, layer, 0, io, None)
     }
 
     /// [`AttnChain::enqueue_layer`] reading row `row`'s words, which its
-    /// [`enqueue_step_of`](Self::enqueue_step_of) gathered.
+    /// [`enqueue_step_of`](Self::enqueue_step_of) gathered. On a rank of a
+    /// tensor-parallel load the output projection's result is the rank's part,
+    /// and `join` sums the ranks' parts before HC_POST reads it.
     pub fn enqueue_layer_of(
         &mut self,
         gpu: &Gpu,
@@ -1360,6 +1363,7 @@ impl AttnChain {
         layer: usize,
         row: usize,
         io: AttnIo<'_>,
+        join: Option<&mut RankJoin>,
     ) -> Result<(), GpuError> {
         let lp = layer
             .checked_sub(self.layers.start)
@@ -1536,6 +1540,9 @@ impl AttnChain {
         k.attn.enqueue(stream, args)?;
         enqueue_output(&cx, lp, s)?;
         fork.join()?;
+        if let Some(join) = join {
+            join.join(gpu, JoinSlot::Trunk, &mut s.out)?;
+        }
 
         let post = HcPostArgs {
             x: &s.out,

@@ -161,7 +161,13 @@ pub fn run(levers: &Levers) -> Result<(), GateError> {
         });
     }
 
-    let mut rows = StepRows::open(&split, &hp, 1, RowsLevers::from_levers(levers))?;
+    let mut rows = StepRows::open(
+        &split,
+        &hp,
+        1,
+        RowsLevers::from_levers(levers),
+        0..hp.engram()?.rows_per_token(),
+    )?;
     let first = sets.first().ok_or("no set")?;
     let layout = ImageLayout::new(ImageDims::of(&hp, &first.planner, 1, rows.row_bytes()))?;
     let (window, yarn) = rope_specs(&hp)?;

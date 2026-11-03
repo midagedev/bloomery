@@ -437,24 +437,26 @@ const HELPER_STEPS: usize = 256;
 pub(super) fn helper_rows(split: &Split) -> Result<bool, GateError> {
     let hp = Hparams::read(split)?;
     let planner = Planner::from_file(split, &hp, HELPER_STEPS as u64)?;
-    let mut helper = StepRows::open(
-        split,
-        &hp,
-        1,
-        RowsLevers {
-            helper: true,
-            stats: true,
-        },
-    )?;
-    let mut direct = StepRows::open(
-        split,
-        &hp,
-        1,
-        RowsLevers {
-            helper: false,
-            stats: false,
-        },
-    )?;
+    let all = 0..hp.engram()?.rows_per_token();
+    // A rank's columns, as a rank of a tensor-parallel load reads them: the second quarter.
+    let quarter = all.end / 4;
+    let cols = quarter..2 * quarter;
+    let open = |helper, cols| {
+        StepRows::open(
+            split,
+            &hp,
+            1,
+            RowsLevers {
+                helper,
+                stats: helper,
+            },
+            cols,
+        )
+    };
+    let mut helper = open(true, all.clone())?;
+    let mut direct = open(false, all)?;
+    let mut rank = open(true, cols.clone())?;
+    let row_bytes = direct.row_bytes();
     let sites = hp.engram()?.layer_ids.len();
     let mut plan = StepPlan::default();
     let mut history: Vec<u32> = Vec::with_capacity(HELPER_STEPS);
@@ -472,8 +474,19 @@ pub(super) fn helper_rows(split: &Split) -> Result<bool, GateError> {
         planner.plan_into(&[token], pos as u32, &history, &mut plan)?;
         helper.fill(split, &plan)?;
         direct.fill(split, &plan)?;
-        let ids_eq = (0..sites).all(|s| helper.ids(0, s) == direct.ids(0, s));
-        let bytes_eq = helper.engram() == direct.engram() && helper.embd() == direct.embd();
+        rank.fill(split, &plan)?;
+        let ids_eq = (0..sites).all(|s| {
+            helper.ids(0, s) == direct.ids(0, s)
+                && rank.ids(0, s) == &direct.ids(0, s)[cols.clone()]
+        });
+        let site_bytes = direct.engram().len() / sites;
+        let rank_bytes = (0..sites).all(|s| {
+            let site = &direct.engram()[s * site_bytes..][..site_bytes];
+            let own = cols.start * row_bytes..cols.end * row_bytes;
+            rank.engram()[s * own.len()..][..own.len()] == site[own]
+        });
+        let bytes_eq =
+            rank_bytes && helper.engram() == direct.engram() && helper.embd() == direct.embd();
         bad_ids += usize::from(!ids_eq);
         bad_bytes += usize::from(!bytes_eq);
         if (!ids_eq || !bytes_eq) && first_bad.is_none() {
@@ -484,9 +497,9 @@ pub(super) fn helper_rows(split: &Split) -> Result<bool, GateError> {
     let st = helper.engram_stats();
     let pass = helper.helper_cpu().is_some() && bad_ids == 0 && bad_bytes == 0 && st.direct == 0;
     println!(
-        "host rows: {HELPER_STEPS} steps x {sites} sites, helper {} vs direct: ids differ at {bad_ids} \
-             steps, bytes at {bad_bytes} (first {first_bad:?}); helper rows warm {} cold {} \
-             direct {}: {}",
+        "host rows: {HELPER_STEPS} steps x {sites} sites, helper {} and columns {cols:?} vs direct: \
+             ids differ at {bad_ids} steps, bytes at {bad_bytes} (first {first_bad:?}); helper rows \
+             warm {} cold {} direct {}: {}",
         match helper.helper_cpu() {
             None => "off".to_string(),
             Some(None) => "floating".to_string(),

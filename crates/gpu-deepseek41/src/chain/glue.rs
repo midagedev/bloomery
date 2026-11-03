@@ -44,6 +44,7 @@
 //! resolved at `new`; an enqueue looks the names up (at capture, once per
 //! graph) and allocates nothing.
 
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -68,6 +69,7 @@ use model::arch::deepseek41::plan::StepPlan;
 use model::embed::RowLayout;
 
 use crate::chain::ffn::ShadowWork;
+use crate::chain::join::{JoinSlot, RankJoin};
 use crate::dense::{Dense, DenseKernels};
 use crate::engram_gate::{EngramGateKernels, GateArgs, KeyNormArgs, ROW};
 use crate::hc::{HC_MIX, HC_STREAMS, HcKernels};
@@ -723,6 +725,8 @@ pub struct EngramKv<'a> {
     pub row: usize,
     /// The row's engram rows arrive here: the first reader of any of them.
     pub arrive: Option<&'a RowsArrival>,
+    /// The rank's side of the ranks' sums, on a rank of a tensor-parallel load.
+    pub join: Option<&'a mut RankJoin>,
 }
 
 impl ShadowWork for EngramKv<'_> {
@@ -730,8 +734,13 @@ impl ShadowWork for EngramKv<'_> {
         if let Some(arrive) = self.arrive {
             arrive.enqueue(gpu.stream(), self.row, self.params)?;
         }
-        self.glue
-            .enqueue_engram_kv_of(gpu, self.w, self.params, self.layer, self.row)
+        self.glue.enqueue_engram_kv_of(
+            gpu,
+            self.w,
+            self.params,
+            (self.layer, self.row),
+            self.join.as_deref_mut(),
+        )
     }
 }
 
@@ -855,6 +864,9 @@ pub struct Glue {
     shape: TableShape,
     table: TableRows,
     sites: Vec<EngramSite>,
+    /// Whether a site's rows are a rank's columns of them: its `engram_wkv` output is then the
+    /// rank's part of a sum over the ranks, whose key norm waits for the sum.
+    split: bool,
 }
 
 impl Glue {
@@ -896,20 +908,28 @@ impl Glue {
             )));
         }
         let (en, table_ty) = (hp.engram()?, hp.rows.engram()?);
-        let rows = en.rows_per_token();
         let table = TableRows::of(table_ty, en.key_length)
             .filter(|&(t, b)| t != TableRows::Q8_0 || b.is_multiple_of(4));
-        let Some((table, row_bytes)) = table.filter(|&(_, b)| {
-            en.key_length > 0 && dims.engram_bytes == en.layer_ids.len() * rows * b
-        }) else {
+        // A rank of a tensor-parallel load carries its columns of each site's rows alone.
+        let site_cols = |b: usize| {
+            let site = en.layer_ids.len() * b;
+            (site > 0 && dims.engram_bytes.is_multiple_of(site))
+                .then(|| dims.engram_bytes / site)
+                .filter(|&c| c > 0 && c <= en.rows_per_token())
+        };
+        let Some((table, row_bytes, rows)) = table
+            .filter(|_| en.key_length > 0)
+            .and_then(|(t, b)| Some((t, b, site_cols(b)?)))
+        else {
             return Err(refuse(format!(
                 "engram rows of {} values of {}, {} bytes a token in the image: not {} sites of \
-                 {rows} Q8_0 rows in whole words, Q3_K rows of whole super-blocks, or IQ4_NL or \
+                 up to {} Q8_0 rows in whole words, Q3_K rows of whole super-blocks, or IQ4_NL or \
                  MXFP8 rows of whole blocks",
                 en.key_length,
                 table_ty,
                 dims.engram_bytes,
-                en.layer_ids.len()
+                en.layer_ids.len(),
+                en.rows_per_token()
             )));
         };
         let Some(embd) =
@@ -977,6 +997,7 @@ impl Glue {
             },
             table,
             sites,
+            split: rows < en.rows_per_token(),
         })
     }
 
@@ -1071,21 +1092,26 @@ impl Glue {
         params: &DeviceBuffer<u32>,
         layer: usize,
     ) -> Result<(), GpuError> {
-        self.enqueue_engram_kv_of(gpu, w, params, layer, 0)
+        self.enqueue_engram_kv_of(gpu, w, params, (layer, 0), None)
     }
 
     /// [`Glue::enqueue_engram_kv_at`] into row `row`'s scratch, from that
-    /// row's image `params`.
+    /// row's image `params`. On a rank of a tensor-parallel load the rows are
+    /// the rank's columns and `engram_wkv`'s output the rank's part of the
+    /// sum: `join` posts it, and the key norm runs after the sum
+    /// ([`Glue::enqueue_engram_of`]). A `join` without split rows, or split
+    /// rows without one, is refused by name.
     pub fn enqueue_engram_kv_of(
         &mut self,
         gpu: &Gpu,
         w: &Weights,
         params: &DeviceBuffer<u32>,
-        layer: usize,
-        row: usize,
+        (layer, row): (usize, usize),
+        join: Option<&mut RankJoin>,
     ) -> Result<(), GpuError> {
         const WHAT: &str = "Glue::enqueue_engram_kv_at";
         let stream = gpu.stream();
+        let site_at = self.joined(layer, join.is_some(), WHAT)?;
         let SiteRef {
             at_byte,
             wkv,
@@ -1123,19 +1149,34 @@ impl Glue {
             None
         };
         self.dense.enqueue(gpu, wkv, &site.x, act, &mut site.kv)?;
-        self.engram.enqueue_key_norm(
-            stream,
-            KeyNormArgs {
-                kv: &site.kv,
-                gain: gain(w, gain_k, HC_STREAMS * ROW)?,
-                eps: self.eps,
-                hc: HC_STREAMS,
-                m: 1,
-                kn: &mut site.kn,
-                fault: gpu.layer_sink(layer)?,
-            },
-        )?;
-        Ok(())
+        if let Some(join) = join {
+            return join.post(gpu, JoinSlot::Site(site_at), &site.kv);
+        }
+        key_norm(&self.engram, gpu, w, (gain_k, self.eps), layer, site)
+    }
+
+    /// The index of the site at `layer`, checked against the rows it reads: a
+    /// rank's columns go with the rank's side of the sums, and every column
+    /// with none.
+    fn joined(&self, layer: usize, join: bool, what: &'static str) -> Result<usize, GpuError> {
+        let at = self
+            .sites
+            .iter()
+            .position(|s| s.layer == layer)
+            .ok_or_else(|| GpuError::Shape {
+                what,
+                detail: format!("layer {layer} carries no engram site"),
+            })?;
+        if join != self.split {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!(
+                    "a site whose rows are a rank's columns: {}; a sum over ranks given: {join}",
+                    self.split
+                ),
+            });
+        }
+        Ok(at)
     }
 
     /// Enqueue the engram step at `layer`: the gate over `a.streams` into
@@ -1150,25 +1191,35 @@ impl Glue {
         layer: usize,
         a: EngramStep<'_>,
     ) -> Result<(), GpuError> {
-        self.enqueue_engram_of(gpu, w, layer, 0, a)
+        self.enqueue_engram_of(gpu, w, (layer, 0), a, None)
     }
 
     /// [`Glue::enqueue_engram`] on row `row`'s scratch, which that row's
-    /// token-only work wrote.
+    /// token-only work wrote. On a rank of a tensor-parallel load `join` first
+    /// sums the ranks' parts of `engram_wkv`'s output, which the token-only
+    /// work posted, and the key norm runs on the sum.
     pub fn enqueue_engram_of(
         &mut self,
         gpu: &Gpu,
         w: &Weights,
-        layer: usize,
-        row: usize,
+        (layer, row): (usize, usize),
         a: EngramStep<'_>,
+        join: Option<&mut RankJoin>,
     ) -> Result<(), GpuError> {
         const WHAT: &str = "Glue::enqueue_engram";
         let stream = gpu.stream();
         need(WHAT, "pre", a.pre.len(), HC_MIX)?;
+        let site_at = self.joined(layer, join.is_some(), WHAT)?;
         let SiteRef {
-            gain_q, row: site, ..
+            gain_k,
+            gain_q,
+            row: site,
+            ..
         } = site_row(&mut self.sites, layer, row, WHAT)?;
+        if let Some(join) = join {
+            join.sum(gpu, JoinSlot::Site(site_at), &mut site.kv)?;
+            key_norm(&self.engram, gpu, w, (gain_k, self.eps), layer, site)?;
+        }
         self.engram.enqueue_gate(
             stream,
             GateArgs {
@@ -1224,6 +1275,30 @@ struct SiteRef<'s> {
     gain_k: &'s str,
     gain_q: &'s str,
     row: &'s mut SiteRow,
+}
+
+/// Enqueue the key norm of `site`'s `engram_wkv` output at `layer`, by the
+/// gain named `gain_k` and the epsilon `eps`.
+fn key_norm(
+    k: &EngramGateKernels,
+    gpu: &Gpu,
+    w: &Weights,
+    (gain_k, eps): (&str, f32),
+    layer: usize,
+    site: &mut SiteRow,
+) -> Result<(), GpuError> {
+    k.enqueue_key_norm(
+        gpu.stream(),
+        KeyNormArgs {
+            kv: &site.kv,
+            gain: gain(w, gain_k, HC_STREAMS * ROW)?,
+            eps,
+            hc: HC_STREAMS,
+            m: 1,
+            kn: &mut site.kn,
+            fault: gpu.layer_sink(layer)?,
+        },
+    )
 }
 
 /// The site at `layer` of `sites`, with row `row`'s scratch; `what` names
@@ -1385,9 +1460,13 @@ pub struct StepRows {
     /// Rows a site gathers per token, and bytes a row.
     n_cols: usize,
     row_bytes: usize,
+    /// The columns of each site's rows the step reads: every one, or a rank's.
+    cols: Range<usize>,
     tokens: usize,
     ctx: Vec<u64>,
-    /// `[token][site][n_cols]`.
+    /// One token's ids of every column of every site, as the hash gives them.
+    all: Vec<u32>,
+    /// `[token][site][n_cols]`: the read columns' ids.
     ids: Vec<u32>,
     embd_rows: Vec<u8>,
     engram_rows: Vec<u8>,
@@ -1400,7 +1479,9 @@ impl StepRows {
     /// The host half for steps of `tokens` tokens of `file`, whose
     /// hyperparameters are `hp`, under `levers`: the embedding table checked,
     /// the engram tables opened (headers only) and checked against `hp`, and
-    /// every buffer a fill writes allocated.
+    /// every buffer a fill writes allocated. Each site's rows are read in its
+    /// columns `cols`: all of them, or a rank's of a tensor-parallel load. An
+    /// empty range or one past the columns is refused by name.
     ///
     /// A helper is pinned to the SMT sibling of the calling thread's core when
     /// that thread is pinned ([`caller_sibling`]) — the caller is the pool's
@@ -1411,6 +1492,7 @@ impl StepRows {
         hp: &Hparams,
         tokens: usize,
         levers: RowsLevers,
+        cols: Range<usize>,
     ) -> Result<StepRows, GpuError> {
         const WHAT: &str = "StepRows::open";
         let refuse = |detail: String| GpuError::Shape { what: WHAT, detail };
@@ -1471,7 +1553,13 @@ impl StepRows {
                 table_ty
             )));
         }
-        let n_cols = hash.n_cols();
+        let all = hash.n_cols();
+        if cols.is_empty() || cols.end > all {
+            return Err(refuse(format!(
+                "columns {cols:?} of a site's rows; the hash gives {all}"
+            )));
+        }
+        let n_cols = cols.len();
         let sites = engram.sites().len();
         let engram = Arc::new(engram);
         let helper = levers
@@ -1493,8 +1581,10 @@ impl StepRows {
             n_vocab: hp.n_vocab,
             n_cols,
             row_bytes,
+            cols,
             tokens,
             ctx: vec![0; en.max_ngram],
+            all: vec![0; sites * all],
             ids: vec![0; tokens * sites * n_cols],
             embd_rows: vec![0; tokens * embd_bytes],
             engram_rows: vec![0; tokens * sites * n_cols * row_bytes],
@@ -1548,7 +1638,13 @@ impl StepRows {
         let token_ids = self.engram.sites().len() * self.n_cols;
         for (k, window) in plan.engram_window.chunks_exact(n_gram).enumerate() {
             let ids = &mut self.ids[k * token_ids..][..token_ids];
-            token_rows(&self.engram, &mut self.ctx, window, ids, self.n_cols)?;
+            token_rows(
+                &self.engram,
+                (&mut self.ctx, window),
+                &mut self.all,
+                ids,
+                &self.cols,
+            )?;
             let ids = &self.ids[k * token_ids..][..token_ids];
             match self.helper.as_mut() {
                 Some(helper) => {
@@ -1699,16 +1795,17 @@ impl StepRows {
 
 /// The row ids every site gathers for the token whose n-gram `window` holds,
 /// newest first (a plan's [`StepPlan::engram_window`] run of one token), into
-/// `ids`, `n_cols` per site in site order: the window mapped as the port
-/// maps it — the token, then each older one up to the first missing, the pad
-/// id from there on — into `ctx`, then hashed per site. A token past the
+/// `ids`, the columns `cols` of each site in site order: the window mapped as
+/// the port maps it — the token, then each older one up to the first missing,
+/// the pad id from there on — into `ctx`, then hashed per site into `all`,
+/// every column of every site, whose `cols` are kept. A token past the
 /// table's token map is not a token of the model and is refused by name.
 fn token_rows(
     engram: &Engram,
-    ctx: &mut [u64],
-    window: &[Option<u32>],
+    (ctx, window): (&mut [u64], &[Option<u32>]),
+    all: &mut [u32],
     ids: &mut [u32],
-    n_cols: usize,
+    cols: &Range<usize>,
 ) -> Result<(), GpuError> {
     let hash = engram.hash();
     let mut blocked = false;
@@ -1721,9 +1818,15 @@ fn token_rows(
             _ => hash.pad_id(),
         };
     }
-    for (s, site_ids) in ids.chunks_exact_mut(n_cols).enumerate() {
-        hash.rows_into(s, ctx, site_ids)
+    let n_cols = all.len() / engram.sites().len().max(1);
+    for (s, (site_all, site_ids)) in all
+        .chunks_exact_mut(n_cols)
+        .zip(ids.chunks_exact_mut(cols.len()))
+        .enumerate()
+    {
+        hash.rows_into(s, ctx, site_all)
             .map_err(|e| GpuError::plan("StepRows::begin", e))?;
+        site_ids.copy_from_slice(&site_all[cols.clone()]);
     }
     Ok(())
 }
