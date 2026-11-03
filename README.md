@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/midagedev/bloomery/releases/tag/v0.3.11">0.3.11 release notes</a> ·
+  <a href="https://github.com/midagedev/bloomery/releases/tag/v0.3.12">0.3.12 release notes</a> ·
   <a href="docs/models.md">Models</a> ·
   <a href="docs/serving.md">Serving</a> ·
   <a href="docs/agents.md">Agents</a> ·
@@ -81,7 +81,8 @@ and Homebrew all take the latest release. To build from source instead: [`docs/B
 The release carries a GB10 archive (`linux-aarch64-cuda-sm121a`, built for the GB10's FP4 tensor cores, its GPU code
 compiled ahead) and a linux/arm64 variant of the Docker image `ghcr.io/midagedev/bloomery` made from it. On a GB10
 the installer picks that archive and Docker pulls that variant by itself. The machine needs DGX OS 7 (Ubuntu 24.04,
-glibc 2.39) and an NVIDIA driver of R580 or newer (CUDA 13).
+glibc 2.39) and an NVIDIA driver of R580 or newer (CUDA 13). 0.3.12's GB10 archive is added to the release when it is
+ready; until then the installer stops at its download by name, and `install.sh --version v0.3.11` installs 0.3.11.
 
 ```sh
 # Docker (needs the host's NVIDIA Container Toolkit; model downloads live in the bloomery-cache volume)
@@ -116,12 +117,12 @@ docker run --gpus all -p 8080:8080 -v bloomery-cache:/root/.cache/bloomery \
   ghcr.io/midagedev/bloomery --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M
 
 # or the plain tarball
-tar -xzf bloomery-0.3.11-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.3.11-linux-x86_64-cuda-sm86
+tar -xzf bloomery-0.3.12-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.3.12-linux-x86_64-cuda-sm86
 bin/bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M
 ```
 
 The tarballs are on the [releases page](https://github.com/midagedev/bloomery/releases)
-([0.3.11](https://github.com/midagedev/bloomery/releases/tag/v0.3.11)).
+([0.3.12](https://github.com/midagedev/bloomery/releases/tag/v0.3.12)).
 
 From 0.3.11 the release carries an archive for the RTX 50 series (`linux-x86_64-cuda-sm120a`, compute capability 12.0:
 the RTX 5090 and the RTX PRO Blackwell cards), built for the Blackwell FP4 and FP8 tensor cores. The installer takes it
@@ -144,7 +145,7 @@ The Mac needs macOS 26.2 or newer; the binaries are signed and notarized. The se
 brew install midagedev/tap/bloomery
 bloomery-serve-metal -m PATH/Qwen3.6-35B-A3B-Q4_K_M.gguf
 
-# or the same installer as on Linux (bloomery-0.3.11-macos-arm64-metal.tar.gz on the releases page)
+# or the same installer as on Linux (bloomery-0.3.12-macos-arm64-metal.tar.gz on the releases page)
 curl -fsSL https://raw.githubusercontent.com/midagedev/bloomery/main/tools/release/install.sh | sh
 ~/.local/bin/bloomery-serve-metal -m PATH/Qwen3.6-35B-A3B-Q4_K_M.gguf
 ```
@@ -194,6 +195,7 @@ These seats serve a file or a checkpoint folder on disk (`-m PATH`):
 | `qwen38` | Qwen3.8-Flash-Next, checkpoint folders | NVIDIA's NVFP4 or FP4-Local folder, its routed experts split between the card and the host, no conversion; also `--hf nvidia/Qwen3.8-Flash-Next-NVFP4` |
 | `nemotron` | Nemotron 3 Nano 4B, Nemotron 3.5 Bolt 74B-A9B, Nemotron-3.5-Lightning 30B-A3B | the GGUF |
 | `solar2` | Solar-Open2-250B, two cards | the GGUF, with `--place bp` |
+| `mistrallarge4` | Mistral Large 4 (1T, 52B active) | unsloth's `UD-IQ1_S` or Mix-256G GGUF; `--place a` on one 24 GB card |
 | `raon1` | Raon-1-mini-preview | `raon-1-mini-preview-Q4_K_M.gguf`, its DFlash2 draft file beside it |
 
 The server has one slot, so a second request waits for the first. `--parallel 4 --slot-ctx 32768` serves four
@@ -223,12 +225,12 @@ Ada cards (sm_89) have no report yet, and AMD GPUs are not supported yet. On an 
 accelerators for the prompt's GEMMs. What each part of the machine costs in a decode step:
 [`docs/HARDWARE.md`](docs/HARDWARE.md).
 
-## Status (0.3.11)
+## Status (0.3.12)
 
 Four common machines, one table each, tok/s. Every other record (two cards, older releases, other cards and Macs, the
 reference engines) is in [`docs/numbers.md`](docs/numbers.md), with its machine and conditions. Each table names the
-release or commit it was measured on; 0.3.11's own rows, Qwen3.8-27B's among them, are in its
-[release notes](https://github.com/midagedev/bloomery/releases/tag/v0.3.11).
+release or commit it was measured on; 0.3.12's own rows, Mistral Large 4's among them, are in its
+[release notes](https://github.com/midagedev/bloomery/releases/tag/v0.3.12).
 
 **One RTX 3090 24 GB**, on our workstation (32-core AVX2 host, 256 GB of RAM, the 3090 at its 250 W cap): the tagged
 0.3.10 tree at the serving defaults (`--place` unset, every lever unset, speculative drafts on where a model has one, no
@@ -324,7 +326,7 @@ release's check:
 Output is checked layer by layer against ik_llama.cpp (V4.1: PPL 2.2401 against 2.2378, same top token 97.46 %), and
 every gate is shown to fail on its defect before the fix lands ([how](docs/performance.md#how-it-is-verified)).
 
-## Known limits (0.3.11)
+## Known limits (0.3.12)
 
 - DeepSeek V4.1 on two cards (`--place bp`) is not faster than one card (`--place a`). Unset `--place` picks `a`.
 - The `nemotron`, `raon1`, `solar2` and `musespark` seats serve one slot; `--parallel` above 1 is refused by name.
@@ -334,10 +336,12 @@ every gate is shown to fail on its defect before the fix lands ([how](docs/perfo
   types stay on the host.
 - Muse Spark Open always thinks: a turn's first tokens are its reasoning, so a short `max_tokens` can end with empty
   `content`.
-- MiniMax-M3 (not M3.1) was not checked for 0.3.11; each family's newest model was.
+- MiniMax-M3 (not M3.1) was not checked for 0.3.12; each family's newest model was.
 - Flint's greedy text has no CPU or llama.cpp referee yet; the card path's gates and the serving checks hold it.
 - DeepSeek V4.1 runs routed experts on a card only as Q3_K gate·up with a Q4_K down; other expert types (ISTA-DASLab's
   IQ1_M, IQ2_XXS and IQ2_XS) run on the host tier.
+- DeepSeek V4.1 on one 24 GB card from a file with an r8 sidecar beside it is refused at the load by name (the NVMe
+  tier does not fill from the sidecar yet); `BLOOMERY_R8=off` reads the source file with the same bits.
 - GLM-5.3 holds at most 16,384 positions a slot; a `--ctx-size` whose slot share is larger is refused at the start.
 
 Every limit, by seat: [`docs/serving.md`](docs/serving.md#12-limits).
