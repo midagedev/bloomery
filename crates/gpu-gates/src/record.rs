@@ -255,6 +255,33 @@ pub fn tp_need(
         .u("read_runs", reads.len())
 }
 
+/// One rank's run of a tensor-parallel greedy run.
+pub static TP_RUN: Kind = Kind {
+    name: "tp_run",
+    head: "tp run",
+    doc: "One rank's tensor-parallel greedy run (generate_ds41 --place tp), after the run: its rank among the ranks, the context the group agreed on, its load's wall time and device bytes, the prompt positions it stepped and their wall time, and the generated tokens it stepped and their rate.",
+    parts: &[
+        key("rank", U64, ""),
+        lit("/"),
+        pos("ranks", U64, "ranks"),
+        key("ctx", U64, "positions"),
+        key("load_s", F64(3), "s"),
+        key("resident_bytes", U64, "B"),
+        key("prompt", U64, "positions"),
+        key("prompt_s", F64(3), "s"),
+        key("decoded", U64, "tokens"),
+        key("decode_tps", F64(3), "tok/s"),
+    ],
+};
+
+/// The decode of a tensor-parallel run's tokens.
+pub static TP_TEXT: Kind = Kind {
+    name: "tp_text",
+    head: "tp text",
+    doc: "Rank 0's generated tokens decoded by the folder's tokenizer, as a quoted string (generate_ds41 --place tp).",
+    parts: &[key("text", Text, "")],
+};
+
 /// Where a qwen3moe-family placement puts the routed experts, before the
 /// load.
 pub static PLAN38: Kind = Kind {
@@ -3114,6 +3141,8 @@ pub static GATE_GEMMA_EMBEDDING2_SERVE: &[&Kind] = kinds![
 /// What `generate_ds41` prints, in the order it prints them.
 pub static GENERATE_DS41: &[&Kind] = &[
     &TP_NEED,
+    &TP_RUN,
+    &TP_TEXT,
     &PLACE_UNSET,
     &WARM_LOAD,
     &WARM_SAVE,

@@ -12,6 +12,11 @@
 //!                   [--logits] [--warm-save]
 //!     generate_ds41 --records-schema
 //!     generate_ds41 --preflight <folder> --ranks N[,N...] [--ctx C]
+//!     generate_ds41 --place tp --ranks FILE --rank R (--folder DIR | --store DIR) [flags]
+//!
+//! `--place tp`, in a build with the `checkpoint` feature (a build without it
+//! refuses it by name), runs one rank of a tensor-parallel greedy run of an
+//! original checkpoint folder (`shared/ds41_tp.rs`).
 //!
 //! `--preflight`, in a build with the `checkpoint` feature (a build without it
 //! refuses the flag by name), reads the original checkpoint folder's headers
@@ -356,6 +361,10 @@ mod gen_slots;
 #[path = "shared/state_back.rs"]
 mod state_back;
 
+#[cfg(all(feature = "deepseek41", feature = "checkpoint"))]
+#[path = "shared/ds41_tp.rs"]
+mod tp;
+
 #[cfg(feature = "deepseek41")]
 mod drive {
     use std::num::NonZeroUsize;
@@ -363,6 +372,8 @@ mod drive {
     use std::path::Path;
     use std::time::{Duration, Instant};
 
+    #[cfg(feature = "checkpoint")]
+    use crate::tp::run as tp_run;
     use app::arch::deepseek41::Ds41Cfg;
     use app::warm::{WarmFile, WarmLoad, WarmSave};
     use app::{Loaded, OpenArgs, OpenLog, RowsLog, Session, SessionError};
@@ -698,7 +709,7 @@ mod drive {
     /// The depth tables' sequence, `lcg_prompt` of `tools/ref/lease.sh`: 100000,
     /// then an LCG walk over [1000, 91000). awk computes it in doubles, so this
     /// does too — past the second id the exact 64-bit LCG is another sequence.
-    fn depth_ids(n: usize) -> Vec<u32> {
+    pub(crate) fn depth_ids(n: usize) -> Vec<u32> {
         let mut out = Vec::with_capacity(n);
         let mut s: f64 = 12345.0;
         for i in 0..n {
@@ -800,11 +811,25 @@ mod drive {
         )
     }
 
+    /// `--place tp` in a build without the `checkpoint` feature, refused by name.
+    #[cfg(not(feature = "checkpoint"))]
+    fn tp_run(_args: &[String], _levers: &Levers) -> Result<(), GateError> {
+        Err(
+            "--place tp: a rank's checkpoint folder is opened by a build with the checkpoint feature"
+                .into(),
+        )
+    }
+
     pub fn run() -> Result<(), GateError> {
         let args: Vec<String> = std::env::args().collect();
         if args.iter().any(|a| a == "--preflight") {
             record::at_main("generate_ds41", record::GENERATE_DS41);
             return preflight(&args[1..]);
+        }
+        if args.windows(2).any(|w| w[0] == "--place" && w[1] == "tp") {
+            let levers = bloomery_levers::at_main(ACTS_ON)?;
+            record::at_main("generate_ds41", record::GENERATE_DS41);
+            return tp_run(&args[1..], &levers);
         }
         // llama-server's placement flags and variables come out of the arguments, and the levers
         // they are replace the environment's, before any lever is read.
