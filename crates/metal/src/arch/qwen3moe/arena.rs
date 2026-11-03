@@ -809,7 +809,7 @@ fn bytes_of_len<T: Elem>(n: usize) -> u64 {
 }
 
 /// The bytes buffer `b` holds.
-fn bytes_of<T: Elem>(b: &MetalBuffer<T>) -> u64 {
+pub(super) fn bytes_of<T: Elem>(b: &MetalBuffer<T>) -> u64 {
     bytes_of_len::<T>(b.pages().len().get())
 }
 

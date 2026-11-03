@@ -47,8 +47,10 @@ pub fn band(max_logit: f32) -> f64 {
     ROUNDINGS * DELTA * f64::from(max_logit.abs())
 }
 
-/// FNV-1a 64 over `bytes`: the dump's checksum.
-fn fnv1a(bytes: &[u8]) -> u64 {
+/// FNV-1a 64 over `bytes`: the checksum of a dump and of a pin file's f32
+/// little-endian bytes.
+#[must_use]
+pub fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
         h ^= u64::from(b);
@@ -64,10 +66,6 @@ pub struct Dump {
     pub n: usize,
     pub hidden: usize,
     pub positions: Vec<usize>,
-    /// The target's argmax after the id at each kept position's next step.
-    pub target: Vec<u32>,
-    /// The reference draft's argmax at each kept position, `pre` then `post`.
-    pub picks: [Vec<u32>; 2],
     pub agree: [usize; 2],
     /// The hidden row (before the output norm) of every pair, `hidden` values each.
     pub rows: Vec<f32>,
@@ -75,13 +73,13 @@ pub struct Dump {
     pub logits: Vec<[Vec<f32>; 2]>,
 }
 
-/// The ints of a dump text's list line.
-fn list(v: &str) -> Result<Vec<u64>, String> {
+/// The ids of a dump text's list line: each fits u32, or the line is refused.
+fn list(v: &str) -> Result<Vec<u32>, String> {
     if v.is_empty() {
         return Ok(Vec::new());
     }
     v.split(',')
-        .map(|x| x.parse::<u64>().map_err(|e| format!("{x:?}: {e}")))
+        .map(|x| x.parse::<u32>().map_err(|e| format!("{x:?}: {e}")))
         .collect()
 }
 
@@ -102,15 +100,14 @@ pub fn read(dir: &Path, family: &str) -> Result<Dump, String> {
             .parse::<usize>()
             .map_err(|e| format!("{}: {name}: {e}", txt.display()))
     };
-    let ints = |name: &str| -> Result<Vec<u64>, String> {
+    let ints = |name: &str| -> Result<Vec<u32>, String> {
         list(field(name)?).map_err(|e| format!("{}: {name}: {e}", txt.display()))
     };
     if field("kind")? != "mtp" || num("version")? != 1 {
         return Err(format!("{}: not an mtp dump of version 1", txt.display()));
     }
-    let to_u32 = |v: Vec<u64>| -> Vec<u32> { v.into_iter().map(|x| x as u32).collect() };
     let (steps, n, hidden) = (num("steps")?, num("n")?, num("hidden")?);
-    let ids = to_u32(ints("ids")?);
+    let ids = ints("ids")?;
     let positions: Vec<usize> = ints("positions")?.into_iter().map(|x| x as usize).collect();
     if ids.len() != steps || steps < 2 || positions.is_empty() {
         return Err(format!(
@@ -154,17 +151,13 @@ pub fn read(dir: &Path, family: &str) -> Result<Dump, String> {
         .chunks(2 * n)
         .map(|c| [c[..n].to_vec(), c[n..].to_vec()])
         .collect();
-    let (target, pre, post) = (
-        to_u32(ints("target")?),
-        to_u32(ints("pre")?),
-        to_u32(ints("post")?),
-    );
-    for (name, v) in [("target", &target), ("pre", &pre), ("post", &post)] {
-        if v.len() != positions.len() {
+    for name in ["target", "pre", "post"] {
+        let picks = ints(name)?;
+        if picks.len() != positions.len() {
             return Err(format!(
                 "{}: {} {name} picks for {} positions",
                 txt.display(),
-                v.len(),
+                picks.len(),
                 positions.len()
             ));
         }
@@ -174,8 +167,6 @@ pub fn read(dir: &Path, family: &str) -> Result<Dump, String> {
         n,
         hidden,
         positions,
-        target,
-        picks: [pre, post],
         agree: [num("agree_pre")?, num("agree_post")?],
         rows: rows.to_vec(),
         logits,
@@ -397,6 +388,15 @@ mod tests {
         assert!(read(&dir, "t").unwrap_err().contains("checksum"));
         std::fs::write(dir.join("t.f32"), &raw[..raw.len() - 4]).unwrap();
         assert!(read(&dir, "t").unwrap_err().contains("bytes"));
+        // An id that does not fit u32 is refused by name, not cut to 5; the
+        // checksum is the dump's own, so only the id differs.
+        std::fs::write(dir.join("t.f32"), &raw).unwrap();
+        std::fs::write(dir.join("t.txt"), text.replace("ids 5,", "ids 4294967301,")).unwrap();
+        let e = read(&dir, "t").unwrap_err();
+        assert!(e.contains("ids") && e.contains("4294967301"), "{e}");
+        std::fs::write(dir.join("t.txt"), text.replace("pre 2", "pre 4294967296")).unwrap();
+        let e = read(&dir, "t").unwrap_err();
+        assert!(e.contains("pre") && e.contains("4294967296"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

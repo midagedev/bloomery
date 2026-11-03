@@ -84,7 +84,7 @@ fn refuse(detail: impl Into<String>) -> SessionError {
 }
 
 /// The whole of `b`.
-fn all<T: Elem>(b: &MetalBuffer<T>) -> Result<Window<'_, T, MetalDevice>, DeviceError> {
+pub(super) fn all<T: Elem>(b: &MetalBuffer<T>) -> Result<Window<'_, T, MetalDevice>, DeviceError> {
     b.window(Elems(0), b.len())
 }
 

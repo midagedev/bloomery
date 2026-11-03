@@ -40,6 +40,7 @@ use std::time::Duration;
 
 use bloomery_device::conformance::{Clause, Verdict};
 use bloomery_metal::arch::qwen3moe::check;
+use bloomery_metal::arch::qwen3moe::mtp_check::fnv1a;
 use bloomery_metal::arch::qwen3moe::plan::{self, Data, DeviceRoom, HostMemory};
 use bloomery_metal::arch::qwen3moe::session::{Session, SessionError, StepMode};
 use bloomery_metal::device::MetalDevice;
@@ -55,16 +56,6 @@ const GREEDY: usize = 24;
 /// The token `m_mlx` and `m_mlx_folder` start from: the row's seed.
 fn seed() -> u32 {
     row::current().seed
-}
-
-/// FNV-1a 64-bit, the pin file's checksum of the f32 little-endian bytes.
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut h = 0xcbf29ce484222325u64;
-    for &b in bytes {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
 }
 
 /// A [`PassSink`] that hears nothing.

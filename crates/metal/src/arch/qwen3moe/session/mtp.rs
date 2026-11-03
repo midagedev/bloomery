@@ -50,14 +50,16 @@ use chain::arch::qwen3moe::ops::{ChainOps, LayerCtx};
 use chain::arch::qwen3moe::walk;
 use gguf::TensorInfo;
 use gguf::quant::GgmlType;
+use hf::modelopt::{Plain, Use, normalize};
+use hf::quant_config::{Format, Placed};
 use model::part::Part;
 use safetensors::{Dtype, Safetensors};
 
 use super::super::arena::{
-    self, Arena, LayerBufs, PartSource, load_layer, load_site, load_values, slot_of,
+    self, Arena, LayerBufs, PartSource, bytes_of, load_layer, load_site, load_values, slot_of,
 };
 use super::super::check::{AttnLayout, FfnLayout, LayerLayout, Layout, MixerLayout, Site, Values};
-use super::super::ops::{Feed, MetalOps};
+use super::super::ops::{Feed, MetalOps, all};
 use super::{STAMP_WAIT, Session, SessionError, refuse};
 use crate::buffer::MetalBuffer;
 use crate::kernels::{EmbedParams, HiddenRow, Kernels, MatvecParams, Mode, MtpJoinParams, Quant};
@@ -71,7 +73,7 @@ const WHAT: &str = "qwen35moe mtp";
 const MODEL_TYPE: &str = "qwen3_5_mtp";
 
 /// MLX's affine groups: 4-bit codes, 64 values a scale and bias.
-const BITS: u64 = 4;
+const BITS: usize = 4;
 const GROUP: usize = 64;
 
 /// The record slot's layer of an embed fault: layer 0 of the draft.
@@ -248,7 +250,7 @@ impl Sidecar {
         }
         let quant = json.get("quantization");
         let q = |k: &str| quant.and_then(|q| q.get(k));
-        if q("bits").and_then(|v| v.as_u64()) != Some(BITS)
+        if q("bits").and_then(|v| v.as_u64()) != Some(BITS as u64)
             || q("group_size").and_then(|v| v.as_u64()) != Some(GROUP as u64)
             || q("mode").and_then(|v| v.as_str()) != Some("affine")
         {
@@ -410,107 +412,52 @@ impl Sidecar {
         }
         Ok(())
     }
-
-    /// The f32 values of the BF16 vector `name`, read byte-wise: a sidecar's
-    /// small vectors may sit off a 2-byte boundary in the file.
-    fn vector(&self, name: &str) -> Result<Vec<f32>, SessionError> {
-        let raw = self
-            .st
-            .raw(name)
-            .map_err(|e| mtp_refuse(format!("{name}: {e}")))?;
-        if raw.dtype != Dtype::Bf16 {
-            return Err(mtp_refuse(format!(
-                "{name}: a {} tensor where BF16 is expected",
-                raw.dtype.name()
-            )));
-        }
-        let (pairs, rest) = raw.bytes.as_chunks::<2>();
-        if !rest.is_empty() {
-            return Err(mtp_refuse(format!("{name}: an odd byte count")));
-        }
-        Ok(pairs
-            .iter()
-            .map(|b| f32::from_bits(u32::from(u16::from_le_bytes(*b)) << 16))
-            .collect())
-    }
-}
-
-/// MLX's affine 4-bit tensor as the file's MLX_A4 blocks: each group of 64
-/// values is its 8 little-endian words of codes, then its scale and its bias
-/// as BF16 bits (36 bytes), a row's groups in order, rows in order.
-/// `words` is the packed weight (`rows * cols / 8` words), `scales` and
-/// `biases` each `rows * cols / 64` BF16 values, as safetensors stores them.
-fn a4_blocks(
-    name: &str,
-    rows: usize,
-    cols: usize,
-    words: &[u8],
-    scales: &[u8],
-    biases: &[u8],
-) -> Result<Vec<u8>, SessionError> {
-    let groups = rows * (cols / GROUP);
-    if !cols.is_multiple_of(GROUP)
-        || words.len() != groups * 32
-        || scales.len() != groups * 2
-        || biases.len() != groups * 2
-    {
-        return Err(mtp_refuse(format!(
-            "{name}: {rows} rows of {cols} columns are not {groups} groups of {GROUP} in {} \
-             bytes of codes, {} of scales and {} of biases",
-            words.len(),
-            scales.len(),
-            biases.len()
-        )));
-    }
-    let mut out = Vec::with_capacity(groups * 36);
-    for g in 0..groups {
-        out.extend_from_slice(&words[g * 32..(g + 1) * 32]);
-        out.extend_from_slice(&scales[g * 2..g * 2 + 2]);
-        out.extend_from_slice(&biases[g * 2..g * 2 + 2]);
-    }
-    Ok(out)
 }
 
 impl PartSource for Sidecar {
     /// A name a layout gives: a linear's base name is its MLX_A4 blocks, a
-    /// vector's full name its F32 values.
+    /// vector's full name its F32 values, each made by the owner of the
+    /// checkpoint's tensors ([`normalize`]), as the session's own folder is.
     fn part(&self, name: &str) -> Result<Part<'static>, SessionError> {
-        let scales = format!("{name}.scales");
-        if self.st.entry(&scales).is_some() {
-            let (rows, cols) = self.shape(name)?;
-            let get = |suffix: &str| -> Result<&[u8], SessionError> {
-                self.st
-                    .raw(&format!("{name}.{suffix}"))
-                    .map(|r| r.bytes)
-                    .map_err(|e| mtp_refuse(format!("{name}.{suffix}: {e}")))
-            };
-            let bytes = a4_blocks(
-                name,
-                rows,
-                cols,
-                get("weight")?,
-                get("scales")?,
-                get("biases")?,
-            )?;
-            let info = TensorInfo {
-                name: name.to_owned(),
-                dims: vec![cols as u64, rows as u64],
-                ty: GgmlType::MLX_A4,
-                offset: 0,
-                nbytes: bytes.len() as u64,
-            };
-            return Ok(Part::made(info, bytes, None));
-        }
-        let values = self.vector(name)?;
-        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let quant = self.st.entry(&format!("{name}.scales")).is_some();
+        let (weight, placed) = if quant {
+            (
+                format!("{name}.weight"),
+                Placed {
+                    format: Format::MlxAffine {
+                        bits: BITS,
+                        group: GROUP,
+                    },
+                    companions: vec![format!("{name}.scales"), format!("{name}.biases")],
+                },
+            )
+        } else {
+            (
+                name.to_owned(),
+                Placed {
+                    format: Format::Bf16,
+                    companions: vec![],
+                },
+            )
+        };
+        let normal = normalize(
+            |n| self.st.raw(n),
+            &[(&weight, &placed)],
+            Use::Matrix(Plain::F32),
+        )
+        .map_err(|e| mtp_refuse(e.to_string()))?;
         let info = TensorInfo {
             name: name.to_owned(),
-            dims: vec![values.len() as u64],
-            ty: GgmlType::F32,
+            dims: normal.dims,
+            ty: if quant {
+                GgmlType::MLX_A4
+            } else {
+                GgmlType::F32
+            },
             offset: 0,
-            nbytes: bytes.len() as u64,
+            nbytes: normal.bytes.len() as u64,
         };
-        Ok(Part::made(info, bytes, None))
+        Ok(Part::made(info, normal.bytes, None))
     }
 }
 
@@ -540,10 +487,6 @@ pub(super) struct Mtp {
     /// The plan layer the draft's walk reads.
     plan_layer: usize,
     eps: f32,
-    /// The bytes the sidecar's weights occupy on the device.
-    weight_bytes: u64,
-    /// The bytes of the draft layer's K/V planes.
-    kv_bytes: u64,
 }
 
 /// What [`Session::open_mtp`] made.
@@ -671,19 +614,11 @@ impl Session {
             bufs,
             plan_layer,
             eps,
-            weight_bytes,
-            kv_bytes,
         });
         Ok(MtpOpened {
             weight_bytes,
             kv_bytes,
         })
-    }
-
-    /// Whether a sidecar is open.
-    #[must_use]
-    pub fn has_mtp(&self) -> bool {
-        self.mtp.is_some()
     }
 
     fn mtp_ref(&self) -> Result<&Mtp, SessionError> {
@@ -841,15 +776,6 @@ impl Session {
         }
         Ok(times)
     }
-
-    /// The sidecar's resident bytes, for a caller that prints them.
-    #[must_use]
-    pub fn mtp_bytes(&self) -> Option<MtpOpened> {
-        self.mtp.as_ref().map(|m| MtpOpened {
-            weight_bytes: m.weight_bytes,
-            kv_bytes: m.kv_bytes,
-        })
-    }
 }
 
 /// The device bytes of the weights of one layer of buffers: its mixer's and
@@ -869,11 +795,6 @@ fn layer_bytes(l: &LayerBufs) -> u64 {
     n + bytes_of(&l.ffn.gate) + bytes_of(&l.ffn.up) + bytes_of(&l.ffn.down) + bytes_of(&l.ffn.norm)
 }
 
-/// The bytes buffer `b` holds.
-fn bytes_of<T: bloomery_device::Elem>(b: &MetalBuffer<T>) -> u64 {
-    b.pages().len().get() as u64 * core::mem::size_of::<T>() as u64
-}
-
 /// The draft step's groups on `enc`: the embedding of the token, the join, the
 /// fusion projection, the draft layer's walk and the head, each closed by a
 /// barrier. The arena's layer list and head norm are the draft's for the
@@ -889,14 +810,6 @@ fn encode_draft(
 ) -> Result<(), SessionError> {
     let slot = slot_of(pos);
     let h = arena.hidden;
-    fn all(
-        b: &MetalBuffer<f32>,
-    ) -> Result<
-        bloomery_device::Window<'_, f32, crate::device::MetalDevice>,
-        bloomery_device::DeviceError,
-    > {
-        b.window(Elems(0), b.len())
-    }
     {
         let b = &mut mtp.bufs;
         kernels.embed(
@@ -965,66 +878,104 @@ fn encode_draft(
 mod tests {
     use super::*;
 
-    /// A packed weight, scales and biases of `rows` x `cols`, drawn from a
-    /// counter, and the value MLX's `dequantize` gives each place
-    /// (`scale · code + bias`, the low nibble of word `i / 8` first).
-    fn drawn(rows: usize, cols: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<f32>) {
+    /// The planes of a `rows` x `cols` linear as safetensors stores them: the
+    /// packed codes, and a BF16 scale and bias a group (finite, distinct).
+    fn planes(rows: usize, cols: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let groups = rows * (cols / GROUP);
-        let mut words = Vec::with_capacity(groups * 32);
-        for i in 0..groups * 8 {
-            let w: u32 = (i as u32)
-                .wrapping_mul(0x9E37_79B1)
-                .rotate_left(i as u32 % 31);
-            words.extend_from_slice(&w.to_le_bytes());
-        }
+        let words: Vec<u8> = (0..groups * 32).map(|i| (i * 7 + 3) as u8).collect();
         let bf = |x: f32| ((x.to_bits() >> 16) as u16).to_le_bytes();
-        let scale = |g: usize| 0.0625 * (1 + g % 5) as f32;
-        let bias = |g: usize| -0.5 + 0.125 * (g % 7) as f32;
-        let (mut scales, mut biases) = (Vec::new(), Vec::new());
-        for g in 0..groups {
-            scales.extend_from_slice(&bf(scale(g)));
-            biases.extend_from_slice(&bf(bias(g)));
-        }
-        let mut want = Vec::with_capacity(rows * cols);
-        for i in 0..rows * cols {
-            let g = i / GROUP;
-            let word = u32::from_le_bytes(words[(i / 8) * 4..(i / 8) * 4 + 4].try_into().unwrap());
-            let code = ((word >> (4 * (i % 8))) & 0xf) as f32;
-            want.push(scale(g) * code + bias(g));
-        }
-        (words, scales, biases, want)
+        let scales = (0..groups).flat_map(|g| bf(0.0625 * (1 + g % 5) as f32));
+        let biases = (0..groups).flat_map(|g| bf(-0.5 + 0.125 * (g % 7) as f32));
+        (words, scales.collect(), biases.collect())
     }
 
-    /// The MLX_A4 blocks decode, through the file reader's own `dequant_row`,
-    /// to the values MLX's affine dequantize gives the stored planes: the
-    /// repack moves bytes and changes no value. Mutant: scale and bias written
-    /// in the other order (every value moves).
+    /// A part is the type and dims its layout reads: a linear's MLX_A4 blocks
+    /// (a group's code words, then its scale, then its bias, rows in order,
+    /// `[cols, rows]`) and a BF16 vector's F32 values, widened exactly, whether
+    /// or not the vector sits on a 2-byte boundary of the file.
     #[test]
-    fn the_repacked_blocks_decode_to_mlx_s_dequantize() {
+    fn a_part_is_the_blocks_and_values_its_layout_reads() {
         let (rows, cols) = (3, 128);
-        let (words, scales, biases, want) = drawn(rows, cols);
-        let blocks = a4_blocks("t", rows, cols, &words, &scales, &biases).unwrap();
+        let (words, scales, biases) = planes(rows, cols);
+        let bits = [0x3f80u16, 0xc0a0, 0x0001, 0x7f7f];
+        let vector: Vec<u8> = bits.iter().flat_map(|b| b.to_le_bytes()).collect();
+        let (packed, grid) = ([rows, cols / 8], [rows, cols / GROUP]);
+        let tensors: [(&str, &str, &[usize], &[u8]); 6] = [
+            ("lin.weight", "U32", &packed, &words),
+            ("lin.scales", "BF16", &grid, &scales),
+            ("lin.biases", "BF16", &grid, &biases),
+            ("even", "BF16", &[4], &vector),
+            ("lead", "U8", &[1], &[0]),
+            ("odd", "BF16", &[4], &vector),
+        ];
+        let dir = folder("part", &config(64, 100, "", 4), &tensors);
+        let side = Sidecar::open(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let at = |name: &str| side.st.file_range(name).unwrap().start % 2;
+        assert_eq!((at("even"), at("odd")), (0, 1));
+        let lin = side.part("lin").unwrap();
+        assert_eq!(lin.info.ty, GgmlType::MLX_A4);
+        assert_eq!(lin.info.dims, [cols as u64, rows as u64]);
+        let blocks = lin.spans().concat();
+        assert_eq!(blocks.len() as u64, lin.info.nbytes);
         assert_eq!(blocks.len(), rows * cols / GROUP * 36);
-        let mut got = vec![0f32; rows * cols];
-        gguf::quant::dequant_row(GgmlType::MLX_A4, &blocks, &mut got).unwrap();
-        assert_eq!(got, want);
+        for (g, block) in blocks.chunks(36).enumerate() {
+            assert_eq!(block[..32], words[g * 32..(g + 1) * 32], "group {g} codes");
+            assert_eq!(block[32..34], scales[g * 2..g * 2 + 2], "group {g} scale");
+            assert_eq!(block[34..], biases[g * 2..g * 2 + 2], "group {g} bias");
+        }
+        for name in ["odd", "even"] {
+            let v = side.part(name).unwrap();
+            assert_eq!(
+                (v.info.ty, v.info.dims.as_slice()),
+                (GgmlType::F32, &[4][..])
+            );
+            let want: Vec<u8> = bits
+                .iter()
+                .flat_map(|&b| (f32::from_bits(u32::from(b) << 16)).to_le_bytes())
+                .collect();
+            assert_eq!(v.spans().concat(), want, "{name}");
+        }
     }
 
+    /// A scale, a bias or a vector value that is not finite is refused by the
+    /// tensor's name, where the part is made. Mutant: a part that passes the
+    /// stored bits through (the draft's first dot is NaN).
     #[test]
-    fn a_plane_of_another_length_is_refused_by_name() {
-        let (words, scales, biases, _) = drawn(2, 64);
-        let e = a4_blocks(
-            "layers.0.mlp.up_proj",
-            2,
-            64,
-            &words[..words.len() - 4],
-            &scales,
-            &biases,
-        )
-        .unwrap_err();
-        assert!(e.to_string().contains("layers.0.mlp.up_proj"), "{e}");
-        let e = a4_blocks("t", 2, 60, &words, &scales, &biases).unwrap_err();
-        assert!(e.to_string().contains("groups of 64"), "{e}");
+    fn a_non_finite_scale_bias_or_value_is_refused_by_name() {
+        let (rows, cols) = (2, 64);
+        let (words, scales, biases) = planes(rows, cols);
+        let bf = |x: f32| ((x.to_bits() >> 16) as u16).to_le_bytes();
+        let (mut bad_scales, mut bad_biases) = (scales.clone(), biases.clone());
+        bad_scales[2..4].copy_from_slice(&bf(f32::NAN));
+        bad_biases[0..2].copy_from_slice(&bf(f32::INFINITY));
+        let mut vector: Vec<u8> = [1.0f32, 2.0, 3.0].iter().flat_map(|&x| bf(x)).collect();
+        vector[4..6].copy_from_slice(&bf(f32::NEG_INFINITY));
+        let (packed, grid) = ([rows, cols / 8], [rows, cols / GROUP]);
+        let tensors: [(&str, &str, &[usize], &[u8]); 10] = [
+            ("ok.weight", "U32", &packed, &words),
+            ("ok.scales", "BF16", &grid, &scales),
+            ("ok.biases", "BF16", &grid, &biases),
+            ("nan.weight", "U32", &packed, &words),
+            ("nan.scales", "BF16", &grid, &bad_scales),
+            ("nan.biases", "BF16", &grid, &biases),
+            ("inf.weight", "U32", &packed, &words),
+            ("inf.scales", "BF16", &grid, &scales),
+            ("inf.biases", "BF16", &grid, &bad_biases),
+            ("vec", "BF16", &[3], &vector),
+        ];
+        let dir = folder("finite", &config(64, 100, "", 4), &tensors);
+        let side = Sidecar::open(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(side.part("ok").is_ok());
+        for (name, tensor, what) in [
+            ("nan", "nan.weight", "scale bits"),
+            ("inf", "inf.weight", "bias bits"),
+            ("vec", "vec", "non-finite value at 2"),
+        ] {
+            let e = side.part(name).err().unwrap().to_string();
+            assert!(e.contains(tensor) && e.contains(what), "{name}: {e}");
+        }
     }
 
     /// A sidecar written to a temporary folder: `tensors` by name, dtype,
