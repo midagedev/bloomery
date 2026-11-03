@@ -256,8 +256,17 @@ const PARTS: &str = "Weights::add_parts";
 /// multiplies; its part carries the scale ([`TensorPart::scale`]). A load checks every part it plans here before it reads any
 /// ([`Weights::add_parts`] checks each again with its bytes).
 pub fn part_format(t: &TensorInfo) -> Result<(CardFormat, usize), GpuError> {
+    part_format_as(t, None)
+}
+
+/// [`part_format`] in the card format `card` when given (a load's own choice for the tensor,
+/// such as a routed stack its plan holds as the file's blocks), else the type's.
+pub fn part_format_as(
+    t: &TensorInfo,
+    card: Option<CardFormat>,
+) -> Result<(CardFormat, usize), GpuError> {
     file_slot(&t.name)?;
-    let format = file_format(t).ok_or_else(|| {
+    let format = card.or_else(|| file_format(t)).ok_or_else(|| {
         GpuError::shape(
             PARTS,
             format!(
@@ -280,11 +289,12 @@ pub fn part_format(t: &TensorInfo) -> Result<(CardFormat, usize), GpuError> {
     Ok((format, bytes))
 }
 
-/// Each part's format, shape, scales, spans and staging bytes, checked before anything moves; a
-/// name `held` already holds is refused.
+/// Each part's format (`card`'s, else its type's), shape, scales, spans and staging bytes,
+/// checked before anything moves; a name `held` already holds is refused.
 fn part_formats(
     parts: &[TensorPart<'_>],
     held: impl Fn(&str) -> bool,
+    card: impl Fn(&TensorInfo) -> Option<CardFormat>,
 ) -> Result<(Vec<CardFormat>, usize), GpuError> {
     let mut seen = BTreeSet::new();
     let mut budget = 0usize;
@@ -294,7 +304,7 @@ fn part_formats(
         if !seen.insert(t.name.as_str()) || held(&t.name) {
             return Err(GpuError::shape(PARTS, format!("{} given twice", t.name)));
         }
-        let (format, bytes) = part_format(t)?;
+        let (format, bytes) = part_format_as(t, card(t))?;
         formats.push(format);
         let want = match t.dims.as_slice() {
             [_, _, experts] => *experts,
@@ -353,7 +363,7 @@ pub(crate) fn stage_parts(
     held: impl Fn(&str) -> bool,
     card: impl Fn(&TensorInfo) -> Option<CardFormat>,
 ) -> Result<Vec<(String, DevWeight)>, GpuError> {
-    let (formats, _) = part_formats(parts, held)?;
+    let (formats, _) = part_formats(parts, held, &card)?;
     let mut added = Vec::with_capacity(parts.len());
     for (p, format) in parts.iter().zip(formats) {
         let t = &p.info;
@@ -361,7 +371,7 @@ pub(crate) fn stage_parts(
             stream,
             ring,
             PARTS,
-            card(t).unwrap_or(format),
+            format,
             t,
             tensor_rows(t),
             &p.spans,
@@ -524,7 +534,7 @@ impl Weights {
         parts: &[TensorPart<'_>],
     ) -> Result<(), GpuError> {
         let held = |name: &str| self.by_name.contains_key(name);
-        let (_, budget) = part_formats(parts, held)?;
+        let (_, budget) = part_formats(parts, held, |_| None)?;
         stream.context().bind_to_thread()?;
         let mut ring = UploadRing::new(stream, budget)?;
         let added = stage_parts(stream, &mut ring, parts, held, |_| None)?;
@@ -2073,7 +2083,7 @@ mod tests {
                 spans,
                 scale: None,
             };
-            if !std::panic::catch_unwind(|| part_formats(&[part], |_| false))
+            if !std::panic::catch_unwind(|| part_formats(&[part], |_| false, |_| None))
                 .is_ok_and(|result| result.is_err())
             {
                 accepted.push((dims, nbytes));
@@ -2091,7 +2101,7 @@ mod tests {
             spans: vec![&[0u8; 72], &[0u8; 72]],
             scale: None,
         };
-        assert!(part_formats(&[part], |_| false).is_ok());
+        assert!(part_formats(&[part], |_| false, |_| None).is_ok());
     }
 
     /// Every type with a card format takes a part, and of the types a tensor scale multiplies only
@@ -2113,7 +2123,7 @@ mod tests {
                 spans: vec![&bytes],
                 scale: row.ty.reads_scale().then(|| vec![1.0]),
             };
-            let result = part_formats(&[part], |_| false);
+            let result = part_formats(&[part], |_| false, |_| None);
             if row.card.layout.is_some() && (!row.ty.reads_scale() || row.ty == GgmlType::NVFP4) {
                 assert!(result.is_ok(), "{}: {result:?}", row.ty);
             } else {
@@ -2153,7 +2163,7 @@ mod tests {
         let row = [32, 2];
         let none = |_: &str| false;
         let ok = [part("a", q8, &row, None), part("b", wide, &row, None)];
-        let (formats, budget) = part_formats(&ok, none).unwrap_or_else(|e| panic!("{e}"));
+        let (formats, budget) = part_formats(&ok, none, |_| None).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(formats.len(), 2);
         // Q8_0 [32, 2] stages 68 plane bytes, F32 [32, 2] 256.
         assert_eq!(budget, 68 + 256);
@@ -2162,7 +2172,7 @@ mod tests {
             nv("n", &[64, 2], Some(vec![0.5])),
             nv("s", &[64, 1, 3], Some(vec![0.5; 3])),
         ];
-        assert!(part_formats(&scaled, none).is_ok());
+        assert!(part_formats(&scaled, none, |_| None).is_ok());
         for (bad, says) in [
             (
                 vec![part("a", q8, &row, None), part("a", wide, &row, None)],
@@ -2190,13 +2200,13 @@ mod tests {
                 "reads 0 finite tensor scales",
             ),
         ] {
-            let e = part_formats(&bad, none)
+            let e = part_formats(&bad, none, |_| None)
                 .map(|_| ())
                 .unwrap_err()
                 .to_string();
             assert!(e.contains(says), "{e}");
         }
-        let e = part_formats(&ok[..1], |name| name == "a")
+        let e = part_formats(&ok[..1], |name| name == "a", |_| None)
             .map(|_| ())
             .unwrap_err();
         assert!(e.to_string().contains("a given twice"), "{e}");
