@@ -120,12 +120,16 @@
 //!   card arm's logits are bit-identical to it, a host arm's keep
 //!   [`COSINE_FLOOR`] with its argmax wherever its top-1 margin passes twice
 //!   the max |Δ|, and [`CONTINUE`] steps after the batch (fed the reference's
-//!   greedy ids) keep the same band at each position against the reference's
-//!   own, which holds the stores the batch leaves. The batch's last position
-//!   also keeps the floor and the argmax band against the arm's own decode
-//!   steps; the continuation does not run against the steps, because the
-//!   batch and the steps sum in another order and the fixture's near-tied
-//!   routers turn that into a different expert past the first position. A
+//!   greedy ids) keep the argmax band and [`CROSS_FLOOR`] at each position
+//!   against the reference's own, all but one of them [`COSINE_FLOOR`] too,
+//!   which holds the stores the batch leaves (how closely on each tier:
+//!   [`CROSS_FLOOR`]). Each step's MoE layers whose kept set is not the
+//!   reference's are printed, with the gap each load's own selection values
+//!   put at the cut. The batch's last position also keeps the floor and the
+//!   argmax band against the arm's own decode steps; the continuation does
+//!   not run against the steps, because the batch and the steps sum in
+//!   another order and the fixture's near-tied routers turn that into a
+//!   different expert past the first position. A
 //!   launch of the whole-card load's walks or batches, or of an arm's, that
 //!   raises the fault word fails the clause, the whole-card load's too: the
 //!   arms are then held against nothing, and the clause is red, not skipped.
@@ -205,6 +209,25 @@ mod gate {
     /// Steps after a prompt batch the host-tier clause compares with the
     /// whole-card load's.
     const CONTINUE: usize = 4;
+
+    /// The cosine every step after a host arm's prompt batch keeps against
+    /// the whole-card batch's, of which all but one also keep
+    /// [`COSINE_FLOOR`]. On the real file every such step's routing crosses
+    /// the whole-card's at the 9-expert cut in some MoE layer, each load's
+    /// pick within the two loads' score difference of a tie, and one crossing
+    /// can swap an expert whose output moves that step's logits past the
+    /// floor while the steps after it come back inside it. There a host-leg
+    /// defect the size of one MoE layer's share moves a step about as far as
+    /// a crossing does; the fixture tier, whose MoE layers are all hosted, is
+    /// where this clause holds the stores the batch leaves.
+    /// PIN(2026-11-03): was COSINE_FLOOR on every step. Since the IQ2_XXS dot's sum order moved,
+    /// the host arm's batch of 8 reads 0.998385 at step 1 on both cards (its worst was 0.999165),
+    /// its other steps 0.999912 or more; that step crosses at layers 85 and 87, the last MoE
+    /// layers, where the two loads' scores differ by up to 0.1. 0.998385 is a relative logit
+    /// error of 5.7 % (sqrt(2 (1 - c))), the other steps 1.3 % or less; 0.995 is 10 %, 1.76 times
+    /// the worst crossing measured. A batch that drops MoE layer 1's host share reads 0.998990 at
+    /// worst here and 0.878987 in the fixture tier (0/4 steps at 0.995).
+    const CROSS_FLOOR: f64 = 0.995;
 
     /// The fixture-oracle clauses the gate declares.
     const FIXTURE_ORACLE: usize = 5;
@@ -1376,13 +1399,18 @@ mod gate {
     /// host arms' band. The cosine, the max |Δ| and whether the ids are equal
     /// come back for the line.
     fn in_band(want: (u32, &[f32]), got: (u32, &[f32])) -> (bool, f64, f64, bool) {
+        in_band_at(COSINE_FLOOR, want, got)
+    }
+
+    /// [`in_band`] with `floor` for the cosine.
+    fn in_band_at(floor: f64, want: (u32, &[f32]), got: (u32, &[f32])) -> (bool, f64, f64, bool) {
         let ((want_id, want), (got_id, got)) = (want, got);
         let (dmax, cos) = (max_delta(want, got), cosine(want, got));
         let margin = f64::from(want[argmax(want) as usize])
             - f64::from(want[second(want, argmax(want)) as usize]);
         let same_id = want_id == got_id;
         (
-            cos >= COSINE_FLOOR && (same_id || margin <= 2.0 * dmax),
+            cos >= floor && (same_id || margin <= 2.0 * dmax),
             cos,
             dmax,
             same_id,
@@ -1396,6 +1424,8 @@ mod gate {
         id: u32,
         logits: Vec<f32>,
         after: Vec<(u32, Vec<f32>)>,
+        /// Each step's routing, every MoE layer in layer order.
+        routes: Vec<Vec<Routing>>,
     }
 
     /// `prompt` as a batch, then [`CONTINUE`] steps fed `forced`'s greedy ids
@@ -1403,6 +1433,7 @@ mod gate {
     /// word.
     fn batch_run(
         m: &mut Model,
+        hp: &Hparams,
         prompt: &[u32],
         forced: Option<&BatchRun>,
     ) -> Result<Option<BatchRun>, GateError> {
@@ -1413,15 +1444,68 @@ mod gate {
         };
         let logits = m.logits()?;
         let mut after = Vec::with_capacity(CONTINUE);
+        let mut routes = Vec::with_capacity(CONTINUE);
         let mut tok = forced.map_or(id, |f| f.id);
         for i in 0..CONTINUE {
             let Some(next) = or_fault(CLAUSE, "a step after the batch", m.step(&[tok]))? else {
                 return Ok(None);
             };
             after.push((next, m.logits()?));
+            let mut step = Vec::new();
+            for l in moe_layers(hp) {
+                step.push(m.body(NAME)?.routing(m.gpu().stream(), l)?);
+            }
+            routes.push(step);
             tok = forced.map_or(next, |f| f.after[i].0);
         }
-        Ok(Some(BatchRun { id, logits, after }))
+        Ok(Some(BatchRun {
+            id,
+            logits,
+            after,
+            routes,
+        }))
+    }
+
+    /// Every MoE layer whose kept set in `got` is not `want`'s, in layer
+    /// order: the layer, the experts only `got` keeps and those only `want`
+    /// keeps, the gap each run's own selection values put between its picks
+    /// and the other's (`got`'s, then `want`'s), and the layer's largest score
+    /// difference between the runs. A layer after the first runs on another
+    /// expert's output.
+    fn crossings(case: &Case, want: &[Routing], got: &[Routing]) -> Vec<String> {
+        let only = |a: &Routing, o: &Routing| -> Vec<u32> {
+            a.ids
+                .iter()
+                .copied()
+                .filter(|i| !o.ids.contains(i))
+                .collect()
+        };
+        let mut out = Vec::new();
+        for ((l, (w, g)), b) in moe_layers(&case.hp)
+            .into_iter()
+            .zip(want.iter().zip(got))
+            .zip(&case.bias)
+        {
+            let (gk, wk) = (only(g, w), only(w, g));
+            if gk.is_empty() {
+                continue;
+            }
+            // The smallest selection value of `keep` minus the largest of `drop`, in `r`'s values.
+            let gap = |r: &Routing, keep: &[u32], drop: &[u32]| {
+                let v = |e: &u32| r.scores[*e as usize] + b[*e as usize];
+                keep.iter().map(v).fold(f32::INFINITY, f32::min)
+                    - drop.iter().map(v).fold(f32::NEG_INFINITY, f32::max)
+            };
+            let ds = (g.scores.iter().zip(&w.scores))
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            out.push(format!(
+                "{l} +{gk:?} -{wk:?} gap {:.1e}/{:.1e} of {ds:.1e}",
+                gap(g, &gk, &wk),
+                gap(w, &wk, &gk)
+            ));
+        }
+        out
     }
 
     /// The whole-card load's batch of the walk's first [`GEMV_ROWS`] ids and
@@ -1429,7 +1513,7 @@ mod gate {
     fn whole_batches(m: &mut Model, case: &Case) -> Result<Option<Vec<BatchRun>>, GateError> {
         let mut out = Vec::new();
         for len in [GEMV_ROWS, case.walk.len()] {
-            let Some(run) = batch_run(m, &case.walk[..len], None)? else {
+            let Some(run) = batch_run(m, &case.hp, &case.walk[..len], None)? else {
                 return Ok(None);
             };
             out.push(run);
@@ -1471,7 +1555,7 @@ mod gate {
                 return Err("the steps' prompt is empty".into());
             };
             let before = stats(m)?;
-            let Some(got) = batch_run(m, prompt, Some(want))? else {
+            let Some(got) = batch_run(m, &case.hp, prompt, Some(want))? else {
                 pass = false;
                 continue;
             };
@@ -1486,22 +1570,35 @@ mod gate {
                 in_band((want.id, &want.logits), (got.id, &got.logits));
             let (vs_steps, steps_cos, ..) =
                 in_band((steps_id, steps_logits), (got.id, &got.logits));
-            let mut held = 0;
+            let (mut held, mut loose) = (0, 0);
             let mut worst = 1.0f64;
             let mut exact = same_bits(&want.logits, &got.logits);
-            for ((next_id, next), (id, logits)) in want.after.iter().zip(&got.after) {
+            let mut split = Vec::with_capacity(CONTINUE);
+            for (i, ((next_id, next), (id, logits))) in
+                want.after.iter().zip(&got.after).enumerate()
+            {
                 let (ok, c, ..) = in_band((*next_id, next), (*id, logits));
+                let (ok_cross, ..) = in_band_at(CROSS_FLOOR, (*next_id, next), (*id, logits));
                 held += usize::from(ok);
+                loose += usize::from(ok_cross);
                 worst = worst.min(c);
                 exact &= same_bits(next, logits);
+                let x = crossings(case, &want.routes[i], &got.routes[i]);
+                split.push(format!(
+                    "step {i} cosine {c:.6} in band {ok}, {} MoE layers crossed [{}]",
+                    x.len(),
+                    x.join(", ")
+                ));
             }
-            let arm_pass =
-                structure && near && vs_steps && held == CONTINUE && (arm != "card" || exact);
+            // One step may carry a costly crossing; every step reads the stores ([`CROSS_FLOOR`]).
+            let continued = held + 1 >= CONTINUE && loose == CONTINUE;
+            let arm_pass = structure && near && vs_steps && continued && (arm != "card" || exact);
             println!(
                 "{CLAUSE}: arm {arm} batch of {len} ids ({passes} pass of up to {rows} rows, {}): \
                  batch_served {served}/{}, batch_cols {cols}/{}; last id {} vs the whole-card \
                  batch's {} (equal {same_id}), cosine {cos:.6}, max|Δ| {dmax:.3e}; {held}/{CONTINUE} \
-                 steps after it in the band, worst cosine {worst:.6}, bit-identical {exact}; \
+                 steps after it in the band, {loose}/{CONTINUE} at {CROSS_FLOOR} or more, \
+                 worst cosine {worst:.6}, bit-identical {exact}; \
                  against the arm's steps: id {steps_id}, cosine {steps_cos:.6} {}",
                 if len <= GEMV_ROWS {
                     "gemv arm"
@@ -1513,6 +1610,12 @@ mod gate {
                 got.id,
                 want.id,
                 verdict(arm_pass)
+            );
+            println!(
+                "{CLAUSE}: arm {arm} batch of {len} ids, the steps after it against the whole-card \
+                 batch's (each MoE layer whose kept set differs: layer +its -the whole-card's, the \
+                 gap in its selection values/the whole-card's of the layer's max |Δ score|): {}",
+                split.join("; ")
             );
             pass &= arm_pass;
         }
@@ -1555,12 +1658,12 @@ mod gate {
         paths.push(("steps".into(), hit, bits));
         for len in [GEMV_ROWS, case.walk.len()] {
             let prompt = &case.walk[..len];
-            let before = batch_run(m, prompt, None)?;
+            let before = batch_run(m, &case.hp, prompt, None)?;
             let mut bad = prompt.to_vec();
             bad[0] = BAD;
             m.reset()?;
             let hit = raised(m.prefill(&bad));
-            let after = batch_run(m, prompt, None)?;
+            let after = batch_run(m, &case.hp, prompt, None)?;
             let bits = matches!((&before, &after), (Some(b), Some(a)) if same_batch(b, a));
             let name = if len <= GEMV_ROWS {
                 format!("gemv batch of {len}")
