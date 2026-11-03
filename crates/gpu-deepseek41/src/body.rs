@@ -109,6 +109,7 @@ use crate::chain::ffn::{
     host_widths,
 };
 use crate::chain::glue::{EngramKv, EngramStep, Glue, RowsArrival, RowsLevers, StepRows};
+use crate::chain::join::RankJoin;
 use crate::hc::{HC_STREAMS, HcKernels};
 use crate::params::{ImageDims, ImageLayout, StepImage, rope_specs};
 use crate::swap;
@@ -881,6 +882,9 @@ pub struct Body {
     /// The NVMe expert tier's arena, on a load whose plan paged routed
     /// experts ([`Body::nvme_tier`]).
     nvme_tier: Option<Arc<NvTier>>,
+    /// On a rank of a tensor-parallel load, its side of the ranks' sums
+    /// ([`RankJoin`]); `None` on a whole load.
+    join: Option<RankJoin>,
 }
 
 /// A tier card a placed load hangs under the host tier
@@ -1708,6 +1712,7 @@ impl Body {
             tap,
             arrival,
             tier,
+            join,
             ..
         } = self;
         Ok((
@@ -1724,6 +1729,7 @@ impl Body {
                 tap: tap.as_mut(),
                 arrival,
                 tier: tier.as_mut(),
+                join: join.as_mut(),
             },
             hybrid,
         ))
@@ -1755,6 +1761,8 @@ struct Parts<'a> {
     arrival: &'a RowsArrival,
     /// The stage card's side of the tier layers, on a load with a tier card.
     tier: Option<&'a mut TierPiece>,
+    /// The rank's side of the ranks' sums, on a rank of a tensor-parallel load.
+    join: Option<&'a mut RankJoin>,
 }
 
 impl Parts<'_> {
@@ -1800,14 +1808,14 @@ impl Parts<'_> {
         glue.enqueue_engram_of(
             gpu,
             w,
-            l,
-            row,
+            (l, row),
             EngramStep {
                 streams: streams.buf(),
                 pre,
                 out: out.buf_mut(),
                 input: if cur.f == 0 { f0 } else { f1 },
             },
+            self.join.as_deref_mut(),
         )?;
         cur.s ^= 1;
         Ok(true)
@@ -1856,6 +1864,7 @@ impl Parts<'_> {
                 compressed,
                 selection,
             },
+            self.join.as_deref_mut(),
         )?;
         cur.s ^= 1;
         cur.f ^= 1;
@@ -1942,6 +1951,7 @@ impl Parts<'_> {
             layer,
             row,
             arrive: step.arrive.then_some(self.arrival),
+            join: self.join.as_deref_mut(),
         });
         let mut one: [&mut dyn ShadowWork; 1];
         let shadow: &mut [&mut dyn ShadowWork] = match engram_kv.as_mut() {
@@ -2496,7 +2506,13 @@ impl Body {
             Planner::from_file(file, hp, plan.ctx_max).map_err(|e| GpuError::plan(WHAT, e))?;
         let seq = Seq::new(gpu, hp, layers.clone(), ctx_max, planner.stream_ratios())?;
         let row_bytes = engram_row_bytes(file, hp)?;
-        let rows = StepRows::open(file, hp, STEP_TOKENS, cfg.rows)?;
+        let rows = StepRows::open(
+            file,
+            hp,
+            STEP_TOKENS,
+            cfg.rows,
+            0..hp.engram()?.rows_per_token(),
+        )?;
         if rows.row_bytes() != row_bytes {
             return Err(refuse(format!(
                 "the engram tables' rows are {row_bytes} bytes, the step's host half reads {}",
@@ -2622,6 +2638,7 @@ impl Body {
             tier,
             residency_glue,
             nvme_tier,
+            join: None,
         };
         // Last: the machine frees each layer's spare slots, and every piece
         // above sized itself from the load's map, capacity = live.

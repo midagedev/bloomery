@@ -2012,7 +2012,7 @@ fn cand_wire(cx: &Cx<'_>, tally: &mut Tally) -> Result<(), GateError> {
                 .copy_from_host(stream, &activations(4 * hp.n_embd, 1, seed))?;
             bufs.fold_in
                 .copy_from_host(stream, &activations(hp.n_embd, 1, seed + 5))?;
-            piece.enqueue_layer_of(gpu, &w, src, r, bufs.io(&kinds[0]))?;
+            piece.enqueue_layer_of(gpu, &w, src, r, bufs.io(&kinds[0]), None)?;
             stream.synchronize()?;
             let taps = piece.taps();
             let sel = taps
@@ -2033,7 +2033,7 @@ fn cand_wire(cx: &Cx<'_>, tally: &mut Tally) -> Result<(), GateError> {
                 .copy_from_host(stream, &activations(hp.n_embd, 1, seed + 5))?;
             let poison = vec![u32::MAX; bufs.lists[st].len()];
             bufs.lists[st].copy_from_host(stream, &poison)?;
-            piece.enqueue_layer_of(gpu, &w, consumer, r, bufs.io(&kinds[1]))?;
+            piece.enqueue_layer_of(gpu, &w, consumer, r, bufs.io(&kinds[1]), None)?;
             stream.synchronize()?;
             let taps = piece.taps();
             let sel = taps
