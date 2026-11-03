@@ -468,6 +468,27 @@ pub(crate) mod testing {
     use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
     use std::time::Duration;
 
+    /// The buffers each job of the numbering tests makes; job 2 makes none.
+    pub(crate) const MADE: [u64; 5] = [2, 1, 0, 3, 2];
+
+    /// An order across threads that [`MADE`]'s buffers are made in: the last
+    /// jobs make theirs first, the first jobs' last.
+    pub(crate) const MIXED: [(usize, u64); 8] = [
+        (4, 0),
+        (3, 0),
+        (0, 0),
+        (4, 1),
+        (1, 0),
+        (3, 1),
+        (0, 1),
+        (3, 2),
+    ];
+
+    /// Where buffer `k` of job `j` lives.
+    pub(crate) fn address(j: usize, k: u64) -> usize {
+        0x10_0000 + j * 0x1000 + usize::try_from(k).expect("a small count") * 0x10
+    }
+
     use super::{Name, State, state};
 
     /// The state, reset, held until the guard drops.
@@ -541,16 +562,10 @@ pub(crate) mod testing {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::testing::{Script, names, refused, session};
+    use super::testing::{MADE, MIXED, Script, address, names, refused, session};
     use super::{BY_NO_JOB, LOST_JOB, Load, NESTED, OFF_THREAD, buffer_made, finish};
 
-    /// The buffers each job of the tests makes; job 2 makes none.
-    const MADE: [u64; 5] = [2, 1, 0, 3, 2];
-
-    /// Where buffer `k` of job `j` lives, and its length.
-    fn address(j: usize, k: u64) -> usize {
-        0x10_0000 + j * 0x1000 + usize::try_from(k).unwrap() * 0x10
-    }
+    /// The length of buffer `k` of job `j`.
     fn length(j: usize, k: u64) -> usize {
         64 * (j + 1) + usize::try_from(k).unwrap()
     }
@@ -623,20 +638,10 @@ mod tests {
             (0, 0),
             (0, 1),
         ];
-        let mixed = [
-            (4, 0),
-            (3, 0),
-            (0, 0),
-            (4, 1),
-            (1, 0),
-            (3, 1),
-            (0, 1),
-            (3, 2),
-        ];
         for (name, order) in [
             ("in order", in_order),
             ("reversed", reversed),
-            ("mixed", mixed),
+            ("mixed", MIXED),
         ] {
             assert_eq!(load_in(&order), expected, "{name}");
         }
