@@ -12,8 +12,8 @@ use bloomery_gpu::host::rank::{RankError, RankSession, Round};
 const WHAT: &str = "tp greedy";
 
 /// Run `prompt` then `max` greedy tokens on rank `me` of `session`, whose part of the vocabulary
-/// starts at id `vocab_at`; `step` runs a round's tokens at its position and gives the rank's
-/// logits over its part. Rank 0 decides from `prompt` and returns the tokens; every other rank
+/// starts at id `vocab_at`; `step` runs a round's tokens at its position and gives the card's
+/// argmax over the rank's part and the rank's logits over it. Rank 0 decides from `prompt` and returns the tokens; every other rank
 /// passes an empty prompt and returns none. An empty prompt on rank 0, a step that fails, and a
 /// pick no rank agrees on fail the group by name ([`RankSession::fail`]).
 pub fn greedy(
@@ -21,7 +21,7 @@ pub fn greedy(
     me: usize,
     vocab_at: u32,
     (prompt, max): (&[u32], usize),
-    mut step: impl FnMut(&Round) -> Result<Vec<f32>, GpuError>,
+    mut step: impl FnMut(&Round) -> Result<(u32, Vec<f32>), GpuError>,
 ) -> Result<Vec<u32>, RankError> {
     let Ok(prompt_len) = u32::try_from(prompt.len()) else {
         return Err(session.fail(&format!("{WHAT}: a prompt past u32 tokens")));
@@ -49,7 +49,7 @@ pub fn greedy(
         if round.stop {
             return Ok(out);
         }
-        let pick = step(&round).and_then(|logits| local_pick(&logits, vocab_at));
+        let pick = step(&round).and_then(|(id, logits)| local_pick(&logits, id, vocab_at));
         let (value, id) = pick.map_err(|e| session.fail(&format!("{WHAT}: {e}")))?;
         let picks = session.collect(&[u64::from(value.to_bits()), u64::from(id)])?;
         pos = u32::try_from(round.tokens.len())

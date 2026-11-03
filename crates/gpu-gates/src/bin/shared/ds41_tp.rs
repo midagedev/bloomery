@@ -141,21 +141,34 @@ fn source_files(dir: &Path) -> Result<Vec<SourceFile>, GateError> {
         .collect())
 }
 
-/// `reads` as ranges of `files`, by file name; the runs of a file `files` does not name (the
+/// `reads` as ranges of `files`, by file name, the runs of one file whose gap is at most
+/// [`dist::GAP`] merged as the head sends them; the runs of a file `files` does not name (the
 /// folder's `SHA256SUMS` itself) are left out.
 fn ranges(files: &[SourceFile], reads: &[(PathBuf, std::ops::Range<u64>)]) -> Vec<ReadRange> {
-    reads
-        .iter()
-        .filter_map(|(path, at)| {
-            let name = path.file_name()?.to_str()?;
-            let file = files.iter().position(|f| f.name == name)?;
-            Some(ReadRange {
+    let mut out: Vec<ReadRange> = Vec::new();
+    let mut at: Option<(&Path, usize)> = None;
+    for (path, run) in reads {
+        let file = match at {
+            Some((p, f)) if p == path.as_path() => Some(f),
+            _ => path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| files.iter().position(|f| f.name == n)),
+        };
+        let Some(file) = file else { continue };
+        at = Some((path.as_path(), file));
+        match out.last_mut() {
+            Some(last) if last.file == file && run.start <= last.offset + last.len + dist::GAP => {
+                last.len = (last.offset + last.len).max(run.end) - last.offset;
+            }
+            _ => out.push(ReadRange {
                 file,
-                offset: at.start,
-                len: at.end - at.start,
-            })
-        })
-        .collect()
+                offset: run.start,
+                len: run.end - run.start,
+            }),
+        }
+    }
+    out
 }
 
 /// A rank's folder: rank 0's own, every other rank's the view of its store, each file's name a
@@ -204,8 +217,12 @@ fn rank_folder(o: &Opts, ranks: usize) -> Result<(Opened, Vec<SourceFile>), Gate
     }
     let opened = folder::open(&view).map_err(|e| format!("{}: {e}", view.display()))?;
     let store = Store::open(store_dir)?;
+    let covering = files
+        .iter()
+        .map(|f| store.covering(&f.digest))
+        .collect::<Result<Vec<_>, _>>()?;
     for r in ranges(&files, &rank_reads(&opened, o.rank, ranks)?) {
-        if !store.covers(&files[r.file].digest, r.offset, r.len)? {
+        if !covering[r.file].holds(r.offset, r.len) {
             return Err(format!(
                 "rank {}: the store holds no verified {} B at {} of {}",
                 o.rank, r.len, r.offset, files[r.file].name
@@ -313,10 +330,11 @@ pub fn run(args: &[String], levers: &Levers) -> Result<(), GateError> {
         (&prompt, o.n),
         |round| {
             let t = Instant::now();
+            let mut pick = 0;
             for &id in &round.tokens {
-                m.step(&[id])?;
+                pick = m.step(&[id])?;
             }
-            let logits = m.logits();
+            let logits = m.logits().map(|l| (pick, l));
             match round.prompt {
                 Some(_) => {
                     prompt_s += t.elapsed().as_secs_f64();

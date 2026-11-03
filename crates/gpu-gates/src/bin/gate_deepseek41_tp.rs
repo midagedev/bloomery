@@ -160,7 +160,7 @@ mod gate {
         type Link = Option<(Gathers, Arc<MappedHost>)>;
         std::thread::scope(|scope| -> Result<_, GateError> {
             let (links_tx, links_rx) = mpsc::channel::<(usize, Result<Link, String>)>();
-            let (out_tx, out_rx) = mpsc::channel::<(usize, Result<Vec<f32>, String>)>();
+            let (out_tx, out_rx) = mpsc::channel::<(usize, Result<(u32, Vec<f32>), String>)>();
             let mut tokens = Vec::with_capacity(ranks);
             for r in 0..ranks {
                 let (tok_tx, tok_rx) = mpsc::channel::<u32>();
@@ -183,7 +183,7 @@ mod gate {
                     while let Ok(token) = tok_rx.recv() {
                         let logits = m
                             .step(&[token])
-                            .and_then(|_| m.logits())
+                            .and_then(|id| Ok((id, m.logits()?)))
                             .map_err(|e| e.to_string());
                         let failed = logits.is_err();
                         let _ = out_tx.send((r, logits));
@@ -216,7 +216,7 @@ mod gate {
                 for tx in &tokens {
                     tx.send(token).map_err(|e| e.to_string())?;
                 }
-                let mut parts = vec![Vec::new(); ranks];
+                let mut parts = vec![(0, Vec::new()); ranks];
                 for _ in 0..ranks {
                     let (r, logits) = out_rx.recv().map_err(|e| e.to_string())?;
                     match logits {
@@ -234,12 +234,12 @@ mod gate {
                 }
                 let mut picks = Vec::with_capacity(ranks);
                 let mut at = 0u32;
-                for p in &parts {
-                    picks.push(local_pick(p, at)?);
+                for (id, p) in &parts {
+                    picks.push(local_pick(p, *id, at)?);
                     at += u32::try_from(p.len())?;
                 }
                 token = merge(&picks)?;
-                out.push((token, parts.concat()));
+                out.push((token, parts.into_iter().flat_map(|(_, p)| p).collect()));
             }
             drop(tokens);
             Ok(out)
