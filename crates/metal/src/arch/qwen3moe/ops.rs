@@ -1114,6 +1114,20 @@ impl ChainOps for MetalOps<'_, '_> {
         self.attn_flash(l.layer)
     }
 
+    /// The decode flash stores the position's keys and values before it
+    /// attends, so its group is the append; the attention output it leaves is
+    /// read by no op after it. Only the step's one-row arm has it.
+    fn attn_append(&mut self, l: LayerCtx<'_>, _: &GqaPlan) -> Result<(), SessionError> {
+        if self.arm(l.m)? == Arm::Rows {
+            return Err(refuse(format!(
+                "layer {}: a cache append alone over a pass's rows; a store walk is one row at a \
+                 time",
+                l.layer
+            )));
+        }
+        self.attn_flash(l.layer)
+    }
+
     fn attn_out(&mut self, l: LayerCtx<'_>, _: &GqaPlan) -> Result<(), SessionError> {
         if self.arm(l.m)? == Arm::Rows {
             return self.rows_attn_out(l, l.m);

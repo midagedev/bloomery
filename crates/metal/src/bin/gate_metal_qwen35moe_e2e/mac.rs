@@ -76,12 +76,14 @@
 //!   (`resident.rs`): the set holds every byte the open and the first pass
 //!   allocated, and a submit after an idle gap renews its request once.
 //!
-//! - `v_forced`, `v_count`, `v_segments`, `v_lookup`, `v_cut`, `v_refused`: the verify
+//! - `v_forced`, `v_count`, `v_segments`, `v_lookup`, `v_mtp`, `v_cut`, `v_refused`: the verify
 //!   pass of two rows (`Session::verify_rows`) and the commit that keeps the first rows
 //!   of it (`verify.rs`): each row is the bits of the plain step at its position, a
 //!   verify is one command buffer and one wait with the groups, dispatches and barriers
 //!   the count model gives, a commit moves the position and launches nothing, a lookup
-//!   draft behind the width chooser, in both modes, picks the plain run's ids, a cut
+//!   draft behind the width chooser, in both modes, picks the plain run's ids, the MTP
+//!   draft (`--mtp SIDECAR`, the qwen38d row) behind the same chooser picks them too with
+//!   its proposals held to the layer's own draft step (`mtp.rs`), a cut
 //!   after a commit keeps its contract, and what a verify refuses is refused by name. A file the pass does not serve prints each but `v_refused`
 //!   as SKIP with the pass's own reason.
 //!
@@ -126,6 +128,8 @@ mod layers;
 mod mlx;
 #[path = "../shared/mlx_split.rs"]
 mod mlx_split;
+#[path = "mtp.rs"]
+mod mtp;
 #[path = "mutants.rs"]
 mod mutants;
 #[path = "pass.rs"]
@@ -464,14 +468,14 @@ fn tensor_text_of(
 
 pub fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(name) = ["--only", "--mutant", "--row", "--dump-layers"]
+    if let Some(name) = ["--only", "--mutant", "--row", "--dump-layers", "--mtp"]
         .into_iter()
         .find(|name| args.last().is_some_and(|last| last == name))
     {
         println!("{GATE}: {name} takes a value");
         return ExitCode::from(64);
     }
-    const NAMES: [&str; 26] = [
+    const NAMES: [&str; 27] = [
         "d_count",
         "e_token_id",
         "b_chain",
@@ -496,6 +500,7 @@ pub fn main() -> ExitCode {
         "v_count",
         "v_segments",
         "v_lookup",
+        "v_mtp",
         "v_cut",
         "v_refused",
     ];
@@ -641,6 +646,7 @@ pub fn main() -> ExitCode {
     if args.iter().any(|a| a == "--ops") {
         return wall::run(&mut session);
     }
+    let sidecar = flag(&args, "--mtp").map(PathBuf::from);
     let mut report = Report::new();
     for name in NAMES {
         if only.is_some_and(|o| o != name) {
@@ -676,6 +682,7 @@ pub fn main() -> ExitCode {
                 "v_count" => verify::v_count(&mut session),
                 "v_segments" => verify::v_segments(&device, library, &path),
                 "v_lookup" => verify::v_lookup(&device, library, &path),
+                "v_mtp" => mtp::v_mtp(&device, library, &path, sidecar.as_deref()),
                 "v_cut" => verify::v_cut(&device, library, &path),
                 "v_refused" => verify::v_refused(&mut session),
                 other => Err(format!("no clause named {other}")),
