@@ -1280,7 +1280,7 @@ mod probe {
             source: [0; 32],
             headers: h.finish(),
             form: 0,
-            build: env!("CARGO_PKG_VERSION").to_string(),
+            build: bloomery_gpu_gates::rank_build()?,
             n: u16::try_from(o.nodes)?,
             rank: u16::try_from(o.rank)?,
         };
