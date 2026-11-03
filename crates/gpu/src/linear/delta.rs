@@ -106,11 +106,12 @@
 //! ([`chunk_plane`]), so the parts hold all of its 24 bits. A product takes
 //! the six terms down to `2⁻¹⁶` of it ([`SPLIT_TERMS`]), the smallest first
 //! (`Sᵀk` and `Sᵀq` the same within each eight keys). The chunk's
-//! `Dₜ·Sᵀqₜ` and `D·S` seed the accumulators of the products they join, so
-//! a sum the one-token rule keeps finite stays finite while the terms
-//! cancel against them. The sum order differs from `gdn_delta_lanes`:
-//! `gate_linear`'s `prompt` clause holds `o` and the state within a band of
-//! [`delta_host`]. A non-finite `o`
+//! `Dₜ·Sᵀqₜ` and `D·S` join the products' smaller terms in one f32 rounding
+//! and seed the high parts' term ([`split_mma`]), so a sum the one-token
+//! rule keeps finite stays finite while the terms cancel against them, and
+//! only the high term's sum aligns to the seed. The sum order differs from
+//! `gdn_delta_lanes`: `gate_linear`'s `prompt` clause holds `o` and the
+//! state within a band of [`delta_host`]. A non-finite `o`
 //! or state value raises [`FaultSite::LinearDelta`] once per thread; a
 //! non-finite `v` reaches its column of `o` from its chunk's first row on
 //! (the tensor cores' `0·∞`) and that column of the state.
@@ -691,7 +692,9 @@ unsafe fn frag_mma(a: [u32; 4], b: *const u32, c: [f32; 4]) -> [f32; 4] {
 }
 
 /// [`frag_mma`]'s [`SPLIT_TERMS`] over three-part operands onto `c`, `a`
-/// [`frag_parts`] and `b` each part's row.
+/// [`frag_parts`] and `b` each part's row: the terms below the high parts'
+/// from a zero accumulator, then `c` in one f32 rounding, then the high
+/// parts' term, so only that term's sum aligns to `c`.
 ///
 /// # Safety
 ///
@@ -701,14 +704,21 @@ unsafe fn frag_mma(a: [u32; 4], b: *const u32, c: [f32; 4]) -> [f32; 4] {
     clippy::needless_range_loop,
     reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
 )]
-unsafe fn split_mma(a: [[u32; 4]; PLANES], b: [*const u32; PLANES], mut c: [f32; 4]) -> [f32; 4] {
-    for i in 0usize..SPLIT_TERMS.len() {
+unsafe fn split_mma(a: [[u32; 4]; PLANES], b: [*const u32; PLANES], c: [f32; 4]) -> [f32; 4] {
+    let mut low = [0.0; 4];
+    for i in 0usize..SPLIT_TERMS.len() - 1 {
         cuda_device::thread::__unroll_config::<0>();
         let (pa, pb) = SPLIT_TERMS[i];
         // SAFETY: the caller's row of part pb.
-        c = unsafe { frag_mma(a[pa], b[pb], c) };
+        low = unsafe { frag_mma(a[pa], b[pb], low) };
     }
-    c
+    for i in 0usize..4 {
+        cuda_device::thread::__unroll_config::<0>();
+        low[i] += c[i];
+    }
+    let (pa, pb) = SPLIT_TERMS[SPLIT_TERMS.len() - 1];
+    // SAFETY: the caller's row of part pb.
+    unsafe { frag_mma(a[pa], b[pb], low) }
 }
 
 /// One thread's eight 4-key pieces of a chunk's query rows (the first four)

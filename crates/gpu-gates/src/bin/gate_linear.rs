@@ -3555,14 +3555,16 @@ mod gate {
     /// The prompt clause's band on `‖ours − rule‖ / ‖rule‖` for `o` and the
     /// state: each operand the tensor cores take is three BF16 parts holding
     /// all of its f32 bits, so what is left is the f32 sum order of the
-    /// chunked form.
-    // PIN(2026-11-03): measured on the RTX 5090 at 7.2e-7 (16 rows), 5.6e-7
+    /// chunked form and the tensor cores' truncating accumulator.
+    // PIN(2026-11-03): measured on the RTX 5090 at 7.2e-7 (16 rows), 5.7e-7
     // (1,000 and 4,096) and 1.1e-6 (4,096, keys near one direction) for `o`
-    // and 1.7e-7 to 6.6e-7 for the lane. Two BF16 parts, the form before,
-    // read 6.6e-6 and 2.2e-5 for `o` on GB10 and on the RTX 5090, and
-    // products that leave out one of the terms of order 2⁻¹⁶ read 3e-6 to
-    // 5e-6 in a host model of the chunked form [derived], so 2e-6, about 2×
-    // the worst measured, keeps every term under test.
+    // and 1.7e-7 to 6.9e-7 for the lane; an RTX 3090 read 1.3× the RTX 5090
+    // on the keys near one direction, ~1.5e-6 here [derived]. All six terms
+    // on the `D·S` seed read 3.2e-6 (RTX 5090) and 4.2e-6 (RTX 3090) there,
+    // two BF16 parts 6.6e-6 and 2.2e-5 for `o` on GB10 and on the RTX 5090,
+    // and products that leave out one of the terms of order 2⁻¹⁶ read 3e-6
+    // to 5e-6 in a host model of the chunked form [derived], so 2e-6, about
+    // 2× the worst measured, keeps every term under test.
     const PROMPT_BAND: f64 = 2e-6;
 
     /// Clause 16: `enqueue_delta_prompt` against the one-lane rule.

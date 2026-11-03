@@ -801,7 +801,9 @@ gguf 7 2 0
 # launches, 9 blocks). Each with its SAFETY line.
 # PIN(2026-11-03): gpu 3000 -> 2992 blocks: linear::delta's prompt products loop over their split terms, one block a
 # product helper in place of one a term, and the chunk record's cells are written in one loop.
-gpu 2992 413 10
+# PIN(2026-11-03): gpu 2992 -> 2993 blocks: split_mma launches the high parts' term after the others and the seed, a
+# second block beside its loop's, with its SAFETY line.
+gpu 2993 413 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
