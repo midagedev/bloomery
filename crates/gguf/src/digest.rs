@@ -49,6 +49,18 @@ pub fn hex(bytes: &[u8]) -> String {
     text
 }
 
+/// The digest whose 64 hex digits are `s` ([`hex`]'s text of a SHA-256, either case), or `None`.
+pub fn unhex(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 || !s.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut d = [0u8; 32];
+    for (i, b) in d.iter_mut().enumerate() {
+        *b = u8::from_str_radix(s.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    Some(d)
+}
+
 /// Lowercase hex SHA-256 of `bytes`.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     sha256_hex_of([bytes])
@@ -104,6 +116,22 @@ mod tests {
         assert_eq!(sha256_hex(b"abc"), ABC);
         assert_eq!(sha256_hex(&[0, 255, 128]), BINARY);
         assert_eq!(hex(&[0, 1, 15, 16, 128, 255]), "00010f1080ff");
+    }
+
+    #[test]
+    fn unhex_reads_hex_back_and_refuses_another_length_or_a_non_digit() {
+        let d = Sha256::new().finish();
+        assert_eq!(unhex(EMPTY), Some(d));
+        assert_eq!(unhex(&EMPTY.to_uppercase()), Some(d));
+        for bad in [
+            &EMPTY[..62],
+            &format!("{EMPTY}00"),
+            &format!("{}g", &EMPTY[..63]),
+            &format!("+a{}", &EMPTY[2..]),
+            "",
+        ] {
+            assert_eq!(unhex(bad), None, "{bad:?}");
+        }
     }
 
     #[test]
