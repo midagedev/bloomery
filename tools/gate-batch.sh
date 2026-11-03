@@ -685,7 +685,7 @@ try_waits() {
     index($0, t) == 1 { on = 1; next }
     /^=== try / { on = 0 }
     on && match($0, /after [0-9]+ s: the command starts/) { split(substr($0, RSTART + 6), a, " "); w += a[1] }
-    on && match($0, /^gpu-gate\.sh: waited [0-9]+ s for the (gate lock|V4\.1 load lock|batch hold)/) { split(substr($0, RSTART + 20), a, " "); w += a[1] }
+    on && match($0, /^gpu-gate\.sh: waited [0-9]+ s for the (gate lock|V4\.1 load lock|batch hold|sitting hold)/) { split(substr($0, RSTART + 20), a, " "); w += a[1] }
     END { print w + 0 }' "$1"
 }
 
