@@ -7,10 +7,15 @@
 #   tools/release/publish.sh <version> --tap-only   step 5 alone, on the release's own .sha256 assets (after a GB10 upload)
 #   tools/release/publish.sh --self-test     (the rotation's refusal on stub rotation.py exits, and step 3a's warnings; check-recipes runs it)
 #   tools/release/publish.sh --sitting-check <tarball> <name> <dir>...   step 3a alone, on the verdicts in each <dir>
-#   tools/release/publish.sh --tree-check <version> [<rev>]   steps 2 and 2b alone, on the working tree or on <rev>'s tree
-#                                      (git show, nothing is checked out): `just release-build`, tools/release/build.sh and
-#                                      tools/release/pick.sh call it before any archive is built, so the README commit
-#                                      precedes the builds and the tag never moves after them
+#   tools/release/publish.sh --tree-check <version> [<rev>] [--crates-only]   steps 2 and 2b alone, on the working tree or on
+#                                      <rev>'s tree (git show, nothing is checked out): `just release-build`, tools/release/build.sh
+#                                      and tools/release/pick.sh call it before any archive is built, so the README commit
+#                                      precedes the builds and the tag never moves after them. --crates-only holds step 2 alone
+#                                      (the crates' versions): the check of a build at the follower's watermark (build.sh --stage w),
+#                                      whose README names the last release until the docs commit that the tag names
+#   tools/release/publish.sh --docs-delta <built> <tag>   whether an archive built at commit <built> may publish under the tag's
+#                                      commit <built> is, or is an ancestor of, <tag> with only docs paths between (docs_delta below);
+#                                      reads the repository of the working directory; build-mac.sh and pick.sh call it
 #   tools/release/publish.sh --bump-next <version> [<next>]   edits the working tree to the next version (step 6 names it)
 #
 # What it owns, in order:
@@ -23,7 +28,8 @@
 #   2b. the README names this release: its status heading, the tarball it unpacks and the release link; both are
 #      tree_check below, the one owner of the two steps, which the builds call first (--tree-check);
 #   3. the artifacts: on the box, where readelf and the ELF binary run — the release's
-#      own .sha256, build.sh's checks on the unpacked binary (for the archive's arch), and its --version;
+#      own .sha256, build.sh's checks on the unpacked binary (for the archive's arch), and its --version, which names the
+#      commit the archive was built at: the tag's commit, or an ancestor of it with only docs paths between (docs_delta);
 #      then the tarball and .sha256 come here for the upload and the tap's digest; the
 #      box holds two x86-64 archives, sm_86 (`just release-build <v>`) and sm_120a
 #      (`BLOOMERY_ARCH=sm_120a just release-build <v>`, the RTX 50 series'), and a release
@@ -37,9 +43,8 @@
 #      read too. None that qualifies is a WARNING line naming what is missing (a stage=tree verdict, another binary's,
 #      a red one); it never stops the publish, and the line is the release log's record of it;
 #   3b. the Apple Silicon artifacts, which tools/release/build-mac.sh wrote into this tree's
-#      target/mac-release/dist/ from this commit: their .sha256, build-mac.sh's binary checks
-#      on the unpacked binaries, a Developer ID signature on each, and the commit the
-#      archive's README names;
+#      target/mac-release/dist/: their .sha256, build-mac.sh's binary checks on the unpacked binaries, a Developer ID
+#      signature on each, and the commit the archive's README names (the tag's commit, or a docs-only ancestor: docs_delta);
 #   4. the upload: `gh release upload --clobber` with exactly the names the build scripts
 #      wrote (bloomery-<v>-linux-x86_64-cuda-sm86.tar.gz, bloomery-<v>-linux-x86_64-cuda-sm120a.tar.gz,
 #      bloomery-<v>-macos-arm64-metal.tar.gz, bloomery-<v>-linux-aarch64-cuda-sm121a.tar.gz with a GB10
@@ -60,6 +65,7 @@
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+CALLER=$PWD # --docs-delta reads the repository its caller stands in
 cd "$ROOT"
 
 # rotation_gate: tools/rotation.py check's verdict as this script's: 0 green, 1 and the named reason otherwise. The check's own lines
@@ -127,26 +133,132 @@ release_assets() {
     echo "bloomery-$1-macos-arm64-metal"
 }
 
-# tree_check <version> [<rev>]: steps 2 and 2b. The serve and gpu-gates crates say <version>, and README.md names the release:
-# its status heading, the sm_86 tarball it unpacks and the release link. Read from the working tree, or from <rev>'s tree when one
-# is given (git show; nothing is checked out). Returns 0 with nothing printed, or 1 with the first refusal on stderr, naming the
-# file and what to do. The check is the same wherever it runs: before the builds (tools/release/build.sh, tools/release/pick.sh)
-# and again here at the publish.
+# tree_check <version> [<rev> [crates-only]]: steps 2 and 2b. The serve and gpu-gates crates say <version>, and README.md names the
+# release: its status heading, the sm_86 tarball it unpacks and the release link. Read from the working tree, or from <rev>'s tree
+# when one is given (git show; nothing is checked out). A third argument of any text holds step 2 alone: the README is not read.
+# Returns 0 with nothing printed, or 1 with the first refusal on stderr, naming the file and what to do. The check is the same
+# wherever it runs: before the builds (tools/release/build.sh, tools/release/pick.sh) and again here at the publish.
 tree_file() { # tree_file <path> [<rev>]
     if [ -n "${2:-}" ]; then git show "$2:$1"; else cat -- "$1"; fi
 }
 tree_check() {
-    local version=$1 rev=${2:-} c text v want at=''
+    local version=$1 rev=${2:-} crates_only=${3:-} c text v want at=''
     [ -z "$rev" ] || at=" at $rev"
     for c in serve gpu-gates; do
         text=$(tree_file "crates/$c/Cargo.toml" "$rev" 2> /dev/null) || { echo "publish.sh: cannot read crates/$c/Cargo.toml$at" >&2; return 1; }
         v=$(awk -F'"' '/^version = "/ {print $2; exit}' <<< "$text")
         [ "$v" = "$version" ] || { echo "publish.sh: crates/$c says version ${v:-none}$at, not $version — bump it and commit before the builds" >&2; return 1; }
     done
+    [ -z "$crates_only" ] || return 0
     text=$(tree_file README.md "$rev" 2> /dev/null) || { echo "publish.sh: cannot read README.md$at" >&2; return 1; }
     for want in "## Status ($version)" "bloomery-$version-linux-x86_64-cuda-sm86.tar.gz" "releases/tag/v$version)"; do
         grep -qF -- "$want" <<< "$text" || { echo "publish.sh: README.md$at does not name '$want' — update its status heading and install lines and commit before the builds" >&2; return 1; }
     done
+}
+
+# docs_only_path <path>: whether a commit that changes only paths like this one moves no archive byte. The one list: the
+# READMEs (the archives carry tools/release/README.release.md and README.release-macos.md, not these), the changelogs at the
+# root and everything under docs/. DOCS_PACKED names the one docs path an archive does pack (build.sh and build-mac.sh copy
+# docs/serving.md): a delta that touches it passes, with a note, because the build's copy ships.
+DOCS_PACKED=docs/serving.md
+docs_only_path() {
+    case $1 in
+        README.md | README.ko.md | docs/*) return 0 ;;
+        CHANGELOG*) [[ $1 != */* ]] ;;
+        *) return 1 ;;
+    esac
+}
+
+# docs_delta <repo dir> <built> <tag>: whether an archive built at commit <built> may publish under the commit <tag>. Returns 0
+# when <built> is <tag>, or is an ancestor of it and every path in `git diff --name-only <built> <tag>` passes docs_only_path
+# (renames are not followed: a move out of crates/ lists the old path too); prints what it found on stdout, `same commit` or
+# `docs-only delta to <tag, 12 hex> (N path(s): …)`. Returns 1 and a named refusal on stderr otherwise: a commit the repository
+# does not have, a <built> that is not an ancestor, or the paths outside the list.
+docs_delta() {
+    local dir=$1 built=$2 tag=$3 b t p paths n=0 bad=() shown=() list='' more=''
+    b=$(git -C "$dir" rev-parse --verify --quiet "$built^{commit}") || { echo "publish.sh: the archive's commit $built is no commit of this repository (git fetch first)" >&2; return 1; }
+    t=$(git -C "$dir" rev-parse --verify --quiet "$tag^{commit}") || { echo "publish.sh: the tag's commit $tag is no commit of this repository" >&2; return 1; }
+    if [ "$b" = "$t" ]; then echo "same commit"; return 0; fi
+    git -C "$dir" merge-base --is-ancestor "$b" "$t" || { echo "publish.sh: the archive was built at ${b:0:12}, which is not an ancestor of the tag's commit ${t:0:12}: rebuild it at the tag's commit" >&2; return 1; }
+    paths=$(git -C "$dir" -c core.quotepath=off diff --no-renames --name-only "$b" "$t") || { echo "publish.sh: git diff ${b:0:12} ${t:0:12} failed in $dir" >&2; return 1; }
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        n=$((n + 1))
+        if docs_only_path "$p"; then
+            [ ${#shown[@]} -ge 6 ] || shown+=("$p")
+            [ "$p" != "$DOCS_PACKED" ] || echo "publish.sh: NOTE: $p changed after the build and the archives pack it: the build's copy ships" >&2
+        else
+            bad+=("$p")
+        fi
+    done <<< "$paths"
+    if [ ${#bad[@]} != 0 ]; then
+        echo "publish.sh: the archive was built at ${b:0:12} and the tag's commit ${t:0:12} changes ${#bad[@]} path(s) outside README.md, README.ko.md, CHANGELOG* and docs/**: ${bad[*]:0:8}$([ ${#bad[@]} -le 8 ] || echo " … and $((${#bad[@]} - 8)) more"): rebuild the archives at the tag's commit" >&2
+        return 1
+    fi
+    list=${shown[*]-}
+    [ "$n" -le 6 ] || more=" … and $((n - 6)) more"
+    echo "docs-only delta to ${t:0:12} ($n path(s): $list$more)"
+}
+
+# verify_cmd <remote dir> <version> <name> <arch> <scratch dir>: the command the box runs on <name>'s archive (step 3): its own
+# .sha256, build.sh --check on the unpacked binary for <arch>, and its --version, which must be `bloomery-serve <version> (commit …)`;
+# the last line it prints is `publish-version: <that line>`, which built_commit reads.
+verify_cmd() {
+    local remote=$1 version=$2 name=$3 arch=$4 scratch=$5
+    printf '%s' "set -e; cd $remote/target/release-dist; \
+sha256sum -c $name.tar.gz.sha256 > /dev/null; \
+rm -rf $scratch; mkdir $scratch; \
+tar -xzf $name.tar.gz -C $scratch --strip-components=1; \
+bash $remote/tools/release/build.sh --check $scratch/bin $arch; \
+V=\$($scratch/bin/bloomery-serve --version); \
+case \"\$V\" in \"bloomery-serve $version (commit \"*\")\") ;; *) echo \"the packed binary says: \$V\" >&2; exit 1 ;; esac; \
+echo \"publish-version: \$V\""
+}
+
+# built_commit <file>: the commit the last `publish-version:` line of <file> names (7 to 40 hex); rc 1 when there is none.
+built_commit() {
+    local c
+    c=$(sed -n 's/^publish-version: bloomery-serve [^ ]* (commit \([0-9a-f]\{7,40\}\))$/\1/p' "$1" | tail -n 1)
+    [ -n "$c" ] || return 1
+    echo "$c"
+}
+
+# fail <message>: a refusal of the flow, named, rc 1.
+fail() { echo "publish.sh: $*" >&2; exit 1; }
+
+# linux_archive <box> <name> <arch>: <name>'s .sha256, build.sh --check (for the archive of <arch>) and --version on <box>; the
+# --version's commit is judged here (docs_delta: the tag's commit, or an ancestor with only docs paths between); then the tarball
+# and .sha256 fetched into $TMP and hashed here. Prints the sha256.
+linux_archive() {
+    local box=$1 name=$2 arch=$3 sha got f built delta
+    local verify=(ssh "$box")
+    # The box's command goes behind its guard; the GB10's runs over plain ssh, as the account that built it (box.sh's
+    # guard reads /root's lease, which that account need not reach).
+    [ "$box" != "$BOX" ] || verify=(bash tools/box.sh)
+    BLOOMERY_BOX=$box "${verify[@]}" "$(verify_cmd "$REMOTE" "$VERSION" "$name" "$arch" "/tmp/pub-$VERSION")" 2>&1 | tee "$TMP/verify-$name.out" >&2 \
+        || fail "$name failed verification on $box (just release-build $VERSION there first)"
+    built=$(built_commit "$TMP/verify-$name.out") || fail "$name's --version on $box named no commit (no 'publish-version:' line)"
+    delta=$(docs_delta "$ROOT" "$built" HEAD) || fail "$name was built at $built and cannot publish under $TAG's commit $COMMIT: just release-build $VERSION at that commit first"
+    for f in "$name.tar.gz" "$name.tar.gz.sha256"; do
+        scp -q "$box:$REMOTE/target/release-dist/$f" "$TMP/$f" || fail "cannot fetch $f from $box"
+    done
+    sha=$(grep -o '[0-9a-f]\{64\}' "$TMP/$name.tar.gz.sha256" | head -1)
+    [ -n "$sha" ] || fail "$name's .sha256 holds no digest"
+    got=$(shasum -a 256 "$TMP/$name.tar.gz" | awk '{print $1}')
+    [ "$got" = "$sha" ] || fail "the fetched $name.tar.gz hashes $got, its .sha256 says $sha"
+    echo "publish.sh: $name.tar.gz $(stat -f %z "$TMP/$name.tar.gz") bytes, sha256 $sha, checks and --version ok on $box; built at ${built:0:12} ($delta)" >&2
+    echo "$sha"
+}
+
+# mac_built_check <README>: step 3b's last look. The Apple Silicon archive's README names the full commit it was built from
+# (README.release-macos.md's `Built from commit`); that commit is the tag's, or an ancestor of it with only docs paths between
+# (docs_delta). Prints `built at <12 hex> (<delta>)`, or fails by name.
+mac_built_check() {
+    local built delta
+    built=$(sed -n 's/^.*Built from commit \([0-9a-f]\{40\}\).*$/\1/p' "$1" | head -n 1)
+    [ -n "$built" ] || fail "$MAC_NAME's README names no commit ('Built from commit <sha>')"
+    delta=$(docs_delta "$ROOT" "$built" HEAD) || fail "$MAC_NAME was built at $built and cannot publish under $TAG's commit $COMMIT: tools/release/build-mac.sh $VERSION --commit <the tag's commit> first"
+    echo "built at ${built:0:12} ($delta)"
 }
 
 # bump_next <version> [<next>]: the working tree moves to <next> (default: <version>'s next patch) on the serve and gpu-gates
@@ -224,6 +336,9 @@ elif gb10 in s:
 open(f, 'w').write(s)
 PY
 }
+
+# --functions: sourced by this script's own self-test, which runs the functions above on a mutant of it.
+if [ "${1:-}" = --functions ]; then return 0 2> /dev/null || exit 0; fi
 
 # --self-test: a copy of this script in a temporary repository with no tag, beside a stub tools/rotation.py that exits with each
 # code. rc 1, 2 and 70 stop at the rotation with a message that names it; rc 0 passes it and stops at the tag check after it, so the
@@ -366,7 +481,7 @@ if [ "${1:-}" = --self-test ]; then
         fi
         [ "$tc_loud" = 0 ] || cases=$((cases + 1))
     }
-    tc_cases() { # tc_cases <script copy> <loud 0|1>
+    tc_cases() { # tc_cases <script copy> <loud 0|1> [crates]: the tree and bump cases; "crates" stops after the --crates-only ones
         local script=$1 r1 r2 n
         tc_loud=$2 tc_fails=0
         rm -rf "$tc"
@@ -386,6 +501,13 @@ if [ "${1:-}" = --self-test ]; then
         git -C "$tc" tag v0.0.2
         r2=$(git -C "$tc" rev-parse --short=12 HEAD)
         tc_want "tree check: a README that names the last release's status" 1 "README.md does not name '## Status (0.0.2)' — update its status heading and install lines and commit before the builds" "tree check ok" --tree-check 0.0.2
+        tc_want "tree check: --crates-only passes a README that names the last release" 0 "tree check ok (crates only)" "does not name" --tree-check 0.0.2 --crates-only
+        tc_want "tree check: --crates-only still refuses a crate behind the release" 1 "crates/serve says version 0.0.2, not 0.0.3 — bump it and commit before the builds" "tree check ok" --tree-check 0.0.3 --crates-only
+        tc_want "tree check: --crates-only at a rev, in either order" 0 "tree check ok (crates only): crates/serve and crates/gpu-gates say 0.0.1, README.md not read (at $r1)" "" --tree-check --crates-only 0.0.1 "$r1"
+        tc_want "tree check: --crates-only at a rev holds that rev's crates" 1 "crates/serve says version 0.0.1 at $r1, not 0.0.2" "tree check ok" --tree-check 0.0.2 "$r1" --crates-only
+        tc_want "tree check: a third word is refused" 64 "usage: tools/release/publish.sh --tree-check <version> [<rev>] [--crates-only]" "" --tree-check 0.0.1 "$r1" "$r2"
+        tc_want "tree check: an unknown option is refused" 64 "unknown argument --no-such-option" "" --tree-check 0.0.1 --no-such-option
+        [ "${3:-}" != crates ] || return 0
         tc_want "tree check: a rev's tree, not the working tree's" 0 "tree check ok" "" --tree-check 0.0.1 "$r1"
         tc_want "tree check: the rev named in the refusal" 1 "crates/serve says version 0.0.2 at $r2, not 0.0.1" "" --tree-check 0.0.1 "$r2"
         tc_want "tree check: a rev that is no commit" 1 "cannot read crates/serve/Cargo.toml at no-such-rev" "" --tree-check 0.0.1 no-such-rev
@@ -421,11 +543,170 @@ if [ "${1:-}" = --self-test ]; then
         tc_want "bump: an explicit next version" 0 "moved from 0.0.1 to 0.1.0" "" --bump-next 0.0.1 0.1.0
         tc_want "bump: the same version again" 64 "the next version is the current one" "" --bump-next 0.1.0 0.1.0
     }
-    # mutant_publish <name> <old text> <new text>: this script with the first <old text> replaced; its tc_cases must go red. Each
-    # <old text> is the code's own: the first occurrence in the file, or one with a newline round it, which this self-test spells \n.
+    # dd_setup: a repository for --docs-delta and the archive steps: dA the first commit, dB a crates change (where an archive is
+    # built), dD the docs commit, dM more docs (HEAD); dE (no path changed), dS (docs/serving.md), dN (a changelog below the root),
+    # dR (the archive's README), dV (crates/serve/lib.rs moved to docs/) are commits on dB that are on no branch.
+    dd="$t/dd"
+    dd_commit() { git -C "$dd" add -A && git -C "$dd" -c user.name=selftest -c user.email=selftest@invalid commit -q -m "$1" && git -C "$dd" rev-parse HEAD; }
+    dd_child() { # dd_child <parent> <path> [<moved from>]: a commit on <parent> that adds <path>, or moves <moved from> to it
+        local idx="$t/dd.idx" blob tree
+        rm -f "$idx"
+        if [ -n "${3:-}" ]; then blob=$(git -C "$dd" rev-parse "$1:$3"); else blob=$(printf 'child %s\n' "$2" | git -C "$dd" hash-object -w --stdin); fi
+        GIT_INDEX_FILE=$idx git -C "$dd" read-tree "$1"
+        [ -z "${3:-}" ] || GIT_INDEX_FILE=$idx git -C "$dd" update-index --force-remove "$3"
+        GIT_INDEX_FILE=$idx git -C "$dd" update-index --add --cacheinfo "100644,$blob,$2"
+        tree=$(GIT_INDEX_FILE=$idx git -C "$dd" write-tree)
+        git -C "$dd" -c user.name=selftest -c user.email=selftest@invalid commit-tree -p "$1" -m child "$tree"
+    }
+    dd_setup() {
+        mkdir -p "$dd/crates/serve" "$dd/tools/release" "$dd/docs/a"
+        git -C "$dd" init -q
+        printf 'fn a() {}\n' > "$dd/crates/serve/lib.rs"
+        printf 'one\n' > "$dd/README.md"
+        printf 'one\n' > "$dd/tools/release/README.release.md"
+        dA=$(dd_commit first)
+        printf 'fn a() { 1 }\n' > "$dd/crates/serve/lib.rs"
+        dB=$(dd_commit code)
+        printf 'two\n' > "$dd/README.md"; printf 'ko\n' > "$dd/README.ko.md"; printf 'log\n' > "$dd/CHANGELOG.md"; printf 'b\n' > "$dd/docs/a/b.md"
+        dD=$(dd_commit docs)
+        for k in 1 2 3 4; do printf 'm\n' > "$dd/docs/m$k.md"; done
+        dM=$(dd_commit more)
+        dE=$(git -C "$dd" -c user.name=selftest -c user.email=selftest@invalid commit-tree -p "$dB" -m empty "$dB^{tree}")
+        dS=$(dd_child "$dB" docs/serving.md)
+        dN=$(dd_child "$dB" crates/serve/CHANGELOG.md)
+        dR=$(dd_child "$dB" tools/release/README.release.md)
+        dV=$(dd_child "$dB" docs/lib.rs crates/serve/lib.rs)
+    }
+    dd_setup
+    # dd_cases <script copy> <loud 0|1>: --docs-delta on the repository of dd_setup: an archive built at B publishes under the commit T
+    # when B is T, or an ancestor of it with only docs paths between. The functions of that copy run in one shell (sourced); two cases
+    # run its command line. The number of red cases is dd_fails.
+    dd_cases() {
+        local script out line n=0 rc=0
+        script=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
+        dd_loud=$2 dd_fails=0
+        out=$( (
+            # shellcheck source=/dev/null
+            source "$script" --functions
+            k=0
+            dd_try() { # dd_try <case> <want rc> <want text> <text it must not hold or ''> <built> <tag>
+                local o rc=0
+                o=$(docs_delta "$dd" "$5" "$6" 2>&1) || rc=$?
+                k=$((k + 1))
+                if [ "$rc" != "$2" ] || [[ "$o" != *"$3"* ]] || { [ -n "$4" ] && [[ "$o" == *"$4"* ]]; }; then
+                    echo "FAIL $1: rc $rc (want $2), want '$3'${4:+ without '$4'}; got: $o"
+                fi
+            }
+            dd_try "docs delta: the same commit, short against full" 0 "same commit" "" "${dB:0:12}" "$dB"
+            dd_try "docs delta: only docs paths between" 0 "docs-only delta to ${dD:0:12} (4 path(s): CHANGELOG.md README.ko.md README.md docs/a/b.md)" "" "$dB" "$dD"
+            dd_try "docs delta: more than six paths are counted, six are named" 0 "docs-only delta to ${dM:0:12} (8 path(s): CHANGELOG.md README.ko.md README.md docs/a/b.md docs/m1.md docs/m2.md … and 2 more)" "" "$dB" "$dM"
+            dd_try "docs delta: no path between at all" 0 "docs-only delta to ${dE:0:12} (0 path(s): )" "" "$dB" "$dE"
+            dd_try "docs delta: docs/serving.md passes with a note that the build's copy ships" 0 "NOTE: docs/serving.md changed after the build and the archives pack it" "" "$dB" "$dS"
+            dd_try "docs delta: a crates path is refused by name" 1 "changes 1 path(s) outside README.md, README.ko.md, CHANGELOG* and docs/**: crates/serve/lib.rs: rebuild the archives" "docs-only delta" "$dA" "$dB"
+            dd_try "docs delta: only the paths outside the list are named" 1 "crates/serve/lib.rs" "docs/a/b.md" "$dA" "$dD"
+            dd_try "docs delta: a changelog below the root is no changelog" 1 "crates/serve/CHANGELOG.md" "docs-only delta" "$dB" "$dN"
+            dd_try "docs delta: the archive's own README is not the repository's" 1 "tools/release/README.release.md" "docs-only delta" "$dB" "$dR"
+            dd_try "docs delta: a move out of crates/ names the old path" 1 "crates/serve/lib.rs" "docs-only delta" "$dB" "$dV"
+            dd_try "docs delta: a built commit newer than the tag's is no ancestor" 1 "is not an ancestor of the tag's commit" "docs-only delta" "$dD" "$dB"
+            dd_try "docs delta: a built commit the repository does not have" 1 "the archive's commit no-such-commit is no commit of this repository" "" no-such-commit "$dB"
+            echo "CASES $k"
+        ) 2>&1) || rc=$?
+        while IFS= read -r line; do
+            case $line in
+                CASES\ *) n=${line#CASES } ;;
+                FAIL\ *) dd_fails=$((dd_fails + 1)); [ "$dd_loud" = 0 ] || echo "publish.sh self-test: ${line#FAIL }" >&2 ;;
+            esac
+        done <<< "$out"
+        if [ "$rc" != 0 ] || [ "$n" != 12 ]; then
+            dd_fails=$((dd_fails + 1))
+            [ "$dd_loud" = 0 ] || echo "publish.sh self-test: docs delta: the cases ended rc $rc after ${n:-0} of 12: $out" >&2
+        fi
+        # the command line: the repository is the caller's, and the usage is named
+        out=$(cd "$dd" && bash "$script" --docs-delta "$dB" "$dD" 2>&1) || rc=$?
+        [[ "$out" == "docs-only delta to ${dD:0:12} ("* ]] || { dd_fails=$((dd_fails + 1)); [ "$dd_loud" = 0 ] || echo "publish.sh self-test: docs delta: the command line printed: $out" >&2; }
+        rc=0
+        out=$(cd "$dd" && bash "$script" --docs-delta "$dB" 2>&1) || rc=$?
+        if [ "$rc" != 64 ] || [[ "$out" != *"usage: tools/release/publish.sh --docs-delta <built commit> <tag commit>"* ]]; then
+            dd_fails=$((dd_fails + 1))
+            [ "$dd_loud" = 0 ] || echo "publish.sh self-test: docs delta: no tag commit: rc $rc (want 64); got: $out" >&2
+        fi
+        [ "$dd_loud" = 0 ] || cases=$((cases + n + 2))
+    }
+    # flow_cases <script copy> <loud 0|1> [linux|mac]: steps 3 and 3b on that copy's functions (sourced), with the box's ssh and scp stood in for
+    # by a shell and cp: a stub archive whose binary says the version line the case names, the repository dd as the tree. The number
+    # of red cases is flow_fails. A third argument runs the Linux archive's cases or the Mac archive's alone.
+    flow_cases() {
+        local script=$1 ver="9.9.9-st$$" rem="$t/rem" arch="$t/arch" stubs="$t/stubbin" nm built group=${3:-all}
+        flow_loud=$2 flow_fails=0
+        nm="bloomery-$ver-linux-x86_64-cuda-sm86"
+        mkdir -p "$stubs" "$rem/target/release-dist" "$rem/tools/release" "$t/ftmp"
+        printf '#!/bin/sh\nexit 0\n' > "$rem/tools/release/build.sh"
+        command -v sha256sum > /dev/null || printf '#!/bin/sh\nexec shasum -a 256 "$@"\n' > "$stubs/sha256sum"
+        chmod +x "$stubs"/* 2> /dev/null || true
+        flow_pack() { # flow_pack <the line its bloomery-serve --version prints>
+            rm -rf "$arch" && mkdir -p "$arch/$nm/bin"
+            printf '#!/bin/sh\necho "%s"\n' "$1" > "$arch/$nm/bin/bloomery-serve"
+            chmod +x "$arch/$nm/bin/bloomery-serve"
+            tar -czf "$rem/target/release-dist/$nm.tar.gz" -C "$arch" "$nm"
+            (cd "$rem/target/release-dist" && shasum -a 256 "$nm.tar.gz" > "$nm.tar.gz.sha256")
+        }
+        flow_try() { # flow_try <case> <want rc> <want text> <text it must not hold or ''> <code to run after sourcing the copy>
+            local name=$1 want_rc=$2 want=$3 unwanted=$4 out rc=0
+            out=$( (
+                # shellcheck source=/dev/null
+                source "$script" --functions
+                PATH="$stubs:$PATH"
+                ssh() { shift; bash -c "$1"; }
+                scp() { shift; cp "${1#*:}" "$2"; }
+                BOX=ws REMOTE=$rem VERSION=$ver TAG=v$ver ROOT=$dd TMP="$t/ftmp" MAC_NAME="bloomery-$ver-macos-arm64-metal"
+                COMMIT=$(git -C "$dd" rev-parse --short=12 HEAD)
+                eval "$5"
+            ) 2>&1) || rc=$?
+            if [ "$rc" != "$want_rc" ] || [[ "$out" != *"$want"* ]] || { [ -n "$unwanted" ] && [[ "$out" == *"$unwanted"* ]]; }; then
+                flow_fails=$((flow_fails + 1))
+                [ "$flow_loud" = 0 ] || echo "publish.sh self-test: $name: rc $rc (want $want_rc), want '$want'${unwanted:+ without '$unwanted'}; got: $out" >&2
+            fi
+            [ "$flow_loud" = 0 ] || cases=$((cases + 1))
+        }
+        if [ "$group" != mac ]; then
+            built="bloomery-serve $ver (commit ${dM:0:12})"
+            flow_pack "$built"
+            flow_try "archive: built at the tag's commit" 0 "built at ${dM:0:12} (same commit)" "" 'linux_archive gb "$nm" sm_86'
+            flow_try "archive: the sha256 is what the flow prints" 0 "$(shasum -a 256 "$rem/target/release-dist/$nm.tar.gz" | awk '{print $1}')" "" 'linux_archive gb "$nm" sm_86 2> /dev/null'
+            flow_pack "bloomery-serve $ver (commit ${dB:0:12})"
+            flow_try "archive: built at an ancestor with a docs-only delta" 0 "built at ${dB:0:12} (docs-only delta to ${dM:0:12} (8 path(s)" "cannot publish" 'linux_archive gb "$nm" sm_86'
+            flow_pack "bloomery-serve $ver (commit ${dA:0:12})"
+            flow_try "archive: built before a crates change" 1 "crates/serve/lib.rs: rebuild the archives at the tag's commit" "(docs-only delta" 'linux_archive gb "$nm" sm_86'
+            flow_try "archive: the refusal names the archive and the tag" 1 "$nm was built at ${dA:0:12} and cannot publish under v$ver's commit" "" 'linux_archive gb "$nm" sm_86'
+            flow_pack "bloomery-serve 0.0.0 (commit ${dM:0:12})"
+            flow_try "archive: a binary that says another version" 1 "the packed binary says: bloomery-serve 0.0.0 (commit ${dM:0:12})" "built at" 'linux_archive gb "$nm" sm_86'
+            flow_pack "bloomery-serve $ver (commit )"
+            flow_try "archive: a --version line that names no commit" 1 "named no commit" "built at" 'linux_archive gb "$nm" sm_86'
+        fi
+        if [ "$group" != linux ]; then
+            printf 'llama-server HTTP API. Built from commit %s. Source\n' "$dM" > "$t/mac-readme"
+            flow_try "mac: built at the tag's commit" 0 "built at ${dM:0:12} (same commit)" "" 'mac_built_check "$t/mac-readme"'
+            printf 'llama-server HTTP API. Built from commit %s. Source\n' "$dB" > "$t/mac-readme"
+            flow_try "mac: built at an ancestor with a docs-only delta" 0 "built at ${dB:0:12} (docs-only delta to ${dM:0:12}" "" 'mac_built_check "$t/mac-readme"'
+            printf 'llama-server HTTP API. Built from commit %s. Source\n' "$dA" > "$t/mac-readme"
+            flow_try "mac: built before a crates change" 1 "crates/serve/lib.rs: rebuild the archives" "(docs-only delta" 'mac_built_check "$t/mac-readme"'
+            printf 'llama-server HTTP API. Built from a commit.\n' > "$t/mac-readme"
+            flow_try "mac: a README that names no commit" 1 "names no commit" "" 'mac_built_check "$t/mac-readme"'
+        fi
+        # the flow calls both steps (a step nobody calls holds nothing)
+        if ! grep -q '^SHA=\$(linux_archive "\$BOX" "\$NAME" sm_86) || exit 1$' "$script" || ! grep -q '^MAC_NOTE=\$(mac_built_check "\$TMP/mac/README.md") || exit 1$' "$script"; then
+            flow_fails=$((flow_fails + 1))
+            [ "$flow_loud" = 0 ] || echo "publish.sh self-test: the publish flow does not call linux_archive and mac_built_check" >&2
+        fi
+        [ "$flow_loud" = 0 ] || cases=$((cases + 1))
+        rm -rf "/tmp/pub-$ver"
+    }
+    # mutant_publish <name> <group> <old text> <new text>: this script with the first <old text> replaced; the cases of its group (tc,
+    # crates, dd, linux or mac) must go red. Each <old text> is the code's own: the first occurrence in the file, or one with a newline
+    # round it, which this self-test spells \n.
     mutant_publish() {
         cp "$0" "$t/mutant.sh"
-        python3 -I - "$t/mutant.sh" "$2" "$3" << 'PY' || { echo "publish.sh self-test: mutant $1: the text to replace is not in the code" >&2; fails=$((fails + 1)); return 0; }
+        python3 -I - "$t/mutant.sh" "$3" "$4" << 'PY' || { echo "publish.sh self-test: mutant $1: the text to replace is not in the code" >&2; fails=$((fails + 1)); return 0; }
 import sys
 
 path, old, new = sys.argv[1:4]
@@ -436,18 +717,41 @@ if i < 0:
 open(path, "w").write(s[:i] + new + s[i + len(old):])
 PY
         cases=$((cases + 1))
-        tc_cases "$t/mutant.sh" 0
-        if [ "$tc_fails" = 0 ]; then
-            echo "publish.sh self-test: mutant $1 left every tree and bump case green: the cases do not hold it" >&2
+        red=0
+        case $2 in
+            tc) tc_cases "$t/mutant.sh" 0; red=$tc_fails ;;
+            crates) tc_cases "$t/mutant.sh" 0 crates; red=$tc_fails ;;
+            dd) dd_cases "$t/mutant.sh" 0; red=$dd_fails ;;
+            linux | mac) flow_cases "$t/mutant.sh" 0 "$2"; red=$flow_fails ;;
+        esac
+        if [ "$red" = 0 ]; then
+            echo "publish.sh self-test: mutant $1 left every $2 case green: the cases do not hold it" >&2
             fails=$((fails + 1))
         fi
     }
     tc_cases "$0" 1
     if [ "$tc_fails" != 0 ]; then fails=$((fails + tc_fails)); fi
-    mutant_publish "no README look" 'grep -qF -- "$want" <<< "$text" ||' ': ||'
-    mutant_publish "no version look" '[ "$v" = "$version" ] ||' '[ -n "$v" ] ||'
-    mutant_publish "flow without the tree check" $'\ntree_check "$VERSION" || exit 1\n' $'\n:\n'
-    mutant_publish "lock left behind" 'lock = lock[:m.start(1)] + nxt + lock[m.end(1):]' 'pass'
+    dd_cases "$0" 1
+    if [ "$dd_fails" != 0 ]; then fails=$((fails + dd_fails)); fi
+    flow_cases "$0" 1
+    if [ "$flow_fails" != 0 ]; then fails=$((fails + flow_fails)); fi
+    mutant_publish "no README look" tc 'grep -qF -- "$want" <<< "$text" ||' ': ||'
+    mutant_publish "no version look" tc '[ "$v" = "$version" ] ||' '[ -n "$v" ] ||'
+    mutant_publish "flow without the tree check" tc $'\ntree_check "$VERSION" || exit 1\n' $'\n:\n'
+    mutant_publish "lock left behind" tc 'lock = lock[:m.start(1)] + nxt + lock[m.end(1):]' 'pass'
+    mutant_publish "--crates-only reads the README" crates '[ -z "$crates_only" ] || return 0' ':'
+    mutant_publish "--crates-only skips the crates" crates 'for c in serve gpu-gates; do' 'for c in $([ -n "$crates_only" ] || echo serve gpu-gates); do'
+    mutant_publish "any ancestor passes" dd 'docs_only_path "$p"; then' 'true; then'
+    mutant_publish "no ancestry look" dd 'git -C "$dir" merge-base --is-ancestor "$b" "$t" ||' 'true ||'
+    mutant_publish "only the same commit passes" dd 'if [ "$b" = "$t" ]; then echo "same commit"; return 0; fi' 'if [ "$b" = "$t" ]; then echo "same commit"; return 0; else echo "publish.sh: the archive was built elsewhere" >&2; return 1; fi'
+    mutant_publish "renames are followed" dd 'diff --no-renames --name-only' 'diff --name-only'
+    mutant_publish "a changelog anywhere passes" dd 'CHANGELOG*) [[ $1 != */* ]] ;;' 'CHANGELOG* | */CHANGELOG*) return 0 ;;'
+    mutant_publish "no note for the packed doc" dd '[ "$p" != "$DOCS_PACKED" ] ||' 'true ||'
+    mutant_publish "the Linux archive is not judged" linux 'delta=$(docs_delta "$ROOT" "$built" HEAD) ||' 'delta=$(echo "same commit") ||'
+    mutant_publish "the box does not look at the version" linux 'exit 1 ;; esac; \' ': ;; esac; \'
+    mutant_publish "the flow never looks at the Linux archive" linux $'\nSHA=$(linux_archive "$BOX" "$NAME" sm_86) || exit 1\n' $'\nSHA=0\n'
+    mutant_publish "the flow never looks at the Mac archive" mac $'\nMAC_NOTE=$(mac_built_check "$TMP/mac/README.md") || exit 1\n' $'\nMAC_NOTE=ok\n'
+    mutant_publish "the Mac archive is not judged" mac 'delta=$(docs_delta "$ROOT" "$built" HEAD) || fail "$MAC_NAME' 'delta=$(echo "same commit") || fail "$MAC_NAME'
     if [ "$fails" = 0 ]; then
         echo "publish.sh: self-test ok ($cases cases)"
         exit 0
@@ -464,9 +768,33 @@ if [ "${1:-}" = --sitting-check ]; then
 fi
 
 if [ "${1:-}" = --tree-check ]; then
-    [ $# -ge 2 ] && [ $# -le 3 ] || { echo "usage: tools/release/publish.sh --tree-check <version> [<rev>]" >&2; exit 64; }
-    tree_check "$2" "${3:-}" || exit 1
-    echo "publish.sh: tree check ok: crates/serve and crates/gpu-gates say $2, README.md names its status, tarball and link${3:+ (at $3)}"
+    tc_usage="usage: tools/release/publish.sh --tree-check <version> [<rev>] [--crates-only]"
+    shift
+    tc_version='' tc_rev='' tc_crates=''
+    for a in "$@"; do
+        case "$a" in
+            --crates-only) tc_crates=1 ;;
+            -*) echo "publish.sh: unknown argument $a; $tc_usage" >&2; exit 64 ;;
+            *)
+                if [ -z "$tc_version" ]; then tc_version=$a
+                elif [ -z "$tc_rev" ]; then tc_rev=$a
+                else echo "$tc_usage" >&2; exit 64
+                fi ;;
+        esac
+    done
+    [ -n "$tc_version" ] || { echo "$tc_usage" >&2; exit 64; }
+    tree_check "$tc_version" "$tc_rev" "$tc_crates" || exit 1
+    if [ -n "$tc_crates" ]; then
+        echo "publish.sh: tree check ok (crates only): crates/serve and crates/gpu-gates say $tc_version, README.md not read${tc_rev:+ (at $tc_rev)}"
+    else
+        echo "publish.sh: tree check ok: crates/serve and crates/gpu-gates say $tc_version, README.md names its status, tarball and link${tc_rev:+ (at $tc_rev)}"
+    fi
+    exit 0
+fi
+
+if [ "${1:-}" = --docs-delta ]; then
+    [ $# = 3 ] || { echo "usage: tools/release/publish.sh --docs-delta <built commit> <tag commit>" >&2; exit 64; }
+    docs_delta "$CALLER" "$2" "$3" || exit 1
     exit 0
 fi
 
@@ -476,7 +804,7 @@ if [ "${1:-}" = --bump-next ]; then
     exit $?
 fi
 
-VERSION=${1:?usage: tools/release/publish.sh <version> [--dry-run] [--no-tap] [--no-sm120a] | <version> --tap-only | --self-test | --sitting-check <tarball> <name> <dir>... | --tree-check <version> [<rev>] | --bump-next <version> [<next>]}
+VERSION=${1:?usage: tools/release/publish.sh <version> [--dry-run] [--no-tap] [--no-sm120a] | <version> --tap-only | --self-test | --sitting-check <tarball> <name> <dir>... | --tree-check <version> [<rev>] [--crates-only] | --docs-delta <built> <tag> | --bump-next <version> [<next>]}
 DRY=0; TAP=1; BW=1; TAP_ONLY=0
 for a in "${@:2}"; do
     case "$a" in
@@ -496,8 +824,6 @@ BW_NAME="bloomery-$VERSION-linux-x86_64-cuda-sm120a"
 GB10_NAME="bloomery-$VERSION-linux-aarch64-cuda-sm121a"
 MAC_NAME="bloomery-$VERSION-macos-arm64-metal"
 TAG="v$VERSION"
-
-fail() { echo "publish.sh: $*" >&2; exit 1; }
 
 # tap_bump: step 5 on SHA, MAC_SHA and GB10_SHA (GB10_SHA empty: the release carries no GB10 archive yet).
 tap_bump() {
@@ -558,32 +884,6 @@ tree_check "$VERSION" || exit 1
 
 # 3. the Linux artifacts, each verified on the machine that built it (readelf/objdump and the ELF binary are Linux's)
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
-# linux_archive <box> <name> <arch>: <name>'s .sha256, build.sh --check (for the archive of <arch>) and --version on <box>;
-# then the tarball and .sha256 fetched into $TMP and hashed here. Prints the sha256.
-linux_archive() {
-    local box=$1 name=$2 arch=$3 sha got f
-    local verify=(ssh "$box")
-    # The box's command goes behind its guard; the GB10's runs over plain ssh, as the account that built it (box.sh's
-    # guard reads /root's lease, which that account need not reach).
-    [ "$box" != "$BOX" ] || verify=(bash tools/box.sh)
-    BLOOMERY_BOX=$box "${verify[@]}" "set -e; cd $REMOTE/target/release-dist; \
-sha256sum -c $name.tar.gz.sha256 > /dev/null; \
-rm -rf /tmp/pub-$VERSION; mkdir /tmp/pub-$VERSION; \
-tar -xzf $name.tar.gz -C /tmp/pub-$VERSION --strip-components=1; \
-bash $REMOTE/tools/release/build.sh --check /tmp/pub-$VERSION/bin $arch; \
-V=\$(/tmp/pub-$VERSION/bin/bloomery-serve --version); \
-[ \"\$V\" = \"bloomery-serve $VERSION (commit $COMMIT)\" ] || { echo \"the packed binary says: \$V\" >&2; exit 1; }" >&2 \
-        || fail "$name failed verification on $box (just release-build $VERSION there first)"
-    for f in "$name.tar.gz" "$name.tar.gz.sha256"; do
-        scp -q "$box:$REMOTE/target/release-dist/$f" "$TMP/$f" || fail "cannot fetch $f from $box"
-    done
-    sha=$(grep -o '[0-9a-f]\{64\}' "$TMP/$name.tar.gz.sha256" | head -1)
-    [ -n "$sha" ] || fail "$name's .sha256 holds no digest"
-    got=$(shasum -a 256 "$TMP/$name.tar.gz" | awk '{print $1}')
-    [ "$got" = "$sha" ] || fail "the fetched $name.tar.gz hashes $got, its .sha256 says $sha"
-    echo "publish.sh: $name.tar.gz $(stat -f %z "$TMP/$name.tar.gz") bytes, sha256 $sha, checks and --version ok on $box" >&2
-    echo "$sha"
-}
 SHA=$(linux_archive "$BOX" "$NAME" sm_86) || exit 1
 BW_SHA=
 if [ "$BW" = 1 ]; then
@@ -611,8 +911,8 @@ for b in "$TMP"/mac/bin/*; do
     sig=$(codesign -dvv "$b" 2>&1)
     grep -q '^Authority=Developer ID Application' <<< "$sig" || fail "$(basename "$b") is not signed by a Developer ID (build-mac.sh without MAC_SIGN_IDENTITY)"
 done
-grep -qF "$(git rev-parse HEAD)" "$TMP/mac/README.md" || fail "$MAC_NAME's README names another commit than HEAD"
-echo "publish.sh: $MAC_NAME.tar.gz $(stat -f %z "$TMP/$MAC_NAME.tar.gz") bytes, sha256 $MAC_SHA, checks and Developer ID ok"
+MAC_NOTE=$(mac_built_check "$TMP/mac/README.md") || exit 1
+echo "publish.sh: $MAC_NAME.tar.gz $(stat -f %z "$TMP/$MAC_NAME.tar.gz") bytes, sha256 $MAC_SHA, checks and Developer ID ok; $MAC_NOTE"
 
 # 4. the upload. gh uploads one call's files in parallel, and the image workflow starts when the x86-64 .sha256 is up,
 # so that file goes up alone after every other one.

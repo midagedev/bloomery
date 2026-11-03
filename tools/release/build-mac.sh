@@ -22,7 +22,9 @@
 #        tools/release/build-mac.sh --self-test     (the tree and signing refusals on a temporary repository; check-recipes runs it)
 # Without --commit the release's tag v<version> must exist and be HEAD. With --commit <commit>, HEAD must be that commit and
 # the tag need not exist: the archive is built beside the sitting, before the tag, from the commit the Linux archives were built
-# at, and a tag that does exist must name the same commit.
+# at, and a tag that does exist must name the same commit, or a commit that follows it with only docs paths changed
+# (tools/release/publish.sh --docs-delta: README.md, README.ko.md, CHANGELOG* and docs/**), the case of archives built at the
+# follower's watermark and published under the docs commit that names the release.
 # Writes target/mac-release/dist/$NAME.tar.gz and its .sha256; upload them with `gh release upload v<version>` as named.
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -33,15 +35,17 @@ FIXTURE_IDS=95971,52281,135771,76423,11251,224948,16570,68738
 fail() { echo "build-mac.sh: $*" >&2; exit 1; }
 
 # check_tree_commit <version> <commit or ''>: HEAD is the release's commit and no tracked file changed. The release's commit is
-# <commit> when one is given (and a tag v<version>, if it exists, names it too), else the tag v<version>'s.
+# <commit> when one is given (and a tag v<version>, if it exists, names it too, or a commit after it with only docs paths changed:
+# publish.sh --docs-delta), else the tag v<version>'s.
 check_tree_commit() {
-  local version=$1 want=$2 head full tag
+  local version=$1 want=$2 head full tag delta
   head=$(git rev-parse HEAD) || fail "cannot read HEAD"
   if [ -n "$want" ]; then
     full=$(git rev-parse --verify --quiet "$want^{commit}") || fail "--commit $want is no commit of this tree"
     [ "$head" = "$full" ] || fail "HEAD $head is not the release commit $want ($full): check out the commit the Linux archives were built at"
-    if tag=$(git rev-parse --verify --quiet "v$version^{commit}"); then
-      [ "$tag" = "$head" ] || fail "the tag v$version names $tag, not the release commit $head"
+    if tag=$(git rev-parse --verify --quiet "v$version^{commit}") && [ "$tag" != "$head" ]; then
+      delta=$(bash "$ROOT/tools/release/publish.sh" --docs-delta "$head" "$tag" 2>&1) || fail "the tag v$version names $tag, not the release commit $head: $delta"
+      echo "build-mac.sh: the tag v$version names $tag, which follows the release commit $head: $delta" >&2
     fi
   else
     tag=$(git rev-parse "v$version^{commit}" 2> /dev/null) || fail "no tag v$version (before the tag, name the commit: --commit <commit>)"
@@ -94,6 +98,19 @@ self_test() {
   printf 'two\n' > "$r/f"
   git -C "$r" -c user.name=selftest -c user.email=selftest@invalid commit -q -am two
   c2=$(git -C "$r" rev-parse HEAD)
+  # two commits on c2, on no branch: one adds a docs path, one a crates path; tags v7.7.7 and v7.7.8 name them
+  mk_child() { # mk_child <path>
+    local idx="$t/idx" blob tree
+    rm -f "$idx"
+    blob=$(printf 'child\n' | git -C "$r" hash-object -w --stdin)
+    GIT_INDEX_FILE=$idx git -C "$r" read-tree "$c2"
+    GIT_INDEX_FILE=$idx git -C "$r" update-index --add --cacheinfo "100644,$blob,$1"
+    tree=$(GIT_INDEX_FILE=$idx git -C "$r" write-tree)
+    git -C "$r" -c user.name=selftest -c user.email=selftest@invalid commit-tree -p "$c2" -m child "$tree"
+  }
+  git -C "$r" tag v7.7.7 "$(mk_child README.md)"
+  git -C "$r" tag v7.7.8 "$(mk_child crates/serve/lib.rs)"
+  t78=$(git -C "$r" rev-parse "v7.7.8^{commit}")
   # tree_case <script> <loud> <case> <want rc> <want text> <version> <commit or ''>: check_tree_commit of that copy of this script
   tree_case() {
     cases=$((cases + 1))
@@ -120,6 +137,9 @@ self_test() {
     tree_case "$s" "$l" "commit mode, HEAD is not the commit" 1 "HEAD $c2 is not the release commit ${c1:0:12} ($c1)" 9.8.8 "${c1:0:12}" || n=$((n + 1))
     tree_case "$s" "$l" "commit mode, no such commit" 1 "--commit no-such-commit is no commit of this tree" 9.8.8 no-such-commit || n=$((n + 1))
     tree_case "$s" "$l" "commit mode, the tag names another commit" 1 "the tag v9.9.9 names $c1, not the release commit $c2" 9.9.9 "$c2" || n=$((n + 1))
+    tree_case "$s" "$l" "commit mode, the tag follows with a docs-only delta" 0 "docs-only delta to" 7.7.7 "${c2:0:12}" || n=$((n + 1))
+    tree_case "$s" "$l" "commit mode, the tag follows with a crates path" 1 "the tag v7.7.8 names $t78, not the release commit $c2: publish.sh: the archive was built at ${c2:0:12} and the tag's commit" 7.7.8 "${c2:0:12}" || n=$((n + 1))
+    tree_case "$s" "$l" "commit mode, the crates path is named" 1 "crates/serve/lib.rs" 7.7.8 "${c2:0:12}" || n=$((n + 1))
     tree_case "$s" "$l" "tag mode, HEAD is not the tag" 1 "HEAD $c2 is not v9.9.9 ($c1)" 9.9.9 "" || n=$((n + 1))
     tree_case "$s" "$l" "tag mode, no tag" 1 "no tag v9.8.8 (before the tag, name the commit: --commit <commit>)" 9.8.8 "" || n=$((n + 1))
     printf 'dirty\n' > "$r/f"
@@ -171,7 +191,8 @@ PY
   }
   all_cases "$self" 1 || fails=$((fails + $?))
   mutant "HEAD need not be the commit" '[ "$head" = "$full" ] ||' 'true ||'
-  mutant "the tag may name another commit" '[ "$tag" = "$head" ] || fail "the tag' 'true || fail "the tag'
+  mutant "the tag may name another commit" '[ "$tag" != "$head" ]; then' 'false; then'
+  mutant "the tag may follow with any delta" 'delta=$(bash "$ROOT/tools/release/publish.sh" --docs-delta "$head" "$tag" 2>&1) ||' 'delta=ok ||'
   mutant "the release is unsigned without a word" '[ -z "$missing" ] || fail' 'true || fail'
   mutant "signing is asked after the host" $'\nrequire_signing "$UNSIGNED"\n' $'\n:\n'
   rm -rf "$t"

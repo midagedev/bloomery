@@ -47,8 +47,13 @@
 # Before anything is built the tree is held to what the publish will hold it to: the serve and gpu-gates crates say <version>
 # and README.md names the release's status, tarball and link (tools/release/publish.sh --tree-check, the one owner of the
 # check), so a tree that cannot publish is refused here, not after every archive is built.
-# Usage: tools/release/build.sh <version> <commit>
-#        tools/release/build.sh --dry-run <version> <commit>   (the tree check and the directories this build would use; builds nothing)
+# --stage w builds at the follower's watermark, the newest all-green commit, ahead of the ask: the tree check holds the crates'
+# versions alone (--tree-check <version> --crates-only), because that commit's README names the last release until the docs
+# commit that the tag names. The archive is the same program, and its --version names the watermark's commit; tools/release/
+# publish.sh accepts it for a tag commit that follows with only docs paths changed (its docs_delta). Without --stage the
+# README is held too.
+# Usage: tools/release/build.sh [--stage w] <version> <commit>
+#        tools/release/build.sh [--stage w] --dry-run <version> <commit>   (the tree check and the directories this build would use; builds nothing)
 #        tools/release/build.sh --check <dir> [<arch>]   (the binary checks alone, on <dir>/<bin>, for the archive of
 #                                                         <arch>, default the archive machine's sm_86 or sm_121a; builds and packs nothing)
 #        tools/release/build.sh --self-test     (the host-code scan on fixture listings, the platform table, the cross refusals and
@@ -62,7 +67,7 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$ROOT"
-CHECK_ONLY= SELF_TEST= CHECK_ARCH= DRY=
+CHECK_ONLY= SELF_TEST= CHECK_ARCH= DRY= BUILD_STAGE=
 if [ "${1:-}" = --check ]; then
   CHECK_ONLY=${2:?usage: tools/release/build.sh --check <dir> [<arch>]}
   CHECK_ARCH=${3:-}
@@ -70,12 +75,21 @@ if [ "${1:-}" = --check ]; then
 elif [ "${1:-}" = --self-test ]; then
   [ $# = 1 ] || { echo "usage: tools/release/build.sh --self-test" >&2; exit 64; }
   SELF_TEST=1
-elif [ "${1:-}" = --dry-run ]; then
-  [ $# = 3 ] || { echo "usage: tools/release/build.sh --dry-run <version> <commit>" >&2; exit 64; }
-  DRY=1 VERSION=$2 COMMIT=$3
 else
-  VERSION=${1:?usage: tools/release/build.sh <version> <commit>}
-  COMMIT=${2:?usage: tools/release/build.sh <version> <commit>}
+  BUILD_USAGE="usage: tools/release/build.sh [--stage w] [--dry-run] <version> <commit>"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) DRY=1; shift ;;
+      --stage)
+        [ $# -ge 2 ] || { echo "build.sh: --stage needs a stage (w); $BUILD_USAGE" >&2; exit 64; }
+        [ "$2" = w ] || { echo "build.sh: --stage takes w, got '$2'; $BUILD_USAGE" >&2; exit 64; }
+        BUILD_STAGE=$2; shift 2 ;;
+      -*) echo "build.sh: unknown argument $1; $BUILD_USAGE" >&2; exit 64 ;;
+      *) break ;;
+    esac
+  done
+  [ $# = 2 ] || { echo "$BUILD_USAGE" >&2; exit 64; }
+  VERSION=$1 COMMIT=$2
 fi
 
 BINS=(bloomery-serve)
@@ -204,6 +218,7 @@ build_dirs() {
 plan_lines() {
   echo "release: dry run: $NAME (arch $RELEASE_ARCH, $MACHINE) builds in $CARGO_TARGET_DIR"
   echo "release: dry run: its device files (PTX, .ll, .oxide-artifacts/) go to $OXIDE_OUT, not the tree's root"
+  [ -z "$BUILD_STAGE" ] || echo "release: dry run: stage $BUILD_STAGE: the README was not checked; the archive's --version will name $COMMIT"
   echo "release: dry run: it packs $DIST/$NAME.tar.gz; nothing was built"
 }
 
@@ -519,7 +534,7 @@ import sys
 
 src, dst = sys.argv[1:3]
 s = open(src).read()
-old = '\nif [ -z "$CHECK_ONLY" ]; then\n  bash "$ROOT/tools/release/publish.sh" --tree-check "$VERSION" || exit 1\nfi\n'
+old = '\nif [ -z "$CHECK_ONLY" ]; then\n  bash "$ROOT/tools/release/publish.sh" --tree-check "$VERSION" ${BUILD_STAGE:+--crates-only} || exit 1\nfi\n'
 i = s.find(old)
 if i < 0:
     sys.exit(1)
@@ -531,6 +546,60 @@ PY
     echo "release self-test: the build without the tree check still refused the stale README: $out" >&2
     fails=$((fails + 1))
   fi
+
+  # --stage w: the crates' versions are held and the README is not (a watermark's README names the last release). The tree above has
+  # crates at 0.0.2 and a README at 0.0.1. A build on this machine goes on past the tree check to the platform (this Mac refuses it,
+  # a Linux box reaches the plan), so these cases read the tree check's line and the refusals, never the rc past it.
+  expect_args() { # expect_args <case> <build.sh copy> <want rc or ''> <want text> <text it must not hold or ''> <args…>
+    local name=$1 copy=$2 want_rc=$3 want=$4 unwanted=$5
+    shift 5
+    cases=$((cases + 1))
+    out=$(cd "$tc" && bash "$copy" "$@" 2>&1) && rc=0 || rc=$?
+    if { [ -n "$want_rc" ] && [ "$rc" != "$want_rc" ]; } || [[ "$out" != *"$want"* ]] || { [ -n "$unwanted" ] && [[ "$out" == *"$unwanted"* ]]; }; then
+      echo "release self-test: stage $name: rc $rc (want ${want_rc:-any}), want '$want'${unwanted:+ without '$unwanted'}; output: $out" >&2
+      fails=$((fails + 1))
+    fi
+  }
+  stage_cases() { # stage_cases <build.sh copy>: the cases of the stage, all against that copy
+    expect_args "w passes a stale README" "$1" '' "tree check ok (crates only)" "does not name" --dry-run --stage w 0.0.2 abc123456789
+    expect_args "w, either order" "$1" '' "tree check ok (crates only)" "does not name" --stage w --dry-run 0.0.2 abc123456789
+    expect_args "w refuses a crate behind the release" "$1" 1 "crates/serve says version 0.0.2, not 0.0.3" "tree check ok" --dry-run --stage w 0.0.3 abc123456789
+    expect_args "w builds with the stage and no dry run, the same tree check" "$1" 1 "crates/serve says version 0.0.2, not 0.0.3" "tree check ok" --stage w 0.0.3 abc123456789
+    expect_args "no stage refuses the stale README" "$1" 1 "README.md does not name '## Status (0.0.2)'" "tree check ok" --dry-run 0.0.2 abc123456789
+    expect_args "no stage, no dry run, refuses the stale README" "$1" 1 "README.md does not name '## Status (0.0.2)'" "tree check ok" 0.0.2 abc123456789
+    expect_args "a stage that is not w" "$1" 64 "--stage takes w, got 'x'" "tree check ok" --stage x 0.0.2 abc123456789
+    expect_args "a stage with no name" "$1" 64 "--stage needs a stage (w)" "" --stage
+    expect_args "an option it does not take" "$1" 64 "unknown argument --no-such-option" "" --no-such-option 0.0.2 abc123456789
+    expect_args "a commit missing" "$1" 64 "usage: tools/release/build.sh [--stage w] [--dry-run] <version> <commit>" "tree check ok" --stage w 0.0.2
+  }
+  stage_cases "$tc/tools/release/build.sh"
+  # mutate_build <name> <old text> <new text>: the copy of this script in the temporary tree with the first <old text> replaced; its
+  # stage cases must go red
+  mutate_build() {
+    local before=$fails
+    python3 -I - "$0" "$tc/tools/release/build-mutant.sh" "$2" "$3" << 'PY' || { echo "release self-test: mutant $1: the text to replace is not in the code" >&2; fails=$((fails + 1)); return 0; }
+import sys
+
+src, dst, old, new = sys.argv[1:5]
+s = open(src).read()
+i = s.find(old)
+if i < 0:
+    sys.exit(1)
+open(dst, "w").write(s[:i] + new + s[i + len(old):])
+PY
+    fails=0
+    stage_cases "$tc/tools/release/build-mutant.sh" 2> /dev/null
+    if [ "$fails" = 0 ]; then
+      fails=$before
+      echo "release self-test: mutant $1 left every stage case green: the cases do not hold it" >&2
+      fails=$((fails + 1))
+    else
+      fails=$before
+    fi
+  }
+  mutate_build "the stage is ignored" $' ${BUILD_STAGE:+--crates-only} || exit 1\n' $' || exit 1\n'
+  mutate_build "the stage skips the tree check" $'\nif [ -z "$CHECK_ONLY" ]; then\n  bash "$ROOT/tools/release/publish.sh"' $'\nif [ -z "$CHECK_ONLY" ] && [ -z "$BUILD_STAGE" ]; then\n  bash "$ROOT/tools/release/publish.sh"'
+  mutate_build "any stage name is taken" '[ "$2" = w ] ||' 'true ||'
 
   # check_version on stub binaries: the line it prints, the runner that runs a cross binary, and each refusal by name. The
   # stub runner says so on stderr and execs its argument, so a case that must run under one shows it.
@@ -594,7 +663,7 @@ fi
 
 # The tree is held to what the publish will hold it to, first: nothing below runs for a tree that cannot publish.
 if [ -z "$CHECK_ONLY" ]; then
-  bash "$ROOT/tools/release/publish.sh" --tree-check "$VERSION" || exit 1
+  bash "$ROOT/tools/release/publish.sh" --tree-check "$VERSION" ${BUILD_STAGE:+--crates-only} || exit 1
 fi
 
 # The archive's machine: the building machine's own, or the cross one BLOOMERY_RELEASE_TARGET names. The archive's

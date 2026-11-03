@@ -17,7 +17,9 @@
 #   README and versions  tools/release/publish.sh --tree-check at W and at HEAD: the serve and gpu-gates crates say the release's
 #                        version and README.md names its status, tarball and link
 #   tarballs             the box's target/release-dist archives (BLOOMERY_BOX and BLOOMERY_REMOTE, as publish.sh reads them): each arch's
-#                        sha256 and the commit its VERSION file names, held to the picked commit
+#                        sha256 and the commit its VERSION file names, held to the picked commit: the same commit, or an ancestor
+#                        with only docs paths between (tools/release/publish.sh --docs-delta: README.md, README.ko.md, CHANGELOG*,
+#                        docs/**), so archives the follower built at W are ready for a HEAD that adds the docs commit
 #   rotation             tools/rotation.py check
 #   needs-gpu PRs        gh: merged since the last release tag with needs-gpu and neither gpu-verified nor gpu-evidence; skipped by
 #                        name where gh is absent or cannot answer
@@ -141,6 +143,18 @@ self_test() {
   commit three
   head=$(git -C "$r" rev-parse HEAD)
   w2=${w0:0:12}
+  # two commits on head, on no branch: one adds a docs path, one a crates path; --head names them
+  mk_child() { # mk_child <path>
+    local idx="$t/idx" blob tree
+    rm -f "$idx"
+    blob=$(printf 'child\n' | git -C "$r" hash-object -w --stdin)
+    GIT_INDEX_FILE=$idx git -C "$r" read-tree "$head"
+    GIT_INDEX_FILE=$idx git -C "$r" update-index --add --cacheinfo "100644,$blob,$1"
+    tree=$(GIT_INDEX_FILE=$idx git -C "$r" write-tree)
+    git -C "$r" -c user.name=selftest -c user.email=selftest@invalid commit-tree -p "$head" -m child "$tree"
+  }
+  hd_docs=$(mk_child docs/notes.md)
+  hd_code=$(mk_child crates/serve/lib.rs)
   # the stubs, each driven by an environment variable the case sets
   cat > "$t/stub/late" << 'EOF'
 #!/bin/sh
@@ -243,6 +257,14 @@ EOF
     run_pick STUB_GATES="$g" STUB_WALL=1200 STUB_TARS="sm86_abc_deadbeef0000 sm120a_def_${head:0:12}" -- "$p" --w-file "$t/follow-kv" --version 0.0.1
     want "tarballs: built at another commit" 0 "built at deadbeef0000, not ${head:0:12}" "ready: no" "archive built at another commit: sm86"
   }
+  cases_docs() {
+    run_pick STUB_GATES="$g" STUB_WALL=1200 STUB_TARS="sm86_abc_${head:0:12} sm120a_def_${head:0:12}" -- "$p" --w-file "$t/follow-kv" --head "$hd_docs" --version 0.0.1
+    want "tarballs: built at W, the pick adds a docs commit" 0 "pick: HEAD ${hd_docs:0:12}" "sm86 abc built at ${head:0:12}, docs-only delta to ${hd_docs:0:12}" "sm120a def built at ${head:0:12}, docs-only delta to ${hd_docs:0:12}" "ready: yes" "!archive built at another commit"
+    run_pick STUB_GATES="$g" STUB_WALL=1200 STUB_TARS="sm86_abc_${head:0:12} sm120a_def_${head:0:12}" -- "$p" --w-file "$t/follow-kv" --head "$hd_code" --version 0.0.1
+    want "tarballs: built before a crates change" 0 "pick: HEAD ${hd_code:0:12}" "sm86 abc built at ${head:0:12}, not ${hd_code:0:12}" "ready: no" "archive built at another commit: sm86" "!docs-only delta"
+    run_pick STUB_GATES="$g" STUB_WALL=1200 STUB_TARS="sm86_abc_${head:0:12} sm120a_def_${head:0:12}" -- "$p" --w-file "$t/follow-kv" --head "$head" --version 0.0.1
+    want "tarballs: built at the pick itself" 0 "sm86 abc built at ${head:0:12}" "ready: yes" "!docs-only delta" "!archive built at another commit"
+  }
   cases_tags() {
     run_pick STUB_GATES="$g" STUB_WALL=1200 STUB_PRS=$'#41 a kernel\n#44 another' -- "$p" --w-file "$t/follow-kv" --version 0.0.1
     want "needs-gpu PRs listed" 0 "needs-gpu PRs        2 merged since v0.0.0" "#41 a kernel" "needs-gpu PRs: 2"
@@ -266,7 +288,7 @@ EOF
     run_pick -- "$p" --head no-such-rev
     want "a HEAD that is no commit" 64 "--head no-such-rev is no commit"
   }
-  # all_cases <pick.sh copy in the temp repo> <loud> [rule|rows|tags]: the cases (all groups without the third argument); BAD counts the red ones
+  # all_cases <pick.sh copy in the temp repo> <loud> [rule|rows|docs|tags]: the cases (all groups without the third argument); BAD counts the red ones
   all_cases() {
     local p=$1 g="gate-a gate-b" group=${3:-all}
     LOUD=$2 BAD=0
@@ -274,6 +296,7 @@ EOF
     printf '%s 2026-11-03T06:30 212\n' "$w2" > "$t/follow-line"
     case $group in all | rule) cases_rule ;; esac
     case $group in all | rows) cases_rows ;; esac
+    case $group in all | docs) cases_docs ;; esac
     case $group in all | tags) cases_tags ;; esac
     [ "$group" != all ] || cases_rest
     return "$BAD"
@@ -304,6 +327,8 @@ PY
   mutant "W whatever the delta" rule 'PICK=HEAD REASON="the HEAD delta proves' 'PICK=W REASON="the HEAD delta proves'
   mutant "a watermark that is not an ancestor is used" rule $'\n    if git merge-base --is-ancestor "$W_FULL" "$HEAD_FULL"; then\n' $'\n    if true; then\n'
   mutant "the last tag is the nearest ancestor" tags $'\nTAGS=$(git tag -l \'v[0-9]*\' --sort=-v:refname)\n' $'\nTAGS=$(git describe --tags --abbrev=0 --match \'v[0-9]*\' "$HEAD_FULL" 2> /dev/null)\n'
+  mutant "an archive built before a crates change is ready" docs $'\n    elif [ -n "$tar_c" ] && tar_d=$(bash tools/release/publish.sh --docs-delta "$tar_c" "$PICK_FULL" 2> /dev/null < /dev/null); then\n' $'\n    elif [ -n "$tar_c" ] && tar_d=ok; then\n'
+  mutant "an archive behind a docs commit is not ready" docs $'\n    elif [ -n "$tar_c" ] && tar_d=$(bash tools/release/publish.sh --docs-delta "$tar_c" "$PICK_FULL" 2> /dev/null < /dev/null); then\n' $'\n    elif false; then\n'
   mutant "the README is not looked at" rows $'\n[ "$W_OK" != 1 ] || W_TREE=$(tree_row "$W_FULL")\n' $'\nW_TREE=ok\n'
   mutant "an archive of another commit is ready" rows $'\n    elif [ "${tar_c:0:12}" = "$pc" ] && [ -n "$tar_c" ]; then\n' $'\n    elif true; then\n'
   rm -rf "$t"
@@ -426,6 +451,8 @@ else
       TAR_BAD+=("archive absent: $tar_a")
     elif [ "${tar_c:0:12}" = "$pc" ] && [ -n "$tar_c" ]; then
       TAR_ROWS+=("$tar_a ${tar_s:0:12} built at ${tar_c:0:12}")
+    elif [ -n "$tar_c" ] && tar_d=$(bash tools/release/publish.sh --docs-delta "$tar_c" "$PICK_FULL" 2> /dev/null < /dev/null); then
+      TAR_ROWS+=("$tar_a ${tar_s:0:12} built at ${tar_c:0:12}, $tar_d")
     else
       TAR_ROWS+=("$tar_a ${tar_s:0:12} built at ${tar_c:-?}, not $pc")
       TAR_BAD+=("archive built at another commit: $tar_a")
