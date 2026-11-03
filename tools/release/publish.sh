@@ -7,6 +7,11 @@
 #   tools/release/publish.sh <version> --tap-only   step 5 alone, on the release's own .sha256 assets (after a GB10 upload)
 #   tools/release/publish.sh --self-test     (the rotation's refusal on stub rotation.py exits, and step 3a's warnings; check-recipes runs it)
 #   tools/release/publish.sh --sitting-check <tarball> <name> <dir>...   step 3a alone, on the verdicts in each <dir>
+#   tools/release/publish.sh --tree-check <version> [<rev>]   steps 2 and 2b alone, on the working tree or on <rev>'s tree
+#                                      (git show, nothing is checked out): `just release-build`, tools/release/build.sh and
+#                                      tools/release/pick.sh call it before any archive is built, so the README commit
+#                                      precedes the builds and the tag never moves after them
+#   tools/release/publish.sh --bump-next <version> [<next>]   edits the working tree to the next version (step 6 names it)
 #
 # What it owns, in order:
 #   0. the rotation: `python3 tools/rotation.py check` must be green (every F family has a green ledger row inside the
@@ -14,7 +19,9 @@
 #   1. the tag: HEAD must carry tag v<version> (the release is the tag; the binaries'
 #      --version names this commit);
 #   2. the versions: the serve AND gpu-gates crates must both say <version> (--version
-#      reads gpu-gates, /props reads serve — v0.2.0 shipped with 0.1.0 in --version);
+#      reads gpu-gates, /props reads serve — v0.2.0 shipped with 0.1.0 in --version), and
+#   2b. the README names this release: its status heading, the tarball it unpacks and the release link; both are
+#      tree_check below, the one owner of the two steps, which the builds call first (--tree-check);
 #   3. the artifacts: on the box, where readelf and the ELF binary run — the release's
 #      own .sha256, build.sh's checks on the unpacked binary (for the archive's arch), and its --version;
 #      then the tarball and .sha256 come here for the upload and the tap's digest; the
@@ -44,8 +51,10 @@
 #      release without a GB10 archive leaves the tap as it is, named: the GB10 archive is built on a Spark after the
 #      tag, and `--tap-only` bumps the tap once it is on the release (a bump without it would install an older GB10
 #      build under the new version);
-#   6. prints what is left to the lead: the release notes (gh release edit --notes-file)
-#      and the ghcr image — the v* tag push already triggered .github/workflows/container.yml.
+#   6. prints what is left to the lead: the release notes (gh release edit --notes-file),
+#      the ghcr image — the v* tag push already triggered .github/workflows/container.yml — and the next-version edit
+#      (`--bump-next <version>`: the serve and gpu-gates crates and their two Cargo.lock entries move to the next patch
+#      version on main, so the tarballs built there before the next ask are that release's).
 #
 # --dry-run does 1–3 and prints 4–6 without touching the release or the tap.
 set -euo pipefail
@@ -116,6 +125,71 @@ release_assets() {
     [ "$3" = 0 ] || echo "bloomery-$1-linux-x86_64-cuda-sm120a"
     [ "$2" = 0 ] || echo "bloomery-$1-linux-aarch64-cuda-sm121a"
     echo "bloomery-$1-macos-arm64-metal"
+}
+
+# tree_check <version> [<rev>]: steps 2 and 2b. The serve and gpu-gates crates say <version>, and README.md names the release:
+# its status heading, the sm_86 tarball it unpacks and the release link. Read from the working tree, or from <rev>'s tree when one
+# is given (git show; nothing is checked out). Returns 0 with nothing printed, or 1 with the first refusal on stderr, naming the
+# file and what to do. The check is the same wherever it runs: before the builds (tools/release/build.sh, tools/release/pick.sh)
+# and again here at the publish.
+tree_file() { # tree_file <path> [<rev>]
+    if [ -n "${2:-}" ]; then git show "$2:$1"; else cat -- "$1"; fi
+}
+tree_check() {
+    local version=$1 rev=${2:-} c text v want at=''
+    [ -z "$rev" ] || at=" at $rev"
+    for c in serve gpu-gates; do
+        text=$(tree_file "crates/$c/Cargo.toml" "$rev" 2> /dev/null) || { echo "publish.sh: cannot read crates/$c/Cargo.toml$at" >&2; return 1; }
+        v=$(awk -F'"' '/^version = "/ {print $2; exit}' <<< "$text")
+        [ "$v" = "$version" ] || { echo "publish.sh: crates/$c says version ${v:-none}$at, not $version — bump it and commit before the builds" >&2; return 1; }
+    done
+    text=$(tree_file README.md "$rev" 2> /dev/null) || { echo "publish.sh: cannot read README.md$at" >&2; return 1; }
+    for want in "## Status ($version)" "bloomery-$version-linux-x86_64-cuda-sm86.tar.gz" "releases/tag/v$version)"; do
+        grep -qF -- "$want" <<< "$text" || { echo "publish.sh: README.md$at does not name '$want' — update its status heading and install lines and commit before the builds" >&2; return 1; }
+    done
+}
+
+# bump_next <version> [<next>]: the working tree moves to <next> (default: <version>'s next patch) on the serve and gpu-gates
+# crates and the two Cargo.lock entries, the shape of the commit "version: main moves to <next> after the <version> release". Nothing is written unless
+# all four places say <version> now; the files are edited and the commit is the lead's (the command is printed). Returns 0, or 1
+# and a named refusal, or 64 for a malformed version.
+bump_next() {
+    local cur=$1 next=${2:-} semver='^([0-9]+)\.([0-9]+)\.([0-9]+)$'
+    [[ $cur =~ $semver ]] || { echo "publish.sh: --bump-next takes MAJOR.MINOR.PATCH, got '$cur'" >&2; return 64; }
+    [ -n "$next" ] || next="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.$((BASH_REMATCH[3] + 1))"
+    [[ $next =~ $semver ]] || { echo "publish.sh: --bump-next's next version is MAJOR.MINOR.PATCH, got '$next'" >&2; return 64; }
+    [ "$next" != "$cur" ] || { echo "publish.sh: --bump-next: the next version is the current one, $cur" >&2; return 64; }
+    python3 -I - "$cur" "$next" << 'PY' || return 1
+import re
+import sys
+
+cur, nxt = sys.argv[1:3]
+crates = {"crates/serve/Cargo.toml": "bloomery-serve", "crates/gpu-gates/Cargo.toml": "bloomery-gpu-gates"}
+edits = {}
+try:
+    lock = open("Cargo.lock", encoding="utf-8").read()
+    for path, name in crates.items():
+        text = open(path, encoding="utf-8").read()
+        m = re.search(r'^name = "' + re.escape(name) + r'"\nversion = "([^"]*)"$', text, re.M)
+        if not m or m.group(1) != cur:
+            print(f"publish.sh: --bump-next: {path} says version {m.group(1) if m else 'none'}, not {cur}: nothing was written", file=sys.stderr)
+            sys.exit(1)
+        edits[path] = text[:m.start(1)] + nxt + text[m.end(1):]
+        m = re.search(r'^name = "' + re.escape(name) + r'"\nversion = "([^"]*)"$', lock, re.M)
+        if not m or m.group(1) != cur:
+            print(f"publish.sh: --bump-next: Cargo.lock's {name} entry says version {m.group(1) if m else 'none'}, not {cur}: nothing was written", file=sys.stderr)
+            sys.exit(1)
+        lock = lock[:m.start(1)] + nxt + lock[m.end(1):]
+except OSError as e:
+    print(f"publish.sh: --bump-next: {e}: nothing was written", file=sys.stderr)
+    sys.exit(1)
+edits["Cargo.lock"] = lock
+for path, text in edits.items():
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+PY
+    echo "publish.sh: the working tree moved from $cur to $next (crates/serve, crates/gpu-gates, Cargo.lock); the commit is the lead's:"
+    echo "  git commit -m 'version: main moves to $next after the $cur release' -- Cargo.lock crates/serve/Cargo.toml crates/gpu-gates/Cargo.toml"
 }
 
 # formula_bump <formula> <version> <sha> <mac sha> <gb10 sha or ''>: the tap formula's version, urls and sha256s in place;
@@ -272,6 +346,108 @@ if [ "${1:-}" = --self-test ]; then
         echo "publish.sh self-test: the publish flow does not call sitting_check on the tarball it uploads" >&2
         fails=$((fails + 1))
     }
+    # tree_check (steps 2 and 2b, the builds' first look) and bump_next, on a tree of their own: a copy of this script in a git
+    # repository with the serve and gpu-gates manifests, a README and a Cargo.lock. tc_cases runs every case against one copy of the
+    # script and counts the red ones in tc_fails; the real script must have none, and each mutant of it must have some.
+    tc="$t/tc"
+    mk_tree() { # mk_tree <crates' version> <README's version>
+        printf '[package]\nname = "bloomery-serve"\nversion = "%s"\nedition = "2024"\n' "$1" > "$tc/crates/serve/Cargo.toml"
+        printf '[package]\nname = "bloomery-gpu-gates"\nversion = "%s"\nedition = "2024"\n' "$1" > "$tc/crates/gpu-gates/Cargo.toml"
+        printf '# bloomery\n\n## Status (%s)\n\ntar xz bloomery-%s-linux-x86_64-cuda-sm86.tar.gz\n[release](https://example.invalid/releases/tag/v%s)\n' "$2" "$2" "$2" > "$tc/README.md"
+        printf 'version = 4\n\n[[package]]\nname = "bloomery-gpu-gates"\nversion = "%s"\ndependencies = [\n "x",\n]\n\n[[package]]\nname = "bloomery-serve"\nversion = "%s"\n\n[[package]]\nname = "x"\nversion = "%s"\n' "$1" "$1" "$1" > "$tc/Cargo.lock"
+    }
+    tc_want() { # tc_want <case> <want rc> <want text> <text it must not hold or ''> <publish.sh args…>
+        local name=$1 want_rc=$2 want=$3 unwanted=$4 out rc=0
+        shift 4
+        out=$(cd "$tc" && bash tools/release/publish.sh "$@" 2>&1) || rc=$?
+        if [ "$rc" != "$want_rc" ] || [[ "$out" != *"$want"* ]] || { [ -n "$unwanted" ] && [[ "$out" == *"$unwanted"* ]]; }; then
+            tc_fails=$((tc_fails + 1))
+            [ "$tc_loud" = 0 ] || echo "publish.sh self-test: $name: rc $rc (want $want_rc), want '$want'${unwanted:+ without '$unwanted'}; got: $out" >&2
+        fi
+        [ "$tc_loud" = 0 ] || cases=$((cases + 1))
+    }
+    tc_cases() { # tc_cases <script copy> <loud 0|1>
+        local script=$1 r1 r2 n
+        tc_loud=$2 tc_fails=0
+        rm -rf "$tc"
+        mkdir -p "$tc/tools/release" "$tc/crates/serve" "$tc/crates/gpu-gates"
+        cp "$script" "$tc/tools/release/publish.sh"
+        printf 'import sys\nsys.exit(0)\n' > "$tc/tools/rotation.py"
+        git -C "$tc" init -q
+        mk_tree 0.0.1 0.0.1
+        git -C "$tc" add -A
+        git -C "$tc" -c user.name=selftest -c user.email=selftest@invalid commit -q -m one
+        r1=$(git -C "$tc" rev-parse --short=12 HEAD)
+        tc_want "tree check: a consistent tree" 0 "tree check ok" "" --tree-check 0.0.1
+        tc_want "tree check: a crate behind the release" 1 "crates/serve says version 0.0.1, not 0.0.2 — bump it and commit before the builds" "" --tree-check 0.0.2
+        mk_tree 0.0.2 0.0.1
+        git -C "$tc" add -A
+        git -C "$tc" -c user.name=selftest -c user.email=selftest@invalid commit -q -m two
+        git -C "$tc" tag v0.0.2
+        r2=$(git -C "$tc" rev-parse --short=12 HEAD)
+        tc_want "tree check: a README that names the last release's status" 1 "README.md does not name '## Status (0.0.2)' — update its status heading and install lines and commit before the builds" "tree check ok" --tree-check 0.0.2
+        tc_want "tree check: a rev's tree, not the working tree's" 0 "tree check ok" "" --tree-check 0.0.1 "$r1"
+        tc_want "tree check: the rev named in the refusal" 1 "crates/serve says version 0.0.2 at $r2, not 0.0.1" "" --tree-check 0.0.1 "$r2"
+        tc_want "tree check: a rev that is no commit" 1 "cannot read crates/serve/Cargo.toml at no-such-rev" "" --tree-check 0.0.1 no-such-rev
+        printf '# bloomery\n\n## Status (0.0.2)\n\n[release](https://example.invalid/releases/tag/v0.0.2)\n' > "$tc/README.md"
+        tc_want "tree check: a README that does not name the tarball" 1 "does not name 'bloomery-0.0.2-linux-x86_64-cuda-sm86.tar.gz'" "" --tree-check 0.0.2
+        git -C "$tc" checkout -q -- README.md
+        tc_want "tree check: no version at all" 64 "usage: tools/release/publish.sh --tree-check" "" --tree-check
+        # The flow refuses at the README before it reaches the box: the archives are not built or fetched for a tree that cannot publish.
+        tc_want "flow: the README check comes before the archives" 1 "README.md does not name '## Status (0.0.2)'" "box.sh" 0.0.2 --dry-run
+        # bump_next: the three files move together, and a tree that disagrees is not touched.
+        mk_tree 0.0.1 0.0.1
+        cp "$tc/Cargo.lock" "$tc/lock.before"
+        tc_want "bump: the next patch version" 0 "git commit -m 'version: main moves to 0.0.2 after the 0.0.1 release' -- Cargo.lock crates/serve/Cargo.toml crates/gpu-gates/Cargo.toml" "" --bump-next 0.0.1
+        n=$(diff "$tc/lock.before" "$tc/Cargo.lock" | grep -c '^[<>]' || true)
+        n=$n/$(grep -c 'version = "0.0.2"' "$tc/crates/serve/Cargo.toml" "$tc/crates/gpu-gates/Cargo.toml" | tr '\n' ' ')
+        if [ "$n" != "4/$tc/crates/serve/Cargo.toml:1 $tc/crates/gpu-gates/Cargo.toml:1 " ]; then
+            tc_fails=$((tc_fails + 1))
+            [ "$tc_loud" = 0 ] || echo "publish.sh self-test: bump: the lock changed lines and the manifests' new versions are '$n', want 4 and one each" >&2
+        fi
+        [ "$tc_loud" = 0 ] || cases=$((cases + 1))
+        mk_tree 0.0.1 0.0.1
+        cp -R "$tc/crates" "$tc/crates.before"
+        sed '/^name = "bloomery-gpu-gates"$/{n;s/0\.0\.1/0.0.0/;}' "$tc/Cargo.lock" > "$tc/Cargo.lock.new" && mv "$tc/Cargo.lock.new" "$tc/Cargo.lock"
+        tc_want "bump: a Cargo.lock that disagrees writes nothing" 1 "Cargo.lock's bloomery-gpu-gates entry says version 0.0.0, not 0.0.1: nothing was written" "" --bump-next 0.0.1
+        if ! diff -r "$tc/crates" "$tc/crates.before" > /dev/null; then
+            tc_fails=$((tc_fails + 1))
+            [ "$tc_loud" = 0 ] || echo "publish.sh self-test: bump: a refused bump changed a manifest" >&2
+        fi
+        [ "$tc_loud" = 0 ] || cases=$((cases + 1))
+        mk_tree 0.0.1 0.0.1
+        tc_want "bump: a tree that says another version" 1 "crates/serve/Cargo.toml says version 0.0.1, not 0.0.7: nothing was written" "" --bump-next 0.0.7
+        tc_want "bump: a version that is no MAJOR.MINOR.PATCH" 64 "takes MAJOR.MINOR.PATCH, got '0.1'" "" --bump-next 0.1
+        tc_want "bump: an explicit next version" 0 "moved from 0.0.1 to 0.1.0" "" --bump-next 0.0.1 0.1.0
+        tc_want "bump: the same version again" 64 "the next version is the current one" "" --bump-next 0.1.0 0.1.0
+    }
+    # mutant_publish <name> <old text> <new text>: this script with the first <old text> replaced; its tc_cases must go red. Each
+    # <old text> is the code's own: the first occurrence in the file, or one with a newline round it, which this self-test spells \n.
+    mutant_publish() {
+        cp "$0" "$t/mutant.sh"
+        python3 -I - "$t/mutant.sh" "$2" "$3" << 'PY' || { echo "publish.sh self-test: mutant $1: the text to replace is not in the code" >&2; fails=$((fails + 1)); return 0; }
+import sys
+
+path, old, new = sys.argv[1:4]
+s = open(path).read()
+i = s.find(old)
+if i < 0:
+    sys.exit(1)
+open(path, "w").write(s[:i] + new + s[i + len(old):])
+PY
+        cases=$((cases + 1))
+        tc_cases "$t/mutant.sh" 0
+        if [ "$tc_fails" = 0 ]; then
+            echo "publish.sh self-test: mutant $1 left every tree and bump case green: the cases do not hold it" >&2
+            fails=$((fails + 1))
+        fi
+    }
+    tc_cases "$0" 1
+    if [ "$tc_fails" != 0 ]; then fails=$((fails + tc_fails)); fi
+    mutant_publish "no README look" 'grep -qF -- "$want" <<< "$text" ||' ': ||'
+    mutant_publish "no version look" '[ "$v" = "$version" ] ||' '[ -n "$v" ] ||'
+    mutant_publish "flow without the tree check" $'\ntree_check "$VERSION" || exit 1\n' $'\n:\n'
+    mutant_publish "lock left behind" 'lock = lock[:m.start(1)] + nxt + lock[m.end(1):]' 'pass'
     if [ "$fails" = 0 ]; then
         echo "publish.sh: self-test ok ($cases cases)"
         exit 0
@@ -287,7 +463,20 @@ if [ "${1:-}" = --sitting-check ]; then
     exit 0
 fi
 
-VERSION=${1:?usage: tools/release/publish.sh <version> [--dry-run] [--no-tap] [--no-sm120a] | <version> --tap-only | --self-test | --sitting-check <tarball> <name> <dir>...}
+if [ "${1:-}" = --tree-check ]; then
+    [ $# -ge 2 ] && [ $# -le 3 ] || { echo "usage: tools/release/publish.sh --tree-check <version> [<rev>]" >&2; exit 64; }
+    tree_check "$2" "${3:-}" || exit 1
+    echo "publish.sh: tree check ok: crates/serve and crates/gpu-gates say $2, README.md names its status, tarball and link${3:+ (at $3)}"
+    exit 0
+fi
+
+if [ "${1:-}" = --bump-next ]; then
+    [ $# -ge 2 ] && [ $# -le 3 ] || { echo "usage: tools/release/publish.sh --bump-next <version> [<next>]" >&2; exit 64; }
+    bump_next "$2" "${3:-}"
+    exit $?
+fi
+
+VERSION=${1:?usage: tools/release/publish.sh <version> [--dry-run] [--no-tap] [--no-sm120a] | <version> --tap-only | --self-test | --sitting-check <tarball> <name> <dir>... | --tree-check <version> [<rev>] | --bump-next <version> [<next>]}
 DRY=0; TAP=1; BW=1; TAP_ONLY=0
 for a in "${@:2}"; do
     case "$a" in
@@ -363,16 +552,9 @@ COMMIT=$(git rev-parse --short=12 HEAD)
 [ -z "$(git status --porcelain --untracked-files=no)" ] || fail "the tree has uncommitted changes"
 git tag -l --points-at HEAD | grep -qx "$TAG" || fail "HEAD does not carry $TAG (tag the release first)"
 
-# 2. the versions: --version reads gpu-gates, /props reads serve
-for c in serve gpu-gates; do
-    v=$(sed -n 's/^version = "\(.*\)"/\1/p' "crates/$c/Cargo.toml" | head -1)
-    [ "$v" = "$VERSION" ] || fail "crates/$c says version $v, not $VERSION — bump it, commit, re-tag, release-build again"
-done
-
-# 2b. the README names this release: its status heading, the tarball it unpacks and the release link
-for want in "## Status ($VERSION)" "$NAME.tar.gz" "releases/tag/$TAG)"; do
-    grep -qF -- "$want" README.md || fail "README.md does not name '$want' — update its status heading and install lines, commit, re-tag"
-done
+# 2 and 2b. the versions (--version reads gpu-gates, /props reads serve) and the README's status heading, tarball and link; the
+# builds ran the same check first, so a refusal here means the tree moved after them
+tree_check "$VERSION" || exit 1
 
 # 3. the Linux artifacts, each verified on the machine that built it (readelf/objdump and the ELF binary are Linux's)
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
@@ -460,6 +642,7 @@ echo "publish.sh: left to the lead:"
 [ -n "$GB10_SHA" ] || echo "  - no GB10 archive in this release: BLOOMERY_GB10_BOX names the GB10 that ran 'just release-build $VERSION'"
 [ -n "$BW_SHA" ] || echo "  - no sm_120a archive in this release (--no-sm120a): the installer takes the sm_86 archive on an RTX 50 series card"
 [ -z "$BW_SHA" ] || echo "  - the sm_120a archive is install.sh's pick on a machine whose every GPU is compute capability 12.0 (sha256 $BW_SHA); Homebrew and the ghcr image stay on the sm_86 archive"
+echo "  - the next version on main (the tarballs built there before the next ask are that release's): tools/release/publish.sh --bump-next $VERSION, then the commit it prints"
 echo "  - release notes: gh release edit $TAG --repo $REPO --notes-file <file>"
 echo "  - the ghcr image builds itself from the tag push (.github/workflows/container.yml); watch:"
 echo "      gh run watch \$(gh run list --repo $REPO --workflow 'Docker image' --limit 1 --json databaseId -q '.[0].databaseId')"

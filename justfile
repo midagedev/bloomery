@@ -1073,10 +1073,11 @@ wt-retire NAME:
 # BLOOMERY_RELEASE_TARGET=aarch64 builds the GB10 archive on the box itself, cross, its cubins from the toolkit's ptxas; the
 # box names the aarch64 sysroot qemu-aarch64 runs the binary's --version in as QEMU_LD_PREFIX (its environment file, or
 # BLOOMERY_BOX_ENV), and build.sh refuses by name what the box lacks.
-# Before the box is touched, tools/release/carry.sh refuses a commit that lacks a fix tools/release/carry.tsv lists
+# Before the box is touched, publish.sh --tree-check refuses a README or version that does not name VERSION, and tools/release/carry.sh refuses a commit that lacks a fix tools/release/carry.tsv lists
 # (here, where .git is).
 release-build VERSION:
     test -z "$(git status --porcelain --untracked-files=no)" || { echo "release-build: the tree has uncommitted changes" >&2; exit 1; }
+    ./tools/release/publish.sh --tree-check {{VERSION}}
     ./tools/release/carry.sh
     ./tools/box.sh "${BLOOMERY_RELEASE_TARGET:+BLOOMERY_RELEASE_TARGET=$BLOOMERY_RELEASE_TARGET }bash tools/release/build.sh {{VERSION}} $(git rev-parse --short=12 HEAD)"
 

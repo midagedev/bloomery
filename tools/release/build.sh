@@ -39,7 +39,16 @@
 # A BLOOMERY_ARCH that is no arch of the machine's archives (tools/arch.sh) ends a build with 64 before anything is built;
 # `--check` reads the binaries and never that variable: the archive's arch is its argument, its machine is
 # BLOOMERY_RELEASE_TARGET's or the machine's own, and an x86_64 binary checked with none is held to sm_86.
+# Each archive builds in a directory of its own, so two archives build at the same time from one tree and neither rebuilds the
+# other: cargo's artifacts in target/<its dir> (below) and the device codegen's files in target/<its dir>/oxide-out. The
+# second is CUDA_OXIDE_PTX_DIR: cargo-oxide writes a crate's PTX, .ll and .oxide-artifacts/ into the compiler's working
+# directory, the tree's root, unless that variable names another, and removes the previous ones first, so two builds of
+# different archs from one root would delete and overwrite each other's.
+# Before anything is built the tree is held to what the publish will hold it to: the serve and gpu-gates crates say <version>
+# and README.md names the release's status, tarball and link (tools/release/publish.sh --tree-check, the one owner of the
+# check), so a tree that cannot publish is refused here, not after every archive is built.
 # Usage: tools/release/build.sh <version> <commit>
+#        tools/release/build.sh --dry-run <version> <commit>   (the tree check and the directories this build would use; builds nothing)
 #        tools/release/build.sh --check <dir> [<arch>]   (the binary checks alone, on <dir>/<bin>, for the archive of
 #                                                         <arch>, default the archive machine's sm_86 or sm_121a; builds and packs nothing)
 #        tools/release/build.sh --self-test     (the host-code scan on fixture listings, the platform table, the cross refusals and
@@ -53,7 +62,7 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$ROOT"
-CHECK_ONLY= SELF_TEST= CHECK_ARCH=
+CHECK_ONLY= SELF_TEST= CHECK_ARCH= DRY=
 if [ "${1:-}" = --check ]; then
   CHECK_ONLY=${2:?usage: tools/release/build.sh --check <dir> [<arch>]}
   CHECK_ARCH=${3:-}
@@ -61,6 +70,9 @@ if [ "${1:-}" = --check ]; then
 elif [ "${1:-}" = --self-test ]; then
   [ $# = 1 ] || { echo "usage: tools/release/build.sh --self-test" >&2; exit 64; }
   SELF_TEST=1
+elif [ "${1:-}" = --dry-run ]; then
+  [ $# = 3 ] || { echo "usage: tools/release/build.sh --dry-run <version> <commit>" >&2; exit 64; }
+  DRY=1 VERSION=$2 COMMIT=$3
 else
   VERSION=${1:?usage: tools/release/build.sh <version> <commit>}
   COMMIT=${2:?usage: tools/release/build.sh <version> <commit>}
@@ -178,6 +190,21 @@ cross_platform() {
   TARGET_DIR=portable-aarch64 TRIPLE=aarch64-unknown-linux-gnu
   LINKER=aarch64-linux-gnu-gcc OBJCOPY=aarch64-linux-gnu-objcopy
   READELF=aarch64-linux-gnu-readelf OBJDUMP=aarch64-linux-gnu-objdump STRINGS=aarch64-linux-gnu-strings
+}
+
+# build_dirs <root>: this archive's two build directories, both under target/<TARGET_DIR> (set_platform, cross_platform): cargo's
+# CARGO_TARGET_DIR and OXIDE_OUT, where cargo-oxide puts the device codegen's PTX, .ll and .oxide-artifacts/ (CUDA_OXIDE_PTX_DIR).
+# Another archive's directory is never inside this one's.
+build_dirs() {
+  CARGO_TARGET_DIR="$1/target/$TARGET_DIR"
+  OXIDE_OUT="$CARGO_TARGET_DIR/oxide-out"
+}
+
+# plan_lines: what this build does, for --dry-run (NAME, RELEASE_ARCH, MACHINE, DIST, CARGO_TARGET_DIR and OXIDE_OUT are set).
+plan_lines() {
+  echo "release: dry run: $NAME (arch $RELEASE_ARCH, $MACHINE) builds in $CARGO_TARGET_DIR"
+  echo "release: dry run: its device files (PTX, .ll, .oxide-artifacts/) go to $OXIDE_OUT, not the tree's root"
+  echo "release: dry run: it packs $DIST/$NAME.tar.gz; nothing was built"
 }
 
 # need_tool <tool> <what to do>: refuses (69) a tool that is not on PATH, naming the command that provides it.
@@ -432,6 +459,79 @@ self_test() {
     fails=$((fails + 1))
   fi
 
+  # The build directories: each archive's own, the device codegen's inside it, and no archive's inside another's, so builds of
+  # two archs at the same time from one tree share nothing. The plan line is what --dry-run prints.
+  expect_dirs() { # expect_dirs <case> <uname -m> <variable> <arch> <want>
+    cases=$((cases + 1))
+    out=$( (set_target "$2" "$3" && set_platform "$MACHINE" "$4" && { [ -z "$CROSS" ] || cross_platform; } && build_dirs /r &&
+      NAME=n DIST=/r/target/release-dist && plan_lines) 2>&1) && rc=0 || rc=$?
+    if [ "$rc" != 0 ] || [ "$out" != "$5" ]; then
+      echo "release self-test: dirs $1: rc $rc (want 0), output: $out" >&2
+      echo "  want: $5" >&2
+      fails=$((fails + 1))
+    fi
+  }
+  expect_dirs sm86 x86_64 '' sm_86 "release: dry run: n (arch sm_86, x86_64) builds in /r/target/portable
+release: dry run: its device files (PTX, .ll, .oxide-artifacts/) go to /r/target/portable/oxide-out, not the tree's root
+release: dry run: it packs /r/target/release-dist/n.tar.gz; nothing was built"
+  expect_dirs sm120a x86_64 '' sm_120a "release: dry run: n (arch sm_120a, x86_64) builds in /r/target/portable-sm120a
+release: dry run: its device files (PTX, .ll, .oxide-artifacts/) go to /r/target/portable-sm120a/oxide-out, not the tree's root
+release: dry run: it packs /r/target/release-dist/n.tar.gz; nothing was built"
+  expect_dirs cross x86_64 aarch64 '' "release: dry run: n (arch sm_121a, aarch64) builds in /r/target/portable-aarch64
+release: dry run: its device files (PTX, .ll, .oxide-artifacts/) go to /r/target/portable-aarch64/oxide-out, not the tree's root
+release: dry run: it packs /r/target/release-dist/n.tar.gz; nothing was built"
+  local a_dir a_out b_dir b_out pair d o
+  read -r a_dir a_out <<< "$(set_platform x86_64 sm_86 && build_dirs /r && echo "$CARGO_TARGET_DIR $OXIDE_OUT")"
+  read -r b_dir b_out <<< "$(set_platform x86_64 sm_120a && build_dirs /r && echo "$CARGO_TARGET_DIR $OXIDE_OUT")"
+  cases=$((cases + 1))
+  if [ -z "$a_dir" ] || [ "$a_dir" = "$b_dir" ] || [ "$a_out" = "$b_out" ]; then
+    echo "release self-test: the sm_86 and sm_120a archives share a build directory: $a_dir $a_out / $b_dir $b_out" >&2
+    fails=$((fails + 1))
+  fi
+  for pair in "$a_dir $b_out" "$b_dir $a_out"; do
+    read -r d o <<< "$pair"
+    cases=$((cases + 1))
+    case "$o/" in "$d/"*)
+      echo "release self-test: $o lies inside $d, another archive's build directory" >&2
+      fails=$((fails + 1)) ;; esac
+  done
+
+  # The tree check comes before anything else is decided or built: a tree whose README names another release is refused by
+  # name, and on a machine that is no Linux release machine too (the platform, which this Mac refuses, is not reached).
+  local tc="$t/tree"
+  mkdir -p "$tc/tools/release" "$tc/crates/serve" "$tc/crates/gpu-gates"
+  cp "$0" "$tc/tools/release/build.sh"
+  cp "$(dirname "$0")/publish.sh" "$tc/tools/release/publish.sh"
+  printf '[package]\nname = "bloomery-serve"\nversion = "0.0.2"\n' > "$tc/crates/serve/Cargo.toml"
+  printf '[package]\nname = "bloomery-gpu-gates"\nversion = "0.0.2"\n' > "$tc/crates/gpu-gates/Cargo.toml"
+  printf '## Status (0.0.1)\nbloomery-0.0.1-linux-x86_64-cuda-sm86.tar.gz\nreleases/tag/v0.0.1)\n' > "$tc/README.md"
+  expect_tree_check() { # expect_tree_check <case> <build.sh copy> <want rc> <want text>
+    cases=$((cases + 1))
+    out=$(cd "$tc" && bash "$2" --dry-run 0.0.2 abc123456789 2>&1) && rc=0 || rc=$?
+    if [ "$rc" != "$3" ] || [[ "$out" != *"$4"* ]] || [[ "$out" == *"dry run: "* ]]; then
+      echo "release self-test: tree check $1: rc $rc (want $3, with '$4' and no plan line), output: $out" >&2
+      fails=$((fails + 1))
+    fi
+  }
+  expect_tree_check stale-readme "$tc/tools/release/build.sh" 1 "README.md does not name '## Status (0.0.2)'"
+  python3 -I - "$0" "$tc/tools/release/build-nocheck.sh" << 'PY' || { echo "release self-test: the tree check line is not in the code" >&2; fails=$((fails + 1)); }
+import sys
+
+src, dst = sys.argv[1:3]
+s = open(src).read()
+old = '\nif [ -z "$CHECK_ONLY" ]; then\n  bash "$ROOT/tools/release/publish.sh" --tree-check "$VERSION" || exit 1\nfi\n'
+i = s.find(old)
+if i < 0:
+    sys.exit(1)
+open(dst, "w").write(s[:i] + "\n" + s[i + len(old):])
+PY
+  cases=$((cases + 1))
+  out=$(cd "$tc" && bash tools/release/build-nocheck.sh --dry-run 0.0.2 abc123456789 2>&1) && rc=0 || rc=$?
+  if [[ "$out" == *"does not name '## Status (0.0.2)'"* ]]; then
+    echo "release self-test: the build without the tree check still refused the stale README: $out" >&2
+    fails=$((fails + 1))
+  fi
+
   # check_version on stub binaries: the line it prints, the runner that runs a cross binary, and each refusal by name. The
   # stub runner says so on stderr and execs its argument, so a case that must run under one shows it.
   printf '#!/bin/sh\necho "bloomery-serve 0.3.12 (commit abc123456789)"\n' > "$t/serve"
@@ -492,6 +592,11 @@ if [ -n "$SELF_TEST" ]; then
   exit $?
 fi
 
+# The tree is held to what the publish will hold it to, first: nothing below runs for a tree that cannot publish.
+if [ -z "$CHECK_ONLY" ]; then
+  bash "$ROOT/tools/release/publish.sh" --tree-check "$VERSION" || exit 1
+fi
+
 # The archive's machine: the building machine's own, or the cross one BLOOMERY_RELEASE_TARGET names. The archive's
 # arch: a build's is BLOOMERY_ARCH, as tools/arch.sh resolves it, except that a cross build takes its row's own (the
 # building machine's selection names none of the aarch64 archive's arches, and tools/box.sh exports it into the box
@@ -521,7 +626,13 @@ else
   NAME="bloomery-$VERSION-$PLATFORM"
   DIST="$ROOT/target/release-dist"
   STAGE="$DIST/$NAME"
-  export CARGO_TARGET_DIR="$ROOT/target/$TARGET_DIR"
+  build_dirs "$ROOT"
+  if [ -n "$DRY" ]; then
+    plan_lines
+    exit 0
+  fi
+  mkdir -p "$OXIDE_OUT"
+  export CARGO_TARGET_DIR CUDA_OXIDE_PTX_DIR="$OXIDE_OUT"
   target_args=()
   if [ -n "$CROSS" ]; then
     # The cubin packer is a host tool: no device code, so the host's plain cargo builds it into the cross dir's host

@@ -390,6 +390,14 @@ blk_releasesitting() {
   fi
   printf '%s\n' "${out##*$'\n'}"
 }
+# pick.sh is the release picker at the ask: the pick rule (W unless the HEAD delta proves in 25 minutes; an unproven delta, no usable
+# watermark and W equal to HEAD each named), the watermark file's two forms and every way W is unusable, and the table's rows
+# (README and versions, archives, rotation, sitting, needs-gpu PRs), on a temporary repository and stub tools, then a mutant of each
+# guard that its group of cases must turn red; no box, no gh.
+blk_releasepick() { tool_selftest release/pick.sh; }
+# build-mac.sh's refusals on a temporary repository, on any OS: a HEAD that is not the release's commit (the tag's, or --commit's before
+# the tag exists), a tag that names another commit, a dirty tracked file and an archive that would be unsigned, then a mutant of each guard.
+blk_releasebuildmac() { tool_selftest release/build-mac.sh; }
 # Every Python tool's own tests, on the Mac and the Linux host nightly (seconds in all): a self-test that no check runs rots. A tool
 # that grows one is listed here, and the comparison (unit pytools.list) fails on one that is not. Each tool is a unit of its own
 # (pytools.K, the K-th line, run from the repository root), so the scheduler bounds them with every other unit.
@@ -1210,7 +1218,7 @@ proc_leg_gpu() {
 }
 
 BLOCKS=(prelude recipescheck gateclass selftest smoke cardorder cardtests lease boxtracks unsafecount archscan loadscan commentscan leverscan loadgroups lcppfit coldblocks leverarms slotsarm binlabel lcppwarm q38srv
-  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macremote boxsh oxidehost oxidebackend seedtarget carry releasebuild releaseinstall releasepublish releasesitting pytools boxqcodes fixturevariants fixturedirs dsparkread
+  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macremote boxsh oxidehost oxidebackend seedtarget carry releasebuild releaseinstall releasepublish releasesitting releasepick releasebuildmac pytools boxqcodes fixturevariants fixturedirs dsparkread
   refsetpublish orphan archowner treecommit archivepipe fnowner wt macgate boundedscan gatebound dumpdequant tokoracle ikpintree qdotrefargs)
 # blk_keyspec NAME: what a block's input key reads (tools/recipes.py static-key). Every block's is the whole tree: a
 # narrower key needs proof that the block reads nothing outside it, and a green run on a copy whose other files are
