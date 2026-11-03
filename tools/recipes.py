@@ -19,6 +19,7 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
     python3 tools/recipes.py rows              # tools/gate-paths.tsv as narrow() reads it: each `derive` row's gates written out, line for line (cached by tree)
     python3 tools/recipes.py reach FILE... [--brief] [--row] [--mac-landing]  # the gates whose targets can run the file's code, each with a chain (--brief: the reason; --mac-landing: the list a mac-crate change runs)
     python3 tools/recipes.py key --manifest F [--ledger L [--round-ledger R]] ITEM...  # the green ledger's key per item
+    python3 tools/recipes.py key --files ITEM  # the tree files ITEM's key reads, one a line (gate-batch.sh's red-line attribution)
     python3 tools/recipes.py box-manifest      # on the box, through tools/box.sh: the key's box part
     python3 tools/recipes.py box-command RECIPE  # the recipe's box.sh command, verbatim (tools/mac-check.sh derives from it)
     python3 tools/recipes.py opens [RECIPE...] [--explain]  # per recipe, whether a target it builds or runs reaches the fixture fence (tools/gate-batch.sh's real-file deferral)
@@ -10128,9 +10129,13 @@ def part_id(line: str) -> tuple[str, ...]:
 class KeyContext:
     """Keys for the items of one batch: one tree, one box manifest, one caller environment."""
 
-    def __init__(self, side: Side, manifest_path: str | None, box_env: str = "", environ: dict[str, str] | None = None, manifest_error: str | None = None, settings: dict | None = None):
+    def __init__(self, side: Side, manifest_path: str | None, box_env: str = "", environ: dict[str, str] | None = None, manifest_error: str | None = None, settings: dict | None = None, files_only: bool = False):
         self.side = side
         self.box_env = box_env
+        # files_only: `parts` stops after the file and global parts, which need no box manifest (`key --files`); `blind_files` then
+        # holds the ones among them whose digest left out a member's own version.
+        self.files_only = files_only
+        self.blind_files: set[str] = set()
         env = dict(os.environ) if environ is None else environ
         self.env = env
         self.mac = [f"mac-env\t{v}\t{tier_of([], env.get(v)) if v == 'BLOOMERY_TIER' else env[v] if v in env else '<unset>'}" for v in MAC_ENV]
@@ -10388,7 +10393,7 @@ class KeyContext:
             argv = shlex.split(args) if args else []
         except ValueError as err:
             return [], f"ARGS {args!r}: {err}", None, ""
-        if self.manifest_error:
+        if self.manifest_error and not self.files_only:
             return [], self.manifest_error, None, ""
         try:
             ri = graph.key_inputs(name)
@@ -10462,6 +10467,7 @@ class KeyContext:
         # reads are not modeled, and a file the item names or walks is read as data: those keep every byte.
         reader = self.version_read(files) if scope == "closure" else None
         blind = scope == "closure" and reader is None
+        self.blind_files = set()
         for rel in sorted(files):
             # a package manifest the closure reads by table is keyed on that view (manifest_view, the reader
             # selection uses); one read whole, named by the item, or in a tree-scoped key, on its bytes
@@ -10469,14 +10475,23 @@ class KeyContext:
             own = blind and rel in tree.manifest_paths and rel not in named
             try:
                 if wants is None:
-                    parts.append(self.file_part(rel, own and not any(rel.startswith(d) for d in ri.prefixes)))
+                    left_out = own and not any(rel.startswith(d) for d in ri.prefixes)
+                    parts.append(self.file_part(rel, left_out))
                 else:
+                    left_out = own
                     parts.append(self.view_part(rel, wants, own))
+                if left_out:
+                    self.blind_files.add(rel)
             except OSError as err:
                 return [], f"cannot read {rel}: {err.strerror}", None, ""
             except RecipeError as err:
                 return [], str(err), None, ""
-        parts += self.globals(blind and "Cargo.lock" not in named)
+        lock_blind = blind and "Cargo.lock" not in named
+        parts += self.globals(lock_blind)
+        if lock_blind and any(p.startswith("global\tCargo.lock\t") and not p.endswith("\tabsent") for p in parts):
+            self.blind_files.add("Cargo.lock")
+        if self.files_only:
+            return parts, None, never, ""
         card = "none"
         for e in eff:
             k, _, v = e.partition("=")
@@ -10608,7 +10623,35 @@ def ledger_status(key: str, name: str, item: str, parts: list[str], ledgers: lis
     return "run", f"no green record of {name}"
 
 
+def key_input_files(ctx: KeyContext, item: str) -> list[tuple[str, bool]]:
+    """The tree files `item`'s key reads, as (path, blind): the file, link and manifest parts and the global parts that name a
+    file, in the key's order. `blind` marks one whose digest leaves out a workspace member's own version (a commit that changes
+    only that value moved nothing). `ctx` is files_only: no box manifest is needed. A named RecipeError when the key has no parts."""
+    parts, err, _, _ = ctx.parts(item)
+    if err is not None:
+        raise RecipeError(err)
+    out: list[tuple[str, bool]] = []
+    for part in parts:
+        f = part.split("\t")
+        if f[0] in ("file", "link", "manifest") or (f[0] == "global" and f[1] != "oxide-rev" and f[2] != "absent"):
+            out.append((f[1], f[1] in ctx.blind_files))
+    return out
+
+
+def cmd_key_files(args: argparse.Namespace) -> int:
+    """`key --files ITEM`: the files the item's key reads, one path a line, a member-version-blind one followed by a tab and
+    `blind` (key_input_files). It reads no manifest, ledger or box."""
+    if len(args.items) != 1:
+        raise RecipeError("--files takes exactly one ITEM")
+    ctx = KeyContext(make_side(ROOT), None, args.box_env or "", files_only=True)
+    for rel, blind in key_input_files(ctx, args.items[0]):
+        print(f"{rel}\tblind" if blind else rel)
+    return 0
+
+
 def cmd_key(args: argparse.Namespace) -> int:
+    if args.files:
+        return cmd_key_files(args)
     side = make_side(ROOT)
     ctx = KeyContext(side, args.manifest, args.box_env or "", manifest_error=args.manifest_error)
     if args.round_ledger and not args.ledger:
@@ -12633,6 +12676,25 @@ def key_self_test(expect, real: Side, section: str | None = None) -> None:
             with_reader = with_edits([("tools/gpu-gate.sh", read_version)], lambda: keys(sa, only=modeled))
             m = with_edits([("tools/gpu-gate.sh", read_version)] + member, lambda: {k for k, v in keys(sa, only=modeled).items() if v != with_reader[k]})
             expect(m == set(modeled), f"a script that reads a manifest's version: the bump moves {sorted(m)}, not every key")
+            # `key --files` (tools/gate-batch.sh's red-line attribution): the files an item's key reads, from no box manifest, the global parts
+            # that name a file included, and a member's manifest and the lock marked blind where their digest leaves out its version. Added
+            # 2026-11-03 (rf-follow); FAIL-first: on the code before it there is no files_only (KeyContext takes no such argument), and with the
+            # blind mark dropped the third clause fails.
+            def files_of(item: str) -> dict[str, bool]:
+                return dict(key_input_files(KeyContext(sa, None, "", {}, settings=settings, files_only=True), item))
+
+            gf, cf = files_of(items["gpu"]), files_of(items["cpu"])
+            gate_src = "crates/gpu-gates/src/bin/gate_q4k_sel.rs"
+            expect(gf.get(gate_src) is False and gate_src not in cf, f"key --files: the gate's own source is {gf.get(gate_src)} for the gate and {cf.get(gate_src)} for the CPU item")
+            expect("oxide-rev" not in gf and all(g in gf for g in KEY_GLOBALS), f"key --files: the global parts that name a file are not all listed: {sorted(g for g in KEY_GLOBALS if g not in gf)}")
+            expect(gf.get("crates/gpu-gates/Cargo.toml") is True and gf.get("Cargo.lock") is True and gf.get("Cargo.toml") is False,
+                   f"key --files: a member's manifest and the lock are blind, the workspace manifest is not: {[gf.get(k) for k in ('crates/gpu-gates/Cargo.toml', 'Cargo.lock', 'Cargo.toml')]}")
+            full_parts = KeyContext(sa, mf, "", {}, settings=settings).parts(items["gpu"])[0]
+            expect(set(gf) == {x.split("\t")[1] for x in full_parts if x.split("\t")[0] in ("file", "link", "manifest") or (x.startswith("global\t") and x.split("\t")[1] != "oxide-rev")},
+                   "key --files: the files are not the key's file, link, manifest and global parts")
+            with_reader_files = with_edits([("tools/gpu-gate.sh", read_version)], lambda: files_of(items["gpu"]))
+            expect(not any(with_reader_files.values()), f"key --files: an item with an input that reads a version marks {sorted(k for k, v in with_reader_files.items() if v)} blind")
+            expect(files_of(items["mac"]).get("Cargo.lock") is False and len(files_of(items["mac"])) > len(gf), "key --files: a whole-tree item keeps every byte: no file blind, every tree file listed")
             # an item that names the lock reads it as a file: its version is part of what the item reads
             named_lock = "gate-gpu-q4k-sel@BLOOMERY_GATE_CARD=3090:./Cargo.lock"
             expect(with_edits([("Cargo.lock", bump_lock)], lambda: one(named_lock)) != one(named_lock), "an item that names Cargo.lock is blind to a member's version in it")
@@ -16426,6 +16488,8 @@ def build_parser() -> argparse.ArgumentParser:
     k.add_argument("--rerun", action="store_true", help="with --ledger: no item skips")
     k.add_argument("--parts-dir", help="write each item's labelled parts to DIR/<index>.parts")
     k.add_argument("--parts", dest="show_parts", action="store_true", help="print each item's labelled parts")
+    k.add_argument("--files", action="store_true", help="with one ITEM: the tree files its key reads, one path a line (a member-version-blind one "
+                   "followed by a tab and `blind`); no manifest, ledger or box is read")
     bc = sub.add_parser("box-command", help="the single-quoted argument of RECIPE's one tools/box.sh line, verbatim (tools/mac-check.sh)")
     bc.add_argument("recipe")
     ot = sub.add_parser("orphan-tests", help="every #[test] no gate-* or lab-* recipe runs on the box, one `path:line name — why` line each")
