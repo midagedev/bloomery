@@ -92,12 +92,28 @@
 #   gpu-gate.sh --gpuhold path                   print the path
 # The batch calls these through tools/box.sh with BLOOMERY_BOX_READONLY=1 (no sync, no guard wait: a heartbeat stuck behind a sitting
 # would go stale), a deliberate write of this one control file.
+# The sitting hold. While a release sitting (tools/release/sitting.sh) runs, the file /root/bloomery-sitting.gpuhold is up on the box:
+# `owner=<id> cards=<3090|a6000|3090,a6000> pid=<the sitting's> start=<its start time> since=<epoch>`. Its meaning is not the batch
+# hold's, so it is a file of its own: nothing passes it (no gate of the sitting's owner exists), it names the cards the sitting times,
+# and it lives as long as its pid does, with no heartbeat (the sitting runs on the box; a pid that is gone, or another process now,
+# makes the hold dead and the runs ignore it, saying so once). The box hold /root/bloomery-<owner>-hold stops new box.sh commands; it
+# cannot stop a gate whose box.sh command began before it, and that gate takes a card the moment the lease is free between two cells.
+# A run whose cards meet the hold's WAITS at the top of every poll, after the batch hold and before the load lock and any card lock, so
+# it holds none, printing `[sitting-hold]` lines at once and once a minute, inside CARD_BOUND (75 at the bound, with its seconds in a
+# `waited N s for the sitting hold` line): a run of 3090 meets a hold on the 3090, a6000 one on the A6000, both and local any hold,
+# and `any` only when both cards are held (with one held it takes the other, and never the held one). A hold that cannot be read is
+# read as up for both cards, never as free. The file has one writer, this script:
+#   gpu-gate.sh --sitting-hold up <owner> <cards> <pid>   put it up (75 while a live hold is up, any owner's; a dead one is taken over)
+#   gpu-gate.sh --sitting-hold down <owner>               remove it, only if it is <owner>'s
+#   gpu-gate.sh --sitting-hold path                       print the path
+# The name does not match tools/ref/lease-probe.sh's LEASE_HOLDS either: it is the sitting's second hold, the GPU one.
 set -uo pipefail
 # shellcheck source=tools/ref/lease-probe.sh
 source "${BASH_SOURCE[0]%/*}/ref/lease-probe.sh"
 GATE_LOCK=$LOCK_DIR/bloomery-gate.lock A6000_LOCK=$LOCK_DIR/bloomery-gate-a6000.lock LOCAL_LOCK=$LOCK_DIR/bloomery-gate-local.lock
 V41_LOCK=$LOCK_DIR/bloomery-v41-load.lock V41_BOUND=1800 POLL=1 CARD_BOUND=1800
 GPU_HOLD=$LOCK_DIR/bloomery-batch.gpuhold HOLD_STALE=300
+SIT_HOLD=$LOCK_DIR/bloomery-sitting.gpuhold
 V41_QDIR=$LOCK_DIR/bloomery-v41-queue.d V41_SEQ=$LOCK_DIR/bloomery-v41-queue.seq PACE=''
 EXE_LINK=''
 
@@ -218,6 +234,126 @@ pid_start() {
   fi
 }
 
+# The sitting hold (the header). sit_hold_read: SIT_STATE none | up | dead (its pid is gone, or another process now), SIT_OWNER (`?`
+# when the file names none), SIT_CARDS (3090, a6000 or 3090,a6000; a file that names none readable is read as both), SIT_PID, SIT_START
+# and SIT_SINCE. A file whose pid cannot be read is up, never free.
+SIT_STATE=none SIT_OWNER='' SIT_CARDS='' SIT_PID='' SIT_START='' SIT_SINCE='' SIT_DEAD_SAID=0
+sit_hold_read() {
+  local line f
+  SIT_STATE=none SIT_OWNER='' SIT_CARDS='' SIT_PID='' SIT_START='' SIT_SINCE=''
+  [ -e "$SIT_HOLD" ] || return 0
+  SIT_STATE=up SIT_OWNER='?' SIT_CARDS='3090,a6000'
+  line=$(head -1 "$SIT_HOLD" 2> /dev/null) || line=
+  set -f
+  for f in $line; do
+    case $f in
+      owner=*) SIT_OWNER=${f#owner=} ;;
+      cards=*) SIT_CARDS=${f#cards=} ;;
+      pid=*) SIT_PID=${f#pid=} ;;
+      start=*) SIT_START=${f#start=} ;;
+      since=*[!0-9]*) ;;
+      since=?*) SIT_SINCE=${f#since=} ;;
+    esac
+  done
+  set +f
+  case $SIT_OWNER in '' | *[!A-Za-z0-9_]*) SIT_OWNER='?' ;; esac
+  case $SIT_CARDS in 3090 | a6000 | 3090,a6000 | a6000,3090) ;; *) SIT_CARDS='3090,a6000' ;; esac
+  case $SIT_PID in '' | *[!0-9]*) return 0 ;; esac
+  pid_start "$SIT_PID"
+  if [ -z "$PID_START" ] || [ "$PID_START" != "$SIT_START" ]; then SIT_STATE=dead; fi
+}
+
+# sit_card_held <3090|a6000>: 0 when the hold (read by sit_hold_read) is up and names the card.
+sit_card_held() {
+  [ "$SIT_STATE" = up ] || return 1
+  case ",$SIT_CARDS," in *",$1,"*) return 0 ;; esac
+  return 1
+}
+
+# sit_ticket_held <cards word of a queue ticket>: 0 when the hold (read by sit_hold_read) is up and stops a run of those cards.
+sit_ticket_held() {
+  [ "$SIT_STATE" = up ] || return 1
+  case $1 in
+    3090) sit_card_held 3090 ;;
+    a6000) sit_card_held a6000 ;;
+    any) sit_card_held 3090 && sit_card_held a6000 ;;
+    *) return 0 ;;
+  esac
+}
+
+# sit_hold_blocks: 0 when a live sitting hold meets this run's cards (the run waits), else 1. `any` waits only when both cards are
+# held: with one held, take_3090 and take_a6000 leave that card alone. A dead hold is named once, then ignored.
+sit_hold_blocks() {
+  sit_hold_read
+  case $SIT_STATE in
+    up) ;;
+    dead)
+      if [ "$SIT_DEAD_SAID" = 0 ]; then
+        echo "[sitting-hold] $(now) ${NAME:-gpu-gate.sh}: the sitting hold $SIT_HOLD (owner $SIT_OWNER, pid $SIT_PID) is dead — its sitting is gone; ignoring it" >&2
+        SIT_DEAD_SAID=1
+      fi
+      return 1 ;;
+    *) return 1 ;;
+  esac
+  case $CARD in
+    3090) sit_card_held 3090 ;;
+    a6000) sit_card_held a6000 ;;
+    any) sit_card_held 3090 && sit_card_held a6000 ;;
+    *) return 0 ;;
+  esac
+}
+
+# sitting_hold <verb> ...: the sitting hold file's one writer (the header). Prints what it did; the rc is the verb's.
+sitting_hold() {
+  local verb=${1:-} owner=${2:-} cards=${3:-} pid=${4:-} tmp
+  if [ "$verb" = path ]; then echo "$SIT_HOLD"; return 0; fi
+  case $verb in
+    up | down) ;;
+    *) echo "gpu-gate.sh: --sitting-hold takes path, up <owner> <cards> <pid> or down <owner>, got '$verb'" >&2; return 64 ;;
+  esac
+  case $owner in
+    '' | *[!A-Za-z0-9_]*) echo "gpu-gate.sh: --sitting-hold $verb: an owner is letters, digits and _, got '$owner'" >&2; return 64 ;;
+  esac
+  sit_hold_read
+  if [ "$verb" = down ]; then
+    if [ "$SIT_STATE" = none ]; then
+      echo "gpu-gate.sh: the sitting hold $SIT_HOLD is already down"
+    elif [ "$SIT_OWNER" != "$owner" ]; then
+      echo "gpu-gate.sh: the sitting hold $SIT_HOLD is owner $SIT_OWNER's, not $owner's: left up"
+    else
+      rm -f "$SIT_HOLD"
+      echo "gpu-gate.sh: sitting hold $SIT_HOLD down: owner $owner"
+    fi
+    return 0
+  fi
+  case $cards in
+    3090 | a6000 | 3090,a6000) ;;
+    *) echo "gpu-gate.sh: --sitting-hold up: the cards are 3090, a6000 or 3090,a6000, got '$cards'" >&2; return 64 ;;
+  esac
+  case $pid in '' | *[!0-9]*) echo "gpu-gate.sh: --sitting-hold up: the pid is the sitting's, got '$pid'" >&2; return 64 ;; esac
+  pid_start "$pid"
+  [ -n "$PID_START" ] || { echo "gpu-gate.sh: --sitting-hold up: pid $pid is not a live process" >&2; return 64; }
+  case $SIT_STATE in
+    up)
+      echo "gpu-gate.sh: the sitting hold $SIT_HOLD is up for owner $SIT_OWNER (pid $SIT_PID): not taking it (rc 75)" >&2
+      return 75 ;;
+    dead)
+      echo "gpu-gate.sh: the sitting hold $SIT_HOLD of owner $SIT_OWNER (pid $SIT_PID) is dead: taking it over" >&2
+      rm -f "$SIT_HOLD" ;;
+  esac
+  tmp=$SIT_HOLD.$$.new
+  printf 'owner=%s cards=%s pid=%s start=%s since=%s\n' "$owner" "$cards" "$pid" "$PID_START" "$(date +%s)" > "$tmp" 2> /dev/null ||
+    { echo "gpu-gate.sh: cannot write $tmp — the hold is written on the box, as root" >&2; return 69; }
+  if ln "$tmp" "$SIT_HOLD" 2> /dev/null; then
+    rm -f "$tmp"
+  else
+    rm -f "$tmp"
+    echo "gpu-gate.sh: another sitting put $SIT_HOLD up at the same moment: not taking it (rc 75)" >&2
+    return 75
+  fi
+  echo "gpu-gate.sh: sitting hold $SIT_HOLD up: owner $owner cards $cards"
+}
+
 # tget <ticket line> <key>: TV is the key's value (up to the next space), empty when the line has no such key.
 tget() {
   local r=" $1"
@@ -260,15 +396,18 @@ v41_queue_read() {
   done
 }
 
-# v41_standing <ticket name>: reads the queue (batch_hold_read has just run: HOLD_STATE, HOLD_OWNER) and sets Q_N, the live tickets a fresh
-# hold of another owner does not hold back, Q_POS, the named ticket's place among them (0: it is not there) and the head's item, owner
-# and since. Returns 0 when the named ticket is the head.
+# v41_standing <ticket name>: reads the queue (batch_hold_read and sit_hold_read have just run: HOLD_STATE, HOLD_OWNER, SIT_STATE, SIT_CARDS)
+# and sets Q_N, the live tickets a fresh hold of another owner does not hold back and the sitting hold does not stop (a ticket whose cards
+# meet the hold's), Q_POS, the named ticket's place among them (0: it is not there) and the head's item, owner and since. Returns 0 when
+# the named ticket is the head.
 v41_standing() {
   local i
   v41_queue_read
   Q_N=0 Q_POS=0 Q_HEAD_ITEM='' Q_HEAD_OWNER='' Q_HEAD_SINCE=''
   for ((i = 0; i < ${#Q_NAME[@]}; i++)); do
     if [ "$HOLD_STATE" = up ] && [ "${Q_OWNER[$i]}" != "$HOLD_OWNER" ]; then continue; fi
+    tget "${Q_LINE[$i]}" cards
+    if sit_ticket_held "$TV"; then continue; fi
     Q_N=$((Q_N + 1))
     if [ "$Q_N" = 1 ]; then
       Q_HEAD_OWNER=${Q_OWNER[$i]}
@@ -1377,6 +1516,33 @@ PY
   judge_all 'the batch hold: a head lets the load lock go and a held-back ticket is no head for the batch'"'"'s own loader' "$rc" 0 \
     'signs: polled exit polled exit probe load lock rc=0$' 'held-back ticket before and after the batch.s loader: same$' 'markers: Q H $'
   pace_close 0; pace_close 1
+  # The sitting hold holds back tickets as the batch hold does: a loader it stops (a 3090 loader, the hold naming the 3090) is no head for one
+  # it does not stop (an `any` loader, which takes the A6000), so that one is served at once while the held-back ticket keeps its name.
+  qreset
+  bash "$self" --test-locks "$t" --sitting-hold up sit 3090 $$ > /dev/null 2>&1
+  pgate 0 H 2 3090
+  p1=$PG
+  ack 0 'sitting hold over the queue'
+  s1=$ACK
+  tk0=$(ls "$t/v41-queue.d")
+  pgate 1 Q 2 any
+  p2=$PG
+  ack 1 'sitting hold over the queue'
+  s2=$ACK
+  tk1=$(ls "$t/v41-queue.d")
+  rm -f "$t/sitting.gpuhold"
+  grant 0 'sitting hold over the queue'
+  s3=$ACK
+  [ "$s2" = exit ] || grant 1 'sitting hold over the queue'
+  rc=0
+  wait "$p1" || rc=$?
+  wait "$p2" || rc=$?
+  echo "signs: $s1 $s2 $s3" > "$t/out"
+  echo "held-back ticket while the other loader ran: $([ "$tk1" = "$tk0" ] && [ -n "$tk0" ] && echo same || echo "moved ($tk0 / $tk1)")" >> "$t/out"
+  markers >> "$t/out"
+  judge_all "the sitting hold: a loader it stops is no head for one it does not stop" "$rc" 0 \
+    'signs: polled exit exit$' 'held-back ticket while the other loader ran: same$' 'markers: Q H $'
+  pace_close 0; pace_close 1
   # A loader ended by TERM takes its ticket with it (the trap runs; its last sign says so).
   qreset
   exec 6> "$t/v41-load.lock"
@@ -1718,6 +1884,147 @@ PY
     "$(dirname "$self")/ref/lease-probe.sh" "$out")"
   printf '%s\n' "$out" > "$t/out"
   judge_all "the batch hold's name does not match the sittings' LEASE_HOLDS" 0 0 '^/root/bloomery-batch\.gpuhold sitting-hold-matches apart$'
+  # The sitting hold (the header): a file of its own, named for the cards a release sitting times, alive as long as its pid. $$ is a live
+  # pid the cases point it at, the pid of a finished child a dead one. Each case that waits has a directory of its own, so its own hold.
+  rm -f "$t/batch.gpuhold" "$t/sitting.gpuhold"
+  srun() { # <dir> <verb> …: the writer, its output and the file after it in $t/out
+    local d=$1
+    shift
+    rc=0
+    bash "$self" --test-locks "$d" --sitting-hold "$@" > "$t/out" 2>&1 || rc=$?
+    if [ -e "$d/sitting.gpuhold" ]; then printf 'after: %s\n' "$(head -1 "$d/sitting.gpuhold")" >> "$t/out"; else echo 'after: no hold' >> "$t/out"; fi
+  }
+  sleep 0 &
+  dpid=$!
+  wait "$dpid"
+  mkdir -p "$t/sh1" "$t/sh2" "$t/sh3" "$t/sh4" "$t/sh5" "$t/sh6" "$t/sh7"
+  srun "$t/sh7" up sit 3090 $$
+  judge_all 'sitting hold up: puts it up with its owner, cards, pid and start' "$rc" 0 'sitting hold .*sitting\.gpuhold up: owner sit cards 3090$' \
+    "after: owner=sit cards=3090 pid=$$ start=[^ ]+ since=[0-9]+\$"
+  srun "$t/sh7" up other 3090,a6000 $$
+  judge_all "  … a live hold is not taken, whoever asks: 75, and it stays" "$rc" 75 'sitting\.gpuhold is up for owner sit \(pid [0-9]+\): not taking it \(rc 75\)' 'after: owner=sit cards=3090 ' '!owner=other'
+  srun "$t/sh7" down other
+  judge_all "sitting hold down: leaves another owner's" "$rc" 0 "is owner sit's, not other's: left up" 'after: owner=sit '
+  srun "$t/sh7" down sit
+  judge_all '  … removes its own' "$rc" 0 'sitting hold .*down: owner sit$' 'after: no hold$'
+  srun "$t/sh7" down sit
+  judge_all '  … and is no error when it is already down' "$rc" 0 'is already down$' 'after: no hold$'
+  printf 'owner=gone cards=3090 pid=%s start=Mon1 since=1\n' "$dpid" > "$t/sh7/sitting.gpuhold"
+  srun "$t/sh7" up sit2 a6000 $$
+  judge_all 'sitting hold up: takes over a dead hold (its pid is gone), naming it' "$rc" 0 'owner gone \(pid [0-9]+\) is dead: taking it over' 'after: owner=sit2 cards=a6000 '
+  srun "$t/sh7" down sit2
+  srun "$t/sh7" up sit 5090 $$
+  judge_all 'sitting hold: cards that are none of 3090, a6000, 3090,a6000: 64, named' "$rc" 64 "the cards are 3090, a6000 or 3090,a6000, got '5090'" 'after: no hold$'
+  srun "$t/sh7" up sit 3090 "$dpid"
+  judge_all '  … a pid that is not a live process: 64, named' "$rc" 64 "pid $dpid is not a live process" 'after: no hold$'
+  srun "$t/sh7" up 'a b' 3090 $$
+  judge_all '  … an owner with a space: 64, named' "$rc" 64 "an owner is letters, digits and _, got 'a b'" 'after: no hold$'
+  out=$(bash "$self" --sitting-hold path)
+  out="$out $(env -u BLOOMERY_LEASE_HOLDS bash -c '. "$1"; case "$2" in $LEASE_HOLDS) echo MATCHES ;; *) echo apart ;; esac' _ "$(dirname "$self")/ref/lease-probe.sh" "$out")"
+  printf '%s\n' "$out" > "$t/out"
+  judge_all "the sitting hold's name is neither the batch hold's nor a sitting's LEASE_HOLDS" 0 0 '^/root/bloomery-sitting\.gpuhold apart$'
+  # Waiting: a hold on the 3090 stops a 3090 run (75 at the 4 s bound, a [sitting-hold] line at once naming owner, cards and pid) and lets the
+  # A6000 run go; a hold on the A6000 sends an `any` run to the 3090; a hold on both stops `any` and `both`, and a V4.1 loader before its
+  # load lock; a hold with nothing readable is up for both; a dead hold is ignored, named once; a hold released while the run waits.
+  srun "$t/sh1" up sit 3090 $$
+  srun "$t/sh2" up sit a6000 $$
+  srun "$t/sh3" up sit 3090,a6000 $$
+  : > "$t/sh4/sitting.gpuhold"
+  printf 'owner=gone cards=3090,a6000 pid=%s start=Mon1 since=1\n' "$dpid" > "$t/sh5/sitting.gpuhold"
+  srun "$t/sh6" up sit 3090 $$
+  exec 6> "$t/sh3/v41-load.lock"
+  flock -x 6 || { echo "FAIL: the test cannot hold the s3 V4.1 load lock"; return 1; }
+  TL="$t/sh1" gate "$t/sg1" 3090 "$t/lease" &
+  p1=$!
+  TL="$t/sh1" gate "$t/sg2" a6000 "$t/lease" &
+  p2=$!
+  TL="$t/sh2" gate "$t/sg3" any "$t/lease" &
+  p3=$!
+  TL="$t/sh3" gate "$t/sg4" any "$t/lease" &
+  p4=$!
+  TL="$t/sh3" gate "$t/sg5" both "$t/lease" BLOOMERY_BOX_CARD=both &
+  p5=$!
+  TL="$t/sh3" gate "$t/sg6" 3090 "$t/lease" BLOOMERY_GATE_V41_LOAD=1 &
+  p6=$!
+  TL="$t/sh4" gate "$t/sg7" 3090 "$t/lease" &
+  p7=$!
+  TL="$t/sh5" gate "$t/sg8" 3090 "$t/lease" &
+  p8=$!
+  TL="$t/sh6" gate "$t/sg9" 3090 "$t/lease" GATE_TEST_CAP="$cap" &
+  p9=$!
+  TL="$t/sh1" gate "$t/sg10" any "$t/lease" &
+  p10=$!
+  mkdir -p "$t/sh8"
+  srun "$t/sh8" up sit 3090 $$
+  exec 5> "$t/sh8/gate-a6000.lock"
+  flock -x 5 || { echo "FAIL: the test cannot hold the sh8 A6000 gate lock"; return 1; }
+  TL="$t/sh8" gate "$t/sg11" any "$t/lease" &
+  p11=$!
+  k=$SECONDS
+  while ! grep -q 'sitting-hold' "$t/sg9" 2> /dev/null && kill -0 "$p9" 2> /dev/null && [ $((SECONDS - k)) -lt "$fs" ]; do
+    sleep 0.2
+  done
+  sleep 1
+  prc3=0 prca=0
+  flock -n "$t/sh3/gate.lock" true || prc3=$?
+  flock -n "$t/sh3/gate-a6000.lock" true || prca=$?
+  echo "probe 3090 lock rc=$prc3 a6000 lock rc=$prca" > "$t/out"
+  judge_all 'runs waiting on the sitting hold hold no card lock' 0 0 'probe 3090 lock rc=0 a6000 lock rc=0$'
+  rm -f "$t/sh6/sitting.gpuhold"
+  rc=0
+  wait "$p1" || rc=$?
+  cp "$t/sg1" "$t/out"
+  judge_all 'a sitting hold on the 3090: a 3090 run waits, 75 at the bound, a [sitting-hold] line at once naming owner, cards and pid' "$rc" 75 \
+    '\[sitting-hold\] .* waits: a release sitting holds the cards \(.*sitting\.gpuhold, owner sit, cards 3090, pid [0-9]+, up [0-9]+ s\)' \
+    'the sitting hold .*sitting\.gpuhold \(owner sit, cards 3090\) was still up after ([4-9]|[1-9][0-9]+) s \(CARD_BOUND 4 s\) .*contention' '!ok on the'
+  rc=0
+  wait "$p2" || rc=$?
+  cp "$t/sg2" "$t/out"
+  judge_all '  … an A6000 run goes ahead, no hold line' "$rc" 0 'ok on the a6000 \(asked a6000\)' '!sitting-hold|sitting hold'
+  rc=0
+  wait "$p10" || rc=$?
+  cp "$t/sg10" "$t/out"
+  judge_all '  … an `any` run takes the A6000' "$rc" 0 'ok on the a6000 \(asked any\)' '!sitting-hold|sitting hold'
+  rc=0
+  wait "$p11" || rc=$?
+  flock -u 5
+  exec 5>&-
+  cp "$t/sg11" "$t/out"
+  judge_all '  … with the A6000 busy an `any` run waits for it, never taking the held 3090' "$rc" 75 'no gate lock \(any\) was free within 4 s' '!ok on'
+  rc=0
+  wait "$p3" || rc=$?
+  cp "$t/sg3" "$t/out"
+  judge_all 'a sitting hold on the A6000: an `any` run, which looks at the A6000 first, takes the 3090' "$rc" 0 'ok on the 3090 \(asked any\)' '!sitting-hold|sitting hold'
+  rc=0
+  wait "$p4" || rc=$?
+  cp "$t/sg4" "$t/out"
+  judge_all 'a sitting hold on both: an `any` run waits' "$rc" 75 '\[sitting-hold\] .* cards 3090,a6000' 'the sitting hold .* was still up after ([4-9]|[1-9][0-9]+) s \(CARD_BOUND 4 s\)' '!ok on'
+  rc=0
+  wait "$p5" || rc=$?
+  cp "$t/sg5" "$t/out"
+  judge_all '  … a run of both cards waits' "$rc" 75 '\[sitting-hold\] .* owner sit' '!ok on'
+  rc=0
+  wait "$p6" || rc=$?
+  flock -u 6
+  exec 6>&-
+  cp "$t/sg6" "$t/out"
+  judge_all "  … a V4.1 loader waits on the hold before its load lock: the hold's bound, not the load lock's" "$rc" 75 \
+    'the sitting hold .* was still up after ([4-9]|[1-9][0-9]+) s \(CARD_BOUND 4 s\)' '!V4\.1 load lock .* was not free'
+  rc=0
+  wait "$p7" || rc=$?
+  cp "$t/sg7" "$t/out"
+  judge_all 'a hold with nothing readable is up for both cards, never free' "$rc" 75 '\[sitting-hold\] .* owner \?, cards 3090,a6000' '!ok on'
+  rc=0
+  wait "$p8" || rc=$?
+  cp "$t/sg8" "$t/out"
+  echo "hold lines: $(grep -c 'sitting-hold' "$t/out")" >> "$t/out"
+  judge_all 'a dead hold (its pid is gone): the run goes ahead and says so once, naming the hold, its owner and pid' "$rc" 0 \
+    'ok on the 3090 \(asked 3090\)' '\[sitting-hold\] .*sitting\.gpuhold \(owner gone, pid [0-9]+\) is dead — its sitting is gone; ignoring it' 'hold lines: 1$' '!waits'
+  rc=0
+  wait "$p9" || rc=$?
+  cp "$t/sg9" "$t/out"
+  judge_all 'a hold released while the run waits: it goes ahead and counts the wait on its own line' "$rc" 0 \
+    'ok on the 3090 \(asked 3090\)' '^gpu-gate\.sh: waited [0-9]+ s for the sitting hold$'
   # box.sh's local mode (BLOOMERY_BOX_CARD=local, its lock directory the test's): one lock for this machine's card(s), apart from
   # the box's two, and the caller's CUDA_VISIBLE_DEVICES (the stub prints it); a held lease is waited for as the lock is.
   fi
@@ -2106,7 +2413,7 @@ if [ "${1:-}" = --self-test ]; then
 fi
 if [ "${1:-}" = --test-locks ]; then
   [ $# -ge 3 ] && [ -d "$2" ] || { echo "usage: gpu-gate.sh --test-locks <dir> <binary> [args...] (the self-test's)" >&2; exit 64; }
-  GATE_LOCK=$2/gate.lock A6000_LOCK=$2/gate-a6000.lock LOCAL_LOCK=$2/gate-local.lock V41_LOCK=$2/v41-load.lock GPU_HOLD=$2/batch.gpuhold V41_BOUND=6 POLL=1 CARD_BOUND=4
+  GATE_LOCK=$2/gate.lock A6000_LOCK=$2/gate-a6000.lock LOCAL_LOCK=$2/gate-local.lock V41_LOCK=$2/v41-load.lock GPU_HOLD=$2/batch.gpuhold SIT_HOLD=$2/sitting.gpuhold V41_BOUND=6 POLL=1 CARD_BOUND=4
   V41_QDIR=$2/v41-queue.d V41_SEQ=$2/v41-queue.seq
   # A helper waiter, one whose life the test ends by an event (it releases the lock the waiter queues on), is set up with a safety cap
   # in place of the two bounds; the cases that judge a bound never set it.
@@ -2125,6 +2432,11 @@ fi
 if [ "${1:-}" = --gpuhold ]; then
   shift
   gpuhold "$@"
+  exit $?
+fi
+if [ "${1:-}" = --sitting-hold ]; then
+  shift
+  sitting_hold "$@"
   exit $?
 fi
 if [ "${1:-}" = --v41-queue ]; then
@@ -2399,6 +2711,7 @@ refuse_forced() {
 # Under `any` a card in doubt, or an untestable lease, is passed by like the timing card.
 take_a6000() {
   local src=0
+  sit_card_held a6000 && return 1
   flock -n 8 || return 1
   if [ "$CARD" = a6000 ]; then
     refuse_forced a6000
@@ -2413,6 +2726,7 @@ take_a6000() {
 }
 take_3090() {
   local src=0
+  sit_card_held 3090 && return 1
   flock -n 9 || return 1
   if [ "$CARD" = 3090 ]; then
     refuse_forced 3090
@@ -2480,7 +2794,7 @@ drop_card() {
 # The batch hold (the header) is read first in every poll, before the queue and before any lock: a run under a hold holds nothing while
 # it waits (a head lets the load lock go), and a gate already polling cannot slip in between a batch's items.
 GOT=
-CARD_W=0 LOAD_W=0 HOLD_W=0 why='' said=-60 hsaid=-60 csaid=-60 qsaid=-60 last=$SECONDS HAVE7=0 qnote=''
+CARD_W=0 LOAD_W=0 HOLD_W=0 SIT_W=0 why='' said=-60 hsaid=-60 ssaid=-60 csaid=-60 qsaid=-60 last=$SECONDS HAVE7=0 qnote=''
 try_cards() {
   if [ "$CARD" = both ]; then take_both; else take_card; fi
 }
@@ -2488,6 +2802,12 @@ while :; do
   why=
   if batch_hold_blocks; then
     why=hold
+    if [ "$HAVE7" = 1 ]; then
+      flock -u 7
+      HAVE7=0
+    fi
+  elif sit_hold_blocks; then
+    why=sitting
     if [ "$HAVE7" = 1 ]; then
       flock -u 7
       HAVE7=0
@@ -2525,6 +2845,12 @@ while :; do
     echo "[batch-hold] $(now) $NAME waits: a landing batch holds the GPUs ($GPU_HOLD, owner $HOLD_OWNER, up $up_s s, refreshed $HOLD_AGE s ago), holding no lock; ${HOLD_W} s so far, at most ${CARD_BOUND} s with the lock waits" >&2
     hsaid=$HOLD_W
   fi
+  if [ "$why" = sitting ] && [ $((SIT_W - ssaid)) -ge 60 ]; then
+    up_s='?'
+    [ -z "$SIT_SINCE" ] || up_s=$(($(date +%s) - SIT_SINCE))
+    echo "[sitting-hold] $(now) $NAME waits: a release sitting holds the cards ($SIT_HOLD, owner $SIT_OWNER, cards $SIT_CARDS, pid $SIT_PID, up $up_s s), holding no lock; ${SIT_W} s so far, at most ${CARD_BOUND} s with the lock waits" >&2
+    ssaid=$SIT_W
+  fi
   if [ "$why" = card ] && [ $((CARD_W - csaid)) -ge 60 ]; then
     echo "gpu-gate.sh: $NAME waits for the gate lock ($CARD), holding $([ "$HAVE7" = 1 ] && echo 'the V4.1 load lock' || echo 'no lock'); ${CARD_W} s so far, at most ${CARD_BOUND} s with the other waits" >&2
     csaid=$CARD_W
@@ -2543,15 +2869,20 @@ while :; do
   case $why in
     card) CARD_W=$((CARD_W + spent)) ;;
     hold) HOLD_W=$((HOLD_W + spent)) ;;
+    sitting) SIT_W=$((SIT_W + spent)) ;;
     *) LOAD_W=$((LOAD_W + spent)) ;;
   esac
   # The hold's seconds and the card lock's share CARD_BOUND: a batch's hold is a wait for the cards, as the card lock is.
-  if [ $((CARD_W + HOLD_W)) -ge "$CARD_BOUND" ] && [ "$why" = card ]; then
+  if [ $((CARD_W + HOLD_W + SIT_W)) -ge "$CARD_BOUND" ] && [ "$why" = card ]; then
     echo "gpu-gate.sh: no gate lock ($CARD) was free within ${CARD_BOUND} s — contention, not a red gate" >&2
     exit 75
   fi
-  if [ $((CARD_W + HOLD_W)) -ge "$CARD_BOUND" ] && [ "$why" = hold ]; then
+  if [ $((CARD_W + HOLD_W + SIT_W)) -ge "$CARD_BOUND" ] && [ "$why" = hold ]; then
     echo "gpu-gate.sh: $NAME: the batch hold $GPU_HOLD (owner $HOLD_OWNER) was still up after ${HOLD_W} s (CARD_BOUND ${CARD_BOUND} s) — contention, not a red gate (rc 75)" >&2
+    exit 75
+  fi
+  if [ $((CARD_W + HOLD_W + SIT_W)) -ge "$CARD_BOUND" ] && [ "$why" = sitting ]; then
+    echo "gpu-gate.sh: $NAME: the sitting hold $SIT_HOLD (owner $SIT_OWNER, cards $SIT_CARDS) was still up after ${SIT_W} s (CARD_BOUND ${CARD_BOUND} s) — contention, not a red gate (rc 75)" >&2
     exit 75
   fi
   if [ "$LOAD_W" -ge "$V41_BOUND" ] && { [ "$why" = load ] || [ "$why" = queue ]; }; then
@@ -2565,6 +2896,7 @@ CARD_W=$((CARD_W + SECONDS - last))
 ticket_drop
 # The waits are not the gate's time: tools/gate-batch.sh subtracts these lines' seconds from the item's times row.
 [ "$HOLD_W" = 0 ] || echo "gpu-gate.sh: waited ${HOLD_W} s for the batch hold" >&2
+[ "$SIT_W" = 0 ] || echo "gpu-gate.sh: waited ${SIT_W} s for the sitting hold" >&2
 [ "$CARD_W" = 0 ] || echo "gpu-gate.sh: waited ${CARD_W} s for the gate lock ($CARD)" >&2
 [ "$LOAD_W" = 0 ] || echo "gpu-gate.sh: waited ${LOAD_W} s for the V4.1 load lock" >&2
 if [ "$GOT" = a6000 ] || [ "$CARD" = any ]; then

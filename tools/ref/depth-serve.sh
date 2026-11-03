@@ -29,10 +29,12 @@
 #      server started before that finds its port taken, exit 83). Checked before the memory baseline is read, so the
 #      baseline is the idle card's, and before every server start (waits DEPTH_SERVE_PORT_WAIT_S, polling every second,
 #      then the arm fails by name);
-#   0. the card's used memory back within DEPTH_SERVE_MEM_SLACK_MIB of the sitting's baseline (read once, after the lease
-#      is taken and the last server is gone): a server's memory is released after its process is gone, and a load that
-#      starts before that finds the card smaller than the sitting's plan (waits DEPTH_SERVE_MEM_WAIT_S, then the arm
-#      fails by name);
+#   0. the card's used memory back within DEPTH_SERVE_MEM_SLACK_MIB of the sitting's baseline (the release sitting's,
+#      read once at its start with the cards idle and passed in as DEPTH_SERVE_MEM_BASELINE; else read once, after the
+#      lease is taken and the last server is gone): a server's memory is released after its process is gone, and a load
+#      that starts before that finds the card smaller than the sitting's plan (waits DEPTH_SERVE_MEM_WAIT_S, printing
+#      `[mem-wait]`, then the arm fails by name: a server never loads on a card that has not come back, the first arm of a
+#      call included);
 #   1. the server at the serving defaults — `-m <file> --host 127.0.0.1 --port P`, no --ctx-size (unless
 #      DEPTH_SERVE_CTX names one), no --place (unless DEPTH_SERVE_PLACE does), no --parallel, no lever — under
 #      `timeout` (BLOOMERY_ARM_BOUND, default 900 s, covers its load, request and hook), BLOOMERY_REF_MODEL removed
@@ -112,6 +114,12 @@
 #   DEPTH_SERVE_MEM_WAIT_S   seconds the card's used memory may take to return to the sitting's baseline before a
 #                            server starts, default 60
 #   DEPTH_SERVE_MEM_SLACK_MIB  MiB above the baseline that still count as returned, default 128
+#   DEPTH_SERVE_MEM_BASELINE   `<card UUID>=<MiB>[,<card UUID>=<MiB>...]`: each card's used memory as the release sitting read
+#                            it at its start (tools/release/sitting.sh), the baseline of every server of this call in place
+#                            of the one this call would read itself. A call that reads its own takes the previous call's
+#                            server for the idle card when that server's memory is still being released; the sitting's
+#                            baseline is the one the whole sitting is held to. Every timing card of the call must be named
+#                            (rc 64 otherwise); unset: this call reads its own
 #
 # Refused before the lease, by name: no model, an arm that does not parse, a tree or its binary missing (rc 2), a
 # binary older than the Cargo files and sources its dep-info lists (rc 3, timing-card.sh's assert_fresh_binary; a
@@ -547,7 +555,7 @@ ds_print_plan() {
   fi
   [ -z "$AFTER" ] || echo "[plan] hook: DEPTH_SERVE_AFTER (bound ${AFTER_BOUND}s) after the timed request of round 1's last server of each arm group"
   echo "[plan] last server: a server starts, and the memory baseline is read, when nothing listens on port $PORT and no bloomery-serve holds a timing card (waits up to ${PORT_WAIT_S}s; port 0 skips the port)"
-  echo "[plan] memory: a server starts when each timing card's used memory is within ${MEM_SLACK_MIB} MiB of the sitting's baseline (waits up to ${MEM_WAIT_S}s)"
+  echo "[plan] memory: a server starts when each timing card's used memory is within ${MEM_SLACK_MIB} MiB of the sitting's baseline (waits up to ${MEM_WAIT_S}s; the baseline is $([ -n "$MEM_BASELINE" ] && echo "the sitting's, DEPTH_SERVE_MEM_BASELINE=$MEM_BASELINE" || echo "read once after the lease"))"
   est=${DEPTH_SERVE_LOAD_EST:-}
   [ -n "$est" ] || case $MODEL_NAME in mimo2) est=41 ;; esac
   if [ -n "$est" ]; then
@@ -770,11 +778,24 @@ ds_mem_used() {
   echo "$v"
 }
 
-# ds_mem_baseline: MEM_GPU and MEM_BASE, each timing card and its used MiB now; a card with no reading is named and skipped.
+# ds_mem_baseline: MEM_GPU and MEM_BASE, each timing card and its baseline MiB: the sitting's (MEM_BASELINE, every timing
+# card named in it, else rc 64) or the card's used memory now; a card with no reading is named and skipped.
 ds_mem_baseline() {
-  local g v
+  local g v e
+  local -a ents
   MEM_GPU=() MEM_BASE=()
   for g in $TIMING_GPU ${TIMING_GPU2:-}; do
+    if [ -n "$MEM_BASELINE" ]; then
+      v=''
+      IFS=, read -r -a ents <<< "$MEM_BASELINE"
+      for e in "${ents[@]}"; do
+        [ "${e%=*}" != "$g" ] || v=${e##*=}
+      done
+      [ -n "$v" ] || ds_refuse 64 "DEPTH_SERVE_MEM_BASELINE=$MEM_BASELINE names no baseline for the timing card $g: the sitting read the cards its cells time, and this call times another"
+      MEM_GPU+=("$g") MEM_BASE+=("$v")
+      echo "[mem-baseline] the sitting's baseline is $v MiB on the timing card $g (read by the sitting at its start, DEPTH_SERVE_MEM_BASELINE): a server's memory must be back within $MEM_SLACK_MIB MiB of it before every load, this call's first included"
+      continue
+    fi
     v=$(ds_mem_used "$g")
     if [ -z "$v" ]; then
       echo "[mem-baseline] the timing card $g gives no used-memory reading: the wait between servers is skipped"
@@ -901,7 +922,7 @@ ds_main() {
   # Local mode refused (timing-card.sh printed why as this file sourced it) ends the run here, dry or not.
   [ -z "$TIMING_LOCAL" ] || [ -z "$TIMING_CARDS_WHY" ] || exit 64
   for v in $(compgen -v BLOOMERY_SERVE_); do
-    ds_refuse 64 "$v is set, and nothing reads it: this runner's knobs are DEPTH_SERVE_CTX, DEPTH_SERVE_PLACE, DEPTH_SERVE_N, DEPTH_SERVE_PORT, DEPTH_SERVE_REQ_BOUND, DEPTH_SERVE_IDS, DEPTH_SERVE_LOAD_EST, DEPTH_SERVE_TARBALL, DEPTH_SERVE_AFTER, DEPTH_SERVE_AFTER_BOUND, DEPTH_SERVE_USER_PLAN, DEPTH_SERVE_PORT_WAIT_S, DEPTH_SERVE_MEM_WAIT_S and DEPTH_SERVE_MEM_SLACK_MIB (a BLOOMERY_ name would have to be a row of the lever registry)"
+    ds_refuse 64 "$v is set, and nothing reads it: this runner's knobs are DEPTH_SERVE_CTX, DEPTH_SERVE_PLACE, DEPTH_SERVE_N, DEPTH_SERVE_PORT, DEPTH_SERVE_REQ_BOUND, DEPTH_SERVE_IDS, DEPTH_SERVE_LOAD_EST, DEPTH_SERVE_TARBALL, DEPTH_SERVE_AFTER, DEPTH_SERVE_AFTER_BOUND, DEPTH_SERVE_USER_PLAN, DEPTH_SERVE_PORT_WAIT_S, DEPTH_SERVE_MEM_WAIT_S, DEPTH_SERVE_MEM_SLACK_MIB and DEPTH_SERVE_MEM_BASELINE (a BLOOMERY_ name would have to be a row of the lever registry)"
   done
   DRY=${BLOOMERY_DRY:-}
   ROUNDS=${BLOOMERY_AB_ROUNDS:-4}
@@ -916,6 +937,7 @@ ds_main() {
   PORT_WAIT_S=${DEPTH_SERVE_PORT_WAIT_S:-120}
   MEM_WAIT_S=${DEPTH_SERVE_MEM_WAIT_S:-60}
   MEM_SLACK_MIB=${DEPTH_SERVE_MEM_SLACK_MIB:-128}
+  MEM_BASELINE=${DEPTH_SERVE_MEM_BASELINE:-}
   PLAN_PROBE_BOUND=120
   ds_posint BLOOMERY_AB_ROUNDS "$ROUNDS" 1
   ds_posint DEPTH_SERVE_N "$N" 2
@@ -927,6 +949,9 @@ ds_main() {
   ds_posint DEPTH_SERVE_PORT_WAIT_S "$PORT_WAIT_S" 0
   ds_posint DEPTH_SERVE_MEM_WAIT_S "$MEM_WAIT_S" 0
   ds_posint DEPTH_SERVE_MEM_SLACK_MIB "$MEM_SLACK_MIB" 0
+  if [ -n "$MEM_BASELINE" ] && ! [[ $MEM_BASELINE =~ ^[^=,[:space:]]+=[0-9]+(,[^=,[:space:]]+=[0-9]+)*$ ]]; then
+    ds_refuse 64 "DEPTH_SERVE_MEM_BASELINE is <card UUID>=<MiB>[,<card UUID>=<MiB>...], got '$MEM_BASELINE'"
+  fi
   ds_posint BLOOMERY_ARM_BOUND "$LEASE_ARM_BOUND" 1
   case $PLACE in '' | a | bp) ;; *) ds_refuse 64 "DEPTH_SERVE_PLACE is a or bp (unset: the plan's own pick), got '$PLACE'" ;; esac
   case $USER_PLAN in check | note | off) ;; *) ds_refuse 64 "DEPTH_SERVE_USER_PLAN is check, note or off, got '$USER_PLAN'" ;; esac
@@ -1119,6 +1144,7 @@ WRAP
     tar -czf "$stage/$name.tar.gz" -C "$stage" "$name"
     ST_TB=$stage/$name.tar.gz ST_TBM=$name/bin/bloomery-serve
   }
+  st_now_ms() { python3 -c 'import time; print(int(time.time() * 1000))'; }
   st_port() { python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
   # st_seq <name>: the next line of $C/<name>.seq (the last again once they run out), the position kept in $C/<name>.i
   # (a command substitution is a subshell, so a variable would not carry it).
@@ -1160,8 +1186,28 @@ WRAP
       ds_guard_timing() { :; }
       guard_cpu() { :; }
       lcpp_srv_majflt() { if [ -r "$C/mf.seq" ]; then st_seq mf; else echo 7; fi; }
+      # A card whose released memory lingers: $C/card.linger is the milliseconds a stopped server's 1 GiB stays on the card
+      # (card.until, the epoch ms it is held to, is written by every stop; a case may write it to start dirty), idle at 100 MiB.
+      # Every server start prints the card's used memory as the start finds it.
+      if [ -r "$C/card.linger" ]; then
+        eval "st_real_stop() $(declare -f lcpp_srv_stop | sed 1d)"
+        eval "st_real_start() $(declare -f lcpp_srv_start | sed 1d)"
+        lcpp_srv_stop() {
+          st_real_stop
+          echo $(($(st_now_ms) + $(cat "$C/card.linger"))) > "$C/card.until"
+        }
+        lcpp_srv_start() {
+          echo "[card-at-start] used $(ds_mem_used x) MiB"
+          st_real_start "$@"
+        }
+      fi
       ds_mem_used() {
-        local v
+        local v until
+        if [ -r "$C/card.linger" ]; then
+          until=$(cat "$C/card.until" 2> /dev/null || echo 0)
+          if [ "$(st_now_ms)" -lt "$until" ]; then echo 1124; else echo 100; fi
+          return 0
+        fi
         if [ -r "$C/mem.seq" ]; then
           v=$(st_seq mem)
           [ "$v" = none ] || echo "$v"
@@ -1659,6 +1705,40 @@ HOOK
   ST_ENV=(BLOOMERY_AB_ROUNDS=1)
   st_run a:6 b:6
   st_check refuse-mem-no-reading 1 "FAIL r1 b D=6: the timing card" "gives no used-memory reading now (100 MiB at the sitting's baseline)"
+  # A stopped server's 1 GiB stays on the card for 3 s (the card.linger stub): the next load waits for it and starts on the
+  # idle card, and a load never starts on the card as the stop left it.
+  st_case memlinger
+  st_tree a 20
+  st_tree b 21
+  echo 3000 > "$C/card.linger"
+  ST_ENV=(BLOOMERY_AB_ROUNDS=1)
+  st_run a:6 b:6
+  st_check mem-linger-waits 0 "[mem-baseline] the sitting's baseline is 100 MiB" "[mem-wait] r1 b D=6: used 1124 MiB, baseline 100 MiB + 128 MiB slack: waiting for the last server's memory" \
+    "[mem-wait] r1 b D=6: back at 100 MiB after" "ROW r1 a/place=a/ctx=16384 D=6" "ROW r1 b/place=a/ctx=16384 D=6"
+  st_before mem-linger-wait-before-the-load "[mem-wait] r1 b D=6: back at 100 MiB after" "[server] r1 b D=6"
+  st_absent mem-linger-no-load-on-a-dirty-card "[card-at-start] used 1124" "[mem-wait] r1 a D=6"
+  # The baseline the sitting passes in is the idle card's, whatever the card shows as this call begins: the previous cell's
+  # server (the 0.3.12 defect) still holds its memory, and the first load of the call waits for it.
+  st_case membase
+  st_tree a 20
+  echo 3000 > "$C/card.linger"
+  echo $(($(st_now_ms) + 3000)) > "$C/card.until"
+  ST_ENV=(BLOOMERY_AB_ROUNDS=1 DEPTH_SERVE_MEM_BASELINE=GPU-11111111-1111-1111-1111-111111111111=100)
+  st_run a:6
+  st_check mem-baseline-from-the-sitting 0 "[mem-baseline] the sitting's baseline is 100 MiB on the timing card GPU-11111111-1111-1111-1111-111111111111 (read by the sitting at its start" \
+    "[mem-wait] r1 a D=6: used 1124 MiB, baseline 100 MiB + 128 MiB slack: waiting for the last server's memory" "[card-at-start] used 100 MiB" "ROW r1 a/place=a/ctx=16384 D=6"
+  st_absent mem-baseline-first-load-on-a-clean-card "[card-at-start] used 1124"
+  st_before mem-baseline-wait-before-the-first-load "[mem-wait] r1 a D=6: back at 100 MiB after" "[server] r1 a D=6"
+  st_case membaserefuse
+  st_tree a 20
+  ST_ENV=(BLOOMERY_AB_ROUNDS=1 DEPTH_SERVE_MEM_BASELINE=nonsense)
+  st_run a:6
+  st_check refuse-mem-baseline-syntax 64 "DEPTH_SERVE_MEM_BASELINE is <card UUID>=<MiB>[,<card UUID>=<MiB>...], got 'nonsense'"
+  st_absent refuse-mem-baseline-syntax-before-the-lease "[lease-stub]"
+  ST_ENV=(BLOOMERY_AB_ROUNDS=1 DEPTH_SERVE_MEM_BASELINE=GPU-other=100)
+  st_run a:6
+  st_check refuse-mem-baseline-card 64 "names no baseline for the timing card GPU-11111111-1111-1111-1111-111111111111"
+  st_servers refuse-mem-baseline-card-no-server 0
   ST_ENV=()
 
   # --- the last server's exit: a server starts, and the memory baseline is read, once nothing listens on the port and no
