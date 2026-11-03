@@ -84,6 +84,7 @@ use bloomery_gpu::fused::FusedKernels;
 use bloomery_gpu::gemm::GemmRoute;
 pub use bloomery_gpu::host::handoff::Handoff;
 use bloomery_gpu::host::handoff::HandoffKernels;
+use bloomery_gpu::host::rank::Sums;
 use bloomery_gpu::host::run::{HostRun, HostWidths};
 use bloomery_gpu::host::tier::TierTarget;
 use bloomery_gpu::hybrid::{Boundary, HOST, HandoffTarget, HostExperts, Hybrid, SlotMap};
@@ -105,11 +106,12 @@ use model::placement::kernels::{self, DownForms};
 use model::placement::{Role, tp};
 use runtime::combine::Slots;
 
+use crate::chain::join::TRUNK;
 use crate::dense::{Dense, DenseKernels};
 use crate::experts::{ExpertGateUp, ExpertKernels};
 use crate::hc::{
-    HC_MAX_TOKENS, HC_MIX, HC_PIECE, HC_STREAMS, HcFn, HcFnArgs, HcKernels, HcPreScratch,
-    hc_fold_elem, hc_post_elem,
+    HC_MAX_TOKENS, HC_MIX, HC_PIECE, HC_STREAMS, HcFn, HcFnArgs, HcKernels, HcPostArgs,
+    HcPreScratch, hc_fold_elem, hc_post_elem,
 };
 use crate::router::{N_EXPERT, N_USED, RouterKernels, RouterOut};
 use crate::transpose::TransposeKernels;
@@ -1523,7 +1525,7 @@ impl FfnPiece {
         extra: &mut [&mut dyn ShadowWork],
     ) -> Result<(), GpuError> {
         self.enqueue_go_half(gpu, w, card, &io, hybrid, layer, 0, extra)?;
-        self.enqueue_join_half(gpu, io, hybrid, layer, 0)
+        self.enqueue_join_half(gpu, io, hybrid, (layer, 0), None)
     }
 
     /// The layer's launches up to its join, on row `row`'s buffers:
@@ -1609,18 +1611,20 @@ impl FfnPiece {
 
     /// The layer's rest on row `row`'s buffers, after its
     /// [`FfnPiece::enqueue_go_half`]: the wait, the join, and the host tier told the row's layer is enqueued.
+    /// On a rank of a tensor-parallel load `sums` adds the ranks' combines before HC_POST reads
+    /// them ([`FfnPiece::enqueue_join`]).
     pub fn enqueue_join_half<H: HostExperts>(
         &mut self,
         gpu: &Gpu,
         io: FfnIo<'_>,
         hybrid: &mut Hybrid<H>,
-        layer: usize,
-        row: usize,
+        (layer, row): (usize, usize),
+        sums: Option<&mut Sums>,
     ) -> Result<(), GpuError> {
         let i = self.check_io(layer, hybrid.slots(), &io, row)?;
         let boundary = hybrid.boundary();
         boundary.enqueue_back_of(gpu.stream(), row, layer)?;
-        self.enqueue_join(gpu, i, row, io, boundary)?;
+        self.enqueue_join(gpu, (i, row), io, boundary, sums)?;
         hybrid.row_enqueued(layer, row)
     }
 
@@ -1973,14 +1977,17 @@ impl FfnPiece {
     }
 
     /// The join on row `row`'s buffers and host sum: the combine and HC_POST
-    /// in one launch, with the next fold where the layer folds.
+    /// in one launch, with the next fold where the layer folds. On a rank (`sums`) the combine is
+    /// the rank's part of every expert's width: the launch's `y` is summed over the ranks
+    /// ([`crate::chain::join::TRUNK`]) and HC_POST runs again on the sum. HC_POST writes a fold:
+    /// where the layer does not fold, into the shared expert's output, which the combine has read.
     fn enqueue_join(
         &mut self,
         gpu: &Gpu,
-        i: usize,
-        row: usize,
+        (i, row): (usize, usize),
         io: FfnIo<'_>,
         boundary: &Boundary,
+        sums: Option<&mut Sums>,
     ) -> Result<(), GpuError> {
         let hsum = boundary.hsum_of(row)?;
         let r = &mut self.rows[row];
@@ -1996,8 +2003,28 @@ impl FfnPiece {
             n_card: self.cfg[i].n_card,
             n_used: N_USED,
         };
+        let Some(sums) = sums else {
+            return self.kernels.enqueue_post(
+                gpu.stream(),
+                &p,
+                &mut r.y,
+                io.streams_out,
+                io.fold_out,
+            );
+        };
         self.kernels
-            .enqueue_post(gpu.stream(), &p, &mut r.y, io.streams_out, io.fold_out)
+            .enqueue_post(gpu.stream(), &p, &mut r.y, io.streams_out, None)?;
+        sums.join(gpu, TRUNK, &mut r.y)?;
+        let fold = io.fold_out.unwrap_or(&mut r.sh_y);
+        let post = HcPostArgs {
+            x: &r.y,
+            res: io.streams,
+            hc: &r.hc_out,
+            n_embd: self.n_embd,
+            tokens: 1,
+        };
+        self.hc
+            .enqueue_post(gpu.stream(), &post, io.streams_out, fold)
     }
 }
 
