@@ -2180,7 +2180,9 @@ impl Parts<'_> {
                 self.ffn
                     .enqueue_join_half_tier(gpu, io, hybrid, l, row, tier)?;
             }
-            _ => self.ffn.enqueue_join_half(gpu, io, hybrid, l, row)?,
+            _ => self
+                .ffn
+                .enqueue_join_half(gpu, io, hybrid, (l, row), self.join.as_deref_mut())?,
         }
         cur.s ^= 1;
         if step.folds {
