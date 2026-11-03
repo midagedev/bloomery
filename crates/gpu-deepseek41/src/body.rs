@@ -79,6 +79,7 @@ use bloomery_gpu::head::Head;
 use bloomery_gpu::host::Gathers;
 use bloomery_gpu::host::node::{NodeFamily, NodeOpen};
 use bloomery_gpu::host::nvtier::NvTier;
+use bloomery_gpu::host::rank::Sums;
 use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::host::served::{ResidencyParts, TierBody};
 use bloomery_gpu::host::swap::{PassReport, Residency};
@@ -115,7 +116,6 @@ use crate::chain::ffn::{
     host_widths,
 };
 use crate::chain::glue::{EngramKv, EngramStep, Glue, RowsArrival, RowsLevers, StepRows};
-use crate::chain::join::RankJoin;
 use crate::hc::{HC_STREAMS, HcKernels};
 use crate::params::{ImageDims, ImageLayout, StepImage, rope_specs};
 use crate::swap;
@@ -370,7 +370,9 @@ pub fn open_slots(
 /// `source` (a GGUF split's own bytes or a checkpoint folder's parts) as
 /// `take` gives the rank its part of it, every routed expert on the card at
 /// the rank's part of its inner width, no host tier, and the rank's side of
-/// the ranks' sums ([`RankJoin`]) when there is more than one. The rank's
+/// the ranks' sums `sums` (`bloomery_gpu::host::rank::Sums`, of the slots
+/// [`crate::chain::join::shapes`] gives) when there is more than one: a
+/// loopback's page or a session's. The rank's
 /// hyperparameters are the file's with its parts of the query heads, the
 /// output groups and the experts' width ([`rank_hparams`]); its head projects
 /// its part of the vocabulary, and each engram site's rows are read in the
@@ -382,6 +384,7 @@ pub fn open_rank(
     source: &(impl Source + Sync),
     take: impl Fn(&str, GgmlType, &[u64]) -> Result<Take, GpuError>,
     (rank, ranks): (usize, usize),
+    sums: Option<Sums>,
     ctx_max: usize,
     levers: BodyLevers,
 ) -> Result<Deepseek41Model, GpuError> {
@@ -395,6 +398,23 @@ pub fn open_rank(
     let whole = Hparams::read(&file).map_err(|e| GpuError::plan(WHAT, e))?;
     let hp = rank_hparams(&whole, rank, ranks)?;
     let cols = rank_cols(&whole, rank, ranks)?;
+    let shapes = crate::chain::join::shapes(&hp)?;
+    let fits = |s: &Sums| {
+        let (layout, _) = s.link();
+        layout.rank() == rank
+            && layout.slots() == shapes.len()
+            && (0..shapes.len()).all(|i| layout.shape(i) == shapes[i])
+    };
+    if (ranks > 1) != sums.is_some() || sums.as_ref().is_some_and(|s| !fits(s)) {
+        return Err(GpuError::shape(
+            WHAT,
+            format!(
+                "rank {rank} of {ranks}: sums given {}; a rank of several takes its sums of \
+                 {shapes:?} (chain::join::shapes), one rank none",
+                sums.is_some()
+            ),
+        ));
+    }
     let tensors = roles::classify(&file, &whole).map_err(|e| GpuError::plan(WHAT, e))?;
     let card: BTreeMap<&str, &ModelTensor> = tensors
         .tensors
@@ -421,24 +441,13 @@ pub fn open_rank(
     let file = Arc::new(file);
     let host = crate::chain::ffn::host_run(Arc::clone(&file), &hp, layers.end..layers.end, false)?;
     let map = SlotMap::prefix(layers.clone(), hp.experts.n_expert, hp.experts.n_expert)?;
-    let join = (ranks > 1)
-        .then(|| {
-            let sites = hp.engram()?.layer_ids.len();
-            RankJoin::new(
-                gpu.context(),
-                (rank, ranks),
-                hp.n_embd,
-                (sites, (HC_STREAMS + 1) * hp.n_embd),
-            )
-        })
-        .transpose()?;
     let meta = BodyMeta { hp, levers };
     let at = Assembly {
         layers,
         ctx_max,
         slots: 1,
         cols,
-        join,
+        join: sums,
     };
     let mut body = Body::assemble(
         &gpu,
@@ -1039,8 +1048,8 @@ pub struct Body {
     /// experts ([`Body::nvme_tier`]).
     nvme_tier: Option<Arc<NvTier>>,
     /// On a rank of a tensor-parallel load, its side of the ranks' sums
-    /// ([`RankJoin`]); `None` on a whole load.
-    join: Option<RankJoin>,
+    /// (`bloomery_gpu::host::rank::Sums`); `None` on a whole load.
+    join: Option<Sums>,
 }
 
 /// A tier card a placed load hangs under the host tier
@@ -1262,7 +1271,7 @@ impl Body {
     /// rank.
     #[must_use]
     pub fn rank_link(&self) -> Option<(&Gathers, &Arc<MappedHost>)> {
-        self.join.as_ref().map(RankJoin::link)
+        self.join.as_ref().map(Sums::link)
     }
 
     /// The rows the last [`ChainBody::decode_input`] read for its step: its
@@ -1927,7 +1936,7 @@ struct Parts<'a> {
     /// The stage card's side of the tier layers, on a load with a tier card.
     tier: Option<&'a mut TierPiece>,
     /// The rank's side of the ranks' sums, on a rank of a tensor-parallel load.
-    join: Option<&'a mut RankJoin>,
+    join: Option<&'a mut Sums>,
 }
 
 impl Parts<'_> {
@@ -2863,7 +2872,7 @@ struct Assembly {
     ctx_max: usize,
     slots: usize,
     cols: Range<usize>,
-    join: Option<RankJoin>,
+    join: Option<Sums>,
 }
 
 /// Where a placed load lands besides its plan ([`Body::load_placed`]): the
