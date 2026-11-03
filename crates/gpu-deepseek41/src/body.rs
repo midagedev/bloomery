@@ -68,6 +68,7 @@
 //! the compressed rows, the index keys and the states consistently with each
 //! other.
 
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::mem::ManuallyDrop;
 use std::num::NonZeroUsize;
@@ -75,6 +76,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bloomery_gpu::head::Head;
+use bloomery_gpu::host::Gathers;
 use bloomery_gpu::host::node::{NodeFamily, NodeOpen};
 use bloomery_gpu::host::nvtier::NvTier;
 use bloomery_gpu::host::run::HostRun;
@@ -86,20 +88,24 @@ use bloomery_gpu::host::{PassKind, refuse_tier_count};
 use bloomery_gpu::hybrid::{
     Boundary, BoundaryShape, Chain, HostResidency, Hybrid, SlotMap, refuse_expert_tiers,
 };
-use bloomery_gpu::model::{ChainBody, HostServed, Rollback, Rows};
+use bloomery_gpu::model::{ChainBody, HostServed, Resident, Rollback, Rows};
 use bloomery_gpu::weights::Weights;
-use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel, PartedBuffer, capturing, window};
+use bloomery_gpu::{
+    DeviceTensor, Gpu, GpuError, GpuModel, MappedHost, PartedBuffer, capturing, window,
+};
 use bloomery_levers::{ChurnHosting, HostCfg, ResidencyAt};
 use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy, IntoResult, PinnedHostBuffer, sys};
-use gguf::Split;
+use gguf::{GgmlType, Split};
 use model::arch::Arch;
 use model::arch::deepseek41::host;
 use model::arch::deepseek41::hparams::Hparams;
 use model::arch::deepseek41::names;
 use model::arch::deepseek41::place::PlanInputs;
 use model::arch::deepseek41::plan::{Planner, StepPlan};
+use model::arch::deepseek41::roles;
 use model::moe::UNION_MAX_COLS;
-use model::placement::{Machine, ModelTensors, Plan, PlanLevers};
+use model::part::{Source, Take};
+use model::placement::{Machine, ModelTensor, ModelTensors, Plan, PlanLevers, Role};
 
 use crate::chain::attn::{
     AttnChain, AttnIo, AttnTaps, Compressed, Selection, SourceIo, join_projections,
@@ -357,6 +363,156 @@ pub fn open_slots(
     };
     let tiers = TierOpen::of_machine(plan.machine)?;
     Body::open_placed_slots(file, &plan, 0, tiers, &meta, slots)
+}
+
+/// Rank `rank` of `ranks` of a tensor-parallel load of `file` on `gpu`, at
+/// `ctx_max` positions under `levers`: every tensor the card holds read from
+/// `source` (a GGUF split's own bytes or a checkpoint folder's parts) as
+/// `take` gives the rank its part of it, every routed expert on the card at
+/// the rank's part of its inner width, no host tier, and the rank's side of
+/// the ranks' sums ([`RankJoin`]) when there is more than one. The rank's
+/// hyperparameters are the file's with its parts of the query heads, the
+/// output groups and the experts' width ([`rank_hparams`]); its head projects
+/// its part of the vocabulary, and each engram site's rows are read in the
+/// rank's columns ([`rank_cols`]). A count the ranks do not divide is refused
+/// by name before anything is uploaded.
+pub fn open_rank(
+    gpu: Gpu,
+    file: Split,
+    source: &(impl Source + Sync),
+    take: impl Fn(&str, GgmlType, &[u64]) -> Result<Take, GpuError>,
+    (rank, ranks): (usize, usize),
+    ctx_max: usize,
+    levers: BodyLevers,
+) -> Result<Deepseek41Model, GpuError> {
+    const WHAT: &str = "deepseek41 body::open_rank";
+    levers.check()?;
+    // A rank feeds a prompt as steps: each step's sums join the ranks.
+    let levers = BodyLevers {
+        prefill: PrefillMode::Steps,
+        ..levers
+    };
+    let whole = Hparams::read(&file).map_err(|e| GpuError::plan(WHAT, e))?;
+    let hp = rank_hparams(&whole, rank, ranks)?;
+    let cols = rank_cols(&whole, rank, ranks)?;
+    let tensors = roles::classify(&file, &whole).map_err(|e| GpuError::plan(WHAT, e))?;
+    let card: BTreeMap<&str, &ModelTensor> = tensors
+        .tensors
+        .iter()
+        .filter(|t| on_rank(t.role))
+        .map(|t| (t.name.as_str(), t))
+        .collect();
+    gpu.context().bind_to_thread()?;
+    let layers = 0..hp.n_layer;
+    let mut w = bloomery_gpu::parts::load(
+        gpu.stream(),
+        source,
+        |name, ty, dims| match card.get(name) {
+            Some(_) => take(name, ty, dims),
+            None => Ok(Take::Skip),
+        },
+        |t| {
+            card.get(t.name.as_str())
+                .and_then(|m| tensors.card_format(m))
+        },
+        false,
+    )?;
+    join_projections(gpu.stream(), &hp, layers.clone(), &mut w)?;
+    let file = Arc::new(file);
+    let host = crate::chain::ffn::host_run(Arc::clone(&file), &hp, layers.end..layers.end, false)?;
+    let map = SlotMap::prefix(layers.clone(), hp.experts.n_expert, hp.experts.n_expert)?;
+    let join = (ranks > 1)
+        .then(|| {
+            let sites = hp.engram()?.layer_ids.len();
+            RankJoin::new(
+                gpu.context(),
+                (rank, ranks),
+                hp.n_embd,
+                (sites, (HC_STREAMS + 1) * hp.n_embd),
+            )
+        })
+        .transpose()?;
+    let meta = BodyMeta { hp, levers };
+    let at = Assembly {
+        layers,
+        ctx_max,
+        slots: 1,
+        cols,
+        join,
+    };
+    let mut body = Body::assemble(
+        &gpu,
+        &file,
+        &meta,
+        at,
+        (map, host),
+        ResidencyGlue::off(),
+        |_, _| Ok(None),
+    )?;
+    // A rank's host serves no expert; ranks in one process share the pool.
+    body.hybrid_mut().wait_go_alone();
+    let head = Head::new(&gpu, &w, meta.hp.rms_eps)?;
+    Ok(GpuModel::new(Resident {
+        gpu,
+        weights: w,
+        body,
+        head: Some(head),
+        ctx_max,
+    }))
+}
+
+/// Whether a rank's card holds a tensor of `role`: every one a step reads on
+/// the card, every routed expert among them; not the rows the host reads per
+/// token (the token embedding, the engram and hash tables) nor what no step
+/// reads.
+fn on_rank(role: Role) -> bool {
+    !matches!(
+        role,
+        Role::TokenEmbedding
+            | Role::EngramTable
+            | Role::EngramHash
+            | Role::HashTable
+            | Role::Unread
+            | Role::Unused
+    )
+}
+
+/// The hyperparameters of rank `rank` of `ranks` of the model `hp`
+/// describes: its parts of the query heads, of the attention's output groups
+/// and of every expert's inner width, the routed and the shared alike; every
+/// other width is the model's. A count the ranks do not divide, no rank and a
+/// rank past them are refused by name.
+pub fn rank_hparams(hp: &Hparams, rank: usize, ranks: usize) -> Result<Hparams, GpuError> {
+    let part = |what: &str, v: usize| -> Result<usize, GpuError> {
+        if rank < ranks && v.is_multiple_of(ranks) && v >= ranks {
+            Ok(v / ranks)
+        } else {
+            Err(GpuError::shape(
+                "deepseek41 rank_hparams",
+                format!("rank {rank} of {ranks}: {v} {what} over the ranks"),
+            ))
+        }
+    };
+    let mut r = hp.clone();
+    r.n_head = part("query heads", hp.n_head)?;
+    r.o_groups = part("output groups", hp.o_groups)?;
+    r.experts.ff = part("expert width", hp.experts.ff)?;
+    Ok(r)
+}
+
+/// The columns of each engram site's rows rank `rank` of `ranks` reads: its
+/// run of the site's `rows_per_token`, in order. A count the ranks do not
+/// divide is refused by name.
+pub fn rank_cols(hp: &Hparams, rank: usize, ranks: usize) -> Result<Range<usize>, GpuError> {
+    let n = hp.engram()?.rows_per_token();
+    if rank >= ranks || !n.is_multiple_of(ranks) {
+        return Err(GpuError::shape(
+            "deepseek41 rank_cols",
+            format!("rank {rank} of {ranks}: {n} engram columns over the ranks"),
+        ));
+    }
+    let c = n / ranks;
+    Ok(rank * c..(rank + 1) * c)
 }
 
 /// A placement that puts the layers on other than one card, refused by name
@@ -1098,6 +1254,15 @@ impl Body {
     /// each with the kind of the pass it ended; the log keeps its capacity.
     pub fn take_residency_passes(&mut self) -> Vec<(PassKind, PassReport)> {
         self.residency_glue.take_passes()
+    }
+
+    /// The page of the rank's side of the ranks' sums and its layout, for the
+    /// link that joins it to the other ranks' (a loopback's,
+    /// `bloomery_gpu::host::GatherLoop`); `None` on a whole load and on one
+    /// rank.
+    #[must_use]
+    pub fn rank_link(&self) -> Option<(&Gathers, &Arc<MappedHost>)> {
+        self.join.as_ref().map(RankJoin::link)
     }
 
     /// The rows the last [`ChainBody::decode_input`] read for its step: its
@@ -2500,26 +2665,101 @@ impl Body {
         let ctx_max = usize::try_from(plan.ctx_max)
             .map_err(|_| refuse(format!("ctx_max {} passes usize", plan.ctx_max)))?;
         gpu.context().bind_to_thread()?;
-        let stream = gpu.stream();
+        let tier_cards: Vec<usize> = tiers.iter().map(|t| t.card).collect();
+        let map =
+            SlotMap::of_plan_tiers(plan, card, &tier_cards, layers.clone(), hp.experts.n_expert)?;
+        // The common chain's host-run build: a paged plan's NVMe expert tier
+        // is attached before the run's first call.
+        let first = host_first(hp, &layers);
+        let host = bloomery_gpu::model::host_run(
+            gpu.context(),
+            plan,
+            file,
+            first..layers.end,
+            cfg.host.r8,
+            residency.arena(),
+            host_widths(hp),
+            |src| host::layers(src, hp, first..layers.end),
+        )?;
+        residency_glue.attach_tier(host.tier())?;
+        let at = Assembly {
+            layers,
+            ctx_max,
+            slots: planned.get(),
+            cols: 0..hp.engram()?.rows_per_token(),
+            join: None,
+        };
+        Body::assemble(
+            gpu,
+            file,
+            meta,
+            at,
+            (map, host),
+            residency_glue,
+            |gpu, hybrid| {
+                hybrid.keep_residency(residency);
+                if tiers.is_empty() {
+                    return Ok(None);
+                }
+                let map = hybrid.slots().clone();
+                let tier_cards = tiers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        open_tier(gpu, file, plan, t, i, hp, &map, cfg.host.card_dontneed)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                hybrid.attach_tiers(tier_cards, gpu)?;
+                // The tiers' batch staging is reserved on their cards by the plan,
+                // so it is made at load, not at the first prompt.
+                hybrid.prepare_batch(gpu.context(), prefill::T_MAX)?;
+                hybrid
+                    .check_tier_reserves(plan, &tiers.iter().map(|t| t.card).collect::<Vec<_>>())?;
+                Ok(Some(TierPiece::new(gpu, hybrid.slots(), PAIR_ROWS)?))
+            },
+        )
+    }
 
+    /// The body of `meta`'s hyperparameters on `gpu` over `file`, from what
+    /// its load decided (`at`), its slot map and host tier, and its residency
+    /// side: the step's host half and image, the three pieces, the host
+    /// tier's join, and the live sequence. `tiers` hangs the load's tier
+    /// cards, if any, under the host tier once it is made, and gives the stage
+    /// card's side of them.
+    fn assemble(
+        gpu: &Gpu,
+        file: &Arc<Split>,
+        meta: &BodyMeta,
+        at: Assembly,
+        (map, host): (SlotMap, HostRun),
+        residency_glue: ResidencyGlue,
+        tiers: impl FnOnce(&Gpu, &mut Hybrid<HostRun>) -> Result<Option<TierPiece>, GpuError>,
+    ) -> Result<Body, GpuError> {
+        const WHAT: &str = "deepseek41 Body::assemble";
+        let refuse = |detail: String| GpuError::Shape { what: WHAT, detail };
+        let (hp, cfg) = (&meta.hp, meta.levers);
+        let Assembly {
+            layers,
+            ctx_max,
+            slots: planned,
+            cols,
+            join,
+        } = at;
+        let stream = gpu.stream();
         let planner =
-            Planner::from_file(file, hp, plan.ctx_max).map_err(|e| GpuError::plan(WHAT, e))?;
+            Planner::from_file(file, hp, ctx_max as u64).map_err(|e| GpuError::plan(WHAT, e))?;
         let seq = Seq::new(gpu, hp, layers.clone(), ctx_max, planner.stream_ratios())?;
         let row_bytes = engram_row_bytes(file, hp)?;
-        let rows = StepRows::open(
-            file,
-            hp,
-            STEP_TOKENS,
-            cfg.rows,
-            0..hp.engram()?.rows_per_token(),
-        )?;
+        let n_cols = cols.len();
+        let rows = StepRows::open(file, hp, STEP_TOKENS, cfg.rows, cols)?;
         if rows.row_bytes() != row_bytes {
             return Err(refuse(format!(
                 "the engram tables' rows are {row_bytes} bytes, the step's host half reads {}",
                 rows.row_bytes()
             )));
         }
-        let dims = ImageDims::of(hp, &planner, STEP_TOKENS, row_bytes);
+        let mut dims = ImageDims::of(hp, &planner, STEP_TOKENS, row_bytes);
+        dims.engram_bytes = hp.engram()?.layer_ids.len() * n_cols * row_bytes;
         let (window, yarn) = rope_specs(hp)?;
         let image = StepImage::new(ImageLayout::new(dims)?, &window, &yarn)?;
         let lanes = (0..PAIR_ROWS)
@@ -2527,14 +2767,11 @@ impl Body {
             .collect::<Result<Vec<_>, _>>()?;
         let arrival = RowsArrival::new(gpu.context(), PAIR_ROWS, image.layout())?;
 
-        let n_expert = hp.experts.n_expert;
-        let tier_cards: Vec<usize> = tiers.iter().map(|t| t.card).collect();
-        let map = SlotMap::of_plan_tiers(plan, card, &tier_cards, layers.clone(), n_expert)?;
         let slots = Arc::new(DeviceTensor::upload(
             stream,
             &map.stage_view(),
             layers.len(),
-            n_expert,
+            hp.experts.n_expert,
         )?);
 
         let attn =
@@ -2568,46 +2805,16 @@ impl Body {
             PAIR_ROWS,
         )?;
         let file = Arc::clone(file);
-        // The common chain's host-run build: a paged plan's NVMe expert tier
-        // is attached before the run's first call.
-        let first = host_first(hp, &layers);
-        let host = bloomery_gpu::model::host_run(
-            gpu.context(),
-            plan,
-            &file,
-            first..layers.end,
-            cfg.host.r8,
-            residency.arena(),
-            host_widths(hp),
-            |src| host::layers(src, hp, first..layers.end),
-        )?;
-        residency_glue.attach_tier(host.tier())?;
         let nvme_tier = host.tier().cloned();
-        let tier_cards = tiers
-            .iter()
-            .enumerate()
-            .map(|(i, t)| open_tier(gpu, &file, plan, t, i, hp, &map, cfg.host.card_dontneed))
-            .collect::<Result<Vec<_>, _>>()?;
         let mut hybrid = Hybrid::new(boundary, map, host, layers.len())?;
         hybrid.watch_fault(gpu.fault_word())?;
-        hybrid.keep_residency(residency);
-        let tier = if tier_cards.is_empty() {
-            None
-        } else {
-            let cards: Vec<usize> = tiers.iter().map(|t| t.card).collect();
-            hybrid.attach_tiers(tier_cards, gpu)?;
-            // The tiers' batch staging is reserved on their cards by the plan,
-            // so it is made at load, not at the first prompt.
-            hybrid.prepare_batch(gpu.context(), prefill::T_MAX)?;
-            hybrid.check_tier_reserves(plan, &cards)?;
-            Some(TierPiece::new(gpu, hybrid.slots(), PAIR_ROWS)?)
-        };
+        let tier = tiers(gpu, &mut hybrid)?;
         let ced = ced::Ced::new(&CedLayer::table(hp), seq.ring_rows(), cfg.ced);
 
         let mut body = Body {
             layers,
             seq,
-            slots_planned: planned.get(),
+            slots_planned: planned,
             slots_made: 1,
             steps,
             lanes,
@@ -2638,13 +2845,25 @@ impl Body {
             tier,
             residency_glue,
             nvme_tier,
-            join: None,
+            join,
         };
         // Last: the machine frees each layer's spare slots, and every piece
         // above sized itself from the load's map, capacity = live.
         body.start_residency(gpu)?;
         Ok(body)
     }
+}
+
+/// What a load decided that [`Body::assemble`] builds the body at: the layers
+/// the card runs, the positions its stores hold, the resident sequences it
+/// counts, the columns of each engram site's rows a step reads, and on a rank
+/// of a tensor-parallel load its side of the ranks' sums.
+struct Assembly {
+    layers: Range<usize>,
+    ctx_max: usize,
+    slots: usize,
+    cols: Range<usize>,
+    join: Option<RankJoin>,
 }
 
 /// Where a placed load lands besides its plan ([`Body::load_placed`]): the

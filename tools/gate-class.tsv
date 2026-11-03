@@ -56,6 +56,7 @@ gate-gpu-ds41-prefill	family	deepseek41	e2e	prompt_walks
 gate-gpu-ds41-residency-a	family	deepseek41	residency	residency+prompt_walks
 gate-gpu-ds41-step	family	deepseek41	e2e	graph_fault+attn_ds41_csa_hca+moe_route
 gate-gpu-ds41-tier	family	deepseek41	tier	tier_legs
+gate-gpu-ds41-tp	family	deepseek41	e2e	placement_nodes+moe_route
 gate-gpu-ds41-twocard	family	deepseek41	tier	tier_legs+placement_sizing
 gate-gpu-ds41-unpack	common		residency	residency
 gate-gpu-dspark-experts	family	deepseek41	draft	drafts_dspark
