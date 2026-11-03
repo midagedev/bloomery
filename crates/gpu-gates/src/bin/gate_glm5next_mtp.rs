@@ -132,7 +132,7 @@ mod gate {
     use std::time::Instant;
 
     use app::Session;
-    use app::mtp::{MtpDraft, SLOT_DEPTH, SlotWindow, pass_slots};
+    use app::mtp::{MtpDraft, SLOT_DEPTH, SlotWindow, open_draft, pass_slots};
     use bloomery_gpu::GpuError;
     use bloomery_gpu::draft::{DraftFeed, DraftHead, Feed, Hidden, WalkMode};
     use bloomery_gpu::host::PassKind;
@@ -1280,7 +1280,7 @@ mod gate {
         set_prefill(&mut m, path)?;
         let ctx = u32::try_from(CTX)?;
         let mut s = Session::from_model(m, ctx);
-        let draft = MtpDraft::open(s.model(), path, StepMode::Eager)?;
+        let draft = open_draft(s.model(), path, StepMode::Eager)?;
         let mut spec = s.with_draft::<MtpDraft<Body>, M>(draft, &mut Quiet)?;
         let first = spec.prompt(&mut s, prompt)?;
         let mut k = Kept::default();
@@ -1757,7 +1757,7 @@ mod gate {
     /// the seat's depth: the proposal, the verify of its rows, the draft told
     /// the rule's kept rows, the commit.
     fn z_alone(s: &mut Session<Body>, ids: &[u32]) -> Result<ZRun, GateError> {
-        let mut d = MtpDraft::open(s.model(), PrefillMode::Batch, StepMode::Eager)?;
+        let mut d = open_draft(s.model(), PrefillMode::Batch, StepMode::Eager)?;
         let last = z_prompt(s, &mut d, ids)?;
         let mut out = vec![z_step(s, &mut d, last)?];
         let mut rounds = Vec::with_capacity(Z_ROUNDS);
@@ -1835,8 +1835,8 @@ mod gate {
         let alone = [z_alone(&mut s, windows[0])?, z_alone(&mut s, windows[1])?];
         s.add_slots(Z_SLOTS)?;
         let mut drafts = [
-            MtpDraft::open(s.model(), PrefillMode::Batch, StepMode::Eager)?,
-            MtpDraft::open(s.model(), PrefillMode::Batch, StepMode::Eager)?,
+            open_draft(s.model(), PrefillMode::Batch, StepMode::Eager)?,
+            open_draft(s.model(), PrefillMode::Batch, StepMode::Eager)?,
         ];
         let mut outs = [Vec::new(), Vec::new()];
         let mut last = [0u32; Z_SLOTS];
@@ -2030,9 +2030,9 @@ mod gate {
         );
         ok &= refused(
             "the MTP window over a load without the layer",
-            MtpDraft::<Body>::open(&m, PrefillMode::Batch, StepMode::Eager).map_err(|e| {
+            open_draft::<Body>(&m, PrefillMode::Batch, StepMode::Eager).map_err(|e| {
                 GpuError::Shape {
-                    what: "MtpDraft::open",
+                    what: "open_draft",
                     detail: e.to_string(),
                 }
             }),

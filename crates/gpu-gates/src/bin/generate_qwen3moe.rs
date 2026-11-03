@@ -443,7 +443,7 @@ mod cli {
     use super::taps;
     use super::xstream_rule::{Stage, plans_ring, xstream_rule};
     use app::arch::qwen3moe::Q38Cfg;
-    use app::mtp::{MtpBody, MtpDraft, WindowDraft};
+    use app::mtp::{MtpBody, MtpDraft, WindowDraft, open_draft};
     use app::{Session, SessionError};
     use bloomery_gpu::arch::nemotron_h::{Body as BodyNh, PASS_ROWS as NH_PASS_ROWS};
     use bloomery_gpu::arch::nemotron_h_moe::{Body as BodyNhMoe, PASS_ROWS_MAX};
@@ -3365,7 +3365,7 @@ mod cli {
     ) -> Result<(), GateError> {
         let mut s = Session::from_model(m, u32::try_from(run.ctx)?);
         let path = cfg.prompt;
-        let mut draft = MtpDraft::open(s.model(), path, cfg.draft)?;
+        let mut draft = open_draft(s.model(), path, cfg.draft)?;
         if run.windows {
             draft.keep_windows();
         }

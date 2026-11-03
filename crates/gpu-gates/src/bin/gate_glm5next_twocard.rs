@@ -163,7 +163,7 @@ mod gate {
     use std::time::Instant;
 
     use app::arch::glm5next::{GlmCfg, open_nextn, open_pair, open_resident};
-    use app::mtp::MtpDraft;
+    use app::mtp::{MtpDraft, open_draft};
     use app::{Loaded, OpenArgs, Session};
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::slots::Slot;
@@ -780,7 +780,7 @@ mod gate {
     fn drafted(s: &mut Session<Body>, ids: &[u32]) -> Result<(Drafted, Option<Sent>), GateError> {
         s.clear()?;
         s.model_mut().body_parts(NAME)?.2.take_residency_passes();
-        let draft = MtpDraft::open(s.model(), PrefillMode::Batch, StepMode::Eager)?;
+        let draft = open_draft(s.model(), PrefillMode::Batch, StepMode::Eager)?;
         let mut spec = s.with_draft::<MtpDraft<Body>, PAIR>(draft, &mut Quiet)?;
         let first = spec.prompt(s, ids)?;
         let before = tier_counts(s.model())?;

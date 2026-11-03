@@ -257,7 +257,7 @@
 //!   all reasoning, as in the unset load's chat clause), its timings carry draft counts
 //!   (`draft_n` above 0), and the seat prints no `mtp prompt` record naming a skipped why for
 //!   it: a request that holds an image keeps its slot's draft (the draft's media prompt call,
-//!   `app::mtp::MtpDraft::prompt_media`); `draft_n_accepted / draft_n` prints;
+//!   `app::mtp::prompt_media`); `draft_n_accepted / draft_n` prints;
 //! - (m3) the text chat is a 200 whose timings carry draft counts (`draft_n` above 0) on a slot
 //!   the image chat's `slot call` records do not name: a text slot beside an image slot drafts;
 //!   `draft_n_accepted / draft_n` prints;

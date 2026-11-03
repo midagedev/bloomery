@@ -35,7 +35,7 @@
 //! ([`SlotDrafts::lookup`]) and the served draft (`served::ServedDraft`)
 //! alike.
 
-use app::mtp::{MtpBody, MtpDraft, Parked, ParkedBytes, SlotWalks, SlotWindow};
+use app::mtp::{MtpBody, MtpDraft, Parked, ParkedBytes, SlotWalks, SlotWindow, prompt_media};
 use app::{Draw, Keep, Prompt, RoundWindow, RowsLog, Session, SessionError};
 use bloomery_gpu::GpuModel;
 use bloomery_gpu::best;
@@ -803,7 +803,7 @@ where
     /// [`SlotDrafts::prompt_call`] of a prompt that holds an image: `spans` are the
     /// body's spans of the image's rows, spliced in place of their positions'
     /// embeddings. Under the draft the draft's own media prompt call
-    /// ([`MtpDraft::prompt_media`]: its store walked over the call's units, a
+    /// ([`prompt_media`]: its store walked over the call's units, a
     /// span's positions included), then its join record; without it, or while
     /// it is off, the session's ([`Session::prompt_media`]).
     #[cfg(feature = "vision")]
@@ -825,7 +825,7 @@ where
             |spec, s| {
                 Ok(spec
                     .draft_mut()
-                    .prompt_by(|d| d.prompt_media(s, ids, spans))?)
+                    .prompt_by(|d| prompt_media(d, s, ids, spans))?)
             },
         )
     }
@@ -1377,7 +1377,7 @@ where
     Window<M>: Widths,
 {
     /// [`SlotDrafts::before_row`] on `slot`, the session's selected one, the
-    /// draft caught up through [`MtpDraft::gather`]: shared prompt rows
+    /// draft caught up through [`SlotWalks::gather`]: shared prompt rows
     /// walked now, step and verify rows gathered into `walks` for one store
     /// walk of the round's gathered rows ([`SlotWalks::run`]) before its
     /// pass. Refused as [`SlotDrafts::has`].
@@ -1388,7 +1388,7 @@ where
         last: u32,
         walks: &mut SlotWalks<B>,
     ) -> Result<(), GateError> {
-        self.before_row_by(s, slot, |d, s| d.gather(s, last, walks))
+        self.before_row_by(s, slot, |d, s| walks.gather(d, s, last))
     }
 }
 

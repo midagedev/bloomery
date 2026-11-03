@@ -878,7 +878,7 @@ mod gate {
         }
         m.reset()?;
         let mut session = app::Session::from_model(m, CTX as u32);
-        let draft = app::mtp::MtpDraft::open(session.model(), Prompt38::Auto, StepMode::Graph)?;
+        let draft = app::mtp::open_draft(session.model(), Prompt38::Auto, StepMode::Graph)?;
         let mut spec =
             session.with_draft::<app::mtp::MtpDraft<Body38>, 4>(draft, &mut crate::quiet::Quiet)?;
         let first = spec.prompt(&mut session, prompt)?;
