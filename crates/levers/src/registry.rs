@@ -2261,6 +2261,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         "The model attention gate's handshake with the child it runs of its own test \
          binary: the file the lever child writes.",
     ),
+    runner(
+        "BLOOMERY_FOLLOW_DIR",
+        Some("release/pick.sh"),
+        "`tools/release/pick.sh`: the directory whose `W` file names the newest commit the daily \
+         real-tier pass found green (default `~/.cache/bloomery/follow`).",
+    ),
     LeverSpec {
         name: "BLOOMERY_GATE_BOUND",
         class: Class::R,
