@@ -23,7 +23,8 @@
 # as the other depth runners do); the variables show in the arm's row label. The model is BLOOMERY_MODEL's profile
 # (tools/ref/models/<name>.sh): its file is `-m`, and the seat is the file's architecture's.
 #
-# Per arm and round, one fresh server (the load is the price of a round and is outside every timed number):
+# Per arm and round, one fresh server (or, DEPTH_SERVE_FOLD=depths, per arm group and round: Fold, below; the load is the
+# price of a round and is outside every timed number):
 #   0a. the last server gone: nothing listens on the port and no bloomery-serve holds a compute context on a timing
 #      card (a process that held tens of GB of mapped host memory takes seconds to exit after its stop returned, and a
 #      server started before that finds its port taken, exit 83). Checked before the memory baseline is read, so the
@@ -78,6 +79,19 @@
 # Order. The arms rotate by one place every round (arm k of round r is arm (k + r - 1) mod n, ab-decode.sh's rule),
 # BLOOMERY_AB_ROUNDS rounds, default 4.
 #
+# Fold. DEPTH_SERVE_FOLD=depths makes the server an arm group's and a round's, not an arm's: the arms of one label (one tree,
+# one env= list, whatever their D) are answered by one fresh server a round, one after the other in the round's rotated order,
+# the groups in the order their first arm comes up. A load is the largest term of a sitting (the wall is the sum of the loads
+# and the requests, one server at a time), so two depths on one load drop the second load of every round. The first request
+# of a server is exactly what it is without the fold: a fresh server's. A later request of the server follows another one
+# (the KV rewritten, the page cache and the expert ring warmed by the first), which is a different quantity until
+# measured, so its ROW ends ` [shared]`, and the tables print a fold audit: per arm, the [shared] rows against the first
+# requests (mean difference with the same interval as the arm differences). Nothing is dropped from the means: they cover
+# both kinds of row, and the audit is the check that the fold may stand. The rotation puts each depth first in some rounds
+# and shared in others. A server's rows are published together after it has stopped and its card was checked; a failure
+# after the first request leaves none of that server's rows. BLOOMERY_ARM_BOUND bounds the whole server, its load, every
+# request and the hook. Default off: one fresh server a row.
+#
 # Knobs (each reaches the box through BLOOMERY_BOX_ENV). None is a BLOOMERY_ name, which would have to be a row of the lever
 # registry (tools/check-levers.sh) though no binary reads it; a BLOOMERY_SERVE_ variable set in the environment is refused
 # by name, so a caller who spells a knob that way is told and not silently run at the default:
@@ -95,6 +109,8 @@
 #                            `<name>/bin/bloomery-serve` every @portable arm's binary must equal by sha256, read before
 #                            the lease; the witness blocks' `binary:` line names the tarball and the sha256. Required
 #                            by a @portable arm, refused beside none
+#   DEPTH_SERVE_FOLD         `off` (default: one fresh server a row) or `depths` (one server an arm group and round,
+#                            above); a row of a later request of a server ends ` [shared]`
 #   DEPTH_SERVE_AFTER        a command line (bash -c) run under the lease (lease_bounded) on round 1's last server of
 #                            each arm group — the arms of one label, whatever their D — after that server's timed request
 #                            and before it stops, with BLOOMERY_SESSION_URL (http://127.0.0.1:<port>), _PID (the pid of
@@ -241,7 +257,9 @@ def warm_rows(rs):
     return [x for x in rs if '[cold]' not in x['tags']]
 
 
-print('=== per arm (tok/s): tg = timings.predicted_per_second, pp = timings.prompt_per_second; one fresh server a row; [cold] rows out of the means ===')
+has_shared = any('[shared]' in x['tags'] for rs in arms.values() for x in rs)
+served = 'a [shared] row follows another request on its server (the fold audit below)' if has_shared else 'one fresh server a row'
+print(f'=== per arm (tok/s): tg = timings.predicted_per_second, pp = timings.prompt_per_second; {served}; [cold] rows out of the means ===')
 for label, dep in order:
     rs = arms[(label, dep)]
     warm = warm_rows(rs)
@@ -296,6 +314,36 @@ for key in order:
             h = card.half_width(t975, sp, len(a))[0]
             parts.append(f'{head} ± {h:.2f} tok/s (± {100 * h / m0:.2f} %) [{"clears 0" if abs(d) > h else "holds 0"}]')
     print(f'diff {label} vs {first[0]} D={dep} | ' + ' | '.join(parts))
+
+# A [shared] row (DEPTH_SERVE_FOLD=depths) followed another request on its server: its warm state is the fold's, not a
+# fresh server's. Per arm, shared - first is the fold's own term; nothing is dropped from the means above.
+if has_shared:
+    print('=== fold audit (DEPTH_SERVE_FOLD=depths): a [shared] row followed another request on its server; shared - first per arm, [cold] rows out, same interval ===')
+    for label, dep in order:
+        warm = warm_rows(arms[(label, dep)])
+        base = [x for x in warm if '[shared]' not in x['tags']]
+        late = [x for x in warm if '[shared]' in x['tags']]
+        if not late:
+            continue
+        if not base:
+            print(f'fold {label} D={dep} | no audit: every warm row of the arm is [shared]')
+            continue
+        parts = []
+        for name in ('tg', 'pp'):
+            b = [x[name] for x in base]
+            a = [x[name] for x in late]
+            m0 = statistics.mean(b)
+            d = statistics.mean(a) - m0
+            head = f'{name} {d:+.2f} tok/s ({100 * d / m0:+.2f} %)'
+            if len(a) != len(b):
+                parts.append(f'{head}, no interval: {len(a)} shared rows against {len(b)} first')
+            elif len(a) < 2:
+                parts.append(f'{head}, one pair: no interval')
+            else:
+                sp = math.sqrt((statistics.stdev(b) ** 2 + statistics.stdev(a) ** 2) / 2)
+                h = card.half_width(t975, sp, len(a))[0]
+                parts.append(f'{head} ± {h:.2f} tok/s (± {100 * h / m0:.2f} %) [{"clears 0" if abs(d) > h else "holds 0"}]')
+        print(f'fold {label} D={dep} | shared - first (n={len(late)} against {len(base)}) | ' + ' | '.join(parts))
 PY
 }
 
@@ -532,9 +580,25 @@ ds_log_name() { echo "$LOGDIR/$4$1-$(echo "$2" | tr -c 'A-Za-z0-9._\n-' _)-D$3.l
 
 # ds_print_plan: the plan, for a dry run and the head of a real one.
 ds_print_plan() {
-  local i r k n=${#A_LABEL[@]} line envs servers=$((${#A_LABEL[@]} * ROUNDS)) est w
+  local i r k n=${#A_LABEL[@]} line envs servers=0 u arms est w
+  local -a per_round
+  for ((r = 1; r <= ROUNDS; r++)); do
+    ds_units "$r"
+    servers=$((servers + ${#UNITS[@]}))
+    line=''
+    for u in "${UNITS[@]}"; do
+      arms=''
+      for k in $u; do arms="${arms:+$arms+}${A_LABEL[k]}:${A_DEP[k]}"; done
+      line="${line:+$line | }$arms"
+    done
+    per_round[r]=$line
+  done
   echo "[plan] model=$MODEL_NAME file=$MODEL ids=$(ds_ids_file)"
-  echo "[plan] servers=$servers (${n} arms x $ROUNDS rounds, one load each) n_predict=$N ctx-size=${CTX:-unset (the plan picks it; its ctx_max is in each row label)} place=${PLACE:-unset} port=$PORT arm_bound=${LEASE_ARM_BOUND}s req_bound=${REQ_BOUND}s"
+  if [ "$FOLD" = depths ]; then
+    echo "[plan] servers=$servers (the arm groups of $n arms x $ROUNDS rounds, one load each; DEPTH_SERVE_FOLD=depths) n_predict=$N ctx-size=${CTX:-unset (the plan picks it; its ctx_max is in each row label)} place=${PLACE:-unset} port=$PORT arm_bound=${LEASE_ARM_BOUND}s req_bound=${REQ_BOUND}s"
+  else
+    echo "[plan] servers=$servers (${n} arms x $ROUNDS rounds, one load each) n_predict=$N ctx-size=${CTX:-unset (the plan picks it; its ctx_max is in each row label)} place=${PLACE:-unset} port=$PORT arm_bound=${LEASE_ARM_BOUND}s req_bound=${REQ_BOUND}s"
+  fi
   for ((i = 0; i < n; i++)); do
     ds_server_cmd "$i"
     envs=''
@@ -549,6 +613,12 @@ ds_print_plan() {
     done
     echo "[plan] order r$r:$line"
   done
+  for ((r = 1; r <= ROUNDS; r++)); do
+    echo "[plan] servers r$r: ${per_round[r]}"
+  done
+  if [ "$FOLD" = depths ]; then
+    echo "[plan] fold: a server answers its arm group's depths one after the other; its first request is a fresh server's, each later one is tagged [shared] and the tables' fold audit sets them against the first requests (a fold's only new term)"
+  fi
   echo "[plan] request: POST /completion, the first D ids of the prose corpus, n_predict=$N, temperature 0, ignore_eos, cache_prompt off"
   if [ "$USER_PLAN" != off ]; then
     echo "[plan] user-environment plan (DEPTH_SERVE_USER_PLAN=$USER_PLAN): before round 1, under the lease, each arm group's first arm runs with --plan, CUDA_VISIBLE_DEVICES removed; its plan record must be the one the group's first load prints"
@@ -849,18 +919,47 @@ ds_hook_run() {
   HOOK_RUNS=$((HOOK_RUNS + 1))
 }
 
-# ds_run_arm <round> <index>: one server, one request, its row (appended to ROWS_FILE) or a ds_fail.
-ds_run_arm() {
-  local r=$1 i=$2 label=${A_LABEL[$2]} dep=${A_DEP[$2]} ids t0 load tg pp maj listen ctx need win row
+# ds_units <round>: UNITS, the round's servers in the order they run, each the arm indices it serves (space-separated, in
+# the round's rotated order). Fold off: one server an arm. Fold depths: one server an arm group (the arms of one label,
+# whatever their D), the groups in the order their first arm comes up in the rotation.
+ds_units() {
+  local r=$1 n=${#A_LABEL[@]} i j k u
+  UNITS=()
+  for ((i = 0; i < n; i++)); do
+    k=$(((i + r - 1) % n))
+    if [ "$FOLD" != depths ]; then
+      UNITS+=("$k")
+      continue
+    fi
+    u=-1
+    for ((j = 0; j < ${#UNITS[@]}; j++)); do
+      if [ "${A_GROUP[${UNITS[j]%% *}]}" = "${A_GROUP[k]}" ]; then
+        u=$j
+        break
+      fi
+    done
+    if [ "$u" -ge 0 ]; then UNITS[u]+=" $k"; else UNITS+=("$k"); fi
+  done
+}
+
+# ds_need_check <round> <index>: the arm's D and n_predict fit the context the server listens on (SRV_CTX), else it fails by name.
+ds_need_check() {
+  local need=$((${A_DEP[$2]} + N - 1))
+  [ -n "$CTX" ] || [ "$need" -le "$SRV_CTX" ] ||
+    ds_fail "$1" "$2" "D ${A_DEP[$2]} and n_predict $N take $need positions, past the context the server listens on ($SRV_CTX), which the unset rule picked: lower DEPTH_SERVE_N or name a DEPTH_SERVE_CTX that holds them"
+}
+
+# ds_server_start <round> <index>: a fresh server for the unit whose first arm is <index>, up to the point where its first
+# request can be sent: SRV_LOG, LOAD_S, SRV_CTX and the plan (PLAN_PLACE, PLAN_CTX) it printed, or a ds_fail.
+ds_server_start() {
+  local r=$1 i=$2 label=${A_LABEL[$2]} dep=${A_DEP[$2]} t0 listen
   local -a envs
-  CPU_BUSY_TAG='' OTHER_BUSY_TAG='' COLD_TAG='' SRV_TIMED_PID=''
   ds_prev_gone "$r" "$i" "before the server starts"
   guard_other
   ds_guard_timing
   ds_mem_wait "$r" "$i"
   guard_cpu "pre r$r $label D=$dep"
   BIN_PATH=${A_BIN[$i]} BIN_SHA=${A_IDENT[$i]} BIN_MTIME=${A_MTIME[$i]}
-  ids=$(ds_ids "$dep")
   ds_server_cmd "$i"
   envs=()
   [ -z "${A_ENV[$i]}" ] || IFS=, read -r -a envs <<< "${A_ENV[$i]}"
@@ -868,22 +967,35 @@ ds_run_arm() {
   t0=$(date +%s)
   lcpp_srv_start "$LEASE_ARM_BOUND" "$SRV_LOG" -u BLOOMERY_REF_MODEL ${envs[@]+"${envs[@]}"} ||
     ds_fail "$r" "$i" "$SRV_WHY"
-  load=$(($(date +%s) - t0))
+  LOAD_S=$(($(date +%s) - t0))
   listen=$(grep -m1 'listening on http://' "$SRV_LOG")
-  echo "[server] r$r $label D=$dep: $listen (loaded and listening in $load s)"
+  echo "[server] r$r $label D=$dep: $listen (loaded and listening in $LOAD_S s)"
   if [ "$PORT" != 0 ] && [ "$SRV_PORT" != "$PORT" ]; then
     ds_fail "$r" "$i" "the server listens on port $SRV_PORT, not the --port $PORT it was given"
   fi
-  ctx=$(sed -n 's/.* ctx=\([0-9][0-9]*\) .*/\1/p' <<< "$listen")
-  [ -n "$ctx" ] || ds_fail "$r" "$i" "the listening line names no ctx=, so the context the arm ran at is not proven"
+  SRV_CTX=$(sed -n 's/.* ctx=\([0-9][0-9]*\) .*/\1/p' <<< "$listen")
+  [ -n "$SRV_CTX" ] || ds_fail "$r" "$i" "the listening line names no ctx=, so the context the arm ran at is not proven"
   if [ -n "$CTX" ]; then
-    [ "$ctx" = "$CTX" ] || ds_fail "$r" "$i" "the listening line names ctx=$ctx, not the --ctx-size $CTX the arm asked"
-  else
-    need=$((dep + N - 1))
-    [ "$need" -le "$ctx" ] || ds_fail "$r" "$i" "D $dep and n_predict $N take $need positions, past the context the server listens on ($ctx), which the unset rule picked: lower DEPTH_SERVE_N or name a DEPTH_SERVE_CTX that holds them"
+    [ "$SRV_CTX" = "$CTX" ] || ds_fail "$r" "$i" "the listening line names ctx=$SRV_CTX, not the --ctx-size $CTX the arm asked"
   fi
+  ds_need_check "$r" "$i"
   ds_plan_read "$SRV_LOG" || ds_fail "$r" "$i" "$PLAN_WHY: the placement and the context the plan picked are not proven"
   ds_plan_group "$r" "$i"
+}
+
+# ds_serve_request <round> <index> <position>: the arm's timed request on the running server (<position> 1 is the server's
+# first request, which is the fresh server's), and its ROW into ROWS_PENDING. A later request of a folded server carries
+# ` [shared]`: it followed another request on its server, so it is a fold's row and the tables keep it apart.
+ds_serve_request() {
+  local r=$1 i=$2 pos=$3 label=${A_LABEL[$2]} dep=${A_DEP[$2]} ids row maj win tg pp shared=''
+  if [ "$pos" -gt 1 ]; then
+    CPU_BUSY_TAG='' OTHER_BUSY_TAG='' COLD_TAG=''
+    shared=' [shared]'
+    ds_need_check "$r" "$i"
+    guard_other
+    guard_cpu "pre r$r $label D=$dep"
+  fi
+  ids=$(ds_ids "$dep")
   row=$(ds_row_label "$i")
   witness "pre r$r $label D=$dep"
   if ! lcpp_srv_request "$ids" "$N" "$REQ_BOUND"; then
@@ -904,11 +1016,27 @@ ds_run_arm() {
   if ! awk -v v="$tg" 'BEGIN { exit !(v > 0) }'; then
     ds_fail "$r" "$i" "timings.predicted_per_second is '$SRV_PRED_TPS', not a rate"
   fi
+  ROWS_PENDING+=("ROW r$r $row D=$dep | tg_tok/s $tg | pp_tok/s $pp | load_s $LOAD_S | majflt $maj${CPU_BUSY_TAG:-}${OTHER_BUSY_TAG:-}${COLD_TAG:-}$shared")
   if [ -n "$AFTER" ] && [ "$r" = 1 ] && [ "${A_HOOK[$i]}" = 1 ]; then ds_hook_run "$r" "$i"; fi
+}
+
+# ds_run_server <round> <index>...: one fresh server, the timed request of each arm given (in that order), the server
+# stopped, and then the rows of those requests (appended to ROWS_FILE): a server's rows are published together, once it
+# has stopped and its card has been checked, so a server that fails mid-way leaves none.
+ds_run_server() {
+  local r=$1 i pos=0
+  shift
+  CPU_BUSY_TAG='' OTHER_BUSY_TAG='' COLD_TAG='' SRV_TIMED_PID=''
+  ROWS_PENDING=()
+  ds_server_start "$r" "$1"
+  for i in "$@"; do
+    pos=$((pos + 1))
+    ds_serve_request "$r" "$i" "$pos"
+  done
   lcpp_srv_stop
   # Local mode: an Xid since the last arm's check, or the card lost, fails the arm (timing-card.sh).
   timing_cards_arm "$(cat "$SRV_LOG")" serve || ds_fail "$r" "$i" "$TWOCARD_WHY"
-  echo "ROW r$r $row D=$dep | tg_tok/s $tg | pp_tok/s $pp | load_s $load | majflt $maj${CPU_BUSY_TAG:-}${OTHER_BUSY_TAG:-}${COLD_TAG:-}" | tee -a "$ROWS_FILE"
+  printf '%s\n' "${ROWS_PENDING[@]}" | tee -a "$ROWS_FILE"
 }
 
 # ds_main <arm>...: the run (or, under BLOOMERY_DRY, the plan).
@@ -918,11 +1046,11 @@ ds_main() {
     if [ -n "$TIMING_LOCAL" ]; then echo "[timing-card] refused: $TIMING_CARDS_WHY" >&2; else echo "[timing-cards] refused: $TIMING_CARDS_WHY" >&2; fi
     exit 64
   fi
-  local i r k n v maxd need
+  local i r u n v maxd need
   # Local mode refused (timing-card.sh printed why as this file sourced it) ends the run here, dry or not.
   [ -z "$TIMING_LOCAL" ] || [ -z "$TIMING_CARDS_WHY" ] || exit 64
   for v in $(compgen -v BLOOMERY_SERVE_); do
-    ds_refuse 64 "$v is set, and nothing reads it: this runner's knobs are DEPTH_SERVE_CTX, DEPTH_SERVE_PLACE, DEPTH_SERVE_N, DEPTH_SERVE_PORT, DEPTH_SERVE_REQ_BOUND, DEPTH_SERVE_IDS, DEPTH_SERVE_LOAD_EST, DEPTH_SERVE_TARBALL, DEPTH_SERVE_AFTER, DEPTH_SERVE_AFTER_BOUND, DEPTH_SERVE_USER_PLAN, DEPTH_SERVE_PORT_WAIT_S, DEPTH_SERVE_MEM_WAIT_S, DEPTH_SERVE_MEM_SLACK_MIB and DEPTH_SERVE_MEM_BASELINE (a BLOOMERY_ name would have to be a row of the lever registry)"
+    ds_refuse 64 "$v is set, and nothing reads it: this runner's knobs are DEPTH_SERVE_CTX, DEPTH_SERVE_PLACE, DEPTH_SERVE_N, DEPTH_SERVE_PORT, DEPTH_SERVE_REQ_BOUND, DEPTH_SERVE_IDS, DEPTH_SERVE_LOAD_EST, DEPTH_SERVE_TARBALL, DEPTH_SERVE_AFTER, DEPTH_SERVE_AFTER_BOUND, DEPTH_SERVE_FOLD, DEPTH_SERVE_USER_PLAN, DEPTH_SERVE_PORT_WAIT_S, DEPTH_SERVE_MEM_WAIT_S, DEPTH_SERVE_MEM_SLACK_MIB and DEPTH_SERVE_MEM_BASELINE (a BLOOMERY_ name would have to be a row of the lever registry)"
   done
   DRY=${BLOOMERY_DRY:-}
   ROUNDS=${BLOOMERY_AB_ROUNDS:-4}
@@ -931,6 +1059,7 @@ ds_main() {
   PLACE=${DEPTH_SERVE_PLACE:-}
   PORT=${DEPTH_SERVE_PORT:-18180}
   REQ_BOUND=${DEPTH_SERVE_REQ_BOUND:-300}
+  FOLD=${DEPTH_SERVE_FOLD:-off}
   AFTER=${DEPTH_SERVE_AFTER:-}
   AFTER_BOUND=${DEPTH_SERVE_AFTER_BOUND:-300}
   USER_PLAN=${DEPTH_SERVE_USER_PLAN:-check}
@@ -955,6 +1084,7 @@ ds_main() {
   ds_posint BLOOMERY_ARM_BOUND "$LEASE_ARM_BOUND" 1
   case $PLACE in '' | a | bp) ;; *) ds_refuse 64 "DEPTH_SERVE_PLACE is a or bp (unset: the plan's own pick), got '$PLACE'" ;; esac
   case $USER_PLAN in check | note | off) ;; *) ds_refuse 64 "DEPTH_SERVE_USER_PLAN is check, note or off, got '$USER_PLAN'" ;; esac
+  case $FOLD in off | depths) ;; *) ds_refuse 64 "DEPTH_SERVE_FOLD is off or depths, got '$FOLD'" ;; esac
   if [ -n "$AFTER" ] && [ "$AFTER_BOUND" -ge "$LEASE_ARM_BOUND" ]; then
     ds_refuse 64 "DEPTH_SERVE_AFTER_BOUND $AFTER_BOUND s must be under BLOOMERY_ARM_BOUND $LEASE_ARM_BOUND s: the server's bound covers its load, its request and the hook"
   fi
@@ -991,7 +1121,7 @@ ds_main() {
   : > "$ROWS_FILE"
   G_KEY=() G_FIRST=() UP_KEY=() HOOK_FAILS=0 HOOK_RUNS=0 SRV_TIMED_PID=''
   echo "[config] model=$MODEL_NAME n=$N ctx=${CTX:-unset} port=$PORT rounds=$ROUNDS place=${PLACE:-unset} arm_bound=${LEASE_ARM_BOUND}s req_bound=${REQ_BOUND}s timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES logs=$LOGDIR"
-  echo "[config] arms=$* (the server at the serving defaults beside --ctx-size and --place when named, no warm-up request, one fresh server a row)"
+  echo "[config] arms=$* (the server at the serving defaults beside --ctx-size and --place when named, no warm-up request, fold=$FOLD: $([ "$FOLD" = depths ] && echo "one fresh server an arm group and round, its depths one after the other" || echo "one fresh server a row"))"
   # The witness blocks' binary line (timing-card.sh's card field) names BIN_PATH and BIN_SHA: the first arm's for the
   # sitting's first block, each arm's own in its blocks.
   BIN_PATH=${A_BIN[0]} BIN_SHA=${A_IDENT[0]} BIN_MTIME=${A_MTIME[0]}
@@ -1001,9 +1131,10 @@ ds_main() {
   ds_mem_baseline
   ds_user_plan_probe
   for ((r = 1; r <= ROUNDS; r++)); do
-    for ((i = 0; i < n; i++)); do
-      k=$(((i + r - 1) % n))
-      ds_run_arm "$r" "$k"
+    ds_units "$r"
+    for u in "${UNITS[@]}"; do
+      # shellcheck disable=SC2086 # the unit is a list of arm indices
+      ds_run_server "$r" $u
     done
   done
   echo
@@ -1678,6 +1809,93 @@ HOOK
     ds_hook_run 1 0 ) > "$C/out" 2>&1 || RC=$?
   st_check refuse-hook-before-the-timed-request 70 "ds_hook_run: refused: the hook of r1 a D=6 would run before the timed request of its server"
   st_absent refuse-hook-before-the-timed-request-ran-nothing "must-not-run"
+
+  # --- the fold: DEPTH_SERVE_FOLD=depths answers an arm group's depths on one server a round, in the round's rotated order. The
+  # server's first request is what it is without the fold, a later one ends ` [shared]`, a server's rows come after its stop,
+  # and the tables audit shared against first.
+  st_case fold
+  st_tree a 20
+  st_tree b 21
+  ST_ENV=(BLOOMERY_DRY=1 BLOOMERY_AB_ROUNDS=2 DEPTH_SERVE_FOLD=depths)
+  st_run a:6 a:12 b:6
+  st_check fold-plan 0 "[plan] servers=4 (the arm groups of 3 arms x 2 rounds, one load each; DEPTH_SERVE_FOLD=depths)" \
+    "[plan] order r1: a:6 a:12 b:6" "[plan] order r2: a:12 b:6 a:6" "[plan] servers r1: a:6+a:12 | b:6" "[plan] servers r2: a:12+a:6 | b:6" \
+    "[plan] fold: a server answers its arm group's depths one after the other"
+  ST_ENV=(BLOOMERY_DRY=1 BLOOMERY_AB_ROUNDS=2)
+  st_run a:6 a:12 b:6
+  st_check fold-off-plan 0 "[plan] servers=6 (3 arms x 2 rounds, one load each)" "[plan] servers r1: a:6 | a:12 | b:6" "[plan] servers r2: a:12 | b:6 | a:6"
+  st_absent fold-off-plan-says-nothing-of-a-fold "[plan] fold:"
+  ST_ENV=(DEPTH_SERVE_FOLD=sometimes)
+  st_run a:6
+  st_check refuse-fold-mode 64 "DEPTH_SERVE_FOLD is off or depths, got 'sometimes'"
+  cat > "$C/hook.sh" << 'HOOK'
+echo "hook-ran last=$(tail -n 1 "$TMPDIR/stub-srv-reqs" | cut -d' ' -f1-2) health=$(curl -s -o /dev/null -w '%{http_code}' "$BLOOMERY_SESSION_URL/health")"
+HOOK
+  ST_PORT=$(st_port)
+  ST_ENV=(BLOOMERY_AB_ROUNDS=2 DEPTH_SERVE_FOLD=depths DEPTH_SERVE_CTX=4160 "DEPTH_SERVE_AFTER=bash $C/hook.sh")
+  st_run a:6 a:12 b:6
+  st_check fold-run 0 "[config] model=mimo2 n=128 ctx=4160 port=$ST_PORT rounds=2 place=unset" "fold=depths: one fresh server an arm group and round"
+  got=$(grep '^ROW' "$C/out" | awk '{ sub(/\/.*/, "", $3); printf "%s%s%s%s ", $2, $3, $4, ($0 ~ /\[shared\]$/ ? "s" : "") }')
+  [ "$got" = "r1aD=6 r1aD=12s r1bD=6 r2aD=12 r2aD=6s r2bD=6 " ] && ok fold-rows-in-server-order-the-later-one-shared || bad fold-rows-in-server-order-the-later-one-shared "rows [$got]"
+  st_servers fold-servers-stopped 4
+  got=$(cut -d' ' -f1,2 "$C/stub-srv-reqs" | paste -sd, -)
+  [ "$got" = "1 6,2 12,1 6,1 12,2 6,1 6" ] && ok fold-requests-per-server || bad fold-requests-per-server "the stub's requests (number in its server, ids) [$got]"
+  st_before fold-rows-after-the-servers-last-request "[witness-stub] post r1 a D=12" "ROW r1 a/place=a/ctx=4160 D=6"
+  st_check fold-hook-after-the-groups-last-request 0 "hook-ran last=2 12 health=200" "hook-ran last=1 6 health=200" "HOOK r1 a D=12 rc=0" "HOOK r1 b D=6 rc=0"
+  st_before fold-hook-before-the-rows "HOOK r1 a D=12 rc=0" "ROW r1 a/place=a/ctx=4160 D=6"
+  [ "$(grep -c '^hook-ran ' "$C/out")" = 2 ] && ok fold-hook-once-per-group-in-round-1 || bad fold-hook-once-per-group-in-round-1 "the hook did not run exactly twice"
+  st_check fold-audit 0 "=== fold audit (DEPTH_SERVE_FOLD=depths): a [shared] row followed another request on its server" \
+    "fold a/place=a/ctx=4160 D=6 | shared - first (n=1 against 1) | tg +0.00 tok/s (+0.00 %), one pair: no interval" \
+    "a [shared] row follows another request on its server (the fold audit below)"
+  ST_PORT=
+  # Without the fold the same arms are six servers, no row is shared and the tables have no audit.
+  st_case foldoff
+  st_tree a 20
+  ST_ENV=(BLOOMERY_AB_ROUNDS=2 DEPTH_SERVE_CTX=4160)
+  st_run a:6 a:12
+  st_servers foldoff-servers 4
+  st_absent foldoff-no-shared-row-no-audit "[shared]" "fold audit"
+  # A request that fails after the server's first leaves none of that server's rows; the second arm is named, the server stopped.
+  st_case foldfail
+  st_tree a 20 STUB_SRV_BADN=1
+  ST_ENV=(BLOOMERY_AB_ROUNDS=1 DEPTH_SERVE_FOLD=depths)
+  st_run a:6 a:12
+  st_check fold-second-request-fails 1 "FAIL r1 a D=12: predicted_n 127, not 128"
+  st_absent fold-failed-server-leaves-no-row "ROW r1"
+  st_servers fold-failed-server-stopped 1
+  # The second arm's D must fit the context the server listens on (the first arm's check is the unfolded one).
+  st_case foldctx
+  st_tree a 20
+  ST_ENV=(BLOOMERY_AB_ROUNDS=1 DEPTH_SERVE_FOLD=depths ST_CTXFIXED=4999 DEPTH_SERVE_N=64)
+  st_run a:6 a:4990
+  st_check fold-second-arm-past-the-context 1 "FAIL r1 a D=4990: D 4990 and n_predict 64 take 5053 positions, past the context the server listens on (4999)"
+  # A shared request that read cold is out of the means and the audit, with both tags on its row.
+  st_case foldcold
+  st_tree a 20
+  printf '0\n0\n0\n100\n34323\n' > "$C/mf.seq"
+  ST_ENV=(BLOOMERY_AB_ROUNDS=1 DEPTH_SERVE_FOLD=depths DEPTH_SERVE_CTX=4300)
+  st_run a:512 a:1024
+  st_check fold-cold-shared-row 0 "| majflt 34223 [cold] [shared]" "[cold] r1 a D=1024: 34223 major faults x 75 us"
+  ST_ENV=()
+  # The audit's math by hand: first tg 20 and 22 (mean 21, sd 1.41), shared 19 and 21 (mean 20, sd 1.41), pooled sd 1.41,
+  # df 2, t 4.303 (card.py's table), half width 4.303 x 1.4142 x sqrt(2/2) = 6.09 tok/s (28.98 % of 21): the difference -1.00 (-4.76 %) holds 0;
+  # pp 100 and 100 against 104 and 104: +4.00 (+4.00 %), no spread, half width 0: clears 0. A [cold] shared row is out of both.
+  st_case foldtables
+  cat > "$C/rows" << 'ROWS'
+ROW r1 a D=6 | tg_tok/s 20.00 | pp_tok/s 100.00 | load_s 41 | majflt 0
+ROW r1 a D=12 | tg_tok/s 19.00 | pp_tok/s 102.00 | load_s 41 | majflt 0 [shared]
+ROW r2 a D=12 | tg_tok/s 21.00 | pp_tok/s 98.00 | load_s 40 | majflt 0
+ROW r2 a D=6 | tg_tok/s 19.00 | pp_tok/s 104.00 | load_s 40 | majflt 0 [shared]
+ROW r3 a D=6 | tg_tok/s 22.00 | pp_tok/s 100.00 | load_s 41 | majflt 0
+ROW r3 a D=12 | tg_tok/s 19.00 | pp_tok/s 100.00 | load_s 41 | majflt 3 [shared] [cold]
+ROW r4 a D=12 | tg_tok/s 21.00 | pp_tok/s 98.00 | load_s 41 | majflt 0
+ROW r4 a D=6 | tg_tok/s 21.00 | pp_tok/s 104.00 | load_s 41 | majflt 0 [shared]
+ROWS
+  RC=0
+  bash "$HERE/depth-serve.sh" --summary "$C/rows" > "$C/out" 2>&1 || RC=$?
+  st_check fold-audit-by-hand 0 "fold a D=6 | shared - first (n=2 against 2) | tg -1.00 tok/s (-4.76 %) ± 6.09 tok/s (± 28.98 %) [holds 0] | pp +4.00 tok/s (+4.00 %) ± 0.00 tok/s (± 0.00 %) [clears 0]" \
+    "fold a D=12 | shared - first (n=1 against 2) | tg -2.00 tok/s (-9.52 %), no interval: 1 shared rows against 2 first | pp +4.00 tok/s (+4.08 %), no interval: 1 shared rows against 2 first" \
+    "mean a D=12 | tg 20.33 tok/s (sd 1.15 = 5.68 %, [19.00..21.00], n=3)" "[cold 1/4]"
 
   # --- the memory between servers: the next load starts when the card's used memory is back at the sitting's baseline.
   st_case mem

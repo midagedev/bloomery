@@ -17,10 +17,14 @@ $BLOOMERY_SESSION_URL, _PID, _STDERR and _DIR. Every request is a greedy chat tu
                                repeats of one sentence; a count under 4096 is a FAIL whose detail starts `harness:`
                                and names it, and the prompt is not sent), is answered
   second_request_equals_first  pass_short's request replayed, after the long one, answers the same text
-  tape_short, tape_long        only with --client toktape: the two prompts recorded as tapes by `toktape record` as the
-                               release pass did (the flags are pass.sh's), after the checks above so no tape
-                               changes what they saw; the long one is skipped when its token count failed
   off_reason                   only when the server is not up when the checks end: its refusal read from --stderr
+
+With --client toktape the request of each of those three checks is `toktape record`'s (the flags are the release
+pass's), tagged <tag>-short, <tag>-long and <tag>-short2, and the check reads the reply from the tape toktape wrote
+under --dir/tapes: the check sends nothing itself, so a prompt is prefilled once and the tape that is the release's
+record is the very request the check judged. The tape must hold one request, without an error, whose last message
+is the check's prompt, and whose completion equals the text of its streamed tokens (the reasoning ones apart);
+anything else is a FAIL naming it. toktape ends other than 0 -> FAIL naming its exit status.
 
 A reply's text is `content`, or `reasoning_content` when content is empty; both empty is a FAIL. Anything but HTTP
 200 is a FAIL. A FAIL does not stop the next check. After every check the server is probed (/health, and --pid
@@ -43,6 +47,7 @@ code (the behaviour of the pass scripts this replaces, one at a time) and requir
 """
 import argparse
 import contextlib
+import gzip
 import http.client
 import importlib.util
 import io
@@ -71,6 +76,8 @@ BANNER = re.compile(r"^bloomery-serve[\w-]*: a first start on a new card\b")
 # The binaries whose records a server's stderr can hold; `plan` and `load` are the generate_ds41 kinds.
 RECORD_BINS = ("generate_ds41", "bloomery-serve-ds41", "bloomery-serve-qwen38")
 REASON_LINES = 8
+# The run file `toktape record` writes: gzip'd JSON (or plain), `schema` first; this reader knows one.
+TAPE_SCHEMA = 1
 
 
 class CheckFail(Exception):
@@ -142,15 +149,63 @@ def chat_body(prompt, max_tokens):
             "stream": False, "chat_template_kwargs": {"enable_thinking": False}}
 
 
-def reply_text(obj):
-    """(text, field) of a chat reply: content, or reasoning_content when content is empty; both empty is a CheckFail."""
-    msg = ((obj.get("choices") or [{}])[0]).get("message") or {}
-    content = msg.get("content") or ""
-    reasoning = msg.get("reasoning_content") or ""
+def choose_text(content, reasoning):
+    """(text, field): the content, or the reasoning when content is empty; both empty is a CheckFail."""
     text = content if content.strip() else reasoning
     if not text.strip():
         raise CheckFail("both content and reasoning_content are empty")
     return text, "content" if content.strip() else "reasoning_content"
+
+
+def reply_text(obj):
+    """(text, field) of a chat reply: content, or reasoning_content when content is empty; both empty is a CheckFail."""
+    msg = ((obj.get("choices") or [{}])[0]).get("message") or {}
+    return choose_text(msg.get("content") or "", msg.get("reasoning_content") or "")
+
+
+def read_tape(path):
+    """The parsed run file `toktape record` wrote at `path`; CheckFail when it is missing, unreadable or of another schema."""
+    try:
+        raw = Path(path).read_bytes()
+    except OSError as e:
+        raise CheckFail(f"toktape wrote no tape at {path}: {e.strerror}")
+    try:
+        raw = gzip.decompress(raw)
+    except OSError:
+        pass
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        raise CheckFail(f"the tape {path} is no JSON")
+    if not isinstance(obj, dict) or obj.get("schema") != TAPE_SCHEMA:
+        raise CheckFail(f"the tape {path} has schema {obj.get('schema') if isinstance(obj, dict) else None!r}, "
+                        f"this reader knows {TAPE_SCHEMA}")
+    return obj
+
+
+def tape_reply(obj, prompt):
+    """(text, field, evaluated) of the one request a tape holds, which must be the check's: CheckFail on a tape of
+    another shape, with an error, of another prompt, or whose completion is not its streamed tokens' text."""
+    reqs = obj.get("requests") or []
+    if len(reqs) != 1:
+        raise CheckFail(f"the tape holds {len(reqs)} requests, want 1")
+    rec = reqs[0]
+    if rec.get("error"):
+        raise CheckFail(f"the tape's request failed: {head(rec['error'])}")
+    p = rec.get("prompt") or {}
+    msgs = p.get("messages") or [{}]
+    sent = msgs[-1].get("content")
+    if sent != prompt:
+        raise CheckFail(f"the tape recorded another prompt than the check's: {head(sent, 60)!r}, want {head(prompt, 60)!r}")
+    toks = rec.get("tokens") or []
+    completion = p.get("completion") or ""
+    streamed = "".join(t.get("text", "") for t in toks if not t.get("r"))
+    if completion != streamed:
+        raise CheckFail(f"the tape's completion ({len(completion)} chars) is not the text of its streamed tokens "
+                        f"({len(streamed)} chars)")
+    reasoning = "".join(t.get("text", "") for t in toks if t.get("r"))
+    text, field = choose_text(completion, reasoning)
+    return text, field, (rec.get("timings") or {}).get("prompt_n")
 
 
 def refusal_of(text):
@@ -180,8 +235,7 @@ class Session:
         self.a = a
         self.fails = 0
         self.dead = None          # why the server is not up, once it is known not to be
-        self.first = None         # (request body, text) of pass_short
-        self.long_ok = False      # whether pass_long's token count reached the bound
+        self.first = None         # (request body, text) of pass_short; the body is None under --client toktape
 
     def say(self, name, status, detail=""):
         if status == "FAIL":
@@ -251,7 +305,38 @@ class Session:
         except (ValueError, KeyError, TypeError):
             raise CheckFail(f"harness: /tokenize's reply has no tokens list: {head(reply)}")
 
+    def record(self, kind, suffix, prompt):
+        """One `toktape record` of `prompt`, and (text, field, evaluated, name) of the reply its tape holds."""
+        a = self.a
+        name = f"{a.tag}-{kind}{suffix}"
+        prompts = Path(a.dir) / f"{name}.jsonl"
+        prompts.write_text(json.dumps({"name": kind, "prompt": prompt}, ensure_ascii=False) + "\n")
+        tapes = Path(a.dir) / "tapes"
+        cmd = [a.toktape_bin, "record", "--url", a.url, "--temp", "0", "--no-think", "--endpoint", "chat",
+               "-n", str(a.max_tokens), "--for", "0", "--wait", "60s", "--host-label", "none",
+               "--prompts", str(prompts), "--out", str(tapes), "--tag", name, "-o", "json", "--quiet"]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=a.timeout)
+        except subprocess.TimeoutExpired:
+            raise CheckFail(f"toktape did not end within {a.timeout:g} s")
+        (Path(a.dir) / f"{name}.json").write_text(r.stdout)
+        if r.returncode != 0:
+            raise CheckFail(f"toktape exit {r.returncode}: {head(r.stderr or r.stdout)}")
+        try:
+            run_id = json.loads(r.stdout)["id"]
+        except (ValueError, KeyError, TypeError):
+            raise CheckFail(f"toktape's summary names no run id: {head(r.stdout)}")
+        text, field, evaluated = tape_reply(read_tape(tapes / f"{run_id}.toktape"), prompt)
+        return text, field, evaluated, name
+
+    def tape_detail(self, name, evaluated, text, field):
+        return f"tape {name}, {evaluated} prompt tokens evaluated, {len(text)} chars from {field}"
+
     def pass_short(self):
+        if self.a.client == "toktape":
+            text, field, evaluated, name = self.record("short", "", SHORT_PROMPT)
+            self.first = (None, text)
+            return self.tape_detail(name, evaluated, text, field)
         body = chat_body(SHORT_PROMPT, self.a.max_tokens)
         text, field = self.post_chat("pass_short", body)
         self.first = (body, text)
@@ -262,7 +347,9 @@ class Session:
         tokens = self.tokenized(prompt)
         if tokens < LONG_MIN_TOKENS:
             raise CheckFail(f"harness: the long prompt is {tokens} tokens by /tokenize, under {LONG_MIN_TOKENS}")
-        self.long_ok = True
+        if self.a.client == "toktape":
+            text, field, evaluated, name = self.record("long", "", prompt)
+            return f"{tokens} prompt tokens, " + self.tape_detail(name, evaluated, text, field)
         text, field = self.post_chat("pass_long", chat_body(prompt, self.a.max_tokens))
         return f"{tokens} prompt tokens, {len(text)} chars from {field}"
 
@@ -270,35 +357,13 @@ class Session:
         if self.first is None:
             raise CheckSkip("pass_short gave no reply to replay")
         body, want = self.first
-        text, _ = self.post_chat("second_request_equals_first", body)
+        if body is None:
+            text, _, _, _ = self.record("short", "2", SHORT_PROMPT)
+        else:
+            text, _ = self.post_chat("second_request_equals_first", body)
         if text != want:
             raise CheckFail(f"the replay's text differs: first {head(want, 60)!r}, replay {head(text, 60)!r}")
         return f"the replay of pass_short has the same {len(text)} chars"
-
-    def tape(self, kind):
-        a = self.a
-        if kind == "long" and not self.long_ok:
-            raise CheckSkip("pass_long did not reach its token count")
-        prompt = SHORT_PROMPT if kind == "short" else (LONG_SENTENCE * a.long_repeat).strip()
-        prompts = Path(a.dir) / f"{a.tag}-{kind}.jsonl"
-        prompts.write_text(json.dumps({"name": kind, "prompt": prompt}, ensure_ascii=False) + "\n")
-        cmd = [a.toktape_bin, "record", "--url", a.url, "--temp", "0", "--no-think", "--endpoint", "chat",
-               "-n", str(a.max_tokens), "--for", "0", "--wait", "60s", "--host-label", "none",
-               "--prompts", str(prompts), "--out", str(Path(a.dir) / "tapes"), "--tag", f"{a.tag}-{kind}",
-               "-o", "json", "--quiet"]
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=a.timeout)
-        except subprocess.TimeoutExpired:
-            raise CheckFail(f"toktape did not end within {a.timeout:g} s")
-        (Path(a.dir) / f"{a.tag}-{kind}.json").write_text(r.stdout)
-        if r.returncode != 0:
-            raise CheckFail(f"toktape exit {r.returncode}: {head(r.stderr or r.stdout)}")
-        try:
-            s = json.loads(r.stdout)
-            n = (s.get("timings") or {}).get("prompt_n", s.get("prompt_tokens"))
-        except (ValueError, AttributeError):
-            n = None
-        return f"tape {a.tag}-{kind}" + (f", {n} prompt tokens" if n is not None else "")
 
     def off_reason(self):
         if not self.a.stderr:
@@ -312,11 +377,8 @@ class Session:
             self.say("off_reason", "FAIL", f"no refusal line in {self.a.stderr} (the start banner and records are no reason)")
 
     def steps(self):
-        out = [("pass_short", self.pass_short), ("pass_long", self.pass_long),
-               ("second_request_equals_first", self.second_request_equals_first)]
-        if self.a.client == "toktape":
-            out += [("tape_short", lambda: self.tape("short")), ("tape_long", lambda: self.tape("long"))]
-        return out
+        return [("pass_short", self.pass_short), ("pass_long", self.pass_long),
+                ("second_request_equals_first", self.second_request_equals_first)]
 
     def run(self):
         self.info()
@@ -636,35 +698,157 @@ def an_off_cell_with_only_the_banner_is_unnamed(main):
     return p
 
 
-@case
-def toktape_client_records_the_tapes_after_the_checks(main):
-    fake = scratch("pass-checks-tt.") / "toktape"
-    log = fake.parent / "argv"
-    fake.write_text(f'#!/bin/sh\necho "$@" >> "{log}"\necho \'{{"timings": {{"prompt_n": 4500}}}}\'\nexit ${{FAKE_TOKTAPE_RC:-0}}\n')
+# A stand-in for `toktape record`: it POSTs the prompt of its --prompts line to the stub server's chat endpoint, writes the
+# run file (gzip'd JSON, schema 1) at <out>/<id>.toktape with the reply as the recorder keeps it (the completion, and the
+# streamed tokens with the reasoning ones flagged), and prints the summary. FAKE_TOKTAPE_MODE (comma-separated) bends the tape:
+# otherprompt, splitdiff (tokens that are not the completion), error (a request error, exit 0), two (two requests), schema2,
+# plain (not gzip'd); FAKE_TOKTAPE_RC ends it with that status and no tape; every call's argv is appended to FAKE_TOKTAPE_LOG.
+FAKE_TOKTAPE = r"""#!@PY@
+import gzip, http.client, json, os, re, sys, urllib.parse
+argv = sys.argv[1:]
+if os.environ.get("FAKE_TOKTAPE_LOG"):
+    with open(os.environ["FAKE_TOKTAPE_LOG"], "a") as f:
+        f.write(" ".join(argv) + "\n")
+def opt(name):
+    return argv[argv.index(name) + 1]
+modes = os.environ.get("FAKE_TOKTAPE_MODE", "").split(",")
+rc = int(os.environ.get("FAKE_TOKTAPE_RC") or 0)
+if rc:
+    print(json.dumps({"error": {"code": "streams"}}))
+    sys.exit(rc)
+prompt = json.loads(open(opt("--prompts")).readline())["prompt"]
+u = urllib.parse.urlsplit(opt("--url"))
+body = {"messages": [{"role": "user", "content": prompt}], "max_tokens": int(opt("-n")), "temperature": 0,
+        "stream": False, "chat_template_kwargs": {"enable_thinking": False}}
+try:
+    conn = http.client.HTTPConnection(u.hostname, u.port, timeout=30)
+    conn.request("POST", "/v1/chat/completions", json.dumps(body).encode(), {"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    status, raw = resp.status, resp.read()
+except (OSError, http.client.HTTPException):
+    print(json.dumps({"error": {"code": "unreachable"}}))
+    sys.exit(2)
+if status // 100 != 2:
+    print(json.dumps({"error": {"code": "streams"}}))
+    sys.exit(3)
+msg = json.loads(raw)["choices"][0]["message"]
+content, reasoning = msg.get("content") or "", msg.get("reasoning_content") or ""
+toks = [{"i": i, "text": w} for i, w in enumerate(re.findall(r"\S+\s*", content))]
+toks += [{"i": len(toks) + i, "text": w, "r": True} for i, w in enumerate(re.findall(r"\S+\s*", reasoning))]
+if "splitdiff" in modes:
+    toks.append({"i": len(toks), "text": " and more"})
+shown = "something else" if "otherprompt" in modes else prompt
+rec = {"index": 0, "prompt": {"messages": [{"role": "user", "content": shown}], "completion": content, "max_tokens": 128},
+       "tokens": toks, "timings": {"prompt_n": len(prompt.split())}}
+if "error" in modes:
+    rec["error"] = "stream cut"
+tape = {"schema": 2 if "schema2" in modes else 1, "summary": {}, "requests": [rec, rec] if "two" in modes else [rec]}
+run_id = opt("--tag") + "-" + str(os.getpid())
+os.makedirs(opt("--out"), exist_ok=True)
+data = json.dumps(tape).encode()
+with open(os.path.join(opt("--out"), run_id + ".toktape"), "wb") as f:
+    f.write(data if "plain" in modes else gzip.compress(data))
+print(json.dumps({"id": run_id, "timings": {"prompt_n": len(prompt.split())}}))
+"""
+
+
+def tape_run(main, stub_env=None, mode="", rc=0, extra=()):
+    """A session with --client toktape through the stand-in; its toktape calls are in `.calls`."""
+    d = scratch("pass-checks-tt.")
+    fake, log = d / "toktape", d / "argv"
+    fake.write_text(FAKE_TOKTAPE.replace("@PY@", sys.executable))
     fake.chmod(0o755)
-    extra = ["--client", "toktape", "--toktape-bin", str(fake), "--tag", "rel"]
-    p = []
-    r = Run(main, argv=extra)
-    p += verdicts(r, pass_short="PASS", pass_long="PASS", second_request_equals_first="PASS", tape_short="PASS",
-                  tape_long="PASS") + rc_problem(r, 0)
-    calls = log.read_text().splitlines() if log.exists() else []
-    if len(calls) != 2 or not all(
-            re.match(r"record --url http://127\.0\.0\.1:\d+ --temp 0 --no-think --endpoint chat -n 128 --for 0 "
-                     r"--wait 60s --host-label none --prompts \S+ --out \S+ --tag rel-(short|long) -o json --quiet$", c)
-            for c in calls):
-        p.append(f"toktape's argv is not the release pass's: {calls}")
-    if "prompt tokens" not in r.by.get("tape_long", ("", ""))[1]:
-        p.append("tape_long's detail reads no prompt count from toktape's summary")
-    os.environ["FAKE_TOKTAPE_RC"] = "3"
+    env = {"FAKE_TOKTAPE_LOG": str(log), "FAKE_TOKTAPE_MODE": mode, "FAKE_TOKTAPE_RC": str(rc)}
+    saved = {k: os.environ.get(k) for k in env}
+    os.environ.update(env)
     try:
-        r = Run(main, argv=extra)
+        r = Run(main, stub_env, argv=["--client", "toktape", "--toktape-bin", str(fake), "--tag", "rel", *extra])
     finally:
-        del os.environ["FAKE_TOKTAPE_RC"]
-    p += [f"rc 3: {x}" for x in verdicts(r, pass_short="PASS", tape_short="FAIL", tape_long="FAIL") + rc_problem(r, 1)]
-    if "toktape exit 3" not in r.by.get("tape_long", ("", ""))[1]:
-        p.append("tape_long's detail does not name toktape's exit status")
-    r = Run(main, {"STUB_SRV_TOKENIZE_N": "4061"}, argv=extra)
-    p += [f"4061: {x}" for x in verdicts(r, pass_long="FAIL", tape_short="PASS", tape_long="SKIP")]
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    r.calls = log.read_text().splitlines() if log.exists() else []
+    return r
+
+
+THREE = ["pass_short", "pass_long", "second_request_equals_first"]
+
+
+@case
+def toktape_client_checks_are_the_tapes(main):
+    r = tape_run(main, {"STUB_SRV_PLAN": "16384"})
+    p = verdicts(r, pass_short="PASS", pass_long="PASS", second_request_equals_first="PASS") + rc_problem(r, 0)
+    if r.order != THREE:
+        p.append(f"checks {r.order}: want the three, with no tape check of their own")
+    ch = r.chats()
+    if len(ch) != 3 or ch[0][2] != ch[2][2] or ch[0][2] == ch[1][2] or {c[1] for c in ch} != {"128"}:
+        p.append(f"the requests are not the three tapes' (short, long, the short again at 128 tokens, none of the check's own): {ch}")
+    flags = (r"record --url http://127\.0\.0\.1:\d+ --temp 0 --no-think --endpoint chat -n 128 --for 0 --wait 60s "
+             r"--host-label none --prompts \S+ --out \S+ --tag rel-%s -o json --quiet$")
+    if len(r.calls) != 3 or not all(re.match(flags % tag, c) for c, tag in zip(r.calls, ("short", "long", "short2"))):
+        p.append(f"toktape's argv is not the release pass's, short, long, short2: {r.calls}")
+    kept = sorted(f.name for f in (r.tmp / "out").iterdir())
+    want = sorted(["rel-short.json", "rel-long.json", "rel-short2.json", "rel-short.jsonl", "rel-long.jsonl",
+                   "rel-short2.jsonl", "tapes"])
+    if kept != want:
+        p.append(f"kept in --dir: {kept}, want {want}")
+    if len(list((r.tmp / "out" / "tapes").glob("*.toktape"))) != 3:
+        p.append("the three tapes are not in --dir/tapes")
+    detail = r.by.get("pass_long", ("", ""))[1]
+    if not re.match(r"\d+ prompt tokens, tape rel-long, \d+ prompt tokens evaluated, \d+ chars from content$", detail):
+        p.append(f"pass_long's detail does not name its tape and the tokens: {detail!r}")
+    r = tape_run(main, {"STUB_SRV_CHAT_MODE": "reasoning"}, mode="plain")
+    p += [f"reasoning, plain tape: {x}" for x in verdicts(r, pass_short="PASS", pass_long="PASS", second_request_equals_first="PASS")]
+    if "reasoning_content" not in r.by.get("pass_short", ("", ""))[1]:
+        p.append("a reasoning-only tape: pass_short's detail does not name reasoning_content")
+    for mode in ("empty", "null"):
+        r = tape_run(main, {"STUB_SRV_CHAT_MODE": mode})
+        p += [f"{mode}: {x}" for x in verdicts(r, pass_short="FAIL", pass_long="FAIL", second_request_equals_first="SKIP")
+              + rc_problem(r, 1)]
+    return p
+
+
+@case
+def toktape_client_failures_name_their_check(main):
+    p = []
+    r = tape_run(main, rc=3)
+    p += [f"toktape exit 3: {x}" for x in verdicts(r, pass_short="FAIL", pass_long="FAIL", second_request_equals_first="SKIP")
+          + rc_problem(r, 1)]
+    if "toktape exit 3" not in r.by.get("pass_long", ("", ""))[1]:
+        p.append("pass_long's detail does not name toktape's exit status")
+    r = tape_run(main, {"STUB_SRV_DRIFT": "1"})
+    p += [f"drift: {x}" for x in verdicts(r, pass_short="PASS", pass_long="PASS", second_request_equals_first="FAIL")
+          + rc_problem(r, 1)]
+    r = tape_run(main, {"STUB_SRV_FAIL_AT": "3"})
+    p += [f"500 at the replay: {x}" for x in verdicts(r, pass_short="PASS", pass_long="PASS", second_request_equals_first="FAIL")
+          + rc_problem(r, 1)]
+    if "toktape exit 3" not in r.by.get("second_request_equals_first", ("", ""))[1]:
+        p.append("500 at the replay: the detail does not name toktape's exit status")
+    r = tape_run(main, {"STUB_SRV_TOKENIZE_N": "4061"})
+    p += [f"4061: {x}" for x in verdicts(r, pass_short="PASS", pass_long="FAIL", second_request_equals_first="PASS")
+          + rc_problem(r, 1)]
+    if len(r.calls) != 2 or len(r.chats()) != 2:
+        p.append(f"4061: the long prompt was recorded anyway: {len(r.calls)} toktape calls, {len(r.chats())} chat requests, want 2")
+    r = tape_run(main, {"STUB_SRV_DIE_AT": "2"})
+    p += [f"dead at the long one: {x}" for x in verdicts(r, pass_short="PASS", pass_long="FAIL",
+                                                         second_request_equals_first="SKIP", off_reason="PASS")
+          + rc_problem(r, 1)]
+    if "engine fault at request 2" not in r.by.get("second_request_equals_first", ("", ""))[1]:
+        p.append("dead at the long one: the skip does not name the server's last words")
+    return p
+
+
+@case
+def toktape_tape_of_another_shape_fails(main):
+    p = []
+    for mode, word in (("otherprompt", "another prompt"), ("splitdiff", "streamed tokens"), ("error", "request failed"),
+                       ("two", "2 requests"), ("schema2", "schema")):
+        r = tape_run(main, mode=mode)
+        p += [f"{mode}: {x}" for x in verdicts(r, pass_short="FAIL") + rc_problem(r, 1)]
+        if word not in r.by.get("pass_short", ("", ""))[1]:
+            p.append(f"{mode}: pass_short's detail does not say '{word}': {r.by.get('pass_short')}")
     return p
 
 
@@ -752,6 +936,22 @@ MUTANTS = (
     ("takes a record for the refusal", (("not BANNER.match(line) and not is_rec(line)", "not BANNER.match(line)", 1),), "off-reason-command-reads-the-refusal"),
     ("compares no text", (("if text != want:", "if False:", 1),), "a-replay-that-differs-fails"),
     ("ends 0 on a FAIL", (("rc = 1 if self.fails else 0", "rc = 0", 1),), "second-request-500"),
+    ("sends the long prompt itself as well as recording it",
+     (('text, field, evaluated, name = self.record("long", "", prompt)',
+       'self.post_chat("pass_long", chat_body(prompt, self.a.max_tokens))\n            '
+       'text, field, evaluated, name = self.record("long", "", prompt)', 1),),
+     "toktape-client-checks-are-the-tapes"),
+    ("takes a tape of another prompt", (("if sent != prompt:", "if False:", 1),), "toktape-tape-of-another-shape-fails"),
+    ("trusts the completion over the tokens", (("if completion != streamed:", "if False:", 1),),
+     "toktape-tape-of-another-shape-fails"),
+    ("ignores the error of a tape's request", (('if rec.get("error"):', "if False:", 1),),
+     "toktape-tape-of-another-shape-fails"),
+    ("takes a tape of any number of requests", (("if len(reqs) != 1:", "if False:", 1),),
+     "toktape-tape-of-another-shape-fails"),
+    ("reads a tape of any schema", (('or obj.get("schema") != TAPE_SCHEMA:', ":", 1),),
+     "toktape-tape-of-another-shape-fails"),
+    ("passes a toktape that ended other than 0", (("if r.returncode != 0:", "if False:", 1),),
+     "toktape-client-failures-name-their-check"),
 )
 
 

@@ -2,18 +2,18 @@
 # The release sitting: every cell of a release's table timed and checked on one binary, in one hold.
 #
 #   tools/release/sitting.sh --cells FILE --binary tree|portable [--tarball PATH] [--version V] [--tree NAME]
-#                            [--out FILE] [--hold-owner NAME] [--keep-going] [--resume VERDICT [--only I,J]] [--dry-run]
+#                            [--out FILE] [--hold-owner NAME] [--keep-going] [--fold off|depths] [--resume VERDICT [--only I,J]] [--dry-run]
 #   tools/release/sitting.sh --self-test    (stub depth-serve and checks, no box, no card; check-recipes runs it)
 #
 # Runs on the box (`just release-sitting`). A cell is a model file served by `bloomery-serve` at the serving defaults
-# on a card set: its timed arms are tools/ref/depth-serve.sh's (one fresh server a depth and a round, the headline
-# rows), and on round 1's last server its functional phase is tools/release/pass_checks.py (DEPTH_SERVE_AFTER: after
+# on a card set: its timed arms are tools/ref/depth-serve.sh's (one fresh server a round and cell, serving every depth of the
+# cell one after the other under --fold depths, else one a depth and a round; the headline rows), and on round 1's last server its functional phase is tools/release/pass_checks.py (DEPTH_SERVE_AFTER: after
 # that server's timed request, under the lease, so its tapes carry a witness). The sitting is the one place a
 # release's numbers and its first-request checks meet, on the binary the release ships.
 #
 # The cells file. Tab-separated, a header line first (blank lines and `#` lines are skipped):
 #
-#   file/profile  place  cards  ctx  D  checks  [load_s  pp  tg]
+#   file/profile  place  cards  ctx  D  checks  [load_s  pp  tg  fold]
 #
 #   file/profile  `<profile>` (tools/ref/models/<profile>.sh) or `<profile>=<model path>` (BLOOMERY_REF_MODEL for the cell)
 #   place         a | bp | -   (`-`: the placement rule's own pick; bp needs `both`)
@@ -22,13 +22,22 @@
 #   D             the timed prompt lengths, comma-separated (512,4096): one arm each
 #   checks        pass_checks.py's arguments for round 1's functional phase, or `-` for none (a timed-only cell)
 #   load_s pp tg  optional: seconds a load takes and the cell's prompt and decode tok/s, for the predicted wall only
+#   fold          optional (needs the three before it, which may be empty): off | depths | empty (the sitting's --fold). A cell
+#                 whose numbers a shared server would change keeps its depths on servers of their own with `off`
 #
 # Order. The cells sit family-major: every cell of one file/profile together, `bp` before `a` before `-` inside it,
 # otherwise in file order. Round 1 runs them in that order, one depth-serve call a cell with BLOOMERY_AB_ROUNDS=1 and
 # the hook; round 2 runs them in the reverse order, each cell's arms rotated by one place (depth-serve's rule for
 # round 2), with no hook: no functional request ever precedes a timed one on a server. A red cell ends the sitting
 # there (the cells and rounds left are named, not run) because the binary is about to change; --keep-going runs the
-# round's other cells anyway and still skips round 2 after a red round 1.
+# round's other cells anyway, and round 2 then runs the cells whose round 1 was green and names the others not run: a red
+# cell costs its own two runs, which a --resume re-runs.
+#
+# Fold. --fold depths (the default) gives depth-serve DEPTH_SERVE_FOLD=depths: a cell's round has one server for all its depths
+# (the first request of a server is a fresh server's; each later one ends ` [shared]` in its ROW and the means print a fold audit
+# of shared against first), so a cell loads twice, not once a depth and round. --fold off is one fresh server a depth and a
+# round. The fold is part of the cell (a cell line ends fold=<mode>, and a --resume of another fold is refused), and the
+# verdict's header names it. A server's round 2 is always its own: round 1's carries the checks.
 #
 # Red. A cell's run is red when its depth-serve call exits other than 0, prints fewer ROW lines than the cell has
 # arms, tags a row [cpu-busy] (a co-tenant voided it), or, with checks, has no HOOK line of rc 0 and a SESSION line, or
@@ -146,7 +155,7 @@ member_sha() {
 
 # cells_py <records|text> <cells file> <stage>: the cells file validated (rc 64, each fault named with its line),
 # then `records` prints one US-separated line a cell in round 1's order (family-major) —
-#   C idx profile path place cards ctx deps checks load_s pp tg
+#   C idx profile path place cards ctx deps checks load_s pp tg fold
 # — and `text` the plan and the predicted wall for a person.
 cells_py() {
   python3 -I - "$@" << 'PY'
@@ -155,9 +164,10 @@ import re
 import sys
 
 mode, path, stage = sys.argv[1:4]
+default_fold = os.environ.get("SITTING_FOLD", "off")
 US = "\037"
 HEADER = ["file/profile", "place", "cards", "ctx", "D", "checks"]
-OPTIONAL = ["load_s", "pp", "tg"]
+OPTIONAL = ["load_s", "pp", "tg", "fold"]
 PLACE_RANK = {"bp": 0, "a": 1, "-": 2}
 LONG_TOKENS = 5855
 CHAT_TOKENS = 128
@@ -218,7 +228,9 @@ for line, text in rows[1:]:
         fail(line, f"D names a depth twice: '{deps}'")
     if not checks.strip() or "\n" in checks:
         fail(line, "checks is pass_checks.py's arguments or `-`")
-    load_s, pp, tg = opt
+    load_s, pp, tg, fold = opt
+    if fold not in ("", "off", "depths"):
+        fail(line, f"fold is off or depths (empty: the sitting's --fold), got '{fold}'")
     if load_s:
         positive(load_s, "load_s", line)
     if pp:
@@ -226,7 +238,8 @@ for line, text in rows[1:]:
     if tg:
         positive(tg, "tg", line, float)
     cells.append(dict(idx=len(cells) + 1, line=line, prof=prof, profile=profile, path=mpath, place=place,
-                      cards=cards, ctx=ctx, deps=deps, checks=checks, load_s=load_s, pp=pp, tg=tg))
+                      cards=cards, ctx=ctx, deps=deps, checks=checks, load_s=load_s, pp=pp, tg=tg,
+                      fold=fold or default_fold))
 if not cells:
     fail(hline, "no cell: the header is the only line")
 
@@ -238,7 +251,7 @@ order = sorted(cells, key=lambda c: (first[c["prof"]], PLACE_RANK[c["place"]], c
 if mode == "records":
     for c in order:
         print(US.join(["C", str(c["idx"]), c["profile"], c["path"], c["place"], c["cards"], c["ctx"], c["deps"],
-                       c["checks"], c["load_s"], c["pp"], c["tg"]]))
+                       c["checks"], c["load_s"], c["pp"], c["tg"], c["fold"]]))
     sys.exit(0)
 
 overhead = int(os.environ["SITTING_OVERHEAD_S"])
@@ -250,7 +263,12 @@ unpriced = []
 
 def show(c, tag):
     return (f"{tag} cell {c['idx']}: {c['prof']} place={c['place']} cards={c['cards']} ctx={c['ctx'] or 'unset'} "
-            f"D={c['deps']} checks={c['checks']}")
+            f"D={c['deps']} checks={c['checks']} fold={c['fold']}")
+
+
+def servers_of(c, fold):
+    """Servers a cell loads over both rounds: one a depth and round, or (fold depths) one a round."""
+    return 2 if fold == "depths" else 2 * len(c["deps"].split(","))
 
 
 print(f"[plan] sitting: stage={stage} cells={len(cells)} file={path}")
@@ -260,9 +278,12 @@ for k, c in enumerate(order, 1):
 print("[plan] round 2 (the reverse order; each cell's arms rotated by one; no hook):")
 for k, c in enumerate(reversed(order), 1):
     print("[plan]   " + show(c, f"{k}."))
+loads = sum(servers_of(c, c["fold"]) for c in cells)
+loads_off = sum(servers_of(c, "off") for c in cells)
+print(f"[plan] loads: {loads} servers (a cell with fold=depths loads one a round for all its depths; {loads_off} with every cell's fold off)")
 for c in cells:
     deps = [int(d) for d in c["deps"].split(",")]
-    servers = 2 * len(deps)
+    servers = servers_of(c, c["fold"])
     total += servers * overhead
     load = c["load_s"] or est
     if load:
@@ -273,16 +294,13 @@ for c in cells:
         pp, tg = float(c["pp"]), float(c["tg"])
         total += 2 * sum(d / pp + (n_predict - 1) / tg for d in deps)
         if c["checks"] != "-":
-            func = LONG_TOKENS / pp + 3 * CHAT_TOKENS / tg
-            if "--client toktape" in c["checks"]:
-                func *= 2
-            total += func
+            total += LONG_TOKENS / pp + 3 * CHAT_TOKENS / tg
     else:
         unpriced.append(f"cell {c['idx']} requests" + (" and checks" if c["checks"] != "-" else "") + " (no pp and tg)")
 bound = ">=" if unpriced else "="
-print(f"[plan] predicted wall {bound} {total:.0f} s (~{total / 60:.0f} min) [derived per cell: 2 rounds x D arms servers x "
+print(f"[plan] predicted wall {bound} {total:.0f} s (~{total / 60:.0f} min) [derived per cell: {loads} servers x "
       f"(load + {overhead} s overhead) + 2 x sum(D/pp + (N-1)/tg), N={n_predict}"
-      f" + the checks (long prompt {LONG_TOKENS} tokens/pp + 3 x {CHAT_TOKENS}/tg, doubled by --client toktape's tapes);"
+      f" + the checks (long prompt {LONG_TOKENS} tokens/pp + 3 x {CHAT_TOKENS}/tg; a toktape client's own prefill probe a request is not priced);"
       f" the load, pp and tg from the cells file]")
 if unpriced:
     print("[plan] unpriced (a lower bound): " + "; ".join(unpriced))
@@ -290,12 +308,12 @@ PY
 }
 
 usage() {
-  echo "usage: tools/release/sitting.sh --cells FILE --binary tree|portable [--tarball PATH] [--version V] [--tree NAME] [--out FILE] [--hold-owner NAME] [--keep-going] [--resume VERDICT [--only I,J]] [--dry-run] | --self-test" >&2
+  echo "usage: tools/release/sitting.sh --cells FILE --binary tree|portable [--tarball PATH] [--version V] [--tree NAME] [--out FILE] [--hold-owner NAME] [--keep-going] [--fold off|depths] [--resume VERDICT [--only I,J]] [--dry-run] | --self-test" >&2
 }
 
 # ---- the run ---------------------------------------------------------------------------------------------------------
 
-STAGE='' CELLS='' TARBALL='' VERSION='' TREE='' OUT='' OWNER='' KEEP=0 DRY=0
+STAGE='' CELLS='' TARBALL='' VERSION='' TREE='' OUT='' OWNER='' KEEP=0 DRY=0 FOLD=depths
 WORK='' HOLD_FILE='' FINISHED='' RESULT=red REASON='the sitting ended before its last run' STARTED=''
 BIN='' BIN_SHA='' BIN_VERSION='' TB_SHA='' TB_MEMBER='' TB_MEMBER_SHA='' GPU_3090='' CARDS_ERROR='' DS='' CHECKS_RUN='' CHECKS_PY=''
 CELLREC=() REDS=() NOTRUN=()
@@ -584,13 +602,13 @@ finish() {
 # price the predicted wall in the python plan and are not read here).
 cell_fields() {
   local tag
-  IFS=$US read -r tag CF_IDX CF_PROFILE CF_PATH CF_PLACE CF_CARDS CF_CTX CF_DEPS CF_CHECKS _ _ _ <<< "$1"
+  IFS=$US read -r tag CF_IDX CF_PROFILE CF_PATH CF_PLACE CF_CARDS CF_CTX CF_DEPS CF_CHECKS _ _ _ CF_FOLD <<< "$1"
 }
 
 # cell_text <record>: one line naming the cell.
 cell_text() {
   cell_fields "$1"
-  echo "cell $CF_IDX: $CF_PROFILE${CF_PATH:+=$CF_PATH} place=$CF_PLACE cards=$CF_CARDS ctx=${CF_CTX:-unset} D=$CF_DEPS checks=$CF_CHECKS"
+  echo "cell $CF_IDX: $CF_PROFILE${CF_PATH:+=$CF_PATH} place=$CF_PLACE cards=$CF_CARDS ctx=${CF_CTX:-unset} D=$CF_DEPS checks=$CF_CHECKS fold=$CF_FOLD"
 }
 
 # call_bound <arms>: SITTING_CALL_BOUND, else the call's arms x (arm bound + the memory wait, the plan probe's share
@@ -659,7 +677,8 @@ run_cell() {
   done
   envv=(-u BLOOMERY_REF_MODEL -u BLOOMERY_REF_MODEL_PROFILE -u DEPTH_SERVE_CTX -u DEPTH_SERVE_PLACE -u DEPTH_SERVE_TARBALL
     -u DEPTH_SERVE_AFTER -u DEPTH_SERVE_MEM_BASELINE -u BLOOMERY_TIMING_GPU -u BLOOMERY_TIMING_CARDS -u BLOOMERY_DRY
-    "BLOOMERY_MODEL=$CF_PROFILE" BLOOMERY_AB_ROUNDS=1 "DEPTH_SERVE_MEM_BASELINE=$MEMBASE" "TMPDIR=$dir/tmp")
+    "BLOOMERY_MODEL=$CF_PROFILE" BLOOMERY_AB_ROUNDS=1 "DEPTH_SERVE_MEM_BASELINE=$MEMBASE" "DEPTH_SERVE_FOLD=$CF_FOLD"
+    "TMPDIR=$dir/tmp")
   [ -z "$CF_PATH" ] || envv+=("BLOOMERY_REF_MODEL=$CF_PATH")
   [ "$CF_PLACE" = - ] || envv+=("DEPTH_SERVE_PLACE=$CF_PLACE")
   [ -z "$CF_CTX" ] || envv+=("DEPTH_SERVE_CTX=$CF_CTX")
@@ -730,9 +749,63 @@ write_blocks() {
   done
 }
 
+# fold_audit: the fold's own term over the whole sitting. A row ending [shared] followed another request on its server; for each
+# cell and depth with both kinds of warm row ([cold] rows out) it is set against the first request's, in percent of the first, and
+# the pairs are pooled (the mean and its 95 % interval over pairs: card.py's t table, n - 1 degrees of freedom). One pair has no
+# spread, but a sitting has a pair for every depth of every folded cell, and the cells are independent loads. Prints nothing when
+# no row of the sitting is shared.
+fold_audit() {
+  python3 -I - "$HERE/card.py" "$WORK" << 'PY'
+import glob
+import importlib.util
+import math
+import re
+import statistics
+import sys
+
+spec = importlib.util.spec_from_file_location('card', sys.argv[1])
+card = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(card)
+ROW = re.compile(r'^ROW r\d+ \S+ D=(\d+) \| tg_tok/s (\S+) \| pp_tok/s (\S+) \| load_s \d+ \| majflt \d+(.*)$')
+rows = {}
+for path in sorted(glob.glob(sys.argv[2] + '/block-r*-c*.txt')):
+    idx = int(re.search(r'-c(\d+)\.txt$', path).group(1))
+    for line in open(path, errors='replace'):
+        m = ROW.match(line.rstrip('\n'))
+        if not m or '[cold]' in m.group(4):
+            continue
+        kind = 'shared' if '[shared]' in m.group(4) else 'first'
+        rows.setdefault((idx, int(m.group(1))), {'first': [], 'shared': []})[kind].append((float(m.group(2)), float(m.group(3))))
+if not any(d['shared'] for d in rows.values()):
+    sys.exit(0)
+print('== fold audit over the sitting: a [shared] row followed another request on its server; per cell and depth, shared against first, % of first, [cold] rows out')
+pairs = []
+for (idx, dep), d in sorted(rows.items()):
+    if not d['shared']:
+        continue
+    if not d['first']:
+        print(f'fold cell {idx} D={dep} | no pair: every warm row of the arm is [shared]')
+        continue
+    pct = [100 * (statistics.mean(x[k] for x in d['shared']) / statistics.mean(x[k] for x in d['first']) - 1) for k in (0, 1)]
+    pairs.append(pct)
+    print(f'fold cell {idx} D={dep} | tg {pct[0]:+.2f} % | pp {pct[1]:+.2f} %')
+if len(pairs) < 2:
+    print(f'fold pooled over {len(pairs)} pair(s): no interval')
+    sys.exit(0)
+t975 = card.t_table()
+parts = []
+for k, name in enumerate(('tg', 'pp')):
+    xs = [p[k] for p in pairs]
+    m, sd = statistics.mean(xs), statistics.stdev(xs)
+    h = t975(len(xs) - 1) * sd / math.sqrt(len(xs))
+    parts.append(f'{name} {m:+.2f} % ± {h:.2f} % (sd {sd:.2f} %) [{"clears 0" if abs(m) > h else "holds 0"}]')
+print(f'fold pooled over {len(pairs)} pairs | ' + ' | '.join(parts))
+PY
+}
+
 # write_verdict: the verdict file from the state so far.
 write_verdict() {
-  local tmp=$OUT.tmp rec b rows r
+  local tmp=$OUT.tmp rec b rows r audit
   FINISHED=1
   {
     echo "sitting-verdict 1"
@@ -752,6 +825,7 @@ write_verdict() {
     echo "hold_owner=$OWNER"
     echo "work=$WORK"
     echo "keep_going=$KEEP"
+    echo "fold=$FOLD"
     echo "started=$STARTED"
     echo "finished=$(now)"
     if [ -n "$RESUME" ]; then
@@ -780,6 +854,11 @@ write_verdict() {
       echo "== cell $CF_IDX means over its rows"
       bash "$REAL_DS" --summary "$rows" 2>&1 || echo "(depth-serve.sh --summary exited $?)"
     done
+    audit=$(fold_audit 2>&1) || audit="(the fold audit exited $?: $audit)"
+    if [ -n "$audit" ]; then
+      echo
+      echo "$audit"
+    fi
   } > "$tmp" && mv "$tmp" "$OUT" || echo "sitting.sh: cannot write the verdict $OUT" >&2
 }
 
@@ -877,7 +956,7 @@ resume_load() {
   done
   exp=$(for rec in "${CELLREC[@]}"; do cell_text "$rec"; done | sort)
   have=$(printf '%s\n' ${RV_CELLS[@]+"${RV_CELLS[@]}"} | sort)
-  [ "$have" = "$exp" ] || die 64 "the cells of $RESUME are not this cells file's: a verdict is resumed with the cells file it was run with"
+  [ "$have" = "$exp" ] || die 64 "the cells of $RESUME are not this cells file's: a verdict is resumed with the cells file it was run with, and the --fold it was run with (a cell line ends fold=<mode>)"
   if [ -n "$ONLY" ]; then
     ONLYSET=,
     IFS=, read -r -a parts <<< "$ONLY"
@@ -990,6 +1069,30 @@ run_round() {
   done
 }
 
+# round1_green <cell idx>: 0 when round 1 of the cell has a block and it is green.
+round1_green() {
+  local b=$WORK/block-r1-c$1.txt
+  [ -s "$b" ] && head -n 1 "$b" | grep -q ' result=green'
+}
+
+# round2_cells <record>...: R2SEL, the cells round 2 runs, in the order given. Under --keep-going a cell whose round 1 was not green is
+# left out and named in NOTRUN: its own two runs are what a --resume re-runs, and the cells whose round 1 was green keep their round 2.
+R2SEL=()
+round2_cells() {
+  local rec skipped=''
+  R2SEL=()
+  for rec in "$@"; do
+    cell_fields "$rec"
+    if round1_green "$CF_IDX"; then
+      R2SEL+=("$rec")
+    else
+      NOTRUN+=("round 2 cell $CF_IDX not run: its round 1 was red or not run, so its rows are not one binary's (--resume re-runs it)")
+      skipped="$skipped${skipped:+,}$CF_IDX"
+    fi
+  done
+  [ -z "$skipped" ] || echo "[sitting] round 2 leaves out cell(s) $skipped: their round 1 was not green"
+}
+
 main() {
   local arg i rec rev=() total
 
@@ -1013,6 +1116,14 @@ main() {
         ;;
       --keep-going) KEEP=1; shift ;;
       --dry-run) DRY=1; shift ;;
+      --fold)
+        [ $# -ge 2 ] || { usage; die 64 "--fold needs a value"; }
+        case $2 in
+          off | depths) FOLD=$2 ;;
+          *) usage; die 64 "--fold is off or depths, got '$2'" ;;
+        esac
+        shift 2
+        ;;
       *) usage; die 64 "unknown argument '$arg'" ;;
     esac
   done
@@ -1047,6 +1158,7 @@ main() {
   case $OUT in /*) ;; *) OUT=$PWD/$OUT ;; esac
   case $RESUME in '' | /*) ;; *) RESUME=$PWD/$RESUME ;; esac
 
+  export SITTING_FOLD=$FOLD
   SITTING_OVERHEAD_S=$(sed -n 's/^OVERHEAD_S=\([0-9][0-9]*\)$/\1/p' "$REAL_DS" | head -n1)
   [ -n "$SITTING_OVERHEAD_S" ] || die 2 "tools/ref/depth-serve.sh has no OVERHEAD_S=<seconds> line to price a server's overhead from"
   export SITTING_OVERHEAD_S
@@ -1149,13 +1261,12 @@ main() {
   else
     run_round 1 "${CELLREC[@]}"
   fi
-  if [ "$ROUND_RED" = 1 ]; then
+  if [ "$ROUND_RED" = 1 ] && [ "$KEEP" = 0 ]; then
     NOTRUN+=("round 2 skipped: round 1 had a red cell, so the binary changes and round 2's rows would not be its")
     echo "[sitting] round 2 skipped: round 1 had a red cell, so the binary changes"
-  elif [ -n "$RESUME" ]; then
-    run_round 2 ${SEL2[@]+"${SEL2[@]}"}
   else
-    run_round 2 "${rev[@]}"
+    if [ -n "$RESUME" ]; then round2_cells ${SEL2[@]+"${SEL2[@]}"}; else round2_cells "${rev[@]}"; fi
+    run_round 2 ${R2SEL[@]+"${R2SEL[@]}"}
   fi
   [ -z "$RESUME" ] || merge_state
 
@@ -1185,7 +1296,7 @@ st_stubs() {
 # The self-test's depth-serve.sh: what it was given goes to $STUB_CALLS, and it prints a call's lines (the hook's before
 # the last arm's row, one ROW an arm). The profile's name picks a fault: red* fails, slow* waits for $STUB_RELEASE, drift*
 # prints another context on its second call, busy* tags a row, short* prints one row, nohook* never runs the hook, flaky* is red on
-# its first call only. Each call line names the box hold, the GPU hold (with the cards it names) and the baseline it was given.
+# its first call only. Under DEPTH_SERVE_FOLD=depths every row after the first ends [shared] and reads 19 tok/s against 20. Each call line names the box hold, the GPU hold (with the cards it names) and the baseline it was given.
 set -u
 prof=$BLOOMERY_MODEL
 n=$(cat "$STUB_COUNT.$prof" 2> /dev/null || echo 0)
@@ -1197,7 +1308,7 @@ gpuhold=down
 [ ! -e "$STUB_GPUHOLD" ] || gpuhold=up:$(sed -n 's/.* cards=\([^ ]*\) .*/\1/p' "$STUB_GPUHOLD")
 after=unset
 [ -z "${DEPTH_SERVE_AFTER:-}" ] || after=set
-echo "call profile=$prof ref=${BLOOMERY_REF_MODEL-unset} refprof=${BLOOMERY_REF_MODEL_PROFILE-unset} place=${DEPTH_SERVE_PLACE-unset} ctx=${DEPTH_SERVE_CTX-unset} cards=${BLOOMERY_TIMING_CARDS-unset} gpu=${BLOOMERY_TIMING_GPU-unset} tarball=${DEPTH_SERVE_TARBALL-unset} after=$after rounds=${BLOOMERY_AB_ROUNDS-unset} userplan=${DEPTH_SERVE_USER_PLAN-unset} hold=$hold gpuhold=$gpuhold membase=${DEPTH_SERVE_MEM_BASELINE-unset} arms=$*" >> "$STUB_CALLS"
+echo "call profile=$prof ref=${BLOOMERY_REF_MODEL-unset} refprof=${BLOOMERY_REF_MODEL_PROFILE-unset} place=${DEPTH_SERVE_PLACE-unset} ctx=${DEPTH_SERVE_CTX-unset} cards=${BLOOMERY_TIMING_CARDS-unset} gpu=${BLOOMERY_TIMING_GPU-unset} tarball=${DEPTH_SERVE_TARBALL-unset} after=$after rounds=${BLOOMERY_AB_ROUNDS-unset} userplan=${DEPTH_SERVE_USER_PLAN-unset} hold=$hold gpuhold=$gpuhold membase=${DEPTH_SERVE_MEM_BASELINE-unset} fold=${DEPTH_SERVE_FOLD-unset} arms=$*" >> "$STUB_CALLS"
 case $prof in
   red*)
     echo "FAIL r1 ${1%%:*} D=${1#*:}: the stub's server did not answer" >&2
@@ -1239,7 +1350,12 @@ for arm in "$@"; do
     echo "HOOK r1 $label D=$d rc=$rc"
     [ "$rc" = 0 ] || fail=1
   fi
-  echo "ROW r1 $label D=$d | tg_tok/s 20.00 | pp_tok/s 100.00 | load_s 5 | majflt 0$tag"
+  tg=20.00
+  if [ "${DEPTH_SERVE_FOLD:-off}" = depths ] && [ "$k" -gt 1 ]; then
+    tag="$tag [shared]"
+    tg=19.00
+  fi
+  echo "ROW r1 $label D=$d | tg_tok/s $tg | pp_tok/s 100.00 | load_s 5 | majflt 0$tag"
 done
 exit "$fail"
 STUB
@@ -1460,8 +1576,11 @@ case_keepgoing() {
   # shellcheck disable=SC2046
   st_run $(portable) --keep-going
   want_rc 1
-  calls_seq "$CALL_PROF" 'ok1 red1 ok2'
-  want_out 'round 2 skipped'
+  calls_seq "$CALL_PROF" 'ok1 red1 ok2 ok2 ok1'
+  want_out 'round 2 leaves out cell(s) 2: their round 1 was not green'
+  want_v 'round 2 cell 2 not run'
+  want_v '== round 2 cell 1 rc=0 result=green'
+  want_v '== round 2 cell 3 rc=0 result=green'
   [ -z "$WHY" ]
 }
 
@@ -1469,7 +1588,7 @@ case_verdict() {
   st_case "verdict$SUF"
   { echo "$HDR"; echo 'pa=/m/a.gguf|a|3090||512,4096|--stub-pass'; } | st_cells
   # shellcheck disable=SC2046
-  st_run $(portable) --version 0.0.0
+  st_run $(portable) --version 0.0.0 --fold off
   want_rc 0
   local sha lab=stubtree@portable/place=a/ctx=16384
   sha=$(sha256_of "$C/home/repo/stubtree/target/portable/release/bloomery-serve")
@@ -1703,7 +1822,7 @@ case_dry() {
   want_out 'round 1 (family-major'
   want_out 'round 2 (the reverse order'
   want_out '[plan]   1. cell 1: pa=/m/a.gguf place=a cards=3090'
-  want_out 'predicted wall = 584 s (~10 min)'
+  want_out 'predicted wall = 399 s (~7 min)'
   want_out '[dry] no hold up, no call, no verdict'
   no_calls
   no_hold
@@ -1759,9 +1878,9 @@ case_env() {
   # shellcheck disable=SC2046
   st_run $(portable)
   want_rc 0
-  calls_seq '1s/ arms=.*//p' 'call profile=pa ref=/m/a.gguf refprof=unset place=unset ctx=unset cards=a6000+3090 gpu=unset tarball='"$C"'/tb/'"$TBN"'.tar.gz after=unset rounds=1 userplan=unset hold=up gpuhold=up:3090,a6000 membase=GPU-bbbb=100,GPU-aaaa=100'
-  calls_seq '2s/ arms=.*//p' 'call profile=pb ref=unset refprof=unset place=a ctx=4300 cards=unset gpu=GPU-bbbb tarball='"$C"'/tb/'"$TBN"'.tar.gz after=unset rounds=1 userplan=note hold=up gpuhold=up:3090,a6000 membase=GPU-bbbb=100,GPU-aaaa=100'
-  calls_seq '3s/ arms=.*//p' 'call profile=pc ref=unset refprof=unset place=a ctx=unset cards=unset gpu=unset tarball='"$C"'/tb/'"$TBN"'.tar.gz after=unset rounds=1 userplan=note hold=up gpuhold=up:3090,a6000 membase=GPU-bbbb=100,GPU-aaaa=100'
+  calls_seq '1s/ arms=.*//p' 'call profile=pa ref=/m/a.gguf refprof=unset place=unset ctx=unset cards=a6000+3090 gpu=unset tarball='"$C"'/tb/'"$TBN"'.tar.gz after=unset rounds=1 userplan=unset hold=up gpuhold=up:3090,a6000 membase=GPU-bbbb=100,GPU-aaaa=100 fold=depths'
+  calls_seq '2s/ arms=.*//p' 'call profile=pb ref=unset refprof=unset place=a ctx=4300 cards=unset gpu=GPU-bbbb tarball='"$C"'/tb/'"$TBN"'.tar.gz after=unset rounds=1 userplan=note hold=up gpuhold=up:3090,a6000 membase=GPU-bbbb=100,GPU-aaaa=100 fold=depths'
+  calls_seq '3s/ arms=.*//p' 'call profile=pc ref=unset refprof=unset place=a ctx=unset cards=unset gpu=unset tarball='"$C"'/tb/'"$TBN"'.tar.gz after=unset rounds=1 userplan=note hold=up gpuhold=up:3090,a6000 membase=GPU-bbbb=100,GPU-aaaa=100 fold=depths'
   [ -z "$WHY" ]
 }
 
@@ -1775,6 +1894,52 @@ case_drift() {
   # round 2 runs the reverse order, so the red drift1 is its first cell and okz is not run
   calls_seq "$CALL_PROF" 'okz drift1 drift1'
   want_v 'round 2 cell 1 not run'
+  [ -z "$WHY" ]
+}
+
+# The fold: the sitting's --fold is every cell's DEPTH_SERVE_FOLD unless the cell's own fold column says otherwise; the plan prices
+# the loads either way, the verdict names the fold, and a bad value is refused by name.
+case_fold() {
+  st_case "fold$SUF"
+  local hdr='file/profile|place|cards|ctx|D|checks|load_s|pp|tg|fold'
+  { echo "$hdr"; echo 'fa|bp|both||512,4096|-||||'; echo 'fb|a|3090||512,4096|-||||off'; echo 'fc|a|3090||512,4096|-||||depths'; } | st_cells
+  # shellcheck disable=SC2046
+  st_run $(portable)
+  want_rc 0
+  calls_seq 's/.* fold=\([^ ]*\) .*/\1/p' 'depths off depths depths off depths'
+  grep -qx 'fold=depths' "$C/v.sitting" || fault "the verdict's header lacks fold=depths"
+  want_v 'cell 2: fb place=a cards=3090 ctx=unset D=512,4096 checks=- fold=off'
+  want_v '== fold audit over the sitting'
+  want_v 'fold cell 1 D=512 | tg -5.00 % | pp +0.00 %'
+  want_v 'fold pooled over 4 pairs | tg -5.00 % ± 0.00 % (sd 0.00 %) [clears 0] | pp +0.00 % ± 0.00 % (sd 0.00 %) [holds 0]'
+  grep -q 'fold cell 2 ' "$C/v.sitting" && fault "a cell with fold=off is in the fold audit"
+  st_fresh
+  # shellcheck disable=SC2046
+  st_run $(portable) --fold off
+  want_rc 0
+  calls_seq 's/.* fold=\([^ ]*\) .*/\1/p' 'off off depths depths off off'
+  grep -qx 'fold=off' "$C/v.sitting" || fault "the verdict's header lacks fold=off"
+  want_v 'cell 1: fa place=bp cards=both ctx=unset D=512,4096 checks=- fold=off'
+  want_v 'cell 3: fc place=a cards=3090 ctx=unset D=512,4096 checks=- fold=depths'
+  want_v 'fold pooled over 2 pairs'
+  grep -q 'fold cell 1 ' "$C/v.sitting" && fault "a cell under --fold off is in the fold audit"
+  # the plan: 8 loads with the default fold (fa 2, fb 4, fc 2), 12 with every fold off, and 10 under --fold off (fc's own stays)
+  # shellcheck disable=SC2046
+  st_run $(portable) --dry-run
+  want_rc 0
+  want_out '[plan] loads: 8 servers (a cell with fold=depths loads one a round for all its depths; 12 with every cell'"'"'s fold off)'
+  # shellcheck disable=SC2046
+  st_run $(portable) --dry-run --fold off
+  want_out '[plan] loads: 10 servers'
+  # shellcheck disable=SC2046
+  st_run $(portable) --fold sometimes
+  want_rc 64
+  want_out "--fold is off or depths, got 'sometimes'"
+  { echo "$hdr"; echo 'fa|bp|both||512|-||||maybe'; } | st_cells
+  # shellcheck disable=SC2046
+  st_run $(portable)
+  want_rc 64
+  want_out "fold is off or depths (empty: the sitting's --fold), got 'maybe'"
   [ -z "$WHY" ]
 }
 
@@ -2053,37 +2218,41 @@ case_resume() {
   st_case "resume$SUF"
   local p1 p2 first
   { echo "$HDR"; echo 'ok1|bp|both||512|--stub-pass'; echo 'flaky1|bp|both||512|-'; echo 'ok2|bp|both||512|-'; } | st_cells
-  # the first sitting: flaky1 is red in round 1, --keep-going runs ok2, round 2 is skipped
+  # the first sitting: flaky1 is red in round 1, --keep-going runs ok2, and round 2 runs the cells whose round 1 was green
   # shellcheck disable=SC2046
   st_run $(portable) --keep-going
   want_rc 1
-  calls_seq "$CALL_PROF" 'ok1 flaky1 ok2'
+  calls_seq "$CALL_PROF" 'ok1 flaky1 ok2 ok2 ok1'
   want_v 'result=red'
   want_v 'stamp finished='
+  want_v 'round 2 cell 2 not run'
   cp "$C/v.sitting" "$C/first.sitting"
-  # the resume: flaky1's round 1 and every cell's round 2, nothing else
+  # the resume: flaky1's round 1 and its round 2, nothing else
   : > "$C/calls"
   # shellcheck disable=SC2046
   st_run $(portable) --resume "$C/v.sitting"
   want_rc 0
-  calls_seq "$CALL_PROF" 'flaky1 ok2 flaky1 ok1'
-  calls_seq 's/.* membase=\([^ ]*\) .*/\1/p' 'GPU-bbbb=100,GPU-aaaa=100 GPU-bbbb=100,GPU-aaaa=100 GPU-bbbb=100,GPU-aaaa=100 GPU-bbbb=100,GPU-aaaa=100'
+  calls_seq "$CALL_PROF" 'flaky1 flaky1'
+  calls_seq 's/.* membase=\([^ ]*\) .*/\1/p' 'GPU-bbbb=100,GPU-aaaa=100 GPU-bbbb=100,GPU-aaaa=100'
   want_out '[resume] '
   want_v 'result=green'
-  want_v 'resumed_runs=round 1 cells 2; round 2 cells 3,2,1'
+  want_v 'resumed_runs=round 1 cells 2; round 2 cells 2'
   want_v "resumed_from=$C/v.sitting."
   want_v '== round 1 cell 2 rc=0 result=green'
+  want_v '== round 2 cell 2 rc=0 result=green'
   want_v '== round 2 cell 1 rc=0 result=green'
   want_v '== cell 2 means over its rows'
-  # the untouched runs keep their blocks, stamps included, byte for byte; the re-run one has a stamp of its own
+  # the untouched runs keep their blocks, stamps included, byte for byte; the re-run ones have a stamp of their own
   first=$(blk "$C/first.sitting" '== round 1 cell 1 rc=0')
   [ -n "$first" ] || fault "the first verdict has no round 1 cell 1 block"
   [ "$first" = "$(blk "$C/v.sitting" '== round 1 cell 1 rc=0')" ] || fault "round 1 cell 1's block changed in the merge"
   [ "$(blk "$C/first.sitting" '== round 1 cell 3 rc=0')" = "$(blk "$C/v.sitting" '== round 1 cell 3 rc=0')" ] || fault "round 1 cell 3's block changed in the merge"
+  [ "$(blk "$C/first.sitting" '== round 2 cell 1 rc=0')" = "$(blk "$C/v.sitting" '== round 2 cell 1 rc=0')" ] || fault "round 2 cell 1's block changed in the merge"
   p1=$(blk_pid "$C/v.sitting" '== round 1 cell 1 rc=0')
   p2=$(blk_pid "$C/v.sitting" '== round 1 cell 2 rc=0')
   { [ -n "$p1" ] && [ -n "$p2" ] && [ "$p1" != "$p2" ]; } || fault "the stamps of the kept run ('$p1') and the re-run one ('$p2') are not two sittings'"
-  [ "$(blk_pid "$C/v.sitting" '== round 2 cell 1 rc=0')" = "$p2" ] || fault "round 2 cell 1 was not stamped by the resuming sitting"
+  [ "$(blk_pid "$C/v.sitting" '== round 2 cell 2 rc=0')" = "$p2" ] || fault "round 2 cell 2 was not stamped by the resuming sitting"
+  [ "$(blk_pid "$C/v.sitting" '== round 2 cell 1 rc=0')" = "$p1" ] || fault "round 2 cell 1 lost the first sitting's stamp"
   [ -e "$C/v.sitting.d" ] || fault "no work directory for the resumed sitting"
   # the merged verdict is a sitting's verdict: green, nothing left to resume
   : > "$C/calls"
@@ -2128,12 +2297,18 @@ case_resumeguard() {
   want_rc 64
   want_out 'is a stage=portable verdict'
   no_calls
-  # another cells file
-  { echo "$HDR"; echo 'ok1|bp|both||512|-'; } | st_cells
+  # another cells file (one the guard alone keeps from running a cell), and another fold: the fold is part of a cell
+  { echo "$HDR"; echo 'ok1|bp|both||512|-'; echo 'ok3|bp|both||512|-'; } | st_cells
   # shellcheck disable=SC2046
   st_run $(portable) --resume "$C/first.sitting"
   want_rc 64
   want_out "are not this cells file's"
+  no_calls
+  { echo "$HDR"; echo 'ok1|bp|both||512|-'; echo 'red1|bp|both||512|-'; } | st_cells
+  # shellcheck disable=SC2046
+  st_run $(portable) --resume "$C/first.sitting" --fold off
+  want_rc 64
+  want_out "and the --fold it was run with"
   no_calls
   { echo "$HDR"; echo 'ok1|bp|both||512|-'; echo 'red1|bp|both||512|-'; } | st_cells
   # a cell the file does not have, a number that is none, --only without --resume
@@ -2188,8 +2363,9 @@ case_resumeguard() {
 case_resumedrift() {
   st_case "resumedrift$SUF"
   { echo "$HDR"; echo 'drift1|bp|both||512|-'; echo 'flaky1|bp|both||512|-'; } | st_cells
+  # the first sitting stops at flaky1's red: drift1's round 1 is green and its round 2 has not run
   # shellcheck disable=SC2046
-  st_run $(portable) --keep-going
+  st_run $(portable)
   want_rc 1
   calls_seq "$CALL_PROF" 'drift1 flaky1'
   # the resume runs flaky1's round 1, then round 2: drift1's second call prints another context than its kept round 1
@@ -2212,7 +2388,7 @@ case_resumedry() {
   st_run $(portable) --resume "$C/v.sitting" --dry-run
   want_rc 0
   want_out '[dry] resume '
-  want_out 'runs round 1 cells 2; round 2 cells 2,1'
+  want_out 'runs round 1 cells 2; round 2 cells 2'
   no_calls
   no_hold
   cmp -s "$C/v.sitting" "$C/first.sitting" || fault "a dry run touched the verdict"
@@ -2290,7 +2466,7 @@ selftest() {
   trap st_cleanup EXIT
   trap 'exit 143' TERM
   trap 'exit 130' INT
-  for cs in order redstop keepgoing verdict tree noportable mismatch checks hold quiet dry cellserr env drift busy rows dryenv relpaths archive \
+  for cs in order redstop keepgoing verdict tree noportable mismatch checks hold quiet dry cellserr env drift fold busy rows dryenv relpaths archive \
     gpuhold baseline cardlook resume resumeguard resumedrift resumedry; do
     JOBS_KIND+=(case) JOBS_ARG+=("$cs")
   done
@@ -2298,7 +2474,20 @@ selftest() {
   mutant reverse order 'for ((i = total - 1; i >= 0; i--)); do rev+=("${CELLREC[i]}"); done' 'for ((i = 0; i < total; i++)); do rev+=("${CELLREC[i]}"); done'
   mutant rotate order 'k=$(((i + r - 1) % n))' 'k=$i'
   mutant hook-round-2 order 'if [ "$r" = 1 ] && [ "$CF_CHECKS" != - ]; then' 'if [ "$CF_CHECKS" != - ]; then'
-  mutant round-2-after-red keepgoing 'if [ "$ROUND_RED" = 1 ]; then' 'if false; then'
+  mutant round-2-after-red redstop 'if [ "$ROUND_RED" = 1 ] && [ "$KEEP" = 0 ]; then' 'if false; then'
+  mutant round-2-skipped-by-keep keepgoing 'if [ "$ROUND_RED" = 1 ] && [ "$KEEP" = 0 ]; then' 'if [ "$ROUND_RED" = 1 ]; then'
+  mutant round-2-red-cell keepgoing '    if round1_green "$CF_IDX"; then
+      R2SEL+=("$rec")' '    if true; then
+      R2SEL+=("$rec")'
+  mutant fold-passed fold ' "DEPTH_SERVE_FOLD=$CF_FOLD"' ''
+  mutant fold-cell-wins fold 'c["fold"]]))' '"depths"]))'
+  mutant fold-default fold 'fold=fold or default_fold))' 'fold=fold or "off"))'
+  mutant fold-audit-called fold '    audit=$(fold_audit 2>&1) || audit="(the fold audit exited $?: $audit)"' '    audit='
+  mutant fold-audit-math fold "pct = [100 * (statistics.mean(x[k] for x in d['shared']) / statistics.mean(x[k] for x in d['first']) - 1) for k in (0, 1)]" "pct = [100 * (statistics.mean(x[k] for x in d['first']) / statistics.mean(x[k] for x in d['shared']) - 1) for k in (0, 1)]"
+  mutant fold-header fold '    echo "fold=$FOLD"' ':'
+  mutant fold-flag fold '          off | depths) FOLD=$2 ;;' '          off | depths | *) FOLD=$2 ;;'
+  mutant fold-column fold '    if fold not in ("", "off", "depths"):' '    if False:'
+  mutant fold-plan fold 'loads = sum(servers_of(c, c["fold"]) for c in cells)' 'loads = sum(servers_of(c, "off") for c in cells)'
   mutant stop-on-red redstop 'if [ "$KEEP" = 0 ]; then STOPPED=' 'if false; then STOPPED='
   mutant tarball-required noportable 'if [ "$STAGE" = portable ] && [ -z "$TARBALL" ]; then' 'if false; then'
   mutant member-sha mismatch '[ "$BIN_SHA" = "$TB_MEMBER_SHA" ] || die 65' 'true || die 65'
