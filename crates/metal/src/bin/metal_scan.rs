@@ -91,18 +91,24 @@
 //! `--compare-trace` compares two encode traces
 //! (`generate_metal --encode-trace`) and prints the first differing event:
 //! exit 0 identical, 6 identical up to buffer numbering, 3 they differ, 2 a
-//! file that is no trace, two format versions or a line it cannot read. A
-//! binding names its buffer by allocation order, so a change that allocates
-//! one more buffer early shifts every later id and moves every later line.
-//! When the lines differ, each side's buffer ids are renumbered by first use
-//! (the first buffer a binding names is buffer 0, the next new one buffer 1)
-//! and the traces compared again with every other field as text: equal
-//! renumbered traces bind their slots in the same pattern under a bijection of
-//! the two sides' buffers (exit 6, the pairs printed), anything else is a real
-//! difference (exit 3, the first differing event printed with both sides' raw
-//! lines). Exit 6 is a diagnostic, not a proof: a trace names a buffer by its
-//! allocation order only, so two buffers of one length whose roles are
-//! swapped at every use renumber the same.
+//! file that is no trace of a format version this reads, or holds a line it
+//! cannot read (a `refused` line, which a trace carries when a buffer had no
+//! place in the numbering, is one). A binding names its buffer by allocation
+//! order, so a change that allocates one more buffer early shifts every later
+//! id and moves every later line. When the lines differ, each side's buffer
+//! ids are renumbered by first use (the first buffer a binding names is
+//! buffer 0, the next new one buffer 1) and the traces compared again with
+//! every other field as text: equal renumbered traces bind their slots in the
+//! same pattern under a bijection of the two sides' buffers (exit 6, the
+//! pairs printed), anything else is a real difference (exit 3, the first
+//! differing event printed with both sides' raw lines). Exit 6 is a
+//! diagnostic, not a proof: a trace names a buffer by its allocation order
+//! only, so two buffers of one length whose roles are swapped at every use
+//! renumber the same. Two traces of the same format version with equal lines
+//! are identical. A v1 trace numbered the buffers of the weight load in the
+//! order its threads made them, so a v1 and a v2 trace are never identical:
+//! they are compared renumbered, with a note, and equal lines are exit 6 at
+//! best.
 
 use std::process::ExitCode;
 
@@ -1188,7 +1194,11 @@ mod compare {
 
     /// The trace format's first line (`bloomery_metal::trace::VERSION`, which
     /// exists only in an encode-trace build).
-    const TRACE_VERSION: &str = "# bloomery encode trace v1";
+    const TRACE_VERSION: &str = "# bloomery encode trace v2";
+
+    /// The first line of the older format, read for the compare of a trace
+    /// made before the move: its buffer numbers followed thread scheduling.
+    const TRACE_VERSION_V1: &str = "# bloomery encode trace v1";
 
     /// The bytes an archive may change size by between two sessions of the
     /// device compiler (one 16-byte alignment unit, twice) and still be the
@@ -1485,17 +1495,23 @@ mod compare {
         (lines, rc)
     }
 
-    /// The events of a trace: its lines but the `#` ones.
-    fn events(path: &str) -> Result<Vec<String>, String> {
+    /// The events of a trace and its format's first line: its lines but the
+    /// `#` ones.
+    fn events(path: &str) -> Result<(&'static str, Vec<String>), String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
         let mut lines = text.lines();
-        if lines.next() != Some(TRACE_VERSION) {
-            return Err(format!("{path}: not a {TRACE_VERSION} trace"));
-        }
-        Ok(lines
-            .filter(|l| !l.starts_with('#'))
-            .map(str::to_string)
-            .collect())
+        let first = lines.next();
+        let version = [TRACE_VERSION, TRACE_VERSION_V1]
+            .into_iter()
+            .find(|v| first == Some(v))
+            .ok_or_else(|| format!("{path}: not a {TRACE_VERSION} or {TRACE_VERSION_V1} trace"))?;
+        Ok((
+            version,
+            lines
+                .filter(|l| !l.starts_with('#'))
+                .map(str::to_string)
+                .collect(),
+        ))
     }
 
     /// A buffer as a binding names it: `#n` for the nth buffer the engine
@@ -1573,6 +1589,11 @@ mod compare {
                     lines.push(line.clone());
                     continue;
                 }
+                Some("refused") => {
+                    return Err(format!(
+                        "event {at}: the trace found a buffer no place in the numbering, so its ids are no names: {line}"
+                    ));
+                }
                 Some("dispatch") => {}
                 kind => {
                     return Err(format!(
@@ -1605,6 +1626,11 @@ mod compare {
         Ok(Renumbered { lines, first_use })
     }
 
+    /// A format version's name in a note: the last word of its first line.
+    fn version_tag(version: &str) -> &str {
+        version.rsplit(' ').next().unwrap_or(version)
+    }
+
     /// The first position where two event lists differ, a list ending early
     /// differing where it ends.
     fn first_difference(a: &[String], b: &[String]) -> Option<usize> {
@@ -1618,12 +1644,13 @@ mod compare {
     /// The most buffer pairs the renumbered verdict lists.
     const PAIRS_SHOWN: usize = 8;
 
-    /// Two traces: rc 0 the events are equal, 6 equal once each side's
-    /// buffer ids are renumbered by first use, 3 they differ (the first
-    /// differing event, in that comparison, printed with the events before it),
-    /// 2 a file that is no trace or holds a line this cannot read.
+    /// Two traces: rc 0 the events are equal and the traces number buffers
+    /// alike (one format version), 6 equal once each side's buffer ids are
+    /// renumbered by first use, 3 they differ (the first differing event, in
+    /// that comparison, printed with the events before it), 2 a file that is
+    /// no trace or holds a line this cannot read.
     pub(super) fn traces(base: &str, head: &str) -> u8 {
-        let (a, b) = match (events(base), events(head)) {
+        let ((va, a), (vb, b)) = match (events(base), events(head)) {
             (Ok(a), Ok(b)) => (a, b),
             (a, b) => {
                 for e in [a.err(), b.err()].into_iter().flatten() {
@@ -1643,6 +1670,16 @@ mod compare {
             dispatches(&b),
             buffers(&b)
         );
+        // Equal lines of two formats are not one program: the weights' ids
+        // follow thread scheduling in one and job order in the other.
+        let alike = va == vb;
+        if !alike {
+            println!(
+                "note: base is a {} trace and head a {} trace: they number buffers differently, so the events are compared renumbered and are never identical",
+                version_tag(va),
+                version_tag(vb)
+            );
+        }
         // Every line is read before any verdict, so two equal traces with a
         // line this cannot read are refused, not identical.
         let (ra, rb) = match (renumber(&a), renumber(&b)) {
@@ -1656,10 +1693,11 @@ mod compare {
                 return 2;
             }
         };
-        let Some(raw_at) = first_difference(&a, &b) else {
+        let raw_at = first_difference(&a, &b);
+        if raw_at.is_none() && alike {
             println!("identical");
             return 0;
-        };
+        }
         let Some(at) = first_difference(&ra.lines, &rb.lines) else {
             let moved: Vec<String> = ra
                 .first_use
@@ -1673,16 +1711,20 @@ mod compare {
             } else {
                 ""
             };
+            let pairs = if moved.is_empty() {
+                "the lines are equal as written".to_string()
+            } else {
+                format!("{}{more}", moved[..moved.len().min(PAIRS_SHOWN)].join(", "))
+            };
             println!(
-                "identical up to buffer numbering: {} of {} buffers renumbered ({}{more})",
+                "identical up to buffer numbering: {} of {} buffers renumbered ({pairs})",
                 moved.len(),
                 ra.first_use.len(),
-                moved[..moved.len().min(PAIRS_SHOWN)].join(", ")
             );
             return 6;
         };
         println!("first difference at event {at}:");
-        if raw_at != at {
+        if let Some(raw_at) = raw_at.filter(|&raw_at| raw_at != at) {
             println!(
                 "  (the raw lines first differ at event {raw_at}; buffer ids are compared renumbered by first use)"
             );
@@ -2272,14 +2314,24 @@ mod compare {
             events
         }
 
-        /// The exit code of comparing two traces made of `a` and `b`.
-        fn trace_rc(a: &[String], b: &[String]) -> u8 {
-            let text = |events: &[String]| format!("{TRACE_VERSION}\n{}\n", events.join("\n"));
-            let (x, y) = (write("a", &text(a)), write("b", &text(b)));
+        /// The exit code of comparing two traces made of `a` and `b`, of the
+        /// format versions `versions` (base, head).
+        fn trace_rc_as(versions: [&str; 2], a: &[String], b: &[String]) -> u8 {
+            let text =
+                |version: &str, events: &[String]| format!("{version}\n{}\n", events.join("\n"));
+            let (x, y) = (
+                write("a", &text(versions[0], a)),
+                write("b", &text(versions[1], b)),
+            );
             let code = traces(&x, &y);
             let _ = std::fs::remove_file(&x);
             let _ = std::fs::remove_file(&y);
             code
+        }
+
+        /// The exit code of comparing two traces of the current format.
+        fn trace_rc(a: &[String], b: &[String]) -> u8 {
+            trace_rc_as([TRACE_VERSION; 2], a, b)
         }
 
         #[test]
@@ -2291,13 +2343,60 @@ mod compare {
             assert_eq!(trace_rc(&t, &t), 0);
         }
 
+        /// Equal lines under two format versions are not one program: v1 numbered
+        /// the weights' buffers in the order threads made them. They are compared
+        /// renumbered (6 when that is equal, 3 when not), never 0, whichever side
+        /// is the older. Mutant: the version ignored (0).
+        #[test]
+        fn equal_lines_of_two_format_versions_are_never_identical() {
+            let t = program(&["b0=#1+0/64 b1=#2+0/64", "b0=#2+0/64 b1=#1+0/64"]);
+            for versions in [
+                [TRACE_VERSION_V1, TRACE_VERSION],
+                [TRACE_VERSION, TRACE_VERSION_V1],
+            ] {
+                assert_eq!(trace_rc_as(versions, &t, &t), 6, "{versions:?}");
+                // Two traces of the old format are compared as they were.
+                let shifted = program(&["b0=#2+0/64 b1=#3+0/64", "b0=#3+0/64 b1=#2+0/64"]);
+                assert_eq!(trace_rc_as(versions, &t, &shifted), 6, "{versions:?}");
+                let other = program(&["b0=#1+0/64 b1=#2+0/64", "b0=#1+0/64 b1=#2+0/64"]);
+                assert_eq!(trace_rc_as(versions, &t, &other), 3, "{versions:?}");
+            }
+            assert_eq!(trace_rc_as([TRACE_VERSION_V1; 2], &t, &t), 0);
+            // A format this does not know is refused, not read as the nearest one.
+            let later = "# bloomery encode trace v3";
+            assert_eq!(trace_rc_as([later, TRACE_VERSION], &t, &t), 2);
+            assert_eq!(trace_rc_as([TRACE_VERSION, later], &t, &t), 2);
+        }
+
+        /// A trace that says a buffer had no place in the numbering is refused
+        /// by name: its ids cannot be read, equal or not.
+        #[test]
+        fn a_trace_that_refused_a_buffer_is_refused() {
+            let mut t = program(&["b0=#1+0/64"]);
+            t.insert(0, "refused a buffer made by no job: 1".to_string());
+            assert_eq!(trace_rc(&t, &t), 2);
+            assert!(
+                renumber(&t).err().is_some_and(
+                    |e| e.contains("no place in the numbering") && e.contains("refused")
+                )
+            );
+        }
+
+        /// The format version the engine writes is the one this reads.
+        #[cfg(all(target_os = "macos", feature = "encode-trace"))]
+        #[test]
+        fn the_engines_trace_version_is_the_one_read() {
+            assert_eq!(bloomery_metal::trace::VERSION, TRACE_VERSION);
+        }
+
         #[test]
         fn a_trace_with_its_ids_shifted_is_the_same_program() {
             let base = program(&["b0=#1+0/64 b1=#2+0/64", "b0=#2+0/64 b1=#3+0/64"]);
             // Every id one higher.
             let head = program(&["b0=#2+0/64 b1=#3+0/64", "b0=#3+0/64 b1=#4+0/64"]);
             assert_eq!(trace_rc(&base, &head), 6);
-            // The shift begins after the first dispatch, as one more buffer made early does.
+            // The shift begins after the first dispatch, as one more buffer made early does
+            // (a trace numbers buffers in the order one thread would make them).
             let head = program(&["b0=#1+0/64 b1=#3+0/64", "b0=#3+0/64 b1=#4+0/64"]);
             assert_eq!(trace_rc(&base, &head), 6);
             let (a, b) = (renumber(&base).unwrap(), renumber(&head).unwrap());

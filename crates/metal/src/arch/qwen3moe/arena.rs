@@ -632,11 +632,34 @@ struct Loads {
     layers: Vec<LayerBufs>,
 }
 
+/// The encode trace's view of a load: its buffers are numbered as the jobs
+/// run in index order would make them. With no trace built, a load is its jobs.
+#[cfg(feature = "encode-trace")]
+use crate::trace::Load;
+
+#[cfg(not(feature = "encode-trace"))]
+struct Load;
+
+#[cfg(not(feature = "encode-trace"))]
+impl Load {
+    fn begin() -> Self {
+        Self
+    }
+
+    fn job<R>(&self, _index: usize, run: impl FnOnce() -> R) -> R {
+        run()
+    }
+
+    fn end(self, _counted: usize) {}
+}
+
 /// Jobs `0..jobs` run by up to `workers` threads, each taking the next job in
 /// order; their results in job order, or the error of the earliest job that
 /// failed. A worker takes no job past the earliest failure, and every job
 /// before it was taken, so the error is the one a run in order on one thread
-/// returns.
+/// returns. The buffers the jobs make are named by job and place in the job,
+/// so the encode trace numbers them the same on every thread count: the jobs
+/// up to the earliest failure, in order.
 fn in_order<T: Send, E: Send>(
     jobs: usize,
     workers: usize,
@@ -644,6 +667,7 @@ fn in_order<T: Send, E: Send>(
 ) -> Result<Vec<T>, E> {
     let next = AtomicUsize::new(0);
     let failed = AtomicUsize::new(usize::MAX);
+    let load = Load::begin();
     let work = || {
         let mut done = Vec::new();
         loop {
@@ -651,7 +675,7 @@ fn in_order<T: Send, E: Send>(
             if j >= jobs || j > failed.load(Ordering::Relaxed) {
                 return done;
             }
-            let r = job(j);
+            let r = load.job(j, || job(j));
             if r.is_err() {
                 failed.fetch_min(j, Ordering::Relaxed);
             }
@@ -671,6 +695,13 @@ fn in_order<T: Send, E: Send>(
             slots[j] = Some(r);
         }
     });
+    // Jobs past the earliest failure may have run, which a run in order would
+    // not have: their buffers are not counted.
+    let counted = slots
+        .iter()
+        .position(|r| matches!(r, Some(Err(_))))
+        .map_or(jobs, |failed| failed + 1);
+    load.end(counted);
     // Every job up to the earliest failure ran; the first `None` is past it.
     let mut out = Vec::with_capacity(jobs);
     for r in slots.into_iter().map_while(|r| r) {
@@ -1463,6 +1494,9 @@ mod in_order_tests {
     /// came first in time returned (job 9 here, with two workers or more).
     #[test]
     fn jobs_return_in_order_and_the_earliest_failure_wins() {
+        // A load numbers buffers in the process's trace, one at a time.
+        #[cfg(feature = "encode-trace")]
+        let _session = crate::trace::testing::session();
         for workers in [1, 2, 3, 8] {
             let got = in_order(20, workers, |j| Ok::<_, usize>(j * 3)).unwrap();
             assert_eq!(got, (0..20).map(|j| j * 3).collect::<Vec<_>>(), "{workers}");
@@ -1480,6 +1514,111 @@ mod in_order_tests {
             assert_eq!(err, 4, "{workers} workers");
         }
         assert_eq!(in_order(0, 4, Ok::<_, ()>).unwrap(), Vec::<usize>::new());
+    }
+
+    /// The buffers the jobs make through the trace's hook, as the weights
+    /// load makes them: job `j` makes `MADE[j]` of them, buffer `k` at
+    /// `address(j, k)`.
+    #[cfg(feature = "encode-trace")]
+    const MADE: [u64; 5] = [2, 1, 0, 3, 2];
+
+    #[cfg(feature = "encode-trace")]
+    fn address(j: usize, k: u64) -> usize {
+        0x10_0000 + j * 0x1000 + usize::try_from(k).expect("a small count") * 0x10
+    }
+
+    /// The names the trace gives after a load of [`MADE`]'s jobs on `workers`
+    /// threads, one buffer made before it and one after; job `j` fails when
+    /// `fails` says so. A script fixes the order the buffers are made in
+    /// across the threads.
+    #[cfg(feature = "encode-trace")]
+    fn loaded(
+        workers: usize,
+        script: Option<&crate::trace::testing::Script>,
+        fails: Option<usize>,
+    ) -> std::collections::BTreeMap<usize, (u64, usize)> {
+        use crate::trace::buffer_made;
+        let _session = crate::trace::testing::session();
+        buffer_made(0x100, 8);
+        let result = in_order(MADE.len(), workers, |j| {
+            for k in 0..MADE[j] {
+                let make = || buffer_made(address(j, k), 16 * (j + 1));
+                match script {
+                    Some(script) => script.step(j, k, make),
+                    None => make(),
+                }
+            }
+            if fails == Some(j) { Err(j) } else { Ok(j) }
+        });
+        assert_eq!(result.err(), fails);
+        buffer_made(0x300, 32);
+        crate::trace::testing::names()
+    }
+
+    /// The buffers a load's jobs make are numbered as one thread running the
+    /// jobs in index order would number them, on one worker and on four,
+    /// whichever order the four make them in. Mutant: one counter for every
+    /// buffer (the four workers' order shows).
+    #[cfg(feature = "encode-trace")]
+    #[test]
+    fn a_loads_buffers_are_numbered_alike_on_one_worker_and_on_four() {
+        use crate::trace::testing::Script;
+
+        let one = loaded(1, None, None);
+        let mut expected = std::collections::BTreeMap::from([(0x100, (0, 8)), (0x300, (9, 32))]);
+        let mut n = 1;
+        for (j, &made) in MADE.iter().enumerate() {
+            for k in 0..made {
+                expected.insert(address(j, k), (n, 16 * (j + 1)));
+                n += 1;
+            }
+        }
+        assert_eq!(one, expected);
+        // The last jobs make their buffers first, the first jobs' last.
+        let script = Script::new(vec![
+            (4, 0),
+            (3, 0),
+            (0, 0),
+            (4, 1),
+            (1, 0),
+            (3, 1),
+            (0, 1),
+            (3, 2),
+        ]);
+        assert_eq!(loaded(4, Some(&script), None), one);
+    }
+
+    /// A load that fails numbers the jobs up to the earliest failure and no
+    /// other, as a run in order would have: a later job that ran beside it
+    /// left no number behind. Mutant: every job that ran is counted.
+    #[cfg(feature = "encode-trace")]
+    #[test]
+    fn a_failed_load_numbers_the_jobs_up_to_its_earliest_failure() {
+        use crate::trace::testing::Script;
+
+        // Job 3 makes its buffers, then job 1 makes its and fails, then job 0
+        // makes its own. Job 4 runs or not, depending on when a thread frees.
+        let script = Script::new(vec![
+            (3, 0),
+            (3, 1),
+            (3, 2),
+            (1, 0),
+            (0, 0),
+            (0, 1),
+            (4, 0),
+            (4, 1),
+        ]);
+        let names = loaded(4, Some(&script), Some(1));
+        assert_eq!(
+            names,
+            std::collections::BTreeMap::from([
+                (0x100, (0, 8)),
+                (address(0, 0), (1, 16)),
+                (address(0, 1), (2, 16)),
+                (address(1, 0), (3, 32)),
+                (0x300, (4, 32)),
+            ])
+        );
     }
 }
 

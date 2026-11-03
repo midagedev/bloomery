@@ -47,7 +47,10 @@
 # 6 identical up to buffer numbering (a binding names its buffer by allocation order, so a change that allocates one more buffer
 # shifts every later id; the compare renumbers each side by first use and finds the same binding pattern: the pairs are printed), 3
 # differ, 2 refused. A trace rc 6 counts as a difference for the run's code: the trace holds no identity of a buffer but its order,
-# so a swap of two buffers' roles at every use also renumbers the same; the summary line keeps the 6 for the reader.
+# so a swap of two buffers' roles at every use also renumbers the same; the summary line keeps the 6 for the reader. A trace numbers
+# its buffers in the order one thread would make them, whatever threads loaded the weights, so two runs of one binary write one
+# trace; a base whose trace is the older format (v1, the weights numbered in thread order) is never rc 0 against a head (rc 6 at
+# best, with a note), and a trace with a `refused` line (a buffer that had no place in the numbering) is rc 2.
 # Runs no gate and takes no lock: it opens this Mac's GPU, which nothing it does changes.
 set -uo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
