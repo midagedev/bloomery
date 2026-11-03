@@ -35,7 +35,7 @@
 //! ([`SlotDrafts::lookup`]) and the served draft (`served::ServedDraft`)
 //! alike.
 
-use app::mtp::{MtpBody, MtpDraft, Parked, SlotWalks, SlotWindow};
+use app::mtp::{MtpBody, MtpDraft, Parked, ParkedBytes, SlotWalks, SlotWindow};
 use app::{Draw, Keep, Prompt, RoundWindow, RowsLog, Session, SessionError};
 use bloomery_gpu::GpuModel;
 use bloomery_gpu::best;
