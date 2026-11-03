@@ -156,6 +156,24 @@ impl Gathers {
         })
     }
 
+    /// The gather slots on the page.
+    #[must_use]
+    pub fn slots(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// The shape of slot `slot`.
+    #[must_use]
+    pub fn shape(&self, slot: usize) -> GatherShape {
+        self.slot(slot).shape
+    }
+
+    /// This page's rank.
+    #[must_use]
+    pub fn rank(&self) -> usize {
+        self.rank
+    }
+
     /// The page's bytes, the link's tail for every pair of ranks included.
     #[must_use]
     pub fn page_bytes(&self) -> usize {

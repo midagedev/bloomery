@@ -1274,16 +1274,6 @@ pub(crate) fn check_ctx(ctx: usize) -> Result<(), GpuError> {
     Ok(())
 }
 
-/// A step at `pos` inside stores of `ctx` positions, refused by name past them.
-pub(crate) fn check_pos(pos: u32, ctx: usize) -> Result<(), GpuError> {
-    if pos as usize >= ctx {
-        return Err(shape(format!(
-            "a step at position {pos} in stores of {ctx}"
-        )));
-    }
-    Ok(())
-}
-
 /// The layer's SwiGLU limit, 0 (the plain combine) when it has none. Any
 /// other activation has no clamp and is refused by name.
 pub(crate) fn limit_of(act: Act) -> Result<f32, GpuError> {
@@ -2491,7 +2481,7 @@ impl ChainBody for Body {
     /// past the stores, or one the stores do not stand at, is refused by
     /// name ([`Body::stores_at`]).
     fn decode_input(&mut self, token: u32, pos: u32) -> Result<StepInput, GpuError> {
-        check_pos(pos, self.ctx)?;
+        bloomery_gpu::host::rank::check_pos(pos, self.ctx)?;
         self.stores_at(pos)?;
         self.embd.fill(token)?;
         Ok(StepInput { pos })

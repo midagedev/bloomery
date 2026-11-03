@@ -929,6 +929,42 @@ impl Drop for Head {
     }
 }
 
+/// One rank's pick over its part of the vocabulary: `id`, the card's argmax
+/// of `logits` (one row), with its value, as `(value, id)` with `id` counted
+/// from `vocab_at`, the part's first id in the whole vocabulary. An id past
+/// the row, or past `u32` from `vocab_at`, is refused by name.
+pub fn local_pick(logits: &[f32], id: u32, vocab_at: u32) -> Result<(f32, u32), GpuError> {
+    const WHAT: &str = "head::local_pick";
+    let v = *logits.get(id as usize).ok_or_else(|| {
+        GpuError::shape(WHAT, format!("pick {id} past the row's {}", logits.len()))
+    })?;
+    let at = vocab_at
+        .checked_add(id)
+        .ok_or_else(|| GpuError::shape(WHAT, format!("pick {id} from {vocab_at} past u32")))?;
+    Ok((v, at))
+}
+
+/// The step's token from every rank's pick `(value, id)`, `id` in the whole
+/// vocabulary: the largest value, and of equal values the lowest id, which is
+/// the one-card argmax's rule (the first index of the largest value) over the
+/// ranks' parts in vocabulary order. No pick, and a value that is not finite
+/// (a part's argmax refuses one), are refused by name.
+pub fn merge(picks: &[(f32, u32)]) -> Result<u32, GpuError> {
+    const WHAT: &str = "head::merge";
+    let mut best: Option<(f32, u32)> = None;
+    for &(v, id) in picks {
+        if !v.is_finite() {
+            return Err(GpuError::shape(WHAT, format!("a pick of {v} at id {id}")));
+        }
+        best = match best {
+            Some((bv, bid)) if bv > v || (bv == v && bid < id) => Some((bv, bid)),
+            _ => Some((v, id)),
+        };
+    }
+    best.map(|(_, id)| id)
+        .ok_or_else(|| GpuError::shape(WHAT, "no rank's pick"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1101,5 +1137,52 @@ mod tests {
             other => panic!("want the raised fault, got {other:?}"),
         }
         assert!(refuse_readback_fault(FAULT_NONE, 0).is_ok());
+    }
+
+    /// The merge of every split of a row into N = 1, 2 and 4 parts, each part's pick its
+    /// [`super::local_pick`], is the row's first index of its largest value, ties across parts and
+    /// within one included, whatever order the picks come in; no pick and a pick that is not
+    /// finite are refused.
+    #[test]
+    fn the_merge_of_local_picks_is_the_whole_rows_argmax() {
+        use super::{local_pick, merge};
+        let rows: [&[f32]; 4] = [
+            &[1.0, 3.0, 2.0, 3.0, 0.5, -1.0, 3.0, 2.5],
+            &[-4.0, -2.0, -3.0, -2.0, -9.0, -2.5, -7.0, -8.0],
+            &[0.0; 8],
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 7.0],
+        ];
+        // The one-card argmax: the first index of the largest value.
+        let argmax = |row: &[f32]| {
+            row.iter()
+                .enumerate()
+                .fold(0, |b, (i, &x)| if x > row[b] { i } else { b }) as u32
+        };
+        for row in rows {
+            let want = argmax(row);
+            for n in [1usize, 2, 4] {
+                let part = row.len() / n;
+                let mut picks: Vec<(f32, u32)> = row
+                    .chunks(part)
+                    .enumerate()
+                    .map(|(r, c)| local_pick(c, argmax(c), (r * part) as u32).unwrap())
+                    .collect();
+                assert_eq!(merge(&picks).unwrap(), want, "{row:?} in {n} parts");
+                picks.reverse();
+                assert_eq!(
+                    merge(&picks).unwrap(),
+                    want,
+                    "{row:?} in {n} parts, reversed"
+                );
+            }
+        }
+        assert!(local_pick(&[], 0, 0).is_err() && local_pick(&[1.0], 1, 0).is_err());
+        assert!(
+            local_pick(&[1.0], 0, u32::MAX).is_ok()
+                && local_pick(&[1.0, 2.0], 1, u32::MAX).is_err()
+        );
+        assert!(merge(&[]).is_err());
+        assert!(merge(&[(1.0, 0), (f32::NAN, 1)]).is_err());
+        assert!(merge(&[(f32::INFINITY, 0)]).is_err());
     }
 }
