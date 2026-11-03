@@ -45,6 +45,16 @@
 # (tools/ref/lease-probe.sh's), goes up before the first call and comes down on every exit path, so no other box call
 # starts between two cells while the lease is free for a moment. Another owner's hold already up is rc 75, nothing run.
 #
+# The quiet box. The hold stops new box commands, not the ones already running: a compile of another track that began
+# before it (cargo, cargo-oxide, rustc, llc, ptxas) runs through the first cell and voids its rows ([cpu-busy]). After
+# the hold is up and before anything is written or run, the sitting waits until none of those processes runs (read from
+# `ps -eo pid=,stat=,comm=` by command name, a zombie being none; `pgrep -f` would match the shell that asks), polling
+# every SITTING_QUIET_POLL seconds for up to SITTING_QUIET_WAIT. It prints `[quiet] waiting: <names>` on the first poll
+# and then every sixth (once a minute at the default poll) and `[quiet] box quiet after N s`; past the bound it ends rc
+# 75 naming the processes, with no verdict written and no cell run. Before every cell the same check runs with a bound
+# of 120 s at most; past it the cell runs anyway, the line says so, and depth-serve's own cpu guard tags and reds the
+# rows a compile voided.
+#
 # The verdict. --out (default: beside the tarball as <tarball without .tar.gz>.sitting, or target/release-dist/
 # <version>-<tree>-tree.sitting) is `key=value` header lines (stage, result, binary, binary_sha256, tarball,
 # tarball_sha256, ...), the cells, then one `== round R cell I rc=N result=...` block a run with its ROW, HOOK, check
@@ -57,6 +67,9 @@
 #   SITTING_LOAD_EST    seconds a load takes for a cell with no load_s column (unset: that term is unpriced)
 #   SITTING_CALL_BOUND  seconds one depth-serve call may take (default: its arms x (BLOOMERY_ARM_BOUND + 120) + 300)
 #   SITTING_POLL        seconds between reads of a running call's log, which are echoed as it grows (default 1)
+#   SITTING_QUIET_WAIT  whole seconds the box may take to go quiet before the first cell (default 1800), the bound of
+#                       the check before each cell is at most 120 of them
+#   SITTING_QUIET_POLL  seconds between two looks for a running compile (default 10)
 #   SITTING_STUB_DIR    the self-test's: a directory whose depth-serve.sh and checks.sh stand in for the real two (named on
 #                       the first line of the run); leave it unset
 # The environment is the caller's beyond what a cell sets: BLOOMERY_LEASE_CARD names the sitting's prediction card
@@ -64,7 +77,8 @@
 # is this script's dry run (no hold, no call, no verdict).
 #
 # Exit: 0 green; 1 red; 2 a file missing; 64 usage or a cells file that does not parse; 65 the binary is not the
-# tarball's member; 69 a card the cells name is not on the machine; 75 another owner's hold is up; 130/143 a signal.
+# tarball's member; 69 a card the cells name is not on the machine; 75 another owner's hold is up, or a compile of
+# another track still runs after SITTING_QUIET_WAIT seconds; 130/143 a signal.
 set -uo pipefail
 __d=${BASH_SOURCE[0]%/*}
 [ "$__d" != "${BASH_SOURCE[0]}" ] || __d=.
@@ -310,6 +324,47 @@ hold_down() {
   HOLD_FILE=''
 }
 
+# quiet_procs: one `name(pid)` line for each compile process running now (cargo, cargo-oxide, rustc, llc, ptxas; a zombie
+# is none), by command name from `ps -eo pid=,stat=,comm=`; nothing when the box is quiet, 1 when ps does not answer (a
+# box that cannot be read is not a quiet one). The name is the last path component, as ps prints it on a Mac.
+quiet_procs() {
+  ps -eo pid=,stat=,comm= | awk '
+    $2 ~ /^Z/ { next }
+    { n = $3; sub(/.*\//, "", n) }
+    n == "cargo" || n == "cargo-oxide" || n == "rustc" || n == "ptxas" || n ~ /^llc(-[0-9]+)?$/ { print n "(" $1 ")" }'
+}
+
+# quiet_names <quiet_procs lines>: the names with their counts, `cargo x2, rustc x24`.
+quiet_names() {
+  printf '%s\n' "$1" | sed 's/(.*//' | sort | uniq -c | awk '{ printf "%s%s x%s", (NR > 1 ? ", " : ""), $2, $1 }'
+}
+
+# quiet_wait initial|between: returns when no compile process runs. `initial` (after the hold is up, before anything is
+# written) ends the sitting rc 75 past SITTING_QUIET_WAIT; `between` (before a cell) waits at most 120 s of it and then
+# returns anyway, naming what still runs.
+quiet_wait() {
+  local kind=$1 limit=${SITTING_QUIET_WAIT:-1800} poll=${SITTING_QUIET_POLL:-10} t0=$SECONDS polls=0 procs waited
+  if [ "$kind" = between ] && [ "$limit" -gt 120 ]; then limit=120; fi
+  while :; do
+    procs=$(quiet_procs) || die 2 "ps -eo pid=,stat=,comm= does not answer: whether the box is quiet cannot be read"
+    waited=$((SECONDS - t0))
+    if [ -z "$procs" ]; then
+      if [ "$kind" = initial ] || [ "$polls" != 0 ]; then echo "[quiet] box quiet after $waited s"; fi
+      return 0
+    fi
+    if [ "$waited" -ge "$limit" ]; then
+      if [ "$kind" = initial ]; then
+        die 75 "compiles of other tracks still run after $waited s (SITTING_QUIET_WAIT $limit): $(quiet_names "$procs") [$(printf '%s\n' "$procs" | head -n 12 | paste -sd' ' -)]: contention, not a failure; nothing ran"
+      fi
+      echo "[quiet] between cells: still running after $waited s: $(quiet_names "$procs"): the cell runs anyway and the cpu guard judges its rows"
+      return 0
+    fi
+    if [ $((polls % 6)) = 0 ]; then echo "[quiet] waiting: $(quiet_names "$procs") ($waited s of $limit)"; fi
+    polls=$((polls + 1))
+    sleep "$poll" 9>&-
+  done
+}
+
 # archive <path>: a verdict or directory from an earlier sitting keeps its content under a UTC stamp.
 archive() {
   local to n=0
@@ -426,6 +481,7 @@ run_cell() {
   if [ "$r" = 1 ] && [ "$CF_CHECKS" != - ]; then
     envv+=("DEPTH_SERVE_AFTER=$CHECKS_RUN $CF_CHECKS")
   fi
+  quiet_wait between
   echo
   echo "=== sitting: round $r, $pos of $total: $(cell_text "$rec") ($(now)) ==="
   EMIT_OFF=0
@@ -589,6 +645,8 @@ main() {
   [[ $TREE =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 64 "--tree '$TREE' is no tree name (a directory under ~/repo)"
   [ -n "$OWNER" ] || OWNER=${BLOOMERY_HOLD_OWNER:-rel}
   [[ $OWNER =~ ^[A-Za-z0-9_]+$ ]] || die 64 "--hold-owner '$OWNER': letters, digits and _"
+  [[ ${SITTING_QUIET_WAIT:-1800} =~ ^[0-9]+$ ]] || die 64 "SITTING_QUIET_WAIT is whole seconds, got '$SITTING_QUIET_WAIT'"
+  [[ ${SITTING_QUIET_POLL:-10} =~ ^[0-9]+(\.[0-9]+)?$ ]] || die 64 "SITTING_QUIET_POLL is seconds, got '$SITTING_QUIET_POLL'"
   [ -z "${BLOOMERY_DRY:-}" ] || die 64 "BLOOMERY_DRY is set: --dry-run is this script's dry run (no hold, no call, no verdict); each call's own plan is depth-serve.sh's under BLOOMERY_DRY=1"
   # Every path the verdict and the lines below name is absolute, so a caller elsewhere (sit.sh fetches the verdict by the
   # path printed here) reads it as this script does.
@@ -670,6 +728,7 @@ main() {
   trap 'exit 130' INT
   trap 'exit 129' HUP
   hold_up
+  quiet_wait initial
   archive "$OUT"
   WORK=$OUT.d
   archive "$WORK"
@@ -790,6 +849,35 @@ echo "SESSION rc=0"
 STUB
 }
 
+# st_ps <bin dir>: the case's `ps`. `ps -eo pid=,stat=,comm=` (the quiet check's look) answers from $C/ps.seq: one line a
+# call, words `name:pid` (`name:pid:Z` a zombie) or `-` for none, the last line again once they run out, no file a quiet
+# box, $C/ps.fail a ps that fails; every other call is the real ps's, so the host's own compiles never reach a case.
+st_ps() {
+  cat > "$1/ps" << 'STUB'
+#!/bin/sh
+case "$*" in *pid=,stat=,comm=*) ;; *) exec REAL_PS "$@" ;; esac
+if [ -e CASE_DIR/ps.fail ]; then
+  echo 'ps: the stub fails' >&2
+  exit 1
+fi
+[ -r CASE_DIR/ps.seq ] || exit 0
+i=$(cat CASE_DIR/ps.i 2> /dev/null || echo 0)
+i=$((i + 1))
+echo "$i" > CASE_DIR/ps.i
+line=$(sed -n "${i}p" CASE_DIR/ps.seq)
+[ -n "$line" ] || line=$(tail -n 1 CASE_DIR/ps.seq)
+for w in $line; do
+  [ "$w" != - ] || continue
+  rest=${w#*:}
+  st=S
+  case $rest in *:*) st=${rest#*:} ;; esac
+  echo "${rest%%:*} $st ${w%%:*}"
+done
+STUB
+  sed -i.bak -e "s|REAL_PS|$(command -v ps)|" -e "s|CASE_DIR|$C|g" "$1/ps" && rm -f "$1/ps.bak"
+  chmod +x "$1/ps"
+}
+
 # st_case <name>: a fresh case directory C and TBN (the tarball's name), WHY empty.
 st_case() {
   C=$T/$1
@@ -805,6 +893,7 @@ st_case() {
   st_stubs "$C/stub"
   printf '#!/bin/sh\ncase "$*" in *--query-gpu=name,uuid*) printf "NVIDIA RTX A6000, GPU-aaaa\\nNVIDIA GeForce RTX 3090, GPU-bbbb\\n" ;; esac\n' > "$C/bin/nvidia-smi"
   chmod +x "$C/bin/nvidia-smi"
+  st_ps "$C/bin"
   if ! command -v timeout > /dev/null; then
     cp "$HERE/stub-timeout.py" "$C/bin/timeout"
     chmod +x "$C/bin/timeout"
@@ -822,7 +911,7 @@ st_run() {
   cd "$C" || exit 2
   env "HOME=$C/home" "PATH=$C/bin:$PATH" "TMPDIR=$C/tmp" "STUB_CALLS=$C/calls" "STUB_COUNT=$C/count" \
     "STUB_HOLD=$C/holds/bloomery-rel-hold" "STUB_RELEASE=$C/release" "BLOOMERY_LEASE_HOLDS=$C/holds/bloomery-*-hold" \
-    "BLOOMERY_LEASE_CARD=$C/card" "SITTING_STUB_DIR=$C/stub" SITTING_POLL=0.05 ${ST_EXTRA[@]+"${ST_EXTRA[@]}"} \
+    "BLOOMERY_LEASE_CARD=$C/card" "SITTING_STUB_DIR=$C/stub" SITTING_POLL=0.05 SITTING_QUIET_POLL=0.05 ${ST_EXTRA[@]+"${ST_EXTRA[@]}"} \
     bash "$C/tree/tools/release/sitting.sh" --cells "$C/cells.tsv" --tree stubtree --out "$C/v.sitting" "$@" > "$C/out" 2>&1
   RC=$?
   cd "$OLDPWD" || exit 2
@@ -833,7 +922,7 @@ st_start() {
   cd "$C" || exit 2
   env "HOME=$C/home" "PATH=$C/bin:$PATH" "TMPDIR=$C/tmp" "STUB_CALLS=$C/calls" "STUB_COUNT=$C/count" \
     "STUB_HOLD=$C/holds/bloomery-rel-hold" "STUB_RELEASE=$C/release" "BLOOMERY_LEASE_HOLDS=$C/holds/bloomery-*-hold" \
-    "BLOOMERY_LEASE_CARD=$C/card" "SITTING_STUB_DIR=$C/stub" SITTING_POLL=0.05 ${ST_EXTRA[@]+"${ST_EXTRA[@]}"} \
+    "BLOOMERY_LEASE_CARD=$C/card" "SITTING_STUB_DIR=$C/stub" SITTING_POLL=0.05 SITTING_QUIET_POLL=0.05 ${ST_EXTRA[@]+"${ST_EXTRA[@]}"} \
     bash "$C/tree/tools/release/sitting.sh" --cells "$C/cells.tsv" --tree stubtree --out "$C/v.sitting" "$@" > "$C/out" 2>&1 &
   ST_PID=$!
   echo "$ST_PID" >> "$T/pids"
@@ -850,6 +939,14 @@ want_out() { grep -qF -- "$1" "$C/out" || fault "the output lacks '$1'"; }
 want_v() { grep -qF -- "$1" "$C/v.sitting" 2> /dev/null || fault "the verdict lacks '$1'"; }
 no_calls() { [ ! -s "$C/calls" ] || fault "a call happened"; }
 no_hold() { [ ! -e "$C/holds/bloomery-rel-hold" ] || fault "the hold is still up"; }
+want_before() {
+  local a b
+  a=$(grep -nF -- "$1" "$C/out" | head -n 1 | cut -d: -f1)
+  b=$(grep -nF -- "$2" "$C/out" | head -n 1 | cut -d: -f1)
+  { [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]; } || fault "'$1' (line ${a:-none}) is not before '$2' (line ${b:-none})"
+}
+# st_fresh: the next sitting of a case starts from no call, no count, no ps position and no verdict.
+st_fresh() { : > "$C/calls"; rm -rf "$C"/count.* "$C/ps.i" "$C/v.sitting"; }
 calls_seq() {
   local got
   got=$(sed -n "$1" "$C/calls" 2> /dev/null | paste -sd' ' -)
@@ -1034,6 +1131,89 @@ case_hold() {
   no_hold
   want_v 'result=red'
   want_v 'reason=the sitting ended before its last run'
+  [ -z "$WHY" ]
+}
+
+# The quiet box: after the hold is up and before anything is written or run, the sitting waits until no compile of another
+# track runs; a box that stays busy ends it rc 75 with nothing run and no verdict; before each cell the same look, bounded,
+# and a cell goes on after the bound.
+case_quiet() {
+  st_case "quiet$SUF"
+  { echo "$HDR"; echo 'pa|a|a6000||512|-'; } | st_cells
+  # busy for two looks, then quiet: the wait names the compiles, ends, and only then does the sitting write anything
+  printf '%s\n' 'rustc:101 cargo:100' 'rustc:101' '-' > "$C/ps.seq"
+  # shellcheck disable=SC2046
+  st_run $(portable)
+  want_rc 0
+  want_out '[quiet] waiting: cargo x1, rustc x1'
+  want_out '[quiet] box quiet after '
+  want_before " up: $C/holds/bloomery-rel-hold" '[quiet] waiting: cargo x1, rustc x1'
+  want_before '[quiet] box quiet after ' '[sitting] stage='
+  want_before '[sitting] stage=' '=== sitting: round 1, 1 of 1'
+  # a box that stays busy: rc 75 naming them, once a minute's line more than once, nothing run, nothing written
+  st_fresh
+  printf '%s\n' 'rustc:101 cargo:100' > "$C/ps.seq"
+  ST_EXTRA=(SITTING_QUIET_WAIT=2)
+  # shellcheck disable=SC2046
+  st_run $(portable)
+  want_rc 75
+  want_out 'compiles of other tracks still run after'
+  want_out 'cargo x1, rustc x1 [rustc(101) cargo(100)]'
+  [ "$(grep -cF '[quiet] waiting: ' "$C/out")" -ge 2 ] || fault "the wait named the compiles once, want a line every sixth look"
+  no_calls
+  no_hold
+  [ ! -e "$C/v.sitting" ] || fault "a verdict was written by a sitting that never ran"
+  # a quiet box before each cell: the compile that starts after cell 1 is waited out before cell 2
+  st_fresh
+  { echo "$HDR"; echo 'pa|a|a6000||512|-'; echo 'pb|a|a6000||512|-'; } | st_cells
+  printf '%s\n' '-' '-' 'rustc:7' '-' > "$C/ps.seq"
+  ST_EXTRA=()
+  # shellcheck disable=SC2046
+  st_run $(portable)
+  want_rc 0
+  [ "$(grep -cF '[quiet] waiting: rustc x1' "$C/out")" = 1 ] || fault "the compile before cell 2 was not named exactly once"
+  want_before 'round 1, 1 of 2: cell 1 green' '[quiet] waiting: rustc x1'
+  want_before '[quiet] waiting: rustc x1' 'round 1, 2 of 2: cell 2: '
+  # a compile that outlasts the between-cells bound: the cell goes on, and says so
+  st_fresh
+  { echo "$HDR"; echo 'pa|a|a6000||512|-'; } | st_cells
+  printf '%s\n' '-' 'rustc:7' > "$C/ps.seq"
+  ST_EXTRA=(SITTING_QUIET_WAIT=2)
+  # shellcheck disable=SC2046
+  st_run $(portable)
+  want_rc 0
+  want_out '[quiet] between cells: still running after 2 s: rustc x1'
+  calls_seq "$CALL_PROF" 'pa pa'
+  # a zombie is no compile: the box is quiet at the first look
+  st_fresh
+  printf '%s\n' 'rustc:9:Z' > "$C/ps.seq"
+  ST_EXTRA=(SITTING_QUIET_WAIT=2)
+  # shellcheck disable=SC2046
+  st_run $(portable)
+  want_rc 0
+  want_out '[quiet] box quiet after 0 s'
+  [ "$(grep -cF '[quiet] waiting: ' "$C/out")" = 0 ] || fault "a zombie was waited for"
+  # a ps that does not answer is not a quiet box
+  st_fresh
+  rm -f "$C/ps.seq"
+  : > "$C/ps.fail"
+  ST_EXTRA=()
+  # shellcheck disable=SC2046
+  st_run $(portable)
+  want_rc 2
+  want_out 'ps -eo pid=,stat=,comm= does not answer'
+  no_calls
+  no_hold
+  rm -f "$C/ps.fail"
+  # a bound that is no number
+  st_fresh
+  ST_EXTRA=(SITTING_QUIET_WAIT=abc)
+  # shellcheck disable=SC2046
+  st_run $(portable)
+  want_rc 64
+  want_out 'SITTING_QUIET_WAIT is whole seconds'
+  no_calls
+  no_hold
   [ -z "$WHY" ]
 }
 
@@ -1257,7 +1437,7 @@ selftest() {
   trap st_cleanup EXIT
   trap 'exit 143' TERM
   trap 'exit 130' INT
-  for cs in order redstop keepgoing verdict tree noportable mismatch checks hold dry cellserr env drift busy rows dryenv relpaths archive; do
+  for cs in order redstop keepgoing verdict tree noportable mismatch checks hold quiet dry cellserr env drift busy rows dryenv relpaths archive; do
     JOBS_KIND+=(case) JOBS_ARG+=("$cs")
   done
   mutant family order 'key=lambda c: (first[c["prof"]], PLACE_RANK[c["place"]], c["idx"])' 'key=lambda c: c["idx"]'
@@ -1270,10 +1450,22 @@ selftest() {
   mutant member-sha mismatch '[ "$BIN_SHA" = "$TB_MEMBER_SHA" ] || die 65' 'true || die 65'
   mutant hold-down hold '[ -z "$HOLD_FILE" ] || rm -f "$HOLD_FILE"' ':'
   mutant hold-up hold '  hold_up
-  archive "$OUT"' '  :
-  archive "$OUT"'
+  quiet_wait initial' '  :
+  quiet_wait initial'
   mutant other-hold hold 'others=$(lease_holds_up "$OWNER") || exit $?' 'others='
   mutant finish-trap hold 'trap finish EXIT' ':'
+  mutant quiet-initial quiet '  quiet_wait initial
+  archive "$OUT"' '  :
+  archive "$OUT"'
+  mutant quiet-between quiet '  quiet_wait between' '  :'
+  mutant quiet-timeout quiet 'die 75 "compiles of other tracks still run' 'echo "compiles of other tracks still run'
+  mutant quiet-between-goes-on quiet '      if [ "$kind" = initial ]; then
+        die 75' '      if true; then
+        die 75'
+  mutant quiet-zombie quiet '    $2 ~ /^Z/ { next }
+' ''
+  mutant quiet-ps-fails quiet ' || die 2 "ps -eo pid=,stat=,comm= does not answer: whether the box is quiet cannot be read"' ''
+  mutant quiet-wait-number quiet '[[ ${SITTING_QUIET_WAIT:-1800} =~ ^[0-9]+$ ]] || die 64' '[[ ${SITTING_QUIET_WAIT:-1800} =~ ^ ]] || die 64'
   mutant check-fail checks 'elif [ -n "$fails" ]; then' 'elif false; then'
   mutant stage-name tree 'echo "stage=$STAGE"' 'echo "stage=portable"'
   mutant plan-drift drift 'if ! cmp -s "$other" "$labels"; then' 'if false; then'

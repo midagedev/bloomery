@@ -24,9 +24,15 @@
 # (tools/ref/models/<name>.sh): its file is `-m`, and the seat is the file's architecture's.
 #
 # Per arm and round, one fresh server (the load is the price of a round and is outside every timed number):
+#   0a. the last server gone: nothing listens on the port and no bloomery-serve holds a compute context on a timing
+#      card (a process that held tens of GB of mapped host memory takes seconds to exit after its stop returned, and a
+#      server started before that finds its port taken, exit 83). Checked before the memory baseline is read, so the
+#      baseline is the idle card's, and before every server start (waits DEPTH_SERVE_PORT_WAIT_S, polling every second,
+#      then the arm fails by name);
 #   0. the card's used memory back within DEPTH_SERVE_MEM_SLACK_MIB of the sitting's baseline (read once, after the lease
-#      is taken): a server's memory is released after its process is gone, and a load that starts before that finds
-#      the card smaller than the sitting's plan (waits DEPTH_SERVE_MEM_WAIT_S, then the arm fails by name);
+#      is taken and the last server is gone): a server's memory is released after its process is gone, and a load that
+#      starts before that finds the card smaller than the sitting's plan (waits DEPTH_SERVE_MEM_WAIT_S, then the arm
+#      fails by name);
 #   1. the server at the serving defaults — `-m <file> --host 127.0.0.1 --port P`, no --ctx-size (unless
 #      DEPTH_SERVE_CTX names one), no --place (unless DEPTH_SERVE_PLACE does), no --parallel, no lever — under
 #      `timeout` (BLOOMERY_ARM_BOUND, default 900 s, covers its load, request and hook), BLOOMERY_REF_MODEL removed
@@ -101,6 +107,8 @@
 #                            in the user's environment, else the arm fails; `note`: the difference is printed
 #                            (`[user-plan]`) and the run goes on, for a card set the user's environment does not see
 #                            as the timing environment does (the 3090 alone beside an A6000); `off`: no probe
+#   DEPTH_SERVE_PORT_WAIT_S  seconds the last server may take to exit (its port free, no bloomery-serve on a timing
+#                            card) before the memory baseline is read and before each server starts, default 120
 #   DEPTH_SERVE_MEM_WAIT_S   seconds the card's used memory may take to return to the sitting's baseline before a
 #                            server starts, default 60
 #   DEPTH_SERVE_MEM_SLACK_MIB  MiB above the baseline that still count as returned, default 128
@@ -113,8 +121,8 @@
 # the words above. After the lease an arm fails (rc 1, the server stopped, its log's tail printed) on a server that
 # exits or does not answer /health within its bound, a listening line with another port or ctx (or, DEPTH_SERVE_CTX
 # unset, a context that does not hold D + N - 1), a log with no plan record, a plan that drifted from the group's
-# first, a user-environment plan that is not the timing plan, a card whose memory did not return, or a request that
-# fails (no timings among them). Contention is the lease's and the guards' (rc 75). BLOOMERY_DRY=1 prints the plan (arms, order, commands, predicted wall) and the binaries' state, takes no
+# first, a user-environment plan that is not the timing plan, a port or a card the last server still holds, a card whose
+# memory did not return, or a request that fails (no timings among them). Contention is the lease's and the guards' (rc 75). BLOOMERY_DRY=1 prints the plan (arms, order, commands, predicted wall) and the binaries' state, takes no
 # lease and starts nothing; the recipe builds nothing under it.
 #
 # Local mode. Under tools/box.sh's local mode (BLOOMERY_BOX_CARD=local; timing-card.sh's header has its refusals) the
@@ -538,6 +546,7 @@ ds_print_plan() {
     echo "[plan] user-environment plan (DEPTH_SERVE_USER_PLAN=$USER_PLAN): before round 1, under the lease, each arm group's first arm runs with --plan, CUDA_VISIBLE_DEVICES removed; its plan record must be the one the group's first load prints"
   fi
   [ -z "$AFTER" ] || echo "[plan] hook: DEPTH_SERVE_AFTER (bound ${AFTER_BOUND}s) after the timed request of round 1's last server of each arm group"
+  echo "[plan] last server: a server starts, and the memory baseline is read, when nothing listens on port $PORT and no bloomery-serve holds a timing card (waits up to ${PORT_WAIT_S}s; port 0 skips the port)"
   echo "[plan] memory: a server starts when each timing card's used memory is within ${MEM_SLACK_MIB} MiB of the sitting's baseline (waits up to ${MEM_WAIT_S}s)"
   est=${DEPTH_SERVE_LOAD_EST:-}
   [ -n "$est" ] || case $MODEL_NAME in mimo2) est=41 ;; esac
@@ -688,6 +697,66 @@ ds_user_plan_compare() {
   ds_fail "$1" "$2" "$msg"
 }
 
+# The last server's exit. A server's listening socket and its card memory are released when its process is gone, and a
+# process that held tens of GB of mapped host memory takes seconds to go after its stop returned. A server started before
+# that finds its port taken (exit 83), and a memory baseline read before it takes the last server's memory for the card's
+# own. Before the baseline and before every server start: nothing listens on PORT and no bloomery-serve holds a compute
+# context on a timing card, polled every second for PORT_WAIT_S.
+
+# ds_port_listeners <port>: the listening sockets on the port (ss lines, with the owning process where ss may read it),
+# nothing when none. A machine without ss answers by a connect to the loopback.
+ds_port_listeners() {
+  local out rc=0
+  if command -v ss > /dev/null 2>&1; then
+    out=$(ss -Hltnp "sport = :$1" 2>&1) || rc=$?
+    [ "$rc" = 0 ] || out="ss exited $rc: $out"
+    [ -z "$out" ] || printf '%s\n' "$out"
+  elif (exec 3<> "/dev/tcp/127.0.0.1/$1") 2> /dev/null; then
+    echo "127.0.0.1:$1 answers a connect"
+  fi
+}
+
+# ds_serve_apps: one `pid path MiB` line for each compute process of a bloomery-serve on a timing card (nvidia-smi's
+# process name is the executable's path), nothing when none. A card that does not answer is a line saying so: the wait
+# does not take its silence for a free card.
+ds_serve_apps() {
+  local g out rc
+  for g in $TIMING_GPU ${TIMING_GPU2:-}; do
+    rc=0
+    out=$(nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader,nounits -i "$g" 2>&1) || rc=$?
+    if [ "$rc" != 0 ]; then
+      echo "nvidia-smi on $g exited $rc"
+      continue
+    fi
+    printf '%s\n' "$out" | awk -F', *' '{ n = split($2, p, "/"); if (p[n] == "bloomery-serve") print $1, $2, $3 " MiB" }'
+  done
+}
+
+# ds_prev_gone <round> <index> <when>: returns once the port is free and no bloomery-serve holds a timing card, naming the
+# wait when there is one; the arm fails by name past PORT_WAIT_S. <when> says which start waited ("before the memory
+# baseline", "before the server starts").
+ds_prev_gone() {
+  local polls=0 ports apps held
+  while :; do
+    ports='' apps=''
+    [ "$PORT" = 0 ] || ports=$(ds_port_listeners "$PORT")
+    apps=$(ds_serve_apps)
+    [ -n "$ports$apps" ] || break
+    held=''
+    [ -z "$ports" ] || held="port $PORT is listened on [$(printf '%s' "$ports" | tr '\n' ';')]"
+    [ -z "$apps" ] || held="${held:+$held and }a bloomery-serve holds a timing card [$(printf '%s' "$apps" | tr '\n' ';')]"
+    if [ "$polls" -ge "$PORT_WAIT_S" ]; then
+      ds_fail "$1" "$2" "$held, $PORT_WAIT_S s into the wait for the last server to exit ($3): its process has not exited"
+    fi
+    if [ "$polls" = 0 ]; then
+      echo "[port-wait] r$1 ${A_LABEL[$2]} D=${A_DEP[$2]}: $held, $3: waiting for the last server to exit"
+    fi
+    polls=$((polls + 1))
+    sleep 1
+  done
+  [ "$polls" = 0 ] || echo "[port-wait] r$1 ${A_LABEL[$2]} D=${A_DEP[$2]}: the last server is gone after $polls s"
+}
+
 # The card's memory between servers. A server's memory is released once its process is gone, and a load that starts before
 # that finds a smaller card than the sitting's plan assumed: the next arm waits until each timing card's used memory is
 # within MEM_SLACK_MIB of what it was when the lease was taken.
@@ -764,6 +833,7 @@ ds_run_arm() {
   local r=$1 i=$2 label=${A_LABEL[$2]} dep=${A_DEP[$2]} ids t0 load tg pp maj listen ctx need win row
   local -a envs
   CPU_BUSY_TAG='' OTHER_BUSY_TAG='' COLD_TAG='' SRV_TIMED_PID=''
+  ds_prev_gone "$r" "$i" "before the server starts"
   guard_other
   ds_guard_timing
   ds_mem_wait "$r" "$i"
@@ -831,7 +901,7 @@ ds_main() {
   # Local mode refused (timing-card.sh printed why as this file sourced it) ends the run here, dry or not.
   [ -z "$TIMING_LOCAL" ] || [ -z "$TIMING_CARDS_WHY" ] || exit 64
   for v in $(compgen -v BLOOMERY_SERVE_); do
-    ds_refuse 64 "$v is set, and nothing reads it: this runner's knobs are DEPTH_SERVE_CTX, DEPTH_SERVE_PLACE, DEPTH_SERVE_N, DEPTH_SERVE_PORT, DEPTH_SERVE_REQ_BOUND, DEPTH_SERVE_IDS, DEPTH_SERVE_LOAD_EST, DEPTH_SERVE_TARBALL, DEPTH_SERVE_AFTER, DEPTH_SERVE_AFTER_BOUND, DEPTH_SERVE_USER_PLAN, DEPTH_SERVE_MEM_WAIT_S and DEPTH_SERVE_MEM_SLACK_MIB (a BLOOMERY_ name would have to be a row of the lever registry)"
+    ds_refuse 64 "$v is set, and nothing reads it: this runner's knobs are DEPTH_SERVE_CTX, DEPTH_SERVE_PLACE, DEPTH_SERVE_N, DEPTH_SERVE_PORT, DEPTH_SERVE_REQ_BOUND, DEPTH_SERVE_IDS, DEPTH_SERVE_LOAD_EST, DEPTH_SERVE_TARBALL, DEPTH_SERVE_AFTER, DEPTH_SERVE_AFTER_BOUND, DEPTH_SERVE_USER_PLAN, DEPTH_SERVE_PORT_WAIT_S, DEPTH_SERVE_MEM_WAIT_S and DEPTH_SERVE_MEM_SLACK_MIB (a BLOOMERY_ name would have to be a row of the lever registry)"
   done
   DRY=${BLOOMERY_DRY:-}
   ROUNDS=${BLOOMERY_AB_ROUNDS:-4}
@@ -843,6 +913,7 @@ ds_main() {
   AFTER=${DEPTH_SERVE_AFTER:-}
   AFTER_BOUND=${DEPTH_SERVE_AFTER_BOUND:-300}
   USER_PLAN=${DEPTH_SERVE_USER_PLAN:-check}
+  PORT_WAIT_S=${DEPTH_SERVE_PORT_WAIT_S:-120}
   MEM_WAIT_S=${DEPTH_SERVE_MEM_WAIT_S:-60}
   MEM_SLACK_MIB=${DEPTH_SERVE_MEM_SLACK_MIB:-128}
   PLAN_PROBE_BOUND=120
@@ -853,6 +924,7 @@ ds_main() {
   [ "$PORT" -le 65535 ] || ds_refuse 64 "DEPTH_SERVE_PORT is a port, got $PORT"
   ds_posint DEPTH_SERVE_REQ_BOUND "$REQ_BOUND" 1
   ds_posint DEPTH_SERVE_AFTER_BOUND "$AFTER_BOUND" 1
+  ds_posint DEPTH_SERVE_PORT_WAIT_S "$PORT_WAIT_S" 0
   ds_posint DEPTH_SERVE_MEM_WAIT_S "$MEM_WAIT_S" 0
   ds_posint DEPTH_SERVE_MEM_SLACK_MIB "$MEM_SLACK_MIB" 0
   ds_posint BLOOMERY_ARM_BOUND "$LEASE_ARM_BOUND" 1
@@ -898,6 +970,7 @@ ds_main() {
   # The witness blocks' binary line (timing-card.sh's card field) names BIN_PATH and BIN_SHA: the first arm's for the
   # sitting's first block, each arm's own in its blocks.
   BIN_PATH=${A_BIN[0]} BIN_SHA=${A_IDENT[0]} BIN_MTIME=${A_MTIME[0]}
+  ds_prev_gone 1 0 "before the memory baseline"
   witness pre
   guard_other
   ds_mem_baseline
@@ -1094,6 +1167,22 @@ WRAP
           [ "$v" = none ] || echo "$v"
         fi
       }
+      # The last server's exit: one line a look of port.seq (what listens on the port) and of apps.seq (what a timing
+      # card holds), `none` for nothing, the last line again past the end; no file, nothing.
+      ds_port_listeners() {
+        local v
+        if [ -r "$C/port.seq" ]; then
+          v=$(st_seq port)
+          [ "$v" = none ] || echo "$v"
+        fi
+      }
+      ds_serve_apps() {
+        local v
+        if [ -r "$C/apps.seq" ]; then
+          v=$(st_seq apps)
+          [ "$v" = none ] || echo "$v"
+        fi
+      }
       ds_main "$@"
     ) > "$C/out" 2>&1
     RC=$?
@@ -1107,6 +1196,13 @@ WRAP
       grep -qF -- "$s" "$C/out" || { bad "$name" "no line holds '$s'"; return; }
     done
     ok "$name"
+  }
+  # st_before <name> <first string> <second string>: the first's line in the last run's output comes before the second's.
+  st_before() {
+    local a b
+    a=$(grep -nF -- "$2" "$C/out" | head -n 1 | cut -d: -f1)
+    b=$(grep -nF -- "$3" "$C/out" | head -n 1 | cut -d: -f1)
+    if [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]; then ok "$1"; else bad "$1" "'$2' (line ${a:-none}) is not before '$3' (line ${b:-none})"; fi
   }
   # st_absent <name> <fixed string>...: the last run's output holds none of them.
   st_absent() {
@@ -1563,6 +1659,98 @@ HOOK
   ST_ENV=(BLOOMERY_AB_ROUNDS=1)
   st_run a:6 b:6
   st_check refuse-mem-no-reading 1 "FAIL r1 b D=6: the timing card" "gives no used-memory reading now (100 MiB at the sitting's baseline)"
+  ST_ENV=()
+
+  # --- the last server's exit: a server starts, and the memory baseline is read, once nothing listens on the port and no
+  # bloomery-serve holds a timing card. portwait: the port is held through two looks before the first arm (the previous
+  # call's last server still exiting), the second arm's start finds it free.
+  st_case portwait
+  st_tree a 20
+  st_tree b 21
+  printf 'none\nLISTEN 0 4096 0.0.0.0:1\nLISTEN 0 4096 0.0.0.0:1\nnone\n' > "$C/port.seq"
+  ST_ENV=(BLOOMERY_AB_ROUNDS=1)
+  st_run a:6 b:6
+  st_check port-wait-returns 0 "[port-wait] r1 a D=6: port " "is listened on [LISTEN 0 4096 0.0.0.0:1], before the server starts: waiting for the last server to exit" \
+    "[port-wait] r1 a D=6: the last server is gone after 2 s" "ROW r1 a/place=a/ctx=16384 D=6" "ROW r1 b/place=a/ctx=16384 D=6"
+  st_absent port-wait-quiet-when-free "[port-wait] r1 b D=6"
+  # The call's start, the 0.3.12 defect: the last call's server holds the port and the card as this call begins, so the
+  # baseline would read its memory as the card's own. The wait ends before the baseline is read.
+  st_case basewait
+  st_tree a 20
+  printf 'LISTEN 0 4096 0.0.0.0:1\nnone\n' > "$C/port.seq"
+  printf '4242 /r/target/portable/release/bloomery-serve 22558 MiB\nnone\n' > "$C/apps.seq"
+  printf '100\n100\n' > "$C/mem.seq"
+  ST_ENV=(BLOOMERY_AB_ROUNDS=1)
+  st_run a:6
+  st_check base-wait-returns 0 "before the memory baseline: waiting for the last server to exit" "a bloomery-serve holds a timing card [4242 /r/target/portable/release/bloomery-serve 22558 MiB]" \
+    "[port-wait] r1 a D=6: the last server is gone after 1 s" "[mem-baseline] the sitting's baseline is 100 MiB" "ROW r1 a/place=a/ctx=16384 D=6"
+  st_before base-wait-before-the-baseline "[port-wait] r1 a D=6: the last server is gone after 1 s" "[mem-baseline] the sitting's baseline is 100 MiB"
+  # a server still on the card with the port free is waited for as well
+  st_case appswait
+  st_tree a 20
+  printf 'none\n' > "$C/port.seq"
+  printf '4242 /r/target/portable/release/bloomery-serve 22558 MiB\n4242 /r/target/portable/release/bloomery-serve 22558 MiB\nnone\n' > "$C/apps.seq"
+  ST_ENV=(BLOOMERY_AB_ROUNDS=1)
+  st_run a:6
+  st_check apps-wait-returns 0 "a bloomery-serve holds a timing card [4242 /r/target/portable/release/bloomery-serve 22558 MiB], before the memory baseline" \
+    "[port-wait] r1 a D=6: the last server is gone after 2 s" "ROW r1 a/place=a/ctx=16384 D=6"
+  st_absent apps-wait-port-not-named "is listened on"
+  # a server that never goes: the second arm fails by name, no server of its own started
+  st_case portstuck
+  st_tree a 20
+  st_tree b 21
+  printf 'none\nnone\nLISTEN 0 4096 0.0.0.0:1\n' > "$C/port.seq"
+  ST_ENV=(BLOOMERY_AB_ROUNDS=1 DEPTH_SERVE_PORT_WAIT_S=2)
+  st_run a:6 b:6
+  st_check refuse-port-not-free 1 "FAIL r1 b D=6: port " "is listened on [LISTEN 0 4096 0.0.0.0:1], 2 s into the wait for the last server to exit (before the server starts): its process has not exited"
+  st_absent refuse-port-not-free-no-row "ROW r1 b"
+  st_servers refuse-port-not-free-one-server 1
+  st_case baseStuck
+  st_tree a 20
+  printf '4242 /r/bloomery-serve 1 MiB\n' > "$C/apps.seq"
+  ST_ENV=(BLOOMERY_AB_ROUNDS=1 DEPTH_SERVE_PORT_WAIT_S=1)
+  st_run a:6
+  st_check refuse-baseline-wait 1 "FAIL r1 a D=6: a bloomery-serve holds a timing card [4242 /r/bloomery-serve 1 MiB], 1 s into the wait for the last server to exit (before the memory baseline)"
+  st_servers refuse-baseline-wait-no-server 0
+  st_absent refuse-baseline-wait-no-baseline "[mem-baseline]"
+  # The primitives themselves: a real listener on a port is seen by ds_port_listeners and gone with it; nvidia-smi's
+  # compute list is read by process name (a bloomery-serve of any path, no other), and a card that does not answer is a line.
+  st_case primitives
+  ST_PORT=$(st_port)
+  python3 -c 'import os, socket, sys, time
+s = socket.socket()
+s.bind(("127.0.0.1", int(sys.argv[1])))
+s.listen()
+open(sys.argv[2], "w").write(str(os.getpid()) + "\n")
+time.sleep(60)  # port-holder' "$ST_PORT" "$C/listener-pid" &
+  holder=$!
+  for ((k = 0; k < 100; k++)); do [ -s "$C/listener-pid" ] && break; sleep 0.3; done
+  if [ -s "$C/listener-pid" ]; then
+    [ -n "$(ds_port_listeners "$ST_PORT")" ] && ok port-primitive-sees-a-listener || bad port-primitive-sees-a-listener "nothing listens on $ST_PORT by its answer"
+    kill "$holder" 2> /dev/null
+    wait "$holder" 2> /dev/null
+    [ -z "$(ds_port_listeners "$ST_PORT")" ] && ok port-primitive-sees-it-gone || bad port-primitive-sees-it-gone "$(ds_port_listeners "$ST_PORT")"
+  else
+    kill "$holder" 2> /dev/null
+    wait "$holder" 2> /dev/null
+    bad port-primitive-sees-a-listener "the port holder did not listen within 30 s"
+  fi
+  ST_PORT=
+  cat > "$C/bin/nvidia-smi" << 'SMI'
+#!/bin/sh
+case "$*" in
+  *-i\ GPU-bad*) echo 'Unable to determine the device handle (stub)' >&2; exit 15 ;;
+  *-i\ GPU-aaaa*) printf '11, /opt/x/bin/llama-server, 5\n22, /r/target/portable/release/bloomery-serve, 22558\n33, [Not Found], 7\n' ;;
+  *-i\ GPU-bbbb*) printf '44, /usr/bin/python3, 9\n' ;;
+esac
+SMI
+  chmod +x "$C/bin/nvidia-smi"
+  got=$(PATH=$C/bin:$PATH TIMING_GPU=GPU-aaaa TIMING_GPU2=GPU-bbbb ds_serve_apps)
+  [ "$got" = "22 /r/target/portable/release/bloomery-serve 22558 MiB" ] && ok apps-primitive-reads-the-server-by-name || bad apps-primitive-reads-the-server-by-name "got '$got'"
+  got=$(PATH=$C/bin:$PATH TIMING_GPU=GPU-bbbb ds_serve_apps)
+  [ -z "$got" ] && ok apps-primitive-passes-other-processes || bad apps-primitive-passes-other-processes "got '$got'"
+  got=$(PATH=$C/bin:$PATH TIMING_GPU=GPU-bad ds_serve_apps)
+  [ "$got" = "nvidia-smi on GPU-bad exited 15" ] && ok apps-primitive-names-a-card-that-does-not-answer || bad apps-primitive-names-a-card-that-does-not-answer "got '$got'"
   ST_ENV=()
 
   # --- local mode (tools/box.sh's BLOOMERY_BOX_CARD=local): $T/local's nvidia-smi lists one made-up card and answers
