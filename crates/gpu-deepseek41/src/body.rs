@@ -107,7 +107,8 @@ use model::arch::deepseek41::roles;
 use model::arch::deepseek41::tp::{self, TpUnits};
 use model::moe::UNION_MAX_COLS;
 use model::part::{Source, StoredRows, Take};
-use model::placement::{Machine, ModelTensor, ModelTensors, Plan, PlanLevers, Role};
+use model::placement::accepts::{self, Program};
+use model::placement::{CardFormat, Machine, ModelTensor, ModelTensors, Plan, PlanLevers, Role};
 
 use crate::chain::attn::{
     AttnChain, AttnIo, AttnTaps, Compressed, Selection, SourceIo, join_projections,
@@ -376,6 +377,56 @@ pub struct RankFrom<'a, S> {
     pub stored: Option<&'a BTreeMap<String, StoredRows>>,
 }
 
+/// A rank's levers from the caller's `levers`: a prompt fed as steps, each step's sums joining
+/// the ranks. A rank holds every expert on its card, so a residency lever, which it would not
+/// honor, is refused by name.
+fn rank_levers(levers: BodyLevers) -> Result<BodyLevers, GpuError> {
+    if levers.residency != Residency::Off {
+        return Err(GpuError::Shape {
+            what: "BLOOMERY_RESIDENCY",
+            detail: "a tensor-parallel rank holds every expert on its card and runs no residency; \
+                     use BLOOMERY_RESIDENCY=off"
+                .into(),
+        });
+    }
+    let levers = BodyLevers {
+        prefill: PrefillMode::Steps,
+        ..levers
+    };
+    levers.check()?;
+    Ok(levers)
+}
+
+/// The card format of each routed stack of `tensors`, by name: the format the chain's card leg
+/// reads it in, as a placed load's. A rank holds every expert on its card, so a stack no card
+/// kernel reads is refused by name.
+fn rank_routed_formats<'t>(
+    tensors: impl IntoIterator<Item = &'t ModelTensor>,
+) -> Result<BTreeMap<&'t str, CardFormat>, GpuError> {
+    const WHAT: &str = "deepseek41 body::open_rank";
+    let routed = accepts::routed_rule(Program::Deepseek41Chain);
+    let mut formats = BTreeMap::new();
+    for m in tensors
+        .into_iter()
+        .filter(|m| m.role == Role::RoutedExperts)
+    {
+        let f = routed
+            .format(m)
+            .map_err(|e| GpuError::plan(WHAT, e))?
+            .ok_or_else(|| {
+                GpuError::shape(
+                    WHAT,
+                    format!(
+                        "{}: no card expert kernel reads a {} routed stack",
+                        m.name, m.ty
+                    ),
+                )
+            })?;
+        formats.insert(m.name.as_str(), f);
+    }
+    Ok(formats)
+}
+
 /// Rank `rank` of `ranks` of a tensor-parallel load on `gpu` read from `from`, at
 /// `ctx_max` positions under `levers`: every tensor the card holds read from
 /// the source, the rank's part of it where the model's cut splits it
@@ -402,12 +453,7 @@ pub fn open_rank<S: Source + Sync>(
     levers: BodyLevers,
 ) -> Result<Deepseek41Model, GpuError> {
     const WHAT: &str = "deepseek41 body::open_rank";
-    levers.check()?;
-    // A rank feeds a prompt as steps: each step's sums join the ranks.
-    let levers = BodyLevers {
-        prefill: PrefillMode::Steps,
-        ..levers
-    };
+    let levers = rank_levers(levers)?;
     let whole = Hparams::read(&file).map_err(|e| GpuError::plan(WHAT, e))?;
     let hp = rank_hparams(&whole, rank, ranks)?;
     let units = TpUnits::of(&whole);
@@ -438,6 +484,7 @@ pub fn open_rank<S: Source + Sync>(
         .filter(|t| on_rank(t.role))
         .map(|t| (t.name.as_str(), t))
         .collect();
+    let routed_formats = rank_routed_formats(card.values().copied())?;
     gpu.context().bind_to_thread()?;
     let layers = 0..hp.n_layer;
     let mut w = bloomery_gpu::parts::load(
@@ -452,8 +499,11 @@ pub fn open_rank<S: Source + Sync>(
             None => Ok(Take::Skip),
         },
         |t| {
-            card.get(t.name.as_str())
-                .and_then(|m| tensors.card_format(m))
+            let m = card.get(t.name.as_str())?;
+            match m.role {
+                Role::RoutedExperts => routed_formats.get(m.name.as_str()).copied(),
+                _ => tensors.card_format(m),
+            }
         },
         false,
     )?;
@@ -3411,6 +3461,87 @@ pub fn engram_row_bytes(file: &Split, hp: &Hparams) -> Result<usize, GpuError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rank_feeds_steps_and_refuses_a_residency_lever() {
+        let off = BodyLevers {
+            ced: false,
+            prefill: PrefillMode::Batch,
+            group: 1,
+            rows: RowsLevers {
+                helper: true,
+                stats: false,
+            },
+            host: HostCfg {
+                populate: false,
+                lock: false,
+                card_dontneed: false,
+                r8: false,
+                route_trace: false,
+            },
+            residency: Residency::Off,
+            hoststream: false,
+        };
+        assert_eq!(
+            rank_levers(off).expect("no residency").prefill,
+            PrefillMode::Steps
+        );
+        let mid = BodyLevers {
+            residency: Residency::Mid {
+                pinned: 4,
+                spares: 1,
+            },
+            ..off
+        };
+        let refused = rank_levers(mid).expect_err("a residency lever on a rank");
+        let text = refused.to_string();
+        assert!(
+            text.contains("BLOOMERY_RESIDENCY") && text.contains("tensor-parallel rank"),
+            "the refusal names the lever and why a rank takes none: {refused}"
+        );
+    }
+
+    #[test]
+    fn a_ranks_routed_stacks_load_in_the_leg_format_and_an_unread_type_is_refused() {
+        use gguf::quant::GgmlType;
+        let stack = |name: &str, ty| ModelTensor {
+            name: name.to_string(),
+            shard: 0,
+            layer: Some(0),
+            role: Role::RoutedExperts,
+            ty,
+            dims: vec![256, 64, 8],
+            file_bytes: 0,
+            gathered_rows: None,
+        };
+        let shared = ModelTensor {
+            role: Role::SharedExpert,
+            ..stack("blk.0.ffn_gate_shexp.weight", GgmlType::MXFP8)
+        };
+        let read = [
+            stack("blk.0.ffn_gate_exps.weight", GgmlType::MXFP4),
+            stack("blk.0.ffn_up_exps.weight", GgmlType::MXFP4),
+            stack("blk.0.ffn_down_exps.weight", GgmlType::MXFP4),
+            stack("blk.1.ffn_gate_exps.weight", GgmlType::Q3_K),
+            stack("blk.1.ffn_down_exps.weight", GgmlType::Q4_K),
+            shared,
+        ];
+        let got = rank_routed_formats(&read).expect("every stack a card kernel reads");
+        let want = [
+            ("blk.0.ffn_down_exps.weight", CardFormat::KQuant),
+            ("blk.0.ffn_gate_exps.weight", CardFormat::KQuant),
+            ("blk.0.ffn_up_exps.weight", CardFormat::KQuant),
+            ("blk.1.ffn_down_exps.weight", CardFormat::KQuant),
+            ("blk.1.ffn_gate_exps.weight", CardFormat::KQuant),
+        ];
+        assert_eq!(got.into_iter().collect::<Vec<_>>(), want);
+        let unread = [stack("blk.2.ffn_gate_exps.weight", GgmlType::NVFP4)];
+        let refused = rank_routed_formats(&unread).expect_err("an NVFP4 routed stack");
+        assert!(
+            refused.to_string().contains("blk.2.ffn_gate_exps.weight"),
+            "the refusal names the stack: {refused}"
+        );
+    }
 
     #[test]
     fn a_step_feed_under_residency_is_refused() {

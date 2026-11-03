@@ -577,7 +577,7 @@ pub type LegPair = fn(GgmlType, GgmlType, bool) -> bool;
 
 impl RoutedRule {
     /// The card format stack `t` loads in, `None` where the rule reads none.
-    pub(super) fn format(self, t: &ModelTensor) -> Result<Option<CardFormat>, PlacementError> {
+    pub fn format(self, t: &ModelTensor) -> Result<Option<CardFormat>, PlacementError> {
         match self {
             Self::PerType(f) => Ok(f(t.ty)),
             Self::Leg { gate_up, down, .. } => match ExpertPart::of_name(&t.name) {
