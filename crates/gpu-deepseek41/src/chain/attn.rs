@@ -78,6 +78,7 @@ use std::ops::Range;
 
 use bloomery_gpu::cand::{CandKernels, CandScratch, CandShape, CompactArgs, RemapArgs, SelectArgs};
 use bloomery_gpu::fused::FusedKernels;
+use bloomery_gpu::host::rank::Sums;
 use bloomery_gpu::model::{Q8_0GemvHeadsArgs, StepKernels};
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{
@@ -90,7 +91,7 @@ use model::arch::deepseek41::names;
 use model::arch::deepseek41::plan::Planner;
 
 use crate::attn::{self as attn_op, AttnArgs, AttnKernels, CommitArgs, SelectedRows, Staged};
-use crate::chain::join::{JoinSlot, RankJoin};
+use crate::chain::join::TRUNK;
 use crate::compress::{
     self, CompGeom, CompressKernels, PoolArgs, RowsArgs, W_GROUPS, W_PERSISTS, w_persist, w_read,
     w_row,
@@ -1363,7 +1364,7 @@ impl AttnChain {
         layer: usize,
         row: usize,
         io: AttnIo<'_>,
-        join: Option<&mut RankJoin>,
+        join: Option<&mut Sums>,
     ) -> Result<(), GpuError> {
         let lp = layer
             .checked_sub(self.layers.start)
@@ -1541,7 +1542,7 @@ impl AttnChain {
         enqueue_output(&cx, lp, s)?;
         fork.join()?;
         if let Some(join) = join {
-            join.join(gpu, JoinSlot::Trunk, &mut s.out)?;
+            join.join(gpu, TRUNK, &mut s.out)?;
         }
 
         let post = HcPostArgs {

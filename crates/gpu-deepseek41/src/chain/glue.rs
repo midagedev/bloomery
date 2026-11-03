@@ -53,6 +53,7 @@ use bloomery_gpu::elem::{
 };
 use bloomery_gpu::fault::FaultSink;
 use bloomery_gpu::head::Head;
+use bloomery_gpu::host::rank::Sums;
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{Gpu, GpuError, Q8Act, StagedRows, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -69,7 +70,7 @@ use model::arch::deepseek41::plan::StepPlan;
 use model::embed::RowLayout;
 
 use crate::chain::ffn::ShadowWork;
-use crate::chain::join::{JoinSlot, RankJoin};
+use crate::chain::join;
 use crate::dense::{Dense, DenseKernels};
 use crate::engram_gate::{EngramGateKernels, GateArgs, KeyNormArgs, ROW};
 use crate::hc::{HC_MIX, HC_STREAMS, HcKernels};
@@ -726,7 +727,7 @@ pub struct EngramKv<'a> {
     /// The row's engram rows arrive here: the first reader of any of them.
     pub arrive: Option<&'a RowsArrival>,
     /// The rank's side of the ranks' sums, on a rank of a tensor-parallel load.
-    pub join: Option<&'a mut RankJoin>,
+    pub join: Option<&'a mut Sums>,
 }
 
 impl ShadowWork for EngramKv<'_> {
@@ -1107,7 +1108,7 @@ impl Glue {
         w: &Weights,
         params: &DeviceBuffer<u32>,
         (layer, row): (usize, usize),
-        join: Option<&mut RankJoin>,
+        join: Option<&mut Sums>,
     ) -> Result<(), GpuError> {
         const WHAT: &str = "Glue::enqueue_engram_kv_at";
         let stream = gpu.stream();
@@ -1150,7 +1151,7 @@ impl Glue {
         };
         self.dense.enqueue(gpu, wkv, &site.x, act, &mut site.kv)?;
         if let Some(join) = join {
-            return join.post(gpu, JoinSlot::Site(site_at), &site.kv);
+            return join.post(gpu, join::site(site_at), &site.kv);
         }
         key_norm(&self.engram, gpu, w, (gain_k, self.eps), layer, site)
     }
@@ -1204,7 +1205,7 @@ impl Glue {
         w: &Weights,
         (layer, row): (usize, usize),
         a: EngramStep<'_>,
-        join: Option<&mut RankJoin>,
+        join: Option<&mut Sums>,
     ) -> Result<(), GpuError> {
         const WHAT: &str = "Glue::enqueue_engram";
         let stream = gpu.stream();
@@ -1217,7 +1218,7 @@ impl Glue {
             ..
         } = site_row(&mut self.sites, layer, row, WHAT)?;
         if let Some(join) = join {
-            join.sum(gpu, JoinSlot::Site(site_at), &mut site.kv)?;
+            join.sum(gpu, join::site(site_at), &mut site.kv)?;
             key_norm(&self.engram, gpu, w, (gain_k, self.eps), layer, site)?;
         }
         self.engram.enqueue_gate(

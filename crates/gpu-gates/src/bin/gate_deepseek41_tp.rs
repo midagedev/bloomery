@@ -30,12 +30,16 @@ mod ds41_tier;
 mod gate {
     use std::sync::{Arc, mpsc};
 
+    use bloomery_gpu::head::{local_pick, merge};
+    use bloomery_gpu::host::rank::Sums;
     use bloomery_gpu::host::{GatherLoop, Gathers, PostCols};
     use bloomery_gpu::{Gpu, GpuError, MappedHost};
     use bloomery_gpu_deepseek41::body::{self, Deepseek41Model, OpenCfg};
+    use bloomery_gpu_deepseek41::chain::join;
     use bloomery_gpu_gates::GateError;
     use bloomery_levers::{CARD_BUDGET, ENGRAM_HELPER};
     use gguf::{GgmlType, Split};
+    use model::arch::deepseek41::hparams::Hparams;
     use model::part::Take;
 
     /// The greedy steps each run takes.
@@ -83,7 +87,7 @@ mod gate {
     /// [`STEPS`] greedy steps from [`FIRST`] on `ranks` ranks of the file at `path`, each opened
     /// and stepped on a thread of its own with a context of its own on the one card, reading what
     /// `take` gives it, their pages joined by a loopback past one rank: at each step the merge of
-    /// the ranks' picks ([`merge`]) and the ranks' logits laid in rank order.
+    /// the ranks' picks (`bloomery_gpu::head::merge`) and the ranks' logits laid in rank order.
     fn run_ranks(
         path: &str,
         cfg: &OpenCfg,
@@ -103,12 +107,25 @@ mod gate {
                     let opened = (|| -> Result<Deepseek41Model, GateError> {
                         let open = || Split::open(path).map_err(|e| format!("open {path}: {e}"));
                         let source = open()?;
+                        let gpu = Gpu::new()?;
+                        let sums = (ranks > 1)
+                            .then(|| {
+                                let hp = Hparams::read(&source).map_err(|e| e.to_string())?;
+                                Ok::<_, GateError>(Sums::new(
+                                    gpu.context(),
+                                    r,
+                                    ranks,
+                                    &join::shapes(&hp)?,
+                                )?)
+                            })
+                            .transpose()?;
                         Ok(body::open_rank(
-                            Gpu::new()?,
+                            gpu,
                             open()?,
                             &source,
                             |name, ty, dims| take(r, name, ty, dims),
                             (r, ranks),
+                            sums,
                             CTX,
                             cfg.body,
                         )?)
@@ -177,26 +194,18 @@ mod gate {
                         }
                     }
                 }
-                let logits = parts.concat();
-                token = merge(&logits)?;
-                out.push((token, logits));
+                let mut picks = Vec::with_capacity(ranks);
+                let mut at = 0u32;
+                for p in &parts {
+                    picks.push(local_pick(p, at)?);
+                    at += u32::try_from(p.len())?;
+                }
+                token = merge(&picks)?;
+                out.push((token, parts.concat()));
             }
             drop(tokens);
             Ok(out)
         })
-    }
-
-    /// The step's token over logits laid in rank order: the largest value, of equal values the
-    /// lowest id.
-    fn merge(logits: &[f32]) -> Result<u32, GateError> {
-        let mut best: Option<(usize, f32)> = None;
-        for (i, &v) in logits.iter().enumerate() {
-            if best.is_none_or(|(_, b)| v > b) {
-                best = Some((i, v));
-            }
-        }
-        let (i, _) = best.ok_or("no logits to merge")?;
-        Ok(u32::try_from(i)?)
     }
 
     /// [`STEPS`] greedy steps from [`FIRST`]: each step's token and logits.
