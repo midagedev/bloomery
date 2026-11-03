@@ -1080,4 +1080,20 @@ fn the_row_room_counts_the_hosts_base_page() {
         e.to_string()
             .contains("NVFP4 row bytes are not whole groups")
     );
+
+    // An MXFP8 row of 256 values is a 256 B code plane and an 8 B scale plane, each on two pages.
+    let table = &mut model.tensors[0];
+    table.ty = GgmlType::MXFP8;
+    table.dims = vec![256, 100];
+    table.file_bytes = 264 * 100;
+    table.gathered_rows = Some(1);
+    for (source, pages) in [(RowTableSource::Split, 2), (RowTableSource::Parts, 4)] {
+        assert_eq!(row_room(&model, 1, 4096, source).unwrap(), pages * 4096);
+    }
+    model.tensors[0].file_bytes = 263 * 100;
+    let e = row_room(&model, 1, 4096, RowTableSource::Parts).unwrap_err();
+    assert!(
+        e.to_string()
+            .contains("MXFP8 row bytes are not whole groups")
+    );
 }

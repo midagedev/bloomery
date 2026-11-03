@@ -83,6 +83,12 @@ fn role(name: &str, n_layer: usize) -> Option<(Role, Option<usize>)> {
         .map(|&(_, r)| (r, Some(layer)))
 }
 
+/// The role of a model-level or layer tensor by its GGUF name, without a layer-count bound.
+#[must_use]
+pub fn tensor_role(name: &str) -> Option<Role> {
+    role(name, usize::MAX).map(|(r, _)| r)
+}
+
 /// Every tensor of `split` with its role and header facts, and the model's
 /// layer and expert counts from `hp`, the file's [`Hparams`].
 pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementError> {

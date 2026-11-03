@@ -396,6 +396,7 @@ dependencies = [
  "sha1",
  "sha2",
  "thiserror",
+ "unicode-normalization-alignments",
 ]
 
 [[package]]

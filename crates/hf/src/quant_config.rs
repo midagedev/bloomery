@@ -315,6 +315,9 @@ enum Other {
     Fp8 {
         block: Format,
         mxfp4: bool,
+        /// `scale_fmt` `ue8m0`: the scales are E8M0 bytes, so a weight whose grid is one scale a
+        /// row's 32 values (a row table's) is MXFP8 beside the block format.
+        e8m0: bool,
         not_convert: Vec<String>,
         convert: Vec<String>,
     },
@@ -487,15 +490,17 @@ impl Config {
             Some(Other::Fp8 {
                 block,
                 mxfp4,
+                e8m0,
                 not_convert,
                 convert,
             }) => {
                 if skipped(module, not_convert) && !skipped(module, convert) {
                     vec![]
-                } else if *mxfp4 {
-                    vec![*block, Format::Mxfp4]
                 } else {
-                    vec![*block]
+                    let mut formats = vec![*block];
+                    formats.extend(mxfp4.then_some(Format::Mxfp4));
+                    formats.extend(e8m0.then_some(Format::Mxfp8));
+                    formats
                 }
             }
             Some(Other::Mxfp8 { nvfp4, ignored }) => {
@@ -771,9 +776,11 @@ impl Other {
         not_convert.extend(list("ignored_layers")?);
         let convert = list("modules_to_convert")?;
         literal_patterns("fp8", not_convert.iter().chain(&convert))?;
+        let e8m0 = q.get("scale_fmt").and_then(Value::as_str) == Some("ue8m0");
         Ok(Other::Fp8 {
             block,
             mxfp4,
+            e8m0,
             not_convert,
             convert,
         })
@@ -1128,7 +1135,7 @@ fn layout(
             }
             out.push(find(
                 module,
-                &["weight_scale", "weight_scale_inv"],
+                &["weight_scale", "weight_scale_inv", "scale"],
                 &[Dtype::U8, Dtype::F8E8M0],
                 &fits,
             )?);
@@ -1483,11 +1490,17 @@ mod tests {
                     ("lm_head", &[]),
                 ],
             ),
+            // PIN(2026-11-03): a `scale_fmt: ue8m0` config also declares MXFP8, the format of
+            // its E8M0 row tables (the Engram table), beside its block and MXFP4 formats.
             (
                 "deepseek-ai__DeepSeek-V4.1-Flash",
                 &[(
                     "layers.21.ffn.experts.0.w1",
-                    &[Format::Fp8Block { rows: 32, cols: 32 }, Format::Mxfp4],
+                    &[
+                        Format::Fp8Block { rows: 32, cols: 32 },
+                        Format::Mxfp4,
+                        Format::Mxfp8,
+                    ],
                 )],
             ),
             (

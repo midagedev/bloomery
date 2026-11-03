@@ -197,6 +197,64 @@ pub static TP_RANK: Kind = Kind {
     ],
 };
 
+/// One rank's preflight ledger of a tensor-parallel load.
+pub static TP_NEED: Kind = Kind {
+    name: "tp_need",
+    head: "tp need",
+    doc: "One rank's preflight ledger (generate_ds41 --preflight), in rank order, from the folder's headers alone: its rank among the ranks, its node, its pool, each item it needs (its parts of the split tensors, the whole tensors, the KV cache and ring shadows, the table rows' host staging and the page cache their reads keep, the gather slots, the card's context and scratch, and the most one part's read holds), their total, what they leave of the pool, and the folder bytes and runs the rank reads (its read-set).",
+    parts: &[
+        key("rank", U64, ""),
+        lit("/"),
+        pos("ranks", U64, "ranks"),
+        key("node", Word, ""),
+        key("pool", U64, "B"),
+        key("split", U64, "B"),
+        key("whole", U64, "B"),
+        key("kv", U64, "B"),
+        key("shadow", U64, "B"),
+        key("row_staging", U64, "B"),
+        key("row_cache", U64, "B"),
+        key("gathers", U64, "B"),
+        key("scratch", U64, "B"),
+        key("load_peak", U64, "B"),
+        key("total", U64, "B"),
+        key("left", U64, "B"),
+        key("reads", U64, "B"),
+        key("read_runs", U64, "runs"),
+    ],
+};
+
+/// The `tp_need` record of `ledger`, a rank of `ranks`, whose read-set is `reads`.
+///
+/// # Panics
+///
+/// On a need whose total passes u64, which `placement::tp::preflight` refuses before a ledger.
+pub fn tp_need(
+    ledger: &model::placement::tp::RankLedger,
+    ranks: usize,
+    reads: &[(std::path::PathBuf, std::ops::Range<u64>)],
+) -> Record {
+    let need = &ledger.need;
+    let total = need
+        .total()
+        .expect("placement::tp::preflight refuses a total past u64");
+    let mut r = Record::new(&TP_NEED)
+        .u("rank", ledger.rank)
+        .u("ranks", ranks)
+        .w("node", &ledger.node)
+        .u("pool", ledger.pool_bytes);
+    for (item, bytes) in need.items() {
+        r = r.u(item, bytes);
+    }
+    r.u("total", total)
+        .u("left", ledger.pool_bytes.saturating_sub(total))
+        .u(
+            "reads",
+            reads.iter().map(|(_, at)| at.end - at.start).sum::<u64>(),
+        )
+        .u("read_runs", reads.len())
+}
+
 /// Where a qwen3moe-family placement puts the routed experts, before the
 /// load.
 pub static PLAN38: Kind = Kind {
@@ -2990,6 +3048,7 @@ pub static GATE_GEMMA_EMBEDDING2_SERVE: &[&Kind] = kinds![
 
 /// What `generate_ds41` prints, in the order it prints them.
 pub static GENERATE_DS41: &[&Kind] = &[
+    &TP_NEED,
     &PLACE_UNSET,
     &WARM_LOAD,
     &WARM_SAVE,
@@ -5339,6 +5398,38 @@ mod tests {
         plan card bytes 23113320896 (dense 3891325376 + experts 19221995520) host bytes \
         239830005760\n\
         plan (b′): A6000 (GPU1) 48642009536 B, tier 3090 (GPU0) 881 experts 14777118720 B";
+
+    /// A rank's ledger prints every item of its need, their total, what they leave of the pool
+    /// and its read-set's bytes and runs.
+    #[test]
+    fn a_tp_need_line_names_every_item() {
+        use model::placement::tp::{RankLedger, RankNeed};
+        let need = RankNeed {
+            split: 10,
+            whole: 2,
+            kv: 3,
+            ..RankNeed::default()
+        };
+        let ledger = RankLedger {
+            rank: 1,
+            node: "n1".into(),
+            pool_bytes: 100,
+            need,
+        };
+        let reads = [("a".into(), 0..5), ("a".into(), 9..12)];
+        let line = tp_need(&ledger, 4, &reads).line();
+        for part in [
+            "split=10",
+            "kv=3",
+            "load_peak=0",
+            "total=15",
+            "left=85",
+            "reads=8",
+            "read_runs=2",
+        ] {
+            assert!(line.contains(part), "{part} in {line}");
+        }
+    }
 
     /// Every kind of every binary's list, rendered by [`Record`] with every
     /// part given (each flag set) and with every optional part left out, reads

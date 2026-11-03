@@ -243,6 +243,10 @@ dispatch=(
   # Hparams::read refuses a non-deepseek41v file by name, and the delimiter names and the card
   # figure it reads are the tower's own.
   'crates/gpu-gates/src/ds41_media.rs use'
+  # generate_ds41 --preflight's body, a lib module so the checkpoint feature gates it: the run shape, the rank ledgers
+  # and each rank's file reads are V4.1's own (model::arch::deepseek41::tp, model_hf::arch::deepseek41), so it only
+  # names them. PIN(2026-11-04): added for generate_ds41 --preflight.
+  'crates/gpu-gates/src/ds41_preflight.rs use'
   # The Qwen3.6 fixture's shape (q36_fixture, the e2e gate's census) names its layers by the header's own kind
   # (qwen35moe::hparams::Kind), the one owner of that fact, not a copy.
   'crates/gpu-gates/src/q36_fixture.rs use'
@@ -259,6 +263,10 @@ dispatch=(
   'crates/model/src/bin/r8conv.rs use'
   # The ModelOpt converter: Checkpoint::parse refuses another architecture by name before mapping qwen4exp's tensors.
   'crates/model-hf/src/bin/prepare.rs use'
+  # The fixture CLI's ds41-folder verb: the original-format V4.1 folder writer is the model's own (it reads the model's
+  # folder map, layer map and Engram table rows), so the verb only names it.
+  # PIN(2026-11-04): added for the ds41-folder verb.
+  'crates/model-hf/src/bin/fixture.rs fn ds41_folder'
   # 호스트 union 벤치: 파일의 아키텍처가 qwen4exp 일 때만 qwen35moe 의 Hparams·텐서 이름·host::layers 로 routed 층을 연다.
   'crates/model/src/bin/bench_v41_host.rs use'
   # 오라클 표의 디스패치: for_arch 가 Arch 를 그 아키텍처의 표로 잇는다.

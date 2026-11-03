@@ -23,6 +23,7 @@ gate-ds41-open	family	deepseek41	meta	arch_registry
 gate-ds41-oracle	tooling		harness	-
 gate-ds41-place	family	glm5next	place	placement_sizing+tier_legs
 gate-ds41-plan	family	deepseek41	host	-
+gate-ds41-reads	family	deepseek41	host	-
 gate-dspark-read	family	deepseek41	draft	drafts_dspark
 gate-emb2-mel	family	gemma4a	media	serve_media
 gate-embed	common		host	ple_embed

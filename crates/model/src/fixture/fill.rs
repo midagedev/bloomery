@@ -538,11 +538,12 @@ fn nvfp4_rule(sigma: f64, window: Window) -> Option<Rule> {
 
 // ------------------------------------------------------------------ generator
 
-/// SplitMix64: one `u64` per step.
-pub(super) struct Rng(u64);
+/// SplitMix64: one `u64` per step, from the state it holds.
+pub struct Rng(u64);
 
 impl Rng {
-    fn next(&mut self) -> u64 {
+    /// The next value of the stream.
+    pub fn step(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -553,10 +554,10 @@ impl Rng {
     fn fill(&mut self, out: &mut [u8]) {
         let (words, tail) = out.as_chunks_mut::<8>();
         for w in words {
-            *w = self.next().to_le_bytes();
+            *w = self.step().to_le_bytes();
         }
         if !tail.is_empty() {
-            let last = self.next().to_le_bytes();
+            let last = self.step().to_le_bytes();
             let n = tail.len();
             tail.copy_from_slice(&last[..n]);
         }
@@ -564,7 +565,7 @@ impl Rng {
 }
 
 fn mix(x: u64) -> u64 {
-    Rng(x).next()
+    Rng(x).step()
 }
 
 /// FNV-1a of a tensor name.
@@ -575,7 +576,7 @@ fn name_key(name: &str) -> u64 {
 }
 
 /// The generator of chunk `chunk` of the tensor named `name` under `seed`.
-pub(super) fn chunk_rng(seed: u64, name: &str, chunk: usize) -> Rng {
+pub fn chunk_rng(seed: u64, name: &str, chunk: usize) -> Rng {
     Rng(mix(mix(mix(seed) ^ name_key(name)) ^ chunk as u64))
 }
 
@@ -645,7 +646,7 @@ pub(super) fn q3k_scale(sc: &[u8], j: usize) -> i32 {
 fn draws<const N: usize>(rng: &mut Rng, band: &Band) -> [i32; N] {
     let mut out = [0i32; N];
     for pair in out.chunks_mut(2) {
-        let r = rng.next();
+        let r = rng.step();
         pair[0] = band.draw(r as u32);
         if let Some(b) = pair.get_mut(1) {
             *b = band.draw((r >> 32) as u32);
@@ -771,7 +772,7 @@ pub(super) fn fill_units(rule: &Rule, rng: &mut Rng, out: &mut [u8]) {
         }
         Rule::Mxfp4 { e_lo, p_lo } => {
             for blk in units::<17>(out) {
-                let r = rng.next() & 0xffff_ffff;
+                let r = rng.step() & 0xffff_ffff;
                 blk[0] = if r < *p_lo { *e_lo } else { e_lo + 1 };
                 rng.fill(&mut blk[1..17]);
             }
@@ -781,7 +782,7 @@ pub(super) fn fill_units(rule: &Rule, rng: &mut Rng, out: &mut [u8]) {
             for blk in units::<36>(out) {
                 let (scales, codes) = blk.split_at_mut(4);
                 for pair in scales.as_chunks_mut::<2>().0 {
-                    let r = rng.next();
+                    let r = rng.step();
                     pair[0] = pick(r & 0xffff_ffff);
                     pair[1] = pick(r >> 32);
                 }
@@ -793,17 +794,17 @@ pub(super) fn fill_units(rule: &Rule, rng: &mut Rng, out: &mut [u8]) {
             match ty {
                 FloatTy::F32 => {
                     for e in units::<4>(out) {
-                        *e = u(rng.next()).to_le_bytes();
+                        *e = u(rng.step()).to_le_bytes();
                     }
                 }
                 FloatTy::F16 => {
                     for e in units::<2>(out) {
-                        *e = f32_to_f16_bits(u(rng.next())).to_le_bytes();
+                        *e = f32_to_f16_bits(u(rng.step())).to_le_bytes();
                     }
                 }
                 FloatTy::BF16 => {
                     for e in units::<2>(out) {
-                        *e = bf16_bits(u(rng.next())).to_le_bytes();
+                        *e = bf16_bits(u(rng.step())).to_le_bytes();
                     }
                 }
             }

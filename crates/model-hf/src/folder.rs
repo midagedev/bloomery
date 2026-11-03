@@ -334,8 +334,12 @@ pub struct Read<M: FolderMap> {
 
 /// A folder's config, read.
 fn read_config(dir: &Path) -> Result<Json, Error> {
-    let path = dir.join("config.json");
-    std::fs::read(&path)
+    read_json(&dir.join("config.json"))
+}
+
+/// The JSON file at `path`, read; a file that cannot be read or parsed is refused by its path.
+pub(crate) fn read_json(path: &Path) -> Result<Json, Error> {
+    std::fs::read(path)
         .map_err(|e| e.to_string())
         .and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string()))
         .map_err(|e| Error::Refused(format!("{}: {e}", path.display())))
@@ -891,9 +895,13 @@ fn table_rows<S>(
 ) -> Result<StoredRows, Error> {
     let name = &decl.name;
     let ty = GgmlType::from_u32(decl.type_id);
-    if !matches!(ty, GgmlType::F8E4M3_ROWS | GgmlType::NVFP4_ROWS) {
-        return Err(format!("{name}: {ty} is not F8 or NVFP4 rows").into());
-    }
+    // Values per block-scale byte, for the formats that store a plane of block scales.
+    let per_scale: Option<u64> = match ty {
+        GgmlType::F8E4M3_ROWS => None,
+        GgmlType::NVFP4_ROWS => Some(16),
+        GgmlType::MXFP8 => Some(32),
+        _ => return Err(format!("{name}: {ty} is not F8, NVFP4 or MXFP8 rows").into()),
+    };
     let (width, rows) = match decl.dims[..] {
         [width, rows]
             if width > 0 && rows > 0 && size_of(decl.type_id, &decl.dims) == Some(decl.nbytes) =>
@@ -909,12 +917,18 @@ fn table_rows<S>(
     let divisor = if ty == GgmlType::NVFP4_ROWS { 2 } else { 1 };
     let mut held = 0u64;
     for (source, placed) in m.placed(plan)? {
-        let s = if ty == GgmlType::NVFP4_ROWS {
-            let (s, block_scale) = modelopt::nvfp4_rows_scale(&get, source, placed)?;
-            scale_runs.push(folder.file_range(block_scale)?);
-            s
-        } else {
-            modelopt::fp8_rows_scale(&get, source, placed)?.0
+        let s = match ty {
+            GgmlType::NVFP4_ROWS => {
+                let (s, block_scale) = modelopt::nvfp4_rows_scale(&get, source, placed)?;
+                scale_runs.push(folder.file_range(block_scale)?);
+                s
+            }
+            GgmlType::MXFP8 => {
+                let block_scale = modelopt::mxfp8_rows_scale(&get, source, placed)?;
+                scale_runs.push(folder.file_range(block_scale)?);
+                1.0
+            }
+            _ => modelopt::fp8_rows_scale(&get, source, placed)?.0,
         };
         if let Some(t) = scale.filter(|&t| t != s) {
             return Err(format!("{source}: tensor scale {s}, the table's {t}").into());
@@ -945,8 +959,8 @@ fn table_rows<S>(
             row_bytes: width / divisor,
             runs,
         },
-        block_scales: (ty == GgmlType::NVFP4_ROWS).then_some(StoredPlane {
-            row_bytes: width / 16,
+        block_scales: per_scale.map(|n| StoredPlane {
+            row_bytes: width / n,
             runs: scale_runs,
         }),
         scale: scale.ok_or_else(|| format!("{name}: a table of no parts"))?,

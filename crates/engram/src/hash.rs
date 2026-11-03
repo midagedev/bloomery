@@ -297,6 +297,24 @@ impl Hash {
         })
     }
 
+    /// [`Hash::from_gguf`] over the keys of `split`'s header alone: a checkpoint folder's header
+    /// (`gguf::Split::header_only`), whose keys carry every constant, reads as a split's would.
+    pub fn from_keys(split: &gguf::Split) -> Result<Hash, EngramError> {
+        Hash::from_gguf(&Inventory {
+            version: 3,
+            meta: split
+                .iter_kv()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+            tensors: vec![],
+            header_end: 0,
+            data_base: 0,
+            alignment: 32,
+            file_len: 0,
+            path: None,
+        })
+    }
+
     /// The constants of the split set in `dir`, read from headers only.
     ///
     /// The tables themselves are never mapped: this is the path for a caller

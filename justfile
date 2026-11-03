@@ -2399,6 +2399,14 @@ gate-fixture:
 gate-fixture-budget:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model-hf --bin fixture -- --ignored hw_the_written_fixtures_hold_their_recorded_budget --nocapture'
 
+# A rank's read-set of an original DeepSeek-V4.1 folder (model_hf::arch::deepseek41::rank_reads) on a fixture folder written
+# from the 1017 headers in crates/hf's fixtures: the preflight ledgers at 1, 2 and 4 ranks (each rank's row cache every
+# page a row's value and scale planes can touch), no two runs of one file within
+# READ_GAP, and for each of 4 ranks a sparse folder holding only its reads gives the same parts, bytes and scales, as the
+# whole folder. Writes about a GiB under the temporary directory and removes it. No card.
+gate-ds41-reads:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model-hf --lib -- --ignored hw_rank_read_set --nocapture'
+
 # The architecture registry (crates/model/src/arch/registry.rs): every architecture string is in one row and every `Arch`
 # in one row, a fixture row declares its row's architecture, the draft rules are the three rows that have one,
 # tools/arch-registry.tsv (which tools/hf-arch-check.py reads) is the registry's print, and each family's written fixture
@@ -2921,11 +2929,12 @@ gate-serve-draft-rules:
 # The V4.1 binaries' `--place` word (`generate::Place`, behind the deepseek41 feature like bind): each alias and its card
 # list (`a6000+3090` is `bp`) planning the machine its plan function makes, a list word planning its own cards, and every
 # refusal by name before any plan. The GLM generator's TP plan holds rank order and bytes at N = 1, 2 and 4. Every
-# --place word llama-server's flags make (llama_place) parses at the seats and resolves on the census.
+# --place word llama-server's flags make (llama_place) parses at the seats and resolves on the census. The V4.1
+# generator's `--preflight` (ds41_preflight, behind `checkpoint` too) counts its ranks only against a unified pool.
 # Host only, no card or gate lock.
 [group('host')]
 gate-ds41-place:
-    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41 --lib -- generate:: && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41 --lib -- llama_place::seat_words && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41 --lib -- llama_launch:: && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next-hf --bin generate_glm5next'
+    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41 --lib -- generate:: && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41 --lib -- llama_place::seat_words && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41 --lib -- llama_launch:: && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next-hf --bin generate_glm5next && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,checkpoint --lib -- ds41_preflight::'
 
 # ik의 KLD 기준 파일(ik-ppl --kld-base)이 그것을 쓴 실행과 맞는지 본다: 헤더의 ctx·청크 수와 파일 크기가 실행의 결과
 # 줄과 같고, 기록마다 ik 양자화기가 쓸 수 있는 모양이며, 파일에서 다시 잰 PPL이 실행이 찍은 PPL과 양자화 밴드 안에서
