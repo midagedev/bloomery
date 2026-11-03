@@ -788,7 +788,7 @@ disk_ok() { # $1 a path whose volume must hold the floor free; one verdict line,
 # builds on never split across parts), and runs the fixture, the helpers and the locals above and between them itself.
 # `--self-test` starts every part and sums their counts; `--self-test --part K` runs one (K, or `all`: the parts one
 # after another in this process, the serial form). The summary names the three slowest cases.
-SELFTEST_PARTS=20
+SELFTEST_PARTS=22
 self_test() {
   local self t h n=0 bad=0 out rc real_classes part=${1:-all} case_t0=$SECONDS
   gb_part() {
@@ -3020,9 +3020,6 @@ HK
     '^DONE total=2 red=0 tier=fixture skipped=0 wall=[0-9]+s plan=[0-9]+s( slow=[0-9]+\.[0-9]{2})? laneA=0s laneB=0s deferred=2 real_file=2 deferred_list=[^ ]*/c-rf-only/deferred.list$'
   want_not '  … has no other kind in it' "$t/target/c-rf-only/run.log" '^DONE .*(real_only|no_fixture)='
   want_no_row '  … and made no box call at all' "$t/fake-state/box.log" '1'
-  check "real-file: the tree's own recipes.py reaches the fence for a gate that opens the model, and not for one that opens none" 0 \
-    '^gate-gpu-p1	D	real-file	-	family deepseek2: .* bloomery-gpu-gates:bin:gate_p1 reaches the fixture fence at crates/gpu-gates/src/bin/gate_p1\.rs:[0-9]+ \(' bash "$self" --tier fixture --classes
-  real_classes=$out
   # The fixture table is tools/fixture-dirs.tsv's: a table this reader cannot read is a named error.
   cp "$t/tools/fixture-dirs.tsv" "$t/fixture-dirs.good"
   rm -f "$t/tools/fixture-dirs.tsv"
@@ -3035,6 +3032,13 @@ HK
   { cat "$t/fixture-dirs.good"; printf '%s\t%s\n' qwen4exp v41x; } > "$t/tools/fixture-dirs.tsv"
   check "no-fixture: a family in the table twice: a named error" 65 'line 7: the family .qwen4exp. is in the table twice' "${gb[@]}" --tier fixture --classes
   cp "$t/fixture-dirs.good" "$t/tools/fixture-dirs.tsv"
+  fi
+  if gb_part 21; then
+  # The tree's own classification of every recipe is one CPU-bound python process, the longest single case of the file: it and the two
+  # cases that read its output are a part of their own, so part 13's other cases run beside it, not behind it.
+  check "real-file: the tree's own recipes.py reaches the fence for a gate that opens the model, and not for one that opens none" 0 \
+    '^gate-gpu-p1	D	real-file	-	family deepseek2: .* bloomery-gpu-gates:bin:gate_p1 reaches the fixture fence at crates/gpu-gates/src/bin/gate_p1\.rs:[0-9]+ \(' bash "$self" --tier fixture --classes
+  real_classes=$out
   # The real table: the tree's own tools/fixture-dirs.tsv parses, and the family it names runs (a converted V4.1 gate is balanced, not deferred).
   check "no-fixture: the tree's own tools/fixture-dirs.tsv is a table this runner reads" 0 '^gate-gpu-ds41-step	F	balanced	' printf '%s\n' "$real_classes"
   out=$real_classes
@@ -3444,7 +3448,9 @@ PY
   # INT/TERM (stop): TERM to the batch's own pid, once its item runs.
   fi
   local slow_s='steal-slow@FAKE_SLEEP=20'
-  if gb_part 15; then
+  if gb_part 22; then
+  # The stop, die and reap cases and the hold's end-of-life cases are a part of their own: they share no file or variable with the hold
+  # cases of part 15 (each sets its own state), and both halves are sleep-bound.
   printf '%s\n' "$slow_s	A	3090	30	$d" > "$t/times-hold-stop.tsv"
   fresh_state "$t/target/c-hold-stop"
   BLOOMERY_GATE_TIMES=$t/times-hold-stop.tsv BLOOMERY_GATE_LEDGER=$t/lead-hold-stop.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-hold-stop.tsv \
