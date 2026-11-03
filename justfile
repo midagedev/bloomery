@@ -1065,12 +1065,15 @@ wt-retire NAME:
 # remote dir's target/release-dist/. The box's platform picks the archive: the x86-64 one on the box, the GB10 one on a
 # GB10 (run there with BLOOMERY_BOX_LOCAL=1: box.sh's remote guard reads /root's lease); BLOOMERY_ARCH naming the RTX 50
 # series' arch builds its x86-64 archive on the box, beside the first (tools/release/build.sh's header names the archs).
+# BLOOMERY_RELEASE_TARGET=aarch64 builds the GB10 archive on the box itself, cross, its cubins from the toolkit's ptxas; the
+# box names the aarch64 sysroot qemu-aarch64 runs the binary's --version in as QEMU_LD_PREFIX (its environment file, or
+# BLOOMERY_BOX_ENV), and build.sh refuses by name what the box lacks.
 # Before the box is touched, tools/release/carry.sh refuses a commit that lacks a fix tools/release/carry.tsv lists
 # (here, where .git is).
 release-build VERSION:
     test -z "$(git status --porcelain --untracked-files=no)" || { echo "release-build: the tree has uncommitted changes" >&2; exit 1; }
     ./tools/release/carry.sh
-    ./tools/box.sh "bash tools/release/build.sh {{VERSION}} $(git rev-parse --short=12 HEAD)"
+    ./tools/box.sh "${BLOOMERY_RELEASE_TARGET:+BLOOMERY_RELEASE_TARGET=$BLOOMERY_RELEASE_TARGET }bash tools/release/build.sh {{VERSION}} $(git rev-parse --short=12 HEAD)"
 
 # The release sitting (tools/release/sitting.sh's header: the cells file, the order, the hold, the verdict): every cell of the
 # release's table timed and checked on one binary inside one hold. CELLS is a cells file on the box (or under the synced tree);

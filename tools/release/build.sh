@@ -13,15 +13,18 @@
 #     archive's build rebuilds the other's. A build machine with no cc 12.0 card cannot compile the PTX to cubins, so it
 #     stays PTX and the driver compiles it on the card's first start;
 #   - aarch64: bloomery-<v>-linux-aarch64-cuda-sm121a, sm_121a PTX (GB10's native FP4, which loads on cc 12.1 alone),
-#     host code for GB10's cores; built on a GB10 (BLOOMERY_BOX names one, or BLOOMERY_BOX_LOCAL=1 on the Spark itself)
-#     or cross on an x86_64 machine (BLOOMERY_RELEASE_TARGET=aarch64: the rust aarch64 target, the cross gcc for the
-#     host code and aarch64 binutils, the cargo --target, the triple's bin dir and its own target dir; every missing
-#     tool and the rust target are refused by name, rc 69, before anything is built, and any other value is rc 64).
+#     host code for GB10's cores (rustc's `gb10`); built on a GB10 (BLOOMERY_BOX names one, or BLOOMERY_BOX_LOCAL=1 on the
+#     Spark itself) or cross on an x86_64 machine (BLOOMERY_RELEASE_TARGET=aarch64: the rust aarch64 target, the cross gcc
+#     for the host code and aarch64 binutils, the cargo --target, the triple's bin dir and its own target dir; every missing
+#     tool, the rust target and, when qemu-aarch64 is on PATH, a QEMU_LD_PREFIX that is no aarch64 sysroot are refused by
+#     name, rc 69, before anything is built, and any other value is rc 64).
 #     Either way the packed binary carries that PTX compiled as cubins, and the PTX stays beside it as `.oxart.ptx`,
 #     which bloomery-gpu loads for a bundle whose cubin the driver refuses, so a first start compiles nothing. On a
 #     GB10, oxart_jit --cubin links each `.oxart` bundle on the building machine's card; cross, oxart_ptxas hands each
 #     bundle's PTX to the toolkit's ptxas -arch=<the bundle's target> on the build host, no card and no gate lock, the
-#     ptxas version printed.
+#     ptxas version printed. A cross binary's `--version` runs under qemu-aarch64 (user mode, QEMU_LD_PREFIX its
+#     sysroot) before and after the cubins are packed; without qemu-aarch64 on PATH the check is named "not run" in the
+#     output. What no x86_64 machine proves: the driver's load of the cubins on a GB10 and a request.
 #
 # The failures it blocks, each checked on the built binaries before anything is packed:
 #   - a binary for another machine than the platform's (its ELF header);
@@ -30,16 +33,19 @@
 #   - a binary that links a shared library outside the allowed set (libcuda must be loaded at run time, never linked);
 #   - on x86_64, host code built for this box's CPU (znver3) instead of x86-64-v3: an instruction past x86-64-v3 outside a
 #     function that runs behind a runtime CPU check;
-#   - a binary with no embedded PTX of the platform's arch, or PTX for another target.
+#   - a binary with no embedded PTX of the platform's arch, or PTX for another target;
+#   - a packed binary whose `--version` fails to run, or names another commit or version than the archive's (a cross
+#     binary runs under qemu-aarch64, or is named "not run" where that is absent).
 # A BLOOMERY_ARCH that is no arch of the machine's archives (tools/arch.sh) ends a build with 64 before anything is built;
 # `--check` reads the binaries and never that variable: the archive's arch is its argument, its machine is
 # BLOOMERY_RELEASE_TARGET's or the machine's own, and an x86_64 binary checked with none is held to sm_86.
 # Usage: tools/release/build.sh <version> <commit>
 #        tools/release/build.sh --check <dir> [<arch>]   (the binary checks alone, on <dir>/<bin>, for the archive of
 #                                                         <arch>, default the archive machine's sm_86 or sm_121a; builds and packs nothing)
-#        tools/release/build.sh --self-test     (the host-code scan on fixture listings, the platform table and the cross refusals;
-#                                                check-recipes runs it)
-# BLOOMERY_RELEASE_TARGET=aarch64 builds the aarch64 archive cross on an x86_64 machine; a build and a --check both read it.
+#        tools/release/build.sh --self-test     (the host-code scan on fixture listings, the platform table, the cross refusals and
+#                                                the --version checks on stub binaries and a stub qemu; check-recipes runs it)
+# BLOOMERY_RELEASE_TARGET=aarch64 builds the aarch64 archive cross on an x86_64 machine; a build and a --check both read it
+# (`just release-build <v>` carries it to the box; QEMU_LD_PREFIX, the machine's aarch64 sysroot, is the box's own).
 # The tarball and its .sha256 keep the names this script writes ($NAME.tar.gz…): install.sh resolves the release by
 # them and the Homebrew tap's formula pins them, so `gh release upload` must be given the files as named, not copies
 # under other names. The version the tarball carries is the serve crate's, so a release bumps that crate first.
@@ -165,33 +171,84 @@ set_target() {
 }
 
 # The cross build's own rows: its target dir (never the x86_64 archives', never a GB10's), the cargo triple, the cross
-# linker and the target binutils — the x86_64 objcopy cannot read an aarch64 binary. The cubin packer is a host tool
-# (oxart_ptxas, no device code), so nothing that runs is built for the wrong machine.
+# linker, and the target binutils — the x86_64 objcopy cannot read an aarch64 binary, and the checks read the ELF with the
+# target's readelf, objdump and strings. The cubin packer is a host tool (oxart_ptxas, no device code), so nothing that
+# runs is built for the wrong machine; the row's CUBIN stays 1: the cross archive packs cubins like the GB10's own.
 cross_platform() {
   TARGET_DIR=portable-aarch64 TRIPLE=aarch64-unknown-linux-gnu
   LINKER=aarch64-linux-gnu-gcc OBJCOPY=aarch64-linux-gnu-objcopy
+  READELF=aarch64-linux-gnu-readelf OBJDUMP=aarch64-linux-gnu-objdump STRINGS=aarch64-linux-gnu-strings
+}
+
+# need_tool <tool> <what to do>: refuses (69) a tool that is not on PATH, naming the command that provides it.
+need_tool() {
+  command -v "$1" > /dev/null || {
+    echo "release: $1 is not on PATH: $2" >&2
+    return 69
+  }
+}
+
+# The cross binutils the checks read the binary with, refused by name (rc 69): a `--check` needs these alone.
+cross_binutils() {
+  local t
+  for t in readelf objdump strings; do
+    need_tool "aarch64-linux-gnu-$t" "apt install binutils-aarch64-linux-gnu (the checks read the aarch64 binary with the target's $t)" || return $?
+  done
 }
 
 # The cross toolchain, refused by name before anything is built (rc 69): each tool names the package that provides it,
-# the rust target the command that installs it, ptxas the toolkit it comes with.
+# the rust target the command that installs it, ptxas the toolkit it comes with. qemu-aarch64 is optional (the packed
+# binary's --version is then named "not run", see cross_version); when it is on PATH, QEMU_LD_PREFIX must name the
+# aarch64 sysroot it runs the binary in (the machine's own path; there is no default for it).
 cross_tools() {
-  command -v aarch64-linux-gnu-gcc > /dev/null || {
-    echo "release: aarch64-linux-gnu-gcc is not on PATH: apt install gcc-aarch64-linux-gnu (the cross linker)" >&2
-    return 69
-  }
-  command -v aarch64-linux-gnu-objcopy > /dev/null || {
-    echo "release: aarch64-linux-gnu-objcopy is not on PATH: apt install binutils-aarch64-linux-gnu (the x86_64 objcopy cannot read an aarch64 binary)" >&2
-    return 69
-  }
-  command -v ptxas > /dev/null || {
-    echo "release: ptxas is not on PATH: the CUDA toolkit's assembler compiles the archive's cubins (no card is needed)" >&2
-    return 69
-  }
+  need_tool aarch64-linux-gnu-gcc "apt install gcc-aarch64-linux-gnu (the cross linker)" || return $?
+  need_tool aarch64-linux-gnu-objcopy "apt install binutils-aarch64-linux-gnu (the x86_64 objcopy cannot read an aarch64 binary)" || return $?
+  cross_binutils || return $?
+  need_tool ptxas "the CUDA toolkit's assembler compiles the archive's cubins (no card is needed)" || return $?
   local sysroot
   sysroot=$(rustc --print sysroot 2> /dev/null) || sysroot=
   if [ -z "$sysroot" ] || [ ! -d "$sysroot/lib/rustlib/aarch64-unknown-linux-gnu" ]; then
     echo "release: the aarch64-unknown-linux-gnu target is not installed for ${sysroot:-this rustc}: rustup target add aarch64-unknown-linux-gnu" >&2
     return 69
+  fi
+  command -v qemu-aarch64 > /dev/null || return 0
+  if [ -z "${QEMU_LD_PREFIX:-}" ]; then
+    echo "release: QEMU_LD_PREFIX is not set: name the aarch64 sysroot qemu-aarch64 runs the binary in (apt install libc6-arm64-cross; Ubuntu puts it at /usr/aarch64-linux-gnu)" >&2
+    return 69
+  fi
+  if [ ! -e "$QEMU_LD_PREFIX/lib/ld-linux-aarch64.so.1" ]; then
+    echo "release: QEMU_LD_PREFIX=$QEMU_LD_PREFIX holds no lib/ld-linux-aarch64.so.1: it is not an aarch64 sysroot (apt install libc6-arm64-cross)" >&2
+    return 69
+  fi
+}
+
+# check_version <binary> <version> <commit> [runner…]: the binary's `--version` (run by the runner when one is given: a
+# cross binary needs qemu-aarch64) must name the commit and the version the tarball's name says — the serve crate's, so a
+# release bumps that crate first. Prints the line; a failing run, a missing commit or a missing version ends it with 1.
+check_version() {
+  local f=$1 version=$2 commit=$3 v
+  shift 3
+  v=$("$@" "$f" --version) || {
+    echo "release: ${f##*/} --version failed${1:+ under $1}" >&2
+    return 1
+  }
+  case "$v" in
+    *"$commit"*) ;;
+    *) echo "release: ${f##*/} --version does not name the commit $commit: $v" >&2; return 1 ;;
+  esac
+  case "$v" in
+    *" $version ("*) echo "release: ${f##*/} --version: $v" ;;
+    *) echo "release: ${f##*/} --version does not name the version $version (bump crates/serve and crates/gpu-gates first): $v" >&2; return 1 ;;
+  esac
+}
+
+# cross_version <binary> <version> <commit>: a cross binary's --version, run by qemu-aarch64 (the sysroot is
+# QEMU_LD_PREFIX, which cross_tools checked). With no qemu-aarch64 on PATH the check does not run, and says so.
+cross_version() {
+  if command -v qemu-aarch64 > /dev/null; then
+    check_version "$@" qemu-aarch64
+  else
+    echo "release: ${1##*/} --version not run: qemu-aarch64 is not on PATH (apt install qemu-user); a run on a GB10 checks it"
   fi
 }
 
@@ -312,40 +369,115 @@ self_test() {
   expect_cross() { # expect_cross <case> <uname -m> <variable> <want rc> <want output>
     cases=$((cases + 1))
     out=$( (set_target "$2" "$3" && set_platform "$MACHINE" '' && cross_platform &&
-      echo "$PLATFORM $RELEASE_ARCH $HOST_CPU $TARGET_DIR v3=$SCAN_V3 glibc=$GLIBC_FLOOR cubin=$CUBIN triple=$TRIPLE linker=$LINKER objcopy=$OBJCOPY") 2>&1) && rc=0 || rc=$?
+      echo "$PLATFORM $RELEASE_ARCH $HOST_CPU $TARGET_DIR v3=$SCAN_V3 glibc=$GLIBC_FLOOR cubin=$CUBIN triple=$TRIPLE linker=$LINKER objcopy=$OBJCOPY readelf=$READELF objdump=$OBJDUMP strings=$STRINGS") 2>&1) && rc=0 || rc=$?
     if [ "$rc" != "$4" ] || [ "$out" != "$5" ]; then
       echo "release self-test: cross $1: rc $rc (want $4), output: $out" >&2
       echo "  want: $5" >&2
       fails=$((fails + 1))
     fi
   }
-  expect_cross cross-line x86_64 aarch64 0 "linux-aarch64-cuda-sm121a sm_121a gb10 portable-aarch64 v3= glibc=2.39 cubin=1 triple=aarch64-unknown-linux-gnu linker=aarch64-linux-gnu-gcc objcopy=aarch64-linux-gnu-objcopy"
+  expect_cross cross-line x86_64 aarch64 0 "linux-aarch64-cuda-sm121a sm_121a gb10 portable-aarch64 v3= glibc=2.39 cubin=1 triple=aarch64-unknown-linux-gnu linker=aarch64-linux-gnu-gcc objcopy=aarch64-linux-gnu-objcopy readelf=aarch64-linux-gnu-readelf objdump=aarch64-linux-gnu-objdump strings=aarch64-linux-gnu-strings"
 
-  # cross_tools on a stub PATH: each missing piece refused by name (69), the rust target named with its command, all
-  # present a pass. The stubs are empty executables; the stub rustc names a sysroot the test fills last.
-  local t
+  # cross_tools on a stub PATH: each missing piece refused by name (69), the rust target named with its command, and
+  # qemu-aarch64 optional: absent it passes, present it needs QEMU_LD_PREFIX to name an aarch64 sysroot. The stubs are
+  # empty executables; the stub rustc names a sysroot the test fills when the rust target is due.
+  local t qp=
   t=$(mktemp -d "${TMPDIR:-/tmp}/release-tools.XXXXXX") || return 70
   stub() { printf '#!/bin/sh\n' > "$t/$1" && chmod +x "$t/$1"; }
-  expect_tools() { # expect_tools <case> <want rc> <want output>
+  expect_tools() { # expect_tools <case> <want rc> <want output>: cross_tools with QEMU_LD_PREFIX=$qp
     cases=$((cases + 1))
-    out=$(PATH="$t" cross_tools 2>&1) && rc=0 || rc=$?
+    out=$(QEMU_LD_PREFIX=$qp PATH="$t" cross_tools 2>&1) && rc=0 || rc=$?
     if [ "$rc" != "$2" ] || [ "$out" != "$3" ]; then
       echo "release self-test: tools $1: rc $rc (want $2), output: $out" >&2
       echo "  want: $3" >&2
       fails=$((fails + 1))
     fi
   }
+  local binutils='apt install binutils-aarch64-linux-gnu'
   expect_tools none 69 "release: aarch64-linux-gnu-gcc is not on PATH: apt install gcc-aarch64-linux-gnu (the cross linker)"
   stub aarch64-linux-gnu-gcc
-  expect_tools no-objcopy 69 "release: aarch64-linux-gnu-objcopy is not on PATH: apt install binutils-aarch64-linux-gnu (the x86_64 objcopy cannot read an aarch64 binary)"
+  expect_tools no-objcopy 69 "release: aarch64-linux-gnu-objcopy is not on PATH: $binutils (the x86_64 objcopy cannot read an aarch64 binary)"
   stub aarch64-linux-gnu-objcopy
+  expect_tools no-readelf 69 "release: aarch64-linux-gnu-readelf is not on PATH: $binutils (the checks read the aarch64 binary with the target's readelf)"
+  stub aarch64-linux-gnu-readelf
+  expect_tools no-objdump 69 "release: aarch64-linux-gnu-objdump is not on PATH: $binutils (the checks read the aarch64 binary with the target's objdump)"
+  stub aarch64-linux-gnu-objdump
+  expect_tools no-strings 69 "release: aarch64-linux-gnu-strings is not on PATH: $binutils (the checks read the aarch64 binary with the target's strings)"
+  stub aarch64-linux-gnu-strings
   expect_tools no-ptxas 69 "release: ptxas is not on PATH: the CUDA toolkit's assembler compiles the archive's cubins (no card is needed)"
   stub ptxas
   printf '#!/bin/sh\necho %s\n' "$t/sysroot" > "$t/rustc"
   chmod +x "$t/rustc"
   expect_tools no-rust-target 69 "release: the aarch64-unknown-linux-gnu target is not installed for $t/sysroot: rustup target add aarch64-unknown-linux-gnu"
   mkdir -p "$t/sysroot/lib/rustlib/aarch64-unknown-linux-gnu"
-  expect_tools present 0 ""
+  expect_tools present-no-qemu 0 ""
+  stub qemu-aarch64
+  expect_tools qemu-no-sysroot-name 69 "release: QEMU_LD_PREFIX is not set: name the aarch64 sysroot qemu-aarch64 runs the binary in (apt install libc6-arm64-cross; Ubuntu puts it at /usr/aarch64-linux-gnu)"
+  qp=$t/sysroot-aarch64
+  expect_tools qemu-not-a-sysroot 69 "release: QEMU_LD_PREFIX=$qp holds no lib/ld-linux-aarch64.so.1: it is not an aarch64 sysroot (apt install libc6-arm64-cross)"
+  mkdir -p "$qp/lib" && : > "$qp/lib/ld-linux-aarch64.so.1"
+  expect_tools present-with-qemu 0 ""
+  # A --check reads the binary with the target's binutils alone.
+  cases=$((cases + 1))
+  out=$(PATH="$t" cross_binutils 2>&1) && rc=0 || rc=$?
+  if [ "$rc" != 0 ] || [ -n "$out" ]; then
+    echo "release self-test: binutils present: rc $rc (want 0), output: $out" >&2
+    fails=$((fails + 1))
+  fi
+  rm "$t/aarch64-linux-gnu-strings"
+  cases=$((cases + 1))
+  out=$(PATH="$t" cross_binutils 2>&1) && rc=0 || rc=$?
+  if [ "$rc" != 69 ] || [ "$out" != "release: aarch64-linux-gnu-strings is not on PATH: $binutils (the checks read the aarch64 binary with the target's strings)" ]; then
+    echo "release self-test: binutils no-strings: rc $rc (want 69), output: $out" >&2
+    fails=$((fails + 1))
+  fi
+
+  # check_version on stub binaries: the line it prints, the runner that runs a cross binary, and each refusal by name. The
+  # stub runner says so on stderr and execs its argument, so a case that must run under one shows it.
+  printf '#!/bin/sh\necho "bloomery-serve 0.3.12 (commit abc123456789)"\n' > "$t/serve"
+  printf '#!/bin/sh\necho "bloomery-serve 0.3.12" >&2\nexit 7\n' > "$t/serve-dies"
+  printf '#!/bin/sh\necho "ran under the runner" >&2\nexec "$@"\n' > "$t/runner"
+  chmod +x "$t/serve" "$t/serve-dies" "$t/runner"
+  expect_version() { # expect_version <case> <binary> <version> <commit> <want rc> <want output> [runner…]
+    cases=$((cases + 1))
+    local name=$1 binary=$2 version=$3 commit=$4 want_rc=$5 want=$6
+    shift 6
+    out=$(check_version "$t/$binary" "$version" "$commit" "$@" 2>&1) && rc=0 || rc=$?
+    if [ "$rc" != "$want_rc" ] || [ "$out" != "$want" ]; then
+      echo "release self-test: version $name: rc $rc (want $want_rc), output: $out" >&2
+      echo "  want: $want" >&2
+      fails=$((fails + 1))
+    fi
+  }
+  local line='bloomery-serve 0.3.12 (commit abc123456789)'
+  expect_version native serve 0.3.12 abc123456789 0 "release: serve --version: $line"
+  expect_version under-runner serve 0.3.12 abc123456789 0 "ran under the runner
+release: serve --version: $line" "$t/runner"
+  expect_version other-commit serve 0.3.12 deadbeefdead 1 "release: serve --version does not name the commit deadbeefdead: $line"
+  expect_version other-version serve 0.3.13 abc123456789 1 "release: serve --version does not name the version 0.3.13 (bump crates/serve and crates/gpu-gates first): $line"
+  expect_version dies serve-dies 0.3.12 abc123456789 1 "bloomery-serve 0.3.12
+release: serve-dies --version failed"
+  expect_version dies-under-runner serve-dies 0.3.12 abc123456789 1 "ran under the runner
+bloomery-serve 0.3.12
+release: serve-dies --version failed under $t/runner" "$t/runner"
+
+  # cross_version: a cross binary runs under qemu-aarch64 when it is on PATH, and is named "not run" when it is not.
+  expect_cross_version() { # expect_cross_version <case> <version> <commit> <want rc> <want output>
+    cases=$((cases + 1))
+    out=$(PATH="$t" cross_version "$t/serve" "$2" "$3" 2>&1) && rc=0 || rc=$?
+    if [ "$rc" != "$4" ] || [ "$out" != "$5" ]; then
+      echo "release self-test: cross version $1: rc $rc (want $4), output: $out" >&2
+      echo "  want: $5" >&2
+      fails=$((fails + 1))
+    fi
+  }
+  cp "$t/runner" "$t/qemu-aarch64"
+  expect_cross_version under-qemu 0.3.12 abc123456789 0 "ran under the runner
+release: serve --version: $line"
+  expect_cross_version under-qemu-other-commit 0.3.12 deadbeefdead 1 "ran under the runner
+release: serve --version does not name the commit deadbeefdead: $line"
+  rm "$t/qemu-aarch64"
+  expect_cross_version no-qemu 0.3.12 abc123456789 0 "release: serve --version not run: qemu-aarch64 is not on PATH (apt install qemu-user); a run on a GB10 checks it"
   rm -rf "$t"
 
   if [ "$fails" = 0 ]; then
@@ -375,11 +507,11 @@ else
   ARCH=
 fi
 set_platform "$MACHINE" "$ARCH" || exit $?
-OBJCOPY=objcopy
+OBJCOPY=objcopy READELF=readelf OBJDUMP=objdump STRINGS=strings
 if [ -n "$CROSS" ]; then
   ARCH=$RELEASE_ARCH
   cross_platform
-  [ -n "$CHECK_ONLY" ] || { cross_tools || exit $?; }
+  if [ -n "$CHECK_ONLY" ]; then cross_binutils || exit $?; else cross_tools || exit $?; fi
 fi
 ALLOWED_NEEDED="^(libc\\.so\\.6|libm\\.so\\.6|libgcc_s\\.so\\.1|$LOADER)\$"
 
@@ -417,19 +549,19 @@ for b in "${BINS[@]}"; do
   f="$BIN_DIR/$b"
   [ -x "$f" ] || { echo "release: $f was not built" >&2; exit 1; }
 
-  machine=$(readelf -h "$f" | sed -n 's/^ *Machine: *//p')
+  machine=$("$READELF" -h "$f" | sed -n 's/^ *Machine: *//p')
   if [ "$machine" != "$ELF_MACHINE" ]; then
     echo "release: $b is a binary for '$machine', not this platform's '$ELF_MACHINE' ($PLATFORM)" >&2
     fail=1
   fi
 
-  strong=$(readelf -V "$f" | awk '/Name: GLIBC_/ && /Flags: none/ {sub("GLIBC_", "", $3); print $3}' | sort -V | tail -1)
+  strong=$("$READELF" -V "$f" | awk '/Name: GLIBC_/ && /Flags: none/ {sub("GLIBC_", "", $3); print $3}' | sort -V | tail -1)
   if [ "$(printf '%s\n%s\n' "$strong" "$GLIBC_FLOOR" | sort -V | tail -1)" != "$GLIBC_FLOOR" ]; then
     echo "release: $b needs GLIBC_$strong through a strong symbol version, past the floor $GLIBC_FLOOR" >&2
     fail=1
   fi
 
-  bad_needed=$(readelf -d "$f" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' | grep -Ev "$ALLOWED_NEEDED" || true)
+  bad_needed=$("$READELF" -d "$f" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' | grep -Ev "$ALLOWED_NEEDED" || true)
   if [ -n "$bad_needed" ]; then
     echo "release: $b links a library outside the allowed set: $bad_needed" >&2
     fail=1
@@ -439,7 +571,7 @@ for b in "${BINS[@]}"; do
   # selected by cpufeatures; crc32fast's AVX-512 and AVX2+VPCLMULQDQ arms under png, selected by is_x86_feature_detected!;
   # qdot's Q4_K AVX-512 VNNI bodies, selected by qdot::q4k_avx512); anywhere else they mean the host code was built for this box's CPU.
   past_v3=
-  if [ -n "$SCAN_V3" ] && ! past_v3=$(objdump -d -C "$f" | scan_past_v3); then
+  if [ -n "$SCAN_V3" ] && ! past_v3=$("$OBJDUMP" -d -C "$f" | scan_past_v3); then
     echo "release: $b: the host-code scan failed on its objdump listing" >&2
     fail=1
   elif [ -n "$past_v3" ]; then
@@ -450,18 +582,18 @@ for b in "${BINS[@]}"; do
 
   # A cubin archive's binary reads its code from `.oxart` and keeps the PTX it came from as `.oxart.ptx`.
   if [ -n "$CHECK_ONLY" ] && [ -n "$CUBIN" ] &&
-    [ "$(readelf -S -W "$f" | grep -cE ' \.oxart(\.ptx)? ')" != 2 ]; then
+    [ "$("$READELF" -S -W "$f" | grep -cE ' \.oxart(\.ptx)? ')" != 2 ]; then
     echo "release: $b does not carry both .oxart (the cubins) and .oxart.ptx (their PTX)" >&2
     fail=1
   fi
 
-  targets=$(strings -n 8 "$f" | sed -n 's/^\.target[[:space:]]\+\([a-z0-9_]*\).*/\1/p' | sort -u | tr '\n' ' ')
+  targets=$("$STRINGS" -n 8 "$f" | sed -n 's/^\.target[[:space:]]\+\([a-z0-9_]*\).*/\1/p' | sort -u | tr '\n' ' ')
   if [ "$targets" != "$RELEASE_ARCH " ]; then
     echo "release: $b embeds PTX targets [$targets], not $RELEASE_ARCH alone" >&2
     fail=1
   fi
 
-  echo "release: $b glibc_strong_max=$strong needed=$(readelf -d "$f" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' | tr '\n' ' ')ptx=[$targets] bytes=$(stat -c %s "$f")"
+  echo "release: $b glibc_strong_max=$strong needed=$("$READELF" -d "$f" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' | tr '\n' ' ')ptx=[$targets] bytes=$(stat -c %s "$f")"
 done
 [ "$fail" = 0 ] || exit 1
 if [ -n "$CHECK_ONLY" ]; then
@@ -469,23 +601,14 @@ if [ -n "$CHECK_ONLY" ]; then
   exit 0
 fi
 
+# The packed binary runs: --version names the commit and the version. A cross binary runs under qemu-aarch64 (user mode,
+# QEMU_LD_PREFIX its sysroot), the only run of the aarch64 code on the build host; without qemu it is named "not run".
 for b in "${BINS[@]}"; do
   if [ -n "$CROSS" ]; then
-    # The cross binary does not run on the build host; the Spark run before the tag stands in for it
-    # (docs/contrib/dgx-spark.md).
-    echo "release: $b --version not run: an aarch64 binary on x86_64 (the Spark run before the tag checks it)"
-    continue
+    cross_version "$BIN_DIR/$b" "$VERSION" "$COMMIT" || exit $?
+  else
+    check_version "$BIN_DIR/$b" "$VERSION" "$COMMIT" || exit $?
   fi
-  v=$("$CARGO_TARGET_DIR/release/$b" --version)
-  case "$v" in
-    *"$COMMIT"*) ;;
-    *) echo "release: $b --version does not name the commit $COMMIT: $v" >&2; exit 1 ;;
-  esac
-  # The tarball's name says VERSION, so the binary must say it too (the serve crate's version is bumped first).
-  case "$v" in
-    *" $VERSION ("*) echo "release: $b --version: $v" ;;
-    *) echo "release: $b --version does not name the version $VERSION (bump crates/serve and crates/gpu-gates first): $v" >&2; exit 1 ;;
-  esac
 done
 
 rm -rf "$STAGE"
@@ -505,7 +628,12 @@ if [ -n "$CUBIN" ]; then
     rm "$f.ptx.oxart" "$f.cubin.oxart"
   done
   bash "$0" --check "$STAGE/bin"
+  # The objcopy rewrote the cross binary: it must still run.
+  if [ -n "$CROSS" ]; then
+    for b in "${BINS[@]}"; do cross_version "$STAGE/bin/$b" "$VERSION" "$COMMIT" || exit $?; done
+  fi
 fi
+
 cp LICENSE THIRD_PARTY_NOTICES.md docs/serving.md "$STAGE/"
 cp tools/release/README.release.md "$STAGE/README.md"
 printf '%s\n%s\n' "$VERSION" "$COMMIT" > "$STAGE/VERSION"
