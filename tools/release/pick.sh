@@ -137,7 +137,7 @@ self_test() {
   w0=$(git -C "$r" rev-parse HEAD)
   printf '## Status (0.0.1)\nbloomery-0.0.1-linux-x86_64-cuda-sm86.tar.gz\nreleases/tag/v0.0.1)\n' > "$r/README.md"
   commit readme
-  git -C "$r" tag v0.0.0 "$(git -C "$r" commit-tree -p "$w0" -m side "$w0^{tree}")" # a release commit on a line of its own, no ancestor of HEAD
+  git -C "$r" tag v0.0.0 "$(git -C "$r" -c user.name=selftest -c user.email=selftest@invalid commit-tree -p "$w0" -m side "$w0^{tree}")" # a release commit on a line of its own, no ancestor of HEAD
   commit two
   w1=$(git -C "$r" rev-parse HEAD)
   commit three

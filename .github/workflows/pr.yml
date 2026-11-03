@@ -28,7 +28,9 @@ concurrency:
 jobs:
   contrib-check-t0:
     name: contrib-check t0
-    runs-on: ubuntu-latest
+    # ubuntu-24.04, not ubuntu-latest: latest moved to 26.04, whose default timeout, sort, cat and mkdir are uutils
+    # coreutils, and six tool self-tests read GNU's behaviour (#1150). Back to latest once the tools hold on both.
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - name: Checkout
@@ -90,7 +92,9 @@ jobs:
   # "Never"). It runs beside t0, not after it, so it adds no wall.
   lint:
     name: lint (clippy ratchet)
-    runs-on: ubuntu-latest
+    # ubuntu-24.04, not ubuntu-latest: latest moved to 26.04, whose default timeout, sort, cat and mkdir are uutils
+    # coreutils, and six tool self-tests read GNU's behaviour (#1150). Back to latest once the tools hold on both.
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - name: Checkout
