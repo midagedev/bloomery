@@ -5800,7 +5800,13 @@ mod gate {
             ]);
         }
         let after = [after_alone(&mut s, 0, a)?, after_alone(&mut s, 1, b)?];
-        let plain = [0, 1].map(|half| PLAIN_ROUNDS.map(|pass| half_of(pass, half)));
+        let rounds = plain_passes(&mut s, [a, b])?;
+        let plain = [0, 1].map(|half| {
+            rounds
+                .iter()
+                .map(|&pass| half_of(pass, half))
+                .collect::<Vec<_>>()
+        });
         let plain = [
             capped_run(&mut s, a, &plain[0])?,
             capped_run(&mut s, b, &plain[1])?,
@@ -5876,7 +5882,10 @@ mod gate {
         }
         z_ok &= z_red("waiting", waiting_select(&mut s));
         z_ok &= z_red("step after", step_after(&mut s, [a, b], &after));
-        z_ok &= z_red("plain rounds", plain_rounds(&mut s, [a, b], &plain, uneven));
+        z_ok &= z_red(
+            "plain rounds",
+            plain_rounds(&mut s, [a, b], &rounds, &plain, uneven),
+        );
         z_ok &= z_red("prompt anchor", prompt_anchor(&mut s, [a, b]));
         tier::sc(
             "(kp-draft) two slots cut to points at one position: each rejoins with its own row",
@@ -6473,7 +6482,7 @@ mod gate {
     fn slot_rounds(
         s: &mut app::Session<Body38>,
         windows: [&[u32]; 2],
-        rounds: &[(Option<usize>, Option<usize>)],
+        rounds: &[Pass],
         refs: [&Drafted; 2],
     ) -> Result<SlotRounds, GateError> {
         let mut drafts = [fresh_draft(s)?, fresh_draft(s)?];
@@ -6605,6 +6614,9 @@ mod gate {
         Ok(ok)
     }
 
+    /// A pass's depth for each slot (slot 0, slot 1), `None` for a slot the pass leaves out.
+    type Pass = (Option<usize>, Option<usize>);
+
     /// (z) plain rounds' passes: each pass's depth a slot (slot 0, slot 1),
     /// `None` for a slot the pass leaves out, 0 a plain row whose draft's
     /// waiting rows the pass's one store walk of every depth zero slot's
@@ -6614,7 +6626,7 @@ mod gate {
     /// drafted window where one is. The passes of slot 1 alone run while
     /// slot 0's draft waits on rows of the pass arena, which slot 0's next
     /// pass reads.
-    const PLAIN_ROUNDS: [(Option<usize>, Option<usize>); 12] = [
+    const PLAIN_ROUNDS: [Pass; 12] = [
         (Some(0), Some(0)),
         (Some(3), Some(3)),
         (Some(0), Some(0)),
@@ -6629,10 +6641,46 @@ mod gate {
         (Some(3), Some(3)),
     ];
 
+    /// The most drafted passes [`plain_passes`] runs on a window alone after
+    /// [`PLAIN_ROUNDS`] for one that keeps more than one row.
+    const DEEP_TRIES: usize = 16;
+
+    /// (z) plain rounds' passes: [`PLAIN_ROUNDS`], then on each slot the
+    /// drafted passes its window run alone takes after them, up to the first
+    /// that keeps more than one row (within [`DEEP_TRIES`]), and a plain pass
+    /// that walks the rows that pass kept. The tail is read off the window's
+    /// own run ([`capped_run`]), so a plain store walk of more than one row of
+    /// a slot stands on the draft accepting a proposal in that many passes,
+    /// not on an acceptance falling on a pass [`PLAIN_ROUNDS`] follows with a
+    /// plain one. A window whose passes keep one row each gets no tail.
+    fn plain_passes(
+        s: &mut app::Session<Body38>,
+        windows: [&[u32]; 2],
+    ) -> Result<Vec<Pass>, GateError> {
+        let mut tails = [Vec::new(), Vec::new()];
+        for (half, (ids, tail)) in windows.into_iter().zip(&mut tails).enumerate() {
+            let mut probe: Vec<_> = PLAIN_ROUNDS.iter().map(|&p| half_of(p, half)).collect();
+            let fixed = probe.iter().flatten().count();
+            probe.extend([Some(3); DEEP_TRIES]);
+            let run = capped_run(s, ids, &probe)?;
+            if let Some(j) = run.passes[fixed..].iter().position(|c| c.kept > 1) {
+                *tail = vec![Some(3); j + 1];
+                tail.push(Some(0));
+            }
+        }
+        let [t0, t1] = &tails;
+        let mut rounds = PLAIN_ROUNDS.to_vec();
+        rounds.extend(
+            (0..t0.len().max(t1.len()))
+                .map(|k| (t0.get(k).copied().flatten(), t1.get(k).copied().flatten())),
+        );
+        Ok(rounds)
+    }
+
     /// (z) plain rounds: each window's request started alone on its own
-    /// slot, then [`PLAIN_ROUNDS`]' passes of the slots each names
-    /// ([`app::mtp::pass_slots`]): each slot's ids, kept rows, draft windows
-    /// and draft store equal its window run alone ([`capped_run`]). At
+    /// slot, then the passes of `rounds` ([`plain_passes`]) of the slots each
+    /// names ([`app::mtp::pass_slots`]): each slot's ids, kept rows, draft
+    /// windows and draft store equal its window run alone ([`capped_run`]). At
     /// least one pass's store walk takes both slots' rows, and at least one
     /// pass of slot 1 alone runs while slot 0's draft waits on rows of the
     /// pass arena; the captured pass of slot 1's four rows alone holds the
@@ -6645,17 +6693,18 @@ mod gate {
     fn plain_rounds(
         s: &mut app::Session<Body38>,
         windows: [&[u32]; 2],
+        rounds: &[Pass],
         refs: &[Drafted; 2],
         wide: bool,
     ) -> Result<bool, GateError> {
-        let (done, off) = slot_rounds(s, windows, &PLAIN_ROUNDS, refs.each_ref())?;
+        let (done, off) = slot_rounds(s, windows, rounds, refs.each_ref())?;
         let key = [(1, 4)];
         let nodes = s.model_mut().capture_slots(&key)?;
         let own = s.model().body("(z) plain rounds")?.slots_launches(&key);
         // The rows each slot's draft has waiting: its start's step leaves one.
         let mut waiting = [1, 1];
         let (mut both, mut alone, mut deep) = (0usize, 0usize, 0usize);
-        for (pass, depths) in done.iter().zip(PLAIN_ROUNDS) {
+        for (pass, &depths) in done.iter().zip(rounds) {
             both += usize::from(depths == (Some(0), Some(0)));
             alone += usize::from(depths.0.is_none());
             for &(slot, c) in pass {
@@ -6671,7 +6720,7 @@ mod gate {
              of slot 1 alone ran beside slot 0's waiting rows, the pass of slot 1's 4 rows alone \
              holds {nodes} nodes against the body's own {own}, {deep} walks took more than one \
              row of a slot{} {}",
-            PLAIN_ROUNDS.len(),
+            rounds.len(),
             alone_runs(&off),
             if wide {
                 ""
