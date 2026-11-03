@@ -9,7 +9,8 @@
 //! either is refused by name. The family says which dim and unit ([`TpTensor::cut`]), the
 //! format its bytes and blocks, and [`card_blocks`] includes the role's kernel K unit. Which
 //! indices a rank holds is [`Cut::span`]'s, for every source of a rank's parts; [`part_of`] cuts
-//! a file tensor's bytes to them.
+//! a file tensor's bytes to them. [`preflight`] admits each rank by everything it needs beside its
+//! weights ([`RankNeed`]) before a load reads any.
 
 use std::ops::Range;
 
@@ -18,7 +19,10 @@ use models::Role;
 
 use super::devices::DeviceId;
 use super::machine::file_card_format;
+use super::refusal::PlacementError;
+use super::rule::ExpertPart;
 use super::workstation::{CardSpec, unified_of};
+use crate::accepts::leg_card_format;
 use crate::kernels;
 
 /// A tensor as the plan takes it.
@@ -29,9 +33,10 @@ pub struct TpTensor {
     pub dims: Vec<u64>,
     /// The bytes that split with the values (the values and their block scales).
     pub bytes: u64,
-    /// The card type a rank loads its part in. A part then counts its own shape's resident bytes
-    /// in that type's card layout ([`file_card_format`]), each row's padding and scale words
-    /// included; `None` splits `bytes` evenly.
+    /// The card type a rank loads the tensor or its part in. A whole tensor or a part then counts
+    /// its own shape's resident bytes in that type's card layout (a routed stack's card leg's,
+    /// [`leg_card_format`], where that holds the type, else its file's, [`file_card_format`]),
+    /// each row's padding and scale words included; `None` counts `bytes`, split evenly.
     pub card: Option<GgmlType>,
     /// The bytes every rank holds whole beside its part (a tensor scale a matrix).
     pub whole_bytes: u64,
@@ -211,6 +216,91 @@ pub fn part_of(
     ))
 }
 
+/// The cut of the tensor `name` of `dims`, which a family's rule gives `rank` dims split along
+/// `dim`: into parts of `units` units of `dims[dim]` (a head, a column), or of one value for
+/// `None`. A tensor of another dim count and an extent that is not whole units are refused.
+///
+/// # Errors
+///
+/// [`PlacementError::Tensor`].
+pub fn cut_units(
+    name: &str,
+    dims: &[u64],
+    rank: usize,
+    dim: usize,
+    units: Option<u64>,
+) -> Result<Option<Cut>, PlacementError> {
+    let refuse = |detail: String| PlacementError::Tensor {
+        name: name.into(),
+        detail,
+    };
+    if dims.len() != rank || dim >= rank {
+        return Err(refuse(format!("{dims:?} is not {rank}-D")));
+    }
+    let extent = dims[dim];
+    let unit = match units {
+        None => 1,
+        Some(n) if n > 0 && extent.is_multiple_of(n) => extent / n,
+        Some(n) => return Err(refuse(format!("dim {dim} of {extent} is not {n} units"))),
+    };
+    Ok(Some(Cut { dim, unit }))
+}
+
+/// A family's `cut` of the tensor `name` held in card type `ty` and run by the kernel of `role`,
+/// with the values a part keeps whole along dims 0 and 1: whole blocks of the type, along K at
+/// least the role's K unit ([`card_blocks`]); `None` for whole on every rank. A cut tensor with no
+/// role or of a type with no block is refused by name.
+///
+/// # Errors
+///
+/// [`PlacementError::Tensor`].
+pub fn cut_blocks(
+    name: &str,
+    ty: GgmlType,
+    cut: Option<Cut>,
+    role: Option<Role>,
+) -> Result<Option<(Cut, [u64; 2])>, PlacementError> {
+    let Some(c) = cut else {
+        return Ok(None);
+    };
+    let refuse = |detail: String| PlacementError::Tensor {
+        name: name.into(),
+        detail,
+    };
+    let role = role.ok_or_else(|| refuse("no tensor role".into()))?;
+    let block = ty
+        .blck_size()
+        .filter(|&b| b > 0)
+        .ok_or_else(|| refuse(format!("{ty} has no block size")))?;
+    let blocks = card_blocks(ty, [block, 1], role).map_err(|e| refuse(e.to_string()))?;
+    Ok(Some((c, blocks)))
+}
+
+/// Rank `rank` of `ranks`' indices of the tensor `name` of `dims` under `cut_of` (a family's cut
+/// with its blocks, [`cut_blocks`]): the dim it splits and the indices along it ([`Cut::span`]);
+/// `None` at one rank, where `cut_of` is not asked, and for a tensor kept whole.
+///
+/// # Errors
+///
+/// [`TpError::Rank`], and `cut_of`'s and [`Cut::span`]'s refusals.
+pub fn span_of(
+    name: &str,
+    dims: &[u64],
+    rank: usize,
+    ranks: usize,
+    cut_of: impl FnOnce() -> Result<Option<(Cut, [u64; 2])>, PlacementError>,
+) -> Result<Option<(usize, Range<u64>)>, PlacementError> {
+    check_rank(name, rank, ranks)?;
+    if ranks == 1 {
+        return Ok(None);
+    }
+    let Some((c, blocks)) = cut_of()? else {
+        return Ok(None);
+    };
+    let at = c.span(name, dims, blocks, rank, ranks)?;
+    Ok(Some((c.dim, at)))
+}
+
 /// The values a part of a tensor of card type `ty`, whose format block spans `block` values along
 /// dims 0 and 1, keeps whole: along dim 0 the least multiple of the block and the K unit of the
 /// role's kernel ([`kernels::card_k_unit`]), so a cut never leaves a rank a part it cannot run. A
@@ -335,6 +425,14 @@ pub enum TpError {
         node: String,
         other: usize,
     },
+    #[error("tp: rank {rank} on {node} needs more than its pool of {pool} B: {items}")]
+    Short {
+        rank: usize,
+        node: String,
+        pool: u64,
+        /// Every item of the rank's need and its bytes ([`RankLedger::line`]).
+        items: String,
+    },
     #[error("tp: rank {rank} on {node} holds {bytes} B, past its pool of {pool} B")]
     Over {
         rank: usize,
@@ -351,6 +449,44 @@ pub enum TpError {
 /// A cut [`Cut::part`] refuses, a rank past its pool and two ranks on one device, each by name; no
 /// rank or a byte sum past u64.
 pub fn plan_tp(pools: &[RankPool], tensors: &[TpTensor]) -> Result<Vec<Rank>, TpError> {
+    let w = weights(pools, tensors)?;
+    pools
+        .iter()
+        .enumerate()
+        .map(|(rank, p)| {
+            let r = Rank {
+                rank,
+                node: p.node.clone(),
+                pool_bytes: p.pool_bytes,
+                split_bytes: w.split,
+                whole_bytes: w.whole,
+                split_tensors: w.split_n,
+                whole_tensors: w.whole_n,
+            };
+            if r.bytes() > p.pool_bytes {
+                return Err(TpError::Over {
+                    rank,
+                    node: p.node.clone(),
+                    bytes: r.bytes(),
+                    pool: p.pool_bytes,
+                });
+            }
+            Ok(r)
+        })
+        .collect()
+}
+
+/// The weight bytes one rank of `pools` holds of `tensors`, the same on every rank.
+struct Weights {
+    split: u64,
+    whole: u64,
+    split_n: usize,
+    whole_n: usize,
+}
+
+/// [`Weights`] of `tensors` over `pools`. No rank, two ranks on one device, a cut [`Cut::part`]
+/// refuses and a byte sum past u64 are refused.
+fn weights(pools: &[RankPool], tensors: &[TpTensor]) -> Result<Weights, TpError> {
     let n = pools.len();
     if n == 0 {
         return Err(TpError::NoRank);
@@ -368,76 +504,190 @@ pub fn plan_tp(pools: &[RankPool], tensors: &[TpTensor]) -> Result<Vec<Rank>, Tp
             });
         }
     }
-    let (mut split, mut whole, mut split_n, mut whole_n) = (0u64, 0u64, 0, 0);
+    let mut w = Weights {
+        split: 0,
+        whole: 0,
+        split_n: 0,
+        whole_n: 0,
+    };
     for t in tensors {
         let Some(cut) = t.cut else {
-            whole = whole
-                .checked_add(t.bytes)
+            let bytes = match t.card {
+                Some(ty) => resident_bytes(t, &t.dims, ty)?,
+                None => t.bytes,
+            };
+            w.whole = w
+                .whole
+                .checked_add(bytes)
                 .and_then(|sum| sum.checked_add(t.whole_bytes))
                 .ok_or(TpError::Overflow)?;
-            whole_n += 1;
+            w.whole_n += 1;
             continue;
         };
         let part = cut.part(&t.name, &t.dims, t.block, n)?;
         let bytes = match t.card {
-            Some(ty) => part_bytes(t, cut.dim, part, ty)?,
+            Some(ty) => {
+                let mut dims = t.dims.clone();
+                dims[cut.dim] = part;
+                resident_bytes(t, &dims, ty)?
+            }
             // Whole blocks a part: the bytes split evenly with the values.
             None => t.bytes / n as u64,
         };
-        split = split.checked_add(bytes).ok_or(TpError::Overflow)?;
-        whole = whole.checked_add(t.whole_bytes).ok_or(TpError::Overflow)?;
-        split_n += 1;
+        w.split = w.split.checked_add(bytes).ok_or(TpError::Overflow)?;
+        w.whole = w
+            .whole
+            .checked_add(t.whole_bytes)
+            .ok_or(TpError::Overflow)?;
+        w.split_n += 1;
     }
-    split.checked_add(whole).ok_or(TpError::Overflow)?;
+    w.split.checked_add(w.whole).ok_or(TpError::Overflow)?;
+    Ok(w)
+}
+
+/// What one rank needs from its pool, by item: the weights (its parts of the
+/// split tensors and every whole one), the KV cache and the ring shadows of its context and
+/// slots, the host staging of gathered table rows and the page cache their reads keep, the
+/// gather pages of its collectives, the work scratch and the peak a load holds past the
+/// resident bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RankNeed {
+    pub split: u64,
+    pub whole: u64,
+    pub kv: u64,
+    pub shadow: u64,
+    pub row_staging: u64,
+    pub row_cache: u64,
+    pub gathers: u64,
+    pub scratch: u64,
+    pub load_peak: u64,
+}
+
+impl RankNeed {
+    /// Each item by its name, in the order the fields are.
+    #[must_use]
+    pub fn items(&self) -> [(&'static str, u64); 9] {
+        [
+            ("split", self.split),
+            ("whole", self.whole),
+            ("kv", self.kv),
+            ("shadow", self.shadow),
+            ("row_staging", self.row_staging),
+            ("row_cache", self.row_cache),
+            ("gathers", self.gathers),
+            ("scratch", self.scratch),
+            ("load_peak", self.load_peak),
+        ]
+    }
+
+    /// Every byte the items sum to; `None` past u64.
+    #[must_use]
+    pub fn total(&self) -> Option<u64> {
+        self.items()
+            .iter()
+            .try_fold(0u64, |sum, &(_, b)| sum.checked_add(b))
+    }
+}
+
+/// One rank's admission ([`preflight`]): its node, its pool and what it needs of it by item.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RankLedger {
+    pub rank: usize,
+    pub node: String,
+    pub pool_bytes: u64,
+    pub need: RankNeed,
+}
+
+impl RankLedger {
+    /// The ledger as one line: the rank, its node, every item and the total against the pool.
+    #[must_use]
+    pub fn line(&self) -> String {
+        let items: Vec<String> = self
+            .need
+            .items()
+            .iter()
+            .map(|(item, b)| format!("{item}={b}"))
+            .collect();
+        format!(
+            "rank={} node={} {} total={} pool={}",
+            self.rank,
+            self.node,
+            items.join(" "),
+            self.need
+                .total()
+                .map_or("overflow".into(), |t| t.to_string()),
+            self.pool_bytes
+        )
+    }
+}
+
+/// Each rank's admission of `tensors` over `pools`, checked before any byte is read: the weight
+/// bytes the cuts give a rank ([`plan_tp`]'s), added to the `split` and `whole` of what
+/// `need(rank)` names beside them, and the other items as `need` gives them. A rank whose items
+/// pass its pool is refused naming every item and its bytes.
+///
+/// # Errors
+///
+/// [`plan_tp`]'s refusals but its weights-only [`TpError::Over`], and [`TpError::Short`].
+pub fn preflight(
+    pools: &[RankPool],
+    tensors: &[TpTensor],
+    need: &dyn Fn(usize) -> RankNeed,
+) -> Result<Vec<RankLedger>, TpError> {
+    let w = weights(pools, tensors)?;
     pools
         .iter()
         .enumerate()
         .map(|(rank, p)| {
-            let r = Rank {
+            let mut n = need(rank);
+            n.split = n.split.checked_add(w.split).ok_or(TpError::Overflow)?;
+            n.whole = n.whole.checked_add(w.whole).ok_or(TpError::Overflow)?;
+            let ledger = RankLedger {
                 rank,
                 node: p.node.clone(),
                 pool_bytes: p.pool_bytes,
-                split_bytes: split,
-                whole_bytes: whole,
-                split_tensors: split_n,
-                whole_tensors: whole_n,
+                need: n,
             };
-            if r.bytes() > p.pool_bytes {
-                return Err(TpError::Over {
+            match n.total() {
+                Some(t) if t <= p.pool_bytes => Ok(ledger),
+                _ => Err(TpError::Short {
                     rank,
                     node: p.node.clone(),
-                    bytes: r.bytes(),
                     pool: p.pool_bytes,
-                });
+                    items: ledger.line(),
+                }),
             }
-            Ok(r)
         })
         .collect()
 }
 
-/// The resident bytes of `t`'s part of `part` values along `dim` in card type `ty`'s layout, as a
-/// rank's load allocates them; a shape past u64 or with no layout is refused.
-fn part_bytes(t: &TpTensor, dim: usize, part: u64, ty: GgmlType) -> Result<u64, TpError> {
-    let mut dims = t.dims.clone();
-    dims[dim] = part;
-    let k = dims[0];
-    let rows = dims[1..]
+/// The resident bytes of `t` at `dims` (its own or a part's) in card type `ty`'s layout, as a
+/// rank's load allocates them: a routed gate, up or down stack in the card leg's
+/// ([`leg_card_format`]) where that holds `ty`, any other tensor in its file's
+/// ([`file_card_format`]). No dims, a shape past u64 or no layout is refused.
+fn resident_bytes(t: &TpTensor, dims: &[u64], ty: GgmlType) -> Result<u64, TpError> {
+    let refuse = || TpError::Tensor {
+        name: t.name.clone(),
+        detail: format!("no resident card form for {ty} {dims:?}"),
+    };
+    let (&k, rest) = dims.split_first().ok_or_else(refuse)?;
+    let rows = rest
         .iter()
         .try_fold(1u64, |a, &b| a.checked_mul(b))
         .ok_or(TpError::Overflow)?;
-    file_card_format(&t.name, ty, k)
+    ExpertPart::of_name(&t.name)
+        .map(|_| leg_card_format(ty))
+        .filter(|f| f.holds(ty))
+        .or_else(|| file_card_format(&t.name, ty, k))
         .and_then(|f| f.resident_bytes(ty, k, rows))
-        .ok_or_else(|| TpError::Tensor {
-            name: t.name.clone(),
-            detail: format!("no resident card form for {ty} part {dims:?}"),
-        })
+        .ok_or_else(refuse)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Cut, GgmlType, Range, RankPool, Role, TensorInfo, TpError, TpTensor, card_blocks, part_of,
-        plan_tp,
+        Cut, GgmlType, Range, RankNeed, RankPool, Role, TensorInfo, TpError, TpTensor, card_blocks,
+        part_of, plan_tp, preflight,
     };
 
     fn pools(n: usize, bytes: u64) -> Vec<RankPool> {
@@ -533,6 +783,90 @@ mod tests {
                 "{ty}"
             );
         }
+    }
+
+    /// A whole tensor and a routed stack with a card type count their card layouts' bytes: a
+    /// BF16 router of 4096 × 256 is widened to f32, 4,194,304 B on every rank at N = 1, 2 and 4,
+    /// and an MXFP4 down of K 2304 over 4 ranks keeps the card leg's file blocks in whole words,
+    /// 18 blocks of 17 bytes, 306, rounded to 308 a row. Mutants: the router's file bytes,
+    /// 2,097,152; the down in its file layout, which MXFP4 lacks, refused.
+    #[test]
+    fn a_whole_tensor_and_a_routed_stack_count_their_card_layouts() {
+        let router = TpTensor {
+            name: "router".into(),
+            dims: vec![4096, 256],
+            bytes: 4096 * 256 * 2,
+            card: Some(GgmlType::BF16),
+            whole_bytes: 0,
+            block: [1, 1],
+            cut: None,
+        };
+        for n in [1, 2, 4] {
+            let plan = plan_tp(&pools(n, 1 << 40), std::slice::from_ref(&router)).unwrap();
+            assert!(plan.iter().all(|r| r.whole_bytes == 4_194_304), "{plan:?}");
+        }
+        let down = TpTensor {
+            name: "ffn_down_exps.weight".into(),
+            dims: vec![2304, 64, 4],
+            bytes: 72 * 17 * 256,
+            card: Some(GgmlType::MXFP4),
+            whole_bytes: 0,
+            block: [32, 1],
+            cut: Some(Cut { dim: 0, unit: 32 }),
+        };
+        let plan = plan_tp(&pools(4, 1 << 40), &[down]).unwrap();
+        assert!(plan.iter().all(|r| r.split_bytes == 308 * 256), "{plan:?}");
+    }
+
+    /// A rank's ledger holds its weights beside the items its need names, at N = 1, 2 and 4; a
+    /// rank whose items pass its pool is refused naming each item, where its weights alone fit.
+    #[test]
+    fn preflight_admits_each_rank_by_every_item_it_needs() {
+        let rows = Some(Cut { dim: 1, unit: 128 });
+        let ts = [
+            t("q", 4096, 8192, [1, 1], rows),
+            t("norm", 4096, 1, [1, 1], None),
+        ];
+        let need = |rank: usize| RankNeed {
+            whole: 1,
+            kv: 100 + rank as u64,
+            row_cache: 7,
+            ..RankNeed::default()
+        };
+        for n in [1, 2, 4] {
+            let ledgers = preflight(&pools(n, 1 << 40), &ts, &need).unwrap();
+            for (rank, l) in ledgers.iter().enumerate() {
+                assert_eq!(l.rank, rank);
+                assert_eq!(l.need.split, 4096 * 8192 / n as u64);
+                assert_eq!(l.need.whole, 4096 + 8 + 1);
+                assert_eq!(l.need.kv, 100 + rank as u64);
+                assert_eq!(
+                    l.need.total(),
+                    Some(4096 * 8192 / n as u64 + 4096 + 9 + 107 + rank as u64)
+                );
+            }
+        }
+        let fits = 4096 * 8192 / 2 + 4096 + 9 + 107;
+        let mut short = pools(2, fits);
+        assert!(preflight(&short, &ts, &need).is_err());
+        assert!(plan_tp(&short, &ts).is_ok());
+        short[1].pool_bytes = fits + 1;
+        short[0].pool_bytes = fits;
+        let ok = preflight(&short, &ts, &need).unwrap();
+        assert!(
+            ok[1]
+                .line()
+                .contains("kv=101 shadow=0 row_staging=0 row_cache=7")
+        );
+        short[1].pool_bytes = fits;
+        let TpError::Short { rank, items, .. } = preflight(&short, &ts, &need).unwrap_err() else {
+            panic!("not a named shortfall");
+        };
+        assert_eq!(rank, 1);
+        assert!(
+            items.contains("split=16777216 whole=4105 kv=101"),
+            "{items}"
+        );
     }
 
     /// A unified node's rank plans against its node's pool, a card's against its usable bytes

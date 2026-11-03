@@ -33,7 +33,7 @@ use std::path::Path;
 
 use memchr::memmem::Finder;
 
-pub use decode::{Decoder, SpaceCleaner};
+pub use decode::{Decoder, SpaceCleaner, byte_decoder};
 pub use unicode::byte_to_cpt_table;
 pub use vocab::{Specials, attr};
 

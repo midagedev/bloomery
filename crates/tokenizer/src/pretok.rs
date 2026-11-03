@@ -707,6 +707,10 @@ pub(crate) struct Scratch {
 pub(crate) enum Pre {
     /// `deepseek-v3`, `hunyuan-dense`, `joyai-llm`: three regexes in turn.
     DeepseekV3,
+    /// `deepseek-v3` as a Hugging Face `tokenizer.json` runs it: classes are Unicode 14.0's, and
+    /// BPE skips a byte its vocabulary lacks. Never named in a header; a vocabulary with
+    /// `tokenizer.bloomery.eog_token_ids` gets it.
+    DeepseekV3Hf,
     /// `qwen2`, `solar-open`: the reference's hand-written splitter, one number
     /// a word. Solar's `tokenizer.json` carries qwen2's regex verbatim.
     Qwen2,
@@ -788,6 +792,7 @@ impl Pre {
     /// own case; `None` for a name no folder's `tokenizer.json` spells.
     pub(crate) fn hf_reading(self) -> Option<Pre> {
         match self {
+            Pre::DeepseekV3 => Some(Pre::DeepseekV3Hf),
             Pre::Qwen2 => Some(Pre::Qwen2Hf),
             Pre::Qwen35 => Some(Pre::Qwen35Hf),
             Pre::Llama3 => Some(Pre::Llama3Hf),
@@ -840,6 +845,7 @@ impl Pre {
         match self {
             Pre::Gemma4 => Spelling::Metaspace,
             Pre::DeepseekV3
+            | Pre::DeepseekV3Hf
             | Pre::Qwen2
             | Pre::Glm4
             | Pre::Qwen35
@@ -864,13 +870,13 @@ impl Pre {
 pub(crate) fn split<'s>(pre: Pre, cpts: &[u32], s: &'s mut Scratch) -> &'s [usize] {
     s.collapsed.clear();
     let class: fn(u32) -> u8 = match pre {
-        Pre::Qwen35Hf | Pre::Qwen2Hf | Pre::Llama3Hf => collapse_hf,
+        Pre::Qwen35Hf | Pre::Qwen2Hf | Pre::Llama3Hf | Pre::DeepseekV3Hf => collapse_hf,
         Pre::MiniMaxM2Hf | Pre::TekkenHf => collapse_cased,
         _ => collapse,
     };
     s.collapsed.extend(cpts.iter().map(|&cp| class(cp)));
     match pre {
-        Pre::DeepseekV3 => split_ordered(cpts, s, match_word),
+        Pre::DeepseekV3 | Pre::DeepseekV3Hf => split_ordered(cpts, s, match_word),
         Pre::Flint => split_ordered(cpts, s, match_flint),
         Pre::Qwen2 => {
             split_custom(cpts, &s.collapsed, 1, &mut s.b);
@@ -1535,17 +1541,12 @@ mod tests {
         assert_eq!(Pre::Llama3.hf_reading(), Some(Pre::Llama3Hf));
     }
 
-    /// Qwen3's regex split as Hugging Face's `tokenizers` runs it: every text of the pinned corpus
-    /// (`hf_pieces_qwen2.py`: contractions in every case, letters and marks and numbers against
-    /// each other, spaces, symbols, code, every Unicode version's codepoints) is cut into pieces of
-    /// the byte lengths its pre-tokenizer gives.
-    ///
-    /// FAIL-first: with the reference's splitter in its place, the texts of codepoints Unicode 15.0
-    /// added and the `ſ` contractions fail; with marks in the letter run, the mark texts.
-    #[test]
-    fn qwen2_hf_pieces_are_hugging_faces() {
+    /// Every text of the pinned corpus `crates/hf/tests/fixtures/<fixture>.json.gz` is cut by
+    /// `pre` into pieces of the byte lengths Hugging Face's `tokenizers` gives, the first 20
+    /// texts that differ named.
+    fn hf_pieces(pre: Pre, fixture: &str) {
         let path = format!(
-            "{}/../hf/tests/fixtures/qwen2-hf-pieces.json.gz",
+            "{}/../hf/tests/fixtures/{fixture}.json.gz",
             env!("CARGO_MANIFEST_DIR")
         );
         let corpus: serde_json::Value = serde_json::from_reader(flate2::read::GzDecoder::new(
@@ -1561,7 +1562,7 @@ mod tests {
             let want: Vec<u64> = serde_json::from_value(case["pieces"].clone()).unwrap();
             let cpts: Vec<u32> = text.chars().map(u32::from).collect();
             let mut at = 0;
-            let ours: Vec<u64> = split(Pre::Qwen2Hf, &cpts, &mut s)
+            let ours: Vec<u64> = split(pre, &cpts, &mut s)
                 .iter()
                 .map(|&n| {
                     let bytes: usize = cpts[at..at + n]
@@ -1590,6 +1591,29 @@ mod tests {
         );
     }
 
+    /// Qwen3's regex split as Hugging Face's `tokenizers` runs it: every text of the pinned corpus
+    /// (`hf_pieces_qwen2.py`: contractions in every case, letters and marks and numbers against
+    /// each other, spaces, symbols, code, every Unicode version's codepoints) is cut into pieces of
+    /// the byte lengths its pre-tokenizer gives.
+    ///
+    /// FAIL-first: with the reference's splitter in its place, the texts of codepoints Unicode 15.0
+    /// added and the `ſ` contractions fail; with marks in the letter run, the mark texts.
+    #[test]
+    fn qwen2_hf_pieces_are_hugging_faces() {
+        hf_pieces(Pre::Qwen2Hf, "qwen2-hf-pieces");
+    }
+
+    /// DeepSeek-V3's three regexes as Hugging Face's `tokenizers` runs them over DeepSeek-V4.1's
+    /// `tokenizer.json`: every text of the pinned corpus (`hf_pieces_deepseek.py`, the qwen2
+    /// corpus's texts) is cut into pieces of the byte lengths its pre-tokenizer gives.
+    ///
+    /// FAIL-first: with the reference's classes in its place, the texts of codepoints Unicode 15.0
+    /// added fail.
+    #[test]
+    fn deepseek_v3_hf_pieces_are_hugging_faces() {
+        hf_pieces(Pre::DeepseekV3Hf, "deepseek-v3-hf-pieces");
+    }
+
     /// MiniMax's regex split as Hugging Face's `tokenizers` runs it: every text of the pinned corpus
     /// (`hf_pieces_minimax.py`: contractions in every case, letters of every category against
     /// each other, marks, digits, spaces, symbols, every Unicode version's codepoints) is cut into
@@ -1602,50 +1626,7 @@ mod tests {
     /// texts; with the prefix never left out or the capitals never given back, the mark texts.
     #[test]
     fn minimax_m2_hf_pieces_are_hugging_faces() {
-        let path = format!(
-            "{}/../hf/tests/fixtures/minimax-hf-pieces.json.gz",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        let corpus: serde_json::Value = serde_json::from_reader(flate2::read::GzDecoder::new(
-            std::fs::File::open(&path).unwrap_or_else(|e| panic!("{path}: {e}")),
-        ))
-        .unwrap();
-        let cases = corpus["cases"].as_array().unwrap();
-        assert!(cases.len() >= 11_000, "{} cases in {path}", cases.len());
-        let mut s = Scratch::default();
-        let mut failures = Vec::new();
-        for case in cases {
-            let text = case["text"].as_str().unwrap();
-            let want: Vec<u64> = serde_json::from_value(case["pieces"].clone()).unwrap();
-            let cpts: Vec<u32> = text.chars().map(u32::from).collect();
-            let mut at = 0;
-            let ours: Vec<u64> = split(Pre::MiniMaxM2Hf, &cpts, &mut s)
-                .iter()
-                .map(|&n| {
-                    let bytes: usize = cpts[at..at + n]
-                        .iter()
-                        .map(|&c| char::from_u32(c).unwrap().len_utf8())
-                        .sum();
-                    at += n;
-                    bytes as u64
-                })
-                .collect();
-            if ours != want {
-                failures.push(format!("{text:?}: ours {ours:?}, HF {want:?}"));
-            }
-        }
-        assert!(
-            failures.is_empty(),
-            "{} of {} texts:\n{}",
-            failures.len(),
-            cases.len(),
-            failures
-                .iter()
-                .take(20)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
+        hf_pieces(Pre::MiniMaxM2Hf, "minimax-hf-pieces");
     }
 
     /// The `minimax-m2` regex's alternatives, one case each, derived from the

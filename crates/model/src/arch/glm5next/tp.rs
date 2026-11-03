@@ -24,7 +24,7 @@ use gguf::GgmlType;
 
 use super::{names, roles};
 use crate::placement::PlacementError;
-use crate::placement::tp::{Cut, card_blocks, check_rank};
+use crate::placement::tp::{self, Cut};
 
 /// Whether a tensor of layer `layer` (`None` for one of no layer) is one a TP rank of a trunk of
 /// `layers` layers loads: not one of the next-token layers past the trunk's.
@@ -92,26 +92,7 @@ pub fn cut(name: &str, dims: &[u64], heads: u64) -> Result<Option<Cut>, Placemen
             });
         }
     };
-    if dims.len() != rank {
-        return Err(PlacementError::Tensor {
-            name: name.into(),
-            detail: format!("{dims:?} is not {rank}-D"),
-        });
-    }
-    let extent = dims[dim];
-    if !by_head {
-        return Ok(Some(Cut { dim, unit: 1 }));
-    }
-    if heads == 0 || !extent.is_multiple_of(heads) {
-        return Err(PlacementError::Tensor {
-            name: name.into(),
-            detail: format!("dim {dim} of {extent} is not {heads} heads"),
-        });
-    }
-    Ok(Some(Cut {
-        dim,
-        unit: extent / heads,
-    }))
+    tp::cut_units(name, dims, rank, dim, by_head.then_some(heads))
 }
 
 /// The [`cut`] of the glm5next tensor `name` of `dims` held in card type `ty`, with the values a
@@ -124,20 +105,7 @@ pub fn cut_of(
     dims: &[u64],
     heads: u64,
 ) -> Result<Option<(Cut, [u64; 2])>, PlacementError> {
-    let Some(c) = cut(name, dims, heads)? else {
-        return Ok(None);
-    };
-    let refuse = |detail: String| PlacementError::Tensor {
-        name: name.into(),
-        detail,
-    };
-    let role = roles::tensor_role(name).ok_or_else(|| refuse("no tensor role".into()))?;
-    let block = ty
-        .blck_size()
-        .filter(|&b| b > 0)
-        .ok_or_else(|| refuse(format!("{ty} has no block size")))?;
-    let blocks = card_blocks(ty, [block, 1], role).map_err(|e| refuse(e.to_string()))?;
-    Ok(Some((c, blocks)))
+    tp::cut_blocks(name, ty, cut(name, dims, heads)?, roles::tensor_role(name))
 }
 
 /// Rank `rank` of `ranks`' indices of the glm5next tensor `name` of card type `ty` and `dims`
@@ -152,15 +120,7 @@ pub fn rank_span(
     rank: usize,
     ranks: usize,
 ) -> Result<Option<(usize, Range<u64>)>, PlacementError> {
-    check_rank(name, rank, ranks)?;
-    if ranks == 1 {
-        return Ok(None);
-    }
-    let Some((c, blocks)) = cut_of(name, ty, dims, heads)? else {
-        return Ok(None);
-    };
-    let at = c.span(name, dims, blocks, rank, ranks)?;
-    Ok(Some((c.dim, at)))
+    tp::span_of(name, dims, rank, ranks, || cut_of(name, ty, dims, heads))
 }
 
 #[cfg(test)]

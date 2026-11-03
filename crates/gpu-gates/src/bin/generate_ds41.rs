@@ -11,6 +11,22 @@
 //!                   [--place PLACE] [--mode eager|graph] [--time [--warm W]]
 //!                   [--logits] [--warm-save]
 //!     generate_ds41 --records-schema
+//!     generate_ds41 --preflight <folder> --ranks N[,N...] [--ctx C]
+//!
+//! `--preflight`, in a build with the `checkpoint` feature (a build without it
+//! refuses the flag by name), reads the original checkpoint folder's headers
+//! alone (`model_hf::folder::open`) and prints a `tp need` record for each rank of
+//! each rank count `--ranks` lists: what the rank needs of its pool by item
+//! (`model_hf::arch::deepseek41::preflight`, at `--ctx` positions of one
+//! sequence, one position a step) and the folder bytes its read-set holds
+//! (`model_hf::arch::deepseek41::rank_reads`). Every rank's pool is this
+//! node's (its one device's census, `placement::tp::RankPool::of`): the ranks'
+//! own pools are their open's. The node's device must allocate from host
+//! memory, since a rank's need counts host and device bytes in one pool; a
+//! card of its own memory is refused by name. A rank count the cuts or a pool refuse is
+//! refused by name after the others print, with every item the short rank
+//! needs; no card is allocated or loaded (the census only reads the device's
+//! memory).
 //!
 //! Defaults: prompt 0 (none when `--depth` is given), N 32, C the serving
 //! context (`workstation::CTX_MAX`), place `a` (the common unset rule,
@@ -357,6 +373,8 @@ mod drive {
     };
     use bloomery_gpu_deepseek41::chain::attn::SUB_TOKENS;
     use bloomery_gpu_deepseek41::swap;
+    #[cfg(feature = "checkpoint")]
+    use bloomery_gpu_gates::ds41_preflight::preflight;
     use bloomery_gpu_gates::generate::{
         Diag, Lane, NoEog, Place, PlaceWhy, Residence, ServeFeed, TopRows, before_path, card_table,
         dump_table, lane_at, mode_name, place_table, read_table, repeat_runs, seed_path,
@@ -770,7 +788,21 @@ mod drive {
         bloomery_gpu_gates::llama_place::DRAFT_CARD,
     ];
 
+    /// `--preflight` in a build without the `checkpoint` feature, refused by name.
+    #[cfg(not(feature = "checkpoint"))]
+    fn preflight(_args: &[String]) -> Result<(), GateError> {
+        Err(
+            "--preflight: a checkpoint folder is opened by a build with the checkpoint feature"
+                .into(),
+        )
+    }
+
     pub fn run() -> Result<(), GateError> {
+        let args: Vec<String> = std::env::args().collect();
+        if args.iter().any(|a| a == "--preflight") {
+            record::at_main("generate_ds41", record::GENERATE_DS41);
+            return preflight(&args[1..]);
+        }
         // llama-server's placement flags and variables come out of the arguments, and the levers
         // they are replace the environment's, before any lever is read.
         let seat = || -> Result<&'static str, GateError> { Ok("ds41") };

@@ -52,7 +52,10 @@
 //! under the working directory. `cut` is the fixture of a safetensors checkpoint folder in its stored
 //! bits (`cut::cut`): the layers, widths and tensor roles its spec names (`tools/fixture-cuts/<name>.json`),
 //! the tokenizer and chat files copied, and `bloomery-cut.tsv` recording each kept tensor's source range
-//! and hash; it refuses an existing `<out dir>` and writes beside it, renaming on success. `verify` of a
+//! and hash; it refuses an existing `<out dir>` and writes beside it, renaming on success. `ds41-folder`
+//! is the original-format DeepSeek-V4.1 fixture folder of a checkpoint folder
+//! (`model_hf::arch::deepseek41::fixture::write`): the GGUF fixture's layers, a narrower inner width and
+//! small Engram tables in the source's own formats, every value drawn from `--seed`. `verify` of a
 //! directory (or its first shard) holds such a cut to its record and to its source folder, the one the
 //! record names unless `--source` says another (`cut::verify`). `registry` prints the architecture registry's rows (the text of
 //! `tools/arch-registry.tsv`). A flag its verb does not take, a flag given twice,
@@ -81,6 +84,7 @@ const USAGE: &str = "usage: fixture plan <real first shard> [--draft <real draft
        fixture generate <real first shard> <out dir> [--draft <real draft>] [flags]
        fixture fetch <family | repo[@rev][:quant]> <out dir> [--rev R] [flags]
        fixture cut <source folder> <out dir> --spec FILE [--shard-bytes B] [--card-budget B]
+       fixture ds41-folder <source folder> <out dir> [--seed N]
        fixture verify <fixture first shard> [--source <real first shard>] [--draft-source <real draft>]
        fixture verify <cut dir | its first shard> [--source <source folder>]
        fixture variant-rules <fixture first shard> --tag T [--table FILE]
@@ -138,6 +142,7 @@ fn run(args: &[String]) -> Res<()> {
         "plan" | "generate" => &PLAN_FLAGS,
         "fetch" => &FETCH_FLAGS,
         "cut" => &CUT_FLAGS,
+        "ds41-folder" => &["--seed"],
         "verify" => &VERIFY_FLAGS,
         "variant-rules" => &RULES_FLAGS,
         "variant-check" => &CHECK_FLAGS,
@@ -151,6 +156,7 @@ fn run(args: &[String]) -> Res<()> {
         ("generate", [source, out]) => generate(source, out, &a),
         ("fetch", [repo, out]) => fetch(repo, out, &a),
         ("cut", [source, out]) => cut_folder(source, out, &a),
+        ("ds41-folder", [source, out]) => ds41_folder(source, out, &a),
         ("verify", [first]) => verify(first, &a),
         ("variant-rules", [source]) => variant_rules(source, &a),
         ("variant-check", [variant]) => variant_check(variant, &a),
@@ -725,6 +731,23 @@ fn verify_fixture(
             sc.secs
         );
     }
+    Ok(())
+}
+
+/// `ds41-folder`: the original-format DeepSeek-V4.1 fixture folder of the checkpoint folder `source`.
+fn ds41_folder(source: &str, out: &str, a: &Args) -> Res<()> {
+    let shape = model_hf::arch::deepseek41::fixture::Shape::default();
+    let seed = a.seed.unwrap_or(DEFAULT_SEED);
+    let bytes = model_hf::arch::deepseek41::fixture::write(
+        Path::new(source),
+        Path::new(out),
+        &shape,
+        seed,
+    )?;
+    println!(
+        "ds41-folder: {out}: layers {:?} of {source}, ff {}, seed {seed}, {bytes} data bytes",
+        shape.layers, shape.ff
+    );
     Ok(())
 }
 

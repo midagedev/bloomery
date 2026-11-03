@@ -41,6 +41,7 @@ pub mod card;
 pub mod catalog;
 pub mod csf;
 pub mod dspark;
+pub mod engram;
 pub mod fetch;
 pub mod modelopt;
 pub mod quant_config;

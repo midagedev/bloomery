@@ -6,6 +6,7 @@ use serde_json::Value as Json;
 
 use crate::folder::{self, FolderMap};
 
+pub mod deepseek41;
 pub mod glm5next;
 pub mod lfm3;
 pub mod llama;
@@ -51,6 +52,11 @@ pub const MAPS: &[MapRow] = &[
         model_types: <llama::Checkpoint as FolderMap>::MODEL_TYPES,
         open: folder::open_as::<llama::Checkpoint>,
         architecture: folder::architecture_as::<llama::Checkpoint>,
+    },
+    MapRow {
+        model_types: <deepseek41::Ds41Map as FolderMap>::MODEL_TYPES,
+        open: folder::open_as::<deepseek41::Ds41Map>,
+        architecture: folder::architecture_as::<deepseek41::Ds41Map>,
     },
     MapRow {
         model_types: <nemotron_h::Checkpoint as FolderMap>::MODEL_TYPES,
