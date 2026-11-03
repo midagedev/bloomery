@@ -655,8 +655,11 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               highest, and none while no width beats the plain step by its margin. A \
               single-sequence pass can cut a full proposal to a prefix. Batched MTP rounds \
               price all active slots together, choose proposal depths before drafting and \
-              pack complete windows within the body's row bounds. Widths never change a \
-              generated token. `fixed` verifies every proposal whole, the same-binary arm. A drafting \
+              pack complete windows within the body's row bounds. While no expert moves \
+              (`BLOOMERY_RESIDENCY=off`) widths never change a generated token; under adaptive \
+              residency a flip lands a fixed number of passes after it is planned, so a width \
+              that changes the pass sequence moves the token a flip lands at, and a reply can \
+              differ at a near-tie. `fixed` verifies every proposal whole, the same-binary arm. A drafting \
               server prints an `mtp width` record a request under `cost`. Refused by name on a \
               run that drafts nothing. Read once at `main`, the policy every window of the \
               process runs by; no setter changes it between calls.",
@@ -833,7 +836,13 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         doc: "Adaptive expert residency (`host::swap`): `off` keeps the load's slot map for the \
               model's life; `mid-p<P>-s<S>` runs the residency rule's `mid` parameters over the \
               stage card's routed stacks, the first P seed experts of each layer never a victim \
-              and S slots a layer freed for flips in flight. The rule plans every 4 kept rows, \
+              and S slots a layer freed for flips in flight. The load frees those S slots at its \
+              start (their experts go to the host), so a `mid` word begins S experts a layer off \
+              the card that `off` keeps there on the same plan: its bits differ from `off`'s \
+              before the first flip lands, the host (Q8_2_X4, 32-value activation blocks) and \
+              the card (q8_1, 128-value blocks) summing one expert in different orders, and a \
+              reply after other traffic can differ from the first at a near-tie. The rule plans \
+              every 4 kept rows, \
               not every 4 passes, so a drafted pass of several kept rows swaps at the same \
               kept-token rate a plain one does; the rows past 4 carry to the next plan. Its cap \
               is a churn guard, not link-sized: the copies one planning pass issues are a few \

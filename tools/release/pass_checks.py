@@ -16,7 +16,8 @@ $BLOOMERY_SESSION_URL, _PID, _STDERR and _DIR. Every request is a greedy chat tu
   pass_long                    a prompt of at least 4096 tokens, counted by /tokenize before it is sent (--long-repeat
                                repeats of one sentence; a count under 4096 is a FAIL whose detail starts `harness:`
                                and names it, and the prompt is not sent), is answered
-  second_request_equals_first  pass_short's request replayed, after the long one, answers the same text
+  second_request_equals_first  pass_short's request replayed, after the long one, answers the same text (a server that
+                               moves experts: the same ids, or a split at a near tie; see below)
   off_reason                   only when the server is not up when the checks end: its refusal read from --stderr
 
 With --client toktape the request of each of those three checks is `toktape record`'s (the flags are the release
@@ -25,6 +26,17 @@ under --dir/tapes: the check sends nothing itself, so a prompt is prefilled once
 record is the very request the check judged. The tape must hold one request, without an error, whose last message
 is the check's prompt, and whose completion equals the text of its streamed tokens (the reasoning ones apart);
 anything else is a FAIL naming it. toktape ends other than 0 -> FAIL naming its exit status.
+
+A server that moves experts is read from its own records, not from a family list: the word of its `residency lever`
+(else `residency unset`, else `residency host`) record in --stderr is `off` or a `mid-p<P>-s<S>` word, and any word but `off`
+moves experts between the card and the host while it serves. Its replay runs on another expert map than the first reply
+did, and the host and the card sum one expert in different orders (designed rounding, AGENTS.md "Performance first,
+accuracy opt-in"), so a near-tie argmax may flip. Both requests then carry `logprobs` and `top_logprobs: 2`, and the check
+passes when the two replies' token ids are the same, or when, at the first differing position, the first reply's top-2 gap
+plus the replay's (a flip moves the pair's gap by at least both) is within SPLIT_GAP_BAND (the texts after the split are not
+compared); a larger sum is a FAIL naming the position, both tokens and both gaps. Under --client toktape the tapes hold no logprobs, so the check sends a direct pair of the short request
+(after the first tape, and after the long one) and judges that pair; the tapes are recorded and checked as ever. A server
+that moves no expert (word `off`, or no residency record, which the detail names) keeps the exact text comparison.
 
 A reply's text is `content`, or `reasoning_content` when content is empty; both empty is a FAIL. Anything but HTTP
 200 is a FAIL. A FAIL does not stop the next check. After every check the server is probed (/health, and --pid
@@ -46,12 +58,15 @@ Exit status: SESSION rc (0 or 1); 2 a named refusal (a file or the toktape binar
 code (the behaviour of the pass scripts this replaces, one at a time) and requires its case to fail.
 """
 import argparse
+import collections
 import contextlib
 import gzip
 import http.client
+import http.server
 import importlib.util
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -60,6 +75,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import types
 import urllib.parse
 from pathlib import Path
 
@@ -78,6 +94,22 @@ RECORD_BINS = ("generate_ds41", "bloomery-serve-ds41", "bloomery-serve-qwen38")
 REASON_LINES = 8
 # The run file `toktape record` writes: gzip'd JSON (or plain), `schema` first; this reader knows one.
 TAPE_SCHEMA = 1
+# The residency words a load runs by (crates/levers `residency_word`): `off`, or `mid-p<P>-s<S>` with an optional
+# `-unhosted`. The kinds that state the word, most resolved first: the lever's record (V4.1, Qwen3.8 and GLM-5.3 set), the
+# `residency unset` record of Qwen3.8 and the GLM seat unset, and the churn pool's `residency host` (printed only where the
+# word is not `off`).
+RESIDENCY_WORD = re.compile(r"^(off|mid-p\d+-s\d+(-unhosted)?)$")
+RESIDENCY_KINDS = ("residency_lever", "residency_unset", "residency_host")
+LOGPROBS_TOP = 2
+# The widest shift, in nats, between a replay's two top-2 gaps at its split on a moving expert map. The host (Q8_2_X4, 32-value
+# activation blocks) and the card (q8_1, 128-value blocks) round a moved expert's activation differently, so two expert maps
+# give one id's logit apart by sigma = 0.35; a gap is the difference of two logits, so it moves by sqrt(2) * 0.35 = 0.495, and a
+# flip is excused at three of that. A flip needs the pair's gap to move by the first reply's gap g1 plus the replay's g2.
+# PIN(2026-11-04): 3 * sqrt(2) * 0.35 = 1.485 [derived] with V4.1's sigma (crates/gpu-gates/src/prompts.rs SIGMA_LOGIT_V41),
+# which is borrowed: GLM-5.3's own sigma is not measured. The GLM-5.3 seat's data (rounds glmrep and resbits, [measured]: gap
+# shift rms 0.19 and p95 0.37 over 768 same-prefix position pairs; g1 + g2 at ten splits at most 0.77) sits inside it.
+SPLIT_GAP_BAND = 1.485
+SIGMA_LOGIT = 0.35
 
 
 class CheckFail(Exception):
@@ -144,9 +176,12 @@ def alive(pid):
     return bool(stat.strip()) and not stat.strip().startswith("Z")
 
 
-def chat_body(prompt, max_tokens):
-    return {"messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens, "temperature": 0,
+def chat_body(prompt, max_tokens, top_logprobs=0):
+    body = {"messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens, "temperature": 0,
             "stream": False, "chat_template_kwargs": {"enable_thinking": False}}
+    if top_logprobs:
+        body.update(logprobs=True, top_logprobs=top_logprobs)
+    return body
 
 
 def choose_text(content, reasoning):
@@ -161,6 +196,78 @@ def reply_text(obj):
     """(text, field) of a chat reply: content, or reasoning_content when content is empty; both empty is a CheckFail."""
     msg = ((obj.get("choices") or [{}])[0]).get("message") or {}
     return choose_text(msg.get("content") or "", msg.get("reasoning_content") or "")
+
+
+First = collections.namedtuple("First", "body text rows why")
+Residency = collections.namedtuple("Residency", "word moves note err")
+
+
+def residency_word(text):
+    """The residency word the load ran by, read from the server's own records in `text` (its stderr): the `residency lever`
+    record, else `residency unset`, else `residency host`; None when it printed none."""
+    lines = text.splitlines()
+    found = {}
+    for b in RECORD_BINS:
+        for r in records.read(lines, schema=schema(b)):
+            if r.kind in RESIDENCY_KINDS and "residency" in r.fields:
+                found.setdefault(r.kind, r["residency"])
+    return next((found[k] for k in RESIDENCY_KINDS if k in found), None)
+
+
+def logprob_rows(obj, who):
+    """The rows of a chat reply's choices[0].logprobs.content as (id, token, [(id, token, logprob), ...]); CheckFail when
+    the reply has none or a row without an id."""
+    content = (((obj.get("choices") or [{}])[0]).get("logprobs") or {}).get("content")
+    if not isinstance(content, list) or not content:
+        raise CheckFail(f"{who} carries no logprobs.content although top_logprobs {LOGPROBS_TOP} was asked")
+    rows = []
+    for i, e in enumerate(content):
+        try:
+            tops = [(int(t["id"]), t.get("token", ""), float(t["logprob"])) for t in e["top_logprobs"]]
+            rows.append((int(e["id"]), e.get("token", ""), tops))
+        except (KeyError, TypeError, ValueError):
+            raise CheckFail(f"{who}: logprobs.content[{i}] has no id, or a top_logprobs entry has no id or logprob")
+    return rows
+
+
+def split_index(a, b):
+    """The index of the first token id two replies' rows differ at; None when their ids are the same."""
+    for i in range(min(len(a), len(b))):
+        if a[i][0] != b[i][0]:
+            return i
+    return None if len(a) == len(b) else min(len(a), len(b))
+
+
+def top2_gap(rows, i):
+    """Row i's top-2 gap (the best logprob less the next, in nats); None when there is no such row or it names one token."""
+    if i >= len(rows) or len(rows[i][2]) < 2:
+        return None
+    best = sorted((t[2] for t in rows[i][2]), reverse=True)
+    return best[0] - best[1]
+
+
+def split_verdict(first, replay, note):
+    """The detail of a replay that is the first reply or splits from it at a near tie; CheckFail for a split above the band.
+    A flip moves the pair's gap by at least the first reply's top-2 gap g1 plus the replay's g2 (a lower bound on the
+    reversed gap), so g1 + g2 is held to the band; a reply that ended at the split has no gap there and counts 0."""
+    i = split_index(first, replay)
+    if i is None:
+        return f"the replay of pass_short has the same {len(first)} ids ({note})"
+
+    def tok(rows):
+        return f"{rows[i][1]!r} (id {rows[i][0]})" if i < len(rows) else "<end of reply>"
+
+    g1, g2 = top2_gap(first, i), top2_gap(replay, i)
+    where = f"the replay splits at token {i} of {len(first)}: first {tok(first)}, replay {tok(replay)}"
+    if g1 is None and g2 is None:
+        raise CheckFail(f"{where}; neither reply has a top-2 row there to tell a near tie from a leak ({note})")
+    total = (g1 or 0.0) + (g2 or 0.0)
+    gaps = " + ".join(f"{g:.4f}" if g is not None else "none" for g in (g1, g2))
+    if total > SPLIT_GAP_BAND:
+        raise CheckFail(f"{where}; the first reply's and the replay's top-2 gaps {gaps} = {total:.4f} are above the band "
+                        f"{SPLIT_GAP_BAND}, so not a near tie ({note})")
+    return (f"{where}; the first reply's and the replay's top-2 gaps {gaps} = {total:.4f} are within the band {SPLIT_GAP_BAND}, "
+            f"the texts after it are not compared ({note})")
 
 
 def read_tape(path):
@@ -235,7 +342,8 @@ class Session:
         self.a = a
         self.fails = 0
         self.dead = None          # why the server is not up, once it is known not to be
-        self.first = None         # (request body, text) of pass_short; the body is None under --client toktape
+        self.first = None         # First(body, text, logprob rows, why they are missing) of pass_short; the body is None under --client toktape
+        self.residency = Residency(None, False, "residency not read", None)
 
     def say(self, name, status, detail=""):
         if status == "FAIL":
@@ -267,6 +375,20 @@ class Session:
         if parts:
             print("session-plan: " + " ".join(parts), flush=True)
 
+    def read_residency(self):
+        """Whether the server moves experts, from the residency word its stderr records: Residency(word, moves, note, err),
+        the note naming the fact for a check's detail and err a word this check does not know."""
+        text = self.stderr_text()
+        if text is None:
+            return Residency(None, False, "no --stderr, so no residency record was read", None)
+        word = residency_word(text)
+        if word is None:
+            return Residency(None, False, "no residency record in the --stderr", None)
+        if not RESIDENCY_WORD.match(word):
+            return Residency(word, False, f"residency {word}",
+                             f"harness: the residency record names {word!r}, none of off or mid-p<P>-s<S>[-unhosted]")
+        return Residency(word, word != "off", f"residency {word}", None)
+
     def probe_down(self):
         """None while the server answers /health and its process runs; else why it is down."""
         why = None
@@ -284,17 +406,30 @@ class Session:
         said = refusal_of(text) if text is not None else None
         return f"{why}; its last words: {said}" if said else why
 
-    def post_chat(self, name, body):
-        """(text, field) of one chat request; CheckFail on a status other than 200, a reply that is no JSON, or no text."""
+    def post_chat_obj(self, name, body):
+        """The parsed reply of one chat request; CheckFail on a status other than 200 or a reply that is no JSON."""
         status, text = request(self.a.url, "POST", CHAT_PATH, body, self.a.timeout)
         self.save(name, body, status, text)
         if status != 200:
             raise CheckFail(f"HTTP {status}: {head(text)}")
         try:
-            obj = json.loads(text)
+            return json.loads(text)
         except ValueError:
             raise CheckFail(f"the reply is not JSON: {head(text)}")
-        return reply_text(obj)
+
+    def post_chat(self, name, body):
+        """(text, field) of one chat request; CheckFail on a status other than 200, a reply that is no JSON, or no text."""
+        return reply_text(self.post_chat_obj(name, body))
+
+    def asked_reply(self, name, body, who):
+        """(text, field, rows, why) of a chat request that asked for logprobs: the rows are None, with the reason in `why`,
+        when the reply carries none; CheckFail as `post_chat` for a reply with no text."""
+        obj = self.post_chat_obj(name, body)
+        text, field = reply_text(obj)
+        try:
+            return text, field, logprob_rows(obj, who), None
+        except CheckFail as e:
+            return text, field, None, str(e)
 
     def tokenized(self, text):
         st, reply = request(self.a.url, "POST", "/tokenize", {"content": text, "add_special": False}, self.a.timeout)
@@ -333,13 +468,27 @@ class Session:
         return f"tape {name}, {evaluated} prompt tokens evaluated, {len(text)} chars from {field}"
 
     def pass_short(self):
+        top = LOGPROBS_TOP if self.residency.moves else 0
         if self.a.client == "toktape":
             text, field, evaluated, name = self.record("short", "", SHORT_PROMPT)
-            self.first = (None, text)
+            rows = why = None
+            if top:
+                # A tape holds no logprobs: the pair the replay check judges is this direct request and the one after the long
+                # prompt; a failure of it is that check's, not pass_short's (the short prompt was answered).
+                try:
+                    _, _, rows, why = self.asked_reply("pass_short_probe", chat_body(SHORT_PROMPT, self.a.max_tokens, top),
+                                                       "the direct request after pass_short's tape")
+                except CheckFail as e:
+                    why = f"the direct request after pass_short's tape failed: {e}"
+            self.first = First(None, text, rows, why)
             return self.tape_detail(name, evaluated, text, field)
-        body = chat_body(SHORT_PROMPT, self.a.max_tokens)
-        text, field = self.post_chat("pass_short", body)
-        self.first = (body, text)
+        body = chat_body(SHORT_PROMPT, self.a.max_tokens, top)
+        if top:
+            text, field, rows, why = self.asked_reply("pass_short", body, "pass_short's reply")
+        else:
+            text, field = self.post_chat("pass_short", body)
+            rows = why = None
+        self.first = First(body, text, rows, why)
         return f"{len(text)} chars from {field}"
 
     def pass_long(self):
@@ -356,14 +505,37 @@ class Session:
     def second_request_equals_first(self):
         if self.first is None:
             raise CheckSkip("pass_short gave no reply to replay")
-        body, want = self.first
+        if self.residency.err:
+            raise CheckFail(self.residency.err)
+        if self.residency.moves:
+            return self.replay_of_a_moving_server()
+        body, want = self.first.body, self.first.text
         if body is None:
             text, _, _, _ = self.record("short", "2", SHORT_PROMPT)
         else:
             text, _ = self.post_chat("second_request_equals_first", body)
         if text != want:
-            raise CheckFail(f"the replay's text differs: first {head(want, 60)!r}, replay {head(text, 60)!r}")
+            raise CheckFail(f"the replay's text differs: first {head(want, 60)!r}, replay {head(text, 60)!r} "
+                            f"({self.residency.note}, so the replay is held exact)")
         return f"the replay of pass_short has the same {len(text)} chars"
+
+    def replay_of_a_moving_server(self):
+        """The replay on a server that moves experts: its ids the first reply's, or a split at a near tie (`split_verdict`)."""
+        first, note = self.first, self.residency.note
+        if first.why:
+            raise CheckFail(f"{first.why} ({note} and moves experts, so the replay is judged by logprobs)")
+        if first.body is None:
+            body = chat_body(SHORT_PROMPT, self.a.max_tokens, LOGPROBS_TOP)
+            _, _, rows, why = self.asked_reply("second_request_probe", body, "the direct request after the long prompt")
+            tape, _, _, _ = self.record("short", "2", SHORT_PROMPT)
+            tapes = "agree" if tape == first.text else "differ"
+            note += f", experts move; tapes {tapes}, direct pair judged"
+        else:
+            _, _, rows, why = self.asked_reply("second_request_equals_first", first.body, "the replay")
+            note += ", experts move"
+        if why:
+            raise CheckFail(f"{why} ({note})")
+        return split_verdict(first.rows, rows, note)
 
     def off_reason(self):
         if not self.a.stderr:
@@ -382,6 +554,7 @@ class Session:
 
     def run(self):
         self.info()
+        self.residency = self.read_residency()
         self.dead = self.probe_down()
         for name, fn in self.steps():
             if self.dead:
@@ -852,6 +1025,288 @@ def toktape_tape_of_another_shape_fails(main):
     return p
 
 
+# The replay cases of a server that moves experts. The stub child answers no logprobs, so these run against Scripted: a chat
+# server in this process whose k-th chat reply is script[k] = (text, rows), the rows going out as choices[0].logprobs.content
+# when the request asked for logprobs and rows is not None.
+class Scripted:
+    def __init__(self, script):
+        outer = self
+        self.script, self.bodies = list(script), []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def reply(self, code, obj):
+                b = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+
+            def do_GET(self):
+                self.reply(200 if self.path == "/health" else 404, {"status": "ok"})
+
+            def do_POST(self):
+                req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if self.path == "/tokenize":
+                    return self.reply(200, {"tokens": list(range(5000))})
+                outer.bodies.append(req)
+                k = len(outer.bodies) - 1
+                text, rows = outer.script[k] if k < len(outer.script) else ("past the script", None)
+                choice = {"index": 0, "finish_reason": "length",
+                          "message": {"role": "assistant", "content": text, "reasoning_content": ""}}
+                if rows is not None and req.get("logprobs"):
+                    choice["logprobs"] = {"content": [
+                        {"id": i, "token": t, "logprob": top[0][2],
+                         "top_logprobs": [{"id": a, "token": b, "logprob": c} for a, b, c in top]} for i, t, top in rows]}
+                self.reply(200, {"choices": [choice], "usage": {}})
+
+        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.srv.daemon_threads = True
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.srv.server_address[1]}"
+
+    def close(self):
+        self.srv.shutdown()
+        self.srv.server_close()
+
+
+def rows_of(ids, gaps=None):
+    """Rows for token ids `ids`: row i names the id and id + 100000, `gaps[i]` nats apart (3.0 where none is given)."""
+    gaps = gaps or {}
+    return [(t, f"t{t}", [(t, f"t{t}", -0.1), (t + 100000, f"u{t}", -0.1 - gaps.get(i, 3.0))]) for i, t in enumerate(ids)]
+
+
+GLM_UNSET = """residency unset residency=mid-p0-s1 why=unset: --place a or bp read=MemAvailable room=260623720448 plan_room=260086849536 mem_left=82845655040
+residency host residency=mid-p0-s1 hosted=hosted pinned=0 churn_experts=850 churn_bytes=13036814336 headroom=86135177216 headroom_after=73098362880 host_figure=nominal-A6000-workstation host_usable=270071001088
+"""
+LEVER_MID = "residency lever residency=mid-p0-s1 why=place\n"
+HOST_ONLY = GLM_UNSET.splitlines(True)[1]
+LEVER_OFF = "residency lever residency=off why=set\n"
+LEVER_BAD = "residency lever residency=banana why=set\n"
+NO_RESIDENCY = "plan place=a card=Stub ctx_max=16384 card_experts=1 (1 B) host_experts=0 (0 B) host_shadow=0 B n_l=1 on 1 layers\n"
+SPLIT_AT = 2           # the token index the near-tie replays split at
+IDS = [11, 12, 13, 14, 15]
+
+
+def tie_script(gap, back=0.02, ids=IDS, at=SPLIT_AT, long_text="the long reply"):
+    """The replies of short, long, short: the replay takes the runner-up at index `at`; the first reply's top-2 gap there is
+    `gap` and the replay's is `back`."""
+    first = rows_of(ids, {at: gap})
+    runner = ids[at] + 100000
+    swapped = [(runner, f"u{ids[at]}", [(runner, f"u{ids[at]}", -0.1), (ids[at], f"t{ids[at]}", -0.1 - back)])]
+    replay = first[:at] + swapped + rows_of([x + 200000 for x in ids[at + 1:]])
+    return [("short reply " + " ".join(f"t{i}" for i in ids), first), (long_text, None),
+            ("short reply " + " ".join(f"t{i}" for i in ids[:at]) + f" u{ids[at]} later", replay)]
+
+
+def scripted_run(main, script, stderr=None, argv=(), toktape=None):
+    """One session of `main` against a Scripted server; `stderr` is the text of the --stderr file (None: no such flag).
+    `toktape` (a mode string) puts the fake toktape on the run."""
+    tmp = scratch("pass-checks-sc.")
+    srv = Scripted(script)
+    try:
+        args = [srv.url, "--dir", str(tmp / "out"), "--timeout", "20"] + list(argv)
+        if stderr is not None:
+            (tmp / "err").write_text(stderr)
+            args += ["--stderr", str(tmp / "err")]
+        saved = {}
+        if toktape is not None:
+            fake, log = tmp / "toktape", tmp / "argv"
+            fake.write_text(FAKE_TOKTAPE.replace("@PY@", sys.executable))
+            fake.chmod(0o755)
+            env = {"FAKE_TOKTAPE_LOG": str(log), "FAKE_TOKTAPE_MODE": toktape, "FAKE_TOKTAPE_RC": "0"}
+            saved = {k: os.environ.get(k) for k in env}
+            os.environ.update(env)
+            args += ["--client", "toktape", "--toktape-bin", str(fake), "--tag", "rel"]
+        try:
+            rc, lines, raised = call(main, args, {})
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        r = types.SimpleNamespace(rc=rc, lines=lines, raised=raised, bodies=list(srv.bodies), tmp=tmp)
+        r.by, r.order, r.rc_line = parse(lines)
+        return r
+    finally:
+        srv.close()
+
+
+def asked(body):
+    return body.get("logprobs") is True and body.get("top_logprobs") == LOGPROBS_TOP
+
+
+def detail(r, name="second_request_equals_first"):
+    return r.by.get(name, ("missing", ""))[1]
+
+
+@case
+def a_moving_seat_that_splits_at_a_near_tie_passes(main):
+    r = scripted_run(main, tie_script(0.05), GLM_UNSET)
+    p = verdicts(r, pass_short="PASS", pass_long="PASS", second_request_equals_first="PASS") + rc_problem(r, 0)
+    d = detail(r)
+    for want in (f"splits at token {SPLIT_AT} of {len(IDS)}", "'t13' (id 13)", "'u13' (id 100013)", "gaps 0.0500 + 0.0200 = 0.0700",
+                 "residency mid-p0-s1", "texts after it are not compared"):
+        if want not in d:
+            p.append(f"the detail lacks {want!r}: {d!r}")
+    if [asked(b) for b in r.bodies] != [True, False, True]:
+        p.append(f"the short requests ask logprobs and the long one does not: {r.bodies}")
+    if {b.get("max_tokens") for b in r.bodies} != {128}:
+        p.append(f"max_tokens drifted: {[b.get('max_tokens') for b in r.bodies]}")
+    return p
+
+
+@case
+def a_moving_seat_with_the_same_ids_passes(main):
+    ids = IDS
+    script = [("same", rows_of(ids)), ("long", None), ("same", rows_of(ids))]
+    r = scripted_run(main, script, GLM_UNSET)
+    p = verdicts(r, pass_short="PASS", pass_long="PASS", second_request_equals_first="PASS") + rc_problem(r, 0)
+    if f"the same {len(ids)} ids" not in detail(r):
+        p.append(f"the detail does not say the ids are the same: {detail(r)!r}")
+    return p
+
+
+@case
+def a_moving_seat_that_splits_above_the_band_fails(main):
+    r = scripted_run(main, tie_script(2.0), GLM_UNSET)
+    p = verdicts(r, pass_short="PASS", pass_long="PASS", second_request_equals_first="FAIL") + rc_problem(r, 1)
+    d = detail(r)
+    for want in (f"token {SPLIT_AT} of {len(IDS)}", "'t13' (id 13)", "'u13' (id 100013)", "gaps 2.0000 + 0.0200 = 2.0200",
+                 f"band {1.485}"):
+        if want not in d:
+            p.append(f"the detail lacks {want!r}: {d!r}")
+    # The band's edge, through the check, in g1 + g2: 1.46 + 0.02 splits, 1.47 + 0.02 does not.
+    for gap, status in ((1.46, "PASS"), (1.47, "FAIL")):
+        e = scripted_run(main, tie_script(gap), GLM_UNSET)
+        p += [f"gap {gap}: {x}" for x in verdicts(e, second_request_equals_first=status)]
+    return p
+
+
+@case
+def a_moving_seat_whose_first_gap_is_small_and_replay_gap_large_fails(main):
+    # A flip moves the pair's gap by g1 + g2: a replay that is sure of the other token (2.0) is not a near tie.
+    r = scripted_run(main, tie_script(0.05, back=2.0), GLM_UNSET)
+    p = verdicts(r, pass_short="PASS", pass_long="PASS", second_request_equals_first="FAIL") + rc_problem(r, 1)
+    d = detail(r)
+    if "gaps 0.0500 + 2.0000 = 2.0500" not in d or "above the band" not in d:
+        p.append(f"the detail does not hold the sum of both gaps to the band: {d!r}")
+    p += verdicts(scripted_run(main, tie_script(0.05, back=0.4), GLM_UNSET), second_request_equals_first="PASS")
+    return p
+
+
+@case
+def a_moving_seat_whose_first_reply_ended_at_the_split_reads_the_replay_gap(main):
+    short = IDS[:3]
+    script = [("short", rows_of(short)), ("long", None), ("longer", rows_of(IDS, {3: 0.04}))]
+    r = scripted_run(main, script, GLM_UNSET)
+    p = verdicts(r, second_request_equals_first="PASS") + rc_problem(r, 0)
+    d = detail(r)
+    if "<end of reply>" not in d or "gaps none + 0.0400 = 0.0400" not in d:
+        p.append(f"the detail does not read the replay's row at the end of the first reply: {d!r}")
+    script[2] = ("longer", rows_of(IDS, {3: 2.0}))
+    p += verdicts(scripted_run(main, script, GLM_UNSET), second_request_equals_first="FAIL")
+    return p
+
+
+@case
+def a_seat_that_moves_no_expert_keeps_the_exact_comparison(main):
+    r = scripted_run(main, tie_script(0.05), LEVER_OFF)
+    p = verdicts(r, pass_short="PASS", pass_long="PASS", second_request_equals_first="FAIL") + rc_problem(r, 1)
+    d = detail(r)
+    if "the replay's text differs" not in d or "residency off" not in d:
+        p.append(f"the detail is not the exact comparison naming the word: {d!r}")
+    if any(b.get("logprobs") or b.get("top_logprobs") for b in r.bodies):
+        p.append(f"a seat that moves no expert was asked for logprobs: {r.bodies}")
+    same = [("same", rows_of(IDS)), ("long", None), ("same", rows_of(IDS))]
+    p += verdicts(scripted_run(main, same, LEVER_OFF), second_request_equals_first="PASS")
+    return p
+
+
+@case
+def a_server_with_no_residency_record_is_held_exact_and_says_so(main):
+    p = []
+    for text, said in ((NO_RESIDENCY, "no residency record in the --stderr"), (None, "no --stderr, so no residency record was read")):
+        r = scripted_run(main, tie_script(0.05), text)
+        p += [f"{said}: {x}" for x in verdicts(r, pass_short="PASS", second_request_equals_first="FAIL") + rc_problem(r, 1)]
+        if said not in detail(r):
+            p.append(f"the FAIL does not name the missing fact ({said!r}): {detail(r)!r}")
+        if any(b.get("logprobs") for b in r.bodies):
+            p.append(f"{said}: logprobs were asked of a server with no residency fact")
+    return p
+
+
+@case
+def the_residency_word_comes_from_the_servers_records(main):
+    p = []
+    for name, text, status in (("lever mid", LEVER_MID, "PASS"), ("unset and host", GLM_UNSET, "PASS"),
+                               ("host only", HOST_ONLY, "PASS"), ("lever off", LEVER_OFF, "FAIL"),
+                               ("lever off before a host line", LEVER_OFF + HOST_ONLY, "FAIL")):
+        r = scripted_run(main, tie_script(0.05), text)
+        p += [f"{name}: {x}" for x in verdicts(r, second_request_equals_first=status)]
+    return p
+
+
+@case
+def a_moving_seat_with_no_logprobs_in_a_reply_fails_by_name(main):
+    p = []
+    for name, script in (("first", [("a", None), ("long", None), ("a", rows_of(IDS))]),
+                         ("replay", [("a", rows_of(IDS)), ("long", None), ("a", None)])):
+        r = scripted_run(main, script, GLM_UNSET)
+        p += [f"{name}: {x}" for x in verdicts(r, pass_short="PASS", second_request_equals_first="FAIL") + rc_problem(r, 1)]
+        if "logprobs" not in detail(r):
+            p.append(f"{name}: the FAIL does not name logprobs: {detail(r)!r}")
+    return p
+
+
+@case
+def an_unknown_residency_word_is_a_harness_fail(main):
+    r = scripted_run(main, tie_script(0.05), LEVER_BAD)
+    p = verdicts(r, pass_short="PASS", second_request_equals_first="FAIL") + rc_problem(r, 1)
+    if not detail(r).startswith("harness:") or "banana" not in detail(r):
+        p.append(f"the FAIL is not a harness line naming the word: {detail(r)!r}")
+    return p
+
+
+@case
+def the_toktape_client_on_a_moving_seat_judges_a_direct_pair(main):
+    # The tapes (toktape's own requests, no logprobs) are chats 0, 2 and 4; the direct pair is chats 1 and 3.
+    p = []
+    for name, tied, want in (("near tie", tie_script(0.05), "PASS"), ("far split", tie_script(2.0), "FAIL")):
+        script = [("tape one", None), tied[0], (tied[1][0], None), tied[2], ("tape two", None)]
+        r = scripted_run(main, script, GLM_UNSET, toktape="")
+        p += [f"{name}: {x}" for x in verdicts(r, pass_short="PASS", pass_long="PASS", second_request_equals_first=want)
+              + rc_problem(r, 0 if want == "PASS" else 1)]
+        if [asked(b) for b in r.bodies] != [False, True, False, True, False]:
+            p.append(f"{name}: the direct requests are not chats 1 and 3: {[asked(b) for b in r.bodies]}")
+        if want == "PASS" and ("tapes differ" not in detail(r) or "direct pair" not in detail(r)):
+            p.append(f"{name}: the detail does not say the tapes differ and the direct pair is judged: {detail(r)!r}")
+        kept = sorted(f.name for f in (r.tmp / "out").glob("*.json"))
+        if "pass_short_probe.json" not in kept or "second_request_probe.json" not in kept:
+            p.append(f"{name}: the direct pair is not kept in --dir: {kept}")
+        if len(list((r.tmp / "out" / "tapes").glob("*.toktape"))) != 3:
+            p.append(f"{name}: the three tapes are not in --dir/tapes")
+    return p
+
+
+@case
+def the_band_is_its_derivation(main):
+    g = main.__globals__
+    band, sigma = g["SPLIT_GAP_BAND"], g["SIGMA_LOGIT"]
+    p = []
+    if abs(band - 3 * math.sqrt(2) * sigma) > 5e-4:
+        p.append(f"SPLIT_GAP_BAND {band} is not 3 * sqrt(2) * SIGMA_LOGIT {sigma} = {3 * math.sqrt(2) * sigma:.4f}")
+    src = (HERE.parent.parent / "crates" / "gpu-gates" / "src" / "prompts.rs").read_text()
+    m = re.search(r"pub const SIGMA_LOGIT_V41: f64 = ([0-9.]+);", src)
+    if not m or float(m.group(1)) != sigma:
+        p.append(f"SIGMA_LOGIT {sigma} is not prompts.rs's SIGMA_LOGIT_V41 ({m.group(1) if m else 'not found'})")
+    return p
+
+
 OFF_LOG = """bloomery-serve: a first start on a new card can compile the GPU code for it (tens of seconds); later starts take seconds
 place unset place=bp why=set tier_experts=0 break_even=0 basis=none
 bloomery-serve-ds41: place=bp ctx=65536 listening on http://127.0.0.1:18080
@@ -952,6 +1407,37 @@ MUTANTS = (
      "toktape-tape-of-another-shape-fails"),
     ("passes a toktape that ended other than 0", (("if r.returncode != 0:", "if False:", 1),),
      "toktape-client-failures-name-their-check"),
+    ("judges the replay of a server that moves experts by exact text",
+     (("        if self.residency.moves:\n            return self.replay_of_a_moving_server()",
+       "        if False:\n            return self.replay_of_a_moving_server()", 1),),
+     "a-moving-seat-that-splits-at-a-near-tie-passes"),
+    ("passes a split at any gap", (("if total > SPLIT_GAP_BAND:", "if False:", 1),),
+     "a-moving-seat-that-splits-above-the-band-fails"),
+    ("holds the first reply's gap alone to the band", (("total = (g1 or 0.0) + (g2 or 0.0)", "total = g1 or 0.0", 1),),
+     "a-moving-seat-whose-first-gap-is-small-and-replay-gap-large-fails"),
+    ("reads a split as the same ids", (("if a[i][0] != b[i][0]:", "if False:", 1),),
+     "a-moving-seat-that-splits-above-the-band-fails"),
+    ("takes every server for one that moves experts",
+     (('return Residency(word, word != "off", f"residency {word}", None)',
+       'return Residency(word, True, f"residency {word}", None)', 1),),
+     "a-seat-that-moves-no-expert-keeps-the-exact-comparison"),
+    ("asks every server for logprobs", (("top = LOGPROBS_TOP if self.residency.moves else 0", "top = LOGPROBS_TOP", 1),),
+     "a-seat-that-moves-no-expert-keeps-the-exact-comparison"),
+    ("takes a server with no residency record for one that moves experts",
+     (('return Residency(None, False, "no residency record in the --stderr", None)',
+       'return Residency(None, True, "no residency record in the --stderr", None)', 1),),
+     "a-server-with-no-residency-record-is-held-exact-and-says-so"),
+    ("reads only the lever record for the residency word",
+     (('RESIDENCY_KINDS = ("residency_lever", "residency_unset", "residency_host")',
+       'RESIDENCY_KINDS = ("residency_lever",)', 1),),
+     "the-residency-word-comes-from-the-servers-records"),
+    ("takes any residency word", (("if not RESIDENCY_WORD.match(word):", "if False:", 1),),
+     "an-unknown-residency-word-is-a-harness-fail"),
+    ("judges no direct pair under toktape",
+     (("rows = why = None\n            if top:", "rows = why = None\n            if False:", 1),),
+     "the-toktape-client-on-a-moving-seat-judges-a-direct-pair"),
+    ("re-pins the band without its derivation", (("SPLIT_GAP_BAND = 1.485", "SPLIT_GAP_BAND = 3.0", 1),),
+     "the-band-is-its-derivation"),
 )
 
 
