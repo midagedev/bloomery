@@ -695,7 +695,7 @@ mod probe {
         let local: Vec<(usize, Endpoint)> = ends
             .iter()
             .zip(peers)
-            .map(|(e, &j)| (to(j), e.endpoint(psn(0, o.rank, to(j)))))
+            .map(|(e, &j)| (to(j), e.endpoint(psn(o.rank, to(j)))))
             .collect();
         let remote = control.endpoints(&local)?;
         enter("connect");

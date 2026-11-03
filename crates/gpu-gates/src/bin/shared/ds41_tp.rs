@@ -304,6 +304,7 @@ pub fn run(args: &[String], levers: &Levers) -> Result<(), GateError> {
         .map_or(0, |(_, at)| at.start);
     let sums = session.sums();
     let t_load = Instant::now();
+    // A rank whose load fails tells the group, so every rank names it.
     let mut m = body::open_rank(
         gpu,
         RankFrom {
@@ -315,7 +316,8 @@ pub fn run(args: &[String], levers: &Levers) -> Result<(), GateError> {
         sums,
         ctx,
         cfg.body,
-    )?;
+    )
+    .map_err(|e| session.fail(&format!("its load: {e}")))?;
     let load_s = t_load.elapsed().as_secs_f64();
     let prompt = match (o.rank, &o.text) {
         (0, Some(text)) => tokenizer.encode(text, true, false),

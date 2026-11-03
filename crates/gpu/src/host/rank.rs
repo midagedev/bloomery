@@ -17,10 +17,10 @@
 //!   [`at_pos`]).
 //!
 //! One rank's failure is the group's. A rank that fails releases its ends:
-//! when every end settles ([`super::RdmaEnd::release`]) the group opens
-//! again at a new epoch ([`RankSession::reopen`]); when one does not, the
-//! session names it and keeps its page and ends alive, since a card may still
-//! wait on the page, and the run ends.
+//! when every end settles ([`super::RdmaEnd::release`]) the group ends with
+//! the failure that came first ([`RankError::Settled`]); when one does not,
+//! the session names it and keeps its page and ends alive, since a card may
+//! still wait on the page, and the run ends.
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
@@ -159,9 +159,9 @@ pub struct Round {
 /// Why a group stopped.
 #[derive(Debug)]
 pub enum RankError {
-    /// A rank failed and every end of this rank settled: the group opens
-    /// again at a new epoch ([`RankSession::reopen`]).
-    Settled { epoch: u64 },
+    /// Rank `rank` failed, `why` its own error, and every end of this rank
+    /// settled.
+    Settled { rank: usize, why: String },
     /// A rank failed and the named end did not settle: a card may still wait
     /// on the page, which stays allocated with the end; the run ends.
     Unsettled { end: String },
@@ -174,10 +174,10 @@ pub enum RankError {
 impl std::fmt::Display for RankError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RankError::Settled { epoch } => {
+            RankError::Settled { rank, why } => {
                 write!(
                     f,
-                    "the rank group failed at epoch {epoch}; every end settled"
+                    "the rank group failed, rank {rank} first: {why}; every end settled"
                 )
             }
             RankError::Unsettled { end } => {
@@ -205,9 +205,8 @@ const WHAT: &str = "the rank group";
 const VERSION: u32 = 1;
 
 /// The items a hello is compared by, in the order rank 0 compares them.
-const ITEMS: [&str; 9] = [
+const ITEMS: [&str; 8] = [
     "version",
-    "epoch",
     "rank count",
     "rank",
     "source",
@@ -427,19 +426,14 @@ pub struct Bootstrap {
 }
 
 /// A group of ranks opened on their nodes (module doc): the control channel,
-/// the gather page and the RDMA end to every peer, at an epoch.
+/// the gather page and the RDMA end to every peer.
 ///
 /// Field order is drop order: the ends settle before the page drops.
 pub struct RankSession {
     me: usize,
-    list: RankList,
-    how: Bootstrap,
-    fp: Fingerprint,
-    asked: Vec<(&'static str, u64)>,
+    n: usize,
     limits: Vec<(&'static str, u64)>,
-    shapes: Vec<GatherShape>,
     ctx: Arc<CudaContext>,
-    epoch: u64,
     control: Option<Control>,
     ends: Vec<RdmaEnd>,
     paths: Vec<PeerPath>,
@@ -479,16 +473,12 @@ impl RankSession {
             )
             .into());
         }
+        let n = list.len();
         let mut s = RankSession {
             me,
-            list: list.clone(),
-            how: how.clone(),
-            fp: fp.clone(),
-            asked: limits.to_vec(),
+            n,
             limits: limits.to_vec(),
-            shapes: shapes.to_vec(),
             ctx: Arc::clone(gpu.context()),
-            epoch: 0,
             control: None,
             ends: Vec::new(),
             paths: Vec::new(),
@@ -496,38 +486,20 @@ impl RankSession {
             layout: None,
             page: None,
         };
-        s.bootstrap()?;
-        Ok(s)
-    }
-
-    /// The control channel, the agreement, the page and the ends at the
-    /// session's epoch.
-    fn bootstrap(&mut self) -> Result<(), RankError> {
-        let n = self.list.len();
         if n == 1 {
-            return Ok(());
+            return Ok(s);
         }
-        let mut control = Control::open(&self.list, self.me, self.how.wait)?;
+        let mut control = Control::open(list, me, how.wait)?;
         let hello = Hello {
             version: VERSION,
-            epoch: self.epoch,
-            fp: self.fp.clone(),
-            limits: self
-                .asked
-                .iter()
-                .map(|&(k, v)| (k.to_string(), v))
-                .collect(),
+            fp: fp.clone(),
+            limits: limits.iter().map(|&(k, v)| (k.to_string(), v)).collect(),
         };
-        self.limits = control.agree(&hello, &self.asked)?;
-        let all = paths(
-            &self.list,
-            self.me,
-            self.how.fabric.as_deref(),
-            &mut control,
-        )?;
-        let layout = Gathers::new(0, n, self.me, &self.shapes)?;
+        s.limits = control.agree(&hello, limits)?;
+        let all = paths(list, me, how.fabric.as_deref(), &mut control)?;
+        let layout = Gathers::new(0, n, me, shapes)?;
         let page = Arc::new(MappedHost::new(
-            &self.ctx,
+            &s.ctx,
             layout.page_bytes(),
             "the rank group's gather page",
         )?);
@@ -546,7 +518,7 @@ impl RankSession {
         let local: Vec<(usize, Endpoint)> = ends
             .iter()
             .zip(&all)
-            .map(|(e, p)| (p.peer, e.endpoint(psn(self.epoch, self.me, p.peer))))
+            .map(|(e, p)| (p.peer, e.endpoint(psn(me, p.peer))))
             .collect();
         let remote = control.endpoints(&local)?;
         for (((e, &(_, l)), r), path) in ends.iter_mut().zip(&local).zip(&remote).zip(&all) {
@@ -561,19 +533,13 @@ impl RankSession {
             })?;
         }
         control.barrier()?;
-        self.control = Some(control);
-        self.ends = ends;
-        self.paths = all;
-        self.sums = Some(Sums::over(layout.clone(), Arc::clone(&page)));
-        self.layout = Some(layout);
-        self.page = Some(page);
-        Ok(())
-    }
-
-    /// The group's epoch: 0 at open, one more at each reopen.
-    #[must_use]
-    pub fn epoch(&self) -> u64 {
-        self.epoch
+        s.control = Some(control);
+        s.ends = ends;
+        s.paths = all;
+        s.sums = Some(Sums::over(layout.clone(), Arc::clone(&page)));
+        s.layout = Some(layout);
+        s.page = Some(page);
+        Ok(s)
     }
 
     /// Each limit's smallest value over the ranks, in this rank's order.
@@ -588,17 +554,12 @@ impl RankSession {
         self.layout.as_ref()
     }
 
-    /// The sums on the session's page, once an epoch: the rank body posts
-    /// and sums on them. `None` at one rank or once taken.
+    /// The sums on the session's page, once: the rank body posts and sums on
+    /// them. `None` at one rank or once taken.
     pub fn sums(&mut self) -> Option<Sums> {
         self.sums.take()
     }
 
-    /// Why an end stopped carrying, if one did.
-    #[must_use]
-    pub fn broken(&self) -> Option<String> {
-        self.ends.iter().find_map(RdmaEnd::broken)
-    }
     /// The gather page; `None` at one rank.
     #[must_use]
     pub fn page(&self) -> Option<&Arc<MappedHost>> {
@@ -624,14 +585,14 @@ impl RankSession {
     /// holds them all, so the call is also a barrier. A control channel that
     /// fails fails the group ([`RankSession::fail`]).
     pub fn collect(&mut self, words: &[u64]) -> Result<Vec<Vec<u64>>, RankError> {
-        if self.list.len() == 1 {
+        if self.n == 1 {
             return Ok(vec![words.to_vec()]);
         }
         let Some(control) = self.control.as_mut() else {
-            return Err(GpuError::state(WHAT, "an open group (RankSession::reopen)").into());
+            return Err(GpuError::state(WHAT, "an open group, not one that failed").into());
         };
-        let got = control.collect(words);
-        got.map_err(|e| self.fail(&e.to_string()))
+        let got = control.exchange(words);
+        got.map_err(|f| self.fault(f))
     }
 
     /// Rank 0 sends `r` to every rank and every other rank receives it: rank 0
@@ -640,41 +601,67 @@ impl RankSession {
     /// group ([`RankSession::fail`]). At one rank the round comes back as it
     /// went.
     pub fn round(&mut self, r: Option<&Round>) -> Result<Round, RankError> {
-        if self.list.len() == 1 {
+        if self.n == 1 {
             return r
                 .cloned()
                 .ok_or_else(|| GpuError::shape(WHAT, "rank 0 decides the round").into());
         }
         let Some(control) = self.control.as_mut() else {
-            return Err(GpuError::state(WHAT, "an open group (RankSession::reopen)").into());
+            return Err(GpuError::state(WHAT, "an open group, not one that failed").into());
         };
         let sent = match (self.me, r) {
             (0, Some(r)) => control.send_round(r).map(|()| r.clone()),
-            (0, None) => Err(GpuError::shape(WHAT, "rank 0 decides the round")),
-            (_, Some(_)) => Err(GpuError::shape(WHAT, "only rank 0 decides the round")),
+            (0, None) => Err(Fault::Link("rank 0 decides the round".into())),
+            (_, Some(_)) => Err(Fault::Link("only rank 0 decides the round".into())),
             (_, None) => control.recv_round(),
         };
-        sent.map_err(|e| self.fail(&e.to_string()))
+        sent.map_err(|f| self.fault(f))
+    }
+
+    /// [`RankSession::fail`] from a fault of the control channel: a peer's notice keeps the rank
+    /// that failed first and its error.
+    fn fault(&mut self, f: Fault) -> RankError {
+        match f {
+            Fault::Peer { rank, why } => self.fail_from(rank, &why),
+            Fault::Link(why) => self.fail(&why),
+        }
     }
 
     /// Fail the group from this rank, `why` saying why: close the control
     /// channel, so every other rank's next round fails too, release the
     /// ends and finish the context's queued work. Every end settled and the
-    /// work finished: [`RankError::Settled`], and the group may reopen.
-    /// Otherwise [`RankError::Unsettled`] names why, and the session keeps
+    /// work finished: [`RankError::Settled`]. Otherwise [`RankError::Unsettled`] names why, and the session keeps
     /// its page and ends alive for good.
     pub fn fail(&mut self, why: &str) -> RankError {
-        self.control = None;
+        // A peer's notice already here names the failure that came first; this rank's own error
+        // may only follow from it.
+        match self.control.as_mut().and_then(Control::notice) {
+            Some((rank, first)) => self.fail_from(rank, &first),
+            None => self.fail_from(self.me, why),
+        }
+    }
+
+    /// [`RankSession::fail`] for a failure rank `rank` had first, `why` its error: every peer
+    /// this rank reaches is told before the channel closes (rank 0 tells every rank, every other
+    /// rank tells rank 0, which tells the rest at its next exchange), so each rank's error names
+    /// the rank and its own error.
+    fn fail_from(&mut self, rank: usize, why: &str) -> RankError {
+        if let Some(mut control) = self.control.take() {
+            control.notify(rank, why);
+        }
         self.sums = None;
         if self.ends.is_empty() {
-            return RankError::Settled { epoch: self.epoch };
+            return RankError::Settled {
+                rank,
+                why: why.to_string(),
+            };
         }
         // The released counters let the card's waits pass; the context's queued work then
         // finishes before the page can go.
         let released = RdmaEnd::release(&self.ends, RELEASE).and_then(|()| {
             crate::capsync::ctx_sync(&self.ctx, "RankSession::fail").map_err(GpuError::from)
         });
-        let settled = settle(released, self.epoch, why);
+        let settled = settle(released, (rank, why));
         if matches!(settled, RankError::Unsettled { .. }) {
             std::mem::forget(std::mem::take(&mut self.ends));
             if let Some(page) = self.page.take() {
@@ -683,46 +670,33 @@ impl RankSession {
         }
         settled
     }
-
-    /// Open the group again at the next epoch after a settled failure, every
-    /// rank calling it: a new page, new ends and a new agreement. The rank
-    /// body takes the session's sums again ([`RankSession::sums`]). A group
-    /// that is still open, or one an unsettled failure ended, is refused by
-    /// name.
-    pub fn reopen(&mut self) -> Result<u64, RankError> {
-        if self.control.is_some() || (self.list.len() > 1 && self.page.is_none()) {
-            return Err(GpuError::state(WHAT, "a settled failure before a reopen").into());
-        }
-        self.ends.clear();
-        self.layout = None;
-        self.page = None;
-        self.epoch += 1;
-        self.bootstrap()?;
-        Ok(self.epoch)
-    }
 }
 
-/// The error a failure from `why` leaves, the ends' release `released`.
-fn settle(released: Result<(), GpuError>, epoch: u64, why: &str) -> RankError {
+/// The error a failure rank `rank` had first, `why` its error, leaves, the ends' release
+/// `released`.
+fn settle(released: Result<(), GpuError>, (rank, why): (usize, &str)) -> RankError {
     match released {
-        Ok(()) => RankError::Settled { epoch },
+        Ok(()) => RankError::Settled {
+            rank,
+            why: why.to_string(),
+        },
         Err(e) => RankError::Unsettled {
-            end: format!("{e} (after {why})"),
+            end: format!("{e} (after rank {rank}: {why})"),
         },
     }
 }
 
-/// The first packet sequence number of `me`'s queue pair to `peer` at
-/// `epoch`: 24 bits, distinct per pair and epoch.
-pub fn psn(epoch: u64, me: usize, peer: usize) -> u32 {
-    (((epoch as u32 & 0xff) << 16) | ((me as u32 & 0xff) << 8) | (peer as u32 & 0xff)) & 0xff_ffff
+/// The first packet sequence number of `me`'s queue pair to `peer`, which
+/// `peer` computes the same way for that pair: the low byte of each rank, 16
+/// of the 24 bits a sequence number holds.
+pub fn psn(me: usize, peer: usize) -> u32 {
+    ((me as u32 & 0xff) << 8) | (peer as u32 & 0xff)
 }
 
 /// One hello: what a rank opens with.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Hello {
     version: u32,
-    epoch: u64,
     fp: Fingerprint,
     limits: Vec<(String, u64)>,
 }
@@ -731,7 +705,6 @@ impl Hello {
     fn encode(&self) -> Vec<u8> {
         let mut o = Out::default();
         o.u32(self.version)
-            .u64(self.epoch)
             .u32(self.fp.n.into())
             .u32(self.fp.rank.into())
             .bytes(&self.fp.source)
@@ -748,7 +721,6 @@ impl Hello {
     fn decode(b: &[u8]) -> Result<Hello, String> {
         let mut r = In::new(b);
         let version = r.u32("version")?;
-        let epoch = r.u64("epoch")?;
         let n = u16_at(&mut r, "rank count")?;
         let rank = u16_at(&mut r, "rank")?;
         let source = array_at(&mut r, "source digest")?;
@@ -761,7 +733,6 @@ impl Hello {
         r.end()?;
         Ok(Hello {
             version,
-            epoch,
             fp: Fingerprint {
                 source,
                 headers,
@@ -780,7 +751,6 @@ impl Hello {
         let limit_names = |h: &Hello| h.limits.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
         let same = [
             self.version == peer.version,
-            self.epoch == peer.epoch,
             self.fp.n == peer.fp.n,
             usize::from(peer.fp.rank) == from,
             self.fp.source == peer.fp.source,
@@ -811,6 +781,64 @@ fn write_frame(s: &mut TcpStream, b: &[u8]) -> Result<(), String> {
     s.write_all(&n.to_le_bytes())
         .and_then(|()| s.write_all(b))
         .map_err(|e| format!("a control write: {e}"))
+}
+
+/// A run-time frame's first byte: the exchange's data, or a failure notice.
+const DATA: u8 = 0;
+const FAILED: u8 = 1;
+
+/// Why a run-time exchange of the control channel did not finish.
+enum Fault {
+    /// A peer's failure notice: the rank that failed first and its error.
+    Peer { rank: usize, why: String },
+    /// The channel itself, as the text says.
+    Link(String),
+}
+
+impl std::fmt::Display for Fault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Fault::Peer { rank, why } => write!(f, "rank {rank} failed: {why}"),
+            Fault::Link(why) => write!(f, "{why}"),
+        }
+    }
+}
+
+/// Write `b` as a data frame of the run-time exchange. A write the peer refused may follow its
+/// failure notice, which then comes back in place of the write's error.
+fn send_data(s: &mut TcpStream, b: &[u8]) -> Result<(), Fault> {
+    let mut f = Vec::with_capacity(1 + b.len());
+    f.push(DATA);
+    f.extend(b);
+    write_frame(s, &f).map_err(|e| {
+        let _ = s.set_read_timeout(Some(Duration::from_secs(1)));
+        match recv_data(s) {
+            Err(peer @ Fault::Peer { .. }) => peer,
+            _ => Fault::Link(e),
+        }
+    })
+}
+
+/// Read a data frame of the run-time exchange; a failure notice comes back as the peer's fault.
+fn recv_data(s: &mut TcpStream) -> Result<Vec<u8>, Fault> {
+    let mut b = read_frame(s).map_err(Fault::Link)?;
+    match b.first() {
+        Some(&DATA) => {
+            b.remove(0);
+            Ok(b)
+        }
+        Some(&FAILED) => {
+            let mut r = In::new(&b[1..]);
+            let notice = r
+                .u32("rank")
+                .and_then(|rank| Ok((rank as usize, r.str("error")?)));
+            Err(match notice {
+                Ok((rank, why)) => Fault::Peer { rank, why },
+                Err(e) => Fault::Link(format!("a failure notice: {e}")),
+            })
+        }
+        _ => Err(Fault::Link("a frame of no kind".into())),
+    }
 }
 
 fn read_frame(s: &mut TcpStream) -> Result<Vec<u8>, String> {
@@ -1030,11 +1058,46 @@ impl Control {
     /// Rank 0 answers each rank once it holds them all, so the call is also a
     /// barrier. Each read waits at most the channel's open bound.
     pub fn collect(&mut self, words: &[u64]) -> Result<Vec<Vec<u64>>, GpuError> {
-        let link = |e: String| GpuError::link(WHAT, format!("collect: {e}"));
-        self.bound(Some(self.wait)).map_err(link)?;
-        let got = self.gather_words(words).map_err(link);
-        self.bound(None).map_err(link)?;
+        self.exchange(words)
+            .map_err(|f| GpuError::link(WHAT, format!("collect: {f}")))
+    }
+
+    /// [`Control::collect`], a peer's failure notice kept apart.
+    fn exchange(&mut self, words: &[u64]) -> Result<Vec<Vec<u64>>, Fault> {
+        self.bound(Some(self.wait)).map_err(Fault::Link)?;
+        let got = self.gather_words(words);
+        self.bound(None).map_err(Fault::Link)?;
         got
+    }
+
+    /// Tell every peer this channel reaches that rank `rank` failed, `why` its error; a peer
+    /// already gone is passed over, since the group fails either way.
+    fn notify(&mut self, rank: usize, why: &str) {
+        let mut o = Out::default();
+        o.u8(FAILED).u32(rank as u32).str(why);
+        for s in &mut self.socks {
+            let _ = write_frame(s, o.done());
+        }
+    }
+
+    /// The first failure notice a peer already sent, the frames before it read and passed
+    /// over; `None` when none has arrived. Reads only what is here, without waiting.
+    fn notice(&mut self) -> Option<(usize, String)> {
+        let mut found = None;
+        for s in &mut self.socks {
+            if s.set_nonblocking(true).is_err() {
+                continue;
+            }
+            while found.is_none() {
+                match recv_data(s) {
+                    Ok(_) => {}
+                    Err(Fault::Peer { rank, why }) => found = Some((rank, why)),
+                    Err(Fault::Link(_)) => break,
+                }
+            }
+            let _ = s.set_nonblocking(false);
+        }
+        found
     }
 
     /// Set every socket's read bound.
@@ -1046,23 +1109,23 @@ impl Control {
     }
 
     /// [`Control::collect`]'s exchange.
-    fn gather_words(&mut self, words: &[u64]) -> Result<Vec<Vec<u64>>, String> {
+    fn gather_words(&mut self, words: &[u64]) -> Result<Vec<Vec<u64>>, Fault> {
         let encode = |w: &[u64]| w.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
         if !self.root {
-            write_frame(&mut self.socks[0], &encode(words))?;
-            read_frame(&mut self.socks[0])?;
+            send_data(&mut self.socks[0], &encode(words))?;
+            recv_data(&mut self.socks[0])?;
             return Ok(Vec::new());
         }
         let mut all = vec![words.to_vec()];
         for (i, s) in self.socks.iter_mut().enumerate() {
-            let b = read_frame(s)?;
+            let b = recv_data(s)?;
             if b.len() != 8 * words.len() {
-                return Err(format!(
+                return Err(Fault::Link(format!(
                     "rank {} sent {} bytes, not {} words",
                     i + 1,
                     b.len(),
                     words.len()
-                ));
+                )));
             }
             all.push(
                 b.as_chunks::<8>()
@@ -1073,24 +1136,29 @@ impl Control {
             );
         }
         for s in &mut self.socks {
-            write_frame(s, &[])?;
+            send_data(s, &[])?;
         }
         Ok(all)
     }
 
-    fn send_round(&mut self, r: &Round) -> Result<(), GpuError> {
+    fn send_round(&mut self, r: &Round) -> Result<(), Fault> {
         let b = encode_round(r);
         for (i, s) in self.socks.iter_mut().enumerate() {
-            write_frame(s, &b)
-                .map_err(|e| GpuError::link(WHAT, format!("round to rank {}: {e}", i + 1)))?;
+            send_data(s, &b).map_err(|f| match f {
+                Fault::Link(e) => Fault::Link(format!("round to rank {}: {e}", i + 1)),
+                peer @ Fault::Peer { .. } => peer,
+            })?;
         }
         Ok(())
     }
 
-    fn recv_round(&mut self) -> Result<Round, GpuError> {
-        let b = read_frame(&mut self.socks[0])
-            .map_err(|e| GpuError::link(WHAT, format!("round from rank 0: {e}")))?;
-        decode_round(&b).map_err(|e| GpuError::link(WHAT, format!("round from rank 0: {e}")))
+    fn recv_round(&mut self) -> Result<Round, Fault> {
+        let at = |e: String| Fault::Link(format!("round from rank 0: {e}"));
+        let b = recv_data(&mut self.socks[0]).map_err(|f| match f {
+            Fault::Link(e) => at(e),
+            peer @ Fault::Peer { .. } => peer,
+        })?;
+        decode_round(&b).map_err(at)
     }
 }
 
@@ -1272,7 +1340,6 @@ mod tests {
     fn hello(rank: usize, n: usize, build: &str) -> Hello {
         Hello {
             version: super::VERSION,
-            epoch: 0,
             fp: Fingerprint {
                 source: [1; 32],
                 headers: [2; 32],
@@ -1326,7 +1393,7 @@ mod tests {
     }
 
     fn port(k: u16) -> u16 {
-        40_000 + (std::process::id() % 2000) as u16 * 4 + k
+        40_000 + (std::process::id() % 2000) as u16 * 5 + k
     }
 
     // At N = 2 and 4 every rank agrees on the smallest limit and receives rank 0's rounds as
@@ -1366,7 +1433,7 @@ mod tests {
     // A rank whose rank 0 is gone fails its next round by name, so one rank's failure is the
     // group's; the failure's ends settled or not decide what follows.
     #[test]
-    fn a_lost_rank_fails_the_group_and_its_ends_decide_the_epoch() {
+    fn a_lost_rank_fails_the_group_and_its_ends_decide_what_follows() {
         let list = local(2, port(3));
         let e = std::thread::scope(|s| {
             let root = s.spawn(|| {
@@ -1381,11 +1448,52 @@ mod tests {
             c.recv_round().unwrap_err()
         });
         assert!(e.to_string().contains("round from rank 0"), "{e}");
+        // A failing rank's notice reaches rank 0's next exchange with its rank and its error.
+        let list = local(2, port(4));
+        let got = std::thread::scope(|s| {
+            let root = s.spawn(|| {
+                let mut c = Control::open(&list, 0, Duration::from_secs(10)).unwrap();
+                c.agree(&hello(0, 2, "b"), &[("positions", 100)]).unwrap();
+                c.barrier().unwrap();
+                c.exchange(&[7]).map(|_| ()).unwrap_err()
+            });
+            let mut c = Control::open(&list, 1, Duration::from_secs(10)).unwrap();
+            c.agree(&hello(1, 2, "b"), &[("positions", 101)]).unwrap();
+            c.barrier().unwrap();
+            c.notify(1, "wo_a refused");
+            root.join().unwrap()
+        });
+        assert!(
+            matches!(&got, super::Fault::Peer { rank: 1, why } if why == "wo_a refused"),
+            "{got}"
+        );
+        // A notice already at rank 0 when its own step fails is the failure it reports.
+        let list = local(2, port(3));
+        let first = std::sync::Barrier::new(2);
+        let got = std::thread::scope(|s| {
+            let root = s.spawn(|| {
+                let mut c = Control::open(&list, 0, Duration::from_secs(10)).unwrap();
+                c.agree(&hello(0, 2, "b"), &[("positions", 100)]).unwrap();
+                c.barrier().unwrap();
+                assert_eq!(c.notice(), None);
+                first.wait();
+                first.wait();
+                c.notice()
+            });
+            let mut c = Control::open(&list, 1, Duration::from_secs(10)).unwrap();
+            c.agree(&hello(1, 2, "b"), &[("positions", 101)]).unwrap();
+            c.barrier().unwrap();
+            first.wait();
+            c.notify(1, "wo_a refused");
+            first.wait();
+            root.join().unwrap()
+        });
+        assert_eq!(got, Some((1, "wo_a refused".to_string())));
         assert!(matches!(
-            settle(Ok(()), 3, "x"),
-            RankError::Settled { epoch: 3 }
+            settle(Ok(()), (1, "x")),
+            RankError::Settled { rank: 1, .. }
         ));
-        let held = settle(Err(GpuError::shape("end", "rank 2's end")), 3, "x");
+        let held = settle(Err(GpuError::shape("end", "rank 2's end")), (1, "x"));
         assert!(matches!(&held, RankError::Unsettled { end } if end.contains("rank 2's end")));
     }
 
