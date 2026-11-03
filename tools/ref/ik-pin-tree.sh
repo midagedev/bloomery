@@ -36,7 +36,7 @@ dirty_outside_build() { printf '%s\n' "$1" | grep_answer ik-pin-tree -v '^?? bui
 # that cannot be read, or has none of them, is a nonzero status.
 cache_flags() {
   grep -E '^(GGML_[A-Z0-9_]*|LLAMA_[A-Z0-9_]*|CMAKE_BUILD_TYPE|CMAKE_(C|CXX)_(COMPILER|FLAGS|FLAGS_RELEASE)):[A-Z]+=' \
-    "$1/build/CMakeCache.txt" | grep -v -e '_FOUND:' -e '^GGML_CUDA:BOOL=' | LC_ALL=C sort -t= -k1,1
+    "$1/build/CMakeCache.txt" | grep -v -e '_FOUND:' -e '^GGML_CUDA:BOOL=' | LC_ALL=C sort -t '=' -k1,1
 }
 # cache_differ SHARED PINNED: the options whose values differ, one `option<TAB>shared value<TAB>pinned value` line each
 # on stdout (none: the caches agree), and on stderr the options only one of the two has. A value is everything after
@@ -45,7 +45,7 @@ cache_differ() {
   local shared pinned only
   shared=$(cache_flags "$1") || { echo "ik-pin-tree: cannot read the cache options of the shared tree $1" >&2; return 2; }
   pinned=$(cache_flags "$2") || { echo "ik-pin-tree: cannot read the cache options of the pinned tree $2" >&2; return 2; }
-  only=$(LC_ALL=C join -t= -v1 -v2 <(printf '%s\n' "$shared") <(printf '%s\n' "$pinned")) || return 2
+  only=$(LC_ALL=C join -t '=' -v1 -v2 <(printf '%s\n' "$shared") <(printf '%s\n' "$pinned")) || return 2
   [ -z "$only" ] || { echo "ik-pin-tree: cache options only one of $1 and $2 has:"; echo "$only"; } >&2
   awk '
     function key(s) { return substr(s, 1, index(s, "=") - 1) }

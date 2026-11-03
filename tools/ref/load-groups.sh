@@ -267,14 +267,13 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
   check env-key "$(lg_env_key "Y=2,X=1")" "X=1,Y=2"
   # lg_process on a stalled arm: the process prints its arm line and then nothing, so the idle bound of BOUND s (the
   # idle second, scaled with the load: tools/bloomery/selftest.py) sends its timeout a TERM, which ends it with 143,
-  # and the arms behind it are left for a fresh load. The outer bound, BOUND x (arms + 1), would end it with 124.
-  # A host with no timeout takes tools/ref/stub-timeout.py, which ends the same two ways.
+  # and the arms behind it are left for a fresh load. The outer bound, BOUND x (arms + 1), would end it with 124. The monitor
+  # is bounded_bg's (bound_timeout, tools/gate-bound.sh), one that ends the same two ways on every host.
   stall_case() {
     local sd child_status want s errexit st idle_bound
     # shellcheck source=tools/ref/lease.sh
     source "${BASH_SOURCE[0]%/*}/lease.sh"
     sd=$(mktemp -d "${TMPDIR:-/tmp}/load-groups-selftest.XXXXXX")
-    command -v timeout > /dev/null || cp "${BASH_SOURCE[0]%/*}/stub-timeout.py" "$sd/timeout"
     lg_majflt() { echo 0; }
     # The arm line arms the idle bound; process startup has its own wait.
     lg_pre() { BOUND=$idle_bound; }
@@ -283,13 +282,13 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
     ARMS=(s0 s1 s2)
     BOUND=$(python3 "${BASH_SOURCE[0]%/*}/../bloomery/selftest.py" 1) || exit 2
     idle_bound=$BOUND
-    (PATH="$sd:$PATH"; BOUND=$((idle_bound * 10)) lg_process 1 0 1 2; echo "left=${LG_LEFT[*]}" >> "$sd/post.log") > /dev/null 2> "$sd/err.log"
+    (BOUND=$((idle_bound * 10)) lg_process 1 0 1 2; echo "left=${LG_LEFT[*]}" >> "$sd/post.log") > /dev/null 2> "$sd/err.log"
     check stall-killed "$(grep -c "no line for $BOUND s; killing the process" "$sd/err.log")" 1
     check stall-term "$(grep '^post 0 ' "$sd/post.log")" "post 0 rc=143"
     check stall-left "$(grep '^left=' "$sd/post.log")" "left=1 2"
     lg_cmd() { LG_CMD=(sleep 1000); LG_ENV=(); }
     : > "$sd/post.log"
-    (PATH="$sd:$PATH"; lg_process 1 0 1 2; echo "left=${LG_LEFT[*]}" >> "$sd/post.log") > /dev/null 2> "$sd/err.log"
+    (lg_process 1 0 1 2; echo "left=${LG_LEFT[*]}" >> "$sd/post.log") > /dev/null 2> "$sd/err.log"
     check startup-killed "$(grep -c "no line for $BOUND s; killing the process" "$sd/err.log")" 1
     check startup-failed-all "$(grep -c '^post [012] rc=143$' "$sd/post.log")" 3
     check startup-left "$(grep '^left=' "$sd/post.log")" "left="
@@ -300,7 +299,6 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
       : > "$sd/post.log"
       (
         lease_stop() { echo stop >&"$wfd"; return 70; }
-        PATH="$sd:$PATH"
         BOUND=$((idle_bound * 10)) lg_process 1 0
       ) > /dev/null 2> "$sd/err.log"
       check "stall-cleanup-$child_status-idle" "$(grep -c "no line for $BOUND s; killing the process" "$sd/err.log")" 1
@@ -313,7 +311,6 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${1:-}" = --self-test ]; then
       : > "$sd/post.log"
       (
         lease_stop() { echo stop >&"$wfd"; return 71; }
-        PATH="$sd:$PATH"
         BOUND=$((idle_bound * 10)) lg_process 1 0
       ) > /dev/null 2> "$sd/err.log"
       check "extra-arm-cleanup-$child_status-rc" "$(tail -n 1 "$sd/post.log")" "post 0 rc=$want"

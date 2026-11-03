@@ -444,7 +444,11 @@ lock_release() { # drops this process's flock. The directory is removed only whe
 # backend preflight cannot fall through into it. The leading `:` makes box.sh check cargo oxide before the command.
 side_command() {
   printf '%s\n' ': cargo oxide && {'
-  declare -f stop_pid_ok lease_stop group_live group_clear run_bounded
+  declare -f stop_pid_ok lease_stop group_live group_clear bound_timeout run_bounded
+  # bound_timeout's last choice, the tree's stub-timeout.py, goes with it: the box side has no tree of this commit.
+  local stub
+  stub=$(cat "$ROOT/tools/ref/stub-timeout.py") || return $?
+  printf '__narrow_timeout() { exec python3 -c %q "$@"; }\n__BOUND_STUB=__narrow_timeout\n' "$stub"
   printf 'P="$HOME/.cache/bloomery/narrow-scan/%s"\nB=%s\n' "$2" "$1"
   cat <<'NARROW_SIDE_EOF'
 mkdir -p "${P%/*}" || { echo "narrow-scan: cannot create remote control directory" >&2; exit 70; }
@@ -649,6 +653,10 @@ self_test() {
   )
   rc=0; remote_call "$(side_command 60 .empty.pid)" < /dev/null > "$t/empty.log" 2>&1 || rc=$?
   [ "$rc" = 65 ]; ok "remote: an empty runner is refused with 65" $?
+  # The box may have none of bound_timeout's GNU monitors: the stand-in the command carries runs the child with its own
+  # arguments (a --kill-after among them is the child's) and keeps its status.
+  rc=0; ( eval "$(side_command 60 .stub.pid | grep '^__narrow_timeout() ')"; __narrow_timeout --kill-after=1 30 sh -c '[ "$1" = --kill-after=2 ] && exit 7' _ --kill-after=2 ) || rc=$?
+  [ "$rc" = 7 ]; ok "remote: the shipped stand-in monitor keeps the child's status" $?
   printf 'printf ran > "%s"\nexit 23\n' "$t/remote-ran" > "$t/short-runner"
   HOME="$t/remote-home" BLOOMERY_BOX_LOCAL=0 remote_stop "$t/remote-command" .before.pid > "$t/before-stop.log" 2>&1
   HOME="$t/remote-home" BLOOMERY_BOX_LOCAL=0 remote_stop "$t/remote-command" .before.pid >> "$t/before-stop.log" 2>&1
@@ -1042,6 +1050,8 @@ NARROW_STUB_EOF
   mkdir -p "$w/tools/nightly"
   cp "$ROOT/tools/nightly/units.sh" "$w/tools/nightly/units.sh"
   cp "$ROOT/tools/gate-bound.sh" "$w/tools/gate-bound.sh"
+  mkdir -p "$w/tools/ref"
+  cp "$ROOT/tools/ref/stub-timeout.py" "$w/tools/ref/stub-timeout.py"
   cp "$ROOT/tools/arch.sh" "$w/tools/arch.sh"
   git -C "$w" init -q && git -C "$w" config user.email test@test && git -C "$w" config user.name test && git -C "$w" config commit.gpgsign false
   echo base > "$w/marker.txt"
