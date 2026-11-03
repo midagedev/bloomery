@@ -55,17 +55,29 @@
 //! sums against the host's rank-order sum; the stage fails on a stale word,
 //! a sum the host disagrees with or a digest that differs between nodes.
 //!
-//! Both ends run this binary on a host with rdma-core (`libibverbs.so.1`):
+//! Every node runs this binary on a host with rdma-core (`libibverbs.so.1`),
+//! each with the same rank file (`bloomery_gpu::host::rank::RankList`: a
+//! line a rank, its control `ip:port`, then its fabric addresses) and its
+//! own rank:
 //!
 //! ```text
-//! link_probe --nodes 2 --rank 0 --dev <ibdev> --gid <index> --listen <ip:port>
-//! link_probe --nodes 2 --rank 1 --dev <ibdev> --gid <index> --stage <ip:port>
+//! link_probe --ranks <file> --rank 0 [--fabric <manifest>]
+//! link_probe --ranks <file> --rank 1 [--fabric <manifest>]
 //! ```
 //!
-//! `--tcp` in place of `--dev` and `--gid` carries the counters over TCP
-//! ends: the stage's end to each peer listens on the address that peer's
-//! control connection reached, and the peer's end dials it. `--gather` takes
-//! RDMA ends alone.
+//! Rank 0 listens on its control address and every other rank dials it.
+//! Each end's queue pair takes the engine's peer path
+//! (`bloomery_gpu::host::paths`): the peer's first fabric address this node
+//! reaches over one link, or through a relay the manifest names a flow label
+//! for, from the local address and RoCE device the kernel's route picks. A
+//! failure names its stage: `setup` (arguments, the card), `bootstrap` (the
+//! control channel), `endpoint` (a peer path or an end), `connect` (a queue
+//! pair) or `payload` (the generations or gathers).
+//!
+//! `--tcp` in place of the peer paths carries the counters over TCP ends:
+//! the stage's end to each peer listens on the address that peer's control
+//! connection reached, and the peer's end dials it. `--gather` and
+//! `--fabric` take RDMA ends alone.
 //!
 //! Optional: `--iters` (timed generations, or replays under `--gather`),
 //! `--warmup`, `--size`, `--gather`, `--deadline-ms`. Every node runs the
@@ -79,15 +91,16 @@
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::record::at_main("link_probe", bloomery_gpu_gates::record::LINK_PROBE);
-    bloomery_gpu_gates::exit_with("link_probe", probe::run())
+    bloomery_gpu_gates::exit_with("link_probe", probe::staged())
 }
 
 #[cfg(feature = "gpu")]
 mod probe {
+    use bloomery_gpu::host::rank::RankList;
     use bloomery_gpu::host::step::RELEASE;
     use bloomery_gpu::host::{
         Crossing, GatherSet, GatherShape, Gathers, PostCols, RdmaEnd, Reader, Span, TcpEnd,
-        TcpPeer, link_tail,
+        TcpPeer, link_tail, paths,
     };
     use bloomery_gpu::{
         Gpu, MappedHost, WindowMut, mem_batch, op_add, op_barrier_sys, op_wait_geq,
@@ -101,8 +114,9 @@ mod probe {
     use std::io::{Read, Write};
     use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
     use std::panic::AssertUnwindSafe;
+    use std::path::PathBuf;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
     const LINE: usize = 64;
@@ -343,13 +357,11 @@ mod probe {
     struct Opts {
         nodes: usize,
         rank: usize,
-        /// `--tcp`: TCP ends in place of RDMA ends, which `dev` and `gid` name.
+        /// `--tcp`: TCP ends in place of RDMA ends on the peer paths.
         tcp: bool,
-        dev: String,
-        gid: u8,
-        /// The stage's control address: listened on by rank 0, dialled by
-        /// the peers.
-        control: String,
+        ranks: RankList,
+        /// `--fabric`: the fabric manifest the peer paths read.
+        fabric: Option<PathBuf>,
         iters: usize,
         warmup: usize,
         /// `warmup + iters`, a generation that fits a word.
@@ -363,17 +375,21 @@ mod probe {
     }
 
     fn opts() -> Result<Opts, GateError> {
-        const USAGE: &str = "link_probe --nodes N --rank R (--dev IBDEV --gid INDEX | --tcp) \
-             (--listen IP:PORT | --stage IP:PORT) [--iters N] [--warmup N] [--size BYTES] \
-             [--gather ROWS] [--deadline-ms MS]";
+        const USAGE: &str = "link_probe --ranks FILE --rank R [--fabric MANIFEST | --tcp] \
+             [--iters N] [--warmup N] [--size BYTES] [--gather ROWS] [--deadline-ms MS]";
         let args: Vec<String> = std::env::args().skip(1).collect();
+        let ranks = args
+            .iter()
+            .position(|a| a == "--ranks")
+            .and_then(|i| args.get(i + 1))
+            .ok_or_else(|| format!("--ranks is required; usage: {USAGE}"))?;
+        let ranks = RankList::read(ranks.as_ref())?;
         let mut o = Opts {
-            nodes: 0,
+            nodes: ranks.len(),
             rank: usize::MAX,
             tcp: false,
-            dev: String::new(),
-            gid: 0,
-            control: String::new(),
+            ranks,
+            fabric: None,
             iters: 100_000,
             warmup: 1_000,
             total: 0,
@@ -381,7 +397,6 @@ mod probe {
             gather: 0,
             deadline: Duration::from_secs(10),
         };
-        let (mut listen, mut stage, mut gid) = (None, None, None);
         let mut it = args.iter();
         while let Some(k) = it.next() {
             if k == "--tcp" {
@@ -393,12 +408,9 @@ mod probe {
                 .ok_or_else(|| format!("{k} takes a value; usage: {USAGE}"))?;
             let bad = |_| format!("{k} {v}: not a number");
             match k.as_str() {
-                "--nodes" => o.nodes = v.parse().map_err(bad)?,
+                "--ranks" => {} // read above
                 "--rank" => o.rank = v.parse().map_err(bad)?,
-                "--dev" => o.dev.clone_from(v),
-                "--gid" => gid = Some(v.parse().map_err(bad)?),
-                "--listen" => listen = Some(v.clone()),
-                "--stage" => stage = Some(v.clone()),
+                "--fabric" => o.fabric = Some(PathBuf::from(v)),
                 "--iters" => o.iters = v.parse().map_err(bad)?,
                 "--warmup" => o.warmup = v.parse().map_err(bad)?,
                 "--size" => o.size = v.parse().map_err(bad)?,
@@ -407,10 +419,10 @@ mod probe {
                 _ => return Err(format!("unknown argument {k}; usage: {USAGE}").into()),
             }
         }
-        if o.nodes < 2 || o.rank >= o.nodes || o.dev.is_empty() == !o.tcp || o.iters == 0 {
+        if o.nodes < 2 || o.rank >= o.nodes || o.iters == 0 {
             return Err(format!(
-                "want --nodes >= 2, --rank below it, --dev or --tcp (one of them) and --iters >= \
-                 1; usage: {USAGE}"
+                "want a rank file of at least two ranks, --rank below them and --iters >= 1; \
+                 usage: {USAGE}"
             )
             .into());
         }
@@ -420,19 +432,11 @@ mod probe {
         if o.gather != 0 && o.size != 0 {
             return Err("--gather and --size are two runs: give one".into());
         }
-        if o.gather != 0 && o.tcp {
-            return Err("--gather runs over RDMA ends alone: give --dev and --gid".into());
+        if o.tcp && (o.gather != 0 || o.fabric.is_some()) {
+            return Err(
+                "--gather and --fabric run over RDMA ends alone: --tcp takes neither".into(),
+            );
         }
-        o.gid = match (o.tcp, gid) {
-            (true, None) => 0,
-            (true, Some(_)) => return Err("--gid names an RDMA port: --tcp takes none".into()),
-            (false, g) => g.ok_or_else(|| format!("--gid is required; usage: {USAGE}"))?,
-        };
-        o.control = match (o.rank, listen, stage) {
-            (0, Some(a), None) => a,
-            (r, None, Some(a)) if r > 0 => a,
-            _ => return Err("rank 0 takes --listen, every other rank --stage".into()),
-        };
         o.total = o
             .warmup
             .checked_add(o.iters)
@@ -507,7 +511,22 @@ mod probe {
         }
     }
 
-    pub fn run() -> Result<(), GateError> {
+    /// The stages a run goes through, as a failure names them.
+    const STAGES: [&str; 5] = ["setup", "bootstrap", "endpoint", "connect", "payload"];
+    /// The index in [`STAGES`] of the stage the run is in.
+    static STAGE: AtomicU8 = AtomicU8::new(0);
+
+    fn enter(stage: &str) {
+        let i = STAGES.iter().position(|&s| s == stage).expect("a stage");
+        STAGE.store(i as u8, Ordering::Relaxed);
+    }
+
+    /// The run, a failure prefixed with the stage it came from.
+    pub fn staged() -> Result<(), GateError> {
+        run().map_err(|e| format!("{}: {e}", STAGES[STAGE.load(Ordering::Relaxed) as usize]).into())
+    }
+
+    fn run() -> Result<(), GateError> {
         let o = opts()?;
         let gpu = Gpu::new()?;
         let ctx = gpu.context();
@@ -623,6 +642,7 @@ mod probe {
         let shape = [o.size, o.gather, usize::from(o.tcp)];
         let to = |j: usize| if j == o.rank { 0 } else { j };
         if o.tcp {
+            enter("bootstrap");
             let mut control = Control::open(o)?;
             let mut ends = peers
                 .iter()
@@ -646,12 +666,14 @@ mod probe {
                 .map(|(e, &j)| (to(j), Ep::Tcp(e.endpoint())))
                 .collect();
             let remote = control.exchange(&local, o.rank, shape)?;
+            enter("connect");
             for (e, r) in ends.iter_mut().zip(&remote) {
                 let Ep::Tcp(r) = r else {
                     return Err("an RDMA end on a --tcp run".into());
                 };
                 e.connect(r)?;
             }
+            enter("payload");
             println!(
                 "link setup rank={} nodes={} wire=tcp page_bytes={} size={} gather={} iters={} \
                  warmup={}",
@@ -665,21 +687,29 @@ mod probe {
             );
             return Ok((Ends::Tcp(ends), control));
         }
-        let mut ends = peers
-            .iter()
-            .map(|&j| {
-                let (tail, crossings, side) = of(j);
-                RdmaEnd::new(
-                    Arc::clone(page),
-                    tail,
-                    crossings,
-                    side,
-                    &o.dev,
-                    o.gid,
-                    cols.clone(),
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        enter("endpoint");
+        let all = paths(&o.ranks, o.rank, o.fabric.as_deref())?;
+        let mut ends = Vec::with_capacity(peers.len());
+        for &j in peers {
+            let path = all
+                .iter()
+                .find(|p| p.peer == j)
+                .expect("a path to every peer");
+            println!(
+                "link path rank={} peer={j} local={} remote={} dev={} gid_index={} flow_label={}",
+                o.rank, path.local, path.remote, path.dev, path.gid, path.flow_label
+            );
+            let (tail, crossings, side) = of(j);
+            ends.push(RdmaEnd::new(
+                Arc::clone(page),
+                tail,
+                crossings,
+                side,
+                path,
+                cols.clone(),
+            )?);
+        }
+        enter("bootstrap");
         let mut control = Control::open(o)?;
         let local: Vec<(usize, Ep)> = ends
             .iter()
@@ -688,19 +718,19 @@ mod probe {
             .map(|(i, (e, &j))| (to(j), Ep::Rdma(e.endpoint(psn(o.rank, i)))))
             .collect();
         let remote = control.exchange(&local, o.rank, shape)?;
+        enter("connect");
         for ((e, (_, l)), r) in ends.iter_mut().zip(&local).zip(&remote) {
             let (Ep::Rdma(l), Ep::Rdma(r)) = (l, r) else {
                 return Err("a TCP end on an RDMA run".into());
             };
             e.connect(l.psn, r)?;
         }
+        enter("payload");
         println!(
-            "link setup rank={} nodes={} dev={} gid_index={} page_bytes={} \
+            "link setup rank={} nodes={} page_bytes={} \
              access=local_write,remote_write size={} gather={} iters={} warmup={}",
             o.rank,
             o.nodes,
-            o.dev,
-            o.gid,
             page.bytes(),
             o.size,
             o.gather,
@@ -1491,9 +1521,11 @@ mod probe {
         fn open(o: &Opts) -> Result<Control, GateError> {
             let deadline = Duration::from_secs(60).max(o.deadline);
             let start = Instant::now();
+            // The stage's control address: listened on by rank 0, dialled by the peers.
+            let control = o.ranks.rank(0).control;
             let mut socks: Vec<Option<TcpStream>> = Vec::new();
             if o.rank == 0 {
-                let listener = TcpListener::bind(&o.control)?;
+                let listener = TcpListener::bind(control)?;
                 listener.set_nonblocking(true)?;
                 socks.resize_with(o.nodes - 1, || None);
                 while socks.iter().any(Option::is_none) {
@@ -1525,12 +1557,10 @@ mod probe {
                 }
             } else {
                 let mut s = loop {
-                    match TcpStream::connect(&o.control) {
+                    match TcpStream::connect(control) {
                         Ok(s) => break s,
                         Err(e) if start.elapsed() > deadline => {
-                            return Err(
-                                format!("cannot reach the stage at {}: {e}", o.control).into()
-                            );
+                            return Err(format!("cannot reach the stage at {control}: {e}").into());
                         }
                         Err(_) => std::thread::sleep(Duration::from_millis(100)),
                     }
