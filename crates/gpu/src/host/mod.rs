@@ -2123,6 +2123,14 @@ impl<H: HostExperts> HostTier<H> {
         self.unserved.get_or_insert(l);
     }
 
+    /// The step port waits for each go on the calling thread alone, not over
+    /// the process-wide pool: for a load whose host computes no expert, as a
+    /// rank of a tensor-parallel load, where other ranks in the process need
+    /// the pool to serve the goes this port's go waits on. Load-time only.
+    pub fn wait_go_alone(&mut self) {
+        self.step.parallel_wait = false;
+    }
+
     /// Attach `trace`: from here on every one-row step's service records
     /// its routed ids into it ([`route_trace`]), and a prompt batch's
     /// service is refused by name. The trace must cover the slot map's
