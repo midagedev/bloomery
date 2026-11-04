@@ -1,0 +1,30 @@
+# Round sparkr3 (kind ab): the first ws+Spark decode number against ws alone, same binary, same lease. The Spark
+# (GB10, driver 580.178.04) is the V4.1 expert tier node over the TCP wire (r1wire+r2compact+r3node landed in
+# 1ace3447c, the kernel word adds of round r3b in this tree: the 580 driver has no atomic-reduction memop), bound by
+# `BLOOMERY_TIER_NODES` under `--place bp`, the prompt fed as steps (a prompt batch refuses a node tier), one card
+# budget of 48G on every card (the only spelling a node plan takes; 48G >= the A6000's usable 48.5 GB, so the stage
+# keeps plan (a)'s share, and the node's tier is sized 48 GB on the shared Spark's ~80 GB free).
+# [derived] sparktier report 4.3 rerun at wc = 150.7 us (rig-log 2026-11-04#sparkr0-wc): the node arm's step =
+# front + max(wc, 142 us x (n - k), a + 80 us x k) a layer, a = the exposed tier round trip (card
+# docs/cards/sparkr3-a.card predicts 110..175 us): at a = 110 +6.3..+9.6 %, a = 140 +5.2..+7.2 %, a = 170
+# +2.8..+3.7 %, break-even a = 197..198; above it the arm is slower. The r3b kernel adds cost 2 launches a layer
+# on the node (+2 c_node ~ +10 us of a). The node arm's tier holds ~2,400 experts the stage's host tier served in
+# plan (a) (smoke 2026-11-05 04:04: host_slots 166 a layer with the node, 41 GB tier), the term the model prices.
+# Effect = (node arm tok/s - plan (a) tok/s) / plan (a): the band below is the model at a in 110..175; a above
+# break-even reads below the band (decide-below), never inside it.
+kind: ab
+question: does the ws with the Spark as its TCP expert tier node decode faster than the ws alone on the same prose
+  prompt at depth 512, same binary, one lease?
+term: tok/s @ n=96, prose P 512, A6000 stage, the node arm --place bp with the Spark tier over tcp, the plain arm
+  --place a; both under BLOOMERY_CARD_BUDGET=48G and BLOOMERY_PREFILL=steps so the two loads differ only by the node
+unit: %
+predict: 2.8..9.6
+rounds: 4
+condition: one binary, every arm's load its own process; the Spark's tier_server loop up (cpuidle-shallow started),
+  its caches dropped before the sitting, free >= 60 GB; the witness shows no [cpu-busy] on a counted row (a compile
+  on the box spoils it); rows marked [cold] stand with that mark
+decide-in: the first ws+Spark decode number: write it with its interval at four rounds, then the a profile
+  (sparkr3-a) and the code corpus at >= 6 rounds
+decide-below: below -2: a is above break-even on this link; take the a profile before any lever (the pump hop, the
+  node's H2D, the ack)
+decide-above: above 10: the host tier's share moved more than the model's n - k term; read host_slots of both arms
