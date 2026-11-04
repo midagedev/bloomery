@@ -134,8 +134,10 @@ pub trait Convert: Send + Sync {
     /// Whether the step rewrites part `part` of an expert: the parts it
     /// unpacks with the sizes it was built from, which every card layer of
     /// the load holds alike ([`one_layout`]); a part it leaves as staged may
-    /// differ from layer to layer.
-    fn converts(&self, part: usize) -> bool;
+    /// differ from layer to layer. Every part unless a step names fewer.
+    fn converts(&self, _part: usize) -> bool {
+        true
+    }
 
     /// Enqueue on `stream` the conversion of part `part` at `dst`.
     fn convert(
