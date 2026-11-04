@@ -544,62 +544,55 @@ impl RankSession {
             limits: limits.iter().map(|&(k, v)| (k.to_string(), v)).collect(),
         };
         s.limits = control.agree(&hello, limits)?;
-        if how.wire == RemoteWire::Tcp {
-            let layout = Gathers::new(0, n, me, shapes)?;
-            let page = Arc::new(MappedHost::new(
-                &s.ctx,
-                layout.page_bytes(),
-                "the rank group's gather page",
-            )?);
-            s.ends = Ends::Tcp(tcp_ends(&mut control, list, me, &layout, &page)?);
-            control.barrier()?;
-            s.control = Some(control);
-            s.sums = Some(Sums::over(layout.clone(), Arc::clone(&page)));
-            s.layout = Some(layout);
-            s.page = Some(page);
-            return Ok(s);
-        }
-        let peers: Vec<usize> = (0..n).filter(|&p| p != me).collect();
-        let all = paths(list, me, &peers, how.fabric.as_deref(), &mut control)?;
         let layout = Gathers::new(0, n, me, shapes)?;
         let page = Arc::new(MappedHost::new(
             &s.ctx,
             layout.page_bytes(),
             "the rank group's gather page",
         )?);
-        let mut ends = Vec::with_capacity(n - 1);
-        for path in &all {
-            let j = path.peer;
-            ends.push(RdmaEnd::new(
-                Arc::clone(&page),
-                layout.tail(j),
-                layout.crossings(j),
-                layout.side(j),
-                path,
-                PostCols::default(),
-            )?);
-        }
-        let local: Vec<(usize, Endpoint)> = ends
-            .iter()
-            .zip(&all)
-            .map(|(e, p)| (p.peer, e.endpoint(psn(me, p.peer))))
-            .collect();
-        let remote = control.endpoints(&local)?;
-        for (((e, &(_, l)), r), path) in ends.iter_mut().zip(&local).zip(&remote).zip(&all) {
-            e.connect(l.psn, r).map_err(|e| {
-                GpuError::link(
-                    WHAT,
-                    format!(
-                        "rank {} from {} on {} GID {} to {}: {e}",
-                        path.peer, path.local, path.dev, path.gid, path.remote
-                    ),
-                )
-            })?;
+        match how.wire {
+            RemoteWire::Tcp => {
+                s.ends = Ends::Tcp(tcp_ends(&mut control, list, me, &layout, &page)?);
+            }
+            RemoteWire::Rdma => {
+                let peers: Vec<usize> = (0..n).filter(|&p| p != me).collect();
+                s.paths = paths(list, me, &peers, how.fabric.as_deref(), &mut control)?;
+                let mut ends = Vec::with_capacity(n - 1);
+                for path in &s.paths {
+                    let j = path.peer;
+                    ends.push(RdmaEnd::new(
+                        Arc::clone(&page),
+                        layout.tail(j),
+                        layout.crossings(j),
+                        layout.side(j),
+                        path,
+                        PostCols::default(),
+                    )?);
+                }
+                let local: Vec<(usize, Endpoint)> = ends
+                    .iter()
+                    .zip(&s.paths)
+                    .map(|(e, p)| (p.peer, e.endpoint(psn(me, p.peer))))
+                    .collect();
+                let remote = control.endpoints(&local)?;
+                for (((e, &(_, l)), r), path) in
+                    ends.iter_mut().zip(&local).zip(&remote).zip(&s.paths)
+                {
+                    e.connect(l.psn, r).map_err(|e| {
+                        GpuError::link(
+                            WHAT,
+                            format!(
+                                "rank {} from {} on {} GID {} to {}: {e}",
+                                path.peer, path.local, path.dev, path.gid, path.remote
+                            ),
+                        )
+                    })?;
+                }
+                s.ends = Ends::Rdma(ends);
+            }
         }
         control.barrier()?;
         s.control = Some(control);
-        s.ends = Ends::Rdma(ends);
-        s.paths = all;
         s.sums = Some(Sums::over(layout.clone(), Arc::clone(&page)));
         s.layout = Some(layout);
         s.page = Some(page);
