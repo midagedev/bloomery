@@ -286,6 +286,53 @@ pub static PLAN38: Kind = Kind {
     ],
 };
 
+/// Where the host seat's plan puts the model, before the load.
+pub static PLAN_HOST: Kind = Kind {
+    name: "plan_host",
+    head: "plan",
+    doc: "The host seat's plan, before the load: every layer, the head and the embedding on the \
+          one host stage (the layer range the file's block_count spans), no card in the plan.",
+    parts: &[
+        key("stage", Word, ""),
+        key("layers", Word, "layers"),
+        key("head", Word, ""),
+    ],
+};
+
+/// The host seat's model in memory.
+pub static LOAD_HOST: Kind = Kind {
+    name: "load_host",
+    head: "load",
+    doc: "The host seat's model: its architecture, the file's tensor bytes its mapping holds \
+          (the need record's bytes), the positions the target holds (`ctx`), the sequences it \
+          holds (`slots`: one, the target holds no more), the layers it runs, and the load's wall.",
+    parts: &[
+        key("arch", Word, ""),
+        key("resident_bytes", U64, "B"),
+        key("ctx", U64, "positions"),
+        key("slots", U64, ""),
+        key("layers", U64, ""),
+        lit(" in "),
+        pos("load_s", F64(1), "s"),
+        lit(" s"),
+    ],
+};
+
+/// The host seat's address.
+pub static LISTENING_HOST: Kind = Kind {
+    name: "listening_host",
+    head: "bloomery-serve-host:",
+    doc: "The host seat's placement (the host stage, no card), the context its one slot serves, \
+          the slots it serves and the address it listens on.",
+    parts: &[
+        key("place", Word, ""),
+        key("ctx", U64, "positions"),
+        key("slots", U64, ""),
+        lit(" listening on http://"),
+        pos("addr", Word, ""),
+    ],
+};
+
 /// A routed tensor whose kernel contract keeps its layer on the host.
 pub static HOST_ONLY: Kind = Kind {
     name: "host_only",
@@ -3380,6 +3427,16 @@ pub static BLOOMERY_SERVE_NEMOTRON: &[&Kind] = kinds![
     &[&LOAD_NEMOTRON, &LOAD_PHASES, &LISTENING_NEMOTRON],
     groups::host_tier::ARENA,
     groups::bind::CACHE,
+];
+
+/// What the host seat of `bloomery-serve` prints, all on stderr: a `--hf`
+/// repo's resolve lines (printed by the server before the seat registers),
+/// the plan, the need, the load and the address. No cache notes (the seat
+/// runs no prompt cache) and no rounds (it serves one slot).
+pub static BLOOMERY_SERVE_HOST: &[&Kind] = kinds![
+    groups::fetch::FETCH,
+    groups::fetch::SET,
+    &[&PLAN_HOST, &NEED, &LOAD_HOST, &LISTENING_HOST],
 ];
 
 /// What the raon1 seat of `bloomery-serve` prints, all on stderr: the

@@ -202,6 +202,7 @@ gate-gpu-vision-hw	common		kernel	serve_media
 gate-gpu-vision-lib	common		lib	serve_media
 gate-gpu-xstream	common		tier	tier_legs
 gate-hf	common		host	refset_readers
+gate-host-serve	common		serve	serve_host_seat
 gate-hf-minimax	tooling		by-hand	-
 gate-hf-vocab-qwen38	tooling		by-hand	-
 gate-safetensors	common		host	refset_readers

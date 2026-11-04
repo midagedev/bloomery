@@ -1,0 +1,12 @@
+--- a/crates/serve/src/target_engine.rs
++++ b/crates/serve/src/target_engine.rs
+@@ -106,7 +106,7 @@ impl<T: Target + Send> Engine for TargetEngine<T> {
+         let from = self.target.pos();
+         let t0 = Instant::now();
+         self.target
+-            .prompt_marked(ids, &at, Want::Argmax)
++            .prompt_marked(&ids[usize::from(ids.len() > 1)..], &at, Want::Argmax)
+             .map_err(engine_error)?;
+         eprintln!(
+             "{}: prompt call {from}..{}: {} ids, points at {at:?}, in {:.1} ms",
+

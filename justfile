@@ -744,6 +744,16 @@ gate-gpu-nemotron-serve:
 gate-gpu-nemotron-h-moe-serve:
     BLOOMERY_TIER=fixture BLOOMERY_MODEL=nemotron_h_moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_nemotron_serve && D=target/nemotron-h-moe-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_nemotron_serve --dir $D'
 
+# The host seat of bloomery-serve on DeepSeek-V2-Lite (gate_host_serve's doc), with no card visible: the gate opens no card and
+# takes no card lock, so it runs under tools/host-gate.sh, the lock-free runner. `--model host --plan` names the host stage, the
+# ctx line and the need; `--parallel 2` and `--ctx` past the trained context are refused by name; `-ngl 0` and `-dev none` plan on
+# the host seat with no model word while `-ngl <block_count>` keeps its refusal; one server with no model word listens at the ctx
+# its load named and answers /completion with the ids bloomery-decode gives on the same ids (bit for bit) and ik's first argmax
+# (the divergence set pinned empty); the Qwen3.6 file (its profile's, read on the box) ends 65 with the host coverage list.
+# Real tier only: the deepseek2 family has no fixture file.
+gate-host-serve:
+    ./tools/box.sh 'bash tools/ref/real-only.sh gate-host-serve && q36=$(env -u BLOOMERY_REF_MODEL -u BLOOMERY_REF_MODEL_PROFILE BLOOMERY_MODEL=qwen35moe bash -c ". tools/ref/ref-paths.sh && printf %s \"\$MODEL\"") && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_host_serve && D=target/host-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=1200 bash tools/host-gate.sh gate_host_serve --dir $D --qwen36 "$q36"'
+
 # GLM-5.3-Flash 라우터(288개 중 8개, sigmoid, ×2.5 — `router::glm5next`)를 모델 없이 합성 입력으로 호스트 규칙과 맞춘다.
 # 규칙마다 절이 하나다: logits·ids·weights·batch는 비트, scores는 sigmoid 밴드, ties·guard·fault·graph는 명시한 값.
 gate-gpu-glm-router:

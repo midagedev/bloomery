@@ -24,7 +24,8 @@
 //! the recipient protocol; [`nemotron`] the Nemotron 3 Nano seat, one
 //! sequence on one card, opened as `gate_nemotron_e2e` opens it.
 //! [`hybrid`] holds the open, load record and calls of the one-chain seat
-//! ([`solar2`]).
+//! ([`solar2`]). [`host_seat`] is the host seat: the file's own host forward with
+//! no card (deepseek2 today), served through `serve::TargetEngine`.
 //! `drafted` is the
 //! seats' shared MTP draft driver and `served` the owner of the DSpark draft
 //! the V4.1 and qwen3 seats serve, each one file a seat's per-model binary
@@ -118,6 +119,13 @@ pub mod rounds;
 // context, the plan and the engine thread behind one owner, each seat giving its family's facts.
 #[cfg(feature = "deepseek41")]
 pub mod tiered;
+// The host seat: the file's own host forward on the CPU, no card in the plan.
+// The module is `host_seat`, not `host`: `host` is an identifier the check's
+// module-name match reads in many files, so a module of that name is reached
+// from every root and `tools/check-records.py` asks for a record group of it.
+#[cfg(feature = "deepseek41")]
+pub mod host_seat;
+
 // The decide seat: a decision model's backbone on the card, its head on the host.
 #[cfg(feature = "clef")]
 pub mod decide;

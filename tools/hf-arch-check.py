@@ -118,7 +118,12 @@ SERVES = {
     "ds41": ("deepseek41", "deepseek4"),
     "qwen38": ("qwen4exp",),
     "mimo2": ("mimo2",),
+    "host": ("deepseek2",),
 }
+# The architecture strings a seat serves with no reader in the model reader: the host seat serves deepseek2, the one
+# architecture whose file the host engine runs whole without a `models::Arch` reader. --self-test holds that the registry
+# still has no reader for each, so a reader added makes the exception stale and it is named.
+SERVES_NO_READER = {"host": ("deepseek2",)}
 SERVES_VIA_FROM_NAME = {"glm": ("Glm5next",), "solar2": ("SolarOpen2",), "minimaxm3": ("MiniMaxM3",), "nemotron": ("NemotronH", "NemotronHMoe"),
                         "raon1": ("Raon1",), "musespark": ("MuseSpark",), "flint": ("Flint",),
                         "mistrallarge4": ("MistralLarge4",)}
@@ -134,7 +139,7 @@ MODELS_ARCH_NAME = {"Qwen3Moe": "qwen3moe", "Qwen35Moe": "qwen35moe", "Qwen35": 
 # crates/gpu-gates/src/bin/bloomery_serve.rs:Model::ALL and Model::word — the generative seats in the order
 # the refusal of an unserved file lists them; crates/serve/src/decide.rs:WORD is the decide seat's word.
 SEAT_ORDER = ("ds41", "qwen38", "glm", "qwen3", "mimo2", "solar2", "minimaxm3", "nemotron", "raon1", "musespark", "flint",
-              "mistrallarge4")
+              "mistrallarge4", "host")
 DECIDE_WORD = "decide"
 # tools/arch-registry.tsv, the registry's print: FROM_NAME is crates/model/src/arch/mod.rs:Arch::from_name — variant -> the
 # strings that name it; SPEC is crates/model/src/arch/mod.rs:spec — the architectures the model reader takes (the
@@ -344,7 +349,7 @@ def route(arch, decision, repo, card, spec=None, word=None):
             return None, f"a {arch} file, which no seat serves: the coverage list (model::arch::coverage::check)"
         if seat is None:
             return None, f"a {arch} file, which no seat serves; the seats are --model " + ", ".join(SEAT_WORDS)
-    if arch not in spec:
+    if arch not in spec and arch not in SERVES_NO_READER.get(seat, ()):
         return None, (f"the seat {seat} takes a {arch} file, which model::arch::spec does not read: "
                       f"UnknownArchitecture({arch})")
     return seat, None
@@ -1805,8 +1810,11 @@ def mirror_vs_source(read):
         out += [f"{SERVE_RS}:Model::serves: the {word} seat reads Arch::{v}, which {REGISTRY_TSV} has no variant for"
                 for v in variants if v not in from_name]
     for word, names in direct.items():
+        unread = SERVES_NO_READER.get(word, ())
         out += [f"{SERVE_RS}:Model::serves: the {word} seat serves {n!r}, which {REGISTRY_TSV} has no reader for"
-                for n in names if n not in spec]
+                for n in names if n not in spec and n not in unread]
+        out += [f"{SERVE_RS}:Model::serves: the {word} seat's {n!r} is no exception any more: {REGISTRY_TSV} has a "
+                f"reader for it" for n in unread if n in spec]
     for word in SERVES_BY_PROGRAM:
         out += [f"{SERVE_RS}:Model::serves: the {word} seat serves {n!r} by program, which {REGISTRY_TSV} has no "
                 f"reader for" for n in seat_names(word) if n not in spec]
@@ -2080,7 +2088,8 @@ def self_test():
         line, green, _ = row_line("glm", "glm5nextx", small)
         check("a glm5nextx file is refused by name",
               not green and "arch=glm5nextx route=REFUSED: a glm5nextx file, which no seat serves; the seats are "
-              "--model ds41, qwen38, glm, qwen3, mimo2, solar2, minimaxm3, nemotron, raon1, musespark, flint, mistrallarge4, decide" in line, line)
+              "--model ds41, qwen38, glm, qwen3, mimo2, solar2, minimaxm3, nemotron, raon1, musespark, flint, mistrallarge4, "
+              "host, decide" in line, line)
         line, green, _ = row_line("glm", "deepseek41", small)
         check("a file the router seats elsewhere is refused for the row's seat",
               not green and "in the ds41 seat, and the README row says glm" in line, line)
@@ -2093,9 +2102,15 @@ def self_test():
         check("a deepseek4 file routes to the ds41 seat", green and "arch=deepseek4 route=ok" in line, line)
         line, green, _ = row_line("glm", "glm5next", small)
         check("a glm5next file routes to the glm seat", green, line)
-        line, green, _ = row_line("qwen3", "deepseek2", small)
+        line, green, _ = row_line("qwen3", "gpt2", small)
         check("an architecture no seat serves is refused by name, before the reader's verdict",
-              not green and "a deepseek2 file, which no seat serves" in line, line)
+              not green and "a gpt2 file, which no seat serves" in line, line)
+        line, green, _ = row_line("host", "deepseek2", small)
+        check("a deepseek2 file routes to the host seat, which serves it with no reader",
+              green and "arch=deepseek2 route=ok" in line, line)
+        line, green, _ = row_line("qwen3", "deepseek2", small)
+        check("a deepseek2 file the README row seats elsewhere is refused for the row's seat",
+              not green and "in the host seat, and the README row says qwen3" in line, line)
         line, green, _ = row_line("mimo2", "mimo2", small)
         check("a mimo2 file routes to the mimo2 seat", green and "arch=mimo2 route=ok" in line, line)
         line, green, _ = row_line("qwen3", "llama", small)
