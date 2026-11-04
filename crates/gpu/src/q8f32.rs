@@ -87,6 +87,7 @@
 //! rows raises [`FaultSite::TokenId`] and writes its row NaN.
 
 use crate::GpuError;
+use crate::autotune::{Mcol, McolSig, Picks};
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::half_bits_to_f32;
 use crate::gemm::{
@@ -95,7 +96,7 @@ use crate::gemm::{
 };
 use crate::launch_u32;
 use crate::planes::{self, Format};
-use crate::tensor::DeviceTensor;
+use crate::tensor::{DeviceTensor, Window, WindowMut};
 use crate::upload::pack_planes;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::vector::{F32x4, as_vectors};
@@ -104,7 +105,7 @@ use cuda_device::{
 };
 use cuda_host::cuda_module;
 use gguf::quant::GgmlType;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 // --------------------------------------------------------------- cores
 //
@@ -1570,6 +1571,9 @@ pub(crate) const STAGED_COLS: usize = 4;
 /// [`STAGED_COLS`] columns runs a stage of this many, its columns past the
 /// launch's idle.
 pub(crate) const STAGED_MAX_COLS: usize = 8;
+
+/// The values every row's `k` is a multiple of for [`blocks_gemv_mcol_staged`].
+pub(crate) const STAGED_K: usize = 512;
 
 /// Shared f32 values of [`blocks_gemv_mcol_staged`]'s two stages of `cols`
 /// columns: one step's 128 values of each column a stage.
@@ -3114,6 +3118,9 @@ mod q8f32_kernels {
 pub struct Q8F32Kernels {
     module: q8f32_kernels::LoadedModule,
     pub(crate) dense_mma: bool,
+    /// The card's load-time picks ([`crate::autotune`]), installed once;
+    /// unset, every launch takes today's rule.
+    picks: OnceLock<Picks>,
 }
 
 impl Q8F32Kernels {
@@ -3125,6 +3132,15 @@ impl Q8F32Kernels {
         Ok(Q8F32Kernels {
             module,
             dense_mma: crate::dense_mma(ctx)?,
+            picks: OnceLock::new(),
+        })
+    }
+
+    /// Install `picks` for every later launch: once, before any capture
+    /// reads them; a second install is refused by name.
+    pub(crate) fn install(&self, picks: Picks) -> Result<(), GpuError> {
+        self.picks.set(picks).map_err(|_| {
+            GpuError::protocol("Q8F32Kernels::install", "the card holds picks already")
         })
     }
 
@@ -3469,7 +3485,9 @@ impl Q8F32Kernels {
     /// `m = 1` launch of column c bit for bit; an MXFP8 weight at `m >=`
     /// [`STAGED_COLS`] with `k` a multiple of 512 and `x` from a 16-byte
     /// aligned base runs `mxfp8_gemv_mcol_staged` (`m =` [`STAGED_COLS`]) or
-    /// `mxfp8_gemv_mcol_staged_wide`, the same bits. `k` must be
+    /// `mxfp8_gemv_mcol_staged_wide`, the same bits, unless the card's
+    /// picks name another way for the weight's rows, `k` and `m`
+    /// ([`crate::autotune::Mcol`], the same bits). `k` must be
     /// a multiple of the format's block (MXFP8 32, FP8_B128 128) and `e`
     /// `ceil(k / 128)` words a row over the same rows
     /// ([`E4m3Weight::dimensions`]); another geometry is a named error. Asynchronous, allocation-free, capturable.
@@ -3478,12 +3496,34 @@ impl Q8F32Kernels {
         stream: &CudaStream,
         a: E4m3GemvArgs<'_>,
     ) -> Result<(), GpuError> {
+        self.e4m3_gemv(stream, a, None)
+    }
+
+    /// [`Self::enqueue_e4m3_gemv`] by `way` whatever the card picked: what
+    /// the picker times. A launch the staged entries cannot take (an
+    /// FP8_B128 weight, `k` no multiple of 512, `x` off 16 bytes) runs
+    /// the rule's entry under every way.
+    pub fn enqueue_e4m3_gemv_way(
+        &self,
+        stream: &CudaStream,
+        a: E4m3GemvArgs<'_>,
+        way: Mcol,
+    ) -> Result<(), GpuError> {
+        self.e4m3_gemv(stream, a, Some(way))
+    }
+
+    fn e4m3_gemv(
+        &self,
+        stream: &CudaStream,
+        a: E4m3GemvArgs<'_>,
+        way: Option<Mcol>,
+    ) -> Result<(), GpuError> {
         let E4m3GemvArgs { w, x, m, out, y } = a;
         let what = "enqueue_e4m3_gemv";
-        let (n_rows, k) = w.dimensions(what)?;
-        check_gemv_geometry(what, n_rows, k, x.len(), m, y.len())?;
-        let n_rows = launch_u32(what, "n_rows", n_rows)?;
-        let k = launch_u32(what, "k", k)?;
+        let (rows, k_len) = w.dimensions(what)?;
+        check_gemv_geometry(what, rows, k_len, x.len(), m, y.len())?;
+        let n_rows = launch_u32(what, "n_rows", rows)?;
+        let k = launch_u32(what, "k", k_len)?;
         let cfg = LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0);
         let (qs, e) = (w.qs.buf(), w.e.buf());
         let module = &self.module;
@@ -3502,39 +3542,99 @@ impl Q8F32Kernels {
             }
             return Ok(());
         }
+        let cols = m;
         let m = launch_u32(what, "m", m)?;
         let (y_row, y_col) = match out {
             GemvOut::RowMajor => (m, 1),
             GemvOut::TokenMajor => (1, n_rows),
         };
-        let staged = k.is_multiple_of(512) && x.cu_deviceptr().is_multiple_of(16);
+        let staged = k_len.is_multiple_of(STAGED_K) && x.cu_deviceptr().is_multiple_of(16);
         match w.scales {
-            E4m3Scales::Mxfp8 if staged && m as usize == STAGED_COLS => {
-                let prep = module.prepare_mxfp8_gemv_mcol_staged(cfg)?;
-                let e_cols = launch_u32(what, "e_cols", w.e.cols())?;
-                module.mxfp8_gemv_mcol_staged(
-                    stream, &prep, qs, e, x, n_rows, k, e_cols, y_row, y_col, y,
-                )?;
-            }
-            E4m3Scales::Mxfp8 if staged && m as usize > STAGED_COLS => {
-                let prep = module.prepare_mxfp8_gemv_mcol_staged_wide(cfg)?;
-                let e_cols = launch_u32(what, "e_cols", w.e.cols())?;
-                module.mxfp8_gemv_mcol_staged_wide(
-                    stream, &prep, qs, e, x, n_rows, k, e_cols, m, y_row, y_col, y,
-                )?;
-            }
             E4m3Scales::Mxfp8 => {
-                let prep = module.prepare_mxfp8_gemv_mcol(cfg)?;
-                let e_cols = launch_u32(what, "e_cols", w.e.cols())?;
-                module.mxfp8_gemv_mcol(
-                    stream, &prep, qs, e, x, n_rows, k, e_cols, m, y_row, y_col, y,
-                )?;
+                let l = Mxfp8Cols {
+                    qs,
+                    e,
+                    n_rows,
+                    k,
+                    e_cols: launch_u32(what, "e_cols", w.e.cols())?,
+                    y_strides: (y_row, y_col),
+                    cfg,
+                };
+                let sig = McolSig {
+                    rows,
+                    k: k_len,
+                    m: cols,
+                };
+                let way =
+                    way.unwrap_or_else(|| self.picks.get().map_or(Mcol::Rule, |p| p.mcol(sig)));
+                match way {
+                    Mcol::Split if staged && cols > STAGED_COLS => {
+                        self.mxfp8_cols(stream, &l, x, (STAGED_COLS, true), y)?;
+                        let rest = cols - STAGED_COLS;
+                        let x_rest = Window::<f32>::of(
+                            x,
+                            size_of::<f32>() * STAGED_COLS * sig.k,
+                            rest * sig.k,
+                        )?;
+                        let at = match out {
+                            GemvOut::RowMajor => STAGED_COLS,
+                            GemvOut::TokenMajor => STAGED_COLS * sig.rows,
+                        };
+                        let mut y_rest =
+                            WindowMut::<f32>::of_mut(y, size_of::<f32>() * at, y.len() - at)?;
+                        let rest_staged = rest == STAGED_COLS;
+                        self.mxfp8_cols(stream, &l, &x_rest, (rest, rest_staged), &mut y_rest)?;
+                    }
+                    Mcol::Plain => self.mxfp8_cols(stream, &l, x, (cols, false), y)?,
+                    _ => self.mxfp8_cols(stream, &l, x, (cols, staged), y)?,
+                }
             }
             E4m3Scales::Fp8B128 => {
                 let prep = module.prepare_fp8_b128_gemv_mcol(cfg)?;
                 module
                     .fp8_b128_gemv_mcol(stream, &prep, qs, e, x, n_rows, k, m, y_row, y_col, y)?;
             }
+        }
+        Ok(())
+    }
+
+    /// `n` columns of `l`'s weight from `x` into `y` at `l`'s strides: the
+    /// staged entry at [`STAGED_COLS`] and the wide stage past it when
+    /// `staged`, else `_mcol`.
+    fn mxfp8_cols(
+        &self,
+        stream: &CudaStream,
+        l: &Mxfp8Cols<'_>,
+        x: &DeviceBuffer<f32>,
+        (n, staged): (usize, bool),
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let Mxfp8Cols {
+            qs,
+            e,
+            n_rows,
+            k,
+            e_cols,
+            y_strides: (y_row, y_col),
+            cfg,
+        } = *l;
+        let module = &self.module;
+        let m = launch_u32("enqueue_e4m3_gemv", "m", n)?;
+        if staged && n == STAGED_COLS {
+            let prep = module.prepare_mxfp8_gemv_mcol_staged(cfg)?;
+            module.mxfp8_gemv_mcol_staged(
+                stream, &prep, qs, e, x, n_rows, k, e_cols, y_row, y_col, y,
+            )?;
+        } else if staged && n > STAGED_COLS {
+            let prep = module.prepare_mxfp8_gemv_mcol_staged_wide(cfg)?;
+            module.mxfp8_gemv_mcol_staged_wide(
+                stream, &prep, qs, e, x, n_rows, k, e_cols, m, y_row, y_col, y,
+            )?;
+        } else {
+            let prep = module.prepare_mxfp8_gemv_mcol(cfg)?;
+            module.mxfp8_gemv_mcol(
+                stream, &prep, qs, e, x, n_rows, k, e_cols, m, y_row, y_col, y,
+            )?;
         }
         Ok(())
     }
@@ -4175,6 +4275,19 @@ impl E4m3Weight<'_> {
         }
         Ok((rows, k))
     }
+}
+
+/// An MXFP8 m-column launch's fixed parts: the planes, the geometry, row
+/// r's column c at `y[r·y_strides.0 + c·y_strides.1]`, and the grid.
+#[derive(Clone, Copy)]
+struct Mxfp8Cols<'a> {
+    qs: &'a DeviceBuffer<u32>,
+    e: &'a DeviceBuffer<u32>,
+    n_rows: u32,
+    k: u32,
+    e_cols: u32,
+    y_strides: (u32, u32),
+    cfg: LaunchConfig1D,
 }
 
 /// [`Q8F32Kernels::enqueue_e4m3_gemv`]'s arguments: the weight, `m`

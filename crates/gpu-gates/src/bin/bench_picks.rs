@@ -2,17 +2,16 @@
 //!
 //! The pairs (docs/research/kernel-picks.md §3.4), each on the shapes the Qwen3.8 files carry:
 //!
-//! - `mxfp8_<shape>_m<m>`: the MXFP8 gemv at `m` columns. The launcher takes the staged walk (`m` = 4) or the wide stage
-//!   (`m` = 5..8) for a 16-byte aligned `x` and `k` a multiple of 512, so the plain walk at that `k` is a launch only a
-//!   hook in `q8f32.rs` can make (an unaligned `x` runs the plain walk's scalar fallback, no candidate). At `m` = 4..8 the
-//!   pair is a proxy: the plain walk at `k - 128` against the engine's walk at `k`, the same rows, compared per 128-value
-//!   step by the model tool. At `m` = 1..3 the row is the engine's walk alone (`kcal single`).
+//! - `mxfp8_<shape>_m<m>`: the MXFP8 gemv at `m` columns. At `m` = 4..8 every way the load-time picker races there
+//!   (`autotune::Mcol::racing`, through `enqueue_e4m3_gemv_way`): the engine's walk (the staged walk at 4, the wide stage
+//!   past 4), the plain walk, and past 4 the split (four columns staged, then the rest). At `m` = 1..3 the row is the
+//!   engine's walk alone (`kcal single`).
 //! - `q8_0p_<shape>_t<t>`: the Q8_0-plane GEMM, `gemm_q8_0p` against `gemm_q8_0p_slab` (`enqueue_gemm32_entry`), on the
 //!   dense prompt projections, the stacks around the slab entry's wave, and two routed 512-expert stacks.
 //! - `f32_<rows>_m<m>`, `bf16_<rows>_m<m>`: the exact tile against `ceil(m / 8)` launches of the gemv.
 //!
-//! Every pair but the MXFP8 proxy gives both candidates the same bits (checked on their first launch, a mismatch is a named
-//! error, an all-zero result too). `--check` stops there and needs no timing lease. `--time` (lead-only, through
+//! Every candidate of a configuration gives the same bits (checked on their first launch, a mismatch is a named error, an
+//! all-zero result too). `--check` stops there and needs no timing lease. `--time` (lead-only, through
 //! `tools/ref/bench-picks.sh`, which owns the lease and the witness blocks) then times each candidate's eager burst and
 //! graph replay with `shared/bench.rs`'s instrument (`bench op=` rows) and runs [`PAIR_ROUNDS`] rounds in which the
 //! candidates and a second capture of the first (the A/A arm, the instrument's own spread) take turns in rotating
@@ -34,6 +33,7 @@ mod picks {
     use crate::bench_arm::{
         GREPS, N, ROUNDS, burst, fill_pattern, fill_pattern_f32, print_arm, replay,
     };
+    use bloomery_gpu::autotune::Mcol;
     use bloomery_gpu::gemm::{
         GEMM_BN, Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct32, GemmInput, GemmKernels,
         GemmRoute, Q8_0pEntry,
@@ -87,8 +87,6 @@ mod picks {
         bytes: u64,
         /// The candidate the engine's rule takes: its name, `-` when none of the candidates.
         rule: &'static str,
-        /// Whether the candidates give one answer, which the first launch checks: false for a proxy pair of two shapes.
-        compare: bool,
     }
 
     struct Opts {
@@ -213,7 +211,6 @@ mod picks {
             }
             match &first {
                 None => first = Some(got),
-                Some(_) if !cfg.compare => {}
                 Some(want) => {
                     if let Some(i) = (0..want.len()).find(|&i| want[i] != got[i]) {
                         return Err(format!(
@@ -227,12 +224,11 @@ mod picks {
         }
         if !o.time {
             println!(
-                "kcal check label={} family={} {} cands={} bits={}",
+                "kcal check label={} family={} {} cands={} bits=equal",
                 cfg.label,
                 cfg.family,
                 cfg.fields,
                 cands.iter().map(|c| c.name).collect::<Vec<_>>().join(","),
-                if cfg.compare { "equal" } else { "unchecked" }
             );
             return Ok(());
         }
@@ -351,28 +347,39 @@ mod picks {
     }
 
     /// Qwen3.8's MXFP8 dense verify shapes `(label, rows, k)`: the GDN output, the qkvz, the attention query; then a
-    /// latent attention's `attn_q_b` and `attn_output`, the short row and the long row `gate_mxfp8` runs.
-    const MXFP8_SHAPES: [(&str, usize, usize); 5] = [
+    /// latent attention's `attn_q_b` and `attn_output`, the short row and the long row `gate_mxfp8` runs; then Qwen3.8's
+    /// other verify sites (the 6,144-row, 640-, 512-, 128- and 96-row projections and the head) and a 1,152-row
+    /// projection at `k` 5,120.
+    const MXFP8_SHAPES: [(&str, usize, usize); 12] = [
         ("2560x6144", 2560, 6144),
         ("10240x2560", 10_240, 2560),
         ("12288x2560", 12_288, 2560),
         ("16384x1536", 16_384, 1536),
         ("4096x16384", 4096, 16_384),
+        ("6144x2560", 6144, 2560),
+        ("640x2560", 640, 2560),
+        ("512x2560", 512, 2560),
+        ("128x2560", 128, 2560),
+        ("96x2560", 96, 2560),
+        ("248320x2560", 248_320, 2560),
+        ("1152x5120", 1152, 5120),
     ];
 
     /// One MXFP8 weight copy: its value plane and its scale plane.
     type Mxfp8Planes = (DeviceTensor<u32>, DeviceTensor<u32>);
 
-    /// The MXFP8 gemv of `ws[c % ws.len()]` against the `m` columns of `x`, token-major: the launch as the engine makes it.
+    /// The MXFP8 gemv of `ws[c % ws.len()]` against the `m` columns of `x`, token-major, by `way`: [`Mcol::Rule`] is the
+    /// launch as the engine makes it.
     fn mxfp8_enq<'a>(
         q8: &'a Q8F32Kernels,
         ws: &'a [Mxfp8Planes],
         x: &'a DeviceBuffer<f32>,
         m: usize,
+        way: Mcol,
     ) -> Enq<'a> {
         Box::new(move |s, c, y| {
             let w = &ws[c % ws.len()];
-            q8.enqueue_e4m3_gemv(
+            q8.enqueue_e4m3_gemv_way(
                 s,
                 E4m3GemvArgs {
                     w: E4m3Weight {
@@ -385,6 +392,7 @@ mod picks {
                     out: GemvOut::TokenMajor,
                     y,
                 },
+                way,
             )
         })
     }
@@ -408,13 +416,9 @@ mod picks {
             .map_err(Into::into)
     }
 
-    /// The MXFP8 gemv at one to eight columns. The launcher takes the staged walk (four columns) or the wide stage (five
-    /// to eight) for an `x` from a 16-byte aligned base when `k` is a multiple of 512, and the plain walk below four
-    /// columns or at any other `k`; the plain walk at a multiple of 512 and four or more columns is a launch only a hook
-    /// in `q8f32.rs` can make, and an unaligned `x` runs the plain walk's scalar fallback, which is no candidate. So
-    /// the pair at four or more columns is a proxy: the plain walk at `k - 128` (not a multiple of 512, aligned `x`)
-    /// against the engine's walk at `k`, each a launch the engine makes, on the same rows; the tool compares them per
-    /// 128-value step. Below four columns the row is the engine's plain walk alone.
+    /// The MXFP8 gemv at one to eight columns, each candidate on the same planes and the same `x` from a 16-byte aligned
+    /// base: at four to eight columns every way the picker races there, the engine's walk first; below four the engine's
+    /// plain walk alone.
     fn mxfp8(gpu: &Gpu, o: &Opts) -> Result<(), GateError> {
         let stream = gpu.stream();
         let q8 = gpu.q8f32();
@@ -425,8 +429,6 @@ mod picks {
             let seed = 0x5eed_0900 + i as u64;
             let bytes = (rows * k / 32 * 33) as u64;
             let ws = mxfp8_planes(gpu, (rows, k), seed)?;
-            let k_plain = k - 128;
-            let ws_plain = mxfp8_planes(gpu, (rows, k_plain), seed)?;
             let x_host = fill_pattern_f32(GEMV_COLS * k);
             for m in 1..=GEMV_COLS {
                 let label = format!("mxfp8_{shape}_m{m}");
@@ -434,10 +436,7 @@ mod picks {
                     continue;
                 }
                 let x = DeviceBuffer::from_host(stream, &x_host[..m * k])?;
-                let x_plain = DeviceBuffer::from_host(stream, &x_host[..m * k_plain])?;
-                if !x.cu_deviceptr().is_multiple_of(16)
-                    || !x_plain.cu_deviceptr().is_multiple_of(16)
-                {
+                if !x.cu_deviceptr().is_multiple_of(16) {
                     return Err(format!(
                         "bench_picks: {label}: the arms need an x at a 16-byte aligned base"
                     )
@@ -451,36 +450,32 @@ mod picks {
                     4 => "staged",
                     _ => "staged_wide",
                 };
-                let proxy = m >= 4;
+                let ways = match Mcol::racing(m) {
+                    [] => &[Mcol::Rule][..],
+                    racing => racing,
+                };
+                let cands: Vec<Cand<'_>> = ways
+                    .iter()
+                    .map(|&way| Cand {
+                        name: if way == Mcol::Rule {
+                            engine
+                        } else {
+                            way.word()
+                        },
+                        layout: Layout::Col,
+                        enq: mxfp8_enq(q8, &ws, &x, m, way),
+                    })
+                    .collect();
                 let cfg = Cfg {
                     label,
                     family: "mxfp8",
-                    fields: format!(
-                        "shape={shape} rows={rows} k={k} k_plain={} experts=1 slots={m}",
-                        if proxy { k_plain } else { k }
-                    ),
+                    fields: format!("shape={shape} rows={rows} k={k} experts=1 slots={m}"),
                     rows,
                     m,
-                    copies: ws.len().max(ws_plain.len()),
+                    copies: ws.len(),
                     bytes,
                     rule: engine,
-                    compare: false,
                 };
-                let mut cands = vec![Cand {
-                    name: engine,
-                    layout: Layout::Col,
-                    enq: mxfp8_enq(q8, &ws, &x, m),
-                }];
-                if proxy {
-                    cands.insert(
-                        0,
-                        Cand {
-                            name: "plain",
-                            layout: Layout::Col,
-                            enq: mxfp8_enq(q8, &ws_plain, &x_plain, m),
-                        },
-                    );
-                }
                 run_cfg(gpu, o, &cfg, &cands)?;
             }
         }
@@ -625,7 +620,6 @@ mod picks {
             copies: ws.len(),
             bytes,
             rule: if slab_rule { "slab" } else { "plain" },
-            compare: true,
         };
         run_cfg(gpu, o, &cfg, &cands)
     }
@@ -796,7 +790,6 @@ mod picks {
                             (false, false, true) => "-",
                             _ => "tile",
                         },
-                        compare: true,
                     };
                     let cands = [
                         Cand {

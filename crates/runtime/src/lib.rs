@@ -25,6 +25,7 @@
 //! flat weight stream, the one count the loader's staging and the packings
 //! that pin it must agree on.
 
+pub mod autotune;
 pub mod combine;
 pub mod costs;
 pub mod dspark;

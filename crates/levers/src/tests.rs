@@ -451,6 +451,7 @@ fn accessors_read_their_rows() {
     assert_eq!(unset.nvtier_mem(), NvTierMem::Auto);
     assert_eq!(unset.gen_slots(), 1);
     assert!(!unset.prepare_q8());
+    assert!(unset.autotune());
     assert_eq!(
         unset.host(),
         HostCfg {
@@ -498,6 +499,7 @@ fn accessors_read_their_rows() {
             (PREFILL_GROUP, "8"),
             (GEN_SLOTS, "2"),
             (PREPARE_Q8, "1"),
+            (AUTOTUNE, "off"),
         ]),
         Scope::Every,
     )
@@ -551,6 +553,7 @@ fn accessors_read_their_rows() {
     }
     assert_eq!(set.gen_slots(), 2);
     assert!(set.prepare_q8());
+    assert!(!set.autotune());
     assert_eq!(
         set.host(),
         HostCfg {
@@ -609,7 +612,8 @@ fn accessors_read_their_rows() {
             FORCE_IDS,
             SCREEN,
             SCHEMAJUMP,
-            PREPARE_Q8
+            PREPARE_Q8,
+            AUTOTUNE
         ]
     );
 }

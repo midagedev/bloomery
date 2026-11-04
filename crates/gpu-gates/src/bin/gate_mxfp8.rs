@@ -31,6 +31,11 @@
 //! Each gemv also runs on the same columns read through a window that starts
 //! one f32 past a 16-byte boundary (`gemv.x_off4`): the same checks.
 //!
+//! An MXFP8 gemv of four or more columns also runs by every way the
+//! load-time picker races there (`autotune::Mcol::racing`, through
+//! `enqueue_e4m3_gemv_way`), token-major and row-major (`ways`): the same
+//! checks, so a pick changes no output bit.
+//!
 //! At one column each shape also runs through `site::resident_gemv`
 //! (`decode`), the launch by resident form that glm5next's decode step runs
 //! for every projection (`gpu-glm5next`'s `body::gemv`: the latent layer's
@@ -88,6 +93,13 @@
 //! `written`, `band` and `bits` checks there too; the wide tile reads whole
 //! 128-value records and refuses such a K by name (`plane-shape`).
 //!
+//! The picker (`autotune::tune`) over the MXFP8 tensors above, on a cost
+//! store of its own (`autotune`): a first run measures every signature, four
+//! to eight columns of each `(rows, k)` the staged entries read (`miss`); a
+//! second reads every pick back, the same ways, and times nothing (`hit`);
+//! an entry that names a way its signature does not race is timed again and
+//! every other read (`bad_entry`).
+//!
 //! And the load's refusals, each naming the tensor: an MXFP8 scale byte 0xFF
 //! (E8M0's NaN), a value byte 0x7F (E4M3's NaN) of either type, an FP8_B128
 //! scale that is not finite, and an FP8_B128 scale a value times leaves f32's
@@ -127,8 +139,10 @@ fn main() -> std::process::ExitCode {
 
 mod gate {
     use crate::dense_file::{by_name, check, columns, decl, host_rows, mma_neighbours, q8_0_bytes};
+    use bloomery_gpu::autotune::{self, Mcol, Tuned};
     use bloomery_gpu::gemm::{Gemm32Kernels, GemmInput, GemmKernels, GemmRoute};
     use bloomery_gpu::head::{Head, HeadNorm};
+    use bloomery_gpu::host::costs::{Source, Store};
     use bloomery_gpu::q8f32::{
         E4m3GemvArgs, E4m3Scales, E4m3Weight, GemvOut, Mxfp8GemvIdsArgs, SelArgs, e4m3_planes,
     };
@@ -157,14 +171,15 @@ mod gate {
     /// `ssm_f_b` (`dims` 1,536 × 16,384, 16,384 × 4,096 and 128 × 8,192,
     /// `dims[0]` the row width): a short row, the row a lane walks in whole
     /// trips, and the one-word-a-lane row. `attn_q_b`'s and `attn_output`'s
-    /// rows are multiples of 512, so their four, six and eight columns run
-    /// MXFP8's staged walks (four, and the wide stage past four).
+    /// rows are multiples of 512, so their four to six and eight columns run
+    /// MXFP8's staged walks (four, and the wide stage past four) and every
+    /// way the picker races there.
     pub(crate) const SHAPES: [Shape; 3] = [
         Shape {
             stem: "blk.3.attn_q_b",
             rows: 16_384,
             k: 1536,
-            ms: &[1, 2, 3, 4, 6, WIDE],
+            ms: &[1, 2, 3, 4, 5, 6, WIDE],
             seed: 0x5eed_0801,
         },
         Shape {
@@ -551,6 +566,122 @@ mod gate {
             ok &= plane_shapes(gpu, &g32, (scales_of(ty), tag))?;
         }
         ok &= normalized_head(gpu, dir)?;
+        ok &= autotune_case(gpu, &split, dir)?;
+        Ok(ok)
+    }
+
+    /// The picker over this file's MXFP8 weights (`autotune::tune`) on a
+    /// store of its own (module doc, `autotune`).
+    fn autotune_case(gpu: &Gpu, split: &Split, dir: &Path) -> Result<bool, GateError> {
+        let shapes: Vec<&Shape> = SHAPES.iter().chain(&TAILS).collect();
+        let names: Vec<String> = shapes.iter().map(|s| shape_name(s, "mxfp8")).collect();
+        let w = Weights::load_where(gpu.stream(), split, |n| names.iter().any(|m| m == n))?;
+        let mut sigs: Vec<(usize, usize)> = shapes
+            .iter()
+            .filter(|s| s.k.is_multiple_of(512))
+            .map(|s| (s.rows, s.k))
+            .collect();
+        sigs.sort_unstable();
+        sigs.dedup();
+        let want = sigs.len() * (1..=8).filter(|&m| !Mcol::racing(m).is_empty()).count();
+        let store_dir = dir.join("autotune-store");
+        let store = Store::at(store_dir.clone());
+        let first = autotune::tune(gpu, &w, "gate_mxfp8", &store)?;
+        let second = autotune::tune(gpu, &w, "gate_mxfp8", &store)?;
+        let entry = std::fs::read_dir(&store_dir)?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "costs"))
+            .ok_or("the picker's store holds no entry")?;
+        let bad: String = std::fs::read_to_string(&entry)?
+            .lines()
+            .map(|l| {
+                if l.starts_with("way\t") {
+                    format!("way\t{:016x}\t9\n", 9.0f64.to_bits())
+                } else {
+                    format!("{l}\n")
+                }
+            })
+            .collect();
+        std::fs::write(&entry, bad)?;
+        let third = autotune::tune(gpu, &w, "gate_mxfp8", &store)?;
+        let measured = |t: &Tuned| {
+            t.picks
+                .iter()
+                .filter(|p| p.from == Source::Measured)
+                .count()
+        };
+        let ways = |t: &Tuned| t.picks.iter().map(|p| (p.sig, p.way)).collect::<Vec<_>>();
+        let moved = first.picks.iter().filter(|p| p.way != Mcol::Rule).count();
+        let mut ok = true;
+        for (clause, pass, shown) in [
+            (
+                "miss",
+                first.picks.len() == want && measured(&first) == want,
+                format!(
+                    "picks={} want={want} measured={} moved={moved} wall_ms={}",
+                    first.picks.len(),
+                    measured(&first),
+                    first.wall.as_millis()
+                ),
+            ),
+            (
+                "hit",
+                measured(&second) == 0 && ways(&second) == ways(&first),
+                format!(
+                    "measured={} same_ways={}",
+                    measured(&second),
+                    ways(&second) == ways(&first)
+                ),
+            ),
+            (
+                "bad_entry",
+                measured(&third) == 1 && third.picks.len() == want,
+                format!("measured={} picks={}", measured(&third), third.picks.len()),
+            ),
+        ] {
+            println!("mxfp8 clause=autotune.{clause} {shown} {}", verdict(pass));
+            ok &= pass;
+        }
+        Ok(ok)
+    }
+
+    /// Every way the picker races at `m` columns (`Mcol::racing`) in both
+    /// layouts, through `enqueue_e4m3_gemv_way` (module doc, `ways`).
+    fn ways_case(
+        gpu: &Gpu,
+        w: E4m3Weight<'_>,
+        (x, x_dev): (&[f32], &DeviceBuffer<f32>),
+        (rows, k, m): (usize, usize, usize),
+        (wf, shown): (&[Vec<f32>], &str),
+    ) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let walk = |r: usize, c: usize| byte_rule(&wf[r], &x[c * k..][..k]);
+        let token_major = |at: usize| (at % rows, at / rows);
+        let row_major = |at: usize| (at / m, at % m);
+        let mut ok = true;
+        for &way in Mcol::racing(m) {
+            for out in [GemvOut::TokenMajor, GemvOut::RowMajor] {
+                let mut y_dev = DeviceBuffer::from_host(stream, &vec![f32::NAN; m * rows])?;
+                let a = E4m3GemvArgs {
+                    w,
+                    x: x_dev,
+                    m,
+                    out,
+                    y: &mut y_dev,
+                };
+                gpu.q8f32().enqueue_e4m3_gemv_way(stream, a, way)?;
+                stream.synchronize()?;
+                let y = y_dev.to_host_vec(stream)?;
+                let index: &(dyn Fn(usize) -> (usize, usize) + Sync) = match out {
+                    GemvOut::TokenMajor => &token_major,
+                    GemvOut::RowMajor => &row_major,
+                };
+                let shown = format!("{shown} way={} out={out:?}", way.word());
+                ok &= check(("mxfp8", "ways"), &shown, (&y, x, k), wf, index, &walk);
+            }
+        }
         Ok(ok)
     }
 
@@ -1068,6 +1199,10 @@ mod gate {
                     &|at| (at % wf.len(), at / wf.len()),
                     &walk,
                 );
+            }
+            if !wide && file_ty == GgmlType::MXFP8 && m >= 4 {
+                let e4m3 = w.e4m3("gate_mxfp8", &name)?;
+                ok &= ways_case(gpu, e4m3, (&x, &x_dev), (rows, k, m), (&wf, &shown))?;
             }
             // The listed-row clause lists three rows, more than a shorter
             // matrix may list.

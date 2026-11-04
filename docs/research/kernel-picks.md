@@ -2,6 +2,8 @@
 
 Status (2026-11-04): a proposal beside #1151's load-time race, not built. Its band (±10 %) is derived, not measured. The first step is the calibration both designs need: force every candidate on the real shapes on sm_86 and sm_121a, and set the model's ranking against the measured one. That result picks between this design and the race.
 
+The race is built in `crates/gpu/src/autotune.rs`, with the MXFP8 gemv of four to eight columns as its first site; `bench_picks` forces each way it races there (`enqueue_e4m3_gemv_way`).
+
 Status: proposal, 2026-11-04, written on main `6a3570613`. Nothing here is built. Tags: `[measured: source]` is a
 number someone timed, with its source; `[derived]` is arithmetic on the tree's facts; `[datasheet]` is a vendor figure
 that the load would read from the driver instead. Register, shared-memory and blocks-per-SM figures are from the

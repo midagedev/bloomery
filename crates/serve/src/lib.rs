@@ -68,10 +68,10 @@ pub use api::{
     MAX_CONNECTIONS, ServeError, Server, ServerConfig, VERSION, panic_text,
 };
 pub use engine::{
-    Ahead, CacheNote, Decoder, DeviceProps, DraftProps, Drafted, Engine, EngineError, EngineProps,
-    Flight, Landed, ModelProps, Pending, PlacementProps, ResidencyReset, Sampler, SamplerFactory,
-    SamplerRefused, SamplingParams, SaveInFlight, Saved, SavedState, SharedPrefix, SlotDraw,
-    SlotPass, SlotRow, StateError, Tokenizer, Waits,
+    Ahead, AutotuneProps, CacheNote, Decoder, DeviceProps, DraftProps, Drafted, Engine,
+    EngineError, EngineProps, Flight, Landed, ModelProps, Pending, PickProps, PlacementProps,
+    ResidencyReset, Sampler, SamplerFactory, SamplerRefused, SamplingParams, SaveInFlight, Saved,
+    SavedState, SharedPrefix, SlotDraw, SlotPass, SlotRow, StateError, Tokenizer, Waits,
 };
 pub use jinja::{ChatTemplate, TemplateError};
 pub use mock::{DraftMock, MockEngine, MockTokenizer, SaveStats, ScriptedEngine};

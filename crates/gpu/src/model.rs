@@ -39,6 +39,7 @@ pub use slots::{SlotRange, SlotRowOrder, SlotRows, Slots, SlotsOut, slots_a_pass
 
 use slots::{ParkedSlot, PoisonWhy, SlotFault, SlotGraphs, SlotSet};
 
+use crate::autotune;
 use crate::best::{self, Best};
 use crate::fault::Fault;
 use crate::graph::MappedHost;
@@ -65,6 +66,7 @@ use model::placement::need_hook;
 use model::placement::workstation::{self, ArenaGrant, HostNeed};
 use model::placement::{ArenaFloor, ExpertList, Plan};
 use model::r8file::R8Source;
+use runtime::costs::Store;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1216,6 +1218,24 @@ impl<B: ChainBody> GpuModel<B> {
             Some(host) => host.refusal_poison(),
             None => None,
         })
+    }
+
+    /// Time the bit-equal ways of the kernel signatures this model's
+    /// resident weights reach and install the picks on its card
+    /// ([`autotune::tune`], the store's entries under `build`): load-time,
+    /// before any capture, so every capture reads them and none changes while
+    /// the model serves. A model that holds a capture or a parked slot is
+    /// refused by name, and so is a card that holds picks already.
+    pub fn autotune(&self, build: &str, store: &Store) -> Result<autotune::Tuned, GpuError> {
+        if self.graphs.any() || !self.parked.is_empty() {
+            return Err(GpuError::protocol(
+                "GpuModel::autotune",
+                "the model holds a capture or a parked slot: picks come before both",
+            ));
+        }
+        let tuned = autotune::tune(&self.gpu, &self.weights, build, store)?;
+        self.gpu.q8f32().install(tuned.table())?;
+        Ok(tuned)
     }
 
     /// Capture the whole chain — every resident layer plus the head — into

@@ -409,7 +409,7 @@ impl Store {
 
     /// The `names.len()` values kept under `key`, or, when none are, `measure`'s, written under
     /// it: with where they came from. An invalid file under the key's name, including one
-    /// holding another key or other names, is refused until deleted. The key's lock file is
+    /// that is not UTF-8 or holds another key or other names, is refused until deleted. The key's lock file is
     /// held from the read to the write, so two loads that miss the same key at once take one
     /// measurement: the second reads the
     /// first's. `measure`'s error is returned whole. Refused by name: no directory (neither
@@ -419,6 +419,31 @@ impl Store {
         &self,
         key: &str,
         names: &[&str],
+        measure: impl FnOnce() -> Result<Vec<f64>, E>,
+    ) -> Result<(Vec<f64>, Source), E> {
+        self.entry(key, names, None, measure)
+    }
+
+    /// [`Store::get_or`] for values every reading of which gives the same output bits (an
+    /// autotune pick, `crate::autotune`): a file under the key's name that does not decode (not
+    /// UTF-8 included), or whose values `keep` refuses, is measured again and replaced instead
+    /// of refused. A measurement `keep` refuses is refused by name and not written.
+    pub fn get_or_retime<E: From<CostError>>(
+        &self,
+        key: &str,
+        names: &[&str],
+        keep: impl Fn(&[f64]) -> bool,
+        measure: impl FnOnce() -> Result<Vec<f64>, E>,
+    ) -> Result<(Vec<f64>, Source), E> {
+        self.entry(key, names, Some(&keep), measure)
+    }
+
+    /// [`Store::get_or`], and with `retime` [`Store::get_or_retime`].
+    fn entry<E: From<CostError>>(
+        &self,
+        key: &str,
+        names: &[&str],
+        retime: Option<Keep<'_>>,
         measure: impl FnOnce() -> Result<Vec<f64>, E>,
     ) -> Result<(Vec<f64>, Source), E> {
         let dir = self.dir.as_ref().ok_or_else(|| {
@@ -441,21 +466,31 @@ impl Store {
             .open(path.with_extension("lock"))
             .map_err(|e| bad("open the lock", e))?;
         lock.lock().map_err(|e| bad("lock", e))?;
-        match std::fs::read_to_string(&path) {
-            Ok(t) => {
-                if let Some(v) = decode(&t, key, names) {
-                    return Ok((v, Source::Stored));
+        match std::fs::read(&path) {
+            Ok(b) => match (
+                std::str::from_utf8(&b)
+                    .ok()
+                    .and_then(|t| decode(t, key, names)),
+                retime,
+            ) {
+                (Some(v), None) => return Ok((v, Source::Stored)),
+                (Some(v), Some(keep)) if keep(&v) => return Ok((v, Source::Stored)),
+                (_, Some(_)) => {}
+                (None, None) => {
+                    return Err(E::from(CostError(format!(
+                        "cost store {}: invalid cached entry for {key}; delete it to recalibrate",
+                        path.display()
+                    ))));
                 }
-                return Err(E::from(CostError(format!(
-                    "cost store {}: invalid cached entry for {key}; delete it to recalibrate",
-                    path.display()
-                ))));
-            }
+            },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(bad("read", e)),
         }
         let values = measure()?;
-        if values.len() != names.len() || values.iter().any(|v| !v.is_finite()) {
+        if values.len() != names.len()
+            || values.iter().any(|v| !v.is_finite())
+            || retime.is_some_and(|keep| !keep(&values))
+        {
             return Err(E::from(CostError(format!(
                 "cost store {}: invalid measured values for {key}: {values:?}, names {names:?}",
                 path.display()
@@ -467,6 +502,9 @@ impl Store {
         Ok((values, Source::Measured))
     }
 }
+
+/// What [`Store::get_or_retime`] keeps of an entry that decodes.
+type Keep<'a> = &'a dyn Fn(&[f64]) -> bool;
 
 /// The file a key is kept in: its FNV-1a hash.
 fn file_name(key: &str) -> String {
@@ -806,7 +844,11 @@ mod tests {
             format!("{valid}extra\t3ff0000000000000\t1\n"),
             format!("{valid}bad row\n"),
             valid.replace("b\t", "a\t"),
-        ] {
+        ]
+        .map(String::into_bytes)
+        .into_iter()
+        .chain([vec![0xff], [valid.as_bytes(), &[0xff]].concat()])
+        {
             std::fs::write(dir.join(file_name("k1")), &text).unwrap();
             let e = store
                 .get_or::<CostError>("k1", &names, || panic!("an invalid entry is not measured"))
@@ -815,10 +857,7 @@ mod tests {
                 e.0.contains("invalid cached entry for k1; delete it to recalibrate"),
                 "{e}"
             );
-            assert_eq!(
-                std::fs::read_to_string(dir.join(file_name("k1"))).unwrap(),
-                text
-            );
+            assert_eq!(std::fs::read(dir.join(file_name("k1"))).unwrap(), text);
         }
         for values in [vec![1.0], vec![1.0, f64::NAN], vec![1.0, f64::INFINITY]] {
             let e = store
@@ -827,6 +866,41 @@ mod tests {
             assert!(e.0.contains("invalid measured values"), "{e}");
             assert!(!dir.join(file_name("bad-measure")).exists());
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A retimed entry is read like any other while it decodes and `keep` takes it; a corrupt
+    /// one (not UTF-8 included), or one `keep` refuses, is measured again and replaced, and a
+    /// measurement `keep` refuses is refused unwritten (mutants: the refusal of `get_or` kept,
+    /// a read error for bytes that are not UTF-8, `keep` skipped on the file or on the
+    /// measurement, the new values left unwritten).
+    #[test]
+    fn a_bad_retimed_entry_is_measured_again() {
+        let dir = std::env::temp_dir().join(format!("bloomery-retime-test-{}", std::process::id()));
+        let store = Store::at(dir.clone());
+        let names = ["pick"];
+        let keep = |v: &[f64]| v[0] < 3.0;
+        let get = |v: f64| {
+            store
+                .get_or_retime("k", &names, keep, || Ok::<_, CostError>(vec![v]))
+                .unwrap()
+        };
+        assert_eq!(get(1.0), (vec![1.0], Source::Measured));
+        assert_eq!(get(2.0), (vec![1.0], Source::Stored));
+        for text in [
+            b"key\tk\npick\tgarbled\t0\n".to_vec(),
+            encode("k", &names, &[7.0]).into_bytes(),
+            vec![0xff],
+        ] {
+            std::fs::write(dir.join(file_name("k")), &text).unwrap();
+            assert_eq!(get(2.0), (vec![2.0], Source::Measured));
+            assert_eq!(get(1.0), (vec![2.0], Source::Stored));
+        }
+        let e = store
+            .get_or_retime("k2", &names, keep, || Ok::<_, CostError>(vec![7.0]))
+            .unwrap_err();
+        assert!(e.0.contains("invalid measured values for k2"), "{e}");
+        assert!(!dir.join(file_name("k2")).exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 
