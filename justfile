@@ -3018,13 +3018,15 @@ gate-gpu-ds41-twocard *ARGS='--union':
 # the step fails within the go deadline and its grace naming the lost card, the host tier is poisoned as a lost card
 # (CardLost), the next call or step is refused by that poison and a reset by name. Then the tier gate's T1, T2, B7, B2 and
 # the same three lost-card clauses again over BLOOMERY_TIER_LINK=loopback (two pages on one card and the host pump that
-# carries each go and done between them, host/link/pump.rs): every clause as over the shared page. Weekly: `just weekly`
+# carries each go and done between them, host/link/pump.rs), and again over BLOOMERY_TIER_LINK=tcp (the same two pages,
+# each end's posts framed over one loopback TCP stream and landed by a receiver thread, host/link/tcp.rs): every clause
+# as over the shared page. Weekly: `just weekly`
 # runs it, and `just affected` names it when a file its triggers in tools/gate-paths.tsv match changes. Alone in a batch.
 # Group solo, reason r2 (the twocard leg holds both cards): a fixture-tier run keeps it, so it stays `solo`, not `solo-real`.
 [group('solo')]
 [group('v41-load')]
 weekly-gpu-ds41-lost:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_tier && __s=$(. tools/ref/ref-paths.sh && dspark_model) && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gpu-gate.sh gate_deepseek41_tier --bfirst --blost --lost && BLOOMERY_TIER_LINK=loopback bash tools/gpu-gate.sh gate_deepseek41_tier --union --fault --batch --batch2 --bfault && BLOOMERY_TIER_LINK=loopback bash tools/gpu-gate.sh gate_deepseek41_tier --bfirst --blost --lost'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_tier && __s=$(. tools/ref/ref-paths.sh && dspark_model) && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gpu-gate.sh gate_deepseek41_tier --bfirst --blost --lost && BLOOMERY_TIER_LINK=loopback bash tools/gpu-gate.sh gate_deepseek41_tier --union --fault --batch --batch2 --bfault && BLOOMERY_TIER_LINK=loopback bash tools/gpu-gate.sh gate_deepseek41_tier --bfirst --blost --lost && BLOOMERY_TIER_LINK=tcp bash tools/gpu-gate.sh gate_deepseek41_tier --union --fault --batch --batch2 --bfault && BLOOMERY_TIER_LINK=tcp bash tools/gpu-gate.sh gate_deepseek41_tier --bfirst --blost --lost'
     BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_twocard && __s=$(. tools/ref/ref-paths.sh && dspark_model) && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gpu-gate.sh gate_deepseek41_twocard --lost'
 
 # 상주 교체의 r8 → Q3_K 풀기(`ds41_r8_q3k_groups`, 그룹 하나를 블록 하나가 제자리에서): 무작위 r8 워드를 V4.1 파트

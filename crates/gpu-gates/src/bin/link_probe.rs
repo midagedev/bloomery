@@ -1,6 +1,7 @@
 //! The protocol probe of `docs/contrib/dgx-spark.md` section 9.6: the host
 //! tier's counters carried between nodes by the engine's RDMA link ends
-//! (`bloomery_gpu::host::RdmaEnd`), timed as one round trip a generation.
+//! (`bloomery_gpu::host::RdmaEnd`), or under `--tcp` its TCP link ends
+//! (`bloomery_gpu::host::TcpEnd`), timed as one round trip a generation.
 //!
 //! N nodes, one process each: rank 0 is the stage, ranks 1.. are peers.
 //! Every node allocates the same page: the image, each peer's rows, a go and
@@ -61,9 +62,14 @@
 //! link_probe --nodes 2 --rank 1 --dev <ibdev> --gid <index> --stage <ip:port>
 //! ```
 //!
+//! `--tcp` in place of `--dev` and `--gid` carries the counters over TCP
+//! ends: the stage's end to each peer listens on the address that peer's
+//! control connection reached, and the peer's end dials it. `--gather` takes
+//! RDMA ends alone.
+//!
 //! Optional: `--iters` (timed generations, or replays under `--gather`),
 //! `--warmup`, `--size`, `--gather`, `--deadline-ms`. Every node runs the
-//! same `--size` and `--gather`: setup refuses a mismatch. The stage prints one `link` line (the round trip's percentiles
+//! same `--size`, `--gather` and `--tcp`: setup refuses a mismatch. The stage prints one `link` line (the round trip's percentiles
 //! and the stale lines of both directions, or under `--size` the one-way
 //! time) and fails when a line was stale.
 //!
@@ -80,7 +86,8 @@ fn main() -> std::process::ExitCode {
 mod probe {
     use bloomery_gpu::host::step::RELEASE;
     use bloomery_gpu::host::{
-        Crossing, GatherSet, GatherShape, Gathers, PostCols, RdmaEnd, Reader, Span, link_tail,
+        Crossing, GatherSet, GatherShape, Gathers, PostCols, RdmaEnd, Reader, Span, TcpEnd,
+        TcpPeer, link_tail,
     };
     use bloomery_gpu::{
         Gpu, MappedHost, WindowMut, mem_batch, op_add, op_barrier_sys, op_wait_geq,
@@ -92,7 +99,7 @@ mod probe {
     use cuda_device::{DisjointSlice, debug, kernel, launch_bounds, launch_contract, thread};
     use cuda_host::cuda_module;
     use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
+    use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
     use std::panic::AssertUnwindSafe;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -336,6 +343,8 @@ mod probe {
     struct Opts {
         nodes: usize,
         rank: usize,
+        /// `--tcp`: TCP ends in place of RDMA ends, which `dev` and `gid` name.
+        tcp: bool,
         dev: String,
         gid: u8,
         /// The stage's control address: listened on by rank 0, dialled by
@@ -354,13 +363,14 @@ mod probe {
     }
 
     fn opts() -> Result<Opts, GateError> {
-        const USAGE: &str = "link_probe --nodes N --rank R --dev IBDEV --gid INDEX \
+        const USAGE: &str = "link_probe --nodes N --rank R (--dev IBDEV --gid INDEX | --tcp) \
              (--listen IP:PORT | --stage IP:PORT) [--iters N] [--warmup N] [--size BYTES] \
              [--gather ROWS] [--deadline-ms MS]";
         let args: Vec<String> = std::env::args().skip(1).collect();
         let mut o = Opts {
             nodes: 0,
             rank: usize::MAX,
+            tcp: false,
             dev: String::new(),
             gid: 0,
             control: String::new(),
@@ -374,6 +384,10 @@ mod probe {
         let (mut listen, mut stage, mut gid) = (None, None, None);
         let mut it = args.iter();
         while let Some(k) = it.next() {
+            if k == "--tcp" {
+                o.tcp = true;
+                continue;
+            }
             let v = it
                 .next()
                 .ok_or_else(|| format!("{k} takes a value; usage: {USAGE}"))?;
@@ -393,9 +407,10 @@ mod probe {
                 _ => return Err(format!("unknown argument {k}; usage: {USAGE}").into()),
             }
         }
-        if o.nodes < 2 || o.rank >= o.nodes || o.dev.is_empty() || o.iters == 0 {
+        if o.nodes < 2 || o.rank >= o.nodes || o.dev.is_empty() == !o.tcp || o.iters == 0 {
             return Err(format!(
-                "want --nodes >= 2, --rank below it, --dev and --iters >= 1; usage: {USAGE}"
+                "want --nodes >= 2, --rank below it, --dev or --tcp (one of them) and --iters >= \
+                 1; usage: {USAGE}"
             )
             .into());
         }
@@ -405,7 +420,14 @@ mod probe {
         if o.gather != 0 && o.size != 0 {
             return Err("--gather and --size are two runs: give one".into());
         }
-        o.gid = gid.ok_or_else(|| format!("--gid is required; usage: {USAGE}"))?;
+        if o.gather != 0 && o.tcp {
+            return Err("--gather runs over RDMA ends alone: give --dev and --gid".into());
+        }
+        o.gid = match (o.tcp, gid) {
+            (true, None) => 0,
+            (true, Some(_)) => return Err("--gid names an RDMA port: --tcp takes none".into()),
+            (false, g) => g.ok_or_else(|| format!("--gid is required; usage: {USAGE}"))?,
+        };
         o.control = match (o.rank, listen, stage) {
             (0, Some(a), None) => a,
             (r, None, Some(a)) if r > 0 => a,
@@ -588,14 +610,61 @@ mod probe {
     /// crossings and side from `of`, each posting the rows `cols` holds,
     /// connected to the other nodes' through the control channel, which is
     /// returned with them. A peer equal to this node's rank is the layout's
-    /// own block on a star's peer, whose end reaches the stage.
+    /// own block on a star's peer, whose end reaches the stage. Under
+    /// `--tcp` each end is a TCP end, and the stage's end to a peer listens
+    /// on the address that peer's control connection reached.
     fn open_ends(
         o: &Opts,
         page: &Arc<MappedHost>,
         peers: &[usize],
         of: impl Fn(usize) -> (usize, Vec<Crossing>, Reader),
         cols: &PostCols,
-    ) -> Result<(Vec<RdmaEnd>, Control), GateError> {
+    ) -> Result<(Ends, Control), GateError> {
+        let shape = [o.size, o.gather, usize::from(o.tcp)];
+        let to = |j: usize| if j == o.rank { 0 } else { j };
+        if o.tcp {
+            let mut control = Control::open(o)?;
+            let mut ends = peers
+                .iter()
+                .zip(&control.socks)
+                .map(|(&j, sock)| {
+                    let (tail, crossings, side) = of(j);
+                    let ip = sock.local_addr()?.ip();
+                    Ok(TcpEnd::new(
+                        Arc::clone(page),
+                        tail,
+                        crossings,
+                        side,
+                        ip,
+                        cols.clone(),
+                    )?)
+                })
+                .collect::<Result<Vec<_>, GateError>>()?;
+            let local: Vec<(usize, Ep)> = ends
+                .iter()
+                .zip(peers)
+                .map(|(e, &j)| (to(j), Ep::Tcp(e.endpoint())))
+                .collect();
+            let remote = control.exchange(&local, o.rank, shape)?;
+            for (e, r) in ends.iter_mut().zip(&remote) {
+                let Ep::Tcp(r) = r else {
+                    return Err("an RDMA end on a --tcp run".into());
+                };
+                e.connect(r)?;
+            }
+            println!(
+                "link setup rank={} nodes={} wire=tcp page_bytes={} size={} gather={} iters={} \
+                 warmup={}",
+                o.rank,
+                o.nodes,
+                page.bytes(),
+                o.size,
+                o.gather,
+                o.iters,
+                o.warmup
+            );
+            return Ok((Ends::Tcp(ends), control));
+        }
         let mut ends = peers
             .iter()
             .map(|&j| {
@@ -612,17 +681,17 @@ mod probe {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let mut control = Control::open(o)?;
-        let local: Vec<(usize, Endpoint)> = ends
+        let local: Vec<(usize, Ep)> = ends
             .iter()
             .zip(peers)
             .enumerate()
-            .map(|(i, (e, &j))| {
-                let to = if j == o.rank { 0 } else { j };
-                (to, e.endpoint(psn(o.rank, i)))
-            })
+            .map(|(i, (e, &j))| (to(j), Ep::Rdma(e.endpoint(psn(o.rank, i)))))
             .collect();
-        let remote = control.exchange(&local, o.rank, [o.size, o.gather])?;
+        let remote = control.exchange(&local, o.rank, shape)?;
         for ((e, (_, l)), r) in ends.iter_mut().zip(&local).zip(&remote) {
+            let (Ep::Rdma(l), Ep::Rdma(r)) = (l, r) else {
+                return Err("a TCP end on an RDMA run".into());
+            };
             e.connect(l.psn, r)?;
         }
         println!(
@@ -638,7 +707,32 @@ mod probe {
             o.iters,
             o.warmup
         );
-        Ok((ends, control))
+        Ok((Ends::Rdma(ends), control))
+    }
+
+    /// This node's ends, all of one wire.
+    enum Ends {
+        Rdma(Vec<RdmaEnd>),
+        Tcp(Vec<TcpEnd>),
+    }
+
+    impl Ends {
+        /// The first end that broke, by why.
+        fn broken(&self) -> Option<String> {
+            match self {
+                Ends::Rdma(e) => e.iter().find_map(RdmaEnd::broken),
+                Ends::Tcp(e) => e.iter().find_map(TcpEnd::broken),
+            }
+        }
+
+        /// The ends' release ([`RdmaEnd::release`], [`TcpEnd::release`]).
+        fn release(&self, v: u32) -> Result<(), String> {
+            match self {
+                Ends::Rdma(e) => RdmaEnd::release(e, v),
+                Ends::Tcp(e) => TcpEnd::release(e, v),
+            }
+            .map_err(|e| e.to_string())
+        }
     }
 
     /// The first packet sequence number of this rank's `i`th queue pair.
@@ -719,7 +813,7 @@ mod probe {
     struct Node<'a> {
         rank: usize,
         page: &'a MappedHost,
-        ends: &'a [RdmaEnd],
+        ends: &'a Ends,
         /// Each counter a stall report prints, by name and byte.
         watch: Vec<(String, usize)>,
         deadline: Duration,
@@ -734,7 +828,7 @@ mod probe {
 
         /// The first end that broke, by why.
         fn broken(&self) -> Option<String> {
-            self.ends.iter().find_map(RdmaEnd::broken)
+            self.ends.broken()
         }
 
         /// The stall's report at generation `g`: every watched counter as the
@@ -757,9 +851,9 @@ mod probe {
         /// Release every counter this rank waits on: its ends stop carrying
         /// every counter, and once their posts are over raise the ones this
         /// rank reads to [`RELEASE`]; `Err` names an end whose posts are not
-        /// known to be over, whose counters stay ([`RdmaEnd::release`]).
+        /// known to be over, whose counters stay ([`Ends::release`]).
         fn release(&self) -> Result<(), String> {
-            RdmaEnd::release(self.ends, RELEASE).map_err(|e| e.to_string())
+            self.ends.release(RELEASE)
         }
 
         /// Wait for `event`, generation `g`'s, until `since` is a deadline
@@ -1390,8 +1484,8 @@ mod probe {
 
     /// One endpoint as the control channel carries it: the rank whose end it
     /// is, the rank whose end connects to it, the endpoint, and the sender's
-    /// `--size` and `--gather`.
-    const FRAME_BYTES: usize = 60;
+    /// `--size`, `--gather` and `--tcp`.
+    const FRAME_BYTES: usize = 68;
 
     impl Control {
         fn open(o: &Opts) -> Result<Control, GateError> {
@@ -1462,10 +1556,10 @@ mod probe {
         /// generation.
         fn exchange(
             &mut self,
-            local: &[(usize, Endpoint)],
+            local: &[(usize, Ep)],
             rank: usize,
-            shape: [usize; 2],
-        ) -> Result<Vec<Endpoint>, GateError> {
+            shape: [usize; 3],
+        ) -> Result<Vec<Ep>, GateError> {
             let shape = shape.map(|v| v as u64);
             let own: Vec<Frame> = local
                 .iter()
@@ -1550,12 +1644,20 @@ mod probe {
         }
     }
 
+    /// An end as the control channel carries it: an RDMA endpoint, or a TCP
+    /// end's address and nonce.
+    #[derive(Clone, Copy)]
+    enum Ep {
+        Rdma(Endpoint),
+        Tcp(TcpPeer),
+    }
+
     /// An endpoint on the control channel ([`FRAME_BYTES`]).
     struct Frame {
         from: usize,
         to: usize,
-        e: Endpoint,
-        shape: [u64; 2],
+        e: Ep,
+        shape: [u64; 3],
     }
 
     /// Write the count of `frames`, then each.
@@ -1568,21 +1670,35 @@ mod probe {
             let mut b = [0u8; FRAME_BYTES];
             b[0..4].copy_from_slice(&u32::try_from(f.from)?.to_le_bytes());
             b[4..8].copy_from_slice(&u32::try_from(f.to)?.to_le_bytes());
-            b[8..12].copy_from_slice(&f.e.qpn.to_le_bytes());
-            b[12..16].copy_from_slice(&f.e.psn.to_le_bytes());
-            b[16..32].copy_from_slice(&f.e.gid.raw);
-            b[32..40].copy_from_slice(&f.e.addr.to_le_bytes());
-            b[40..44].copy_from_slice(&f.e.rkey.to_le_bytes());
-            b[44..52].copy_from_slice(&f.shape[0].to_le_bytes());
-            b[52..60].copy_from_slice(&f.shape[1].to_le_bytes());
+            match f.e {
+                Ep::Rdma(e) => {
+                    b[8..12].copy_from_slice(&e.qpn.to_le_bytes());
+                    b[12..16].copy_from_slice(&e.psn.to_le_bytes());
+                    b[16..32].copy_from_slice(&e.gid.raw);
+                    b[32..40].copy_from_slice(&e.addr.to_le_bytes());
+                    b[40..44].copy_from_slice(&e.rkey.to_le_bytes());
+                }
+                Ep::Tcp(p) => {
+                    let ip = match p.addr.ip() {
+                        IpAddr::V4(v) => v.to_ipv6_mapped(),
+                        IpAddr::V6(v) => v,
+                    };
+                    b[8..24].copy_from_slice(&ip.octets());
+                    b[24..26].copy_from_slice(&p.addr.port().to_le_bytes());
+                    b[28..36].copy_from_slice(&p.nonce.to_le_bytes());
+                }
+            }
+            for (i, w) in f.shape.iter().enumerate() {
+                b[44 + 8 * i..52 + 8 * i].copy_from_slice(&w.to_le_bytes());
+            }
             s.write_all(&b)?;
         }
         Ok(())
     }
 
-    /// Read a count of frames, then each; a frame whose `--size` and
-    /// `--gather` are not `shape` is refused by name.
-    fn read_frames(s: &mut TcpStream, shape: [u64; 2]) -> Result<Vec<Frame>, GateError> {
+    /// Read a count of frames, then each; a frame whose `--size`, `--gather`
+    /// and `--tcp` are not `shape` is refused by name.
+    fn read_frames(s: &mut TcpStream, shape: [u64; 3]) -> Result<Vec<Frame>, GateError> {
         let mut n = [0u8; 4];
         s.read_exact(&mut n)
             .map_err(|e| format!("the endpoint count: {e}"))?;
@@ -1596,25 +1712,36 @@ mod probe {
                 let w64 =
                     |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().expect("8 bytes"));
                 let from = w32(0) as usize;
-                let theirs = [w64(44), w64(52)];
+                let theirs = [w64(44), w64(52), w64(60)];
                 if theirs != shape {
                     return Err(format!(
-                        "--size and --gather differ: here {shape:?}, rank {from} {theirs:?}"
+                        "--size, --gather and --tcp differ: here {shape:?}, rank {from} {theirs:?}"
                     )
                     .into());
                 }
-                let mut gid = Gid::default();
-                gid.raw.copy_from_slice(&b[16..32]);
-                Ok(Frame {
-                    from,
-                    to: w32(4) as usize,
-                    e: Endpoint {
+                let e = if shape[2] == 1 {
+                    let v6 = Ipv6Addr::from(<[u8; 16]>::try_from(&b[8..24]).expect("16 bytes"));
+                    let ip = v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4);
+                    let port = u16::from_le_bytes(b[24..26].try_into().expect("2 bytes"));
+                    Ep::Tcp(TcpPeer {
+                        addr: SocketAddr::new(ip, port),
+                        nonce: w64(28),
+                    })
+                } else {
+                    let mut gid = Gid::default();
+                    gid.raw.copy_from_slice(&b[16..32]);
+                    Ep::Rdma(Endpoint {
                         qpn: w32(8),
                         psn: w32(12),
                         gid,
                         addr: w64(32),
                         rkey: w32(40),
-                    },
+                    })
+                };
+                Ok(Frame {
+                    from,
+                    to: w32(4) as usize,
+                    e,
                     shape: theirs,
                 })
             })
