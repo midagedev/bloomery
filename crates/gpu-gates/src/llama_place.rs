@@ -1707,7 +1707,7 @@ mod tests {
         let resolved = |line: &str| resolved_on(HOST_SEAT, line);
         for line in ["-dev none", "-ngl 0", "-dev none -ngl 0"] {
             let r = resolved(line).expect(line);
-            assert_eq!((r.word, r.set), (None, Vec::new()), "{line}: {r:?}");
+            assert_eq!((&r.word, &r.set), (&None, &Vec::new()), "{line}: {r:?}");
             assert!(
                 r.notes[0].contains("no card in the plan"),
                 "{line}: {:?}",

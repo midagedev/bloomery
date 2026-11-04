@@ -237,7 +237,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     start::note_place("host", "no card in the plan");
     Record::new(&record::PLAN_HOST)
         .w("stage", "host")
-        .w("layers", &format!("0..{layers}"))
+        .w("layers", format!("0..{layers}"))
         .w("head", "host")
         .eprint();
     let pool = threads::report().map_err(|e| format!("the worker pool: {e}"))?;

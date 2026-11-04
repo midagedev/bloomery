@@ -2216,8 +2216,10 @@ mod tests {
     /// families' rows are a whole number of words).
     pub(super) fn stack_words(bytes: &[u8]) -> Vec<u32> {
         bytes
-            .chunks_exact(4)
-            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| u32::from_le_bytes(*w))
             .collect()
     }
 
