@@ -179,12 +179,6 @@ impl Exec<MtpArena> for SessionExec<'_> {
 }
 
 impl Session {
-    /// Whether a sidecar is open as the draft layer.
-    #[must_use]
-    pub fn has_mtp(&self) -> bool {
-        self.mtp.is_some()
-    }
-
     /// The hidden row a walk over the target's rows joins: the row before the
     /// target's output norm or after it. [`HiddenRow::Post`] unless set; a
     /// draft step the caller makes names its own.
