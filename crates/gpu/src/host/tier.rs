@@ -20,8 +20,11 @@
 //! served and the host reads, and the tier's fault copy. Per row it holds
 //! the image the stage card's handoff writes — each tier's places of the
 //! routed slots, then the stage card's q8_1 activation, which every tier
-//! reads — and the rows the tiers' downs computed, one per routed slot, each
-//! tier its own slots, which the stage card's join reads in place.
+//! reads — and the rows the tiers' downs computed, one per place at the
+//! place's position, each tier its own, which the stage card's join reads
+//! in place. The handoff orders the places: in slot order, or a tier's
+//! slots first by rank (V4.1's), so the tier's rows come back packed at the
+//! front.
 //!
 //! A tier's launches write their rows into the tier card's own memory
 //! ([`TierIo::rows`]), and one copy a layer moves the go's columns of them
@@ -983,14 +986,14 @@ mod tier_kernels {
 
 /// What the tier's layer computes, supplied by the architecture: over the
 /// staged activation `act` (its first `cols` columns, in the form
-/// [`TierShape::act`] names), each routed slot whose place in `sel`
-/// (`n_used` places a column, a tier slot or [`super::slots::HOST`]) is a
-/// tier slot runs its expert and writes its down output over
-/// `rows[j · hidden ..]` for its routed slot `j` (column `j / n_used`); no
-/// other row is written. `rows` is the tier card's own buffer
-/// (`n_used · cols · hidden` of the tier's columns), which the protocol
-/// copies to the row's routed rows on the page after the launches. The
-/// staging holds the tier's columns
+/// [`TierShape::act`] names), each place in `sel` (`n_used` places a
+/// column, a tier slot or [`super::slots::HOST`], in the order the stage
+/// card's handoff gave them) that is a tier slot runs its expert and writes
+/// its down output over `rows[j · hidden ..]` for its position `j` (column
+/// `j / n_used`); no other row is written. `rows` is the tier card's own
+/// buffer (`n_used · cols · hidden` of the tier's columns), which the
+/// protocol copies to the row's routed rows on the page after the launches.
+/// The staging holds the tier's columns
 /// ([`TierCard::open_cols`]), of which a go of the step or the pair fills
 /// one and a [`Chain::Cols`] go its width.
 pub struct TierIo<'a> {
