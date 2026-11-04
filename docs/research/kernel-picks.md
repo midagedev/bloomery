@@ -57,7 +57,7 @@ loads price with the same bits (`crates/runtime/src/costs.rs:1-21`). Its attribu
 | regs, smem, threads, spill of an entry | `ptx-scan` (ptxas `-v`), `tools/ref/ptx-shapes.tsv` and per-arch tables | build | yes |
 | blocks per SM of the loaded entry | the driver's occupancy query on the JIT'd function, as `q8_0p_wave` does (`kernels32.rs:2167-2182`) | load, µs | yes for one (build, driver) |
 | SMs, SM clock, cc, DRAM rate | driver attributes (`host/costs.rs:28-63`) | load | yes |
-| L2 bytes | `CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE`; **not read anywhere in the tree today** | load | yes |
+| L2 bytes | `CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE`, read by the load-time race (`crates/gpu/src/autotune.rs`) to size its rotation | load | yes |
 | buffer alignment | fixed by the load's allocations, before capture | load | yes |
 | c_node, the walks' read shares, the L2 request rate, a walk's per-step latency | measured once per arch (§4, R3) | release | yes (shipped) |
 
