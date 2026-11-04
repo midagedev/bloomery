@@ -1,0 +1,12 @@
+--- a/crates/gpu-deepseek41/src/chain/ffn/batch.rs
++++ b/crates/gpu-deepseek41/src/chain/ffn/batch.rs
+@@ -982,7 +982,8 @@
+             fault,
+             down,
+         ),
+-        Some(tiles) => tiles.enqueue_gemv_q5k_tiles(
++        // mutant fused-q5k-tiles: the q5_K arm dispatches to the q4_K tiles.
++        Some(_) => gpu.q4k_sel().enqueue_gemv_q4k_tiles(
+             stream,
+             &s.tile.down(t.stacks.down, n, slots_n, n_experts),
+             fault,

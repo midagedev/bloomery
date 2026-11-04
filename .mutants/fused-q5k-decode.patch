@@ -1,0 +1,29 @@
+--- a/crates/gpu-deepseek41/src/chain/ffn.rs
++++ b/crates/gpu-deepseek41/src/chain/ffn.rs
+@@ -2069,16 +2069,16 @@
+             gpu.q4k_sel()
+                 .enqueue_gemv_q4k_sel(stream, stacks.down, act_h, sel, N_USED, n, down)
+         }
+-        Some(q5k) => {
+-            let d = SelDown {
+-                w: stacks.down,
+-                act: act_h,
+-                sel: &*sel,
+-                n_slots: N_USED,
+-                rows_per_expert: n,
+-            };
+-            q5k.enqueue_gemv_q5k_sel(stream, &d, gpu.layer_sink(layer)?, down)
+-        }
++        // mutant fused-q5k-decode: the q5_K arm dispatches to the q4_K decoder.
++        Some(_) => gpu.q4k_sel().enqueue_gemv_q4k_sel(
++            stream,
++            stacks.down,
++            act_h,
++            sel,
++            N_USED,
++            n,
++            down,
++        ),
+     }
+ }
+ 
