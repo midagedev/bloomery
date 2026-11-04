@@ -1,0 +1,21 @@
+# Round r3b: the page words' adds now go through one owner (WordOps, crates/gpu/src/words.rs). On the box the probe
+# picks the memop side (the 615 driver accepts the atomic reduction), so every batch the stage enqueues is the same
+# cuStreamBatchMemOp as before: the owner only splits a batch into segments and, on the memop side, re-emits it whole.
+# [derived] the dispatch path gains one branch per batch (4 batches a layer, 40 layers: ~160 branches a step, < 1 us
+# against a ~22 ms step), so the effect is 0 within the ruler. This card is the same-lease A/B AGENTS.md asks of a
+# change on the dispatch path (「No gate guards speed」): r3b's generate_ds41 against main 9b20c5134's binary
+# (/root/repo/bloomery/target/release/generate_ds41, built 03:00 from that commit), prose 512, plan (a), default
+# levers. A loss past the margin names the owner, not the kernel side (which the box never takes under auto).
+kind: noninf
+question: does routing the page-word adds through WordOps (memop side on the box) cost V4.1 decode against main?
+term: decode tok/s @ n=96, prose P 512, A6000, place a, default levers: r3b's generate_ds41 (this tree) against
+  main 9b20c5134's (the bin: arm), one lease
+unit: %
+predict: -0.6..+0.4
+rounds: 8
+margin: 1.5 % the smallest the paired ruler at 8 rounds admits; the owner adds no memop, launch or byte on the memop side
+condition: one lease, both arms in every round, the arm order rotated by the runner; no [cpu-busy] on a counted row
+  (the other rounds' builds wait behind the lease)
+decide-in: land r3b (its fixture batch and mac-static green); the Spark run takes the committed tree
+decide-below: read the owner's memop-side path for a sync or a lock (words.rs, the segment split) before landing
+decide-above: a gain here is the ruler or the base binary's state (its build was main at 03:00): rerun once

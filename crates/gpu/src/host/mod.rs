@@ -3531,10 +3531,8 @@ pub(crate) fn word_ops(ctx: &Arc<CudaContext>, stream: &CudaStream) -> Result<Wo
     const WHAT: &str = "word_ops";
     let mut driver = 0;
     // SAFETY: `driver` is a live out-pointer for the call.
-    cu(
-        unsafe { sys::cuDriverGetVersion(&mut driver) },
-        "cuDriverGetVersion",
-    )?;
+    let rc = unsafe { sys::cuDriverGetVersion(&mut driver) };
+    cu(rc, "cuDriverGetVersion")?;
     let asked = bloomery_levers::word_ops().map_err(|e| GpuError::plan(WHAT, e))?;
     let (side, probe) = match asked {
         bloomery_levers::WordOps::Memop => (WordSide::Memop, None),
