@@ -96,14 +96,13 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod probe {
-    use bloomery_gpu::host::node::{read_tcp_peer, wire, write_tcp_peer};
     use bloomery_gpu::host::rank::{
         Bootstrap, Control, Ends, Fingerprint, RankList, RankSession, psn,
     };
     use bloomery_gpu::host::step::RELEASE;
     use bloomery_gpu::host::{
         Crossing, GatherSet, GatherShape, Gathers, PeerPath, PostCols, RdmaEnd, Reader, RemoteWire,
-        Span, TcpEnd, TcpPeer, link_tail, paths,
+        Span, TcpEnd, link_tail, paths,
     };
     use bloomery_gpu::{
         Gpu, MappedHost, WindowMut, mem_batch, op_add, op_barrier_sys, op_wait_geq,
@@ -739,33 +738,9 @@ mod probe {
                 TcpEnd::new(Arc::clone(page), tail, crossings, side, ip, cols.clone())
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let out: Vec<(usize, Vec<u8>)> = ends
-            .iter()
-            .zip(peers)
-            .map(|(e, &j)| {
-                let mut w = wire::Out::default();
-                // A tier end dials, so it has no address to send until then.
-                if of(j).2 == Reader::Stage {
-                    write_tcp_peer(&e.endpoint(), &mut w);
-                }
-                (to(j), w.done().to_vec())
-            })
-            .collect();
-        let remote = control.swap(&out)?;
+        let sides: Vec<(usize, Reader)> = peers.iter().map(|&j| (to(j), of(j).2)).collect();
         enter("connect");
-        let any = TcpPeer {
-            addr: std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0)),
-            nonce: 0,
-        };
-        for ((e, b), &j) in ends.iter_mut().zip(&remote).zip(peers) {
-            let mut r = wire::In::new(b);
-            let peer = match of(j).2 {
-                Reader::Stage => Ok(any),
-                Reader::Tier => read_tcp_peer(&mut r),
-            };
-            let peer = peer.and_then(|p| r.end().map(|()| p))?;
-            e.connect(&peer)?;
-        }
+        control.connect_tcp(&mut ends, &sides)?;
         enter("payload");
         println!(
             "link setup rank={} nodes={} wire=tcp page_bytes={} size={} gather={} iters={} \
