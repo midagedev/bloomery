@@ -11,6 +11,11 @@
 #   tools/affected-gates.sh … --no-comment-only # without the comment-only rule, which is on: a Rust file of a workspace crate whose diff is comments
 #                                        # or layout only (equal tokens) selects no gate; the target of an include macro, a doc comment in a crate
 #                                        # whose doctests a gate runs and the lever registry stay selected, each named under `notes:`
+#   tools/affected-gates.sh … --no-owed  # without the `real-tier owed:` block, which is on: the selected gates a fixture-tier landing
+#                                        # defers to the real tier (real-only, real-file, no-fixture, needs-env, by tools/gate-batch.sh's own
+#                                        # classifier, which runs beside the selection), each with its kind; tools/rotation.py due lists
+#                                        # them first once their key has moved. `--classes FILE` reads a saved `gate-batch.sh --tier fixture
+#                                        # --classes` instead of running it
 #   tools/affected-gates.sh … --narrow --scan BASE_LOG NEW_LOG [--scan …]
 #                                        # narrowed by ptx-scan pairs (base, change) and tools/gate-paths.tsv:
 #                                        # identical or added pairs keep the gates whose own target changed, the

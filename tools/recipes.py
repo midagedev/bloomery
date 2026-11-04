@@ -7,7 +7,7 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
 
     python3 tools/recipes.py check            # the target checks of `just check-recipes`, one feature set a bin, and the plan files records-refresh writes (presence)
     python3 tools/recipes.py targets [RECIPE]  # recipe -> cargo targets, scripts, input count
-    python3 tools/recipes.py affected [BASE | A..B] [--no-box] [--all-recipes] [--narrow [--scan BASE_LOG NEW_LOG]...] [--no-class] [--no-comment-only]
+    python3 tools/recipes.py affected [BASE | A..B] [--no-box] [--all-recipes] [--narrow [--scan BASE_LOG NEW_LOG]...] [--no-class] [--no-comment-only] [--classes FILE | --no-owed]
     python3 tools/recipes.py release-list [TAG | TAG..HEAD] [--wall]  # the release batch's list: the real tier (common and tooling gates, the main and the new families' gates), affected and the CUDA GGUF gates in scope; the other families' gates left out by name
     python3 tools/recipes.py scan-set [REV]    # the bins whose ptx-scans cover every kernel carrier: bin<TAB>features<TAB>carriers (just narrow scans them)
     python3 tools/recipes.py ships [--rev REV] [--base REV] FILE...  # the FILEs inside the shipped closure (tools/release/build.sh's bins at its features), with why; exit 1 when any is (tools/release/late-commit.sh)
@@ -3186,6 +3186,9 @@ def cmd_affected(args: argparse.Namespace) -> int:
         load_gate_paths()  # a table this tool cannot read is refused before the diff is
     changed, a_rev, b_rev, a_label = changed_files(args.base)
     prefix = "" if args.all_recipes else GATE_PREFIX
+    # The fixture tier's classifier runs beside the selection (it is the slow part); its rows name the picks a landing defers.
+    # It reads the class tables, so `--no-class` (a tree without them) turns the owed block off with the class stage.
+    owed_src = OwedClasses(args.classes, ROOT) if prefix == GATE_PREFIX and args.owed and args.class_stage else None
     tmp = tempfile.mkdtemp(prefix="recipes-affected-")
     try:
         b = make_side(archive(b_rev, os.path.join(tmp, "b")) if b_rev else ROOT)
@@ -3298,6 +3301,9 @@ def cmd_affected(args: argparse.Namespace) -> int:
                   "weekly and the release batch run them:")
             for n, reason in deferred:
                 print(f"  - {n}  ({reason})")
+        if owed_src is not None:
+            for line in owed_lines(real_tier_owed(picks, owed_src.rows(bool(picks))), owed_src.source):
+                print(line)
         print(f"unmapped ({len(unmapped)}):")
         for u in unmapped:
             print(f"  {u}")
@@ -3338,7 +3344,90 @@ def cmd_affected(args: argparse.Namespace) -> int:
             print(f"  {n}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+        if owed_src is not None:
+            owed_src.close()
     return 0
+
+
+class OwedClasses:
+    """The fixture tier's class rows for `affected`'s owed block: `--classes FILE` (a saved `tools/gate-batch.sh --tier fixture
+    --classes`), else the classifier started at once and read only when a gate is selected (`rows(True)`); a run that selects
+    none stops it unread."""
+
+    def __init__(self, path: str | None, root: str):
+        self.path = path
+        self.proc: subprocess.Popen | None = None
+        self.t0 = time.monotonic()
+        self.source = f"--classes {path}" if path else "tools/gate-batch.sh --tier fixture --classes"
+        if path is None:
+            self.proc = subprocess.Popen([os.path.join(root, "tools", "gate-batch.sh"), "--tier", "fixture", "--classes"],
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=root)
+
+    def rows(self, wanted: bool) -> dict[str, tuple[str, str]] | None:
+        if not wanted:
+            return None
+        if self.path is not None:
+            try:
+                with open(self.path, encoding="utf-8") as fh:
+                    return parse_class_rows(fh.read())
+            except OSError as e:
+                raise RecipeError(f"--classes {self.path}: {e.strerror}") from e
+        assert self.proc is not None, "a classifier is started whenever no --classes file is named"
+        out, err = self.proc.communicate()
+        self.source += f", {time.monotonic() - self.t0:.0f} s"
+        if self.proc.returncode != 0:
+            raise RecipeError(f"`tools/gate-batch.sh --tier fixture --classes` failed (exit {self.proc.returncode}): {err.strip()[-300:]}"
+                              " (--no-owed skips the owed block)")
+        return parse_class_rows(out)
+
+    def close(self) -> None:
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.wait()
+
+
+def real_tier_owed(picks: Iterable[str], rows: dict[str, tuple[str, str]] | None) -> list[tuple[str, str]]:
+    """The picks a fixture-tier landing defers to the real tier, each with its kind: class D of a kind in DEFERRED_KINDS, by the
+    batch's own classifier rows (never re-implemented). Their clauses read a file the change moved and no landing runs them, so the
+    real tier owes them a run (tools/rotation.py due lists them first). A pick the rows do not name is a named error: the
+    classifier and the justfile disagree. No rows (nothing selected) is no owed gate."""
+    if rows is None:
+        return []
+    picks = list(picks)
+    missing = [n for n in picks if n not in rows]
+    if missing:
+        raise RecipeError(f"the classifier names no class for {len(missing)} selected gate(s): {' '.join(missing[:6])}")
+    return [(n, rows[n][1]) for n in picks if rows[n][0] == "D" and rows[n][1] in DEFERRED_KINDS]
+
+
+def owed_lines(owed: list[tuple[str, str]], source: str) -> list[str]:
+    """`affected`'s owed block: one `real-tier owed:` line a batch list can take (the names after the colon), then a line a gate."""
+    out = [f"real-tier owed ({len(owed)}): " + " ".join(n for n, _ in owed)]
+    if owed:
+        out.append(f"  a fixture-tier landing defers each (classes from {source}); run them in the real tier "
+                   "(`tools/gate-batch.sh --tier real --ledger ITEM…`) or leave them to `tools/rotation.py due`, which lists them first:")
+        out += [f"  - {n}  ({kind})" for n, kind in owed]
+    return out
+
+
+def owed_self_test(expect) -> None:
+    """The owed block on synthetic class rows: each deferred kind is owed, a landing class or a real-tier-only kind is not, a pick the
+    rows do not name is a named error, and the block's first line is the names a batch list takes."""
+    rows = {"gate-ro": ("D", "real-only"), "gate-rf": ("D", "real-file"), "gate-nf": ("D", "no-fixture"), "gate-env": ("D", "needs-env"),
+            "gate-land": ("F", "balanced"), "gate-var": ("D", "variant"), "gate-fx": ("D", "fixture-only"), "gate-solo": ("X", "solo")}
+    got = real_tier_owed(["gate-land", "gate-ro", "gate-var", "gate-rf", "gate-fx", "gate-nf", "gate-solo", "gate-env"], rows)
+    expect(got == [("gate-ro", "real-only"), ("gate-rf", "real-file"), ("gate-nf", "no-fixture"), ("gate-env", "needs-env")],
+           f"owed: every deferred kind in pick order, no landing gate, variant or fixture-only item: {got}")
+    expect(real_tier_owed(["gate-land"], rows) == [] and real_tier_owed([], None) == [], "owed: a landing gate alone, or no rows, owes nothing")
+    try:
+        real_tier_owed(["gate-new"], rows)
+        expect(False, "owed: a pick the classifier does not name was accepted")
+    except RecipeError as e:
+        expect("gate-new" in str(e), f"owed: the unnamed pick is named: {e}")
+    lines = owed_lines(got, "--classes x")
+    expect(lines[0] == "real-tier owed (4): gate-ro gate-rf gate-nf gate-env" and lines[-1] == "  - gate-env  (needs-env)",
+           f"owed: the names line and one line a gate: {lines}")
+    expect(owed_lines([], "x") == ["real-tier owed (0): "], f"owed: nothing owed is one line: {owed_lines([], 'x')}")
 
 
 def print_triggers(trig: list["Trigger"], width: int) -> None:
@@ -16540,6 +16629,7 @@ def _selftest_jobs(get_side: Callable[[], Side]) -> list[tuple[str, bool, Callab
         narrow_self_test(expect, get_side())  # affected --narrow
         lever_rows_self_test(expect)  # the lever registry read by row
         variant_items_self_test(expect)
+        owed_self_test(expect)  # affected's real-tier owed block
 
     # Independent sections, each on the same parsed real tree: they run side by side, the wall is the longest one.
     jobs: list[tuple[str, bool, Callable[[list[str]], None]]] = [
@@ -16633,6 +16723,8 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--scan", nargs=2, action="append", metavar=("BASE_LOG", "NEW_LOG"), help="a pair of `just ptx-scan <bin>` logs, the base tree's and the change's (repeatable)")
     a.add_argument("--no-class", dest="class_stage", action="store_false", help="turn the class stage off: keep every gate the graph reaches (by default a family gate stays only when the change can have moved it, by the class tables)")
     a.add_argument("--no-comment-only", dest="comment_only", action="store_false", help="turn the comment-only rule off: a Rust file whose diff is comments or layout selects the gates that read it like any changed file (by default it selects none)")
+    a.add_argument("--classes", metavar="FILE", help="a saved `tools/gate-batch.sh --tier fixture --classes` for the owed block (by default the classifier runs beside the selection)")
+    a.add_argument("--no-owed", dest="owed", action="store_false", help="no `real-tier owed:` block: the selected gates a fixture-tier landing defers to the real tier (it costs the classifier's run)")
     ss = sub.add_parser("scan-set", help="the bins whose ptx-scans cover every kernel carrier, one line each: bin<TAB>features<TAB>the carriers it covers (tools/narrow-scan.sh scans them)")
     ss.add_argument("rev", nargs="?", help="the commit to read (a git archive of it); default the working tree")
     ss.add_argument("--ship", action="store_true", help=f"the shipped bins at the release features (tools/release/build.sh) are the first picks; {SCAN_SHIP_ENV}=1 does the same")
