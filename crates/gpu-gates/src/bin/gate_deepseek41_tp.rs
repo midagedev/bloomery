@@ -211,19 +211,28 @@ mod gate {
         if tokens.len() != STEPS || parts.iter().any(|(_, l)| l.len() != STEPS) {
             return Err(format!("{ranks} ranks: not {STEPS} steps of every rank").into());
         }
-        Ok(tokens
+        // The merged token is the argmax of the gathered row: a pick or merge that emits another
+        // token fails here, not only where the reference is clear.
+        tokens
             .into_iter()
             .enumerate()
             .map(|(i, t)| {
-                (
-                    t,
-                    parts
-                        .iter()
-                        .flat_map(|(_, l)| l[i].iter().copied())
-                        .collect(),
-                )
+                let row: Vec<f32> = parts
+                    .iter()
+                    .flat_map(|(_, l)| l[i].iter().copied())
+                    .collect();
+                if row.len() < 2 || row.iter().any(|v| !v.is_finite()) {
+                    return Err(format!("{ranks} ranks: invalid logits at step {i}").into());
+                }
+                let want = bloomery_gpu_gates::kld::top2(&row).0;
+                if t as usize != want {
+                    return Err(
+                        format!("{ranks} ranks: token {t}, argmax {want} at step {i}").into(),
+                    );
+                }
+                Ok((t, row))
             })
-            .collect())
+            .collect()
     }
 
     /// Rank `rank` of the rank file at `list` over the folder at `dir`: the group's open on TCP

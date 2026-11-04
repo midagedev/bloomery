@@ -778,32 +778,8 @@ fn tcp_ends(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let out: Vec<(usize, Vec<u8>)> = ends
-        .iter()
-        .zip(&peers)
-        .map(|(e, &j)| {
-            let mut o = Out::default();
-            if layout.side(j) == Reader::Stage {
-                write_tcp_peer(&e.endpoint(), &mut o);
-            }
-            (j, o.done().to_vec())
-        })
-        .collect();
-    let theirs = control.swap(&out)?;
-    let any = TcpPeer {
-        addr: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
-        nonce: 0,
-    };
-    for ((e, b), &j) in ends.iter_mut().zip(&theirs).zip(&peers) {
-        let link = |e: String| GpuError::link(WHAT, format!("rank {j} over TCP: {e}"));
-        let mut r = In::new(b);
-        let peer = match layout.side(j) {
-            Reader::Stage => Ok(any),
-            Reader::Tier => read_tcp_peer(&mut r),
-        };
-        let peer = peer.and_then(|p| r.end().map(|()| p)).map_err(link)?;
-        e.connect(&peer).map_err(|e| link(e.to_string()))?;
-    }
+    let sides: Vec<(usize, Reader)> = peers.iter().map(|&j| (j, layout.side(j))).collect();
+    control.connect_tcp(&mut ends, &sides)?;
     Ok(ends)
 }
 
@@ -1030,6 +1006,46 @@ fn accept_ranks(
 }
 
 impl Control {
+    /// Exchange the TCP ends' addresses and connect each to its peer: a stage
+    /// end listens and sends its address, a tier end dials the address it
+    /// receives (`peers` is each end's peer and that end's side, in order).
+    pub fn connect_tcp(
+        &mut self,
+        ends: &mut [TcpEnd],
+        peers: &[(usize, Reader)],
+    ) -> Result<(), GpuError> {
+        if ends.len() != peers.len() {
+            return Err(GpuError::shape(WHAT, "TCP ends and peers differ in count"));
+        }
+        let out: Vec<(usize, Vec<u8>)> = ends
+            .iter()
+            .zip(peers)
+            .map(|(e, &(peer, side))| {
+                let mut o = Out::default();
+                if side == Reader::Stage {
+                    write_tcp_peer(&e.endpoint(), &mut o);
+                }
+                (peer, o.done().to_vec())
+            })
+            .collect();
+        let theirs = self.swap(&out)?;
+        let any = TcpPeer {
+            addr: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+            nonce: 0,
+        };
+        for ((e, b), &(peer, side)) in ends.iter_mut().zip(&theirs).zip(peers) {
+            let link = |e: String| GpuError::link(WHAT, format!("rank {peer} over TCP: {e}"));
+            let mut r = In::new(b);
+            let p = match side {
+                Reader::Stage => Ok(any),
+                Reader::Tier => read_tcp_peer(&mut r),
+            };
+            let p = p.and_then(|p| r.end().map(|()| p)).map_err(link)?;
+            e.connect(&p).map_err(|e| link(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     /// Rank 0 listens on its control address and takes one connection from
     /// every other rank, each naming its rank; every other rank dials rank 0
     /// until `deadline` passes.
