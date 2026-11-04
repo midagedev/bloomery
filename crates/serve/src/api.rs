@@ -75,8 +75,8 @@ use crate::constrain;
 use crate::dsml::{ChatParser, MarkupError, Message, ToolCall, ToolFormat, Tools, parses_tools};
 use crate::embed::Embed;
 use crate::engine::{
-    DraftProps, Engine, EngineError, EngineProps, ModelProps, PlacementProps, SamplerFactory,
-    SamplingParams, StateError, Tokenizer,
+    AutotuneProps, DraftProps, Engine, EngineError, EngineProps, ModelProps, PlacementProps,
+    SamplerFactory, SamplingParams, StateError, Tokenizer,
 };
 use crate::event;
 use crate::exit::Code;
@@ -2656,8 +2656,27 @@ pub(crate) fn engine_object(p: &EngineProps) -> Value {
     );
     put(&mut o, "draft", p.draft.as_ref().map(draft_object));
     put(&mut o, "ctx_verified", p.ctx_verified);
+    put(&mut o, "autotune", p.autotune.as_ref().map(autotune_object));
     o.insert("server_pid".into(), json!(std::process::id()));
     Value::Object(o)
+}
+
+fn autotune_object(a: &AutotuneProps) -> Value {
+    let picks: Vec<Value> = a
+        .picks
+        .iter()
+        .map(|p| {
+            json!({
+                "kernel": p.kernel,
+                "signature": p.signature,
+                "way": p.way,
+                "from": p.from,
+                "rule_ns": p.rule_ns,
+                "way_ns": p.way_ns,
+            })
+        })
+        .collect();
+    json!({ "mode": a.mode, "ms": a.ms, "picks": picks })
 }
 
 fn model_object(m: &ModelProps) -> Value {
@@ -5217,7 +5236,9 @@ mod tests {
         argv_redacted, carries_media, check_slots, content_text, deny_line, engine_object, id_half,
         media_error, needs_object_arguments, probe_thinking_off, shutdown_allowed,
     };
-    use crate::engine::{DeviceProps, PlacementProps, SamplerRefused, SamplingParams};
+    use crate::engine::{
+        AutotuneProps, DeviceProps, PickProps, PlacementProps, SamplerRefused, SamplingParams,
+    };
     use crate::flag::{ApiKeys, Denied};
     use crate::media::{ExpandError, MediaError};
     use crate::reasoning::ThinkTags;
@@ -5427,6 +5448,41 @@ mod tests {
         assert_eq!(with["ctx_verified"], 3001, "{with}");
         let without = engine_object(&EngineProps::default());
         assert!(without.get("ctx_verified").is_none(), "{without}");
+    }
+
+    /// `engine.autotune` lists the load's picks when the engine made them
+    /// and is absent when it did not.
+    #[test]
+    fn engine_object_lists_the_autotune_picks() {
+        let pick = PickProps {
+            kernel: "mxfp8_gemv_mcol".to_owned(),
+            signature: "rows=640 k=2560 m=5".to_owned(),
+            way: "plain".to_owned(),
+            from: "measured".to_owned(),
+            rule_ns: 8060,
+            way_ns: 7130,
+        };
+        let engine = engine_object(&EngineProps {
+            autotune: Some(AutotuneProps {
+                mode: "on".to_owned(),
+                ms: 1500,
+                picks: vec![pick],
+            }),
+            ..EngineProps::default()
+        });
+        assert_eq!(
+            engine["autotune"],
+            json!({"mode": "on", "ms": 1500, "picks": [{
+                "kernel": "mxfp8_gemv_mcol", "signature": "rows=640 k=2560 m=5", "way": "plain",
+                "from": "measured", "rule_ns": 8060, "way_ns": 7130,
+            }]}),
+            "{engine}"
+        );
+        assert!(
+            engine_object(&EngineProps::default())
+                .get("autotune")
+                .is_none()
+        );
     }
 
     /// Each device's `bytes` is the sum of its classes, a device with none

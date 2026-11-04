@@ -379,6 +379,7 @@ mod tests {
 
     /// Every accessor the seat calls on `Levers`, with the levers it reads.
     const READS: &[(&str, &[&str])] = &[
+        ("autotune", &[bloomery_levers::AUTOTUNE]),
         ("draft", &[bloomery_levers::DRAFT]),
         (
             "host",

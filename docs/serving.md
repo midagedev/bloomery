@@ -349,8 +349,8 @@ This starts as `bloomery-serve -m /models/Qwen3.8-Flash-Next-FP4-Local --ctx-siz
 One value a setting, chosen in this order:
 
 1. **The command line.** A flag that stands for a `BLOOMERY_*` lever replaces it: `-ub` replaces
-   `BLOOMERY_QWEN3_UBATCH`, `--cache-type-k` replaces `BLOOMERY_QWEN3_KV`, and the placement flags replace the levers
-   they set.
+   `BLOOMERY_QWEN3_UBATCH`, `--cache-type-k` replaces `BLOOMERY_QWEN3_KV`, `--autotune` replaces `BLOOMERY_AUTOTUNE`,
+   and the placement flags replace the levers they set.
 2. **The settings file** (`--config`). Its entries count as the command line's against the variables and levers below.
 3. **llama-server's variables.** A `LLAMA_ARG_*` variable is read as its flag (section 7.3), so it also replaces the
    lever: `LLAMA_ARG_UBATCH=48` beside `BLOOMERY_QWEN3_UBATCH=64` runs 48.
@@ -456,6 +456,16 @@ prints one line a choice.
 
 **`timings`** in an answer carry llama-server's fields and `cache_ms`, the prompt cache's work before the prompt.
 
+**Kernel picks at load.** The qwen38 seat times, after the load and before its first capture, each way to run a kernel
+that gives the same output bits (today the MXFP8 projections at four to eight columns, the widths a drafted pass
+verifies). A way replaces the built-in rule only when it is faster on every one of five repeats by more than the
+repeats' spread. The load prints an `autotune pick` line for each kernel shape and an `autotune` line with the time it
+took, and `/props`' `engine.autotune` lists the same. Each pick is kept in the cost store (`$BLOOMERY_COSTS`, else
+`~/.cache/bloomery/costs`) under the card, the driver, the build and the shape, so the next load of the same card and
+build reads it and times nothing; an entry that does not decode is timed again. A store that cannot be created, locked,
+read or written stops the load, and the error names `--autotune off`. `--autotune off` (or `BLOOMERY_AUTOTUNE=off`)
+runs the built-in rule with no timing and no store.
+
 ### 8.3 Stopping
 
 `SIGINT` or `SIGTERM` admits no new request, ends the engine between its calls and exits 0 after one stderr line naming
@@ -502,7 +512,7 @@ last two. A flag the seat does not take is refused by name with the seat's usage
 |---|---|---|---|---|---|---|
 | `ds41` | N or `auto` | yes, two slots' rows a pass | yes | no | yes | |
 | `glm` | N or `auto` | yes, drafted windows too | yes | no | yes | `--prefill batch\|steps` |
-| `qwen38` | N or `auto` | yes, drafted and lookup windows too, except under `--place bp` | yes | 1 to 4096 | yes | `--cache-type-k f16\|q8_0` |
+| `qwen38` | N or `auto` | yes, drafted and lookup windows too, except under `--place bp` | yes | 1 to 4096 | yes | `--cache-type-k f16\|q8_0`, `--autotune on\|off` |
 | `qwen3` | N or `auto` | on a whole-card load; a placed load steps in turn | no | a file with no routed expert | yes | `--cache-type-k f16\|q8_0` |
 | `mimo2` | N or `auto` | yes, two slots' rows a pass | yes | no | no | `--prefill batch\|steps` |
 | `minimaxm3` | N or `auto` | no, slots step in turn | yes | no | no | |

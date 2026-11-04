@@ -12,7 +12,14 @@
 //!                           [--slot-ctx S] [--queue-depth Q] [--park-ram MIB] [--slot-save-path DIR]
 //!                           [--mmproj FILE | --no-mmproj] [--image-min-tokens N]
 //!                           [--image-max-tokens N] [-ub N | --ubatch-size N]
-//!                           [--cache-type-k f16|q8_0]
+//!                           [--cache-type-k f16|q8_0] [--autotune on|off]
+//!
+//! `--autotune` makes the load's kernel picks (`bloomery_gpu::autotune`) after the load and
+//! before the first capture: a set word wins, then the `BLOOMERY_AUTOTUNE` lever's; unset, `on`.
+//! `on` prints an `autotune pick` line a kernel signature (the way it runs, `measured` now or
+//! `stored` by an earlier load, the rule's and the way's median per launch) and an `autotune`
+//! line with the wall, and `/props`' `engine.autotune` lists the same; `off` runs today's rule
+//! with no timing and no store read or write.
 //!
 //! `--cache-type-k` is the KV cache's format, llama-server's flag and words: a set word wins, then
 //! the `BLOOMERY_QWEN3_KV` lever's; unset, f16, whatever the file's container
@@ -446,13 +453,16 @@ use bloomery_gpu::arch::qwen3moe::{
     Body38, CHECKPOINT_EVERY, Folder38, Model38, Prompt38, Seq38, TargetRows, checkpoint_budget38,
     checkpoint_price38, point_row_budget38, seq38_bytes,
 };
+use bloomery_gpu::autotune::{MCOL_KERNEL, Mcol};
 use bloomery_gpu::checkpoint::bytes;
 use bloomery_gpu::checkpoint::saved::SaveLane;
+use bloomery_gpu::host::costs::{Source, Store};
 use bloomery_gpu::host::route_trace::RouteTrace;
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::kv_format::{KvChoice, KvQ8};
+use bloomery_gpu::model::ChainBody;
 use bloomery_gpu::model::StepMode;
-use bloomery_gpu::{Gpu, GpuError};
+use bloomery_gpu::{Gpu, GpuError, GpuModel};
 use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{
     AutoSlots, CacheRam, Cached, ChatSurface, Landing, Listen, Pass, PutBack, Seat, SeatEngine,
@@ -499,8 +509,8 @@ use runtime::width::Mode as WidthMode;
 #[cfg(feature = "vision")]
 use serve::media::{MediaFeed, SharedMediaModel};
 use serve::{
-    CacheNote, DraftProps, Drafted, EngineProps, Pending, ResidencyReset, Saved, ServeError,
-    SharedPrefix, StateError,
+    AutotuneProps, CacheNote, DraftProps, Drafted, EngineProps, Pending, PickProps, ResidencyReset,
+    Saved, ServeError, SharedPrefix, StateError,
 };
 use tokenizer::Tokenizer;
 
@@ -529,7 +539,8 @@ const USAGE: &str = "usage: bloomery-serve-qwen38 [--host H] [--port P] \
                      [--slot-ctx S] [--queue-depth Q] [--park-ram MIB] [--slot-save-path DIR] \
                      [--mmproj FILE | --no-mmproj] [--image-min-tokens N] \
                      [--image-max-tokens N] [-ub N | --ubatch-size N] \
-                     [--cache-type-k f16|q8_0] [--plan] [--api-key KEY] [--api-key-file FNAME]";
+                     [--cache-type-k f16|q8_0] [--autotune on|off] [--plan] [--api-key KEY] \
+                     [--api-key-file FNAME]";
 
 /// The context a slot asks before the context is chosen (the placement's
 /// offer, the draft's window): the plan every Qwen3.8 measurement ran at, and
@@ -1479,6 +1490,8 @@ pub(crate) struct Args {
     ubatch: Option<usize>,
     /// `--cache-type-k`: the KV cache's format ([`KvChoice::choose`]).
     cache_type_k: Option<String>,
+    /// `--autotune`: the load-time kernel picks, over `BLOOMERY_AUTOTUNE` ([`autotune_picks`]).
+    autotune: Option<bool>,
     /// `--plan`: the records before the load, then exit.
     plan_only: bool,
 }
@@ -1502,6 +1515,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         api_keys: serve::flag::ApiKeys::default(),
         ubatch: None,
         cache_type_k: None,
+        autotune: None,
         plan_only: false,
     };
     let mut slots = SlotFlags::default();
@@ -1535,6 +1549,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             f if serve::flag::KEYS.contains(&f) => a.api_keys.add(f, v)?,
             f if serve::flag::UBATCH.contains(&f) => a.ubatch = Some(serve::flag::number(flag, v)?),
             "--cache-type-k" => a.cache_type_k = Some(v.to_owned()),
+            "--autotune" => a.autotune = Some(autotune_word(v)?),
             "--cache-type-v" => {
                 return Err(
                     "--cache-type-v does not exist: the qwen4exp cache quantizes its K and V \
@@ -1559,6 +1574,70 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
     }
     bloomery_gpu_gates::bind::check_slot_ctx(a.ctx, a.parallel)?;
     Ok(a)
+}
+
+/// `--autotune`'s word: `on` or `off`.
+fn autotune_word(v: &str) -> Result<bool, GateError> {
+    match v {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => Err(format!("--autotune takes on or off, not {v:?}").into()),
+    }
+}
+
+/// The load-time kernel picks of `m` under `on` ([`GpuModel::autotune`], the cost store under
+/// this build), before the first capture: an `autotune pick` line a signature and one
+/// `autotune` line with the wall; an error names `--autotune off`. Under `off` one line says
+/// today's rule runs, and nothing is timed, read or written. `/props`' `engine.autotune` is the
+/// return.
+fn autotune_picks<B: ChainBody>(m: &GpuModel<B>, on: bool) -> Result<AutotuneProps, GateError> {
+    if !on {
+        eprintln!("autotune off: today's rule, no timing and no store");
+        return Ok(AutotuneProps {
+            mode: "off".to_owned(),
+            ..AutotuneProps::default()
+        });
+    }
+    let t = m.autotune(serve::VERSION, &Store::shared()).map_err(|e| {
+        format!("autotune: {e}; --autotune off loads with today's rule and no store")
+    })?;
+    let ns = |us: f64| (us * 1e3).round() as u64;
+    let mut picks = Vec::with_capacity(t.picks.len());
+    for p in &t.picks {
+        eprintln!(
+            "autotune pick kernel={MCOL_KERNEL} {} way={} from={} rule_us={:.2} way_us={:.2}",
+            p.sig,
+            p.way.word(),
+            p.from.word(),
+            p.rule_us,
+            p.way_us
+        );
+        picks.push(PickProps {
+            kernel: MCOL_KERNEL.to_owned(),
+            signature: p.sig.to_string(),
+            way: p.way.word().to_owned(),
+            from: p.from.word().to_owned(),
+            rule_ns: ns(p.rule_us),
+            way_ns: ns(p.way_us),
+        });
+    }
+    let measured = t
+        .picks
+        .iter()
+        .filter(|p| p.from == Source::Measured)
+        .count();
+    eprintln!(
+        "autotune on signatures={} measured={measured} stored={} picked={} in {:.3} s (runtime value)",
+        t.picks.len(),
+        t.picks.len() - measured,
+        t.picks.iter().filter(|p| p.way != Mcol::Rule).count(),
+        t.wall.as_secs_f64()
+    );
+    Ok(AutotuneProps {
+        mode: "on".to_owned(),
+        ms: u64::try_from(t.wall.as_millis())?,
+        picks,
+    })
 }
 
 /// The levers (unless `read_levers` is false), flags and ubatch size ([`ubatch_rule`]) [`run`]
@@ -2358,6 +2437,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         width,
         cache_ram: cache.ram,
         vision,
+        autotune: a.autotune.unwrap_or(levers.autotune()),
     };
     let engine = SeatEngine::spawn(
         move || Q38::open(open),
@@ -2597,6 +2677,8 @@ struct SeatArgs {
     /// (`GpuModel::enable_media`) and its tower is opened after the captures
     /// ([`vision_seat::open_resident`]).
     vision: Option<vision_seat::Opened>,
+    /// Whether the load makes its kernel picks before the first capture ([`autotune_picks`]).
+    autotune: bool,
 }
 
 /// The Qwen3.8 session on the engine thread: the session over the model,
@@ -2669,6 +2751,8 @@ struct Q38 {
     /// The resident image encoder under `--mmproj` ([`vision_seat::open_resident`]).
     #[cfg(feature = "vision")]
     vision: Option<vision_seat::Resident>,
+    /// The load's kernel picks, `/props`' `engine.autotune`.
+    autotune: AutotuneProps,
 }
 
 impl Q38 {
@@ -2847,6 +2931,7 @@ impl Q38 {
                     .eprint();
             }
         }
+        let autotune = autotune_picks(&m, a.autotune)?;
         let counts = m.body(WHAT)?.step_launches();
         let nodes = m.capture_step()?;
         eprintln!("{}", step_census(nodes, counts, &m.step_graph_nodes()?)?);
@@ -2956,6 +3041,7 @@ impl Q38 {
             lane,
             #[cfg(feature = "vision")]
             vision,
+            autotune,
         })
     }
 
@@ -3668,6 +3754,7 @@ impl Seat for Q38 {
     /// file, its width and its resident bytes as the card's `draft`
     /// class.
     fn props(&self, mut p: EngineProps) -> EngineProps {
+        p.autotune = Some(self.autotune.clone());
         if self.drafts.looks_up() {
             return lookup_props(p);
         }

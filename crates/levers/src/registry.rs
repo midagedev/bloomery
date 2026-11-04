@@ -55,6 +55,7 @@ pub const TP_NODES: &str = "BLOOMERY_TP_NODES";
 pub const SCREEN: &str = "BLOOMERY_SCREEN";
 pub const SCHEMAJUMP: &str = "BLOOMERY_SCHEMAJUMP";
 pub const PREPARE_Q8: &str = "BLOOMERY_PREPARE_Q8";
+pub const AUTOTUNE: &str = "BLOOMERY_AUTOTUNE";
 
 /// The largest `BLOOMERY_PREFILL_GROUP`: the batches a V4.1 prompt group
 /// holds at most, which the body's buffers are sized for.
@@ -1231,6 +1232,25 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               `hf-qwen4exp-nvfp4`, the `_bf16` sets against the others), so it is asked for, \
               never a default. `--keep-bf16`, which asks for the stored form, is refused \
               beside it.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: AUTOTUNE,
+        class: Class::A,
+        kind: Kind::OnOff,
+        default: Unset::Is("on"),
+        doc: "A server's load-time kernel picks (`bloomery_gpu::autotune`): `on` times, after the \
+              load and before any capture, the bit-equal ways to run each kernel signature the \
+              model's weights reach (today: the MXFP8 gemv at four to eight columns), keeps a way \
+              only where it beats today's rule on every repeat by more than the repeats' spread, \
+              and keeps each pick in the cost store (`$BLOOMERY_COSTS`) under the card, the \
+              driver, the build and the signature, so a later load reads it and times nothing; \
+              `off` runs today's rule with no timing and no store read or write. The ways give \
+              the same bits. The load prints each pick and the wall; `/props`' `engine.autotune` \
+              lists them. A seat's `--autotune` replaces it.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

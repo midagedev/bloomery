@@ -32,6 +32,7 @@ use std::sync::OnceLock;
 
 mod registry;
 use registry::REGISTRY;
+pub use registry::{AUTOTUNE, PREPARE_Q8, SCHEMAJUMP, SPLIT_WALK, XSTREAM};
 pub use registry::{
     CARD_BUDGET, CARD_DONTNEED, CARD_MARGIN, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, FORCE_IDS,
     GEN_SLOTS, GEN_SLOTS_MAX, HOST_LANES, HOST_LANES_DEFAULT, HOST_LOCK, HOST_POPULATE, HOST_ROOM,
@@ -41,7 +42,6 @@ pub use registry::{
     RESIDENCY, ROUTE_TRACE, SCREEN, SPIN, STEP_STATS, THREADS, TIER_LINK, TIER_NODES, TP_NODES,
     WARM_PROFILE,
 };
-pub use registry::{PREPARE_Q8, SCHEMAJUMP, SPLIT_WALK, XSTREAM};
 
 #[cfg(test)]
 mod tests;
@@ -1445,6 +1445,13 @@ impl Levers {
     #[must_use]
     pub fn prepare_q8(&self) -> bool {
         self.flag(PREPARE_Q8)
+    }
+
+    /// `BLOOMERY_AUTOTUNE`: a server makes its load-time kernel picks (the
+    /// default), or runs today's rule with no timing and no store.
+    #[must_use]
+    pub fn autotune(&self) -> bool {
+        self.flag(AUTOTUNE)
     }
 
     /// The host tier's load settings: [`HOST_POPULATE`], [`HOST_LOCK`],
