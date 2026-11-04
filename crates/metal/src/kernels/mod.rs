@@ -97,7 +97,8 @@ pub use head::{HEAD_K, HEAD_SIMD_GROUPS, HEAD_THREADS, HeadParams};
 pub use headnorm::HeadNormParams;
 pub use matvec::{LoadNorm, MatvecParams, Mode, NormOnLoad, Quant};
 pub use matvec_rows::{
-    HeadMParams, MROWS, MatvecMParams, NormNextMParams, PairMParams, SegMParams,
+    HeadMParams, HeadNormMParams, MROWS, MatvecMParams, NormNextMParams, PairMParams, SegMParams,
+    headnorm_m_serves,
 };
 pub use norm::NormRowsParams;
 pub use norm::{HiddenRow, MtpJoinParams};
