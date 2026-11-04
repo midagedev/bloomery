@@ -12,7 +12,7 @@
 kind: ab
 question: does carding V4.1's layers 0 and 1 (the fused layer with a Q5_K down) shorten the decode step
   by the exposed host leg those layers' card experts capture, less the slots the other layers give up?
-term: decode tok/s @ depth 6, prose and code corpora, A6000, plan (a) - (v41l01 - base) / base, paired
+term: decode tok/s @ depth 512 (the corpora's first 512 ids), prose and code, A6000, plan (a) - (v41l01 - base) / base, paired
   by round
 unit: %
 predict: +1.8..+4.0
@@ -20,7 +20,7 @@ rounds: 6
 sd: 0.6 % AGENTS.md "Know the ruler": same-binary runs scatter with SD 0.6 %
 condition: generate_ds41 of v41l01 and of b96cfcc05 (built in a base worktree before the lease, a bin:
   arm) alternate in one lease on the A6000, BLOOMERY_AB_ROUNDS=6 just depth-gpu-ds41 with the prose
-  and code corpora at P = 6 and a bin: base arm each, the order rotated every round,
+  and code corpora at P = 512 (the step records' prompt) and a bin: base arm each, the order rotated every round,
   BLOOMERY_STEP_STATS=1 on both so the host leg and host slots print per arm; no row carries
   [cpu-busy] or [other-busy]. The pp rows at P = 512 and 4096 are read as no-regression beside it
 decide-in: land v41l01 with the regenerated V4.1 fixture; re-derive #1162's Spark gain on the card
