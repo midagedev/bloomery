@@ -33,7 +33,8 @@ use bloomery_verbs::Endpoint;
 use cuda_core::{CudaContext, DeviceBuffer, sys};
 
 use super::link::{
-    GatherSet, GatherShape, Gathers, PeerPath, PostCols, RdmaEnd, Reader, TcpEnd, TcpPeer, paths,
+    GatherSet, GatherShape, Gathers, PeerPath, PostCols, RdmaEnd, Reader, RemoteWire, TcpEnd,
+    TcpPeer, paths,
 };
 use super::node::wire::{In, MAX_FRAME, Out};
 use super::node::{read_endpoint, read_tcp_peer, write_endpoint, write_tcp_peer};
@@ -427,21 +428,14 @@ impl Sums {
 pub struct Bootstrap {
     pub fabric: Option<std::path::PathBuf>,
     pub wait: Duration,
-    pub wire: RankWire,
-}
-
-/// The wire a group's ends carry the gathers on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RankWire {
-    /// An RDMA end to every peer on its path ([`super::paths`]).
-    Rdma,
-    /// A TCP end to every peer ([`TcpEnd`]), each listening on its rank's
-    /// control address: no fabric manifest, no peer path.
-    Tcp,
+    /// `Rdma`: an end to every peer on its path ([`super::paths`]). `Tcp`:
+    /// a [`TcpEnd`] to every peer, each listening on its rank's control
+    /// address, with no fabric manifest and no peer path.
+    pub wire: RemoteWire,
 }
 
 /// A session's ends, every one of the wire its bootstrap names, in rank order.
-enum Ends {
+pub enum Ends {
     Rdma(Vec<RdmaEnd>),
     Tcp(Vec<TcpEnd>),
 }
@@ -454,8 +448,17 @@ impl Ends {
         }
     }
 
+    /// The first end that broke, by why.
+    #[must_use]
+    pub fn broken(&self) -> Option<String> {
+        match self {
+            Ends::Rdma(e) => e.iter().find_map(RdmaEnd::broken),
+            Ends::Tcp(e) => e.iter().find_map(TcpEnd::broken),
+        }
+    }
+
     /// Release every counter the ends carry ([`RdmaEnd::release`], [`TcpEnd::release`]).
-    fn release(&self, v: u32) -> Result<(), GpuError> {
+    pub fn release(&self, v: u32) -> Result<(), GpuError> {
         match self {
             Ends::Rdma(e) => RdmaEnd::release(e, v),
             Ends::Tcp(e) => TcpEnd::release(e, v),
@@ -513,7 +516,7 @@ impl RankSession {
             )
             .into());
         }
-        if how.wire == RankWire::Tcp && how.fabric.is_some() {
+        if how.wire == RemoteWire::Tcp && how.fabric.is_some() {
             return Err(GpuError::shape(
                 WHAT,
                 "a fabric manifest names RDMA relay labels; a TCP wire reads none",
@@ -543,7 +546,7 @@ impl RankSession {
             limits: limits.iter().map(|&(k, v)| (k.to_string(), v)).collect(),
         };
         s.limits = control.agree(&hello, limits)?;
-        if how.wire == RankWire::Tcp {
+        if how.wire == RemoteWire::Tcp {
             let layout = Gathers::new(0, n, me, shapes)?;
             let page = Arc::new(MappedHost::new(
                 &s.ctx,
@@ -634,15 +637,11 @@ impl RankSession {
         &self.paths
     }
 
-    /// The RDMA end to every peer, in rank order: what a stall report reads
-    /// and a release releases ([`RdmaEnd::broken`], [`RdmaEnd::release`]).
-    /// `None` on a TCP wire.
+    /// The end to every peer, in rank order: what a stall report reads and a
+    /// release releases ([`Ends::broken`], [`Ends::release`]).
     #[must_use]
-    pub fn ends(&self) -> Option<&[RdmaEnd]> {
-        match &self.ends {
-            Ends::Rdma(e) => Some(e),
-            Ends::Tcp(_) => None,
-        }
+    pub fn ends(&self) -> &Ends {
+        &self.ends
     }
 
     /// Every rank sends rank 0 `words`, its figures to compare (a digest of

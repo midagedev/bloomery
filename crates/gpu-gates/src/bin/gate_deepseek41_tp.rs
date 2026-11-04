@@ -5,7 +5,7 @@
 //!
 //! Past one rank every rank is a process of its own (this binary under [`CHILD`]), joined as a
 //! deployment joins them: a rank group over the rank file's control addresses on the loopback
-//! (`bloomery_gpu::host::rank::RankSession`), its gathers on TCP ends (`RankWire::Tcp`), its
+//! (`bloomery_gpu::host::rank::RankSession`), its gathers on TCP ends (`RemoteWire::Tcp`), its
 //! rounds and picks by the group's greedy run (`app::tp::greedy`). A rank's wait for the others'
 //! parts is a stream memory op; each process holds a context of its own, whose queues no other
 //! rank's work stands in, so one rank's wait never holds another rank's part.
@@ -45,8 +45,9 @@ mod gate {
 
     use crate::ds41_rank::rank_greedy;
     use bloomery_gpu::Gpu;
+    use bloomery_gpu::host::RemoteWire;
     use bloomery_gpu::host::node::wire::{In, Out};
-    use bloomery_gpu::host::rank::{Bootstrap, Fingerprint, RankList, RankSession, RankWire};
+    use bloomery_gpu::host::rank::{Bootstrap, Fingerprint, RankList, RankSession};
     use bloomery_gpu_deepseek41::body::{self, OpenCfg, RankFrom};
     use bloomery_gpu_deepseek41::chain::join;
     use bloomery_gpu_gates::GateError;
@@ -258,7 +259,7 @@ mod gate {
         let how = Bootstrap {
             fabric: None,
             wait: WAIT,
-            wire: RankWire::Tcp,
+            wire: RemoteWire::Tcp,
         };
         let gpu = Gpu::new()?;
         let mut session =

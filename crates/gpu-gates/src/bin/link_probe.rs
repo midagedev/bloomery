@@ -98,12 +98,12 @@ fn main() -> std::process::ExitCode {
 mod probe {
     use bloomery_gpu::host::node::{read_tcp_peer, wire, write_tcp_peer};
     use bloomery_gpu::host::rank::{
-        Bootstrap, Control, Fingerprint, RankList, RankSession, RankWire, psn,
+        Bootstrap, Control, Ends, Fingerprint, RankList, RankSession, psn,
     };
     use bloomery_gpu::host::step::RELEASE;
     use bloomery_gpu::host::{
-        Crossing, GatherSet, GatherShape, Gathers, PeerPath, PostCols, RdmaEnd, Reader, Span,
-        TcpEnd, TcpPeer, link_tail, paths,
+        Crossing, GatherSet, GatherShape, Gathers, PeerPath, PostCols, RdmaEnd, Reader, RemoteWire,
+        Span, TcpEnd, TcpPeer, link_tail, paths,
     };
     use bloomery_gpu::{
         Gpu, MappedHost, WindowMut, mem_batch, op_add, op_barrier_sys, op_wait_geq,
@@ -599,7 +599,7 @@ mod probe {
             node: Node {
                 rank: o.rank,
                 page: &page,
-                ends: ends.wire(),
+                ends: &ends,
                 watch,
                 deadline: o.deadline,
             },
@@ -770,47 +770,6 @@ mod probe {
         Ok((Ends::Tcp(ends), control))
     }
 
-    /// This node's ends, all of one wire.
-    enum Ends {
-        Rdma(Vec<RdmaEnd>),
-        Tcp(Vec<TcpEnd>),
-    }
-
-    impl Ends {
-        fn wire(&self) -> Wire<'_> {
-            match self {
-                Ends::Rdma(e) => Wire::Rdma(e),
-                Ends::Tcp(e) => Wire::Tcp(e),
-            }
-        }
-    }
-
-    /// A node's ends as it drives them: [`Ends`], or the RDMA ends a session holds.
-    #[derive(Clone, Copy)]
-    enum Wire<'a> {
-        Rdma(&'a [RdmaEnd]),
-        Tcp(&'a [TcpEnd]),
-    }
-
-    impl Wire<'_> {
-        /// The first end that broke, by why.
-        fn broken(self) -> Option<String> {
-            match self {
-                Wire::Rdma(e) => e.iter().find_map(RdmaEnd::broken),
-                Wire::Tcp(e) => e.iter().find_map(TcpEnd::broken),
-            }
-        }
-
-        /// The ends' release ([`RdmaEnd::release`], [`TcpEnd::release`]).
-        fn release(self, v: u32) -> Result<(), String> {
-            match self {
-                Wire::Rdma(e) => RdmaEnd::release(e, v),
-                Wire::Tcp(e) => TcpEnd::release(e, v),
-            }
-            .map_err(|e| e.to_string())
-        }
-    }
-
     /// The stage's line: the round trip of every timed generation, both
     /// stale counts, each node's kernel time.
     fn report(
@@ -884,7 +843,7 @@ mod probe {
     struct Node<'a> {
         rank: usize,
         page: &'a MappedHost,
-        ends: Wire<'a>,
+        ends: &'a Ends,
         /// Each counter a stall report prints, by name and byte.
         watch: Vec<(String, usize)>,
         deadline: Duration,
@@ -922,9 +881,9 @@ mod probe {
         /// Release every counter this rank waits on: its ends stop carrying
         /// every counter, and once their posts are over raise the ones this
         /// rank reads to [`RELEASE`]; `Err` names an end whose posts are not
-        /// known to be over, whose counters stay ([`Wire::release`]).
+        /// known to be over, whose counters stay ([`Ends::release`]).
         fn release(&self) -> Result<(), String> {
-            self.ends.release(RELEASE)
+            self.ends.release(RELEASE).map_err(|e| e.to_string())
         }
 
         /// Wait for `event`, generation `g`'s, until `since` is a deadline
@@ -1289,7 +1248,7 @@ mod probe {
         let how = Bootstrap {
             fabric: o.fabric.clone(),
             wait: Duration::from_secs(60).max(o.deadline),
-            wire: RankWire::Rdma,
+            wire: RemoteWire::Rdma,
         };
         enter("bootstrap");
         let mut session = RankSession::open(gpu, &o.ranks, o.rank, &how, &fp, &[], &shapes)?;
@@ -1297,7 +1256,7 @@ mod probe {
         print_paths(o, session.paths());
         let g = session.gathers().ok_or("a gather of one rank")?.clone();
         let page = Arc::clone(session.page().ok_or("a gather of one rank")?);
-        let ends = Wire::Rdma(session.ends().ok_or("a gather over RDMA ends")?);
+        let ends = session.ends();
         let mut watch = Vec::new();
         for slot in 0..shapes.len() {
             for set in 0..Gathers::SETS {
