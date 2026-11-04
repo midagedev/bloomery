@@ -131,6 +131,12 @@ pub trait FileStacks: Send + Sync {
 /// place, on the machine's copy stream. The copies of later parts and the
 /// flip's event follow it on the stream.
 pub trait Convert: Send + Sync {
+    /// Whether the step rewrites part `part` of an expert: the parts it
+    /// unpacks with the sizes it was built from, which every card layer of
+    /// the load holds alike ([`one_layout`]); a part it leaves as staged may
+    /// differ from layer to layer.
+    fn converts(&self, part: usize) -> bool;
+
     /// Enqueue on `stream` the conversion of part `part` at `dst`.
     fn convert(
         &self,
@@ -652,10 +658,15 @@ fn tensor_scales(split: &Split, t: &ModelTensor, experts: u64) -> Result<Vec<u8>
 }
 
 /// The one convert step is built from the first card layer's parts: a card
-/// layer of other parts would be unpacked with the wrong sizes, so a load
-/// with a convert step refuses it by name. `first` is the layer `layers[0]`
-/// holds.
-fn one_layout(first: usize, layers: &[Option<LayerParts>]) -> Result<(), GpuError> {
+/// layer whose converted parts (`converts`) are of other sizes would be
+/// unpacked with the wrong sizes, so a load with a convert step refuses it by
+/// name. A part the step leaves as staged may differ. `first` is the layer
+/// `layers[0]` holds.
+fn one_layout(
+    first: usize,
+    layers: &[Option<LayerParts>],
+    converts: impl Fn(usize) -> bool,
+) -> Result<(), GpuError> {
     let mut held = layers
         .iter()
         .enumerate()
@@ -663,7 +674,11 @@ fn one_layout(first: usize, layers: &[Option<LayerParts>]) -> Result<(), GpuErro
     let Some((l0, p0)) = held.next() else {
         return Ok(());
     };
-    match held.find(|(_, p)| p.parts != p0.parts) {
+    let differs = |p: &LayerParts| {
+        p.parts.len() != p0.parts.len()
+            || (0..p.parts.len()).any(|k| converts(k) && p.parts[k] != p0.parts[k])
+    };
+    match held.find(|(_, p)| differs(p)) {
         None => Ok(()),
         Some((l, p)) => Err(GpuError::shape(
             "FileSwap::new",
@@ -819,8 +834,8 @@ impl FileSwap {
             .ok_or_else(|| GpuError::shape(WHAT, "no layer of the card holds routed stacks"))?;
         let t0 = first.tensors[0].clone();
         let convert = stacks.open(&t0.dims, &first.parts, pair.r8().sidecar().is_some(), ctx)?;
-        if convert.is_some() {
-            one_layout(layers.start, &out)?;
+        if let Some(c) = &convert {
+            one_layout(layers.start, &out, |k| c.converts(k))?;
         }
         Ok(FileSwap {
             tier: OnceLock::new(),
@@ -1894,21 +1909,33 @@ mod tests {
         })
     }
 
-    /// A load with a convert step takes card layers of one layout only, and
-    /// names the first layer of another layout. Mutant: the check skipped (or
-    /// comparing only neighbours past the first) — the layer 7 arm catches it.
+    /// A load with a convert step takes card layers whose converted parts are
+    /// of one layout only, and names the first layer of another; a part the
+    /// step leaves as staged (V4.1's Q5_K down beside its Q4_K one) may
+    /// differ. Mutant: the check skipped (or comparing only neighbours past
+    /// the first) — the layer 7 arm catches it; comparing every part — the
+    /// down arm catches it.
     #[test]
     fn a_convert_step_refuses_a_layer_of_other_parts_by_name() {
+        let gate_up = |k: usize| k < 2;
         let same = [None, held(&[4096, 4096, 8192]), held(&[4096, 4096, 8192])];
-        assert!(one_layout(4, &same).is_ok(), "one layout passes");
-        assert!(one_layout(4, &[None, None]).is_ok(), "no held layer passes");
+        assert!(one_layout(4, &same, gate_up).is_ok(), "one layout passes");
+        assert!(
+            one_layout(4, &[None, None], gate_up).is_ok(),
+            "no held layer passes"
+        );
+        let down = [held(&[4096, 4096, 10240]), held(&[4096, 4096, 8192])];
+        assert!(
+            one_layout(4, &down, gate_up).is_ok(),
+            "a part the step leaves as staged may differ"
+        );
         let other = [
             held(&[4096, 4096, 8192]),
             None,
             held(&[4096, 4096, 8192]),
             held(&[6144, 6144, 16384]),
         ];
-        match one_layout(4, &other) {
+        match one_layout(4, &other, gate_up) {
             Err(GpuError::Shape { what, detail }) => {
                 assert_eq!(what, "FileSwap::new");
                 assert_eq!(

@@ -721,6 +721,12 @@ struct R8Unpack {
 }
 
 impl Convert for R8Unpack {
+    /// The gate and the up, staged from the sidecar; the down is the file's
+    /// bytes, of the layer's own type.
+    fn converts(&self, part: usize) -> bool {
+        part < 2
+    }
+
     fn convert(
         &self,
         part: usize,
