@@ -18,6 +18,8 @@
 #   PLACE_LOAD_KIND  (place_arm_cards, optional) the records.py kind of the binary's load record, default load
 #   PLACE_LOAD_BIN   (place_arm_cards, optional) the binary whose checked-in schema reads it, default
 #                    records.py's (generate_ds41)
+#   PLACE_NODES      (place_arm_cards, optional) the arm's BLOOMERY_TIER_NODES value (arm_tier_nodes of its
+#                    items), empty for an arm that sets none; set for every arm, before each call
 #
 # The words: a is plan (a), on the largest visible card (workstation::ALIASES: the binary finds its cards by
 # device); gate the gate plan, the 3090's bytes on the smallest card with the room for them (plan_gate); bp plan (b′), plan (a) with the
@@ -26,8 +28,11 @@
 # A6000 as the timing card (on the 3090 alone it would plan the gate plan's card under a's label), gate the
 # 3090 (on the A6000 alone it would time the A6000 under gate's label), and bp is refused. The two-card mode (BLOOMERY_TIMING_CARDS=a6000+3090) shows both cards to every arm: bp
 # loads both, a loads the A6000 and leaves the 3090 idle (place_arm_cards holds each a arm's load record to
-# the A6000 alone), and gate, a 3090-only row in the A6000+3090 table, is refused. Local mode
-# (timing-card.sh's TIMING_LOCAL) times this machine's one card at a, and gate and bp are refused.
+# the A6000 alone), and gate, a 3090-only row in the A6000+3090 table, is refused. A bp arm whose items set
+# BLOOMERY_TIER_NODES runs its expert tier on that node: its second card is the node's, whatever its name, in
+# the row and in the load record (place_arm_cards), and an a arm that sets it is refused (place_nodes_check:
+# plan (a) has no expert tier). Local mode (timing-card.sh's TIMING_LOCAL) times this machine's one card at a,
+# and gate and bp are refused.
 
 # place_refuse <arm or empty> <why>: the refusal, exit 64.
 place_refuse() {
@@ -80,6 +85,27 @@ arm_place_split() {
 }
 # arm_has_place <NAME=VALUE list>: whether the list holds a place= item.
 arm_has_place() { [[ ,$1 == *,place=* ]]; }
+# arm_tier_nodes <NAME=VALUE list>: the value of the list's BLOOMERY_TIER_NODES item, empty without one; of a
+# repeated item the last, the one `env` hands the binary. An arm's items are separated by `,`, as the lever's
+# own list of nodes is, so an arm names one node.
+arm_tier_nodes() {
+  local s="$1," e v=''
+  while [ -n "$s" ]; do
+    e=${s%%,*} s=${s#*,}
+    case $e in BLOOMERY_TIER_NODES=*) v=${e#*=} ;; esac
+  done
+  echo "$v"
+}
+# place_nodes_check <arm> <word> <nodes> <hint>: an arm that sets BLOOMERY_TIER_NODES (<nodes>, arm_tier_nodes of
+# its items) at the placement <word>. An a arm is refused by name (exit 64, <hint> the way to run it at bp): plan
+# (a) has no expert tier for a node to run. A bp arm is held to its load record's cards after its run
+# (place_arm_cards); no other word is judged here (place_check refuses gate in the two-card mode).
+place_nodes_check() {
+  [ -n "$3" ] || return 0
+  case $2 in
+    a) place_refuse "$1" "BLOOMERY_TIER_NODES=$3 puts the expert tier on a node, and --place a is plan (a), which has no expert tier: run the arm at $4 (plan (b′))" ;;
+  esac
+}
 # place_ref_refuse <arm> <engine>: place= on a reference engine's arm, refused by name.
 place_ref_refuse() {
   place_refuse "$1" "place= sets $PLACE_BIN's --place, and $2 is a reference engine's arm, which takes no placement of ours"
@@ -124,13 +150,51 @@ place_check() {
       ;;
   esac
 }
+# place_node_cards <cards> <cards as the record has them>: the cards of a bp arm whose expert tier runs on the
+# nodes PLACE_NODES lists (the lever's own comma-separated value, one node a tier card in tier order); <cards>
+# is `name,name` with each underscore a space. The stage card, the A6000, comes first and one card a node
+# follows, in the nodes' order, each whatever its name (a node's card is no card of this machine's census)
+# but the 3090, which is this machine's own: the tier did not run on the node. The names are the record's
+# only evidence, so a node that holds a 3090 is read as this machine's. TWOCARD_DEVS is `A6000 + GB10 (tier
+# node 10.0.0.2:9000)` for one node and `A6000 + GB10 (tier node X) + GB10 (tier node Y)` for two, the cards'
+# names without their NVIDIA, GeForce and RTX prefixes (the rows' card field). 1 with TWOCARD_WHY on a failure.
+# shellcheck disable=SC2034 # TWOCARD_WHY and TWOCARD_DEVS are timing-card.sh's, read by the runners
+place_node_cards() {
+  local raw=$2 k c devs
+  local -a cards nodes
+  IFS=, read -r -a cards <<< "$1"
+  IFS=, read -r -a nodes <<< "$PLACE_NODES"
+  if [ "${#cards[@]}" -ne $((${#nodes[@]} + 1)) ]; then
+    TWOCARD_WHY="the engine's load record names cards $raw, not the A6000 and one card for each of the ${#nodes[@]} tier node(s) in BLOOMERY_TIER_NODES=$PLACE_NODES"
+    return 1
+  fi
+  if [[ ${cards[0]} != *A6000* ]]; then
+    TWOCARD_WHY="the engine's load record names cards $raw: the A6000 is the stage card and comes first, ahead of the tier node's card"
+    return 1
+  fi
+  devs=${cards[0]#NVIDIA }
+  devs=${devs#GeForce }
+  devs=${devs#RTX }
+  for ((k = 1; k < ${#cards[@]}; k++)); do
+    if [[ ${cards[k]} == *3090* ]]; then
+      TWOCARD_WHY="the engine's load record names cards $raw: BLOOMERY_TIER_NODES=$PLACE_NODES puts the expert tier on a node, and the 3090 is this machine's card, not the node's: the tier did not run on the node"
+      return 1
+    fi
+    c=${cards[k]#NVIDIA }
+    c=${c#GeForce }
+    c=${c#RTX }
+    devs+=" + $c (tier node ${nodes[k - 1]})"
+  done
+  TWOCARD_DEVS=$devs
+}
 # place_arm_cards <engine log> <place> [<cards>]: after one of our arms in the two-card mode (0 at once
 # without it), timing-card.sh's witness (timing_cards_arm: an Xid since the last arm, a card lost or off its
 # cap), then the cards the arm loaded against its placement: <cards> as given (`[name,name]`, each space
 # written `_`, for a binary whose load line is no records.py kind), else the `cards` of the log's first load
-# record (records.py, PLACE_LOAD_KIND of PLACE_LOAD_BIN's schema). bp must name the A6000 then the 3090; a the
-# A6000 alone (plan (a) with the 3090 idle); a load with no cards fails, and so does any other place. 1 with
-# TWOCARD_WHY on a failure; TWOCARD_DEVS the devices, ` + ` between two, for the row.
+# record (records.py, PLACE_LOAD_KIND of PLACE_LOAD_BIN's schema). bp must name the A6000 then the 3090, or,
+# with PLACE_NODES set, the A6000 then one card a tier node (place_node_cards); a the A6000 alone (plan (a)
+# with the 3090 idle); a load with no cards fails, and so does any other place. 1 with TWOCARD_WHY on a
+# failure; TWOCARD_DEVS the devices, ` + ` between two, for the row (a node arm's: place_node_cards).
 # shellcheck disable=SC2034 # TWOCARD_WHY and TWOCARD_DEVS are timing-card.sh's, read by the runners
 place_arm_cards() {
   local log=$1 p=$2 rec d CARDS err
@@ -156,6 +220,10 @@ place_arm_cards() {
   d=${CARDS#\[} d=${d%\]} d=${d//_/ }
   case $p in
     bp)
+      if [ -n "${PLACE_NODES:-}" ]; then
+        place_node_cards "$d" "$CARDS" && return 0
+        return 1
+      fi
       if [[ $d =~ ^[^,]*A6000[^,]*,[^,]*3090[^,]*$ ]]; then
         TWOCARD_DEVS="${d//,/ + }"
         return 0

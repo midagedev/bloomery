@@ -460,9 +460,12 @@
 # its row in the A6000+3090 table all the same. A gate arm (a 3090-only row) and an a arm under
 # BLOOMERY_DRAFT=dspark (its draft sits on the 3090 as a holder) are refused by name before anything runs.
 # After each of our arms its `load` record's `cards` (records.py) must name the A6000 and the 3090 under bp
-# and the A6000 alone under a (tools/ref/arm-place.sh place_arm_cards), or the arm is a FAIL row. An ik
-# arm is refused by name (ik's -ts is a
-# byte split over its own layer sizes, src/llama.cpp get_layer_sizes, which nobody has read against this
+# and the A6000 alone under a (tools/ref/arm-place.sh place_arm_cards), or the arm is a FAIL row. A bp arm
+# whose items set BLOOMERY_TIER_NODES (its expert tier on that node) must name the A6000 and then the node's
+# card, whatever its name but the 3090's, and its row's card field reads `A6000 + <card> (tier node <addr>)`
+# in place of the table's; an a arm that sets it is refused by name before anything runs (plan (a) has no
+# expert tier). An ik arm is refused by name (ik's -ts is a byte split over its own layer sizes,
+# src/llama.cpp get_layer_sizes, which nobody has read against this
 # placement; the public reference is llama.cpp). Before the lease a card that does not answer, a 3090 off
 # its cap or an unpatched lease.sh refuses the run; after every arm an Xid since the last arm, a card lost
 # or off its cap, or a llama-bench or llama-server that did not see both cards (its ggml_cuda_init lines)
@@ -549,10 +552,10 @@ ours_row() {
     # The aggregate: Σ positions · 1000 / Σ ms over the counted rounds; the SMOKE footer's p50 and mean are
     # a round's, so 1000 / mean is one stream's rate.
     TPS_ROW=$(awk -v p="$SL_POS" -v ms="$SL_MS" 'BEGIN { printf "%.2f", p * 1e3 / ms }')
-    echo "$ROW_TAG r$r $label d=$dep n=$N | tok/s(aggregate) $TPS_ROW @ n=$ROW_SLOTS·$SL_N, depth $dep, $CARD_NAME | place ${PLACE_RAN:-$PLACE_ARM} | slots $ROW_SLOTS | tok/s(per stream, mean) $TPS_MEAN | p50 $P50 ms/pass | mean $MEAN ms/pass | warm ${WARMCOL:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok$PP_COL$MAJ_COL$SLOT_COL | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
+    echo "$ROW_TAG r$r $label d=$dep n=$N | tok/s(aggregate) $TPS_ROW @ n=$ROW_SLOTS·$SL_N, depth $dep, ${ROW_CARD:-$CARD_NAME} | place ${PLACE_RAN:-$PLACE_ARM} | slots $ROW_SLOTS | tok/s(per stream, mean) $TPS_MEAN | p50 $P50 ms/pass | mean $MEAN ms/pass | warm ${WARMCOL:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok$PP_COL$MAJ_COL$SLOT_COL | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
     return 0
   fi
-  echo "$ROW_TAG r$r $label d=$dep n=$N | tok/s(mean) $TPS_MEAN @ n=$N, depth $dep, $CARD_NAME | place ${PLACE_RAN:-$PLACE_ARM} | p50 $P50 ms | mean $MEAN ms | tok/s(p50) $TPS_P50 | warm ${WARMCOL:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok${DRAFT:+ | draft $DRAFT}$PP_COL$MAJ_COL$SLOT_COL | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
+  echo "$ROW_TAG r$r $label d=$dep n=$N | tok/s(mean) $TPS_MEAN @ n=$N, depth $dep, ${ROW_CARD:-$CARD_NAME} | place ${PLACE_RAN:-$PLACE_ARM} | p50 $P50 ms | mean $MEAN ms | tok/s(p50) $TPS_P50 | warm ${WARMCOL:-0} | first10_p50 $h10 | last10_p50 $t10 | distinct_tokens $uniq_tok${DRAFT:+ | draft $DRAFT}$PP_COL$MAJ_COL$SLOT_COL | wall ${wall}s$CPU_BUSY_TAG$OTHER_BUSY_TAG$COLD_TAG"
 }
 # The residency seed condition and curve (the header's Residency). RES_WINDOW: the passes a curve window
 # holds.
@@ -1303,8 +1306,9 @@ for i in "${!ARMS[@]}"; do
     place_check '' "$PLACE"
     PLACE_SEEN=1
   fi
+  if [ -n "${A_PLACE_SET[$i]}" ]; then hint=place=bp; else hint=BLOOMERY_GEN_PLACE=bp; fi
+  place_nodes_check "${ARMS[$i]}" "${A_PLACE[$i]}" "$(arm_tier_nodes "${A_ENV[$i]}")" "$hint"
   if [ -n "$TIMING_CARDS" ] && [ "${A_PLACE[$i]}" = a ] && [[ ,${A_ENV[$i]}, == *,BLOOMERY_DRAFT=dspark,* ]]; then
-    if [ -n "${A_PLACE_SET[$i]}" ]; then hint=place=bp; else hint=BLOOMERY_GEN_PLACE=bp; fi
     arm_refuse "${ARMS[$i]}" "BLOOMERY_DRAFT=dspark seats the draft on the 3090 as a holder, and in the two-card mode an a arm keeps the 3090 idle: run the draft under $hint"
   fi
 done
@@ -1770,11 +1774,14 @@ ours_post() {
     return 0
   fi
   # Two cards: an Xid, a card lost or off its cap, or a load whose cards are not its placement's (bp both
-  # cards, a the A6000 alone) fails the arm (a grouped arm's load record is its load's header).
+  # cards, or the A6000 and its tier node's card under BLOOMERY_TIER_NODES; a the A6000 alone) fails the arm
+  # (a grouped arm's load record is its load's header). A node arm's row names its own cards, not the table's.
+  PLACE_NODES=$(arm_tier_nodes "${A_ENV[$i]}") ROW_CARD=''
   if ! place_arm_cards "$out"$'\n'"${LG_HEADER:-}" "${A_PLACE[$i]}"; then
     arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "two cards: $TWOCARD_WHY" "$out"
     return 0
   fi
+  [ -z "$PLACE_NODES" ] || [ -z "$TWOCARD_DEVS" ] || ROW_CARD=$TWOCARD_DEVS
   # The residency seed condition (the header's Residency): the slot from the arm record, 1 for a process
   # of its own; LG_PREV_OUT is read only past slot 1, which only the load driver's processes have.
   # An arm of a shared load (an `arm` record opens its output) has its load's lines in LG_HEADER.

@@ -84,6 +84,20 @@
 #                both cards, its row reads `A6000+3090` and `place bp`; rc 0.
 #   twocard-bp-one  the same with a load record naming the A6000 alone (STUB_GEN_CARDS): ours is a FAIL row
 #                naming the cards it saw; rc 1.
+#   twocard-bp-node  6@place=bp,BLOOMERY_TIER_NODES=10.0.0.2:9000,BLOOMERY_TIER_LINK=tcp, one round, the load
+#                record naming the A6000 and a node's card (STUB_GEN_CARDS=[NVIDIA_RTX_A6000,NVIDIA_GB10]): the row
+#                reads `A6000 + GB10 (tier node 10.0.0.2:9000)` in the card field, not `A6000+3090`; rc 0.
+#   twocard-bp-node-3090  the same arm whose record names the 3090 as the second card: a FAIL row saying the
+#                tier ran on this machine's card, not the node's; rc 1.
+#   twocard-bp-node-count  the same arm whose record names a third card: a FAIL row naming the one card a node
+#                expects; rc 1.
+#   twocard-bp-nodes-fn  place_arm_cards called by hand with two nodes (an arm's items carry one: a `,` splits
+#                them): A6000 + one card a node renders both, one card short fails by name, and so does the
+#                A6000 not first; arm_tier_nodes reads the last of a repeated item and empty without one.
+#   twocard-a-node  6@place=a,BLOOMERY_TIER_NODES=10.0.0.2:9000: refused by name before anything runs (plan a has
+#                no expert tier), rc 64.
+#   a-node-gen   BLOOMERY_GEN_PLACE=a and 6@BLOOMERY_TIER_NODES=10.0.0.2:9000, one card: the same refusal, its
+#                hint BLOOMERY_GEN_PLACE=bp; rc 64.
 #   bp-onecard   BLOOMERY_GEN_PLACE=bp outside the two-card mode: refused by name, rc 64.
 # An arm's place= (`<arm>@place=<a|gate|bp>`, red on the runner before it: it passes `place` to the binary as
 # a variable, which the stub refuses at rc 9, or refuses the arm as arm usage):
@@ -902,6 +916,74 @@ if [ "$RC" != 1 ]; then
 elif want twocard-bp-one "$L" 1 "^FAIL r1 ours d=6 rc=0 \| two cards: the engine.s load record names cards \[NVIDIA_RTX_A6000\], not the A6000 and the 3090: a one-card run in the two-card table" &&
   want twocard-bp-one "$L" 0 '^ROW '; then
   pass twocard-bp-one
+fi
+
+# A bp arm whose expert tier runs on a node (BLOOMERY_TIER_NODES in its items): the load record names the A6000
+# and then the node's card, whatever its name; the row's card field names those two cards and the node, and the
+# 3090 is not among them (red on the runner before it: its FAIL row says `a one-card run in the two-card table`).
+NODE_ARM=6@place=bp,BLOOMERY_TIER_NODES=10.0.0.2:9000,BLOOMERY_TIER_LINK=tcp
+NODE_LABEL=ours@place=bp,BLOOMERY_TIER_NODES=10\.0\.0\.2:9000,BLOOMERY_TIER_LINK=tcp
+L=$tmp/twocard-bp-node.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "$TC" 'STUB_GEN_CARDS=[NVIDIA_RTX_A6000,NVIDIA_GB10]' -- "$NODE_ARM"
+if [ "$RC" != 0 ]; then
+  fail twocard-bp-node "rc $RC, want 0" "$L"
+elif want twocard-bp-node "$L" 1 "^ROW r1 $NODE_LABEL d=6 n=4 \| tok/s\(mean\) [0-9.]+ @ n=4, depth 6, A6000 \+ GB10 \(tier node 10\.0\.0\.2:9000\) \| place bp \| " &&
+  want twocard-bp-node "$L" 0 'depth 6, A6000\+3090' &&
+  want twocard-bp-node "$L" 1 '^    load resident_bytes=0 place=bp cards=\[NVIDIA_RTX_A6000,NVIDIA_GB10\] ' &&
+  want twocard-bp-node "$L" 0 '^FAIL '; then
+  pass twocard-bp-node
+fi
+# The same arm whose record names the 3090: the tier ran on this machine's card, not on the node.
+L=$tmp/twocard-bp-node-3090.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "$TC" 'STUB_GEN_CARDS=[NVIDIA_RTX_A6000,NVIDIA_GeForce_RTX_3090]' -- "$NODE_ARM"
+if [ "$RC" != 1 ]; then
+  fail twocard-bp-node-3090 "rc $RC, want 1" "$L"
+elif want twocard-bp-node-3090 "$L" 1 "^FAIL r1 $NODE_LABEL d=6 rc=0 \| two cards: the engine.s load record names cards \[NVIDIA_RTX_A6000,NVIDIA_GeForce_RTX_3090\]: BLOOMERY_TIER_NODES=10\.0\.0\.2:9000 puts the expert tier on a node, and the 3090 is this machine.s card, not the node.s: the tier did not run on the node; last line: " &&
+  want twocard-bp-node-3090 "$L" 0 '^ROW '; then
+  pass twocard-bp-node-3090
+fi
+# A third card: one node, so one tier card.
+L=$tmp/twocard-bp-node-count.log
+stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "$TC" 'STUB_GEN_CARDS=[NVIDIA_RTX_A6000,NVIDIA_GB10,NVIDIA_GB10]' -- "$NODE_ARM"
+if [ "$RC" != 1 ]; then
+  fail twocard-bp-node-count "rc $RC, want 1" "$L"
+elif want twocard-bp-node-count "$L" 1 "^FAIL r1 $NODE_LABEL d=6 rc=0 \| two cards: the engine.s load record names cards \[NVIDIA_RTX_A6000,NVIDIA_GB10,NVIDIA_GB10\], not the A6000 and one card for each of the 1 tier node\(s\) in BLOOMERY_TIER_NODES=10\.0\.0\.2:9000; last line: " &&
+  want twocard-bp-node-count "$L" 0 '^ROW '; then
+  pass twocard-bp-node-count
+fi
+# place_arm_cards called by hand (arm-place.sh sourced, the witness stubbed; the cards given as its third
+# argument): two nodes, an arm's items cannot carry (a `,` separates them), render A6000 + one card each; a
+# list one card short fails by name.
+# shellcheck disable=SC2034,SC2329 # the copy sourced below reads TIMING_CARDS and PLACE_NODES and calls the stub
+fn=$(
+  TIMING_CARDS=a6000+3090 PLACE_NODES=10.0.0.2:9000,10.0.0.3:9000
+  timing_cards_arm() { return 0; }
+  # shellcheck source=/dev/null # the stub tree's copy, which the line above the case cannot name
+  source "$T/tools/ref/arm-place.sh"
+  place_arm_cards log bp '[NVIDIA_RTX_A6000,NVIDIA_GB10,NVIDIA_GB10]' && echo "ok: $TWOCARD_DEVS"
+  place_arm_cards log bp '[NVIDIA_RTX_A6000,NVIDIA_GB10]' || echo "refused: $TWOCARD_WHY"
+  place_arm_cards log bp '[NVIDIA_GB10,NVIDIA_RTX_A6000,NVIDIA_GB10]' || echo "refused: $TWOCARD_WHY"
+  echo "nodes: [$(arm_tier_nodes 'place=bp,BLOOMERY_TIER_NODES=10.0.0.1:1,X=1,BLOOMERY_TIER_NODES=10.0.0.2:9000')] [$(arm_tier_nodes 'place=bp,X=1')]"
+)
+if [ "$fn" = "ok: A6000 + GB10 (tier node 10.0.0.2:9000) + GB10 (tier node 10.0.0.3:9000)
+refused: the engine's load record names cards [NVIDIA_RTX_A6000,NVIDIA_GB10], not the A6000 and one card for each of the 2 tier node(s) in BLOOMERY_TIER_NODES=10.0.0.2:9000,10.0.0.3:9000
+refused: the engine's load record names cards [NVIDIA_GB10,NVIDIA_RTX_A6000,NVIDIA_GB10]: the A6000 is the stage card and comes first, ahead of the tier node's card
+nodes: [10.0.0.2:9000] []" ]; then
+  pass twocard-bp-nodes-fn
+else
+  fail twocard-bp-nodes-fn "got: $fn" /dev/null
+fi
+# plan (a) has no expert tier: a node named for an a arm is refused before anything runs.
+twocard_refused twocard-a-node "^depth-ds41.sh: arm '6@place=a,BLOOMERY_TIER_NODES=10\.0\.0\.2:9000': BLOOMERY_TIER_NODES=10\.0\.0\.2:9000 puts the expert tier on a node, and --place a is plan \(a\), which has no expert tier: run the arm at place=bp \(plan \(b′\)\)$" 6@place=a,BLOOMERY_TIER_NODES=10.0.0.2:9000
+# The same refusal where the a is BLOOMERY_GEN_PLACE's, outside the two-card mode: the placement, not the mode,
+# has no tier, and the hint names the variable.
+L=$tmp/a-node-gen.log
+stub_run "$L" BLOOMERY_GEN_PLACE=a -- 6@BLOOMERY_TIER_NODES=10.0.0.2:9000
+if [ "$RC" != 64 ]; then
+  fail a-node-gen "rc $RC, want 64" "$L"
+elif want a-node-gen "$L" 1 "^depth-ds41.sh: arm '6@BLOOMERY_TIER_NODES=10\.0\.0\.2:9000': BLOOMERY_TIER_NODES=10\.0\.0\.2:9000 puts the expert tier on a node, and --place a is plan \(a\), which has no expert tier: run the arm at BLOOMERY_GEN_PLACE=bp \(plan \(b′\)\)$" &&
+  want a-node-gen "$L" 0 '^(ROW|FAIL|DISCARD|WARMUP) |^--- witness|^\[stub\] no lease'; then
+  pass a-node-gen
 fi
 
 L=$tmp/bp-onecard.log
