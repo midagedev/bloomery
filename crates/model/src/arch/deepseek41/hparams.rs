@@ -192,15 +192,7 @@ impl RowTypes {
     }
 
     fn read(split: &Split, engram: Option<&Engram>) -> Result<RowTypes, PlacementError> {
-        let ty = |name: String| {
-            split
-                .find(&name)
-                .map(|(_, t)| t.ty)
-                .ok_or_else(|| PlacementError::Tensor {
-                    name,
-                    detail: "is not in the file".to_string(),
-                })
-        };
+        let ty = |name| ty_in(split, name);
         let token_embd = ty(names::token_embd())?;
         let Some(engram) = engram else {
             return Ok(RowTypes {

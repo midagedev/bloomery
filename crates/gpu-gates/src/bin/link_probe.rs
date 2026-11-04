@@ -744,15 +744,26 @@ mod probe {
             .zip(peers)
             .map(|(e, &j)| {
                 let mut w = wire::Out::default();
-                write_tcp_peer(&e.endpoint(), &mut w);
+                // A tier end dials, so it has no address to send until then.
+                if of(j).2 == Reader::Stage {
+                    write_tcp_peer(&e.endpoint(), &mut w);
+                }
                 (to(j), w.done().to_vec())
             })
             .collect();
         let remote = control.swap(&out)?;
         enter("connect");
-        for (e, b) in ends.iter_mut().zip(&remote) {
+        let any = TcpPeer {
+            addr: std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0)),
+            nonce: 0,
+        };
+        for ((e, b), &j) in ends.iter_mut().zip(&remote).zip(peers) {
             let mut r = wire::In::new(b);
-            let peer: TcpPeer = read_tcp_peer(&mut r).and_then(|p| r.end().map(|()| p))?;
+            let peer = match of(j).2 {
+                Reader::Stage => Ok(any),
+                Reader::Tier => read_tcp_peer(&mut r),
+            };
+            let peer = peer.and_then(|p| r.end().map(|()| p))?;
             e.connect(&peer)?;
         }
         enter("payload");
