@@ -360,10 +360,13 @@ mod picks {
         ("4096x16384", 4096, 16_384),
     ];
 
+    /// One MXFP8 weight copy: its value plane and its scale plane.
+    type Mxfp8Planes = (DeviceTensor<u32>, DeviceTensor<u32>);
+
     /// The MXFP8 gemv of `ws[c % ws.len()]` against the `m` columns of `x`, token-major: the launch as the engine makes it.
     fn mxfp8_enq<'a>(
         q8: &'a Q8F32Kernels,
-        ws: &'a [(DeviceTensor<u32>, DeviceTensor<u32>)],
+        ws: &'a [Mxfp8Planes],
         x: &'a DeviceBuffer<f32>,
         m: usize,
     ) -> Enq<'a> {
@@ -391,7 +394,7 @@ mod picks {
         gpu: &Gpu,
         (rows, k): (usize, usize),
         seed: u64,
-    ) -> Result<Vec<(DeviceTensor<u32>, DeviceTensor<u32>)>, GateError> {
+    ) -> Result<Vec<Mxfp8Planes>, GateError> {
         let stream = gpu.stream();
         let (qs, e) = e4m3_planes(E4m3Scales::Mxfp8, &mxfp8_bytes(rows, k, seed), rows, k)?;
         (0..copies((rows * k / 32 * 33) as u64))
