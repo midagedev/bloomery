@@ -210,7 +210,7 @@ pub fn run<K: Kind>(row: &Row) -> Result<(), GateError> {
             lcg_ids(SLOT_A + SLOT_B, vocab),
             SLOT_A,
             (U_GATE, CTX),
-            (geom, 1 + 2 * geom.n_delta + 3 * geom.n_attn),
+            (geom, 1 + geom.n_attn * geom.attn_slot_launches()),
             Box::new(move || load(&path, mma).map(|(m, _)| m)),
         )?;
         ok &= q35::slots_two(&slots)?;
