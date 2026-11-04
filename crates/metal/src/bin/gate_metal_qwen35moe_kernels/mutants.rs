@@ -1255,8 +1255,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "a4_matvec",
         why: "one nibble of an A4 word pairs the lane value beside it",
         edits: &[(
-            "acc[1] += lane.yl[4 * m + 1] * (words[m] & 0x00F0);",
-            "acc[1] += lane.yl[4 * m + 2] * (words[m] & 0x00F0);",
+            "acc[1] = fma(lane.yl[4 * m + 1], float(words[m] & 0x00F0), acc[1]);",
+            "acc[1] = fma(lane.yl[4 * m + 2], float(words[m] & 0x00F0), acc[1]);",
             1,
         )],
     },

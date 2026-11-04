@@ -26,12 +26,11 @@
 //! head's time is `[plain]` plus the norm's term (`[norm]` less `[plain]`)
 //! plus the pick's term (the head less `[norm]`, which `[pick]` reads on its
 //! own). A plain mat-vec of the gate's shape is timed beside its norm-on-load
-//! form and four cuts of the A4 row loop: `[fma]` (the dot accumulated with
-//! `fma`, the one float change), `[scalarx]` (the activation and gain loads as
-//! scalar floats, the shipped loads' predecessor: the same bits), `[unroll]`
-//! (the walk over a SIMD group's rows forced to unroll: the same bits) and
-//! `[lite]` (the dot reduced to a conversion and an add a word, the weight
-//! reads kept: what the loads alone cost).
+//! form and three cuts of the A4 row loop: `[scalarx]` (the activation and
+//! gain loads as scalar floats, the shipped loads' predecessor: the same
+//! bits), `[unroll]` (the walk over a SIMD group's rows forced to unroll: the
+//! same bits) and `[lite]` (the dot reduced to a conversion and an add a word,
+//! the weight reads kept: what the loads alone cost).
 //!
 //! `--only lfm3,sweep` times every row (but the cuts) once more under each
 //! geometry of `SWEEP` (rows a SIMD group and SIMD groups a threadgroup),
@@ -91,14 +90,6 @@ pub(super) struct Cut {
 
 /// The A4 block's accumulate lines, in the dot's own order.
 const ACC_FIND: &str = concat!(
-    "            acc[0] += lane.yl[4 * m + 0] * (words[m] & 0x000F);\n",
-    "            acc[1] += lane.yl[4 * m + 1] * (words[m] & 0x00F0);\n",
-    "            acc[2] += lane.yl[4 * m + 2] * (words[m] & 0x0F00);\n",
-    "            acc[3] += lane.yl[4 * m + 3] * (words[m] & 0xF000);\n",
-);
-
-/// The same four lines with `fma`: the contracted form of the products.
-const ACC_FMA: &str = concat!(
     "            acc[0] = fma(lane.yl[4 * m + 0], float(words[m] & 0x000F), acc[0]);\n",
     "            acc[1] = fma(lane.yl[4 * m + 1], float(words[m] & 0x00F0), acc[1]);\n",
     "            acc[2] = fma(lane.yl[4 * m + 2], float(words[m] & 0x0F00), acc[2]);\n",
@@ -120,10 +111,6 @@ const ACT4_SCALAR: &str = "    return float4(p[0], p[1], p[2], p[3]);\n";
 static UNROLL: Cut = Cut {
     name: "unroll",
     edits: &[(ROWS_FIND, ROWS_UNROLL)],
-};
-static FMA: Cut = Cut {
-    name: "fma",
-    edits: &[(ACC_FIND, ACC_FMA)],
 };
 /// The row loop's walk over a SIMD group's rows, left to the compiler's choice
 /// of unrolling.
@@ -310,7 +297,7 @@ fn rows() -> Vec<Row> {
         ),
         cut: None,
     });
-    for cut in [&SCALARX, &UNROLL, &FMA, &LITE] {
+    for cut in [&SCALARX, &UNROLL, &LITE] {
         rows.push(Row {
             label: format!("lfm3 loop matvec a4 {ff}x{hidden} store [{}]", cut.name),
             shape: loop_shape(),
