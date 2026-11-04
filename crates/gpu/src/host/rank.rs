@@ -148,13 +148,11 @@ pub struct Fingerprint {
     pub rank: u16,
 }
 
-/// One round of a group: what rank 0 decides and every rank runs, the slot,
-/// the position its first token takes, the tokens, the prompt range they
-/// belong to when they are a prompt's, and whether the slot stops.
+/// One round of a group: what rank 0 decides and every rank runs, the
+/// tokens, the prompt range they belong to when they are a prompt's, and
+/// whether the group stops.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Round {
-    pub slot: u32,
-    pub pos: u32,
     pub tokens: Vec<u32>,
     pub prompt: Option<Range<u32>>,
     pub stop: bool,
@@ -561,7 +559,8 @@ impl RankSession {
             s.page = Some(page);
             return Ok(s);
         }
-        let all = paths(list, me, how.fabric.as_deref(), &mut control)?;
+        let peers: Vec<usize> = (0..n).filter(|&p| p != me).collect();
+        let all = paths(list, me, &peers, how.fabric.as_deref(), &mut control)?;
         let layout = Gathers::new(0, n, me, shapes)?;
         let page = Arc::new(MappedHost::new(
             &s.ctx,
@@ -1366,7 +1365,7 @@ fn decode_swap(b: &[u8]) -> Result<Vec<(usize, usize, Vec<u8>)>, String> {
 
 fn encode_round(r: &Round) -> Vec<u8> {
     let mut o = Out::default();
-    o.u32(r.slot).u32(r.pos).u8(u8::from(r.stop));
+    o.u8(u8::from(r.stop));
     match &r.prompt {
         Some(p) => o.u8(1).u32(p.start).u32(p.end),
         None => o.u8(0),
@@ -1376,7 +1375,7 @@ fn encode_round(r: &Round) -> Vec<u8> {
 
 fn decode_round(b: &[u8]) -> Result<Round, String> {
     let mut r = In::new(b);
-    let (slot, pos, stop) = (r.u32("slot")?, r.u32("pos")?, r.flag("stop")?);
+    let stop = r.flag("stop")?;
     let prompt = if r.flag("prompt")? {
         Some(r.u32("prompt start")?..r.u32("prompt end")?)
     } else {
@@ -1385,8 +1384,6 @@ fn decode_round(b: &[u8]) -> Result<Round, String> {
     let tokens = r.u32s("tokens")?;
     r.end()?;
     Ok(Round {
-        slot,
-        pos,
         tokens,
         prompt,
         stop,
@@ -1558,15 +1555,11 @@ mod tests {
     fn a_group_agrees_on_its_load_and_carries_rank_zeros_rounds() {
         let rounds = [
             Round {
-                slot: 0,
-                pos: 0,
                 tokens: vec![5, 6, 7],
                 prompt: Some(0..3),
                 stop: false,
             },
             Round {
-                slot: 2,
-                pos: 3,
                 tokens: vec![9],
                 prompt: None,
                 stop: true,

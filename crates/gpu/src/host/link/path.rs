@@ -52,7 +52,7 @@ impl PeerPath {
     }
 }
 
-/// The path to every other rank of `ranks` from rank `me`, in rank order,
+/// The path to each rank of `peers`, in order, from rank `me` of `ranks`,
 /// read from this node's main routing table and RoCE GID tables, and the
 /// relay flow label from the fabric manifest at `fabric` when one is given.
 /// A queue pair sends to the address its peer's end sends from, so the two
@@ -64,6 +64,7 @@ impl PeerPath {
 pub fn paths(
     ranks: &RankList,
     me: usize,
+    peers: &[usize],
     fabric: Option<&Path>,
     control: &mut Control,
 ) -> Result<Vec<PeerPath>, GpuError> {
@@ -77,7 +78,6 @@ pub fn paths(
     let table = std::fs::read_to_string("/proc/net/route")
         .map_err(|e| GpuError::link(WHAT, format!("/proc/net/route: {e}")))?;
     let routes = Route::table(&table)?;
-    let peers: Vec<usize> = (0..ranks.len()).filter(|&p| p != me).collect();
     let (mine, skipped): (Vec<Vec<PeerPath>>, Vec<Vec<String>>) = peers
         .iter()
         .map(|&peer| carried(ranks, peer, &routes, mark))
