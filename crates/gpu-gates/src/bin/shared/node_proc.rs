@@ -96,13 +96,6 @@ impl Proc {
         }
     }
 
-    /// Every stdout line the process printed and [`Proc::wait_line`] has not
-    /// taken, in order, without waiting: once the process has exited, the
-    /// rest of its output.
-    pub fn take_lines(&self) -> Vec<String> {
-        self.lines.try_iter().collect()
-    }
-
     /// The process's exit, waited for within `within`, with its stderr
     /// read to the end; `None` past it.
     pub fn wait_within(&mut self, within: Duration) -> Result<Option<ExitStatus>, GateError> {

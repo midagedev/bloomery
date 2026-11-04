@@ -661,12 +661,6 @@ impl<'a> BatchSlots<'a> {
         Ok(BatchSlots { map, nodes })
     }
 
-    /// The map the view reads.
-    #[must_use]
-    pub fn map(&self) -> &'a SlotMap {
-        self.map
-    }
-
     /// Whether tier `tier` is on a node: its entries read as the host's.
     #[must_use]
     pub fn on_node(&self, tier: usize) -> bool {
