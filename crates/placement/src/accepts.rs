@@ -401,11 +401,33 @@ pub const fn leg_card_format(ty: GgmlType) -> CardFormat {
     }
 }
 
-/// The V4.1 chain's fused card layer, in stack order: the Q3_K gate and up and
-/// the Q4_K down its fused expert kernels read (`gpu-deepseek41`'s step and
-/// batch tile launches). A layer of other types runs the common card leg
-/// ([`ds41_gate_up`], [`ds41_down`], [`ds41_pair`]).
+/// The V4.1 chain's fused card layer, in stack order: the Q3_K gate and up
+/// and the Q4_K down an expert tier's image reads (`gpu-deepseek41`'s tier
+/// launches). A stage card runs the wider fused rule ([`ds41_fused`]); a layer
+/// of other types runs the common card leg ([`ds41_gate_up`], [`ds41_down`],
+/// [`ds41_pair`]).
 pub const DS41_LEG: [GgmlType; 3] = [GgmlType::Q3_K, GgmlType::Q3_K, GgmlType::Q4_K];
+
+/// The downs the fused layer's own launches read ([`ds41_fused`]): the Q4_K an
+/// expert tier's image reads too, and the Q5_K of V4.1's first two layers,
+/// which a stage card's fused down gemv and tile launch read over the same
+/// q8_1 form the Q4_K one does.
+pub const DS41_FUSED_DOWNS: [GgmlType; 2] = [GgmlType::Q4_K, GgmlType::Q5_K];
+
+/// Whether a triple of routed stack types is V4.1's fused card layer: a Q3_K
+/// gate and up and a down of [`DS41_FUSED_DOWNS`], which `gpu-deepseek41`'s
+/// step and batch tile launches read by the down's own type.
+#[must_use]
+pub const fn ds41_fused([gate, up, down]: [GgmlType; 3]) -> bool {
+    matches!(
+        (gate, up, down),
+        (
+            GgmlType::Q3_K,
+            GgmlType::Q3_K,
+            GgmlType::Q4_K | GgmlType::Q5_K
+        )
+    )
+}
 
 /// Whether V4.1's chain runs a routed gate or up stack of type `ty` on the
 /// card: the fused layer's Q3_K or a type the common leg launches
@@ -417,22 +439,25 @@ pub const fn ds41_gate_up(ty: GgmlType) -> bool {
 
 /// Whether V4.1's chain runs a routed down stack of type `ty` on the card: a
 /// type the common leg launches over the 128-value form the chain's buffers
-/// hold ([`kernels::card_q8act_down_runs`], the fused layer's Q4_K among them).
+/// hold ([`kernels::card_q8act_down_runs`], the fused layer's downs among
+/// them).
 #[must_use]
 pub const fn ds41_down(ty: GgmlType) -> bool {
     kernels::card_q8act_down_runs(ty)
 }
 
 /// Whether V4.1's chain runs a layer of this gate·up and down type: the fused
-/// layer ([`DS41_LEG`]) or, on a stage card, the common leg's, never a mix of
-/// the two — the fused gate·up reads its Q4_K down by the fused launches
-/// alone, and the common leg has no Q3_K gate·up. An expert tier (`tier`)
-/// runs the fused layer alone: its image carries the activation's Q3_K plane
-/// and scales, which the common leg's gate·up entries do not read.
+/// layer ([`ds41_fused`]) or, on a stage card, the common leg's, never a mix
+/// of the two — the fused gate·up reads its down of [`DS41_FUSED_DOWNS`] by
+/// the fused launches alone, and the common leg has no Q3_K gate·up. An
+/// expert tier (`tier`) runs the fused layer's Q4_K triple ([`DS41_LEG`])
+/// alone: its image carries the activation's Q3_K plane and scales and a
+/// q4_K-only down, which the common leg's gate·up entries do not read and the
+/// tier's launches do not decode another down beside.
 #[must_use]
 pub const fn ds41_pair(gate_up: GgmlType, down: GgmlType, tier: bool) -> bool {
     if matches!(gate_up, GgmlType::Q3_K) {
-        matches!(down, GgmlType::Q4_K)
+        matches!(down, GgmlType::Q4_K) || (!tier && matches!(down, GgmlType::Q5_K))
     } else {
         !tier
     }
@@ -596,8 +621,9 @@ pub fn leg_down_forms(p: Program, model: &crate::placement::ModelTensors) -> ker
 /// ([`kernels::card_q8act_down_runs`]), a Q6_K down among them. The glm5next
 /// and minimax-m3 bodies', whose buffers hold the form each card layer's down
 /// reads, carry each part by its arm ([`planes_leg_gate_up`],
-/// [`planes_leg_down`]), NVFP4 in its planes. V4.1's chain runs [`DS41_LEG`]
-/// or the common leg's types ([`ds41_pair`]). A program with no routed expert puts none on a card.
+/// [`planes_leg_down`]), NVFP4 in its planes. V4.1's chain runs the fused
+/// layer ([`ds41_fused`]) or the common leg's types ([`ds41_pair`]). A program
+/// with no routed expert puts none on a card.
 #[must_use]
 pub fn routed_rule(p: Program) -> RoutedRule {
     match p {
@@ -780,14 +806,15 @@ mod tests {
     }
 
     /// V4.1's card layers over every (gate, up, down) triple of the file
-    /// format's types: the fused layer (a Q3_K gate and up, a Q4_K down) or a
-    /// gate and up of one type the common leg launches with a down it reads
-    /// over the 128-value form (IQ1_M, IQ1_S, IQ2_S, IQ2_XS, IQ2_XXS, IQ3_S,
-    /// IQ3_XXS, IQ4_XS, Q4_K, Q5_K, MXFP4 gate·up), never a Q3_K gate and up
-    /// beside another down. The plan's rule, its host-only list and the load's
-    /// check ([`leg_runs`]) read the one pair. An expert tier runs the fused
-    /// layer alone. Mutant: `leg_pair` returning `None` for V4.1 — a Q3_K gate
-    /// and up beside an IQ2_XXS or Q5_K down is carded and its load refuses.
+    /// format's types: the fused layer (a Q3_K gate and up, a Q4_K or Q5_K
+    /// down) or a gate and up of one type the common leg launches with a down
+    /// it reads over the 128-value form (IQ1_M, IQ1_S, IQ2_S, IQ2_XS, IQ2_XXS,
+    /// IQ3_S, IQ3_XXS, IQ4_XS, Q4_K, Q5_K, MXFP4 gate·up), never a Q3_K gate
+    /// and up beside another down. The plan's rule, its host-only list and the
+    /// load's check ([`leg_runs`]) read the one pair. An expert tier runs the
+    /// fused layer's Q4_K triple ([`DS41_LEG`]) alone. Mutant: `leg_pair`
+    /// returning `None` for V4.1 — a Q3_K gate and up beside an IQ2_XXS down
+    /// is carded and its load refuses.
     #[test]
     fn ds41_cards_the_fused_layer_or_the_common_legs_and_never_a_mix() {
         let (model, layers) = triples(&types());
@@ -795,7 +822,8 @@ mod tests {
         let host_only = rule.host_only(&model).expect("named stacks");
         let mut wrong = Vec::new();
         for (l, &[gate, up, down]) in layers.iter().enumerate() {
-            let fused = [gate, up, down] == DS41_LEG;
+            let fused = ds41_fused([gate, up, down]);
+            let tier_fused = [gate, up, down] == DS41_LEG;
             let common = gate == up
                 && kernels::card_gate_up_runs(gate)
                 && kernels::card_q8act_down_runs(down);
@@ -808,7 +836,8 @@ mod tests {
                 .expect("named stacks");
             let held = host_only.iter().any(|h| h.layer == l);
             let runs = leg_runs(Program::Deepseek41Chain, [gate, up, down]) == Some(true);
-            if cards != (fused || common) || held == cards || runs != cards || on_tier != fused {
+            if cards != (fused || common) || held == cards || runs != cards || on_tier != tier_fused
+            {
                 wrong.push(format!(
                     "{gate:?} {up:?} {down:?}: cards {cards}, host-only {held}"
                 ));
@@ -820,6 +849,53 @@ mod tests {
             wrong.len(),
             &wrong[..wrong.len().min(8)]
         );
+    }
+
+    /// V4.1's pair rule by its own words: the Q3_K gate·up pairs with every
+    /// down of [`DS41_FUSED_DOWNS`] on a stage card and with the Q4_K alone on
+    /// a tier, and a Q3_K gate·up beside any other down stays on the host on
+    /// either; a gate·up of another type pairs by the common leg's rule alone
+    /// (a stage card, never a tier). Mutants, each red here: the Q5_K down
+    /// admitted on a tier (the tier's image holds no q5_K decoder), the tier
+    /// arm dropped with the stage arm (a Q4_K triple refuses the tier).
+    #[test]
+    fn ds41_pairs_the_fused_gate_up_with_its_downs_by_the_card_kind() {
+        for &down in &DS41_FUSED_DOWNS {
+            assert!(ds41_pair(GgmlType::Q3_K, down, false), "{down} on a stage");
+            assert!(ds41_fused([GgmlType::Q3_K, GgmlType::Q3_K, down]), "{down}");
+            assert_eq!(
+                [GgmlType::Q3_K, GgmlType::Q3_K, down] == DS41_LEG,
+                down == GgmlType::Q4_K,
+                "the tier's own triple is the q4_K one, {down} is not"
+            );
+        }
+        assert!(ds41_pair(GgmlType::Q3_K, GgmlType::Q4_K, true));
+        assert!(!ds41_pair(GgmlType::Q3_K, GgmlType::Q5_K, true));
+        for ty in types() {
+            let downs = if matches!(ty, GgmlType::Q3_K) {
+                // The Q3_K gate·up beside a down the fused launches do not
+                // read stays on the host on either card kind.
+                vec![GgmlType::Q6_K, GgmlType::IQ2_XXS, GgmlType::Q8_0]
+            } else {
+                // A gate·up of another type pairs by the common leg's rule
+                // alone: a stage card, never a tier, whatever the down (the
+                // down's arm rules the down).
+                vec![GgmlType::Q4_K, GgmlType::Q5_K, GgmlType::Q6_K]
+            };
+            for down in downs {
+                let want = !matches!(ty, GgmlType::Q3_K);
+                assert_eq!(
+                    ds41_pair(ty, down, false),
+                    want,
+                    "{ty} gate·up with a {down} down on a stage card"
+                );
+                assert!(
+                    !ds41_pair(ty, down, true),
+                    "{ty} with a {down} down on a tier"
+                );
+                assert!(!ds41_fused([ty, ty, down]), "{ty} is not the fused gate·up");
+            }
+        }
     }
 
     /// `Body35`'s placed card leg: a Q4_K or Q5_K gate and up with a Q4_K, Q5_K

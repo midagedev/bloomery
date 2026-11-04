@@ -564,14 +564,15 @@ impl Hparams {
     /// Whether some layer's routed stacks run on the common card leg: a
     /// layer of types the chain's card experts run
     /// ([`crate::placement::accepts::leg_runs`]) that is not the fused layer
-    /// ([`crate::placement::accepts::DS41_LEG`]).
+    /// ([`crate::placement::accepts::ds41_fused`], whose q5_K down among them
+    /// the fused launches read, not the leg's).
     #[must_use]
     pub fn on_leg(&self) -> bool {
-        use crate::placement::accepts::{DS41_LEG, Program, leg_runs};
+        use crate::placement::accepts::{Program, ds41_fused, leg_runs};
         self.layers
             .iter()
             .filter_map(|k| k.routed_types)
-            .any(|t| t != DS41_LEG && leg_runs(Program::Deepseek41Chain, t) == Some(true))
+            .any(|t| !ds41_fused(t) && leg_runs(Program::Deepseek41Chain, t) == Some(true))
     }
 
     /// Everything from `split`'s headers; a missing or malformed key, or a

@@ -12,9 +12,10 @@
 //! checkpoint reserve is none (V4.1's body makes no checkpoints). The forced
 //! rooms go through the same call at the arm's context and slots.
 //!
-//! V4.1's card layers are the fused one ([`DS41_LEG`]: a Q3_K gate and up, a
-//! Q4_K down) or the common leg's types, never a mix of the two
-//! (`accepts::ds41_pair`), so the sweep holds the fused layer, the IQ1_M and
+//! V4.1's card layers are the fused one ([`DS41_LEG`] and its q5_K-down twin
+//! `accepts::ds41_fused` reads: a Q3_K gate and up, a Q4_K or Q5_K down) or
+//! the common leg's types, never a mix of the two (`accepts::ds41_pair`), so
+//! the sweep holds both fused triples, the IQ1_M and
 //! IQ2_XXS layer of the ISTA set, a leg gate and up beside the fused layer's
 //! Q4_K down, and the fused gate and up beside a leg down and a Q6_K down,
 //! which the pair rule keeps on the host.
@@ -58,6 +59,7 @@ impl Adapter for Row {
     fn extra_triples(&self) -> Vec<[GgmlType; 3]> {
         vec![
             DS41_LEG,
+            [DS41_LEG[0], DS41_LEG[1], GgmlType::Q5_K],
             [DS41_LEG[0], DS41_LEG[1], GgmlType::Q6_K],
             [GgmlType::IQ1_M, GgmlType::IQ1_M, GgmlType::IQ2_XXS],
             [DS41_LEG[0], DS41_LEG[1], GgmlType::IQ2_XXS],

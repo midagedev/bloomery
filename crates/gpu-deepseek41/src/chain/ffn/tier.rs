@@ -756,14 +756,16 @@ impl Ds41Tier {
             })?;
             let stacks = CardStacks::of(w, l)?;
             // The tier's image carries the activation's Q3_K plane and scales
-            // alone, which the common card leg's gate·up entries do not read
-            // (`accepts::ds41_pair`): the plan puts only the fused layer on a
-            // tier, and a stack of the common leg's types is refused by name.
-            if stacks.is_some_and(|s| !s.fused()) {
+            // alone, which the common card leg's gate·up entries do not read,
+            // and the tier's own launches decode a q4_K down alone
+            // (`accepts::ds41_pair` at `tier`): the plan puts only the fused
+            // layer's q4_K triple on a tier, and a stack of the common leg's
+            // types or of another down is refused by name.
+            if stacks.is_some_and(|s| !s.fused() || s.down_ty() != GgmlType::Q4_K) {
                 return Err(GpuError::Tensor {
                     what: WHAT,
                     name: names::ffn_down_exps(l),
-                    need: "the fused layer's stacks (q3_K gate and up, q4_K down) on an expert tier",
+                    need: "the fused layer with a q4_K down on an expert tier",
                 });
             }
             match (k, stacks) {
@@ -866,7 +868,9 @@ impl TierExperts for Ds41Tier {
             what: WHAT,
             missing: "the tile scratch of a tier with a tier layer (Ds41Tier::new)",
         })?;
-        enqueue_tiled_experts(gpu, &self.batch, &t, tile, io.down)
+        // No q5_K tile module: a tier layer's down is the q4_K triple's by
+        // the load's own refusal above, so the dispatch never asks for one.
+        enqueue_tiled_experts(gpu, &self.batch, None, &t, tile, io.down)
     }
 
     fn enqueue_layer(
