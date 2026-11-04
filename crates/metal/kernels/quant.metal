@@ -819,6 +819,27 @@ struct A4T {
         return lo * partial(blk, lane);
     }
 
+    // The M-row form of `partial_head`: the group's contribution to N loaded
+    // inputs (`partial_rows`'s own, so row m's is `partial`'s bits on row m's
+    // input) with the head's one scale applied to the finished contribution,
+    // `partial_head`'s own rule; THIS ORDER IS THE GATE. `lo[m]` is input m's
+    // head's scale of this block; `hi` has no M-row form, a group sitting
+    // whole inside one head.
+    template <short N>
+    static inline void partial_head_rows(const thread Words & wd,
+                                         const thread Lane * lanes,
+                                         const thread float * lo,
+                                         thread float * sum) {
+        float block[N];
+        FOR_UNROLL (short m = 0; m < N; ++m) {
+            block[m] = 0.f;
+        }
+        partial_rows<N>(wd, lanes, block);
+        FOR_UNROLL (short m = 0; m < N; ++m) {
+            sum[m] += lo[m] * block[m];
+        }
+    }
+
     static inline float2 head_scales(threadgroup const float * scales, int ib) {
         const int head = ib >> 1;
         return float2(scales[head], scales[head]);

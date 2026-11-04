@@ -952,7 +952,7 @@ pub const GDN48_MUTANTS: &[Mutant] = &[
         edits: &[(
             "for (uint head = tiisg; head < BLOOMERY_DELTA_VALUE_HEADS; head += 32u) {",
             "for (uint head = tiisg; head < 32u; head += 32u) {",
-            1,
+            2,
         )],
     },
     Mutant {
@@ -1057,7 +1057,7 @@ pub const MUTANTS: &[Mutant] = &[
         name: "tail_read",
         clause: "row_tail_reads",
         why: "the rows past the last read past the weights window",
-        edits: &[(ROW_POINTER, ROW_POINTER_RAW, 2), (EARLY_RETURN, "", 2)],
+        edits: &[(ROW_POINTER, ROW_POINTER_RAW, 3), (EARLY_RETURN, "", 3)],
     },
     Mutant {
         name: "seg_weight_offset",
@@ -1082,7 +1082,7 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[(
             "sum / float(BLOOMERY_DELTA_HEAD_COLS)",
             "sum / float(BLOOMERY_DELTA_HEAD_COLS * 2)",
-            1,
+            2,
         )],
     },
     Mutant {
@@ -1093,12 +1093,12 @@ pub const MUTANTS: &[Mutant] = &[
             (
                 "raise(faults, args.layer, BLOOMERY_FAULT_SITE_LINEAR_GATE);",
                 "",
-                1,
+                2,
             ),
             (
                 "raise(faults, layer, BLOOMERY_FAULT_SITE_LINEAR_GATE);",
                 "",
-                1,
+                2,
             ),
         ],
     },
@@ -3224,6 +3224,50 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[(
             "(int)args.rows, args.stride, tiisg);",
             "(int)args.rows, args.stride - 4u, tiisg);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mrows_headnorm_scales_swapped",
+        clause: "mrows_headnorm",
+        why: "each activation row of the M-row head-normed out projection takes the other row's head scales",
+        edits: &[(
+            "lo[m] = Q::head_scales(scales + m * BLOOMERY_DELTA_VALUE_HEADS, ib).x;",
+            "lo[m] = Q::head_scales(scales + (M - 1 - m) * BLOOMERY_DELTA_VALUE_HEADS, ib).x;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mrows_headnorm_scale_per_value",
+        clause: "mrows_headnorm",
+        why: "the head scale multiplies every loaded value of its head, not the block's finished contribution: the same sum in another order, other bits in some groups",
+        edits: &[(
+            concat!(
+                "        FOR_UNROLL (short row = 0; row < NR0; ++row) {\n",
+                "            Q::template partial_head_rows<M>(wd[row], lanes, lo, sumf[row]);\n",
+                "        }\n"
+            ),
+            concat!(
+                "        FOR_UNROLL (short m = 0; m < M; ++m) {\n",
+                "            lanes[m].sumy *= lo[m];\n",
+                "            FOR_UNROLL (short k = 0; k < 16; ++k) {\n",
+                "                lanes[m].yl[k] *= lo[m];\n",
+                "            }\n",
+                "        }\n",
+                "        FOR_UNROLL (short row = 0; row < NR0; ++row) {\n",
+                "            Q::template partial_rows<M>(wd[row], lanes, sumf[row]);\n",
+                "        }\n"
+            ),
+            1,
+        )],
+    },
+    Mutant {
+        name: "mrows_headnorm_partials_first",
+        clause: "mrows_headnorm",
+        why: "every activation row's head scales are computed from the first row's partial sums",
+        edits: &[(
+            "sum += partials[(ulong)m * pstride + head * BLOOMERY_DELTA_COLUMN_BLOCKS + j];",
+            "sum += partials[head * BLOOMERY_DELTA_COLUMN_BLOCKS + j];",
             1,
         )],
     },
