@@ -195,10 +195,12 @@ mod gate {
     /// The most the every-position call's features may sit from the steps': the RMS |Δ| over
     /// the steps' RMS |x|, every value of every position. A tap that reads another position or
     /// layer sits near or past 1; the two sum orders sit far under it.
-    // PIN(2026-10-31): the grouped GEMM's sum order; real 0.0789, fixture 0.0644 (against the step one
-    // position earlier: 0.944, 1.245), x2. Not derived: the taps sit past the layers that compound the
-    // first routed seam's sum-order distance.
-    const FEATURE_REL_PIN: f64 = 0.16;
+    // PIN(2026-11-04): with layers 0·1's routed experts on the cards, the prompt call runs them by the
+    // tile GEMM and the steps by the `_sel` gemv, so the first routed seam's sum-order distance now
+    // opens at layer 0 and every layer compounds it: real 0.1156, fixture 0.1656 (against the step one
+    // position earlier: 0.944, 1.246), x1.5. Before (2026-10-31, the seam at layer 2): real 0.0789,
+    // fixture 0.0644, pin 0.16. Not derived.
+    const FEATURE_REL_PIN: f64 = 0.25;
     /// The batches a group holds that `--batch2`'s call must run as.
     const BATCH_GROUP: usize = 2;
     /// Greedy steps after a prompt call.
