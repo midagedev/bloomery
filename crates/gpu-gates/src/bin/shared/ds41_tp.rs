@@ -23,8 +23,9 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use bloomery_gpu::Gpu;
+use bloomery_gpu::host::RemoteWire;
 use bloomery_gpu::host::rank::dist::{self, ReadRange, SourceFile};
-use bloomery_gpu::host::rank::{Bootstrap, Fingerprint, RankList, RankSession, RankWire};
+use bloomery_gpu::host::rank::{Bootstrap, Fingerprint, RankList, RankSession};
 use bloomery_gpu_deepseek41::body::{OpenCfg, RankFrom};
 use bloomery_gpu_deepseek41::chain::join;
 use bloomery_gpu_gates::GateError;
@@ -293,7 +294,7 @@ pub fn run(args: &[String], levers: &Levers) -> Result<(), GateError> {
     let how = Bootstrap {
         fabric: o.fabric.clone(),
         wait: WAIT,
-        wire: RankWire::Rdma,
+        wire: RemoteWire::Rdma,
     };
     let gpu = Gpu::new()?;
     let mut session = RankSession::open(
