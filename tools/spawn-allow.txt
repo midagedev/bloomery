@@ -50,7 +50,6 @@ crates/gpu-gates/src/bin/shared/node_proc.rs 2 a gate binary's child process, re
 crates/gpu-gates/src/bin/shared/ds41_chain_glue_gate.rs 1 a gate module, never pinned
 crates/gpu-gates/src/bin/shared/ds41_index_gate.rs 2 a gate module, never pinned
 crates/gpu-gates/src/bin/gate_deepseek41_moe.rs 1 a gate binary, never pinned
-crates/gpu-gates/src/bin/gate_deepseek41_tp.rs 1 a gate binary, never pinned: its ranks, a thread each on the one card
 crates/gpu-gates/src/bin/shared/ds41_residency.rs 1 the residency clauses of a gate binary, never pinned
 crates/gpu-gates/src/bin/shared/ds41_woa_gate.rs 1 a gate module, never pinned
 crates/gpu-gates/src/bin/gate_ds41_callstream.rs 2 a gate binary: the copy stream hold's raiser and the clause watchdog, each asleep but for one store or print

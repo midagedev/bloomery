@@ -22,19 +22,19 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use app::tp::greedy;
 use bloomery_gpu::Gpu;
 use bloomery_gpu::host::rank::dist::{self, ReadRange, SourceFile};
 use bloomery_gpu::host::rank::{Bootstrap, Fingerprint, RankList, RankSession, RankWire};
-use bloomery_gpu_deepseek41::body::{self, OpenCfg, RankFrom};
+use bloomery_gpu_deepseek41::body::{OpenCfg, RankFrom};
 use bloomery_gpu_deepseek41::chain::join;
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::record::{self, Record};
+
+use crate::ds41_rank::rank_greedy;
 use bloomery_levers::Levers;
 use gguf::digest::{Sha256, hex, unhex};
 use model::arch::deepseek41::hparams::Hparams;
-use model::arch::deepseek41::tp::{TpUnits, cut_of, rank_span};
-use model::placement::HEAD_TENSOR;
+use model::arch::deepseek41::tp::{TpUnits, cut_of};
 use model_hf::arch::deepseek41::rank_reads;
 use model_hf::folder::{self, Opened};
 
@@ -310,80 +310,47 @@ pub fn run(args: &[String], levers: &Levers) -> Result<(), GateError> {
         .iter()
         .find(|(k, _)| *k == "ctx")
         .map_or(want_ctx, |&(_, v)| v as usize);
-    let (_, head) = header.find(HEAD_TENSOR).ok_or("the folder holds no head")?;
-    let vocab_at = rank_span(&head.name, head.ty, &head.dims, &u, o.rank, ranks)?
-        .map_or(0, |(_, at)| at.start);
-    let sums = session.sums();
-    let t_load = Instant::now();
-    // A rank whose load fails tells the group, so every rank names it.
-    let mut m = body::open_rank(
-        gpu,
-        RankFrom {
-            file: header,
-            source: &source,
-            stored: Some(&rows),
-        },
-        (o.rank, ranks),
-        sums,
-        ctx,
-        cfg.body,
-    )
-    .map_err(|e| session.fail(&format!("its load: {e}")))?;
-    let load_s = t_load.elapsed().as_secs_f64();
     let prompt = match (o.rank, &o.text) {
         (0, Some(text)) => tokenizer.encode(text, true, false),
         (0, None) => crate::drive::depth_ids(o.depth),
         _ => Vec::new(),
     };
-    let (mut prompt_s, mut decode_s, mut prompted, mut decoded) = (0.0, 0.0, 0usize, 0usize);
-    let tokens = greedy(
+    let (mut prompt_t, mut decode_t, mut prompted, mut decoded) =
+        (Duration::ZERO, Duration::ZERO, 0usize, 0usize);
+    let (tokens, m, load) = rank_greedy(
+        gpu,
         &mut session,
-        o.rank,
-        u32::try_from(vocab_at)?,
-        (&prompt, o.n),
-        |round| {
-            let t = Instant::now();
-            let mut pick = 0;
-            for &id in &round.tokens {
-                pick = m.step(&[id])?;
-            }
-            let logits = m.logits().map(|l| (pick, l));
-            match round.prompt {
-                Some(_) => {
-                    prompt_s += t.elapsed().as_secs_f64();
-                    prompted += round.tokens.len();
-                }
-                None => {
-                    decode_s += t.elapsed().as_secs_f64();
-                    decoded += round.tokens.len();
-                }
-            }
-            logits
+        (o.rank, ranks),
+        RankFrom {
+            file: header,
+            source: &source,
+            stored: Some(&rows),
         },
-    );
-    let tokens = match tokens {
-        Ok(tokens) => tokens,
-        Err(e) => {
-            // A release that did not settle leaves a card waiting on the page: dropping the
-            // model would synchronize that wait for good.
-            if matches!(e, bloomery_gpu::host::rank::RankError::Unsettled { .. }) {
-                std::mem::forget(m);
+        (ctx, cfg.body),
+        (&prompt, o.n),
+        |round, _, took| match round.prompt {
+            Some(_) => {
+                prompt_t += took;
+                prompted += round.tokens.len();
             }
-            return Err(e.into());
-        }
-    };
+            None => {
+                decode_t += took;
+                decoded += round.tokens.len();
+            }
+        },
+    )?;
     Record::new(&record::TP_RUN)
         .u("rank", o.rank)
         .u("ranks", ranks)
         .u("ctx", ctx)
-        .f("load_s", load_s)
+        .f("load_s", load.as_secs_f64())
         .u("resident_bytes", m.resident_bytes())
         .u("prompt", prompted)
-        .f("prompt_s", prompt_s)
+        .f("prompt_s", prompt_t.as_secs_f64())
         .u("decoded", decoded)
         .f(
             "decode_tps",
-            decoded as f64 / decode_s.max(f64::MIN_POSITIVE),
+            decoded as f64 / decode_t.as_secs_f64().max(f64::MIN_POSITIVE),
         )
         .print();
     if o.rank == 0 {

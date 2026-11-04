@@ -76,7 +76,6 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bloomery_gpu::head::Head;
-use bloomery_gpu::host::Gathers;
 use bloomery_gpu::host::node::{NodeFamily, NodeOpen};
 use bloomery_gpu::host::nvtier::NvTier;
 use bloomery_gpu::host::rank::Sums;
@@ -91,9 +90,7 @@ use bloomery_gpu::hybrid::{
 };
 use bloomery_gpu::model::{ChainBody, HostServed, Resident, Rollback, Rows};
 use bloomery_gpu::weights::Weights;
-use bloomery_gpu::{
-    DeviceTensor, Gpu, GpuError, GpuModel, MappedHost, PartedBuffer, capturing, window,
-};
+use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel, PartedBuffer, capturing, window};
 use bloomery_levers::{ChurnHosting, HostCfg, ResidencyAt};
 use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy, IntoResult, PinnedHostBuffer, sys};
 use gguf::Split;
@@ -1319,15 +1316,6 @@ impl Body {
     /// each with the kind of the pass it ended; the log keeps its capacity.
     pub fn take_residency_passes(&mut self) -> Vec<(PassKind, PassReport)> {
         self.residency_glue.take_passes()
-    }
-
-    /// The page of the rank's side of the ranks' sums and its layout, for the
-    /// link that joins it to the other ranks' (a loopback's,
-    /// `bloomery_gpu::host::GatherLoop`); `None` on a whole load and on one
-    /// rank.
-    #[must_use]
-    pub fn rank_link(&self) -> Option<(&Gathers, &Arc<MappedHost>)> {
-        self.join.as_ref().map(Sums::link)
     }
 
     /// The rows the last [`ChainBody::decode_input`] read for its step: its

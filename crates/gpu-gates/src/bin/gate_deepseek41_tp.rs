@@ -1,13 +1,14 @@
 //! The tensor-parallel V4.1 body (`bloomery_gpu_deepseek41::body::open_rank`) on the
 //! original-format fixture folder (`<fixture root>/v41-folder`, written by
-//! `model_hf::arch::deepseek41::fixture`): every rank a thread and a handle of its own on the one
-//! visible card, reading its part of each tensor as the model's cut gives it, their sum pages
-//! joined by a loopback past one rank.
+//! `model_hf::arch::deepseek41::fixture`) on the one visible card, each rank reading its part of
+//! each tensor as the model's cut gives it.
 //!
-//! The ranks share the card's primary context, and a rank's wait for the others' parts is a stream
-//! memory op the driver's scheduler does not see: two ranks' streams on one hardware queue hold
-//! each other, the wait in front of the part it waits for. So the gate runs only under the
-//! driver's most queues, `CUDA_DEVICE_MAX_CONNECTIONS=32`, which its recipe sets.
+//! Past one rank every rank is a process of its own (this binary under [`CHILD`]), joined as a
+//! deployment joins them: a rank group over the rank file's control addresses on the loopback
+//! (`bloomery_gpu::host::rank::RankSession`), its gathers on TCP ends (`RankWire::Tcp`), its
+//! rounds and picks by the group's greedy run (`app::tp::greedy`). A rank's wait for the others'
+//! parts is a stream memory op; each process holds a context of its own, whose queues no other
+//! rank's work stands in, so one rank's wait never holds another rank's part.
 //!
 //! - (n1) one rank reads the folder whole and runs [`STEPS`] greedy steps from [`FIRST`]: every
 //!   logit is finite. No one-card run is its reference: the one-card body reads a GGUF split and
@@ -32,18 +33,26 @@ fn main() {}
 mod gate_card;
 
 #[cfg(feature = "deepseek41")]
-mod gate {
-    use std::sync::{Arc, mpsc};
+#[path = "shared/ds41_rank.rs"]
+mod ds41_rank;
 
-    use bloomery_gpu::head::{local_pick, merge};
-    use bloomery_gpu::host::rank::Sums;
-    use bloomery_gpu::host::{GatherLoop, Gathers, PostCols};
-    use bloomery_gpu::{Gpu, MappedHost};
-    use bloomery_gpu_deepseek41::body::{self, Deepseek41Model, OpenCfg, RankFrom};
+#[cfg(feature = "deepseek41")]
+mod gate {
+    use std::net::{Ipv4Addr, TcpListener};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::time::Duration;
+
+    use crate::ds41_rank::rank_greedy;
+    use bloomery_gpu::Gpu;
+    use bloomery_gpu::host::node::wire::{In, Out};
+    use bloomery_gpu::host::rank::{Bootstrap, Fingerprint, RankList, RankSession, RankWire};
+    use bloomery_gpu_deepseek41::body::{self, OpenCfg, RankFrom};
     use bloomery_gpu_deepseek41::chain::join;
     use bloomery_gpu_gates::GateError;
     use bloomery_gpu_gates::logits_band::{self, Positions};
     use bloomery_levers::{CARD_BUDGET, ENGRAM_HELPER};
+    use gguf::digest::Sha256;
     use model::arch::deepseek41::hparams::Hparams;
     use model_hf::folder::{self, Opened};
 
@@ -55,26 +64,26 @@ mod gate {
     const CTX: usize = 64;
     /// The fixture folder under the fixture root.
     const FOLDER: &str = "v41-folder";
-    /// The hardware queues the driver gives the ranks' streams (`CUDA_DEVICE_MAX_CONNECTIONS`).
-    const CONNECTIONS: &str = "32";
+    /// The first argument of a rank's process: `CHILD <rank> <rank file> <out file>`.
+    const CHILD: &str = "--rank-of";
+    /// How long a rank waits for the others at the group's open.
+    const WAIT: Duration = Duration::from_secs(120);
 
     /// One run's steps: each step's token and the ranks' logits laid in rank order.
     type Run = Vec<(u32, Vec<f32>)>;
 
     pub fn run() -> Result<(), GateError> {
-        let queues = std::env::var("CUDA_DEVICE_MAX_CONNECTIONS");
-        if queues.as_deref() != Ok(CONNECTIONS) {
-            return Err(format!(
-                "gate_deepseek41_tp: CUDA_DEVICE_MAX_CONNECTIONS is {queues:?}; the ranks' streams \
-                 each need a hardware queue, so the gate runs under {CONNECTIONS} (its recipe)"
-            )
-            .into());
-        }
         let levers = bloomery_levers::at_main(&[ENGRAM_HELPER, CARD_BUDGET])?;
         crate::gate_card::init()?;
         let cfg = OpenCfg::from_levers(&levers)?;
         let dir = format!("{}/{FOLDER}", refset::fixture::root()?);
-        let one = run_ranks(&dir, &cfg, 1)?;
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        if let [child, rank, list, out] = args.as_slice()
+            && child == CHILD
+        {
+            return rank_process(&dir, &cfg, rank.parse()?, Path::new(list), Path::new(out));
+        }
+        let one = one_rank(&dir, &cfg)?;
         let finite = one.iter().all(|(_, l)| l.iter().all(|v| v.is_finite()));
         println!(
             "(n1) one rank, {STEPS} steps from {FIRST}: tokens {:?}, every logit finite {finite}: {}",
@@ -83,7 +92,7 @@ mod gate {
         );
         let mut pass = finite;
         for ranks in [2, 4] {
-            let got = run_ranks(&dir, &cfg, ranks)?;
+            let got = run_group(ranks)?;
             let walk = logits_band::walk(
                 &format!("(n{ranks}) against (n1)"),
                 positions(&one).as_view(),
@@ -120,132 +129,178 @@ mod gate {
         }
     }
 
-    /// Rank `r` of `ranks` of the folder at `dir` opened on a context of its own, with its sums
-    /// on a page of its own past one rank.
-    fn open_rank(
-        dir: &str,
-        cfg: &OpenCfg,
-        r: usize,
-        ranks: usize,
-    ) -> Result<Deepseek41Model, GateError> {
+    /// [`STEPS`] greedy steps from [`FIRST`] on one rank that reads the folder at `dir` whole.
+    fn one_rank(dir: &str, cfg: &OpenCfg) -> Result<Run, GateError> {
         let Opened {
             header,
             source,
             rows,
             ..
         } = folder::open(dir.as_ref()).map_err(|e| format!("open {dir}: {e}"))?;
-        let gpu = Gpu::new()?;
-        let sums = (ranks > 1)
-            .then(|| {
-                let hp = Hparams::read(&header).map_err(|e| e.to_string())?;
-                Ok::<_, GateError>(Sums::new(gpu.context(), r, ranks, &join::shapes(&hp)?)?)
+        let from = RankFrom {
+            file: header,
+            source: &source,
+            stored: Some(&rows),
+        };
+        let mut m = body::open_rank(Gpu::new()?, from, (0, 1), None, CTX, cfg.body)?;
+        let (mut token, mut out) = (FIRST, Vec::with_capacity(STEPS));
+        for _ in 0..STEPS {
+            token = m.step(&[token])?;
+            out.push((token, m.logits()?));
+        }
+        Ok(out)
+    }
+
+    /// [`STEPS`] greedy steps from [`FIRST`] on `ranks` ranks, each a process of its own
+    /// ([`rank_process`]) on a rank file of loopback addresses: at each step the group's token and
+    /// the ranks' logits laid in rank order. Any rank that fails fails the run, by its exit.
+    fn run_group(ranks: usize) -> Result<Run, GateError> {
+        let scratch =
+            std::env::temp_dir().join(format!("gate_deepseek41_tp-{}-{ranks}", std::process::id()));
+        std::fs::create_dir_all(&scratch)?;
+        let got = group_in(&scratch, ranks);
+        std::fs::remove_dir_all(&scratch)?;
+        got
+    }
+
+    fn group_in(scratch: &Path, ranks: usize) -> Result<Run, GateError> {
+        // A port the system has free for rank 0's control listener; every rank its own loopback
+        // address, on which its TCP ends listen.
+        let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?
+            .local_addr()?
+            .port();
+        let list: String = (0..ranks)
+            .map(|r| format!("127.0.0.{}:{port} 127.0.1.{}\n", r + 1, r + 1))
+            .collect();
+        let list_path = scratch.join("ranks");
+        std::fs::write(&list_path, list)?;
+        let exe = std::env::current_exe()?;
+        let outs: Vec<PathBuf> = (0..ranks)
+            .map(|r| scratch.join(format!("rank{r}")))
+            .collect();
+        let children = outs
+            .iter()
+            .enumerate()
+            .map(|(r, out)| {
+                Command::new(&exe)
+                    .arg(CHILD)
+                    .arg(r.to_string())
+                    .arg(&list_path)
+                    .arg(out)
+                    .spawn()
             })
-            .transpose()?;
-        Ok(body::open_rank(
+            .collect::<Result<Vec<_>, _>>()?;
+        let failed: Vec<String> = children
+            .into_iter()
+            .enumerate()
+            .filter_map(|(r, mut c)| match c.wait() {
+                Ok(s) if s.success() => None,
+                Ok(s) => Some(format!("rank {r} of {ranks}: {s}")),
+                Err(e) => Some(format!("rank {r} of {ranks}: {e}")),
+            })
+            .collect();
+        if !failed.is_empty() {
+            return Err(failed.join("; ").into());
+        }
+        let mut parts = outs
+            .iter()
+            .map(|p| read_part(&std::fs::read(p)?))
+            .collect::<Result<Vec<_>, GateError>>()?;
+        let tokens = std::mem::take(&mut parts[0].0);
+        if tokens.len() != STEPS || parts.iter().any(|(_, l)| l.len() != STEPS) {
+            return Err(format!("{ranks} ranks: not {STEPS} steps of every rank").into());
+        }
+        Ok(tokens
+            .into_iter()
+            .enumerate()
+            .map(|(i, t)| {
+                (
+                    t,
+                    parts
+                        .iter()
+                        .flat_map(|(_, l)| l[i].iter().copied())
+                        .collect(),
+                )
+            })
+            .collect())
+    }
+
+    /// Rank `rank` of the rank file at `list` over the folder at `dir`: the group's open on TCP
+    /// ends, then [`rank_greedy`], rank 0 feeding [`FIRST`]; the rank's
+    /// logits at each step, and rank 0's tokens, written to `out` ([`write_part`]).
+    fn rank_process(
+        dir: &str,
+        cfg: &OpenCfg,
+        rank: usize,
+        list: &Path,
+        out: &Path,
+    ) -> Result<(), GateError> {
+        let list = RankList::read(list)?;
+        let ranks = list.len();
+        let Opened {
+            header,
+            source,
+            rows,
+            ..
+        } = folder::open(dir.as_ref()).map_err(|e| format!("open {dir}: {e}"))?;
+        let hp = Hparams::read(&header).map_err(|e| e.to_string())?;
+        // Every rank reads the same folder: its path is the source's identity.
+        let mut h = Sha256::new();
+        h.update(dir.as_bytes());
+        let fp = Fingerprint {
+            source: h.finish(),
+            headers: [0; 32],
+            form: 0,
+            build: bloomery_gpu_gates::rank_build()?,
+            n: u16::try_from(ranks)?,
+            rank: u16::try_from(rank)?,
+        };
+        let how = Bootstrap {
+            fabric: None,
+            wait: WAIT,
+            wire: RankWire::Tcp,
+        };
+        let gpu = Gpu::new()?;
+        let mut session =
+            RankSession::open(&gpu, &list, rank, &how, &fp, &[], &join::shapes(&hp)?)?;
+        let mut logits = Vec::with_capacity(STEPS);
+        let prompt = if rank == 0 { vec![FIRST] } else { Vec::new() };
+        let (tokens, _, _) = rank_greedy(
             gpu,
+            &mut session,
+            (rank, ranks),
             RankFrom {
                 file: header,
                 source: &source,
                 stored: Some(&rows),
             },
-            (r, ranks),
-            sums,
-            CTX,
-            cfg.body,
-        )?)
+            (CTX, cfg.body),
+            (&prompt, STEPS),
+            |_, l, _| logits.push(l.to_vec()),
+        )?;
+        std::fs::write(out, write_part(&tokens, &logits))?;
+        Ok(())
     }
 
-    /// [`STEPS`] greedy steps from [`FIRST`] on `ranks` ranks of the folder at `dir`, each opened
-    /// and stepped on a thread of its own ([`open_rank`]), their pages joined by a loopback past one
-    /// rank: at each step the merge of the ranks' picks (`bloomery_gpu::head::merge`) and the
-    /// ranks' logits laid in rank order.
-    fn run_ranks(dir: &str, cfg: &OpenCfg, ranks: usize) -> Result<Run, GateError> {
-        type Link = Option<(Gathers, Arc<MappedHost>)>;
-        std::thread::scope(|scope| -> Result<_, GateError> {
-            let (links_tx, links_rx) = mpsc::channel::<(usize, Result<Link, String>)>();
-            let (out_tx, out_rx) = mpsc::channel::<(usize, Result<(u32, Vec<f32>), String>)>();
-            let mut tokens = Vec::with_capacity(ranks);
-            for r in 0..ranks {
-                let (tok_tx, tok_rx) = mpsc::channel::<u32>();
-                tokens.push(tok_tx);
-                let (links_tx, out_tx) = (links_tx.clone(), out_tx.clone());
-                scope.spawn(move || {
-                    let opened = open_rank(dir, cfg, r, ranks);
-                    let mut m = match opened {
-                        Ok(m) => m,
-                        Err(e) => {
-                            let _ = links_tx.send((r, Err(e.to_string())));
-                            return;
-                        }
-                    };
-                    let link = m.body("gate_deepseek41_tp").map(|b| {
-                        b.rank_link()
-                            .map(|(layout, page)| (layout.clone(), Arc::clone(page)))
-                    });
-                    let _ = links_tx.send((r, link.map_err(|e| e.to_string())));
-                    while let Ok(token) = tok_rx.recv() {
-                        let logits = m
-                            .step(&[token])
-                            .and_then(|id| Ok((id, m.logits()?)))
-                            .map_err(|e| e.to_string());
-                        let failed = logits.is_err();
-                        let _ = out_tx.send((r, logits));
-                        if failed {
-                            return;
-                        }
-                    }
-                });
-            }
-            drop((links_tx, out_tx));
-            let mut links: Vec<Link> = vec![None; ranks];
-            for _ in 0..ranks {
-                let (r, link) = links_rx.recv().map_err(|e| e.to_string())?;
-                links[r] = link.map_err(|e| format!("rank {r} of {ranks}: {e}"))?;
-            }
-            let ring = if ranks > 1 {
-                let (layouts, pages): (Vec<_>, Vec<_>) = links
-                    .into_iter()
-                    .map(|l| l.ok_or("a rank of several without a sum page"))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_iter()
-                    .unzip();
-                Some(GatherLoop::new(&layouts, &pages, &PostCols::default())?)
-            } else {
-                None
-            };
-            let mut token = FIRST;
-            let mut out = Vec::with_capacity(STEPS);
-            for _ in 0..STEPS {
-                for tx in &tokens {
-                    tx.send(token).map_err(|e| e.to_string())?;
-                }
-                let mut parts = vec![(0, Vec::new()); ranks];
-                for _ in 0..ranks {
-                    let (r, logits) = out_rx.recv().map_err(|e| e.to_string())?;
-                    match logits {
-                        Ok(l) => parts[r] = l,
-                        Err(e) => {
-                            // A rank still waiting on the failed rank's part runs on.
-                            let released = ring.as_ref().map(GatherLoop::release);
-                            drop(tokens);
-                            return Err(format!(
-                                "rank {r} of {ranks}: {e} (link released: {released:?})"
-                            )
-                            .into());
-                        }
-                    }
-                }
-                let mut picks = Vec::with_capacity(ranks);
-                let mut at = 0u32;
-                for (id, p) in &parts {
-                    picks.push(local_pick(p, *id, at)?);
-                    at += u32::try_from(p.len())?;
-                }
-                token = merge(&picks)?;
-                out.push((token, parts.into_iter().flat_map(|(_, p)| p).collect()));
-            }
-            drop(tokens);
-            Ok(out)
-        })
+    /// A rank's part of a run as its process writes it: the tokens (rank 0's; none on another
+    /// rank), then each step's logits as their bits.
+    fn write_part(tokens: &[u32], logits: &[Vec<f32>]) -> Vec<u8> {
+        let mut o = Out::default();
+        o.u32s(tokens).len(logits.len());
+        for l in logits {
+            o.u32s(&l.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+        }
+        o.done().to_vec()
+    }
+
+    /// [`write_part`]'s tokens and logits.
+    fn read_part(b: &[u8]) -> Result<(Vec<u32>, Vec<Vec<f32>>), GateError> {
+        let mut r = In::new(b);
+        let tokens = r.u32s("tokens")?;
+        let logits = (0..r.len("steps")?)
+            .map(|_| Ok(r.u32s("logits")?.into_iter().map(f32::from_bits).collect()))
+            .collect::<Result<Vec<_>, String>>()?;
+        r.end()?;
+        Ok((tokens, logits))
     }
 }
