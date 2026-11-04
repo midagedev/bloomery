@@ -218,6 +218,7 @@ pub(super) fn totals<'a>(
         arena_columns: 1,
         table_bytes: host_tables,
         shadow_bytes,
+        stage_kv_bytes: 0,
         reserve_bytes,
         row_reserve_bytes: row_reserve,
         pool_card_bytes: if machine.unified().is_some() {
@@ -306,6 +307,14 @@ impl Plan<'_> {
                 .ok_or_else(|| card.bytes_past_u64()),
             None => Ok(Some(*bytes)),
         }
+    }
+
+    /// The host stage's cache of `bytes`, out of the host's headroom: the
+    /// host's need counts it with the ring shadows
+    /// ([`workstation::HostNeed::shadows`]).
+    pub(super) fn host_stage_kv(&mut self, bytes: u64) {
+        self.host.stage_kv_bytes = bytes;
+        self.host.headroom_bytes -= i128::from(bytes);
     }
 
     pub(super) fn reserve_beside(&mut self, reserve: u64) -> Result<(), PlacementError> {

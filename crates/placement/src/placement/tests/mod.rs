@@ -11,6 +11,7 @@ use super::*;
 mod bounds;
 mod early;
 mod floor;
+mod host_stage;
 mod legs;
 
 /// A plan of no rows under `budget`, for a planner [`plan_in_pool`]
@@ -30,6 +31,7 @@ fn budget_plan<'a>(model: &'a ModelTensors, machine: &'a Machine, budget: u64) -
             arena_columns: 1,
             table_bytes: 0,
             shadow_bytes: 0,
+            stage_kv_bytes: 0,
             reserve_bytes: 0,
             row_reserve_bytes: 0,
             pool_card_bytes: 0,

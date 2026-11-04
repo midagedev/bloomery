@@ -561,6 +561,7 @@ dependencies = [
  "bloomery-gguf",
  "bloomery-jinja",
  "bloomery-models",
+ "bloomery-runtime",
  "bloomery-sampler",
  "bloomery-threads",
  "bloomery-tokenizer",

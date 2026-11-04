@@ -5,7 +5,8 @@
 //! model-aware layers live here — the hyperparameters and the values this chain
 //! refuses (`hparams`), tensor resolution (`plan`) over the name table
 //! (`names`), the load-time weight state (`derived`), the layer chain
-//! (`forward`), and the attention this architecture uses (`attn`, MLA).
+//! (`forward`), the attention this architecture uses (`attn`, MLA) and the forward as a
+//! `runtime::Target` (`target`).
 
 pub mod attn;
 pub mod derived;
@@ -13,3 +14,4 @@ pub mod forward;
 pub mod hparams;
 pub mod names;
 pub mod plan;
+pub mod target;

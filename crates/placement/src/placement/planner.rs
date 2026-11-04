@@ -233,6 +233,8 @@ fn plan_rule<'a>(
     }
     machine.pool_bytes()?;
     let stages = Stages::new(model.layers, &machine.cards)?;
+    // The host stage runs its routed stacks on the host: no card holds an expert.
+    let routed = if stages.host { None } else { routed };
     let mut rows: Vec<Option<Row>> = vec![None; model.tensors.len()];
     let mut stacks: Vec<Vec<usize>> = vec![Vec::new(); model.layers];
     for (i, t) in model.tensors.iter().enumerate() {
@@ -365,6 +367,9 @@ fn plan_rule<'a>(
         (n_l, tier_n_l),
         card_budget.clone(),
     )?;
+    if stages.host {
+        plan.host_stage_kv(host_stage_kv(model, ctx_max, kv)?);
+    }
     plan.reserve_beside(reserve)?;
     Ok(plan)
 }
@@ -478,6 +483,24 @@ fn resolve_shares(
         .map(|(&(ordinal, floor), x)| (ordinal, floor + x))
         .collect();
     Ok(card_budget::CardBudget::Per(per))
+}
+
+/// The host stage's cache: its layers' [`KvBytes::layer_bytes`] and the
+/// position rows beside it, held in host memory.
+fn host_stage_kv(
+    model: &ModelTensors,
+    ctx_max: u64,
+    kv: &dyn KvBytes,
+) -> Result<u64, PlacementError> {
+    let past = || PlacementError::Metadata {
+        key: "host stage cache".to_owned(),
+        detail: format!("the cache of {} layers passes u64 bytes", model.layers),
+    };
+    (0..model.layers)
+        .map(|l| kv.layer_bytes(l, ctx_max))
+        .chain([kv.stage_position_bytes(ctx_max)])
+        .try_fold(0u64, u64::checked_add)
+        .ok_or_else(past)
 }
 
 /// A card's KV cache and its ring shadows over the layers its stage runs,

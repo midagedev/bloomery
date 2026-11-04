@@ -1111,7 +1111,8 @@ pub fn spec_of(card: &Card) -> Option<CardSpec> {
 pub struct HostNeed {
     pub experts: u64,
     pub tables: u64,
-    /// Pinned ring buffers, including the part loader's upload staging at load time.
+    /// Pinned ring buffers, including the part loader's upload staging at load time, and a host
+    /// stage's cache (`HostTotals::stage_kv_bytes`).
     pub shadows: u64,
     pub reserves: u64,
     pub extra: u64,
@@ -1157,7 +1158,7 @@ impl HostNeed {
         HostNeed {
             experts: totals.expert_bytes,
             tables: totals.table_bytes,
-            shadows: totals.shadow_bytes,
+            shadows: totals.shadow_bytes.saturating_add(totals.stage_kv_bytes),
             reserves: totals.reserve_bytes.saturating_sub(reads),
             extra,
             read_ahead: reads,

@@ -181,10 +181,15 @@ pub struct HostTotals {
     /// capped at the step port's width, set by the plan's maker before the
     /// split runs; 1 for a plan that steps one column.
     pub arena_columns: u64,
-    /// Row-gathered tables held on the host.
+    /// Dense tensors held on the host: the row-gathered tables, and with no
+    /// stage card every tensor the host stage runs, the file's bytes in
+    /// place.
     pub table_bytes: u64,
     /// The cards' ring shadows, page-locked ([`KvBytes::shadow_bytes`]).
     pub shadow_bytes: u64,
+    /// The host stage's cache ([`KvBytes::layer_bytes`] over its layers and
+    /// the position rows beside it); 0 with a stage card.
+    pub stage_kv_bytes: u64,
     /// The machine's host reserves and [`HostTotals::row_reserve_bytes`],
     /// and on a plan the NVMe expert tier split, the prompt run-ahead's
     /// page-cache window ([`expert_nvme_tier`]).

@@ -1,6 +1,6 @@
 //! `bloomery-serve-metal` — the llama-server-compatible HTTP API on this
 //! Mac's Metal device: a model opened as `generate_metal` opens it, served
-//! by `bloomery_metal::server::TargetEngine`.
+//! by `serve::TargetEngine`.
 //!
 //!     bloomery-serve-metal (-m PATH | --hf REPO) [--host 127.0.0.1]
 //!                          [--port 8080] [--ctx C]
@@ -53,13 +53,14 @@ mod cli {
     use bloomery_metal::MetalDevice;
     use bloomery_metal::arch::qwen3moe::session::{CHECKPOINT_EVERY, MarkCopies, Session};
     use bloomery_metal::model_arg;
-    use bloomery_metal::server::TargetEngine;
     use hf::source::Source;
     use model_hf::ModelFile;
     use serve::flag::{self, ApiKeys};
     use serve::sampling::sampler_factory;
     use serve::vocab::{ChatSurface, TemplateFile, Vocab};
-    use serve::{EngineProps, FATAL_LINGER, ServeError, Server, ServerConfig, SlotConfig};
+    use serve::{
+        EngineProps, FATAL_LINGER, ServeError, Server, ServerConfig, SlotConfig, TargetEngine,
+    };
 
     /// The cache rows' default cap.
     const CTX_DEFAULT: usize = 32768;

@@ -29,6 +29,9 @@ bloomery-jinja = { path = "../jinja" }
 # The tool-call markup of a format is its description's (`models::function_xml`): the scanner reads a reply by
 # the strings the template table names a file's format by.
 bloomery-models = { path = "../models" }
+# The generation target `TargetEngine` serves (`runtime::Target`): host only, its one dependency the
+# model description.
+bloomery-runtime = { path = "../runtime" }
 # The file's vocabulary as the server's `Tokenizer` (`vocab::Vocab`), and the sampler crate's chain as
 # the server's sampler factory (`sampling::sampler_factory`): every seat's, the CUDA seats' and Metal's.
 bloomery-tokenizer = { path = "../tokenizer" }

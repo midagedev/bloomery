@@ -74,6 +74,11 @@ pub enum Program {
     /// beside a shared expert; its MLA layers read the latent cache and the
     /// lightning indexer's keys the description names.
     MistralLarge4Body,
+    /// The host engine (`crates/model`): no card, every layer, the head and the embedding on the
+    /// host stage, the matmuls the fused `qdot` kernels run and the routed stacks resident on
+    /// the host. No architecture picks it ([`program_of`]): a start with no card, or one that asks
+    /// for the host, checks a file against its rows alone ([`crate::kernels::host_stack`]).
+    Host,
 }
 
 /// The program that runs `arch`'s layers; `None` when none does.
@@ -121,6 +126,7 @@ impl Program {
             Self::MuseSparkBody => "musespark",
             Self::FlintBody => "flint",
             Self::MistralLarge4Body => "mistrallarge4",
+            Self::Host => "host",
         }
     }
 }
@@ -550,7 +556,8 @@ pub fn leg_arms(p: Program) -> Option<LegArms> {
             gate_up: |ty| ty == MUSESPARK_LEG,
             down: |ty| ty == MUSESPARK_LEG,
         }),
-        Program::NemotronHBody | Program::GemmaEmbedding2Body => None,
+        // The host stage holds every stack on the host: no card leg.
+        Program::NemotronHBody | Program::GemmaEmbedding2Body | Program::Host => None,
     }
 }
 
@@ -668,7 +675,9 @@ pub fn routed_rule(p: Program) -> RoutedRule {
             pair: leg_pair(p),
         },
         // No routed stack: every one is refused by name.
-        Program::NemotronHBody | Program::GemmaEmbedding2Body => RoutedRule::PerType(|_| None),
+        Program::NemotronHBody | Program::GemmaEmbedding2Body | Program::Host => {
+            RoutedRule::PerType(|_| None)
+        }
     }
 }
 

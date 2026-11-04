@@ -174,6 +174,24 @@ impl KvCache {
         );
     }
 
+    /// Take back every position from `n` on: the slot table and each block's rows, which a
+    /// `begin` and `push` grew together. Positions below `n` are untouched, so the cache stands
+    /// as it did after `n` positions were fed (rows are causal: none reads a later one).
+    ///
+    /// # Panics
+    /// If `n` is past the positions held.
+    pub fn truncate(&mut self, n: usize) {
+        assert!(
+            n <= self.slots.len(),
+            "a cut to {n} positions of {}",
+            self.slots.len()
+        );
+        self.slots.truncate(n);
+        for rows in &mut self.rows {
+            rows.truncate(n * self.width);
+        }
+    }
+
     /// The next position for `seq`, i.e. how many of its tokens are already cached.
     ///
     /// Derived from the table rather than counted separately: one source of truth for
@@ -187,5 +205,36 @@ impl KvCache {
             .map(|s| s.pos + 1)
             .max()
             .unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{KvCache, Slot};
+
+    /// A cut takes back the slot table and every block's rows together, leaves the positions
+    /// below it as they were, and the next `begin` lands at the cut. Mutant: rows kept past the
+    /// cut trip `push`'s block-at-row assert.
+    #[test]
+    fn a_cut_takes_back_slots_and_rows_together() {
+        let mut cache = KvCache::new(2, 3);
+        let slots: Vec<Slot> = (0..4).map(|pos| Slot { seq: 0, pos }).collect();
+        let range = cache.begin(&slots);
+        for b in 0..2 {
+            let rows: Vec<u16> = (0..12).map(|i| i + 100 * b as u16).collect();
+            cache.push(b, &range, &rows);
+        }
+        cache.truncate(2);
+        assert_eq!((cache.len(), cache.next_pos(0)), (2, 2));
+        assert_eq!(cache.keys(1).as_slice(), [100, 101, 102, 103, 104, 105]);
+        let range = cache.begin(&[Slot { seq: 0, pos: 2 }]);
+        assert_eq!(range, 2..3);
+        for b in 0..2 {
+            cache.push(b, &range, &[7, 8, 9]);
+        }
+        assert_eq!(cache.keys(0).row(2), [7, 8, 9]);
+        cache.truncate(0);
+        assert!(cache.is_empty());
+        assert_eq!(cache.next_pos(0), 0);
     }
 }

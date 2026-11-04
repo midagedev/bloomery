@@ -12,16 +12,33 @@ use super::table::{Row, Segment};
 use super::{CardFormat, Role};
 use crate::kernels;
 
-/// Which card runs each layer, which ends with the head, and which holds
-/// the token embedding when one does.
+/// Which stage runs each layer, which ends with the head, and which holds
+/// the token embedding when one does. A stage is a card, by its index, or the
+/// host: with no stage card the host is the one stage, index 0, and runs
+/// every layer, the head and the embedding.
 pub(super) struct Stages {
     pub(super) of_layer: Vec<usize>,
     head: usize,
     pub(super) embedding: Option<usize>,
+    /// The host runs the stage: no stage card is in the plan.
+    pub(super) host: bool,
 }
 
 impl Stages {
     pub(super) fn new(layers: usize, cards: &[Card]) -> Result<Stages, PlacementError> {
+        if cards.is_empty() {
+            if layers == 0 {
+                return Err(PlacementError::Stages(
+                    "the model has no layer for the host stage to run".to_owned(),
+                ));
+            }
+            return Ok(Stages {
+                of_layer: vec![0; layers],
+                head: 0,
+                embedding: None,
+                host: true,
+            });
+        }
         let mut of_layer = Vec::with_capacity(layers);
         for (c, card) in cards.iter().enumerate() {
             if card.layers.start != of_layer.len() || card.layers.is_empty() {
@@ -70,6 +87,7 @@ impl Stages {
             of_layer,
             head,
             embedding,
+            host: false,
         })
     }
 
@@ -83,6 +101,21 @@ impl Stages {
             (_, Some(_)) => Ok(self.of_layer[layer_of(t, layers)?]),
         }
     }
+}
+
+/// `t`, which `stages`' stage runs whole, as a segment: on the stage card in
+/// the card format, or where the host stage runs it, the file's bytes in
+/// place.
+fn stage_segment(
+    model: &ModelTensors,
+    t: &ModelTensor,
+    stages: &Stages,
+    stage: usize,
+) -> Result<Segment, PlacementError> {
+    if stages.host {
+        return Ok(in_place(Device::Host, Format::HostFile, None, t.file_bytes));
+    }
+    card_segment(model, t, stage, rows_of(t), None)
 }
 
 /// Rows as the loader counts them: the product of every dim past the row width.
@@ -296,15 +329,9 @@ pub(super) fn place_whole(
         | Role::EngramDense
         | Role::EngramGain => {
             layer_of(t, layers)?;
-            (
-                card_segment(model, t, stage, rows_of(t), None)?,
-                t.file_bytes,
-            )
+            (stage_segment(model, t, stages, stage)?, t.file_bytes)
         }
-        Role::Head => (
-            card_segment(model, t, stage, rows_of(t), None)?,
-            t.file_bytes,
-        ),
+        Role::Head => (stage_segment(model, t, stages, stage)?, t.file_bytes),
         Role::TokenEmbedding => match stages.embedding {
             Some(card) => (
                 card_segment(model, t, card, rows_of(t), None)?,

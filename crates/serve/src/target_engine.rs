@@ -1,7 +1,8 @@
-//! The server's engine over a Metal session: [`TargetEngine`] implements
+//! The server's engine over a generation target: [`TargetEngine`] implements
 //! `serve::Engine` over any [`runtime::Target`] beside the file's
-//! vocabulary, so a request's ids are the ones `generate_metal` picks for the
-//! same prompt.
+//! vocabulary, so a request's ids are the ones the target's own loop picks for
+//! the same prompt. Host code, every OS: the Metal session and the host
+//! engine are served through it.
 //!
 //! What it maps:
 //!
@@ -28,9 +29,9 @@ use std::fmt::Display;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::media::MediaFeed;
+use crate::{Engine, EngineError, EngineProps, Tokenizer};
 use runtime::{Out, Target, Want};
-use serve::media::MediaFeed;
-use serve::{Engine, EngineError, EngineProps, Tokenizer};
 
 /// A target served with its vocabulary.
 pub struct TargetEngine<T> {
@@ -184,8 +185,8 @@ mod tests {
     use std::io;
     use std::sync::Arc;
 
+    use crate::{Engine, EngineProps, MockTokenizer, Tokenizer};
     use runtime::{Out, Target, Want};
-    use serve::{Engine, EngineProps, MockTokenizer, Tokenizer};
 
     use super::TargetEngine;
 

@@ -185,6 +185,7 @@ mod tests {
                 arena_columns: 1,
                 table_bytes: 0,
                 shadow_bytes: 0,
+                stage_kv_bytes: 0,
                 reserve_bytes: 0,
                 row_reserve_bytes: 0,
                 pool_card_bytes: 0,
