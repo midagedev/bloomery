@@ -202,7 +202,9 @@ fn rank_folder(o: &Opts, ranks: usize) -> Result<(Opened, Vec<SourceFile>), Gate
                 format!("{}: a sparse copy's path is not absolute", sparse.display()).into(),
             );
         }
-        // `fetch` refused every name that is not `dist::inside`, so the link stays in the view.
+        if !dist::inside(&f.name) {
+            return Err(format!("{:?} is not a name inside the folder", f.name).into());
+        }
         let link = view.join(&f.name);
         if let Some(parent) = link.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
