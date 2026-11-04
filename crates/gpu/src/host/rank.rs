@@ -8,16 +8,17 @@
 //!   channel never assumes it.
 //! - [`RankSession`]: the group's open over the control channel (rank 0
 //!   listens, every other rank dials it), the agreement on the group's
-//!   [`Fingerprint`] and limits, the RDMA end to every peer on its path
-//!   ([`super::paths`]) over one gather page, the round record rank 0 sends
-//!   every step ([`Round`]), and the failure contract ([`RankError`]).
+//!   [`Fingerprint`] and limits, the end to every peer over one gather page
+//!   (an RDMA end on its path, [`super::paths`], or a TCP end, as
+//!   [`Bootstrap::wire`] names), the round record rank 0 sends every step
+//!   ([`Round`]), and the failure contract ([`RankError`]).
 //! - [`Sums`]: a rank's side of the sums over the ranks on a gather page,
 //!   for a loopback ([`super::GatherLoop`]) or a session alike.
 //! - The step's checks every rank body makes ([`streams_at`], [`alike`],
 //!   [`at_pos`]).
 //!
 //! One rank's failure is the group's. A rank that fails releases its ends:
-//! when every end settles ([`super::RdmaEnd::release`]) the group ends with
+//! when every end settles ([`super::RdmaEnd::release`], [`super::TcpEnd::release`]) the group ends with
 //! the failure that came first ([`RankError::Settled`]); when one does not,
 //! the session names it and keeps its page and ends alive, since a card may
 //! still wait on the page, and the run ends.
@@ -31,9 +32,11 @@ use std::time::{Duration, Instant};
 use bloomery_verbs::Endpoint;
 use cuda_core::{CudaContext, DeviceBuffer, sys};
 
-use super::link::{GatherSet, GatherShape, Gathers, PeerPath, RdmaEnd, paths};
+use super::link::{
+    GatherSet, GatherShape, Gathers, PeerPath, PostCols, RdmaEnd, Reader, TcpEnd, TcpPeer, paths,
+};
 use super::node::wire::{In, MAX_FRAME, Out};
-use super::node::{read_endpoint, write_endpoint};
+use super::node::{read_endpoint, read_tcp_peer, write_endpoint, write_tcp_peer};
 use super::step::RELEASE;
 use crate::graph::{MappedHost, mem_batch};
 use crate::tensor::WindowMut;
@@ -417,16 +420,51 @@ impl Sums {
 }
 
 /// How a rank's group bootstraps: the fabric manifest the peer paths read
-/// their relay flow label from ([`super::paths`]), and how long rank 0 waits
-/// for every other rank to connect and every other rank keeps dialing it.
+/// their relay flow label from ([`super::paths`]), how long rank 0 waits
+/// for every other rank to connect and every other rank keeps dialing it,
+/// and the wire its ends carry the gathers on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bootstrap {
     pub fabric: Option<std::path::PathBuf>,
     pub wait: Duration,
+    pub wire: RankWire,
+}
+
+/// The wire a group's ends carry the gathers on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RankWire {
+    /// An RDMA end to every peer on its path ([`super::paths`]).
+    Rdma,
+    /// A TCP end to every peer ([`TcpEnd`]), each listening on its rank's
+    /// control address: no fabric manifest, no peer path.
+    Tcp,
+}
+
+/// A session's ends, every one of the wire its bootstrap names, in rank order.
+enum Ends {
+    Rdma(Vec<RdmaEnd>),
+    Tcp(Vec<TcpEnd>),
+}
+
+impl Ends {
+    fn is_empty(&self) -> bool {
+        match self {
+            Ends::Rdma(e) => e.is_empty(),
+            Ends::Tcp(e) => e.is_empty(),
+        }
+    }
+
+    /// Release every counter the ends carry ([`RdmaEnd::release`], [`TcpEnd::release`]).
+    fn release(&self, v: u32) -> Result<(), GpuError> {
+        match self {
+            Ends::Rdma(e) => RdmaEnd::release(e, v),
+            Ends::Tcp(e) => TcpEnd::release(e, v),
+        }
+    }
 }
 
 /// A group of ranks opened on their nodes (module doc): the control channel,
-/// the gather page and the RDMA end to every peer.
+/// the gather page and the end to every peer.
 ///
 /// Field order is drop order: the ends settle before the page drops.
 pub struct RankSession {
@@ -435,7 +473,7 @@ pub struct RankSession {
     limits: Vec<(&'static str, u64)>,
     ctx: Arc<CudaContext>,
     control: Option<Control>,
-    ends: Vec<RdmaEnd>,
+    ends: Ends,
     paths: Vec<PeerPath>,
     sums: Option<Sums>,
     layout: Option<Gathers>,
@@ -447,10 +485,12 @@ impl RankSession {
     /// above, the control channel to rank 0, the comparison of every rank's
     /// `fp` with rank 0's and of its `limits` names (the group runs at each
     /// limit's smallest value, [`RankSession::limits`]), a gather page of
-    /// `shapes`, and the RDMA end to every peer on its path, as `how` says.
-    /// Refused by name: a fingerprint that is not this rank's place in the
-    /// list, a rank whose load differs ([`RankError::Mismatch`]), a peer with
-    /// no path, and a rank that does not connect within `how.wait`.
+    /// `shapes`, and the end to every peer of the wire `how` names: an RDMA
+    /// end on its path, or a TCP end ([`tcp_ends`]). Refused by name: a
+    /// fingerprint that is not this rank's place in the list, a fabric
+    /// manifest on a TCP wire, a rank whose load differs
+    /// ([`RankError::Mismatch`]), a peer with no path, and a rank that does
+    /// not connect within `how.wait`.
     /// Load-time only.
     pub fn open(
         gpu: &Gpu,
@@ -473,6 +513,13 @@ impl RankSession {
             )
             .into());
         }
+        if how.wire == RankWire::Tcp && how.fabric.is_some() {
+            return Err(GpuError::shape(
+                WHAT,
+                "a fabric manifest names RDMA relay labels; a TCP wire reads none",
+            )
+            .into());
+        }
         let n = list.len();
         let mut s = RankSession {
             me,
@@ -480,7 +527,7 @@ impl RankSession {
             limits: limits.to_vec(),
             ctx: Arc::clone(gpu.context()),
             control: None,
-            ends: Vec::new(),
+            ends: Ends::Rdma(Vec::new()),
             paths: Vec::new(),
             sums: None,
             layout: None,
@@ -496,6 +543,21 @@ impl RankSession {
             limits: limits.iter().map(|&(k, v)| (k.to_string(), v)).collect(),
         };
         s.limits = control.agree(&hello, limits)?;
+        if how.wire == RankWire::Tcp {
+            let layout = Gathers::new(0, n, me, shapes)?;
+            let page = Arc::new(MappedHost::new(
+                &s.ctx,
+                layout.page_bytes(),
+                "the rank group's gather page",
+            )?);
+            s.ends = Ends::Tcp(tcp_ends(&mut control, list, me, &layout, &page)?);
+            control.barrier()?;
+            s.control = Some(control);
+            s.sums = Some(Sums::over(layout.clone(), Arc::clone(&page)));
+            s.layout = Some(layout);
+            s.page = Some(page);
+            return Ok(s);
+        }
         let all = paths(list, me, how.fabric.as_deref(), &mut control)?;
         let layout = Gathers::new(0, n, me, shapes)?;
         let page = Arc::new(MappedHost::new(
@@ -512,7 +574,7 @@ impl RankSession {
                 layout.crossings(j),
                 layout.side(j),
                 path,
-                crate::host::PostCols::default(),
+                PostCols::default(),
             )?);
         }
         let local: Vec<(usize, Endpoint)> = ends
@@ -534,7 +596,7 @@ impl RankSession {
         }
         control.barrier()?;
         s.control = Some(control);
-        s.ends = ends;
+        s.ends = Ends::Rdma(ends);
         s.paths = all;
         s.sums = Some(Sums::over(layout.clone(), Arc::clone(&page)));
         s.layout = Some(layout);
@@ -574,9 +636,13 @@ impl RankSession {
 
     /// The RDMA end to every peer, in rank order: what a stall report reads
     /// and a release releases ([`RdmaEnd::broken`], [`RdmaEnd::release`]).
+    /// `None` on a TCP wire.
     #[must_use]
-    pub fn ends(&self) -> &[RdmaEnd] {
-        &self.ends
+    pub fn ends(&self) -> Option<&[RdmaEnd]> {
+        match &self.ends {
+            Ends::Rdma(e) => Some(e),
+            Ends::Tcp(_) => None,
+        }
     }
 
     /// Every rank sends rank 0 `words`, its figures to compare (a digest of
@@ -658,12 +724,12 @@ impl RankSession {
         }
         // The released counters let the card's waits pass; the context's queued work then
         // finishes before the page can go.
-        let released = RdmaEnd::release(&self.ends, RELEASE).and_then(|()| {
+        let released = self.ends.release(RELEASE).and_then(|()| {
             crate::capsync::ctx_sync(&self.ctx, "RankSession::fail").map_err(GpuError::from)
         });
         let settled = settle(released, (rank, why));
         if matches!(settled, RankError::Unsettled { .. }) {
-            std::mem::forget(std::mem::take(&mut self.ends));
+            std::mem::forget(std::mem::replace(&mut self.ends, Ends::Rdma(Vec::new())));
             if let Some(page) = self.page.take() {
                 std::mem::forget(page);
             }
@@ -684,6 +750,62 @@ fn settle(released: Result<(), GpuError>, (rank, why): (usize, &str)) -> RankErr
             end: format!("{e} (after rank {rank}: {why})"),
         },
     }
+}
+
+/// Rank `me`'s TCP end to every other rank of `list` over `page` of `layout`, in rank order, each
+/// on `me`'s control address. The stage's side of a pair (the lower rank's) listens and sends its
+/// address and nonce on `control`; the tier's side sends nothing and dials that address with that
+/// nonce, which the stage's accept checks, so it takes a dial from any port.
+fn tcp_ends(
+    control: &mut Control,
+    list: &RankList,
+    me: usize,
+    layout: &Gathers,
+    page: &Arc<MappedHost>,
+) -> Result<Vec<TcpEnd>, GpuError> {
+    let ip = list.rank(me).control.ip();
+    let peers: Vec<usize> = (0..list.len()).filter(|&j| j != me).collect();
+    let mut ends = peers
+        .iter()
+        .map(|&j| {
+            let (tail, crossings, side) = (layout.tail(j), layout.crossings(j), layout.side(j));
+            TcpEnd::new(
+                Arc::clone(page),
+                tail,
+                crossings,
+                side,
+                ip,
+                PostCols::default(),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let out: Vec<(usize, Vec<u8>)> = ends
+        .iter()
+        .zip(&peers)
+        .map(|(e, &j)| {
+            let mut o = Out::default();
+            if layout.side(j) == Reader::Stage {
+                write_tcp_peer(&e.endpoint(), &mut o);
+            }
+            (j, o.done().to_vec())
+        })
+        .collect();
+    let theirs = control.swap(&out)?;
+    let any = TcpPeer {
+        addr: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        nonce: 0,
+    };
+    for ((e, b), &j) in ends.iter_mut().zip(&theirs).zip(&peers) {
+        let link = |e: String| GpuError::link(WHAT, format!("rank {j} over TCP: {e}"));
+        let mut r = In::new(b);
+        let peer = match layout.side(j) {
+            Reader::Stage => Ok(any),
+            Reader::Tier => read_tcp_peer(&mut r),
+        };
+        let peer = peer.and_then(|p| r.end().map(|()| p)).map_err(link)?;
+        e.connect(&peer).map_err(|e| link(e.to_string()))?;
+    }
+    Ok(ends)
 }
 
 /// The first packet sequence number of `me`'s queue pair to `peer`, which
