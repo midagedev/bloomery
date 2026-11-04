@@ -33,13 +33,10 @@ pub fn greedy(
     // sums past their step's deadline.
     session.collect(&[])?;
     let mut out = Vec::with_capacity(max);
-    let mut pos = 0u32;
     loop {
         let decided = (me == 0).then(|| {
             let tokens = out.last().map_or_else(|| prompt.to_vec(), |&t| vec![t]);
             Round {
-                slot: 0,
-                pos,
                 prompt: out.is_empty().then_some(0..prompt_len),
                 tokens,
                 stop: out.len() >= max,
@@ -52,10 +49,6 @@ pub fn greedy(
         let pick = step(&round).and_then(|(id, logits)| local_pick(&logits, id, vocab_at));
         let (value, id) = pick.map_err(|e| session.fail(&format!("{WHAT}: {e}")))?;
         let picks = session.collect(&[u64::from(value.to_bits()), u64::from(id)])?;
-        pos = u32::try_from(round.tokens.len())
-            .ok()
-            .and_then(|n| pos.checked_add(n))
-            .ok_or_else(|| session.fail(&format!("{WHAT}: a position past u32")))?;
         if me == 0 {
             let token = picks
                 .iter()

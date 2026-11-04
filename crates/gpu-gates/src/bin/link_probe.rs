@@ -675,7 +675,14 @@ mod probe {
             return tcp_ends(o, page, peers, of, cols, control);
         }
         enter("endpoint");
-        let all = paths(&o.ranks, o.rank, o.fabric.as_deref(), &mut control)?;
+        let targets: Vec<usize> = peers.iter().map(|&j| to(j)).collect();
+        let all = paths(
+            &o.ranks,
+            o.rank,
+            &targets,
+            o.fabric.as_deref(),
+            &mut control,
+        )?;
         print_paths(o, &all);
         let mut ends = Vec::with_capacity(peers.len());
         for &j in peers {
