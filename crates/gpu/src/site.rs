@@ -511,11 +511,11 @@ fn gemv_planes(
 
 /// Rows `at .. at + n` of a weight a site reads, `(at, n)`; all of them at
 /// `None`.
-type Part = Option<(usize, usize)>;
+pub(crate) type Part = Option<(usize, usize)>;
 
 /// A plane of a dense weight as a launch reads it: the resident plane, or a
 /// window of its rows.
-enum View<'t, T> {
+pub(crate) enum View<'t, T> {
     All(&'t DeviceTensor<T>),
     Rows(TensorWindow<'t, T>),
 }
@@ -533,7 +533,7 @@ impl<T> std::ops::Deref for View<'_, T> {
 
 /// Plane `t` of site `name`, or its rows `at .. at + n` at `part`: an empty
 /// part or one past the plane's rows is refused by name as `what`'s.
-fn view<'t, T: DeviceCopy>(
+pub(crate) fn view<'t, T: DeviceCopy>(
     what: &'static str,
     (name, part): (&str, Part),
     t: &'t DeviceTensor<T>,

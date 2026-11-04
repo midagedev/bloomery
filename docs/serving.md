@@ -458,9 +458,10 @@ prints one line a choice.
 
 **Kernel picks at load.** The qwen38 seat times, after the load and before its first capture, each way to run a kernel
 that gives the same output bits (today the MXFP8 projections at four to eight columns, the widths a drafted pass
-verifies). A way replaces the built-in rule only when it is faster on every one of five repeats by more than the
-repeats' spread. The load prints an `autotune pick` line for each kernel shape and an `autotune` line with the time it
-took, and `/props`' `engine.autotune` lists the same. Each pick is kept in the cost store (`$BLOOMERY_COSTS`, else
+verifies), each on weights read from the card's memory rather than its L2, as a decode step reads them. A way replaces
+the built-in rule only when it is faster on every one of five repeats by more than the repeats' spread. The load prints
+an `autotune pick` line for each kernel shape and an `autotune` line with the time it took, and `/props`'
+`engine.autotune` lists the same. Each pick is kept in the cost store (`$BLOOMERY_COSTS`, else
 `~/.cache/bloomery/costs`) under the card, the driver, the build and the shape, so the next load of the same card and
 build reads it and times nothing; an entry that does not decode is timed again. A store that cannot be created, locked,
 read or written stops the load, and the error names `--autotune off`. `--autotune off` (or `BLOOMERY_AUTOTUNE=off`)

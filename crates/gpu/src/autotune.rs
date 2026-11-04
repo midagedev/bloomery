@@ -14,15 +14,19 @@
 //! token-major outputs and the pick serves both layouts, which differ only in
 //! where each row's few outputs land.
 //!
-//! The timing rotates over every resident weight of the signature, up to
-//! [`ROTATE_BYTES`] and [`ROTATE_MAX`] of them in name order, so L2 does not
-//! favour the way timed first: a launch reads the weight the last launch
-//! of its graph read least recently, as a step reads each layer's once. A
-//! signature whose weights all fit in L2 is timed with them warm. A pick is
-//! a signature's, not a model's: a model with more or fewer weights of the
-//! signature than the load that timed it reads the same pick. A race
-//! takes `ways × (REPEATS + 2)` samples, each about [`SAMPLE_US`] or one
-//! replay of its graph when that is longer; the load prints the whole wall.
+//! A step reads every other weight of the model between two reads of one,
+//! so each of its launches reads its weight from DRAM, whatever the
+//! weight's size. The timing reads them so too: it rotates over the
+//! resident weights of the signature in name order, then over windows of
+//! the signature's rows cut from the other resident MXFP8 weights of its
+//! `k`, until the rotation spans [`COLD_L2`] times the card's L2 (one weight
+//! at least, all there are when they span less). A launch reads the weight
+//! the last launch of its graph read least recently, and no way is timed
+//! on weights an earlier one left in L2. A pick is a signature's, not a
+//! model's: a model with more or fewer weights of the signature than the
+//! load that timed it reads the same pick. A race takes
+//! `ways × (REPEATS + 2)` samples, each about [`SAMPLE_US`] or one replay
+//! of its graph when that is longer; the load prints the whole wall.
 //!
 //! Each pick is kept in the cost store (`runtime::costs::Store`) under the
 //! card, the driver, the build and the signature (`runtime::autotune::key`),
@@ -43,17 +47,16 @@ use crate::planes::Format;
 use crate::q8f32::{
     E4m3GemvArgs, E4m3Scales, E4m3Weight, GemvOut, STAGED_COLS, STAGED_K, STAGED_MAX_COLS,
 };
+use crate::site::{View, view};
+use crate::tensor::DeviceTensor;
 use crate::weights::{DevWeight, Weights};
 use crate::{Gpu, GpuError};
 
 /// The kernel family name an MXFP8 pick is kept and printed under.
 pub const MCOL_KERNEL: &str = "mxfp8_gemv_mcol";
 
-/// The most weight bytes a race rotates over.
-pub const ROTATE_BYTES: usize = 512 << 20;
-
-/// The most weights a race rotates over.
-pub const ROTATE_MAX: usize = 64;
+/// The bytes a race's rotation spans, in the card's L2 sizes (module doc).
+pub const COLD_L2: usize = 2;
 
 /// The card time a timed sample spans, at least [µs].
 pub const SAMPLE_US: f64 = 2000.0;
@@ -176,7 +179,14 @@ const NAMES: [&str; 3] = ["way", "rule_us", "way_us"];
 /// under `build`'s key (module doc). Load-time; installs nothing.
 pub fn tune(gpu: &Gpu, weights: &Weights, build: &str, store: &Store) -> Result<Tuned, GpuError> {
     let t0 = Instant::now();
-    let groups = mcol_groups(weights);
+    let l2 = crate::raw_device_attribute(
+        gpu.context().cu_device(),
+        cuda_core::sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE,
+        "cuDeviceGetAttribute(L2_CACHE_SIZE)",
+    )?;
+    let l2 = usize::try_from(l2)
+        .map_err(|_| GpuError::shape("autotune::tune", format!("an L2 of {l2} bytes")))?;
+    let groups = mcol_rotations(weights, COLD_L2 * l2)?;
     let mut picks = Vec::new();
     if let (Some(k), Some(rows)) = (
         groups.keys().map(|s| s.1).max(),
@@ -186,7 +196,15 @@ pub fn tune(gpu: &Gpu, weights: &Weights, build: &str, store: &Store) -> Result<
         let device = crate::host::costs::card_key(gpu.context())?;
         let x = DeviceBuffer::from_host(stream, &activations(STAGED_MAX_COLS * k))?;
         let mut y = DeviceBuffer::<f32>::zeroed(stream, STAGED_MAX_COLS * rows)?;
-        for (&(rows, k), ws) in &groups {
+        for (&(rows, k), planes) in &groups {
+            let ws: Vec<E4m3Weight<'_>> = planes
+                .iter()
+                .map(|(qs, e)| E4m3Weight {
+                    qs,
+                    e,
+                    scales: E4m3Scales::Mxfp8,
+                })
+                .collect();
             for m in STAGED_COLS..=STAGED_MAX_COLS {
                 let sig = McolSig { rows, k, m };
                 let ways = Mcol::racing(m);
@@ -197,7 +215,7 @@ pub fn tune(gpu: &Gpu, weights: &Weights, build: &str, store: &Store) -> Result<
                 };
                 let id = key(&device, build, MCOL_KERNEL, &sig.to_string());
                 let (v, from) =
-                    store.get_or_retime(&id, &NAMES, keep, || race(gpu, ws, sig, (&x, &mut y)))?;
+                    store.get_or_retime(&id, &NAMES, keep, || race(gpu, &ws, sig, (&x, &mut y)))?;
                 picks.push(Pick {
                     sig,
                     way: ways[v[0] as usize],
@@ -214,29 +232,77 @@ pub fn tune(gpu: &Gpu, weights: &Weights, build: &str, store: &Store) -> Result<
     })
 }
 
-/// The resident MXFP8 weights a race rotates over, by `(rows, k)`: every
-/// such weight whose `k` the staged entries read, in name order, up to
-/// [`ROTATE_BYTES`] and [`ROTATE_MAX`] a signature (one at least).
-fn mcol_groups(weights: &Weights) -> BTreeMap<(usize, usize), Vec<E4m3Weight<'_>>> {
-    let mut groups: BTreeMap<(usize, usize), Vec<E4m3Weight<'_>>> = BTreeMap::new();
-    for name in weights.names() {
-        let Some(DevWeight::Mxfp8 { qs, e, k }) = weights.get(name) else {
-            continue;
-        };
-        if !k.is_multiple_of(STAGED_K) {
-            continue;
-        }
-        let ws = groups.entry((qs.rows(), *k)).or_default();
-        let bytes = (ws.len() + 1) * weight_bytes(qs.rows(), *k);
-        if ws.is_empty() || (ws.len() < ROTATE_MAX && bytes <= ROTATE_BYTES) {
-            ws.push(E4m3Weight {
-                qs,
-                e,
-                scales: E4m3Scales::Mxfp8,
-            });
-        }
+/// One weight a race reads: the code and scale planes of a resident MXFP8
+/// weight's rows.
+type Planes<'w> = (View<'w, u32>, View<'w, u32>);
+
+/// The planes each signature's race rotates over, by `(rows, k)`, over the
+/// resident MXFP8 weights whose `k` the staged entries read: [`rotations`]
+/// of `cold` bytes.
+fn mcol_rotations(
+    weights: &Weights,
+    cold: usize,
+) -> Result<BTreeMap<(usize, usize), Vec<Planes<'_>>>, GpuError> {
+    let resident: Vec<(&str, &DeviceTensor<u32>, &DeviceTensor<u32>, usize)> = weights
+        .names()
+        .filter_map(|name| match weights.get(name) {
+            Some(DevWeight::Mxfp8 { qs, e, k }) if k.is_multiple_of(STAGED_K) => {
+                Some((name, qs, e, *k))
+            }
+            _ => None,
+        })
+        .collect();
+    let shapes: Vec<(usize, usize)> = resident
+        .iter()
+        .map(|&(_, qs, _, k)| (qs.rows(), k))
+        .collect();
+    rotations(&shapes, cold)
+        .into_iter()
+        .map(|((rows, k), slots)| {
+            let planes = slots
+                .into_iter()
+                .map(|(i, at)| {
+                    let (name, qs, e, _) = resident[i];
+                    let part = (name, Some((at, rows)));
+                    Ok((
+                        view("autotune::tune", part, qs)?,
+                        view("autotune::tune", part, e)?,
+                    ))
+                })
+                .collect::<Result<_, GpuError>>()?;
+            Ok(((rows, k), planes))
+        })
+        .collect()
+}
+
+/// Each signature's rotation (module doc) over `shapes`, each weight's rows
+/// and `k` in name order, as `(index in shapes, first row)` a launch of the
+/// signature's rows: the signature's own weights, then the whole windows of
+/// its rows the other weights of its `k` hold, each weight's from its first
+/// row, until the launches read `cold` bytes; one at least, all there are
+/// when they read less.
+fn rotations(
+    shapes: &[(usize, usize)],
+    cold: usize,
+) -> BTreeMap<(usize, usize), Vec<(usize, usize)>> {
+    let mut out = BTreeMap::new();
+    for &(rows, k) in shapes {
+        out.entry((rows, k)).or_insert_with(|| {
+            let own = shapes
+                .iter()
+                .enumerate()
+                .filter(|&(_, &s)| s == (rows, k))
+                .map(|(i, _)| (i, 0));
+            let windows = shapes
+                .iter()
+                .enumerate()
+                .filter(|&(_, &(r, kk))| kk == k && r != rows)
+                .flat_map(|(i, &(r, _))| (0..r / rows).map(move |j| (i, j * rows)));
+            let launches = cold.div_ceil(weight_bytes(rows, k)).max(1);
+            own.chain(windows).take(launches).collect()
+        });
     }
-    groups
+    out
 }
 
 /// An MXFP8 weight's bytes: a record a block, [`Format::code_bytes`] values.
@@ -376,6 +442,32 @@ mod tests {
         assert_eq!(Mcol::racing(3), &[] as &[Mcol]);
         assert_eq!(Mcol::racing(4), &[Mcol::Rule, Mcol::Plain]);
         assert_eq!(Mcol::racing(8), &Mcol::ALL);
+    }
+
+    /// A rotation reads its signature's weights, then the whole windows of
+    /// its rows the other weights of its `k` hold, never another `k`'s,
+    /// until it reads the cold bytes; one weight at least, all there are
+    /// short of them (mutants: a window past a weight's rows, another `k`'s
+    /// weight, the windows before the signature's own, no stop at the cold
+    /// bytes, none at zero).
+    #[test]
+    fn a_rotation_reads_cold_bytes_of_its_rows_from_its_k() {
+        let one = weight_bytes(96, 2560);
+        let shapes = [(96, 2560), (256, 2560), (96, 6144), (96, 2560), (100, 2560)];
+        let r = rotations(&shapes, 5 * one);
+        assert_eq!(r.len(), 4);
+        assert_eq!(r[&(96, 2560)], [(0, 0), (3, 0), (1, 0), (1, 96), (4, 0)]);
+        assert_eq!(r[&(96, 6144)], [(2, 0)]);
+        assert_eq!(r[&(256, 2560)], [(1, 0)]);
+        assert_eq!(
+            rotations(&shapes, 3 * one)[&(96, 2560)],
+            [(0, 0), (3, 0), (1, 0)]
+        );
+        assert_eq!(rotations(&shapes, 0)[&(96, 2560)], [(0, 0)]);
+        assert_eq!(
+            rotations(&shapes, 1 << 40)[&(100, 2560)],
+            [(4, 0), (1, 0), (1, 100)]
+        );
     }
 
     /// An installed table steers `enqueue_e4m3_gemv`'s launch: a signature
