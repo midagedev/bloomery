@@ -33,11 +33,18 @@
 //! by name when either has moved.
 //!
 //! A walk is eager. A captured walk is refused by name. A store walk
-//! ([`WalkMode::Store`]) runs the step through the layer's cache append
-//! alone (`walk::store`): the join, `eh_proj`, the attention's input side and
-//! its append, no flash, FFN half or head. A later row reads a row's keys and
-//! values and nothing else of it, and the launches up to the append are the
-//! eager step's, so the store holds an eager walk's bits. A step walk
+//! ([`WalkMode::Store`], the prompt's warmup) takes up to [`MTP35_STORE_ROWS`]
+//! rows at once and runs them through the layer's cache append alone
+//! (`walk::store` over [`StoreOps`]): the join, `eh_proj`, the attention's
+//! input side — the norm, k and v — and the append at no query head; no
+//! query, flash, FFN half or head. A later row reads a row's keys and values
+//! and nothing else of it, and each op computes a row's values from that
+//! row's inputs alone. The projections are the trunk's wide arm
+//! ([`wide::gemm_site`]: one GEMM of the weight's own type, which reads each
+//! weight once for the walk), over the walk's own buffers ([`StoreArena`]) and
+//! a one-expert table; against an eager walk, which reads the f32 rows
+//! through the gemv arm, the two stores agree to the error of the projections'
+//! quantized activations and are not bit-equal. A step walk
 //! ([`MtpArena::Step`]) reads the target head's normed row on the card,
 //! copied into the draft's own row on the engine stream: no readback.
 //! `held` counts the positions the draft's store holds; a walk from position
@@ -47,21 +54,25 @@ use super::PrefillPath;
 use super::body::Kernels;
 use super::dispatch::{self, Ctx, PassCtx, embed_into};
 use super::mtp38::BorrowedPlanes;
-use super::plan::LayerPlan;
+use super::plan::{DeltaPlan, FfnPlan, GqaKind, GqaPlan, LayerPlan, MixerPlan};
 use super::program::{OneLayer, Program, Tail};
-use super::scratch::{Arena, Dims, Forms, KvPlanes, StepParams};
+use super::scratch::{
+    Append256, Arena, Dims, Forms, IN_IDS, IN_POS0, Inbox, Io, KvPlanes, StepParams, put_input,
+};
+use super::wide::{gemm_site, wide_kernels};
 use crate::draft::{self, DraftHead, Feed, Hidden, WalkBounds, WalkMode};
+use crate::gemm::{GemmInput, GemmRoute};
 use crate::head::{Head, HeadNorm};
 use crate::kv_format::KvQ8;
 use crate::model::lookup::f32_gain;
 use crate::mtp::{MtpInputArgs, MtpKernels};
-use crate::site::{self, SiteTy};
-use crate::tensor::{Q8Act, Window};
+use crate::site::{self, SiteTy, WideActs};
+use crate::tensor::{Q8Act, Window, WindowMut};
 use crate::weights::{DevWeight, HEAD_TENSOR, Weights};
-use crate::{Gpu, GpuError, launch_u32};
-use chain::arch::qwen3moe::ops::LayerCtx;
+use crate::{FaultSink, Gpu, GpuError, launch_u32};
+use chain::arch::qwen3moe::ops::{ChainOps, LayerCtx};
 use chain::arch::qwen3moe::walk;
-use cuda_core::DeviceBuffer;
+use cuda_core::{CudaStream, DeviceBuffer};
 use model::arch::models::MtpDraft;
 use model::arch::qwen3moe::names::token_embd;
 use runtime::prompt::CallEnd;
@@ -71,6 +82,10 @@ const WHAT: &str = "qwen35moe Mtp35";
 /// The draft's input join is one stream: the hidden row's width is the
 /// embedding's.
 const STREAMS: usize = 1;
+
+/// The most rows one store walk takes: the columns of its GEMMs and the rows of
+/// its buffers ([`StoreArena`]).
+pub const MTP35_STORE_ROWS: usize = 256;
 
 /// The draft layer's tensor names in its file.
 struct Names {
@@ -123,6 +138,8 @@ pub struct Mtp35 {
     h_row: DeviceBuffer<f32>,
     head: Head,
     mtp: MtpKernels,
+    /// A store walk's buffers.
+    store: StoreArena,
     /// `token_embd` and the head matrix of the target, at open.
     borrowed: [BorrowedPlanes; 2],
     /// Positions of this sequence the store holds: the first it does not.
@@ -145,7 +162,92 @@ impl WalkBounds for Mtp35 {
     const WALK_ROWS: usize = 2;
     /// The layer captures no walk.
     const GRAPH_ROWS: usize = 0;
-    const STORE_ROWS: usize = 2;
+    const STORE_ROWS: usize = MTP35_STORE_ROWS;
+}
+
+/// A store walk's own buffers for up to [`MTP35_STORE_ROWS`] rows,
+/// token-major: the input record (the walk's first position, then its ids),
+/// the target's hidden rows after `output_norm`, the embedding rows with
+/// their positions and live key counts, the join's pack and its quantized
+/// forms, `eh_proj`'s rows (the layer's input), the attention-normed rows
+/// with their forms, k and v, and the one-expert table every projection
+/// reads. `qg` and `q` stand in for the append's query arguments at no query
+/// head, where the launch reads and writes neither.
+struct StoreArena {
+    inbox: Inbox,
+    h: DeviceBuffer<f32>,
+    emb: DeviceBuffer<f32>,
+    pos: DeviceBuffer<u32>,
+    n_keys: DeviceBuffer<u32>,
+    pack: DeviceBuffer<f32>,
+    pack_acts: WideActs,
+    x: DeviceBuffer<f32>,
+    normed: DeviceBuffer<f32>,
+    normed_acts: WideActs,
+    k: DeviceBuffer<f32>,
+    v: DeviceBuffer<f32>,
+    rows: GemmRoute,
+    qg: DeviceBuffer<f32>,
+    q: DeviceBuffer<f32>,
+}
+
+impl StoreArena {
+    /// The buffers for `d`'s shapes, `eh_proj` read at `eh_ty` and the
+    /// attention's k and v at `g`'s types. Load-time only.
+    fn new(
+        stream: &CudaStream,
+        d: &Dims,
+        eh_ty: SiteTy,
+        g: &GqaPlan,
+    ) -> Result<StoreArena, GpuError> {
+        let r = MTP35_STORE_ROWS;
+        let (h, kv) = (d.hidden, d.kv_len());
+        let f = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
+        let u = |n: usize| DeviceBuffer::<u32>::zeroed(stream, n);
+        // The f32 rows a site of an f32 type reads are `pack` and `normed`
+        // themselves, so the forms hold none.
+        let pack_forms = WideActs::wants(eh_ty).without_f32();
+        let kv_forms = WideActs::wants_of(&[g.k_ty, g.v_ty]).without_f32();
+        Ok(StoreArena {
+            inbox: Inbox::new(stream, IN_IDS + r)?,
+            h: f(r * h)?,
+            emb: f(r * h)?,
+            pos: u(r)?,
+            n_keys: u(r)?,
+            pack: f(r * 2 * h)?,
+            pack_acts: WideActs::new(stream, pack_forms, r, 2 * h)?,
+            x: f(r * h)?,
+            normed: f(r * h)?,
+            normed_acts: WideActs::new(stream, kv_forms, r, h)?,
+            k: f(r * kv)?,
+            v: f(r * kv)?,
+            rows: GemmRoute::new(stream, r, 1)?,
+            qg: f(1)?,
+            q: f(1)?,
+        })
+    }
+
+    /// Device bytes.
+    fn bytes(&self) -> usize {
+        let f32s = [
+            &self.h,
+            &self.emb,
+            &self.pack,
+            &self.x,
+            &self.normed,
+            &self.k,
+            &self.v,
+            &self.qg,
+            &self.q,
+        ];
+        f32s.iter().map(|b| b.num_bytes()).sum::<usize>()
+            + self.pos.num_bytes()
+            + self.n_keys.num_bytes()
+            + self.inbox.bytes()
+            + self.pack_acts.bytes()
+            + self.normed_acts.bytes()
+            + self.rows.bytes()
+    }
 }
 
 /// Device addresses held by [`BorrowedPlanes`]: Q8_0 or MXFP8 planes,
@@ -225,6 +327,23 @@ impl Mtp35 {
         // a file leaves `eh_proj` decides the form the step feeds it, so it
         // is read once here, like the head's own output form.
         let eh_ty = site::resident_type(&w, WHAT, &names.eh)?;
+        let MixerPlan::Gqa(g) = &plan.mixer else {
+            return Err(GpuError::shape(
+                WHAT,
+                "the next-token layer's mixer is not attention",
+            ));
+        };
+        if g.kind != GqaKind::Gated256 {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the next-token layer's attention is {:?}; the store walk runs the head-256 \
+                     gated append",
+                    g.kind
+                ),
+            ));
+        }
+        let store = StoreArena::new(stream, &d, eh_ty, g)?;
         let forms = Forms::of(std::slice::from_ref(&plan), &d);
         let head = Head::with_gain(
             gpu,
@@ -252,6 +371,7 @@ impl Mtp35 {
             raw: DeviceBuffer::zeroed(stream, hidden)?,
             h_row: DeviceBuffer::zeroed(stream, hidden)?,
             mtp: MtpKernels::load(gpu.context())?,
+            store,
             names,
             w,
             plan,
@@ -297,11 +417,13 @@ impl Mtp35 {
 
     /// Card bytes of the step's scratch: the one-row arena, the embedding row,
     /// the join's pack and its q8_1 form, the copied target row and its normed
-    /// row, and the head's rows, activations and logits, less the residual
-    /// stream counted in [`Mtp35::resident_bytes`].
+    /// row, the head's rows, activations and logits, and a store walk's
+    /// buffers ([`StoreArena`]), less the residual stream counted in
+    /// [`Mtp35::resident_bytes`].
     #[must_use]
     pub fn scratch_bytes(&self) -> usize {
         self.s.bytes()
+            + self.store.bytes()
             + self.emb.num_bytes()
             + self.pack.num_bytes()
             + self.act.device_bytes()
@@ -326,6 +448,38 @@ impl Mtp35 {
         self.head.gain()
     }
 
+    /// The store's keys and values at positions `0..n`, position-major:
+    /// `[n][n_kv][head]` f16 bits each (the store's own layout is
+    /// `[n_kv][ctx][head]`). Blocking; gate use.
+    pub fn store_host(
+        &self,
+        stream: &CudaStream,
+        n: usize,
+    ) -> Result<(Vec<u16>, Vec<u16>), GpuError> {
+        if n > self.ctx {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("positions 0..{n} of a store of {}", self.ctx),
+            ));
+        }
+        let (ctx, head, n_kv) = (self.ctx, self.s.dims.head, self.s.dims.n_kv);
+        let plane = |b: &DeviceBuffer<u16>| -> Result<Vec<u16>, GpuError> {
+            let heads = (0..n_kv)
+                .map(|kv| {
+                    let at = kv * ctx * head * size_of::<u16>();
+                    Ok(Window::<u16>::of(b, at, n * head)?.to_host_vec(stream)?)
+                })
+                .collect::<Result<Vec<_>, GpuError>>()?;
+            Ok((0..n)
+                .flat_map(|p| heads.iter().map(move |h| &h[p * head..(p + 1) * head]))
+                .flatten()
+                .copied()
+                .collect())
+        };
+        let (k, v) = self.kv.f16(WHAT)?;
+        Ok((plane(k)?, plane(v)?))
+    }
+
     /// The last step's logits (`vocab` f32). Blocking read; gate/debug use.
     pub fn logits_to_host(&self, gpu: &Gpu) -> Result<Vec<f32>, GpuError> {
         self.head.logits_to_host(gpu)
@@ -335,18 +489,14 @@ impl Mtp35 {
     /// the target's hidden row `h` (`hidden` f32 on the card, the row of the
     /// position before `t`): the join, `eh_proj`, the layer at `pos` over the
     /// draft's K/V rows `0..=pos`, and the head, whose token and logits the
-    /// caller reads back. In [`WalkMode::Store`] the layer runs through its
-    /// cache append alone (`walk::store`) and the head does not run: the
-    /// draft's K/V row `pos` is the eager step's, and the last token and
-    /// logits stay those of the step before. Eager; the target's `target`
-    /// weights, kernels and rope table are the ones its own layers launch
-    /// with.
+    /// caller reads back. Eager; the target's `target` weights, kernels and
+    /// rope table are the ones its own layers launch with.
     pub(super) fn enqueue(
         &mut self,
         gpu: &Gpu,
         target: &Weights,
         (k, table, mma): (&Kernels, &DeviceBuffer<f32>, bool),
-        (t, pos, mode): (u32, usize, WalkMode),
+        (t, pos): (u32, usize),
         h: &DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         super::refuse_past_vocab(WHAT, &[t], self.vocab)?;
@@ -442,9 +592,6 @@ impl Mtp35 {
             m: 1,
             tail: Tail::Into(self.head.input_mut()),
         };
-        if mode == WalkMode::Store {
-            return walk::store(&mut layer, cx);
-        }
         walk::layer(&mut layer, cx)?;
         self.head.enqueue_over(gpu, &self.w, target)
     }
@@ -462,7 +609,7 @@ impl Mtp35 {
         gpu: &Gpu,
         target: &Weights,
         kernels: (&Kernels, &DeviceBuffer<f32>, bool),
-        feed: (u32, usize, WalkMode),
+        feed: (u32, usize),
     ) -> Result<(), GpuError> {
         // The pointer is taken before `enqueue` borrows `self`, so the two
         // borrows of the row do not alias in the checker.
@@ -470,6 +617,294 @@ impl Mtp35 {
         // SAFETY: `enqueue` reads `h` and does not write `h_row`. `h_row`
         // stays allocated.
         self.enqueue(gpu, target, kernels, feed, unsafe { &*h })
+    }
+}
+
+impl Mtp35 {
+    /// Enqueue a store walk of `tokens` at positions `pos0 ..`, their hidden
+    /// rows the store arena's `h`: the embedding rows, the join, `eh_proj`
+    /// as one GEMM over the rows, then `walk::store` over [`StoreOps`] — the
+    /// attention's norm, k and v as GEMMs, and the append at no query head
+    /// into the draft's K/V planes. The head does not run and the last step's
+    /// token and logits stay. Each row's keys and values are its inputs'
+    /// alone, so a row's stored bits do not depend on the walk it lands in.
+    /// The target's `target` weights, kernels and rope table are the ones its
+    /// own layers launch with.
+    pub(super) fn enqueue_store(
+        &mut self,
+        gpu: &Gpu,
+        target: &Weights,
+        (k, table): (&Kernels, &DeviceBuffer<f32>),
+        (tokens, pos0): (&[u32], usize),
+    ) -> Result<(), GpuError> {
+        let n = tokens.len();
+        super::refuse_past_vocab(WHAT, tokens, self.vocab)?;
+        if pos0.saturating_add(n) > self.ctx {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "positions {pos0}..{} on a draft of {} K/V rows",
+                    pos0.saturating_add(n),
+                    self.ctx
+                ),
+            ));
+        }
+        for b in &self.borrowed {
+            super::mtp38::at_open(target, b, WHAT)?;
+        }
+        let stream = gpu.stream();
+        let sink = gpu.layer_sink(self.index)?;
+        let d = self.s.dims;
+        let Mtp35 {
+            index,
+            hidden,
+            eps,
+            names,
+            w,
+            plan,
+            kv,
+            eh_ty,
+            mtp,
+            store,
+            ..
+        } = self;
+        let (hidden, eps) = (*hidden, *eps);
+        let (w, plan, names): (&Weights, &LayerPlan, &Names) = (w, plan, names);
+        let StoreArena {
+            inbox,
+            h,
+            emb,
+            pos,
+            n_keys,
+            pack,
+            pack_acts,
+            x,
+            rows,
+            ..
+        } = &mut *store;
+
+        // The walk's first position and its ids, then the embedding rows
+        // with their positions and live key counts.
+        put_input(inbox.host_mut()?, tokens, launch_u32(WHAT, "pos", pos0)?)?;
+        inbox.upload(stream, IN_IDS + n)?;
+        {
+            let ids = Window::<u32>::of(inbox.dev(), IN_IDS * size_of::<u32>(), n)?;
+            let first = Window::<u32>::of(inbox.dev(), IN_POS0 * size_of::<u32>(), 1)?;
+            let io = Io {
+                ids: &ids,
+                pos0: &first,
+                first: 0,
+                lane: None,
+            };
+            embed_into(gpu, target, k, &io, (emb, pos, n_keys))?;
+        }
+
+        // The join of every row, then `eh_proj` over them as one GEMM into
+        // the layer's input rows.
+        mtp.enqueue_mtp_input(
+            stream,
+            MtpInputArgs {
+                e: emb,
+                h,
+                enorm: f32_gain(w, &names.enorm)?,
+                hnorm: f32_gain(w, &names.hnorm)?,
+                hidden,
+                eps,
+                m: n,
+                streams: STREAMS,
+                fault: sink,
+                out: pack,
+            },
+        )?;
+        let wk = wide_kernels(k);
+        pack_acts.quantize(gpu, &wk, sink, pack, n, &[*eh_ty])?;
+        k.gemm
+            .enqueue_route_dense(stream, n, rows, gpu.unlabelled_sink())?;
+        let input = pack_acts.input(pack);
+        gemm_site(
+            (gpu, w, k),
+            (*eh_ty, &names.eh),
+            hidden,
+            &input,
+            (rows, GemmInput::PerSlot),
+            n,
+            x,
+        )?;
+
+        let mut ops = StoreOps {
+            gpu,
+            w,
+            k,
+            table,
+            eps,
+            sink,
+            d,
+            kv,
+            s: store,
+        };
+        let cx = LayerCtx {
+            layer: *index,
+            plan,
+            m: n,
+            last: true,
+        };
+        walk::store(&mut ops, cx)
+    }
+}
+
+/// The ops of a store walk ([`walk::store`]) over the draft layer: the
+/// attention's input side without its query, and the cache append. Every other
+/// op of a layer is no part of one and is refused by name.
+struct StoreOps<'a> {
+    gpu: &'a Gpu,
+    w: &'a Weights,
+    k: &'a Kernels,
+    table: &'a DeviceBuffer<f32>,
+    eps: f32,
+    sink: FaultSink,
+    d: Dims,
+    kv: &'a mut KvPlanes,
+    s: &'a mut StoreArena,
+}
+
+/// The refusal of op `op` in a store walk.
+fn outside_store(op: &'static str) -> GpuError {
+    GpuError::shape(
+        WHAT,
+        format!("{op} in a store walk: it runs the attention's input side and its append alone"),
+    )
+}
+
+impl ChainOps for StoreOps<'_> {
+    type Error = GpuError;
+
+    fn embed(&mut self, _: usize) -> Result<(), GpuError> {
+        Err(outside_store("the unit's front"))
+    }
+
+    /// The layer's input rows (`eh_proj`'s) normed and quantized into the
+    /// forms k and v read, then k and v as the trunk's wide arm runs them. No
+    /// query: nothing reads one of a store walk's rows.
+    fn attn_in(&mut self, l: LayerCtx<'_>, g: &GqaPlan) -> Result<(), GpuError> {
+        let (gpu, w, k, m) = (self.gpu, self.w, self.k, l.m);
+        let StoreArena {
+            x,
+            normed,
+            normed_acts,
+            k: kr,
+            v,
+            rows,
+            ..
+        } = &mut *self.s;
+        gpu.elem().enqueue_rms_norm(
+            gpu.stream(),
+            x,
+            f32_gain(w, &g.attn_norm)?,
+            self.eps,
+            self.d.hidden,
+            m,
+            normed,
+        )?;
+        normed_acts.quantize(
+            gpu,
+            &wide_kernels(k),
+            self.sink,
+            normed,
+            m,
+            &[g.k_ty, g.v_ty],
+        )?;
+        let input = normed_acts.input(normed);
+        let table = (&*rows, GemmInput::PerSlot);
+        let kv_len = self.d.kv_len();
+        gemm_site(
+            (gpu, w, k),
+            (g.k_ty, &g.attn_k),
+            kv_len,
+            &input,
+            table,
+            m,
+            kr,
+        )?;
+        gemm_site(
+            (gpu, w, k),
+            (g.v_ty, &g.attn_v),
+            kv_len,
+            &input,
+            table,
+            m,
+            v,
+        )
+    }
+
+    fn attn_core(&mut self, _: LayerCtx<'_>, _: &GqaPlan) -> Result<(), GpuError> {
+        Err(outside_store("the attention's flash"))
+    }
+
+    /// The keys' norm and turn by the rows' positions and the append of keys
+    /// and values into the draft's planes, at no query head.
+    fn attn_append(&mut self, l: LayerCtx<'_>, g: &GqaPlan) -> Result<(), GpuError> {
+        let StoreArena {
+            pos,
+            k: kr,
+            v,
+            qg,
+            q,
+            ..
+        } = &mut *self.s;
+        // SAFETY: the rows are one embedding's consecutive positions below
+        // the planes' rows (`enqueue_store` refuses a walk past them), so
+        // they are pairwise distinct and cache-valid; the planes are this
+        // draft's own.
+        unsafe {
+            self.kv.append_256(
+                &self.k.neox,
+                self.gpu.stream(),
+                Append256 {
+                    qg,
+                    q,
+                    k: kr,
+                    v,
+                    gq: f32_gain(self.w, &g.attn_q_norm)?,
+                    gk: f32_gain(self.w, &g.attn_k_norm)?,
+                    table: self.table,
+                    pos,
+                    eps: self.eps,
+                    n_head: 0,
+                    n_kv: self.d.n_kv,
+                    ctx: self.d.ctx,
+                    m: l.m,
+                    fault: self.sink,
+                },
+            )
+        }
+    }
+
+    fn attn_out(&mut self, _: LayerCtx<'_>, _: &GqaPlan) -> Result<(), GpuError> {
+        Err(outside_store("the attention's output side"))
+    }
+
+    fn delta_in(&mut self, _: LayerCtx<'_>, _: &DeltaPlan) -> Result<(), GpuError> {
+        Err(outside_store("a delta layer"))
+    }
+
+    fn delta_core(&mut self, _: LayerCtx<'_>, _: &DeltaPlan) -> Result<(), GpuError> {
+        Err(outside_store("a delta layer"))
+    }
+
+    fn delta_out(&mut self, _: LayerCtx<'_>, _: &DeltaPlan) -> Result<(), GpuError> {
+        Err(outside_store("a delta layer"))
+    }
+
+    fn route(&mut self, _: LayerCtx<'_>, _: &FfnPlan) -> Result<(), GpuError> {
+        Err(outside_store("the FFN's router"))
+    }
+
+    fn experts(&mut self, _: LayerCtx<'_>, _: &FfnPlan) -> Result<(), GpuError> {
+        Err(outside_store("the FFN's experts"))
+    }
+
+    fn head(&mut self, _: usize) -> Result<(), GpuError> {
+        Err(outside_store("the head"))
     }
 }
 
@@ -510,10 +945,42 @@ fn norm_row(
     )
 }
 
+/// The first `n` rows of `src` from row `first`, each RMS-normed by the
+/// target's `output_norm` into the store arena's `h`.
+fn norm_rows(
+    mtp: &mut Mtp35,
+    gpu: &Gpu,
+    w: &Weights,
+    (src, eps): (&Arena, f32),
+    (first, n): (usize, usize),
+) -> Result<(), GpuError> {
+    let hidden = mtp.hidden;
+    if first.saturating_add(n) > src.rows {
+        return Err(GpuError::shape(
+            WHAT,
+            format!(
+                "hidden rows {first}..{} of a {}-row arena",
+                first.saturating_add(n),
+                src.rows
+            ),
+        ));
+    }
+    let rows = Window::<f32>::of(&src.x, first * hidden * size_of::<f32>(), n * hidden)?;
+    gpu.elem().enqueue_rms_norm(
+        gpu.stream(),
+        &rows,
+        f32_gain(w, "output_norm.weight")?,
+        eps,
+        hidden,
+        n,
+        &mut mtp.store.h,
+    )
+}
+
 /// One eager walk of the file's next-token layer, no readback. A captured
-/// walk is refused by name. A store walk runs each step through the layer's
-/// cache append alone. A poisoned model is refused; a fault the walk raises
-/// is [`GpuModel::note_fault`]'s.
+/// walk is refused by name. A store walk runs its rows through the layer's
+/// cache append alone, all at once ([`Mtp35::enqueue_store`]). A poisoned
+/// model is refused; a fault the walk raises is [`GpuModel::note_fault`]'s.
 pub fn mtp_walk(
     m: &mut super::Qwen35moeModel,
     feed: Feed<'_, MtpArena>,
@@ -674,15 +1141,11 @@ fn walk_rows(
     let table = crate::media::rope_table(rope, seq_rope.as_ref());
     let mma = *mma;
     let eps = *eps;
-    for i in 0..n {
-        let pos = (pos0 as usize).checked_add(i).ok_or_else(|| {
-            GpuError::shape(WHAT, format!("position {pos0} plus {i} passes usize"))
-        })?;
-        let t = tokens[i];
+    if mode == WalkMode::Store {
         match hidden {
             Hidden::Host(v) => {
-                mtp.h_row
-                    .copy_from_host(gpu.stream(), &v[i * width..(i + 1) * width])?;
+                let mut rows = WindowMut::<f32>::of_mut(&mut mtp.store.h, 0, n * width)?;
+                rows.copy_from_host(gpu.stream(), v)?;
             }
             Hidden::Target {
                 walk: MtpArena::Step,
@@ -690,18 +1153,50 @@ fn walk_rows(
             } => {
                 let row = step_row
                     .ok_or_else(|| GpuError::state(WHAT, "the head's normed row of the step"))?;
-                mtp.h_row.copy_from_device_async(row, gpu.stream())?;
+                let mut rows = WindowMut::<f32>::of_mut(&mut mtp.store.h, 0, width)?;
+                rows.copy_from_device_async(row, gpu.stream())?;
             }
             Hidden::Target {
                 walk: MtpArena::Pass,
                 first,
-            } => norm_row(mtp, gpu, w, a, eps, first + i)?,
+            } => norm_rows(mtp, gpu, w, (a, eps), (first, n))?,
             Hidden::Target {
                 walk: MtpArena::Ubatch,
                 first,
-            } => norm_row(mtp, gpu, w, u, eps, first + i)?,
+            } => norm_rows(mtp, gpu, w, (u, eps), (first, n))?,
         }
-        mtp.enqueue_held(gpu, w, (k, table, mma), (t, pos, mode))?;
+        mtp.enqueue_store(gpu, w, (k, table), (tokens, pos0 as usize))?;
+    } else {
+        for i in 0..n {
+            let pos = (pos0 as usize).checked_add(i).ok_or_else(|| {
+                GpuError::shape(WHAT, format!("position {pos0} plus {i} passes usize"))
+            })?;
+            let t = tokens[i];
+            match hidden {
+                Hidden::Host(v) => {
+                    mtp.h_row
+                        .copy_from_host(gpu.stream(), &v[i * width..(i + 1) * width])?;
+                }
+                Hidden::Target {
+                    walk: MtpArena::Step,
+                    ..
+                } => {
+                    let row = step_row.ok_or_else(|| {
+                        GpuError::state(WHAT, "the head's normed row of the step")
+                    })?;
+                    mtp.h_row.copy_from_device_async(row, gpu.stream())?;
+                }
+                Hidden::Target {
+                    walk: MtpArena::Pass,
+                    first,
+                } => norm_row(mtp, gpu, w, a, eps, first + i)?,
+                Hidden::Target {
+                    walk: MtpArena::Ubatch,
+                    first,
+                } => norm_row(mtp, gpu, w, u, eps, first + i)?,
+            }
+            mtp.enqueue_held(gpu, w, (k, table, mma), (t, pos))?;
+        }
     }
     let n_u = u32::try_from(n)
         .map_err(|_| GpuError::shape(WHAT, format!("a walk of {n} rows passes u32")))?;

@@ -8,7 +8,7 @@
 use bloomery_gpu::GpuError;
 use bloomery_gpu::GpuModel;
 use bloomery_gpu::arch::qwen3moe::{
-    Body35, MtpArena, Qwen35moeModel, mtp_chain, mtp_walk, prompt_with35,
+    Body35, MTP35_STORE_ROWS, MtpArena, Qwen35moeModel, mtp_chain, mtp_walk, prompt_with35,
 };
 
 use super::path35;
@@ -25,8 +25,9 @@ impl MtpBody for Body35 {
     const WIDTH: usize = 1;
     /// A refresh of the verify's two rows is one walk.
     const WALK_ROWS: usize = 2;
-    /// The prompt's store walk takes the same two rows.
-    const STORE_ROWS: usize = 2;
+    /// The prompt's store walk takes the layer's own width: its rows run
+    /// through the GEMMs at once.
+    const STORE_ROWS: usize = MTP35_STORE_ROWS;
 
     type Arena = MtpArena;
     /// A plain step's post-norm row is the head's last position, copied on

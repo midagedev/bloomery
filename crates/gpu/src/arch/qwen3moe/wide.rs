@@ -328,7 +328,7 @@ fn gemm(
 /// The GEMM kernels a wide site launches: the grouped GEMM always, the
 /// 32-value kernels when the load holds them (a load whose sites are all
 /// K-quants holds none; `site` refuses a site that needs them by name).
-fn wide_kernels(k: &Kernels) -> WideKernels<'_> {
+pub(super) fn wide_kernels(k: &Kernels) -> WideKernels<'_> {
     WideKernels {
         gemm: &k.gemm,
         g32: k.q35.as_ref().map(|q| &q.g32),

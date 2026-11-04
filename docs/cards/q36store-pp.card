@@ -1,0 +1,63 @@
+# Round q36store (#1152 item 1): Qwen3.6's MTP draft stores a prompt's K/V rows with one wide-arm GEMM walk
+# of up to 256 rows (Mtp35 store walk: eh_proj, k and v as GEMMs of their own type, the append at no query head)
+# where the base runs each prompt row as a decode-shaped walk (four q8_0_gemv, five small launches, a pinned-word
+# upload that waits on the last upload's event). Same commit apart from the round's diff; the base tree is main.
+#
+# Decomposition, per prompt row, Qwen3.6-35B-A3B UD-Q4_K_M MTP file (22,663,387,424 bytes), A6000, serving defaults:
+#   bytes of the base's four gemvs: eh_proj 4,096 x 2,048 = 8.92 MB, q 2,048 x 8,192 = 17.8 MB, k and v 1.11 MB each
+#     (Q8_0, 34 B / 32 values) = 28.9 MB a row [derived from the shapes]; the Spark nsys measures 470.5 ms / 16,800
+#     q8_0_gemv = 112 us a row on 273 GB/s = 106 us of bytes, so the gemv runs at 94 % of the bus (rig-log
+#     spark-engines.md "Qwen3.6 MTP nsys").
+#   A6000 (768 GB/s peak, ~85 % reached by a gemv): eh_proj + q 26.7 MB = 40 us; k and v are launch-bound, ~7 us
+#     each; the five small kernels (mtp_input, norm_quant, rms_norm, head_norm_neox_append_256, embed) are 82 ms /
+#     4,200 = 19.5 us a row on the Spark, ~15 us here. c_row = 40 + 14 + 15 = ~69 us, range 55..88 us.
+#   Host side per row: 12 enqueues + one pinned-word copy = ~35 us < the card's 69 us; the upload's event wait
+#     (Inbox::host_mut) keeps the host one row ahead, so the card binds and the wall is the card's sum, not a max.
+#   => delta_store(P = 4,096) = 4,096 x c_row = 0.28 s (0.22..0.36); delta_store(512) = 0.035 s (0.028..0.046).
+#   Trunk prefill, MTP off, A6000: the same GA102 as the 3090, whose README row for the plain Q4_K_M reads pp4096
+#     6,652 tok/s = 0.62 s; the A6000 at 0.62..0.70 s (pp512 0.09..0.11 s). Base MTP-on pp4096 = 4,096 / (0.62..0.70
+#     + 0.22..0.36) = 3,900..4,850 tok/s.
+#   The new walk: 16 walks of 256 rows (P = 4,096). One walk reads eh_proj + k + v = 11.1 MB (q is not projected:
+#     nothing reads a store row's query) = 17 us, runs the three GEMMs (256 x 10.5 M MACs = 5.4 GOP int8, ~50..150 us
+#     at 30..100 TOPS) and 12 small launches (~60 us): ~0.3 ms a walk, 5 ms a prompt. pp4096 new = 4,096 / (0.62..0.70
+#     + 0.005..0.008).
+#   => pp4096 new / base = (T + delta_store) / (T + 0.006) - 1 = +34 % (0.62 s, 0.22 s) .. +50 % (0.70 s, 0.36 s).
+#   pp512 (read beside, band +29..+40 %): (0.09..0.11 + 0.028..0.046) / (0.09..0.11 + 0.001) - 1.
+#   MTP on / MTP off in the new tree: -(0.006 / 0.66) = -0.5..-1.2 % (read beside, band -2.0..-0.3 %).
+#   Decode (tg tok/s, the same rows): the window walks are the eager step, unchanged; 0 +- the ruler. The draft's
+#     K/V rows move by the q8 activation error, so the acceptance can move by a rare flip: read, not judged.
+# Resource timeline of the 4,096-row prompt (ms): host CPU base 143 (35 us a row, hidden under the card), new <1;
+#   card base 283 (gemv 223 + small kernels 60), new ~5 + the 640 ms trunk it shares the stream with; PCIe 4,096
+#   8-byte copies (latency only) -> 16; DRAM and NVMe 0 after the file is resident. The wall is the card's sum on
+#   one stream (the walk follows each ubatch unit); bulk (one walk a 256 rows) is the lever taken, asynchrony would
+#   hide at most the new 5 ms under the trunk (<= 0.8 %), so it is not taken.
+# Runner (from /Users/hckim/repo/bloomery-q36store, the full output to a file first):
+# BLOOMERY_MODEL=qwen35moe BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q36store-pp.card
+#   BLOOMERY_REF_MODEL=/models/qwen36-hf/unsloth-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf DEPTH_SERVE_FOLD=depths
+#   BLOOMERY_AB_ROUNDS=4' just depth-serve bloomery-q36store-base:4096 bloomery-q36store:4096
+#   env=BLOOMERY_DRAFT=off:bloomery-q36store:4096 bloomery-q36store-base:512 bloomery-q36store:512
+#   env=BLOOMERY_DRAFT=off:bloomery-q36store:512
+# Wall [derived]: 3 servers a round (one per arm group, both depths on one load), ~45 s load + ~4 s of requests each
+#   = 2.5 min a round, 4 rounds = 10 min (8..14 min); the first round meets the file cold (22.7 GB at ~3 GB/s, 8 s).
+kind: ab
+question: does the Qwen3.6 MTP draft's prompt store walk as one wide-arm GEMM walk of up to 256 rows lift the
+  MTP-on prompt rate over the per-row decode-shaped walk by the derived band, and leave decode where it was?
+term: pp tok/s @ P = 4096 prose ids, ctx the plan's pick, A6000, Qwen3.6-35B-A3B UD-Q4_K_M with its in-file MTP
+  layer at the serving defaults (no --place, no lever), one fresh server a round per tree (both depths on one
+  load); the round's tree against the base tree (main), paired by round. The BLOOMERY_DRAFT=off arm of the round's
+  tree, the P = 512 rows and every row's tg tok/s are read beside, not judged
+unit: %
+predict: +34..+50
+rounds: 4
+condition: both trees' bloomery-serve built before the lease (one cargo oxide build at a time), same card, no row
+  carries [cpu-busy], [other-busy] or [cold], the plan record of both trees' servers equal (the runner's plan
+  drifted check) so both draft the same ubatch and context, and the MTP-off arm's pp is the trunk's T the band
+  was derived from (pp4096 6,000..6,800 tok/s); the gate_qwen35moe_mtp (w) clauses green on the same tree just
+  before the lease
+decide-in: land q36store as the single store path; read the P = 512 rows and the off arm against their bands, and
+  write the measured c_row (off minus base, per row) into the rig-log entry
+decide-below: do not land on the number; split the gap with the off arm: if new/off is above -2 % the walk is
+  right and the A6000's trunk or c_row was off (re-derive T from the off arm); if new/off is below -2 % the new
+  walk costs more than 5 ms, so read its launches and GEMM time in one nsys of a 4,096-id prompt before any change
+decide-above: check the MTP-off arm and the tokens first (a lower base than the derived 3,900 means the base's
+  host side binds, which the timeline put under the card); re-derive c_row from base minus off before landing

@@ -40,14 +40,18 @@
 //!   at this prompt length: a draft attending to one row stays above it.
 //! - (w) the store walk and the step row, after (s): the draft's K/V rows
 //!   below (s)'s last position are overwritten by steps of other ids and
-//!   rows, which moves that position's logits; store walks
-//!   (`WalkMode::Store`, two rows a walk) of (s)'s feed over those positions
-//!   leave the draft's last logits bit for bit (no head runs), and the eager
-//!   step at the last position after them is (s)'s last step bit for bit
-//!   (the store holds the eager walk's keys and values). After two plain
-//!   target steps, a chain at position 1 that reads the target head's row on
-//!   the card (`MtpArena::Step`) gives the token and logits, bit for bit, of
-//!   the same step over that row read back to the host.
+//!   rows, which moves that position's logits; one store walk
+//!   (`WalkMode::Store`, all those rows at once through the wide arm's
+//!   GEMMs) of (s)'s feed over those positions leaves the draft's last
+//!   logits bit for bit (no head runs) and the stored keys and values within
+//!   `key_band` and `value_band` of the eager steps' (s)-stored rows, which
+//!   the GEMMs' q8 activations move where the eager gemv reads f32 rows;
+//!   store walks of three rows over the same positions, after an overwrite,
+//!   store the same bits as the one walk (a row's stored bits are its inputs'
+//!   alone). After two plain target steps, a chain at position 1 that reads
+//!   the target head's row on the card (`MtpArena::Step`) gives the token and
+//!   logits, bit for bit, of the same step over that row read back to the
+//!   host.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -56,7 +60,7 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 #[path = "shared/e2e.rs"]
-#[allow(dead_code, reason = "this gate uses only the shared argmax")]
+#[allow(dead_code, reason = "this gate uses only the shared argmax and rel")]
 mod e2e;
 
 #[cfg(feature = "gpu")]
@@ -68,13 +72,13 @@ mod gate {
     use bloomery_gpu::kv_format::KvQ8;
     use bloomery_gpu::mtp::{MtpInputArgs, MtpKernels};
     use bloomery_gpu::{Gpu, GpuError};
-    use bloomery_gpu_gates::rounding::{U, gamma};
+    use bloomery_gpu_gates::rounding::{U, gamma, q8_32_rel};
     use bloomery_gpu_gates::{
         GateError, bits_equal, checks_failed, open_split, prose_ids, verdict,
     };
     use cuda_core::DeviceBuffer;
     use gguf::Split;
-    use gguf::quant::GgmlType;
+    use gguf::quant::{GgmlType, half_to_f32};
     use model::arch::Arch;
     use model::arch::models::Mixer;
     use model::arch::qwen35moe::mtp::{EH_PROJ, ENORM, HNORM, InFile, SHARED_HEAD_NORM, in_file};
@@ -103,6 +107,33 @@ mod gate {
 
     /// (j)'s embedding width and head-row count: the file's.
     const HIDDEN: usize = 2048;
+
+    /// Rows of the second store walks of (w): a width no caller walks, so the
+    /// first walk's bits equal theirs only when a row's stored bits are its
+    /// inputs' alone, not those of the walk it lands in.
+    const RUN: usize = 3;
+
+    /// PIN(2026-11-04): a store walk's values against an eager walk's over the
+    /// same rows, a position's row at a time. The store walk's projections
+    /// read 32-value q8 blocks where the eager walk's Q8_0 gemv reads the f32
+    /// rows: `eh_proj`'s output moves by at most `rounding::q8_32_rel` of its
+    /// RMS, the attention norm moves a unit vector by at most twice its
+    /// input's relative distance, and the value's own projection adds one
+    /// rounding of its own; the three add (the triangle inequality, as the
+    /// qwen4exp gate's `value_band` adds its two); each side's f16 store one
+    /// rounding of 2^-11. 3 · 1.2858e-2 + 2 · 2^-11 = 3.96e-2.
+    fn value_band() -> f64 {
+        3.0 * q8_32_rel() + 2.0 * 2f64.powi(-11)
+    }
+
+    /// PIN(2026-11-04): a store walk's keys against an eager walk's: the
+    /// value's chain, then each head's RMS norm, which moves a unit vector by
+    /// at most twice its input's relative distance, and the rope, a rotation;
+    /// each side's f16 store one rounding. 2 · 3 · 1.2858e-2 + 2 · 2^-11 =
+    /// 7.81e-2.
+    fn key_band() -> f64 {
+        6.0 * q8_32_rel() + 2.0 * 2f64.powi(-11)
+    }
 
     fn open_at(o: Open35, file: Split) -> Result<Qwen35moeModel, GpuError> {
         Qwen35moeModel::open_mtp(Gpu::new()?, file, o)
@@ -483,6 +514,66 @@ mod gate {
         Ok((token, draft_logits(m)?))
     }
 
+    /// The draft's stored keys and values at positions `0..n`, position-major.
+    fn store_of(m: &Qwen35moeModel, n: usize) -> Result<(Vec<u16>, Vec<u16>), GateError> {
+        let d = m
+            .body(WHAT)?
+            .mtp()
+            .ok_or("the load opened no next-token layer")?;
+        Ok(d.store_host(m.gpu().stream(), n)?)
+    }
+
+    /// The largest relative distance over the positions below `n` of the keys,
+    /// then of the values, in `a` from those in `b` (two [`store_of`] reads of
+    /// `n` positions), a position's row at a time.
+    fn store_rel(a: &(Vec<u16>, Vec<u16>), b: &(Vec<u16>, Vec<u16>), n: usize) -> (f64, f64) {
+        let row = a.0.len() / n.max(1);
+        let f = |v: &[u16]| -> Vec<f32> { v.iter().map(|&x| half_to_f32(x)).collect() };
+        let worst = |x: &[u16], y: &[u16]| {
+            (0..n)
+                .map(|p| {
+                    let r = p * row..(p + 1) * row;
+                    super::e2e::rel(&f(&x[r.clone()]), &f(&y[r]))
+                })
+                .fold(0.0f64, f64::max)
+        };
+        (worst(&a.0, &b.0), worst(&a.1, &b.1))
+    }
+
+    /// Steps of other ids over positions `0..last`, so no stored row is (s)'s.
+    fn overwrite(
+        m: &mut Qwen35moeModel,
+        ids: &[u32],
+        rows: &[f32],
+        last: usize,
+    ) -> Result<(), GateError> {
+        let row = |i: usize| &rows[i * HIDDEN..(i + 1) * HIDDEN];
+        for i in 0..last {
+            host_step(m, (ids[i + 2], i), row(i + 1))?;
+        }
+        Ok(())
+    }
+
+    /// Store walks of (s)'s feed over positions `0..last`, `run` rows a walk.
+    fn store_walks(
+        m: &mut Qwen35moeModel,
+        ids: &[u32],
+        rows: &[f32],
+        (last, run): (usize, usize),
+    ) -> Result<(), GateError> {
+        for pos0 in (0..last).step_by(run) {
+            let end = (pos0 + run).min(last);
+            let feed = Feed {
+                tokens: &ids[pos0 + 1..end + 1],
+                pos0: u32::try_from(pos0)?,
+                hidden: Hidden::Host(&rows[pos0 * HIDDEN..end * HIDDEN]),
+                media: None,
+            };
+            mtp_walk(m, feed, DraftHead::Full, WalkMode::Store)?;
+        }
+        Ok(())
+    }
+
     /// (w) on (s)'s run.
     fn store_clause(
         m: &mut Qwen35moeModel,
@@ -497,25 +588,27 @@ mod gate {
             (at, l[at].to_bits())
         };
         let fed = peak_bits(&run.logits);
-        for i in 0..last {
-            host_step(m, (ids[i + 2], i), row(i + 1))?;
-        }
+        // (s)'s eager steps stored positions `0..last`; read them before the
+        // overwrite.
+        let eager = store_of(m, last)?;
+        overwrite(m, ids, rows, last)?;
         let (_, moved) = host_step(m, (ids[last + 1], last), row(last))?;
         let sensitive = !bits_equal(&moved, &run.logits);
         let before = draft_logits(m)?;
-        for pos0 in (0..last).step_by(<Mtp35 as WalkBounds>::STORE_ROWS) {
-            let end = (pos0 + <Mtp35 as WalkBounds>::STORE_ROWS).min(last);
-            let feed = Feed {
-                tokens: &ids[pos0 + 1..end + 1],
-                pos0: u32::try_from(pos0)?,
-                hidden: Hidden::Host(&rows[pos0 * HIDDEN..end * HIDDEN]),
-                media: None,
-            };
-            mtp_walk(m, feed, DraftHead::Full, WalkMode::Store)?;
-        }
+        let one = <Mtp35 as WalkBounds>::STORE_ROWS;
+        store_walks(m, ids, rows, (last, one))?;
         let kept = bits_equal(&draft_logits(m)?, &before);
+        let whole = store_of(m, last)?;
+        let (dk, dv) = store_rel(&whole, &eager, last);
+        let (bk, bv) = (key_band(), value_band());
+        let band_ok = dk <= bk && dv <= bv;
+        overwrite(m, ids, rows, last)?;
+        store_walks(m, ids, rows, (last, RUN))?;
+        let apart = store_of(m, last)?;
+        let alone = apart == whole;
         let (token, logits) = host_step(m, (ids[last + 1], last), row(last))?;
-        let same = token == run.drafted[last] && bits_equal(&logits, &run.logits);
+        let finite = logits.iter().all(|v| v.is_finite())
+            && token as usize == super::e2e::argmax(&logits) as usize;
         println!(
             "(w) other rows below position {last} move its logits: peak {:?} against \
              (s)'s {fed:?} {}",
@@ -523,14 +616,25 @@ mod gate {
             verdict(sensitive)
         );
         println!(
-            "(w) store walks over positions 0..{last} leave the draft's logits bit for bit {}",
+            "(w) one store walk of {last} rows (the walk takes {one}) leaves the draft's logits \
+             bit for bit {}",
             verdict(kept)
         );
         println!(
-            "(w) the step at position {last} after them: token {token} (s): {}, logits \
-             bit for bit {}",
+            "(w) that walk's stored keys within {dk:.3e} (band {bk:.3e}) and values within \
+             {dv:.3e} (band {bv:.3e}) of (s)'s eager rows {}",
+            verdict(band_ok)
+        );
+        println!(
+            "(w) store walks of {RUN} rows over the same positions, after an overwrite, store the \
+             one walk's keys and values bit for bit {}",
+            verdict(alone)
+        );
+        println!(
+            "(w) the step at position {last} after them: token {token} ((s): {}), finite logits \
+             {}",
             run.drafted[last],
-            verdict(same)
+            verdict(finite)
         );
         m.reset()?;
         m.step(&ids[..1])?;
@@ -554,7 +658,7 @@ mod gate {
             out[0],
             verdict(on_card)
         );
-        Ok(sensitive && kept && same && on_card)
+        Ok(sensitive && kept && band_ok && alone && finite && on_card)
     }
 
     /// (r): the refusals on the live draft, then the last step again.

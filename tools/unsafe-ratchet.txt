@@ -805,7 +805,9 @@ gguf 7 2 0
 # second block beside its loop's, with its SAFETY line.
 # PIN(2026-11-03): gpu 2993 -> 2995 blocks, 413 -> 414 fns, new code, not old code relaxed: `elem::mxfp8_embed_value`,
 # the MXFP8 row decode (the fn and its scale and value byte loads), each with its SAFETY line.
-gpu 2995 414 10
+# PIN(2026-11-04): gpu 2995 -> 2996 blocks, new code, not old code relaxed: the Qwen3.6 draft's 256-row store walk calls
+# KvPlanes::append_256 (an unsafe fn: its key, value and query rows must be the planes' own, pairwise distinct), with its SAFETY.
+gpu 2996 414 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
