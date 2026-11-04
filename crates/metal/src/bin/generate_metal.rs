@@ -876,8 +876,8 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
     /// Each verify keeps both rows, so the session stands two positions on
     /// each; the second row's id is the first's. A group's bytes are the step
     /// group's at the verify's first position: the weights once, so a group
-    /// the verify runs a row at a time (the delta layers' out projection)
-    /// counts each launch's.
+    /// the verify runs a row at a time (a delta out projection the M-row
+    /// head-normed entry does not serve) counts each launch's.
     fn profile_verify_run(s: &mut Session, p: &Profile, mut id: u32) -> Result<(), String> {
         let m = VERIFY_PROFILE_ROWS;
         let rows = s.ctx() - s.pos() as usize;

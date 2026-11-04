@@ -956,6 +956,7 @@ impl Arena {
                 match &l.mixer {
                     MixerBufs::Delta(d) => Layer::Delta {
                         qkv: d.p1.projection(),
+                        out: d.out_quant,
                         ffn,
                         residual,
                     },

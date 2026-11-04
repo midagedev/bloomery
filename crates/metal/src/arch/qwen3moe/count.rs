@@ -10,6 +10,8 @@
 
 use core::num::NonZeroU32;
 
+use crate::kernels::{Quant, headnorm_m_serves};
+
 /// One layer of the token.
 ///
 /// `qkv`, `v` and `in_proj` are the projection that is P1: one dispatch for
@@ -22,6 +24,10 @@ pub enum Layer {
     /// A gated delta layer. The live-key length does not add a dispatch.
     Delta {
         qkv: Projection,
+        /// The out projection's weight type: the verify runs it as one M-row
+        /// dispatch where `headnorm_m_serves`, else a dispatch a row. A token
+        /// has one row, so `token_count` ignores it.
+        out: Quant,
         ffn: FfnKind,
         residual: Residual,
     },
@@ -262,12 +268,14 @@ const VERIFY_HEAD_GROUPS: u32 = 2;
 /// The verify's groups are not the token's: its delta core is three groups of
 /// four dispatches and its flash two of two for each of `flash_launches`
 /// launches (one while its rows share a segment count), the delta layers' out
-/// projection one group of a dispatch a row, and the head two groups, the
-/// logits and then a pick a row. The embed is one group; P1, the attention's
-/// out, the gate-up, the down, an attention layer's biases and each of a plain
-/// residual's two hand-ons are one group of one dispatch each, P1 of its
-/// dispatches. What the verify does not serve (a short conv layer, a routed
-/// FFN, a sandwich) panics by name, as a count that does not fit `u32` does.
+/// projection one group of one dispatch where `headnorm_m_serves` its type at
+/// the verify's rows (an A4 out at two rows) and else a dispatch a row, and
+/// the head two groups, the logits and then a pick a row. The embed is one
+/// group; P1, the attention's out, the gate-up, the down, an attention
+/// layer's biases and each of a plain residual's two hand-ons are one group of
+/// one dispatch each, P1 of its dispatches. What the verify does not serve (a
+/// short conv layer, a routed FFN, a sandwich) panics by name, as a count that
+/// does not fit `u32` does.
 pub fn verify_count(layers: &[Layer], rows: u32, flash_launches: u32) -> TokenCount {
     let (mut groups, mut dispatches) = (1u32, 1u32);
     let mut add = |g: u32, d: u32| {
@@ -276,10 +284,17 @@ pub fn verify_count(layers: &[Layer], rows: u32, flash_launches: u32) -> TokenCo
     };
     for layer in layers {
         match *layer {
-            Layer::Delta { qkv, .. } => {
+            Layer::Delta { qkv, out, .. } => {
                 add(1, qkv.dispatches());
                 add(VERIFY_DELTA_CORE.0, VERIFY_DELTA_CORE.1);
-                add(1, rows);
+                add(
+                    1,
+                    if headnorm_m_serves(out, rows as usize) {
+                        1
+                    } else {
+                        rows
+                    },
+                );
             }
             Layer::Attention { v, bias, .. } => {
                 add(1, v.dispatches());
@@ -442,6 +457,7 @@ mod tests {
     fn routed_delta(qkv: Projection) -> Layer {
         Layer::Delta {
             qkv,
+            out: Quant::A4,
             ffn: FfnKind::Routed,
             residual: Residual::Plain,
         }
@@ -461,8 +477,11 @@ mod tests {
         layers
             .iter()
             .map(|l| match *l {
-                Layer::Delta { qkv, residual, .. } => Layer::Delta {
+                Layer::Delta {
+                    qkv, out, residual, ..
+                } => Layer::Delta {
                     qkv,
+                    out,
                     ffn: FfnKind::Dense,
                     residual,
                 },
@@ -727,8 +746,9 @@ mod tests {
                     ffn,
                     residual: Residual::Plain,
                 },
-                Layer::Delta { qkv, ffn, .. } => Layer::Delta {
+                Layer::Delta { qkv, out, ffn, .. } => Layer::Delta {
                     qkv,
+                    out,
                     ffn,
                     residual: Residual::Plain,
                 },
@@ -767,8 +787,9 @@ mod tests {
         let layers: Vec<Layer> = dense(&vec![routed_delta(Projection::ONE); 64])
             .into_iter()
             .map(|l| match l {
-                Layer::Delta { qkv, ffn, .. } => Layer::Delta {
+                Layer::Delta { qkv, out, ffn, .. } => Layer::Delta {
                     qkv,
+                    out,
                     ffn,
                     residual: Residual::PlainHandOn,
                 },
@@ -825,6 +846,7 @@ mod tests {
             .map(|c| match c {
                 'd' => Layer::Delta {
                     qkv: Projection::ONE,
+                    out: Quant::A4,
                     ffn: FfnKind::Dense,
                     residual: Residual::PlainHandOn,
                 },
@@ -841,18 +863,22 @@ mod tests {
 
     /// A verify of two rows encodes what the layers' ops do, not the token's
     /// one group an op: a delta layer is P1, a core of three groups and four
-    /// dispatches, an out of a dispatch a row, two hand-ons, the pair and the
-    /// down, 9 groups and 11 dispatches; an attention layer is P1, a flash of
+    /// dispatches, an out of one group of one dispatch (the M-row head-normed
+    /// entry serves its A4 out at two rows), two hand-ons, the pair and the
+    /// down, 9 groups and 10 dispatches; an attention layer is P1, a flash of
     /// two groups and two dispatches, the out, two hand-ons, the pair and the
     /// down, 8 and 8; the embed is one of each and the head two groups of
     /// 1 + 2 dispatches. Qwen3.8-27B's four-layer cut (three delta layers and
-    /// an attention layer) is 38 groups (1 + 3 · 9 + 8 + 2) and 45 dispatches
-    /// (1 + 3 · 11 + 8 + 3), Qwen3's four attention layers 35 and 36, and the
-    /// 27B's 48 delta and 16 attention layers 563 and 660, where its profile's
-    /// 498 groups count a core as one and a delta out as a group a row.
+    /// an attention layer) is 38 groups (1 + 3 · 9 + 8 + 2, the out one group
+    /// whatever runs it) and 42 dispatches (1 + 3 · 10 + 8 + 3), Qwen3's four
+    /// attention layers 35 and 36, and the 27B's 48 delta and 16 attention
+    /// layers 563 (1 + 48 · 9 + 16 · 8 + 2) and 612 (1 + 48 · 10 + 16 · 8 +
+    /// 3), where its profile's 498 groups count a core as one and a delta out
+    /// as a group a row.
     ///
-    /// Mutant: `VERIFY_DELTA_CORE` is (1, 1), the delta out one dispatch, the
-    /// head's picks one dispatch, or a plain residual's hand-ons not counted.
+    /// Mutant: `VERIFY_DELTA_CORE` is (1, 1), the delta out a dispatch a row
+    /// at two rows, the head's picks one dispatch, or a plain residual's
+    /// hand-ons not counted.
     #[test]
     fn a_verify_encodes_the_ops_groups_not_the_tokens() {
         let count = |kinds: &str| verify_count(&verify_layers(kinds, false), 2, 1);
@@ -860,7 +886,7 @@ mod tests {
             count("ddda"),
             TokenCount {
                 groups: 38,
-                dispatches: 45
+                dispatches: 42
             }
         );
         assert_eq!(
@@ -874,7 +900,7 @@ mod tests {
             count(&"ddda".repeat(16)),
             TokenCount {
                 groups: 563,
-                dispatches: 660
+                dispatches: 612
             }
         );
         assert_eq!(
@@ -886,9 +912,54 @@ mod tests {
         );
     }
 
-    /// The rows add a dispatch each to a delta layer's out and to the head's
-    /// picks, never a group; the flash's launches add two groups and two
-    /// dispatches each to an attention layer; the biases add one of each.
+    /// A delta layer whose out the M-row head-normed entry does not serve
+    /// (a Q4_K out) keeps a dispatch a row at two rows: the same one group of
+    /// the out, one dispatch more than the A4 out the entry folds into one
+    /// launch.
+    ///
+    /// Mutant: the served arm is asked of the quant alone, so a Q4_K out at
+    /// two rows counts one dispatch.
+    #[test]
+    fn a_q4k_delta_out_stays_a_dispatch_a_row() {
+        let q4k = |kinds: &str| {
+            verify_layers(kinds, false)
+                .into_iter()
+                .map(|l| match l {
+                    Layer::Delta {
+                        qkv, ffn, residual, ..
+                    } => Layer::Delta {
+                        qkv,
+                        out: Quant::Q4K,
+                        ffn,
+                        residual,
+                    },
+                    other => other,
+                })
+                .collect::<Vec<_>>()
+        };
+        // One delta layer of 9 groups and the ends' 3: 12 groups either way
+        // (the out one group), 15 dispatches at a Q4_K out (the out two:
+        // 1 + 11 + 3) against 14 at an A4 out (the out one: 1 + 10 + 3).
+        assert_eq!(
+            verify_count(&q4k("d"), 2, 1),
+            TokenCount {
+                groups: 12,
+                dispatches: 15
+            }
+        );
+        assert_eq!(
+            verify_count(&verify_layers("d", false), 2, 1),
+            TokenCount {
+                groups: 12,
+                dispatches: 14
+            }
+        );
+    }
+
+    /// The rows past the M-row entry's count add a dispatch each to a delta
+    /// layer's out (the entry serves two rows only) and to the head's picks,
+    /// never a group; the flash's launches add two groups and two dispatches
+    /// each to an attention layer; the biases add one of each.
     ///
     /// Mutant: the delta out or the head's picks count a dispatch a launch
     /// and not a row, `flash_launches` is not multiplied, or `BIAS_GROUPS` is
@@ -903,15 +974,17 @@ mod tests {
             base,
             TokenCount {
                 groups: 20,
-                dispatches: 23
+                dispatches: 22
             }
         );
-        // Two more rows: a delta out dispatch each and a pick each.
+        // Two more rows: the delta out leaves the M-row entry's count (a
+        // dispatch a row again, one more than the entry's one) and the head's
+        // picks a dispatch a row: 3 + 2 = 5.
         assert_eq!(
             at("da", false, 4, 1),
             TokenCount {
                 groups: base.groups,
-                dispatches: base.dispatches + 4
+                dispatches: base.dispatches + 5
             }
         );
         // A second launch of the flash.

@@ -298,13 +298,16 @@ pub static QWEN3MOE: Row = Row {
 /// The verify's count is derived on paper from the four layers (three delta
 /// layers and an attention layer, each over a plain residual that hands on):
 /// a delta layer is P1 (1 group, 1 dispatch), the core (3 groups, 4
-/// dispatches: the prep, the ring and the scan, the post), the out (1 group, a
-/// dispatch a row, 2), two hand-ons, the pair and the down, 9 groups and 11
+/// dispatches: the prep, the ring and the scan, the post), the out (1 group of
+/// 1 dispatch), two hand-ons, the pair and the down, 9 groups and 10
 /// dispatches; an attention layer is P1, the flash (2 groups, 2 dispatches:
 /// the append, the flash), the out, two hand-ons, the pair and the down, 8 and
 /// 8; the embed 1 and 1, and the head 2 groups (the logits, the picks) of 1 +
-/// 2 dispatches: 1 + 3 · 9 + 8 + 2 = 38 groups, 1 + 3 · 11 + 8 + 3 = 45
+/// 2 dispatches: 1 + 3 · 9 + 8 + 2 = 38 groups, 1 + 3 · 10 + 8 + 3 = 42
 /// dispatches, 37 barriers.
+// PIN(2026-11-04): the delta out is one M-row dispatch at A4 (the out stays
+// one group), so a delta layer is 10 dispatches where it was a dispatch a
+// row's 11.
 pub static QWEN38D: Row = Row {
     name: "qwen38d",
     arch: "qwen38d",
@@ -320,7 +323,7 @@ pub static QWEN38D: Row = Row {
     count: None,
     verify: Some(Count {
         groups: 38,
-        dispatches: 45,
+        dispatches: 42,
     }),
     mutants: Mutants::Dense,
     skips: &[(
