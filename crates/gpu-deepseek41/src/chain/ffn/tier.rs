@@ -13,7 +13,11 @@
 //!   output at the place's position, so its rows come back packed: the tier
 //!   slot of rank `r` at row `r`, `k` rows for `k` tier slots — the rule of
 //!   a packed block ([`bloomery_gpu::host::tier::BlockRows::Packed`]), set
-//!   by the places alone, so the tier runs no launch of its own for it.
+//!   by the places alone, so the tier runs no launch of its own for it. The
+//!   handoff writes `k` after the tier's places
+//!   ([`bloomery_gpu::host::tier::TierImageLayout::count`]), and the go
+//!   carries it, so a mirrored link's done carries those `k` rows alone
+//!   ([`bloomery_gpu::host::tier::ReplyRows::Packed`]).
 //! - `ds41_ffn_post_tier` (`_streams_tier` without the fold) is the join with
 //!   the card sum over the slots on the stage card or on the tier, in the
 //!   router's pick order, each slot's down output read from the stage card's
@@ -57,7 +61,8 @@ mod tier_kernels {
     /// place to the tier image's word `tsel_at + p` at slot `s`'s position
     /// `p` ([`tier_position`]: its rank among the slots whose tier place is
     /// below `n_tier` when its own is, else the count of those slots plus
-    /// the other slots before it); threads `d < nq` copy the q8_1 code
+    /// the other slots before it), and thread 0 the count of those slots to
+    /// word `tsel_at + 6`; threads `d < nq` copy the q8_1 code
     /// `q3[d]` to the tier image's words `q3_at + 2d` (low half) and `q3_at +
     /// 2d + 1`; threads `d < nd` copy `d8[d]` to word `d8_at + d`; thread 0
     /// copies the sequence word. The go that follows orders every write here
@@ -87,7 +92,7 @@ mod tier_kernels {
             wts_at >= ids_at + 6,
             x_at >= wts_at + 6,
             image.len() >= x_at + n,
-            q3_at >= tsel_at + 6,
+            q3_at >= tsel_at + 7,
             d8_at >= q3_at + 2 * nq,
             timage.len() >= d8_at + nd,
             sel.len() >= 6,
@@ -147,19 +152,23 @@ mod tier_kernels {
             };
             // SAFETY: d < 6, ids_in.len() >= 6 and tmap.len() >= row_off +
             // n_expert by the launch contract.
-            let p = unsafe { tier_position(ids_in, tmap, [row_off, n_expert, n_tier], d) };
+            let (p, k) = unsafe { tier_position(ids_in, tmap, [row_off, n_expert, n_tier], d) };
             // SAFETY: d < 6 <= sel.len() and tsel.len(); ids_at + d and wts_at
             // + d lie in the routing's two spans of the image, apart from each
             // other, from seq_at and from the activation; p < 6, so tsel_at +
-            // p lies in the tier image's places, below q3_at; the six slots'
-            // positions are 0..6 each once, so thread d is each of those
-            // words' only writer.
+            // p lies in the tier image's places, and tsel_at + 6 is the count's
+            // word after them, both below q3_at; the six slots' positions are
+            // 0..6 each once, so thread d is each of those words' only writer,
+            // and thread 0 the count's.
             unsafe {
                 *image.get_unchecked_mut(ids_at as usize + d) = id;
                 *image.get_unchecked_mut(wts_at as usize + d) = w.to_bits();
                 *sel.get_unchecked_mut(d) = place;
                 *tsel.get_unchecked_mut(d) = tplace;
                 *timage.get_unchecked_mut(tsel_at as usize + p) = tplace;
+                if d == 0 {
+                    *timage.get_unchecked_mut(tsel_at as usize + N_USED) = k as u32;
+                }
             }
         }
         if d < nq as usize {
@@ -330,18 +339,18 @@ mod tier_kernels {
 }
 
 /// Slot `s`'s position in a row's tier image, of the six slots `ids_in`
-/// routes, `[row_off, n_expert, n_tier]` the layer's: a slot is a tier slot
-/// when its tier place — `tmap[row_off + id]` for an id below `n_expert`,
-/// [`HOST`] for any other, the place the handoff writes — is below
-/// `n_tier`, the rule the join reads the tier's rows by. A tier slot's
-/// position is its rank, the tier slots before it in slot order; any other
-/// slot's is the tier slots' count plus the other slots before it. The six
-/// positions are 0..6, each once.
+/// routes, `[row_off, n_expert, n_tier]` the layer's, and the tier slots'
+/// count: a slot is a tier slot when its tier place — `tmap[row_off + id]`
+/// for an id below `n_expert`, [`HOST`] for any other, the place the
+/// handoff writes — is below `n_tier`, the rule the join reads the tier's
+/// rows by. A tier slot's position is its rank, the tier slots before it in
+/// slot order; any other slot's is the tier slots' count plus the other
+/// slots before it. The six positions are 0..6, each once.
 ///
 /// SAFETY: `s < 6`, `ids_in.len() >= 6` and `tmap.len() >= row_off +
 /// n_expert`.
 #[inline(always)]
-unsafe fn tier_position(ids_in: &[u32], tmap: &[u32], layer: [u32; 3], s: usize) -> usize {
+unsafe fn tier_position(ids_in: &[u32], tmap: &[u32], layer: [u32; 3], s: usize) -> (usize, usize) {
     let [row_off, n_expert, n_tier] = layer;
     let (mut tier, mut before, mut own) = (0usize, 0usize, false);
     let mut j = 0usize;
@@ -363,7 +372,8 @@ unsafe fn tier_position(ids_in: &[u32], tmap: &[u32], layer: [u32; 3], s: usize)
         }
         j += 1;
     }
-    if own { before } else { tier + s - before }
+    let p = if own { before } else { tier + s - before };
+    (p, tier)
 }
 
 /// Value `d`'s combine of a tier layer, then HC_POST of it: slot `j` is on
@@ -731,6 +741,17 @@ fn enqueue_handoff_tier(
                 tl.q3_words,
                 tl.d8_len,
                 2 * nq
+            ),
+        });
+    }
+    if tl.count() != tl.sel + N_USED {
+        return Err(GpuError::Shape {
+            what: WHAT,
+            detail: format!(
+                "the tier image counts its tier slots at word {}; the handoff writes the count at \
+                 word {}, after one column's {N_USED} places",
+                tl.count(),
+                tl.sel + N_USED
             ),
         });
     }

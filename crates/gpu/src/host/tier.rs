@@ -77,7 +77,7 @@ use cuda_host::cuda_module;
 use model::placement::Machine;
 use model::placement::devices::DeviceInfo;
 
-use super::link::{Crossing, Link, LinkEnd, PostCols, Reader, Span};
+use super::link::{Crossing, Link, LinkEnd, Peer, PostCols, Reader, RemoteEnd, RemoteWire, Span};
 use super::node::TierNode;
 use super::page::MAX_ROWS;
 use super::slots::{MAX_TIERS, Slot, SlotMap};
@@ -359,6 +359,14 @@ impl TierImageLayout {
     pub fn words(&self) -> usize {
         self.x + self.x_len
     }
+
+    /// The word after this tier's places, where a handoff of a
+    /// [`ReplyRows::Packed`] tier writes its tier slots' count: inside the
+    /// places' line, which the layout keeps a word longer for it.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.sel + self.n_used * self.cols
+    }
 }
 
 /// The activation a row's tier image carries, the architecture's choice
@@ -385,6 +393,21 @@ impl TierAct {
     }
 }
 
+/// Which of a row's routed rows a tier's done carries back to the stage
+/// card's page over a mirrored link, the architecture's choice
+/// ([`TierShape::reply`]); the shared page carries nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplyRows {
+    /// Every slot's row of the columns the chain uses.
+    Whole,
+    /// The handoff puts the tier's places of its tier slots first, by rank,
+    /// so the tier's rows come back packed at the front, and writes their
+    /// count after the places ([`TierImageLayout::count`]), which the go
+    /// carries: the done carries that many rows from the front. One column a
+    /// row.
+    Packed,
+}
+
 /// The tier page's layout over `tiers` tiers: each tier's flag lines, then
 /// per row its image (each tier's places, the shared q8_1 activation), then
 /// per row its routed rows (`n_used · cols · hidden` f32, slot-major), which
@@ -400,6 +423,7 @@ pub struct TierLayout {
     sel_stride: usize,
     image_stride: usize,
     rows_stride: usize,
+    reply: ReplyRows,
 }
 
 impl TierLayout {
@@ -423,7 +447,9 @@ impl TierLayout {
     /// else refused by name): the places `n_used · cols`, the activation's
     /// codes and scales — `q3_u64` and `d8_len` are the whole staging's, its
     /// `cols` columns — or its `cols · hidden` f32, and the routed rows
-    /// `n_used · cols · hidden` f32.
+    /// `n_used · cols · hidden` f32. A [`ReplyRows::Packed`] shape takes one
+    /// column a row, else it is refused by name, and its places' line a word
+    /// more for the count.
     pub fn with_cols(
         shape: TierShape,
         cols: usize,
@@ -437,6 +463,7 @@ impl TierLayout {
             n_used,
             rows,
             act,
+            reply,
         } = shape;
         if !(1..=MAX_ROWS).contains(&rows)
             || !(1..=MAX_TIERS).contains(&tiers)
@@ -453,10 +480,23 @@ impl TierLayout {
                 ),
             ));
         }
+        if reply == ReplyRows::Packed && cols != 1 {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("a packed reply of rows of {cols} columns: it counts the rows of one"),
+            ));
+        }
         let o = || GpuError::shape(WHAT, "the page's size passes usize");
         let q3_words = q3_u64.checked_mul(2).ok_or_else(o)?;
         let places = n_used.checked_mul(cols).ok_or_else(o)?;
-        let sel_stride = places.next_multiple_of(64);
+        let count = match reply {
+            ReplyRows::Whole => 0,
+            ReplyRows::Packed => 1,
+        };
+        let sel_stride = places
+            .checked_add(count)
+            .ok_or_else(o)?
+            .next_multiple_of(64);
         let q3 = sel_stride.checked_mul(tiers).ok_or_else(o)?;
         let d8 = q3
             .checked_add(q3_words)
@@ -495,6 +535,7 @@ impl TierLayout {
             sel_stride,
             image_stride,
             rows_stride,
+            reply,
         };
         l.bytes().ok_or_else(o)?;
         Ok(l)
@@ -511,7 +552,8 @@ impl TierLayout {
     }
 
     /// Bytes in one row's go and done posts of a chain of `cols` columns,
-    /// including their generation words.
+    /// including their generation words: a packed reply's done at most, its
+    /// every slot's row.
     #[must_use]
     pub fn wire_bytes(&self, cols: usize) -> [usize; 2] {
         let crossings = self.crossings();
@@ -579,8 +621,9 @@ impl TierLayout {
     /// Every counter of the page and the bytes it publishes, as a link that
     /// mirrors the page carries them: per tier and row the go, which
     /// publishes the row's image, and the done, which publishes the columns
-    /// of the row's routed rows its chain uses and the tier's fault copy and
-    /// counts in its progress word.
+    /// of the row's routed rows its chain uses — of a packed reply the rows
+    /// its tier's count word in that image names — and the tier's fault copy,
+    /// and counts in its progress word.
     fn crossings(&self) -> Vec<Crossing> {
         let image = 4 * self.image.words();
         let rows = 4 * self.image.n_used * self.image.cols * self.image.hidden;
@@ -589,6 +632,19 @@ impl TierLayout {
             .flat_map(|(t, r)| {
                 let fault = self.word_off(t, TWord::Fault);
                 let go = self.image_off(r)..self.image_off(r) + image;
+                let routed = self.rows_off(r)..self.rows_off(r) + rows;
+                let routed = match self.reply {
+                    ReplyRows::Whole => Span {
+                        bytes: routed,
+                        cols: self.image.cols,
+                        count: None,
+                    },
+                    ReplyRows::Packed => Span::counted(
+                        routed,
+                        self.image_off(r) + 4 * (t * self.sel_stride + self.image.count()),
+                        4 * self.image.hidden,
+                    ),
+                };
                 [
                     Crossing {
                         counter: self.word_off(t, TWord::Go(r)),
@@ -599,13 +655,7 @@ impl TierLayout {
                     Crossing {
                         counter: self.word_off(t, TWord::Cnt(r)),
                         reader: Reader::Stage,
-                        spans: vec![
-                            Span {
-                                bytes: self.rows_off(r)..self.rows_off(r) + rows,
-                                cols: self.image.cols,
-                            },
-                            Span::whole(fault..fault + 8),
-                        ],
+                        spans: vec![routed, Span::whole(fault..fault + 8)],
                         prog: Some(self.word_off(t, TWord::Prog)),
                     },
                 ]
@@ -613,14 +663,15 @@ impl TierLayout {
             .collect()
     }
 
-    /// One tier's end, with its relay tail apart from every other tier's.
+    /// One tier's end of the remote page `link`, on its wire, with its relay
+    /// tail apart from every other tier's.
     fn remote_end(
         &self,
         link: &Link,
         index: usize,
         side: Reader,
         ip: std::net::IpAddr,
-    ) -> Result<super::link::RdmaEnd, GpuError> {
+    ) -> Result<RemoteEnd, GpuError> {
         self.check_tier(index)?;
         let n = 2 * self.rows;
         let bytes = TierPage::bytes_of(*self, "the remote tier page")?;
@@ -631,7 +682,7 @@ impl TierLayout {
             .skip(index * n)
             .take(n)
             .collect();
-        link.rdma_end(tail, crossings, side, ip)
+        link.remote_end(tail, crossings, side, ip)
     }
 
     /// Bytes the page holds.
@@ -643,14 +694,16 @@ impl TierLayout {
 }
 
 /// The shapes a tier is cut for: the model width, the routed slots a token,
-/// the rows in flight, and the activation its image carries; the columns a
-/// row carries are [`TierCard::open_cols`]'s.
+/// the rows in flight, the activation its image carries and the rows its
+/// done carries back; the columns a row carries are
+/// [`TierCard::open_cols`]'s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TierShape {
     pub hidden: usize,
     pub n_used: usize,
     pub rows: usize,
     pub act: TierAct,
+    pub reply: ReplyRows,
 }
 
 /// One row's windows over the page as the stage card's launches address
@@ -723,10 +776,15 @@ impl TierPage {
         Self::over(stage, layout, link)
     }
 
-    /// A page of this process alone, with one RDMA end per remote tier.
-    pub(super) fn remote(stage: &Gpu, layout: TierLayout) -> Result<TierPage, GpuError> {
+    /// A page of this process alone, with one end per remote tier over
+    /// `wire`, which each tier node meets with its own page's end.
+    pub(super) fn remote(
+        stage: &Gpu,
+        layout: TierLayout,
+        wire: RemoteWire,
+    ) -> Result<TierPage, GpuError> {
         let bytes = Self::bytes_of(layout, "TierPage::remote")?;
-        let link = Link::remote(stage.context(), bytes, layout.crossings().len())?;
+        let link = Link::remote(stage.context(), bytes, layout.crossings().len(), wire)?;
         Self::over(stage, layout, link)
     }
 
@@ -939,6 +997,15 @@ impl TierPage {
         self.layout.counters(tier)
     }
 
+    /// Bytes this process's ends of the link posted for tier `tier`'s dones
+    /// ([`Link::posted_bytes`]).
+    pub(super) fn posted_bytes(&self, tier: usize) -> u64 {
+        let dones: Vec<usize> = (0..self.layout.rows)
+            .map(|r| self.off(tier, TWord::Cnt(r)))
+            .collect();
+        self.link.posted_bytes(&dones)
+    }
+
     /// Release every wait of both cards on the page's words that is still
     /// pending, for good: every tier's counters and go counters go far past
     /// anything a step subtracts, in one link call ([`Link::release`]), which
@@ -1124,6 +1191,11 @@ pub struct TierStats {
     pub replays: u64,
     pub feeds: u64,
     pub captures: u64,
+    /// Bytes this process's ends of a mirrored or remote link posted for the
+    /// tier's dones (the rows, the fault copy, the generation word): with the
+    /// tier's card in this process every done's, on a tier node none (the
+    /// node's end posts them), 0 on the shared page.
+    pub posted_bytes: u64,
 }
 
 /// One row's routed rows on the page as the tier's copy out writes them (the
@@ -1362,21 +1434,30 @@ impl TierWork {
         Ok(layout)
     }
 
-    /// Bind this node's own page and connect its RDMA end to the stage's endpoint.
+    /// Bind this node's own page, its end on the wire of the stage's `peer`,
+    /// connected to it, as tier `index` of `tiers`, `ip` the control socket's
+    /// local address; what the stage's end needs to meet this one. A TCP end
+    /// dials the stage's listener and names the address it dialed from, so
+    /// its endpoint is read after the connect.
     pub(super) fn bind_remote(
         &mut self,
         tiers: usize,
         index: usize,
-        peer: &bloomery_verbs::Endpoint,
+        peer: &Peer,
         ip: std::net::IpAddr,
-    ) -> Result<bloomery_verbs::Endpoint, GpuError> {
+    ) -> Result<Peer, GpuError> {
         let layout = self.binding_layout(tiers, index)?;
         let bytes = TierPage::bytes_of(layout, "TierWork::bind_remote")?;
-        let mut link = Link::remote(self.gpu.context(), bytes, layout.crossings().len())?;
+        let mut link = Link::remote(
+            self.gpu.context(),
+            bytes,
+            layout.crossings().len(),
+            peer.wire(),
+        )?;
         link.store(layout.word_off(index, TWord::Fault), FAULT_NONE);
         let mut end = layout.remote_end(&link, index, Reader::Tier, ip)?;
+        end.connect(0x200, peer)?;
         let endpoint = end.endpoint(0x200);
-        end.connect(endpoint.psn, peer)?;
         link.keep_remote(end);
         self.bind(layout, index, link.own_end(), link.post_cols());
         self.link = Some(link);
@@ -1895,7 +1976,7 @@ impl TierCard {
                 let mut end = layout.remote_end(&page.link, index, Reader::Stage, n.local_ip()?)?;
                 let endpoint = end.endpoint(0x100);
                 let peer = n.bind_remote(layout.tiers, index, &endpoint)?;
-                end.connect(endpoint.psn, &peer)?;
+                end.connect(0x100, &peer)?;
                 page.link.keep_remote(end);
             }
             TierSide::Node(n) => {
@@ -2145,9 +2226,12 @@ impl TierCard {
     }
 
     /// Release the remote reader's waits and drain its stream, keeping its relay stopped.
+    /// Nothing for a lost node: no card of this process waits on its page, and a node that
+    /// loses this process releases its own words ([`TierWork::release_opened`]).
     pub(super) fn release_remote(&mut self, page: &TierPage) -> Result<(), GpuError> {
         if page.link.is_remote()
             && let TierSide::Node(n) = &mut self.side
+            && n.lost().is_none()
         {
             n.release_remote()?;
         }
@@ -2485,8 +2569,8 @@ pub(super) mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use super::{
-        TIER_CHAINS, TIER_FLAGS, TWord, TierAct, TierLayout, TierPage, TierSet, TierShape,
-        chain_slot,
+        ReplyRows, Span, TIER_CHAINS, TIER_FLAGS, TWord, TierAct, TierLayout, TierPage, TierSet,
+        TierShape, chain_slot,
     };
     use crate::Gpu;
     use crate::host::slots::{HOST, Slot, SlotMap, TIER};
@@ -2536,6 +2620,7 @@ pub(super) mod tests {
             n_used: 1,
             rows: 1,
             act: TierAct::F32,
+            reply: ReplyRows::Whole,
         };
         let mut work = super::TierWork::open(gpu, weights, Box::new(Empty(dropped)), shape, 1)
             .expect("empty work");
@@ -2700,6 +2785,7 @@ pub(super) mod tests {
         n_used: 6,
         rows: 2,
         act: TierAct::Q8,
+        reply: ReplyRows::Packed,
     };
 
     /// V4.1's tier page of one tier: two rows of six slots over 4096 values,
@@ -2734,6 +2820,42 @@ pub(super) mod tests {
         assert!(TierLayout::new(TierShape { rows: 5, ..V41 }, 512, 32, 1).is_err());
         assert!(TierLayout::new(V41, 512, 32, 0).is_err());
         assert!(TierLayout::new(V41, 512, 32, 9).is_err());
+    }
+
+    /// V4.1's packed reply: each row's done counts its rows, `hidden` f32
+    /// each, by the word after tier 0's places in that row's image, which the
+    /// row's go carries; the page's offsets are a whole reply's, the count
+    /// inside the places' line. A whole reply's done carries its rows by
+    /// columns, and a packed reply of rows of two columns is refused by name.
+    #[test]
+    fn a_packed_reply_counts_its_rows_by_a_word_its_go_carries() {
+        let packed = TierLayout::new(V41, 512, 32, 1).expect("V4.1's tier page");
+        let whole = TierShape {
+            reply: ReplyRows::Whole,
+            ..V41
+        };
+        let whole = TierLayout::new(whole, 512, 32, 1).expect("a whole reply's page");
+        let i = packed.image(0).expect("tier 0");
+        assert_eq!((i.count(), i.q3), (6, 64));
+        assert_eq!(Some(i), whole.image(0).ok());
+        assert_eq!(packed.bytes(), whole.bytes());
+        let (pc, wc) = (packed.crossings(), whole.crossings());
+        for r in 0..2 {
+            let (go, done) = (&pc[2 * r], &pc[2 * r + 1]);
+            let word = packed.image_off(r) + 4 * 6;
+            assert!(
+                go.spans[0].bytes.contains(&word),
+                "row {r}'s go carries its count"
+            );
+            let rows = packed.rows_off(r)..packed.rows_off(r) + 4 * 6 * 4096;
+            assert_eq!(done.spans[0], Span::counted(rows.clone(), word, 4 * 4096));
+            assert_eq!(wc[2 * r + 1].spans[0], Span::whole(rows));
+            assert_eq!(done.spans[1..], wc[2 * r + 1].spans[1..]);
+        }
+        assert!(matches!(
+            TierLayout::with_cols(V41, 2, 512, 32, 1),
+            Err(crate::GpuError::Shape { detail, .. }) if detail.contains("a packed reply")
+        ));
     }
 
     /// A release interrupted after any store leaves a loss marker before
@@ -2842,6 +2964,7 @@ pub(super) mod tests {
             n_used: 8,
             rows: 2,
             act: TierAct::F32,
+            reply: ReplyRows::Whole,
         };
         let l = TierLayout::new(glm, 0, 0, 1).expect("GLM's tier page");
         let i = l.image(0).expect("tier 0");
@@ -2873,6 +2996,7 @@ pub(super) mod tests {
             n_used: 10,
             rows: 1,
             act: TierAct::F32,
+            reply: ReplyRows::Whole,
         };
         let l = TierLayout::with_cols(q38, 4, 0, 0, 1).expect("Qwen3.8's tier page");
         let i = l.image(0).expect("tier 0");

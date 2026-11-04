@@ -807,7 +807,8 @@ gguf 7 2 0
 # the MXFP8 row decode (the fn and its scale and value byte loads), each with its SAFETY line.
 # PIN(2026-11-04): gpu 2995 -> 2996 blocks, new code, not old code relaxed: the Qwen3.6 draft's 256-row store walk calls
 # KvPlanes::append_256 (an unsafe fn: its key, value and query rows must be the planes' own, pairwise distinct), with its SAFETY.
-gpu 2996 414 10
+# PIN(2026-11-05): gpu 2996 -> 2997 blocks, new code, not old code relaxed: the TCP link's SO_BUSY_POLL setsockopt (host/link/tcp.rs busy_poll), with its SAFETY line.
+gpu 2997 414 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -846,7 +847,9 @@ gpu 2996 414 10
 # loads, and the store, each with its SAFETY line.
 # PIN(2026-11-03): gpu-deepseek41 402 -> 404 blocks, new code, not old code relaxed: glue.rs's MXFP8 engram row
 # kernel `ds41_glue_engram_rows_mxfp8` (its decode call and its store), each with its SAFETY line.
-gpu-deepseek41 404 44 0
+# PIN(2026-11-05): gpu-deepseek41 404/44 -> 407/45 blocks/fns, new code, not old code relaxed: the packed tier reply's
+# tier_position (chain/ffn/tier.rs, an unsafe fn with its contract and three indexed reads, each with its SAFETY line)
+gpu-deepseek41 407 45 0
 # PIN(2026-10-24): gpu-flint starts at 2 blocks, 0 fns and 0 impls: step and prompt
 # call the checked common attention binding with staged distinct positions, each with SAFETY.
 gpu-flint 2 0 0

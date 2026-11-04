@@ -38,7 +38,8 @@ use model::r8file::R8Source;
 use super::node::{NodeFamily, NodeOpen};
 use super::run::{HostRun, HostWidths};
 use super::tier::{
-    TierAct, TierBlock, TierCard, TierExperts, TierInput, TierIo, TierOpen, TierSet, TierShape,
+    ReplyRows, TierAct, TierBlock, TierCard, TierExperts, TierInput, TierIo, TierOpen, TierSet,
+    TierShape,
 };
 use crate::card_leg::{CardLeg, ExpertInput, LegBufs, LegRun, LegShape, LegStacks, STACK_ROLES};
 use crate::hybrid::{Hybrid, SlotMap};
@@ -394,6 +395,7 @@ impl LegOpen {
             n_used: self.n_used,
             rows: self.rows,
             act: TierAct::F32,
+            reply: ReplyRows::Whole,
         }
     }
 

@@ -25,7 +25,9 @@
 //! in a pass of two rows (`docs/contrib/dgx-spark.md` 9.5, item 2).
 //!
 //! A span may hold a row's columns one after another ([`Span`]): a post
-//! carries only the columns the chain in flight uses ([`PostCols`]).
+//! carries only the columns the chain in flight uses ([`PostCols`]). A span
+//! of one column may count its rows: a post carries only as many rows from
+//! its front as a word on the writer's page names ([`Span::counted`]).
 //!
 //! The inbox and two staging words per crossing (the generation a post sends
 //! and the progress a reset sends) are the link's tail, past the tier page's
@@ -101,18 +103,39 @@ pub struct Crossing {
 
 /// A byte range a crossing publishes, laid out as `cols` equal columns one
 /// after another: a post carries its first columns, as many as the end's
-/// [`PostCols`] holds when it posts, and all of a span of one column.
+/// [`PostCols`] holds when it posts, and all of a span of one column. A
+/// counted span (`count`, one column of rows) carries its first rows, as
+/// many as its count word names ([`Span::counted`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Span {
     pub bytes: Range<usize>,
     pub cols: usize,
+    /// The byte of the count word on the writer's page and the bytes of a
+    /// row; `None` for a span carried by its columns alone.
+    pub count: Option<(usize, usize)>,
 }
 
 impl Span {
     /// The span carried whole: one column.
     #[must_use]
     pub fn whole(bytes: Range<usize>) -> Span {
-        Span { bytes, cols: 1 }
+        Span {
+            bytes,
+            cols: 1,
+            count: None,
+        }
+    }
+
+    /// One column of rows of `row` bytes each, of which a post carries the
+    /// first `k`, `k` the word at byte `word` of the writer's page when it
+    /// posts.
+    #[must_use]
+    pub fn counted(bytes: Range<usize>, word: usize, row: usize) -> Span {
+        Span {
+            bytes,
+            cols: 1,
+            count: Some((word, row)),
+        }
     }
 
     /// Bytes a post carries when its chain uses `cols` columns.
@@ -194,6 +217,9 @@ struct Line {
     relay: Relay,
     /// Set by a release: nothing is carried for this line until its reset.
     stopped: bool,
+    /// The writer's side: bytes posted for the line's generations, its spans
+    /// and generation words, resets apart.
+    bytes: u64,
 }
 
 impl Line {
@@ -260,6 +286,25 @@ impl Half {
                 "the crossing {c:?} is not 4-aligned columns before the link's tail at byte {tail}"
             ));
         }
+        if let Some((c, s)) = crossings
+            .iter()
+            .flat_map(|c| c.spans.iter().map(move |s| (c, s)))
+            .find(|(_, s)| {
+                s.count.is_some_and(|(word, row)| {
+                    s.cols != 1
+                        || !fits(&(word..word + 4))
+                        || row == 0
+                        || !row.is_multiple_of(4)
+                        || !s.bytes.len().is_multiple_of(row)
+                })
+            })
+        {
+            return Err(format!(
+                "the crossing at byte {} counts {s:?}: a count word 4-aligned before the link's \
+                 tail at byte {tail}, over one column of whole rows of 4-aligned bytes",
+                c.counter
+            ));
+        }
         let moves = Vec::with_capacity(
             crossings
                 .iter()
@@ -279,6 +324,7 @@ impl Half {
                     posted: 0,
                     relay: Relay::at(0),
                     stopped: false,
+                    bytes: 0,
                 }
             })
             .collect();
@@ -357,24 +403,19 @@ impl Half {
             }
         }
         let cols = self.cols.get();
-        let moves = &mut self.moves;
-        moves.clear();
-        moves.extend(line.c.spans.iter().map(|s| Move {
-            from: s.bytes.start,
-            to: s.bytes.start,
-            len: s.bytes_at(cols),
-        }));
+        if let Err(why) = moves_of(line, page, cols, &mut self.moves) {
+            self.break_with(why);
+            return false;
+        }
         page.word(line.gen_slot()).store(g, Ordering::Relaxed);
-        moves.push(Move {
-            from: line.gen_slot(),
-            to: line.inbox(),
-            len: 4,
-        });
-        if let Err(e) = wire.post(moves) {
+        let bytes: usize = self.moves.iter().map(|m| m.len).sum();
+        if let Err(e) = wire.post(&self.moves) {
             self.break_with(e);
             return false;
         }
-        self.lines[i].posted = g;
+        let line = &mut self.lines[i];
+        line.posted = g;
+        line.bytes += bytes as u64;
         true
     }
 
@@ -577,6 +618,16 @@ impl Half {
         self.unsettled
     }
 
+    /// Bytes this end posted for the generations of the counters at bytes
+    /// `counters` it writes ([`Line::bytes`]).
+    pub(super) fn posted(&self, counters: &[usize]) -> u64 {
+        self.lines
+            .iter()
+            .filter(|l| l.writes && counters.contains(&l.c.counter))
+            .map(|l| l.bytes)
+            .sum()
+    }
+
     /// The counter of every crossing this end carries.
     pub(super) fn counters(&self) -> Vec<usize> {
         self.lines.iter().map(|l| l.c.counter).collect()
@@ -586,6 +637,57 @@ impl Half {
     pub(super) fn broken(&self) -> Option<&str> {
         self.broken.as_deref()
     }
+}
+
+/// A post of `line`'s generation at `cols` columns, into `moves`: each span's
+/// bytes the chain uses, a counted span's first rows alone, no move of no
+/// bytes, then the generation from its staging word into the inbox. A count
+/// past its span is refused by name, before any byte moves.
+fn moves_of(
+    line: &Line,
+    page: &dyn Page,
+    cols: usize,
+    moves: &mut Vec<Move>,
+) -> Result<(), String> {
+    moves.clear();
+    for s in &line.c.spans {
+        let mut len = s.bytes_at(cols);
+        if let Some((word, row)) = s.count {
+            // The count is this generation's: the writing card's handoff wrote
+            // it into the row's image, which the go before this done carried
+            // to this page, data first, its generation last; this end's pump
+            // delivered that go (an Acquire read of the inbox) before the card
+            // ran it, and read the counter above with Acquire. The row's next
+            // go leaves only after the reader took this done, which this post
+            // carries, so no later image is here yet.
+            let k = page.word(word).load(Ordering::Acquire);
+            match (k as usize).checked_mul(row) {
+                Some(b) if b <= s.bytes.len() => len = len.min(b),
+                _ => {
+                    return Err(format!(
+                        "the count word at byte {word} names {k} rows of {row} bytes past the \
+                         span of {} bytes at byte {} that the counter at byte {} publishes",
+                        s.bytes.len(),
+                        s.bytes.start,
+                        line.c.counter
+                    ));
+                }
+            }
+        }
+        if len > 0 {
+            moves.push(Move {
+                from: s.bytes.start,
+                to: s.bytes.start,
+                len,
+            });
+        }
+    }
+    moves.push(Move {
+        from: line.gen_slot(),
+        to: line.inbox(),
+        len: 4,
+    });
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1402,6 +1504,7 @@ pub(super) mod tests {
         crossings[1].spans = vec![Span {
             bytes: ROWS..ROWS + 64,
             cols: 4,
+            count: None,
         }];
         let cols = PostCols::default();
         let mut end = Half::new(crossings, Reader::Tier, TAIL, &*tier, cols.clone())
@@ -1422,5 +1525,109 @@ pub(super) mod tests {
             }
         }
         assert_eq!(end.broken(), None);
+    }
+
+    // A done whose rows count themselves carries the rows its count word
+    // names from the front, then the fault copy and the generation: at
+    // V4.1's rows of 20 480 bytes, 0, 1, 2 and 6 rows post 12, 20 492, 40 972
+    // and 122 892 bytes, where the rows carried whole post 122 892 each time;
+    // a row past the count keeps what the stage's page held. A count past the
+    // span ends the end by name before any byte moves, and a count word that
+    // is not 4-aligned before the tail, a row that does not divide the span
+    // or a span of more than one column is refused at load.
+    #[test]
+    fn a_counted_done_carries_the_rows_its_count_names() {
+        const ROW: usize = 20_480;
+        const CNT: usize = 64;
+        const PROG: usize = 128;
+        const COUNT: usize = 216;
+        const FAULT: usize = 256;
+        const ROWS: usize = 512;
+        const TAIL: usize = ROWS + 6 * ROW;
+        let mem = || {
+            Arc::new(Mem((0..(TAIL + TAIL_LINE) / 4)
+                .map(|_| AtomicU32::new(0))
+                .collect()))
+        };
+        let done = |rows: Span| {
+            vec![Crossing {
+                counter: CNT,
+                reader: Reader::Stage,
+                spans: vec![rows, Span::whole(FAULT..FAULT + 8)],
+                prog: Some(PROG),
+            }]
+        };
+        let value = |generation: u32, w: usize| generation << 24 | (w / 4) as u32;
+        for (counted, want) in [
+            (false, [122_892u64; 4]),
+            (true, [12, 20_492, 40_972, 122_892]),
+        ] {
+            let (stage, tier) = (mem(), mem());
+            let rows = if counted {
+                Span::counted(ROWS..TAIL, COUNT, ROW)
+            } else {
+                Span::whole(ROWS..TAIL)
+            };
+            let mut end = Half::new(done(rows), Reader::Tier, TAIL, &*tier, PostCols::default())
+                .expect("the row fits before the tail");
+            let mut to_stage = wire(&tier, &stage);
+            let (mut before, mut held) = (0, [0u32; 6]);
+            for (generation, (k, want)) in (1u32..).zip([0u32, 1, 2, 6].into_iter().zip(want)) {
+                for w in (ROWS..TAIL).step_by(4) {
+                    tier.word(w).store(value(generation, w), Ordering::Relaxed);
+                }
+                tier.word(COUNT).store(k, Ordering::Relaxed);
+                tier.word(CNT).store(generation, Ordering::Release);
+                assert!(end.pass(&*tier, &mut to_stage));
+                let posted = end.posted(&[CNT]);
+                assert_eq!(
+                    posted - before,
+                    want,
+                    "bytes posted for a done of {k} rows, counted {counted}"
+                );
+                before = posted;
+                let carried = if counted { k as usize } else { 6 };
+                for (r, h) in held.iter_mut().enumerate() {
+                    if r < carried {
+                        *h = generation;
+                    }
+                    for w in (ROWS + r * ROW..ROWS + (r + 1) * ROW).step_by(4) {
+                        let expect = if *h == 0 { 0 } else { value(*h, w) };
+                        let got = stage.word(w).load(Ordering::Acquire);
+                        assert_eq!(got, expect, "row {r} at {k} rows, counted {counted}");
+                    }
+                }
+            }
+            assert_eq!(end.broken(), None);
+            if counted {
+                tier.word(COUNT).store(7, Ordering::Relaxed);
+                tier.word(CNT).store(5, Ordering::Release);
+                assert!(!end.pass(&*tier, &mut to_stage));
+                assert!(
+                    end.broken()
+                        .is_some_and(|b| b.contains("names 7 rows of 20480 bytes past")),
+                    "{:?}",
+                    end.broken()
+                );
+                assert_eq!(
+                    stage.word(TAIL).load(Ordering::Acquire),
+                    4,
+                    "no generation moved"
+                );
+                assert_eq!(end.posted(&[CNT]), before, "no byte moved");
+            }
+        }
+        for bad in [
+            Span {
+                cols: 2,
+                ..Span::counted(ROWS..TAIL, COUNT, ROW)
+            },
+            Span::counted(ROWS..TAIL, COUNT + 2, ROW),
+            Span::counted(ROWS..TAIL, TAIL, ROW),
+            Span::counted(ROWS..TAIL, COUNT, ROW + 4),
+        ] {
+            let refused = Half::new(done(bad), Reader::Tier, TAIL, &*mem(), PostCols::default());
+            assert!(refused.is_err_and(|e| e.contains("counts")));
+        }
     }
 }

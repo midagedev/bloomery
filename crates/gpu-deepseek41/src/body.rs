@@ -81,7 +81,7 @@ use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::host::served::{ResidencyParts, TierBody};
 use bloomery_gpu::host::swap::{PassReport, Residency};
 use bloomery_gpu::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
-use bloomery_gpu::host::tier::{TierAct, TierCard, TierSet, TierShape};
+use bloomery_gpu::host::tier::{ReplyRows, TierAct, TierCard, TierSet, TierShape};
 use bloomery_gpu::host::{PassKind, refuse_tier_count};
 use bloomery_gpu::hybrid::{
     Boundary, BoundaryShape, Chain, HostResidency, Hybrid, SlotMap, refuse_expert_tiers,
@@ -2661,6 +2661,7 @@ fn node_hparams(file: &Split, open: &NodeOpen) -> Result<Hparams, GpuError> {
             n_used: hp.experts.n_used,
             rows: PAIR_ROWS,
             act: TierAct::Q8,
+            reply: ReplyRows::Packed,
         })
         || open.set.n_expert() != hp.experts.n_expert
         || open.layers != hp.n_layer
@@ -2719,6 +2720,7 @@ fn open_tier(
             n_used: hp.experts.n_used,
             rows: PAIR_ROWS,
             act: TierAct::Q8,
+            reply: ReplyRows::Packed,
         },
         cols: 1,
         layers: hp.n_layer,

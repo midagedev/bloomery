@@ -1,0 +1,13 @@
+--- a/crates/gpu-deepseek41/src/chain/ffn/tier.rs
++++ b/crates/gpu-deepseek41/src/chain/ffn/tier.rs
+@@ -167,7 +167,9 @@
+                 *tsel.get_unchecked_mut(d) = tplace;
+                 *timage.get_unchecked_mut(tsel_at as usize + p) = tplace;
+                 if d == 0 {
+-                    *timage.get_unchecked_mut(tsel_at as usize + N_USED) = k as u32;
++                    let prev = *timage.get_unchecked_mut(tsel_at as usize + N_USED + 1);
++                    *timage.get_unchecked_mut(tsel_at as usize + N_USED) = prev;
++                    *timage.get_unchecked_mut(tsel_at as usize + N_USED + 1) = k as u32;
+                 }
+             }
+         }

@@ -430,7 +430,8 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               `tcp` is the loopback's two pages, each held by its own end with its own pump \
               thread, the posts sent as framed writes over one TCP stream between the two ends \
               and landed by a receiver thread on each, with an ack for each post; local tiers \
-              meet on the loopback address. It needs no NIC beyond TCP. \
+              meet on the loopback address, a node's tier on the control channel's. It needs no \
+              NIC beyond TCP. \
               Each pump spins on one core while the load lives. Read where the host tier takes \
               its tier cards.",
         site: Site::Parsed {
@@ -447,12 +448,13 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               plan's tier order, one a tier, where a `tier_server` process serves that tier's \
               card over its control channel. A loopback node can map the stage's file under \
               `/dev/shm`. A private or 198.18.0.0/15 IPv4 node off this host requires `BLOOMERY_TIER_LINK=rdma` \
-              or `tcp`: each process holds its own page and exchanges its endpoint on the channel. \
-              A node binds its page over RDMA alone so far: a load refuses `tcp` with a node by \
-              name. The \
+              or `tcp`: each process holds its own page and exchanges its endpoint on the channel \
+              (over `tcp`, the stage's listener on the channel's local address, which the node \
+              dials). The \
               channel has no authentication and belongs on a trusted network. The plan takes \
               each tier card from its node's census. \
-              Qwen3.8's load opens a tier on a node; the other families refuse one by name. \
+              Qwen3.8's, V4.1's, GLM's and Solar-Open2's loads open a tier on a node, which \
+              `tier_server` serves when built with that family's feature. \
               Read where a load takes its tier cards.",
         site: Site::Parsed {
             left: &[],

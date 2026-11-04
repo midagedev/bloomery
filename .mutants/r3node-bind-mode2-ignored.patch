@@ -1,0 +1,11 @@
+--- a/crates/gpu/src/host/node.rs
++++ b/crates/gpu/src/host/node.rs
+@@ -1732,7 +1732,7 @@
+                     1 | 2 => {
+                         let tiers = i.len("tiers").map_err(bad)?;
+                         let index = i.len("index").map_err(bad)?;
+-                        let remote = read_peer(mode, &mut i).map_err(bad)?;
++                        let remote = read_peer(1, &mut i).map_err(bad)?;
+                         i.end().map_err(bad)?;
+                         let ip = self.local_ip;
+                         let endpoint =

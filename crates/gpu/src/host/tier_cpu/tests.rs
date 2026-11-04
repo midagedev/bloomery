@@ -3,7 +3,7 @@ use crate::graph::Graph;
 use crate::host::node::{NodeCensus, NodeOpen};
 use crate::host::nvtier::{ArenaKind, NvTier};
 use crate::host::run::HostWidths;
-use crate::host::tier::{TierAct, TierWork};
+use crate::host::tier::{ReplyRows, TierAct, TierWork};
 use crate::weights::Weights;
 use bloomery_levers::NvTierEvict;
 use cuda_core::DeviceBuffer;
@@ -149,6 +149,7 @@ fn node_nvme_host_run(
             n_used: 2,
             rows: 2,
             act,
+            reply: ReplyRows::Whole,
         };
         let mut open = NodeOpen {
             nvme: None,

@@ -128,8 +128,8 @@ pub mod xstream;
 
 pub use leg::{BatchLeg, LegTimer, ServeNote, StepLeg};
 pub use link::{
-    Crossing, GatherLoop, GatherSet, GatherShape, Gathers, PostCols, RdmaEnd, Reader, Span, TcpEnd,
-    TcpPeer, link_tail,
+    Crossing, GatherLoop, GatherSet, GatherShape, Gathers, Peer, PostCols, RdmaEnd, Reader,
+    RemoteWire, Span, TcpEnd, TcpPeer, link_tail,
 };
 
 use crate::GpuError;
@@ -2071,16 +2071,11 @@ impl<H: HostExperts> HostTier<H> {
         let mut page = match (tiers.iter().find_map(TierCard::node), kind) {
             (None, _) => TierPage::new(stage, tiers[0].gpu()?, layout, kind)?,
             (Some(_), bloomery_levers::TierLink::Shared) => TierPage::across(stage, layout)?,
-            (Some(_), bloomery_levers::TierLink::Rdma) => TierPage::remote(stage, layout)?,
-            (Some(addr), bloomery_levers::TierLink::Tcp) => {
-                return Err(GpuError::shape(
-                    WHAT,
-                    format!(
-                        "{}=tcp with an expert tier on the node at {addr}: a node binds its \
-                         page over the shared file or RDMA (TierCard::bind)",
-                        bloomery_levers::TIER_LINK
-                    ),
-                ));
+            (Some(_), bloomery_levers::TierLink::Rdma) => {
+                TierPage::remote(stage, layout, link::RemoteWire::Rdma)?
+            }
+            (Some(_), bloomery_levers::TierLink::Tcp) => {
+                TierPage::remote(stage, layout, link::RemoteWire::Tcp)?
             }
             (Some(addr), kind @ bloomery_levers::TierLink::Loopback) => {
                 return Err(GpuError::shape(
@@ -2204,10 +2199,18 @@ impl<H: HostExperts> HostTier<H> {
         first
     }
 
-    /// What each tier has done since load, in tier order.
+    /// What each tier has done since load, in tier order, with the bytes
+    /// this process's ends of the page's link posted for its dones.
     #[must_use]
     pub fn tier_stats(&self) -> Vec<tier::TierStats> {
-        self.tiers.iter().map(TierCard::stats).collect()
+        self.tiers
+            .iter()
+            .enumerate()
+            .map(|(t, card)| tier::TierStats {
+                posted_bytes: self.tier_page.as_ref().map_or(0, |p| p.posted_bytes(t)),
+                ..card.stats()
+            })
+            .collect()
     }
 
     /// The experts of layer `layer` the tier cards hold, summed over the

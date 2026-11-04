@@ -5,9 +5,11 @@
 //! server's process (node 1, [`serve`]), and each step node 0 asks of it is a
 //! request over a TCP control channel ([`TierNode`]). A shared page is a
 //! file under `/dev/shm` both processes map ([`super::link::Link::across`]).
-//! An RDMA bind gives each process its own page and exchanges its queue
-//! pair's endpoint on this channel; each end carries only its tier's
-//! crossings. The channel has no authentication.
+//! A remote bind gives each process its own page, whose end of the link,
+//! RDMA or TCP, exchanges what the other end needs to meet it on this channel
+//! ([`super::link::Peer`]: a queue pair's endpoint, or a TCP listener's
+//! address and nonce); each end carries only its tier's crossings. The
+//! channel has no authentication.
 //!
 //! On connect the server sends its census ([`NodeCensus`]): node 0 plans
 //! the tier on the device it names ([`node_cards`]). The open
@@ -49,10 +51,11 @@ use model::placement::{
 };
 
 use super::DRAIN_DEADLINE;
+use super::link::{Peer, TcpPeer};
 use super::step::{Chain, GO_DEADLINE};
 use super::tier::{
-    TIER_CHAINS, TIER_GRACE, TierAct, TierCard, TierExperts, TierLayout, TierSet, TierShape,
-    TierWork, chain_slot,
+    ReplyRows, TIER_CHAINS, TIER_GRACE, TierAct, TierCard, TierExperts, TierLayout, TierSet,
+    TierShape, TierWork, chain_slot,
 };
 use crate::fault::{FAULT_NONE, Fault};
 use crate::model::CardBytes;
@@ -777,6 +780,10 @@ impl NodeOpen {
             TierAct::Q8 => 0,
             TierAct::F32 => 1,
         });
+        o.u8(match s.reply {
+            ReplyRows::Whole => 0,
+            ReplyRows::Packed => 1,
+        });
         o.len(self.cols)
             .len(self.layers)
             .len(self.block.0)
@@ -856,6 +863,11 @@ impl NodeOpen {
             1 => TierAct::F32,
             a => return Err(format!("an activation form {a}")),
         };
+        let reply = match i.u8("reply rows")? {
+            0 => ReplyRows::Whole,
+            1 => ReplyRows::Packed,
+            r => return Err(format!("a reply of rows {r}")),
+        };
         Ok(NodeOpen {
             nvme,
             family,
@@ -869,6 +881,7 @@ impl NodeOpen {
                 n_used,
                 rows: rows_,
                 act,
+                reply,
             },
             cols: i.len("columns")?,
             layers: i.len("layers")?,
@@ -970,6 +983,77 @@ pub fn write_file_bind(
     })?;
     out.u8(0).str(path).len(bytes).len(tiers).len(index);
     Ok(())
+}
+
+/// The bind mode of a remote bind over `peer`'s wire: 1 RDMA, 2 TCP. A
+/// remote bind's request is its mode, the page's tiers and the tier's index,
+/// then the stage's end's peer; its reply is the mode and the tier's end's
+/// peer.
+fn peer_mode(peer: &Peer) -> u8 {
+    match peer {
+        Peer::Rdma(_) => 1,
+        Peer::Tcp(_) => 2,
+    }
+}
+
+/// `peer`'s fields as a remote bind of its mode carries them.
+fn write_peer(peer: &Peer, out: &mut Out) {
+    match peer {
+        Peer::Rdma(e) => write_endpoint(e, out),
+        Peer::Tcp(t) => write_tcp_peer(t, out),
+    }
+}
+
+/// The peer a remote bind of mode `mode` carries; a mode that is not a
+/// remote bind's is refused by name.
+fn read_peer(mode: u8, i: &mut In<'_>) -> Result<Peer, String> {
+    match mode {
+        1 => read_endpoint(i).map(Peer::Rdma),
+        2 => read_tcp_peer(i).map(Peer::Tcp),
+        m => Err(format!("unknown remote bind mode {m}")),
+    }
+}
+
+/// A remote bind's reply: its mode and the tier's end's peer, the whole
+/// payload.
+fn read_peer_reply(body: &[u8]) -> Result<Peer, String> {
+    let mut i = In::new(body);
+    let mode = i.u8("bind mode")?;
+    let peer = read_peer(mode, &mut i)?;
+    i.end()?;
+    Ok(peer)
+}
+
+/// A TCP end's address, as 16 bytes (an IPv4 address IPv6-mapped), its
+/// port and its nonce.
+fn write_tcp_peer(t: &TcpPeer, out: &mut Out) {
+    let ip = match t.addr.ip() {
+        std::net::IpAddr::V4(a) => a.to_ipv6_mapped(),
+        std::net::IpAddr::V6(a) => a,
+    };
+    out.bytes(&ip.octets())
+        .u32(u32::from(t.addr.port()))
+        .u64(t.nonce);
+}
+
+/// [`write_tcp_peer`]'s fields, an IPv6-mapped address read back as the
+/// IPv4 address it maps; an unspecified address or a port of 0 or past
+/// `u16` is refused by name.
+fn read_tcp_peer(i: &mut In<'_>) -> Result<TcpPeer, String> {
+    let octets: [u8; 16] = i
+        .bytes("TCP address")?
+        .try_into()
+        .map_err(|_| "a TCP address is 16 bytes")?;
+    let ip = std::net::Ipv6Addr::from(octets).to_canonical();
+    let port = i.u32("TCP port")?;
+    let nonce = i.u64("TCP nonce")?;
+    match u16::try_from(port) {
+        Ok(port) if port != 0 && !ip.is_unspecified() => Ok(TcpPeer {
+            addr: SocketAddr::new(ip, port),
+            nonce,
+        }),
+        _ => Err(format!("an invalid TCP endpoint: {ip} port {port}")),
+    }
 }
 
 fn write_endpoint(e: &bloomery_verbs::Endpoint, out: &mut Out) {
@@ -1176,20 +1260,21 @@ impl TierNode {
         self.ask(Tag::Bind, REPLY, "bind")
     }
 
-    /// Bind a page held by this node's own RDMA end, exchanging endpoints on the control channel.
+    /// Bind a page held by this node's own end, on the wire of the stage's
+    /// end `peer` (bind mode 1 RDMA, 2 TCP), as tier `index` of `tiers`:
+    /// the peers of the two ends exchanged on the control channel, the
+    /// node's end connected to the stage's before it answers. Returns the
+    /// node's end's peer.
     pub(super) fn bind_remote(
         &mut self,
         tiers: usize,
         index: usize,
-        endpoint: &bloomery_verbs::Endpoint,
-    ) -> Result<bloomery_verbs::Endpoint, GpuError> {
-        self.req.clear().u8(1).len(tiers).len(index);
-        write_endpoint(endpoint, &mut self.req);
+        peer: &Peer,
+    ) -> Result<Peer, GpuError> {
+        self.req.clear().u8(peer_mode(peer)).len(tiers).len(index);
+        write_peer(peer, &mut self.req);
         self.call(Tag::Bind, REPLY, "remote bind")?;
-        let mut i = In::new(self.ch.body());
-        read_endpoint(&mut i)
-            .and_then(|e| i.end().map(|()| e))
-            .map_err(|e| self.lose_now("remote bind", e))
+        read_peer_reply(self.ch.body()).map_err(|e| self.lose_now("remote bind", e))
     }
 
     pub(super) fn local_ip(&self) -> Result<std::net::IpAddr, GpuError> {
@@ -1644,15 +1729,16 @@ impl Session<'_> {
                             .work
                             .bind_opened(Path::new(&path), bytes, tiers, index)?;
                     }
-                    1 => {
+                    1 | 2 => {
                         let tiers = i.len("tiers").map_err(bad)?;
                         let index = i.len("index").map_err(bad)?;
-                        let remote = read_endpoint(&mut i).map_err(bad)?;
+                        let remote = read_peer(mode, &mut i).map_err(bad)?;
                         i.end().map_err(bad)?;
                         let ip = self.local_ip;
                         let endpoint =
                             self.opened()?.work.bind_remote(tiers, index, &remote, ip)?;
-                        write_endpoint(&endpoint, &mut self.reply);
+                        self.reply.u8(peer_mode(&endpoint));
+                        write_peer(&endpoint, &mut self.reply);
                     }
                     _ => return Err(bad(format!("unknown bind mode {mode}")).into()),
                 }
@@ -1908,8 +1994,9 @@ pub(super) mod tests {
     };
     use crate::GpuError;
     use crate::fault::{Fault, FaultSite};
+    use crate::host::link::{Peer, TcpPeer};
     use crate::host::step::Chain;
-    use crate::host::tier::{TierAct, TierSet, TierShape};
+    use crate::host::tier::{ReplyRows, TierAct, TierSet, TierShape};
     use gguf::write::{Layout, Writer};
     use gguf::{GgmlType, Split};
     use model::placement::devices::{DeviceId, DeviceInfo};
@@ -2017,6 +2104,7 @@ pub(super) mod tests {
                 n_used: 1,
                 rows: 1,
                 act: TierAct::F32,
+                reply: ReplyRows::Whole,
             },
             cols: 1,
             layers: 1,
@@ -2163,6 +2251,7 @@ pub(super) mod tests {
                 n_used: 1,
                 rows: 1,
                 act: TierAct::F32,
+                reply: ReplyRows::Whole,
             },
             cols: 1,
             planes: (0, 0),
@@ -2258,6 +2347,66 @@ pub(super) mod tests {
             super::write_endpoint(&invalid, &mut out);
             assert!(super::read_endpoint(&mut In::new(out.done())).is_err());
         }
+    }
+
+    /// A remote bind carries each wire's peer under its own mode: a TCP
+    /// peer's IPv4 address comes back as that IPv4 address (the stage's end
+    /// compares it with the address the dial came from), an IPv6 one as
+    /// itself; a reply reads back as the peer of its mode, every truncation
+    /// and an unspecified address or a port of 0 or past `u16` refused.
+    #[test]
+    fn remote_binds_carry_each_wires_peer_under_its_mode() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let rdma = Peer::Rdma(bloomery_verbs::Endpoint {
+            qpn: 7,
+            psn: 0x100,
+            gid: bloomery_verbs::Gid { raw: [1; 16] },
+            addr: 0x1000,
+            rkey: 9,
+        });
+        let v4 = Peer::Tcp(TcpPeer {
+            addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 2)), 40_001),
+            nonce: 0xfeed_beef_0123_4567,
+        });
+        let v6 = Peer::Tcp(TcpPeer {
+            addr: SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 9),
+            nonce: 1,
+        });
+        let mut out = Out::default();
+        for peer in [rdma, v4, v6] {
+            out.clear().u8(super::peer_mode(&peer));
+            super::write_peer(&peer, &mut out);
+            assert_eq!(super::read_peer_reply(out.done()), Ok(peer), "{peer:?}");
+            for n in 0..out.done().len() {
+                assert!(super::read_peer_reply(&out.done()[..n]).is_err(), "{n}");
+            }
+        }
+        out.clear().u8(super::peer_mode(&v4));
+        super::write_peer(&v4, &mut out);
+        assert_eq!(out.done()[0], 2, "TCP is bind mode 2");
+        assert_eq!(
+            &out.done()[1 + 8..1 + 8 + 16],
+            &Ipv4Addr::new(198, 18, 0, 2).to_ipv6_mapped().octets(),
+            "16 bytes after their length, IPv6-mapped"
+        );
+        for (ip, port) in [
+            (Ipv6Addr::UNSPECIFIED, 1),
+            (Ipv4Addr::LOCALHOST.to_ipv6_mapped(), 0),
+            (Ipv4Addr::LOCALHOST.to_ipv6_mapped(), 1 << 16),
+        ] {
+            out.clear().u8(2).bytes(&ip.octets()).u32(port).u64(0);
+            let read = super::read_peer_reply(out.done());
+            assert!(
+                read.as_ref()
+                    .is_err_and(|e| e.contains("an invalid TCP endpoint")),
+                "{ip} {port}: {read:?}"
+            );
+        }
+        out.clear().u8(0);
+        assert!(
+            super::read_peer_reply(out.done())
+                .is_err_and(|e| e.contains("unknown remote bind mode 0"))
+        );
     }
 
     #[test]
@@ -2365,6 +2514,7 @@ pub(super) mod tests {
                 n_used: 10,
                 rows: 1,
                 act: TierAct::F32,
+                reply: ReplyRows::Whole,
             },
             cols: 4,
             layers: 3,

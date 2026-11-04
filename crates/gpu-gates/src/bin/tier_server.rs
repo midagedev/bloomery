@@ -15,7 +15,8 @@
 //! `glm5next` or `solar2` feature; an open of another family is refused by
 //! name. The explicit
 //! listen address is loopback, private or 198.18.0.0/15 IPv4. Off-host nodes bind their
-//! own RDMA pages over this control channel, which has no authentication and belongs on a trusted network.
+//! own RDMA or TCP pages over this control channel, which has no authentication and belongs on a trusted
+//! network.
 //! A port of 0 takes a free
 //! one. The server prints `listening on <ip:port>` once bound, serves one
 //! load, and exits 0 once node 0 closes that load, whether node 0's side of

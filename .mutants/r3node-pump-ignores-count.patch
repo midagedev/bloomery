@@ -1,0 +1,11 @@
+--- a/crates/gpu/src/host/link/pump.rs
++++ b/crates/gpu/src/host/link/pump.rs
+@@ -662,7 +662,7 @@
+             // carries, so no later image is here yet.
+             let k = page.word(word).load(Ordering::Acquire);
+             match (k as usize).checked_mul(row) {
+-                Some(b) if b <= s.bytes.len() => len = len.min(b),
++                Some(b) if b <= s.bytes.len() => len = len.min(s.bytes.len()),
+                 _ => {
+                     return Err(format!(
+                         "the count word at byte {word} names {k} rows of {row} bytes past the \

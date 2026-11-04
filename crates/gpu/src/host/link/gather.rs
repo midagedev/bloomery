@@ -261,6 +261,7 @@ impl Gathers {
                         spans: vec![Span {
                             bytes: self.part(i, set, writer),
                             cols: s.shape.rows,
+                            count: None,
                         }],
                         prog: None,
                     });

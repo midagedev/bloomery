@@ -3352,7 +3352,7 @@ pub fn tier_ip(ip: std::net::IpAddr) -> bool {
 /// `BLOOMERY_TIER_NODES` from the process environment ([`TIER_NODES`]),
 /// parsed as [`at_main`] parses it, and refused when it is set to a value its
 /// kind does not take and when a retired name is set: the address of each
-/// expert tier's node, in tier order; empty when unset. An off-host node requires RDMA.
+/// expert tier's node, in tier order; empty when unset. An off-host node requires RDMA or TCP.
 pub fn tier_nodes() -> Result<Vec<SocketAddr>, LeverError> {
     let env = process_env();
     let levers = read(&env, Scope::TierNodes)?;

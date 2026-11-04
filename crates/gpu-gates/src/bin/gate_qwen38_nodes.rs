@@ -100,7 +100,7 @@ mod gate {
     use bloomery_gpu::host::slots::SlotMap;
     use bloomery_gpu::host::step::Chain;
     use bloomery_gpu::host::swap::Residency;
-    use bloomery_gpu::host::tier::{TierAct, TierCard, TierOpen, TierSet, TierShape};
+    use bloomery_gpu::host::tier::{ReplyRows, TierAct, TierCard, TierOpen, TierSet, TierShape};
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::{
         GateError, beside, checks_failed, data_dir, prose_ids, ref_model_path, verdict,
@@ -811,6 +811,7 @@ mod gate {
                 n_used: 1,
                 rows: 1,
                 act: TierAct::F32,
+                reply: ReplyRows::Whole,
             },
             cols: 1,
             layers: plan.model.layers,
