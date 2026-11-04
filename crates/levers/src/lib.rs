@@ -980,9 +980,13 @@ pub(crate) fn reading(env: &[(OsString, OsString)], scope: Scope<'_>) -> Reading
             },
         }
     }
-    let rdma = entries
+    let link = entries
         .iter()
-        .any(|e| e.row.name == TIER_LINK && e.value == Some(Value::Word("rdma")));
+        .find(|e| e.row.name == TIER_LINK)
+        .and_then(|e| match &e.value {
+            Some(Value::Word(w)) => Some(*w),
+            _ => None,
+        });
     let nodes_of = |name: &str| {
         entries
             .iter()
@@ -992,10 +996,15 @@ pub(crate) fn reading(env: &[(OsString, OsString)], scope: Scope<'_>) -> Reading
                 _ => None,
             })
     };
-    for name in [TIER_NODES, TP_NODES] {
+    // An expert tier's page crosses over either wire; a tensor-parallel run's
+    // gathers take RDMA ends alone.
+    for (name, links, need) in [
+        (TIER_NODES, &["rdma", "tcp"][..], "rdma or tcp"),
+        (TP_NODES, &["rdma"][..], "rdma"),
+    ] {
         if let Some((entry, addrs)) = nodes_of(name)
             && addrs.iter().any(|a| !a.ip().is_loopback())
-            && !rdma
+            && !link.is_some_and(|w| links.contains(&w))
         {
             refused.push(Refusal {
                 name: name.to_string(),
@@ -1003,7 +1012,7 @@ pub(crate) fn reading(env: &[(OsString, OsString)], scope: Scope<'_>) -> Reading
                     .set
                     .clone()
                     .expect("node addresses came from a set lever"),
-                why: Why::Value(format!("a node off this host requires {TIER_LINK}=rdma")),
+                why: Why::Value(format!("a node off this host requires {TIER_LINK}={need}")),
             });
         }
     }
@@ -3310,6 +3319,9 @@ pub enum TierLink {
     /// Two pages, each with its own pump thread posting RDMA writes to the
     /// other.
     Rdma,
+    /// Two pages, each with its own pump thread posting framed writes to the
+    /// other over one TCP stream, and a receiver thread landing the other's.
+    Tcp,
 }
 
 /// `BLOOMERY_TIER_LINK` from the process environment, parsed as [`at_main`]
@@ -3322,7 +3334,8 @@ pub fn tier_link() -> Result<TierLink, LeverError> {
         None | Some(Value::Word("shared")) => Ok(TierLink::Shared),
         Some(Value::Word("loopback")) => Ok(TierLink::Loopback),
         Some(Value::Word("rdma")) => Ok(TierLink::Rdma),
-        v => panic!("{TIER_LINK} holds {v:?}, not shared, loopback or rdma"),
+        Some(Value::Word("tcp")) => Ok(TierLink::Tcp),
+        v => panic!("{TIER_LINK} holds {v:?}, not shared, loopback, rdma or tcp"),
     }
 }
 

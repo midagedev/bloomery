@@ -1,0 +1,12 @@
+--- a/crates/levers/src/lib.rs	2026-11-04 23:40:52
++++ b/crates/levers/src/lib.rs	2026-11-04 23:40:52
+@@ -999,7 +999,8 @@
+     // An expert tier's page crosses over either wire; a tensor-parallel run's
+     // gathers take RDMA ends alone.
+     for (name, links, need) in [
+-        (TIER_NODES, &["rdma", "tcp"][..], "rdma or tcp"),
++        // MUTANT M5: an off-host tier node takes RDMA alone.
++        (TIER_NODES, &["rdma"][..], "rdma or tcp"),
+         (TP_NODES, &["rdma"][..], "rdma"),
+     ] {
+         if let Some((entry, addrs)) = nodes_of(name)

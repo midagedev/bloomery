@@ -20,8 +20,10 @@
 //!   in process, one pump thread driving both ends; the RDMA link
 //!   ([`Link::rdma`]) carries it as RDMA writes between two queue pairs on
 //!   one RoCE port, each end with its own device context and pump thread
-//!   ([`rdma::RdmaEnd`]), which is what one node holds of a link between
-//!   two.
+//!   ([`rdma::RdmaEnd`]); the TCP link ([`Link::tcp`]) carries it as framed
+//!   writes over one TCP stream on the machine's loopback, each end with its
+//!   own pump and receiver threads ([`tcp::TcpEnd`]). An RDMA or a TCP end is
+//!   what one node holds of a link between two.
 //!
 //! A tier served by another process on the same machine (a tier node,
 //! [`super::node`]) reaches a shared page through a file under `/dev/shm`
@@ -44,6 +46,7 @@
 mod gather;
 mod pump;
 mod rdma;
+mod tcp;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -62,6 +65,7 @@ pub use gather::{GatherLoop, GatherSet, GatherShape, Gathers};
 pub use pump::{Crossing, PostCols, Reader, Span};
 use pump::{Half, Move, Page, TAIL_LINE, Wire};
 pub use rdma::RdmaEnd;
+pub use tcp::{TcpEnd, TcpPeer};
 
 /// How long a reset, release or drop waits for an end's posts in flight to
 /// finish, and a release or drop then for the posts it aborted.
@@ -407,8 +411,9 @@ impl LinkEnd {
 impl Link {
     /// The link of kind `kind` over `bytes` zeroed bytes of page: the shared
     /// page, allocated in `stage`, or mirrored pages, whose ends carry
-    /// `crossings` ([`Link::loopback`], [`Link::rdma`]) and refuse one by name
-    /// ([`Half::new`]). Load-time only; `stage` is current on return.
+    /// `crossings` ([`Link::loopback`], [`Link::rdma`], [`Link::tcp`]) and
+    /// refuse one by name ([`Half::new`]). Load-time only; `stage` is current
+    /// on return.
     pub(super) fn new(
         kind: TierLink,
         stage: &Arc<CudaContext>,
@@ -423,6 +428,7 @@ impl Link {
             }
             TierLink::Loopback => Link::loopback(stage, tier, bytes, crossings, what),
             TierLink::Rdma => Link::rdma(stage, tier, bytes, crossings, what),
+            TierLink::Tcp => Link::tcp(stage, tier, bytes, crossings),
         }
     }
 
@@ -614,6 +620,51 @@ impl Link {
         let (se, te) = (s.endpoint(s_psn), t.endpoint(t_psn));
         s.connect(s_psn, &te)?;
         t.connect(t_psn, &se)?;
+        let (s_pump, stage_end) = s.into_parts();
+        let (t_pump, tier_end) = t.into_parts();
+        Ok(Link {
+            mirror: Some(Mirror {
+                pumps: s_pump.into_iter().chain(t_pump).collect(),
+                stage: stage_end,
+                tier: tier_end,
+                #[cfg(test)]
+                run_on: None,
+            }),
+            remote: None,
+            page,
+            counters: Vec::new(),
+            path: None,
+            post_cols,
+        })
+    }
+
+    /// The TCP link on one machine: the two pages ([`Link::pages`]), each
+    /// held by a TCP end with its own stream, receiver thread and pump thread,
+    /// the tier's end dialing the stage's listener on the loopback address.
+    /// Load-time only; `stage` is current on return.
+    fn tcp(
+        stage: &Arc<CudaContext>,
+        tier: &Arc<CudaContext>,
+        bytes: usize,
+        crossings: Vec<Crossing>,
+    ) -> Result<Link, GpuError> {
+        let (tail, page, tier) = Link::pages(stage, tier, bytes, crossings.len())?;
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let post_cols = PostCols::default();
+        let open = |side, page: &Arc<MappedHost>| {
+            TcpEnd::new(
+                Arc::clone(page),
+                tail,
+                crossings.clone(),
+                side,
+                ip,
+                post_cols.clone(),
+            )
+        };
+        let (mut s, mut t) = (open(Reader::Stage, &page)?, open(Reader::Tier, &tier)?);
+        // The tier's dial waits in the stage's listen queue until its accept.
+        t.connect(&s.endpoint())?;
+        s.connect(&t.endpoint())?;
         let (s_pump, stage_end) = s.into_parts();
         let (t_pump, tier_end) = t.into_parts();
         Ok(Link {

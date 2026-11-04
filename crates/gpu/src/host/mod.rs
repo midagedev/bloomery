@@ -128,8 +128,8 @@ pub mod xstream;
 
 pub use leg::{BatchLeg, LegTimer, ServeNote, StepLeg};
 pub use link::{
-    Crossing, GatherLoop, GatherSet, GatherShape, Gathers, PostCols, RdmaEnd, Reader, Span,
-    link_tail,
+    Crossing, GatherLoop, GatherSet, GatherShape, Gathers, PostCols, RdmaEnd, Reader, Span, TcpEnd,
+    TcpPeer, link_tail,
 };
 
 use crate::GpuError;
@@ -2072,6 +2072,16 @@ impl<H: HostExperts> HostTier<H> {
             (None, _) => TierPage::new(stage, tiers[0].gpu()?, layout, kind)?,
             (Some(_), bloomery_levers::TierLink::Shared) => TierPage::across(stage, layout)?,
             (Some(_), bloomery_levers::TierLink::Rdma) => TierPage::remote(stage, layout)?,
+            (Some(addr), bloomery_levers::TierLink::Tcp) => {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "{}=tcp with an expert tier on the node at {addr}: a node binds its \
+                         page over the shared file or RDMA (TierCard::bind)",
+                        bloomery_levers::TIER_LINK
+                    ),
+                ));
+            }
             (Some(addr), kind @ bloomery_levers::TierLink::Loopback) => {
                 return Err(GpuError::shape(
                     WHAT,

@@ -1,0 +1,12 @@
+--- a/crates/gpu/src/host/link/tcp.rs	2026-11-04 23:40:28
++++ b/crates/gpu/src/host/link/tcp.rs	2026-11-04 23:40:28
+@@ -231,7 +231,8 @@
+     };
+     let mut frame = head.bytes().to_vec();
+     frame.extend_from_slice(&why.as_bytes()[..n]);
+-    drop(s.write_all(&frame));
++    // MUTANT M4: the bye is never sent.
++    drop((&mut s, frame));
+ }
+ 
+ /// Read the text of the bye `h` heads from `rx`: why the other end ended.
