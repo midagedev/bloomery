@@ -97,7 +97,9 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 mod probe {
     use bloomery_gpu::host::node::{read_tcp_peer, wire, write_tcp_peer};
-    use bloomery_gpu::host::rank::{Bootstrap, Control, Fingerprint, RankList, RankSession, psn};
+    use bloomery_gpu::host::rank::{
+        Bootstrap, Control, Fingerprint, RankList, RankSession, RankWire, psn,
+    };
     use bloomery_gpu::host::step::RELEASE;
     use bloomery_gpu::host::{
         Crossing, GatherSet, GatherShape, Gathers, PeerPath, PostCols, RdmaEnd, Reader, Span,
@@ -1287,6 +1289,7 @@ mod probe {
         let how = Bootstrap {
             fabric: o.fabric.clone(),
             wait: Duration::from_secs(60).max(o.deadline),
+            wire: RankWire::Rdma,
         };
         enter("bootstrap");
         let mut session = RankSession::open(gpu, &o.ranks, o.rank, &how, &fp, &[], &shapes)?;
@@ -1294,7 +1297,7 @@ mod probe {
         print_paths(o, session.paths());
         let g = session.gathers().ok_or("a gather of one rank")?.clone();
         let page = Arc::clone(session.page().ok_or("a gather of one rank")?);
-        let ends = Wire::Rdma(session.ends());
+        let ends = Wire::Rdma(session.ends().ok_or("a gather over RDMA ends")?);
         let mut watch = Vec::new();
         for slot in 0..shapes.len() {
             for set in 0..Gathers::SETS {
