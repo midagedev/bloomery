@@ -9,7 +9,9 @@
 //! here rather than carrying a copy. A comparison of two whole runs, the
 //! call's last position and the steps that follow it, is [`walk`]: the
 //! one walk over their positions in order that the tier and two-card gates
-//! share.
+//! share. Two runs a server answered, which hold their generated ids and each
+//! row's top-2 gap but not the rows, compare through [`parted`], by the same
+//! clarity rule ([`gap_is_clear`]).
 
 use crate::prompts::MARGIN_FLOOR;
 
@@ -37,6 +39,12 @@ pub const LOGITS_MAX_PIN: f64 = 16.0;
 // PIN(2026-10-30): the grouped GEMM's sum order; the largest of 16 cases a tier, real 1.245 (P=1), fixture
 // 0.184, x2. Not derived, as the max pin.
 pub const LOGITS_RMS_PIN: f64 = 2.5;
+
+/// Whether a row whose top-1 leads its top-2 by `gap` is clear at the margin `floor`: the one
+/// clarity rule of the band's positions ([`LogitsBand::add_at`]) and of [`parted`]'s.
+pub fn gap_is_clear(gap: f32, floor: f32) -> bool {
+    gap >= floor
+}
 
 /// The band one order's logits are held to against the other's (the
 /// module doc): the largest and RMS |Δlogit| over every compared
@@ -91,7 +99,7 @@ impl LogitsBand {
         let want: Vec<f32> = want.iter().copied().map(f32::from_bits).collect();
         let (got_id, _, _, _) = crate::kld::top2(&got);
         let (want_id, top1, _, top2) = crate::kld::top2(&want);
-        let clear = top1 - top2 >= floor;
+        let clear = gap_is_clear(top1 - top2, floor);
         self.clear += usize::from(clear);
         self.disagree += usize::from(clear && got_id != want_id);
         for (&g, &w) in got.iter().zip(&want) {
@@ -267,6 +275,80 @@ pub fn walk_at(what: &str, want: Positions<'_>, got: Positions<'_>, floor: f32) 
     }
 }
 
+/// A generated token and the gap between the top two logits of the row it was taken from: what a
+/// server's per-token probabilities give of a run (the top-2 log-probabilities differ by the
+/// logits' gap, the normalizer cancels).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pick {
+    pub id: u32,
+    pub gap: f32,
+}
+
+/// How two runs of one prompt compare, token for token, when each summed it in a split of its own
+/// (a batched call sums by its row count, so two splits of one prompt are not bit-identical).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Parted {
+    /// Every token equal, and as many.
+    Same,
+    /// The first position whose tokens differ, where neither run's row is clear: the two orders
+    /// resolved a near-tie differently, and the positions after it ran on other contexts.
+    Near { at: usize, want: Pick, got: Pick },
+    /// The first position whose tokens differ, where a run's row is clear: not a re-lottery.
+    Clear { at: usize, want: Pick, got: Pick },
+    /// One run ends with every token of the shorter agreeing: `shared` positions, the longer
+    /// holds `longer`.
+    Ends { shared: usize, longer: usize },
+}
+
+impl Parted {
+    /// Whether the runs are the same or part at a near-tie.
+    pub fn ok(&self) -> bool {
+        matches!(self, Parted::Same | Parted::Near { .. })
+    }
+}
+
+/// Compare the runs `want` and `got` of the same ids, each a batched call of its own split, at
+/// their first differing position: a position is clear when either run's row leads by `floor`
+/// ([`gap_is_clear`]), and only a differing token at a clear position is red. The tokens after the
+/// first difference ran on other contexts and are not compared.
+///
+/// # Panics
+/// A gap that is not a number at the differing position: a row with no distribution has no gap to
+/// read the position's clarity from.
+pub fn parted(want: &[Pick], got: &[Pick], floor: f32) -> Parted {
+    for (at, (&w, &g)) in want.iter().zip(got).enumerate() {
+        if w.id != g.id {
+            assert!(
+                !w.gap.is_nan() && !g.gap.is_nan(),
+                "position {at}: the tokens differ and a gap is not a number ({} and {})",
+                w.gap,
+                g.gap
+            );
+            return if gap_is_clear(w.gap, floor) || gap_is_clear(g.gap, floor) {
+                Parted::Clear {
+                    at,
+                    want: w,
+                    got: g,
+                }
+            } else {
+                Parted::Near {
+                    at,
+                    want: w,
+                    got: g,
+                }
+            };
+        }
+    }
+    if want.len() == got.len() {
+        Parted::Same
+    } else {
+        Parted::Ends {
+            shared: want.len().min(got.len()),
+            longer: want.len().max(got.len()),
+        }
+    }
+}
+
 /// What the leading passes of a DSpark run kept: how many passes lie inside the compared span and
 /// how many of them kept every row (the draft's proposal was the target's next token).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -368,6 +450,53 @@ mod tests {
         let got = [gapped(2, 5.0)];
         let far = walk_at("floor", run(&tw, &want), run(&tg, &got), floor);
         assert!(!far.ok && far.band.clear == 1 && far.band.disagree == 1);
+    }
+
+    fn picks(run: &[(u32, f32)]) -> Vec<Pick> {
+        run.iter().map(|&(id, gap)| Pick { id, gap }).collect()
+    }
+
+    /// Two runs compare at their first differing position alone: equal ids are the same whatever the
+    /// gaps; a split where both rows lead by less than the floor is a near tie, and a run's row that
+    /// leads by the floor (either side) makes it clear; a shorter run with every token agreeing is
+    /// red by name; the tokens after the first difference are not read.
+    #[test]
+    fn parted_reads_clarity_at_the_first_difference() {
+        let f = MARGIN_FLOOR;
+        let a = picks(&[(1, 5.0), (2, 0.1), (3, 4.0)]);
+        assert_eq!(
+            parted(&a, &picks(&[(1, 0.0), (2, 9.0), (3, 0.0)]), f),
+            Parted::Same
+        );
+        let b = picks(&[(1, 5.0), (7, 0.2), (9, 4.0)]);
+        let near = parted(&a, &b, f);
+        assert_eq!(
+            near,
+            Parted::Near {
+                at: 1,
+                want: a[1],
+                got: b[1]
+            }
+        );
+        assert!(near.ok());
+        // Either run's clear row is a clear position; a gap at the floor is clear.
+        let c = picks(&[(1, 5.0), (7, f), (9, 4.0)]);
+        assert!(matches!(parted(&a, &c, f), Parted::Clear { at: 1, .. }));
+        assert!(matches!(parted(&c, &a, f), Parted::Clear { at: 1, .. }));
+        assert!(!parted(&a, &c, f).ok());
+        // The same split is a near tie at a wider floor and clear at a zero floor.
+        assert!(parted(&a, &c, 2.0 * f).ok());
+        assert!(matches!(parted(&a, &b, 0.0), Parted::Clear { at: 1, .. }));
+        let short = picks(&[(1, 5.0), (2, 0.1)]);
+        let ends = parted(&a, &short, f);
+        assert_eq!(
+            ends,
+            Parted::Ends {
+                shared: 2,
+                longer: 3
+            }
+        );
+        assert!(!ends.ok());
     }
 
     /// The passes counted are the ones ending inside the span, and an accept is a pass that kept

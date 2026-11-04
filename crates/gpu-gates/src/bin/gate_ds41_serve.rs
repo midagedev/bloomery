@@ -61,7 +61,11 @@
 //!   first's long system prompt, diverging inside the first's prompt call; and
 //!   one conversation's second turn after another conversation's first. What a
 //!   turn keeps is the engine's answer, which this gate does not model: every
-//!   turn's reply is the fresh run's text and length, its counts add up to the
+//!   turn's reply is the fresh run's text and length, or parts from it at the
+//!   first differing token where neither run's top1−top2 gap reaches the
+//!   logits band's clarity floor (`logits_band::parted`; a batched prompt call
+//!   sums by its row count, so a warm turn's split of the prompt and the fresh
+//!   run's are two orders), the tokens after it not compared; its counts add up to the
 //!   prompt (`usage.prompt_tokens`, `cached_tokens` = `timings.cache_n`), and
 //!   `cache_n` is at most the longest prefix the prompt shares with what any
 //!   earlier request left. Where the template makes a turn share the previous
@@ -86,7 +90,7 @@
 //!   its hole, then a chat with the same system prompt and another message
 //!   keeps the system prompt (`cache_n` is the first user marker's position,
 //!   or one less for the compressor's parity) and answers as with
-//!   `cache_prompt: false`.
+//!   `cache_prompt: false`, by the same rule.
 //!
 //! Then the server is killed by the handle this binary spawned it with and
 //! waited for. A server with no `--ctx` (`<dir>/ctx-default`, one slot)
@@ -310,6 +314,8 @@ mod gate {
     use bloomery_gpu_gates::bind::nvidia_smi_index;
     use bloomery_gpu_gates::ctx_ladder::{self, ctx_line, default_line_held, step_above};
     use bloomery_gpu_gates::generate::Place;
+    use bloomery_gpu_gates::logits_band::{Parted, Pick, parted};
+    use bloomery_gpu_gates::prompts::MARGIN_FLOOR;
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::serve_client::{
         self, Served, agree, curl, ids_of, json_of, metric, parse_ids, plan_run, server_log,
@@ -658,6 +664,41 @@ mod gate {
         parse_ids(line)
     }
 
+    /// The tokens of a `generate_ds41 --top2 K` log with the margin between the largest two logits
+    /// of the row behind each of the first K, in order (the `top2` records). A log with no `top2`
+    /// record, a record out of order or of another token than the `tokens` line's, or a margin that
+    /// is not finite is a named error.
+    fn gen_picks(log: &Path) -> Result<Vec<Pick>, GateError> {
+        let tokens = gen_tokens(log)?;
+        let text = std::fs::read_to_string(log).map_err(|e| format!("{}: {e}", log.display()))?;
+        let rows = record::Log::of(&text, record::GENERATE_DS41)
+            .named(log.display().to_string())
+            .all(&record::TOP2)?;
+        if rows.is_empty() {
+            return Err(format!(
+                "{}: no `top2` record; the reference run takes `--top2 {N_PREDICT}`",
+                log.display()
+            )
+            .into());
+        }
+        rows.iter()
+            .enumerate()
+            .map(|(k, r)| {
+                let id = u32::try_from(r.u64("top1")?)?;
+                let gap = r.f64("margin")? as f32;
+                if r.u64("i")? != k as u64 || tokens.get(k) != Some(&id) || !gap.is_finite() {
+                    return Err(format!(
+                        "{}: `top2` record {k} is out of order, of another token than the `tokens` \
+                         line's, or its margin {gap} is not finite",
+                        log.display()
+                    )
+                    .into());
+                }
+                Ok(Pick { id, gap })
+            })
+            .collect()
+    }
+
     /// The rendered ids of a chat's `messages` under the template's `kwargs`,
     /// through the server's own template and tokenizer.
     fn rendered(
@@ -775,6 +816,108 @@ mod gate {
         }
     }
 
+    /// The alternatives a token's row gives the `_is_fresh` checks: its top two, whose log-probability
+    /// difference is the gap between the row's two largest logits.
+    const GAP_TOP: usize = 2;
+
+    /// The generated ids of a chat reply (`choices[0].logprobs.content`) or a `/completion` answer
+    /// (`completion_probabilities`), one entry a token, each with the gap between its row's top two
+    /// logits. A token that is not its row's largest (the sampler banned that one under `ignore_eos`,
+    /// or forced the token) has no gap to read: it counts clear. An answer with no entries field, an
+    /// entry with no id or fewer than two alternatives, or a gap that is not finite is a named error.
+    fn picks(entries: &Value, who: &str) -> Result<Vec<Pick>, GateError> {
+        let rows = entries.as_array().ok_or_else(|| {
+            format!(
+                "{who} carries no probability entries although {GAP_TOP} alternatives were asked"
+            )
+        })?;
+        rows.iter()
+            .enumerate()
+            .map(|(k, e)| {
+                let id = e["id"]
+                    .as_u64()
+                    .and_then(|i| u32::try_from(i).ok())
+                    .ok_or_else(|| format!("{who}: entry {k} has no token id: {e}"))?;
+                let mut alt: Vec<(f64, u64)> = e["top_logprobs"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|t| Some((t["logprob"].as_f64()?, t["id"].as_u64()?)))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                alt.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+                let gap = match alt.as_slice() {
+                    [(best, top), (next, _), ..] if *top == u64::from(id) => (best - next) as f32,
+                    [_, _, ..] => f32::MAX,
+                    _ => {
+                        return Err(format!(
+                            "{who}: entry {k} holds {} alternatives, not {GAP_TOP}: {e}",
+                            alt.len()
+                        )
+                        .into());
+                    }
+                };
+                if gap.is_finite() {
+                    Ok(Pick { id, gap })
+                } else {
+                    Err(format!("{who}: entry {k}'s top-2 gap {gap} is not finite: {e}").into())
+                }
+            })
+            .collect()
+    }
+
+    /// The ids of `picks`.
+    fn ids_in(picks: &[Pick]) -> Vec<u32> {
+        picks.iter().map(|k| k.id).collect()
+    }
+
+    // PIN(2026-11-04): the fresh-run checks (`_is_fresh`, `interleaved_ids_are_fresh`,
+    // `reuse_*_ids_are_fresh`) held a warm run to the fresh run's exact ids; they now defer to the
+    // logits band's clarity rule (crates/gpu-gates/src/logits_band.rs). 09aef0e52 runs the prompt
+    // batch's card experts as the grouped IMMA GEMM, which sums by the call's row count, so a turn that
+    // prefills 15 ids over a 39-id restore and a fresh server's 54-id prefill are two splits of one
+    // prompt, not bit-identical (AGENTS.md "float sum order"). Derivation: the band's rule, the e2e
+    // clarity floor MARGIN_FLOOR: a position whose top1-top2 gap reaches it keeps its token across
+    // orders, under it either order may take the other token; the ids (and text) still hold exactly
+    // wherever the runs do not part, and a clear position that parts is red.
+    /// Compares a fresh run's generated ids with the warm run's: [`split_of`] with their names.
+    fn fresh_split(what: &str, fresh: &[Pick], warm: &[Pick]) -> Parted {
+        split_of(what, ("fresh run", fresh), ("warm run", warm))
+    }
+
+    /// Compares two runs of one prompt, `want` the reference, by [`parted`] at [`MARGIN_FLOOR`]
+    /// (either run's row clear at the first differing position is red) and prints the position, both
+    /// tokens and both gaps whenever the runs part.
+    fn split_of(what: &str, want: (&str, &[Pick]), got: (&str, &[Pick])) -> Parted {
+        let ((wn, w), (gn, g)) = (want, got);
+        let split = parted(w, g, MARGIN_FLOOR);
+        let apart = |at: usize, wp: Pick, gp: Pick| {
+            format!(
+                "{what}: the {wn} and the {gn} part at token {at} ({wn} id {} gap {:.4}, {gn} id {} \
+                 gap {:.4}; clear = gap >= {MARGIN_FLOOR})",
+                wp.id, wp.gap, gp.id, gp.gap
+            )
+        };
+        match split {
+            Parted::Same => {}
+            Parted::Near { at, want, got } => println!(
+                "{}, a near tie: the {wn}'s {} and the {gn}'s {} ids after it, on other contexts, \
+                 are not compared",
+                apart(at, want, got),
+                w.len() - at - 1,
+                g.len() - at - 1
+            ),
+            Parted::Clear { at, want, got } => {
+                println!("{}: FAIL, not a near tie", apart(at, want, got))
+            }
+            Parted::Ends { shared, longer } => println!(
+                "{what}: FAIL, a run ends at {shared} tokens with every token agreeing, the other holds {longer}"
+            ),
+        }
+        split
+    }
+
     /// Runs `s` (see the module header): every turn warm, as a client sends it,
     /// then every turn again as a greedy `/completion` of its rendered ids from
     /// a reset cache. `ledger` holds what the requests before left and gains
@@ -801,6 +944,7 @@ mod gate {
             let body = json!({
                 "messages": messages, "temperature": 0, "max_tokens": s.max_tokens,
                 "ignore_eos": s.ignore_eos, "chat_template_kwargs": s.kwargs,
+                "logprobs": true, "top_logprobs": GAP_TOP,
             });
             let (code, text) = curl(&url("/v1/chat/completions"), Some(&body), false)?;
             let reply = json_of("/v1/chat/completions", code, &text)?;
@@ -816,6 +960,7 @@ mod gate {
             let body = json!({
                 "prompt": p, "n_predict": s.max_tokens, "temperature": 0,
                 "ignore_eos": s.ignore_eos, "return_tokens": true, "cache_prompt": false,
+                "n_probs": GAP_TOP,
             });
             let (code, text) = curl(&url("/completion"), Some(&body), false)?;
             let v = json_of("/completion", code, &text)?;
@@ -825,6 +970,8 @@ mod gate {
         let mut before = ledger.clone();
         let mut prev: Vec<Option<usize>> = vec![None; convs.len()];
         let mut recent: Option<usize> = None;
+        // The ids each warm turn generated: what it left in the cache, where it parted from its fresh run too.
+        let mut left: Vec<Vec<u32>> = Vec::new();
         let mut ok = true;
         for (i, (st, ((p, reply), (g, f)))) in
             s.steps.iter().zip(warm.iter().zip(&fresh)).enumerate()
@@ -868,12 +1015,22 @@ mod gate {
                     && u["prompt_tokens"] == json!(p.len())
                     && u["prompt_tokens_details"]["cached_tokens"] == t["cache_n"],
             );
+            let warm_picks = picks(
+                &reply["choices"][0]["logprobs"]["content"],
+                &format!("{name} warm reply"),
+            )?;
+            let fresh_picks = picks(&f["completion_probabilities"], &format!("{name} fresh run"))?;
+            let split = fresh_split(&name, &fresh_picks, &warm_picks);
+            // The warm count is its own entries'; where the runs do not part it is the fresh run's.
             check(
                 &mut ok,
                 &format!("{name}_is_fresh"),
                 f["timings"]["cache_n"] == json!(0)
-                    && u["completion_tokens"] == json!(g.len())
-                    && same_text(m, f["content"].as_str().unwrap_or(""), thinking),
+                    && fresh_picks.iter().map(|k| k.id).eq(g.iter().copied())
+                    && u["completion_tokens"] == json!(warm_picks.len())
+                    && split.ok()
+                    && (matches!(split, Parted::Near { .. })
+                        || same_text(m, f["content"].as_str().unwrap_or(""), thinking)),
             );
             let before_p = prev[st.conv];
             let shares = match (st.shares, before_p) {
@@ -901,16 +1058,19 @@ mod gate {
                     g.len() > rules.window,
                 );
             }
-            before.book(p, g);
+            let kept: Vec<u32> = warm_picks.iter().map(|k| k.id).collect();
+            before.book(p, &kept);
+            left.push(kept);
             prev[st.conv] = Some(p.len());
             recent = Some(p.len());
         }
         // The warm turns, then their fresh runs, which left the same ids when
         // the turns passed.
-        for _ in 0..2 {
-            for ((p, _), (g, _)) in warm.iter().zip(&fresh) {
-                ledger.book(p, g);
-            }
+        for ((p, _), kept) in warm.iter().zip(&left) {
+            ledger.book(p, kept);
+        }
+        for ((p, _), (g, _)) in warm.iter().zip(&fresh) {
+            ledger.book(p, g);
         }
         Ok(ok)
     }
@@ -1105,25 +1265,34 @@ mod gate {
     }
 
     /// One greedy `/completion` of `prompt` run past the end-of-generation id:
-    /// its ids and `timings.cache_n`.
+    /// its ids with each row's top-2 gap, and `timings.cache_n`.
     fn greedy(
         url: &dyn Fn(&str) -> String,
         prompt: &[u32],
         cache: bool,
-    ) -> Result<(Vec<u32>, Value), GateError> {
+    ) -> Result<(Vec<Pick>, Value), GateError> {
         let body = json!({
             "prompt": prompt, "n_predict": REUSE_PREDICT, "temperature": 0,
             "ignore_eos": true, "return_tokens": true, "cache_prompt": cache,
+            "n_probs": GAP_TOP,
         });
         let (st, body) = curl(&url("/completion"), Some(&body), false)?;
         let v = json_of("/completion", st, &body)?;
         let ids = ids_of(&v["tokens"])?;
+        let run = picks(&v["completion_probabilities"], "the greedy completion")?;
+        if ids_in(&run) != ids {
+            return Err(format!(
+                "the greedy completion's probability entries name ids {:?}, its tokens {ids:?}",
+                ids_in(&run)
+            )
+            .into());
+        }
         println!(
             "greedy prompt {} ids cache_prompt={cache}: cache_n={} tokens {ids:?}",
             prompt.len(),
             v["timings"]["cache_n"]
         );
-        Ok((ids, v["timings"]["cache_n"].clone()))
+        Ok((run, v["timings"]["cache_n"].clone()))
     }
 
     /// Two conversations interleaved (module header).
@@ -1131,9 +1300,10 @@ mod gate {
         let (g1, _) = greedy(url, ids, true)?;
         let other: Vec<u32> = ids.iter().rev().copied().collect();
         greedy(url, &other, true)?;
-        let cont: Vec<u32> = ids.iter().chain(&g1).copied().collect();
+        let cont: Vec<u32> = ids.iter().chain(&ids_in(&g1)).copied().collect();
         let (g2, c2) = greedy(url, &cont, true)?;
         let (g3, c3) = greedy(url, &cont, false)?;
+        let split = fresh_split("interleaved", &g3, &g2);
         let mut ok = true;
         check(
             &mut ok,
@@ -1143,7 +1313,7 @@ mod gate {
         check(
             &mut ok,
             "interleaved_ids_are_fresh",
-            g2 == g3 && c3 == json!(0),
+            split.ok() && c3 == json!(0),
         );
         Ok(ok)
     }
@@ -1172,7 +1342,7 @@ mod gate {
         let chat = |messages: &Value, cache: bool| -> Result<Value, GateError> {
             let body = json!({
                 "messages": messages, "temperature": 0, "max_tokens": TURN_PREDICT,
-                "cache_prompt": cache,
+                "cache_prompt": cache, "logprobs": true, "top_logprobs": GAP_TOP,
             });
             let (st, body) = curl(&url("/v1/chat/completions"), Some(&body), false)?;
             json_of("/v1/chat/completions", st, &body)
@@ -1194,10 +1364,20 @@ mod gate {
             "shared_system_prompt_kept",
             common(&p1, &p2) > mark && (mark - 1..=mark).contains(&kept),
         );
+        let split = fresh_split(
+            "shared_system_prompt",
+            &picks(
+                &fresh["choices"][0]["logprobs"]["content"],
+                "the fresh chat",
+            )?,
+            &picks(&warm["choices"][0]["logprobs"]["content"], "the warm chat")?,
+        );
         check(
             &mut ok,
             "shared_system_prompt_answer_is_fresh",
-            warm["choices"][0]["message"] == fresh["choices"][0]["message"]
+            split.ok()
+                && (matches!(split, Parted::Near { .. })
+                    || warm["choices"][0]["message"] == fresh["choices"][0]["message"])
                 && fresh["timings"]["cache_n"] == json!(0),
         );
         Ok(ok)
@@ -2842,10 +3022,49 @@ mod gate {
         Ok(ok)
     }
 
+    // PIN(2026-11-04): `bp_completion_ids_are_generate_ds41` held the drafted completion to
+    // `generate_ds41`'s exact ids; where they part it now defers to the logits band's clarity rule
+    // ([`fresh_split`]'s PIN: the prompt batch and the draft's pair passes sum by their row counts, so
+    // the server's order and `generate_ds41`'s are two orders of one prompt). The server's rows are
+    // read by a second request: `n_probs` turns the draft off for the request that asks (no
+    // `draft_n` in its timings), so it runs the steps, `cache_prompt` off so its prompt call is the
+    // drafted request's, and counts for the drafted ids only where it takes them; the reference's
+    // rows are the `top2` records of its log (`generate_ds41 --top2` reads a draft's passes).
+    /// Whether the drafted completion `drafted`, which does not agree with `reference`, parts from
+    /// it at a near tie ([`split_of`]): the server's steps over the same prompt must take `drafted`'s
+    /// ids, else the rows read are not the drafted run's.
+    fn bp_near_tie(
+        url: &dyn Fn(&str) -> String,
+        prompt: &str,
+        drafted: &[u32],
+        reference: &[Pick],
+    ) -> Result<bool, GateError> {
+        let body = json!({
+            "prompt": prompt, "n_predict": N_PREDICT, "temperature": 0, "return_tokens": true,
+            "cache_prompt": false, "n_probs": GAP_TOP,
+        });
+        let (st, text) = curl(&url("/completion"), Some(&body), false)?;
+        let v = json_of("/completion", st, &text)?;
+        let steps = picks(&v["completion_probabilities"], "the bp steps run")?;
+        let same = ids_in(&steps) == drafted;
+        println!(
+            "bp steps run (n_probs {GAP_TOP}, no draft): ids {:?}, the drafted run's: {same}",
+            ids_in(&steps)
+        );
+        let reference = &reference[..reference.len().min(steps.len())];
+        let split = split_of(
+            "bp_completion",
+            ("generate_ds41", reference),
+            ("server steps", &steps),
+        );
+        Ok(same && split.ok())
+    }
+
     /// The two-card run (module header): the server under `--place bp` and
     /// this process's `BLOOMERY_DRAFT=dspark`.
     fn tiered(a: &Args, levers: &PlanLevers) -> Result<(), GateError> {
         let reference = gen_tokens(&a.gen_log)?;
+        let reference_picks = gen_picks(&a.gen_log)?;
         let (draft, _) = dspark::draft_hparams()?;
         let draft_path = dspark::draft_path()?;
         let path = ref_model_path()?;
@@ -2959,11 +3178,9 @@ mod gate {
         println!("completion tokens {ids:?} stop_type={stop}");
         println!("generate_ds41    {reference:?}");
         println!("completion timings {t}");
-        check(
-            &mut ok,
-            "bp_completion_ids_are_generate_ds41",
-            agree(&ids, &stop, &reference),
-        );
+        let parted_ok =
+            agree(&ids, &stop, &reference) || bp_near_tie(&url, &a.prompt, &ids, &reference_picks)?;
+        check(&mut ok, "bp_completion_ids_are_generate_ds41", parted_ok);
         let (n, acc) = (as_count(&t["draft_n"]), as_count(&t["draft_n_accepted"]));
         check(
             &mut ok,
@@ -3224,14 +3441,23 @@ mod gate {
             ids_of(&repeat["tokens"])? == first,
         );
 
-        let reuse = |prompt: &[u32], cache: bool| -> Result<(Vec<u32>, Value), GateError> {
+        let reuse = |prompt: &[u32], cache: bool| -> Result<(Vec<Pick>, Value), GateError> {
             let body = json!({
                 "prompt": prompt, "n_predict": REUSE_PREDICT, "temperature": 0,
                 "ignore_eos": true, "return_tokens": true, "cache_prompt": cache,
+                "n_probs": GAP_TOP,
             });
             let (st, body) = curl(&url("/completion"), Some(&body), false)?;
             let v = json_of("/completion", st, &body)?;
             let ids = ids_of(&v["tokens"])?;
+            let run = picks(&v["completion_probabilities"], "the reuse completion")?;
+            if ids_in(&run) != ids {
+                return Err(format!(
+                    "the reuse completion's probability entries name ids {:?}, its tokens {ids:?}",
+                    ids_in(&run)
+                )
+                .into());
+            }
             let t = &v["timings"];
             println!(
                 "reuse prompt {} ids cache_prompt={cache}: cache_n={} prompt_n={} tokens {ids:?}",
@@ -3250,7 +3476,7 @@ mod gate {
                 );
             }
             Ok((
-                ids,
+                run,
                 if counted {
                     t["cache_n"].clone()
                 } else {
@@ -3259,9 +3485,10 @@ mod gate {
             ))
         };
         let (g1, _) = reuse(&a.ids, false)?;
-        let cont: Vec<u32> = a.ids.iter().chain(&g1).copied().collect();
+        let cont: Vec<u32> = a.ids.iter().chain(&ids_in(&g1)).copied().collect();
         let (g2, c2) = reuse(&cont, true)?;
         let (g3, c3) = reuse(&cont, false)?;
+        let continued = fresh_split("reuse_continuation", &g3, &g2);
         let full = g1.len() == REUSE_PREDICT && g3.len() == REUSE_PREDICT;
         check(&mut ok, "reuse_fixture_ran_to_n_predict", full);
         // The cache held the prompt and all but the last of g1: every position is kept.
@@ -3273,18 +3500,20 @@ mod gate {
         check(
             &mut ok,
             "reuse_continuation_ids_are_fresh",
-            g2 == g3 && c3 == json!(0),
+            continued.ok() && c3 == json!(0),
         );
         if full {
             // The cache holds `cont` and g3[..7]; this prompt shares all of it but the
             // last, so the engine takes that one position back.
-            let last = g3[REUSE_PREDICT - 2];
+            let g3_ids = ids_in(&g3);
+            let last = g3_ids[REUSE_PREDICT - 2];
             let alt = if a.ids[0] != last { a.ids[0] } else { a.ids[1] };
             let mut back = cont;
-            back.extend(&g3[..REUSE_PREDICT - 2]);
+            back.extend(&g3_ids[..REUSE_PREDICT - 2]);
             back.push(alt);
             let (g4, c4) = reuse(&back, true)?;
             let (g5, c5) = reuse(&back, false)?;
+            let rolled = fresh_split("reuse_rollback", &g5, &g4);
             check(
                 &mut ok,
                 "reuse_rollback_cache_n",
@@ -3293,7 +3522,7 @@ mod gate {
             check(
                 &mut ok,
                 "reuse_rollback_ids_are_fresh",
-                g4 == g5 && c5 == json!(0),
+                rolled.ok() && c5 == json!(0),
             );
         }
 

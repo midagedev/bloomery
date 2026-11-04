@@ -1465,6 +1465,8 @@ pub fn mode_name(mode: StepMode) -> &'static str {
 ///   — ids and values, the larger first, ties to the lower id as the argmax
 ///   takes them — and their margin. A row whose largest entry is not the
 ///   token the run took, and a NaN in a row, are named errors ([`TopRows`]).
+///   A binary with a draft reads the rows of the draft's passes too, one a
+///   kept token, in position order.
 /// - `--rows FILE`: the K rows `--top2` reads, whole, appended to FILE as
 ///   little-endian f32, run after run (FILE emptied before the first), each
 ///   run's followed by a `rows` record.

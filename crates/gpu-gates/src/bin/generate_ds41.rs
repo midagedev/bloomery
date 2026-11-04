@@ -232,7 +232,10 @@
 //! `--serve-feed`, `--dump-table FILE` and `--card-table FILE` are the
 //! generate binaries' shared diagnosis flags (`generate::Diag`, whose doc is
 //! theirs). They act on the plain runs of the prompt flags, and each is
-//! refused by name beside a draft, the finite probe and `BLOOMERY_GEN_SLOTS`.
+//! refused by name beside a draft, the finite probe and `BLOOMERY_GEN_SLOTS`;
+//! `--top2` alone also reads a draft's passes (the same pass the greedy run
+//! takes, its rows read back as it picks), and is refused beside the finite
+//! probe.
 //! `--repeat` does not mix with `--arm`: an arm list's runs start from the
 //! session's clear, which sends the residency back to its seed, and
 //! `--repeat`'s from `Target::reset`, which keeps it. `--card-table` needs
@@ -395,8 +398,8 @@ mod drive {
     use model::placement::{Machine, Plan, PlanLevers, workstation};
     use runtime::width::{Choosing, Chosen, Mode as WidthMode, Rule, Wall};
     use runtime::{
-        Advance, Committed, GenOutcome, Lookup, PassSink, Speculative, Stop, StopReason, Target,
-        Want,
+        Advance, Committed, GenOutcome, Lookup, PassSink, Pick, Picked, RowLogits, Speculative,
+        Stop, StopReason, Target, Want,
     };
 
     use crate::draft::{Draft, open_dspark};
@@ -1162,9 +1165,26 @@ mod drive {
             return Err("generate_ds41: a draft or the finite probe runs one arm".into());
         };
         let a = &r.a;
-        if let Some(flag) = a.diag.set().first() {
+        // `--top2` reads a draft's passes too ([`TopPick`]); the other flags act on the plain runs.
+        let top2_ok = draft != Draft::Off;
+        if let Some(flag) = a
+            .diag
+            .set()
+            .into_iter()
+            .find(|&f| !(f == "--top2" && top2_ok))
+        {
             return Err(format!(
-                "{flag} acts on the plain runs: not under a draft or the finite probe"
+                "{flag} acts on the plain runs{}: not under {}",
+                if flag == "--top2" {
+                    " and a draft's passes"
+                } else {
+                    ""
+                },
+                if flag == "--top2" {
+                    "the finite probe"
+                } else {
+                    "a draft or the finite probe"
+                }
             )
             .into());
         }
@@ -2636,6 +2656,27 @@ mod drive {
         }
     }
 
+    /// `--top2` under a draft: the pick that takes each row's argmax as the pass found it and, while
+    /// the run still wants a row, reads the row behind it ([`TopRows::read`] names a row whose
+    /// largest entry is another id). Rows are picked in position order, one a kept token.
+    struct TopPick<'a>(&'a mut TopRows);
+
+    impl Pick<Session<Body>> for TopPick<'_> {
+        fn pick(
+            &mut self,
+            t: &mut Session<Body>,
+            r: usize,
+            argmax: u32,
+        ) -> Result<u32, SessionError> {
+            if self.0.wants() {
+                self.0
+                    .read(t.row_logits(r)?, argmax)
+                    .map_err(SessionError::Caller)?;
+            }
+            Ok(argmax)
+        }
+    }
+
     /// `decode` under `BLOOMERY_DRAFT`: passes of `spec` until `-n` tokens are
     /// out, each timed around the proposal, the pair pass and the draft's
     /// update — the lookup's push, or the DSpark draft's features. The draft
@@ -2662,8 +2703,19 @@ mod drive {
             probes: Vec::new(),
             n_gen: a.n_gen,
         };
+        let mut tops = TopRows::new(&a.diag);
+        if tops.wants() {
+            tops.read(&s.model().logits()?, first)?;
+        }
         let stop = stop_at_n(s, a)?;
-        let out = runtime::generate(s, spec, f.ids, first, &stop, &mut sink)?;
+        // The same pass the greedy run takes (`Speculative::pass` is `pass_picking` by `Argmax`),
+        // its rows read as `--top2` asks.
+        let out = if tops.wants() {
+            let mut picked = Picked::new(&mut *spec, TopPick(&mut tops));
+            runtime::generate(s, &mut picked, f.ids, first, &stop, &mut sink)?
+        } else {
+            runtime::generate(s, spec, f.ids, first, &stop, &mut sink)?
+        };
         ran_to_n(&out)?;
         after(spec)?;
         let passes = sink.passes;
@@ -2677,6 +2729,7 @@ mod drive {
         }
         feed_time.print();
         print_draft_rows(a, first, &sink.emitted, &passes);
+        tops.finish(None)?;
         if a.logits {
             print_logits(s.model())?;
         }
