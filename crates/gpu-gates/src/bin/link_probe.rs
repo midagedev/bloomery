@@ -1249,7 +1249,6 @@ mod probe {
         print_paths(o, session.paths());
         let g = session.gathers().ok_or("a gather of one rank")?.clone();
         let page = Arc::clone(session.page().ok_or("a gather of one rank")?);
-        let ends = session.ends();
         let mut watch = Vec::new();
         for slot in 0..shapes.len() {
             for set in 0..Gathers::SETS {
@@ -1258,13 +1257,6 @@ mod probe {
                 }
             }
         }
-        let node = Node {
-            rank: o.rank,
-            page: &page,
-            ends,
-            watch,
-            deadline: o.deadline,
-        };
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launcher checks its launch contract.
         let kernels = unsafe { bloomery_gpu::shared_module!(gather_kernels, ctx)? };
@@ -1335,6 +1327,16 @@ mod probe {
             }
             Ok(())
         })?;
+        // Every rank's graph is captured before any replays: a rank still loading would hold
+        // the others' first gather past the deadline.
+        session.collect(&[])?;
+        let node = Node {
+            rank: o.rank,
+            page: &page,
+            ends: session.ends(),
+            watch,
+            deadline: o.deadline,
+        };
         node.drive(gpu, || {
             replays(|_| Ok(graph.launch(gpu.stream())?), gpu, &node, total)
         })?;
