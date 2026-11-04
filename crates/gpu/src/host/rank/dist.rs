@@ -170,7 +170,7 @@ pub fn inside(name: &str) -> bool {
 }
 
 /// Check every file of `files` in folder `dir` against its digest, once: a
-/// file whose digest, length, modification time and inode the record at
+/// file whose digest, length, modification and change times and inode the record at
 /// `record` lists is taken as checked; every other file is hashed, on
 /// [`CHECKERS`] threads, and one whose bytes do not hash to its digest is
 /// refused by name. The record then lists every file of `files`. A name not
@@ -191,13 +191,15 @@ pub fn verify(dir: &Path, files: &[SourceFile], record: &Path) -> Result<(), Gpu
             let m =
                 std::fs::metadata(&path).map_err(|e| shape(format!("{}: {e}", path.display())))?;
             Ok(format!(
-                "{}\t{}\t{}.{:09}\t{}:{}\t{}",
+                "{}\t{}\t{}.{:09}\t{}:{}\t{}.{:09}\t{}",
                 hex(&f.digest),
                 m.len(),
                 m.mtime(),
                 m.mtime_nsec(),
                 m.dev(),
                 m.ino(),
+                m.ctime(),
+                m.ctime_nsec(),
                 f.name
             ))
         })
@@ -1612,8 +1614,8 @@ mod tests {
         });
     }
 
-    // The head hashes a source file once: changed bytes under the recorded length, time and
-    // inode pass unhashed, a changed time hashes the file again and refuses it. Only a name
+    // The head hashes a source file once: a write that keeps the length and restores the
+    // modification time still changes the change time, so the file is hashed again and refused. Only a name
     // inside the folder is one, and a read of a shard in a subfolder is that file's.
     #[test]
     fn the_head_checks_a_file_once_by_its_stamp_and_names_only_inside_its_folder() {
@@ -1636,8 +1638,6 @@ mod tests {
         let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         f.write_all(b"WEIGHTS").unwrap();
         f.set_modified(mtime).unwrap();
-        verify(&dir, one, &record).unwrap();
-        f.set_modified(mtime + Duration::from_secs(1)).unwrap();
         let e = verify(&dir, one, &record).unwrap_err().to_string();
         assert!(
             e.contains("weights/a.safetensors: its bytes hash to"),
