@@ -243,7 +243,12 @@ pub fn verify(dir: &Path, files: &[SourceFile], record: &Path) -> Result<(), Gpu
         if let Some(parent) = record.parent() {
             std::fs::create_dir_all(parent).map_err(at)?;
         }
-        let new = record.with_extension("new");
+        // Each writer its own file: two loads of one folder may record at once.
+        let new = record.with_extension(format!(
+            "{}.{:?}.new",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         std::fs::write(&new, format!("{}\n", stamps.join("\n"))).map_err(at)?;
         std::fs::rename(&new, record).map_err(at)?;
     }

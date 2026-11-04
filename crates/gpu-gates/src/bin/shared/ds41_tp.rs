@@ -19,7 +19,7 @@
 //! Defaults: D 4096, N 128, C D + N.
 
 use std::collections::BTreeMap;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use bloomery_gpu::Gpu;
@@ -202,14 +202,8 @@ fn rank_folder(o: &Opts, ranks: usize) -> Result<(Opened, Vec<SourceFile>), Gate
                 format!("{}: a sparse copy's path is not absolute", sparse.display()).into(),
             );
         }
-        // The link stays in the view: every part of the name is a plain one.
-        let mut link = view.clone();
-        for part in Path::new(&f.name).components() {
-            let Component::Normal(part) = part else {
-                return Err(format!("{:?} is not a name inside the folder", f.name).into());
-            };
-            link.push(part);
-        }
+        // `fetch` refused every name that is not `dist::inside`, so the link stays in the view.
+        let link = view.join(&f.name);
         if let Some(parent) = link.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
         }
