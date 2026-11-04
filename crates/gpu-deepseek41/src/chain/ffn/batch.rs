@@ -3271,7 +3271,7 @@ mod tests {
         let gpu = Gpu::new().expect("a card");
         let stream = gpu.stream();
         let stack = |ty: GgmlType, rows: usize, k: usize, seed: u64, row_k: usize| {
-            let rb = ty.type_size().expect("a size") * (row_k / 256);
+            let rb = ty.type_size().expect("a size") as usize * (row_k / 256);
             DeviceTensor::upload(
                 stream,
                 &super::super::tests::stack_words(&super::super::tests::kquant_bytes(

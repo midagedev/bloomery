@@ -2181,12 +2181,13 @@ mod tests {
 
     /// Synthetic file bytes of a K-quant stack: `rows` rows of `k` values of
     /// `ty`, a wandering byte pattern whose every block scale is a small
-    /// normal f16 pair (a block's first four bytes: `d` 0.5, `dmin` 0.25), as
-    /// the file holds them. Shared with the child modules' tests.
+    /// normal f16 (a Q3_K block's last two bytes: `d` 0.0625; another
+    /// K-quant's first four: `d` 0.5, `dmin` 0.25), as the file holds them.
+    /// Shared with the child modules' tests.
     pub(super) fn kquant_bytes(ty: GgmlType, rows: usize, k: usize, seed: u64) -> Vec<u8> {
         let (blck, size) = (
             ty.blck_size().expect("a block size") as usize,
-            ty.type_size().expect("a type size"),
+            ty.type_size().expect("a type size") as usize,
         );
         let mut out = vec![0u8; rows * (k / blck) * size];
         let mut state = seed | 1;
@@ -2195,8 +2196,13 @@ mod tests {
             state ^= state >> 7;
             state ^= state << 17;
             *b = (state >> 48) as u8;
-            if i % size < 4 {
-                *b = match i % size {
+            // The block's f16 scales: a Q3_K block's one `d` is its last two
+            // bytes, every other K-quant's `d` and `dmin` its first four.
+            let at = i % size;
+            if ty == GgmlType::Q3_K && at >= size - 2 {
+                *b = if at == size - 1 { 0x2c } else { 0x00 };
+            } else if ty != GgmlType::Q3_K && at < 4 {
+                *b = match at {
                     1 => 0x38,
                     3 => 0x34,
                     _ => 0x00,
@@ -2230,7 +2236,7 @@ mod tests {
         let gpu = Gpu::new().expect("a card");
         let stream = gpu.stream();
         let stack = |ty: GgmlType, rows: usize, k: usize, seed: u64, row_k: usize| {
-            let rb = ty.type_size().expect("a size") * (row_k / 256);
+            let rb = ty.type_size().expect("a size") as usize * (row_k / 256);
             DeviceTensor::upload(
                 stream,
                 &stack_words(&kquant_bytes(ty, rows, k, seed)),
