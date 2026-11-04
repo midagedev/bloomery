@@ -64,11 +64,15 @@ fn routed_gate_up(ty: GgmlType, l: usize) -> Result<&'static str, GateError> {
     })
 }
 
-/// The kernel that runs layer `l`'s routed down of file type `ty` on the card.
+/// The kernel that runs layer `l`'s routed down of file type `ty` on the
+/// card: the fused layer's down by its type (`q4k_sel`'s entry for a Q4_K, the
+/// kquant `_sel` entry for a Q5_K, which launches the same entry whether or
+/// not the device prefetches rows) or the common leg's entry for the type.
 fn routed_down(ty: GgmlType, prefetch: bool, l: usize) -> Result<&'static str, GateError> {
     Ok(match ty {
         GgmlType::Q4_K if prefetch => "q4k_gemv_sel_prefetch",
         GgmlType::Q4_K => "q4k_gemv_sel",
+        GgmlType::Q5_K => "q5k_gemv_sel",
         GgmlType::IQ2_XXS => "iq2_xxs_gemv_sel",
         GgmlType::IQ2_XS => "iq2_xs_gemv_sel",
         GgmlType::IQ2_S => "iq2_s_gemv_sel",

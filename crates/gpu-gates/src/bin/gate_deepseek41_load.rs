@@ -43,10 +43,12 @@
 //!   one 2 MiB mapping granule that capture keeps; the second load takes what
 //!   the first took less that granule, and its drop gives back all of it.
 //! - (vi) slots: on every layer's routed stacks, at slots 0, n/2 and n − 1,
-//!   the stack's `_sel` gemv (`q3k_gemv_sel`, `q4k_gemv_sel`) is bit for bit
-//!   the plain gemv of an upload of just that slot's expert's rows from the
-//!   file — the contract `gate_p9`/`gate_q4k_sel` pin on a prefix, here on the
-//!   loaded stacks, so a list whose gather puts another expert in a slot fails.
+//!   the stack's `_sel` gemv (`q3k_gemv_sel`, `q4k_gemv_sel`, `q5k_gemv_sel`)
+//!   is bit for bit the plain gemv of an upload of just that slot's expert's
+//!   rows from the file — the contract `gate_p9`/`gate_q4k_sel` pin on a
+//!   prefix, here on the loaded stacks, so a list whose gather puts another
+//!   expert in a slot fails. A q5_K stack has no plain gemv: its own side is
+//!   the same `q5k_gemv_sel` entry over the one-expert upload at id 0.
 //! - (vii) r8 off: after (v), one load whose host tier reads the source
 //!   (`BLOOMERY_R8=off`, the path of every load with no sidecar beside its file)
 //!   and then one that reads the r8 sidecar, each fed [`R8_PROMPT`] prose ids
@@ -86,7 +88,9 @@ mod gate {
     use std::time::Instant;
 
     use bloomery_gpu::hybrid::HOST;
+    use bloomery_gpu::kquant::SelDown;
     use bloomery_gpu::model::ChainBody;
+    use bloomery_gpu::quant_sel::QuantSelKernels;
     use bloomery_gpu::weights::{DevWeight, Weights};
     use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
     use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, OpenCfg, StepInput};
@@ -590,7 +594,8 @@ mod gate {
     /// Check (vi): on every routed stack on the card, at slots 0, n/2 and
     /// n − 1 of the layer's card experts `lists[l]`, the `_sel` gemv of the
     /// resident stack is bit for bit the plain gemv of the listed expert's
-    /// rows uploaded alone from the file at `path`.
+    /// rows uploaded alone from the file at `path`; a q5_K stack's plain side
+    /// is the same `_sel` entry over that one upload at id 0.
     fn check_sel(
         plan: &Plan<'_>,
         lists: &[Vec<u32>],
@@ -601,6 +606,8 @@ mod gate {
         let name = &plan.machine.cards[0].name;
         let stream = gpu.stream();
         let split = Split::open(path).map_err(|e| format!("open {path}: {e}"))?;
+        let kq = QuantSelKernels::load(gpu.context(), gpu.fault_word())?;
+        let sink = gpu.unlabelled_sink();
         let mut acts: BTreeMap<usize, Q8Act> = BTreeMap::new();
         let (mut pairs, mut layers, mut bad) = (0usize, BTreeSet::new(), Vec::new());
         for row in &plan.rows {
@@ -649,6 +656,28 @@ mod gate {
                         gpu.q4k_sel()
                             .enqueue_gemv_q4k_sel(stream, stack, act, &sel, 1, rpe, &mut y_sel)?;
                         gpu.enqueue_gemv_q4k(&own, act, &mut y_own)?;
+                    }
+                    GgmlType::Q5_K => {
+                        // `Gpu` has no plain q5_K gemv: the own side is the `_sel` entry over the
+                        // one-expert upload at id 0, so the pair pins that slot `s` of the stack
+                        // reads expert `id`'s rows.
+                        let sel0 = DeviceBuffer::from_host(stream, &[0u32])?;
+                        let at_slot = SelDown {
+                            w: stack,
+                            act,
+                            sel: &sel,
+                            n_slots: 1,
+                            rows_per_expert: rpe,
+                        };
+                        let alone = SelDown {
+                            w: &own,
+                            act,
+                            sel: &sel0,
+                            n_slots: 1,
+                            rows_per_expert: rpe,
+                        };
+                        kq.enqueue_gemv_q5k_sel(stream, &at_slot, sink, &mut y_sel)?;
+                        kq.enqueue_gemv_q5k_sel(stream, &alone, sink, &mut y_own)?;
                     }
                     ty => {
                         bad.push(format!("{}: {ty} has no `_sel` gemv here", t.name));

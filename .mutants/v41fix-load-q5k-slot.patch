@@ -1,0 +1,12 @@
+# mutant: gate-ds41-load: the q5_K stack side reads id 0 whatever the slot; check vi reads FAIL at slots n/2 and n-1 of layers 0 and 1
+--- a/crates/gpu-gates/src/bin/gate_deepseek41_load.rs
++++ b/crates/gpu-gates/src/bin/gate_deepseek41_load.rs
+@@ -665,7 +665,7 @@
+                         let at_slot = SelDown {
+                             w: stack,
+                             act,
+-                            sel: &sel,
++                            sel: &sel0,
+                             n_slots: 1,
+                             rows_per_expert: rpe,
+                         };

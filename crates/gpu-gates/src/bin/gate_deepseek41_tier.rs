@@ -3,7 +3,9 @@
 //! (`crate::gate_card::plan_gate`: the 3090's bytes in the real tier, the largest visible card
 //! under the header's card budget in the fixture tier), two `Gpu`s on it. Each routed layer's card
 //! list is its id prefix `[0, n_l)`. The tiered plan moves the last `k3` ([`tier_depth`]) of
-//! them, ids `n_l - k3 .. n_l`, from card 0 to device 1 (the tier) through
+//! them, ids `n_l - k3 .. n_l`, from card 0 to device 1 (the tier) in each layer the pair rule
+//! admits on an expert tier (`accepts::ds41_pair` at `tier`: the fused layer's q4_K down; a q5_K
+//! down stays whole on the stage card, as the placement's own tier plan keeps it) through
 //! the placement's own split (`placement::routed_row`): the (b′) shape, the
 //! stage the first ids and the tier the next ones, on the gate machine
 //! with (b′)'s tier card and its prompt-batch reserves beside the stage card
@@ -110,6 +112,10 @@ mod dspark;
 #[cfg(feature = "deepseek41")]
 #[path = "shared/gate_card.rs"]
 mod gate_card;
+
+#[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_pair.rs"]
+mod ds41_pair;
 
 #[cfg(feature = "deepseek41")]
 #[path = "shared/ds41_tier.rs"]
@@ -362,14 +368,19 @@ mod gate {
 
     /// `plan` on `machine` (the gate plan's with the tier card,
     /// [`tier_machine`]) with the last `k3` experts of each routed stack's
-    /// card-0 list, in id order, moved to device [`TIER_DEVICE`]; a stack
-    /// whose card list holds `k3` or fewer is refused by name. With `twice`,
-    /// the first stack's tier list also keeps its first expert on card 0 (an
-    /// expert on two devices). The host segments stay as they are, so the
-    /// host set is the plan's.
+    /// card-0 list, in id order, moved to device [`TIER_DEVICE`], in each
+    /// layer whose gate and down types (`hp`'s layer table) the pair rule
+    /// admits on an expert tier (`accepts::ds41_pair` at `tier`); a layer it
+    /// keeps off a tier keeps its card-0 lists whole, where the engine's tier
+    /// refuses it (`Ds41Tier::new`). A stack of a tier layer whose card list
+    /// holds `k3` or fewer is refused by name. With `twice`, the first stack
+    /// the tier takes also keeps its first tier expert on card 0 (an expert on
+    /// two devices). The host segments stay as they are, so the host set is
+    /// the plan's.
     fn tiered<'a>(
         plan: &Plan<'a>,
         machine: &'a Machine,
+        hp: &Hparams,
         k3: usize,
         twice: bool,
     ) -> Result<Plan<'a>, GateError> {
@@ -388,6 +399,9 @@ mod gate {
             let layer = t
                 .layer
                 .ok_or_else(|| format!("{}: a routed stack without a layer", t.name))?;
+            if !crate::ds41_pair::tier_admits(hp, layer)? {
+                continue;
+            }
             let ids = card
                 .experts
                 .as_ref()
@@ -781,13 +795,17 @@ mod gate {
             &bloomery_gpu_gates::tier::plan_levers(&split()?, &levers, reserve)?,
             reserve,
         )?;
-        let tplan = tiered(&plan, &tmachine, k3, false)?;
+        let tplan = tiered(&plan, &tmachine, &inputs.hp, k3, false)?;
         let tier_layers: Vec<usize> = (0..inputs.model.layers)
             .filter(|&l| tplan.n_l.get(l) != plan.n_l.get(l))
             .collect();
+        let whole: Vec<usize> = (0..inputs.model.layers)
+            .filter(|&l| plan.n_l.get(l).is_some_and(|&n| n > 0) && !tier_layers.contains(&l))
+            .collect();
         println!(
             "plan: gate card {card}, {} experts on it by the id prefix; tier: the last {k3} of each \
-             routed layer's list on {} layers ({} experts), stage keeps the rest",
+             tier layer's list on {} layers ({} experts), stage keeps the rest and, whole, layers \
+             {whole:?} the pair rule keeps off a tier",
             plan.cards[0].experts,
             tier_layers.len(),
             k3 * tier_layers.len()
@@ -795,7 +813,7 @@ mod gate {
         let mut pass = true;
 
         if args.two {
-            let bad = tiered(&plan, &tmachine, k3, true)?;
+            let bad = tiered(&plan, &tmachine, &inputs.hp, k3, true)?;
             let t0 = Instant::now();
             match open(split()?, &bad, Some(tier_open()), &meta) {
                 Err(e @ GpuError::Plan { what, .. })

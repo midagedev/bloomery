@@ -1,0 +1,12 @@
+# mutant: gate-gpu-ds41-step: the shadow clause names the q5_K down as the q4_K entry; layers 0 and 1 read FAIL "shadow layer=0 got=[..q5k_gemv_sel..] want=[..q4k_gemv_sel..]"
+--- a/crates/gpu-gates/src/bin/shared/ds41_shadow.rs
++++ b/crates/gpu-gates/src/bin/shared/ds41_shadow.rs
+@@ -72,7 +72,7 @@
+     Ok(match ty {
+         GgmlType::Q4_K if prefetch => "q4k_gemv_sel_prefetch",
+         GgmlType::Q4_K => "q4k_gemv_sel",
+-        GgmlType::Q5_K => "q5k_gemv_sel",
++        GgmlType::Q5_K => "q4k_gemv_sel",
+         GgmlType::IQ2_XXS => "iq2_xxs_gemv_sel",
+         GgmlType::IQ2_XS => "iq2_xs_gemv_sel",
+         GgmlType::IQ2_S => "iq2_s_gemv_sel",

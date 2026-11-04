@@ -1,0 +1,10 @@
+# mutant: gate-gpu-ds41-tier and gate-gpu-ds41-twocard: the pair rule read at a stage card; the tier gate moves layers 0 and 1 to the tier and its load dies as before (Ds41Tier::new: blk.0.ffn_down_exps.weight is not the fused layer with a q4_K down on an expert tier), the twocard sets clause reads FAIL sets: the tier holds experts on layers [2..8], the stage hybrid layers the pair rule admits are [0..8]
+--- a/crates/gpu-gates/src/bin/shared/ds41_pair.rs
++++ b/crates/gpu-gates/src/bin/shared/ds41_pair.rs
+@@ -17,5 +17,5 @@
+         .get(l)
+         .and_then(|k| k.routed_types)
+         .ok_or_else(|| format!("layer {l} holds no routed gate, up and down stacks"))?;
+-    Ok(model::placement::accepts::ds41_pair(gate, down, true))
++    Ok(model::placement::accepts::ds41_pair(gate, down, false))
+ }
