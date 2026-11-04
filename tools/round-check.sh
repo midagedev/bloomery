@@ -27,7 +27,7 @@
 # Ledger. A shape green on the box is appended to ~/.cache/bloomery/round-check-<check|clippy>.tsv as
 # `<input key><TAB>green<TAB><date><TAB><DIR>` (the key is combos' own: every file the shape reads, its command and the
 # environment); the next run skips a shape green at its key, so a round re-checks only what moved and what was red. `--fresh`
-# reads no ledger (every changed shape runs) and still records. BLOOMERY_ROUND_LEDGER_DIR moves the ledgers. Each run's wall
+# reads no ledger (every changed shape runs) and still records. ROUND_CHECK_LEDGER_DIR moves the ledgers. Each run's wall
 # lands in ~/.cache/bloomery/round-check-times.tsv (`<date> <DIR> <mode> <shapes> <wall s> <rc>`), and its median per shape
 # predicts the next run's wall before it starts.
 #
@@ -64,7 +64,7 @@ on_box() {
 # A shape's words: what combos prints, and nothing a shell would read as more than a word.
 SHAPE_RE='^cargo (check|clippy)( [A-Za-z0-9_,.:=/-]+)+$'
 
-ledger_dir() { echo "${BLOOMERY_ROUND_LEDGER_DIR:-$HOME/.cache/bloomery}"; }
+ledger_dir() { echo "${ROUND_CHECK_LEDGER_DIR:-$HOME/.cache/bloomery}"; }
 
 # predict MODE SHAPES: the median per-shape wall of the last five runs of MODE, times SHAPES; empty when none ran yet.
 predict() {
@@ -223,7 +223,7 @@ SH
     n=$((n + 1))
     rm -f "$d"/box.* "$d"/cargo.calls "$d"/lockback.calls
     rc=0
-    out=$(env -i PATH="/usr/bin:/bin:$(dirname "$(command -v python3)")" HOME="$d/home" RC_T="$d" BLOOMERY_ROUND_LEDGER_DIR="$d/led" \
+    out=$(env -i PATH="/usr/bin:/bin:$(dirname "$(command -v python3)")" HOME="$d/home" RC_T="$d" ROUND_CHECK_LEDGER_DIR="$d/led" \
       ${envs[@]+"${envs[@]}"} bash "$d/bloomery-tr/tools/round-check.sh" "$@" 2>&1) || rc=$?
     if [ "$rc" != "$want" ] || ! grep -qE -- "$pat" <<< "$out"; then
       echo "round-check self-test FAIL: $name (rc $rc, want $want; pattern '$pat')" >&2

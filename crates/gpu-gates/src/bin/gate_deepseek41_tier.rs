@@ -198,8 +198,8 @@ mod gate {
     // PIN(2026-11-04): with layers 0·1's routed experts on the cards, the prompt call runs them by the
     // tile GEMM and the steps by the `_sel` gemv, so the first routed seam's sum-order distance now
     // opens at layer 0 and every layer compounds it: real 0.1156, fixture 0.1656 (against the step one
-    // position earlier: 0.944, 1.246), x1.5. Before (2026-10-31, the seam at layer 2): real 0.0789,
-    // fixture 0.0644, pin 0.16. Not derived.
+    // position earlier: 0.944, 1.246), x1.5. With the seam at layer 2 it read 0.0789 real, 0.0644
+    // fixture, under 0.16. Not derived.
     const FEATURE_REL_PIN: f64 = 0.25;
     /// The batches a group holds that `--batch2`'s call must run as.
     const BATCH_GROUP: usize = 2;
