@@ -13,6 +13,7 @@
 //!     fixture variant-check <variant first shard> --source <fixture first shard> --tag T
 //!                           [--table FILE]
 //!     fixture variant-budget <variant first shard>
+//!     fixture rebudget <fixture first shard> [--card-budget B]
 //!     fixture registry
 //!
 //! The spec is the family's whose architecture the first file declares (for `verify`, the
@@ -31,7 +32,7 @@
 //! listed size with its header (fetched through the hf crate's client) at the front, in a
 //! directory beside `<out dir>` that is removed afterwards; the family's draft is the repo's
 //! file its family's source row names, when the row has one (a row can say its draft is not
-//! fetchable, and `fetch` then skips it by name). A family name (`v41`, `qwen3moe`, `qwen38`, `qwen35moe`, `glm5next`, `solar2`, `nemotron`, `nemotron-bolt`, `musespark`, `mistrallarge4-e128`)
+//! fetchable, and `fetch` then skips it by name, in its line and in its closing `fetch done` line). A family name (`v41`, `qwen3moe`, `qwen38`, `qwen35moe`, `glm5next`, `solar2`, `nemotron`, `nemotron-bolt`, `musespark`, `mistrallarge4-e128`)
 //! reads its row of the registry (`model::arch::registry`): repo, quant and revision; a `<repo>:<quant>` takes `main`, a `<repo>@<rev>:<quant>` its `rev`.
 //! After writing, it runs `verify`'s check against the sparse sources it still holds, and a
 //! fixture that fails it is removed with its sidecar, so a failed fetch leaves nothing.
@@ -47,7 +48,12 @@
 //! map's types, and every other tensor's bytes equal — the budget a planned family's variant holds
 //! is the planner's value for the written file, a fixed family's the trunk's. `variant-budget`
 //! records that value on a written variant, in place (the planner's cap for the variant's own
-//! file, replacing the trunk's the quantizer copied; a fixed family's is kept as it is). The table
+//! file, replacing the trunk's the quantizer copied; a fixed family's is kept as it is). `rebudget`
+//! records the same value on any written fixture, a trunk or a variant, in place
+//! (`fixture::rebudget`): the planner's cap for the file as it stands, the draft fixture beside a
+//! trunk given the same value, and the r8 sidecar beside it re-recording the source header digests
+//! the patch moved, so a fixture whose plan moved under it needs no regeneration; `--card-budget B`
+//! records B instead, as `generate`'s flag does, with no plan run. The table
 //! is `--table`, else `tools/fixture-variants.tsv`
 //! under the working directory. `cut` is the fixture of a safetensors checkpoint folder in its stored
 //! bits (`cut::cut`): the layers, widths and tensor roles its spec names (`tools/fixture-cuts/<name>.json`),
@@ -74,8 +80,8 @@ use hf::fetch::Client;
 use hf::{Entry, RepoRef};
 use model::arch::registry::{self, DraftSource};
 use model::fixture::{
-    self, DEFAULT_SEED, FilePlan, FixtureError, FixtureSpec, Options, PlannedTensor, Sample,
-    TensorStat, VARIANT_TABLE,
+    self, BudgetChosen, DEFAULT_SEED, FilePlan, FixtureError, FixtureSpec, Options, PlannedTensor,
+    Sample, TensorStat, VARIANT_TABLE,
 };
 use model::placement::card_budget;
 use model_hf::remote::{self, HeaderStat, RemoteError};
@@ -90,6 +96,7 @@ const USAGE: &str = "usage: fixture plan <real first shard> [--draft <real draft
        fixture variant-rules <fixture first shard> --tag T [--table FILE]
        fixture variant-check <variant first shard> --source <fixture first shard> --tag T [--table FILE]
        fixture variant-budget <variant first shard>
+       fixture rebudget <fixture first shard> [--card-budget B]
        fixture registry
 flags of plan and generate: --seed N --card-budget B --shard-bytes B --tensors a,b,... --draft-tensors a,b,...
 flags of fetch: the same but --draft, and --rev R";
@@ -147,6 +154,7 @@ fn run(args: &[String]) -> Res<()> {
         "variant-rules" => &RULES_FLAGS,
         "variant-check" => &CHECK_FLAGS,
         "variant-budget" => &[],
+        "rebudget" => &["--card-budget"],
         "registry" => &[],
         _ => return Err(USAGE.into()),
     };
@@ -161,6 +169,7 @@ fn run(args: &[String]) -> Res<()> {
         ("variant-rules", [source]) => variant_rules(source, &a),
         ("variant-check", [variant]) => variant_check(variant, &a),
         ("variant-budget", [variant]) => variant_budget(variant),
+        ("rebudget", [first]) => rebudget(first, a.card_budget),
         ("registry", []) => {
             print!("{}", registry::print());
             Ok(())
@@ -546,10 +555,12 @@ fn fetch_into(r: &RepoRef, rev: &str, out: &str, a: &Args, tmp: &Path) -> Res<()
     let row = registry::fixture_of(spec.arch)
         .ok_or_else(|| format!("{first}: the {} family has no fixture row", spec.arch))?;
     let mut draft_path: Option<String> = None;
+    let mut draft_note = format!("none (the {} family has no draft)", row.family);
     let draft = match row.draft {
         DraftSource::None => None,
         DraftSource::NotFetchable(why) => {
-            println!("fixture: fetch draft skipped, not fetchable: {why}");
+            draft_note = format!("skipped (not fetchable: {why})");
+            println!("fixture: fetch draft {draft_note}");
             None
         }
         DraftSource::File(name) => match hf::mtp_draft(&r.repo, &entries, name)? {
@@ -558,6 +569,7 @@ fn fetch_into(r: &RepoRef, rev: &str, out: &str, a: &Args, tmp: &Path) -> Res<()
                 let p =
                     remote::sparse_set(&client, &r.repo, rev, one, &dir, &mut note)?.swap_remove(0);
                 println!("fixture: fetch draft {}", e.path);
+                draft_note.clone_from(&e.path);
                 draft_path = Some(p.to_string_lossy().into_owned());
                 Some(open(&p.to_string_lossy())?)
             }
@@ -595,7 +607,10 @@ fn fetch_into(r: &RepoRef, rev: &str, out: &str, a: &Args, tmp: &Path) -> Res<()
         Ok(fx_first)
     });
     match checked {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            println!("fixture: fetch done {r}@{rev} -> {out} draft={draft_note}");
+            Ok(())
+        }
         Err(e) => {
             let sidecar = match (&spec.sidecar, first_shard(Path::new(out), spec.stem)) {
                 (Some(_), Ok(f)) => fixture::sidecar_path(&f).ok(),
@@ -878,42 +893,80 @@ fn variant_check(variant: &str, a: &Args) -> Res<()> {
     Ok(())
 }
 
-/// Record on the written `variant` the card budget its own file plans, in place: the family's
-/// planner chooses the cap for the variant's headers (the tag names the file a refusal speaks of),
-/// replacing the trunk's the quantizer copied; a family with a fixed budget keeps the trunk's.
+/// Record on the written `variant` the card budget its own file plans, in place
+/// (`fixture::rebudget`): the family's planner chooses the cap for the variant's headers (the tag
+/// names the file a refusal speaks of), replacing the trunk's the quantizer copied; a family with a
+/// fixed budget keeps the trunk's.
 fn variant_budget(variant: &str) -> Res<()> {
-    let var = open(variant)?;
-    let tag = var
-        .value(model::fixture::KEY_VARIANT)
-        .and_then(gguf::Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| {
-            format!(
-                "{variant} carries no {}: a budget is recorded on a variant",
-                model::fixture::KEY_VARIANT
-            )
-        })?;
-    let spec = spec_of(&var, variant)?;
-    match spec.card_budget {
-        model::fixture::CardBudget::Fixed(b) => {
-            println!(
-                "fixture: variant-budget {tag}: the {} family records a fixed budget; the trunk's \
-                 {b} is kept",
-                spec.arch
-            );
-        }
-        model::fixture::CardBudget::Planned(planner) => {
-            let planned = fixture::choose_budget_written(&planner, &var)?;
-            let was = fixture::variant_record_budget(&tag, &var, planned)?;
-            let key = model::fixture::KEY_CARD_BUDGET;
-            let own = if fixture::budget_host_only(&planner, &var)? {
-                "host-only: no layer holds a card expert, the trunk's budget is kept"
-            } else {
-                "planned on the variant's own file"
-            };
-            println!("fixture: variant-budget {tag}: {key} {was} -> {planned} ({own})");
-        }
+    let (tag, spec) = {
+        let var = open(variant)?;
+        let tag = var
+            .value(model::fixture::KEY_VARIANT)
+            .and_then(gguf::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| {
+                format!(
+                    "{variant} carries no {}: a budget is recorded on a variant",
+                    model::fixture::KEY_VARIANT
+                )
+            })?;
+        (tag, spec_of(&var, variant)?)
+    };
+    let r = fixture::rebudget(&spec, Path::new(variant), None)
+        .map_err(|e| format!("variant {tag}: {e}"))?;
+    let key = model::fixture::KEY_CARD_BUDGET;
+    match r.chosen {
+        BudgetChosen::Fixed => println!(
+            "fixture: variant-budget {tag}: the {} family records a fixed budget; the trunk's {} \
+             is kept",
+            spec.arch, r.now
+        ),
+        BudgetChosen::HostOnly => println!(
+            "fixture: variant-budget {tag}: {key} {} -> {} (host-only: no layer holds a card \
+             expert, the trunk's budget is kept)",
+            r.was, r.now
+        ),
+        BudgetChosen::Planned | BudgetChosen::Given => println!(
+            "fixture: variant-budget {tag}: {key} {} -> {} (planned on the variant's own file)",
+            r.was, r.now
+        ),
     }
+    Ok(())
+}
+
+/// Rewrite the written fixture whose first shard is `first` to the card budget its family's
+/// planner gives it as it stands, in place (`fixture::rebudget`), with the draft fixture beside it
+/// and the r8 sidecar's record of the headers that moved; `given` replaces the plan. The closing
+/// line names each of the three, and what was absent.
+fn rebudget(first: &str, given: Option<u64>) -> Res<()> {
+    let spec = spec_of(&open(first)?, first)?;
+    let r = fixture::rebudget(&spec, Path::new(first), given)?;
+    let how = match r.chosen {
+        BudgetChosen::Fixed => "the family's budget is fixed: kept",
+        BudgetChosen::HostOnly => "host-only: the header's kept",
+        BudgetChosen::Planned => "planned on the file as written",
+        BudgetChosen::Given => "given by --card-budget, no plan run",
+    };
+    let draft = match (&r.draft, spec.draft) {
+        (Some(p), _) => p.display().to_string(),
+        (None, None) => "none (the family has no draft)".to_string(),
+        (None, Some(_)) if r.variant => "none (a variant has no draft)".to_string(),
+        (None, Some(ds)) => format!("absent ({} is not beside it)", ds.file),
+    };
+    let sidecar = match (&r.sidecar, spec.sidecar) {
+        (Some((p, n)), _) => format!("{} ({n} header digests re-recorded)", p.display()),
+        (None, None) => "none (the family has no sidecar)".to_string(),
+        (None, Some(_)) => format!(
+            "absent ({} is not there)",
+            fixture::sidecar_path(Path::new(first))?.display()
+        ),
+    };
+    println!(
+        "fixture: rebudget {first}: {} {} -> {} ({how}) draft={draft} sidecar={sidecar}",
+        model::fixture::KEY_CARD_BUDGET,
+        r.was,
+        r.now
+    );
     Ok(())
 }
 

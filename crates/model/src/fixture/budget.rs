@@ -241,8 +241,13 @@ pub fn choose_written(planner: &Budget, split: &Split) -> Result<u64, FixtureErr
     choose_in(planner, split, true)
 }
 
-/// [`choose_written`] for a file whose plan may be host-only only when `host_only_ok`.
-fn choose_in(planner: &Budget, split: &Split, host_only_ok: bool) -> Result<u64, FixtureError> {
+/// [`choose_written`] for a file whose plan may be host-only only when `host_only_ok`: a variant's
+/// may, a trunk's ([`choose`]) may not.
+pub(super) fn choose_in(
+    planner: &Budget,
+    split: &Split,
+    host_only_ok: bool,
+) -> Result<u64, FixtureError> {
     let (_, eligible, half) = fills(planner, split, host_only_ok)?;
     if eligible.is_empty() {
         // Host-only: the header's budget stays, once it plans the file with no expert on a card.
