@@ -80,7 +80,7 @@
 //!   a chain whose rows carry media rows and a store walk whose media rows are
 //!   not the embedding's width, a capture with the taps armed, a media load
 //!   (`enable_media`) after a captured draft walk, before and after a reset; a store walk (`WalkMode::Store`) past its
-//!   `MTP_STORE_ROWS` rows, read back or chained, and the own row and the
+//!   load's store rows, read back or chained, and the own row and the
 //!   streams after one — and a NaN in a
 //!   hidden row raised on the fault word as the draft layer's `hc_mix`, the
 //!   walk's error; and a walk that reads the target's arenas by position
@@ -191,6 +191,12 @@
 //!   took its anchor), the draft's store stands at the target's position
 //!   (the chain took its own rows back), a snapshot there is taken, and the
 //!   drafted ids after it are the plain run's.
+//! - (wide) the store walk's two arenas, the plan's choice between 64 and 512 rows
+//!   (`StoreRows`; the model crate's restated rows equal the gpu crate's): a load asked
+//!   for each holds the arena the plan counts (`MtpPlan::arena_bytes`, the formula
+//!   `mtp_arena_bytes` against the allocation) and the rows it asked, and a store
+//!   walk of 200 rows (four walks of the 64-row arena, one of the 512-row one)
+//!   leaves every position's keys and values bit for bit the same in both.
 //! - (y) two drafted sequences resident over a plan of two
 //!   (`PlanInputs::plan_mtp_with_slots`, `Body38::open_placed_mtp_slots`),
 //!   in the server's order (`worker.rs`'s `start` → `genloop`'s `prompt`):
@@ -281,9 +287,9 @@ mod gate {
 
     use bloomery_gpu::GpuError;
     use bloomery_gpu::arch::qwen3moe::{
-        Body38, CHECKPOINT_EVERY, MTP_GRAPH_ROWS, MTP_ROWS, MTP_STORE_ROWS, Mtp38, MtpNode,
-        MtpTaps, Prompt38, Qwen38Model, Seq38, SplitWalk, Store38Host, TargetRows,
-        checkpoint_bytes, seq_positional_bytes, seq38_bytes,
+        Body38, CHECKPOINT_EVERY, MTP_GRAPH_ROWS, MTP_ROWS, MTP_STORE_ROWS_LEAST,
+        MTP_STORE_ROWS_MOST, Mtp38, MtpNode, MtpTaps, Prompt38, Qwen38Model, Seq38, SplitWalk,
+        Store38Host, TargetRows, checkpoint_bytes, seq_positional_bytes, seq38_bytes,
     };
     use bloomery_gpu::draft::{DraftFeed, DraftHead, Feed, Hidden, Proposal, WalkMode};
     use bloomery_gpu::fault::FaultSite;
@@ -307,7 +313,8 @@ mod gate {
     use model::arch::models::{Borrows, MtpSource};
     use model::arch::qwen35moe::head_list::{HeadWhy, SHIPPED, head_rows_of};
     use model::arch::qwen35moe::place::{
-        Experts, MtpInputs, MtpPlan, PlaceError, PlanInputs, machine, machine_for_experts,
+        Experts, MtpInputs, MtpPlan, PlaceError, PlanInputs, StoreRows, StoreWhy, machine,
+        machine_for_experts,
     };
     use model::placement::workstation::HostRead;
     use model::placement::{PlacementError, PlanLevers};
@@ -2127,7 +2134,7 @@ mod gate {
             let b = m.body("refusals")?;
             (b.vocab(), b.mtp().map_or(0, |d| d.ctx()))
         };
-        let over = MTP_STORE_ROWS + 1;
+        let over = store_rows(m)? + 1;
         let tokens: Vec<u32> = g.tokens.iter().copied().cycle().take(over).collect();
         let states: Vec<f32> = g.states.iter().copied().cycle().take(over * WIDE).collect();
         let feed = |k: usize, pos0: u32| {
@@ -2323,12 +2330,13 @@ mod gate {
         // The draft's store must hold every walk's start: warm it over the
         // prompt's rows and the position after them (store walks, the prompt
         // call's warmup shape).
-        let zeros = vec![0.0f32; MTP_STORE_ROWS * WIDE];
+        let warm_rows = store_rows(m)?.min(prompt.len());
+        let zeros = vec![0.0f32; warm_rows * WIDE];
         m.mtp_walk(
             DraftFeed::Rows(Feed {
-                tokens: &prompt[..MTP_STORE_ROWS.min(prompt.len())],
+                tokens: &prompt[..warm_rows],
                 pos0: 0,
-                hidden: Hidden::Host(&zeros[..MTP_STORE_ROWS.min(prompt.len()) * WIDE]),
+                hidden: Hidden::Host(&zeros[..warm_rows * WIDE]),
                 media: None,
             }),
             DraftHead::Rows,
@@ -2598,7 +2606,7 @@ mod gate {
         use bloomery_gpu::media::{ImageShape, ImageSpan, MediaSpan};
         use bloomery_gpu::{Window, to_host};
         const PREFIX: [u32; 4] = [1, 2, 3, 4];
-        const IMAGE: usize = MTP_STORE_ROWS + 8;
+        const IMAGE: usize = MTP_STORE_ROWS_LEAST + 8;
         let ctx = m.body("media draft")?.ctx() as u32;
         let embedding = {
             let (gpu, w, _) = m.body_parts("media draft")?;
@@ -2645,8 +2653,9 @@ mod gate {
             if image {
                 m.rope_restore(rope.clone())?;
             }
-            for (block, tokens) in reference_ids[..held].chunks(MTP_STORE_ROWS).enumerate() {
-                let from = block * MTP_STORE_ROWS;
+            let rows = store_rows(&m)?;
+            for (block, tokens) in reference_ids[..held].chunks(rows).enumerate() {
+                let from = block * rows;
                 m.mtp_walk(
                     DraftFeed::Rows(Feed {
                         tokens,
@@ -3453,7 +3462,7 @@ mod gate {
         let (mut m, w_ok) = scripted_window(m, &plain, prompt, KEEP, ctx, "the partial accept")?;
         let at = m.pos() as usize;
         let pos0 = at - KEEP;
-        let zeros = vec![0.0f32; MTP_STORE_ROWS * WIDE];
+        let zeros = vec![0.0f32; WIDE];
         let vocab = u32::try_from(m.body("kept state")?.vocab())?;
         let ids: Vec<u32> = (0..at + 2)
             .map(|i| (prompt[i % prompt.len()] + 1) % vocab)
@@ -3978,12 +3987,13 @@ mod gate {
         let ids: Vec<u32> = (0..n)
             .map(|i| (prompt[i % prompt.len()] + shift) % vocab)
             .collect();
-        let zeros = vec![0.0f32; MTP_STORE_ROWS * WIDE];
-        for (i, run) in ids.chunks(MTP_STORE_ROWS).enumerate() {
+        let rows = store_rows(m)?;
+        let zeros = vec![0.0f32; rows * WIDE];
+        for (i, run) in ids.chunks(rows).enumerate() {
             m.mtp_walk(
                 DraftFeed::Rows(Feed {
                     tokens: run,
-                    pos0: u32::try_from(i * MTP_STORE_ROWS)?,
+                    pos0: u32::try_from(i * rows)?,
                     hidden: Hidden::Host(&zeros[..run.len() * WIDE]),
                     media: None,
                 }),
@@ -3997,6 +4007,93 @@ mod gate {
     /// The long point clause's context: a prompt call past the first inner mark
     /// ([`CHECKPOINT_EVERY`]), its drafted run and a few positions of slack.
     const CTX_LONG: u64 = 2 * CHECKPOINT_EVERY as u64;
+
+    /// (wide) the store walk's two arenas ([`StoreRows`]): a load asked for each holds the
+    /// arena its plan counts (`MtpPlan::arena_bytes`, [`model::arch::qwen35moe::place::mtp_arena_bytes`]
+    /// against the device allocation) and the rows it asked, and a store walk of `N` ids — past
+    /// the 64-row arena's walk, inside the 512-row one's — leaves every position's keys and
+    /// values bit for bit the same: four walks of one arena, one walk of the other. The model
+    /// crate's restated rows equal the gpu crate's.
+    /// Mutant: the 512-row arena's inbox or a route table sized for 64 rows (the allocation
+    /// is refused against the plan's count, or the walk's tail rows read past the tables).
+    fn wide_store(inputs: &PlanInputs, mtp: &MtpInputs) -> Result<bool, GateError> {
+        const N: usize = 200;
+        let consts = StoreRows::Least.rows() == MTP_STORE_ROWS_LEAST as u64
+            && StoreRows::Most.rows() == MTP_STORE_ROWS_MOST as u64;
+        println!(
+            "(wide) the model crate's rows {} and {} equal the gpu crate's {MTP_STORE_ROWS_LEAST} \
+             and {MTP_STORE_ROWS_MOST} {}",
+            StoreRows::Least.rows(),
+            StoreRows::Most.rows(),
+            verdict(consts)
+        );
+        let mut ok = consts;
+        let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(usize::try_from(CTX)?)?;
+        let draft = open_draft()?;
+        let hidden: Vec<f32> = (0..N * WIDE)
+            .map(|i| ((i as u64 * 2_654_435_761) % 2003) as f32 / 2003.0 - 0.5)
+            .collect();
+        let mut stores = Vec::new();
+        for rows in [StoreRows::Least, StoreRows::Most] {
+            let asked = mtp.clone().asking(rows);
+            let file = open_target()?;
+            let machine = machine(card()?, inputs.stack(), u64::try_from(ub)?);
+            let extra = asked.card_bytes(CTX)?;
+            let plan = inputs.plan_mtp(
+                &machine,
+                (CTX, u64::try_from(ub)?),
+                &plan_levers(extra)?,
+                &asked,
+            )?;
+            let mut m =
+                Body38::open_placed_mtp(file, &plan, inputs, 0, cfg().host, ub, &draft, &asked)?;
+            let (arena, walk) = {
+                let d = m.body("wide")?.mtp().ok_or("the load opened no draft")?;
+                (d.arena_bytes() as u64, d.store_walk_rows() as u64)
+            };
+            let held = arena == plan.arena_bytes
+                && walk == rows.rows()
+                && (plan.store, plan.store_why) == (rows, StoreWhy::Asked);
+            ok &= held;
+            println!(
+                "(wide) {rows:?}: the arena {arena} B (the plan's {}), the walk's {walk} rows, the \
+                 plan's {:?} {:?} {}",
+                plan.arena_bytes,
+                plan.store,
+                plan.store_why,
+                verdict(held)
+            );
+            m.reset()?;
+            let vocab = u32::try_from(m.body("wide")?.vocab())?;
+            let ids: Vec<u32> = (0..N).map(|i| (i as u32 * 7 + 3) % vocab).collect();
+            let step = usize::try_from(rows.rows())?;
+            let mut at = 0;
+            while at < N {
+                let end = (at + step).min(N);
+                m.mtp_walk(
+                    DraftFeed::Rows(Feed {
+                        tokens: &ids[at..end],
+                        pos0: u32::try_from(at)?,
+                        hidden: Hidden::Host(&hidden[at * WIDE..end * WIDE]),
+                        media: None,
+                    }),
+                    DraftHead::Rows,
+                    WalkMode::Store,
+                )?;
+                at = end;
+            }
+            stores.push(store_of(&m, N)?);
+        }
+        let same = same_rows(&stores[0], &stores[1], N);
+        let differ = same.iter().filter(|&&b| !b).count();
+        ok &= differ == 0;
+        println!(
+            "(wide) a store walk of {N} ids: {differ} of {N} positions differ between the 64-row \
+             arena's four walks and the 512-row one's {}",
+            verdict(differ == 0)
+        );
+        Ok(ok)
+    }
 
     /// (kp-draft) a point inside a long prompt call, on a load of [`CTX_LONG`] positions: a
     /// drafted run whose prompt call of `CHECKPOINT_EVERY + prompt.len()` ids takes an inner
@@ -4736,6 +4833,14 @@ mod gate {
             verdict(same)
         );
         Ok((m, band_ok && store_ok && same))
+    }
+
+    /// The rows of the store walk this load's arena holds, the plan's choice.
+    fn store_rows(m: &Qwen38Model) -> Result<usize, GateError> {
+        Ok(m.body("store rows")?
+            .mtp()
+            .ok_or("the load opened no draft")?
+            .store_walk_rows())
     }
 
     /// The draft's stored keys and values at positions `0..n`, position-major.
@@ -7537,6 +7642,10 @@ mod gate {
         ok &= final_rows_ubatches(&inputs, &mtp, &prompt, &one_unit)?;
         tier::sc("(kp-draft) a point inside a long prompt call, cut to and put back as a prefix")?;
         ok &= long_point(&inputs, &mtp, &prompt)?;
+        tier::sc(
+            "(wide) the store walk's 64-row and 512-row arenas hold the plan's bytes and the same store",
+        )?;
+        ok &= wide_store(&inputs, &mtp)?;
         // Window B diverges from window A from position 0 on: the corpus's
         // deep window read past A's whole length, so no per-sequence state
         // the two share by content can pass for one the slots exchanged.

@@ -2223,7 +2223,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         let (gdn, qsa) = layer_counts(&inputs);
         checkpoint_budget38(gdn, qsa, u64::try_from(ctx)?)?
     })?;
-    let (plan, draft_bytes) = match &mtp_inputs {
+    let (plan, draft_bytes, store) = match &mtp_inputs {
         None => (
             inputs.plan_with_slots(
                 &machine,
@@ -2233,6 +2233,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
                 slots,
             )?,
             0,
+            None,
         ),
         Some(mi) => {
             let with = inputs.plan_mtp_with_slots(
@@ -2244,7 +2245,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
                 slots,
             )?;
             let bytes = with.draft_card_bytes() + with.arena_bytes;
-            (with.plan, bytes)
+            (with.plan, bytes, Some((with.store, with.store_why)))
         }
     };
     // PIN(2026-10-23): the planner's slot-aware arena floor replaces the one-column
@@ -2267,6 +2268,12 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         None => line,
     };
     let line = record::with_room(line, plan.host.room.as_ref());
+    let line = match store {
+        Some((rows, why)) => line
+            .u("mtp_rows", rows.rows())
+            .w("mtp_rows_why", why.word()),
+        None => line,
+    };
     let line = line
         .csv("devices", record::plan_devices(&machine))
         .w("cuda_order", record::cuda_order());
@@ -2823,10 +2830,11 @@ impl Q38 {
                 None => "full".to_string(),
             };
             eprintln!(
-                "load draft=mtp resident={} arena={} head={head} card_bytes={bytes} (the \
-                 plan's {}) in {:.1} s (runtime value)",
+                "load draft=mtp resident={} arena={} store_rows={} head={head} \
+                 card_bytes={bytes} (the plan's {}) in {:.1} s (runtime value)",
                 d.resident_bytes(),
                 d.arena_bytes(),
+                d.store_walk_rows(),
                 a.draft_bytes,
                 t.elapsed().as_secs_f64(),
             );

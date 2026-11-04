@@ -193,7 +193,13 @@ impl Session {
     /// `Speculative<Choosing<MtpDraft<Session>>, 2>`.
     pub fn mtp_draft(&self) -> Result<MtpDraft<Session>, SessionError> {
         self.mtp_ref()?;
-        Ok(MtpDraft::new((), (), WalkMode::Eager, self.arena.hidden))
+        Ok(MtpDraft::new(
+            (),
+            (),
+            WalkMode::Eager,
+            self.arena.hidden,
+            STORE_ROWS,
+        ))
     }
 
     /// A draft walk's preconditions: the session is not poisoned, no verify

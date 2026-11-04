@@ -17,7 +17,8 @@ impl MtpBody for Body38 {
     /// A proposal fills the widest verify the GDN lanes hold.
     const WIDTH: usize = <Body38 as Rows>::MAX_ROWS - 1;
     const WALK_ROWS: usize = <Mtp38 as WalkBounds>::WALK_ROWS;
-    /// The prompt's store walks run wide, through the GEMM path.
+    /// The prompt's store walks run wide, through the GEMM path, up to the rows
+    /// the load's plan chose ([`MtpBody::store_walk_rows`]).
     const STORE_ROWS: usize = <Mtp38 as WalkBounds>::STORE_ROWS;
     /// The walk's argmax writes each row's probability beside its id, and
     /// the chain reads both back at once ([`Qwen38Model::mtp_chain`]).
@@ -48,6 +49,15 @@ impl MtpBody for Body38 {
     /// is four streams of it.
     fn embed_width(m: &Qwen38Model) -> Result<usize, GpuError> {
         Ok(m.body(WHAT)?.embed_width())
+    }
+
+    /// [`Mtp38::store_walk_rows`]: the rows the plan chose for the load's arena;
+    /// the widest ([`MtpBody::STORE_ROWS`]) on a load without the layer, which
+    /// walks nothing.
+    fn store_walk_rows(m: &Qwen38Model) -> Result<usize, GpuError> {
+        Ok(m.body(WHAT)?
+            .mtp()
+            .map_or(Self::STORE_ROWS, Mtp38::store_walk_rows))
     }
 
     /// [`Mtp38::held`]; 0 on a load without the layer.

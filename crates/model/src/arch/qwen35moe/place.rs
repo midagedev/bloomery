@@ -38,7 +38,8 @@
 //! with the full head, byte for byte. Under
 //! [`Experts::Card`] ([`PlanInputs::plan_mtp_with`]) the target's expert rule
 //! spreads within its card's budget less the draft's card bytes, so the sum
-//! fits.
+//! fits. The draft program's arena holds a store walk of 64 or 512 rows
+//! ([`StoreRows`]), chosen by the plan from its room.
 
 use bloomery_placement::slots::{SeqTerms, Stores};
 use gguf::{GgmlType, Split};
@@ -978,13 +979,32 @@ impl PlanInputs {
     /// [`MtpInputs::card_bytes`], else the plan is refused by name; the
     /// stage card's own bound and headroom then hold the sum, and the tier
     /// plans as without the draft.
+    ///
+    /// The draft's store walk takes the rows the plan's room allows
+    /// ([`MtpPlan::store`], `choose_store_rows`): the larger arena where it
+    /// costs the card no expert, else the smaller.
     pub fn plan_mtp_with<'a>(
+        &'a self,
+        machine: &'a Machine,
+        shape: (u64, u64),
+        levers: &PlanLevers,
+        mtp: &'a MtpInputs,
+        experts: Experts,
+    ) -> Result<MtpPlan<'a>, PlaceError> {
+        choose_store_rows(mtp, machine, |rows| {
+            self.plan_mtp_with_rows(machine, shape, levers, mtp, experts, rows)
+        })
+    }
+
+    /// [`PlanInputs::plan_mtp_with`] with the draft's arena at `rows`.
+    fn plan_mtp_with_rows<'a>(
         &'a self,
         machine: &'a Machine,
         (ctx_max, ubatch): (u64, u64),
         levers: &PlanLevers,
         mtp: &'a MtpInputs,
         experts: Experts,
+        store: StoreRows,
     ) -> Result<MtpPlan<'a>, PlaceError> {
         check_shape(ctx_max, ubatch)?;
         let [card] = machine.cards.as_slice() else {
@@ -992,8 +1012,8 @@ impl PlanInputs {
                 cards: machine.cards.len(),
             });
         };
-        let (draft, reserve) = mtp.draft_plan(ctx_max)?;
-        let arena = mtp.arena_bytes();
+        let (draft, reserve) = mtp.draft_plan_at(ctx_max, store)?;
+        let arena = mtp.arena_bytes_at(store);
         if !machine.tiers.is_empty() {
             check_draft_reserve(machine, Some(reserve))?;
             let plan = self.target(
@@ -1017,6 +1037,8 @@ impl PlanInputs {
                 draft,
                 map_bytes: mtp.map_bytes,
                 arena_bytes: arena,
+                store,
+                store_why: StoreWhy::Asked,
             });
         }
         check_draft_reserve(machine, None)?;
@@ -1061,6 +1083,8 @@ impl PlanInputs {
             draft,
             map_bytes: mtp.map_bytes,
             arena_bytes: arena,
+            store,
+            store_why: StoreWhy::Asked,
         })
     }
 
@@ -1076,14 +1100,41 @@ impl PlanInputs {
     pub fn plan_mtp_with_slots<'a>(
         &'a self,
         machine: &'a Machine,
-        (ctx_max, ubatch): (u64, u64),
+        shape: (u64, u64),
         levers: &PlanLevers,
         mtp: &'a MtpInputs,
         experts: Experts,
         slots: usize,
     ) -> Result<MtpPlan<'a>, PlaceError> {
+        choose_store_rows(mtp, machine, |rows| {
+            self.plan_mtp_with_slots_rows(machine, shape, levers, mtp, experts, slots, rows)
+        })
+    }
+
+    /// [`PlanInputs::plan_mtp_with_slots`] with the draft's arena at `rows`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "plan_mtp_with_slots's six and the rows (rust-quality R8)"
+    )]
+    fn plan_mtp_with_slots_rows<'a>(
+        &'a self,
+        machine: &'a Machine,
+        (ctx_max, ubatch): (u64, u64),
+        levers: &PlanLevers,
+        mtp: &'a MtpInputs,
+        experts: Experts,
+        slots: usize,
+        store: StoreRows,
+    ) -> Result<MtpPlan<'a>, PlaceError> {
         if slots == 1 {
-            return self.plan_mtp_with(machine, (ctx_max, ubatch), levers, mtp, experts);
+            return self.plan_mtp_with_rows(
+                machine,
+                (ctx_max, ubatch),
+                levers,
+                mtp,
+                experts,
+                store,
+            );
         }
         check_shape(ctx_max, ubatch)?;
         if slots == 0 {
@@ -1094,8 +1145,8 @@ impl PlanInputs {
                 cards: machine.cards.len(),
             });
         };
-        let (draft, reserve) = mtp.draft_plan_of(ctx_max, slots)?;
-        let arena = mtp.arena_bytes();
+        let (draft, reserve) = mtp.draft_plan_of(ctx_max, slots, store)?;
+        let arena = mtp.arena_bytes_at(store);
         let terms = self.seq_terms(Some(mtp));
         let rows = terms.plan_beside(slots as u64);
         let kv = terms.slots_of(slots as u64);
@@ -1124,6 +1175,8 @@ impl PlanInputs {
                 draft,
                 map_bytes: mtp.map_bytes,
                 arena_bytes: arena,
+                store,
+                store_why: StoreWhy::Asked,
             });
         }
         check_draft_reserve(machine, None)?;
@@ -1170,6 +1223,8 @@ impl PlanInputs {
             draft,
             map_bytes: mtp.map_bytes,
             arena_bytes: arena,
+            store,
+            store_why: StoreWhy::Asked,
         })
     }
 
@@ -1213,8 +1268,9 @@ fn draft_card_bytes(d: &placement::CardTotals, map_bytes: u64) -> u64 {
 }
 
 /// Card bytes the MTP draft's program arena holds at a vocabulary of `vocab`
-/// [derived: the arena `MtpArena::new` allocates
-/// for eight rows — its input record 65 u32 (a store walk's 64 ids); the hidden
+/// and a store walk of `rows` rows [derived: the arena `MtpArena::new` allocates
+/// for eight rows — its input record, one word and a store walk's `rows` ids;
+/// the hidden
 /// rows in and the last row's own copy 2 · (81,920 + 10,240) f32; the
 /// embedding, the mix and sub-layer outputs and the shared expert's rows, 7 ·
 /// 20,480 f32; the input pack 163,840 f32; the streams 81,920 f32; the mix
@@ -1229,22 +1285,109 @@ fn draft_card_bytes(d: &placement::CardTotals, map_bytes: u64) -> u64 {
 /// the head's input and logits' rows 20,480 f32 each; the head's logits 8 ·
 /// `vocab` f32; the readback 18 u32, its ticket count, the stand-in map word
 /// and the chain's 10 words; the taps none (the engine's walk arms none) —
-/// 1,212,160 + 8 · `vocab` f32 and 793 u32; then the store walk's arena for 64
-/// rows, 5,049,938 values: the hidden rows 655,360, the embedding 163,840 and
-/// its positions and key counts 128, the pack 1,310,720 and its 32-value q8
-/// blocks over 256 columns of 5,120 (codes, scales and sums, 20 words a
-/// 64-value step) 409,600, the streams 655,360, the wide mix's scratch
-/// 1,573,696 (the normed streams and the up's rows 655,360 each, the q8 of the
-/// normed streams 204,800, the down's dots and the bottleneck 20,480 each, its
-/// q8 6,400, its BF16 pairs 10,240 and refusals 64, the inject's dots and
-/// the weights 256 each), the mix 163,840 and
-/// its q8 51,200, the keys and values 65,536, and the two one-expert tables
-/// of 256 and 64 slots, 524 and 134 words — four bytes a value].
+/// 1,212,160 + 8 · `vocab` f32 and 728 u32 beside the input record; then the
+/// store walk's arena for `rows` rows ([`mtp_store_words`]) — four bytes a
+/// value].
+///
+/// A load whose arena differs from this count is refused by name
+/// (`Mtp38::arm`), so a restated constant here that drifts from the gpu
+/// crate's (`MTP_STORE_ROWS_LEAST`, `MTP_STORE_ROWS_MOST`,
+/// `MTP_FLASH_SEGMENTS`, `GEMM_BN`) fails the load.
 ///
 /// [`MtpArena::new`]: bloomery_gpu::arch::qwen3moe::Mtp38
 #[must_use]
-pub fn mtp_arena_bytes(vocab: u64) -> u64 {
-    4 * (1_212_160 + 8 * vocab + 49_536 * MTP_FLASH_SEGMENTS + 793 + 5_049_938)
+pub fn mtp_arena_bytes(vocab: u64, rows: u64) -> u64 {
+    4 * (1_212_160
+        + 8 * vocab
+        + 49_536 * MTP_FLASH_SEGMENTS
+        + 728
+        + 1
+        + rows
+        + mtp_store_words(rows))
+}
+
+/// Values of the store walk's arena for `rows` rows (a multiple of
+/// [`GEMM_BN`]): per row the hidden rows 10,240, the embedding 2,560, its
+/// position and key count 2, the pack 20,480 and its 32-value q8 blocks over
+/// four columns of 5,120 (codes, scales and sums, 20 words a 64-value step)
+/// 6,400, the streams 10,240, the wide mix's scratch 24,589 (the normed
+/// streams and the up's rows 10,240 each, the q8 of the normed streams 3,200,
+/// the down's dots and the bottleneck 324 and 320, its q8 100, its BF16 pairs
+/// 160 and refusal 1, the inject's weights 4), the mix 2,560 and its q8 800,
+/// the keys and values 1,024 — 78,895 values; and the two one-expert route
+/// tables, over `4 · rows` and `rows` slots ([`route_table_words`]).
+const fn mtp_store_words(rows: u64) -> u64 {
+    78_895 * rows + route_table_words(4 * rows) + route_table_words(rows)
+}
+
+/// Words of a one-expert route table for `slots` slots (`GemmRoute::new`):
+/// the slot list and the all-zero ids, `slots` each, the tiles (`2 · (slots /
+/// GEMM_BN + 1)` words, an expert's most) and the tile and refusal counts.
+const fn route_table_words(slots: u64) -> u64 {
+    2 * slots + 2 * (slots / GEMM_BN + 1) + 2
+}
+
+/// The GEMM's slot tile, `gemm::GEMM_BN` restated.
+const GEMM_BN: u64 = 64;
+
+/// The widths of the draft's store walk a plan chooses between: the rows of
+/// the arena it runs in, the columns of its GEMMs. The prompt's rows are
+/// walked in runs of this many, so the wider walk launches an eighth of the
+/// walks; its arena is 141,399,832 B larger ([`mtp_arena_bytes`]).
+/// `MTP_STORE_ROWS_LEAST` and `MTP_STORE_ROWS_MOST` of the gpu crate,
+/// restated; `gate_qwen4exp_mtp`'s arena clause holds them equal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreRows {
+    /// 64 rows: the arena a plan keeps when the wider one costs it a card
+    /// expert or the plan.
+    Least,
+    /// 512 rows: the arena a plan takes when it has the room.
+    Most,
+}
+
+impl StoreRows {
+    /// The rows of the store walk's arena.
+    #[must_use]
+    pub const fn rows(self) -> u64 {
+        match self {
+            StoreRows::Least => 64,
+            StoreRows::Most => 512,
+        }
+    }
+}
+
+/// Why a plan holds the store walk's rows it holds ([`MtpPlan::store`]),
+/// printed with the plan (`record::PLAN38`'s `mtp_rows_why`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreWhy {
+    /// [`StoreRows::Most`]: the plan with the larger arena holds and keeps
+    /// every card expert the plan with the smaller one keeps.
+    Room,
+    /// [`StoreRows::Least`]: the larger arena leaves the card `experts` fewer
+    /// routed experts.
+    Displaces { experts: u64 },
+    /// [`StoreRows::Least`]: the plan with the larger arena is refused (the
+    /// card's bound).
+    Short,
+    /// [`StoreRows::Least`]: a plan (b′) machine's stage card holds the
+    /// draft's bytes as the caller's reserve row, which names the arena.
+    Reserve,
+    /// The inputs named the rows ([`MtpInputs::asking`]).
+    Asked,
+}
+
+impl StoreWhy {
+    /// The word the plan's record prints.
+    #[must_use]
+    pub fn word(self) -> String {
+        match self {
+            StoreWhy::Room => "room".to_string(),
+            StoreWhy::Displaces { experts } => format!("displaces:{experts}"),
+            StoreWhy::Short => "short".to_string(),
+            StoreWhy::Reserve => "reserve".to_string(),
+            StoreWhy::Asked => "asked".to_string(),
+        }
+    }
 }
 
 /// The decode flash's segments a row of the MTP program's arena holds
@@ -1295,6 +1438,12 @@ pub struct MtpPlan<'a> {
     /// beside the draft's card bytes; the load's `Mtp38::arm` holds the arena
     /// it allocates to it.
     pub arena_bytes: u64,
+    /// The rows of the draft's store walk the arena holds ([`StoreRows`]),
+    /// which `arena_bytes` counts; the load's `Mtp38::arm` allocates the
+    /// arena for them.
+    pub store: StoreRows,
+    /// Why the plan holds those rows.
+    pub store_why: StoreWhy,
     /// The card's usable bytes (capped by the card budget) less the target's
     /// and the draft's card terms; the margin is inside it.
     pub headroom_bytes: i128,
@@ -1917,6 +2066,51 @@ fn reserve_rows(card: &Card, name: &str) -> Vec<u64> {
         .collect()
 }
 
+/// The plan of the MTP draft `mtp` beside the target on `machine`, at the
+/// store walk's rows its room allows. `plan_at` plans at given rows.
+///
+/// The rule, in one place: [`StoreRows::Most`] when the plan with the larger
+/// arena holds and keeps every routed expert on the card that the plan with
+/// the smaller one keeps (so it costs no card expert, and no slot or context
+/// either, which the same plan at the same slots and context holds);
+/// [`StoreRows::Least`] otherwise. Inputs that name their rows
+/// ([`MtpInputs::asking`]) plan at them, and a plan (b′) machine's stage card
+/// holds the draft's bytes as the caller's reserve row, which names the
+/// smaller arena ([`MtpInputs::card_bytes_of`]).
+fn choose_store_rows<'a>(
+    mtp: &MtpInputs,
+    machine: &Machine,
+    plan_at: impl Fn(StoreRows) -> Result<MtpPlan<'a>, PlaceError>,
+) -> Result<MtpPlan<'a>, PlaceError> {
+    if let Some(rows) = mtp.asked {
+        return plan_at(rows);
+    }
+    if !machine.tiers.is_empty() {
+        let mut plan = plan_at(StoreRows::Least)?;
+        plan.store_why = StoreWhy::Reserve;
+        return Ok(plan);
+    }
+    let mut least = plan_at(StoreRows::Least)?;
+    match plan_at(StoreRows::Most) {
+        Ok(mut most) => {
+            let (kept, held) = (least.plan.cards[0].experts, most.plan.cards[0].experts);
+            if held >= kept {
+                most.store_why = StoreWhy::Room;
+                Ok(most)
+            } else {
+                least.store_why = StoreWhy::Displaces {
+                    experts: kept - held,
+                };
+                Ok(least)
+            }
+        }
+        Err(_) => {
+            least.store_why = StoreWhy::Short;
+            Ok(least)
+        }
+    }
+}
+
 /// The stage cards' [`MTP_RESERVE`] rows against `want`: none for `None`,
 /// exactly one of `want` bytes on the one stage card for `Some`; anything
 /// else is refused by name ([`PlaceError::DraftReserve`]).
@@ -2476,7 +2670,7 @@ pub struct FileTensor {
 /// What a plan with an MTP draft is made from ([`PlanInputs::plan_mtp`]):
 /// the draft's description, its file's tensors as a one-layer model on a
 /// card of its own ([`MtpInputs::machine`]), and its store.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct MtpInputs {
     /// The layer, its head rows the list the head reads or the full head.
     pub draft: MtpDraft,
@@ -2501,33 +2695,51 @@ pub struct MtpInputs {
     /// ([`mtp_head_act_bytes`]). [`MtpInputs::from_parts`] reads no target,
     /// so it records the Q8_0 form.
     pub borrowed_head: mtp::BorrowedHead,
+    /// The store walk's rows when the inputs name them
+    /// ([`MtpInputs::asking`]); `None` leaves the plan to choose them from
+    /// its room ([`StoreRows`], `choose_store_rows`).
+    asked: Option<StoreRows>,
 }
 
 impl MtpInputs {
-    /// Card bytes the draft's program arena holds: [`mtp_arena_bytes`] at
-    /// the draft's vocabulary and its borrowed head's activation
-    /// ([`mtp_head_act_bytes`]). The one owner of the arena term: the
-    /// reserve the target's expert rule spreads within
-    /// ([`MtpInputs::draft_plan`]), the drafted plan's card bound and its
+    /// These inputs with the store walk's rows named: the plan holds `rows`
+    /// whatever its room, and refuses by name when the card cannot hold them.
+    /// For a gate that pins one arena; a load leaves the rows to the plan.
+    #[must_use]
+    pub fn asking(mut self, rows: StoreRows) -> MtpInputs {
+        self.asked = Some(rows);
+        self
+    }
+
+    /// Card bytes the draft's program arena holds at `rows`:
+    /// [`mtp_arena_bytes`] at the draft's vocabulary and its borrowed head's
+    /// activation ([`mtp_head_act_bytes`]). The one owner of the arena term:
+    /// the reserve the target's expert rule spreads within
+    /// ([`MtpInputs::draft_plan_at`]), the drafted plan's card bound and its
     /// [`MtpPlan::arena_bytes`] all take it from here.
     #[must_use]
-    pub fn arena_bytes(&self) -> u64 {
-        mtp_arena_bytes(u64::from(self.draft.vocab))
+    pub fn arena_bytes_at(&self, rows: StoreRows) -> u64 {
+        mtp_arena_bytes(u64::from(self.draft.vocab), rows.rows())
             + mtp_head_act_bytes(self.borrowed_head, u64::from(self.draft.hidden))
     }
 
     /// The draft's plan at `ctx_max` positions on its own card
     /// ([`MtpInputs::machine`]), and the bytes it adds to the target's card:
     /// its granules, its store, the head's row map and its program's arena
-    /// ([`MtpInputs::arena_bytes`]). Refused by name when the plan keeps a
-    /// routed expert off the card.
-    fn draft_plan(&self, ctx_max: u64) -> Result<(Plan<'_>, u64), PlaceError> {
-        self.draft_plan_of(ctx_max, 1)
+    /// at `rows` ([`MtpInputs::arena_bytes_at`]). Refused by name when the
+    /// plan keeps a routed expert off the card.
+    fn draft_plan_at(&self, ctx_max: u64, rows: StoreRows) -> Result<(Plan<'_>, u64), PlaceError> {
+        self.draft_plan_of(ctx_max, 1, rows)
     }
 
-    /// [`MtpInputs::draft_plan`] for a load that serves `slots` resident
+    /// [`MtpInputs::draft_plan_at`] for a load that serves `slots` resident
     /// sequences: the draft's store counts them all.
-    fn draft_plan_of(&self, ctx_max: u64, slots: usize) -> Result<(Plan<'_>, u64), PlaceError> {
+    fn draft_plan_of(
+        &self,
+        ctx_max: u64,
+        slots: usize,
+        rows: StoreRows,
+    ) -> Result<(Plan<'_>, u64), PlaceError> {
         // The draft's own plan is a plan of its one layer, whose sequence is
         // its store; the rows its walks read are the target's `beside`.
         let terms = SeqTerms {
@@ -2551,7 +2763,7 @@ impl MtpInputs {
                 experts: self.model.experts,
             });
         }
-        let bytes = draft_card_bytes(&draft.cards[0], self.map_bytes) + self.arena_bytes();
+        let bytes = draft_card_bytes(&draft.cards[0], self.map_bytes) + self.arena_bytes_at(rows);
         Ok((draft, bytes))
     }
 
@@ -2576,7 +2788,8 @@ impl MtpInputs {
     /// [`MtpInputs::card_bytes`] for a load that serves `slots` resident
     /// sequences: the reserve [`PlanInputs::plan_mtp_with_slots`] checks a
     /// plan (b′) machine for, from the one owner of both,
-    /// [`MtpInputs::draft_plan_of`].
+    /// [`MtpInputs::draft_plan_of`], at the arena a plan (b′) machine holds:
+    /// the named rows, else [`StoreRows::Least`] ([`StoreWhy::Reserve`]).
     pub fn card_bytes_of(&self, ctx_max: u64, slots: usize) -> Result<u64, PlaceError> {
         if ctx_max == 0 || ctx_max > KERNEL_POSITIONS {
             return Err(PlaceError::Positions { ctx_max });
@@ -2584,7 +2797,9 @@ impl MtpInputs {
         if slots == 0 {
             return Err(PlaceError::Slots { slots });
         }
-        self.draft_plan_of(ctx_max, slots).map(|(_, bytes)| bytes)
+        let rows = self.asked.unwrap_or(StoreRows::Least);
+        self.draft_plan_of(ctx_max, slots, rows)
+            .map(|(_, bytes)| bytes)
     }
 
     /// The MTP draft `draft` read against the target `target` that `inputs`
@@ -2821,6 +3036,7 @@ impl MtpInputs {
             kv,
             map_bytes,
             borrowed_head: mtp::BorrowedHead::Q8_0,
+            asked: None,
         })
     }
 
@@ -3803,7 +4019,7 @@ mod tests {
         };
 
         use super::super::{
-            FileTensor, MtpInputs, MtpLoad, mtp_arena_bytes, mtp_tensors, mtp_widened,
+            FileTensor, MtpInputs, MtpLoad, StoreRows, mtp_arena_bytes, mtp_tensors, mtp_widened,
         };
         use crate::arch::synthetic::header;
         use crate::placement::{self, CardFormat, Device, PlanLevers, Role, RoutedRule};
@@ -3825,12 +4041,28 @@ mod tests {
         // PIN(2026-10-24): the HC bottleneck's BF16 pairs and refusal add 64 · 644 = 41,216 B.
         #[test]
         fn the_mtp_arena_formula() {
-            assert_eq!(mtp_arena_bytes(248_320), 48_849_324);
+            assert_eq!(mtp_arena_bytes(248_320, 64), 48_849_324);
             assert_eq!(
-                mtp_arena_bytes(248_320),
+                mtp_arena_bytes(248_320, 64),
                 4 * (1_212_160 + 8 * 248_320 + 49_536 * 80 + 793 + 5_049_938)
             );
-            assert_eq!(mtp_arena_bytes(248_321) - mtp_arena_bytes(248_320), 4 * 8);
+            assert_eq!(
+                mtp_arena_bytes(248_321, 64) - mtp_arena_bytes(248_320, 64),
+                4 * 8
+            );
+            // The wider store walk [derived: 78,895 · 512 = 40,394,240 values and the
+            // two route tables of 2,048 and 512 slots, 4,164 and 1,044 words, 40,399,448 where 64
+            // rows hold 5,049,938; the input record's 512 ids where it holds 64, 1,241 u32 where it
+            // holds 793].
+            assert_eq!(mtp_arena_bytes(248_320, 512), 190_249_156);
+            assert_eq!(
+                mtp_arena_bytes(248_320, 512),
+                4 * (1_212_160 + 8 * 248_320 + 49_536 * 80 + 1_241 + 40_399_448)
+            );
+            assert_eq!(
+                mtp_arena_bytes(248_320, 512) - mtp_arena_bytes(248_320, 64),
+                141_399_832
+            );
         }
 
         /// Qwen3.8's MTP layer as `mtp_of` reads the shared file.
@@ -3986,7 +4218,7 @@ mod tests {
                     .iter()
                     .all(|t| !matches!(t.load, MtpLoad::Widened(_)))
             );
-            let plan = m.draft_plan(4096).unwrap().0;
+            let plan = m.draft_plan_at(4096, StoreRows::Least).unwrap().0;
             assert!(plan.violations().is_empty(), "{:?}", plan.violations());
             assert_eq!(plan.n_l, [512]);
             for t in &m.model.tensors {
@@ -4039,7 +4271,7 @@ mod tests {
                     f.nbytes = f.dims.iter().product::<u64>() * ty.type_size().unwrap();
                 }
                 let m = MtpInputs::from_parts(draft(HeadSet::Full), &stored).unwrap();
-                let plan = m.draft_plan(4096).unwrap().0;
+                let plan = m.draft_plan_at(4096, StoreRows::Least).unwrap().0;
                 assert!(plan.violations().is_empty(), "{:?}", plan.violations());
                 for (name, ty) in parts {
                     let row = plan
@@ -4229,8 +4461,8 @@ mod tests {
 
         use super::super::{
             Beside, Experts, KvLayout, MtpInputs, PlaceError, PlanInputs, ROUTE_UNIT_RESERVE,
-            RouteForm, UBATCH_PLANNED, card_route_run, draft_card_bytes, machine_bp,
-            route_unit_bytes, slot_resident_bytes, tier_batch_of, widen_card_route,
+            RouteForm, StoreRows, StoreWhy, UBATCH_PLANNED, card_route_run, draft_card_bytes,
+            machine_bp, route_unit_bytes, slot_resident_bytes, tier_batch_of, widen_card_route,
         };
         use super::mtp::{draft, file};
         use crate::placement::workstation::HostRead;
@@ -4586,7 +4818,7 @@ mod tests {
 
         /// The draft's plan of `slots` slots, its store times the slots, and
         /// the bytes it adds to the target's card.
-        fn draft_of(mtp: &MtpInputs, slots: u64) -> (Plan<'_>, u64) {
+        fn draft_of(mtp: &MtpInputs, slots: u64, rows: StoreRows) -> (Plan<'_>, u64) {
             let kv = Times { kv: &mtp.kv, slots };
             let plan = placement::plan_routed(
                 &mtp.model,
@@ -4597,7 +4829,7 @@ mod tests {
                 RoutedRule::PerType(CardFormat::of_routed),
             )
             .expect("the draft's plan");
-            let bytes = draft_card_bytes(&plan.cards[0], mtp.map_bytes) + mtp.arena_bytes();
+            let bytes = draft_card_bytes(&plan.cards[0], mtp.map_bytes) + mtp.arena_bytes_at(rows);
             (plan, bytes)
         }
 
@@ -4683,7 +4915,7 @@ mod tests {
                         n,
                     )
                     .expect("the drafted plan");
-                let (draft_want, reserve) = draft_of(&mtp, slots);
+                let (draft_want, reserve) = draft_of(&mtp, slots, drafted.store);
                 assert_eq!(view(&drafted.draft), view(&draft_want), "{n} slots");
                 let mut want = target(&inputs, &machine, slots, reserve);
                 want.host.arena_columns = columns;
@@ -4854,7 +5086,7 @@ mod tests {
                         n,
                     )
                     .expect("the drafted plan");
-                let (_, reserve) = draft_of(&mtp, n as u64);
+                let (_, reserve) = draft_of(&mtp, n as u64, drafted.store);
                 let t = &drafted.plan.cards[0];
                 assert_eq!(t.reserve_bytes, 64 << 20, "{n} slots");
                 assert_eq!(
@@ -5386,11 +5618,163 @@ mod tests {
             }
         }
 
-        /// A plan (b′) machine that reserves the draft's card bytes for the
-        /// slots it plans (`MtpInputs::card_bytes_of`, the serve seat's
-        /// reserve) passes the drafted plan's reserve check at 1, 2 and 4
-        /// slots; the one-sequence reserve (`MtpInputs::card_bytes`) is
-        /// refused by name at 2, the draft's store counting both.
+        /// The draft's inputs, its store walk's rows named (`Some`) or left to the plan.
+        fn mtp_of(rows: Option<StoreRows>) -> MtpInputs {
+            let mtp =
+                MtpInputs::from_parts(draft(HeadSet::Full), &file()).expect("the draft's inputs");
+            match rows {
+                Some(rows) => mtp.asking(rows),
+                None => mtp,
+            }
+        }
+
+        /// A one-card drafted plan of the synthetic file's routed stacks at `usable` card
+        /// bytes under the card expert rule, its draft's rows named (`Some`) or left to the
+        /// plan (`None`); `None` when the plan is refused.
+        fn store_plan(
+            inputs: &PlanInputs,
+            usable: u64,
+            rows: Option<StoreRows>,
+        ) -> Option<((u64, u64), StoreRows, StoreWhy)> {
+            let mut machine = machine();
+            machine.cards[0].usable_bytes = usable;
+            let mtp = mtp_of(rows);
+            let plan = inputs
+                .plan_mtp_with(
+                    &machine,
+                    (CTX, UBATCH_PLANNED.min(CTX)),
+                    &PlanLevers::default(),
+                    &mtp,
+                    Experts::Card,
+                )
+                .ok()?;
+            let total = usable - u64::try_from(plan.headroom_bytes).ok()?;
+            Some((
+                (plan.plan.cards[0].experts, total),
+                plan.store,
+                plan.store_why,
+            ))
+        }
+
+        /// `inputs` with 16 routed Q4_K experts on every layer (35,389,440 B each, 2.2 GB in
+        /// all): a card holds them whole, or some on the host.
+        fn routed_few(mut inputs: PlanInputs) -> PlanInputs {
+            for l in 0..LAYERS {
+                inputs.model.tensors.push(ModelTensor {
+                    name: format!("blk.{l}.ffn_gate_exps.weight"),
+                    shard: 0,
+                    layer: Some(l),
+                    role: Role::RoutedExperts,
+                    ty: GgmlType::Q4_K,
+                    dims: vec![2560, 24_576, 16],
+                    file_bytes: 16 * 24_576 * 10 * 144,
+                    gathered_rows: None,
+                });
+            }
+            inputs.model.experts = 16;
+            inputs
+        }
+
+        /// The card sizes, a MiB apart, from three experts below the card that holds every
+        /// expert and the smaller arena, to an expert past the card that also holds the larger
+        /// one: where the larger arena fits beside every expert, costs some, or the smaller
+        /// arena already costs some.
+        fn store_sizes(inputs: &PlanInputs) -> impl Iterator<Item = u64> {
+            let expert = 35_389_440u64;
+            let (whole, _, _) =
+                store_plan(inputs, 1 << 40, Some(StoreRows::Least)).expect("the roomy plan");
+            let extra = mtp_of(None).arena_bytes_at(StoreRows::Most)
+                - mtp_of(None).arena_bytes_at(StoreRows::Least);
+            let total = whole.1;
+            let (from, to) = (total - 3 * expert, total + extra + expert);
+            (0..=(to - from) >> 20).map(move |mib| from + (mib << 20))
+        }
+
+        /// A room that holds the larger arena beside the same card experts: the plan takes 512
+        /// rows, `Room`, and its card experts are the 64-row plan's.
+        #[test]
+        fn the_store_walk_takes_512_rows_where_the_room_holds_them() {
+            let inputs = routed_few(inputs());
+            let mut fits = 0;
+            for usable in store_sizes(&inputs) {
+                let Some((experts, rows, why)) = store_plan(&inputs, usable, None) else {
+                    continue;
+                };
+                let (least, ..) = store_plan(&inputs, usable, Some(StoreRows::Least))
+                    .expect("the smaller arena's plan");
+                if why == StoreWhy::Room {
+                    fits += 1;
+                    assert_eq!(rows, StoreRows::Most, "{usable} B");
+                    assert_eq!(experts.0, least.0, "{usable} B: no card expert displaced");
+                }
+            }
+            assert!(fits > 0, "no card size in the sweep leaves the room");
+        }
+
+        /// A room where the larger arena would displace a card expert: the plan keeps 64
+        /// rows, `Displaces` naming the experts it would cost, and the plan with the larger arena
+        /// asked for holds exactly that many fewer.
+        #[test]
+        fn the_store_walk_keeps_64_rows_where_512_displace_an_expert() {
+            let inputs = routed_few(inputs());
+            let mut displaced = 0;
+            for usable in store_sizes(&inputs) {
+                let Some((experts, rows, why)) = store_plan(&inputs, usable, None) else {
+                    continue;
+                };
+                if let StoreWhy::Displaces { experts: cost } = why {
+                    displaced += 1;
+                    assert_eq!(rows, StoreRows::Least, "{usable} B");
+                    assert!(cost > 0, "{usable} B");
+                    let (most, ..) = store_plan(&inputs, usable, Some(StoreRows::Most))
+                        .expect("the larger arena's plan");
+                    assert_eq!(experts.0 - most.0, cost, "{usable} B");
+                }
+            }
+            assert!(
+                displaced > 0,
+                "no card size in the sweep displaces an expert"
+            );
+        }
+
+        /// A card that holds the smaller arena and not the larger one, with no card expert to
+        /// displace (the host rule): the plan keeps 64 rows, `Short`; one byte more takes 512,
+        /// `Room`. Named rows are the plan's whatever the room (`Asked`).
+        #[test]
+        fn the_store_walk_is_short_by_the_cards_bound() {
+            let inputs = inputs();
+            let extra = mtp_of(None).arena_bytes_at(StoreRows::Most)
+                - mtp_of(None).arena_bytes_at(StoreRows::Least);
+            let plan = |usable: u64, rows: Option<StoreRows>| {
+                let mut machine = machine();
+                machine.cards[0].usable_bytes = usable;
+                let mtp = mtp_of(rows);
+                inputs
+                    .plan_mtp_with(
+                        &machine,
+                        (CTX, UBATCH_PLANNED.min(CTX)),
+                        &PlanLevers::default(),
+                        &mtp,
+                        Experts::Host,
+                    )
+                    .map(|p| (p.store, p.store_why, p.headroom_bytes))
+            };
+            let (rows, why, _) = plan(1 << 40, None).expect("the roomy plan");
+            assert_eq!((rows, why), (StoreRows::Most, StoreWhy::Room));
+            let (.., headroom) = plan(1 << 40, Some(StoreRows::Least)).expect("the least plan");
+            let total = (1u64 << 40) - u64::try_from(headroom).expect("headroom");
+            let (rows, why, _) = plan(total + extra - 1, None).expect("the tight plan");
+            assert_eq!((rows, why), (StoreRows::Least, StoreWhy::Short));
+            let (rows, why, _) = plan(total + extra, None).expect("the fitting plan");
+            assert_eq!((rows, why), (StoreRows::Most, StoreWhy::Room));
+            assert!(
+                plan(total + extra - 1, Some(StoreRows::Most)).is_err(),
+                "the named larger arena past the card is refused"
+            );
+            let (rows, why, _) = plan(1 << 40, Some(StoreRows::Least)).expect("asked");
+            assert_eq!((rows, why), (StoreRows::Least, StoreWhy::Asked));
+        }
+
         #[test]
         fn bp_reserves_the_drafts_slots() {
             let inputs = inputs();
@@ -5419,6 +5803,14 @@ mod tests {
                     "{n} slots: {:?}",
                     r.err()
                 );
+                // The stage card's reserve row names the arena: the smaller one.
+                if let Ok(plan) = r {
+                    assert_eq!(
+                        (plan.store, plan.store_why),
+                        (StoreRows::Least, StoreWhy::Reserve),
+                        "{n} slots"
+                    );
+                }
             }
             let one = mtp.card_bytes(CTX).expect("one sequence's card bytes");
             let two = mtp

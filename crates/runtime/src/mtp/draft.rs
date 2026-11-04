@@ -53,10 +53,27 @@ pub struct MtpDraft<H: Host> {
 impl<H: Host> MtpDraft<H> {
     /// The draft on a host whose load opened `head` (a row list or the full
     /// vocabulary), the prompt fed by `path`, the chains run in `mode`,
-    /// `hidden_width` the values of one hidden row a walk reads. Load-time
-    /// only.
-    pub fn new(path: H::Path, head: H::Head, mode: WalkMode, hidden_width: usize) -> Self {
+    /// `hidden_width` the values of one hidden row a walk reads, `store_rows`
+    /// the rows one store walk takes: what the load's arena was made for, more
+    /// than a proposal's ids and at most [`Host::STORE_ROWS`]. Load-time only.
+    ///
+    /// # Panics
+    ///
+    /// `store_rows` outside that range, by name.
+    pub fn new(
+        path: H::Path,
+        head: H::Head,
+        mode: WalkMode,
+        hidden_width: usize,
+        store_rows: usize,
+    ) -> Self {
         let () = H::FITS;
+        assert!(
+            H::WIDTH < store_rows && store_rows <= H::STORE_ROWS,
+            "{WHAT}: a store walk of {store_rows} rows; it takes more than {} and at most {}",
+            H::WIDTH,
+            H::STORE_ROWS
+        );
         MtpDraft {
             path,
             head,
@@ -65,7 +82,7 @@ impl<H: Host> MtpDraft<H> {
                 verify: H::VERIFY_ARENA,
                 mode,
                 width: H::WIDTH,
-                store_rows: H::STORE_ROWS,
+                store_rows,
                 hidden_width,
             }),
             windows: None,
@@ -756,6 +773,7 @@ mod tests {
     impl<const PROBS: bool> Host for Rig<PROBS> {
         const WIDTH: usize = 3;
         const WALK_ROWS: usize = 4;
+        const STORE_ROWS: usize = 8;
         const PROBS: bool = PROBS;
 
         type Arena = Ar;
@@ -854,8 +872,12 @@ mod tests {
         }
     }
 
+    /// The store rows [`draft`] opens with: narrower than the rig's widest
+    /// ([`Host::STORE_ROWS`]).
+    const STORE_ROWS_OPENED: usize = 4;
+
     fn draft<const PROBS: bool>() -> MtpDraft<Rig<PROBS>> {
-        MtpDraft::new((), HEAD, WalkMode::Graph, HIDDEN)
+        MtpDraft::new((), HEAD, WalkMode::Graph, HIDDEN, STORE_ROWS_OPENED)
     }
 
     /// The walks a prompt of [`IDS`] in units of four rows runs to fill the
@@ -1144,5 +1166,41 @@ mod tests {
             .prompt_joined(&mut x, 5, &ids, |_, sink| Ok(sink.is_none()))
             .unwrap();
         assert!(none && x.0.is_empty());
+    }
+
+    #[test]
+    fn a_store_walk_takes_the_rows_the_draft_was_opened_with() {
+        let mut d = draft::<false>();
+        let mut x = Own(Vec::new());
+        let ids: Vec<u32> = (10..20).collect();
+        d.prompt_joined(&mut x, 0, &ids, |x, sink| {
+            sink.expect("a draft at position 0 joins")(x, Ar::Ubatch, 0, 10)?;
+            Ok(())
+        })
+        .unwrap();
+        let w = |pos0, tokens: &[u32], first| {
+            walk(None, STORE, pos0, tokens, Rd::Target(Ar::Ubatch, first))
+        };
+        assert_eq!(
+            x.0,
+            [
+                walk(None, STORE, 0, &[10], Rd::Host(HIDDEN)),
+                w(1, &[11, 12, 13, 14], 0),
+                w(5, &[15, 16, 17, 18], 4),
+                w(9, &[19], 8),
+            ]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "MTP window: a store walk of 9 rows")]
+    fn a_draft_opened_past_the_hosts_widest_store_walk_is_refused_by_name() {
+        let _ = MtpDraft::<Rig<false>>::new((), HEAD, WalkMode::Graph, HIDDEN, 9);
+    }
+
+    #[test]
+    #[should_panic(expected = "MTP window: a store walk of 3 rows")]
+    fn a_draft_opened_under_a_proposals_rows_is_refused_by_name() {
+        let _ = MtpDraft::<Rig<false>>::new((), HEAD, WalkMode::Graph, HIDDEN, 3);
     }
 }

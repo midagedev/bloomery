@@ -1,0 +1,27 @@
+# q38store: the MTP draft's store walk at 512 rows against 64 on a DGX Spark (GB10, unified memory), where the plan's
+# room holds the larger arena beside every expert (nothing displaced).
+# Derivation. The prompt's rows are walked by the draft in store walks of the arena's rows: 4,096 ids are 64 walks of
+# 64 rows or 8 of 512. The launch term is small: a store walk runs about 15 launches (embedding and pack, eh_proj's
+# GEMM, the attention site's mix, k and v, the norm and the append), so 56 walks fewer are about 840 launches at about
+# 5 us, 4 ms of a 1,679 ms prompt (+0.2 %). The rest of the rig-log's measurement (docs/spark-engines.md, "소스 빌드로
+# 잰 제안 ②⑦": 2,440 -> 2,504 tok/s, two takes a row, 1,679 -> 1,636 ms, 43 ms) is GEMM work the larger tiles raise
+# the grid of (4 x 64 = 256 packed columns are four 64-column tiles; 4 x 512 are thirty-two), and it is the one term
+# the derivation does not fix. Decode walks no store: its step and window are unchanged by the arena (+0.0 %).
+kind: ab
+question: does a store walk of 512 rows, which the plan takes on the GB10 where the larger arena displaces no
+  expert, raise the prompt rate of Qwen3.8-Flash-Next-FP4-Local with MTP on over the 64-row arena?
+term: pp tok/s @ P=4096, MTP on at the serving defaults, DGX Spark GB10 sm_121a, bloomery-serve --parallel 1 —
+  (new − base) / base, paired by round; decode tok/s of the same requests is read beside it
+unit: %
+predict: +1.5..+3.5
+rounds: 5
+sd: 0.6 % AGENTS.md "Know the ruler"; the rig-log's two takes a row on this machine differ by 0.3..0.5 %
+condition: the base (0e763b848) and the new binary alternate in one lease, one fresh bloomery-serve a round and arm
+  (BLOOMERY_AB_ROUNDS=5 depth-serve.sh q38store-base:4096 q38store-new:4096, local mode on the Spark), the order
+  rotated every round; the new arm's plan record prints mtp_rows=512 mtp_rows_why=room and the base arm's has no
+  mtp_rows; both arms print the same card_experts; no row carries [cpu-busy] or [other-busy] and no bench hold is up
+decide-in: the rule stays as built; report the effect and its interval, and the decode ratio beside it
+decide-below: the gain is not the larger tiles' alone; read the rig-log's two builds for what else differed (the
+  container, the toolchain) before the rule is claimed as a Spark gain, and ask the lead whether to keep it
+decide-above: the store walk's weight reads are the larger term; read the walk per row in an nsys timeline of one
+  prompt before the model of its launches and tiles is trusted again

@@ -202,7 +202,7 @@ pub static TP_RANK: Kind = Kind {
 pub static PLAN38: Kind = Kind {
     name: "plan38",
     head: "plan",
-    doc: "A qwen3moe-family placement the engine is about to load by: its card, the architecture (a placed qwen3moe or qwen35moe file names it; a qwen4exp line does not), the expert rule (host or card), the context, where the routed experts sit (each layer's id prefix on the card, a placed line stating as n_l the fewest and the most one layer keeps; under plan (b′) the expert tier card and the next ids it holds), each plan card's device as the plan record names them, the card's free bytes at plan time when the census read them, the host room's reading the plan was made at (room) and the plan room it was held to (plan_room, the reading less the drift margin) when it was made at one, and — on the placed plan a run with --place unset took because the whole file did not fit the free bytes — why it did not; for a file with a row-gathered table (a qwen4exp file's PLE table), the tier the plan reads it from (rows, host or nvme) and the host room's reading that chose it (read), and, when the card holds a file tensor in another quantization than its file's (a BF16 head in MXFP8 planes), each such tensor as tensor:file type:card format (requantized; absent when there is none).",
+    doc: "A qwen3moe-family placement the engine is about to load by: its card, the architecture (a placed qwen3moe or qwen35moe file names it; a qwen4exp line does not), the expert rule (host or card), the context, where the routed experts sit (each layer's id prefix on the card, a placed line stating as n_l the fewest and the most one layer keeps; under plan (b′) the expert tier card and the next ids it holds), each plan card's device as the plan record names them, the card's free bytes at plan time when the census read them, the host room's reading the plan was made at (room) and the plan room it was held to (plan_room, the reading less the drift margin) when it was made at one, and — on the placed plan a run with --place unset took because the whole file did not fit the free bytes — why it did not; for a file with a row-gathered table (a qwen4exp file's PLE table), the tier the plan reads it from (rows, host or nvme) and the host room's reading that chose it (read), and, when the card holds a file tensor in another quantization than its file's (a BF16 head in MXFP8 planes), each such tensor as tensor:file type:card format (requantized; absent when there is none). A plan that holds the MTP draft beside the target also prints the rows of the draft's store walk its arena is made for (mtp_rows, 64 or 512) and why (mtp_rows_why: room, the plan with the 512-row arena holds and keeps every card expert the 64-row one keeps; displaces:N, it leaves the card N fewer experts; short, the card cannot hold it; reserve, a plan (b′) machine's reserve row names the smaller arena; asked, the inputs named the rows).",
     parts: &[
         key("place", Word, ""),
         key("card", Word, ""),
@@ -220,6 +220,8 @@ pub static PLAN38: Kind = Kind {
         opt("why", Word, ""),
         opt("rows", Word, ""),
         opt("read", Word, ""),
+        opt("mtp_rows", U64, "rows"),
+        opt("mtp_rows_why", Word, ""),
         opt("devices", Csv, ""),
         opt("cuda_order", Word, ""),
         opt("requantized", Csv, "tensor:file type:card format"),
@@ -5090,6 +5092,21 @@ mod tests {
         assert_eq!(
             plan38,
             "plan place=a card=A6000 experts=card ctx_max=4096 host_experts=11735 card_experts=12841"
+        );
+        let drafted = Record::new(&PLAN38)
+            .w("place", "a")
+            .w("card", "GB10")
+            .w("experts", "card")
+            .u("ctx_max", 4096)
+            .u("host_experts", 0)
+            .u("card_experts", 14_336)
+            .u("mtp_rows", 512)
+            .w("mtp_rows_why", "room")
+            .line();
+        assert_eq!(
+            drafted,
+            "plan place=a card=GB10 experts=card ctx_max=4096 host_experts=0 card_experts=14336 \
+             mtp_rows=512 mtp_rows_why=room"
         );
         let decide = Record::new(&LISTENING_DECIDE)
             .w("model", "m-Q3_K_M.gguf")

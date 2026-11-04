@@ -33,7 +33,9 @@ pub trait Host: Verify {
 
     /// The most rows one store walk ([`super::WalkMode::Store`], the prompt's
     /// warmup) takes: a host whose store walk runs wider than its whole walks
-    /// names its width; the default is [`Host::WALK_ROWS`].
+    /// names its width; the default is [`Host::WALK_ROWS`]. A host whose load
+    /// chooses its width names the widest it can, and the draft is opened
+    /// with the chosen one ([`super::MtpDraft::new`]).
     const STORE_ROWS: usize = Self::WALK_ROWS;
 
     /// Whether the chain's one readback holds each proposed id's probability

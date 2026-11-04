@@ -3200,10 +3200,11 @@ mod cli {
             None => "full".to_string(),
         };
         println!(
-            "load draft=mtp resident={} arena={} head={head_line} card_bytes={} in {:.1} s \
-             (runtime value)",
+            "load draft=mtp resident={} arena={} store_rows={} head={head_line} card_bytes={} \
+             in {:.1} s (runtime value)",
             draft.resident_bytes(),
             draft.arena_bytes(),
+            draft.store_walk_rows(),
             plan.draft_card_bytes() + plan.arena_bytes,
             t.elapsed().as_secs_f64()
         );

@@ -1708,12 +1708,17 @@ impl Body38 {
                 )?;
                 if let Some(mut d) = draft {
                     let rows = body.rope.table.len() / body.rope.width;
+                    let store = mtp.map_or(0, |(_, _, p)| p.store.rows());
                     d.arm(
                         gpu.stream(),
                         body.s.route.dims(),
-                        body.vocab,
-                        rows,
-                        mtp.map(|(_, _, p)| p.arena_bytes).unwrap_or_default(),
+                        (body.vocab, rows),
+                        (
+                            usize::try_from(store).map_err(|_| {
+                                GpuError::shape(WHAT, "the plan's store rows past usize")
+                            })?,
+                            mtp.map(|(_, _, p)| p.arena_bytes).unwrap_or_default(),
+                        ),
                     )?;
                     body.mtp = Some(d);
                 }

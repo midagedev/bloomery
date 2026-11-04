@@ -63,11 +63,13 @@ pub fn open_draft<B: MtpBody>(
 ) -> Result<MtpDraft<B>, SessionError> {
     let head = B::head(m)?;
     let hidden_width = B::hidden_width(m)?;
+    let store_rows = B::store_walk_rows(m)?;
     Ok(runtime::mtp::MtpDraft::new(
         path,
         head,
         WalkMode::from(mode),
         hidden_width,
+        store_rows,
     ))
 }
 
@@ -142,7 +144,9 @@ pub trait MtpBody: Prompt + Keep + Rows + Rollback {
 
     /// The most rows one store walk ([`WalkMode::Store`], the prompt's
     /// warmup) takes: a body whose store walk runs wider than its whole walks
-    /// names its width; the default is [`MtpBody::WALK_ROWS`].
+    /// names its width; the default is [`MtpBody::WALK_ROWS`]. A body whose
+    /// load chooses its width names the widest it can
+    /// ([`MtpBody::store_walk_rows`]).
     const STORE_ROWS: usize = Self::WALK_ROWS;
 
     /// Holds when the widths fit together: at least one id a proposal, a
@@ -192,6 +196,14 @@ pub trait MtpBody: Prompt + Keep + Rows + Rollback {
     /// several streams a hidden row names its embedding's width.
     fn embed_width(m: &GpuModel<Self>) -> Result<usize, GpuError> {
         Self::hidden_width(m)
+    }
+
+    /// The most rows one store walk of this load takes: the rows its arena
+    /// was made for, at most [`MtpBody::STORE_ROWS`]. The default is
+    /// [`MtpBody::STORE_ROWS`], a body whose arena is made for it alone.
+    /// Load-time only.
+    fn store_walk_rows(_: &GpuModel<Self>) -> Result<usize, GpuError> {
+        Ok(Self::STORE_ROWS)
     }
 
     /// Positions of the current sequence the draft's store holds: a walk may
@@ -652,7 +664,7 @@ where
     B::Seq: 'static,
 {
     /// Every gathered slot's rows walked, in store walks of at most
-    /// [`MtpBody::STORE_ROWS`] rows, before the target call that may
+    /// [`MtpBody::store_walk_rows`] rows, before the target call that may
     /// overwrite the arenas they read; nothing stays gathered. The selected
     /// slot stays selected.
     ///
@@ -668,10 +680,11 @@ where
             .iter()
             .map(|(slot, r)| (*slot, refresh_feed(r)))
             .collect();
+        let most = B::store_walk_rows(t.model())?;
         let mut start = 0;
         let mut rows = 0;
         for (i, (_, f)) in feeds.iter().enumerate() {
-            if rows + f.tokens.len() > B::STORE_ROWS {
+            if rows + f.tokens.len() > most {
                 t.model_mut().draft_store_slots(&feeds[start..i], head)?;
                 (start, rows) = (i, 0);
             }
