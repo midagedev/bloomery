@@ -116,6 +116,7 @@ pub(crate) mod view;
 pub mod waits;
 pub(crate) mod watchdog;
 pub mod weights;
+pub mod words;
 
 pub use fault::{FAULT_NONE, FAULT_WORDS, Fault, FaultSink, FaultSite, LAYER_HEAD, LAYER_NONE};
 pub use graph::{

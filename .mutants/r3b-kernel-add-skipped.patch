@@ -1,0 +1,11 @@
+--- a/crates/gpu/src/words.rs
++++ b/crates/gpu/src/words.rs
+@@ -54,7 +54,7 @@
+     fn push(&mut self, at: sys::CUdeviceptr, by: u32) {
+         let i = self.len();
+         self.at[i] = at;
+-        self.by[i] = by;
++        self.by[i] = 0;
+         self.n += 1;
+     }
+ 

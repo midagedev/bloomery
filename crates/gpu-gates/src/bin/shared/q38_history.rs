@@ -11,6 +11,7 @@ use app::Session;
 use bloomery_gpu::arch::qwen3moe::Body38;
 use bloomery_gpu::host::tier::{TierAct, TierCard};
 use bloomery_gpu::hybrid::Chain;
+use bloomery_gpu::words::WordSide;
 use bloomery_gpu_gates::{GateError, verdict};
 use model::placement::Plan;
 use runtime::{Out, Target, Verify, Want};
@@ -21,10 +22,11 @@ pub const PROMPT: usize = 32;
 pub const STEPS: usize = 24;
 /// The verify windows: their rows and the rows each keeps.
 pub const WINDOWS: [(usize, usize); 6] = [(4, 2), (3, 3), (2, 1), (4, 4), (2, 2), (3, 1)];
-/// Nodes of a tier graph a tier layer, nine: the go wait, the
-/// activation's and the places' copies in, the card leg's four launches
-/// into the tier card's rows, the rows' copy out to the page, the signal.
-pub const TIER_LAYER_NODES: usize = TierCard::nodes_per_layer(TierAct::F32, 4);
+/// Nodes of a tier graph a tier layer on a card that adds to the page's
+/// words by memory operations, nine: the go wait, the activation's and the
+/// places' copies in, the card leg's four launches into the tier card's
+/// rows, the rows' copy out to the page, the signal.
+pub const TIER_LAYER_NODES: usize = TierCard::nodes_per_layer(TierAct::F32, 4, WordSide::Memop);
 // PIN(2026-10-06): 8 -> 9, the rows' copy out; launches storing into the page held 385 against 433.
 const _: () = assert!(TIER_LAYER_NODES == 9);
 
@@ -158,14 +160,20 @@ pub fn tier_layers(plan: &Plan<'_>) -> Vec<usize> {
 /// `tier`'s structure after the history over `layers` tier layers, one
 /// line a check: its graphs hold the resident card's four launches or
 /// the host tier's four copies and callback per layer, plus the protocol
-/// nodes and fault copy. Every history chain is fed and captured once.
+/// nodes on the side its card adds to the page's words on
+/// ([`TierCard::word_side`]) and the fault copy. Every history chain is fed
+/// and captured once.
 pub fn tier_graphs_and_chains(tier: &TierCard, layers: usize) -> bool {
     let paged = tier.resident_bytes() == 0;
-    let per_layer = if paged {
-        TierCard::nodes_per_layer(TierAct::F32, 5)
-    } else {
-        TIER_LAYER_NODES
+    let Some(side) = tier.word_side() else {
+        println!(
+            "structure: the tier names no page-word side, the side a capture names: {}",
+            verdict(false)
+        );
+        return false;
     };
+    let launches = if paged { 5 } else { 4 };
+    let per_layer = TierCard::nodes_per_layer(TierAct::F32, launches, side);
     let want = Some(per_layer * layers + 1);
     let graphs: Vec<Option<usize>> = [Chain::Step, Chain::Cols(2), Chain::Cols(3), Chain::Cols(4)]
         .iter()
@@ -174,7 +182,9 @@ pub fn tier_graphs_and_chains(tier: &TierCard, layers: usize) -> bool {
     let graphs_ok = graphs.iter().all(|&g| g == want);
     println!(
         "structure: the tier's graphs of the step and the 2, 3, 4-column verifies hold {graphs:?} \
-         nodes, {per_layer} a tier layer (host execution {paged}) and the fault copy ({want:?}): {}",
+         nodes, {per_layer} a tier layer (host execution {paged}, word_ops={}) and the fault copy \
+         ({want:?}): {}",
+        side.word(),
         verdict(graphs_ok)
     );
     let st = tier.stats();

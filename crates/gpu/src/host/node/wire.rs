@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 /// The protocol's version, the census's first word: a node of another
 /// version is refused by name. Version 8 is the go frame's packed places
 /// (V4.1's tier slots first by rank), the open's tier reply, the remote
-/// bind over TCP (mode 2) and a remote bind's reply that names its mode.
+/// bind over TCP (mode 2), a remote bind's reply that names its mode and a
+/// capture's reply that names the node's page-word side after its nodes.
 pub(super) const VERSION: u32 = 8;
 
 /// The longest frame either side takes: an open's rows are the largest, a

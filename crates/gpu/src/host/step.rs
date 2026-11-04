@@ -13,11 +13,10 @@ use super::route_trace::RouteTrace;
 use super::slots::{MAX_TIERS, Slot, SlotMap};
 use super::{Health, HostExperts, Refusal, nanos, non_finite, unknown_id};
 use crate::GpuError;
-use crate::graph::{
-    MappedHost, capturing, mem_batch, op_add, op_barrier_sys, op_wait_geq, op_write,
-};
+use crate::graph::{MappedHost, capturing, op_add, op_barrier_sys, op_wait_geq, op_write};
 use crate::kquant::sel::ARENA_PARTS;
 use crate::tensor::WindowMut;
+use crate::words::WordOps;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, sys};
 use model::ops::DEFER_MAX_COLS;
 use model::{Tensor2, Tensor2View};
@@ -156,6 +155,9 @@ pub struct Boundary {
     pub(super) region: DeviceBuffer<u32>,
     pub(super) page: MappedHost,
     pub(super) layout: PageLayout,
+    /// How the stage card adds to the page's words: the go's and the
+    /// wait's, and a tier page's beside them ([`super::word_ops`]).
+    words: WordOps,
 }
 
 /// What a chain's own handoff launch reads and writes
@@ -217,6 +219,7 @@ impl Boundary {
             .ok_or_else(|| GpuError::shape(what, "the page's size passes usize"))?;
         let h = layout.handoff();
         let words = layout.image_words();
+        let word_ops = super::word_ops(ctx, stream)?;
         let region = DeviceBuffer::<u32>::zeroed(stream, words)?;
         let page = MappedHost::new(ctx, bytes, "cuMemHostAlloc (hybrid page)")?;
         let base = region.cu_deviceptr();
@@ -276,7 +279,13 @@ impl Boundary {
             region,
             page,
             layout,
+            words: word_ops,
         })
+    }
+
+    /// How the stage card adds to the page's words.
+    pub(crate) fn words(&self) -> &WordOps {
+        &self.words
     }
 
     /// Rows the boundary carries.
@@ -433,7 +442,7 @@ impl Boundary {
         // the callers checked the row); both allocations live as long as the
         // boundary, which outlives every graph that captured this batch.
         unsafe {
-            mem_batch(
+            self.words.batch(
                 stream,
                 &mut [
                     op_barrier_sys(),
@@ -477,7 +486,7 @@ impl Boundary {
         // which lives as long as the boundary, which outlives every graph
         // that captured this batch.
         unsafe {
-            mem_batch(
+            self.words.batch(
                 stream,
                 &mut [op_wait_geq(cnt, 1), op_add(cnt, u32::MAX)],
                 "cuStreamBatchMemOp_v2 (hybrid wait)",

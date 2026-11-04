@@ -630,6 +630,7 @@ generate_ds41   swiglu_quant32_sel                       0           0
 generate_ds41   tier_fault_copy                          0           0
 generate_ds41   touch                                    0           0
 generate_ds41   weighted_sum                             0           0
+generate_ds41   word_add                                 0           0
 generate_ds41	mul_rows	0	0
 generate_ds41	mix_rows	0	0
 generate_ds41	scale_rows	0	0

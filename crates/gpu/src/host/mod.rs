@@ -134,9 +134,11 @@ pub use link::{
 
 use crate::GpuError;
 use crate::fault::{Fault, LAYER_NONE};
+use crate::graph::{MappedHost, cu, mem_batch, op_add, op_barrier_sys};
 use crate::tensor::DeviceTensor;
+use crate::words::{WordOps, WordSide};
 use batch::{BatchKey, BatchPort, BatchService, ServeTimes, Tier};
-use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer};
+use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer, DriverError, sys};
 use model::placement::Machine;
 use model::{Tensor2, Tensor2View};
 use page::{MAX_ROWS, Word};
@@ -2264,6 +2266,12 @@ impl<H: HostExperts> HostTier<H> {
         Ok((hsum, page.rows_of(row)?))
     }
 
+    /// How the stage card adds to the page words ([`WordOps`]), as the
+    /// boundary opened them: the load's report, `word_ops=… driver=…`.
+    pub fn word_ops(&self) -> &WordOps {
+        self.step.boundary.words()
+    }
+
     /// Enqueue a tier layer's go of layer `layer`, row `row`, on the stage
     /// card's `stream`: one go batch with a go for each tier that holds
     /// experts of the layer ([`TierPage::enqueue_go_of`]); refused without a
@@ -3513,13 +3521,133 @@ fn count_ids(
     Ok(())
 }
 
+/// The page words' operations of the card whose context is `ctx`
+/// ([`WordOps`]), opened where the owner of its words opens: the side
+/// `BLOOMERY_WORD_OPS` names, or under `auto` the side the driver's answer
+/// to one atomic-reduction stream memory operation picks ([`probe_words`]),
+/// with the driver's version beside it for the load to report
+/// ([`HostTier::word_ops`]). Prints nothing. Load-time only.
+pub(crate) fn word_ops(ctx: &Arc<CudaContext>, stream: &CudaStream) -> Result<WordOps, GpuError> {
+    const WHAT: &str = "word_ops";
+    let mut driver = 0;
+    // SAFETY: `driver` is a live out-pointer for the call.
+    cu(
+        unsafe { sys::cuDriverGetVersion(&mut driver) },
+        "cuDriverGetVersion",
+    )?;
+    let asked = bloomery_levers::word_ops().map_err(|e| GpuError::plan(WHAT, e))?;
+    let (side, probe) = match asked {
+        bloomery_levers::WordOps::Memop => (WordSide::Memop, None),
+        bloomery_levers::WordOps::Kernel => (WordSide::Kernel, None),
+        bloomery_levers::WordOps::Auto => {
+            let (side, word) = probe_words(ctx, stream)?;
+            (side, Some(word))
+        }
+    };
+    WordOps::open(ctx, side, driver, probe)
+}
+
+/// The probe of [`word_ops`] on `stream` (not capturing, else refused by
+/// name): a system barrier, which either side needs and which a refusal
+/// fails here by name, then one add of 1 to a zeroed scratch word, whose
+/// answer picks the side ([`word_side`]), and the word read back once the
+/// stream drained: 1 after the memory operation, 0 after a refusal, any
+/// other value refused by name. Returns the side and the scratch word, which
+/// the owner keeps.
+fn probe_words(
+    ctx: &Arc<CudaContext>,
+    stream: &CudaStream,
+) -> Result<(WordSide, MappedHost), GpuError> {
+    const WHAT: &str = "word_ops probe";
+    if crate::graph::capturing(stream)? {
+        return Err(GpuError::state(WHAT, "a stream that is not capturing"));
+    }
+    let word = MappedHost::new(ctx, 4, "cuMemHostAlloc (word_ops probe)")?;
+    // SAFETY: the batch names no address.
+    unsafe {
+        mem_batch(
+            stream,
+            &mut [op_barrier_sys()],
+            "cuStreamBatchMemOp_v2 (word_ops probe, barrier)",
+        )?;
+    }
+    let mut add = [op_add(word.dev_at(0), 1)];
+    // SAFETY: the add's address is the scratch word, the page's first u32,
+    // which stays allocated past the synchronize below (the owner keeps it);
+    // the raw call hands back the driver's answer as it is.
+    let rc = unsafe { sys::cuStreamBatchMemOp_v2(stream.cu_stream(), 1, add.as_mut_ptr(), 0) };
+    let side = word_side(rc)?;
+    stream.synchronize()?;
+    let want = u32::from(side == WordSide::Memop);
+    match word.atomic_u32(0).map(|w| w.load(Ordering::Acquire)) {
+        Some(got) if got == want => Ok((side, word)),
+        got => Err(GpuError::protocol(
+            WHAT,
+            format!(
+                "the scratch word holds {got:?} after the driver answered {rc} to one add of 1; \
+                 the {} side expects {want}",
+                side.word()
+            ),
+        )),
+    }
+}
+
+/// The side the driver's answer `rc` to one atomic-reduction stream memory
+/// operation picks: it ran, the memory operations; refused as an invalid
+/// value, a driver that does not take the reduction, the kernel; any other
+/// answer refused by name.
+fn word_side(rc: sys::CUresult) -> Result<WordSide, GpuError> {
+    match rc {
+        sys::cudaError_enum_CUDA_SUCCESS => Ok(WordSide::Memop),
+        sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE => Ok(WordSide::Kernel),
+        _ => Err(GpuError::Driver {
+            op: Some("cuStreamBatchMemOp_v2 (word_ops probe, add)"),
+            source: DriverError(rc),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         Drain, OpenCall, PassKind, SERVED_TIERS, await_within, count_ids, drain_of, pass_kept,
-        refuse_tier_count, union_probe,
+        refuse_tier_count, union_probe, word_side,
     };
     use crate::GpuError;
+    use crate::words::WordSide;
+    use cuda_core::sys;
+
+    /// The probe's decision table: the add ran, the memory operations; the
+    /// driver refused it as an invalid value, the kernel; any other answer
+    /// is the probe's error, naming the call (mutants: the two sides
+    /// swapped, every refusal taken as the kernel).
+    #[test]
+    fn word_side_is_the_probe_s_answer() {
+        assert_eq!(
+            word_side(sys::cudaError_enum_CUDA_SUCCESS).unwrap(),
+            WordSide::Memop
+        );
+        assert_eq!(
+            word_side(sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE).unwrap(),
+            WordSide::Kernel
+        );
+        for rc in [
+            sys::cudaError_enum_CUDA_ERROR_NOT_SUPPORTED,
+            sys::cudaError_enum_CUDA_ERROR_INVALID_HANDLE,
+            sys::cudaError_enum_CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED,
+        ] {
+            match word_side(rc) {
+                Err(GpuError::Driver {
+                    op: Some(op),
+                    source,
+                }) => {
+                    assert!(op.contains("word_ops probe, add"), "{op}");
+                    assert_eq!(source.0, rc);
+                }
+                other => panic!("answer {rc}: {other:?}, want the probe's driver error"),
+            }
+        }
+    }
     use std::time::Duration;
 
     /// The union probe fits the union a load prepared: a Qwen3.8 load of a 64-column batch over

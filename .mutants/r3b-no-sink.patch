@@ -1,0 +1,10 @@
+--- a/crates/gpu/src/words.rs
++++ b/crates/gpu/src/words.rs
+@@ -219,7 +219,6 @@
+                     }
+                     seg.adds.push(at, by);
+                 }
+-                None if is_barrier(op) && seg.adds.len() > 0 => seg.held += 1,
+                 None => {
+                     if seg.adds.len() > 0 {
+                         seg.flush()?;

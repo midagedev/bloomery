@@ -60,6 +60,7 @@ use super::tier::{
 use crate::fault::{FAULT_NONE, Fault};
 use crate::model::CardBytes;
 use crate::weights::{SegmentFile, Weights};
+use crate::words::{WordOps, WordSide};
 use crate::{Gpu, GpuError};
 use wire::{Channel, In, Out, Polled, Tag};
 
@@ -920,6 +921,22 @@ fn chain_of(w: u32) -> Result<Chain, String> {
     Ok(chain)
 }
 
+/// A page-word side as a capture's reply carries it.
+fn side_byte(side: WordSide) -> u8 {
+    match side {
+        WordSide::Memop => 0,
+        WordSide::Kernel => 1,
+    }
+}
+
+fn side_of(b: u8) -> Result<WordSide, String> {
+    match b {
+        0 => Ok(WordSide::Memop),
+        1 => Ok(WordSide::Kernel),
+        _ => Err(format!("a page-word side {b}")),
+    }
+}
+
 // ---------------------------------------------------------------- errors
 
 /// The kinds of error a [`Tag::Err`] reply carries, so node 0 raises the
@@ -1108,6 +1125,9 @@ pub struct TierNode {
     device_bytes: usize,
     /// Per chain, the nodes of the graph the server holds for it.
     graphs: [Option<usize>; TIER_CHAINS],
+    /// How the node's card adds to the page's words, as its captures'
+    /// replies name it; `None` before the first.
+    words: Option<WordSide>,
     control_round_trips: u64,
     lost: Option<String>,
 }
@@ -1175,6 +1195,7 @@ impl TierNode {
             resident_bytes: 0,
             device_bytes: 0,
             graphs: [None; TIER_CHAINS],
+            words: None,
             control_round_trips: 0,
             lost: None,
         };
@@ -1310,7 +1331,9 @@ impl TierNode {
         self.ask(Tag::Launch, REPLY, "launch")
     }
 
-    /// [`TierWork::capture`] on the node: the graph's node count.
+    /// [`TierWork::capture`] on the node: the graph's node count. The reply
+    /// names the node's page-word side after the count; a side other than
+    /// an earlier capture's loses the node.
     pub(super) fn capture(
         &mut self,
         chain: Chain,
@@ -1326,8 +1349,22 @@ impl TierNode {
         }
         self.call(Tag::Capture, REPLY, "capture")?;
         let mut r = In::new(self.ch.body());
-        let n = r.len("nodes").and_then(|n| r.end().map(|()| n));
-        let n = n.map_err(|e| self.lose_now("capture", e))?;
+        let reply = (|| {
+            let n = r.len("nodes")?;
+            let side = side_of(r.u8("page-word side")?)?;
+            r.end()?;
+            Ok::<_, String>((n, side))
+        })();
+        let (n, side) = reply.map_err(|e| self.lose_now("capture", e))?;
+        if let Some(was) = self.words.filter(|&was| was != side) {
+            let why = format!(
+                "a page-word side of {} where an earlier capture's was {}",
+                side.word(),
+                was.word()
+            );
+            return Err(self.lose_now("capture", why));
+        }
+        self.words = Some(side);
         self.graphs[i] = (!list.is_empty()).then_some(n);
         Ok(n)
     }
@@ -1409,6 +1446,12 @@ impl TierNode {
     /// Nodes of the graph the server holds in slot `i`; `None` when none.
     pub(super) fn graph_nodes(&self, i: usize) -> Option<usize> {
         self.graphs.get(i).copied().flatten()
+    }
+
+    /// The node's page-word side its captures' replies named; `None`
+    /// before the first.
+    pub(super) fn word_side(&self) -> Option<WordSide> {
+        self.words
     }
 
     pub(super) fn resident_bytes(&self) -> usize {
@@ -1535,12 +1578,16 @@ struct Session<'a> {
     seen: (u32, Instant),
     listed: Vec<(u32, u32)>,
     reply: Out,
+    /// Given the tier's page-word operations once an open succeeds.
+    on_open: &'a mut dyn FnMut(&WordOps),
 }
 
 /// Serve the expert tier of one load on `listener`, from `file`: each
 /// connection gets this process's census; a connection that closes before
 /// an open is a census read, and the server waits for the next. The first
 /// open's load is served until node 0 closes it, and the server returns.
+/// `on_open` is given the opened tier's page-word operations, whose display
+/// is `word_ops=<side> driver=<cuDriverGetVersion>`, once its open succeeds.
 /// Node 0's channel ended with no close, a protocol it does not speak, a
 /// request that failed after it reached the tier's stream, or work asked of
 /// the tier with no progress past the go deadline and its grace is node 0
@@ -1550,6 +1597,7 @@ pub fn serve(
     listener: &TcpListener,
     file: &Arc<Split>,
     families: &[NodeFamily],
+    mut on_open: impl FnMut(&WordOps),
 ) -> Result<(), GpuError> {
     loop {
         let (s, peer) = listener
@@ -1568,6 +1616,7 @@ pub fn serve(
             seen: (0, Instant::now()),
             listed: Vec::new(),
             reply: Out::default(),
+            on_open: &mut on_open,
         };
         NodeCensus::here()?.write(&mut session.reply);
         ch.send(Tag::Census, session.reply.done(), Instant::now() + REPLY)
@@ -1841,6 +1890,7 @@ impl Session<'_> {
         let open = NodeOpen::read(i).map_err(&bad)?;
         i.end().map_err(&bad)?;
         let work = self.open(&open)?;
+        (self.on_open)(work.word_ops());
         let (q3, d8) = work.planes();
         self.reply
             .len(q3)
@@ -1881,11 +1931,12 @@ impl Session<'_> {
             o.check_service(layer, row, cols)?;
         }
         let nodes = o.work.capture(chain, cols, &list).map_err(Failed::Fatal)?;
+        let side = o.work.word_side();
         self.listed.retain(|(w, _)| *w != c);
         if len > 0 {
             self.listed.push((c, len));
         }
-        self.reply.len(nodes);
+        self.reply.len(nodes).u8(side_byte(side));
         Ok(())
     }
 
@@ -1990,13 +2041,14 @@ pub(super) mod tests {
     use super::wire::{In, Out, Tag};
     use super::{
         Failed, NodeCensus, NodeOpen, NodeRow, OPEN_BASE, OPEN_RATE, Session, chain_of, chain_word,
-        open_bound, read_err, write_err,
+        open_bound, read_err, side_byte, side_of, write_err,
     };
     use crate::GpuError;
     use crate::fault::{Fault, FaultSite};
     use crate::host::link::{Peer, TcpPeer};
     use crate::host::step::Chain;
     use crate::host::tier::{ReplyRows, TierAct, TierSet, TierShape};
+    use crate::words::WordSide;
     use gguf::write::{Layout, Writer};
     use gguf::{GgmlType, Split};
     use model::placement::devices::{DeviceId, DeviceInfo};
@@ -2144,6 +2196,7 @@ pub(super) mod tests {
             seen: (0, Instant::now()),
             listed: Vec::new(),
             reply: Out::default(),
+            on_open: &mut |_| {},
         };
         let error = session
             .open(&open)
@@ -2183,6 +2236,7 @@ pub(super) mod tests {
             seen: (0, Instant::now()),
             listed: Vec::new(),
             reply: Out::default(),
+            on_open: &mut |_| {},
         };
         assert!(matches!(
             session.handle(Tag::Release, &[]),
@@ -2258,6 +2312,7 @@ pub(super) mod tests {
             resident_bytes: 0,
             device_bytes: 0,
             graphs: [None; TIER_CHAINS],
+            words: None,
             control_round_trips: 0,
             lost: None,
         };
@@ -2590,6 +2645,10 @@ pub(super) mod tests {
             assert!(chain_of(chain_word(c).expect("a word")).is_err());
         }
         assert!(chain_word(Chain::Cols(usize::MAX)).is_err());
+        for side in [WordSide::Memop, WordSide::Kernel] {
+            assert_eq!(side_of(side_byte(side)), Ok(side));
+        }
+        assert!(side_of(2).is_err());
 
         let (path, file) = empty_file("node");
         let mut session = Session {
@@ -2602,6 +2661,7 @@ pub(super) mod tests {
             seen: (0, Instant::now()),
             listed: Vec::new(),
             reply: Out::default(),
+            on_open: &mut |_| {},
         };
         session.reset_phase = 1;
         for (tag, payload) in [(Tag::Launch, vec![]), (Tag::Reset, vec![0])] {

@@ -52,6 +52,7 @@ pub const NVTIER_EVICT: &str = "BLOOMERY_NVTIER_EVICT";
 pub const TIER_LINK: &str = "BLOOMERY_TIER_LINK";
 pub const TIER_NODES: &str = "BLOOMERY_TIER_NODES";
 pub const TP_NODES: &str = "BLOOMERY_TP_NODES";
+pub const WORD_OPS: &str = "BLOOMERY_WORD_OPS";
 pub const SCREEN: &str = "BLOOMERY_SCREEN";
 pub const SCHEMAJUMP: &str = "BLOOMERY_SCHEMAJUMP";
 pub const PREPARE_Q8: &str = "BLOOMERY_PREPARE_Q8";
@@ -473,6 +474,26 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               requires `BLOOMERY_TIER_LINK=rdma`, and `BLOOMERY_TIER_NODES` is not set beside \
               it. GLM-5.3-Flash's `--place tp --plan` reads it. Read where a load takes its \
               placement.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: WORD_OPS,
+        class: Class::A,
+        kind: Kind::Words(&["auto", "memop", "kernel"]),
+        default: Unset::Is("auto"),
+        doc: "How a card adds to the counting words of the host tier's and the expert tiers' \
+              pages (a go, a take-back, a done): `memop` by the driver's atomic-reduction stream \
+              memory operation, inside the batch of waits, writes and barriers around it; \
+              `kernel` by a one-thread kernel of system-scope adds launched in the batch's place, \
+              the waits, writes and barriers staying memory operations. `auto` asks the driver \
+              once where a card's words are opened: one atomic-reduction memory operation on a \
+              scratch word, `kernel` when the driver refuses it as an invalid value, `memop` when \
+              it runs, and any other answer refused by name. The two words give the same bits; \
+              a go or a wait is one graph node more on `kernel`. `memop` and `kernel` are the \
+              same-binary arms. Read where the host tier's boundary and each tier card open.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

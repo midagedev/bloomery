@@ -83,9 +83,10 @@ use super::page::MAX_ROWS;
 use super::slots::{MAX_TIERS, Slot, SlotMap};
 use super::step::{Boundary, Chain, RELEASE};
 use crate::fault::{FAULT_NONE, Fault};
-use crate::graph::{Graph, cu, mem_batch, op_add, op_barrier_sys, op_wait_geq};
+use crate::graph::{Graph, cu, op_add, op_barrier_sys, op_wait_geq};
 use crate::tensor::{WindowMut, window};
 use crate::weights::Weights;
+use crate::words::{WordOps, WordSide};
 use crate::{FaultSink, Gpu, GpuError, Q8Act};
 use bloomery_levers::TierLink;
 use model::ops::DEFER_MAX_COLS;
@@ -919,7 +920,7 @@ impl TierPage {
         // checked the row); each outlives every graph that captured this
         // batch, as for the boundary's own go.
         unsafe {
-            mem_batch(
+            boundary.words().batch(
                 stream,
                 &mut ops[..5 + k],
                 "cuStreamBatchMemOp_v2 (hybrid go, tier)",
@@ -959,7 +960,7 @@ impl TierPage {
         // the row); each outlives every graph that captured this batch, as
         // for the boundary's own wait.
         unsafe {
-            mem_batch(
+            boundary.words().batch(
                 stream,
                 &mut ops[..2 + 2 * k],
                 "cuStreamBatchMemOp_v2 (hybrid wait, tier)",
@@ -1236,6 +1237,9 @@ pub(crate) struct TierWork {
     graphs: [Option<Graph>; TIER_CHAINS],
     experts: Box<dyn TierExperts>,
     module: tier_kernels::LoadedModule,
+    /// How this card adds to the page's words: a layer's go take-back and
+    /// its done ([`super::word_ops`]).
+    words: WordOps,
     /// The staged activation and places a layer's kernels read, copied in
     /// from the row's image.
     act: Staged,
@@ -1299,10 +1303,12 @@ impl TierWork {
         // SAFETY: this crate owns the embedded device bundle produced for the
         // module above; its launcher checks the launch contract.
         let module = unsafe { crate::shared_module!(tier_kernels, &ctx)? };
+        let words = super::word_ops(&ctx, stream)?;
         Ok(TierWork {
             graphs: std::array::from_fn(|_| None),
             experts,
             module,
+            words,
             sel: DeviceBuffer::zeroed(stream, cols * shape.n_used)?,
             out: DeviceBuffer::zeroed(stream, cols * shape.n_used * shape.hidden)?,
             act,
@@ -1352,6 +1358,18 @@ impl TierWork {
     /// Nodes of the graph held in slot `i`; `None` when none is held.
     fn graph_nodes(&self, i: usize) -> Option<usize> {
         self.graphs[i].as_ref().map(Graph::node_count)
+    }
+
+    /// How this card adds to the page's words, which sets its graphs' nodes
+    /// a layer ([`TierCard::nodes_per_layer`]).
+    pub(super) fn word_side(&self) -> WordSide {
+        self.words.side()
+    }
+
+    /// The card's page-word operations, its side and the driver version it
+    /// was chosen under.
+    pub(super) fn word_ops(&self) -> &WordOps {
+        &self.words
     }
 
     /// Bind the work to a page laid out by `layout` as tier `index`, `end`
@@ -1630,6 +1648,7 @@ impl TierWork {
         let TierWork {
             experts,
             module,
+            words,
             act,
             sel,
             out,
@@ -1647,6 +1666,7 @@ impl TierWork {
         Ok(Parts {
             experts: &mut **experts,
             module,
+            words,
             act,
             sel,
             out,
@@ -1891,12 +1911,24 @@ impl TierCard {
     }
 
     /// Nodes per tier layer of a captured tier graph whose image carries
-    /// `act`: the go wait, the copies in ([`TierAct::copies`]), the
+    /// `act`, on a card that adds to the page's words on `side`: the go wait
+    /// and its take-back, the copies in ([`TierAct::copies`]), the
     /// architecture's launches (`launches`), the routed rows' copy out and
     /// the signal; the graph's last layer adds the fault copy.
     #[must_use]
-    pub const fn nodes_per_layer(act: TierAct, launches: usize) -> usize {
-        1 + act.copies() + launches + 1 + 1
+    pub const fn nodes_per_layer(act: TierAct, launches: usize, side: WordSide) -> usize {
+        word_batch_nodes(side) + act.copies() + launches + 1 + word_batch_nodes(side)
+    }
+
+    /// The side the tier's card adds to the page's words on: the work's own
+    /// here, and on a node the side its last capture's reply named; `None`
+    /// on a node before its first capture.
+    #[must_use]
+    pub fn word_side(&self) -> Option<WordSide> {
+        match &self.side {
+            TierSide::Here(w) => Some(w.word_side()),
+            TierSide::Node(n) => n.word_side(),
+        }
     }
 
     /// Nodes of `chain`'s captured tier graph; `None` before its first
@@ -2399,6 +2431,7 @@ impl Staged {
 struct Parts<'a> {
     experts: &'a mut dyn TierExperts,
     module: &'a tier_kernels::LoadedModule,
+    words: &'a WordOps,
     act: &'a mut Staged,
     sel: &'a mut DeviceBuffer<u32>,
     out: &'a mut DeviceBuffer<f32>,
@@ -2446,7 +2479,7 @@ impl Parts<'_> {
         // checked above), which the host tier drops after its tier cards and
         // so after every graph that captured this batch.
         unsafe {
-            mem_batch(
+            self.words.batch(
                 stream,
                 &mut [op_wait_geq(go, 1), op_add(go, u32::MAX)],
                 "cuStreamBatchMemOp_v2 (tier go)",
@@ -2534,7 +2567,7 @@ impl Parts<'_> {
         // in the page (row checked above), which the host tier drops after
         // its tier cards and so after every graph that captured this batch.
         unsafe {
-            mem_batch(
+            self.words.batch(
                 stream,
                 &mut [
                     op_barrier_sys(),
@@ -2544,6 +2577,17 @@ impl Parts<'_> {
                 "cuStreamBatchMemOp_v2 (tier signal)",
             )
         }
+    }
+}
+
+/// Nodes of a captured page-word batch whose adds follow a wait or a system
+/// barrier (a layer's go take-back, its signal) on `side`: the one batch of
+/// memory operations, or that batch's other operations and one `word_add`
+/// launch ([`WordOps::batch`]).
+const fn word_batch_nodes(side: WordSide) -> usize {
+    match side {
+        WordSide::Memop => 1,
+        WordSide::Kernel => 2,
     }
 }
 

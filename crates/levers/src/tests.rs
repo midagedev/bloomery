@@ -42,9 +42,9 @@ fn retired() -> impl Iterator<Item = &'static LeverSpec> {
 /// Whether the pool reads it: it is on every binary's list.
 /// The rows read below every binary's `main` (the pool's two, the host's
 /// room, the NVMe tier's four, [`nvtier_levers`], the tier link,
-/// [`tier_link`], the tiers' nodes, [`tier_nodes`], the need hook,
-/// [`need_levers`], and the cards' margin, [`card_margin`]), which no
-/// `at_main` list refuses.
+/// [`tier_link`], the tiers' nodes, [`tier_nodes`], the page words' adds,
+/// [`word_ops`], the need hook, [`need_levers`], and the cards' margin,
+/// [`card_margin`]), which no `at_main` list refuses.
 fn pool(r: &LeverSpec) -> bool {
     r.name == CARD_MARGIN
         || r.name == THREADS
@@ -57,6 +57,7 @@ fn pool(r: &LeverSpec) -> bool {
         || r.name == NVTIER_EVICT
         || r.name == TIER_LINK
         || r.name == TIER_NODES
+        || r.name == WORD_OPS
 }
 
 /// The Direct rows `by` reads.
@@ -586,6 +587,7 @@ fn accessors_read_their_rows() {
             TIER_LINK,
             TIER_NODES,
             TP_NODES,
+            WORD_OPS,
             PIN_MAIN,
             DRAFT,
             MTP_HEAD_ROWS,
@@ -2324,6 +2326,25 @@ fn a_reading_refuses_everything_at_once() {
         "{e}"
     );
     assert_eq!(e.to_string().lines().count(), 4, "{e}");
+}
+
+/// The page words' reading ([`Scope::WordOps`]): unset is `auto`, each word
+/// its side, a word the row does not take refused by name, and every
+/// binary's `main` acts on it.
+#[test]
+fn word_ops_reads_each_word_and_refuses_the_rest() {
+    let side = |pairs: &[(&str, &str)]| read(&env(pairs), Scope::WordOps).map(|l| word_ops_of(&l));
+    assert_eq!(side(&[]).unwrap(), WordOps::Auto);
+    for (word, want) in [
+        ("auto", WordOps::Auto),
+        ("memop", WordOps::Memop),
+        ("kernel", WordOps::Kernel),
+    ] {
+        assert_eq!(side(&[(WORD_OPS, word)]).unwrap(), want, "{word}");
+    }
+    let e = side(&[(WORD_OPS, "atomic")]).expect_err("a word the row does not take");
+    assert!(e.to_string().contains(WORD_OPS), "{e}");
+    assert!(read(&env(&[(WORD_OPS, "kernel")]), NO_LEVER).is_ok());
 }
 
 /// The pool reads its two levers alone — any other lever, whatever its value,

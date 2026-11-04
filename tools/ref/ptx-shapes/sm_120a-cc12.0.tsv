@@ -586,6 +586,8 @@ generate_ds41 swiglu_rule_rows 0 0
 generate_ds41 tier_fault_copy 0 0
 generate_ds41 touch 0 0
 generate_ds41 weighted_sum 0 0
+# PIN(2026-11-05): word_add at 0/0 [derived: the sm_86 scan's 0/0, one thread of reductions, no local array], until a scan on this table's arch and capability.
+generate_ds41 word_add 0 0
 gate_qwen3vl_tower vis_add_f32 0 0
 gate_qwen3vl_tower vis_attn 0 0
 gate_qwen3vl_tower vis_attn_group 0 0

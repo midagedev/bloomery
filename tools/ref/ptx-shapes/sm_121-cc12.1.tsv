@@ -547,6 +547,8 @@ generate_ds41   swiglu_quant32_sel                       0           0
 generate_ds41   tier_fault_copy                          0           0
 generate_ds41   touch                                    0           0
 generate_ds41   weighted_sum                             0           0
+# PIN(2026-11-05): word_add at 0/0 [derived: the sm_86 scan's 0/0, one thread of reductions, no local array], until a scan on this table's arch and capability.
+generate_ds41   word_add                                 0           0
 
 # gate_qwen3vl_tower (--features vision), the shared vision entries, including Gemma4 residual and post-norm precision.
 # PIN(2026-10-15): the seven Gemma4 entries have zero ptxas spill and JIT local bytes on GB10 cc12.1.

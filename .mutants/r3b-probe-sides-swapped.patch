@@ -1,0 +1,13 @@
+--- a/crates/gpu/src/host/mod.rs
++++ b/crates/gpu/src/host/mod.rs
+@@ -3605,8 +3605,8 @@
+ /// answer refused by name.
+ fn word_side(rc: sys::CUresult) -> Result<WordSide, GpuError> {
+     match rc {
+-        sys::cudaError_enum_CUDA_SUCCESS => Ok(WordSide::Memop),
+-        sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE => Ok(WordSide::Kernel),
++        sys::cudaError_enum_CUDA_SUCCESS => Ok(WordSide::Kernel),
++        sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE => Ok(WordSide::Memop),
+         _ => Err(GpuError::Driver {
+             op: Some("cuStreamBatchMemOp_v2 (word_ops probe, add)"),
+             source: DriverError(rc),

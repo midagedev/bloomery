@@ -40,7 +40,7 @@ pub use registry::{
     MTP_WINDOWS, NEED_HOOK, NVTIER_BYTES, NVTIER_EVICT, NVTIER_MEM, NVTIER_READ, PIN_MAIN, PREFILL,
     PREFILL_GROUP, PREFILL_GROUP_DEFAULT, PREFILL_GROUP_MAX, QWEN3_KV, QWEN38_EXPERTS, R8,
     RESIDENCY, ROUTE_TRACE, SCREEN, SPIN, STEP_STATS, THREADS, TIER_LINK, TIER_NODES, TP_NODES,
-    WARM_PROFILE,
+    WARM_PROFILE, WORD_OPS,
 };
 
 #[cfg(test)]
@@ -882,6 +882,9 @@ pub(crate) enum Scope<'a> {
     /// The expert tiers' nodes ([`tier_nodes`]), read where a load takes its
     /// tier cards, below every binary's `main`.
     TierNodes,
+    /// How a card adds to its page words ([`word_ops`]), read where the
+    /// owner of a card's words opens, below every binary's `main`.
+    WordOps,
     /// The cards' budget ([`card_budget`]), read where a placement meets the
     /// census, below every binary's `main`, which still refuses it in a
     /// binary that does not act on it; and the cards' margin
@@ -926,6 +929,7 @@ pub(crate) fn reading(env: &[(OsString, OsString)], scope: Scope<'_>) -> Reading
     };
     let link = |name: &str| name == TIER_LINK;
     let nodes = |name: &str| name == TIER_NODES;
+    let words = |name: &str| name == WORD_OPS;
     let hook = |name: &str| name == NEED_HOOK;
     let margin = |name: &str| name == CARD_MARGIN;
     let mut entries = Vec::new();
@@ -937,6 +941,7 @@ pub(crate) fn reading(env: &[(OsString, OsString)], scope: Scope<'_>) -> Reading
                     || nvtier(row.name)
                     || link(row.name)
                     || nodes(row.name)
+                    || words(row.name)
                     || hook(row.name)
                     || margin(row.name)
                     || acts_on.contains(&row.name)
@@ -950,6 +955,7 @@ pub(crate) fn reading(env: &[(OsString, OsString)], scope: Scope<'_>) -> Reading
             (Site::Parsed { .. }, Scope::Need) if hook(row.name) || row.name == HOST_LOCK => true,
             (Site::Parsed { .. }, Scope::TierLink) if link(row.name) => true,
             (Site::Parsed { .. }, Scope::TierNodes) if nodes(row.name) || link(row.name) => true,
+            (Site::Parsed { .. }, Scope::WordOps) if words(row.name) => true,
             (Site::Parsed { .. }, Scope::CardBudget)
                 if row.name == CARD_BUDGET || margin(row.name) =>
             {
@@ -3336,6 +3342,36 @@ pub fn tier_link() -> Result<TierLink, LeverError> {
         Some(Value::Word("rdma")) => Ok(TierLink::Rdma),
         Some(Value::Word("tcp")) => Ok(TierLink::Tcp),
         v => panic!("{TIER_LINK} holds {v:?}, not shared, loopback, rdma or tcp"),
+    }
+}
+
+/// How a card adds to its page words ([`WORD_OPS`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WordOps {
+    /// `auto`, and unset: the side the driver's answer to one atomic-reduction
+    /// stream memory operation picks.
+    Auto,
+    /// The atomic-reduction stream memory operation.
+    Memop,
+    /// A kernel of system-scope adds.
+    Kernel,
+}
+
+/// `BLOOMERY_WORD_OPS` from the process environment, parsed as [`at_main`]
+/// parses it, and refused when it is set to a value its kind does not take
+/// and when a retired name is set. Nothing else.
+pub fn word_ops() -> Result<WordOps, LeverError> {
+    let env = process_env();
+    Ok(word_ops_of(&read(&env, Scope::WordOps)?))
+}
+
+/// [`word_ops`] of a reading that holds the row.
+fn word_ops_of(levers: &Levers) -> WordOps {
+    match &levers.entry(WORD_OPS).value {
+        None | Some(Value::Word("auto")) => WordOps::Auto,
+        Some(Value::Word("memop")) => WordOps::Memop,
+        Some(Value::Word("kernel")) => WordOps::Kernel,
+        v => panic!("{WORD_OPS} holds {v:?}, not auto, memop or kernel"),
     }
 }
 

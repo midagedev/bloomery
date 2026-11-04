@@ -18,8 +18,9 @@
 //! own RDMA or TCP pages over this control channel, which has no authentication and belongs on a trusted
 //! network.
 //! A port of 0 takes a free
-//! one. The server prints `listening on <ip:port>` once bound, serves one
-//! load, and exits 0 once node 0 closes that load, whether node 0's side of
+//! one. The server prints `listening on <ip:port>` once bound and
+//! `word_ops=<memop|kernel> driver=<cuDriverGetVersion>` once a load's tier
+//! opens, serves one load, and exits 0 once node 0 closes that load, whether node 0's side of
 //! it came up or failed; a connection that opened no tier (a census, a
 //! refused open) leaves it serving the next. A lost node 0 ends it with the
 //! named loss.
@@ -88,6 +89,7 @@ mod server {
                 #[cfg(feature = "solar2")]
                 bloomery_gpu_solar2::NODE_FAMILY,
             ],
+            |words| println!("{words}"),
         )?;
         println!("node 0 closed the load");
         Ok(())
