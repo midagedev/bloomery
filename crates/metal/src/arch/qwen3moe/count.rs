@@ -10,8 +10,6 @@
 
 use core::num::NonZeroU32;
 
-use crate::kernels::{Quant, headnorm_m_serves};
-
 /// One layer of the token.
 ///
 /// `qkv`, `v` and `in_proj` are the projection that is P1: one dispatch for
@@ -24,10 +22,12 @@ pub enum Layer {
     /// A gated delta layer. The live-key length does not add a dispatch.
     Delta {
         qkv: Projection,
-        /// The out projection's weight type: the verify runs it as one M-row
-        /// dispatch where `headnorm_m_serves`, else a dispatch a row. A token
-        /// has one row, so `token_count` ignores it.
-        out: Quant,
+        /// The verify width at which the out projection runs as one M-row
+        /// dispatch for all its rows, as `headnorm_m_serves` answers for its
+        /// weight type; `None` where that type has no M-row entry. At any
+        /// other width it is a dispatch a row. A token has one row, so
+        /// `token_count` ignores it.
+        out_one_at: Option<usize>,
         ffn: FfnKind,
         residual: Residual,
     },
@@ -268,8 +268,8 @@ const VERIFY_HEAD_GROUPS: u32 = 2;
 /// The verify's groups are not the token's: its delta core is three groups of
 /// four dispatches and its flash two of two for each of `flash_launches`
 /// launches (one while its rows share a segment count), the delta layers' out
-/// projection one group of one dispatch where `headnorm_m_serves` its type at
-/// the verify's rows (an A4 out at two rows) and else a dispatch a row, and
+/// projection one group of one dispatch at its `out_one_at` width (an A4 out at
+/// two rows) and else a dispatch a row, and
 /// the head two groups, the logits and then a pick a row. The embed is one
 /// group; P1, the attention's out, the gate-up, the down, an attention
 /// layer's biases and each of a plain residual's two hand-ons are one group of
@@ -284,12 +284,14 @@ pub fn verify_count(layers: &[Layer], rows: u32, flash_launches: u32) -> TokenCo
     };
     for layer in layers {
         match *layer {
-            Layer::Delta { qkv, out, .. } => {
+            Layer::Delta {
+                qkv, out_one_at, ..
+            } => {
                 add(1, qkv.dispatches());
                 add(VERIFY_DELTA_CORE.0, VERIFY_DELTA_CORE.1);
                 add(
                     1,
-                    if headnorm_m_serves(out, rows as usize) {
+                    if out_one_at == Some(rows as usize) {
                         1
                     } else {
                         rows
@@ -453,11 +455,12 @@ impl GroupBytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geometry::MROWS;
 
     fn routed_delta(qkv: Projection) -> Layer {
         Layer::Delta {
             qkv,
-            out: Quant::A4,
+            out_one_at: Some(MROWS),
             ffn: FfnKind::Routed,
             residual: Residual::Plain,
         }
@@ -478,10 +481,13 @@ mod tests {
             .iter()
             .map(|l| match *l {
                 Layer::Delta {
-                    qkv, out, residual, ..
+                    qkv,
+                    out_one_at,
+                    residual,
+                    ..
                 } => Layer::Delta {
                     qkv,
-                    out,
+                    out_one_at,
                     ffn: FfnKind::Dense,
                     residual,
                 },
@@ -746,9 +752,14 @@ mod tests {
                     ffn,
                     residual: Residual::Plain,
                 },
-                Layer::Delta { qkv, out, ffn, .. } => Layer::Delta {
+                Layer::Delta {
                     qkv,
-                    out,
+                    out_one_at,
+                    ffn,
+                    ..
+                } => Layer::Delta {
+                    qkv,
+                    out_one_at,
                     ffn,
                     residual: Residual::Plain,
                 },
@@ -787,9 +798,14 @@ mod tests {
         let layers: Vec<Layer> = dense(&vec![routed_delta(Projection::ONE); 64])
             .into_iter()
             .map(|l| match l {
-                Layer::Delta { qkv, out, ffn, .. } => Layer::Delta {
+                Layer::Delta {
                     qkv,
-                    out,
+                    out_one_at,
+                    ffn,
+                    ..
+                } => Layer::Delta {
+                    qkv,
+                    out_one_at,
                     ffn,
                     residual: Residual::PlainHandOn,
                 },
@@ -846,7 +862,7 @@ mod tests {
             .map(|c| match c {
                 'd' => Layer::Delta {
                     qkv: Projection::ONE,
-                    out: Quant::A4,
+                    out_one_at: Some(MROWS),
                     ffn: FfnKind::Dense,
                     residual: Residual::PlainHandOn,
                 },
@@ -912,13 +928,13 @@ mod tests {
         );
     }
 
-    /// A delta layer whose out the M-row head-normed entry does not serve
-    /// (a Q4_K out) keeps a dispatch a row at two rows: the same one group of
-    /// the out, one dispatch more than the A4 out the entry folds into one
-    /// launch.
+    /// A delta layer whose out the M-row head-normed entry does not serve (a
+    /// Q4_K out, `out_one_at: None`) keeps a dispatch a row at two rows: the
+    /// same one group of the out, one dispatch more than the A4 out the entry
+    /// folds into one launch.
     ///
-    /// Mutant: the served arm is asked of the quant alone, so a Q4_K out at
-    /// two rows counts one dispatch.
+    /// Mutant: the out counts one dispatch without asking its `out_one_at`
+    /// width, so a Q4_K out at two rows counts one dispatch.
     #[test]
     fn a_q4k_delta_out_stays_a_dispatch_a_row() {
         let q4k = |kinds: &str| {
@@ -929,7 +945,7 @@ mod tests {
                         qkv, ffn, residual, ..
                     } => Layer::Delta {
                         qkv,
-                        out: Quant::Q4K,
+                        out_one_at: None,
                         ffn,
                         residual,
                     },
