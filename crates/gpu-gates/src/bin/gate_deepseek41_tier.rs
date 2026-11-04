@@ -1098,8 +1098,10 @@ mod gate {
         if !bloomery_levers::tier_nodes()?.is_empty() {
             return Err(format!("{TIER_NODES} is set: B9 sets it for its stage alone").into());
         }
-        let (mut node, addr) =
-            crate::node_proc::tier_server(Some(Path::new(model)), None, "B9 node")?;
+        let (mut node, addr) = crate::node_proc::tier_server(
+            crate::node_proc::tier_server_command(Some(Path::new(model)))?,
+            "B9 node",
+        )?;
         println!("B9: tier_server pid {} serves on {addr}", node.id());
         let mut cmd = Command::new(std::env::current_exe()?);
         cmd.arg(NODE_STAGE)
@@ -1252,7 +1254,7 @@ mod gate {
             .collect();
         let slots: u64 = tier_layers.iter().map(|&l| hit(l)).sum();
         println!(
-            "{what} node: {} tier layers asked, {slots} routed slots over {} tier layers",
+            "{what} node: stats().issued {}, stats().layer_hits {slots} over {} tier layers",
             sent.issued,
             tier_layers.len()
         );
@@ -1284,10 +1286,12 @@ mod gate {
             .sum();
         let ok = sent.issued == 0 && slots == 0 && sent.stats.served == 0;
         println!(
-            "{} {what} node: the prompt call asked the node tier {} layers, sent it {slots} routed \
-             slots and served {} tier legs; the host served the node's experts",
+            "{} {what} node: over the prompt call the node tier's stats().issued moved {}, its \
+             stats().layer_hits on the {} tier layers {slots} and tier_batch_stats().served {}: no \
+             batch request reached the node, the host served its experts",
             if ok { "ok" } else { "FAIL" },
             sent.issued,
+            tier_layers.len(),
             sent.stats.served
         );
         ok

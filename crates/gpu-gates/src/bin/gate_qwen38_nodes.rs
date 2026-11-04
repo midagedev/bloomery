@@ -91,7 +91,7 @@ mod gate {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
-    use std::process::{Command, Stdio};
+    use std::process::Command;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::{Arc, Mutex};
@@ -112,7 +112,7 @@ mod gate {
     use bloomery_gpu::host::tier::{ReplyRows, TierAct, TierCard, TierOpen, TierSet, TierShape};
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::{
-        GateError, beside, checks_failed, data_dir, prose_ids, ref_model_path, verdict,
+        GateError, checks_failed, data_dir, prose_ids, ref_model_path, verdict,
     };
     use bloomery_gpu_gates::{record, tier};
     use bloomery_levers::{
@@ -493,13 +493,23 @@ mod gate {
         Ok(ok && pre)
     }
 
+    /// Node 1's command: [`tier_server_command`] with `host_room` as its host
+    /// room when one is given.
+    fn node1_command(model: Option<&Path>, host_room: Option<u64>) -> Result<Command, GateError> {
+        let mut cmd = tier_server_command(model)?;
+        if let Some(room) = host_room {
+            cmd.env(bloomery_levers::HOST_ROOM, room.to_string());
+        }
+        Ok(cmd)
+    }
+
     /// Node 1: a tier server on a free loopback port, serving `model` when
     /// one is given, and its address.
     fn node1(
         model: Option<&Path>,
         host_room: Option<u64>,
     ) -> Result<(Proc, SocketAddr), GateError> {
-        tier_server(model, host_room, "node 1")
+        tier_server(node1_command(model, host_room)?, "node 1")
     }
 
     /// Node 0 as a child of this binary in `mode`'s arguments, with the
@@ -1652,7 +1662,7 @@ mod gate {
         #[test]
         fn node_host_room_is_explicit_or_inherited() {
             for room in [None, Some(0), Some(super::GATE_HOST_ROOM), Some(32 << 30)] {
-                let cmd = super::tier_server_command(None, room).unwrap();
+                let cmd = super::node1_command(None, room).unwrap();
                 let actual = cmd
                     .get_envs()
                     .find(|(name, _)| *name == bloomery_levers::HOST_ROOM)

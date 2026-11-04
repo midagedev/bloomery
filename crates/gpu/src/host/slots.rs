@@ -1132,8 +1132,16 @@ mod tests {
             );
         }
         assert_eq!(view.slot(3, 6), None, "an id past the row stays unknown");
-        assert_eq!(view.on_tier_of(0, 3).ok(), Some(1));
-        assert_eq!(view.on_tier_of(1, 3).ok(), Some(0));
+        assert_eq!(
+            view.on_tier_of(0, 3).ok(),
+            Some(1),
+            "a local tier counts its rows"
+        );
+        assert_eq!(
+            view.on_tier_of(1, 3).ok(),
+            Some(0),
+            "a node tier counts none"
+        );
         assert_eq!(view.on_tier(3).ok(), Some(1));
         assert!(view.on_tier_of(2, 3).is_err() && view.on_tier(4).is_err());
         assert!(view.on_node(1) && !view.on_node(0) && !view.on_node(MAX_TIERS));

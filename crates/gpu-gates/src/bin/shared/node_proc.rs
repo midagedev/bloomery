@@ -13,9 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bloomery_gpu_gates::GateError;
-use bloomery_levers::{
-    CARD_BUDGET, CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, HOST_ROOM, TIER_NODES,
-};
+use bloomery_levers::{CARD_BUDGET, CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, TIER_NODES};
 
 /// What a `tier_server` prints once bound, before its address.
 pub const LISTENING: &str = "listening on ";
@@ -181,14 +179,10 @@ impl Drop for Proc {
 }
 
 /// The `tier_server` beside this binary on a free loopback port, serving
-/// `model` when one is given (else its `$BLOOMERY_REF_MODEL`), with `host_room`
-/// as its host room when one is given: the gate's load levers that size a
-/// stage (`BLOOMERY_CARD_BUDGET`, the host set's populate and lock, the card's
-/// dontneed) and the node list are taken out of its environment.
-pub fn tier_server_command(
-    model: Option<&Path>,
-    host_room: Option<u64>,
-) -> Result<Command, GateError> {
+/// `model` when one is given (else its `$BLOOMERY_REF_MODEL`): the gate's load
+/// levers that size a stage (`BLOOMERY_CARD_BUDGET`, the host set's populate and
+/// lock, the card's dontneed) and the node list are taken out of its environment.
+pub fn tier_server_command(model: Option<&Path>) -> Result<Command, GateError> {
     let mut cmd = Command::new(bloomery_gpu_gates::beside("tier_server")?);
     cmd.args(["--listen", "127.0.0.1:0"])
         .env_remove(TIER_NODES)
@@ -196,23 +190,17 @@ pub fn tier_server_command(
         .env_remove(HOST_POPULATE)
         .env_remove(HOST_LOCK)
         .env_remove(CARD_DONTNEED);
-    if let Some(room) = host_room {
-        cmd.env(HOST_ROOM, room.to_string());
-    }
     if let Some(m) = model {
         cmd.arg("-m").arg(m);
     }
     Ok(cmd)
 }
 
-/// A `tier_server` ([`tier_server_command`]) under `tag`, and the address it
-/// printed once bound ([`LISTENING`], within [`BIND_WITHIN`]).
-pub fn tier_server(
-    model: Option<&Path>,
-    host_room: Option<u64>,
-    tag: &'static str,
-) -> Result<(Proc, SocketAddr), GateError> {
-    let p = Proc::spawn(tier_server_command(model, host_room)?, tag)?;
+/// `cmd`, a [`tier_server_command`] and what its caller added, started under
+/// `tag`, and the address it printed once bound ([`LISTENING`], within
+/// [`BIND_WITHIN`]).
+pub fn tier_server(cmd: Command, tag: &'static str) -> Result<(Proc, SocketAddr), GateError> {
+    let p = Proc::spawn(cmd, tag)?;
     let line = p.wait_line(LISTENING, BIND_WITHIN)?;
     let addr = line[LISTENING.len()..].parse()?;
     Ok((p, addr))
