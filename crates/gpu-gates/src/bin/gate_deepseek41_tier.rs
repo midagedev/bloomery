@@ -91,6 +91,19 @@
 //!   the step's, not on its bits. Preconditions: the calls ran two batches
 //!   as one group of [`BATCH_GROUP`], the every-position call handed rows
 //!   over from both batches, and it sent every tier layer a routed slot.
+//! - `--bnode` (B9): the tier on a node. The gate serves the tiered plan's tier from a
+//!   `tier_server` beside it on a free loopback port (`shared/node_proc.rs`) and runs the stage as
+//!   its own child (`--bnode-stage`), whose environment alone names that port
+//!   (`BLOOMERY_TIER_NODES`) and the TCP link (`BLOOMERY_TIER_LINK=tcp`), so no other clause's
+//!   load takes either. The stage feeds B7's prompt of [`BATCH_P`] positions one decode step per
+//!   position, the node serving its tier experts, then as one prompt batch, whose host serves
+//!   them in the node's place (the host tier's batch view); each is followed by [`BATCH_STEPS`]
+//!   greedy steps, and the call is walked against the steps (`logits_band::walk`), within the
+//!   logits band as B7's is. The call sends the node nothing: across it the node tier's layers
+//!   asked and routed slots stay where they were, and no tier leg is served. The residency lever
+//!   resolves for a batch feed (its `why` is not `prefill_steps`). The node exits 0 once the stage
+//!   closed its load. Precondition: the steps sent every tier layer a routed slot through the
+//!   node, and the stage's tier is on the node.
 //!
 //! Every clause is self-consistency (the tiered load against the reference load or against the
 //! same file fed another way), so the fixture tier runs all of them; each names its tag once
@@ -118,6 +131,14 @@ mod gate_card;
 mod ds41_pair;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/node_proc.rs"]
+#[allow(
+    dead_code,
+    reason = "B9 starts and reaps its two children; stdin, signals, kills and stderr serve gate_qwen38_nodes"
+)]
+mod node_proc;
+
+#[cfg(feature = "deepseek41")]
 #[path = "shared/ds41_tier.rs"]
 #[allow(
     dead_code,
@@ -127,7 +148,9 @@ mod ds41_tier;
 
 #[cfg(feature = "deepseek41")]
 mod gate {
-    use std::time::Instant;
+    use std::path::Path;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
 
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::batch::TierBatchStats;
@@ -140,15 +163,17 @@ mod gate {
         TIER_MAP_BEFORE_UPLOAD, TierOpen,
     };
     use bloomery_gpu_gates::logits_band::{self, Positions};
-    use bloomery_gpu_gates::{GateError, checks_failed, prose_ids};
+    use bloomery_gpu_gates::{GateError, checks_failed, prose_ids, record};
     use bloomery_levers::{
-        CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, R8,
+        CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, Levers, R8,
+        ResidencyAt, ResidencyWhy, TIER_LINK, TIER_NODES, TierLink,
     };
     use cuda_core::DeviceBuffer;
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::place::PlanInputs;
     use model::arch::deepseek41::place::tier_batch;
+    use model::placement::workstation::DeviceId;
     use model::placement::{self, Device, ExpertList, Machine, Plan, Role, Row, workstation};
     use runtime::swaprule::KeptRows;
 
@@ -211,6 +236,13 @@ mod gate {
     const TIER_DEVICE: usize = 1;
     /// The go deadline and the grace a lost card is named within, plus room.
     const LOST_BOUND_S: f64 = 25.0;
+    /// The argument B9's stage child runs under ([`node_case`]).
+    const NODE_STAGE: &str = "--bnode-stage";
+    /// How long B9's stage child may take: its tiered load, the steps, the prompt call and the
+    /// greedy steps after each.
+    const NODE_STAGE_WITHIN: Duration = Duration::from_secs(600);
+    /// How long the node may take to exit once the stage has ended.
+    const NODE_CLOSE_WITHIN: Duration = Duration::from_secs(60);
 
     struct Args {
         union: bool,
@@ -223,6 +255,9 @@ mod gate {
         blost: bool,
         bfirst: bool,
         bfeat: bool,
+        bnode: bool,
+        /// B9's stage, the child [`node_case`] runs: alone, never beside a clause.
+        bnode_stage: bool,
     }
 
     impl Args {
@@ -240,7 +275,8 @@ mod gate {
 
     fn parse_args() -> Result<Args, GateError> {
         const USAGE: &str = "usage: gate_deepseek41_tier [--union] [--fault] [--lost] [--two] \
-                             [--batch] [--batch2] [--bfault] [--blost] [--bfirst] [--bfeat]";
+                             [--batch] [--batch2] [--bfault] [--blost] [--bfirst] [--bfeat] \
+                             [--bnode]";
         let mut a = Args {
             union: false,
             fault: false,
@@ -252,6 +288,8 @@ mod gate {
             blost: false,
             bfirst: false,
             bfeat: false,
+            bnode: false,
+            bnode_stage: false,
         };
         for arg in std::env::args().skip(1) {
             match arg.as_str() {
@@ -265,10 +303,20 @@ mod gate {
                 "--blost" => a.blost = true,
                 "--bfirst" => a.bfirst = true,
                 "--bfeat" => a.bfeat = true,
+                "--bnode" => a.bnode = true,
+                NODE_STAGE => a.bnode_stage = true,
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             }
         }
-        if !(a.on_load() || a.two || a.bfirst || a.bfeat) {
+        let clause = a.on_load() || a.two || a.bfirst || a.bfeat || a.bnode;
+        if a.bnode_stage && clause {
+            return Err(format!(
+                "{NODE_STAGE} is B9's stage, which the gate runs as a child of its own: never \
+                 beside a clause"
+            )
+            .into());
+        }
+        if !(clause || a.bnode_stage) {
             return Err(USAGE.into());
         }
         Ok(a)
@@ -540,16 +588,19 @@ mod gate {
     struct Sent {
         first: usize,
         hits: Vec<u64>,
+        /// Tier layers the host asked of the tier (replayed or enqueued).
+        issued: u64,
         stats: TierBatchStats,
     }
 
-    /// The tier's per-layer hits and batch counters since load; `None`
-    /// without a tier.
+    /// The tier's per-layer hits, layers asked and batch counters since load;
+    /// `None` without a tier.
     fn tier_counts(m: &Deepseek41Model) -> Result<Option<Sent>, GateError> {
         let hybrid = m.body(NAME)?.hybrid();
         Ok(hybrid.tiers().first().map(|t| Sent {
             first: t.set().layers().start,
             hits: t.stats().layer_hits,
+            issued: t.stats().issued,
             stats: hybrid
                 .tier_batch_stats()
                 .first()
@@ -565,6 +616,7 @@ mod gate {
         Some(Sent {
             first: a.first,
             hits: a.hits.iter().zip(&b.hits).map(|(a, b)| a - b).collect(),
+            issued: a.issued - b.issued,
             stats: TierBatchStats {
                 served: a.stats.served - b.stats.served,
                 settles: a.stats.settles - b.stats.settles,
@@ -772,6 +824,11 @@ mod gate {
                 "B8: the feature tap through a tiered prompt call hands over the call's own rows, \
                  near the steps'",
             ),
+            (
+                args.bnode,
+                "B9: one batch over a tier on a node: the host serves the node's experts, within \
+                 the logits band of the steps",
+            ),
         ] {
             if on {
                 crate::ds41_tier::sc(name)?;
@@ -812,6 +869,12 @@ mod gate {
             tier_layers.len(),
             k3 * tier_layers.len()
         );
+        if args.bnode_stage {
+            let ids = prose_ids("engram", BATCH_P2)?;
+            let node = node_open(&card, device)?;
+            let m = open(split()?, &tplan, Some(node), &meta)?;
+            return stage_verdict(node_stage(m, &levers, &ids[..BATCH_P], &tier_layers)?);
+        }
         let mut pass = true;
 
         if args.two {
@@ -837,6 +900,13 @@ mod gate {
                     println!("FAIL T7: a plan with an expert on two devices loaded");
                     pass = false;
                 }
+            }
+        }
+
+        if args.bnode {
+            pass &= node_case(&path)?;
+            if !(args.on_load() || args.bfirst || args.bfeat) {
+                return verdict(pass);
             }
         }
 
@@ -1017,6 +1087,218 @@ mod gate {
             return Err(checks_failed());
         }
         println!("PASSED: {NAME}");
+        Ok(())
+    }
+
+    /// B9 (module header), the gate's side: a `tier_server` serving `model` on a free loopback
+    /// port, then this binary as the stage under [`NODE_STAGE`], with the node's address and the
+    /// TCP link in its environment alone. Both must end 0 within their bounds, the node once the
+    /// stage has closed its load; a child past its bound is killed and the clause fails by name.
+    fn node_case(model: &str) -> Result<bool, GateError> {
+        if !bloomery_levers::tier_nodes()?.is_empty() {
+            return Err(format!("{TIER_NODES} is set: B9 sets it for its stage alone").into());
+        }
+        let (mut node, addr) =
+            crate::node_proc::tier_server(Some(Path::new(model)), None, "B9 node")?;
+        println!("B9: tier_server pid {} serves on {addr}", node.id());
+        let mut cmd = Command::new(std::env::current_exe()?);
+        cmd.arg(NODE_STAGE)
+            .env(TIER_NODES, addr.to_string())
+            .env(TIER_LINK, "tcp");
+        let mut stage = crate::node_proc::Proc::spawn(cmd, "B9 stage")?;
+        println!("B9: stage pid {}", stage.id());
+        let mut pass = match stage.wait_within(NODE_STAGE_WITHIN)? {
+            Some(s) if s.success() => {
+                println!("ok B9 stage: it exited 0");
+                true
+            }
+            Some(s) => {
+                println!("FAIL B9 stage: {s}");
+                false
+            }
+            None => {
+                println!("FAIL B9 stage: still running after {NODE_STAGE_WITHIN:?}; killed");
+                false
+            }
+        };
+        drop(stage);
+        match node.wait_within(NODE_CLOSE_WITHIN)? {
+            Some(s) if s.success() => {
+                println!("ok B9 node: it exited 0 once the stage closed its load");
+            }
+            Some(s) => {
+                println!("FAIL B9 node: {s}");
+                pass = false;
+            }
+            None => {
+                println!(
+                    "FAIL B9 node: still running {NODE_CLOSE_WITHIN:?} after the stage ended; \
+                     killed"
+                );
+                pass = false;
+            }
+        }
+        Ok(pass)
+    }
+
+    /// B9's tier on the node `BLOOMERY_TIER_NODES` names, over the link `BLOOMERY_TIER_LINK`
+    /// names, which must be TCP: the stage's environment [`node_case`] set. Another count of
+    /// nodes or another link is refused by name.
+    fn node_open(card: &str, device: Option<DeviceId>) -> Result<TierOpen, GateError> {
+        let nodes = bloomery_levers::tier_nodes()?;
+        let [addr] = nodes.as_slice() else {
+            return Err(format!(
+                "{NODE_STAGE}: {TIER_NODES} names {} nodes; B9's stage takes the one the gate \
+                 serves",
+                nodes.len()
+            )
+            .into());
+        };
+        let link = bloomery_levers::tier_link()?;
+        if link != TierLink::Tcp {
+            return Err(format!("{NODE_STAGE}: {TIER_LINK} is {link:?}; B9 runs over tcp").into());
+        }
+        Ok(TierOpen {
+            card: TIER_DEVICE,
+            name: card.to_string(),
+            device,
+            node: Some(*addr),
+        })
+    }
+
+    /// B9 (module header), the stage's side, on `m`, the tiered load with its tier on the node:
+    /// the residency lever as a batch feed resolves it, `ids` fed one decode step each and then as
+    /// one prompt call, each followed by greedy steps, the call walked against the steps, and what
+    /// the call and the steps sent the node tier. A refused call is the clause's failure, named.
+    fn node_stage(
+        mut m: Deepseek41Model,
+        levers: &Levers,
+        ids: &[u32],
+        tier_layers: &[usize],
+    ) -> Result<bool, GateError> {
+        let pick = levers.residency_at(ResidencyAt {
+            serving_place: false,
+            check_finite: false,
+            route_trace: false,
+            prefill_steps: false,
+        });
+        record::residency_lever(pick).print();
+        let mut pass = pick.why != ResidencyWhy::PrefillSteps;
+        println!(
+            "{} B9 residency: the lever resolves {} ({:?}) for a batch feed",
+            if pass { "ok" } else { "FAIL" },
+            pick.word,
+            pick.why
+        );
+        {
+            let tier = m
+                .body(NAME)?
+                .hybrid()
+                .tiers()
+                .first()
+                .ok_or("the tiered load holds no tier card")?;
+            match tier.node() {
+                Some(a) => println!(
+                    "ok B9 structure: the tier {} runs on the node at {a}",
+                    tier.name()
+                ),
+                None => {
+                    println!(
+                        "FAIL B9 structure: the tier {} is a card of this process",
+                        tier.name()
+                    );
+                    pass = false;
+                }
+            }
+        }
+        let before = tier_counts(&m)?;
+        let want = steps_run(&mut m, ids)?;
+        let steps = sent_between(before, tier_counts(&m)?);
+        pass &= node_served("B9 steps", steps.as_ref(), tier_layers);
+        let (got, sent) = match batch_run(&mut m, ids) {
+            Ok(r) => r,
+            Err(e) => {
+                println!("FAIL B9: the prompt call over the node tier: {e}");
+                return Ok(false);
+            }
+        };
+        pass &= in_band(
+            "B9 (one batch over the node tier against the steps, then greedy steps)",
+            &want,
+            &got,
+        );
+        pass &= node_untouched("B9", sent.as_ref(), tier_layers);
+        drop(m);
+        Ok(pass)
+    }
+
+    /// The precondition of B9 `what`: the steps sent every layer of `tier_layers` at least one
+    /// routed slot through the node.
+    fn node_served(what: &str, sent: Option<&Sent>, tier_layers: &[usize]) -> bool {
+        let Some(sent) = sent else {
+            println!("FAIL {what} precondition: the tiered load holds no tier card");
+            return false;
+        };
+        let hit = |l: usize| {
+            l.checked_sub(sent.first)
+                .and_then(|i| sent.hits.get(i))
+                .copied()
+                .unwrap_or(0)
+        };
+        let missing: Vec<usize> = tier_layers
+            .iter()
+            .copied()
+            .filter(|&l| hit(l) == 0)
+            .collect();
+        let slots: u64 = tier_layers.iter().map(|&l| hit(l)).sum();
+        println!(
+            "{what} node: {} tier layers asked, {slots} routed slots over {} tier layers",
+            sent.issued,
+            tier_layers.len()
+        );
+        if missing.is_empty() {
+            println!(
+                "ok {what} precondition: the steps sent every tier layer a slot through the node"
+            );
+            true
+        } else {
+            println!(
+                "FAIL {what} precondition: tier layers {missing:?} were sent no routed slot by the \
+                 steps; the clause proves nothing there"
+            );
+            false
+        }
+    }
+
+    /// B9 `what`'s pin on the prompt call: it sent the node tier nothing — no tier layer asked, no
+    /// routed slot on any of `tier_layers`, no tier leg served — so the host served every one of
+    /// the node's slots.
+    fn node_untouched(what: &str, sent: Option<&Sent>, tier_layers: &[usize]) -> bool {
+        let Some(sent) = sent else {
+            println!("FAIL {what} node: the tiered load holds no tier card");
+            return false;
+        };
+        let slots: u64 = tier_layers
+            .iter()
+            .filter_map(|&l| l.checked_sub(sent.first).and_then(|i| sent.hits.get(i)))
+            .sum();
+        let ok = sent.issued == 0 && slots == 0 && sent.stats.served == 0;
+        println!(
+            "{} {what} node: the prompt call asked the node tier {} layers, sent it {slots} routed \
+             slots and served {} tier legs; the host served the node's experts",
+            if ok { "ok" } else { "FAIL" },
+            sent.issued,
+            sent.stats.served
+        );
+        ok
+    }
+
+    /// B9's stage child's end: its checks' verdict, which [`node_case`] reads as its exit status.
+    fn stage_verdict(pass: bool) -> Result<(), GateError> {
+        if !pass {
+            return Err(checks_failed());
+        }
+        println!("PASSED: {NAME} {NODE_STAGE}");
         Ok(())
     }
 

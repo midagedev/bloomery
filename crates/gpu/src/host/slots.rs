@@ -95,9 +95,10 @@ impl Slot {
 /// `layers`, a row of `n_expert` entries, each a stage card slot, a tier card
 /// slot (`TIER | t << 24 | s`, [`Slot::of`]) or [`HOST`]. The one owner of
 /// which experts run where: the host serves an id exactly when
-/// [`SlotMap::slot`] says [`Slot::Host`], and a card copy is one device's
-/// view of the rows ([`SlotMap::stage_view`], [`SlotMap::tier_view`]), never
-/// the rows.
+/// [`SlotMap::slot`] says [`Slot::Host`] — in a prompt batch, when
+/// [`BatchSlots::slot`] does, which reads a tier on a node's entries as the
+/// host's — and a card copy is one device's view of the rows
+/// ([`SlotMap::stage_view`], [`SlotMap::tier_view`]), never the rows.
 ///
 /// Per row and device the map holds a capacity — the slots of that device's
 /// stacks in the layer — and the live entries, which name distinct slots
@@ -630,6 +631,89 @@ impl SlotMap {
     }
 }
 
+/// A prompt batch's reading of a [`SlotMap`]: every entry of a tier on a node
+/// reads as [`Slot::Host`], every other entry as the map holds it. A batch
+/// port runs no leg on a node, so the batch's host serves a node tier's
+/// experts in its place; the decode step reads the map itself, and the node
+/// serves them there. The view borrows the map and decodes each entry as it
+/// is read, so a residency move between passes shows in it at once.
+#[derive(Clone, Copy, Debug)]
+pub struct BatchSlots<'a> {
+    map: &'a SlotMap,
+    /// The tiers on a node, bit `t` tier `t`.
+    nodes: u32,
+}
+
+impl<'a> BatchSlots<'a> {
+    /// `map` as a prompt batch reads it with the tiers whose bit `nodes`
+    /// sets (bit `t` tier `t`) on a node. A bit of a tier the map does not
+    /// name is refused by name.
+    pub fn new(map: &'a SlotMap, nodes: u32) -> Result<BatchSlots<'a>, GpuError> {
+        if (map.tiers..u32::BITS as usize).any(|t| nodes >> t & 1 == 1) {
+            return Err(GpuError::shape(
+                "BatchSlots::new",
+                format!(
+                    "tiers {nodes:#b} on a node, of a map that names {} tiers",
+                    map.tiers
+                ),
+            ));
+        }
+        Ok(BatchSlots { map, nodes })
+    }
+
+    /// The map the view reads.
+    #[must_use]
+    pub fn map(&self) -> &'a SlotMap {
+        self.map
+    }
+
+    /// Whether tier `tier` is on a node: its entries read as the host's.
+    #[must_use]
+    pub fn on_node(&self, tier: usize) -> bool {
+        tier < MAX_TIERS && self.nodes >> tier & 1 == 1
+    }
+
+    /// Where a prompt batch runs layer `layer`'s expert `id`: the map's
+    /// [`SlotMap::slot`], with a slot of a tier on a node read as
+    /// [`Slot::Host`]; `None` for a layer or an id the map has no entry for.
+    #[must_use]
+    pub fn slot(&self, layer: usize, id: u32) -> Option<Slot> {
+        self.map.slot(layer, id).map(|s| match s {
+            Slot::Tier { tier, .. } if self.on_node(tier) => Slot::Host,
+            s => s,
+        })
+    }
+
+    /// The experts of layer `layer` tier `tier` holds for a prompt batch:
+    /// the map's [`SlotMap::on_tier_of`], 0 for a tier on a node. A layer
+    /// the map has no row for, and a tier it does not name, are refused by
+    /// name.
+    pub fn on_tier_of(&self, tier: usize, layer: usize) -> Result<usize, GpuError> {
+        let n = self.map.on_tier_of(tier, layer)?;
+        Ok(if self.on_node(tier) { 0 } else { n })
+    }
+
+    /// The experts of layer `layer` the tiers hold for a prompt batch,
+    /// summed over the tiers not on a node: whether a batch routes the layer
+    /// to a tier at all. A layer the map has no row for is refused by name.
+    pub fn on_tier(&self, layer: usize) -> Result<usize, GpuError> {
+        (0..self.map.tiers).try_fold(0, |sum, t| Ok(sum + self.on_tier_of(t, layer)?))
+    }
+
+    /// Entries per row: the file's experts per layer.
+    #[must_use]
+    pub fn n_expert(&self) -> usize {
+        self.map.n_expert
+    }
+
+    /// Layer `layer`'s row's first entry, the map's
+    /// [`SlotMap::row_offset`].
+    #[must_use]
+    pub fn row_offset(&self, layer: usize) -> Option<usize> {
+        self.map.row_offset(layer)
+    }
+}
+
 /// Marks slot `s` of a device with `capacity` slots in the row — the stage
 /// card, or tier `tier` when given: the row's live slots on it must be
 /// distinct and below `capacity`, so a slot at or past it or taken before is
@@ -673,7 +757,7 @@ fn take_slot(
 
 #[cfg(test)]
 mod tests {
-    use super::{HOST, MAX_EXPERTS, MAX_TIERS, Slot, SlotMap, TIER};
+    use super::{BatchSlots, HOST, MAX_EXPERTS, MAX_TIERS, Slot, SlotMap, TIER};
     use gguf::GgmlType;
     use model::placement::{
         self, Device, ExpertList, KvBytes, ModelTensor, ModelTensors, Plan, Role, workstation,
@@ -1014,6 +1098,103 @@ mod tests {
         assert_eq!(map.on_tier(1).ok(), Some(3));
         assert!(map.on_tier_of(2, 0).is_err());
         assert_eq!(map.slot(1, 3), Some(Slot::Tier { tier: 1, slot: 0 }));
+    }
+
+    /// Layer 3's row over two tiers: experts 0 and 5 on the card (slots 0,
+    /// 1), 1 on tier 0, 2 and 4 on tier 1 (slots 0, 1), 3 on the host.
+    fn two_tier_row() -> SlotMap {
+        let t = |tier: usize, slot: u32| Slot::Tier { tier, slot }.entry().expect("a tier slot");
+        SlotMap::from_rows(3..4, 6, vec![0, t(0, 0), t(1, 0), HOST, t(1, 1), 1])
+            .expect("one row over two tiers")
+    }
+
+    /// The ids of layer 3 that `slot` sends to the host.
+    fn host_ids(slot: impl Fn(u32) -> Option<Slot>) -> Vec<u32> {
+        (0..6).filter(|&id| slot(id) == Some(Slot::Host)).collect()
+    }
+
+    /// With tier 1 on a node, a batch's host list is the host's ids and the
+    /// node tier's; the card's and tier 0's entries, the stage card's view
+    /// and tier 0's view are the map's; the node tier holds nothing a batch
+    /// routes; with no tier on a node the view is the map.
+    #[test]
+    fn batch_view_sends_a_node_tiers_experts_to_the_host() {
+        let map = two_tier_row();
+        let h = HOST;
+        let view = BatchSlots::new(&map, 0b10).expect("tier 1 on a node");
+        assert_eq!(host_ids(|id| map.slot(3, id)), vec![3]);
+        assert_eq!(host_ids(|id| view.slot(3, id)), vec![2, 3, 4]);
+        for id in [0, 1, 5] {
+            assert_eq!(
+                view.slot(3, id),
+                map.slot(3, id),
+                "expert {id}: the card's and tier 0's entries read as the map holds them"
+            );
+        }
+        assert_eq!(view.slot(3, 6), None, "an id past the row stays unknown");
+        assert_eq!(view.on_tier_of(0, 3).ok(), Some(1));
+        assert_eq!(view.on_tier_of(1, 3).ok(), Some(0));
+        assert_eq!(view.on_tier(3).ok(), Some(1));
+        assert!(view.on_tier_of(2, 3).is_err() && view.on_tier(4).is_err());
+        assert!(view.on_node(1) && !view.on_node(0) && !view.on_node(MAX_TIERS));
+        assert_eq!(map.on_tier(3).ok(), Some(3), "the map keeps its tiers");
+        assert_eq!(map.stage_view(), vec![0, h, h, h, h, 1]);
+        assert_eq!(map.tier_view(0).ok(), Some(vec![h, 0, h, h, h, h]));
+        let none = BatchSlots::new(&map, 0).expect("no tier on a node");
+        for id in 0..7 {
+            assert_eq!(
+                none.slot(3, id),
+                map.slot(3, id),
+                "expert {id} with no node"
+            );
+        }
+        assert_eq!(none.on_tier(3).ok(), Some(3));
+    }
+
+    /// The view reads the map as it stands: an eviction and an admission on
+    /// the map show in it at once; the map refuses by name to admit a node
+    /// tier's expert to the card, so a mover of host experts (the residency
+    /// machine admits and evicts card slots only) never takes a node tier's
+    /// entry.
+    #[test]
+    fn batch_view_follows_the_map_and_a_node_tiers_expert_stays() {
+        let mut map = two_tier_row();
+        assert_eq!(map.evict(3, 5).ok(), Some(Slot::Card(1)));
+        let view = BatchSlots::new(&map, 0b10).expect("tier 1 on a node");
+        assert_eq!(host_ids(|id| view.slot(3, id)), vec![2, 3, 4, 5]);
+        let before = map.clone();
+        assert!(
+            map.admit(3, 2, Slot::Card(1)).is_err(),
+            "expert 2 is on tier 1"
+        );
+        assert!(
+            map.admit(3, 4, Slot::Card(1)).is_err(),
+            "expert 4 is on tier 1"
+        );
+        assert_eq!(map, before, "a refused admission leaves the map");
+        map.admit(3, 3, Slot::Card(1))
+            .expect("a host expert to the free card slot");
+        let view = BatchSlots::new(&map, 0b10).expect("tier 1 on a node");
+        assert_eq!(view.slot(3, 3), Some(Slot::Card(1)));
+        assert_eq!(host_ids(|id| view.slot(3, id)), vec![2, 4, 5]);
+        assert_eq!(view.on_tier_of(1, 3).ok(), Some(0));
+        assert_eq!(
+            map.on_tier_of(1, 3).ok(),
+            Some(2),
+            "the node tier keeps both experts"
+        );
+    }
+
+    /// A node bit of a tier the map does not name is refused by name.
+    #[test]
+    fn batch_view_refuses_a_node_the_map_does_not_name() {
+        let map = SlotMap::from_rows(0..1, 2, vec![0, TIER]).expect("one tier");
+        assert!(BatchSlots::new(&map, 0b1).is_ok());
+        assert!(BatchSlots::new(&map, 0b10).is_err());
+        assert!(BatchSlots::new(&map, 1 << 31).is_err());
+        let none = SlotMap::prefix(0..1, 2, 1).expect("no tier");
+        assert!(BatchSlots::new(&none, 0).is_ok());
+        assert!(BatchSlots::new(&none, 0b1).is_err());
     }
 
     /// No KV cache: the synthetic model's card holds only its tensors.

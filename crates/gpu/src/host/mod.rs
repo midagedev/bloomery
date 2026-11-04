@@ -146,7 +146,7 @@ use residency::HostResidency;
 use route_trace::RouteTrace;
 use runtime::swaprule::KeptRows;
 use runtime::xsplit;
-use slots::{MAX_TIERS, Slot, SlotMap};
+use slots::{BatchSlots, MAX_TIERS, Slot, SlotMap};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -958,6 +958,10 @@ pub struct HostTier<H> {
     health: Health,
     /// Which experts each layer's card stack holds; the host serves the rest.
     slots: SlotMap,
+    /// The tiers on a node, bit `t` tier `t`, once attached
+    /// ([`HostTier::attach_tiers`]): a prompt batch reads their entries as
+    /// the host's ([`HostTier::batch_slots`]).
+    nodes: u32,
     step: StepPort,
     /// The batch service's scratch and counters, and the port's sets once a
     /// caller made them ([`HostTier::prepare_batch`]).
@@ -1128,6 +1132,7 @@ impl<H: HostExperts> HostTier<H> {
             unserved: None,
             health: Health::default(),
             slots,
+            nodes: 0,
             step: StepPort::new(boundary, layers),
             batch: BatchService::default(),
             port: None,
@@ -2099,6 +2104,10 @@ impl<H: HostExperts> HostTier<H> {
         self.step.parallel_wait = !tiers
             .iter()
             .any(|t| t.node().is_none() && t.resident_bytes() == 0);
+        self.nodes = (0u32..)
+            .zip(&tiers)
+            .filter(|(_, t)| t.node().is_some())
+            .fold(0, |m, (i, _)| m | 1 << i);
         self.tiers = tiers;
         self.tier_page = Some(page);
         Ok(())
@@ -2359,9 +2368,11 @@ impl<H: HostExperts> HostTier<H> {
     }
 
     /// The refusal of an untiered route of a layer whose expert tier holds
-    /// experts: without its tier places the tier would not serve the block.
+    /// experts a batch routes to it ([`HostTier::batch_slots`]): without its
+    /// tier places the tier would not serve the block. A tier on a node
+    /// routes none: the batch's host serves its experts.
     fn refuse_untiered_route(&self, what: &'static str, layer: usize) -> Result<(), GpuError> {
-        if !self.tiers.is_empty() && self.slots.on_tier(layer)? > 0 {
+        if !self.tiers.is_empty() && self.batch_slots()?.on_tier(layer)? > 0 {
             return Err(GpuError::shape(
                 what,
                 format!(
@@ -2433,8 +2444,8 @@ impl<H: HostExperts> HostTier<H> {
     /// Both batch sets free, at a group's start ([`BatchPort::begin`]); a
     /// poisoned tier is refused first, as [`BEGIN_GROUP`], so a call after a
     /// failed service — a lost tier card among them — enqueues nothing. A
-    /// route to a tier on a node is refused before its download: the port
-    /// makes no leg for it ([`HostTier::enqueue_download_tiered_pitched`]).
+    /// tier on a node has no leg: the batch's host serves its experts
+    /// ([`HostTier::batch_slots`]).
     pub fn begin_group(&mut self) -> Result<(), GpuError> {
         self.health.refuse_if_poisoned(BEGIN_GROUP)?;
         self.port_mut(BEGIN_GROUP)?.begin();
@@ -2814,6 +2825,16 @@ impl<H: HostExperts> HostTier<H> {
     #[must_use]
     pub fn slots(&self) -> &SlotMap {
         &self.slots
+    }
+
+    /// The slot map as a prompt batch reads it: a tier on a node's experts
+    /// are the host's, whose batch service serves them in the node's place
+    /// (the batch port runs no leg on a node); the decode step reads
+    /// [`HostTier::slots`], and the node serves them there. A card side
+    /// decides a batch's tiered layers by it. Refused by name only for a
+    /// node mask the map does not name, which the attach never makes.
+    pub fn batch_slots(&self) -> Result<BatchSlots<'_>, GpuError> {
+        BatchSlots::new(&self.slots, self.nodes)
     }
 
     /// The boundary to enqueue a chain's handoffs on, and the slot map that
@@ -3291,7 +3312,9 @@ impl<H: HostExperts> HostTier<H> {
         let t = Tier {
             experts: &mut self.experts,
             health: &mut self.health,
-            slots: &self.slots,
+            slots: BatchSlots::new(&self.slots, self.nodes)?,
+            // No tier is attached (refuse_tier_batch above), so no leg.
+            legs: 0,
             fault: self.fault.as_ref(),
             hidden: h.hidden,
             n_used: h.n_used,

@@ -20,7 +20,7 @@
 //! reads the rows in place. No launch of any card waits for another: the
 //! host orders them through the set's events.
 
-use super::slots::{HOST, MAX_TIERS, Slot, SlotMap};
+use super::slots::{BatchSlots, HOST, MAX_TIERS, Slot};
 use super::step::GO_DEADLINE;
 use super::tier::{BlockRows, TierBlock, TierCard};
 use super::{Health, HostExperts, HostTier, Refusal, name_refusal, nanos, non_finite, unknown_id};
@@ -543,7 +543,11 @@ impl BatchPort {
         key: BatchKey,
         serve: impl FnOnce(usize, Tensor2View<'_>, &[u32], &[f32], &mut [f32]) -> Result<(), GpuError>,
     ) -> Result<ServeTimes, GpuError> {
-        self.serve_tiered(key, |_, _| Ok(()), serve)
+        self.serve_tiered(
+            key,
+            |_, _| Ok(()),
+            |layer, x, ids, w, out, _| serve(layer, x, ids, w, out),
+        )
     }
 
     /// [`BatchPort::serve`], and for a tiered set, once its copies have
@@ -551,12 +555,20 @@ impl BatchPort {
     /// tier's service of its routed leg of the set, given the tier; each such
     /// leg is then issued, and the set's upload waits for
     /// [`BatchPort::settle_tiers`]. `tier` is not called for a tier whose leg
-    /// of the set is idle.
+    /// of the set is idle. `serve` is also given the tiers whose leg of the
+    /// set it issued, bit t.
     fn serve_tiered(
         &mut self,
         key: BatchKey,
         mut tier: impl FnMut(usize, TierServe<'_>) -> Result<(), GpuError>,
-        serve: impl FnOnce(usize, Tensor2View<'_>, &[u32], &[f32], &mut [f32]) -> Result<(), GpuError>,
+        serve: impl FnOnce(
+            usize,
+            Tensor2View<'_>,
+            &[u32],
+            &[f32],
+            &mut [f32],
+            u32,
+        ) -> Result<(), GpuError>,
     ) -> Result<ServeTimes, GpuError> {
         let (n, s) = (self.n_embd, self.n_used);
         let BatchKey { layer, at, u, .. } = key;
@@ -574,6 +586,7 @@ impl BatchPort {
         let routed = &set.routed;
         super::await_done("BatchPort::serve", || routed.query())?;
         let t1 = Instant::now();
+        let mut issued = 0u32;
         for (t, port) in self.tiers.iter_mut().enumerate() {
             let TierPort {
                 legs,
@@ -606,6 +619,7 @@ impl BatchPort {
                     )?;
                     l.leg = Leg::Issued(key);
                     stats.served += 1;
+                    issued |= 1 << t;
                 }
                 other => {
                     return Err(GpuError::Shape {
@@ -628,6 +642,7 @@ impl BatchPort {
             &set.ids[at * s..u * s],
             &set.w[at * s..u * s],
             &mut set.sum[at * n..u * n],
+            issued,
         )?;
         set.stage = Stage::Served(key);
         self.serve ^= 1;
@@ -1054,10 +1069,10 @@ impl<H: HostExperts> HostTier<H> {
     /// ([`HostTier::prepare_batch`]) and its expert tiers: per tier and set
     /// the places, the rows and the tier's event, and the tier card's staging
     /// ([`BatchPort::attach_tier`]). Nothing without a tier, and nothing
-    /// with a tier on a node, whose routed batch download is refused by
-    /// [`HostTier::enqueue_download_tiered_pitched`]; made once. Load-time or
-    /// first-prompt only; what it holds is checked against the plan by
-    /// [`HostTier::check_tier_reserves`].
+    /// with a tier that runs no block (a tier on a node among them, whose
+    /// experts a batch's host serves: [`HostTier::batch_slots`]); made once.
+    /// Load-time or first-prompt only; what it holds is checked against the
+    /// plan by [`HostTier::check_tier_reserves`].
     pub fn prepare_tier_batch(&mut self) -> Result<(), GpuError> {
         const WHAT: &str = "HostTier::prepare_tier_batch";
         let stage = Arc::clone(self.step.boundary.region.context());
@@ -1179,9 +1194,11 @@ impl<H: HostExperts> HostTier<H> {
 
     /// [`HostTier::enqueue_download`] of a tiered layer: the slots' places
     /// of each tier too, `tsels[t]` tier `t`'s (`n_used` a token), copied for
-    /// each tier that holds experts of the layer, which that tier's service
-    /// reads ([`BatchPort::download_tiered`]). Refused by name for a layer no
-    /// tier holds an expert of, for a place list that is not one a tier, and
+    /// each tier that holds experts of the layer a batch routes to it, which
+    /// that tier's service reads ([`BatchPort::download_tiered`]); a tier on
+    /// a node routes none, its experts the batch's host's
+    /// ([`HostTier::batch_slots`]). Refused by name for a layer no tier
+    /// holds such an expert of, for a place list that is not one a tier, and
     /// without a tier or its leg.
     pub fn enqueue_download_tiered(
         &mut self,
@@ -1209,27 +1226,20 @@ impl<H: HostExperts> HostTier<H> {
         key: BatchKey,
     ) -> Result<(), GpuError> {
         const WHAT: &str = "HostTier::enqueue_download_tiered";
-        let mask = self.tier_mask(key.layer)?;
-        if let Some(tier) = self
-            .tiers
-            .iter()
-            .enumerate()
-            .find_map(|(t, tier)| (mask >> t & 1 == 1 && tier.node().is_some()).then_some(tier))
-        {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "a prompt batch with the expert tier {} on a node: the batch port's tier \
-                     legs run on a card of this process; feed the prompt as steps",
-                    tier.name()
-                ),
-            ));
+        let view = self.batch_slots()?;
+        let mut mask = 0u32;
+        for t in 0..self.tiers.len() {
+            if view.on_tier_of(t, key.layer)? > 0 {
+                mask |= 1 << t;
+            }
         }
         if mask == 0 {
             return Err(GpuError::shape(
                 WHAT,
                 format!(
-                    "layer {}: a tiered route of a layer the tier holds no expert of",
+                    "layer {}: a tiered route of a layer whose tiers hold no expert a batch \
+                     routes to them (a tier on a node routes none: the batch's host serves its \
+                     experts, HostTier::batch_slots)",
                     key.layer
                 ),
             ));
@@ -1282,7 +1292,10 @@ impl<H: HostExperts> HostTier<H> {
             &mut self.health,
             &mut self.tiers,
         );
-        let (slots, fault) = (&self.slots, self.fault.as_ref());
+        let (slots, fault) = (
+            BatchSlots::new(&self.slots, self.nodes)?,
+            self.fault.as_ref(),
+        );
         let exclude = self.xstream.as_ref().map_or(&[][..], |x| x.excluded(key));
         let mut tier_failed = false;
         let r = port.serve_tiered(
@@ -1295,11 +1308,12 @@ impl<H: HostExperts> HostTier<H> {
                 tier_failed = r.is_err();
                 r
             },
-            |layer, x, ids, w, out| {
+            |layer, x, ids, w, out, legs| {
                 let t = Tier {
                     experts,
                     health,
                     slots,
+                    legs,
                     fault,
                     hidden: h.hidden,
                     n_used: h.n_used,
@@ -1462,11 +1476,17 @@ pub(super) struct BatchService {
     pub(super) stats: BatchStats,
 }
 
-/// What one batch service reads besides its columns: the tier's parts.
+/// What one batch service reads besides its columns: the tier's parts, its
+/// slot map as a batch reads it, the tiers whose leg of the layer-batch it
+/// issued.
 pub(super) struct Tier<'a, H> {
     pub(super) experts: &'a mut H,
     pub(super) health: &'a mut Health,
-    pub(super) slots: &'a SlotMap,
+    pub(super) slots: BatchSlots<'a>,
+    /// Bit t: tier t's leg serves the layer-batch's slots of tier t. A slot
+    /// the view sends to a tier outside it is refused by name
+    /// ([`no_leg`]): no one would compute it.
+    pub(super) legs: u32,
     pub(super) fault: Option<&'a Arc<DeviceBuffer<u32>>>,
     pub(super) hidden: usize,
     pub(super) n_used: usize,
@@ -1518,7 +1538,7 @@ impl BatchService {
                 "a hybrid layer without a slot map row",
             ));
         }
-        check_exclude(exclude, t.slots, layer)?;
+        check_exclude(exclude, &t.slots, layer)?;
         if self.lens.len() < cols {
             self.lens.resize(cols, 0);
             self.lists.resize(cols * n_used, (0, 0.0f32));
@@ -1544,7 +1564,10 @@ impl BatchService {
                         list[n] = (id, w);
                         n += 1;
                     }
-                    Some(Slot::Card(_) | Slot::Tier { .. }) => {}
+                    Some(Slot::Card(_)) => {}
+                    Some(Slot::Tier { tier, .. })
+                        if tier < MAX_TIERS && t.legs >> tier & 1 == 1 => {}
+                    Some(Slot::Tier { tier, .. }) => return Err(no_leg(layer, id, tier)),
                     None => unknown = unknown.or(Some((s, id))),
                 }
             }
@@ -1624,6 +1647,7 @@ impl BatchService {
             experts,
             health,
             slots,
+            legs,
             fault,
             hidden,
             n_used,
@@ -1634,6 +1658,7 @@ impl BatchService {
                 experts: &mut *experts,
                 health: &mut *health,
                 slots,
+                legs,
                 fault,
                 hidden,
                 n_used,
@@ -1714,12 +1739,26 @@ fn reuse_slices<'a, 'b, T>(mut v: Vec<&'a [T]>) -> Vec<&'b [T]> {
         .collect()
 }
 
+/// A batch service's refusal of expert `id` of layer `layer`, which its view
+/// of the slot map sends to tier `tier` while the service issued that tier no
+/// leg of the layer-batch: the host skips it and no tier computes it.
+fn no_leg(layer: usize, id: u32, tier: usize) -> GpuError {
+    GpuError::protocol(
+        SERVE_BATCH,
+        format!(
+            "layer {layer}: expert {id} reads as tier {tier}'s in the batch's view of the slot \
+             map, and the service issued tier {tier} no leg of the layer-batch: no one would \
+             compute it"
+        ),
+    )
+}
+
 /// A batch service's exclusion set against layer `layer`'s row of `slots`:
 /// strictly ascending, so no id twice, and every id one of the layer's
-/// experts that the map sends to the host. A set that breaks any of these is
-/// a caller's bug — an expert it names would be computed twice or never — and
-/// is refused by name.
-fn check_exclude(exclude: &[u32], slots: &SlotMap, layer: usize) -> Result<(), GpuError> {
+/// experts that the batch's view of the map sends to the host. A set that
+/// breaks any of these is a caller's bug — an expert it names would be
+/// computed twice or never — and is refused by name.
+fn check_exclude(exclude: &[u32], slots: &BatchSlots<'_>, layer: usize) -> Result<(), GpuError> {
     let what = SERVE_BATCH;
     if let Some(p) = exclude.windows(2).find(|p| p[0] >= p[1]) {
         let why = if p[0] == p[1] {
@@ -1758,6 +1797,83 @@ fn check_exclude(exclude: &[u32], slots: &SlotMap, layer: usize) -> Result<(), G
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::slots::SlotMap;
+
+    /// Host experts that write zeros and count the slots listed to them.
+    struct Zeros {
+        listed: usize,
+    }
+
+    impl HostExperts for Zeros {
+        fn experts_into(
+            &mut self,
+            _: usize,
+            _: &Tensor2,
+            experts: &[(u32, f32)],
+            out: &mut [f32],
+            _: u64,
+        ) -> Result<(), GpuError> {
+            self.listed += experts.len();
+            out.fill(0.0);
+            Ok(())
+        }
+
+        fn experts_union_into(
+            &mut self,
+            _: usize,
+            _: Tensor2View<'_>,
+            lists: &[&[(u32, f32)]],
+            out: &mut [f32],
+        ) -> Result<(), GpuError> {
+            self.listed += lists.iter().map(|l| l.len()).sum::<usize>();
+            out.fill(0.0);
+            Ok(())
+        }
+    }
+
+    /// One column of layer 3 routing experts 1 to 5 over a row of two tiers
+    /// (`[card 0, tier 0, tier 1, host, tier 1, card 1]`): with tier 1 on a
+    /// node and tier 0's leg issued, the host computes 2, 3 and 4; a service
+    /// that issued no leg to a tier its view sends an expert to is refused by
+    /// name before any host expert runs — tier 0's expert 1 with no leg, and
+    /// with no tier on a node tier 1's expert 2.
+    #[test]
+    fn a_batch_service_refuses_a_tier_slot_whose_leg_it_did_not_issue() {
+        let t = |tier: usize, slot: u32| Slot::Tier { tier, slot }.entry().expect("a tier slot");
+        let map = SlotMap::from_rows(3..4, 6, vec![0, t(0, 0), t(1, 0), HOST, t(1, 1), 1])
+            .expect("one row over two tiers");
+        let (hidden, n_used) = (4, 5);
+        let (x, ids, w) = (vec![1.0f32; hidden], [1u32, 2, 3, 4, 5], [0.2f32; 5]);
+        let serve = |nodes: u32, legs: u32| {
+            let mut experts = Zeros { listed: 0 };
+            let mut health = Health::default();
+            let mut out = vec![f32::NAN; hidden];
+            let t = Tier {
+                experts: &mut experts,
+                health: &mut health,
+                slots: BatchSlots::new(&map, nodes).expect("a view of the map's tiers"),
+                legs,
+                fault: None,
+                hidden,
+                n_used,
+            };
+            let x = Tensor2View::new(&x, hidden, 1).expect("one column");
+            let r = BatchService::default().serve_one(t, 3, x, &ids, &w, &[], &mut out);
+            (r, experts.listed)
+        };
+        let (r, listed) = serve(0b10, 0b01);
+        r.expect("tier 0's leg issued, tier 1 on a node");
+        assert_eq!(listed, 3, "the host computes experts 2, 3 and 4");
+        for (nodes, legs, id, tier) in [(0b10, 0, 1, 0), (0, 0b01, 2, 1)] {
+            let (r, listed) = serve(nodes, legs);
+            let e = r.expect_err("a tier slot with no leg").to_string();
+            assert!(
+                e.contains(&format!("expert {id} reads as tier {tier}'s")),
+                "{e}"
+            );
+            assert_eq!(listed, 0, "no host expert runs");
+        }
+    }
 
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]

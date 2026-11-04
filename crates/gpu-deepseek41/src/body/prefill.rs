@@ -1770,11 +1770,13 @@ impl Body {
     }
 
     /// Per layer index of the body, the experts the stage card's tier
-    /// ([`STAGE_TIER`]) holds of the layer, as the slot map says now; all 0
-    /// without a tier. With a tier, a layer the slot map has no row for is
-    /// refused by name. Read once per group.
+    /// ([`STAGE_TIER`]) holds of the layer, as the batch's view of the slot
+    /// map says now (`HostTier::batch_slots`: a tier on a node holds none, the
+    /// batch's host serves its experts); all 0 without a tier. With a tier, a
+    /// layer the slot map has no row for is refused by name. Read once per
+    /// group.
     fn tier_counts(&self) -> Result<Vec<usize>, GpuError> {
-        let map = self.slot_map();
+        let map = self.hybrid.batch_slots()?;
         let tier = !self.hybrid.tiers().is_empty();
         self.layers
             .clone()
