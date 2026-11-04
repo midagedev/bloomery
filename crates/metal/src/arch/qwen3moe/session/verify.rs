@@ -47,7 +47,7 @@ use chain::arch::qwen3moe::ops::{ChainOps, LayerCtx};
 use chain::arch::qwen3moe::plan::{DeltaPlan, FfnPlan, FfnRoute, GqaPlan};
 use chain::arch::qwen3moe::walk::Walk;
 
-use super::super::arena::{Arena, slot_of};
+use super::super::arena::{Arena, MixerBufs, slot_of};
 use super::super::count::GroupKind;
 use super::super::lanes::{self, VERIFY_ROWS};
 use super::super::ops::{Half, Part, VerifyOps, serves};
@@ -56,7 +56,7 @@ use super::{
     Arms, LayerBuffers, Layered, ProfileGroup, STAMP_WAIT, Session, SessionError, Traced, refuse,
 };
 use crate::encode::{ComputeEncoder, EncodeCount};
-use crate::kernels::Kernels;
+use crate::kernels::{Kernels, headnorm_m_serves};
 use crate::residency::Alloc;
 use crate::stream::{GpuInterval, MetalStream, Settled, host_secs};
 
@@ -194,8 +194,24 @@ impl ChainOps for VerifyProfiler<'_> {
 
     fn delta_out(&mut self, l: LayerCtx<'_>, _: &DeltaPlan) -> Result<(), SessionError> {
         l.plain_only("qwen3moe::VerifyProfiler::delta_out")?;
-        for row in 0..l.m {
-            self.one(GroupKind::DeltaOut, Some(l.layer), l.m, Part::Row(row))?;
+        // The delta out is one group where the M-row head-normed entry serves
+        // the layer's out type at the verify's rows (the other M-row launches'
+        // own shape), else a group a row, each launch timed on its own buffer.
+        let out = match &self.arena.layers[l.layer].mixer {
+            MixerBufs::Delta(d) => d.out_quant,
+            MixerBufs::Attention(_) | MixerBufs::ShortConv(_) => {
+                return Err(refuse(format!(
+                    "layer {}: a delta op on a layer of another mixer",
+                    l.layer
+                )));
+            }
+        };
+        if headnorm_m_serves(out, l.m) {
+            self.one(GroupKind::DeltaOut, Some(l.layer), l.m, Part::Whole)?;
+        } else {
+            for row in 0..l.m {
+                self.one(GroupKind::DeltaOut, Some(l.layer), l.m, Part::Row(row))?;
+            }
         }
         self.hand_on(l, Half::Mixer)
     }
