@@ -362,6 +362,10 @@ mod gen_slots;
 mod state_back;
 
 #[cfg(all(feature = "deepseek41", feature = "checkpoint"))]
+#[path = "shared/ds41_rank.rs"]
+mod ds41_rank;
+
+#[cfg(all(feature = "deepseek41", feature = "checkpoint"))]
 #[path = "shared/ds41_tp.rs"]
 mod tp;
 
