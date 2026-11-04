@@ -1,0 +1,29 @@
+# Round nodebatch (kind profile): the ws+Spark decode rate with the prompt as one batch over the node tier, so the
+# residency machine runs on the node path (BatchSlots: the host serves the node's experts in the batch; residency
+# `mid-p0-s1 why=place` in the smoke of 2026-11-05 06:34, prompt `kind=batch`), against ws alone at its best (plan (a),
+# batch prefill, residency mid: 46.0 tok/s @ n 96 d 512 on 2026-11-05 04:05). Same binary, same lease, 4 rounds.
+# [derived] plan (a) with residency: step 21.7 ms = card front ~17 ms (nsys 2026-09-24, kernels 17.36 ms of a step)
+# + ~4.7 ms exposed host wait. The node arm: the smoke's host leg fell to 10-15 ms by step 40 (host_slots 101 -> 45 as
+# residency admitted), under the card front, so the exposed term is the node's round trip a a layer (sparkr3-a card:
+# 110..175 us) x 40 layers = 4.4..7.0 ms: step 21.4..24.0 ms -> 41.6..46.6 tok/s. The measured value is the node arm's
+# tok/s; the plan (a) arm beside it is the paired reference. The residency warm-up (~40 steps of 96) is the same in
+# both arms. Above the band means the host wait at plan (a) is larger than 4.7 ms or a below 110 us; below it, a above
+# 175 us on this link (the pump hop, H2D, the ack).
+kind: profile
+question: with the prompt batched over the node tier and the residency machine on, does the ws with the Spark decode
+  at, above or below ws alone at its best, and which term (the node round trip a, or the host wait) sets it?
+term: tok/s @ n=96, prose P 512, depth 512, A6000 stage; the node arm --place bp with the Spark tier over tcp
+  (BLOOMERY_TIER_NODES, BLOOMERY_TIER_LINK=tcp), the plain arm --place a; both under BLOOMERY_CARD_BUDGET=90G, the
+  prompt as one batch (BLOOMERY_PREFILL unset), residency unset (mid on both)
+unit: tok/s
+predict: 41.6..46.6
+condition: one binary (the nodebatch tree), every arm's load its own process; the Spark's tier_server loop up from the
+  same tree, its caches dropped before the sitting, free >= 100 GB; no [cpu-busy] on a counted row; rows marked
+  [cold] stand with that mark and the first clean row of each arm is read beside the mean
+decide-in: parity with ws alone: the plain decode gains nothing from the node at this link; the gain path is the a
+  term (the sparkr3-a profile: pump hop, H2D, ack) and the two-row pass (the draft amortizes a over k rows), and the
+  prefill headline (batch pp over the node against plan (a)'s 220) is written beside it
+decide-below: below 41.6: a is above 175 us; profile the link before any other lever (sparkr3-a), and read the node
+  arm's host_slots against the smoke's 45..55 (a residency that did not converge reads here too)
+decide-above: above 46.6: the exposed host wait at plan (a) is larger than modelled or a is under 110 us; write the
+  ws+Spark headline with its interval and run the code corpus and depth 4096 next
