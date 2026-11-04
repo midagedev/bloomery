@@ -4,7 +4,8 @@
 //! Qwen3-MoE's (`qwen2`), GLM-5.3-Flash's (`glm4`), Qwen3.8-Flash-Next's
 //! (`qwen35`), Nemotron 3 Nano 4B's (`pixtral`), MiniMax-M3's (`minimax-m2`)
 //! Muse Spark Open's (`gpt-4o`), Mistral Large 4's (`tekken-num3`, with cases of its own for its
-//! digit runs and special tokens) and Nanbeige4.3-33B's (`llama`, SentencePiece with byte fallback).
+//! digit runs and special tokens), Nanbeige4.3-33B's (`llama`, SentencePiece with byte fallback) and
+//! DeepSeek-V2-Lite-Chat's (`deepseek-llm`, with cases of its own for the edges of its six regexes).
 //!
 //! The reference's sets are written once by `just dump-ref-tokenizer`
 //! (`crates/tokenizer/tools/oracle.sh`) and opened here through their refset
@@ -15,7 +16,7 @@
 //! Every text is checked in both of the reference's parse modes: special
 //! tokens parsed (its default) and `--no-parse-special`. The first four
 //! vocabularies do not add a BOS (`tokenizer.ggml.add_bos_token` is false).
-//! Nemotron's file does, so its set is dumped with `--no-bos`: that is
+//! Nemotron's file does, and so does DeepSeek-V2-Lite-Chat's, so their sets are dumped with `--no-bos`: that is
 //! `llama-tokenize`'s `add_special` false, the call `encode` makes here, and
 //! the ids are the text's own. The round trip decodes with
 //! special tokens rendered, which returns their text, so it is exact for
@@ -30,7 +31,7 @@ use std::time::Instant;
 
 use refset::arch::gemma_embedding::TOKENIZER as LLAMA;
 use refset::arch::tokenizer::{
-    GLM5NEXT, MISTRALLARGE4, MUSESPARK, NANBEIGE43, NEMOTRON, QWEN3MOE, QWEN38, V41,
+    DS2, GLM5NEXT, MISTRALLARGE4, MUSESPARK, NANBEIGE43, NEMOTRON, QWEN3MOE, QWEN38, V41,
 };
 use refset::family::Family;
 use refset::tokenizer::{Text, TokenizerSet};
@@ -161,6 +162,20 @@ fn nanbeige43() -> Vocabulary {
         eog: &["<|im_end|>", "<|endoftext|>"],
         unspelled: &[],
         extra: None,
+    }
+}
+
+/// DeepSeek-V2-Lite-Chat on the box (`deepseek-llm`). The header has no `eot_token_id` key, and of
+/// the reference's EOT, FIM and stop names only the eos `<｜end▁of▁sentence｜>` is among its token
+/// texts, so no role is ambiguous and generation ends on that eos. The cases after `cases.txt` are
+/// the vocabulary's own.
+fn ds2() -> Vocabulary {
+    Vocabulary {
+        family: &DS2,
+        ambiguous: &[],
+        eog: &["<｜end▁of▁sentence｜>"],
+        unspelled: &[],
+        extra: Some(include_bytes!("cases-ds2.txt")),
     }
 }
 
@@ -558,4 +573,16 @@ fn hw_mistrallarge4_corpus_ids_equal_reference() {
 #[ignore = "needs the mistrallarge4 vocabulary and its oracle set (just dump-ref-tokenizer) on the box"]
 fn hw_mistrallarge4_cases_equal_reference() {
     cases_equal_reference(&mistrallarge4());
+}
+
+#[test]
+#[ignore = "needs the DeepSeek-V2-Lite-Chat vocabulary and its oracle set (just dump-ref-tokenizer ds2) on the box"]
+fn hw_ds2_corpus_ids_equal_reference() {
+    corpus_ids_equal_reference(&ds2());
+}
+
+#[test]
+#[ignore = "needs the DeepSeek-V2-Lite-Chat vocabulary and its oracle set (just dump-ref-tokenizer ds2) on the box"]
+fn hw_ds2_cases_equal_reference() {
+    cases_equal_reference(&ds2());
 }

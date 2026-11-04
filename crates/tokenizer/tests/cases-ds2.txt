@@ -1,0 +1,31 @@
+# deepseek-llm's own cases, after cases.txt (tools/oracle.sh decodes each line with printf %b): the edges of the six regexes of
+# crates/tokenizer/src/pretok.rs, which no corpus line reaches. \x20 is a space written where a trailing one must survive an editor.
+# Regex 2's letters: Latin-1, Greek, Cyrillic and Cherokee are in its class, and a letter before an ASCII one is cut off by regex 3.
+Ωmega ßeta naïve Привет мир ǅx éa b é ᎠᎡ x
+aʔb aʰb ĸ ȷ ſ
+Ａｂｃ１２３ ＡＢＣ Ｘ＿ｙ
+𐐀𐐁 𐑏x 𞤀 x𐐀y
+# Regex 3: ASCII punctuation, symbols and letters with an optional space, the fullwidth forms and the quotation marks.
+x = y;\x20\x20z!!\x20\x20?? (a,b) [c] {d} <e> ~f ^g `h` |i| \\j
+‘single’ “double” „low‟ ‛x ’s don’t
+你好！ 再见。\n「引用」（括号）：冒号；分号，逗号、顿号～
+# U+3000 is whitespace for the reference's wregex and a member of no class.
+，\xe3\x80\x80、
+你\xe3\x80\x80好 你\xe2\x80\x83好
+你好\xe3\x80\x80
+\xe3\x80\x80\xe3\x80\x80x\xe3\x80\x80
+a\xc2\xa0\xc2\xa0b\xc2\xa0
+# Regex 4: whitespace at a piece's end, after text of every kind.
+foo\x20\x20
+你好\x20\x20\x09
+x\x20\r\n\x20y\x20\n\x20\n
+\t\n\x20\x20
+\n\n\r\n\r\n\n\x20
+# Regex 5: CJK, Thai, Devanagari, kana, jamo and Runic runs, and the letters that are in both classes.
+你好 你好世界abc世界 สวัสดี ไทย नमस्ते ひらがなカタカナ ｱｲｳ ᄀᄁ ᚠᚢᚦ
+한국어 한국어abc 가나다라마바사
+# Regex 6: numbers of every script are one piece, whatever their length.
+1234567 ١٢٣٤٥٦٧ ²³ x²y 3.14 1,000 ２０２６ ①② 12345678901234567890
+# Mixed runs and code.
+Ünïcödé тест ünï_cödé camelCase snake_case HTTPServer x86_64 😀 hi 😀hi
+if (x != y) { return a[i] + b->c; } // done\n\tfoo(bar);\n

@@ -47,6 +47,7 @@
 #   llama     EmbeddingGemma v1's Q8_0 file      the same mainline pin, gemma-embedding profile       ref-tokenizer-llama
 #   nanbeige43  Nanbeige4.3-33B's Q4_K_M file     llama.cpp-mainline at the nanbeige43 profile's LCPP  ref-tokenizer-nanbeige43
 #                                                 and LCPP_PIN (tools/ref/models/nanbeige43.sh)
+#   ds2       DeepSeek-V2-Lite-Chat's Q3_K_M file ik main c10fbbcc (deepseek-llm; --no-bos, below)  ref-tokenizer-ds2
 #
 # Every vocabulary's reference is a tree's build, not one machine's md5s: before anything is read, the tree is checked against
 # the pin the profile names (tools/ref/emb2/oracle-tree.sh owns the check), and the manifest then states `# build <commit>` or
@@ -69,7 +70,8 @@
 #
 # A vocabulary can have cases of its own after the shared ones (EXTRA, `# extra cases` in the manifest, rows numbered on
 # from the shared cases): gemma4's crates/tokenizer/tests/cases-gemma4.txt, the boundaries of its own vocabulary and the
-# texts the EmbeddingGemma 2 oracle sets are dumped from (tools/ref/emb2/emb2.sh reads their ids here).
+# texts the EmbeddingGemma 2 oracle sets are dumped from (tools/ref/emb2/emb2.sh reads their ids here); ds2's
+# crates/tokenizer/tests/cases-ds2.txt, the edges of the deepseek-llm pre-tokenizer's six regexes.
 #
 # The sets' directories are `ref-tokenizer-*`, not the `tokenizer*` of the format this script wrote
 # before it wrote a trailer: a checkout that still runs that format's gate rewrites those and cannot
@@ -81,7 +83,7 @@
 # takes one snapshot of docs/ per vocabulary, in turn, all but gemma4 and llama, which run by name on a machine with their
 # mainline tree.
 #
-# Usage: bash crates/tokenizer/tools/oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|minimaxm3|musespark|mistrallarge4|nanbeige43|gemma4|llama|all [--cases-only]
+# Usage: bash crates/tokenizer/tools/oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|minimaxm3|musespark|mistrallarge4|nanbeige43|ds2|gemma4|llama|all [--cases-only]
 # --cases-only writes the fixed cases without reading the corpus trees.
 set -euo pipefail
 
@@ -164,15 +166,15 @@ case $#:${2:-} in
 esac
 
 case ${1:-} in
-  v41 | qwen3moe | glm5next | qwen38 | nemotron | minimaxm3 | musespark | mistrallarge4 | nanbeige43 | gemma4 | llama) ;;
+  v41 | qwen3moe | glm5next | qwen38 | nemotron | minimaxm3 | musespark | mistrallarge4 | nanbeige43 | ds2 | gemma4 | llama) ;;
   all)
-    for v in v41 qwen3moe glm5next qwen38 nemotron musespark mistrallarge4 nanbeige43; do
+    for v in v41 qwen3moe glm5next qwen38 nemotron musespark mistrallarge4 nanbeige43 ds2; do
       echo "oracle: $v"
       bash "${BASH_SOURCE[0]}" "$v" "${@:2}"
     done
     exit 0
     ;;
-  *) echo "usage: oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|minimaxm3|musespark|mistrallarge4|nanbeige43|gemma4|llama|all" >&2; exit 64 ;;
+  *) echo "usage: oracle.sh v41|qwen3moe|glm5next|qwen38|nemotron|minimaxm3|musespark|mistrallarge4|nanbeige43|ds2|gemma4|llama|all" >&2; exit 64 ;;
 esac
 VOCAB_NAME=$1
 
@@ -316,6 +318,23 @@ profile() {
       # /tokenize with add_special gives, and the text's own ids are the ones after that first id (no EOS: add_eos_token is
       # false). The EmbeddingGemma sets are read the same way. --no-escape keeps the text's bytes, as for nemotron.
       REF_FLAGS=(--no-escape)
+      ;;
+    ds2)
+      # The default profile's reference: ik main at c10fbbcc, no patch, the tree the texts of every set are gathered from. Its
+      # `deepseek-llm` pre is DEEPSEEK_LLM's six regexes, five of them through unicode.cpp's std::wregex fallback over the
+      # codepoints (the last, \p{N}+, over the collapsed text), and its UTF-8 decoder is the lenient one `decode_lenient` follows.
+      # ik's llama-tokenize reports no commit, so --unversioned: the tree's HEAD, its clean tracked files and the age of the build
+      # are the check. The file is the V2-Lite one crates/refset/src/arch/dequant.rs names, not whatever BLOOMERY_REF_MODEL says.
+      ORACLE_TREE=/home/user/ik_llama.cpp
+      BUILD_PIN=c10fbbcccd69cb1c66ddeb39601b0cd71701f7c3 BUILD_PATCH=
+      TREE_FLAGS=(--unversioned)
+      SHARD=/models/small/DeepSeek-V2-Lite-Chat.Q3_K_M.gguf
+      SET=ref-tokenizer-ds2
+      # The edges of the six regexes, and the digit and whitespace cases of this vocabulary, after the shared ones.
+      EXTRA=$ROOT/crates/tokenizer/tests/cases-ds2.txt
+      # The file sets add_bos_token, and the gate compares the text's own ids: --no-bos is `add_special` false. ik's llama-tokenize
+      # has no --no-escape (it reads a -f text as it is), so the mainline trees' flag is not passed.
+      REF_FLAGS=(--no-bos)
       ;;
     gemma4 | llama)
       # The profile's own MODEL, not the file tools/box.sh resolved for the default profile.

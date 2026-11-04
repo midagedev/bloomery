@@ -1711,6 +1711,22 @@ mod tests {
         }
     }
 
+    /// The `deepseek-llm` row loads from a header and decodes as the reference does with
+    /// `clean_spaces` false: a space before `?`, `.` or `'s` stays. FAIL-first: a name added to
+    /// `CLEAN_SPACES` fails it.
+    #[test]
+    fn the_deepseek_llm_row_loads_and_cleans_no_spaces() {
+        let tok = from_header(&byte_header("deepseek-llm")).unwrap();
+        assert!(tok.space_cleaner().is_none());
+        for text in ["What ?", "Hello , world", "it 's", "你好 。 x  "] {
+            assert_eq!(
+                &tok.decode(&tok.encode(text, false, false)),
+                text,
+                "{text:?}"
+            );
+        }
+    }
+
     /// llama.cpp's three passes over one whole text (llama-vocab.cpp, `detokenize`'s
     /// `clean_spaces`), as it writes them: the space before `?`, `!`, `.` and `,` dropped; an
     /// apostrophe between two spaces keeping neither, its right space marked so a later

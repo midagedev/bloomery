@@ -24,7 +24,9 @@
 //! the musespark node dumps are read by). Mistral Large 4's `tekken-num3` pre is the Tekken regex with
 //! digit runs grouped by three from the right, and its set is read by `/home/user/llama.cpp-ml4`
 //! (mainline at PR 31376's merge, no patch; [`MISTRALLARGE4_BUILD`], the same tree the
-//! mistrallarge4 node dumps are read by). A family pins the tree its oracle is built from, the
+//! mistrallarge4 node dumps are read by). DeepSeek-V2-Lite-Chat's `deepseek-llm` pre is read by
+//! `/home/user/ik_llama.cpp` itself (ik main at `c10fbbcc`, no patch; [`DS2_BUILD`]), the default
+//! profile's tree. A family pins the tree its oracle is built from, the
 //! `# build` line its set states after `crates/tokenizer/tools/oracle.sh` has
 //! checked the tree (`tools/ref/emb2/oracle-tree.sh`): the upstream commit's
 //! first 9 digits, and for a tree with a local patch `+` and the 12 digits
@@ -88,6 +90,12 @@ pub const MUSESPARK_BUILD: &str = super::musespark::COMMIT;
 /// same tree at ([`super::mistrallarge4::COMMIT`]).
 // PIN(2026-10-31): the commit, not one machine's llama-tokenize and libllama.so.0 md5s, which no rebuild matched.
 pub const MISTRALLARGE4_BUILD: &str = super::mistrallarge4::COMMIT;
+
+/// The tree `/home/user/ik_llama.cpp`, whose `llama-tokenize` loads the DeepSeek-V2-Lite-Chat file:
+/// ik main at `c10fbbcc`, no patch, the tree the default profile's texts, dequant harness and decode
+/// references are read from.
+// PIN(2026-11-04): the commit, not one machine's llama-tokenize and libllama.so md5s, which no rebuild matched.
+pub const DS2_BUILD: &str = "c10fbbccc";
 
 /// V4.1's set (`deepseek-v3` pre-tokenizer), from the file the tree runs.
 pub static V41: Family = Family {
@@ -220,6 +228,20 @@ pub static NANBEIGE43: Family = Family {
     consumers: &["gate-tokenizer"],
 };
 
+/// DeepSeek-V2-Lite-Chat's set (`deepseek-llm` pre-tokenizer, BOS added by the file, so the set is dumped without it).
+pub static DS2: Family = Family {
+    name: "tokenizer-ds2",
+    sets: &["ref-tokenizer-ds2"],
+    resolve: None,
+    recipe: "just dump-ref-tokenizer ds2",
+    identity: Identity::Vocabulary,
+    arch: None,
+    build: Some(Build::Is(DS2_BUILD)),
+    runs: Some(ds2_model),
+    draft_runs: None,
+    consumers: &["gate-tokenizer"],
+};
+
 /// The Qwen3-MoE vocabulary file: `$BLOOMERY_QWEN3MOE_VOCAB`, else
 /// [`QWEN3MOE_MODEL`]. An empty value counts as unset.
 fn qwen3moe_model() -> Result<String, RefError> {
@@ -257,6 +279,10 @@ fn nanbeige43_model() -> Result<String, RefError> {
     Ok(super::llama::dense::MODEL.to_string())
 }
 
+fn ds2_model() -> Result<String, RefError> {
+    Ok(super::dequant::V2LITE_MODEL.to_string())
+}
+
 /// The families, in the order `refset-check` lists them.
 pub static FAMILIES: &[&Family] = &[
     &V41,
@@ -268,15 +294,16 @@ pub static FAMILIES: &[&Family] = &[
     &MUSESPARK,
     &MISTRALLARGE4,
     &NANBEIGE43,
+    &DS2,
     &super::gemma_embedding::TOKENIZER,
 ];
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ARCH, FAMILIES, GLM5NEXT, MAINLINE_BUILD, MINIMAXM3, MINIMAXM3_BUILD, MISTRALLARGE4,
-        MISTRALLARGE4_BUILD, MUSESPARK, MUSESPARK_BUILD, NANBEIGE43, NEMOTRON, NEMOTRON_BUILD,
-        QWEN3MOE, QWEN38, TILDE_BUILD, TOKREF_BUILD, V41,
+        ARCH, DS2, DS2_BUILD, FAMILIES, GLM5NEXT, MAINLINE_BUILD, MINIMAXM3, MINIMAXM3_BUILD,
+        MISTRALLARGE4, MISTRALLARGE4_BUILD, MUSESPARK, MUSESPARK_BUILD, NANBEIGE43, NEMOTRON,
+        NEMOTRON_BUILD, QWEN3MOE, QWEN38, TILDE_BUILD, TOKREF_BUILD, V41,
     };
     use crate::RefError;
     use crate::emb2::LCPP_BUILD;
@@ -337,7 +364,7 @@ mod tests {
     /// without a patch are mainline's, whose commit the pin states as it is.
     #[test]
     fn the_vocabularies_are_rows_of_the_table() {
-        assert_eq!(crate::arch::families(ARCH).len(), 10);
+        assert_eq!(crate::arch::families(ARCH).len(), 11);
         for f in FAMILIES {
             assert!(std::ptr::eq(crate::arch::named(f.name).unwrap_or(&V41), *f));
             assert!(
@@ -361,6 +388,7 @@ mod tests {
             (&MUSESPARK, MUSESPARK_BUILD, false),
             (&MISTRALLARGE4, MISTRALLARGE4_BUILD, false),
             (&NANBEIGE43, MAINLINE_BUILD, false),
+            (&DS2, DS2_BUILD, false),
             (&super::super::gemma_embedding::TOKENIZER, LCPP_BUILD, false),
         ] {
             assert_eq!(pin(f), want, "{} pins the wrong tree", f.name);
@@ -384,6 +412,7 @@ mod tests {
                 "ref-tokenizer-musespark",
                 "ref-tokenizer-mistrallarge4",
                 "ref-tokenizer-nanbeige43",
+                "ref-tokenizer-ds2",
                 "ref-tokenizer-llama",
             ]
         );

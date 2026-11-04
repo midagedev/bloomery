@@ -1,9 +1,10 @@
 //! The pre-tokenizers of the vocabularies this crate runs, as the reference
 //! runs them: [`Pre::DeepseekV3`] (`deepseek-v3`, `hunyuan-dense`,
-//! `joyai-llm`), [`Pre::Qwen2`] (`qwen2`, `solar-open`), [`Pre::Glm4`] (`glm4`),
-//! [`Pre::Qwen35`] (`qwen35`), [`Pre::Llama3`] (`llama-bpe`, `lfm2`), [`Pre::Tekken`] (`tekken`, `pixtral`),
-//! [`Pre::TekkenNum3`] (`tekken-num3`), [`Pre::MiniMaxM2`] (`minimax-m2`), [`Pre::Gpt4o`] (`gpt-4o`),
-//! [`Pre::Gemma4`] (`gemma4`), [`Pre::Raon`] (`raon`) and [`Pre::Flint`] (`flint`).
+//! `joyai-llm`), [`Pre::DeepseekLlm`] (`deepseek-llm`), [`Pre::Qwen2`] (`qwen2`, `solar-open`),
+//! [`Pre::Glm4`] (`glm4`), [`Pre::Qwen35`] (`qwen35`), [`Pre::Llama3`] (`llama-bpe`, `lfm2`),
+//! [`Pre::Tekken`] (`tekken`, `pixtral`), [`Pre::TekkenNum3`] (`tekken-num3`),
+//! [`Pre::MiniMaxM2`] (`minimax-m2`), [`Pre::Gpt4o`] (`gpt-4o`), [`Pre::Gemma4`] (`gemma4`),
+//! [`Pre::Raon`] (`raon`) and [`Pre::Flint`] (`flint`).
 //!
 //! ## deepseek-v3
 //!
@@ -29,6 +30,38 @@
 //! The matchers below are those three regexes under ECMAScript semantics
 //! (leftmost start, alternatives in order, greedy quantifiers that back off),
 //! written out by hand; none of them can match the empty string.
+//!
+//! ## deepseek-llm
+//!
+//! The reference applies six regexes in turn (its DEEPSEEK_LLM type):
+//!
+//! 1. `[\r\n]`
+//! 2. `\s?[A-Za-zµÀ-ÖØ-öø-ƺ…]+`, the class a list of 87 ranges ([`LLM_LETTERS`])
+//! 3. `\s?[!-/:-~！-／：-～‘-‟　-。]+`
+//! 4. `\s+$`
+//! 5. `[一-龥ࠀ-一가-퟿]+`
+//! 6. `\p{N}+`
+//!
+//! None has a hand-written splitter there, so all six go through its `std::regex` fallback, which
+//! re-splits every piece the previous regex left, as deepseek-v3's three do ([`resplit`]). The
+//! fallback has two forms. Only regex 6 names a Unicode category, and only it runs on the
+//! collapsed text (one byte per codepoint, [`crate::unicode::collapse`]) with `\p{N}` rewritten
+//! as "its collapsed byte, plus `0-9`". Regexes 1 to 5 run as a `std::wregex` over the
+//! codepoints themselves, ranges and all, after the reference has written every non-ASCII
+//! whitespace codepoint as 0x0B: `\s` is ASCII whitespace there, so a codepoint of the reference's
+//! whitespace set is `\s` and no member of any class, whatever range holds it. That is `　`
+//! (U+3000), which opens the last range of regex 3, and the whitespace codepoints inside the
+//! one range regex 5 spells from U+0800. [`match_llm_run`] is that reading of a class.
+//!
+//! Three consequences of the cascade, each a case of the unit tests: regex 3's class holds
+//! `:-~`, the ASCII letters too, so a piece regex 2 took whole is cut again at its non-ASCII
+//! letters (`Ωmega` is `Ω`, `mega`); a run of numbers is never cut in words (no `\p{N}{1,3}`);
+//! and `\r` and `\n` are pieces of one codepoint each, `\r\n` two. `\s+$` ends a piece's own
+//! trailing whitespace only, the end of a piece being the end of input for it
+//! ([`split_trailing_space`]). The reference sets `clean_spaces` false for this name; this
+//! crate cleans no spaces ([`crate::vocab`]'s `CLEAN_SPACES` does not hold it). No folder's
+//! `tokenizer.json` spells this pipeline, so the name has no reading that runs as a Hugging Face
+//! one does ([`Pre::hf_reading`]).
 //!
 //! ## qwen2
 //!
@@ -664,6 +697,195 @@ fn match_flint(c: &[u8], i: usize, hi: usize) -> usize {
     match_space(c, i, hi)
 }
 
+/// Regex 2 of `deepseek-llm`, `\s?[A-Za-zµÀ-ÖØ-öø-ƺ…]+`: the class as the sorted, disjoint ranges
+/// `(first, last)` its characters spell, a single character `(x, x)`.
+const LLM_LETTERS: [(u32, u32); 87] = [
+    (0x0041, 0x005A),
+    (0x0061, 0x007A),
+    (0x00B5, 0x00B5),
+    (0x00C0, 0x00D6),
+    (0x00D8, 0x00F6),
+    (0x00F8, 0x01BA),
+    (0x01BC, 0x01BF),
+    (0x01C4, 0x0293),
+    (0x0295, 0x02AF),
+    (0x0370, 0x0373),
+    (0x0376, 0x0376),
+    (0x0377, 0x0377),
+    (0x037B, 0x037D),
+    (0x037F, 0x037F),
+    (0x0386, 0x0386),
+    (0x0388, 0x038A),
+    (0x038C, 0x038C),
+    (0x038E, 0x03A1),
+    (0x03A3, 0x03F5),
+    (0x03F7, 0x0481),
+    (0x048A, 0x052F),
+    (0x0531, 0x0556),
+    (0x10A0, 0x10C5),
+    (0x13A0, 0x13F5),
+    (0x13F8, 0x13FD),
+    (0x1C90, 0x1CBA),
+    (0x1CBD, 0x1CBF),
+    (0x1D00, 0x1D2B),
+    (0x1D6B, 0x1D77),
+    (0x1D79, 0x1D9A),
+    (0x1E00, 0x1F15),
+    (0x1F18, 0x1F1D),
+    (0x1F20, 0x1F45),
+    (0x1F48, 0x1F4D),
+    (0x1F50, 0x1F57),
+    (0x1F59, 0x1F59),
+    (0x1F5B, 0x1F5B),
+    (0x1F5D, 0x1F5D),
+    (0x1F5F, 0x1F7D),
+    (0x1F80, 0x1FB4),
+    (0x1FB6, 0x1FBC),
+    (0x1FBE, 0x1FBE),
+    (0x1FC2, 0x1FC4),
+    (0x1FC6, 0x1FCC),
+    (0x1FD0, 0x1FD3),
+    (0x1FD6, 0x1FDB),
+    (0x1FE0, 0x1FEC),
+    (0x1FF2, 0x1FF4),
+    (0x1FF6, 0x1FFC),
+    (0x2102, 0x2102),
+    (0x2107, 0x2107),
+    (0x210A, 0x2113),
+    (0x2115, 0x2115),
+    (0x2119, 0x211D),
+    (0x2124, 0x2124),
+    (0x2126, 0x2126),
+    (0x2128, 0x2128),
+    (0x212A, 0x212D),
+    (0x212F, 0x2134),
+    (0x2139, 0x2139),
+    (0x213C, 0x213F),
+    (0x2145, 0x2149),
+    (0x214E, 0x214E),
+    (0x2183, 0x2183),
+    (0x2184, 0x2184),
+    (0x2C00, 0x2C7B),
+    (0x2C7E, 0x2CE4),
+    (0x2CEB, 0x2CEE),
+    (0x2CF2, 0x2CF2),
+    (0x2CF3, 0x2CF3),
+    (0xA640, 0xA66D),
+    (0xA680, 0xA69B),
+    (0xA722, 0xA76F),
+    (0xA771, 0xA787),
+    (0xA78B, 0xA78E),
+    (0xAB70, 0xABBF),
+    (0xFB00, 0xFB06),
+    (0xFB13, 0xFB17),
+    (0xFF21, 0xFF3A),
+    (0xFF41, 0xFF5A),
+    (0x10400, 0x1044F),
+    (0x104B0, 0x104D3),
+    (0x104D8, 0x104FB),
+    (0x10C80, 0x10CB2),
+    (0x10CC0, 0x10CF2),
+    (0x118A0, 0x118DF),
+    (0x1E900, 0x1E943),
+];
+
+/// Whether `cpt` is in the class of `deepseek-llm`'s regex 2 ([`LLM_LETTERS`]).
+fn is_llm_letter(cpt: u32) -> bool {
+    let i = LLM_LETTERS.partition_point(|&(_, last)| last < cpt);
+    LLM_LETTERS.get(i).is_some_and(|&(first, _)| first <= cpt)
+}
+
+/// Whether `cpt` is in the class of `deepseek-llm`'s regex 3, `[!-/:-~！-／：-～‘-‟　-。]`: ASCII
+/// punctuation, symbols and letters (the digits sit between its first two ranges), their fullwidth
+/// forms, the quotation marks U+2018..=U+201F and U+3000..=U+3002.
+fn is_llm_symbol(cpt: u32) -> bool {
+    matches!(cpt, 0x21..=0x2F | 0x3A..=0x7E)
+        || matches!(cpt, 0xFF01..=0xFF0F | 0xFF1A..=0xFF5E)
+        || matches!(cpt, 0x2018..=0x201F | 0x3000..=0x3002)
+}
+
+/// Whether `cpt` is in the class of `deepseek-llm`'s regex 5, `[一-龥ࠀ-一가-퟿]`: its first two
+/// ranges (U+4E00..=U+9FA5 and U+0800..=U+4E00) are one run, and the third is U+AC00..=U+D7FF.
+fn is_llm_wide(cpt: u32) -> bool {
+    matches!(cpt, 0x0800..=0x9FA5 | 0xAC00..=0xD7FF)
+}
+
+/// `[class]+` at `i`, under the reference's `std::wregex` reading (the module docs): the codepoints of
+/// `class` that are not whitespace, `c` the collapsed bytes of `cpts`, whose 0x0B and ASCII
+/// whitespace are the reference's `\s`. Its length, 0 for none.
+fn match_llm_run(cpts: &[u32], c: &[u8], i: usize, hi: usize, class: fn(u32) -> bool) -> usize {
+    (i..hi)
+        .take_while(|&k| !is_space(c[k]) && class(cpts[k]))
+        .count()
+}
+
+/// `\s?[class]+` at `i`: a whitespace codepoint first, and only when a run of `class` follows it
+/// (a greedy `?` backs off when the run fails, and a whitespace codepoint is no member of `class`).
+fn match_llm_spaced_run(
+    cpts: &[u32],
+    c: &[u8],
+    i: usize,
+    hi: usize,
+    class: fn(u32) -> bool,
+) -> usize {
+    if is_space(c[i]) {
+        let n = match_llm_run(cpts, c, i + 1, hi, class);
+        if n > 0 {
+            return 1 + n;
+        }
+    }
+    match_llm_run(cpts, c, i, hi, class)
+}
+
+/// `\s+$` over each piece of `pieces` (lengths, in codepoints): the piece's trailing run of
+/// whitespace is a piece of its own and the text before it another, and a piece with no
+/// trailing whitespace stays as it is. `$` is the end of the piece, and the leftmost start that
+/// reaches it is the run's first codepoint.
+fn split_trailing_space(pieces: &[usize], out: &mut Vec<usize>, c: &[u8]) {
+    out.clear();
+    let mut lo = 0;
+    for &len in pieces {
+        let hi = lo + len;
+        let tail = c[lo..hi].iter().rev().take_while(|&&x| is_space(x)).count();
+        if tail == 0 || tail == len {
+            out.push(len);
+        } else {
+            out.extend([len - tail, tail]);
+        }
+        lo = hi;
+    }
+}
+
+/// The six regexes of `deepseek-llm` in turn over one text fragment, each re-splitting the
+/// pieces of the one before it; the words' lengths come back in `s.a`.
+fn split_deepseek_llm<'s>(cpts: &[u32], s: &'s mut Scratch) -> &'s [usize] {
+    let c = &s.collapsed;
+
+    s.a.clear();
+    if !cpts.is_empty() {
+        s.a.push(cpts.len());
+    }
+    // `[\r\n]`
+    resplit(&s.a, &mut s.b, |i, _| usize::from(is_newline(c[i])));
+    // `\s?[A-Za-zµÀ-ÖØ-öø-ƺ…]+`
+    resplit(&s.b, &mut s.a, |i, hi| {
+        match_llm_spaced_run(cpts, c, i, hi, is_llm_letter)
+    });
+    // `\s?[!-/:-~！-／：-～‘-‟　-。]+`
+    resplit(&s.a, &mut s.b, |i, hi| {
+        match_llm_spaced_run(cpts, c, i, hi, is_llm_symbol)
+    });
+    // `\s+$`
+    split_trailing_space(&s.b, &mut s.a, c);
+    // `[一-龥ࠀ-一가-퟿]+`
+    resplit(&s.a, &mut s.b, |i, hi| {
+        match_llm_run(cpts, c, i, hi, is_llm_wide)
+    });
+    // `\p{N}+`, over the collapsed bytes
+    resplit(&s.b, &mut s.a, |i, hi| match_number(c, i, hi, usize::MAX));
+    &s.a
+}
+
 /// Re-split every piece of `pieces` (lengths, in codepoints) with a matcher
 /// `m(i, hi)` that returns the match length at `i` inside `[.., hi)`, 0 for
 /// none. Unmatched runs become pieces of their own.
@@ -711,6 +933,8 @@ pub(crate) enum Pre {
     /// BPE skips a byte its vocabulary lacks. Never named in a header; a vocabulary with
     /// `tokenizer.bloomery.eog_token_ids` gets it.
     DeepseekV3Hf,
+    /// `deepseek-llm`: six regexes in turn, five of them over the codepoints themselves.
+    DeepseekLlm,
     /// `qwen2`, `solar-open`: the reference's hand-written splitter, one number
     /// a word. Solar's `tokenizer.json` carries qwen2's regex verbatim.
     Qwen2,
@@ -768,10 +992,11 @@ pub(crate) enum Pre {
 
 impl Pre {
     /// The names this crate runs, as `tokenizer.ggml.pre` spells them.
-    pub(crate) const NAMES: [(&'static str, Pre); 17] = [
+    pub(crate) const NAMES: [(&'static str, Pre); 18] = [
         ("deepseek-v3", Pre::DeepseekV3),
         ("hunyuan-dense", Pre::DeepseekV3),
         ("joyai-llm", Pre::DeepseekV3),
+        ("deepseek-llm", Pre::DeepseekLlm),
         ("qwen2", Pre::Qwen2),
         ("solar-open", Pre::Qwen2),
         ("glm4", Pre::Glm4),
@@ -846,6 +1071,7 @@ impl Pre {
             Pre::Gemma4 => Spelling::Metaspace,
             Pre::DeepseekV3
             | Pre::DeepseekV3Hf
+            | Pre::DeepseekLlm
             | Pre::Qwen2
             | Pre::Glm4
             | Pre::Qwen35
@@ -878,6 +1104,7 @@ pub(crate) fn split<'s>(pre: Pre, cpts: &[u32], s: &'s mut Scratch) -> &'s [usiz
     match pre {
         Pre::DeepseekV3 | Pre::DeepseekV3Hf => split_ordered(cpts, s, match_word),
         Pre::Flint => split_ordered(cpts, s, match_flint),
+        Pre::DeepseekLlm => split_deepseek_llm(cpts, s),
         Pre::Qwen2 => {
             split_custom(cpts, &s.collapsed, 1, &mut s.b);
             &s.b
@@ -1203,7 +1430,7 @@ fn split_custom(cpts: &[u32], c: &[u8], digits: usize, out: &mut Vec<usize>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Pre, Scratch, split};
+    use super::{LLM_LETTERS, Pre, Scratch, is_llm_letter, is_llm_symbol, is_llm_wide, split};
 
     /// Every name the table runs is one the crate says it runs and the
     /// refusal of another lists.
@@ -1306,6 +1533,125 @@ mod tests {
         ];
         for &(text, want) in cases {
             assert_eq!(words(Pre::Flint, text), want, "{text:?}");
+        }
+    }
+
+    /// `deepseek-llm` is a row of its own: the reference maps the name to its DEEPSEEK_LLM type,
+    /// whose six regexes `deepseek_llm_cases` runs. No folder's `tokenizer.json` spells that
+    /// pipeline, so it has no Hugging Face reading and the explicit stop list refuses it by
+    /// name. FAIL-first: a row that names another splitter, or a reading that is invented, fails.
+    #[test]
+    fn deepseek_llm_is_a_row_with_no_hf_reading() {
+        assert_eq!(
+            crate::named(&Pre::NAMES, "deepseek-llm"),
+            Some(Pre::DeepseekLlm)
+        );
+        assert!(crate::runs_pre_tokenizer("deepseek-llm"));
+        assert_eq!(Pre::DeepseekLlm.hf_reading(), None);
+        assert!(!Pre::hf_names().contains("deepseek-llm"));
+        assert!(!Pre::DeepseekLlm.ignore_merges() && !Pre::DeepseekLlm.nfc());
+        assert!(!Pre::DeepseekLlm.strict_utf8());
+    }
+
+    /// The six regexes of `deepseek-llm` in turn, each case's pieces derived by hand from the
+    /// regexes (the reference's `std::wregex` for the first five, over codepoints whose
+    /// non-ASCII whitespace is `\s`; the collapsed text for `\p{N}+`). Each case names what it
+    /// holds: a letter run takes one leading whitespace, regex 3's class holds the ASCII letters
+    /// and so cuts a piece at its non-ASCII letters, `\r` and `\n` are pieces of their own, a
+    /// piece's trailing whitespace is a piece, a CJK run takes no leading space, a run of numbers
+    /// is not cut in words, and a whitespace codepoint is no member of a class that spans it.
+    #[test]
+    fn deepseek_llm_cases() {
+        let cases: &[(&str, &[&str])] = &[
+            // Regex 2: `\s?` and a run of letters.
+            ("Hello world", &["Hello", " world"]),
+            ("a  b", &["a", " ", " b"]),
+            ("\tfoo", &["\tfoo"]),
+            ("a\u{a0}b", &["a", "\u{a0}b"]),
+            ("don't", &["don", "'", "t"]),
+            ("x = y;", &["x", " =", " y", ";"]),
+            // Regex 3 cuts a piece at its non-ASCII letters: `:-~` holds the ASCII letters.
+            ("Ωmega", &["Ω", "mega"]),
+            ("x éa", &["x", " é", "a"]),
+            // Regex 1: a newline or a carriage return is a piece of one codepoint.
+            ("a\r\nb", &["a", "\r", "\n", "b"]),
+            ("\n\nHello", &["\n", "\n", "Hello"]),
+            ("  \n x", &["  ", "\n", " x"]),
+            // Regex 4: a piece's trailing whitespace is a piece.
+            ("foo  ", &["foo", "  "]),
+            ("你好  ", &["你好", "  "]),
+            ("你好\u{3000}", &["你好", "\u{3000}"]),
+            ("你好  吗", &["你好", "  ", "吗"]),
+            // Only a piece's end: a codepoint no other regex takes keeps its inner whitespace.
+            ("😀 😀", &["😀 😀"]),
+            ("😀 😀 ", &["😀 😀", " "]),
+            ("😀  x", &["😀", " ", " x"]),
+            ("¿ \t", &["¿", " \t"]),
+            // Regex 5: a CJK run, with no leading space of its own.
+            ("a中文b", &["a", "中文", "b"]),
+            (" 你", &[" ", "你"]),
+            ("Hello, 世界!", &["Hello", ",", " ", "世界", "!"]),
+            ("你好！ 再见。", &["你好", "！", " ", "再见", "。"]),
+            // U+3000 and the U+2000 spaces are inside regex 5's range and regex 3's, and are
+            // whitespace in the reference's wregex text: no member of either class.
+            ("你\u{3000}好", &["你", "\u{3000}", "好"]),
+            ("你\u{2003}好", &["你", "\u{2003}", "好"]),
+            ("，\u{3000}、", &["，", "\u{3000}", "、"]),
+            // Regex 6: a run of numbers, in any script, is one piece whatever its length.
+            ("1234567", &["1234567"]),
+            ("abc123def", &["abc", "123", "def"]),
+            ("x²³ ١٢٣٤4", &["x", "²³", " ", "١٢٣٤4"]),
+            ("", &[]),
+        ];
+        for &(text, want) in cases {
+            let got = words(Pre::DeepseekLlm, text);
+            assert_eq!(got, want, "{text:?}");
+            assert_eq!(got.concat(), text, "the pieces tile {text:?}");
+        }
+    }
+
+    /// The codepoints a class spec spells, as the reference's `std::wregex` reads a bracket
+    /// expression of single characters and `x-y` ranges.
+    fn class_members(spec: &str) -> Vec<bool> {
+        let chars: Vec<char> = spec.chars().collect();
+        let mut member = vec![false; 0x11_0000];
+        let mut i = 0;
+        while i < chars.len() {
+            let (first, last, used) = match chars.get(i + 1) {
+                Some('-') if i + 2 < chars.len() => (chars[i], chars[i + 2], 3),
+                _ => (chars[i], chars[i], 1),
+            };
+            assert!(first <= last, "range {first:?}-{last:?} of {spec:?}");
+            member[first as usize..=last as usize].fill(true);
+            i += used;
+        }
+        member
+    }
+
+    /// The three classes of `deepseek-llm` equal the bracket expressions the reference spells,
+    /// on every codepoint: regex 2's 87-range list (as ik's source writes it), regex 3's and
+    /// regex 5's. The characters whose NFC form is another codepoint (U+1F7D, U+1FBE, U+1FD3,
+    /// U+1FDB, U+2126, U+212A), U+3000 and the ends U+0800 and U+D7FF are written as escapes, so
+    /// no editor can change what is compared. FAIL-first: a range off by one codepoint, or one
+    /// dropped, fails.
+    #[test]
+    fn deepseek_llm_classes_are_the_references() {
+        const LETTERS: &str = "A-Za-zµÀ-ÖØ-öø-ƺƼ-ƿǄ-ʓʕ-ʯͰ-ͳͶͷͻ-ͽͿΆΈ-ΊΌΎ-ΡΣ-ϵϷ-ҁҊ-ԯԱ-ՖႠ-ჅᎠ-Ᏽᏸ-ᏽᲐ-ᲺᲽ-Ჿᴀ-ᴫᵫ-ᵷᵹ-ᶚḀ-ἕἘ-Ἕἠ-ὅὈ-Ὅὐ-ὗὙὛὝὟ-\u{1F7D}ᾀ-ᾴᾶ-ᾼ\u{1FBE}ῂ-ῄῆ-ῌῐ-\u{1FD3}ῖ-\u{1FDB}ῠ-Ῥῲ-ῴῶ-ῼℂℇℊ-ℓℕℙ-ℝℤ\u{2126}ℨ\u{212A}-ℭℯ-ℴℹℼ-ℿⅅ-ⅉⅎↃↄⰀ-ⱻⱾ-ⳤⳫ-ⳮⳲⳳꙀ-ꙭꚀ-ꚛꜢ-ꝯꝱ-ꞇꞋ-ꞎꭰ-ꮿﬀ-ﬆﬓ-ﬗＡ-Ｚａ-ｚ𐐀-𐑏𐒰-𐓓𐓘-𐓻𐲀-𐲲𐳀-𐳲𑢠-𑣟𞤀-𞥃";
+        const SYMBOLS: &str = "!-/:-~！-／：-～‘-‟\u{3000}-。";
+        const WIDE: &str = "一-龥\u{800}-一가-\u{D7FF}";
+        for (name, spec, class) in [
+            ("regex 2", LETTERS, is_llm_letter as fn(u32) -> bool),
+            ("regex 3", SYMBOLS, is_llm_symbol),
+            ("regex 5", WIDE, is_llm_wide),
+        ] {
+            let member = class_members(spec);
+            for (cpt, &want) in member.iter().enumerate() {
+                assert_eq!(class(cpt as u32), want, "{name}: U+{cpt:04X}");
+            }
+        }
+        // The table is what `partition_point` needs: ascending and disjoint.
+        for pair in LLM_LETTERS.windows(2) {
+            assert!(pair[0].0 <= pair[0].1 && pair[0].1 < pair[1].0, "{pair:?}");
         }
     }
 
