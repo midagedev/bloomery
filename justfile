@@ -214,7 +214,10 @@ mac-metal-lint:
 # type-check를 겸한다 — check를 따로 돌리면 멤버 크레이트를 두 번 짓는다) 다음 BASE 범위 combos. BASE를 주면 그 base
 # 이후 바뀐 파일을 입력에 갖는 모양만 돌고 초록이 레저(~/.cache/bloomery/mac-static-ledger.tsv)에 남는다; 인자 없이 전체.
 # 주인은 tools/mac-static.sh다.
+# First, tools/mac-setup.sh --check holds the Mac's host tools (Python modules, just, rsync ≥ 3, the pinned toolchain): a
+# missing one stops the run with 69 and its install line.
 mac-static *ARGS:
+    ./tools/mac-setup.sh --check
     ./tools/mac-static.sh {{ARGS}}
 
 # `just mac-static BASE` for this tree on the second Mac (idle, 10 cores), its output and exit code back here: a round runs
