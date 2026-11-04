@@ -303,6 +303,12 @@ blk_mutantrun() { tool_selftest mutant-run.sh; }
 # under tools/static-sched.py: its job list, its scheduling, its rc/wall capture, its skip lines and its red-step naming are
 # tested against stub jobs, no cargo, no check script.
 blk_macstatic() { tool_selftest mac-static.sh; }
+# mac-setup.sh names every host tool the Mac static tier needs (python3 and the modules tools/nightly/install.sh names, just,
+# rsync ≥ 3, git, mac-check.sh's prereqs): each check and its install line against stub tools on a scratch PATH, no install.
+blk_macsetup() { tool_selftest mac-setup.sh; }
+# round-check.sh type-checks the shapes recipes.py combos selects on the box: its refusals, the remote directory, the rc, the
+# ledger and the on-box loop against a stub recipes.py, box.sh and cargo, no box.
+blk_roundcheck() { tool_selftest round-check.sh; }
 # mac-remote.sh sends a tree to the second Mac and runs mac-static there: its argument, config-file, track-name,
 # dirty-tree, lock and ledger rules, and (on macOS) the whole flow against a stub ssh that runs the "remote" in a
 # fake home, are tested here, no remote and no cargo.
@@ -1220,7 +1226,7 @@ proc_leg_gpu() {
 }
 
 BLOCKS=(prelude recipescheck gateclass selftest smoke cardorder cardtests lease boxtracks unsafecount archscan loadscan commentscan leverscan loadgroups lcppfit coldblocks leverarms slotsarm binlabel lcppwarm q38srv
-  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macremote boxsh oxidehost oxidebackend seedtarget carry releasebuild releaseinstall releasepublish releasesitting releasepick releasebuildmac pytools boxqcodes fixturevariants fixturedirs dsparkread
+  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macsetup roundcheck macremote boxsh oxidehost oxidebackend seedtarget carry releasebuild releaseinstall releasepublish releasesitting releasepick releasebuildmac pytools boxqcodes fixturevariants fixturedirs dsparkread
   refsetpublish orphan archowner treecommit archivepipe fnowner wt macgate boundedscan gatebound dumpdequant tokoracle ikpintree qdotrefargs)
 # blk_keyspec NAME: what a block's input key reads (tools/recipes.py static-key). Every block's is the whole tree: a
 # narrower key needs proof that the block reads nothing outside it, and a green run on a copy whose other files are
