@@ -1057,7 +1057,7 @@ pub const MUTANTS: &[Mutant] = &[
         name: "tail_read",
         clause: "row_tail_reads",
         why: "the rows past the last read past the weights window",
-        edits: &[(ROW_POINTER, ROW_POINTER_RAW, 3), (EARLY_RETURN, "", 3)],
+        edits: &[(ROW_POINTER, ROW_POINTER_RAW, 2), (EARLY_RETURN, "", 2)],
     },
     Mutant {
         name: "seg_weight_offset",
@@ -3243,20 +3243,20 @@ pub const MUTANTS: &[Mutant] = &[
         why: "the head scale multiplies every loaded value of its head, not the block's finished contribution: the same sum in another order, other bits in some groups",
         edits: &[(
             concat!(
-                "        FOR_UNROLL (short row = 0; row < NR0; ++row) {\n",
-                "            Q::template partial_head_rows<M>(wd[row], lanes, lo, sumf[row]);\n",
-                "        }\n"
+                "            FOR_UNROLL (short row = 0; row < NR0; ++row) {\n",
+                "                Q::template partial_head_rows<M>(wd[row], lanes, lo, sumf[row]);\n",
+                "            }\n"
             ),
             concat!(
-                "        FOR_UNROLL (short m = 0; m < M; ++m) {\n",
-                "            lanes[m].sumy *= lo[m];\n",
-                "            FOR_UNROLL (short k = 0; k < 16; ++k) {\n",
-                "                lanes[m].yl[k] *= lo[m];\n",
+                "            FOR_UNROLL (short m = 0; m < M; ++m) {\n",
+                "                lanes[m].sumy *= lo[m];\n",
+                "                FOR_UNROLL (short k = 0; k < 16; ++k) {\n",
+                "                    lanes[m].yl[k] *= lo[m];\n",
+                "                }\n",
                 "            }\n",
-                "        }\n",
-                "        FOR_UNROLL (short row = 0; row < NR0; ++row) {\n",
-                "            Q::template partial_rows<M>(wd[row], lanes, sumf[row]);\n",
-                "        }\n"
+                "            FOR_UNROLL (short row = 0; row < NR0; ++row) {\n",
+                "                Q::template partial_rows<M>(wd[row], lanes, sumf[row]);\n",
+                "            }\n"
             ),
             1,
         )],

@@ -1687,6 +1687,14 @@ pub fn refusals(h: &Harness<'_>) -> Clause {
         Box::new(|b: &mut RefusalBufs, enc| next_launch(b, enc, QUANT, 2, cols, 2 * cols + 2, EPS)),
         |h, b| common::moved(h, &b.out, |v| v.to_bits() != SENTINEL_BITS),
     )?;
+    // Zeroed again, so a word that is not zero is the head-normed launch's
+    // write and not the plain launch's above.
+    bufs.y = device
+        .upload(
+            stream,
+            &padded(0.0f32, OUT_GUARD, &vec![0.0f32; 4 * rows], OUT_GUARD),
+        )
+        .map_err(why)?;
     common::accepted_writes(
         h,
         &mut bufs,

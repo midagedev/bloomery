@@ -112,7 +112,7 @@ constexpr short mrow_nr0() {
 // here is unrolled: the weight rows' reads are issued together before the
 // first is used, and no register array is indexed by a loop variable.
 template <typename Q, short M, bool NORM, bool RESID, bool ROW_RAISE = true,
-          bool SCALED = false>
+          bool SCALED = false, bool HEADNORM = false>
 inline void matvec_rows_m(device const typename Q::Block * W,
                           device const float      * x,
                           device float            * y,
@@ -124,9 +124,12 @@ inline void matvec_rows_m(device const typename Q::Block * W,
                           int first_row,
                           int rows,
                           uint out_stride,
-                          ushort tiisg) {
+                          ushort tiisg,
+                          threadgroup const float * scales = nullptr) {
     constexpr short NR0 = mrow_nr0();
     static_assert(!(NORM && SCALED), "a scaled input is normed once, by its join");
+    static_assert(!HEADNORM || (RESID && !NORM && !SCALED),
+                  "the head-normed rows add a plain load's dots into the residual");
     const int nb = nblocks;
     if (first_row >= rows) {
         return;
@@ -172,8 +175,27 @@ inline void matvec_rows_m(device const typename Q::Block * W,
             wd[row] = Q::words_of(rp[row][ib], lane);
         }
         Q::template load_rows<NORM ? LOAD_NORM : LOAD_PLAIN, M>(lanes, xp, row_span, gp, sum_sq);
-        FOR_UNROLL (short row = 0; row < NR0; ++row) {
-            Q::template partial_rows<M>(wd[row], lanes, sumf[row]);
+        if constexpr (HEADNORM) {
+            // A value a row's numerator cannot carry, or a group sum that
+            // left the finite range: the gate's site is raised, and the sums
+            // it is in are not finite either, so the rows are NaN.
+            FOR_UNROLL (short m = 0; m < M; ++m) {
+                if (!Q::sums_finite(lanes[m])) {
+                    raise(faults, layer, BLOOMERY_FAULT_SITE_LINEAR_GATE);
+                }
+            }
+            // The block's head scale of each row, the 1-row arm's own ask.
+            float lo[M];
+            FOR_UNROLL (short m = 0; m < M; ++m) {
+                lo[m] = Q::head_scales(scales + m * BLOOMERY_DELTA_VALUE_HEADS, ib).x;
+            }
+            FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                Q::template partial_head_rows<M>(wd[row], lanes, lo, sumf[row]);
+            }
+        } else {
+            FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                Q::template partial_rows<M>(wd[row], lanes, sumf[row]);
+            }
         }
         xp += Q::block_stride() * Q::values_per_block();
         if (NORM) {
@@ -300,9 +322,9 @@ kernel void head_logits_m_kernel(device const typename Q::Block *weights [[buffe
 // with the weights' read and their unpack the only thing the M rows share.
 // Each row's head scales are computed once per threadgroup into threadgroup
 // memory, SIMD group 0 running the 1-row kernel's loop over that row's
-// partial sums before the one barrier, and the row loop below scales each
-// block's finished contribution by its row's head scale, the 1-row
-// partial_head's own rule. The argument block is the family's MatvecMArgs:
+// partial sums before the one barrier (row m's at `m * heads`), and
+// matvec_rows_m's HEADNORM arm scales each block's finished contribution by
+// its row's head scale, the 1-row partial_head's own rule. The argument block is the family's MatvecMArgs:
 // the numerators' and the partials' row strides the kernel derives, a
 // numerator row the launch's columns and a partials row the heads' own
 // table.
@@ -321,88 +343,6 @@ kernel void head_logits_m_kernel(device const typename Q::Block *weights [[buffe
 // NaN in that row only; a value a row's numerator cannot carry, or a group
 // sum that left the finite range, raises the same site (Q::sums_finite, the
 // 1-row arm's own ask), and the other row's writes are its exact bits.
-template <typename Q, short M>
-inline void matvec_headnorm_rows_m(device const typename Q::Block * W,
-                                   device const float      * g,
-                                   device float            * y,
-                                   threadgroup const float * scales,
-                                   int nblocks,
-                                   uint layer,
-                                   device atomic_uint      * faults,
-                                   int first_row,
-                                   int rows,
-                                   uint out_stride,
-                                   ushort tiisg) {
-    constexpr short NR0 = mrow_nr0();
-    const int nb = nblocks;
-    if (first_row >= rows) {
-        return;
-    }
-    // Each row's blocks, the last row's for a row past the last: the 1-row
-    // loop's clamp.
-    device const typename Q::Block * rp[NR0];
-    FOR_UNROLL (short r = 0; r < NR0; ++r) {
-        rp[r] = W + (ulong)min(first_row + r, rows - 1) * (ulong)nb;
-    }
-
-    const typename Q::Lane lane = Q::lane_of(tiisg);
-    typename Q::Lane lanes[M];
-    FOR_UNROLL (short m = 0; m < M; ++m) {
-        lanes[m] = lane;
-    }
-    float sumf[NR0][M];
-    FOR_UNROLL (short r = 0; r < NR0; ++r) {
-        FOR_UNROLL (short m = 0; m < M; ++m) {
-            sumf[r][m] = 0.f;
-        }
-    }
-
-    // Activation row m's lane share of the numerator is row 0's, its row
-    // span on.
-    const long row_span = (long)nb * (long)Q::values_per_block();
-    device const float * gp = g + Q::first_block(lane) * Q::values_per_block();
-
-    for (int ib = Q::first_block(lane); ib < nb; ib += Q::block_stride()) {
-        typename Q::Words wd[NR0];
-        FOR_UNROLL (short row = 0; row < NR0; ++row) {
-            wd[row] = Q::words_of(rp[row][ib], lane);
-        }
-        Q::template load_rows<LOAD_PLAIN, M>(lanes, gp, row_span, nullptr, nullptr);
-        // A value a row's numerator cannot carry, or a group sum that left
-        // the finite range: the gate's site is raised, and the sums it is in
-        // are not finite either, so the rows are NaN.
-        FOR_UNROLL (short m = 0; m < M; ++m) {
-            if (!Q::sums_finite(lanes[m])) {
-                raise(faults, layer, BLOOMERY_FAULT_SITE_LINEAR_GATE);
-            }
-        }
-        // The block's head scale of each row, the 1-row arm's own ask.
-        float lo[M];
-        FOR_UNROLL (short m = 0; m < M; ++m) {
-            lo[m] = Q::head_scales(scales + m * BLOOMERY_DELTA_VALUE_HEADS, ib).x;
-        }
-        FOR_UNROLL (short row = 0; row < NR0; ++row) {
-            Q::template partial_head_rows<M>(wd[row], lanes, lo, sumf[row]);
-        }
-        gp += Q::block_stride() * Q::values_per_block();
-    }
-
-    FOR_UNROLL (short row = 0; row < NR0; ++row) {
-        if (first_row + row >= rows) {
-            break;
-        }
-        FOR_UNROLL (short m = 0; m < M; ++m) {
-            const float sum_all = simd_sum(sumf[row][m]);
-            if (tiisg == 0) {
-                y[(ulong)m * out_stride + (uint)(first_row + row)] += sum_all;
-            }
-        }
-    }
-}
-
-// The head-normed M-row entry: the scales of the M rows in threadgroup
-// memory, row m's at `m * heads`, SIMD group 0 filling them by the 1-row
-// kernel's loop before the one barrier.
 template <typename Q, short M>
 kernel void matvec_headnorm_m_kernel(device const typename Q::Block * W [[buffer(0)]],
                                      device const float      * g [[buffer(1)]],
@@ -441,9 +381,9 @@ kernel void matvec_headnorm_m_kernel(device const typename Q::Block * W [[buffer
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    matvec_headnorm_rows_m<Q, M>(W, g, y, scales, (int)args.nblocks, args.layer, faults,
-                                 simd_first_row(tgpig.x, sgitg), (int)args.rows, args.stride,
-                                 tiisg);
+    matvec_rows_m<Q, M, false, true, true, false, true>(
+        W, g, y, (int)args.nblocks, args.eps, args.layer, nullptr, faults,
+        simd_first_row(tgpig.x, sgitg), (int)args.rows, args.stride, tiisg, scales);
 }
 
 // The M-row gate-up pair: pair_slot's (experts.metal) walk with M activation
