@@ -1,0 +1,28 @@
+# Round sparkroom (kind profile): ws+Spark against ws alone when the workstation's host room is smaller than the model —
+# the configuration the Spark is for. The box's 256 GB holds V4.1-Flash Q3_K_M (324 GB) with the A6000's 48 GB; a
+# workstation with 190 GB of host room (BLOOMERY_HOST_ROOM=190G: 48 + 190 = 238 of the 324) cannot, and pages the
+# missing 86 GB of experts from NVMe each token (BLOOMERY_NVTIER_BYTES=90G), while the same box with the Spark holds them
+# on the node (BLOOMERY_CARD_BUDGET=90G, tier 94.65 GB: 48 + 190 + 95 = 333 >= 324).
+# [derived, rig-log tools/spark-model.py decode_bigger_quant with 92 GB past the box] ws alone: the missing share of
+# the routed experts read from NVMe at QD ~1-4 (2.5-5.7 GB/s), the hot half kept by residency: 7 tok/s at 50 % hot,
+# 4 at 0 %, 13 at 75 %. ws+Spark: the lock sitting's 37 tok/s(p50) (the node round trip 7 ms a step; the host set
+# is smaller than at plan a, so the host leg hides). The ratio is the number: 3..9 x.
+kind: profile
+question: with the host room capped at 190G so the model does not fit the workstation, how much faster is the same
+  workstation with the Spark holding the missing experts than alone paging them from NVMe?
+term: tok/s @ n=96, prose P 512, depth 512, A6000 stage; both arms BLOOMERY_HOST_ROOM=190G; the plain arm --place a
+  with BLOOMERY_NVTIER_BYTES=90G (the nvtier takes the rest) and BLOOMERY_R8=off (the NVMe tier refuses a paged plan under
+  the r8 sidecar by name: `GpuModel::nvme_tier`; the host leg then reads the source tiles, slower than the node arm's r8
+  path by a term under the paging), the node arm --place bp with the Spark tier over tcp (BLOOMERY_TIER_NODES,
+  BLOOMERY_TIER_LINK=tcp, BLOOMERY_CARD_BUDGET=90G, BLOOMERY_HOST_LOCK=1); batch prefill, residency unset
+unit: tok/s
+predict: 25..40
+condition: one binary (main after #1169), every arm's load its own process; the Spark's tier_server loop from the same
+  tree, caches dropped before the sitting, free >= 100 GB; the plain arm's plan line names its nvtier bytes (the room
+  is binding) or the arm is not the configuration; 4 rounds; rows marked [cold] stand with their mark
+decide-in: the node arm inside 25..40 and the plain arm under 13: the headline "a 192 GB workstation + Spark" with both
+  numbers and the ratio, conditions named; the prefill row (pp) beside it, read against the nodeprefill round
+decide-below: the node arm under 25: the smaller host room moved something else (host_slots, residency) — read the
+  lever records; the plain arm over 13: residency keeps more than 75 % hot, the model's hot share moves
+decide-above: the node arm over 40: the host leg at plan a was larger than modelled; write it and re-read the plan (a)
+  sitting's host wait
