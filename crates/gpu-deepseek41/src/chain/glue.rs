@@ -1851,7 +1851,7 @@ fn check_tokens(plan: &StepPlan, n_vocab: usize) -> Result<(), GpuError> {
 
 /// The engram hash and each site's row table, in site order, which a step's rows and a prompt's
 /// read ([`StepRows`], [`PromptRows`]).
-pub struct Tables {
+pub(crate) struct Tables {
     hash: Hash,
     sites: Box<dyn RowTables>,
 }

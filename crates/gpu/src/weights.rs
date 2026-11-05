@@ -261,7 +261,7 @@ pub fn part_format(t: &TensorInfo) -> Result<(CardFormat, usize), GpuError> {
 
 /// [`part_format`] in the card format `card` when given (a load's own choice for the tensor,
 /// such as a routed stack its plan holds as the file's blocks), else the type's.
-pub fn part_format_as(
+pub(crate) fn part_format_as(
     t: &TensorInfo,
     card: Option<CardFormat>,
 ) -> Result<(CardFormat, usize), GpuError> {

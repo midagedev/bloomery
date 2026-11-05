@@ -17,11 +17,11 @@ use model::arch::deepseek41::hparams::Hparams;
 use crate::hc::HC_STREAMS;
 
 /// The trunk's slot: the attention's and the MoE sub-layer's sums.
-pub const TRUNK: usize = 0;
+pub(crate) const TRUNK: usize = 0;
 
 /// Engram site `s`'s slot.
 #[must_use]
-pub const fn site(s: usize) -> usize {
+pub(crate) const fn site(s: usize) -> usize {
     1 + s
 }
 
