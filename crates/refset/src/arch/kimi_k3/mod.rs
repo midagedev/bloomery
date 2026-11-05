@@ -74,7 +74,7 @@ pub static LCPP: Family = Family {
     build: Some(Build::Is(LCPP_BUILD)),
     runs: Some(model),
     draft_runs: None,
-    consumers: &[],
+    consumers: &["gate-gpu-kimik3-e2e"],
 };
 
 /// The architecture's families, in the order `refset-check` lists them: the real file's, then the fixture's.

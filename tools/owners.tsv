@@ -58,3 +58,4 @@ model_host_ops	host	crates/model/src/ops.rs crates/model/src/ffn.rs crates/model
 fixture_writer	refset	crates/model/src/fixture/mod.rs crates/model/src/fixture/plan.rs crates/model/src/fixture/spec.rs crates/model/src/fixture/write.rs crates/model/src/fixture/budget.rs crates/model/src/fixture/fill.rs
 elem_kernels	kernel	crates/gpu/src/elem.rs
 device_seam	host	crates/device/src/*.rs crates/gpu/src/device.rs crates/metal/src/*.rs
+attn_res	kernel	crates/gpu/src/attn_res.rs

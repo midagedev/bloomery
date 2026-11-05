@@ -4465,3 +4465,16 @@ dump-ref-kimi-k3:
     BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=1200 BLOOMERY_MODEL=kimi-k3 ./tools/box.sh 'bash tools/ref/kimi-k3-dump.sh'
 
 # --- end kimik3-ref ---
+# --- kimik3-body ---
+
+# Kimi K3's decode step on one card (gate_kimi_k3_e2e's doc): the delta and gated latent layers, the dense and latent routed blocks,
+# the AttnRes mixes over the banked block inputs and the head, one prompt id a step, opened through GpuModel<Body> over the fixture file,
+# against mainline llama.cpp's node dumps of that file (refset family fx-lcpp-kimi-k3, `BLOOMERY_TIER=fixture just dump-ref-kimi-k3`):
+# on each of the four prompt sets the free chain's layer outputs, each layer's mixer and feed-forward block alone over the vendor's own
+# rows (the router's picks the vendor's), the teacher-forced argmax against the greedy ids and the last logits row; and with no vendor
+# the steps deterministic, the graph the eager chain, and the AttnRes mix kernel against a host f64 mix (rows = steps, refusals, fault word).
+# Fixture-only (tools/ref/fixture-only.sh): the real file's placement is not wired yet, so the real tier has no run.
+gate-gpu-kimik3-e2e:
+    BLOOMERY_MODEL=kimi-k3 ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-kimik3-e2e && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_kimi_k3_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_kimi_k3_e2e'
+
+# --- end kimik3-body ---
