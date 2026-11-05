@@ -11,8 +11,10 @@
 //! folder as downloaded, no `prepare`); `--hf REPO` fetches a repo into the
 //! cache and opens it (`bloomery_metal::model_arg`). `--ctx-size` and `-c`
 //! are `--ctx` under llama-server's spellings; unset, the cache holds the
-//! smaller of 32768 rows and the file's `context_length`. The file gives the
-//! vocabulary, `tokenizer.chat_template` the chat template
+//! smaller of 32768 rows and the file's `context_length`, cut to the largest
+//! cache whose session fits the device's free bytes (a line on stderr names
+//! the cut); an asked count that does not fit is refused by name. The file
+//! gives the vocabulary, `tokenizer.chat_template` the chat template
 //! (`--chat-template-file` replaces it) and the alias (`--alias` replaces
 //! it): `general.name`, else the folder's name, else the repo's, else the
 //! architecture's.
@@ -51,6 +53,7 @@ mod cli {
     use std::time::Instant;
 
     use bloomery_metal::MetalDevice;
+    use bloomery_metal::arch::qwen3moe::plan;
     use bloomery_metal::arch::qwen3moe::session::{CHECKPOINT_EVERY, MarkCopies, Session};
     use bloomery_metal::model_arg;
     use hf::source::Source;
@@ -69,7 +72,8 @@ mod cli {
 bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--chat-template-file PATH]
                      [--alias NAME] [--queue-depth Q] [--api-key KEY] [--api-key-file F]
   PATH is a GGUF file (its first shard) or a checkpoint folder; REPO is fetched into the cache
-  --ctx (--ctx-size, -c) defaults to the smaller of 32768 and the file's context_length";
+  --ctx (--ctx-size, -c) defaults to the smaller of 32768 and the file's context_length,
+  cut to the largest that fits the device's free bytes";
 
     /// The model's path flags; `--hf` is the repo's.
     const PATH_FLAGS: &[&str] = &["-m", "--model"];
@@ -162,17 +166,11 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
         let ctx = match a.ctx {
             Some(c) => c,
             None => {
-                let train = split
-                    .arch_get_u64("context_length")
-                    .and_then(|v| usize::try_from(v).ok())
-                    .ok_or_else(|| {
-                        format!(
-                            "{}: {} is absent or not a count",
-                            path.display(),
-                            split.arch_key("context_length")
-                        )
-                    })?;
-                CTX_DEFAULT.min(train)
+                let unasked = plan::unasked_ctx(split, CTX_DEFAULT, path)?;
+                if let Some(note) = unasked.note() {
+                    eprintln!("bloomery-serve-metal: {note}");
+                }
+                unasked.ctx
             }
         };
         let arch = split

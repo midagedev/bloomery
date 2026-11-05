@@ -953,7 +953,7 @@ impl Session {
                 kernels.prepare_prefill()?;
                 Ok::<_, SessionError>((kernels, started.elapsed()))
             });
-            let loaded = Self::open_load(device, library, file, ctx, copies);
+            let loaded = Self::open_load(device, library, file, ctx, every, copies);
             let built = pipelines
                 .join()
                 .unwrap_or_else(|p| std::panic::resume_unwind(p));
@@ -1021,16 +1021,18 @@ impl Session {
     }
 
     /// The load half of [`Session::open_model_as`], run beside the pipeline
-    /// build: the plan's checks and the room rule, the stream and its
-    /// residency set, the arena, the rows arena (and the mark copies' when
-    /// `copies` asks at open), and the set's commit. The arena is sized at the
-    /// geometry the file was judged at and the launches at the library's: one
-    /// instance, or the open is refused before any buffer is made.
+    /// build: the plan's checks and the room rule (the checkpoints priced
+    /// every `every` positions), the stream and its residency set, the arena,
+    /// the rows arena (and the mark copies' when `copies` asks at open), and
+    /// the set's commit. The arena is sized at the geometry the file was
+    /// judged at and the launches at the library's: one instance, or the open
+    /// is refused before any buffer is made.
     fn open_load(
         device: &MetalDevice,
         library: &Library,
         file: &ModelFile,
         ctx: usize,
+        every: u32,
         copies: MarkCopies,
     ) -> Result<Loaded, SessionError> {
         let started = Instant::now();
@@ -1048,10 +1050,10 @@ impl Session {
             )));
         }
         // The room rule, the one `--plan` prints as an item, before any
-        // buffer is made: the load's bytes held to the device's free bytes,
-        // the census's reading.
+        // buffer is made: the session's bytes, the copies it makes later
+        // among them, held to the device's free bytes, the census's reading.
         let free = device.info()?.free_bytes;
-        check::room(file.header(), &checked, free)?;
+        check::room(file.header(), &checked, every, free)?;
         let mut stream = device.new_stream()?;
         stream.enable_residency(device.metal())?;
         let residency = stream

@@ -186,6 +186,59 @@ pub struct DeviceRoom {
     pub free: u64,
 }
 
+/// The cache rows of an open that asked for none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Unasked {
+    /// The rows the open takes.
+    pub ctx: usize,
+    /// The default the binary names, at most the file's `context_length`:
+    /// `ctx` unless the device's room cut it.
+    pub default: usize,
+    /// The device's free bytes the cut was judged at; none when the census
+    /// could not be read, and the open reads it again.
+    pub free: Option<u64>,
+}
+
+impl Unasked {
+    /// The line a binary prints when the room cut the default, naming both
+    /// counts and the room: none when the default stands.
+    #[must_use]
+    pub fn note(&self) -> Option<String> {
+        let free = self.free?;
+        (self.ctx < self.default).then(|| {
+            format!(
+                "--ctx unset: a cache of {} rows, the largest whose session fits the device's \
+                 free bytes ({free}); the default is {} rows",
+                self.ctx, self.default
+            )
+        })
+    }
+}
+
+/// The cache rows of an open of `model` that asked for none: the smaller of
+/// `cap` and the file's `context_length`, cut to the largest cache whose
+/// session fits the device's free bytes when that default's does not
+/// ([`super::check::unasked_ctx`]). A file with no `context_length` count is
+/// refused by name.
+pub fn unasked_ctx(split: &Split, cap: usize, model: &Path) -> Result<Unasked, String> {
+    let train = split
+        .arch_get_u64("context_length")
+        .and_then(|v| usize::try_from(v).ok())
+        .ok_or_else(|| {
+            format!(
+                "{}: {} is absent or not a count",
+                model.display(),
+                split.arch_key("context_length")
+            )
+        })?;
+    let default = cap.min(train);
+    let free = device_room().ok().map(|d| d.free);
+    let ctx = free.map_or(default, |free| {
+        super::check::unasked_ctx(split, default, free)
+    });
+    Ok(Unasked { ctx, default, free })
+}
+
 /// The default device's room, or the reason there is none.
 pub fn device_room() -> Result<DeviceRoom, String> {
     let default = MTLCreateSystemDefaultDevice()
@@ -402,6 +455,7 @@ pub fn render(
 
 fn bytes_lines(b: &Bytes, device: &Result<DeviceRoom, String>) -> Vec<String> {
     let total = b.total();
+    let held = b.held();
     let mut lines = vec![
         format!("plan: bytes weights {}", tally(&b.weights)),
         format!("plan: bytes kv {}", tally(&b.kv)),
@@ -414,9 +468,19 @@ fn bytes_lines(b: &Bytes, device: &Result<DeviceRoom, String>) -> Vec<String> {
              between)",
             tally(&total)
         ),
+        format!(
+            "plan: bytes copies {} (made after the open: a pass's mark copies and the \
+             checkpoints the budget grants)",
+            tally(&b.copies)
+        ),
+        format!(
+            "plan: bytes held {} (total and copies: the bytes the room rule holds to the \
+             device's free bytes)",
+            tally(&held)
+        ),
     ];
     if let Ok(d) = device {
-        let over = i128::from(total.paged) - i128::from(d.recommended);
+        let over = i128::from(held.paged) - i128::from(d.recommended);
         lines.push(format!(
             "plan: room paged_minus_recommended_bytes={over} (negative: the upper bound is under \
              the device's working set; the census's rule is the open's, not this line)"
