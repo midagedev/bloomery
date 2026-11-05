@@ -2085,7 +2085,7 @@ impl Session<'_> {
         if !(1..=TIER_ACT_MAX_COLS).contains(&cap) {
             return Err(refused(format!("{cap} columns, 1 to {TIER_ACT_MAX_COLS}")).into());
         }
-        block::check_frames(cap, s, n, (q3 * 8, d8 * 4)).map_err(&refused)?;
+        block::check_frames(cap, s, n, (q3 * 8, d8 * 4)).map_err(refused)?;
         let g = o.work.gpu();
         g.context().bind_to_thread().map_err(GpuError::from)?;
         let staging = BlockStaging::new(g.stream(), cap, n, s)
