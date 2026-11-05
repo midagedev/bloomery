@@ -884,7 +884,7 @@ fn reads(ids: &[u64], per: &[u64]) -> (f64, f64) {
 /// where the down is (2). Every expert is served by one home: the cards hold dense bytes and
 /// their share, the host a layer's worth beside its RAM arena, the NVMe tier the rest; the cards
 /// hold the front only across both (one A6000 refuses it) and at the cut the sweep picks. The
-/// file is refused by the engine until a body runs it, with every coverage row listed.
+/// file is refused by the coverage check for the template's tool-call parser alone.
 /// Mutants (`.mutants/kimik3place-*.patch`): the KDA state's bytes halved, the latent row's
 /// unrotated values left out.
 #[test]
@@ -1038,9 +1038,9 @@ fn kimi_k3_places_on_the_box() {
         }
     }
 
-    // The engine's refusal, row by row: the features no program runs, each with the layers that
-    // need it. These counts go red when a body's program covers the architecture; that change
-    // re-pins them.
+    // The engine's refusal, row by row: what the body leaves to the coverage check is the template's
+    // tool-call parser, the chat surface's. These counts go red when a coverage row loses its
+    // program or a feature joins the description; that change re-pins them.
     let missing = inputs.unimplemented();
     let mut rows: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     for item in &missing {
@@ -1050,26 +1050,7 @@ fn kimi_k3_places_on_the_box() {
     for (feature, n) in &rows {
         println!("  {n:>3} x {feature}");
     }
-    let want: [(&str, usize); 6] = [
-        ("a layer program for kimi-k3", 1),
-        ("a tool-call parser for this template", 1),
-        (
-            "cross-layer residual attention: every 12th layer banks its input, each sublayer and the head read the softmax mix of the banks and the running sum",
-            layers,
-        ),
-        (
-            "delta rule KDA with a full-width output gate: d 128, 96 heads, conv 4, sigmoid gate bounded below by -5",
-            layers - mla,
-        ),
-        (
-            "router: sigmoid, 896 experts, top 16, with a selection bias",
-            layers - 1,
-        ),
-        (
-            "the routed experts' weighted sum normed by ffn_routed_norm before the up projection",
-            layers - 1,
-        ),
-    ];
+    let want: [(&str, usize); 1] = [("a tool-call parser for this template", 1)];
     let got: Vec<(&str, usize)> = rows.iter().map(|(f, &n)| (f.as_str(), n)).collect();
     if got != want {
         bad.push(format!("the coverage rows are {got:?}"));
@@ -1077,6 +1058,9 @@ fn kimi_k3_places_on_the_box() {
     match PlanInputs::read(&split) {
         Err(placement::PlacementError::Unimplemented(items)) if items == missing => {}
         other => bad.push(format!("read: {other:?}, not the coverage refusal")),
+    }
+    if let Err(e) = PlanInputs::read_without_chat(&split) {
+        bad.push(format!("read_without_chat: {e}"));
     }
     assert!(
         bad.is_empty(),

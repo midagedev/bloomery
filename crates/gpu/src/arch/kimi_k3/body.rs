@@ -58,6 +58,7 @@ pub(super) mod rows;
 
 const WHAT: &str = "kimi_k3::Body::load";
 const STEP: &str = "kimi_k3::Body::enqueue_chain";
+const OPEN: &str = "kimi_k3 GpuModel::open";
 
 /// The types the dense layer's projections have in the released set.
 const DENSE_TYPES: &[SiteTy] = &[SiteTy::Q6K];
@@ -518,8 +519,24 @@ impl GpuModel<Body> {
     /// The whole model of `file` resident on `gpu`, plus the output head: every tensor in its
     /// kernels' device format, the latent layers' caches of `ctx` rows and the delta layers' stores
     /// of one lane. The model takes the file and closes it once the weights are resident.
+    ///
+    /// A file whose tensors exceed the card's free bytes is refused by name before any tensor is
+    /// read: the released file does not fit one card, and its placement over two stage cards, the
+    /// host tier and the NVMe tier has no loader.
     pub fn open(gpu: Gpu, file: Split, ctx: usize) -> Result<GpuModel<Body>, GpuError> {
-        let n_layers = block_count(&file, "kimi_k3 GpuModel::open")?;
+        let n_layers = block_count(&file, OPEN)?;
+        let (free, total) = gpu.mem_info()?;
+        let bytes: u64 = file.iter_tensors().map(|(_, t)| t.nbytes).sum();
+        if usize::try_from(bytes).map_or(true, |b| b > free) {
+            return Err(GpuError::shape(
+                OPEN,
+                format!(
+                    "the file's tensors are {bytes} B and the card has {free} of {total} B free: \
+                     the body holds the whole model on one card, and no loader places it over \
+                     two stage cards, the host tier and the NVMe tier"
+                ),
+            ));
+        }
         GpuModel::load_blocks(gpu, &file, ctx, 0..n_layers, true, |gpu, w| {
             let hp = Hparams::read(&file).map_err(|e| GpuError::plan(WHAT, e))?;
             for l in (0..hp.n_layer).filter(|&l| hp.kind(l) == Kind::Kda) {

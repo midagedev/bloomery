@@ -10,17 +10,77 @@
 //! running sum. The file's tokenizer is `kimi-k2`'s.
 
 use gguf::Split;
+use models::shape::RouterBody;
 use models::{
-    Arch, ChatSpec, DeltaKind, DeltaRule, Ffn, LayerSpec, Mixer, ModelSpec, Moe, Residual,
+    Arch, ChatSpec, DeltaKind, DeltaRule, Ffn, KdaGate, LayerSpec, Mixer, ModelSpec, Moe, Need,
+    Residual,
 };
 
 use super::hparams::{Hparams, Kind};
 use super::roles;
+use crate::arch::coverage::{self, Available, Program};
 use crate::arch::{Read, chat_of, spec_u32};
 use crate::placement::PlacementError;
 
 /// The pre-tokenizer the file names: Kimi K2's, which K3 keeps.
 pub const PRE: &str = "kimi-k2";
+
+/// The `(experts, kept)` pairs the body's router is built for: the file's 896 with the top 16 and
+/// the fixture's 8 with the top 2 (`gpu/src/arch/kimi_k3/moe.rs` `INSTANCES`).
+const ROUTERS: &[(u32, u32)] = &[(896, 16), (8, 2)];
+
+/// What the Kimi K3 body runs that no other program's row ([`coverage::AVAILABLE`]) lists for it:
+/// one row per kernel instance or program step, citing the constant or the function that owns it.
+/// The rows it shares with Raon-1 (the gated latent layer, the `situ` blocks, the shared stack) are
+/// the common table's.
+pub const AVAILABLE: &[Available] = &[
+    Available {
+        programs: &[Program::KimiK3Body],
+        at: "gpu/src/arch/kimi_k3/kda.rs (the common KDA mixer, linear/mixer_kda.rs, with the \
+             full-width output gate `ssm_g`: HEAD, CONV_TAPS, the bounded sigmoid decay)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::DeltaRule {
+                    kind: DeltaKind::KdaFullGate {
+                        gate: KdaGate::Sigmoid { lower_bound },
+                    },
+                    k_heads,
+                    v_heads,
+                    d: 128,
+                    conv: 4,
+                } if k_heads == v_heads && *k_heads > 0 && *lower_bound < 0.0
+            )
+        },
+    },
+    Available {
+        programs: &[Program::KimiK3Body],
+        at: "gpu/src/attn_res.rs (the `attn_res_mix` kernel over at most MAX_VECS vectors; the \
+             body's banks and scores, gpu/src/arch/kimi_k3/body.rs)",
+        runs: |n| matches!(n, Need::AttnRes { block } if *block > 0),
+    },
+    Available {
+        programs: &[Program::KimiK3Body],
+        at: "gpu/src/arch/kimi_k3/moe.rs routed_of (the latent pair `ffn_routed_down`, `ffn_routed_up` \
+             around the experts; MoeDims::check holds the latent to whole super-blocks of 256)",
+        runs: |n| matches!(n, Need::LatentExperts { latent } if latent.is_multiple_of(256)),
+    },
+    Available {
+        programs: &[Program::KimiK3Body],
+        at: "gpu/src/arch/kimi_k3/moe.rs routed_of (the sum's gain `ffn_routed_norm`, the card's \
+             RMS norm before the latent up)",
+        runs: |n| matches!(n, Need::SumNorm),
+    },
+    Available {
+        programs: &[Program::KimiK3Body],
+        at: "models/src/shape.rs ROUTERS, the BiasedSigmoid body at the body's own (experts, \
+             kept) pairs (gpu/src/route_body.rs sigmoid_896_16 and sigmoid_8_2)",
+        runs: |n| {
+            matches!(n, Need::Router(s) if ROUTERS.contains(&(s.experts, s.top_k)))
+                && coverage::routes(n, &[RouterBody::BiasedSigmoid])
+        },
+    },
+];
 
 /// `split`'s description and roles, and the defaults the key read took.
 pub fn read(split: &Split) -> Result<Read, PlacementError> {

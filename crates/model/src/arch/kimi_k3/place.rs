@@ -2,17 +2,18 @@
 //! this family's reading. What each layer holds is read off the description (a KDA layer's state
 //! and conv ring, a latent layer's plane of cached rows), the routed experts' bytes are the
 //! file's by their stacks' types, and a machine that hangs an expert tier card is refused by name
-//! ([`PlaceError::Tier`]) until a body serves one. No body runs the architecture yet, so
-//! [`PlanInputs::read`] refuses the file with every feature the coverage check lists
-//! ([`PlacementError::Unimplemented`]) and [`PlanInputs::plan`] with the same list: a plan of K3
-//! is never made as if a program ran it.
+//! ([`PlaceError::Tier`]) until a body serves one. The body runs every layer of the description
+//! ([`Program::KimiK3Body`]); what is left to the coverage check is the template's tool-call
+//! parser, the chat surface's, so [`PlanInputs::read`] refuses that one item and a driver that
+//! feeds ids and renders no chat reads the file by [`PlanInputs::read_without_chat`].
 
 use gguf::Split;
+use models::Need;
 
 use super::hparams::Hparams;
 use super::spec;
 use crate::arch::place_hybrid;
-use crate::placement::PlacementError;
+use crate::placement::{PlacementError, Unimplemented};
 
 pub use place_hybrid::{KvLayout, PlaceError};
 
@@ -24,9 +25,27 @@ const ENGINE: &str = "Kimi K3";
 
 impl PlanInputs {
     /// [`PlanInputs::describe`], then the file refused with every feature the engine does not run
-    /// ([`PlacementError::Unimplemented`]).
+    /// ([`PlacementError::Unimplemented`]): the template's tool-call parser.
     pub fn read(split: &Split) -> Result<PlanInputs, PlacementError> {
         PlanInputs::describe(split)?.runnable()
+    }
+
+    /// [`PlanInputs::read`] for a driver that renders no chat: the file refused with every feature
+    /// the engine does not run but the tool-call parser of its template, which only a request with
+    /// tools reads.
+    pub fn read_without_chat(split: &Split) -> Result<PlanInputs, PlacementError> {
+        let inputs = PlanInputs::describe(split)?;
+        let parser = Need::ToolParser.to_string();
+        let missing: Vec<Unimplemented> = inputs
+            .unimplemented()
+            .into_iter()
+            .filter(|item| item.feature != parser)
+            .collect();
+        if missing.is_empty() {
+            Ok(inputs)
+        } else {
+            Err(PlacementError::Unimplemented(missing))
+        }
     }
 
     /// The file as it is, for a gate that describes it whatever the coverage list holds, and the
@@ -42,6 +61,7 @@ impl PlanInputs {
 #[cfg(test)]
 mod tests {
     use gguf::Split;
+    use models::Need;
 
     use super::super::hparams::tests::{keys, tensors, typed};
     use super::{PlaceError, PlanInputs};
@@ -122,26 +142,49 @@ mod tests {
         assert_eq!(expert(3), 42_496);
     }
 
-    /// The file is described and the engine refuses to run it: [`PlanInputs::read`] and
-    /// [`PlanInputs::plan`] each name every feature the coverage check lists, the same list; a
-    /// context of no position is refused by its own name. The refusal lists go red when a body's
-    /// program covers the architecture: that change re-pins them.
+    /// The coverage check lists what the body is not built for. The released file's list is the
+    /// template's tool-call parser alone (`kimi_k3_places_on_the_box`); the small header's router
+    /// of 4 experts is no instance of the body's (896 and 8), so it lists that router at each
+    /// routed layer beside the parser. [`PlanInputs::read`] refuses with the whole list, [`PlanInputs::plan`]
+    /// makes the plan whatever the list holds, [`PlanInputs::read_without_chat`] leaves the
+    /// parser out of the refusal, and a context of no position is refused by its own name.
+    /// Mutant: `Program::KimiK3Body` left out of a coverage row's list lists that row's layers.
     #[test]
-    fn the_described_file_is_refused_until_a_body_runs_it() {
+    fn the_coverage_list_is_what_the_body_is_not_built_for() {
         let inputs = described("kimi-k3-place-refused");
-        let want = inputs.unimplemented();
-        assert!(!want.is_empty(), "no body runs Kimi K3 yet");
+        let parser = Need::ToolParser.to_string();
+        let items = inputs.unimplemented();
+        assert!(
+            items
+                .iter()
+                .any(|i| i.layer.is_none() && i.feature == parser)
+        );
+        let shapes: Vec<&str> = items
+            .iter()
+            .filter(|i| i.feature != parser)
+            .map(|i| i.feature.as_str())
+            .collect();
+        assert_eq!(shapes.len(), 3, "{shapes:?}: the router of layers 1 to 3");
+        assert!(
+            shapes
+                .iter()
+                .all(|f| f.starts_with("router: sigmoid, 4 experts, top 2"))
+        );
         match PlanInputs::read(&opened("kimi-k3-place-read", &[])) {
-            Err(PlacementError::Unimplemented(items)) => assert_eq!(items, want),
+            Err(PlacementError::Unimplemented(got)) => assert_eq!(got, items),
             other => panic!("{other:?}, not the coverage refusal"),
+        }
+        match PlanInputs::read_without_chat(&opened("kimi-k3-place-chatless", &[])) {
+            Err(PlacementError::Unimplemented(got)) => {
+                assert_eq!(got.len(), items.len() - 1);
+                assert!(got.iter().all(|i| i.feature != parser));
+            }
+            other => panic!("{other:?}, not the refusal without the parser"),
         }
         let machine = workstation::plan_gate(4);
-        match inputs.plan(&machine, 64, &PlanLevers::default()) {
-            Err(PlaceError::Placement(PlacementError::Unimplemented(items))) => {
-                assert_eq!(items, want);
-            }
-            other => panic!("{other:?}, not the coverage refusal"),
-        }
+        inputs
+            .plan(&machine, 64, &PlanLevers::default())
+            .expect("the gate machine plans the small file");
         assert!(matches!(
             inputs.plan(&machine, 0, &PlanLevers::default()),
             Err(PlaceError::CtxZero)
