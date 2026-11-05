@@ -1,0 +1,21 @@
+# Round prefillcut (kind profile): the decode after a cut prompt with the stream floor per rows. The decode A/B
+# (prefillcut-decode, n 512) read the 256 arm's last10 step 20.4 ms against 19.4-19.8 and p50 41 against 46: a steady
+# cost. The map (residency-pass-map): the residency's admission floor was STREAM_FLOOR x members = 64 for a group of two
+# 256-row batches, where each expert's per-batch count is half a 512-row batch's, so the pick admitted ~a quarter of
+# the set (stage_us 0.3 s against 2.2 s). The floor is now per T_MAX rows the group holds (32 at 2 x 256, as at 1 x 512).
+# [derived] the admitted set is then the one-pass call's, and the decode after the cut prompt reads the one-pass arm's
+# warm step within the ruler (2 rounds, +-1.4 %); pp stays ~280 (the floor does not touch the prompt's own time).
+kind: profile
+question: with the floor per rows, does the decode after a 256-cut prompt match the one-pass arm's warm step, and does
+  pp keep its 280?
+term: last10_p50 step ms @ n=512, prose P 512, depth 512, plan (a), A6000, BLOOMERY_PREFILL_CUT=256 against 512
+unit: ms
+predict: 18.8..20.0
+condition: one binary (the prefillcut worktree's commit with the floor change), BLOOMERY_DECODE_N=512, 2 rounds, each
+  arm's load its own process printing `cut=`; the 256 arm's residency pass=prompt record's stage_us within 2x of the
+  512 arm's; rows marked [cold] or [cpu-busy] stand with their mark
+decide-in: the cut costs decode nothing: land the lever (opt-in, default 512) with the pp headline and both arms' decode
+  beside it; the default moves after the gate tier proves the cut on every family that shares the walk
+decide-below: under 18.8: re-read the ruler
+decide-above: over 20.0: the admitted set still differs (read kept/landed/churn of both arms' residency records); the
+  lever stays opt-in and the residency pick under a cut is a triage item
