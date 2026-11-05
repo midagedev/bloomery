@@ -11,8 +11,10 @@
 
 use gguf::{GENERAL_ARCHITECTURE, GgmlType, Split, Value};
 use model::arch::kimi_k3::fixture as k3;
+use model::arch::kimi_k3::place::PlanInputs;
 use model::fixture::{FilePlan, FixtureSpec};
-use model::placement::Role;
+use model::placement::workstation::{self, HostRead};
+use model::placement::{self, CardFormat, Device, KvBytes, PlanLevers, Role, RoutedRule};
 use models::{Act, DeltaKind, Ffn, KdaGate, LatentUp, Mixer, Moe, OutGate, Residual, Router};
 use models::{RouterNorm, Score, Shared};
 
@@ -741,4 +743,345 @@ fn another_architecture_is_not_kimi_k3() {
             }
         }
     }
+}
+
+/// The serving context the plans below are made at, and the host rooms the box's plans are made
+/// at: a load with half and with most of the 256 GB.
+const CTX: u64 = 32_768;
+const ROOMS: [u64; 2] = [128 << 30, 220 << 30];
+
+/// What the common card-format rule makes of a K3 file on the box's two stage cards cut at `cut`,
+/// at host room `room`, by home: no body runs the architecture, so this is the placement's own
+/// rule ([`RoutedRule::PerType`] of [`CardFormat::of_routed`]) on the expert stacks' types, not a
+/// program's plan.
+#[derive(Debug, PartialEq, Eq)]
+struct Homes {
+    /// The two cards' resident bytes but the routed experts, their allocator rounding, and their
+    /// caches at [`CTX`].
+    dense: u64,
+    rounding: u64,
+    kv: u64,
+    /// Per layer: the experts each home serves.
+    card: Vec<u64>,
+    host: Vec<u64>,
+    nvme: Vec<u64>,
+    /// The bytes of each home's experts, and the host's RAM arena and row-gathered table.
+    card_bytes: u64,
+    host_bytes: u64,
+    nvme_bytes: u64,
+    arena: u64,
+    table: u64,
+}
+
+/// The expert bytes of one expert of each layer (its three stacks), 0 for a layer with none.
+fn expert_bytes(inputs: &PlanInputs) -> Vec<u64> {
+    let mut per = vec![0; inputs.model.layers];
+    for t in &inputs.model.tensors {
+        if t.role == Role::RoutedExperts {
+            per[t.layer.expect("a routed stack has its layer")] += t.file_bytes / t.dims[2];
+        }
+    }
+    per
+}
+
+/// `inputs` planned on the box's cards cut at `cut` ([`workstation::plan_b`] moved to this cut,
+/// the token embedding on the host) at host room `room`, the NVMe expert tier split at that room,
+/// refused with the plan's own words when it does not plan or breaks its invariants.
+fn homes(inputs: &PlanInputs, cut: usize, room: u64) -> Result<Homes, String> {
+    let layers = inputs.model.layers;
+    let mut machine = workstation::plan_b(layers);
+    machine.cards[0].layers = 0..cut;
+    machine.cards[1].layers = cut..layers;
+    let kv = inputs.seq_terms().slots_of(1);
+    let routed = RoutedRule::PerType(CardFormat::of_routed);
+    let mut plan = placement::plan_routed_reserving(
+        &inputs.model,
+        &machine,
+        CTX,
+        &kv,
+        &PlanLevers::default(),
+        routed,
+        0,
+    )
+    .map_err(|e| e.to_string())?;
+    let at = plan.plan_at(&(room, HostRead::Given));
+    placement::expert_nvme_tier(&mut plan, at, None).map_err(|e| e.to_string())?;
+    let bad = plan.violations();
+    if !bad.is_empty() {
+        return Err(placement::joined(&bad));
+    }
+    let mut homes = Homes {
+        dense: plan.cards.iter().map(|c| c.dense_bytes).sum(),
+        rounding: plan.cards.iter().map(|c| c.rounding_bytes).sum(),
+        kv: plan.cards.iter().map(|c| c.kv_bytes).sum(),
+        card: vec![0; layers],
+        host: vec![0; layers],
+        nvme: vec![0; layers],
+        card_bytes: plan.cards.iter().map(|c| c.expert_bytes).sum(),
+        host_bytes: plan.host.expert_bytes,
+        nvme_bytes: plan.host.nvme_expert_bytes,
+        arena: plan.host.nvme_arena_bytes,
+        table: plan.host.table_bytes,
+    };
+    for (t, row) in inputs.model.tensors.iter().zip(&plan.rows) {
+        if t.role != Role::RoutedExperts || !t.name.contains("ffn_gate_exps") {
+            continue;
+        }
+        let l = t.layer.expect("a routed stack has its layer");
+        for s in &row.segments {
+            let n = s.experts.as_ref().map_or(0, |e| e.len());
+            match s.device {
+                Device::Card(_) => homes.card[l] += n,
+                Device::Host => homes.host[l] += n,
+                Device::Nvme => homes.nvme[l] += n,
+                other @ Device::Unused => panic!("layer {l}: a routed stack on {other:?}"),
+            }
+        }
+    }
+    Ok(homes)
+}
+
+/// Every cut of the two stage cards that plans `inputs` (the A6000 runs layers `0..cut`, the 3090
+/// the rest and the head), with the experts the two cards hold at the larger host room.
+fn sweep(inputs: &PlanInputs) -> Vec<(usize, u64)> {
+    (1..inputs.model.layers)
+        .filter_map(|cut| {
+            homes(inputs, cut, ROOMS[1])
+                .ok()
+                .map(|h| (cut, h.card.iter().sum()))
+        })
+        .collect()
+}
+
+/// The lowest cut that holds the most experts on the two cards, and how many.
+fn best_cut(sweep: &[(usize, u64)]) -> (usize, u64) {
+    let best = sweep.iter().map(|&(_, n)| n).max().expect("a cut plans");
+    let cut = sweep
+        .iter()
+        .find(|&&(_, n)| n == best)
+        .expect("one holds it");
+    (cut.0, best)
+}
+
+/// Experts a token reads from each home under uniform routing, in picks and in bytes: `ids[l]`
+/// of a layer's 896, 16 picks a layer, each of the layer's expert bytes.
+fn reads(ids: &[u64], per: &[u64]) -> (f64, f64) {
+    let share = |l: usize| 16.0 * ids[l] as f64 / 896.0;
+    (
+        (0..ids.len()).map(share).sum(),
+        (0..ids.len()).map(|l| share(l) * per[l] as f64).sum(),
+    )
+}
+
+/// The K3 plan's inputs on the real header and what the box's two cards, its host and its NVMe
+/// tier hold of the file. The layers' stores are the dims': a KDA layer 96 heads of 128 x 128 f32
+/// (6,291,456 B), 11 ring rows of the q, k and v channels, 3 x 96 x 128 f32 (1,622,016 B) and a
+/// u32 stamp = 7,913,476 B whatever the context, a latent layer 576 f16 values (1,152 B) a
+/// position. The file is 594,033,825,152 B [derived from the tensor table, apart from the reader]:
+/// 48,684,127,616 B of everything but the routed stacks (the card's dense and glue, the token
+/// embedding's 963,379,200 B among them) and 545,349,697,536 B of experts, 6,451,200 B an expert
+/// at IQ1_S in 80 layers, 7,827,456 B where the gate and up are IQ2_XXS (10 layers), 7,139,328 B
+/// where the down is (2). Every expert is served by one home: the cards hold dense bytes and
+/// their share, the host a layer's worth beside its RAM arena, the NVMe tier the rest; the cards
+/// hold the front only across both (one A6000 refuses it) and at the cut the sweep picks. The
+/// file is refused by the engine until a body runs it, with every coverage row listed.
+/// Mutants (`.mutants/kimik3place-*.patch`): the KDA state's bytes halved, the latent row's
+/// unrotated values left out.
+#[test]
+fn kimi_k3_places_on_the_box() {
+    let split = header();
+    let inputs = PlanInputs::describe(&split).unwrap_or_else(|e| panic!("describe: {e}"));
+    let per = expert_bytes(&inputs);
+    let layers = inputs.model.layers;
+    let mut bad = Vec::new();
+
+    // The stores of the real dims.
+    let mla = (0..layers).filter(|&l| latent(l)).count();
+    for l in 0..layers {
+        let want = if latent(l) { 1_152 * CTX } else { 7_913_476 };
+        let got = inputs.kv.layer_bytes(l, CTX);
+        if got != want {
+            bad.push(format!("layer {l} holds {got} B at {CTX}, wanted {want}"));
+        }
+    }
+    let kv_total = inputs.kv.bytes(0..layers, CTX);
+    if kv_total != (layers - mla) as u64 * 7_913_476 + mla as u64 * 1_152 * CTX {
+        bad.push(format!("the stores at {CTX} hold {kv_total} B"));
+    }
+
+    // The file's bytes, by the routed stacks' types and apart from them.
+    let routed: u64 = per.iter().sum::<u64>() * 896;
+    let front: u64 = inputs
+        .model
+        .tensors
+        .iter()
+        .filter(|t| t.role != Role::RoutedExperts)
+        .map(|t| t.file_bytes)
+        .sum();
+    let embedding = 963_379_200;
+    if (front, routed) != (48_684_127_616, 545_349_697_536) {
+        bad.push(format!("front {front} B, routed {routed} B"));
+    }
+    for (l, &p) in per.iter().enumerate().skip(1) {
+        let want = if MIX_GATE_UP_XXS.contains(&l) {
+            7_827_456
+        } else if MIX_DOWN_XXS.contains(&l) {
+            7_139_328
+        } else {
+            6_451_200
+        };
+        if p != want {
+            bad.push(format!("layer {l}: an expert is {p} B, wanted {want}"));
+        }
+    }
+
+    // One A6000 refuses the front, and so does any cut at or below the V4.1 cut; the sweep's best
+    // cut plans.
+    let one = workstation::plan_a(layers);
+    let kv = inputs.seq_terms().slots_of(1);
+    let alone = placement::plan_routed_reserving(
+        &inputs.model,
+        &one,
+        CTX,
+        &kv,
+        &PlanLevers::default(),
+        RoutedRule::PerType(CardFormat::of_routed),
+        0,
+    )
+    .expect("a plan builds");
+    if alone.violations().is_empty() {
+        bad.push("one A6000 holds the front".to_string());
+    }
+    let sweep = sweep(&inputs);
+    let (cut, best) = best_cut(&sweep);
+    println!("kimi-k3 cuts that plan, with the experts the two cards hold: {sweep:?}");
+    if sweep.first().map(|&(c, _)| c) <= Some(workstation::CUT) {
+        bad.push(format!(
+            "a cut at or below the V4.1 cut {} plans",
+            workstation::CUT
+        ));
+    }
+
+    // The homes at each room.
+    println!(
+        "kimi-k3 box: A6000 0..{cut} (the lowest cut holding the most experts, {best}) + 3090 {cut}..{layers}, ctx {CTX}, token embedding on the host, \
+         front {front} B, routed {routed} B"
+    );
+    for room in ROOMS {
+        let h = homes(&inputs, cut, room).unwrap_or_else(|e| panic!("room {room}: {e}"));
+        let sum = |v: &[u64]| v.iter().sum::<u64>();
+        let routed_layers = (layers - 1) as u64;
+        let span = |v: &[u64]| {
+            (
+                sum(v),
+                v[1..].iter().min().copied().unwrap_or(0),
+                v[1..].iter().max().copied().unwrap_or(0),
+            )
+        };
+        let (ids, lo, hi) = span(&h.card);
+        println!(
+            "room {} GiB: cards dense {} B + rounding {} B + kv {} B; experts card {} B ({ids} ids, \
+             {lo}..{hi} a layer), host {} B ({} ids, {}..{} a layer), NVMe {} B ({} ids); RAM arena \
+             {} B; token table {} B",
+            room >> 30,
+            h.dense,
+            h.rounding,
+            h.kv,
+            h.card_bytes,
+            h.host_bytes,
+            sum(&h.host),
+            h.host[1..].iter().min().unwrap_or(&0),
+            h.host[1..].iter().max().unwrap_or(&0),
+            h.nvme_bytes,
+            sum(&h.nvme),
+            h.arena,
+            h.table,
+        );
+        let (cp, cb) = reads(&h.card, &per);
+        let (hp, hb) = reads(&h.host, &per);
+        let (np, nb) = reads(&h.nvme, &per);
+        println!(
+            "  a token's {} picks, uniform: card {cp:.0} ({:.2} GB), host {hp:.0} ({:.2} GB), NVMe \
+             {np:.0} ({:.2} GB), the arena a cache of {:.1} % of the NVMe bytes",
+            16 * routed_layers,
+            cb / 1e9,
+            hb / 1e9,
+            nb / 1e9,
+            100.0 * h.arena as f64 / h.nvme_bytes as f64,
+        );
+        if h.dense != front - embedding || h.table != embedding {
+            bad.push(format!(
+                "room {room}: dense {} B, table {} B",
+                h.dense, h.table
+            ));
+        }
+        if h.card_bytes + h.host_bytes + h.nvme_bytes != routed {
+            bad.push(format!(
+                "room {room}: the homes hold {} B of experts",
+                h.card_bytes + h.host_bytes + h.nvme_bytes
+            ));
+        }
+        for l in 1..layers {
+            if h.card[l] + h.host[l] + h.nvme[l] != 896 {
+                bad.push(format!(
+                    "room {room}: layer {l} serves {} experts",
+                    h.card[l] + h.host[l] + h.nvme[l]
+                ));
+            }
+        }
+        if (0..layers)
+            .map(|l| h.card[l] + h.host[l] + h.nvme[l])
+            .sum::<u64>()
+            != 896 * routed_layers
+        {
+            bad.push(format!("room {room}: ids do not sum to the routed layers'"));
+        }
+    }
+
+    // The engine's refusal, row by row: the features no program runs, each with the layers that
+    // need it. These counts go red when a body's program covers the architecture; that change
+    // re-pins them.
+    let missing = inputs.unimplemented();
+    let mut rows: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for item in &missing {
+        *rows.entry(item.feature.clone()).or_default() += 1;
+    }
+    println!("kimi-k3 coverage rows refused: {} items", missing.len());
+    for (feature, n) in &rows {
+        println!("  {n:>3} x {feature}");
+    }
+    let want: [(&str, usize); 6] = [
+        ("a layer program for kimi-k3", 1),
+        ("a tool-call parser for this template", 1),
+        (
+            "cross-layer residual attention: every 12th layer banks its input, each sublayer and the head read the softmax mix of the banks and the running sum",
+            layers,
+        ),
+        (
+            "delta rule KDA with a full-width output gate: d 128, 96 heads, conv 4, sigmoid gate bounded below by -5",
+            layers - mla,
+        ),
+        (
+            "router: sigmoid, 896 experts, top 16, with a selection bias",
+            layers - 1,
+        ),
+        (
+            "the routed experts' weighted sum normed by ffn_routed_norm before the up projection",
+            layers - 1,
+        ),
+    ];
+    let got: Vec<(&str, usize)> = rows.iter().map(|(f, &n)| (f.as_str(), n)).collect();
+    if got != want {
+        bad.push(format!("the coverage rows are {got:?}"));
+    }
+    match PlanInputs::read(&split) {
+        Err(placement::PlacementError::Unimplemented(items)) if items == missing => {}
+        other => bad.push(format!("read: {other:?}, not the coverage refusal")),
+    }
+    assert!(
+        bad.is_empty(),
+        "{} pin(s) differ:\n  {}",
+        bad.len(),
+        bad.join("\n  ")
+    );
 }
