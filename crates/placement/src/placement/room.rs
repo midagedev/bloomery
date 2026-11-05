@@ -401,11 +401,12 @@ pub fn host_room_given(
     }
 }
 
-/// One layer's routed stacks as the NVMe expert tier splits them: each
-/// stack's row and the index of its host segment, the ids that segment holds
-/// (the same for every stack of the layer), and the bytes of one expert
+/// One layer's routed stacks as the NVMe expert tier splits them: the layer,
+/// each stack's row and the index of its host segment, the ids that segment
+/// holds (the same for every stack of the layer), and the bytes of one expert
 /// across the stacks.
 struct HostLayer {
+    layer: usize,
     stacks: Vec<(usize, usize)>,
     ids: Vec<u32>,
     unit: u64,
@@ -422,10 +423,14 @@ impl HostLayer {
 /// the host's available bytes to) passes `room`: each layer's host-served
 /// ids split into the first `r_l`, which stay on the host, and the rest,
 /// which the host leg reads from the NVMe tier ([`Device::Nvme`],
-/// [`Format::NvmeFile`]). The `r_l` are spread over the layers by their host
+/// [`Format::NvmeFile`]) — the tier takes the layer's id tail, or under the
+/// plan's rank ([`Plan::expert_rank`]) its coldest host ids
+/// ([`ExpertRank::cold_split`]), a layer the rank does not order refused by
+/// name. The `r_l` are spread over the layers by their host
 /// bytes, so the host's resident bytes fall by the overflow, to within one
-/// layer's expert; every stack of a layer splits at the same ids. A plan
-/// whose need `room` holds is left as it is.
+/// layer's expert; every stack of a layer splits at the same ids, and the
+/// pick moves ids only: every byte the split accounts is the rank's own. A
+/// plan whose need `room` holds is left as it is.
 ///
 /// Runs after [`row_table_tier`], which puts the row-gathered tables on the
 /// NVMe tier first: a plan that still needs a split with such a table on the
@@ -893,6 +898,7 @@ fn split_nvme_tier(plan: &mut Plan<'_>, room: u64, grant: Grant) -> Result<(), P
             None => {
                 *slot = Some(layers.len());
                 layers.push(HostLayer {
+                    layer: l,
                     stacks: vec![(i, at)],
                     ids: list.ids().to_vec(),
                     unit: per,
@@ -983,15 +989,28 @@ fn split_nvme_tier(plan: &mut Plan<'_>, room: u64, grant: Grant) -> Result<(), P
         for &(i, at) in &l.stacks {
             let t = &model.tensors[plan.rows[i].tensor];
             let (_, per) = per_expert(t, model.experts_of(t))?;
-            let on_host = &l.ids[..n];
-            let off_host = &l.ids[n..];
+            // Which `n` of the layer's host ids stay is the pick: the id
+            // prefix of the host's list (its id tail paging), or under the
+            // plan's rank the layer's hottest host ids with its coldest
+            // `ids.len() − n` paging ([`ExpertRank::cold_split`]). The count
+            // is the split's own either way, so every byte the need, the
+            // arena and the moved sum account is the rank's own.
+            let (on_host, off_host) = match plan.expert_rank.as_deref() {
+                Some(rank) => rank.cold_split(
+                    l.layer,
+                    model.layer_experts(l.layer),
+                    &l.ids,
+                    (l.ids.len() - n) as u64,
+                )?,
+                None => (l.ids[..n].to_vec(), l.ids[n..].to_vec()),
+            };
             let mut pieces = Vec::with_capacity(2);
             if !on_host.is_empty() {
                 pieces.push(Segment {
                     device: Device::Host,
                     format: Format::HostFile,
-                    experts: Some(ExpertList::new(on_host.to_vec(), model.experts)?),
-                    resident_bytes: on_host.len() as u64 * per,
+                    experts: Some(ExpertList::new(on_host, model.experts)?),
+                    resident_bytes: n as u64 * per,
                 });
             }
             if !off_host.is_empty() {
@@ -1000,7 +1019,7 @@ fn split_nvme_tier(plan: &mut Plan<'_>, room: u64, grant: Grant) -> Result<(), P
                 pieces.push(Segment {
                     device: Device::Nvme,
                     format: Format::NvmeFile,
-                    experts: Some(ExpertList::new(off_host.to_vec(), model.experts)?),
+                    experts: Some(ExpertList::new(off_host, model.experts)?),
                     resident_bytes: bytes,
                 });
             }
