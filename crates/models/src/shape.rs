@@ -1191,6 +1191,8 @@ mod tests {
                     || r.at.contains("sigmoid_128_6_router")
                     || r.at.contains("sigmoid_256_6_router")
                     || r.at.contains("sigmoid_16_8_router")
+                    || r.at.contains("sigmoid_896_16_router")
+                    || r.at.contains("sigmoid_8_2_router")
                     || r.at.contains("nemotron_moe_router"),
                 "{}",
                 r.at
@@ -1198,7 +1200,8 @@ mod tests {
         }
         // The rows that carry the body: GLM's and MiMo's, then Bolt's five, then
         // the 320-expert instance's, then the two 128-expert ones (top 4, top 6),
-        // then the 256-expert top-6 row.
+        // then the 256-expert top-6 row, Muse Spark's fixture at 16, and Kimi
+        // K3's two (896 top 16, its fixture's 8 top 2).
         let widths: Vec<u32> = ROUTERS
             .iter()
             .filter(|r| super::body_eq(r.body, super::RouterBody::BiasedSigmoid))
@@ -1206,7 +1209,7 @@ mod tests {
             .collect();
         assert_eq!(
             widths,
-            [288, 256, 240, 304, 368, 432, 496, 320, 128, 128, 256, 16]
+            [288, 256, 240, 304, 368, 432, 496, 320, 128, 128, 256, 16, 896, 8]
         );
         // Coverage's `routes(n, &[BiasedSigmoid])`: the rule's shapes pass at
         // both widths, and a width between them is refused. 256 at top 6 is
@@ -1220,7 +1223,7 @@ mod tests {
         assert_eq!(
             e.why,
             Refusal::RouterWidth {
-                served: vec![288, 256, 240, 304, 368, 432, 496, 320, 128, 16]
+                served: vec![288, 256, 240, 304, 368, 432, 496, 320, 128, 16, 896, 8]
             }
         );
     }
