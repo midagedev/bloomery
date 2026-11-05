@@ -38,8 +38,6 @@ use crate::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks, LegSum};
 use crate::kquant::Act;
 use crate::linear::PASS_ROWS;
 use crate::routed_block::{RouteIn, RoutedRows, RouterEntry};
-use crate::site::{self, Form, SiteTy};
-use crate::tensor::{Window, WindowMut};
 use crate::weights::Weights;
 use crate::{Gpu, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -524,59 +522,8 @@ pub(crate) fn stage_len(ff: usize) -> usize {
     PASS_ROWS * ff
 }
 
-/// Whether site `s` runs over several rows in one launch: the f32 rows'
-/// gemv, or a K-quant's m-column gemv. Not a Q6_K row of an odd
-/// super-block count, which `site::kgemv` runs one column at a launch, nor
-/// the Q5_0 form.
-fn has_columns(s: &Site) -> bool {
-    match s.ty().reads() {
-        Form::F32 | Form::Q8x32 => true,
-        Form::Q8x128 => {
-            let odd_q6k = matches!(s.ty(), SiteTy::Q6K) && (s.k() / 256) % 2 == 1;
-            site::kgemv_order(s.ty()).is_some() && !odd_q6k
-        }
-        Form::Q8Blocks32 => false,
-    }
-}
-
-/// `y = W · x` for site `s` over `m` rows of `x` (token-major, `s.k()`
-/// values a row) into `y` (`rows` values a row), each row the one-row
-/// [`Site::project`]'s bits: a site [`has_columns`] in one launch over the
-/// rows ([`rows_kit::project_rows`]: each column its one-column launch bit for
-/// bit), any other the one-row launch on each row's window. At one row it
-/// is [`Site::project`].
-#[allow(
-    clippy::too_many_arguments,
-    reason = "a site's launch inputs: the context, the row kit, the forms, the layer, the site, \
-              the rows and the buffers"
-)]
-fn project_rows(
-    cx: &GqaCx<'_>,
-    kit: &mut RowsKit<'_>,
-    acts: &mut Acts,
-    l: usize,
-    s: &Site,
-    (m, rows): (usize, usize),
-    x: &DeviceBuffer<f32>,
-    y: &mut DeviceBuffer<f32>,
-) -> Result<(), GpuError> {
-    if m == 1 {
-        return s.project(cx, acts, l, x, y);
-    }
-    if has_columns(s) {
-        return rows_kit::project_rows(cx, kit, acts, (l, m), (s, rows), x, y);
-    }
-    let (k, f) = (s.k(), size_of::<f32>());
-    for r in 0..m {
-        let xr = Window::<f32>::of(x, r * k * f, k)?;
-        let mut yr = WindowMut::<f32>::of_mut(y, r * rows * f, rows)?;
-        s.project(cx, acts, l, &xr, &mut yr)?;
-    }
-    Ok(())
-}
-
 /// [`glu`] over `m` rows of `xn`: each site over the rows
-/// ([`project_rows`]; a site's rows run before the next site's, so a
+/// ([`rows_kit::project_rows`]; a site's rows run before the next site's, so a
 /// per-row form reads its weight from the cache after the first row), the
 /// SiTU over every row in one launch.
 #[allow(
@@ -598,12 +545,12 @@ fn glu_rows(
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
     let (gate, up, act) = s;
-    project_rows(cx, kit, acts, l, &g.gate, (m, g.ff), xn, gate)?;
-    project_rows(cx, kit, acts, l, &g.up, (m, g.ff), xn, up)?;
+    rows_kit::project_rows(cx, kit, acts, (l, m), (&g.gate, g.ff), xn, gate)?;
+    rows_kit::project_rows(cx, kit, acts, (l, m), (&g.up, g.ff), xn, up)?;
     cx.gpu
         .elem()
         .enqueue_situ(cx.gpu.stream(), rule, (gate, up), m * g.ff, act)?;
-    project_rows(cx, kit, acts, l, &g.down, (m, cx.hidden), act, y)
+    rows_kit::project_rows(cx, kit, acts, (l, m), (&g.down, cx.hidden), act, y)
 }
 
 /// [`ffn`] over `m` rows of `xn` (token-major) into `y`, each row the
@@ -680,7 +627,7 @@ pub(crate) fn ffn_rows<R: RouterEntry>(
             let ex: &DeviceBuffer<f32> = match lat.as_mut() {
                 Some(LatentRun { pair, x, .. }) => {
                     let width = pair.width;
-                    project_rows(cx, &mut kit, acts, l, &pair.down, (m, width), xn, x)?;
+                    rows_kit::project_rows(cx, &mut kit, acts, (l, m), (&pair.down, width), xn, x)?;
                     x
                 }
                 None => xn,
@@ -690,7 +637,15 @@ pub(crate) fn ffn_rows<R: RouterEntry>(
             let summed = sum_norm(cx, (l, r), (&*routed, normed.as_mut()), m)?;
             let delta: &DeviceBuffer<f32> = match lat {
                 Some(LatentRun { pair, up, .. }) => {
-                    project_rows(cx, &mut kit, acts, l, &pair.up, (m, cx.hidden), summed, up)?;
+                    rows_kit::project_rows(
+                        cx,
+                        &mut kit,
+                        acts,
+                        (l, m),
+                        (&pair.up, cx.hidden),
+                        summed,
+                        up,
+                    )?;
                     up
                 }
                 None => summed,
