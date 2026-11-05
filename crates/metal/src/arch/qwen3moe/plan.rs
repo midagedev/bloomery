@@ -2,13 +2,15 @@
 //! and tensor table alone.
 //!
 //! The refusals are [`super::check`]'s, the open's own, every one rather than
-//! the first. The plan adds what the open does not print: the bytes the open
-//! would make buffers of, beside the room the device reports
-//! (`recommendedMaxWorkingSetSize`, a device query) and the host's free memory
-//! now (`vm_stat`: other processes included, which the census's count of this
-//! process's own buffers is not). The two room numbers are printed side by
-//! side and judge nothing: the census's rule is the open's, and this plan
-//! states what each says.
+//! the first — the room rule's ([`super::check::room`]) among them, the load's
+//! bytes held to the device's free bytes, so a load too large for the device
+//! is refused here as it is at the open. The plan adds what the open does not
+//! print: the bytes the open would make buffers of, beside the room the device
+//! reports (`recommendedMaxWorkingSetSize`, a device query) and the host's free
+//! memory now (`vm_stat`: other processes included, which the census's count
+//! of this process's own buffers is not). The two room numbers are printed
+//! side by side and judge nothing here: the census's free bytes are what the
+//! open's room rule holds the load to, and this plan states what each says.
 //!
 //! A GGUF file whose data section is cut short (a header fetched by a range
 //! read) is read from its header and tensor table alone ([`open_plan_header`]);
@@ -178,6 +180,10 @@ pub struct DeviceRoom {
     pub recommended: u64,
     /// `currentAllocatedSize` less nothing: what this process holds (none yet).
     pub allocated: u64,
+    /// The census's free bytes: the working set less this process's
+    /// allocation and the host's available memory, the smaller — the room the
+    /// open's rule holds the load's bytes to.
+    pub free: u64,
 }
 
 /// The default device's room, or the reason there is none.
@@ -194,6 +200,7 @@ pub fn device_room() -> Result<DeviceRoom, String> {
         name: info.name,
         recommended: info.total_bytes,
         allocated: MetalCensus::allocated_of(&default).map_err(|e| e.to_string())?,
+        free: info.free_bytes,
     })
 }
 
@@ -349,8 +356,9 @@ pub fn render(
     lines.push(format!("plan: ctx={ctx}"));
     match device {
         Ok(d) => lines.push(format!(
-            "plan: device={:?} recommended_max_working_set_bytes={} allocated_bytes={}",
-            d.name, d.recommended, d.allocated
+            "plan: device={:?} recommended_max_working_set_bytes={} allocated_bytes={} \
+             free_bytes={}",
+            d.name, d.recommended, d.allocated, d.free
         )),
         Err(e) => lines.push(format!("plan: device=unavailable ({e})")),
     }

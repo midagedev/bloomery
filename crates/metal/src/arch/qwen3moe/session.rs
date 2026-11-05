@@ -97,7 +97,7 @@ use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
 
 use bloomery_device::fault::Fault;
-use bloomery_device::{Buffer, DeviceError, Elem, Elems, Stream};
+use bloomery_device::{Buffer, Device, DeviceError, Elem, Elems, Stream};
 use chain::ChainError;
 use chain::arch::qwen3moe::ops::{ChainOps, LayerCtx};
 use chain::arch::qwen3moe::plan::{
@@ -1021,11 +1021,11 @@ impl Session {
     }
 
     /// The load half of [`Session::open_model_as`], run beside the pipeline
-    /// build: the plan's checks, the stream and its residency set, the arena,
-    /// the rows arena (and the mark copies' when `copies` asks at open), and
-    /// the set's commit. The arena is sized at the geometry the file was
-    /// judged at and the launches at the library's: one instance, or the
-    /// open is refused before any buffer is made.
+    /// build: the plan's checks and the room rule, the stream and its
+    /// residency set, the arena, the rows arena (and the mark copies' when
+    /// `copies` asks at open), and the set's commit. The arena is sized at the
+    /// geometry the file was judged at and the launches at the library's: one
+    /// instance, or the open is refused before any buffer is made.
     fn open_load(
         device: &MetalDevice,
         library: &Library,
@@ -1047,6 +1047,11 @@ impl Session {
                 library.instance()
             )));
         }
+        // The room rule, the one `--plan` prints as an item, before any
+        // buffer is made: the load's bytes held to the device's free bytes,
+        // the census's reading.
+        let free = device.info()?.free_bytes;
+        check::room(file.header(), &checked, free)?;
         let mut stream = device.new_stream()?;
         stream.enable_residency(device.metal())?;
         let residency = stream

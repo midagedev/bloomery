@@ -200,9 +200,10 @@
 //! device buffer) and prints, on stdout, what the open would find: the
 //! description, the room the device and the host report beside the bytes the
 //! open would make buffers of, every refusal the open's checks meet (not the
-//! first alone), and a last line, `plan: opens` (exit 0) or `plan: refused, N
-//! items` (exit 3). A file whose data section is cut short is read as a header
-//! alone. A folder or file the open refuses before the plan can check it is a
+//! first alone) — the room rule's among them, a load whose bytes pass the
+//! device's free bytes — and a last line, `plan: opens` (exit 0) or
+//! `plan: refused, N items` (exit 3). A file whose data section is cut short
+//! is read as a header alone. A folder or file the open refuses before the plan can check it is a
 //! named error and exit 3; a header the plan cannot read is a named error and
 //! exit 64; a repo it cannot fetch is a named error and exit 1. `--hf` fetches
 //! what the cache lacks before the plan reads it. It takes no generation flag.
@@ -1403,13 +1404,18 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
             Some(c) => c,
             None => default_ctx(header.split(), model).map_err(plan::OpenError::Unreadable)?,
         };
-        let outcome = check::check(header.split(), ctx);
+        let device = plan::device_room();
+        let free = match &device {
+            Ok(d) => Ok(d.free),
+            Err(e) => Err(e.clone()),
+        };
+        let outcome = check::check_room(header.split(), ctx, free);
         Ok(plan::render(
             model,
             header.data,
             ctx,
             &outcome,
-            &plan::device_room(),
+            &device,
             &plan::HostMemory::probe(),
         ))
     }
