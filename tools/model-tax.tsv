@@ -222,6 +222,7 @@ crates/serve/src/dsml.rs	muse	7	PIN(2026-10-23) muse: ToolFormat, Tools and Scan
 crates/serve/src/lib.rs	muse	1	PIN(2026-10-23) muse: the recipient-protocol parser's module declaration beside the other chat formats'
 crates/gpu-gates/src/bin/bloomery_serve.rs	muse	8	PIN(2026-10-23) muse: MK9 seat by program: the seat word, its usage and models-table lines, the file's architecture arm and the dispatch are the variant's arms until a seat is chosen by the description's program
 crates/gpu-gates/src/record.rs	muse	4	PIN(2026-10-23) muse: MK12 per-bin Kind statics into record/<bin>.rs: the seat's load and listening kinds and its list are the common file's, where every seat's are
+crates/gpu-gates/src/record.rs	kimi	1	PIN(2026-11-06) kimi: the per-bin Kind static GENERATE_KIMI_K3 (what generate_kimi_k3 prints), one line like the other families' until MK12 moves the statics into record/<bin>
 crates/model/src/arch/coverage.rs	muse	25	PIN(2026-10-23) muse: the coverage rows, the type pins and the expert-stack match are keyed by Program, so each row the musespark body runs lists its variant; the program would own its rows instead of the list naming programs
 crates/hf/src/vocab.rs	minimax	3	PIN(2026-10-23) minimax: the minimax-m2 pre-tokenizer's name, regex and pipeline row; tokenizer programs are not yet described by ModelSpec
 crates/hf/src/vocab.rs	lfm	1	PIN(2026-10-28) lfm: the lfm2 pre-tokenizer's name in the pre-tokenizer table (the llama3 regex row with ignore_merges); tokenizer programs are not yet described by ModelSpec
