@@ -4,7 +4,7 @@
 //! [`Pre::Glm4`] (`glm4`), [`Pre::Qwen35`] (`qwen35`), [`Pre::Llama3`] (`llama-bpe`, `lfm2`),
 //! [`Pre::Tekken`] (`tekken`, `pixtral`), [`Pre::TekkenNum3`] (`tekken-num3`),
 //! [`Pre::MiniMaxM2`] (`minimax-m2`), [`Pre::Gpt4o`] (`gpt-4o`), [`Pre::Gemma4`] (`gemma4`),
-//! [`Pre::Raon`] (`raon`) and [`Pre::Flint`] (`flint`).
+//! [`Pre::Raon`] (`raon`), [`Pre::KimiK2`] (`kimi-k2`) and [`Pre::Flint`] (`flint`).
 //!
 //! ## deepseek-v3
 //!
@@ -203,6 +203,27 @@
 //! optional space with the newlines and slashes after it; a run of whitespace ending in a
 //! newline; a whitespace run but its last space when a word follows. The reference applies NFC
 //! before this ([`Pre::nfc`]). [`split_raon`] is that function line for line.
+//!
+//! ## kimi-k2
+//!
+//! One regex in Kimi's `tokenization_kimi.py`, which the reference runs as the hand-written
+//! `unicode_regex_split_custom_kimi_k2` (its `\p{Han}+` row only triggers the function), in the
+//! order of its branches: a run of Han, the nine literal ranges of `unicode_cpt_is_han`
+//! ([`is_han`]); a run of letters that are not Han behind one optional character that is no letter,
+//! number, `\r` or `\n` (a space, a tab, a mark, a symbol), with the contraction
+//! `'s|'t|'m|'d|'re|'ve|'ll` of either case after it; a run of numbers cut in words of three from
+//! its start; a run of punctuation behind an optional space with the newlines after it; a
+//! whitespace run ending in a newline; a whitespace run but its last space when a word follows.
+//!
+//! It is the llama3 splitter's shape with four differences. A Han run is a word of its own and
+//! never joins a letter run, and a space before it is a word apart. Every letter of a run is one
+//! class: `HelloWorld` is a word, where the regex's capital and lowercase classes would cut it.
+//! A mark is no letter, so it ends a run, and the optional character before a run may be a mark.
+//! The contraction hangs on the letter run: after no letter, `'s` is the optional character and a
+//! letter, so it is a word of two.
+//! No NFC step runs, the UTF-8 reader is the strict one ([`Pre::strict_utf8`]), and no word is
+//! taken whole ([`Pre::ignore_merges`]). No folder's `tokenizer.json` spells the pipeline (Kimi's
+//! tokenizer is a tiktoken one), so the name has no Hugging Face reading.
 //!
 //! ## flint
 //!
@@ -986,13 +1007,16 @@ pub(crate) enum Pre {
     /// `raon`: the reference's hand-written splitter with the CJK run, the letter run joined by
     /// single spaces and the digits in threes from the end; the text is NFC-normalized first.
     Raon,
+    /// `kimi-k2`: the reference's hand-written splitter with the Han run, the letter run with its
+    /// contraction, digits in threes from the start, the punctuation run and the whitespace rules.
+    KimiK2,
     /// `flint`: numbers, CJK, then the reference's collapsed case/mark regex.
     Flint,
 }
 
 impl Pre {
     /// The names this crate runs, as `tokenizer.ggml.pre` spells them.
-    pub(crate) const NAMES: [(&'static str, Pre); 18] = [
+    pub(crate) const NAMES: [(&'static str, Pre); 19] = [
         ("deepseek-v3", Pre::DeepseekV3),
         ("hunyuan-dense", Pre::DeepseekV3),
         ("joyai-llm", Pre::DeepseekV3),
@@ -1010,6 +1034,7 @@ impl Pre {
         ("gpt-4o", Pre::Gpt4o),
         ("gemma4", Pre::Gemma4),
         ("raon", Pre::Raon),
+        ("kimi-k2", Pre::KimiK2),
         ("flint", Pre::Flint),
     ];
 
@@ -1056,12 +1081,13 @@ impl Pre {
     /// Whether the reference decodes UTF-8 strictly, independently of NFC.
     /// An overlong form is not a codepoint there; older readers accept it. The trees that read
     /// `gpt-4o`, `raon`, `flint`, `tekken` (every tree that maps `pixtral` to it has the check)
-    /// and `tekken-num3` (a name younger than the check) reject it; the trees the other names'
-    /// sets are read by (ik, the Solar-Open2 patch, mainline before the check) accept it.
+    /// `tekken-num3` (a name younger than the check) and `kimi-k2` (read by the same mainline tree)
+    /// reject it; the trees the other names' sets are read by (ik, the Solar-Open2 patch, mainline
+    /// before the check) accept it.
     pub(crate) fn strict_utf8(self) -> bool {
         matches!(
             self,
-            Pre::Raon | Pre::Flint | Pre::Gpt4o | Pre::Tekken | Pre::TekkenNum3
+            Pre::Raon | Pre::Flint | Pre::Gpt4o | Pre::Tekken | Pre::TekkenNum3 | Pre::KimiK2
         )
     }
 
@@ -1086,6 +1112,7 @@ impl Pre {
             | Pre::MiniMaxM2
             | Pre::Gpt4o
             | Pre::Raon
+            | Pre::KimiK2
             | Pre::Flint => Spelling::ByteLevel,
         }
     }
@@ -1128,6 +1155,10 @@ pub(crate) fn split<'s>(pre: Pre, cpts: &[u32], s: &'s mut Scratch) -> &'s [usiz
         }
         Pre::Raon => {
             split_raon(cpts, &s.collapsed, &mut s.b);
+            &s.b
+        }
+        Pre::KimiK2 => {
+            split_kimi_k2(cpts, &s.collapsed, &mut s.b);
             &s.b
         }
     }
@@ -1202,6 +1233,74 @@ fn split_raon(cpts: &[u32], c: &[u8], out: &mut Vec<usize>) {
             } else {
                 pos + 1
             };
+        }
+        out.push(pos - start);
+    }
+}
+
+/// `unicode_cpt_is_han`: the reference's nine literal ranges, not the `\p{Han}` property. It counts
+/// all of `U+F900..U+FAFF`, unassigned codepoints too, and has nothing from `U+30000` up. Its
+/// extensions C to F are the one range `U+2A700..U+2EBEF` here.
+fn is_han(cpt: u32) -> bool {
+    matches!(
+        cpt,
+        0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xF900..=0xFAFF
+            | 0x20000..=0x2A6DF
+            | 0x2A700..=0x2EBEF
+            | 0x2F800..=0x2FA1F
+    )
+}
+
+/// `unicode_regex_split_custom_kimi_k2` over one fragment: `cpts` its codepoints, `c` their
+/// collapsed bytes; the words' lengths go to `out`. Each branch is the reference's, in its order.
+fn split_kimi_k2(cpts: &[u32], c: &[u8], out: &mut Vec<usize>) {
+    out.clear();
+    let end = cpts.len();
+    // The reference's flags read as empty past the fragment.
+    let han = |p: usize| p < end && is_han(cpts[p]);
+    let flag_letter = |p: usize| p < end && is_letter(c[p]);
+    let letter = |p: usize| flag_letter(p) && !han(p);
+    let number = |p: usize| p < end && is_number(c[p]);
+    let space = |p: usize| p < end && is_space(c[p]);
+    let punct = |p: usize| p < end && !space(p) && !flag_letter(p) && !number(p);
+    let mut pos = 0;
+    while pos < end {
+        let start = pos;
+        let lead = usize::from(cpts[pos] == u32::from(b' '));
+        if han(pos) {
+            // `[\p{Han}]+`
+            while han(pos) {
+                pos += 1;
+            }
+        } else if letter(pos)
+            || (!flag_letter(pos) && !number(pos) && !is_newline(c[pos]) && letter(pos + 1))
+        {
+            // `[^\r\n\p{L}\p{N}]?` (a mark is none of `\p{L}`), the letters that are not Han, and
+            // the contraction: the run of letters is the same class whatever their case.
+            pos += usize::from(!letter(pos));
+            while letter(pos) {
+                pos += 1;
+            }
+            // The reference's `unicode_tolower` maps no codepoint above U+007F to a letter of the
+            // contractions, so the ASCII lowercase of the collapsed byte is its comparison.
+            pos += contraction(c, pos, end, |k| c[k].to_ascii_lowercase());
+        } else if number(pos) {
+            // `\p{N}{1,3}`
+            pos += DigitRule::Front(3).at(c, pos, end);
+        } else if punct(pos + lead) {
+            // ` ?[^\s\p{L}\p{N}]+[\r\n]*`
+            pos += lead;
+            while punct(pos) {
+                pos += 1;
+            }
+            while pos < end && is_newline(c[pos]) {
+                pos += 1;
+            }
+        } else {
+            // `\s*[\r\n]+`, `\s+(?!\S)`, `\s+`; no alternative: one codepoint.
+            pos += match_space(c, pos, end).max(1);
         }
         out.push(pos - start);
     }
@@ -1715,6 +1814,109 @@ mod tests {
         for &(text, want) in cases {
             assert_eq!(words(Pre::Raon, text), want, "{text:?}");
         }
+    }
+
+    /// The kimi-k2 splitter's branches, one case each, as the reference's function splits them
+    /// (derived from its code, not from our output): a Han run is a word of its own and a space
+    /// before it a word apart, kana and Hangul are letters, the optional character before a run is
+    /// any non-letter but a newline (a space, a tab, a mark, a symbol), a mark ends a run, case is no
+    /// boundary, a contraction of either case ends a run and a short one does not, digits are cut in
+    /// threes from the run's start, a punctuation run keeps its newlines but not its slashes, and a
+    /// whitespace run gives its last space to the word after it.
+    ///
+    /// FAIL-first: with the digits cut from the run's end (raon's rule) "1234567" reads 1|234|567,
+    /// and with the contraction list dropped "it's" reads it|'s; the rows below fail both.
+    #[test]
+    fn kimi_k2_cases() {
+        let cases: &[(&str, &[&str])] = &[
+            ("hello world", &["hello", " world"]),
+            ("Hello,世界!", &["Hello", ",", "世界", "!"]),
+            (" 中文", &[" ", "中文"]),
+            ("日本語のテキスト", &["日本語", "のテキスト"]),
+            ("漢字와 한글混用", &["漢字", "와", " 한글", "混用"]),
+            ("HelloWorld iPhone", &["HelloWorld", " iPhone"]),
+            (
+                "it's WE'RE I'm you'LL he'd can't've",
+                &[
+                    "it's", " WE'RE", " I'm", " you'LL", " he'd", " can't", "'ve",
+                ],
+            ),
+            (
+                "x're x'r x'l x' '",
+                &["x're", " x", "'r", " x", "'l", " x", "'", " '"],
+            ),
+            (
+                "rock'n'roll it\u{2019}s",
+                &["rock", "'n", "'roll", " it", "\u{2019}s"],
+            ),
+            (
+                "\u{4dbf}\u{4dc0} \u{9fff}\u{a000}",
+                &["\u{4dbf}", "\u{4dc0}", " ", "\u{9fff}", "\u{a000}"],
+            ),
+            (
+                "\u{2a6df}\u{2a6e0}\u{30000}x \u{2a6e0} \u{30000}",
+                &[
+                    "\u{2a6df}",
+                    "\u{2a6e0}\u{30000}x",
+                    " \u{2a6e0}",
+                    " \u{30000}",
+                ],
+            ),
+            (
+                "e\u{301}a \u{301}\u{301}",
+                &["e", "\u{301}a", " \u{301}\u{301}"],
+            ),
+            ("中\u{301}文", &["中", "\u{301}", "文"]),
+            ("12", &["12"]),
+            ("1234567", &["123", "456", "7"]),
+            (
+                "x1y22 $12 \u{663}\u{664}\u{665}\u{666}",
+                &[
+                    "x",
+                    "1",
+                    "y",
+                    "22",
+                    " $",
+                    "12",
+                    " ",
+                    "\u{663}\u{664}\u{665}",
+                    "\u{666}",
+                ],
+            ),
+            ("x = y;", &["x", " =", " y", ";"]),
+            (
+                "//c a/\nb ?/\r\n",
+                &["//", "c", " a", "/\n", "b", " ?/\r\n"],
+            ),
+            ("a\u{1c}b \u{1c}\u{1d}", &["a", "\u{1c}b", " \u{1c}\u{1d}"]),
+            ("hello\n\nworld", &["hello", "\n\n", "world"]),
+            ("a  b", &["a", " ", " b"]),
+            ("a \n b", &["a", " \n", " b"]),
+            ("\t\tHello", &["\t", "\tHello"]),
+            (
+                "a\u{a0}b\u{85}\u{85}c",
+                &["a", "\u{a0}b", "\u{85}", "\u{85}c"],
+            ),
+            ("end ", &["end", " "]),
+            ("  ", &["  "]),
+            (" ", &[" "]),
+        ];
+        for &(text, want) in cases {
+            assert_eq!(words(Pre::KimiK2, text), want, "{text:?}");
+        }
+    }
+
+    /// `kimi-k2` is a row of its own: the reference's splitter, its tree's strict UTF-8 reader, no
+    /// NFC, no whole-token words, and no Hugging Face reading (Kimi publishes no `tokenizer.json`
+    /// that spells it), so the explicit stop list refuses it by name.
+    #[test]
+    fn kimi_k2_is_a_row_with_no_hf_reading() {
+        assert_eq!(crate::named(&Pre::NAMES, "kimi-k2"), Some(Pre::KimiK2));
+        assert!(crate::runs_pre_tokenizer("kimi-k2"));
+        assert_eq!(Pre::KimiK2.hf_reading(), None);
+        assert!(!Pre::hf_names().contains("kimi-k2"));
+        assert!(!Pre::KimiK2.ignore_merges() && !Pre::KimiK2.nfc());
+        assert!(Pre::KimiK2.strict_utf8());
     }
 
     /// The glm4 splitter is qwen2's but for its number branch: a run of

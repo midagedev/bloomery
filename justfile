@@ -4396,3 +4396,12 @@ gate-gpu-kimik3-kda:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_kimi_k3_kda && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_kimi_k3_kda'
 
 # --- end kimik3kda ---
+# --- kimik3-tokenizer ---
+
+# Kimi K3's vocabulary: our ids equal mainline `llama-tokenize` on every case of crates/tokenizer/tests/cases.txt and cases-kimik2.txt, in
+# both parse modes (the pins are tests/kimik2-ids.tsv, written by crates/tokenizer/tools/kimik2-oracle.sh from the box's llama.cpp-ml4
+# tree, whose `kimi-k2` pre-tokenizer is a hand-written splitter), and the header's end tokens end generation. The vocabulary only: seconds.
+gate-kimi-k3-tokenizer:
+    ./tools/box.sh 'BLOOMERY_LLAMA_BPE_GGUF=$BLOOMERY_DATA/vocab-llama-bpe/ggml-vocab-llama-bpe.gguf bash tools/gate.sh --release -p bloomery-tokenizer --lib --test kimik2 -- --include-ignored --nocapture'
+
+# --- end kimik3-tokenizer ---
