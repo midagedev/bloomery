@@ -880,19 +880,31 @@ ds_serve_apps() {
   done
 }
 
-# ds_prev_gone <round> <index> <when>: returns once the port is free and no bloomery-serve holds a timing card, naming the
-# wait when there is one; the arm fails by name past PORT_WAIT_S. <when> says which start waited ("before the memory
-# baseline", "before the server starts").
+# ds_serve_procs: the server processes still in the process table, `<pid> <comm>` a line. A server ended through its
+# wrapper's KILL keeps exiting for seconds while it frees its host set, its port closed and its card context gone: the
+# port and the card read it as gone while the CPU probe before the next server reads it as a co-tenant.
+ds_serve_procs() {
+  local c
+  for c in bloomery-serve llama-server; do
+    pgrep -x "$c" 2> /dev/null | sed "s/\$/ $c/"
+  done
+}
+
+# ds_prev_gone <round> <index> <when>: returns once the port is free, no bloomery-serve holds a timing card and no server
+# process is left in the process table, naming the wait when there is one; the arm fails by name past PORT_WAIT_S. <when>
+# says which start waited ("before the memory baseline", "before the server starts").
 ds_prev_gone() {
-  local polls=0 ports apps held
+  local polls=0 ports apps procs held
   while :; do
-    ports='' apps=''
+    ports='' apps='' procs=''
     [ "$PORT" = 0 ] || ports=$(ds_port_listeners "$PORT")
     apps=$(ds_serve_apps)
-    [ -n "$ports$apps" ] || break
+    procs=$(ds_serve_procs)
+    [ -n "$ports$apps$procs" ] || break
     held=''
     [ -z "$ports" ] || held="port $PORT is listened on [$(printf '%s' "$ports" | tr '\n' ';')]"
     [ -z "$apps" ] || held="${held:+$held and }a bloomery-serve holds a timing card [$(printf '%s' "$apps" | tr '\n' ';')]"
+    [ -z "$procs" ] || held="${held:+$held and }a server process is still exiting [$(printf '%s' "$procs" | tr '\n' ';')]"
     if [ "$polls" -ge "$PORT_WAIT_S" ]; then
       ds_fail "$1" "$2" "$held, $PORT_WAIT_S s into the wait for the last server to exit ($3): its process has not exited"
     fi
