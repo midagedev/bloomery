@@ -4376,3 +4376,17 @@ gate-raon1-tokenizer:
     ./tools/box.sh 'BLOOMERY_LLAMA_BPE_GGUF=$BLOOMERY_DATA/vocab-llama-bpe/ggml-vocab-llama-bpe.gguf bash tools/gate.sh --release -p bloomery-tokenizer --lib --test raon -- --include-ignored --nocapture'
 
 # --- end raon-model ---
+
+# --- kimik3-moe ---
+
+# Kimi K3's MoE block on the card (gate_kimi_k3_moe's doc): the common routed block with its optional stages (a biased sigmoid
+# router at 896/16 and 8/2, the latent down and up around the experts, the routed sum's RMS norm, the gated shared stack, situ
+# activations, IQ1_S and IQ2_XXS expert rows) at decode and at the P = 8 prefill shape, against a host f64 reference of the
+# llama.cpp graph. Fixture tier: the fixture's f1 (IQ2_XXS gate/up, IQ1_S down), f2 (IQ1_S gate/up, IQ2_XXS down) and f3 (all
+# IQ1_S) layers, each with its in-gate separations (routed norm out, shared gate at 1) and the named refusals, then one layer at
+# the real widths on seeded random tensors (a synthetic GGUF in the temp dir, about 5.8 GB). The tier only changes which
+# file the fixture layers come from. Wall [derived]: build 3-5 min cold, the real-width file's write and load about 2 min.
+gate-gpu-kimik3-moe:
+    BLOOMERY_MODEL=kimi-k3 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_kimi_k3_moe && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_kimi_k3_moe'
+
+# --- end kimik3-moe ---

@@ -35,13 +35,16 @@ use crate::linear::mixer_kda::{
 };
 use crate::linear::{CONV_TAPS, HEAD, KHeadMap, LinearKernels, LinearShape};
 use crate::site::{self, Form, Order, SiteTy};
-use crate::tensor::{Q8Act, WindowMut};
-use crate::token_major::TokenMajor;
+use crate::tensor::WindowMut;
 use crate::weights::Weights;
-use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
+use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::raon1::names;
-use std::sync::Arc;
+
+// The rows kit is `crate::arch::rows_kit`'s; the raon1 layers read it through this module.
+use crate::arch::rows_kit::order;
+pub(crate) use crate::arch::rows_kit::{RowKernels, RowsKit, add_row_forms};
+pub(super) use crate::arch::rows_kit::{kgemv_rows, project_rows};
 
 /// What the refusals of this file name.
 const WHAT: &str = "raon1 rda";
@@ -190,126 +193,11 @@ impl RdaSites {
     }
 }
 
-/// The kernels a pass of more than one row launches beyond the step's: the
-/// copy of a row-major K-quant output into token-major rows
-/// ([`TokenMajor`], the one owner of that copy).
-pub(crate) struct RowKernels {
-    tm: TokenMajor,
-}
-
-impl RowKernels {
-    /// Load the copy's module into `ctx`. Load-time only.
-    pub(crate) fn load(ctx: &Arc<CudaContext>) -> Result<RowKernels, GpuError> {
-        Ok(RowKernels {
-            tm: TokenMajor::load(ctx)?,
-        })
-    }
-}
-
-/// What a pass of rows lends a layer beyond its buffers: the linear
-/// families' kernels, the row kernels and the stage a row-major site's
-/// columns land in before their copy, at least the [`stage_len`] of every
-/// layer the pass runs.
-pub(crate) struct RowsKit<'a> {
-    pub linear: &'a LinearKernels,
-    pub rows: &'a RowKernels,
-    pub stage: &'a mut DeviceBuffer<f32>,
-}
-
 /// f32s of the stage an RDA layer's pass of up to [`PASS_ROWS`] rows writes:
 /// the joined channels (or the model width, if wider) of every row.
 #[must_use]
 pub(crate) fn stage_len(d: &KdaDims) -> usize {
     PASS_ROWS * d.shape.channels().max(d.embd)
-}
-
-/// The q8_1 forms of 2 to [`PASS_ROWS`] columns a pass of rows reads, at the
-/// width of each K-quant site of `sites`, beside the one-column forms
-/// [`Acts::new`] makes. Load-time only.
-pub(crate) fn add_row_forms<'s>(
-    stream: &CudaStream,
-    acts: &mut Acts,
-    sites: impl Iterator<Item = &'s Site>,
-) -> Result<(), GpuError> {
-    for s in sites.filter(|s| s.ty().reads() == Form::Q8x128) {
-        for m in 2..=PASS_ROWS {
-            acts.add_q8_1(stream, s.k(), m)?;
-        }
-    }
-    Ok(())
-}
-
-/// Where site `t`'s m-column launch lands column `c`'s outputs: a K-quant's
-/// by its gemv ([`site::kgemv_order`]), token-major on the gemv arm;
-/// `None` for the Q5_0 form, which no row launch here reads.
-fn order(t: &Site) -> Option<Order> {
-    match t.ty().reads() {
-        Form::Q8x128 => site::kgemv_order(t.ty()),
-        Form::F32 | Form::Q8x32 => Some(Order::TokenMajor),
-        Form::Q8Blocks32 => None,
-    }
-}
-
-/// The refusal of site `t` at a pass of `m` rows, naming `what`.
-fn no_rows(what: &'static str, t: &Site, m: usize) -> GpuError {
-    GpuError::shape(
-        what,
-        format!(
-            "{} is {}: a pass of {m} rows runs no m-column launch of it",
-            t.name(),
-            t.ty()
-        ),
-    )
-}
-
-/// K-quant site `t` over the columns of the q8_1 form `act`, its `rows`
-/// outputs of each column token-major into `y`: a row-major gemv through the
-/// stage and the copy, a token-major one straight in. Refusals name
-/// `cx.what`, as [`Site::project`]'s do.
-pub(super) fn kgemv_rows(
-    cx: &GqaCx<'_>,
-    kit: &mut RowsKit<'_>,
-    (t, rows): (&Site, usize),
-    act: &Q8Act,
-    l: usize,
-    y: &mut DeviceBuffer<f32>,
-) -> Result<(), GpuError> {
-    let m = act.m();
-    match site::kgemv_order(t.ty()) {
-        Some(Order::TokenMajor) => t.kgemv(cx, act, l, y),
-        Some(Order::RowMajor) => {
-            {
-                let mut stage = WindowMut::<f32>::of_mut(&mut *kit.stage, 0, rows * m)?;
-                t.kgemv(cx, act, l, &mut stage)?;
-            }
-            kit.rows.tm.enqueue(cx.gpu.stream(), kit.stage, rows, m, y)
-        }
-        None => Err(no_rows(cx.what, t, m)),
-    }
-}
-
-/// `y = W · x` for site `t` over the `m` token-major rows of `x`, its `rows`
-/// outputs of each row token-major into `y`: the gemv arm's m-column launch,
-/// or a K-quant's gemv over `x`'s q8_1 form of `m` columns ([`kgemv_rows`]).
-/// Each column is the site's one-column launch on that row bit for bit.
-pub(super) fn project_rows(
-    cx: &GqaCx<'_>,
-    kit: &mut RowsKit<'_>,
-    acts: &mut Acts,
-    (l, m): (usize, usize),
-    (t, rows): (&Site, usize),
-    x: &DeviceBuffer<f32>,
-    y: &mut DeviceBuffer<f32>,
-) -> Result<(), GpuError> {
-    match t.ty().reads() {
-        Form::F32 | Form::Q8x32 => site::gemv(cx.gpu, cx.g32, (t.ty(), cx.w, t.name()), x, m, y),
-        Form::Q8x128 => {
-            let act = acts.q8_1_at(cx.what, t.k(), m)?;
-            cx.gpu.enqueue_quantize_q8_1_layer(x, act, l)?;
-            kgemv_rows(cx, kit, (t, rows), act, l, y)
-        }
-        Form::Q8Blocks32 => Err(no_rows(cx.what, t, m)),
-    }
 }
 
 /// The step's projections of one RDA layer: its sites, the activation forms

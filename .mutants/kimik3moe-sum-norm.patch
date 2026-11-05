@@ -1,0 +1,12 @@
+--- a/crates/gpu/src/arch/routed_ffn.rs
++++ b/crates/gpu/src/arch/routed_ffn.rs
+@@ -503,7 +503,8 @@
+                 m,
+                 dst,
+             )?;
+-            Ok(dst)
++            // mutant kimik3moe-sum-norm: the normed copy is made and dropped, the routed sum goes on as it is.
++            Ok(routed)
+         }
+         (None, None) => Ok(routed),
+         (Some(_), None) => Err(GpuError::shape(

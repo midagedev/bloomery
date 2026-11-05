@@ -851,3 +851,9 @@ required-features = ["gpu"]
 [[bin]]
 name = "gate_raon1_dflash"
 required-features = ["gpu"]
+
+# kimik3-moe: Kimi K3's routed block (the common routed block with the latent pair, the routed-sum norm and the gated shared stack)
+# against the llama.cpp graph in f64, on the fixture's routed layers and on random tensors at the real widths.
+[[bin]]
+name = "gate_kimi_k3_moe"
+required-features = ["gpu"]

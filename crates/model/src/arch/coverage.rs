@@ -829,13 +829,13 @@ pub const AVAILABLE: &[Available] = &[
     },
     Available {
         programs: &[Program::Raon1Body],
-        at: "gpu/src/arch/raon1/ffn.rs Glu (the gate and up sites, gpu/src/elem.rs enqueue_situ, the \
+        at: "gpu/src/arch/routed_ffn.rs Glu (the gate and up sites, gpu/src/elem.rs enqueue_situ, the \
              down site)",
         runs: |n| matches!(n, Need::Situ { ff } if ff.is_multiple_of(32)),
     },
     Available {
         programs: &[Program::Raon1Body],
-        at: "gpu/src/arch/raon1/ffn.rs (the card leg's gate·up `_sel` under kquant::Act::Situ, \
+        at: "gpu/src/arch/routed_ffn.rs (the card leg's gate·up `_sel` under kquant::Act::Situ, \
              SITU_LINEAR_BETA)",
         runs: |n| {
             matches!(
@@ -849,7 +849,7 @@ pub const AVAILABLE: &[Available] = &[
     },
     Available {
         programs: &[Program::Raon1Body],
-        at: "gpu/src/arch/raon1/ffn.rs Routed.shared (the shared expert's Glu block, added after \
+        at: "gpu/src/arch/routed_ffn.rs Routed.shared (the shared expert's Glu block, added after \
              the routed sum)",
         runs: |n| {
             matches!(
@@ -863,7 +863,7 @@ pub const AVAILABLE: &[Available] = &[
     },
     Available {
         programs: &[Program::Raon1Body],
-        at: "gpu/src/arch/raon1/ffn.rs Routed.shared (gpu/src/elem.rs enqueue_situ between the \
+        at: "gpu/src/arch/routed_ffn.rs Routed.shared (gpu/src/elem.rs enqueue_situ between the \
              shared expert's gate·up and down sites, SITU_LINEAR_BETA)",
         runs: |n| {
             matches!(
