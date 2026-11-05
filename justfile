@@ -3009,8 +3009,10 @@ gate-gpu-ds41-step *ARGS='--structure --sets --select --skew-structure --skew-se
 # the one visible card, past one rank each a process of its own in a rank group over TCP ends on the loopback (the
 # bin's doc lists the clauses). The card budget is unset: a rank holds every expert on the card. Fixture-only (tools/ref/fixture-only.sh): the real file's ranks are loaded across
 # nodes, not on one card.
+# The card is the A6000 (box.sh's pick): a rank holds every expert of the v41-folder fixture on its card, which the
+# 24 GB card cannot hold (the 3090 reads DriverError out of memory at the load).
 gate-gpu-ds41-tp:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-ds41-tp && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41,checkpoint --release --bin gate_deepseek41_tp && unset BLOOMERY_CARD_BUDGET && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_tp'
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-ds41-tp && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41,checkpoint --release --bin gate_deepseek41_tp && unset BLOOMERY_CARD_BUDGET && bash tools/gpu-gate.sh gate_deepseek41_tp'
 
 # V4.1 전문가 층(host/tier.rs, twoeng R3)의 루프백: 스테이지와 층을 한 카드(3090, 게이트 배치)의 Gpu 둘에 올린다.
 # The gate plan puts each layer's id prefix [0, n_l) on the card; the tier plan moves its last 23 ids (n_l−23 … n_l) to
