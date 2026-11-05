@@ -1,3 +1,11 @@
+# STRUCK 2026-11-05 12:10 (lead): the premise is wrong by arithmetic. The file's 394.7 GB hold a 161.3 GB q6_K Engram table
+# (`per_layer_token_embd.weight`, 256 x 768M rows) that the engine reads sparsely from the file (a few rows a token, the
+# engram leg hidden under the host leg), not resident; the non-Engram bytes are 394.7 - 161.3 - 0.2 = 233 GB, LESS than
+# Q3_K_M's 324 - 79 = 245 GB, so the file fits the box alone and nothing is "past the box". No sitting was run. The file
+# also uses upstream llama.cpp's Engram layout (one concatenated table, engram_kv, a folded engram_gate, q6_K rows), which
+# the engine refuses by name today (`blk.1.engram_embd.weight: is not in the file`); that is a layout gap, a separate round.
+# [derived] even UD-Q4_K_XL (501 GB) is ~340 GB non-Engram, ~30 GB short of the box: ws alone 37.3 ms vs ws+Spark 37.2 ms,
+# parity; the breakeven is ~32 GB short at the measured 0.22 ms per GB short against the node's flat 7 ms a step.
 # Round iq3xxs-spark (kind profile): V4.1-Flash at a quant the box cannot hold (unsloth UD-IQ3_XXS, 394.7 GB in 7 shards)
 # — ws alone paging its missing experts from NVMe against ws + the Spark holding them. The box holds RAM 256 + A6000 48 +
 # 3090 24 = 328 GB; with ~20 GB of KV, scratch and the page cache's floor the file leaves ~87 GB past the box [derived].
