@@ -1,4 +1,7 @@
-# Round prefillcut (kind profile): the decode after a cut prompt with the stream floor per rows. The decode A/B
+# Round prefillcut (kind profile): the decode after a cut prompt with the group priced at T_MAX-row units — the floor per
+# rows AND the pick's counts scaled by T_MAX / the first member's rows (the floor alone, tried first, moved stage_us only
+# 0.3 -> 0.39 s: the pick counts the group's first member only, prefill.rs picked bitset, so a 256-row member's counts
+# are half a 512-row batch's). The decode A/B
 # (prefillcut-decode, n 512) read the 256 arm's last10 step 20.4 ms against 19.4-19.8 and p50 41 against 46: a steady
 # cost. The map (residency-pass-map): the residency's admission floor was STREAM_FLOOR x members = 64 for a group of two
 # 256-row batches, where each expert's per-batch count is half a 512-row batch's, so the pick admitted ~a quarter of
