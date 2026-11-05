@@ -3056,7 +3056,8 @@ mod tests {
         use model::placement::kernels::{self, DownAct, DownForms};
         const N: usize = 512;
         const FF: usize = 576;
-        let reads = Reads::default().with_layer(Some([GgmlType::MXFP4; 3]), GgmlType::MXFP8, FF);
+        let reads =
+            Reads::default().with_layer(Some([GgmlType::MXFP4; 3]), [GgmlType::MXFP8; 3], FF);
         assert!(!reads.fused && !reads.sh_q8_1, "{reads:?}");
         assert_eq!(reads.leg, DownForms::of(DownAct::Q8Blocks32));
         let gpu = Gpu::new().expect("card");

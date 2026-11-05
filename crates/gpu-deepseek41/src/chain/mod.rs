@@ -19,6 +19,7 @@
 pub mod attn;
 pub mod ffn;
 pub mod glue;
+pub mod join;
 
 // The prompt batch's host-side sums count in the host tier's nanoseconds.
 pub(crate) use bloomery_gpu::host::nanos;

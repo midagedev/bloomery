@@ -192,15 +192,7 @@ impl RowTypes {
     }
 
     fn read(split: &Split, engram: Option<&Engram>) -> Result<RowTypes, PlacementError> {
-        let ty = |name: String| {
-            split
-                .find(&name)
-                .map(|(_, t)| t.ty)
-                .ok_or_else(|| PlacementError::Tensor {
-                    name,
-                    detail: "is not in the file".to_string(),
-                })
-        };
+        let ty = |name| ty_in(split, name);
         let token_embd = ty(names::token_embd())?;
         let Some(engram) = engram else {
             return Ok(RowTypes {
@@ -539,6 +531,9 @@ pub struct LayerKind {
     /// `ffn_down_shexp`'s type: whether the shared expert's down projection
     /// reads its input as is or in q8_1 decides a launch of the step.
     pub shared_down: GgmlType,
+    /// `ffn_gate_shexp`'s and `ffn_up_shexp`'s types: the shared gate·up runs
+    /// a fused pair, or a gemv each over the f32 row with buffers of its own.
+    pub shared_gate_up: [GgmlType; 2],
     /// The types of the layer's routed gate, up and down stacks in stack
     /// order, `None` where the file holds none of them.
     pub routed_types: Option<[GgmlType; 3]>,
@@ -1338,17 +1333,26 @@ fn layer_kinds(
             },
             swiglu_limit: tables.swiglu[l],
             swiglu_limit_shared: tables.swiglu_shared[l],
-            shared_down: split
-                .find(&names::ffn_down_shexp(l))
-                .map(|(_, t)| t.ty)
-                .ok_or_else(|| PlacementError::Tensor {
-                    name: names::ffn_down_shexp(l),
-                    detail: "is not in the file".to_string(),
-                })?,
+            shared_down: ty_in(split, names::ffn_down_shexp(l))?,
+            shared_gate_up: [
+                ty_in(split, names::ffn_gate_shexp(l))?,
+                ty_in(split, names::ffn_up_shexp(l))?,
+            ],
             routed_types: routed_types(split, l),
         });
     }
     Ok(layers)
+}
+
+/// The type of tensor `name`, refused by name when the file holds none.
+fn ty_in(split: &Split, name: String) -> Result<GgmlType, PlacementError> {
+    match split.find(&name) {
+        Some((_, t)) => Ok(t.ty),
+        None => Err(PlacementError::Tensor {
+            name,
+            detail: "is not in the file".to_string(),
+        }),
+    }
 }
 
 /// The types of layer `l`'s routed gate, up and down stacks, `None` unless

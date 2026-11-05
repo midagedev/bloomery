@@ -113,6 +113,7 @@ pub mod node;
 pub mod nvtier;
 pub mod page;
 pub mod prompt_stream;
+pub mod rank;
 pub mod residency;
 pub mod route_trace;
 pub mod run;
@@ -128,8 +129,8 @@ pub mod xstream;
 
 pub use leg::{BatchLeg, LegTimer, ServeNote, StepLeg};
 pub use link::{
-    Crossing, GatherLoop, GatherSet, GatherShape, Gathers, Peer, PostCols, RdmaEnd, Reader,
-    RemoteWire, Span, TcpEnd, TcpPeer, link_tail,
+    Crossing, GatherLoop, GatherSet, GatherShape, Gathers, Peer, PeerPath, PostCols, RdmaEnd,
+    Reader, RemoteWire, Span, TcpEnd, TcpPeer, link_tail, paths,
 };
 
 use crate::GpuError;
@@ -2125,6 +2126,14 @@ impl<H: HostExperts> HostTier<H> {
     /// to the service. Load-time only.
     pub fn mark_unserved(&mut self, l: usize) {
         self.unserved.get_or_insert(l);
+    }
+
+    /// The step port waits for each go on the calling thread alone, not over
+    /// the process-wide pool: for a load whose host computes no expert, as a
+    /// rank of a tensor-parallel load, where other ranks in the process need
+    /// the pool to serve the goes this port's go waits on. Load-time only.
+    pub fn wait_go_alone(&mut self) {
+        self.step.parallel_wait = false;
     }
 
     /// Attach `trace`: from here on every one-row step's service records

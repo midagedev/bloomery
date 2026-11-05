@@ -84,6 +84,7 @@ use bloomery_gpu::fused::FusedKernels;
 use bloomery_gpu::gemm::GemmRoute;
 pub use bloomery_gpu::host::handoff::Handoff;
 use bloomery_gpu::host::handoff::HandoffKernels;
+use bloomery_gpu::host::rank::Sums;
 use bloomery_gpu::host::run::{HostRun, HostWidths};
 use bloomery_gpu::host::tier::TierTarget;
 use bloomery_gpu::hybrid::{Boundary, HOST, HandoffTarget, HostExperts, Hybrid, SlotMap};
@@ -105,11 +106,12 @@ use model::placement::kernels::{self, DownForms};
 use model::placement::{Role, tp};
 use runtime::combine::Slots;
 
+use crate::chain::join::TRUNK;
 use crate::dense::{Dense, DenseKernels};
 use crate::experts::{ExpertGateUp, ExpertKernels};
 use crate::hc::{
-    HC_MAX_TOKENS, HC_MIX, HC_PIECE, HC_STREAMS, HcFn, HcFnArgs, HcKernels, HcPreScratch,
-    hc_fold_elem, hc_post_elem,
+    HC_MAX_TOKENS, HC_MIX, HC_PIECE, HC_STREAMS, HcFn, HcFnArgs, HcKernels, HcPostArgs,
+    HcPreScratch, hc_fold_elem, hc_post_elem,
 };
 use crate::router::{N_EXPERT, N_USED, RouterKernels, RouterOut};
 use crate::transpose::TransposeKernels;
@@ -797,6 +799,9 @@ struct LayerCfg {
     limit_shared: f32,
     /// The shared down projection reads its input in q8_1: one launch more.
     sh_down_q8_1: bool,
+    /// The shared gate and up each run a gemv over the f32 row ([`sh_rows`]):
+    /// two launches more.
+    sh_rows: bool,
     /// HC_POST with the next fold (`false`: HC_POST alone).
     fold: bool,
 }
@@ -827,6 +832,8 @@ struct LayerWeights<'w> {
     bias: &'w DeviceBuffer<f32>,
     sh_gate: &'w DevWeight,
     sh_up: &'w DevWeight,
+    /// A shared gate and up each read over the f32 row ([`sh_rows`]).
+    sh_rows: Option<[Dense<'w>; 2]>,
     sh_down: Dense<'w>,
     hc: HcFn<'w>,
 }
@@ -849,6 +856,14 @@ impl<'w> LayerWeights<'w> {
             w.resident(ENQUEUE, &c.sh_gate)?,
             w.resident(ENQUEUE, &c.sh_up)?,
         );
+        let sh_rows = if c.sh_rows {
+            Some([
+                Dense::of(w, &c.sh_gate, n_embd, ff)?,
+                Dense::of(w, &c.sh_up, n_embd, ff)?,
+            ])
+        } else {
+            None
+        };
         let sh_down = Dense::of(w, &c.sh_down, ff, n_embd)?;
         Ok(LayerWeights {
             gain,
@@ -856,6 +871,7 @@ impl<'w> LayerWeights<'w> {
             bias,
             sh_gate,
             sh_up,
+            sh_rows,
             sh_down,
             hc: HcFn::of(
                 w,
@@ -1061,6 +1077,9 @@ struct FfnRow {
     act_h: Option<Q8Act>,
     down: DeviceBuffer<f32>,
     sh_h: DeviceBuffer<f32>,
+    /// The shared gate's and up's f32 rows, for a pair of types read over the
+    /// f32 row ([`sh_rows`]).
+    sh_gu: Option<[DeviceBuffer<f32>; 2]>,
     /// `sh_h` in q8_1, for a K-quant shared down projection.
     act_sh: Option<Q8Act>,
     sh_y: DeviceBuffer<f32>,
@@ -1085,6 +1104,9 @@ pub(crate) struct Reads {
     fused_q5k_down: bool,
     /// A shared down of a K-quant reads `sh_h` in q8_1.
     sh_q8_1: bool,
+    /// A shared gate and up of types read over the f32 row write rows of
+    /// their own ([`sh_rows`]).
+    sh_rows: bool,
     /// The forms the common card leg's downs read ([`kernels::down_act`] at
     /// `ff`), for its buffers ([`FfnPiece::prepare_leg`]).
     leg: DownForms,
@@ -1092,12 +1114,12 @@ pub(crate) struct Reads {
 
 impl Reads {
     /// These forms and those a layer of routed stacks `routed` (`[gate, up,
-    /// down]`, none for a layer without them) and shared down `shared_down`
-    /// reads at `ff`.
+    /// down]`, none for a layer without them) and shared expert `[gate, up,
+    /// down]` reads at `ff`.
     fn with_layer(
         mut self,
         routed: Option<[GgmlType; 3]>,
-        shared_down: GgmlType,
+        [shared_gate, shared_up, shared_down]: [GgmlType; 3],
         ff: usize,
     ) -> Reads {
         if let Some(t) = routed {
@@ -1109,8 +1131,43 @@ impl Reads {
             }
         }
         self.sh_q8_1 |= sh_down_reads_q8_1(shared_down);
+        self.sh_rows |= sh_rows(shared_gate, shared_up);
         self
     }
+}
+
+/// Whether a shared gate of type `gate` and up of type `up` each run a gemv
+/// over the f32 row and then the clamped SwiGLU: MXFP8 or BF16, which no
+/// fused pair reads.
+fn sh_rows(gate: GgmlType, up: GgmlType) -> bool {
+    let rows = |t| matches!(t, GgmlType::MXFP8 | GgmlType::BF16);
+    rows(gate) && rows(up)
+}
+
+/// The shared expert's h over the f32 row `x` for a gate and up read over
+/// the f32 row ([`sh_rows`]): a gemv each into `g` and `u`, then the clamped
+/// SwiGLU at `limit` of the first `h.len()` values into `h`.
+fn enqueue_sh_rows(
+    gpu: &Gpu,
+    dense: &DenseKernels,
+    [gate, up]: [Dense<'_>; 2],
+    (x, limit): (&DeviceBuffer<f32>, f32),
+    (sink, [g, u], h): (
+        FaultSink,
+        &mut [DeviceBuffer<f32>; 2],
+        &mut DeviceBuffer<f32>,
+    ),
+) -> Result<(), GpuError> {
+    dense.enqueue(gpu, gate, x, None, g)?;
+    dense.enqueue(gpu, up, x, None, u)?;
+    let n = h.len();
+    gpu.elem().enqueue_swiglu_rule(
+        gpu.stream(),
+        Act::SwigluClamp { limit },
+        (&*g, &*u),
+        n,
+        (sink, h),
+    )
 }
 
 /// Whether a shared down of type `ty` reads its input in q8_1: the K-quant
@@ -1150,6 +1207,11 @@ impl FfnRow {
             act_h: q8(reads.fused, N_USED)?,
             down: z(N_USED * n_embd)?,
             sh_h: z(ff)?,
+            sh_gu: if reads.sh_rows {
+                Some([z(ff)?, z(ff)?])
+            } else {
+                None
+            },
             act_sh: q8(reads.sh_q8_1, 1)?,
             sh_y: z(n_embd)?,
             y: z(n_embd)?,
@@ -1179,6 +1241,10 @@ impl FfnRow {
             + q8act_bytes(&self.act_x)
             + self.act_h.as_ref().map_or(0, q8act_bytes)
             + self.act_sh.as_ref().map_or(0, q8act_bytes)
+            + self
+                .sh_gu
+                .as_ref()
+                .map_or(0, |g| g.iter().map(DeviceBuffer::num_bytes).sum())
             + self.leg.as_ref().map_or(0, LegBufs::bytes)
     }
 }
@@ -1288,7 +1354,8 @@ impl FfnPiece {
                     )));
                 }
             }
-            reads = reads.with_layer(kind.routed_types, kind.shared_down, ff);
+            let [sh_gate, sh_up] = kind.shared_gate_up;
+            reads = reads.with_layer(kind.routed_types, [sh_gate, sh_up, kind.shared_down], ff);
             cfg.push(LayerCfg {
                 norm: names::ffn_norm(l),
                 router: names::ffn_gate_inp(l),
@@ -1304,6 +1371,7 @@ impl FfnPiece {
                 limit: kind.swiglu_limit,
                 limit_shared: kind.swiglu_limit_shared,
                 sh_down_q8_1: sh_down_reads_q8_1(kind.shared_down),
+                sh_rows: sh_rows(sh_gate, sh_up),
                 fold: hp.layers.get(l + 1).is_some_and(|k| k.engram.is_none()),
             });
         }
@@ -1412,8 +1480,10 @@ impl FfnPiece {
     /// memory-operation batches; it enqueues no copy.
     #[must_use]
     pub fn launches(&self, layer: usize) -> Option<usize> {
-        self.cfg_of(layer)
-            .map(|c| if c.n_card > 0 { 10 } else { 7 } + usize::from(c.sh_down_q8_1))
+        self.cfg_of(layer).map(|c| {
+            let base = if c.n_card > 0 { 10 } else { 7 };
+            base + usize::from(c.sh_down_q8_1) + 2 * usize::from(c.sh_rows)
+        })
     }
 
     /// Device bytes of the piece's own scratch, every row's and the GEMM
@@ -1523,7 +1593,7 @@ impl FfnPiece {
         extra: &mut [&mut dyn ShadowWork],
     ) -> Result<(), GpuError> {
         self.enqueue_go_half(gpu, w, card, &io, hybrid, layer, 0, extra)?;
-        self.enqueue_join_half(gpu, io, hybrid, layer, 0)
+        self.enqueue_join_half(gpu, io, hybrid, (layer, 0), None)
     }
 
     /// The layer's launches up to its join, on row `row`'s buffers:
@@ -1609,18 +1679,20 @@ impl FfnPiece {
 
     /// The layer's rest on row `row`'s buffers, after its
     /// [`FfnPiece::enqueue_go_half`]: the wait, the join, and the host tier told the row's layer is enqueued.
+    /// On a rank of a tensor-parallel load `sums` adds the ranks' combines before HC_POST reads
+    /// them ([`FfnPiece::enqueue_join`]).
     pub fn enqueue_join_half<H: HostExperts>(
         &mut self,
         gpu: &Gpu,
         io: FfnIo<'_>,
         hybrid: &mut Hybrid<H>,
-        layer: usize,
-        row: usize,
+        (layer, row): (usize, usize),
+        sums: Option<&mut Sums>,
     ) -> Result<(), GpuError> {
         let i = self.check_io(layer, hybrid.slots(), &io, row)?;
         let boundary = hybrid.boundary();
         boundary.enqueue_back_of(gpu.stream(), row, layer)?;
-        self.enqueue_join(gpu, i, row, io, boundary)?;
+        self.enqueue_join(gpu, (i, row), io, boundary, sums)?;
         hybrid.row_enqueued(layer, row)
     }
 
@@ -1916,8 +1988,25 @@ impl FfnPiece {
             }
             None => {}
         }
-        match (lw.sh_gate, lw.sh_up) {
+        match (lw.sh_rows, lw.sh_gate, lw.sh_up) {
+            (Some([gate, up]), ..) => {
+                let Some(gu) = r.sh_gu.as_mut() else {
+                    return Err(GpuError::State {
+                        what: ENQUEUE,
+                        missing: "the shared gate's and up's f32 rows, which a piece of no such \
+                                  layer does not hold",
+                    });
+                };
+                enqueue_sh_rows(
+                    gpu,
+                    &self.dense,
+                    [gate, up],
+                    (boundary.normed(), c.limit_shared),
+                    (gpu.layer_sink(layer)?, gu, &mut r.sh_h),
+                )?;
+            }
             (
+                None,
                 DevWeight::KQuant {
                     ty: GgmlType::Q3_K,
                     w: g,
@@ -1937,7 +2026,7 @@ impl FfnPiece {
                 gpu.layer_sink(layer)?,
                 &mut r.sh_h,
             )?,
-            (gate, up) => self.experts.enqueue_shexp_gate_up(
+            (None, gate, up) => self.experts.enqueue_shexp_gate_up(
                 stream,
                 gate,
                 up,
@@ -1973,14 +2062,17 @@ impl FfnPiece {
     }
 
     /// The join on row `row`'s buffers and host sum: the combine and HC_POST
-    /// in one launch, with the next fold where the layer folds.
+    /// in one launch, with the next fold where the layer folds. On a rank (`sums`) the combine is
+    /// the rank's part of every expert's width: the launch's `y` is summed over the ranks
+    /// ([`crate::chain::join::TRUNK`]) and HC_POST runs again on the sum. HC_POST writes a fold:
+    /// where the layer does not fold, into the shared expert's output, which the combine has read.
     fn enqueue_join(
         &mut self,
         gpu: &Gpu,
-        i: usize,
-        row: usize,
+        (i, row): (usize, usize),
         io: FfnIo<'_>,
         boundary: &Boundary,
+        sums: Option<&mut Sums>,
     ) -> Result<(), GpuError> {
         let hsum = boundary.hsum_of(row)?;
         let r = &mut self.rows[row];
@@ -1996,8 +2088,28 @@ impl FfnPiece {
             n_card: self.cfg[i].n_card,
             n_used: N_USED,
         };
+        let Some(sums) = sums else {
+            return self.kernels.enqueue_post(
+                gpu.stream(),
+                &p,
+                &mut r.y,
+                io.streams_out,
+                io.fold_out,
+            );
+        };
         self.kernels
-            .enqueue_post(gpu.stream(), &p, &mut r.y, io.streams_out, io.fold_out)
+            .enqueue_post(gpu.stream(), &p, &mut r.y, io.streams_out, None)?;
+        sums.join(gpu, TRUNK, &mut r.y)?;
+        let fold = io.fold_out.unwrap_or(&mut r.sh_y);
+        let post = HcPostArgs {
+            x: &r.y,
+            res: io.streams,
+            hc: &r.hc_out,
+            n_embd: self.n_embd,
+            tokens: 1,
+        };
+        self.hc
+            .enqueue_post(gpu.stream(), &post, io.streams_out, fold)
     }
 }
 
@@ -2154,6 +2266,94 @@ pub fn host_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shared gate and up read over the f32 row ([`enqueue_sh_rows`]),
+    /// BF16 and MXFP8: `h` is the clamped SwiGLU of the gate's gemv and the
+    /// up's, bit for bit, at a limit some values reach. Mutant: the gate's
+    /// and the up's rows swapped into the SwiGLU.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-ds41-lib` runs it on the box"]
+    fn hw_shared_rows_pair_is_two_gemvs_then_swiglu() {
+        use crate::dense::testdata::f32s;
+        use crate::experts::swiglu_clamp;
+        use bloomery_gpu::q8f32::{E4m3Scales, E4m3Weight, e4m3_planes};
+        const ROWS: usize = 24;
+        const K: usize = 256;
+        const LIMIT: f32 = 0.5;
+        let gpu = Gpu::new().expect("card");
+        let stream = gpu.stream();
+        let dense = DenseKernels::load(gpu.context()).expect("dense");
+        let x = DeviceBuffer::from_host(stream, &f32s(K, 7)).expect("x");
+        // BF16 words of values in [-1/8, 1/8), two a word, low half first.
+        let bf16 = |seed| {
+            let words: Vec<u32> = f32s(ROWS * K, seed)
+                .chunks(2)
+                .map(|p| ((p[0] / 8.0).to_bits() >> 16) | ((p[1] / 8.0).to_bits() & 0xffff_0000))
+                .collect();
+            DeviceTensor::upload(stream, &words, ROWS, K / 2).expect("bf16")
+        };
+        // MXFP8 blocks at scale 2^-3, each value byte's top exponent bit clear (off E4M3's NaN).
+        let mxfp8 = |seed| {
+            let bytes: Vec<u8> = f32s(ROWS * K / 32 * 33, seed)
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    if i % 33 == 0 {
+                        124
+                    } else {
+                        ((v + 1.0) * 127.5) as u8 & 0xBF
+                    }
+                })
+                .collect();
+            let (qs, e) = e4m3_planes(E4m3Scales::Mxfp8, &bytes, ROWS, K).expect("planes");
+            (
+                DeviceTensor::upload(stream, &qs, ROWS, K / 4).expect("qs"),
+                DeviceTensor::upload(stream, &e, ROWS, K.div_ceil(128)).expect("e"),
+            )
+        };
+        let (bg, bu, mg, mu) = (bf16(1), bf16(2), mxfp8(3), mxfp8(4));
+        fn mx((qs, e): &(DeviceTensor<u32>, DeviceTensor<u32>)) -> Dense<'_> {
+            Dense::Mxfp8(E4m3Weight {
+                qs,
+                e,
+                scales: E4m3Scales::Mxfp8,
+            })
+        }
+        for (what, gate, up) in [
+            ("bf16", Dense::Bf16(&bg), Dense::Bf16(&bu)),
+            ("mxfp8", mx(&mg), mx(&mu)),
+        ] {
+            let gemv = |w| {
+                let mut y = DeviceBuffer::zeroed(stream, ROWS).expect("y");
+                dense.enqueue(&gpu, w, &x, None, &mut y).expect("gemv");
+                y.to_host_vec(stream).expect("rows")
+            };
+            let want: Vec<u32> = gemv(gate)
+                .iter()
+                .zip(&gemv(up))
+                .map(|(&g, &u)| swiglu_clamp(g, u, LIMIT).to_bits())
+                .collect();
+            let zeros = || DeviceBuffer::zeroed(stream, ROWS).expect("rows");
+            let (mut gu, mut h) = ([zeros(), zeros()], zeros());
+            let sink = gpu.unlabelled_sink();
+            enqueue_sh_rows(
+                &gpu,
+                &dense,
+                [gate, up],
+                (&x, LIMIT),
+                (sink, &mut gu, &mut h),
+            )
+            .expect(what);
+            let got: Vec<u32> = h
+                .to_host_vec(stream)
+                .expect("h")
+                .iter()
+                .map(|v| v.to_bits())
+                .collect();
+            assert_eq!(gpu.take_fault().expect("fault"), None, "{what}");
+            assert_eq!(got, want, "{what}");
+        }
+    }
 
     /// A rank's part of the 2,304-wide experts (1,152 at two ranks, 576 at
     /// four) opens where its downs read it: an MXFP4 routed down over the

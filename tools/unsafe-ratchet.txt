@@ -812,12 +812,17 @@ gguf 7 2 0
 # (words.rs: `WordOps::batch`, an unsafe fn with mem_batch's contract, its memop arm, its two kernel-side enqueues, the
 # module load and the kernel's system-scope add), graph.rs's two reads of a memory operation's union (its kind, an add's
 # fields), and host/mod.rs's probe (the driver version, the barrier and the raw reduction), each with its SAFETY line.
-# PIN(2026-11-05): gpu 3007 -> 3012 blocks, 415 -> 417 fns, new code, not old code relaxed: a prompt batch's block on a
+# PIN(2026-11-03): gpu 3007 -> 3012 blocks, not old code relaxed: a tensor-parallel rank's sums (host/rank.rs
+# `Sums`). Three moved from gpu-glm5next's tp::gather, which comes down by 3: the part's window over the rank's
+# own page, the join's one-batch counter operations (mem_batch) and the rank-order sum. Two are new code: the
+# separate post's and wait's counter operations of a slot posted early and summed later. Each call is in a block
+# of its own with its SAFETY line; the sums hold the page past every launch they enqueue.
+# PIN(2026-11-05): gpu 3012 -> 3017 blocks, 415 -> 417 fns, new code, not old code relaxed: a prompt batch's block on a
 # tier node — batch.rs's `dtoh_mapped_at` (the block's q8_1 planes into the leg's rows) and `htod_bytes` (the request's
 # bytes into the node's staging), two unsafe fns with their copies, graph.rs's `MappedHost::bytes_at` (the planes read
 # for the request) and node.rs's `run_block` (the request's landing copies and the rows' copy back), each with its
 # SAFETY line.
-gpu 3012 417 10
+gpu 3017 417 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -957,7 +962,8 @@ gpu-gemma4a 11 0 0
 # (tp::gather) writes its part into its own mapped page through a window, posts and waits on the page's counters
 # (mem_batch) and adds the parts in rank order (Gathers::enqueue_sum), each call in a block of its own with its
 # SAFETY line; the rank holds the page past every launch it enqueues.
-gpu-glm5next 7 0 0
+# PIN(2026-11-03): gpu-glm5next 7 -> 4 blocks: tp::gather moved to the shared owner (gpu's host/rank.rs `Sums`).
+gpu-glm5next 4 0 0
 # PIN(2026-10-23): gpu-mimo2 0 -> 5 blocks, 0 -> 1 fns: enqueue_append propagates the
 # K192 cache-writer contract to one-token and consecutive prompt/slot callers within each ring.
 # Each call has its SAFETY invariant; no device operation changes.

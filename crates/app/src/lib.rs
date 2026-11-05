@@ -32,6 +32,7 @@ pub mod arch;
 #[cfg(feature = "dspark")]
 pub mod dspark;
 pub mod mtp;
+pub mod tp;
 pub mod warm;
 
 use std::collections::BTreeSet;

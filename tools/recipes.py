@@ -6205,6 +6205,8 @@ def row_derivation(tree: Tree, graph: Graph, gates: list[str], matched: list[str
                 if t is None:
                     continue
                 own, _ = tree.tree_of(t.src, test=True)
+                # a module the recipe's features leave out of its own tree names nothing the gate runs
+                own = {f for f in own if graph.inputs(n).match(f) is not None}
                 hit = next((f for f in sorted(own) if any(names_module(named_paths(tree.read(f)), p, kids) for p, kids in paths)), None)
                 if hit:
                     named[n] = (kind, tname or "", hit, "::".join(paths[0][0]))
