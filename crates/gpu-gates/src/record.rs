@@ -393,6 +393,7 @@ pub static LOAD: Kind = Kind {
         key("ced", Text, ""),
         opt("prefill_refusal", Text, ""),
         key("group", U64, "batches"),
+        key("cut", U64, "positions"),
         lit(" in "),
         pos("load_s", F64(1), "s"),
         lit(" s (runtime value)"),

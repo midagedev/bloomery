@@ -256,6 +256,32 @@ fn prefill_group_default_is_the_rows() {
     assert_eq!(*d, PREFILL_GROUP_DEFAULT.to_string());
 }
 
+/// `BLOOMERY_PREFILL_CUT` takes 1 to [`PREFILL_CUT_MAX`] positions, reads
+/// unset as the most a pass holds (in a binary that does not act on it
+/// too, where the body reads it at open), and refuses 0 and anything above
+/// that by name with its range.
+#[test]
+fn prefill_cut_takes_one_to_the_pass_size_and_refuses_the_rest() {
+    let cut = |pairs: &[(&str, &str)]| read(&env(pairs), Scope::Every).map(|l| l.prefill_cut());
+    let most = usize::try_from(PREFILL_CUT_MAX).unwrap();
+    assert_eq!(cut(&[]).unwrap(), most);
+    let other = read(&env::<&str>(&[]), NO_LEVER).expect("nothing is set");
+    assert_eq!(other.prefill_cut(), most);
+    for (v, want) in [("1", 1), ("128", 128), ("256", 256), ("512", 512)] {
+        assert_eq!(cut(&[(PREFILL_CUT, v)]).unwrap(), want, "{v}");
+    }
+    for bad in ["0", "513", "1024", "", "2k", "-1"] {
+        let Err(e) = cut(&[(PREFILL_CUT, bad)]) else {
+            panic!("{bad:?} is outside 1 to {PREFILL_CUT_MAX} and must be refused");
+        };
+        let text = e.to_string();
+        assert!(
+            text.contains(PREFILL_CUT) && text.contains("a whole number from 1 to 512"),
+            "{bad:?}: {text}"
+        );
+    }
+}
+
 /// `BLOOMERY_LANE_PREFETCH`'s row is a parsed same-binary arm taking `on`
 /// and `off`, its default [`LANE_PREFETCH_DEFAULT`] (what the host union
 /// holds in a binary that does not act on it), and its accessor reads unset
@@ -432,6 +458,7 @@ fn accessors_read_their_rows() {
     assert!(unset.ced());
     assert_eq!(unset.prefill(), "batch");
     assert_eq!(unset.prefill_group(), 2);
+    assert_eq!(unset.prefill_cut(), 512);
     assert!(unset.engram_helper());
     assert!(!unset.step_stats());
     assert_eq!(unset.card_budget(), CardBudget::Unset);
@@ -471,6 +498,7 @@ fn accessors_read_their_rows() {
             (CED, "off"),
             (PREFILL, "steps"),
             (PREFILL_GROUP, "1"),
+            (PREFILL_CUT, "256"),
             (ENGRAM_HELPER, "0"),
             (STEP_STATS, "1"),
             (CARD_BUDGET, "38G"),
@@ -510,6 +538,7 @@ fn accessors_read_their_rows() {
     assert!(!set.ced());
     assert_eq!(set.prefill(), "steps");
     assert_eq!(set.prefill_group(), 8);
+    assert_eq!(set.prefill_cut(), 256);
     assert!(!set.engram_helper());
     assert!(set.step_stats());
     assert_eq!(set.card_budget(), CardBudget::Every(38 << 30));
@@ -575,6 +604,7 @@ fn accessors_read_their_rows() {
             CED,
             PREFILL,
             PREFILL_GROUP,
+            PREFILL_CUT,
             ENGRAM_HELPER,
             STEP_STATS,
             CARD_BUDGET,

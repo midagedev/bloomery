@@ -40,7 +40,6 @@ use bloomery_gpu::{Gpu, GpuError};
 use cuda_core::CudaStream;
 use model::arch::deepseek41::hparams::Hparams;
 
-use super::prefill::batches;
 use super::{Body, Holds, LayerKv, PAIR_ROWS, Shadows, layer_kv};
 
 /// The tokens a sequence holds, one per position: what each step's engram
@@ -459,13 +458,15 @@ impl Body {
 
     /// The positions of a prompt call of `first .. end` whose shadow rows
     /// some layer leaves unwritten: [`super::Need::hole`] of the needs the
-    /// call's start would set, fed as [`batches`] with no feature tap.
+    /// call's start would set, fed as [`super::BodyLevers::batches`] with no feature tap.
     #[must_use]
     pub fn call_hole(&self, first: usize, end: usize) -> Range<usize> {
         if end <= first {
             return first..first;
         }
-        let starts: Vec<usize> = batches(first, end - first)
+        let starts: Vec<usize> = self
+            .levers
+            .batches(first, end - first)
             .iter()
             .map(|r| r.start)
             .collect();

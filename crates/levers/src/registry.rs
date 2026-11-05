@@ -15,6 +15,7 @@ pub const SPIN: &str = "BLOOMERY_SPIN";
 pub const CED: &str = "BLOOMERY_CED";
 pub const PREFILL: &str = "BLOOMERY_PREFILL";
 pub const PREFILL_GROUP: &str = "BLOOMERY_PREFILL_GROUP";
+pub const PREFILL_CUT: &str = "BLOOMERY_PREFILL_CUT";
 pub const ENGRAM_HELPER: &str = "BLOOMERY_ENGRAM_HELPER";
 pub const STEP_STATS: &str = "BLOOMERY_STEP_STATS";
 pub const CARD_BUDGET: &str = "BLOOMERY_CARD_BUDGET";
@@ -65,6 +66,11 @@ pub const PREFILL_GROUP_MAX: u64 = 8;
 /// `BLOOMERY_PREFILL_GROUP` unset: the row's default, the group GLM-5.3's
 /// plan reserves a prompt batch's units for and MiMo-V2.6-Flash's load runs.
 pub const PREFILL_GROUP_DEFAULT: u64 = 2;
+
+/// The largest `BLOOMERY_PREFILL_CUT`, and its default when unset: the
+/// positions a V4.1 prompt pass carries at most, which is the host union's
+/// column count and what the body's batch buffers are sized for.
+pub const PREFILL_CUT_MAX: u64 = 512;
 
 /// `BLOOMERY_LANE_PREFETCH` unset: the row's default, which the host
 /// union holds in a binary that does not act on the lever
@@ -216,6 +222,30 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               reserve is refused by name. GLM-5.3, MiMo-V2.6-Flash, MiniMax-M3 and Mistral \
               Large 4 change it between calls through `set_prefill_group`; V4.1 fixes it at \
               load, so the row's phase is `load` until every family carries a setter.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: PREFILL_CUT,
+        class: Class::A,
+        kind: Kind::Count {
+            min: 1,
+            max: PREFILL_CUT_MAX,
+            trim: false,
+        },
+        default: Unset::Is("512"),
+        doc: "V4.1 `generate_ds41`: the positions a prompt pass carries at most; a call of `n` \
+              positions runs `ceil(n / cut)` passes of near-equal size, so a call of 512 under \
+              256 is two passes of 256. The group pipeline (`BLOOMERY_PREFILL_GROUP`) overlaps \
+              one pass's host serve with the next pass's card route, so a call that is one pass \
+              overlaps nothing; cutting it into passes gives the pipeline something to \
+              overlap, at the cost of reading each host expert once a pass. Unset is one pass \
+              up to 512 positions, the most a pass holds; a value above 512 or 0 is refused by \
+              name. `1` runs a pass a position, is no use and is accepted. The cut moves no \
+              bits: the prefill gate holds a call to the decode steps' bits under 256 as under \
+              the default. The `load` line prints `cut=`.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

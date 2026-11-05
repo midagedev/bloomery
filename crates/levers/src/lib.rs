@@ -38,9 +38,9 @@ pub use registry::{
     GEN_SLOTS, GEN_SLOTS_MAX, HOST_LANES, HOST_LANES_DEFAULT, HOST_LOCK, HOST_POPULATE, HOST_ROOM,
     HOSTSTREAM, LANE_PREFETCH, LANE_PREFETCH_DEFAULT, MTP_DRAFT, MTP_HEAD_ROWS, MTP_WIDTH,
     MTP_WINDOWS, NEED_HOOK, NVTIER_BYTES, NVTIER_EVICT, NVTIER_MEM, NVTIER_READ, PIN_MAIN, PREFILL,
-    PREFILL_GROUP, PREFILL_GROUP_DEFAULT, PREFILL_GROUP_MAX, QWEN3_KV, QWEN38_EXPERTS, R8,
-    RESIDENCY, ROUTE_TRACE, SCREEN, SPIN, STEP_STATS, THREADS, TIER_LINK, TIER_NODES, TP_NODES,
-    WARM_PROFILE, WORD_OPS,
+    PREFILL_CUT, PREFILL_CUT_MAX, PREFILL_GROUP, PREFILL_GROUP_DEFAULT, PREFILL_GROUP_MAX,
+    QWEN3_KV, QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE, SCREEN, SPIN, STEP_STATS, THREADS,
+    TIER_LINK, TIER_NODES, TP_NODES, WARM_PROFILE, WORD_OPS,
 };
 
 #[cfg(test)]
@@ -1194,6 +1194,14 @@ impl Levers {
     pub fn prefill_group(&self) -> usize {
         let n = Levers::defaulted(PREFILL_GROUP, self.count(PREFILL_GROUP));
         Levers::usize_of(PREFILL_GROUP, n)
+    }
+
+    /// `BLOOMERY_PREFILL_CUT`: the positions a V4.1 prompt pass carries at
+    /// most, 1 to [`PREFILL_CUT_MAX`].
+    #[must_use]
+    pub fn prefill_cut(&self) -> usize {
+        let n = Levers::defaulted(PREFILL_CUT, self.count(PREFILL_CUT));
+        Levers::usize_of(PREFILL_CUT, n)
     }
 
     /// `BLOOMERY_ENGRAM_HELPER`: V4.1 step rows read by a helper thread.
