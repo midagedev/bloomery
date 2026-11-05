@@ -3445,6 +3445,7 @@ mod tests {
             ced: false,
             prefill: PrefillMode::Batch,
             group: 1,
+            cut: T_MAX,
             rows: RowsLevers {
                 helper: true,
                 stats: false,
