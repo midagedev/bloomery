@@ -4344,3 +4344,18 @@ gate-raon1-tokenizer:
     ./tools/box.sh 'BLOOMERY_LLAMA_BPE_GGUF=$BLOOMERY_DATA/vocab-llama-bpe/ggml-vocab-llama-bpe.gguf bash tools/gate.sh --release -p bloomery-tokenizer --lib --test raon -- --include-ignored --nocapture'
 
 # --- end raon-model ---
+
+# --- prune-lab ---
+# What V4.1-Flash loses when the coldest X % of each routed layer's experts cannot be picked (crates/gpu-gates/src/bin/lab_prune_ds41.rs): per corpus
+# (prose, code: the first ids of $BLOOMERY_DATA/engram/corpus-{prose,code}.ids; ko: tools/ref/corpus-ko.txt, Kim Yu-jeong's «Dongbaek-kkot» from ko.wikisource,
+# public domain, tokenized by the file's vocabulary) the full-vocabulary KL of the pruned model against the unpruned one in f64, the top-id agreement
+# and the change of the next id's NLL, at X = 0 (the A/A, which must be exactly 0), 25, 40, 50. The ranks it cuts by are the prose + code learning slice
+# `python3 tools/ref/router-prune.py rank --out $BLOOMERY_DATA/router/v41-rank-prunelab-prose-code.tsv` writes (the replay `router-prune.py replay`
+# prints the share of slots the same cuts take on the sets). A lab, not a gate: no engine landing selects it, nothing times, no lease; it loads V4.1 on
+# plan a, so it takes the V4.1 load lock. ARGS reach the bin (--corpus prose,code,ko; --cuts 0,25,40,50; --n 2048; --plan prints the plan and the
+# wall and stops before the load). Planned wall 3 corpora x 5 passes x 2,048 steps at ~40 ms plus the load: ~24 min [derived]; run one --corpus a job.
+[group('v41-load')]
+lab-prune-ds41 *ARGS:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh lab-prune-ds41 && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin lab_prune_ds41 && BLOOMERY_GATE_BOUND=1740 bash tools/gpu-gate.sh lab_prune_ds41 --rank $BLOOMERY_DATA/router/v41-rank-prunelab-prose-code.tsv {{ARGS}}'
+
+# --- end prune-lab ---

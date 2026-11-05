@@ -851,3 +851,9 @@ required-features = ["gpu"]
 [[bin]]
 name = "gate_raon1_dflash"
 required-features = ["gpu"]
+
+# lab-prune-ds41: a lab, not a gate (no engine landing selects it): what V4.1-Flash loses when the coldest X % of each layer's experts
+# cannot be picked, measured as the full-vocabulary KL of the pruned model against the unpruned one on prose, code and Korean ids.
+[[bin]]
+name = "lab_prune_ds41"
+required-features = ["deepseek41"]

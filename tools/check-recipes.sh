@@ -469,6 +469,7 @@ pytools_list() {
     "tools/ref/qwen4exp-nvfp4-oracle-test.py --self-test"
     "tools/ref/route-trace-chat.py --self-test"
     "tools/ref/router-coverage.py --self-test"
+    "tools/ref/router-prune.py --self-test"
     "tools/ref/router-rank.py --self-test"
     "tools/ref/router-residency.py --self-test"
     "tools/ref/set-diff.py --self-test"

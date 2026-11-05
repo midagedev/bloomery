@@ -53,6 +53,7 @@ pub mod oracle;
 #[cfg(feature = "gpu")]
 pub mod prefill_gate;
 pub mod prompts;
+pub mod prune;
 pub mod ptx;
 pub mod q36_fixture;
 pub mod q38_fixture;
