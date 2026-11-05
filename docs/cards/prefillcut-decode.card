@@ -1,0 +1,19 @@
+# Round prefillcut (kind profile): the decode after a cut prompt. In the pp A/B (prefillcut-ab, n 96) the 256 and 128
+# arms decoded 39-40 tok/s(p50) against the one-pass arm's 46, warm step 20.5-21.3 ms against 18.9, and their
+# `residency pass pass=prompt` record read stage_us 0.26-0.38 s against the one-pass arm's 2.0-2.3 s: the residency
+# machine stages its hot set during the prompt call, under the long one-pass prompt, and a shorter prompt leaves less
+# staged when decode starts. [derived] the gap is the warm-up's, not a steady-state cost: with n 512 the last 10 steps
+# of the 256 arm read the one-pass arm's warm step within the ruler (SD 0.6 %, 2 rounds: +-1.4 %); the first 100 steps
+# carry the gap. The measured value is the 256 arm's last10_p50 step against the 512 arm's, same lease.
+kind: profile
+question: is the slower decode after a cut prompt a residency warm-up transient (converges by n 512) or a steady cost?
+term: last10_p50 step ms @ n=512, prose P 512, depth 512, plan (a), A6000, BLOOMERY_PREFILL_CUT=256 against 512
+unit: ms
+predict: 18.5..19.8
+condition: one binary (the prefillcut worktree's commit), BLOOMERY_DECODE_N=512, 2 rounds, each arm's load its own
+  process printing `cut=`; rows marked [cold] or [cpu-busy] stand with their mark
+decide-in: transient: land the cut with the pp headline; the decide-below item of the residency (stage during a short
+  prompt) is a triage line, not a blocker
+decide-below: under 18.5 is not expected; re-read the ruler
+decide-above: over 19.8: the cut leaves the residency a different hot set (the per-pass boundary counts), a steady cost;
+  read the two arms' residency pass records (kept, landed, churn) before landing, and the lever stays opt-in
