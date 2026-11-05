@@ -1,0 +1,11 @@
+--- a/crates/gpu/src/linear/delta.rs
++++ b/crates/gpu/src/linear/delta.rs
+@@ -2741,7 +2741,7 @@
+         // SAFETY: row_at + v_at < m * ch, inside qkv.
+         let vt = unsafe { *qkv.get_unchecked(row_at + v_at) };
+         // SAFETY: t * n_v + h < m * n_v, inside beta.
+-        let bt = unsafe { *beta.get_unchecked(t * n_v + h) };
++        let bt = unsafe { *beta.get_unchecked(h) };
+         let dh = if DECAY == DECAY_HEAD {
+             // SAFETY: t * n_v + h < m * n_v, inside per-head decay.
+             unsafe { *decay.get_unchecked(t * n_v + h) }

@@ -847,6 +847,11 @@ required-features = ["gpu"]
 name = "gate_raon1_attn"
 required-features = ["gpu"]
 
+# kimik3kda: Kimi K3's KDA layer through `mixer_kda` at 2 and 96 heads of 128 against llama.cpp's graph in f64.
+[[bin]]
+name = "gate_kimi_k3_kda"
+required-features = ["gpu"]
+
 # dfl-wire: Raon-1's DFlash2 draft: its load, the V4.1 DSpark file refused, and its first block against the host oracle's.
 [[bin]]
 name = "gate_raon1_dflash"

@@ -255,3 +255,5 @@ gate-raon1-meta	family	raon1	meta	arch_registry
 gate-raon1-tokenizer	family	raon1	tokenizer	tokenizer_jinja
 # dfl-wire
 gate-gpu-raon1-dflash	family	raon1	draft	drafts_dspark
+# kimik3kda
+gate-gpu-kimik3-kda	family	kimi-k3	kernel	attn_linear_gdn_kda
