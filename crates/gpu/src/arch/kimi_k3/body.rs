@@ -8,7 +8,7 @@
 //! 1. the mix of the banks and the sum `x` (`attn_res_score`); with no bank yet, `x` itself;
 //! 2. on every `attn_res.block_size`th layer, `x` is banked (the raw sum, not the mix);
 //! 3. the mixer: a delta layer ([`super::kda`]) or the gated latent layer
-//!    ([`crate::arch::raon1::mla`], the one gated latent core both Raon-1 and K3 run), each
+//!    ([`crate::arch::gated_mla`], the one gated latent core both Raon-1 and K3 run), each
 //!    taking its own attn norm of the mix;
 //! 4. the sum after the mixer is the mixer's update alone on a banking layer (the stream
 //!    restarts), else `x` plus the update;
