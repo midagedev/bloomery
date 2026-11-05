@@ -2392,12 +2392,8 @@ impl Body {
             missing: "the call's needs",
         })?;
         if batch.stream.on {
-            // The floor is per T_MAX rows the group holds, not per member: a cut
-            // batch carries fewer rows, so its counts are smaller in the same
-            // ratio, and a per-member floor would admit a quarter of the set.
-            let rows: usize = members.iter().map(|m| m.u).sum();
-            let floor = (STREAM_FLOOR as usize * rows).div_ceil(T_MAX);
-            hybrid.call_floor(u32::try_from(floor).unwrap_or(u32::MAX))?;
+            let n = u32::try_from(members.len()).unwrap_or(u32::MAX);
+            hybrid.call_floor(STREAM_FLOOR.saturating_mul(n))?;
         }
         let first = members.first().map_or(0, |m| m.batch);
         let mut cx = GroupCx {
