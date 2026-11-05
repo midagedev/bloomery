@@ -1,0 +1,7 @@
+{
+  "model_type": "toy_kimi",
+  "bos_token_id": 267,
+  "eos_token_id": 269,
+  "pad_token_id": 522,
+  "vocab_size": 525
+}
