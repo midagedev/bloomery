@@ -478,7 +478,7 @@ pub fn open_rank<S: Source + Sync>(
     let card: BTreeMap<&str, &ModelTensor> = tensors
         .tensors
         .iter()
-        .filter(|t| on_rank(t.role))
+        .filter(|t| tp::card_holds(&t.name))
         .map(|t| (t.name.as_str(), t))
         .collect();
     let routed_formats = rank_routed_formats(card.values().copied())?;
@@ -536,22 +536,6 @@ pub fn open_rank<S: Source + Sync>(
         head: Some(head),
         ctx_max,
     }))
-}
-
-/// Whether a rank's card holds a tensor of `role`: every one a step reads on
-/// the card, every routed expert among them; not the rows the host reads per
-/// token (the token embedding, the engram and hash tables) nor what no step
-/// reads.
-fn on_rank(role: Role) -> bool {
-    !matches!(
-        role,
-        Role::TokenEmbedding
-            | Role::EngramTable
-            | Role::EngramHash
-            | Role::HashTable
-            | Role::Unread
-            | Role::Unused
-    )
 }
 
 /// The hyperparameters of rank `rank` of `ranks` of the model `hp`
