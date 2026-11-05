@@ -1,0 +1,11 @@
+--- a/crates/model/src/arch/kimi_k3/spec.rs
++++ b/crates/model/src/arch/kimi_k3/spec.rs
+@@ -89,7 +89,7 @@
+         } else {
+             Ffn::Moe(Moe {
+                 latent: Some(spec_u32("expert_latent_length", hp.latent)?),
+-                sum_norm: true,
++                sum_norm: false,
+                 ..hp.experts.moe(act)?
+             })
+         };

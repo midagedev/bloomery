@@ -347,6 +347,7 @@ pub fn of(arch: model::arch::Arch) -> StepOrder {
         // runnable step.
         Arch::Flint => ("Flint", FaultSite::ALL),
         Arch::MistralLarge4 => ("MistralLarge4", FaultSite::ALL),
+        Arch::KimiK3 => ("KimiK3", FaultSite::ALL),
     };
     StepOrder { arch: name, sites }
 }
@@ -358,7 +359,7 @@ mod tests {
 
     /// Every architecture; a new one is a compile error here until it is
     /// listed (and [`of`] gives it a table).
-    fn every_arch() -> [Arch; 16] {
+    fn every_arch() -> [Arch; 17] {
         let all = [
             Arch::Deepseek2,
             Arch::Deepseek41,
@@ -376,6 +377,7 @@ mod tests {
             Arch::Flint,
             Arch::MuseSpark,
             Arch::MistralLarge4,
+            Arch::KimiK3,
         ];
         for a in all {
             match a {
@@ -394,7 +396,8 @@ mod tests {
                 | Arch::GemmaEmbedding2
                 | Arch::Flint
                 | Arch::MuseSpark
-                | Arch::MistralLarge4 => {}
+                | Arch::MistralLarge4
+                | Arch::KimiK3 => {}
             }
         }
         all

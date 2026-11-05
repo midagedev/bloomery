@@ -115,13 +115,20 @@ impl Experts {
 
     /// The layer's feed-forward description: routed experts and the shared one both of `act`.
     pub(in crate::arch) fn ffn(&self, act: Act) -> Result<Ffn, PlacementError> {
-        Ok(Ffn::Moe(Moe {
+        Ok(Ffn::Moe(self.moe(act)?))
+    }
+
+    /// The routed block of [`Experts::ffn`], for a family whose experts run in a latent or norm
+    /// their sum: it sets those fields on the block this returns.
+    pub(in crate::arch) fn moe(&self, act: Act) -> Result<Moe, PlacementError> {
+        Ok(Moe {
             experts: spec_u32("expert_count", self.n_expert)?,
             top_k: spec_u32("expert_used_count", self.n_used)?,
             expert_ff: spec_u32("expert_feed_forward_length", self.ff)?,
             latent: None,
             pre_exp_norm: false,
             post_exp_norm: None,
+            sum_norm: false,
             act,
             router: Router {
                 score: Score::Sigmoid,
@@ -135,6 +142,6 @@ impl Experts {
                 act,
                 sigmoid_gate: false,
             }),
-        }))
+        })
     }
 }

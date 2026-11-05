@@ -842,6 +842,11 @@ fn delta_shape(d: &DeltaRule) -> Result<LinearShape, String> {
         DeltaKind::Rda { .. } => {
             return Err("a Raon delta rule, which no kernel here runs".into());
         }
+        DeltaKind::KdaFullGate { .. } => {
+            return Err(
+                "a Kimi delta rule with a full-width gate, which no kernel here runs".into(),
+            );
+        }
     };
     let shape = LinearShape {
         n_k: d.k_heads as usize,
@@ -973,6 +978,7 @@ pub(crate) mod fixtures {
                 latent: None,
                 pre_exp_norm: false,
                 post_exp_norm: None,
+                sum_norm: false,
                 act: Act::SwiGlu { limit: None },
                 router: Router {
                     score: Score::Softmax,

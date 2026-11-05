@@ -115,6 +115,11 @@ pub enum Arch {
     /// the layer input, KV sharing and NoPE layers the file's arrays name, over softmax-routed
     /// experts with one shared. No program runs it yet.
     MistralLarge4,
+    /// Kimi K3: Kimi delta attention layers with a full-width output gate and a gated NoPE
+    /// latent-attention layer every few, a dense lead, `situ` experts in a latent beside a shared
+    /// stack, and the cross-layer residual attention over banked block inputs. No program runs it
+    /// yet.
+    KimiK3,
 }
 
 impl Arch {
@@ -145,6 +150,7 @@ impl Arch {
             Arch::Qwen3 => "qwen3",
             Arch::Lfm3 => "lfm3",
             Arch::MistralLarge4 => "mistral-large4",
+            Arch::KimiK3 => "kimi-k3",
         }
     }
 }
@@ -552,6 +558,11 @@ pub enum DeltaKind {
     /// per-head `ssm_rda` projection), the output gated by a full-width projection of its own
     /// (`ssm_g`) after a per-head RMS norm. `gate` is how the decay is made.
     Rda { gate: KdaGate },
+    /// A Kda decay and conv whose output gate is one full-width projection of its own (`ssm_g`)
+    /// in place of the low-rank pair: the heads' output is RMS-normed per head, then multiplied
+    /// by `sigmoid(ssm_g x)`. The write gate is `sigmoid(ssm_beta x)`, unscaled. `gate` is how
+    /// the decay is made.
+    KdaFullGate { gate: KdaGate },
 }
 
 /// How a KDA layer's decay gate is made.
@@ -657,6 +668,10 @@ pub struct Moe {
     /// weight, then normalized at this epsilon, before the router's weights
     /// apply; `None`: no norm.
     pub post_exp_norm: Option<f32>,
+    /// `ffn_routed_norm`: the routed experts' weighted sum (the latent row, when they run in one)
+    /// through a weighted RMS norm at the block norm's epsilon, before the up projection;
+    /// `false`: no norm.
+    pub sum_norm: bool,
     /// The routed experts' activation.
     pub act: Act,
     pub router: Router,
@@ -779,6 +794,16 @@ pub enum Residual {
     Sandwich {
         eps: f32,
         add: [f32; 2],
+    },
+    /// Cross-layer residual attention over banked block inputs. Every `block`-th layer
+    /// (`l % block == 0`) pushes its raw input onto a bank, and its running sum restarts from
+    /// the mixer's output alone. Each sublayer reads, in place of the running sum, the softmax
+    /// mix of the banks and the running sum, scored by `rms_norm(row) · score` summed over the
+    /// row (`attn_res_score`, `ffn_res_score`) at the spec's `rms_eps`, where an empty bank
+    /// reads the running sum unmixed. One more mix by `output_res_score` precedes the final
+    /// norm.
+    AttnRes {
+        block: u32,
     },
 }
 

@@ -1825,6 +1825,17 @@ gate-lfm3-meta:
 gate-mistrallarge4-meta:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::mistrallarge4 --nocapture && bash tools/gate.sh --release -p bloomery-model --test mistrallarge4_meta -- --nocapture && bash tools/gate.sh --release -p bloomery-model --test mistrallarge4_dspark -- --nocapture'
 
+# Kimi K3's metadata gate (crates/model/tests/kimi_k3_meta.rs): what the header reader resolves from the real file's headers,
+# checked in beside the test as the key table of its first shard and the tensor table of its 14 shards (kimi_k3_hdr.kv.json,
+# kimi_k3_tensors.tsv) and built into a header-only GGUF in the test: the description layer by layer (93 layers, 24 latent, a bank
+# every 12th), the roles of the latent experts' pair and the residual's scores, the quant types by stem, and the fixture clause:
+# the plan of the fixture of the four real layers [0, 46, 83, 84] (model::arch::kimi_k3::fixture) on that header, read back
+# through the reader as the cut, with a map, a key, a tensor and a type that differ refused by name; the library tests are the
+# reader's own (arch::kimi_k3: the keys, dims, types and roles refused by name, the table of types). Headers only, seconds; the
+# 14-shard file itself is not read.
+gate-kimi-k3-meta:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::kimi_k3 --nocapture && bash tools/gate.sh --release -p bloomery-model --test kimi_k3_meta -- --nocapture'
+
 # Cache append safety contracts and model-less plane/ring writer refusals.
 gate-gpu-rope-writers:
     ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu --release --doc rope_neox::RopeNeoxKernels && bash tools/gate.sh --oxide -p bloomery-gpu-gates --features gpu,mimo2 --release --lib --bin gate_qwen35moe_attn --bin gate_mimo2_flash -- --include-ignored writers --nocapture'

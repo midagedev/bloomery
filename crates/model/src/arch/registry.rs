@@ -17,14 +17,14 @@ use super::coverage::Available;
 use super::draft::Rule;
 use super::{
     Arch, DEEPSEEK4, GEMMA_EMBEDDING, GEMMA_EMBEDDING2, GLM5_NEXT_LLAMA_CPP, QWEN35_BODY, Read,
-    deepseek41, draft, flint, gemma_embedding, gemma_embedding2, glm5next, lfm3, llama, mimo2,
-    minimaxm3, mistrallarge4, musespark, nemotron_h, nemotron_h_moe, qwen3moe, qwen35moe, raon1,
-    solar2,
+    deepseek41, draft, flint, gemma_embedding, gemma_embedding2, glm5next, kimi_k3, lfm3, llama,
+    mimo2, minimaxm3, mistrallarge4, musespark, nemotron_h, nemotron_h_moe, qwen3moe, qwen35moe,
+    raon1, solar2,
 };
 use crate::placement::PlacementError;
 
 /// Every fixture family's spec, read by the fixture tool and the gates' budget admission.
-pub const FIXTURE_SPECS: [fn() -> crate::fixture::FixtureSpec; 10] = [
+pub const FIXTURE_SPECS: [fn() -> crate::fixture::FixtureSpec; 11] = [
     deepseek41::fixture::spec,
     qwen3moe::fixture::spec,
     qwen35moe::fixture::spec,
@@ -35,6 +35,7 @@ pub const FIXTURE_SPECS: [fn() -> crate::fixture::FixtureSpec; 10] = [
     nemotron_h_moe::fixture::spec,
     musespark::fixture::spec,
     mistrallarge4::fixture::spec,
+    kimi_k3::fixture::spec,
 ];
 
 /// The fixture spec whose architecture string is `arch`, from [`FIXTURE_SPECS`].
@@ -395,6 +396,21 @@ pub static ROWS: &[ArchRow] = &[
             draft: DraftSource::None,
         })),
     },
+    ArchRow {
+        arch: Some(Arch::KimiK3),
+        names: &["kimi-k3"],
+        read: Some(kimi_k3::spec::read),
+        draft: None,
+        coverage: None,
+        fixture: Some(Fixture::Gguf(FixtureRow {
+            family: "kimik3",
+            repo: "unsloth/Kimi-K3-GGUF",
+            quant: "UD-IQ1_S",
+            // The commit the checked-in header tables were read at.
+            rev: Some("a0836360ce58dfec088d966a97f2ddc8a606279b"),
+            draft: DraftSource::None,
+        })),
+    },
 ];
 
 /// Every profile's cut fixture, in table order.
@@ -511,6 +527,7 @@ mod tests {
             GEMMA_EMBEDDING2 => gemma_embedding2::spec::read,
             "muse-spark" => musespark::spec::read,
             "mistral-large4" => mistrallarge4::spec::read,
+            "kimi-k3" => kimi_k3::spec::read,
             other => panic!("{other}: no reader is named for it"),
         }
     }
@@ -557,6 +574,7 @@ mod tests {
             Arch::Flint,
             Arch::MuseSpark,
             Arch::MistralLarge4,
+            Arch::KimiK3,
         ] {
             let rows = ROWS.iter().filter(|r| r.arch == Some(arch)).count();
             assert_eq!(rows, 1, "{arch:?} is in {rows} rows");
@@ -598,7 +616,8 @@ mod tests {
                 "nemotron_h",
                 "nemotron_h_moe",
                 "muse-spark",
-                "mistral-large4"
+                "mistral-large4",
+                "kimi-k3"
             ]
         );
         assert_eq!(archs_of(false), ["minimax-m3"]);

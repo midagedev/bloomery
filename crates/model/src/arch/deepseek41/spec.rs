@@ -223,6 +223,7 @@ fn layer_of(
         latent: None,
         pre_exp_norm: false,
         post_exp_norm: None,
+        sum_norm: false,
         act: Act::SwiGlu {
             limit: Some(kind.swiglu_limit),
         },
@@ -340,6 +341,7 @@ pub fn draft_of(hp: &DraftHparams) -> Result<DraftSpec, PlacementError> {
                     latent: None,
                     pre_exp_norm: false,
                     post_exp_norm: None,
+                    sum_norm: false,
                     act: Act::SwiGlu {
                         limit: Some(hp.swiglu_limit[l]),
                     },

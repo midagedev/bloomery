@@ -71,6 +71,7 @@ pub fn read(split: &Split) -> Result<Read, PlacementError> {
                     latent: None,
                     pre_exp_norm: false,
                     post_exp_norm: None,
+                    sum_norm: false,
                     act,
                     router: Router {
                         score: Score::Sigmoid,

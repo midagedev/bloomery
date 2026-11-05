@@ -255,3 +255,4 @@ gate-raon1-meta	family	raon1	meta	arch_registry
 gate-raon1-tokenizer	family	raon1	tokenizer	tokenizer_jinja
 # dfl-wire
 gate-gpu-raon1-dflash	family	raon1	draft	drafts_dspark
+gate-kimi-k3-meta	family	kimi-k3	meta	arch_registry

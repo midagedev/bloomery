@@ -98,7 +98,8 @@ fn family_of(arch: Arch) -> Option<&'static dyn Adapter> {
         | Arch::GemmaEmbedding2
         | Arch::Flint
         | Arch::MuseSpark
-        | Arch::MistralLarge4 => None,
+        | Arch::MistralLarge4
+        | Arch::KimiK3 => None,
     }
 }
 
@@ -124,7 +125,8 @@ fn skip_of(arch: Arch) -> &'static str {
         | Arch::GemmaEmbedding
         | Arch::Flint
         | Arch::MuseSpark
-        | Arch::MistralLarge4 => "no program",
+        | Arch::MistralLarge4
+        | Arch::KimiK3 => "no program",
     }
 }
 

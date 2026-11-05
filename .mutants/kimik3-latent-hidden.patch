@@ -1,0 +1,11 @@
+--- a/crates/model/src/arch/kimi_k3/hparams.rs
++++ b/crates/model/src/arch/kimi_k3/hparams.rs
+@@ -345,7 +345,7 @@
+             let mut block = self.experts.dims(e);
+             for ((_, dims), (_, in_latent)) in block.iter_mut().zip(narrow) {
+                 if dims.len() == 3 {
+-                    *dims = in_latent;
++                    let _ = in_latent;
+                 }
+             }
+             dims.extend(block);

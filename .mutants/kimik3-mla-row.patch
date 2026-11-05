@@ -1,0 +1,11 @@
+--- a/crates/model/src/arch/kimi_k3/hparams.rs
++++ b/crates/model/src/arch/kimi_k3/hparams.rs
+@@ -59,7 +59,7 @@
+     /// (`attention.key_length`). The value is the row's first `kv_lora` values.
+     #[must_use]
+     pub fn row(&self) -> usize {
+-        self.kv_lora + self.pe
++        self.kv_lora
+     }
+ }
+ 

@@ -1,0 +1,11 @@
+--- a/crates/gguf/src/arch/kimi_k3.rs
++++ b/crates/gguf/src/arch/kimi_k3.rs
+@@ -17,7 +17,7 @@
+ const Q6_K: &[GgmlType] = &[GgmlType::Q6_K];
+ const Q8_0: &[GgmlType] = &[GgmlType::Q8_0];
+ /// The routed stacks' two types.
+-const ROUTED: &[GgmlType] = &[GgmlType::IQ1_S, GgmlType::IQ2_XXS];
++const ROUTED: &[GgmlType] = &[GgmlType::IQ1_S];
+ 
+ /// Every tensor stem of a Kimi K3 file (the name past `blk.N.` for a layer's tensor, the whole name
+ /// for a model-level one) with the types it may carry.

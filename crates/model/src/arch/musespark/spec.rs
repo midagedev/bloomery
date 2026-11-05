@@ -118,6 +118,7 @@ pub fn spec_of(hp: &Hparams, chat: ChatSpec) -> Result<ModelSpec, PlacementError
                 latent: Some(spec_u32("moe_latent_size", hp.latent)?),
                 pre_exp_norm: true,
                 post_exp_norm: Some(hp.post_eps),
+                sum_norm: false,
                 act: Act::SwiGlu { limit: None },
                 router: Router {
                     score: Score::Sigmoid,

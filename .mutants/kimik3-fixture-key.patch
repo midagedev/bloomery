@@ -1,0 +1,11 @@
+--- a/crates/model/src/arch/kimi_k3/fixture.rs
++++ b/crates/model/src/arch/kimi_k3/fixture.rs
+@@ -222,7 +222,7 @@
+         "expert_count" => KeyRule::Set(EXPERTS),
+         "expert_used_count" => KeyRule::Set(USED),
+         "expert_feed_forward_length" => KeyRule::Set(FF),
+-        "expert_latent_length" => KeyRule::Set(LATENT),
++        "expert_latent_length" => KeyRule::Copy,
+         "attention.q_lora_rank" => KeyRule::Set(Q_LORA),
+         "attn_res.block_size" => KeyRule::Set(BLOCK),
+         s if COPY.contains(&s) => KeyRule::Copy,
