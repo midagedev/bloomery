@@ -1,0 +1,31 @@
+# Round iq3xxs-spark (kind profile): V4.1-Flash at a quant the box cannot hold (unsloth UD-IQ3_XXS, 394.7 GB in 7 shards)
+# — ws alone paging its missing experts from NVMe against ws + the Spark holding them. The box holds RAM 256 + A6000 48 +
+# 3090 24 = 328 GB; with ~20 GB of KV, scratch and the page cache's floor the file leaves ~87 GB past the box [derived].
+# [derived, rig-log tools/spark-model.py decode_bigger_quant] the NVMe term is 0.22 ms a step per GB past RAM (the
+# sparkroom point: 27.4 GB on NVMe cost 6.1 ms) scaled by this file's bytes a token (bpw 4.19 / 3.44): ws alone step
+# 19.4 x 1.22 + 0.22 x 87 x 1.22 = 46.9 ms -> 21.3 tok/s; ws + Spark (the split's 7 ms round trip share, no paging)
+# 26.4 x 1.22 = 32.2 ms -> 31.1 tok/s. Prefill: the host set grows from 90 to ~160 GB, so the host leg (28.8 x 160/90 =
+# 51 ms a layer) becomes the bound over the card's ~36; the node taking 95 GB of it leaves ~21 ms host and a node leg
+# the host reads from the file in today's code (nodebatch: 48-69 pp at Q3_K_M) — the prefill row is read, not predicted,
+# until the nodeprefill round lands. Same binary, same lease, 4 rounds; both arms BLOOMERY_R8=off (the r8 sidecar takes
+# Q3_K stacks only; this file's routed experts are IQ3_XXS).
+kind: profile
+question: at a file the box cannot hold, does the Spark as the expert tier node beat ws alone paging from NVMe, by how
+  much, and does the engine open a real IQ3_XXS V4.1 file at all (no gate fixture on the box holds that type)?
+term: tok/s @ n=96, prose P 512, depth 512, A6000 stage; the plain arm --place a (the NVMe tier takes what the room
+  cannot hold, BLOOMERY_HOST_ROOM unset), the node arm --place bp with the Spark tier over tcp (BLOOMERY_TIER_NODES,
+  BLOOMERY_TIER_LINK=tcp, BLOOMERY_CARD_BUDGET=90G, BLOOMERY_HOST_LOCK=1); both BLOOMERY_R8=off; batch prefill,
+  residency unset
+unit: tok/s
+predict: 28..36
+condition: one binary (main), every arm's load its own process; the same 7 shards on the box (/models) and the Spark
+  (its /models), sizes equal to the HF tree's; the Spark's tier_server loop from the same tree on that file, caches
+  dropped before the sitting, free >= 100 GB; the plain arm's plan line names its paged and arena bytes; 4 rounds; rows
+  marked [cold] stand with their mark
+decide-in: the node arm inside 28..36 with the plain arm under 25: the headline "a 395 GB V4.1-Flash on a 256 GB
+  workstation + one DGX Spark" with both numbers, the ratio and the pp row beside it, conditions named; then the quality
+  row (exact_ref sigma against Q3_K_M) before any public number
+decide-below: the node arm under 28: the file's bigger experts moved the node round trip or the card front more than
+  bytes x 1.22; read the trip stamps and the host_slots against the Q3_K_M node arm's
+decide-above: the node arm over 36 or the plain arm over 25: the NVMe term or the bpw scaling is wrong; re-derive from
+  the plan line's paged and arena bytes
