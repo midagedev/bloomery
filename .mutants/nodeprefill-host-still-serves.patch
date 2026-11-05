@@ -1,0 +1,10 @@
+--- a/crates/gpu/src/host/batch.rs
++++ b/crates/gpu/src/host/batch.rs
+@@ -1417,7 +1417,6 @@
+             r?;
+             back.map_err(|e| GpuError::shape(WHAT, format!("rebinding the stage context: {e}")))?;
+         }
+-        self.nodes = 0;
+         Ok(())
+     }
+ 

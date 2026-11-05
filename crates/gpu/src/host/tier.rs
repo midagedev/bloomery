@@ -79,6 +79,7 @@ use model::placement::devices::DeviceInfo;
 
 use super::link::{Crossing, Link, LinkEnd, Peer, PostCols, Reader, RemoteEnd, RemoteWire, Span};
 use super::node::TierNode;
+use super::node::block::NodeBlock;
 use super::page::MAX_ROWS;
 use super::slots::{MAX_TIERS, Slot, SlotMap};
 use super::step::{Boundary, Chain, RELEASE};
@@ -1126,6 +1127,15 @@ pub trait TierExperts {
     fn block_rows(&self) -> BlockRows {
         BlockRows::Staged
     }
+
+    /// Whether a block reads, of its input, only the q3 plane and scales of
+    /// its q8_1 form ([`TierBlock::act`]'s [`Q8Act::q3`] and [`Q8Act::d8`]),
+    /// the form a [`TierAct::Q8`] image carries: a tier on a node runs blocks
+    /// only then, sent those planes alone, and its experts are otherwise a
+    /// batch's host's. By default it reads more.
+    fn block_planes(&self) -> bool {
+        false
+    }
 }
 
 /// Where the rows of a prompt batch's block that the tier computed reach the
@@ -1573,6 +1583,22 @@ impl TierWork {
             .enqueue_block(&self.gpu, &self.weights, layer, io)
     }
 
+    /// The work's shape.
+    pub(super) fn shape(&self) -> TierShape {
+        self.shape
+    }
+
+    /// What a tier node's blocks need of this work: its architecture's
+    /// block scratch bytes and where it leaves a block's rows, when it runs
+    /// blocks from the q8_1 planes a [`TierAct::Q8`] image carries
+    /// ([`TierExperts::block_planes`]); `None` when it runs no block, or
+    /// none from those planes alone.
+    pub(super) fn block_kind(&self) -> Option<(usize, BlockRows)> {
+        let scratch = self.experts.block_bytes();
+        (self.shape.act == TierAct::Q8 && self.experts.block_planes() && scratch != 0)
+            .then(|| (scratch, self.experts.block_rows()))
+    }
+
     /// Wait until the tier's stream has drained.
     pub(super) fn sync(&self) -> Result<(), GpuError> {
         self.gpu.stream().synchronize()?;
@@ -1839,15 +1865,100 @@ impl TierCard {
     }
 
     /// Device bytes of the architecture's prompt-batch block scratch on the
-    /// tier card ([`TierExperts::block_bytes`]), when it is in this process.
+    /// tier card ([`TierExperts::block_bytes`]): its own in this process, a
+    /// node's as its block open named them; a node that opened no block
+    /// staging is refused by name.
     pub fn block_bytes(&self) -> Result<usize, GpuError> {
-        Ok(self.work()?.experts.block_bytes())
+        match &self.side {
+            TierSide::Here(w) => Ok(w.experts.block_bytes()),
+            TierSide::Node(n) => Ok(Self::opened_block(n, &self.name)?.scratch),
+        }
     }
 
     /// Where the architecture's block rows reach the set's rows
-    /// ([`TierExperts::block_rows`]), when the card is in this process.
+    /// ([`TierExperts::block_rows`]): a node's as its block open named it; a
+    /// node that opened no block staging is refused by name.
     pub fn block_rows(&self) -> Result<BlockRows, GpuError> {
-        Ok(self.work()?.experts.block_rows())
+        match &self.side {
+            TierSide::Here(w) => Ok(w.experts.block_rows()),
+            TierSide::Node(n) => Ok(Self::opened_block(n, &self.name)?.rows),
+        }
+    }
+
+    /// The node `n`'s block staging, refused by name before its block open
+    /// made one.
+    fn opened_block(n: &TierNode, name: &str) -> Result<NodeBlock, GpuError> {
+        n.block().ok_or_else(|| {
+            GpuError::shape(
+                WHAT,
+                format!(
+                    "the tier {name} on the node at {}: it opened no block staging \
+                     (TierCard::open_node_block)",
+                    n.addr()
+                ),
+            )
+        })
+    }
+
+    /// On a node, open its block staging for blocks of up to `cap` tokens
+    /// ([`TierNode::block_open`]) unless an earlier open made it; nothing
+    /// for a card of this process. The stage card's context is current on
+    /// return.
+    pub(super) fn open_node_block(&mut self, cap: usize) -> Result<(), GpuError> {
+        if let TierSide::Node(n) = &mut self.side
+            && n.block().is_none()
+        {
+            n.block_open(cap)?;
+        }
+        self.rebind_stage()
+    }
+
+    /// The node's block staging, once its block open made one; `None` for a
+    /// card of this process.
+    pub(super) fn node_block(&self) -> Option<NodeBlock> {
+        match &self.side {
+            TierSide::Here(_) => None,
+            TierSide::Node(n) => n.block(),
+        }
+    }
+
+    /// Send layer `layer`'s block of `cols` tokens to the node: each slot's
+    /// tier place and the columns' q3 plane and scales `planes`, of which
+    /// `sent` slots are the tier's ([`TierNode::block_send`]); a card of
+    /// this process is refused by name.
+    pub(super) fn block_send(
+        &mut self,
+        (layer, cols): (usize, usize),
+        places: &[u32],
+        planes: (&[u8], &[u8]),
+        sent: usize,
+    ) -> Result<(), GpuError> {
+        match &mut self.side {
+            TierSide::Here(_) => Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the tier {}: a block request to a card of this process",
+                    self.name
+                ),
+            )),
+            TierSide::Node(n) => n.block_send((layer, cols), places, planes, sent),
+        }
+    }
+
+    /// The rows of the block [`TierCard::block_send`] sent, the node's reply
+    /// read by `deadline` ([`TierNode::block_rows`]); a card of this process
+    /// is refused by name.
+    pub(super) fn block_rows_of(&mut self, deadline: Instant) -> Result<&[u8], GpuError> {
+        match &mut self.side {
+            TierSide::Here(_) => Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the tier {}: a block reply from a card of this process",
+                    self.name
+                ),
+            )),
+            TierSide::Node(n) => n.block_rows(deadline),
+        }
     }
 
     /// Which experts the tier holds.
@@ -2110,10 +2221,13 @@ impl TierCard {
         self.rebind_stage()
     }
 
+    /// Whether the tier runs a prompt batch's blocks: its architecture's
+    /// block scratch in this process, or on a node, the block staging its
+    /// block open made ([`TierCard::open_node_block`]).
     pub(super) fn supports_blocks(&self) -> bool {
         match &self.side {
             TierSide::Here(work) => work.experts.block_bytes() != 0,
-            TierSide::Node(_) => false,
+            TierSide::Node(n) => n.block().is_some(),
         }
     }
 

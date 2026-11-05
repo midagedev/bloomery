@@ -861,11 +861,12 @@ pub static STEP0: Kind = Kind {
 pub static STAT_PREFILL: Kind = Kind {
     name: "stat_prefill",
     head: "stat prefill",
-    doc: "The host tier's batch services since load: layers, columns, host slots and the union calls' wall.",
+    doc: "The host tier's batch services since load: layers, columns, host slots, the slots left to the tiers' batch legs and the union calls' wall.",
     parts: &[
         key("union_layers", U64, ""),
         key("union_cols", U64, ""),
         key("union_host_slots", U64, ""),
+        key("union_tier_slots", U64, ""),
         key("union_ms", F64(1), "ms"),
     ],
 };

@@ -9,7 +9,7 @@ use crate::GpuError;
 use gguf::Split;
 use std::sync::OnceLock;
 
-pub use crate::host::batch::{BatchKey, BatchPort, ServeTimes};
+pub use crate::host::batch::{BatchKey, BatchPort, BlockPlanes, ServeTimes};
 pub use crate::host::page::{HandoffLayout, MAX_ROWS, PageError, PageLayout};
 pub use crate::host::residency::HostResidency;
 pub use crate::host::slots::{HOST, Slot, SlotMap, TIER};

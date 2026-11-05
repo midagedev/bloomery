@@ -96,14 +96,20 @@
 //!   its own child (`--bnode-stage`), whose environment alone names that port
 //!   (`BLOOMERY_TIER_NODES`) and the TCP link (`BLOOMERY_TIER_LINK=tcp`), so no other clause's
 //!   load takes either. The stage feeds B7's prompt of [`BATCH_P`] positions one decode step per
-//!   position, the node serving its tier experts, then as one prompt batch, whose host serves
-//!   them in the node's place (the host tier's batch view); each is followed by [`BATCH_STEPS`]
-//!   greedy steps, and the call is walked against the steps (`logits_band::walk`), within the
-//!   logits band as B7's is. The call sends the node nothing: across it the node tier's layers
-//!   asked and routed slots stay where they were, and no tier leg is served. The residency lever
-//!   resolves for a batch feed (its `why` is not `prefill_steps`). The node exits 0 once the stage
-//!   closed its load. Precondition: the steps sent every tier layer a routed slot through the
-//!   node, and the stage's tier is on the node.
+//!   position, the node serving its tier experts, then as one prompt batch, whose every tiered
+//!   layer-batch sends the node its block and lands the node's rows (`host::node::block`); each
+//!   is followed by [`BATCH_STEPS`] greedy steps, and the call is walked against the steps
+//!   (`logits_band::walk`), within the logits band as B7's is. Across the call the node's batch
+//!   leg is served and settled once a block, every tier layer is sent a routed slot, no decode
+//!   layer is asked of the node, and the slots the host left to the node's leg
+//!   (`stats().batch_tier_slots`) are the node's routed slots (`stats().layer_hits`): the host
+//!   serves none of them. Then the stage opens the same plan with its tier a card of this process
+//!   and runs the call and its steps again: tokens and logits bit for bit the node's — the node
+//!   runs the same block on the same q8_1 bytes, so its rows are the tier card's — and the host's
+//!   batch slots, those it served and those it left to the tier's leg, the same counts. The residency
+//!   lever resolves for a batch feed (its `why` is not `prefill_steps`). The node exits 0 once
+//!   the stage closed its load. Precondition: the steps sent every tier layer a routed slot
+//!   through the node, and the stage's tier is on the node.
 //!
 //! Every clause is self-consistency (the tiered load against the reference load or against the
 //! same file fed another way), so the fixture tier runs all of them; each names its tag once
@@ -591,12 +597,18 @@ mod gate {
         /// Tier layers the host asked of the tier (replayed or enqueued).
         issued: u64,
         stats: TierBatchStats,
+        /// The host's batch slots: those it served, and those it left to a
+        /// tier's batch leg (`HybridStats::batch_host_slots`,
+        /// `batch_tier_slots`).
+        host_slots: u64,
+        tier_slots: u64,
     }
 
     /// The tier's per-layer hits, layers asked and batch counters since load;
     /// `None` without a tier.
     fn tier_counts(m: &Deepseek41Model) -> Result<Option<Sent>, GateError> {
         let hybrid = m.body(NAME)?.hybrid();
+        let st = hybrid.stats();
         Ok(hybrid.tiers().first().map(|t| Sent {
             first: t.set().layers().start,
             hits: t.stats().layer_hits,
@@ -606,6 +618,8 @@ mod gate {
                 .first()
                 .copied()
                 .unwrap_or_default(),
+            host_slots: st.batch_host_slots,
+            tier_slots: st.batch_tier_slots,
         }))
     }
 
@@ -623,6 +637,8 @@ mod gate {
                 settle_early: a.stats.settle_early - b.stats.settle_early,
                 settle_ns: a.stats.settle_ns - b.stats.settle_ns,
             },
+            host_slots: a.host_slots - b.host_slots,
+            tier_slots: a.tier_slots - b.tier_slots,
         })
     }
 
@@ -826,8 +842,8 @@ mod gate {
             ),
             (
                 args.bnode,
-                "B9: one batch over a tier on a node: the host serves the node's experts, within \
-                 the logits band of the steps",
+                "B9: one batch over a tier on a node: the node computes its block, within the \
+                 logits band of the steps and bit for bit the same plan's with its tier a card",
             ),
         ] {
             if on {
@@ -873,7 +889,10 @@ mod gate {
             let ids = prose_ids("engram", BATCH_P2)?;
             let node = node_open(&card, device)?;
             let m = open(split()?, &tplan, Some(node), &meta)?;
-            return stage_verdict(node_stage(m, &levers, &ids[..BATCH_P], &tier_layers)?);
+            let (mut pass, got) = node_stage(m, &levers, &ids[..BATCH_P], &tier_layers)?;
+            let local = open(split()?, &tplan, Some(tier_open()), &meta)?;
+            pass &= node_exact(local, &ids[..BATCH_P], got)?;
+            return stage_verdict(pass);
         }
         let mut pass = true;
 
@@ -1171,13 +1190,14 @@ mod gate {
     /// B9 (module header), the stage's side, on `m`, the tiered load with its tier on the node:
     /// the residency lever as a batch feed resolves it, `ids` fed one decode step each and then as
     /// one prompt call, each followed by greedy steps, the call walked against the steps, and what
-    /// the call and the steps sent the node tier. A refused call is the clause's failure, named.
+    /// the call and the steps sent the node tier. Returns the verdict and the call's run and
+    /// counters, which [`node_exact`] reads. A refused call is the clause's failure, named.
     fn node_stage(
         mut m: Deepseek41Model,
         levers: &Levers,
         ids: &[u32],
         tier_layers: &[usize],
-    ) -> Result<bool, GateError> {
+    ) -> Result<(bool, Option<(Run, Option<Sent>)>), GateError> {
         let pick = levers.residency_at(ResidencyAt {
             serving_place: false,
             check_finite: false,
@@ -1221,7 +1241,7 @@ mod gate {
             Ok(r) => r,
             Err(e) => {
                 println!("FAIL B9: the prompt call over the node tier: {e}");
-                return Ok(false);
+                return Ok((false, None));
             }
         };
         pass &= in_band(
@@ -1229,8 +1249,47 @@ mod gate {
             &want,
             &got,
         );
-        pass &= node_untouched("B9", sent.as_ref(), tier_layers);
+        pass &= node_batch_served("B9", sent.as_ref(), tier_layers);
         drop(m);
+        Ok((pass, Some((got, sent))))
+    }
+
+    /// B9's exactness, on `m`, the same plan with its tier a card of this process: `ids` as one
+    /// prompt call and its greedy steps ([`batch_run`]), tokens and logits bit for bit `got`'s run,
+    /// the node's, and the host's batch slots — served, and left to the tier's leg — `got`'s
+    /// counts. The node runs the tier card's block on the q8_1 bytes the tier card quantizes for
+    /// itself, and its rows land where the tier card's copy puts them, so the call is the same
+    /// program on the same inputs, and the host serves what it serves beside a tier card.
+    fn node_exact(
+        mut m: Deepseek41Model,
+        ids: &[u32],
+        got: Option<(Run, Option<Sent>)>,
+    ) -> Result<bool, GateError> {
+        let Some((got, node)) = got else {
+            println!("FAIL B9 exact: no prompt call over the node to compare");
+            return Ok(false);
+        };
+        let (want, card) = batch_run(&mut m, ids)?;
+        let mut pass = same(
+            "B9 exact (the call over the node against the same plan's with its tier a card)",
+            &want,
+            &got,
+        );
+        let (Some(node), Some(card)) = (node, card) else {
+            println!("FAIL B9 exact slots: a load holds no tier card");
+            return Ok(false);
+        };
+        let ok = (node.host_slots, node.tier_slots) == (card.host_slots, card.tier_slots);
+        println!(
+            "{} B9 exact slots: over the call over the node the host served {} slots and left {} \
+             to the node's leg; with the tier a card it served {} and left {} to the card's leg",
+            if ok { "ok" } else { "FAIL" },
+            node.host_slots,
+            node.tier_slots,
+            card.host_slots,
+            card.tier_slots
+        );
+        pass &= ok;
         Ok(pass)
     }
 
@@ -1272,27 +1331,48 @@ mod gate {
         }
     }
 
-    /// B9 `what`'s pin on the prompt call: it sent the node tier nothing — no tier layer asked, no
-    /// routed slot on any of `tier_layers`, no tier leg served — so the host served every one of
-    /// the node's slots.
-    fn node_untouched(what: &str, sent: Option<&Sent>, tier_layers: &[usize]) -> bool {
+    /// B9 `what`'s pin on the prompt call: the node computed its experts' block of every tiered
+    /// layer-batch — its batch leg served and settled once a block, a routed slot on every layer
+    /// of `tier_layers`, no decode layer asked of it — and the host left it exactly the node's
+    /// slots: those the host's batch services left to a tier's leg are the slots the legs sent
+    /// the node, so the host served none of them.
+    // PIN(2026-11-05): inverted from "the call sends the node nothing" — the node now serves its
+    // block of a prompt batch (`host::node::block`), so the host no longer serves its experts.
+    fn node_batch_served(what: &str, sent: Option<&Sent>, tier_layers: &[usize]) -> bool {
         let Some(sent) = sent else {
             println!("FAIL {what} node: the tiered load holds no tier card");
             return false;
         };
-        let slots: u64 = tier_layers
+        let hit = |l: usize| {
+            l.checked_sub(sent.first)
+                .and_then(|i| sent.hits.get(i))
+                .copied()
+                .unwrap_or(0)
+        };
+        let missing: Vec<usize> = tier_layers
             .iter()
-            .filter_map(|&l| l.checked_sub(sent.first).and_then(|i| sent.hits.get(i)))
-            .sum();
-        let ok = sent.issued == 0 && slots == 0 && sent.stats.served == 0;
+            .copied()
+            .filter(|&l| hit(l) == 0)
+            .collect();
+        let slots: u64 = tier_layers.iter().map(|&l| hit(l)).sum();
+        let st = sent.stats;
+        let ok = st.served > 0
+            && st.settles == st.served
+            && missing.is_empty()
+            && sent.issued == 0
+            && sent.tier_slots == slots;
         println!(
-            "{} {what} node: over the prompt call the node tier's stats().issued moved {}, its \
-             stats().layer_hits on the {} tier layers {slots} and tier_batch_stats().served {}: no \
-             batch request reached the node, the host served its experts",
+            "{} {what} node: over the prompt call tier_batch_stats().served {} (settles {}, {:.2} ms \
+             waited), stats().issued moved {}, stats().layer_hits on the {} tier layers {slots} \
+             (none on {missing:?}); the host's batch slots: {} left to the node's leg, {} served",
             if ok { "ok" } else { "FAIL" },
+            st.served,
+            st.settles,
+            st.settle_ns as f64 / 1e6,
             sent.issued,
             tier_layers.len(),
-            sent.stats.served
+            sent.tier_slots,
+            sent.host_slots
         );
         ok
     }

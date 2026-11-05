@@ -804,6 +804,19 @@ impl MappedHost {
         Some(unsafe { std::slice::from_raw_parts_mut(self.host_at(off).cast::<f32>(), len) })
     }
 
+    /// The `len` bytes at byte `off`, for the host to read; `None` past the
+    /// allocation. The owner's protocol keeps the card from writing the span
+    /// while the slice lives.
+    pub(crate) fn bytes_at(&self, off: usize, len: usize) -> Option<&[u8]> {
+        if off.checked_add(len).is_none_or(|end| end > self.bytes) {
+            return None;
+        }
+        // SAFETY: the span is inside the allocation (checked above); no host
+        // write aliases it while `&self` is held, and the owner's protocol
+        // keeps the card off it.
+        Some(unsafe { std::slice::from_raw_parts(self.host_at(off).cast_const(), len) })
+    }
+
     /// A copy of the `len` f32 at byte `off`, when inside the allocation.
     pub(crate) fn f32_copy(&self, off: usize, len: usize) -> Option<Vec<f32>> {
         if !off.is_multiple_of(4) || !self.holds(off, len) {
