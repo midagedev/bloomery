@@ -26,8 +26,8 @@
 use super::kda::{self, KdaSites};
 use super::moe::{MoeDims, routed_of};
 use super::state::{self, Lane, StepIn};
+use crate::arch::gated_mla::{self as mla, MlaBufs, MlaSites};
 use crate::arch::hybrid::{Acts, DecodeInput, GqaCx, Site};
-use crate::arch::raon1::mla::{self, MlaBufs, MlaSites};
 use crate::arch::routed_ffn::{self as ffn, Ffn, FfnKernels, FfnScratch, Glu};
 use crate::attn_res::{AttnResArgs, AttnResKernels, MAX_VECS};
 use crate::elem::EmbedRowsArgs;

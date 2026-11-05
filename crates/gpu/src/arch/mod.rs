@@ -12,6 +12,7 @@
 //! the gates at once.
 
 pub mod deepseek2;
+pub mod gated_mla;
 pub mod hybrid;
 pub mod kimi_k3;
 pub mod musespark;
