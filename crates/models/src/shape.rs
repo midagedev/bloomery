@@ -1209,7 +1209,9 @@ mod tests {
             .collect();
         assert_eq!(
             widths,
-            [288, 256, 240, 304, 368, 432, 496, 320, 128, 128, 256, 16, 896, 8]
+            [
+                288, 256, 240, 304, 368, 432, 496, 320, 128, 128, 256, 16, 896, 8
+            ]
         );
         // Coverage's `routes(n, &[BiasedSigmoid])`: the rule's shapes pass at
         // both widths, and a width between them is refused. 256 at top 6 is
