@@ -191,7 +191,12 @@
 //! runs the batched call whatever that lever says. `BLOOMERY_PREFILL_GROUP=n` picks how many
 //! batches a group runs layer by layer (default 2; the `loaded` line names
 //! it, with the bytes the batches past a group's first hold); 1 and 2 must
-//! pass. The cases hold calls of
+//! pass. `BLOOMERY_PREFILL_CUT=n` cuts each call at `n` positions a batch
+//! (default 512, which the structure below is written for): the clauses
+//! hold a call at any cut to the same bits and band, while the batch counts
+//! named here and the clauses that pick a batch by `body::batches` read the
+//! default cut. The
+//! cases hold calls of
 //! one batch, two, three (one group of three under 2), five (a pair, then
 //! three) and six. `BLOOMERY_STEP_STATS=1`
 //! times each layer's card work with events and prints, after each case, a
@@ -290,8 +295,8 @@ mod gate {
         no_local_depot, patch_bytes, record, row_bytes, verdict,
     };
     use bloomery_levers::{
-        CARD_BUDGET, CARD_DONTNEED, CED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, PREFILL_GROUP,
-        R8, STEP_STATS,
+        CARD_BUDGET, CARD_DONTNEED, CED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, PREFILL_CUT,
+        PREFILL_GROUP, R8, STEP_STATS,
     };
     use cuda_core::{DeviceBuffer, DeviceCopy};
     use gguf::Split;
@@ -480,6 +485,7 @@ mod gate {
         let levers = bloomery_levers::at_main(&[
             CED,
             PREFILL_GROUP,
+            PREFILL_CUT,
             ENGRAM_HELPER,
             STEP_STATS,
             CARD_BUDGET,

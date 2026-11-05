@@ -1,5 +1,7 @@
-//! The prompt batch: a prompt of `P` ids fed as `⌈P / T_MAX⌉` batches of
-//! near-equal size ([`prefill`], [`batches`]), which leaves the model where
+//! The prompt batch: a prompt of `P` ids fed as `⌈P / cut⌉` batches of
+//! near-equal size ([`prefill`], [`BodyLevers::batches`]; `cut` is
+//! `BLOOMERY_PREFILL_CUT`, at most [`T_MAX`], and [`T_MAX`] unset), which
+//! leaves the model where
 //! `P` decode steps over the same ids leave it, bit for bit, in everything
 //! a later step reads: every layer's window ring, the compressed rows,
 //! compressor states and index keys, the host tier, the last position's
@@ -137,8 +139,11 @@ use bloomery_gpu::Fault;
 use bloomery_gpu::fault::read_cards;
 use runtime::prompt::{CallEnd, GROUP_LEVER, group_sets, groups};
 
-/// Positions one batch runs at most: the host union's columns.
+/// Positions one batch runs at most: the host union's columns, and the
+/// buffers' rows.
 pub const T_MAX: usize = UNION_MAX_COLS;
+// `BLOOMERY_PREFILL_CUT` takes up to what a batch's buffers hold.
+const _: () = assert!(T_MAX as u64 == bloomery_levers::PREFILL_CUT_MAX);
 
 /// Positions one chunk runs at most: the m-column kernels' and HC_PRE's.
 pub const CHUNK: usize = HC_MAX_TOKENS;
@@ -297,17 +302,39 @@ fn headed(token: Result<Option<u32>, GpuError>) -> Result<u32, GpuError> {
     })
 }
 
-/// How many batches a call of `n` positions runs: `⌈n / T_MAX⌉`.
+/// How many batches a call of `n` positions runs at the default cut:
+/// `⌈n / T_MAX⌉`. A body loaded under `BLOOMERY_PREFILL_CUT` runs
+/// [`BodyLevers::batch_count`], which a reader of a loaded body's calls
+/// takes instead.
 #[must_use]
 pub fn batch_count(n: usize) -> usize {
     n.div_ceil(T_MAX)
 }
 
-/// The batches a call of `n` positions from `first` runs: [`batch_count`]
-/// of them ([`runtime::prompt::batches`] at [`T_MAX`] positions).
+/// The batches a call of `n` positions from `first` runs at the default cut:
+/// [`batch_count`] of them ([`runtime::prompt::batches`] at [`T_MAX`]
+/// positions). A loaded body's calls run [`BodyLevers::batches`].
 #[must_use]
 pub fn batches(first: usize, n: usize) -> Vec<Range<usize>> {
     runtime::prompt::batches(first, n, T_MAX)
+}
+
+impl BodyLevers {
+    /// How many batches a call of `n` positions runs under the lever's cut:
+    /// `⌈n / cut⌉`.
+    #[must_use]
+    pub fn batch_count(&self, n: usize) -> usize {
+        n.div_ceil(self.cut)
+    }
+
+    /// The batches a call of `n` positions from `first` runs under the
+    /// lever's cut: [`BodyLevers::batch_count`] of them
+    /// ([`runtime::prompt::batches`] at `cut` positions). The owner of a
+    /// call's cut: the call, its plan and the hole it leaves read it here.
+    #[must_use]
+    pub fn batches(&self, first: usize, n: usize) -> Vec<Range<usize>> {
+        runtime::prompt::batches(first, n, self.cut)
+    }
 }
 
 /// A prompt call's plan as its enqueue runs it: the batches ([`batches`]),
@@ -322,6 +349,8 @@ pub fn batches(first: usize, n: usize) -> Vec<Range<usize>> {
 pub struct CallPlan {
     /// `BLOOMERY_PREFILL_GROUP`: the batches a group holds.
     pub group: usize,
+    /// `BLOOMERY_PREFILL_CUT`: the positions a batch holds at most.
+    pub cut: usize,
     /// The window ring's rows, which the triangle's latent starts reach back.
     pub ring: usize,
     pub ced: CedState,
@@ -332,13 +361,14 @@ pub struct CallPlan {
 }
 
 impl CallPlan {
-    fn new(ced: &Ced, ring: usize, group: usize, first: usize, n: usize) -> CallPlan {
-        let batches = batches(first, n);
+    fn new(ced: &Ced, ring: usize, levers: &BodyLevers, first: usize, n: usize) -> CallPlan {
+        let batches = levers.batches(first, n);
         let starts: Vec<usize> = batches.iter().map(|r| r.start).collect();
         let need = ced.need(first, first + n, &starts, None);
         let cuts = batches.iter().map(|r| chunks(r.start, r.len())).collect();
         CallPlan {
-            group,
+            group: levers.group,
+            cut: levers.cut,
             ring,
             ced: ced.state(),
             batches,
@@ -384,7 +414,7 @@ impl BodyLevers {
     pub fn call_plan(&self, hp: &Hparams, ctx_max: usize, first: usize, n: usize) -> CallPlan {
         let ring = ctx_max.min(hp.window);
         let ced = Ced::new(&super::ced::CedLayer::table(hp), ring, self.ced);
-        CallPlan::new(&ced, ring, self.group, first, n)
+        CallPlan::new(&ced, ring, self, first, n)
     }
 }
 
@@ -740,7 +770,7 @@ fn feed(
     }
     let first = m.pos() as usize;
     let end = first + ids.len();
-    let runs = batches(first, ids.len());
+    let runs = m.body(WHAT)?.levers.batches(first, ids.len());
     let starts: Vec<usize> = runs.iter().map(|r| r.start).collect();
     let (window, mut sink) = match features {
         Some(f) => (Some(f.window), Some(f.sink)),
@@ -886,6 +916,23 @@ pub(super) fn check_group(group: usize) -> Result<(), GpuError> {
 /// row's kind takes.
 const GROUP_MAX: usize = bloomery_levers::PREFILL_GROUP_MAX as usize;
 const _: () = assert!(GROUP_MAX as u64 == bloomery_levers::PREFILL_GROUP_MAX);
+
+/// `cut`, `BLOOMERY_PREFILL_CUT` — the positions a batch holds at most —
+/// refused by name, with its value, unless it is from 1 to [`T_MAX`], the
+/// rows the batch's buffers have.
+pub(super) fn check_cut(cut: usize) -> Result<(), GpuError> {
+    if (1..=T_MAX).contains(&cut) {
+        Ok(())
+    } else {
+        Err(GpuError::Shape {
+            what: CUT_LEVER,
+            detail: format!("{cut} positions, where a batch holds 1 to {T_MAX}"),
+        })
+    }
+}
+
+/// The lever whose value [`check_cut`] refuses.
+const CUT_LEVER: &str = "BLOOMERY_PREFILL_CUT";
 
 /// A batch's own buffers in its group: per token its streams and folds,
 /// ping and pong; per chunk, per indexer layer, its list of [`CHUNK`]
@@ -1864,6 +1911,20 @@ impl Body {
     #[must_use]
     pub fn prefill_group_lever(&self) -> usize {
         self.levers.group
+    }
+
+    /// `BLOOMERY_PREFILL_CUT` as the body was loaded with it: the positions
+    /// a batch holds at most.
+    #[must_use]
+    pub fn prefill_cut_lever(&self) -> usize {
+        self.levers.cut
+    }
+
+    /// How many batches a call of `n` positions runs on this body
+    /// ([`BodyLevers::batch_count`]).
+    #[must_use]
+    pub fn prefill_batch_count(&self, n: usize) -> usize {
+        self.levers.batch_count(n)
     }
 
     /// The queue entries the last prompt call enqueued, per batch and per
@@ -3142,7 +3203,152 @@ fn set_of(sets: &mut [BatchSet], set: usize) -> Result<&mut BatchSet, GpuError> 
 
 #[cfg(test)]
 mod tests {
+    use super::super::ced::CedLayer;
     use super::*;
+
+    /// The levers of a body under a cut of `cut` positions, every other
+    /// lever at its registry default.
+    fn levers(cut: usize) -> BodyLevers {
+        BodyLevers {
+            ced: true,
+            prefill: PrefillMode::Batch,
+            group: 2,
+            cut,
+            rows: RowsLevers {
+                helper: true,
+                stats: false,
+            },
+            host: HostCfg {
+                populate: true,
+                lock: false,
+                card_dontneed: true,
+                r8: true,
+                route_trace: false,
+            },
+            residency: Residency::Off,
+            hoststream: false,
+        }
+    }
+
+    /// V4.1's shape: 40 layers, compressors (and index keys) on 2, 8, 14
+    /// and 20, each layer reading the last one at or below it.
+    fn v41() -> Vec<CedLayer> {
+        let sources = [2, 8, 14, 20];
+        (0..40)
+            .map(|l| {
+                let src = sources.iter().copied().filter(|&s| s <= l).max();
+                CedLayer {
+                    compressor: sources.contains(&l),
+                    index_keys: sources.contains(&l),
+                    sources: src.map(|s| [s, s, s]),
+                    candidates: None,
+                }
+            })
+            .collect()
+    }
+
+    /// A call is cut at the lever's positions into near-equal batches: 512
+    /// positions under 256 are two, under 512 one, under 128 four; 600
+    /// under 256 are three of 200 (the first `n mod k` one longer, as at
+    /// every cut, where a greedy cut would leave a short last batch); a call
+    /// from `first` carries the offset; and a count agrees with the cut.
+    #[test]
+    fn a_cut_makes_more_near_equal_batches() {
+        let cut = |c: usize, first: usize, n: usize| levers(c).batches(first, n);
+        assert_eq!(cut(512, 0, 512), vec![0..512]);
+        assert_eq!(cut(256, 0, 512), vec![0..256, 256..512]);
+        assert_eq!(cut(128, 0, 512), vec![0..128, 128..256, 256..384, 384..512]);
+        assert_eq!(cut(256, 0, 600), vec![0..200, 200..400, 400..600]);
+        assert_eq!(cut(256, 0, 513), vec![0..171, 171..342, 342..513]);
+        assert_eq!(cut(256, 1000, 512), vec![1000..1256, 1256..1512]);
+        assert_eq!(cut(256, 0, 256), vec![0..256]);
+        assert_eq!(cut(256, 0, 1), vec![0..1]);
+        for (c, n, want) in [(512, 512, 1), (256, 512, 2), (128, 512, 4), (256, 600, 3)] {
+            assert_eq!(levers(c).batch_count(n), want, "{n} positions under {c}");
+            assert_eq!(
+                levers(c).batches(0, n).len(),
+                want,
+                "{n} positions under {c}"
+            );
+        }
+        // Unset is the default cut: the free functions of the gates that
+        // model it.
+        assert_eq!(levers(T_MAX).batches(7, 1100), batches(7, 1100));
+        assert_eq!(levers(T_MAX).batch_count(1100), batch_count(1100));
+    }
+
+    /// A call's plan reads the same cut: its batches, the chunks of each,
+    /// the cut it prints and the groups over its batches. Under 256 a call
+    /// of 512 is two batches in one group of two, each cut into chunks that
+    /// cover it; under 512 one batch in one group.
+    #[test]
+    fn a_call_plan_is_cut_where_the_lever_cuts() {
+        let ced = Ced::new(&v41(), 128, true);
+        let plan =
+            |c: usize, first: usize, n: usize| CallPlan::new(&ced, 128, &levers(c), first, n);
+        let p = plan(256, 0, 512);
+        assert_eq!((p.cut, p.group), (256, 2));
+        assert_eq!(p.batches, vec![0..256, 256..512]);
+        assert_eq!(p.cuts.len(), 2);
+        for (batch, chunks) in p.batches.iter().zip(&p.cuts) {
+            assert_eq!(chunks.first().map(|c| c.start), Some(batch.start));
+            assert_eq!(chunks.last().map(|c| c.end), Some(batch.end));
+            assert!(chunks.windows(2).all(|w| w[0].end == w[1].start));
+            assert!(chunks.iter().all(|c| (1..=CHUNK).contains(&c.len())));
+        }
+        assert_eq!(p.groups(2), vec![0..2]);
+        let p = plan(512, 0, 512);
+        assert_eq!(p.cut, 512);
+        assert_eq!(p.batches, vec![0..512]);
+        assert_eq!(p.groups(2), vec![0..1]);
+        let p = plan(128, 0, 512);
+        assert_eq!(p.batches.len(), 4);
+        assert_eq!(p.groups(2), vec![0..2, 2..4]);
+        let p = plan(256, 700, 600);
+        assert_eq!(p.batches, vec![700..900, 900..1100, 1100..1300]);
+        assert_eq!(p.need.first, 700);
+        assert_eq!(p.need.end, 1300);
+    }
+
+    /// The hole a call leaves is computed from the batches the call runs: a
+    /// latent start floors to the last batch start before it, so a call of
+    /// 257 positions under 256 (batches 0..129 and 129..257) has its hole
+    /// end at that last start, where under 512 (one batch) it ends at the
+    /// chunk boundary below; the same from an unaligned first position.
+    #[test]
+    fn a_calls_hole_follows_the_cut() {
+        let ced = Ced::new(&v41(), 128, true);
+        let hole = |c: usize, first: usize, n: usize| {
+            super::super::seq::call_hole(&ced, &levers(c), first, first + n)
+        };
+        assert_eq!(levers(256).batches(0, 257), vec![0..129, 129..257]);
+        assert_eq!(hole(256, 0, 257), 0..129);
+        assert_eq!(hole(512, 0, 257), 0..128);
+        assert_eq!(levers(256).batches(700, 265), vec![700..833, 833..965]);
+        assert_eq!(hole(256, 700, 265), 700..833);
+        assert_eq!(hole(512, 700, 265), 700..832);
+        // A call that cuts at chunk-aligned starts leaves the same hole.
+        assert_eq!(hole(256, 0, 512), hole(512, 0, 512));
+        assert_eq!(hole(256, 0, 0), 0..0);
+    }
+
+    /// The cut is refused by name, with its value, unless it is from 1 to
+    /// the rows a batch's buffers have.
+    #[test]
+    fn check_cut_names_a_value_outside_one_to_t_max() {
+        for ok in [1, 128, 256, T_MAX] {
+            check_cut(ok).expect("a cut a batch's buffers hold");
+        }
+        for bad in [0, T_MAX + 1, 2 * T_MAX] {
+            match check_cut(bad) {
+                Err(GpuError::Shape { what, detail }) => {
+                    assert_eq!(what, "BLOOMERY_PREFILL_CUT");
+                    assert!(detail.contains(&bad.to_string()), "{detail}");
+                }
+                other => panic!("a cut of {bad} must be refused by name, got {other:?}"),
+            }
+        }
+    }
 
     /// A timed call of two batches over three layers, the first layer
     /// without a block, and its stats as the group's fold makes them.

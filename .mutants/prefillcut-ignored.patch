@@ -1,0 +1,20 @@
+--- a/crates/gpu-deepseek41/src/body/prefill.rs
++++ b/crates/gpu-deepseek41/src/body/prefill.rs
+@@ -324,7 +324,7 @@
+     /// `⌈n / cut⌉`.
+     #[must_use]
+     pub fn batch_count(&self, n: usize) -> usize {
+-        n.div_ceil(self.cut)
++        n.div_ceil(T_MAX)
+     }
+ 
+     /// The batches a call of `n` positions from `first` runs under the
+@@ -333,7 +333,7 @@
+     /// call's cut: the call, its plan and the hole it leaves read it here.
+     #[must_use]
+     pub fn batches(&self, first: usize, n: usize) -> Vec<Range<usize>> {
+-        runtime::prompt::batches(first, n, self.cut)
++        runtime::prompt::batches(first, n, T_MAX)
+     }
+ }
+ 

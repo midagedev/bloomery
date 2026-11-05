@@ -1,0 +1,13 @@
+--- a/crates/gpu-deepseek41/src/body/seq.rs
++++ b/crates/gpu-deepseek41/src/body/seq.rs
+@@ -50,8 +50,8 @@
+     if end <= first {
+         return first..first;
+     }
+-    let starts: Vec<usize> = levers
+-        .batches(first, end - first)
++    let _ = levers;
++    let starts: Vec<usize> = super::prefill::batches(first, end - first)
+         .iter()
+         .map(|r| r.start)
+         .collect();

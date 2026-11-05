@@ -175,6 +175,9 @@ pub struct BodyLevers {
     /// Batches a prompt group holds, 1 to `bloomery_levers::PREFILL_GROUP_MAX`
     /// (`BLOOMERY_PREFILL_GROUP`); the load refuses any other.
     pub group: usize,
+    /// Positions a prompt batch holds at most, 1 to [`T_MAX`]
+    /// (`BLOOMERY_PREFILL_CUT`); the load refuses any other.
+    pub cut: usize,
     /// The step rows' levers.
     pub rows: RowsLevers,
     /// The host tier's load settings: what the placed load does to the host
@@ -280,6 +283,7 @@ impl OpenCfg {
             ced: levers.ced(),
             prefill,
             group: levers.prefill_group(),
+            cut: levers.prefill_cut(),
             rows: RowsLevers::from_levers(levers),
             host: levers.host(),
             residency,
@@ -2468,6 +2472,7 @@ impl Body {
             slots: planned,
         } = on;
         prefill::check_group(cfg.group)?;
+        prefill::check_cut(cfg.cut)?;
         let spec = plan
             .machine
             .cards

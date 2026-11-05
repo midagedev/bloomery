@@ -1,0 +1,20 @@
+# Round prefillcut (kind profile): the same binary at BLOOMERY_PREFILL_CUT=512 (one pass, today), 256 (two passes) and 128
+# (four passes) on a P 512 prose prompt, plan (a), A6000, 2 rounds. [derived, prefill-passes.card and the round's paper
+# decomposition] per layer: one pass = card 36.1 + host 28.8 serial = 58 ms -> 220 (measured 210-221); two passes of 256 =
+# 2 x ~15 + one exposed host piece ~14.5 = 43.5 ms -> 295; four of 128 = 36.3 ms -> 353. Both are upper bounds: the host
+# union's per-expert floor W = 126 us does not halve with the columns, so a cut's host piece shrinks less than its rows.
+# The measured value is the 256 arm's pp; the 512 arm beside it is the paired reference and the 128 arm reads the floor.
+kind: profile
+question: does cutting a one-pass P 512 prompt into two or four passes raise pp as the pipeline model says, and where does
+  the host union's floor stop it?
+term: pp tok/s @ P 512 (prose), plan (a), A6000 stage, BLOOMERY_PREFILL_CUT=256; the 512 and 128 arms in the same lease
+unit: tok/s
+predict: 265..310
+condition: one binary (the prefillcut worktree's WIP commit), every arm's load its own process, its `load` line printing
+  `cut=` and the `time prompt` row `passes=` 1, 2, 4; 2 rounds; a row marked [cold] or [cpu-busy] stands with its mark
+decide-in: the cut is the P 512 prefill lever: land it (the union batch once before the PR) and write the headline
+  `pp @ P 512` at the better of 256 and 128 with the one-pass number beside it; the default stays 512 until the gate
+  tier proves the cut on every family that shares the walk
+decide-below: under 265: the host floor or the attention over the ring eats the overlap; read the two arms' `stat
+  prefill` records (front, lb) before a smaller cut is tried
+decide-above: over 310: the host piece overlapped more than one exposed leg; re-derive the fill and drain

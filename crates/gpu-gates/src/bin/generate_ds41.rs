@@ -389,8 +389,8 @@ mod drive {
     use bloomery_gpu_gates::{Fnv1a64, GateError, data_dir, ref_model_path, residency};
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, GEN_SLOTS, HOST_LANES,
-        HOST_LOCK, HOST_POPULATE, HOSTSTREAM, Levers, MTP_WIDTH, PIN_MAIN, PREFILL, PREFILL_GROUP,
-        R8, RESIDENCY, ResidencyAt, ResidencyPick, STEP_STATS, WARM_PROFILE,
+        HOST_LOCK, HOST_POPULATE, HOSTSTREAM, Levers, MTP_WIDTH, PIN_MAIN, PREFILL, PREFILL_CUT,
+        PREFILL_GROUP, R8, RESIDENCY, ResidencyAt, ResidencyPick, STEP_STATS, WARM_PROFILE,
     };
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
@@ -772,6 +772,7 @@ mod drive {
         CED,
         PREFILL,
         PREFILL_GROUP,
+        PREFILL_CUT,
         ENGRAM_HELPER,
         STEP_STATS,
         CARD_BUDGET,
@@ -2147,6 +2148,7 @@ mod drive {
                 None => load,
             };
             load.u("group", b.prefill_group_lever())
+                .u("cut", b.prefill_cut_lever())
                 .f("load_s", total.as_secs_f64())
                 .print();
             if let Some(times) = m.load_times() {
@@ -2386,7 +2388,7 @@ mod drive {
         let time = FeedTime {
             n: depth,
             passes: if batch {
-                body::batch_count(called) + usize::from(f.serve)
+                s.model().body("generate_ds41")?.prefill_batch_count(called) + usize::from(f.serve)
             } else {
                 depth
             },
