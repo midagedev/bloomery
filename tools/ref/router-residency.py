@@ -270,9 +270,6 @@ class Set:
             a = a.reshape(self.T, self.K)
             if a.size and a.max() >= self.E:
                 raise ToolError(f"{self.dir} layer {layer}: id {a.max()} >= n_expert {self.E}")
-            for row in a[:: max(1, self.T // 997)]:
-                if len(set(row.tolist())) != self.K:
-                    raise ToolError(f"{self.dir} layer {layer}: a token selects an expert twice")
             self._ids[layer] = a
         return self._ids[layer]
 

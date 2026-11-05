@@ -27,7 +27,6 @@ const HEADER: &str = "# router-rank";
 pub struct ExpertRank {
     path: String,
     n_expert: u64,
-    n_used: u64,
     sets: String,
     positions: u64,
     layers: BTreeMap<usize, Box<[u32]>>,
@@ -158,7 +157,6 @@ impl ExpertRank {
         Ok(ExpertRank {
             path: file.to_string(),
             n_expert,
-            n_used,
             sets,
             positions,
             layers,
@@ -169,18 +167,6 @@ impl ExpertRank {
     #[must_use]
     pub fn path(&self) -> &str {
         &self.path
-    }
-
-    /// Experts a layer ranks.
-    #[must_use]
-    pub fn n_expert(&self) -> u64 {
-        self.n_expert
-    }
-
-    /// Experts a token routes to, as the sets it came from had them.
-    #[must_use]
-    pub fn n_used(&self) -> u64 {
-        self.n_used
     }
 
     /// The router sets the order was learned from, as the file's header names

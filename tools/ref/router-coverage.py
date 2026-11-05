@@ -154,6 +154,10 @@ def read_topk(s, layer):
         a.byteswap()
     if len(a) != s["tokens"] * s["n_used"]:
         raise SetError(f"{path} holds {len(a)} ids, not tokens x n_expert_used = {s['tokens'] * s['n_used']}")
+    K = s["n_used"]
+    for t in range(s["tokens"]):
+        if len(set(a[t * K:(t + 1) * K])) != K:
+            raise SetError(f"{path}: token {t} selects an expert twice")
     return a
 
 
@@ -236,9 +240,8 @@ def locality(set_dirs):
         for layer in s["layers"]:
             ids = read_topk(s, layer)
             for p in range(0, len(ids), K):
-                row = ids[p:p + K]
-                if any(e >= E for e in row) or len(set(row)) != K:
-                    raise SetError(f"{d}: layer {layer} token {p // K} has invalid or duplicate expert ids")
+                if any(e >= E for e in ids[p:p + K]):
+                    raise SetError(f"{d}: layer {layer} token {p // K} has an expert id not below n_expert {E}")
             first = count(ids, E, 0, half, K)
             second = count(ids, E, half, T, K)
             if [a + b for a, b in zip(first, second)] != counts[layer]:
@@ -576,9 +579,6 @@ def predict(set_dir, n_list, keep=None, positions="all", genre=None, tiers=()):
             a = np.frombuffer(read_topk(s, l), dtype=np.uint16).astype(np.int64).reshape(T, K)
             if a.size and a.max() >= E:
                 raise SetError(f"{set_dir}: layer {l}: id {a.max()} >= n_expert {E}")
-            twice = np.nonzero((np.diff(np.sort(a, axis=1), axis=1) == 0).any(axis=1))[0]
-            if len(twice):
-                raise SetError(f"{set_dir}: layer {l}: position {twice[0]} selects an expert twice")
             ids[l] = a
         return ids[l]
 
@@ -834,6 +834,16 @@ def self_test():
                 pass
             else:
                 raise AssertionError(f"locality accepted {name}")
+        # the reader itself refuses a token that selects one expert twice, naming it, whatever counts.tsv says,
+        # so every caller (locality, predict, router-residency, router-rank) gets only distinct ids
+        dup = make("dup", {0: [[0, 1], [1, 1], [2, 3]]})
+        try:
+            read_topk(read_manifest(dup), 0)
+        except SetError as e:
+            assert "token 1 selects an expert twice" in str(e), e
+        else:
+            raise AssertionError("read_topk accepted a token that selects an expert twice")
+        assert list(read_topk(read_manifest(make("dup-free", {0: [[0, 1], [1, 2], [2, 3]]})), 0)) == [0, 1, 1, 2, 2, 3]
         # bursts: routing that follows the set-wide rates everywhere reads phi 1 — 16 experts over 8
         # windows of 4 rows, every window every expert twice (K 8)
         flat = [[(t * 8 + j) % 16 for j in range(8)] for t in range(32)]

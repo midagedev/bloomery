@@ -583,14 +583,8 @@ mod gate {
     /// the pair passes, all in graph mode from a reset; then the prompt and
     /// [`EAGER_STEPS`] steps eagerly from a reset.
     fn union_run(m: &mut Deepseek41Model, prompt: &[u32]) -> Result<Run, GateError> {
-        let mut run = Run::default();
-        m.set_mode(StepMode::Graph);
-        m.reset()?;
-        let mut tok = 0;
-        for &id in prompt {
-            tok = m.step(&[id])?;
-            run.push(tok, m.logits()?);
-        }
+        let mut run = rank_run(m, prompt)?;
+        let mut tok = *run.tokens.last().ok_or("T1: empty prompt")?;
         run.stage_nodes = Some(m.step_graph_nodes()?.len());
         for _ in 0..STEPS {
             tok = m.step(&[tok])?;

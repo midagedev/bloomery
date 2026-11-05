@@ -16,11 +16,12 @@ rank  Writes FILE, the input of BLOOMERY_EXPERT_RANK (crates/placement/src/place
       then one row `<layer><TAB><id>,<id>,...` per layer, ascending: every expert id of the layer
       exactly once, the hottest first, ties to the lower id. The sets' counts are pooled (a layer's
       count of an expert is the sum over the sets of the tokens that selected it), `positions` is
-      their tokens in all. Every set must hold the same number of experts and of experts a token
-      selects. The layers are --layers (ranges `a-b` inclusive), else every layer the sets have,
+      their tokens in all. Every set must name the same `# model` (the first shard's full path) and
+      `# build` and hold the same number of experts and of experts a token selects. The layers are --layers (ranges `a-b` inclusive), else every layer the sets have,
       which then must be the same list in every set. Refused by name, nothing written: a set
-      without its trailer, a set twice, a layer a set lacks, sets of other shapes, a topk file with
-      an id past n_expert, counts.tsv that disagree with topk. FILE is written whole or not at all.
+      without its trailer, a set twice, a layer a set lacks, sets of another model file or build or
+      with none named, sets of other shapes, a topk file with an id past n_expert or a token that
+      selects an expert twice, counts.tsv that disagree with topk. FILE is written whole or not at all.
 """
 import importlib.util
 import io
@@ -57,6 +58,14 @@ def read_sets(args, data):
         sets.append(rc.read_manifest(d))
     first = sets[0]
     for name, s in zip(names, sets):
+        for key in ("model", "build"):
+            want, got = first["header"].get(key), s["header"].get(key)
+            if not got:
+                raise SetError(f"rank: set {name} has no `# {key}` line: what it was traced from is unknown")
+            if got != want:
+                raise SetError(
+                    f"rank: set {name} has `# {key}` {got!r}, set {names[0]} {want!r}: "
+                    f"counts of two traces are not pooled into one rank")
         if (s["n_expert"], s["n_used"]) != (first["n_expert"], first["n_used"]):
             raise SetError(
                 f"rank: set {name} has {s['n_expert']} experts and selects {s['n_used']}, "
@@ -110,7 +119,8 @@ def rank(args, data, keep, out):
             for e, c in enumerate(layer_counts(s, layer)):
                 pooled[e] += c
         order = rc.hot(pooled, E)
-        assert sorted(order) == list(range(E))
+        if sorted(order) != list(range(E)):
+            raise SetError(f"rank: layer {layer}: the order is not a permutation of 0..{E}")
         rows.append(f"{layer}\t{','.join(str(e) for e in order)}\n")
     head = (f"{HEADER}\tn_expert={E}\tn_used={sets[0]['n_used']}\tsets={','.join(names)}"
             f"\tpositions={sum(s['tokens'] for s in sets)}")
@@ -130,15 +140,18 @@ def read_rank(path):
     """The header fields and the layers' id lists of a rank file, as the planner's reader takes it."""
     with open(path, encoding="utf-8") as f:
         text = f.read()
-    assert text.endswith("\n"), "a rank file ends with a newline"
+    if not text.endswith("\n"):
+        raise SetError(f"{path}: a rank file ends with a newline")
     head, *rows = text[:-1].split("\n")
     first, *fields = head.split("\t")
-    assert first == HEADER, head
+    if first != HEADER:
+        raise SetError(f"{path}: not a rank file: first field {first!r}, not {HEADER!r}")
     meta = dict(f.split("=", 1) for f in fields)
     layers = {}
     for row in rows:
         layer, ids = row.split("\t")
-        assert int(layer) not in layers
+        if int(layer) in layers:
+            raise SetError(f"{path}: layer {layer} is listed twice")
         layers[int(layer)] = [int(e) for e in ids.split(",")]
     return meta, layers
 
@@ -168,7 +181,9 @@ def self_test():
     """Synthetic sets with known orders: the pooled order, ties, the file's shape and each refusal."""
     E, K = 8, 2
 
-    def make(tmp, name, rows_by_layer, complete=True, n_expert=E):
+    MODEL = "/models/q3/m-00001-of-00002.gguf"
+
+    def make(tmp, name, rows_by_layer, complete=True, n_expert=E, model=MODEL, build="b"):
         d = os.path.join(tmp, name)
         os.mkdir(d)
         T = len(next(iter(rows_by_layer.values())))
@@ -186,7 +201,9 @@ def self_test():
         with open(os.path.join(d, "MANIFEST.tsv"), "w") as f:
             f.write("# router_trace — self-test\n# tokens\t%d\n# n_expert\t%d\n# n_expert_used\t%d\n"
                     % (T, n_expert, len(next(iter(rows_by_layer.values()))[0])))
-            f.write(f"# model\t/models/q3/m-00001-of-00002.gguf\n# model_file\tm.gguf\n# build\tb\n# ids\t{d}/ids\n")
+            for key, value in (("model", model), ("model_file", "m.gguf"), ("build", build), ("ids", f"{d}/ids")):
+                if value is not None:
+                    f.write(f"# {key}\t{value}\n")
             f.write("# layer\tlayer\tsource\tproducer\ttokens\tid_sum\tignored\tfile\n")
             for l in rows_by_layer:
                 f.write(f"layer\t{l}\tVIEW-of-ARGSORT\tp\t{T}\t0\t0\ttopk-{l}.u16\n")
@@ -244,6 +261,18 @@ def self_test():
         wide = make(tmp, "wide", {2: [[9, 1]] * 2}, n_expert=16)
         refused("16 experts", [a, wide], None, None)
         refused("names no layer", [a], None, [])
+        # one rank is learned from one model file and one build: a set of another identity, or one that
+        # names none, is refused before any count is pooled
+        def like_a(name, **identity):
+            return make(tmp, name, {2: a2, 3: a3}, **identity)
+
+        refused("`# model`", [a, like_a("other-model", model="/models/q3-requant/m-00001-of-00002.gguf")], None, None)
+        refused("`# build`", [a, like_a("other-build", build="b2")], None, None)
+        refused("no `# model` line", [a, like_a("no-model", model=None)], None, None)
+        refused("no `# build` line", [like_a("no-build", build=None)], None, None)
+        # a token that selects one expert twice is no top-k: refused with its token, counts.tsv agreeing
+        twice = make(tmp, "twice", {2: [[0, 1], [1, 1], [2, 3]]})
+        refused("token 1 selects an expert twice", [twice], None, None)
         # topk and counts.tsv must agree, and no id may pass n_expert
         skew = make(tmp, "skew", {2: [[0, 1]] * 2})
         with open(os.path.join(skew, "topk-2.u16"), "wb") as f:

@@ -245,9 +245,6 @@ fn plan_rule<'a>(
         }
     }
     check_tiers(&machine.tiers)?;
-    if let Some(rank) = rank {
-        check_rank(rank, model, &stacks, routed.is_some())?;
-    }
     card_budget::check(card_budget, machine)?;
     let by_shares;
     let card_budget = match card_budget {
@@ -335,6 +332,10 @@ fn plan_rule<'a>(
         tier_n_l.push(own);
         kv_bytes.push((kv_tier, shadow, 0));
     }
+    if let Some(rank) = rank {
+        let on_cards = n_l.iter().chain(tier_n_l.iter().flatten()).any(|&n| n != 0);
+        check_rank(rank, model, &stacks, on_cards)?;
+    }
     for (l, layer_stacks) in stacks.iter().enumerate() {
         if layer_stacks.is_empty() {
             continue;
@@ -397,8 +398,8 @@ fn plan_rule<'a>(
 
 /// Refuse by name unless `rank` orders exactly the layers of `model` that
 /// hold routed stacks (`stacks`, each layer's stack rows), over their experts,
-/// and the plan places routed experts on a card (`on_cards`): a rank on a plan
-/// that keeps every expert on the host would order nothing.
+/// and the filled plan places routed experts on a card (`on_cards`): a rank on
+/// a plan that keeps every expert on the host would order nothing.
 fn check_rank(
     rank: &ExpertRank,
     model: &ModelTensors,

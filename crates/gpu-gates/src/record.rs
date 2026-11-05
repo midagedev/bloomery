@@ -5828,41 +5828,63 @@ mod tests {
         assert_eq!(plan.csv("requantized"), Ok(vec![want.as_str()]), "{named}");
     }
 
-    /// A plan line names the rank file the plan took its experts in, last,
-    /// and a plan in id order prints no part. Mutant: `with_expert_rank`
-    /// printing nothing.
+    /// A plan line names the rank file the plan took its experts in, last, and
+    /// a plan in id order prints no part, both through [`plan`], the line every
+    /// binary prints. Mutant: `plan` leaving out its `with_expert_rank` call,
+    /// or the helper printing nothing.
     #[test]
     fn a_plan_line_names_the_rank_the_plan_took_its_experts_in() {
-        use model::placement::ExpertRank;
+        use gguf::GgmlType;
+        use model::placement::{
+            ExpertRank, KvBytes, ModelTensor, ModelTensors, PlanLevers, Role, plan_with,
+        };
+        struct NoKv;
+        impl KvBytes for NoKv {
+            fn layer_bytes(&self, _: usize, _: u64) -> u64 {
+                0
+            }
+        }
+        let model = ModelTensors {
+            tensors: vec![ModelTensor {
+                name: "ffn_gate_exps.weight".to_string(),
+                shard: 0,
+                layer: Some(0),
+                role: Role::RoutedExperts,
+                ty: GgmlType::Q4_K,
+                dims: vec![256, 4, 8],
+                file_bytes: 0,
+                gathered_rows: None,
+            }],
+            layers: 1,
+            experts: 8,
+            experts_used: 2,
+            bf16_words: |_| false,
+        };
+        let machine = workstation::plan_on(workstation::A6000, 1);
+        let kv = NoKv;
+        let in_id_order = plan_with(&model, &machine, 1088, &kv, None).expect("a plan");
+        let plain = plan("cuda0", &machine, &in_id_order).line();
+        assert!(!plain.contains("expert_rank"), "{plain}");
         let rank = ExpertRank::parse(
             "/data/router/v41-rank.tsv",
-            "# router-rank\tn_expert=2\tn_used=1\tsets=a\tpositions=1\n0\t1,0\n",
+            "# router-rank\tn_expert=8\tn_used=2\tsets=a\tpositions=1\n0\t7,6,5,4,3,2,1,0\n",
         )
-        .expect("a rank over two experts");
-        let base = || {
-            Record::new(&PLAN)
-                .w("place", "cuda0")
-                .w("card", "3090")
-                .u("ctx_max", 1088)
-                .u("card_experts", 2)
-                .u("card_expert_bytes", 8)
-                .u("host_experts", 1)
-                .u("host_expert_bytes", 4)
-                .u("host_shadow", 0)
-                .w("n_l", "1..1")
-                .u("n_l_layers", 2)
-                .w("card_budget", "unset")
-                .u("paged", 0)
-                .u("arena", 0)
-                .u("arena_slots", 0)
+        .expect("a rank over eight experts");
+        let levers = PlanLevers {
+            expert_rank: Some(std::sync::Arc::new(rank)),
+            ..PlanLevers::default()
         };
-        let plain = with_expert_rank(base(), None).line();
-        assert!(!plain.contains("expert_rank"), "{plain}");
-        let named = with_expert_rank(base(), Some(&rank)).line();
-        let plan = Log::of(&named, BLOOMERY_SERVE_DS41).one(&PLAN).unwrap();
+        let by_rank = model::placement::plan(&model, &machine, 1088, &kv, &levers)
+            .expect("a plan under the rank");
+        let named = plan("cuda0", &machine, &by_rank).line();
+        let fields = Log::of(&named, BLOOMERY_SERVE_DS41).one(&PLAN).unwrap();
         assert_eq!(
-            plan.text("expert_rank"),
+            fields.text("expert_rank"),
             Ok("/data/router/v41-rank.tsv"),
+            "{named}"
+        );
+        assert!(
+            named.ends_with("expert_rank=/data/router/v41-rank.tsv"),
             "{named}"
         );
     }
