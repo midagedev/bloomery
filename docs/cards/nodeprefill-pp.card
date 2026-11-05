@@ -1,0 +1,24 @@
+# Round nodeprefill (kind profile): the prefill rate with the Spark computing its own block for the V4.1 prompt batch
+# (protocol 9: BlockOpen, Block with the q8_1 planes and places, the reply the node's slots' rows in f32), against plan
+# (a) on the same binary and lease. [derived, the round's paper decomposition] per tiered layer the node leg is request
+# 3.1 + GB10 read and GEMM 16 + pack 3.5 + reply 39.2 MB at 1.24 GB/s 31.6 + landing 3.5 = 57.7 ms; at P 512 the prompt
+# is one pass, so the leg is serial with ~29.4 ms of card work (fitted from plan (a)'s 58.2 ms a layer = 220 pp): 87 ms a
+# layer -> pp 147. The host's union (28.8 x 0.556 = 16 ms) and the card's shadow run under the leg. The measured value is
+# the node arm's pp; plan (a) beside it is the reference (210-221 today). The nodebatch arm of this configuration read
+# 48-69 (the host read the node's experts from the file; 68-94k faults): that gap is what the round closes.
+kind: profile
+question: does the node computing its block lift the ws+Spark prompt batch from 48-69 to the leg model's ~147, and does
+  the reply term (39 MB a layer on the link) hold its 1.24 GB/s?
+term: pp tok/s @ P 512 (prose), depth 512, n 96, A6000 stage, the node arm --place bp with the Spark tier over tcp
+  (BLOOMERY_TIER_NODES, BLOOMERY_TIER_LINK=tcp, BLOOMERY_CARD_BUDGET=90G, BLOOMERY_HOST_LOCK=1); plan (a) beside it
+unit: tok/s
+predict: 125..165
+condition: one binary (the nodeprefill worktree's WIP commit 8d5932bed, the Spark's tier_server built from the same
+  commit, protocol 9), every arm's load its own process; the Spark's caches dropped before its listen, free >= 100 GB;
+  2 rounds; a row marked [cold] or [cpu-busy] stands with its mark; the node arm's majflt read beside nodebatch's 68-94k
+decide-in: the leg model holds: the node path is the host's equal in bits (B9) and 2-3 x nodebatch's rate, still under
+  plan (a)'s 220 and under the cut's 281; the levers left are the reply bytes (combine on the node, bf16: ~190-207) and
+  the overlap (two sets in one group) — both priced before any round; the ws+Spark prefill headline is not written
+decide-below: under 125: the reply term is under 1.24 GB/s on 39 MB frames or the landing loop is not a copy; read the
+  node arm's stat prefill (union_tier_slots) and the trip stamps
+decide-above: over 165: the card's serial term overlaps the leg better than modelled; re-fit the 29.4 ms
