@@ -655,10 +655,9 @@ fn backoff(idle: u32) -> Duration {
 mod tests {
     use super::*;
     use crate::Check;
-    use crate::fetch::tests::{content, hex, hub_answering, run_split, scratch, served};
+    use crate::fetch::tests::{content, fake_curl, hex, hub_answering, run_split, scratch, served};
     use crate::fetch::with_suffix;
     use sha2::Digest as _;
-    use std::os::unix::fs::PermissionsExt;
 
     /// Ranges of 16 KiB, four at once: [`content`] is cut into four.
     const SMALL: Split = Split {
@@ -670,19 +669,16 @@ mod tests {
     /// one) to `dir/calls`, then starts curl once `at_once` calls have begun; a call that waits
     /// five seconds for them exits 2, a failure no fetch asks again.
     fn logging_curl(dir: &Path, at_once: usize) -> std::ffi::OsString {
-        let script = dir.join("curl");
-        fs::write(
-            &script,
-            format!(
+        fake_curl(
+            dir,
+            &format!(
                 "#!/bin/sh\nd=$(dirname -- \"$0\")\nfrom=0\nprev=\nfor a in \"$@\"; do \
                  [ \"$prev\" = --continue-at ] && from=$a; prev=$a; done\necho $from >> \"$d/calls\"\n\
                  i=0\nwhile [ $(wc -l < \"$d/calls\") -lt {at_once} ]; do i=$((i+1)); \
                  [ $i -gt 50 ] && exit 2; sleep 0.1; done\nexec curl \"$@\"\n"
             ),
         )
-        .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-        script.into_os_string()
+        .into_os_string()
     }
 
     fn calls(dir: &Path) -> Vec<u64> {
@@ -773,8 +769,7 @@ mod tests {
         let body = content();
         let (mut c, e) = served(&d, "a/b", "m.gguf", &body);
         c.curl = logging_curl(&d, 4);
-        let script = d.join("curl");
-        let text = fs::read_to_string(&script).unwrap().replace(
+        let text = fs::read_to_string(d.join("curl")).unwrap().replace(
             r#"exec curl "$@""#,
             r#"if [ "$from" = 0 ]; then
 i=0
@@ -784,7 +779,7 @@ done
 fi
 exec curl "$@""#,
         );
-        fs::write(&script, text).unwrap();
+        fake_curl(&d, &text);
         let dest = crate::cache_path(&c.root, "a/b", &e.path).unwrap();
         let part = with_suffix(&dest, ".part");
         let record = sidecar(&part);

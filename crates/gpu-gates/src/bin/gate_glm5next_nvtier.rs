@@ -375,6 +375,7 @@ mod gate {
     ) -> Result<u64, GateError> {
         match make(&PlanLevers {
             card_budget_bytes: Some(0).into(),
+            ..PlanLevers::default()
         }) {
             Err(PlaceError::Placement(PlacementError::CardBudgetFloor { floor, .. })) => Ok(floor),
             Err(e) => Err(format!("the zero card budget's probe: {e}").into()),

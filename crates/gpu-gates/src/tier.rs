@@ -1081,16 +1081,23 @@ fn fixture_budget_error(
 /// `extra`, the card bytes the load reserves out of the same budget past the header's plan (a
 /// draft's `card_bytes`, the stores' page rounding; 0 for neither). A budget lever the caller set that is not the
 /// recorded value — another value, or one per card — is refused by name, never planned under.
+/// The router rank `BLOOMERY_EXPERT_RANK` names, when the caller acts on it, rides along in either
+/// tier.
 ///
 /// # Errors
-/// An invalid tier, an error from [`header_budget`], or an error from [`budget_levers`].
+/// An invalid tier, an error from [`header_budget`], an error from [`budget_levers`], or a rank
+/// file that is not a rank.
 pub fn plan_levers(split: &Split, levers: &Levers, extra: u64) -> Result<PlanLevers, GateError> {
-    budget_levers(
+    let budget = budget_levers(
         Tier::from_env()?,
         header_budget(split)?,
         levers.card_budget(),
         extra,
-    )
+    )?;
+    Ok(PlanLevers {
+        expert_rank: PlanLevers::from_levers(levers)?.expert_rank,
+        ..budget
+    })
 }
 
 /// [`plan_levers`] of its three inputs: the tier, the header's budget and the caller's lever.
@@ -1108,6 +1115,7 @@ pub fn budget_levers(
     match tier {
         Tier::Real => Ok(PlanLevers {
             card_budget_bytes: lever,
+            ..PlanLevers::default()
         }),
         Tier::Fixture => {
             let header =
@@ -1137,6 +1145,7 @@ pub fn budget_levers(
                 })?;
             Ok(PlanLevers {
                 card_budget_bytes: CardBudget::Every(budget),
+                ..PlanLevers::default()
             })
         }
     }

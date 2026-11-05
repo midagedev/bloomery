@@ -534,6 +534,7 @@ impl PlaceQ3 {
         let card_experts = |budget: u64| -> Result<Option<u64>, GateError> {
             let levers = PlanLevers {
                 card_budget_bytes: Some(budget).into(),
+                ..PlanLevers::default()
             };
             match self.plan(ctx, &levers) {
                 Ok(plan) => Ok(Some(plan.cards.first().ok_or("a plan of no card")?.experts)),

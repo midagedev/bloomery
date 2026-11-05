@@ -208,6 +208,7 @@ mod gate {
         };
         Ok(PlanLevers {
             card_budget_bytes: Some(no_experts + experts).into(),
+            ..PlanLevers::default()
         })
     }
 

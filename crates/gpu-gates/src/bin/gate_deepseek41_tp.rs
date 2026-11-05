@@ -1,5 +1,6 @@
 //! The tensor-parallel V4.1 body (`bloomery_gpu_deepseek41::body::open_rank`) on the
-//! original-format fixture folder (`<fixture root>/v41-folder`, written by
+//! original-format fixture folder (`<fixture root>/v41-folder`, written by `just
+//! fixture-ds41-folder`: `fixture ds41-folder <repo>@<rev>` of crates/model-hf,
 //! `model_hf::arch::deepseek41::fixture`) on the one visible card, each rank reading its part of
 //! each tensor as the model's cut gives it.
 //!
@@ -137,7 +138,8 @@ mod gate {
             source,
             rows,
             ..
-        } = folder::open(dir.as_ref()).map_err(|e| format!("open {dir}: {e}"))?;
+        } = folder::open(dir.as_ref())
+            .map_err(|e| format!("open {dir}: {e}; write it with `just fixture-ds41-folder`"))?;
         let from = RankFrom {
             file: header,
             source: &source,

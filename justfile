@@ -1437,6 +1437,15 @@ fixture-requant FAMILY TAG:
 fixture-engram-upstream:
     env -u BLOOMERY_FIXTURE_VARIANT BLOOMERY_MODEL=deepseek41 BLOOMERY_TIER=fixture ./tools/box.sh 'bash tools/ref/fixture-engram-upstream.sh'
 
+# The V4.1 original-format fixture folder at <fixture root>/v41-folder (the reader gate-gpu-ds41-tp opens), written by
+# `fixture ds41-folder` from the Hub repo at the pinned revision: each shard a sparse file of its listed size with its
+# header at the front, read by HTTP Range into a temporary folder beside the output and removed after the write, so
+# nothing but the fixture is stored. The revision is the one /models/DeepSeek-V4.1-Flash-fp8's MANIFEST holds (all 48
+# shard digests match the listing at it). The header read is seconds and megabytes; the write is the writer's own
+# (Shape::default: nine layers, every expert, ff 1024; the summary line prints its exact data bytes).
+fixture-ds41-folder:
+    ./tools/box.sh 'cargo build --release -p bloomery-model-hf --bin fixture && ./target/release/fixture ds41-folder deepseek-ai/DeepSeek-V4.1-Flash@314113f8a7dadb388215396ba5fbee2c610a04d6 "${BLOOMERY_FIXTURE_ROOT:-/models/fixtures}/v41-folder"'
+
 # The MTP draft oracles' dumper, GLM-5.3-Flash's and Qwen3.8-Flash-Next's: dump_mtp linked against the ik tree that
 # carries the glm5next MTP graph on upstream's qwen4exp one (the glm5next profile's GLM_MTP_IK at GLM_MTP_SHA, checked
 # clean); `cmake --build` of its libllama and libcommon first (nothing to do when current). Under the CPU lease:
@@ -3014,8 +3023,10 @@ gate-gpu-ds41-step *ARGS='--structure --sets --select --skew-structure --skew-se
 # the one visible card, past one rank each a process of its own in a rank group over TCP ends on the loopback (the
 # bin's doc lists the clauses). The card budget is unset: a rank holds every expert on the card. Fixture-only (tools/ref/fixture-only.sh): the real file's ranks are loaded across
 # nodes, not on one card.
+# The card is the A6000 (box.sh's pick): a rank holds every expert of the v41-folder fixture on its card, which the
+# 24 GB card cannot hold (the 3090 reads DriverError out of memory at the load).
 gate-gpu-ds41-tp:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-ds41-tp && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41,checkpoint --release --bin gate_deepseek41_tp && unset BLOOMERY_CARD_BUDGET && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_tp'
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-ds41-tp && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41,checkpoint --release --bin gate_deepseek41_tp && unset BLOOMERY_CARD_BUDGET && bash tools/gpu-gate.sh gate_deepseek41_tp'
 
 # V4.1 전문가 층(host/tier.rs, twoeng R3)의 루프백: 스테이지와 층을 한 카드(3090, 게이트 배치)의 Gpu 둘에 올린다.
 # The gate plan puts each layer's id prefix [0, n_l) on the card; the tier plan moves its last 23 ids (n_l−23 … n_l) to
@@ -3038,8 +3049,13 @@ gate-gpu-ds41-tp:
 # batch: within B7's band of the same load's steps, the node computing its block of every tiered layer-batch (the slots the
 # host leaves to its leg are its routed slots). It runs
 # in the default list; the recipe builds tier_server beside the gate (with deepseek41, the one feature set every recipe builds it with).
+# --rank (B10) plans under a router-rank file the gate writes (BLOOMERY_EXPERT_RANK, set on a child of the gate alone): the child's plan
+# names the file, keeps the plan's counts and holds each layer's hottest n_l ranked ids on the card instead of its id prefix; under it T1
+# holds (the tiered carve answers the reference load of that plan bit for bit), and the prompt fed one step a position sits within the
+# logits band of the same steps over the plan without the file (a card expert and a host expert are not one result bit for bit).
+# It runs in the default list.
 [group('v41-load')]
-gate-gpu-ds41-tier *ARGS='--union --fault --two --batch --batch2 --bfault --bfeat --bnode':
+gate-gpu-ds41-tier *ARGS='--union --fault --two --batch --batch2 --bfault --bfeat --bnode --rank':
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_tier --bin tier_server && __s=$(. tools/ref/ref-paths.sh && dspark_model) && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_tier {{ARGS}}'
 
 # V4.1 plan (b′) on both cards (--place bp): the stage on the A6000, the expert tier and the DSpark draft on the 3090.

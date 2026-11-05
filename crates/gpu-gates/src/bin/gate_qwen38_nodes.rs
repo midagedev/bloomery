@@ -364,6 +364,7 @@ mod gate {
     ) -> Result<Result<Plan<'a>, String>, GateError> {
         let levers = PlanLevers {
             card_budget_bytes: Some(gib << 30).into(),
+            ..PlanLevers::default()
         };
         let inputs = &c.inputs;
         let planned = if c.node_host {
@@ -1004,6 +1005,7 @@ mod gate {
                 plan_shape()?,
                 &PlanLevers {
                     card_budget_bytes: Some(gib << 30).into(),
+                    ..PlanLevers::default()
                 },
                 Experts::Card,
             )?;
@@ -1441,6 +1443,7 @@ mod gate {
                 plan_shape()?,
                 &PlanLevers {
                     card_budget_bytes: Some(gib << 30).into(),
+                    ..PlanLevers::default()
                 },
                 Experts::Card,
             )?

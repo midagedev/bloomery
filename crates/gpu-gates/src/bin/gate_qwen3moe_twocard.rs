@@ -123,6 +123,7 @@ mod gate {
         match tier {
             Tier::Real => Ok(PlanLevers {
                 card_budget_bytes: Some(BUDGET).into(),
+                ..PlanLevers::default()
             }),
             Tier::Fixture => tier::plan_levers(split, levers, 0),
         }

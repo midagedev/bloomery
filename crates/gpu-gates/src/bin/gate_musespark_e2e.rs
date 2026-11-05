@@ -1777,6 +1777,7 @@ mod gate {
         let c = &all.cards[0];
         let budget = |bytes: u64| PlanLevers {
             card_budget_bytes: Some(bytes).into(),
+            ..PlanLevers::default()
         };
         // The least budget the plan takes, at which the card keeps no routed
         // expert: the floor its zero-budget probe is refused with (the dense

@@ -1173,6 +1173,20 @@ mod tests {
         );
         let folder = safetensors::Folder::open(&dest).expect("index paths open both shards");
         assert_eq!(folder.names().collect::<Vec<_>>(), ["a", "b"]);
+        // Each shard's copy is its listed size, its header at the front and its data a hole, so
+        // a reader that checks a tensor's end against the file's length is satisfied.
+        for (name, whole) in [
+            ("first/model.safetensors", &a),
+            ("second/model.safetensors", &b),
+        ] {
+            assert_eq!(
+                fs::metadata(dest.join(name))
+                    .expect("the copy's size")
+                    .len(),
+                whole.len() as u64,
+                "{name}: the listed size"
+            );
+        }
         assert!(!dest.join("model.safetensors").exists());
         assert_eq!(fs::read(dest.join("config.json")).unwrap(), b"{}");
         for bad in [

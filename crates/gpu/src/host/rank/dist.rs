@@ -1619,8 +1619,8 @@ mod tests {
         });
     }
 
-    // The head hashes a source file once: a write that keeps the length and restores the
-    // modification time still changes the change time, so the file is hashed again and refused. Only a name
+    // The head hashes a source file once: a rewrite that keeps the length and restores the
+    // modification time still moves the stamp, so the file is hashed again and refused. Only a name
     // inside the folder is one, and a read of a shard in a subfolder is that file's.
     #[test]
     fn the_head_checks_a_file_once_by_its_stamp_and_names_only_inside_its_folder() {
@@ -1640,9 +1640,20 @@ mod tests {
         let record = root.join("record/verified.tsv");
         verify(&dir, one, &record).unwrap();
         let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
-        let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        // The rewrite lands as a new inode renamed over the old name: with the old mtime restored,
+        // an in-place write would move only the change time, and the coarse clock that stamps it
+        // can leave both writes in one tick; dev:ino moves with the inode.
+        let staged = dir.join("weights/a.safetensors.staged");
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&staged)
+            .unwrap();
         f.write_all(b"WEIGHTS").unwrap();
         f.set_modified(mtime).unwrap();
+        drop(f);
+        std::fs::rename(&staged, &path).unwrap();
         let e = verify(&dir, one, &record).unwrap_err().to_string();
         assert!(
             e.contains("weights/a.safetensors: its bytes hash to"),

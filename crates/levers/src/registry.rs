@@ -20,6 +20,7 @@ pub const ENGRAM_HELPER: &str = "BLOOMERY_ENGRAM_HELPER";
 pub const STEP_STATS: &str = "BLOOMERY_STEP_STATS";
 pub const CARD_BUDGET: &str = "BLOOMERY_CARD_BUDGET";
 pub const CARD_MARGIN: &str = "BLOOMERY_CARD_MARGIN";
+pub const EXPERT_RANK: &str = "BLOOMERY_EXPERT_RANK";
 pub const PIN_MAIN: &str = "BLOOMERY_PIN_MAIN";
 pub const DRAFT: &str = "BLOOMERY_DRAFT";
 pub const CHECK_FINITE: &str = "BLOOMERY_CHECK_FINITE";
@@ -341,6 +342,31 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               card named twice, a card the census does not list, shares (`<n>x`), a list on a \
               plan whose tier cards are another node's, and a margin that leaves a card no \
               usable byte. `M` and `G` are binary units.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: EXPERT_RANK,
+        class: Class::C,
+        kind: Kind::Path,
+        default: Unset::Means(
+            "id order: the stage card keeps each layer's id prefix and each expert tier the ids \
+             after it",
+        ),
+        doc: "Placement: a router-rank file (`tools/ref/router-rank.py rank`): each routed \
+              layer's experts, every id once, hottest first. The stage card's prefix becomes \
+              the layer's hottest `n_l` ids and each expert tier's block the layer's coldest \
+              ids (tier 0 the coldest `own` ids, the next tier the next-coldest block), the \
+              host the middle; adaptive residency (`BLOOMERY_RESIDENCY`) still moves experts \
+              between the stage card and the host from there. The counts per layer are the \
+              plan's, unchanged. The `plan` record names the file (`expert_rank=`). Refused \
+              by name: a file that cannot be read or is not a rank (no final newline, a layer \
+              or an id twice, an id past `n_expert`, a layer with other than `n_expert` ids), \
+              a rank whose layers or `n_expert` differ from the model's routed layers, a plan \
+              that places no routed expert on a card, and explicit node-owned id ranges \
+              (`placement::nodes`), which keep their id blocks.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

@@ -65,6 +65,7 @@ pub fn plan_in_pool<'a>(
         budget = lower;
         let refused = match make(&PlanLevers {
             card_budget_bytes: card_budget::CardBudget::Every(budget),
+            ..levers.clone()
         }) {
             Ok(mut plan) => {
                 plan.budget_from_pool = true;
@@ -246,6 +247,7 @@ pub(super) fn totals<'a>(
         tier_n_l,
         card_budget,
         budget_from_pool: false,
+        expert_rank: None,
     })
 }
 

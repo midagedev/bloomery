@@ -197,6 +197,7 @@ mod tests {
             tier_n_l: Vec::new(),
             card_budget: crate::placement::card_budget::CardBudget::Unset,
             budget_from_pool: false,
+            expert_rank: None,
         }
     }
 

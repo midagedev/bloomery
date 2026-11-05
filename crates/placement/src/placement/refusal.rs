@@ -70,6 +70,11 @@ pub enum PlacementError {
     /// An expert list that is not one: a repeated id, an id past the stack.
     #[error("expert list: {0}")]
     Experts(String),
+    /// A router rank (`BLOOMERY_EXPERT_RANK`) the plan cannot place: a file
+    /// that is not a rank, or one that disagrees with the model or the plan,
+    /// with what says why.
+    #[error("expert rank {file}: {detail}")]
+    ExpertRank { file: String, detail: String },
     /// A host room under the floor of the NVMe expert tier: the plan's host
     /// terms outside the routed experts, and the transient reads of two
     /// layers' NVMe-tier experts and one layer's host experts beside them —

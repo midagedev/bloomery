@@ -6,13 +6,15 @@
 //! copied. Only the source's headers are read: every value is drawn from the seed and the
 //! tensor's name, a matrix's elements of standard deviation `1/√k`, a gain or a bias the GGUF
 //! fixture's constant for its deepseek41 name ([`fixture::const_value`],
-//! [`fixture::spread_value`]).
+//! [`fixture::spread_value`]). A hub repo is a source through [`write_from_hub`], its files read
+//! as headers the same way.
 
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
+use hf::fetch::Client;
 use model::arch::deepseek41::fixture;
 use model::fixture::{Rng, chunk_rng};
 use safetensors::Folder;
@@ -20,6 +22,7 @@ use serde_json::{Value as Json, json};
 
 use super::{Ds41Map, skip_reason};
 use crate::folder::{Error, FolderMap, refuse};
+use crate::remote;
 
 /// The fixture's routed and shared inner width: halves and quarters remain whole
 /// 256-value MXFP4 kernel units.
@@ -381,7 +384,8 @@ fn draw(
 ///
 /// # Errors
 ///
-/// A source whose config, headers or tokenizer files cannot be read, a layer past it, a
+/// A source whose config, headers or tokenizer files cannot be read (a missing one of the files
+/// the fixture copies is refused at the entry, before any shard is written), a layer past it, a
 /// candidate source layer `shape` drops, a tensor of a format the fixture does not draw, a
 /// fixture the map does not read, and any I/O error, each by name.
 pub fn write(source: &Path, out: &Path, shape: &Shape, seed: u64) -> Result<u64, Error> {
@@ -389,6 +393,15 @@ pub fn write(source: &Path, out: &Path, shape: &Shape, seed: u64) -> Result<u64,
         return Err(Error::Refused(format!("{} exists", out.display())));
     }
     let config = crate::folder::read_json(&source.join("config.json"))?;
+    for name in COPY {
+        let from = source.join(name);
+        if !from.is_file() {
+            return Err(Error::Refused(format!(
+                "{}: the source holds no {name}",
+                from.display()
+            )));
+        }
+    }
     let src_ff = config["text_config"]["moe_intermediate_size"]
         .as_u64()
         .ok_or_else(|| Error::Refused("config.json: no text_config.moe_intermediate_size".into()))?
@@ -434,6 +447,49 @@ pub fn write(source: &Path, out: &Path, shape: &Shape, seed: u64) -> Result<u64,
         Ok(()) => e,
         Err(c) => Error::Refused(format!("{e}; and removing {} failed: {c}", tmp.display())),
     })
+}
+
+/// The fixture of the checkpoint folder the hub repo `repo` holds at revision `rev`, written by
+/// [`write`] from a header-only copy of the repo's files ([`remote::sparse_checkpoint`]: each shard
+/// a sparse file of its listed size with its header at the front, the configs whole) under
+/// `tmp/source`. `tmp`, which the caller created, is removed whether or not the write ends. The
+/// data bytes written.
+///
+/// # Errors
+///
+/// A repo whose listing holds no checkpoint folder, the hub's own refusals of the listing and the
+/// copy, and [`write`]'s, each by name.
+pub fn write_from_hub(
+    client: &Client,
+    repo: &str,
+    rev: &str,
+    tmp: &Path,
+    out: &Path,
+    shape: &Shape,
+    seed: u64,
+) -> Result<u64, Error> {
+    if client.offline {
+        return Err(Error::Refused(
+            "ds41-folder's hub source reads the hub's listing; HF_HUB_OFFLINE is set".into(),
+        ));
+    }
+    let entries = client
+        .listing_at(repo, rev)
+        .map_err(|e| Error::Refused(format!("{repo}@{rev}: {e}")))?;
+    let files = hf::checkpoint_files(&entries)
+        .ok_or_else(|| Error::Refused(format!("{repo}@{rev} holds no {}", Folder::INDEX)))?;
+    let done =
+        remote::sparse_checkpoint(client, repo, rev, &files, &tmp.join("source"), &mut |_| {})
+            .map_err(|e| Error::Refused(e.to_string()))
+            .and_then(|source| write(&source, out, shape, seed));
+    match (done, std::fs::remove_dir_all(tmp)) {
+        (done, Ok(())) => done,
+        (Ok(_), Err(e)) => Err(Error::Refused(format!("{}: {e}", tmp.display()))),
+        (Err(e), Err(c)) => Err(Error::Refused(format!(
+            "{e}; and removing {} failed: {c}",
+            tmp.display()
+        ))),
+    }
 }
 
 /// The fixture's shards, index, config and copied tokenizer files written into `tmp`, and the
@@ -500,9 +556,9 @@ fn write_into(
 mod tests {
     use serde_json::{Map, Value as Json};
 
-    use super::{Ds41Map, FF, Shape, edit_config};
+    use super::{Ds41Map, FF, Shape, edit_config, write_from_hub};
     use crate::folder::{Error, FolderMap};
-    use crate::test_support::json;
+    use crate::test_support::{json, temp_dir};
 
     /// `config` edited by `edit` is refused by a message naming `key`.
     fn refused(config: &Json, key: &str, edit: impl FnOnce(&mut Map<String, Json>)) {
@@ -553,5 +609,72 @@ mod tests {
         let (config, _) = edit_config(&config, &shape).unwrap();
         assert_eq!(config["text_config"]["candidate_source_layer_id"], 0);
         Ds41Map::parse(&config).unwrap();
+    }
+
+    /// A hub source's files are read as headers into a temporary folder, and a write that fails
+    /// (here at a tokenizer file the source holds none of) leaves neither the fixture nor the
+    /// temporary sources.
+    #[test]
+    fn a_failed_hub_write_leaves_no_temporary_sources() {
+        use sha2::Digest as _;
+
+        let root = temp_dir("ds41-hub");
+        let hub = root.join("hub");
+        let shard = |json: &str| -> Vec<u8> {
+            let mut out = (json.len() as u64).to_le_bytes().to_vec();
+            out.extend_from_slice(json.as_bytes());
+            out.extend(std::iter::repeat_n(0, 8));
+            out
+        };
+        let a = shard(r#"{"t":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#);
+        let b = shard(r#"{"u":{"dtype":"F32","shape":[2],"data_offsets":[0,8]}}"#);
+        let index = br#"{"weight_map":{"t":"model-00001-of-00002.safetensors","u":"model-00002-of-00002.safetensors"}}"#;
+        let mut listed = Vec::new();
+        for (path, bytes) in [
+            (safetensors::Folder::INDEX, index.as_slice()),
+            ("config.json", br#"{"text_config": {}}"#.as_slice()),
+            ("model-00001-of-00002.safetensors", a.as_slice()),
+            ("model-00002-of-00002.safetensors", b.as_slice()),
+        ] {
+            let served = hub.join("a/b/resolve/main").join(path);
+            std::fs::create_dir_all(served.parent().unwrap()).unwrap();
+            std::fs::write(&served, bytes).unwrap();
+            listed.push(format!(
+                "{{\"type\":\"file\",\"path\":\"{path}\",\"size\":{},\"lfs\":{{\"oid\":\"{}\",\"size\":{}}}}}",
+                bytes.len(),
+                sha2::Sha256::digest(bytes)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+                bytes.len()
+            ));
+        }
+        let tree = hub.join("api/models/a/b/tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("main"), format!("[{}]", listed.join(","))).unwrap();
+        let client = hf::fetch::Client {
+            base: format!("file://{}", hub.display()),
+            token: None,
+            root: root.join("cache"),
+            curl: "curl".into(),
+            offline: false,
+            revision: "main".into(),
+        };
+        let tmp = root.join("fetch");
+        std::fs::create_dir(&tmp).unwrap();
+        let err = write_from_hub(
+            &client,
+            "a/b",
+            "main",
+            &tmp,
+            &root.join("out"),
+            &Shape::default(),
+            7,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("tokenizer.json"), "{err}");
+        assert!(!tmp.exists(), "the temporary sources are removed");
+        assert!(!root.join("out").exists());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

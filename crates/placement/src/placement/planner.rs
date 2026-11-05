@@ -3,6 +3,7 @@ use super::machine::{
     Card, ExpertList, KvBytes, Machine, ModelTensors, routed_down_acts, selected_leg_scratch,
 };
 use super::pool::totals;
+use super::rank::ExpertRank;
 use super::refusal::{CardFreeFloor, PlacementError};
 use super::rule::{
     Footprint, RoutedRule, Stages, card_uploads, eligible, layer_of, place_whole, routed_row_on_as,
@@ -10,11 +11,14 @@ use super::rule::{
 };
 use super::table::{Plan, Row};
 use super::{CardFormat, Role};
+use std::sync::Arc;
 
 /// The placement's levers, which a binary parses once
 /// ([`PlanLevers::from_levers`]): the card budget `BLOOMERY_CARD_BUDGET`
-/// sets. The default is none: each card's own usable bytes, or on a unified
-/// pool the budget [`plan_in_pool`] lowers to the NVMe expert tier's floor.
+/// sets and the router rank `BLOOMERY_EXPERT_RANK` names. The default is
+/// none of either: each card's own usable bytes, or on a unified pool the
+/// budget [`plan_in_pool`] lowers to the NVMe expert tier's floor; the id
+/// order.
 #[derive(Clone, Debug, Default)]
 pub struct PlanLevers {
     /// The card budget `BLOOMERY_CARD_BUDGET` sets, in bytes: a card of the
@@ -23,13 +27,25 @@ pub struct PlanLevers {
     /// bytes, or on a unified pool the budget [`plan_in_pool`] lowers to the
     /// NVMe expert tier's floor. One value converts from `Option<u64>`.
     pub card_budget_bytes: card_budget::CardBudget,
+    /// The router rank `BLOOMERY_EXPERT_RANK` names, read: the order the plan
+    /// takes each routed layer's experts in. The stage card keeps the layer's
+    /// hottest `n_l` ids and each expert tier the coldest ids, tier 0 the
+    /// coldest block (`ExpertRank::split`); none, the id prefix and the ids
+    /// after it. The plan refuses by name a rank that disagrees with the
+    /// model, and one on a plan that places no routed expert on a card.
+    pub expert_rank: Option<Arc<ExpertRank>>,
 }
 
 impl PlanLevers {
-    /// The placement's levers of a binary's one parse.
+    /// The placement's levers of a binary's one parse: the rank file the
+    /// lever names is read here, refused by name when it is not a rank.
     pub fn from_levers(levers: &bloomery_levers::Levers) -> Result<PlanLevers, PlacementError> {
         Ok(PlanLevers {
             card_budget_bytes: levers.card_budget(),
+            expert_rank: levers
+                .expert_rank()
+                .map(|path| ExpertRank::read(path).map(Arc::new))
+                .transpose()?,
         })
     }
 }
@@ -47,7 +63,7 @@ pub fn plan<'a>(
         machine,
         ctx_max,
         kv,
-        &levers.card_budget_bytes,
+        levers,
         Some(RoutedRule::PerType(CardFormat::of_routed)),
         0,
     )
@@ -100,7 +116,10 @@ pub fn plan_with<'a>(
         machine,
         ctx_max,
         kv,
-        &card_budget.into(),
+        &PlanLevers {
+            card_budget_bytes: card_budget.into(),
+            ..PlanLevers::default()
+        },
         Some(RoutedRule::PerType(CardFormat::of_routed)),
         0,
     )
@@ -117,15 +136,7 @@ pub fn plan_routed<'a>(
     levers: &PlanLevers,
     routed: RoutedRule,
 ) -> Result<Plan<'a>, PlacementError> {
-    plan_rule(
-        model,
-        machine,
-        ctx_max,
-        kv,
-        &levers.card_budget_bytes,
-        Some(routed),
-        0,
-    )
+    plan_rule(model, machine, ctx_max, kv, levers, Some(routed), 0)
 }
 
 /// [`plan_routed`] with `reserve` bytes of every card kept for what the
@@ -146,15 +157,7 @@ pub fn plan_routed_reserving<'a>(
     routed: RoutedRule,
     reserve: u64,
 ) -> Result<Plan<'a>, PlacementError> {
-    plan_rule(
-        model,
-        machine,
-        ctx_max,
-        kv,
-        &levers.card_budget_bytes,
-        Some(routed),
-        reserve,
-    )
+    plan_rule(model, machine, ctx_max, kv, levers, Some(routed), reserve)
 }
 
 /// [`plan`] with every routed stack on the host: no card is eligible for the
@@ -196,23 +199,18 @@ pub fn plan_host_routed_reserving<'a>(
             tier: t,
         });
     }
-    plan_rule(
-        model,
-        machine,
-        ctx_max,
-        kv,
-        &levers.card_budget_bytes,
-        None,
-        reserve,
-    )
+    plan_rule(model, machine, ctx_max, kv, levers, None, reserve)
 }
 
 /// [`plan_with`], the expert rule run on each card's layers eligible under
 /// `routed`, and on none without it, within each card's budget less
 /// `reserve` ([`plan_routed_reserving`]), the budget per card under a
-/// per-card `card_budget` ([`card_budget::of`], refused on a machine whose
-/// card no CUDA ordinal of this process names: [`card_budget::check`]); the
-/// routed stacks' card segments in the format `routed` gives them.
+/// per-card `levers.card_budget_bytes` ([`card_budget::of`], refused on a
+/// machine whose card no CUDA ordinal of this process names:
+/// [`card_budget::check`]); the routed stacks' card segments in the format
+/// `routed` gives them, their ids by `levers.expert_rank` when it names one
+/// ([`ExpertRank::split`]), refused by name when the rank disagrees with the
+/// model's routed layers or the plan places no routed expert on a card.
 #[allow(
     clippy::too_many_arguments,
     reason = "the planners' one body: the model, machine, context and cache, and the rule's three inputs"
@@ -222,10 +220,12 @@ fn plan_rule<'a>(
     machine: &'a Machine,
     ctx_max: u64,
     kv: &dyn KvBytes,
-    card_budget: &card_budget::CardBudget,
+    levers: &PlanLevers,
     routed: Option<RoutedRule>,
     reserve: u64,
 ) -> Result<Plan<'a>, PlacementError> {
+    let card_budget = &levers.card_budget_bytes;
+    let rank = levers.expert_rank.as_deref();
     let tiers = machine.tiers.len();
     let nodes = machine.nodes.len();
     if nodes != 1 && (tiers == 0 || nodes != 1 + tiers) {
@@ -332,19 +332,40 @@ fn plan_rule<'a>(
         tier_n_l.push(own);
         kv_bytes.push((kv_tier, shadow, 0));
     }
+    if let Some(rank) = rank {
+        let on_cards = n_l.iter().chain(tier_n_l.iter().flatten()).any(|&n| n != 0);
+        check_rank(rank, model, &stacks, on_cards)?;
+    }
     for (l, layer_stacks) in stacks.iter().enumerate() {
         if layer_stacks.is_empty() {
             continue;
         }
         let stage = stages.of_layer[l];
-        let mut lists = vec![(stage, ExpertList::range(0..n_l[l])?)];
-        let mut next = n_l[l];
-        for (t, own) in tier_n_l.iter().enumerate() {
-            let ids = next..next + own[l];
-            next = ids.end;
-            let list = ExpertList::range(ids)?;
-            lists.push((machine.cards.len() + t, list));
-        }
+        let lists = match rank {
+            Some(rank) => {
+                let own: Vec<u64> = tier_n_l.iter().map(|own| own[l]).collect();
+                let (on_stage, on_tiers) = rank.split(l, model.layer_experts(l), n_l[l], &own)?;
+                std::iter::once((stage, on_stage))
+                    .chain(
+                        on_tiers
+                            .into_iter()
+                            .enumerate()
+                            .map(|(t, list)| (machine.cards.len() + t, list)),
+                    )
+                    .collect()
+            }
+            None => {
+                let mut lists = vec![(stage, ExpertList::range(0..n_l[l])?)];
+                let mut next = n_l[l];
+                for (t, own) in tier_n_l.iter().enumerate() {
+                    let ids = next..next + own[l];
+                    next = ids.end;
+                    let list = ExpertList::range(ids)?;
+                    lists.push((machine.cards.len() + t, list));
+                }
+                lists
+            }
+        };
         for &i in layer_stacks {
             let t = &model.tensors[i];
             rows[i] = Some(routed_row_on_as(
@@ -371,7 +392,34 @@ fn plan_rule<'a>(
         plan.host_stage_kv(host_stage_kv(model, ctx_max, kv)?);
     }
     plan.reserve_beside(reserve)?;
+    plan.expert_rank = levers.expert_rank.clone();
     Ok(plan)
+}
+
+/// Refuse by name unless `rank` orders exactly the layers of `model` that
+/// hold routed stacks (`stacks`, each layer's stack rows), over their experts,
+/// and the filled plan places routed experts on a card (`on_cards`): a rank on
+/// a plan that keeps every expert on the host would order nothing.
+fn check_rank(
+    rank: &ExpertRank,
+    model: &ModelTensors,
+    stacks: &[Vec<usize>],
+    on_cards: bool,
+) -> Result<(), PlacementError> {
+    if !on_cards {
+        return Err(PlacementError::ExpertRank {
+            file: rank.path().to_string(),
+            detail: "this plan places no routed expert on a card, so it has nothing to order"
+                .to_string(),
+        });
+    }
+    let routed: Vec<(usize, u64)> = stacks
+        .iter()
+        .enumerate()
+        .filter(|(_, layer_stacks)| !layer_stacks.is_empty())
+        .map(|(l, _)| (l, model.layer_experts(l)))
+        .collect();
+    rank.check(&routed)
 }
 
 /// A budget by shares ([`card_budget::CardBudget::Shares`]) as the budget per

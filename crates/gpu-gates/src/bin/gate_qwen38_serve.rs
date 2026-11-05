@@ -5150,6 +5150,7 @@ mod gate {
             let machine = route_machine(&inputs, card, (ub, c), experts, (1, drafted))?;
             let plan_levers = PlanLevers {
                 card_budget_bytes: Some(budget).into(),
+                ..PlanLevers::default()
             };
             Ok(inputs
                 .plan_target(

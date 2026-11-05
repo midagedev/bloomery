@@ -20,7 +20,9 @@
 //! variable are each a named error and exit 2. The file opens once, for the
 //! tokenizer, the plan's check and the session.
 //!
-//! Defaults: N 32, C the smaller of 4096 and the file's `context_length`. A
+//! Defaults: N 32, C the smaller of 4096 and the file's `context_length`, cut
+//! to the largest cache whose session fits the device's free bytes (stderr,
+//! and `--plan`'s line after `plan: ctx=`, name the cut). A
 //! flag given twice takes its last value, but `-m` and `--hf` (above).
 //! `--prompt` tokenizes the text with the file's own vocabulary (`tokenizer`,
 //! the specials the header asks for, no chat template — the CUDA CLI runs
@@ -200,9 +202,10 @@
 //! device buffer) and prints, on stdout, what the open would find: the
 //! description, the room the device and the host report beside the bytes the
 //! open would make buffers of, every refusal the open's checks meet (not the
-//! first alone), and a last line, `plan: opens` (exit 0) or `plan: refused, N
-//! items` (exit 3). A file whose data section is cut short is read as a header
-//! alone. A folder or file the open refuses before the plan can check it is a
+//! first alone) — the room rule's among them, a load whose bytes pass the
+//! device's free bytes — and a last line, `plan: opens` (exit 0) or
+//! `plan: refused, N items` (exit 3). A file whose data section is cut short
+//! is read as a header alone. A folder or file the open refuses before the plan can check it is a
 //! named error and exit 3; a header the plan cannot read is a named error and
 //! exit 64; a repo it cannot fetch is a named error and exit 1. `--hf` fetches
 //! what the cache lacks before the plan reads it. It takes no generation flag.
@@ -281,7 +284,7 @@ generate_metal [-m PATH | --hf REPO] --mtp SIDECAR --mtp-check DIR/FAMILY [--ctx
 generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
   the model is a GGUF file (its first shard) or a checkpoint folder, named by -m,
   by --hf (fetched into the cache) or by $BLOOMERY_REF_MODEL; defaults N 32, --ctx the smaller of 4096
-  and the file's context_length; --plan reads the header alone and prints
+  and the file's context_length, cut to the largest that fits the device's free bytes; --plan reads the header alone and prints
   every refusal the open would make, the bytes it would allocate and the
   room (exit 0 opens, 3 refused, 64 a header it cannot read); --print-ids prints the ids, not the text;
   --ignore-eos stops nothing at an end-of-generation id (the picks stay the device's argmax, unmasked);
@@ -683,21 +686,6 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
                 Ok(Some(c))
             }
         }
-    }
-
-    /// The smaller of the default cap and `split`'s `context_length`.
-    fn default_ctx(split: &gguf::Split, model: &std::path::Path) -> Result<usize, String> {
-        let train = split
-            .arch_get_u64("context_length")
-            .and_then(|v| usize::try_from(v).ok())
-            .ok_or_else(|| {
-                format!(
-                    "{}: {} is absent or not a count",
-                    model.display(),
-                    split.arch_key("context_length")
-                )
-            })?;
-        Ok(CTX_DEFAULT.min(train))
     }
 
     /// The generated text as it completes: the tokenizer's streaming
@@ -1399,19 +1387,38 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         ctx: Option<usize>,
     ) -> Result<plan::Printed, plan::OpenError> {
         let header = plan::open_plan_header(model)?;
-        let ctx = match ctx {
-            Some(c) => c,
-            None => default_ctx(header.split(), model).map_err(plan::OpenError::Unreadable)?,
+        let (ctx, unasked) = match ctx {
+            Some(c) => (c, None),
+            None => {
+                let u = plan::unasked_ctx(header.split(), CTX_DEFAULT, model)
+                    .map_err(plan::OpenError::Unreadable)?;
+                (u.ctx, Some(u))
+            }
         };
-        let outcome = check::check(header.split(), ctx);
-        Ok(plan::render(
+        let device = plan::device_room();
+        let free = match &device {
+            Ok(d) => Ok(d.free),
+            Err(e) => Err(e.clone()),
+        };
+        let outcome = check::check_room(header.split(), ctx, free);
+        let mut printed = plan::render(
             model,
             header.data,
             ctx,
             &outcome,
-            &plan::device_room(),
+            &device,
             &plan::HostMemory::probe(),
-        ))
+        );
+        // The room's cut of the default, right after the line naming the rows.
+        if let Some(note) = unasked.and_then(|u| u.note()) {
+            let at = printed
+                .lines
+                .iter()
+                .position(|l| l.starts_with("plan: ctx="))
+                .map_or(printed.lines.len(), |i| i + 1);
+            printed.lines.insert(at, format!("plan: {note}"));
+        }
+        Ok(printed)
     }
 
     /// A repeated run's ids against the first run's, which a greedy run of the
@@ -1565,10 +1572,16 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
             return Err("the prompt has no ids".into());
         }
         // The cache rows: the asked count, else the smaller of the default cap and the file's
-        // `context_length`.
+        // `context_length`, cut to the largest whose session fits the device's room.
         let ctx = match a.ctx {
             Some(c) => c,
-            None => default_ctx(file.header(), &model.path)?,
+            None => {
+                let unasked = plan::unasked_ctx(file.header(), CTX_DEFAULT, &model.path)?;
+                if let Some(note) = unasked.note() {
+                    eprintln!("generate_metal: {note}");
+                }
+                unasked.ctx
+            }
         };
         // The library is the instance the file's shape selects, by the check `--plan` prints.
         let instance = Session::instance_of_model(&file, ctx).map_err(|e| e.to_string())?;

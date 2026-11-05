@@ -1395,6 +1395,7 @@ mod gate {
             host: levers.host(),
             plan_levers: PlanLevers {
                 card_budget_bytes: Some(budget).into(),
+                ..PlanLevers::default()
             },
         };
 

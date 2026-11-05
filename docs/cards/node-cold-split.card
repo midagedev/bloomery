@@ -1,0 +1,37 @@
+# Round node-cold-split (kind profile): the Spark tier's experts are today a fixed id block after the card's prefix
+# (plan (b'): `SlotMap::of_plan_tiers`, each layer's next ids), and adaptive residency moves experts between the stage
+# card and the host only (`swap.rs`: a tier entry is never a victim, never admitted). Replayed over the box's V4.1
+# router sets (tools/ref/router_trace.cpp layout, 50,000 positions each, ranks learned on the first half, slots counted
+# on the second; card 70, node 182, host 132 experts a routed layer = the smallroom plan's 2,662 / 6,900 / 5,800):
+#   plan a (card hot 70, host the rest): host 82.1 (prose) / 53.1 (code) / 89.2 (threads) slots a token — the measured
+#     83 host slots a token at plan a (sparktier) sits on the prose row: the replay is calibrated.
+#   today (node = id block, card hot among the rest): node 106.7 / 109.8 / 107.1 slots a token, card held to 98 / 106 /
+#     95: the node block holds hot experts residency cannot take.
+#   cold (card hottest 70, node coldest 182, host the middle): node 18.9 / 7.8 / 23.1, card back at plan a's.
+# [derived] the node arm's step at room 128G (28.5 ms) against nodebatch's (26.5 ms at a 94.65 GB node, ~87 slots)
+# fits step = 17 (card front) + 40 x a + node_slots x c with c = 0.09 ms a slot (2.0 ms / 22 slots) and a ~ 40..50 us
+# (the TCP floor 52): the node's cost is per slot (GB10 read 16.8 MB at 209 GB/s = 0.08 ms + 28.7 KB of rows back),
+# not the per-layer trip the lock sitting's a = 175..240 us read (that reading folded the slots in).
+# So the cold split takes 107 - 19 = 88 slots a token off the node: -88 x 0.09 = -7.9 ms (prose; -9.2 code, -7.6
+# threads) -> 28.5 -> 20.6 ms = 48 tok/s, the host leg growing to 63 x 0.14 = 8.8 ms under the card front. The
+# skip lever (no go on a layer with no node pick) adds only 23.6 layers x a ~ 1.2 ms at this a: second.
+# With the rank learned on another corpus (prose -> code, code -> threads, code -> prose) the node keeps 35..70 slots:
+# a static cold split (round coldsplit, a rank file at plan time) is predicted 40..45 tok/s; the adaptive three-home
+# residency is what reaches the same-corpus row above.
+kind: profile
+question: with the node tier's experts the coldest of each routed layer by a rank file learned on the box's router sets
+  (card hottest, host the middle; BLOOMERY_EXPERT_RANK) at the smallroom room 128G, does the node arm's step drop by the
+  node slots it loses, 0.09 ms a slot: 28.5 ms to 22..25 (node slots 35..70 a token, the cross-corpus rows)?
+term: tok/s @ n=96, prose P 512, depth 512, A6000 stage, --place bp, Spark tier over tcp, BLOOMERY_HOST_ROOM=128G,
+  BLOOMERY_CARD_BUDGET=110G, BLOOMERY_HOST_LOCK=1; the engine's `host_slots` and node slot counts a step read beside
+  the step
+unit: tok/s
+predict: 40..45
+condition: the same commit on the box and the Spark; the node arm's plan line names the node tier's bytes as the smallroom
+  node arm's (~116 GB); the node slot count a step (the engine's stamp) read on both arms; 3 rounds; the smallroom node
+  arm rerun beside it in the same lease as the base
+decide-in: the per-slot model holds (c ~ 0.09 ms, a near the TCP floor); the adaptive three-home residency is opened with
+  its prediction at the same-corpus row (node ~19 slots: ~48 tok/s, the 256 GB box's decode at a 128 GB room)
+decide-below: under 40: the slots moved to the host are not under the card front (the host leg's exposed part), or the
+  node's cost has a per-layer term the two-point fit hid; read the trip stamps against the node slots
+decide-above: over 45: the base node arm paid more than slots (a page-cache or staging effect); re-read the base

@@ -293,6 +293,7 @@ fn card_experts_with(
     let machine = machine(&inputs);
     let levers = PlanLevers {
         card_budget_bytes: budget.into(),
+        ..PlanLevers::default()
     };
     let plan = plan(&inputs, &machine, &levers).map_err(|e| FixtureError::Budget(e.to_string()))?;
     Ok(CardExperts {
