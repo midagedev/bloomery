@@ -1,6 +1,7 @@
 //! `kimi_k3` — Kimi K3. The file's keys (`hparams`), every tensor's role (`roles`), the typed
-//! description (`spec`), the tensor names a step reads (`names`) and the synthetic gate fixture
-//! cut from the released file (`fixture`).
+//! description (`spec`), the tensor names a step reads (`names`), the file planned onto a
+//! machine's cache bytes (`place`) and the synthetic gate fixture cut from the released file
+//! (`fixture`).
 //!
 //! The trunk mixes with Kimi delta attention (KDA) layers and gated latent-attention (MLA)
 //! layers, the MLA layers being those whose `attention.head_count_kv` is 1 and the KDA layers
@@ -16,5 +17,6 @@
 pub mod fixture;
 pub mod hparams;
 pub mod names;
+pub mod place;
 pub mod roles;
 pub mod spec;

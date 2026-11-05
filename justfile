@@ -1831,8 +1831,11 @@ gate-mistrallarge4-meta:
 # every 12th), the roles of the latent experts' pair and the residual's scores, the quant types by stem, and the fixture clause:
 # the plan of the fixture of the four real layers [0, 46, 83, 84] (model::arch::kimi_k3::fixture) on that header, read back
 # through the reader as the cut, with a map, a key, a tensor and a type that differ refused by name; the library tests are the
-# reader's own (arch::kimi_k3: the keys, dims, types and roles refused by name, the table of types). Headers only, seconds; the
-# 14-shard file itself is not read.
+# reader's own (arch::kimi_k3: the keys, dims, types and roles refused by name, the table of types), and the placement's
+# (arch::kimi_k3::place: a KDA layer's state and conv ring, a latent layer's 576-wide row a position, an expert's bytes by its
+# stacks' types, the tier card and the missing program refused by name; kimi_k3_places_on_the_box: the real header's per-layer
+# stores, the file's bytes by home on the box's two cards at both host rooms, and the coverage rows the engine refuses until a
+# body runs it). Headers only, seconds; the 14-shard file itself is not read.
 gate-kimi-k3-meta:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::kimi_k3 --nocapture && bash tools/gate.sh --release -p bloomery-model --test kimi_k3_meta -- --nocapture'
 

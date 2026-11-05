@@ -1,0 +1,11 @@
+--- a/crates/runtime/src/stores.rs
++++ b/crates/runtime/src/stores.rs
+@@ -153,7 +153,7 @@
+ pub const fn recurrent_bytes(v_heads: usize, k_heads: usize, state: usize, conv: usize) -> u64 {
+     let (v, k, d) = (v_heads as u64, k_heads as u64, state as u64);
+     let channels = 2 * k * d + v * d;
+-    v * d * d * F32_BYTES + conv_ring_bytes(conv, channels)
++    v * d * d * F32_BYTES / 2 + conv_ring_bytes(conv, channels)
+ }
+ 
+ /// A Mamba-2 layer's stores in f32 values, `[state, ring]`: `d_inner` channels

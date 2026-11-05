@@ -1,0 +1,11 @@
+--- a/crates/model/src/arch/place_hybrid.rs
++++ b/crates/model/src/arch/place_hybrid.rs
+@@ -736,7 +736,7 @@
+                     };
+                     match a.cache {
+                         Source::Own(()) => Hold::Attention {
+-                            row: (u64::from(a.latent) + u64::from(a.pe)) * stores::F16_BYTES,
++                            row: u64::from(a.latent) * stores::F16_BYTES,
+                             index,
+                             window: None,
+                         },
