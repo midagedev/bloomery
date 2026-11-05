@@ -3012,7 +3012,8 @@ gate-gpu-ds41-tp:
 # these keep only what the tier loopback load shows. The lost-card clauses --lost (T3), --blost (B3) and --bfirst (B3f) are not
 # in the landing run: weekly-gpu-ds41-lost runs them. The 3090's plan on either card (shared/gate_card.rs), gate lock.
 # --bnode (B9) serves the tier from a loopback tier_server child, the binary beside the gate, and feeds B7's prompt as one
-# batch: within B7's band of the same load's steps, the call asking the node nothing (the host serves its experts). It runs
+# batch: within B7's band of the same load's steps, the node computing its block of every tiered layer-batch (the slots the
+# host leaves to its leg are its routed slots). It runs
 # in the default list; the recipe builds tier_server beside the gate (with deepseek41, the one feature set every recipe builds it with).
 [group('v41-load')]
 gate-gpu-ds41-tier *ARGS='--union --fault --two --batch --batch2 --bfault --bfeat --bnode':
