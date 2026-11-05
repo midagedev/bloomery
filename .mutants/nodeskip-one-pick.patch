@@ -1,0 +1,16 @@
+# nodeskip-one-pick: the skip takes a layer with one pick too (`picks == 0`
+# becomes `picks <= 1` in TierCard::send_layer). Red: the unit test's layer 7
+# (one pick) sends no frame, so `a_node_free_layer_sends_no_frame` sees one
+# frame, not two; on a load the picked expert is served by nobody, so the
+# stage card's wait of the layer never passes and the step names the tier a
+# lost card (B11's bits differ or the clause fails by name).
+--- a/crates/gpu/src/host/tier.rs
++++ b/crates/gpu/src/host/tier.rs
+@@ -2283,7 +2283,7 @@
+         picks: u64,
+     ) -> Result<bool, GpuError> {
+-        if picks == 0 {
++        if picks <= 1 {
+             // Nothing of the layer's is the node's to compute: the node is
+             // sent no frame, so no round trip, and the host signals the
+             // layer's unit itself ([`TierPage::add_unit`]).

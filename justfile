@@ -3041,7 +3041,7 @@ gate-gpu-ds41-tp:
 # logits band of the same steps over the plan without the file (a card expert and a host expert are not one result bit for bit).
 # It runs in the default list.
 [group('v41-load')]
-gate-gpu-ds41-tier *ARGS='--union --fault --two --batch --batch2 --bfault --bfeat --bnode --rank':
+gate-gpu-ds41-tier *ARGS='--union --fault --two --batch --batch2 --bfault --bfeat --bnode --bnodeskip --rank':
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_tier --bin tier_server && __s=$(. tools/ref/ref-paths.sh && dspark_model) && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_tier {{ARGS}}'
 
 # V4.1 plan (b′) on both cards (--place bp): the stage on the A6000, the expert tier and the DSpark draft on the 3090.
