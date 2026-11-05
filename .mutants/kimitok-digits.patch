@@ -1,0 +1,12 @@
+--- a/crates/tokenizer/src/pretok.rs
++++ b/crates/tokenizer/src/pretok.rs
+@@ -1288,7 +1288,8 @@
+             pos += contraction(c, pos, end, |k| c[k].to_ascii_lowercase());
+         } else if number(pos) {
+             // `\p{N}{1,3}`
+-            pos += DigitRule::Front(3).at(c, pos, end);
++            // mutant kimitok-digits: the number run cut from its end, as raon's rule does.
++            pos += DigitRule::ThreesFromEnd.at(c, pos, end);
+         } else if punct(pos + lead) {
+             // ` ?[^\s\p{L}\p{N}]+[\r\n]*`
+             pos += lead;
