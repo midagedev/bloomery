@@ -10,11 +10,17 @@
 #           to 14, so the reader opens the whole set from shard 1. BLOOMERY_REF_MODEL moves it. The path is the file's identity: a set
 #           names its file's full path, so the file is not moved or deleted before the sets are re-dumped.
 #
-# No reference engine is named: mainline llama.cpp is Kimi K3's numeric oracle, but no recipe of this profile builds or runs it yet; the
-# default IK is only so IKBIN can be formed.
+#   LCPP    mainline llama.cpp at 78feec062d50ec9e8940244cac918ac4480b60cb (/home/user/llama.cpp-kimik3, the CPU backend alone, built by
+#           `just build-k3-lcpp`): src/models/kimi-k3.cpp is mainline's own graph, so the oracle (tools/ref/kimi-k3-dump.sh) and the
+#           public baseline are one engine. The commit is the one Mistral Large 4's tree and the kimik2 tokenizer pins use; the tree is
+#           a tree of its own, since a rebuild moves the libllama md5 the oracle sets name. The default IK is only so IKBIN can be
+#           formed: ik has no Kimi K3 graph (its delta layer is the K2 dialect).
+#
+# The dump (tools/ref/kimi-k3-dump.sh) hides CUDA and takes the CPU lease.
 #
 # SC2034: every name here is read by the file that sources this one.
 # shellcheck disable=SC2034
 MODEL_NAME=kimi-k3
 : "${IK:=/home/user/ik-idxkey}"
+: "${LCPP:=/home/user/llama.cpp-kimik3}"
 MODEL=${BLOOMERY_REF_MODEL:-/models/Kimi-K3-UD-IQ1_S/Kimi-K3-UD-IQ1_S-00001-of-00014.gguf}

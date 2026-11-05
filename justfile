@@ -4405,3 +4405,31 @@ gate-kimi-k3-tokenizer:
     ./tools/box.sh 'BLOOMERY_LLAMA_BPE_GGUF=$BLOOMERY_DATA/vocab-llama-bpe/ggml-vocab-llama-bpe.gguf bash tools/gate.sh --release -p bloomery-tokenizer --lib --test kimik2 -- --include-ignored --nocapture'
 
 # --- end kimik3-tokenizer ---
+
+# --- kimik3-ref (Kimi K3's oracle: the vendor llama.cpp tree and its node dumps) ---------------------------------------------------------
+
+# Kimi K3 (kimi-k3), the oracle's tree: llama.cpp mainline at 78feec062 (the merge of PR 31376, the commit Mistral Large 4's oracle and the
+# kimik2 tokenizer pins are taken from) in /home/user/llama.cpp-kimik3, the same script as the Qwen tree (tools/ref/qvis/build-lcpp-qvis.sh)
+# with the pin, tree, sentinel directory and targets by environment, the CPU backend alone and the tools the tokenizer and the smoke run
+# (llama-cli, llama-completion, llama-tokenize); detached, pid, log and rc under /root/lcpp-kimik3. The node dumper links this tree's
+# libraries (`just build-ref-kimi-k3`).
+build-k3-lcpp:
+    BLOOMERY_BOX_ENV='LCPP_BUILD_PIN=78feec062d50ec9e8940244cac918ac4480b60cb LCPP_BUILD_TREE=/home/user/llama.cpp-kimik3 LCPP_BUILD_DIR=/root/lcpp-kimik3 LCPP_BUILD_CPU_ONLY=1 LCPP_BUILD_TARGETS=llama,llama-common,llama-cli,llama-completion,llama-tokenize' ./tools/box.sh '[ "$(id -u)" = 0 ] || { echo "build-k3-lcpp: this recipe requires root on the box (/root/lcpp-kimik3 and /home/user); run build-lcpp-qvis.sh directly with writable LCPP_BUILD_DIR and LCPP_BUILD_TREE on a local machine" >&2; exit 2; }; setsid -f bash tools/ref/qvis/build-lcpp-qvis.sh </dev/null >/dev/null 2>&1'
+
+# Kimi K3 oracle: kimik3_dump (the shared tools/ref/cb_dump.cpp) linked against mainline llama.cpp at 78feec062 (CPU, no patch,
+# /home/user/llama.cpp-kimik3, whose tracked files must be clean), which this does not rebuild: the tree is built once by
+# `just build-k3-lcpp`. tools/ref/kimi-k3-dump-build.sh is the call; the binary and its build record land in $BLOOMERY_DATA/bin.
+build-ref-kimi-k3:
+    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=60 BLOOMERY_MODEL=kimi-k3 ./tools/box.sh 'bash tools/ref/kimi-k3-dump-build.sh'
+
+# The Kimi K3 oracle sets (refset family lcpp-kimi-k3; tools/ref/kimi-k3-dump.sh has the layout and the taps): mainline llama.cpp on the
+# CPU over the four prompts of tools/ref/data/kimi-k3 (35, 46, 48 and 5 ids, raw text) from one load of the UD-IQ1_S file (594 GB in
+# fourteen shards), into $BLOOMERY_DATA/ref_kimik3_{a,b,c,d}: each layer's taps, the last logits row, the top-40 logprobs and 32 greedy
+# tokens. The load reads the whole file once through the page cache, then every prompt and token faults in the experts the cache does
+# not hold: predicted wall 12-36 min (central 20), bound 90, under the CPU lease and its card
+# (BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/kimi-k3-dump.card'); DUMP_DRY=1 in that variable prints the dump and stops before the
+# lease. BLOOMERY_TIER=fixture dumps the fixture file's twin sets fx_ref_kimik3_{a,b,c,d} in seconds (card docs/cards/kimi-k3-fx-dump.card).
+dump-ref-kimi-k3:
+    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=1200 BLOOMERY_MODEL=kimi-k3 ./tools/box.sh 'bash tools/ref/kimi-k3-dump.sh'
+
+# --- end kimik3-ref ---
