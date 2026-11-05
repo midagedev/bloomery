@@ -284,6 +284,7 @@ fn hw_two_card_full_file_union_capture_publication_fault_reset() -> Result<(), E
     flat.tiers.clear();
     let levers = PlanLevers {
         card_budget_bytes: Some(budget).into(),
+        ..PlanLevers::default()
     };
     let plan = inputs.plan(&machine, CTX as u64, &levers)?;
     let routed: Vec<usize> = inputs

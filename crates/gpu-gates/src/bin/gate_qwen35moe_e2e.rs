@@ -3284,6 +3284,7 @@ mod gate {
         let q = PlaceQ3::qwen35(&file, Place::parse("cuda0")?, o)?;
         let levers = PlanLevers {
             card_budget_bytes: Some(placed_budget()).into(),
+            ..PlanLevers::default()
         };
         let plan = q.plan(CTX, &levers)?;
         for line in q.records(&plan, None)? {
@@ -3643,6 +3644,7 @@ mod gate {
         let budget = q.budget_for_card_experts(CTX, want, placed_budget())?;
         let levers = PlanLevers {
             card_budget_bytes: Some(budget).into(),
+            ..PlanLevers::default()
         };
         let plan = q.plan(CTX, &levers)?;
         for line in q.records(&plan, None)? {
@@ -3829,6 +3831,7 @@ mod gate {
         let budget = pick(&q)?;
         let levers = PlanLevers {
             card_budget_bytes: Some(budget).into(),
+            ..PlanLevers::default()
         };
         let plan = q.plan(CTX, &levers)?;
         for line in q.records(&plan, None)? {
@@ -4332,6 +4335,7 @@ mod gate {
         let q = PlaceQ3::qwen35(&file, Place::parse("cuda0")?, o)?.streaming()?;
         let levers = PlanLevers {
             card_budget_bytes: Some(placed_budget()).into(),
+            ..PlanLevers::default()
         };
         let plan = q.plan(CTX, &levers)?;
         let mid = residency_clauses::mid_of(&plan.n_l);

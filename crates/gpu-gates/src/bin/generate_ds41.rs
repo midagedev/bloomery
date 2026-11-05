@@ -403,9 +403,10 @@ mod drive {
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::{Fnv1a64, GateError, data_dir, ref_model_path, residency};
     use bloomery_levers::{
-        CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, GEN_SLOTS, HOST_LANES,
-        HOST_LOCK, HOST_POPULATE, HOSTSTREAM, Levers, MTP_WIDTH, PIN_MAIN, PREFILL, PREFILL_CUT,
-        PREFILL_GROUP, R8, RESIDENCY, ResidencyAt, ResidencyPick, STEP_STATS, WARM_PROFILE,
+        CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, EXPERT_RANK,
+        GEN_SLOTS, HOST_LANES, HOST_LOCK, HOST_POPULATE, HOSTSTREAM, Levers, MTP_WIDTH, PIN_MAIN,
+        PREFILL, PREFILL_CUT, PREFILL_GROUP, R8, RESIDENCY, ResidencyAt, ResidencyPick, STEP_STATS,
+        WARM_PROFILE,
     };
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
@@ -791,6 +792,7 @@ mod drive {
         ENGRAM_HELPER,
         STEP_STATS,
         CARD_BUDGET,
+        EXPERT_RANK,
         PIN_MAIN,
         HOST_LANES,
         DRAFT,

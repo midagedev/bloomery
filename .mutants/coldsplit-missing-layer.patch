@@ -1,0 +1,36 @@
+--- a/crates/placement/src/placement/rank.rs
++++ b/crates/placement/src/placement/rank.rs
+@@ -217,7 +217,8 @@
+             detail,
+         };
+         for &(layer, experts) in routed {
+-            if self.ranked(layer).is_none() {
++            // mutant coldsplit-missing-layer: a layer the model routes and the rank does not order is accepted ...
++            if false && self.ranked(layer).is_none() {
+                 return Err(refuse(format!(
+                     "layer {layer} holds routed experts in the model and the rank orders none of \
+                      its experts"
+@@ -260,14 +261,15 @@
+             file: self.path.clone(),
+             detail,
+         };
+-        let ids = self
+-            .ranked(layer)
+-            .filter(|ids| ids.len() as u64 == experts)
+-            .ok_or_else(|| {
+-                refuse(format!(
+-                    "layer {layer} is not ordered over its {experts} experts"
+-                ))
+-            })?;
++        // ... and its experts are taken in id order.
++        let identity: Vec<u32>;
++        let ids: &[u32] = match self.ranked(layer).filter(|ids| ids.len() as u64 == experts) {
++            Some(ids) => ids,
++            None => {
++                identity = (0..experts as u32).collect();
++                &identity
++            }
++        };
+         let taken = tiers
+             .iter()
+             .try_fold(stage, |sum, &n| sum.checked_add(n))

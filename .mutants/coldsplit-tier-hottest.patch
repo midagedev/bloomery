@@ -1,0 +1,18 @@
+--- a/crates/placement/src/placement/rank.rs
++++ b/crates/placement/src/placement/rank.rs
+@@ -283,11 +283,12 @@
+         let cut =
+             |from: u64, to: u64| ExpertList::new(ids[from as usize..to as usize].to_vec(), experts);
+         let stage_list = cut(0, stage)?;
+-        let mut end = experts;
++        // mutant coldsplit-tier-hottest: a tier takes the next-hottest block after the stage's, not the coldest.
++        let mut start = stage;
+         let mut tier_lists = Vec::with_capacity(tiers.len());
+         for &own in tiers {
+-            tier_lists.push(cut(end - own, end)?);
+-            end -= own;
++            tier_lists.push(cut(start, start + own)?);
++            start += own;
+         }
+         Ok((stage_list, tier_lists))
+     }

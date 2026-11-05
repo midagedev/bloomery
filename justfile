@@ -3015,8 +3015,13 @@ gate-gpu-ds41-tp:
 # batch: within B7's band of the same load's steps, the node computing its block of every tiered layer-batch (the slots the
 # host leaves to its leg are its routed slots). It runs
 # in the default list; the recipe builds tier_server beside the gate (with deepseek41, the one feature set every recipe builds it with).
+# --rank (B10) plans under a router-rank file the gate writes (BLOOMERY_EXPERT_RANK, set on a child of the gate alone): the child's plan
+# names the file, keeps the plan's counts and holds each layer's hottest n_l ranked ids on the card instead of its id prefix; under it T1
+# holds (the tiered carve answers the reference load of that plan bit for bit), and the prompt fed one step a position sits within the
+# logits band of the same steps over the plan without the file (a card expert and a host expert are not one result bit for bit).
+# It runs in the default list.
 [group('v41-load')]
-gate-gpu-ds41-tier *ARGS='--union --fault --two --batch --batch2 --bfault --bfeat --bnode':
+gate-gpu-ds41-tier *ARGS='--union --fault --two --batch --batch2 --bfault --bfeat --bnode --rank':
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_tier --bin tier_server && __s=$(. tools/ref/ref-paths.sh && dspark_model) && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_tier {{ARGS}}'
 
 # V4.1 plan (b′) on both cards (--place bp): the stage on the A6000, the expert tier and the DSpark draft on the 3090.

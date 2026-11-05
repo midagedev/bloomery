@@ -4201,6 +4201,7 @@ mod gate {
         let fixture = Tier::from_env()? == Tier::Fixture;
         let levers = PlanLevers {
             card_budget_bytes: bloomery_levers::CardBudget::default(),
+            ..PlanLevers::default()
         };
         let (rows, next) = verify_rows(toks)?;
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;

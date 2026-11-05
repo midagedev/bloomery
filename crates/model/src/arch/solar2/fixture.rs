@@ -202,6 +202,7 @@ fn card_experts(split: &Split, budget: Option<u64>) -> Result<CardExperts, Fixtu
     let machine = workstation::plan_gate(inputs.model.layers);
     let levers = PlanLevers {
         card_budget_bytes: budget.into(),
+        ..PlanLevers::default()
     };
     let plan = inputs
         .plan(&machine, BUDGET_CTX, &levers)

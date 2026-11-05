@@ -289,6 +289,7 @@ mod tests {
         };
         let levers = PlanLevers {
             card_budget_bytes: bloomery_levers::CardBudget::Every(2 << 20),
+            ..PlanLevers::default()
         };
         let expected = inputs
             .plan(&machine, 64, &levers)

@@ -141,7 +141,7 @@ pub static TIER_COST: Kind = Kind {
 pub static PLAN: Kind = Kind {
     name: "plan",
     head: "plan",
-    doc: "The placement the engine is about to load by: its card, context, where the experts sit, the routed-expert bytes the plan pages through the NVMe tier (paged), the RAM arena they page through (arena) and the slots it holds (arena_slots), 0 and 0 and 0 on a plan that pages nothing, the host room's reading the plan was made at (room) and the plan room it was held to (plan_room, the reading less the drift margin) when it was made at one, and each plan card's device (role:name:ordinal:usable bytes; the role is stage, tier<i> for an expert tier card by its place among the tier cards, or holder for a card that joins the plan to hold a reserve, a draft's, and no expert; by-name for a card a census-free plan opens by its name) under the CUDA enumeration order in force, with the card's free bytes at plan time when the census read them, and, when the card holds a file tensor in another quantization than its file's (a BF16 head in MXFP8 planes), each such tensor as tensor:file type:card format (requantized; absent when there is none).",
+    doc: "The placement the engine is about to load by: its card, context, where the experts sit, the routed-expert bytes the plan pages through the NVMe tier (paged), the RAM arena they page through (arena) and the slots it holds (arena_slots), 0 and 0 and 0 on a plan that pages nothing, the host room's reading the plan was made at (room) and the plan room it was held to (plan_room, the reading less the drift margin) when it was made at one, and each plan card's device (role:name:ordinal:usable bytes; the role is stage, tier<i> for an expert tier card by its place among the tier cards, or holder for a card that joins the plan to hold a reserve, a draft's, and no expert; by-name for a card a census-free plan opens by its name) under the CUDA enumeration order in force, with the card's free bytes at plan time when the census read them, and, when the card holds a file tensor in another quantization than its file's (a BF16 head in MXFP8 planes), each such tensor as tensor:file type:card format (requantized; absent when there is none), and, when the plan took each routed layer's experts in a router rank's order (BLOOMERY_EXPERT_RANK), the rank file's path (expert_rank, last; absent when there is none).",
     parts: &[
         key("place", Word, ""),
         key("card", Word, ""),
@@ -170,6 +170,7 @@ pub static PLAN: Kind = Kind {
         opt("devices", Csv, ""),
         opt("cuda_order", Word, ""),
         opt("requantized", Csv, "tensor:file type:card format"),
+        opt("expert_rank", Text, "router-rank file"),
     ],
 };
 
@@ -3867,7 +3868,18 @@ pub fn plan(place: &str, machine: &Machine, plan: &Plan<'_>) -> Record {
     let r = r
         .csv("devices", plan_devices(machine))
         .w("cuda_order", cuda_order());
-    with_requantized(r, plan.model)
+    let r = with_requantized(r, plan.model);
+    with_expert_rank(r, plan.expert_rank.as_deref())
+}
+
+/// `r` with the `expert_rank` part, the rank file the plan took each routed
+/// layer's experts in, none printed when the plan took the id order; it is the
+/// kind's last part, so the caller has put every other before it.
+pub fn with_expert_rank(r: Record, rank: Option<&model::placement::ExpertRank>) -> Record {
+    match rank {
+        Some(rank) => r.w("expert_rank", rank.path()),
+        None => r,
+    }
 }
 
 /// Each card of `machine` as the `plan` record's `devices` field names it: its
@@ -5814,6 +5826,45 @@ mod tests {
         let plan = Log::of(&named, BLOOMERY_SERVE_QWEN3).one(&PLAN38).unwrap();
         let want = format!("output.weight:{}:mxfp8_planes", GgmlType::BF16);
         assert_eq!(plan.csv("requantized"), Ok(vec![want.as_str()]), "{named}");
+    }
+
+    /// A plan line names the rank file the plan took its experts in, last,
+    /// and a plan in id order prints no part. Mutant: `with_expert_rank`
+    /// printing nothing.
+    #[test]
+    fn a_plan_line_names_the_rank_the_plan_took_its_experts_in() {
+        use model::placement::ExpertRank;
+        let rank = ExpertRank::parse(
+            "/data/router/v41-rank.tsv",
+            "# router-rank\tn_expert=2\tn_used=1\tsets=a\tpositions=1\n0\t1,0\n",
+        )
+        .expect("a rank over two experts");
+        let base = || {
+            Record::new(&PLAN)
+                .w("place", "cuda0")
+                .w("card", "3090")
+                .u("ctx_max", 1088)
+                .u("card_experts", 2)
+                .u("card_expert_bytes", 8)
+                .u("host_experts", 1)
+                .u("host_expert_bytes", 4)
+                .u("host_shadow", 0)
+                .w("n_l", "1..1")
+                .u("n_l_layers", 2)
+                .w("card_budget", "unset")
+                .u("paged", 0)
+                .u("arena", 0)
+                .u("arena_slots", 0)
+        };
+        let plain = with_expert_rank(base(), None).line();
+        assert!(!plain.contains("expert_rank"), "{plain}");
+        let named = with_expert_rank(base(), Some(&rank)).line();
+        let plan = Log::of(&named, BLOOMERY_SERVE_DS41).one(&PLAN).unwrap();
+        assert_eq!(
+            plan.text("expert_rank"),
+            Ok("/data/router/v41-rank.tsv"),
+            "{named}"
+        );
     }
 
     /// An optional part the line leaves out reads as absent, and the parts

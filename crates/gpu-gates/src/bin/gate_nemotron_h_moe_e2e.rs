@@ -1279,6 +1279,7 @@ mod gate {
                 name: "mid",
                 levers: PlanLevers {
                     card_budget_bytes: Some(half).into(),
+                    ..PlanLevers::default()
                 },
                 experts: Experts::Placed,
             },
@@ -1293,6 +1294,7 @@ mod gate {
                 name: "room12g",
                 levers: PlanLevers {
                     card_budget_bytes: Some(ROOM_12G).into(),
+                    ..PlanLevers::default()
                 },
                 experts: Experts::Placed,
             });

@@ -13,6 +13,7 @@ mod early;
 mod floor;
 mod host_stage;
 mod legs;
+mod rank;
 
 /// A plan of no rows under `budget`, for a planner [`plan_in_pool`]
 /// calls: only its budget is read.
@@ -43,6 +44,7 @@ fn budget_plan<'a>(model: &'a ModelTensors, machine: &'a Machine, budget: u64) -
         tier_n_l: Vec::new(),
         card_budget: card_budget::CardBudget::Every(budget),
         budget_from_pool: false,
+        expert_rank: None,
     }
 }
 /// A card running `layers`, with the head and the token embedding as

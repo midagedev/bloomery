@@ -1176,6 +1176,7 @@ mod gate {
             CTX,
             &PlanLevers {
                 card_budget_bytes: Some(PLACED_BUDGET).into(),
+                ..PlanLevers::default()
             },
         )?;
         let line = q
@@ -1206,6 +1207,7 @@ mod gate {
                 "a budget above free",
                 PlanLevers {
                     card_budget_bytes: Some(usable).into(),
+                    ..PlanLevers::default()
                 },
             ),
         ];
@@ -1274,6 +1276,7 @@ mod gate {
         let q = PlaceQ3::qwen3(&file, Place::parse("cuda0")?, ctx, KvQ8::F16)?;
         let levers = PlanLevers {
             card_budget_bytes: Some(PLACED_BUDGET).into(),
+            ..PlanLevers::default()
         };
         let plan = q.plan(ctx, &levers)?;
         for line in q.records(&plan, None)? {
@@ -1741,6 +1744,7 @@ mod gate {
         let budget = pick(&q)?;
         let levers = PlanLevers {
             card_budget_bytes: Some(budget).into(),
+            ..PlanLevers::default()
         };
         let plan = q.plan(CTX, &levers)?;
         for line in q.records(&plan, None)? {
