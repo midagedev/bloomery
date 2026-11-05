@@ -118,6 +118,7 @@ use std::time::Instant;
 
 use cuda_core::{CudaEvent, sys};
 use gguf::quant::GgmlType;
+use model::arch::deepseek41::names;
 use model::moe::UNION_MAX_COLS;
 
 use bloomery_gpu::COL_GROUP;
@@ -1377,13 +1378,14 @@ impl Tally {
     }
 }
 
-/// Whether the resident weight `name` is a Q3_K or Q4_K row stream, which a
-/// launch reads in q8_1: the q8_1 form is a launch of its own.
+/// Whether the resident weight `name` is a Q3_K, Q4_K or Q6_K row stream,
+/// which a launch reads in q8_1 (`Dense::reads_q8_1`): the q8_1 form is a
+/// launch of its own.
 fn reads_q8(w: &Weights, name: &str) -> bool {
     matches!(
         w.get(name),
         Some(DevWeight::KQuant {
-            ty: GgmlType::Q3_K | GgmlType::Q4_K,
+            ty: GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q6_K,
             ..
         })
     )
@@ -2822,7 +2824,11 @@ impl<'a> GroupCx<'a> {
         let row0 = m.set * CHUNKS_MAX;
         let (u, b) = (m.u, m.b);
         let own = set_of(&mut batch.sets, m.set)?;
-        let wkv_q8 = reads_q8(w, &names::engram_wkv(l));
+        let wkv = self.glue.wkv(l).ok_or_else(|| GpuError::Shape {
+            what: WHAT,
+            detail: format!("layer {l} carries no engram site"),
+        })?;
+        let wkv_q8 = reads_q8(w, wkv);
         for (k, r) in m.cuts.iter().enumerate().skip(run) {
             let (at, len) = (r.start - b, r.len());
             let p = span(WHAT, &batch.params, (row0 + k) * words, words)?;

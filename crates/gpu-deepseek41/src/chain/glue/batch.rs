@@ -246,7 +246,7 @@ impl Glue {
             stream,
             KeyNormArgs {
                 kv: &kv,
-                gain: gain(w, &site.gain_k, HC_STREAMS * ROW)?,
+                gain: gain(w, &site.gain_k, self.ones.as_ref())?,
                 eps: self.eps,
                 hc: HC_STREAMS,
                 m,
@@ -261,7 +261,7 @@ impl Glue {
                 x: a.streams,
                 kn: &kn,
                 kv: &kv,
-                gain: gain(w, &site.gain_q, HC_STREAMS * ROW)?,
+                gain: gain(w, &site.gain_q, self.ones.as_ref())?,
                 eps: self.eps,
                 hc: HC_STREAMS,
                 m,

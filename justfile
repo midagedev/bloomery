@@ -1428,6 +1428,15 @@ dump-ref-fixture FAMILY *VARIANT:
 fixture-requant FAMILY TAG:
     env -u BLOOMERY_FIXTURE_VARIANT BLOOMERY_MODEL={{FAMILY}} BLOOMERY_TIER=fixture ./tools/box.sh 'bash tools/ref/fixture-requant.sh {{FAMILY}} {{TAG}}'
 
+# The V4.1 fixture's upstream twin and its per-site counterpart (tools/ref/fixture-engram-upstream.sh has the steps): the
+# fixture with its Engram in llama.cpp's layout, its table rows and kv transcoded exactly to Q6_K
+# (tools/ref/engram-relayout.py), and the fixture's own layout carrying the twin's numbers (`relayout --per-site`), each
+# with its card budget planned on its own file, into fixture-variants/engram-upstream/<fixture dir>/ and its per-site/
+# beside the variants (`engram-relayout.py twin`; no variant tag names them). gate-gpu-ds41-engram-layout reads them. An
+# existing twin is refused.
+fixture-engram-upstream:
+    env -u BLOOMERY_FIXTURE_VARIANT BLOOMERY_MODEL=deepseek41 BLOOMERY_TIER=fixture ./tools/box.sh 'bash tools/ref/fixture-engram-upstream.sh'
+
 # The MTP draft oracles' dumper, GLM-5.3-Flash's and Qwen3.8-Flash-Next's: dump_mtp linked against the ik tree that
 # carries the glm5next MTP graph on upstream's qwen4exp one (the glm5next profile's GLM_MTP_IK at GLM_MTP_SHA, checked
 # clean); `cmake --build` of its libllama and libcommon first (nothing to do when current). Under the CPU lease:
@@ -3214,6 +3223,23 @@ gate-gpu-ds41-draft:
 [group('v41-load')]
 gate-gpu-ds41-dspark-loop:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin gate_deepseek41_dsloop && __s=$(. tools/ref/ref-paths.sh && dspark_model) && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_dsloop --structure --tap && D=target/dsloop-gate && rm -rf $D && mkdir -p $D && if [ "${BLOOMERY_TIER:-real}" = fixture ]; then BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh generate_ds41 --place a --prompt-id 0 --ctx 4096 -n 64 --seat-dspark > $D/plain.log && BLOOMERY_MTP_WIDTH=fixed BLOOMERY_DRAFT=dspark BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh generate_ds41 --place a --prompt-id 0 --ctx 4096 -n 64 > $D/dspark.log; else export BLOOMERY_CARD_BUDGET=21542M && bash tools/gpu-gate.sh generate_ds41 --place gate --prompt-id 0 --ctx 4096 -n 64 --seat-dspark > $D/plain.log && BLOOMERY_MTP_WIDTH=fixed BLOOMERY_DRAFT=dspark bash tools/gpu-gate.sh generate_ds41 --place gate --prompt-id 0 --ctx 4096 -n 64 > $D/dspark.log; fi && grep -h "^load draft=\|^draft summary " $D/dspark.log && target/release/gate_deepseek41_dsloop --draft-load $D/dspark.log && grep "^tokens " $D/plain.log > $D/plain.tok && grep "^tokens " $D/dspark.log > $D/dspark.tok && echo "plain $(cat $D/plain.tok)" && echo "dspark $(cat $D/dspark.tok)" && cmp $D/plain.tok $D/dspark.tok && echo "tokens identical" && S=$(grep "^draft summary " $D/dspark.log) && P=$(echo "$S" | sed -n "s/.*proposals=\([0-9]*\).*/\1/p") && A=$(echo "$S" | sed -n "s/.* accepts=\([0-9]*\).*/\1/p") && N=$(echo "$S" | sed -n "s/.* passes=\([0-9]*\).*/\1/p") && [ -n "$N" ] && [ "$P" = "$N" ] && echo "proposals $P = passes $N: every pass verified a proposal" && if [ "${BLOOMERY_TIER:-real}" = fixture ]; then echo "deferred(real) file-bound: accepts $A of $P proposals (the real draft accept rate)"; else [ "$A" -gt 0 ] && [ "$A" -lt "$P" ] && echo "accepts $A of $P proposals: both branches ran"; fi && echo "gate-gpu-ds41-dspark-loop: PASS"'
+
+# The V4.1 Engram in both layouts, bit for bit: the fixture's upstream twin (tools/ref/fixture-engram-upstream.sh: one
+# per_layer_token_embd table, engram_gate = q * k in f32, engram_kv, the ple.* keys, the rows and the kv Q6_K transcoded
+# exactly from the fixture's Q3_K) and its per-site counterpart (the fixture's layout and keys with the twin's numbers: the
+# same Q6_K tables and wkv, engram_q the twin's gate, engram_k F32 ones), each through generate_ds41 at --place a on the
+# first five ids of corpus-prose.ids and eight decode steps (-n 9: the prompt call's row and the steps'), both under the
+# twin's header budget. Red unless both sets are the current fixture's (engram-relayout.py check), the two runs place the
+# same experts on the card and the host, their tokens lines are identical and every logits row is bit-equal
+# (tools/bloomery/rows.py diff). The sets carry the same values, so what the gate holds is each layout's reader: the one
+# table's base rows and the ple.* offsets against the per-site tables, the folded gate read as the query gain with a key
+# gain of ones. The fixture itself rounds its bf16 gains apart (the fold rounds q * k once) and reads Q3_K rows: lab-engram
+# holds its rows to the twin's, bit for bit.
+# Fixture-only (tools/ref/fixture-only.sh): the public files are in the upstream layout alone, so the real tier has no
+# per-site twin to hold them to; the real file's open is generate_ds41's. Logs in target/engram-layout-gate/.
+[group('v41-load')]
+gate-gpu-ds41-engram-layout:
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-ds41-engram-layout && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && D=target/engram-layout-gate && rm -rf $D && mkdir -p $D && F=$(. tools/ref/ref-paths.sh && printf %s "$FIXTURE_FILE") && T=$(. tools/ref/ref-paths.sh && python3 -I tools/ref/engram-relayout.py twin "$FIXTURE_DIR") && U=$(find "$T" -maxdepth 1 -name "*-00001-of-*.gguf" 2>/dev/null) && P=$(find "$T/per-site" -maxdepth 1 -name "*-00001-of-*.gguf" 2>/dev/null) && if [ -z "$U" ] || [ -z "$P" ] || [ "$(printf "%s\n" "$U" | wc -l)" != 1 ] || [ "$(printf "%s\n" "$P" | wc -l)" != 1 ]; then echo "gate-gpu-ds41-engram-layout: $T and $T/per-site do not hold one first shard each: just fixture-engram-upstream writes them (exit 66)" >&2; exit 66; fi && python3 -I tools/ref/engram-relayout.py check "$U" --source "$F" && python3 -I tools/ref/engram-relayout.py check "$P" --source "$F" && UB=$(. tools/ref/ref-paths.sh && FIXTURE_FILE=$U fixture_budget) && IDS=$(head -n 5 "$BLOOMERY_DATA/engram/corpus-prose.ids" | paste -sd, -) && echo "prompt ids $IDS; per-site $P; twin $U (budget $UB for both)" && arm() { BLOOMERY_CARD_BUDGET=$UB BLOOMERY_V41_MODEL=$1 BLOOMERY_REF_MODEL=$1 BLOOMERY_FIXTURE_MODEL=$1 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh generate_ds41 --place a --ctx 4096 --tokens "$IDS" -n 9 --top2 9 --rows $D/$2.rows > $D/$2.log && sed -n "s/^plan .*\(card_experts=.* layers\) card_budget=.*/\1/p" $D/$2.log > $D/$2.plan && grep "^tokens " $D/$2.log > $D/$2.tok && echo "$2 $(cat $D/$2.plan)" && echo "$2 $(cat $D/$2.tok)"; } && arm "$P" persite && arm "$U" upstream && [ -s $D/persite.plan ] && cmp $D/persite.plan $D/upstream.plan && echo "plan: the same experts on the card and the host" && cmp $D/persite.tok $D/upstream.tok && echo "tokens: identical" && N=$(sed -n "s/^rows .* n=\([0-9]*\).*/\1/p" $D/persite.log) && python3 -I tools/bloomery/rows.py diff $D/persite.rows $D/upstream.rows --n "$N" && echo "gate-gpu-ds41-engram-layout: PASS"'
 
 # V4.1 배치 프리필(`body::prefill`)을 게이트 배치에서: corpus-prose.ids 앞부분으로 3001스텝 디코드 오라클을 한 번 뜨고(DSpark
 # 드래프트의 특징 탭 포함), P ∈ {1, 127, 128, 129, 511, 512, 513, 2300}과 분할 700+400·1800+1000·300+2700마다 모든 층의 창 링·

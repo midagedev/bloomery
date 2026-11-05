@@ -455,6 +455,7 @@ pytools_list() {
     "tools/ref/draft-vocab.py --self-test"
     "tools/ref/ds41copy.py --self-test"
     "tools/ref/ds41pp.py self-test"
+    "tools/ref/engram-relayout.py --self-test"
     "tools/ref/flat-imatrix.py --self-test"
     "tools/ref/gguf-ranges.py --self-test"
     "tools/ref/gguf-respell.py --self-test"

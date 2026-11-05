@@ -11,7 +11,7 @@
 //!   that fold is the row itself and does not run.
 //! - [`Glue::enqueue_engram_kv_at`], three launches per engram site (four
 //!   when `engram_wkv` is a K-quant), none of which reads a stream: the
-//!   site's gathered rows (the table's Q8_0, Q3_K, IQ4_NL or MXFP8 bytes in the
+//!   site's gathered rows (the table's Q8_0, Q3_K, Q6_K, IQ4_NL or MXFP8 bytes in the
 //!   image) dequantized, `engram_wkv` over them ([`crate::dense`]: `q8_0_gemv`
 //!   on the f32 rows, or the rows' q8_1 form and the K-quant gemv), and the key
 //!   norm. They depend on the token alone and are first read by the site
@@ -61,8 +61,9 @@ use cuda_host::cuda_module;
 use engram::prefetch::{FillMode, HelperOptions, Prefetcher, caller_sibling};
 use engram::{Engram, Faults};
 use gguf::Split;
+use gguf::engram::EngramLayout;
 use gguf::quant::GgmlType;
-use model::arch::deepseek41::hparams::Hparams;
+use model::arch::deepseek41::hparams::{EngramGains, Hparams};
 use model::arch::deepseek41::names;
 use model::arch::deepseek41::plan::StepPlan;
 use model::embed::RowLayout;
@@ -102,6 +103,11 @@ const IQ4_NL_BYTES: usize = 18;
 /// byte a value.
 const MXFP8_BLOCK: usize = 32;
 const MXFP8_BYTES: usize = 33;
+
+/// Values of one Q6_K super-block, and its bytes: 128 bytes of low nibbles,
+/// 64 of high bit pairs, 16 signed scales, then the f16 `d`.
+const Q6_K_BLOCK: usize = 256;
+const Q6_K_BYTES: usize = 210;
 
 /// How a token's embedding row sits in the image: `token_embd`'s type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,6 +177,9 @@ enum TableRows {
     /// MXFP8 rows of whole blocks, packed at 33 bytes each, read a byte at a
     /// time: a block starts at any byte.
     Mxfp8,
+    /// Q6_K rows of whole super-blocks, packed at 210 bytes each: every other
+    /// row starts on a half word.
+    Q6K,
 }
 
 impl TableRows {
@@ -190,6 +199,9 @@ impl TableRows {
             GgmlType::MXFP8 if key_len.is_multiple_of(MXFP8_BLOCK) => {
                 Some((TableRows::Mxfp8, key_len / MXFP8_BLOCK * MXFP8_BYTES))
             }
+            GgmlType::Q6_K if key_len.is_multiple_of(Q6_K_BLOCK) => {
+                Some((TableRows::Q6K, key_len / Q6_K_BLOCK * Q6_K_BYTES))
+            }
             _ => None,
         }
     }
@@ -197,7 +209,7 @@ impl TableRows {
     /// Whether the format's blocks start on a half word, not a word: the
     /// kernels read a block's f16 scale from one half of its covering word.
     fn on_half_words(self) -> bool {
-        matches!(self, TableRows::Q3K | TableRows::Iq4Nl)
+        matches!(self, TableRows::Q3K | TableRows::Iq4Nl | TableRows::Q6K)
     }
 
     /// Enqueue the dequantization of `rows` gathered rows of `key_len`
@@ -255,6 +267,18 @@ impl TableRows {
                     at_byte,
                     rows,
                     key_len / IQ4_NL_BLOCK as u32,
+                    y,
+                )?;
+            }
+            TableRows::Q6K => {
+                let prep = module.prepare_ds41_glue_engram_rows_q6k(cfg)?;
+                module.ds41_glue_engram_rows_q6k(
+                    stream,
+                    &prep,
+                    params,
+                    at_byte,
+                    rows,
+                    key_len / Q6_K_BLOCK as u32,
                     y,
                 )?;
             }
@@ -318,6 +342,57 @@ pub(crate) fn enqueue_embed_row(
         }
     }
     Ok(())
+}
+
+/// Byte `x` of the image `w`, from its covering word.
+///
+/// # Safety
+///
+/// `x < 4 * w.len()`.
+#[inline(always)]
+unsafe fn image_byte(w: &[u32], x: usize) -> u32 {
+    // SAFETY: x < 4·w.len() by this fn's `# Safety`, so word x / 4 is inside w.
+    (unsafe { *w.get_unchecked(x >> 2) } >> (8 * (x & 3))) & 0xff
+}
+
+/// The f32 value of Q6_K weight `v` (0..256) of the super-block at byte
+/// `base` of the image `w`, in `gguf::quant::dequant_row`'s op order (ggml's
+/// `dequantize_row_q6_K`): half `h = v / 128`, quarter `q = (v % 128) / 32`,
+/// lane `l = v % 32`; the 6-bit code is the nibble `q / 2` of ql byte `64h +
+/// 32(q % 2) + l` plus the bit pair `q` of qh byte `128 + 32h + l` shifted up
+/// four, the signed scale is byte `192 + 8h + l / 16 + 2q`, `d` the f16 that
+/// closes the block (bytes 208..209), and the value is `(d · scale) ·
+/// (code − 32)` — two plain products, bit-identical to the host's. A
+/// super-block starts on an even byte (210 is even), so `d` is one half of
+/// a word.
+///
+/// # Safety
+///
+/// `base + 210 <= 4 * w.len()`, `base` even, and `v < 256`: every byte read
+/// is below `base + 210`.
+#[inline(always)]
+unsafe fn q6k_row_value(w: &[u32], base: usize, v: usize) -> f32 {
+    let (h, q, l) = (v >> 7, (v >> 5) & 3, v & 31);
+    // SAFETY: the ql byte is below base + 128, the qh byte below base + 192
+    // and the scale byte below base + 208, inside the super-block by this
+    // fn's `# Safety`.
+    let (ql, qh, sc) = unsafe {
+        (
+            image_byte(w, base + 64 * h + 32 * (q & 1) + l),
+            image_byte(w, base + 128 + 32 * h + l),
+            image_byte(w, base + 192 + 8 * h + l / 16 + 2 * q),
+        )
+    };
+    let code = ((ql >> (4 * (q >> 1))) & 0xf) | (((qh >> (2 * q)) & 3) << 4);
+    let x = base + 208;
+    // SAFETY: x + 2 <= base + 210 <= 4·w.len() by this fn's `# Safety`.
+    let dw = unsafe { *w.get_unchecked(x >> 2) };
+    let d = if x.is_multiple_of(4) {
+        cvt_f32_f16x2_lo(dw)
+    } else {
+        cvt_f32_f16x2_hi(dw)
+    };
+    (d * f32::from(sc as u8 as i8)) * (code as i32 - 32) as f32
 }
 
 // ---------------------------------------------------------------- kernels
@@ -555,6 +630,44 @@ pub(crate) mod glue_kernels {
         unsafe { *y.get_unchecked_mut(i) = v };
     }
 
+    /// One site's gathered Q6_K rows, dequantized: thread `i` is value `v =
+    /// i % (256·n_sb)` of row `r = i / (256·n_sb)`, super-block `v / 256` of
+    /// the rows packed from image byte `at_byte` at `210·n_sb` bytes each
+    /// ([`q6k_row_value`]).
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * params.len() >= at_byte + rows * 210 * n_sb,
+            y.len() >= rows * 256 * n_sb
+        )
+    )]
+    pub fn ds41_glue_engram_rows_q6k(
+        params: &[u32],
+        at_byte: u32,
+        rows: u32,
+        n_sb: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        let n_sb = n_sb as usize;
+        if i >= rows as usize * 256 * n_sb {
+            return;
+        }
+        let sb = i / 256;
+        // SAFETY: i < rows·256·n_sb (the guard above) gives sb < rows·n_sb, so
+        // the super-block ends at byte at_byte + 210·(sb + 1) <= at_byte +
+        // rows·210·n_sb <= 4·params.len() (the launch contract); it starts on
+        // an even byte (`Glue::new` checks at_byte even; 210 is even); i % 256
+        // < 256.
+        let v = unsafe { q6k_row_value(params, at_byte as usize + 210 * sb, i % 256) };
+        // SAFETY: i < rows·256·n_sb <= y.len() by the launch contract; one
+        // thread per value.
+        unsafe { *y.get_unchecked_mut(i) = v };
+    }
+
     /// One site's gathered IQ4_NL rows, dequantized: thread `i` is value `v =
     /// i % (32·n_blk)` of row `r = i / (32·n_blk)`, value `v % 32` of block
     /// `v / 32` of the rows packed from image byte `at_byte` at `18·n_blk`
@@ -634,13 +747,22 @@ pub(crate) mod glue_kernels {
 
 // -------------------------------------------------------------- the piece
 
+/// A gain an engram launch reads: a resident f32 weight of `hc` rows, or the
+/// piece's rows of ones ([`Glue::with_rows`] holds them for a file whose
+/// gains are folded into the query's: `v·1` is `v`, so the key side then
+/// rounds once, the norm's product alone).
+enum Gain {
+    Weight(String),
+    Ones,
+}
+
 /// One engram site: its layer, its weights' names, where its rows lie in the
 /// image, and per row the scratch its launches leave for the layer's gate.
 struct EngramSite {
     layer: usize,
     wkv: String,
-    gain_k: String,
-    gain_q: String,
+    gain_k: Gain,
+    gain_q: Gain,
     /// Image byte of the site's first row.
     at_byte: u32,
     /// Per row ([`Glue::with_rows`]): a pass whose rows run one layer apart
@@ -855,6 +977,9 @@ pub struct Glue {
     shape: TableShape,
     table: TableRows,
     sites: Vec<EngramSite>,
+    /// `hc` rows of ones, the key gain of a file whose gains are folded
+    /// ([`EngramGains::Folded`]); `None` otherwise.
+    ones: Option<DeviceBuffer<f32>>,
 }
 
 impl Glue {
@@ -863,7 +988,7 @@ impl Glue {
     /// and each engram site's scratch. The kernels hold a stream row of
     /// [`ROW`] values and four streams; a step runs one token, and the image
     /// carries the embedding row as bf16, Q3_K or Q5_K and each site's rows as
-    /// Q8_0, Q3_K, IQ4_NL or MXFP8 (the file's types, [`Hparams::rows`]). One row of
+    /// Q8_0, Q3_K, Q6_K, IQ4_NL or MXFP8 (the file's types, [`Hparams::rows`]). One row of
     /// site scratch.
     pub fn new(gpu: &Gpu, hp: &Hparams, layout: &ImageLayout) -> Result<Glue, GpuError> {
         Glue::with_rows(gpu, hp, layout, 1)
@@ -904,8 +1029,8 @@ impl Glue {
         }) else {
             return Err(refuse(format!(
                 "engram rows of {} values of {}, {} bytes a token in the image: not {} sites of \
-                 {rows} Q8_0 rows in whole words, Q3_K rows of whole super-blocks, or IQ4_NL or \
-                 MXFP8 rows of whole blocks",
+                 {rows} Q8_0 rows in whole words, Q3_K or Q6_K rows of whole super-blocks, or \
+                 IQ4_NL or MXFP8 rows of whole blocks",
                 en.key_length,
                 table_ty,
                 dims.engram_bytes,
@@ -924,6 +1049,13 @@ impl Glue {
         let (embd_at, embd_words, engram_at) = row_offsets(layout)?;
         let site_bytes = rows * row_bytes;
         let stream = gpu.stream();
+        let ones = match en.layout() {
+            EngramLayout::PerSite => None,
+            EngramLayout::Concatenated => Some(DeviceBuffer::from_host(
+                stream,
+                &vec![1.0f32; HC_STREAMS * ROW],
+            )?),
+        };
         let mut sites = Vec::with_capacity(en.layer_ids.len());
         for (s, &layer) in en.layer_ids.iter().enumerate() {
             if hp.layers.get(layer).and_then(|k| k.engram) != Some(s) {
@@ -938,11 +1070,15 @@ impl Glue {
                      word"
                 )));
             }
+            let (gain_k, gain_q) = match en.gains(layer) {
+                EngramGains::Pair { key, query } => (Gain::Weight(key), Gain::Weight(query)),
+                EngramGains::Folded { gate } => (Gain::Ones, Gain::Weight(gate)),
+            };
             sites.push(EngramSite {
                 layer,
-                wkv: names::engram_wkv(layer),
-                gain_k: names::engram_k(layer),
-                gain_q: names::engram_q(layer),
+                wkv: en.wkv(layer),
+                gain_k,
+                gain_q,
                 at_byte,
                 bufs: (0..n_rows)
                     .map(|_| {
@@ -977,17 +1113,29 @@ impl Glue {
             },
             table,
             sites,
+            ones,
         })
     }
 
     /// Device bytes of the piece's scratch.
     #[must_use]
     pub fn device_bytes(&self) -> usize {
+        let ones = self.ones.as_ref().map_or(0, |o| 4 * o.len());
         self.sites
             .iter()
             .flat_map(|s| &s.bufs)
             .map(SiteRow::device_bytes)
-            .sum()
+            .sum::<usize>()
+            + ones
+    }
+
+    /// Site `layer`'s projection of its gathered rows, by the file's name.
+    #[must_use]
+    pub fn wkv(&self, layer: usize) -> Option<&str> {
+        self.sites
+            .iter()
+            .find(|s| s.layer == layer)
+            .map(|s| s.wkv.as_str())
     }
 
     /// Device bytes of one row's scratch, every site's.
@@ -1127,7 +1275,7 @@ impl Glue {
             stream,
             KeyNormArgs {
                 kv: &site.kv,
-                gain: gain(w, gain_k, HC_STREAMS * ROW)?,
+                gain: gain(w, gain_k, self.ones.as_ref())?,
                 eps: self.eps,
                 hc: HC_STREAMS,
                 m: 1,
@@ -1175,7 +1323,7 @@ impl Glue {
                 x: a.streams,
                 kn: &site.kn,
                 kv: &site.kv,
-                gain: gain(w, gain_q, HC_STREAMS * ROW)?,
+                gain: gain(w, gain_q, self.ones.as_ref())?,
                 eps: self.eps,
                 hc: HC_STREAMS,
                 m: 1,
@@ -1221,8 +1369,8 @@ impl Glue {
 struct SiteRef<'s> {
     at_byte: u32,
     wkv: &'s str,
-    gain_k: &'s str,
-    gain_q: &'s str,
+    gain_k: &'s Gain,
+    gain_q: &'s Gain,
     row: &'s mut SiteRow,
 }
 
@@ -1288,8 +1436,23 @@ fn row_offsets(layout: &ImageLayout) -> Result<(u32, u32, u32), GpuError> {
     }
 }
 
-/// The resident f32 values of `name`, refused unless there are `len`.
-fn gain<'w>(w: &'w Weights, name: &str, len: usize) -> Result<&'w DeviceBuffer<f32>, GpuError> {
+/// The `hc` rows of `g`: its resident f32 values, refused unless there are
+/// `HC_STREAMS·ROW`, or `ones`.
+fn gain<'w>(
+    w: &'w Weights,
+    g: &Gain,
+    ones: Option<&'w DeviceBuffer<f32>>,
+) -> Result<&'w DeviceBuffer<f32>, GpuError> {
+    let len = HC_STREAMS * ROW;
+    let name = match g {
+        Gain::Weight(name) => name,
+        Gain::Ones => {
+            return ones.ok_or_else(|| GpuError::Shape {
+                what: WHAT,
+                detail: "a key gain of ones in a piece that holds none".to_string(),
+            });
+        }
+    };
     match w.get(name) {
         Some(DevWeight::F32 { w: t, .. }) if t.buf().len() == len => Ok(t.buf()),
         Some(DevWeight::F32 { w: t, .. }) => Err(GpuError::Shape {
@@ -1438,7 +1601,7 @@ impl StepRows {
         let (hash, en, table_ty) = (engram.hash(), hp.engram()?, hp.rows.engram()?);
         let (_, row_bytes) = TableRows::of(table_ty, en.key_length).ok_or_else(|| {
             refuse(format!(
-                "engram tables of {} rows of {} values: the card reads Q8_0, Q3_K, IQ4_NL and MXFP8 rows",
+                "engram tables of {} rows of {} values: the card reads Q8_0, Q3_K, Q6_K, IQ4_NL and MXFP8 rows",
                 table_ty, en.key_length
             ))
         })?;
@@ -1796,6 +1959,7 @@ mod tests {
         let scales: &[usize] = match ty {
             GgmlType::Q3_K => &[108],
             GgmlType::Q5_K => &[0, 2],
+            GgmlType::Q6_K => &[208],
             GgmlType::MXFP8 => return mxfp8_blocks(n_blocks, rng),
             _ => &[0],
         };
@@ -1859,10 +2023,11 @@ mod tests {
     /// Every row format the glue takes, decoded on the card out of an image,
     /// is the bits `gguf::quant::dequant_row` gives the same bytes: a token's
     /// embedding row into the four streams and the layer's input, and a
-    /// site's gathered table rows (Q8_0, Q3_K, IQ4_NL and MXFP8), none of
-    /// them raising; an MXFP8 byte the format leaves undefined decodes to NaN
-    /// under its named fault. Mutant: the decoder without its check gives
-    /// 480 for the E4M3 NaN.
+    /// site's gathered table rows (Q8_0, Q3_K, IQ4_NL, MXFP8 and Q6_K — its
+    /// rows from both half-word starts), none of them raising; an MXFP8 byte
+    /// the format leaves undefined decodes to NaN under its named fault.
+    /// Mutants: the decoder without its check gives 480 for the E4M3 NaN; a
+    /// Q6_K decode that drops its signed scale differs from the file's.
     #[test]
     #[ignore = "needs a CUDA card"]
     fn hw_glue_rows_decode_as_the_file_decodes_them() {
@@ -1925,6 +2090,7 @@ mod tests {
             GgmlType::Q3_K,
             GgmlType::IQ4_NL,
             GgmlType::MXFP8,
+            GgmlType::Q6_K,
         ] {
             let (table, row_bytes) = TableRows::of(ty, KEY_LEN).expect("a table format");
             let n_blocks = ROWS * row_bytes / ty.type_size().expect("sized") as usize;
@@ -1936,9 +2102,10 @@ mod tests {
             {
                 dequant_row(ty, b, w).expect("the file decode");
             }
-            // Q8_0 rows are read by word; Q3_K and IQ4_NL start on a half
-            // word, which 14 puts at 2 mod 4; MXFP8 is read by byte, from an
-            // odd one.
+            // Q8_0 rows are read by word; Q3_K, IQ4_NL and Q6_K start on a
+            // half word, which 14 puts at 2 mod 4 (a Q6_K row's 210 bytes
+            // put the next at 0 mod 4); MXFP8 is read by byte, from an odd
+            // one.
             let at_byte = match table {
                 TableRows::Q8_0 => 12,
                 TableRows::Mxfp8 => 13,

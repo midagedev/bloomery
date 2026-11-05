@@ -9,7 +9,9 @@
 //! `engram-lab` crate, built on this one; the engine uses none of it.
 //!
 //! The tables are the `engram_embd` weights of the blocks the metadata names
-//! (blk.1 and blk.14 in V4.1-Flash): ~384 M rows of 256 values each, in the
+//! (blk.1 and blk.14 in V4.1-Flash), or each site's run of rows of the one
+//! table llama.cpp's converter writes (`gguf::engram::EngramTables` places
+//! them): ~384 M rows a site of 256 values each, in the
 //! file's block type — one Q3_K block of **110 B a row** in the public
 //! `Q3_K_M` file (84.6 GB together). They cannot live in RAM beside the
 //! weights, and each site is mapped and read where it lies. A row's bytes are
@@ -61,12 +63,6 @@ pub mod rows;
 pub use direct::DIRECT_ALIGN;
 pub use direct::open_direct;
 pub use hash::Hash;
-
-/// The tensor one engram site lives in. The block index is metadata, so this is
-/// the only place the name's shape is written down.
-fn site_name(layer_id: u32) -> String {
-    format!("blk.{layer_id}.engram_embd.weight")
-}
 
 /// Every `*.gguf` of a split set, in name order.
 fn shards_in(dir: &Path) -> Result<Vec<PathBuf>, EngramError> {
@@ -177,6 +173,13 @@ pub enum EngramError {
         len: usize,
         source: std::io::Error,
     },
+    #[error("{name}: a site of rows {base_row}..+{rows} is past the tensor's {tensor_rows} rows")]
+    SiteRows {
+        name: String,
+        base_row: u64,
+        rows: u64,
+        tensor_rows: u64,
+    },
     #[error("{name}: row length {ne0} is not a multiple of its type's block ({block})")]
     UnalignedRow { name: String, ne0: u64, block: u64 },
     #[error(
@@ -237,7 +240,9 @@ fn fadvise_off(n: usize) -> libc::off_t {
     libc::off_t::try_from(n).expect("a span inside a mapping fits an off_t")
 }
 
-/// One engram table: a row store mapped where it lies in its shard.
+/// One engram site's table: a row store mapped where it lies in its shard,
+/// the site's rows of the tensor that holds them ([`gguf::engram::SiteTable`]:
+/// a whole per-site tensor, or the site's run of a concatenated one).
 pub struct Site {
     name: String,
     path: PathBuf,
@@ -245,9 +250,9 @@ pub struct Site {
     // page-cache advice (`posix_fadvise`) and any independent read need.
     file: File,
     map: Mmap,
-    /// Byte offset of row 0. The mapping starts at file offset 0, so this is
-    /// the file offset too — which is what makes [`Site::file_offset`] usable
-    /// by a reader that never maps the file.
+    /// Byte offset of the site's row 0. The mapping starts at file offset 0,
+    /// so this is the file offset too — which is what makes
+    /// [`Site::file_offset`] usable by a reader that never maps the file.
     base: u64,
     /// The rows' ggml type id.
     type_id: u32,
@@ -258,11 +263,14 @@ pub struct Site {
 }
 
 impl Site {
+    /// The rows `[base_row, base_row + rows)` of tensor `t` of the shard at
+    /// `path`, whose data starts at `data_base` in a file of `file_len`
+    /// bytes.
     fn open(
         path: &Path,
-        data_base: u64,
-        file_len: u64,
+        (data_base, file_len): (u64, u64),
         t: &RawTensorInfo,
+        (base_row, rows): (u64, u64),
     ) -> Result<Site, EngramError> {
         let Some((_, block, block_bytes)) = ggml_type_info(t.type_id) else {
             return Err(EngramError::UnsizedType {
@@ -298,7 +306,7 @@ impl Site {
                 nbytes,
             });
         }
-        let base = data_base
+        let tensor_base = data_base
             .checked_add(t.offset)
             .filter(|b| b.checked_add(nbytes).is_some_and(|end| end <= file_len))
             .ok_or_else(|| EngramError::PastEndOfFile {
@@ -309,6 +317,16 @@ impl Site {
                 nbytes,
                 len: file_len,
             })?;
+        if base_row.checked_add(rows).is_none_or(|end| end > ne1) {
+            return Err(EngramError::SiteRows {
+                name: t.name.clone(),
+                base_row,
+                rows,
+                tensor_rows: ne1,
+            });
+        }
+        // Inside the tensor's bytes, which end inside the file (above).
+        let base = tensor_base + base_row * row_bytes;
 
         let page = page_size() as u64;
 
@@ -338,12 +356,13 @@ impl Site {
             base,
             type_id: t.type_id,
             row_bytes,
-            rows: ne1,
+            rows,
             page,
         })
     }
 
-    /// The tensor's name, e.g. `blk.1.engram_embd.weight`.
+    /// The tensor's name, e.g. `blk.1.engram_embd.weight` or, for every site
+    /// of a concatenated table, `per_layer_token_embd.weight`.
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -353,7 +372,7 @@ impl Site {
         &self.path
     }
 
-    /// Rows in the table.
+    /// Rows in the site's table.
     pub fn rows(&self) -> u64 {
         self.rows
     }
@@ -905,23 +924,30 @@ impl Engram {
             invs.push(inventory_of(path)?);
         }
         let hash = Hash::from_shards(&invs)?;
-
-        let mut slots: Vec<Option<Site>> = (0..hash.sites()).map(|_| None).collect();
-        for (path, inv) in paths.iter().zip(&invs) {
-            for (e, slot) in slots.iter_mut().enumerate() {
-                let name = site_name(hash.layer_ids()[e]);
-                let Some(t) = inv.tensors.iter().find(|t| t.name == name) else {
-                    continue;
-                };
-                *slot = Some(Site::open(path, inv.data_base, inv.file_len, t)?);
-            }
+        let tables = hash::site_tables(&invs)?;
+        let find = |name: &str| {
+            paths
+                .iter()
+                .zip(&invs)
+                .find_map(|(p, inv)| Some((p, inv, inv.tensors.iter().find(|t| t.name == name)?)))
+        };
+        let mut sites = Vec::with_capacity(tables.sites.len());
+        for s in &tables.sites {
+            let (path, inv, t) = find(&s.tensor).ok_or_else(|| EngramError::MissingSite {
+                name: s.tensor.clone(),
+            })?;
+            sites.push(Site::open(
+                path,
+                (inv.data_base, inv.file_len),
+                t,
+                (s.base_row, s.rows),
+            )?);
         }
-
-        let mut sites = Vec::with_capacity(slots.len());
-        for (e, slot) in slots.into_iter().enumerate() {
-            sites.push(slot.ok_or_else(|| EngramError::MissingSite {
-                name: site_name(hash.layer_ids()[e]),
-            })?);
+        if sites.len() != hash.sites() {
+            return Err(EngramError::SiteOutOfRange {
+                site: sites.len(),
+                sites: hash.sites(),
+            });
         }
         Ok(Engram { hash, sites })
     }
@@ -1041,7 +1067,7 @@ mod tests {
                     offset: offset as u64,
                     nbytes: Some((row_bytes * 32) as u64),
                 };
-                let site = Site::open(&path, page as u64, len as u64, &tensor).unwrap();
+                let site = Site::open(&path, (page as u64, len as u64), &tensor, (0, 32)).unwrap();
                 let ids = [31, 15, 2, 0, 2, 1, 8, 9];
                 let mut expected = std::collections::BTreeSet::new();
                 for &id in &ids {
@@ -1088,6 +1114,32 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
+    /// A site's rows end inside the tensor that holds them: a run of rows
+    /// past its last row, or one whose end passes a u64, is refused by name
+    /// before anything is mapped; the run that ends at its last row opens,
+    /// its row 0 at its base row.
+    #[test]
+    fn a_site_past_its_tensors_rows_is_refused() {
+        let path = std::env::temp_dir().join(format!("engram-site-{}", std::process::id()));
+        std::fs::write(&path, [0u8; 64 + 16 * 6]).unwrap();
+        let t = RawTensorInfo {
+            name: "per_layer_token_embd.weight".to_string(),
+            dims: vec![4, 6],
+            type_id: 0,
+            offset: 0,
+            nbytes: Some(16 * 6),
+        };
+        for run in [(4, 3), (7, 0), (u64::MAX, 2)] {
+            match Site::open(&path, (64, 64 + 16 * 6), &t, run) {
+                Err(EngramError::SiteRows { tensor_rows: 6, .. }) => {}
+                other => panic!("rows {run:?} must be refused, got {:?}", other.map(|_| ())),
+            }
+        }
+        let site = Site::open(&path, (64, 64 + 16 * 6), &t, (4, 2)).unwrap();
+        assert_eq!((site.rows(), site.file_offset(0)), (2, 64 + 16 * 4));
+        std::fs::remove_file(&path).unwrap();
+    }
+
     /// A table whose start or end passes u64 is past the end of its file, named
     /// with the data base and the header's offset: an F32 [4, 1] table in an
     /// 80-byte file whose data starts at 64, at an offset that wraps the start
@@ -1105,7 +1157,7 @@ mod tests {
                 offset,
                 nbytes: Some(16),
             };
-            match Site::open(&path, data_base, len, &t) {
+            match Site::open(&path, (data_base, len), &t, (0, 1)) {
                 Err(EngramError::PastEndOfFile { base, off, .. }) => {
                     assert_eq!((base, off), (data_base, offset));
                 }

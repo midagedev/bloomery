@@ -95,7 +95,6 @@ use gguf::Split;
 use model::arch::Arch;
 use model::arch::deepseek41::host;
 use model::arch::deepseek41::hparams::Hparams;
-use model::arch::deepseek41::names;
 use model::arch::deepseek41::place::PlanInputs;
 use model::arch::deepseek41::plan::{Planner, StepPlan};
 use model::moe::UNION_MAX_COLS;
@@ -3125,10 +3124,10 @@ pub fn engram_row_bytes(file: &Split, hp: &Hparams) -> Result<usize, GpuError> {
         detail,
     };
     let mut bytes = None;
-    for &l in &hp.engram()?.layer_ids {
-        let name = names::engram_embd(l);
+    for site in &hp.engram()?.tables.sites {
+        let name = &site.tensor;
         let (_, t) = file
-            .find(&name)
+            .find(name)
             .ok_or_else(|| refuse(format!("{name} is not in the file")))?;
         let rows: u64 = t.dims.iter().skip(1).product();
         if t.dims.first().copied() != Some(hp.engram()?.key_length as u64)

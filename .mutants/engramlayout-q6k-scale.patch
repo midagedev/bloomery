@@ -1,0 +1,13 @@
+--- a/crates/gpu-deepseek41/src/chain/glue.rs
++++ b/crates/gpu-deepseek41/src/chain/glue.rs
+@@ -392,7 +392,9 @@
+     } else {
+         cvt_f32_f16x2_hi(dw)
+     };
+-    (d * f32::from(sc as u8 as i8)) * (code as i32 - 32) as f32
++    // mutant engramlayout-q6k-scale: the sub-block scale dropped.
++    let _ = sc;
++    d * (code as i32 - 32) as f32
+ }
+ 
+ // ---------------------------------------------------------------- kernels

@@ -15,7 +15,9 @@
 //! * Unsloth's sets: the Engram as llama.cpp's `ple.*` keys
 //!   (`ple.layers`, `ple.ngram_size`, `ple.heads_per_ngram`,
 //!   `embedding_length_per_layer_input`, `ple.layer_multipliers`,
-//!   `ple.head_vocab_sizes`, `ple.head_offsets`) and `engram.pad_token_id`.
+//!   `ple.head_vocab_sizes`, `ple.head_offsets`) and `engram.pad_token_id`,
+//!   and every site's rows in the one table [`CONCAT_TABLE`]
+//!   ([`crate::engram::EngramLayout::Concatenated`]).
 //!
 //! The spellings are Strata's packer tables (`ALIASES`, `ple_to_engram`,
 //! `int_tensors_to_engram` of its v0.2.4 `pack_gguf.py`) checked against the
@@ -66,11 +68,15 @@ pub fn is_hash_tensor(name: &str) -> bool {
     HASH_TENSORS.contains(&name)
 }
 
-/// The tensor of Engram site `layer`'s table.
+/// The tensor of Engram site `layer`'s table, one a site.
 #[must_use]
 pub fn table_name(layer: u64) -> String {
     format!("blk.{layer}.engram_embd.weight")
 }
+
+/// The tensor of llama.cpp's converter that holds every site's rows back to
+/// back, in `ple.layers` order.
+pub const CONCAT_TABLE: &str = "per_layer_token_embd.weight";
 
 /// The router's scoring function as a number: ik's type, or the publishers'
 /// name for the one function the V4 and V4.1 routers apply.
@@ -191,6 +197,9 @@ pub static ENGRAM: EngramFacts = EngramFacts {
         HASH_TENSORS[0],
     ),
     table: table_name,
+    concat_table: CONCAT_TABLE,
+    // llama.cpp's converter writes the offsets counted from the one table's row 0.
+    concat_offsets: Fact::new("ple.head_offsets", &[], Kind::Counts),
     companion: Companion {
         arch: ENGRAM_ARCH,
         env: COMPANION_ENV,
@@ -209,7 +218,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::engram::attach_companion_with;
+    use crate::engram::{EngramLayout, EngramTables, attach_companion_with};
     use crate::facts::{Norm, count, hash_constant, resolve};
     use crate::write::{TensorDecl, write_file};
     use crate::{GENERAL_ARCHITECTURE, GgmlType, LoadError, Split, inventory_of};
@@ -388,6 +397,150 @@ mod tests {
         let k = pairs(&[("ple.head_offsets", Value::Array(Vec::new()))]);
         let e = resolve(&k, ARCH, &ENGRAM.offsets.kv, 2).unwrap_err();
         assert!(matches!(e, FactError::Bad { .. }), "{e}");
+    }
+
+    /// A two-site concatenated Engram (layers 1 and 3, two buckets a site,
+    /// rows of width 4) whose table has `rows` rows and whose absolute
+    /// offsets are `offsets`, plus `extra` tensors.
+    fn concat_file(d: &Path, name: &str, offsets: &[u64], rows: u64, extra: &[&str]) -> PathBuf {
+        let model = pairs(&[
+            (
+                "ple.layers",
+                Value::Array(vec![Value::U32(1), Value::U32(3)]),
+            ),
+            ("ple.head_vocab_sizes", u64s(&[3, 5, 7, 11])),
+            ("ple.head_offsets", u64s(offsets)),
+            ("embedding_length_per_layer_input", Value::U32(4)),
+        ]);
+        let t = |name: &str, rows: u64| {
+            (
+                TensorDecl {
+                    name: name.to_string(),
+                    dims: vec![4, rows],
+                    type_id: GgmlType::F32.as_u32(),
+                    nbytes: 16 * rows,
+                },
+                vec![0u8; 16 * rows as usize],
+            )
+        };
+        let mut tensors = vec![t(CONCAT_TABLE, rows)];
+        tensors.extend(extra.iter().map(|n| t(n, 8)));
+        write(d, name, &model, &tensors)
+    }
+
+    fn tables_of(p: &Path) -> Result<Option<EngramTables>, LoadError> {
+        let split = Split::open_model(p)?;
+        EngramTables::read(split.keys(), ARCH, &ENGRAM, |n| {
+            split.find(n).map(|(_, t)| (t.dims.clone(), t.ty.as_u32()))
+        })
+    }
+
+    #[test]
+    fn a_concatenated_table_places_each_site_at_its_first_buckets_offset() {
+        let d = dir("concat");
+        let p = concat_file(&d, "c.gguf", &[0, 3, 8, 15], 26, &[]);
+        let t = tables_of(&p).unwrap().unwrap();
+        assert_eq!(t.layout, EngramLayout::Concatenated);
+        let got: Vec<_> = t
+            .sites
+            .iter()
+            .map(|s| (s.layer, s.tensor.as_str(), s.base_row, s.rows, s.width))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(1, CONCAT_TABLE, 0, 8, 4), (3, CONCAT_TABLE, 8, 18, 4)]
+        );
+        // The hash reads the same key per site, each from its own row 0.
+        let k = keys_of("concat-k", &[("ple.head_offsets", u64s(&[0, 3, 8, 15]))]);
+        let per_site = resolve(&k, ARCH, &ENGRAM.offsets.kv, 2).unwrap().unwrap().1;
+        assert_eq!(per_site, Norm::Counts(vec![0, 3, 0, 7]));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_concatenated_table_the_sites_do_not_tile_is_refused_by_name() {
+        let d = dir("concat-bad");
+        let cases: [(&str, &[u64], u64, &[&str], &str); 4] = [
+            (
+                "rows",
+                &[0, 3, 8, 15],
+                27,
+                &[],
+                "has 27 rows; the sites' buckets",
+            ),
+            (
+                "base",
+                &[0, 3, 9, 16],
+                26,
+                &[],
+                "starts site 1 (layer 3) at row 9",
+            ),
+            (
+                "both",
+                &[0, 3, 8, 15],
+                26,
+                &["blk.3.engram_embd.weight"],
+                "two layouts",
+            ),
+            ("short", &[0, 3, 8], 26, &[], "not the same whole number"),
+        ];
+        for (name, offsets, rows, extra, want) in cases {
+            let p = concat_file(&d, &format!("{name}.gguf"), offsets, rows, extra);
+            let e = tables_of(&p).unwrap_err().to_string();
+            assert!(e.contains(CONCAT_TABLE) && e.contains(want), "{name}: {e}");
+        }
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_file_with_neither_layout_names_both_tables() {
+        let d = dir("neither");
+        let p = write(
+            &d,
+            "n.gguf",
+            &pairs(&[("engram.layer_ids", Value::Array(vec![Value::I32(1)]))]),
+            &[],
+        );
+        let e = tables_of(&p).unwrap_err().to_string();
+        assert!(
+            e.contains(&table_name(1)) && e.contains(CONCAT_TABLE) && e.contains("lists layer 1"),
+            "{e}"
+        );
+        let per_site = write(
+            &d,
+            "p.gguf",
+            &pairs(&[("engram.layer_ids", Value::Array(vec![Value::I32(1)]))]),
+            &[(
+                TensorDecl {
+                    name: table_name(1),
+                    dims: vec![4, 3],
+                    type_id: GgmlType::F32.as_u32(),
+                    nbytes: 48,
+                },
+                vec![0; 48],
+            )],
+        );
+        let t = tables_of(&per_site).unwrap().unwrap();
+        assert_eq!(t.layout, EngramLayout::PerSite);
+        assert_eq!((t.sites[0].base_row, t.sites[0].rows), (0, 3));
+        assert!(
+            tables_of(&write(&d, "none.gguf", &pairs(&[]), &[]))
+                .unwrap()
+                .is_none()
+        );
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_concatenated_split_takes_no_companion() {
+        let d = dir("concat-comp");
+        let p = concat_file(&d, "c.gguf", &[0, 3, 8, 15], 26, &[]);
+        let mut split = Split::open_model(&p).unwrap();
+        attach_companion_with(&mut split, ARCH, &ENGRAM, None).unwrap();
+        assert_eq!(split.shard_count(), 1);
+        let e = attach_companion_with(&mut split, ARCH, &ENGRAM, Some(&p)).unwrap_err();
+        assert!(e.to_string().contains("holds every Engram table"), "{e}");
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     /// A file with the four hash tensors of a one-site toy Engram (2 columns,

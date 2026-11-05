@@ -16,7 +16,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::facts::{Fact, HashFact, count, counts_opt, full_key, text_opt};
+use crate::facts::{Fact, FactError, HashFact, count, counts, counts_opt, full_key, text_opt};
 use crate::{GENERAL_ARCHITECTURE, Gguf, LoadError, Split, Value};
 
 /// One architecture's Engram facts under every publisher's spelling.
@@ -46,8 +46,14 @@ pub struct EngramFacts {
     pub offsets: HashFact,
     /// The compressed vocabulary, indexed by token id.
     pub token_map: HashFact,
-    /// The tensor of Engram site `layer`'s table.
+    /// The tensor of Engram site `layer`'s table ([`EngramLayout::PerSite`]).
     pub table: fn(u64) -> String,
+    /// The one tensor that holds every site's rows back to back, in site
+    /// order ([`EngramLayout::Concatenated`]).
+    pub concat_table: &'static str,
+    /// Per site, each bucket's first row counted from the concatenated
+    /// table's row 0: what places a site in it.
+    pub concat_offsets: Fact,
     /// The file that holds the tables when the model split lacks them.
     pub companion: Companion,
 }
@@ -63,6 +69,222 @@ pub struct Companion {
     /// The path `env` holds, when set: used only when the model split lacks an
     /// Engram table.
     pub explicit: fn() -> Option<PathBuf>,
+}
+
+/// How a file lays out its Engram tables.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EngramLayout {
+    /// One tensor a site ([`EngramFacts::table`]), the site's rows from its
+    /// row 0.
+    PerSite,
+    /// Every site's rows in one tensor ([`EngramFacts::concat_table`]), site
+    /// after site in `layer_ids` order; a site starts at its first bucket's
+    /// offset ([`EngramFacts::concat_offsets`]).
+    Concatenated,
+}
+
+/// One Engram site's rows in the file: the tensor that holds them, the
+/// tensor row the site's row 0 is, the site's row count, the rows' ggml type
+/// id and their width (the tensor's `ne[0]`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SiteTable {
+    /// The block the site is.
+    pub layer: u64,
+    pub tensor: String,
+    pub base_row: u64,
+    pub rows: u64,
+    pub type_id: u32,
+    pub width: u64,
+}
+
+/// A tensor's header as [`EngramTables::read`] looks it up: its dims
+/// (`ne[0]` first) and its ggml type id.
+pub type TableHeader = (Vec<u64>, u32);
+
+/// Every Engram site's rows, by the file's layout: the one owner of where a
+/// site's rows are, for the model's open and the Engram crate's header-only
+/// one alike.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EngramTables {
+    pub layout: EngramLayout,
+    /// In `layer_ids` order.
+    pub sites: Vec<SiteTable>,
+}
+
+fn table_err(name: &str, detail: impl Into<String>) -> LoadError {
+    LoadError::EngramTable {
+        name: name.to_string(),
+        detail: detail.into(),
+    }
+}
+
+impl EngramLayout {
+    /// The layout of a file whose header is `meta` and which holds tensor
+    /// `name` when `has(name)`; `None` when the header lists no Engram site.
+    /// The concatenated table beside a per-site one is refused by name. A
+    /// file with neither is [`EngramLayout::PerSite`]: its tables may sit in
+    /// a companion ([`attach_companion`]), and [`EngramTables::read`] names
+    /// what is missing.
+    pub fn of(
+        meta: &[(String, Value)],
+        arch: &str,
+        facts: &EngramFacts,
+        has: impl Fn(&str) -> bool,
+    ) -> Result<Option<EngramLayout>, LoadError> {
+        let Some(layers) = counts_opt(meta, arch, &facts.layer_ids).map_err(LoadError::from)?
+        else {
+            return Ok(None);
+        };
+        let per_site: Vec<String> = layers
+            .iter()
+            .map(|&l| (facts.table)(l))
+            .filter(|n| has(n))
+            .collect();
+        match (has(facts.concat_table), per_site.is_empty()) {
+            (true, false) => Err(table_err(
+                facts.concat_table,
+                format!(
+                    "is in the file beside the per-site tables {per_site:?}: two layouts of one Engram"
+                ),
+            )),
+            (true, true) => Ok(Some(EngramLayout::Concatenated)),
+            (false, _) => Ok(Some(EngramLayout::PerSite)),
+        }
+    }
+}
+
+impl EngramTables {
+    /// Every site's rows in a file whose header is `meta` and whose tensor
+    /// `name` has the header `find(name)`; `None` when the header lists no
+    /// Engram site. Refused by name: a per-site table that is missing or not
+    /// 2-D, and a concatenated table whose sites (each `Σ` its buckets'
+    /// primes rows, at its first bucket's [`EngramFacts::concat_offsets`])
+    /// do not follow one another from row 0 to its last row.
+    pub fn read(
+        meta: &[(String, Value)],
+        arch: &str,
+        facts: &EngramFacts,
+        find: impl Fn(&str) -> Option<TableHeader>,
+    ) -> Result<Option<EngramTables>, LoadError> {
+        let Some(layout) = EngramLayout::of(meta, arch, facts, |n| find(n).is_some())? else {
+            return Ok(None);
+        };
+        let layers = counts(meta, arch, &facts.layer_ids).map_err(LoadError::from)?;
+        let two_d = |name: &str, (dims, ty): TableHeader| match dims[..] {
+            [width, rows] => Ok((width, rows, ty)),
+            _ => Err(table_err(
+                name,
+                format!("has dims {dims:?}, want [width, rows]"),
+            )),
+        };
+        let sites = match layout {
+            EngramLayout::PerSite => layers
+                .iter()
+                .map(|&layer| {
+                    let tensor = (facts.table)(layer);
+                    let header = find(&tensor).ok_or_else(|| {
+                        table_err(
+                            &tensor,
+                            format!(
+                                "is not in the file, nor is {}, and {} lists layer {layer}",
+                                facts.concat_table,
+                                full_key(arch, facts.layer_ids.name)
+                            ),
+                        )
+                    })?;
+                    let (width, rows, type_id) = two_d(&tensor, header)?;
+                    Ok(SiteTable {
+                        layer,
+                        tensor,
+                        base_row: 0,
+                        rows,
+                        type_id,
+                        width,
+                    })
+                })
+                .collect::<Result<Vec<_>, LoadError>>()?,
+            EngramLayout::Concatenated => concatenated(meta, arch, facts, &layers, &find, two_d)?,
+        };
+        Ok(Some(EngramTables { layout, sites }))
+    }
+
+    /// The site of block `layer`, if the header lists it.
+    #[must_use]
+    pub fn site(&self, layer: u64) -> Option<&SiteTable> {
+        self.sites.iter().find(|s| s.layer == layer)
+    }
+}
+
+/// The sites of [`EngramLayout::Concatenated`]: site `e`'s rows are the sum
+/// of its buckets' primes and start at its first bucket's absolute offset,
+/// which must be where the sites before it end; the last ends at the
+/// table's last row.
+fn concatenated(
+    meta: &[(String, Value)],
+    arch: &str,
+    facts: &EngramFacts,
+    layers: &[u64],
+    find: &impl Fn(&str) -> Option<TableHeader>,
+    two_d: impl Fn(&str, TableHeader) -> Result<(u64, u64, u32), LoadError>,
+) -> Result<Vec<SiteTable>, LoadError> {
+    let name = facts.concat_table;
+    let header = find(name).ok_or_else(|| table_err(name, "is not in the file"))?;
+    let (width, total, type_id) = two_d(name, header)?;
+    let fact = |e: FactError| LoadError::from(e);
+    let primes = counts(meta, arch, &facts.primes.kv).map_err(fact)?;
+    let offsets = counts(meta, arch, &facts.concat_offsets).map_err(fact)?;
+    let (primes_key, offsets_key) = (
+        full_key(arch, facts.primes.kv.name),
+        full_key(arch, facts.concat_offsets.name),
+    );
+    let sites = layers.len();
+    if primes.is_empty() || !primes.len().is_multiple_of(sites) || offsets.len() != primes.len() {
+        return Err(table_err(
+            name,
+            format!(
+                "{primes_key} holds {} buckets and {offsets_key} {}: not the same whole number for each of {sites} sites",
+                primes.len(),
+                offsets.len()
+            ),
+        ));
+    }
+    let n_cols = primes.len() / sites;
+    let mut next = 0u64;
+    let mut out = Vec::with_capacity(sites);
+    for (e, &layer) in layers.iter().enumerate() {
+        let chunk = &primes[e * n_cols..(e + 1) * n_cols];
+        let rows = chunk
+            .iter()
+            .try_fold(0u64, |a, &p| a.checked_add(p))
+            .ok_or_else(|| table_err(name, format!("site {e}'s buckets pass a u64 of rows")))?;
+        let base_row = offsets[e * n_cols];
+        if base_row != next {
+            return Err(table_err(
+                name,
+                format!(
+                    "{offsets_key} starts site {e} (layer {layer}) at row {base_row}; the sites before it end at row {next}"
+                ),
+            ));
+        }
+        next = base_row
+            .checked_add(rows)
+            .ok_or_else(|| table_err(name, format!("site {e} ends past a u64 row")))?;
+        out.push(SiteTable {
+            layer,
+            tensor: name.to_string(),
+            base_row,
+            rows,
+            type_id,
+            width,
+        });
+    }
+    if next != total {
+        return Err(table_err(
+            name,
+            format!("has {total} rows; the sites' buckets ({primes_key}) cover {next}"),
+        ));
+    }
+    Ok(out)
 }
 
 fn companion_err(path: &Path, detail: impl Into<String>) -> LoadError {
@@ -272,10 +494,14 @@ pub(crate) fn attach_companion_with(
         .map(Path::to_path_buf)
         .unwrap_or_default();
     let sites = Sites::read(split.keys(), arch, facts)?;
-    let missing: Vec<u64> = sites.as_ref().map_or_else(Vec::new, |s| {
-        let lacking = |&l: &u64| split.find(&(facts.table)(l)).is_none();
-        s.layers.iter().copied().filter(lacking).collect()
-    });
+    let layout = EngramLayout::of(split.keys(), arch, facts, |n| split.find(n).is_some())?;
+    let missing: Vec<u64> = match (&sites, layout) {
+        (Some(s), Some(EngramLayout::PerSite)) => {
+            let lacking = |&l: &u64| split.find(&(facts.table)(l)).is_none();
+            s.layers.iter().copied().filter(lacking).collect()
+        }
+        _ => Vec::new(),
+    };
     let (Some(sites), false) = (&sites, missing.is_empty()) else {
         return match explicit {
             Some(p) => Err(companion_err(

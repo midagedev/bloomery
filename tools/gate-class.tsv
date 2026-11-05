@@ -47,6 +47,7 @@ gate-gpu-ds41-chain-ffn	family	deepseek41	kernel	moe_route
 gate-gpu-ds41-chat	family	deepseek41	e2e	seats_app
 gate-gpu-ds41-draft	family	deepseek41	draft	drafts_mtp
 gate-gpu-ds41-dspark-loop	family	deepseek41	draft	drafts_dspark
+gate-gpu-ds41-engram-layout	family	deepseek41	e2e	engram_verbs
 gate-gpu-ds41-lib	family	deepseek41	host	-
 gate-gpu-ds41-long	family	deepseek41	e2e	graph_fault
 gate-gpu-ds41-media	family	deepseek41	media	serve_media+prompt_walks

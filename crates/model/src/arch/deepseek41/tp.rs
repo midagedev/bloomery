@@ -18,6 +18,7 @@
 
 use std::ops::Range;
 
+use gguf::arch::deepseek41::CONCAT_TABLE;
 use gguf::{GgmlType, Split};
 
 use super::hparams::Hparams;
@@ -52,7 +53,7 @@ impl TpUnits {
 /// embedding and the Engram tables, which stay in their files and are read by row.
 #[must_use]
 pub fn card_holds(name: &str) -> bool {
-    name != names::token_embd() && !stem_of(name).starts_with("engram_embd")
+    name != names::token_embd() && name != CONCAT_TABLE && !stem_of(name).starts_with("engram_embd")
 }
 
 /// The name past `blk.N.`, or the whole name for a model-level tensor.
@@ -84,7 +85,9 @@ pub fn cut(name: &str, dims: &[u64], u: &TpUnits) -> Result<Option<Cut>, Placeme
         | "exp_probs_b_vl.bias"
         | "engram_q.weight"
         | "engram_k.weight"
-        | "engram_embd.weight" => return Ok(None),
+        | "engram_gate.weight"
+        | "engram_embd.weight"
+        | "per_layer_token_embd.weight" => return Ok(None),
         _ if stem.starts_with("indexer")
             || stem.starts_with("attn_compressor")
             || stem.starts_with("hc_")
@@ -96,7 +99,7 @@ pub fn cut(name: &str, dims: &[u64], u: &TpUnits) -> Result<Option<Cut>, Placeme
         "attn_sinks.weight" => (1, 0, u.heads),
         "attn_output_a.weight" => (2, 1, u.groups),
         "attn_output_b.weight" => (2, 0, u.groups),
-        "engram_wkv.weight" => (2, 0, u.engram_cols),
+        "engram_wkv.weight" | "engram_kv.weight" => (2, 0, u.engram_cols),
         "ffn_gate_shexp.weight" | "ffn_up_shexp.weight" | "output.weight" => (2, 1, 0),
         "ffn_down_shexp.weight" => (2, 0, 0),
         "ffn_gate_exps.weight" | "ffn_up_exps.weight" => (3, 1, 0),
@@ -258,8 +261,12 @@ pub fn rank_need(
             .and_then(|n| n.checked_mul(e.layer_ids.len() as u64))
             .ok_or_else(over)?;
         for &site in &e.layer_ids {
-            let table = format!("blk.{site}.engram_embd.weight");
-            let wkv = format!("blk.{site}.engram_wkv.weight");
+            let table = e
+                .tables
+                .site(site as u64)
+                .map(|s| s.tensor.clone())
+                .ok_or_else(|| refuse("engram site", &format!("layer {site} has no table")))?;
+            let wkv = e.wkv(site);
             let (_, t) = split
                 .find(&table)
                 .ok_or_else(|| refuse(&table, "is not in the header"))?;
@@ -288,7 +295,8 @@ pub fn rank_need(
         let mut tables = roles::classify(split, hp)?;
         for t in &mut tables.tensors {
             if t.role == Role::EngramTable {
-                t.gathered_rows = Some(cols.end - cols.start);
+                let sites = e.tables.sites.iter().filter(|s| s.tensor == t.name).count() as u64;
+                t.gathered_rows = Some((cols.end - cols.start) * sites);
             }
         }
         row_cache = crate::placement::row_room(

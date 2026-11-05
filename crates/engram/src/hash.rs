@@ -57,6 +57,25 @@ pub use ngram::{EosWindow, History, NgramError};
 /// The architecture the keys of [`Hash::from_gguf`] are under.
 const ARCH: &str = "deepseek41";
 
+/// Where each site's rows are in the split set `invs` describes: the header
+/// that carries the constants, the tables looked up in every shard
+/// ([`gguf::engram::EngramTables`], the one owner of the layout).
+pub(crate) fn site_tables(invs: &[Inventory]) -> Result<gguf::engram::EngramTables, EngramError> {
+    let table = engram_facts()?;
+    let carrier = invs
+        .iter()
+        .find(|inv| facts::carries(&inv.meta, ARCH, &table.layer_ids))
+        .ok_or_else(|| EngramError::NoHashMetadata(key(table.layer_ids.name)))?;
+    let find = |name: &str| {
+        invs.iter()
+            .flat_map(|inv| &inv.tensors)
+            .find(|t| t.name == name)
+            .map(|t| (t.dims.clone(), t.type_id))
+    };
+    gguf::engram::EngramTables::read(&carrier.meta, ARCH, table, find)?
+        .ok_or_else(|| EngramError::NoHashMetadata(key(table.layer_ids.name)))
+}
+
 /// The Engram facts the header of [`ARCH`] is read by.
 fn engram_facts() -> Result<&'static EngramFacts, EngramError> {
     gguf::arch::engram_facts(ARCH).ok_or_else(|| EngramError::NoFacts {

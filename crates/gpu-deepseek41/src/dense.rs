@@ -5,12 +5,13 @@
 //! never branches on it.
 //!
 //! - Q8_0: `q8f32`'s gemv, f32 activations.
-//! - Q3_K and Q4_K: `bloomery_gpu`'s gemvs against the q8_1 form of the
-//!   activation (`Gpu::enqueue_gemv_q3k`, `Gpu::enqueue_gemv_q4k`), the
-//!   rule every K-quant site of the card runs — `cores::q3k_row_dot`,
-//!   `cores::q4k_row_dot`, ik's CUDA `mmvq` shape. The caller quantizes the
-//!   activation once for every projection that reads it; a Q3_K row may have
-//!   an odd super-block count.
+//! - Q3_K, Q4_K and Q6_K: `bloomery_gpu`'s gemvs against the q8_1 form of
+//!   the activation (`Gpu::enqueue_gemv_q3k`, `Gpu::enqueue_gemv_q4k`,
+//!   `Gpu::enqueue_gemv_q6k`), the rule every K-quant site of the card runs —
+//!   `cores::q3k_row_dot`, `cores::q4k_row_dot`, ik's CUDA `mmvq` shape. The
+//!   caller quantizes the activation once for every projection that reads
+//!   it; a Q3_K row may have an odd super-block count, a Q6_K row's count is
+//!   even (`Gpu::enqueue_gemv_q6k` refuses another by name).
 //! - Q5_K: [`DenseKernels`]'s f32-activation gemv, the Q5_K dense site
 //!   (the shared down projection, q_b, wo_b): each weight dequantized as
 //!   `gguf::quant::dequant_row` does it, then one fused multiply-add.
@@ -793,6 +794,7 @@ pub enum Dense<'w> {
     Q3K(&'w DeviceTensor<u32>),
     Q4K(&'w DeviceTensor<u32>),
     Q5K(&'w DeviceTensor<u32>),
+    Q6K(&'w DeviceTensor<u32>),
     /// BF16 as the file stores it, two values to a word.
     Bf16(&'w DeviceTensor<u32>),
     /// MXFP8 in the card's two planes, the common E4M3 gemv's
@@ -805,11 +807,12 @@ impl<'w> Dense<'w> {
     /// values onto `rows` rows at a site type this module runs (the type of
     /// its resident form, `site::resident_site`).
     pub fn of(w: &'w Weights, name: &str, k: usize, rows: usize) -> Result<Dense<'w>, GpuError> {
-        const TYS: [SiteTy; 6] = [
+        const TYS: [SiteTy; 7] = [
             SiteTy::Q8_0,
             SiteTy::Q3K,
             SiteTy::Q4K,
             SiteTy::Q5K,
+            SiteTy::Q6K,
             SiteTy::Bf16,
             SiteTy::Mxfp8,
         ];
@@ -819,6 +822,7 @@ impl<'w> Dense<'w> {
             (SiteTy::Q3K, DevWeight::KQuant { w: t, .. }) => Ok(Dense::Q3K(t)),
             (SiteTy::Q4K, DevWeight::KQuant { w: t, .. }) => Ok(Dense::Q4K(t)),
             (SiteTy::Q5K, DevWeight::KQuant { w: t, .. }) => Ok(Dense::Q5K(t)),
+            (SiteTy::Q6K, DevWeight::KQuant { w: t, .. }) => Ok(Dense::Q6K(t)),
             (SiteTy::Bf16, DevWeight::Bf16 { w: t, .. }) => Ok(Dense::Bf16(t)),
             (SiteTy::Mxfp8, DevWeight::Mxfp8 { .. }) => Ok(Dense::Mxfp8(w.e4m3(WHAT, name)?)),
             _ => Err(GpuError::tensor(
@@ -832,7 +836,7 @@ impl<'w> Dense<'w> {
     /// Whether the projection reads its input in q8_1.
     #[must_use]
     pub fn reads_q8_1(&self) -> bool {
-        matches!(self, Dense::Q3K(_) | Dense::Q4K(_))
+        matches!(self, Dense::Q3K(_) | Dense::Q4K(_) | Dense::Q6K(_))
     }
 }
 
@@ -898,6 +902,7 @@ impl DenseKernels {
             Dense::Q3K(w) => gpu.enqueue_gemv_q3k(w, act()?, y),
             Dense::Q4K(w) => gpu.enqueue_gemv_q4k(w, act()?, y),
             Dense::Q5K(w) => self.enqueue_q5k(stream, w, x, m, y),
+            Dense::Q6K(w) => gpu.enqueue_gemv_q6k(w, act()?, y),
             Dense::Bf16(w) => gpu.q8f32().enqueue_bf16_gemv(stream, w, x, m, y),
             Dense::Mxfp8(w) => gpu.q8f32().enqueue_e4m3_gemv(
                 stream,
@@ -1652,6 +1657,91 @@ mod tests {
                 q8_dot(&wr, &x[g * K..][..K]).to_bits(),
                 "row {r} group {g}"
             );
+        }
+    }
+
+    /// The Q6_K block that decodes to Q3_K block `b`'s values: the same f16
+    /// `d`, each sub-block scale `sc - 32` as a signed byte, each value's code
+    /// `q + 28 + 4·h` (Q3_K's `q - 4·!h` plus 32), at Q6_K's lane of value
+    /// `128·n + 32·j + l` (ggml's two layouts).
+    fn q3k_to_q6k(b: &[u8]) -> [u8; 210] {
+        let mut o = [0u8; 210];
+        for n in 0..2 {
+            for l in 0..32 {
+                let (q, h) = (b[32 + 32 * n + l], (b[l] >> (4 * n)) & 15);
+                let code = |j: usize| ((q >> (2 * j)) & 3) + 28 + 4 * ((h >> j) & 1);
+                o[64 * n + l] = (code(0) & 15) | ((code(2) & 15) << 4);
+                o[64 * n + 32 + l] = (code(1) & 15) | ((code(3) & 15) << 4);
+                o[128 + 32 * n + l] = (0..4).fold(0, |a, j| a | (((code(j) >> 4) & 3) << (2 * j)));
+            }
+        }
+        let s12 = &b[96..108];
+        for j in 0..16 {
+            let low = if j < 8 { s12[j] & 15 } else { s12[j - 8] >> 4 };
+            let high = (s12[8 + (j & 3)] >> (2 * (j >> 2))) & 3;
+            o[192 + j] = (low | (high << 4)).wrapping_sub(32);
+        }
+        o[208..].copy_from_slice(&b[108..110]);
+        o
+    }
+
+    /// A Q6_K projection is the Q3_K one on the same values: the engram kv a
+    /// llama.cpp file stores as Q6_K, exactly transcoded from Q3_K rows of 24
+    /// super-blocks, gives at one token and at five (`y[r·m + c]`) the Q3_K
+    /// projection's outputs to the f32 rounding of their partial sums, both
+    /// against one q8_1 activation. Mutant: the Q6_K dense arm reading the
+    /// q8_1 form another K-quant's gemv reads.
+    #[test]
+    #[ignore = "needs a CUDA card"]
+    fn hw_q6k_dense_is_the_q3k_dense_of_its_transcode() {
+        const ROWS: usize = 40;
+        const N_SB: usize = 24;
+        const K: usize = 256 * N_SB;
+        let gpu = Gpu::new().expect("card");
+        let stream = gpu.stream();
+        let dense = DenseKernels::load(gpu.context()).expect("dense");
+        let d_bits = [0x2c00u16, 0x3000, 0x2800, 0x3400];
+        let noise = f32s(ROWS * N_SB * 108, 7);
+        let mut q3 = Vec::with_capacity(ROWS * N_SB * 110);
+        let mut q6 = Vec::with_capacity(ROWS * N_SB * 210);
+        for (b, block) in noise.chunks(108).enumerate() {
+            let mut blk: Vec<u8> = block.iter().map(|v| ((v + 1.0) * 127.5) as u8).collect();
+            blk.extend(d_bits[b % 4].to_le_bytes());
+            q6.extend(q3k_to_q6k(&blk));
+            q3.extend(blk);
+        }
+        let words = |b: &[u8]| -> Vec<u32> {
+            b.chunks(4)
+                .map(|c| u32::from_le_bytes(c.try_into().expect("whole words")))
+                .collect()
+        };
+        let w3 = DeviceTensor::upload(stream, &words(&q3), ROWS, N_SB * 110 / 4).expect("q3k");
+        let w6 = DeviceTensor::upload(stream, &words(&q6), ROWS, N_SB * 210 / 4).expect("q6k");
+        for m in [1, 5] {
+            let xd = DeviceBuffer::from_host(stream, &f32s(m * K, 8)).expect("x");
+            let mut act = Q8Act::with_k(stream, m, K).expect("act");
+            gpu.enqueue_quantize_q8_1(&xd, &mut act).expect("q8_1");
+            let mut y3 = DeviceBuffer::zeroed(stream, ROWS * m).expect("y3");
+            let mut y6 = DeviceBuffer::zeroed(stream, ROWS * m).expect("y6");
+            dense
+                .enqueue_m(&gpu, Dense::Q3K(&w3), &xd, Some(&act), m, &mut y3)
+                .expect("q3k dense");
+            dense
+                .enqueue_m(&gpu, Dense::Q6K(&w6), &xd, Some(&act), m, &mut y6)
+                .expect("q6k dense");
+            let (a, b) = (
+                y3.to_host_vec(stream).expect("y3"),
+                y6.to_host_vec(stream).expect("y6"),
+            );
+            let scale = a.iter().fold(0f32, |s, v| s.max(v.abs()));
+            for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+                assert!(
+                    (x - y).abs() <= 1e-5 * scale,
+                    "m {m} row {} column {}: Q3_K {x}, Q6_K {y} (largest |y| {scale})",
+                    i / m,
+                    i % m
+                );
+            }
         }
     }
 }

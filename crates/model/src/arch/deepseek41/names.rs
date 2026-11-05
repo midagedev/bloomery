@@ -242,3 +242,16 @@ pub fn engram_q(block: usize) -> String {
 pub fn engram_wkv(block: usize) -> String {
     format!("blk.{block}.engram_wkv.weight")
 }
+
+/// `blk.{block}.engram_kv.weight` — [`engram_wkv`] under llama.cpp's
+/// converter's name (`EngramLayout::Concatenated` files).
+pub fn engram_kv(block: usize) -> String {
+    format!("blk.{block}.engram_kv.weight")
+}
+
+/// `blk.{block}.engram_gate.weight` — llama.cpp's converter's fold of the two
+/// gains, `engram_q ⊙ engram_k` rounded to f32 once, one row per stream
+/// (`EngramLayout::Concatenated` files).
+pub fn engram_gate(block: usize) -> String {
+    format!("blk.{block}.engram_gate.weight")
+}

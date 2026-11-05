@@ -10,10 +10,9 @@
 //! file this classifier refuses.
 
 use gguf::Split;
-use gguf::arch::deepseek41::is_hash_tensor;
+use gguf::arch::deepseek41::{CONCAT_TABLE, is_hash_tensor};
 
 use super::hparams::Hparams;
-use super::names;
 use crate::arch::classify::{Counts, classify_with};
 use crate::placement::{ModelTensor, ModelTensors, PlacementError, Role};
 
@@ -37,7 +36,7 @@ impl Pattern {
 
 /// The per-layer rules; order matters (the never-loaded heads first, so none
 /// of their tensors takes a decode role; `engram_embd` and the gains
-/// `engram_k.`/`engram_q.` before `engram_`,
+/// `engram_k.`/`engram_q.`/`engram_gate.` before `engram_`,
 /// `exp_probs_b.` before `exp_probs_b_vl`, the shared expert before `_exps`).
 const LAYER_RULES: &[(Pattern, Role)] = &[
     (Pattern::Prefix("nextn."), Role::Unused),
@@ -46,6 +45,7 @@ const LAYER_RULES: &[(Pattern, Role)] = &[
     (Pattern::Prefix("engram_embd"), Role::EngramTable),
     (Pattern::Prefix("engram_k."), Role::EngramGain),
     (Pattern::Prefix("engram_q."), Role::EngramGain),
+    (Pattern::Prefix("engram_gate."), Role::EngramGain),
     (Pattern::Prefix("engram_"), Role::EngramDense),
     (Pattern::Prefix("hc_"), Role::HyperConnection),
     (Pattern::Prefix("ffn_gate_inp"), Role::Router),
@@ -72,6 +72,9 @@ fn role(name: &str, n_layer: usize) -> Option<(Role, Option<usize>)> {
     if name.starts_with("token_embd") {
         return Some((Role::TokenEmbedding, None));
     }
+    if name == CONCAT_TABLE {
+        return Some((Role::EngramTable, None));
+    }
     if name.starts_with("output") {
         return Some((Role::Head, None));
     }
@@ -83,6 +86,21 @@ fn role(name: &str, n_layer: usize) -> Option<(Role, Option<usize>)> {
         .map(|&(_, r)| (r, Some(layer)))
 }
 
+/// [`role`] in a file whose first Engram site is `first_site`: the
+/// concatenated table has no layer in its name and belongs to that site's
+/// layer, as a per-site table belongs to its own (placement holds a table to
+/// a layer). With no site it keeps no layer, which [`gathered_rows`] refuses.
+fn file_role(
+    name: &str,
+    n_layer: usize,
+    first_site: Option<usize>,
+) -> Option<(Role, Option<usize>)> {
+    match role(name, n_layer)? {
+        (Role::EngramTable, None) => Some((Role::EngramTable, first_site)),
+        r => Some(r),
+    }
+}
+
 /// The role of a model-level or layer tensor by its GGUF name, without a layer-count bound.
 #[must_use]
 pub fn tensor_role(name: &str) -> Option<Role> {
@@ -92,13 +110,17 @@ pub fn tensor_role(name: &str) -> Option<Role> {
 /// Every tensor of `split` with its role and header facts, and the model's
 /// layer and expert counts from `hp`, the file's [`Hparams`].
 pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementError> {
+    let first_site = hp
+        .engram
+        .as_ref()
+        .and_then(|e| e.layer_ids.first().copied());
     let mut model = classify_with(
         split,
-        |name| role(name, hp.n_layer),
+        |name| file_role(name, hp.n_layer, first_site),
         Counts::new(hp.n_layer, hp.experts.n_expert, hp.experts.n_used),
     )?;
     for t in &mut model.tensors {
-        t.gathered_rows = gathered_rows(split, t)?;
+        t.gathered_rows = gathered_rows(split, hp, t)?;
     }
     model.bf16_words = bf16_words;
     Ok(model)
@@ -119,40 +141,65 @@ fn bf16_words(t: &ModelTensor) -> bool {
 }
 
 /// Rows one token reads from a row-gathered table: one row of the token
-/// embedding and of a hash router's table; of an engram layer's table, as many rows as its `engram_wkv`
-/// takes in — that tensor's input width over the table's row width.
-fn gathered_rows(split: &Split, t: &ModelTensor) -> Result<Option<u64>, PlacementError> {
+/// embedding and of a hash router's table; of an engram table, as many rows
+/// as the projection of each site it holds takes in — that tensor's input
+/// width over the table's row width — summed over those sites (one for a
+/// per-site table, every site for the concatenated one). The table's layer
+/// is its first site's.
+fn gathered_rows(
+    split: &Split,
+    hp: &Hparams,
+    t: &ModelTensor,
+) -> Result<Option<u64>, PlacementError> {
     let refuse = |detail: String| PlacementError::Tensor {
         name: t.name.clone(),
         detail,
     };
-    match (t.role, t.layer) {
-        (Role::TokenEmbedding | Role::HashTable, _) => Ok(Some(1)),
-        (Role::EngramTable, Some(layer)) => {
-            let wkv = names::engram_wkv(layer);
-            let Some((_, w)) = split.find(&wkv) else {
-                return Err(refuse(format!("its layer has no {wkv}")));
-            };
-            let input = w.dims.first().copied().unwrap_or(0);
-            let width = t.dims.first().copied().unwrap_or(0);
-            if width == 0 || !input.is_multiple_of(width) {
-                return Err(refuse(format!(
-                    "rows of {width} values do not tile {wkv}'s input of {input}"
-                )));
-            }
-            Ok(Some(input / width))
-        }
-        (Role::EngramTable, None) => Err(refuse("an engram table outside a layer".to_string())),
-        _ => Ok(None),
+    if t.role != Role::EngramTable {
+        return Ok(matches!(t.role, Role::TokenEmbedding | Role::HashTable).then_some(1));
     }
+    let engram = hp
+        .engram
+        .as_ref()
+        .ok_or_else(|| refuse("an engram table in a model of no engram sites".to_string()))?;
+    let width = t.dims.first().copied().unwrap_or(0);
+    let held: Vec<usize> = engram
+        .layer_ids
+        .iter()
+        .copied()
+        .filter(|&l| {
+            engram
+                .tables
+                .site(l as u64)
+                .is_some_and(|s| s.tensor == t.name)
+        })
+        .collect();
+    if held.is_empty() || t.layer != Some(held[0]) {
+        return Err(refuse("holds the rows of no engram site".to_string()));
+    }
+    let mut rows = 0u64;
+    for layer in held {
+        let wkv = engram.wkv(layer);
+        let Some((_, w)) = split.find(&wkv) else {
+            return Err(refuse(format!("its site at layer {layer} has no {wkv}")));
+        };
+        let input = w.dims.first().copied().unwrap_or(0);
+        if width == 0 || !input.is_multiple_of(width) {
+            return Err(refuse(format!(
+                "rows of {width} values do not tile {wkv}'s input of {input}"
+            )));
+        }
+        rows += input / width;
+    }
+    Ok(Some(rows))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{bf16_words, role};
+    use super::{bf16_words, file_role, role};
     use crate::placement::{CardFormat, ModelTensor, ModelTensors, Role};
     use gguf::GgmlType;
-    use gguf::arch::deepseek41::HASH_TENSORS;
+    use gguf::arch::deepseek41::{CONCAT_TABLE, HASH_TENSORS};
 
     /// A BF16 compressor or indexer matrix loads in its words, where another
     /// BF16 attention matrix, a router and a gain load widened to f32.
@@ -246,6 +293,29 @@ mod tests {
         assert_eq!(
             role("blk.42.attn_q.weight", 43),
             Some((Role::Attention, Some(42)))
+        );
+    }
+
+    /// The concatenated Engram table belongs to the first site's layer, a
+    /// per-site table to its own; with no site the table keeps no layer.
+    /// Mutant: a concatenated table with no layer, which placement refuses.
+    #[test]
+    fn the_concatenated_table_takes_its_first_sites_layer() {
+        assert_eq!(
+            file_role(CONCAT_TABLE, 43, Some(1)),
+            Some((Role::EngramTable, Some(1)))
+        );
+        assert_eq!(
+            file_role("blk.14.engram_embd.weight", 43, Some(1)),
+            Some((Role::EngramTable, Some(14)))
+        );
+        assert_eq!(
+            file_role(CONCAT_TABLE, 43, None),
+            Some((Role::EngramTable, None))
+        );
+        assert_eq!(
+            file_role("blk.2.attn_q_a.weight", 43, Some(1)),
+            Some((Role::Attention, Some(2)))
         );
     }
 }
