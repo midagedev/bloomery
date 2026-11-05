@@ -684,3 +684,5 @@ generate_ds41   restore                                  0           0
 generate_ds41   routed_shared_residual                   0           0
 generate_ds41   sigmoid_floor_256_6_router               0           0
 generate_ds41   sigmoid_floor_256_6_router_pick          0           0
+# PIN(2026-11-06): attn_res_mix, a new entry (Kimi K3's AttnRes bank mix), at 0 spill and 0 JIT local bytes [derived: the sm_86 cc 8.6 scan's 0/0 (tools/ref/ptx-shapes.tsv)], until a scan on this table's arch and capability.
+generate_ds41 attn_res_mix 0 0

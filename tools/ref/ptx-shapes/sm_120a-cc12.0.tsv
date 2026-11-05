@@ -626,3 +626,5 @@ gate_qwen3vl_tower vis_row_op 0 0
 gate_qwen3vl_tower vis_silu_mul 0 0
 gate_qwen3vl_tower vis_silu_mul_clamp 0 0
 gate_qwen3vl_tower vis_unfold 0 0
+# PIN(2026-11-06): attn_res_mix, a new entry (Kimi K3's AttnRes bank mix), at 0 spill and 0 JIT local bytes [derived: the sm_86 cc 8.6 scan's 0/0 (tools/ref/ptx-shapes.tsv)], until a scan on this table's arch and capability.
+generate_ds41 attn_res_mix 0 0

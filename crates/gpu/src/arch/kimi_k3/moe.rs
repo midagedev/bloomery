@@ -104,16 +104,27 @@ impl MoeDims {
     }
 
     /// The `situ` rule the block's gate·up launches run.
-    fn rule(&self) -> Act {
+    pub(super) fn rule(&self) -> Act {
         Act::Situ {
             beta: self.situ_beta,
             linear_beta: self.situ_linear_beta,
         }
     }
 
+    /// The routed experts' shape: latent rows, the routed sum normed, the down stack's
+    /// activation form.
+    pub(super) fn shape(&self) -> RoutedShape {
+        RoutedShape {
+            expert_ff: self.expert_ff,
+            latent: Some(self.latent),
+            sum_norm: true,
+            down: DownAct::Q8Act,
+        }
+    }
+
     /// Whether the widths and the router fit what the block runs, else the refusal naming the
     /// one that does not.
-    fn check(&self) -> Result<(), GpuError> {
+    pub(super) fn check(&self) -> Result<(), GpuError> {
         let refuse = |what: &str, v: usize| {
             GpuError::shape(
                 WHAT,
@@ -184,6 +195,67 @@ impl<R: RouterEntry> Kern<R> {
     }
 }
 
+/// Layer `l`'s routed block of `file`'s resident weights `w` at `dims` (the sites, the router
+/// rows, the routed stacks, the latent pair and the sum norm, each held to its width and type),
+/// and the name of the layer's `ffn_norm`. Load-time only.
+pub(super) fn routed_of(
+    (file, w): (&Split, &Weights),
+    l: usize,
+    dims: &MoeDims,
+) -> Result<(Routed, String), GpuError> {
+    let MoeDims {
+        hidden: n,
+        latent,
+        shared_ff,
+        n_expert,
+        ..
+    } = *dims;
+    let site = |name: String, (rows, k): (usize, usize)| {
+        Site::of_file((file, w), WHAT, name, (rows, k), SITE_TYPES)
+    };
+    let glu = || -> Result<Glu, GpuError> {
+        Ok(Glu {
+            gate: site(names::ffn_gate_shexp(l), (shared_ff, n))?,
+            up: site(names::ffn_up_shexp(l), (shared_ff, n))?,
+            down: site(names::ffn_down_shexp(l), (n, shared_ff))?,
+            ff: shared_ff,
+        })
+    };
+    let router = names::ffn_gate_inp(l);
+    let got = w.f32_tensor(WHAT, &router)?;
+    if (got.rows(), got.cols()) != (n_expert, n) {
+        return Err(GpuError::shape(
+            WHAT,
+            format!(
+                "{router} is {} rows of {}: the router scores {n_expert} experts of the \
+                 {n}-wide row",
+                got.rows(),
+                got.cols()
+            ),
+        ));
+    }
+    let routed = Routed {
+        bias: site::vector(w, WHAT, names::exp_probs_b(l), n_expert)?,
+        router,
+        stacks: [
+            names::ffn_gate_exps(l),
+            names::ffn_up_exps(l),
+            names::ffn_down_exps(l),
+        ],
+        shared: glu().map_err(|e| layer_refusal(l, "the shared stack", &e))?,
+        latent: Some(Box::new(Latent {
+            down: site(names::ffn_routed_down(l), (latent, n))?,
+            up: site(names::ffn_routed_up(l), (n, latent))?,
+            width: latent,
+        })),
+        sum_norm: Some(site::vector(w, WHAT, names::ffn_routed_norm(l), latent)?),
+    };
+    // The stacks' types and shapes, refused here by name rather than at the first launch.
+    LegStacks::of_resident(w, routed.stacks.each_ref().map(String::as_str)).map(drop)?;
+    let norm = site::vector(w, WHAT, names::ffn_norm(l), n)?;
+    Ok((routed, norm))
+}
+
 /// One layer's block at one router instance.
 struct Block<R: RouterEntry> {
     dims: MoeDims,
@@ -210,54 +282,10 @@ impl<R: RouterEntry> Block<R> {
         let MoeDims {
             hidden: n,
             latent,
-            expert_ff,
             shared_ff,
-            n_expert,
             ..
         } = dims;
-        let site = |name: String, (rows, k): (usize, usize)| {
-            Site::of_file((file, w), WHAT, name, (rows, k), SITE_TYPES)
-        };
-        let glu = || -> Result<Glu, GpuError> {
-            Ok(Glu {
-                gate: site(names::ffn_gate_shexp(l), (shared_ff, n))?,
-                up: site(names::ffn_up_shexp(l), (shared_ff, n))?,
-                down: site(names::ffn_down_shexp(l), (n, shared_ff))?,
-                ff: shared_ff,
-            })
-        };
-        let router = names::ffn_gate_inp(l);
-        let got = w.f32_tensor(WHAT, &router)?;
-        if (got.rows(), got.cols()) != (n_expert, n) {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "{router} is {} rows of {}: the router scores {n_expert} experts of the \
-                     {n}-wide row",
-                    got.rows(),
-                    got.cols()
-                ),
-            ));
-        }
-        let routed = Routed {
-            bias: site::vector(w, WHAT, names::exp_probs_b(l), n_expert)?,
-            router,
-            stacks: [
-                names::ffn_gate_exps(l),
-                names::ffn_up_exps(l),
-                names::ffn_down_exps(l),
-            ],
-            shared: glu().map_err(|e| layer_refusal(l, "the shared stack", &e))?,
-            latent: Some(Box::new(Latent {
-                down: site(names::ffn_routed_down(l), (latent, n))?,
-                up: site(names::ffn_routed_up(l), (n, latent))?,
-                width: latent,
-            })),
-            sum_norm: Some(site::vector(w, WHAT, names::ffn_routed_norm(l), latent)?),
-        };
-        // The stacks' types and shapes, refused here by name rather than at the first launch.
-        LegStacks::of_resident(w, routed.stacks.each_ref().map(String::as_str)).map(drop)?;
-        let norm = site::vector(w, WHAT, names::ffn_norm(l), n)?;
+        let (routed, norm) = routed_of((file, w), l, &dims)?;
         let ffn = Ffn::Routed(routed);
         let sites = match &ffn {
             Ffn::Routed(r) => r.sites(),
@@ -265,12 +293,7 @@ impl<R: RouterEntry> Block<R> {
         };
         let mut acts = Acts::new(stream, sites.iter().copied())?;
         add_row_forms(stream, &mut acts, sites.iter().copied())?;
-        let shape = RoutedShape {
-            expert_ff,
-            latent: Some(latent),
-            sum_norm: true,
-            down: DownAct::Q8Act,
-        };
+        let shape = dims.shape();
         let wide = n.max(latent).max(shared_ff);
         Ok(Block {
             dims,

@@ -706,3 +706,5 @@ gate_qwen3vl_tower   vis_unfold                         0           0
 # PIN(2026-10-17): mamba2_conv_rows measured spill=0 jit_local=0 by gate-ptx-spill s-job of the same tree: a flat one-thread-one-item pre-pass, no arrays held across calls.
 # PIN(2026-11-04): mxfp8_gemv_ids in generate_ds41 down to spill 16, jit_local 8 on sm_86 (#1154, 6490d03f3: the
 # MXFP8 planes take ceil(K/128) scale words; the gate read both columns below their pins).
+
+generate_ds41   attn_res_mix                             0           0

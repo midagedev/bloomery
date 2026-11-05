@@ -865,3 +865,8 @@ name = "gate_kimi_k3_mla"
 [[bin]]
 name = "gate_kimi_k3_moe"
 required-features = ["gpu"]
+
+# kimik3-body: Kimi K3's decode step (the delta and gated latent layers, the latent MoE blocks, the AttnRes mixes, the head) over the fixture file against mainline llama.cpp's node dumps of it.
+[[bin]]
+name = "gate_kimi_k3_e2e"
+required-features = ["gpu"]
