@@ -261,3 +261,4 @@ gate-gpu-kimik3-mla	family	kimi-k3	kernel	attn_latent_mla
 gate-gpu-kimik3-kda	family	kimi-k3	kernel	attn_linear_gdn_kda
 gate-gpu-kimik3-moe	family	kimi-k3	kernel	tier_legs+moe_route+quant_iq+quant_q6k+elem_kernels
 gate-gpu-kimik3-e2e	family	kimi-k3	e2e	graph_fault+attn_linear_gdn_kda+attn_latent_mla+moe_route+attn_res+elem_kernels
+gate-gpu-kimik3-pp	family	kimi-k3	e2e	prompt_walks+attn_linear_gdn_kda+attn_latent_mla+moe_route+attn_res+elem_kernels

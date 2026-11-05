@@ -11,15 +11,19 @@
 //! - the output projection `attn_output` (Q6_K);
 //! - no write gate: the rule is the erase gate alone, so the mixer takes no write rows.
 //!
-//! [`step`] runs one row of the layer. The three conv tap sets are joined in q, k, v order at
+//! [`step`] runs one row of the layer, [`rows`] a pass of up to [`PASS_ROWS`]: each row the
+//! step's bits, the K-quant sites through one q8_1 form of the rows (q, k and v stacked
+//! row-major in the pass's stage and laid into the joined rows by one copy), a site with no
+//! m-column launch on each row's window. The three conv tap sets are joined in q, k, v order at
 //! load ([`derive`]).
 
 use crate::arch::hybrid::{Acts, GqaCx, Site};
+use crate::arch::rows_kit::{RowsKit, has_columns, kgemv_rows, order, project_rows};
 use crate::linear::mixer_kda::{
     self, KdaBufs, KdaDecay, KdaDims, KdaFile, KdaIn, KdaProj, KdaRule, KdaState, KdaVecs,
 };
-use crate::linear::{CONV_TAPS, HEAD, LinearKernels, LinearShape};
-use crate::site::{self, Form, SiteTy};
+use crate::linear::{CONV_TAPS, HEAD, LinearKernels, LinearShape, PASS_ROWS};
+use crate::site::{self, Form, Order, SiteTy};
 use crate::tensor::WindowMut;
 use crate::weights::Weights;
 use crate::{Gpu, GpuError};
@@ -255,4 +259,133 @@ pub(super) fn step(
         acts,
     };
     mixer_kda::enqueue(gpu, gpu.stream(), k, &mut proj, (l, 1, d), &vecs, st, bufs)
+}
+
+/// A pass's projections of one delta layer over 2 to [`PASS_ROWS`] rows: the step's sites, forms
+/// and context, and the pass's kit.
+struct Rows<'a, 'k> {
+    cx: &'a GqaCx<'a>,
+    sites: &'a KdaSites,
+    shape: LinearShape,
+    acts: &'a mut Acts,
+    kit: &'a mut RowsKit<'k>,
+}
+
+impl KdaProj for Rows<'_, '_> {
+    /// [`Step::input`]'s projections over the pass's `m` rows: the K-quant sites through one
+    /// q8_1 form of the normed rows, q, k and v stacked row-major in the stage and laid into the
+    /// joined rows by one copy, `z`, β's raw rows and `fa` each token-major ([`project_rows`]),
+    /// then `f = f_b · fa`. A q, k or v that is not an m-column row-major K-quant is refused by
+    /// name.
+    fn input(
+        &mut self,
+        gpu: &Gpu,
+        l: usize,
+        m: usize,
+        xn: &DeviceBuffer<f32>,
+        mut y: KdaIn<'_>,
+    ) -> Result<(), GpuError> {
+        let (cx, s, shape) = (self.cx, self.sites, self.shape);
+        let (qk, v) = (shape.n_k * HEAD, shape.n_v * HEAD);
+        let joined = [(&s.qkv[0], qk), (&s.qkv[1], qk), (&s.qkv[2], v)];
+        if let Some((t, _)) = joined
+            .iter()
+            .find(|(t, _)| order(t) != Some(Order::RowMajor) || !has_columns(t))
+        {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "layer {l}: a pass of {m} rows stacks q, k and v as row-major K-quants with an \
+                     m-column launch; {} is {} at {} values a row",
+                    t.name(),
+                    t.ty(),
+                    t.k()
+                ),
+            ));
+        }
+        let all = s.sites();
+        let rest = &all[3..6];
+        let rows_of = [v, shape.n_v, HEAD];
+        let shared = |t: &Site| t.ty().reads() == Form::Q8x128 && has_columns(t);
+        {
+            let act = self.acts.q8_1_at(WHAT, cx.hidden, m)?;
+            gpu.enqueue_quantize_q8_1_layer(xn, act, l)?;
+            let mut at = 0;
+            for (t, rows) in joined {
+                let mut win = WindowMut::<f32>::of_mut(&mut *self.kit.stage, 4 * at, rows * m)?;
+                t.kgemv(cx, act, l, &mut win)?;
+                at += rows * m;
+            }
+            self.kit
+                .rows
+                .tm
+                .enqueue(gpu.stream(), self.kit.stage, shape.channels(), m, y.qkv)?;
+            for (i, t) in rest.iter().enumerate().filter(|(_, t)| shared(t)) {
+                let mut win = window(&mut y, 3 + i, shape)?;
+                kgemv_rows(cx, self.kit, (t, rows_of[i]), act, l, &mut win)?;
+            }
+        }
+        for (i, t) in rest.iter().enumerate().filter(|(_, t)| !shared(t)) {
+            let mut win = window(&mut y, 3 + i, shape)?;
+            let at = (l, m);
+            project_rows(cx, self.kit, self.acts, at, (t, rows_of[i]), xn, &mut win)?;
+        }
+        project_rows(cx, self.kit, self.acts, (l, m), (&s.f_b, v), y.fa, y.f)
+    }
+
+    /// `out = o_proj · gated` over the pass's rows ([`project_rows`]).
+    fn output(
+        &mut self,
+        _gpu: &Gpu,
+        l: usize,
+        m: usize,
+        gated: &DeviceBuffer<f32>,
+        out: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let t = (&self.sites.out, self.cx.hidden);
+        project_rows(self.cx, self.kit, self.acts, (l, m), t, gated, out)
+    }
+}
+
+/// f32s of the stage a delta layer's pass of up to [`PASS_ROWS`] rows writes: the joined
+/// channels (or the model width, if wider) of every row.
+#[must_use]
+pub(super) fn stage_len(d: &KdaDims) -> usize {
+    PASS_ROWS * d.shape.channels().max(d.embd)
+}
+
+/// Enqueue delta layer `l` over a pass of `m` rows, 1 to [`PASS_ROWS`], in position order:
+/// `bufs.x` the rows' inputs token-major, `bufs.pos` their positions (`pos[t] = pos[0] + t`),
+/// `bufs.out` the rows' updates, every buffer of `bufs` at least `m` rows of its width; the store
+/// `st` is read and written in place, each row the step's bits. One row is [`step`]; a count past
+/// [`PASS_ROWS`] is refused by name. `d` is [`dims`]'s.
+pub(super) fn rows(
+    cx: &GqaCx<'_>,
+    mut kit: RowsKit<'_>,
+    acts: &mut Acts,
+    sites: &KdaSites,
+    (l, d, m): (usize, &KdaDims, usize),
+    st: KdaState<'_>,
+    bufs: KdaBufs<'_>,
+) -> Result<(), GpuError> {
+    let k = kit.linear;
+    if m == 1 {
+        return step(cx, k, acts, sites, (l, d), st, bufs);
+    }
+    if !(2..=PASS_ROWS).contains(&m) {
+        return Err(GpuError::shape(
+            WHAT,
+            format!("layer {l}: a pass of {m} rows; a pass runs 1 to {PASS_ROWS}"),
+        ));
+    }
+    let gpu = cx.gpu;
+    let vecs = sites.vecs(cx.w)?;
+    let mut proj = Rows {
+        cx,
+        sites,
+        shape: d.shape,
+        acts,
+        kit: &mut kit,
+    };
+    mixer_kda::enqueue(gpu, gpu.stream(), k, &mut proj, (l, m, d), &vecs, st, bufs)
 }

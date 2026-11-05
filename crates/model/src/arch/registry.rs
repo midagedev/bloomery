@@ -401,7 +401,7 @@ pub static ROWS: &[ArchRow] = &[
         names: &["kimi-k3"],
         read: Some(kimi_k3::spec::read),
         draft: None,
-        coverage: None,
+        coverage: Some(kimi_k3::spec::AVAILABLE),
         fixture: Some(Fixture::Gguf(FixtureRow {
             family: "kimik3",
             repo: "unsloth/Kimi-K3-GGUF",

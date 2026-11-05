@@ -4,13 +4,14 @@
 //! one owner) lays the rows token-major; the f32 and q8_0 sites' m-column launches write token-major
 //! straight in. [`project_rows`] runs a site over a pass's rows, [`kgemv_rows`] a K-quant site
 //! over rows already in q8_1 form, and each column is the site's one-column launch on that row
-//! bit for bit.
+//! bit for bit. A site with no m-column launch ([`has_columns`]) runs its one-row launch on each
+//! row's window.
 
 use crate::GpuError;
 use crate::arch::hybrid::{Acts, GqaCx, Site};
 use crate::linear::{LinearKernels, PASS_ROWS};
-use crate::site::{self, Form, Order};
-use crate::tensor::{Q8Act, WindowMut};
+use crate::site::{self, Form, Order, SiteTy};
+use crate::tensor::{Q8Act, Window, WindowMut};
 use crate::token_major::TokenMajor;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use std::sync::Arc;
@@ -106,10 +107,26 @@ pub(crate) fn kgemv_rows(
     }
 }
 
+/// Whether site `t` runs over several rows in one launch: the f32 rows' gemv,
+/// or a K-quant's m-column gemv. Not a Q6_K row of an odd super-block count,
+/// which `site::kgemv` runs one column at a launch, nor the Q5_0 form.
+pub(crate) fn has_columns(t: &Site) -> bool {
+    match t.ty().reads() {
+        Form::F32 | Form::Q8x32 => true,
+        Form::Q8x128 => {
+            let odd_q6k = matches!(t.ty(), SiteTy::Q6K) && (t.k() / 256) % 2 == 1;
+            site::kgemv_order(t.ty()).is_some() && !odd_q6k
+        }
+        Form::Q8Blocks32 => false,
+    }
+}
+
 /// `y = W · x` for site `t` over the `m` token-major rows of `x`, its `rows`
-/// outputs of each row token-major into `y`: the gemv arm's m-column launch,
-/// or a K-quant's gemv over `x`'s q8_1 form of `m` columns ([`kgemv_rows`]).
-/// Each column is the site's one-column launch on that row bit for bit.
+/// outputs of each row token-major into `y`: a site that [`has_columns`] in
+/// one launch over the rows (the gemv arm's m-column launch, or a K-quant's
+/// gemv over `x`'s q8_1 form of `m` columns, [`kgemv_rows`]), any other the
+/// one-row launch on each row's window. Each row is the site's one-row
+/// [`Site::project`] bit for bit; at one row it is [`Site::project`].
 pub(crate) fn project_rows(
     cx: &GqaCx<'_>,
     kit: &mut RowsKit<'_>,
@@ -119,6 +136,18 @@ pub(crate) fn project_rows(
     x: &DeviceBuffer<f32>,
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
+    if m == 1 {
+        return t.project(cx, acts, l, x, y);
+    }
+    if !has_columns(t) {
+        let (k, f) = (t.k(), size_of::<f32>());
+        for r in 0..m {
+            let xr = Window::<f32>::of(x, r * k * f, k)?;
+            let mut yr = WindowMut::<f32>::of_mut(y, r * rows * f, rows)?;
+            t.project(cx, acts, l, &xr, &mut yr)?;
+        }
+        return Ok(());
+    }
     match t.ty().reads() {
         Form::F32 | Form::Q8x32 => site::gemv(cx.gpu, cx.g32, (t.ty(), cx.w, t.name()), x, m, y),
         Form::Q8x128 => {

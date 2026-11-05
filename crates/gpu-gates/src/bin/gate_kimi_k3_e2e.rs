@@ -4,11 +4,11 @@
 //! a dense delta layer, a routed delta layer, a routed latent layer, a routed delta layer; hidden
 //! 512, an attn_res block of 2), one prompt id a step, against mainline llama.cpp's CPU node dumps
 //! of that fixture (refset family `fx-lcpp-kimi-k3`, `BLOOMERY_TIER=fixture just dump-ref-kimi-k3`).
-//! The model opens through `GpuModel<Body>::open`: `generate` opens K3 once the Program wiring
-//! exists (round kimik3place), and this gate does not wait for it.
+//! The model opens through `GpuModel<Body>::open`, the whole-card load `generate_kimi_k3` runs.
 //!
-//! The fixture tier only: the real file (594 GB) does not fit one card and its placement is not
-//! wired, so the real tier ends by name before anything loads.
+//! The fixture tier only: the real file (594 GB) does not fit one card and the body has no placed
+//! load (two stage cards, the host and the NVMe tier), so the real tier ends by name before
+//! anything loads.
 //!
 //! For each prompt set of [`SETS`] (an English paragraph, a Korean one, a Rust function head and a
 //! five-id question), against the vendor's node dumps:
@@ -40,10 +40,14 @@
 //!   stores and the latent caches, is back where the load left it).
 //! - `graph_is_eager`: the steps in graph mode (the chain captured once and replayed) give the
 //!   eager chain's ids and last logits row bit for bit.
+//! - `generate_matches_the_gate`: `generate_kimi_k3` (built beside this gate, its own process and
+//!   load, graph mode) over set `d`'s prompt ids prints the ids this gate's own steps give from
+//!   the same ids (the prompt one id a step, then each id fed back), 8 of them, and the line
+//!   prints where they and the vendor's greedy table part.
 //! - `mix_matches_host`: the AttnRes mix kernel against a host f64 mix of its definition at the
 //!   fixture's width (1, 2 and 15 banks) and the real file's (7168, 8 banks), within [`MIX_BAND`].
 //! - `mix_rows_are_steps`: a pass of 8 rows is 8 one-row mixes bit for bit. This is the mix kernel
-//!   alone: the body has no rows pass (the prompt batch is round kimik3pp's).
+//!   alone; the body's rows pass is `gate_kimi_k3_pp`'s.
 //! - `mix_is_the_mix`: the stream alone in place of the mix (the mix dropped) lies past [`SEP`]
 //!   bands of the kernel's output.
 //! - `mix_refused`: a row or width of 0, more than 16 vectors, a stride under a pass's rows, an
@@ -110,7 +114,7 @@ mod gate {
     use bloomery_gpu_gates::prompts::{GreedyRow, MARGIN_FLOOR, compare_forced, std_normal_cdf};
     use bloomery_gpu_gates::tier::{self, Tag, Tier};
     use bloomery_gpu_gates::{
-        GateError, GateRng, RefManifest, bits_equal, checks_failed, open_split,
+        GateError, GateRng, RefManifest, beside, bits_equal, checks_failed, open_split,
         ref_tensor_logical_in, topk_ids_logical_within, verdict,
     };
     use cuda_core::DeviceBuffer;
@@ -613,6 +617,71 @@ mod gate {
         Ok(pass)
     }
 
+    /// The ids after `ids` that [`generate_matches_the_gate`] asks `generate_kimi_k3` for.
+    const GENERATE_IDS: usize = 8;
+
+    /// The `ids [..]` line `generate_kimi_k3` prints, as ids.
+    fn printed_ids(stdout: &str) -> Result<Vec<u32>, GateError> {
+        let line = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("ids ["))
+            .ok_or_else(|| format!("generate_kimi_k3 printed no ids line:\n{stdout}"))?;
+        let body = line
+            .strip_suffix(']')
+            .ok_or_else(|| format!("generate_kimi_k3's ids line is not a list: {line}"))?;
+        body.split(',')
+            .map(|t| t.trim().parse::<u32>().map_err(GateError::from))
+            .collect()
+    }
+
+    /// Clause `generate_matches_the_gate`: `generate_kimi_k3` over set `s`'s prompt ids gives the
+    /// ids this gate's own steps give from the same ids in graph mode, [`GENERATE_IDS`] of them;
+    /// the line prints the vendor's greedy table beside them and where the two part.
+    fn generate_matches_the_gate(m: &mut GpuModel<Body>, s: &Set) -> Result<bool, GateError> {
+        m.set_mode(StepMode::Graph);
+        m.reset()?;
+        let mut ours = vec![m.step(&s.prompt)?];
+        while ours.len() < GENERATE_IDS {
+            let last = ours[ours.len() - 1];
+            ours.push(m.step(&[last])?);
+        }
+        m.set_mode(StepMode::Eager);
+        let prompt = s
+            .prompt
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let bin = beside("generate_kimi_k3")?;
+        let out = std::process::Command::new(&bin)
+            .args(["--tokens", &prompt])
+            .args(["-n", &GENERATE_IDS.to_string()])
+            .args(["--ctx", &CTX.to_string(), "--place", "a"])
+            .output()
+            .map_err(|e| format!("{}: {e}", bin.display()))?;
+        if !out.status.success() {
+            return Err(format!(
+                "{} ended {}:\n{}",
+                bin.display(),
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            )
+            .into());
+        }
+        let printed = printed_ids(&String::from_utf8_lossy(&out.stdout))?;
+        let vendor = &s.greedy.ids[..GENERATE_IDS.min(s.greedy.ids.len())];
+        let parts_at = ours.iter().zip(vendor).position(|(a, b)| a != b);
+        let pass = printed == ours;
+        println!(
+            "generate_matches_the_gate set={} generate={printed:?} gate={ours:?} vendor={vendor:?} \
+             parts_from_vendor_at={parts_at:?} vendor_margin_there={:?} {}",
+            s.name,
+            parts_at.map(|i| s.greedy.margins[i]),
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
     // ------------------------------------------------------------------ the AttnRes mix
 
     /// One synthetic mix: `n_banks` banks and the stream, `m` rows of `n`.
@@ -877,9 +946,8 @@ mod gate {
     pub fn run() -> Result<(), GateError> {
         if Tier::from_env()? != Tier::Fixture {
             return Err(format!(
-                "{NAME}: the real file's placement is not wired (the Program wiring is round \
-                 kimik3place's), so the gate runs the fixture tier: BLOOMERY_TIER=fixture just \
-                 {RECIPE}"
+                "{NAME}: the real file (594 GB) does not fit one card and the body has no placed \
+                 load, so the gate runs the fixture tier: BLOOMERY_TIER=fixture just {RECIPE}"
             )
             .into());
         }
@@ -921,6 +989,7 @@ mod gate {
         tier::expect_fixture_oracle(NAME, FX_ORACLE)?;
         ok &= steps_are_deterministic(&mut m, (&sets[0], &sets[1]))?;
         ok &= graph_is_eager(&mut m, &sets[3])?;
+        ok &= generate_matches_the_gate(&mut m, &sets[3])?;
         ok &= mix_clauses(m.gpu())?;
         println!("{}", tier::tally_line());
         if !ok {

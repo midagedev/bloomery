@@ -44,6 +44,10 @@ pub struct Available {
     pub runs: fn(&Need) -> bool,
 }
 
+/// The programs whose trunk mixes delta layers and gated latent layers over the situ GLU blocks and
+/// the card leg's routed stacks: each runs the rows and type pins that trunk needs alike.
+const LATENT_TRUNK: &[Program] = &[Program::Raon1Body, Program::KimiK3Body];
+
 /// Everything the programs run that a [`Need`] names, beside the rows a
 /// family's own code keeps ([`rows`]). A need no row covers is an item of
 /// [`check`]; a row removed makes its needs items.
@@ -803,7 +807,7 @@ pub const AVAILABLE: &[Available] = &[
         },
     },
     Available {
-        programs: &[Program::Raon1Body],
+        programs: LATENT_TRUNK,
         at: "gpu/src/arch/gated_mla.rs (the absorbed heads over gpu/src/latent.rs LATENT, \
              latent_extra_rms_append)",
         runs: |n| {
@@ -818,23 +822,23 @@ pub const AVAILABLE: &[Available] = &[
         },
     },
     Available {
-        programs: &[Program::Raon1Body],
+        programs: LATENT_TRUNK,
         at: "gpu/src/latent.rs latent_extra_rms_append (the extra values first, raw, at most 128)",
         runs: |n| matches!(n, Need::LatentPe { width } if (1..=128).contains(width)),
     },
     Available {
-        programs: &[Program::Raon1Body],
+        programs: LATENT_TRUNK,
         at: "gpu/src/arch/gated_mla.rs (attn_gate, then gpu/src/linear/out_gate.rs)",
         runs: |n| matches!(n, Need::LatentOutGate),
     },
     Available {
-        programs: &[Program::Raon1Body],
+        programs: LATENT_TRUNK,
         at: "gpu/src/arch/routed_ffn.rs Glu (the gate and up sites, gpu/src/elem.rs enqueue_situ, the \
              down site)",
         runs: |n| matches!(n, Need::Situ { ff } if ff.is_multiple_of(32)),
     },
     Available {
-        programs: &[Program::Raon1Body],
+        programs: LATENT_TRUNK,
         at: "gpu/src/arch/routed_ffn.rs (the card leg's gate·up `_sel` under kquant::Act::Situ, \
              SITU_LINEAR_BETA)",
         runs: |n| {
@@ -848,7 +852,7 @@ pub const AVAILABLE: &[Available] = &[
         },
     },
     Available {
-        programs: &[Program::Raon1Body],
+        programs: LATENT_TRUNK,
         at: "gpu/src/arch/routed_ffn.rs Routed.shared (the shared expert's Glu block, added after \
              the routed sum)",
         runs: |n| {
@@ -862,7 +866,7 @@ pub const AVAILABLE: &[Available] = &[
         },
     },
     Available {
-        programs: &[Program::Raon1Body],
+        programs: LATENT_TRUNK,
         at: "gpu/src/arch/routed_ffn.rs Routed.shared (gpu/src/elem.rs enqueue_situ between the \
              shared expert's gate·up and down sites, SITU_LINEAR_BETA)",
         runs: |n| {
@@ -889,12 +893,12 @@ pub const AVAILABLE: &[Available] = &[
         },
     },
     Available {
-        programs: &[Program::Raon1Body],
+        programs: LATENT_TRUNK,
         at: "gpu/src/arch/raon1/body.rs Mixer::Rda (the state, the stamp and the conv ring, one lane)",
         runs: |n| matches!(n, Need::RecurrentState),
     },
     Available {
-        programs: &[Program::Raon1Body],
+        programs: LATENT_TRUNK,
         at: "gpu/src/arch/raon1/body.rs Mixer (a delta or a latent mixer per layer's kind)",
         runs: |n| matches!(n, Need::MixedTrunk),
     },
@@ -1592,7 +1596,7 @@ const RAON1_FFN: &[GgmlType] = &[
 /// rows: the types it reads are those `row` takes, so a type the table gains
 /// is admitted with no edit here.
 struct RowPin {
-    program: Program,
+    programs: &'static [Program],
     role: Role,
     /// As [`TypePin::matrices`].
     matrices: bool,
@@ -1618,7 +1622,7 @@ struct RowPin {
 /// types its row takes or the table row it follows.
 const ROW_PINS: &[RowPin] = &[
     RowPin {
-        program: Program::FlintBody,
+        programs: &[Program::FlintBody],
         role: Role::Attention,
         matrices: true,
         names: None,
@@ -1626,7 +1630,7 @@ const ROW_PINS: &[RowPin] = &[
         row: h128_projection,
     },
     RowPin {
-        program: Program::FlintBody,
+        programs: &[Program::FlintBody],
         role: Role::DenseFfn,
         matrices: true,
         names: None,
@@ -1634,7 +1638,7 @@ const ROW_PINS: &[RowPin] = &[
         row: gated_block_site,
     },
     RowPin {
-        program: Program::FlintBody,
+        programs: &[Program::FlintBody],
         role: Role::SharedExpert,
         matrices: true,
         names: None,
@@ -1642,7 +1646,7 @@ const ROW_PINS: &[RowPin] = &[
         row: gated_block_site,
     },
     RowPin {
-        program: Program::FlintBody,
+        programs: &[Program::FlintBody],
         role: Role::TokenEmbedding,
         matrices: true,
         names: None,
@@ -1650,7 +1654,7 @@ const ROW_PINS: &[RowPin] = &[
         row: |ty| embed_of_widened(ty).is_some(),
     },
     RowPin {
-        program: Program::FlintBody,
+        programs: &[Program::FlintBody],
         role: Role::Head,
         matrices: true,
         names: None,
@@ -1664,7 +1668,7 @@ const ROW_PINS: &[RowPin] = &[
     // `gate_qwen4exp_e2e` runs on the fixture variant `q38dense`. The shared expert's down has K = 640, not whole
     // super-blocks of 256, so no q8_1 family reads it: its own pin keeps the f32-row types.
     RowPin {
-        program: Program::Qwen38Body,
+        programs: &[Program::Qwen38Body],
         role: Role::Attention,
         matrices: true,
         names: None,
@@ -1672,7 +1676,7 @@ const ROW_PINS: &[RowPin] = &[
         row: |ty| dense_projected(ty).is_some(),
     },
     RowPin {
-        program: Program::Qwen38Body,
+        programs: &[Program::Qwen38Body],
         role: Role::SharedExpert,
         matrices: true,
         names: None,
@@ -1680,7 +1684,7 @@ const ROW_PINS: &[RowPin] = &[
         row: |ty| dense_projected(ty).is_some(),
     },
     RowPin {
-        program: Program::Qwen38Body,
+        programs: &[Program::Qwen38Body],
         role: Role::SharedExpert,
         matrices: true,
         names: Some(|n| n.ends_with(".ffn_down_shexp.weight")),
@@ -1692,7 +1696,7 @@ const ROW_PINS: &[RowPin] = &[
     // q8_0 alone; each type is a launch of `site.rs`, which the family's e2e
     // gate runs on its mixer fixture variants.
     RowPin {
-        program: Program::Glm5nextBody,
+        programs: &[Program::Glm5nextBody],
         role: Role::Attention,
         matrices: true,
         names: Some(|n| {
@@ -1708,7 +1712,7 @@ const ROW_PINS: &[RowPin] = &[
     // read, so these two rows keep BF16 where the qwen3moe body's
     // (`head_of_widened`, `embed_of_widened`) do not.
     RowPin {
-        program: Program::Qwen38Body,
+        programs: &[Program::Qwen38Body],
         role: Role::Head,
         matrices: true,
         names: None,
@@ -1716,7 +1720,7 @@ const ROW_PINS: &[RowPin] = &[
         row: |ty| crate::placement::kernels::head(ty).is_some(),
     },
     RowPin {
-        program: Program::Qwen38Body,
+        programs: &[Program::Qwen38Body],
         role: Role::TokenEmbedding,
         matrices: true,
         names: None,
@@ -1724,7 +1728,7 @@ const ROW_PINS: &[RowPin] = &[
         row: |ty| crate::placement::kernels::embed(ty).is_some(),
     },
     RowPin {
-        program: Program::Qwen3moeBody,
+        programs: &[Program::Qwen3moeBody],
         role: Role::Attention,
         matrices: true,
         names: None,
@@ -1732,7 +1736,7 @@ const ROW_PINS: &[RowPin] = &[
         row: |ty| qwen3moe_dense(ty).is_some(),
     },
     RowPin {
-        program: Program::Qwen3moeBody,
+        programs: &[Program::Qwen3moeBody],
         role: Role::Head,
         matrices: true,
         names: None,
@@ -1740,7 +1744,7 @@ const ROW_PINS: &[RowPin] = &[
         row: |ty| head_of_widened(ty).is_some(),
     },
     RowPin {
-        program: Program::Qwen3moeBody,
+        programs: &[Program::Qwen3moeBody],
         role: Role::TokenEmbedding,
         matrices: true,
         names: None,
@@ -1748,7 +1752,7 @@ const ROW_PINS: &[RowPin] = &[
         row: |ty| embed_of_widened(ty).is_some(),
     },
     RowPin {
-        program: Program::Glm5nextBody,
+        programs: &[Program::Glm5nextBody],
         role: Role::TokenEmbedding,
         matrices: true,
         names: None,
@@ -1756,7 +1760,7 @@ const ROW_PINS: &[RowPin] = &[
         row: GgmlType::has_dequant,
     },
     RowPin {
-        program: Program::Mimo2Body,
+        programs: &[Program::Mimo2Body],
         role: Role::TokenEmbedding,
         matrices: true,
         names: None,
@@ -1764,7 +1768,7 @@ const ROW_PINS: &[RowPin] = &[
         row: GgmlType::has_dequant,
     },
     RowPin {
-        program: Program::Solar2Body,
+        programs: &[Program::Solar2Body],
         role: Role::TokenEmbedding,
         matrices: true,
         names: None,
@@ -1772,7 +1776,7 @@ const ROW_PINS: &[RowPin] = &[
         row: GgmlType::has_dequant,
     },
     RowPin {
-        program: Program::GemmaEmbedding2Body,
+        programs: &[Program::GemmaEmbedding2Body],
         role: Role::TokenEmbedding,
         matrices: true,
         names: None,
@@ -1780,7 +1784,7 @@ const ROW_PINS: &[RowPin] = &[
         row: GgmlType::has_dequant,
     },
     RowPin {
-        program: Program::GemmaEmbedding2Body,
+        programs: &[Program::GemmaEmbedding2Body],
         role: Role::EngramDense,
         matrices: true,
         names: Some(per_layer_model_proj),
@@ -1788,7 +1792,7 @@ const ROW_PINS: &[RowPin] = &[
         row: GgmlType::has_dequant,
     },
     RowPin {
-        program: Program::Qwen3moeBody,
+        programs: &[Program::Qwen3moeBody],
         role: Role::RoutedExperts,
         matrices: true,
         names: Some(routed_gate_up),
@@ -1796,7 +1800,7 @@ const ROW_PINS: &[RowPin] = &[
         row: prompt_leg_gate_up,
     },
     RowPin {
-        program: Program::Qwen3moeBody,
+        programs: &[Program::Qwen3moeBody],
         role: Role::RoutedExperts,
         matrices: true,
         names: Some(routed_down),
@@ -1804,7 +1808,7 @@ const ROW_PINS: &[RowPin] = &[
         row: prompt_leg_down,
     },
     RowPin {
-        program: Program::Qwen35Body,
+        programs: &[Program::Qwen35Body],
         role: Role::SharedExpert,
         matrices: true,
         names: None,
@@ -1812,7 +1816,7 @@ const ROW_PINS: &[RowPin] = &[
         row: |ty| qwen35_shared(ty).is_some(),
     },
     RowPin {
-        program: Program::Qwen35Body,
+        programs: &[Program::Qwen35Body],
         role: Role::RoutedExperts,
         matrices: true,
         names: Some(routed_gate_up),
@@ -1820,7 +1824,7 @@ const ROW_PINS: &[RowPin] = &[
         row: prompt_leg_gate_up,
     },
     RowPin {
-        program: Program::Qwen35Body,
+        programs: &[Program::Qwen35Body],
         role: Role::RoutedExperts,
         matrices: true,
         names: Some(routed_down),
@@ -1828,7 +1832,7 @@ const ROW_PINS: &[RowPin] = &[
         row: prompt_leg_down,
     },
     RowPin {
-        program: Program::Raon1Body,
+        programs: LATENT_TRUNK,
         role: Role::Head,
         matrices: true,
         names: None,
@@ -1836,7 +1840,7 @@ const ROW_PINS: &[RowPin] = &[
         row: |ty| head_of_widened(ty).is_some(),
     },
     RowPin {
-        program: Program::Raon1Body,
+        programs: LATENT_TRUNK,
         role: Role::TokenEmbedding,
         matrices: true,
         names: None,
@@ -1844,7 +1848,7 @@ const ROW_PINS: &[RowPin] = &[
         row: |ty| embed_of_widened(ty).is_some(),
     },
     RowPin {
-        program: Program::Raon1Body,
+        programs: LATENT_TRUNK,
         role: Role::RoutedExperts,
         matrices: true,
         names: Some(routed_gate_up),
@@ -1852,7 +1856,7 @@ const ROW_PINS: &[RowPin] = &[
         row: crate::placement::kernels::card_gate_up_runs,
     },
     RowPin {
-        program: Program::Raon1Body,
+        programs: LATENT_TRUNK,
         role: Role::RoutedExperts,
         matrices: true,
         names: Some(routed_down),
@@ -1860,7 +1864,7 @@ const ROW_PINS: &[RowPin] = &[
         row: resident_down_runs,
     },
     RowPin {
-        program: Program::NemotronHMoeBody,
+        programs: &[Program::NemotronHMoeBody],
         role: Role::SharedExpert,
         matrices: false,
         names: None,
@@ -1869,7 +1873,7 @@ const ROW_PINS: &[RowPin] = &[
         row: |ty| ty == BOLT_LEG || ty == GgmlType::Q8_0 || ty == GgmlType::NVFP4,
     },
     RowPin {
-        program: Program::MuseSparkBody,
+        programs: &[Program::MuseSparkBody],
         role: Role::TokenEmbedding,
         matrices: true,
         names: None,
@@ -2077,14 +2081,7 @@ fn weight_formats(program: Option<Program>, t: &ModelTensor) -> Vec<Need> {
         .chain(
             ROW_PINS
                 .iter()
-                .filter(|pin| {
-                    takes(
-                        std::slice::from_ref(&pin.program),
-                        pin.role,
-                        pin.matrices,
-                        pin.names,
-                    )
-                })
+                .filter(|pin| takes(pin.programs, pin.role, pin.matrices, pin.names))
                 .map(|pin| (pin.what, (pin.row)(t.ty))),
         )
         .collect();
@@ -2253,6 +2250,7 @@ fn check_for(
                 // by name and part (the default expert rule's card formats
                 // would pass q3_K and q6_K gate·up to the load's refusal).
                 Some(Program::Qwen3moeBody | Program::Qwen35Body | Program::Raon1Body) => {}
+                Some(Program::KimiK3Body) => {}
                 // These bodies are dense: a routed stack is an item.
                 Some(Program::NemotronHBody | Program::GemmaEmbedding2Body) => {
                     at(t.layer, Need::RoutedFormat(t.ty));
@@ -2753,11 +2751,17 @@ mod tests {
                     role: pin.role,
                     ..matrix("", pin.role, ty)
                 };
-                let item = weight_formats(Some(pin.program), &t)
-                    .iter()
-                    .any(|n| n.to_string() == format!("{ty} {}", pin.what));
-                let is_matrix = t.dims.len() >= 2 && ty != GgmlType::F32;
-                assert_eq!(item, !(pin.row)(ty) && (!pin.matrices || is_matrix), "{ty}");
+                for &program in pin.programs {
+                    let item = weight_formats(Some(program), &t)
+                        .iter()
+                        .any(|n| n.to_string() == format!("{ty} {}", pin.what));
+                    let is_matrix = t.dims.len() >= 2 && ty != GgmlType::F32;
+                    assert_eq!(
+                        item,
+                        !(pin.row)(ty) && (!pin.matrices || is_matrix),
+                        "{program:?} {ty}"
+                    );
+                }
             }
         }
     }

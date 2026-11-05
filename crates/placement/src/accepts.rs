@@ -61,6 +61,12 @@ pub enum Program {
     /// leg's K-quant entries read and whose down it reads in the file's blocks
     /// or, for a Q5_0 stack, in the packed layout ([`resident_down_runs`]).
     Raon1Body,
+    /// The Kimi K3 body (`crates/gpu/src/arch/kimi_k3` `Body`): whole-card, its delta layers over the
+    /// common KDA mixer with the full-width output gate, its gated latent layers (raon1's core), the
+    /// latent routed block with the biased sigmoid router, and the cross-layer residual mixes
+    /// (`attn_res`). Its routed stacks run raon1's card leg: [`LegStacks::of_resident`] reads
+    /// both bodies' stacks, so the arms and the plan rule are raon1's.
+    KimiK3Body,
     /// The muse-spark body (`crates/gpu/src/arch/musespark` `Body`):
     /// one stage card running every layer, each the one attention-over-latent-MoE
     /// block, its gated experts' id prefix on the card by the common i-quant
@@ -100,7 +106,8 @@ pub fn program_of(arch: Arch) -> Option<Program> {
         Arch::Flint => Some(Program::FlintBody),
         Arch::MuseSpark => Some(Program::MuseSparkBody),
         Arch::MistralLarge4 => Some(Program::MistralLarge4Body),
-        Arch::Lfm3 | Arch::KimiK3 => None,
+        Arch::KimiK3 => Some(Program::KimiK3Body),
+        Arch::Lfm3 => None,
     }
 }
 
@@ -123,6 +130,7 @@ impl Program {
             Self::NemotronHMoeBody => "nemotron_h_moe",
             Self::GemmaEmbedding2Body => "gemma-embedding2",
             Self::Raon1Body => "raon1",
+            Self::KimiK3Body => "kimi-k3",
             Self::MuseSparkBody => "musespark",
             Self::FlintBody => "flint",
             Self::MistralLarge4Body => "mistrallarge4",
@@ -548,7 +556,7 @@ pub fn leg_arms(p: Program) -> Option<LegArms> {
             gate_up: latent_leg_runs,
             down: latent_leg_runs,
         }),
-        Program::Raon1Body => Some(LegArms {
+        Program::Raon1Body | Program::KimiK3Body => Some(LegArms {
             gate_up: kernels::card_gate_up_runs,
             down: resident_down_runs,
         }),
@@ -664,7 +672,7 @@ pub fn routed_rule(p: Program) -> RoutedRule {
             down: bolt_leg_card,
             pair: leg_pair(p),
         },
-        Program::Raon1Body => RoutedRule::Leg {
+        Program::Raon1Body | Program::KimiK3Body => RoutedRule::Leg {
             gate_up: |ty| kernels::card_gate_up_runs(ty).then(|| leg_card_format(ty)),
             down: resident_down_card,
             pair: leg_pair(p),
@@ -717,7 +725,7 @@ mod tests {
     use super::*;
     use crate::placement::{ModelTensor, ModelTensors, Role};
 
-    const PROGRAMS: [Program; 14] = [
+    const PROGRAMS: [Program; 15] = [
         Program::Deepseek41Chain,
         Program::Qwen3moeBody,
         Program::Qwen35Body,
@@ -729,6 +737,7 @@ mod tests {
         Program::NemotronHBody,
         Program::NemotronHMoeBody,
         Program::Raon1Body,
+        Program::KimiK3Body,
         Program::MuseSparkBody,
         Program::FlintBody,
         Program::MistralLarge4Body,
@@ -1125,6 +1134,49 @@ mod tests {
         }
         assert_eq!(leg_runs(p, [NVFP4_ROWS; 3]), Some(true));
         assert_eq!(leg_runs(p, [NVFP4; 3]), Some(true));
+    }
+
+    /// Kimi K3's routed stacks load through the leg raon1's do (`LegStacks::of_resident`), so the
+    /// two programs run the same triples: the released set's IQ1_S and IQ2_XXS in every part, no
+    /// Q6_K down. Mutant: `program_of`'s arm of the family dropped, or `Program::KimiK3Body` out of
+    /// the shared arm of `leg_arms` or of `routed_rule`.
+    #[test]
+    fn kimi_k3_runs_the_raon1_leg_on_the_released_types() {
+        use GgmlType::{IQ1_S, IQ2_XXS, Q6_K};
+        assert_eq!(program_of(Arch::KimiK3), Some(Program::KimiK3Body));
+        for tys in [
+            [IQ1_S; 3],
+            [IQ2_XXS, IQ2_XXS, IQ1_S],
+            [IQ1_S, IQ1_S, IQ2_XXS],
+        ] {
+            assert_eq!(leg_runs(Program::KimiK3Body, tys), Some(true), "{tys:?}");
+        }
+        assert_eq!(
+            leg_runs(Program::KimiK3Body, [IQ1_S, IQ1_S, Q6_K]),
+            Some(false)
+        );
+        let types = types();
+        for &gate in &types {
+            for &down in &types {
+                assert_eq!(
+                    leg_runs(Program::KimiK3Body, [gate, gate, down]),
+                    leg_runs(Program::Raon1Body, [gate, gate, down]),
+                    "{gate} {down}"
+                );
+            }
+        }
+        let arms = leg_arms(Program::KimiK3Body).expect("a card leg");
+        let RoutedRule::Leg { gate_up, down, .. } = routed_rule(Program::KimiK3Body) else {
+            panic!("a leg rule");
+        };
+        for &ty in &types {
+            assert_eq!(
+                gate_up(ty).is_some(),
+                (arms.gate_up)(ty),
+                "{ty} gate·up rule"
+            );
+            assert_eq!(down(ty).is_some(), (arms.down)(ty), "{ty} down rule");
+        }
     }
 
     /// The raon1 body's arms are the common leg's launches and the Q5_0 down: a gate·up of

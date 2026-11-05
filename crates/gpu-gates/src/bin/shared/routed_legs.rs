@@ -125,8 +125,9 @@ fn skip_of(arch: Arch) -> &'static str {
         | Arch::GemmaEmbedding
         | Arch::Flint
         | Arch::MuseSpark
-        | Arch::MistralLarge4
-        | Arch::KimiK3 => "no program",
+        | Arch::MistralLarge4 => "no program",
+        // Whole-card: its routed stacks load as the file holds them and no plan splits them.
+        Arch::KimiK3 => "no adapter",
     }
 }
 

@@ -4472,9 +4472,27 @@ dump-ref-kimi-k3:
 # against mainline llama.cpp's node dumps of that file (refset family fx-lcpp-kimi-k3, `BLOOMERY_TIER=fixture just dump-ref-kimi-k3`):
 # on each of the four prompt sets the free chain's layer outputs, each layer's mixer and feed-forward block alone over the vendor's own
 # rows (the router's picks the vendor's), the teacher-forced argmax against the greedy ids and the last logits row; and with no vendor
-# the steps deterministic, the graph the eager chain, and the AttnRes mix kernel against a host f64 mix (rows = steps, refusals, fault word).
-# Fixture-only (tools/ref/fixture-only.sh): the real file's placement is not wired yet, so the real tier has no run.
+# the steps deterministic, the graph the eager chain, the AttnRes mix kernel against a host f64 mix (rows = steps, refusals, fault word),
+# and `generate_kimi_k3` (built beside the gate, its own process) printing the ids the gate's own steps give from set d's prompt.
+# Fixture-only (tools/ref/fixture-only.sh): the real file (594 GB) does not fit one card and the body has no placed load, so the real tier has no run.
 gate-gpu-kimik3-e2e:
-    BLOOMERY_MODEL=kimi-k3 ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-kimik3-e2e && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_kimi_k3_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_kimi_k3_e2e'
+    BLOOMERY_MODEL=kimi-k3 ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-kimik3-e2e && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_kimi_k3_e2e --bin generate_kimi_k3 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_kimi_k3_e2e'
+
+# Kimi K3's end-to-end decode CLI (generate_kimi_k3's doc): --tokens a,b,c or --prompt TEXT (raw, no template), -n, --ctx, --place, --mode,
+# --plan (the plan's records and nothing loaded). The fixture: BLOOMERY_BOX_ENV='BLOOMERY_TIER=fixture BLOOMERY_GATE_CARD=any'; the real
+# file (BLOOMERY_CARD=a6000, one run at a time under a timeout) is refused by name past the card's free bytes. Never a timing run.
+gen-kimi-k3 *ARGS:
+    BLOOMERY_MODEL=kimi-k3 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_kimi_k3 && bash tools/gpu-gate.sh generate_kimi_k3 {{ARGS}}'
 
 # --- end kimik3-body ---
+# --- kimik3pp ---
+
+# Kimi K3's pass of up to eight rows through the chain (gate_kimi_k3_pp's doc): the delta and gated latent layers' rows, the routed blocks'
+# rows and the AttnRes mixes over every row's banked inputs, over the fixture file's prompt sets a, b and c (35, 46 and 48 ids): the
+# prompt as passes of eight and of five gives every position's logits row and argmax bit for bit the decode steps', the steps after the
+# passes the reference's, `GpuModel::prompt_rows` the last position bit for bit and within the e2e band of the vendor's row, and the shapes
+# a pass does not take are refused by name. Fixture-only (tools/ref/fixture-only.sh), as gate-gpu-kimik3-e2e.
+gate-gpu-kimik3-pp:
+    BLOOMERY_MODEL=kimi-k3 ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-kimik3-pp && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_kimi_k3_pp && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_kimi_k3_pp'
+
+# --- end kimik3pp ---
