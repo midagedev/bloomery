@@ -21,7 +21,7 @@
 
 use super::ffn::{self, Ffn, FfnKernels, FfnRows, FfnScratch, Glu, Routed};
 use super::mhc::{self, HC_OUT, MhcKernels, STREAMS, SiteVecs};
-use super::mla::{self, MlaBufs, MlaDims, MlaKernels, MlaSites};
+use super::mla::{self, MlaBufs, MlaSites};
 use super::rda::{self, RdaSites, RowKernels, RowsKit};
 use super::rows::{RowState, RowViews};
 use super::state::{self, PASS_ROWS, Pass};
@@ -32,6 +32,7 @@ use crate::flash_gqa::FlashGqaKernels;
 use crate::gemm::Gemm32Kernels;
 use crate::head::Head;
 use crate::kquant::Act;
+use crate::latent_gated::{self, MlaDims, MlaKernels};
 use crate::linear::mixer_kda::{KdaBufs, KdaDims};
 use crate::linear::{HEAD, LinearKernels};
 use crate::model::{ChainBody, GpuModel, NoHost, block_count};
@@ -157,7 +158,7 @@ impl Kernels {
             rows: RowKernels::load(ctx)?,
             hc: MhcKernels::load(ctx)?,
             ffn: FfnKernels::load(gpu)?,
-            mla: MlaKernels::load(gpu, mla)?,
+            mla: MlaKernels::load(gpu, mla, WIDE_ROWS)?,
         })
     }
 }
@@ -295,7 +296,7 @@ impl Scratch {
         let (channels, v, n_v) = (lin.channels(), lin.n_v * HEAD, lin.n_v);
         // The latent attention takes at most [`mla::ATTN_CHUNK`] rows a launch:
         // a wider unit runs it in chunks that share one set of partials.
-        let (part_v, part_ms) = mla::partials_lens_rows(m, ctx, rows.min(mla::ATTN_CHUNK));
+        let (part_v, part_ms) = latent_gated::partials_lens_rows(m, ctx, rows.min(mla::ATTN_CHUNK));
         let (heads, row) = (m.heads, m.row());
         Ok((
             [
@@ -1182,10 +1183,11 @@ mod tests {
     use super::{Ffn, Glu, Layer, Mixer, STREAMS, Site, SiteTy, dims, wide_dims, wide_refusal};
     use crate::weights::Weights;
     use crate::{DeviceTensor, Gpu};
+    use model::arch::delta_mla::{Mla, Situ};
     use model::arch::kda::Keys;
     use model::arch::models::KdaGate;
     use model::arch::noaux::Experts;
-    use model::arch::raon1::hparams::{Hc, Hparams, Kind, Mla, Situ};
+    use model::arch::raon1::hparams::{Hc, Hparams, Kind};
 
     /// A header with Raon's widths and a dense width, a routed expert's width and a
     /// count of shared experts of the caller's.

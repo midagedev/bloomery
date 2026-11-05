@@ -4,14 +4,15 @@
 //! authority is ik_llama.cpp's `src/llama-kda.cpp`, which loads it.
 //!
 //! What stays with a family: what a KDA layer decays by (the gate's own
-//! parameter), which of its layers is a KDA one, and the plan that places
-//! them. Those are the family's facts; the mixer's shape is the
-//! architecture's.
+//! parameter: [`gate`] reads the bounded form two families take alike), which
+//! of its layers is a KDA one, and the plan that places them. Those are the
+//! family's facts; the mixer's shape is the architecture's.
 
 use gguf::Split;
+use models::KdaGate;
 
 use crate::arch::stems::{Stem, join, req};
-use crate::arch::{meta_usize, metadata, optional_usize, positive};
+use crate::arch::{meta_usize, metadata, optional_f32, optional_usize, positive};
 use crate::placement::{PlacementError, Role};
 
 /// A delta-rule layer's mixer up to the decay's low-rank halves, which a KDA layer
@@ -89,6 +90,33 @@ pub(in crate::arch) fn read(
         ));
     }
     Ok(Keys { conv, head_dim })
+}
+
+/// How the decay of the delta layers is made: `kda.gate_lower_bound` when the file has it (the
+/// sigmoid form bounded below by it), else the softplus form, which a default records in
+/// `defaults` with `authority`, the llama.cpp source that takes it. A bound that is not finite
+/// and below 0 is an error naming the key.
+pub(in crate::arch) fn gate(
+    split: &Split,
+    authority: &str,
+    defaults: &mut Vec<String>,
+) -> Result<KdaGate, PlacementError> {
+    match optional_f32(split, "kda.gate_lower_bound")? {
+        Some(lower_bound) if lower_bound.is_finite() && lower_bound < 0.0 => {
+            Ok(KdaGate::Sigmoid { lower_bound })
+        }
+        Some(lower_bound) => Err(metadata(
+            split,
+            "kda.gate_lower_bound",
+            format!("is {lower_bound}; the bounded decay needs a finite bound below 0"),
+        )),
+        None => {
+            defaults.push(format!(
+                "kda.gate_lower_bound = softplus decay (absent, {authority})"
+            ));
+            Ok(KdaGate::Softplus)
+        }
+    }
 }
 
 /// The dims of [`HEAD`]'s tensors by stem, ggml order: `d_state` is the head dim, `d_inner` that

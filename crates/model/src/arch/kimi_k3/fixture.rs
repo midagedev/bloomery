@@ -47,8 +47,9 @@
 
 use gguf::{GgmlType, Split};
 
-use super::hparams::{Hparams, Kind, Mla};
+use super::hparams::{Hparams, Kind};
 use super::names::OUTPUT_RES_SCORE;
+use crate::arch::delta_mla::Mla;
 use crate::arch::names::{blk, output, output_norm, token_embd};
 use crate::arch::noaux::Experts;
 use crate::fixture::{CardBudget, Family, FixtureError, FixtureSpec, KeyRule, Tables, Window};

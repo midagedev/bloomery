@@ -4352,7 +4352,7 @@ gate-gpu-raon1-dflash:
 
 # --- raon-attn (Raon-1-mini attention layers) ------------------------------------------------------------------------------------------
 
-# Raon-1's RDA step (conv prep, write gate, KDA delta) and gated latent attention (`raon1::mla::attend`) on the card at the model's
+# Raon-1's RDA step (conv prep, write gate, KDA delta) and gated latent attention (`latent_gated::attend`) on the card at the model's
 # shapes against the HF model in f64 (gate_raon1_attn's doc), seeded inputs, no model file; each with an in-gate separation.
 gate-gpu-raon1-attn:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_raon1_attn && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_raon1_attn'
@@ -4382,7 +4382,7 @@ gate-raon1-tokenizer:
 # Kimi K3's gated no-RoPE MLA layer on the card at the layer's shapes (2 and 96 heads, nope 128, 64 unrotated rope lanes beside the
 # 512 latent, value 128) against llama.cpp's `build_mla_layer` in f64 (gate_kimi_k3_mla's doc), seeded inputs, no model file: decode at
 # 1, 7, 64, 65 and 300 keys, an 8-row pass equal to 8 decode steps, each clause's in-gate separation, the shapes the launches refuse.
-# The launches are `raon1::mla::attend` and `attend_rows`; the gate adds no kernel.
+# The launches are `latent_gated::attend` and `attend_rows`; the gate adds no kernel.
 gate-gpu-kimik3-mla:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_kimi_k3_mla && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_kimi_k3_mla'
 

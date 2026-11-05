@@ -11,8 +11,7 @@
 
 use gguf::Split;
 use models::{
-    Act, Arch, ChatSpec, DeltaKind, DeltaRule, Ffn, Latent, LatentOut, LatentUp, LayerSpec, Mixer,
-    ModelSpec, Moe, OutGate, Residual, Source,
+    Arch, ChatSpec, DeltaKind, DeltaRule, Ffn, LayerSpec, Mixer, ModelSpec, Moe, Residual,
 };
 
 use super::hparams::{Hparams, Kind};
@@ -44,10 +43,7 @@ pub fn read(split: &Split) -> Result<Read, PlacementError> {
 
 /// The description of the file `hp` was read from, with the chat surface `chat`.
 pub fn spec_of(hp: &Hparams, chat: ChatSpec) -> Result<ModelSpec, PlacementError> {
-    let act = Act::Situ {
-        gate_beta: hp.situ.gate_beta,
-        value_beta: hp.situ.value_beta,
-    };
+    let act = hp.situ.act();
     let layer = |l: usize| -> Result<LayerSpec, PlacementError> {
         let mixer = match hp.kind(l) {
             Kind::Kda => Mixer::DeltaRule(DeltaRule {
@@ -57,29 +53,7 @@ pub fn spec_of(hp: &Hparams, chat: ChatSpec) -> Result<ModelSpec, PlacementError
                 d: spec_u32("kda.head_dim", hp.kda.head_dim)?,
                 conv: spec_u32("ssm.conv_kernel", hp.kda.conv)?,
             }),
-            Kind::Mla => {
-                let m = &hp.mla;
-                Mixer::Latent(Latent {
-                    heads: spec_u32("attention.head_count", hp.n_head)?,
-                    q_lora: spec_u32("attention.q_lora_rank", m.q_lora)?,
-                    latent: spec_u32("attention.kv_lora_rank", m.kv_lora)?,
-                    up: LatentUp::Absorbed {
-                        qk: spec_u32("attention.key_length_mla", m.head_k)?,
-                        v: spec_u32("attention.value_length_mla", m.head_v)?,
-                    },
-                    rope: None,
-                    q_head_norm: false,
-                    ssmax: false,
-                    pe: spec_u32("rope.dimension_count", m.pe)?,
-                    cache: Source::Own(()),
-                    out_gate: OutGate::Proj,
-                    out: LatentOut::Plain,
-                    window: None,
-                    sinks: false,
-                    compress: None,
-                    select: None,
-                })
-            }
+            Kind::Mla => Mixer::Latent(hp.mla.latent(hp.n_head)?),
         };
         let ffn = if hp.dense(l) {
             Ffn::Dense {

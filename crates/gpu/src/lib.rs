@@ -69,6 +69,7 @@ pub mod kquant;
 pub mod kv_format;
 pub mod lane;
 pub mod latent;
+pub mod latent_gated;
 pub mod linear;
 pub mod mamba2;
 pub mod mamba2_ssd;

@@ -27,20 +27,8 @@ const GATE: &[Stem] = &[req("ssm_g.weight", Role::Attention)];
 /// A KDA layer's mixer: the common [`kda`] head and tail around the full-width gate.
 pub(super) const KDA: &[Stem] = &join::<15>(&[kda::HEAD, GATE, kda::TAIL]);
 
-/// A latent layer's mixer: the query and key-value latents with their norms, the absorbed
-/// per-head up projections, the output gate and the output projection.
-pub(super) const MLA: &[Stem] = &[
-    req("attn_norm.weight", Role::Attention),
-    req("attn_q_a.weight", Role::Attention),
-    req("attn_q_a_norm.weight", Role::Attention),
-    req("attn_q_b.weight", Role::Attention),
-    req("attn_kv_a_mqa.weight", Role::Attention),
-    req("attn_kv_a_norm.weight", Role::Attention),
-    req("attn_k_b.weight", Role::Attention),
-    req("attn_v_b.weight", Role::Attention),
-    req("attn_gate.weight", Role::Attention),
-    req("attn_output.weight", Role::Attention),
-];
+/// A latent layer's mixer, the common `delta_mla` owner's.
+use crate::arch::delta_mla::MLA;
 
 /// The scores of the two mixes a layer reads: the mixer's and the feed-forward block's.
 pub(super) const MIX: &[Stem] = &[

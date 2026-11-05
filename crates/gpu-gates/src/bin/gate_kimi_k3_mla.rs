@@ -9,7 +9,7 @@
 //! `1/sqrt(nope + rope)`; there is no RoPE, so the 64 rope lanes stay in the dot unrotated; the
 //! heads of `attn_v_b · softmax(QKᵀ) V` are multiplied by `sigmoid(attn_gate · x)` before
 //! `attn_output`, with `x` the normed layer input. The cache is one 576-wide row a position, the
-//! latent doing both the key's and the value's part. `raon1::mla::attend` and `attend_rows` launch
+//! latent doing both the key's and the value's part. `latent_gated::attend` and `attend_rows` launch
 //! exactly that — the row append, the per-head absorb, the rope gather, the latent flash, the
 //! per-head value projection and the sigmoid gate — so the gate drives them at K3's geometry; the
 //! file adds no kernel. The projections that feed `attend` (`attn_q_a`, its norm, `attn_q_b`,
@@ -41,10 +41,10 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod gate {
-    use bloomery_gpu::arch::raon1::mla::{
+    use bloomery_gpu::latent::LATENT;
+    use bloomery_gpu::latent_gated::{
         AttendIn, AttnBufs, MlaDims, MlaKernels, ValueW, attend, attend_rows, partials_lens_rows,
     };
-    use bloomery_gpu::latent::LATENT;
     use bloomery_gpu::linear::PASS_ROWS;
     use bloomery_gpu::weights::q8_0_planes;
     use bloomery_gpu::{DeviceTensor, Gpu, GpuError};
@@ -434,7 +434,7 @@ mod gate {
                 gpu,
                 l,
                 d,
-                mk: MlaKernels::load(gpu, &d)?,
+                mk: MlaKernels::load(gpu, &d, PASS_ROWS)?,
                 kb: planes(&l.kb_planes.0, &l.kb_planes.1, h * LATENT, NOPE)?,
                 v6: DeviceTensor::upload(s, w6, h * V_HEAD, LATENT / 256 * SB_BYTES / 4)?,
                 v8: planes(q8s, q8d, h * V_HEAD, LATENT)?,
@@ -838,7 +838,7 @@ mod gate {
         ));
         out.push(refusal(
             "the load at a rope part of 32",
-            refused(MlaKernels::load(gpu, &bad)),
+            refused(MlaKernels::load(gpu, &bad, PASS_ROWS)),
             "576",
         ));
         let bad = MlaDims {
