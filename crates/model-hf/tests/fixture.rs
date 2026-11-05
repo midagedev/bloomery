@@ -1343,9 +1343,10 @@ fn hw_fixture_v41_budget() {
             .map_err(|e| e.to_string())
     };
     let ctx = v41::BUDGET_CTX;
-    // f0 and f1 are the source's first two layers, whose Q5_K down no card
-    // kernel runs: their experts stay on the host.
-    let want = |n: u64| -> Vec<u64> { (0..layers).map(|l| if l < 2 { 0 } else { n }).collect() };
+    // f0 and f1 are the source's first two layers: the fused layer reads
+    // their Q5_K down by type, so they take card experts like the rest.
+    // PIN(2026-11-06): was 0 on both until the fused down read its type.
+    let want = |n: u64| -> Vec<u64> { (0..layers).map(|_| n).collect() };
     assert_eq!(
         at(None, ctx, 1).unwrap(),
         want(experts),
