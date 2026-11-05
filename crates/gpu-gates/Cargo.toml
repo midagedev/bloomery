@@ -857,7 +857,7 @@ required-features = ["gpu"]
 name = "gate_raon1_dflash"
 required-features = ["gpu"]
 
-# kimik3-mla: Kimi K3's gated MLA layer on the card (raon1::mla's launches at K3's geometry) against the llama.cpp graph in f64.
+# kimik3-mla: Kimi K3's gated MLA layer on the card (latent_gated's launches at K3's geometry) against the llama.cpp graph in f64.
 [[bin]]
 name = "gate_kimi_k3_mla"
 # kimik3-moe: Kimi K3's routed block (the common routed block with the latent pair, the routed-sum norm and the gated shared stack)

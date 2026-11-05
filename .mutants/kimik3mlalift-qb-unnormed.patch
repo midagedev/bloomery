@@ -1,0 +1,13 @@
+--- a/crates/gpu/src/arch/gated_mla.rs
++++ b/crates/gpu/src/arch/gated_mla.rs
+@@ -264,7 +264,9 @@
+         1,
+         b.qr,
+     )?;
+-    sites.q_b.project(cx, acts, l, b.qr, b.q)?;
++    // mutant kimik3mlalift-qb-unnormed: the one-row step feeds `attn_q_b` the q_a rows before
++    // their norm, where the pass's rows (and the graph) feed it the normed ones.
++    sites.q_b.project(cx, acts, l, b.qa, b.q)?;
+     attend(
+         gpu,
+         k,

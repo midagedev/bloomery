@@ -804,7 +804,7 @@ pub const AVAILABLE: &[Available] = &[
     },
     Available {
         programs: &[Program::Raon1Body],
-        at: "gpu/src/arch/raon1/mla.rs (the absorbed heads over gpu/src/latent.rs LATENT, \
+        at: "gpu/src/arch/gated_mla.rs (the absorbed heads over gpu/src/latent.rs LATENT, \
              latent_extra_rms_append)",
         runs: |n| {
             matches!(
@@ -824,7 +824,7 @@ pub const AVAILABLE: &[Available] = &[
     },
     Available {
         programs: &[Program::Raon1Body],
-        at: "gpu/src/arch/raon1/mla.rs (attn_gate, then gpu/src/linear/out_gate.rs)",
+        at: "gpu/src/arch/gated_mla.rs (attn_gate, then gpu/src/linear/out_gate.rs)",
         runs: |n| matches!(n, Need::LatentOutGate),
     },
     Available {
