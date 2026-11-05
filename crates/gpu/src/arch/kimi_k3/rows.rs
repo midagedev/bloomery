@@ -34,7 +34,7 @@ use super::{
     Body, Instance, KdaBuffers, Kernels, Layer, Mixer, MixerIo, MlaBuffers, Scratch, step_cx,
 };
 use crate::arch::hybrid::{Acts, GqaCx};
-use crate::arch::raon1::mla::{self, MlaBufs};
+use crate::arch::gated_mla::{self as mla, MlaBufs};
 use crate::arch::routed_ffn::{self as ffn, Ffn, FfnRows};
 use crate::arch::rows_kit::{RowKernels, RowsKit, add_row_forms};
 use crate::attn_res::AttnResArgs;
