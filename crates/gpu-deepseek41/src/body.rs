@@ -559,7 +559,7 @@ fn on_rank(role: Role) -> bool {
 /// and of every expert's inner width, the routed and the shared alike; every
 /// other width is the model's. A count the ranks do not divide, no rank and a
 /// rank past them are refused by name.
-pub fn rank_hparams(hp: &Hparams, rank: usize, ranks: usize) -> Result<Hparams, GpuError> {
+pub(crate) fn rank_hparams(hp: &Hparams, rank: usize, ranks: usize) -> Result<Hparams, GpuError> {
     let part = |what: &str, v: usize| -> Result<usize, GpuError> {
         if rank < ranks && v.is_multiple_of(ranks) && v >= ranks {
             Ok(v / ranks)

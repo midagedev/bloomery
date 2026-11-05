@@ -50,7 +50,7 @@ pub mod dist;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RankAddr {
     pub control: SocketAddr,
-    pub data: Vec<Ipv4Addr>,
+    pub(crate) data: Vec<Ipv4Addr>,
 }
 
 /// The ranks of one group in rank order.
@@ -65,7 +65,7 @@ impl RankList {
     /// after `#` are ignored. No rank, a line of another shape, a control
     /// address given twice or a data address held by two ranks is refused by
     /// line.
-    pub fn parse(text: &str) -> Result<RankList, GpuError> {
+    pub(crate) fn parse(text: &str) -> Result<RankList, GpuError> {
         const WHAT: &str = "the rank list";
         let mut ranks: Vec<RankAddr> = Vec::new();
         for (n, line) in text.lines().enumerate() {
