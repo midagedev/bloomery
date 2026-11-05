@@ -2392,8 +2392,12 @@ impl Body {
             missing: "the call's needs",
         })?;
         if batch.stream.on {
-            let n = u32::try_from(members.len()).unwrap_or(u32::MAX);
-            hybrid.call_floor(STREAM_FLOOR.saturating_mul(n))?;
+            // The floor is per T_MAX rows the group holds, not per member: a cut
+            // batch carries fewer rows, so its counts are smaller in the same
+            // ratio, and a per-member floor would admit a quarter of the set.
+            let rows: usize = members.iter().map(|m| m.u).sum();
+            let floor = (STREAM_FLOOR as usize * rows).div_ceil(T_MAX);
+            hybrid.call_floor(u32::try_from(floor).unwrap_or(u32::MAX))?;
         }
         let first = members.first().map_or(0, |m| m.batch);
         let mut cx = GroupCx {
@@ -3308,6 +3312,28 @@ mod tests {
         assert_eq!(p.batches, vec![700..900, 900..1100, 1100..1300]);
         assert_eq!(p.need.first, 700);
         assert_eq!(p.need.end, 1300);
+    }
+
+    /// The hole a call leaves is computed from the batches the call runs: a
+    /// latent start floors to the last batch start before it, so a call of
+    /// 257 positions under 256 (batches 0..129 and 129..257) has its hole
+    /// end at that last start, where under 512 (one batch) it ends at the
+    /// chunk boundary below; the same from an unaligned first position.
+    #[test]
+    fn a_calls_hole_follows_the_cut() {
+        let ced = Ced::new(&v41(), 128, true);
+        let hole = |c: usize, first: usize, n: usize| {
+            super::super::seq::call_hole(&ced, &levers(c), first, first + n)
+        };
+        assert_eq!(levers(256).batches(0, 257), vec![0..129, 129..257]);
+        assert_eq!(hole(256, 0, 257), 0..129);
+        assert_eq!(hole(512, 0, 257), 0..128);
+        assert_eq!(levers(256).batches(700, 265), vec![700..833, 833..965]);
+        assert_eq!(hole(256, 700, 265), 700..833);
+        assert_eq!(hole(512, 700, 265), 700..832);
+        // A call that cuts at chunk-aligned starts leaves the same hole.
+        assert_eq!(hole(256, 0, 512), hole(512, 0, 512));
+        assert_eq!(hole(256, 0, 0), 0..0);
     }
 
     /// The cut is refused by name, with its value, unless it is from 1 to

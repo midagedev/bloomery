@@ -40,7 +40,23 @@ use bloomery_gpu::{Gpu, GpuError};
 use cuda_core::CudaStream;
 use model::arch::deepseek41::hparams::Hparams;
 
-use super::{Body, Holds, LayerKv, PAIR_ROWS, Shadows, layer_kv};
+use super::ced::Ced;
+use super::{Body, BodyLevers, Holds, LayerKv, PAIR_ROWS, Shadows, layer_kv};
+
+/// [`Body::call_hole`]'s rule over the walk and the levers it reads: the
+/// call's batch starts come from the levers' cut, since a latent start
+/// floors to the last batch start before it.
+pub(super) fn call_hole(ced: &Ced, levers: &BodyLevers, first: usize, end: usize) -> Range<usize> {
+    if end <= first {
+        return first..first;
+    }
+    let starts: Vec<usize> = levers
+        .batches(first, end - first)
+        .iter()
+        .map(|r| r.start)
+        .collect();
+    ced.need(first, end, &starts, None).hole()
+}
 
 /// The tokens a sequence holds, one per position: what each step's engram
 /// n-grams read back from (`Planner::plan_into`'s `before`), cut, cleared and
@@ -458,19 +474,11 @@ impl Body {
 
     /// The positions of a prompt call of `first .. end` whose shadow rows
     /// some layer leaves unwritten: [`super::Need::hole`] of the needs the
-    /// call's start would set, fed as [`super::BodyLevers::batches`] with no feature tap.
+    /// call's start would set, fed as the body's batches
+    /// ([`super::BodyLevers::batches`]) with no feature tap.
     #[must_use]
     pub fn call_hole(&self, first: usize, end: usize) -> Range<usize> {
-        if end <= first {
-            return first..first;
-        }
-        let starts: Vec<usize> = self
-            .levers
-            .batches(first, end - first)
-            .iter()
-            .map(|r| r.start)
-            .collect();
-        self.ced.need(first, end, &starts, None).hole()
+        call_hole(&self.ced, &self.levers, first, end)
     }
 
     /// Where to cut a prompt call of `first .. end` into calls so that each
