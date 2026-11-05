@@ -1,0 +1,16 @@
+diff --git a/crates/placement/src/placement/rank.rs b/crates/placement/src/placement/rank.rs
+index edfa4df26..58d04a6de 100644
+--- a/crates/placement/src/placement/rank.rs
++++ b/crates/placement/src/placement/rank.rs
+@@ -327,9 +327,8 @@ impl ExpertRank {
+         let mut paged = Vec::new();
+         let mut kept = Vec::new();
+         for &id in ids.iter().rev() {
+-            if of.binary_search(&id).is_err() {
+-                continue;
+-            }
++            // mutant nvmerank-no-host-filter: the pick ignores the host's ids and takes the
++            // coldest of the rank's row whole, so an id a card holds lands on the NVMe tier too.
+             if u64::try_from(paged.len()).is_ok_and(|len| len < n) {
+                 paged.push(id);
+             } else {
