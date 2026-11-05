@@ -1,0 +1,20 @@
+# The Kimi K3 gate fixture's CPU node dumps (four real layers of the file's two mixers, a delta layer with the dense lead, two routed
+# delta layers and a routed latent layer, on a hidden of 512 with 8 experts and the real 163,840-id vocabulary: 152 MB in one shard
+# [measured: ls], /models/fixtures/kimik3), `BLOOMERY_TIER=fixture just dump-ref-kimi-k3`: the four prompts of the real file's dump (35,
+# 46, 48 and 5 ids) from ONE load, into fx_ref_kimik3_{a,b,c,d}. The phases run one after the other.
+# Predicted wall [derived], seconds:
+#   load      152 MB mapped and populated (token_embd and output are 69 MB each in Q6_K, the four layers 14 MB), from the page cache or one
+#             cold read at ~1 GB/s: 0.2-1 s
+#   prefill   134 ids x 2 x ~10 M MACs a token (four layers at hidden 512, 2 of 8 experts) plus the head's 512 x 163,840 = 84 M MACs on
+#             the last row of each prompt: under 1 s
+#   greedy    128 tokens, each reading the head's 69 MB over ~120 GB/s (0.6 ms) and sorting 163,840 logits twice (partial sort, ~2 ms
+#             each): 0.6-1.2 s
+#   writes    a's taps (the widest rows 512 x 35 f32): under 1 s
+#   total     3-8 s, bound 1800 s.
+# What the run guarantees: CUDA hidden, the CPU lease held, the staging set installed only when each prompt's manifest carries its
+# `# complete` trailer.
+kind: exclusive
+reason: kimik3_dump runs mainline llama.cpp on 32 CPU threads; beside a timed run or a gate batch it would take their cores, so it holds
+  the lease; why now: the fixture's oracle sets the Kimi K3 end-to-end gate reads on every landing batch, and the first read of whether
+  the vendor tree opens our fixture file at all (round kimik3ref)
+minutes: 0.1..1

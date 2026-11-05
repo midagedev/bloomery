@@ -1,0 +1,44 @@
+# Round kimik3ref: the Kimi K3 real file's CPU node dumps (UD-IQ1_S, 594.03 GB in fourteen shards, /models/Kimi-K3-UD-IQ1_S),
+# `just dump-ref-kimi-k3`: the four prompts (35, 46, 48 and 5 ids) from ONE load, into ref_kimik3_{a,b,c,d}, each with 32 greedy tokens.
+# The phases run one after the other on the same 32 threads: the wall is their sum, and the one term derivation cannot fix is the
+# rate at which the drive hands the cache the pages a phase faults in.
+# Bytes [derived from crates/model/tests/kimi_k3_tensors.tsv, the 2,573 tensors of the real header, summed by type]: file 594.03 GB;
+# routed experts 545.35 GB (IQ1_S 489.40, IQ2_XXS 55.95; 92 layers x 896 experts, 6.62 MB an expert gate+up+down); everything else
+# 48.68 GB (Q6_K 45.80, F32 2.61, Q8_0 0.28), read in full by every token; a token's 16 x 92 routed experts are 9.74 GB. Nothing is
+# repacked on this AVX2 CPU (IQ1_S, IQ2_XXS, Q6_K, Q8_0, F32), so every byte stays a page-cache read.
+# Phases, seconds [derived]:
+#   load     the tree's llama_mmap maps each shard with MAP_POPULATE (no tensor of this arch is lazy: src/llama-model-loader.cpp init_mappings),
+#            so the load reads all 594 GB once, through a cache of 251 GB, of which the last ~240 GB stay. Single-stream cold populate on
+#            this drive measured 1.07-1.7 GB/s (glmref-dump.card: 199.7 GB in 133 s): 350-555 s, central 396 s at 1.5 GB/s
+#   prompts  134 ids x 2 x ~50 G MACs = 13 TFLOP at 0.5-1 TFLOP/s through the AVX2 dots: 13-27 s, under the faults: a prompt of T ids
+#            draws 16 T slots a layer over 896 experts, 417 distinct at T = 35 up to 515 at T = 48 if routing were uniform (a skew
+#            leaves ~75 % of that), so the four prompts touch ~690 GB of experts, ~55 % of it not in the cache: ~380 GB (280-500) at the
+#            0.85-2.7 GB/s a cold file's page faults measured (cflra-load.card): 104-590 s, central 253 s
+#   greedy   124 decode steps (32 tokens a prompt, the first from the prompt's own logits), each reading the 47.7 GB of non-routed
+#            weights from DRAM (~0.5 s at ~100 GB/s with the dots) and faulting 40-65 % of its 9.74 GB of experts, 3.9-6.3 GB, at the same
+#            0.85-2.7 GB/s: 2.0-8.0 s a step, central 4.2 s: 250-990 s, central 520 s
+#   fixed    context and graph reserve ~10 s, writes (a's taps ~2.7 GB, b, c and d ~0.7 GB each) at ~0.5 GB/s ~10 s, lease and witnesses 5 s: ~25 s
+#   total    730-2,160 s (12-36 min), central 1,200 s (20 min), bound 5,400 s (BLOOMERY_DUMP_BOUND, set in tools/ref/kimi-k3-dump.sh): a
+#            dump over the bound is killed and installs nothing
+# Resource timeline per unit [derived]: a decode step, host CPU 0.5-0.6 s of dots, DRAM 57 GB at ~100 GB/s = 0.5 s (under the dots),
+# NVMe 3.9-6.3 GB at 0.85-2.7 GB/s = 1.4-7.4 s, card none (CUDA hidden), PCIe none. The page fault stalls the thread that took it, so
+# the wall is the sum of the NVMe and CPU terms; the NVMe term is 70-90 % of the step. No flow lever applies to an oracle dump.
+kind: profile
+question: how long does the vendor CPU build take to dump the four Kimi K3 prompts and their 32 greedy tokens each from the 594 GB
+  UD-IQ1_S file on the 251 GB box, and which phase (the populate load, the prompts, the greedy steps) holds the wall?
+term: wall seconds of `just dump-ref-kimi-k3`, the lease window from lease_take to the last set's installation (kimik3_dump at
+  32 threads, -fa on, -c 4096, -ub 512, CUDA hidden, mainline 78feec062 CPU build, UD-IQ1_S 594.03 GB, nvme0, 251 GB host)
+unit: s
+predict: 730..2160
+condition: CUDA_VISIBLE_DEVICES empty and no card touched; the CPU lease held through lease_take with this card, the witness blocks
+  before and after the dump printing Cached, pgmajfault and read-sectors of nvme0 (the bytes the drive handed over: expected 1.0-1.6 TB,
+  so the cold rate is read-sectors over a phase's wall); the dumper's own lines give the load, per-prompt (prompt, greedy) and total
+  seconds; no peer reads /models in the window beyond what the box's lease machinery orders; each staged set installed only when its
+  manifest carries the `# complete` trailer
+decide-in: take the sets as installed, record the load, prompt and greedy seconds and the read-sectors in the report (the cold rate of
+  this file on this drive under the populate and under the faults), and hand the sets to the gate rounds
+decide-below: the cache was warm before the load (read the pre-dump witness's Cached against the file) or the faults ran at 3 GB/s or
+  more: take the sets, record which, and lower the next card's band; nothing to rerun
+decide-above: read which phase's seconds overran; a load over 600 s means the populate thrashed the cache (the next dump moves the
+  tree's prefetch off by a patch, a change of the oracle's identity), a greedy phase over 1,000 s means the faults ran under 0.8 GB/s
+  (the next dump runs 64 threads for more outstanding faults, no change of the build): report it and stop, no second dump in this round

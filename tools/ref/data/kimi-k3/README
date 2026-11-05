@@ -1,0 +1,30 @@
+Kimi K3 oracle prompts (tools/ref/kimi-k3-dump.sh): the text of each prompt and its token ids, one decimal id a line, no BOS and
+no chat template (the file's tokenizer adds no BOS: llama-tokenize gives the same ids with and without --no-bos). The dumper never
+tokenizes (tools/ref/cb_dump.cpp): a tokenizer difference would read as a kernel bug.
+
+Made once, on the box, by the tokenizer of the dump's own tree (mainline llama.cpp 78feec062d50ec9e8940244cac918ac4480b60cb, CPU
+build by `just build-k3-lcpp`, libllama.so md5 ae99cf8db62c4a42bdf6e13a22ef6d86, no patch) on shard 1 of the UD-IQ1_S file
+(/models/Kimi-K3-UD-IQ1_S/Kimi-K3-UD-IQ1_S-00001-of-00014.gguf; the vocabulary is in shard 1; the pre-tokenizer is `kimi-k2`):
+
+    llama-tokenize -m <shard 1> -f <text> --ids --no-escape --log-disable     # "[id, id, ...]", written one id a line
+
+The texts hold no final newline (one would be an id) and no backslash, so --no-escape and the default tokenize alike. Our
+tokenizer (bloomery-tokenize -m <shard 1> -f <text> --ids) gives the same ids for all four.
+
+    a  35 ids  English paragraph, cut after "one by one,"          txt 175 bytes
+               ids  a59402fe42e4a48a2eafa4d7b92afdc08426166c999f7cb6936cf814bf6cd009
+               text b8697c5bc02ca27aadaa96572e902af16b78ac8e281f8c3a4689442fd2bd13c8
+    b  46 ids  Korean paragraph, cut after "내려다보면"             txt 119 bytes
+               ids  961fe41064d7acdaa5af8d0d195a499052c9383d95c335dd51002c139fc4b3f7
+               text de58f3b01c674ca1fba4a1caed60efcac5c4c860ee5e11dd8664168a5dfce2e7
+    c  48 ids  Rust function head, cut after `let mut counts = HashMap::new();`   txt 184 bytes
+               ids  89f3e2e82264efe6ef12f3710cd7895b2671265bc9794dcdc24e2b63ebb642df
+               text 80ea0567fdf73e292bf76493f5b207a0531652a879ec59cc36c942c7cffd1503
+    d   5 ids  "The capital of France is"                           txt 24 bytes
+               ids  6e03873fd84b78a90006c6ff0c24433255740bff94c3fbe20c193348b82c0760
+               text bbaff4d2ecd5892d4a442b0f53131641bf6e6f284761dd20fc0664bc97145762
+
+Every prompt is at most 48 ids: the dump's cost is the load of the file's 594 GB, and a prompt position costs a gather of up to 16
+experts a layer from a file the page cache holds less than half of, so the four prompts are short and the 32 greedy tokens run
+past each one. a is the one prompt that carries the per-stage taps (the delta layers' convolutions, gates and scan, the latent
+layers' gate, the router's logits and probabilities, the experts' activation); b, c and d carry the layer taps.
