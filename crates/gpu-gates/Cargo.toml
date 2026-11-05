@@ -851,3 +851,8 @@ required-features = ["gpu"]
 [[bin]]
 name = "gate_raon1_dflash"
 required-features = ["gpu"]
+
+# kimik3-mla: Kimi K3's gated MLA layer on the card (raon1::mla's launches at K3's geometry) against the llama.cpp graph in f64.
+[[bin]]
+name = "gate_kimi_k3_mla"
+required-features = ["gpu"]
