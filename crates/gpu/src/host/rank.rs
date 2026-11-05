@@ -1494,7 +1494,8 @@ mod tests {
                 n: n as u16,
                 rank: rank as u16,
             },
-            limits: vec![("positions".into(), 100 + rank as u64)],
+            // Rank 0 offers the most and one follower the least: the agreed limit is a peer's.
+            limits: vec![("positions".into(), 100 + ((rank + 1) % n) as u64)],
         }
     }
 
@@ -1518,7 +1519,7 @@ mod tests {
                         let mut c = Control::open(list, r, Duration::from_secs(10))
                             .map_err(|e| e.to_string())?;
                         let h = hello(r, n, build(r));
-                        let limits = [("positions", 100 + r as u64)];
+                        let limits = [("positions", h.limits[0].1)];
                         let agreed = c.agree(&h, &limits).map_err(|e| e.to_string())?;
                         c.barrier().map_err(|e| e.to_string())?;
                         let mut got = Vec::new();
