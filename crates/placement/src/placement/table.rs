@@ -1,4 +1,5 @@
 use std::ops::Range;
+use std::sync::Arc;
 
 use super::Role;
 use super::card_budget;
@@ -6,6 +7,7 @@ use super::machine::{
     Device, ExpertList, Format, Machine, ModelTensor, ModelTensors, stack_experts,
 };
 use super::planner::capped;
+use super::rank::ExpertRank;
 use super::refusal::{PlacementError, Violation};
 use super::rule::{card_buffers, card_heaps, per_expert, routed_row_on_as, row_bytes, rows_of};
 use super::workstation;
@@ -266,11 +268,13 @@ pub struct Plan<'a> {
     pub host: HostTotals,
     pub nvme_bytes: u64,
     /// Per layer: how many experts its stage card holds (the ids are its
-    /// routed stacks' segments on that card, [`Segment::experts`]).
+    /// routed stacks' segments on that card, [`Segment::experts`]: the id
+    /// prefix, or under a rank the layer's hottest).
     pub n_l: Vec<u64>,
     /// Per tier of [`Machine::tiers`], per layer: how many experts the tier
     /// holds — the ids after the stage card's `n_l` and the earlier
-    /// tiers'. The host holds the rest.
+    /// tiers', or under a rank the layer's coldest, tier 0 the coldest block.
+    /// The host holds the rest.
     pub tier_n_l: Vec<Vec<u64>>,
     /// The card byte budget the plan was made under: a card planned with
     /// `min(usable, budget)` usable bytes, its budget [`card_budget::of`]
@@ -279,6 +283,9 @@ pub struct Plan<'a> {
     /// The card budget is the one [`plan_in_pool`] lowered to the NVMe
     /// expert tier's floor, not one the caller gave.
     pub budget_from_pool: bool,
+    /// The router rank the plan took each routed layer's ids in
+    /// (`PlanLevers::expert_rank`); none, the id prefix and the ids after it.
+    pub expert_rank: Option<Arc<ExpertRank>>,
 }
 
 /// The one-stage reference of a one-expert-tier plan: the stage holds the union
@@ -372,6 +379,7 @@ pub fn union_plan<'a>(plan: &Plan<'a>, flat: &'a Machine) -> Result<Plan<'a>, Pl
     out.tier_n_l.clear();
     out.card_budget = card_budget::CardBudget::default();
     out.budget_from_pool = false;
+    out.expert_rank = None;
     let (heaps, _) = card_heaps(model, flat, &out.rows);
     let card = &flat.cards[0];
     let total = &mut out.cards[0];

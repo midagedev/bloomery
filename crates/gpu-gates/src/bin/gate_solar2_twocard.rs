@@ -290,6 +290,7 @@ mod gate {
         let place_levers = match Tier::from_env()? {
             Tier::Real => PlanLevers {
                 card_budget_bytes: Some(BUDGET).into(),
+                ..PlanLevers::default()
             },
             Tier::Fixture => tier::plan_levers(&split, &levers, 0)?,
         };

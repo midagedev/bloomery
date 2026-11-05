@@ -3,14 +3,14 @@
 //! so a lever the server would refuse is refused by the gate first.
 
 use bloomery_levers::{
-    CARD_BUDGET, CARD_DONTNEED, CED, DRAFT, ENGRAM_HELPER, HOST_LANES, HOST_LOCK, HOST_POPULATE,
-    HOSTSTREAM, MTP_WIDTH, PIN_MAIN, PREFILL, PREFILL_CUT, PREFILL_GROUP, R8, RESIDENCY,
-    ROUTE_TRACE, SCHEMAJUMP, SCREEN, STEP_STATS,
+    CARD_BUDGET, CARD_DONTNEED, CED, DRAFT, ENGRAM_HELPER, EXPERT_RANK, HOST_LANES, HOST_LOCK,
+    HOST_POPULATE, HOSTSTREAM, MTP_WIDTH, PIN_MAIN, PREFILL, PREFILL_CUT, PREFILL_GROUP, R8,
+    RESIDENCY, ROUTE_TRACE, SCHEMAJUMP, SCREEN, STEP_STATS,
 };
 
 /// Besides the pool's two: how a prompt is fed, and the batched feed's CED
-/// triangle and group; the step rows' helper; the placement's card budget;
-/// the main thread's pin and the lanes of the host tier's legs on its CCD
+/// triangle and group; the step rows' helper; the placement's card budget and
+/// router rank; the main thread's pin and the lanes of the host tier's legs on its CCD
 /// map; the host tier's load settings; the draft; the route
 /// trace; adaptive expert residency and its prompt streaming; the step
 /// statistics, whose rounds of several slots the seat counts, and which on
@@ -25,6 +25,7 @@ pub const ACTS_ON: &[&str] = &[
     PREFILL_CUT,
     ENGRAM_HELPER,
     CARD_BUDGET,
+    EXPERT_RANK,
     PIN_MAIN,
     HOST_LANES,
     HOST_POPULATE,

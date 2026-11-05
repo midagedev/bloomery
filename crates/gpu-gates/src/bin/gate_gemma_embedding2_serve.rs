@@ -491,6 +491,7 @@ mod gate {
         };
         let levers = |budget: u64| PlanLevers {
             card_budget_bytes: Some(budget).into(),
+            ..PlanLevers::default()
         };
         let (q, q0) = (place(Some(reserve))?, place(None)?);
         let p = q.plan(CTX, &levers(BUDGET + reserve))?;

@@ -153,6 +153,7 @@ mod gate {
         let card = whole.cards.first().ok_or("a plan of no card")?;
         Ok(PlanLevers {
             card_budget_bytes: Some(card.bytes() - card.expert_bytes / 2).into(),
+            ..PlanLevers::default()
         })
     }
 

@@ -1088,6 +1088,7 @@ fn hw_placement_unified_pool_lowers_the_card_budget() {
     let machine = workstation::plan_on(spec, inputs.model.layers);
     let whole = PlanLevers {
         card_budget_bytes: Some(u64::MAX).into(),
+        ..PlanLevers::default()
     };
     let mut bad = Vec::new();
     for slots in [NonZeroUsize::MIN, NonZeroUsize::new(2).expect("two")] {

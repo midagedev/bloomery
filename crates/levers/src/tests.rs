@@ -468,6 +468,7 @@ fn accessors_read_their_rows() {
     assert_eq!(unset.mtp_head_rows(), None);
     assert_eq!(unset.mtp_draft(), None);
     assert_eq!(unset.route_trace(), None);
+    assert_eq!(unset.expert_rank(), None);
     assert!(!unset.check_finite());
     assert!(!unset.mtp_windows());
     assert_eq!(unset.qwen38_experts(), "card");
@@ -503,6 +504,7 @@ fn accessors_read_their_rows() {
             (STEP_STATS, "1"),
             (CARD_BUDGET, "38G"),
             (CARD_MARGIN, "1G"),
+            (EXPERT_RANK, "/data/rank.tsv"),
             (PIN_MAIN, "0"),
             (DRAFT, "dspark"),
             (MTP_HEAD_ROWS, "/data/rows.txt"),
@@ -553,6 +555,7 @@ fn accessors_read_their_rows() {
     assert!(set.mtp_windows());
     assert_eq!(set.warm_profile(), Some(Path::new("/data/warm.bin")));
     assert_eq!(set.route_trace(), Some(Path::new("/data/trace")));
+    assert_eq!(set.expert_rank(), Some(Path::new("/data/rank.tsv")));
     assert!(set.check_finite());
     assert_eq!(set.residency(), Some("mid-p40-s1"));
     assert_eq!(set.qwen38_experts(), "card");
@@ -609,6 +612,7 @@ fn accessors_read_their_rows() {
             STEP_STATS,
             CARD_BUDGET,
             CARD_MARGIN,
+            EXPERT_RANK,
             HOST_ROOM,
             NVTIER_BYTES,
             NVTIER_READ,
@@ -730,6 +734,37 @@ fn the_need_hook_is_read_below_main() {
         panic!("a binary that leaves the lock out refuses it");
     };
     assert!(e.to_string().contains(HOST_LOCK), "{e}");
+}
+
+/// `BLOOMERY_EXPERT_RANK` takes a non-empty path, unset is no rank, an empty value
+/// is refused by name, and a binary that leaves the lever out refuses it.
+#[test]
+fn expert_rank_takes_a_path_and_a_binary_that_leaves_it_out_refuses_it() {
+    let rank = |pairs: &[(&str, &str)]| {
+        read(&env(pairs), Scope::Every).map(|l| l.expert_rank().map(Path::to_path_buf))
+    };
+    assert_eq!(rank(&[]).unwrap(), None);
+    assert_eq!(
+        rank(&[(EXPERT_RANK, "/data/rank.tsv")]).unwrap(),
+        Some(PathBuf::from("/data/rank.tsv"))
+    );
+    let Err(e) = rank(&[(EXPERT_RANK, "")]) else {
+        panic!("an empty path is refused");
+    };
+    assert!(e.to_string().contains(EXPERT_RANK), "{e}");
+    let acts = Scope::Main {
+        bin: "b",
+        acts_on: &[EXPERT_RANK],
+    };
+    assert!(read(&env(&[(EXPERT_RANK, "/data/rank.tsv")]), acts).is_ok());
+    let Err(e) = read(&env(&[(EXPERT_RANK, "/data/rank.tsv")]), NO_LEVER) else {
+        panic!("a binary that leaves the rank out refuses it");
+    };
+    assert!(e.to_string().contains(EXPERT_RANK), "{e}");
+    // A reading that left the lever out has it unset, where the placement's reader asks.
+    let none: &[(&str, &str)] = &[];
+    let left_out = read(&env(none), NO_LEVER).expect("an unset lever is no refusal");
+    assert_eq!(left_out.expert_rank(), None);
 }
 
 /// `BLOOMERY_NVTIER_EVICT` is read where the tier is built

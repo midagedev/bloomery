@@ -110,9 +110,24 @@
 //!   lever resolves for a batch feed (its `why` is not `prefill_steps`). The node exits 0 once
 //!   the stage closed its load. Precondition: the steps sent every tier layer a routed slot
 //!   through the node, and the stage's tier is on the node.
+//! - `--rank` (B10): the plan with a router rank (`BLOOMERY_EXPERT_RANK`). The gate writes a
+//!   rank file from the model's own routed layers, each layer's ids in a stride order that is not
+//!   the id order, and runs this binary as a child (`--rank-stage`) whose environment alone names
+//!   it, so no other clause's plan takes it. The child's gate plan names the file, keeps the
+//!   counts of the plan without it (`n_l`, the tier depth, the card's experts), and holds in each
+//!   routed stack the layer's hottest `n_l` ranked ids on the card, not its id prefix. Under it
+//!   the child runs T1: the tiered carve of that plan answers the reference load of the same plan
+//!   bit for bit, its stage graph has the reference's node count, every tier layer was sent a
+//!   routed slot. That is the slot map, the tier and the host set over lists that are no id
+//!   prefix. The child then leaves the [`PROMPT`] positions of its tiered run, and the gate feeds
+//!   the same ids over the tiered carve of the plan without the file and walks the child's
+//!   positions against its own within the logits band (`logits_band::walk`). The two plans keep
+//!   other experts on the card and the host, and a card expert and a host expert are not one
+//!   result bit for bit, so across plans the rows sit within the band, not on bits.
 //!
 //! Every clause is self-consistency (the tiered load against the reference load or against the
-//! same file fed another way), so the fixture tier runs all of them; each names its tag once
+//! same file fed another way, B10 the same plan under another expert order), so the fixture tier
+//! runs all of them; each names its tag once
 //! through `crate::ds41_tier::sc` before it runs, and the closing line counts them.
 
 #[cfg(feature = "deepseek41")]
@@ -154,7 +169,8 @@ mod ds41_tier;
 
 #[cfg(feature = "deepseek41")]
 mod gate {
-    use std::path::Path;
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::{Duration, Instant};
 
@@ -171,8 +187,8 @@ mod gate {
     use bloomery_gpu_gates::logits_band::{self, Positions};
     use bloomery_gpu_gates::{GateError, checks_failed, prose_ids, record};
     use bloomery_levers::{
-        CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, Levers, R8,
-        ResidencyAt, ResidencyWhy, TIER_LINK, TIER_NODES, TierLink,
+        CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, EXPERT_RANK, HOST_LOCK, HOST_POPULATE, Levers,
+        R8, ResidencyAt, ResidencyWhy, TIER_LINK, TIER_NODES, TierLink,
     };
     use cuda_core::DeviceBuffer;
     use gguf::Split;
@@ -249,6 +265,12 @@ mod gate {
     const NODE_STAGE_WITHIN: Duration = Duration::from_secs(600);
     /// How long the node may take to exit once the stage has ended.
     const NODE_CLOSE_WITHIN: Duration = Duration::from_secs(60);
+    /// The argument B10's child runs under ([`rank_case`]).
+    const RANK_STAGE: &str = "--rank-stage";
+    /// How long B10's child may take: its plans, one tiered load and the prompt's steps.
+    const RANK_STAGE_WITHIN: Duration = Duration::from_secs(600);
+    /// The file B10's child writes its run to, beside the rank file it ran under.
+    const RANK_ROWS: &str = "rows.bin";
 
     struct Args {
         union: bool,
@@ -262,8 +284,11 @@ mod gate {
         bfirst: bool,
         bfeat: bool,
         bnode: bool,
+        rank: bool,
         /// B9's stage, the child [`node_case`] runs: alone, never beside a clause.
         bnode_stage: bool,
+        /// B10's stage, the child [`rank_case`] runs: alone, never beside a clause.
+        rank_stage: bool,
     }
 
     impl Args {
@@ -282,7 +307,7 @@ mod gate {
     fn parse_args() -> Result<Args, GateError> {
         const USAGE: &str = "usage: gate_deepseek41_tier [--union] [--fault] [--lost] [--two] \
                              [--batch] [--batch2] [--bfault] [--blost] [--bfirst] [--bfeat] \
-                             [--bnode]";
+                             [--bnode] [--rank]";
         let mut a = Args {
             union: false,
             fault: false,
@@ -295,7 +320,9 @@ mod gate {
             bfirst: false,
             bfeat: false,
             bnode: false,
+            rank: false,
             bnode_stage: false,
+            rank_stage: false,
         };
         for arg in std::env::args().skip(1) {
             match arg.as_str() {
@@ -310,19 +337,26 @@ mod gate {
                 "--bfirst" => a.bfirst = true,
                 "--bfeat" => a.bfeat = true,
                 "--bnode" => a.bnode = true,
+                "--rank" => a.rank = true,
                 NODE_STAGE => a.bnode_stage = true,
+                RANK_STAGE => a.rank_stage = true,
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             }
         }
-        let clause = a.on_load() || a.two || a.bfirst || a.bfeat || a.bnode;
-        if a.bnode_stage && clause {
-            return Err(format!(
-                "{NODE_STAGE} is B9's stage, which the gate runs as a child of its own: never \
-                 beside a clause"
-            )
-            .into());
+        let clause = a.on_load() || a.two || a.bfirst || a.bfeat || a.bnode || a.rank;
+        for (on, stage, owner) in [
+            (a.bnode_stage, NODE_STAGE, "B9's"),
+            (a.rank_stage, RANK_STAGE, "B10's"),
+        ] {
+            if on && (clause || a.bnode_stage == a.rank_stage) {
+                return Err(format!(
+                    "{stage} is {owner} stage, which the gate runs as a child of its own: never \
+                     beside a clause or the other stage"
+                )
+                .into());
+            }
         }
-        if !(clause || a.bnode_stage) {
+        if !(clause || a.bnode_stage || a.rank_stage) {
             return Err(USAGE.into());
         }
         Ok(a)
@@ -782,6 +816,7 @@ mod gate {
         let levers = bloomery_levers::at_main(&[
             ENGRAM_HELPER,
             CARD_BUDGET,
+            EXPERT_RANK,
             HOST_POPULATE,
             HOST_LOCK,
             CARD_DONTNEED,
@@ -848,6 +883,10 @@ mod gate {
                 "B9: one batch over a tier on a node: the node computes its block, within the \
                  logits band of the steps and bit for bit the same plan's with its tier a card",
             ),
+            (
+                args.rank,
+                "B10: a router rank moves the experts' homes, not the tokens",
+            ),
         ] {
             if on {
                 crate::ds41_tier::sc(name)?;
@@ -888,6 +927,42 @@ mod gate {
             tier_layers.len(),
             k3 * tier_layers.len()
         );
+        if args.rank_stage {
+            let base = inputs.plan(
+                &machine,
+                workstation::CTX_MAX,
+                &model::placement::PlanLevers {
+                    expert_rank: None,
+                    ..cfg.place.clone()
+                },
+            )?;
+            let mut pass = rank_plan(&plan, &base)?;
+            let Some(rank) = plan.expert_rank.as_deref() else {
+                return rank_verdict(false);
+            };
+            let prompt = prose_ids("engram", PROMPT)?;
+            let mut reference = open(split()?, &plan, None, &meta)?;
+            let want = union_run(&mut reference, &prompt)?;
+            drop(reference);
+            let mut m = open(split()?, &tplan, Some(tier_open()), &meta)?;
+            let got = union_run(&mut m, &prompt)?;
+            pass &= tiered_is_reference(
+                (
+                    "B10",
+                    "B10 (the tiered load under the rank is the reference load under it)",
+                ),
+                &m,
+                (&want, &got),
+                &tier_layers,
+            )?;
+            drop(m);
+            write_rows(
+                &Path::new(rank.path()).with_file_name(RANK_ROWS),
+                &got,
+                prompt.len(),
+            )?;
+            return rank_verdict(pass);
+        }
         if args.bnode_stage {
             let ids = prose_ids("engram", BATCH_P2)?;
             let node = node_open(&card, device)?;
@@ -927,9 +1002,17 @@ mod gate {
 
         if args.bnode {
             pass &= node_case(&path)?;
-            if !(args.on_load() || args.bfirst || args.bfeat) {
-                return verdict(pass);
-            }
+        }
+        if args.rank {
+            pass &= rank_case(
+                &path,
+                (&inputs, &plan, &tplan),
+                (&meta, tier_open()),
+                &levers,
+            )?;
+        }
+        if (args.bnode || args.rank) && !(args.on_load() || args.bfirst || args.bfeat) {
+            return verdict(pass);
         }
 
         let prompt = prose_ids("engram", PROMPT)?;
@@ -1000,52 +1083,12 @@ mod gate {
         if let Some(want) = &want.union {
             if args.union {
                 let got = union_run(&mut m, &prompt)?;
-                pass &= same("T1 (step, 32 steps, pairs, eager)", want, &got);
-                if got.stage_nodes != want.stage_nodes {
-                    println!(
-                        "FAIL T1 structure: stage graph of {:?} nodes, the reference's {:?}",
-                        got.stage_nodes, want.stage_nodes
-                    );
-                    pass = false;
-                } else {
-                    println!(
-                        "ok T1 structure: stage graph of {:?} nodes, the reference's",
-                        got.stage_nodes
-                    );
-                }
-                let body = m.body(NAME)?;
-                let tier = body
-                    .hybrid()
-                    .tiers()
-                    .first()
-                    .ok_or("the tiered load holds no tier card")?;
-                let st = tier.stats();
-                let first = tier.set().layers().start;
-                let missing: Vec<usize> = tier_layers
-                    .iter()
-                    .copied()
-                    .filter(|&l| st.layer_hits.get(l - first).copied().unwrap_or(0) == 0)
-                    .collect();
-                let hits: u64 = st.layer_hits.iter().sum();
-                println!(
-                    "tier: {} layers asked, {} settles ({} early), hits {hits} over {} layers; graph \
-                     nodes step {:?} pair {:?}",
-                    st.issued,
-                    st.settles,
-                    st.settle_early,
-                    tier_layers.len(),
-                    tier.graph_nodes(Chain::Step),
-                    tier.graph_nodes(Chain::Pair)
-                );
-                if missing.is_empty() {
-                    println!("ok precondition: every tier layer was sent a routed slot");
-                } else {
-                    println!(
-                        "FAIL precondition: tier layers {missing:?} were sent no routed slot; T1 proves \
-                         nothing there"
-                    );
-                    pass = false;
-                }
+                pass &= tiered_is_reference(
+                    ("T1", "T1 (step, 32 steps, pairs, eager)"),
+                    &m,
+                    (want, &got),
+                    &tier_layers,
+                )?;
             }
             if args.fault {
                 let first = *tier_layers
@@ -1294,6 +1337,343 @@ mod gate {
         );
         pass &= ok;
         Ok(pass)
+    }
+
+    /// T1's checks on `m`, the tiered load, after `union_run` left `got`: the run is the
+    /// reference's `want` bit for bit, the stage graph has the reference's node count, and every
+    /// layer of `tier_layers` was sent at least one routed slot over the run, or the clause proves
+    /// nothing there. `tag` names the clause on the lines, `what` the run.
+    fn tiered_is_reference(
+        (tag, what): (&str, &str),
+        m: &Deepseek41Model,
+        (want, got): (&Run, &Run),
+        tier_layers: &[usize],
+    ) -> Result<bool, GateError> {
+        let mut pass = same(what, want, got);
+        if got.stage_nodes != want.stage_nodes {
+            println!(
+                "FAIL {tag} structure: stage graph of {:?} nodes, the reference's {:?}",
+                got.stage_nodes, want.stage_nodes
+            );
+            pass = false;
+        } else {
+            println!(
+                "ok {tag} structure: stage graph of {:?} nodes, the reference's",
+                got.stage_nodes
+            );
+        }
+        let body = m.body(NAME)?;
+        let tier = body
+            .hybrid()
+            .tiers()
+            .first()
+            .ok_or("the tiered load holds no tier card")?;
+        let st = tier.stats();
+        let first = tier.set().layers().start;
+        let missing: Vec<usize> = tier_layers
+            .iter()
+            .copied()
+            .filter(|&l| st.layer_hits.get(l - first).copied().unwrap_or(0) == 0)
+            .collect();
+        let hits: u64 = st.layer_hits.iter().sum();
+        println!(
+            "tier: {} layers asked, {} settles ({} early), hits {hits} over {} layers; graph \
+             nodes step {:?} pair {:?}",
+            st.issued,
+            st.settles,
+            st.settle_early,
+            tier_layers.len(),
+            tier.graph_nodes(Chain::Step),
+            tier.graph_nodes(Chain::Pair)
+        );
+        if missing.is_empty() {
+            println!("ok {tag} precondition: every tier layer was sent a routed slot");
+        } else {
+            println!(
+                "FAIL {tag} precondition: tier layers {missing:?} were sent no routed slot; {tag} \
+                 proves nothing there"
+            );
+            pass = false;
+        }
+        Ok(pass)
+    }
+
+    /// B10 (module header), the gate's side: a rank file for `plan`'s model ([`write_rank`]), then
+    /// this binary as the child under [`RANK_STAGE`] with the file in its environment alone, and
+    /// the prompt fed one step a position over the tiered carve of `tplan`, the plan without the
+    /// file. The child must end 0 within its bound and leave its run beside the rank file; its
+    /// positions are walked against the gate's within the logits band. A child past its bound is
+    /// killed and the clause fails by name.
+    fn rank_case(
+        model: &str,
+        (inputs, plan, tplan): (&PlanInputs, &Plan<'_>, &Plan<'_>),
+        (meta, tier): (&BodyMeta, TierOpen),
+        levers: &Levers,
+    ) -> Result<bool, GateError> {
+        if levers.expert_rank().is_some() || plan.expert_rank.is_some() {
+            return Err(format!("{EXPERT_RANK} is set: B10 sets it for its stage alone").into());
+        }
+        let dir = std::env::temp_dir().join(format!("bloomery-b10-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let _clean = RemoveDir(dir.clone());
+        let file = write_rank(&dir, inputs, plan)?;
+        println!("B10: rank file {}", file.display());
+        let mut cmd = Command::new(std::env::current_exe()?);
+        cmd.arg(RANK_STAGE).env(EXPERT_RANK, &file);
+        let mut stage = crate::node_proc::Proc::spawn(cmd, "B10 stage")?;
+        println!("B10: stage pid {}", stage.id());
+        let ended = stage.wait_within(RANK_STAGE_WITHIN)?;
+        drop(stage);
+        match ended {
+            Some(s) if s.success() => println!("ok B10 stage: it exited 0"),
+            Some(s) => {
+                println!("FAIL B10 stage: {s}");
+                return Ok(false);
+            }
+            None => {
+                println!("FAIL B10 stage: still running after {RANK_STAGE_WITHIN:?}; killed");
+                return Ok(false);
+            }
+        }
+        let got = read_rows(&dir.join(RANK_ROWS))?;
+        let mut m = open(Split::open(model)?, tplan, Some(tier), meta)?;
+        let want = rank_run(&mut m, &prose_ids("engram", PROMPT)?)?;
+        drop(m);
+        Ok(in_band(
+            "B10 (the prompt's steps under the rank against the plan without it)",
+            &want,
+            &got,
+        ))
+    }
+
+    /// The prompt `ids` fed one decode step per position on `m`, graph mode from a reset: each
+    /// position's argmax and logits row.
+    fn rank_run(m: &mut Deepseek41Model, ids: &[u32]) -> Result<Run, GateError> {
+        let mut run = Run::default();
+        m.set_mode(StepMode::Graph);
+        m.reset()?;
+        for &id in ids {
+            let tok = m.step(&[id])?;
+            run.push(tok, m.logits()?);
+        }
+        Ok(run)
+    }
+
+    /// `run`'s first `n` positions' tokens and logits rows in `path`: the position count and the
+    /// row width as two little-endian `u32`s, the tokens, then the rows' `f32`s, all
+    /// little-endian.
+    fn write_rows(path: &Path, run: &Run, n: usize) -> Result<(), GateError> {
+        use std::io::Write;
+        let (Some(tokens), Some(rows)) = (run.tokens.get(..n), run.logits.get(..n)) else {
+            return Err(format!("B10: the run holds fewer than {n} positions").into());
+        };
+        let width = rows.first().map_or(0, Vec::len);
+        let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+        f.write_all(&u32::try_from(n)?.to_le_bytes())?;
+        f.write_all(&u32::try_from(width)?.to_le_bytes())?;
+        for t in tokens {
+            f.write_all(&t.to_le_bytes())?;
+        }
+        for row in rows {
+            if row.len() != width {
+                return Err(format!(
+                    "B10: a logits row of {} values, the first has {width}",
+                    row.len()
+                )
+                .into());
+            }
+            for x in row {
+                f.write_all(&x.to_le_bytes())?;
+            }
+        }
+        f.flush()?;
+        Ok(())
+    }
+
+    /// The run [`write_rows`] wrote; a file of another size than its two counts give is refused
+    /// by name.
+    fn read_rows(path: &Path) -> Result<Run, GateError> {
+        let bytes = std::fs::read(path).map_err(|e| format!("B10: {}: {e}", path.display()))?;
+        let word = |at: usize| -> Result<[u8; 4], GateError> {
+            bytes
+                .get(at..at + 4)
+                .and_then(|b| b.try_into().ok())
+                .ok_or_else(|| "B10: the stage's rows file is cut short".into())
+        };
+        let n = usize::try_from(u32::from_le_bytes(word(0)?))?;
+        let width = usize::try_from(u32::from_le_bytes(word(4)?))?;
+        let want = 8 + 4 * n + 4 * n * width;
+        if bytes.len() != want {
+            return Err(format!(
+                "B10: the stage's rows file holds {} bytes, {n} positions of {width} values take \
+                 {want}",
+                bytes.len()
+            )
+            .into());
+        }
+        let tokens = (0..n)
+            .map(|i| word(8 + 4 * i).map(u32::from_le_bytes))
+            .collect::<Result<Vec<_>, _>>()?;
+        let rows_at = 8 + 4 * n;
+        let logits = (0..n)
+            .map(|i| {
+                (0..width)
+                    .map(|j| word(rows_at + 4 * (i * width + j)).map(f32::from_le_bytes))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Run {
+            tokens,
+            logits,
+            stage_nodes: None,
+        })
+    }
+
+    /// A directory removed when dropped.
+    struct RemoveDir(PathBuf);
+
+    impl Drop for RemoveDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The rank file for `plan`'s model in `dir`: the format of `tools/ref/router-rank.py`, every
+    /// routed layer's `n_expert` ids once in a stride order. The stride is the smallest of 3 or
+    /// more with no factor in common with `n_expert`, offset by the layer, so a layer's first ids
+    /// are neither its id prefix nor the same ids of another layer. No count of routed experts
+    /// that has no such stride, and no model whose routed stacks differ in expert count, has a
+    /// rank: refused by name.
+    fn write_rank(dir: &Path, inputs: &PlanInputs, plan: &Plan<'_>) -> Result<PathBuf, GateError> {
+        fn gcd(a: u64, b: u64) -> u64 {
+            if b == 0 { a } else { gcd(b, a % b) }
+        }
+        let n = plan.model.experts;
+        let stride = (3..n)
+            .find(|&s| gcd(s, n) == 1)
+            .ok_or_else(|| format!("B10: {n} experts have no stride of 3 or more coprime to it"))?;
+        let mut layers = BTreeSet::new();
+        for t in &plan.model.tensors {
+            if t.role == Role::RoutedExperts {
+                layers.insert(
+                    t.layer
+                        .ok_or_else(|| format!("{}: a routed stack without a layer", t.name))?,
+                );
+            }
+        }
+        if layers.is_empty() {
+            return Err("B10: the model has no routed layer".into());
+        }
+        let mut text = format!(
+            "# router-rank\tn_expert={n}\tn_used={}\tsets=gate-b10\tpositions=1\n",
+            u64::try_from(inputs.hp.experts.n_used)?
+        );
+        for layer in layers {
+            let ids: Vec<String> = (0..n)
+                .map(|i| ((i * stride + layer as u64) % n).to_string())
+                .collect();
+            text.push_str(&format!("{layer}\t{}\n", ids.join(",")));
+        }
+        let file = dir.join("rank.tsv");
+        std::fs::write(&file, text)?;
+        Ok(file)
+    }
+
+    /// B10's plan clauses on `plan`, the gate plan under the rank, against `base`, the same plan
+    /// without it: it names a rank; its counts (`n_l`, the tier's, the card's experts) are
+    /// `base`'s; each routed stack's card list is the layer's hottest `n_l` ranked ids; and the
+    /// rank moved a card list off the id prefix, or the clause proves nothing.
+    fn rank_plan(plan: &Plan<'_>, base: &Plan<'_>) -> Result<bool, GateError> {
+        let Some(rank) = plan.expert_rank.as_deref() else {
+            println!(
+                "FAIL B10 plan: the plan names no rank: {EXPERT_RANK} did not reach the planner"
+            );
+            return Ok(false);
+        };
+        println!(
+            "B10: the plan names the rank {} ({} layers, sets {}, {} positions)",
+            rank.path(),
+            rank.layers().count(),
+            rank.sets(),
+            rank.positions()
+        );
+        let mut pass = true;
+        let same_counts = plan.n_l == base.n_l
+            && plan.tier_n_l == base.tier_n_l
+            && plan.cards[0].experts == base.cards[0].experts;
+        println!(
+            "{} B10 plan counts: n_l, the tier's and the card's {} experts are the plan without \
+             the rank's",
+            if same_counts { "ok" } else { "FAIL" },
+            plan.cards[0].experts
+        );
+        pass &= same_counts;
+        let (mut stacks, mut moved) = (0usize, 0usize);
+        let mut wrong = Vec::new();
+        for row in &plan.rows {
+            let t = &plan.model.tensors[row.tensor];
+            if t.role != Role::RoutedExperts {
+                continue;
+            }
+            let Some(card) = row.segments.iter().find(|s| s.device == Device::Card(0)) else {
+                continue;
+            };
+            let layer = t
+                .layer
+                .ok_or_else(|| format!("{}: a routed stack without a layer", t.name))?;
+            let have = card
+                .experts
+                .as_ref()
+                .ok_or_else(|| format!("{}: a card segment without experts", t.name))?
+                .ids();
+            let hottest = rank
+                .ranked(layer)
+                .and_then(|ids| ids.get(..have.len()))
+                .map(|ids| {
+                    let mut ids = ids.to_vec();
+                    ids.sort_unstable();
+                    ids
+                });
+            stacks += 1;
+            if hottest.as_deref() != Some(have) {
+                wrong.push(t.name.clone());
+            }
+            if have.iter().copied().ne(0..u32::try_from(have.len())?) {
+                moved += 1;
+            }
+        }
+        if wrong.is_empty() {
+            println!(
+                "ok B10 plan lists: the card list of each of {stacks} routed stacks is its \
+                 layer's hottest ranked ids"
+            );
+        } else {
+            println!(
+                "FAIL B10 plan lists: stacks {wrong:?} are not their layer's hottest ranked ids"
+            );
+            pass = false;
+        }
+        if moved == 0 {
+            println!(
+                "FAIL B10 precondition: the rank left every card list its id prefix; the clause \
+                 proves nothing"
+            );
+            pass = false;
+        } else {
+            println!(
+                "ok B10 precondition: the rank moved the card list of {moved} of {stacks} stacks \
+                 off the id prefix"
+            );
+        }
+        Ok(pass)
+    }
+
+    fn rank_verdict(pass: bool) -> Result<(), GateError> {
+        if !pass {
+            return Err(checks_failed());
+        }
+        println!("PASSED: {NAME} {RANK_STAGE}");
+        Ok(())
     }
 
     /// The precondition of B9 `what`: the steps sent every layer of `tier_layers` at least one

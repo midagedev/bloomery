@@ -42,6 +42,7 @@ mod gate {
             CTX,
             &PlanLevers {
                 card_budget_bytes: Some(budget).into(),
+                ..PlanLevers::default()
             },
             KdaLanes::Two,
             &[half, inputs.model.experts - half],

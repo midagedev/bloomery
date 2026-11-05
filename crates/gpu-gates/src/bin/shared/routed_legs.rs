@@ -1049,6 +1049,7 @@ fn rooms_of(
 fn budget(bytes: u64) -> PlanLevers {
     PlanLevers {
         card_budget_bytes: Some(bytes).into(),
+        ..PlanLevers::default()
     }
 }
 

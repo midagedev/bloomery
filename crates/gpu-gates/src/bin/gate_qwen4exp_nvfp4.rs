@@ -239,6 +239,7 @@ mod gate {
             (Tier::Real, _) => Ok(PlanLevers::default()),
             (Tier::Fixture, CardBudget::Every(b)) => Ok(PlanLevers {
                 card_budget_bytes: CardBudget::Every(b),
+                ..PlanLevers::default()
             }),
             (Tier::Fixture, other) => Err(format!(
                 "{GATE}: BLOOMERY_CARD_BUDGET is {other:?}; the fixture tier sets it to the one \
@@ -720,6 +721,7 @@ mod gate {
         let budget_bytes = (card_bytes + spec.margin()).saturating_sub(short);
         let budget = PlanLevers {
             card_budget_bytes: Some(budget_bytes).into(),
+            ..PlanLevers::default()
         };
         open.plan_levers = &budget;
         let planned = open.plan(model_of(path)?)?;

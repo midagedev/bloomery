@@ -2782,6 +2782,7 @@ mod gate {
         );
         let plan_levers = PlanLevers {
             card_budget_bytes: levers.card_budget(),
+            ..PlanLevers::default()
         };
         let plan = inputs.plan_mtp_with_slots(
             &machine,

@@ -2251,6 +2251,7 @@ mod tests {
         fn nvme_room_is_capped_by_the_unified_pool() {
             let levers = PlanLevers {
                 card_budget_bytes: bloomery_levers::CardBudget::Every(1 << 30),
+                ..PlanLevers::default()
             };
             for slots in [1, 2, 4] {
                 let ample = unified(1 << 40);
@@ -2287,6 +2288,7 @@ mod tests {
         fn nextn_nvme_room_is_capped_by_the_unified_pool() {
             let levers = PlanLevers {
                 card_budget_bytes: bloomery_levers::CardBudget::Every(1 << 30),
+                ..PlanLevers::default()
             };
             let nextn = nextn();
             for slots in [1, 2, 4] {
@@ -2328,6 +2330,7 @@ mod tests {
         fn node_nvme_room_is_capped_by_the_unified_pool() {
             let levers = PlanLevers {
                 card_budget_bytes: bloomery_levers::CardBudget::Every(1 << 30),
+                ..PlanLevers::default()
             };
             for ranks in [1, 2, 4] {
                 let wide = routed(1 << 40);
@@ -2477,6 +2480,7 @@ mod tests {
             let (m, nextn) = (machine(LAYERS), nextn());
             let levers = PlanLevers {
                 card_budget_bytes: Some(1 << 30).into(),
+                ..PlanLevers::default()
             };
             let ample = routed(u64::MAX);
             let whole = ample
@@ -2512,6 +2516,7 @@ mod tests {
             let unset = PlanLevers::default();
             let whole = PlanLevers {
                 card_budget_bytes: Some(u64::MAX).into(),
+                ..PlanLevers::default()
             };
             let nextn = nextn();
             let draft = nextn.model.tensors[1].file_bytes;

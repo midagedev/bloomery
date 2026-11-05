@@ -253,6 +253,7 @@ fn a_node_host_projection_keeps_non_routed_rows_on_node_zero() {
                 &NoKv,
                 &PlanLevers {
                     card_budget_bytes: budget.into(),
+                    ..PlanLevers::default()
                 },
                 RoutedRule::PerType(|_| Some(CardFormat::KQuant)),
             )

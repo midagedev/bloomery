@@ -3323,6 +3323,7 @@ mod tests {
         );
         let levers = PlanLevers {
             card_budget_bytes: bloomery_levers::CardBudget::default(),
+            ..PlanLevers::default()
         };
         for ubatch in [1, 8, 512, 4096] {
             for (input, tier) in [
@@ -3447,6 +3448,7 @@ mod tests {
         workstation::reserve_stream_staging(&mut host_only, words.stream_slot(host).unwrap());
         let levers = PlanLevers {
             card_budget_bytes: bloomery_levers::CardBudget::default(),
+            ..PlanLevers::default()
         };
         let how = Hosting {
             lock: false,
@@ -3987,6 +3989,7 @@ mod tests {
             let (model, machine) = (model(), machine(131 * MIB));
             let levers = PlanLevers {
                 card_budget_bytes: Some(2 * MIB).into(),
+                ..PlanLevers::default()
             };
             let card = card_plan(&model, &machine, &levers, 0);
             let host = placement::plan_host_routed(&model, &machine, 4096, &NoKv, &levers)
@@ -5237,6 +5240,7 @@ mod tests {
             inputs.room = (pool, HostRead::Given);
             let whole = PlanLevers {
                 card_budget_bytes: Some(u64::MAX).into(),
+                ..PlanLevers::default()
             };
             for n in [1, 2] {
                 match inputs.plan_with_slots(
@@ -5296,6 +5300,7 @@ mod tests {
         fn nvme_room_is_capped_by_the_unified_pool() {
             let levers = PlanLevers {
                 card_budget_bytes: bloomery_levers::CardBudget::Every(1 << 30),
+                ..PlanLevers::default()
             };
             let mut inputs = routed(inputs());
             for slots in [1, 2, 4] {
@@ -5351,6 +5356,7 @@ mod tests {
         fn node_nvme_room_is_capped_by_the_unified_pool() {
             let levers = PlanLevers {
                 card_budget_bytes: bloomery_levers::CardBudget::Every(1 << 30),
+                ..PlanLevers::default()
             };
             let mut inputs = routed(inputs());
             for ranks in [1, 2, 4] {
@@ -5435,6 +5441,7 @@ mod tests {
             for budget in [None, Some(32 << 20), Some(u64::MAX)] {
                 let levers = PlanLevers {
                     card_budget_bytes: budget.into(),
+                    ..PlanLevers::default()
                 };
                 for owned in [[0, 512], [256, 256], [511, 1]] {
                     let result = inputs.plan_nodes(
@@ -5490,6 +5497,7 @@ mod tests {
                         (CTX, UBATCH_PLANNED.min(CTX)),
                         &PlanLevers {
                             card_budget_bytes: Some(0).into(),
+                            ..PlanLevers::default()
                         },
                         &[256, 256],
                     )
@@ -5543,6 +5551,7 @@ mod tests {
                     (CTX, UBATCH_PLANNED.min(CTX)),
                     &PlanLevers {
                         card_budget_bytes: Some(u64::MAX).into(),
+                        ..PlanLevers::default()
                     },
                     &[0, 512],
                 ),

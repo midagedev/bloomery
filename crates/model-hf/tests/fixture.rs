@@ -1334,6 +1334,7 @@ fn hw_fixture_v41_budget() {
     let at = |budget: Option<u64>, ctx: u64, slots: usize| -> Result<Vec<u64>, String> {
         let levers = PlanLevers {
             card_budget_bytes: budget.into(),
+            ..PlanLevers::default()
         };
         let slots = NonZeroUsize::new(slots).unwrap();
         inputs
@@ -2768,6 +2769,7 @@ fn hw_fixture_q38_budget() {
         );
         let levers = PlanLevers {
             card_budget_bytes: budget.into(),
+            ..PlanLevers::default()
         };
         inputs
             .plan_with_slots(
@@ -3314,6 +3316,7 @@ fn hw_fixture_glm_budget() {
     let with_nextn = |budget: Option<u64>, ctx: u64| -> Result<Vec<u64>, String> {
         let levers = PlanLevers {
             card_budget_bytes: budget.into(),
+            ..PlanLevers::default()
         };
         inputs
             .plan_nextn(&machine, ctx, &levers, &nextn)
@@ -3323,6 +3326,7 @@ fn hw_fixture_glm_budget() {
     let plain = |budget: Option<u64>, ctx: u64| -> Result<Vec<u64>, String> {
         let levers = PlanLevers {
             card_budget_bytes: budget.into(),
+            ..PlanLevers::default()
         };
         inputs
             .plan(&machine, ctx, &levers)
@@ -5348,6 +5352,7 @@ fn hw_fixture_solar_budget() {
     let counts = |budget: Option<u64>| -> Vec<u64> {
         let levers = PlanLevers {
             card_budget_bytes: budget.into(),
+            ..PlanLevers::default()
         };
         inputs
             .plan(&machine, ctx, &levers)

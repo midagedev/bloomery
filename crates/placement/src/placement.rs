@@ -12,7 +12,9 @@
 //! Routed experts follow one rule ([`plan`]): the eligible layers of a card
 //! keep the same number of experts on it, give or take one — the count
 //! `n_l` — and the rest stay on the host. Which experts a layer keeps is an
-//! [`ExpertList`]: the id prefix `[0, n_l)`. A card byte budget
+//! [`ExpertList`]: the id prefix `[0, n_l)`, or under a router rank
+//! (`BLOOMERY_EXPERT_RANK`, [`ExpertRank`]) the layer's hottest `n_l` ids. A
+//! card byte budget
 //! (`BLOOMERY_CARD_BUDGET`, [`card_budget`]: one for every card, or one per
 //! card) caps a card's usable bytes before the rule runs — the lever comes in
 //! as [`PlanLevers`], which a binary parses once — and the census's free
@@ -24,7 +26,8 @@
 //! that run no stage and hold only routed experts beside the host. The stage
 //! cards are planned first, exactly as without tiers; then each tier, in
 //! order, takes per eligible layer the ids after the stage card's `n_l` and
-//! the earlier tiers', in id order, one
+//! the earlier tiers', in id order — under a rank the layer's coldest ids,
+//! tier 0 the coldest block — one
 //! expert at a time on the layer that holds the fewest so far, so the
 //! per-layer totals stay even ([`Plan::tier_n_l`]).
 
@@ -47,6 +50,7 @@ mod qwen38_cards;
 mod machine;
 mod planner;
 mod pool;
+mod rank;
 mod refusal;
 mod room;
 mod rule;
@@ -67,6 +71,7 @@ pub use planner::{
     plan_routed_reserving, plan_with,
 };
 pub use pool::{PoolNeed, plan_in_pool};
+pub use rank::ExpertRank;
 pub use refusal::{CardFreeFloor, PlacementError, Violation};
 pub use room::{
     ARENA_ALIGN, ARENA_LANE_SLOTS, ArenaDial, ArenaFloor, RowTableSource, STEP_PORT_COLUMNS,
