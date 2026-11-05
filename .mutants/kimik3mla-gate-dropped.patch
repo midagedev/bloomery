@@ -1,0 +1,12 @@
+--- a/crates/gpu/src/linear/out_gate.rs
++++ b/crates/gpu/src/linear/out_gate.rs
+@@ -71,7 +71,8 @@
+         // SAFETY: i < HEAD·n_head·m <= attn.len(), gate.len() by the launch
+         // contract.
+         let (a, g) = unsafe { (*attn.get_unchecked(i), *gate.get_unchecked(i)) };
+-        let out = mul_rn_f32(a, sigmoid(g));
++        // mutant kimik3mla-gate-dropped: the value written is the ungated head.
++        let out = mul_rn_f32(a, 1.0);
+         let ok = a.is_finite() & g.is_finite() & out.is_finite();
+         if !ok {
+             fault.raise(FaultSite::F32Product);

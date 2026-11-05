@@ -148,6 +148,47 @@ impl MlaDims {
         }
         Ok(())
     }
+
+    /// Refuse by name per-head weights that are not this layer's: `attn_k_b` is
+    /// `heads · LATENT` rows of `nope` values and `attn_v_b` is `heads ·
+    /// v_head` rows, so planes that disagree with the dims would otherwise run
+    /// on other widths or on fewer heads without a word.
+    pub fn check_heads(
+        &self,
+        k_b: (&DeviceTensor<u32>, &DeviceTensor<u16>),
+        v_b: &ValueW<'_>,
+    ) -> Result<(), GpuError> {
+        let (qs, d) = k_b;
+        let k_rows = self.heads * LATENT;
+        if qs.rows() != k_rows || d.rows() != k_rows || d.cols() * 32 != self.nope {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "attn_k_b holds {} rows of {} values; {} heads of nope {} are {k_rows} rows of {}",
+                    qs.rows(),
+                    d.cols() * 32,
+                    self.heads,
+                    self.nope,
+                    self.nope
+                ),
+            ));
+        }
+        let v_rows = self.heads * self.v_head;
+        let have = match v_b {
+            ValueW::Q6K(w) => w.rows(),
+            ValueW::Q8_0(qs, _) => qs.rows(),
+        };
+        if have != v_rows {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "attn_v_b holds {have} rows; {} heads of {} values are {v_rows}",
+                    self.heads, self.v_head
+                ),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// How a layer's per-head value projection runs, by the file type of
@@ -419,6 +460,7 @@ pub fn attend(
     cache: &mut DeviceTensor<u16>,
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
+    d.check_heads(a.k_b, &a.v_b)?;
     let stream = gpu.stream();
     k.latent.enqueue_latent_extra_append(
         stream,
@@ -539,6 +581,7 @@ pub fn attend_rows(
     if m == 1 {
         return attend(gpu, k, d, a, s, cache, y);
     }
+    d.check_heads(a.k_b, &a.v_b)?;
     let (hk, row, hl, hv) = (
         d.heads * d.head_k(),
         d.heads * d.row(),
