@@ -9,7 +9,7 @@
 //!
 //! No program runs the architecture yet, so the coverage table's list is not read here.
 
-use gguf::{GgmlType, Split, Value};
+use gguf::{GENERAL_ARCHITECTURE, GgmlType, Split, Value};
 use model::arch::kimi_k3::fixture as k3;
 use model::fixture::{FilePlan, FixtureSpec};
 use model::placement::Role;
@@ -603,7 +603,8 @@ fn kimi_k3_fixture_cut() {
     // The one shard's range follows the tensors the plan holds.
     let drop = |p: &mut FilePlan, name: &str| {
         p.tensors.retain(|t| t.name != name);
-        p.shards = vec![0..p.tensors.len()];
+        p.shards.clear();
+        p.shards.push(0..p.tensors.len());
     };
     let results = [
         mutant(
@@ -726,7 +727,7 @@ fn kimi_k3_fixture_cut() {
 fn another_architecture_is_not_kimi_k3() {
     for arch in ["deepseek41", "glm5next"] {
         let mut table = serde_json::from_str::<serde_json::Value>(KV).expect("the table parses");
-        table["general.architecture"] = serde_json::Value::String(arch.to_string());
+        table[GENERAL_ARCHITECTURE] = serde_json::Value::String(arch.to_string());
         let split =
             header_tables::header_of(&format!("k3-not-{arch}"), &table.to_string(), TENSORS);
         match model::arch::kimi_k3::spec::read(&split) {
@@ -734,7 +735,7 @@ fn another_architecture_is_not_kimi_k3() {
             Err(e) => {
                 let e = e.to_string();
                 assert!(
-                    e.contains("general.architecture") && e.contains(arch),
+                    e.contains(GENERAL_ARCHITECTURE) && e.contains(arch),
                     "{arch}: {e}"
                 );
             }

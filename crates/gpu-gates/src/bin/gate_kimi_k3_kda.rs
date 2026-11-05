@@ -197,7 +197,7 @@ mod gate {
     /// One dot in f64, four partial sums.
     fn dot(w: &[f32], x: &[f64]) -> f64 {
         let mut a = [0.0f64; 4];
-        for (wc, xc) in w.chunks_exact(4).zip(x.chunks_exact(4)) {
+        for (wc, xc) in w.as_chunks::<4>().0.iter().zip(x.as_chunks::<4>().0) {
             for ((acc, &wv), &xv) in a.iter_mut().zip(wc).zip(xc) {
                 *acc += f64::from(wv) * xv;
             }

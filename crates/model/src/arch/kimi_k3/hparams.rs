@@ -1018,7 +1018,7 @@ pub(super) mod tests {
             match got {
                 Ok(_) => panic!("{arch}: read"),
                 Err(e) => assert!(
-                    e.contains("general.architecture") && e.contains(arch),
+                    e.contains(gguf::GENERAL_ARCHITECTURE) && e.contains(arch),
                     "{arch}: {e}"
                 ),
             }
