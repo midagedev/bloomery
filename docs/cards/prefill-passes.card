@@ -1,0 +1,25 @@
+# Round prefill-passes (kind profile): is plan (a)'s prefill at P 512 serial because the prompt is one pass? The prompt
+# batch cuts a call at T_MAX = 512 positions and a group of 2 batches overlaps a layer-batch's card route with the
+# previous batch's host serve (BLOOMERY_PREFILL_GROUP, default 2). A P 512 prompt is one pass, so nothing overlaps:
+# measured pp 220 = 58.3 ms a layer against the card's 36.1 and the host's 28.8 (card A sitting), their sum, not their
+# max. At P 4096 (8 passes, the same binary) the same sittings read 416-427 = 30 ms a layer-batch of 512, the card's
+# pipelined term with the host leg hidden. [derived] a call of k passes costs per layer k x 28..30 ms + one exposed host
+# leg of ~29 ms (the fill and drain): P 1024 = 2 x 29 + 29 = 87 ms -> pp 294; P 2048 = 4 x 29 + 29 = 145 -> 353;
+# P 4096 = 8 x 29 + 29 = 261 -> 392 (measured 416-427: the per-pass term is nearer 28). The same binary, plan (a),
+# same lease, 2 rounds; pp is read from the `time prompt` row of each arm.
+kind: profile
+question: does pp at plan (a) rise with the pass count as the pipeline model says (one exposed host leg per call, the
+  rest hidden under the card), so that a P 512 prompt cut into smaller batches would gain the same?
+term: pp tok/s @ P 1024 (2 passes), prose corpus, plan (a), A6000 stage, BLOOMERY_CARD_BUDGET unset, residency unset;
+  P 512 (1 pass) and P 2048 (4 passes) beside it in the same lease
+unit: tok/s
+predict: 270..320
+condition: one binary (main 9a3d3b519), every arm's load its own process; 2 rounds; a row marked [cpu-busy] (the
+  nodeprefill round's build on the box) or [cold] stands with its mark and is not read; the download to /models runs at
+  ~77 MB/s (noted, under 2 % of the drive)
+decide-in: the pipeline model holds: the P 512 headline is serial for want of a second pass, and a batch cut (T_MAX
+  256 for a call under 2 x 256, or a rule that cuts a single-pass call into group pieces) is predicted at pp 290..310
+  for P 512 [derived: 2 x 14.5 + 14.5 = 43.5 ms a layer]; open that round (one lever, one binary A/B)
+decide-below: under 270: the second pass costs more than the card term (attention over the ring, the proj tables); read
+  the `stat prefill` records of the two arms before any cut
+decide-above: over 320: the exposed leg is smaller than one host leg; re-derive the fill and drain from the records
