@@ -908,8 +908,13 @@ impl Qp {
     }
 
     /// Take the queue pair through init, ready to receive and ready to send
-    /// against `remote`, starting this side's sends at `psn`.
-    pub fn connect(&self, psn: u32, remote: &Endpoint) -> Result<(), VerbsError> {
+    /// against `remote`, starting this side's sends at `psn`, every packet
+    /// carrying `flow_label` in its global route header (RoCE v2 derives the
+    /// UDP source port from it). A label past its 20 bits is refused by name.
+    pub fn connect(&self, psn: u32, remote: &Endpoint, flow_label: u32) -> Result<(), VerbsError> {
+        if flow_label >= 1 << 20 {
+            return Err(format!("flow label {flow_label}: a flow label is 20 bits").into());
+        }
         let nic = &self.nic;
         let mut a = qp_attr();
         a.qp_state = QPS_INIT;
@@ -931,6 +936,7 @@ impl Qp {
         a.ah_attr.port_num = PORT;
         a.ah_attr.grh.dgid = remote.gid;
         a.ah_attr.grh.sgid_index = nic.gid_index;
+        a.ah_attr.grh.flow_label = flow_label;
         a.ah_attr.grh.hop_limit = 64;
         self.modify(
             &mut a,

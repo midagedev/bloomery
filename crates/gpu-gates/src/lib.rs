@@ -200,6 +200,22 @@ pub fn checks_failed() -> GateError {
     "FAILED: one or more checks above did not pass".into()
 }
 
+/// The build every rank of a tensor-parallel group must share (the fingerprint's `build`): the
+/// clean source commit `tools/box.sh` builds from, the package version and the profile. A build
+/// without a clean commit (none, `unknown` or `-dirty`) is refused by name: two such builds of
+/// other sources would agree.
+pub fn rank_build() -> Result<String, GateError> {
+    let commit = option_env!("BLOOMERY_GIT_COMMIT")
+        .filter(|c| (8..=40).contains(&c.len()) && c.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or("rank build: a clean source commit is required; build through tools/box.sh")?;
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    Ok(format!("{commit} {} {profile}", env!("CARGO_PKG_VERSION")))
+}
+
 /// The optional `--bench-arm` prefix, refused unless it selects an arm.
 /// Call before opening the card; `ops` names every arm the bench can run.
 pub fn bench_arm(

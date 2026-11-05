@@ -18,12 +18,11 @@
 
 use std::ops::Range;
 
-use gguf::arch::deepseek41::CONCAT_TABLE;
 use gguf::{GgmlType, Split};
 
 use super::hparams::Hparams;
 use super::kv::KvLayout;
-use super::{names, roles};
+use super::roles;
 use crate::placement::tp::{self, Cut, RankNeed, TpTensor, check_rank};
 use crate::placement::workstation::{CONTEXT_SELF, SCRATCH};
 use crate::placement::{KvBytes, PlacementError, Role, RowTableSource};
@@ -50,10 +49,21 @@ impl TpUnits {
 }
 
 /// Whether a TP rank holds the tensor `name` on the card: every trunk tensor but the token
-/// embedding and the Engram tables, which stay in their files and are read by row.
+/// embedding and the Engram and hash tables, which stay in their files and are read by row, and
+/// the tensors no step reads.
 #[must_use]
 pub fn card_holds(name: &str) -> bool {
-    name != names::token_embd() && name != CONCAT_TABLE && !stem_of(name).starts_with("engram_embd")
+    !matches!(
+        roles::tensor_role(name),
+        Some(
+            Role::TokenEmbedding
+                | Role::EngramTable
+                | Role::EngramHash
+                | Role::HashTable
+                | Role::Unread
+                | Role::Unused
+        )
+    )
 }
 
 /// The name past `blk.N.`, or the whole name for a model-level tensor.
@@ -327,6 +337,8 @@ pub fn rank_need(
 
 #[cfg(test)]
 mod tests {
+    use gguf::arch::deepseek41::CONCAT_TABLE;
+
     use super::{GgmlType, TpUnits, card_holds, cut, engram_cols, engram_rows, rank_span};
     use crate::placement::PlacementError;
     use crate::placement::tp::Cut;
@@ -371,6 +383,10 @@ mod tests {
             assert_eq!(cut(name, &[5120, 512], &V41).unwrap(), None, "{name}");
         }
         assert!(!card_holds("token_embd.weight") && !card_holds("blk.14.engram_embd.weight"));
+        assert!(
+            !card_holds(CONCAT_TABLE),
+            "the concatenated Engram table stays in its file"
+        );
         assert!(card_holds("blk.14.engram_wkv.weight"));
         assert!(matches!(
             cut("blk.0.attn_q.weight", &[64], &V41),

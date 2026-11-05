@@ -255,6 +255,33 @@ pub fn tp_need(
         .u("read_runs", reads.len())
 }
 
+/// One rank's run of a tensor-parallel greedy run.
+pub static TP_RUN: Kind = Kind {
+    name: "tp_run",
+    head: "tp run",
+    doc: "One rank's tensor-parallel greedy run (generate_ds41 --place tp), after the run: its rank among the ranks, the context the group agreed on, its load's wall time and device bytes, the prompt positions it stepped and their wall time, and the generated tokens it stepped and their rate.",
+    parts: &[
+        key("rank", U64, ""),
+        lit("/"),
+        pos("ranks", U64, "ranks"),
+        key("ctx", U64, "positions"),
+        key("load_s", F64(3), "s"),
+        key("resident_bytes", U64, "B"),
+        key("prompt", U64, "positions"),
+        key("prompt_s", F64(3), "s"),
+        key("decoded", U64, "tokens"),
+        key("decode_tps", F64(3), "tok/s"),
+    ],
+};
+
+/// The decode of a tensor-parallel run's tokens.
+pub static TP_TEXT: Kind = Kind {
+    name: "tp_text",
+    head: "tp text",
+    doc: "Rank 0's generated tokens decoded by the folder's tokenizer, as a quoted string (generate_ds41 --place tp).",
+    parts: &[key("text", Text, "")],
+};
+
 /// Where a qwen3moe-family placement puts the routed experts, before the
 /// load.
 pub static PLAN38: Kind = Kind {
@@ -1173,6 +1200,22 @@ pub static LINK_GATHER: Kind = Kind {
         key("stale_words", U64, ""),
         key("host_wrong", U64, ""),
         key("digest", Word, ""),
+    ],
+};
+
+/// One rank's path to a peer in `link_probe`.
+pub static LINK_PATH: Kind = Kind {
+    name: "link_path",
+    head: "link path",
+    doc: "One rank's RDMA path to a peer in link_probe: the two ranks, the local and the peer's fabric address the two ends agreed on, the RoCE device and GID index of the local address, and the flow label its packets carry.",
+    parts: &[
+        key("rank", U64, ""),
+        key("peer", U64, ""),
+        key("local", Word, ""),
+        key("remote", Word, ""),
+        key("dev", Word, ""),
+        key("gid_index", U64, ""),
+        key("flow_label", U64, ""),
     ],
 };
 
@@ -3100,6 +3143,8 @@ pub static GATE_GEMMA_EMBEDDING2_SERVE: &[&Kind] = kinds![
 /// What `generate_ds41` prints, in the order it prints them.
 pub static GENERATE_DS41: &[&Kind] = &[
     &TP_NEED,
+    &TP_RUN,
+    &TP_TEXT,
     &PLACE_UNSET,
     &WARM_LOAD,
     &WARM_SAVE,
@@ -3614,8 +3659,9 @@ pub static PROBE_NVREAD: &[&Kind] = &[&NVREAD];
 /// The readback result that `h2d_probe` prints.
 pub static H2D_PROBE: &[&Kind] = &[&H2D_READBACK];
 
-/// The record `link_probe` prints under `--gather`: one line a rank.
-pub static LINK_PROBE: &[&Kind] = &[&LINK_GATHER];
+/// The records `link_probe` prints: a line a peer path, and under `--gather`
+/// one line a rank.
+pub static LINK_PROBE: &[&Kind] = &[&LINK_PATH, &LINK_GATHER];
 
 /// The width chooser's state on `r`, a `draft summary` or an `mtp width`
 /// record: the gate's width, each width's cost median in ms (`-` while

@@ -22,7 +22,7 @@ use model::placement::{CardFormat, Device, ExpertList, Format, ModelTensor, Plan
 
 use crate::GpuError;
 use crate::upload::UploadRing;
-use crate::weights::{CardOf, TensorPart, Weights, part_format, stage_parts};
+use crate::weights::{CardOf, TensorPart, Weights, part_format_as, stage_parts};
 
 /// What the errors name.
 const WHAT: &str = "parts::load";
@@ -41,7 +41,7 @@ pub fn load<S: Source + Sync, E: std::fmt::Display>(
     release: bool,
 ) -> Result<Weights, GpuError> {
     let reading = host_available_read().map_err(refused)?;
-    let plan = LoadPlan::new(source, rule, reading.0)?;
+    let plan = LoadPlan::new(source, rule, &card, reading.0)?;
     Ok(load_plan(stream, source, &plan, card, release, &reading)?.0)
 }
 
@@ -445,13 +445,14 @@ impl LoadPlan {
     fn new<S: Source, E: std::fmt::Display>(
         source: &S,
         rule: impl Fn(&str, GgmlType, &[u64]) -> Result<Take, E>,
+        card: impl Fn(&TensorInfo) -> Option<CardFormat>,
         room: u64,
     ) -> Result<Self, GpuError> {
         let parts = source.plan(rule).map_err(|e| refused(e.to_string()))?;
         let mut upload_bytes = 0usize;
         let mut costs = Vec::with_capacity(parts.len());
         for p in &parts {
-            let staged = part_format(&p.info)?.1;
+            let staged = part_format_as(&p.info, card(&p.info))?.1;
             upload_bytes = upload_bytes
                 .checked_add(staged)
                 .ok_or_else(|| refused("the parts' staging bytes pass usize".into()))?;
@@ -518,7 +519,7 @@ impl LoadPlan {
             source,
             keep: |name: &str| plan.model.tensors.iter().any(|t| t.name == name),
         };
-        Self::new(&selected, |name, _, _| on.take(name), room)
+        Self::new(&selected, |name, _, _| on.take(name), |_| None, room)
     }
 }
 
@@ -1056,15 +1057,25 @@ mod tests {
         let source =
             Split::header_only(std::path::PathBuf::from("/synthetic/falling-room"), &layout)
                 .unwrap();
-        let shared =
-            LoadPlan::new(&source, |_, _, _| Ok::<_, String>(Take::Whole), 296 * mib).unwrap();
+        let shared = LoadPlan::new(
+            &source,
+            |_, _, _| Ok::<_, String>(Take::Whole),
+            |_| None,
+            296 * mib,
+        )
+        .unwrap();
         assert_eq!(shared.window, 200 * mib);
         assert_eq!(shared.host_bytes, 296 * mib);
         let read = |bytes: u64| (bytes, HostRead::MemAvailable);
         shared.check(&read(288 * mib)).unwrap();
         assert!(shared.check(&read(288 * mib - 1)).is_err());
-        let plan =
-            LoadPlan::new(&source, |_, _, _| Ok::<_, String>(Take::Whole), 288 * mib).unwrap();
+        let plan = LoadPlan::new(
+            &source,
+            |_, _, _| Ok::<_, String>(Take::Whole),
+            |_| None,
+            288 * mib,
+        )
+        .unwrap();
         assert_eq!(plan.window, 192 * mib);
         assert_eq!(plan.host_bytes, 288 * mib);
         plan.check(&read(300 * mib)).unwrap();
@@ -1119,8 +1130,13 @@ mod tests {
                 Err(std::io::Error::other("read before host admission"))
             }
         }
-        let plan =
-            LoadPlan::new(&Owned, |_, _, _| Ok::<_, String>(Take::Whole), 128 << 20).unwrap();
+        let plan = LoadPlan::new(
+            &Owned,
+            |_, _, _| Ok::<_, String>(Take::Whole),
+            |_| None,
+            128 << 20,
+        )
+        .unwrap();
         assert_eq!(plan.window + UploadRing::HOST_MAX, plan.serial_bytes);
         assert_eq!(plan.host_bytes, (192 + 3 * 32) << 20);
         let gpu = crate::Gpu::with_device(0).unwrap();
@@ -1179,7 +1195,13 @@ mod tests {
         }
         let source = Small(Mutex::new(Vec::new()));
         let room = (1 << 30, HostRead::Given);
-        let plan = LoadPlan::new(&source, |_, _, _| Ok::<_, String>(Take::Whole), room.0).unwrap();
+        let plan = LoadPlan::new(
+            &source,
+            |_, _, _| Ok::<_, String>(Take::Whole),
+            |_| None,
+            room.0,
+        )
+        .unwrap();
         let gpu = crate::Gpu::with_device(0).unwrap();
         for (release, want) in [(false, vec![]), (true, vec!["a.weight", "b.weight"])] {
             let (w, _) = load_plan(gpu.stream(), &source, &plan, |_| None, release, &room).unwrap();

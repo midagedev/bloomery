@@ -1,0 +1,34 @@
+# Round smallroom (kind profile): the configuration the Spark is for, at a room where ws alone cannot page well. The
+# sparkroom sitting (room 190G: 24 GB past the arena) read ws alone at 27.5-28.5 against ws + Spark 35.2-37.2, and the
+# NVMe term there was 0.22 ms a step per GB past the arena (O_DIRECT reads, the default BLOOMERY_NVTIER_READ=direct:
+# the page cache serves nothing, so the room cap is the workstation's RAM). That term is one point; it hides the hot
+# share the arena keeps, and the two models of the term disagree by 3x once the room is small:
+# [derived] room 128G (a 128 GB workstation: host experts 68 GB pinned, a 60 GB arena, ~96 GB of experts past the
+# arena, from the sparkroom plan's 90 + 124 GB host set beyond the card's 45):
+#   linear term   19.4 + 0.22 x 96 = 40.6 ms -> 24.6 tok/s
+#   hot-share term 19.4 + 4.63 GB x (96/214) x (1 - hot) / 5.7 GB/s: hot 0.5 -> 7.2, hot 0.75 -> 12.6 tok/s
+# ws + Spark at the same room: the node holds the 96 GB (BLOOMERY_CARD_BUDGET=110G, under the node's 125.8 GB), the host
+# leg is 68 GB of experts, under plan a's; the node round trip ~7 ms a step stays: 35..38 tok/s as the sparkroom node arm.
+# Room 160G beside it (64 GB past the arena) gives the curve's middle point: linear 33.5 ms -> 29.9; hot 0.5 -> 10.4.
+# Rooms under 128G do not fit the node (the short bytes pass the node tier's 125.8 GB), so 128G is the floor of the
+# picture. The prefill row (pp) is read beside each arm (the node computes its block: nodeprefill).
+kind: profile
+question: at a host room of 128 GB (and 160 GB beside it), is ws alone's decode the linear term's ~25 tok/s or the
+  hot-share term's 7..13, and does ws + Spark hold 35..38 at the same room? The ratio is the picture.
+term: tok/s @ n=96, prose P 512, depth 512, A6000 stage; the plain arms --place a with BLOOMERY_HOST_ROOM=128G|160G,
+  BLOOMERY_NVTIER_BYTES=60G|80G and BLOOMERY_R8=off (the nvtier refuses a paged plan under the r8 sidecar by name), the
+  node arms --place bp with the Spark tier over tcp (BLOOMERY_TIER_NODES, BLOOMERY_TIER_LINK=tcp,
+  BLOOMERY_CARD_BUDGET=110G, BLOOMERY_HOST_LOCK=1) at the same rooms; batch prefill, residency unset
+unit: tok/s
+predict: 35..38
+condition: one binary (the train tree's commit, generate_ds41 on the box and tier_server on the Spark from it), every
+  arm's load its own process; the Spark's caches dropped before each node open, free >= 110 GB; each plain arm's plan
+  line names its paged and arena bytes (the room is binding) or the arm is not the configuration; the node arm's plan
+  line names the node tier's bytes >= the plain arm's paged minus arena; 3 rounds; rows marked [cold] stand with their
+  mark; NVTIER_READ at its default (direct)
+decide-in: the node arms inside 35..38: the headline is the ratio at 128G, both numbers and the room named, "a 128 GB
+  workstation + one DGX Spark"; the plain arm's value names the NVMe term (linear or hot-share) the cost model keeps
+  (rig-log tools/spark-model.py decode_bigger_quant takes the measured point)
+decide-below: a node arm under 35: the smaller host room moved the node's share past what the link hides (the node
+  leg over the card's); read the trip stamps and host_slots against the sparkroom node arm's
+decide-above: a node arm over 38: the host leg at room 190 was larger than the round trip; re-read the host wait

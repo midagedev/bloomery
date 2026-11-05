@@ -527,6 +527,9 @@ mod gate {
         stage_nodes: Option<usize>,
     }
 
+    /// A staged call's run and what it sent the node tier, when the stage ran one.
+    type Staged = (Run, Option<Sent>);
+
     impl Run {
         fn push(&mut self, token: u32, logits: Vec<f32>) {
             self.tokens.push(token);
@@ -1197,7 +1200,7 @@ mod gate {
         levers: &Levers,
         ids: &[u32],
         tier_layers: &[usize],
-    ) -> Result<(bool, Option<(Run, Option<Sent>)>), GateError> {
+    ) -> Result<(bool, Option<Staged>), GateError> {
         let pick = levers.residency_at(ResidencyAt {
             serving_place: false,
             check_finite: false,
@@ -1263,7 +1266,7 @@ mod gate {
     fn node_exact(
         mut m: Deepseek41Model,
         ids: &[u32],
-        got: Option<(Run, Option<Sent>)>,
+        got: Option<Staged>,
     ) -> Result<bool, GateError> {
         let Some((got, node)) = got else {
             println!("FAIL B9 exact: no prompt call over the node to compare");

@@ -55,17 +55,29 @@
 //! sums against the host's rank-order sum; the stage fails on a stale word,
 //! a sum the host disagrees with or a digest that differs between nodes.
 //!
-//! Both ends run this binary on a host with rdma-core (`libibverbs.so.1`):
+//! Every node runs this binary on a host with rdma-core (`libibverbs.so.1`),
+//! each with the same rank file (`bloomery_gpu::host::rank::RankList`: a
+//! line a rank, its control `ip:port`, then its fabric addresses) and its
+//! own rank:
 //!
 //! ```text
-//! link_probe --nodes 2 --rank 0 --dev <ibdev> --gid <index> --listen <ip:port>
-//! link_probe --nodes 2 --rank 1 --dev <ibdev> --gid <index> --stage <ip:port>
+//! link_probe --ranks <file> --rank 0 [--fabric <manifest>]
+//! link_probe --ranks <file> --rank 1 [--fabric <manifest>]
 //! ```
 //!
-//! `--tcp` in place of `--dev` and `--gid` carries the counters over TCP
-//! ends: the stage's end to each peer listens on the address that peer's
-//! control connection reached, and the peer's end dials it. `--gather` takes
-//! RDMA ends alone.
+//! Rank 0 listens on its control address and every other rank dials it.
+//! Each end's queue pair takes the engine's peer path
+//! (`bloomery_gpu::host::paths`): an address pair both ends reach over one
+//! link, or through a relay the manifest names a flow label for, each from
+//! the local address and RoCE device its kernel's route picks. A
+//! failure names its stage: `setup` (arguments, the card), `bootstrap` (the
+//! control channel), `endpoint` (a peer path or an end), `connect` (a queue
+//! pair) or `payload` (the generations or gathers). Under `--gather` the
+//! group's open is one stage, `bootstrap`, whose error names its part.
+//!
+//! `--tcp` in place of the peer paths carries the counters over TCP ends:
+//! each end listens on its rank's control address in the rank file and dials
+//! the peer's end. `--gather` and `--fabric` take RDMA ends alone.
 //!
 //! Optional: `--iters` (timed generations, or replays under `--gather`),
 //! `--warmup`, `--size`, `--gather`, `--deadline-ms`. Every node runs the
@@ -79,30 +91,34 @@
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::record::at_main("link_probe", bloomery_gpu_gates::record::LINK_PROBE);
-    bloomery_gpu_gates::exit_with("link_probe", probe::run())
+    bloomery_gpu_gates::exit_with("link_probe", probe::staged())
 }
 
 #[cfg(feature = "gpu")]
 mod probe {
+    use bloomery_gpu::host::rank::{
+        Bootstrap, Control, Ends, Fingerprint, RankList, RankSession, psn,
+    };
     use bloomery_gpu::host::step::RELEASE;
     use bloomery_gpu::host::{
-        Crossing, GatherSet, GatherShape, Gathers, PostCols, RdmaEnd, Reader, Span, TcpEnd,
-        TcpPeer, link_tail,
+        Crossing, GatherSet, GatherShape, Gathers, PeerPath, PostCols, RdmaEnd, Reader, RemoteWire,
+        Span, TcpEnd, link_tail, paths,
     };
     use bloomery_gpu::{
         Gpu, MappedHost, WindowMut, mem_batch, op_add, op_barrier_sys, op_wait_geq,
     };
-    use bloomery_gpu_gates::record::{LINK_GATHER, Record};
+    use bloomery_gpu_gates::record::{LINK_GATHER, LINK_PATH, Record};
     use bloomery_gpu_gates::{Fnv1a64, GateError, verdict};
-    use bloomery_verbs::{Endpoint, Gid};
+    use bloomery_verbs::Endpoint;
     use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, LaunchConfig1D, sys};
     use cuda_device::{DisjointSlice, debug, kernel, launch_bounds, launch_contract, thread};
     use cuda_host::cuda_module;
-    use std::io::{Read, Write};
-    use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
+    use gguf::digest::Sha256;
+    use std::io::Write;
     use std::panic::AssertUnwindSafe;
+    use std::path::PathBuf;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
     const LINE: usize = 64;
@@ -343,13 +359,11 @@ mod probe {
     struct Opts {
         nodes: usize,
         rank: usize,
-        /// `--tcp`: TCP ends in place of RDMA ends, which `dev` and `gid` name.
+        /// `--tcp`: TCP ends in place of RDMA ends on the peer paths.
         tcp: bool,
-        dev: String,
-        gid: u8,
-        /// The stage's control address: listened on by rank 0, dialled by
-        /// the peers.
-        control: String,
+        ranks: RankList,
+        /// `--fabric`: the fabric manifest the peer paths read.
+        fabric: Option<PathBuf>,
         iters: usize,
         warmup: usize,
         /// `warmup + iters`, a generation that fits a word.
@@ -363,17 +377,21 @@ mod probe {
     }
 
     fn opts() -> Result<Opts, GateError> {
-        const USAGE: &str = "link_probe --nodes N --rank R (--dev IBDEV --gid INDEX | --tcp) \
-             (--listen IP:PORT | --stage IP:PORT) [--iters N] [--warmup N] [--size BYTES] \
-             [--gather ROWS] [--deadline-ms MS]";
+        const USAGE: &str = "link_probe --ranks FILE --rank R [--fabric MANIFEST | --tcp] \
+             [--iters N] [--warmup N] [--size BYTES] [--gather ROWS] [--deadline-ms MS]";
         let args: Vec<String> = std::env::args().skip(1).collect();
+        let ranks = args
+            .iter()
+            .position(|a| a == "--ranks")
+            .and_then(|i| args.get(i + 1))
+            .ok_or_else(|| format!("--ranks is required; usage: {USAGE}"))?;
+        let ranks = RankList::read(ranks.as_ref())?;
         let mut o = Opts {
-            nodes: 0,
+            nodes: ranks.len(),
             rank: usize::MAX,
             tcp: false,
-            dev: String::new(),
-            gid: 0,
-            control: String::new(),
+            ranks,
+            fabric: None,
             iters: 100_000,
             warmup: 1_000,
             total: 0,
@@ -381,7 +399,6 @@ mod probe {
             gather: 0,
             deadline: Duration::from_secs(10),
         };
-        let (mut listen, mut stage, mut gid) = (None, None, None);
         let mut it = args.iter();
         while let Some(k) = it.next() {
             if k == "--tcp" {
@@ -393,12 +410,9 @@ mod probe {
                 .ok_or_else(|| format!("{k} takes a value; usage: {USAGE}"))?;
             let bad = |_| format!("{k} {v}: not a number");
             match k.as_str() {
-                "--nodes" => o.nodes = v.parse().map_err(bad)?,
+                "--ranks" => {} // read above
                 "--rank" => o.rank = v.parse().map_err(bad)?,
-                "--dev" => o.dev.clone_from(v),
-                "--gid" => gid = Some(v.parse().map_err(bad)?),
-                "--listen" => listen = Some(v.clone()),
-                "--stage" => stage = Some(v.clone()),
+                "--fabric" => o.fabric = Some(PathBuf::from(v)),
                 "--iters" => o.iters = v.parse().map_err(bad)?,
                 "--warmup" => o.warmup = v.parse().map_err(bad)?,
                 "--size" => o.size = v.parse().map_err(bad)?,
@@ -407,10 +421,10 @@ mod probe {
                 _ => return Err(format!("unknown argument {k}; usage: {USAGE}").into()),
             }
         }
-        if o.nodes < 2 || o.rank >= o.nodes || o.dev.is_empty() == !o.tcp || o.iters == 0 {
+        if o.nodes < 2 || o.rank >= o.nodes || o.iters == 0 {
             return Err(format!(
-                "want --nodes >= 2, --rank below it, --dev or --tcp (one of them) and --iters >= \
-                 1; usage: {USAGE}"
+                "want a rank file of at least two ranks, --rank below them and --iters >= 1; \
+                 usage: {USAGE}"
             )
             .into());
         }
@@ -420,19 +434,11 @@ mod probe {
         if o.gather != 0 && o.size != 0 {
             return Err("--gather and --size are two runs: give one".into());
         }
-        if o.gather != 0 && o.tcp {
-            return Err("--gather runs over RDMA ends alone: give --dev and --gid".into());
+        if o.tcp && (o.gather != 0 || o.fabric.is_some()) {
+            return Err(
+                "--gather and --fabric run over RDMA ends alone: --tcp takes neither".into(),
+            );
         }
-        o.gid = match (o.tcp, gid) {
-            (true, None) => 0,
-            (true, Some(_)) => return Err("--gid names an RDMA port: --tcp takes none".into()),
-            (false, g) => g.ok_or_else(|| format!("--gid is required; usage: {USAGE}"))?,
-        };
-        o.control = match (o.rank, listen, stage) {
-            (0, Some(a), None) => a,
-            (r, None, Some(a)) if r > 0 => a,
-            _ => return Err("rank 0 takes --listen, every other rank --stage".into()),
-        };
         o.total = o
             .warmup
             .checked_add(o.iters)
@@ -507,7 +513,37 @@ mod probe {
         }
     }
 
-    pub fn run() -> Result<(), GateError> {
+    /// The stages a run goes through, as a failure names them.
+    const STAGES: [&str; 5] = ["setup", "bootstrap", "endpoint", "connect", "payload"];
+    /// The index in [`STAGES`] of the stage the run is in.
+    static STAGE: AtomicU8 = AtomicU8::new(0);
+
+    fn enter(stage: &str) {
+        let i = STAGES.iter().position(|&s| s == stage).expect("a stage");
+        STAGE.store(i as u8, Ordering::Relaxed);
+    }
+
+    /// The run, a failure prefixed with the stage it came from.
+    pub fn staged() -> Result<(), GateError> {
+        run().map_err(|e| format!("{}: {e}", STAGES[STAGE.load(Ordering::Relaxed) as usize]).into())
+    }
+
+    /// Print each of this rank's peer paths as a `link path` line.
+    fn print_paths(o: &Opts, all: &[PeerPath]) {
+        for p in all {
+            Record::new(&LINK_PATH)
+                .u("rank", o.rank)
+                .u("peer", p.peer)
+                .w("local", p.local)
+                .w("remote", p.remote)
+                .w("dev", &p.dev)
+                .u("gid_index", p.gid)
+                .u("flow_label", p.flow_label)
+                .print();
+        }
+    }
+
+    fn run() -> Result<(), GateError> {
         let o = opts()?;
         let gpu = Gpu::new()?;
         let ctx = gpu.context();
@@ -588,22 +624,20 @@ mod probe {
         stream.launch(&mut stale, &mut stamps, 0, 0, 0, 0)?;
         gpu.stream().synchronize()?;
         stale.copy_from_host(gpu.stream(), &[0; THREADS as usize])?;
-        control.ready()?;
+        control.barrier()?;
         stream.drive(&mut stale, &mut stamps)?;
         let stale_here: u64 = stale.to_host_vec(gpu.stream())?.iter().sum();
         let stamps = stamps.to_host_vec(gpu.stream())?;
         let kernel_ns: Vec<u64> = (1..=total)
             .map(|g| stamps[2 * (g - 1) + 1] - stamps[2 * (g - 1)])
             .collect();
+        let kernel = pct(&mut kernel_ns[o.warmup..].to_vec(), 50.0);
+        let reports = control.collect(&[stale_here, kernel])?;
         if o.rank != 0 {
-            control.report(stale_here, pct(&mut kernel_ns[o.warmup..].to_vec(), 50.0))?;
-            control.ready()?;
             println!("link peer rank={} stale_image={stale_here}", o.rank);
             return Ok(());
         }
-        let reports = control.collect()?;
-        control.ready()?;
-        report(&o, &stamps, stale_here, &reports, &kernel_ns)
+        report(&o, &stamps, stale_here, &reports[1..], &kernel_ns)
     }
 
     /// This node's ends over `page`, one for each of `peers`, its tail line,
@@ -611,8 +645,7 @@ mod probe {
     /// connected to the other nodes' through the control channel, which is
     /// returned with them. A peer equal to this node's rank is the layout's
     /// own block on a star's peer, whose end reaches the stage. Under
-    /// `--tcp` each end is a TCP end, and the stage's end to a peer listens
-    /// on the address that peer's control connection reached.
+    /// `--tcp` each end is a TCP end ([`tcp_ends`]).
     fn open_ends(
         o: &Opts,
         page: &Arc<MappedHost>,
@@ -620,87 +653,69 @@ mod probe {
         of: impl Fn(usize) -> (usize, Vec<Crossing>, Reader),
         cols: &PostCols,
     ) -> Result<(Ends, Control), GateError> {
-        let shape = [o.size, o.gather, usize::from(o.tcp)];
+        enter("bootstrap");
+        let mut control = Control::open(&o.ranks, o.rank, Duration::from_secs(60).max(o.deadline))?;
+        // A star: the stage's ends reach every peer, a peer's one end the stage.
         let to = |j: usize| if j == o.rank { 0 } else { j };
-        if o.tcp {
-            let mut control = Control::open(o)?;
-            let mut ends = peers
-                .iter()
-                .zip(&control.socks)
-                .map(|(&j, sock)| {
-                    let (tail, crossings, side) = of(j);
-                    let ip = sock.local_addr()?.ip();
-                    Ok(TcpEnd::new(
-                        Arc::clone(page),
-                        tail,
-                        crossings,
-                        side,
-                        ip,
-                        cols.clone(),
-                    )?)
-                })
-                .collect::<Result<Vec<_>, GateError>>()?;
-            let local: Vec<(usize, Ep)> = ends
-                .iter()
-                .zip(peers)
-                .map(|(e, &j)| (to(j), Ep::Tcp(e.endpoint())))
-                .collect();
-            let remote = control.exchange(&local, o.rank, shape)?;
-            for (e, r) in ends.iter_mut().zip(&remote) {
-                let Ep::Tcp(r) = r else {
-                    return Err("an RDMA end on a --tcp run".into());
-                };
-                e.connect(r)?;
-            }
-            println!(
-                "link setup rank={} nodes={} wire=tcp page_bytes={} size={} gather={} iters={} \
-                 warmup={}",
-                o.rank,
-                o.nodes,
-                page.bytes(),
-                o.size,
-                o.gather,
-                o.iters,
-                o.warmup
-            );
-            return Ok((Ends::Tcp(ends), control));
-        }
-        let mut ends = peers
+        let shape: Vec<u8> = [o.size, o.gather, usize::from(o.tcp)]
             .iter()
-            .map(|&j| {
-                let (tail, crossings, side) = of(j);
-                RdmaEnd::new(
-                    Arc::clone(page),
-                    tail,
-                    crossings,
-                    side,
-                    &o.dev,
-                    o.gid,
-                    cols.clone(),
+            .flat_map(|&v| (v as u64).to_le_bytes())
+            .collect();
+        let out: Vec<(usize, Vec<u8>)> = peers.iter().map(|&j| (to(j), shape.clone())).collect();
+        for (&j, theirs) in peers.iter().zip(control.swap(&out)?) {
+            if theirs != shape {
+                return Err(format!(
+                    "--size, --gather and --tcp differ: here {shape:?}, rank {} {theirs:?}",
+                    to(j)
                 )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut control = Control::open(o)?;
-        let local: Vec<(usize, Ep)> = ends
+                .into());
+            }
+        }
+        if o.tcp {
+            return tcp_ends(o, page, peers, of, cols, control);
+        }
+        enter("endpoint");
+        let targets: Vec<usize> = peers.iter().map(|&j| to(j)).collect();
+        let all = paths(
+            &o.ranks,
+            o.rank,
+            &targets,
+            o.fabric.as_deref(),
+            &mut control,
+        )?;
+        print_paths(o, &all);
+        let mut ends = Vec::with_capacity(peers.len());
+        for &j in peers {
+            let path = all
+                .iter()
+                .find(|p| p.peer == to(j))
+                .expect("a path to every peer");
+            let (tail, crossings, side) = of(j);
+            ends.push(RdmaEnd::new(
+                Arc::clone(page),
+                tail,
+                crossings,
+                side,
+                path,
+                cols.clone(),
+            )?);
+        }
+        let local: Vec<(usize, Endpoint)> = ends
             .iter()
             .zip(peers)
-            .enumerate()
-            .map(|(i, (e, &j))| (to(j), Ep::Rdma(e.endpoint(psn(o.rank, i)))))
+            .map(|(e, &j)| (to(j), e.endpoint(psn(o.rank, to(j)))))
             .collect();
-        let remote = control.exchange(&local, o.rank, shape)?;
+        let remote = control.endpoints(&local)?;
+        enter("connect");
         for ((e, (_, l)), r) in ends.iter_mut().zip(&local).zip(&remote) {
-            let (Ep::Rdma(l), Ep::Rdma(r)) = (l, r) else {
-                return Err("a TCP end on an RDMA run".into());
-            };
             e.connect(l.psn, r)?;
         }
+        enter("payload");
         println!(
-            "link setup rank={} nodes={} dev={} gid_index={} page_bytes={} \
+            "link setup rank={} nodes={} page_bytes={} \
              access=local_write,remote_write size={} gather={} iters={} warmup={}",
             o.rank,
             o.nodes,
-            o.dev,
-            o.gid,
             page.bytes(),
             o.size,
             o.gather,
@@ -710,34 +725,42 @@ mod probe {
         Ok((Ends::Rdma(ends), control))
     }
 
-    /// This node's ends, all of one wire.
-    enum Ends {
-        Rdma(Vec<RdmaEnd>),
-        Tcp(Vec<TcpEnd>),
-    }
-
-    impl Ends {
-        /// The first end that broke, by why.
-        fn broken(&self) -> Option<String> {
-            match self {
-                Ends::Rdma(e) => e.iter().find_map(RdmaEnd::broken),
-                Ends::Tcp(e) => e.iter().find_map(TcpEnd::broken),
-            }
-        }
-
-        /// The ends' release ([`RdmaEnd::release`], [`TcpEnd::release`]).
-        fn release(&self, v: u32) -> Result<(), String> {
-            match self {
-                Ends::Rdma(e) => RdmaEnd::release(e, v),
-                Ends::Tcp(e) => TcpEnd::release(e, v),
-            }
-            .map_err(|e| e.to_string())
-        }
-    }
-
-    /// The first packet sequence number of this rank's `i`th queue pair.
-    fn psn(rank: usize, i: usize) -> u32 {
-        u32::try_from(((rank << 12) | i) & 0xff_ffff).expect("masked to 24 bits")
+    /// [`open_ends`]'s TCP ends, past the shape check on `control`: each
+    /// listens on this rank's control address and dials the peer's end.
+    fn tcp_ends(
+        o: &Opts,
+        page: &Arc<MappedHost>,
+        peers: &[usize],
+        of: impl Fn(usize) -> (usize, Vec<Crossing>, Reader),
+        cols: &PostCols,
+        mut control: Control,
+    ) -> Result<(Ends, Control), GateError> {
+        enter("endpoint");
+        let to = |j: usize| if j == o.rank { 0 } else { j };
+        let ip = o.ranks.rank(o.rank).control.ip();
+        let mut ends = peers
+            .iter()
+            .map(|&j| {
+                let (tail, crossings, side) = of(j);
+                TcpEnd::new(Arc::clone(page), tail, crossings, side, ip, cols.clone())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let sides: Vec<(usize, Reader)> = peers.iter().map(|&j| (to(j), of(j).2)).collect();
+        enter("connect");
+        control.connect_tcp(&mut ends, &sides)?;
+        enter("payload");
+        println!(
+            "link setup rank={} nodes={} wire=tcp page_bytes={} size={} gather={} iters={} \
+             warmup={}",
+            o.rank,
+            o.nodes,
+            page.bytes(),
+            o.size,
+            o.gather,
+            o.iters,
+            o.warmup
+        );
+        Ok((Ends::Tcp(ends), control))
     }
 
     /// The stage's line: the round trip of every timed generation, both
@@ -746,7 +769,7 @@ mod probe {
         o: &Opts,
         stamps: &[u64],
         stale_rows: u64,
-        reports: &[(u64, u64)],
+        reports: &[Vec<u64>],
         kernel_ns: &[u64],
     ) -> Result<(), GateError> {
         let mut rtt: Vec<u64> = (o.warmup + 1..=o.total as usize)
@@ -757,8 +780,8 @@ mod probe {
         let mean = rtt.iter().sum::<u64>() as f64 / rtt.len() as f64 / 1e3;
         let [p50, p90, p99, p999] = [50.0, 90.0, 99.0, 99.9].map(|p| us(pct(&mut rtt, p)));
         let (min, max) = (us(rtt[0]), us(rtt[rtt.len() - 1]));
-        let stale_image: u64 = reports.iter().map(|r| r.0).sum();
-        let peer_kernel = reports.iter().map(|r| r.1).max().unwrap_or(0);
+        let stale_image: u64 = reports.iter().map(|r| r[0]).sum();
+        let peer_kernel = reports.iter().map(|r| r[1]).max().unwrap_or(0);
         let stage_kernel = pct(&mut kernel_ns[o.warmup..].to_vec(), 50.0);
         println!(
             "link nodes={} iters={} rtt_us_p50={:.2} rtt_us_p90={:.2} rtt_us_p99={:.2} \
@@ -777,7 +800,7 @@ mod probe {
             us(peer_kernel),
         );
         for (i, r) in reports.iter().enumerate() {
-            println!("link peer rank={} stale_image={}", i + 1, r.0);
+            println!("link peer rank={} stale_image={}", i + 1, r[0]);
         }
         stale_verdict(stale_image + stale_rows)
     }
@@ -853,7 +876,7 @@ mod probe {
         /// rank reads to [`RELEASE`]; `Err` names an end whose posts are not
         /// known to be over, whose counters stay ([`Ends::release`]).
         fn release(&self) -> Result<(), String> {
-            self.ends.release(RELEASE)
+            self.ends.release(RELEASE).map_err(|e| e.to_string())
         }
 
         /// Wait for `event`, generation `g`'s, until `since` is a deadline
@@ -947,7 +970,7 @@ mod probe {
 
     /// The host as the card: `--size`'s run on this node.
     fn host_run(o: &Opts, card: &Card<'_>, control: &mut Control) -> Result<(), GateError> {
-        control.ready()?;
+        control.barrier()?;
         let l = card.layout;
         let mut one_way = Vec::with_capacity(o.total as usize);
         let mut stale = 0u64;
@@ -996,17 +1019,15 @@ mod probe {
             }
             return Err(e);
         }
+        let reports = control.collect(&[stale])?;
         if o.rank != 0 {
-            control.report(stale, 0)?;
-            control.ready()?;
             println!(
                 "link peer rank={} size={} stale_words={stale}",
                 o.rank, o.size
             );
             return Ok(());
         }
-        let peer_stale: u64 = control.collect()?.iter().map(|r| r.0).sum();
-        control.ready()?;
+        let peer_stale: u64 = reports[1..].iter().map(|r| r[0]).sum();
         let t = &mut one_way[o.warmup..];
         let us = |ns: u64| ns as f64 / 1e3;
         let mean = t.iter().sum::<u64>() as f64 / t.len() as f64 / 1e3;
@@ -1205,23 +1226,29 @@ mod probe {
     fn gather_run(o: &Opts, gpu: &Gpu) -> Result<(), GateError> {
         let rows = o.gather;
         let shapes = [BODY_WIDTH, HEAD_WIDTH].map(|width| GatherShape { rows, width });
-        let g = Gathers::new(0, o.nodes, o.rank, &shapes)?;
         let ctx = gpu.context();
-        let page = Arc::new(MappedHost::new(
-            ctx,
-            g.page_bytes(),
-            "cuMemHostAlloc (the probe's gather page)",
-        )?);
-        let cols = PostCols::default();
-        cols.set(rows);
-        let peers: Vec<usize> = (0..o.nodes).filter(|&j| j != o.rank).collect();
-        let (ends, mut control) = open_ends(
-            o,
-            &page,
-            &peers,
-            |j| (g.tail(j), g.crossings(j), g.side(j)),
-            &cols,
-        )?;
+        // Every rank runs one gather shape: the rows are the probe's header identity.
+        let mut h = Sha256::new();
+        h.update(format!("link_probe --gather {rows}").as_bytes());
+        let fp = Fingerprint {
+            source: [0; 32],
+            headers: h.finish(),
+            form: 0,
+            build: bloomery_gpu_gates::rank_build()?,
+            n: u16::try_from(o.nodes)?,
+            rank: u16::try_from(o.rank)?,
+        };
+        let how = Bootstrap {
+            fabric: o.fabric.clone(),
+            wait: Duration::from_secs(60).max(o.deadline),
+            wire: RemoteWire::Rdma,
+        };
+        enter("bootstrap");
+        let mut session = RankSession::open(gpu, &o.ranks, o.rank, &how, &fp, &[], &shapes)?;
+        enter("payload");
+        print_paths(o, session.paths());
+        let g = session.gathers().ok_or("a gather of one rank")?.clone();
+        let page = Arc::clone(session.page().ok_or("a gather of one rank")?);
         let mut watch = Vec::new();
         for slot in 0..shapes.len() {
             for set in 0..Gathers::SETS {
@@ -1230,13 +1257,6 @@ mod probe {
                 }
             }
         }
-        let node = Node {
-            rank: o.rank,
-            page: &page,
-            ends: &ends,
-            watch,
-            deadline: o.deadline,
-        };
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launcher checks its launch contract.
         let kernels = unsafe { bloomery_gpu::shared_module!(gather_kernels, ctx)? };
@@ -1307,7 +1327,16 @@ mod probe {
             }
             Ok(())
         })?;
-        control.ready()?;
+        // Every rank's graph is captured before any replays: a rank still loading would hold
+        // the others' first gather past the deadline.
+        session.collect(&[])?;
+        let node = Node {
+            rank: o.rank,
+            page: &page,
+            ends: session.ends(),
+            watch,
+            deadline: o.deadline,
+        };
         node.drive(gpu, || {
             replays(|_| Ok(graph.launch(gpu.stream())?), gpu, &node, total)
         })?;
@@ -1352,15 +1381,13 @@ mod probe {
             .u("host_wrong", wrong)
             .w("digest", format!("{digest_here:#018x}"))
             .print();
+        drop(node);
+        let reports = session.collect(&[stale_here + wrong, digest_here])?;
         if o.rank != 0 {
-            control.report(stale_here + wrong, digest_here)?;
-            control.ready()?;
             return Ok(());
         }
-        let reports = control.collect()?;
-        control.ready()?;
-        let bad = stale_here + wrong + reports.iter().map(|r| r.0).sum::<u64>();
-        let same = reports.iter().all(|r| r.1 == digest_here);
+        let bad: u64 = reports.iter().map(|r| r[0]).sum();
+        let same = reports.iter().all(|r| r[1] == digest_here);
         let pass = bad == 0 && same;
         println!(
             "{}: link_probe gather stale words and host disagreements {bad}, digests equal on \
@@ -1468,283 +1495,5 @@ mod probe {
             }
         }
         Ok(wrong)
-    }
-
-    // ------------------------------------------------------ control channel
-
-    /// The stage's TCP connections to its peers (one, to the stage, on a
-    /// peer): the endpoints, `--size` and `--gather`, the start, and the
-    /// peers' counts at the end.
-    struct Control {
-        socks: Vec<TcpStream>,
-        /// Whether this node is the stage, the one end of every connection.
-        stage: bool,
-        deadline: Duration,
-    }
-
-    /// One endpoint as the control channel carries it: the rank whose end it
-    /// is, the rank whose end connects to it, the endpoint, and the sender's
-    /// `--size`, `--gather` and `--tcp`.
-    const FRAME_BYTES: usize = 68;
-
-    impl Control {
-        fn open(o: &Opts) -> Result<Control, GateError> {
-            let deadline = Duration::from_secs(60).max(o.deadline);
-            let start = Instant::now();
-            let mut socks: Vec<Option<TcpStream>> = Vec::new();
-            if o.rank == 0 {
-                let listener = TcpListener::bind(&o.control)?;
-                listener.set_nonblocking(true)?;
-                socks.resize_with(o.nodes - 1, || None);
-                while socks.iter().any(Option::is_none) {
-                    match listener.accept() {
-                        Ok((mut s, _)) => {
-                            s.set_nonblocking(false)?;
-                            s.set_read_timeout(Some(deadline))?;
-                            let mut rank = [0u8; 4];
-                            s.read_exact(&mut rank)?;
-                            let r = u32::from_le_bytes(rank) as usize;
-                            if r == 0 || r >= o.nodes || socks[r - 1].is_some() {
-                                return Err(
-                                    format!("a peer named rank {r} twice or out of range").into()
-                                );
-                            }
-                            socks[r - 1] = Some(s);
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            if start.elapsed() > deadline {
-                                return Err(format!(
-                                    "peers did not all connect within {deadline:?}"
-                                )
-                                .into());
-                            }
-                            std::thread::sleep(Duration::from_millis(10));
-                        }
-                        Err(e) => return Err(e.into()),
-                    }
-                }
-            } else {
-                let mut s = loop {
-                    match TcpStream::connect(&o.control) {
-                        Ok(s) => break s,
-                        Err(e) if start.elapsed() > deadline => {
-                            return Err(
-                                format!("cannot reach the stage at {}: {e}", o.control).into()
-                            );
-                        }
-                        Err(_) => std::thread::sleep(Duration::from_millis(100)),
-                    }
-                };
-                s.set_read_timeout(Some(deadline))?;
-                s.write_all(&u32::try_from(o.rank)?.to_le_bytes())?;
-                socks.push(Some(s));
-            }
-            Ok(Control {
-                socks: socks.into_iter().flatten().collect(),
-                stage: o.rank == 0,
-                deadline,
-            })
-        }
-
-        /// Trade endpoints: `local` holds this node's end to each peer (its
-        /// rank and endpoint), and the result holds, in the same order, each
-        /// peer's end to this node. A peer sends the stage its count and its
-        /// frames; the stage sends each peer every frame that names it, its
-        /// own included, so two peers learn each other's ends through it.
-        /// Every frame carries its sender's `--size` and `--gather`, and a
-        /// node that reads another value refuses it by name before any
-        /// generation.
-        fn exchange(
-            &mut self,
-            local: &[(usize, Ep)],
-            rank: usize,
-            shape: [usize; 3],
-        ) -> Result<Vec<Ep>, GateError> {
-            let shape = shape.map(|v| v as u64);
-            let own: Vec<Frame> = local
-                .iter()
-                .map(|&(to, e)| Frame {
-                    from: rank,
-                    to,
-                    e,
-                    shape,
-                })
-                .collect();
-            let mut mine = Vec::new();
-            if self.stage {
-                let mut all = own;
-                for s in &mut self.socks {
-                    all.extend(read_frames(s, shape)?);
-                }
-                for (i, s) in self.socks.iter_mut().enumerate() {
-                    write_frames(s, all.iter().filter(|f| f.to == i + 1))?;
-                }
-                mine.extend(all.into_iter().filter(|f| f.to == 0));
-            } else {
-                let s = &mut self.socks[0];
-                write_frames(s, own.iter())?;
-                mine = read_frames(s, shape)?;
-            }
-            local
-                .iter()
-                .map(|&(peer, _)| {
-                    let mut of = mine.iter().filter(|f| f.from == peer && f.to == rank);
-                    match (of.next(), of.next()) {
-                        (Some(f), None) => Ok(f.e),
-                        _ => Err(format!("rank {rank}: not one end of rank {peer} to it").into()),
-                    }
-                })
-                .collect()
-        }
-
-        /// A barrier, a byte each way: a peer writes, then reads; the stage
-        /// reads every peer's byte before it writes any. Before the first
-        /// generation, every node's queue pairs are ready, those between two
-        /// peers included; after the last, the stage has every peer's done,
-        /// so no peer drops its end (its pump and queue pair) with a done
-        /// still to post.
-        fn ready(&mut self) -> Result<(), GateError> {
-            let read = |s: &mut TcpStream| s.read_exact(&mut [0u8; 1]);
-            if self.stage {
-                self.socks.iter_mut().try_for_each(read)?;
-                self.socks.iter_mut().try_for_each(|s| s.write_all(b"R"))?;
-            } else {
-                self.socks.iter_mut().try_for_each(|s| s.write_all(b"R"))?;
-                self.socks.iter_mut().try_for_each(read)?;
-            }
-            Ok(())
-        }
-
-        /// A peer's stale count and, by mode, its kernel's median time or its
-        /// sums' digest, to the stage.
-        fn report(&mut self, stale: u64, second: u64) -> Result<(), GateError> {
-            let mut b = [0u8; 16];
-            b[0..8].copy_from_slice(&stale.to_le_bytes());
-            b[8..16].copy_from_slice(&second.to_le_bytes());
-            self.socks[0].write_all(&b)?;
-            Ok(())
-        }
-
-        /// Every peer's report, in rank order.
-        fn collect(&mut self) -> Result<Vec<(u64, u64)>, GateError> {
-            self.socks
-                .iter_mut()
-                .enumerate()
-                .map(|(i, s)| {
-                    s.set_read_timeout(Some(self.deadline))?;
-                    let mut b = [0u8; 16];
-                    s.read_exact(&mut b)
-                        .map_err(|e| format!("rank {}'s report: {e}", i + 1))?;
-                    Ok((
-                        u64::from_le_bytes(b[0..8].try_into().expect("8 bytes")),
-                        u64::from_le_bytes(b[8..16].try_into().expect("8 bytes")),
-                    ))
-                })
-                .collect()
-        }
-    }
-
-    /// An end as the control channel carries it: an RDMA endpoint, or a TCP
-    /// end's address and nonce.
-    #[derive(Clone, Copy)]
-    enum Ep {
-        Rdma(Endpoint),
-        Tcp(TcpPeer),
-    }
-
-    /// An endpoint on the control channel ([`FRAME_BYTES`]).
-    struct Frame {
-        from: usize,
-        to: usize,
-        e: Ep,
-        shape: [u64; 3],
-    }
-
-    /// Write the count of `frames`, then each.
-    fn write_frames<'a>(
-        s: &mut TcpStream,
-        frames: impl Iterator<Item = &'a Frame> + Clone,
-    ) -> Result<(), GateError> {
-        s.write_all(&u32::try_from(frames.clone().count())?.to_le_bytes())?;
-        for f in frames {
-            let mut b = [0u8; FRAME_BYTES];
-            b[0..4].copy_from_slice(&u32::try_from(f.from)?.to_le_bytes());
-            b[4..8].copy_from_slice(&u32::try_from(f.to)?.to_le_bytes());
-            match f.e {
-                Ep::Rdma(e) => {
-                    b[8..12].copy_from_slice(&e.qpn.to_le_bytes());
-                    b[12..16].copy_from_slice(&e.psn.to_le_bytes());
-                    b[16..32].copy_from_slice(&e.gid.raw);
-                    b[32..40].copy_from_slice(&e.addr.to_le_bytes());
-                    b[40..44].copy_from_slice(&e.rkey.to_le_bytes());
-                }
-                Ep::Tcp(p) => {
-                    let ip = match p.addr.ip() {
-                        IpAddr::V4(v) => v.to_ipv6_mapped(),
-                        IpAddr::V6(v) => v,
-                    };
-                    b[8..24].copy_from_slice(&ip.octets());
-                    b[24..26].copy_from_slice(&p.addr.port().to_le_bytes());
-                    b[28..36].copy_from_slice(&p.nonce.to_le_bytes());
-                }
-            }
-            for (i, w) in f.shape.iter().enumerate() {
-                b[44 + 8 * i..52 + 8 * i].copy_from_slice(&w.to_le_bytes());
-            }
-            s.write_all(&b)?;
-        }
-        Ok(())
-    }
-
-    /// Read a count of frames, then each; a frame whose `--size`, `--gather`
-    /// and `--tcp` are not `shape` is refused by name.
-    fn read_frames(s: &mut TcpStream, shape: [u64; 3]) -> Result<Vec<Frame>, GateError> {
-        let mut n = [0u8; 4];
-        s.read_exact(&mut n)
-            .map_err(|e| format!("the endpoint count: {e}"))?;
-        (0..u32::from_le_bytes(n))
-            .map(|_| {
-                let mut b = [0u8; FRAME_BYTES];
-                s.read_exact(&mut b)
-                    .map_err(|e| format!("an endpoint: {e}"))?;
-                let w32 =
-                    |at: usize| u32::from_le_bytes(b[at..at + 4].try_into().expect("4 bytes"));
-                let w64 =
-                    |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().expect("8 bytes"));
-                let from = w32(0) as usize;
-                let theirs = [w64(44), w64(52), w64(60)];
-                if theirs != shape {
-                    return Err(format!(
-                        "--size, --gather and --tcp differ: here {shape:?}, rank {from} {theirs:?}"
-                    )
-                    .into());
-                }
-                let e = if shape[2] == 1 {
-                    let v6 = Ipv6Addr::from(<[u8; 16]>::try_from(&b[8..24]).expect("16 bytes"));
-                    let ip = v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4);
-                    let port = u16::from_le_bytes(b[24..26].try_into().expect("2 bytes"));
-                    Ep::Tcp(TcpPeer {
-                        addr: SocketAddr::new(ip, port),
-                        nonce: w64(28),
-                    })
-                } else {
-                    let mut gid = Gid::default();
-                    gid.raw.copy_from_slice(&b[16..32]);
-                    Ep::Rdma(Endpoint {
-                        qpn: w32(8),
-                        psn: w32(12),
-                        gid,
-                        addr: w64(32),
-                        rkey: w32(40),
-                    })
-                };
-                Ok(Frame {
-                    from,
-                    to: w32(4) as usize,
-                    e,
-                    shape: theirs,
-                })
-            })
-            .collect()
     }
 }

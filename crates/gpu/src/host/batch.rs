@@ -188,7 +188,7 @@ impl BlockStaging {
 /// process, with the staging there, or on a node, whose staging the node
 /// holds ([`NodeBlock`]).
 enum PortSide {
-    Card(BlockStaging),
+    Card(Box<BlockStaging>),
     Node(NodeBlock),
 }
 
@@ -307,8 +307,8 @@ impl NodeLanding<'_> {
             .f32_mut(0, span * n)
             .ok_or_else(|| GpuError::shape(WHAT, format!("{span} rows past the set's rows")))?;
         let land = |dst: &mut [f32], src: &[u8]| {
-            for (v, b) in dst.iter_mut().zip(src.chunks_exact(4)) {
-                *v = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            for (v, b) in dst.iter_mut().zip(src.as_chunks::<4>().0) {
+                *v = f32::from_le_bytes(*b);
             }
         };
         match self.kind {
@@ -382,7 +382,7 @@ impl BatchPort {
         stage.bind_to_thread()?;
         self.tiers.push(TierPort {
             legs,
-            side: PortSide::Card(staging?),
+            side: PortSide::Card(Box::new(staging?)),
             stats: TierBatchStats::default(),
         });
         Ok(())

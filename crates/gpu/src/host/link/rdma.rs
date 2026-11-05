@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use bloomery_verbs::{Endpoint, MAX_CHAIN, Nic, Qp, Region, WC_RDMA_WRITE, Wc, Write};
 
+use super::path::PeerPath;
 use super::pump::{Crossing, Half, Move, PostCols, Reader, Wire};
 use super::{End, Pump, Side};
 use crate::GpuError;
@@ -26,6 +27,8 @@ struct Rdma {
     qp: Qp,
     region: Region,
     peer: Option<(u64, u32)>,
+    /// The flow label every packet of the queue pair carries.
+    flow_label: u32,
     /// Writes posted whose completion was not yet polled.
     in_flight: usize,
     wc: [Wc; 16],
@@ -109,8 +112,8 @@ pub struct RdmaEnd {
 impl RdmaEnd {
     /// The end on side `side` over `page`, carrying `crossings` with their
     /// tail lines from byte `tail` ([`super::link_tail`]), on port 1 of the
-    /// RoCE device `dev` with GID index `gid`, each post carrying the columns
-    /// `cols` holds. The relay takes every word as `page` holds it now. A
+    /// RoCE device of `path` with its GID index, its packets carrying its flow
+    /// label, each post carrying the columns `cols` holds. The relay takes every word as `page` holds it now. A
     /// crossing whose counter, progress word or span's columns are not
     /// 4-aligned before the tail is refused by name. Load-time only.
     pub fn new(
@@ -118,15 +121,15 @@ impl RdmaEnd {
         tail: usize,
         crossings: Vec<Crossing>,
         side: Reader,
-        dev: &str,
-        gid: u8,
+        path: &PeerPath,
         cols: PostCols,
     ) -> Result<RdmaEnd, GpuError> {
         let what = "the link's RDMA end";
         let depth: usize = crossings.iter().map(|c| c.spans.len() + 2).sum();
         let half =
             Half::new(crossings, side, tail, &*page, cols).map_err(|e| GpuError::shape(what, e))?;
-        let nic = Nic::open(dev, gid).map_err(|e| GpuError::shape(what, e.to_string()))?;
+        let nic =
+            Nic::open(&path.dev, path.gid).map_err(|e| GpuError::shape(what, e.to_string()))?;
         // SAFETY: the end holds `page` after its wire, so the page drops after
         // the region: the range stays allocated while it is registered.
         let region = unsafe { nic.register(page.host_at(0), page.bytes()) }
@@ -140,6 +143,7 @@ impl RdmaEnd {
             qp,
             region,
             peer: None,
+            flow_label: path.flow_label,
             in_flight: 0,
             wc: [Wc::default(); 16],
             writes: Vec::with_capacity(MAX_CHAIN),
@@ -170,7 +174,7 @@ impl RdmaEnd {
         {
             let wire = &mut self.end().lock().1;
             wire.qp
-                .connect(psn, remote)
+                .connect(psn, remote, wire.flow_label)
                 .map_err(|e| GpuError::shape(what, e.to_string()))?;
             wire.peer = Some((remote.addr, remote.rkey));
         }
