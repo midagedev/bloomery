@@ -126,8 +126,8 @@ mod gate {
         Fnv1a64, GateError, checks_failed, data_dir, prose_ids, split_f32, verdict,
     };
     use bloomery_levers::{
-        CARD_BUDGET, CARD_DONTNEED, CED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, PREFILL_GROUP,
-        R8, STEP_STATS,
+        CARD_BUDGET, CARD_DONTNEED, CED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, PREFILL_CUT,
+        PREFILL_GROUP, R8, STEP_STATS,
     };
     use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy};
     use gguf::Split;
@@ -946,6 +946,7 @@ mod gate {
         let levers = bloomery_levers::at_main(&[
             CED,
             PREFILL_GROUP,
+            PREFILL_CUT,
             ENGRAM_HELPER,
             STEP_STATS,
             CARD_BUDGET,
