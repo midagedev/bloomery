@@ -30,7 +30,9 @@
 //! `attn · sigmoid(g)` ([`out_gate`]). Raon Delta Attention takes
 //! GLM-5.3-Flash's steps with a write gate apart from the erase gate β: the
 //! values the prep leaves are scaled by `sigmoid(b + w) / sigmoid(b)`, `w`
-//! the write projection's rows, before the delta step ([`write_gate`]).
+//! the write projection's rows, before the delta step ([`write_gate`]). Kimi K3
+//! takes GLM-5.3-Flash's steps unchanged, its three conv tap sets joined in q, k,
+//! v order and its gate one full-rank projection ([`mixer_kda`]).
 //!
 //! Layouts, all f32 and token-major:
 //! - channels `[m][C]`: q heads, then k heads, then v heads, [`HEAD`] each —

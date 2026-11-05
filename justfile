@@ -4387,3 +4387,12 @@ gate-gpu-kimik3-mla:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_kimi_k3_mla && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_kimi_k3_mla'
 
 # --- end kimik3-mla ---
+# --- kimik3kda (Kimi K3's KDA layer on the card) ---------------------------------------------------------------------------------------
+
+# Kimi K3's KDA layer through `mixer_kda::enqueue` (the bounded sigmoid decay at -5, the joined q/k/v convs, the full-rank gate, one step
+# and a prompt batch) at 2 and 96 heads of 128 against llama.cpp's `build_kda_layer` in f64 (gate_kimi_k3_kda's doc), seeded inputs, no
+# model file; the file's numbers a kernel does not tile are refused by name, and the gate's own clause sees a gate mutated to 1.
+gate-gpu-kimik3-kda:
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_kimi_k3_kda && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_kimi_k3_kda'
+
+# --- end kimik3kda ---
