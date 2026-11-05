@@ -53,6 +53,9 @@ use model::arch::kimi_k3::hparams::{Hparams, Kind};
 use model::arch::kimi_k3::names;
 use std::ops::Range;
 
+#[path = "rows.rs"]
+pub(super) mod rows;
+
 const WHAT: &str = "kimi_k3::Body::load";
 const STEP: &str = "kimi_k3::Body::enqueue_chain";
 

@@ -43,7 +43,7 @@
 //! - `mix_matches_host`: the AttnRes mix kernel against a host f64 mix of its definition at the
 //!   fixture's width (1, 2 and 15 banks) and the real file's (7168, 8 banks), within [`MIX_BAND`].
 //! - `mix_rows_are_steps`: a pass of 8 rows is 8 one-row mixes bit for bit. This is the mix kernel
-//!   alone: the body has no rows pass (the prompt batch is round kimik3pp's).
+//!   alone; the body's rows pass is `gate_kimi_k3_pp`'s.
 //! - `mix_is_the_mix`: the stream alone in place of the mix (the mix dropped) lies past [`SEP`]
 //!   bands of the kernel's output.
 //! - `mix_refused`: a row or width of 0, more than 16 vectors, a stride under a pass's rows, an

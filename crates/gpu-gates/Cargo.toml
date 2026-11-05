@@ -870,3 +870,8 @@ required-features = ["gpu"]
 [[bin]]
 name = "gate_kimi_k3_e2e"
 required-features = ["gpu"]
+
+# kimik3pp: Kimi K3's pass of up to eight rows through the chain, each row the decode step's bits, over the fixture file.
+[[bin]]
+name = "gate_kimi_k3_pp"
+required-features = ["gpu"]
