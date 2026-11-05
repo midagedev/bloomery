@@ -982,6 +982,38 @@ crate::sigmoid_router_instance! {
     }
 }
 
+crate::sigmoid_router_instance! {
+    /// The sigmoid router at 896 experts and the top 16 (Kimi K3's): the rule
+    /// of `sigmoid_128_6` at another expert and pick count (`exp_probs_b`
+    /// steering the selection only, the kept unbiased scores renormalized,
+    /// scale 1). Its 28 experts a selecting lane and 16 rounds are inside the
+    /// generic bodies' limits (`⌈E / 32⌉ <= 32`, one `u32` of taken bits). A
+    /// non-finite selection value writes NaN weights, so the finite rank order
+    /// is not a defined pick.
+    pub mod sigmoid_896_16 {
+        experts: 896,
+        used: 16,
+        kernels: sigmoid_896_16_router_kernels,
+        entries: sigmoid_896_16_router, sigmoid_896_16_router_pick,
+        prepare: prepare_sigmoid_896_16_router, prepare_sigmoid_896_16_router_pick,
+        refuse_nan: true,
+    }
+}
+
+crate::sigmoid_router_instance! {
+    /// The sigmoid router at 8 experts and the top 2: `sigmoid_896_16`'s rule
+    /// at the expert and pick counts of Kimi K3's gate fixture. The real file's
+    /// own count is `sigmoid_896_16`'s.
+    pub mod sigmoid_8_2 {
+        experts: 8,
+        used: 2,
+        kernels: sigmoid_8_2_router_kernels,
+        entries: sigmoid_8_2_router, sigmoid_8_2_router_pick,
+        prepare: prepare_sigmoid_8_2_router, prepare_sigmoid_8_2_router_pick,
+        refuse_nan: true,
+    }
+}
+
 /// A fixed selected-sum-floor sigmoid binding over 256 experts and six
 /// slots, with an actual optional selection-only bias. Shares the score,
 /// publication, selection and sum order with the legacy instances above.

@@ -378,6 +378,26 @@ pub const ROUTERS: &[RouterInst] = &[
         top_k_max: 8,
         at: "gpu/src/route_body.rs sigmoid_16_8_router*",
     },
+    // Kimi K3's router: 896 experts, the top 16.
+    RouterInst {
+        body: RouterBody::BiasedSigmoid,
+        rule: BIASED_SIGMOID,
+        norm_arg: false,
+        experts: 896,
+        top_k_min: 16,
+        top_k_max: 16,
+        at: "gpu/src/route_body.rs sigmoid_896_16_router*",
+    },
+    // Kimi K3's fixture: 8 experts, the top 2.
+    RouterInst {
+        body: RouterBody::BiasedSigmoid,
+        rule: BIASED_SIGMOID,
+        norm_arg: false,
+        experts: 8,
+        top_k_min: 2,
+        top_k_max: 2,
+        at: "gpu/src/route_body.rs sigmoid_8_2_router*",
+    },
 ];
 
 /// Why a shape has no instance.

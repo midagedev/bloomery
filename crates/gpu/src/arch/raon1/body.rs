@@ -10,7 +10,7 @@
 //! streams and its output. The attention sub-layer is an RDA layer
 //! ([`super::rda`]) or a latent one ([`super::mla`]), each applying its own
 //! `attn_norm`; the feed-forward one is `ffn_norm` then the dense or routed
-//! SiTU block ([`super::ffn`]). The head reads the streams' mean.
+//! SiTU block ([`crate::arch::routed_ffn`]). The head reads the streams' mean.
 //!
 //! A pass of `m` rows ([`Run::Rows`]: a verify's or a prompt chunk's,
 //! [`super::rows`]) is the same walk over the rows the staging holds: the
@@ -19,7 +19,6 @@
 //! ([`ffn::ffn_rows`]), each row the one-row step's bits. A walk of one row
 //! runs the step's own launches.
 
-use super::ffn::{self, Ffn, FfnKernels, FfnRows, FfnScratch, Glu, Routed};
 use super::mhc::{self, HC_OUT, MhcKernels, STREAMS, SiteVecs};
 use super::mla::{self, MlaBufs, MlaSites};
 use super::rda::{self, RdaSites, RowKernels, RowsKit};
@@ -27,6 +26,9 @@ use super::rows::{RowState, RowViews};
 use super::state::{self, PASS_ROWS, Pass};
 use super::wide::{self, WIDE_ROWS, Wide, WideDims};
 use crate::arch::hybrid::{Acts, DecodeInput, GqaCx, Site};
+use crate::arch::routed_ffn::{
+    self as ffn, Ffn, FfnKernels, FfnRows, FfnScratch, Glu, Routed, RoutedShape,
+};
 use crate::elem::EmbedRowsArgs;
 use crate::flash_gqa::FlashGqaKernels;
 use crate::gemm::Gemm32Kernels;
@@ -100,7 +102,7 @@ impl Layer {
         let mut out = self.mixer_sites();
         match &self.ffn {
             Ffn::Dense(g) => out.extend(g.sites()),
-            Ffn::Routed(r) => out.extend(r.shared.sites()),
+            Ffn::Routed(r) => out.extend(r.sites()),
         }
         out
     }
@@ -697,6 +699,8 @@ impl Body {
                         ),
                         e.shared_ff(),
                     )?,
+                    latent: None,
+                    sum_norm: None,
                 })
             };
             let hc = [Sub::Attn, Sub::Ffn].map(|sub| {
@@ -730,9 +734,9 @@ impl Body {
             k: Kernels::load(gpu, &mla)?,
             s: Scratch::new(stream, &hp, (&kda, &mla), ctx, 1)?,
             step_in: StepIn::new(stream)?,
-            ffn_s: FfnScratch::new(stream, n, ff.0, ff.1)?,
+            ffn_s: FfnScratch::new(stream, n, ff.0, RoutedShape::plain(ff.1))?,
             pass: Scratch::new(stream, &hp, (&kda, &mla), ctx, PASS_ROWS)?,
-            ffn_rows: FfnRows::new(stream, n, ff, PASS_ROWS)?,
+            ffn_rows: FfnRows::new(stream, n, (ff.0, RoutedShape::plain(ff.1)), PASS_ROWS)?,
             stage: DeviceBuffer::zeroed(stream, stage)?,
             wide: Wide::new(
                 gpu,
@@ -1178,9 +1182,9 @@ impl ChainBody for Body {
 
 #[cfg(test)]
 mod tests {
-    use super::ffn::sigmoid_128_6::{N_EXPERT, N_USED};
     use super::mla::tests::typed_sites;
     use super::{Ffn, Glu, Layer, Mixer, STREAMS, Site, SiteTy, dims, wide_dims, wide_refusal};
+    use crate::arch::routed_ffn::sigmoid_128_6::{N_EXPERT, N_USED};
     use crate::weights::Weights;
     use crate::{DeviceTensor, Gpu};
     use model::arch::delta_mla::{Mla, Situ};

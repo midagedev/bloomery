@@ -1,0 +1,16 @@
+--- a/crates/gpu/src/route_body.rs
++++ b/crates/gpu/src/route_body.rs
+@@ -68,11 +68,9 @@
+     while e < E {
+         // SAFETY: at + e < at + E, inside probs by this fn's contract.
+         let p = unsafe { core::ptr::read_volatile(probs.add(at + e)) };
++        // mutant kimik3moe-select-bias: the selection ignores the bias.
+         let v = match bias {
+-            Some(bias) => {
+-                // SAFETY: e < E and any supplied bias holds E entries.
+-                p + unsafe { *bias.get_unchecked(e) }
+-            }
++            Some(_) => p,
+             None => p,
+         };
+         if !v.is_finite() {
