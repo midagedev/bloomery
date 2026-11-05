@@ -1,0 +1,11 @@
+--- a/crates/gpu/src/host/tier.rs
++++ b/crates/gpu/src/host/tier.rs
+@@ -2224,7 +2224,7 @@
+     pub(super) fn supports_blocks(&self) -> bool {
+         match &self.side {
+             TierSide::Here(work) => work.experts.block_bytes() != 0,
+-            TierSide::Node(n) => n.block().is_some(),
++            TierSide::Node(_) => false,
+         }
+     }
+ 

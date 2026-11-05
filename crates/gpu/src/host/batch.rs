@@ -19,7 +19,16 @@
 //! go deadline ([`HostTier::tier_rows_of`]) before the stage card's card sum
 //! reads the rows in place. No launch of any card waits for another: the
 //! host orders them through the set's events.
+//!
+//! A tier on a node ([`super::node`]) runs the same service in its own
+//! process: the route's download also copies the block's q8_1 planes (the
+//! form the tier's image carries) into the front of the leg's rows, the
+//! service sends them with the places as one block request before the
+//! union, and the wait after the union reads the node's packed rows into
+//! the leg's rows, in their slots' places where the architecture leaves a
+//! block's rows staged ([`BlockRows`]).
 
+use super::node::block::NodeBlock;
 use super::slots::{BatchSlots, HOST, MAX_TIERS, Slot};
 use super::step::GO_DEADLINE;
 use super::tier::{BlockRows, TierBlock, TierCard};
@@ -125,28 +134,79 @@ enum Leg {
 /// A set's tier leg: the slots' tier places the route downloads, the rows
 /// the tier's down writes back (host-mapped, slot-major from the block's
 /// first slot, or packed: [`BlockRows::Packed`]) as the stage card's card
-/// sum reads them, the event the tier's service completes at (the tier's
-/// context), and its stage.
+/// sum reads them, for a tier card of this process the event its service
+/// completes at (the tier's context), for a tier on a node the bytes of the
+/// q3 plane and scales the route copied to the rows' front, and its stage.
 ///
 /// Field order is drop order: the window before the allocation it views.
 struct TierLeg {
     rows_stage: WindowMut<'static, f32>,
     rows: MappedHost,
     tsel: PinnedHostBuffer<u32>,
-    done: CudaEvent,
+    done: Option<CudaEvent>,
+    planes: (usize, usize),
     leg: Leg,
 }
 
-/// One tier's side of the port: its two legs, one a set, and its staging on
-/// the tier card for a block — the activations and places copied in, their
-/// q8_1 form, the down outputs by slot.
+/// A tier's block staging on the card that runs its experts — a tier card
+/// of this process, or a tier node's ([`super::node`]): the block's f32
+/// activations and tier places copied in, their q8_1 form, the down outputs
+/// by slot, for blocks of up to the port's tokens. Its bytes are the plan's
+/// staging reserve on that card ([`TierPort`], `check_tier_reserves`).
+pub(super) struct BlockStaging {
+    pub(super) x: DeviceBuffer<f32>,
+    pub(super) tsel: DeviceBuffer<u32>,
+    pub(super) act: Q8Act,
+    pub(super) y: DeviceBuffer<f32>,
+}
+
+impl BlockStaging {
+    /// The staging for blocks of up to `cap` tokens of rows of `n_embd`,
+    /// `n_used` slots a token, on `stream`'s card. Load-time only.
+    pub(super) fn new(
+        stream: &CudaStream,
+        cap: usize,
+        n_embd: usize,
+        n_used: usize,
+    ) -> Result<BlockStaging, GpuError> {
+        let slots = cap * n_used;
+        Ok(BlockStaging {
+            x: DeviceBuffer::zeroed(stream, cap * n_embd)?,
+            tsel: DeviceBuffer::zeroed(stream, slots)?,
+            act: Q8Act::with_tier_cols(stream, cap, n_embd)?,
+            y: DeviceBuffer::zeroed(stream, slots * n_embd)?,
+        })
+    }
+
+    /// Device bytes of the staging.
+    pub(super) fn device_bytes(&self) -> usize {
+        self.x.num_bytes() + self.tsel.num_bytes() + self.act.device_bytes() + self.y.num_bytes()
+    }
+}
+
+/// Where a tier's side of the port runs a block: on its card in this
+/// process, with the staging there, or on a node, whose staging the node
+/// holds ([`NodeBlock`]).
+enum PortSide {
+    Card(BlockStaging),
+    Node(NodeBlock),
+}
+
+/// One tier's side of the port: its two legs, one a set, and where its
+/// blocks run.
 struct TierPort {
     legs: [TierLeg; 2],
-    x: DeviceBuffer<f32>,
-    tsel: DeviceBuffer<u32>,
-    act: Q8Act,
-    y: DeviceBuffer<f32>,
+    side: PortSide,
     stats: TierBatchStats,
+}
+
+/// The block's q8_1 planes on the stage card, a column a token as a
+/// [`Q8Act`] lays one out: the q3 plane and its scales, which a tier on a
+/// node is sent ([`HostTier::enqueue_download_planes`]).
+#[derive(Clone, Copy)]
+pub struct BlockPlanes<'a> {
+    pub q3: &'a DeviceBuffer<u64>,
+    pub d8: &'a DeviceBuffer<f32>,
 }
 
 /// What a tier's batch services have done since load: services enqueued,
@@ -182,20 +242,86 @@ pub struct BatchPort {
 
 /// What a tiered set hands one tier's service
 /// ([`HostTier::serve_port`]): `key`'s tokens' activations and tier places
-/// in the set, the tier's staging, the set's rows and the event to record.
+/// in the set, the set's rows, and where the block runs.
 struct TierServe<'a> {
     key: BatchKey,
     n_embd: usize,
     n_used: usize,
     x: &'a PinnedHostBuffer<f32>,
     tsel: &'a PinnedHostBuffer<u32>,
-    stage_x: &'a mut DeviceBuffer<f32>,
-    stage_tsel: &'a mut DeviceBuffer<u32>,
-    act: &'a mut Q8Act,
-    y: &'a mut DeviceBuffer<f32>,
     rows: &'a MappedHost,
     rows_len: usize,
-    done: &'a CudaEvent,
+    side: ServeSide<'a>,
+}
+
+/// Where a tier's service of a set runs: on its card, the tier's staging
+/// and the event to record; or on a node, sent the q3 plane and scales of
+/// those bytes at the rows' front.
+enum ServeSide<'a> {
+    Card {
+        staging: &'a mut BlockStaging,
+        done: &'a CudaEvent,
+    },
+    Node {
+        planes: (usize, usize),
+    },
+}
+
+/// A node leg's rows as its wait lands them ([`BatchPort::settle_tiers`]):
+/// the set's rows, the block's tier places, its rows of `n_embd` and where
+/// the node's architecture leaves them.
+pub(super) struct NodeLanding<'a> {
+    rows: &'a mut MappedHost,
+    places: &'a [u32],
+    n_embd: usize,
+    kind: BlockRows,
+}
+
+impl NodeLanding<'_> {
+    /// The node's packed rows `packed` (one a tier slot of the block, in
+    /// slot order, `n_embd` f32 each, as the reply carries them) into the
+    /// set's rows: at the front for a packed architecture, at each tier
+    /// slot's place in slot order for a staged one. Refused by name for rows
+    /// that are not one a tier slot.
+    pub(super) fn land(self, packed: &[u8]) -> Result<(), GpuError> {
+        const WHAT: &str = "BatchPort::settle_tiers (a node's rows)";
+        let row = 4 * self.n_embd;
+        let k = self.places.iter().filter(|&&p| p != HOST).count();
+        if packed.len() != k * row {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "{} bytes of rows for {k} tier slots of {} values",
+                    packed.len(),
+                    self.n_embd
+                ),
+            ));
+        }
+        let span = match self.kind {
+            BlockRows::Packed => k,
+            BlockRows::Staged => self.places.len(),
+        };
+        let n = self.n_embd;
+        let dst = self
+            .rows
+            .f32_mut(0, span * n)
+            .ok_or_else(|| GpuError::shape(WHAT, format!("{span} rows past the set's rows")))?;
+        let land = |dst: &mut [f32], src: &[u8]| {
+            for (v, b) in dst.iter_mut().zip(src.chunks_exact(4)) {
+                *v = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            }
+        };
+        match self.kind {
+            BlockRows::Packed => land(&mut dst[..k * n], packed),
+            BlockRows::Staged => {
+                let tier = self.places.iter().enumerate().filter(|(_, p)| **p != HOST);
+                for ((j, _), src) in tier.zip(packed.chunks_exact(row)) {
+                    land(&mut dst[j * n..(j + 1) * n], src);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl BatchPort {
@@ -247,6 +373,57 @@ impl BatchPort {
     /// the `t`-th call's. Load-time only; past [`super::slots::MAX_TIERS`]
     /// tiers it is refused by name.
     pub fn attach_tier(&mut self, stage: &Arc<CudaContext>, tier: &Gpu) -> Result<(), GpuError> {
+        let legs = [
+            self.leg(stage, Some(tier.context()))?,
+            self.leg(stage, Some(tier.context()))?,
+        ];
+        tier.context().bind_to_thread()?;
+        let staging = BlockStaging::new(tier.stream(), self.cap, self.n_embd, self.n_used);
+        stage.bind_to_thread()?;
+        self.tiers.push(TierPort {
+            legs,
+            side: PortSide::Card(staging?),
+            stats: TierBatchStats::default(),
+        });
+        Ok(())
+    }
+
+    /// The next tier's side of the port for an expert tier on a node whose
+    /// block open answered `block` ([`super::node::TierNode::block_open`]):
+    /// per set the places' copy and the rows, under the stage card of
+    /// `stage`; the node holds the staging. A node that holds blocks of
+    /// other than the port's tokens is refused by name. Load-time only.
+    pub(super) fn attach_node(
+        &mut self,
+        stage: &Arc<CudaContext>,
+        block: NodeBlock,
+    ) -> Result<(), GpuError> {
+        if block.cap != self.cap {
+            return Err(GpuError::shape(
+                "BatchPort::attach_node",
+                format!(
+                    "a node holding blocks of {} tokens for a port of {}",
+                    block.cap, self.cap
+                ),
+            ));
+        }
+        let legs = [self.leg(stage, None)?, self.leg(stage, None)?];
+        self.tiers.push(TierPort {
+            legs,
+            side: PortSide::Node(block),
+            stats: TierBatchStats::default(),
+        });
+        Ok(())
+    }
+
+    /// One set's leg of the next tier: its rows and places under `stage`,
+    /// and with the tier's context `tier` its event there. Refused by name
+    /// past [`super::slots::MAX_TIERS`] tiers.
+    fn leg(
+        &self,
+        stage: &Arc<CudaContext>,
+        tier: Option<&Arc<CudaContext>>,
+    ) -> Result<TierLeg, GpuError> {
         const WHAT: &str = "BatchPort::attach_tier";
         if self.tiers.len() >= super::slots::MAX_TIERS {
             return Err(GpuError::shape(
@@ -257,46 +434,28 @@ impl BatchPort {
                 ),
             ));
         }
-        let (n, s, cap) = (self.n_embd, self.n_used, self.cap);
-        let slots = cap * s;
-        let row_values = slots * n;
-        let leg = || -> Result<TierLeg, GpuError> {
-            let rows = MappedHost::new(stage, 4 * row_values, "cuMemHostAlloc (the tier's rows)")?;
-            // SAFETY: the window spans the `row_values` f32 of `rows`'s
-            // allocation, which the leg keeps and frees only after the window
-            // (field order).
-            let rows_stage =
-                unsafe { WindowMut::<f32>::from_raw(rows.dev_at(0), row_values, stage) };
-            #[cfg(test)]
-            crate::tensor::allocation_failure("BatchPort::tsel")?;
-            let tsel = PinnedHostBuffer::<u32>::zeroed(stage, slots).map_err(|source| {
-                GpuError::Driver {
-                    op: Some("cuMemAllocHost (the batch's tier places)"),
-                    source,
-                }
+        let slots = self.cap * self.n_used;
+        let row_values = slots * self.n_embd;
+        let rows = MappedHost::new(stage, 4 * row_values, "cuMemHostAlloc (the tier's rows)")?;
+        // SAFETY: the window spans the `row_values` f32 of `rows`'s
+        // allocation, which the leg keeps and frees only after the window
+        // (field order).
+        let rows_stage = unsafe { WindowMut::<f32>::from_raw(rows.dev_at(0), row_values, stage) };
+        #[cfg(test)]
+        crate::tensor::allocation_failure("BatchPort::tsel")?;
+        let tsel =
+            PinnedHostBuffer::<u32>::zeroed(stage, slots).map_err(|source| GpuError::Driver {
+                op: Some("cuMemAllocHost (the batch's tier places)"),
+                source,
             })?;
-            Ok(TierLeg {
-                rows_stage,
-                rows,
-                tsel,
-                done: tier.context().new_event(None)?,
-                leg: Leg::Idle,
-            })
-        };
-        let legs = [leg()?, leg()?];
-        tier.context().bind_to_thread()?;
-        let ts = tier.stream();
-        let port = TierPort {
-            legs,
-            x: DeviceBuffer::zeroed(ts, cap * n)?,
-            tsel: DeviceBuffer::zeroed(ts, slots)?,
-            act: Q8Act::with_tier_cols(ts, cap, n)?,
-            y: DeviceBuffer::zeroed(ts, row_values)?,
-            stats: TierBatchStats::default(),
-        };
-        stage.bind_to_thread()?;
-        self.tiers.push(port);
-        Ok(())
+        Ok(TierLeg {
+            rows_stage,
+            rows,
+            tsel,
+            done: tier.map(|c| c.new_event(None)).transpose()?,
+            planes: (0, 0),
+            leg: Leg::Idle,
+        })
     }
 
     /// Tokens a block of this port holds at most.
@@ -316,12 +475,13 @@ impl BatchPort {
             .sum()
     }
 
-    /// Device bytes tier `tier`'s staging holds on its card; 0 for a tier the
-    /// port has no side of.
+    /// Device bytes tier `tier`'s staging holds on its card, a node's as its
+    /// block open named them; 0 for a tier the port has no side of.
     #[must_use]
     pub fn tier_device_bytes(&self, tier: usize) -> usize {
-        self.tiers.get(tier).map_or(0, |t| {
-            t.x.num_bytes() + t.tsel.num_bytes() + t.act.device_bytes() + t.y.num_bytes()
+        self.tiers.get(tier).map_or(0, |t| match &t.side {
+            PortSide::Card(staging) => staging.device_bytes(),
+            PortSide::Node(block) => block.staging,
         })
     }
 
@@ -371,7 +531,7 @@ impl BatchPort {
         pitch: usize,
         key: BatchKey,
     ) -> Result<(), GpuError> {
-        self.download_with(stream, xw, ids, pitch, &[], key)
+        self.download_with(stream, xw, ids, (pitch, None), &[], key)
     }
 
     /// [`BatchPort::download`] of a tiered layer: for each `(t, places)` of
@@ -387,7 +547,7 @@ impl BatchPort {
         tsels: &[(usize, &DeviceBuffer<u32>)],
         key: BatchKey,
     ) -> Result<(), GpuError> {
-        self.download_with(stream, xw, ids, self.n_used, tsels, key)
+        self.download_with(stream, xw, ids, (self.n_used, None), tsels, key)
     }
 
     /// [`BatchPort::download_tiered`] from routing buffers of `pitch`
@@ -403,7 +563,23 @@ impl BatchPort {
         tsels: &[(usize, &DeviceBuffer<u32>)],
         key: BatchKey,
     ) -> Result<(), GpuError> {
-        self.download_with(stream, xw, ids, pitch, tsels, key)
+        self.download_with(stream, xw, ids, (pitch, None), tsels, key)
+    }
+
+    /// [`BatchPort::download_tiered_pitched`] with the block's q8_1 planes
+    /// `planes` (its tokens from the block's first, [`BlockPlanes`]): each
+    /// routed tier on a node also gets the columns' q3 plane and scales
+    /// copied to its leg's rows' front, which its service sends.
+    pub fn download_planes(
+        &mut self,
+        stream: &CudaStream,
+        xw: [&DeviceBuffer<f32>; 2],
+        ids: &DeviceBuffer<u32>,
+        (pitch, planes): (usize, BlockPlanes<'_>),
+        tsels: &[(usize, &DeviceBuffer<u32>)],
+        key: BatchKey,
+    ) -> Result<(), GpuError> {
+        self.download_with(stream, xw, ids, (pitch, Some(planes)), tsels, key)
     }
 
     fn download_with(
@@ -411,7 +587,7 @@ impl BatchPort {
         stream: &CudaStream,
         [x, w]: [&DeviceBuffer<f32>; 2],
         ids: &DeviceBuffer<u32>,
-        pitch: usize,
+        (pitch, planes): (usize, Option<BlockPlanes<'_>>),
         tsels: &[(usize, &DeviceBuffer<u32>)],
         key: BatchKey,
     ) -> Result<(), GpuError> {
@@ -434,6 +610,14 @@ impl BatchPort {
                 ),
             });
         }
+        // Only a download that carries the planes reads the q8_1 shape: a
+        // hidden size the planes cannot hold is no other download's refusal.
+        let (q3_col, d8_col) = match planes {
+            Some(_) => Q8Act::q3_d8_words(n)?,
+            None => (0, 0),
+        };
+        let cols = u - at;
+        let plane_bytes = (cols * q3_col * 8, cols * d8_col * 4);
         for &(t, _) in tsels {
             let Some(port) = self.tiers.get(t) else {
                 return Err(GpuError::state(
@@ -442,6 +626,24 @@ impl BatchPort {
                 ));
             };
             let l = &port.legs[self.down];
+            if matches!(port.side, PortSide::Node(_)) {
+                if planes.is_none() {
+                    return Err(GpuError::state(
+                        PORT,
+                        "the block's q8_1 planes for a tier on a node (BatchPort::download_planes)",
+                    ));
+                }
+                if plane_bytes.0 + plane_bytes.1 > l.rows.bytes() {
+                    return Err(GpuError::Shape {
+                        what: PORT,
+                        detail: format!(
+                            "{key:?}'s q8_1 planes of {} bytes past tier {t}'s rows of {}",
+                            plane_bytes.0 + plane_bytes.1,
+                            l.rows.bytes()
+                        ),
+                    });
+                }
+            }
             if l.leg != Leg::Idle {
                 return Err(GpuError::Shape {
                     what: PORT,
@@ -469,12 +671,23 @@ impl BatchPort {
                 dtoh_pitched(stream, &mut set.w, w, (at..u, s, pitch))?;
             }
             for &(t, places) in tsels {
-                dtoh(
-                    stream,
-                    &mut self.tiers[t].legs[self.down].tsel,
-                    places,
-                    at * s..u * s,
-                )?;
+                let port = &mut self.tiers[t];
+                let l = &mut port.legs[self.down];
+                dtoh(stream, &mut l.tsel, places, at * s..u * s)?;
+                if let (PortSide::Node(_), Some(p)) = (&port.side, planes) {
+                    // The leg's rows are free here: the stage card's card sum
+                    // read them before this set's last upload, enqueued
+                    // before these copies; the node's rows land over the
+                    // planes only after the service sent them.
+                    dtoh_mapped_at(stream, (&l.rows, 0), p.q3, at * q3_col..u * q3_col)?;
+                    dtoh_mapped_at(
+                        stream,
+                        (&l.rows, plane_bytes.0),
+                        p.d8,
+                        at * d8_col..u * d8_col,
+                    )?;
+                    l.planes = plane_bytes;
+                }
             }
         }
         for &(t, _) in tsels {
@@ -588,18 +801,21 @@ impl BatchPort {
         let t1 = Instant::now();
         let mut issued = 0u32;
         for (t, port) in self.tiers.iter_mut().enumerate() {
-            let TierPort {
-                legs,
-                x,
-                tsel,
-                act,
-                y,
-                stats,
-            } = port;
+            let TierPort { legs, side, stats } = port;
             let l = &mut legs[self.serve];
             match l.leg {
                 Leg::Idle => {}
                 Leg::Routed(k) if k == key => {
+                    let side = match (side, &l.done) {
+                        (PortSide::Card(staging), Some(done)) => ServeSide::Card { staging, done },
+                        (PortSide::Node(_), None) => ServeSide::Node { planes: l.planes },
+                        _ => {
+                            return Err(GpuError::state(
+                                PORT,
+                                "a tier card's leg with its event, or a node's without one",
+                            ));
+                        }
+                    };
                     tier(
                         t,
                         TierServe {
@@ -608,13 +824,9 @@ impl BatchPort {
                             n_used: s,
                             x: &set.x,
                             tsel: &l.tsel,
-                            stage_x: x,
-                            stage_tsel: tsel,
-                            act,
-                            y,
                             rows: &l.rows,
                             rows_len: l.rows_stage.len(),
-                            done: &l.done,
+                            side,
                         },
                     )?;
                     l.leg = Leg::Issued(key);
@@ -653,11 +865,20 @@ impl BatchPort {
     /// served set — `key`'s, and tiered, else refused by name — after which
     /// each served leg's rows are what the stage card reads: that tier's down
     /// outputs of the block's slots, slot-major from its first slot
-    /// ([`BatchPort::tier_rows`]). Returns the tiers, one bit a tier, whose
-    /// event has not completed by `deadline`: the caller names them lost. A
+    /// ([`BatchPort::tier_rows`]). A tier card's leg is waited for on its
+    /// event; a node's is handed to `node` with its [`NodeLanding`], which
+    /// reads the node's reply into the rows and returns whether they landed.
+    /// Returns the tiers, one bit a tier, whose service has not completed by
+    /// `deadline` or whose rows did not land: the caller names them lost. A
     /// second call on a settled set returns 0 at once.
-    pub fn settle_tiers(&mut self, key: BatchKey, deadline: Instant) -> Result<u32, GpuError> {
+    pub(super) fn settle_tiers(
+        &mut self,
+        key: BatchKey,
+        deadline: Instant,
+        mut node: impl FnMut(usize, NodeLanding<'_>) -> bool,
+    ) -> Result<u32, GpuError> {
         const WHAT: &str = "BatchPort::settle_tiers";
+        let (n, s) = (self.n_embd, self.n_used);
         let set = &self.sets[self.up];
         if self.tiers.is_empty() {
             return Err(GpuError::state(WHAT, "a tier leg (BatchPort::attach_tier)"));
@@ -700,15 +921,35 @@ impl BatchPort {
             }
             let t0 = Instant::now();
             let mut early = true;
-            let mut landed = true;
-            while !l.done.query()? {
-                early = false;
-                if Instant::now() > deadline {
-                    landed = false;
-                    break;
+            let landed = match (&port.side, &l.done) {
+                (PortSide::Node(b), _) => {
+                    early = false;
+                    node(
+                        t,
+                        NodeLanding {
+                            rows: &mut l.rows,
+                            places: &l.tsel[key.at * s..key.u * s],
+                            n_embd: n,
+                            kind: b.rows,
+                        },
+                    )
                 }
-                std::thread::yield_now();
-            }
+                (PortSide::Card(_), Some(done)) => {
+                    let mut landed = true;
+                    while !done.query()? {
+                        early = false;
+                        if Instant::now() > deadline {
+                            landed = false;
+                            break;
+                        }
+                        std::thread::yield_now();
+                    }
+                    landed
+                }
+                (PortSide::Card(_), None) => {
+                    return Err(GpuError::state(WHAT, "a tier card's leg with its event"));
+                }
+            };
             if !landed {
                 late |= 1 << t;
                 continue;
@@ -805,7 +1046,7 @@ impl BatchPort {
 /// Enqueue the copy of values `at` of `src` to the same values of `dst`.
 ///
 /// SAFETY: `dst` is not read or freed until the copy completes.
-unsafe fn dtoh<T: cuda_core::DeviceCopy>(
+pub(super) unsafe fn dtoh<T: cuda_core::DeviceCopy>(
     stream: &CudaStream,
     dst: &mut PinnedHostBuffer<T>,
     src: &DeviceBuffer<T>,
@@ -945,6 +1186,33 @@ unsafe fn htod_front<T: cuda_core::DeviceCopy>(
     cu(rc, "cuMemcpyHtoDAsync_v2 (the tier's block)")
 }
 
+/// Enqueue the copy of `src`'s bytes to the start of `dst`.
+///
+/// SAFETY: `src` is not written or freed until the copy completes.
+pub(super) unsafe fn htod_bytes<T: cuda_core::DeviceCopy>(
+    stream: &CudaStream,
+    dst: &mut DeviceBuffer<T>,
+    src: &[u8],
+) -> Result<(), GpuError> {
+    if src.is_empty() || src.len() > dst.num_bytes() {
+        return Err(GpuError::Shape {
+            what: PORT,
+            detail: format!("{} bytes into {}", src.len(), dst.num_bytes()),
+        });
+    }
+    // SAFETY: `dst` holds `src`'s bytes (checked above); `src` stays
+    // unwritten until the copy completes by this fn's contract.
+    let rc = unsafe {
+        sys::cuMemcpyHtoDAsync_v2(
+            dst.cu_deviceptr(),
+            src.as_ptr().cast(),
+            src.len(),
+            stream.cu_stream(),
+        )
+    };
+    cu(rc, "cuMemcpyHtoDAsync_v2 (a node's block)")
+}
+
 /// Enqueue the copy of the first `len` f32 of `src` to the start of `dst`,
 /// a host-mapped allocation of `dst_len` f32.
 ///
@@ -975,6 +1243,41 @@ unsafe fn dtoh_mapped(
     cu(rc, "cuMemcpyDtoHAsync_v2 (the tier's rows)")
 }
 
+/// Enqueue the copy of values `at` of `src` to byte `off` of `dst`.
+///
+/// SAFETY: nothing reads or writes `dst`'s bytes from `off` on, for the
+/// copy's length, until it completes.
+unsafe fn dtoh_mapped_at<T: cuda_core::DeviceCopy>(
+    stream: &CudaStream,
+    (dst, off): (&MappedHost, usize),
+    src: &DeviceBuffer<T>,
+    at: Range<usize>,
+) -> Result<(), GpuError> {
+    let len = at.len() * size_of::<T>();
+    if at.is_empty() || at.end > src.len() || off.checked_add(len).is_none_or(|e| e > dst.bytes()) {
+        return Err(GpuError::Shape {
+            what: PORT,
+            detail: format!(
+                "values {at:?} from {} into byte {off} of {}",
+                src.len(),
+                dst.bytes()
+            ),
+        });
+    }
+    // SAFETY: the source holds the values of `at` and the destination the
+    // copy's bytes from `off` (checked above); nothing touches those bytes
+    // until the copy completes by this fn's contract.
+    let rc = unsafe {
+        sys::cuMemcpyDtoHAsync_v2(
+            dst.host_at(off).cast(),
+            src.cu_deviceptr() + (at.start * size_of::<T>()) as u64,
+            len,
+            stream.cu_stream(),
+        )
+    };
+    cu(rc, "cuMemcpyDtoHAsync_v2 (the block's q8_1 planes)")
+}
+
 // ------------------------------------------------------------------- tier
 
 /// Enqueue the tier's service of `io`'s block on `tier`'s stream
@@ -992,16 +1295,18 @@ fn enqueue_tier_service(
     Ok(())
 }
 
-/// The tier's service of `io`'s block, on the tier's stream, its tier
-/// slots counted as the tier's hits ([`TierCard::hit`]): the block's
-/// f32 activations and tier places copied from the set to the staging from
-/// column 0; their q8_1 form, the bytes the stage card's fused norm wrote
-/// for the same columns (its q8_1 output is the quantizer's over its f32
-/// output); the tier's experts over the block by the tile path into the
-/// down outputs by slot, and those copied into the set's rows — or, for a
-/// [`BlockRows::Packed`] tier, its slots' rows packed at their front and
-/// those alone copied, one row for each slot the places do not leave to the
-/// host; the set's event.
+/// The tier's service of `io`'s block, its tier slots counted as the
+/// tier's hits ([`TierCard::hit`]). On a tier card of this process, on the
+/// tier's stream: the block's f32 activations and tier places copied from
+/// the set to the staging from column 0; their q8_1 form, the bytes the
+/// stage card's fused norm wrote for the same columns (its q8_1 output is
+/// the quantizer's over its f32 output); the tier's experts over the block
+/// by the tile path into the down outputs by slot, and those copied into
+/// the set's rows — or, for a [`BlockRows::Packed`] tier, its slots' rows
+/// packed at their front and those alone copied, one row for each slot the
+/// places do not leave to the host; the set's event. On a node: the block
+/// request — the places and the q8_1 planes the route copied to the rows'
+/// front, the same bytes — sent, its reply read by the set's wait.
 /// Each copy's source was complete when the host enqueued it: the host has
 /// waited for the set's route copies.
 fn enqueue_tier_leg(tier: &mut TierCard, io: TierServe<'_>) -> Result<(), GpuError> {
@@ -1011,13 +1316,9 @@ fn enqueue_tier_leg(tier: &mut TierCard, io: TierServe<'_>) -> Result<(), GpuErr
         n_used: s,
         x,
         tsel,
-        stage_x,
-        stage_tsel,
-        act,
-        y,
         rows,
         rows_len,
-        done,
+        side,
     } = io;
     let BatchKey { layer, at, u, .. } = key;
     let cols = u - at;
@@ -1027,6 +1328,16 @@ fn enqueue_tier_leg(tier: &mut TierCard, io: TierServe<'_>) -> Result<(), GpuErr
     })?;
     let on_tier = places.iter().filter(|&&p| p != HOST).count();
     tier.hit(layer, on_tier as u64);
+    let (staging, done) = match side {
+        ServeSide::Card { staging, done } => (staging, done),
+        ServeSide::Node { planes: (q3, d8) } => {
+            let planes = rows.bytes_at(0, q3 + d8).ok_or_else(|| GpuError::Shape {
+                what: PORT,
+                detail: format!("{key:?}'s q8_1 planes of {} bytes past its rows", q3 + d8),
+            })?;
+            return tier.block_send((layer, cols), places, planes.split_at(q3), on_tier);
+        }
+    };
     {
         let g = tier.gpu()?;
         g.context().bind_to_thread()?;
@@ -1034,10 +1345,10 @@ fn enqueue_tier_leg(tier: &mut TierCard, io: TierServe<'_>) -> Result<(), GpuErr
         // before its upload, which waits for this service's event, recorded
         // after these copies.
         unsafe {
-            htod_front(g.stream(), stage_x, x, at * n..u * n)?;
-            htod_front(g.stream(), stage_tsel, tsel, at * s..u * s)?;
+            htod_front(g.stream(), &mut staging.x, x, at * n..u * n)?;
+            htod_front(g.stream(), &mut staging.tsel, tsel, at * s..u * s)?;
         }
-        g.enqueue_quantize_q8_1_cols(stage_x, act, cols, layer)?;
+        g.enqueue_quantize_q8_1_cols(&staging.x, &mut staging.act, cols, layer)?;
     }
     let copied = match tier.block_rows()? {
         BlockRows::Staged => cols * s,
@@ -1046,11 +1357,11 @@ fn enqueue_tier_leg(tier: &mut TierCard, io: TierServe<'_>) -> Result<(), GpuErr
     tier.enqueue_block(
         layer,
         TierBlock {
-            x: &*stage_x,
-            act: &*act,
-            sel: &*stage_tsel,
+            x: &staging.x,
+            act: &staging.act,
+            sel: &staging.tsel,
             cols,
-            down: &mut *y,
+            down: &mut staging.y,
         },
     )?;
     let stream = tier.gpu()?.stream();
@@ -1058,7 +1369,7 @@ fn enqueue_tier_leg(tier: &mut TierCard, io: TierServe<'_>) -> Result<(), GpuErr
         // SAFETY: `rows_len` is the rows' allocation's length (their window
         // spans all of it); the stage card reads them only after the host
         // has seen the event recorded below complete.
-        unsafe { dtoh_mapped(stream, (rows, rows_len), y, copied * n)? };
+        unsafe { dtoh_mapped(stream, (rows, rows_len), &staging.y, copied * n)? };
     }
     done.record(stream)?;
     Ok(())
@@ -1067,30 +1378,46 @@ fn enqueue_tier_leg(tier: &mut TierCard, io: TierServe<'_>) -> Result<(), GpuErr
 impl<H: HostExperts> HostTier<H> {
     /// The batch port's tier legs, once the host tier holds both the port
     /// ([`HostTier::prepare_batch`]) and its expert tiers: per tier and set
-    /// the places, the rows and the tier's event, and the tier card's staging
-    /// ([`BatchPort::attach_tier`]). Nothing without a tier, and nothing
-    /// with a tier that runs no block (a tier on a node among them, whose
-    /// experts a batch's host serves: [`HostTier::batch_slots`]); made once.
-    /// Load-time or first-prompt only; what it holds is checked against the
-    /// plan by [`HostTier::check_tier_reserves`].
+    /// the places, the rows and, for a tier card, the tier's event and its
+    /// staging ([`BatchPort::attach_tier`]); a tier on a node is first asked
+    /// to open its block staging for the port's blocks
+    /// ([`TierCard::open_node_block`]) and its leg holds none
+    /// ([`BatchPort::attach_node`]). Nothing without a tier, and nothing
+    /// with a tier that runs no block — a tier card whose architecture runs
+    /// none, or a node whose tier does not run one from the q8_1 planes —
+    /// whose experts, on a node, a batch's host serves
+    /// ([`HostTier::batch_slots`]); a node whose leg is made no longer reads
+    /// as the host's. Made once. Load-time or first-prompt only; what it
+    /// holds is checked against the plan by
+    /// [`HostTier::check_tier_reserves`].
     pub fn prepare_tier_batch(&mut self) -> Result<(), GpuError> {
         const WHAT: &str = "HostTier::prepare_tier_batch";
         let stage = Arc::clone(self.step.boundary.region.context());
         let Some(port) = self.port.as_mut() else {
             return Ok(());
         };
-        if self.tiers.is_empty()
-            || !port.tiers.is_empty()
-            || self.tiers.iter().any(|t| !t.supports_blocks())
-        {
+        if self.tiers.is_empty() || !port.tiers.is_empty() {
             return Ok(());
         }
-        for tier in &self.tiers {
-            let r = port.attach_tier(&stage, tier.gpu()?);
+        for tier in &mut self.tiers {
+            let r = tier.open_node_block(port.cap());
             let back = stage.bind_to_thread();
             r?;
             back.map_err(|e| GpuError::shape(WHAT, format!("rebinding the stage context: {e}")))?;
         }
+        if self.tiers.iter().any(|t| !t.supports_blocks()) {
+            return Ok(());
+        }
+        for tier in &self.tiers {
+            let r = match tier.node_block() {
+                Some(block) => port.attach_node(&stage, block),
+                None => port.attach_tier(&stage, tier.gpu()?),
+            };
+            let back = stage.bind_to_thread();
+            r?;
+            back.map_err(|e| GpuError::shape(WHAT, format!("rebinding the stage context: {e}")))?;
+        }
+        self.nodes = 0;
         Ok(())
     }
 
@@ -1196,10 +1523,12 @@ impl<H: HostExperts> HostTier<H> {
     /// of each tier too, `tsels[t]` tier `t`'s (`n_used` a token), copied for
     /// each tier that holds experts of the layer a batch routes to it, which
     /// that tier's service reads ([`BatchPort::download_tiered`]); a tier on
-    /// a node routes none, its experts the batch's host's
+    /// a node with no batch leg routes none, its experts the batch's host's
     /// ([`HostTier::batch_slots`]). Refused by name for a layer no tier
-    /// holds such an expert of, for a place list that is not one a tier, and
-    /// without a tier or its leg.
+    /// holds such an expert of, for a place list that is not one a tier,
+    /// without a tier or its leg, and for a layer routed to a node's leg,
+    /// which reads the block's q8_1 planes
+    /// ([`HostTier::enqueue_download_planes`]).
     pub fn enqueue_download_tiered(
         &mut self,
         stream: &CudaStream,
@@ -1225,6 +1554,35 @@ impl<H: HostExperts> HostTier<H> {
         tsels: &[&DeviceBuffer<u32>],
         key: BatchKey,
     ) -> Result<(), GpuError> {
+        self.download_tiered_with(stream, xw, ids, (pitch, None), tsels, key)
+    }
+
+    /// [`HostTier::enqueue_download_tiered`] with the block's q8_1 planes
+    /// on the stage card (`planes`, [`BlockPlanes`]), which a tier on a node
+    /// is sent ([`BatchPort::download_planes`]): what a body whose layer
+    /// [`HostTier::batch_planes`] names downloads.
+    pub fn enqueue_download_planes(
+        &mut self,
+        stream: &CudaStream,
+        xw: [&DeviceBuffer<f32>; 2],
+        ids: &DeviceBuffer<u32>,
+        planes: BlockPlanes<'_>,
+        tsels: &[&DeviceBuffer<u32>],
+        key: BatchKey,
+    ) -> Result<(), GpuError> {
+        let pitch = self.step.boundary.layout.handoff().n_used;
+        self.download_tiered_with(stream, xw, ids, (pitch, Some(planes)), tsels, key)
+    }
+
+    fn download_tiered_with(
+        &mut self,
+        stream: &CudaStream,
+        xw: [&DeviceBuffer<f32>; 2],
+        ids: &DeviceBuffer<u32>,
+        (pitch, planes): (usize, Option<BlockPlanes<'_>>),
+        tsels: &[&DeviceBuffer<u32>],
+        key: BatchKey,
+    ) -> Result<(), GpuError> {
         const WHAT: &str = "HostTier::enqueue_download_tiered";
         let view = self.batch_slots()?;
         let mut mask = 0u32;
@@ -1238,8 +1596,8 @@ impl<H: HostExperts> HostTier<H> {
                 WHAT,
                 format!(
                     "layer {}: a tiered route of a layer whose tiers hold no expert a batch \
-                     routes to them (a tier on a node routes none: the batch's host serves its \
-                     experts, HostTier::batch_slots)",
+                     routes to them (a tier on a node with no block leg routes none: the batch's \
+                     host serves its experts, HostTier::batch_slots)",
                     key.layer
                 ),
             ));
@@ -1261,8 +1619,25 @@ impl<H: HostExperts> HostTier<H> {
             routed[k] = (t, places);
             k += 1;
         }
-        self.port_mut(WHAT)?
-            .download_tiered_pitched(stream, xw, ids, pitch, &routed[..k], key)
+        let port = self.port_mut(WHAT)?;
+        match planes {
+            Some(p) => port.download_planes(stream, xw, ids, (pitch, p), &routed[..k], key),
+            None => port.download_tiered_pitched(stream, xw, ids, pitch, &routed[..k], key),
+        }
+    }
+
+    /// Whether a prompt batch's layer `layer` routes slots to a tier on a
+    /// node through its batch leg: its download then carries the block's
+    /// q8_1 planes ([`HostTier::enqueue_download_planes`]). A layer the map
+    /// has no row for is refused by name.
+    pub fn batch_planes(&self, layer: usize) -> Result<bool, GpuError> {
+        let view = self.batch_slots()?;
+        for (t, tier) in self.tiers.iter().enumerate() {
+            if tier.node_block().is_some() && view.on_tier_of(t, layer)? > 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// The oldest download not served yet — `key`'s, else refused by name —
@@ -1377,16 +1752,46 @@ impl<H: HostExperts> HostTier<H> {
     ) -> Result<&DeviceBuffer<f32>, GpuError> {
         const WHAT: &str = "HostTier::tier_rows_of";
         let deadline = Instant::now() + GO_DEADLINE;
-        let late = self.port_mut(WHAT)?.settle_tiers(key, deadline)?;
+        let port = self.port.as_mut().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "the batch port's sets (HostTier::prepare_batch)",
+        })?;
+        let tiers = &mut self.tiers;
+        // A node's leg whose rows did not land, by its card's name, and why.
+        let mut failed: Vec<(String, String)> = Vec::new();
+        let late = port.settle_tiers(key, deadline, |t, landing| {
+            let Some(tier) = tiers.get_mut(t) else {
+                return false;
+            };
+            match tier
+                .block_rows_of(deadline)
+                .and_then(|rows| landing.land(rows))
+            {
+                Ok(()) => true,
+                Err(e) => {
+                    failed.push((tier.name().to_owned(), e.to_string()));
+                    false
+                }
+            }
+        })?;
         if late != 0 {
             return Err(self.lose_tiers_as(SERVE_BATCH, key.layer, late, |t, _| {
-                format!(
-                    "the expert tier on {} did not finish its service of the prompt block's \
-                     columns {}..{} in {GO_DEADLINE:?}: the card is lost",
-                    t.name(),
-                    key.at,
-                    key.u
-                )
+                match failed.iter().find(|(n, _)| n == t.name()).map(|(_, e)| e) {
+                    Some(e) => format!(
+                        "the expert tier on {} returned no rows of the prompt block's columns \
+                         {}..{}: {e}: the card is lost",
+                        t.name(),
+                        key.at,
+                        key.u
+                    ),
+                    None => format!(
+                        "the expert tier on {} did not finish its service of the prompt block's \
+                         columns {}..{} in {GO_DEADLINE:?}: the card is lost",
+                        t.name(),
+                        key.at,
+                        key.u
+                    ),
+                }
             }));
         }
         self.port_mut(WHAT)?.tier_rows(tier, key)
@@ -1453,6 +1858,7 @@ pub(super) struct BatchStats {
     pub(super) batch_host_slots: u64,
     pub(super) batch_ns: u64,
     pub(super) batch_excluded_slots: u64,
+    pub(super) batch_tier_slots: u64,
 }
 
 /// A batch service's scratch and counters: the host lists, the boundary's
@@ -1545,7 +1951,7 @@ impl BatchService {
             self.refused.reserve(cols);
         }
         self.refused.clear();
-        let (mut host_slots, mut excluded) = (0u64, 0u64);
+        let (mut host_slots, mut excluded, mut tier_slots) = (0u64, 0u64, 0u64);
         // One pool pass over x finds the first column whose activation is not
         // finite; the columns before it are, and only the ones from it on are
         // scanned here, one by one, for what the host saw.
@@ -1566,7 +1972,10 @@ impl BatchService {
                     }
                     Some(Slot::Card(_)) => {}
                     Some(Slot::Tier { tier, .. })
-                        if tier < MAX_TIERS && t.legs >> tier & 1 == 1 => {}
+                        if tier < MAX_TIERS && t.legs >> tier & 1 == 1 =>
+                    {
+                        tier_slots += 1;
+                    }
                     Some(Slot::Tier { tier, .. }) => return Err(no_leg(layer, id, tier)),
                     None => unknown = unknown.or(Some((s, id))),
                 }
@@ -1596,7 +2005,7 @@ impl BatchService {
             let r = t.experts.experts_union_into(layer, x, &lists, out);
             self.slices = reuse_slices(lists);
             r?;
-            self.count(cols, host_slots, excluded, t0);
+            self.count(cols, [host_slots, excluded, tier_slots], t0);
             return Ok(());
         };
         // The refused columns reach the host experts as zeros with an empty
@@ -1613,7 +2022,7 @@ impl BatchService {
         for &j in &self.refused {
             out[j * hidden..][..hidden].fill(f32::NAN);
         }
-        self.count(cols, host_slots, excluded, t0);
+        self.count(cols, [host_slots, excluded, tier_slots], t0);
         let r = Refusal {
             what: WHAT,
             layer,
@@ -1681,12 +2090,13 @@ impl BatchService {
     /// A service's counters: `cols` columns, `host_slots` host slots computed
     /// and `excluded` left out by the call's set, the union call's wall time
     /// since `t0`.
-    fn count(&mut self, cols: usize, host_slots: u64, excluded: u64, t0: Instant) {
+    fn count(&mut self, cols: usize, [host_slots, excluded, tier_slots]: [u64; 3], t0: Instant) {
         let s = &mut self.stats;
         s.batch_served += 1;
         s.batch_cols += cols as u64;
         s.batch_host_slots += host_slots;
         s.batch_excluded_slots += excluded;
+        s.batch_tier_slots += tier_slots;
         s.batch_ns += nanos(t0.elapsed());
     }
 
@@ -1833,7 +2243,9 @@ mod tests {
 
     /// One column of layer 3 routing experts 1 to 5 over a row of two tiers
     /// (`[card 0, tier 0, tier 1, host, tier 1, card 1]`): with tier 1 on a
-    /// node and tier 0's leg issued, the host computes 2, 3 and 4; a service
+    /// node and tier 0's leg issued, the host computes 2, 3 and 4 and leaves
+    /// 1 to the leg; with both legs issued it computes 3 alone and leaves the
+    /// other three to them; a service
     /// that issued no leg to a tier its view sends an expert to is refused by
     /// name before any host expert runs — tier 0's expert 1 with no leg, and
     /// with no tier on a node tier 1's expert 2.
@@ -1858,14 +2270,28 @@ mod tests {
                 n_used,
             };
             let x = Tensor2View::new(&x, hidden, 1).expect("one column");
-            let r = BatchService::default().serve_one(t, 3, x, &ids, &w, &[], &mut out);
-            (r, experts.listed)
+            let mut service = BatchService::default();
+            let r = service.serve_one(t, 3, x, &ids, &w, &[], &mut out);
+            (r, experts.listed, service.stats)
         };
-        let (r, listed) = serve(0b10, 0b01);
+        let (r, listed, st) = serve(0b10, 0b01);
         r.expect("tier 0's leg issued, tier 1 on a node");
         assert_eq!(listed, 3, "the host computes experts 2, 3 and 4");
+        assert_eq!(
+            (st.batch_host_slots, st.batch_tier_slots),
+            (3, 1),
+            "the host leaves expert 1 to tier 0's leg"
+        );
+        let (r, listed, st) = serve(0, 0b11);
+        r.expect("both tiers' legs issued");
+        assert_eq!(listed, 1, "the host computes expert 3 alone");
+        assert_eq!(
+            (st.batch_host_slots, st.batch_tier_slots),
+            (1, 3),
+            "the host leaves experts 1, 2 and 4 to the tiers' legs"
+        );
         for (nodes, legs, id, tier) in [(0b10, 0, 1, 0), (0, 0b01, 2, 1)] {
-            let (r, listed) = serve(nodes, legs);
+            let (r, listed, _) = serve(nodes, legs);
             let e = r.expect_err("a tier slot with no leg").to_string();
             assert!(
                 e.contains(&format!("expert {id} reads as tier {tier}'s")),

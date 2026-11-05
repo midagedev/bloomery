@@ -339,6 +339,10 @@ pub struct HybridStats {
     /// was in the service's exclusion set and so not computed, summed. A
     /// refused column counts in neither this nor `batch_host_slots`.
     pub batch_excluded_slots: u64,
+    /// Of the slots batch services' columns listed, those the service left
+    /// to a tier's batch leg of its layer-batch, summed: the tiers' share,
+    /// which the host did not compute.
+    pub batch_tier_slots: u64,
     /// Services, step or batch, that met input the card should already have
     /// refused ([`HostTier::refusal`] names the first).
     pub refusals: u64,
@@ -958,9 +962,10 @@ pub struct HostTier<H> {
     health: Health,
     /// Which experts each layer's card stack holds; the host serves the rest.
     slots: SlotMap,
-    /// The tiers on a node, bit `t` tier `t`, once attached
-    /// ([`HostTier::attach_tiers`]): a prompt batch reads their entries as
-    /// the host's ([`HostTier::batch_slots`]).
+    /// The tiers on a node with no batch leg, bit `t` tier `t`: each node's
+    /// once attached ([`HostTier::attach_tiers`]), none once the batch port's
+    /// legs are made ([`HostTier::prepare_tier_batch`]). A prompt batch reads
+    /// their entries as the host's ([`HostTier::batch_slots`]).
     nodes: u32,
     step: StepPort,
     /// The batch service's scratch and counters, and the port's sets once a
@@ -2827,12 +2832,13 @@ impl<H: HostExperts> HostTier<H> {
         &self.slots
     }
 
-    /// The slot map as a prompt batch reads it: a tier on a node's experts
-    /// are the host's, whose batch service serves them in the node's place
-    /// (the batch port runs no leg on a node); the decode step reads
-    /// [`HostTier::slots`], and the node serves them there. A card side
-    /// decides a batch's tiered layers by it. Refused by name only for a
-    /// node mask the map does not name, which the attach never makes.
+    /// The slot map as a prompt batch reads it: the experts of a tier on a
+    /// node with no batch leg are the host's, whose batch service serves them
+    /// in the node's place; a node whose leg the batch port made
+    /// ([`HostTier::prepare_tier_batch`]) serves its own, as it does for the
+    /// decode step, which reads [`HostTier::slots`]. A card side decides a
+    /// batch's tiered layers by it. Refused by name only for a node mask the
+    /// map does not name, which the attach never makes.
     pub fn batch_slots(&self) -> Result<BatchSlots<'_>, GpuError> {
         BatchSlots::new(&self.slots, self.nodes)
     }
@@ -2876,6 +2882,7 @@ impl<H: HostExperts> HostTier<H> {
             batch_host_slots: b.batch_host_slots,
             batch_ns: b.batch_ns,
             batch_excluded_slots: b.batch_excluded_slots,
+            batch_tier_slots: b.batch_tier_slots,
             refusals: t.refusals,
             resets: t.resets,
             last_poison: t.last_poison,

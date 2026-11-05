@@ -924,6 +924,11 @@ impl TierExperts for Ds41Tier {
         self.tile.as_ref().map_or(0, Q3TileScratch::device_bytes)
     }
 
+    /// The tile path reads the q3 plane and its scales alone.
+    fn block_planes(&self) -> bool {
+        true
+    }
+
     fn enqueue_block(
         &mut self,
         gpu: &Gpu,

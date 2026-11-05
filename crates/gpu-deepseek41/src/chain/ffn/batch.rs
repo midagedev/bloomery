@@ -64,7 +64,7 @@ use bloomery_gpu::cores::q3k_row_dot;
 use bloomery_gpu::gemm::{
     DownW, GateUp, Gemm32Kernels, GemmAct, GemmKernels, GemmWeight, enqueue_gemm_batch,
 };
-use bloomery_gpu::hybrid::{BatchKey, ServeTimes};
+use bloomery_gpu::hybrid::{BatchKey, BlockPlanes, ServeTimes};
 use bloomery_gpu::kquant::TileScratch;
 use bloomery_gpu::kquant::tiles::{GatherPlanes, KquantTileKernels, gather, gather_plane};
 use bloomery_gpu::q4k_sel::{TileBlock, TileWork, tile_block, tile_cap};
@@ -1882,14 +1882,16 @@ impl FfnBatch {
     /// host into the host tier's next batch set, and the event they complete
     /// at ([`Hybrid::enqueue_download`]); for a `tiered` layer the slots'
     /// tier places too ([`Hybrid::enqueue_download_tiered`]), which a batch
-    /// made without them refuses by name. Asynchronous. Refused while both
-    /// sets hold a layer not uploaded yet.
+    /// made without them refuses by name, and with `planes` the block's q8_1
+    /// planes the route copied ([`Hybrid::enqueue_download_planes`]), which
+    /// a tier on a node is sent. Asynchronous. Refused while both sets hold
+    /// a layer not uploaded yet.
     pub fn enqueue_download<H: HostExperts>(
         &self,
         gpu: &Gpu,
         tier: &mut Hybrid<H>,
         key: BatchKey,
-        tiered: bool,
+        (tiered, planes): (bool, bool),
     ) -> Result<(), GpuError> {
         self.check_key(key)?;
         let xw = [&self.x, &self.weights];
@@ -1897,6 +1899,13 @@ impl FfnBatch {
             return tier.enqueue_download(gpu.stream(), xw, &self.ids, key);
         }
         let tsel = self.tsel()?;
+        if planes {
+            let planes = BlockPlanes {
+                q3: &self.q3_all,
+                d8: &self.d8_all,
+            };
+            return tier.enqueue_download_planes(gpu.stream(), xw, &self.ids, planes, &[tsel], key);
+        }
         tier.enqueue_download_tiered(gpu.stream(), xw, &self.ids, &[tsel], key)
     }
 
@@ -2168,16 +2177,19 @@ impl FfnPiece {
     /// batch whether it is a media position — the block's media tokens pick
     /// with that bias: the router's scores once over the block, then a pick
     /// launch per run of tokens of one kind
-    /// ([`RouterKernels::enqueue_router_rows_runs`]). Returns the router's
-    /// pick launches and, on a layer with card experts, the map row's copy.
-    /// Asynchronous, allocation-free without `vl`.
+    /// ([`RouterKernels::enqueue_router_rows_runs`]). With `planes`, each
+    /// chunk's q8_1 codes and scales are copied into the block's planes, two
+    /// copies a chunk, which the download sends a tier on a node
+    /// ([`FfnBatch::enqueue_download`]). Returns the router's pick launches
+    /// and, on a layer with card experts, the map row's copy. Asynchronous,
+    /// allocation-free without `vl`.
     pub fn enqueue_batch_route(
         &mut self,
         gpu: &Gpu,
         bl: &BatchLayer<'_>,
         b: &mut FfnBatch,
         io: &BlockIo<'_>,
-        slots: &DeviceTensor<u32>,
+        (slots, planes): (&DeviceTensor<u32>, bool),
         vl: Option<(&DeviceBuffer<f32>, &[bool])>,
     ) -> Result<usize, GpuError> {
         let (layer, lw) = (bl.layer, &bl.lw);
@@ -2207,6 +2219,19 @@ impl FfnPiece {
                 &mut x,
                 fault,
             )?;
+            if planes {
+                let (m, at) = (chunk.m, chunk.at);
+                let act_x = &b.act_x[m - 1];
+                let (q, d) = (act_x.q3().len() / m, act_x.d8().len() / m);
+                // SAFETY: the copies read the chunk's own scratch and write
+                // its tokens' columns of the block's planes, both on the
+                // engine stream, which orders them after the norm that wrote
+                // the scratch and before the download that reads the planes.
+                unsafe {
+                    dtod(stream, &mut b.q3_all, at * q, act_x.q3(), m * q)?;
+                    dtod(stream, &mut b.d8_all, at * d, act_x.d8(), m * d)?;
+                }
+            }
         }
         let t = u - at;
         let picks = {

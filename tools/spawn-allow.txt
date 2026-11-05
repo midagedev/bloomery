@@ -25,6 +25,7 @@ crates/gpu/src/host/link/gather.rs 1 the gather tests' model rank cards, from a 
 crates/gpu/src/host/link/pump.rs 1 the relay tests' model tier card, from a libtest thread that is never pinned
 crates/gpu/src/host/link/tcp.rs 1 the wire tests' model tier card (its goes, images and dones), from a libtest thread that is never pinned
 crates/gpu/src/host/node.rs 1 the one-close test's peer that reads the node's frames, from a libtest thread that is never pinned
+crates/gpu/src/host/node/wire.rs 1 the long-frame test's writer, from a libtest thread that is never pinned
 crates/gpu/src/host/nvtier.rs 2 the drop-queue tests' drop and read threads, from a libtest thread that is never pinned
 crates/gpu/src/host/xstream.rs 1 the fallback-copy test's thread that releases the copy stream's hold, from a libtest thread that is never pinned
 crates/gpu/src/host/step.rs 1 the scalar go-wait test's host tier thread, from a libtest thread that is never pinned

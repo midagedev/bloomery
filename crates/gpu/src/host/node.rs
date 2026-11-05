@@ -32,7 +32,14 @@
 //! ([`super::tier::TierCard::released`]); it drains its stream and returns
 //! the loss by name. A half-open control connection is bounded by its
 //! request deadline, and an unresponsive tier by the go deadline.
+//!
+//! A prompt batch's block runs on the node as one request a tiered
+//! layer-batch ([`block`]): node 0 sends it before its host's union and
+//! reads its reply after, so the link, the node's card and node 0's host
+//! work beside each other; no other request goes out while a block's reply
+//! is unread.
 
+pub mod block;
 pub mod wire;
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -51,17 +58,23 @@ use model::placement::{
 };
 
 use super::DRAIN_DEADLINE;
+use super::batch::{BlockStaging, dtoh, htod_bytes};
 use super::link::{Peer, TcpPeer};
+use super::slots::HOST;
 use super::step::{Chain, GO_DEADLINE};
 use super::tier::{
-    ReplyRows, TIER_CHAINS, TIER_GRACE, TierAct, TierCard, TierExperts, TierLayout, TierSet,
-    TierShape, TierWork, chain_slot,
+    BlockRows, ReplyRows, TIER_CHAINS, TIER_GRACE, TierAct, TierBlock, TierCard, TierExperts,
+    TierLayout, TierSet, TierShape, TierWork, chain_slot,
 };
 use crate::fault::{FAULT_NONE, Fault};
 use crate::model::CardBytes;
+use crate::tensor::TIER_ACT_MAX_COLS;
+use crate::upload::bytes_of;
 use crate::weights::{SegmentFile, Weights};
 use crate::words::{WordOps, WordSide};
-use crate::{Gpu, GpuError};
+use crate::{Gpu, GpuError, Q8Act};
+use block::{BlockRequest, NodeBlock};
+use cuda_core::PinnedHostBuffer;
 use wire::{Channel, In, Out, Polled, Tag};
 
 /// What node 0's errors name.
@@ -961,6 +974,52 @@ fn write_err(e: &GpuError, o: &mut Out) {
 /// The error a [`Tag::Err`] reply `body` from the node at `addr` to the
 /// request `what` carries, of the kind the server raised; a payload of
 /// another form is the error's text.
+/// Run a block on the tier's card: the request's tier places and q8_1
+/// planes landed in the staging from column 0, the tier's experts over the
+/// block of `cols` columns ([`TierWork::enqueue_block`], the path a tier
+/// card of node 0 runs), the down outputs of the first `copied` slots
+/// copied to the page-locked rows. Returns once the tier's stream drained,
+/// so the request's bytes and the rows are free.
+fn run_block(
+    work: &mut TierWork,
+    b: &mut ServerBlock,
+    (layer, cols): (usize, usize),
+    places: &[u32],
+    (q3, d8): (&[u8], &[u8]),
+    copied: usize,
+) -> Result<(), GpuError> {
+    let n = work.shape().hidden;
+    {
+        let g = work.gpu();
+        g.context().bind_to_thread()?;
+        let st = &mut b.staging;
+        let (aq3, ad8) = st.act.q3_d8_mut();
+        // SAFETY: the request's bytes outlive the copies: this fn drains the
+        // tier's stream before it returns.
+        unsafe {
+            htod_bytes(g.stream(), &mut st.tsel, bytes_of(places))?;
+            htod_bytes(g.stream(), aq3, q3)?;
+            htod_bytes(g.stream(), ad8, d8)?;
+        }
+    }
+    let st = &mut b.staging;
+    work.enqueue_block(
+        layer,
+        TierBlock {
+            x: &st.x,
+            act: &st.act,
+            sel: &st.tsel,
+            cols,
+            down: &mut st.y,
+        },
+    )?;
+    if copied > 0 {
+        // SAFETY: the rows are read only after the drain below.
+        unsafe { dtoh(work.gpu().stream(), &mut b.host, &st.y, 0..copied * n)? };
+    }
+    work.drain(DRAIN_DEADLINE, "tier_server: a block")
+}
+
 fn read_err(addr: SocketAddr, what: &str, body: &[u8]) -> Result<GpuError, String> {
     let mut i = In::new(body);
     let kind = i.u8("error kind")?;
@@ -1128,6 +1187,11 @@ pub struct TierNode {
     /// How the node's card adds to the page's words, as its captures'
     /// replies name it; `None` before the first.
     words: Option<WordSide>,
+    /// The node's block staging, once its block open made one.
+    block: Option<NodeBlock>,
+    /// A block request sent whose reply is unread: its slots and the tier
+    /// slots it sent.
+    pending: Option<(usize, usize)>,
     control_round_trips: u64,
     lost: Option<String>,
 }
@@ -1196,6 +1260,8 @@ impl TierNode {
             device_bytes: 0,
             graphs: [None; TIER_CHAINS],
             words: None,
+            block: None,
+            pending: None,
             control_round_trips: 0,
             lost: None,
         };
@@ -1231,15 +1297,7 @@ impl TierNode {
     /// [`Channel::body`]. A refusal by the server is its error, of the kind
     /// it raised; a channel that fails loses the node.
     fn call(&mut self, tag: Tag, within: Duration, what: &'static str) -> Result<(), GpuError> {
-        if let Some(why) = &self.lost {
-            return Err(GpuError::link(
-                WHAT,
-                format!(
-                    "the node at {} is lost ({why}): no {what} request",
-                    self.addr
-                ),
-            ));
-        }
+        self.ready(what)?;
         let deadline = Instant::now() + within;
         let r = self
             .ch
@@ -1257,6 +1315,107 @@ impl TierNode {
             Ok(t) => Err(self.lose_now(what, format!("a {t:?} frame where a reply belongs"))),
             Err(e) => Err(self.lose_now(what, e.to_string())),
         }
+    }
+
+    /// Refuse a request `what` to a lost node by name; with a block's reply
+    /// unread, read it first and set it aside, whatever it carries, so the
+    /// request's reply is the next frame. A channel that fails loses the
+    /// node.
+    fn ready(&mut self, what: &str) -> Result<(), GpuError> {
+        if let Some(why) = &self.lost {
+            return Err(GpuError::link(
+                WHAT,
+                format!(
+                    "the node at {} is lost ({why}): no {what} request",
+                    self.addr
+                ),
+            ));
+        }
+        if self.pending.take().is_some() {
+            match self.ch.recv(Instant::now() + REPLY) {
+                Ok(Tag::Ok | Tag::Err) => self.control_round_trips += 1,
+                Ok(t) => {
+                    let why = format!("a {t:?} frame where a block's reply belongs");
+                    return Err(self.lose_now("block", why));
+                }
+                Err(e) => return Err(self.lose_now("block", e.to_string())),
+            }
+        }
+        Ok(())
+    }
+
+    /// Open the node's block staging for a prompt batch's blocks of up to
+    /// `cap` tokens: its staging and block scratch bytes and where its
+    /// architecture leaves a block's rows ([`NodeBlock`]), or `None` when
+    /// its tier runs no block from the q8_1 planes, whose experts a batch's
+    /// host then serves. A node that cannot hold the staging refuses by
+    /// name. Load-time only.
+    pub(super) fn block_open(&mut self, cap: usize) -> Result<Option<NodeBlock>, GpuError> {
+        self.req.clear().len(cap);
+        self.call(Tag::BlockOpen, REPLY, "block open")?;
+        let block = block::read_open_reply(self.ch.body(), cap)
+            .map_err(|e| self.lose_now("block open", e))?;
+        self.block = block;
+        Ok(block)
+    }
+
+    /// The node's block staging, once its block open made one.
+    pub(super) fn block(&self) -> Option<NodeBlock> {
+        self.block
+    }
+
+    /// Send layer `layer`'s block of `cols` tokens: each slot's tier place
+    /// and the columns' q3 plane and scales, of whose slots `sent` are the
+    /// node's. Returns once the request is written; [`TierNode::block_rows`]
+    /// reads its reply.
+    pub(super) fn block_send(
+        &mut self,
+        (layer, cols): (usize, usize),
+        places: &[u32],
+        (q3, d8): (&[u8], &[u8]),
+        sent: usize,
+    ) -> Result<(), GpuError> {
+        self.ready("block")?;
+        self.req.clear();
+        block::write_request(&mut self.req, (layer, cols), places, q3, d8);
+        let written = self
+            .ch
+            .send(Tag::Block, self.req.done(), Instant::now() + REPLY);
+        written.map_err(|e| self.lose_now("block", e.to_string()))?;
+        self.pending = Some((places.len(), sent));
+        Ok(())
+    }
+
+    /// The rows of the block [`TierNode::block_send`] sent, its reply read
+    /// by `deadline`: one a tier slot it sent, in slot order. A refusal by
+    /// the node is its error; a reply of other rows, or a channel that
+    /// fails, loses the node.
+    pub(super) fn block_rows(&mut self, deadline: Instant) -> Result<&[u8], GpuError> {
+        let (slots, sent) = self.pending.take().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "a block request sent (TierNode::block_send)",
+        })?;
+        match self.ch.recv(deadline) {
+            Ok(Tag::Ok) => self.control_round_trips += 1,
+            Ok(Tag::Err) => {
+                self.control_round_trips += 1;
+                return match read_err(self.addr, "block", self.ch.body()) {
+                    Ok(e) => Err(e),
+                    Err(why) => Err(self.lose_now("block", why)),
+                };
+            }
+            Ok(t) => {
+                let why = format!("a {t:?} frame where a block's reply belongs");
+                return Err(self.lose_now("block", why));
+            }
+            Err(e) => return Err(self.lose_now("block", e.to_string())),
+        }
+        let hidden = self.shape.hidden;
+        if let Err(why) = block::read_reply(self.ch.body(), slots, hidden, sent) {
+            return Err(self.lose_now("block", why));
+        }
+        block::read_reply(self.ch.body(), slots, hidden, sent)
+            .map_err(|e| GpuError::protocol(WHAT, e))
     }
 
     /// A request whose reply carries nothing.
@@ -1531,13 +1690,23 @@ impl From<GpuError> for Failed {
     }
 }
 
-/// The tier a connection opened: its work, its card's name, its set and
-/// its columns.
+/// The tier a connection opened: its work, its card's name, its set, its
+/// columns and, once a block open made it, its block staging.
 struct Opened {
     work: TierWork,
     name: String,
     set: TierSet,
     cols: usize,
+    block: Option<ServerBlock>,
+}
+
+/// A connection's block staging, made by its block open: the staging on
+/// the tier's card, the page-locked rows a block's down outputs land in,
+/// and what the open's reply named.
+struct ServerBlock {
+    staging: BlockStaging,
+    host: PinnedHostBuffer<f32>,
+    meta: NodeBlock,
 }
 
 impl Opened {
@@ -1873,8 +2042,143 @@ impl Session<'_> {
                 let (w, s) = f.map_or((FAULT_NONE, 0), |f| (f.word(), f.sites));
                 self.reply.u32(w).u32(s);
             }
+            Tag::BlockOpen => {
+                let cap = i.len("block columns").map_err(bad)?;
+                i.end().map_err(bad)?;
+                self.handle_block_open(cap)?;
+            }
+            Tag::Block => self.handle_block(&mut i, bad)?,
             Tag::Census | Tag::Close | Tag::Ok | Tag::Err => {
                 return Err(bad("not a request".to_string()).into());
+            }
+        }
+        Ok(())
+    }
+
+    /// A block open: the block staging for blocks of up to `cap` columns
+    /// made on the tier's card, its bytes the reply
+    /// ([`block::write_open_reply`]); a tier whose work runs no block from
+    /// the q8_1 planes ([`TierWork::block_kind`]) answers that it runs none.
+    /// A second block open, columns past the staging's or a frame's
+    /// ([`block::check_frames`]), and a staging the card cannot hold are
+    /// refused by name.
+    fn handle_block_open(&mut self, cap: usize) -> Result<(), Failed> {
+        let o = self.opened.as_mut().ok_or(GpuError::State {
+            what: SERVER,
+            missing: "an opened tier (the open request)",
+        })?;
+        if o.block.is_some() {
+            return Err(GpuError::shape(SERVER, "a second block open on one connection").into());
+        }
+        let Some((scratch, rows)) = o.work.block_kind() else {
+            block::write_open_reply(&mut self.reply, None);
+            return Ok(());
+        };
+        let TierShape {
+            hidden: n,
+            n_used: s,
+            ..
+        } = o.work.shape();
+        let (q3, d8) = Q8Act::q3_d8_words(n)?;
+        let refused =
+            |why: String| GpuError::shape(SERVER, format!("a block open on {}: {why}", o.name));
+        if !(1..=TIER_ACT_MAX_COLS).contains(&cap) {
+            return Err(refused(format!("{cap} columns, 1 to {TIER_ACT_MAX_COLS}")).into());
+        }
+        block::check_frames(cap, s, n, (q3 * 8, d8 * 4)).map_err(&refused)?;
+        let g = o.work.gpu();
+        g.context().bind_to_thread().map_err(GpuError::from)?;
+        let staging = BlockStaging::new(g.stream(), cap, n, s)
+            .map_err(|e| refused(format!("the staging of {cap} columns: {e}")))?;
+        let host = PinnedHostBuffer::<f32>::zeroed(g.context(), cap * s * n)
+            .map_err(|e| refused(format!("the page-locked rows of {cap} columns: {e}")))?;
+        let meta = NodeBlock {
+            staging: staging.device_bytes(),
+            scratch,
+            rows,
+            cap,
+        };
+        o.block = Some(ServerBlock {
+            staging,
+            host,
+            meta,
+        });
+        block::write_open_reply(&mut self.reply, Some(meta));
+        Ok(())
+    }
+
+    /// A block request ([`BlockRequest`]): checked against the block
+    /// staging and the tier's set before the tier's stream is touched, its
+    /// places and planes landed, the tier's experts run over the block
+    /// ([`run_block`]), and the rows of the slots it places on the tier, in
+    /// slot order, the reply ([`block::write_reply_head`]).
+    fn handle_block(
+        &mut self,
+        i: &mut In<'_>,
+        bad: impl Fn(String) -> GpuError,
+    ) -> Result<(), Failed> {
+        let r = BlockRequest::read(i).map_err(&bad)?;
+        let o = self.opened.as_mut().ok_or(GpuError::State {
+            what: SERVER,
+            missing: "an opened tier (the open request)",
+        })?;
+        let b = o.block.as_mut().ok_or(GpuError::State {
+            what: SERVER,
+            missing: "the block staging (the block open request)",
+        })?;
+        let TierShape {
+            hidden: n,
+            n_used: s,
+            ..
+        } = o.work.shape();
+        let (q3, d8) = Q8Act::q3_d8_words(n)?;
+        let on_tier = o.set.on_tier(r.layer)?;
+        let cols = r.cols;
+        if !(1..=b.meta.cap).contains(&cols)
+            || r.places.len() != cols * s
+            || r.q3.len() != cols * q3 * 8
+            || r.d8.len() != cols * d8 * 4
+            || on_tier == 0
+        {
+            return Err(bad(format!(
+                "layer {}'s block of {cols} columns of up to {}: {} places, {} q3 and {} scale \
+                 bytes, the tier holding {on_tier} of the layer's experts",
+                r.layer,
+                b.meta.cap,
+                r.places.len(),
+                r.q3.len(),
+                r.d8.len()
+            ))
+            .into());
+        }
+        if let Some(p) = r
+            .places
+            .iter()
+            .find(|&&p| p != HOST && p as usize >= on_tier)
+        {
+            return Err(bad(format!(
+                "layer {}'s tier place {p}, past the tier's {on_tier} experts of the layer",
+                r.layer
+            ))
+            .into());
+        }
+        let sent = r.places.iter().filter(|&&p| p != HOST).count();
+        let copied = match b.meta.rows {
+            BlockRows::Staged => cols * s,
+            BlockRows::Packed => sent,
+        };
+        let planes = (r.q3, r.d8);
+        run_block(&mut o.work, b, (r.layer, cols), &r.places, planes, copied)
+            .map_err(Failed::Fatal)?;
+        block::write_reply_head(&mut self.reply, sent, n);
+        match b.meta.rows {
+            BlockRows::Packed => {
+                self.reply.raw(bytes_of(&b.host[..sent * n]));
+            }
+            BlockRows::Staged => {
+                for (j, _) in r.places.iter().enumerate().filter(|&(_, &p)| p != HOST) {
+                    self.reply.raw(bytes_of(&b.host[j * n..(j + 1) * n]));
+                }
             }
         }
         Ok(())
@@ -1902,6 +2206,7 @@ impl Session<'_> {
             name: open.name,
             set: open.set,
             cols: open.cols,
+            block: None,
         });
         Ok(())
     }
@@ -2231,6 +2536,7 @@ pub(super) mod tests {
                 name: "test tier".into(),
                 set: TierSet::new(0..1, 1, vec![vec![0]]).expect("a set"),
                 cols: 1,
+                block: None,
             }),
             asked: 0,
             seen: (0, Instant::now()),
@@ -2313,6 +2619,8 @@ pub(super) mod tests {
             device_bytes: 0,
             graphs: [None; TIER_CHAINS],
             words: None,
+            block: None,
+            pending: None,
             control_round_trips: 0,
             lost: None,
         };

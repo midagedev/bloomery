@@ -1818,8 +1818,9 @@ impl Body {
 
     /// Per layer index of the body, the experts the stage card's tier
     /// ([`STAGE_TIER`]) holds of the layer, as the batch's view of the slot
-    /// map says now (`HostTier::batch_slots`: a tier on a node holds none, the
-    /// batch's host serves its experts); all 0 without a tier. With a tier, a
+    /// map says now (`HostTier::batch_slots`: a tier on a node with no block
+    /// leg holds none, the batch's host serves its experts); all 0 without a
+    /// tier. With a tier, a
     /// layer the slot map has no row for is refused by name. Read once per
     /// group.
     fn tier_counts(&self) -> Result<Vec<usize>, GpuError> {
@@ -2707,6 +2708,9 @@ impl<'a> GroupCx<'a> {
         if m.set == 0 {
             self.sums.first_layer_batches += 1;
         }
+        // A tiered layer whose block a tier on a node runs sends it the
+        // block's q8_1 planes.
+        let planes = tiered && self.hybrid.batch_planes(l)?;
         let block = BlockIo {
             set: m.set,
             chunks: &m.cuts[full..],
@@ -2736,15 +2740,20 @@ impl<'a> GroupCx<'a> {
                 &bl,
                 &mut batch.ffn,
                 &block,
-                self.slots,
+                (self.slots, planes),
                 vl.as_ref().map(|(bias, media)| (&**bias, *media)),
             )?
         };
-        // Each chunk's norm, the router's score launch over the block and
+        // Each chunk's norm — and its two plane copies when a tier on a node
+        // is sent the planes — the router's score launch over the block and
         // its picks — one, or on a media call one a run of one kind — the
         // places, and on a layer with card experts the map row's copy.
-        self.tally
-            .route(i, m.set, (m.cuts.len() - full) as u64 + 2 + picks as u64)?;
+        let per_chunk = 1 + 2 * u64::from(planes);
+        self.tally.route(
+            i,
+            m.set,
+            (m.cuts.len() - full) as u64 * per_chunk + 2 + picks as u64,
+        )?;
         if tiered {
             let map = self.tier.map(TierPiece::places).ok_or(GpuError::State {
                 what: WHAT,
@@ -2774,10 +2783,12 @@ impl<'a> GroupCx<'a> {
         }
         batch
             .ffn
-            .enqueue_download(gpu, self.hybrid, m.key(l, at), tiered)?;
+            .enqueue_download(gpu, self.hybrid, m.key(l, at), (tiered, planes))?;
         // The three copies to the host — four on a tiered layer, its tier
-        // places — and the event the host waits on.
-        self.tally.route(i, m.set, 4 + u64::from(tiered))?;
+        // places, and six with the planes a tier on a node is sent — and the
+        // event the host waits on.
+        self.tally
+            .route(i, m.set, 4 + u64::from(tiered) + 2 * u64::from(planes))?;
         if timed {
             self.mark(m.set, i, 1)?;
             self.tally.route(i, m.set, 1)?;

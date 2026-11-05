@@ -2219,7 +2219,8 @@ mod drive {
     }
 
     /// The host tier's batch services since `base`, the arm's start, one
-    /// line: the layers served, the columns and host slots they carried, and the union calls'
+    /// line: the layers served, the columns and host slots they carried, the slots they left
+    /// to the tiers' batch legs (a tier node's block among them), and the union calls'
     /// wall — the part of a batched feed the card waits on the host; then
     /// the last call's needs and its split, then its host-streaming picks
     /// and end when it streamed.
@@ -2233,6 +2234,10 @@ mod drive {
             .u(
                 "union_host_slots",
                 s.batch_host_slots - base.batch_host_slots,
+            )
+            .u(
+                "union_tier_slots",
+                s.batch_tier_slots - base.batch_tier_slots,
             )
             .f("union_ms", (s.batch_ns - base.batch_ns) as f64 / 1e6)
             .print();
