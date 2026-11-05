@@ -2392,8 +2392,13 @@ impl Body {
             missing: "the call's needs",
         })?;
         if batch.stream.on {
-            let n = u32::try_from(members.len()).unwrap_or(u32::MAX);
-            hybrid.call_floor(STREAM_FLOOR.saturating_mul(n))?;
+            // The floor and the pick's scale price the group at T_MAX-row
+            // units: a cut batch carries fewer rows, so its first member's
+            // counts stand for T_MAX / rows of them and the floor counts the
+            // group's rows, not its members — 2 x 256 is priced as 1 x 512.
+            let rows: usize = members.iter().map(|m| m.u).sum();
+            let floor = (STREAM_FLOOR as usize * rows).div_ceil(T_MAX);
+            hybrid.call_floor(u32::try_from(floor).unwrap_or(u32::MAX))?;
         }
         let first = members.first().map_or(0, |m| m.batch);
         let mut cx = GroupCx {
@@ -2919,11 +2924,13 @@ impl<'a> GroupCx<'a> {
         };
         self.ffn
             .enqueue_batch_shadow_chunks(gpu, bl, card, &mut batch.ffn, &block)?;
-        let pick = self.hybrid.call_pick_routed(
+        let scale = u32::try_from(T_MAX.div_ceil(m.u.max(1))).unwrap_or(u32::MAX);
+        let pick = self.hybrid.call_pick_routed_scaled(
             gpu.stream(),
             m.key(l, r.at),
             &mut batch.stream.counts,
             usize::MAX,
+            scale,
         )?;
         batch.stream.picks.push((batch.stream.group, pick));
         self.ffn
