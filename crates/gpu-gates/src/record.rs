@@ -141,7 +141,7 @@ pub static TIER_COST: Kind = Kind {
 pub static PLAN: Kind = Kind {
     name: "plan",
     head: "plan",
-    doc: "The placement the engine is about to load by: its card, context, where the experts sit, the routed-expert bytes the plan pages through the NVMe tier (paged), the RAM arena they page through (arena) and the slots it holds (arena_slots), 0 and 0 and 0 on a plan that pages nothing, the host room's reading the plan was made at (room) and the plan room it was held to (plan_room, the reading less the drift margin) when it was made at one, and each plan card's device (role:name:ordinal:usable bytes; the role is stage, tier<i> for an expert tier card by its place among the tier cards, or holder for a card that joins the plan to hold a reserve, a draft's, and no expert; by-name for a card a census-free plan opens by its name) under the CUDA enumeration order in force, with the card's free bytes at plan time when the census read them, and, when the card holds a file tensor in another quantization than its file's (a BF16 head in MXFP8 planes), each such tensor as tensor:file type:card format (requantized; absent when there is none), and, when the plan took each routed layer's experts in a router rank's order (BLOOMERY_EXPERT_RANK), the rank file's path (expert_rank, last; absent when there is none).",
+    doc: "The placement the engine is about to load by: its card, context, where the experts sit, the routed-expert bytes the plan pages through the NVMe tier (paged), the pick those ids took (nvme: coldest, each layer's coldest host ids under the router rank, else id-tail; absent when it pages nothing), the RAM arena they page through (arena) and the slots it holds (arena_slots), 0 and 0 and 0 on a plan that pages nothing, the host room's reading the plan was made at (room) and the plan room it was held to (plan_room, the reading less the drift margin) when it was made at one, and each plan card's device (role:name:ordinal:usable bytes; the role is stage, tier<i> for an expert tier card by its place among the tier cards, or holder for a card that joins the plan to hold a reserve, a draft's, and no expert; by-name for a card a census-free plan opens by its name) under the CUDA enumeration order in force, with the card's free bytes at plan time when the census read them, and, when the card holds a file tensor in another quantization than its file's (a BF16 head in MXFP8 planes), each such tensor as tensor:file type:card format (requantized; absent when there is none), and, when the plan took each routed layer's experts in a router rank's order (BLOOMERY_EXPERT_RANK), the rank file's path (expert_rank, last; absent when there is none).",
     parts: &[
         key("place", Word, ""),
         key("card", Word, ""),
@@ -162,6 +162,7 @@ pub static PLAN: Kind = Kind {
         lit(" layers"),
         key("card_budget", Word, "B"),
         key("paged", U64, "B"),
+        opt("nvme", Word, ""),
         key("arena", U64, "B"),
         key("arena_slots", U64, "slots"),
         opt("room", U64, "B"),
@@ -3831,7 +3832,8 @@ pub fn tp_rank(r: &model::placement::tp::Rank, ranks: usize) -> Record {
 /// The `plan` record of `plan`, made over `machine` by the placement named
 /// `place`: its first card, the experts on it and on the host, the per-layer
 /// card counts' range, the budget, and the NVMe tier's terms (the bytes paged,
-/// the arena and its slots), and the host room it was made at when it had one.
+/// the pick they took, the arena and its slots), and the host room it was
+/// made at when it had one.
 pub fn plan(place: &str, machine: &Machine, plan: &Plan<'_>) -> Record {
     let held: Vec<u64> = plan.n_l.iter().copied().filter(|&n| n > 0).collect();
     let card = &plan.cards[0];
@@ -3854,12 +3856,12 @@ pub fn plan(place: &str, machine: &Machine, plan: &Plan<'_>) -> Record {
         )
         .u("n_l_layers", held.len())
         .w("card_budget", &plan.card_budget)
-        .u("paged", plan.host.nvme_expert_bytes)
-        .u("arena", plan.host.nvme_arena_bytes)
-        .u(
-            "arena_slots",
-            arena_slots(plan).expect("the arena's slots of a plan the split made"),
-        );
+        .u("paged", plan.host.nvme_expert_bytes);
+    let r = with_nvme_pick(r, plan.host.nvme_expert_bytes, plan.expert_rank.is_some());
+    let r = r.u("arena", plan.host.nvme_arena_bytes).u(
+        "arena_slots",
+        arena_slots(plan).expect("the arena's slots of a plan the split made"),
+    );
     let r = with_room(r, plan.host.room.as_ref());
     let r = match machine.cards.first().and_then(|c| c.free_bytes) {
         Some(free) => r.u("card_free", free),
@@ -3880,6 +3882,18 @@ pub fn with_expert_rank(r: Record, rank: Option<&model::placement::ExpertRank>) 
         Some(rank) => r.w("expert_rank", rank.path()),
         None => r,
     }
+}
+
+/// `r` with the `nvme` part, the pick the plan's paged experts
+/// (`model::placement::HostTotals::nvme_expert_bytes` above 0) took: each
+/// layer's coldest host ids under a router rank (`rank`: the plan's
+/// `expert_rank`), its id tail without one. A plan that pages nothing prints
+/// no part: the NVMe tier holds nothing to pick.
+pub fn with_nvme_pick(r: Record, paged: u64, rank: bool) -> Record {
+    if paged == 0 {
+        return r;
+    }
+    r.w("nvme", if rank { "coldest" } else { "id-tail" })
 }
 
 /// Each card of `machine` as the `plan` record's `devices` field names it: its
@@ -5826,6 +5840,43 @@ mod tests {
         let plan = Log::of(&named, BLOOMERY_SERVE_QWEN3).one(&PLAN38).unwrap();
         let want = format!("output.weight:{}:mxfp8_planes", GgmlType::BF16);
         assert_eq!(plan.csv("requantized"), Ok(vec![want.as_str()]), "{named}");
+    }
+
+    /// A plan that pages names the pick its NVMe ids took: the layer's
+    /// coldest host ids under a rank, its id tail without one, and no part
+    /// when it pages nothing. Mutant: `with_nvme_pick` printing nothing.
+    #[test]
+    fn a_plan_line_names_the_nvme_pick() {
+        // The pick goes where `plan` puts it, between `paged` and `arena`.
+        let line = |paged: u64, rank: bool| {
+            with_nvme_pick(
+                Record::new(&PLAN)
+                    .w("place", "bp")
+                    .w("card", "A6000")
+                    .u("ctx_max", 16384)
+                    .u("card_experts", 2552)
+                    .u("card_expert_bytes", 38_801_506_304u64)
+                    .u("host_experts", 8045)
+                    .u("host_expert_bytes", 123_885_584_384u64)
+                    .u("host_shadow", 0)
+                    .w("n_l", "65..66")
+                    .u("n_l_layers", 39)
+                    .w("card_budget", "none")
+                    .u("paged", paged),
+                paged,
+                rank,
+            )
+            .u("arena", 64_000_000_000u64)
+            .u("arena_slots", 5)
+            .line()
+        };
+        let quiet = line(0, true);
+        assert!(!quiet.contains("nvme="), "{quiet}");
+        for (rank, want) in [(false, "id-tail"), (true, "coldest")] {
+            let text = line(94_000_000_000u64, rank);
+            let plan = Log::of(&text, BLOOMERY_SERVE_DS41).one(&PLAN).unwrap();
+            assert_eq!(plan.word("nvme"), Ok(want), "{text}");
+        }
     }
 
     /// A plan line names the rank file the plan took its experts in, last, and

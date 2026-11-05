@@ -249,6 +249,163 @@ fn a_rank_beside_node_owned_ranges_is_refused_by_name() {
     assert!(text.contains("explicit node-owned id ranges"), "{text}");
 }
 
+/// [`layered`]`(5)`'s ranks: layer 0 the ids backwards and each later layer
+/// an interleave no other layer has, none the id order.
+fn five_orders() -> Vec<(usize, Vec<u32>)> {
+    vec![
+        (0, vec![7, 6, 5, 4, 3, 2, 1, 0]),
+        (1, vec![3, 1, 5, 7, 0, 2, 4, 6]),
+        (2, vec![0, 2, 4, 6, 1, 3, 5, 7]),
+        (3, vec![5, 0, 6, 1, 7, 2, 3, 4]),
+        (4, vec![2, 5, 1, 4, 0, 7, 3, 6]),
+    ]
+}
+
+/// A stage card and one tier card over [`layered`]`(5)`, the host holding
+/// most of every layer's experts.
+fn five_machine() -> Machine {
+    Machine {
+        cards: vec![bytes_card("stage", HEAD + 10 * EXPERT, 0..5)],
+        tiers: vec![bytes_card("tier0", 4 * EXPERT, 0..0)],
+        nodes: vec![Node {
+            host: host(),
+            unified: None,
+        }],
+    }
+}
+
+/// `plan`'s routed ids by home, for every layer: the host segment's and the
+/// NVMe tier's, ascending as the lists keep them.
+fn split_homes(plan: &Plan<'_>) -> Vec<(Vec<u32>, Vec<u32>)> {
+    let mut out = vec![(Vec::new(), Vec::new()); plan.model.layers];
+    for row in &plan.rows {
+        let t = &plan.model.tensors[row.tensor];
+        let Some(l) = t.layer.filter(|_| t.role == Role::RoutedExperts) else {
+            continue;
+        };
+        let ids = |device: Device| -> Vec<u32> {
+            row.segments
+                .iter()
+                .filter(|s| s.device == device)
+                .flat_map(|s| s.experts.iter().flat_map(|e| e.ids().to_vec()))
+                .collect()
+        };
+        out[l] = (ids(Device::Host), ids(Device::Nvme));
+    }
+    out
+}
+
+/// The room that leaves `keep` experts on the host of a plan whose host leg
+/// holds `held` bytes with `heavy` its heaviest layer: the split's own terms
+/// ([`expert_nvme_tier`]), so the test fixes how many ids move, not where
+/// the dial lands.
+fn room_for(plan: &Plan<'_>, keep: u64) -> u64 {
+    let need = workstation::HostNeed::of(plan, 0);
+    let heavy = split_homes(plan)
+        .iter()
+        .map(|(host, _)| host.len() as u64 * EXPERT)
+        .max()
+        .unwrap_or(0);
+    u64::try_from(
+        u128::from(keep * EXPERT) + need.exact(true) + u128::from(2 * heavy)
+            - u128::from(plan.host.expert_bytes),
+    )
+    .expect("a room under u64")
+}
+
+/// Under a rank the NVMe expert tier takes each layer's coldest host ids,
+/// not its id tail, and the host keeps the rest: the bytes the split moves
+/// are the rank's own, so the arena and the need account nothing new.
+/// Without a rank the tier keeps today's id tail. The stage card keeps the
+/// layer's hottest ids either way.
+#[test]
+fn a_rank_gives_the_nvme_tier_the_coldest_host_ids() {
+    let model = layered(5);
+    let machine = five_machine();
+    let orders = five_orders();
+    for (levers, coldest) in [(PlanLevers::default(), false), (ranked(&orders), true)] {
+        let mut plan = plan(&model, &machine, 4096, &NoKv, &levers).expect("a plan");
+        let before = split_homes(&plan);
+        let held = plan.host.expert_bytes;
+        assert!(
+            before
+                .iter()
+                .all(|(host, nvme)| !host.is_empty() && nvme.is_empty()),
+            "the split has not run yet"
+        );
+        let room = room_for(&plan, 2 * 5);
+        expert_nvme_tier(&mut plan, room, Some(0)).expect("the split");
+        let after = split_homes(&plan);
+        let on_cards = homes(&plan, 1);
+        assert_eq!(after.len(), before.len());
+        for (l, ((host_before, _), (host, nvme))) in before.iter().zip(&after).enumerate() {
+            let order = &orders[l].1;
+            let off = host_before.len() - host.len();
+            assert_eq!(nvme.len(), off, "layer {l} moves what it does not hold");
+            // The expected NVMe list: the layer's coldest `off` host ids
+            // under the rank, or its id tail; the host keeps the rest.
+            let mut want: Vec<u32> = if coldest {
+                order
+                    .iter()
+                    .rev()
+                    .copied()
+                    .filter(|id| host_before.binary_search(id).is_ok())
+                    .take(off)
+                    .collect()
+            } else {
+                host_before[host_before.len() - off..].to_vec()
+            };
+            want.sort_unstable();
+            assert_eq!(nvme, &want, "layer {l} NVMe ids");
+            let mut kept: Vec<u32> = host_before
+                .iter()
+                .copied()
+                .filter(|id| !want.contains(id))
+                .collect();
+            kept.sort_unstable();
+            assert_eq!(host, &kept, "layer {l} host ids");
+            let n_l = plan.n_l[l] as usize;
+            // The stage card holds the layer's hottest ids under the rank,
+            // its id prefix without one.
+            let mut card = if coldest {
+                order[..n_l].to_vec()
+            } else {
+                (0..n_l as u32).collect()
+            };
+            card.sort_unstable();
+            assert_eq!(on_cards[l].0, card, "layer {l} card ids");
+        }
+        // The counts are the plan's, unchanged by the pick: the same bytes
+        // move whatever ids they are.
+        assert_eq!(plan.host.expert_bytes, 2 * 5 * EXPERT);
+        assert_eq!(plan.host.nvme_expert_bytes, held - 2 * 5 * EXPERT);
+        assert_eq!(plan.host.nvme_arena_bytes, 0);
+    }
+}
+
+/// A rank that does not order a layer the split pages is refused by name at
+/// the split, the refusal [`ExpertRank::split`] gives.
+#[test]
+fn a_rank_that_orders_no_layer_of_a_split_is_refused_by_name() {
+    let model = layered(5);
+    let machine = five_machine();
+    let mut plan = plan(&model, &machine, 4096, &NoKv, &PlanLevers::default()).expect("a plan");
+    let mut short = five_orders();
+    short.pop();
+    let rank = ExpertRank::parse("short.tsv", &rank_text(8, &short)).expect("a rank");
+    plan.expert_rank = Some(Arc::new(rank));
+    let room = room_for(&plan, 2 * 5);
+    let text = match expert_nvme_tier(&mut plan, room, Some(0)) {
+        Err(e @ PlacementError::ExpertRank { .. }) => e.to_string(),
+        Err(e) => panic!("{e}, not ExpertRank"),
+        Ok(()) => panic!("a rank that orders no layer of the split paged it"),
+    };
+    assert!(
+        text.contains("short.tsv") && text.contains("layer 4 is not ordered over its 8 experts"),
+        "{text}"
+    );
+}
+
 /// A rank file the reader cannot place is refused by name, never padded or
 /// defaulted, and the file it reads gives back its header and orders.
 #[test]

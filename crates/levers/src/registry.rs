@@ -359,9 +359,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               layer's experts, every id once, hottest first. The stage card's prefix becomes \
               the layer's hottest `n_l` ids and each expert tier's block the layer's coldest \
               ids (tier 0 the coldest `own` ids, the next tier the next-coldest block), the \
-              host the middle; adaptive residency (`BLOOMERY_RESIDENCY`) still moves experts \
+              host the middle; the NVMe expert tier, paging what the host cannot hold, takes \
+              each layer's coldest host ids (else their id tail). Adaptive residency \
+              (`BLOOMERY_RESIDENCY`) still moves experts \
               between the stage card and the host from there. The counts per layer are the \
-              plan's, unchanged. The `plan` record names the file (`expert_rank=`). Refused \
+              plan's, unchanged. The `plan` record names the file (`expert_rank=`) and the \
+              paged pick (`nvme=coldest` or `nvme=id-tail`). Refused \
               by name: a file that cannot be read or is not a rank (no final newline, a layer \
               or an id twice, an id past `n_expert`, a layer with other than `n_expert` ids), \
               a rank whose layers or `n_expert` differ from the model's routed layers, a plan \

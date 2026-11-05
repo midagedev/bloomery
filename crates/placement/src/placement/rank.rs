@@ -2,7 +2,9 @@
 //! (`BLOOMERY_EXPERT_RANK`, written by `tools/ref/router-rank.py` from router
 //! sets). The planner reads it as an order over the ids of a layer: the stage
 //! card keeps the layer's hottest `n_l`, each expert tier card a block from
-//! the coldest end, the host the middle ([`ExpertRank::split`]).
+//! the coldest end, the host the middle ([`ExpertRank::split`]); the NVMe
+//! expert tier, paging what the host cannot hold, takes the coldest of the
+//! host's own ids ([`ExpertRank::cold_split`]).
 //!
 //! The file is one TSV: a header line
 //! `# router-rank<TAB>n_expert=<N><TAB>n_used=<U><TAB>sets=<a,b><TAB>positions=<total>`,
@@ -276,5 +278,52 @@ impl ExpertRank {
             end -= own;
         }
         Ok((stage_list, tier_lists))
+    }
+
+    /// The layer's ids `of` — the host leg's, ascending — split by the rank
+    /// at its cold end: the coldest `n` of them, which the NVMe expert tier
+    /// pages ([`super::room::expert_nvme_tier`]), and the rest, which the
+    /// host keeps; each list ascending as the slot order needs it
+    /// ([`ExpertList`]). The counts are the caller's, so the bytes the split
+    /// moves are the same whatever ids they are. Refused by name when the
+    /// rank does not order `layer` over its `experts` experts, the refusal
+    /// [`ExpertRank::split`] gives.
+    pub(super) fn cold_split(
+        &self,
+        layer: usize,
+        experts: u64,
+        of: &[u32],
+        n: u64,
+    ) -> Result<(Vec<u32>, Vec<u32>), PlacementError> {
+        let refuse = |detail: String| PlacementError::ExpertRank {
+            file: self.path.clone(),
+            detail,
+        };
+        let ids = self
+            .ranked(layer)
+            .filter(|ids| ids.len() as u64 == experts)
+            .ok_or_else(|| {
+                refuse(format!(
+                    "layer {layer} is not ordered over its {experts} experts"
+                ))
+            })?;
+        // `of` holds ids below `experts` ([`ExpertList`]) and the rank's row
+        // every id of the layer once, so the row names every id of `of` and
+        // the two lists below partition it.
+        let mut paged = Vec::new();
+        let mut kept = Vec::new();
+        for &id in ids.iter().rev() {
+            if of.binary_search(&id).is_err() {
+                continue;
+            }
+            if u64::try_from(paged.len()).is_ok_and(|len| len < n) {
+                paged.push(id);
+            } else {
+                kept.push(id);
+            }
+        }
+        paged.sort_unstable();
+        kept.sort_unstable();
+        Ok((kept, paged))
     }
 }

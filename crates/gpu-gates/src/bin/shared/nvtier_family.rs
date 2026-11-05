@@ -31,17 +31,27 @@
 //! - `residency`: the unset residency rule on the paged plan resolves as the plan's own numbers say (the card
 //!   experts, the churn pool at the counts the rule probes, the host headroom and what the host's room leaves,
 //!   [`RoomFacts`]), never with why `paged`: the family states the pair it expects ([`Family::expected_residency`]).
+//! - `rank`: on a family that supplies it ([`Family::takes_rank`]), the paged arm — at an arena of 0, paging
+//!   through the file mapping, for the RAM arena holds a paged layer's host ids as one id run and a rank's pick
+//!   scatters them — once under a router rank the clause writes, a child of this binary whose environment alone
+//!   names `BLOOMERY_EXPERT_RANK`, so no other arm's plan takes it, and once without one. The child holds every
+//!   paged layer's NVMe list to the layer's coldest host ids under the rank ([`rank_lists`]) and leaves its run
+//!   beside the rank file; the parent walks the child's positions against its own run of the same ids within
+//!   the logits band, for the two plans keep other experts on the host and the NVMe tier, so the rows sit
+//!   within the band, not on bits.
 
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
 use bloomery_gpu::host::arena_leg::LegOff;
 use bloomery_gpu::host::nvtier::{NvTier, NvTierStats};
+use bloomery_gpu_gates::logits_band;
 use bloomery_gpu_gates::residency::PlanRoom;
 use bloomery_gpu_gates::{GateError, checks_failed, record, tier, verdict};
-use bloomery_levers::{NVTIER_MEM, RESIDENCY_SERVING, ResidencyWord, residency_word};
+use bloomery_levers::{EXPERT_RANK, NVTIER_MEM, RESIDENCY_SERVING, ResidencyWord, residency_word};
 use model::placement::workstation::HostNeed;
-use model::placement::{ArenaFloor, Device, PlacementError, Plan, Role, arena_slots};
+use model::placement::{ArenaFloor, Device, ExpertRank, PlacementError, Plan, Role, arena_slots};
 
 /// The most slots a paged layer's arena holds in the arm the gate pages ([`paged_slots`]): above the arena's floor,
 /// under the ids a layer serves, so evictions happen.
@@ -52,6 +62,13 @@ const PROBE_ROOM: u64 = 1 << 30;
 
 /// The argument that makes this binary the paged arm's child ([`arm_child`]): the arm's room and arena follow it.
 const ARM_CHILD: &str = "--nvtier-arm-child";
+
+/// The argument that makes this binary the rank clause's child ([`rank_child`]): the arm's room and arena, then
+/// the rank file the parent wrote and the rows file the child writes follow it.
+const RANK_CHILD: &str = "--nvtier-rank-child";
+
+/// The file the rank clause's child writes its run to, in the directory its rank file sits in.
+const RANK_ROWS: &str = "rows.bin";
 
 /// The arm child's arena memory where the host leg computes the arena's ids ([`arm_child`]).
 const HOST_LEG_MEM: (&str, &str) = (NVTIER_MEM, "anon");
@@ -73,6 +90,103 @@ pub struct Pos {
     pub fnv: u64,
 }
 
+/// One run's positions with their logits rows: the token each position took
+/// and the row it took it from, in order. The rank clause's band reads rows,
+/// not digests ([`Family::run_rows`]).
+#[derive(Default)]
+pub struct Rows {
+    pub tokens: Vec<u32>,
+    pub logits: Vec<Vec<f32>>,
+}
+
+impl Rows {
+    /// One position more.
+    #[allow(
+        dead_code,
+        reason = "the families that keep rows push them (the ds41 rank clause); one that keeps none \
+                  reads the struct whole"
+    )]
+    pub fn push(&mut self, token: u32, row: Vec<f32>) {
+        self.tokens.push(token);
+        self.logits.push(row);
+    }
+
+    /// The run as the band's walk reads it.
+    pub fn positions(&self) -> logits_band::Positions<'_> {
+        logits_band::Positions {
+            tokens: &self.tokens,
+            rows: &self.logits,
+        }
+    }
+
+    /// The run's first `n` positions' tokens and logits rows in `path`: the
+    /// position count and the row width as two little-endian `u32`s, the
+    /// tokens, then the rows' `f32`s, all little-endian — the file one child
+    /// leaves its parent.
+    pub fn write(&self, path: &Path, n: usize) -> Result<(), GateError> {
+        use std::io::Write;
+        let (Some(tokens), Some(rows)) = (self.tokens.get(..n), self.logits.get(..n)) else {
+            return Err(format!("the rank run holds fewer than {n} positions").into());
+        };
+        let width = rows.first().map_or(0, Vec::len);
+        let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+        f.write_all(&u32::try_from(n)?.to_le_bytes())?;
+        f.write_all(&u32::try_from(width)?.to_le_bytes())?;
+        for t in tokens {
+            f.write_all(&t.to_le_bytes())?;
+        }
+        for row in rows {
+            if row.len() != width {
+                return Err(format!(
+                    "a logits row of {} values, the first has {width}",
+                    row.len()
+                )
+                .into());
+            }
+            for x in row {
+                f.write_all(&x.to_le_bytes())?;
+            }
+        }
+        f.flush()?;
+        Ok(())
+    }
+
+    /// The run [`Rows::write`] wrote to `path`; a file of another size than
+    /// its two counts give is refused by name.
+    pub fn read(path: &Path) -> Result<Rows, GateError> {
+        let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let word = |at: usize| -> Result<[u8; 4], GateError> {
+            bytes
+                .get(at..at + 4)
+                .and_then(|b| b.try_into().ok())
+                .ok_or_else(|| "the rank run's rows file is cut short".into())
+        };
+        let n = usize::try_from(u32::from_le_bytes(word(0)?))?;
+        let width = usize::try_from(u32::from_le_bytes(word(4)?))?;
+        let want = 8 + 4 * n + 4 * n * width;
+        if bytes.len() != want {
+            return Err(format!(
+                "the rank run's rows file holds {} bytes, {n} positions of {width} values take \
+                 {want}",
+                bytes.len()
+            )
+            .into());
+        }
+        let tokens = (0..n)
+            .map(|i| word(8 + 4 * i).map(u32::from_le_bytes))
+            .collect::<Result<Vec<_>, _>>()?;
+        let rows_at = 8 + 4 * n;
+        let logits = (0..n)
+            .map(|i| {
+                (0..width)
+                    .map(|j| word(rows_at + 4 * (i * width + j)).map(f32::from_le_bytes))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Rows { tokens, logits })
+    }
+}
+
 /// What a plan says of the tier, owned: the family reads it off its plan with [`PlanFacts::of`].
 #[derive(Clone, Debug)]
 pub struct PlanFacts {
@@ -83,10 +197,22 @@ pub struct PlanFacts {
     pub floor: ArenaFloor,
     /// The layers whose routed experts the plan pages (an NVMe segment), ascending.
     pub paged_layers: Vec<usize>,
+    /// Each paged layer's routed ids by home, in layer order ([`PagedIds`]).
+    pub paged_ids: Vec<PagedIds>,
     /// The expert ids a layer holds.
     pub experts: u32,
     /// What the unset residency rule reads of the plan.
     pub room: RoomFacts,
+}
+
+/// One paged layer's routed ids by home, ascending as the lists keep them:
+/// the host's (after the split: what it kept) and the NVMe tier's. A layer's
+/// stacks share their lists, so its first row names them.
+#[derive(Clone, Debug)]
+pub struct PagedIds {
+    pub layer: usize,
+    pub host: Vec<u32>,
+    pub nvme: Vec<u32>,
 }
 
 /// What the unset residency rule reads of a plan, taken through the rule's own reader ([`PlanRoom`]) so the gate
@@ -257,6 +383,31 @@ impl PlanFacts {
             .collect();
         paged_layers.sort_unstable();
         paged_layers.dedup();
+        let mut paged_ids: Vec<PagedIds> = Vec::with_capacity(paged_layers.len());
+        for r in &plan.rows {
+            let t = &model.tensors[r.tensor];
+            let Some(layer) = t.layer.filter(|_| {
+                t.role == Role::RoutedExperts && r.segments.iter().any(|s| s.device == Device::Nvme)
+            }) else {
+                continue;
+            };
+            if paged_ids.iter().any(|p| p.layer == layer) {
+                continue;
+            }
+            let ids = |device: Device| -> Vec<u32> {
+                r.segments
+                    .iter()
+                    .filter(|s| s.device == device)
+                    .flat_map(|s| s.experts.iter().flat_map(|e| e.ids().to_vec()))
+                    .collect()
+            };
+            paged_ids.push(PagedIds {
+                layer,
+                host: ids(Device::Host),
+                nvme: ids(Device::Nvme),
+            });
+        }
+        paged_ids.sort_unstable_by_key(|p| p.layer);
         Ok(PlanFacts {
             paged: plan.host.nvme_expert_bytes,
             arena: plan.host.nvme_arena_bytes,
@@ -264,6 +415,7 @@ impl PlanFacts {
             need: HostNeed::of(plan, 0).bytes(),
             floor: ArenaFloor::of(plan)?,
             paged_layers,
+            paged_ids,
             experts: u32::try_from(model.experts)?,
             room: RoomFacts::of(plan, card)?,
         })
@@ -365,6 +517,39 @@ pub trait Family {
     /// (`bloomery_gpu::host::arena_leg`): it then reads a pinned arena's slots on the card.
     fn card_leg(&self) -> bool {
         false
+    }
+
+    /// Whether the family's gate runs the rank clause: it writes a rank over
+    /// its file's routed layers ([`Family::write_rank`]) and runs its arms
+    /// with the logits rows kept ([`Family::run_rows`]). A family that runs
+    /// none keeps its clause set.
+    fn takes_rank(&self) -> bool {
+        false
+    }
+
+    /// The rank file for the family's model in `dir`: every routed layer's
+    /// ids once, in an order that is not the id order, as
+    /// `tools/ref/router-rank.py` writes them. Refuses when the family's own
+    /// placement already took a rank — the lever named in this process's
+    /// environment — for the clause sets one for its child alone, and a
+    /// parent under a rank would compare the rank with itself. Read only
+    /// where [`Family::takes_rank`] holds.
+    ///
+    /// # Errors
+    /// The family's own refusal: a model whose layers it cannot order.
+    fn write_rank(&self, _dir: &Path) -> Result<PathBuf, GateError> {
+        Err("this family writes no rank: its gate runs no rank clause".into())
+    }
+
+    /// The rank clause's run with the logits rows kept: one decode step a
+    /// position over the family's prompt ids, then the greedy steps, every
+    /// position a row the band walks ([`Rows`]). Read only where
+    /// [`Family::takes_rank`] holds.
+    ///
+    /// # Errors
+    /// The run's failure, or a family that keeps no rows.
+    fn run_rows(&self, _s: &mut Self::Session) -> Result<Rows, GateError> {
+        Err("this family's run keeps no logits rows: its gate runs no rank clause".into())
     }
 
     /// The session cleared and dropped.
@@ -633,6 +818,36 @@ fn child_arm() -> Result<Option<Arm>, GateError> {
     }))
 }
 
+/// The arm this process runs as the rank clause's child: `Some` of its arm,
+/// the rank file its parent wrote and the rows file it writes, after
+/// [`RANK_CHILD`]; `None` for the gate itself.
+fn rank_child() -> Result<Option<(Arm, PathBuf, PathBuf)>, GateError> {
+    let mut args = std::env::args().skip(1);
+    if args.find(|a| a == RANK_CHILD).is_none() {
+        return Ok(None);
+    }
+    let (Some(room), Some(arena), Some(rank), Some(rows)) =
+        (args.next(), args.next(), args.next(), args.next())
+    else {
+        return Err(format!(
+            "{RANK_CHILD} takes the arm's room and arena, the rank file and the rows file"
+        )
+        .into());
+    };
+    let arena = match arena.as_str() {
+        "-" => None,
+        a => Some(a.parse()?),
+    };
+    Ok(Some((
+        Arm {
+            room: room.parse()?,
+            arena,
+        },
+        rank.into(),
+        rows.into(),
+    )))
+}
+
 /// A clause's verdict line.
 fn clause(name: &str, what: &str, ok: bool) -> bool {
     println!("{name}: {what}: {}", verdict(ok));
@@ -797,12 +1012,147 @@ fn refused(what: &str, holds: &str, got: Result<(), GateError>) -> bool {
     ok
 }
 
+/// The rank clause's plan-side holds, on `plan` — the paged arm's facts under
+/// the rank `rank` reads, judged in the child that ran under it: every paged
+/// layer's NVMe list is the layer's coldest host ids under the rank (the host
+/// list the split read is the layer's kept and paged ids together), and the
+/// rank moved at least one of them off the id tail the split takes without
+/// it, or the clause proves nothing.
+fn rank_lists(name: &str, plan: &PlanFacts, rank: &ExpertRank) -> bool {
+    let mut pass = true;
+    let (mut layers, mut wrong, mut moved) = (0usize, Vec::new(), 0usize);
+    for p in &plan.paged_ids {
+        layers += 1;
+        let Some(order) = rank.ranked(p.layer) else {
+            wrong.push(p.layer);
+            continue;
+        };
+        // The layer's host list before the split: what it kept and what
+        // paged, ascending again.
+        let mut host = p.host.clone();
+        host.extend_from_slice(&p.nvme);
+        host.sort_unstable();
+        let mut coldest: Vec<u32> = order
+            .iter()
+            .rev()
+            .copied()
+            .filter(|id| host.binary_search(id).is_ok())
+            .take(p.nvme.len())
+            .collect();
+        coldest.sort_unstable();
+        if coldest != p.nvme {
+            wrong.push(p.layer);
+        }
+        if p.nvme != host[host.len() - p.nvme.len()..] {
+            moved += 1;
+        }
+    }
+    if wrong.is_empty() {
+        println!(
+            "ok {name} rank plan: each of {layers} paged layers' NVMe list is its coldest host ids"
+        );
+    } else {
+        println!("FAIL {name} rank plan: layers {wrong:?} are not their coldest host ids");
+        pass = false;
+    }
+    if moved == 0 {
+        println!(
+            "FAIL {name} rank precondition: the rank left every NVMe list its id tail; the \
+             clause proves nothing"
+        );
+        pass = false;
+    } else {
+        println!(
+            "ok {name} rank precondition: the rank moved {moved} of {layers} NVMe lists off the \
+             id tail"
+        );
+    }
+    pass
+}
+
+/// The rank clause, the parent's side: the paged arm `arm` — at an arena of
+/// 0, both sides paging through the file mapping, for the RAM arena holds a
+/// paged layer's host ids as one id run and a rank's pick scatters them —
+/// once under a router rank the clause writes ([`Family::write_rank`]), a
+/// child of this binary whose environment alone names `BLOOMERY_EXPERT_RANK`
+/// so no other arm's plan takes it, and once without one, the parent's own
+/// run of the same arm. The child holds its plan's paged lists to the rank's
+/// coldest host ids ([`rank_lists`]) and leaves its run beside the rank
+/// file; the parent walks the child's positions against its own within the
+/// logits band: the two plans keep other experts on the host and the NVMe
+/// tier, so the rows sit within the band, not on bits.
+fn rank_clause<F: Family>(name: &str, f: &F, arm: Arm) -> Result<bool, GateError> {
+    let arm = Arm {
+        arena: Some(0),
+        ..arm
+    };
+    let dir = std::env::temp_dir().join(format!("bloomery-{name}-rank-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let rank = f.write_rank(&dir)?;
+    let rows = dir.join(RANK_ROWS);
+    println!("{name} rank: the file {}", rank.display());
+    let mut cmd = Command::new(std::env::current_exe()?);
+    cmd.arg(RANK_CHILD)
+        .arg(arm.room.to_string())
+        .arg(arm.arena.map_or_else(|| "-".to_string(), |a| a.to_string()))
+        .arg(&rank)
+        .arg(&rows)
+        .env(EXPERT_RANK, &rank);
+    bloomery_gpu_gates::die_with_parent(&mut cmd);
+    let out = cmd
+        .output()
+        .map_err(|e| format!("{name} rank: run the child: {e}"))?;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        println!("[rank child] {line}");
+    }
+    for line in String::from_utf8_lossy(&out.stderr).lines() {
+        eprintln!("[rank child] {line}");
+    }
+    if !out.status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Ok(clause(
+            "rank",
+            &format!("the child ended {}", out.status),
+            false,
+        ));
+    }
+    let got = Rows::read(&rows)?;
+    let mut s = f.load(arm, false)?;
+    let want = f.run_rows(&mut s)?;
+    f.finish(s)?;
+    let _ = std::fs::remove_dir_all(&dir);
+    let walk = logits_band::walk(
+        &format!(
+            "{name} rank: the paged arm through the file mapping under the rank (each layer's \
+             coldest host ids on the NVMe tier) against the same arm without it (its id tail)"
+        ),
+        want.positions(),
+        got.positions(),
+    );
+    Ok(walk.ok)
+}
+
 /// The gate: `f`'s file planned, its arms run, the six clauses judged, none stopping the others after the
 /// arms ran.
 ///
 /// # Errors
 /// A clause that is red ([`checks_failed`]), or a failure the clauses cannot name: a probe, a load, a run.
 pub fn gate<F: Family>(name: &str, f: &F) -> Result<(), GateError> {
+    if let Some((arm, rank, rows)) = rank_child()? {
+        let plan = f
+            .plan(arm)?
+            .map_err(|e| format!("{name}: the rank child's plan: {e}"))?;
+        let rank = ExpertRank::read(&rank).map_err(|e| format!("{name}: the rank child: {e}"))?;
+        let pass = rank_lists(name, &plan, &rank);
+        let mut s = f.load(arm, false)?;
+        let run = f.run_rows(&mut s)?;
+        f.finish(s)?;
+        run.write(&rows, run.tokens.len())?;
+        if !pass {
+            return Err(checks_failed());
+        }
+        return Ok(());
+    }
     if let Some(arm) = child_arm()? {
         let plan = f
             .plan(arm)?
@@ -972,6 +1322,15 @@ pub fn gate<F: Family>(name: &str, f: &F) -> Result<(), GateError> {
             ),
             expected.holds(&word, why),
         );
+    }
+    if f.takes_rank()
+        && tier::host_clause(
+            "rank: the NVMe tier under a router rank takes each paged layer's coldest host ids, \
+             within the logits band of the same arm without it",
+            host,
+        )?
+    {
+        pass &= rank_clause(name, f, paged_arm)?;
     }
     println!("{name}: {}", tier::tally_line());
     if pass {

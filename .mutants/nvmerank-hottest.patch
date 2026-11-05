@@ -1,0 +1,14 @@
+diff --git a/crates/placement/src/placement/rank.rs b/crates/placement/src/placement/rank.rs
+index edfa4df26..1e48b7115 100644
+--- a/crates/placement/src/placement/rank.rs
++++ b/crates/placement/src/placement/rank.rs
+@@ -326,7 +326,8 @@ impl ExpertRank {
+         // the two lists below partition it.
+         let mut paged = Vec::new();
+         let mut kept = Vec::new();
+-        for &id in ids.iter().rev() {
++        // mutant nvmerank-hottest: the NVMe tier takes the host's hottest ids, not its coldest.
++        for &id in ids.iter() {
+             if of.binary_search(&id).is_err() {
+                 continue;
+             }
