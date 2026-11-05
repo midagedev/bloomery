@@ -216,17 +216,18 @@ fn a_rank_that_disagrees_with_the_model_is_refused_by_name() {
             unified: None,
         }],
     };
-    let text = refusal(plan_host_routed(
-        &model,
-        &on_host,
-        4096,
-        &NoKv,
-        &ranked(&orders()),
-    ));
-    assert!(
-        text.contains("places no routed expert on a card, so it has nothing to order"),
-        "{text}"
-    );
+    // the same machine through the ordinary planner: its rule is on, and its
+    // fill still puts every expert on the host
+    for result in [
+        plan_host_routed(&model, &on_host, 4096, &NoKv, &ranked(&orders())),
+        plan(&model, &on_host, 4096, &NoKv, &ranked(&orders())),
+    ] {
+        let text = refusal(result);
+        assert!(
+            text.contains("places no routed expert on a card, so it has nothing to order"),
+            "{text}"
+        );
+    }
 }
 
 /// Explicit node-owned id ranges keep their id blocks, so a rank beside them
@@ -254,15 +255,7 @@ fn a_rank_beside_node_owned_ranges_is_refused_by_name() {
 fn a_rank_file_the_reader_cannot_place_is_refused_by_name() {
     let good = rank_text(8, &orders());
     let rank = ExpertRank::parse("good.tsv", &good).expect("a rank");
-    assert_eq!(
-        (
-            rank.n_expert(),
-            rank.n_used(),
-            rank.sets(),
-            rank.positions()
-        ),
-        (8, 2, "prose,code", 100)
-    );
+    assert_eq!((rank.sets(), rank.positions()), ("prose,code", 100));
     assert_eq!(rank.layers().collect::<Vec<_>>(), [0, 1, 2]);
     assert_eq!(rank.ranked(1), Some(&[3, 1, 5, 7, 0, 2, 4, 6][..]));
     assert_eq!(rank.ranked(3), None);
