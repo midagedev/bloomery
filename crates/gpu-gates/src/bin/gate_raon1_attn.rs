@@ -19,7 +19,7 @@
 //!    values times `σ(b + w)/σ(b)`, then `torch_recurrent_rda`): the largest
 //!    per-token relative L2 of the delta output within [`RDA_BAND`]. The card
 //!    run without the write gate lies past [`SEP`] bands.
-//! 3. `mla`: `raon1::mla::attend` one row a step from position 0, over a
+//! 3. `mla`: `latent_gated::attend` one row a step from position 0, over a
 //!    cache of 64 rows (the single-launch pass) and one of 1024 (the segment
 //!    pass), against the HF attention in f64 on the dequantized `attn_k_b`
 //!    (Q8_0) and `attn_v_b` (Q6_K): each head's key the nope keys `k_b`
@@ -37,10 +37,10 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod gate {
-    use bloomery_gpu::arch::raon1::mla::{
+    use bloomery_gpu::latent::LATENT;
+    use bloomery_gpu::latent_gated::{
         AttendIn, AttnBufs, MlaDims, MlaKernels, ValueW, attend, partials_lens,
     };
-    use bloomery_gpu::latent::LATENT;
     use bloomery_gpu::linear::conv::{KdaBetaScale, KdaConvArgs, KdaGateRule};
     use bloomery_gpu::linear::delta::DeltaArgs;
     use bloomery_gpu::linear::write_gate::{WriteGateArgs, write_gate_host};
@@ -745,7 +745,7 @@ mod gate {
     }
 
     fn mla_clauses(gpu: &Gpu) -> Result<Vec<bool>, GateError> {
-        let mk = MlaKernels::load(gpu, &MLA)?;
+        let mk = MlaKernels::load(gpu, &MLA, 1)?;
         let n = MLA_RUNS.iter().map(|r| r.1).max().unwrap_or(0);
         let m = Mla::new(0x006d_6c61, n)?;
         let ks = keys(&m, n);

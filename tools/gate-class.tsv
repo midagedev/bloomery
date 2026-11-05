@@ -253,5 +253,11 @@ gate-gpu-raon1-e2e	family	raon1	e2e	graph_fault+attn_linear_gdn_kda+attn_latent_
 gate-gpu-raon1-attn	family	raon1	kernel	attn_linear_gdn_kda+attn_latent_mla
 gate-raon1-meta	family	raon1	meta	arch_registry
 gate-raon1-tokenizer	family	raon1	tokenizer	tokenizer_jinja
+gate-kimi-k3-tokenizer	family	kimi-k3	tokenizer	tokenizer_jinja
 # dfl-wire
 gate-gpu-raon1-dflash	family	raon1	draft	drafts_dspark
+gate-kimi-k3-meta	family	kimi-k3	meta	arch_registry
+gate-gpu-kimik3-mla	family	kimi-k3	kernel	attn_latent_mla
+gate-gpu-kimik3-kda	family	kimi-k3	kernel	attn_linear_gdn_kda
+gate-gpu-kimik3-moe	family	kimi-k3	kernel	tier_legs+moe_route+quant_iq+quant_q6k+elem_kernels
+gate-gpu-kimik3-e2e	family	kimi-k3	e2e	graph_fault+attn_linear_gdn_kda+attn_latent_mla+moe_route+attn_res+elem_kernels

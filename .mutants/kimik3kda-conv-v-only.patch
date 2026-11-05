@@ -1,0 +1,13 @@
+--- a/crates/gpu/src/linear/conv.rs
++++ b/crates/gpu/src/linear/conv.rs
+@@ -262,7 +262,9 @@
+                 // values by the contract); else the slot (p − d) mod RING_ROWS
+                 // (p >= d) is a row of the ring (RING_ROWS·ch values).
+                 xs[j] = unsafe {
+-                    if d <= t {
++                    if hp < 2 * n_k && d != 0 {
++                        0.0
++                    } else if d <= t {
+                         *self.get_unchecked((t - d) * ch + c)
+                     } else {
+                         ring_input(ring, RING_ROWS, p, d, ch, c)

@@ -70,6 +70,9 @@ generate_ds41   ds41_expert_gate_up                      0           0
 generate_ds41   ds41_expert_gate_up_tiles                0         152
 generate_ds41   ds41_ffn_card_acc                        0           0
 generate_ds41   ds41_ffn_card_acc_10                     0           0
+# PIN(2026-11-05): ds41_ffn_card_acc_16 and ds41_ffn_card_acc_2, new entries, at 0 spill and 0 JIT local bytes [derived: the sm_86 cc 8.6 scan's 0/0 (tools/ref/ptx-shapes.tsv): the same body as ds41_ffn_card_acc_4 at other slot counts], until a scan on this table's arch and capability.
+generate_ds41   ds41_ffn_card_acc_16                     0           0
+generate_ds41   ds41_ffn_card_acc_2                      0           0
 generate_ds41   ds41_ffn_card_acc_4                      0           0
 generate_ds41   ds41_ffn_card_acc_4_tier                 0           0
 generate_ds41   ds41_ffn_card_acc_8                      0           0
@@ -538,6 +541,11 @@ generate_ds41   sigmoid_128_6_router                     0           0
 generate_ds41   sigmoid_128_6_router_pick                0           0
 generate_ds41   sigmoid_320_8_router                     0           0
 generate_ds41   sigmoid_320_8_router_pick                0           0
+# PIN(2026-11-05): sigmoid_896_16_router, sigmoid_896_16_router_pick, sigmoid_8_2_router and sigmoid_8_2_router_pick, new entries, at 0 spill and 0 JIT local bytes [derived: the sm_86 cc 8.6 scan's 0/0 (tools/ref/ptx-shapes.tsv): the same body as sigmoid_128_6_router at other counts], until a scan on this table's arch and capability.
+generate_ds41   sigmoid_896_16_router                    0           0
+generate_ds41   sigmoid_896_16_router_pick               0           0
+generate_ds41   sigmoid_8_2_router                       0           0
+generate_ds41   sigmoid_8_2_router_pick                  0           0
 generate_ds41   sigmoid_rows                             0           0
 generate_ds41   situ_rows                                0           0
 generate_ds41   softplus_rows                            0           0
@@ -679,3 +687,5 @@ generate_ds41   restore                                  0           0
 generate_ds41   routed_shared_residual                   0           0
 generate_ds41   sigmoid_floor_256_6_router               0           0
 generate_ds41   sigmoid_floor_256_6_router_pick          0           0
+# PIN(2026-11-06): attn_res_mix, a new entry (Kimi K3's AttnRes bank mix), at 0 spill and 0 JIT local bytes [derived: the sm_86 cc 8.6 scan's 0/0 (tools/ref/ptx-shapes.tsv)], until a scan on this table's arch and capability.
+generate_ds41 attn_res_mix 0 0

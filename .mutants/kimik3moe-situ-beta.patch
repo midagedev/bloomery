@@ -1,0 +1,15 @@
+--- a/crates/gpu/src/arch/kimi_k3/moe.rs
++++ b/crates/gpu/src/arch/kimi_k3/moe.rs
+@@ -105,9 +105,10 @@
+ 
+     /// The `situ` rule the block's gate·up launches run.
+     fn rule(&self) -> Act {
++        // mutant kimik3moe-situ-beta: the gate's bound and the up path's bound swapped.
+         Act::Situ {
+-            beta: self.situ_beta,
+-            linear_beta: self.situ_linear_beta,
++            beta: self.situ_linear_beta,
++            linear_beta: self.situ_beta,
+         }
+     }
+ 

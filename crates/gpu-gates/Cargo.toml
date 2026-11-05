@@ -847,7 +847,26 @@ required-features = ["gpu"]
 name = "gate_raon1_attn"
 required-features = ["gpu"]
 
+# kimik3kda: Kimi K3's KDA layer through `mixer_kda` at 2 and 96 heads of 128 against llama.cpp's graph in f64.
+[[bin]]
+name = "gate_kimi_k3_kda"
+required-features = ["gpu"]
+
 # dfl-wire: Raon-1's DFlash2 draft: its load, the V4.1 DSpark file refused, and its first block against the host oracle's.
 [[bin]]
 name = "gate_raon1_dflash"
+required-features = ["gpu"]
+
+# kimik3-mla: Kimi K3's gated MLA layer on the card (latent_gated's launches at K3's geometry) against the llama.cpp graph in f64.
+[[bin]]
+name = "gate_kimi_k3_mla"
+# kimik3-moe: Kimi K3's routed block (the common routed block with the latent pair, the routed-sum norm and the gated shared stack)
+# against the llama.cpp graph in f64, on the fixture's routed layers and on random tensors at the real widths.
+[[bin]]
+name = "gate_kimi_k3_moe"
+required-features = ["gpu"]
+
+# kimik3-body: Kimi K3's decode step (the delta and gated latent layers, the latent MoE blocks, the AttnRes mixes, the head) over the fixture file against mainline llama.cpp's node dumps of it.
+[[bin]]
+name = "gate_kimi_k3_e2e"
 required-features = ["gpu"]

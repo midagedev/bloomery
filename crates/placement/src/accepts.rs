@@ -100,7 +100,7 @@ pub fn program_of(arch: Arch) -> Option<Program> {
         Arch::Flint => Some(Program::FlintBody),
         Arch::MuseSpark => Some(Program::MuseSparkBody),
         Arch::MistralLarge4 => Some(Program::MistralLarge4Body),
-        Arch::Lfm3 => None,
+        Arch::Lfm3 | Arch::KimiK3 => None,
     }
 }
 

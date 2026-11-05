@@ -203,6 +203,12 @@ pub fn ssm_f_b(l: usize) -> String {
     blk(l, "ssm_f_b.weight")
 }
 
+/// `blk.{l}.ssm_g.weight` — the delta layer's output gate projection, one value for each channel.
+#[must_use]
+pub fn ssm_g(l: usize) -> String {
+    blk(l, "ssm_g.weight")
+}
+
 /// `blk.{l}.ssm_g_a.weight` — the output gate's down projection.
 #[must_use]
 pub fn ssm_g_a(l: usize) -> String {
@@ -392,6 +398,13 @@ pub fn attn_k_b(l: usize) -> String {
 #[must_use]
 pub fn attn_v_b(l: usize) -> String {
     blk(l, "attn_v_b.weight")
+}
+
+/// `blk.{l}.attn_gate.weight` — the latent layer's output gate projection, one value for each
+/// value the heads write.
+#[must_use]
+pub fn attn_gate(l: usize) -> String {
+    blk(l, "attn_gate.weight")
 }
 
 /// The sub-layer a hyper-connection mix feeds: the mixer or the feed-forward block.

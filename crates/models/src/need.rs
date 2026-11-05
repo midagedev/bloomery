@@ -152,6 +152,9 @@ pub enum Need {
     /// The routed experts' aggregated output scaled by `ffn_post_exp_norm`,
     /// then normalized at `eps`, before the router's weights apply.
     PostExpNorm { eps: f32 },
+    /// The routed experts' weighted sum, in the latent when they run in one, through a weighted
+    /// RMS norm (`ffn_routed_norm`) at the block norm's epsilon before the up projection.
+    SumNorm,
     /// Experts (`shared`: the shared expert, else the routed ones) of an
     /// activation other than SwiGLU, the one every routed body runs.
     ExpertAct { shared: bool, act: Act },
@@ -212,6 +215,10 @@ pub enum Need {
     /// The residual joined per channel, α·stream + β·branch, each sublayer's
     /// output normalized at `eps` first.
     AlphaBeta { eps: f32 },
+    /// Cross-layer residual attention: every `block`-th layer banks its input, each sublayer
+    /// reads the softmax mix of the banks and the running sum, and one more mix precedes the
+    /// final norm.
+    AttnRes { block: u32 },
     /// Each sublayer's output weight-normed at `eps` before it joins the stream, scaled by
     /// `add` (mixer, feed-forward block) when it does.
     Sandwich { eps: f32, add: [f32; 2] },
@@ -406,6 +413,18 @@ impl fmt::Display for Need {
                         KdaGate::Softplus => f.write_str(", softplus gate"),
                     }
                 }
+                DeltaKind::KdaFullGate { gate } => {
+                    write!(
+                        f,
+                        "delta rule KDA with a full-width output gate: d {d}, {v_heads} heads, conv {conv}"
+                    )?;
+                    match gate {
+                        KdaGate::Sigmoid { lower_bound } => {
+                            write!(f, ", sigmoid gate bounded below by {lower_bound}")
+                        }
+                        KdaGate::Softplus => f.write_str(", softplus gate"),
+                    }
+                }
             },
             Need::Router(MoeShape {
                 rule,
@@ -452,6 +471,9 @@ impl fmt::Display for Need {
             Need::PostExpNorm { eps } => write!(
                 f,
                 "the routed experts' output scaled by ffn_post_exp_norm, then normed at {eps}"
+            ),
+            Need::SumNorm => f.write_str(
+                "the routed experts' weighted sum normed by ffn_routed_norm before the up projection",
             ),
             Need::ExpertAct { shared, act } => {
                 let who = if *shared {
@@ -519,6 +541,11 @@ impl fmt::Display for Need {
             Need::AlphaBeta { eps } => write!(
                 f,
                 "the alpha/beta residual mix, each sublayer's output normed at {eps} first"
+            ),
+            Need::AttnRes { block } => write!(
+                f,
+                "cross-layer residual attention: every {block}th layer banks its input, each \
+                 sublayer and the head read the softmax mix of the banks and the running sum"
             ),
             Need::Sandwich { eps, add } => write!(
                 f,
@@ -701,6 +728,9 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                 if let Some(eps) = m.post_exp_norm {
                     at(Need::PostExpNorm { eps });
                 }
+                if m.sum_norm {
+                    at(Need::SumNorm);
+                }
                 if !matches!(m.act, Act::SwiGlu { .. }) {
                     at(Need::ExpertAct {
                         shared: false,
@@ -755,6 +785,7 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                 at(Need::AlphaBeta { eps });
             }
             Residual::Sandwich { eps, add } => at(Need::Sandwich { eps, add }),
+            Residual::AttnRes { block } => at(Need::AttnRes { block }),
         }
         if let Some(e) = &spec.encoder {
             if e.post_norms {
@@ -959,6 +990,7 @@ mod tests {
                     latent: Some(16),
                     pre_exp_norm: pre,
                     post_exp_norm: post,
+                    sum_norm: false,
                     act: Act::SwiGlu { limit: None },
                     router: Router {
                         score: Score::Sigmoid,
@@ -1117,6 +1149,41 @@ mod tests {
                 "{want}: not in the needs"
             );
         }
+    }
+
+    /// Kimi K3's three description facts each need a row of their own, spelled by its display: the
+    /// delta rule with the full-width output gate, the routed sum's norm, and the cross-layer
+    /// residual attention. FAIL-first: with any emission removed its text row fails, and with the
+    /// delta kind folded into the low-rank KDA row the first assertion fails.
+    #[test]
+    fn the_kimi_k3_facts_need_their_rows() {
+        let mut spec = muse_spec(false, false, None, Residual::AttnRes { block: 12 }, None);
+        let layer = &mut spec.layers[0];
+        layer.mixer = Mixer::DeltaRule(crate::DeltaRule {
+            kind: crate::DeltaKind::KdaFullGate {
+                gate: crate::KdaGate::Sigmoid { lower_bound: -5.0 },
+            },
+            k_heads: 96,
+            v_heads: 96,
+            d: 128,
+            conv: 4,
+        });
+        let Ffn::Moe(moe) = &mut layer.ffn else {
+            panic!("the muse layer routes")
+        };
+        moe.sum_norm = true;
+        let got: Vec<String> = needs(&spec).iter().map(|(n, _)| n.to_string()).collect();
+        for want in [
+            "delta rule KDA with a full-width output gate: d 128, 96 heads, conv 4, sigmoid gate bounded below by -5",
+            "the routed experts' weighted sum normed by ffn_routed_norm before the up projection",
+            "cross-layer residual attention: every 12th layer banks its input, each sublayer and the head read the softmax mix of the banks and the running sum",
+        ] {
+            assert!(got.iter().any(|g| g == want), "{want:?} not in {got:#?}");
+        }
+        assert!(
+            !got.iter().any(|g| g.starts_with("delta rule KDA:")),
+            "the full-gate kind rides the low-rank KDA row: {got:#?}"
+        );
     }
 
     /// None of it without the facts: a Proj-gated layer with no output norm,

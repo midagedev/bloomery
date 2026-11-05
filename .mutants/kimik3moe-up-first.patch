@@ -1,0 +1,37 @@
+--- a/crates/gpu/src/arch/routed_ffn.rs
++++ b/crates/gpu/src/arch/routed_ffn.rs
+@@ -440,13 +440,13 @@
+             };
+             let picks = (R::out_ids(route), R::out_weights(route));
+             routed_sum::<R>(gpu, w, &k.leg, (l, r, rule), (ex, 1), picks, leg, routed)?;
+-            let summed = sum_norm(cx, (l, r), (&*routed, normed.as_mut()), 1)?;
++            // mutant kimik3moe-up-first: the latent up reads the routed sum, the norm follows it.
+             let delta: &DeviceBuffer<f32> = match lat {
+                 Some(LatentRun { pair, up, .. }) => {
+-                    pair.up.project(cx, acts, l, summed, up)?;
+-                    up
++                    pair.up.project(cx, acts, l, &*routed, up)?;
++                    sum_norm(cx, (l, r), (&*up, normed.as_mut()), 1)?
+                 }
+-                None => summed,
++                None => sum_norm(cx, (l, r), (&*routed, normed.as_mut()), 1)?,
+             };
+             glu(cx, (acts, rule), l, &r.shared, xn, (gate, up, act), shared)?;
+             gpu.elem().enqueue_add(stream, delta, shared, cx.hidden, y)
+@@ -687,13 +687,12 @@
+             };
+             let picks = (&*ids, &*weights);
+             routed_sum::<R>(gpu, w, &k.leg, (l, r, rule), (ex, m), picks, leg, routed)?;
+-            let summed = sum_norm(cx, (l, r), (&*routed, normed.as_mut()), m)?;
+             let delta: &DeviceBuffer<f32> = match lat {
+                 Some(LatentRun { pair, up, .. }) => {
+-                    project_rows(cx, &mut kit, acts, l, &pair.up, (m, cx.hidden), summed, up)?;
+-                    up
++                    project_rows(cx, &mut kit, acts, l, &pair.up, (m, cx.hidden), &*routed, up)?;
++                    sum_norm(cx, (l, r), (&*up, normed.as_mut()), m)?
+                 }
+-                None => summed,
++                None => sum_norm(cx, (l, r), (&*routed, normed.as_mut()), m)?,
+             };
+             glu_rows(
+                 cx,

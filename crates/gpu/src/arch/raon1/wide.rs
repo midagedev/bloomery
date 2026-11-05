@@ -24,12 +24,12 @@
 //! - the feed-forward block: [`ffn`], below.
 
 use super::body::Scratch;
-use super::ffn::{Ffn, Glu, Routed, sigmoid_128_6};
 use super::mhc::{MAX_TOKENS, STREAMS};
 use super::rda::RdaSites;
 use super::rows::RowsIn;
 use super::state::PASS_ROWS;
 use crate::arch::hybrid::{GqaCx, Site};
+use crate::arch::routed_ffn::{Ffn, Glu, Routed, sigmoid_128_6};
 use crate::card_leg::{RouteW, StackW};
 use crate::card_slots::{CardAcc, CardSlotKernels};
 use crate::fault::FaultSink;
@@ -1081,6 +1081,15 @@ pub(super) fn ffn_runs(l: usize, f: &Ffn, w: &Weights, d: &WideDims) -> Result<(
     match f {
         Ffn::Dense(g) => glu(g),
         Ffn::Routed(r) => {
+            if r.latent.is_some() || r.sum_norm.is_some() {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "layer {l}: a routed block with a latent pair or a sum norm: the wide arm \
+                         runs the experts at the model's width and sums them as they are"
+                    ),
+                ));
+            }
             glu(&r.shared)?;
             routed_stacks(w, l, &r.stacks).map(drop)
         }
@@ -1147,7 +1156,7 @@ fn glu(
 }
 
 /// Layer `l`'s block over the unit's `m` rows of `xn` into `y`: the dense
-/// block, or the routed sum plus the shared expert ([`super::ffn::ffn`]'s
+/// block, or the routed sum plus the shared expert ([`crate::arch::routed_ffn::ffn`]'s
 /// launches over a route table): the router, the gate and up GEMMs over the
 /// slots, the SiTU into q8 blocks of 32 a slot, the down GEMM of the stack's
 /// type, the card sum in slot order, the shared expert, the add.
@@ -1292,6 +1301,7 @@ mod tests {
     use crate::Gpu;
     use crate::arch::hybrid::Site;
     use crate::arch::raon1::rda::tests::{Lcg, q8_0, raw, resident};
+    use crate::arch::routed_ffn::Latent;
     use crate::gemm::Gemm32Weight;
     use crate::q8f32::Q8_0GemvHeadsMcolArgs;
     use crate::site::SiteTy;
@@ -1424,6 +1434,8 @@ mod tests {
                 bias: "bias".to_owned(),
                 stacks: ["gate", "up", "down"].map(str::to_owned),
                 shared,
+                latent: None,
+                sum_norm: None,
             })
         };
         assert!(ffn_runs(0, &Ffn::Dense(glu(SiteTy::Q6K, dense_ff)), &w, &d).is_ok());
@@ -1433,6 +1445,21 @@ mod tests {
         assert!(e.to_string().contains("a block of width 1792"), "{e}");
         let e = ffn_runs(1, &routed(glu(SiteTy::Q8_0, shared_ff)), &w, &d).unwrap_err();
         assert!(e.to_string().contains("a resident routed stack"), "{e}");
+        // The latent pair and the sum norm are stages the wide arm does not run: refused whole.
+        let mut normed = routed(glu(SiteTy::Q6K, shared_ff));
+        let mut latent = routed(glu(SiteTy::Q6K, shared_ff));
+        if let (Ffn::Routed(n), Ffn::Routed(x)) = (&mut normed, &mut latent) {
+            n.sum_norm = Some("norm".to_owned());
+            x.latent = Some(Box::new(Latent {
+                down: site("down", SiteTy::Q6K, 512),
+                up: site("up", SiteTy::Q6K, 256),
+                width: 256,
+            }));
+        }
+        for block in [&normed, &latent] {
+            let e = ffn_runs(1, block, &w, &d).unwrap_err();
+            assert!(e.to_string().contains("a latent pair or a sum norm"), "{e}");
+        }
     }
 
     /// A layer's routed stacks run wide as the gate and up of one grouped

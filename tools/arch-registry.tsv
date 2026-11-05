@@ -21,3 +21,4 @@ gemma-embedding2	GemmaEmbedding2	yes	no	-
 flint	Flint	yes	no	-
 muse-spark	MuseSpark	yes	no	musespark
 mistral-large4	MistralLarge4	yes	no	mistrallarge4-e128
+kimi-k3	KimiK3	yes	no	kimik3

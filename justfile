@@ -1834,6 +1834,20 @@ gate-lfm3-meta:
 gate-mistrallarge4-meta:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::mistrallarge4 --nocapture && bash tools/gate.sh --release -p bloomery-model --test mistrallarge4_meta -- --nocapture && bash tools/gate.sh --release -p bloomery-model --test mistrallarge4_dspark -- --nocapture'
 
+# Kimi K3's metadata gate (crates/model/tests/kimi_k3_meta.rs): what the header reader resolves from the real file's headers,
+# checked in beside the test as the key table of its first shard and the tensor table of its 14 shards (kimi_k3_hdr.kv.json,
+# kimi_k3_tensors.tsv) and built into a header-only GGUF in the test: the description layer by layer (93 layers, 24 latent, a bank
+# every 12th), the roles of the latent experts' pair and the residual's scores, the quant types by stem, and the fixture clause:
+# the plan of the fixture of the four real layers [0, 46, 83, 84] (model::arch::kimi_k3::fixture) on that header, read back
+# through the reader as the cut, with a map, a key, a tensor and a type that differ refused by name; the library tests are the
+# reader's own (arch::kimi_k3: the keys, dims, types and roles refused by name, the table of types), and the placement's
+# (arch::kimi_k3::place: a KDA layer's state and conv ring, a latent layer's 576-wide row a position, an expert's bytes by its
+# stacks' types, the tier card and the missing program refused by name; kimi_k3_places_on_the_box: the real header's per-layer
+# stores, the file's bytes by home on the box's two cards at both host rooms, and the coverage rows the engine refuses until a
+# body runs it). Headers only, seconds; the 14-shard file itself is not read.
+gate-kimi-k3-meta:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::kimi_k3 --nocapture && bash tools/gate.sh --release -p bloomery-model --test kimi_k3_meta -- --nocapture'
+
 # Cache append safety contracts and model-less plane/ring writer refusals.
 gate-gpu-rope-writers:
     ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu --release --doc rope_neox::RopeNeoxKernels && bash tools/gate.sh --oxide -p bloomery-gpu-gates --features gpu,mimo2 --release --lib --bin gate_qwen35moe_attn --bin gate_mimo2_flash -- --include-ignored writers --nocapture'
@@ -4357,7 +4371,7 @@ gate-gpu-raon1-dflash:
 
 # --- raon-attn (Raon-1-mini attention layers) ------------------------------------------------------------------------------------------
 
-# Raon-1's RDA step (conv prep, write gate, KDA delta) and gated latent attention (`raon1::mla::attend`) on the card at the model's
+# Raon-1's RDA step (conv prep, write gate, KDA delta) and gated latent attention (`latent_gated::attend`) on the card at the model's
 # shapes against the HF model in f64 (gate_raon1_attn's doc), seeded inputs, no model file; each with an in-gate separation.
 gate-gpu-raon1-attn:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_raon1_attn && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_raon1_attn'
@@ -4381,3 +4395,86 @@ gate-raon1-tokenizer:
     ./tools/box.sh 'BLOOMERY_LLAMA_BPE_GGUF=$BLOOMERY_DATA/vocab-llama-bpe/ggml-vocab-llama-bpe.gguf bash tools/gate.sh --release -p bloomery-tokenizer --lib --test raon -- --include-ignored --nocapture'
 
 # --- end raon-model ---
+
+# --- kimik3-mla (Kimi K3's gated MLA layer) --------------------------------------------------------------------------------------------
+
+# Kimi K3's gated no-RoPE MLA layer on the card at the layer's shapes (2 and 96 heads, nope 128, 64 unrotated rope lanes beside the
+# 512 latent, value 128) against llama.cpp's `build_mla_layer` in f64 (gate_kimi_k3_mla's doc), seeded inputs, no model file: decode at
+# 1, 7, 64, 65 and 300 keys, an 8-row pass equal to 8 decode steps, each clause's in-gate separation, the shapes the launches refuse.
+# The launches are `latent_gated::attend` and `attend_rows`; the gate adds no kernel.
+gate-gpu-kimik3-mla:
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_kimi_k3_mla && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_kimi_k3_mla'
+
+# --- end kimik3-mla ---
+# --- kimik3kda (Kimi K3's KDA layer on the card) ---------------------------------------------------------------------------------------
+
+# Kimi K3's KDA layer through `mixer_kda::enqueue` (the bounded sigmoid decay at -5, the joined q/k/v convs, the full-rank gate, one step
+# and a prompt batch) at 2 and 96 heads of 128 against llama.cpp's `build_kda_layer` in f64 (gate_kimi_k3_kda's doc), seeded inputs, no
+# model file; the file's numbers a kernel does not tile are refused by name, and the gate's own clause sees a gate mutated to 1.
+gate-gpu-kimik3-kda:
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_kimi_k3_kda && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_kimi_k3_kda'
+
+# --- end kimik3kda ---
+# --- kimik3-tokenizer ---
+
+# Kimi K3's vocabulary: our ids equal mainline `llama-tokenize` on every case of crates/tokenizer/tests/cases.txt and cases-kimik2.txt, in
+# both parse modes (the pins are tests/kimik2-ids.tsv, written by crates/tokenizer/tools/kimik2-oracle.sh from the box's llama.cpp-ml4
+# tree, whose `kimi-k2` pre-tokenizer is a hand-written splitter), and the header's end tokens end generation. The vocabulary only: seconds.
+gate-kimi-k3-tokenizer:
+    ./tools/box.sh 'BLOOMERY_LLAMA_BPE_GGUF=$BLOOMERY_DATA/vocab-llama-bpe/ggml-vocab-llama-bpe.gguf bash tools/gate.sh --release -p bloomery-tokenizer --lib --test kimik2 -- --include-ignored --nocapture'
+
+# --- end kimik3-tokenizer ---
+# --- kimik3-moe ---
+
+# Kimi K3's MoE block on the card (gate_kimi_k3_moe's doc): the common routed block with its optional stages (a biased sigmoid
+# router at 896/16 and 8/2, the latent down and up around the experts, the routed sum's RMS norm, the gated shared stack, situ
+# activations, IQ1_S and IQ2_XXS expert rows) at decode and at the P = 8 prefill shape, against a host f64 reference of the
+# llama.cpp graph. Fixture tier: the fixture's f1 (IQ2_XXS gate/up, IQ1_S down), f2 (IQ1_S gate/up, IQ2_XXS down) and f3 (all
+# IQ1_S) layers, each with its in-gate separations (routed norm out, shared gate at 1) and the named refusals, then one layer at
+# the real widths on seeded random tensors (a synthetic GGUF in the temp dir, about 5.8 GB). The tier only changes which
+# file the fixture layers come from. Wall [derived]: build 3-5 min cold, the real-width file's write and load about 2 min.
+gate-gpu-kimik3-moe:
+    BLOOMERY_MODEL=kimi-k3 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_kimi_k3_moe && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_kimi_k3_moe'
+
+# --- end kimik3-moe ---
+
+# --- kimik3-ref (Kimi K3's oracle: the vendor llama.cpp tree and its node dumps) ---------------------------------------------------------
+
+# Kimi K3 (kimi-k3), the oracle's tree: llama.cpp mainline at 78feec062 (the merge of PR 31376, the commit Mistral Large 4's oracle and the
+# kimik2 tokenizer pins are taken from) in /home/user/llama.cpp-kimik3, the same script as the Qwen tree (tools/ref/qvis/build-lcpp-qvis.sh)
+# with the pin, tree, sentinel directory and targets by environment, the CPU backend alone and the tools the tokenizer and the smoke run
+# (llama-cli, llama-completion, llama-tokenize); detached, pid, log and rc under /root/lcpp-kimik3. The node dumper links this tree's
+# libraries (`just build-ref-kimi-k3`).
+build-k3-lcpp:
+    BLOOMERY_BOX_ENV='LCPP_BUILD_PIN=78feec062d50ec9e8940244cac918ac4480b60cb LCPP_BUILD_TREE=/home/user/llama.cpp-kimik3 LCPP_BUILD_DIR=/root/lcpp-kimik3 LCPP_BUILD_CPU_ONLY=1 LCPP_BUILD_TARGETS=llama,llama-common,llama-cli,llama-completion,llama-tokenize' ./tools/box.sh '[ "$(id -u)" = 0 ] || { echo "build-k3-lcpp: this recipe requires root on the box (/root/lcpp-kimik3 and /home/user); run build-lcpp-qvis.sh directly with writable LCPP_BUILD_DIR and LCPP_BUILD_TREE on a local machine" >&2; exit 2; }; setsid -f bash tools/ref/qvis/build-lcpp-qvis.sh </dev/null >/dev/null 2>&1'
+
+# Kimi K3 oracle: kimik3_dump (the shared tools/ref/cb_dump.cpp) linked against mainline llama.cpp at 78feec062 (CPU, no patch,
+# /home/user/llama.cpp-kimik3, whose tracked files must be clean), which this does not rebuild: the tree is built once by
+# `just build-k3-lcpp`. tools/ref/kimi-k3-dump-build.sh is the call; the binary and its build record land in $BLOOMERY_DATA/bin.
+build-ref-kimi-k3:
+    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=60 BLOOMERY_MODEL=kimi-k3 ./tools/box.sh 'bash tools/ref/kimi-k3-dump-build.sh'
+
+# The Kimi K3 oracle sets (refset family lcpp-kimi-k3; tools/ref/kimi-k3-dump.sh has the layout and the taps): mainline llama.cpp on the
+# CPU over the four prompts of tools/ref/data/kimi-k3 (35, 46, 48 and 5 ids, raw text) from one load of the UD-IQ1_S file (594 GB in
+# fourteen shards), into $BLOOMERY_DATA/ref_kimik3_{a,b,c,d}: each layer's taps, the last logits row, the top-40 logprobs and 32 greedy
+# tokens. The load reads the whole file once through the page cache, then every prompt and token faults in the experts the cache does
+# not hold: predicted wall 12-36 min (central 20), bound 90, under the CPU lease and its card
+# (BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/kimi-k3-dump.card'); DUMP_DRY=1 in that variable prints the dump and stops before the
+# lease. BLOOMERY_TIER=fixture dumps the fixture file's twin sets fx_ref_kimik3_{a,b,c,d} in seconds (card docs/cards/kimi-k3-fx-dump.card).
+dump-ref-kimi-k3:
+    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=1200 BLOOMERY_MODEL=kimi-k3 ./tools/box.sh 'bash tools/ref/kimi-k3-dump.sh'
+
+# --- end kimik3-ref ---
+# --- kimik3-body ---
+
+# Kimi K3's decode step on one card (gate_kimi_k3_e2e's doc): the delta and gated latent layers, the dense and latent routed blocks,
+# the AttnRes mixes over the banked block inputs and the head, one prompt id a step, opened through GpuModel<Body> over the fixture file,
+# against mainline llama.cpp's node dumps of that file (refset family fx-lcpp-kimi-k3, `BLOOMERY_TIER=fixture just dump-ref-kimi-k3`):
+# on each of the four prompt sets the free chain's layer outputs, each layer's mixer and feed-forward block alone over the vendor's own
+# rows (the router's picks the vendor's), the teacher-forced argmax against the greedy ids and the last logits row; and with no vendor
+# the steps deterministic, the graph the eager chain, and the AttnRes mix kernel against a host f64 mix (rows = steps, refusals, fault word).
+# Fixture-only (tools/ref/fixture-only.sh): the real file's placement is not wired yet, so the real tier has no run.
+gate-gpu-kimik3-e2e:
+    BLOOMERY_MODEL=kimi-k3 ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-kimik3-e2e && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_kimi_k3_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_kimi_k3_e2e'
+
+# --- end kimik3-body ---

@@ -1,0 +1,13 @@
+--- a/crates/model/src/arch/kimi_k3/hparams.rs
++++ b/crates/model/src/arch/kimi_k3/hparams.rs
+@@ -468,8 +468,8 @@
+         .into_iter()
+         .enumerate()
+         .map(|(l, kv)| match kv {
+-            0 => Ok(Kind::Kda),
+-            1 => Ok(Kind::Mla),
++            0 => Ok(Kind::Mla),
++            1 => Ok(Kind::Kda),
+             other => Err(metadata(
+                 split,
+                 key,

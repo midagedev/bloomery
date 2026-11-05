@@ -1,0 +1,12 @@
+--- a/crates/models/src/need.rs
++++ b/crates/models/src/need.rs
+@@ -785,7 +785,8 @@
+                 at(Need::AlphaBeta { eps });
+             }
+             Residual::Sandwich { eps, add } => at(Need::Sandwich { eps, add }),
+-            Residual::AttnRes { block } => at(Need::AttnRes { block }),
++            // mutant kimik3-need-attnres: the cross-layer residual attention needs no row.
++            Residual::AttnRes { block: _ } => {}
+         }
+         if let Some(e) = &spec.encoder {
+             if e.post_norms {

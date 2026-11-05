@@ -333,6 +333,7 @@ fn mistrallarge4_header() {
             latent: None,
             pre_exp_norm: false,
             post_exp_norm: None,
+            sum_norm: false,
             act: Act::SwiGlu { limit: None },
             router: models::Router {
                 score: Score::Softmax,

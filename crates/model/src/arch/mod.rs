@@ -14,6 +14,7 @@ mod classify;
 pub mod coverage;
 pub mod deepseek2;
 pub mod deepseek41;
+pub mod delta_mla;
 pub mod dflash2;
 pub mod draft;
 pub mod dspark;
@@ -24,6 +25,7 @@ mod gemma_encoder;
 pub mod glm5next;
 pub mod hybrid;
 pub mod kda;
+pub mod kimi_k3;
 pub mod lfm3;
 pub mod llama;
 pub mod mimo2;
@@ -199,6 +201,9 @@ pub enum Arch {
     /// arrays name, over softmax-routed experts with one shared. No
     /// executable program is registered.
     MistralLarge4,
+    /// Kimi K3: Kimi delta attention and gated latent-attention layers, `situ` experts in a
+    /// latent, and the cross-layer residual attention. No executable program is registered.
+    KimiK3,
 }
 
 impl Arch {
@@ -235,6 +240,7 @@ impl Arch {
             "flint" => Ok(Arch::Flint),
             "muse-spark" => Ok(Arch::MuseSpark),
             "mistral-large4" => Ok(Arch::MistralLarge4),
+            "kimi-k3" => Ok(Arch::KimiK3),
             other => Err(ModelError::UnknownArchitecture(other.to_string())),
         }
     }
@@ -264,6 +270,7 @@ impl Arch {
             Arch::Flint => "flint",
             Arch::MuseSpark => "muse-spark",
             Arch::MistralLarge4 => "mistral-large4",
+            Arch::KimiK3 => "kimi-k3",
         }
     }
 }
@@ -1053,6 +1060,8 @@ pub(crate) mod synthetic {
         /// IQ2_XXS: blocks of 256 values in 66 bytes; the first dim a multiple of
         /// 256.
         Iq2Xxs,
+        /// IQ1_S: blocks of 256 values in 50 bytes; the first dim a multiple of 256.
+        Iq1S,
         /// bloomery's F8_E4M3 rows: one byte a value, scaled by `<stem>.scale`.
         F8Rows,
     }
@@ -1083,6 +1092,13 @@ pub(crate) mod synthetic {
                         "{n} values are not whole IQ2_XXS blocks"
                     );
                     (16, n / 256 * 66)
+                }
+                Ty::Iq1S => {
+                    assert!(
+                        n.is_multiple_of(256),
+                        "{n} values are not whole IQ1_S blocks"
+                    );
+                    (19, n / 256 * 50)
                 }
                 Ty::F8Rows => (gguf::GgmlType::F8E4M3_ROWS.as_u32(), n),
             }
@@ -1278,6 +1294,7 @@ mod tests {
             Arch::Flint,
             Arch::MuseSpark,
             Arch::MistralLarge4,
+            Arch::KimiK3,
         ] {
             assert_eq!(Arch::from_name(a.name()).unwrap(), a);
         }

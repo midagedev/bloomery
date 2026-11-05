@@ -1,0 +1,88 @@
+# Cases of the Kimi K3 vocabulary (pre-tokenizer kimi-k2) beyond cases.txt: the Han run and its range edges, kana and Hangul as letters, the letter run with any leading character and its contraction, digits cut in threes from the start, the punctuation run, every whitespace rule, marks, and the special tokens; tools/kimik2-oracle.sh decodes each line with printf %b.
+안녕하세요, 저는 키미입니다. 한국어 문장을 토큰화합니다.
+한국어 텍스트 mixed with English words 그리고 다시 한국어
+你好，世界！这是一个中文分词测试。今天天气很好。
+使用Python3.11编写的程序，版本v2.0.1发布于2026年11月5日
+日本語のテキストです。カタカナとひらがなと漢字が混ざっています。
+日本語のテキスト 漢字かな交じり文 カタカナ ひらがな ｶﾀｶﾅ
+漢字와 한글混用 Hello,世界!こんにちは world
+2026年11月5日、中文：测试（一）「日本」
+ 中文 中文,中文。 (中) 中\n中
+  中文   日本語
+中\xcc\x81文 中\xe2\x80\x8d文
+㐀䶿|\xe4\xb7\x80|一\xe9\xbf\xbf|\xea\x80\x80a
+𠀀\xf0\xaa\x9b\x9f|\xf0\xaa\x9b\xa0|\xf0\xaa\x9c\x80\xf0\xab\x9c\xbf|\xf0\xab\x9d\x80\xf0\xab\xa0\x9f|\xf0\xab\xa0\xa0\xf0\xac\xba\xa1\xf0\xac\xba\xaf|\xf0\xac\xba\xb0\xf0\xae\xaf\xa0\xf0\xae\xaf\xaf
+\xef\xa4\x80\xef\xab\xbf|\xef\xac\x80|\xf0\xaf\xa0\x80\xf0\xaf\xa8\x9f|\xf0\xaf\xa8\xa0|\xf0\xb0\x80\x80\xf0\xb1\x8d\x8f|\xf0\xae\xaf\xb0|々〇〡|⺀⼀
+It's we're they've I'm you'll he'd don't can't won't isn't
+IT'S WE'RE THEY'VE I'M YOU'LL HE'D DON'T 'S 'x 'RE
+I'Ll he'D they'Re we'Ve 'Sorry 'Tis 'Mom 'Dad 'REady 'VEry 'LLama rock'n'roll can't've it's'nt
+naïve's ÜBER'S 한국어's 中's x'ſy ſ'S ß's it’s we’re ‘single’ `tick`
+x're
+x'r
+x'l
+x's
+x'
+'
+'ll
+''s '''
+1 12 123 1234 12345 123456 1234567 12345678 123456789 1234567890
+1,234,567.89 3.14159e-10 2026-11-05 12:34:56 +82-10-1234-5678 0x1F 1e10 v1.2.3 $12 ₩1,000 %5 12% #1
+x1y22z333w4444v55555u666666t7777777
+١٢٣٤٥ ٠١٢٣ ２０２６年１１月 ²³ ① ½ Ⅷ ⅷ ௧௨௩௪ ๑๒๓๔
+中文123中文 数字4567 ２０２６年 1234567中 中1234567
+12345\xcc\x816789 12\xe2\x80\x8b345
+HelloWorld iPhone ÜBERüber camelCaseWord snake_case_word kebab-case-word ALLCAPS
+!Hello ~한 @user #tag $x +y -z *w /v ^t |s &r %q =p "quoted" 'single' (paren) [brack] {brace} <angle>
+var_1 x2 2x _x __init__ a_b 3d 4k 5x5
+Привет мир! مرحبا بالعالم! שלום עולם! สวัสดีชาวโลก! नमस्ते दुनिया! Γειά σου Κόσμε! Ελληνικά café naïve Ωmega
+\tHello \t\tworld\n\nHello\r\nworld \rx
+Hello!!! ... ?! -- == => -> <= != && || :: // /* */ ;;
+a//b //comment http://x.y/z?a=b&c=d#e ~/.cargo/bin
+a/\nb ?/\r\n x;\n\ny !\r\n\r\nz .\n \n w
+\n#include <stdio.h>\nint main(void) {\n    printf("Hello, %s!\\n", "world");\n    return 0;\n}\n
+def f(x):\n    if x > 0:\n        return x ** 2\n    return -1\n\nprint(f(3))\n
+fn main() {\n\tlet v: Vec<u32> = (0..10).map(|x| x * 2).collect();\n\tprintln!("{:?}", v);\n}\n
+{"name": "Kimi", "ids": [1, 2.5, -3e4, null, true], "nested": {"a": "한국어", "b": "中文"}}
+\n# Title\n\n- item one\n- item two\n\n> quote\n\n```rust\nlet x = 1;\n```\n
+C:\\Users\\kimi\\file.txt and \\n \\t literal
+Hello 👋 world 🌍🚀 ok 👨\xe2\x80\x8d👩\xe2\x80\x8d👧 🇰🇷 1\xef\xb8\x8f\xe2\x83\xa3 ❤\xef\xb8\x8f 👍🏽
+e\xcc\x81 a\xcc\x88 A\xcc\x8a\xcc\x81 \xe0\xa4\xa8\xe0\xa4\xae\xe0\xa4\xb8\xe0\xa5\x8d\xe0\xa4\xa4\xe0\xa5\x87 x\xcc\x81y
+\xe1\x84\x92\xe1\x85\xa1\xe1\x86\xab\xe1\x84\x80\xe1\x85\xb5\xe1\x86\xa8 \xe1\x84\x92\xe1\x85\xa1\xe1\x86\xab글
+a  b   c    d
+  two
+    four spaces then 中文
+end 
+a b 
+   
+ 
+a\nb\n\nc\n\n\nd
+a \n b
+a\n \n b
+a\r\nb\r\n\r\nc
+\r\r\n\n
+x\r
+\n x
+a\tb\t\tc\t \td
+\t\tindent\n\t\t\tmore
+x\t
+\t
+a\xc2\xa0b\xc2\xa0\xc2\xa0c \xc2\xa0d\xc2\xa0 e
+a\xe3\x80\x80b\xe2\x80\x83c\xe2\x80\x83\xe2\x80\x83d\xe2\x80\xa8e\xe2\x80\xa9f\xe2\x80\xafg
+a\xc2\x85b\xc2\x85\xc2\x85c\x0bd\x0c\x0ce
+a\x1cb\x1d\x1ec\x1fd\x7fe\x01f
+a\xe2\x80\x8bb\xef\xbb\xbfc \xe2\x80\x8bd\xe2\x81\xa0\xe2\x81\xa0
+ !x  !x \n!x
+ 123 12345  12
+a\xee\x80\x80b \xf4\x8f\xbf\xbf x \xef\xbf\xbf y \xcd\xb8 z\xed\xa0\x80w
+\xe4\xb8 \xe4\xb8\xad\xe4\xb8 x\xf4\x90\x80\x80y \xc0\xaf \xe4\xb8\xad
+[BOS]hello[EOS]
+<|open|>user<|close|>안녕<|sep|>你好<|end_of_msg|>
+[start_header_id]system[end_header_id]\n\nYou are Kimi.[EOT][start_header_id]user[end_header_id]\n\n안녕[EOT]
+<|media_begin|>image<|media_content|><|media_pad|><|media_pad|><|media_end|>
+<|end_of_msg|>
+[UNK] [PAD] <|reserved_token_163592|> <osagent_mode>x
+<|open| [BOS [eos] <|OPEN|> <|end_of_msg| |close|> [EOT
+서울특별시는 대한민국의 수도이자 최대 도시이다. 한강을 중심으로 남북으로 나뉘어 있으며, 인구는 약 천만 명이다. 조선 시대부터 오백 년이 넘는 세월 동안 정치와 문화의 중심지였고, 오늘날에도 경제와 교육, 문화 활동의 중심 역할을 하고 있다.
+北京是中华人民共和国的首都，也是全国的政治中心和文化中心。这座城市有三千多年的建城史和八百多年的建都史，拥有众多名胜古迹，如故宫、天坛和长城。每年都有数以千万计的游客来到这里参观游览。
+東京は日本の首都であり、世界でも有数の大都市です。伝統的な文化と最先端の技術が共存しており、毎年多くの観光客が訪れます。春には桜が咲き、秋には紅葉が楽しめます。
+The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs! How vexingly quick daft zebras jump? It's 5 o'clock somewhere, isn't it? We've got 1,234 items at $56.78 each.

@@ -1,0 +1,11 @@
+--- a/crates/model/src/arch/kimi_k3/fixture.rs
++++ b/crates/model/src/arch/kimi_k3/fixture.rs
+@@ -54,7 +54,7 @@
+ use crate::fixture::{CardBudget, Family, FixtureError, FixtureSpec, KeyRule, Tables, Window};
+ 
+ /// Fixture layer `f` holds source layer `LAYER_MAP[f]` (the table above).
+-pub const LAYER_MAP: [usize; 4] = [0, 46, 83, 84];
++pub const LAYER_MAP: [usize; 4] = [0, 1, 83, 84];
+ 
+ /// The hidden the mini writes: `embedding_length`, the residual stream and the router's row.
+ pub const HIDDEN: u64 = 256;

@@ -10,7 +10,7 @@
 //! streams and its output. The attention sub-layer is an RDA layer
 //! ([`super::rda`]) or a latent one ([`super::mla`]), each applying its own
 //! `attn_norm`; the feed-forward one is `ffn_norm` then the dense or routed
-//! SiTU block ([`super::ffn`]). The head reads the streams' mean.
+//! SiTU block ([`crate::arch::routed_ffn`]). The head reads the streams' mean.
 //!
 //! A pass of `m` rows ([`Run::Rows`]: a verify's or a prompt chunk's,
 //! [`super::rows`]) is the same walk over the rows the staging holds: the
@@ -19,19 +19,23 @@
 //! ([`ffn::ffn_rows`]), each row the one-row step's bits. A walk of one row
 //! runs the step's own launches.
 
-use super::ffn::{self, Ffn, FfnKernels, FfnRows, FfnScratch, Glu, Routed};
 use super::mhc::{self, HC_OUT, MhcKernels, STREAMS, SiteVecs};
-use super::mla::{self, MlaBufs, MlaDims, MlaKernels, MlaSites};
+use super::mla;
 use super::rda::{self, RdaSites, RowKernels, RowsKit};
 use super::rows::{RowState, RowViews};
 use super::state::{self, PASS_ROWS, Pass};
 use super::wide::{self, WIDE_ROWS, Wide, WideDims};
+use crate::arch::gated_mla::{self, MlaBufs, MlaSites};
 use crate::arch::hybrid::{Acts, DecodeInput, GqaCx, Site};
+use crate::arch::routed_ffn::{
+    self as ffn, Ffn, FfnKernels, FfnRows, FfnScratch, Glu, Routed, RoutedShape,
+};
 use crate::elem::EmbedRowsArgs;
 use crate::flash_gqa::FlashGqaKernels;
 use crate::gemm::Gemm32Kernels;
 use crate::head::Head;
 use crate::kquant::Act;
+use crate::latent_gated::{self, MlaDims, MlaKernels};
 use crate::linear::mixer_kda::{KdaBufs, KdaDims};
 use crate::linear::{HEAD, LinearKernels};
 use crate::model::{ChainBody, GpuModel, NoHost, block_count};
@@ -99,7 +103,7 @@ impl Layer {
         let mut out = self.mixer_sites();
         match &self.ffn {
             Ffn::Dense(g) => out.extend(g.sites()),
-            Ffn::Routed(r) => out.extend(r.shared.sites()),
+            Ffn::Routed(r) => out.extend(r.sites()),
         }
         out
     }
@@ -117,7 +121,7 @@ impl Layer {
     fn wide_runs(&self, l: usize, w: &Weights, d: &WideDims) -> Result<(), GpuError> {
         let mixer = match &self.mixer {
             Mixer::Rda { sites, .. } => wide::rda_runs(sites),
-            Mixer::Mla { sites, .. } => sites.wide_runs(),
+            Mixer::Mla { sites, .. } => mla::wide_runs(sites),
         };
         mixer.map_err(|refusal| GpuError::shape(WHAT, format!("layer {l}'s mixer: {refusal}")))?;
         wide::ffn_runs(l, &self.ffn, w, d)
@@ -157,7 +161,7 @@ impl Kernels {
             rows: RowKernels::load(ctx)?,
             hc: MhcKernels::load(ctx)?,
             ffn: FfnKernels::load(gpu)?,
-            mla: MlaKernels::load(gpu, mla)?,
+            mla: MlaKernels::load(gpu, mla, WIDE_ROWS)?,
         })
     }
 }
@@ -295,7 +299,7 @@ impl Scratch {
         let (channels, v, n_v) = (lin.channels(), lin.n_v * HEAD, lin.n_v);
         // The latent attention takes at most [`mla::ATTN_CHUNK`] rows a launch:
         // a wider unit runs it in chunks that share one set of partials.
-        let (part_v, part_ms) = mla::partials_lens_rows(m, ctx, rows.min(mla::ATTN_CHUNK));
+        let (part_v, part_ms) = latent_gated::partials_lens_rows(m, ctx, rows.min(mla::ATTN_CHUNK));
         let (heads, row) = (m.heads, m.row());
         Ok((
             [
@@ -592,7 +596,7 @@ impl Body {
     /// shared expert whose down has no form at its width (a K-quant down over
     /// the dense width, a Q8_0 down over the shared width), routed stacks that
     /// are not one grouped K-quant type with a down the 32-value GEMM reads
-    /// ([`wide::rda_runs`], `MlaSites::wide_runs`, [`wide::ffn_runs`]). One
+    /// ([`wide::rda_runs`], [`mla::wide_runs`], [`wide::ffn_runs`]). One
     /// such layer keeps the whole file on the rows pass for prompts of every
     /// length, where a prompt past [`PASS_ROWS`] ids would otherwise stop at
     /// that layer by name.
@@ -696,6 +700,8 @@ impl Body {
                         ),
                         e.shared_ff(),
                     )?,
+                    latent: None,
+                    sum_norm: None,
                 })
             };
             let hc = [Sub::Attn, Sub::Ffn].map(|sub| {
@@ -723,15 +729,15 @@ impl Body {
         let wd = wide_dims(&hp, &kda, &mla)?;
         let wide_off = wide_refusal(&layers, w, &wd);
         let stage = rda::stage_len(&kda)
-            .max(mla::stage_len(&mla))
+            .max(gated_mla::stage_len(&mla))
             .max(ffn::stage_len(ff.0.max(ff.1)));
         Ok(Body {
             k: Kernels::load(gpu, &mla)?,
             s: Scratch::new(stream, &hp, (&kda, &mla), ctx, 1)?,
             step_in: StepIn::new(stream)?,
-            ffn_s: FfnScratch::new(stream, n, ff.0, ff.1)?,
+            ffn_s: FfnScratch::new(stream, n, ff.0, RoutedShape::plain(ff.1))?,
             pass: Scratch::new(stream, &hp, (&kda, &mla), ctx, PASS_ROWS)?,
-            ffn_rows: FfnRows::new(stream, n, ff, PASS_ROWS)?,
+            ffn_rows: FfnRows::new(stream, n, (ff.0, RoutedShape::plain(ff.1)), PASS_ROWS)?,
             stage: DeviceBuffer::zeroed(stream, stage)?,
             wide: Wide::new(
                 gpu,
@@ -1038,7 +1044,7 @@ impl Body {
                         cache,
                     };
                     if m == 1 {
-                        mla::step(&cx, &k.mla, acts, (&**sites, &*md), l, bufs)?;
+                        gated_mla::step(&cx, &k.mla, acts, (&**sites, &*md), l, bufs)?;
                     } else if let Some(kit) = wide_kit.as_mut() {
                         mla::rows_wide(&cx, &k.mla, kit, (&**sites, &*md), (l, m), bufs)?;
                     } else {
@@ -1047,7 +1053,7 @@ impl Body {
                             rows: &k.rows,
                             stage: &mut *stage,
                         };
-                        mla::rows(&cx, &k.mla, acts, (&**sites, &*md), (l, m), bufs, kit)?;
+                        gated_mla::rows(&cx, &k.mla, acts, (&**sites, &*md), (l, m), bufs, kit)?;
                     }
                 }
             }
@@ -1177,15 +1183,16 @@ impl ChainBody for Body {
 
 #[cfg(test)]
 mod tests {
-    use super::ffn::sigmoid_128_6::{N_EXPERT, N_USED};
     use super::mla::tests::typed_sites;
     use super::{Ffn, Glu, Layer, Mixer, STREAMS, Site, SiteTy, dims, wide_dims, wide_refusal};
+    use crate::arch::routed_ffn::sigmoid_128_6::{N_EXPERT, N_USED};
     use crate::weights::Weights;
     use crate::{DeviceTensor, Gpu};
+    use model::arch::delta_mla::{Mla, Situ};
     use model::arch::kda::Keys;
     use model::arch::models::KdaGate;
     use model::arch::noaux::Experts;
-    use model::arch::raon1::hparams::{Hc, Hparams, Kind, Mla, Situ};
+    use model::arch::raon1::hparams::{Hc, Hparams, Kind};
 
     /// A header with Raon's widths and a dense width, a routed expert's width and a
     /// count of shared experts of the caller's.

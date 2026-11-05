@@ -753,10 +753,12 @@ pub fn plan_residual(
             }
             Ok(ResidualPlan::Sandwich(SandwichPlan { eps, add, norms }))
         }
-        other @ (Residual::Hc | Residual::AlphaBeta { .. }) => Err(ChainError::shape(
-            what,
-            format!("layer {l}: the residual {other:?}, which no walk here runs"),
-        )),
+        other @ (Residual::Hc | Residual::AlphaBeta { .. } | Residual::AttnRes { .. }) => {
+            Err(ChainError::shape(
+                what,
+                format!("layer {l}: the residual {other:?}, which no walk here runs"),
+            ))
+        }
     }
 }
 

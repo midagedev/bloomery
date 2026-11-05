@@ -4109,6 +4109,7 @@ mod tests {
                         latent: None,
                         pre_exp_norm: false,
                         post_exp_norm: None,
+                        sum_norm: false,
                         act: Act::SwiGlu { limit: None },
                         router: Router {
                             score: Score::Softmax,
@@ -4530,6 +4531,7 @@ mod tests {
                     latent: None,
                     pre_exp_norm: false,
                     post_exp_norm: None,
+                    sum_norm: false,
                     act: Act::SwiGlu { limit: None },
                     router: Router {
                         score: Score::Softmax,

@@ -12,10 +12,14 @@
 //! the gates at once.
 
 pub mod deepseek2;
+pub mod gated_mla;
 pub mod hybrid;
+pub mod kimi_k3;
 pub mod musespark;
 pub mod nemotron_h;
 pub mod nemotron_h_moe;
 pub mod qwen3moe;
 pub mod raon1;
+pub mod routed_ffn;
+pub mod rows_kit;
 pub mod step_order;
