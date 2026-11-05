@@ -1556,7 +1556,7 @@ fn gain<'w>(
         }),
         found => Err(GpuError::Tensor {
             what: WHAT,
-            name: name.to_string(),
+            name: name.clone(),
             need: if found.is_some() { "F32" } else { "resident" },
         }),
     }

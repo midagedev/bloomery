@@ -708,7 +708,7 @@ fn write_both_layouts(dir: &std::path::Path) -> (std::path::PathBuf, std::path::
     let kv = |k: &str, v: Value| (format!("deepseek41.{k}"), v);
     let arr = |v: &[u64]| Value::Array(v.iter().map(|&x| Value::U64(x)).collect());
     let arch = (
-        "general.architecture".to_string(),
+        gguf::GENERAL_ARCHITECTURE.to_string(),
         Value::String("deepseek41".to_string()),
     );
     let rows = [8u64, 18];

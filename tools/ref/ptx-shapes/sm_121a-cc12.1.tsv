@@ -132,6 +132,8 @@ generate_ds41 ds41_glue_engram_rows_q3k 0 0
 generate_ds41 ds41_glue_engram_rows_iq4nl 0 0
 # PIN(2026-11-03): ds41_glue_engram_rows_mxfp8, a new entry, at ds41_glue_engram_rows_iq4nl's 0 spill and 0 JIT local bytes [derived: the same body with a byte decode in place of the nibble one], not measured at this arch until a scan runs.
 generate_ds41 ds41_glue_engram_rows_mxfp8 0 0
+# PIN(2026-11-05): ds41_glue_engram_rows_q6k, a new entry, at 0 spill and 0 JIT local bytes [derived: the sm_86 scan's 0/0 (tools/ref/ptx-shapes.tsv; one thread per value, no local array)], until a scan on this table's arch and capability.
+generate_ds41 ds41_glue_engram_rows_q6k 0 0
 generate_ds41 ds41_groups_to_tokens 0 0
 generate_ds41 ds41_hc_fold 0 0
 generate_ds41 ds41_hc_mean 0 0

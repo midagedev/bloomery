@@ -223,6 +223,16 @@ mod tests {
     use crate::write::{TensorDecl, write_file};
     use crate::{GENERAL_ARCHITECTURE, GgmlType, LoadError, Split, inventory_of};
 
+    /// One refused concatenated table: its case name, the file's offsets, its
+    /// table's rows, its extra tensors and the words the error names.
+    type Refusal = (
+        &'static str,
+        &'static [u64],
+        u64,
+        &'static [&'static str],
+        &'static str,
+    );
+
     fn dir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("v41-facts-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
@@ -460,7 +470,7 @@ mod tests {
     #[test]
     fn a_concatenated_table_the_sites_do_not_tile_is_refused_by_name() {
         let d = dir("concat-bad");
-        let cases: [(&str, &[u64], u64, &[&str], &str); 4] = [
+        let cases: [Refusal; 4] = [
             (
                 "rows",
                 &[0, 3, 8, 15],

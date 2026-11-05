@@ -865,7 +865,11 @@ gpu 3017 417 10
 # tier_position (chain/ffn/tier.rs, an unsafe fn with its contract and three indexed reads, each with its SAFETY line)
 # PIN(2026-11-05): gpu-deepseek41 407 -> 408 blocks, new code, not old code relaxed: the batch route's copies of each
 # chunk's q8_1 planes into the block's planes a tier node is sent (chain/ffn/batch.rs), with its SAFETY line.
-gpu-deepseek41 408 45 0
+# PIN(2026-11-05): gpu-deepseek41 408/45 -> 413/47 blocks/fns, new code, not old code relaxed: glue.rs's Q6_K engram row
+# kernel `ds41_glue_engram_rows_q6k` (its decode call and its store) and the two unsafe fns it decodes through,
+# `image_byte` (the covering-word read) and `q6k_row_value` (the three byte reads and the scale word read), each with
+# its `# Safety` contract or SAFETY line.
+gpu-deepseek41 413 47 0
 # PIN(2026-10-24): gpu-flint starts at 2 blocks, 0 fns and 0 impls: step and prompt
 # call the checked common attention binding with staged distinct positions, each with SAFETY.
 gpu-flint 2 0 0
