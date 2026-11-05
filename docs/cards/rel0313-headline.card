@@ -1,0 +1,10 @@
+kind: baseline
+question: what are 0.3.13's headline decode and prompt rates for V4.1-Flash UD-IQ3_XXS at the serving defaults on the release tarball's bloomery-serve, --place bp (RTX A6000 + RTX 3090) and --place a (RTX 3090 alone)
+term: decode tok/s of V4.1-Flash at D=512, the release tarball's bloomery-serve, --place bp, ctx unset
+unit: tok/s
+predict: 36.0..45.0
+condition: one hold, tools/release/sitting.sh through just release-sitting 0.3.13 --binary portable; cells target/release-dist/cells-0.3.13.tsv; tools/ref/depth-serve.sh arms D=512 and D=4096, 2 rounds, each round a fresh server with every lever unset and ctx unset
+reason: 0.3.12's sitting on the same file and cards read 40.83 and 40.94 tok/s at D=512 (36.46 and 36.07 at D=4096, pp 111..124 at 512 and 331..340 at 4096) [measured]; nothing since changes the two-card decode path with no lever set (the expert tier and the rank file are opt-in and unset here), so the band is 0.3.12's rows ±10 %; the `a` cell (the 3090 alone) is read beside it with no band of its own: its one reference is the README's one-3090 row of the 0.3.10 tree (34.73 tg at D=512, pp 167 at 512 and 300 at 4096, ctx 4300)
+decide-in: write the rows into the release notes' table with these conditions
+decide-below: under 36.0: a lever or a plan drifted; read the plan line and the witness block before writing a number, compare with 0.3.12's bp rows in the same table
+decide-above: beyond 45.0: read the witness block and the plan line (the room, the place) before crediting
