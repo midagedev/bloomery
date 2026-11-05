@@ -22,7 +22,7 @@ use gguf::{GgmlType, Split};
 
 use super::hparams::Hparams;
 use super::kv::KvLayout;
-use super::{names, roles};
+use super::roles;
 use crate::placement::tp::{self, Cut, RankNeed, TpTensor, check_rank};
 use crate::placement::workstation::{CONTEXT_SELF, SCRATCH};
 use crate::placement::{KvBytes, PlacementError, Role, RowTableSource};
@@ -49,10 +49,21 @@ impl TpUnits {
 }
 
 /// Whether a TP rank holds the tensor `name` on the card: every trunk tensor but the token
-/// embedding and the Engram tables, which stay in their files and are read by row.
+/// embedding and the Engram and hash tables, which stay in their files and are read by row, and
+/// the tensors no step reads.
 #[must_use]
 pub fn card_holds(name: &str) -> bool {
-    name != names::token_embd() && !stem_of(name).starts_with("engram_embd")
+    !matches!(
+        roles::tensor_role(name),
+        Some(
+            Role::TokenEmbedding
+                | Role::EngramTable
+                | Role::EngramHash
+                | Role::HashTable
+                | Role::Unread
+                | Role::Unused
+        )
+    )
 }
 
 /// The name past `blk.N.`, or the whole name for a model-level tensor.

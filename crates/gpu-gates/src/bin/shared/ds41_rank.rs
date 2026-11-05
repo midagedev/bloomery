@@ -54,10 +54,7 @@ pub fn rank_greedy<S: Source + Sync>(
         (prompt, n),
         |round| {
             let t = Instant::now();
-            let mut pick = 0;
-            for &id in &round.tokens {
-                pick = model.step(&[id])?;
-            }
+            let pick = model.step(&round.tokens)?;
             let logits = model.logits()?;
             seen(round, &logits, t.elapsed());
             Ok((pick, logits))
