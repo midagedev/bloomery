@@ -59,7 +59,9 @@
 //! bits (`cut::cut`): the layers, widths and tensor roles its spec names (`tools/fixture-cuts/<name>.json`),
 //! the tokenizer and chat files copied, and `bloomery-cut.tsv` recording each kept tensor's source range
 //! and hash; it refuses an existing `<out dir>` and writes beside it, renaming on success. `ds41-folder`
-//! is the original-format DeepSeek-V4.1 fixture folder of a checkpoint folder
+//! is the original-format DeepSeek-V4.1 fixture folder of a checkpoint folder or of a hub repo
+//! `REPO[@REV]` (`fetch`'s form; an existing folder is read as today, and a repo's files are read
+//! as headers into `<out dir>.fetch.<pid>`, removed after the write)
 //! (`model_hf::arch::deepseek41::fixture::write`): the GGUF fixture's layers, a narrower inner width and
 //! small Engram tables in the source's own formats, every value drawn from `--seed`. `verify` of a
 //! directory (or its first shard) holds such a cut to its record and to its source folder, the one the
@@ -90,7 +92,7 @@ const USAGE: &str = "usage: fixture plan <real first shard> [--draft <real draft
        fixture generate <real first shard> <out dir> [--draft <real draft>] [flags]
        fixture fetch <family | repo[@rev][:quant]> <out dir> [--rev R] [flags]
        fixture cut <source folder> <out dir> --spec FILE [--shard-bytes B] [--card-budget B]
-       fixture ds41-folder <source folder> <out dir> [--seed N]
+       fixture ds41-folder <source folder | repo[@rev]> <out dir> [--seed N]
        fixture verify <fixture first shard> [--source <real first shard>] [--draft-source <real draft>]
        fixture verify <cut dir | its first shard> [--source <source folder>]
        fixture variant-rules <fixture first shard> --tag T [--table FILE]
@@ -749,16 +751,51 @@ fn verify_fixture(
     Ok(())
 }
 
-/// `ds41-folder`: the original-format DeepSeek-V4.1 fixture folder of the checkpoint folder `source`.
+/// `ds41-folder`: the original-format DeepSeek-V4.1 fixture folder of the checkpoint folder
+/// `source`, or of the hub repo `source` names (`REPO[@REV]`, `fetch`'s form): an existing
+/// folder is the source as today, and a repo's files are read as headers into a temporary
+/// folder beside `out` (`fixture::write_from_hub`), removed after the write.
 fn ds41_folder(source: &str, out: &str, a: &Args) -> Res<()> {
     let shape = model_hf::arch::deepseek41::fixture::Shape::default();
     let seed = a.seed.unwrap_or(DEFAULT_SEED);
-    let bytes = model_hf::arch::deepseek41::fixture::write(
-        Path::new(source),
-        Path::new(out),
-        &shape,
-        seed,
-    )?;
+    let out_path = Path::new(out);
+    let bytes = if Path::new(source).is_dir() {
+        model_hf::arch::deepseek41::fixture::write(Path::new(source), out_path, &shape, seed)?
+    } else {
+        let r = RepoRef::parse(source)
+            .map_err(|e| format!("{source} is not a folder, and not a hub source: {e}"))?;
+        if let Some(q) = &r.quant {
+            return Err(format!(
+                "{source}: a checkpoint folder is served as stored, and {q} names no part of it"
+            )
+            .into());
+        }
+        let rev = r.rev.unwrap_or_else(|| "main".into());
+        if out_path
+            .try_exists()
+            .map_err(|e| format!("stat {out}: {e}"))?
+        {
+            return Err(FixtureError::Exists {
+                path: out_path.to_path_buf(),
+            }
+            .into());
+        }
+        let mut tmp = out_path.as_os_str().to_owned();
+        tmp.push(format!(".fetch.{}", std::process::id()));
+        let tmp = PathBuf::from(tmp);
+        std::fs::create_dir(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
+        let done: Res<u64> = match Client::new(tmp.clone()) {
+            Ok(client) => model_hf::arch::deepseek41::fixture::write_from_hub(
+                &client, &r.repo, &rev, &tmp, out_path, &shape, seed,
+            )
+            .map_err(Into::into),
+            Err(e) => match std::fs::remove_dir_all(&tmp) {
+                Ok(()) => Err(e.into()),
+                Err(c) => Err(format!("{e}; and removing {} failed: {c}", tmp.display()).into()),
+            },
+        };
+        done?
+    };
     println!(
         "ds41-folder: {out}: layers {:?} of {source}, ff {}, seed {seed}, {bytes} data bytes",
         shape.layers, shape.ff

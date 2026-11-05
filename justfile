@@ -1437,6 +1437,15 @@ fixture-requant FAMILY TAG:
 fixture-engram-upstream:
     env -u BLOOMERY_FIXTURE_VARIANT BLOOMERY_MODEL=deepseek41 BLOOMERY_TIER=fixture ./tools/box.sh 'bash tools/ref/fixture-engram-upstream.sh'
 
+# The V4.1 original-format fixture folder at <fixture root>/v41-folder (the reader gate-gpu-ds41-tp opens), written by
+# `fixture ds41-folder` from the Hub repo at the pinned revision: each shard a sparse file of its listed size with its
+# header at the front, read by HTTP Range into a temporary folder beside the output and removed after the write, so
+# nothing but the fixture is stored. The revision is the one /models/DeepSeek-V4.1-Flash-fp8's MANIFEST holds (all 48
+# shard digests match the listing at it). The header read is seconds and megabytes; the write is the writer's own
+# (Shape::default: nine layers, every expert, ff 1024; the summary line prints its exact data bytes).
+fixture-ds41-folder:
+    ./tools/box.sh 'cargo build --release -p bloomery-model-hf --bin fixture && ./target/release/fixture ds41-folder deepseek-ai/DeepSeek-V4.1-Flash@314113f8a7dadb388215396ba5fbee2c610a04d6 "${BLOOMERY_FIXTURE_ROOT:-/models/fixtures}/v41-folder"'
+
 # The MTP draft oracles' dumper, GLM-5.3-Flash's and Qwen3.8-Flash-Next's: dump_mtp linked against the ik tree that
 # carries the glm5next MTP graph on upstream's qwen4exp one (the glm5next profile's GLM_MTP_IK at GLM_MTP_SHA, checked
 # clean); `cmake --build` of its libllama and libcommon first (nothing to do when current). Under the CPU lease:
