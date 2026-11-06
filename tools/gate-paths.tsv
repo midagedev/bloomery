@@ -214,6 +214,7 @@ crates/models/src/headpick.rs	derive	models::headpick, the row-list head's reade
 crates/engram/src/rows.rs	derive	SplitTable, which the Qwen3.8 body opens
 crates/model-hf/src/{folder.rs,model_file.rs}	derive	the one checkpoint-folder reader and the owner of GGUF-or-folder ModelFile; every arch map and the gpu checkpoint gates plug into folder
 crates/model-hf/src/{part.rs,cut.rs}	derive	reading a load's tensors from a checkpoint folder and writing fixture cuts; gpu-glm5next's hf tests and refset fixture cut
+crates/model-hf/src/{quantize_source.rs,shards.rs}	derive	the folder read as bloomery-quantize's input and the shard planner it shares with the prepare bin; gate-quantize-hf and gate-prepare read them
 crates/model-hf/src/remote.rs	derive	HTTP Range reads of a hub listing for fixture fetch; the fixture bin
 crates/model-hf/src/arch/mod.rs	derive	the MAPS dispatch folder::open uses to pick a checkpoint map by model_type
 crates/model-hf/src/arch/glm5next.rs	derive	the GLM-5.3-Flash checkpoint map; gpu-glm5next's folder test with the hf feature

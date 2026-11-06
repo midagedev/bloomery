@@ -6,6 +6,7 @@
 
 use crate::cli::Args;
 use crate::imatrix::Imatrix;
+use crate::source::Source;
 use gguf::Value;
 
 /// `GGML_QNT_VERSION`.
@@ -27,7 +28,7 @@ fn val_str(s: &str) -> String {
 /// The metadata of every output shard: `n_split` lists, the first the whole of it.
 #[must_use]
 pub fn output_kvs(
-    set: &gguf::Split,
+    set: &dyn Source,
     a: &Args,
     im: Option<&Imatrix>,
     n_tensors: usize,

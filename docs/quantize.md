@@ -22,7 +22,14 @@ anything is written.
 ## Usage
 
     bloomery-quantize [options] <in first shard> <out> <ftype> [nthreads]
+    bloomery-quantize [options] --hf DIR <out> <ftype> [nthreads]
 
+    --hf DIR                  the input is the Hugging Face checkpoint folder DIR, read as `prepare` reads it
+                              (`model_hf::quantize_source`), and quantized without writing that GGUF set first; exactly
+                              one of `<in first shard>` and `--hf`. Needs a build with the `hf` feature
+    --hf-arch WORD / --hf-drop GLOB / --hf-shard-gib N   with `--hf`: `prepare`'s `--arch`, `--drop` (repeatable) and
+                              `--shard-gib` (48), so the folder's tensors, header and shards are those of the split
+                              `prepare` would write; `--keep-split` writes one output shard per such shard
     --imatrix FILE            the importance matrix
     --tensor-type-file FILE   llama-quantize's rules file
     --output-tensor-type T / --token-embedding-type T   the flag types, as llama-quantize's
@@ -38,6 +45,11 @@ anything is written.
 
 `nthreads` is accepted for llama-quantize's command line and ignored: the host rules run on the resident pool.
 `--help` and `--version` print the usage and `bloomery-quantize <version> (commit <hash>)`.
+
+With `--hf` the bytes are the ones the `prepare` split would have given (`just gate-quantize-hf`: the header and the
+output's sha256 per shard equal on a toy K3.1 folder and on a 2-layer cut of the real one). A folder with a shard its
+index names missing, a `weight_scale` with no `weight`, or an E8M0 scale byte of 255 is refused by name before any
+output remains.
 
 Exit: 0 done; 1 a refusal, named; 64 a usage error; 66 a missing input file.
 

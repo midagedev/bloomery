@@ -7,6 +7,7 @@
 //! as in ggml's driver; the order the caller passes the tensors in is therefore part of the result.
 
 use crate::rules::Rules;
+use crate::source::Source;
 use crate::{Error, Result};
 use gguf::quant::GgmlType;
 
@@ -101,7 +102,7 @@ pub struct Model {
 
 impl Model {
     /// From the first shard's metadata; an architecture other than [`ARCH`] is refused.
-    pub fn read(set: &gguf::Split) -> Result<Model> {
+    pub fn read(set: &dyn Source) -> Result<Model> {
         let arch = set.architecture().unwrap_or("");
         if arch != ARCH {
             return Err(Error::refused(format!(

@@ -9,6 +9,7 @@
 //! - [`meta`]: the metadata of every output shard, key by key.
 //! - [`plan`]: every tensor's type and fate, the bytes, the room and the derived wall; writes nothing.
 //! - [`scan`]: the finite check of every source row.
+//! - [`source`]: where the input is read from: a GGUF split or a checkpoint folder, one [`source::Source`].
 //! - [`check`]: a row's bytes against the host rule's, naming the first byte that differs.
 //! - [`host`]: the host rules on all cores: the IQ search as a [`Backend`] that opens no card, the K-quant rules.
 //! - [`run`]: the writer, over a [`Backend`] (the card's lives in the binary).
@@ -26,6 +27,7 @@ pub mod resolve;
 pub mod rules;
 pub mod run;
 pub mod scan;
+pub mod source;
 
 pub use run::{Backend, BackendError, run};
 

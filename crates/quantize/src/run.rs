@@ -5,12 +5,13 @@
 //! current one.
 
 use crate::check::{check_rows, compare_row, host_row};
-use crate::cli::Args;
+use crate::cli::{Args, Input};
 use crate::host::convert_rows;
 use crate::imatrix::Imatrix;
 use crate::plan::{Fate, LlamaPlan, Plan, Target};
 use crate::rules::Rules;
 use crate::scan::{row_bytes, scan_rows};
+use crate::source::{Source, SplitSource};
 use crate::{Error, Result};
 use gguf::iq_quant::{GridTables, IqKind};
 use gguf::quant::GgmlType;
@@ -45,7 +46,7 @@ pub trait Backend {
 
 /// The opened inputs and the plan over them.
 pub struct Prepared {
-    pub set: gguf::Split,
+    pub set: Box<dyn Source + Send>,
     pub im: Option<Imatrix>,
     pub plan: Plan,
 }
@@ -66,10 +67,25 @@ fn io(p: &Path, source: std::io::Error) -> Error {
     }
 }
 
-/// Open the set, the imatrix, the rules and the optional llama plan, and decide every tensor; reads no tensor data
-/// but the imatrix's.
+/// [`prepare_from`] over the GGUF split the command line names; a checkpoint folder is opened by the caller that
+/// links its reader (`model_hf::quantize_source`) and handed to [`prepare_from`], and is refused by name here.
 pub fn prepare(a: &Args) -> Result<Prepared> {
-    let mut inputs: Vec<&Path> = vec![&a.first];
+    let Input::First(first) = &a.input else {
+        return Err(Error::refused(format!(
+            "{}: this build reads no checkpoint folder (--hf needs the `hf` feature)",
+            a.input.path().display()
+        )));
+    };
+    exists(first)?;
+    let set = gguf::Split::open(first)
+        .map_err(|e| Error::refused(format!("{}: {e}", first.display())))?;
+    prepare_from(a, Box::new(SplitSource(set)))
+}
+
+/// Open the imatrix, the rules and the optional llama plan, and decide every tensor of `set`; reads no tensor data
+/// but the imatrix's.
+pub fn prepare_from(a: &Args, set: Box<dyn Source + Send>) -> Result<Prepared> {
+    let mut inputs: Vec<&Path> = Vec::new();
     inputs.extend(a.rules.as_deref());
     inputs.extend(a.llama_plan.as_deref());
     inputs.extend(a.imatrix.as_deref().map(Path::new));
@@ -88,10 +104,8 @@ pub fn prepare(a: &Args) -> Result<Prepared> {
         .as_ref()
         .map(|p| LlamaPlan::parse(&text(p)?, &p.display().to_string()))
         .transpose()?;
-    let set = gguf::Split::open(&a.first)
-        .map_err(|e| Error::refused(format!("{}: {e}", a.first.display())))?;
     let im = a.imatrix.as_deref().map(Imatrix::open).transpose()?;
-    let plan = Plan::build(&set, &rules, lcpp.as_ref(), im.as_ref(), a)?;
+    let plan = Plan::build(&*set, &rules, lcpp.as_ref(), im.as_ref(), a)?;
     Ok(Prepared { set, im, plan })
 }
 
@@ -157,21 +171,19 @@ pub fn run(
 
 /// The host-rule conversion of one tensor, whole: the importance, the finite scan, the rules, and the size check.
 fn host_convert(
-    set: &gguf::Split,
+    set: &dyn Source,
     im: Option<&Imatrix>,
     item: &crate::plan::Item,
     target: Target,
 ) -> Result<Vec<u8>> {
-    let data = set
-        .data(&item.name)
-        .map_err(|e| Error::refused(format!("{}: {e}", item.name)))?;
+    let data = set.read(&item.name, 0..item.bytes_in)?;
     let (ne0, ne1) = (item.dims[0] as usize, item.dims[1] as usize);
     let qw = match (item.importance, im) {
         (true, Some(m)) => Some(m.weights(&item.name)?),
         _ => None,
     };
-    scan_rows(&item.name, item.src, data, ne0, 0, ne1)?;
-    let out = convert_rows(target, item.src, data, ne0, 0, ne1, qw.as_deref())
+    scan_rows(&item.name, item.src, &data, ne0, 0, ne1)?;
+    let out = convert_rows(target, item.src, &data, ne0, 0, ne1, qw.as_deref())
         .map_err(|e| Error::refused(format!("{}: {e}", item.name)))?;
     if out.len() as u64 != item.bytes_out {
         return Err(Error::refused(format!(
@@ -212,7 +224,7 @@ fn write_all(
         .count();
     log(&format!(
         "bloomery-quantize: {n} output shard(s) from {}; {n_conv} of {} tensors converted (IQ by the {}, the rest by the host rules), the rest copied; {:.2} GB to write to {}",
-        a.first.display(),
+        set.label(),
         items.len(),
         backend.name(),
         out_file_bytes as f64 / 1e9,
@@ -230,7 +242,7 @@ fn write_all(
         .filter(|&i| matches!(items[i].fate, Fate::Convert(Target::K(_) | Target::F32)))
         .collect();
     let (tx, rx) = mpsc::sync_channel::<(usize, Result<Vec<u8>>)>(LOOKAHEAD);
-    let (items_ref, set_ref, im_ref) = (&items, &set, im.as_ref());
+    let (items_ref, set_ref, im_ref) = (&items, &*set, im.as_ref());
     let mut err_out: Option<Error> = None;
     std::thread::scope(|sc| {
         if ahead && !host_items.is_empty() {
@@ -265,16 +277,10 @@ fn write_all(
                     let name = &item.name;
                     match item.fate {
                         Fate::Copy => {
-                            let data = set
-                                .data(name)
-                                .map_err(|e| Error::refused(format!("{name}: {e}")))?;
-                            w.tensor(name, data).map_err(wr)?;
+                            let data = set.read(name, 0..item.bytes_in)?;
+                            w.tensor(name, &data).map_err(wr)?;
                         }
                         Fate::Convert(Target::Iq(kind)) => {
-                            let data = set
-                                .data(name)
-                                .map_err(|e| Error::refused(format!("{name}: {e}")))?;
-                            let t = set.find(name).expect("planned from the set").1;
                             let qw = im
                                 .as_ref()
                                 .ok_or_else(|| Error::refused("an IQ target needs the imatrix"))?
@@ -282,8 +288,8 @@ fn write_all(
                             backend
                                 .bind(kind, &qw)
                                 .map_err(|e| Error::refused(format!("{name}: {e}")))?;
-                            let (ne0, ne1) = (t.dims[0] as usize, t.dims[1] as usize);
-                            let n_exp: usize = t.dims[2..].iter().product::<u64>() as usize;
+                            let (ne0, ne1) = (item.dims[0] as usize, item.dims[1] as usize);
+                            let n_exp: usize = item.dims[2..].iter().product::<u64>() as usize;
                             let tab = &*tables[usize::from(kind == IqKind::Iq1S)]
                                 .get_or_insert_with(|| GridTables::new(kind));
                             let t0 = Instant::now();
@@ -291,8 +297,8 @@ fn write_all(
                                 a,
                                 backend,
                                 &mut w,
-                                t,
-                                data,
+                                &*set,
+                                item,
                                 kind,
                                 tab,
                                 &qw,
@@ -303,7 +309,7 @@ fn write_all(
                             (t_q, w_q, n_q) = (t_q + secs, w_q + wt, n_q + 1);
                             log(&format!(
                                 "  {name} {:?} -> {kind:?}: {wt:.3e} weights in {secs:.1} s (read overlapped) = {:.3e} weights/s",
-                                t.ty,
+                                item.src,
                                 wt / secs
                             ));
                         }
@@ -316,7 +322,7 @@ fn write_all(
                                 debug_assert_eq!(got, i);
                                 r?
                             } else {
-                                host_convert(&set, im.as_ref(), item, target)?
+                                host_convert(&*set, im.as_ref(), item, target)?
                             };
                             w.tensor(name, &bytes).map_err(wr)?;
                             n_q += 1;
@@ -369,23 +375,25 @@ fn quantize_tensor<W: std::io::Write>(
     a: &Args,
     backend: &dyn Backend,
     w: &mut Writer<W>,
-    t: &gguf::TensorInfo,
-    data: &[u8],
+    set: &dyn Source,
+    t: &crate::plan::Item,
     kind: IqKind,
     tables: &GridTables,
     qw: &[f32],
     (ne0, ne1, n_exp): (usize, usize, usize),
 ) -> Result<()> {
-    let rb = row_bytes(t.ty, ne0).expect("the plan checked the row geometry");
-    let eb = data.len() / n_exp;
-    debug_assert_eq!(eb, rb * ne1);
+    let rb = row_bytes(t.src, ne0).expect("the plan checked the row geometry");
+    let eb = rb * ne1;
+    debug_assert_eq!(eb * n_exp, t.bytes_in as usize);
     let picks = check_rows(ne1 * n_exp, a.check);
     let batch = a.batch;
     let mut err: Option<Error> = None;
     let wrote = std::thread::scope(|sc| {
         let read = |e0: usize, e1: usize| -> Result<Vec<u8>> {
-            let src = data[e0 * eb..e1 * eb].to_vec();
-            scan_rows(&t.name, t.ty, &src, ne0, e0 * ne1, ne1)?;
+            let src = set
+                .read(&t.name, (e0 * eb) as u64..(e1 * eb) as u64)?
+                .into_owned();
+            scan_rows(&t.name, t.src, &src, ne0, e0 * ne1, ne1)?;
             Ok(src)
         };
         let mut pending = Some(sc.spawn(move || read(0, batch.min(n_exp))));
@@ -408,7 +416,7 @@ fn quantize_tensor<W: std::io::Write>(
                 let e2 = (e1 + batch).min(n_exp);
                 pending = Some(sc.spawn(move || read(e1, e2)));
             }
-            let out = match backend.quantize(t.ty, &src, ne0, e0 * ne1, ne1) {
+            let out = match backend.quantize(t.src, &src, ne0, e0 * ne1, ne1) {
                 Ok(o) => o,
                 Err(x) => {
                     err = Some(Error::refused(format!(
@@ -425,7 +433,7 @@ fn quantize_tensor<W: std::io::Write>(
                 let want = host_row(
                     kind,
                     tables,
-                    t.ty,
+                    t.src,
                     &src[k * rb..(k + 1) * rb],
                     &qw[(r / ne1) * ne0..(r / ne1 + 1) * ne0],
                 );

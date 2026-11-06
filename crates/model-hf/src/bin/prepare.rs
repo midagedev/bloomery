@@ -79,6 +79,7 @@ use model_hf::arch::{self, MapUse};
 use model_hf::folder::{self, FolderMap, Make, Planned};
 use model_hf::follow::Follow;
 use model_hf::select::Select;
+use model_hf::shards::plan_shards;
 
 const USAGE: &str = concat!(
     "usage: prepare <folder> <out prefix> [--shard-gib <n>] [--keep-bf16]\n",
@@ -819,56 +820,6 @@ fn print_plan(dir: &Path) -> Res<()> {
         opened.tokenizer.n_vocab()
     );
     Ok(())
-}
-
-fn plan_shards<S>(
-    planned: Vec<Planned<S>>,
-    kvs: &[(String, Value)],
-    limit: u64,
-) -> Res<Vec<(Vec<Planned<S>>, Layout)>> {
-    let tensors32 =
-        i32::try_from(planned.len()).map_err(|_| "too many tensors for a GGUF split")?;
-    let shard_keys = |no: u16, count: u16| {
-        let mut keys = if no == 0 { kvs.to_vec() } else { vec![] };
-        keys.extend([
-            ("split.no".to_string(), Value::U16(no)),
-            ("split.count".to_string(), Value::U16(count)),
-            ("split.tensors.count".to_string(), Value::I32(tensors32)),
-        ]);
-        keys
-    };
-    let mut shards: Vec<Vec<Planned<S>>> = vec![vec![]];
-    let mut pending = planned.into_iter().peekable();
-    while let Some(p) = pending.next() {
-        let mut group = vec![p];
-        if pending
-            .peek()
-            .is_some_and(|p| matches!(p.make, Make::Scale { .. }))
-        {
-            group.push(pending.next().expect("the scale was just inspected"));
-        }
-        let no = shards.len() - 1;
-        let no16 = u16::try_from(no).map_err(|_| "too many shards for a GGUF split")?;
-        let last = &mut shards[no];
-        let declarations = last.iter().chain(&group).map(|p| p.decl.clone()).collect();
-        // split.count has the same U16 width for every final count.
-        let candidate = Layout::new(&shard_keys(no16, 1), declarations)?;
-        if !last.is_empty() && candidate.file_len() > limit {
-            shards.push(group);
-        } else {
-            last.extend(group);
-        }
-    }
-    let count16 = u16::try_from(shards.len()).map_err(|_| "too many shards for a GGUF split")?;
-    shards
-        .into_iter()
-        .enumerate()
-        .map(|(no, shard)| {
-            let keys = shard_keys(u16::try_from(no)?, count16);
-            let layout = Layout::new(&keys, shard.iter().map(|p| p.decl.clone()).collect())?;
-            Ok((shard, layout))
-        })
-        .collect()
 }
 
 #[cfg(test)]
