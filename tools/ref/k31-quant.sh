@@ -928,25 +928,34 @@ do_quantize() {
   splice classes --in "$QFIRST" | sed 's/^/    /'
 }
 
-dsa_kv_args() { # <config.json> <arch>: one --kv value per line
+dsa_kv_args() { # <config.json> <arch>: one --kv value per line, the keys crates/model/src/arch/kimi_k3/hparams.rs INDEXER_KEYS reads
   python3 -I - "$1" "$2" << 'PY'
 import json, sys
 cfg = json.load(open(sys.argv[1]))
-d = (cfg.get("text_config") or cfg).get("dsa_config")
+t = cfg.get("text_config") or cfg
+d = t.get("dsa_config")
 if not isinstance(d, dict):
     sys.exit("no text_config.dsa_config in " + sys.argv[1])
 a = sys.argv[2]
-for src, dst in (("index_topk", "top_k"), ("index_head_dim", "key_length"), ("index_num_heads", "head_count")):
+for src, dst in (("index_topk", "top_k"), ("index_head_dim", "key_length"), ("index_num_heads", "head_count"), ("index_rope_dim", "rope_dimension_count")):
     if not isinstance(d.get(src), int):
         sys.exit(f"dsa_config.{src} is missing or not an integer")
     print(f"{a}.attention.indexer.{dst}=u32:{d[src]}")
 layers = d.get("dsa_layers")
 if not (isinstance(layers, list) and layers and all(isinstance(x, int) for x in layers)):
     sys.exit("dsa_config.dsa_layers is missing, empty or not a list of integers")
+n = t.get("num_hidden_layers")
+if not isinstance(n, int) or n < 1:
+    sys.exit("num_hidden_layers is missing or not a positive integer")
 # config.json counts layers from 1 (K3.1's dsa_layers 4, 8, ..., 92, 93 are blocks 3, 7, ..., 91, 92); the GGUF's blk.N counts from 0.
-if min(layers) < 1:
-    sys.exit("dsa_config.dsa_layers holds a layer below 1: the config counts layers from 1")
-print(f"{a}.attention.indexer.layers=u32[]:" + ",".join(str(x - 1) for x in sorted(layers)))
+if min(layers) < 1 or max(layers) > n:
+    sys.exit(f"dsa_config.dsa_layers holds a layer outside 1..{n}: the config counts layers from 1")
+# attention.indexer.types: one bool per block, true where the indexer runs (the reader holds it equal to the MLA layers).
+print(f"{a}.attention.indexer.types=bool[]:" + ",".join("true" if l + 1 in layers else "false" for l in range(n)))
+eps = t.get("rms_norm_eps")
+if not isinstance(eps, (int, float)) or not eps > 0:
+    sys.exit("rms_norm_eps is missing or not positive (the indexer key LayerNorm's epsilon)")
+print(f"{a}.attention.layer_norm_epsilon=f32:{eps}")
 PY
 }
 check_dsa_layers() { # <kv args...>: the layers key against the blocks the indexer file holds tensors for (a config's 1-based list is refused here)
