@@ -22,12 +22,14 @@
 //!   the latent up, and the shared stack's output added.
 //!
 //! The sum's order is `(card + tier) + host`: up to rounding the whole-card layer's, which sums
-//! the sixteen slots in one launch. The body walks a prompt one id a step, so there is no rows
-//! pass here.
+//! the sixteen slots in one launch. A load whose plan reserved the placed pass runs a prompt as
+//! passes of rows through the same parts at the pass's rows ([`super::pass`]); any other placed
+//! load steps its prompt one id at a time.
 
 use super::super::tier::{
     NODE_FAMILY, PAGE_ROWS, TierParts, TierSum, enqueue_tier_sum, host_layer,
 };
+use super::pass::PlacedPass;
 use super::{Ffn, Instance, Layer, MoeDims, Walk};
 use crate::arch::hybrid::{Acts, GqaCx};
 use crate::arch::routed_ffn::{FfnKernels, Glu, Routed};
@@ -73,8 +75,8 @@ pub(super) const STEP_WALK: Overlap = Overlap {
 pub(super) const LOAD_ROWS: usize = PAGE_ROWS;
 
 /// The token embedding as the host reads it: the table and one dequantized row.
-struct EmbedHost {
-    table: EmbedTable,
+pub(super) struct EmbedHost {
+    pub(super) table: EmbedTable,
     row: Vec<f32>,
 }
 
@@ -82,17 +84,17 @@ struct EmbedHost {
 /// each routed layer's card count and slot-map row, the slot map's card copy, the handoff and sum
 /// launches and the places of one layer's slots.
 pub(super) struct Side {
-    hosted: Vec<bool>,
-    n_card: Vec<usize>,
-    row_off: Vec<usize>,
+    pub(super) hosted: Vec<bool>,
+    pub(super) n_card: Vec<usize>,
+    pub(super) row_off: Vec<usize>,
     /// The slot map's card copy, one row of `n_expert` places a routed layer.
-    slots: Arc<DeviceTensor<u32>>,
+    pub(super) slots: Arc<DeviceTensor<u32>>,
     handoff: HandoffKernels,
-    acc_k: CardSlotKernels,
+    pub(super) acc_k: CardSlotKernels,
     /// The routed slots' places in the card's stacks, or `HOST`.
     sel: DeviceBuffer<u32>,
     /// The stage card's side of the expert tier, when the plan hangs one.
-    tier: Option<TierParts>,
+    pub(super) tier: Option<TierParts>,
 }
 
 /// The placed side of a load: the host tier and its glue, what the walk reads beside them, and the
@@ -101,7 +103,9 @@ pub(super) struct Side {
 pub struct Placed {
     pub(super) shell: TierShell<HostRun>,
     pub(super) side: Side,
-    embed: EmbedHost,
+    pub(super) embed: EmbedHost,
+    /// The placed pass's buffers, on a load whose plan reserved them ([`Placed::attach_pass`]).
+    pub(super) pass: Option<Box<PlacedPass>>,
 }
 
 impl Drop for Placed {
@@ -118,6 +122,9 @@ pub(super) struct Open<'a> {
     pub(super) host: HostCfg,
     pub(super) set: HostResidency,
     pub(super) glue: ResidencyGlue,
+    /// The columns the expert tier's batch serves: the placed pass's rows, or the step's one on a
+    /// load without the pass.
+    pub(super) cols: usize,
 }
 
 impl Placed {
@@ -140,6 +147,7 @@ impl Placed {
             host,
             set,
             glue,
+            cols,
         } = open;
         let hp = &inputs.hp;
         let (n_expert, n_used) = (hp.experts.n_expert, hp.experts.n_used);
@@ -190,7 +198,7 @@ impl Placed {
                 n_used,
                 rows: LOAD_ROWS,
             },
-            cols: LOAD_ROWS,
+            cols,
             card_dontneed: host.card_dontneed,
             bytes: crate::model::CardBytes::File,
         });
@@ -242,7 +250,24 @@ impl Placed {
                 table,
                 row: vec![0.0; hp.n_embd],
             },
+            pass: None,
         })
+    }
+
+    /// The placed pass's buffers at `shape` held for the load's life, and the host tier's batch
+    /// sets and union slabs for its rows. Load-time only.
+    pub(super) fn attach_pass(&mut self, gpu: &Gpu, pass: PlacedPass) -> Result<(), GpuError> {
+        let rows = pass.shape().rows;
+        self.shell.hybrid.prepare_batch(gpu.context(), rows)?;
+        self.shell.hybrid.host_mut().prepare_union(rows)?;
+        gpu.stream().synchronize()?;
+        self.pass = Some(Box::new(pass));
+        Ok(())
+    }
+
+    /// Device bytes the placed pass holds; 0 on a load without it.
+    pub(super) fn pass_bytes(&self) -> usize {
+        self.pass.as_deref().map_or(0, PlacedPass::bytes)
     }
 
     /// Device bytes the placed side holds beside the plan's terms for the tier: the slot map's

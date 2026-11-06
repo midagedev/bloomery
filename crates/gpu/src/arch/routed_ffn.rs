@@ -530,7 +530,7 @@ pub(crate) fn stage_len(ff: usize) -> usize {
     clippy::too_many_arguments,
     reason = "glu's inputs, the row count and the row kit"
 )]
-fn glu_rows(
+pub(crate) fn glu_rows(
     cx: &GqaCx<'_>,
     kit: &mut RowsKit<'_>,
     (acts, rule): (&mut Acts, Act),

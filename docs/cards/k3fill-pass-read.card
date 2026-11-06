@@ -1,0 +1,26 @@
+# Round k3fill stage 3: the placed prompt pass's one underived term, the NVMe bytes a pass reads with the
+# plan's arena at its floor. [derived, docs/research/k3-prompt-pass.md §2.3, §3.1, §10]: at 250 GiB room the
+# pass plan pages 296.2 GB with a 22.6 GB arena (kimi_k3_meta
+# the_prompt_pass_plan_takes_the_arena_at_its_floor);
+# a pass of 256 rows touches U(256)/896 = 887.1/896 of each layer's experts, so 293.3 GB when the host share
+# stays
+# in the page cache (43.3 s at 6.77 GB/s), and up to 514 GB when the pass's scan of the 223 GB share evicts
+# it.
+kind: profile
+question: does a placed pass on the arena path read only the paged experts, or does its scan of the host share
+  evict that share from the page cache?
+term: NVMe bytes read from the /models drive (/proc/diskstats sectors read) during the second pass of 256 rows
+  of a 512-id prompt, K3 UD-IQ1_S, generate_kimi_k3 --place bp --walk pass --ctx 4096, A6000 stage, the
+  prompt_pass record rows=256 mla_rows=1, the plan's arena at its floor
+unit: GB
+predict: 293..330 GB
+condition: the counted bytes are a 512-id run's /models reads less a 256-id run's (each a process of its own, the
+  load's reads the same in both), the two back to back in one lease after a discarded warm-up run of 512 ids; no other
+  reader of /models runs (lease_take, guard_other), and each run's plan and prompt_pass records equal the --plan print
+  made before them
+decide-in: the arena path keeps the host share: take the pp tok/s @ P = 512 and 4096 rows against the step's,
+  one lease, and the score wall on 10 lines
+decide-below: fewer distinct experts than the uniform U(R): re-derive U(R) from a k3trace of the prompt's
+  routing before reading any pass number
+decide-above: the pass's scan evicts the host share: lock the share (HOST_LOCK) or move it to the arena's
+  O_DIRECT path, re-derive the pass wall, and do not publish a pass number until the bytes are in band

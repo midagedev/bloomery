@@ -71,6 +71,8 @@ use std::sync::Arc;
 
 #[path = "index.rs"]
 mod index;
+#[path = "pass.rs"]
+pub(super) mod pass;
 #[path = "placed.rs"]
 pub(super) mod placed;
 #[path = "rows.rs"]
@@ -212,6 +214,20 @@ fn run_mixer(
             };
             mla::step(cx, &k.mla, acts, (&**sites, md), l, bufs)
         }
+    }
+}
+
+/// The latent mixer's dims of `hp`'s file.
+fn mla_dims(hp: &Hparams) -> MlaDims {
+    MlaDims {
+        embd: hp.n_embd,
+        heads: hp.n_head,
+        q_lora: hp.mla.q_lora,
+        nope: hp.mla.nope(),
+        extra: hp.mla.pe,
+        v_head: hp.mla.head_v,
+        rms_eps: hp.rms_eps,
+        latent_eps: hp.rms_eps,
     }
 }
 
@@ -650,7 +666,8 @@ impl GpuModel<Body> {
     /// layer's card experts the plan puts there, the stores at the plan's `ctx_max`, the host tier
     /// over the layers whose experts the card does not hold whole with the plan's expert tier
     /// card hung under it, and the embedding as a host row ([`placed`]). The load's slot map
-    /// stays for the model's life ([`Residency::Off`]). The prompt is stepped one id at a time.
+    /// stays for the model's life ([`Residency::Off`]). The prompt is stepped one id at a time;
+    /// [`GpuModel::open_placed_pass`] loads the placed pass beside it.
     /// A plan whose stage card carries no head leaves `output_norm.weight` and `output.weight` on
     /// the host, and the output head is the host's ([`HostHead`]). Refused by name: a plan of
     /// other than one stage card running every layer, a plan that carries the head on no card and
@@ -666,7 +683,36 @@ impl GpuModel<Body> {
         card: usize,
         host: HostCfg,
     ) -> Result<GpuModel<Body>, GpuError> {
+        Self::open_placed_with(file, (plan, inputs), card, host, None)
+    }
+
+    /// [`GpuModel::open_placed`] with the placed pass at `shape` ([`pass`]): its buffers made
+    /// beside the placed side, the expert tier's batch hung for its rows, and the host tier's
+    /// batch sets and union slabs, so a prompt runs as passes of up to `shape.rows` rows
+    /// ([`GpuModel::prompt_placed`]). The plan's prompt reserve holds the pass's bytes
+    /// ([`pass::pass_bytes`] at the plan's context), its tier batch the tier's at those rows.
+    /// Refused by name as [`GpuModel::open_placed`] refuses, and the pass's buffers with the
+    /// tier's places past the plan's reserves for them.
+    pub fn open_placed_pass(
+        file: Split,
+        plan: &Plan<'_>,
+        inputs: &PlanInputs,
+        card: usize,
+        host: HostCfg,
+        shape: pass::PassShape,
+    ) -> Result<GpuModel<Body>, GpuError> {
+        Self::open_placed_with(file, (plan, inputs), card, host, Some(shape))
+    }
+
+    fn open_placed_with(
+        file: Split,
+        (plan, inputs): (&Plan<'_>, &PlanInputs),
+        card: usize,
+        host: HostCfg,
+        pass: Option<pass::PassShape>,
+    ) -> Result<GpuModel<Body>, GpuError> {
         const PLAN: &str = "kimi_k3::Body::open_placed";
+        let pass = pass.map(pass::PassShape::check).transpose()?;
         let hp = &inputs.hp;
         let (_, ctx) = stage_run(PLAN, plan, card, hp.n_layer)?;
         // The common load refuses it too ([`GpuModel::load_placed_with`]); asked here first, no
@@ -705,11 +751,37 @@ impl GpuModel<Body> {
                     host,
                     set,
                     glue,
+                    cols: pass.map_or(placed::LOAD_ROWS, |s| s.rows),
                 };
                 let mut body =
                     Body::load(gpu, file, w, (inputs.hp.clone(), ctx), Some((open, card)))?;
                 if host_head {
                     body.host_head = Some(HostHead::open(Arc::clone(file), inputs.hp.rms_eps)?);
+                }
+                if let Some(shape) = pass {
+                    let Body {
+                        hp,
+                        kda,
+                        mla,
+                        acts,
+                        layers,
+                        ctx,
+                        placed,
+                        ..
+                    } = &mut body;
+                    let made = pass::PlacedPass::new(
+                        gpu,
+                        (&*hp, (&*kda, &*mla), *ctx),
+                        (acts, &layers[..]),
+                        shape,
+                    )?;
+                    placed
+                        .as_mut()
+                        .ok_or(GpuError::shape(
+                            PLAN,
+                            "a placed load without its placed side",
+                        ))?
+                        .attach_pass(gpu, made)?;
                 }
                 refuse_scratch_past(
                     PLAN,
@@ -725,10 +797,11 @@ impl GpuModel<Body> {
                 if let Some(p) = body.placed.as_mut() {
                     refuse_reserve_past(
                         PLAN,
-                        "tier places",
+                        "tier places and placed pass",
                         reserve,
-                        p.tier_bytes() as u64,
-                        "the slot map's tier view and the step's tier places",
+                        (p.tier_bytes() + p.pass_bytes()) as u64,
+                        "the slot map's tier view, the step's tier places and the placed pass's \
+                         buffers",
                     )?;
                     p.start_residency(gpu)?;
                 }
@@ -866,16 +939,7 @@ impl Body {
             ));
         }
         let kd = kda::dims(&hp)?;
-        let md = MlaDims {
-            embd: n,
-            heads: hp.n_head,
-            q_lora: hp.mla.q_lora,
-            nope: hp.mla.nope(),
-            extra: hp.mla.pe,
-            v_head: hp.mla.head_v,
-            rms_eps: hp.rms_eps,
-            latent_eps: hp.rms_eps,
-        };
+        let md = mla_dims(&hp);
         if md.row() != hp.mla.row() {
             return Err(GpuError::shape(
                 WHAT,

@@ -4,9 +4,11 @@
 //! file's by their stacks' types. The plan serves the placed load: an expert tier card beside the
 //! stage card ([`tier_places_bytes`] of card buffers on the stage, [`tier_batch`] reserved on the
 //! tier card and the host) and the common host run's NVMe arena for the experts the host's room
-//! cannot hold ([`PlanInputs::with_nvme_tier`]). The body walks a prompt one id a step, so the
-//! plan keeps no prompt-pass bytes ([`PlanInputs::prompt_reserve`] is 0) and the tier's run and
-//! page are one token ([`TIER_CHUNK`], [`TIER_ROWS`]). The body runs every layer of the
+//! cannot hold ([`PlanInputs::with_nvme_tier`]). The step's plan keeps no prompt-pass bytes
+//! ([`PlanInputs::prompt_reserve`] is 0) and the tier's run and page are one token
+//! ([`TIER_CHUNK`], [`TIER_ROWS`]). A load that runs the placed prompt pass plans its rows apart:
+//! the card driver states the pass's bytes, its tier places among them, as the prompt reserve,
+//! and the tier's batch at the pass's rows ([`tier_batch_at`]). The body runs every layer of the
 //! description ([`Program::KimiK3Body`]); what is left to the coverage check is the template's
 //! tool-call parser, the chat surface's, so [`PlanInputs::read`] refuses that one item and a
 //! driver that feeds ids and renders no chat reads the file by [`PlanInputs::read_without_chat`].
@@ -56,12 +58,18 @@ pub fn tier_places_bytes(hp: &Hparams) -> u64 {
 /// width, through the card leg in runs of [`TIER_CHUNK`] over [`TIER_ROWS`] tokens. Refused by
 /// name: a geometry the common leg's bytes do not count.
 pub fn tier_batch(hp: &Hparams) -> Result<TierBatchBytes, PlacementError> {
+    tier_batch_at(hp, TIER_ROWS)
+}
+
+/// [`tier_batch`] for a load whose tier batch holds `rows` rows, a prompt pass's, run through the
+/// card leg in runs of [`TIER_CHUNK`].
+pub fn tier_batch_at(hp: &Hparams, rows: u64) -> Result<TierBatchBytes, PlacementError> {
     workstation::tier_leg_batch_bytes(
         hp.latent as u64,
         hp.experts.ff as u64,
         hp.experts.n_used as u64,
         TIER_CHUNK,
-        TIER_ROWS,
+        rows,
     )
 }
 

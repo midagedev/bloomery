@@ -421,6 +421,61 @@ impl HostHead {
     }
 }
 
+/// The most rows one projection of a host head takes ([`Head::host_logits_rows`]).
+pub const HOST_HEAD_ROWS: usize = 128;
+
+impl HostHead {
+    /// The logits of `rows` token-major rows at the start of the card's `x`, row-major (`rows`
+    /// rows of `n_vocab`): the rows copied down, the final RMS norm by the gain on each, then one
+    /// projection of every row by `output.weight`'s own type ([`matmul_q`], each column's dot the
+    /// one-row call's), so the weight is read once for all of them. Leaves the held row of
+    /// [`HostHead::with_row`] as it was. Refused by name: no rows, more than [`HOST_HEAD_ROWS`],
+    /// a buffer shorter than the rows, and the projection's own refusals.
+    fn logits_rows(
+        &self,
+        stream: &CudaStream,
+        x: &DeviceBuffer<f32>,
+        rows: usize,
+    ) -> Result<Vec<f32>, GpuError> {
+        const WHAT: &str = "Head::host_logits_rows";
+        let hidden = self.gain.len();
+        if rows == 0 || rows > HOST_HEAD_ROWS || x.len() < rows * hidden {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "{rows} rows of {hidden} from a buffer of {} values: 1 to {HOST_HEAD_ROWS} \
+                     rows a projection",
+                    x.len()
+                ),
+            ));
+        }
+        let mut data = vec![0.0; rows * hidden];
+        let window = crate::tensor::Window::<f32>::of(x, 0, rows * hidden)?;
+        window.copy_to_host(stream, &mut data)?;
+        let x = Tensor2 {
+            ne0: hidden,
+            ne1: rows,
+            data,
+        };
+        let normed = rms_norm(&x, &self.gain, self.eps);
+        let gguf = self
+            .file
+            .shard(self.shard)
+            .ok_or_else(|| GpuError::shape(WHAT, format!("no shard {} in the file", self.shard)))?;
+        let mut logits = matmul_q(gguf, &self.out, &normed)?;
+        if (logits.ne0, logits.ne1) != (self.n_vocab, rows) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the projection wrote {} x {}, the head's rows are {rows} of {} logits",
+                    logits.ne0, logits.ne1, self.n_vocab
+                ),
+            ));
+        }
+        Ok(std::mem::take(&mut logits.data))
+    }
+}
+
 /// The token of `logits`, one row: the first index of the largest value, the card argmax's rule.
 /// A logit that is not finite is refused by name, as the card's argmax over f32 rows refuses it.
 fn host_argmax(logits: &[f32]) -> Result<u32, GpuError> {
@@ -1041,6 +1096,29 @@ impl Head {
             return Err(GpuError::fault(WHAT, fault));
         }
         h.with_row(stream, &self.x, read)
+    }
+
+    /// The logits of `rows` token-major rows at the start of `x` (a pass's final mix), row-major,
+    /// projected on the host at once, when the head is the host's ([`HOST_HEAD_ROWS`] rows at
+    /// most); `None` for a card head, whose rows a caller runs through [`Head::enqueue`] one at a
+    /// time. Waits for the stream and refuses a raised fault first, as the host head's readback
+    /// does.
+    pub fn host_logits_rows(
+        &self,
+        gpu: &Gpu,
+        x: &DeviceBuffer<f32>,
+        rows: usize,
+    ) -> Result<Option<Vec<f32>>, GpuError> {
+        const WHAT: &str = "Head::host_logits_rows";
+        let Some(h) = &self.host else {
+            return Ok(None);
+        };
+        let stream = gpu.stream();
+        crate::host::await_done(WHAT, || stream.query())?;
+        if let Some(fault) = gpu.fault()? {
+            return Err(GpuError::fault(WHAT, fault));
+        }
+        h.logits_rows(stream, x, rows).map(Some)
     }
 
     /// The head is read on the host: its normed rows and logits are not on the card.
