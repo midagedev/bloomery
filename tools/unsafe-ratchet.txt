@@ -827,7 +827,12 @@ gguf 7 2 0
 # each as in the other counts' entries, each with its SAFETY line.
 # PIN(2026-11-06): gpu 3021 -> 3036 blocks, 417 -> 419 fns, new code, not old code relaxed: attn_res.rs, Kimi K3's
 # AttnRes bank mix kernel entry `attn_res_mix` and its row helper (15 blocks, 2 unsafe fns, each with its SAFETY line).
-gpu 3036 419 10
+# PIN(2026-11-06): gpu 3036 -> 3079 blocks, 419 -> 421 fns, moved code, not old code relaxed: the lightning indexer's
+# three kernel entries (`ds41_indexer_score`, `ds41_indexer_topk`, `ds41_index_key_input`), their launchers and the
+# index-key cores (`load4`, `ht_warp`) moved from gpu-deepseek41 (-42 blocks, -2 fns there), unchanged but for the
+# one extra `shared_module!` block the index-key loader's split into the common input form and V4.1's compressor
+# form needs (+1 block in total); each with its SAFETY line or `# Safety` contract.
+gpu 3079 421 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -874,7 +879,7 @@ gpu 3036 419 10
 # kernel `ds41_glue_engram_rows_q6k` (its decode call and its store) and the two unsafe fns it decodes through,
 # `image_byte` (the covering-word read) and `q6k_row_value` (the three byte reads and the scale word read), each with
 # its `# Safety` contract or SAFETY line.
-gpu-deepseek41 413 47 0
+gpu-deepseek41 371 45 0
 # PIN(2026-10-24): gpu-flint starts at 2 blocks, 0 fns and 0 impls: step and prompt
 # call the checked common attention binding with staged distinct positions, each with SAFETY.
 gpu-flint 2 0 0

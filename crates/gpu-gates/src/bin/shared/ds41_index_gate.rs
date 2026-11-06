@@ -1,6 +1,6 @@
 //! GPU gate for DeepSeek-V4.1's lightning indexer — B4 op block F
-//! (`docs/research/v41-b4-plan-report.md` §1-F) — `bloomery_gpu_deepseek41::
-//! indexer` against ik's CPU dumps. Every emitting layer
+//! (`docs/research/v41-b4-plan-report.md` §1-F) — `bloomery_gpu::indexer`
+//! against ik's CPU dumps. Every emitting layer
 //! (`LayerKind::indexer`) of the decode-step sets at position 301 (top_k 64,
 //! the set's `--override-kv`) and 1,025 (the file's top_k), each fused (ik's
 //! bucket top-k, `lid_top_k`) and unfused (`lid_kq`, `lid_score`,
@@ -83,13 +83,11 @@ use std::collections::HashMap;
 use std::f32::consts::FRAC_1_SQRT_2;
 
 use bloomery_gpu::cand::{CandKernels, CandScratch, CandShape, CompactArgs, RemapArgs, SelectArgs};
+use bloomery_gpu::index_key::HT_SCALE;
+use bloomery_gpu::indexer::{HEAD_DIM, HEADS, IndexerArgs, IndexerKernels, IndexerScratch};
 use bloomery_gpu::weights::{DevWeight, q8_0_planes, upload_file_tensor};
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Q8Act};
 use bloomery_gpu_deepseek41::attn::{self, AttnArgs, AttnKernels, LATENT, SelectedRows};
-use bloomery_gpu_deepseek41::index_key::HT_SCALE;
-use bloomery_gpu_deepseek41::indexer::{
-    HEAD_DIM, HEADS, IndexerArgs, IndexerKernels, IndexerScratch,
-};
 use bloomery_gpu_deepseek41::params::rope_specs;
 use bloomery_gpu_deepseek41::rope::{Direction, RopeSpec, RopeTable, ggml_rope_cache};
 use bloomery_gpu_gates::act_rule::{self, Q3kWeight};
@@ -804,7 +802,7 @@ pub fn run() -> Result<(), GateError> {
     let hp = Hparams::read(&split)?;
     let (_, yarn) = rope_specs(&hp)?;
     let gpu = Gpu::new()?;
-    let kernels = IndexerKernels::load(gpu.context(), &hp)?;
+    let kernels = bloomery_gpu_deepseek41::indexer::kernels(gpu.context(), &hp)?;
     let attn = AttnKernels::load(gpu.context())?;
     let cand = CandKernels::load(gpu.context())?;
     let emitting: Vec<usize> = (0..hp.layers.len())

@@ -91,6 +91,7 @@
 
 use std::collections::BTreeSet;
 
+use bloomery_gpu::index_key::HT_SCALE;
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{DeviceTensor, Gpu};
 use bloomery_gpu_deepseek41::body::STEP_TOKENS;
@@ -99,7 +100,6 @@ use bloomery_gpu_deepseek41::chain::attn::{
 };
 use bloomery_gpu_deepseek41::compress::StepInts;
 use bloomery_gpu_deepseek41::hc::HC_MIX;
-use bloomery_gpu_deepseek41::index_key::HT_SCALE;
 use bloomery_gpu_deepseek41::params::{ImageDims, ImageLayout, StepImage, Table, rope_specs};
 use bloomery_gpu_gates::act_rule::{self, Q3K_BYTES, QK_K, Rule, q8_var};
 use bloomery_gpu_gates::ik_q8_2::{self, QK};
