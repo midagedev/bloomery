@@ -167,6 +167,25 @@ pub const STREAM_MIN_P: usize = 128;
 /// which no uniform (lcg) routing's expert clears [derived].
 pub const STREAM_FLOOR: u32 = 32;
 
+/// A stream pick's price for a call's group of `members` batches made under
+/// `cut` (`BLOOMERY_PREFILL_CUT`): the group's floor and the scale its first
+/// member's counts are read at, in units of [`T_MAX`] rows, a unit being the
+/// batches of `cut` positions that make [`T_MAX`], to the nearest whole batch.
+/// A batch is priced by the cut it was made under, not by the rows it
+/// carries: a call's only or last batch is short of its cut (a 512-id
+/// prompt's call carries 511 ids, a short prompt fewer) and is the unit a full
+/// one is. At the default cut a batch is one unit, the floor is
+/// [`STREAM_FLOOR`] per member and the counts are the batch's own; under a cut
+/// that divides [`T_MAX`] a group of cut batches is one unit, 2 x 256 priced as
+/// 1 x 512.
+fn stream_price(cut: usize, members: usize) -> (u32, u32) {
+    let unit = u32::try_from((T_MAX + cut / 2) / cut.max(1))
+        .unwrap_or(u32::MAX)
+        .max(1);
+    let members = u32::try_from(members).unwrap_or(u32::MAX);
+    (STREAM_FLOOR.saturating_mul(members).div_ceil(unit), unit)
+}
+
 const WHAT: &str = "deepseek41 prefill";
 
 /// How a prompt is fed (`BLOOMERY_PREFILL`, [`super::BodyLevers::prefill`]):
@@ -2370,6 +2389,7 @@ impl Body {
         observe: &mut BatchObserver<'_>,
     ) -> Result<(PrefillStats, Tally), GpuError> {
         let on_tier = self.tier_counts()?;
+        let cut = self.levers.cut;
         let Body {
             layers,
             seq: Seq { kv, shadows, .. },
@@ -2394,14 +2414,9 @@ impl Body {
             what: WHAT,
             missing: "the call's needs",
         })?;
+        let (floor, pick_scale) = stream_price(cut, members.len());
         if batch.stream.on {
-            // The floor and the pick's scale price the group at T_MAX-row
-            // units: a cut batch carries fewer rows, so its first member's
-            // counts stand for T_MAX / rows of them and the floor counts the
-            // group's rows, not its members — 2 x 256 is priced as 1 x 512.
-            let rows: usize = members.iter().map(|m| m.u).sum();
-            let floor = (STREAM_FLOOR as usize * rows).div_ceil(T_MAX);
-            hybrid.call_floor(u32::try_from(floor).unwrap_or(u32::MAX))?;
+            hybrid.call_floor(floor)?;
         }
         let first = members.first().map_or(0, |m| m.batch);
         let mut cx = GroupCx {
@@ -2421,6 +2436,7 @@ impl Body {
             tier: tier.as_ref(),
             on_tier,
             n: hp.n_embd,
+            pick_scale,
             sums: PrefillStats::default(),
             tally: Tally::new(first, members.len(), layers.clone()),
         };
@@ -2516,6 +2532,8 @@ struct GroupCx<'a> {
     tier: Option<&'a TierPiece>,
     on_tier: Vec<usize>,
     n: usize,
+    /// The count scale of the group's picks ([`stream_price`]).
+    pick_scale: u32,
     sums: PrefillStats,
     tally: Tally,
 }
@@ -2941,13 +2959,12 @@ impl<'a> GroupCx<'a> {
         };
         self.ffn
             .enqueue_batch_shadow_chunks(gpu, bl, card, &mut batch.ffn, &block)?;
-        let scale = u32::try_from(T_MAX.div_ceil(m.u.max(1))).unwrap_or(u32::MAX);
         let pick = self.hybrid.call_pick_routed_scaled(
             gpu.stream(),
             m.key(l, r.at),
             &mut batch.stream.counts,
             usize::MAX,
-            scale,
+            self.pick_scale,
         )?;
         batch.stream.picks.push((batch.stream.group, pick));
         self.ffn
@@ -3354,6 +3371,34 @@ mod tests {
         // A call that cuts at chunk-aligned starts leaves the same hole.
         assert_eq!(hole(256, 0, 512), hole(512, 0, 512));
         assert_eq!(hole(256, 0, 0), 0..0);
+    }
+
+    /// A stream pick is priced by the cut its call was made under, never by
+    /// the rows its batch carries: a 512-id prompt's call is one batch of 511
+    /// ids and is the one unit the default cut prices any batch; a cut that
+    /// divides T_MAX prices that many batches as one, the group's floor
+    /// per member in those units. Mutant: the unit read off the first batch's
+    /// rows as `T_MAX.div_ceil(rows)`, which prices 511 rows as two and
+    /// doubles the picks of that prompt.
+    #[test]
+    fn a_stream_pick_is_priced_by_the_cut_not_by_a_short_batch() {
+        assert_eq!(levers(T_MAX).batches(0, T_MAX - 1), vec![0..T_MAX - 1]);
+        let unit = u32::try_from(T_MAX).expect("T_MAX fits a u32");
+        for (cut, members, want) in [
+            (T_MAX, 1, (STREAM_FLOOR, 1)),
+            (T_MAX, 2, (2 * STREAM_FLOOR, 1)),
+            (T_MAX - 1, 1, (STREAM_FLOOR, 1)),
+            (256, 2, (STREAM_FLOOR, 2)),
+            (256, 1, (STREAM_FLOOR / 2, 2)),
+            (128, 2, (STREAM_FLOOR / 2, 4)),
+            (1, 1, (1, unit)),
+        ] {
+            assert_eq!(
+                stream_price(cut, members),
+                want,
+                "cut {cut}, {members} members"
+            );
+        }
     }
 
     /// The cut is refused by name, with its value, unless it is from 1 to
