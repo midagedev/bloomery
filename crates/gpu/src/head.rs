@@ -1430,7 +1430,11 @@ mod tests {
             .expect("the gain resident");
         let host = HostHead::open(Arc::clone(&split), EPS).expect("a host head");
         let mut head = Head::host(&gpu, host).expect("a host head");
-        assert_eq!((head.hidden(), head.n_vocab()), (K, N_VOCAB));
+        assert_eq!(
+            (head.hidden(), head.n_vocab()),
+            (K, N_VOCAB),
+            "the host head takes its width from the gain and its vocabulary from the rows"
+        );
         let x: Vec<f32> = (0..K)
             .map(|i| ((i * 37 % 101) as f32 - 50.0) / 25.0)
             .collect();
@@ -1449,7 +1453,11 @@ mod tests {
             );
         }
         let logits = head.logits_to_host(&gpu).expect("the logits");
-        assert_eq!(logits.len(), N_VOCAB);
+        assert_eq!(
+            logits.len(),
+            N_VOCAB,
+            "one logit a row of the file's output tensor"
+        );
         let row_bytes = K / 256 * Q6K_BLOCK;
         let mut wv = vec![0.0f32; K];
         for (r, &got) in logits.iter().enumerate() {
@@ -1471,8 +1479,16 @@ mod tests {
             );
         }
         let best = (0..N_VOCAB).fold(0, |b, i| if logits[i] > logits[b] { i } else { b });
-        assert_eq!(head.token(&gpu).expect("the token") as usize, best);
-        assert_eq!(head.tokens(&gpu).expect("the tokens"), vec![best as u32]);
+        assert_eq!(
+            head.token(&gpu).expect("the token") as usize,
+            best,
+            "the token is the first largest logit of the row the host read back"
+        );
+        assert_eq!(
+            head.tokens(&gpu).expect("the tokens"),
+            vec![best as u32],
+            "a one-row head has one token, the same pick"
+        );
         assert!(
             head.copy_tokens(&gpu).is_err(),
             "a host head has no readback words on the card"
@@ -1484,18 +1500,37 @@ mod tests {
     /// logit that is not finite is refused by name rather than ranked.
     #[test]
     fn the_host_argmax_is_the_first_largest_and_refuses_a_non_finite_logit() {
-        assert_eq!(host_argmax(&[1.0, 3.0, 2.0, 3.0, -1.0]).unwrap(), 1);
-        assert_eq!(host_argmax(&[-4.0, -2.0, -3.0, -2.0]).unwrap(), 1);
-        assert_eq!(host_argmax(&[0.0; 5]).unwrap(), 0);
-        assert_eq!(host_argmax(&[7.0]).unwrap(), 0);
+        assert_eq!(
+            host_argmax(&[1.0, 3.0, 2.0, 3.0, -1.0]).unwrap(),
+            1,
+            "the first of two equal maxima wins"
+        );
+        assert_eq!(
+            host_argmax(&[-4.0, -2.0, -3.0, -2.0]).unwrap(),
+            1,
+            "an all-negative row ranks by value, ties to the first"
+        );
+        assert_eq!(
+            host_argmax(&[0.0; 5]).unwrap(),
+            0,
+            "a flat row is a tie of every index, the first wins"
+        );
+        assert_eq!(
+            host_argmax(&[7.0]).unwrap(),
+            0,
+            "a one-logit row has one index to name"
+        );
         for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             let err = host_argmax(&[1.0, bad, 2.0]).unwrap_err().to_string();
             assert!(
                 err.contains("logit 1") && err.contains("non-finite"),
-                "{bad}: {err}"
+                "{bad} must be refused naming its index and that it is not finite: {err}"
             );
         }
-        assert!(host_argmax(&[]).is_err());
+        assert!(
+            host_argmax(&[]).is_err(),
+            "an empty row has no largest logit to name"
+        );
     }
 
     /// A host head of a file that lacks a tensor or whose tensors disagree on the width is
@@ -1517,14 +1552,17 @@ mod tests {
         let no_gain = open("host-head-no-gain", &[head(K as u64)]).expect("a refusal");
         assert!(
             no_gain.contains("output_norm.weight") && no_gain.contains("in the file"),
-            "{no_gain}"
+            "a file without the gain is refused naming it and where it was looked for: {no_gain}"
         );
         let no_out = open(
             "host-head-no-out",
             &[("output_norm.weight", vec![K as u64], GgmlType::F32, &gain)],
         )
         .expect("a refusal");
-        assert!(no_out.contains(HEAD_TENSOR), "{no_out}");
+        assert!(
+            no_out.contains(HEAD_TENSOR),
+            "a file without the output rows is refused naming them: {no_out}"
+        );
         let wide = open(
             "host-head-wide",
             &[
@@ -1541,7 +1579,7 @@ mod tests {
         assert!(
             wide.contains(&format!("{K} values wide"))
                 && wide.contains(&format!("gain is {}", K / 2)),
-            "{wide}"
+            "a gain of another width than the rows is refused naming both widths: {wide}"
         );
         let whole = open(
             "host-head-whole",

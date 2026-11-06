@@ -82,7 +82,7 @@ pub use rule::{
     ExpertPart, HostOnly, LegPair, RoutedFormat, RoutedRule, per_expert, routed_row, routed_row_on,
     whole_on_card,
 };
-pub use table::{CardTotals, HostTotals, Plan, Row, Segment, Span, union_plan};
+pub use table::{CardTotals, HeadSite, HostTotals, Plan, Row, Segment, Span, union_plan};
 
 use machine::NoKv;
 use planner::{check_devices, check_tiers};
