@@ -1,0 +1,36 @@
+# k31quant. The K3.1 quantize run: llama-quantize --allow-requantize over the 1.56 TB K3-shaped set, the tight map (routed experts IQ1_S
+# with the imatrix, the trunk Q4_K_M, token_embd Q4_K, output Q6_K, norms F32). No lease and no hold: the run is not a measurement, the
+# lead schedules timed runs around it, and the runner holds its own lock (/root/k31quant/run.lock) and runs under nice and ionice.
+#
+# Bytes per class [derived: llama-quantize --dry-run over K3's 2573 tensor shapes, the tool's own plan, no data read; K3.1 has K3's
+# shapes (k31 report) plus 120 indexer tensors, 0.357 GB BF16 that the splice adds; the HF index of K3.1 is not on the box yet]:
+#   map            experts (276, IQ1_S)  trunk (1114)            embedding  head   small F32  total      with the indexer
+#   tight          531.79 GB             31.70 GB (Q4_K 941,     0.66 GB    0.96   2.61 GB    567.72 GB  568.08 GB
+#                                         Q6_K 80, Q8_0 93)       (Q4_K)     (Q6_K)
+#   trunk-q5       531.79 GB             37.74 GB (Q5_K 941,     0.66 GB    0.96   2.61 GB    573.76 GB  574.12 GB
+#                                         Q6_K 80, Q8_0 93)
+#   K3 UD-IQ1_S    489.40 + 55.95 GB     45.8 GB (Q6_K) + 0.28   (in the trunk's Q6_K)            2.61 GB    594.03 GB  (the comparison)
+# The trunk target (<= 35 GB) holds for tight (31.70) and not for trunk-q5 (37.74): the fallback is a deliberate step up, --max-trunk-gb 0.
+# The Q8_0 93 are attn_k_b (24) and ssm_f_b (69), whose rows are not a K-quant block's width or whose size makes Q8_0 free (0.28 GB); the
+# 69 ssm_beta stay F32 (2.6 GB with the norms): a rule each, the rest is the global type's own mix (Q6_K on 80 of the attention-v-like
+# and ffn_down tensors).
+#
+# The wall [derived]: expert weights 2.72274e12 / (40 effective threads x R) + read 1.56 TB / 1.6 GB/s (975 s) + write 568 GB / 1.5 GB/s
+# (379 s). R = 5.4 Mweights/s/thread is the smoke's measurement on 1 thread (5.36, 4.72 Mweights in 881 ms with the 152 MB read and write
+# inside it, so a lower bound at 1 thread); the 40-thread scaling is the unmeasured term. 12.6 ks + 1.35 ks = 13.96 ks = 3.9 h; R in
+# 3..6 gives 6.7 h .. 3.5 h. The run's own progress file (every 120 s) prices the real rate in the first hour.
+kind: calibration
+question: what total rate in Mweights/s does llama-quantize reach on 64 threads over K3.1's MXFP4 expert tensors to IQ1_S with an imatrix?
+term: Mweights/s over the first 60 minutes of the quantize run, from the runner's progress file ($K3Q_WORK/quantize.progress: tensors converted
+  so far, each routed-expert tensor 3584 x 3072 x 896 = 9.86e9 weights), llama-quantize of mainline 78feec062, 64 threads, CPU only, the
+  tight map, --keep-split, imatrix of 4 chunks at ctx 2048
+unit: Mweights/s
+predict: 120..260
+condition: the run holds /root/k31quant/run.lock for its whole window and runs under nice -n 10 and ionice -c2 -n7; the lead keeps timed runs and
+  heavy jobs off the box for the window, so the rate is the quantizer's, not a contended one; the first 3 dense tensors are not experts
+reason: sets the quantize step's bound (three times its predicted wall) and the box queue's predicted wall (BLOOMERY_Q_PRED_S) for the
+  1.56 TB set; the 1-thread figure of the smoke is 5.4 Mweights/s/thread, so 40 effective threads give 216
+decide-in: the run continues to its end (about 4 h); the IQ2_XXS run (every expert IQ2_XXS) is priced from the same rate
+decide-below: below 120 Mweights/s the run is over 7 h: look at the thread count and the nice/ionice share against a peer job, and split the
+  quantize in two runs by layer range before restarting (the quantizer is not resumable inside a run)
+decide-above: above 260 Mweights/s the run is under 3.3 h: keep it, and queue the trunk-q5 and IQ2_XXS runs in the same sitting

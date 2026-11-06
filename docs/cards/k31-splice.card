@@ -1,0 +1,7 @@
+# k31quant. The splice: gguf-splice.py add over the quantized K3-shaped set (about 594 GB, 14 shards): the first shard rewritten, the
+# receiving shard (the last, ~48 GB) read, written and read back for verification, the others hard links. [derived] 48e9 x 2 / 1.6e9 +
+# 48e9 / 1.5e9 + 5 s = 97 s on the NVMe, so 1.5..5 min. It needs the lease only to keep every other job off /models while it runs.
+kind: exclusive
+reason: the splice reads and writes 150 GB on the one NVMe that holds every model; the runner takes no lease for it (its own lock only),
+  so this card states the prediction (the wall and bytes are in the runner's log); a timed run beside it would read slower. It measures nothing.
+minutes: 2..5

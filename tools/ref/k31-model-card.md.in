@@ -1,0 +1,66 @@
+---
+license: other
+license_name: kimi-k3.1-pro
+license_link: LICENSE
+base_model: moonshotai/Kimi-K3.1-Pro
+base_model_relation: quantized
+tags:
+- gguf
+- bloomery
+- kimi-k3.1
+---
+
+# @NAME@
+
+A low-bit GGUF of [moonshotai/Kimi-K3.1-Pro](https://huggingface.co/moonshotai/Kimi-K3.1-Pro), made to run on one workstation with
+[bloomery](https://github.com/midagedev/bloomery). The license is the base model's: the `LICENSE` file in this repository is the
+source repository's own.
+
+## Read this first
+
+- **The architecture word is `@ARCH@`. llama.cpp does not load this file; only bloomery does.** Mainline llama.cpp has no K3.1
+  graph. The file is not a drop-in for any other runtime.
+- **The DSA indexer tensors are kept in BF16, unquantized.** K3.1 adds a lightning indexer to @INDEXER_COUNT@ attention layers
+  (blocks @INDEXER_LAYERS@). Those tensors are small and stay as the source has them. Every other tensor is as the map below says.
+- No quality numbers are published with this file yet.
+
+## Type map
+
+Map `@MAP@`: the routed experts are @EXPERT_TYPE@ (with an importance matrix), the trunk follows the global type @QTYPE@ except
+where the rules below name a type, the token embedding is Q4_K, the output head Q6_K, and the norms and scores stay F32 as in the source.
+
+@CLASS_TABLE@
+
+Total: @TOTAL_GB@ GB (10^9 bytes), in the shards below.
+
+The rules passed to `llama-quantize --tensor-type-file` (the first matching rule wins):
+
+```
+@RULES@
+```
+
+and the flags of the run (the paths are the maker's):
+
+```
+@QUANT_FLAGS@
+```
+
+## How it was made
+
+1. The checkpoint (`moonshotai/Kimi-K3.1-Pro`, revision `@SOURCE_REV@`) was converted to a GGUF in the shape of Kimi K3, the
+   experts kept as MXFP4 blocks as the checkpoint stores them, and **without** the indexer tensors, so that mainline llama.cpp's
+   `kimi-k3` loader accepts it.
+2. The importance matrix was computed with `llama-imatrix` over @IMATRIX_CHUNKS@ chunks of @IMATRIX_CTX@ tokens (@IMATRIX_TOKENS@
+   tokens in all), on the CPU. At a context of at most 2048 positions the DSA selection (top-k 2048) keeps every position, so the K3
+   graph computes K3.1 exactly there; that is why the K3-shaped file can stand in for it. The calibration text: @IMATRIX_CORPUS@
+   It is small and narrow (English technical documents and C++ source); it is not a general-purpose calibration set.
+3. `llama-quantize` (mainline llama.cpp, with `--allow-requantize` for the MXFP4 source) wrote the K3-shaped quantized set.
+4. `gguf-splice.py` put the indexer tensors back (BF16, as `prepare` wrote them from the checkpoint), renamed the architecture word
+   and its keys to `@ARCH@`, and added the `@ARCH@.attention.indexer.*` keys. Every other tensor's bytes are the quantizer's, copied
+   and checked by sha256.
+
+Tools: @TOOLS@
+
+## Shards
+
+@SHARD_TABLE@
