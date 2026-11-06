@@ -3,15 +3,16 @@
 //! ModelOpt writes `hf_quant_config.json`: `quant_algo`, the per-module `quantized_layers` of a
 //! MIXED_PRECISION export and `exclude_modules` globs. transformers' `fp8` (`config.json`
 //! `quantization_config`) gives `weight_block_size` and `modules_to_not_convert`;
-//! compressed-tensors gives `config_groups` and `ignore`; the `mxfp8` method gives MXFP8 to every
-//! module outside `ignored_layers` and, with `moe_quant_algo`, NVFP4 pack-quantized
-//! ([`Format::Nvfp4Ct`]) to the routed experts. MLX's own block (`config.json` `quantization`,
-//! what mlx-lm's convert writes, with a verbatim copy at `quantization_config`) gives
-//! `group_size`, `bits`, `mode` and per-module `{group_size, bits, mode}` overrides keyed as the
-//! tensor names minus `.weight`, and `false` for a module it left unquantized. [`Config`] reads
-//! them into the formats each module is declared, and [`plan`] gives every tensor of a checkpoint
-//! one [`Format`]: each weight's stored tensors (dtype, shape and companion scales) are matched
-//! against the formats its module is declared.
+//! compressed-tensors gives `config_groups` and `ignore` (its `pack-quantized` int4 and its
+//! `mxfp4-pack-quantized` of group 32 with U8 E8M0 scales, read as [`Format::Mxfp4`]); the `mxfp8`
+//! method gives MXFP8 to every module outside `ignored_layers` and, with `moe_quant_algo`, NVFP4
+//! pack-quantized ([`Format::Nvfp4Ct`]) to the routed experts. MLX's own block (`config.json`
+//! `quantization`, what mlx-lm's convert writes, with a verbatim copy at `quantization_config`)
+//! gives `group_size`, `bits`, `mode` and per-module `{group_size, bits, mode}` overrides keyed as
+//! the tensor names minus `.weight`, and `false` for a module it left unquantized. [`Config`]
+//! reads them into the formats each module is declared, and [`plan`] gives every tensor of a
+//! checkpoint one [`Format`]: each weight's stored tensors (dtype, shape and companion scales)
+//! are matched against the formats its module is declared.
 //!
 //! A BF16, F16 or F32 tensor is placed as stored: configs quantize linears, and a tensor table cannot
 //! tell a linear from a norm. A quantized weight whose module the config leaves unquantized, or
@@ -868,6 +869,17 @@ impl Other {
                         .as_u64()
                         .filter(|&g| g > 0)
                         .map(|g| Format::Int4Pack { group: g as usize })
+                }
+                // OCP MXFP4 pack-quantized: E2M1 pairs in a U8 `weight_packed`, one E8M0 U8
+                // `weight_scale` a 32 values, no tensor scale.
+                ("mxfp4-pack-quantized", Some(4), Some("float"), Some("group"))
+                    if field("symmetric") == Value::Bool(true)
+                        && field("group_size").as_u64() == Some(32)
+                        && matches!(field("dynamic"), Value::Null | Value::Bool(false))
+                        && (field("scale_dtype") == Value::Null
+                            || field("scale_dtype").as_str() == Some("torch.uint8")) =>
+                {
+                    Some(Format::Mxfp4)
                 }
                 _ => None,
             };
@@ -2163,6 +2175,127 @@ mod tests {
                 None
             );
         }
+    }
+
+    /// Kimi K3.1's `quantization_config`, as the checkpoint writes it: one group of OCP MXFP4,
+    /// symmetric, E2M1 over groups of 32 with U8 scales, on every `Linear` outside the ignore list.
+    fn kimi_k31_quantization() -> Value {
+        serde_json::json!({
+            "config_groups": { "group_0": {
+                "format": "mxfp4-pack-quantized", "input_activations": null,
+                "output_activations": null, "targets": ["Linear"],
+                "weights": { "actorder": null, "block_structure": null, "dynamic": false,
+                    "group_size": 32, "num_bits": 4, "observer": "minmax", "observer_kwargs": {},
+                    "scale_dtype": "torch.uint8", "strategy": "group", "symmetric": true,
+                    "type": "float", "zp_dtype": null } } },
+            "format": "mxfp4-pack-quantized", "global_compression_ratio": null,
+            "ignore": ["re:.*self_attn.*", "re:.*block_sparse_moe\\.gate$", "re:.*lm_head.*"],
+            "kv_cache_scheme": null, "quant_method": "compressed-tensors",
+            "quantization_status": "compressed" })
+    }
+
+    /// compressed-tensors `mxfp4-pack-quantized` (Kimi K3.1's routed experts) is [`Format::Mxfp4`]:
+    /// a U8 `weight_packed` `[rows, k/2]` beside a U8 `weight_scale` `[rows, k/32]` of one E8M0 a
+    /// 32 values, claimed with it; an ignored module's BF16 weight stays as stored. Every other
+    /// group of the format, and a scale of another shape or dtype, is refused by name.
+    /// Mutants: the arm dropped, `group_size` unchecked, `symmetric` unchecked, `scale_dtype`
+    /// unchecked.
+    #[test]
+    fn mxfp4_pack_quantized_is_ocp_mxfp4() {
+        use Dtype::*;
+        let config = |q: Value| {
+            Config::parse(
+                &serde_json::json!({ "text_config": {
+            "quantization_config": q } }),
+                None,
+            )
+        };
+        let ct = config(kimi_k31_quantization()).unwrap();
+        let tensors: &[(&str, Dtype, &[usize])] = &[
+            (
+                "l.block_sparse_moe.experts.0.w1.weight_packed",
+                U8,
+                &[8, 32],
+            ),
+            ("l.block_sparse_moe.experts.0.w1.weight_scale", U8, &[8, 2]),
+            // A scale of another dtype, and one of another shape.
+            (
+                "l.block_sparse_moe.experts.1.w1.weight_packed",
+                U8,
+                &[8, 32],
+            ),
+            ("l.block_sparse_moe.experts.1.w1.weight_scale", F32, &[8, 2]),
+            (
+                "l.block_sparse_moe.experts.2.w1.weight_packed",
+                U8,
+                &[8, 32],
+            ),
+            ("l.block_sparse_moe.experts.2.w1.weight_scale", U8, &[8, 4]),
+            ("l.self_attn.q_proj.weight", Bf16, &[8, 64]),
+            ("l.block_sparse_moe.gate.weight", Bf16, &[4, 64]),
+        ];
+        let linear = |module: &str| module.contains(".experts.").then_some(ModuleClass::Linear);
+        let p = plan(&ct, tensors.iter().copied(), linear);
+        let w1 = &p.placed["l.block_sparse_moe.experts.0.w1.weight_packed"];
+        assert_eq!(w1.format, Format::Mxfp4);
+        assert_eq!(
+            w1.companions,
+            ["l.block_sparse_moe.experts.0.w1.weight_scale"]
+        );
+        assert!(
+            !p.refused
+                .contains_key("l.block_sparse_moe.experts.0.w1.weight_scale")
+        );
+        for e in [1, 2] {
+            let why = &p.refused[&format!("l.block_sparse_moe.experts.{e}.w1.weight_packed")];
+            assert!(why.contains("fits none of [\"MXFP4-OCP\"]"), "{why}");
+        }
+        assert_eq!(p.placed["l.self_attn.q_proj.weight"].format, Format::Bf16);
+        assert_eq!(
+            p.placed["l.block_sparse_moe.gate.weight"].format,
+            Format::Bf16
+        );
+        // The scale's dtype may also be the E8M0 float type.
+        let p = plan(
+            &ct,
+            [
+                ("m.experts.0.w.weight_packed", U8, &[8, 32][..]),
+                ("m.experts.0.w.weight_scale", F8E8M0, &[8, 2][..]),
+            ],
+            linear,
+        );
+        assert_eq!(
+            p.placed["m.experts.0.w.weight_packed"].format,
+            Format::Mxfp4
+        );
+
+        let mutated = |key: &str, value: Value| {
+            let mut q = kimi_k31_quantization();
+            q["config_groups"]["group_0"]["weights"][key] = value;
+            config(q)
+        };
+        for (key, value) in [
+            ("group_size", serde_json::json!(16)),
+            ("group_size", Value::Null),
+            ("symmetric", serde_json::json!(false)),
+            ("scale_dtype", serde_json::json!("torch.float8_e8m0fnu")),
+            ("scale_dtype", serde_json::json!(8)),
+            ("dynamic", serde_json::json!(true)),
+            ("num_bits", serde_json::json!(8)),
+            ("type", serde_json::json!("int")),
+            ("strategy", serde_json::json!("tensor_group")),
+        ] {
+            let e = mutated(key, value.clone()).unwrap_err().to_string();
+            assert!(
+                e.contains("compressed-tensors group_0: mxfp4-pack-quantized weights")
+                    && e.contains("are not a format this reader places"),
+                "{key} {value}: {e}"
+            );
+        }
+        // A scale dtype left out is the format's own default, U8.
+        let mut q = kimi_k31_quantization();
+        q["config_groups"]["group_0"]["weights"]["scale_dtype"] = Value::Null;
+        config(q).unwrap();
     }
 
     #[test]

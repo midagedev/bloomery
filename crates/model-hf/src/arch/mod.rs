@@ -8,6 +8,7 @@ use crate::folder::{self, FolderMap};
 
 pub mod deepseek41;
 pub mod glm5next;
+pub mod kimi_k3;
 pub mod lfm3;
 pub mod llama;
 pub mod minimaxm3;
@@ -63,6 +64,11 @@ pub const MAPS: &[MapRow] = &[
         open: folder::open_as::<nemotron_h::Checkpoint>,
         architecture: folder::architecture_as::<nemotron_h::Checkpoint>,
     },
+    MapRow {
+        model_types: <kimi_k3::Checkpoint as FolderMap>::MODEL_TYPES,
+        open: folder::open_as::<kimi_k3::Checkpoint>,
+        architecture: folder::architecture_as::<kimi_k3::Checkpoint>,
+    },
 ];
 
 /// A program's work with one folder map `M`, which [`with_split_map`] picks by the folder's
@@ -81,6 +87,7 @@ pub fn split_model_types() -> Vec<&'static str> {
     [
         <qwen35moe::Checkpoint as FolderMap>::MODEL_TYPES,
         <qwen3moe::Checkpoint as FolderMap>::MODEL_TYPES,
+        <kimi_k3::Checkpoint as FolderMap>::MODEL_TYPES,
     ]
     .concat()
 }
@@ -92,6 +99,8 @@ pub fn with_split_map<U: MapUse>(model_type: &str, user: U) -> Option<U::Out> {
         Some(user.with::<qwen35moe::Checkpoint>())
     } else if <qwen3moe::Checkpoint as FolderMap>::MODEL_TYPES.contains(&model_type) {
         Some(user.with::<qwen3moe::Checkpoint>())
+    } else if <kimi_k3::Checkpoint as FolderMap>::MODEL_TYPES.contains(&model_type) {
+        Some(user.with::<kimi_k3::Checkpoint>())
     } else {
         None
     }
