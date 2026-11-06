@@ -1692,12 +1692,17 @@ fn plain_append<'a>(
     left: usize,
 ) -> Result<[usize; 2], Error> {
     let raw = get(name)?;
-    let &[rows, k] = raw.shape else {
-        return Err(Error::Format {
-            name: name.to_string(),
-            format: placed.format,
-            what: format!("shape {:?}, not [rows, k]", raw.shape),
-        });
+    // A vector is a matrix of one row, so a norm `[k]` stacks with a projection `[1, k]`.
+    let (rows, k) = match *raw.shape {
+        [rows, k] => (rows, k),
+        [k] => (1, k),
+        _ => {
+            return Err(Error::Format {
+                name: name.to_string(),
+                format: placed.format,
+                what: format!("shape {:?}, not [rows, k] or [k]", raw.shape),
+            });
+        }
     };
     finite(name, &raw)?;
     plain_values(name, &raw, plain, out, left)?;
@@ -4618,5 +4623,42 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_vector_stacks_as_a_matrix_of_one_row() {
+        let norm: Vec<f32> = (0..32).map(|i| i as f32 * 0.25 - 3.0).collect();
+        let proj: Vec<f32> = (0..32).map(|i| 1.0 - i as f32 * 0.125).collect();
+        let bytes = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let (n, p) = (bytes(&norm), bytes(&proj));
+        let file = write(&[
+            ("n.weight", "F32", &[32][..], &n[..]),
+            ("p.weight", "F32", &[1, 32], &p),
+            ("m.weight", "F32", &[2, 2, 8], &n),
+        ]);
+        let st = Safetensors::parse(file).unwrap();
+        let get = |name: &str| st.raw(name);
+        let plain = Placed {
+            format: Format::F32,
+            companions: vec![],
+        };
+        let pair = [("n.weight", &plain), ("p.weight", &plain)];
+        let stack = normalize(get, &pair, Use::Matrix(Plain::F32)).unwrap();
+        assert_eq!(
+            (stack.type_id, &stack.dims, &stack.bytes),
+            (0, &vec![32, 1, 2], &[&n[..], &p].concat())
+        );
+        let alone = normalize(get, &pair[..1], Use::Matrix(Plain::F32)).unwrap();
+        assert_eq!((&alone.dims, &alone.bytes), (&vec![32], &n));
+        let e = normalize(
+            get,
+            &[("m.weight", &plain), pair[1]],
+            Use::Matrix(Plain::F32),
+        )
+        .unwrap_err();
+        assert!(
+            e.to_string().contains("m.weight") && e.to_string().contains("not [rows, k] or [k]"),
+            "{e}"
+        );
     }
 }
