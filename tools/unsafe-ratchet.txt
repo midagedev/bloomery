@@ -836,7 +836,10 @@ gguf 7 2 0
 # one extra `shared_module!` block the index-key loader's split into the common input form and V4.1's compressor
 # form needs (+1 block in total); each with its SAFETY line or `# Safety` contract.
 # Both land together: 3036 + 5 + 43 = 3084 blocks, 421 fns.
-gpu 3084 421 10
+# PIN(2026-11-07): gpu 3084 -> 3093 blocks, 421 -> 423 fns, new code, not old code relaxed: the IQ1_S/IQ2_XXS card quantizer
+# (crates/gpu/src/iq_quant.rs: the two unchecked table readers `byte_at` and `mxfp4_value`, the three kernel bodies' reads
+# and stores, and the shared-module load), each with its SAFETY line or `# Safety` contract.
+gpu 3093 423 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -1192,6 +1195,7 @@ placement 0 0 0
 # ik's mul_mat_iq1_m_q8_K (its pack, block step, one-column dot and column tile, each a target_feature AVX2 fn) and
 # the IQ1_S wide tile (its group walk and the column-pointer fill it shares with IQ2_XXS's).
 qdot 281 132 0
+quantize 0 0 0
 record 0 0 0
 refset 0 0 0
 runtime 0 0 0

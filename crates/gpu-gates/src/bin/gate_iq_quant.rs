@@ -222,7 +222,7 @@ mod clauses {
     fn kvs(shard: u16, count: u16, tensors: i32) -> Vec<(String, Value)> {
         vec![
             (
-                "general.architecture".to_string(),
+                gguf::GENERAL_ARCHITECTURE.to_string(),
                 Value::String("kimi-k3".to_string()),
             ),
             ("kimi-k3.block_count".to_string(), Value::U32(2)),
@@ -563,7 +563,7 @@ mod clauses {
         let first_card = shard_files(&out_card)[0].clone();
         let ok = verify_set(oracle_bin, dir, &fix, &first_card)?;
         println!(
-            "{} set: bloomery-quantize over two shards (MXFP4, BF16 and F16 stacks, --check 5, the llama plan): metadata, names, dims and the F32 copy equals the input, the stacks equal ggml, the trunk weight equals the host K-quant rule",
+            "{} set: bloomery-quantize over two shards (MXFP4, BF16 and F16 stacks, --check 5, the llama.cpp plan): metadata, names, dims and the F32 copy equals the input, the stacks equal ggml, the trunk weight equals the host K-quant rule",
             verdict(ok)
         );
         all &= ok;
@@ -701,7 +701,10 @@ mod clauses {
             ]),
         )?;
         for (plan, want) in [
-            (&short, "the llama plan names 2 tensors, the set holds 6"),
+            (
+                &short,
+                "the llama.cpp plan names 2 tensors, the set holds 6",
+            ),
             (
                 &other,
                 "blk.0.ffn_gate_exps.weight: llama-quantize's plan says IQ2_XXS",
@@ -816,7 +819,7 @@ mod clauses {
             let dims = vec![ne0 as u64, ne1 as u64, n_exp as u64];
             let kv = vec![
                 (
-                    "general.architecture".to_string(),
+                    gguf::GENERAL_ARCHITECTURE.to_string(),
                     Value::String("kimi-k3".to_string()),
                 ),
                 ("kimi-k3.block_count".to_string(), Value::U32(1)),
@@ -860,7 +863,7 @@ mod clauses {
             ok &= one;
         }
         println!(
-            "{} refusals: a short or disagreeing llama plan, Inf and NaN rows of every source type, an MXFP4 scale byte of 255, a negative or Inf importance sum or count and an uncovered source type each end at 1 by name with no file left",
+            "{} refusals: a short or disagreeing llama.cpp plan, Inf and NaN rows of every source type, an MXFP4 scale byte of 255, a negative or Inf importance sum or count and an uncovered source type each end at 1 by name with no file left",
             verdict(ok)
         );
         Ok(ok)
@@ -918,7 +921,7 @@ mod clauses {
         let tool = tool()?;
         let work = dir.join("e2e");
         std::fs::create_dir_all(&work)?;
-        let llama = |args: &[&OsStr]| -> Result<(), GateError> {
+        let lcpp = |args: &[&OsStr]| -> Result<(), GateError> {
             let r = run_cmd(&lq, &os(args), true)?;
             if r.code == Some(0) {
                 return Ok(());
@@ -952,7 +955,7 @@ mod clauses {
             "Q4_K_M".as_ref(),
             "16".as_ref(),
         ]);
-        llama(&a)?;
+        lcpp(&a)?;
         // the stand-in's routed stacks, and an imatrix over them
         let standin = gguf::Gguf::open(&src)?;
         let stacks: Vec<(String, u64, u64)> = standin
@@ -1022,7 +1025,7 @@ mod clauses {
                 "Q4_K_M".as_ref(),
                 "16".as_ref(),
             ]);
-            llama(&a)
+            lcpp(&a)
         };
         run_llama(&src, &out_a)?;
         let mut ours: Vec<&OsStr> = vec![

@@ -184,7 +184,7 @@ impl Plan {
     pub fn build(
         set: &gguf::Split,
         rules: &Rules,
-        llama: Option<&LlamaPlan>,
+        lcpp: Option<&LlamaPlan>,
         im: Option<&Imatrix>,
         a: &Args,
     ) -> Result<Plan> {
@@ -228,7 +228,7 @@ impl Plan {
             shards[if a.keep_split { *shard } else { 0 }].push(i);
             items.push(item);
         }
-        if let Some(lp) = llama {
+        if let Some(lp) = lcpp {
             cross_check(&items, lp)?;
         }
         let outs = out_names(a, n_split);
@@ -509,7 +509,7 @@ fn cross_check(items: &[Item], lp: &LlamaPlan) -> Result<()> {
                 .take(3)
                 .collect();
         return Err(Error::refused(format!(
-            "the llama plan names {} tensors, the set holds {}; plan rows the set does not hold: {missing:?}",
+            "the llama.cpp plan names {} tensors, the set holds {}; plan rows the set does not hold: {missing:?}",
             lp.0.len(),
             items.len()
         )));
@@ -517,7 +517,7 @@ fn cross_check(items: &[Item], lp: &LlamaPlan) -> Result<()> {
     for it in items {
         let Some((lty, ldims, lbytes)) = lp.0.get(&it.name) else {
             return Err(Error::refused(format!(
-                "the llama plan has no row for {}",
+                "the llama.cpp plan has no row for {}",
                 it.name
             )));
         };

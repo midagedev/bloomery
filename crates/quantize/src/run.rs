@@ -83,7 +83,7 @@ pub fn prepare(a: &Args) -> Result<Prepared> {
         }
         None => Rules::parse("")?,
     };
-    let llama = a
+    let lcpp = a
         .llama_plan
         .as_ref()
         .map(|p| LlamaPlan::parse(&text(p)?, &p.display().to_string()))
@@ -91,7 +91,7 @@ pub fn prepare(a: &Args) -> Result<Prepared> {
     let set = gguf::Split::open(&a.first)
         .map_err(|e| Error::refused(format!("{}: {e}", a.first.display())))?;
     let im = a.imatrix.as_deref().map(Imatrix::open).transpose()?;
-    let plan = Plan::build(&set, &rules, llama.as_ref(), im.as_ref(), a)?;
+    let plan = Plan::build(&set, &rules, lcpp.as_ref(), im.as_ref(), a)?;
     Ok(Prepared { set, im, plan })
 }
 

@@ -691,3 +691,7 @@ generate_ds41   sigmoid_floor_256_6_router               0           0
 generate_ds41   sigmoid_floor_256_6_router_pick          0           0
 # PIN(2026-11-06): attn_res_mix, a new entry (Kimi K3's AttnRes bank mix), at 0 spill and 0 JIT local bytes [derived: the sm_86 cc 8.6 scan's 0/0 (tools/ref/ptx-shapes.tsv)], until a scan on this table's arch and capability.
 generate_ds41 attn_res_mix 0 0
+# PIN(2026-11-07): the IQ1_S/IQ2_XXS card quantizer's three entries (iq_quant_finish, iq_quant_subs, iq_src_f32) at the cc 8.6 scan's values (tools/ref/ptx-shapes.tsv, ptxas 13.3.73 sm_86: 0 spill; JIT local 280, 1096, 0 B), not measured on cc 12.1 (the table's card) until a GB10 scan runs.
+generate_ds41 iq_quant_finish 0 280
+generate_ds41 iq_quant_subs 0 1096
+generate_ds41 iq_src_f32 0 0

@@ -1,4 +1,7 @@
-use super::*;
+use gguf::quant::GgmlType;
+use quantize::Result;
+use quantize::resolve::{Ftype, Model, Options, TensorRef, layer_of, resolve};
+use quantize::rules::Rules;
 
 const M8: Model = Model {
     n_layer_all: 8,

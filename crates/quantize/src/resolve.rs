@@ -444,6 +444,3 @@ pub fn resolve(
     }
     Ok(out)
 }
-
-#[cfg(test)]
-mod tests;
