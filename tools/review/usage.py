@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Token and tool accounting for one review bot run, from Claude Code's stream-json transcript or Codex's JSONL events.
+"""Token and tool accounting for one review bot run, from Claude Code's stream-json transcript (the claude and glm
+engines) or Codex's JSONL events.
 
-    tools/review/usage.py ROLE TRANSCRIPT.ndjson OUT.json [claude|codex]
+    tools/review/usage.py ROLE TRANSCRIPT.ndjson OUT.json [glm|claude|codex]
     tools/review/usage.py --self-test
 
 Writes OUT.json and prints one line. The fields are what a later optimization needs: the engine, how the run ended,
@@ -11,7 +12,10 @@ the files read most often with how many times; the last error message, whole (to
 credentials from it before it shortens it). A Codex stream (`codex exec --json`) reports only the turn's summed tokens
 and no cost (a ChatGPT login has no per-run price), so its requests, context_max, turns, cost and reads are None; its
 tools are the item types, and a command the sandbox refused counts as a denial. Without ENGINE, a stream with Codex's
-thread or turn events is Codex's. Exit 1 when the transcript has no result event (Codex: no completed turn) or the
+thread or turn events is Codex's. A glm stream (Claude Code on z.ai) streams every request's usage as zeros and
+holds the run's totals only in its result, so its context_max is None and its context_sum the result's total, and its
+cost_usd is None: the CLI's figure is its own price list applied to a model it does not know, and the plan is billed in
+prompts, not tokens. Exit 1 when the transcript has no result event (Codex: no completed turn) or the
 result is an error; OUT.json is written either way.
 """
 
@@ -127,15 +131,17 @@ def summarize(role, lines, engine=None):
     r = result or {}
     u = r.get("usage") or {}
     is_error = bool(r.get("is_error", result is None))
+    total = sum(u.get(k) or 0 for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+    unreported = bool(contexts) and not any(contexts) and total > 0
     return {
         "role": role,
-        "engine": "claude",
+        "engine": engine or "claude",
         "subtype": r.get("subtype", "no-result"),
         "is_error": is_error,
         "error": (str(r.get("result") or "") or None) if is_error else None,
         "num_turns": r.get("num_turns"),
         "duration_ms": r.get("duration_ms"),
-        "cost_usd": r.get("total_cost_usd"),
+        "cost_usd": None if engine == "glm" else r.get("total_cost_usd"),
         "tokens": {
             "input": u.get("input_tokens"),
             "cache_read": u.get("cache_read_input_tokens"),
@@ -143,8 +149,8 @@ def summarize(role, lines, engine=None):
             "output": u.get("output_tokens"),
         },
         "requests": len(contexts),
-        "context_max": max(contexts, default=0),
-        "context_sum": sum(contexts),
+        "context_max": None if unreported else max(contexts, default=0),
+        "context_sum": total if unreported else sum(contexts),
         "tools": dict(tools.most_common()),
         "tool_calls": sum(tools.values()),
         "denied": denied,
@@ -209,13 +215,28 @@ def self_test():
                                         "`m` and will be omitted from requests."}
     ct = summarize("reviewer", [json.dumps(e) for e in cx[:2] + [{"type": "item.completed", "item": tier}] + cx[2:]])
     assert ct["is_error"] and ct["subtype"] == "error" and "`bo\ngus`" in ct["error"], ct
+    # z.ai through Claude Code: every request's usage streams as zeros, the totals are in the result, and the cost is
+    # the CLI's guess. The same stream under the claude label keeps that cost; real per-request usage keeps its numbers.
+    zeros = [{"type": "assistant", "message": {"id": f"m{i}", "usage": {"input_tokens": 0, "output_tokens": 0},
+                                               "content": [{"type": "text", "text": "x"}]}} for i in (1, 2)]
+    zres = {"type": "result", "subtype": "success", "is_error": False, "num_turns": 2, "total_cost_usd": 0.0487,
+            "usage": {"input_tokens": 9533, "cache_read_input_tokens": 1344, "cache_creation_input_tokens": 0,
+                      "output_tokens": 16}}
+    z = summarize("reviewer", [json.dumps(e) for e in zeros + [zres]], "glm")
+    assert (z["engine"], z["cost_usd"], z["context_max"], z["context_sum"], z["requests"]) == ("glm", None, None, 10877, 2), z
+    assert "glm success" in line(z) and "cost_usd=None ctx_max=None ctx_sum=10877" in line(z), line(z)
+    zc = summarize("reviewer", [json.dumps(e) for e in zeros + [zres]], "claude")
+    assert zc["cost_usd"] == 0.0487 and zc["context_sum"] == 10877, zc
+    assert summarize("reviewer", [json.dumps(e) for e in ev], "glm")["context_max"] == 2005
     # A Codex run that died before its first event is still Codex's.
     assert summarize("reviewer", ["Reading additional input"], "codex")["engine"] == "codex"
     with tempfile.NamedTemporaryFile("w", suffix=".ndjson", delete=False) as f:
         f.write("\n".join(json.dumps(e) for e in ev))
     out = f.name + ".json"
     assert main(["usage.py", "reviewer", f.name, out]) == 0
-    assert json.load(open(out))["num_turns"] == 3
+    assert json.load(open(out))["num_turns"] == 3 and json.load(open(out))["engine"] == "claude"
+    assert main(["usage.py", "reviewer", f.name, out, "glm"]) == 0 and json.load(open(out))["engine"] == "glm"
+    assert main(["usage.py", "reviewer", f.name, out, "gpt"]) == 64
     print("usage.py self-test: ok")
 
 
@@ -223,7 +244,7 @@ def main(argv):
     if argv[1:] == ["--self-test"]:
         self_test()
         return 0
-    if len(argv) not in (4, 5) or argv[4:] not in ([], ["claude"], ["codex"]):
+    if len(argv) not in (4, 5) or argv[4:] not in ([], ["glm"], ["claude"], ["codex"]):
         print(__doc__, file=sys.stderr)
         return 64
     try:
