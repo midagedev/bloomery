@@ -124,6 +124,28 @@ fn a_k31_folder_split_in_k3s_shape_and_its_indexer_alone_are_complements() {
     let has_indexer_key = |w: &Written| w.keys.iter().any(|k| k.contains(".attention.indexer."));
     assert!(!has_indexer_key(&k3_whole) && !has_indexer_key(&shaped));
     assert!(has_indexer_key(&whole));
+
+    // The tokenizer stage reads the folder's tiktoken files as the `kimi-k2` row, in every split.
+    for w in [&k3_whole, &whole, &shaped, &indexer] {
+        for key in [
+            "tokenizer.ggml.model",
+            "tokenizer.ggml.pre",
+            "tokenizer.ggml.tokens",
+        ] {
+            assert!(w.keys.iter().any(|k| k == key), "{key} is missing");
+        }
+    }
+    // The map names the `kimi-k2` row itself: a `tokenizer.json` beside `tiktoken.model` does not
+    // take the vocabulary away from it.
+    std::fs::write(k31.join("tokenizer.json"), "{}").unwrap();
+    let beside = run(&k31, "k31-beside-json", &["--only", "blk.*.indexer.*"]);
+    assert_eq!(beside.keys, indexer.keys);
+    std::fs::remove_file(k31.join("tokenizer.json")).unwrap();
+    // `--plan` prints the stored form of the folder under the same map.
+    for folder in [&k3, &k31] {
+        let o = prepare(&[folder.to_str().unwrap(), "--plan"]);
+        assert!(o.status.success(), "{}", text(&o));
+    }
     std::fs::remove_dir_all(&root).unwrap();
 }
 
