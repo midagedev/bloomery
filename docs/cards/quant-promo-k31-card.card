@@ -1,0 +1,16 @@
+# Promo speed row 1/3 (K3.1, card): bloomery-quantize on the card over the real K3.1 set with the production imatrix and rules, a
+# 600 s window, expert-stack rate from the binary's per-tensor lines (`... 9.865e9 weights in X s (read overlapped)`).
+# The band's centre is today's production log (iq_quant_set, the predecessor binary, /root/k31quant/gpuset.log, the A6000 per
+# the lead's handoff note of 11-06 23:10, ~/.cache/bloomery/handoff-2026-11-06.md): 13.2-13.9 s a IQ1_S stack = 7.1-7.7e8 weights/s, UNLEASED and beside a GPU llama-imatrix on the
+# same card, so a quiet lease sits at or above it; the upper edge is the search kernel alone, 1.09e9 (docs/research/iq-quant-card.md).
+# [derived from those two rows]
+kind: calibration
+question: what weights/s does bloomery-quantize (card) reach on K3.1's IQ1_S routed-expert stacks with the real imatrix, alone on the A6000?
+term: Mweights/s over the IQ1_S stacks that finish in a 600 s window, each 3584 x 3072 x 896 = 9.865e9 weights, MXFP4 source, imatrix kimi-k31-c8192x4.imatrix.gguf, rules-IQ1_S.txt, batch 32, A6000
+unit: Mweights/s
+predict: 700..1000
+condition: the window runs under tools/ref/lease-hold.sh on the A6000 with no other process on either card and a quiet host (the witness blocks show it); the input set is read from its drive (cold page cache is part of the run: the line says `read overlapped`); the run is killed by `timeout 600`, its output removed by name, and the rate is the sum of the IQ1_S stacks' weights over the sum of their printed seconds
+reason: fills the K3.1 card row of the promo's speed chart with a leased number that replaces the production log's contended one, and checks the binary (bloomery-quantize) against its predecessor's (iq_quant_set) rate; why now: the promo quantization segment needs one number per arm and none is leased yet
+decide-in: use the leased value as the chart's K3.1 card row and keep GPU_STACK_S and the plan's rates
+decide-below: look at the terms the line does not print (read, host words, pack: `just quant-measure` prints them) and the card witness (clock, power): a host or PCIe term over the search kernel means the flow is the next lever
+decide-above: set GPU_STACK_S to the leased value and add the row to docs/research/iq-quant-card.md; the production run's contended rate was the floor

@@ -1,0 +1,14 @@
+# Promo mid-size run, arm C: llama-quantize alone (mainline 78feec062, 64 threads) from the MXFP4 source to the final file, the
+# reference. [derived] 3.028e11 / 2.14e8 (measured on K3.1, contended) = 1415 s, the trunk's 5.9e9 Q8_0 weights at most 28 s (the IQ
+# rate as an upper bound), the read (104 s) and the 63 GB write (42 s) under the compute: ~1445 s; band from the K3.1 rate band
+# 2.1e8..2.5e8 and the contention that run had.
+kind: calibration
+question: how long does llama-quantize take from MXFP4 source to final GGUF on a 167 GB MoE, the reference the card path is compared with?
+term: seconds, wall of `llama-quantize --allow-requantize --imatrix ... --tensor-type-file ...` at 64 threads, CUDA_VISIBLE_DEVICES empty, first read to last byte, input and output drives as arms A and B, imatrix and rules as arm A
+unit: s
+predict: 1200..1750
+condition: the same lease, quiet host and drive layout as arms A and B, in the same sitting; normal priority (no nice); the output is the file whose sha256 arms A and B must equal
+reason: fills the reference row of the promo's mid-size speed chart and gives the exactness frame its third file; why now: the card path ships with this comparison as its headline
+decide-in: use it as the chart's reference; the speed-up is C / A
+decide-below: the CPU was faster than the K3.1 attempt (nice 10, contended): rebase the K3.1 row 2 prediction down and say which run is the leased one
+decide-above: check the thread count and the read term (an HDD-resident input would put the read over the compute); a read-bound C is a different row, not this one
