@@ -18,6 +18,10 @@
 #   quantize  llama-quantize --allow-requantize --imatrix <that> --tensor-type-file <rules> [--keep-split] <in> <out> <ftype>, the map
 #             --map says (below), after llama-quantize's own --dry-run plan of every tensor's type and size over the input's headers
 #             (kept in $K3Q_WORK; the output is held to it tensor by tensor afterwards)
+#             With --gpu-quant, iq_quant_set (crates/gpu-gates, the card's IQ1_S/IQ2_XXS quantizer, ggml's bytes by gate-gpu-iq-quant)
+#             first writes the input's shards again with every tensor that plan types IQ1_S or IQ2_XXS already quantized (the imatrix's
+#             importance as llama-quantize computes it) and the rest copied, to --gpu-set; llama-quantize then reads that set and
+#             copies those tensors (their type is the target), quantizing only the trunk. The card set is removed once the output passes.
 #             -> $K3Q_OUT_BASE/Kimi-K3.1-Pro-<type>[-<map>]-k3shape/ (a K3-shaped set: mainline loads it as K3, which at ctx <= 2048 is K3.1).
 #             Maps (what the lead's placement sizes): `tight` (default) the routed experts IQ1_S with IQ2_XXS on the layers K3's UD-IQ1_S
 #             file also promotes (read from the reference table: gate/up 11 46 47 56 57 58 68 69 70 71, down 83 92), every trunk stem
@@ -74,6 +78,10 @@
 #   --pred-s           print the predicted wall in whole seconds (no file is read) and exit: the box queue's BLOOMERY_Q_PRED_S
 #   --lease            smoke only: take the CPU lease with the smoke's card (the 1-thread rate is a measurement)
 #   --max-trunk-gb N   quantize: refuse when the plan's trunk class exceeds N GB (default 35 for tight; 0 = off)
+#   --gpu-quant        quantize: the IQ1_S/IQ2_XXS tensors on the card first (above); needs target/release/iq_quant_set (`just
+#                      iq-quant-set` builds it) and a card (tools/gpu-gate.sh takes its lock)     [K3Q_GPU_QUANT=1]
+#   --gpu-set DIR      --gpu-quant's card set, under $K3Q_WORK or --out-base (default $K3Q_WORK/<the output's name>.gpuset; it needs
+#                      GPUSET_PER_IN x the input's bytes, 0.66 TB for K3.1: a drive without the room is refused before the run)  [K3Q_GPU_SET]
 #   --hf-folder DIR    the K3.1 HF folder: prepare's input, the LICENSE and the source revision   [K3Q_HF_FOLDER] (/data/models/Kimi-K3.1-Pro)
 #   --license FILE     splice: the LICENSE copied into the output (default: <hf-folder>/LICENSE)
 #   --source-rev REV   splice: the HF commit the folder holds, for the card (default: read from the folder's own download metadata)
@@ -117,6 +125,12 @@ QUANT_RATE_MW=5.4           # measured: the smoke's 1-thread rate on the fixture
 QUANT_EFF_THREADS=40        # assumed, unmeasured: nproc is 64 (Threadripper PRO 5975WX, 32 cores x 2 SMT) and every one is passed as -t; 32 cores x 1.25 SMT yield = 40
 PCIE_GBS=22                 # assumed, unmeasured: host-to-card copy of the weights over the A6000's PCIe 4.0 x16 (--imatrix-gpu)
 SPLICE_SHARD_BYTES=48000000000   # the receiving shard's size, a K3 UD shard's (47-52 GB)
+K31_TRUNK_W=57000000000     # derived: the trunk's 0.114 TB (1.56 TB less the experts' 2.72e12 x 17/32 B of MXFP4) at 2 B a weight
+GPUSET_PER_IN=0.422         # derived: --gpu-quant's card set over the input: the trunk's 0.114 TB + the tight map's experts (254 stacks IQ1_S
+                            # at 50 B and 22 IQ2_XXS at 66 B a 256-weight block, 9.865e9 weights a stack: 0.545 TB) = 0.659 TB of 1.56 TB
+GPU_STACK_S=14.3            # measured (unleased, A6000, beside a 64-thread llama-imatrix): iq_quant_probe's quantize call on one 9.865e9-weight
+                            # stack, IQ1_S 14.0 s (search kernel 9.1 s), IQ2_XXS 17.4 s (11.8 s); 254:22 weighted. The card, not the read, bounds
+K31_STACKS=276              # the routed-expert stacks of the tight map (K31_EXPERT_W / 9.865e9)
 
 die() { echo "k31-quant.sh: $1" >&2; exit "${2:-64}"; }
 usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "${BASH_SOURCE[0]}" >&2; exit 64; }
@@ -127,7 +141,7 @@ say() { echo "k31-quant.sh: $*"; }
 case $1 in -h | --help) usage ;; esac
 STEP=$1
 shift
-DRY=0 SMOKE=0 DETACH=0 FORCE=0 PRED=0 USE_LEASE=0 IMATRIX_GPU=${K3Q_IMATRIX_GPU:-0} SEQS=${K3Q_SEQS:-1}
+DRY=0 SMOKE=0 DETACH=0 FORCE=0 PRED=0 USE_LEASE=0 IMATRIX_GPU=${K3Q_IMATRIX_GPU:-0} SEQS=${K3Q_SEQS:-1} GPUQ=${K3Q_GPU_QUANT:-0} GPU_SET=${K3Q_GPU_SET:-}
 MAP=${K3Q_MAP:-tight} REPO=midagedev/Kimi-K3.1-Pro-GGUF HF=${K3Q_HF_FOLDER:-/data/models/Kimi-K3.1-Pro} LICENSE_F='' SRC_REV='' PREPARE_BIN='' FOLLOW='' SHARD_GIB='' MAX_TRUNK=''
 TYPE=IQ1_S CTX='' CHUNKS='' IN=${K3Q_IN:-} CORPUS=${K3Q_CORPUS:-} SPECIAL=${K3Q_CORPUS_SPECIAL:-0} INDEXER=${K3Q_INDEXER:-} DSA=${K3Q_DSA_CONFIG:-}
 ARCH=${K3Q_ARCH:-kimi-k31} THREADS=${K3Q_THREADS:-} REF='' OUT_BASE=${K3Q_OUT_BASE:-/models} BUMP_GU='' BUMP_DN='' BUMP_SET=0
@@ -141,6 +155,11 @@ while [ $# -gt 0 ]; do
     --imatrix-gpu) IMATRIX_GPU=1 ;;
     --smoke) SMOKE=1 ;;
     --lease) USE_LEASE=1 ;;
+    --gpu-quant) GPUQ=1 ;;
+    --gpu-set)
+      [ $# -ge 2 ] || die "$1 takes a value"
+      GPU_SET=$2
+      shift ;;
     --map | --repo | --hf-folder | --license | --source-rev | --prepare-bin | --follow | --shard-gib | --max-trunk-gb)
       [ $# -ge 2 ] || die "$1 takes a value"
       case $1 in
@@ -261,7 +280,18 @@ pred_imatrix() { # <bytes> <chunks> <ctx>: populate + chunks x (read share + CPU
   awk -v b="$1" -v n="$2" -v x="$3" -v kb="$K3_BYTES" -v r="$K3_CHUNK_READ_S" -v c="$K3_CHUNK_CPU_S" -v p="$K3_POPULATE_S" \
     'BEGIN { printf "%d", (p + n * (r + c * x / 2048)) * b / kb + 0.5 }'
 }
+pred_gpuset() { # <bytes>: --gpu-quant's card set: the card's quantize call a stack (the next batch is read meanwhile, under its shadow:
+  # 3.3 s a stack against 14.3) + the set written after each batch, in sequence (docs/research/iq-quant-card.md)
+  awk -v b="$1" -v kb="$K31_BYTES" -v n="$K31_STACKS" -v s="$GPU_STACK_S" -v wr="$NVME_WRITE_GBS" -v g="$GPUSET_PER_IN" \
+    'BEGIN { printf "%d", n * s * b / kb + b * g / (wr * 1e9) + 0.5 }'
+}
 pred_quantize() { # <bytes> <threads>: read + quantizer CPU + write, in sequence (the quantizer reads a tensor, quantizes it, writes it)
+  if [ "$GPUQ" = 1 ]; then # over the card set: the experts copied, the trunk quantized (at the IQ rate: an upper bound for k-quants)
+    awk -v b="$1" -v e="$QUANT_EFF_THREADS" -v r="$QUANT_RATE_MW" -v rd="$NVME_READ_GBS" -v wr="$NVME_WRITE_GBS" -v o="$OUT_PER_IN" \
+      -v t="$K31_TRUNK_W" -v g="$GPUSET_PER_IN" -v kb="$K31_BYTES" \
+      'BEGIN { printf "%d", (t * b / kb) / (e * r * 1e6) + b * g / (rd * 1e9) + b * o / (wr * 1e9) + 0.5 }'
+    return
+  fi
   awk -v b="$1" -v e="$QUANT_EFF_THREADS" -v r="$QUANT_RATE_MW" -v rd="$NVME_READ_GBS" -v wr="$NVME_WRITE_GBS" -v o="$OUT_PER_IN" \
     -v w="$K31_EXPERT_W" -v kb="$K31_BYTES" 'BEGIN { printf "%d", (w * b / kb) / (e * r * 1e6) + b / (rd * 1e9) + b * o / (wr * 1e9) + 0.5 }'
 }
@@ -271,7 +301,7 @@ pred_splice() { # the receiving shard read, written and read back, at the drive'
 pred_of() { # <step> <bytes>
   case $1 in
     imatrix) pred_imatrix "$2" "$CHUNKS" "$CTX" ;;
-    quantize) pred_quantize "$2" ;;
+    quantize) if [ "$GPUQ" = 1 ]; then echo $(($(pred_gpuset "$2") + $(pred_quantize "$2"))); else pred_quantize "$2"; fi ;;
     splice) pred_splice ;;
   esac
 }
@@ -749,6 +779,40 @@ do_plan() {
   rm -f "$rules"
 }
 
+gpu_set() { # <imatrix> <output prefix>: --gpu-quant's card set (iq_quant_set over $IN with the plan $PLAN_TSV) -> $GSET; sets GFIRST
+  local im=$1 prefix=$2 marker gkey pred bound gq=$ROOT/target/release/iq_quant_set
+  GSET=${GPU_SET:-$WORK/$prefix.gpuset}
+  case $GSET in "$WORK"/* | "$OUT_BASE"/*) ;; *) die "--gpu-set $GSET: under $WORK or $OUT_BASE (a partial set is removed by name only there)" 64 ;; esac
+  marker=$WORK/gpuset-$TAG.done
+  pred=$(pred_gpuset "$IN_BYTES")
+  bound=$(bound_of "$pred")
+  GFIRST=$(named_first "$IN" "$GSET" "$prefix")
+  say "gpu-quant: iq_quant_set on the card -> $GSET ($(awk -v b="$IN_BYTES" -v g="$GPUSET_PER_IN" 'BEGIN { printf "%.0f", b * g / 1e9 }') GB derived): $K31_STACKS stacks x $GPU_STACK_S s of card (measured, the read under it) + the set written at $NVME_WRITE_GBS GB/s, scaled by the input's bytes; wall $(hms "$pred"), bound ${bound}s"
+  [ -x "$gq" ] || [ "$DRY" = 1 ] || die "no $gq: just iq-quant-set builds it (with no ARGS it stops at its usage)" 66
+  force_clean "$marker" "$GSET"
+  partial_clean "$GSET.partial"
+  if [ "$DRY" = 0 ]; then
+    gkey=$(key_of gpuset "$(sha_of "$gq")" "$(set_ident "$IN")" "$(sha_of "$im")" "$(sha_of "$PLAN_TSV")")
+    if marker_state "$marker" "$gkey" "$GSET"; then
+      say "gpu-quant: done before ($marker, $GSET): skipped"
+      return 0
+    fi
+    [ ! -e "$GSET" ] || die "$GSET exists and no done marker says this run made it: --force removes it" 65
+    mkdir -p "$GSET.partial"
+    local need avail
+    need=$(awk -v b="$IN_BYTES" -v g="$GPUSET_PER_IN" 'BEGIN { printf "%.0f", b * g * 1.05 }')
+    avail=$(df --output=avail -B1 "$GSET.partial" | tail -n 1 | tr -d ' ')
+    awk -v n="$need" -v a="$avail" 'BEGIN { exit !(a >= n) }' ||
+      { rmdir "$GSET.partial"; die "--gpu-set $GSET: its drive has $avail B free, the card set needs ~$need B (GPUSET_PER_IN x the input, +5 %): --gpu-set on a drive with the room" 65; }
+  fi
+  run gpuset "$bound" env -C "$ROOT" BLOOMERY_GATE_BOUND="$bound" BLOOMERY_GATE_CARD="${BLOOMERY_GATE_CARD:-any}" \
+    bash tools/gpu-gate.sh iq_quant_set "$IN" --imatrix "$im" --plan "${PLAN_TSV:-<the plan tsv>}" --out "$GSET.partial/$prefix" || fail_step gpuset $?
+  [ "$DRY" = 0 ] || return 0
+  [ -f "$(named_first "$IN" "$GSET.partial" "$prefix")" ] || die "iq_quant_set ended 0 but wrote no $(named_first "$IN" "$GSET.partial" "$prefix")" 65
+  mv "$GSET.partial" "$GSET"
+  write_marker "$marker" "$gkey" "$GSET" "plan=$PLAN_TSV"
+}
+
 do_quantize() {
   need_in
   CARD=k31-quantize
@@ -771,7 +835,11 @@ do_quantize() {
   pred=$(pred_of quantize "$IN_BYTES")
   bound=$(bound_of "$pred")
   say "quantize: $IN ($IN_SHARDS shard(s), $IN_BYTES bytes) -> $qdir, --map $MAP, global type ${QTYPE:-$TYPE}, experts $TYPE, threads $qthreads"
-  plan_line quantize "$IN_BYTES" "expert weights $K31_EXPERT_W x bytes/$K31_BYTES / ($QUANT_EFF_THREADS effective threads x $QUANT_RATE_MW Mweights/s, measured on 1 thread) + read $NVME_READ_GBS GB/s + write $OUT_PER_IN x bytes at $NVME_WRITE_GBS GB/s"
+  if [ "$GPUQ" = 1 ]; then
+    plan_line quantize "$IN_BYTES" "the card set ($K31_STACKS stacks x $GPU_STACK_S s, measured, + $GPUSET_PER_IN x bytes written at $NVME_WRITE_GBS GB/s) + llama-quantize over it (trunk weights $K31_TRUNK_W x bytes/$K31_BYTES / ($QUANT_EFF_THREADS threads x $QUANT_RATE_MW Mweights/s) + the set read at $NVME_READ_GBS GB/s + write $OUT_PER_IN x bytes at $NVME_WRITE_GBS GB/s)"
+  else
+    plan_line quantize "$IN_BYTES" "expert weights $K31_EXPERT_W x bytes/$K31_BYTES / ($QUANT_EFF_THREADS effective threads x $QUANT_RATE_MW Mweights/s, measured on 1 thread) + read $NVME_READ_GBS GB/s + write $OUT_PER_IN x bytes at $NVME_WRITE_GBS GB/s"
+  fi
   if [ "$IN_BYTES" != "$K31_BYTES" ] && [ "$SMOKE" = 0 ]; then
     say "plan quantize: for the 1.56 TB K3.1 file: $(hms "$(pred_of quantize "$K31_BYTES")"); the rate band 3-6 Mweights/s/thread gives $(hms "$(QUANT_RATE_MW=6 pred_of quantize "$K31_BYTES")") to $(hms "$(QUANT_RATE_MW=3 pred_of quantize "$K31_BYTES")")"
   fi
@@ -802,12 +870,21 @@ do_quantize() {
   if [ "$DRY" = 0 ]; then
     if [ -e "$qdir" ] && [ ! -f "$marker" ]; then die "$qdir exists and no done marker says this run made it: --force removes it, or --out-base elsewhere" 65; fi
     key=$(key_of quantize "$MAP" "$TYPE" "$(sha_of "$Q")" "$(set_ident "$IN")" "$(sha_of "$im")" "$(sha_of "$rules")" "$qthreads")
+    if [ "$GPUQ" = 1 ]; then
+      [ -x "$ROOT/target/release/iq_quant_set" ] || die "no $ROOT/target/release/iq_quant_set: just iq-quant-set builds it (with no ARGS it stops at its usage)" 66
+      key=$(key_of "$key" gpu "$(sha_of "$ROOT/target/release/iq_quant_set")")
+    fi
     if marker_state "$marker" "$key" "$qdir"; then
       QFIRST=$(named_first "$IN" "$qdir" "$qprefix")
       say "quantize: done before ($marker, $qdir): skipped"
       return 0
     fi
     mkdir -p "$qdir.partial"
+  fi
+  local qin=$IN
+  if [ "$GPUQ" = 1 ]; then
+    gpu_set "$im" "$qprefix"
+    qin=$GFIRST
   fi
   quant_args "$rules" "$im"
   args=("${QARGS[@]}")
@@ -820,7 +897,7 @@ do_quantize() {
     tick=$!
   fi
   t0=$SECONDS
-  run quantize "$bound" "${NICE[@]}" env CUDA_VISIBLE_DEVICES= "$Q" "${args[@]}" "$IN" "$qdir.partial/$qprefix.gguf" "${QTYPE:-$TYPE}" "$qthreads"
+  run quantize "$bound" "${NICE[@]}" env CUDA_VISIBLE_DEVICES= "$Q" "${args[@]}" "$qin" "$qdir.partial/$qprefix.gguf" "${QTYPE:-$TYPE}" "$qthreads"
   local rc=$?
   [ -z "$tick" ] || { kill "$tick" 2> /dev/null; wait "$tick" 2> /dev/null; }
   [ "$rc" = 0 ] || fail_step quantize "$rc"
@@ -836,7 +913,11 @@ do_quantize() {
   fi
   mv "$qdir.partial" "$qdir"
   QFIRST=$(named_first "$IN" "$qdir" "$qprefix")
-  write_marker "$marker" "$key" "$qdir" "tensors=$(wc -l < "$WORK/quantize-$TAG.tsv" | tr -d ' ') map=$MAP type=$TYPE"
+  write_marker "$marker" "$key" "$qdir" "tensors=$(wc -l < "$WORK/quantize-$TAG.tsv" | tr -d ' ') map=$MAP type=$TYPE gpu=$GPUQ"
+  if [ "$GPUQ" = 1 ]; then
+    rm -rf -- "$GSET" "$WORK/gpuset-$TAG.done"
+    say "gpu-quant: the card set $GSET removed (llama-quantize copied its IQ1_S/IQ2_XXS tensors into $qdir)"
+  fi
   say "quantize: done: $qdir, $(du -sb "$qdir" | cut -f1) bytes; wall $((SECONDS - t0)) s for $IN_BYTES B in (derived $pred s); $(grep -E 'quantize time|total time|model size|quant size' "$LOGDIR/quantize.log" | tr -s ' ' | tr '\n' ';')"
   say "type table (the output's real tensors):"
   splice classes --in "$QFIRST" | sed 's/^/    /'

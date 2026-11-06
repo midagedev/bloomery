@@ -66,6 +66,7 @@ pub mod hybrid;
 pub mod index_key;
 pub mod indexer;
 pub mod iq;
+pub mod iq_quant;
 pub mod iq_sel;
 pub mod kpool;
 pub mod kquant;

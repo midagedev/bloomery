@@ -777,6 +777,31 @@ gate-gpu-iq:
 gate-gpu-iq-sel *ARGS:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_iq_sel && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_iq_sel {{ARGS}}'
 
+# The card's IQ1_S and IQ2_XXS quantizer (bloomery_gpu::iq_quant) against ggml's bytes: iq_quant_ref linked to the K3.1
+# quantization tree's libggml-base (just build-iq-quant-ref) on MXFP4 rows over two experts and seven f32 cases, row for
+# row; the host rule (gguf::iq_quant) on two rows of each; iq_quant_set over a two-shard set (metadata, order and copies
+# the input's, the stacks ggml's, a short plan refused). No model file.
+gate-gpu-iq-quant:
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_iq_quant --bin iq_quant_set && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_iq_quant'
+
+# gate-gpu-iq-quant's oracle: tools/ref/iq_quant_ref.cpp linked to the K3.1 quantization tree's libggml-base, into
+# $BLOOMERY_DATA/bin with the tree's commit and the library's md5 beside it. CPU only, no lease.
+build-iq-quant-ref:
+    ./tools/box.sh 'bash tools/ref/build-iq-quant-ref.sh'
+
+# One tensor of a GGUF set quantized to IQ1_S or IQ2_XXS on the card in batches of experts, its read and card time, and the
+# bytes of the experts --check names against ggml's (iq_quant_ref). A tool run, not a gate: it reads the set's tensor and
+# writes only the oracle's files under --scratch. ARGS: <first shard> --tensor NAME --type iq1_s|iq2_xxs [--imatrix FILE]
+# [--batch N] [--check E,E] [--scratch DIR].
+iq-quant-probe *ARGS:
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin iq_quant_probe && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh iq_quant_probe {{ARGS}}'
+
+# The K3.1 pipeline's intermediate set on the card (k31-quant.sh --gpu-quant runs it): the input set's shards again under
+# --out's prefix, each tensor llama-quantize's plan types IQ1_S or IQ2_XXS quantized to ggml's bytes, the rest copied.
+# ARGS: <first shard> --imatrix FILE --plan TSV --out PREFIX [--batch N].
+iq-quant-set *ARGS:
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin iq_quant_set && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh iq_quant_set {{ARGS}}'
+
 # 행 사상 Q6_K gemv(bloomery_gpu::q6k_ids): MTP 드래프트가 빌리는 Q6_K `output` 머리. 합성 70,000행 "어휘"(K = 2,560,
 # UD-Q3_K_XL 머리의 형상)를 고정 시드로 짓고, m ∈ {1,2,4,8} × (1·7·65,536 정렬 id 맵 + 맵 없음)의 매 로짓을
 # enqueue_gemv_q6k의 모은 행 스택과 비트 대조하고, ggml 디퀀트 × f32의 f64 합 대비 유도 밴드(PIN), id 범위 밖의 이름 붙은
