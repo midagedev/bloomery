@@ -287,6 +287,12 @@ mod gate {
         ok
     }
 
+    /// A clause group's verdict: an error it returns is a `FAIL` line with the message, so the
+    /// clauses after it still run and the gate ends by its tally.
+    fn guarded(clause: &str, run: Result<bool, GateError>) -> bool {
+        run.unwrap_or_else(|e| line(false, clause, &format!("the clause ended in an error: {e}")))
+    }
+
     /// The prompt as placed passes (`pass`) or stepped, then [`STEPS`] ids greedy, every step's
     /// logits row, and the tier's counters over the prompt alone.
     fn walked(
@@ -753,8 +759,8 @@ mod gate {
         pass &= host_share(&inputs, &table, (budget, host), (&prompt, &want))?;
         pass &= host_without_tier(&inputs, &table, (budget, host))?;
         pass &= node_family_and_records(&prompt, budget)?;
-        pass &= placed_pass(&inputs, budget, host)?;
-        pass &= pass_cli(&inputs, budget, host)?;
+        pass &= guarded("pass", placed_pass(&inputs, budget, host));
+        pass &= guarded("pass cli", pass_cli(&inputs, budget, host));
         println!("{NAME}: {}", tier::tally_line());
         if !pass {
             return Err(checks_failed());
@@ -1417,7 +1423,21 @@ mod gate {
             &format!("a pass of {} rows: {text:?}", wide.rows),
         );
 
+        // The pass's machine and tier batch with no prompt reserve: the stage card's budget is
+        // the gate's alone, so the experts split as with the reserve.
         let short = inputs.clone().with_arena_at_floor();
+        let grown = tier_batch_at(&inputs.hp, shape.rows as u64)?.card()?
+            - tier_batch(&inputs.hp)?.card()?;
+        let (Some(s), Some(t)) = (
+            machine.cards.first().and_then(|c| c.device),
+            machine.tiers.first().and_then(|c| c.device),
+        ) else {
+            return Err("the gate's cards carry no census device".into());
+        };
+        let at = levers_of(CardBudget::Per(vec![
+            (s.ordinal, budget),
+            (t.ordinal, budget + grown),
+        ]));
         let plan = short.plan(&machine, CTX as u64, &at)?;
         let file = open_split(Arch::KimiK3, RECIPE)?;
         let text = refused(GpuModel::<Body>::open_placed_pass(
@@ -1431,8 +1451,15 @@ mod gate {
             &format!("a plan with no prompt reserve: {text:?}"),
         );
 
+        // The step's plan: the tier's batch one token, no pass anywhere.
+        let step_machine = bp_machine(inputs)?;
+        let step = short.plan(
+            &step_machine,
+            CTX as u64,
+            &levers_of(CardBudget::Every(budget)),
+        )?;
         let file = open_split(Arch::KimiK3, RECIPE)?;
-        let mut m = GpuModel::<Body>::open_placed(file, &plan, &short, 0, host)?;
+        let mut m = GpuModel::<Body>::open_placed(file, &step, &short, 0, host)?;
         let text = m.prompt_placed(&prompt).err().map(|e| e.to_string());
         tier::sc("pass refused: prompt_placed on a load without the pass")?;
         pass &= line(
@@ -1548,7 +1575,7 @@ mod gate {
 
         let plan = pass_inputs.plan(&machine, CTX as u64, &at)?;
         let file = open_split(Arch::KimiK3, RECIPE)?;
-        let mut m = GpuModel::<Body>::open_placed(file, &plan, &pass_inputs, 0, host)?;
+        let mut m = GpuModel::<Body>::open_placed_pass(file, &plan, &pass_inputs, 0, host, shape)?;
         m.set_mode(StepMode::Graph);
         let (stepped, _) = walked(&mut m, &prompt, false)?;
         drop(m);

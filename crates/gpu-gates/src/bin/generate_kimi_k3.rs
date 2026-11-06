@@ -382,8 +382,10 @@ mod cli {
     /// `ctx` as the prompt reserve and the NVMe arena at its floor, planned on the machine `build`
     /// makes at its rows (and on that machine headless when the stage card's dense trunk alone
     /// refuses it, as [`plan_for`] plans). A shape wider than `ctx` is passed over unless it is
-    /// [`CHUNK`]'s. Each refused for its reserve ([`PlaceError::PromptOver`]) steps down, and the
-    /// narrowest refused comes back beside the shape with the bytes it fell short by. Any other
+    /// [`CHUNK`]'s. Each refused for its reserve ([`PlaceError::PromptOver`]) or for a dense trunk
+    /// that, with the shape's bytes beside it, passes the card's free bytes
+    /// ([`PlacementError::CardFreeFloor`] on the headless retry) steps down, and the narrowest
+    /// refused comes back beside the shape with the bytes it fell short by. Any other
     /// refusal, and every shape refused, ends the run by name.
     fn pick_shape(
         inputs: &PlanInputs,
@@ -408,6 +410,11 @@ mod cli {
             match tried {
                 Ok(()) => return Ok((shape, wider)),
                 Err(PlaceError::PromptOver { short, .. }) => wider = Some((shape, short)),
+                // The head already on the host, the shape's own bytes beside the dense trunk
+                // pass the card's free bytes: a narrower shape holds fewer.
+                Err(PlaceError::Placement(PlacementError::CardFreeFloor(f))) => {
+                    wider = Some((shape, f.over));
+                }
                 Err(e) => {
                     return Err(format!(
                         "--place {name} --walk pass: the pass of {} rows ({} latent): {e}",
