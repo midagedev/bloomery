@@ -8,6 +8,9 @@ mod body;
 mod kda;
 pub mod moe;
 mod state;
+mod tier;
 
+pub use body::placed::Placed;
 pub use body::rows::{Pass, Tail};
 pub use body::{Body, TAP_STAGES};
+pub use tier::NODE_FAMILY;

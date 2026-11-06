@@ -379,6 +379,8 @@ generate_ds41 kda_conv_prep_sp2 0 0
 generate_ds41 kda_delta 0 0
 generate_ds41 kda_delta_lanes 0 0
 generate_ds41 kda_write_gate 0 0
+# PIN(2026-11-06): ffn_handoff_n_tier, a new entry, at 0 spill and 0 JIT local bytes [derived: the sm_86 cc 8.6 scan's 0/0 (tools/ref/ptx-shapes.tsv): 30 registers, no local array], until a scan on this table's arch and capability.
+generate_ds41 ffn_handoff_n_tier 0 0
 generate_ds41 kpool_score 0 0
 generate_ds41 kq_card_gather 0 0
 generate_ds41 kq_gate_up_act_q4k 0 0

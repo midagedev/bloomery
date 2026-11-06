@@ -10,8 +10,8 @@
 //!
 //! The model file is `-m`'s, else `$BLOOMERY_REF_MODEL`: this node's own
 //! copy, which must hold the rows node 0's plan gives the tier with node 0's
-//! headers and bytes (each row's sha256). It serves Qwen3.8's tier family,
-//! and V4.1's, GLM's and Solar-Open2's when built with the `deepseek41`,
+//! headers and bytes (each row's sha256). It serves Qwen3.8's and Kimi K3's tier
+//! families, and V4.1's, GLM's and Solar-Open2's when built with the `deepseek41`,
 //! `glm5next` or `solar2` feature; an open of another family is refused by
 //! name. The explicit
 //! listen address is loopback, private or 198.18.0.0/15 IPv4. Off-host nodes bind their
@@ -82,6 +82,7 @@ mod server {
             &file,
             &[
                 NODE_FAMILY,
+                bloomery_gpu::arch::kimi_k3::NODE_FAMILY,
                 #[cfg(feature = "deepseek41")]
                 bloomery_gpu_deepseek41::NODE_FAMILY,
                 #[cfg(feature = "glm5next")]

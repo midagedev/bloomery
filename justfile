@@ -4474,13 +4474,14 @@ dump-ref-kimi-k3:
 # rows (the router's picks the vendor's), the teacher-forced argmax against the greedy ids and the last logits row; and with no vendor
 # the steps deterministic, the graph the eager chain, the AttnRes mix kernel against a host f64 mix (rows = steps, refusals, fault word),
 # and `generate_kimi_k3` (built beside the gate, its own process) printing the ids the gate's own steps give from set d's prompt.
-# Fixture-only (tools/ref/fixture-only.sh): the real file (594 GB) does not fit one card and the body has no placed load, so the real tier has no run.
+# Fixture-only (tools/ref/fixture-only.sh): the real file (594 GB) does not fit one card, so the real tier has no whole-card run (gate-gpu-kimik3-place is the placed load's).
 gate-gpu-kimik3-e2e:
     BLOOMERY_MODEL=kimi-k3 ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-kimik3-e2e && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_kimi_k3_e2e --bin generate_kimi_k3 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_kimi_k3_e2e'
 
 # Kimi K3's end-to-end decode CLI (generate_kimi_k3's doc): --tokens a,b,c or --prompt TEXT (raw, no template), -n, --ctx, --place, --mode,
-# --plan (the plan's records and nothing loaded). The fixture: BLOOMERY_BOX_ENV='BLOOMERY_TIER=fixture BLOOMERY_GATE_CARD=any'; the real
-# file (BLOOMERY_CARD=a6000, one run at a time under a timeout) is refused by name past the card's free bytes. Never a timing run.
+# --plan (the plan's records and nothing loaded). The fixture: BLOOMERY_BOX_ENV='BLOOMERY_TIER=fixture BLOOMERY_GATE_CARD=any'; `--place a`
+# on the real file is refused by name past the card's free bytes; `--place bp` (BLOOMERY_CARD=both, one run at a time under a timeout) loads by
+# the plan, and refuses a plan that leaves experts on the host tier (no SiTU expert form). Never a timing run.
 gen-kimi-k3 *ARGS:
     BLOOMERY_MODEL=kimi-k3 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_kimi_k3 && bash tools/gpu-gate.sh generate_kimi_k3 {{ARGS}}'
 
@@ -4496,3 +4497,18 @@ gate-gpu-kimik3-pp:
     BLOOMERY_MODEL=kimi-k3 ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-kimik3-pp && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_kimi_k3_pp && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_kimi_k3_pp'
 
 # --- end kimik3pp ---
+# --- kimik3place ---
+
+# Kimi K3's placed load (gate_kimi_k3_place's doc): the stage card the dense trunk and each routed layer's first experts, the second card the
+# expert tier (in process, then served by a loopback tier_server on the 3090 alone), the embedding a host row. On the fixture, under the card
+# budget the gate finds by bisection (experts on both cards, none on the host; plans counted at a 4 KiB granule): the placed greedy ids equal the whole-card body's, the eager
+# run the graph run's bits, every tier layer is sent a routed slot, the node's tier reads the in-process tier's ids and logits bits; a tier
+# reserve of 0, a plan with a host share (the host tier has no SiTU expert form) and a node of another family are each refused by name, and
+# `generate_kimi_k3 --plan --place bp` prints the placed machine's plan record. Fixture-only (tools/ref/fixture-only.sh): the real file's plan
+# leaves experts on the host tier. Both cards (the A6000 the stage, the 3090 the tier and the node). Predicted wall [derived: the e2e gate's
+# fixture opens, a few seconds each]: five loads in the gate and four in its children, under 5 min after a warm build.
+[group('solo')]
+gate-gpu-kimik3-place:
+    BLOOMERY_MODEL=kimi-k3 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-kimik3-place && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_kimi_k3_place --bin generate_kimi_k3 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu,deepseek41 --release --bin tier_server && BLOOMERY_GATE_BOUND=1200 bash tools/gpu-gate.sh gate_kimi_k3_place'
+
+# --- end kimik3place ---

@@ -34,11 +34,20 @@ use crate::elem::EmbedRowsArgs;
 use crate::flash_gqa::FlashGqaKernels;
 use crate::gemm::Gemm32Kernels;
 use crate::head::Head;
+use crate::host::StepLeg;
+use crate::host::run::HostRun;
+use crate::host::swap::Residency;
+use crate::host::swap_source::{DEADLINE, LIVE_DELAY, ResidencySpec, hosted_stacks};
+use crate::host::tier::TierOpen;
+use crate::hybrid::{Hybrid, SlotMap};
 use crate::kquant::Act;
 use crate::latent_gated::{self, MlaDims, MlaKernels};
 use crate::linear::mixer_kda::{KdaBufs, KdaDims};
 use crate::linear::{HEAD, LinearKernels, PASS_ROWS};
-use crate::model::{ChainBody, GpuModel, NoHost, block_count};
+use crate::model::{
+    ChainBody, GpuModel, HostServed, block_count, refuse_reserve_past, refuse_scratch_past,
+    stage_run,
+};
 use crate::recur::RecStore;
 use crate::route_body::{sigmoid_8_2, sigmoid_896_16};
 use crate::routed_block::RouterEntry;
@@ -46,13 +55,21 @@ use crate::site::{KGemvKernels, SiteTy};
 use crate::tensor::{WindowMut, copy_row};
 use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, Gpu, GpuError, LAYER_HEAD};
+use bloomery_levers::{ChurnHosting, HostCfg};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::kimi_k3::hparams::{Hparams, Kind};
 use model::arch::kimi_k3::names;
+use model::arch::kimi_k3::place::PlanInputs;
+use model::placement::Plan;
+use placed::{Open, Placed};
+use runtime::layer::hosted;
 use std::ops::Range;
+use std::sync::Arc;
 
+#[path = "placed.rs"]
+pub(super) mod placed;
 #[path = "rows.rs"]
 pub(super) mod rows;
 
@@ -266,14 +283,34 @@ impl Kernels {
 struct Router<R: RouterEntry> {
     k: FfnKernels<R>,
     s: FfnScratch<R>,
+    /// The hosted layers' buffers, on a placed load.
+    p: Option<placed::Bufs<R>>,
 }
 
 impl<R: RouterEntry> Router<R> {
-    fn load(gpu: &Gpu, n: usize, ff: usize, dims: &MoeDims) -> Result<Router<R>, GpuError> {
+    fn load(
+        gpu: &Gpu,
+        n: usize,
+        ff: usize,
+        dims: &MoeDims,
+        placed: bool,
+    ) -> Result<Router<R>, GpuError> {
         Ok(Router {
             k: FfnKernels::load(gpu)?,
             s: FfnScratch::new(gpu.stream(), n, ff, dims.shape())?,
+            p: placed
+                .then(|| placed::Bufs::new(gpu.stream(), n, dims))
+                .transpose()?,
         })
+    }
+
+    /// The kernels and the hosted layers' buffers; refused by name on a load that is not placed.
+    fn hosted(&mut self) -> Result<(&FfnKernels<R>, &mut placed::Bufs<R>), GpuError> {
+        let Router { k, p, .. } = self;
+        let p = p
+            .as_mut()
+            .ok_or_else(|| GpuError::state(STEP, "a placed load's hosted-layer buffers"))?;
+        Ok((k, p))
     }
 }
 
@@ -303,8 +340,50 @@ impl Instance {
 
     fn bytes(&self) -> usize {
         match self {
-            Instance::E896(r) => r.s.bytes(),
-            Instance::E8(r) => r.s.bytes(),
+            Instance::E896(r) => r.s.bytes() + r.p.as_ref().map_or(0, placed::Bufs::bytes),
+            Instance::E8(r) => r.s.bytes() + r.p.as_ref().map_or(0, placed::Bufs::bytes),
+        }
+    }
+
+    /// A hosted layer's front ([`placed::front`]) at this instance.
+    fn front(
+        &mut self,
+        b: &placed::Block<'_>,
+        acts: &mut Acts,
+        side: &mut placed::Side,
+        hy: &mut Hybrid<HostRun>,
+    ) -> Result<(), GpuError> {
+        match self {
+            Instance::E896(r) => placed::front(r.hosted()?, b, acts, side, hy),
+            Instance::E8(r) => placed::front(r.hosted()?, b, acts, side, hy),
+        }
+    }
+
+    /// A hosted layer's shadow ([`placed::shadow`]) at this instance.
+    fn shadow(
+        &mut self,
+        b: &placed::Block<'_>,
+        acts: &mut Acts,
+        side: &placed::Side,
+        hy: &Hybrid<HostRun>,
+    ) -> Result<(), GpuError> {
+        match self {
+            Instance::E896(r) => placed::shadow(r.hosted()?, b, acts, side, hy),
+            Instance::E8(r) => placed::shadow(r.hosted()?, b, acts, side, hy),
+        }
+    }
+
+    /// A hosted layer's back ([`placed::back`]) at this instance.
+    fn back(
+        &mut self,
+        b: &placed::Block<'_>,
+        acts: &mut Acts,
+        side: &placed::Side,
+        (hy, update): (&mut Hybrid<HostRun>, &mut DeviceBuffer<f32>),
+    ) -> Result<(), GpuError> {
+        match self {
+            Instance::E896(r) => placed::back(r.hosted()?.1, b, acts, side, hy, update),
+            Instance::E8(r) => placed::back(r.hosted()?.1, b, acts, side, hy, update),
         }
     }
 
@@ -507,6 +586,8 @@ pub struct Body {
     step_in: StepIn,
     lane: Lane,
     router: Instance,
+    /// The host tier and what the walk reads beside it, on a placed load ([`placed`]).
+    placed: Option<Placed>,
     /// The stage snapshots of the step's position: armed by [`Body::arm_taps`], absent in a
     /// serving load so no launch is recorded for them.
     taps: Option<Taps>,
@@ -542,8 +623,86 @@ impl GpuModel<Body> {
             for l in (0..hp.n_layer).filter(|&l| hp.kind(l) == Kind::Kda) {
                 kda::derive(gpu.stream(), w, l)?;
             }
-            Body::load(gpu, &file, w, (hp, ctx))
+            Body::load(gpu, &file, w, (hp, ctx), None)
         })
+    }
+
+    /// Card `card` of `plan`, which `inputs` made, resident: the dense trunk and each routed
+    /// layer's card experts the plan puts there, the stores at the plan's `ctx_max`, the host tier
+    /// over the layers whose experts the card does not hold whole with the plan's expert tier
+    /// card hung under it, and the embedding as a host row ([`placed`]). The load's slot map
+    /// stays for the model's life ([`Residency::Off`]). The prompt is stepped one id at a time.
+    /// Refused by name: a plan of other than one stage card running every layer, of more than one
+    /// expert tier, a layer whose stacks are not its card count's, a host share (the host tier has
+    /// no SiTU expert form), and scratch or tier places past the plan's terms for them.
+    pub fn open_placed(
+        file: Split,
+        plan: &Plan<'_>,
+        inputs: &PlanInputs,
+        card: usize,
+        host: HostCfg,
+    ) -> Result<GpuModel<Body>, GpuError> {
+        const PLAN: &str = "kimi_k3::Body::open_placed";
+        let hp = &inputs.hp;
+        let (_, ctx) = stage_run(PLAN, plan, card, hp.n_layer)?;
+        let run = hosted(&inputs.spec.layers)
+            .map_err(|e| GpuError::shape(PLAN, format!("the routed layers: {e}")))?;
+        let spec = ResidencySpec {
+            lever: Residency::Off,
+            pool: ChurnHosting::Hosted,
+            delay: LIVE_DELAY,
+            deadline: DEADLINE,
+            top_k: hp.experts.n_used,
+            max_rows: placed::LOAD_ROWS,
+            stacks: Arc::new(hosted_stacks(&inputs.model, PLAN, (run.len(), true))?),
+        };
+        GpuModel::load_placed_with(
+            file,
+            plan,
+            card,
+            host,
+            spec,
+            |stream, _, layers, w| {
+                for l in layers.filter(|&l| hp.kind(l) == Kind::Kda) {
+                    kda::derive(stream, w, l)?;
+                }
+                Ok(())
+            },
+            |gpu, file, w, set, glue| {
+                let open = Open {
+                    file,
+                    plan,
+                    inputs,
+                    host,
+                    set,
+                    glue,
+                };
+                let mut body =
+                    Body::load(gpu, file, w, (inputs.hp.clone(), ctx), Some((open, card)))?;
+                refuse_scratch_past(
+                    PLAN,
+                    plan,
+                    card,
+                    body.scratch_bytes(),
+                    "the step's buffers, the hosted layers' buffers, the host boundary, the slot \
+                     map's copy",
+                )?;
+                let reserve = inputs
+                    .prompt_batch_bytes(plan.machine)
+                    .map_err(|e| GpuError::plan(PLAN, e))?;
+                if let Some(p) = body.placed.as_mut() {
+                    refuse_reserve_past(
+                        PLAN,
+                        "tier places",
+                        reserve,
+                        p.tier_bytes() as u64,
+                        "the slot map's tier view and the step's tier places",
+                    )?;
+                    p.start_residency(gpu)?;
+                }
+                Ok(body)
+            },
+        )
     }
 }
 
@@ -564,14 +723,56 @@ fn dense_glu(file: &Split, w: &Weights, l: usize, hp: &Hparams) -> Result<Glu, G
     build().map_err(|e| GpuError::shape(WHAT, format!("layer {l}'s dense block: {e}")))
 }
 
+/// The slot map of a placed load's plan over the routed run, the stage card `card`'s and the
+/// expert tier cards': one row of `n_expert` places a routed layer. Refused by name: a plan of
+/// other than one stage card running every layer, more tier cards than the host tier serves, and
+/// the map's own refusals.
+fn placed_map(open: &Open<'_>, card: usize, hp: &Hparams) -> Result<SlotMap, GpuError> {
+    stage_run(WHAT, open.plan, card, hp.n_layer)?;
+    let tiers = TierOpen::of_machine(open.plan.machine)?;
+    let tier_cards: Vec<usize> = tiers.iter().map(|t| t.card).collect();
+    let run = hosted(&open.inputs.spec.layers)
+        .map_err(|e| GpuError::shape(WHAT, format!("the routed layers: {e}")))?;
+    SlotMap::of_plan_tiers(open.plan, card, &tier_cards, run, hp.experts.n_expert)
+}
+
+/// The stores the load made against the plan's count of them: the plan counts the layers' stores
+/// by the header's widths, and a load whose stores differ holds another number of bytes than the
+/// plan fitted. Refused by name with both figures.
+fn refuse_stores(layers: &[Layer], open: &Open<'_>, card: usize) -> Result<(), GpuError> {
+    let held: u64 = layers.iter().map(|l| l.store_bytes() as u64).sum();
+    let planned = open.inputs.kv.bytes(0..layers.len(), open.plan.ctx_max);
+    let counted = open
+        .plan
+        .cards
+        .get(card)
+        .map(|t| t.kv_bytes)
+        .ok_or_else(|| GpuError::shape(WHAT, format!("the plan has no card {card}")))?;
+    if held != planned || counted != planned {
+        return Err(GpuError::shape(
+            WHAT,
+            format!(
+                "the stores hold {held} device bytes; the plan's layout counts {planned} and \
+                 card {card}'s plan {counted}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 impl Body {
     fn load(
         gpu: &Gpu,
         file: &Split,
         w: &Weights,
         (hp, ctx): (Hparams, usize),
+        placed: Option<(Open<'_>, usize)>,
     ) -> Result<Body, GpuError> {
         let stream = gpu.stream();
+        let map = placed
+            .as_ref()
+            .map(|(open, card)| placed_map(open, *card, &hp))
+            .transpose()?;
         let n = hp.n_embd;
         if hp.attn_res_block == 0 {
             return Err(GpuError::shape(
@@ -636,7 +837,11 @@ impl Body {
                     vector(names::ffn_norm(l))?,
                 )
             } else {
-                let (routed, norm) = routed_of((file, w), l, &moe)?;
+                let stacks = match &map {
+                    Some(m) => m.on_card(l)? > 0,
+                    None => true,
+                };
+                let (routed, norm) = routed_of((file, w), l, &moe, stacks)?;
                 (Ffn::Routed(routed), norm)
             };
             layers.push(Layer {
@@ -653,12 +858,21 @@ impl Body {
         vector(names::OUTPUT_RES_SCORE.to_owned())?;
         let acts = Acts::new(stream, layers.iter().flat_map(Layer::sites))?;
         let ff = hp.dense_ff.max(moe.shared_ff);
+        let hosted_load = placed.is_some();
         let router = if (moe.n_expert, moe.n_used) == super::moe::INSTANCES[0] {
-            Instance::E896(Router::load(gpu, n, ff, &moe)?)
+            Instance::E896(Router::load(gpu, n, ff, &moe, hosted_load)?)
         } else {
-            Instance::E8(Router::load(gpu, n, ff, &moe)?)
+            Instance::E8(Router::load(gpu, n, ff, &moe, hosted_load)?)
+        };
+        let placed = match (placed, map) {
+            (Some((open, card)), Some(map)) => {
+                refuse_stores(&layers, &open, card)?;
+                Some(Placed::new((gpu, w), &layers, map, open)?)
+            }
+            _ => None,
         };
         Ok(Body {
+            placed,
             k: Kernels::load(gpu, &md)?,
             s: Scratch::new(stream, n, (&kd, &md), ctx)?,
             banks: DeviceBuffer::zeroed(stream, bank_slots * n)?,
@@ -687,6 +901,13 @@ impl Body {
             + self.router.bytes()
             + self.acts.bytes()
             + self.k.kgemv.device_bytes()
+            + self.placed.as_ref().map_or(0, Placed::device_bytes)
+    }
+
+    /// The placed side of the load: `None` on the whole-card load.
+    #[must_use]
+    pub fn placed(&self) -> Option<&Placed> {
+        self.placed.as_ref()
     }
 
     /// Device bytes of the sequence's stores: the delta layers' states and rings, the latent
@@ -848,6 +1069,13 @@ impl Body {
     ) -> Result<(Vec<f32>, Option<Vec<u32>>), GpuError> {
         const ALONE: &str = "kimi_k3::Body::ffn_alone";
         let stream = gpu.stream();
+        if self.placed.is_some() {
+            return Err(GpuError::shape(
+                ALONE,
+                "a placed body's routed block is split across the card, the tier and the host: \
+                 it runs no block alone",
+            ));
+        }
         if xn.len() != self.hp.n_embd {
             return Err(GpuError::shape(
                 ALONE,
@@ -891,9 +1119,9 @@ impl Body {
     }
 
     /// The step's launches in order (module doc): the embedding, every layer, the final mix, the
-    /// head.
+    /// head. A placed load has no embedding launch (its row is the refresh's) and walks its layers
+    /// through the host tier's step port ([`placed`]).
     fn walk(&mut self, gpu: &Gpu, w: &Weights, head: &mut Head) -> Result<(), GpuError> {
-        let stream = gpu.stream();
         let Body {
             hp,
             kda: kd,
@@ -907,14 +1135,107 @@ impl Body {
             step_in,
             lane,
             router,
+            placed,
             taps,
             ctx,
             ..
         } = self;
-        let n = hp.n_embd;
-        let eps = hp.rms_eps;
+        if placed.is_none() {
+            embed(gpu, w, step_in, &mut s.sum[0])?;
+        }
         let scale = hp.experts.weights_scale;
         let cx = step_cx(gpu, w, k, hp, *ctx);
+        let mut walk = Walk {
+            cx,
+            k,
+            acts,
+            lane,
+            kd,
+            md,
+            s,
+            banks,
+            step_in,
+            taps: taps.as_mut(),
+            n: hp.n_embd,
+            eps: hp.rms_eps,
+            pushed: 0,
+        };
+        match placed.as_mut() {
+            None => {
+                for (l, layer) in layers.iter_mut().enumerate() {
+                    walk.attn_half(l, layer)?;
+                    router.run(
+                        &walk.cx,
+                        &mut *walk.acts,
+                        (*act, scale),
+                        (l, &layer.ffn),
+                        &walk.s.ffn_xn,
+                        &mut walk.s.update,
+                    )?;
+                    walk.close(l)?;
+                }
+            }
+            Some(Placed { shell, side, .. }) => {
+                let mut leg = StepLeg::new(gpu.stream(), &mut shell.hybrid);
+                let mut step = placed::StepWalk {
+                    walk,
+                    layers,
+                    router,
+                    side,
+                    rule: (*act, scale),
+                    latent: hp.latent,
+                };
+                step.run(&mut leg)?;
+                walk = step.walk;
+            }
+        }
+        walk.finish(head)
+    }
+}
+
+/// The step's borrowed parts and the walk's one counter, the layers' common sequence (module
+/// doc): [`Walk::attn_half`] runs a layer to its normed feed-forward input, the block runs
+/// (whole, or around the host tier's go, [`placed`]) and [`Walk::close`] adds its update to the
+/// sum.
+struct Walk<'a> {
+    cx: GqaCx<'a>,
+    k: &'a Kernels,
+    acts: &'a mut Acts,
+    lane: &'a Lane,
+    kd: &'a KdaDims,
+    md: &'a MlaDims,
+    s: &'a mut Scratch,
+    banks: &'a mut DeviceBuffer<f32>,
+    step_in: &'a StepIn,
+    taps: Option<&'a mut Taps>,
+    n: usize,
+    eps: f32,
+    /// Block inputs banked so far this step.
+    pushed: usize,
+}
+
+impl Walk<'_> {
+    /// Layer `l`'s steps 1 to 5 up to the block: the mix for the mixer, the bank, the mixer, the
+    /// sum after it (`pb`), and the feed-forward mix normed into `ffn_xn`.
+    fn attn_half(&mut self, l: usize, layer: &mut Layer) -> Result<(), GpuError> {
+        let Walk {
+            cx,
+            k,
+            acts,
+            lane,
+            kd,
+            md,
+            s,
+            banks,
+            step_in,
+            taps,
+            n,
+            eps,
+            pushed,
+        } = self;
+        let (gpu, w) = (cx.gpu, cx.w);
+        let stream = gpu.stream();
+        let (n, eps) = (*n, *eps);
         let Scratch {
             sum,
             mixed,
@@ -923,87 +1244,21 @@ impl Body {
             ffn_xn,
             kda: kb,
             mla: mb,
-        } = s;
+        } = &mut **s;
         let [pa, pb] = sum;
-        embed(gpu, w, step_in, pa)?;
+        let fault = gpu.layer_sink(l)?;
+        let [attn_score, ffn_score] = &layer.scores;
         let (pos, keys) = (&step_in.pos, &step_in.n_keys);
-        let mut pushed = 0usize;
-        for (l, layer) in layers.iter_mut().enumerate() {
-            let fault = gpu.layer_sink(l)?;
-            let [attn_score, ffn_score] = &layer.scores;
-            // 1. The mixer's input: the mix over the banks, or the sum itself with no bank yet.
-            let input: &DeviceBuffer<f32> = if pushed > 0 {
-                k.attn_res.enqueue(
-                    stream,
-                    AttnResArgs {
-                        banks: &*banks,
-                        n_banks: pushed,
-                        stride: n,
-                        cur: &*pa,
-                        score: w.f32_buf(STEP, attn_score)?,
-                        eps,
-                        n,
-                        m: 1,
-                        fault,
-                    },
-                    mixed,
-                )?;
-                &*mixed
-            } else {
-                &*pa
-            };
-            // 2. A banking layer banks the raw sum.
-            if layer.banks {
-                let mut slot = WindowMut::<f32>::of_mut(&mut *banks, pushed * n * 4, n)?;
-                copy_row(stream, &*pa, &mut slot, n)?;
-                pushed += 1;
-            }
-            // 3. The mixer. A banking layer's update is the next sum: it lands in the other sum
-            // buffer.
-            let out: &mut DeviceBuffer<f32> = if layer.banks { &mut *pb } else { &mut *update };
-            let io = MixerIo {
-                input,
-                pos,
-                keys,
-                xn: &mut *xn,
-                kb: &mut *kb,
-                mb: &mut *mb,
-                out,
-            };
-            run_mixer(
-                &cx,
-                (k, &mut *acts, &*lane),
-                (l, &mut layer.mixer),
-                (kd, md),
-                io,
-            )?;
-            if let Some(t) = taps.as_mut() {
-                let mixer_out: &DeviceBuffer<f32> = if layer.banks { &*pb } else { &*update };
-                t.put(stream, (l, TAP_ATTN_NORM), &*xn)?;
-                t.put(stream, (l, TAP_MIXER_OUT), mixer_out)?;
-                if matches!(layer.mixer, Mixer::Kda { .. }) {
-                    t.put(stream, (l, TAP_BETA), &kb.beta)?;
-                    t.put(stream, (l, TAP_G1), &kb.decay)?;
-                    t.put(stream, (l, TAP_SCAN), &kb.o)?;
-                    t.put(stream, (l, TAP_G2), &kb.z)?;
-                }
-            }
-            // 4. The sum after the mixer: its update alone on a banking layer, else the sum plus it.
-            if !layer.banks {
-                gpu.elem().enqueue_add(stream, &*pa, &*update, n, pb)?;
-            }
-            if let Some(t) = taps.as_mut() {
-                t.put(stream, (l, TAP_PREFIX), &*pb)?;
-            }
-            // 5. The block: the mix of the banks and the sum, the layer's norm, the block.
+        // 1. The mixer's input: the mix over the banks, or the sum itself with no bank yet.
+        let input: &DeviceBuffer<f32> = if *pushed > 0 {
             k.attn_res.enqueue(
                 stream,
                 AttnResArgs {
-                    banks: &*banks,
-                    n_banks: pushed,
+                    banks,
+                    n_banks: *pushed,
                     stride: n,
-                    cur: &*pb,
-                    score: w.f32_buf(STEP, ffn_score)?,
+                    cur: &*pa,
+                    score: w.f32_buf(STEP, attn_score)?,
                     eps,
                     n,
                     m: 1,
@@ -1011,32 +1266,117 @@ impl Body {
                 },
                 mixed,
             )?;
-            gpu.elem().enqueue_rms_norm(
-                stream,
-                &*mixed,
-                w.f32_buf(STEP, &layer.ffn_norm)?,
-                eps,
-                n,
-                1,
-                ffn_xn,
-            )?;
-            router.run(&cx, acts, (*act, scale), (l, &layer.ffn), &*ffn_xn, update)?;
-            gpu.elem().enqueue_add(stream, &*pb, &*update, n, pa)?;
-            if let Some(t) = taps.as_mut() {
-                t.put(stream, (l, TAP_FFN_NORM), &*ffn_xn)?;
-                t.put(stream, (l, TAP_FFN_OUT), &*update)?;
-                t.put(stream, (l, TAP_L_OUT), &*pa)?;
+            &*mixed
+        } else {
+            &*pa
+        };
+        // 2. A banking layer banks the raw sum.
+        if layer.banks {
+            let mut slot = WindowMut::<f32>::of_mut(&mut **banks, *pushed * n * 4, n)?;
+            copy_row(stream, &*pa, &mut slot, n)?;
+            *pushed += 1;
+        }
+        // 3. The mixer. A banking layer's update is the next sum: it lands in the other sum
+        // buffer.
+        let out: &mut DeviceBuffer<f32> = if layer.banks { &mut *pb } else { &mut *update };
+        let io = MixerIo {
+            input,
+            pos,
+            keys,
+            xn: &mut *xn,
+            kb: &mut *kb,
+            mb: &mut *mb,
+            out,
+        };
+        run_mixer(
+            cx,
+            (k, &mut **acts, lane),
+            (l, &mut layer.mixer),
+            (kd, md),
+            io,
+        )?;
+        if let Some(t) = taps.as_mut() {
+            let mixer_out: &DeviceBuffer<f32> = if layer.banks { &*pb } else { &*update };
+            t.put(stream, (l, TAP_ATTN_NORM), &*xn)?;
+            t.put(stream, (l, TAP_MIXER_OUT), mixer_out)?;
+            if matches!(layer.mixer, Mixer::Kda { .. }) {
+                t.put(stream, (l, TAP_BETA), &kb.beta)?;
+                t.put(stream, (l, TAP_G1), &kb.decay)?;
+                t.put(stream, (l, TAP_SCAN), &kb.o)?;
+                t.put(stream, (l, TAP_G2), &kb.z)?;
             }
         }
+        // 4. The sum after the mixer: its update alone on a banking layer, else the sum plus it.
+        if !layer.banks {
+            gpu.elem().enqueue_add(stream, &*pa, &*update, n, pb)?;
+        }
+        if let Some(t) = taps.as_mut() {
+            t.put(stream, (l, TAP_PREFIX), &*pb)?;
+        }
+        // 5. The block's input: the mix of the banks and the sum, the layer's norm.
         k.attn_res.enqueue(
             stream,
             AttnResArgs {
-                banks: &*banks,
-                n_banks: pushed,
+                banks,
+                n_banks: *pushed,
                 stride: n,
-                cur: &*pa,
-                score: w.f32_buf(STEP, names::OUTPUT_RES_SCORE)?,
+                cur: &*pb,
+                score: w.f32_buf(STEP, ffn_score)?,
                 eps,
+                n,
+                m: 1,
+                fault,
+            },
+            mixed,
+        )?;
+        gpu.elem().enqueue_rms_norm(
+            stream,
+            &*mixed,
+            w.f32_buf(STEP, &layer.ffn_norm)?,
+            eps,
+            n,
+            1,
+            ffn_xn,
+        )
+    }
+
+    /// Layer `l`'s block update (`update`) added to the sum after the mixer (`pb`) into the
+    /// first sum buffer, and the layer's block taps.
+    fn close(&mut self, l: usize) -> Result<(), GpuError> {
+        let stream = self.cx.gpu.stream();
+        let n = self.n;
+        let Scratch {
+            sum,
+            update,
+            ffn_xn,
+            ..
+        } = &mut *self.s;
+        let [pa, pb] = sum;
+        self.cx
+            .gpu
+            .elem()
+            .enqueue_add(stream, &*pb, &*update, n, pa)?;
+        if let Some(t) = self.taps.as_mut() {
+            t.put(stream, (l, TAP_FFN_NORM), &*ffn_xn)?;
+            t.put(stream, (l, TAP_FFN_OUT), &*update)?;
+            t.put(stream, (l, TAP_L_OUT), &*pa)?;
+        }
+        Ok(())
+    }
+
+    /// The final mix over every bank and the sum into the head's input, and the head.
+    fn finish(&mut self, head: &mut Head) -> Result<(), GpuError> {
+        let (gpu, w) = (self.cx.gpu, self.cx.w);
+        let n = self.n;
+        self.k.attn_res.enqueue(
+            gpu.stream(),
+            AttnResArgs {
+                banks: &*self.banks,
+                n_banks: self.pushed,
+                stride: n,
+                cur: &self.s.sum[0],
+                score: w.f32_buf(STEP, names::OUTPUT_RES_SCORE)?,
+                eps: self.eps,
                 n,
                 m: 1,
                 fault: gpu.fault_sink(LAYER_HEAD),
@@ -1049,7 +1389,7 @@ impl Body {
 
 impl ChainBody for Body {
     type Input = DecodeInput;
-    type Host = NoHost;
+    type Host = Placed;
     const UNHOSTED_POOL: bloomery_levers::UnhostedPool = bloomery_levers::UnhostedPool::NotCarried;
 
     fn arch() -> Arch {
@@ -1080,8 +1420,22 @@ impl ChainBody for Body {
                 ),
             ));
         }
-        self.step_in.ids.copy_from_host(stream, &[input.token])?;
-        self.step_in.pos0.copy_from_host(stream, &[input.pos])?;
+        match self.placed.as_mut() {
+            None => {
+                self.step_in.ids.copy_from_host(stream, &[input.token])?;
+                self.step_in.pos0.copy_from_host(stream, &[input.pos])?;
+            }
+            Some(p) => p.refresh(
+                stream,
+                input.token,
+                (
+                    &mut self.s.sum[0],
+                    &mut self.step_in.pos,
+                    &mut self.step_in.n_keys,
+                ),
+                input.pos,
+            )?,
+        }
         self.held = input.pos + 1;
         Ok(())
     }
@@ -1100,6 +1454,9 @@ impl ChainBody for Body {
                 state::clear_store(stream, store)?;
             }
         }
+        if let Some(p) = self.placed.as_mut() {
+            p.reset(stream)?;
+        }
         self.held = 0;
         Ok(())
     }
@@ -1117,7 +1474,7 @@ impl ChainBody for Body {
         0..self.layers.len()
     }
 
-    fn host(&mut self) -> Option<&mut NoHost> {
-        None
+    fn host(&mut self) -> Option<&mut Placed> {
+        self.placed.as_mut()
     }
 }

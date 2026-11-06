@@ -197,11 +197,14 @@ impl<R: RouterEntry> Kern<R> {
 
 /// Layer `l`'s routed block of `file`'s resident weights `w` at `dims` (the sites, the router
 /// rows, the routed stacks, the latent pair and the sum norm, each held to its width and type),
-/// and the name of the layer's `ffn_norm`. Load-time only.
+/// and the name of the layer's `ffn_norm`. `stacks` is whether the layer's routed stacks are
+/// resident: false on a placed load for a layer whose experts the card holds none of. Load-time
+/// only.
 pub(super) fn routed_of(
     (file, w): (&Split, &Weights),
     l: usize,
     dims: &MoeDims,
+    stacks: bool,
 ) -> Result<(Routed, String), GpuError> {
     let MoeDims {
         hidden: n,
@@ -251,7 +254,9 @@ pub(super) fn routed_of(
         sum_norm: Some(site::vector(w, WHAT, names::ffn_routed_norm(l), latent)?),
     };
     // The stacks' types and shapes, refused here by name rather than at the first launch.
-    LegStacks::of_resident(w, routed.stacks.each_ref().map(String::as_str)).map(drop)?;
+    if stacks {
+        LegStacks::of_resident(w, routed.stacks.each_ref().map(String::as_str)).map(drop)?;
+    }
     let norm = site::vector(w, WHAT, names::ffn_norm(l), n)?;
     Ok((routed, norm))
 }
@@ -285,7 +290,7 @@ impl<R: RouterEntry> Block<R> {
             shared_ff,
             ..
         } = dims;
-        let (routed, norm) = routed_of((file, w), l, &dims)?;
+        let (routed, norm) = routed_of((file, w), l, &dims, true)?;
         let ffn = Ffn::Routed(routed);
         let sites = match &ffn {
             Ffn::Routed(r) => r.sites(),

@@ -2,20 +2,35 @@
 //! template) walked through the decode step one id at a time, then `-n` greedy ids, printed.
 //!
 //!     BLOOMERY_MODEL=kimi-k3 generate_kimi_k3 [--tokens a,b,c | --prompt TEXT] [-n N]
-//!                            [--ctx C] [--place a] [--mode eager|graph] [--plan]
+//!                            [--ctx C] [--place a|bp|gate] [--mode eager|graph] [--plan]
+//!                            [--granule BYTES]
 //!
 //! Defaults: `-n 8`, `--ctx 512`, `--place a`, `--mode graph`. The model is `ref_model_path()`. The
 //! file is read as the plan reads it ([`PlanInputs::read_without_chat`]: every part the body does
 //! not run is refused by name, the template's tool-call parser excepted) and planned on `--place`
-//! before anything loads; `--plan` ends there. The body holds the whole model on one card, so
-//! `--place a` is the one placement. The released file ends at the plan (its dense trunk alone
-//! does not fit the card), and a file the plan passes but whose tensors exceed the card's free
-//! bytes is refused by name by the load ([`bloomery_gpu::GpuModel::open`]): the placed load over
-//! two stage cards, the host and the NVMe tier does not exist. The prompt walk is the session's
-//! ([`app::Prompt`] for the body); the body has no rows pass.
+//! before anything loads; `--plan` ends there.
+//!
+//! `--place a` loads the whole model on one card ([`bloomery_gpu::GpuModel::open`]): a file whose
+//! tensors exceed the card's free bytes is refused by name by the load. Any other placement
+//! (`bp`: the stage card, the second card as the expert tier and the host and NVMe tiers behind
+//! them, `gate`) loads by the plan ([`bloomery_gpu::GpuModel::open_placed`] through
+//! `Body::open_placed`): the dense trunk and each layer's card experts on the stage card, the
+//! embedding as a host row, the tier cards' experts under the host tier (a node's, with
+//! `BLOOMERY_TIER_NODES`, served by `tier_server`). The host tier has no SiTU expert form yet, so a
+//! plan that leaves an expert on the host is refused by name by the load. The prompt walk is the
+//! body's: its ids stepped one at a time, as the session's `Prompt` does, but without that call's
+//! own residency boundary, which a hosted load refuses; the body has no rows pass.
+//!
+//! The plan is made under `BLOOMERY_CARD_BUDGET` and `BLOOMERY_CARD_MARGIN` when they are set.
+//! `--granule BYTES` counts each card's uploads at that allocator granule instead of the
+//! census's (the workstation's 2 MiB when the flag is absent): a fixture's experts fit the shared
+//! granules the dense trunk leaves open at 2 MiB, so no budget splits them between the cards, and
+//! a finer granule gives the budget a window. A value that is not a power of two of at least 4 KiB
+//! is refused by name. It is a plan input only; the driver allocates as it does.
 //!
 //! The lines on stdout: `load` (the resident bytes, the context, seconds), `ids` (the generated
-//! ids) and, with the vocabulary's pieces, `text`. The plan's records go to stderr.
+//! ids), `logits` (an FNV-1a over the last row's bits) and, with the vocabulary's pieces, `text`.
+//! The plan's records go to stderr.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -28,17 +43,19 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod cli {
-    use app::Prompt;
     use bloomery_gpu::arch::kimi_k3::Body;
     use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu::{Gpu, GpuModel};
-    use bloomery_gpu_gates::generate::Place;
+    use bloomery_gpu_gates::generate::{Place, TierRule};
     use bloomery_gpu_gates::need;
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
+    use bloomery_levers::{
+        CARD_BUDGET, CARD_DONTNEED, CARD_MARGIN, HOST_LOCK, HOST_POPULATE, HostCfg, TIER_NODES,
+    };
     use gguf::Split;
-    use model::arch::kimi_k3::place::PlanInputs;
-    use model::placement::PlanLevers;
+    use model::arch::kimi_k3::place::{PlanInputs, tier_batch};
+    use model::placement::{Plan, PlanLevers};
     use tokenizer::Tokenizer;
 
     /// The argument after flag `name`: `None` when the flag is absent, an error when it is last.
@@ -62,10 +79,25 @@ mod cli {
         Ok(m)
     }
 
+    /// The model of `file` as `plan` places it (card 0 the stage), stepping in `mode`. The body's
+    /// own refusals reach the caller by name.
+    fn open_placed(
+        file: Split,
+        (plan, inputs): (&Plan<'_>, &PlanInputs),
+        host: HostCfg,
+        mode: StepMode,
+    ) -> Result<GpuModel<Body>, GateError> {
+        let mut m = GpuModel::<Body>::open_placed(file, plan, inputs, 0, host)?;
+        m.set_mode(mode);
+        Ok(m)
+    }
+
     /// `n` greedy ids after `prompt`, from the model's position: the argmax after the prompt
-    /// ([`Prompt::prompt`]), then each id fed back one a step.
+    /// stepped, then each id fed back one a step.
     fn greedy(m: &mut GpuModel<Body>, prompt: &[u32], n: usize) -> Result<Vec<u32>, GateError> {
-        let mut ids = vec![Body::prompt(m, prompt)?];
+        // The prompt's ids are stepped, not `Prompt::prompt`: that wraps the call in one residency
+        // boundary and each step opens its own, which a hosted load refuses by name.
+        let mut ids = vec![m.step(prompt)?];
         while ids.len() < n {
             let last = ids[ids.len() - 1];
             ids.push(m.step(&[last])?);
@@ -73,12 +105,48 @@ mod cli {
         Ok(ids)
     }
 
+    /// FNV-1a over the bits of the last logits row: what a gate holds two processes' rows equal by.
+    fn fnv(row: &[f32]) -> u64 {
+        row.iter()
+            .flat_map(|v| v.to_bits().to_le_bytes())
+            .fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+                (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+            })
+    }
+
+    /// The tier cards the body serves: one, the stage card's neighbour. No sitting has shown the
+    /// tier not slower, so the flag defaults to `a` and the rule never picks.
+    const TIER_RULE: TierRule = TierRule {
+        tiers: 1,
+        break_even: None,
+        basis: "",
+    };
+
+    /// The levers this CLI acts on: the card budget and margin the plan is made under, the host
+    /// set's load and the expert tier's nodes.
+    const ACTS_ON: [&str; 6] = [
+        CARD_BUDGET,
+        CARD_MARGIN,
+        HOST_POPULATE,
+        HOST_LOCK,
+        CARD_DONTNEED,
+        TIER_NODES,
+    ];
+
     /// Every flag this CLI reads; any other argument is refused by name, never ignored.
-    const KNOWN: [&str; 7] = [
-        "--tokens", "--prompt", "-n", "--ctx", "--place", "--mode", "--plan",
+    const KNOWN: [&str; 8] = [
+        "--tokens",
+        "--prompt",
+        "-n",
+        "--ctx",
+        "--place",
+        "--mode",
+        "--plan",
+        "--granule",
     ];
 
     pub fn run() -> Result<(), GateError> {
+        let levers = bloomery_levers::at_main(&ACTS_ON)?;
         let args: Vec<String> = std::env::args().skip(1).collect();
         let mut i = 0;
         while i < args.len() {
@@ -112,18 +180,40 @@ mod cli {
         let inputs = PlanInputs::read_without_chat(&split)
             .map_err(|e| format!("{}: {e}", path.display()))?;
         let census = gpu_census::census()?;
-        let chosen = Place::choose_untiered(Some(place), &census, "kimi-k3")?;
+        let chosen = Place::choose(Some(place), &census, TIER_RULE, |_| {
+            Err("--place unset is never asked: the flag defaults to a".into())
+        })?;
         chosen.record().eprint();
-        let machine = chosen.place.machine_untiered()?(inputs.model.layers);
+        chosen.place.serves("kimi-k3", TIER_RULE.tiers)?;
+        let tiered = !chosen.place.tier_cards().is_empty();
+        let batch = tiered
+            .then(|| tier_batch(&inputs.hp))
+            .transpose()
+            .map_err(|e| format!("--place {}: {e}", chosen.place.name()))?;
+        let mut machine = chosen.place.machine(None, batch)?(inputs.model.layers);
+        if let Some(g) = flag(&args, "--granule")? {
+            let g: u64 = g.parse()?;
+            if !g.is_power_of_two() || g < 4 << 10 {
+                return Err(format!(
+                    "generate_kimi_k3: --granule {g}: a power of two of at least 4096 bytes (the \
+                     default is the workstation's 2 MiB)"
+                )
+                .into());
+            }
+            let granule = std::num::NonZeroU64::new(g).ok_or("--granule is nonzero")?;
+            for card in machine.cards.iter_mut().chain(machine.tiers.iter_mut()) {
+                card.granule_bytes = granule;
+            }
+        }
         let plan = inputs
-            .plan(&machine, ctx as u64, &PlanLevers::default())
+            .plan(&machine, ctx as u64, &PlanLevers::from_levers(&levers)?)
             .map_err(|e| format!("--place {}: {e}", chosen.place.name()))?;
         record::plan(chosen.place.name(), &machine, &plan).eprint();
         need::print(&plan, 0, 0, true)?;
         if plan_only {
             return Ok(());
         }
-        drop(plan);
+        let placed = chosen.place.name() != "a";
 
         let tok = text
             .is_some()
@@ -152,7 +242,11 @@ mod cli {
             .into());
         }
         let t = std::time::Instant::now();
-        let mut m = open(split, ctx, mode)?;
+        let mut m = if placed {
+            open_placed(split, (&plan, &inputs), levers.host(), mode)?
+        } else {
+            open(split, ctx, mode)?
+        };
         println!(
             "load arch={} resident_bytes={} ctx={ctx} layers={} load_s={:.1}",
             <Body as ChainBody>::arch().name(),
@@ -162,6 +256,7 @@ mod cli {
         );
         let out = greedy(&mut m, &ids, n)?;
         println!("ids {out:?}");
+        println!("logits fnv1a64={:016x}", fnv(&m.logits()?));
         if let Some(tok) = tok {
             println!("text {:?}", tok.decode(&out));
         }

@@ -1,11 +1,15 @@
 //! A Kimi K3 file planned onto a machine: the common hybrid owner's plan ([`place_hybrid`]) over
 //! this family's reading. What each layer holds is read off the description (a KDA layer's state
-//! and conv ring, a latent layer's plane of cached rows), the routed experts' bytes are the
-//! file's by their stacks' types, and a machine that hangs an expert tier card is refused by name
-//! ([`PlaceError::Tier`]) until a body serves one. The body runs every layer of the description
-//! ([`Program::KimiK3Body`]); what is left to the coverage check is the template's tool-call
-//! parser, the chat surface's, so [`PlanInputs::read`] refuses that one item and a driver that
-//! feeds ids and renders no chat reads the file by [`PlanInputs::read_without_chat`].
+//! and conv ring, a latent layer's plane of cached rows), and the routed experts' bytes are the
+//! file's by their stacks' types. The plan serves the placed load: an expert tier card beside the
+//! stage card ([`tier_places_bytes`] of card buffers on the stage, [`tier_batch`] reserved on the
+//! tier card and the host) and the common host run's NVMe arena for the experts the host's room
+//! cannot hold ([`PlanInputs::with_nvme_tier`]). The body walks a prompt one id a step, so the
+//! plan keeps no prompt-pass bytes ([`PlanInputs::prompt_reserve`] is 0) and the tier's run and
+//! page are one token ([`TIER_CHUNK`], [`TIER_ROWS`]). The body runs every layer of the
+//! description ([`Program::KimiK3Body`]); what is left to the coverage check is the template's
+//! tool-call parser, the chat surface's, so [`PlanInputs::read`] refuses that one item and a
+//! driver that feeds ids and renders no chat reads the file by [`PlanInputs::read_without_chat`].
 
 use gguf::Split;
 use models::Need;
@@ -13,6 +17,7 @@ use models::Need;
 use super::hparams::Hparams;
 use super::spec;
 use crate::arch::place_hybrid;
+use crate::placement::workstation::{self, TierBatchBytes};
 use crate::placement::{PlacementError, Unimplemented};
 
 pub use place_hybrid::{KvLayout, PlaceError};
@@ -22,6 +27,35 @@ pub type PlanInputs = place_hybrid::PlanInputs<Hparams>;
 
 /// The engine the plan's refusals name.
 const ENGINE: &str = "Kimi K3";
+
+/// Tokens one run of the tier's card leg covers: the body walks a prompt one id a step, so a
+/// run is the step's one token.
+pub const TIER_CHUNK: u64 = 1;
+
+/// Rows of the tier's page and of the host tier's batch port: the step's one.
+pub const TIER_ROWS: u64 = 1;
+
+/// The stage card's bytes a tiered load makes beside the plan's terms: the slot map's tier view
+/// (a place per expert per layer) and the step's tier places (`n_used` for each of
+/// [`TIER_ROWS`] rows), four bytes each.
+#[must_use]
+pub fn tier_places_bytes(hp: &Hparams) -> u64 {
+    4 * (hp.n_layer * hp.experts.n_expert + TIER_ROWS as usize * hp.experts.n_used) as u64
+}
+
+/// The expert tier's batch bytes ([`TierBatchBytes`]) the machine reserves on the tier card and
+/// the host: the experts run in the latent, so the tier's rows and its staging are the latent's
+/// width, through the card leg in runs of [`TIER_CHUNK`] over [`TIER_ROWS`] tokens. Refused by
+/// name: a geometry the common leg's bytes do not count.
+pub fn tier_batch(hp: &Hparams) -> Result<TierBatchBytes, PlacementError> {
+    workstation::tier_leg_batch_bytes(
+        hp.latent as u64,
+        hp.experts.ff as u64,
+        hp.experts.n_used as u64,
+        TIER_CHUNK,
+        TIER_ROWS,
+    )
+}
 
 impl PlanInputs {
     /// [`PlanInputs::describe`], then the file refused with every feature the engine does not run
@@ -54,7 +88,10 @@ impl PlanInputs {
     pub fn describe(split: &Split) -> Result<PlanInputs, PlacementError> {
         let hp = Hparams::read(split)?;
         let read = spec::read(split)?;
-        PlanInputs::new(ENGINE, hp, read.tensors, read.spec)
+        let tier = tier_places_bytes(&hp);
+        Ok(PlanInputs::new(ENGINE, hp, read.tensors, read.spec)?
+            .with_tier_reserve(tier)
+            .with_nvme_tier())
     }
 }
 
@@ -191,20 +228,31 @@ mod tests {
         ));
     }
 
-    /// A machine that hangs an expert tier card is refused by the tier's name, before the
-    /// coverage list: no body serves a tier.
+    /// The tier's bytes are the header's counts [derived apart from the reader]: the stage card
+    /// keeps a place per expert per layer for the slot map's tier view and `n_used` places for the
+    /// step's row, four bytes each, so the mini's 4 layers of 4 experts, 2 kept, are
+    /// 4 x (4 x 4 + 2) = 72 B, which the inputs carry as the tier reserve and a tiered machine's
+    /// prompt batch adds to the (zero) prompt reserve. A machine that hangs an expert tier card
+    /// passes the body's tier check, and meets the placement's own refusal of a tier with nothing
+    /// to hold (the mini's experts all fit the stage card); the inputs of a body that serves no
+    /// tier are refused by the tier's name.
     #[test]
-    fn a_tier_card_is_refused_by_name() {
+    fn a_tier_card_passes_the_bodys_tier_check() {
         let inputs = described("kimi-k3-place-tier");
-        let machine = workstation::plan_tiers(
-            4,
-            A6000,
-            &[RTX_3090],
-            None,
-            workstation::tier_batch_bytes(512, 256, 2, 512),
-        )
-        .expect("the tier machine plans");
+        assert_eq!(super::tier_places_bytes(&inputs.hp), 72);
+        assert_eq!(inputs.tier_reserve, Some(72));
+        assert_eq!(inputs.prompt_reserve, 0);
+        let batch = super::tier_batch(&inputs.hp).expect("the mini's geometry has leg bytes");
+        let machine = workstation::plan_tiers(4, A6000, &[RTX_3090], None, batch)
+            .expect("the tier machine plans");
+        assert_eq!(inputs.prompt_batch_bytes(&machine).expect("tiered"), 72);
         match inputs.plan(&machine, 64, &PlanLevers::default()) {
+            Err(PlaceError::Placement(PlacementError::IdleTier { tier: 0, .. })) => {}
+            other => panic!("{other:?}, not the placement's idle-tier refusal"),
+        }
+        let mut untiered = inputs;
+        untiered.tier_reserve = None;
+        match untiered.plan(&machine, 64, &PlanLevers::default()) {
             Err(PlaceError::Tier { card, tier }) => assert_eq!((card.as_str(), tier), ("3090", 0)),
             other => panic!("{other:?}, not the tier refusal"),
         }

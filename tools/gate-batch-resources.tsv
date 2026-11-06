@@ -101,6 +101,9 @@ gate-gpu-glm5next-stagger	-	173015891968
 # crate fixture/glm5next and fixture/deepseek41 shard-size comments), one server at a time.
 gate-gpu-serve-start-glm	-	8600000000
 gate-gpu-serve-start-ds41	-	15000000000
+# gate-gpu-kimik3-place is fixture-only (its real tier is deferred by name): the row is the K3 fixture's plan need, `need bytes` of
+# `generate_kimi_k3 --plan --place bp` on it, 68,816,912 B; the gate's loads and its children's run one at a time.
+gate-gpu-kimik3-place	-	68816912
 gate-gpu-musespark-e2e	-	204000000000
 gate-gpu-mistrallarge4-e2e	-	211000000000
 gate-gpu-mistrallarge4-load	-	211000000000

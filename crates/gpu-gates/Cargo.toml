@@ -878,3 +878,8 @@ name = "gate_kimi_k3_pp"
 [[bin]]
 name = "generate_kimi_k3"
 required-features = ["gpu"]
+
+# kimik3place: Kimi K3's placed load (the stage card, the expert tier card in process and on a loopback node, the host row) against the whole-card body, over the fixture file.
+[[bin]]
+name = "gate_kimi_k3_place"
+required-features = ["gpu"]

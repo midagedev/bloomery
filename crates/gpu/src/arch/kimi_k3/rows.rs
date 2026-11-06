@@ -219,8 +219,15 @@ impl Pass {
     /// its K-quant sites read, which the body's activation forms gain here. Load-time only.
     ///
     /// # Errors
-    /// [`GpuError`] from the allocations.
+    /// [`GpuError`] for a placed body, whose prompt is the step's one id at a time, and from the
+    /// allocations.
     pub fn new(gpu: &Gpu, body: &mut Body) -> Result<Pass, GpuError> {
+        if body.placed().is_some() {
+            return Err(GpuError::shape(
+                ROWS,
+                "a placed body runs no rows pass: its prompt is stepped one id at a time",
+            ));
+        }
         let stream = gpu.stream();
         let Body {
             hp,
