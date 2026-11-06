@@ -12,16 +12,19 @@
 #             The built prepare is refused by name when its usage lacks --drop, --only or --arch.
 # Then, each a step of this runner:
 #   imatrix   llama-imatrix (mainline 78feec062, built by tools/ref/build-k3-quant-tree.sh as its own tree) over a calibration text
-#             at ctx 2048 -> $K3Q_WORK/kimi-k31-c<ctx>x<chunks>.imatrix.gguf. The text is the K3 trace corpora's own sources (the engine
-#             tree's docs and README, its C++ sources), half the chunks of each, cut by the K3 tokenizer's own bytes per token.
+#             at ctx 2048 -> $K3Q_WORK/kimi-k31-c<ctx>x<chunks>.imatrix.gguf. The text is 2 x chunks distinct documents of ctx/2 K3 tokens
+#             (4 chunks: 8 documents of 1024): half prose (docs/**/*.md, README.md), half code (tools/ref/*.cpp, the largest src/*.rs of
+#             distinct crates), laid out prose, code, ... so each chunk holds both; the source list is printed and kept as <text>.sources.
 #   quantize  llama-quantize --allow-requantize --imatrix <that> --tensor-type-file <rules> [--keep-split] <in> <out> <ftype>, the map
 #             --map says (below), after llama-quantize's own --dry-run plan of every tensor's type and size over the input's headers
 #             (kept in $K3Q_WORK; the output is held to it tensor by tensor afterwards)
 #             -> $K3Q_OUT_BASE/Kimi-K3.1-Pro-<type>[-<map>]-k3shape/ (a K3-shaped set: mainline loads it as K3, which at ctx <= 2048 is K3.1).
-#             Maps (what the lead's placement sizes): `tight` (default) routed experts IQ1_S, the trunk Q4_K_M (the global ftype; attn_k_b
-#             and ssm_f_b Q8_0, ssm_beta F32, kept for their size and sensitivity), token_embd Q4_K, output Q6_K, norms F32;
-#             `trunk-q5` the same with a Q5_K_M trunk; `ud` the K3 UD-IQ1_S file's own table (experts IQ1_S with IQ2_XXS layer bumps, the
-#             trunk Q6_K), reproduced by rules (`rules` prints them, `check` proves them against the K3 table): the comparison.
+#             Maps (what the lead's placement sizes): `tight` (default) the routed experts IQ1_S with IQ2_XXS on the layers K3's UD-IQ1_S
+#             file also promotes (read from the reference table: gate/up 11 46 47 56 57 58 68 69 70 71, down 83 92), every trunk stem
+#             (attention, KDA, shared expert, latent routed projections, the dense layer's mlp) Q4_K by rule, attn_k_b and ssm_f_b Q8_0,
+#             ssm_beta and the norms F32, token_embd Q4_K and output Q6_K by flag; `trunk-q5` the same with Q5_K stems; `ud` the K3
+#             UD-IQ1_S file's own table (the trunk Q6_K), reproduced by rules (`rules` prints them, `check` proves them against the K3
+#             table): the comparison. `check` proves tight and trunk-q5 against the same table, its Q6_K trunk retyped.
 #   plan      the quantize step's plan alone: no lease, no write besides the plan files; prints the bytes per class and the totals.
 #   splice    tools/ref/gguf-splice.py add: the indexer tensors back into that set, `general.architecture` and the `kimi-k3.*` keys
 #             renamed to $K3Q_ARCH, the dsa_config keys added; the shards that do not change are hard links; the source LICENSE copied
@@ -91,10 +94,10 @@ K31_BYTES=1560000000000     # derived: the K3.1 GGUF from prepare: 1.56 TB (MXFP
 K31_EXPERT_W=2722740000000  # derived from shapes: the 276 routed-expert tensors of K3's table, 3584 x 3072 x 896 each (K3.1 has K3's)
 NVME_READ_GBS=1.6           # measured floor: /models page-fault reads, 1.0-1.6 GB/s (k3trace); the sequential read uses the top
 NVME_WRITE_GBS=1.5          # derived: the same drive's write, no measurement better than the read's
-OUT_PER_IN=0.362            # derived: llama-quantize --dry-run of the tight map over K3's shapes: 567.7 GB out of 1.56 TB in
+OUT_PER_IN=0.372            # derived: llama-quantize --dry-run of the tight map over K3's shapes: 579.94 GB out of 1.56 TB in
 QUANT_RATE_MW=5.4           # measured: the smoke's 1-thread rate on the fixture (5.36 Mweights/s/thread, 4.72 Mweights in 881 ms, I/O included);
                             # the 40-thread scaling below is derived, not measured
-QUANT_EFF_THREADS=40        # derived: 64 hardware threads on 32 cores, the quantizer's row loop scales ~0.6 on the SMT siblings
+QUANT_EFF_THREADS=40        # assumed, unmeasured: nproc is 64 (Threadripper PRO 5975WX, 32 cores x 2 SMT) and every one is passed as -t; 32 cores x 1.25 SMT yield = 40
 SPLICE_SHARD_BYTES=48000000000   # the receiving shard's size, a K3 UD shard's (47-52 GB)
 
 die() { echo "k31-quant.sh: $1" >&2; exit "${2:-64}"; }
@@ -144,9 +147,9 @@ case $STEP in
   *) die "step '$STEP' is not prepare, imatrix, quantize, plan, splice, all, upload, rules, check, calib or smoke" ;;
 esac
 case $MAP in
-  tight) QTYPE=Q4_K_M TOKEMB=q4_k MAPTAG='' ;;
-  trunk-q5) QTYPE=Q5_K_M TOKEMB=q4_k MAPTAG=-trunk-q5 ;;
-  ud) QTYPE='' TOKEMB=q6_k MAPTAG=-ud ;;
+  tight) QTYPE=Q4_K_M TOKEMB=q4_k STEM=q4_k MAPTAG='' ;;
+  trunk-q5) QTYPE=Q5_K_M TOKEMB=q4_k STEM=q5_k MAPTAG=-trunk-q5 ;;
+  ud) QTYPE='' TOKEMB=q6_k STEM=q6_k MAPTAG=-ud ;;
   *) die "--map $MAP: tight, trunk-q5 or ud" ;;
 esac
 [ -n "$MAX_TRUNK" ] || { if [ "$MAP" = tight ]; then MAX_TRUNK=35; else MAX_TRUNK=0; fi; }
@@ -264,23 +267,19 @@ fi
 # quantizer touches (2-D or more, `weight`, not a norm, not ffn_gate_inp, not ssm_conv1d) and only when the global type is itself a
 # quantized one. So: the layer bumps first, then every routed expert, then the stems the K3 file holds as Q8_0 and as F32 (ssm_beta
 # is a 2-D weight the quantizer would otherwise quantize), then the Q6_K stems. token_embd and output.weight go by the two flags.
-gen_rules() { # <expert type> <gate/up bump layers 'a|b'> <down bump layers> <bump type>
+gen_rules() { # <expert type> <gate/up bump layers 'a|b'> <down bump layers> <bump type> <stem type> [head]: head adds token_embd and output
   [ -z "$2" ] || printf '%s\n' "blk\\.($2)\\.ffn_(gate|up)_exps\\.weight=$4"
   [ -z "$3" ] || printf '%s\n' "blk\\.($3)\\.ffn_down_exps\\.weight=$4"
   printf '%s\n' "ffn_(down|gate|up)_exps\\.weight=$1" \
     '\.attn_k_b\.weight$=q8_0' '\.ssm_f_b\.weight$=q8_0' '\.ssm_beta\.weight$=f32' \
-    '\.(attn_gate|attn_k|attn_kv_a_mqa|attn_output|attn_q|attn_q_a|attn_q_b|attn_v|attn_v_b|ffn_down|ffn_gate|ffn_up|ffn_down_shexp|ffn_gate_shexp|ffn_up_shexp|ffn_routed_down|ffn_routed_up|ssm_f_a|ssm_g)\.weight$=q6_k' \
-    '^(token_embd|output)\.weight$=q6_k'
-}
-gen_rules_trunk() { # <expert type>: the routed experts, then the three small exceptions; every other tensor takes the global type's
-  printf '%s\n' "ffn_(down|gate|up)_exps\\.weight=$1" '\.attn_k_b\.weight$=q8_0' '\.ssm_f_b\.weight$=q8_0' '\.ssm_beta\.weight$=f32'
+    "\.(attn_gate|attn_k|attn_kv_a_mqa|attn_output|attn_q|attn_q_a|attn_q_b|attn_v|attn_v_b|ffn_down|ffn_gate|ffn_up|ffn_down_shexp|ffn_gate_shexp|ffn_up_shexp|ffn_routed_down|ffn_routed_up|ssm_f_a|ssm_g)\.weight$=$5"
+  [ "${6:-}" != head ] || printf '%s\n' '^(token_embd|output)\.weight$=q6_k'
 }
 ref_layers() { # <gate|up|down> <type>: the layers of $REF whose routed tensor of that kind has that type, as 'a|b|c'
   awk -F'\t' -v kind="$1" -v ty="$2" '$2 == ty && $1 ~ ("^blk\\.[0-9]+\\.ffn_" kind "_exps\\.weight$") { split($1, a, "."); print a[2] }' "$REF" |
     sort -un | paste -sd'|' -
 }
-derive_bumps() { # sets BUMP_GU and BUMP_DN: IQ1_S follows the table (K3 UD's choice); another type only what --bump-* names
-  [ "$MAP" = ud ] || return 0
+derive_bumps() { # sets BUMP_GU and BUMP_DN: IQ1_S follows the table (K3 UD's IQ2_XXS layers, in every map); another type only what --bump-* names
   [ "$BUMP_SET" = 0 ] || return 0
   [ "$TYPE" = IQ1_S ] || return 0
   [ -f "$REF" ] || die "no reference table at $REF (--ref-table)" 66
@@ -292,12 +291,8 @@ derive_bumps() { # sets BUMP_GU and BUMP_DN: IQ1_S follows the table (K3 UD's ch
   BUMP_DN=$(ref_layers down IQ2_XXS)
 }
 make_rules() { # <file>
-  case $MAP in
-    ud)
-      derive_bumps
-      gen_rules "$TYPE" "$BUMP_GU" "$BUMP_DN" IQ2_XXS > "$1" ;;
-    *) gen_rules_trunk "$TYPE" > "$1" ;;
-  esac
+  derive_bumps
+  if [ "$MAP" = ud ]; then gen_rules "$TYPE" "$BUMP_GU" "$BUMP_DN" IQ2_XXS "$STEM" head > "$1"; else gen_rules "$TYPE" "$BUMP_GU" "$BUMP_DN" IQ2_XXS "$STEM" > "$1"; fi
 }
 
 # ---- the profile, the lease, one bounded command ----
@@ -412,36 +407,92 @@ force_clean() { # <marker> <output...>
 tok_count() { # <model's first shard> <text file>: the token count of the K3 tokenizer (vocab only: no tensor is read)
   CUDA_VISIBLE_DEVICES='' "$TOKENIZE" -m "$1" -f "$2" --ids --no-escape --no-parse-special --log-disable | tr -d '[] ' | tr ',' '\n' | grep -c .
 }
-gather() { # <prose|code>: the K3 trace corpora's sources (tools/ref/kimi-k3-corpus.sh), in its order
-  case $1 in
-    code) find "$IK/src" -maxdepth 1 -name '*.cpp' | sort | xargs -d '\n' cat -- ;;
-    prose) { find "$IK/docs" -name '*.md' | sort | xargs -d '\n' cat --; cat -- "$IK/README.md"; } ;;
-  esac
+# The calibration text: 2 x chunks distinct documents of ctx/2 tokens each (4 chunks at ctx 2048: 8 documents of 1024 tokens), half prose
+# (the tree's docs/**/*.md and README.md) and half code (tools/ref/*.cpp and the largest src/*.rs of each crate), laid out prose, code,
+# prose, code so each chunk holds one of each. A document is cut at the first line end that holds its token count; the pools are the
+# tree's own files that are mostly ASCII and long enough, the documents spread evenly over a pool, so the picks for n chunks are among
+# the picks for 2n (a later --chunks 8 run doubles the sources and keeps the first run's).
+CALIB_TREE=${K3Q_CALIB_TREE:-$ROOT}
+calib_pool() { # <prose|cpp|rs> <model's first shard> <min tokens>: candidate files (paths relative to the tree), sorted in the C locale
+  local f size na n
+  (
+    cd "$CALIB_TREE" || exit 66
+    case $1 in
+      prose) { echo README.md; find docs -name '*.md'; } ;;
+      cpp) find tools/ref -maxdepth 1 -name '*.cpp' ;;
+      rs) for f in crates/*/src; do find "$f" -maxdepth 1 -name '*.rs' -printf '%s %p\n' | sort -k1,1nr -k2 | head -n 1 | cut -d' ' -f2-; done ;;
+    esac | LC_ALL=C sort | while IFS= read -r f; do
+      [ -f "$f" ] || continue
+      size=$(stat -c %s "$f")
+      na=$(LC_ALL=C tr -d '\000-\177' < "$f" | wc -c | tr -d ' ')
+      [ "$na" -le $((size / 50)) ] || continue # a mostly-English file: at most 2 % of its bytes are not ASCII
+      n=$(tok_count "$2" "$f")
+      [ "$n" -ge "$3" ] || continue
+      echo "$f"
+    done
+  )
 }
-build_calib() { # <out> <in's first shard>: half the chunks of prose, then code, cut at the bytes the tokenizer says (bytes per token)
-  local out=$1 in=$2 tmp half need pt ct pb cb want total
+calib_pick() { # <n>: n lines spread evenly over stdin's lines (index floor(i * lines / n)), so the picks for n are among those for 2n
+  awk -v n="$1" '{ a[NR] = $0 } END { if (n > NR) exit 3; for (i = 0; i < n; i++) print a[int(i * NR / n) + 1] }'
+}
+calib_cut() { # <file> <min tokens> <model's first shard> <out>: the file's leading lines up to the first line end with at least <min tokens>
+  local f=$1 want=$2 in=$3 out=$4 lo=0 hi nlo=0 nhi n L probe=0
+  hi=$(wc -l < "$f" | tr -d ' ')
+  head -n "$hi" "$f" > "$out"
+  nhi=$(tok_count "$in" "$out")
+  [ "$nhi" -ge "$want" ] || die "$f has $nhi tokens, $want are needed" 65
+  while [ $((hi - lo)) -gt 1 ]; do # bracket the line count: interpolate, and bisect every other probe so it always ends
+    probe=$((probe + 1))
+    if [ $((probe % 2)) = 1 ] && [ "$nhi" -gt "$nlo" ]; then L=$((lo + (want - nlo) * (hi - lo) / (nhi - nlo))); else L=$(((lo + hi) / 2)); fi
+    [ "$L" -gt "$lo" ] || L=$((lo + 1))
+    [ "$L" -lt "$hi" ] || L=$((hi - 1))
+    head -n "$L" "$f" > "$out"
+    n=$(tok_count "$in" "$out")
+    if [ "$n" -ge "$want" ]; then
+      hi=$L nhi=$n
+    else
+      lo=$L nlo=$n
+    fi
+  done
+  head -n "$hi" "$f" > "$out"
+  CUT_TOK=$nhi
+}
+build_calib() { # <out> <in's first shard>: the documents above; the list of sources goes to <out>.sources and the log
+  local out=$1 in=$2 k=$((CTX / 2)) tmp pool_min ncpp nrs i kind f n b total sha
   [ -x "$TOKENIZE" ] || die "no llama-tokenize at $TOKENIZE: just build-k3-quant-tree" 66
-  [ -d "$IK/docs" ] && [ -d "$IK/src" ] || die "no text sources under IK=$IK (docs/, src/): the calibration text is the K3 trace corpora's" 66
+  [ -d "$CALIB_TREE/docs" ] && [ -d "$CALIB_TREE/crates" ] || die "no docs/ and crates/ under $CALIB_TREE (K3Q_CALIB_TREE): the calibration documents are the tree's" 66
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/k31calib.XXXXXX") || die "no temporary directory" 70
-  gather prose > "$tmp/prose.txt"
-  gather code > "$tmp/code.txt"
-  half=$(((CHUNKS + 1) / 2))
-  need=$((half * CTX))
-  pt=$(tok_count "$in" "$tmp/prose.txt")
-  ct=$(tok_count "$in" "$tmp/code.txt")
-  pb=$(stat -c %s "$tmp/prose.txt")
-  cb=$(stat -c %s "$tmp/code.txt")
-  want=$((CHUNKS * CTX - need + CTX / 4)) # the code part: the chunks left, and a quarter chunk over, so the last chunk is full
-  [ "$pt" -ge "$need" ] || die "the prose source has $pt tokens, $need are needed for $half chunk(s) of $CTX" 65
-  [ "$ct" -ge "$want" ] || die "the code source has $ct tokens, $want are needed" 65
-  head -c $((need * pb / pt)) "$tmp/prose.txt" > "$out.tmp"
-  printf '\n\n' >> "$out.tmp"
-  head -c $((want * cb / ct)) "$tmp/code.txt" >> "$out.tmp"
-  total=$(tok_count "$in" "$out.tmp")
-  [ "$total" -ge $((CHUNKS * CTX + 1)) ] || { rm -f "$out.tmp"; rm -rf "$tmp"; die "the calibration text has $total tokens, $((CHUNKS * CTX + 1)) are needed for $CHUNKS chunk(s) of $CTX" 65; }
-  mv -f "$out.tmp" "$out"
-  say "calibration text $out: $total tokens (prose ~$need of $pt, code ~$want of $ct), $(stat -c %s "$out") bytes, md5 $(md5sum < "$out" | cut -d' ' -f1)"
+  pool_min=$((k + k / 16 + 8)) # a candidate holds its document's tokens and a line's worth over
+  ncpp=$((CHUNKS / 2))
+  nrs=$((CHUNKS - ncpp))
+  calib_pool prose "$in" "$pool_min" > "$tmp/pool.prose"
+  calib_pool cpp "$in" "$pool_min" > "$tmp/pool.cpp"
+  calib_pool rs "$in" "$pool_min" > "$tmp/pool.rs"
+  calib_pick "$CHUNKS" < "$tmp/pool.prose" > "$tmp/pick.prose" || { rm -rf "$tmp"; die "the prose pool has $(wc -l < "$tmp/pool.prose" | tr -d ' ') documents of $pool_min tokens, $CHUNKS are needed" 65; }
+  calib_pick "$ncpp" < "$tmp/pool.cpp" > "$tmp/pick.cpp" || { rm -rf "$tmp"; die "the C++ pool has $(wc -l < "$tmp/pool.cpp" | tr -d ' ') documents of $pool_min tokens, $ncpp are needed" 65; }
+  calib_pick "$nrs" < "$tmp/pool.rs" > "$tmp/pick.rs" || { rm -rf "$tmp"; die "the Rust pool has $(wc -l < "$tmp/pool.rs" | tr -d ' ') crates with a file of $pool_min tokens, $nrs are needed" 65; }
+  paste -d '\n' "$tmp/pick.cpp" "$tmp/pick.rs" | grep . > "$tmp/pick.code"
+  : > "$out.tmp"
+  : > "$out.sources.tmp"
+  for ((i = 1; i <= CHUNKS; i++)); do
+    for kind in prose code; do
+      f=$(sed -n "${i}p" "$tmp/pick.$kind")
+      calib_cut "$CALIB_TREE/$f" "$k" "$in" "$tmp/doc.txt"
+      n=$CUT_TOK
+      b=$(stat -c %s "$tmp/doc.txt")
+      sha=$(sha256sum < "$tmp/doc.txt" | cut -c1-12)
+      cat "$tmp/doc.txt" >> "$out.tmp"
+      printf '\n\n' >> "$out.tmp"
+      printf '%s\t%s\t%s\t%s\t%s\n' "$kind" "$f" "$n" "$b" "$sha" >> "$out.sources.tmp"
+    done
+  done
   rm -rf "$tmp"
+  total=$(tok_count "$in" "$out.tmp")
+  [ "$total" -ge $((CHUNKS * CTX + 1)) ] || { rm -f "$out.tmp" "$out.sources.tmp"; die "the calibration text has $total tokens, $((CHUNKS * CTX + 1)) are needed for $CHUNKS chunk(s) of $CTX" 65; }
+  mv -f "$out.sources.tmp" "$out.sources"
+  mv -f "$out.tmp" "$out"
+  say "calibration text $out: $((2 * CHUNKS)) documents of $k tokens ($CHUNKS prose, $CHUNKS code), $total tokens, $(stat -c %s "$out") bytes, md5 $(md5sum < "$out" | cut -d' ' -f1); sources in $out.sources:"
+  awk -F'\t' '{ printf "    %2d %-5s %-48s %5d tokens %6d bytes sha256 %s\n", NR, $1, $2, $3, $4, $5 }' "$out.sources" | sed 's/^/k31-quant.sh: /'
 }
 
 # ---- the rules against the table (Mac-checkable) ----
@@ -452,21 +503,25 @@ do_rules() {
   if [ "$MAP" = ud ]; then
     echo "# rules for --map ud --type $TYPE (the file llama-quantize reads has no comment lines); bump layers gate/up [$BUMP_GU] down [$BUMP_DN]"
   else
-    echo "# rules for --map $MAP --type $TYPE (the file llama-quantize reads has no comment lines); global type $QTYPE, token_embd $TOKEMB, output q6_k by flag"
+    echo "# rules for --map $MAP --type $TYPE (the file llama-quantize reads has no comment lines); bump layers gate/up [${BUMP_GU:-none}] down [${BUMP_DN:-none}]; global type $QTYPE (only for a tensor no rule names), token_embd $TOKEMB and output q6_k by flag"
   fi
   cat "$f"
   rm -f "$f"
 }
 do_check() {
-  local f
+  local f STEMU
+  STEMU=$(printf '%s' "$STEM" | tr '[:lower:]' '[:upper:]')
   [ -f "$REF" ] || die "no reference table at $REF (--ref-table)" 66
   f=$(mktemp "${TMPDIR:-/tmp}/k31rules.XXXXXX") || die "no temporary file" 70
   make_rules "$f"
   if [ "$MAP" = ud ]; then
     [ "$TYPE" = IQ1_S ] || say "--type $TYPE has no reference table of its own: the check below holds the rules to $REF's IQ1_S types and will name the mismatches"
     splice check-rules --rules "$f" --table "$REF" || { rm -f "$f"; exit 65; }
+  elif [ "$TYPE" = IQ1_S ]; then
+    say "--map $MAP: the table's Q6_K trunk is read as $STEMU, token_embd as $TOKEMB and output as q6_k by flag; the experts are the table's own IQ1_S and IQ2_XXS. The types llama-quantize gives are proved by its plan (the plan step, on the box)"
+    splice check-rules --rules "$f" --table "$REF" --retype "Q6_K=$STEMU" --flag-types "token_embd.weight=$TOKEMB,output.weight=q6_k" || { rm -f "$f"; exit 65; }
   else
-    say "--map $MAP: the rules name the routed experts and three small exceptions; every other tensor takes the global type $QTYPE. The types it gives are llama-quantize's own, so the proof is its plan (the plan step, on the box); here: each rule matches tensors of the K3 table"
+    say "--map $MAP --type $TYPE: the experts are uniform $TYPE, which no table holds; here: each rule matches tensors of the K3 table (the plan step proves the types)"
     splice check-rules --rules "$f" --table "$REF" --partial || { rm -f "$f"; exit 65; }
   fi
   rm -f "$f"
@@ -544,10 +599,13 @@ do_imatrix() {
     if [ -n "$CORPUS" ]; then
       say "[dry-run] calibration text: $CORPUS"
     else
-      say "[dry-run] would build the calibration text $calib: $(((CHUNKS + 1) / 2)) chunk(s) of the engine tree's prose, then code (IK=${IK:-unset until the profile loads})"
+      say "[dry-run] would build the calibration text $calib: $((2 * CHUNKS)) distinct documents of $((CTX / 2)) tokens ($CHUNKS prose from docs/ and README.md, $((CHUNKS / 2)) C++ from tools/ref and $((CHUNKS - CHUNKS / 2)) Rust from distinct crates), the list in $calib.sources"
     fi
   elif [ -n "$CORPUS" ]; then
     [ -f "$CORPUS" ] || die "no calibration text at $CORPUS" 66
+  elif [ -f "$calib" ] && [ -f "$calib.sources" ]; then
+    say "calibration text $calib: built before, kept (the calib step builds it again); sources in $calib.sources:"
+    awk -F'\t' '{ printf "    %2d %-5s %-48s %5d tokens %6d bytes sha256 %s\n", NR, $1, $2, $3, $4, $5 }' "$calib.sources" | sed 's/^/k31-quant.sh: /'
   else
     build_calib "$calib" "$IN"
   fi
@@ -654,11 +712,7 @@ do_quantize() {
     say "plan quantize: for the 1.56 TB K3.1 file: $(hms "$(pred_of quantize "$K31_BYTES")"); the rate band 3-6 Mweights/s/thread gives $(hms "$(QUANT_RATE_MW=6 pred_of quantize "$K31_BYTES")") to $(hms "$(QUANT_RATE_MW=3 pred_of quantize "$K31_BYTES")")"
   fi
   derive_bumps
-  if [ "$MAP" = ud ]; then
-    say "type map: ud, rules for $TYPE, IQ2_XXS bumps gate/up [${BUMP_GU:-none}] down [${BUMP_DN:-none}] (rules file $rules)"
-  else
-    say "type map: $MAP, the routed experts $TYPE and three small exceptions by rule, everything else the global type ${QTYPE} (rules file $rules)"
-  fi
+  say "type map: $MAP, the routed experts $TYPE with IQ2_XXS on gate/up [${BUMP_GU:-none}] down [${BUMP_DN:-none}], the trunk stems ${STEM} and attn_k_b, ssm_f_b q8_0, ssm_beta f32 by rule, token_embd $TOKEMB and output q6_k by flag, the global type ${QTYPE:-$TYPE} for a tensor no rule names (rules file $rules)"
   local tmp_rules=$rules
   if [ "$DRY" = 1 ]; then
     tmp_rules=$(mktemp "${TMPDIR:-/tmp}/k31rules.XXXXXX") || die "no temporary file" 70
@@ -696,9 +750,9 @@ do_quantize() {
   lease_on "$CARD"
   local tick=''
   if [ "$DRY" = 0 ] && [ "$SMOKE" = 0 ]; then
-    # A progress line every two minutes (tensors converted so far): the rate is readable while the quantizer runs. fds 8 and 9 are
+    # A progress line every two minutes (tensors converted so far, the routed experts' apart: 9.86e9 weights each): the rate is readable while the quantizer runs. fds 8 and 9 are
     # closed for it: a leftover ticker would hold the run lock and the lease.
-    (while :; do sleep 120; printf '%s converted=%s\n' "$(date +%s)" "$(grep -c 'converting to' "$LOGDIR/quantize.log" 2> /dev/null)" >> "$WORK/quantize.progress"; done) 8>&- 9>&- &
+    (while :; do sleep 120; printf '%s converted=%s experts=%s\n' "$(date +%s)" "$(grep -c 'converting to' "$LOGDIR/quantize.log" 2> /dev/null)" "$(grep -c 'converting to iq' "$LOGDIR/quantize.log" 2> /dev/null)" >> "$WORK/quantize.progress"; done) 8>&- 9>&- &
     tick=$!
   fi
   t0=$SECONDS
@@ -766,7 +820,10 @@ render_card() { # <README.md to write> <the set's first shard (in the .partial d
   md5=$(printf '%s' "$note" | sed -n 's/.*calib_md5=\([0-9a-f]*\).*/\1/p')
   [ -n "$md5" ] || { rm -rf "$d"; die "$im_marker records no calibration text (calib_md5): run the imatrix step again (--force)" 65; }
   if printf '%s' "$note" | grep -q 'calib=calib-c'; then
-    corpus="the engine tree's docs (*.md) and README, then its C++ sources, cut at the token count by the K3 tokenizer (md5 of the text: $md5)."
+    local sf=$WORK/${note##*calib=}.sources dl
+    [ -f "$sf" ] || { rm -rf "$d"; die "no source list for the calibration text ($sf): run the calib step, then the imatrix step again (--force)" 66; }
+    dl=$(awk -F'\t' -v k="$((CTX / 2))" '{ l[$1] = l[$1] (l[$1] == "" ? "" : ", ") "`" $2 "`" } END { printf "%d documents of %d tokens each, prose: %s; code: %s", NR, k, l["prose"], l["code"] }' "$sf")
+    corpus="$dl, all from the bloomery repository (md5 of the text: $md5)."
   else
     corpus="a text given with --corpus (md5 of the text: $md5)."
   fi
@@ -788,8 +845,20 @@ render_card() { # <README.md to write> <the set's first shard (in the .partial d
   splice list --in "$first" --gguf-py off | awk '/^shard / { n = split($3, p, "/"); t = $4; b = $6; sub(/^tensors=/, "", t); sub(/^bytes=/, "", b); rows = rows "| " $2 " | " p[n] " | " t " | " b " |\n" }
     END { printf "| shard | file | tensors | bytes |\n|---|---|---|---|\n%s", rows }' > "$d/shards.md"
   total=$(splice list --in "$first" --gguf-py off | awk '/^shard / { b = $6; sub(/^bytes=/, "", b); s += b } END { printf "%.2f", s / 1e9 }')
+  derive_bumps
+  local stemu bumps maptext
+  stemu=$(printf '%s' "$STEM" | tr '[:lower:]' '[:upper:]')
+  bumps=''
+  if [ -n "$BUMP_GU$BUMP_DN" ]; then
+    bumps=", and IQ2_XXS on the gate and up experts of layers ${BUMP_GU//|/, } and the down experts of layers ${BUMP_DN//|/, } (the layers the Kimi K3 UD-IQ1_S file also promotes)"
+  fi
+  if [ "$MAP" = ud ]; then
+    maptext="the routed experts are $TYPE with an importance matrix${bumps}; every other trunk tensor, the token embedding and the output head are Q6_K, attn_k_b and ssm_f_b are Q8_0, and the norms, scores and ssm_beta stay F32 as in the source."
+  else
+    maptext="the routed experts are $TYPE with an importance matrix${bumps}; every other trunk tensor (attention, state-space, shared expert, latent routed projections and the dense layer's mlp) is ${stemu}, attn_k_b and ssm_f_b are Q8_0, the token embedding is $(printf '%s' "$TOKEMB" | tr '[:lower:]' '[:upper:]'), the output head Q6_K, and the norms, scores and ssm_beta stay F32 as in the source."
+  fi
   splice fill --template "$ROOT/tools/ref/k31-model-card.md.in" --out "$out" \
-    --set "NAME=$name" --set "ARCH=$ARCH" --set "MAP=$MAP" --set "QTYPE=${QTYPE:-$TYPE}" --set "EXPERT_TYPE=$TYPE" --set "TOTAL_GB=$total" \
+    --set "NAME=$name" --set "ARCH=$ARCH" --set "MAP=$MAP" --set "MAP_TEXT=$maptext" --set "TOTAL_GB=$total" \
     --set "INDEXER_COUNT=$nlayers" --set "INDEXER_LAYERS=$layers" --set "IMATRIX_CHUNKS=$CHUNKS" --set "IMATRIX_CTX=$CTX" \
     --set "IMATRIX_TOKENS=$((CHUNKS * CTX))" --set "IMATRIX_CORPUS=$corpus" --set "SOURCE_REV=$srcrev" --set "TOOLS=$toolsline" \
     --set "QUANT_FLAGS=$flags" --file "CLASS_TABLE=$d/classes.md" --file "RULES=$rules" --file "SHARD_TABLE=$d/shards.md" || { rm -rf "$d"; exit 65; }
@@ -923,7 +992,7 @@ do_prepare() {
   bound=${K3Q_PREPARE_BOUND_S:-43200}
   case $bound in '' | *[!0-9]* | 0) die "K3Q_PREPARE_BOUND_S wants whole seconds above 0, got '$bound'" ;; esac
   [ -z "$SHARD_GIB" ] || extra+=(--shard-gib "$SHARD_GIB")
-  [ -z "$FOLLOW" ] || extra+=(--follow "$FOLLOW")
+  [ -z "$FOLLOW" ] || extra+=(--follow "$FOLLOW" --follow-stall "${FOLLOW_STALL:-1800}")  # a stream can stall minutes behind the others
   say "prepare: $HF -> $out_a-NNNNN-of-NNNNN.gguf (K3-shaped: --drop 'blk.*.indexer.*' --arch kimi-k3) and $out_b-... (--only 'blk.*.indexer.*'), bound ${bound}s each"
   if [ "$DRY" = 0 ]; then
     [ -d "$HF" ] || die "no HF folder at $HF (--hf-folder)" 66
@@ -1030,7 +1099,7 @@ do_smoke() {
     splice list --in "$fx" --tsv --gguf-py off > "$REF" || die "cannot read the fixture's tensor list" 65
     # the stand-in's trunk is already the map's result (the same global type and flags): the smoke's quantize then converts the experts only,
     # as the real run's time is the experts' (the tight map's trunk is 2 % of the weights); the ud map keeps its Q6_K stand-in
-    if [ "$MAP" = ud ]; then gen_rules mxfp4 '' '' '' > "$s/rules-src.txt"; else gen_rules_trunk mxfp4 > "$s/rules-src.txt"; fi
+    if [ "$MAP" = ud ]; then gen_rules mxfp4 '' '' '' "$STEM" head > "$s/rules-src.txt"; else gen_rules mxfp4 '' '' '' "$STEM" > "$s/rules-src.txt"; fi
     make_indexer_script "$s/make-indexer.py"
     printf '{"text_config": {"dsa_config": {"dsa_layers": [2, 3], "index_topk": 2048, "index_head_dim": 8, "index_num_heads": 2}}}\n' > "$s/dsa.json"
     printf 'the smoke'"'"'s stand-in for the source LICENSE\n' > "$s/LICENSE"
@@ -1107,8 +1176,9 @@ do_calib() {
   need_in
   [ "$BLIND" = 0 ] || die "calib: no input at $IN" 66
   [ "$DRY" = 0 ] || die "calib builds a file: it has no --dry-run (the imatrix step's --dry-run says where it goes)" 64
+  [ -z "$CORPUS" ] || die "calib builds the default calibration text; --corpus names a text of your own and is used as it is" 64
   mkdir -p "$WORK"
-  build_calib "${CORPUS:-$WORK/calib-c${CTX}x${CHUNKS}.txt}" "$IN"
+  build_calib "$WORK/calib-c${CTX}x${CHUNKS}.txt" "$IN"
 }
 
 case $STEP in
