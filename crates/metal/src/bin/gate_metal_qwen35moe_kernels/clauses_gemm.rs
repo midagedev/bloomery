@@ -51,8 +51,6 @@
 //! sides are in the band. A value past the half range is a fault, not a band
 //! case.
 
-use std::process::Command;
-
 use bloomery_device::conformance::{Clause, Verdict, why};
 use bloomery_device::fault::FaultSite;
 use bloomery_device::{Buffer, Device, DeviceError, Elems};
@@ -783,84 +781,9 @@ pub fn gemm_q6k_resid(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     run_cases(h, GemmMode::Residual, &q6k_cases(fixture)?)
 }
 
-/// What a child run of the gate under Metal's shader validation said on
-/// stderr.
-struct Validated {
-    /// Whether the validation layer announced itself.
-    started: bool,
-    /// How many accesses it reported.
-    reports: usize,
-    /// The first report's lines, for a clause that fails on it.
-    first: String,
-    /// The child's own verdict and last words.
-    exit: Result<(), String>,
-}
-
 /// The mutant a child of the control run carries: the one that stages the
 /// weight rows past a tile's live rows unclamped.
 const CLAMP_MUTANT: &str = "gemm_weight_edge";
-
-/// The gate's own binary, run as `--child gemm_a4_store` at this row's instance
-/// with Metal's shader validation on (its reports go to stderr), beside the
-/// parent's fixture flags and a `--mutant` when one is named.
-fn gate_under_validation(
-    h: &Harness<'_>,
-    args: &[String],
-    mutant: Option<&str>,
-) -> Result<Validated, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("the gate's own path: {e}"))?;
-    let mut child = Command::new(exe);
-    child.args([
-        "--child",
-        "gemm_a4_store",
-        "--instance",
-        h.library.instance().name,
-    ]);
-    for name in ["--fixture", "--mlx-fixture"] {
-        if let Some(path) = flag(args, name) {
-            child.args([name, path]);
-        }
-    }
-    if let Some(name) = mutant {
-        child.args(["--mutant", name]);
-    }
-    child
-        .env("MTL_SHADER_VALIDATION", "1")
-        .env("MTL_SHADER_VALIDATION_GLOBAL_MEMORY", "1")
-        .env("MTL_SHADER_VALIDATION_REPORT_TO_STDERR", "1")
-        .env("MTL_SHADER_VALIDATION_ENABLE_VERBOSE_LOGGING", "1");
-    let out = child
-        .output()
-        .map_err(|e| format!("the child gate did not start: {e}"))?;
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let first = stderr
-        .split("=====")
-        .find(|block| block.contains("Invalid Metal usage"))
-        .map(|block| {
-            block
-                .lines()
-                .filter(|l| !l.is_empty())
-                .take(2)
-                .collect::<Vec<_>>()
-                .join(" / ")
-        })
-        .unwrap_or_default();
-    Ok(Validated {
-        started: stderr.contains("Metal GPU Validation Enabled"),
-        reports: stderr.matches("Invalid Metal usage").count(),
-        first,
-        exit: if out.status.success() {
-            Ok(())
-        } else {
-            Err(format!(
-                "the child exited {}: {}",
-                out.status,
-                stdout.lines().last().unwrap_or("no output")
-            ))
-        },
-    })
-}
 
 /// The A4 store dot at the row's sites, the head's tail and the gate
 /// projection's 16 rows, every case within the band of the f64 oracle in both
@@ -881,33 +804,26 @@ pub fn gemm_a4_store(h: &Harness<'_>, mlx: &Fixture, sites: &Sites) -> Clause {
     let Verdict::Noted(values) = run_cases(h, GemmMode::Store, &a4_cases(h, mlx, sites)?)? else {
         return Err("the A4 store cases ended in no note".to_string());
     };
-    let control = gate_under_validation(h, &args, Some(CLAMP_MUTANT))?;
-    if !control.started || control.reports == 0 {
-        return Err(format!(
-            "shader validation {} for the control, a kernel that reads past its weights: nothing \
-             was checked",
-            if control.started {
-                "reported nothing"
-            } else {
-                "did not start"
-            }
-        ));
+    let mut child = vec![
+        "--child",
+        "gemm_a4_store",
+        "--instance",
+        h.library.instance().name,
+    ];
+    for name in ["--fixture", "--mlx-fixture"] {
+        if let Some(path) = flag(&args, name) {
+            child.extend([name, path]);
+        }
     }
-    let own = gate_under_validation(h, &args, flag(&args, "--mutant"))?;
-    if !own.started {
-        return Err("shader validation did not start: nothing was checked".to_string());
-    }
-    if own.reports > 0 {
-        return Err(format!(
-            "{} accesses outside a buffer reported in the {GATE_ROWS}-row launches, the first: {}",
-            own.reports, own.first
-        ));
-    }
-    own.exit?;
+    let control = common::reads_inside(
+        &child,
+        &args,
+        CLAMP_MUTANT,
+        &format!("{GATE_ROWS}-row launches"),
+    )?;
     Ok(Verdict::Noted(format!(
-        "{values}; no report in the {GATE_ROWS}-row launches under shader validation, {} for the \
-         control",
-        control.reports
+        "{values}; no report in the {GATE_ROWS}-row launches under shader validation, {control} \
+         for the control"
     )))
 }
 
