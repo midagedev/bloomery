@@ -47,6 +47,17 @@
 #   --type T           IQ1_S (default) | IQ2_XXS: the routed experts' type (ud: IQ2_XXS uniformly, unless --bump-* names layers)
 #   --ctx N --chunks N the imatrix's context (2048) and chunk count (4); smoke 512 and 2
 #   --threads N        llama-imatrix and llama-quantize threads                 [K3Q_THREADS]  (default: nproc)
+#   --imatrix-gpu      imatrix: the CUDA llama-imatrix ($K3Q_TREE/build-cuda, `just build-k3-quant-tree-cuda`) with -ngl 0: the weights stay in
+#                      the host mmap and every matmul with 32 or more tokens runs on the card (the scheduler's op offload, ggml-cuda.cu
+#                      get_op_batch_size), so the CPU term becomes PCIe. The card is the A6000, chosen by box.sh (BLOOMERY_CARD=a6000) and
+#                      held through tools/gpu-gate.sh's gate lock (--executable: lock, bound, the card's CUDA_VISIBLE_DEVICES); a run
+#                      without BLOOMERY_BOX_CARD=a6000 is refused by name, and so is a build-cuda without its CUDA backend library.
+#                      A CPU and a GPU imatrix are different artifacts: the flag is part of the step's key and its marker line; the same
+#                      output name is kept, so a marker of the other kind is refused (--force)      [K3Q_IMATRIX_GPU=1]
+#   --seqs N           imatrix: n_seq chunks per batch (default 1) [K3Q_SEQS]. llama-imatrix runs n_seq = batch / ctx chunks in one batch and
+#                      asserts its -c equals n_seq x the chunk length (imatrix.cpp:1852-1870 multiplies -c itself), so the runner passes
+#                      -c CTX -b CTX*N -ub CTX*N: the weights stream once per N chunks. N above --chunks is refused. On the card the
+#                      compute buffer grows with N x CTX (the bound on N: the A6000's 48 GB); part of the key and the marker
 #   --corpus FILE      a calibration text of your own                           [K3Q_CORPUS]
 #   --corpus-special   imatrix: pass --parse-special, so the text's `<|open|>`, `<|end_of_msg|>`, `[BOS]` ... are read as the control tokens they
 #                      name (without it llama-imatrix tokenizes them as plain characters); needs --corpus (tools/ref/k31-calib-render.py writes
@@ -75,7 +86,7 @@
 # the tool's sha256, the flags) matches is skipped; a marker that no longer matches is refused (rerun with --force); a partial output
 # (`<out>.partial`) is removed by name at the start of the next run. A step is not resumable inside: llama-imatrix and llama-quantize
 # start over. Every command runs under `timeout` through lease_bounded, its pid in $K3Q_WORK/<step>.pid, its output in
-# $K3Q_WORK/<step>.log. The cards (docs/cards/k31-*.card) state each step's prediction; only the smoke's is a lease card.
+# $K3Q_WORK/<step>.log (--imatrix-gpu: inside tools/gpu-gate.sh, whose lock wait of up to 1800 s is added to the bound). The cards (docs/cards/k31-*.card) state each step's prediction; only the smoke's is a lease card.
 #
 # The big files (the K3.1 HF folder, the K3 and K3.1 GGUF sets) are never read in full here: this script reads their headers
 # (gguf-splice.py) and their sizes (stat); the tools it starts read them, and that is the step.
@@ -104,6 +115,7 @@ OUT_PER_IN=0.372            # derived: llama-quantize --dry-run of the tight map
 QUANT_RATE_MW=5.4           # measured: the smoke's 1-thread rate on the fixture (5.36 Mweights/s/thread, 4.72 Mweights in 881 ms, I/O included);
                             # the 40-thread scaling below is derived, not measured
 QUANT_EFF_THREADS=40        # assumed, unmeasured: nproc is 64 (Threadripper PRO 5975WX, 32 cores x 2 SMT) and every one is passed as -t; 32 cores x 1.25 SMT yield = 40
+PCIE_GBS=22                 # assumed, unmeasured: host-to-card copy of the weights over the A6000's PCIe 4.0 x16 (--imatrix-gpu)
 SPLICE_SHARD_BYTES=48000000000   # the receiving shard's size, a K3 UD shard's (47-52 GB)
 
 die() { echo "k31-quant.sh: $1" >&2; exit "${2:-64}"; }
@@ -115,7 +127,7 @@ say() { echo "k31-quant.sh: $*"; }
 case $1 in -h | --help) usage ;; esac
 STEP=$1
 shift
-DRY=0 SMOKE=0 DETACH=0 FORCE=0 PRED=0 USE_LEASE=0
+DRY=0 SMOKE=0 DETACH=0 FORCE=0 PRED=0 USE_LEASE=0 IMATRIX_GPU=${K3Q_IMATRIX_GPU:-0} SEQS=${K3Q_SEQS:-1}
 MAP=${K3Q_MAP:-tight} REPO=midagedev/Kimi-K3.1-Pro-GGUF HF=${K3Q_HF_FOLDER:-/data/models/Kimi-K3.1-Pro} LICENSE_F='' SRC_REV='' PREPARE_BIN='' FOLLOW='' SHARD_GIB='' MAX_TRUNK=''
 TYPE=IQ1_S CTX='' CHUNKS='' IN=${K3Q_IN:-} CORPUS=${K3Q_CORPUS:-} SPECIAL=${K3Q_CORPUS_SPECIAL:-0} INDEXER=${K3Q_INDEXER:-} DSA=${K3Q_DSA_CONFIG:-}
 ARCH=${K3Q_ARCH:-kimi-k31} THREADS=${K3Q_THREADS:-} REF='' OUT_BASE=${K3Q_OUT_BASE:-/models} BUMP_GU='' BUMP_DN='' BUMP_SET=0
@@ -126,6 +138,7 @@ while [ $# -gt 0 ]; do
     --force) FORCE=1 ;;
     --pred-s) PRED=1 ;;
     --corpus-special) SPECIAL=1 ;;
+    --imatrix-gpu) IMATRIX_GPU=1 ;;
     --smoke) SMOKE=1 ;;
     --lease) USE_LEASE=1 ;;
     --map | --repo | --hf-folder | --license | --source-rev | --prepare-bin | --follow | --shard-gib | --max-trunk-gb)
@@ -135,10 +148,10 @@ while [ $# -gt 0 ]; do
         --prepare-bin) PREPARE_BIN=$2 ;; --follow) FOLLOW=$2 ;; --shard-gib) SHARD_GIB=$2 ;; --max-trunk-gb) MAX_TRUNK=$2 ;;
       esac
       shift ;;
-    --in | --type | --ctx | --chunks | --threads | --corpus | --ref-table | --bump-gateup | --bump-down | --indexer | --dsa-config | --arch | --out-base)
+    --in | --type | --ctx | --chunks | --threads | --corpus | --seqs | --ref-table | --bump-gateup | --bump-down | --indexer | --dsa-config | --arch | --out-base)
       [ $# -ge 2 ] || die "$1 takes a value"
       case $1 in
-        --in) IN=$2 ;; --type) TYPE=$2 ;; --ctx) CTX=$2 ;; --chunks) CHUNKS=$2 ;; --threads) THREADS=$2 ;; --corpus) CORPUS=$2 ;;
+        --in) IN=$2 ;; --type) TYPE=$2 ;; --ctx) CTX=$2 ;; --chunks) CHUNKS=$2 ;; --seqs) SEQS=$2 ;; --threads) THREADS=$2 ;; --corpus) CORPUS=$2 ;;
         --ref-table) REF=$2 ;; --bump-gateup) BUMP_GU=$2 BUMP_SET=1 ;; --bump-down) BUMP_DN=$2 BUMP_SET=1 ;;
         --indexer) INDEXER=$2 ;; --dsa-config) DSA=$2 ;; --arch) ARCH=$2 ;; --out-base) OUT_BASE=$2 ;;
       esac
@@ -169,6 +182,13 @@ if [ "$SMOKE" = 1 ]; then CTX=${CTX:-512} CHUNKS=${CHUNKS:-2}; else CTX=${CTX:-2
 for v in CTX CHUNKS; do
   case ${!v} in '' | *[!0-9]* | 0) die "--$(printf '%s' "$v" | tr '[:upper:]' '[:lower:]') wants a whole number above 0, got '${!v}'" ;; esac
 done
+case $IMATRIX_GPU in 0 | 1) ;; *) die "K3Q_IMATRIX_GPU is 1 or 0/unset, got '$IMATRIX_GPU'" ;; esac
+case $SEQS in '' | *[!0-9]* | 0) die "--seqs wants a whole number above 0, got '$SEQS'" ;; esac
+case $STEP in
+  imatrix | all | smoke) ;;
+  *) [ "$IMATRIX_GPU" = 0 ] && [ "$SEQS" = 1 ] || die "--imatrix-gpu and --seqs are the imatrix step's (imatrix, all, smoke): '$STEP' takes neither" ;;
+esac
+[ "$SEQS" -le "$CHUNKS" ] || die "--seqs $SEQS is above --chunks $CHUNKS: the batch would hold $CHUNKS chunk(s) in buffers sized for $SEQS (--seqs at most --chunks)"
 [ "$DRY" = 1 ] && [ "$DETACH" = 1 ] && die "--detach and --dry-run do not combine"
 ARCH_OK=$(printf '%s' "$ARCH" | tr -d 'a-z0-9-')
 [ -z "$ARCH_OK" ] && [ -n "$ARCH" ] || die "--arch $ARCH: letters, digits and '-' only (it names every key prefix)"
@@ -182,6 +202,7 @@ TAG=$TYPE$MAPTAG
 [ "$SMOKE" = 1 ] && TAG=smoke
 Q=$TREE/build/bin/llama-quantize
 IMAT=$TREE/build/bin/llama-imatrix
+[ "$IMATRIX_GPU" = 0 ] || IMAT=$TREE/build-cuda/bin/llama-imatrix
 TOKENIZE=$TREE/build/bin/llama-tokenize
 GSPLIT=$TREE/build/bin/llama-gguf-split
 [ "$SMOKE" = 1 ] && OUT_BASE=$WORK/out
@@ -232,6 +253,11 @@ splice() { python3 -I "$SPLICE" "$@"; }
 
 # ---- the derived walls (seconds; every number above is a term here) ----
 pred_imatrix() { # <bytes> <chunks> <ctx>: populate + chunks x (read share + CPU share x ctx/2048), all scaled by bytes from the measured K3 set
+  if [ "$IMATRIX_GPU" = 1 ]; then # [derived] populate + ceil(chunks/seqs) x (read share + the set over PCIe); card compute and host CPU sit under the read
+    awk -v b="$1" -v n="$2" -v q="$SEQS" -v kb="$K3_BYTES" -v r="$K3_CHUNK_READ_S" -v p="$K3_POPULATE_S" -v g="$PCIE_GBS" \
+      'BEGIN { printf "%d", (p + int((n + q - 1) / q) * r) * b / kb + int((n + q - 1) / q) * b / (g * 1e9) + 0.5 }'
+    return
+  fi
   awk -v b="$1" -v n="$2" -v x="$3" -v kb="$K3_BYTES" -v r="$K3_CHUNK_READ_S" -v c="$K3_CHUNK_CPU_S" -v p="$K3_POPULATE_S" \
     'BEGIN { printf "%d", (p + n * (r + c * x / 2048)) * b / kb + 0.5 }'
 }
@@ -583,7 +609,13 @@ do_imatrix() {
   need_in
   CARD=k31-imatrix
   [ "$SMOKE" = 0 ] || CARD=k31-smoke
-  [ -x "$IMAT" ] || [ "$DRY" = 1 ] || die "no llama-imatrix at $IMAT: just build-k3-quant-tree" 66
+  if [ "$IMATRIX_GPU" = 1 ]; then
+    [ -x "$IMAT" ] || [ "$DRY" = 1 ] || die "no CUDA llama-imatrix at $IMAT: just build-k3-quant-tree-cuda" 66
+    [ -e "$(dirname "$IMAT")/libggml-cuda.so" ] || [ "$DRY" = 1 ] || die "$(dirname "$IMAT") has no libggml-cuda.so: that build has no CUDA backend (just build-k3-quant-tree-cuda)" 66
+    [ "${BLOOMERY_BOX_CARD:-}" = a6000 ] || [ "$DRY" = 1 ] || die "--imatrix-gpu runs on the A6000 held through its gate lock: BLOOMERY_CARD=a6000 tools/box.sh '...' (box card is '${BLOOMERY_BOX_CARD:-unset}')" 64
+    [ -f "$ROOT/tools/gpu-gate.sh" ] || die "no $ROOT/tools/gpu-gate.sh: the card's gate lock has no owner here" 66
+  fi
+  local ngl_args=() runner=() bound_extra=0
   local im marker key calib pred bound kparts
   local -a PARSE=()
   if [ "$SPECIAL" = 1 ]; then
@@ -598,8 +630,12 @@ do_imatrix() {
   THREADS=${THREADS:-$(nproc)}
   pred=$(pred_of imatrix "$IN_BYTES")
   bound=$(bound_of "$pred")
-  say "imatrix: input $IN ($IN_SHARDS shard(s), $IN_BYTES bytes), ctx $CTX, chunks $CHUNKS, threads $THREADS"
-  plan_line imatrix "$IN_BYTES" "populate $K3_POPULATE_S s + $CHUNKS x ($K3_CHUNK_READ_S s read + $K3_CHUNK_CPU_S s CPU x $CTX/2048) (a 2048-token chunk measured $K3_CHUNK_S s on the $K3_BYTES-byte K3 set) x $IN_BYTES/$K3_BYTES"
+  say "imatrix: input $IN ($IN_SHARDS shard(s), $IN_BYTES bytes), ctx $CTX, chunks $CHUNKS, seqs $SEQS, threads $THREADS, $([ "$IMATRIX_GPU" = 1 ] && echo "CUDA build $IMAT on the A6000 (-ngl 0, op offload)" || echo "CPU build $IMAT")"
+  if [ "$IMATRIX_GPU" = 1 ]; then
+    plan_line imatrix "$IN_BYTES" "[derived] populate $K3_POPULATE_S s + ceil($CHUNKS/$SEQS) batches x ($K3_CHUNK_READ_S s read, once a batch) x $IN_BYTES/$K3_BYTES + the set over PCIe at $PCIE_GBS GB/s (assumed) a batch; card compute and host CPU sit under the read"
+  else
+    plan_line imatrix "$IN_BYTES" "populate $K3_POPULATE_S s + $CHUNKS x ($K3_CHUNK_READ_S s read + $K3_CHUNK_CPU_S s CPU x $CTX/2048) (a 2048-token chunk measured $K3_CHUNK_S s on the $K3_BYTES-byte K3 set) x $IN_BYTES/$K3_BYTES"
+  fi
   if [ "$IN_BYTES" != "$K31_BYTES" ] && [ "$SMOKE" = 0 ]; then
     say "plan imatrix: for the 1.56 TB K3.1 file: $(hms "$(pred_of imatrix "$K31_BYTES")")"
   fi
@@ -625,6 +661,8 @@ do_imatrix() {
   if [ "$DRY" = 0 ]; then
     kparts=(imatrix "$CTX" "$CHUNKS" "$THREADS" "$(sha_of "$IMAT")" "$(set_ident "$IN")" "$(sha_of "$calib")")
     [ "$SPECIAL" != 1 ] || kparts+=(parse-special)
+    [ "$IMATRIX_GPU" = 0 ] || kparts+=(gpu)          # appended only when set, so a CPU run's key is the one it always was
+    [ "$SEQS" = 1 ] || kparts+=("seqs=$SEQS")
     key=$(key_of "${kparts[@]}")
     if marker_state "$marker" "$key" "$im"; then
       say "imatrix: done before ($marker, $im): skipped"
@@ -633,10 +671,19 @@ do_imatrix() {
   fi
   lease_on "$CARD"
   local t0=$SECONDS
-  # --no-repack: K3.1's routed experts are MXFP4, which the CPU backend repacks into a RAM buffer the size of the set
-  # (1.45 TB, refused by the allocator); without it the weights stay in the mmap and stream once a chunk.
-  run imatrix "$bound" "${NICE[@]}" env CUDA_VISIBLE_DEVICES= "$IMAT" -m "$IN" -f "$calib" -o "$im.partial" --output-format gguf \
-    -c "$CTX" -b "$CTX" -ub "$CTX" --chunks "$CHUNKS" --no-escape --no-ppl --no-repack -t "$THREADS" ${PARSE[@]+"${PARSE[@]}"} || fail_step imatrix $?
+  # --no-repack on both paths: K3.1's routed experts are MXFP4, which the CPU backend repacks into a RAM buffer the size of
+  # the set (1.45 TB, refused by the allocator); without it the weights stay in the mmap and stream once a batch.
+  if [ "$IMATRIX_GPU" = 1 ]; then
+    # gpu-gate.sh takes the A6000's gate lock (waiting up to its CARD_BOUND of 1800 s, which the outer bound adds), runs the binary under
+    # its own bound and sets the card's CUDA_VISIBLE_DEVICES; no blanking of it on this path.
+    runner=(env "BLOOMERY_GATE_BOUND=$bound" bash "$ROOT/tools/gpu-gate.sh" --executable "$IMAT")
+    ngl_args=(-ngl 0)
+    bound_extra=1800
+  else
+    runner=(env CUDA_VISIBLE_DEVICES= "$IMAT")
+  fi
+  run imatrix $((bound + bound_extra)) "${NICE[@]}" "${runner[@]}" -m "$IN" -f "$calib" -o "$im.partial" --output-format gguf \
+    -c "$CTX" -b $((CTX * SEQS)) -ub $((CTX * SEQS)) --chunks "$CHUNKS" --no-escape --no-ppl --no-repack -t "$THREADS" ${ngl_args[@]+"${ngl_args[@]}"} ${PARSE[@]+"${PARSE[@]}"} || fail_step imatrix $?
   if [ "$DRY" = 1 ]; then lease_off; return 0; fi
   lease_off
   [ -s "$im.partial" ] || die "llama-imatrix ended 0 and wrote no $im.partial: see $LOGDIR/imatrix.log" 65
@@ -648,7 +695,7 @@ do_imatrix() {
     <(cut -f1 "$WORK/imatrix.tsv" | sed -E 's/\.(in_sum2|counts)$//' | LC_ALL=C sort -u))
   [ -z "$miss" ] || die "the imatrix has no entry for $(echo "$miss" | wc -l | tr -d ' ') routed-expert tensor(s) of the input, the first $(echo "$miss" | head -1): see $WORK/imatrix.tsv" 65
   mv -f "$im.partial" "$im"
-  write_marker "$marker" "$key" "$im" "entries=$(wc -l < "$WORK/imatrix.tsv" | tr -d ' ') ctx=$CTX chunks=$CHUNKS calib_md5=$(md5sum < "$calib" | cut -d' ' -f1) calib=$(basename "$calib")$([ "$SPECIAL" != 1 ] || echo ' parse_special=1')"
+  write_marker "$marker" "$key" "$im" "entries=$(wc -l < "$WORK/imatrix.tsv" | tr -d ' ') ctx=$CTX chunks=$CHUNKS seqs=$SEQS imatrix_gpu=$IMATRIX_GPU calib_md5=$(md5sum < "$calib" | cut -d' ' -f1) calib=$(basename "$calib")$([ "$SPECIAL" != 1 ] || echo ' parse_special=1')"
   say "imatrix: done: $im, $(stat -c %s "$im") bytes, $(wc -l < "$WORK/imatrix.tsv" | tr -d ' ') tensors (in_sum2 and counts), every routed-expert tensor of the input covered; wall $((SECONDS - t0)) s for $IN_BYTES B in (derived $pred s)"
 }
 

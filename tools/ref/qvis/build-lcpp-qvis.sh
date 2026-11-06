@@ -19,6 +19,9 @@
 #   LCPP_BUILD_CUDA     the CUDA toolkit nvcc comes from (default /usr/local/cuda-13.3)
 #   LCPP_BUILD_CPU_ONLY 1 builds the CPU backend alone (GGML_CUDA=OFF, GGML_NATIVE=ON, no nvcc); 0, the default, the CUDA
 #                       build above; any other value is refused (rc 64). Mistral Large 4's oracle tree is the CPU-only one
+#   LCPP_BUILD_BUILD    the build directory's name under the tree (default build): a second build of one tree, with another
+#                       backend, goes beside the first and never touches its binaries (a plain name: no slash, not . or ..)
+#   LCPP_BUILD_BOUND_S  the build's bound in seconds (default 1740); a CUDA build niced beside a loaded CPU may need more
 #   LCPP_BUILD_PATCH    a patch in this repository (a path from its root) applied to the tree after its checkout: a dump
 #                       hook the commit lacks (tools/ref/ml4-dspark-dump.patch). Unset, the default, the tree is the
 #                       commit's. An existing tree's tracked changes must then be exactly that patch's (its files, and
@@ -42,6 +45,8 @@ MAINLINE=/home/user/llama.cpp-mainline
 CUDA=${LCPP_BUILD_CUDA:-/usr/local/cuda-13.3}
 CUDA_ARCH=${LCPP_BUILD_CUDA_ARCH:-86}
 CPU_ONLY=${LCPP_BUILD_CPU_ONLY:-0}
+BUILD=${LCPP_BUILD_BUILD:-build}
+BOUND_S=${LCPP_BUILD_BOUND_S:-1740}
 IFS=, read -ra TARGETS <<< "${LCPP_BUILD_TARGETS:-llama,mtmd,llama-common}"
 NVCC=$CUDA/bin/nvcc
 USER_PATH=$CUDA/bin:/usr/bin:/bin
@@ -61,6 +66,8 @@ fail() {
   echo "${2:-2}" > "$DIR/rc"
   exit "${2:-2}"
 }
+[[ $BUILD =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] && [ "$BUILD" != .. ] || fail "LCPP_BUILD_BUILD='$BUILD' is not a plain directory name" 64
+[[ $BOUND_S =~ ^[1-9][0-9]*$ ]] || fail "LCPP_BUILD_BOUND_S='$BOUND_S' is not whole seconds above 0" 64
 [[ $PIN =~ ^[0-9a-f]{40}$ ]] || fail "LCPP_BUILD_PIN='$PIN' is not a full commit id (40 lower-case hex digits)" 64
 case $CPU_ONLY in
   0 | 1) ;;
@@ -112,15 +119,15 @@ else
   echo "build-lcpp-qvis: targets ${TARGETS[*]}, CUDA architecture $CUDA_ARCH, $NVCC"
 fi
 t0=$(date +%s)
-as_user cmake -S "$TREE" -B "$TREE/build" "${BACKEND_FLAGS[@]}" -DLLAMA_CURL=OFF \
+as_user cmake -S "$TREE" -B "$TREE/$BUILD" "${BACKEND_FLAGS[@]}" -DLLAMA_CURL=OFF \
   -DCMAKE_BUILD_TYPE=Release || fail "cmake configure failed"
 rc=0
-lease_bounded 1740 taskset -c 0-31 nice -n 19 "${AS_USER[@]}" \
-  cmake --build "$TREE/build" --config Release -j 16 --target "${TARGETS[@]}" || rc=$?
+lease_bounded "$BOUND_S" taskset -c 0-31 nice -n 19 "${AS_USER[@]}" \
+  cmake --build "$TREE/$BUILD" --config Release -j 16 --target "${TARGETS[@]}" || rc=$?
 echo "build-lcpp-qvis: build rc $rc in $(($(date +%s) - t0)) s, end $(now)"
 if [ "$rc" = 0 ]; then
   for l in libmtmd.so libllama.so libllama-common.so libggml.so libggml-base.so; do
-    [ -e "$TREE/build/bin/$l" ] || { echo "build-lcpp-qvis: no $TREE/build/bin/$l"; rc=2; }
+    [ -e "$TREE/$BUILD/bin/$l" ] || { echo "build-lcpp-qvis: no $TREE/$BUILD/bin/$l"; rc=2; }
   done
 fi
 echo "$rc" > "$DIR/rc"

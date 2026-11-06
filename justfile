@@ -4482,6 +4482,11 @@ dump-ref-kimi-k3:
 build-k3-quant-tree:
     BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=900 BLOOMERY_MODEL=kimi-k3 ./tools/box.sh 'bash tools/ref/build-k3-quant-tree.sh'
 
+# The same tree and pin with CUDA (GGML_CUDA=ON, sm_86) in its own build-cuda/ directory and sentinel directory /root/lcpp-kimik3-quant-cuda; `build/`
+# and the CPU pipeline's binaries are not touched. `k31-quant.sh imatrix --imatrix-gpu` runs this build's llama-imatrix. Niced; bound 7200 s.
+build-k3-quant-tree-cuda:
+    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=2400 BLOOMERY_MODEL=kimi-k3 ./tools/box.sh 'bash tools/ref/build-k3-quant-tree.sh --cuda'
+
 # One step of the K3.1 pipeline (tools/ref/k31-quant.sh has the contract): prepare | imatrix | quantize | splice | upload | all, plan (the
 # quantize step's per-class bytes alone), calib (the calibration text alone), or `smoke` (the whole chain on the K3 fixture, flags only).
 # `--map tight|trunk-q5|ud` picks the type map, `--type IQ1_S|IQ2_XXS` the routed experts' type. `--dry-run` among the ARGS prints every

@@ -5,6 +5,13 @@
 #
 #   BLOOMERY_REMOTE='~/repo/bloomery-<track>' tools/box.sh 'bash tools/ref/build-k3-quant-tree.sh'     (just build-k3-quant-tree)
 #   BLOOMERY_BOX_READONLY=1 tools/box.sh 'cat /root/lcpp-kimik3-quant/rc; tail -n 5 /root/lcpp-kimik3-quant/log'
+#   BLOOMERY_REMOTE='~/repo/bloomery-<track>' tools/box.sh 'bash tools/ref/build-k3-quant-tree.sh --cuda'        (just build-k3-quant-tree-cuda)
+#
+# `--cuda` builds the same tree at the same pin into its own directory $K3_QUANT_TREE/build-cuda (GGML_CUDA=ON, CMAKE_CUDA_ARCHITECTURES
+# 86, nvcc from /usr/local/cuda-13.3 unless LCPP_BUILD_CUDA names another toolkit), its sentinel directory $K3_QUANT_DIR-cuda (pid, log, rc)
+# and the same oracle proof. `build/`, whose binaries a running CPU pipeline uses, and its sentinel directory are not touched; the
+# build runs niced (nice -n 19, 16 jobs, cores 0-31) and its bound is LCPP_BUILD_BOUND_S (default 7200 here). `llama-imatrix` of that
+# directory is what `k31-quant.sh imatrix --imatrix-gpu` runs.
 #
 # The oracle tree /home/user/llama.cpp-kimik3 is never configured, built or edited: the oracle sets name the md5 of its libllama, and
 # a rebuild moves it. This tree is a tree of its own (/home/user/llama.cpp-kimik3-quant) built by the one script that builds every
@@ -37,7 +44,15 @@ TARGETS=llama,mtmd,llama-common,llama-imatrix,llama-quantize,llama-tokenize,llam
 
 die() { echo "build-k3-quant-tree.sh: $1" >&2; exit "${2:-64}"; }
 
-[ $# = 0 ] || die "takes no arguments (the pin, tree and directory are K3_QUANT_TREE and K3_QUANT_DIR)"
+BUILD=build CPU_ONLY=1
+case ${1:-} in
+  '') ;;
+  --cuda)
+    [ $# = 1 ] || die "--cuda takes no further argument"
+    BUILD=build-cuda CPU_ONLY=0
+    DIR=${K3_QUANT_DIR:-/root/lcpp-kimik3-quant}-cuda ;;
+  *) die "takes no argument but --cuda (the pin, tree and directory are K3_QUANT_TREE and K3_QUANT_DIR)" ;;
+esac
 
 # Canonical forms without requiring the paths to exist (the tree does not before its first build).
 canon() {
@@ -76,9 +91,10 @@ printf '%s\n' "$BEFORE" | sed 's/^/    /'
 [ "$(printf '%s\n' "$BEFORE" | head -1)" = "$PIN" ] || die "the oracle tree is at $(printf '%s\n' "$BEFORE" | head -1), not the pin $PIN: this tree would not be the oracle's commit" 65
 [ "$(printf '%s\n' "$BEFORE" | sed -n 2p)" = "status-lines=0" ] || die "the oracle tree has tracked changes: it is not the commit's build, so this tree cannot be said to equal it" 65
 
-echo "build-k3-quant-tree.sh: tree $T, sentinel $D, pin $PIN, targets $TARGETS"
+echo "build-k3-quant-tree.sh: tree $T, build dir $BUILD, sentinel $D, pin $PIN, targets $TARGETS"
 rc=0
-LCPP_BUILD_PIN=$PIN LCPP_BUILD_TREE=$T LCPP_BUILD_DIR=$D LCPP_BUILD_CPU_ONLY=1 LCPP_BUILD_TARGETS=$TARGETS \
+LCPP_BUILD_PIN=$PIN LCPP_BUILD_TREE=$T LCPP_BUILD_DIR=$D LCPP_BUILD_CPU_ONLY=$CPU_ONLY LCPP_BUILD_BUILD=$BUILD \
+  LCPP_BUILD_BOUND_S=${LCPP_BUILD_BOUND_S:-$([ "$CPU_ONLY" = 1 ] && echo 1740 || echo 7200)} LCPP_BUILD_TARGETS=$TARGETS \
   bash "$HERE/qvis/build-lcpp-qvis.sh" || rc=$?
 # The generic script writes to its own log (exec > log) and its rc file last; its exit status is the same number.
 echo "build-k3-quant-tree.sh: generic build script exit $rc; $D/log tail:"
@@ -96,8 +112,8 @@ have=$(git -c safe.directory='*' -C "$T" rev-parse HEAD) || die "cannot read $T'
 [ "$have" = "$PIN" ] || die "$T is at $have after the build, not the pin" 65
 echo "build-k3-quant-tree.sh: tree $T at $have; status-lines=$(git -c safe.directory='*' -C "$T" status --porcelain --untracked-files=no | wc -l | tr -d ' ')"
 for b in llama-imatrix llama-quantize llama-tokenize llama-gguf-split; do
-  [ -x "$T/build/bin/$b" ] || die "no $T/build/bin/$b after a build that reported success" 2
-  printf 'build-k3-quant-tree.sh: %s sha256 %s\n' "$T/build/bin/$b" "$(sha256sum < "$T/build/bin/$b" | cut -d' ' -f1)"
+  [ -x "$T/$BUILD/bin/$b" ] || die "no $T/$BUILD/bin/$b after a build that reported success" 2
+  printf 'build-k3-quant-tree.sh: %s sha256 %s\n' "$T/$BUILD/bin/$b" "$(sha256sum < "$T/$BUILD/bin/$b" | cut -d' ' -f1)"
 done
-printf 'build-k3-quant-tree.sh: %s md5 %s\n' "$T/build/bin/libllama.so.0.8.0" "$(md5sum < "$T/build/bin/libllama.so.0.8.0" 2> /dev/null | cut -d' ' -f1)"
+printf 'build-k3-quant-tree.sh: %s md5 %s\n' "$T/$BUILD/bin/libllama.so.0.8.0" "$(md5sum < "$T/$BUILD/bin/libllama.so.0.8.0" 2> /dev/null | cut -d' ' -f1)"
 echo "build-k3-quant-tree.sh: done"
