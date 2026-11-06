@@ -633,8 +633,10 @@ do_imatrix() {
   fi
   lease_on "$CARD"
   local t0=$SECONDS
+  # --no-repack: K3.1's routed experts are MXFP4, which the CPU backend repacks into a RAM buffer the size of the set
+  # (1.45 TB, refused by the allocator); without it the weights stay in the mmap and stream once a chunk.
   run imatrix "$bound" "${NICE[@]}" env CUDA_VISIBLE_DEVICES= "$IMAT" -m "$IN" -f "$calib" -o "$im.partial" --output-format gguf \
-    -c "$CTX" -b "$CTX" -ub "$CTX" --chunks "$CHUNKS" --no-escape --no-ppl -t "$THREADS" ${PARSE[@]+"${PARSE[@]}"} || fail_step imatrix $?
+    -c "$CTX" -b "$CTX" -ub "$CTX" --chunks "$CHUNKS" --no-escape --no-ppl --no-repack -t "$THREADS" ${PARSE[@]+"${PARSE[@]}"} || fail_step imatrix $?
   if [ "$DRY" = 1 ]; then lease_off; return 0; fi
   lease_off
   [ -s "$im.partial" ] || die "llama-imatrix ended 0 and wrote no $im.partial: see $LOGDIR/imatrix.log" 65
