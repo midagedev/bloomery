@@ -6,7 +6,6 @@
 //! own kimi_k3 arch, so it needs no feature.
 
 use bloomery_gpu::arch::kimi_k3::Body;
-use bloomery_gpu::host::served::prompt_pass;
 use bloomery_gpu::{GpuError, GpuModel};
 
 use crate::{Keep, Prompt};
@@ -14,9 +13,14 @@ use crate::{Keep, Prompt};
 const WHAT: &str = "kimi_k3 session";
 
 impl Prompt for Body {
-    /// The ids stepped from the model's position, one residency pass ([`prompt_pass`]).
+    /// The ids stepped from the model's position. Each step owns its residency pass
+    /// ([`GpuModel::step`]: its boundary, its kept row, the next boundary ahead), and a host
+    /// tier's open-call state refuses a boundary inside an open call, so no outer
+    /// [`prompt_pass`](bloomery_gpu::host::served::prompt_pass) wraps the ids. The body's
+    /// residency lever is off ([`Residency::Off`](bloomery_gpu::host::swap::Residency)), so no
+    /// rule counts the prompt ids' decode rows.
     fn prompt(m: &mut GpuModel<Body>, ids: &[u32]) -> Result<u32, GpuError> {
-        prompt_pass(m, |m| m.step(ids))
+        m.step(ids)
     }
 }
 

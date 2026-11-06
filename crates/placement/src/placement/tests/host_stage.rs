@@ -138,3 +138,75 @@ fn a_host_need_past_the_room_is_refused_by_name() {
         bare.violations()
     );
 }
+
+/// The stage map's head rule: at most one card carries it, and with none
+/// the head stays on the host.
+#[test]
+fn the_stage_map_takes_at_most_one_head() {
+    let map = |head: [bool; 2]| {
+        Stages::new(
+            8,
+            &[
+                card("card0", 0..5, head[0], false),
+                card("card1", 5..8, head[1], false),
+            ],
+        )
+    };
+    let held = |head: [bool; 2]| map(head).unwrap_or_else(|e| panic!("{head:?}: {e}")).head;
+    assert_eq!(held([false, false]), None);
+    assert_eq!(held([false, true]), Some(1));
+    match map([true, true]) {
+        Err(PlacementError::Stages(msg)) => {
+            assert_eq!(msg, "2 cards carry the head, at most one does");
+        }
+        other => panic!("{:?}, want a stage-map refusal", other.map(|s| s.head)),
+    }
+}
+
+/// A plan whose cards carry no head reads it on the host in the file's bytes and
+/// the card holds the rest: with the head on a card too small for it the plan
+/// names the card over its bound, with the card's head off it plans, the head's
+/// row one host segment among the host's tables. Mutant: the head always on its
+/// stage card (`place_whole`'s head arm taken out) ends the second arm in a
+/// `WrongCard` for the head and the same `CardOver` as the first.
+#[test]
+fn a_plan_with_no_head_card_leaves_the_head_on_the_host() {
+    let model = with_attention(2);
+    let usable = 2 * HEAD + HEAD / 2;
+    let machine = |head: bool| Machine {
+        cards: vec![Card {
+            head,
+            ..bytes_card("stage", usable, 0..2)
+        }],
+        tiers: Vec::new(),
+        nodes: vec![Node {
+            host: host(),
+            unified: None,
+        }],
+    };
+    let (with, without) = (machine(true), machine(false));
+    let plan = plan_with(&model, &with, 4096, &HostKv, None).expect("the plan");
+    assert!(
+        matches!(
+            plan.violations().as_slice(),
+            [Violation::CardOver { card, .. }] if card == "stage"
+        ),
+        "{:?}",
+        plan.violations()
+    );
+    let plan = plan_with(&model, &without, 4096, &HostKv, None).expect("the plan");
+    assert_eq!(plan.violations().len(), 0, "{:?}", plan.violations());
+    let head = plan
+        .rows
+        .iter()
+        .find(|r| model.tensors[r.tensor].role == Role::Head)
+        .expect("the head's row");
+    let [segment] = head.segments.as_slice() else {
+        panic!("the head is one segment: {:?}", head.segments);
+    };
+    assert_eq!(
+        (segment.device, segment.format, segment.resident_bytes),
+        (Device::Host, Format::HostFile, HEAD)
+    );
+    assert_eq!(plan.host.table_bytes, 2 * HEAD, "embedding and head");
+}

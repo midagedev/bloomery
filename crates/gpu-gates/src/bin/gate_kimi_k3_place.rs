@@ -1,9 +1,10 @@
 //! GPU gate for Kimi K3's placed load (`--place bp`): the stage card holds the dense trunk and each
 //! routed layer's first experts, the second card is the expert tier (`LegTier`, in process or
 //! served by a loopback `tier_server` through [`bloomery_gpu::arch::kimi_k3::NODE_FAMILY`]), the
-//! embedding is a host row. The fixture tier only: the real file's plan leaves experts on the
-//! host tier, which has no SiTU expert form (`model::ops::ExpertForm`), so the placed load refuses
-//! it by name (clause `host share`) and the real file's run is `generate_kimi_k3 --place bp`'s.
+//! embedding is a host row, and a plan's share the cards cannot hold is the host tier's (SiTU
+//! combined by `model::ops::ExpertForm::Situ`). The fixture tier only: the plans are found by
+//! card budgets over a fixture's experts, and the real file's run is
+//! `generate_kimi_k3 --place bp`'s.
 //!
 //! The plan is made on the gate's `bp` machine (the A6000 the stage, the 3090 the tier, each
 //! counting its uploads at [`GRANULE`]: the fixture's experts, 38 KB each, fit the shared granules
@@ -33,12 +34,19 @@
 //!   and the same logits bits (an FNV-1a over the last row's bits).
 //! - `reserve`: a plan made with a tier reserve of 0 where the load makes tier places is refused
 //!   by name at the load (`tier places`).
+//! - `host head`: a plan whose stage card carries no head (the head read on the host) is refused
+//!   by name at the load: the body ends its step in a card head.
 //! - `host share`: a plan whose tier card is budgeted under what the experts need (per-card
-//!   budgets: the stage at the window's first, the tier below) leaves experts on the host, and the
-//!   load refuses it by name (no SiTU expert form).
+//!   budgets: the stage at the window's first, the tier below) leaves experts on the host; the
+//!   load holds the plan's counts per layer, and fed the whole-card body's ids each step's logits
+//!   row is within [`HOST_REL_BAND`] relative L2 of the whole-card row (the host's SiTU against
+//!   the card's rule). The free-running ids are not the clause: a flat fixture row flips its
+//!   argmax on a rounding, and the rows after that are another history's.
+//! - `host layer without tier`: a plan where a layer holds host experts and no tier expert is
+//!   refused by name at the load (the host handoff's entries are not built for K3's slot count).
 //! - `node family`: a node that serves only another family refuses the open by name.
 //! - `plan records`: `generate_kimi_k3 --plan --place bp` prints the `plan` record of the placed
-//!   machine and no host expert.
+//!   machine and no host expert (the gate's plan holds none).
 //!
 //! The prompt is the fixed walk of `e2e::walk` through the vocabulary: [`PROMPT`] ids, [`STEPS`]
 //! greedy ids.
@@ -74,6 +82,7 @@ mod gate {
     use std::process::Command;
     use std::sync::Arc;
 
+    use app::Prompt;
     use bloomery_gpu::arch::kimi_k3::Body;
     use bloomery_gpu::host::node;
     use bloomery_gpu::model::StepMode;
@@ -109,6 +118,11 @@ mod gate {
     const PROMPT: usize = 6;
     /// Greedy ids after the prompt.
     const STEPS: usize = 8;
+    /// The worst step's logits row's relative L2 distance of a load with host experts from the
+    /// whole-card body's, both fed the same ids: the host's activation rules (q8_K, q8_2) against
+    /// the card's (q8_1) set the floor, `gate_hybrid`'s error model.
+    /// PIN(2026-11-06): twice the worst measured step (8.16e-2); the swapped betas read 5.8e-1.
+    const HOST_REL_BAND: f64 = 1.6e-1;
 
     /// The fixed walk: a multiplicative walk through ids the vocabulary holds.
     fn walk(n: usize, vocab: usize) -> Vec<u32> {
@@ -129,7 +143,10 @@ mod gate {
     /// What a run read: the greedy ids and the last logits row.
     struct Run {
         ids: Vec<u32>,
+        /// The last logits row.
         logits: Vec<f32>,
+        /// The logits row after the prompt and after each id fed back: `ids.len()` rows.
+        rows: Vec<Vec<f32>>,
     }
 
     impl Run {
@@ -138,19 +155,36 @@ mod gate {
         }
     }
 
-    /// The prompt, then [`STEPS`] ids greedy, and the last logits row.
+    /// The prompt, then [`STEPS`] ids greedy, the last logits row and every step's.
     fn greedy(m: &mut GpuModel<Body>, prompt: &[u32]) -> Result<Run, GateError> {
-        // The prompt's ids are stepped, not `Prompt::prompt`: that wraps the call in one residency
-        // boundary and each step opens its own, which a hosted load refuses by name.
-        let mut ids = vec![m.step(prompt)?];
+        let mut ids = vec![Body::prompt(m, prompt)?];
+        let mut rows = vec![m.logits()?];
         while ids.len() < STEPS {
             let last = ids[ids.len() - 1];
             ids.push(m.step(&[last])?);
+            rows.push(m.logits()?);
         }
         Ok(Run {
             ids,
             logits: m.logits()?,
+            rows,
         })
+    }
+
+    /// The prompt, then `ids` fed back one a step (all but the last): the logits row after the
+    /// prompt and after each id, the rows a free-running load would read had it chosen `ids`.
+    fn forced(
+        m: &mut GpuModel<Body>,
+        prompt: &[u32],
+        ids: &[u32],
+    ) -> Result<Vec<Vec<f32>>, GateError> {
+        Body::prompt(m, prompt)?;
+        let mut rows = vec![m.logits()?];
+        for &id in &ids[..ids.len() - 1] {
+            m.step(&[id])?;
+            rows.push(m.logits()?);
+        }
+        Ok(rows)
     }
 
     /// The relative L2 distance of row `b` from row `a`.
@@ -356,8 +390,14 @@ mod gate {
 
     /// The card budgets of a plan that leaves experts on the host: the stage card at `stage`, the
     /// tier card at the first budget above its floor that gives it some experts and the host the
-    /// rest, and the split that makes; none when no budget does.
-    fn host_share_plan(inputs: &PlanInputs, stage: u64) -> Result<Option<HostShare>, GateError> {
+    /// rest, and the split that makes; with `tierless`, a plan where some layer holds host experts
+    /// and no tier expert, and without, one where every layer with host experts holds tier ones
+    /// too. None when no budget does.
+    fn host_share_plan(
+        inputs: &PlanInputs,
+        stage: u64,
+        tierless: bool,
+    ) -> Result<Option<HostShare>, GateError> {
         let machine = bp_machine(inputs)?;
         let (Some(s), Some(t)) = (
             machine.cards.first().and_then(|c| c.device),
@@ -384,16 +424,18 @@ mod gate {
         let step = ((stage - plans) / 512).max(1);
         let mut b = plans;
         while b < stage {
-            if let Cut::Split(stage, tier, host) = cut(inputs, &machine, &of(b))
-                && tier > 0
-                && host > 0
-            {
-                return Ok(Some(HostShare {
-                    levers: of(b),
-                    stage,
-                    tier,
-                    host,
-                }));
+            if let Ok(plan) = inputs.plan(&machine, CTX as u64, &of(b)) {
+                let splits = layer_splits(&plan);
+                let (stage_n, tier, host) = totals(&splits);
+                let has_tierless = splits.iter().any(|&(_, _, t, h)| h > 0 && t == 0);
+                if tier > 0 && host > 0 && has_tierless == tierless {
+                    return Ok(Some(HostShare {
+                        levers: of(b),
+                        stage: stage_n,
+                        tier,
+                        host,
+                    }));
+                }
             }
             b += step;
         }
@@ -522,9 +564,9 @@ mod gate {
     pub fn run() -> Result<(), GateError> {
         if Tier::from_env()? != Tier::Fixture {
             return Err(format!(
-                "{NAME}: the real file's plan leaves experts on the host tier, which has no SiTU \
-                 expert form, so the gate runs the fixture tier: BLOOMERY_TIER=fixture just \
-                 {RECIPE}"
+                "{NAME}: the gate's plans split the fixture's experts by card budget, so it runs \
+                 the fixture tier: BLOOMERY_TIER=fixture just {RECIPE}; the real file's run is \
+                 generate_kimi_k3 --place bp"
             )
             .into());
         }
@@ -549,7 +591,9 @@ mod gate {
         let mut pass = true;
         pass &= placed(&inputs, budget, host, (&prompt, &want))?;
         pass &= tier_only(&inputs, &table, host, (&prompt, &want))?;
-        pass &= refusals(&inputs, (budget, &table), host)?;
+        pass &= refusals(&inputs, budget, host)?;
+        pass &= host_share(&inputs, &table, (budget, host), (&prompt, &want))?;
+        pass &= host_without_tier(&inputs, &table, (budget, host))?;
         pass &= node_family_and_records(&prompt, budget)?;
         println!("{NAME}: {}", tier::tally_line());
         if !pass {
@@ -557,8 +601,9 @@ mod gate {
         }
         println!(
             "PASSED: {NAME} the placed load's greedy ids equal the whole-card body's, eager reads \
-             the graph's bits, the loopback node's tier reads the in-process tier's bits, and the \
-             load refuses a wrong tier reserve, a host share and a node of another family by name"
+             the graph's bits, the loopback node's tier reads the in-process tier's bits, a plan's \
+             host share reads the whole-card logits rows within the band, and the load refuses a wrong tier \
+             reserve and a node of another family by name"
         );
         Ok(())
     }
@@ -761,12 +806,7 @@ mod gate {
     }
 
     /// The loads the body refuses by name.
-    fn refusals(
-        inputs: &PlanInputs,
-        (budget, table): (u64, &[Budget]),
-        host: HostCfg,
-    ) -> Result<bool, GateError> {
-        let mut pass = true;
+    fn refusals(inputs: &PlanInputs, budget: u64, host: HostCfg) -> Result<bool, GateError> {
         let machine = bp_machine(inputs)?;
 
         // A tier reserve of 0 where the load makes tier places.
@@ -775,48 +815,141 @@ mod gate {
         let file = open_split(Arch::KimiK3, RECIPE)?;
         let text = refused(GpuModel::<Body>::open_placed(file, &plan, &wrong, 0, host));
         tier::sc("reserve: a tier reserve of 0 is refused by name at the load")?;
-        pass &= line(
+        let mut pass = line(
             text.as_deref()
                 .is_some_and(|t| t.contains("tier places") && t.contains("the plan reserves 0")),
             "reserve",
             &format!("the load of a plan with a tier reserve of 0: {text:?}"),
         );
 
-        // A plan that leaves experts on the host: the tier card's budget squeezed under the stage's.
-        let found = host_share_plan(inputs, pick_tier_only(table).unwrap_or(budget))?;
-        tier::sc("host share: a plan that leaves experts on the host is refused by name")?;
-        match found {
-            None => {
-                pass &= line(
-                    false,
-                    "host share",
-                    "no tier budget leaves an expert on the host: the clause has no input",
-                );
-            }
-            Some(HostShare {
-                levers,
-                stage,
-                tier: held,
-                host: left,
-            }) => {
-                let plan = inputs.plan(&machine, CTX as u64, &levers)?;
-                let file = open_split(Arch::KimiK3, RECIPE)?;
-                let text = refused(GpuModel::<Body>::open_placed(file, &plan, inputs, 0, host));
-                pass &= line(
-                    text.as_deref().is_some_and(|t| {
-                        t.contains("keep experts on the host tier")
-                            && t.contains("SiTU expert form")
-                    }),
-                    "host share",
-                    &format!(
-                        "per-card budgets {} hold stage {stage}, tier {held}, host {left} experts; \
-                         its load: {text:?}",
-                        levers.card_budget_bytes
-                    ),
-                );
-            }
+        // A plan with no head card reads the head on the host, which the body has no stage for.
+        // The head's bytes leave the stage card, so its budget loses them and the experts split
+        // as the gate's plan does.
+        let head_bytes: u64 = plan
+            .rows
+            .iter()
+            .filter(|r| plan.model.tensors[r.tensor].role == Role::Head)
+            .flat_map(|r| &r.segments)
+            .filter(|s| matches!(s.device, Device::Card(_)))
+            .map(|s| s.resident_bytes)
+            .sum();
+        let mut headless = bp_machine(inputs)?;
+        for card in &mut headless.cards {
+            card.head = false;
         }
+        let plan = inputs.plan(&headless, CTX as u64, &under(budget - head_bytes))?;
+        let file = open_split(Arch::KimiK3, RECIPE)?;
+        let text = refused(GpuModel::<Body>::open_placed(file, &plan, inputs, 0, host));
+        tier::sc("host head: a plan that reads the head on the host is refused by name")?;
+        pass &= line(
+            text.as_deref()
+                .is_some_and(|t| t.contains("reads the head on the host")),
+            "host head",
+            &format!("the load of a plan with no head card: {text:?}"),
+        );
         Ok(pass)
+    }
+
+    /// A plan that leaves experts on the host (the tier card's budget squeezed under what the
+    /// experts need): the load holds the plan's counts, and its greedy ids and last logits row are
+    /// the whole-card body's within [`HOST_REL_BAND`].
+    fn host_share(
+        inputs: &PlanInputs,
+        table: &[Budget],
+        (budget, host): (u64, HostCfg),
+        (prompt, want): (&[u32], &Run),
+    ) -> Result<bool, GateError> {
+        let clause = "host share";
+        tier::sc("host share: the host tier's experts read the whole-card body's logits rows")?;
+        let Some(HostShare {
+            levers,
+            stage,
+            tier: held,
+            host: left,
+        }) = host_share_plan(inputs, pick_tier_only(table).unwrap_or(budget), false)?
+        else {
+            return Ok(line(
+                false,
+                clause,
+                "no tier budget leaves an expert on the host: the clause has no input",
+            ));
+        };
+        let machine = bp_machine(inputs)?;
+        let plan = inputs.plan(&machine, CTX as u64, &levers)?;
+        let splits = layer_splits(&plan);
+        let file = open_split(Arch::KimiK3, RECIPE)?;
+        let mut m = GpuModel::<Body>::open_placed(file, &plan, inputs, 0, host)?;
+        m.set_mode(StepMode::Graph);
+        let wrong: Vec<_> = {
+            let p = m.body(NAME)?.placed().ok_or("not a placed load")?;
+            splits
+                .iter()
+                .filter(|&&(l, s, t, _)| p.n_card(l) as u64 != s || p.tier_k(l) as u64 != t)
+                .map(|&(l, ..)| (l, p.n_card(l), p.tier_k(l)))
+                .collect()
+        };
+        let rows = forced(&mut m, prompt, &want.ids)?;
+        let dists: Vec<f64> = want
+            .rows
+            .iter()
+            .zip(&rows)
+            .map(|(w, g)| rel(w, g))
+            .collect();
+        let shown: Vec<String> = dists.iter().map(|d| format!("{d:.2e}")).collect();
+        let (at, worst) = dists
+            .iter()
+            .copied()
+            .enumerate()
+            .fold((0, 0.0f64), |a, (i, d)| if d > a.1 { (i, d) } else { a });
+        Ok(line(
+            wrong.is_empty() && rows.len() == want.rows.len() && worst <= HOST_REL_BAND,
+            clause,
+            &format!(
+                "per-card budgets {} hold stage {stage}, tier {held}, host {left} experts (layers \
+                 off the plan: {wrong:?}); fed the whole-card ids {:?}, each step's logits row \
+                 relative L2 {shown:?}, worst {worst:.3e} at step {at}, band {HOST_REL_BAND:.1e}",
+                levers.card_budget_bytes, want.ids
+            ),
+        ))
+    }
+
+    /// A plan where some layer holds host experts and no tier expert: the load refuses it by name,
+    /// since the host handoff's entries are built for other slot counts than K3's.
+    fn host_without_tier(
+        inputs: &PlanInputs,
+        table: &[Budget],
+        (budget, host): (u64, HostCfg),
+    ) -> Result<bool, GateError> {
+        let clause = "host layer without tier";
+        tier::sc("host layer without tier: a host share with no tier expert is refused by name")?;
+        let Some(HostShare {
+            levers,
+            stage,
+            tier: held,
+            host: left,
+        }) = host_share_plan(inputs, pick_tier_only(table).unwrap_or(budget), true)?
+        else {
+            return Ok(line(
+                false,
+                clause,
+                "no tier budget leaves a layer with host experts and none on the tier: the clause \
+                 has no input",
+            ));
+        };
+        let machine = bp_machine(inputs)?;
+        let plan = inputs.plan(&machine, CTX as u64, &levers)?;
+        let file = open_split(Arch::KimiK3, RECIPE)?;
+        let text = refused(GpuModel::<Body>::open_placed(file, &plan, inputs, 0, host));
+        Ok(line(
+            text.as_deref()
+                .is_some_and(|t| t.contains("keep experts on the host and none on a tier card")),
+            clause,
+            &format!(
+                "per-card budgets {} hold stage {stage}, tier {held}, host {left} experts; its \
+                 load: {text:?}",
+                levers.card_budget_bytes
+            ),
+        ))
     }
 
     /// The node of another family, and the plan records.

@@ -874,6 +874,8 @@ required-features = ["gpu"]
 # kimik3pp: Kimi K3's pass of up to eight rows through the chain, each row the decode step's bits, over the fixture file.
 [[bin]]
 name = "gate_kimi_k3_pp"
+required-features = ["gpu"]
+
 # Kimi K3's end-to-end decode CLI: a prompt of ids or text walked one id a step, then greedy ids (gate_kimi_k3_e2e runs it).
 [[bin]]
 name = "generate_kimi_k3"

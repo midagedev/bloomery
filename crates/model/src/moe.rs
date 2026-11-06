@@ -1084,7 +1084,9 @@ fn serve_resolved(
     // and two reads of `x` an expert; a relu² leg's holds the ups alone, and
     // moves them to the up slots once the down has read them.
     let (first, up_site) = match run.form {
-        ExpertForm::Gated { .. } | ExpertForm::GatedOai { .. } => (2 * n, "host_gate_up"),
+        ExpertForm::Gated { .. } | ExpertForm::GatedOai { .. } | ExpertForm::Situ { .. } => {
+            (2 * n, "host_gate_up")
+        }
         ExpertForm::Relu2 => (n, "host_up"),
     };
     let mut xl: Vec<&Tensor2> = relist(std::mem::take(xs));
@@ -1096,9 +1098,9 @@ fn serve_resolved(
     let dt = if run.input == ExpertInput::AmaxF16 {
         for i in 0..n {
             let (gate, up) = match run.form {
-                ExpertForm::Gated { .. } | ExpertForm::GatedOai { .. } => {
-                    (gate_up[2 * i].col(0), gate_up[2 * i + 1].col(0))
-                }
+                ExpertForm::Gated { .. }
+                | ExpertForm::GatedOai { .. }
+                | ExpertForm::Situ { .. } => (gate_up[2 * i].col(0), gate_up[2 * i + 1].col(0)),
                 ExpertForm::Relu2 => (&[][..], gate_up[i].col(0)),
             };
             run.form.combine_into(gate, up, pars[i].col_mut(0));
@@ -1116,6 +1118,11 @@ fn serve_resolved(
             ExpertForm::GatedOai { alpha, limit } => {
                 for [gate, up] in gate_up[..2 * n].as_chunks::<2>().0 {
                     sl.push(GroupInput::SwigluOai(gate, up, alpha, limit));
+                }
+            }
+            ExpertForm::Situ { beta, linear_beta } => {
+                for [gate, up] in gate_up[..2 * n].as_chunks::<2>().0 {
+                    sl.push(GroupInput::Situ(gate, up, beta, linear_beta));
                 }
             }
             ExpertForm::Relu2 => {
@@ -2205,6 +2212,21 @@ pub struct HostLayerSpec<'a> {
     pub swiglu_limit: f32,
 }
 
+/// What a host tier needs to serve one SiTU layer's routed experts ([`ExpertForm::Situ`]): the
+/// three stacks' tensor names, the expert count, the widths — `embd` the width the experts run in
+/// (a latent MoE's is the latent's), `ff` this layer's own — and the two betas of the rule. The
+/// architecture fills it from its description.
+pub struct SituSpec<'a> {
+    pub gate: &'a str,
+    pub up: &'a str,
+    pub down: &'a str,
+    pub n_expert: usize,
+    pub embd: usize,
+    pub ff: usize,
+    pub beta: f32,
+    pub linear_beta: f32,
+}
+
 /// What a host tier needs to serve one relu² layer's routed experts
 /// ([`ExpertForm::Relu2`]): the two stacks' tensor names, the expert count and
 /// the widths — `embd` the width the experts run in, `ff` this layer's own.
@@ -2778,6 +2800,37 @@ impl HostLayer {
         )
     }
 
+    /// [`HostLayer::build`] for a SiTU layer ([`ExpertForm::Situ`]): the same three stacks and
+    /// the same checks, the combine the SiTU rule at `beta` on the gate and `linear_beta` on the
+    /// up, like the OAI form an activation fact the load resolves. A beta that is not finite and
+    /// positive is refused by name, as the card's rule refuses it ([`situ_into`]'s contract).
+    pub fn build_situ(src: R8Source<'_>, spec: &SituSpec<'_>) -> Result<HostLayer, ModelError> {
+        for (key, v) in [
+            ("situ beta", spec.beta),
+            ("situ linear beta", spec.linear_beta),
+        ] {
+            if !(v.is_finite() && v > 0.0) {
+                return Err(ModelError::Metadata {
+                    key: key.to_string(),
+                    detail: format!("the beta must be finite and positive, got {v}"),
+                });
+            }
+        }
+        Self::build_form(
+            src,
+            StackNames {
+                gate: Some(spec.gate),
+                up: spec.up,
+                down: spec.down,
+            },
+            (spec.n_expert, spec.embd, spec.ff),
+            ExpertForm::Situ {
+                beta: spec.beta,
+                linear_beta: spec.linear_beta,
+            },
+        )
+    }
+
     /// [`HostLayer::build`] for a relu² layer ([`Relu2Spec`]): the up and the
     /// down checked as the gated build checks them, no gate stack looked for.
     /// The form rides beside the spec like the r8 sidecar does: an activation
@@ -3029,6 +3082,9 @@ impl HostLayer {
             ExpertForm::Gated { limit } => limit,
             ExpertForm::GatedOai { .. } => {
                 panic!("swigluoai has no SwiGLU clamp: read the OAI rule's limit from the form")
+            }
+            ExpertForm::Situ { .. } => {
+                panic!("situ has no SwiGLU clamp: read the SiTU betas from the form")
             }
             ExpertForm::Relu2 => 0.0,
         }
@@ -3412,7 +3468,9 @@ impl HostLayer {
         // A relu² layer warms its up and its down; the stacks' gate slot is
         // the up again.
         let warmed = match self.form {
-            ExpertForm::Gated { .. } | ExpertForm::GatedOai { .. } => &stacks[..],
+            ExpertForm::Gated { .. } | ExpertForm::GatedOai { .. } | ExpertForm::Situ { .. } => {
+                &stacks[..]
+            }
             ExpertForm::Relu2 => &stacks[1..],
         };
         'ids: for &id in ids {
@@ -3452,7 +3510,7 @@ impl HostLayer {
 #[cfg(test)]
 mod tests {
     use super::{
-        Buckets, HostLayer, HostLayerSpec, HostScratch, Relu2Spec, TOUCHED, UnionScratch,
+        Buckets, HostLayer, HostLayerSpec, HostScratch, Relu2Spec, SituSpec, TOUCHED, UnionScratch,
         check_host_call, gather_expert_inputs, last_touched_experts, relist, reset_touched,
     };
     use crate::ops::{self, ExpertForm, RowLayout, Tensor2};
@@ -3978,6 +4036,102 @@ mod tests {
         assert!(
             apart > 0,
             "the OAI form must not give the clamped form's result"
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A SiTU layer's list call is the SiTU rule on the same weights: per expert the gate and up
+    /// dots, the rule at the layer's betas over them, the down over that, summed in list order,
+    /// against the same composition made by hand (the f32 rule in the same op order, the group
+    /// entry's dots and down), within 1e-5 relative L2 (the host's tanh is one libm in both, so
+    /// the sums agree to rounding); and a layer at other betas gives another result over the same
+    /// stacks.
+    #[test]
+    fn host_layer_situ_matches_the_rule_and_the_betas_matter() {
+        let (embd, ff, n_expert) = (256, 256, 3);
+        let (beta, linear_beta) = (1.5f32, 4.0f32);
+        let path = layer_file("situ", [GgmlType::Q4_K; 3], embd, ff, n_expert);
+        let split = gguf::Split::open(&path).unwrap();
+        let src = R8Source::rows(&split);
+        let build = |beta: f32, linear_beta: f32| {
+            HostLayer::build_situ(
+                src,
+                &SituSpec {
+                    gate: "gate_exps",
+                    up: "up_exps",
+                    down: "down_exps",
+                    n_expert,
+                    embd,
+                    ff,
+                    beta,
+                    linear_beta,
+                },
+            )
+            .unwrap()
+        };
+        let situ = build(beta, linear_beta);
+        assert_eq!(situ.form(), ExpertForm::Situ { beta, linear_beta });
+        let x = Tensor2::from_vec(
+            embd,
+            1,
+            (0..embd)
+                .map(|i| ((i * 7919) % 1013) as f32 / 1013.0 - 0.5)
+                .collect(),
+        );
+        let list = [(2u32, 0.5f32), (0, 0.25)];
+        let run = |layer: &HostLayer| {
+            let mut host = HostScratch::new(embd, ff, list.len()).unwrap();
+            let mut out = vec![f32::NAN; embd];
+            layer
+                .experts_into(src, &x, &list, &mut out, &mut host)
+                .unwrap();
+            out
+        };
+        let g = gguf::Gguf::open(&path).unwrap();
+        let view = |name: &str, e: u32| {
+            super::expert_view(g.find(name).unwrap(), e as usize, n_expert).unwrap()
+        };
+        let mut want = vec![0.0f32; embd];
+        let mut clamped = 0usize;
+        for &(e, w) in &list {
+            let [gate, up, down] = ["gate_exps", "up_exps", "down_exps"].map(|n| view(n, e));
+            let gu = ops::matmul_q_group(&g, &[&gate, &up], &[&x, &x]).unwrap();
+            let act: Vec<f32> = gu[0]
+                .data
+                .iter()
+                .zip(&gu[1].data)
+                .map(|(&g, &u)| {
+                    clamped += usize::from(g.abs() > beta || u.abs() > linear_beta);
+                    let a = (g * (1.0 / beta)).tanh() * beta;
+                    let s = 1.0 / (1.0 + qdot::expf_ik_scalar(0.0 - g));
+                    let v = (u * (1.0 / linear_beta)).tanh() * linear_beta;
+                    (a * s) * v
+                })
+                .collect();
+            let act = Tensor2::from_vec(ff, 1, act);
+            let d = ops::matmul_q_group(&g, &[&down], &[&act]).unwrap();
+            for (o, &dv) in want.iter_mut().zip(d[0].col(0)) {
+                *o += w * dv;
+            }
+        }
+        assert!(clamped > 0, "the betas must bite on this data");
+        let rel = |a: &[f32], b: &[f32]| {
+            let num: f64 = a.iter().zip(b).map(|(x, y)| f64::from(x - y).powi(2)).sum();
+            let den: f64 = b.iter().map(|y| f64::from(*y).powi(2)).sum();
+            (num / den).sqrt()
+        };
+        let got = run(&situ);
+        let off = rel(&got, &want);
+        println!("situ layer vs the rule: rel L2 {off:.3e} ({clamped} clamped values)");
+        assert!(
+            off <= 1e-5,
+            "the layer's result must be the SiTU composition: {off:e}"
+        );
+        let other = run(&build(beta * 4.0, linear_beta * 4.0));
+        let apart = rel(&other, &want);
+        assert!(
+            apart > 100.0 * off.max(1e-7),
+            "other betas must differ: {apart:e} vs {off:e}"
         );
         std::fs::remove_file(&path).unwrap();
     }

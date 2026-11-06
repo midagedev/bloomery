@@ -35,6 +35,7 @@ use crate::flash_gqa::FlashGqaKernels;
 use crate::gemm::Gemm32Kernels;
 use crate::head::Head;
 use crate::host::StepLeg;
+use crate::host::handoff::HandoffSlots;
 use crate::host::run::HostRun;
 use crate::host::swap::Residency;
 use crate::host::swap_source::{DEADLINE, LIVE_DELAY, ResidencySpec, hosted_stacks};
@@ -632,9 +633,12 @@ impl GpuModel<Body> {
     /// over the layers whose experts the card does not hold whole with the plan's expert tier
     /// card hung under it, and the embedding as a host row ([`placed`]). The load's slot map
     /// stays for the model's life ([`Residency::Off`]). The prompt is stepped one id at a time.
-    /// Refused by name: a plan of other than one stage card running every layer, of more than one
-    /// expert tier, a layer whose stacks are not its card count's, a host share (the host tier has
-    /// no SiTU expert form), and scratch or tier places past the plan's terms for them.
+    /// Refused by name: a plan of other than one stage card running every layer, a plan that
+    /// reads the head on the host (no card carries it: the step ends in a card head, and no host
+    /// head stage exists), of more than one expert tier, a layer whose stacks are not its card
+    /// count's, a routed layer whose experts the host holds some of and no tier card any (its
+    /// handoff is the host's own entry, which the slot count a token must be one of
+    /// [`HandoffSlots`] builds), and scratch or tier places past the plan's terms for them.
     pub fn open_placed(
         file: Split,
         plan: &Plan<'_>,
@@ -645,8 +649,18 @@ impl GpuModel<Body> {
         const PLAN: &str = "kimi_k3::Body::open_placed";
         let hp = &inputs.hp;
         let (_, ctx) = stage_run(PLAN, plan, card, hp.n_layer)?;
+        if !plan.machine.cards.get(card).is_some_and(|c| c.head) {
+            return Err(GpuError::shape(
+                PLAN,
+                format!(
+                    "the plan reads the head on the host (card {card} does not carry it): the \
+                     step ends in a card head and the body has no host head stage"
+                ),
+            ));
+        }
         let run = hosted(&inputs.spec.layers)
             .map_err(|e| GpuError::shape(PLAN, format!("the routed layers: {e}")))?;
+        refuse_tierless_host_layers(PLAN, plan, run.clone(), hp)?;
         let spec = ResidencySpec {
             lever: Residency::Off,
             pool: ChurnHosting::Hosted,
@@ -721,6 +735,43 @@ fn dense_glu(file: &Split, w: &Weights, l: usize, hp: &Hparams) -> Result<Glu, G
         })
     };
     build().map_err(|e| GpuError::shape(WHAT, format!("layer {l}'s dense block: {e}")))
+}
+
+/// The routed layers `run` the host holds experts of and no tier card holds any, refused by name
+/// when the slot count a token is none of the host handoff's entries ([`HandoffSlots`]): such a
+/// layer's front is the plain host handoff, and a tier layer's is the any-count tier entry.
+fn refuse_tierless_host_layers(
+    what: &'static str,
+    plan: &Plan<'_>,
+    run: Range<usize>,
+    hp: &Hparams,
+) -> Result<(), GpuError> {
+    if HandoffSlots::of(hp.experts.n_used).is_ok() {
+        return Ok(());
+    }
+    let at = |per: &[u64], l: usize| per.get(l).copied().unwrap_or(0);
+    let tierless: Vec<(usize, u64)> = run
+        .filter_map(|l| {
+            let tier: u64 = plan.tier_n_l.iter().map(|t| at(t, l)).sum();
+            let held = at(&plan.n_l, l) + tier;
+            let n_expert = hp.experts.n_expert as u64;
+            (tier == 0 && held < n_expert).then_some((l, n_expert - held))
+        })
+        .collect();
+    if tierless.is_empty() {
+        return Ok(());
+    }
+    Err(GpuError::shape(
+        what,
+        format!(
+            "{} routed layers keep experts on the host and none on a tier card (layer, host \
+             experts): {:?}; the host handoff's entries are built for 4, 6, 8, 9 and 10 slots a \
+             token and this model routes {}, which only a tier layer's any-count entry serves",
+            tierless.len(),
+            &tierless[..tierless.len().min(8)],
+            hp.experts.n_used,
+        ),
+    ))
 }
 
 /// The slot map of a placed load's plan over the routed run, the stage card `card`'s and the

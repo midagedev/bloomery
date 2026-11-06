@@ -6,9 +6,9 @@
 //! of that fixture (refset family `fx-lcpp-kimi-k3`, `BLOOMERY_TIER=fixture just dump-ref-kimi-k3`).
 //! The model opens through `GpuModel<Body>::open`, the whole-card load `generate_kimi_k3` runs.
 //!
-//! The fixture tier only: the real file (594 GB) does not fit one card and the body has no placed
-//! load (two stage cards, the host and the NVMe tier), so the real tier ends by name before
-//! anything loads.
+//! The fixture tier only: the real file (594 GB) does not fit one card, and this gate opens the
+//! whole-card body (the placed load of the real file is `generate_kimi_k3 --place bp`'s, and
+//! `gate_kimi_k3_place`'s on the fixture), so the real tier ends by name before anything loads.
 //!
 //! For each prompt set of [`SETS`] (an English paragraph, a Korean one, a Rust function head and a
 //! five-id question), against the vendor's node dumps:
@@ -946,8 +946,9 @@ mod gate {
     pub fn run() -> Result<(), GateError> {
         if Tier::from_env()? != Tier::Fixture {
             return Err(format!(
-                "{NAME}: the real file (594 GB) does not fit one card and the body has no placed \
-                 load, so the gate runs the fixture tier: BLOOMERY_TIER=fixture just {RECIPE}"
+                "{NAME}: the real file (594 GB) does not fit one card and this gate opens the \
+                 whole-card body, so the gate runs the fixture tier: BLOOMERY_TIER=fixture just \
+                 {RECIPE}"
             )
             .into());
         }

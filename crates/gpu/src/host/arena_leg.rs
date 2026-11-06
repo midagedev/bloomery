@@ -163,12 +163,13 @@ impl LegLayer {
 }
 
 /// The gate·up rule the card leg's kernels run for a layer of `form`: the
-/// gated forms'; `None` for relu², whose `relu(up·x)²` no gate·up kernel
-/// runs, so its layer keeps the host leg.
+/// gated forms' (clamped SwiGLU, OAI, SiTU); `None` for relu², whose
+/// `relu(up·x)²` no gate·up kernel runs, so its layer keeps the host leg.
 fn rule_of(form: ExpertForm) -> Option<Act> {
     match form {
         ExpertForm::GatedOai { alpha, limit } => Some(Act::SwigluOai { alpha, limit }),
         ExpertForm::Gated { limit } => Some(Act::SwigluClamp { limit }),
+        ExpertForm::Situ { beta, linear_beta } => Some(Act::Situ { beta, linear_beta }),
         ExpertForm::Relu2 => None,
     }
 }
@@ -553,8 +554,8 @@ mod tests {
     use crate::kquant::Act;
     use model::ops::ExpertForm;
 
-    /// A gated layer runs its own rule on the card leg, and a relu² layer
-    /// none: the leg's gate·up kernels would read its up as a gate.
+    /// A gated layer runs its own rule on the card leg (SiTU's at its own betas), and a relu²
+    /// layer none: the leg's gate·up kernels would read its up as a gate.
     /// FAIL-first: a relu² layer took the clamped SwiGLU.
     #[test]
     fn a_relu2_layer_has_no_card_leg_rule() {
@@ -570,6 +571,16 @@ mod tests {
             Some(Act::SwigluOai {
                 alpha: 1.702,
                 limit: 7.0
+            })
+        );
+        assert_eq!(
+            rule_of(ExpertForm::Situ {
+                beta: 8.0,
+                linear_beta: 25.0
+            }),
+            Some(Act::Situ {
+                beta: 8.0,
+                linear_beta: 25.0
             })
         );
         assert_eq!(rule_of(ExpertForm::Relu2), None);

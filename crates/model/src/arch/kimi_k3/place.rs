@@ -17,6 +17,7 @@ use models::Need;
 use super::hparams::Hparams;
 use super::spec;
 use crate::arch::place_hybrid;
+use crate::placement::kernels;
 use crate::placement::workstation::{self, TierBatchBytes};
 use crate::placement::{PlacementError, Unimplemented};
 
@@ -85,9 +86,15 @@ impl PlanInputs {
     /// The file as it is, for a gate that describes it whatever the coverage list holds, and the
     /// host's room and the arena's given bytes. The roles and the description are the registry's
     /// reader's ([`spec::read`]), so the plan and the description of a file are one reading.
+    /// Refused by name, before any load: a dense site whose q8_1 input column is wider than the
+    /// card's activation holds ([`kernels::check_q8_act_width`]).
     pub fn describe(split: &Split) -> Result<PlanInputs, PlacementError> {
         let hp = Hparams::read(split)?;
         let read = spec::read(split)?;
+        read.tensors
+            .tensors
+            .iter()
+            .try_for_each(kernels::check_q8_act_width)?;
         let tier = tier_places_bytes(&hp);
         Ok(PlanInputs::new(ENGINE, hp, read.tensors, read.spec)?
             .with_tier_reserve(tier)
@@ -255,6 +262,55 @@ mod tests {
         match untiered.plan(&machine, 64, &PlanLevers::default()) {
             Err(PlaceError::Tier { card, tier }) => assert_eq!((card.as_str(), tier), ("3090", 0)),
             other => panic!("{other:?}, not the tier refusal"),
+        }
+    }
+
+    /// A dense FFN past the card's q8_1 activation is refused at the description by the tensor's
+    /// name and the width, before any load (the released file's dense down is 33,792 wide and
+    /// passes; the card's `Q8Act` refused it only after the file was read): the small header's
+    /// dense block widened to the cap passes and one super-block past it is the refusal. Mutant:
+    /// `kernels::Q8_ACT_MAX_K` left at 24,576, which refuses the 33,792 of the released file.
+    #[test]
+    fn a_dense_ffn_past_the_q8_activation_is_refused_by_name() {
+        use super::super::hparams::tests::E;
+        use crate::placement::kernels::Q8_ACT_MAX_K;
+        let wide = |name: &str, ff: u64| -> Split {
+            let mut kv = keys();
+            let key = kv
+                .iter_mut()
+                .find(|(k, _)| *k == "feed_forward_length")
+                .expect("the dense width key");
+            key.1 = V::U32(u32::try_from(ff).expect("a u32 width"));
+            let dense: Vec<(String, Vec<u64>)> = tensors()
+                .into_iter()
+                .map(|(n, d)| match n.as_str() {
+                    "blk.0.ffn_gate.weight" | "blk.0.ffn_up.weight" => (n, vec![E, ff]),
+                    "blk.0.ffn_down.weight" => (n, vec![ff, E]),
+                    _ => (n, d),
+                })
+                .collect();
+            let global = [
+                ("tokenizer.ggml.pre", V::Str("kimi-k2")),
+                ("tokenizer.chat_template", V::Str("{{ messages }}")),
+            ];
+            let path = header_typed(name, "kimi-k3", &kv, &global, &typed(&dense, &[]));
+            let split = Split::open(&path).expect("the synthetic header opens");
+            let _ = std::fs::remove_file(&path);
+            split
+        };
+        let widest = Q8_ACT_MAX_K as u64;
+        PlanInputs::describe(&wide("kimi-k3-place-wide-ok", 33_792))
+            .expect("the released file's dense down, 33,792 wide, describes");
+        PlanInputs::describe(&wide("kimi-k3-place-wide-cap", widest))
+            .expect("the widest column the engine runs describes");
+        match PlanInputs::describe(&wide("kimi-k3-place-wide-past", widest + 256)) {
+            Err(PlacementError::Tensor { name, detail }) => {
+                assert_eq!(name, "blk.0.ffn_down.weight");
+                for word in ["q6_K", "34048", "33792"] {
+                    assert!(detail.contains(word), "{word} missing from: {detail}");
+                }
+            }
+            other => panic!("{other:?}, not the width's refusal by tensor"),
         }
     }
 

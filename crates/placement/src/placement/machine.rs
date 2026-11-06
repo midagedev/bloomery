@@ -195,7 +195,8 @@ pub struct Card {
     pub held_by: Option<&'static str>,
     /// The layers this card's stage runs.
     pub layers: Range<usize>,
-    /// Whether this stage ends with the head.
+    /// Whether this stage ends with the head: at most one card does, and on a
+    /// plan where none does the head tensor stays on the host, read in place.
     pub head: bool,
     /// Whether this card holds the token embedding table whole — a plan of
     /// the whole model on its cards. Only the card that runs layer 0 may;

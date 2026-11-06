@@ -8,7 +8,9 @@
 //! Defaults: `-n 8`, `--ctx 512`, `--place a`, `--mode graph`. The model is `ref_model_path()`. The
 //! file is read as the plan reads it ([`PlanInputs::read_without_chat`]: every part the body does
 //! not run is refused by name, the template's tool-call parser excepted) and planned on `--place`
-//! before anything loads; `--plan` ends there.
+//! before anything loads; `--plan` ends there. A placed plan the stage card's dense trunk alone
+//! refuses (`PlacementError::CardFreeFloor`) is made again with the head read on the host (no card
+//! carries it); the `head on host` line on stderr says so and carries the refusal.
 //!
 //! `--place a` loads the whole model on one card ([`bloomery_gpu::GpuModel::open`]): a file whose
 //! tensors exceed the card's free bytes is refused by name by the load. Any other placement
@@ -16,10 +18,10 @@
 //! them, `gate`) loads by the plan ([`bloomery_gpu::GpuModel::open_placed`] through
 //! `Body::open_placed`): the dense trunk and each layer's card experts on the stage card, the
 //! embedding as a host row, the tier cards' experts under the host tier (a node's, with
-//! `BLOOMERY_TIER_NODES`, served by `tier_server`). The host tier has no SiTU expert form yet, so a
-//! plan that leaves an expert on the host is refused by name by the load. The prompt walk is the
-//! body's: its ids stepped one at a time, as the session's `Prompt` does, but without that call's
-//! own residency boundary, which a hosted load refuses; the body has no rows pass.
+//! `BLOOMERY_TIER_NODES`, served by `tier_server`). The experts a plan leaves off the cards run
+//! on the host tier (`model::ops::ExpertForm::Situ`), the NVMe tier paging what the room cannot
+//! hold. The prompt walk is the body's `Prompt` (its ids stepped one at a time; the body has no
+//! rows pass).
 //!
 //! The plan is made under `BLOOMERY_CARD_BUDGET` and `BLOOMERY_CARD_MARGIN` when they are set.
 //! `--granule BYTES` counts each card's uploads at that allocator granule instead of the
@@ -43,6 +45,7 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod cli {
+    use app::Prompt;
     use bloomery_gpu::arch::kimi_k3::Body;
     use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu::{Gpu, GpuModel};
@@ -54,8 +57,8 @@ mod cli {
         CARD_BUDGET, CARD_DONTNEED, CARD_MARGIN, HOST_LOCK, HOST_POPULATE, HostCfg, TIER_NODES,
     };
     use gguf::Split;
-    use model::arch::kimi_k3::place::{PlanInputs, tier_batch};
-    use model::placement::{Plan, PlanLevers};
+    use model::arch::kimi_k3::place::{PlaceError, PlanInputs, tier_batch};
+    use model::placement::{PlacementError, Plan, PlanLevers};
     use tokenizer::Tokenizer;
 
     /// The argument after flag `name`: `None` when the flag is absent, an error when it is last.
@@ -95,9 +98,7 @@ mod cli {
     /// `n` greedy ids after `prompt`, from the model's position: the argmax after the prompt
     /// stepped, then each id fed back one a step.
     fn greedy(m: &mut GpuModel<Body>, prompt: &[u32], n: usize) -> Result<Vec<u32>, GateError> {
-        // The prompt's ids are stepped, not `Prompt::prompt`: that wraps the call in one residency
-        // boundary and each step opens its own, which a hosted load refuses by name.
-        let mut ids = vec![m.step(prompt)?];
+        let mut ids = vec![Body::prompt(m, prompt)?];
         while ids.len() < n {
             let last = ids[ids.len() - 1];
             ids.push(m.step(&[last])?);
@@ -205,15 +206,39 @@ mod cli {
                 card.granule_bytes = granule;
             }
         }
-        let plan = inputs
-            .plan(&machine, ctx as u64, &PlanLevers::from_levers(&levers)?)
-            .map_err(|e| format!("--place {}: {e}", chosen.place.name()))?;
-        record::plan(chosen.place.name(), &machine, &plan).eprint();
+        let plan_levers = PlanLevers::from_levers(&levers)?;
+        let placed = chosen.place.name() != "a";
+        // A placed plan the stage card's dense trunk alone refuses (its bytes past the card's free
+        // bytes) is made again with the head read on the host: no card carries it.
+        let headless = {
+            let mut m = machine.clone();
+            m.cards.iter_mut().for_each(|c| c.head = false);
+            m
+        };
+        let (machine, plan) = match inputs.plan(&machine, ctx as u64, &plan_levers) {
+            Err(PlaceError::Placement(PlacementError::CardFreeFloor(floor))) if placed => {
+                let name = chosen.place.name();
+                let on_host = inputs
+                    .plan(&headless, ctx as u64, &plan_levers)
+                    .map_err(|e| {
+                        format!("--place {name}: {floor}; and with the head on the host: {e}")
+                    })?;
+                eprintln!(
+                    "head on host: the plan with the head on the stage card was refused ({floor}); \
+                     the plan below reads the head on the host"
+                );
+                (&headless, on_host)
+            }
+            other => (
+                &machine,
+                other.map_err(|e| format!("--place {}: {e}", chosen.place.name()))?,
+            ),
+        };
+        record::plan(chosen.place.name(), machine, &plan).eprint();
         need::print(&plan, 0, 0, true)?;
         if plan_only {
             return Ok(());
         }
-        let placed = chosen.place.name() != "a";
 
         let tok = text
             .is_some()

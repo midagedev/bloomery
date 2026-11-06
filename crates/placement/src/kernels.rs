@@ -17,6 +17,8 @@ pub use gguf::card::{
 };
 use models::Role;
 
+use crate::placement::{ModelTensor, PlacementError};
+
 pub mod attention;
 pub mod ffn;
 
@@ -120,11 +122,44 @@ pub fn host_stack(ty: GgmlType, k: usize) -> Result<(), qdot::QdotError> {
 }
 
 /// The widest K of a q8_1 activation column ([`DownAct::Q8Act`], [`SiteAct::Q8x128`]): the widest
-/// K-quant input of the models this engine runs, a dense FFN down of 24,576 values (Mistral Large
-/// 4's lead layer); DeepSeek-V4.1's `hc_{attn,ffn}_fn`, which read all four residual streams, take
-/// 4 × 5120. The one owner: the card's `Q8Act` refuses a width past it at load, and a header
-/// check reads the same number.
-pub const Q8_ACT_MAX_K: usize = 24_576;
+/// K-quant input of the models this engine runs, a dense FFN down of 33,792 values (Kimi K3's
+/// lead layer, a Q6_K site); Mistral Large 4's lead layer takes 24,576, and DeepSeek-V4.1's
+/// `hc_{attn,ffn}_fn`, which read all four residual streams, 4 × 5120. The one owner: the card's
+/// `Q8Act` refuses a width past it at load, [`check_q8_act_width`] refuses it at the plan, and a
+/// header check reads the same number.
+pub const Q8_ACT_MAX_K: usize = 33_792;
+
+/// Whether the dense matrix `t` fits the card's q8_1 activation: a site of a dense role
+/// (attention, hyper-connection, shared expert, dense FFN) that reads q8_1 columns
+/// ([`SiteAct::Q8x128`]) contracts `dims[0]` values per row, and a width past [`Q8_ACT_MAX_K`] is
+/// refused by name here, at the plan, where the card's `Q8Act` would refuse it after the load
+/// has read the file.
+///
+/// # Errors
+///
+/// [`PlacementError::Tensor`] naming the tensor, its type and the width.
+pub fn check_q8_act_width(t: &ModelTensor) -> Result<(), PlacementError> {
+    let dense_role = matches!(
+        t.role,
+        Role::Attention | Role::HyperConnection | Role::SharedExpert | Role::DenseFfn
+    );
+    let (true, Some(&k), Some(entry)) =
+        (dense_role && t.dims.len() >= 2, t.dims.first(), dense(t.ty))
+    else {
+        return Ok(());
+    };
+    if entry.reads_at(k) == SiteAct::Q8x128 && k > Q8_ACT_MAX_K as u64 {
+        return Err(PlacementError::tensor(
+            t,
+            format!(
+                "a {} site reads q8_1 columns of {k} values, past the card activation's \
+                 {Q8_ACT_MAX_K} (kernels::Q8_ACT_MAX_K)",
+                t.ty
+            ),
+        ));
+    }
+    Ok(())
+}
 
 /// The card bytes of the q8_1 activation of `cols` columns of `k` values
 /// ([`DownAct::Q8Act`], [`SiteAct::Q8x128`]): the five planes at `n_sb = k / 256`
@@ -1285,6 +1320,38 @@ mod tests {
         assert!(gate_up(GgmlType::Q8_0).is_some() && !card_gate_up_runs(GgmlType::Q8_0));
         assert!(down(GgmlType::Q6_K).is_some() && card_down_runs(GgmlType::Q6_K));
         assert!(down(GgmlType::Q5_0).is_some() && !card_down_runs(GgmlType::Q5_0));
+    }
+
+    /// A dense site whose q8_1 column is as wide as the widest the engine runs (Kimi K3's lead
+    /// layer's Q6_K down, 33,792 values) passes the plan's check, and one a super-block wider is
+    /// refused by name with its width. A routed stack and a site of the f32 rows are not the
+    /// check's. Mutant: [`Q8_ACT_MAX_K`] left at 24,576, which refuses K3's down.
+    #[test]
+    fn a_dense_q8_1_column_past_the_activation_cap_is_refused_by_name() {
+        let site = |role, ty, k: u64| ModelTensor {
+            name: "blk.0.ffn_down.weight".to_owned(),
+            shard: 0,
+            layer: Some(0),
+            role,
+            ty,
+            dims: vec![k, 7168],
+            file_bytes: 0,
+            gathered_rows: None,
+        };
+        let widest = Q8_ACT_MAX_K as u64;
+        assert_eq!(widest, 33_792, "K3's dense down is the widest q8_1 column");
+        assert!(check_q8_act_width(&site(Role::DenseFfn, GgmlType::Q6_K, widest)).is_ok());
+        let past = site(Role::DenseFfn, GgmlType::Q6_K, widest + 256);
+        let err = check_q8_act_width(&past).expect_err("a column past the cap is refused");
+        let said = err.to_string();
+        for word in ["blk.0.ffn_down.weight", "q6_K", "34048", "33792"] {
+            assert!(said.contains(word), "{word} missing from: {said}");
+        }
+        // The f32 rows and a routed stack read no q8_1 column the activation holds.
+        assert!(check_q8_act_width(&site(Role::DenseFfn, GgmlType::F32, widest + 256)).is_ok());
+        assert!(
+            check_q8_act_width(&site(Role::RoutedExperts, GgmlType::Q6_K, widest + 256)).is_ok()
+        );
     }
 
     /// A type id the enum does not name has no row in any operation.

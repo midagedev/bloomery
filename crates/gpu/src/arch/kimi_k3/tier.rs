@@ -12,14 +12,16 @@
 //! The step's tier handoff writes the tier image and its places with the host image
 //! ([`handoff_go_tier`]) and the back waits for both ([`Hybrid::enqueue_tier_back`]).
 
-use std::error::Error;
 use std::ops::Range;
 
 use cuda_core::DeviceBuffer;
 use gguf::Split;
+use model::ModelError;
+use model::arch::kimi_k3::hparams::Hparams;
+use model::arch::kimi_k3::names;
 use model::arch::kimi_k3::place::{self, PlanInputs};
 use model::arch::models::{Act as ModelAct, LayerSpec, Moe};
-use model::moe::HostLayer;
+use model::moe::{HostLayer, SituSpec};
 use model::placement::ModelTensors;
 use model::placement::accepts::Program;
 use model::r8file::R8Source;
@@ -81,18 +83,13 @@ impl LegFamily for KimiK3 {
         }
     }
 
-    /// Refused by name: the host has no SiTU combine, so a node's host run over layers `run`
-    /// cannot serve K3's host experts.
-    fn routed_views(
-        _: R8Source<'_>,
-        _: &PlanInputs,
+    /// The node's host run over layers `run`: each layer's experts as [`host_layer`] reads them.
+    fn routed(
+        src: R8Source<'_>,
+        inputs: &PlanInputs,
         run: Range<usize>,
-    ) -> Result<Vec<HostLayer>, Box<dyn Error + Send + Sync + 'static>> {
-        Err(format!(
-            "{WHAT}: a node tier's host run over layers {run:?}: the host tier has no SiTU \
-             expert form"
-        )
-        .into())
+    ) -> Result<Vec<HostLayer>, ModelError> {
+        run.map(|l| host_layer(src, &inputs.hp, l)).collect()
     }
 
     /// The block's SiTU at the file's betas; any other activation is refused by name, as is a
@@ -118,6 +115,35 @@ impl LegFamily for KimiK3 {
         act.code(WHAT)?;
         Ok(act)
     }
+}
+
+/// Layer `l`'s routed experts as the host tier serves them: the file's three stacks at the
+/// latent's width, combined by SiTU at the file's betas (the card leg's rule, with the host's
+/// `tanh` and `exp` where the card's are libdevice's). The one reader of both the placed load's
+/// host run and a node's.
+pub(super) fn host_layer(
+    src: R8Source<'_>,
+    hp: &Hparams,
+    l: usize,
+) -> Result<HostLayer, ModelError> {
+    let (gate, up, down) = (
+        names::ffn_gate_exps(l),
+        names::ffn_up_exps(l),
+        names::ffn_down_exps(l),
+    );
+    HostLayer::build_situ(
+        src,
+        &SituSpec {
+            gate: &gate,
+            up: &up,
+            down: &down,
+            n_expert: hp.experts.n_expert,
+            embd: hp.latent,
+            ff: hp.experts.ff,
+            beta: hp.situ.gate_beta,
+            linear_beta: hp.situ.value_beta,
+        },
+    )
 }
 
 /// K3's tier node service ([`leg_tier::node_family`]).

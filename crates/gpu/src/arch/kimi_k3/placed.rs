@@ -25,7 +25,9 @@
 //! the sixteen slots in one launch. The body walks a prompt one id a step, so there is no rows
 //! pass here.
 
-use super::super::tier::{NODE_FAMILY, PAGE_ROWS, TierParts, TierSum, enqueue_tier_sum};
+use super::super::tier::{
+    NODE_FAMILY, PAGE_ROWS, TierParts, TierSum, enqueue_tier_sum, host_layer,
+};
 use super::{Ffn, Instance, Layer, MoeDims, Walk};
 use crate::arch::hybrid::{Acts, GqaCx};
 use crate::arch::routed_ffn::{FfnKernels, Glu, Routed};
@@ -48,13 +50,10 @@ use crate::{DeviceTensor, Gpu, GpuError};
 use bloomery_levers::HostCfg;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
-use model::arch::kimi_k3::hparams::Hparams;
 use model::arch::kimi_k3::names;
 use model::arch::kimi_k3::place::PlanInputs;
 use model::embed::EmbedTable;
-use model::moe::{HostLayer, HostLayerSpec};
 use model::placement::Plan;
-use model::r8file::R8Source;
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
 use std::sync::Arc;
 
@@ -72,64 +71,6 @@ pub(super) const STEP_WALK: Overlap = Overlap {
 
 /// The rows in flight a load's host boundary and tier page hold: the step's one.
 pub(super) const LOAD_ROWS: usize = PAGE_ROWS;
-
-/// The layers of `map` the host tier holds experts of, each with its count. The host tier has no
-/// SiTU expert form (`model::ops::ExpertForm`), so a layer with a host share is refused by name:
-/// the plan must hold every expert on the stage and the tier cards between them.
-fn refuse_host_share(map: &SlotMap, n_expert: usize) -> Result<(), GpuError> {
-    let mut held = Vec::new();
-    for l in map.layers() {
-        let on_cards = map.on_card(l)? + map.on_tier(l)?;
-        if on_cards < n_expert {
-            held.push((l, n_expert - on_cards));
-        }
-    }
-    if held.is_empty() {
-        return Ok(());
-    }
-    Err(GpuError::shape(
-        PLACED,
-        format!(
-            "{} layers keep experts on the host tier (layer, experts): {held:?}; the host tier has \
-             no SiTU expert form (`model::ops::ExpertForm`), so it cannot serve K3's experts and \
-             the plan must hold every expert on the stage and the tier cards",
-            held.len()
-        ),
-    ))
-}
-
-/// The host tier's views of the layers `set` (those whose stage card holds fewer than all their
-/// experts), one per layer in order. The host run counts every such layer, the tier layers among
-/// them, so each needs a view; [`refuse_host_share`] has shown that no expert of any of them is
-/// the host's, so no call reads the view's SwiGLU form, which is not K3's rule. Replaced by the
-/// SiTU form's view when the host tier has one.
-fn host_views(
-    src: R8Source<'_>,
-    hp: &Hparams,
-    set: &[usize],
-) -> Result<Vec<HostLayer>, model::ModelError> {
-    set.iter()
-        .map(|&l| {
-            let (gate, up, down) = (
-                names::ffn_gate_exps(l),
-                names::ffn_up_exps(l),
-                names::ffn_down_exps(l),
-            );
-            HostLayer::build(
-                src,
-                &HostLayerSpec {
-                    gate: &gate,
-                    up: &up,
-                    down: &down,
-                    n_expert: hp.experts.n_expert,
-                    embd: hp.latent,
-                    ff: hp.experts.ff,
-                    swiglu_limit: 0.0,
-                },
-            )
-        })
-        .collect()
-}
 
 /// The token embedding as the host reads it: the table and one dequantized row.
 struct EmbedHost {
@@ -184,8 +125,8 @@ impl Placed {
     /// and the slot map `map` of the routed run: the host tier over the layers whose card count is
     /// under their experts, the plan's expert tier card hung under it, the card's side and the
     /// embedding table. Refused by name: more tier cards than the host tier serves, a layer whose
-    /// stacks are not its card count's, a vocabulary that is not the file's, and a host share (the
-    /// host tier has no SiTU form). Load-time only.
+    /// stacks are not its card count's, and a vocabulary that is not the file's. The host serves
+    /// its experts' share under SiTU at the file's betas ([`host_layer`]). Load-time only.
     pub(super) fn new(
         (gpu, w): (&Gpu, &Weights),
         layers: &[Layer],
@@ -231,7 +172,6 @@ impl Placed {
                     .check(on_card, shape)?;
             }
         }
-        refuse_host_share(&map, n_expert)?;
         let hosted_set: Vec<usize> = (0..n).filter(|&l| hosted[l]).collect();
         let stream = gpu.stream();
         let slots = Arc::new(DeviceTensor::upload(
@@ -267,7 +207,7 @@ impl Placed {
                 LOAD_ROWS,
             ),
             hang.as_ref(),
-            |src| host_views(src, hp, &hosted_set),
+            |src| hosted_set.iter().map(|&l| host_layer(src, hp, l)).collect(),
         )?;
         let tier = if tiers.is_empty() {
             None
