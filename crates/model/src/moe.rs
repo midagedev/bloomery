@@ -4043,9 +4043,10 @@ mod tests {
     /// A SiTU layer's list call is the SiTU rule on the same weights: per expert the gate and up
     /// dots, the rule at the layer's betas over them, the down over that, summed in list order,
     /// against the same composition made by hand (the f32 rule in the same op order, the group
-    /// entry's dots and down), within 1e-5 relative L2 (the host's tanh is one libm in both, so
-    /// the sums agree to rounding); and a layer at other betas gives another result over the same
-    /// stacks.
+    /// entry's dots and down), within 1e-5 relative L2; and a layer at other betas gives another
+    /// result over the same stacks. The quantizer, the dots, the tanh and the exponential are one
+    /// code on both sides, so only the f32 order of the two-term weighted sum can differ: 4
+    /// roundings of 2⁻²⁴, 2.4e-7, and the tolerance is forty times that.
     #[test]
     fn host_layer_situ_matches_the_rule_and_the_betas_matter() {
         let (embd, ff, n_expert) = (256, 256, 3);

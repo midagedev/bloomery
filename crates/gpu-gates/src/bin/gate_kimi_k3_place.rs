@@ -125,9 +125,28 @@ mod gate {
     /// Greedy ids after the prompt.
     const STEPS: usize = 8;
     /// The worst step's logits row's relative L2 distance of a load with host experts from the
-    /// whole-card body's, both fed the same ids: the host's activation rules (q8_K, q8_2) against
-    /// the card's (q8_1) set the floor, `gate_hybrid`'s error model.
-    /// PIN(2026-11-06): twice the worst measured step (8.16e-2); the swapped betas read 5.8e-1.
+    /// whole-card body's, both fed the same ids. The experts are the one difference: the host
+    /// rounds both inputs of a routed expert in q8_K blocks of 256 values, the card in q8_1 blocks
+    /// of 128, and `gate_hybrid`'s error model prices each rounding as `e = crest / (127 √12)` of
+    /// an int8 block of crest `amax / rms`:
+    /// - the latent row x (256 values, Gaussian, crest 3.0 over 256 and 2.8 over 128): `e` 6.9e-3
+    ///   and 6.4e-3, the gate and the up each carrying both;
+    /// - the SiTU product h (256 values, a heavier tail, crest 6.4 and 5.5 on simulated Gaussian
+    ///   rows): `e` 1.4e-2 and 1.3e-2, the down carrying both;
+    /// - the weights add no term: both paths read the same codes and sub-scales of IQ1_S and
+    ///   IQ2_XXS, the block dot is an exact i32 sum, and only the f32 order of the scale products
+    ///   differs (about 1e-7).
+    ///
+    /// One host expert then differs by `r² = 2 (e₂₅₆(x)² + e₁₂₈(x)²) + e₂₅₆(h)² + e₁₂₈(h)²`, so
+    /// `r` = 2.3e-2. The plan holds 18 of its 24 routed experts on the host (a factor √(18/24) =
+    /// 0.87 on a layer's branch) over 3 routed layers (√3, independent): 2.3e-2 · 0.87 · 1.73 =
+    /// 3.5e-2, with the routed branch taken as the whole row. That sum is the rounding floor. It
+    /// leaves out what the row passes on the way to the logits (the routed norm, the latent up,
+    /// the cross-layer mix, the head) and the router's top-2 pick on rows that now differ, and
+    /// the worst observed step is above it: the band is twice the observed step, not a multiple
+    /// of the floor.
+    /// PIN(2026-11-06): twice the worst measured step (8.16e-2 of 1.8e-2 to 8.2e-2 over the eight
+    /// steps); the swapped betas read 5.8e-1.
     const HOST_REL_BAND: f64 = 1.6e-1;
 
     /// The worst step's logits row's relative L2 distance of a load whose head the host reads from
@@ -402,15 +421,22 @@ mod gate {
         host: u64,
     }
 
+    /// The kind of host share a plan makes.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Share {
+        /// Every layer with host experts holds tier experts too.
+        Tiered,
+        /// Some layer holds host experts and no tier expert.
+        Tierless,
+    }
+
     /// The card budgets of a plan that leaves experts on the host: the stage card at `stage`, the
     /// tier card at the first budget above its floor that gives it some experts and the host the
-    /// rest, and the split that makes; with `tierless`, a plan where some layer holds host experts
-    /// and no tier expert, and without, one where every layer with host experts holds tier ones
-    /// too. None when no budget does.
+    /// rest, and the split that makes, of the kind `share` names. None when no budget does.
     fn host_share_plan(
         inputs: &PlanInputs,
         stage: u64,
-        tierless: bool,
+        share: Share,
     ) -> Result<Option<HostShare>, GateError> {
         let machine = bp_machine(inputs)?;
         let (Some(s), Some(t)) = (
@@ -441,8 +467,12 @@ mod gate {
             if let Ok(plan) = inputs.plan(&machine, CTX as u64, &of(b)) {
                 let splits = layer_splits(&plan);
                 let (stage_n, tier, host) = totals(&splits);
-                let has_tierless = splits.iter().any(|&(_, _, t, h)| h > 0 && t == 0);
-                if tier > 0 && host > 0 && has_tierless == tierless {
+                let kind = if splits.iter().any(|&(_, _, t, h)| h > 0 && t == 0) {
+                    Share::Tierless
+                } else {
+                    Share::Tiered
+                };
+                if tier > 0 && host > 0 && kind == share {
                     return Ok(Some(HostShare {
                         levers: of(b),
                         stage: stage_n,
@@ -961,8 +991,9 @@ mod gate {
     }
 
     /// A plan that leaves experts on the host (the tier card's budget squeezed under what the
-    /// experts need): the load holds the plan's counts, and its greedy ids and last logits row are
-    /// the whole-card body's within [`HOST_REL_BAND`].
+    /// experts need): the load holds the plan's counts per layer, and fed the whole-card body's
+    /// ids each step's logits row is within [`HOST_REL_BAND`] of the whole-card row. The load's
+    /// own greedy ids and its last row alone are not compared.
     fn host_share(
         inputs: &PlanInputs,
         table: &[Budget],
@@ -976,7 +1007,11 @@ mod gate {
             stage,
             tier: held,
             host: left,
-        }) = host_share_plan(inputs, pick_tier_only(table).unwrap_or(budget), false)?
+        }) = host_share_plan(
+            inputs,
+            pick_tier_only(table).unwrap_or(budget),
+            Share::Tiered,
+        )?
         else {
             return Ok(line(
                 false,
@@ -1037,7 +1072,11 @@ mod gate {
             stage,
             tier: held,
             host: left,
-        }) = host_share_plan(inputs, pick_tier_only(table).unwrap_or(budget), true)?
+        }) = host_share_plan(
+            inputs,
+            pick_tier_only(table).unwrap_or(budget),
+            Share::Tierless,
+        )?
         else {
             return Ok(line(
                 false,

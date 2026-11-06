@@ -6975,8 +6975,10 @@ mod tests {
     /// σ(g) · lb · tanh(u / lb)` against the f64 reference over the gate's and the up's whole
     /// useful range, each value within 1e-5 relative (the host's tanh and the device's differ by
     /// ulps, so the contract between them is a relative error, not bits); an infinity or a NaN in
-    /// either input is refused by name where the rule would write a finite value. Mutants: the
-    /// gate scaled by the up's beta, and the check of the inputs left out.
+    /// either input is refused by name where the rule would write a finite value. The tolerance is
+    /// ten times the rule's own f32 rounding: about 8 ulp (2⁻²³ each) over the four scalings, the
+    /// two tanh, ik's exponential, the add and the divide, and the two products, under 1e-6.
+    /// Mutants: the gate scaled by the up's beta, and the check of the inputs left out.
     #[test]
     fn the_host_situ_combine_is_the_rule_at_its_betas() {
         use super::ExpertForm;
