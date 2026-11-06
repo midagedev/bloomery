@@ -12,10 +12,11 @@
 //! driver that feeds ids and renders no chat reads the file by [`PlanInputs::read_without_chat`].
 //!
 //! A K3.1 file plans with the indexer's key row beside each latent layer's cached row (the
-//! description's selector, [`place_hybrid::KvLayout`]), and the coverage check lists the selection
-//! as a feature no body runs, so it is refused by name until one does. [`PlanInputs::check_ctx`] is
-//! the bound that refusal gives way to: the selection is the identity up to its top-k and past it
-//! the engine would attend densely, which it never does silently.
+//! description's selector, [`place_hybrid::KvLayout`]). The coverage check lists its selection as
+//! run, because the selection is the identity up to its top-k: the dense latent attention is its
+//! result there. [`PlanInputs::check_ctx`] is the bound that holds it, as past the top-k the engine
+//! would attend densely, which it never does silently; a driver that opens the file with a context
+//! reads it by [`PlanInputs::read_without_chat_for`], which refuses a longer one by name.
 
 use gguf::Split;
 use models::Need;
@@ -89,6 +90,15 @@ impl PlanInputs {
         }
     }
 
+    /// [`PlanInputs::read_without_chat`] for a driver that opens the file with a context of `ctx`
+    /// positions: the file refused by name, before any plan or load, when [`PlanInputs::check_ctx`]
+    /// holds `ctx` past what a K3.1 file's selection picks.
+    pub fn read_without_chat_for(split: &Split, ctx: u64) -> Result<PlanInputs, PlacementError> {
+        let inputs = PlanInputs::read_without_chat(split)?;
+        inputs.check_ctx(ctx)?;
+        Ok(inputs)
+    }
+
     /// A context of `ctx` positions refused by name when a K3.1 file's selection would pick among
     /// them ([`Hparams::check_ctx`]): a driver that opens the file calls it beside
     /// [`PlanInputs::plan`], which knows no family's bound.
@@ -120,7 +130,7 @@ mod tests {
     use gguf::Split;
     use models::Need;
 
-    use super::super::hparams::tests::{TOP_K, keys, keys31, tensors, tensors31, typed};
+    use super::super::hparams::tests::{N_EXP, TOP_K, keys, keys31, tensors, tensors31, typed};
     use super::{PlaceError, PlanInputs};
     use crate::arch::synthetic::{Ty, V, header_typed};
     use crate::placement::workstation::{self, A6000, RTX_3090};
@@ -141,17 +151,39 @@ mod tests {
 
     /// The small K3.1 header's file, opened.
     fn opened31(name: &str) -> Split {
+        opened31_at(name, TOP_K as u32, N_EXP as u32)
+    }
+
+    /// The small K3.1 header's file with the indexer's `top_k` and `experts` routed experts,
+    /// opened: 8 experts with the 2 kept are the router instance the body is built for, so that
+    /// file's coverage list is the template's parser alone.
+    fn opened31_at(name: &str, top_k: u32, experts: u32) -> Split {
         let global = [
             ("tokenizer.ggml.pre", V::Str("kimi-k2")),
             ("tokenizer.chat_template", V::Str("{{ messages }}")),
         ];
-        let path = header_typed(
-            name,
-            "kimi-k31",
-            &keys31(),
-            &global,
-            &typed(&tensors31(), &[]),
-        );
+        let kv: Vec<_> = keys31()
+            .into_iter()
+            .map(|(k, v)| match k {
+                "attention.indexer.top_k" => (k, V::U32(top_k)),
+                "expert_count" => (k, V::U32(experts)),
+                _ => (k, v),
+            })
+            .collect();
+        let stacks: Vec<(String, Vec<u64>)> = tensors31()
+            .into_iter()
+            .map(|(n, mut dims)| {
+                if n.ends_with("_exps.weight") {
+                    dims[2] = u64::from(experts);
+                } else if n.ends_with("ffn_gate_inp.weight") {
+                    dims[1] = u64::from(experts);
+                } else if n.ends_with("exp_probs_b.bias") {
+                    dims[0] = u64::from(experts);
+                }
+                (n, dims)
+            })
+            .collect();
+        let path = header_typed(name, "kimi-k31", &kv, &global, &typed(&stacks, &[]));
         let split = Split::open(&path).expect("the synthetic header opens");
         let _ = std::fs::remove_file(&path);
         split
@@ -364,26 +396,30 @@ mod tests {
         assert_eq!(kv.layer_bytes(4, 64), 0);
     }
 
-    /// The coverage check refuses a K3.1 file by the selection's name, at the latent layer
-    /// alone, and [`PlanInputs::check_ctx`] holds its context to the top-k. Mutants: a coverage
-    /// row for the selection added without the body that runs it, the bound dropped.
+    /// The coverage check lists no selection for a K3.1 file: the description still asks for the
+    /// indexer's two needs at the latent layer alone, the rows run them (the dense latent
+    /// attention is the selection's result up to the top-k), and [`PlanInputs::check_ctx`] holds
+    /// the context to that top-k. At the body's router instance (8 experts, 2 kept) the K3.1
+    /// header is read whole but for the template's parser. Mutants: the selection's row
+    /// (`spec::AVAILABLE`) removed, the bound dropped.
     #[test]
-    fn a_k31_file_is_refused_by_the_selection_and_its_context_by_top_k() {
-        let inputs = PlanInputs::describe(&opened31("kimi-k31-place-refused"))
+    fn a_k31_selection_is_run_up_to_top_k_and_its_context_is_held() {
+        let inputs = PlanInputs::describe(&opened31("kimi-k31-place-listed"))
             .expect("the synthetic K3.1 header describes");
+        let asked: Vec<_> = models::needs(&inputs.spec)
+            .into_iter()
+            .filter(|(n, _)| matches!(n, Need::StreamIndex { .. } | Need::IndexKeyFromInput))
+            .collect();
+        assert_eq!(asked.len(), 2, "{asked:?}");
+        assert!(asked.iter().all(|(_, l)| *l == Some(2)), "{asked:?}");
         let selected: Vec<_> = inputs
             .unimplemented()
             .into_iter()
             .filter(|i| i.feature.contains("index"))
             .collect();
-        assert!(!selected.is_empty(), "the selection is unimplemented");
-        assert!(selected.iter().all(|i| i.layer == Some(2)), "{selected:?}");
-        match PlanInputs::read_without_chat(&opened31("kimi-k31-place-read")) {
-            Err(PlacementError::Unimplemented(got)) => {
-                assert!(got.iter().any(|i| i.feature.contains("index")), "{got:?}");
-            }
-            other => panic!("{other:?}, not the coverage refusal"),
-        }
+        assert!(selected.is_empty(), "the selection is listed: {selected:?}");
+        PlanInputs::read_without_chat(&opened31_at("kimi-k31-place-read", TOP_K as u32, 8))
+            .expect("a K3.1 header at the body's router instance reads whole");
         inputs.check_ctx(TOP_K).expect("a context of top-k runs");
         let e = inputs.check_ctx(TOP_K + 1).expect_err("past top-k");
         assert!(
@@ -392,6 +428,25 @@ mod tests {
         );
         let k3 = described("kimi-k3-place-ctx");
         k3.check_ctx(1 << 20).expect("a K3 file has no bound");
+    }
+
+    /// A driver that opens a K3.1 file with a context reads it by `read_without_chat_for`: at the
+    /// released file's top-k of 2,048 a context of 2,048 positions opens and one of 2,049 is
+    /// refused by the key's name and the length, before any plan or load. Mutant: the context
+    /// check left out of the read.
+    #[test]
+    fn a_driver_context_past_top_k_is_refused_as_the_file_is_read() {
+        const RELEASED_TOP_K: u32 = 2048;
+        let file = |name: &str| opened31_at(name, RELEASED_TOP_K, 8);
+        PlanInputs::read_without_chat_for(&file("kimi-k31-place-ctx-at"), 2048)
+            .expect("a context of top-k opens");
+        let e = PlanInputs::read_without_chat_for(&file("kimi-k31-place-ctx-past"), 2049)
+            .expect_err("past top-k")
+            .to_string();
+        assert!(
+            e.contains("kimi-k31.attention.indexer.top_k") && e.contains("2049"),
+            "{e}"
+        );
     }
 
     /// The plan's description is the registry's: one reading of the file, whose chat surface is

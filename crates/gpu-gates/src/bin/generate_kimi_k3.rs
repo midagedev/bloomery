@@ -6,11 +6,13 @@
 //!                            [--granule BYTES]
 //!
 //! Defaults: `-n 8`, `--ctx 512`, `--place a`, `--mode graph`. The model is `ref_model_path()`. The
-//! file is read as the plan reads it ([`PlanInputs::read_without_chat`]: every part the body does
-//! not run is refused by name, the template's tool-call parser excepted) and planned on `--place`
-//! before anything loads; `--plan` ends there. A placed plan the stage card's dense trunk alone
-//! refuses (`PlacementError::CardFreeFloor`) is made again with the head read on the host (no card
-//! carries it); the `head on host` line on stderr says so and carries the refusal.
+//! file is read as the plan reads it ([`PlanInputs::read_without_chat_for`]: every part the body
+//! does not run is refused by name, the template's tool-call parser excepted, and so is a `--ctx`
+//! past a K3.1 file's `attention.indexer.top_k`, where its selection would pick among the positions
+//! and the body attends them all) and planned on `--place` before anything loads; `--plan` ends
+//! there. A placed plan the stage card's dense trunk alone refuses
+//! (`PlacementError::CardFreeFloor`) is made again with the head read on the host (no card carries
+//! it); the `head on host` line on stderr says so and carries the refusal.
 //!
 //! `--place a` loads the whole model on one card ([`bloomery_gpu::GpuModel::open`]): a file whose
 //! tensors exceed the card's free bytes is refused by name by the load. Any other placement
@@ -178,7 +180,7 @@ mod cli {
 
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let inputs = PlanInputs::read_without_chat(&split)
+        let inputs = PlanInputs::read_without_chat_for(&split, ctx as u64)
             .map_err(|e| format!("{}: {e}", path.display()))?;
         let census = gpu_census::census()?;
         let chosen = Place::choose(Some(place), &census, TIER_RULE, |_| {

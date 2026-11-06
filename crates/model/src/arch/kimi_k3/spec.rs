@@ -7,11 +7,13 @@
 //! [`Selector::StreamTopK`] over index keys projected from the layer input, one per position and
 //! owned by the layer (so the plan holds the key row beside the latent row), and its query is
 //! projected from the RMS-normed query latent (`q_lora` above 0), where Mistral Large 4's is of
-//! the LayerNorm-normed input. The first layer is a dense `situ` block and the rest the
-//! sigmoid router over `situ` experts that run in a latent, their weighted sum normed before the
-//! up projection, beside the shared stack that reads the hidden row. Every sublayer and the head
-//! read the cross-layer residual's mix ([`Residual::AttnRes`]); no stream is carried beside the
-//! running sum. The file's tokenizer is `kimi-k2`'s.
+//! the LayerNorm-normed input. The body runs no selected attention: up to the indexer's top-k the
+//! dense latent attention is the selection's result (the last row of [`AVAILABLE`]), and
+//! [`Hparams::check_ctx`] refuses a longer context. The first layer is a dense `situ` block and the
+//! rest the sigmoid router over `situ` experts that run in a latent, their weighted sum normed
+//! before the up projection, beside the shared stack that reads the hidden row. Every sublayer and
+//! the head read the cross-layer residual's mix ([`Residual::AttnRes`]); no stream is carried
+//! beside the running sum. The file's tokenizer is `kimi-k2`'s.
 
 use gguf::Split;
 use models::shape::RouterBody;
@@ -20,7 +22,7 @@ use models::{
     Moe, Need, Residual, Selector, Source,
 };
 
-use super::hparams::{Hparams, Kind};
+use super::hparams::{Hparams, INDEX_DIM, INDEX_HEADS, Kind};
 use super::roles;
 use crate::arch::coverage::{self, Available, Program};
 use crate::arch::{Read, chat_of, spec_u32};
@@ -82,6 +84,21 @@ pub const AVAILABLE: &[Available] = &[
         runs: |n| {
             matches!(n, Need::Router(s) if ROUTERS.contains(&(s.experts, s.top_k)))
                 && coverage::routes(n, &[RouterBody::BiasedSigmoid])
+        },
+    },
+    Available {
+        programs: &[Program::KimiK3Body],
+        at: "gpu/src/arch/gated_mla.rs (the dense latent attention is the K3.1 indexer's selection \
+             at a context of at most its top-k, where every position is picked; held by \
+             model/src/arch/kimi_k3/hparams.rs Hparams::check_ctx through place.rs \
+             PlanInputs::check_ctx, which refuses a longer context by the key \
+             `attention.indexer.top_k`)",
+        runs: |n| match n {
+            Need::StreamIndex { heads, d } => {
+                *heads as usize == INDEX_HEADS && *d as usize == INDEX_DIM
+            }
+            Need::IndexKeyFromInput => true,
+            _ => false,
         },
     },
 ];
