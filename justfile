@@ -4465,6 +4465,27 @@ dump-ref-kimi-k3:
     BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=1200 BLOOMERY_MODEL=kimi-k3 ./tools/box.sh 'bash tools/ref/kimi-k3-dump.sh'
 
 # --- end kimik3-ref ---
+# --- k31quant (Kimi K3.1 Pro's own low-bit GGUF: strip, imatrix at ctx 2048, quantize, splice) -----------------------------------------
+
+# The quantization tree: a second checkout of mainline llama.cpp at 78feec062 (the K3 oracle's commit) in /home/user/llama.cpp-kimik3-quant,
+# CPU only, with llama-imatrix, llama-quantize, llama-tokenize and llama-gguf-split (tools/ref/build-k3-quant-tree.sh, which builds through the same script
+# as `just build-k3-lcpp`, refuses a path that would touch the oracle tree and proves the oracle's commit, status and library md5 unchanged);
+# synchronous, log and rc under /root/lcpp-kimik3-quant. The timing lease must be free (rc 75).
+build-k3-quant-tree:
+    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=900 BLOOMERY_MODEL=kimi-k3 ./tools/box.sh 'bash tools/ref/build-k3-quant-tree.sh'
+
+# One step of the K3.1 pipeline (tools/ref/k31-quant.sh has the contract): prepare | imatrix | quantize | splice | upload | all, plan (the
+# quantize step's per-class bytes alone), calib (the calibration text alone), or `smoke` (the whole chain on the K3 fixture, flags only).
+# `--map tight|trunk-q5|ud` picks the type map, `--type IQ1_S|IQ2_XXS` the routed experts' type. `--dry-run` among the ARGS prints every
+# command with its bound and predicted wall (reads headers only, takes no lease). The steps take NO timing lease and NO hold: the runner's
+# own lock /root/k31quant/run.lock (rc 75 when held) keeps its steps apart, imatrix and quantize run under nice/ionice, pid files and logs
+# (wall and bytes) sit under /root/k31quant and a step whose output is complete is skipped; only `smoke --lease` takes the CPU lease. The
+# predicted wall for box.sh is the runner's own (`k31-quant.sh STEP --pred-s`). `--detach` in the ARGS returns at once (poll the pid file
+# the runner prints); a bare run waits in the foreground.
+k31-quant STEP *ARGS:
+    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S="$(bash tools/ref/k31-quant.sh {{STEP}} --pred-s)" BLOOMERY_MODEL=kimi-k3 ./tools/box.sh 'bash tools/ref/k31-quant.sh {{STEP}} {{ARGS}}'
+
+# --- end k31quant ---
 # --- kimik3-body ---
 
 # Kimi K3's decode step on one card (gate_kimi_k3_e2e's doc): the delta and gated latent layers, the dense and latent routed blocks,
