@@ -69,6 +69,8 @@ use runtime::layer::hosted;
 use std::ops::Range;
 use std::sync::Arc;
 
+#[path = "index.rs"]
+mod index;
 #[path = "placed.rs"]
 pub(super) mod placed;
 #[path = "rows.rs"]
@@ -97,10 +99,15 @@ enum Mixer {
     },
 }
 
-/// One layer: its mixer, its feed-forward block, the name of its `ffn_norm`, the names of its two
-/// AttnRes score vectors (the mixer's, the block's) and whether it banks its input.
+/// One layer: its mixer, the indexer's key rows when the layer runs the indexer, its feed-forward
+/// block, the name of its `ffn_norm`, the names of its two AttnRes score vectors (the mixer's, the
+/// block's) and whether it banks its input.
 struct Layer {
     mixer: Mixer,
+    /// The index key rows of a K3.1 latent layer, `[ctx][width]` f16 ([`index::width`]); `None` on
+    /// a delta layer and in a K3 file. The plan counts them, so the load holds them; no step reads
+    /// or writes them, as the selected attention that fills them is not in this body.
+    index: Option<DeviceTensor<u16>>,
     ffn: Ffn,
     ffn_norm: String,
     scores: [String; 2],
@@ -122,10 +129,11 @@ impl Layer {
     }
 
     fn store_bytes(&self) -> usize {
-        match &self.mixer {
+        let mixer = match &self.mixer {
             Mixer::Kda { store, .. } => store.bytes(),
             Mixer::Mla { cache, .. } => cache.buf().num_bytes(),
-        }
+        };
+        mixer + self.index.as_ref().map_or(0, |rows| rows.buf().num_bytes())
     }
 }
 
@@ -608,8 +616,9 @@ pub struct Body {
 
 impl GpuModel<Body> {
     /// The whole model of `file` resident on `gpu`, plus the output head: every tensor in its
-    /// kernels' device format, the latent layers' caches of `ctx` rows and the delta layers' stores
-    /// of one lane. The model takes the file and closes it once the weights are resident.
+    /// kernels' device format, the latent layers' caches of `ctx` rows (a K3.1 file's with the index
+    /// key rows beside them) and the delta layers' stores of one lane. The model takes the file and
+    /// closes it once the weights are resident.
     ///
     /// A file whose tensors exceed the card's free bytes is refused by name before any tensor is
     /// read: the released file does not fit one card, and its placement over two stage cards, the
@@ -909,8 +918,12 @@ impl Body {
                 let (routed, norm) = routed_of((file, w), l, &moe, stacks)?;
                 (Ffn::Routed(routed), norm)
             };
+            let index = index::width(&hp, l)
+                .map(|d| DeviceTensor::zeroed(stream, ctx, d))
+                .transpose()?;
             layers.push(Layer {
                 mixer,
+                index,
                 ffn,
                 ffn_norm,
                 scores: [
@@ -989,7 +1002,7 @@ impl Body {
     }
 
     /// Device bytes of the sequence's stores: the delta layers' states and rings, the latent
-    /// layers' caches.
+    /// layers' caches and a K3.1 file's index key rows.
     pub fn store_bytes(&self) -> usize {
         self.layers.iter().map(Layer::store_bytes).sum()
     }
