@@ -41,11 +41,11 @@ fn strings(v: &[&str]) -> Vec<String> {
 
 const ALL: [&str; 7] = [
     "token_embd.weight",
-    "blk.0.attn_q.weight",
-    "blk.3.indexer.attn_k.weight",
-    "blk.3.indexer.proj.weight",
-    "blk.3.indexer.proj.weight.scale",
-    "blk.31.indexer.attn_k.weight",
+    "layer0.q.weight",
+    "layer3.index.k.weight",
+    "layer3.index.proj.weight",
+    "layer3.index.proj.weight.scale",
+    "layer31.index.k.weight",
     "output.weight",
 ];
 
@@ -53,11 +53,11 @@ const ALL: [&str; 7] = [
 #[test]
 fn a_glob_matches_the_whole_name() {
     for (pattern, name, want) in [
-        ("blk.*.indexer.*", "blk.3.indexer.attn_k.weight", true),
-        ("blk.*.indexer.*", "blk.31.indexer.proj.weight", true),
-        ("blk.*.indexer.*", "blk.3.attn_q.weight", false),
-        ("blk.?.attn_q.weight", "blk.3.attn_q.weight", true),
-        ("blk.?.attn_q.weight", "blk.31.attn_q.weight", false),
+        ("layer*.index.*", "layer3.index.k.weight", true),
+        ("layer*.index.*", "layer31.index.proj.weight", true),
+        ("layer*.index.*", "layer3.q.weight", false),
+        ("layer?.q.weight", "layer3.q.weight", true),
+        ("layer?.q.weight", "layer31.q.weight", false),
         ("*weight", "token_embd.weight", true),
         ("*", "", true),
         ("token_embd", "token_embd.weight", false),
@@ -73,7 +73,7 @@ fn a_glob_matches_the_whole_name() {
 /// the plan, their intersection empty, their counts add up, and a tensor's scale goes with it.
 #[test]
 fn drop_and_only_split_the_plan_into_complements() {
-    let pattern = strings(&["blk.*.indexer.*"]);
+    let pattern = strings(&["layer*.index.*"]);
     let dropped = Select::of(pattern.clone(), vec![])
         .unwrap()
         .apply(planned(&ALL))
@@ -84,15 +84,15 @@ fn drop_and_only_split_the_plan_into_complements() {
         .unwrap();
     assert_eq!(
         names(&dropped),
-        ["token_embd.weight", "blk.0.attn_q.weight", "output.weight"]
+        ["token_embd.weight", "layer0.q.weight", "output.weight"]
     );
     assert_eq!(
         names(&kept),
         [
-            "blk.3.indexer.attn_k.weight",
-            "blk.3.indexer.proj.weight",
-            "blk.3.indexer.proj.weight.scale",
-            "blk.31.indexer.attn_k.weight",
+            "layer3.index.k.weight",
+            "layer3.index.proj.weight",
+            "layer3.index.proj.weight.scale",
+            "layer31.index.k.weight",
         ]
     );
     assert_eq!(dropped.len() + kept.len(), ALL.len());
@@ -113,9 +113,12 @@ fn a_selection_that_selects_nothing_is_refused() {
             .unwrap_err()
             .to_string()
     };
-    let e = refused(Select::of(strings(&["blk.*.nothing.*"]), vec![]));
-    assert!(e.contains("--drop") && e.contains("blk.*.nothing.*"), "{e}");
-    let e = refused(Select::of(vec![], strings(&["blk.0.*", "output.bias"])));
+    let e = refused(Select::of(strings(&["layer*.nothing.*"]), vec![]));
+    assert!(
+        e.contains("--drop") && e.contains("layer*.nothing.*"),
+        "{e}"
+    );
+    let e = refused(Select::of(vec![], strings(&["layer0.*", "output.bias"])));
     assert!(e.contains("--only") && e.contains("output.bias"), "{e}");
     let e = refused(Select::of(strings(&["*.scale"]), vec![]));
     assert!(e.contains("*.scale"), "{e}");

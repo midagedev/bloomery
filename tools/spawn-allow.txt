@@ -73,3 +73,4 @@ crates/metal/src/bin/gate_metal_device/mac.rs 1 the stream clause's two waiter t
 crates/model-hf/src/remote.rs 1 a set's header reads, up to eight at once in a thread scope (network waits, no compute), from the start by name's pick and the fixture bin's main thread, never pinned
 crates/metal/src/arch/qwen3moe/session.rs 1 the open's pipeline build, scoped beside the weight load on the open's own thread, never pinned (macOS has no affinity call)
 crates/metal/src/trace.rs 2 a test's scripted load workers and a test's off-thread buffer, scoped by the test harness, never pinned (macOS has no affinity call)
+crates/model-hf/src/bin/prepare.rs 1 the --follow order test's landing thread, from a libtest thread that is never pinned

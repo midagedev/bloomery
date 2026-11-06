@@ -1329,7 +1329,7 @@ mod tests {
     #[test]
     fn a_dense_q8_1_column_past_the_activation_cap_is_refused_by_name() {
         let site = |role, ty, k: u64| ModelTensor {
-            name: "blk.0.ffn_down.weight".to_owned(),
+            name: "layer0.down.weight".to_owned(),
             shard: 0,
             layer: Some(0),
             role,
@@ -1344,7 +1344,7 @@ mod tests {
         let past = site(Role::DenseFfn, GgmlType::Q6_K, widest + 256);
         let err = check_q8_act_width(&past).expect_err("a column past the cap is refused");
         let said = err.to_string();
-        for word in ["blk.0.ffn_down.weight", "q6_K", "34048", "33792"] {
+        for word in ["layer0.down.weight", "q6_K", "34048", "33792"] {
             assert!(said.contains(word), "{word} missing from: {said}");
         }
         // The f32 rows and a routed stack read no q8_1 column the activation holds.

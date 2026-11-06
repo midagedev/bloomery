@@ -1,9 +1,11 @@
 //! Every tensor name a `mistral-large4` file spells. The model-level names
 //! are the common ones beside the rope's frequency factors, and every layer's
 //! stems are `blk.{l}.{stem}` (llama.cpp creates each with no
-//! `TENSOR_NOT_REQUIRED`), the indexer's and the SSMax pairs among them.
+//! `TENSOR_NOT_REQUIRED`), the indexer's and the SSMax pairs among them. The
+//! stem of the index key norm's bias is the common one
+//! ([`crate::arch::names::INDEXER_K_NORM_B`]), re-exported here with the rest.
 
-pub use crate::arch::names::{output, output_norm, token_embd};
+pub use crate::arch::names::{INDEXER_K_NORM_B, output, output_norm, token_embd};
 
 /// The pre-attention norm's gain.
 pub const ATTN_NORM: &str = "attn_norm.weight";
@@ -37,8 +39,6 @@ pub const INDEXER_ATTN_Q_B: &str = "indexer.attn_q_b.weight";
 pub const INDEXER_ATTN_K: &str = "indexer.attn_k.weight";
 /// The LayerNorm gain on the projected key.
 pub const INDEXER_K_NORM_W: &str = "indexer.k_norm.weight";
-/// The LayerNorm bias on the projected key.
-pub const INDEXER_K_NORM_B: &str = "indexer.k_norm.bias";
 /// The index heads' weights, one per head, on the rectified scores.
 pub const INDEXER_PROJ: &str = "indexer.proj.weight";
 /// The indexer's SSMax scale `s_h`, one value per index head.
