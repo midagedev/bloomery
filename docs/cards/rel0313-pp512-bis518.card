@@ -1,0 +1,15 @@
+# 0.3.13's release sitting read the P=512 prompt of V4.1-Flash at --place bp at 59..60 tok/s where 0.3.12's sitting read
+# 111..124 on the same file, cards and defaults (D=4096 and decode unmoved). This A/B puts the shipped 0.3.13 binary beside
+# the follower's build at 66b85794 (after 0.3.12's commit, before 518c109d8 f0/f1 card experts, 22b6345d3 engram layout,
+# 99c7977dc rank, 1072f008d Kimi) in one lease, so the halving is either on this side of 66b85794 or already before it.
+kind: ab
+question: does the build at 518c109d8 (f0 and f1 take card experts) prefill a 512-id prompt at --place bp slower than the 66b85794 build, as the shipped binary does?
+term: pp tok/s @ P = 512, prose corpus, A6000+3090 --place bp, serving defaults, a fresh server a round - (518c109d8 - 66b85794) / 66b85794
+unit: %
+predict: -45..-15
+rounds: 3
+sd: 5 % the sitting's two rounds of 0.3.13 (60.05, 59.00) and 0.3.12 (123.79, 111.39) at P 512, cold rows
+condition: BLOOMERY_MODEL=deepseek41, arms bloomery-follow:512 and bloomery-bis518:512 (target/release at 518c109d8), BLOOMERY_AB_ROUNDS=2, DEPTH_SERVE_PLACE=bp, both cards, the order rotated
+decide-in: the halving sits in 66b85794..16c710de2: bisect the four suspects before the tag or state the number in the notes as a known regression with the commit range
+decide-below: beyond -55 %: the follow build is faster than 0.3.12's rows too; read its plan line against the sitting's before crediting either
+decide-above: above -40 %: the halving is already in 66b85794 or is a cold-row artefact; compare the majflt columns and run a warm (second request) row before the tag

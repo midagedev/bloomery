@@ -1,0 +1,16 @@
+# The warm fold A/B (rel0313-pp512-warm) read the [shared] P=512 rows at --place bp: 0.3.13's shipped binary 153..178 tok/s
+# (6 rows, mean ~170), the 66b85794 build 207..232 (7 rows, ~223) and be69d0950 (518c109d8 plus its FileSwap follow-ups)
+# 199..228 (7 rows, ~219): the -24 % sits after be69d0950, so not in the Q5_K-down card-expert move. The first-request rows
+# say the same (70..75 against 109..112). This A/B halves the rest of 66b85794..16c710de2 twice in one lease: 41be83849
+# (the engram layout 22b6345d3 landed, before the rank rule) and 99c7977dc (the rank rule, before the Kimi and metal commits).
+kind: ab
+question: is the warm P=512 prompt at --place bp already slower at 41be83849 (the engram layout), and if not, at 99c7977dc (the rank rule)?
+term: pp tok/s @ P = 512, prose corpus, A6000+3090 --place bp, serving defaults, the [shared] rows (second request of a round's server) - (41be83849 - 66b85794) / 66b85794
+unit: %
+predict: -35..-10
+rounds: 8
+sd: 5 % the warm A/B's shared rows scatter 4..6 % an arm (0.3.13 153..178, 66b85794 207..232); a P=512 row is [shared] in half the rounds, so 8 rounds give ~4 warm rows an arm
+condition: BLOOMERY_MODEL=deepseek41, DEPTH_SERVE_FOLD=depths, depths 4096 and 512 on one server a round, arms bloomery-follow (target/release at 66b85794), bloomery-bis22b (target/release at 41be83849), bloomery-bisrank (target/release at 99c7977dc), BLOOMERY_AB_ROUNDS=8, DEPTH_SERVE_PLACE=bp, BLOOMERY_TIMING_CARDS=a6000+3090; the 99c7977dc arm is the second half's read in the same lease
+decide-in: 41be83849 is slow: the cause is in 22b6345d3's engram layout (q6_K rows on the card, the folded gate) or 41be83849's registrations; read the plan lines (engram rows' home) and diff the prompt path of crates/gpu/src/host/engram*.rs
+decide-below: below -35 %: larger than the whole regression; read both arms' plan lines before crediting the commit
+decide-above: above -10 %: the engram layout is clear; if the 99c7977dc arm is slow the rank rule's plan (the stage card's ids by rank with no rank file set should equal the id order: read its plan line) is the cause, else the cause is in b52db7909..16c710de2 (the Kimi registration 1072f008d/1cd3d4481 or metal 11e616a61) and one more A/B halves it
