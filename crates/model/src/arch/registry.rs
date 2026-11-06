@@ -398,7 +398,7 @@ pub static ROWS: &[ArchRow] = &[
     },
     ArchRow {
         arch: Some(Arch::KimiK3),
-        names: &["kimi-k3"],
+        names: &["kimi-k3", "kimi-k31"],
         read: Some(kimi_k3::spec::read),
         draft: None,
         coverage: Some(kimi_k3::spec::AVAILABLE),
@@ -527,7 +527,7 @@ mod tests {
             GEMMA_EMBEDDING2 => gemma_embedding2::spec::read,
             "muse-spark" => musespark::spec::read,
             "mistral-large4" => mistrallarge4::spec::read,
-            "kimi-k3" => kimi_k3::spec::read,
+            "kimi-k3" | "kimi-k31" => kimi_k3::spec::read,
             other => panic!("{other}: no reader is named for it"),
         }
     }

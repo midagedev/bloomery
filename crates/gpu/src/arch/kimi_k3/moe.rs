@@ -4,13 +4,13 @@
 //! 1. the layer's RMS norm of the row (`ffn_norm`);
 //! 2. the router on the full-width normed row: the F32 rows, the sigmoid, the selection bias
 //!    that steers the pick only, the top 16 of 896 renormalized (scale 1);
-//! 3. the latent down (`ffn_routed_down`, Q6_K, hidden to latent) of the normed row;
+//! 3. the latent down (`ffn_routed_down`, hidden to latent; [`SITE_TYPES`]) of the normed row;
 //! 4. each kept expert on the latent row: the `situ` of its gate and up rows (IQ1_S or IQ2_XXS),
 //!    the down rows (IQ1_S or IQ2_XXS), the weighted sum in slot order;
 //! 5. the routed norm (`ffn_routed_norm`, RMS at the block's eps) of the sum;
-//! 6. the latent up (`ffn_routed_up`, Q6_K, latent to hidden);
-//! 7. the shared stack on the full-width normed row: the `situ` of its gate and up (Q6_K, two
-//!    experts as one gated block of width 2 × `expert_ff`), its down;
+//! 6. the latent up (`ffn_routed_up`, latent to hidden; [`SITE_TYPES`]);
+//! 7. the shared stack on the full-width normed row: the `situ` of its gate and up ([`SITE_TYPES`],
+//!    two experts as one gated block of width 2 × `expert_ff`), its down;
 //! 8. the sum of 6 and 7 added to the row.
 //!
 //! Every stage is the common routed block's (`routed_ffn`: the router instance, the card leg, the
@@ -43,11 +43,16 @@ use model::placement::kernels::DownAct;
 /// What the refusals of this file name.
 const WHAT: &str = "kimi_k3 moe";
 
-/// The types the latent pair and the shared stack have in the released set (`gguf::arch::kimi_k3`).
-const SITE_TYPES: &[SiteTy] = &[SiteTy::Q6K];
+/// The types the latent pair and the shared stack run: the released file's Q6_K, the engine's
+/// quantization's Q4_K and the Q5_K and Q8_0 the table lists beside them (`gguf::arch::kimi_k3`),
+/// each a launch of the common dense site that Raon-1's shared stack runs through the same
+/// `Glu` (`raon1/body.rs` `FFN_TYPES`). The table's BF16 is not here: the load widens a BF16
+/// weight to f32 (`ModelTensors::bf16_words` is unset for this family), so no resident weight is
+/// a BF16 site and the file's type is refused by name.
+const SITE_TYPES: &[SiteTy] = &[SiteTy::Q4K, SiteTy::Q5K, SiteTy::Q6K, SiteTy::Q8_0];
 
-/// Values in a super-block of the routed stacks' types (IQ1_S, IQ2_XXS) and of Q6_K: every row
-/// of the block is a whole number of them.
+/// Values in a super-block of the routed stacks' types (IQ1_S, IQ2_XXS) and of the K-quants of
+/// [`SITE_TYPES`]: every row of the block is a whole number of them.
 const SUPER: usize = 256;
 
 /// The `(experts, kept)` pairs the router instances are built for: the file's 896 with the top
@@ -493,6 +498,44 @@ impl Moe {
         match &self.0 {
             Instance::E896(b) => b.bytes(),
             Instance::E8(b) => b.bytes(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gguf::GgmlType;
+    use gguf::arch::kimi_k3 as table;
+
+    use super::SITE_TYPES;
+    use crate::site::PROJECTED;
+
+    /// The latent pair's and the shared stack's types are the table's for those stems, each a
+    /// launch the dense site has, and the one table type left out is BF16, which this family's load
+    /// widens. Mutant: a type the table does not list added here (the file's type refused before
+    /// the site's), or a table type dropped from here without the reason.
+    #[test]
+    fn the_site_types_are_the_tables_trunk_types() {
+        for stem in [
+            "ffn_routed_down.weight",
+            "ffn_routed_up.weight",
+            "ffn_gate_shexp.weight",
+            "ffn_up_shexp.weight",
+            "ffn_down_shexp.weight",
+        ] {
+            let listed = table::allowed_types(stem).unwrap_or_else(|| panic!("{stem} is no stem"));
+            for ty in SITE_TYPES {
+                assert!(
+                    listed.contains(&ty.ggml()),
+                    "{stem}: {ty} is not in the table"
+                );
+                assert!(PROJECTED.contains(ty), "{stem}: {ty} has no by-name launch");
+            }
+            for ty in listed {
+                if !SITE_TYPES.iter().any(|s| s.ggml() == *ty) {
+                    assert_eq!(*ty, GgmlType::BF16, "{stem}: {ty} is listed and not run");
+                }
+            }
         }
     }
 }

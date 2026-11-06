@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use gguf::arch::kimi_k3 as released;
 use gguf::write::Layout;
 use hf::modelopt;
 use hf::quant_config::Config;
@@ -32,8 +31,9 @@ const EFF: usize = 256;
 const SHARED: usize = 2;
 const LATENT: usize = 512;
 const VOCAB: usize = 2;
-/// The indexer's geometry on a K3.1 folder: heads, key width and the kept positions.
-const INDEX_HEADS: usize = 4;
+/// The indexer's geometry on a K3.1 folder: the heads and key width the description's kernels run
+/// (the reader refuses any other) and the kept positions.
+const INDEX_HEADS: usize = 32;
 const INDEX_DIM: usize = 128;
 /// `A_log` is stored past the heads.
 const A_LOG_LEN: usize = 4;
@@ -412,12 +412,26 @@ fn the_real_configs_read_into_the_converters_keys() {
             (latent[..3].to_vec(), latent[22..].to_vec()),
             (vec![3, 7, 11], vec![91, 92])
         );
-        let indexer =
-            ["head_count", "key_length", "top_k"].map(|s| key(&format!("attention.indexer.{s}")));
+        let indexer = ["head_count", "key_length", "top_k", "rope_dimension_count"]
+            .map(|s| key(&format!("attention.indexer.{s}")));
+        let types = key("attention.indexer.types");
+        let eps = key("attention.layer_norm_epsilon");
         if k31 {
-            assert_eq!(indexer, [32, 128, 2048].map(|v| Some(Value::U32(v))));
+            assert_eq!(
+                indexer,
+                [32, 128, 2048, 0].map(|v| Some(Value::U32(v))),
+                "the indexer's geometry and its no rope values"
+            );
+            let Some(Value::Array(layers)) = types else {
+                panic!("attention.indexer.types is an array");
+            };
+            let on: Vec<bool> = layers.iter().map(|v| *v == Value::Bool(true)).collect();
+            assert!(layers.iter().all(|v| matches!(v, Value::Bool(_))));
+            assert_eq!(on, c.latent_layer, "the indexer is on the latent layers");
+            assert_eq!(eps, Some(Value::F32(1e-5)), "the key LayerNorm's epsilon");
         } else {
-            assert_eq!(indexer, [None, None, None]);
+            assert_eq!(indexer, [None, None, None, None]);
+            assert_eq!((types, eps), (None, None));
         }
     }
 }
@@ -515,22 +529,22 @@ fn each_residual_pair_makes_its_own_score_vector() {
     );
 }
 
-/// The K3.1 folder's indexer tensors are the names Deepseek-V4.1's and Mistral Large 4's
-/// descriptions give theirs, one tensor each on the latent layer alone, and its header carries
-/// the three `attention.indexer.*` keys of the V4.1 spelling.
+/// The K3.1 folder's indexer tensors are the names the K3 description spells (the ones
+/// Deepseek-V4.1's and Mistral Large 4's give theirs), one tensor each on the latent layer alone,
+/// and its header carries the indexer's keys in the spelling the description reads.
 #[test]
-fn the_k31_indexer_takes_the_names_the_other_two_descriptions_give() {
-    use model::arch::deepseek41::names as ds41;
+fn the_k31_indexer_takes_the_names_the_k3_description_spells() {
+    use model::arch::kimi_k3::names as k3;
     let p = plan(&toy_config(true), &toy_entries(true)).unwrap();
     let got = table(&p);
     let l = LATENT_LAYER;
-    let (index_q, index_k, index_proj, index_norm) = (
-        ds41::indexer_attn_q_b(l),
-        ds41::indexer_attn_k(l),
-        ds41::indexer_proj(l),
-        ds41::indexer_k_norm(l),
+    let (index_q, index_k, index_proj, index_norm, bias) = (
+        k3::indexer_attn_q_b(l),
+        k3::indexer_attn_k(l),
+        k3::indexer_proj(l),
+        k3::indexer_k_norm(l),
+        k3::indexer_k_norm_bias(l),
     );
-    let bias = model::arch::names::blk(l, model::arch::mistrallarge4::names::INDEXER_K_NORM_B);
     assert_eq!(
         [&index_q, &index_k, &index_proj, &index_norm, &bias].map(|n| got.get(n).cloned()),
         [
@@ -553,42 +567,24 @@ fn the_k31_indexer_takes_the_names_the_other_two_descriptions_give() {
         ["head_count", "key_length", "top_k"].map(|s| key(&format!("attention.indexer.{s}"))),
         [INDEX_HEADS as u32, INDEX_DIM as u32, 8].map(|v| Some(Value::U32(v)))
     );
+    let mut types = vec![Value::Bool(false); LAYERS];
+    types[l] = Value::Bool(true);
+    assert_eq!(key("attention.indexer.types"), Some(Value::Array(types)));
 }
 
-/// The header of `planned` under `map`, each tensor of a type the released set does not hold its
-/// stem in declared in the first type it does (the description's types are the released quants').
+/// The header of `planned` under `map`, each tensor in the type this map declares it in, written
+/// under the architecture word the map's folder has.
 fn header(map: &Checkpoint, planned: &[folder::Planned<Step>]) -> gguf::Split {
-    let kvs = super::super::trunk::header(ARCHITECTURE, &map.keys);
-    let decls = planned
-        .iter()
-        .map(|t| {
-            let mut decl = t.decl.clone();
-            let stem = decl
-                .name
-                .split_once('.')
-                .filter(|(b, _)| *b == "blk")
-                .map_or(decl.name.as_str(), |_| {
-                    decl.name.splitn(3, '.').nth(2).unwrap()
-                });
-            if let Some(list) = released::allowed_types(stem)
-                && !list.iter().any(|t| t.as_u32() == decl.type_id)
-            {
-                let first = list[0];
-                decl.type_id = first.as_u32();
-                let (blck, size) = (first.blck_size().unwrap(), first.type_size().unwrap());
-                decl.nbytes = decl.dims.iter().product::<u64>() / blck * size;
-            }
-            decl
-        })
-        .collect();
+    let kvs = super::super::trunk::header(map.word.word(), &map.keys);
+    let decls = planned.iter().map(|t| t.decl.clone()).collect();
     let layout = Layout::new(&kvs, decls).unwrap();
     gguf::Split::header_only(PathBuf::from("kimi-k3.gguf"), &layout).unwrap()
 }
 
 /// The K3 toy's header reads as the K3 description's hyperparameters: four layers of the kinds
-/// the config's lists name, the keys, every layer's tensors of its kind and their dims, once each
-/// tensor is in a type the released set holds its stem in (the description widens to BF16 and
-/// MXFP4 in its own round).
+/// the config's lists name, the keys, every layer's tensors of its kind and their dims, each
+/// tensor in the type the map declares (BF16 matrices as stored, MXFP4 stacks, F32 vectors),
+/// which the description's table holds. A K3 header has no indexer.
 #[test]
 fn the_k3_toy_header_reads_as_the_kimi_k3_description() {
     use model::arch::kimi_k3::hparams::Kind;
@@ -610,6 +606,34 @@ fn the_k3_toy_header_reads_as_the_kimi_k3_description() {
     assert_eq!(hp.kinds, [Kind::Kda, Kind::Kda, Kind::Mla, Kind::Kda]);
     assert_eq!((hp.experts.n_expert, hp.experts.n_used), (N_EXP, 2));
     assert_eq!((hp.kda.head_dim, hp.kda.conv), (D, CONV));
+    assert!(hp.indexer.is_none());
+}
+
+/// The K3.1 toy's header reads as the K3.1 description: the K3's hyperparameters under the
+/// `kimi-k31` word, the indexer's geometry and layers the keys give, and the indexer's five
+/// tensors on the latent layer in the types the map declares. (`prepare`'s gate opens the whole
+/// folder through `model::arch::spec`; this header holds no tokenizer.)
+#[test]
+fn the_k31_toy_header_reads_as_the_kimi_k31_description() {
+    let config = toy_config(true);
+    let p = plan(&config, &toy_entries(true)).unwrap();
+    let split = header(&Checkpoint::parse(&config).unwrap(), &p.planned);
+    assert_eq!(split.architecture(), Some("kimi-k31"));
+    let hp = Hparams::read(&split).unwrap();
+    let ix = hp.indexer.as_ref().expect("a K3.1 header has the indexer");
+    assert_eq!(
+        (ix.heads, ix.d, ix.top_k, ix.norm_eps),
+        (INDEX_HEADS, INDEX_DIM, 8, 1e-5)
+    );
+    assert_eq!(ix.layers, [false, false, true, false]);
+    for l in 0..LAYERS {
+        let indexed = hp
+            .layer_dims(l)
+            .iter()
+            .filter(|(stem, _)| stem.starts_with("indexer."))
+            .count();
+        assert_eq!(indexed, if l == LATENT_LAYER { 5 } else { 0 }, "layer {l}");
+    }
 }
 
 /// A safetensors file of `values` (name, dtype, shape, bytes).
@@ -1536,6 +1560,14 @@ fn the_whole_real_k31_folder_plans_with_no_refusal() {
         .filter(|t| t.decl.name.contains(".indexer."))
         .count();
     assert_eq!(indexer, 120);
+    // The write's header, at the real widths, is a file the K3.1 description reads: every type
+    // and shape the plan declares is the table's, the indexer on the 24 latent layers alone.
+    let split = header(&Checkpoint::parse(&config).unwrap(), &p.planned);
+    let hp = Hparams::read(&split).expect("the planned K3.1 header reads");
+    let dsa: Vec<usize> = (0..hp.n_layer).filter(|&l| hp.dsa(l)).collect();
+    assert_eq!(dsa.len(), 24);
+    assert_eq!((dsa[0], dsa[1], dsa[23]), (3, 7, 92));
+    model::arch::kimi_k3::roles::classify(&split, &hp).expect("every tensor has its role");
     let steps: usize = p
         .planned
         .iter()

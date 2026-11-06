@@ -1,4 +1,5 @@
-//! `prepare` on a toy Kimi K3 and K3.1 folder: the split of a whole folder, of a K3.1 folder
+//! `prepare` on a toy Kimi K3 and K3.1 folder: the split of a whole folder (the BF16 projections
+//! and MXFP4 stacks the checkpoint stores, opened through the registry's reader), of a K3.1 folder
 //! written in K3's shape (`--arch kimi-k3 --drop 'blk.*.indexer.*'`) and of its indexer alone
 //! (`--only`), their tensor counts and sets, and the refusals of the flags.
 
@@ -75,9 +76,20 @@ fn write_split(folder: &Path, out: &Path, flags: &[&str]) -> Output {
     prepare(&args)
 }
 
-/// A K3.1 folder written as K3's shape holds exactly the tensors a K3 folder's split holds, its
-/// header is K3's with no indexer key, and its indexer alone is the five tensors it leaves out;
-/// written whole it holds all of them under its own word. Counts: 107 + 5 = 112.
+/// The whole split of a toy folder opened as the server opens it: the description `model::arch::spec`
+/// reads from its header.
+fn description(prefix: &Path) -> model::arch::Read {
+    let split = gguf::Split::open(&glob_first(prefix)).unwrap();
+    model::arch::spec(&split).unwrap_or_else(|e| panic!("{}: {e}", prefix.display()))
+}
+
+/// A K3.1 folder written whole holds its indexer under its own word, and a K3.1 folder written in
+/// K3's shape (`--arch kimi-k3 --drop 'blk.*.indexer.*'`) holds exactly the tensors a K3 folder's
+/// split holds, with K3's header and no indexer key; its indexer alone is the five tensors it
+/// leaves out. Each whole write passes `prepare`'s own open of its split, and the K3-shaped
+/// split opens through `model::arch::spec` here: the K3.1 one with the selector on the latent
+/// layer alone, the K3 ones with none. Counts: 107 + 5 = 112 at the toy's one latent layer (the
+/// real folder has 24, so 120).
 #[test]
 fn a_k31_folder_split_in_k3s_shape_and_its_indexer_alone_are_complements() {
     let root = scratch("complements");
@@ -88,19 +100,26 @@ fn a_k31_folder_split_in_k3s_shape_and_its_indexer_alone_are_complements() {
         let out = root.join(tag);
         let o = write_split(folder, &out, flags);
         assert!(o.status.success(), "{tag}: {}", text(&o));
-        written(&out)
+        (written(&out), out, text(&o))
     };
-    // `--only '*'` keeps every tensor and is checked as a selection is, by its tensor set: the
-    // program's own reader refuses the BF16 and MXFP4 types of a whole Kimi split until R2.
-    let k3_whole = run(&k3, "k3-whole", &["--only", "*"]);
-    let whole = run(&k31, "k31-whole", &["--only", "*"]);
-    let shaped = run(
+    let (k3_whole, k3_prefix, k3_log) = run(&k3, "k3-whole", &[]);
+    let (whole, whole_prefix, whole_log) = run(&k31, "k31-whole", &[]);
+    let (shaped, shaped_prefix, _) = run(
         &k31,
         "k31-as-k3",
         &["--arch", "kimi-k3", "--drop", "blk.*.indexer.*"],
     );
-    let indexer = run(&k31, "k31-indexer", &["--only", "blk.*.indexer.*"]);
+    let (indexer, _, _) = run(&k31, "k31-indexer", &["--only", "blk.*.indexer.*"]);
 
+    // A whole write opens its split as the server does, or `prepare` fails.
+    assert!(
+        k3_log.contains("prepare: the split opens: 4 layers, 107 tensors"),
+        "{k3_log}"
+    );
+    assert!(
+        whole_log.contains("prepare: the split opens: 4 layers, 112 tensors"),
+        "{whole_log}"
+    );
     assert_eq!(k3_whole.names.len(), 107);
     assert_eq!(whole.names.len(), 112);
     assert_eq!(indexer.names.len(), 5);
@@ -121,9 +140,33 @@ fn a_k31_folder_split_in_k3s_shape_and_its_indexer_alone_are_complements() {
         ("kimi-k3", "kimi-k3")
     );
     assert_eq!(whole.arch, "kimi-k31");
-    let has_indexer_key = |w: &Written| w.keys.iter().any(|k| k.contains(".attention.indexer."));
+    let has_indexer_key = |w: &Written| {
+        w.keys.iter().any(|k| {
+            k.contains(".attention.indexer.") || k.ends_with(".attention.layer_norm_epsilon")
+        })
+    };
     assert!(!has_indexer_key(&k3_whole) && !has_indexer_key(&shaped));
     assert!(has_indexer_key(&whole));
+
+    // The three splits open through the registry's reader: one architecture, the selector on the
+    // K3.1 file's latent layer alone.
+    let selects = |prefix: &Path| -> Vec<bool> {
+        description(prefix)
+            .spec
+            .layers
+            .iter()
+            .map(
+                |l| matches!(&l.mixer, model::arch::models::Mixer::Latent(a) if a.select.is_some()),
+            )
+            .collect()
+    };
+    let at_latent = |l: usize| (0..4).map(|i| i == l).collect::<Vec<bool>>();
+    assert_eq!(selects(&whole_prefix), at_latent(latent));
+    assert_eq!(selects(&k3_prefix), [false; 4]);
+    assert_eq!(selects(&shaped_prefix), [false; 4]);
+    let arch = |prefix: &Path| description(prefix).spec.arch;
+    assert_eq!(arch(&whole_prefix), model::arch::models::Arch::KimiK3);
+    assert_eq!(arch(&shaped_prefix), model::arch::models::Arch::KimiK3);
     std::fs::remove_dir_all(&root).unwrap();
 }
 

@@ -666,8 +666,13 @@ fn kimi_k3_fixture_cut() {
             retype(p, "blk.2.ffn_gate_exps.weight", GgmlType::IQ2_XXS, None);
         }),
         mutant(
-            "a tensor of a type the released set does not hold",
-            "released Kimi K3 set",
+            "a tensor of a type the table does not hold its stem in",
+            "the Kimi K3 reader does not run the tensor in",
+            &|p| retype(p, "blk.1.attn_q.weight", GgmlType::F16, None),
+        ),
+        mutant(
+            "a trunk tensor of a table type other than the source layer's",
+            "attn_q.weight is Q4_K, the source layer's Q6_K",
             &|p| retype(p, "blk.1.attn_q.weight", GgmlType::Q4_K, None),
         ),
     ];

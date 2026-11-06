@@ -15,8 +15,11 @@
 //!   expert id, in the OCP MXFP4 blocks the stored packs hold (the pack's even value is the low
 //!   nibble, its scale `2^(e-127)`: [`hf::modelopt`]'s MXFP4 writer, whose order the gate pins);
 //! - K3.1's indexer tensors are the names Deepseek-V4.1's and Mistral Large 4's descriptions give
-//!   theirs, on the latent layers `dsa_config` lists: `attention.indexer.*` keys carry its
-//!   geometry, and the K3 description's reader names them where it needs them.
+//!   theirs, on the latent layers `dsa_config` lists, spelled by the K3 description
+//!   (`model::arch::kimi_k3::names`). The `attention.indexer.{head_count, key_length, top_k,
+//!   types, rope_dimension_count}` keys and `attention.layer_norm_epsilon` carry its geometry:
+//!   the layers (a bool each, the latent layers), no rope values (`index_rope_dim` 0) and the key
+//!   LayerNorm's epsilon, which is `rms_norm_eps`.
 //!
 //! The vision tower and its projector are skipped with the reason. A layer holds the tensors of its
 //! kind and no other, a K3 folder no indexer and a K3.1 folder one on each latent layer. The
@@ -37,9 +40,7 @@ use gguf::{GgmlType, Value};
 use hf::modelopt::{Normal, Plain, Use};
 use hf::quant_config::ModuleClass;
 use hf::schema::{Fields, Rule::*, Type};
-use model::arch::deepseek41::names as indexer;
 use model::arch::kimi_k3::names;
-use model::arch::mistrallarge4::names::INDEXER_K_NORM_B;
 use safetensors::{Dtype, Folder};
 use serde_json::Value as Json;
 
@@ -661,6 +662,25 @@ impl Checkpoint {
                 .flatten()
                 .map(|(k, v)| (k.to_string(), Value::U32(v))),
         );
+        if has_indexer {
+            // The description's own keys: which layers run the indexer, the rope values its key
+            // has (the config's `index_rope_dim` is 0, held above), and the key LayerNorm's
+            // epsilon, which the checkpoint's modeling code sets to `rms_norm_eps`.
+            keys.extend([
+                (
+                    "attention.indexer.types".to_string(),
+                    Value::Array(latent_layer.iter().map(|&l| Value::Bool(l)).collect()),
+                ),
+                (
+                    "attention.indexer.rope_dimension_count".to_string(),
+                    Value::U32(0),
+                ),
+                (
+                    "attention.layer_norm_epsilon".to_string(),
+                    Value::F32(f("rms_norm_eps")?),
+                ),
+            ]);
+        }
         Ok(Checkpoint {
             variant,
             word: variant,
@@ -940,11 +960,11 @@ impl Checkpoint {
 /// descriptions give theirs. The K3 description declares none of them: R2 declares it.
 fn indexer_names(l: usize) -> [String; 5] {
     [
-        indexer::indexer_attn_q_b(l),
-        indexer::indexer_attn_k(l),
-        indexer::indexer_proj(l),
-        indexer::indexer_k_norm(l),
-        model::arch::names::blk(l, INDEXER_K_NORM_B),
+        names::indexer_attn_q_b(l),
+        names::indexer_attn_k(l),
+        names::indexer_proj(l),
+        names::indexer_k_norm(l),
+        names::indexer_k_norm_bias(l),
     ]
 }
 
@@ -1228,13 +1248,11 @@ impl FolderMap for Checkpoint {
                         ),
                     )?;
                 }
-                "self_attn.indexer.wq_b.weight" => put(indexer::indexer_attn_q_b(l), matrix())?,
-                "self_attn.indexer.wk.weight" => put(indexer::indexer_attn_k(l), matrix())?,
-                "self_attn.indexer.weights_proj.weight" => put(indexer::indexer_proj(l), matrix())?,
-                "self_attn.indexer.k_norm.weight" => put(indexer::indexer_k_norm(l), f32s())?,
-                "self_attn.indexer.k_norm.bias" => {
-                    put(model::arch::names::blk(l, INDEXER_K_NORM_B), f32s())?;
-                }
+                "self_attn.indexer.wq_b.weight" => put(names::indexer_attn_q_b(l), matrix())?,
+                "self_attn.indexer.wk.weight" => put(names::indexer_attn_k(l), matrix())?,
+                "self_attn.indexer.weights_proj.weight" => put(names::indexer_proj(l), matrix())?,
+                "self_attn.indexer.k_norm.weight" => put(names::indexer_k_norm(l), f32s())?,
+                "self_attn.indexer.k_norm.bias" => put(names::indexer_k_norm_bias(l), f32s())?,
                 "mlp.gate_proj.weight" => put(names::ffn_gate(l), matrix())?,
                 "mlp.up_proj.weight" => put(names::ffn_up(l), matrix())?,
                 "mlp.down_proj.weight" => put(names::ffn_down(l), matrix())?,
@@ -1367,7 +1385,10 @@ impl FolderMap for Checkpoint {
         let keys: Vec<_> = self
             .keys
             .iter()
-            .filter(|(k, _)| self.word == Variant::K31 || !k.starts_with("attention.indexer."))
+            .filter(|(k, _)| {
+                self.word == Variant::K31
+                    || !(k.starts_with("attention.indexer.") || k == "attention.layer_norm_epsilon")
+            })
             .cloned()
             .collect();
         Ok(super::trunk::header(self.word.word(), &keys))

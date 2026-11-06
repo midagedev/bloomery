@@ -1,10 +1,13 @@
-//! Every `kimi-k3.*` key the description reads, each layer's mixer from
+//! Every `kimi-k3.*` and `kimi-k31.*` key the description reads, each layer's mixer from
 //! `attention.head_count_kv`, and the tensors the file is held to: the names every layer's kind
-//! carries, their dims and the quant types the released set holds them in. A key the loader
-//! requires is required here, and a value this reader does not run is refused by the key's name.
-//! A layer is a KDA layer when its key-head count is 0 and a latent layer when it is 1; the
-//! tensors a layer carries must be exactly its kind's ([`Hparams::read`]). The dialect's authority
-//! is llama.cpp's `src/models/kimi-k3.cpp`.
+//! carries, their dims and the quant types the engine reads them in. A key the loader requires is
+//! required here, and a value this reader does not run is refused by the key's name. A layer is a
+//! KDA layer when its key-head count is 0 and a latent layer when it is 1; the tensors a layer
+//! carries must be exactly its kind's ([`Hparams::read`]). A `kimi-k31` file is a `kimi-k3` one
+//! whose every latent layer carries the lightning indexer of DeepSeek's sparse attention (the
+//! `attention.indexer.*` keys and five tensors a layer, [`Indexer`]). The dialect's authority is
+//! llama.cpp's `src/models/kimi-k3.cpp`; K3.1 has none, so its keys are this engine's, spelled as
+//! Mistral Large 4's indexer keys are where the meaning is the same.
 
 use gguf::Split;
 use gguf::arch::kimi_k3 as released;
@@ -17,7 +20,8 @@ use crate::arch::delta_mla::{self, Mla, Situ};
 use crate::arch::hybrid::{layers_agree, no_nextn};
 use crate::arch::noaux::{self, Experts};
 use crate::arch::{
-    architecture_is, dims_agree, finite_positive, kda, n_vocab, positive, unread_keys_of,
+    architecture_is, dims_agree, finite_positive, kda, meta_usize, metadata, n_vocab,
+    per_layer_bool, positive, unread_keys_of,
 };
 use crate::placement::PlacementError;
 
@@ -30,9 +34,42 @@ pub enum Kind {
     Mla,
 }
 
-/// The hyperparameters of one Kimi K3 file.
+/// The index heads the score kernel runs: the lifted indexer's `HEADS` (Mistral Large 4's reader
+/// holds the same constant), so a file that names another is refused rather than planned for a
+/// launch that does not exist.
+pub const INDEX_HEADS: usize = 32;
+
+/// The index head's width: the key kernel's Hadamard is the 128-wide one, and the score kernel
+/// reads a key of this many values.
+pub const INDEX_DIM: usize = 128;
+
+/// The lightning indexer of a K3.1 file: on each latent layer, a query from the query latent
+/// (`indexer.attn_q_b`, the RMS-normed `attn_q_a` output to `heads` heads of `d` values), a key
+/// from the layer input (`indexer.attn_k`, then a LayerNorm with gain and bias at `norm_eps`, no
+/// rope, stored f16 for every position), and per-head weights from the layer input
+/// (`indexer.proj`); a position's score is the heads' weighted sum of the rectified dots, and the
+/// layer attends the `top_k` best positions. At a context of `top_k` positions or fewer the
+/// selection is every position.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Indexer {
+    /// `attention.indexer.head_count`: [`INDEX_HEADS`].
+    pub heads: usize,
+    /// `attention.indexer.key_length`: [`INDEX_DIM`].
+    pub d: usize,
+    /// `attention.indexer.top_k`: the positions a layer attends past that many.
+    pub top_k: usize,
+    /// `attention.layer_norm_epsilon`: the key LayerNorm's.
+    pub norm_eps: f32,
+    /// `attention.indexer.types`: whether each layer runs the indexer, the latent layers and no
+    /// other.
+    pub layers: Vec<bool>,
+}
+
+/// The hyperparameters of one Kimi K3 or K3.1 file.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Hparams {
+    /// The file's architecture word: [`released::ARCH`] or [`released::ARCH_K31`].
+    pub arch: &'static str,
     /// `block_count`: every layer is a trunk layer, the file carries no next-token block.
     pub n_layer: usize,
     /// `embedding_length`.
@@ -66,11 +103,13 @@ pub struct Hparams {
     pub experts: Experts,
     /// Every layer's kind, from `attention.head_count_kv`.
     pub kinds: Vec<Kind>,
+    /// The K3.1 file's indexer; `None` for a K3 file.
+    pub indexer: Option<Indexer>,
     /// The keys this read took a default for: the key, the value, the line.
     pub defaults: Vec<String>,
 }
 
-/// Every `kimi-k3.` key [`Hparams::read`] reads but the routed block's ([`noaux::KEYS`]), by
+/// Every `kimi-k3.` or `kimi-k31.` key [`Hparams::read`] reads but the routed block's ([`noaux::KEYS`]), by
 /// suffix. The delta rule's `ssm.conv_kernel`, `kda.head_dim`, `ssm.state_size` and
 /// `ssm.group_count` are [`kda::read`]'s. `attention.value_length` is not read: the file's value
 /// does not describe the cache (the value is the key row's latent), and the reader takes the
@@ -103,11 +142,29 @@ const READ: &[&str] = &[
     "activation.situ_linear_beta",
 ];
 
+/// The keys of a K3.1 file's indexer, by suffix. `attention.indexer.head_count`, `.key_length`,
+/// `.top_k`, `.types` and `attention.layer_norm_epsilon` are Mistral Large 4's spellings for the
+/// same meanings; `attention.indexer.rope_dimension_count` is this family's own, since there the
+/// indexer's rope is the layer's `rope.dimension_count` and K3.1's layers rotate nothing.
+const INDEXER_KEYS: &[&str] = &[
+    "attention.indexer.head_count",
+    "attention.indexer.key_length",
+    "attention.indexer.top_k",
+    "attention.indexer.types",
+    "attention.indexer.rope_dimension_count",
+    "attention.layer_norm_epsilon",
+];
+
 /// The architecture keys and `general.sampling.*` keys of `split` that [`Hparams::read`] does not
 /// read: listed, not refused.
 #[must_use]
 pub fn unread_keys(split: &Split) -> Vec<String> {
-    unread_keys_of(split, &[READ, noaux::KEYS].concat())
+    let indexer: &[&str] = if split.architecture() == Some(released::ARCH_K31) {
+        INDEXER_KEYS
+    } else {
+        &[]
+    };
+    unread_keys_of(split, &[READ, noaux::KEYS, indexer].concat())
 }
 
 impl Hparams {
@@ -115,13 +172,18 @@ impl Hparams {
     /// run, a next-token layer, or a layer whose tensors disagree with its kind, the keys or the
     /// released set's types is an error naming the key or the tensor.
     pub fn read(split: &Split) -> Result<Hparams, PlacementError> {
-        if split.architecture() != Some(released::ARCH) {
-            return Err(architecture_is(&format!(
-                "{:?}; this reader reads {:?} files",
-                split.architecture().unwrap_or("<missing>"),
-                released::ARCH
-            )));
-        }
+        let arch = match split.architecture() {
+            Some(released::ARCH) => released::ARCH,
+            Some(released::ARCH_K31) => released::ARCH_K31,
+            other => {
+                return Err(architecture_is(&format!(
+                    "{:?}; this reader reads {:?} and {:?} files",
+                    other.unwrap_or("<missing>"),
+                    released::ARCH,
+                    released::ARCH_K31
+                )));
+            }
+        };
         let mut defaults = Vec::new();
         let n_layer = positive(split, "block_count")?;
         no_nextn(split)?;
@@ -129,11 +191,15 @@ impl Hparams {
         let n_head = positive(split, "attention.head_count")?;
         let kinds = delta_mla::kinds(split, n_layer, (Kind::Kda, Kind::Mla))?;
         let mla = Mla::read(split)?;
+        let indexer = (arch == released::ARCH_K31)
+            .then(|| Indexer::read(split, &kinds))
+            .transpose()?;
         positive(split, "kda.head_dim")?;
         let kda = kda::read(split, n_head, &mut defaults)?;
         let gate = kda::gate(split, "src/models/kimi-k3.cpp", &mut defaults)?;
         let dense_lead = delta_mla::dense_lead_of(split, n_layer)?;
         let hp = Hparams {
+            arch,
             n_layer,
             n_embd,
             n_head,
@@ -150,6 +216,7 @@ impl Hparams {
             dense_ff: positive(split, "feed_forward_length")?,
             experts: Experts::read(split, "the kimi-k3 router", &mut defaults)?,
             kinds,
+            indexer,
             defaults,
         };
         hp.tensors_agree(split)?;
@@ -168,6 +235,32 @@ impl Hparams {
     #[must_use]
     pub fn kind(&self, l: usize) -> Kind {
         self.kinds[l]
+    }
+
+    /// Whether layer `l` runs the lightning indexer: a latent layer of a K3.1 file.
+    #[must_use]
+    pub fn dsa(&self, l: usize) -> bool {
+        self.indexer.as_ref().is_some_and(|ix| ix.layers[l])
+    }
+
+    /// A context of `ctx` positions the engine runs: every context of a K3 file, and a K3.1
+    /// file's up to `attention.indexer.top_k`, where the indexer's selection is every position
+    /// and the dense latent attention is the file's. A longer context needs the selected
+    /// attention, which no body runs yet, so it is refused by the key's name and never attended
+    /// densely.
+    pub fn check_ctx(&self, ctx: u64) -> Result<(), PlacementError> {
+        match &self.indexer {
+            Some(ix) if ctx > ix.top_k as u64 => Err(PlacementError::Metadata {
+                key: format!("{}.attention.indexer.top_k", self.arch),
+                detail: format!(
+                    "is {}; a context of {ctx} positions is past it, where the indexer selects \
+                     that many and the latent attention here reads every position (the selected \
+                     attention is not in this engine)",
+                    ix.top_k
+                ),
+            }),
+            _ => Ok(()),
+        }
     }
 
     /// Whether layer `l` is a dense block, not a routed one.
@@ -199,8 +292,8 @@ impl Hparams {
     /// nothing of the other kind's: the first missing or misplaced name, with how many more
     /// there are. The final mix's scores are required too.
     fn tensors_agree(&self, split: &Split) -> Result<(), PlacementError> {
-        let layers: Vec<(Kind, bool)> = (0..self.n_layer)
-            .map(|l| (self.kind(l), self.dense(l)))
+        let layers: Vec<(Kind, bool, bool)> = (0..self.n_layer)
+            .map(|l| (self.kind(l), self.dense(l), self.dsa(l)))
             .collect();
         layers_agree(split, &layers, stems_of, &KINDS)?;
         if split.find(OUTPUT_RES_SCORE).is_none() {
@@ -247,6 +340,16 @@ impl Hparams {
             }
             Kind::Mla => self.mla.dims(e, h).to_vec(),
         };
+        if let Some(ix) = self.indexer.as_ref().filter(|ix| ix.layers[l]) {
+            let (heads, d, q_lora) = (ix.heads as u64, ix.d as u64, self.mla.q_lora as u64);
+            dims.extend([
+                ("indexer.attn_q_b.weight", vec![q_lora, heads * d]),
+                ("indexer.attn_k.weight", vec![e, d]),
+                ("indexer.proj.weight", vec![e, heads]),
+                ("indexer.k_norm.weight", vec![d]),
+                ("indexer.k_norm.bias", vec![d]),
+            ]);
+        }
         dims.extend([
             ("attn_res_score.weight", vec![e]),
             ("ffn_res_score.weight", vec![e]),
@@ -279,9 +382,68 @@ impl Hparams {
     }
 }
 
-/// Every tensor of `split` is held in a type the released set holds its stem in
-/// ([`released::allowed_types`]): the first tensor of another type, by name, with how many more
-/// there are. A name that is no stem of the set is not this check's: the classifier lists it.
+impl Indexer {
+    /// A K3.1 file's indexer keys: the head count and key width the kernels run, a rope of no
+    /// values (the key is not rotated), the LayerNorm's epsilon, the top-k, and the layers that
+    /// run it, which are the latent layers and no other. Every other value, or a layer list that
+    /// says otherwise, is refused by the key's name.
+    fn read(split: &Split, kinds: &[Kind]) -> Result<Indexer, PlacementError> {
+        let exact = |suffix: &str, want: usize, why: &str| -> Result<usize, PlacementError> {
+            let v = positive(split, suffix)?;
+            if v == want {
+                Ok(v)
+            } else {
+                Err(metadata(split, suffix, format!("is {v}; {why}")))
+            }
+        };
+        let heads = exact(
+            "attention.indexer.head_count",
+            INDEX_HEADS,
+            "the score kernel runs 32 index heads",
+        )?;
+        let d = exact(
+            "attention.indexer.key_length",
+            INDEX_DIM,
+            "the key kernel's transform and the score kernel are 128 values wide",
+        )?;
+        let rope = meta_usize(split, "attention.indexer.rope_dimension_count")?;
+        if rope != 0 {
+            return Err(metadata(
+                split,
+                "attention.indexer.rope_dimension_count",
+                format!("is {rope}; the indexer's key is not rotated (no rope values)"),
+            ));
+        }
+        let layers = per_layer_bool(split, "attention.indexer.types", kinds.len())?;
+        for (l, (&runs, &kind)) in layers.iter().zip(kinds).enumerate() {
+            if runs != (kind == Kind::Mla) {
+                return Err(metadata(
+                    split,
+                    "attention.indexer.types",
+                    format!(
+                        "is {} at layer {l}, a {} layer: the indexer is on every latent layer \
+                         and no other",
+                        u8::from(runs),
+                        if kind == Kind::Mla { "latent" } else { "delta" }
+                    ),
+                ));
+            }
+        }
+        Ok(Indexer {
+            heads,
+            d,
+            top_k: positive(split, "attention.indexer.top_k")?,
+            norm_eps: finite_positive(split, "attention.layer_norm_epsilon")?,
+            layers,
+        })
+    }
+}
+
+/// Every tensor of `split` is held in a type the engine reads its stem in
+/// ([`released::allowed_types`], the union of the released set, the engine's quantization and the
+/// checkpoint as `prepare` writes it): the first tensor of another type, by name, with how many
+/// more there are. A name that is no stem of the table is not this check's: the classifier lists
+/// it.
 fn types_agree(split: &Split, n_layer: usize) -> Result<(), PlacementError> {
     let mut off: Vec<(String, String)> = Vec::new();
     for (_, t) in split.iter_tensors() {
@@ -294,7 +456,7 @@ fn types_agree(split: &Split, n_layer: usize) -> Result<(), PlacementError> {
             off.push((
                 t.name.clone(),
                 format!(
-                    "{} is {} (the set holds {stem} as {})",
+                    "{} is {} (the engine reads {stem} as {})",
                     t.name,
                     t.ty,
                     list.join(" or ")
@@ -307,7 +469,7 @@ fn types_agree(split: &Split, n_layer: usize) -> Result<(), PlacementError> {
         Some((name, _)) => Err(PlacementError::Tensor {
             name: name.clone(),
             detail: format!(
-                "is of a type the released Kimi K3 set does not hold the tensor in ({} such: {})",
+                "is of a type the Kimi K3 reader does not run the tensor in ({} such: {})",
                 off.len(),
                 off.iter()
                     .map(|(_, d)| d.as_str())
@@ -320,10 +482,10 @@ fn types_agree(split: &Split, n_layer: usize) -> Result<(), PlacementError> {
 
 #[cfg(test)]
 pub(super) mod tests {
-    use super::{Hparams, Kind, unread_keys};
+    use super::{Hparams, INDEX_DIM, INDEX_HEADS, Kind, unread_keys};
     use crate::arch::synthetic::{Ty, V, header_typed};
+    use gguf::Split;
     use gguf::arch::kimi_k3 as released;
-    use gguf::{GgmlType, Split};
     use models::KdaGate;
 
     /// The widths of [`keys`]: 4 layers, delta layers at 0, 1 and 3 and a latent one at 2, the
@@ -349,6 +511,13 @@ pub(super) mod tests {
     pub(in crate::arch::kimi_k3) const LATENT: u64 = 256;
     /// The two-token vocabulary of the synthetic header.
     pub(in crate::arch::kimi_k3) const VOCAB: u64 = 2;
+    /// The top-k of [`keys31`]: below the context a gate runs at, so the selection is a choice
+    /// there and the context check has a side to refuse.
+    pub(in crate::arch::kimi_k3) const TOP_K: u64 = 16;
+    /// The index heads and key width of [`keys31`]: the kernels' own, whatever the trunk's
+    /// widths.
+    pub(in crate::arch::kimi_k3) const IX_HEADS: u64 = INDEX_HEADS as u64;
+    pub(in crate::arch::kimi_k3) const IX_D: u64 = INDEX_DIM as u64;
 
     /// The keys of the released file, at this table's widths.
     pub(in crate::arch::kimi_k3) fn keys() -> Vec<(&'static str, V)> {
@@ -475,20 +644,87 @@ pub(super) mod tests {
         kv
     }
 
-    /// The type the released set holds `name`'s stem in: its first listed type, F32 for a name no
-    /// stem of the set has.
+    /// The keys of a K3.1 file at this table's widths: [`keys`] and the indexer's, on the latent
+    /// layer alone.
+    pub(in crate::arch::kimi_k3) fn keys31() -> Vec<(&'static str, V)> {
+        let types: Vec<bool> = (0..LAYERS).map(|l| MLA_LAYERS.contains(&l)).collect();
+        let mut kv = keys();
+        kv.extend([
+            ("attention.indexer.head_count", V::U32(IX_HEADS as u32)),
+            ("attention.indexer.key_length", V::U32(IX_D as u32)),
+            ("attention.indexer.top_k", V::U32(TOP_K as u32)),
+            ("attention.indexer.types", V::Bools(types)),
+            ("attention.indexer.rope_dimension_count", V::U32(0)),
+            ("attention.layer_norm_epsilon", V::F32(1e-5)),
+        ]);
+        kv
+    }
+
+    /// [`keys31`] with `key` replaced by `v`, or dropped when `v` is `None`.
+    pub(in crate::arch::kimi_k3) fn with31(
+        key: &'static str,
+        v: Option<V>,
+    ) -> Vec<(&'static str, V)> {
+        let mut kv: Vec<_> = keys31().into_iter().filter(|(k, _)| *k != key).collect();
+        if let Some(v) = v {
+            kv.push((key, v));
+        }
+        kv
+    }
+
+    /// The five tensors of one layer's indexer, at [`keys31`]'s widths.
+    pub(in crate::arch::kimi_k3) fn indexer_tensors(l: usize) -> Vec<(String, Vec<u64>)> {
+        [
+            ("indexer.attn_q_b.weight", vec![Q_LORA, IX_HEADS * IX_D]),
+            ("indexer.attn_k.weight", vec![E, IX_D]),
+            ("indexer.proj.weight", vec![E, IX_HEADS]),
+            ("indexer.k_norm.weight", vec![IX_D]),
+            ("indexer.k_norm.bias", vec![IX_D]),
+        ]
+        .into_iter()
+        .map(|(s, d)| (format!("blk.{l}.{s}"), d))
+        .collect()
+    }
+
+    /// The tensors of a K3.1 file: [`tensors`] and the indexer of each latent layer.
+    pub(in crate::arch::kimi_k3) fn tensors31() -> Vec<(String, Vec<u64>)> {
+        let mut t = tensors();
+        for l in MLA_LAYERS {
+            t.extend(indexer_tensors(l));
+        }
+        t
+    }
+
+    /// The K3.1 tensors with `name` dropped.
+    fn without31(name: &str) -> Vec<(String, Vec<u64>)> {
+        tensors31().into_iter().filter(|(n, _)| n != name).collect()
+    }
+
+    /// The K3.1 tensors with `name` given `dims`, or added when the table has none.
+    fn shaped31(name: &str, dims: Vec<u64>) -> Vec<(String, Vec<u64>)> {
+        let mut t = without31(name);
+        t.push((name.to_string(), dims));
+        t
+    }
+
+    /// The type the released UD-IQ1_S file holds `name`'s stem in (the K3.1 indexer's matrices
+    /// in BF16, as the engine's quantization leaves them): Q8_0 on the two narrow stems, IQ1_S
+    /// on the routed stacks, F32 on a stem the table holds only in F32 and on a name it has no
+    /// stem of, Q6_K on the rest. Written from the file, apart from the table.
     pub(in crate::arch::kimi_k3) fn ty_of(name: &str) -> Ty {
         let stem = name
             .strip_prefix("blk.")
             .and_then(|rest| rest.split_once('.'))
             .map_or(name, |(_, stem)| stem);
-        match released::allowed_types(stem).map(|types| types[0]) {
-            None | Some(GgmlType::F32) => Ty::F32,
-            Some(GgmlType::Q6_K) => Ty::Q6K,
-            Some(GgmlType::Q8_0) => Ty::Q8_0,
-            Some(GgmlType::IQ1_S) => Ty::Iq1S,
-            Some(GgmlType::IQ2_XXS) => Ty::Iq2Xxs,
-            Some(other) => panic!("the test table has no writer for {other}"),
+        match stem {
+            "ssm_f_b.weight" | "attn_k_b.weight" => Ty::Q8_0,
+            "indexer.attn_q_b.weight" | "indexer.attn_k.weight" | "indexer.proj.weight" => Ty::Bf16,
+            s if s.ends_with("_exps.weight") => Ty::Iq1S,
+            _ => match released::allowed_types(stem) {
+                None => Ty::F32,
+                Some(types) if types == [gguf::GgmlType::F32] => Ty::F32,
+                Some(_) => Ty::Q6K,
+            },
         }
     }
 
@@ -530,6 +766,15 @@ pub(super) mod tests {
         tensors: &[(String, Vec<u64>)],
     ) -> Result<Hparams, String> {
         read_typed(tag, "kimi-k3", kv, &typed(tensors, &[]))
+    }
+
+    /// The reader's verdict on a K3.1 header of `kv` and `tensors` in the released set's types.
+    fn read31(
+        tag: &str,
+        kv: &[(&str, V)],
+        tensors: &[(String, Vec<u64>)],
+    ) -> Result<Hparams, String> {
+        read_typed(tag, "kimi-k31", kv, &typed(tensors, &[]))
     }
 
     /// One refusal case: a tag, the header's keys, the tensor shapes and the name the refusal must hold.
@@ -976,11 +1221,11 @@ pub(super) mod tests {
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
-    /// A tensor of a type the released set does not hold its stem in is refused by name, and every
-    /// type the set does hold reads: the routed stacks in IQ1_S on every layer and in IQ2_XXS on
+    /// A tensor of a type the table does not hold its stem in is refused by name, and every type
+    /// the released file holds reads: the routed stacks in IQ1_S on every layer and in IQ2_XXS on
     /// the layers its recipe gives them. Mutant: the check dropped, or the table cut to one type.
     #[test]
-    fn a_type_outside_the_released_set_is_refused_by_name() {
+    fn a_type_outside_the_table_is_refused_by_name() {
         let all = tensors();
         let mixed = typed(
             &all,
@@ -998,16 +1243,383 @@ pub(super) mod tests {
             ("score-f16", "blk.1.attn_res_score.weight", Ty::F16),
             ("router-q8", "blk.3.ffn_gate_inp.weight", Ty::Q8_0),
             ("latent-down-iq1", "blk.1.ffn_routed_down.weight", Ty::Iq1S),
+            // The narrow stems run Q8_0 and BF16 alone: their first dim is 128 at this width, which
+            // no 256-wide block fits, so the quantized trunk's types are not written there (the
+            // gguf table's test holds that).
+            ("decay-rank-f16", "blk.1.ssm_f_b.weight", Ty::F16),
+            ("head-q4k", "output.weight", Ty::Q4K),
+            ("embd-q8", "token_embd.weight", Ty::Q8_0),
+            ("projection-f16", "blk.1.ssm_g.weight", Ty::F16),
         ] {
             let got = read_typed(tag, "kimi-k3", &keys(), &typed(&all, &[(name, ty)]));
             match got {
                 Ok(_) => panic!("{tag}: read"),
                 Err(e) => assert!(
-                    e.contains(name) && e.contains("released Kimi K3 set"),
+                    e.contains(name) && e.contains("the engine reads"),
                     "{tag}: {e}"
                 ),
             }
         }
+    }
+
+    /// The engine's own quantization (trunk Q4_K, IQ1_S routed stacks) and the checkpoint's
+    /// types (BF16 projections, the stems that are F32 in both) read through the same table as
+    /// the released file. The checkpoint's MXFP4 stacks have no synthetic writer here: the
+    /// `prepare` gate in `bloomery-model-hf` writes and opens them.
+    #[test]
+    fn the_quantization_and_the_checkpoint_read_with_the_released_file() {
+        let released_ty = |n: &str| ty_of(n);
+        let quant: Vec<_> = tensors31()
+            .into_iter()
+            .map(|(n, d)| {
+                let ty = match released_ty(&n) {
+                    Ty::Q6K if !n.ends_with("attn_v_b.weight") && !n.ends_with("output.weight") => {
+                        Ty::Q4K
+                    }
+                    other => other,
+                };
+                (n, d, ty)
+            })
+            .collect();
+        read_typed("quant", "kimi-k31", &keys31(), &quant).expect("the quantization reads");
+        let checkpoint: Vec<_> = tensors31()
+            .into_iter()
+            .map(|(n, d)| {
+                let ty = match released_ty(&n) {
+                    Ty::Q6K | Ty::Q8_0 => Ty::Bf16,
+                    other => other,
+                };
+                (n, d, ty)
+            })
+            .collect();
+        read_typed("checkpoint", "kimi-k31", &keys31(), &checkpoint)
+            .expect("the checkpoint's projections read");
+        let released_file = typed(&tensors(), &[]);
+        read_typed("released", "kimi-k3", &keys(), &released_file)
+            .expect("the released file reads");
+    }
+
+    /// The K3.1 table's header reads to the indexer its keys give, on the latent layer alone, and
+    /// the layer's dims hold the five indexer tensors there and nowhere else. A K3 file has none.
+    #[test]
+    fn a_k31_header_reads_its_indexer() {
+        let hp = read31("k31", &keys31(), &tensors31()).expect("the K3.1 header reads");
+        assert_eq!(hp.arch, "kimi-k31");
+        let ix = hp.indexer.as_ref().expect("the indexer");
+        assert_eq!(
+            (ix.heads, ix.d, ix.top_k, ix.norm_eps),
+            (32, 128, TOP_K as usize, 1e-5)
+        );
+        assert_eq!(ix.layers, [false, false, true, false]);
+        let dsa: Vec<bool> = (0..LAYERS).map(|l| hp.dsa(l)).collect();
+        assert_eq!(dsa, [false, false, true, false]);
+        let of = |l: usize, stem: &str| {
+            hp.layer_dims(l)
+                .into_iter()
+                .find(|(s, _)| *s == stem)
+                .map(|(_, d)| d)
+        };
+        assert_eq!(
+            of(2, "indexer.attn_q_b.weight"),
+            Some(vec![Q_LORA, IX_HEADS * IX_D])
+        );
+        assert_eq!(of(2, "indexer.attn_k.weight"), Some(vec![E, IX_D]));
+        assert_eq!(of(2, "indexer.proj.weight"), Some(vec![E, IX_HEADS]));
+        assert_eq!(of(2, "indexer.k_norm.weight"), Some(vec![IX_D]));
+        assert_eq!(of(2, "indexer.k_norm.bias"), Some(vec![IX_D]));
+        for l in [0, 1, 3] {
+            assert_eq!(of(l, "indexer.proj.weight"), None, "layer {l}");
+        }
+        let k3 = read("k3", &keys(), &tensors()).expect("the K3 header reads");
+        assert!(
+            k3.indexer.is_none() && !k3.dsa(2),
+            "a K3 file has no indexer"
+        );
+    }
+
+    /// One K3.1 refusal case: a tag, the header's keys, the tensor shapes and the name the
+    /// refusal must hold.
+    type Case31 = (
+        &'static str,
+        Vec<(&'static str, V)>,
+        Vec<(String, Vec<u64>)>,
+        &'static str,
+    );
+
+    /// Every K3.1 key and tensor check refuses by name: a head count, key width or rope the
+    /// kernels do not run, a missing or zero top-k and epsilon, a layer list that puts the indexer
+    /// off a latent layer or on a delta one, and the indexer's tensors missing, misshapen or on
+    /// a layer that has none. Mutant: a check dropped, or the wrong name given.
+    #[test]
+    fn the_k31_reader_refuses_by_name() {
+        let ix = |l: usize, stem: &str| format!("blk.{l}.indexer.{stem}.weight");
+        let cases: Vec<Case31> = vec![
+            (
+                "no-heads",
+                with31("attention.indexer.head_count", None),
+                tensors31(),
+                "attention.indexer.head_count",
+            ),
+            (
+                "heads-64",
+                with31("attention.indexer.head_count", Some(V::U32(64))),
+                tensors31(),
+                "attention.indexer.head_count",
+            ),
+            (
+                "key-length-64",
+                with31("attention.indexer.key_length", Some(V::U32(64))),
+                tensors31(),
+                "attention.indexer.key_length",
+            ),
+            (
+                "no-key-length",
+                with31("attention.indexer.key_length", None),
+                tensors31(),
+                "attention.indexer.key_length",
+            ),
+            (
+                "rope-64",
+                with31("attention.indexer.rope_dimension_count", Some(V::U32(64))),
+                tensors31(),
+                "attention.indexer.rope_dimension_count",
+            ),
+            (
+                "no-rope",
+                with31("attention.indexer.rope_dimension_count", None),
+                tensors31(),
+                "attention.indexer.rope_dimension_count",
+            ),
+            (
+                "no-top-k",
+                with31("attention.indexer.top_k", None),
+                tensors31(),
+                "attention.indexer.top_k",
+            ),
+            (
+                "zero-top-k",
+                with31("attention.indexer.top_k", Some(V::U32(0))),
+                tensors31(),
+                "attention.indexer.top_k",
+            ),
+            (
+                "no-types",
+                with31("attention.indexer.types", None),
+                tensors31(),
+                "attention.indexer.types",
+            ),
+            (
+                "types-off-the-latent-layer",
+                with31(
+                    "attention.indexer.types",
+                    Some(V::Bools(vec![false; LAYERS])),
+                ),
+                tensors31(),
+                "attention.indexer.types",
+            ),
+            (
+                "types-on-a-delta-layer",
+                with31(
+                    "attention.indexer.types",
+                    Some(V::Bools(vec![false, true, true, false])),
+                ),
+                tensors31(),
+                "attention.indexer.types",
+            ),
+            (
+                "types-short",
+                with31("attention.indexer.types", Some(V::Bools(vec![false, true]))),
+                tensors31(),
+                "attention.indexer.types",
+            ),
+            (
+                "no-epsilon",
+                with31("attention.layer_norm_epsilon", None),
+                tensors31(),
+                "attention.layer_norm_epsilon",
+            ),
+            (
+                "zero-epsilon",
+                with31("attention.layer_norm_epsilon", Some(V::F32(0.0))),
+                tensors31(),
+                "attention.layer_norm_epsilon",
+            ),
+            (
+                "q-b-heads",
+                keys31(),
+                shaped31(&ix(2, "attn_q_b"), vec![Q_LORA, 64 * IX_D]),
+                "blk.2.indexer.attn_q_b.weight",
+            ),
+            (
+                "q-b-in-hidden",
+                keys31(),
+                shaped31(&ix(2, "attn_q_b"), vec![E, IX_HEADS * IX_D]),
+                "blk.2.indexer.attn_q_b.weight",
+            ),
+            (
+                "k-width",
+                keys31(),
+                shaped31(&ix(2, "attn_k"), vec![E, 64]),
+                "blk.2.indexer.attn_k.weight",
+            ),
+            (
+                "proj-heads",
+                keys31(),
+                shaped31(&ix(2, "proj"), vec![E, 16]),
+                "blk.2.indexer.proj.weight",
+            ),
+            (
+                "k-norm-width",
+                keys31(),
+                shaped31(&ix(2, "k_norm"), vec![64]),
+                "blk.2.indexer.k_norm.weight",
+            ),
+            (
+                "k-norm-bias-width",
+                keys31(),
+                shaped31("blk.2.indexer.k_norm.bias", vec![64]),
+                "blk.2.indexer.k_norm.bias",
+            ),
+            (
+                "no-q-b",
+                keys31(),
+                without31(&ix(2, "attn_q_b")),
+                "blk.2.indexer.attn_q_b.weight",
+            ),
+            (
+                "no-k",
+                keys31(),
+                without31(&ix(2, "attn_k")),
+                "blk.2.indexer.attn_k.weight",
+            ),
+            (
+                "no-proj",
+                keys31(),
+                without31(&ix(2, "proj")),
+                "blk.2.indexer.proj.weight",
+            ),
+            (
+                "no-k-norm",
+                keys31(),
+                without31(&ix(2, "k_norm")),
+                "blk.2.indexer.k_norm.weight",
+            ),
+            (
+                "no-k-norm-bias",
+                keys31(),
+                without31("blk.2.indexer.k_norm.bias"),
+                "blk.2.indexer.k_norm.bias",
+            ),
+            (
+                "indexer-on-a-delta-layer",
+                keys31(),
+                shaped31(&ix(1, "proj"), vec![E, IX_HEADS]),
+                "blk.1.indexer.proj.weight",
+            ),
+            (
+                "bias-on-a-delta-layer",
+                keys31(),
+                shaped31("blk.3.indexer.k_norm.bias", vec![IX_D]),
+                "blk.3.indexer.k_norm.bias",
+            ),
+            (
+                "k3-tensors-under-the-k31-word",
+                keys31(),
+                tensors(),
+                "blk.2.indexer.attn_q_b.weight",
+            ),
+        ];
+        let wrong: Vec<String> = cases
+            .iter()
+            .filter_map(|(tag, kv, t, want)| match read31(tag, kv, t) {
+                Ok(_) => Some(format!("{tag}: read; expected {want:?}")),
+                Err(e) if e.contains(want) => None,
+                Err(e) => Some(format!("{tag}: want {want:?} in: {e}")),
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// A K3 file with an indexer tensor is refused by that tensor's name: the indexer is K3.1's.
+    #[test]
+    fn an_indexer_tensor_in_a_k3_file_is_refused_by_name() {
+        let mut t = tensors();
+        t.extend(indexer_tensors(2));
+        let e = read("k3-indexer", &keys(), &t).expect_err("a K3 file has no indexer");
+        assert!(e.contains("blk.2.indexer.attn_q_b.weight"), "{e}");
+    }
+
+    /// A type the indexer's stems have no kernel for is refused by name: the matrices run BF16
+    /// or Q8_0, the key's LayerNorm F32 alone. Mutant: the indexer stems left out of the table.
+    #[test]
+    fn an_indexer_tensor_of_another_type_is_refused_by_name() {
+        let all = tensors31();
+        for (tag, name, ty) in [
+            ("proj-q4k", "blk.2.indexer.proj.weight", Ty::Q4K),
+            ("k-f16", "blk.2.indexer.attn_k.weight", Ty::F16),
+            ("q-b-iq1", "blk.2.indexer.attn_q_b.weight", Ty::Iq1S),
+            ("norm-bf16", "blk.2.indexer.k_norm.weight", Ty::Bf16),
+            ("bias-f16", "blk.2.indexer.k_norm.bias", Ty::F16),
+        ] {
+            let got = read_typed(tag, "kimi-k31", &keys31(), &typed(&all, &[(name, ty)]));
+            match got {
+                Ok(_) => panic!("{tag}: read"),
+                Err(e) => assert!(
+                    e.contains(name) && e.contains("the engine reads"),
+                    "{tag}: {e}"
+                ),
+            }
+        }
+        read_typed(
+            "indexer-q8",
+            "kimi-k31",
+            &keys31(),
+            &typed(&all, &[("blk.2.indexer.proj.weight", Ty::Q8_0)]),
+        )
+        .expect("a Q8_0 indexer matrix reads");
+    }
+
+    /// A K3.1 file's context is held to the indexer's top-k: at it the selection is every
+    /// position, past it the selected attention would be needed and the check refuses by the
+    /// key's name. A K3 file has no such bound. Mutants: `>` to `>=`, the check dropped.
+    #[test]
+    fn a_k31_context_past_top_k_is_refused_by_name() {
+        let hp = read31("ctx", &keys31(), &tensors31()).expect("the K3.1 header reads");
+        hp.check_ctx(1).expect("a short context runs");
+        hp.check_ctx(TOP_K).expect("a context of top-k runs");
+        let e = hp.check_ctx(TOP_K + 1).expect_err("past top-k").to_string();
+        assert!(
+            e.contains("kimi-k31.attention.indexer.top_k") && e.contains(&format!("{}", TOP_K + 1)),
+            "{e}"
+        );
+        let k3 = read("ctx-k3", &keys(), &tensors()).expect("the K3 header reads");
+        k3.check_ctx(1 << 20).expect("a K3 file has no bound");
+    }
+
+    /// The reader lists, and does not refuse, the keys of a K3.1 file it does not read: the
+    /// indexer's are read.
+    #[test]
+    fn a_k31_file_reads_its_indexer_keys() {
+        let mut kv = keys31();
+        kv.push(("rope.freq_base", V::F32(10_000.0)));
+        let path = header_typed(
+            "kimi-k31-hparams-unread",
+            "kimi-k31",
+            &kv,
+            &[],
+            &typed(&tensors31(), &[]),
+        );
+        let split = Split::open(&path).expect("opens");
+        let mut unread = unread_keys(&split);
+        let _ = std::fs::remove_file(&path);
+        unread.sort();
+        assert_eq!(
+            unread,
+            vec![
+                "kimi-k31.attention.value_length".to_string(),
+                "kimi-k31.rope.freq_base".to_string()
+            ]
+        );
     }
 
     /// Another architecture's file is refused by `general.architecture`, whatever its keys hold.

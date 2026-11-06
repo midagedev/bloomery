@@ -1,17 +1,27 @@
-//! Every tensor name a Kimi K3 step reads: the spellings every family takes from
+//! Every tensor name a Kimi K3 or K3.1 step reads: the spellings every family takes from
 //! [`crate::arch::names`], the delta rule's, the latent layer's and the two gates' among them,
-//! and the names of this family's own: the latent experts' pair and norm, and the cross-layer
-//! residual's scores.
+//! the names of this family's own (the latent experts' pair and norm, and the cross-layer
+//! residual's scores), and the lightning indexer's, which K3.1's latent layers carry in the
+//! spellings Deepseek-V4.1 and Mistral Large 4 give theirs.
 
+use crate::arch::mistrallarge4::names::INDEXER_K_NORM_B;
 use crate::arch::names::blk;
 
+pub use crate::arch::deepseek41::names::{indexer_attn_k, indexer_attn_q_b, indexer_proj};
 pub use crate::arch::names::{
     attn_gate, attn_k, attn_k_b, attn_kv_a_mqa, attn_kv_a_norm, attn_norm, attn_output, attn_q,
     attn_q_a, attn_q_a_norm, attn_q_b, attn_v, attn_v_b, exp_probs_b, ffn_down, ffn_down_exps,
     ffn_down_shexp, ffn_gate, ffn_gate_exps, ffn_gate_inp, ffn_gate_shexp, ffn_norm, ffn_up,
-    ffn_up_exps, ffn_up_shexp, output, output_norm, ssm_a, ssm_beta, ssm_conv1d, ssm_dt_bias,
-    ssm_f_a, ssm_f_b, ssm_g, ssm_norm, token_embd,
+    ffn_up_exps, ffn_up_shexp, indexer_k_norm, output, output_norm, ssm_a, ssm_beta, ssm_conv1d,
+    ssm_dt_bias, ssm_f_a, ssm_f_b, ssm_g, ssm_norm, token_embd,
 };
+
+/// `blk.{l}.indexer.k_norm.bias` — the bias of the index key's LayerNorm; its gain is
+/// [`indexer_k_norm`].
+#[must_use]
+pub fn indexer_k_norm_bias(l: usize) -> String {
+    blk(l, INDEXER_K_NORM_B)
+}
 
 /// `output_res_score.weight`: the score vector of the final mix of the banks and the running sum.
 pub const OUTPUT_RES_SCORE: &str = "output_res_score.weight";

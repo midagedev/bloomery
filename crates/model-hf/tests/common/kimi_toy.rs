@@ -34,7 +34,8 @@ fn gunzip(path: &str) -> Value {
     serde_json::from_slice(&text).unwrap()
 }
 
-/// The real K3 or K3.1 config at the toy widths.
+/// The real K3 or K3.1 config at the toy widths: the indexer keeps the kernels' 32 heads of 128,
+/// which the description's reader refuses to differ from.
 pub fn config(k31: bool) -> Value {
     let name = if k31 { "Kimi-K3.1-Pro" } else { "Kimi-K3" };
     let mut c = gunzip(&format!(
@@ -70,7 +71,7 @@ pub fn config(k31: bool) -> Value {
     t["linear_attn_config"]["kda_layers"] = json!([1, 2, 4]);
     if k31 {
         t["dsa_config"]["dsa_layers"] = json!([LATENT_LAYER + 1]);
-        t["dsa_config"]["index_num_heads"] = json!(4);
+        t["dsa_config"]["index_num_heads"] = json!(32);
         t["dsa_config"]["index_head_dim"] = json!(128);
         t["dsa_config"]["index_topk"] = json!(8);
     }
