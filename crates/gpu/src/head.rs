@@ -54,13 +54,13 @@ use crate::site::{self, Form, KGemvKernels, SiteTy};
 use crate::tensor::{DeviceTensor, Q8Act};
 use crate::token_major::TokenMajor;
 use crate::weights::{DevWeight, HEAD_TENSOR, Weights};
-use cuda_core::{CudaEvent, DeviceBuffer, PinnedHostBuffer};
+use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, PinnedHostBuffer};
 use gguf::{Split, TensorInfo};
 use model::Tensor2;
 use model::arch::names::output_norm;
 use model::ops::{f32_tensor, matmul_q, rms_norm};
 use model::placement::kernels::{self, HeadEntry};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// The lm_head weight (`output.weight`) in a format a gemv here reads: a
 /// K-quant words over q8_1 rows, NVFP4's planes over q8_1 or 32-value rows,
@@ -289,6 +289,20 @@ pub struct HostHead {
     gain: Vec<f32>,
     eps: f32,
     n_vocab: usize,
+    /// The projection's scratch and the row it was last made from. One lock per readback, taken
+    /// by the one thread that reads the head.
+    state: Mutex<HostState>,
+}
+
+/// What a [`HostHead`] reads into and keeps between readbacks, sized once at open.
+struct HostState {
+    /// The input row as copied from the card.
+    x: Tensor2,
+    /// The input row `normed` and `logits` were made from; they hold it only while `held`.
+    from: Vec<f32>,
+    held: bool,
+    normed: Vec<f32>,
+    logits: Vec<f32>,
 }
 
 impl HostHead {
@@ -329,6 +343,7 @@ impl HostHead {
         }
         let n_vocab = usize::try_from(n_vocab)
             .map_err(|_| GpuError::shape(WHAT, format!("{n_vocab} rows past usize")))?;
+        let hidden = gain.len();
         Ok(HostHead {
             file,
             shard,
@@ -336,14 +351,32 @@ impl HostHead {
             gain,
             eps,
             n_vocab,
+            state: Mutex::new(HostState {
+                x: Tensor2 {
+                    ne0: hidden,
+                    ne1: 1,
+                    data: vec![0.0; hidden],
+                },
+                from: vec![0.0; hidden],
+                held: false,
+                normed: vec![0.0; hidden],
+                logits: vec![0.0; n_vocab],
+            }),
         })
     }
 
-    /// The normed row and the logits of the input row `x`: the final RMS norm by the gain, then
-    /// the projection by `output.weight`'s own type (`model::ops::matmul_q`, which quantizes the
-    /// row into the format that type reads). Refused by name: a row of another width than the
-    /// head's and the projection's own refusals.
-    fn project(&self, x: &[f32]) -> Result<(Vec<f32>, Vec<f32>), GpuError> {
+    /// `read` over the normed row and the logits of the card's input row `x`. The row is copied
+    /// down, and the projection (the final RMS norm by the gain, then `output.weight`'s own type,
+    /// `model::ops::matmul_q`, which quantizes the row into the format that type reads) runs only
+    /// when it is not the row the held result was made from, so a second readback of one step is
+    /// a copy. Refused by name: a row of another width than the head's and the projection's own
+    /// refusals.
+    fn with_row<R>(
+        &self,
+        stream: &CudaStream,
+        x: &DeviceBuffer<f32>,
+        read: impl FnOnce(&[f32], &[f32]) -> R,
+    ) -> Result<R, GpuError> {
         const WHAT: &str = "Head::tokens";
         if x.len() != self.gain.len() {
             return Err(GpuError::shape(
@@ -355,27 +388,36 @@ impl HostHead {
                 ),
             ));
         }
-        let row = Tensor2 {
-            ne0: x.len(),
-            ne1: 1,
-            data: x.to_vec(),
-        };
-        let normed = rms_norm(&row, &self.gain, self.eps);
-        let gguf = self
-            .file
-            .shard(self.shard)
-            .ok_or_else(|| GpuError::shape(WHAT, format!("no shard {} in the file", self.shard)))?;
-        let mut logits = matmul_q(gguf, &self.out, &normed)?;
-        if (logits.ne0, logits.ne1) != (self.n_vocab, 1) {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "the projection wrote {} x {}, the head's row is {} logits",
-                    logits.ne0, logits.ne1, self.n_vocab
-                ),
-            ));
+        let mut guard = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let st = &mut *guard;
+        x.copy_to_host(stream, &mut st.x.data)?;
+        let same =
+            st.x.data
+                .iter()
+                .zip(&st.from)
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+        if !(st.held && same) {
+            st.held = false;
+            let normed = rms_norm(&st.x, &self.gain, self.eps);
+            let gguf = self.file.shard(self.shard).ok_or_else(|| {
+                GpuError::shape(WHAT, format!("no shard {} in the file", self.shard))
+            })?;
+            let logits = matmul_q(gguf, &self.out, &normed)?;
+            if (logits.ne0, logits.ne1) != (self.n_vocab, 1) {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "the projection wrote {} x {}, the head's row is {} logits",
+                        logits.ne0, logits.ne1, self.n_vocab
+                    ),
+                ));
+            }
+            st.normed.copy_from_slice(&normed.data);
+            st.logits.copy_from_slice(&logits.data);
+            st.from.copy_from_slice(&st.x.data);
+            st.held = true;
         }
-        Ok((normed.data.clone(), std::mem::take(&mut logits.data)))
+        Ok(read(&st.normed, &st.logits))
     }
 }
 
@@ -608,9 +650,12 @@ impl Head {
     pub fn host(gpu: &Gpu, host: HostHead) -> Result<Head, GpuError> {
         let stream = gpu.stream();
         let (hidden, n_vocab) = (host.gain.len(), host.n_vocab);
+        // The host reads the norm and the projection into its own rows: the fields the card's head
+        // reads stay one value each, and a caller that would read the normed rows on the card is
+        // refused by name (`Head::reads_on_host`).
         Ok(Head {
             fin: Final::Rms {
-                normed: DeviceBuffer::zeroed(stream, hidden)?,
+                normed: DeviceBuffer::zeroed(stream, 1)?,
             },
             gain: output_norm(),
             eps: host.eps,
@@ -619,7 +664,7 @@ impl Head {
             m: 1,
             x: DeviceBuffer::zeroed(stream, hidden)?,
             act: None,
-            logits: DeviceBuffer::zeroed(stream, n_vocab)?,
+            logits: DeviceBuffer::zeroed(stream, 1)?,
             token_out: DeviceBuffer::from_host(stream, &[0u32; 3])?,
             copied: PinnedHostBuffer::zeroed(stream.context(), 3)?,
             copied_at: stream.context().new_event(None)?,
@@ -975,22 +1020,32 @@ impl Head {
     /// gate/debug use.
     pub fn normed_to_host(&self, gpu: &Gpu) -> Result<Vec<f32>, GpuError> {
         if let Some(h) = &self.host {
-            return Ok(self.host_row(gpu, h)?.0);
+            return self.host_row(gpu, h, |normed, _| normed.to_vec());
         }
         Ok(self.normed().to_host_vec(gpu.stream())?)
     }
 
-    /// The normed row and the logits of the input row as it stands, a host head's readback: the
-    /// engine stream waited for, a raised fault refused, the row copied and projected on the
-    /// host.
-    fn host_row(&self, gpu: &Gpu, h: &HostHead) -> Result<(Vec<f32>, Vec<f32>), GpuError> {
+    /// `read` over the normed row and the logits of the input row as it stands, a host head's
+    /// readback: the engine stream waited for, a raised fault refused, the row copied and
+    /// projected on the host unless the held projection is of it.
+    fn host_row<R>(
+        &self,
+        gpu: &Gpu,
+        h: &HostHead,
+        read: impl FnOnce(&[f32], &[f32]) -> R,
+    ) -> Result<R, GpuError> {
         const WHAT: &str = "Head::tokens";
         let stream = gpu.stream();
         crate::host::await_done(WHAT, || stream.query())?;
         if let Some(fault) = gpu.fault()? {
             return Err(GpuError::fault(WHAT, fault));
         }
-        h.project(&self.x.to_host_vec(stream)?)
+        h.with_row(stream, &self.x, read)
+    }
+
+    /// The head is read on the host: its normed rows and logits are not on the card.
+    pub(crate) fn reads_on_host(&self) -> bool {
+        self.host.is_some()
     }
 
     /// [`Head::normed_to_host`]'s rows on the card, for a launch on the
@@ -1006,7 +1061,7 @@ impl Head {
     /// read; gate/debug use.
     pub fn logits_to_host(&self, gpu: &Gpu) -> Result<Vec<f32>, GpuError> {
         if let Some(h) = &self.host {
-            return Ok(self.host_row(gpu, h)?.1);
+            return self.host_row(gpu, h, |_, logits| logits.to_vec());
         }
         Ok(self.logits.to_host_vec(gpu.stream())?)
     }
@@ -1020,15 +1075,16 @@ impl Head {
     /// f32: a caller reading every token reuses one buffer. Blocking read.
     pub fn logits_into_host(&self, gpu: &Gpu, out: &mut [f32]) -> Result<(), GpuError> {
         if let Some(h) = &self.host {
-            let logits = self.host_row(gpu, h)?.1;
-            if out.len() != logits.len() {
-                return Err(GpuError::shape(
-                    "Head::logits_into_host",
-                    format!("a buffer of {} f32 for {} logits", out.len(), logits.len()),
-                ));
-            }
-            out.copy_from_slice(&logits);
-            return Ok(());
+            return self.host_row(gpu, h, |_, logits| {
+                if out.len() != logits.len() {
+                    return Err(GpuError::shape(
+                        "Head::logits_into_host",
+                        format!("a buffer of {} f32 for {} logits", out.len(), logits.len()),
+                    ));
+                }
+                out.copy_from_slice(logits);
+                Ok(())
+            })?;
         }
         if out.len() != self.logits.len() {
             return Err(GpuError::shape(
@@ -1104,7 +1160,9 @@ impl Head {
     /// [`Head::token_words`]).
     pub fn tokens(&self, gpu: &Gpu) -> Result<Vec<u32>, GpuError> {
         match &self.host {
-            Some(h) => Ok(vec![host_argmax(&self.host_row(gpu, h)?.1)?]),
+            Some(h) => Ok(vec![
+                self.host_row(gpu, h, |_, logits| host_argmax(logits))??,
+            ]),
             None => read_tokens(gpu, &self.token_out),
         }
     }
@@ -1226,29 +1284,19 @@ mod tests {
         let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
         let rows = q5k_rows(N_VOCAB, K);
         let gain: Vec<u8> = (0..K).flat_map(|_| 1.0f32.to_le_bytes()).collect();
-        let decls = vec![
-            TensorDecl {
-                name: HEAD_TENSOR.to_string(),
-                dims: vec![K as u64, N_VOCAB as u64],
-                type_id: GgmlType::Q5_K.as_u32(),
-                nbytes: rows.len() as u64,
-            },
-            TensorDecl {
-                name: output_norm(),
-                dims: vec![K as u64],
-                type_id: GgmlType::F32.as_u32(),
-                nbytes: gain.len() as u64,
-            },
-        ];
-        let dir = std::env::temp_dir().join(format!("bloomery-q5k-head-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("a temp dir");
-        let path = dir.join("head.gguf");
-        let layout = Layout::new(&[], decls.clone()).expect("a layout");
-        let file = std::io::BufWriter::new(std::fs::File::create(&path).expect("the file"));
-        let mut writer = Writer::new(file, layout).expect("a writer");
-        writer.tensor(&decls[0].name, &rows).expect("the rows");
-        writer.tensor(&decls[1].name, &gain).expect("the gain");
-        writer.finish().expect("a finished file");
+        let path = write_file(
+            "q5k-head",
+            &[
+                (
+                    HEAD_TENSOR,
+                    vec![K as u64, N_VOCAB as u64],
+                    GgmlType::Q5_K,
+                    &rows,
+                ),
+                (&output_norm(), vec![K as u64], GgmlType::F32, &gain),
+            ],
+        );
+        let dir = path.parent().expect("the file's directory").to_path_buf();
         let split = Split::open(&path).expect("the file opens");
         let w = Weights::load_where(gpu.stream(), &split, |_| true).expect("resident");
         let _ = std::fs::remove_dir_all(&dir);

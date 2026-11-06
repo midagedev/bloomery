@@ -258,9 +258,22 @@ impl Placed {
         self.side.tier.as_ref().map_or(0, TierParts::bytes)
     }
 
-    /// The expert tier's experts of layer `l`: 0 off the tier and on a load that hangs none.
+    /// Layer `l` of the model: a layer past it panics by name, as no accessor below answers for a
+    /// layer the model does not have.
+    fn layer(&self, what: &str, l: usize) -> usize {
+        assert!(
+            l < self.side.hosted.len(),
+            "{what}: layer {l} is past the model's {} layers",
+            self.side.hosted.len()
+        );
+        l
+    }
+
+    /// The expert tier's experts of layer `l`: 0 off the tier and on a load that hangs none. A
+    /// layer past the model panics by name.
     #[must_use]
     pub fn tier_k(&self, l: usize) -> usize {
+        let l = self.layer("tier_k", l);
         self.side.tier.as_ref().map_or(0, |t| t.k(l))
     }
 
@@ -268,18 +281,14 @@ impl Placed {
     /// name.
     #[must_use]
     pub fn hosted(&self, l: usize) -> bool {
-        self.side.hosted.get(l).copied().unwrap_or_else(|| {
-            panic!(
-                "hosted: layer {l} is past the model's {} layers",
-                self.side.hosted.len()
-            )
-        })
+        self.side.hosted[self.layer("hosted", l)]
     }
 
-    /// The card's experts of layer `l`: 0 on the dense layer.
+    /// The card's experts of layer `l`: 0 on the dense layer. A layer past the model panics by
+    /// name.
     #[must_use]
     pub fn n_card(&self, l: usize) -> usize {
-        self.side.n_card.get(l).copied().unwrap_or(0)
+        self.side.n_card[self.layer("n_card", l)]
     }
 
     /// The host tier, for a gate's instrument.

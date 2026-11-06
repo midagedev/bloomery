@@ -54,13 +54,13 @@ mod cli {
     use bloomery_gpu_gates::generate::{Place, TierRule};
     use bloomery_gpu_gates::need;
     use bloomery_gpu_gates::record;
-    use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
+    use bloomery_gpu_gates::{GateError, fnv_row, gpu_census, ref_model_path};
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, CARD_MARGIN, HOST_LOCK, HOST_POPULATE, HostCfg, TIER_NODES,
     };
     use gguf::Split;
     use model::arch::kimi_k3::place::{PlaceError, PlanInputs, tier_batch};
-    use model::placement::{PlacementError, Plan, PlanLevers};
+    use model::placement::{Machine, PlacementError, Plan, PlanLevers};
     use tokenizer::Tokenizer;
 
     /// The argument after flag `name`: `None` when the flag is absent, an error when it is last.
@@ -108,15 +108,6 @@ mod cli {
         Ok(ids)
     }
 
-    /// FNV-1a over the bits of the last logits row: what a gate holds two processes' rows equal by.
-    fn fnv(row: &[f32]) -> u64 {
-        row.iter()
-            .flat_map(|v| v.to_bits().to_le_bytes())
-            .fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
-                (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
-            })
-    }
-
     /// The tier cards the body serves: one, the stage card's neighbour. No sitting has shown the
     /// tier not slower, so the flag defaults to `a` and the rule never picks.
     const TIER_RULE: TierRule = TierRule {
@@ -147,6 +138,34 @@ mod cli {
         "--plan",
         "--granule",
     ];
+
+    /// The plan on `machine` and the machine it is on. A placed plan (`placed` names its place)
+    /// the stage card's dense trunk alone refuses (its bytes past the card's free bytes) is made
+    /// again on `headless`, the same machine with no card carrying the head, which the host reads.
+    fn plan_for<'a>(
+        inputs: &'a PlanInputs,
+        (machine, headless): (&'a Machine, &'a Machine),
+        ctx: u64,
+        levers: &PlanLevers,
+        placed: Option<&str>,
+    ) -> Result<(&'a Machine, Plan<'a>), GateError> {
+        match (inputs.plan(machine, ctx, levers), placed) {
+            (Err(PlaceError::Placement(PlacementError::CardFreeFloor(floor))), Some(name)) => {
+                let on_host = inputs.plan(headless, ctx, levers).map_err(|e| {
+                    format!("--place {name}: {floor}; and with the head on the host: {e}")
+                })?;
+                eprintln!(
+                    "head on host: the plan with the head on the stage card was refused ({floor}); \
+                     the plan below reads the head on the host"
+                );
+                Ok((headless, on_host))
+            }
+            (other, _) => Ok((
+                machine,
+                other.map_err(|e| format!("--place {}: {e}", placed.unwrap_or("a")))?,
+            )),
+        }
+    }
 
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(&ACTS_ON)?;
@@ -210,32 +229,18 @@ mod cli {
         }
         let plan_levers = PlanLevers::from_levers(&levers)?;
         let placed = chosen.place.name() != "a";
-        // A placed plan the stage card's dense trunk alone refuses (its bytes past the card's free
-        // bytes) is made again with the head read on the host: no card carries it.
         let headless = {
             let mut m = machine.clone();
             m.cards.iter_mut().for_each(|c| c.head = false);
             m
         };
-        let (machine, plan) = match inputs.plan(&machine, ctx as u64, &plan_levers) {
-            Err(PlaceError::Placement(PlacementError::CardFreeFloor(floor))) if placed => {
-                let name = chosen.place.name();
-                let on_host = inputs
-                    .plan(&headless, ctx as u64, &plan_levers)
-                    .map_err(|e| {
-                        format!("--place {name}: {floor}; and with the head on the host: {e}")
-                    })?;
-                eprintln!(
-                    "head on host: the plan with the head on the stage card was refused ({floor}); \
-                     the plan below reads the head on the host"
-                );
-                (&headless, on_host)
-            }
-            other => (
-                &machine,
-                other.map_err(|e| format!("--place {}: {e}", chosen.place.name()))?,
-            ),
-        };
+        let (machine, plan) = plan_for(
+            &inputs,
+            (&machine, &headless),
+            ctx as u64,
+            &plan_levers,
+            placed.then(|| chosen.place.name()),
+        )?;
         record::plan(chosen.place.name(), machine, &plan).eprint();
         need::print(&plan, 0, 0, true)?;
         if plan_only {
@@ -283,7 +288,7 @@ mod cli {
         );
         let out = greedy(&mut m, &ids, n)?;
         println!("ids {out:?}");
-        println!("logits fnv1a64={:016x}", fnv(&m.logits()?));
+        println!("logits fnv1a64={:016x}", fnv_row(&m.logits()?));
         if let Some(tok) = tok {
             println!("text {:?}", tok.decode(&out));
         }

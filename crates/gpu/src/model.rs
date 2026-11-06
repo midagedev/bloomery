@@ -2104,13 +2104,19 @@ impl<B: ChainBody> GpuModel<B> {
     /// [`GpuModel::body_parts`] beside the head's normed rows of the last
     /// `step` or prompt call on the card ([`GpuModel::head_normed`]'s rows,
     /// not read back), for a body's launch on the engine stream that reads
-    /// them where they sit. Refused as `head_normed` is.
+    /// them where they sit. Refused as `head_normed` is, and for a head read on the host.
     pub(crate) fn body_parts_normed(
         &mut self,
         what: &'static str,
     ) -> Result<(&Gpu, &Weights, &mut B, &DeviceBuffer<f32>), GpuError> {
         self.refuse_one_pass(what)?;
         let head = self.heads.first().ok_or(no_head(what))?;
+        if head.reads_on_host() {
+            return Err(GpuError::shape(
+                what,
+                "the head is read on the host: its normed rows are not on the card",
+            ));
+        }
         Ok((&self.gpu, &self.weights, &mut *self.body, head.normed()))
     }
 

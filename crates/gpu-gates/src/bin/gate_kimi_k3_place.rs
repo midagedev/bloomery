@@ -68,6 +68,14 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 #[allow(
     dead_code,
+    reason = "the shared harness serves several gates; each takes the helpers it reads"
+)]
+#[path = "shared/e2e.rs"]
+mod e2e;
+
+#[cfg(feature = "gpu")]
+#[allow(
+    dead_code,
     reason = "the shared runner serves several gates; each takes the helpers it reads"
 )]
 #[path = "shared/node_proc.rs"]
@@ -96,7 +104,7 @@ mod gate {
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::tier::{self, Tier};
     use bloomery_gpu_gates::{
-        GateError, beside, checks_failed, die_with_parent, open_split, ref_model_path,
+        GateError, beside, checks_failed, die_with_parent, fnv_row, open_split, ref_model_path,
     };
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, CardBudget, HOST_LOCK, HOST_POPULATE, HostCfg, TIER_NODES,
@@ -108,6 +116,7 @@ mod gate {
         Device, ExpertList, Machine, PlacementError, Plan, PlanLevers, Role, workstation,
     };
 
+    use crate::e2e;
     use crate::node_proc::{LISTENING, tier_server, tier_server_command};
     use crate::tier_twocard::{Sent, sent_every, tier_counts};
 
@@ -157,22 +166,6 @@ mod gate {
     /// from two int8 activation roundings of one normed row); the final norm skipped reads 5.3e-1.
     const HOST_HEAD_REL_BAND: f64 = 1.6e-2;
 
-    /// The fixed walk: a multiplicative walk through ids the vocabulary holds.
-    fn walk(n: usize, vocab: usize) -> Vec<u32> {
-        (0..n)
-            .map(|i| u32::try_from(1_000 + (i * 7_919 + 13) % (vocab - 1_000)).unwrap_or(1))
-            .collect()
-    }
-
-    /// FNV-1a over the bits of a logits row: how two processes' rows are held equal.
-    fn fnv(row: &[f32]) -> u64 {
-        row.iter()
-            .flat_map(|v| v.to_bits().to_le_bytes())
-            .fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
-                (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
-            })
-    }
-
     /// What a run read: the greedy ids and the last logits row.
     struct Run {
         ids: Vec<u32>,
@@ -184,7 +177,7 @@ mod gate {
 
     impl Run {
         fn same_bits(&self, other: &Run) -> bool {
-            self.ids == other.ids && fnv(&self.logits) == fnv(&other.logits)
+            self.ids == other.ids && fnv_row(&self.logits) == fnv_row(&other.logits)
         }
     }
 
@@ -626,7 +619,7 @@ mod gate {
         if PROMPT + STEPS > CTX {
             return Err(format!("{PROMPT} + {STEPS} positions, the caches hold {CTX}").into());
         }
-        let prompt = walk(PROMPT, inputs.hp.n_vocab);
+        let prompt = e2e::walk(PROMPT, inputs.hp.n_vocab);
         let table = split_table(&inputs, header)?;
         let budget = pick_budget(&table)?;
         let host = levers.host();
@@ -840,12 +833,12 @@ mod gate {
         }
         let (ids, hash) = printed(&stdout)?;
         Ok(line(
-            ids == in_process.ids && hash == fnv(&in_process.logits),
+            ids == in_process.ids && hash == fnv_row(&in_process.logits),
             "node ids",
             &format!(
                 "node {ids:?} logits fnv1a64={hash:016x}, in-process {:?} fnv1a64={:016x}",
                 in_process.ids,
-                fnv(&in_process.logits)
+                fnv_row(&in_process.logits)
             ),
         ))
     }

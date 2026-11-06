@@ -809,6 +809,12 @@ impl Fnv1a64 {
     }
 }
 
+/// FNV-1a over the bits of a logits row: how two processes' rows are held equal.
+#[must_use]
+pub fn fnv_row(row: &[f32]) -> u64 {
+    Fnv1a64::default().f32s(row).value()
+}
+
 /// Same length and the same bits at every index — the bit-identity contract
 /// the fusion, rerun and replay checks assert. Not `==`: that calls `-0.0`
 /// equal to `0.0` and two NaNs unequal, and both are differences a fusion

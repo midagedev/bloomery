@@ -4510,7 +4510,8 @@ gate-gpu-kimik3-e2e:
 # Kimi K3's end-to-end decode CLI (generate_kimi_k3's doc): --tokens a,b,c or --prompt TEXT (raw, no template), -n, --ctx, --place, --mode,
 # --plan (the plan's records and nothing loaded). The fixture: BLOOMERY_BOX_ENV='BLOOMERY_TIER=fixture BLOOMERY_GATE_CARD=any'; `--place a`
 # on the real file is refused by name past the card's free bytes; `--place bp` (BLOOMERY_CARD=both, one run at a time under a timeout) loads by
-# the plan, and refuses a plan that leaves experts on the host tier (no SiTU expert form). Never a timing run.
+# the plan: a plan that leaves experts on the host tier runs them there in the SiTU expert form, and a stage card whose dense trunk alone
+# is over the card's free bytes is planned again with the head read on the host. Never a timing run.
 gen-kimi-k3 *ARGS:
     BLOOMERY_MODEL=kimi-k3 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_kimi_k3 && bash tools/gpu-gate.sh generate_kimi_k3 {{ARGS}}'
 
@@ -4532,7 +4533,7 @@ gate-gpu-kimik3-pp:
 # expert tier (in process, then served by a loopback tier_server on the 3090 alone), the embedding a host row. On the fixture, under the card
 # budget the gate finds by bisection (experts on both cards, none on the host; plans counted at a 4 KiB granule): the placed greedy ids equal the whole-card body's, the eager
 # run the graph run's bits, every tier layer is sent a routed slot, the node's tier reads the in-process tier's ids and logits bits; a tier
-# reserve of 0, a plan with a host share (the host tier has no SiTU expert form) and a node of another family are each refused by name, and
+# reserve of 0, a host layer with no tier expert, a head left off the card whose tensors are not on the host and a node of another family are each refused by name; a plan with a host share loads and its logits rows stay within HOST_REL_BAND of the whole-card row, a head the host reads within HOST_HEAD_REL_BAND of the card's, and
 # `generate_kimi_k3 --plan --place bp` prints the placed machine's plan record. Fixture-only (tools/ref/fixture-only.sh): the real file's plan
 # leaves experts on the host tier. Both cards (the A6000 the stage, the 3090 the tier and the node). Predicted wall [derived: the e2e gate's
 # fixture opens, a few seconds each]: five loads in the gate and four in its children, under 5 min after a warm build.
