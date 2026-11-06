@@ -239,6 +239,7 @@ mod gate {
         KIND_CARD, KIND_HOST, KIND_TIER, RouteTrace, TraceHeader, TraceSet,
     };
     use bloomery_gpu::hybrid::{Chain, HostExperts, PoisonKind, RELEASE, Slot};
+    use bloomery_gpu::indexer::{HEAD_DIM as KEY_DIM, HEADS as KEY_HEADS};
     use bloomery_gpu::model::{ChainBody, HostServed, StepMode};
     use bloomery_gpu::weights::{DevWeight, Weights};
     use bloomery_gpu::{FLAG_WAIT_OPS, Fault, FaultSite, Gpu, GpuError, LAYER_HEAD, NodeInfo};
@@ -246,7 +247,6 @@ mod gate {
     use bloomery_gpu_deepseek41::chain::attn::AttnChain;
     use bloomery_gpu_deepseek41::chain::ffn::{FfnPiece, host_run};
     use bloomery_gpu_deepseek41::chain::glue::Glue;
-    use bloomery_gpu_deepseek41::indexer::{HEAD_DIM as KEY_DIM, HEADS as KEY_HEADS};
     use bloomery_gpu_deepseek41::router::{N_EXPERT, N_USED};
     use bloomery_gpu_gates::act_rule::{Arm, SiteRel, site_rel};
     use bloomery_gpu_gates::flip::{head_cap, head_gap, head_tie};

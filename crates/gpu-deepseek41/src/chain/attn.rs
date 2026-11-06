@@ -79,6 +79,8 @@ use std::ops::Range;
 use bloomery_gpu::cand::{CandKernels, CandScratch, CandShape, CompactArgs, RemapArgs, SelectArgs};
 use bloomery_gpu::fused::FusedKernels;
 use bloomery_gpu::host::rank::Sums;
+use bloomery_gpu::index_key;
+use bloomery_gpu::indexer::{self, IndexerArgs, IndexerKernels, IndexerScratch};
 use bloomery_gpu::model::{Q8_0GemvHeadsArgs, StepKernels};
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{
@@ -101,8 +103,7 @@ use crate::hc::{
     HC_MAX_TOKENS, HC_MIX, HC_PIECE, HC_STREAMS, HcFn, HcFnArgs, HcKernels, HcPostArgs,
     HcPreScratch,
 };
-use crate::index_key::{self, IndexKeyArgs, IndexKeyKernels};
-use crate::indexer::{self, IndexerArgs, IndexerKernels, IndexerScratch};
+use crate::index_key::{CompIndexKeyKernels, IndexKeyArgs};
 use crate::params::{ImageLayout, Table};
 use crate::rope::{KvAppendArgs, RopeKernels, TailShape};
 use crate::transpose::TransposeKernels;
@@ -586,7 +587,7 @@ struct Kernels {
     rope: RopeKernels,
     attn: AttnKernels,
     comp: CompressKernels,
-    key: IndexKeyKernels,
+    key: CompIndexKeyKernels,
     /// Loaded when a layer of the card runs the indexer.
     index: Option<IndexerKernels>,
     step: StepKernels,
@@ -868,9 +869,9 @@ impl AttnChain {
             rope: RopeKernels::load(ctx)?,
             attn: AttnKernels::load(ctx)?,
             comp: CompressKernels::load(ctx)?,
-            key: IndexKeyKernels::load(ctx)?,
+            key: CompIndexKeyKernels::load(ctx)?,
             index: any_indexer
-                .then(|| IndexerKernels::load(ctx, hp))
+                .then(|| crate::indexer::kernels(ctx, hp))
                 .transpose()?,
             step: StepKernels::load(ctx)?,
             dense: DenseKernels::load(ctx)?,

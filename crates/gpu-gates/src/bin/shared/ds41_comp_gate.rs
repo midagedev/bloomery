@@ -58,13 +58,12 @@
 use std::collections::HashMap;
 use std::f32::consts::FRAC_1_SQRT_2;
 
+use bloomery_gpu::index_key::{self, HT_SCALE, IndexKeyInputArgs, IndexKeyKernels};
 use bloomery_gpu::{DeviceTensor, Fault, FaultSite, Gpu, LAYER_NONE, Q8Act};
 use bloomery_gpu_deepseek41::compress::{
     self, CompGeom, CompressKernels, PoolArgs, RowsArgs, StepInts,
 };
-use bloomery_gpu_deepseek41::index_key::{
-    self, HT_SCALE, IndexKeyArgs, IndexKeyInputArgs, IndexKeyKernels,
-};
+use bloomery_gpu_deepseek41::index_key::{CompIndexKeyKernels, IndexKeyArgs};
 use bloomery_gpu_deepseek41::rope::{Direction, RopeSpec, RopeTable, ggml_rope_cache};
 use bloomery_gpu_gates::act_rule::{q3k_fields, q8_1_exact, q8k_exact};
 use bloomery_gpu_gates::ds41_meta::RopeMeta;
@@ -321,7 +320,8 @@ struct Weight {
 struct Cx {
     gpu: Gpu,
     comp: CompressKernels,
-    idx: IndexKeyKernels,
+    idx: CompIndexKeyKernels,
+    idx_in: IndexKeyKernels,
     split: Split,
     hp: Hparams,
     meta: RopeMeta<RopeSpec>,
@@ -408,7 +408,8 @@ pub fn run() -> Result<(), GateError> {
     let hp = Hparams::read(&split)?;
     let gpu = Gpu::new()?;
     let comp = CompressKernels::load(gpu.context())?;
-    let idx = IndexKeyKernels::load(gpu.context())?;
+    let idx = CompIndexKeyKernels::load(gpu.context())?;
+    let idx_in = IndexKeyKernels::load(gpu.context())?;
     println!(
         "gate_deepseek41_comp: device {} — n_dims {} eps {:e}; yarn rope {:?}; ht_scale {:e}",
         gpu.device_name()?,
@@ -421,6 +422,7 @@ pub fn run() -> Result<(), GateError> {
         gpu,
         comp,
         idx,
+        idx_in,
         split,
         hp,
         meta,
@@ -1660,7 +1662,7 @@ fn input_run(
     let pos_dev = DeviceBuffer::from_host(stream, pos)?;
     let cs = DeviceBuffer::from_host(stream, cs)?;
     let mut cache = DeviceTensor::upload(stream, &vec![SENTINEL; rows * w], rows, w)?;
-    cx.idx.enqueue_index_key_input(
+    cx.idx_in.enqueue_index_key_input(
         stream,
         IndexKeyInputArgs {
             x: &x,
@@ -2015,7 +2017,7 @@ fn input_key_section(cx: &Cx) -> Result<bool, GateError> {
                         m: usize,
                         wide: bool| {
         let cache = if wide { &mut cache } else { &mut narrow };
-        cx.idx
+        cx.idx_in
             .enqueue_index_key_input(
                 stream,
                 IndexKeyInputArgs {

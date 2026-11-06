@@ -94,6 +94,8 @@ use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::host::swap_source::ResidencyGlue;
 use bloomery_gpu::host::tier::TierOpen;
 use bloomery_gpu::hybrid::{Chain, HostResidency, Hybrid, SlotMap};
+use bloomery_gpu::index_key::{IndexKeyInputArgs, IndexKeyKernels};
+use bloomery_gpu::indexer::{IndexerArgs, IndexerKernels, IndexerScratch};
 use bloomery_gpu::kquant::SelDown;
 use bloomery_gpu::latent::{KvGatherSelArgs, LatentAppendArgs, LatentKernels, Rows as LatentRows};
 use bloomery_gpu::model::{
@@ -109,8 +111,6 @@ use bloomery_gpu::site::{Form, KGemvKernels};
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{DeviceTensor, FaultSink, FaultSite, Gpu, GpuError, Q8Act, copy_row};
 use bloomery_gpu_deepseek41::attn::{AttnArgs, AttnKernels, SelectedRows, segments};
-use bloomery_gpu_deepseek41::index_key::{IndexKeyInputArgs, IndexKeyKernels};
-use bloomery_gpu_deepseek41::indexer::{IndexerArgs, IndexerKernels, IndexerScratch};
 use bloomery_gpu_deepseek41::prompt_walk::{self, BatchBufs};
 use bloomery_gpu_deepseek41::transpose::TransposeKernels;
 use bloomery_levers::HostCfg;
@@ -911,8 +911,8 @@ impl Shape {
             softcap: hp.softcap,
         };
         // The lightning indexer's own head counts are the kernel's.
-        if sh.idx_heads != bloomery_gpu_deepseek41::indexer::HEADS
-            || sh.idx_d != bloomery_gpu_deepseek41::indexer::HEAD_DIM
+        if sh.idx_heads != bloomery_gpu::indexer::HEADS
+            || sh.idx_d != bloomery_gpu::indexer::HEAD_DIM
         {
             return Err(GpuError::shape(
                 WHAT,
@@ -920,8 +920,8 @@ impl Shape {
                     "the indexer has {} heads of {}, the kernels run {} of {}",
                     sh.idx_heads,
                     sh.idx_d,
-                    bloomery_gpu_deepseek41::indexer::HEADS,
-                    bloomery_gpu_deepseek41::indexer::HEAD_DIM
+                    bloomery_gpu::indexer::HEADS,
+                    bloomery_gpu::indexer::HEAD_DIM
                 ),
             ));
         }

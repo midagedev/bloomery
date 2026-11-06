@@ -1,0 +1,427 @@
+//! Indexer keys projected from a layer's input row: a LayerNorm with a gain
+//! and a bias, the turn of the last `n_dims` values, a Hadamard transform and
+//! an f16 row in the index-key cache, and the cores every index-key form
+//! shares (the lane layout, the transform, [`HT_SCALE`]). V4.1's compressor
+//! form (its own crate) and the models whose keys come from the input
+//! (`IndexKeys::FromInput`: Mistral Large 4, and the lightning index keys of
+//! DeepSeek) call the same transform, so the cache rows `ds41_indexer_score`
+//! reads are one format.
+//!
+//! [`IndexKeyKernels::enqueue_index_key_input`] takes the projection of the
+//! input row (the caller's gemv, `[m][WIDTH]`), a LayerNorm with a gain and a
+//! bias, the tail turn at the token's position, the Hadamard transform and
+//! the f16 row at that position, one warp per token. The norm's `eps` and
+//! the tail's `n_dims` are launch arguments: a model whose key norm has
+//! another epsilon, or whose keys carry no rope (`n_dims` 0, the table is not
+//! read), launches the same kernel.
+//!
+//! Numeric contract: the rope is `rope_table::rope_pair_rn`, ik's unfused
+//! rotation; the transform is ik's `fast_ht` (`iqk_cpu_ops.cpp`) op for op
+//! (butterflies at `h = 1, 2, 4, …, 64`, the lower value `x + y`, the upper
+//! `x − y`, then one multiply by [`HT_SCALE`]), so on the same input it is
+//! bit-identical; the cache value is its f16 rounding (to nearest even). The
+//! key's input is token-major, `x[t·WIDTH ..]` for token `t`. The LayerNorm
+//! sums in f64 as the GLM index key's does (`latent::index_key_append`), the
+//! lanes holding contiguous values here: the mean `(sum / WIDTH) as f32`, each
+//! deviation `x − mean` in f32, the variance `(Σ dev² / WIDTH) as f32` over f32
+//! squares added in f64, the scale `1 / sqrt(var + eps)` in f32, the value
+//! `((dev · scale) · gain) + bias`, each op rounded on its own; the lane sums
+//! are added in the lane's value order and then by the xor butterfly (16, 8,
+//! 4, 2, 1) in f64.
+//!
+//! No silent failure: a position at or past the cache's rows raises
+//! `FaultSite::CachePos` and the token writes nothing; a variance that is not
+//! finite makes the scale NaN, and a stored value that is not finite (a
+//! non-finite input or scale, a value past f16's range) raises
+//! `FaultSite::CacheValue` with the row written as computed. The tokens of one
+//! launch hold distinct positions (the caller's contract).
+
+use crate::flash::{f16_finite, f32_to_f16_bits};
+use crate::latent::warp_sum_f64;
+use crate::rope_table::rope_pair_rn;
+use crate::{DeviceTensor, FaultSink, FaultSite, GpuError, launch_u32};
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
+use cuda_device::float::{add_rn_f32, mul_rn_f32};
+use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread, warp};
+use cuda_host::cuda_module;
+use std::f32::consts::FRAC_1_SQRT_2;
+use std::sync::Arc;
+
+/// Lanes of a warp.
+const LANES: u32 = 32;
+
+/// Warps of an input-form block, and its threads.
+const INPUT_WARPS: usize = 4;
+const INPUT_THREADS: u32 = INPUT_WARPS as u32 * LANES;
+/// Values one lane owns: `PER_LANE·lane ..`, contiguous — the transform's
+/// first two stages stay in the lane, the other five are lane butterflies.
+pub const PER_LANE: usize = 4;
+/// Values of an index key (`indexer.head_size`).
+pub const WIDTH: usize = PER_LANE * LANES as usize;
+const _: () = assert!(WIDTH == 128);
+
+/// `fast_ht`'s final scale for `n` values: `scale *= 0.707106781f` once per
+/// butterfly stage, each product rounded to f32, from 1. That literal is
+/// `FRAC_1_SQRT_2` as an f32 (both round to `0x3f3504f3`).
+const fn ht_scale(n: usize) -> f32 {
+    let mut s = 1.0f32;
+    let mut h = 1;
+    while h < n {
+        s *= FRAC_1_SQRT_2;
+        h <<= 1;
+    }
+    s
+}
+
+/// The Hadamard transform's scale for [`WIDTH`] values: seven stages.
+pub const HT_SCALE: f32 = ht_scale(WIDTH);
+
+// ------------------------------------------------------------------ cores
+
+/// Four contiguous f32 at `base`.
+///
+/// # Safety
+/// `base + 4 <= x.len()`.
+#[inline(always)]
+pub unsafe fn load4(x: &[f32], base: usize) -> [f32; PER_LANE] {
+    // SAFETY: base + 3 < x.len() by this fn's contract.
+    unsafe {
+        [
+            *x.get_unchecked(base),
+            *x.get_unchecked(base + 1),
+            *x.get_unchecked(base + 2),
+            *x.get_unchecked(base + 3),
+        ]
+    }
+}
+
+/// The transform's stages `h = 1, 2`, inside the lane's four values.
+#[inline(always)]
+fn ht_lane(n: [f32; PER_LANE]) -> [f32; PER_LANE] {
+    let a = [n[0] + n[1], n[0] - n[1], n[2] + n[3], n[2] - n[3]];
+    [a[0] + a[2], a[1] + a[3], a[0] - a[2], a[1] - a[3]]
+}
+
+/// The transform's stage `h = PER_LANE·m` across lanes `lane` and
+/// `lane ^ m`: the lower lane keeps `x + y`, the upper `x − y`, `x` the
+/// lower value. Every lane of the warp calls it (a warp collective).
+#[inline(always)]
+fn ht_cross(b: [f32; PER_LANE], lane: u32, m: u32) -> [f32; PER_LANE] {
+    let p = [
+        warp::shuffle_xor_f32(b[0], m),
+        warp::shuffle_xor_f32(b[1], m),
+        warp::shuffle_xor_f32(b[2], m),
+        warp::shuffle_xor_f32(b[3], m),
+    ];
+    if lane & m == 0 {
+        [b[0] + p[0], b[1] + p[1], b[2] + p[2], b[3] + p[3]]
+    } else {
+        [p[0] - b[0], p[1] - b[1], p[2] - b[2], p[3] - b[3]]
+    }
+}
+
+/// The transform's seven butterfly stages over a warp's [`WIDTH`] values,
+/// lane `lane` holding `PER_LANE·lane ..`: [`ht_lane`], then [`ht_cross`]
+/// at lane distances 1, 2, 4, 8, 16. The caller multiplies by
+/// [`HT_SCALE`]. Every lane of the warp calls it (a warp collective).
+#[inline(always)]
+pub fn ht_warp(n: [f32; PER_LANE], lane: u32) -> [f32; PER_LANE] {
+    let mut h = ht_lane(n);
+    let mut m = 1;
+    while m < LANES {
+        h = ht_cross(h, lane, m);
+        m <<= 1;
+    }
+    h
+}
+
+/// The LayerNorm's statistics of a [`WIDTH`]-value key a warp holds, lane
+/// `l` the values `PER_LANE·l ..`: each value's deviation from the mean and
+/// the scale `1 / sqrt(var + eps)`, NaN where the variance is not finite (the
+/// module doc's order). Every lane of the warp calls it (a warp collective).
+#[inline(always)]
+fn ln_dev_scale(x: [f32; PER_LANE], eps: f32) -> ([f32; PER_LANE], f32) {
+    let mut s1 = 0.0f64;
+    s1 += f64::from(x[0]);
+    s1 += f64::from(x[1]);
+    s1 += f64::from(x[2]);
+    s1 += f64::from(x[3]);
+    let mean = (warp_sum_f64(s1) / WIDTH as f64) as f32;
+    let dev = [x[0] - mean, x[1] - mean, x[2] - mean, x[3] - mean];
+    let mut s2 = 0.0f64;
+    s2 += f64::from(mul_rn_f32(dev[0], dev[0]));
+    s2 += f64::from(mul_rn_f32(dev[1], dev[1]));
+    s2 += f64::from(mul_rn_f32(dev[2], dev[2]));
+    s2 += f64::from(mul_rn_f32(dev[3], dev[3]));
+    let var = (warp_sum_f64(s2) / WIDTH as f64) as f32;
+    let scale = if var.is_finite() {
+        1.0 / (var + eps).sqrt()
+    } else {
+        f32::NAN
+    };
+    (dev, scale)
+}
+
+// ---------------------------------------------------------------- kernels
+
+#[cuda_module]
+mod index_key_kernels {
+    use super::*;
+
+    /// One warp per token, four a block: token `t`'s key is `x[t·128 ..]`
+    /// (the projection of its layer's input), normalized by the LayerNorm of
+    /// the module doc (`gain`, `bias`, `eps`), its last `n_dims` values turned
+    /// by the table at `cs[t·n_dims ..]` (two pairs per lane; none when
+    /// `n_dims` is 0), transformed and rounded to f16 into row `pos[t]` of
+    /// `cache` (`rows` rows of 128). A token whose position leaves the cache
+    /// writes nothing. The guards read only warp-uniform values, so every
+    /// lane reaches the collectives.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            x.len() >= m * 128,
+            gain.len() >= 128,
+            bias.len() >= 128,
+            pos.len() >= m,
+            cs.len() >= m * n_dims,
+            cache.len() >= rows * 128
+        )
+    )]
+    pub fn ds41_index_key_input(
+        x: &[f32],
+        gain: &[f32],
+        bias: &[f32],
+        pos: &[u32],
+        cs: &[f32],
+        eps: f32,
+        n_dims: u32,
+        rows: u32,
+        m: u32,
+        fault: FaultSink,
+        mut cache: DisjointSlice<u16>,
+    ) {
+        let tid = thread::threadIdx_x();
+        let t = thread::blockIdx_x() as usize * INPUT_WARPS + (tid / LANES) as usize;
+        if t >= m as usize {
+            return;
+        }
+        let lane = tid % LANES;
+        // SAFETY: t < m <= pos.len() by the launch contract.
+        let row = unsafe { *pos.get_unchecked(t) } as usize;
+        if row >= rows as usize {
+            if lane == 0 {
+                fault.raise(FaultSite::CachePos);
+            }
+            return;
+        }
+        let v = PER_LANE * lane as usize;
+        // SAFETY: t < m, so t·128 + v + 4 <= m·128 <= x.len().
+        let k = unsafe { load4(x, t * WIDTH + v) };
+        let (dev, scale) = ln_dev_scale(k, eps);
+        // SAFETY: v + 4 <= 128 <= gain.len() and bias.len().
+        let (gw, bw) = unsafe { (load4(gain, v), load4(bias, v)) };
+        // Each product rounded on its own: a plain multiply feeding the
+        // add would be contracted into a fused one.
+        let mut n = [
+            add_rn_f32(mul_rn_f32(mul_rn_f32(dev[0], scale), gw[0]), bw[0]),
+            add_rn_f32(mul_rn_f32(mul_rn_f32(dev[1], scale), gw[1]), bw[1]),
+            add_rn_f32(mul_rn_f32(mul_rn_f32(dev[2], scale), gw[2]), bw[2]),
+            add_rn_f32(mul_rn_f32(mul_rn_f32(dev[3], scale), gw[3]), bw[3]),
+        ];
+        let nd = n_dims as usize;
+        let tail0 = WIDTH - nd;
+        if v >= tail0 {
+            // SAFETY: v − tail0 + 4 <= n_dims (v <= 124), so the four table
+            // values sit inside token t's table, below m·n_dims <= cs.len().
+            let c = unsafe { load4(cs, t * nd + v - tail0) };
+            let (a0, a1) = rope_pair_rn(n[0], n[1], c[0], c[1]);
+            let (a2, a3) = rope_pair_rn(n[2], n[3], c[2], c[3]);
+            n = [a0, a1, a2, a3];
+        }
+        let h = ht_warp(n, lane);
+        let h = [
+            f32_to_f16_bits(mul_rn_f32(h[0], HT_SCALE)),
+            f32_to_f16_bits(mul_rn_f32(h[1], HT_SCALE)),
+            f32_to_f16_bits(mul_rn_f32(h[2], HT_SCALE)),
+            f32_to_f16_bits(mul_rn_f32(h[3], HT_SCALE)),
+        ];
+        let base = row * WIDTH + v;
+        // SAFETY: base + 4 <= (row + 1)·128 <= rows·128 <= cache.len(); one
+        // warp owns the position's row (distinct positions, the caller's
+        // contract) and the lane its four values.
+        unsafe {
+            *cache.get_unchecked_mut(base) = h[0];
+            *cache.get_unchecked_mut(base + 1) = h[1];
+            *cache.get_unchecked_mut(base + 2) = h[2];
+            *cache.get_unchecked_mut(base + 3) = h[3];
+        }
+        if !(f16_finite(h[0]) & f16_finite(h[1]) & f16_finite(h[2]) & f16_finite(h[3])) {
+            fault.raise(FaultSite::CacheValue);
+        }
+    }
+}
+
+// -------------------------------------------------------------- launchers
+
+/// [`IndexKeyKernels::enqueue_index_key_input`]'s arguments. `x` holds `m`
+/// projections of [`WIDTH`], token-major; `gain` and `bias` the key norm's
+/// weights; `pos` the `m` positions (the cache rows the keys land on) and
+/// `cs` the tokens' rope tables (`n_dims` values a token, `[cos, sin, …]`;
+/// not read when `n_dims` is 0, the table of a layer with no rope);
+/// `cache` is the index-key cache, a row of [`WIDTH`] f16 per position.
+pub struct IndexKeyInputArgs<'a> {
+    pub x: &'a DeviceBuffer<f32>,
+    pub gain: &'a DeviceBuffer<f32>,
+    pub bias: &'a DeviceBuffer<f32>,
+    pub pos: &'a DeviceBuffer<u32>,
+    pub cs: &'a DeviceBuffer<f32>,
+    pub eps: f32,
+    pub n_dims: usize,
+    pub m: usize,
+    pub cache: &'a mut DeviceTensor<u16>,
+    /// Where a position past the cache and a key value that is not finite
+    /// are raised (the launch's layer).
+    pub fault: FaultSink,
+}
+
+/// The loaded input-form index-key module. Owns no stream: each enqueue takes
+/// the engine stream, so its launches order with the rest of the step and
+/// capture.
+pub struct IndexKeyKernels {
+    module: index_key_kernels::LoadedModule,
+}
+
+impl IndexKeyKernels {
+    /// Load this file's device bundle into `ctx`. Load-time only.
+    pub fn load(ctx: &Arc<CudaContext>) -> Result<IndexKeyKernels, GpuError> {
+        // SAFETY: this crate owns the embedded device bundle produced for the
+        // module above; the launcher checks its launch contract.
+        let module = unsafe { crate::shared_module!(index_key_kernels, ctx)? };
+        Ok(IndexKeyKernels { module })
+    }
+
+    /// Enqueue the keys of `m` tokens projected from their layer's input:
+    /// LayerNorm, tail rope, transform, f16 row at each token's position
+    /// (the module doc's input form). One warp a token, four a block.
+    /// Refused before the launch: no token, a tail that is not a whole
+    /// number of lanes' four values (`n_dims` zero or a multiple of four at
+    /// most [`WIDTH`]), a cache of no rows or not [`WIDTH`] wide, short rows,
+    /// weights, positions or tables. Asynchronous, allocation-free,
+    /// capturable.
+    pub fn enqueue_index_key_input(
+        &self,
+        stream: &CudaStream,
+        args: IndexKeyInputArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_index_key_input";
+        let IndexKeyInputArgs {
+            x,
+            gain,
+            bias,
+            pos,
+            cs,
+            eps,
+            n_dims,
+            m,
+            cache,
+            fault,
+        } = args;
+        if m == 0 {
+            return Err(GpuError::shape(what, "no token: m must be at least 1"));
+        }
+        if !n_dims.is_multiple_of(PER_LANE) || n_dims > WIDTH {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!(
+                    "the tail is two pairs per lane: n_dims must be zero or a multiple of \
+                     {PER_LANE} at most {WIDTH}, got {n_dims}"
+                ),
+            });
+        }
+        if cache.cols() != WIDTH || cache.rows() == 0 {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!(
+                    "the cache is {}x{}, want rows of {WIDTH} and at least one",
+                    cache.rows(),
+                    cache.cols()
+                ),
+            });
+        }
+        if x.len() < m * WIDTH
+            || gain.len() < WIDTH
+            || bias.len() < WIDTH
+            || pos.len() < m
+            || cs.len() < m * n_dims
+        {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!(
+                    "x.len() {} (need {}), gain.len() {} and bias.len() {} (need {WIDTH}), \
+                     pos.len() {} (need {m}), cs.len() {} (need {})",
+                    x.len(),
+                    m * WIDTH,
+                    gain.len(),
+                    bias.len(),
+                    pos.len(),
+                    cs.len(),
+                    m * n_dims
+                ),
+            });
+        }
+        let rows = launch_u32(what, "rows", cache.rows())?;
+        launch_u32(what, "rows * WIDTH", cache.rows() * WIDTH)?;
+        let grid = launch_u32(what, "grid", m.div_ceil(INPUT_WARPS))?;
+        let prep = self
+            .module
+            .prepare_ds41_index_key_input(LaunchConfig1D::new(grid, INPUT_THREADS, 0))?;
+        self.module.ds41_index_key_input(
+            stream,
+            &prep,
+            x,
+            gain,
+            bias,
+            pos,
+            cs,
+            eps,
+            launch_u32(what, "n_dims", n_dims)?,
+            rows,
+            launch_u32(what, "m", m)?,
+            fault,
+            cache.buf_mut(),
+        )?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HT_SCALE, WIDTH};
+    use std::f32::consts::FRAC_1_SQRT_2;
+    use std::hint::black_box;
+
+    /// The transform's scale is `fast_ht`'s loop run at runtime: seven f32
+    /// products of ik's `0.707106781f` from 1, not a constant folded another
+    /// way — and that literal is the f32 `FRAC_1_SQRT_2`.
+    #[test]
+    fn ht_scale_is_fast_ht_loop() {
+        let ik: f32 = black_box("0.707106781")
+            .parse()
+            .expect("ik's literal parses");
+        assert_eq!(ik.to_bits(), FRAC_1_SQRT_2.to_bits());
+        let mut s = 1.0f32;
+        let mut h = 1;
+        while h < black_box(WIDTH) {
+            s *= ik;
+            h <<= 1;
+        }
+        assert_eq!(HT_SCALE.to_bits(), s.to_bits());
+    }
+}
