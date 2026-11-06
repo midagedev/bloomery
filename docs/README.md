@@ -19,6 +19,7 @@ in [`docs/bloomery/`](https://github.com/midagedev/rig-log/tree/main/docs/bloome
 | [`pi.md`](pi.md) | pi on a local model: the smallest first request of the surveyed agents, on an NVIDIA card or a Mac |
 | [`dsh.md`](dsh.md) | DeepSeek Harness (dsh) on DeepSeek-V4.1-Flash: the server, the profile patch, what to expect |
 | [`serving.md`](serving.md) | The serving guide: start, slots and context, drafts, placement, settings, API keys, every route, limits |
+| [`quantize.md`](quantize.md) | `bloomery-quantize`: the final quantized set in one pass, byte-identical to llama-quantize's (IQ1_S and IQ2_XXS experts on the card, the trunk by the host's K-quant rules); the plan, the room, the proof, the resource timeline |
 | [`models.md`](models.md) | The recommended files and what each model needs in GPU, RAM and disk |
 | [`performance.md`](performance.md) | The numbers' conditions, why it is fast, how it is verified, recorded sessions |
 | [`dgx-spark.md`](dgx-spark.md) | DGX Spark (GB10): install, Qwen3.8's checkpoint folders, slots, context and memory, speed |

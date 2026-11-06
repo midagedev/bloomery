@@ -58,6 +58,9 @@ fast card set, see [Which coding agent](docs/agents.md#which-coding-agent).
   mlx-community's 4-bit folders as downloaded. Q4_K_M GGUF files run, unverified (Qwen3.6 also from `UD-Q4_K_XL`).
   Ornith-1.5-35B and MiniCPM-V 4.7 35B-A3B (Q4_K_M, text only) run, unverified. Prompts run in batched passes, and a
   follow-up turn reads only its new messages ([below](#apple-silicon)).
+- **A quantizer that writes the final set.** `bloomery-quantize` writes a GGUF set's routed-expert stacks as IQ1_S or
+  IQ2_XXS on the card and every other tensor by the host's K-quant rules, the metadata and shard layout as
+  `llama-quantize` writes them, byte-identical to its output for the same input and options ([`docs/quantize.md`](docs/quantize.md)).
 - **llama-server compatible.** The same HTTP API (OpenAI and Anthropic), GGUF files and flag spellings, including the
   placement flags (`-dev`, `-ts`, `-ngl`, `--cpu-moe`, `-ot`, `--fit`) with llama's meaning. Your client works
   unchanged ([Use](#use)).
@@ -376,6 +379,7 @@ start screen), [@Burntgogi](https://github.com/Burntgogi) (the common owners eve
 | [`docs/claude-code.md`](docs/claude-code.md) | Claude Code on a local model, on an NVIDIA card or a Mac, with measured first-turn times |
 | [`docs/pi.md`](docs/pi.md) | pi on a local model: the smallest first request of the surveyed agents, on an NVIDIA card or a Mac |
 | [`docs/dsh.md`](docs/dsh.md) | DeepSeek Harness (dsh) on DeepSeek-V4.1-Flash: the server, the profile patch, what to expect |
+| [`docs/quantize.md`](docs/quantize.md) | `bloomery-quantize`: the final quantized set in one pass (IQ1_S and IQ2_XXS experts on the card, the trunk by the host's K-quant rules), how its bytes are proved, the resource timeline |
 | [`docs/models.md`](docs/models.md) | Recommended files and what each model needs |
 | [`docs/numbers.md`](docs/numbers.md) | Every measured table beyond the Status tables: two cards, older releases, other cards and Macs |
 | [`docs/performance.md`](docs/performance.md) | Number conditions, why it is fast, verification, recorded sessions |

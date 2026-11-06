@@ -13,6 +13,10 @@ https://github.com/midagedev/bloomery (the Mac page: `docs/mac.md`).
 | `bin/prepare` | optional: writes an MLX 4-bit checkpoint folder (mlx-community) as one GGUF split |
 | `serving.md` | the HTTP API's reference: its routes, the request fields each reads or refuses and the error objects (its flags and seats are the Linux binary's) |
 
+`bloomery-quantize` (IQ1_S and IQ2_XXS quantization on the card) is not in this archive: it links the CUDA backend, and cargo
+refuses to build it without it (`required-features = ["gpu"]`), so a Mac has no binary of it, not even for its `--cpu` path. It is in the
+Linux archives (`docs/quantize.md` in the repository).
+
 ## Requirements
 
 - An Apple Silicon Mac with macOS 26.2 or newer; an older macOS is refused by name at the start.

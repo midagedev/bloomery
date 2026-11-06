@@ -187,3 +187,74 @@ fn imatrix_weights_divide_by_counts() {
     assert!(imatrix_weights(&m, "u").is_err());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// An imatrix file holding tensor `t`: `sums` over `counts.len()` experts.
+fn imatrix_file(dir: &std::path::Path, file: &str, sums: &[f32], counts: &[f32]) -> crate::Gguf {
+    use crate::write::{Layout, TensorDecl, Writer};
+    let f32_bytes = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+    let decl = |name: &str, n: usize| TensorDecl {
+        name: name.to_string(),
+        dims: vec![n as u64],
+        type_id: 0,
+        nbytes: 4 * n as u64,
+    };
+    let layout = Layout::new(
+        &[],
+        vec![
+            decl("t.in_sum2", sums.len()),
+            decl("t.counts", counts.len()),
+        ],
+    )
+    .unwrap();
+    let mut w = Writer::new(Vec::new(), layout).unwrap();
+    w.tensor("t.in_sum2", &f32_bytes(sums)).unwrap();
+    w.tensor("t.counts", &f32_bytes(counts)).unwrap();
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join(file), w.finish().unwrap()).unwrap();
+    crate::Gguf::open(dir.join(file)).unwrap()
+}
+
+#[test]
+fn imatrix_refuses_unusable_sums_and_counts_by_name() {
+    let dir = std::env::temp_dir().join(format!("iq-quant-imatrix-bad-{}", std::process::id()));
+    let inf = f32::INFINITY;
+    let cases: [(&str, [f32; 4], [f32; 2], &str); 5] = [
+        (
+            "inf",
+            [1.0, inf, 1.0, 1.0],
+            [2.0, 2.0],
+            "t.in_sum2: entry 1 is inf, not finite",
+        ),
+        // an Inf sum under a zero count would hide behind the all-ones row
+        (
+            "inf0",
+            [1.0, 1.0, 1.0, inf],
+            [2.0, 0.0],
+            "t.in_sum2: entry 3 is inf, not finite",
+        ),
+        (
+            "neg",
+            [1.0, 1.0, -0.5, 1.0],
+            [2.0, 2.0],
+            "t.in_sum2: entry 2 is -0.5, negative",
+        ),
+        (
+            "negc",
+            [1.0; 4],
+            [2.0, -1.0],
+            "t.counts: entry 1 is -1, negative",
+        ),
+        (
+            "nanc",
+            [1.0; 4],
+            [f32::NAN, 1.0],
+            "t.counts: entry 0 is NaN, not finite",
+        ),
+    ];
+    for (file, sums, counts, want) in cases {
+        let m = imatrix_file(&dir, file, &sums, &counts);
+        let e = imatrix_weights(&m, "t").unwrap_err().to_string();
+        assert!(e.ends_with(want), "{file}: {e}");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}

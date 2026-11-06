@@ -4,8 +4,11 @@
 //! against ggml's (`iq_quant_ref`, `just build-iq-quant-ref`). Reads the set,
 //! writes only the oracle's inputs and outputs under `--scratch`.
 //!
-//!   iq_quant_probe <first shard> --tensor NAME --type iq1_s|iq2_xxs
-//!       [--imatrix FILE] [--batch N] [--check E,E,...] [--scratch DIR]
+//!   iq_quant_probe <first shard> [--tensor NAME] --type iq1_s|iq2_xxs
+//!       [--imatrix FILE] [--batch N] [--check E,E,...|none] [--scratch DIR]
+//!
+//! `--tensor` defaults to the set's first routed-expert stack (`*_exps.weight`, three dims); `--check none` runs
+//! no oracle (the timing runner's, `tools/ref/quant-measure.sh`).
 //!
 //! Without `--imatrix` the importance is a fixed synthetic vector (seeded,
 //! positive), named so in the output: the bytes still must equal ggml's on
@@ -41,7 +44,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 struct Args {
     first: PathBuf,
-    tensor: String,
+    tensor: Option<String>,
     kind: IqKind,
     imatrix: Option<PathBuf>,
     batch: usize,
@@ -54,7 +57,7 @@ fn args() -> Result<Args, GateError> {
     let mut it = std::env::args().skip(1);
     let first = PathBuf::from(
         it.next()
-            .ok_or("usage: iq_quant_probe <first shard> --tensor NAME --type T")?,
+            .ok_or("usage: iq_quant_probe <first shard> [--tensor NAME] --type T")?,
     );
     let (mut tensor, mut kind, mut imatrix) = (None, None, None);
     let (mut batch, mut check, mut scratch) =
@@ -72,14 +75,19 @@ fn args() -> Result<Args, GateError> {
             }
             "--imatrix" => imatrix = Some(PathBuf::from(v()?)),
             "--batch" => batch = v()?.parse()?,
-            "--check" => check = v()?.split(',').map(str::parse).collect::<Result<_, _>>()?,
+            "--check" => {
+                check = match v()?.as_str() {
+                    "none" => Vec::new(),
+                    list => list.split(',').map(str::parse).collect::<Result<_, _>>()?,
+                }
+            }
             "--scratch" => scratch = PathBuf::from(v()?),
             o => return Err(format!("unknown argument {o}").into()),
         }
     }
     Ok(Args {
         first,
-        tensor: tensor.ok_or("--tensor is required")?,
+        tensor,
         kind: kind.ok_or("--type is required")?,
         imatrix,
         batch: batch.max(1),
@@ -100,22 +108,30 @@ fn run() -> Result<(), GateError> {
         .into());
     }
     let set = gguf::Split::open(&a.first)?;
+    let tensor = match &a.tensor {
+        Some(t) => t.clone(),
+        None => set
+            .iter_tensors()
+            .find(|(_, t)| t.name.ends_with("_exps.weight") && t.dims.len() >= 3)
+            .map(|(_, t)| t.name.clone())
+            .ok_or("the set holds no routed-expert stack (*_exps.weight): --tensor NAME")?,
+    };
     let (_, t) = set
-        .find(&a.tensor)
-        .ok_or_else(|| format!("no tensor {} in the set", a.tensor))?;
+        .find(&tensor)
+        .ok_or_else(|| format!("no tensor {tensor} in the set"))?;
     let (ty, dims) = (t.ty, t.dims.clone());
     if !matches!(
         ty,
         GgmlType::MXFP4 | GgmlType::BF16 | GgmlType::F16 | GgmlType::F32
     ) {
-        return Err(format!("{} is {ty:?}: F32, F16, BF16 or MXFP4", a.tensor).into());
+        return Err(format!("{} is {ty:?}: F32, F16, BF16 or MXFP4", tensor).into());
     }
     let (ne0, ne1) = (dims[0] as usize, dims[1] as usize);
     let n_exp = dims.get(2).copied().unwrap_or(1) as usize;
-    let data = set.data(&a.tensor)?;
+    let data = set.data(&tensor)?;
     let expert_bytes = data.len() / n_exp;
     let qw: Vec<f32> = match &a.imatrix {
-        Some(p) => imatrix_weights(&gguf::Gguf::open(p)?, &a.tensor)?,
+        Some(p) => imatrix_weights(&gguf::Gguf::open(p)?, &tensor)?,
         None => {
             let mut s = 0x2545_f491_4f6c_dd1du64;
             (0..ne0 * n_exp)
@@ -138,7 +154,7 @@ fn run() -> Result<(), GateError> {
     }
     println!(
         "tensor {} {ty:?} {dims:?} ({:.2} GB) -> {:?}; importance: {}",
-        a.tensor,
+        tensor,
         data.len() as f64 / 1e9,
         a.kind,
         a.imatrix
@@ -199,7 +215,9 @@ fn run() -> Result<(), GateError> {
         let src: u32 = match ty {
             GgmlType::MXFP4 => 39,
             GgmlType::F32 => 0,
-            o => return Err(format!("the oracle reads F32 or MXFP4, not {o:?}").into()),
+            GgmlType::F16 => 1,
+            GgmlType::BF16 => 30,
+            o => return Err(format!("the oracle reads F32, F16, BF16 or MXFP4, not {o:?}").into()),
         };
         buf.extend_from_slice(&dst.to_le_bytes());
         buf.extend_from_slice(&src.to_le_bytes());

@@ -3583,6 +3583,14 @@ KEY_REACH_PINS = {
 }
 
 
+# PIN(2026-11-06): the recipes that build a shipped bin at the release feature list although the bin runs no code of the crates
+# those features link (the shipped-bin rule above forces the list): bloomery-quantize reads GGUF sets and never the hub or a
+# checkpoint folder. Each name is held to that by the recipe's own text: it must build only bloomery-quantize at the release list.
+KEY_REACH_RELEASE_LIST_ONLY = {
+    "gate-gpu-iq-quant": "bloomery-quantize (the shipped quantizer) is built at the release list and reads no hub or checkpoint code",
+}
+
+
 def _gate_recipes(side: Side) -> list[str]:
     return [n for n in sorted(side.recipes, key=lambda n: side.recipes[n].line) if n.startswith((GATE_PREFIX, WEEKLY_PREFIX))]
 
@@ -3620,7 +3628,7 @@ def key_reach_gap(side: Side, crate: str, names: list[str] | None = None) -> lis
     """The recipes whose key holds a file of `crate` while none of their targets reaches code of it. A recipe that
     builds no cargo target (a script that walks the tree) has no target to ask and is not counted."""
     held = [n for n in key_holders(side, crate, names if names is not None else _gate_recipes(side)) if side.graph.inputs(n).targets]
-    got = set(reach_holders(side, crate, held))
+    got = set(reach_holders(side, crate, held)) | set(KEY_REACH_RELEASE_LIST_ONLY)
     return [n for n in held if n not in got]
 
 
@@ -3638,7 +3646,7 @@ def cmd_gaps(args: argparse.Namespace) -> int:
         rows = []
         for c in crates:
             held = key_holders(side, c, names)
-            got = set(reach_holders(side, c, held))
+            got = set(reach_holders(side, c, held)) | set(KEY_REACH_RELEASE_LIST_ONLY)
             rows.append((len(held) - len(got), c, len(held), len(got), [n for n in held if n not in got]))
     finally:
         if tmp:
@@ -15703,7 +15711,7 @@ def _st_host_crates(fails: list[str], side: Side) -> None:
     # PIN(2026-10-29): qdot joined: its threads dependency's sysfs sibling lookup is Linux-only;
     # `cargo test -p bloomery-qdot` passes natively on macOS, replacing its threads rejection below.
     expect(
-        pure_now == ["bloomery-decision", "bloomery-device", "bloomery-embed", "bloomery-gguf", "bloomery-hf", "bloomery-jinja", "bloomery-levers", "bloomery-models", "bloomery-os", "bloomery-placement", "bloomery-qdot", "bloomery-record", "bloomery-refset", "bloomery-runtime", "bloomery-safetensors", "bloomery-sampler", "bloomery-serve", "bloomery-tokenizer", "bloomery-verbs", "bloomery-vision"],
+        pure_now == ["bloomery-decision", "bloomery-device", "bloomery-embed", "bloomery-gguf", "bloomery-hf", "bloomery-jinja", "bloomery-levers", "bloomery-models", "bloomery-os", "bloomery-placement", "bloomery-qdot", "bloomery-quantize", "bloomery-record", "bloomery-refset", "bloomery-runtime", "bloomery-safetensors", "bloomery-sampler", "bloomery-serve", "bloomery-tokenizer", "bloomery-verbs", "bloomery-vision"],
         f"pure: the real tree's pure crates are {pure_now} — a new member of the set is proven by `just mac-test` before this list takes it",
     )
     # the host chain's Linux-only items are the one owner's now, behind its own cfg, so a crate that holds
@@ -15723,12 +15731,13 @@ def _st_host_crates(fails: list[str], side: Side) -> None:
     # that crate.
     # PIN(2026-10-21): bloomery-device joined with the device contract's pure tests; bloomery-metal is an empty library off macOS.
     # PIN(2026-10-21): bloomery-record joined: the record core lifted out of gpu-gates
+    # PIN(2026-11-06): bloomery-quantize joined: the card quantizer's host rule and plan, native tests pass under `just mac-test`.
     # PIN(2026-10-22): bloomery-chain joined: the qwen3moe chain plan, host data moved out of bloomery-gpu.
     expect(
         host_now
         == [
             "bloomery-app", "bloomery-chain", "bloomery-decision", "bloomery-device", "bloomery-embed", "bloomery-engram", "bloomery-engram-lab", "bloomery-gguf", "bloomery-hf",
-            "bloomery-jinja", "bloomery-levers", "bloomery-metal", "bloomery-model", "bloomery-model-hf", "bloomery-models", "bloomery-os", "bloomery-placement", "bloomery-qdot", "bloomery-record", "bloomery-refset",
+            "bloomery-jinja", "bloomery-levers", "bloomery-metal", "bloomery-model", "bloomery-model-hf", "bloomery-models", "bloomery-os", "bloomery-placement", "bloomery-qdot", "bloomery-quantize", "bloomery-record", "bloomery-refset",
             "bloomery-runtime", "bloomery-safetensors", "bloomery-sampler", "bloomery-serve", "bloomery-threads", "bloomery-tokenizer", "bloomery-verbs",
             "bloomery-vision",
         ],

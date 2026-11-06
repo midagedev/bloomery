@@ -1011,6 +1011,20 @@ pub enum ImatrixError {
         sums: usize,
         counts: usize,
     },
+    #[error("imatrix {name}.{what}: entry {index} is {value}, not finite")]
+    NotFiniteInput {
+        name: String,
+        what: &'static str,
+        index: usize,
+        value: f32,
+    },
+    #[error("imatrix {name}.{what}: entry {index} is {value}, negative")]
+    Negative {
+        name: String,
+        what: &'static str,
+        index: usize,
+        value: f32,
+    },
     #[error("imatrix {name}: value {index} is {value}, not finite")]
     NotFinite {
         name: String,
@@ -1053,11 +1067,30 @@ fn f32_tensor(m: &crate::Gguf, tensor: &str, name: &str) -> Result<Vec<f32>, Ima
 /// `<name>.in_sum2` divided per expert by that expert's `<name>.counts`
 /// entry (rounded with `lround`, then made a float), or all ones for an
 /// expert counted zero times. `ne0 · n_expert` values, expert `e`'s at
-/// `e · ne0`. A value that is not finite is refused, as llama-quantize
-/// refuses the file.
+/// `e · ne0`. A sum or count that is not finite or is negative is refused by
+/// name and entry (a sum of squares and a call count are neither), and so is a
+/// quotient that is not finite, as llama-quantize refuses the file.
 pub fn imatrix_weights(m: &crate::Gguf, name: &str) -> Result<Vec<f32>, ImatrixError> {
     let sums = f32_tensor(m, &format!("{name}.in_sum2"), name)?;
     let counts = f32_tensor(m, &format!("{name}.counts"), name)?;
+    for (what, v) in [("in_sum2", &sums), ("counts", &counts)] {
+        if let Some((index, &value)) = v.iter().enumerate().find(|(_, x)| !x.is_finite()) {
+            return Err(ImatrixError::NotFiniteInput {
+                name: name.to_string(),
+                what,
+                index,
+                value,
+            });
+        }
+        if let Some((index, &value)) = v.iter().enumerate().find(|(_, x)| **x < 0.0) {
+            return Err(ImatrixError::Negative {
+                name: name.to_string(),
+                what,
+                index,
+                value,
+            });
+        }
+    }
     if counts.is_empty() || sums.len() % counts.len() != 0 {
         return Err(ImatrixError::Split {
             name: name.to_string(),

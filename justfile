@@ -779,10 +779,35 @@ gate-gpu-iq-sel *ARGS:
 
 # The card's IQ1_S and IQ2_XXS quantizer (bloomery_gpu::iq_quant) against ggml's bytes: iq_quant_ref linked to the K3.1
 # quantization tree's libggml-base (just build-iq-quant-ref) on MXFP4 rows over two experts and seven f32 cases, row for
-# row; the host rule (gguf::iq_quant) on two rows of each; iq_quant_set over a two-shard set (metadata, order and copies
-# the input's, the stacks ggml's, a short plan refused). No model file.
+# row, on F32, F16, BF16 and MXFP4 sources; the host rule (gguf::iq_quant) on two rows of each; bloomery-quantize over a
+# two-shard set (metadata, order and copies the input's, the stacks ggml's on the card and with --cpu, --check on and
+# its mismatch named, Inf, NaN, negative-importance and uncovered-type refusals named with no file left), and over the K3
+# fixture's set then the K3.1 quantization tree's llama-quantize equal to llama-quantize alone, byte for byte.
 gate-gpu-iq-quant:
-    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_iq_quant --bin iq_quant_set && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_iq_quant'
+    ./tools/box.sh '. tools/ref/ref-paths.sh && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_iq_quant && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-quantize && K3Q_TREE=$K3QUANT BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_iq_quant'
+
+# bloomery-quantize's host side (crates/quantize, no card): the type-rule matcher on llama-quantize's K3.1 rule shapes, the
+# finite scan of every source type, --check's row comparison, the plan's per-tensor decisions and refusals, the argument parser.
+gate-quantize:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-quantize --lib'
+
+# The host K-quant rules (gguf::kquant: Q4_K, Q5_K, Q6_K, Q8_0) against ggml's own quantizer (iq_quant_ref, just
+# build-iq-quant-ref) with and without an importance matrix, row for row over seeded row families, and the K3 fixture
+# end to end through the host writer (--cpu): bloomery-quantize's output equals llama-quantize's, whole file by sha256,
+# the plan equal to llama-quantize's own --dry-run. No card; the box's cores.
+gate-quantize-oracle:
+    ./tools/box.sh '. tools/ref/ref-paths.sh && export BLOOMERY_DATA K3Q_TREE=$K3QUANT && bash tools/gate.sh --release -p bloomery-quantize --test hw_kquant_oracle -- --ignored --nocapture --test-threads=1'
+
+# The K3 fixture end to end through the host writer (--cpu): bloomery-quantize's output equals llama-quantize's, whole
+# file by sha256. No card; the box's cores.
+gate-quantize-e2e:
+    ./tools/box.sh '. tools/ref/ref-paths.sh && export BLOOMERY_DATA K3Q_TREE=$K3QUANT && bash tools/gate.sh --release -p bloomery-quantize --test hw_fixture_e2e -- --ignored --nocapture --test-threads=1'
+
+# Plan equality: bloomery-quantize's resolution of every tensor's type and size against llama-quantize --dry-run's, tensor
+# for tensor, on the K3 fixture and, when K3Q_PLAN_IN (the K3-shaped set's first shard) and K3Q_PLAN_RULES (the tight map's
+# rules file) name files on the box, the K3.1 type maps over that set. Headers only; no card.
+gate-quantize-plan:
+    ./tools/box.sh '. tools/ref/ref-paths.sh && export BLOOMERY_DATA K3Q_TREE=$K3QUANT && bash tools/gate.sh --release -p bloomery-quantize --test hw_plan_equal -- --ignored --nocapture --test-threads=1'
 
 # gate-gpu-iq-quant's oracle: tools/ref/iq_quant_ref.cpp linked to the K3.1 quantization tree's libggml-base, into
 # $BLOOMERY_DATA/bin with the tree's commit and the library's md5 beside it. CPU only, no lease.
@@ -796,11 +821,17 @@ build-iq-quant-ref:
 iq-quant-probe *ARGS:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin iq_quant_probe && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh iq_quant_probe {{ARGS}}'
 
-# The K3.1 pipeline's intermediate set on the card (k31-quant.sh --gpu-quant runs it): the input set's shards again under
-# --out's prefix, each tensor llama-quantize's plan types IQ1_S or IQ2_XXS quantized to ggml's bytes, the rest copied.
-# ARGS: <first shard> --imatrix FILE --plan TSV --out PREFIX [--batch N].
-iq-quant-set *ARGS:
-    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin iq_quant_set && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh iq_quant_set {{ARGS}}'
+# The card quantizer's rate on one real routed-expert stack under the machine-wide lease, lead-only (tools/ref/quant-measure.sh): per
+# type the quantize call's weights/s with the card, PCIe and host terms apart, on the A6000, under docs/cards/quant-measure.card.
+# ARGS: <gguf file with the stack> [--tensor NAME] [--types iq1_s,iq2_xxs] [--batch N].
+quant-measure *ARGS:
+    ./tools/box.sh '{{precheck}} && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin iq_quant_probe && BLOOMERY_LEASE_CARD=docs/cards/quant-measure.card bash tools/ref/quant-measure.sh {{ARGS}}'
+
+# bloomery-quantize (docs/quantize.md; k31-quant.sh --gpu-quant runs it): the input set's shards again under the output
+# prefix, each routed-expert stack the rules type IQ1_S or IQ2_XXS quantized to ggml's bytes on the card, the rest copied.
+# ARGS: <first shard> <out prefix> --imatrix FILE --tensor-type-file FILE [--type T] [--plan] [--check N] [--cpu] [--card N].
+quantize *ARGS:
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-quantize && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh bloomery-quantize {{ARGS}}'
 
 # 행 사상 Q6_K gemv(bloomery_gpu::q6k_ids): MTP 드래프트가 빌리는 Q6_K `output` 머리. 합성 70,000행 "어휘"(K = 2,560,
 # UD-Q3_K_XL 머리의 형상)를 고정 시드로 짓고, m ∈ {1,2,4,8} × (1·7·65,536 정렬 id 맵 + 맵 없음)의 매 로짓을

@@ -258,6 +258,8 @@ if [ "$PLATFORM" = macos-arm64-metal ]; then
     ln -sf "$OPT/bin/prepare" "$PREFIX/bin/bloomery-prepare"
 else
     ln -sf "$OPT/bin/bloomery-serve" "$PREFIX/bin/bloomery-serve"
+    # a release before bloomery-quantize carries none: no dangling link
+    [ ! -x "$OPT/bin/bloomery-quantize" ] || ln -sf "$OPT/bin/bloomery-quantize" "$PREFIX/bin/bloomery-quantize"
 fi
 
 case ":$PATH:" in
@@ -269,9 +271,9 @@ if [ "$PLATFORM" = macos-arm64-metal ]; then
     echo "installed: $PREFIX/bin/bloomery-serve-metal, generate_metal, bloomery-prepare ($VERSION)"
     echo "try:       bloomery-serve-metal -m PATH/Qwen3.6-35B-A3B-Q4_K_M.gguf --port 8080"
 elif [ "$PLATFORM" = linux-aarch64-cuda-sm121a ]; then
-    echo "installed: $PREFIX/bin/bloomery-serve ($VERSION)"
+    echo "installed: $PREFIX/bin/bloomery-serve, bloomery-quantize ($VERSION)"
     echo "try:       bloomery-serve -m PATH/Qwen3.8-Flash-Next-FP4-Local --port 8080"
 else
-    echo "installed: $PREFIX/bin/bloomery-serve ($VERSION)"
+    echo "installed: $PREFIX/bin/bloomery-serve, bloomery-quantize ($VERSION)"
     echo "try:       bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M --port 8080"
 fi

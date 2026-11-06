@@ -94,7 +94,7 @@ else
   VERSION=$1 COMMIT=$2
 fi
 
-BINS=(bloomery-serve)
+BINS=(bloomery-serve bloomery-quantize)
 # PIN(2026-10-12): permit qdot's Q4_K AVX-512 VNNI bodies; every caller reaches them only when qdot::q4k_avx512 has
 # seen AVX-512 F, BW and VNNI beside the AVX2 kernels' AVX2, FMA and F16C.
 DISPATCHED='^(sha2::sha256::x86::digest_blocks|sha1::compress::x86::digest_blocks|crc32fast::specialized::pclmulqdq::calculate_avx(512|2)|qdot::dot_(q4k_q82x4_tile|lanes)_avx512::<[0-9]+>)$'

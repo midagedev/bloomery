@@ -46,6 +46,7 @@ pub mod engram;
 pub mod facts;
 pub mod iq_quant;
 pub mod iq_tables;
+pub mod kquant;
 pub mod qtype;
 pub mod quant;
 pub mod v41;

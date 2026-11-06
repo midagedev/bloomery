@@ -15,10 +15,15 @@
 #             at ctx 2048 -> $K3Q_WORK/kimi-k31-c<ctx>x<chunks>.imatrix.gguf. The text is 2 x chunks distinct documents of ctx/2 K3 tokens
 #             (4 chunks: 8 documents of 1024): half prose (docs/**/*.md, README.md), half code (tools/ref/*.cpp, the largest src/*.rs of
 #             distinct crates), laid out prose, code, ... so each chunk holds both; the source list is printed and kept as <text>.sources.
-#   quantize  llama-quantize --allow-requantize --imatrix <that> --tensor-type-file <rules> [--keep-split] <in> <out> <ftype>, the map
+#   quantize  --quantizer bloomery (default): bloomery-quantize writes the final set in one pass (the routed experts IQ1_S/IQ2_XXS on the
+#             card, every trunk tensor by the host's K-quant rules under the card's shadow, the metadata and shard layout as llama-quantize
+#             writes them, byte for byte; docs/quantize.md), straight into $qdir.partial, cross-checked against llama-quantize's own
+#             --dry-run plan, renamed when whole. No intermediate set. --quantizer llama: llama-quantize alone, or with --gpu-quant the
+#             two-step path below. The rest of this entry describes that command line, which both take:
+#             llama-quantize --allow-requantize --imatrix <that> --tensor-type-file <rules> [--keep-split] <in> <out> <ftype>, the map
 #             --map says (below), after llama-quantize's own --dry-run plan of every tensor's type and size over the input's headers
 #             (kept in $K3Q_WORK; the output is held to it tensor by tensor afterwards)
-#             With --gpu-quant, iq_quant_set (crates/gpu-gates, the card's IQ1_S/IQ2_XXS quantizer, ggml's bytes by gate-gpu-iq-quant)
+#             With --gpu-quant, bloomery-quantize (crates/gpu-gates, the card's IQ1_S/IQ2_XXS quantizer, ggml's bytes by gate-gpu-iq-quant)
 #             first writes the input's shards again with every tensor that plan types IQ1_S or IQ2_XXS already quantized (the imatrix's
 #             importance as llama-quantize computes it) and the rest copied, to --gpu-set; llama-quantize then reads that set and
 #             copies those tensors (their type is the target), quantizing only the trunk. The card set is removed once the output passes.
@@ -78,8 +83,10 @@
 #   --pred-s           print the predicted wall in whole seconds (no file is read) and exit: the box queue's BLOOMERY_Q_PRED_S
 #   --lease            smoke only: take the CPU lease with the smoke's card (the 1-thread rate is a measurement)
 #   --max-trunk-gb N   quantize: refuse when the plan's trunk class exceeds N GB (default 35 for tight; 0 = off)
-#   --gpu-quant        quantize: the IQ1_S/IQ2_XXS tensors on the card first (above); needs target/release/iq_quant_set (`just
-#                      iq-quant-set` builds it) and a card (tools/gpu-gate.sh takes its lock)     [K3Q_GPU_QUANT=1]
+#   --quantizer Q      quantize: bloomery (default) | llama: who writes the quantized set. It is part of the step's key and its marker
+#                      (a llama run's key is unchanged). --gpu-quant without it means llama; with --quantizer bloomery it is refused  [K3Q_QUANTIZER]
+#   --gpu-quant        quantize (--quantizer llama): the IQ1_S/IQ2_XXS tensors on the card first (above); needs target/release/bloomery-quantize (`just
+#                      quantize` builds it) and a card (tools/gpu-gate.sh takes its lock)     [K3Q_GPU_QUANT=1]
 #   --gpu-set DIR      --gpu-quant's card set, under $K3Q_WORK or --out-base (default $K3Q_WORK/<the output's name>.gpuset; it needs
 #                      GPUSET_PER_IN x the input's bytes, 0.66 TB for K3.1: a drive without the room is refused before the run)  [K3Q_GPU_SET]
 #   --hf-folder DIR    the K3.1 HF folder: prepare's input, the LICENSE and the source revision   [K3Q_HF_FOLDER] (/data/models/Kimi-K3.1-Pro)
@@ -141,7 +148,7 @@ say() { echo "k31-quant.sh: $*"; }
 case $1 in -h | --help) usage ;; esac
 STEP=$1
 shift
-DRY=0 SMOKE=0 DETACH=0 FORCE=0 PRED=0 USE_LEASE=0 IMATRIX_GPU=${K3Q_IMATRIX_GPU:-0} SEQS=${K3Q_SEQS:-1} GPUQ=${K3Q_GPU_QUANT:-0} GPU_SET=${K3Q_GPU_SET:-}
+DRY=0 SMOKE=0 DETACH=0 FORCE=0 PRED=0 USE_LEASE=0 IMATRIX_GPU=${K3Q_IMATRIX_GPU:-0} SEQS=${K3Q_SEQS:-1} GPUQ=${K3Q_GPU_QUANT:-0} GPU_SET=${K3Q_GPU_SET:-} QUANTIZER=${K3Q_QUANTIZER:-}
 MAP=${K3Q_MAP:-tight} REPO=midagedev/Kimi-K3.1-Pro-GGUF HF=${K3Q_HF_FOLDER:-/data/models/Kimi-K3.1-Pro} LICENSE_F='' SRC_REV='' PREPARE_BIN='' FOLLOW='' SHARD_GIB='' MAX_TRUNK=''
 TYPE=IQ1_S CTX='' CHUNKS='' IN=${K3Q_IN:-} CORPUS=${K3Q_CORPUS:-} SPECIAL=${K3Q_CORPUS_SPECIAL:-0} INDEXER=${K3Q_INDEXER:-} DSA=${K3Q_DSA_CONFIG:-}
 ARCH=${K3Q_ARCH:-kimi-k31} THREADS=${K3Q_THREADS:-} REF='' OUT_BASE=${K3Q_OUT_BASE:-/models} BUMP_GU='' BUMP_DN='' BUMP_SET=0
@@ -159,6 +166,10 @@ while [ $# -gt 0 ]; do
     --gpu-set)
       [ $# -ge 2 ] || die "$1 takes a value"
       GPU_SET=$2
+      shift ;;
+    --quantizer)
+      [ $# -ge 2 ] || die "$1 takes a value"
+      QUANTIZER=$2
       shift ;;
     --map | --repo | --hf-folder | --license | --source-rev | --prepare-bin | --follow | --shard-gib | --max-trunk-gb)
       [ $# -ge 2 ] || die "$1 takes a value"
@@ -180,6 +191,14 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+if [ -z "$QUANTIZER" ]; then
+  if [ "$GPUQ" = 1 ]; then QUANTIZER=llama; else QUANTIZER=bloomery; fi # --gpu-quant is the two-step path's flag
+fi
+case $QUANTIZER in
+  bloomery | llama) ;;
+  *) die "--quantizer $QUANTIZER: bloomery or llama" 64 ;;
+esac
+[ "$QUANTIZER" = llama ] || [ "$GPUQ" = 0 ] || die "--gpu-quant is the two-step path (a card set, then llama-quantize): with --quantizer bloomery the card writes the final set itself; drop --gpu-quant, or use --quantizer llama" 64
 case $STEP in
   imatrix | quantize | splice | all | rules | check | calib | plan | prepare | upload) ;;
   smoke) SMOKE=1 ;;
@@ -306,7 +325,7 @@ pred_splice() { # the receiving shard read, written and read back, at the drive'
 pred_of() { # <step> <bytes>
   case $1 in
     imatrix) pred_imatrix "$2" "$CHUNKS" "$CTX" ;;
-    quantize) if [ "$GPUQ" = 1 ]; then echo $(($(pred_gpuset "$2") + $(pred_quantize "$2"))); else pred_quantize "$2"; fi ;;
+    quantize) if [ "$QUANTIZER" = bloomery ]; then pred_gpuset "$2"; elif [ "$GPUQ" = 1 ]; then echo $(($(pred_gpuset "$2") + $(pred_quantize "$2"))); else pred_quantize "$2"; fi ;;
     splice) pred_splice ;;
   esac
 }
@@ -784,20 +803,20 @@ do_plan() {
   rm -f "$rules"
 }
 
-gpu_set() { # <imatrix> <output prefix>: --gpu-quant's card set (iq_quant_set over $IN with the plan $PLAN_TSV) -> $GSET; sets GFIRST
-  local im=$1 prefix=$2 marker gkey pred bound gq=$ROOT/target/release/iq_quant_set
+gpu_set() { # <imatrix> <output prefix> <rules file>: --gpu-quant's card set (bloomery-quantize over $IN with the rules $rules, cross-checked against the plan $PLAN_TSV) -> $GSET; sets GFIRST
+  local im=$1 prefix=$2 rules=$3 marker gkey pred bound gq=$ROOT/target/release/bloomery-quantize
   GSET=${GPU_SET:-$WORK/$prefix.gpuset}
   case $GSET in "$WORK"/* | "$OUT_BASE"/*) ;; *) die "--gpu-set $GSET: under $WORK or $OUT_BASE (a partial set is removed by name only there)" 64 ;; esac
   marker=$WORK/gpuset-$TAG.done
   pred=$(pred_gpuset "$IN_BYTES")
   bound=$(bound_of "$pred")
   GFIRST=$(named_first "$IN" "$GSET" "$prefix")
-  say "gpu-quant: iq_quant_set on the card -> $GSET ($(awk -v b="$IN_BYTES" -v g="$GPUSET_PER_IN" 'BEGIN { printf "%.0f", b * g / 1e9 }') GB derived): $K31_STACKS stacks x $GPU_STACK_S s of card (measured, the read under it) + the set written at $NVME_WRITE_GBS GB/s, scaled by the input's bytes; wall $(hms "$pred"), bound ${bound}s"
-  [ -x "$gq" ] || [ "$DRY" = 1 ] || die "no $gq: just iq-quant-set builds it (with no ARGS it stops at its usage)" 66
+  say "gpu-quant: bloomery-quantize on the card -> $GSET ($(awk -v b="$IN_BYTES" -v g="$GPUSET_PER_IN" 'BEGIN { printf "%.0f", b * g / 1e9 }') GB derived): $K31_STACKS stacks x $GPU_STACK_S s of card (measured, the read under it) + the set written at $NVME_WRITE_GBS GB/s, scaled by the input's bytes; wall $(hms "$pred"), bound ${bound}s"
+  [ -x "$gq" ] || [ "$DRY" = 1 ] || die "no $gq: just quantize builds it (with no ARGS it stops at its usage)" 66
   force_clean "$marker" "$GSET"
   partial_clean "$GSET.partial"
   if [ "$DRY" = 0 ]; then
-    gkey=$(key_of gpuset "$(sha_of "$gq")" "$(set_ident "$IN")" "$(sha_of "$im")" "$(sha_of "$PLAN_TSV")")
+    gkey=$(key_of gpuset "$(sha_of "$gq")" "$(set_ident "$IN")" "$(sha_of "$im")" "$(sha_of "$PLAN_TSV")" "$(sha_of "$rules")")
     if marker_state "$marker" "$gkey" "$GSET"; then
       say "gpu-quant: done before ($marker, $GSET): skipped"
       return 0
@@ -811,9 +830,9 @@ gpu_set() { # <imatrix> <output prefix>: --gpu-quant's card set (iq_quant_set ov
       { rmdir "$GSET.partial"; die "--gpu-set $GSET: its drive has $avail B free, the card set needs ~$need B (GPUSET_PER_IN x the input, +5 %): --gpu-set on a drive with the room" 65; }
   fi
   run gpuset "$bound" env -C "$ROOT" BLOOMERY_GATE_BOUND="$bound" BLOOMERY_GATE_CARD="${BLOOMERY_GATE_CARD:-any}" \
-    bash tools/gpu-gate.sh iq_quant_set "$IN" --imatrix "$im" --plan "${PLAN_TSV:-<the plan tsv>}" --out "$GSET.partial/$prefix" || fail_step gpuset $?
+    bash tools/gpu-gate.sh bloomery-quantize "$IN" "$GSET.partial/$prefix" --imatrix "$im" --tensor-type-file "$rules" --llama-plan "${PLAN_TSV:-<the plan tsv>}" || fail_step gpuset $?
   [ "$DRY" = 0 ] || return 0
-  [ -f "$(named_first "$IN" "$GSET.partial" "$prefix")" ] || die "iq_quant_set ended 0 but wrote no $(named_first "$IN" "$GSET.partial" "$prefix")" 65
+  [ -f "$(named_first "$IN" "$GSET.partial" "$prefix")" ] || die "bloomery-quantize ended 0 but wrote no $(named_first "$IN" "$GSET.partial" "$prefix")" 65
   mv "$GSET.partial" "$GSET"
   write_marker "$marker" "$gkey" "$GSET" "plan=$PLAN_TSV"
 }
@@ -822,7 +841,7 @@ do_quantize() {
   need_in
   CARD=k31-quantize
   [ "$SMOKE" = 0 ] || CARD=k31-smoke
-  [ -x "$Q" ] || [ "$DRY" = 1 ] || die "no llama-quantize at $Q: just build-k3-quant-tree" 66
+  [ -x "$Q" ] || [ "$DRY" = 1 ] || die "no llama-quantize at $Q: just build-k3-quant-tree (it is the plan's oracle for either quantizer)" 66
   local im qprefix qdir rules marker key pred bound qthreads pfirst args t0
   im=${IMATRIX:-$WORK/kimi-k31-c${CTX}x${CHUNKS}.imatrix.gguf}
   [ "$SMOKE" = 0 ] || im=${IMATRIX:-$WORK/smoke.imatrix.gguf}
@@ -840,7 +859,9 @@ do_quantize() {
   pred=$(pred_of quantize "$IN_BYTES")
   bound=$(bound_of "$pred")
   say "quantize: $IN ($IN_SHARDS shard(s), $IN_BYTES bytes) -> $qdir, --map $MAP, global type ${QTYPE:-$TYPE}, experts $TYPE, threads $qthreads"
-  if [ "$GPUQ" = 1 ]; then
+  if [ "$QUANTIZER" = bloomery ]; then
+    plan_line quantize "$IN_BYTES" "bloomery-quantize, one pass: the card's search of $K31_STACKS stacks x $GPU_STACK_S s (measured; the read is under its shadow) + the output written at $NVME_WRITE_GBS GB/s; the trunk's host K-quant rules ($K31_TRUNK_W x bytes/$K31_BYTES weights) run under the card's shadow (docs/quantize.md: the resource timeline)"
+  elif [ "$GPUQ" = 1 ]; then
     plan_line quantize "$IN_BYTES" "the card set ($K31_STACKS stacks x $GPU_STACK_S s, measured, + $GPUSET_PER_IN x bytes written at $NVME_WRITE_GBS GB/s) + llama-quantize over it (trunk weights $K31_TRUNK_W x bytes/$K31_BYTES / ($QUANT_EFF_THREADS threads x $QUANT_RATE_MW Mweights/s) + the set read at $NVME_READ_GBS GB/s + write $OUT_PER_IN x bytes at $NVME_WRITE_GBS GB/s)"
   else
     plan_line quantize "$IN_BYTES" "expert weights $K31_EXPERT_W x bytes/$K31_BYTES / ($QUANT_EFF_THREADS effective threads x $QUANT_RATE_MW Mweights/s, measured on 1 thread) + read $NVME_READ_GBS GB/s + write $OUT_PER_IN x bytes at $NVME_WRITE_GBS GB/s"
@@ -876,8 +897,12 @@ do_quantize() {
     if [ -e "$qdir" ] && [ ! -f "$marker" ]; then die "$qdir exists and no done marker says this run made it: --force removes it, or --out-base elsewhere" 65; fi
     key=$(key_of quantize "$MAP" "$TYPE" "$(sha_of "$Q")" "$(set_ident "$IN")" "$(sha_of "$im")" "$(sha_of "$rules")" "$qthreads")
     if [ "$GPUQ" = 1 ]; then
-      [ -x "$ROOT/target/release/iq_quant_set" ] || die "no $ROOT/target/release/iq_quant_set: just iq-quant-set builds it (with no ARGS it stops at its usage)" 66
-      key=$(key_of "$key" gpu "$(sha_of "$ROOT/target/release/iq_quant_set")")
+      [ -x "$ROOT/target/release/bloomery-quantize" ] || die "no $ROOT/target/release/bloomery-quantize: just quantize builds it (with no ARGS it stops at its usage)" 66
+      key=$(key_of "$key" gpu "$(sha_of "$ROOT/target/release/bloomery-quantize")")
+    fi
+    if [ "$QUANTIZER" = bloomery ]; then
+      [ -x "$ROOT/target/release/bloomery-quantize" ] || die "no $ROOT/target/release/bloomery-quantize: just quantize builds it (--quantizer llama runs llama-quantize alone)" 66
+      key=$(key_of "$key" bloomery "$(sha_of "$ROOT/target/release/bloomery-quantize")")
     fi
     if marker_state "$marker" "$key" "$qdir"; then
       QFIRST=$(named_first "$IN" "$qdir" "$qprefix")
@@ -888,28 +913,36 @@ do_quantize() {
   fi
   local qin=$IN
   if [ "$GPUQ" = 1 ]; then
-    gpu_set "$im" "$qprefix"
+    gpu_set "$im" "$qprefix" "$rules"
     qin=$GFIRST
   fi
   quant_args "$rules" "$im"
   args=("${QARGS[@]}")
   lease_on "$CARD"
   local tick=''
-  if [ "$DRY" = 0 ] && [ "$SMOKE" = 0 ]; then
+  if [ "$DRY" = 0 ] && [ "$SMOKE" = 0 ] && [ "$QUANTIZER" = llama ]; then
     # A progress line every two minutes (tensors converted so far, the routed experts' apart: 9.86e9 weights each): the rate is readable while the quantizer runs. fds 8 and 9 are
     # closed for it: a leftover ticker would hold the run lock and the lease.
     (while :; do sleep 120; printf '%s converted=%s experts=%s\n' "$(date +%s)" "$(grep -c 'converting to' "$LOGDIR/quantize.log" 2> /dev/null)" "$(grep -c 'converting to iq' "$LOGDIR/quantize.log" 2> /dev/null)" >> "$WORK/quantize.progress"; done) 8>&- 9>&- &
     tick=$!
   fi
   t0=$SECONDS
-  run quantize "$bound" "${NICE[@]}" env CUDA_VISIBLE_DEVICES= "$Q" "${args[@]}" "$qin" "$qdir.partial/$qprefix.gguf" "${QTYPE:-$TYPE}" "$qthreads"
+  if [ "$QUANTIZER" = bloomery ]; then
+    # one pass, the final set: the card for the IQ stacks (the smoke has none: --cpu), the plan cross-checked, the output named as llama-quantize names it
+    local cardarg=()
+    [ "$SMOKE" = 0 ] || cardarg=(--cpu)
+    run quantize "$bound" env -C "$ROOT" BLOOMERY_GATE_BOUND="$bound" BLOOMERY_GATE_CARD="${BLOOMERY_GATE_CARD:-any}" \
+      bash tools/gpu-gate.sh bloomery-quantize "${args[@]}" "${cardarg[@]}" --llama-plan "${PLAN_TSV:-<the plan tsv>}" "$qin" "$qdir.partial/$qprefix.gguf" "${QTYPE:-$TYPE}"
+  else
+    run quantize "$bound" "${NICE[@]}" env CUDA_VISIBLE_DEVICES= "$Q" "${args[@]}" "$qin" "$qdir.partial/$qprefix.gguf" "${QTYPE:-$TYPE}" "$qthreads"
+  fi
   local rc=$?
   [ -z "$tick" ] || { kill "$tick" 2> /dev/null; wait "$tick" 2> /dev/null; }
   [ "$rc" = 0 ] || fail_step quantize "$rc"
   [ "$DRY" = 0 ] || { lease_off; QFIRST=$(named_first "$IN" "$qdir" "$qprefix"); return 0; }
   lease_off
   pfirst=$(named_first "$IN" "$qdir.partial" "$qprefix")
-  [ -f "$pfirst" ] || die "llama-quantize ended 0 but $pfirst is not there (it names the shards from the output's prefix): $(find "$qdir.partial" -maxdepth 1 -type f | head -3 | tr '\n' ' ')" 65
+  [ -f "$pfirst" ] || die "$QUANTIZER ended 0 but $pfirst is not there (it names the shards from the output's prefix): $(find "$qdir.partial" -maxdepth 1 -type f | head -3 | tr '\n' ' ')" 65
   splice list --in "$pfirst" --tsv > "$WORK/quantize-$TAG.tsv" || die "the quantized set does not read back: $pfirst" 65
   # The output is the plan, tensor by tensor (names, dims, types); the ud map is held to the K3 table too.
   splice check-shape --in "$pfirst" --names "$PLAN_TSV" --types || die "the quantized set is not llama-quantize's own plan (names, dims and types, above)" 65
@@ -918,7 +951,7 @@ do_quantize() {
   fi
   mv "$qdir.partial" "$qdir"
   QFIRST=$(named_first "$IN" "$qdir" "$qprefix")
-  write_marker "$marker" "$key" "$qdir" "tensors=$(wc -l < "$WORK/quantize-$TAG.tsv" | tr -d ' ') map=$MAP type=$TYPE gpu=$GPUQ"
+  write_marker "$marker" "$key" "$qdir" "tensors=$(wc -l < "$WORK/quantize-$TAG.tsv" | tr -d ' ') map=$MAP type=$TYPE gpu=$GPUQ quantizer=$QUANTIZER"
   if [ "$GPUQ" = 1 ]; then
     rm -rf -- "$GSET" "$WORK/gpuset-$TAG.done"
     say "gpu-quant: the card set $GSET removed (llama-quantize copied its IQ1_S/IQ2_XXS tensors into $qdir)"
