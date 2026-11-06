@@ -62,10 +62,15 @@
 //! library's whole text read from PATH at run time, its tile ROWS weight rows
 //! by ACTS activation rows on THREADS threads, the activation tiles (`a`) or
 //! the weight tiles (`w`) fastest across the grid, timed as the arms
-//! `NAME_f16` and `NAME_f32`; a design is tried this way without a build),
+//! `NAME_f16` and `NAME_f32`, and as `NAME_h16` over half activation rows,
+//! the `Half` arm's, through the file's `gemm_<quant>_store_h16`; a design
+//! is tried this way without a build), `--tensor-src
+//! NAME:ROWS:ACTS:THREADS:ORDER:PATH` (the same for a tensor-op library's
+//! text, compiled at Metal 4 as `gemm_tensor.metal`'s program is),
 //! `--dump-source
 //! PATH` (write the engine library's text, the starting point of a `--src`
-//! file, and exit),
+//! file, and exit), `--dump-tensor-source PATH` (the tensor-op library's
+//! text, the starting point of a `--tensor-src` file, and exit),
 //! `--quant NAME` (repeatable), `--shape N:K:R` (repeatable: only these
 //! shapes, any N, K and R), `--pipelines` (print each pipeline's thread
 //! limit and exit), `--peak` (time the machine's own ruler,
@@ -212,8 +217,10 @@ enum Arm {
     Mlx(Operand),
     /// The shipped source with a variant's edits.
     Variant(&'static variants::Variant, Operand),
-    /// A whole library text read at run time (`--src`).
+    /// A whole library text read at run time (`--src`, `--tensor-src`).
     Source(&'static SourceArm, Operand),
+    /// The same library's f16 operand over half activation rows (`NAME_h16`).
+    SourceHalf(&'static SourceArm),
 }
 
 /// A `--src` arm: the library text read from a file, and the tile its
@@ -226,29 +233,32 @@ struct SourceArm {
     threads: usize,
     /// The activation tiles run fastest across the grid.
     acts_fast: bool,
+    /// A tensor-op program (`--tensor-src`), compiled at Metal 4.
+    tensor: bool,
 }
 
 impl SourceArm {
-    /// `NAME:ROWS:ACTS:THREADS:ORDER:PATH`, the file read now.
-    fn parse(spec: &str) -> Result<&'static Self, String> {
+    /// `NAME:ROWS:ACTS:THREADS:ORDER:PATH`, the file read now; `flag` is
+    /// `--src` or `--tensor-src`.
+    fn parse(flag: &str, spec: &str) -> Result<&'static Self, String> {
         let parts: Vec<&str> = spec.splitn(6, ':').collect();
         let [name, rows, acts, threads, order, path] = parts[..] else {
             return Err(format!(
-                "--src takes NAME:ROWS:ACTS:THREADS:ORDER:PATH, not {spec}"
+                "{flag} takes NAME:ROWS:ACTS:THREADS:ORDER:PATH, not {spec}"
             ));
         };
         let acts_fast = match order {
             "a" => true,
             "w" => false,
-            _ => return Err(format!("--src {name}: ORDER is a or w, not {order}")),
+            _ => return Err(format!("{flag} {name}: ORDER is a or w, not {order}")),
         };
         let whole = |v: &str, what: &str| {
             v.parse::<usize>().ok().filter(|&n| n > 0).ok_or(format!(
-                "--src {name}: {what} takes a positive whole number, not {v}"
+                "{flag} {name}: {what} takes a positive whole number, not {v}"
             ))
         };
         let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("--src {name}: reading {path}: {e}"))?;
+            .map_err(|e| format!("{flag} {name}: reading {path}: {e}"))?;
         Ok(Box::leak(Box::new(Self {
             name: name.to_string(),
             text,
@@ -256,6 +266,7 @@ impl SourceArm {
             acts: whole(acts, "ACTS")?,
             threads: whole(threads, "THREADS")?,
             acts_fast,
+            tensor: flag == "--tensor-src",
         })))
     }
 }
@@ -282,6 +293,7 @@ impl Arm {
             Self::Mlx(Operand::F32) => "mlx32".to_string(),
             Self::Variant(v, o) => format!("{}_{}", v.name, operand_name(o)),
             Self::Source(s, o) => format!("{}_{}", s.name, operand_name(o)),
+            Self::SourceHalf(s) => format!("{}_h16", s.name),
         }
     }
 
@@ -295,6 +307,11 @@ impl Arm {
             {
                 return Ok(Self::Source(s, operand));
             }
+        }
+        if let Some(stem) = name.strip_suffix("_h16")
+            && let Some(s) = sources.iter().find(|s| s.name == stem)
+        {
+            return Ok(Self::SourceHalf(s));
         }
         match name {
             "f16" => return Ok(Self::Engine(Operand::F16)),
@@ -380,7 +397,11 @@ impl Libs {
 
     fn source(&mut self, device: &MetalDevice, s: &'static SourceArm) -> Result<&Library, String> {
         if !self.sources.iter().any(|(name, _)| *name == s.name) {
-            let library = Library::from_source_text(device, &s.text).map_err(why)?;
+            let library = if s.tensor {
+                Library::tensor_from_source_text(device, &s.text).map_err(why)?
+            } else {
+                Library::from_source_text(device, &s.text).map_err(why)?
+            };
             self.sources.push((s.name.clone(), library));
         }
         Ok(self
@@ -415,8 +436,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
         println!(
             "metal_gemm_time [--trials N] [--warmups N] [--gflop N] [--arm NAME]... \
              [--only SUBSTRING]... [--quant NAME]... [--shape N:K:R]... [--copies N] [--trace] [--warm-ms N] [--hash] [--pipelines] \
-             [--src NAME:ROWS:ACTS:THREADS:ORDER:PATH]...\n\
-             metal_gemm_time --dump-source PATH\n\
+             [--src NAME:ROWS:ACTS:THREADS:ORDER:PATH]... [--tensor-src NAME:ROWS:ACTS:THREADS:ORDER:PATH]...\n\
+             metal_gemm_time --dump-source PATH | --dump-tensor-source PATH\n\
              metal_gemm_time --routed [--rows U]... [--skew S]... [--arm NAME]... [--hot] [--trials N] [--hash]"
         );
         return Ok(());
@@ -434,7 +455,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "--rows",
         "--skew",
         "--src",
+        "--tensor-src",
         "--dump-source",
+        "--dump-tensor-source",
     ] {
         if args.last().is_some_and(|a| a == name) {
             return Err(format!("{name} takes a value"));
@@ -496,10 +519,15 @@ fn run(args: Vec<String>) -> Result<(), String> {
         std::fs::write(path, SOURCE).map_err(|e| format!("--dump-source {path}: {e}"))?;
         return Ok(());
     }
+    if let Some(Some(path)) = flag(&args, "--dump-tensor-source") {
+        std::fs::write(path, TENSOR_SOURCE)
+            .map_err(|e| format!("--dump-tensor-source {path}: {e}"))?;
+        return Ok(());
+    }
     let sources: Vec<&'static SourceArm> = args
         .windows(2)
-        .filter(|w| w[0] == "--src")
-        .map(|w| SourceArm::parse(&w[1]))
+        .filter(|w| w[0] == "--src" || w[0] == "--tensor-src")
+        .map(|w| SourceArm::parse(&w[0], &w[1]))
         .collect::<Result<_, _>>()?;
     let mut arms: Vec<Arm> = if routed.is_some() {
         Vec::new()
@@ -665,6 +693,10 @@ fn pipelines(device: &MetalDevice, libs: &mut Libs, arms: &[Arm]) -> Result<(), 
                 }
                 Arm::Variant(v, o) => (libs.variant(device, v)?, engine_kernel(quant, o)),
                 Arm::Source(s, o) => (libs.source(device, s)?, engine_kernel(quant, o)),
+                Arm::SourceHalf(s) => (
+                    libs.source(device, s)?,
+                    format!("gemm_{}_store_h16", quant.name()),
+                ),
             };
             let pipeline = library.pipeline(&name).map_err(why)?;
             println!(
@@ -847,7 +879,7 @@ fn one(ctx: &Ctx<'_>, libs: &mut Libs, arm: Arm, cfg: &Config) -> Result<(), Str
     };
     // The half arm's activation rows: the f16 values the cast kernel writes, uploaded once.
     let x_h16 = match arm {
-        Arm::Half => {
+        Arm::Half | Arm::SourceHalf(_) => {
             let halves: Vec<u16> = x_values
                 .iter()
                 .map(|&v| gguf::quant::f32_to_f16_bits(v))
@@ -910,7 +942,7 @@ fn one(ctx: &Ctx<'_>, libs: &mut Libs, arm: Arm, cfg: &Config) -> Result<(), Str
                     .map_err(|e| format!("the dispatch did not encode: {e}"))
             })?
         }
-        Arm::Variant(_, operand) | Arm::Source(_, operand) => {
+        Arm::Variant(_, _) | Arm::Source(_, _) | Arm::SourceHalf(_) => {
             let (library, rows, acts, threads, acts_fast) = match arm {
                 Arm::Variant(v, _) => (
                     libs.variant(ctx.device, v)?,
@@ -919,7 +951,7 @@ fn one(ctx: &Ctx<'_>, libs: &mut Libs, arm: Arm, cfg: &Config) -> Result<(), Str
                     GEMM_THREADS,
                     v.acts_fast,
                 ),
-                Arm::Source(s, _) => (
+                Arm::Source(s, _) | Arm::SourceHalf(s) => (
                     libs.source(ctx.device, s)?,
                     s.rows,
                     s.acts,
@@ -928,9 +960,12 @@ fn one(ctx: &Ctx<'_>, libs: &mut Libs, arm: Arm, cfg: &Config) -> Result<(), Str
                 ),
                 _ => unreachable!("the arm is a variant or a source"),
             };
-            let pipeline = library
-                .pipeline(&engine_kernel(quant, operand))
-                .map_err(why)?;
+            let kernel = match arm {
+                Arm::Variant(_, o) | Arm::Source(_, o) => engine_kernel(quant, o),
+                Arm::SourceHalf(_) => format!("gemm_{}_store_h16", quant.name()),
+                _ => unreachable!("the arm is a variant or a source"),
+            };
+            let pipeline = library.pipeline(&kernel).map_err(why)?;
             let words = [k as u32, n as u32, r as u32, k as u32, n as u32, LAYER_NONE];
             let args: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
             let (groups_w, groups_a) = (n.div_ceil(rows), r.div_ceil(acts));
@@ -942,11 +977,20 @@ fn one(ctx: &Ctx<'_>, libs: &mut Libs, arm: Arm, cfg: &Config) -> Result<(), Str
             time_dispatches(ctx, pool.copies, dispatches, |encoder, copy| {
                 encoder.set_pipeline(&pipeline);
                 let weights = pool.window(copy, 0)?;
-                let x = x_f32.window(Elems(0), Elems(r * k)).map_err(why)?;
                 let y_win = y.window_mut(Elems(0), Elems(r * n)).map_err(why)?;
                 let mut slot = Bindings::new(encoder);
                 slot.set(Binding::of(&weights).map_err(why)?).map_err(why)?;
-                slot.set(Binding::of(&x).map_err(why)?).map_err(why)?;
+                if matches!(arm, Arm::SourceHalf(_)) {
+                    let x = x_h16
+                        .as_ref()
+                        .expect("the half arm's activation rows")
+                        .window(Elems(0), Elems(r * k))
+                        .map_err(why)?;
+                    slot.set(Binding::of(&x).map_err(why)?).map_err(why)?;
+                } else {
+                    let x = x_f32.window(Elems(0), Elems(r * k)).map_err(why)?;
+                    slot.set(Binding::of(&x).map_err(why)?).map_err(why)?;
+                }
                 slot.set(Binding::of_mut(&y_win).map_err(why)?)
                     .map_err(why)?;
                 slot.set(Binding::bytes(&args).map_err(why)?).map_err(why)?;
@@ -1032,6 +1076,7 @@ fn one(ctx: &Ctx<'_>, libs: &mut Libs, arm: Arm, cfg: &Config) -> Result<(), Str
         Arm::Half => (GEMM_ROWS, 2),
         Arm::Variant(v, _) => (v.rows, 4),
         Arm::Source(s, _) => (s.rows, 4),
+        Arm::SourceHalf(s) => (s.rows, 2),
         _ => (GEMM_ROWS, 4),
     };
     // The engine arms store f32 rows whatever their input; MLX's store its own type.
@@ -1179,7 +1224,9 @@ mod tests {
             ("--rows", "1"),
             ("--skew", "0"),
             ("--src", "test"),
+            ("--tensor-src", "test"),
             ("--dump-source", "/dev/null"),
+            ("--dump-tensor-source", "/dev/null"),
         ] {
             for repeated in [false, true] {
                 let mut args = vec!["--dump-source".to_string(), "/dev/null".to_string()];
