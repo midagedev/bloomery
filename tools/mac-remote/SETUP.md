@@ -31,10 +31,10 @@ Installed: uv 0.13.0, Python 3.14.8 (the lead's Mac runs 3.14.7), numpy 2.5.1, P
 
 ## 2. just, at the version of the lead's Mac (recipes.py parses `just --dump --dump-format json`)
 
-    curl -sSfL -o just.tgz https://github.com/casey/just/releases/download/1.58.0/just-1.58.0-aarch64-apple-darwin.tar.gz
+    curl -sSfL -o just.tgz https://github.com/casey/just/releases/download/1.59.0/just-1.59.0-aarch64-apple-darwin.tar.gz
     tar -xzf just.tgz just && cp just ~/opt/bloomery-bin/just
 
-Installed: just 1.58.0. The runner refuses (69) a remote `just --version` that differs from the local one.
+Installed: just 1.59.0. The runner refuses (69) a remote `just --version` that differs from the local one.
 
 ## 3. Rust: rustup without profile edits, then every component rust-toolchain.toml pins and the cross-check target
 
