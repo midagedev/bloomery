@@ -79,7 +79,7 @@ fn write_split(folder: &Path, out: &Path, flags: &[&str]) -> Output {
 /// The whole split of a toy folder opened as the server opens it: the description `model::arch::spec`
 /// reads from its header.
 fn description(prefix: &Path) -> model::arch::Read {
-    let split = gguf::Split::open(&glob_first(prefix)).unwrap();
+    let split = gguf::Split::open(glob_first(prefix)).unwrap();
     model::arch::spec(&split).unwrap_or_else(|e| panic!("{}: {e}", prefix.display()))
 }
 
