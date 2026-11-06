@@ -24,6 +24,7 @@ use serde_json::Value as Json;
 use model::part::{StoredPlane, StoredRows};
 
 use crate::part::{self, Made};
+use crate::select::Select;
 
 pub(crate) mod scales;
 
@@ -111,6 +112,23 @@ pub trait FolderMap: Sized {
     /// The tokenizer's vocabulary fields of the config.
     fn vocab(&self) -> &VocabSpec;
 
+    /// The tensors a folder of this config stores, and which of the index's other names the map
+    /// skips; `None` for a map that cannot say them from the config alone. `prepare --follow`
+    /// plans from them before the folder's shards are all there and holds each shard's own
+    /// header to them.
+    fn stored(&self) -> Option<Stored> {
+        None
+    }
+
+    /// The map reading its config under the architecture word `word` (`prepare --arch`); a map
+    /// with one word refuses any.
+    fn with_arch(self, word: &str) -> Result<Self, Error> {
+        Err(Error::Refused(format!(
+            "--arch {word:?}: this map has one architecture word, {:?}",
+            self.architecture()
+        )))
+    }
+
     /// The tensors of the header that no folder tensor holds, by the program's name: values the
     /// map makes of the config. A name a mapped tensor has is refused.
     fn constants(&self) -> Result<BTreeMap<String, Constant>, Error> {
@@ -132,6 +150,14 @@ pub trait FolderMap: Sized {
         let _ = (path, folder, plan, kvs);
         Ok(None)
     }
+}
+
+/// The tensors a folder of a config stores, from the config alone ([`FolderMap::stored`]).
+pub struct Stored {
+    /// Each tensor's name, dtype and shape, the ones the map skips left out.
+    pub tensors: Vec<(String, Dtype, Vec<usize>)>,
+    /// Why the map skips the folder tensor `name`; `None` for a name it reads.
+    pub skips: fn(&str) -> Option<&'static str>,
 }
 
 /// A draft model a folder holds: its header and its planned tensors.
@@ -203,6 +229,16 @@ impl<S> Mapped<S> {
             .iter()
             .map(|s| Ok((s.as_str(), place(plan, s)?)))
             .collect()
+    }
+
+    /// Every folder tensor it reads: each source and the companions of its place in `plan`.
+    pub fn reads<'p>(&'p self, plan: &'p Plan) -> Result<Vec<&'p str>, Error> {
+        let mut out = vec![];
+        for (source, placed) in self.placed(plan)? {
+            out.push(source);
+            out.extend(placed.companions.iter().map(String::as_str));
+        }
+        Ok(out)
     }
 
     /// A row table's parts, one at a time in order: each normalized by its place in `plan`, and
@@ -332,6 +368,45 @@ pub struct Read<M: FolderMap> {
     pub tokenizer: tokenizer::Tokenizer,
 }
 
+/// A folder's plan whose shards are not all there ([`read_staged`]): [`Read`] with no folder, as
+/// the folder it was planned from holds headers and no tensor bytes.
+pub struct Staged<M: FolderMap> {
+    pub checkpoint: M,
+    pub plan: Plan,
+    pub planned: Vec<Planned<M::Step>>,
+    pub skipped: BTreeMap<String, String>,
+    pub kvs: Vec<(String, Value)>,
+    pub tokenizer: tokenizer::Tokenizer,
+}
+
+/// [`read_with`] for a folder whose shards are not all there: the plan is read from `shell`, a
+/// folder of header-only shards ([`crate::follow::Follow::plan`]) beside the config, and the
+/// tokenizer from `dir`.
+pub fn read_staged<M: FolderMap>(
+    dir: &Path,
+    shell: &Path,
+    q8: bool,
+    options: &Options,
+) -> Result<Staged<M>, Error> {
+    let Folded {
+        checkpoint,
+        plan,
+        planned,
+        skipped,
+        kvs,
+        ..
+    } = fold_with::<M>(shell, &read_config(dir)?, q8, Keep::Made, options)?;
+    let (kvs, tokenizer) = tokenized(dir, &checkpoint, kvs)?;
+    Ok(Staged {
+        checkpoint,
+        plan,
+        planned,
+        skipped,
+        kvs,
+        tokenizer,
+    })
+}
+
 /// A folder's config, read.
 fn read_config(dir: &Path) -> Result<Json, Error> {
     read_json(&dir.join("config.json"))
@@ -356,8 +431,31 @@ struct Folded<M: FolderMap> {
     kvs: Vec<(String, Value)>,
 }
 
+/// What a `prepare` run asks of the split beyond the folder's own plan.
+#[derive(Default)]
+pub struct Options {
+    /// The architecture word the header is written under, in place of the folder's own.
+    pub arch: Option<String>,
+    /// The tensors the split holds.
+    pub select: Select,
+}
+
 fn fold<M: FolderMap>(dir: &Path, config: &Json, q8: bool, keep: Keep) -> Result<Folded<M>, Error> {
+    fold_with(dir, config, q8, keep, &Options::default())
+}
+
+fn fold_with<M: FolderMap>(
+    dir: &Path,
+    config: &Json,
+    q8: bool,
+    keep: Keep,
+    options: &Options,
+) -> Result<Folded<M>, Error> {
     let checkpoint = M::parse(config)?;
+    let checkpoint = match &options.arch {
+        Some(word) => checkpoint.with_arch(word)?,
+        None => checkpoint,
+    };
     let folder = Folder::open(dir)?;
     let entries: Vec<(String, Dtype, Vec<usize>)> = folder
         .names()
@@ -372,6 +470,7 @@ fn fold<M: FolderMap>(dir: &Path, config: &Json, q8: bool, keep: Keep) -> Result
         planned,
         skipped,
     } = plan_tensors(&checkpoint, &Config::read(dir)?, &entries, q8, keep)?;
+    let planned = options.select.apply(planned)?;
     let kvs = checkpoint.header(
         &planned
             .iter()
@@ -408,6 +507,12 @@ fn tokenized<M: FolderMap>(
 /// (the model's and the tokenizer's), and serving's tokenizer built from them and checked against
 /// Hugging Face's ([`served_as_hf`]).
 pub fn read<M: FolderMap>(dir: &Path, q8: bool) -> Result<Read<M>, Error> {
+    read_with(dir, q8, &Options::default())
+}
+
+/// [`read`] with the architecture word and the tensor selection of `options`: the split of a
+/// folder written under another word, or holding some of its tensors.
+pub fn read_with<M: FolderMap>(dir: &Path, q8: bool, options: &Options) -> Result<Read<M>, Error> {
     let Folded {
         checkpoint,
         folder,
@@ -415,7 +520,7 @@ pub fn read<M: FolderMap>(dir: &Path, q8: bool) -> Result<Read<M>, Error> {
         planned,
         skipped,
         kvs,
-    } = fold::<M>(dir, &read_config(dir)?, q8, Keep::Made)?;
+    } = fold_with::<M>(dir, &read_config(dir)?, q8, Keep::Made, options)?;
     let (kvs, tokenizer) = tokenized(dir, &checkpoint, kvs)?;
     Ok(Read {
         checkpoint,

@@ -3,7 +3,11 @@
 //! full-width projection; a latent layer caches the `kv_lora_rank` latent and the
 //! `rope.dimension_count` key values no rope turns a position, absorbs the per-head up
 //! projections (`attn_k_b`, `attn_v_b`) and gates its heads' outputs by a projection of the layer
-//! input (`src/models/kimi-k3.cpp`). The first layer is a dense `situ` block and the rest the
+//! input (`src/models/kimi-k3.cpp`). A K3.1 latent layer also selects: its lightning indexer is a
+//! [`Selector::StreamTopK`] over index keys projected from the layer input, one per position and
+//! owned by the layer (so the plan holds the key row beside the latent row), and its query is
+//! projected from the RMS-normed query latent (`q_lora` above 0), where Mistral Large 4's is of
+//! the LayerNorm-normed input. The first layer is a dense `situ` block and the rest the
 //! sigmoid router over `situ` experts that run in a latent, their weighted sum normed before the
 //! up projection, beside the shared stack that reads the hidden row. Every sublayer and the head
 //! read the cross-layer residual's mix ([`Residual::AttnRes`]); no stream is carried beside the
@@ -12,8 +16,8 @@
 use gguf::Split;
 use models::shape::RouterBody;
 use models::{
-    Arch, ChatSpec, DeltaKind, DeltaRule, Ffn, KdaGate, LayerSpec, Mixer, ModelSpec, Moe, Need,
-    Residual,
+    Arch, ChatSpec, DeltaKind, DeltaRule, Ffn, IndexKeys, KdaGate, LayerSpec, Mixer, ModelSpec,
+    Moe, Need, Residual, Selector, Source,
 };
 
 use super::hparams::{Hparams, Kind};
@@ -113,7 +117,22 @@ pub fn spec_of(hp: &Hparams, chat: ChatSpec) -> Result<ModelSpec, PlacementError
                 d: spec_u32("kda.head_dim", hp.kda.head_dim)?,
                 conv: spec_u32("ssm.conv_kernel", hp.kda.conv)?,
             }),
-            Kind::Mla => Mixer::Latent(hp.mla.latent(hp.n_head)?),
+            Kind::Mla => {
+                let mut latent = hp.mla.latent(hp.n_head)?;
+                if let Some(ix) = hp.indexer.as_ref().filter(|ix| ix.layers[l]) {
+                    latent.select = Some(Selector::StreamTopK {
+                        heads: spec_u32("attention.indexer.head_count", ix.heads)?,
+                        d: spec_u32("attention.indexer.key_length", ix.d)?,
+                        k: spec_u32("attention.indexer.top_k", ix.top_k)?,
+                        keys: Source::Own(IndexKeys::FromInput {
+                            norm_eps: ix.norm_eps,
+                        }),
+                        list: Source::Own(()),
+                        candidates: None,
+                    });
+                }
+                Mixer::Latent(latent)
+            }
         };
         let ffn = if hp.dense(l) {
             Ffn::Dense {
@@ -154,9 +173,11 @@ pub fn spec_of(hp: &Hparams, chat: ChatSpec) -> Result<ModelSpec, PlacementError
 
 #[cfg(test)]
 mod tests {
-    use models::{Act, DeltaKind, Ffn, LatentUp, Mixer, OutGate, Residual, Score, Selector};
+    use models::{
+        Act, DeltaKind, Ffn, IndexKeys, LatentUp, Mixer, OutGate, Residual, Score, Selector, Source,
+    };
 
-    use super::super::hparams::tests::{keys, tensors, typed};
+    use super::super::hparams::tests::{keys, keys31, tensors, tensors31, typed};
     use crate::arch::synthetic::{V, header_typed};
     use crate::placement::PlacementError;
 
@@ -166,11 +187,22 @@ mod tests {
         pre: &'static str,
         tensors: &[(String, Vec<u64>)],
     ) -> Result<super::Read, PlacementError> {
+        read_arch(tag, "kimi-k3", keys(), pre, tensors)
+    }
+
+    /// [`read_with`] for a file of architecture word `arch` and keys `kv`.
+    fn read_arch(
+        tag: &str,
+        arch: &str,
+        kv: Vec<(&'static str, V)>,
+        pre: &'static str,
+        tensors: &[(String, Vec<u64>)],
+    ) -> Result<super::Read, PlacementError> {
         let global = [
             ("tokenizer.ggml.pre", V::Str(pre)),
             ("tokenizer.chat_template", V::Str("{{ messages }}")),
         ];
-        let path = header_typed(tag, "kimi-k3", &keys(), &global, &typed(tensors, &[]));
+        let path = header_typed(tag, arch, &kv, &global, &typed(tensors, &[]));
         let split = gguf::Split::open(&path).expect("the synthetic header opens");
         let read = super::read(&split);
         let _ = std::fs::remove_file(&path);
@@ -251,6 +283,54 @@ mod tests {
         assert!(read.defaults.is_empty(), "{:?}", read.defaults);
     }
 
+    /// A K3.1 file is the K3 description with the latent layer selecting: a streamed top-k of 32
+    /// heads of 128 over 16 positions (the table's `index_topk`), its keys projected from the
+    /// layer input and normed at the file's epsilon, owned by the layer, one list per layer. The
+    /// delta layers and the rest of the latent layer are K3's, and the architecture is K3's, so
+    /// the families' common owners see one model. Mutant: the selector left off, on a delta
+    /// layer, or with the keys another source.
+    #[test]
+    fn the_k31_description_selects_on_the_latent_layer() {
+        let k3 = read_with("kimi-k31-base", "kimi-k2", &tensors()).expect("the K3 header reads");
+        let read = read_arch(
+            "kimi-k31-spec",
+            "kimi-k31",
+            keys31(),
+            "kimi-k2",
+            &tensors31(),
+        )
+        .expect("the K3.1 header reads");
+        assert_eq!(read.spec.arch, models::Arch::KimiK3);
+        assert!(read.defaults.is_empty(), "{:?}", read.defaults);
+        for (l, (layer, base)) in read.spec.layers.iter().zip(&k3.spec.layers).enumerate() {
+            assert_eq!(layer.ffn, base.ffn, "layer {l}");
+            assert_eq!(layer.residual, base.residual, "layer {l}");
+            match (&layer.mixer, &base.mixer) {
+                (Mixer::Latent(a), Mixer::Latent(b)) => {
+                    assert_eq!(l, 2);
+                    assert_eq!(
+                        a.select,
+                        Some(Selector::StreamTopK {
+                            heads: 32,
+                            d: 128,
+                            k: 16,
+                            keys: Source::Own(IndexKeys::FromInput { norm_eps: 1e-5 }),
+                            list: Source::Own(()),
+                            candidates: None,
+                        })
+                    );
+                    let mut selected = b.clone();
+                    selected.select = a.select.clone();
+                    assert_eq!(
+                        a, &selected,
+                        "the latent layer is K3's but for its selection"
+                    );
+                }
+                (a, b) => assert_eq!(a, b, "layer {l}"),
+            }
+        }
+    }
+
     /// The classifier lists every name no role claims: the low-rank gate pair a Kimi linear file
     /// carries, a fused projection and a next-token tensor are not Kimi K3's, and the file is
     /// refused with them named. Mutant: the low-rank pair left among the delta stems.
@@ -314,5 +394,25 @@ mod tests {
             role("blk.1.ffn_gate_exps.weight"),
             Some((Role::RoutedExperts, Some(1)))
         );
+        let k31 = read_arch(
+            "kimi-k31-roles",
+            "kimi-k31",
+            keys31(),
+            "kimi-k2",
+            &tensors31(),
+        )
+        .expect("the K3.1 header reads");
+        for stem in ["attn_q_b", "attn_k", "proj", "k_norm"] {
+            let name = format!("blk.2.indexer.{stem}.weight");
+            assert_eq!(
+                k31.tensors
+                    .tensors
+                    .iter()
+                    .find(|t| t.name == name)
+                    .map(|t| (t.role, t.layer)),
+                Some((Role::Attention, Some(2))),
+                "{name}"
+            );
+        }
     }
 }

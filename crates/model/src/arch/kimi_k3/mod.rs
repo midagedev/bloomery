@@ -1,4 +1,5 @@
-//! `kimi_k3` — Kimi K3. The file's keys (`hparams`), every tensor's role (`roles`), the typed
+//! `kimi_k3` — Kimi K3 and K3.1 (the architecture words `kimi-k3` and `kimi-k31`, one registry row:
+//! K3.1 is K3 whose latent layers also carry a lightning indexer, [`hparams::Indexer`]). The file's keys (`hparams`), every tensor's role (`roles`), the typed
 //! description (`spec`), the tensor names a step reads (`names`), the file planned onto a
 //! machine's cache bytes (`place`) and the synthetic gate fixture cut from the released file
 //! (`fixture`).

@@ -10,6 +10,12 @@
 //! description ([`Program::KimiK3Body`]); what is left to the coverage check is the template's
 //! tool-call parser, the chat surface's, so [`PlanInputs::read`] refuses that one item and a
 //! driver that feeds ids and renders no chat reads the file by [`PlanInputs::read_without_chat`].
+//!
+//! A K3.1 file plans with the indexer's key row beside each latent layer's cached row (the
+//! description's selector, [`place_hybrid::KvLayout`]), and the coverage check lists the selection
+//! as a feature no body runs, so it is refused by name until one does. [`PlanInputs::check_ctx`] is
+//! the bound that refusal gives way to: the selection is the identity up to its top-k and past it
+//! the engine would attend densely, which it never does silently.
 
 use gguf::Split;
 use models::Need;
@@ -83,6 +89,13 @@ impl PlanInputs {
         }
     }
 
+    /// A context of `ctx` positions refused by name when a K3.1 file's selection would pick among
+    /// them ([`Hparams::check_ctx`]): a driver that opens the file calls it beside
+    /// [`PlanInputs::plan`], which knows no family's bound.
+    pub fn check_ctx(&self, ctx: u64) -> Result<(), PlacementError> {
+        self.hp.check_ctx(ctx)
+    }
+
     /// The file as it is, for a gate that describes it whatever the coverage list holds, and the
     /// host's room and the arena's given bytes. The roles and the description are the registry's
     /// reader's ([`spec::read`]), so the plan and the description of a file are one reading.
@@ -107,7 +120,7 @@ mod tests {
     use gguf::Split;
     use models::Need;
 
-    use super::super::hparams::tests::{keys, tensors, typed};
+    use super::super::hparams::tests::{TOP_K, keys, keys31, tensors, tensors31, typed};
     use super::{PlaceError, PlanInputs};
     use crate::arch::synthetic::{Ty, V, header_typed};
     use crate::placement::workstation::{self, A6000, RTX_3090};
@@ -121,6 +134,24 @@ mod tests {
             ("tokenizer.chat_template", V::Str("{{ messages }}")),
         ];
         let path = header_typed(name, "kimi-k3", &keys(), &global, &typed(&tensors(), over));
+        let split = Split::open(&path).expect("the synthetic header opens");
+        let _ = std::fs::remove_file(&path);
+        split
+    }
+
+    /// The small K3.1 header's file, opened.
+    fn opened31(name: &str) -> Split {
+        let global = [
+            ("tokenizer.ggml.pre", V::Str("kimi-k2")),
+            ("tokenizer.chat_template", V::Str("{{ messages }}")),
+        ];
+        let path = header_typed(
+            name,
+            "kimi-k31",
+            &keys31(),
+            &global,
+            &typed(&tensors31(), &[]),
+        );
         let split = Split::open(&path).expect("the synthetic header opens");
         let _ = std::fs::remove_file(&path);
         split
@@ -312,6 +343,55 @@ mod tests {
             }
             other => panic!("{other:?}, not the width's refusal by tensor"),
         }
+    }
+
+    /// A K3.1 latent layer holds the key row of its indexer beside its cached row: 128 f16 values
+    /// (256 B) a position [derived from the indexer's key width, apart from the reader], on that
+    /// layer alone, so at 64 positions the layer's 1,152 + 256 B a position are 90,112 B and the
+    /// 3 delta layers' state is K3's. Mutant: the key row left out of the layout, or put on the
+    /// delta layers.
+    #[test]
+    fn a_k31_latent_layer_holds_the_index_key_row() {
+        let inputs = PlanInputs::describe(&opened31("kimi-k31-place-kv"))
+            .expect("the synthetic K3.1 header describes");
+        let kv: &super::KvLayout = &inputs.kv;
+        for l in [0, 1, 3] {
+            assert_eq!(kv.layer_bytes(l, 64), 164_868, "layer {l}");
+        }
+        assert_eq!(kv.layer_bytes(2, 1), 1_152 + 256);
+        assert_eq!(kv.layer_bytes(2, 64), 64 * (1_152 + 256));
+        assert_eq!(kv.bytes(0..4, 64), 3 * 164_868 + 90_112);
+        assert_eq!(kv.layer_bytes(4, 64), 0);
+    }
+
+    /// The coverage check refuses a K3.1 file by the selection's name, at the latent layer
+    /// alone, and [`PlanInputs::check_ctx`] holds its context to the top-k. Mutants: a coverage
+    /// row for the selection added without the body that runs it, the bound dropped.
+    #[test]
+    fn a_k31_file_is_refused_by_the_selection_and_its_context_by_top_k() {
+        let inputs = PlanInputs::describe(&opened31("kimi-k31-place-refused"))
+            .expect("the synthetic K3.1 header describes");
+        let selected: Vec<_> = inputs
+            .unimplemented()
+            .into_iter()
+            .filter(|i| i.feature.contains("index"))
+            .collect();
+        assert!(!selected.is_empty(), "the selection is unimplemented");
+        assert!(selected.iter().all(|i| i.layer == Some(2)), "{selected:?}");
+        match PlanInputs::read_without_chat(&opened31("kimi-k31-place-read")) {
+            Err(PlacementError::Unimplemented(got)) => {
+                assert!(got.iter().any(|i| i.feature.contains("index")), "{got:?}");
+            }
+            other => panic!("{other:?}, not the coverage refusal"),
+        }
+        inputs.check_ctx(TOP_K).expect("a context of top-k runs");
+        let e = inputs.check_ctx(TOP_K + 1).expect_err("past top-k");
+        assert!(
+            e.to_string().contains("kimi-k31.attention.indexer.top_k"),
+            "{e}"
+        );
+        let k3 = described("kimi-k3-place-ctx");
+        k3.check_ctx(1 << 20).expect("a K3 file has no bound");
     }
 
     /// The plan's description is the registry's: one reading of the file, whose chat surface is

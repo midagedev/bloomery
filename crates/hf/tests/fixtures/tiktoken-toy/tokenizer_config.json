@@ -1,0 +1,78 @@
+{
+  "added_tokens_decoder": {
+    "267": {
+      "content": "[BOS]",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": true
+    },
+    "268": {
+      "content": "[EOS]",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": true
+    },
+    "269": {
+      "content": "<|end_of_msg|>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": true
+    },
+    "270": {
+      "content": "<|open|>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": false
+    },
+    "276": {
+      "content": "[EOT]",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": true
+    },
+    "521": {
+      "content": "[UNK]",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": true
+    },
+    "522": {
+      "content": "[PAD]",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false,
+      "special": true
+    }
+  },
+  "additional_special_tokens": [
+    "<|end_of_msg|>",
+    "[EOT]"
+  ],
+  "bos_token": "[BOS]",
+  "clean_up_tokenization_spaces": false,
+  "eos_token": "[EOS]",
+  "extra_special_tokens": {},
+  "model_max_length": 1000000000000000019884624838656,
+  "pad_token": "[PAD]",
+  "tokenizer_class": "TikTokenTokenizer",
+  "unk_token": "[UNK]",
+  "auto_map": {
+    "AutoTokenizer": [
+      "tokenization_kimi.TikTokenTokenizer",
+      null
+    ]
+  }
+}

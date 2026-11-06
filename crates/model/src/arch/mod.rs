@@ -240,7 +240,7 @@ impl Arch {
             "flint" => Ok(Arch::Flint),
             "muse-spark" => Ok(Arch::MuseSpark),
             "mistral-large4" => Ok(Arch::MistralLarge4),
-            "kimi-k3" => Ok(Arch::KimiK3),
+            "kimi-k3" | "kimi-k31" => Ok(Arch::KimiK3),
             other => Err(ModelError::UnknownArchitecture(other.to_string())),
         }
     }

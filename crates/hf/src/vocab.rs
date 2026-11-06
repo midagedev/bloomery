@@ -37,6 +37,9 @@
 //! `post_processor` is read like the rows: absent, a ByteLevel that moves no id, or Llama 3's
 //! Sequence of one and a template that adds the BOS first — the token the exported BOS id names,
 //! and what makes the header's `add_bos_token` true.
+//!
+//! A folder with `tiktoken.model` and no `tokenizer.json`, or a model whose [`VocabSpec`] names a
+//! tiktoken row (`kimi-k2`), is read by [`tiktoken`] into the same [`Keys`].
 
 use std::collections::HashMap;
 use std::fs;
@@ -46,6 +49,8 @@ use gguf::Value;
 use serde_json::Value as Json;
 
 use crate::schema::{self, Fields, Rule::*, Type};
+
+mod tiktoken;
 
 /// Why the tokenizer was refused.
 #[derive(Debug, thiserror::Error)]
@@ -172,9 +177,13 @@ pub const PRE: [(&str, &str, bool); 7] = [
     ),
 ];
 
-/// The names of [`PRE`], as the refusal of an unknown one lists them.
+/// The names of [`PRE`] and of the tiktoken rows, as the refusal of an unknown one lists them.
 fn pre_names() -> String {
-    PRE.map(|(name, _, _)| name).join(", ")
+    PRE.map(|(name, _, _)| name)
+        .into_iter()
+        .chain(tiktoken::pre_names())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The `config.json` `model_type`s that name the row a folder's pipeline gets when several rows
@@ -455,6 +464,14 @@ const GENERATION: &Fields = &[
     ("bos_token_id", Read),
     ("eos_token_id", Read),
     ("pad_token_id", Read),
+    (
+        "max_length",
+        Ignore(
+            Type::Number,
+            "HF's generate stops at that many tokens; serving's limit is each request's, and no \
+             prompt's ids or logits depend on it",
+        ),
+    ),
     ("do_sample", Ignore(Type::Bool, SAMPLING)),
     ("temperature", Ignore(Type::Number, SAMPLING)),
     ("top_k", Ignore(Type::Number, SAMPLING)),
@@ -579,9 +596,10 @@ impl VocabSpec {
     }
 
     /// The model's tokenizer has the [`PRE`] row `name`: [`keys`] refuses a `tokenizer.json`
-    /// whose pre-tokenizer is another row. A name no row has is refused here.
+    /// whose pre-tokenizer is another row. A name of a tiktoken row (`kimi-k2`) makes [`keys`]
+    /// read the folder's `tiktoken.model`. A name no row has is refused here.
     pub fn with_pre(mut self, name: &'static str) -> Result<Self, Error> {
-        if !PRE.iter().any(|&(row, _, _)| row == name) {
+        if !PRE.iter().any(|&(row, _, _)| row == name) && !tiktoken::is_pre(name) {
             return Err(Error::Vocab(format!(
                 "pre-tokenizer row {name:?} is not one of {}",
                 pre_names()
@@ -1045,7 +1063,30 @@ fn post_processor<'a>(
     Ok(Some(token))
 }
 
-/// The `tokenizer.*` keys of the repo at `dir`.
+/// The chat template of the repo at `dir`: `chat_template.jinja`, else `tokenizer_config.json`'s
+/// (`tc`) `chat_template`; a value that is not a string is refused by name.
+fn chat_template(dir: &Path, tc: &Json) -> Result<Option<String>, Error> {
+    match fs::read_to_string(dir.join("chat_template.jinja")) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match tc.get("chat_template").filter(|v| !v.is_null()) {
+                Some(v) => Ok(Some(
+                    v.as_str()
+                        .ok_or_else(|| Error::Vocab(format!("chat_template {v} is not a string")))?
+                        .to_string(),
+                )),
+                None => Ok(None),
+            }
+        }
+        Err(e) => Err(Error::Io(
+            dir.join("chat_template.jinja").display().to_string(),
+            e,
+        )),
+    }
+}
+
+/// The `tokenizer.*` keys of the repo at `dir`: [`tiktoken`]'s when the model names a tiktoken
+/// row, or the folder has `tiktoken.model` and no `tokenizer.json`; else `tokenizer.json`'s.
 ///
 /// # Errors
 ///
@@ -1066,8 +1107,14 @@ fn post_processor<'a>(
 /// boolean, and a `chat_template` that is not a string, each by name.
 pub fn keys(dir: &Path, spec: &VocabSpec) -> Result<Keys, Error> {
     let bad = |what: String| Error::Vocab(what);
+    if spec.pre.is_some_and(tiktoken::is_pre)
+        || (!dir.join("tokenizer.json").exists() && dir.join("tiktoken.model").exists())
+    {
+        return tiktoken::keys(dir, spec);
+    }
     let read = |file: &str| crate::read_json(dir, file, Error::Io, Error::Json);
-    let tok = read("tokenizer.json")?.ok_or_else(|| bad("no tokenizer.json".into()))?;
+    let tok = read("tokenizer.json")?
+        .ok_or_else(|| bad("no tokenizer.json (and no tiktoken.model)".into()))?;
     let tc = read("tokenizer_config.json")?.unwrap_or_else(|| serde_json::json!({}));
     let generation = read("generation_config.json")?.unwrap_or_else(|| serde_json::json!({}));
     for (file, value, table) in [
@@ -1165,26 +1212,7 @@ pub fn keys(dir: &Path, spec: &VocabSpec) -> Result<Keys, Error> {
         }
         out.push((format!("tokenizer.ggml.{key}"), Value::Bool(b)));
     }
-    let template = match fs::read_to_string(dir.join("chat_template.jinja")) {
-        Ok(t) => Some(t),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            match tc.get("chat_template").filter(|v| !v.is_null()) {
-                Some(v) => Some(
-                    v.as_str()
-                        .ok_or_else(|| bad(format!("chat_template {v} is not a string")))?
-                        .to_string(),
-                ),
-                None => None,
-            }
-        }
-        Err(e) => {
-            return Err(Error::Io(
-                dir.join("chat_template.jinja").display().to_string(),
-                e,
-            ));
-        }
-    };
-    if let Some(t) = template {
+    if let Some(t) = chat_template(dir, &tc)? {
         out.push(("tokenizer.chat_template".to_string(), Value::String(t)));
     }
     let mut stop = stop
@@ -1579,6 +1607,7 @@ mod tests {
             ["generation_config.json", "", "bos_token_id", 3, [3, 4]],
             ["generation_config.json", "", "eos_token_id", [3, 4], [3, "4"]],
             ["generation_config.json", "", "pad_token_id", 4, [4, 3]],
+            ["generation_config.json", "", "max_length", 1048576, "long"],
             ["generation_config.json", "", "do_sample", true, "yes"],
             ["generation_config.json", "", "temperature", 1.0, "hot"],
             ["generation_config.json", "", "top_k", 20, "20"],
