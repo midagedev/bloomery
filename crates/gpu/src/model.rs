@@ -43,7 +43,7 @@ use crate::autotune;
 use crate::best::{self, Best};
 use crate::fault::Fault;
 use crate::graph::MappedHost;
-use crate::head::{Head, HeadNorm};
+use crate::head::{Head, HeadNorm, HostHead};
 use crate::host::leg_tier;
 use crate::host::nvtier::{ArenaKind, ArenaPages, NvTier, PageSource};
 use crate::host::refuse_expert_tiers;
@@ -170,6 +170,14 @@ pub trait ChainBody: Sized {
     /// final RMS norm unless the body's own last launch is the final norm.
     fn head_norm(&self) -> HeadNorm {
         HeadNorm::Rms
+    }
+
+    /// The output head's host side, once, when the plan this load opened leaves the head on the
+    /// host (no stage card carries it): the model then builds its one head from it
+    /// ([`Head::host`]) where a card head would be. `None` (the default) for a body whose card
+    /// carries the head, and for a stage card that ends no pipeline.
+    fn take_host_head(&mut self) -> Option<HostHead> {
+        None
     }
 
     /// Device bytes this body holds resident: caches, arena, step module.
@@ -2877,11 +2885,12 @@ fn stage_rows(what: &'static str, plan: &Plan<'_>, card: usize) -> Result<u64, G
 }
 
 /// The placed load after its body, which took `built`: the output head the
-/// card carries, over the body's weights, and the model over all of it, with
-/// the load's phases.
+/// card carries, over the body's weights, or the host head the body hands over
+/// when the plan reads it on the host, and the model over all of it, with the
+/// load's phases.
 fn placed_done<B: ChainBody>(
     p: PlacedPre,
-    body: B,
+    mut body: B,
     built: Duration,
 ) -> Result<GpuModel<B>, GpuError> {
     let PlacedPre {
@@ -2893,9 +2902,13 @@ fn placed_done<B: ChainBody>(
         mut times,
     } = p;
     let t = Instant::now();
-    let head = head
-        .then(|| Head::of(&gpu, &weights, body.head_eps(), body.head_norm()))
-        .transpose()?;
+    let head = if head {
+        Some(Head::of(&gpu, &weights, body.head_eps(), body.head_norm())?)
+    } else {
+        body.take_host_head()
+            .map(|host| Head::host(&gpu, host))
+            .transpose()?
+    };
     times.body = built;
     times.head = t.elapsed();
     let mut model = GpuModel::new(Resident {

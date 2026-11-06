@@ -36,8 +36,17 @@ use model::arch::models::KdaGate;
 /// What the refusals of this file name.
 const WHAT: &str = "kimi_k3 kda";
 
-/// The types a projection of a delta layer has in the released set (`gguf::arch::kimi_k3`).
-const TYPES: &[SiteTy] = &[SiteTy::Q6K, SiteTy::Q8_0, SiteTy::F32];
+/// The types a projection of a delta layer runs: the trunk's Q4_K, Q5_K, Q6_K and Q8_0 and the
+/// F32 of the gate's beta, each a launch of the common dense site. The table's BF16
+/// (`gguf::arch::kimi_k3`) is not here: the load widens a BF16 weight to f32, so no resident
+/// weight is a BF16 site and the file's type is refused by name.
+pub(super) const TYPES: &[SiteTy] = &[
+    SiteTy::Q4K,
+    SiteTy::Q5K,
+    SiteTy::Q6K,
+    SiteTy::Q8_0,
+    SiteTy::F32,
+];
 
 /// The joined conv taps of delta layer `l`'s q, k and v, in the conv's channel order: the one
 /// weight the mixer's conv reads, made at load ([`derive`]).

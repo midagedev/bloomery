@@ -33,7 +33,7 @@ use crate::attn_res::{AttnResArgs, AttnResKernels, MAX_VECS};
 use crate::elem::EmbedRowsArgs;
 use crate::flash_gqa::FlashGqaKernels;
 use crate::gemm::Gemm32Kernels;
-use crate::head::Head;
+use crate::head::{Head, HostHead};
 use crate::host::StepLeg;
 use crate::host::handoff::HandoffSlots;
 use crate::host::run::HostRun;
@@ -63,7 +63,7 @@ use model::arch::Arch;
 use model::arch::kimi_k3::hparams::{Hparams, Kind};
 use model::arch::kimi_k3::names;
 use model::arch::kimi_k3::place::PlanInputs;
-use model::placement::Plan;
+use model::placement::{Device, Format, Plan, Role};
 use placed::{Open, Placed};
 use runtime::layer::hosted;
 use std::ops::Range;
@@ -78,8 +78,10 @@ const WHAT: &str = "kimi_k3::Body::load";
 const STEP: &str = "kimi_k3::Body::enqueue_chain";
 const OPEN: &str = "kimi_k3 GpuModel::open";
 
-/// The types the dense layer's projections have in the released set.
-const DENSE_TYPES: &[SiteTy] = &[SiteTy::Q6K];
+/// The types the dense layer's projections run: the trunk's Q4_K, Q5_K, Q6_K and Q8_0, each a
+/// launch of the common dense site. The table's BF16 (`gguf::arch::kimi_k3`) is not here: the
+/// load widens a BF16 weight to f32, so no resident weight is a BF16 site.
+pub(super) const DENSE_TYPES: &[SiteTy] = &[SiteTy::Q4K, SiteTy::Q5K, SiteTy::Q6K, SiteTy::Q8_0];
 
 /// A layer's mixer and its store.
 enum Mixer {
@@ -589,6 +591,13 @@ pub struct Body {
     router: Instance,
     /// The host tier and what the walk reads beside it, on a placed load ([`placed`]).
     placed: Option<Placed>,
+    /// The output head's host side, on a placed load whose plan reads the head on the host,
+    /// until the model takes it ([`ChainBody::take_host_head`]).
+    host_head: Option<HostHead>,
+    /// `output_res_score.weight` uploaded from the file, on a load whose plan reads the head on the
+    /// host: the plan leaves that vector (a head row) in the file, and the final mix is a card
+    /// kernel that reads it. `None` where the weights hold it.
+    out_score: Option<Weights>,
     /// The stage snapshots of the step's position: armed by [`Body::arm_taps`], absent in a
     /// serving load so no launch is recorded for them.
     taps: Option<Taps>,
@@ -633,9 +642,10 @@ impl GpuModel<Body> {
     /// over the layers whose experts the card does not hold whole with the plan's expert tier
     /// card hung under it, and the embedding as a host row ([`placed`]). The load's slot map
     /// stays for the model's life ([`Residency::Off`]). The prompt is stepped one id at a time.
-    /// Refused by name: a plan of other than one stage card running every layer, a plan that
-    /// reads the head on the host (no card carries it: the step ends in a card head, and no host
-    /// head stage exists), of more than one expert tier, a layer whose stacks are not its card
+    /// A plan whose stage card carries no head leaves `output_norm.weight` and `output.weight` on
+    /// the host, and the output head is the host's ([`HostHead`]). Refused by name: a plan of
+    /// other than one stage card running every layer, a plan that carries the head on no card and
+    /// does not leave its tensors on the host, of more than one expert tier, a layer whose stacks are not its card
     /// count's, a routed layer whose experts the host holds some of and no tier card any (its
     /// handoff is the host's own entry, which the slot count a token must be one of
     /// [`HandoffSlots`] builds), and scratch or tier places past the plan's terms for them.
@@ -649,14 +659,9 @@ impl GpuModel<Body> {
         const PLAN: &str = "kimi_k3::Body::open_placed";
         let hp = &inputs.hp;
         let (_, ctx) = stage_run(PLAN, plan, card, hp.n_layer)?;
-        if !plan.machine.cards.get(card).is_some_and(|c| c.head) {
-            return Err(GpuError::shape(
-                PLAN,
-                format!(
-                    "the plan reads the head on the host (card {card} does not carry it): the \
-                     step ends in a card head and the body has no host head stage"
-                ),
-            ));
+        let host_head = head_on_host(plan, card);
+        if host_head {
+            refuse_unless_host_head(PLAN, plan, card)?;
         }
         let run = hosted(&inputs.spec.layers)
             .map_err(|e| GpuError::shape(PLAN, format!("the routed layers: {e}")))?;
@@ -693,6 +698,9 @@ impl GpuModel<Body> {
                 };
                 let mut body =
                     Body::load(gpu, file, w, (inputs.hp.clone(), ctx), Some((open, card)))?;
+                if host_head {
+                    body.host_head = Some(HostHead::open(Arc::clone(file), inputs.hp.rms_eps)?);
+                }
                 refuse_scratch_past(
                     PLAN,
                     plan,
@@ -718,6 +726,54 @@ impl GpuModel<Body> {
             },
         )
     }
+}
+
+/// Whether the plan reads the head on the host: its card `card` carries none.
+fn head_on_host(plan: &Plan<'_>, card: usize) -> bool {
+    !plan.machine.cards.get(card).is_some_and(|c| c.head)
+}
+
+/// Refused by name, as `what`'s, a plan whose card `card` carries no head and which does not
+/// leave every head tensor on the host, read in place from the file: the host head stage
+/// ([`HostHead`]) reads `output_norm.weight` and `output.weight` there, and the load uploads
+/// `output_res_score.weight` from there; nothing reads them anywhere else.
+fn refuse_unless_host_head(
+    what: &'static str,
+    plan: &Plan<'_>,
+    card: usize,
+) -> Result<(), GpuError> {
+    let elsewhere: Vec<String> = plan
+        .rows
+        .iter()
+        .filter(|r| plan.model.tensors[r.tensor].role == Role::Head)
+        .filter(|r| {
+            !matches!(
+                r.segments.as_slice(),
+                [s] if s.device == Device::Host && s.format == Format::HostFile
+            )
+        })
+        .map(|r| {
+            format!(
+                "{} {:?}",
+                plan.model.tensors[r.tensor].name,
+                r.segments
+                    .iter()
+                    .map(|s| (s.device, s.format))
+                    .collect::<Vec<_>>()
+            )
+        })
+        .collect();
+    if elsewhere.is_empty() {
+        return Ok(());
+    }
+    Err(GpuError::shape(
+        what,
+        format!(
+            "card {card} carries no head and the plan does not leave its tensors on the host, \
+             read in place from the file, which the host head stage reads (device, format): {}",
+            elsewhere.join("; ")
+        ),
+    ))
 }
 
 /// The dense layer's projections of layer `l`.
@@ -906,7 +962,17 @@ impl Body {
                 banks: hp.banks(l),
             });
         }
-        vector(names::OUTPUT_RES_SCORE.to_owned())?;
+        let out_score = if placed
+            .as_ref()
+            .is_some_and(|(open, card)| head_on_host(open.plan, *card))
+        {
+            let own = Weights::load_where(stream, file, |name| name == names::OUTPUT_RES_SCORE)?;
+            crate::site::vector(&own, WHAT, names::OUTPUT_RES_SCORE.to_owned(), n)?;
+            Some(own)
+        } else {
+            vector(names::OUTPUT_RES_SCORE.to_owned())?;
+            None
+        };
         let acts = Acts::new(stream, layers.iter().flat_map(Layer::sites))?;
         let ff = hp.dense_ff.max(moe.shared_ff);
         let hosted_load = placed.is_some();
@@ -924,6 +990,8 @@ impl Body {
         };
         Ok(Body {
             placed,
+            host_head: None,
+            out_score,
             k: Kernels::load(gpu, &md)?,
             s: Scratch::new(stream, n, (&kd, &md), ctx)?,
             banks: DeviceBuffer::zeroed(stream, bank_slots * n)?,
@@ -953,6 +1021,7 @@ impl Body {
             + self.acts.bytes()
             + self.k.kgemv.device_bytes()
             + self.placed.as_ref().map_or(0, Placed::device_bytes)
+            + self.out_score.as_ref().map_or(0, Weights::resident_bytes)
     }
 
     /// The placed side of the load: `None` on the whole-card load.
@@ -1188,6 +1257,7 @@ impl Body {
             router,
             placed,
             taps,
+            out_score,
             ctx,
             ..
         } = self;
@@ -1207,6 +1277,7 @@ impl Body {
             banks,
             step_in,
             taps: taps.as_mut(),
+            out_score: out_score.as_ref(),
             n: hp.n_embd,
             eps: hp.rms_eps,
             pushed: 0,
@@ -1259,6 +1330,8 @@ struct Walk<'a> {
     banks: &'a mut DeviceBuffer<f32>,
     step_in: &'a StepIn,
     taps: Option<&'a mut Taps>,
+    /// The final mix's score where the load holds it apart from the weights ([`Body::out_score`]).
+    out_score: Option<&'a Weights>,
     n: usize,
     eps: f32,
     /// Block inputs banked so far this step.
@@ -1283,6 +1356,7 @@ impl Walk<'_> {
             n,
             eps,
             pushed,
+            ..
         } = self;
         let (gpu, w) = (cx.gpu, cx.w);
         let stream = gpu.stream();
@@ -1426,7 +1500,10 @@ impl Walk<'_> {
                 n_banks: self.pushed,
                 stride: n,
                 cur: &self.s.sum[0],
-                score: w.f32_buf(STEP, names::OUTPUT_RES_SCORE)?,
+                score: self
+                    .out_score
+                    .unwrap_or(w)
+                    .f32_buf(STEP, names::OUTPUT_RES_SCORE)?,
                 eps: self.eps,
                 n,
                 m: 1,
@@ -1527,5 +1604,9 @@ impl ChainBody for Body {
 
     fn host(&mut self) -> Option<&mut Placed> {
         self.placed.as_mut()
+    }
+
+    fn take_host_head(&mut self) -> Option<HostHead> {
+        self.host_head.take()
     }
 }

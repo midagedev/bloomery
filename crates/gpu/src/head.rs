@@ -32,6 +32,16 @@
 //! buffer holds the `m` tokens, then the first-layer word and that layer's
 //! site mask, one copy, and a raised word turns the readback into
 //! [`GpuError::Fault`] instead of a token.
+//!
+//! A plan that carries no head on a card leaves `output_norm.weight` and
+//! `output.weight` on the host, read in place from the file
+//! ([`HostHead`], [`Head::host`]): the head is one row and the chain's last
+//! launch writes its input as for a card head, the head enqueues nothing, and
+//! the readback ([`Head::token`], [`Head::logits_to_host`]) waits for the
+//! stream, refuses a raised fault, copies the row to the host and runs the
+//! final norm, the projection and the argmax there, over the host's workers.
+//! The card holds no readback words of such a head, so a chain that reads
+//! them on the card ([`Head::copy_tokens`]) is refused by name.
 
 use crate::Gpu;
 use crate::GpuError;
@@ -45,8 +55,12 @@ use crate::tensor::{DeviceTensor, Q8Act};
 use crate::token_major::TokenMajor;
 use crate::weights::{DevWeight, HEAD_TENSOR, Weights};
 use cuda_core::{CudaEvent, DeviceBuffer, PinnedHostBuffer};
+use gguf::{Split, TensorInfo};
+use model::Tensor2;
 use model::arch::names::output_norm;
+use model::ops::{f32_tensor, matmul_q, rms_norm};
 use model::placement::kernels::{self, HeadEntry};
+use std::sync::Arc;
 
 /// The lm_head weight (`output.weight`) in a format a gemv here reads: a
 /// K-quant words over q8_1 rows, NVFP4's planes over q8_1 or 32-value rows,
@@ -265,6 +279,126 @@ impl HeadLaunches {
     }
 }
 
+/// The output head a plan reads on the host: `output_norm.weight` and `output.weight` of the
+/// file, which the plan leaves where they lie ([`Head::host`]). One row: the decode step's.
+pub struct HostHead {
+    file: Arc<Split>,
+    /// The shard `output.weight` lies in: the two tensors need not share one.
+    shard: usize,
+    out: TensorInfo,
+    gain: Vec<f32>,
+    eps: f32,
+    n_vocab: usize,
+}
+
+impl HostHead {
+    /// The head of `file` with the final norm's epsilon `eps`. Refused by name: either tensor
+    /// missing from the file, `output.weight` of other than two dimensions, a vocabulary of no
+    /// rows, and a row width other than the gain's.
+    pub fn open(file: Arc<Split>, eps: f32) -> Result<HostHead, GpuError> {
+        const WHAT: &str = "HostHead::open";
+        let norm = output_norm();
+        let (gain_shard, gain_info) = file
+            .find(&norm)
+            .ok_or_else(|| GpuError::tensor(WHAT, norm.clone(), "in the file"))?;
+        let gain_file = file
+            .shard(gain_shard)
+            .ok_or_else(|| GpuError::shape(WHAT, format!("no shard {gain_shard} in the file")))?;
+        let gain = f32_tensor(gain_file, gain_info)?;
+        let (shard, out) = file
+            .find(HEAD_TENSOR)
+            .map(|(s, t)| (s, t.clone()))
+            .ok_or_else(|| GpuError::tensor(WHAT, HEAD_TENSOR, "in the file"))?;
+        let &[k, n_vocab] = out.dims.as_slice() else {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "{HEAD_TENSOR} is {:?}, want a width and a vocabulary",
+                    out.dims
+                ),
+            ));
+        };
+        if n_vocab == 0 || usize::try_from(k).ok() != Some(gain.len()) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "{HEAD_TENSOR} is {k} values wide over {n_vocab} rows, the norm gain is {}",
+                    gain.len()
+                ),
+            ));
+        }
+        let n_vocab = usize::try_from(n_vocab)
+            .map_err(|_| GpuError::shape(WHAT, format!("{n_vocab} rows past usize")))?;
+        Ok(HostHead {
+            file,
+            shard,
+            out,
+            gain,
+            eps,
+            n_vocab,
+        })
+    }
+
+    /// The normed row and the logits of the input row `x`: the final RMS norm by the gain, then
+    /// the projection by `output.weight`'s own type (`model::ops::matmul_q`, which quantizes the
+    /// row into the format that type reads). Refused by name: a row of another width than the
+    /// head's and the projection's own refusals.
+    fn project(&self, x: &[f32]) -> Result<(Vec<f32>, Vec<f32>), GpuError> {
+        const WHAT: &str = "Head::tokens";
+        if x.len() != self.gain.len() {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a row of {} values, the head takes {}",
+                    x.len(),
+                    self.gain.len()
+                ),
+            ));
+        }
+        let row = Tensor2 {
+            ne0: x.len(),
+            ne1: 1,
+            data: x.to_vec(),
+        };
+        let normed = rms_norm(&row, &self.gain, self.eps);
+        let gguf = self
+            .file
+            .shard(self.shard)
+            .ok_or_else(|| GpuError::shape(WHAT, format!("no shard {} in the file", self.shard)))?;
+        let mut logits = matmul_q(gguf, &self.out, &normed)?;
+        if (logits.ne0, logits.ne1) != (self.n_vocab, 1) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the projection wrote {} x {}, the head's row is {} logits",
+                    logits.ne0, logits.ne1, self.n_vocab
+                ),
+            ));
+        }
+        Ok((normed.data.clone(), std::mem::take(&mut logits.data)))
+    }
+}
+
+/// The token of `logits`, one row: the first index of the largest value, the card argmax's rule.
+/// A logit that is not finite is refused by name, as the card's argmax over f32 rows refuses it.
+fn host_argmax(logits: &[f32]) -> Result<u32, GpuError> {
+    const WHAT: &str = "Head::tokens";
+    let mut best: Option<(usize, f32)> = None;
+    for (i, &v) in logits.iter().enumerate() {
+        if !v.is_finite() {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("logit {i} is {v}: the host head's argmax refuses a non-finite logit"),
+            ));
+        }
+        if best.is_none_or(|(_, b)| v > b) {
+            best = Some((i, v));
+        }
+    }
+    let (i, _) = best.ok_or_else(|| GpuError::shape(WHAT, "a head of no logits"))?;
+    u32::try_from(i).map_err(|_| GpuError::shape(WHAT, format!("token {i} past u32")))
+}
+
 /// The resident output head for `m` rows: input `m * hidden` f32 (row-major,
 /// one row per token), the normed rows, their q8_1 quantization, `n_vocab * m`
 /// logits (`logits[v*m + c]`, the gemv's layout) and `m` argmax tokens. Every
@@ -302,6 +436,9 @@ pub struct Head {
     q5k: Option<Q5kHead>,
     /// An NVFP4 head's kernels and forms.
     nvfp4: Option<Nvfp4Head>,
+    /// The head of a plan that reads it on the host ([`Head::host`]): the card holds the input
+    /// row alone, and the normed rows, logits and readback words here stay as allocated.
+    host: Option<HostHead>,
 }
 
 /// The kernels a Q5_K head's projection launches: the `_sel` Q5_K gemv, which
@@ -460,6 +597,36 @@ impl Head {
             rows_done,
             q5k,
             nvfp4,
+            host: None,
+        })
+    }
+
+    /// The decode head, `m = 1`, of a plan that leaves the head on the host: the input row on
+    /// the card, written by the chain's last launch, and everything past it `host`'s
+    /// ([`Head::enqueue`] launches nothing; the readback runs the norm, the projection and the
+    /// argmax on the host). Load-time only.
+    pub fn host(gpu: &Gpu, host: HostHead) -> Result<Head, GpuError> {
+        let stream = gpu.stream();
+        let (hidden, n_vocab) = (host.gain.len(), host.n_vocab);
+        Ok(Head {
+            fin: Final::Rms {
+                normed: DeviceBuffer::zeroed(stream, hidden)?,
+            },
+            gain: output_norm(),
+            eps: host.eps,
+            hidden,
+            n_vocab,
+            m: 1,
+            x: DeviceBuffer::zeroed(stream, hidden)?,
+            act: None,
+            logits: DeviceBuffer::zeroed(stream, n_vocab)?,
+            token_out: DeviceBuffer::from_host(stream, &[0u32; 3])?,
+            copied: PinnedHostBuffer::zeroed(stream.context(), 3)?,
+            copied_at: stream.context().new_event(None)?,
+            rows_done: None,
+            q5k: None,
+            nvfp4: None,
+            host: Some(host),
         })
     }
 
@@ -557,6 +724,10 @@ impl Head {
         out: &Weights,
         epilogue: &mut dyn FnMut(&mut DeviceBuffer<f32>) -> Result<(), GpuError>,
     ) -> Result<(), GpuError> {
+        if self.host.is_some() {
+            // The host holds the norm's gain and the projection: the readback runs them.
+            return Ok(());
+        }
         let stream = gpu.stream();
         let shape = (self.eps, self.hidden, self.m);
         let rows = norm_rows(
@@ -803,7 +974,23 @@ impl Head {
     /// [`HeadNorm::Mixed`] the input, `result_embd`). Blocking read;
     /// gate/debug use.
     pub fn normed_to_host(&self, gpu: &Gpu) -> Result<Vec<f32>, GpuError> {
+        if let Some(h) = &self.host {
+            return Ok(self.host_row(gpu, h)?.0);
+        }
         Ok(self.normed().to_host_vec(gpu.stream())?)
+    }
+
+    /// The normed row and the logits of the input row as it stands, a host head's readback: the
+    /// engine stream waited for, a raised fault refused, the row copied and projected on the
+    /// host.
+    fn host_row(&self, gpu: &Gpu, h: &HostHead) -> Result<(Vec<f32>, Vec<f32>), GpuError> {
+        const WHAT: &str = "Head::tokens";
+        let stream = gpu.stream();
+        crate::host::await_done(WHAT, || stream.query())?;
+        if let Some(fault) = gpu.fault()? {
+            return Err(GpuError::fault(WHAT, fault));
+        }
+        h.project(&self.x.to_host_vec(stream)?)
     }
 
     /// [`Head::normed_to_host`]'s rows on the card, for a launch on the
@@ -818,6 +1005,9 @@ impl Head {
     /// The logits of the last run (`n_vocab * m` f32, `[v*m + c]`). Blocking
     /// read; gate/debug use.
     pub fn logits_to_host(&self, gpu: &Gpu) -> Result<Vec<f32>, GpuError> {
+        if let Some(h) = &self.host {
+            return Ok(self.host_row(gpu, h)?.1);
+        }
         Ok(self.logits.to_host_vec(gpu.stream())?)
     }
 
@@ -829,6 +1019,17 @@ impl Head {
     /// [`Head::logits_to_host`] into `out`, which holds exactly `n_vocab * m`
     /// f32: a caller reading every token reuses one buffer. Blocking read.
     pub fn logits_into_host(&self, gpu: &Gpu, out: &mut [f32]) -> Result<(), GpuError> {
+        if let Some(h) = &self.host {
+            let logits = self.host_row(gpu, h)?.1;
+            if out.len() != logits.len() {
+                return Err(GpuError::shape(
+                    "Head::logits_into_host",
+                    format!("a buffer of {} f32 for {} logits", out.len(), logits.len()),
+                ));
+            }
+            out.copy_from_slice(&logits);
+            return Ok(());
+        }
         if out.len() != self.logits.len() {
             return Err(GpuError::shape(
                 "Head::logits_into_host",
@@ -863,6 +1064,12 @@ impl Head {
     /// card's stream, for [`Head::copied_token`]: the readback of a run with
     /// later work queued behind it. Never inside a capture.
     pub fn copy_tokens(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
+        if self.host.is_some() {
+            return Err(GpuError::state(
+                "Head::copy_tokens",
+                "readback words on the card (this head reads on the host)",
+            ));
+        }
         let stream = gpu.stream();
         // SAFETY: `copied` is this head's pinned twin of `token_out`, as long
         // as it; the host reads it only once `copied_at`, recorded right
@@ -896,7 +1103,10 @@ impl Head {
     /// The argmax tokens of the last run, one per row ([`read_tokens`] of
     /// [`Head::token_words`]).
     pub fn tokens(&self, gpu: &Gpu) -> Result<Vec<u32>, GpuError> {
-        read_tokens(gpu, &self.token_out)
+        match &self.host {
+            Some(h) => Ok(vec![host_argmax(&self.host_row(gpu, h)?.1)?]),
+            None => read_tokens(gpu, &self.token_out),
+        }
     }
 }
 
@@ -1137,6 +1347,210 @@ mod tests {
             other => panic!("want the raised fault, got {other:?}"),
         }
         assert!(refuse_readback_fault(FAULT_NONE, 0).is_ok());
+    }
+
+    /// Bytes of one Q6_K super-block.
+    const Q6K_BLOCK: usize = 210;
+
+    /// `rows` rows of `k` values of Q6_K as the file's block bytes: random codes and scales, and
+    /// each block's `d` (its last two bytes) a small finite f16, so no dot is NaN or infinite.
+    fn q6k_rows(rows: usize, k: usize) -> Vec<u8> {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut out = vec![0u8; rows * (k / 256) * Q6K_BLOCK];
+        for block in out.as_chunks_mut::<Q6K_BLOCK>().0 {
+            for chunk in block[..Q6K_BLOCK - 2].chunks_mut(8) {
+                let v = next(&mut state).to_le_bytes();
+                chunk.copy_from_slice(&v[..chunk.len()]);
+            }
+            let (exp, mant) = (5 + next(&mut state) % 4, next(&mut state) & 0x3ff);
+            let bits = u16::try_from(exp << 10 | mant).expect("an f16");
+            block[Q6K_BLOCK - 2..].copy_from_slice(&bits.to_le_bytes());
+        }
+        out
+    }
+
+    /// A GGUF file of `tensors` (name, dims, type, bytes) in a fresh temp directory: the file's
+    /// path, whose parent the caller removes.
+    fn write_file(tag: &str, tensors: &[(&str, Vec<u64>, GgmlType, &[u8])]) -> std::path::PathBuf {
+        let decls: Vec<TensorDecl> = tensors
+            .iter()
+            .map(|(name, dims, ty, bytes)| TensorDecl {
+                name: (*name).to_string(),
+                dims: dims.clone(),
+                type_id: ty.as_u32(),
+                nbytes: bytes.len() as u64,
+            })
+            .collect();
+        let dir = std::env::temp_dir().join(format!("bloomery-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temp dir");
+        let path = dir.join("head.gguf");
+        let layout = Layout::new(&[], decls.clone()).expect("a layout");
+        let file = std::io::BufWriter::new(std::fs::File::create(&path).expect("the file"));
+        let mut writer = Writer::new(file, layout).expect("a writer");
+        for (decl, (_, _, _, bytes)) in decls.iter().zip(tensors) {
+            writer.tensor(&decl.name, bytes).expect("a tensor");
+        }
+        writer.finish().expect("a finished file");
+        path
+    }
+
+    /// A host head reads the rows it is handed: the normed row is the input scaled by the gain
+    /// and the rms (the gain applied), each logit is the dot of the dequantized Q6_K row with
+    /// that row within the q8 rounding of the activation, the token is the first largest logit,
+    /// and the card holds no readback words to copy.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_a_host_head_projects_the_rows_it_reads() {
+        const K: usize = 512;
+        const N_VOCAB: usize = 600;
+        const EPS: f32 = 1e-6;
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let rows = q6k_rows(N_VOCAB, K);
+        let gain: Vec<f32> = (0..K).map(|i| 0.5 + (i % 7) as f32 / 10.0).collect();
+        let gain_bytes: Vec<u8> = gain.iter().flat_map(|g| g.to_le_bytes()).collect();
+        let path = write_file(
+            "host-head",
+            &[
+                (
+                    HEAD_TENSOR,
+                    vec![K as u64, N_VOCAB as u64],
+                    GgmlType::Q6_K,
+                    &rows,
+                ),
+                (
+                    "output_norm.weight",
+                    vec![K as u64],
+                    GgmlType::F32,
+                    &gain_bytes,
+                ),
+            ],
+        );
+        let split = Arc::new(Split::open(&path).expect("the file opens"));
+        let w = Weights::load_where(gpu.stream(), &split, |n| n == output_norm())
+            .expect("the gain resident");
+        let host = HostHead::open(Arc::clone(&split), EPS).expect("a host head");
+        let mut head = Head::host(&gpu, host).expect("a host head");
+        assert_eq!((head.hidden(), head.n_vocab()), (K, N_VOCAB));
+        let x: Vec<f32> = (0..K)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 25.0)
+            .collect();
+        head.set_input(&gpu, &x).expect("the input");
+        head.enqueue(&gpu, &w).expect("the head launches nothing");
+
+        let normed = head.normed_to_host(&gpu).expect("the normed row");
+        let mean_sq = x.iter().map(|&v| f64::from(v) * f64::from(v)).sum::<f64>() / K as f64;
+        let inv = 1.0 / (mean_sq + f64::from(EPS)).sqrt();
+        for i in 0..K {
+            let want = f64::from(x[i]) * f64::from(gain[i]) * inv;
+            assert!(
+                (f64::from(normed[i]) - want).abs() <= 1e-5 * want.abs().max(1.0),
+                "normed[{i}] is {}, the gain-scaled row is {want}",
+                normed[i]
+            );
+        }
+        let logits = head.logits_to_host(&gpu).expect("the logits");
+        assert_eq!(logits.len(), N_VOCAB);
+        let row_bytes = K / 256 * Q6K_BLOCK;
+        let mut wv = vec![0.0f32; K];
+        for (r, &got) in logits.iter().enumerate() {
+            dequant_row(
+                GgmlType::Q6_K,
+                &rows[r * row_bytes..(r + 1) * row_bytes],
+                &mut wv,
+            )
+            .expect("a Q6_K row");
+            let terms = wv
+                .iter()
+                .zip(&normed)
+                .map(|(&a, &b)| f64::from(a) * f64::from(b));
+            let want: f64 = terms.clone().sum();
+            let scale = terms.map(|t| t * t).sum::<f64>().sqrt();
+            assert!(
+                (f64::from(got) - want).abs() <= 0.03 * scale + 1e-6,
+                "row {r}: the host's {got}, the dequantized dot {want} (the row's own scale {scale})"
+            );
+        }
+        let best = (0..N_VOCAB).fold(0, |b, i| if logits[i] > logits[b] { i } else { b });
+        assert_eq!(head.token(&gpu).expect("the token") as usize, best);
+        assert_eq!(head.tokens(&gpu).expect("the tokens"), vec![best as u32]);
+        assert!(
+            head.copy_tokens(&gpu).is_err(),
+            "a host head has no readback words on the card"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().expect("the temp dir"));
+    }
+
+    /// The host head's argmax is the first index of the largest logit, ties included, and a
+    /// logit that is not finite is refused by name rather than ranked.
+    #[test]
+    fn the_host_argmax_is_the_first_largest_and_refuses_a_non_finite_logit() {
+        assert_eq!(host_argmax(&[1.0, 3.0, 2.0, 3.0, -1.0]).unwrap(), 1);
+        assert_eq!(host_argmax(&[-4.0, -2.0, -3.0, -2.0]).unwrap(), 1);
+        assert_eq!(host_argmax(&[0.0; 5]).unwrap(), 0);
+        assert_eq!(host_argmax(&[7.0]).unwrap(), 0);
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let err = host_argmax(&[1.0, bad, 2.0]).unwrap_err().to_string();
+            assert!(
+                err.contains("logit 1") && err.contains("non-finite"),
+                "{bad}: {err}"
+            );
+        }
+        assert!(host_argmax(&[]).is_err());
+    }
+
+    /// A host head of a file that lacks a tensor or whose tensors disagree on the width is
+    /// refused by name at the open, not at the first token.
+    #[test]
+    fn a_host_head_of_a_file_without_its_tensors_is_refused_by_name() {
+        const K: usize = 256;
+        let rows = q6k_rows(8, K);
+        let gain = vec![0u8; 4 * K];
+        let short = vec![0u8; 4 * (K / 2)];
+        let head = |k: u64| (HEAD_TENSOR, vec![k, 8], GgmlType::Q6_K, rows.as_slice());
+        let open = |tag: &str, tensors: &[(&str, Vec<u64>, GgmlType, &[u8])]| {
+            let path = write_file(tag, tensors);
+            let split = Arc::new(Split::open(&path).expect("the file opens"));
+            let err = HostHead::open(split, 1e-6).err().map(|e| e.to_string());
+            let _ = std::fs::remove_dir_all(path.parent().expect("the temp dir"));
+            err
+        };
+        let no_gain = open("host-head-no-gain", &[head(K as u64)]).expect("a refusal");
+        assert!(
+            no_gain.contains("output_norm.weight") && no_gain.contains("in the file"),
+            "{no_gain}"
+        );
+        let no_out = open(
+            "host-head-no-out",
+            &[("output_norm.weight", vec![K as u64], GgmlType::F32, &gain)],
+        )
+        .expect("a refusal");
+        assert!(no_out.contains(HEAD_TENSOR), "{no_out}");
+        let wide = open(
+            "host-head-wide",
+            &[
+                head(K as u64),
+                (
+                    "output_norm.weight",
+                    vec![(K / 2) as u64],
+                    GgmlType::F32,
+                    &short,
+                ),
+            ],
+        )
+        .expect("a refusal");
+        assert!(
+            wide.contains(&format!("{K} values wide"))
+                && wide.contains(&format!("gain is {}", K / 2)),
+            "{wide}"
+        );
+        let whole = open(
+            "host-head-whole",
+            &[
+                head(K as u64),
+                ("output_norm.weight", vec![K as u64], GgmlType::F32, &gain),
+            ],
+        );
+        assert!(whole.is_none(), "a whole head opens: {whole:?}");
     }
 
     /// The merge of every split of a row into N = 1, 2 and 4 parts, each part's pick its

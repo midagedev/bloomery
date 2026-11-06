@@ -34,8 +34,14 @@
 //!   and the same logits bits (an FNV-1a over the last row's bits).
 //! - `reserve`: a plan made with a tier reserve of 0 where the load makes tier places is refused
 //!   by name at the load (`tier places`).
-//! - `host head`: a plan whose stage card carries no head (the head read on the host) is refused
-//!   by name at the load: the body ends its step in a card head.
+//! - `host head`: a plan whose stage card carries no head (its head tensors left on the host, read
+//!   in place) loads, and fed the whole-card body's ids each step's logits row is within
+//!   [`HOST_HEAD_REL_BAND`] relative L2 of the same plan's load with the head on the card: the
+//!   head's bytes leave the stage card's budget, so the experts split alike and the head is the
+//!   one difference (the host's activation format and dot against the card's q8_1 gemv).
+//! - `host head fault`: a fault planted on the card is the host head's readback error, not a token.
+//! - `host head refused`: a plan with no head card whose head tensors are not left on the host
+//!   is refused by name at the load.
 //! - `host share`: a plan whose tier card is budgeted under what the experts need (per-card
 //!   budgets: the stage at the window's first, the tier below) leaves experts on the host; the
 //!   load holds the plan's counts per layer, and fed the whole-card body's ids each step's logits
@@ -86,7 +92,7 @@ mod gate {
     use bloomery_gpu::arch::kimi_k3::Body;
     use bloomery_gpu::host::node;
     use bloomery_gpu::model::StepMode;
-    use bloomery_gpu::{Gpu, GpuModel};
+    use bloomery_gpu::{Fault, FaultSite, Gpu, GpuError, GpuModel};
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::tier::{self, Tier};
     use bloomery_gpu_gates::{
@@ -123,6 +129,14 @@ mod gate {
     /// the card's (q8_1) set the floor, `gate_hybrid`'s error model.
     /// PIN(2026-11-06): twice the worst measured step (8.16e-2); the swapped betas read 5.8e-1.
     const HOST_REL_BAND: f64 = 1.6e-1;
+
+    /// The worst step's logits row's relative L2 distance of a load whose head the host reads from
+    /// the same plan's load with the head on the card, both fed the same ids over the same expert
+    /// split: only the final norm's and the projection's activation format and dot order differ
+    /// (the host's q8_2 and fused dot against the card's q8_1 gemv).
+    /// PIN(2026-11-06): twice the worst measured step (7.73e-3, inside the 3e-3 to 2e-2 derived
+    /// from two int8 activation roundings of one normed row); the final norm skipped reads 5.3e-1.
+    const HOST_HEAD_REL_BAND: f64 = 1.6e-2;
 
     /// The fixed walk: a multiplicative walk through ids the vocabulary holds.
     fn walk(n: usize, vocab: usize) -> Vec<u32> {
@@ -592,6 +606,7 @@ mod gate {
         pass &= placed(&inputs, budget, host, (&prompt, &want))?;
         pass &= tier_only(&inputs, &table, host, (&prompt, &want))?;
         pass &= refusals(&inputs, budget, host)?;
+        pass &= host_head(&inputs, (budget, host), (&prompt, &want))?;
         pass &= host_share(&inputs, &table, (budget, host), (&prompt, &want))?;
         pass &= host_without_tier(&inputs, &table, (budget, host))?;
         pass &= node_family_and_records(&prompt, budget)?;
@@ -822,30 +837,125 @@ mod gate {
             &format!("the load of a plan with a tier reserve of 0: {text:?}"),
         );
 
-        // A plan with no head card reads the head on the host, which the body has no stage for.
-        // The head's bytes leave the stage card, so its budget loses them and the experts split
-        // as the gate's plan does.
-        let head_bytes: u64 = plan
-            .rows
+        // A plan with no head card whose head tensors are on no host: neither a card head nor a
+        // host head stage exists. The plan is made headless and its head rows moved to the card.
+        let mut headless = bp_machine(inputs)?;
+        for card in &mut headless.cards {
+            card.head = false;
+        }
+        let mut plan = inputs.plan(
+            &headless,
+            CTX as u64,
+            &under(budget - card_head_bytes(inputs, budget)?),
+        )?;
+        let model = plan.model;
+        for row in &mut plan.rows {
+            if model.tensors[row.tensor].role == Role::Head {
+                for segment in &mut row.segments {
+                    segment.device = Device::Card(0);
+                }
+            }
+        }
+        let file = open_split(Arch::KimiK3, RECIPE)?;
+        let text = refused(GpuModel::<Body>::open_placed(file, &plan, inputs, 0, host));
+        tier::sc(
+            "host head refused: a plan with no head card and no host head is refused by name",
+        )?;
+        pass &= line(
+            text.as_deref()
+                .is_some_and(|t| t.contains("carries no head") && t.contains("output.weight")),
+            "host head refused",
+            &format!("the load of a plan with no head card and its head on a card: {text:?}"),
+        );
+        Ok(pass)
+    }
+
+    /// The bytes the plan at card budget `budget` puts on the stage card for the head tensors.
+    fn card_head_bytes(inputs: &PlanInputs, budget: u64) -> Result<u64, GateError> {
+        let machine = bp_machine(inputs)?;
+        let plan = inputs.plan(&machine, CTX as u64, &under(budget))?;
+        Ok(head_bytes(&plan))
+    }
+
+    /// The bytes the plan puts on cards for the head tensors.
+    fn head_bytes(plan: &Plan<'_>) -> u64 {
+        plan.rows
             .iter()
             .filter(|r| plan.model.tensors[r.tensor].role == Role::Head)
             .flat_map(|r| &r.segments)
             .filter(|s| matches!(s.device, Device::Card(_)))
             .map(|s| s.resident_bytes)
-            .sum();
+            .sum()
+    }
+
+    /// A plan whose stage card carries no head, its head tensors left on the host: the load
+    /// opens, and fed the whole-card body's ids each step's logits row is within
+    /// [`HOST_HEAD_REL_BAND`] of the same plan's load with the head on the card, which holds the
+    /// same expert split (the head's bytes leave the stage card's budget). A fault planted on
+    /// the card is then the host head's readback error.
+    fn host_head(
+        inputs: &PlanInputs,
+        (budget, host): (u64, HostCfg),
+        (prompt, want): (&[u32], &Run),
+    ) -> Result<bool, GateError> {
+        let machine = bp_machine(inputs)?;
+        let with = inputs.plan(&machine, CTX as u64, &under(budget))?;
         let mut headless = bp_machine(inputs)?;
         for card in &mut headless.cards {
             card.head = false;
         }
-        let plan = inputs.plan(&headless, CTX as u64, &under(budget - head_bytes))?;
+        let without = inputs.plan(&headless, CTX as u64, &under(budget - head_bytes(&with)))?;
+        let on_host = without
+            .rows
+            .iter()
+            .filter(|r| without.model.tensors[r.tensor].role == Role::Head)
+            .all(|r| matches!(r.segments.as_slice(), [s] if s.device == Device::Host));
+        let same = layer_splits(&with) == layer_splits(&without);
+        tier::sc("host head: the host head's logits rows read the card head's")?;
+        let mut pass = line(
+            on_host && same && head_bytes(&without) == 0,
+            "precondition host head",
+            &format!(
+                "the headless plan leaves the head tensors on the host ({on_host}) and splits the \
+                 experts as the plan with the card head does ({same})"
+            ),
+        );
         let file = open_split(Arch::KimiK3, RECIPE)?;
-        let text = refused(GpuModel::<Body>::open_placed(file, &plan, inputs, 0, host));
-        tier::sc("host head: a plan that reads the head on the host is refused by name")?;
+        let mut m = GpuModel::<Body>::open_placed(file, &with, inputs, 0, host)?;
+        m.set_mode(StepMode::Graph);
+        let have = forced(&mut m, prompt, &want.ids)?;
+        drop(m);
+        let file = open_split(Arch::KimiK3, RECIPE)?;
+        let mut m = GpuModel::<Body>::open_placed(file, &without, inputs, 0, host)?;
+        m.set_mode(StepMode::Graph);
+        let got = forced(&mut m, prompt, &want.ids)?;
+        let dists: Vec<f64> = have.iter().zip(&got).map(|(w, g)| rel(w, g)).collect();
+        let shown: Vec<String> = dists.iter().map(|d| format!("{d:.2e}")).collect();
+        let (at, worst) = dists
+            .iter()
+            .copied()
+            .enumerate()
+            .fold((0, 0.0), |b, (i, d)| if d > b.1 { (i, d) } else { b });
         pass &= line(
-            text.as_deref()
-                .is_some_and(|t| t.contains("reads the head on the host")),
+            got.len() == have.len() && worst <= HOST_HEAD_REL_BAND,
             "host head",
-            &format!("the load of a plan with no head card: {text:?}"),
+            &format!(
+                "fed the whole-card ids {:?}, each step's logits row relative L2 of the card \
+                 head's {shown:?}, worst {worst:.3e} at step {at}, band {HOST_HEAD_REL_BAND:.1e}",
+                want.ids
+            ),
+        );
+
+        tier::sc("host head fault: a planted fault is the host head's readback error")?;
+        m.plant_fault(Fault::at(3, FaultSite::CachePos))?;
+        let r = m.step(&[want.ids[0]]);
+        pass &= line(
+            matches!(r, Err(GpuError::Fault { .. })),
+            "host head fault",
+            &format!(
+                "a fault planted before a step: {:?}",
+                r.map_err(|e| e.to_string())
+            ),
         );
         Ok(pass)
     }

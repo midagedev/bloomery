@@ -449,6 +449,7 @@ impl Body {
             lane,
             router,
             ctx,
+            out_score,
             ..
         } = self;
         let Pass {
@@ -592,7 +593,10 @@ impl Body {
                     n_banks: pushed,
                     stride,
                     cur: &*pa,
-                    score: w.f32_buf(ROWS, names::OUTPUT_RES_SCORE)?,
+                    score: out_score
+                        .as_ref()
+                        .unwrap_or(w)
+                        .f32_buf(ROWS, names::OUTPUT_RES_SCORE)?,
                     eps,
                     n,
                     m,

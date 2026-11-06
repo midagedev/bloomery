@@ -14,3 +14,52 @@ pub use body::placed::Placed;
 pub use body::rows::{Pass, Tail};
 pub use body::{Body, TAP_STAGES};
 pub use tier::NODE_FAMILY;
+
+#[cfg(test)]
+mod tests {
+    use gguf::GgmlType;
+    use gguf::arch::kimi_k3 as table;
+
+    use super::{body::DENSE_TYPES, kda::TYPES};
+    use crate::site::{PROJECTED, SiteTy};
+
+    /// A card site list holds every type the table lists for the stems the site serves, but
+    /// BF16 (which the load widens), and each of its types is a launch of the common dense site.
+    /// Mutant: a table type dropped from a list, or a type no dense launch runs added to one.
+    #[test]
+    fn the_card_site_lists_hold_the_tables_trunk_types() {
+        let lists: [(&[SiteTy], &[&str]); 2] = [
+            (
+                DENSE_TYPES,
+                &["ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"],
+            ),
+            (
+                TYPES,
+                &[
+                    "attn_q.weight",
+                    "attn_k.weight",
+                    "attn_v.weight",
+                    "ssm_g.weight",
+                    "ssm_beta.weight",
+                    "ssm_f_a.weight",
+                    "ssm_f_b.weight",
+                    "attn_output.weight",
+                ],
+            ),
+        ];
+        for (list, stems) in lists {
+            for ty in list {
+                assert!(PROJECTED.contains(ty), "{ty} has no dense launch");
+            }
+            for stem in stems {
+                let listed =
+                    table::allowed_types(stem).unwrap_or_else(|| panic!("{stem} is no stem"));
+                for ty in listed {
+                    if !list.iter().any(|s| s.ggml() == *ty) {
+                        assert_eq!(*ty, GgmlType::BF16, "{stem}: {ty} is listed and not run");
+                    }
+                }
+            }
+        }
+    }
+}
