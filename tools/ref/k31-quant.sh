@@ -201,13 +201,13 @@ shard_path() { # <first shard> <1-based index>
   n=$(shard_count "$1")
   if [ "$n" = 1 ]; then echo "$1"; else printf '%s-%05d-of-%05d.gguf\n' "${1%-00001-of-*}" "$2" "$n"; fi
 }
-set_ident() { # "path size mtime" per shard; a missing shard is refused by name
+set_ident() { # "path size mtime" per shard, of the file a symlinked shard names; a missing shard is refused by name
   local n i p
   n=$(shard_count "$1")
   for ((i = 1; i <= n; i++)); do
     p=$(shard_path "$1" "$i")
     [ -f "$p" ] || die "shard $i of $n of the set $1 is missing: $p" 66
-    stat -c '%n %s %Y' "$p"
+    stat -L -c '%n %s %Y' "$p"
   done
 }
 set_bytes() { set_ident "$1" | awk '{ s += $(NF-1) } END { printf "%d", s }'; }
