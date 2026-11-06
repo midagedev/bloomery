@@ -165,6 +165,9 @@ mimo2 = ["gpu", "dep:bloomery-gpu-mimo2", "bloomery-app/mimo2"]
 solar2 = ["gpu", "dep:bloomery-gpu-solar2", "bloomery-app/solar2"]
 minimaxm3 = ["gpu", "dep:bloomery-gpu-minimaxm3", "bloomery-app/minimaxm3"]
 flint = ["gpu", "dep:bloomery-gpu-flint", "bloomery-app/flint"]
+# The Kimi K3 seat of `bloomery-serve` (serve_seats/kimi_k3.rs) and its gate: the body lives in `bloomery-gpu` itself, so the
+# feature adds no dependency; `deepseek41` brings the serve crate and the app crate the seat sits on.
+kimik3 = ["gpu"]
 gemma-embedding2 = ["gpu", "gemma4a", "dep:bloomery-gpu-vision", "dep:bloomery-gpu-gemma-embedding2", "dep:bloomery-serve"]
 gemma4a = ["gpu", "dep:bloomery-gpu-gemma4a", "dep:bloomery-vision"]
 mistrallarge4 = ["gpu", "dep:bloomery-gpu-deepseek41", "dep:bloomery-gpu-mistrallarge4", "bloomery-app/mistrallarge4"]
@@ -185,7 +188,7 @@ required-features = ["deepseek41"]
 [[bin]]
 name = "bloomery-serve"
 path = "src/bin/bloomery_serve.rs"
-required-features = ["glm5next", "clef", "mimo2", "solar2", "minimaxm3", "flint", "mistrallarge4", "gemma-embedding2", "hf"]
+required-features = ["glm5next", "clef", "mimo2", "solar2", "minimaxm3", "flint", "kimik3", "mistrallarge4", "gemma-embedding2", "hf"]
 
 [[bin]]
 name = "bloomery-serve-ds41"
@@ -396,6 +399,12 @@ required-features = ["deepseek41", "solar2"]
 [[bin]]
 name = "gate_minimaxm3_serve"
 required-features = ["deepseek41", "minimaxm3"]
+
+# kimik3-serve: the Kimi K3 seat of bloomery-serve over the fixture file: the start order, one chat, the finish token, a cut that
+# keeps the position or nothing, the tools request refused by name, `--parallel` above one refused.
+[[bin]]
+name = "gate_kimi_k3_serve"
+required-features = ["deepseek41", "kimik3"]
 
 [[bin]]
 name = "gate_mimo2_serve"

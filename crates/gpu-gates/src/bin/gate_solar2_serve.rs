@@ -204,7 +204,7 @@ mod gate {
             listening: &record::LISTENING_SOLAR2,
             arch: "solar-open2",
             layers,
-            think: THINK_TAGS,
+            think: Some(THINK_TAGS),
             turn_end: TURN_END,
             ctx: CTX,
             // The KDA layers' recurrent state keeps a shared prefix only where the sequence

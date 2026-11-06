@@ -126,7 +126,7 @@ SERVES = {
 SERVES_NO_READER = {"host": ("deepseek2",)}
 SERVES_VIA_FROM_NAME = {"glm": ("Glm5next",), "solar2": ("SolarOpen2",), "minimaxm3": ("MiniMaxM3",), "nemotron": ("NemotronH", "NemotronHMoe"),
                         "raon1": ("Raon1",), "musespark": ("MuseSpark",), "flint": ("Flint",),
-                        "mistrallarge4": ("MistralLarge4",)}
+                        "mistrallarge4": ("MistralLarge4",), "kimik3": ("KimiK3",)}
 # crates/gpu-gates/src/qwen_seat.rs:Family::pick — the programs a program-served seat serves (Model::serves_arch asks
 # Family::of). crates/placement/src/accepts.rs:program_of — the program that runs each crates/models Arch variant, here
 # the variants of those programs; crates/models/src/lib.rs:Arch::name — the architecture string of each variant.
@@ -139,7 +139,7 @@ MODELS_ARCH_NAME = {"Qwen3Moe": "qwen3moe", "Qwen35Moe": "qwen35moe", "Qwen35": 
 # crates/gpu-gates/src/bin/bloomery_serve.rs:Model::ALL and Model::word — the generative seats in the order
 # the refusal of an unserved file lists them; crates/serve/src/decide.rs:WORD is the decide seat's word.
 SEAT_ORDER = ("ds41", "qwen38", "glm", "qwen3", "mimo2", "solar2", "minimaxm3", "nemotron", "raon1", "musespark", "flint",
-              "mistrallarge4", "host")
+              "kimik3", "mistrallarge4", "host")
 DECIDE_WORD = "decide"
 # tools/arch-registry.tsv, the registry's print: FROM_NAME is crates/model/src/arch/mod.rs:Arch::from_name — variant -> the
 # strings that name it; SPEC is crates/model/src/arch/mod.rs:spec — the architectures the model reader takes (the
@@ -2088,7 +2088,7 @@ def self_test():
         line, green, _ = row_line("glm", "glm5nextx", small)
         check("a glm5nextx file is refused by name",
               not green and "arch=glm5nextx route=REFUSED: a glm5nextx file, which no seat serves; the seats are "
-              "--model ds41, qwen38, glm, qwen3, mimo2, solar2, minimaxm3, nemotron, raon1, musespark, flint, mistrallarge4, "
+              "--model ds41, qwen38, glm, qwen3, mimo2, solar2, minimaxm3, nemotron, raon1, musespark, flint, kimik3, mistrallarge4, "
               "host, decide" in line, line)
         line, green, _ = row_line("glm", "deepseek41", small)
         check("a file the router seats elsewhere is refused for the row's seat",

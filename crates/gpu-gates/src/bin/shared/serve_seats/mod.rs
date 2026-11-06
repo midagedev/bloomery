@@ -3,7 +3,7 @@
 //! behind [`bloomery_gpu_gates::bind::Seat`], with a `run(&args)` a binary
 //! calls once. The per-model binaries (`bloomery-serve-ds41`,
 //! `bloomery-serve-qwen38`) include their one seat directly; the one-binary
-//! server (`bloomery-serve --model ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|musespark|mistrallarge4|nemotron`)
+//! server (`bloomery-serve --model ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|musespark|mistrallarge4|kimik3|nemotron`)
 //! includes this registry and is one call into the seat the model names.
 //!
 //! A seat's module is its contract's owner: read it for the flags, the
@@ -24,7 +24,7 @@
 //! the recipient protocol; [`nemotron`] the Nemotron 3 Nano seat, one
 //! sequence on one card, opened as `gate_nemotron_e2e` opens it.
 //! [`hybrid`] holds the open, load record and calls of the one-chain seat
-//! ([`solar2`]). [`host_seat`] is the host seat: the file's own host forward with
+//! ([`solar2`], [`flint`], [`kimi_k3`]). [`host_seat`] is the host seat: the file's own host forward with
 //! no card (deepseek2 today), served through `serve::TargetEngine`.
 //! `drafted` is the
 //! seats' shared MTP draft driver and `served` the owner of the DSpark draft
@@ -97,8 +97,14 @@ pub mod musespark;
 pub mod mistrallarge4;
 // The seat of a body that runs one chain on one card, fed in prompt batches
 // (`solar2`): its open, its load record, its calls and its think tags.
-#[cfg(all(feature = "deepseek41", any(feature = "solar2", feature = "flint")))]
+#[cfg(all(
+    feature = "deepseek41",
+    any(feature = "solar2", feature = "flint", feature = "kimik3")
+))]
 pub mod hybrid;
+// The Kimi K3 seat, on the hybrid seat's owner: one sequence, its prompt stepped one id at a time.
+#[cfg(all(feature = "deepseek41", feature = "kimik3"))]
+pub mod kimi_k3;
 // The nemotron seat sits behind `deepseek41` for the same reason: the server
 // surface it binds through is scoped to it, and it runs no V4.1 code. The
 // body it serves is in the gpu crate, so it needs no feature of its own.

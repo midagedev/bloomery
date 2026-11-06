@@ -21,9 +21,10 @@ use bloomery_gpu::host::served::TierBody;
 use bloomery_gpu::model::{ChainBody, StepMode};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::bind::{Seat, note_line};
-use bloomery_gpu_gates::generate::{Lane, Place};
+use bloomery_gpu_gates::generate::{Lane, Place, TierRule};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::side_seat;
+use bloomery_levers::{Levers, ResidencyPick};
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::models::ReasoningFormat;
@@ -59,11 +60,27 @@ pub trait Family: Sized + 'static {
     /// The files the seat serves.
     const SERVES: &'static str;
 
+    /// The family's input to the common unset rule and the tier cards its body serves
+    /// ([`Tiered::TIER_RULE`]). The default serves none, and a placement that names a tier card is
+    /// refused by name.
+    const TIER_RULE: TierRule = TierRule::UNTIERED;
+
+    /// Whether the body feeds the prompt one id at a step, each id a decode pass the residency
+    /// rule would count, and so serves no residency but `off` ([`Tiered::prefill_steps`]). The
+    /// default feeds batches.
+    const PREFILL_STEPS: bool = false;
+
     /// Whether `arch` is a file this seat serves.
     fn accepts(arch: Arch) -> bool;
 
     /// The file's plan inputs, its own reading.
     fn read(split: &Split) -> Result<PlanInputs<Self::H>, PlacementError>;
+
+    /// `ctx` positions refused by name when the body cannot serve that many; asked of the context
+    /// as given, before any plan, and of the context the plan chose ([`Tiered::check_ctx`]).
+    fn check_ctx(_inputs: &PlanInputs<Self::H>, _ctx: usize) -> Result<(), GateError> {
+        Ok(())
+    }
 
     /// Price the chosen prompt group before the common context probes.
     fn configure(_inputs: &mut PlanInputs<Self::H>, _group: usize) -> Result<(), GateError> {
@@ -98,10 +115,11 @@ pub trait Family: Sized + 'static {
 
     /// The tags the model's description names for its think span, which the
     /// server splits the reasoning on ([`serve::Server::with_think_tags`]); the
-    /// description of every file of the family names them.
-    fn think_tags(inputs: &PlanInputs<Self::H>) -> Result<ThinkTags, GateError> {
+    /// description of every file of the family names them. A family whose
+    /// description names none and serves plain text says `None`.
+    fn think_tags(inputs: &PlanInputs<Self::H>) -> Result<Option<ThinkTags>, GateError> {
         match inputs.spec.chat.reasoning {
-            Some(ReasoningFormat::ThinkSpan { open, close }) => Ok(ThinkTags { open, close }),
+            Some(ReasoningFormat::ThinkSpan { open, close }) => Ok(Some(ThinkTags { open, close })),
             None => Err(format!("the {} description names no reasoning tags", Self::FAMILY).into()),
         }
     }
@@ -339,6 +357,7 @@ impl<F: Family> Tiered for Hybrid<F> {
     const ALIAS: &'static str = F::ALIAS;
     const FAMILY: &'static str = F::FAMILY;
     const SERVES: &'static str = F::SERVES;
+    const TIER_RULE: TierRule = F::TIER_RULE;
     const RESIDENT: bool = <<F::Body as Batch>::Sequences as SequenceSlots<F::Body>>::RESIDENT;
     const ONE_PASS: bool = false;
 
@@ -354,12 +373,31 @@ impl<F: Family> Tiered for Hybrid<F> {
         F::configure(inputs, group)
     }
 
+    fn check_ctx(inputs: &PlanInputs<Self::H>, ctx: usize) -> Result<(), GateError> {
+        F::check_ctx(inputs, ctx)
+    }
+
+    fn prefill_steps(_flags: &()) -> bool {
+        F::PREFILL_STEPS
+    }
+
+    /// The common machine's pick ([`tiered::residency_pick`]) with the family's prompt feed: a
+    /// step-fed body is `off` unset and refuses any other word by name.
+    fn residency(
+        levers: &Levers,
+        _flags: &(),
+        place: Place,
+        plan: &Plan<'_>,
+    ) -> Result<Option<ResidencyPick>, GateError> {
+        tiered::residency_pick(levers, place, plan, F::PREFILL_STEPS, Self::UNHOSTED_POOL).map(Some)
+    }
+
     fn flags(_flag: &str, _value: &str, _out: &mut ()) -> Result<bool, GateError> {
         Ok(false)
     }
 
     fn think(inputs: &PlanInputs<Self::H>) -> Result<Option<ThinkTags>, GateError> {
-        F::think_tags(inputs).map(Some)
+        F::think_tags(inputs)
     }
 
     fn tier_batch(

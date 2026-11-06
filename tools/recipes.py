@@ -15410,9 +15410,10 @@ def _st_real_tree(fails: list[str], side: Side) -> None:
     # PIN(2026-10-26): gate-gpu-llama-serve joins them; its recipe builds bloomery-serve beside its own bin.
     # PIN(2026-11-02): gate-gpu-mistrallarge4-serve joins them; its recipe builds bloomery-serve beside its own bin.
     # PIN(2026-11-04): gate-host-serve joins them; its recipe builds bloomery-serve for the host seat beside its own bin.
+    # PIN(2026-11-06): gate-gpu-kimik3-serve joins them; its recipe builds bloomery-serve beside its own bin, whose K3 seat names the module.
     expect(dspark == {"gate-gpu-clef-serve", "gate-gpu-ds41-chat", "gate-gpu-ds41-draft", "gate-gpu-ds41-dspark-loop",
                       "gate-gpu-ds41-engram-layout", "gate-gpu-ds41-prefill", "gate-gpu-ds41-tier", "gate-gpu-ds41-twocard", "gate-gpu-gemma-embedding-serve", "gate-gpu-gemma-embedding2-serve", "gate-gpu-glm5next-serve",
-                      "gate-gpu-lev-serve", "gate-gpu-llama-serve", "gate-gpu-minimaxm3-serve", "gate-gpu-minimaxm3-twocard", "gate-gpu-mistrallarge4-serve", "gate-gpu-musespark-serve", "gate-gpu-musespark-twocard", "gate-gpu-nemotron-h-moe-serve", "gate-gpu-nemotron-serve",
+                      "gate-gpu-kimik3-serve", "gate-gpu-lev-serve", "gate-gpu-llama-serve", "gate-gpu-minimaxm3-serve", "gate-gpu-minimaxm3-twocard", "gate-gpu-mistrallarge4-serve", "gate-gpu-musespark-serve", "gate-gpu-musespark-twocard", "gate-gpu-nemotron-h-moe-serve", "gate-gpu-nemotron-serve",
                       "gate-gpu-qwen3-dspark", "gate-gpu-qwen3-serve", "gate-gpu-qwen38-media", "gate-gpu-serve-start-ds41", "gate-gpu-serve-start-glm", "gate-gpu-solar2-serve", "gate-host-serve", "gate-ptx-spill", "gate-serve-draft-rules"},
            f"shared/ds41_dspark.rs (a #[path] module of the bins that name it) selects {sorted(dspark)}")
     hybrid = sel("crates/gpu/src/hybrid.rs")

@@ -7,6 +7,7 @@
 mod body;
 mod kda;
 pub mod moe;
+mod seat;
 mod state;
 mod tier;
 

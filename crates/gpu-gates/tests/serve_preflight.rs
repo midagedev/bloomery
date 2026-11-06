@@ -744,6 +744,7 @@ fn hw_preflight_normal_inputs_reach_the_fetch() {
         "raon1",
         "musespark",
         "flint",
+        "kimik3",
         "decide",
     ] {
         let alias = !["qwen3", "decide"].contains(&model);
@@ -980,7 +981,7 @@ fn clean_refusal(dir: &std::path::Path, err: &str, before_model: bool) {
 /// the refusal "no model file". The words that name no catalog model keep that refusal, now the class `no-model`.
 #[test]
 fn preflight_missing_model_source() {
-    for model in ["raon1", "flint", "decide"] {
+    for model in ["raon1", "flint", "kimik3", "decide"] {
         checked_refusal_as(
             &format!("{model}-missing-source"),
             &["--model", model],
@@ -1038,6 +1039,7 @@ fn preflight_every_seat_refuses_a_zero_context() {
         ("raon1", common),
         ("musespark", common),
         ("flint", common),
+        ("kimik3", common),
         ("decide", whole),
     ] {
         checked_refusal(
@@ -1063,6 +1065,7 @@ fn preflight_template_file() {
         "raon1",
         "musespark",
         "flint",
+        "kimik3",
     ] {
         checked_refusal(
             &format!("{model}-template"),
