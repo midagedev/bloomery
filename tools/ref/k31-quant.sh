@@ -90,6 +90,8 @@ ORIG_ARGS=("$@")
 # ---- the derivation: the terms and where each came from (a number measured is named so; the rest is [derived]) ----
 K3_BYTES=594030000000       # the K3 UD-IQ1_S set: 14 shards, `ls -l` on the box (594.03 GB)
 K3_CHUNK_S=546.5            # measured: k3trace's sizing chunk on that set, one 2048-token call (majflt 4.8 M, window read ~1.13 TB)
+K3_CHUNK_READ_S=396         # derived: the chunk's read share (the set streams once a chunk at -ub ctx), the rest is the CPU share
+K3_CHUNK_CPU_S=150.5        # derived: 2048 tokens of forward on the CPU; it scales with the chunk's tokens (--ctx), the read share does not
 K3_POPULATE_S=367.6         # measured: k3trace's load_s on that set (MAP_POPULATE of the whole file; 368-429 s over its runs)
 K31_BYTES=1560000000000     # derived: the K3.1 GGUF from prepare: 1.56 TB (MXFP4 experts + the trunk), the k31 report's sizes
 K31_EXPERT_W=2722740000000  # derived from shapes: the 276 routed-expert tensors of K3's table, 3584 x 3072 x 896 each (K3.1 has K3's)
@@ -225,8 +227,9 @@ key_of() { printf '%s\n' "$@" | sha256sum | cut -d' ' -f1; }
 splice() { python3 -I "$SPLICE" "$@"; }
 
 # ---- the derived walls (seconds; every number above is a term here) ----
-pred_imatrix() { # <bytes> <chunks>: populate + chunks x one chunk, both scaled by bytes from the measured K3 set
-  awk -v b="$1" -v n="$2" -v kb="$K3_BYTES" -v c="$K3_CHUNK_S" -v p="$K3_POPULATE_S" 'BEGIN { printf "%d", (p + n * c) * b / kb + 0.5 }'
+pred_imatrix() { # <bytes> <chunks> <ctx>: populate + chunks x (read share + CPU share x ctx/2048), all scaled by bytes from the measured K3 set
+  awk -v b="$1" -v n="$2" -v x="$3" -v kb="$K3_BYTES" -v r="$K3_CHUNK_READ_S" -v c="$K3_CHUNK_CPU_S" -v p="$K3_POPULATE_S" \
+    'BEGIN { printf "%d", (p + n * (r + c * x / 2048)) * b / kb + 0.5 }'
 }
 pred_quantize() { # <bytes> <threads>: read + quantizer CPU + write, in sequence (the quantizer reads a tensor, quantizes it, writes it)
   awk -v b="$1" -v e="$QUANT_EFF_THREADS" -v r="$QUANT_RATE_MW" -v rd="$NVME_READ_GBS" -v wr="$NVME_WRITE_GBS" -v o="$OUT_PER_IN" \
@@ -237,7 +240,7 @@ pred_splice() { # the receiving shard read, written and read back, at the drive'
 }
 pred_of() { # <step> <bytes>
   case $1 in
-    imatrix) pred_imatrix "$2" "$CHUNKS" ;;
+    imatrix) pred_imatrix "$2" "$CHUNKS" "$CTX" ;;
     quantize) pred_quantize "$2" ;;
     splice) pred_splice ;;
   esac
@@ -587,7 +590,7 @@ do_imatrix() {
   pred=$(pred_of imatrix "$IN_BYTES")
   bound=$(bound_of "$pred")
   say "imatrix: input $IN ($IN_SHARDS shard(s), $IN_BYTES bytes), ctx $CTX, chunks $CHUNKS, threads $THREADS"
-  plan_line imatrix "$IN_BYTES" "populate $K3_POPULATE_S s + $CHUNKS x $K3_CHUNK_S s (measured on the $K3_BYTES-byte K3 set) x $IN_BYTES/$K3_BYTES"
+  plan_line imatrix "$IN_BYTES" "populate $K3_POPULATE_S s + $CHUNKS x ($K3_CHUNK_READ_S s read + $K3_CHUNK_CPU_S s CPU x $CTX/2048) (a 2048-token chunk measured $K3_CHUNK_S s on the $K3_BYTES-byte K3 set) x $IN_BYTES/$K3_BYTES"
   if [ "$IN_BYTES" != "$K31_BYTES" ] && [ "$SMOKE" = 0 ]; then
     say "plan imatrix: for the 1.56 TB K3.1 file: $(hms "$(pred_of imatrix "$K31_BYTES")")"
   fi
