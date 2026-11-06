@@ -76,6 +76,8 @@ fi
 source "$__ref_paths_profile"
 unset __ref_paths_profile
 IKBIN=${IKBIN:-$IK/build/bin/llama-bench}
+# The K3.1 quantization tree (tools/ref/build-k3-quant-tree.sh): the llama-quantize and libggml-base the quantizer gates compare with.
+K3QUANT=${K3_QUANT_TREE:-/home/user/llama.cpp-kimik3-quant}
 : "${BLOOMERY_DATA:=/root/bloomery-data}"
 
 REF_PATHS_DIR=${BASH_SOURCE[0]%/*}

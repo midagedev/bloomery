@@ -251,6 +251,7 @@ dependencies = [
  "bloomery-model-hf",
  "bloomery-os",
  "bloomery-qdot",
+ "bloomery-quantize",
  "bloomery-record",
  "bloomery-refset",
  "bloomery-runtime",
@@ -512,6 +513,16 @@ dependencies = [
  "bloomery-gguf",
  "bloomery-refset",
  "bloomery-threads",
+]
+
+[[package]]
+name = "bloomery-quantize"
+version = "0.1.0"
+dependencies = [
+ "bloomery-gguf",
+ "bloomery-os",
+ "bloomery-threads",
+ "thiserror",
 ]
 
 [[package]]

@@ -18,7 +18,7 @@
 #   quantize  llama-quantize --allow-requantize --imatrix <that> --tensor-type-file <rules> [--keep-split] <in> <out> <ftype>, the map
 #             --map says (below), after llama-quantize's own --dry-run plan of every tensor's type and size over the input's headers
 #             (kept in $K3Q_WORK; the output is held to it tensor by tensor afterwards)
-#             With --gpu-quant, iq_quant_set (crates/gpu-gates, the card's IQ1_S/IQ2_XXS quantizer, ggml's bytes by gate-gpu-iq-quant)
+#             With --gpu-quant, bloomery-quantize (crates/gpu-gates, the card's IQ1_S/IQ2_XXS quantizer, ggml's bytes by gate-gpu-iq-quant)
 #             first writes the input's shards again with every tensor that plan types IQ1_S or IQ2_XXS already quantized (the imatrix's
 #             importance as llama-quantize computes it) and the rest copied, to --gpu-set; llama-quantize then reads that set and
 #             copies those tensors (their type is the target), quantizing only the trunk. The card set is removed once the output passes.
@@ -78,8 +78,8 @@
 #   --pred-s           print the predicted wall in whole seconds (no file is read) and exit: the box queue's BLOOMERY_Q_PRED_S
 #   --lease            smoke only: take the CPU lease with the smoke's card (the 1-thread rate is a measurement)
 #   --max-trunk-gb N   quantize: refuse when the plan's trunk class exceeds N GB (default 35 for tight; 0 = off)
-#   --gpu-quant        quantize: the IQ1_S/IQ2_XXS tensors on the card first (above); needs target/release/iq_quant_set (`just
-#                      iq-quant-set` builds it) and a card (tools/gpu-gate.sh takes its lock)     [K3Q_GPU_QUANT=1]
+#   --gpu-quant        quantize: the IQ1_S/IQ2_XXS tensors on the card first (above); needs target/release/bloomery-quantize (`just
+#                      quantize` builds it) and a card (tools/gpu-gate.sh takes its lock)     [K3Q_GPU_QUANT=1]
 #   --gpu-set DIR      --gpu-quant's card set, under $K3Q_WORK or --out-base (default $K3Q_WORK/<the output's name>.gpuset; it needs
 #                      GPUSET_PER_IN x the input's bytes, 0.66 TB for K3.1: a drive without the room is refused before the run)  [K3Q_GPU_SET]
 #   --hf-folder DIR    the K3.1 HF folder: prepare's input, the LICENSE and the source revision   [K3Q_HF_FOLDER] (/data/models/Kimi-K3.1-Pro)
@@ -779,20 +779,20 @@ do_plan() {
   rm -f "$rules"
 }
 
-gpu_set() { # <imatrix> <output prefix>: --gpu-quant's card set (iq_quant_set over $IN with the plan $PLAN_TSV) -> $GSET; sets GFIRST
-  local im=$1 prefix=$2 marker gkey pred bound gq=$ROOT/target/release/iq_quant_set
+gpu_set() { # <imatrix> <output prefix> <rules file>: --gpu-quant's card set (bloomery-quantize over $IN with the rules $rules, cross-checked against the plan $PLAN_TSV) -> $GSET; sets GFIRST
+  local im=$1 prefix=$2 rules=$3 marker gkey pred bound gq=$ROOT/target/release/bloomery-quantize
   GSET=${GPU_SET:-$WORK/$prefix.gpuset}
   case $GSET in "$WORK"/* | "$OUT_BASE"/*) ;; *) die "--gpu-set $GSET: under $WORK or $OUT_BASE (a partial set is removed by name only there)" 64 ;; esac
   marker=$WORK/gpuset-$TAG.done
   pred=$(pred_gpuset "$IN_BYTES")
   bound=$(bound_of "$pred")
   GFIRST=$(named_first "$IN" "$GSET" "$prefix")
-  say "gpu-quant: iq_quant_set on the card -> $GSET ($(awk -v b="$IN_BYTES" -v g="$GPUSET_PER_IN" 'BEGIN { printf "%.0f", b * g / 1e9 }') GB derived): $K31_STACKS stacks x $GPU_STACK_S s of card (measured, the read under it) + the set written at $NVME_WRITE_GBS GB/s, scaled by the input's bytes; wall $(hms "$pred"), bound ${bound}s"
-  [ -x "$gq" ] || [ "$DRY" = 1 ] || die "no $gq: just iq-quant-set builds it (with no ARGS it stops at its usage)" 66
+  say "gpu-quant: bloomery-quantize on the card -> $GSET ($(awk -v b="$IN_BYTES" -v g="$GPUSET_PER_IN" 'BEGIN { printf "%.0f", b * g / 1e9 }') GB derived): $K31_STACKS stacks x $GPU_STACK_S s of card (measured, the read under it) + the set written at $NVME_WRITE_GBS GB/s, scaled by the input's bytes; wall $(hms "$pred"), bound ${bound}s"
+  [ -x "$gq" ] || [ "$DRY" = 1 ] || die "no $gq: just quantize builds it (with no ARGS it stops at its usage)" 66
   force_clean "$marker" "$GSET"
   partial_clean "$GSET.partial"
   if [ "$DRY" = 0 ]; then
-    gkey=$(key_of gpuset "$(sha_of "$gq")" "$(set_ident "$IN")" "$(sha_of "$im")" "$(sha_of "$PLAN_TSV")")
+    gkey=$(key_of gpuset "$(sha_of "$gq")" "$(set_ident "$IN")" "$(sha_of "$im")" "$(sha_of "$PLAN_TSV")" "$(sha_of "$rules")")
     if marker_state "$marker" "$gkey" "$GSET"; then
       say "gpu-quant: done before ($marker, $GSET): skipped"
       return 0
@@ -806,9 +806,9 @@ gpu_set() { # <imatrix> <output prefix>: --gpu-quant's card set (iq_quant_set ov
       { rmdir "$GSET.partial"; die "--gpu-set $GSET: its drive has $avail B free, the card set needs ~$need B (GPUSET_PER_IN x the input, +5 %): --gpu-set on a drive with the room" 65; }
   fi
   run gpuset "$bound" env -C "$ROOT" BLOOMERY_GATE_BOUND="$bound" BLOOMERY_GATE_CARD="${BLOOMERY_GATE_CARD:-any}" \
-    bash tools/gpu-gate.sh iq_quant_set "$IN" --imatrix "$im" --plan "${PLAN_TSV:-<the plan tsv>}" --out "$GSET.partial/$prefix" || fail_step gpuset $?
+    bash tools/gpu-gate.sh bloomery-quantize "$IN" "$GSET.partial/$prefix" --imatrix "$im" --tensor-type-file "$rules" --llama-plan "${PLAN_TSV:-<the plan tsv>}" || fail_step gpuset $?
   [ "$DRY" = 0 ] || return 0
-  [ -f "$(named_first "$IN" "$GSET.partial" "$prefix")" ] || die "iq_quant_set ended 0 but wrote no $(named_first "$IN" "$GSET.partial" "$prefix")" 65
+  [ -f "$(named_first "$IN" "$GSET.partial" "$prefix")" ] || die "bloomery-quantize ended 0 but wrote no $(named_first "$IN" "$GSET.partial" "$prefix")" 65
   mv "$GSET.partial" "$GSET"
   write_marker "$marker" "$gkey" "$GSET" "plan=$PLAN_TSV"
 }
@@ -871,8 +871,8 @@ do_quantize() {
     if [ -e "$qdir" ] && [ ! -f "$marker" ]; then die "$qdir exists and no done marker says this run made it: --force removes it, or --out-base elsewhere" 65; fi
     key=$(key_of quantize "$MAP" "$TYPE" "$(sha_of "$Q")" "$(set_ident "$IN")" "$(sha_of "$im")" "$(sha_of "$rules")" "$qthreads")
     if [ "$GPUQ" = 1 ]; then
-      [ -x "$ROOT/target/release/iq_quant_set" ] || die "no $ROOT/target/release/iq_quant_set: just iq-quant-set builds it (with no ARGS it stops at its usage)" 66
-      key=$(key_of "$key" gpu "$(sha_of "$ROOT/target/release/iq_quant_set")")
+      [ -x "$ROOT/target/release/bloomery-quantize" ] || die "no $ROOT/target/release/bloomery-quantize: just quantize builds it (with no ARGS it stops at its usage)" 66
+      key=$(key_of "$key" gpu "$(sha_of "$ROOT/target/release/bloomery-quantize")")
     fi
     if marker_state "$marker" "$key" "$qdir"; then
       QFIRST=$(named_first "$IN" "$qdir" "$qprefix")
@@ -883,7 +883,7 @@ do_quantize() {
   fi
   local qin=$IN
   if [ "$GPUQ" = 1 ]; then
-    gpu_set "$im" "$qprefix"
+    gpu_set "$im" "$qprefix" "$rules"
     qin=$GFIRST
   fi
   quant_args "$rules" "$im"

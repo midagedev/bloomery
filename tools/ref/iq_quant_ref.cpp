@@ -6,7 +6,7 @@
 //   iq_quant_ref <in> <out>
 //
 // <in>, little-endian: the magic "IQQ1"; u32 dst type and u32 src type (ggml ids: IQ2_XXS 16, IQ1_S 19 / F32 0,
-// MXFP4 39); u64 n_per_row, nrows, rows_per_expert, n_expert; then nrows source rows of the src type; then
+// F16 1, BF16 30, MXFP4 39); u64 n_per_row, nrows, rows_per_expert, n_expert; then nrows source rows of the src type; then
 // n_expert x n_per_row f32 importance values. The source rows are widened to f32 by ggml's own to_float (what
 // llama-quantize does to a tensor it requantizes), and each expert's rows are quantized by ggml_quantize_chunk with
 // that expert's importance row, as llama_tensor_quantize_impl calls it. <out> gets the rows' block bytes in order.
@@ -47,8 +47,8 @@ int main(int argc, char ** argv) {
     if (dt != GGML_TYPE_IQ1_S && dt != GGML_TYPE_IQ2_XXS) {
         return fail("dst type is neither IQ1_S nor IQ2_XXS");
     }
-    if (st != GGML_TYPE_F32 && st != GGML_TYPE_MXFP4) {
-        return fail("src type is neither F32 nor MXFP4");
+    if (st != GGML_TYPE_F32 && st != GGML_TYPE_F16 && st != GGML_TYPE_BF16 && st != GGML_TYPE_MXFP4) {
+        return fail("src type is none of F32, F16, BF16 and MXFP4");
     }
     if (n == 0 || n % 256 != 0 || per == 0 || nrows % per != 0 || nrows / per > nexp) {
         return fail("geometry: n_per_row a multiple of 256, whole experts, enough importance rows");

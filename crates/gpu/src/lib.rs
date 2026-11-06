@@ -2982,6 +2982,20 @@ impl Gpu {
         Gpu::with_device(Gpu::resolve_card(name, device)?)
     }
 
+    /// `with_device` on visible device `ordinal` (the driver's, under `CUDA_VISIBLE_DEVICES`): a tool that has no
+    /// plan opens the card its `--card N` names. An ordinal no visible device has is refused by name with how many
+    /// are visible.
+    pub fn open_ordinal(ordinal: usize) -> Result<Gpu, GpuError> {
+        let visible = census()?.len();
+        if ordinal >= visible {
+            return Err(GpuError::shape(
+                "Gpu::open_ordinal",
+                format!("card {ordinal}: {visible} visible device(s)"),
+            ));
+        }
+        Gpu::with_device(ordinal)
+    }
+
     /// The ordinal of the visible device a plan's card is, with every refusal
     /// of [`Gpu::open_card`] that names a card and none of its context or
     /// module load: what a load checks before it starts work beside the open.
