@@ -16,6 +16,10 @@
 #           a tree of its own, since a rebuild moves the libllama md5 the oracle sets name. The default IK is only so IKBIN can be
 #           formed: ik has no Kimi K3 graph (its delta layer is the K2 dialect).
 #
+#   K31_SMOKE_INDEXER   the tensors one DSA layer of K3.1 carries for its lightning indexer, as the synthetic indexer file of
+#           tools/ref/k31-quant.sh's smoke writes them: one `<name>:<dims>` per tensor, `@L@` in the name standing for the layer
+#           number and the dims comma-separated. The dims are the smoke's own small ones, the names are the GGUF's.
+#
 # The dump (tools/ref/kimi-k3-dump.sh) hides CUDA and takes the CPU lease.
 #
 # SC2034: every name here is read by the file that sources this one.
@@ -24,3 +28,10 @@ MODEL_NAME=kimi-k3
 : "${IK:=/home/user/ik-idxkey}"
 : "${LCPP:=/home/user/llama.cpp-kimik3}"
 MODEL=${BLOOMERY_REF_MODEL:-/models/Kimi-K3-UD-IQ1_S/Kimi-K3-UD-IQ1_S-00001-of-00014.gguf}
+K31_SMOKE_INDEXER=(
+  'blk.@L@.indexer.attn_q_b.weight:16,24'
+  'blk.@L@.indexer.attn_k.weight:8,512'
+  'blk.@L@.indexer.proj.weight:4,512'
+  'blk.@L@.indexer.k_norm.weight:8'
+  'blk.@L@.indexer.k_norm.bias:8'
+)

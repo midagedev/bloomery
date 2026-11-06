@@ -843,7 +843,7 @@ render_card() { # <README.md to write> <the set's first shard (in the .partial d
   else
     bcommit=$(git -C "$ROOT" rev-parse --short=9 HEAD 2> /dev/null) || { bcommit=unknown; say "the bloomery tree at $ROOT is not a git checkout (the box's copy has no .git): the card says the commit is unknown; K3Q_TOOLS_COMMIT=<sha> names it"; }
   fi
-  toolsline="llama.cpp \`$lcommit\` (mainline; llama-quantize sha256 \`$(sha_of "$Q" | cut -c1-12)\`, llama-imatrix sha256 \`$(sha_of "$IMAT" | cut -c1-12)\`); bloomery \`$bcommit\` (tools/ref/gguf-splice.py, tools/ref/k31-quant.sh)."
+  toolsline="mainline llama.cpp \`$lcommit\` (llama-quantize sha256 \`$(sha_of "$Q" | cut -c1-12)\`, llama-imatrix sha256 \`$(sha_of "$IMAT" | cut -c1-12)\`); bloomery \`$bcommit\` (tools/ref/gguf-splice.py, tools/ref/k31-quant.sh)."
   flags="llama-quantize --allow-requantize --imatrix <imatrix.gguf> --tensor-type-file <rules.txt> --output-tensor-type q6_k --token-embedding-type $TOKEMB --keep-split <k3-shaped-input.gguf> <output.gguf> ${QTYPE:-$TYPE} <threads>"
   splice classes --in "$first" --md > "$d/classes.md" || { rm -rf "$d"; exit 65; }
   splice list --in "$first" --gguf-py off | awk '/^shard / { n = split($3, p, "/"); t = $4; b = $6; sub(/^tensors=/, "", t); sub(/^bytes=/, "", b); rows = rows "| " $2 " | " p[n] " | " t " | " b " |\n" }
@@ -1050,21 +1050,24 @@ use_prepared() { # --in and --indexer default to prepare's outputs when its mark
   fi
 }
 
-make_indexer_script() { # <file>: a synthetic indexer GGUF through gguf-py's own writer (a third party to gguf-splice's)
+make_indexer_script() { # <file>: a synthetic indexer GGUF through gguf-py's own writer (a third party to gguf-splice's); its tensors are the profile's K31_SMOKE_INDEXER, passed as arguments after the layer list
   cat > "$1" << 'PY'
 import sys
 import numpy as np
 sys.dont_write_bytecode = True
 sys.path.insert(0, sys.argv[1] + "/gguf-py")
 import gguf
-out, layers = sys.argv[2], [int(x) for x in sys.argv[3].split(",")]
+out, layers, specs = sys.argv[2], [int(x) for x in sys.argv[3].split(",")], sys.argv[4:]
+if not specs:
+    sys.exit("make-indexer: no <name>:<dims> tensor given (the profile's K31_SMOKE_INDEXER)")
 w = gguf.GGUFWriter(out, "kimi-k3")
 rng = np.random.default_rng(7)
 for l in layers:
-    for name, shape in ((f"blk.{l}.indexer.attn_q_b.weight", (16, 24)), (f"blk.{l}.indexer.attn_k.weight", (8, 512)),
-                        (f"blk.{l}.indexer.proj.weight", (4, 512)), (f"blk.{l}.indexer.k_norm.weight", (8,)), (f"blk.{l}.indexer.k_norm.bias", (8,))):
+    for spec in specs:
+        name, dims = spec.rsplit(":", 1)
+        shape = tuple(int(d) for d in dims.split(","))
         bits = (rng.standard_normal(shape).astype(np.float32).view(np.uint32) >> 16).astype(np.uint16)  # bfloat16's bits
-        w.add_tensor(name, bits, raw_dtype=gguf.GGMLQuantizationType.BF16)
+        w.add_tensor(name.replace("@L@", str(l)), bits, raw_dtype=gguf.GGMLQuantizationType.BF16)
 w.write_header_to_file()
 w.write_kv_data_to_file()
 w.write_tensors_to_file()
@@ -1089,6 +1092,7 @@ smoke_rate() { # <the input's tensor list> <the quantized set's list>: the quant
 do_smoke() {
   local fx=${K3Q_FIXTURE:-/models/fixtures/kimik3/kimi-k3-fixture-00001-of-00001.gguf} s=$WORK first_src first_like first_strip first_rt n=3 b
   CARD=k31-smoke
+  [ -n "${K31_SMOKE_INDEXER[*]:-}" ] || die "the profile $MODEL_NAME names no K31_SMOKE_INDEXER tensor: the smoke's synthetic indexer file has nothing to write" 70
   if [ "$DRY" = 0 ]; then
     [ -f "$fx" ] || die "no fixture at $fx" 66
     for b in "$Q" "$IMAT" "$TOKENIZE" "$GSPLIT"; do [ -x "$b" ] || die "no $b: just build-k3-quant-tree" 66; done
@@ -1130,7 +1134,7 @@ do_smoke() {
     n=$(shard_count "$first_src")
   fi
   say "smoke: stand-in set $first_src ($n shard(s))"
-  run smoke-indexer 300 python3 -I "$s/make-indexer.py" "${LCPP:-/home/user/llama.cpp-kimik3}" "$s/idx.gguf" 1,2 || fail_step smoke-indexer $?
+  run smoke-indexer 300 python3 -I "$s/make-indexer.py" "${LCPP:-/home/user/llama.cpp-kimik3}" "$s/idx.gguf" 1,2 "${K31_SMOKE_INDEXER[@]}" || fail_step smoke-indexer $?
   first_like=$(named_first "$first_src" "$s/k31like" k31like)
   first_strip=$(named_first "$first_src" "$s/stripped" stripped)
   first_rt=$(named_first "$first_src" "$s/roundtrip" rt)
