@@ -48,6 +48,9 @@
 #   --ctx N --chunks N the imatrix's context (2048) and chunk count (4); smoke 512 and 2
 #   --threads N        llama-imatrix and llama-quantize threads                 [K3Q_THREADS]  (default: nproc)
 #   --corpus FILE      a calibration text of your own                           [K3Q_CORPUS]
+#   --corpus-special   imatrix: pass --parse-special, so the text's `<|open|>`, `<|end_of_msg|>`, `[BOS]` ... are read as the control tokens they
+#                      name (without it llama-imatrix tokenizes them as plain characters); needs --corpus (tools/ref/k31-calib-render.py writes
+#                      such a text); part of the step's key and of its marker     [K3Q_CORPUS_SPECIAL=1]
 #   --ref-table TSV    the reference table: name TAB type TAB dims (default crates/model/tests/kimi_k3_tensors.tsv, K3's)
 #   --bump-gateup L|L  --bump-down L|L   layers whose experts get the bump type (IQ2_XXS); IQ1_S derives them from the table
 #   --indexer FILE     the indexer tensors' GGUF (prepare's `--only` output)    [K3Q_INDEXER]
@@ -114,7 +117,7 @@ STEP=$1
 shift
 DRY=0 SMOKE=0 DETACH=0 FORCE=0 PRED=0 USE_LEASE=0
 MAP=${K3Q_MAP:-tight} REPO=midagedev/Kimi-K3.1-Pro-GGUF HF=${K3Q_HF_FOLDER:-/data/models/Kimi-K3.1-Pro} LICENSE_F='' SRC_REV='' PREPARE_BIN='' FOLLOW='' SHARD_GIB='' MAX_TRUNK=''
-TYPE=IQ1_S CTX='' CHUNKS='' IN=${K3Q_IN:-} CORPUS=${K3Q_CORPUS:-} INDEXER=${K3Q_INDEXER:-} DSA=${K3Q_DSA_CONFIG:-}
+TYPE=IQ1_S CTX='' CHUNKS='' IN=${K3Q_IN:-} CORPUS=${K3Q_CORPUS:-} SPECIAL=${K3Q_CORPUS_SPECIAL:-0} INDEXER=${K3Q_INDEXER:-} DSA=${K3Q_DSA_CONFIG:-}
 ARCH=${K3Q_ARCH:-kimi-k31} THREADS=${K3Q_THREADS:-} REF='' OUT_BASE=${K3Q_OUT_BASE:-/models} BUMP_GU='' BUMP_DN='' BUMP_SET=0
 while [ $# -gt 0 ]; do
   case $1 in
@@ -122,6 +125,7 @@ while [ $# -gt 0 ]; do
     --detach) DETACH=1 ;;
     --force) FORCE=1 ;;
     --pred-s) PRED=1 ;;
+    --corpus-special) SPECIAL=1 ;;
     --smoke) SMOKE=1 ;;
     --lease) USE_LEASE=1 ;;
     --map | --repo | --hf-folder | --license | --source-rev | --prepare-bin | --follow | --shard-gib | --max-trunk-gb)
@@ -580,7 +584,12 @@ do_imatrix() {
   CARD=k31-imatrix
   [ "$SMOKE" = 0 ] || CARD=k31-smoke
   [ -x "$IMAT" ] || [ "$DRY" = 1 ] || die "no llama-imatrix at $IMAT: just build-k3-quant-tree" 66
-  local im marker key calib pred bound
+  local im marker key calib pred bound kparts
+  local -a PARSE=()
+  if [ "$SPECIAL" = 1 ]; then
+    [ -n "$CORPUS" ] || die "--corpus-special parses the special tokens of a text of your own: give --corpus (the built calibration text is plain prose and code)" 64
+    PARSE=(--parse-special)
+  fi
   im=$WORK/kimi-k31-c${CTX}x${CHUNKS}.imatrix.gguf
   [ "$SMOKE" = 0 ] || im=$WORK/smoke.imatrix.gguf
   IMATRIX=$im
@@ -614,7 +623,9 @@ do_imatrix() {
     build_calib "$calib" "$IN"
   fi
   if [ "$DRY" = 0 ]; then
-    key=$(key_of imatrix "$CTX" "$CHUNKS" "$THREADS" "$(sha_of "$IMAT")" "$(set_ident "$IN")" "$(sha_of "$calib")")
+    kparts=(imatrix "$CTX" "$CHUNKS" "$THREADS" "$(sha_of "$IMAT")" "$(set_ident "$IN")" "$(sha_of "$calib")")
+    [ "$SPECIAL" != 1 ] || kparts+=(parse-special)
+    key=$(key_of "${kparts[@]}")
     if marker_state "$marker" "$key" "$im"; then
       say "imatrix: done before ($marker, $im): skipped"
       return 0
@@ -623,7 +634,7 @@ do_imatrix() {
   lease_on "$CARD"
   local t0=$SECONDS
   run imatrix "$bound" "${NICE[@]}" env CUDA_VISIBLE_DEVICES= "$IMAT" -m "$IN" -f "$calib" -o "$im.partial" --output-format gguf \
-    -c "$CTX" -b "$CTX" -ub "$CTX" --chunks "$CHUNKS" --no-escape --no-ppl -t "$THREADS" || fail_step imatrix $?
+    -c "$CTX" -b "$CTX" -ub "$CTX" --chunks "$CHUNKS" --no-escape --no-ppl -t "$THREADS" ${PARSE[@]+"${PARSE[@]}"} || fail_step imatrix $?
   if [ "$DRY" = 1 ]; then lease_off; return 0; fi
   lease_off
   [ -s "$im.partial" ] || die "llama-imatrix ended 0 and wrote no $im.partial: see $LOGDIR/imatrix.log" 65
@@ -635,7 +646,7 @@ do_imatrix() {
     <(cut -f1 "$WORK/imatrix.tsv" | sed -E 's/\.(in_sum2|counts)$//' | LC_ALL=C sort -u))
   [ -z "$miss" ] || die "the imatrix has no entry for $(echo "$miss" | wc -l | tr -d ' ') routed-expert tensor(s) of the input, the first $(echo "$miss" | head -1): see $WORK/imatrix.tsv" 65
   mv -f "$im.partial" "$im"
-  write_marker "$marker" "$key" "$im" "entries=$(wc -l < "$WORK/imatrix.tsv" | tr -d ' ') ctx=$CTX chunks=$CHUNKS calib_md5=$(md5sum < "$calib" | cut -d' ' -f1) calib=$(basename "$calib")"
+  write_marker "$marker" "$key" "$im" "entries=$(wc -l < "$WORK/imatrix.tsv" | tr -d ' ') ctx=$CTX chunks=$CHUNKS calib_md5=$(md5sum < "$calib" | cut -d' ' -f1) calib=$(basename "$calib")$([ "$SPECIAL" != 1 ] || echo ' parse_special=1')"
   say "imatrix: done: $im, $(stat -c %s "$im") bytes, $(wc -l < "$WORK/imatrix.tsv" | tr -d ' ') tensors (in_sum2 and counts), every routed-expert tensor of the input covered; wall $((SECONDS - t0)) s for $IN_BYTES B in (derived $pred s)"
 }
 
@@ -823,7 +834,7 @@ render_card() { # <README.md to write> <the set's first shard (in the .partial d
   note=$(sed -n '4p' "$im_marker")
   md5=$(printf '%s' "$note" | sed -n 's/.*calib_md5=\([0-9a-f]*\).*/\1/p')
   [ -n "$md5" ] || { rm -rf "$d"; die "$im_marker records no calibration text (calib_md5): run the imatrix step again (--force)" 65; }
-  if printf '%s' "$note" | grep -q 'calib=calib-c'; then
+  if printf '%s' "$note" | grep -qE 'calib=calib-c[0-9]'; then
     local sf=$WORK/${note##*calib=}.sources dl
     [ -f "$sf" ] || { rm -rf "$d"; die "no source list for the calibration text ($sf): run the calib step, then the imatrix step again (--force)" 66; }
     dl=$(awk -F'\t' -v k="$((CTX / 2))" '{ l[$1] = l[$1] (l[$1] == "" ? "" : ", ") "`" $2 "`" } END { printf "%d documents of %d tokens each, prose: %s; code: %s", NR, k, l["prose"], l["code"] }' "$sf")

@@ -461,6 +461,8 @@ pytools_list() {
     "tools/ref/gguf-respell.py --self-test"
     "tools/ref/gguf-splice.py --self-test"
     "tools/ref/hidden-diff.py --self-test"
+    "tools/ref/k31-calib-gen.py --self-test"
+    "tools/ref/k31-calib-render.py --self-test"
     "tools/ref/kernel-model.py --self-test"
     "tools/ref/lev_ref.py --self-test"
     "tools/ref/loop-floor.py --self-test"
