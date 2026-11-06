@@ -1,0 +1,13 @@
+# nodeskip-tolerant-node: the node's server serves any layer it is asked of,
+# including one its set holds no expert of (Opened::check_service drops its
+# `on_tier(layer)? == 0` refusal). Red: `hw_a_node_refuses_a_layer_it_holds_
+# none_of` expects the refusal by name and sees the request served instead.
+--- a/crates/gpu/src/host/node.rs
++++ b/crates/gpu/src/host/node.rs
+@@ -1777,7 +1777,7 @@
+             missing: "the tier page (the bind request)",
+         })?;
+-        if row >= rows || !(1..=self.cols).contains(&cols) || self.set.on_tier(layer)? == 0 {
++        if row >= rows || !(1..=self.cols).contains(&cols) {
+             return Err(GpuError::shape(
+                 SERVER,

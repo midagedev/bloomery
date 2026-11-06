@@ -977,6 +977,17 @@ impl Link {
         self.word(off).store(v, Ordering::Release);
     }
 
+    /// Add `by` to the word at byte `off` as this end's writer holds it, from
+    /// the host thread: the go of a tier layer the host serves itself
+    /// ([`TierPage::add_go`]) and the done of one it skips
+    /// ([`TierPage::add_unit`]), which the card's stream added before the
+    /// tiers moved off it. The word's other writers are the pump's deliveries
+    /// (this end's reads) and the card's take-backs, each an add of its own,
+    /// so the callers add only beside a page whose crossings are at rest.
+    pub(super) fn add(&self, off: usize, by: u32) {
+        self.word(off).fetch_add(by, Ordering::AcqRel);
+    }
+
     /// Release every wait on this end's counters until their resets: the
     /// counter each reader waits on goes to `v`, far past
     /// anything a step subtracts. Mirrored pages stop carrying every counter
