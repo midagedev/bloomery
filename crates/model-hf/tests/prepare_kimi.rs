@@ -209,6 +209,16 @@ fn the_selection_flags_are_refused_by_name() {
         "{e}"
     );
     assert!(e.contains("--drop 'blk.*.indexer.*'"), "{e}");
+    // --room states the free-space floor: one past the disk refuses by name, a low one passes
+    // the plan the default check would also pass
+    let e = refused(&k3, &["--room", "18446744073709551615"]);
+    assert!(e.contains("--room asks for 18446744073709551615"), "{e}");
+    let e = refused(&k3, &["--room", "1", "--room", "2"]);
+    assert!(e.contains("--room given twice"), "{e}");
+    let e = refused(&k3, &["--room", "lots"]);
+    assert!(e.contains("--room lots"), "{e}");
+    let o = write_split(&k3, &root.join("room-out"), &["--room", "1"]);
+    assert!(o.status.success(), "{}", text(&o));
     let o = prepare(&[k31.to_str().unwrap(), "--plan", "--drop", "blk.*"]);
     assert!(
         !o.status.success() && text(&o).contains("takes no --shard-gib, --drop"),

@@ -9,7 +9,7 @@
 //!
 //!     prepare <folder> <out prefix> [--shard-gib <n>] [--keep-bf16]
 //!             [--drop <glob>]... [--only <glob>]... [--arch <word>]
-//!             [--follow <list> [--follow-stall <seconds>] [--follow-poll <seconds>]]
+//!             [--follow <list> [--follow-stall <seconds>] [--follow-poll <seconds>]] [--room <bytes>]
 //!
 //! writes `<out prefix>-00001-of-0000N.gguf` and on, each shard at most `n` GiB (48 by default)
 //! unless one tensor with its scale and file layout is larger, the metadata in the first.
@@ -30,7 +30,10 @@
 //! (1,271,398,400 bytes of BF16 against 34 bytes a 32 values). The output shard paths must
 //! not exist. A private temporary directory holds the entire split until it passes the
 //! server's reader; the first shard is published last. A persistent `<out prefix>.prepare.lock`
-//! file serializes writers of that prefix. The disk must hold the split and a tenth more.
+//! file serializes writers of that prefix. The disk must hold the split and a tenth more, or the
+//! `--room <bytes>` a caller states when it frees the input behind the writer (`--follow` with a
+//! deleter of the shards the writer has closed): the plan then refuses by name below that many
+//! free bytes instead.
 //! One line per tensor, a summary line, and exit status 1 with the error on any failure. Before
 //! any shard is written, the tokenizer serving builds from the header is checked to split text
 //! and stop generation where Hugging Face's does.
@@ -81,6 +84,7 @@ const USAGE: &str = concat!(
     "usage: prepare <folder> <out prefix> [--shard-gib <n>] [--keep-bf16]\n",
     "                [--drop <glob>]... [--only <glob>]... [--arch <word>]\n",
     "                [--follow <list> [--follow-stall <seconds>] [--follow-poll <seconds>]]\n",
+    "                [--room <bytes>]\n",
     "       prepare <folder> --plan"
 );
 
@@ -113,6 +117,7 @@ fn run_in(args: &[String], q8: bool, unit: u64) -> Res<()> {
     let (mut shard_gib, mut keep_bf16, mut plan, mut paths) = (None, false, false, vec![]);
     let (mut drop, mut only, mut arch) = (vec![], vec![], None);
     let (mut follow, mut stall, mut poll) = (None, None, None);
+    let mut room = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -133,6 +138,13 @@ fn run_in(args: &[String], q8: bool, unit: u64) -> Res<()> {
             }
             "--follow-stall" => stall = Some(seconds("--follow-stall", it.next().ok_or(USAGE)?)?),
             "--follow-poll" => poll = Some(seconds("--follow-poll", it.next().ok_or(USAGE)?)?),
+            "--room" => {
+                let v = it.next().ok_or(USAGE)?;
+                let bytes = v.parse::<u64>().map_err(|e| format!("--room {v}: {e}"))?;
+                if room.replace(bytes).is_some() {
+                    return Err("--room given twice".into());
+                }
+            }
             _ => paths.push(a),
         }
     }
@@ -148,10 +160,11 @@ fn run_in(args: &[String], q8: bool, unit: u64) -> Res<()> {
             || follow.is_some()
             || stall.is_some()
             || poll.is_some()
+            || room.is_some()
         {
             return Err(format!(
                 "--plan prints the folder's stored form and writes no shard: it takes no \
-                 --shard-gib, --drop, --only, --arch or --follow, and {PREPARE_Q8}=1 asks for a \
+                 --shard-gib, --drop, --only, --arch, --follow or --room, and {PREPARE_Q8}=1 asks for a \
                  Q8_0 rewrite it does not plan"
             )
             .into());
@@ -200,6 +213,7 @@ fn run_in(args: &[String], q8: bool, unit: u64) -> Res<()> {
             q8,
             options: &options,
             follow: follow.as_ref(),
+            room,
         },
     )
     .ok_or_else(|| {
@@ -223,6 +237,8 @@ struct WriteSplit<'a> {
     options: &'a folder::Options,
     /// The download to follow, when the folder's shards are still arriving.
     follow: Option<&'a FollowFlags>,
+    /// The free bytes the output directory must hold at the plan, when the caller states one.
+    room: Option<u64>,
 }
 
 /// `--follow` and its two bounds.
@@ -261,6 +277,7 @@ fn write_as<M: FolderMap>(job: &WriteSplit<'_>) -> Res<()> {
         q8,
         options,
         follow,
+        room,
     } = *job;
     let whole = options.select == Select::All;
     let Some(flags) = follow else {
@@ -272,7 +289,7 @@ fn write_as<M: FolderMap>(job: &WriteSplit<'_>) -> Res<()> {
             kvs,
             ..
         } = folder::read_with::<M>(dir, q8, options)?;
-        let split = lay_out(planned, &kvs, limit, prefix, &plan)?;
+        let split = lay_out(planned, &kvs, limit, prefix, &plan, room)?;
         let get = |n: &str| folder.raw(n);
         return write_split(
             prefix,
@@ -292,7 +309,7 @@ fn write_as<M: FolderMap>(job: &WriteSplit<'_>) -> Res<()> {
         kvs,
         ..
     } = run.plan::<M>(&stage.join("shell"), q8, options)?;
-    let split = lay_out(planned, &kvs, limit, prefix, &plan)?;
+    let split = lay_out(planned, &kvs, limit, prefix, &plan, room)?;
     let needs = split
         .shards
         .iter()
@@ -321,13 +338,15 @@ struct SplitPlan<S> {
 }
 
 /// The shards `planned` fills to `limit` bytes, checked against the free space of `prefix`'s
-/// directory, with the summary line.
+/// directory (the split and a tenth more, or `room` bytes when the caller states the floor it
+/// keeps free behind the writer), with the summary line.
 fn lay_out<S>(
     planned: Vec<Planned<S>>,
     kvs: &[(String, Value)],
     limit: u64,
     prefix: &str,
     plan: &hf::quant_config::Plan,
+    room: Option<u64>,
 ) -> Res<SplitPlan<S>> {
     let held: BTreeSet<String> = planned.iter().map(|p| p.decl.name.clone()).collect();
     let tensors = planned.len();
@@ -343,14 +362,24 @@ fn lay_out<S>(
         .unwrap_or(Path::new("."));
     let free = model::fileio::free_bytes(out_dir)
         .map_err(|e| format!("statvfs {}: {e}", out_dir.display()))?;
-    let needed = total
-        .checked_add(total / 10)
-        .ok_or("the split's file sizes and free-space margin overflow u64")?;
+    let needed = match room {
+        Some(room) => room,
+        None => total
+            .checked_add(total / 10)
+            .ok_or("the split's file sizes and free-space margin overflow u64")?,
+    };
     if free < needed {
-        return Err(format!(
-            "{}: {free} bytes free; the split needs {total} and a tenth more",
-            out_dir.display()
-        )
+        return Err(match room {
+            Some(room) => format!(
+                "{}: {free} bytes free; --room asks for {room} (the split is {total})",
+                out_dir.display()
+            ),
+            None => format!(
+                "{}: {free} bytes free; the split needs {total} and a tenth more (--room <bytes> \
+                 states a lower floor when the input is freed behind the writer)",
+                out_dir.display()
+            ),
+        }
         .into());
     }
     println!(
