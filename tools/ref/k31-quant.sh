@@ -998,6 +998,13 @@ do_prepare() {
   if [ "$DRY" = 0 ]; then
     [ -d "$HF" ] || die "no HF folder at $HF (--hf-folder)" 66
     [ -x "$bin" ] || die "no built prepare at $bin (--prepare-bin BIN): build it from the tree whose prepare has --drop, --only and --arch (round k31hf)" 66
+    # A binary under a tree's target/ is what `just box-gc --kill` and a rebuild of that tree take down (a 12 h write died that
+    # way): the step runs a copy of it from the work directory, where no tree's gc or build reaches.
+    case $bin in */target/*)
+      mkdir -p "$WORK/bin" && cp -f "$bin" "$WORK/bin/prepare" || die "cannot copy $bin to $WORK/bin/prepare" 70
+      say "prepare: running $WORK/bin/prepare, a copy of $bin (a tree's target/ is what box-gc and a rebuild take down)"
+      bin=$WORK/bin/prepare ;;
+    esac
     usage=$("$bin" 2>&1 < /dev/null || true)
     for f in --drop --only --arch; do
       case $usage in *"$f"*) ;; *) die "the built prepare at $bin has no $f in its usage: build it from a tree that has --drop, --only and --arch (round k31hf)" 66 ;; esac
