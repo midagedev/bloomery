@@ -5,7 +5,7 @@
     tools/ref/gguf-splice.py add   --in A --from C --take GLOB [--take GLOB ...] --out D [--arch NEW] [--kv KEY=TYPE:VALUE ...] [options]
     tools/ref/gguf-splice.py list  --in A [--tsv] [--gguf-py MODE]
     tools/ref/gguf-splice.py check-shape --in A --names TSV [--types]
-    tools/ref/gguf-splice.py check-rules --rules FILE --table TSV [--in A] [--partial]
+    tools/ref/gguf-splice.py check-rules --rules FILE --table TSV [--in A] [--partial] [--retype Q6_K=Q4_K] [--flag-types NAME=type,...]
     tools/ref/gguf-splice.py compare --a A --b B [--no-data] [--tensors-only]
     tools/ref/gguf-splice.py plan --log DRYRUN.log --out TSV
     tools/ref/gguf-splice.py classes (--tsv TSV | --in A) [--md] [--field CLASS]
@@ -983,25 +983,52 @@ def cmd_check_shape(a):
     return 0
 
 
+def parse_type_pairs(text, what):
+    """`A=B,C=D` as a list of (A, B); every B (and, for --retype, every A) must be a type llama-quantize knows."""
+    out = []
+    for tok in (text or "").split(","):
+        if not tok:
+            continue
+        k, eq, v = tok.partition("=")
+        if not k or not eq or v.lower() not in NAME_TO_ID:
+            raise Refusal(64, f"{what}: {tok!r} is not NAME=type with a type llama-quantize knows")
+        out.append((k, v))
+    return out
+
+
 def cmd_check_rules(a):
-    """The rules against a reference table (and, with --in, a real input): derived from llama-quantize's own decisions."""
+    """The rules against a reference table (and, with --in, a real input): derived from llama-quantize's own decisions.
+    --retype FROM=TO maps the table's types before the comparison (the tight map is the K3 table's Q6_K trunk as Q4_K);
+    --flag-types NAME=type names the tensors a flag types (--token-embedding-type, --output-tensor-type): no rule may match
+    them and the table's type is not what they get."""
     rules = parse_rules(a.rules)
     table = read_tsv(a.table)
     partial = getattr(a, "partial", False)
-    problems, quantized, kept, by_rule, to_global = [], 0, 0, {}, 0
+    retype = {k.upper(): tname(NAME_TO_ID[v.lower()]) for k, v in parse_type_pairs(getattr(a, "retype", None), "--retype")}
+    flagged = {k: tname(NAME_TO_ID[v.lower()]) for k, v in parse_type_pairs(getattr(a, "flag_types", None), "--flag-types")}
+    problems, quantized, kept, by_rule, to_global, by_flag = [], 0, 0, {}, 0, 0
+    for name in flagged:
+        if name not in table:
+            problems.append(f"--flag-types names {name}, which is not in the table")
     for name, (ty, dims) in table.items():
         d = [int(x) for x in dims.split("x")]
         if quantizer_touches(name, d):
             quantized += 1
             hit = first_rule(rules, name)
+            if name in flagged:
+                by_flag += 1
+                if hit is not None:
+                    problems.append(f"{name}: a flag types it ({flagged[name]}) and rule {hit[0]} matches it too")
+                continue
             if hit is None:
                 to_global += 1
                 if not partial:
                     problems.append(f"{name}: the quantizer quantizes it and no rule matches, so it would get the global type")
             else:
                 by_rule[hit[0]] = by_rule.get(hit[0], 0) + 1
-                if not partial and tname(hit[1]) != ty:
-                    problems.append(f"{name}: rule {hit[0]} gives {tname(hit[1])}, the table has {ty}")
+                want = retype.get(ty.upper(), ty)
+                if not partial and tname(hit[1]) != want:
+                    problems.append(f"{name}: rule {hit[0]} gives {tname(hit[1])}, the table has {ty}" + (f" (wanted {want} by --retype)" if want != ty else ""))
         else:
             kept += 1
             if ty != "F32":
@@ -1026,7 +1053,8 @@ def cmd_check_rules(a):
         for pr in problems[:25]:
             print(f"gguf-splice: {pr}", file=sys.stderr)
         raise Refusal(65, f"{a.rules}: {len(problems)} problem(s) against {a.table}" + (f" and {a.inp}" if a.inp else ""))
-    say(f"check-rules: {len(table)} tensors: {quantized - to_global} quantized by a rule ({', '.join(f'{k}: {v}' for k, v in sorted(by_rule.items()))}), "
+    say(f"check-rules: {len(table)} tensors: {quantized - to_global - by_flag} quantized by a rule ({', '.join(f'{k}: {v}' for k, v in sorted(by_rule.items()))}), "
+        + (f"{by_flag} typed by a flag, " if by_flag else "")
         + (f"{to_global} left to the global type, " if partial else "")
         + f"{kept} kept as the source has them (all F32 in the table)" + (f"; {a.inp} has the kept ones' types" if a.inp else ""))
     return 0
@@ -1350,6 +1378,22 @@ def _checks():
         refused("check-rules refuses a rule that matches no tensor", lambda: cmd_check_rules(argparse.Namespace(rules=rules_file("r.extra", good + ["nothing_like_this=q8_0"]), table=rt, inp=None)), 65, "problem")
         check("check-rules --partial passes a rule set that leaves the trunk to the global type", cmd_check_rules(argparse.Namespace(rules=rules_file("r.part", good[1:3]), table=rt, inp=None, partial=True)) == 0)
         refused("check-rules --partial still refuses a rule that matches no tensor", lambda: cmd_check_rules(argparse.Namespace(rules=rules_file("r.part2", good[1:3] + ["nothing_like_this=q8_0"]), table=rt, inp=None, partial=True)), 65, "problem")
+        # --retype and --flag-types: the tight map is the table's Q6_K trunk as Q4_K, with the embedding typed by a flag
+        def cli_rc(fn):  # a refusal is a red clause, not a crash, in a mutant run
+            try:
+                return fn()
+            except Refusal as e:
+                return e.code
+
+        tight = good[:3] + ["\\.attn_q\\.weight$=q4_k"]
+        ns = lambda name, lines, **kw: argparse.Namespace(rules=rules_file(name, lines), table=rt, inp=None, **kw)  # noqa: E731
+        check("check-rules --retype --flag-types passes the tight rules (trunk Q6_K read as Q4_K, the embedding typed by a flag)",
+              cli_rc(lambda: cmd_check_rules(ns("r.t1", tight, retype="Q6_K=Q4_K", flag_types="token_embd.weight=q4_k"))) == 0)
+        refused("check-rules --retype refuses a rule that still gives the table's own type", lambda: cmd_check_rules(ns("r.t2", good[:4], retype="Q6_K=Q4_K", flag_types="token_embd.weight=q4_k")), 65, "problem")
+        refused("check-rules without --flag-types refuses the embedding no rule matches", lambda: cmd_check_rules(ns("r.t3", tight, retype="Q6_K=Q4_K")), 65, "problem")
+        refused("check-rules refuses a tensor a flag types and a rule matches too", lambda: cmd_check_rules(ns("r.t4", tight + ["^token_embd\\.weight$=q4_k"], retype="Q6_K=Q4_K", flag_types="token_embd.weight=q4_k")), 65, "problem")
+        refused("check-rules --flag-types refuses a name the table does not have", lambda: cmd_check_rules(ns("r.t5", tight, retype="Q6_K=Q4_K", flag_types="token_embd.weight=q4_k,output.weight=q6_k")), 65, "problem")
+        refused("check-rules --retype refuses a type name llama-quantize does not know", lambda: cmd_check_rules(ns("r.t6", tight, retype="Q6_K=Q9_9")), 64, "NAME=type")
         refused("check-rules refuses a type llama-quantize does not know", lambda: parse_rules(rules_file("r.badtype", ["a=q9_9"])), 65, "knows no ggml type")
         refused("check-rules refuses a regex that does not compile", lambda: parse_rules(rules_file("r.badrx", ["(a=q8_0"])), 65, "does not compile")
         with open(rt, "a") as f:
@@ -1538,6 +1582,8 @@ def build_parser():
     s.add_argument("--rules", required=True, help="a llama-quantize --tensor-type-file")
     s.add_argument("--table", required=True, help="the reference table the rules must reproduce")
     s.add_argument("--in", dest="inp", help="a real input set whose kept tensors must already have the table's types")
+    s.add_argument("--retype", help="FROM=TO,...: the table's FROM types are compared as TO (the tight map is the K3 table with its Q6_K trunk as Q4_K)")
+    s.add_argument("--flag-types", help="NAME=type,...: tensors a flag types (token_embd.weight=q4_k): no rule may match them")
     s.add_argument("--partial", action="store_true", help="the rules need not cover every quantizable tensor or give the table's types (the global type does the rest); each must still match a tensor")
     s = sub.add_parser("compare")
     s.add_argument("--a", required=True)

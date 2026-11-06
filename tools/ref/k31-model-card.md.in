@@ -26,8 +26,7 @@ source repository's own.
 
 ## Type map
 
-Map `@MAP@`: the routed experts are @EXPERT_TYPE@ (with an importance matrix), the trunk follows the global type @QTYPE@ except
-where the rules below name a type, the token embedding is Q4_K, the output head Q6_K, and the norms and scores stay F32 as in the source.
+Map `@MAP@`: @MAP_TEXT@
 
 @CLASS_TABLE@
 

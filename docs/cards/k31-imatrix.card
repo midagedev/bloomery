@@ -3,7 +3,9 @@
 # 546.5 s splits into a read term that grows with the file (the file is far above the 251 GB of RAM, so every chunk streams it: the K3
 # call read ~1.13 TB for 594 GB of file) and a CPU term that does not (2048 tokens x 2 x ~60e9 active weights at ~1.6 TFLOP/s = ~150 s,
 # split unmeasured). Read grows x 2.626 (1560/594.03): 396 x 2.626 + 150 = 1190 s; all of it scaling gives 546.5 x 2.626 = 1435 s.
-# The step: populate 368..429 s x 2.626 = 965..1127 s, then 4 chunks: 5.8e3..6.9e3 s, 1.6-1.9 h.
+# The step: populate 368..429 s x 2.626 = 965..1127 s, then 4 chunks: 5.8e3..6.9e3 s, 1.6-1.9 h. The 4 chunks are 8192 tokens of 8 distinct
+# documents (4 prose, 4 code, 1024 tokens each; the source list is printed by `calib` and kept beside the text); a later --chunks 8 run doubles
+# them, and its cost is 8 chunks: 1.0e3 s populate + 8 x 1.2e3..1.4e3 s = 10.6e3..12.2e3 s [derived, same terms].
 kind: calibration
 question: how long is one 2048-token chunk of llama-imatrix over the 1.56 TB K3.1 file (MXFP4 experts, BF16 trunk, no indexer) on this
   box, and so how many chunks can the by-eye read afford?

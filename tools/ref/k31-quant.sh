@@ -21,7 +21,8 @@
 #             -> $K3Q_OUT_BASE/Kimi-K3.1-Pro-<type>[-<map>]-k3shape/ (a K3-shaped set: mainline loads it as K3, which at ctx <= 2048 is K3.1).
 #             Maps (what the lead's placement sizes): `tight` (default) the routed experts IQ1_S with IQ2_XXS on the layers K3's UD-IQ1_S
 #             file also promotes (read from the reference table: gate/up 11 46 47 56 57 58 68 69 70 71, down 83 92), every trunk stem
-#             (attention, KDA, shared expert, latent routed projections, the dense layer's mlp) Q4_K by rule, attn_k_b and ssm_f_b Q8_0,
+#             (attention, KDA, shared expert, latent routed projections, the dense layer's mlp) Q4_K by rule, attn_k_b and ssm_f_b Q8_0, attn_v_b Q6_K
+#             (the per-head value kernel takes Q6_K or Q8_0 only),
 #             ssm_beta and the norms F32, token_embd Q4_K and output Q6_K by flag; `trunk-q5` the same with Q5_K stems; `ud` the K3
 #             UD-IQ1_S file's own table (the trunk Q6_K), reproduced by rules (`rules` prints them, `check` proves them against the K3
 #             table): the comparison. `check` proves tight and trunk-q5 against the same table, its Q6_K trunk retyped.
@@ -271,8 +272,8 @@ gen_rules() { # <expert type> <gate/up bump layers 'a|b'> <down bump layers> <bu
   [ -z "$2" ] || printf '%s\n' "blk\\.($2)\\.ffn_(gate|up)_exps\\.weight=$4"
   [ -z "$3" ] || printf '%s\n' "blk\\.($3)\\.ffn_down_exps\\.weight=$4"
   printf '%s\n' "ffn_(down|gate|up)_exps\\.weight=$1" \
-    '\.attn_k_b\.weight$=q8_0' '\.ssm_f_b\.weight$=q8_0' '\.ssm_beta\.weight$=f32' \
-    "\.(attn_gate|attn_k|attn_kv_a_mqa|attn_output|attn_q|attn_q_a|attn_q_b|attn_v|attn_v_b|ffn_down|ffn_gate|ffn_up|ffn_down_shexp|ffn_gate_shexp|ffn_up_shexp|ffn_routed_down|ffn_routed_up|ssm_f_a|ssm_g)\.weight$=$5"
+    '\.attn_k_b\.weight$=q8_0' '\.ssm_f_b\.weight$=q8_0' '\.ssm_beta\.weight$=f32' '\.attn_v_b\.weight$=q6_k' \
+    "\.(attn_gate|attn_k|attn_kv_a_mqa|attn_output|attn_q|attn_q_a|attn_q_b|attn_v|ffn_down|ffn_gate|ffn_up|ffn_down_shexp|ffn_gate_shexp|ffn_up_shexp|ffn_routed_down|ffn_routed_up|ssm_f_a|ssm_g)\.weight$=$5"
   [ "${6:-}" != head ] || printf '%s\n' '^(token_embd|output)\.weight$=q6_k'
 }
 ref_layers() { # <gate|up|down> <type>: the layers of $REF whose routed tensor of that kind has that type, as 'a|b|c'
@@ -712,7 +713,7 @@ do_quantize() {
     say "plan quantize: for the 1.56 TB K3.1 file: $(hms "$(pred_of quantize "$K31_BYTES")"); the rate band 3-6 Mweights/s/thread gives $(hms "$(QUANT_RATE_MW=6 pred_of quantize "$K31_BYTES")") to $(hms "$(QUANT_RATE_MW=3 pred_of quantize "$K31_BYTES")")"
   fi
   derive_bumps
-  say "type map: $MAP, the routed experts $TYPE with IQ2_XXS on gate/up [${BUMP_GU:-none}] down [${BUMP_DN:-none}], the trunk stems ${STEM} and attn_k_b, ssm_f_b q8_0, ssm_beta f32 by rule, token_embd $TOKEMB and output q6_k by flag, the global type ${QTYPE:-$TYPE} for a tensor no rule names (rules file $rules)"
+  say "type map: $MAP, the routed experts $TYPE with IQ2_XXS on gate/up [${BUMP_GU:-none}] down [${BUMP_DN:-none}], the trunk stems ${STEM} and attn_k_b, ssm_f_b q8_0, attn_v_b q6_k, ssm_beta f32 by rule, token_embd $TOKEMB and output q6_k by flag, the global type ${QTYPE:-$TYPE} for a tensor no rule names (rules file $rules)"
   local tmp_rules=$rules
   if [ "$DRY" = 1 ]; then
     tmp_rules=$(mktemp "${TMPDIR:-/tmp}/k31rules.XXXXXX") || die "no temporary file" 70
@@ -855,7 +856,7 @@ render_card() { # <README.md to write> <the set's first shard (in the .partial d
   if [ "$MAP" = ud ]; then
     maptext="the routed experts are $TYPE with an importance matrix${bumps}; every other trunk tensor, the token embedding and the output head are Q6_K, attn_k_b and ssm_f_b are Q8_0, and the norms, scores and ssm_beta stay F32 as in the source."
   else
-    maptext="the routed experts are $TYPE with an importance matrix${bumps}; every other trunk tensor (attention, state-space, shared expert, latent routed projections and the dense layer's mlp) is ${stemu}, attn_k_b and ssm_f_b are Q8_0, the token embedding is $(printf '%s' "$TOKEMB" | tr '[:lower:]' '[:upper:]'), the output head Q6_K, and the norms, scores and ssm_beta stay F32 as in the source."
+    maptext="the routed experts are $TYPE with an importance matrix${bumps}; every other trunk tensor (attention, state-space, shared expert, latent routed projections and the dense layer's mlp) is ${stemu}, attn_v_b is Q6_K (the per-head value kernel takes Q6_K or Q8_0 only), attn_k_b and ssm_f_b are Q8_0, the token embedding is $(printf '%s' "$TOKEMB" | tr '[:lower:]' '[:upper:]'), the output head Q6_K, and the norms, scores and ssm_beta stay F32 as in the source."
   fi
   splice fill --template "$ROOT/tools/ref/k31-model-card.md.in" --out "$out" \
     --set "NAME=$name" --set "ARCH=$ARCH" --set "MAP=$MAP" --set "MAP_TEXT=$maptext" --set "TOTAL_GB=$total" \
