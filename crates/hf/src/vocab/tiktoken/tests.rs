@@ -48,6 +48,9 @@ fn read(dir: &Path) -> Result<Keys, Error> {
 /// One edit of a toy file: the file, a text that occurs once in it, and what replaces it.
 type Edit = (&'static str, &'static str, &'static str);
 
+/// A stop token: its id and the token it spells.
+type Stop = (u32, &'static str);
+
 /// The toy folder with each edit made.
 fn changed(edits: &[Edit]) -> PathBuf {
     let dir = folder(|_, text| text);
@@ -61,6 +64,24 @@ fn changed(edits: &[Edit]) -> PathBuf {
 
 fn get<'a>(keys: &'a Keys, key: &str) -> Option<&'a Value> {
     keys.keys.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+}
+
+/// The ids of `ids` beside the token each spells, as a stop set reads.
+fn spelled(keys: &Keys, ids: &[u32]) -> Vec<(u32, String)> {
+    let Some(Value::Array(tokens)) = get(keys, "tokenizer.ggml.tokens") else {
+        panic!("no tokens");
+    };
+    ids.iter()
+        .map(|&id| match &tokens[usize::try_from(id).unwrap()] {
+            Value::String(token) => (id, token.clone()),
+            other => panic!("token {id} is {other:?}"),
+        })
+        .collect()
+}
+
+/// `(id, token)` pairs written as literals.
+fn pairs(of: &[(u32, &str)]) -> Vec<(u32, String)> {
+    of.iter().map(|&(id, t)| (id, t.to_string())).collect()
 }
 
 /// GPT-2's byte-level alphabet written out here, apart from the tokenizer crate's table the reader
@@ -352,9 +373,12 @@ fn the_toy_folder_becomes_the_converters_header() {
     }
     assert_eq!(
         get(&keys, "tokenizer.ggml.eog_token_ids"),
-        Some(&Value::Array(vec![Value::U32(269)]))
+        Some(&Value::Array(vec![Value::U32(268), Value::U32(269)]))
     );
-    assert_eq!(keys.stop, [269]);
+    assert_eq!(
+        spelled(&keys, &keys.stop),
+        pairs(&[(268, "[EOS]"), (269, "<|end_of_msg|>")])
+    );
     assert_eq!(keys.added, (267..523).collect::<Vec<u32>>());
 }
 
@@ -558,8 +582,9 @@ fn a_folder_that_is_not_the_converters_is_refused_by_name() {
             vec![
                 ("generation_config.json", ",\n  \"eos_token_id\": 269", ""),
                 ("config.json", "  \"eos_token_id\": 269,\n", ""),
+                (tk, "\"eos_token\": \"[EOS]\"", "\"eos_token\": null"),
             ],
-            "eos_token_id defines no generation stop tokens",
+            "no generation stop tokens",
         ),
         (
             "a generation BOS that is not the config's",
@@ -577,6 +602,61 @@ fn a_folder_that_is_not_the_converters_is_refused_by_name() {
             .unwrap_or_else(|| panic!("{what}: read"))
             .to_string();
         assert!(err.contains(named), "{what}: {err}");
+    }
+}
+
+/// The stop set is the folder's own word and nothing guessed: every id of `generation_config.json`'s
+/// `eos_token_id` (a number or a list; `config.json`'s where it has none) and the token
+/// `tokenizer_config.json`'s `eos_token` names. Serving stops at exactly those, so the toy's `[EOT]`
+/// (a stop name for the engine's guesses) stays out.
+#[test]
+fn the_stop_set_is_the_folders_own() {
+    let tk = "tokenizer_config.json";
+    let generation = "generation_config.json";
+    let (named, unnamed) = ("\"eos_token\": \"[EOS]\"", "\"eos_token\": null");
+    let (turn_end, end) = ((269, "<|end_of_msg|>"), (268, "[EOS]"));
+    // (what changed, its edits, the stop set that results)
+    let cases: Vec<(&str, Vec<Edit>, Vec<Stop>)> = vec![
+        (
+            "the toy as it ships: the number and the named token",
+            vec![],
+            vec![end, turn_end],
+        ),
+        (
+            "no eos_token: the number alone",
+            vec![(tk, named, unnamed)],
+            vec![turn_end],
+        ),
+        (
+            "eos_token the number's own token",
+            vec![(tk, named, "\"eos_token\": \"<|end_of_msg|>\"")],
+            vec![turn_end],
+        ),
+        (
+            "a list, and the named token",
+            vec![(
+                generation,
+                "\"eos_token_id\": 269",
+                "\"eos_token_id\": [270, 269]",
+            )],
+            vec![end, turn_end, (270, "<|open|>")],
+        ),
+        (
+            "no generation id: config.json's, and the named token",
+            vec![(generation, ",\n  \"eos_token_id\": 269", "")],
+            vec![end, turn_end],
+        ),
+    ];
+    for (what, edits, stop) in cases {
+        let keys = read(&changed(&edits)).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert_eq!(spelled(&keys, &keys.stop), pairs(&stop), "{what}");
+        let ids = stop.iter().map(|&(id, _)| Value::U32(id)).collect();
+        assert_eq!(
+            get(&keys, "tokenizer.ggml.eog_token_ids"),
+            Some(&Value::Array(ids)),
+            "{what}"
+        );
+        served(&keys);
     }
 }
 
@@ -696,7 +776,13 @@ fn hw_the_kimi_k3_folder_derives_the_gguf_header_vocabulary() {
             "{key}"
         );
     }
+    // The stop set is the folder's: `generation_config.json`'s end of message and the `[EOS]` of
+    // `tokenizer_config.json`; the header names no stop set of its own.
+    assert_eq!(
+        spelled(&keys, &keys.stop),
+        pairs(&[(163_585, "[EOS]"), (163_586, "<|end_of_msg|>")])
+    );
     let served = served(&keys);
-    assert_eq!(served.eog(), [163_586]);
+    assert_eq!(served.eog(), [163_585, 163_586]);
     assert_eq!(served.pre(), "kimi-k2");
 }

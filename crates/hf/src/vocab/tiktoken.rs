@@ -19,8 +19,11 @@
 //!   reads a folder with no `tokenizer.json`: a token `tokenizer_config.json` names is checked
 //!   against them, not exported (Kimi's `[EOS]` is the document end, its config's EOS the turn's
 //!   `<|end_of_msg|>`, and no unknown id is exported).
-//! - The generation stop set is `generation_config.json`'s `eos_token_id`, else `config.json`'s,
-//!   written as `tokenizer.ggml.eog_token_ids`, so serving stops where HF's generate does. The
+//! - The stop set is the checkpoint's own word and nothing guessed: every id of
+//!   `generation_config.json`'s `eos_token_id` (a number or a list; `config.json`'s where it has
+//!   none) and the special token `tokenizer_config.json`'s `eos_token` names. It is written as
+//!   `tokenizer.ggml.eog_token_ids`, which replaces the engine's stop-name guesses (the Unsloth
+//!   GGUF's `[EOT]` stop is not reproduced), so serving stops where the folder says. The
 //!   private `tokenizer.bloomery.eog_token_ids` is not written: it selects an HF reading of the
 //!   pre-tokenizer, which the tiktoken rows do not have. The engine's tokenizer also marks any
 //!   token spelled as one of its stop or end-of-turn names (`[EOT]`, `[EOS]`, `</s>`) control on
@@ -187,7 +190,7 @@ pub(super) fn keys(dir: &Path, spec: &VocabSpec) -> Result<Keys, Error> {
             "special token {name:?} is also a token of tiktoken.model"
         )));
     }
-    check_named(&tc, spec, &named)?;
+    let eos_named = check_named(&tc, spec, &named)?;
 
     let mut tokens: Vec<Value> = Vec::with_capacity(size);
     let mut types: Vec<Value> = Vec::with_capacity(size);
@@ -239,18 +242,24 @@ pub(super) fn keys(dir: &Path, spec: &VocabSpec) -> Result<Keys, Error> {
             Value::String(template),
         ));
     }
-    let mut stop = stop
-        .filter(|ids| !ids.is_empty())
-        .ok_or_else(|| bad("eos_token_id defines no generation stop tokens".into()))?;
+    let id32 =
+        |id: usize| u32::try_from(id).map_err(|_| bad(format!("special id {id} is past u32")));
+    let mut stop = stop.unwrap_or_default();
+    stop.extend(eos_named.map(id32).transpose()?);
+    if stop.is_empty() {
+        return Err(bad(
+            "no generation stop tokens: no eos_token_id in generation_config.json or config.json \
+             and no eos_token in tokenizer_config.json"
+                .into(),
+        ));
+    }
     stop.sort_unstable();
     stop.dedup();
     out.push((
         "tokenizer.ggml.eog_token_ids".into(),
         Value::Array(stop.iter().copied().map(Value::U32).collect()),
     ));
-    let added = ids
-        .map(|id| u32::try_from(id).map_err(|_| bad(format!("special id {id} is past u32"))))
-        .collect::<Result<Vec<_>, _>>()?;
+    let added = ids.map(id32).collect::<Result<Vec<_>, _>>()?;
     Ok(Keys {
         keys: out,
         added,
@@ -523,7 +532,12 @@ fn special_names(tc: &Json, base: usize) -> Result<Vec<String>, Error> {
 
 /// The special tokens `tokenizer_config.json` names (`<kind>_token`, `additional_special_tokens`)
 /// must each be a special id's name; a kind but EOS must also be the id `config.json` gives it.
-fn check_named(tc: &Json, spec: &VocabSpec, named: &HashMap<&str, usize>) -> Result<(), Error> {
+/// The id its `eos_token` names, if it names one.
+fn check_named(
+    tc: &Json,
+    spec: &VocabSpec,
+    named: &HashMap<&str, usize>,
+) -> Result<Option<usize>, Error> {
     let bad = |what: String| Error::Vocab(what);
     let content = |v: &Json, path: &str| -> Result<Option<String>, Error> {
         match v {
@@ -539,6 +553,7 @@ fn check_named(tc: &Json, spec: &VocabSpec, named: &HashMap<&str, usize>) -> Res
             _ => Err(bad(format!("{path} {v} is not a token or an added token"))),
         }
     };
+    let mut eos = None;
     for (i, (kind, _)) in SPECIAL.iter().enumerate() {
         let path = format!("{kind}_token");
         let Some(name) = content(&tc[&path], &path)? else {
@@ -547,6 +562,9 @@ fn check_named(tc: &Json, spec: &VocabSpec, named: &HashMap<&str, usize>) -> Res
         let id = *named
             .get(name.as_str())
             .ok_or_else(|| bad(format!("{path} {name:?} is no special token")))?;
+        if *kind == "eos" {
+            eos = Some(id);
+        }
         if let Some(&other) = spec.ids[i].as_ref().and_then(|ids| ids.first())
             && *kind != "eos"
             && usize::try_from(other).ok() != Some(id)
@@ -569,7 +587,7 @@ fn check_named(tc: &Json, spec: &VocabSpec, named: &HashMap<&str, usize>) -> Res
             }
         }
     }
-    Ok(())
+    Ok(eos)
 }
 
 #[cfg(test)]
