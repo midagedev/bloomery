@@ -2841,6 +2841,13 @@ gate-hf:
 gate-hf-vocab-qwen38:
     ./tools/box.sh 'bash tools/ref/needs-env.sh gate-hf-vocab-qwen38 BLOOMERY_QWEN38_HF && bash tools/gate.sh --release -p bloomery-hf --lib hw_the_qwen38_vocabulary_is_unchanged -- --ignored --nocapture'
 
+# The Kimi K3 vocabulary the folder reader derives (crates/hf, host only; BLOOMERY_KIMI_K3_HF names moonshotai/Kimi-K3's folder, of which it
+# reads the tokenizer files and config.json; BLOOMERY_KIMI_K3_GGUF names the K3 GGUF whose first shard's header it is held to, the box's
+# UD-IQ1_S by default): every token, type and merge, the model and pre-tokenizer names and the bos, eos and padding ids are the header
+# llama.cpp's converter wrote, and the keys pass the checks the folder map makes of serving's tokenizer. No card.
+gate-hf-vocab-kimi-k3:
+    ./tools/box.sh 'bash tools/ref/needs-env.sh gate-hf-vocab-kimi-k3 BLOOMERY_KIMI_K3_HF && bash tools/gate.sh --release -p bloomery-hf --lib hw_the_kimi_k3_folder_derives_the_gguf_header_vocabulary -- --ignored --nocapture'
+
 # MiniMax-M3.1-Flash's vocabulary from its checkpoint folder (crates/hf, host only; BLOOMERY_MM31_HF names the folder, of which it reads the
 # tokenizer files, config.json and the chat template): the vocabulary `hf::vocab::keys` derives is MiniMax-M3's GGUF vocabulary (the
 # `minimax-m2` pre-tokenizer, tokens, token types and merges at their digests, the bos, eos, padding and unknown ids and the stop list; id
@@ -2854,9 +2861,10 @@ gate-hf-minimax:
 gate-safetensors:
     ./tools/box.sh 'bash tools/gate.sh -p bloomery-safetensors --lib -- --nocapture'
 
-# The shared checkpoint preparer's shard and tokenizer checks, without model files.
+# The shared checkpoint preparer's shard and tokenizer checks, without model files, and its split of a toy Kimi K3 and
+# K3.1 folder (the whole folder, the K3-shaped file without the indexer, the indexer alone, the flags' refusals).
 gate-prepare:
-    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model-hf --bin prepare -- --nocapture'
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model-hf --bin prepare --test prepare_kimi -- --nocapture'
 
 # The served tokenizer against the pinned HF corpus; BLOOMERY_QWEN38_HF names its checkpoint folder.
 gate-prepare-corpus:

@@ -311,8 +311,8 @@ load_profile() {
   PROFILE_LOADED=1
 }
 load_lease() {
-  [ "$DRY" = 0 ] || return 0
-  if [ "$USE_LEASE" = 0 ]; then # no lease: only the bounded runner of the gates is needed
+  # no lease (a dry-run takes none): only the bounded runner of the gates is needed, for the plan's llama-quantize --dry-run
+  if [ "$DRY" = 1 ] || [ "$USE_LEASE" = 0 ]; then
     # shellcheck source=tools/gate-bound.sh
     source "$ROOT/tools/gate-bound.sh" || die "gate-bound.sh failed" 70
     return 0
@@ -657,7 +657,7 @@ plan_for() { # <rules file>: llama-quantize's own --dry-run over the input's hea
     fi
     log=$(mktemp "${TMPDIR:-/tmp}/k31plan.XXXXXX") || die "no temporary file" 70
     tsv=$(mktemp "${TMPDIR:-/tmp}/k31plan.XXXXXX") || die "no temporary file" 70
-    CUDA_VISIBLE_DEVICES='' timeout 300 "$Q" --dry-run "${QARGS[@]}" "$IN" "$WORK/plan-out.gguf" "${QTYPE:-$TYPE}" 1 > "$log" 2>&1 ||
+    LEASE_BOUNDED_OUT=$log bounded 300 env CUDA_VISIBLE_DEVICES= "$Q" --dry-run "${QARGS[@]}" "$IN" "$WORK/plan-out.gguf" "${QTYPE:-$TYPE}" 1 ||
       { tail -n 5 "$log" >&2; rm -f "$log" "$tsv"; die "llama-quantize --dry-run failed (above)" 65; }
     splice plan --log "$log" --out "$tsv" > /dev/null || { rm -f "$log" "$tsv"; exit 65; }
     say "[dry-run] plan of the quantize step over $IN (llama-quantize --dry-run, no data read), bytes per class:"

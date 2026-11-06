@@ -206,6 +206,7 @@ gate-gpu-xstream	common		tier	tier_legs
 gate-hf	common		host	refset_readers
 gate-host-serve	common		serve	serve_host_seat
 gate-hf-minimax	tooling		by-hand	-
+gate-hf-vocab-kimi-k3	tooling		by-hand	-
 gate-hf-vocab-qwen38	tooling		by-hand	-
 gate-safetensors	common		host	refset_readers
 gate-jinja	common		host	tokenizer_jinja
