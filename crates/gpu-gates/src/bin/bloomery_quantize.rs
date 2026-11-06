@@ -1,14 +1,13 @@
-//! `bloomery-quantize` — IQ1_S and IQ2_XXS quantization of a GGUF set's routed-expert stacks on the card,
-//! byte-identical to ggml's, so that `llama-quantize` over the output copies them and quantizes the trunk.
+//! `bloomery-quantize` — llama-quantize's job in one pass, byte for byte: the routed-expert stacks quantized to
+//! IQ1_S or IQ2_XXS on the card, every other tensor by the host's K-quant rules, the metadata and the shard layout as
+//! llama-quantize writes them.
 //!
-//!     bloomery-quantize <in first shard> <out prefix> --imatrix FILE --tensor-type-file FILE
-//!                       [--type IQ1_S|IQ2_XXS] [--plan] [--check N] [--cpu] [--card N] [--batch N]
-//!                       [--llama-plan TSV]
+//!     bloomery-quantize [options] <in first shard> <out> <ftype>
 //!     bloomery-quantize --help | --version
 //!
-//! The plan, the checks and the set writer are the `bloomery-quantize` crate's (`quantize`); this binary is the
-//! card's [`Backend`] and the process around it. `--cpu` runs the host rule on all cores and opens no card;
-//! `--plan` opens none either. Exit: 0 done; 1 a refusal, named; 64 a usage error; 66 a missing input file.
+//! The plan, the type logic, the host rules and the writer are the `bloomery-quantize` crate's (`quantize`); this
+//! binary is the card's [`Backend`] and the process around it. `--cpu` runs every rule on all cores and opens no
+//! card; `--plan` opens none either. Exit: 0 done; 1 a refusal, named; 64 a usage error; 66 a missing input file.
 //! `docs/quantize.md` is the user's page.
 
 #[cfg(feature = "gpu")]
@@ -22,7 +21,7 @@ use gguf::iq_quant::IqKind;
 #[cfg(feature = "gpu")]
 use gguf::quant::GgmlType;
 #[cfg(feature = "gpu")]
-use quantize::cli::{Args, Parsed};
+use quantize::cli::Parsed;
 #[cfg(feature = "gpu")]
 use quantize::{Backend, BackendError, Error};
 use std::process::ExitCode;
@@ -52,6 +51,10 @@ struct CardBackend<'a> {
 impl Backend for CardBackend<'_> {
     fn name(&self) -> String {
         format!("card {}", self.ordinal)
+    }
+
+    fn uses_host_pool(&self) -> bool {
+        false
     }
 
     fn bind(&mut self, kind: IqKind, qw: &[f32]) -> Result<(), BackendError> {
@@ -112,7 +115,10 @@ fn go() -> Result<(), Error> {
     let prep = quantize::run::prepare(&a)?;
     if a.plan {
         let free = os::free_bytes(&a.out_dir()).ok();
-        print!("{}", prep.plan.render(&a, free));
+        print!(
+            "{}",
+            prep.plan.render(&a, free, quantize::host::pool_threads())
+        );
         return Ok(());
     }
     // A refusal that needs no card comes before the card opens.
@@ -143,22 +149,5 @@ fn go() -> Result<(), Error> {
             0.0
         }
     );
-    print_next(&a, &s);
     Ok(())
-}
-
-/// The command to run next, as `--plan` prints it, over the set just written.
-#[cfg(feature = "gpu")]
-fn print_next(a: &Args, s: &quantize::run::Summary) {
-    let split = if s.files.len() > 1 {
-        " --keep-split"
-    } else {
-        ""
-    };
-    println!(
-        "next: llama-quantize --allow-requantize --imatrix {} --tensor-type-file {}{split} <the same flags as the quantize run this replaces> {} <final output> <ftype>",
-        a.imatrix.display(),
-        a.rules.display(),
-        s.files[0].display()
-    );
 }

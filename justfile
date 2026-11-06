@@ -791,6 +791,24 @@ gate-gpu-iq-quant:
 gate-quantize:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-quantize --lib'
 
+# The host K-quant rules (gguf::kquant: Q4_K, Q5_K, Q6_K, Q8_0) against ggml's own quantizer (iq_quant_ref, just
+# build-iq-quant-ref) with and without an importance matrix, row for row over seeded row families, and the K3 fixture
+# end to end through the host writer (--cpu): bloomery-quantize's output equals llama-quantize's, whole file by sha256,
+# the plan equal to llama-quantize's own --dry-run. No card; the box's cores.
+gate-quantize-oracle:
+    ./tools/box.sh '. tools/ref/ref-paths.sh && export BLOOMERY_DATA K3Q_TREE=$K3QUANT && bash tools/gate.sh --release -p bloomery-quantize --test hw_kquant_oracle -- --ignored --nocapture --test-threads=1'
+
+# The K3 fixture end to end through the host writer (--cpu): bloomery-quantize's output equals llama-quantize's, whole
+# file by sha256. No card; the box's cores.
+gate-quantize-e2e:
+    ./tools/box.sh '. tools/ref/ref-paths.sh && export BLOOMERY_DATA K3Q_TREE=$K3QUANT && bash tools/gate.sh --release -p bloomery-quantize --test hw_fixture_e2e -- --ignored --nocapture --test-threads=1'
+
+# Plan equality: bloomery-quantize's resolution of every tensor's type and size against llama-quantize --dry-run's, tensor
+# for tensor, on the K3 fixture and, when K3Q_PLAN_IN (the K3-shaped set's first shard) and K3Q_PLAN_RULES (the tight map's
+# rules file) name files on the box, the K3.1 type maps over that set. Headers only; no card.
+gate-quantize-plan:
+    ./tools/box.sh '. tools/ref/ref-paths.sh && export BLOOMERY_DATA K3Q_TREE=$K3QUANT && bash tools/gate.sh --release -p bloomery-quantize --test hw_plan_equal -- --ignored --nocapture --test-threads=1'
+
 # gate-gpu-iq-quant's oracle: tools/ref/iq_quant_ref.cpp linked to the K3.1 quantization tree's libggml-base, into
 # $BLOOMERY_DATA/bin with the tree's commit and the library's md5 beside it. CPU only, no lease.
 build-iq-quant-ref:

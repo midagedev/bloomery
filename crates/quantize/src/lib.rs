@@ -1,13 +1,17 @@
-//! The host side of `bloomery-quantize`: a GGUF set whose routed-expert stacks are written as IQ1_S or
-//! IQ2_XXS (ggml's bytes, the importance llama-quantize computes), every other tensor copied byte for byte, so
-//! that `llama-quantize` over the result copies the stacks (`cur_type == new_type`) and quantizes the trunk.
+//! The host side of `bloomery-quantize`: llama-quantize's job in one pass, byte for byte. The routed-expert stacks
+//! become IQ1_S or IQ2_XXS on the card or the host (ggml's bytes, the importance llama-quantize computes), every
+//! other tensor the type llama-quantize gives it by the host's K-quant rules, the metadata and the shard layout as
+//! llama-quantize writes them.
 //!
 //! - [`rules`]: llama-quantize's `--tensor-type-file`, read the way it reads it.
-//! - [`plan`]: every tensor's fate, the bytes, the room and the derived wall; writes nothing.
+//! - [`resolve`]: `llama_tensor_get_type`, tensor by tensor, with its counters.
+//! - [`imatrix`]: the importance matrix file as llama-quantize reads it.
+//! - [`meta`]: the metadata of every output shard, key by key.
+//! - [`plan`]: every tensor's type and fate, the bytes, the room and the derived wall; writes nothing.
 //! - [`scan`]: the finite check of every source row.
 //! - [`check`]: a row's bytes against the host rule's, naming the first byte that differs.
-//! - [`host`]: the host rule on all cores, a [`Backend`] that opens no card.
-//! - [`run`]: the set writer, over a [`Backend`] (the card's lives in the binary).
+//! - [`host`]: the host rules on all cores: the IQ search as a [`Backend`] that opens no card, the K-quant rules.
+//! - [`run`]: the writer, over a [`Backend`] (the card's lives in the binary).
 //! - [`cli`]: the arguments and the usage text.
 //!
 //! Every refusal is an [`Error`] that names what it refuses: tensor, expert, row.
@@ -15,7 +19,10 @@
 pub mod check;
 pub mod cli;
 pub mod host;
+pub mod imatrix;
+pub mod meta;
 pub mod plan;
+pub mod resolve;
 pub mod rules;
 pub mod run;
 pub mod scan;

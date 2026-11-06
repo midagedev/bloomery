@@ -103,6 +103,9 @@ gate-gpu-iq	common		kernel	quant_iq
 gate-gpu-iq-sel	common		kernel	quant_iq
 gate-gpu-iq-quant	common		kernel	quant_iq_writer
 gate-quantize	common		kernel	quant_iq_writer
+gate-quantize-oracle	common		kernel	quant_iq_writer
+gate-quantize-e2e	common		e2e	quant_iq_writer
+gate-quantize-plan	common		kernel	quant_iq_writer
 gate-gpu-kquant	common		kernel	quant_q4k+quant_q5k+quant_q8
 gate-gpu-lev-serve	family	qwen35	serve	seats_serve_engine+constrain
 gate-gpu-lib	common		lib	graph_fault+weights_load+kv_pool_checkpoint+tier_legs

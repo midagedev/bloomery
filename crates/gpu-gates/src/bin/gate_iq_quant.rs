@@ -28,11 +28,12 @@
 //!    of three experts the rules type IQ1_S and IQ2_XXS, an F32 tensor and
 //!    one the rules type Q4_K — with an imatrix whose counts round to 3, to
 //!    0 (importance all ones) and 5, at `--batch 2` and `--check 5`: the
-//!    output's shards hold the input's metadata, names, dims and order, the
-//!    copied tensors' bytes, and ggml's bytes for the stacks under the
-//!    importance llama-quantize computes. `--cpu` writes the same bytes as
-//!    the card; `--plan` writes nothing and names every tensor; an existing
-//!    output is refused.
+//!    output's shards hold the input's metadata as llama-quantize writes it,
+//!    the names, dims and order, the copied tensor's bytes, ggml's bytes for
+//!    the stacks under the importance llama-quantize computes, and the host
+//!    K-quant rule's bytes for the trunk weight. `--cpu` writes the same
+//!    bytes as the card; `--plan` writes nothing and names every tensor; an
+//!    existing output is refused.
 //! 6. check: the `--check` comparison names the tensor, expert, row, super-block
 //!    and byte of one flipped byte of the card's output, and passes the
 //!    unflipped bytes.
@@ -42,9 +43,12 @@
 //!    does not cover each end the tool at 1 with the name in its message
 //!    and no file left.
 //! 8. e2e: the K3 fixture requantized to MXFP4 experts (llama-quantize), a
-//!    synthetic imatrix over its stacks, then `bloomery-quantize` and the
-//!    tree's `llama-quantize` over its output equal `llama-quantize` alone,
-//!    byte for byte, with both IQ types among the stacks.
+//!    synthetic imatrix over its stacks, then `bloomery-quantize`'s one pass
+//!    (the card for the stacks, `--check 2`) and the tree's `llama-quantize`
+//!    write the same file, byte for byte, with both IQ types among the
+//!    stacks. The host-only gates `gate-quantize-oracle`, `gate-quantize-e2e`
+//!    and `gate-quantize-plan` hold the K-quant rules, the whole file on the
+//!    host and the plan.
 //!
 //! A row that differs prints its case, type, row and first differing
 //! super-block and byte.
@@ -163,6 +167,8 @@ mod clauses {
             .all(|e| !e.file_name().to_string_lossy().starts_with(prefix)))
     }
 
+    /// The file type every run of the tool here asks for: the stacks' and the trunk's types come from the rules.
+    const FTYPE: &str = "Q4_K_M";
     const NE0: usize = 512;
     const NE1: usize = 4;
     const N_EXP: usize = 3;
@@ -207,9 +213,9 @@ mod clauses {
         }
     }
 
-    fn plan_text(rows: &[(&str, &str, &str)]) -> String {
+    fn plan_text(rows: &[(&str, &str, &str, u64)]) -> String {
         rows.iter()
-            .map(|(n, t, d)| format!("{n}\t{t}\t{d}\t0\n"))
+            .map(|(n, t, d, b)| format!("{n}\t{t}\t{d}\t{b}\n"))
             .collect()
     }
 
@@ -217,11 +223,25 @@ mod clauses {
         vec![
             (
                 "general.architecture".to_string(),
-                Value::String("iqset".to_string()),
+                Value::String("kimi-k3".to_string()),
             ),
+            ("kimi-k3.block_count".to_string(), Value::U32(2)),
+            ("kimi-k3.expert_count".to_string(), Value::U32(3)),
             ("split.no".to_string(), Value::U16(shard)),
             ("split.count".to_string(), Value::U16(count)),
             ("split.tensors.count".to_string(), Value::I32(tensors)),
+        ]
+    }
+
+    /// The metadata an importance matrix file carries (`imatrix.datasets`, `imatrix.chunk_count`, `imatrix.chunk_size`).
+    fn imatrix_kvs() -> Vec<(String, Value)> {
+        vec![
+            (
+                "imatrix.datasets".to_string(),
+                Value::Array(vec![Value::String("gate".to_string())]),
+            ),
+            ("imatrix.chunk_count".to_string(), Value::U32(1)),
+            ("imatrix.chunk_size".to_string(), Value::U32(512)),
         ]
     }
 
@@ -291,7 +311,7 @@ mod clauses {
             vec![
                 stack(rng, d0, GgmlType::MXFP4),
                 stack(rng, d1, GgmlType::F16),
-                f32_t(rng, "b.q4", vec![256, 2], 512),
+                f32_t(rng, "blk.0.attn_q.weight", vec![256, 2], 512),
             ],
         ];
         let src_prefix = dir.join("set-in");
@@ -306,22 +326,22 @@ mod clauses {
         let names = [g0, g1, d0, d1];
         let (im_tensors, want_qw) = imatrix_tensors(rng, &names, NE0, &COUNTS);
         let im = dir.join("set.imatrix.gguf");
-        write_gguf(&im, &[], &im_tensors)?;
+        write_gguf(&im, &imatrix_kvs(), &im_tensors)?;
         let rules = dir.join("set.rules");
         std::fs::write(
             &rules,
-            "ffn_gate_exps\\.weight=IQ1_S\nffn_down_exps\\.weight=IQ2_XXS\nb\\.q4$=q4_k\n",
+            "ffn_gate_exps\\.weight=IQ1_S\nffn_down_exps\\.weight=IQ2_XXS\nattn_q\\.weight$=q4_k\n",
         )?;
         let plan = dir.join("set-plan.tsv");
         std::fs::write(
             &plan,
             plan_text(&[
-                ("a.f32", "F32", "256x3"),
-                (g0, "IQ1_S", "512x4x3"),
-                (g1, "IQ1_S", "512x4x3"),
-                (d0, "IQ2_XXS", "512x4x3"),
-                (d1, "IQ2_XXS", "512x4x3"),
-                ("b.q4", "Q4_K", "256x2"),
+                ("a.f32", "F32", "256x3", 3072),
+                (g0, "IQ1_S", "512x4x3", 1200),
+                (g1, "IQ1_S", "512x4x3", 1200),
+                (d0, "IQ2_XXS", "512x4x3", 1584),
+                (d1, "IQ2_XXS", "512x4x3", 1584),
+                ("blk.0.attn_q.weight", "Q4_K", "256x2", 288),
             ]),
         )?;
         let kind = |n: &str| {
@@ -363,6 +383,9 @@ mod clauses {
             fix.im.as_os_str(),
             "--tensor-type-file".as_ref(),
             fix.rules.as_os_str(),
+            "--keep-split".as_ref(),
+            "--allow-requantize".as_ref(),
+            FTYPE.as_ref(),
         ])
     }
 
@@ -387,8 +410,50 @@ mod clauses {
                 input.shard(i).expect("2 shards"),
                 output.shard(i).expect("2 shards"),
             );
-            if a.keys() != b.keys() {
-                println!("  set: shard {} metadata differs", i + 1);
+            // llama-quantize's metadata: the input's pairs, `general.quantization_version`, `general.file_type` and
+            // `quantize.imatrix.*` moved to the end (set again), the `split.*` pairs of the output shard last
+            let moved = |k: &str| {
+                k == "general.quantization_version"
+                    || k == "general.file_type"
+                    || k.starts_with("quantize.imatrix.")
+                    || k.starts_with("split.")
+            };
+            let keep = |g: &gguf::Gguf| -> Vec<(String, Value)> {
+                g.keys()
+                    .iter()
+                    .filter(|(k, _)| !moved(k))
+                    .cloned()
+                    .collect()
+            };
+            let tail: Vec<&str> = b
+                .keys()
+                .iter()
+                .map(|(k, _)| k.as_str())
+                .skip(keep(b).len())
+                .collect();
+            let want_tail = [
+                "general.quantization_version",
+                "general.file_type",
+                "quantize.imatrix.file",
+                "quantize.imatrix.dataset",
+                "quantize.imatrix.entries_count",
+                "quantize.imatrix.chunks_count",
+                "split.no",
+                "split.count",
+                "split.tensors.count",
+            ];
+            let tail_ok = if i == 0 {
+                tail == want_tail
+            } else {
+                tail == ["split.no", "split.count", "split.tensors.count"]
+            };
+            let head_ok = if i == 0 {
+                keep(a) == keep(b)
+            } else {
+                keep(b).is_empty()
+            };
+            if !head_ok || !tail_ok {
+                println!("  set: shard {} metadata differs: tail {tail:?}", i + 1);
                 ok = false;
             }
             let names = |g: &gguf::Gguf| -> Vec<(String, Vec<u64>)> {
@@ -423,11 +488,29 @@ mod clauses {
                 ok = false;
             }
         }
-        for name in ["a.f32", "b.q4"] {
-            if input.data(name)? != output.data(name)? {
-                println!("  set: {name} is not copied byte for byte");
-                ok = false;
-            }
+        if input.data("a.f32")? != output.data("a.f32")? {
+            println!("  set: a.f32 is not copied byte for byte");
+            ok = false;
+        }
+        // the trunk weight: the host K-quant rule's bytes (`gate-quantize-oracle` holds that rule to ggml)
+        let src = input.data("blk.0.attn_q.weight")?;
+        let vals: Vec<f32> = src
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect();
+        let mut want_q = Vec::new();
+        for row in vals.as_chunks::<256>().0 {
+            want_q.extend(gguf::kquant::quantize_row(
+                gguf::kquant::KType::Q4K,
+                row,
+                None,
+            )?);
+        }
+        if output.data("blk.0.attn_q.weight")? != want_q {
+            println!("  set: blk.0.attn_q.weight is not the host Q4_K rule's bytes");
+            ok = false;
         }
         Ok(ok)
     }
@@ -480,7 +563,7 @@ mod clauses {
         let first_card = shard_files(&out_card)[0].clone();
         let ok = verify_set(oracle_bin, dir, &fix, &first_card)?;
         println!(
-            "{} set: bloomery-quantize over two shards (MXFP4, BF16 and F16 stacks, --check 5, the llama plan): metadata, names, dims and copies equal the input, the stacks equal ggml",
+            "{} set: bloomery-quantize over two shards (MXFP4, BF16 and F16 stacks, --check 5, the llama plan): metadata, names, dims and the F32 copy equals the input, the stacks equal ggml, the trunk weight equals the host K-quant rule",
             verdict(ok)
         );
         all &= ok;
@@ -518,21 +601,22 @@ mod clauses {
             },
             false,
         )?;
-        let names_all = ["a.f32", "b.q4"]
+        let names_all = ["a.f32", "blk.0.attn_q.weight"]
             .iter()
             .chain(fix.stacks.iter().map(|s| &s.name))
             .all(|n| r.out.contains(n));
         let plan_ok = r.code == Some(0)
             && names_all
-            && r.out.matches("quantized here").count() == 4 + 1 // four lines and the summary
-            && r.out.contains("next: llama-quantize")
+            && r.out.matches("converted on the card").count() == 4
+            && r.out.matches("converted on the host").count() == 1
+            && r.out.matches(": copied").count() == 1
             && r.out.contains("room: the output needs")
             && no_files(dir, "set-planned")?;
         if !plan_ok {
             println!("  plan: status {:?}, output:\n{}", r.code, r.out);
         }
         println!(
-            "{} plan: --plan names every tensor, the room and the llama-quantize command, and writes nothing",
+            "{} plan: --plan names every tensor with its type and fate, the derived wall and the room, and writes nothing",
             verdict(plan_ok)
         );
         all &= plan_ok;
@@ -600,27 +684,27 @@ mod clauses {
         std::fs::write(
             &short,
             plan_text(&[
-                ("a.f32", "F32", "256x3"),
-                ("blk.0.ffn_gate_exps.weight", "IQ1_S", "512x4x3"),
+                ("a.f32", "F32", "256x3", 3072),
+                ("blk.0.ffn_gate_exps.weight", "IQ1_S", "512x4x3", 1200),
             ]),
         )?;
         let other = dir.join("set-other.tsv");
         std::fs::write(
             &other,
             plan_text(&[
-                ("a.f32", "F32", "256x3"),
-                ("blk.0.ffn_gate_exps.weight", "IQ2_XXS", "512x4x3"),
-                ("blk.1.ffn_gate_exps.weight", "IQ1_S", "512x4x3"),
-                ("blk.0.ffn_down_exps.weight", "IQ2_XXS", "512x4x3"),
-                ("blk.1.ffn_down_exps.weight", "IQ2_XXS", "512x4x3"),
-                ("b.q4", "Q4_K", "256x2"),
+                ("a.f32", "F32", "256x3", 3072),
+                ("blk.0.ffn_gate_exps.weight", "IQ2_XXS", "512x4x3", 1584),
+                ("blk.1.ffn_gate_exps.weight", "IQ1_S", "512x4x3", 1200),
+                ("blk.0.ffn_down_exps.weight", "IQ2_XXS", "512x4x3", 1584),
+                ("blk.1.ffn_down_exps.weight", "IQ2_XXS", "512x4x3", 1584),
+                ("blk.0.attn_q.weight", "Q4_K", "256x2", 288),
             ]),
         )?;
         for (plan, want) in [
             (&short, "the llama plan names 2 tensors, the set holds 6"),
             (
                 &other,
-                "blk.0.ffn_gate_exps.weight: the rules type it IQ1_S, llama-quantize's own plan IQ2_XXS",
+                "blk.0.ffn_gate_exps.weight: llama-quantize's plan says IQ2_XXS",
             ),
         ] {
             let mut a = base_args(fix, &dir.join("set-refuse"));
@@ -721,7 +805,7 @@ mod clauses {
                 bytes: vec![0u8; ne1 * n_exp * (ne0 / 32) * 34],
                 sums: sums_ok,
                 counts: counts_ok,
-                want: "is Q8_0: the oracle covers F32, F16, BF16 and MXFP4",
+                want: "is Q8_0: the source types read here for IQ1_S do not include it",
             },
         ];
         let rules = dir.join("bad.rules");
@@ -730,10 +814,14 @@ mod clauses {
             let input = dir.join(format!("bad-{}-in.gguf", b.tag));
             let im = dir.join(format!("bad-{}.imatrix.gguf", b.tag));
             let dims = vec![ne0 as u64, ne1 as u64, n_exp as u64];
-            let kv = vec![(
-                "general.architecture".to_string(),
-                Value::String("iqset".to_string()),
-            )];
+            let kv = vec![
+                (
+                    "general.architecture".to_string(),
+                    Value::String("kimi-k3".to_string()),
+                ),
+                ("kimi-k3.block_count".to_string(), Value::U32(1)),
+                ("kimi-k3.expert_count".to_string(), Value::U32(n_exp as u32)),
+            ];
             write_gguf(&input, &kv, &[(name.to_string(), dims, b.ty, b.bytes)])?;
             let im_t: Vec<SetTensor> = vec![
                 (
@@ -749,7 +837,7 @@ mod clauses {
                     f32_bytes(&b.counts),
                 ),
             ];
-            write_gguf(&im, &[], &im_t)?;
+            write_gguf(&im, &imatrix_kvs(), &im_t)?;
             let prefix = format!("bad-{}-out", b.tag);
             let r = run_cmd(
                 tool,
@@ -760,6 +848,8 @@ mod clauses {
                     im.as_os_str(),
                     "--tensor-type-file".as_ref(),
                     rules.as_os_str(),
+                    "--allow-requantize".as_ref(),
+                    FTYPE.as_ref(),
                 ]),
                 false,
             )?;
@@ -807,7 +897,7 @@ mod clauses {
         Ok(out)
     }
 
-    /// Clause 8: `bloomery-quantize` then llama-quantize equals llama-quantize alone, on the K3 fixture.
+    /// Clause 8: `bloomery-quantize`'s one pass equals llama-quantize's output, on the K3 fixture.
     pub(super) fn e2e_clause(dir: &Path, rng: &mut Rng) -> Result<bool, GateError> {
         let tree = PathBuf::from(std::env::var("K3Q_TREE").map_err(|_| {
             "e2e: K3Q_TREE names the K3.1 quantization tree (the recipe sets it from tools/ref/ref-paths.sh)"
@@ -916,11 +1006,7 @@ mod clauses {
                 "blk\\.{layer}\\.ffn_(gate|up)_exps\\.weight=IQ2_XXS\nffn_(down|gate|up)_exps\\.weight=IQ1_S\n"
             ),
         )?;
-        let (out_a, out_b, set_prefix) = (
-            work.join("alone.gguf"),
-            work.join("via.gguf"),
-            work.join("set"),
-        );
+        let (out_a, out_b) = (work.join("alone.gguf"), work.join("ours.gguf"));
         let run_llama = |input: &Path, out: &Path| -> Result<(), GateError> {
             let mut a: Vec<&OsStr> = vec![
                 "--allow-requantize".as_ref(),
@@ -939,20 +1025,18 @@ mod clauses {
             llama(&a)
         };
         run_llama(&src, &out_a)?;
-        let r = run_cmd(
-            &tool,
-            &os(&[
-                src.as_os_str(),
-                set_prefix.as_os_str(),
-                "--imatrix".as_ref(),
-                im.as_os_str(),
-                "--tensor-type-file".as_ref(),
-                rules.as_os_str(),
-                "--check".as_ref(),
-                "2".as_ref(),
-            ]),
-            false,
-        )?;
+        let mut ours: Vec<&OsStr> = vec![
+            "--allow-requantize".as_ref(),
+            "--imatrix".as_ref(),
+            im.as_os_str(),
+            "--tensor-type-file".as_ref(),
+            rules.as_os_str(),
+            "--check".as_ref(),
+            "2".as_ref(),
+        ];
+        ours.extend(flags);
+        ours.extend([src.as_os_str(), out_b.as_os_str(), "Q4_K_M".as_ref()]);
+        let r = run_cmd(&tool, &os(&ours), false)?;
         if r.code != Some(0) {
             println!(
                 "FAIL e2e: bloomery-quantize ended {:?}: {}",
@@ -961,7 +1045,6 @@ mod clauses {
             );
             return Ok(false);
         }
-        run_llama(&work.join("set.gguf"), &out_b)?;
         let alone = gguf::Gguf::open(&out_a)?;
         let kinds = |ty: GgmlType| alone.iter_tensors().filter(|t| t.ty == ty).count();
         let (n1, n2) = (kinds(GgmlType::IQ1_S), kinds(GgmlType::IQ2_XXS));
@@ -979,7 +1062,7 @@ mod clauses {
         }
         let ok = same && both;
         println!(
-            "{} e2e: the K3 fixture's {} stacks ({n1} IQ1_S, {n2} IQ2_XXS): bloomery-quantize then llama-quantize equals llama-quantize alone, byte for byte {same}",
+            "{} e2e: the K3 fixture's {} stacks ({n1} IQ1_S, {n2} IQ2_XXS): bloomery-quantize's one pass equals llama-quantize's output, byte for byte {same}",
             verdict(ok),
             stacks.len()
         );

@@ -1,49 +1,64 @@
 //! The arguments and the usage text of `bloomery-quantize`.
 
+use crate::resolve::{Ftype, parse_type};
 use crate::{Error, Result};
-use gguf::iq_quant::IqKind;
+use gguf::quant::GgmlType;
 use std::path::PathBuf;
 
 /// What `--help` prints.
 pub const USAGE: &str = "\
-bloomery-quantize: IQ1_S and IQ2_XXS quantization of a GGUF set's routed-expert stacks, byte-identical to ggml's,
-on the card or on the host's cores; llama-quantize then copies them and quantizes the trunk (docs/quantize.md).
+bloomery-quantize: llama-quantize's job, byte for byte, in one pass: the routed-expert stacks on the card (or the
+host's cores), every other tensor on the host's cores, the metadata and the shard layout as llama-quantize writes
+them (docs/quantize.md).
 
 usage:
-  bloomery-quantize <in first shard> <out prefix> --imatrix FILE --tensor-type-file FILE [options]
+  bloomery-quantize [options] <in first shard> <out> <ftype> [nthreads]
   bloomery-quantize --help | --version
 
-  <in first shard>       the first file of the input set (MXFP4, F16, BF16 or F32 expert stacks)
-  <out prefix>           the output set: PREFIX.gguf, or PREFIX-0000i-of-0000n.gguf for a split set; an
-                         existing file is refused, never overwritten
-  --imatrix FILE         the GGUF importance matrix llama-imatrix wrote (required)
+  <in first shard>       the first file of the input set
+  <out>                  the output file; with --keep-split its prefix (a trailing .gguf is dropped) and the shards
+                         are PREFIX-0000i-of-0000n.gguf; an existing file is refused, never overwritten
+  <ftype>                Q4_K_M, Q5_K_M, Q6_K, Q8_0, IQ2_XXS or IQ1_S
+  [nthreads]             accepted for llama-quantize's command line and ignored: the host rules run on the resident
+                         pool, one thread a core
+  --imatrix FILE         the GGUF importance matrix llama-imatrix wrote (IQ1_S and IQ2_XXS need it)
   --tensor-type-file FILE
-                         llama-quantize's type rules (regex=type tokens); the stacks they type IQ1_S or IQ2_XXS
-                         are quantized here (required)
-  --type IQ1_S|IQ2_XXS   quantize only the stacks the rules type this; llama-quantize does the others
-  --plan                 print every tensor's source and target type, bytes in and out, quantized-here or
-                         copied, the derived wall, the room needed and the llama-quantize command to run next;
-                         write nothing
-  --check N              run N rows of every quantized tensor through the host rule as well and stop by name
+                         llama-quantize's type rules (regex=type tokens)
+  --output-tensor-type T the type of output.weight
+  --token-embedding-type T
+                         the type of token_embd.weight
+  --allow-requantize     quantize a tensor whose source is already a quantized type (MXFP4 included)
+  --keep-split           write one output shard per input shard, as llama-quantize does
+  --plan                 print every tensor's source and target type, bytes in and out, the derived wall and the
+                         room needed; write nothing
+  --llama-plan TSV       llama-quantize's own --dry-run plan (name TAB type TAB dims TAB bytes): every tensor's type,
+                         dims and bytes must equal this plan's, or the run is refused
+  --check N              run N rows of every card-quantized tensor through the host rule as well and stop by name
                          (tensor, expert, row, byte) on the first byte that differs
-  --cpu                  run the host rule on all cores; open no card
+  --cpu                  run every tensor on the host's cores; open no card
   --card N               the card to use, by CUDA ordinal (default: the first)
   --batch N              experts per card call (default 32)
-  --llama-plan TSV       llama-quantize's own --dry-run plan (name TAB type TAB dims TAB bytes): cross-checked
-                         against the rules for every routed stack
 
-exit: 0 done; 1 a refusal, named (a source row that is not finite, an imatrix entry that is unusable, a type no
-oracle covers, too little room, a --check difference); 64 a usage error; 66 a missing input file.";
+Types are written for F32, Q4_K, Q5_K, Q6_K, Q8_0, IQ1_S and IQ2_XXS and the architecture kimi-k3; anything else is
+refused by name.
+
+exit: 0 done; 1 a refusal, named (a source row that is not finite, an imatrix entry that is unusable, a type this
+quantizer does not write, too little room, a --check or --llama-plan difference); 64 a usage error; 66 a missing
+input file.";
 
 /// The arguments of a run.
 #[derive(Debug, Clone)]
 pub struct Args {
     pub first: PathBuf,
     pub out: String,
-    pub imatrix: PathBuf,
-    pub rules: PathBuf,
+    pub ftype: Ftype,
+    pub imatrix: Option<String>,
+    pub rules: Option<PathBuf>,
+    pub output_tensor_type: Option<GgmlType>,
+    pub token_embedding_type: Option<GgmlType>,
+    pub allow_requantize: bool,
+    pub keep_split: bool,
     pub llama_plan: Option<PathBuf>,
-    pub only: Option<IqKind>,
     pub plan: bool,
     pub check: usize,
     pub cpu: bool,
@@ -60,7 +75,7 @@ pub enum Parsed {
 }
 
 impl Args {
-    /// The directory the output set goes under: the prefix's parent, `.` for a bare prefix.
+    /// The directory the output goes under: the output path's parent, `.` for a bare name.
     #[must_use]
     pub fn out_dir(&self) -> PathBuf {
         match std::path::Path::new(&self.out).parent() {
@@ -77,26 +92,26 @@ fn usage(what: impl std::fmt::Display) -> Error {
 /// Read the arguments after the program name.
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed> {
     let mut it = args.into_iter();
-    let (mut pos, mut imatrix, mut rules, mut llama_plan) = (Vec::new(), None, None, None);
-    let (mut only, mut plan, mut check, mut cpu, mut card, mut batch) =
-        (None, false, 0usize, false, None, 32usize);
+    let mut pos = Vec::new();
+    let (mut imatrix, mut rules, mut llama_plan) = (None, None, None);
+    let (mut out_t, mut emb_t) = (None, None);
+    let (mut allow, mut keep, mut plan, mut cpu) = (false, false, false, false);
+    let (mut check, mut card, mut batch) = (0usize, None, 32usize);
     while let Some(a) = it.next() {
         let value = |it: &mut dyn Iterator<Item = String>| {
             it.next().ok_or_else(|| usage(format!("{a} needs a value")))
         };
+        let ty = |s: String| parse_type(&s).map_err(|e| usage(format!("{a}: {e}")));
         match a.as_str() {
             "--help" | "-h" => return Ok(Parsed::Help),
             "--version" => return Ok(Parsed::Version),
-            "--imatrix" => imatrix = Some(PathBuf::from(value(&mut it)?)),
+            "--imatrix" => imatrix = Some(value(&mut it)?),
             "--tensor-type-file" => rules = Some(PathBuf::from(value(&mut it)?)),
             "--llama-plan" => llama_plan = Some(PathBuf::from(value(&mut it)?)),
-            "--type" => {
-                only = Some(match value(&mut it)?.to_ascii_uppercase().as_str() {
-                    "IQ1_S" => IqKind::Iq1S,
-                    "IQ2_XXS" => IqKind::Iq2Xxs,
-                    o => return Err(usage(format!("--type {o}: IQ1_S or IQ2_XXS"))),
-                });
-            }
+            "--output-tensor-type" => out_t = Some(ty(value(&mut it)?)?),
+            "--token-embedding-type" => emb_t = Some(ty(value(&mut it)?)?),
+            "--allow-requantize" => allow = true,
+            "--keep-split" => keep = true,
             "--plan" => plan = true,
             "--cpu" => cpu = true,
             "--check" => {
@@ -123,9 +138,12 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed> {
             _ => pos.push(a),
         }
     }
-    let [first, out] = <[String; 2]>::try_from(pos).map_err(|p| {
+    if pos.len() == 4 && pos[3].parse::<usize>().is_ok() {
+        pos.pop();
+    }
+    let [first, out, ftype] = <[String; 3]>::try_from(pos).map_err(|p| {
         usage(format!(
-            "two positional arguments (<in first shard> <out prefix>), got {}",
+            "three positional arguments (<in first shard> <out> <ftype>), got {}",
             p.len()
         ))
     })?;
@@ -137,13 +155,21 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed> {
             "--check compares the card with the host rule: --cpu is the host rule",
         ));
     }
+    let out = match (keep, out.strip_suffix(".gguf")) {
+        (true, Some(p)) => p.to_string(),
+        _ => out,
+    };
     Ok(Parsed::Run(Args {
         first: PathBuf::from(first),
         out,
-        imatrix: imatrix.ok_or_else(|| usage("--imatrix is required"))?,
-        rules: rules.ok_or_else(|| usage("--tensor-type-file is required"))?,
+        ftype: Ftype::parse(&ftype)?,
+        imatrix,
+        rules,
+        output_tensor_type: out_t,
+        token_embedding_type: emb_t,
+        allow_requantize: allow,
+        keep_split: keep,
         llama_plan,
-        only,
         plan,
         check,
         cpu,
@@ -164,13 +190,18 @@ mod tests {
     fn a_full_command_line() {
         let Parsed::Run(a) = run(&[
             "in.gguf",
-            "out/p",
+            "out/p.gguf",
+            "q4_k_m",
             "--imatrix",
             "im.gguf",
             "--tensor-type-file",
             "r.txt",
-            "--type",
-            "iq1_s",
+            "--output-tensor-type",
+            "q6_k",
+            "--token-embedding-type",
+            "Q4_K",
+            "--allow-requantize",
+            "--keep-split",
             "--check",
             "4",
             "--card",
@@ -183,69 +214,27 @@ mod tests {
             panic!("a run")
         };
         assert_eq!(
-            (a.check, a.card, a.batch, a.plan, a.only),
-            (4, Some(1), 8, true, Some(IqKind::Iq1S))
+            (a.check, a.card, a.batch, a.plan, a.ftype),
+            (4, Some(1), 8, true, Ftype::Q4KM)
         );
+        assert_eq!(a.out, "out/p", "--keep-split drops a trailing .gguf");
         assert_eq!(a.out_dir(), PathBuf::from("out"));
+        assert_eq!(a.output_tensor_type, Some(GgmlType::Q6_K));
+        assert_eq!(a.token_embedding_type, Some(GgmlType::Q4_K));
+        assert!(a.allow_requantize && a.keep_split);
     }
 
     #[test]
     fn refusals_are_usage_errors() {
         for bad in [
-            &["in", "out", "--imatrix", "i"][..],
-            &["in", "--imatrix", "i", "--tensor-type-file", "r"],
-            &[
-                "in",
-                "out",
-                "--imatrix",
-                "i",
-                "--tensor-type-file",
-                "r",
-                "--cpu",
-                "--card",
-                "0",
-            ],
-            &[
-                "in",
-                "out",
-                "--imatrix",
-                "i",
-                "--tensor-type-file",
-                "r",
-                "--cpu",
-                "--check",
-                "2",
-            ],
-            &[
-                "in",
-                "out",
-                "--imatrix",
-                "i",
-                "--tensor-type-file",
-                "r",
-                "--type",
-                "Q4_K",
-            ],
-            &[
-                "in",
-                "out",
-                "--imatrix",
-                "i",
-                "--tensor-type-file",
-                "r",
-                "--batch",
-                "0",
-            ],
-            &[
-                "in",
-                "out",
-                "--imatrix",
-                "i",
-                "--tensor-type-file",
-                "r",
-                "--bogus",
-            ],
-            &["in", "out", "--imatrix"],
+            &["in", "out"][..],
+            &["in", "out", "q4_k_m", "--cpu", "--card", "0"],
+            &["in", "out", "q4_k_m", "--cpu", "--check", "2"],
+            &["in", "out", "q2_k"],
+            &["in", "out", "q4_k_m", "--output-tensor-type", "q3_k"],
+            &["in", "out", "q4_k_m", "--batch", "0"],
+            &["in", "out", "q4_k_m", "--bogus"],
+            &["in", "out", "q4_k_m", "--imatrix"],
         ] {
             let e = run(bad).unwrap_err();
             assert_eq!(e.status(), 64, "{bad:?}: {e}");

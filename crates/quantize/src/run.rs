@@ -6,7 +6,9 @@
 
 use crate::check::{check_rows, compare_row, host_row};
 use crate::cli::Args;
-use crate::plan::{Fate, LlamaPlan, Plan, importance};
+use crate::host::convert_rows;
+use crate::imatrix::Imatrix;
+use crate::plan::{Fate, LlamaPlan, Plan, Target};
 use crate::rules::Rules;
 use crate::scan::{row_bytes, scan_rows};
 use crate::{Error, Result};
@@ -14,15 +16,19 @@ use gguf::iq_quant::{GridTables, IqKind};
 use gguf::quant::GgmlType;
 use gguf::write::Writer;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::time::Instant;
 
 /// A backend's error, whatever it is made of.
 pub type BackendError = Box<dyn std::error::Error>;
 
-/// What quantizes a batch of rows: the card (the binary supplies it) or the host rule ([`crate::host`]).
+/// What quantizes a batch of IQ rows: the card (the binary supplies it) or the host rule ([`crate::host`]).
 pub trait Backend {
     /// What the run prints it as.
     fn name(&self) -> String;
+    /// Whether the backend's work runs on the host's resident pool, so the host rules of the other tensors cannot
+    /// run beside it.
+    fn uses_host_pool(&self) -> bool;
     /// The tensor quantized next: its kind and its importance, `ne0` values an expert.
     fn bind(&mut self, kind: IqKind, qw: &[f32]) -> std::result::Result<(), BackendError>;
     /// Rows `row0 ..` of the bound tensor, as `src` bytes of `ty` (whole rows of `ne0` values), into the file's
@@ -40,7 +46,7 @@ pub trait Backend {
 /// The opened inputs and the plan over them.
 pub struct Prepared {
     pub set: gguf::Split,
-    pub im: gguf::Gguf,
+    pub im: Option<Imatrix>,
     pub plan: Plan,
 }
 
@@ -63,15 +69,20 @@ fn io(p: &Path, source: std::io::Error) -> Error {
 /// Open the set, the imatrix, the rules and the optional llama plan, and decide every tensor; reads no tensor data
 /// but the imatrix's.
 pub fn prepare(a: &Args) -> Result<Prepared> {
-    for p in [&a.first, &a.imatrix, &a.rules]
-        .into_iter()
-        .chain(a.llama_plan.as_ref())
-    {
+    let mut inputs: Vec<&Path> = vec![&a.first];
+    inputs.extend(a.rules.as_deref());
+    inputs.extend(a.llama_plan.as_deref());
+    inputs.extend(a.imatrix.as_deref().map(Path::new));
+    for p in inputs {
         exists(p)?;
     }
     let text = |p: &Path| std::fs::read_to_string(p).map_err(|e| io(p, e));
-    let rules = Rules::parse(&text(&a.rules)?)
-        .map_err(|e| Error::refused(format!("{}: {e}", a.rules.display())))?;
+    let rules = match &a.rules {
+        Some(p) => {
+            Rules::parse(&text(p)?).map_err(|e| Error::refused(format!("{}: {e}", p.display())))?
+        }
+        None => Rules::parse("")?,
+    };
     let llama = a
         .llama_plan
         .as_ref()
@@ -79,9 +90,8 @@ pub fn prepare(a: &Args) -> Result<Prepared> {
         .transpose()?;
     let set = gguf::Split::open(&a.first)
         .map_err(|e| Error::refused(format!("{}: {e}", a.first.display())))?;
-    let im = gguf::Gguf::open(&a.imatrix)
-        .map_err(|e| Error::refused(format!("{}: {e}", a.imatrix.display())))?;
-    let plan = Plan::build(&set, &rules, llama.as_ref(), &im, a.only, &a.out)?;
+    let im = a.imatrix.as_deref().map(Imatrix::open).transpose()?;
+    let plan = Plan::build(&set, &rules, llama.as_ref(), im.as_ref(), a)?;
     Ok(Prepared { set, im, plan })
 }
 
@@ -118,6 +128,7 @@ fn check_absent(plan: &Plan) -> Result<()> {
 /// What a run did.
 #[derive(Debug)]
 pub struct Summary {
+    /// Tensors converted, and the weights of the IQ ones with the seconds they took (the card's or the host's).
     pub quantized: usize,
     pub weights: f64,
     pub quant_s: f64,
@@ -125,18 +136,17 @@ pub struct Summary {
     pub files: Vec<PathBuf>,
 }
 
-/// Write the set. `log` gets each progress line. A failure removes the files this run made.
+/// Write the output. `log` gets each progress line. A failure removes the files this run made.
 pub fn run(
     a: &Args,
     prep: Prepared,
     backend: &mut dyn Backend,
     log: &mut dyn FnMut(&str),
 ) -> Result<Summary> {
-    let Prepared { set, im, plan } = prep;
-    check_absent(&plan)?;
-    check_room(a, &plan)?;
+    check_absent(&prep.plan)?;
+    check_room(a, &prep.plan)?;
     let mut made = Vec::new();
-    let r = write_all(a, &set, &im, plan, backend, log, &mut made);
+    let r = write_all(a, prep, backend, log, &mut made);
     if r.is_err() {
         for f in &made {
             let _ = std::fs::remove_file(f);
@@ -145,86 +155,200 @@ pub fn run(
     r
 }
 
+/// The host-rule conversion of one tensor, whole: the importance, the finite scan, the rules, and the size check.
+fn host_convert(
+    set: &gguf::Split,
+    im: Option<&Imatrix>,
+    item: &crate::plan::Item,
+    target: Target,
+) -> Result<Vec<u8>> {
+    let data = set
+        .data(&item.name)
+        .map_err(|e| Error::refused(format!("{}: {e}", item.name)))?;
+    let (ne0, ne1) = (item.dims[0] as usize, item.dims[1] as usize);
+    let qw = match (item.importance, im) {
+        (true, Some(m)) => Some(m.weights(&item.name)?),
+        _ => None,
+    };
+    scan_rows(&item.name, item.src, data, ne0, 0, ne1)?;
+    let out = convert_rows(target, item.src, data, ne0, 0, ne1, qw.as_deref())
+        .map_err(|e| Error::refused(format!("{}: {e}", item.name)))?;
+    if out.len() as u64 != item.bytes_out {
+        return Err(Error::refused(format!(
+            "{}: {} bytes converted, the plan says {}",
+            item.name,
+            out.len(),
+            item.bytes_out
+        )));
+    }
+    Ok(out)
+}
+
+/// The host-converted tensors in output order, each converted ahead of the writer on the host's pool while the card
+/// works on the IQ stacks: a bounded queue (a few tensors, a few hundred MB) of results, in the order the writer
+/// asks for them.
+const LOOKAHEAD: usize = 3;
+
 fn write_all(
     a: &Args,
-    set: &gguf::Split,
-    im: &gguf::Gguf,
-    plan: Plan,
+    prep: Prepared,
     backend: &mut dyn Backend,
     log: &mut dyn FnMut(&str),
     made: &mut Vec<PathBuf>,
 ) -> Result<Summary> {
-    let n = plan.shards.len();
+    let Prepared { set, im, plan } = prep;
+    let Plan {
+        items,
+        shards,
+        layouts,
+        outs,
+        out_file_bytes,
+        ..
+    } = plan;
+    let n = shards.len();
+    let n_conv = items
+        .iter()
+        .filter(|i| matches!(i.fate, Fate::Convert(_)))
+        .count();
     log(&format!(
-        "bloomery-quantize: {n} shard(s) from {}; {} tensors quantized by the {}, the rest copied; {:.2} GB to write under {}",
+        "bloomery-quantize: {n} output shard(s) from {}; {n_conv} of {} tensors converted (IQ by the {}, the rest by the host rules), the rest copied; {:.2} GB to write to {}",
         a.first.display(),
-        plan.quantized,
+        items.len(),
         backend.name(),
-        plan.out_file_bytes as f64 / 1e9,
+        out_file_bytes as f64 / 1e9,
         a.out
     ));
     let t_all = Instant::now();
     let (mut t_q, mut w_q, mut n_q) = (0.0f64, 0.0f64, 0usize);
     let mut tables: [Option<GridTables>; 2] = [None, None];
     let mut files = Vec::new();
-    for (i, layout) in plan.layouts.into_iter().enumerate() {
-        let shard = set.shard(i).expect("i < shard_count");
-        let out = plan.outs[i].clone();
-        let partial = PathBuf::from(format!("{}.partial", out.display()));
-        made.push(partial.clone());
-        let file = std::fs::File::create(&partial).map_err(|e| io(&partial, e))?;
-        let wr = |e: gguf::write::WriteError| Error::refused(format!("{}: {e}", partial.display()));
-        let mut w =
-            Writer::new(std::io::BufWriter::with_capacity(1 << 24, file), layout).map_err(wr)?;
-        for (t, item) in shard.iter_tensors().zip(&plan.shards[i]) {
-            let data = shard
-                .data(t)
-                .map_err(|e| Error::refused(format!("{}: {e}", t.name)))?;
-            let Fate::Quantize(kind) = item.fate else {
-                w.tensor(&t.name, data).map_err(wr)?;
-                continue;
-            };
-            let qw = importance(im, t)?;
-            backend
-                .bind(kind, &qw)
-                .map_err(|e| Error::refused(format!("{}: {e}", t.name)))?;
-            let (ne0, ne1) = (t.dims[0] as usize, t.dims[1] as usize);
-            let n_exp: usize = t.dims[2..].iter().product::<u64>() as usize;
-            let tab = &*tables[usize::from(kind == IqKind::Iq1S)]
-                .get_or_insert_with(|| GridTables::new(kind));
-            let t0 = Instant::now();
-            quantize_tensor(
-                a,
-                backend,
-                &mut w,
-                t,
-                data,
-                kind,
-                tab,
-                &qw,
-                (ne0, ne1, n_exp),
-            )?;
-            let s = t0.elapsed().as_secs_f64();
-            let wt = (ne0 * ne1 * n_exp) as f64;
-            (t_q, w_q, n_q) = (t_q + s, w_q + wt, n_q + 1);
-            log(&format!(
-                "  {} {:?} -> {kind:?}: {wt:.3e} weights in {s:.1} s (read overlapped) = {:.3e} weights/s",
-                t.name,
-                t.ty,
-                wt / s
-            ));
+    let ahead = !backend.uses_host_pool();
+    let order: Vec<usize> = shards.iter().flatten().copied().collect();
+    let host_items: Vec<usize> = order
+        .iter()
+        .copied()
+        .filter(|&i| matches!(items[i].fate, Fate::Convert(Target::K(_) | Target::F32)))
+        .collect();
+    let (tx, rx) = mpsc::sync_channel::<(usize, Result<Vec<u8>>)>(LOOKAHEAD);
+    let (items_ref, set_ref, im_ref) = (&items, &set, im.as_ref());
+    let mut err_out: Option<Error> = None;
+    std::thread::scope(|sc| {
+        if ahead && !host_items.is_empty() {
+            sc.spawn(move || {
+                for i in host_items {
+                    let Fate::Convert(t) = items_ref[i].fate else {
+                        unreachable!("host_items holds conversions");
+                    };
+                    let r = host_convert(set_ref, im_ref, &items_ref[i], t);
+                    let bad = r.is_err();
+                    if tx.send((i, r)).is_err() || bad {
+                        return;
+                    }
+                }
+            });
+        } else {
+            drop(tx);
         }
-        w.finish()
-            .map_err(wr)?
-            .into_inner()
-            .map_err(|e| io(&partial, e.into_error()))?
-            .sync_all()
-            .map_err(|e| io(&partial, e))?;
-        std::fs::rename(&partial, &out).map_err(|e| io(&out, e))?;
-        made.pop();
-        made.push(out.clone());
-        log(&format!("  shard {}/{n}: {}", i + 1, out.display()));
-        files.push(out);
+        let r = (|| -> Result<()> {
+            for (s, layout) in layouts.into_iter().enumerate() {
+                let out = outs[s].clone();
+                let partial = PathBuf::from(format!("{}.partial", out.display()));
+                made.push(partial.clone());
+                let file = std::fs::File::create(&partial).map_err(|e| io(&partial, e))?;
+                let wr = |e: gguf::write::WriteError| {
+                    Error::refused(format!("{}: {e}", partial.display()))
+                };
+                let mut w = Writer::new(std::io::BufWriter::with_capacity(1 << 24, file), layout)
+                    .map_err(wr)?;
+                for &i in &shards[s] {
+                    let item = &items[i];
+                    let name = &item.name;
+                    match item.fate {
+                        Fate::Copy => {
+                            let data = set
+                                .data(name)
+                                .map_err(|e| Error::refused(format!("{name}: {e}")))?;
+                            w.tensor(name, data).map_err(wr)?;
+                        }
+                        Fate::Convert(Target::Iq(kind)) => {
+                            let data = set
+                                .data(name)
+                                .map_err(|e| Error::refused(format!("{name}: {e}")))?;
+                            let t = set.find(name).expect("planned from the set").1;
+                            let qw = im
+                                .as_ref()
+                                .ok_or_else(|| Error::refused("an IQ target needs the imatrix"))?
+                                .weights(name)?;
+                            backend
+                                .bind(kind, &qw)
+                                .map_err(|e| Error::refused(format!("{name}: {e}")))?;
+                            let (ne0, ne1) = (t.dims[0] as usize, t.dims[1] as usize);
+                            let n_exp: usize = t.dims[2..].iter().product::<u64>() as usize;
+                            let tab = &*tables[usize::from(kind == IqKind::Iq1S)]
+                                .get_or_insert_with(|| GridTables::new(kind));
+                            let t0 = Instant::now();
+                            quantize_tensor(
+                                a,
+                                backend,
+                                &mut w,
+                                t,
+                                data,
+                                kind,
+                                tab,
+                                &qw,
+                                (ne0, ne1, n_exp),
+                            )?;
+                            let secs = t0.elapsed().as_secs_f64();
+                            let wt = (ne0 * ne1 * n_exp) as f64;
+                            (t_q, w_q, n_q) = (t_q + secs, w_q + wt, n_q + 1);
+                            log(&format!(
+                                "  {name} {:?} -> {kind:?}: {wt:.3e} weights in {secs:.1} s (read overlapped) = {:.3e} weights/s",
+                                t.ty,
+                                wt / secs
+                            ));
+                        }
+                        Fate::Convert(target) => {
+                            let t0 = Instant::now();
+                            let bytes = if ahead {
+                                let (got, r) = rx.recv().map_err(|_| {
+                                    Error::refused("the host conversion thread ended early")
+                                })?;
+                                debug_assert_eq!(got, i);
+                                r?
+                            } else {
+                                host_convert(&set, im.as_ref(), item, target)?
+                            };
+                            w.tensor(name, &bytes).map_err(wr)?;
+                            n_q += 1;
+                            log(&format!(
+                                "  {name} {:?} -> {:?}: {} B on the host ({:.1} s waited for)",
+                                item.src,
+                                item.dst,
+                                bytes.len(),
+                                t0.elapsed().as_secs_f64()
+                            ));
+                        }
+                    }
+                }
+                w.finish()
+                    .map_err(wr)?
+                    .into_inner()
+                    .map_err(|e| io(&partial, e.into_error()))?
+                    .sync_all()
+                    .map_err(|e| io(&partial, e))?;
+                std::fs::rename(&partial, &out).map_err(|e| io(&out, e))?;
+                made.pop();
+                made.push(out.clone());
+                log(&format!("  shard {}/{n}: {}", s + 1, out.display()));
+                files.push(out);
+            }
+            Ok(())
+        })();
+        drop(rx);
+        err_out = r.err();
+    });
+    if let Some(e) = err_out {
+        return Err(e);
     }
     Ok(Summary {
         quantized: n_q,
