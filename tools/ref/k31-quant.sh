@@ -61,7 +61,7 @@
 #   --seqs N           imatrix: n_seq chunks per batch (default 1) [K3Q_SEQS]. llama-imatrix runs n_seq = batch / ctx chunks in one batch and
 #                      asserts its -c equals n_seq x the chunk length (imatrix.cpp:1852-1870 multiplies -c itself), so the runner passes
 #                      -c CTX -b CTX*N -ub CTX*N: the weights stream once per N chunks. N above --chunks is refused. On the card the
-#                      compute buffer grows with N x CTX (the bound on N: the A6000's 48 GB); part of the key and the marker
+#                      compute buffer grows with N x CTX, and the MoE row map caps N x CTX at 25344 tokens (a larger N is refused); part of the key and the marker
 #   --corpus FILE      a calibration text of your own                           [K3Q_CORPUS]
 #   --corpus-special   imatrix: pass --parse-special, so the text's `<|open|>`, `<|end_of_msg|>`, `[BOS]` ... are read as the control tokens they
 #                      name (without it llama-imatrix tokenizes them as plain characters); needs --corpus (tools/ref/k31-calib-render.py writes
@@ -208,6 +208,11 @@ case $STEP in
   *) [ "$IMATRIX_GPU" = 0 ] && [ "$SEQS" = 1 ] || die "--imatrix-gpu and --seqs are the imatrix step's (imatrix, all, smoke): '$STEP' takes neither" ;;
 esac
 [ "$SEQS" -le "$CHUNKS" ] || die "--seqs $SEQS is above --chunks $CHUNKS: the batch would hold $CHUNKS chunk(s) in buffers sized for $SEQS (--seqs at most --chunks)"
+# The card's MoE row map (ggml-cuda mmid.cu launch_mm_ids_helper) holds one 4-byte entry per token of the ubatch in one block's
+# shared memory and asserts it fits the opt-in limit: 99 KiB on sm_86 and sm_120 (101376 B), so a ubatch above 25344 tokens aborts
+# after the first batch's whole read.
+MMID_MAX_TOKENS=25344
+[ "$IMATRIX_GPU" = 0 ] || [ $((CTX * SEQS)) -le $MMID_MAX_TOKENS ] || die "--imatrix-gpu --seqs $SEQS --ctx $CTX: a ubatch of $((CTX * SEQS)) tokens; the card's MoE row map holds at most $MMID_MAX_TOKENS (4 B a token in 99 KiB of shared memory, mmid.cu GGML_ASSERT(nbytes_shared <= smpbo)): --seqs at most $((MMID_MAX_TOKENS / CTX))"
 [ "$DRY" = 1 ] && [ "$DETACH" = 1 ] && die "--detach and --dry-run do not combine"
 ARCH_OK=$(printf '%s' "$ARCH" | tr -d 'a-z0-9-')
 [ -z "$ARCH_OK" ] && [ -n "$ARCH" ] || die "--arch $ARCH: letters, digits and '-' only (it names every key prefix)"
