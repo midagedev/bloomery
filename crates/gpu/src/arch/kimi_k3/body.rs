@@ -63,7 +63,7 @@ use model::arch::Arch;
 use model::arch::kimi_k3::hparams::{Hparams, Kind};
 use model::arch::kimi_k3::names;
 use model::arch::kimi_k3::place::PlanInputs;
-use model::placement::{Device, Format, Plan, Role};
+use model::placement::Plan;
 use placed::{Open, Placed};
 use runtime::layer::hosted;
 use std::ops::Range;
@@ -645,7 +645,8 @@ impl GpuModel<Body> {
     /// A plan whose stage card carries no head leaves `output_norm.weight` and `output.weight` on
     /// the host, and the output head is the host's ([`HostHead`]). Refused by name: a plan of
     /// other than one stage card running every layer, a plan that carries the head on no card and
-    /// does not leave its tensors on the host, of more than one expert tier, a layer whose stacks are not its card
+    /// does not leave its tensors on the host ([`Plan::head_site`], before the card opens), of
+    /// more than one expert tier, a layer whose stacks are not its card
     /// count's, a routed layer whose experts the host holds some of and no tier card any (its
     /// handoff is the host's own entry, which the slot count a token must be one of
     /// [`HandoffSlots`] builds), and scratch or tier places past the plan's terms for them.
@@ -659,10 +660,10 @@ impl GpuModel<Body> {
         const PLAN: &str = "kimi_k3::Body::open_placed";
         let hp = &inputs.hp;
         let (_, ctx) = stage_run(PLAN, plan, card, hp.n_layer)?;
+        // The common load refuses it too ([`GpuModel::load_placed_with`]); asked here first, no
+        // check of this body's reads a plan whose head is on no card and not on the host.
+        plan.head_site(card).map_err(|e| GpuError::plan(PLAN, e))?;
         let host_head = head_on_host(plan, card);
-        if host_head {
-            refuse_unless_host_head(PLAN, plan, card)?;
-        }
         let run = hosted(&inputs.spec.layers)
             .map_err(|e| GpuError::shape(PLAN, format!("the routed layers: {e}")))?;
         refuse_tierless_host_layers(PLAN, plan, run.clone(), hp)?;
@@ -731,49 +732,6 @@ impl GpuModel<Body> {
 /// Whether the plan reads the head on the host: its card `card` carries none.
 fn head_on_host(plan: &Plan<'_>, card: usize) -> bool {
     !plan.machine.cards.get(card).is_some_and(|c| c.head)
-}
-
-/// Refused by name, as `what`'s, a plan whose card `card` carries no head and which does not
-/// leave every head tensor on the host, read in place from the file: the host head stage
-/// ([`HostHead`]) reads `output_norm.weight` and `output.weight` there, and the load uploads
-/// `output_res_score.weight` from there; nothing reads them anywhere else.
-fn refuse_unless_host_head(
-    what: &'static str,
-    plan: &Plan<'_>,
-    card: usize,
-) -> Result<(), GpuError> {
-    let elsewhere: Vec<String> = plan
-        .rows
-        .iter()
-        .filter(|r| plan.model.tensors[r.tensor].role == Role::Head)
-        .filter(|r| {
-            !matches!(
-                r.segments.as_slice(),
-                [s] if s.device == Device::Host && s.format == Format::HostFile
-            )
-        })
-        .map(|r| {
-            format!(
-                "{} {:?}",
-                plan.model.tensors[r.tensor].name,
-                r.segments
-                    .iter()
-                    .map(|s| (s.device, s.format))
-                    .collect::<Vec<_>>()
-            )
-        })
-        .collect();
-    if elsewhere.is_empty() {
-        return Ok(());
-    }
-    Err(GpuError::shape(
-        what,
-        format!(
-            "card {card} carries no head and the plan does not leave its tensors on the host, \
-             read in place from the file, which the host head stage reads (device, format): {}",
-            elsewhere.join("; ")
-        ),
-    ))
 }
 
 /// The dense layer's projections of layer `l`.

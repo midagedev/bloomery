@@ -153,11 +153,22 @@ fn the_stage_map_takes_at_most_one_head() {
         )
     };
     let held = |head: [bool; 2]| map(head).unwrap_or_else(|e| panic!("{head:?}: {e}")).head;
-    assert_eq!(held([false, false]), None);
-    assert_eq!(held([false, true]), Some(1));
+    assert_eq!(
+        held([false, false]),
+        None,
+        "no card carries the head, so no stage ends with it"
+    );
+    assert_eq!(
+        held([false, true]),
+        Some(1),
+        "card1 is the one card that carries the head"
+    );
     match map([true, true]) {
         Err(PlacementError::Stages(msg)) => {
-            assert_eq!(msg, "2 cards carry the head, at most one does");
+            assert_eq!(
+                msg, "2 cards carry the head, at most one does",
+                "the refusal counts the cards that carry it"
+            );
         }
         other => panic!("{:?}, want a stage-map refusal", other.map(|s| s.head)),
     }
@@ -206,7 +217,76 @@ fn a_plan_with_no_head_card_leaves_the_head_on_the_host() {
     };
     assert_eq!(
         (segment.device, segment.format, segment.resident_bytes),
-        (Device::Host, Format::HostFile, HEAD)
+        (Device::Host, Format::HostFile, HEAD),
+        "the head stays in the file's bytes on the host"
     );
     assert_eq!(plan.host.table_bytes, 2 * HEAD, "embedding and head");
+}
+
+/// What each stage card's load does about the head: the card that carries it reads it from the
+/// card and the others have none; with no card carrying it the head is read on the host, by the
+/// load of the card that runs the last layer alone. A headless plan whose head row sits
+/// anywhere but one host-file segment is refused by name with the tensor and where it sits, and
+/// the refusal does not depend on which card asks. Mutants: the row check taken out ends the
+/// refusal in an `Ok`; the last-layer test taken out gives the first card a host head too.
+#[test]
+fn a_headless_plan_reads_the_head_on_the_host_at_its_last_stage() {
+    let model = with_attention(2);
+    let machine = |head: [bool; 2]| Machine {
+        cards: vec![
+            Card {
+                head: head[0],
+                ..bytes_card("card0", 1 << 20, 0..1)
+            },
+            Card {
+                head: head[1],
+                ..bytes_card("card1", 1 << 20, 1..2)
+            },
+        ],
+        tiers: Vec::new(),
+        nodes: vec![Node {
+            host: host(),
+            unified: None,
+        }],
+    };
+    let (on_card1, none) = (machine([false, true]), machine([false, false]));
+    let carried = plan_with(&model, &on_card1, 4096, &HostKv, None).expect("the plan");
+    assert_eq!(
+        carried.head_site(1).expect("a head on card1"),
+        HeadSite::Card,
+        "card1 carries the head, which its weights hold"
+    );
+    assert_eq!(
+        carried.head_site(0).expect("a head on card1"),
+        HeadSite::Elsewhere,
+        "card0 ends no pipeline, the head is card1's"
+    );
+    let mut headless = plan_with(&model, &none, 4096, &HostKv, None).expect("the plan");
+    assert_eq!(
+        headless.head_site(1).expect("a head on the host"),
+        HeadSite::Host,
+        "no card carries the head, and card1 runs the last layer"
+    );
+    assert_eq!(
+        headless.head_site(0).expect("a head on the host"),
+        HeadSite::Elsewhere,
+        "card0 ends no pipeline, so it owes no host head"
+    );
+    for row in &mut headless.rows {
+        if model.tensors[row.tensor].role == Role::Head {
+            for segment in &mut row.segments {
+                segment.device = Device::Card(0);
+            }
+        }
+    }
+    for asked in [0, 1] {
+        match headless.head_site(asked) {
+            Err(PlacementError::Stages(msg)) => {
+                for word in ["carries no head", "head [(Card(0), "] {
+                    assert!(msg.contains(word), "{word} missing from: {msg}");
+                }
+            }
+            other => panic!("card{asked}: {other:?}, want the stage-map refusal"),
+        }
+    }
 }

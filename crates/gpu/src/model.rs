@@ -64,7 +64,7 @@ use model::moe::HostLayer;
 use model::placement::churn::ChurnPool;
 use model::placement::need_hook;
 use model::placement::workstation::{self, ArenaGrant, HostNeed};
-use model::placement::{ArenaFloor, ExpertList, Plan};
+use model::placement::{ArenaFloor, ExpertList, HeadSite, Plan};
 use model::r8file::R8Source;
 use runtime::costs::Store;
 use std::ops::Range;
@@ -173,9 +173,10 @@ pub trait ChainBody: Sized {
     }
 
     /// The output head's host side, once, when the plan this load opened leaves the head on the
-    /// host (no stage card carries it): the model then builds its one head from it
-    /// ([`Head::host`]) where a card head would be. `None` (the default) for a body whose card
-    /// carries the head, and for a stage card that ends no pipeline.
+    /// host (no stage card carries it, [`HeadSite::Host`]): the model then builds its one head
+    /// from it ([`Head::host`]) where a card head would be, and a body that returns `None` there
+    /// is refused by name at the load. `None` (the default) for a body whose card carries the
+    /// head, and for a stage card that ends no pipeline.
     fn take_host_head(&mut self) -> Option<HostHead> {
         None
     }
@@ -531,7 +532,8 @@ struct PlacedPre {
     gpu: Gpu,
     weights: Weights,
     layers: Range<usize>,
-    head: bool,
+    /// What this card's load does about the output head, the plan's ([`Plan::head_site`]).
+    head: HeadSite,
     ctx_max: usize,
     /// The prelude's phases; the body and the head are timed after it.
     times: LoadTimes,
@@ -2682,6 +2684,9 @@ fn placed_pre(
         .filter(|&c| c > 0)
         .ok_or_else(|| GpuError::shape(what, format!("the plan's ctx_max {}", plan.ctx_max)))?;
     let layers = spec.layers.clone();
+    // Refused before the card opens or a byte is read: a plan with no head card that does not
+    // leave the head tensors on the host has no head for any body to build.
+    let head = plan.head_site(card).map_err(|e| GpuError::plan(what, e))?;
     let (extra, extra_bytes) = extra;
     // The hook answers before the load opens its card or reads a byte in: a
     // broker that refuses the load holds nothing of the load's.
@@ -2748,7 +2753,7 @@ fn placed_pre(
             gpu,
             weights,
             layers,
-            head: spec.head,
+            head,
             ctx_max,
             times: LoadTimes {
                 plan: None,
@@ -2902,12 +2907,20 @@ fn placed_done<B: ChainBody>(
         mut times,
     } = p;
     let t = Instant::now();
-    let head = if head {
-        Some(Head::of(&gpu, &weights, body.head_eps(), body.head_norm())?)
-    } else {
-        body.take_host_head()
-            .map(|host| Head::host(&gpu, host))
-            .transpose()?
+    let head = match head {
+        HeadSite::Card => Some(Head::of(&gpu, &weights, body.head_eps(), body.head_norm())?),
+        HeadSite::Elsewhere => None,
+        // The plan reads the head on the host and this load ends the pipeline: a body that hands
+        // over no host side would otherwise load whole and fail at its first step's `no_head`.
+        HeadSite::Host => {
+            let host = body.take_host_head().ok_or_else(|| {
+                GpuError::state(
+                    "GpuModel::load_placed",
+                    "the plan carries the head on no card and this body took no host head to read it",
+                )
+            })?;
+            Some(Head::host(&gpu, host)?)
+        }
     };
     times.body = built;
     times.head = t.elapsed();

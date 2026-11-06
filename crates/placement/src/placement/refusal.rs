@@ -41,7 +41,8 @@ pub enum PlacementError {
         experts: String,
         why: qdot::QdotError,
     },
-    /// The cards' layer ranges do not cover the model once, in order, with one head.
+    /// The cards' layer ranges do not cover the model once, in order, with at most one head, or
+    /// a plan with no card head does not leave the head's tensors on the host.
     #[error("stage map: {0}")]
     Stages(String),
     /// The host tier's lock, or its residency query, failed: the span and the

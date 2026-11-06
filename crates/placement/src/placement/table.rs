@@ -288,6 +288,77 @@ pub struct Plan<'a> {
     pub expert_rank: Option<Arc<ExpertRank>>,
 }
 
+/// What the load of one stage card does about the output head ([`Plan::head_site`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadSite {
+    /// The card ends its stage with the head: its weights hold the head tensors.
+    Card,
+    /// No card carries the head and this card runs the last layer: the head tensors stay in the
+    /// file, read in place, and the load's body hands the model the head's host side.
+    Host,
+    /// Another stage ends the pipeline: this load carries no head.
+    Elsewhere,
+}
+
+impl Plan<'_> {
+    /// What the load of stage card `card` does about the output head. With a card carrying the
+    /// head, that card is [`HeadSite::Card`] and the others [`HeadSite::Elsewhere`]. With none the
+    /// head is read on the host: [`HeadSite::Host`] for the card that runs the last layer,
+    /// [`HeadSite::Elsewhere`] for the others.
+    ///
+    /// # Errors
+    ///
+    /// [`PlacementError::Stages`] naming the tensor and where it sits, when no card carries the
+    /// head and a head row is not one host-file segment: the host head reads nothing else.
+    pub fn head_site(&self, card: usize) -> Result<HeadSite, PlacementError> {
+        let cards = &self.machine.cards;
+        if cards.iter().any(|c| c.head) {
+            return Ok(if cards.get(card).is_some_and(|c| c.head) {
+                HeadSite::Card
+            } else {
+                HeadSite::Elsewhere
+            });
+        }
+        let elsewhere: Vec<String> = self
+            .rows
+            .iter()
+            .filter(|r| self.model.tensors[r.tensor].role == Role::Head)
+            .filter(|r| {
+                !matches!(
+                    r.segments.as_slice(),
+                    [s] if s.device == Device::Host && s.format == Format::HostFile
+                )
+            })
+            .map(|r| {
+                format!(
+                    "{} {:?}",
+                    self.model.tensors[r.tensor].name,
+                    r.segments
+                        .iter()
+                        .map(|s| (s.device, s.format))
+                        .collect::<Vec<_>>()
+                )
+            })
+            .collect();
+        if !elsewhere.is_empty() {
+            return Err(PlacementError::Stages(format!(
+                "each stage card carries no head and the plan does not leave its tensors on the \
+                 host, read in place from the file, which the host head stage reads (device, \
+                 format): {}",
+                elsewhere.join("; ")
+            )));
+        }
+        let last = cards
+            .get(card)
+            .is_some_and(|c| c.layers.end == self.model.layers);
+        Ok(if last {
+            HeadSite::Host
+        } else {
+            HeadSite::Elsewhere
+        })
+    }
+}
+
 /// The one-stage reference of a one-expert-tier plan: the stage holds the union
 /// of its routed ids and the tier's, and the host segments are unchanged.
 /// `flat` is the same stage machine with the tier removed. The reference uses
