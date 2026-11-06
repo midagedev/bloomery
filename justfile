@@ -4512,6 +4512,10 @@ gate-gpu-kimik3-e2e:
 # on the real file is refused by name past the card's free bytes; `--place bp` (BLOOMERY_CARD=both, one run at a time under a timeout) loads by
 # the plan: a plan that leaves experts on the host tier runs them there in the SiTU expert form, and a stage card whose dense trunk alone
 # is over the card's free bytes is planned again with the head read on the host. Never a timing run.
+# `--score FILE` teacher-forces instead (generate_kimi_k3's header has the format): for every completion position it prints the top-K ids and
+# log-probabilities, the completion token's and the extra ids' as JSON lines; `python3 -I tools/ref/k31-eval.py score` reads them against the
+# OpenRouter teacher and `ids` writes FILE. FILE sits in the tree, which box.sh syncs:
+# `just gen-kimi-k3 --score k31-student-in.tsv --ctx 2048 --place bp > student.jsonl` (BLOOMERY_CARD=both for `bp`). Never a timing run.
 gen-kimi-k3 *ARGS:
     BLOOMERY_MODEL=kimi-k3 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_kimi_k3 && bash tools/gpu-gate.sh generate_kimi_k3 {{ARGS}}'
 

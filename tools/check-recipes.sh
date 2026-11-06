@@ -463,6 +463,7 @@ pytools_list() {
     "tools/ref/hidden-diff.py --self-test"
     "tools/ref/k31-calib-gen.py --self-test"
     "tools/ref/k31-calib-render.py --self-test"
+    "tools/ref/k31-eval.py --self-test"
     "tools/ref/kernel-model.py --self-test"
     "tools/ref/lev_ref.py --self-test"
     "tools/ref/loop-floor.py --self-test"

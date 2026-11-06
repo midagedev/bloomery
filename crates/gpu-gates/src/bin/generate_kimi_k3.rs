@@ -4,6 +4,7 @@
 //!     BLOOMERY_MODEL=kimi-k3 generate_kimi_k3 [--tokens a,b,c | --prompt TEXT] [-n N]
 //!                            [--ctx C] [--place a|bp|gate] [--mode eager|graph] [--plan]
 //!                            [--granule BYTES]
+//!     BLOOMERY_MODEL=kimi-k3 generate_kimi_k3 --score FILE [--score-top K] [--ctx C] [--place a|bp|gate]
 //!
 //! Defaults: `-n 8`, `--ctx 512`, `--place a`, `--mode graph`. The model is `ref_model_path()`. The
 //! file is read as the plan reads it ([`PlanInputs::read_without_chat_for`]: every part the body
@@ -31,6 +32,16 @@
 //! granules the dense trunk leaves open at 2 MiB, so no budget splits them between the cards, and
 //! a finer granule gives the budget a window. A value that is not a power of two of at least 4 KiB
 //! is refused by name. It is a plan input only; the driver allocates as it does.
+//!
+//! `--score FILE` teacher-forces instead of generating: each line of FILE is
+//! `KEY<TAB>prompt ids<TAB>completion ids<TAB>extra ids` (ids comma-separated; the extras one group
+//! per completion position, groups joined by `|`, or empty for none). The model runs one line's
+//! prompt from an empty model, then for each completion position prints, before feeding that
+//! position's token, one JSON line: `key`, `pos`, `teacher` (the completion's id), `lp_teacher`
+//! (its log-probability), `top` (the `--score-top` highest `[id, logprob]`, default 20) and `at`
+//! (`[id, logprob]` of each extra id). Log-probabilities are the full logits row's log-softmax in
+//! f64. An empty prompt or completion, a malformed line or prompt + completion past `--ctx` is
+//! refused by name before the model loads; an id past the vocabulary before the first row runs.
 //!
 //! The lines on stdout: `load` (the resident bytes, the context, seconds), `ids` (the generated
 //! ids), `logits` (an FNV-1a over the last row's bits) and, with the vocabulary's pieces, `text`.
@@ -128,7 +139,7 @@ mod cli {
     ];
 
     /// Every flag this CLI reads; any other argument is refused by name, never ignored.
-    const KNOWN: [&str; 8] = [
+    const KNOWN: [&str; 10] = [
         "--tokens",
         "--prompt",
         "-n",
@@ -137,7 +148,186 @@ mod cli {
         "--mode",
         "--plan",
         "--granule",
+        "--score",
+        "--score-top",
     ];
+
+    /// One line of the `--score` file: a prompt, the completion forced after it and, per
+    /// completion position, the extra ids whose log-probabilities are printed beside the top.
+    struct ScoreRow {
+        key: String,
+        prompt: Vec<u32>,
+        done: Vec<u32>,
+        extra: Vec<Vec<u32>>,
+    }
+
+    /// The comma-separated ids of `field` (`what` names the field in an error).
+    fn id_list(field: &str, what: &str, line: usize) -> Result<Vec<u32>, GateError> {
+        if field.is_empty() {
+            return Ok(Vec::new());
+        }
+        field
+            .split(',')
+            .map(|t| {
+                t.trim().parse::<u32>().map_err(|e| {
+                    GateError::from(format!(
+                        "generate_kimi_k3: --score line {line}: {what} {t:?}: {e}"
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    /// The rows of the `--score` file `path`, each checked against `ctx` (prompt + completion).
+    fn read_score_rows(path: &str, ctx: usize) -> Result<Vec<ScoreRow>, GateError> {
+        let text =
+            std::fs::read_to_string(path).map_err(|e| format!("--score {path}: read: {e}"))?;
+        let mut rows = Vec::new();
+        for (i, l) in text.lines().enumerate().filter(|(_, l)| !l.is_empty()) {
+            let line = i + 1;
+            let f: Vec<&str> = l.split('\t').collect();
+            let [key, prompt, done, extra] = f[..] else {
+                return Err(format!(
+                    "generate_kimi_k3: --score line {line}: {} tab-separated fields, want 4 \
+                     (key, prompt ids, completion ids, extra ids)",
+                    f.len()
+                )
+                .into());
+            };
+            if key.is_empty()
+                || !key
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+            {
+                return Err(format!(
+                    "generate_kimi_k3: --score line {line}: key {key:?} is not [A-Za-z0-9_.-]+"
+                )
+                .into());
+            }
+            let prompt = id_list(prompt, "prompt id", line)?;
+            let done = id_list(done, "completion id", line)?;
+            if prompt.is_empty() || done.is_empty() {
+                return Err(format!(
+                    "generate_kimi_k3: --score line {line} ({key}): an empty prompt or completion"
+                )
+                .into());
+            }
+            if prompt.len() + done.len() > ctx {
+                return Err(format!(
+                    "generate_kimi_k3: --score line {line} ({key}): {} prompt + {} completion ids \
+                     exceed --ctx {ctx}",
+                    prompt.len(),
+                    done.len()
+                )
+                .into());
+            }
+            let extra: Vec<Vec<u32>> = if extra.is_empty() {
+                vec![Vec::new(); done.len()]
+            } else {
+                extra
+                    .split('|')
+                    .map(|g| id_list(g, "extra id", line))
+                    .collect::<Result<_, _>>()?
+            };
+            if extra.len() != done.len() {
+                return Err(format!(
+                    "generate_kimi_k3: --score line {line} ({key}): {} extra groups for {} \
+                     completion ids",
+                    extra.len(),
+                    done.len()
+                )
+                .into());
+            }
+            rows.push(ScoreRow {
+                key: key.to_owned(),
+                prompt,
+                done,
+                extra,
+            });
+        }
+        if rows.is_empty() {
+            return Err(format!("generate_kimi_k3: --score {path}: no rows").into());
+        }
+        Ok(rows)
+    }
+
+    /// `[[id, logprob],…]` of `ids` under `logits`' log-softmax (`lse` its log-sum-exp).
+    fn pairs(ids: impl Iterator<Item = u32>, logits: &[f32], lse: f64) -> String {
+        let items: Vec<String> = ids
+            .map(|id| format!("[{id},{}]", f64::from(logits[id as usize]) - lse))
+            .collect();
+        format!("[{}]", items.join(","))
+    }
+
+    /// One position's JSON line: the log-softmax over the whole row in f64, the teacher id's
+    /// log-probability, the `top` highest ids and the `extra` ids'.
+    fn score_line(
+        (key, pos): (&str, usize),
+        logits: &[f32],
+        teacher: u32,
+        extra: &[u32],
+        top: usize,
+    ) -> Result<String, GateError> {
+        if let Some(i) = logits.iter().position(|x| !x.is_finite()) {
+            return Err(format!(
+                "generate_kimi_k3: {key} position {pos}: logit {i} is {} (no log-probability)",
+                logits[i]
+            )
+            .into());
+        }
+        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let max = f64::from(max);
+        let sum: f64 = logits.iter().map(|&x| (f64::from(x) - max).exp()).sum();
+        let lse = max + sum.ln();
+        let k = top.min(logits.len());
+        let mut idx: Vec<u32> = (0..logits.len() as u32).collect();
+        let by_logit = |a: &u32, b: &u32| {
+            logits[*b as usize]
+                .total_cmp(&logits[*a as usize])
+                .then(a.cmp(b))
+        };
+        idx.select_nth_unstable_by(k - 1, by_logit);
+        idx.truncate(k);
+        idx.sort_by(by_logit);
+        Ok(format!(
+            "{{\"key\":\"{key}\",\"pos\":{pos},\"teacher\":{teacher},\"lp_teacher\":{},\"top\":{},\"at\":{}}}",
+            f64::from(logits[teacher as usize]) - lse,
+            pairs(idx.into_iter(), logits, lse),
+            pairs(extra.iter().copied(), logits, lse),
+        ))
+    }
+
+    /// Every row of `rows` from an empty model: the prompt stepped, then each completion id fed
+    /// after its position's line is printed (the last id is never fed: no line follows it).
+    fn score(m: &mut GpuModel<Body>, rows: &[ScoreRow], top: usize) -> Result<(), GateError> {
+        let n_vocab = m.n_vocab()?;
+        for r in rows {
+            let mut ids = r
+                .prompt
+                .iter()
+                .chain(&r.done)
+                .chain(r.extra.iter().flatten());
+            if let Some(id) = ids.find(|&&id| id as usize >= n_vocab) {
+                return Err(format!(
+                    "generate_kimi_k3: {}: id {id} is past the vocabulary ({n_vocab} ids)",
+                    r.key
+                )
+                .into());
+            }
+        }
+        for r in rows {
+            m.reset()?;
+            Body::prompt(m, &r.prompt)?;
+            for (t, &tok) in r.done.iter().enumerate() {
+                let line = score_line((&r.key, t), &m.logits()?, tok, &r.extra[t], top)?;
+                println!("{line}");
+                if t + 1 < r.done.len() {
+                    m.step(&[tok])?;
+                }
+            }
+        }
+        Ok(())
+    }
 
     /// The plan on `machine` and the machine it is on. A placed plan (`placed` names its place)
     /// the stage card's dense trunk alone refuses (its bytes past the card's free bytes) is made
@@ -193,7 +383,23 @@ mod cli {
         };
         let place = Place::parse(flag(&args, "--place")?.as_deref().unwrap_or("a"))?;
         let (tokens, text) = (flag(&args, "--tokens")?, flag(&args, "--prompt")?);
-        if tokens.is_some() == text.is_some() && !plan_only {
+        let scoring = flag(&args, "--score")?;
+        let score_top: usize = flag(&args, "--score-top")?.map_or(Ok(20), |s| s.parse())?;
+        if scoring.is_some() {
+            if tokens.is_some() || text.is_some() || args.iter().any(|a| a == "-n") {
+                return Err(
+                    "generate_kimi_k3: --score takes its prompts from the file: no --tokens, \
+                     --prompt or -n"
+                        .into(),
+                );
+            }
+            if score_top == 0 {
+                return Err("generate_kimi_k3: --score-top is at least 1".into());
+            }
+        } else if args.iter().any(|a| a == "--score-top") {
+            return Err("generate_kimi_k3: --score-top needs --score".into());
+        }
+        if scoring.is_none() && tokens.is_some() == text.is_some() && !plan_only {
             return Err("generate_kimi_k3: one prompt: --tokens a,b,c or --prompt TEXT".into());
         }
 
@@ -246,6 +452,10 @@ mod cli {
         if plan_only {
             return Ok(());
         }
+        let score_rows = scoring
+            .as_deref()
+            .map(|f| read_score_rows(f, ctx))
+            .transpose()?;
 
         let tok = text
             .is_some()
@@ -257,16 +467,17 @@ mod cli {
                 .map(|t| t.trim().parse::<u32>())
                 .collect::<Result<_, _>>()?,
             (_, Some(t)) => tok.as_ref().ok_or("no tokenizer")?.encode(t, true, false),
+            _ if score_rows.is_some() => Vec::new(),
             _ => unreachable!("one prompt by the check above"),
         };
-        if ids.is_empty() || n == 0 {
+        if score_rows.is_none() && (ids.is_empty() || n == 0) {
             return Err(format!(
                 "generate_kimi_k3: a prompt of {} ids and -n {n}: each is at least 1",
                 ids.len()
             )
             .into());
         }
-        if ids.len() + n > ctx {
+        if score_rows.is_none() && ids.len() + n > ctx {
             return Err(format!(
                 "generate_kimi_k3: a prompt of {} ids and {n} generated exceed --ctx {ctx}",
                 ids.len()
@@ -286,6 +497,9 @@ mod cli {
             m.layers().len(),
             t.elapsed().as_secs_f64()
         );
+        if let Some(rows) = score_rows {
+            return score(&mut m, &rows, score_top);
+        }
         let out = greedy(&mut m, &ids, n)?;
         println!("ids {out:?}");
         println!("logits fnv1a64={:016x}", fnv_row(&m.logits()?));
