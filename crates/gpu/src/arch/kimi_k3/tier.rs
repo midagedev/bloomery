@@ -191,6 +191,12 @@ impl TierParts {
         self.side.bytes()
     }
 
+    /// The slot map's tier view: each expert's place in the tier's stacks, or the host mark, a
+    /// row of `n_expert` places a routed layer at the stage view's row offsets.
+    pub(super) fn places(&self) -> &DeviceBuffer<u32> {
+        self.side.places()
+    }
+
     /// The step's tier places, as the last handoff wrote them.
     pub(super) fn step_tsel(&self) -> Result<&DeviceBuffer<u32>, GpuError> {
         self.side.tsel(0)

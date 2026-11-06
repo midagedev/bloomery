@@ -137,6 +137,21 @@ pub static TIER_COST: Kind = Kind {
     doc: "Plan (b') decode with a local or node tier after the same warm history.",
 };
 
+/// The placed prompt pass's rows the plan took, before the load.
+pub static PROMPT_PASS: Kind = Kind {
+    name: "prompt_pass",
+    head: "prompt pass",
+    doc: "The placed prompt pass a placed load runs a prompt by, after its plan record: the rows of one pass (rows) and of its latent mixers' inner run (mla_rows), the pass's card bytes the plan reserved (reserve) and the stage card's room beside the plan's terms (left), which holds the prompt reserve and the tier's places together, and, when a wider shape was refused, the narrowest of those as rows/mla_rows and the bytes it fell short by (wider, short; absent when the widest shape fit).",
+    parts: &[
+        key("rows", U64, "rows"),
+        key("mla_rows", U64, "rows"),
+        key("reserve", U64, "B"),
+        key("left", U64, "B"),
+        opt("wider", Word, "rows/mla_rows"),
+        opt("short", U64, "B"),
+    ],
+};
+
 /// Where the placement puts the experts, before the load.
 pub static PLAN: Kind = Kind {
     name: "plan",
@@ -3557,7 +3572,7 @@ pub static BLOOMERY_SERVE_DECIDE: &[&Kind] = kinds![
 ];
 
 /// What `generate_kimi_k3` prints, in the order it prints them.
-pub static GENERATE_KIMI_K3: &[&Kind] = &[&PLACE_UNSET, &PLAN, &NEED];
+pub static GENERATE_KIMI_K3: &[&Kind] = &[&PLACE_UNSET, &PLAN, &PROMPT_PASS, &NEED];
 
 /// What `generate_glm5next` prints, in the order it prints them.
 pub static GENERATE_GLM5NEXT: &[&Kind] = &[
@@ -3873,6 +3888,26 @@ pub fn plan(place: &str, machine: &Machine, plan: &Plan<'_>) -> Record {
         .w("cuda_order", cuda_order());
     let r = with_requantized(r, plan.model);
     with_expert_rank(r, plan.expert_rank.as_deref())
+}
+
+/// The `prompt_pass` record: a pass of `rows` rows whose latent mixers run `mla_rows` at a
+/// time, its `reserve` bytes, the stage card's `left` room beside the plan's terms (which holds
+/// the prompt and the tier reserves together), and the narrowest wider shape the plan refused
+/// (`rows`, `mla_rows`, the bytes it fell short by).
+pub fn prompt_pass(
+    (rows, mla_rows): (usize, usize),
+    (reserve, left): (u64, u64),
+    wider: Option<((usize, usize), u64)>,
+) -> Record {
+    let r = Record::new(&PROMPT_PASS)
+        .u("rows", rows)
+        .u("mla_rows", mla_rows)
+        .u("reserve", reserve)
+        .u("left", left);
+    match wider {
+        Some(((w, wm), short)) => r.w("wider", format!("{w}/{wm}")).u("short", short),
+        None => r,
+    }
 }
 
 /// `r` with the `expert_rank` part, the rank file the plan took each routed

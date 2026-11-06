@@ -1,9 +1,10 @@
 //! The Kimi K3 session: [`Body`] behind the common hybrid owner's shape ([`super::Batch`]), planned
 //! once by its placement (the dense trunk and each routed layer's card experts on the stage card,
 //! the next ids on an expert tier card, the rest on the host tier) and loaded by the body's placed
-//! constructor ([`GpuModel::open_placed`]). The body has no rows pass on the placed load, so a
-//! prompt is its ids stepped one at a time ([`GpuModel::step`] over the slice, [`Batch::prompt`]):
-//! each id is a decode step's bits and the head's argmax after the last is the call's. A delta
+//! constructor ([`GpuModel::open_placed`]). A load with the placed pass runs a prompt as passes of
+//! its rows ([`GpuModel::prompt_placed`]); one without steps the ids one at a time
+//! ([`GpuModel::step`] over the slice, [`Batch::prompt`]). Either way each id is a decode step's
+//! bits and the head's argmax after the last is the call's. A delta
 //! layer's state holds the position it stands at alone, so a cut keeps every held position or
 //! nothing; the latent layers' caches are per position and ask nothing of it. The body serves one
 //! sequence. It lives in the gpu crate's own kimi_k3 arch, so it needs no feature.
@@ -86,13 +87,18 @@ impl Batch for Body {
         Ok(false)
     }
 
-    /// The ids stepped from the model's position. Each step owns its residency pass
-    /// ([`GpuModel::step`]: its boundary, its kept row, the next boundary ahead), and a host
-    /// tier's open-call state refuses a boundary inside an open call, so no outer
+    /// The ids from the model's position: as placed passes when the load has one
+    /// ([`GpuModel::prompt_placed`]), else stepped. Each pass or step owns its residency pass (its
+    /// boundary, its kept row, the next boundary ahead), and a host tier's open-call state refuses
+    /// a boundary inside an open call, so no outer
     /// [`prompt_pass`](bloomery_gpu::host::served::prompt_pass) wraps the ids. The body's
     /// residency is [`Residency::Off`], so no rule counts the prompt ids' decode rows.
     fn prompt(m: &mut GpuModel<Body>, ids: &[u32]) -> Result<u32, GpuError> {
-        m.step(ids)
+        if m.body("kimi_k3::Batch::prompt")?.pass_shape().is_some() {
+            m.prompt_placed(ids)
+        } else {
+            m.step(ids)
+        }
     }
 
     /// The delta layers' state holds the position it stands at alone: a cut keeps that position,

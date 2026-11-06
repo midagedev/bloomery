@@ -219,13 +219,13 @@ impl Pass {
     /// its K-quant sites read, which the body's activation forms gain here. Load-time only.
     ///
     /// # Errors
-    /// [`GpuError`] for a placed body, whose prompt is the step's one id at a time, and from the
-    /// allocations.
+    /// [`GpuError`] for a placed body, whose passes are the placed pass's ([`super::pass`]), and
+    /// from the allocations.
     pub fn new(gpu: &Gpu, body: &mut Body) -> Result<Pass, GpuError> {
         if body.placed().is_some() {
             return Err(GpuError::shape(
                 ROWS,
-                "a placed body runs no rows pass: its prompt is stepped one id at a time",
+                "a placed body runs no card-alone rows pass: its passes are the placed pass's",
             ));
         }
         let stream = gpu.stream();
@@ -278,7 +278,7 @@ impl Pass {
 
 /// Layer `l`'s mixer over the pass's rows `io.input`: the delta layer's rows on its one-lane store
 /// in place, or the gated latent layer's on its cache; the updates land in `io.out`.
-fn run_mixer_rows(
+pub(super) fn run_mixer_rows(
     cx: &GqaCx<'_>,
     (k, acts, lane): (&Kernels, &mut Acts, &Lane),
     kit: RowsKit<'_>,

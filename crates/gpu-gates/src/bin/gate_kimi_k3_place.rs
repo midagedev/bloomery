@@ -54,6 +54,36 @@
 //! - `plan records`: `generate_kimi_k3 --plan --place bp` prints the `plan` record of the placed
 //!   machine and no host expert (the gate's plan holds none).
 //!
+//! The placed prompt pass (`GpuModel::open_placed_pass`), each clause per pinned [`PASS_SHAPES`]
+//! (16 rows, the latent mixers' inner run at 8 and at 1), on a plan whose prompt reserve is the
+//! pass's bytes, whose tier batch holds its rows and whose per-card budgets add each to the
+//! gate's, over [`PASS_PROMPT`] ids: two passes, the first across the delta layers' chunks. Each
+//! compares the same load stepped after a reset, so the expert split is one and the bits are the
+//! clause:
+//!
+//! - `pass state`: the prompt as passes, then [`STEPS`] greedy ids, reads the stepped prompt's
+//!   ids and every logits row's bits: each row is the step's and the state the passes leave is
+//!   the steps'. Mutant: the close's add over every row but the pass's last (that row's sum and
+//!   every later row off).
+//! - `pass batches`: the tier's hits over the prompt are the steps' (each row's slots sent once)
+//!   and its batches served one per tier layer per pass. The NVMe tier's one read of an expert a
+//!   pass is the real file's (the fixture pages nothing): `generate_kimi_k3 --walk pass` on it.
+//!   Mutant: a pass per row (`pass state` stays green, `pass batches` red).
+//! - `pass score`: `GpuModel::score_placed` over the prompt and the greedy ids but the last reads
+//!   the stepped rows' bits at each of the last [`STEPS`] rows (the card head, a row at a time).
+//!   Mutant: the window one row early.
+//! - `pass refused`: a shape out of range at the load, `prompt_placed` on a load without the
+//!   pass, `score_placed` past the pass's rows and a plan whose prompt reserve does not hold the
+//!   pass are refused by name. Mutant: the load's reserve check without the pass's bytes.
+//! - `pass score, host head`: the same on a plan whose head the host reads, its rows through the
+//!   host's projection of up to `HOST_HEAD_ROWS` rows at once (one `matmul_q` of [`STEPS`]
+//!   columns against the step's one-column calls). Mutant: the projection's second row a copy of
+//!   its first.
+//! - `pass cli`: `generate_kimi_k3 --walk pass --plan` prints the `prompt_pass` record of the
+//!   widest shape at the gate's budget for it, and the run's ids and last logits row are the
+//!   same plan's stepped load's; `--score --walk pass` over the stepped ids prints a line a
+//!   completion position whose top id is the stepped load's argmax there.
+//!
 //! The prompt is the fixed walk of `e2e::walk` through the vocabulary: [`PROMPT`] ids, [`STEPS`]
 //! greedy ids.
 
@@ -97,7 +127,7 @@ mod gate {
     use std::sync::Arc;
 
     use app::Prompt;
-    use bloomery_gpu::arch::kimi_k3::Body;
+    use bloomery_gpu::arch::kimi_k3::{Body, CHUNK, PassShape, SHAPES, pass_bytes};
     use bloomery_gpu::host::node;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::{Fault, FaultSite, Gpu, GpuError, GpuModel};
@@ -111,14 +141,14 @@ mod gate {
     };
     use gguf::Split;
     use model::arch::Arch;
-    use model::arch::kimi_k3::place::{PlaceError, PlanInputs, tier_batch};
+    use model::arch::kimi_k3::place::{PlaceError, PlanInputs, tier_batch, tier_batch_at};
     use model::placement::{
         Device, ExpertList, Machine, PlacementError, Plan, PlanLevers, Role, workstation,
     };
 
     use crate::e2e;
     use crate::node_proc::{LISTENING, tier_server, tier_server_command};
-    use crate::tier_twocard::{Sent, sent_every, tier_counts};
+    use crate::tier_twocard::{Sent, sent_between, sent_every, tier_counts};
 
     /// The gate's name: the recipe's and the refusals'.
     const NAME: &str = "gate_kimi_k3_place";
@@ -133,6 +163,22 @@ mod gate {
     const PROMPT: usize = 6;
     /// Greedy ids after the prompt.
     const STEPS: usize = 8;
+    /// Prompt positions of the pass clauses: two passes of [`PASS_SHAPES`]' rows, the first
+    /// across the delta layers' chunks and the second shorter than one.
+    const PASS_PROMPT: usize = 2 * CHUNK + 3;
+    /// The pass shapes the pass clauses pin: 16 rows, the latent mixers' inner run at
+    /// [`CHUNK`] rows and at one.
+    const PASS_SHAPES: [PassShape; 2] = [
+        PassShape {
+            rows: 16,
+            mla_rows: CHUNK,
+        },
+        PassShape {
+            rows: 16,
+            mla_rows: 1,
+        },
+    ];
+
     /// The worst step's logits row's relative L2 distance of a load with host experts from the
     /// whole-card body's, both fed the same ids. The experts are the one difference: the host
     /// rounds both inputs of a routed expert in q8_K blocks of 256 values, the card in q8_1 blocks
@@ -178,6 +224,17 @@ mod gate {
     impl Run {
         fn same_bits(&self, other: &Run) -> bool {
             self.ids == other.ids && fnv_row(&self.logits) == fnv_row(&other.logits)
+        }
+
+        /// The same ids and every logits row's bits.
+        fn same_rows(&self, other: &Run) -> bool {
+            self.ids == other.ids
+                && self.rows.len() == other.rows.len()
+                && self
+                    .rows
+                    .iter()
+                    .zip(&other.rows)
+                    .all(|(a, b)| fnv_row(a) == fnv_row(b))
         }
     }
 
@@ -230,6 +287,42 @@ mod gate {
         ok
     }
 
+    /// The prompt as placed passes (`pass`) or stepped, then [`STEPS`] ids greedy, every step's
+    /// logits row, and the tier's counters over the prompt alone.
+    fn walked(
+        m: &mut GpuModel<Body>,
+        prompt: &[u32],
+        pass: bool,
+    ) -> Result<(Run, Option<Sent>), GateError> {
+        let counts = |m: &GpuModel<Body>| -> Result<Option<Sent>, GateError> {
+            Ok(tier_counts(
+                m.body(NAME)?.placed().ok_or("not a placed load")?.hybrid(),
+            ))
+        };
+        let before = counts(m)?;
+        let first = if pass {
+            m.prompt_placed(prompt)?
+        } else {
+            m.step(prompt)?
+        };
+        let sent = sent_between(before, counts(m)?);
+        let mut ids = vec![first];
+        let mut rows = vec![m.logits()?];
+        while ids.len() < STEPS {
+            let last = ids[ids.len() - 1];
+            ids.push(m.step(&[last])?);
+            rows.push(m.logits()?);
+        }
+        Ok((
+            Run {
+                ids,
+                logits: m.logits()?,
+                rows,
+            },
+            sent,
+        ))
+    }
+
     /// The allocator granule the gate's plans count each card's uploads at. The fixture's
     /// experts (about 38 KB each) fit the shared granules the dense trunk leaves open at the
     /// card's 2 MiB, so no budget at or above the plan's floor splits them between the cards; at
@@ -240,9 +333,16 @@ mod gate {
     /// The `bp` machine of the gate: the A6000 the stage, the 3090 the tier, each at [`GRANULE`],
     /// the tier's batch reserved.
     fn bp_machine(inputs: &PlanInputs) -> Result<Machine, GateError> {
-        let bp = Place::Bp
-            .on_host()?
-            .machine(None, Some(tier_batch(&inputs.hp)?))?;
+        bp_machine_at(inputs, None)
+    }
+
+    /// [`bp_machine`] with the tier's batch at `rows` rows (`None`: the step's).
+    fn bp_machine_at(inputs: &PlanInputs, rows: Option<u64>) -> Result<Machine, GateError> {
+        let batch = match rows {
+            Some(rows) => tier_batch_at(&inputs.hp, rows)?,
+            None => tier_batch(&inputs.hp)?,
+        };
+        let bp = Place::Bp.on_host()?.machine(None, Some(batch))?;
         let mut machine = bp(inputs.model.layers);
         let granule = NonZeroU64::new(GRANULE).ok_or("the gate's granule is at least one byte")?;
         for card in machine.cards.iter_mut().chain(machine.tiers.iter_mut()) {
@@ -509,6 +609,16 @@ mod gate {
         env: &[(&str, String)],
         plan_only: bool,
     ) -> Result<(bool, String, String), GateError> {
+        generate_with(prompt, env, plan_only, &[])
+    }
+
+    /// [`generate`] with the flags `extra`.
+    fn generate_with(
+        prompt: &[u32],
+        env: &[(&str, String)],
+        plan_only: bool,
+        extra: &[&str],
+    ) -> Result<(bool, String, String), GateError> {
         let bin = beside("generate_kimi_k3")?;
         let ids = prompt
             .iter()
@@ -518,7 +628,8 @@ mod gate {
         let mut cmd = Command::new(&bin);
         cmd.args(["--tokens", &ids, "-n", &STEPS.to_string()])
             .args(["--ctx", &CTX.to_string(), "--place", "bp"])
-            .args(["--granule", &GRANULE.to_string()]);
+            .args(["--granule", &GRANULE.to_string()])
+            .args(extra);
         if plan_only {
             cmd.arg("--plan");
         }
@@ -534,6 +645,15 @@ mod gate {
             String::from_utf8_lossy(&out.stdout).into_owned(),
             String::from_utf8_lossy(&out.stderr).into_owned(),
         ))
+    }
+
+    /// [`generate`] with `--walk pass`.
+    fn generate_walk(
+        prompt: &[u32],
+        env: &[(&str, String)],
+        plan_only: bool,
+    ) -> Result<(bool, String, String), GateError> {
+        generate_with(prompt, env, plan_only, &["--walk", "pass"])
     }
 
     /// The ids and the logits hash `generate_kimi_k3` printed.
@@ -633,6 +753,8 @@ mod gate {
         pass &= host_share(&inputs, &table, (budget, host), (&prompt, &want))?;
         pass &= host_without_tier(&inputs, &table, (budget, host))?;
         pass &= node_family_and_records(&prompt, budget)?;
+        pass &= placed_pass(&inputs, budget, host)?;
+        pass &= pass_cli(&inputs, budget, host)?;
         println!("{NAME}: {}", tier::tally_line());
         if !pass {
             return Err(checks_failed());
@@ -640,8 +762,9 @@ mod gate {
         println!(
             "PASSED: {NAME} the placed load's greedy ids equal the whole-card body's, eager reads \
              the graph's bits, the loopback node's tier reads the in-process tier's bits, a plan's \
-             host share reads the whole-card logits rows within the band, and the load refuses a wrong tier \
-             reserve and a node of another family by name"
+             host share reads the whole-card logits rows within the band, the placed pass reads \
+             the steps' bits, and the load refuses a wrong tier reserve, a node of another family \
+             and a pass the plan does not hold by name"
         );
         Ok(())
     }
@@ -1131,6 +1254,351 @@ mod gate {
             ok && plan.is_some_and(|l| l.contains("place=bp") && l.contains("host_experts=0")),
             "plan records",
             &format!("generate_kimi_k3 --plan --place bp: ok={ok}, record {plan:?}"),
+        );
+        Ok(pass)
+    }
+
+    /// The pass's plan at `shape` over the gate's `budget`: the inputs with the pass's bytes as
+    /// the prompt reserve and the arena at its floor, the machine with the tier's batch at the
+    /// pass's rows, and per-card budgets, the stage card's raised by the pass's bytes and the
+    /// tier card's by its batch's growth, so each card's experts keep their room.
+    /// With `headless`, no card carries the head and the stage card's budget gives up the head's
+    /// bytes, so the experts split as with the head on the card.
+    fn pass_plan_inputs(
+        inputs: &PlanInputs,
+        budget: u64,
+        shape: PassShape,
+        headless: bool,
+    ) -> Result<(PlanInputs, Machine, PlanLevers), GateError> {
+        let reserve = pass_bytes(&inputs.hp, CTX, shape)?;
+        let grown = tier_batch_at(&inputs.hp, shape.rows as u64)?.card()?
+            - tier_batch(&inputs.hp)?.card()?;
+        let pass = inputs
+            .clone()
+            .with_prompt_reserve(reserve)
+            .with_arena_at_floor();
+        let mut machine = bp_machine_at(inputs, Some(shape.rows as u64))?;
+        let head = if headless {
+            machine.cards.iter_mut().for_each(|c| c.head = false);
+            card_head_bytes(inputs, budget)?
+        } else {
+            0
+        };
+        let (Some(s), Some(t)) = (
+            machine.cards.first().and_then(|c| c.device),
+            machine.tiers.first().and_then(|c| c.device),
+        ) else {
+            return Err(
+                "the gate's cards carry no census device, which a per-card budget names".into(),
+            );
+        };
+        let levers = levers_of(CardBudget::Per(vec![
+            (s.ordinal, budget + reserve - head),
+            (t.ordinal, budget + grown),
+        ]));
+        Ok((pass, machine, levers))
+    }
+
+    /// The placed pass at each of [`PASS_SHAPES`] against the same load stepped, and its
+    /// refusals.
+    fn placed_pass(inputs: &PlanInputs, budget: u64, host: HostCfg) -> Result<bool, GateError> {
+        let prompt = e2e::walk(PASS_PROMPT, inputs.hp.n_vocab);
+        let mut pass = true;
+        for shape in PASS_SHAPES {
+            let (pass_inputs, machine, at) = pass_plan_inputs(inputs, budget, shape, false)?;
+            let plan = pass_inputs.plan(&machine, CTX as u64, &at)?;
+            let splits = layer_splits(&plan);
+            let (stage, tier_n, host_n) = totals(&splits);
+            let tier_layers = splits.iter().filter(|o| o.2 > 0).count() as u64;
+            let label = format!("{} rows, latent {}", shape.rows, shape.mla_rows);
+            println!(
+                "pass plan ({label}) under card budgets {}: stage {stage} experts, tier {tier_n}, \
+                 host {host_n}, reserve {} B",
+                at.card_budget_bytes, pass_inputs.prompt_reserve
+            );
+            let file = open_split(Arch::KimiK3, RECIPE)?;
+            let mut m =
+                GpuModel::<Body>::open_placed_pass(file, &plan, &pass_inputs, 0, host, shape)?;
+            m.set_mode(StepMode::Graph);
+            let (got, sent) = walked(&mut m, &prompt, true)?;
+            m.reset()?;
+            let (want, stepped) = walked(&mut m, &prompt, false)?;
+            tier::sc("pass state: the passes read the stepped prompt's ids and rows")?;
+            pass &= line(
+                got.same_rows(&want),
+                "pass state",
+                &format!(
+                    "{label}: passes {:?}, steps {:?}, rows equal {} of {}",
+                    got.ids,
+                    want.ids,
+                    got.rows
+                        .iter()
+                        .zip(&want.rows)
+                        .filter(|(a, b)| fnv_row(a) == fnv_row(b))
+                        .count(),
+                    want.rows.len()
+                ),
+            );
+
+            let passes = PASS_PROMPT.div_ceil(shape.rows) as u64;
+            tier::sc("pass batches: the tier's hits are the steps', one batch a layer a pass")?;
+            let (hits, steps_hits, served) = match (&sent, &stepped) {
+                (Some(p), Some(s)) => (p.hits.clone(), s.hits.clone(), p.stats.served),
+                _ => (Vec::new(), vec![1], 0),
+            };
+            pass &= line(
+                tier_layers > 0 && hits == steps_hits && served == passes * tier_layers,
+                "pass batches",
+                &format!(
+                    "{label}: tier hits over the prompt {hits:?} (steps {steps_hits:?}); batches \
+                     served {served}, {passes} passes of {tier_layers} tier layers"
+                ),
+            );
+
+            m.reset()?;
+            let ids: Vec<u32> = prompt
+                .iter()
+                .chain(&want.ids[..STEPS - 1])
+                .copied()
+                .collect();
+            let logits = m.score_placed(&ids, STEPS)?;
+            let n_vocab = inputs.hp.n_vocab;
+            let same = logits.len() == STEPS * n_vocab
+                && (0..STEPS).all(|t| {
+                    fnv_row(&logits[t * n_vocab..(t + 1) * n_vocab]) == fnv_row(&want.rows[t])
+                });
+            tier::sc("pass score: the last rows' logits are the steps' rows")?;
+            pass &= line(
+                same,
+                "pass score",
+                &format!(
+                    "{label}: {} ids as passes, the last {STEPS} rows' logits against the stepped \
+                     rows: {same}",
+                    ids.len()
+                ),
+            );
+            let past = m
+                .score_placed(&ids, shape.rows + 1)
+                .err()
+                .map(|e| e.to_string());
+            drop(m);
+            tier::sc("pass refused: rows past the pass are refused by name")?;
+            pass &= line(
+                past.as_deref()
+                    .is_some_and(|t| t.contains(&format!("the pass's {} rows", shape.rows))),
+                "pass refused",
+                &format!("{label}: score_placed of {} rows: {past:?}", shape.rows + 1),
+            );
+        }
+
+        pass &= host_head_pass(inputs, budget, host, &prompt)?;
+
+        let shape = PASS_SHAPES[0];
+        let (pass_inputs, machine, at) = pass_plan_inputs(inputs, budget, shape, false)?;
+        let plan = pass_inputs.plan(&machine, CTX as u64, &at)?;
+        let wide = PassShape {
+            rows: model::moe::UNION_MAX_COLS + 1,
+            mla_rows: 1,
+        };
+        let file = open_split(Arch::KimiK3, RECIPE)?;
+        let text = refused(GpuModel::<Body>::open_placed_pass(
+            file,
+            &plan,
+            &pass_inputs,
+            0,
+            host,
+            wide,
+        ));
+        tier::sc("pass refused: a shape out of range at the load")?;
+        pass &= line(
+            text.as_deref()
+                .is_some_and(|t| t.contains(&format!("a pass of {} rows", wide.rows))),
+            "pass refused",
+            &format!("a pass of {} rows: {text:?}", wide.rows),
+        );
+
+        let short = inputs.clone().with_arena_at_floor();
+        let plan = short.plan(&machine, CTX as u64, &at)?;
+        let file = open_split(Arch::KimiK3, RECIPE)?;
+        let text = refused(GpuModel::<Body>::open_placed_pass(
+            file, &plan, &short, 0, host, shape,
+        ));
+        tier::sc("pass refused: a plan that does not reserve the pass")?;
+        pass &= line(
+            text.as_deref()
+                .is_some_and(|t| t.contains("tier places and placed pass")),
+            "pass refused",
+            &format!("a plan with no prompt reserve: {text:?}"),
+        );
+
+        let file = open_split(Arch::KimiK3, RECIPE)?;
+        let mut m = GpuModel::<Body>::open_placed(file, &plan, &short, 0, host)?;
+        let text = m.prompt_placed(&prompt).err().map(|e| e.to_string());
+        tier::sc("pass refused: prompt_placed on a load without the pass")?;
+        pass &= line(
+            text.as_deref()
+                .is_some_and(|t| t.contains("a load made without the placed pass")),
+            "pass refused",
+            &format!("prompt_placed on a load without the pass: {text:?}"),
+        );
+        Ok(pass)
+    }
+
+    /// `pass score, host head`: a plan whose head the host reads, scored as passes against the
+    /// same load stepped.
+    fn host_head_pass(
+        inputs: &PlanInputs,
+        budget: u64,
+        host: HostCfg,
+        prompt: &[u32],
+    ) -> Result<bool, GateError> {
+        let shape = PASS_SHAPES[1];
+        let (pass_inputs, machine, at) = pass_plan_inputs(inputs, budget, shape, true)?;
+        let plan = pass_inputs.plan(&machine, CTX as u64, &at)?;
+        let on_host = plan
+            .rows
+            .iter()
+            .filter(|r| plan.model.tensors[r.tensor].role == Role::Head)
+            .all(|r| matches!(r.segments.as_slice(), [s] if s.device == Device::Host));
+        let file = open_split(Arch::KimiK3, RECIPE)?;
+        let mut m = GpuModel::<Body>::open_placed_pass(file, &plan, &pass_inputs, 0, host, shape)?;
+        m.set_mode(StepMode::Graph);
+        let (want, _) = walked(&mut m, prompt, false)?;
+        m.reset()?;
+        let ids: Vec<u32> = prompt
+            .iter()
+            .chain(&want.ids[..STEPS - 1])
+            .copied()
+            .collect();
+        let logits = m.score_placed(&ids, STEPS)?;
+        let n_vocab = inputs.hp.n_vocab;
+        let equal = (0..STEPS)
+            .filter(|&t| {
+                logits.get(t * n_vocab..(t + 1) * n_vocab).map(fnv_row)
+                    == Some(fnv_row(&want.rows[t]))
+            })
+            .count();
+        tier::sc("pass score, host head: the host's rows projection reads the steps' rows")?;
+        Ok(line(
+            on_host && equal == STEPS,
+            "pass score, host head",
+            &format!(
+                "the plan leaves the head on the host ({on_host}); the last {STEPS} rows' logits \
+                 equal to the stepped rows: {equal} of {STEPS}"
+            ),
+        ))
+    }
+
+    /// `generate_kimi_k3 --score FILE --walk pass` over `env`: its status, stdout and stderr.
+    fn score_walk(
+        file: &std::path::Path,
+        env: &[(&str, String)],
+    ) -> Result<(bool, String, String), GateError> {
+        let bin = beside("generate_kimi_k3")?;
+        let mut cmd = Command::new(&bin);
+        cmd.arg("--score")
+            .arg(file)
+            .args(["--walk", "pass", "--ctx", &CTX.to_string(), "--place", "bp"])
+            .args(["--granule", &GRANULE.to_string()]);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        die_with_parent(&mut cmd);
+        let out = cmd
+            .output()
+            .map_err(|e| format!("{}: {e}", bin.display()))?;
+        Ok((
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        ))
+    }
+
+    /// The first `top` id of a `--score` line: the row's argmax.
+    fn top_id(line: &str) -> Option<u32> {
+        let at = line.find("\"top\":[[")? + "\"top\":[[".len();
+        let digits: String = line[at..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse().ok()
+    }
+
+    /// `generate_kimi_k3 --walk pass` at a budget that holds its widest shape at [`CTX`]: the
+    /// `prompt_pass` record names that shape, and the run reads the same plan's load stepped.
+    fn pass_cli(inputs: &PlanInputs, budget: u64, host: HostCfg) -> Result<bool, GateError> {
+        let shape = SHAPES
+            .iter()
+            .copied()
+            .find(|s| s.rows <= CTX)
+            .ok_or("no pass shape at the gate's context")?;
+        let (pass_inputs, machine, at) = pass_plan_inputs(inputs, budget, shape, false)?;
+        let prompt = e2e::walk(PASS_PROMPT, inputs.hp.n_vocab);
+        let env = [(CARD_BUDGET, at.card_budget_bytes.to_string())];
+        let mut pass = true;
+        let (ok, _, stderr) = generate_walk(&prompt, &env, true)?;
+        let record = stderr.lines().find(|l| l.starts_with("prompt pass "));
+        let want = format!("rows={} mla_rows={} ", shape.rows, shape.mla_rows);
+        tier::sc("pass cli: --walk pass --plan prints the widest shape's prompt_pass record")?;
+        pass &= line(
+            ok && record.is_some_and(|l| l.contains(&want) && !l.contains("wider=")),
+            "pass cli",
+            &format!("generate_kimi_k3 --walk pass --plan: ok={ok}, record {record:?}"),
+        );
+
+        let plan = pass_inputs.plan(&machine, CTX as u64, &at)?;
+        let file = open_split(Arch::KimiK3, RECIPE)?;
+        let mut m = GpuModel::<Body>::open_placed(file, &plan, &pass_inputs, 0, host)?;
+        m.set_mode(StepMode::Graph);
+        let (stepped, _) = walked(&mut m, &prompt, false)?;
+        drop(m);
+        let (ok, stdout, stderr) = generate_walk(&prompt, &env, false)?;
+        let read = if ok { printed(&stdout).ok() } else { None };
+        tier::sc("pass cli: --walk pass reads the same plan's stepped load")?;
+        pass &= line(
+            read.as_ref().is_some_and(|(ids, hash)| {
+                *ids == stepped.ids && *hash == fnv_row(&stepped.logits)
+            }),
+            "pass cli",
+            &format!(
+                "generate_kimi_k3 --walk pass: ok={ok}, read {read:?}, stepped {:?} {:016x}{}",
+                stepped.ids,
+                fnv_row(&stepped.logits),
+                if ok {
+                    String::new()
+                } else {
+                    format!(", stderr {stderr:?}")
+                }
+            ),
+        );
+
+        let list = |ids: &[u32]| ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+        let file = std::env::temp_dir().join(format!("{NAME}-score-{}.tsv", std::process::id()));
+        std::fs::write(
+            &file,
+            format!("pass\t{}\t{}\t\n", list(&prompt), list(&stepped.ids)),
+        )?;
+        let (ok, stdout, stderr) = score_walk(&file, &env)?;
+        std::fs::remove_file(&file)?;
+        let tops: Vec<Option<u32>> = stdout
+            .lines()
+            .filter(|l| l.starts_with('{'))
+            .map(top_id)
+            .collect();
+        let want: Vec<Option<u32>> = stepped.ids.iter().copied().map(Some).collect();
+        tier::sc("pass cli: --score --walk pass reads the stepped load's argmax at each position")?;
+        pass &= line(
+            ok && tops == want,
+            "pass cli",
+            &format!(
+                "generate_kimi_k3 --score --walk pass: ok={ok}, top ids {tops:?}, stepped {:?}{}",
+                stepped.ids,
+                if ok {
+                    String::new()
+                } else {
+                    format!(", stderr {stderr:?}")
+                }
+            ),
         );
         Ok(pass)
     }

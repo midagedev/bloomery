@@ -1,10 +1,12 @@
 //! `generate_kimi_k3` — Kimi K3's end-to-end decode CLI: a prompt of ids (or text, raw, no chat
-//! template) walked through the decode step one id at a time, then `-n` greedy ids, printed.
+//! template) walked through the decode step one id at a time or, on a placed load, as placed
+//! passes (`--walk pass`), then `-n` greedy ids, printed.
 //!
 //!     BLOOMERY_MODEL=kimi-k3 generate_kimi_k3 [--tokens a,b,c | --prompt TEXT] [-n N]
 //!                            [--ctx C] [--place a|bp|gate] [--mode eager|graph] [--plan]
-//!                            [--granule BYTES]
+//!                            [--granule BYTES] [--walk steps|pass]
 //!     BLOOMERY_MODEL=kimi-k3 generate_kimi_k3 --score FILE [--score-top K] [--ctx C] [--place a|bp|gate]
+//!                            [--walk steps|pass]
 //!
 //! Defaults: `-n 8`, `--ctx 512`, `--place a`, `--mode graph`. The model is `ref_model_path()`. The
 //! file is read as the plan reads it ([`PlanInputs::read_without_chat_for`]: every part the body
@@ -23,8 +25,14 @@
 //! embedding as a host row, the tier cards' experts under the host tier (a node's, with
 //! `BLOOMERY_TIER_NODES`, served by `tier_server`). The experts a plan leaves off the cards run
 //! on the host tier (`model::ops::ExpertForm::Situ`), the NVMe tier paging what the room cannot
-//! hold. The prompt walk is the body's `Prompt` (its ids stepped one at a time; the body has no
-//! rows pass).
+//! hold. The prompt walk is the body's `Prompt`: its ids stepped one at a time (`--walk steps`, the
+//! default), or as placed passes (`--walk pass`, a placed load only;
+//! [`bloomery_gpu::GpuModel::prompt_placed`]). A pass load's plan is made apart from the step's:
+//! the widest pass shape ([`bloomery_gpu::arch::kimi_k3::SHAPES`], rows by the latent mixers' inner
+//! rows) whose bytes the stage card's room holds as the prompt reserve, the expert tier's batch at
+//! its rows and the NVMe arena at its floor (`PlanInputs::with_arena_at_floor`). The
+//! `prompt_pass` record after the plan's names the shape, its bytes, the room and the narrowest
+//! wider shape refused. `--walk steps` plans as the step does.
 //!
 //! The plan is made under `BLOOMERY_CARD_BUDGET` and `BLOOMERY_CARD_MARGIN` when they are set.
 //! `--granule BYTES` counts each card's uploads at that allocator granule instead of the
@@ -40,7 +48,10 @@
 //! position's token, one JSON line: `key`, `pos`, `teacher` (the completion's id), `lp_teacher`
 //! (its log-probability), `top` (the `--score-top` highest `[id, logprob]`, default 20) and `at`
 //! (`[id, logprob]` of each extra id). Log-probabilities are the full logits row's log-softmax in
-//! f64. An empty prompt or completion, a malformed line or prompt + completion past `--ctx` is
+//! f64. Under `--walk pass` a line's prompt and its completion but the last id run as one call of
+//! placed passes cut from the end ([`bloomery_gpu::GpuModel::score_placed`]), the completion's
+//! positions read from the last pass's rows; a completion past the pass's rows is refused by name.
+//! An empty prompt or completion, a malformed line or prompt + completion past `--ctx` is
 //! refused by name before the model loads; an id past the vocabulary before the first row runs.
 //!
 //! The lines on stdout: `load` (the resident bytes, the context, seconds), `ids` (the generated
@@ -59,7 +70,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 mod cli {
     use app::Prompt;
-    use bloomery_gpu::arch::kimi_k3::Body;
+    use bloomery_gpu::arch::kimi_k3::{Body, CHUNK, PassShape, SHAPES, pass_bytes};
     use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu::{Gpu, GpuModel};
     use bloomery_gpu_gates::generate::{Place, TierRule};
@@ -70,7 +81,8 @@ mod cli {
         CARD_BUDGET, CARD_DONTNEED, CARD_MARGIN, HOST_LOCK, HOST_POPULATE, HostCfg, TIER_NODES,
     };
     use gguf::Split;
-    use model::arch::kimi_k3::place::{PlaceError, PlanInputs, tier_batch};
+    use model::arch::kimi_k3::place::{PlaceError, PlanInputs, TIER_ROWS, tier_batch_at};
+    use model::arch::place_hybrid::reserve_room;
     use model::placement::{Machine, PlacementError, Plan, PlanLevers};
     use tokenizer::Tokenizer;
 
@@ -95,15 +107,20 @@ mod cli {
         Ok(m)
     }
 
-    /// The model of `file` as `plan` places it (card 0 the stage), stepping in `mode`. The body's
-    /// own refusals reach the caller by name.
+    /// The model of `file` as `plan` places it (card 0 the stage), stepping in `mode`, with the
+    /// placed pass at `pass`'s shape when it names one. The body's own refusals reach the caller
+    /// by name.
     fn open_placed(
         file: Split,
         (plan, inputs): (&Plan<'_>, &PlanInputs),
         host: HostCfg,
         mode: StepMode,
+        pass: Option<PassShape>,
     ) -> Result<GpuModel<Body>, GateError> {
-        let mut m = GpuModel::<Body>::open_placed(file, plan, inputs, 0, host)?;
+        let mut m = match pass {
+            Some(shape) => GpuModel::<Body>::open_placed_pass(file, plan, inputs, 0, host, shape)?,
+            None => GpuModel::<Body>::open_placed(file, plan, inputs, 0, host)?,
+        };
         m.set_mode(mode);
         Ok(m)
     }
@@ -139,7 +156,8 @@ mod cli {
     ];
 
     /// Every flag this CLI reads; any other argument is refused by name, never ignored.
-    const KNOWN: [&str; 10] = [
+    const KNOWN: [&str; 11] = [
+        "--walk",
         "--tokens",
         "--prompt",
         "-n",
@@ -297,10 +315,8 @@ mod cli {
         ))
     }
 
-    /// Every row of `rows` from an empty model: the prompt stepped, then each completion id fed
-    /// after its position's line is printed (the last id is never fed: no line follows it).
-    fn score(m: &mut GpuModel<Body>, rows: &[ScoreRow], top: usize) -> Result<(), GateError> {
-        let n_vocab = m.n_vocab()?;
+    /// Refused by name: an id of `rows` past the model's vocabulary of `n_vocab` ids.
+    fn check_ids(rows: &[ScoreRow], n_vocab: usize) -> Result<(), GateError> {
         for r in rows {
             let mut ids = r
                 .prompt
@@ -315,6 +331,13 @@ mod cli {
                 .into());
             }
         }
+        Ok(())
+    }
+
+    /// Every row of `rows` from an empty model: the prompt stepped, then each completion id fed
+    /// after its position's line is printed (the last id is never fed: no line follows it).
+    fn score(m: &mut GpuModel<Body>, rows: &[ScoreRow], top: usize) -> Result<(), GateError> {
+        check_ids(rows, m.n_vocab()?)?;
         for r in rows {
             m.reset()?;
             Body::prompt(m, &r.prompt)?;
@@ -327,6 +350,82 @@ mod cli {
             }
         }
         Ok(())
+    }
+
+    /// Every row of `rows` from an empty model as one call of placed passes: the prompt and the
+    /// completion but its last id, the last pass's rows read at the completion's positions
+    /// ([`GpuModel::score_placed`]); the lines are [`score`]'s.
+    fn score_pass(m: &mut GpuModel<Body>, rows: &[ScoreRow], top: usize) -> Result<(), GateError> {
+        let n_vocab = m.n_vocab()?;
+        check_ids(rows, n_vocab)?;
+        for r in rows {
+            m.reset()?;
+            let n = r.done.len();
+            let ids: Vec<u32> = r.prompt.iter().chain(&r.done[..n - 1]).copied().collect();
+            let logits = m.score_placed(&ids, n)?;
+            for (t, &tok) in r.done.iter().enumerate() {
+                let row = &logits[t * n_vocab..(t + 1) * n_vocab];
+                println!("{}", score_line((&r.key, t), row, tok, &r.extra[t], top)?);
+            }
+        }
+        Ok(())
+    }
+
+    /// `machine` with no card carrying the head, which the host reads.
+    fn headless_of(machine: &Machine) -> Machine {
+        let mut m = machine.clone();
+        m.cards.iter_mut().for_each(|c| c.head = false);
+        m
+    }
+
+    /// The widest of [`SHAPES`] whose pass the plan holds: `inputs` with the shape's bytes at
+    /// `ctx` as the prompt reserve and the NVMe arena at its floor, planned on the machine `build`
+    /// makes at its rows (and on that machine headless when the stage card's dense trunk alone
+    /// refuses it, as [`plan_for`] plans). A shape wider than `ctx` is passed over unless it is
+    /// [`CHUNK`]'s. Each refused for its reserve ([`PlaceError::PromptOver`]) steps down, and the
+    /// narrowest refused comes back beside the shape with the bytes it fell short by. Any other
+    /// refusal, and every shape refused, ends the run by name.
+    fn pick_shape(
+        inputs: &PlanInputs,
+        build: &dyn Fn(u64) -> Result<Machine, GateError>,
+        ctx: usize,
+        levers: &PlanLevers,
+        name: &str,
+    ) -> Result<(PassShape, Option<(PassShape, u64)>), GateError> {
+        let mut wider = None;
+        for &shape in SHAPES.iter().filter(|s| s.rows <= ctx.max(CHUNK)) {
+            let pass = inputs
+                .clone()
+                .with_prompt_reserve(pass_bytes(&inputs.hp, ctx, shape)?)
+                .with_arena_at_floor();
+            let machine = build(shape.rows as u64)?;
+            let tried = match pass.plan(&machine, ctx as u64, levers) {
+                Err(PlaceError::Placement(PlacementError::CardFreeFloor(_))) => pass
+                    .plan(&headless_of(&machine), ctx as u64, levers)
+                    .map(drop),
+                other => other.map(drop),
+            };
+            match tried {
+                Ok(()) => return Ok((shape, wider)),
+                Err(PlaceError::PromptOver { short, .. }) => wider = Some((shape, short)),
+                Err(e) => {
+                    return Err(format!(
+                        "--place {name} --walk pass: the pass of {} rows ({} latent): {e}",
+                        shape.rows, shape.mla_rows
+                    )
+                    .into());
+                }
+            }
+        }
+        Err(match wider {
+            Some((s, short)) => format!(
+                "--place {name} --walk pass: no pass shape fits the stage card; the narrowest, {} \
+                 rows ({} latent), is {short} B short",
+                s.rows, s.mla_rows
+            ),
+            None => format!("--place {name} --walk pass: no pass shape of --ctx {ctx}"),
+        }
+        .into())
     }
 
     /// The plan on `machine` and the machine it is on. A placed plan (`placed` names its place)
@@ -399,6 +498,13 @@ mod cli {
         } else if args.iter().any(|a| a == "--score-top") {
             return Err("generate_kimi_k3: --score-top needs --score".into());
         }
+        let walk_pass = match flag(&args, "--walk")?.as_deref() {
+            None | Some("steps") => false,
+            Some("pass") => true,
+            Some(o) => {
+                return Err(format!("generate_kimi_k3: --walk is steps or pass, not {o}").into());
+            }
+        };
         if scoring.is_none() && tokens.is_some() == text.is_some() && !plan_only {
             return Err("generate_kimi_k3: one prompt: --tokens a,b,c or --prompt TEXT".into());
         }
@@ -414,32 +520,54 @@ mod cli {
         chosen.record().eprint();
         chosen.place.serves("kimi-k3", TIER_RULE.tiers)?;
         let tiered = !chosen.place.tier_cards().is_empty();
-        let batch = tiered
-            .then(|| tier_batch(&inputs.hp))
-            .transpose()
-            .map_err(|e| format!("--place {}: {e}", chosen.place.name()))?;
-        let mut machine = chosen.place.machine(None, batch)?(inputs.model.layers);
-        if let Some(g) = flag(&args, "--granule")? {
-            let g: u64 = g.parse()?;
-            if !g.is_power_of_two() || g < 4 << 10 {
-                return Err(format!(
-                    "generate_kimi_k3: --granule {g}: a power of two of at least 4096 bytes (the \
-                     default is the workstation's 2 MiB)"
-                )
-                .into());
+        let granule = match flag(&args, "--granule")? {
+            Some(g) => {
+                let g: u64 = g.parse()?;
+                if !g.is_power_of_two() || g < 4 << 10 {
+                    return Err(format!(
+                        "generate_kimi_k3: --granule {g}: a power of two of at least 4096 bytes \
+                         (the default is the workstation's 2 MiB)"
+                    )
+                    .into());
+                }
+                Some(std::num::NonZeroU64::new(g).ok_or("--granule is nonzero")?)
             }
-            let granule = std::num::NonZeroU64::new(g).ok_or("--granule is nonzero")?;
-            for card in machine.cards.iter_mut().chain(machine.tiers.iter_mut()) {
-                card.granule_bytes = granule;
+            None => None,
+        };
+        // The machine whose expert tier's batch holds `rows` rows.
+        let build = |rows: u64| -> Result<Machine, GateError> {
+            let batch = tiered
+                .then(|| tier_batch_at(&inputs.hp, rows))
+                .transpose()
+                .map_err(|e| format!("--place {}: {e}", chosen.place.name()))?;
+            let mut machine = chosen.place.machine(None, batch)?(inputs.model.layers);
+            if let Some(granule) = granule {
+                for card in machine.cards.iter_mut().chain(machine.tiers.iter_mut()) {
+                    card.granule_bytes = granule;
+                }
             }
-        }
+            Ok(machine)
+        };
         let plan_levers = PlanLevers::from_levers(&levers)?;
         let placed = chosen.place.name() != "a";
-        let headless = {
-            let mut m = machine.clone();
-            m.cards.iter_mut().for_each(|c| c.head = false);
-            m
+        if walk_pass && !placed {
+            return Err(
+                "generate_kimi_k3: --walk pass runs on a placed load; --place a steps the prompt"
+                    .into(),
+            );
+        }
+        let pass = walk_pass
+            .then(|| pick_shape(&inputs, &build, ctx, &plan_levers, chosen.place.name()))
+            .transpose()?;
+        let machine = build(pass.map_or(TIER_ROWS, |(s, _)| s.rows as u64))?;
+        let inputs = match pass {
+            Some((shape, _)) => {
+                let reserve = pass_bytes(&inputs.hp, ctx, shape)?;
+                inputs.with_prompt_reserve(reserve).with_arena_at_floor()
+            }
+            None => inputs,
         };
+        let headless = headless_of(&machine);
         let (machine, plan) = plan_for(
             &inputs,
             (&machine, &headless),
@@ -448,6 +576,14 @@ mod cli {
             placed.then(|| chosen.place.name()),
         )?;
         record::plan(chosen.place.name(), machine, &plan).eprint();
+        if let Some((shape, wider)) = pass {
+            record::prompt_pass(
+                (shape.rows, shape.mla_rows),
+                (inputs.prompt_reserve, reserve_room(&plan, 0)),
+                wider.map(|(w, short)| ((w.rows, w.mla_rows), short)),
+            )
+            .eprint();
+        }
         need::print(&plan, 0, 0, true)?;
         if plan_only {
             return Ok(());
@@ -486,7 +622,13 @@ mod cli {
         }
         let t = std::time::Instant::now();
         let mut m = if placed {
-            open_placed(split, (&plan, &inputs), levers.host(), mode)?
+            open_placed(
+                split,
+                (&plan, &inputs),
+                levers.host(),
+                mode,
+                pass.map(|(s, _)| s),
+            )?
         } else {
             open(split, ctx, mode)?
         };
@@ -498,7 +640,11 @@ mod cli {
             t.elapsed().as_secs_f64()
         );
         if let Some(rows) = score_rows {
-            return score(&mut m, &rows, score_top);
+            return if walk_pass {
+                score_pass(&mut m, &rows, score_top)
+            } else {
+                score(&mut m, &rows, score_top)
+            };
         }
         let out = greedy(&mut m, &ids, n)?;
         println!("ids {out:?}");

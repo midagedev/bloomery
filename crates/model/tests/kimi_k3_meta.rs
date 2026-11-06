@@ -1074,3 +1074,80 @@ fn kimi_k3_places_on_the_box() {
         bad.join("\n  ")
     );
 }
+
+/// The step's plan and the prompt pass's plan of the real header on the box's `bp` shape (the
+/// A6000 the stage with the head on the host, the 3090 the expert tier) at a host room past half
+/// the host leg, the box's: the step's plan takes the split dial's arena, none there, and the
+/// pass's (the same inputs [`PlanInputs::with_arena_at_floor`]) the arena at its floor, the
+/// floor of the plan before the split ([`placement::ArenaFloor::of`]): the slots of two union
+/// batches of 16 ids and the lane's 5, 37, over one slot of every routed layer. A set lever of 0
+/// keeps the file mapping under the pass's inputs too. The pass's tier batch at one row is the
+/// step's. Mutants: the opt-in's arm left out of the split's `given`
+/// (the pass's arena 0), the floor read after the split.
+#[test]
+fn the_prompt_pass_plan_takes_the_arena_at_its_floor() {
+    use model::arch::kimi_k3::place::{tier_batch, tier_batch_at};
+    const PASS_CTX: u64 = 4096;
+    const ROOM: u64 = 250 << 30;
+    let split = header();
+    let mut inputs = PlanInputs::describe(&split).unwrap_or_else(|e| panic!("describe: {e}"));
+    inputs.room = (ROOM, HostRead::Given);
+    inputs.arena = None;
+    let layers = inputs.model.layers;
+    assert_eq!(
+        tier_batch_at(&inputs.hp, 1).expect("the step's batch"),
+        tier_batch(&inputs.hp).expect("the step's batch")
+    );
+    let batch = tier_batch(&inputs.hp).expect("the step's batch");
+    let mut machine = workstation::plan_tiers(
+        layers,
+        workstation::A6000,
+        &[workstation::RTX_3090],
+        None,
+        batch,
+    )
+    .expect("the bp machine");
+    machine.cards.iter_mut().for_each(|c| c.head = false);
+    let levers = PlanLevers::default();
+    let floor = {
+        let kv = inputs.seq_terms().slots_of(1);
+        let reserve = inputs.prompt_batch_bytes(&machine).expect("tiered");
+        let pre = placement::plan_routed_reserving(
+            &inputs.model,
+            &machine,
+            PASS_CTX,
+            &kv,
+            &levers,
+            RoutedRule::PerType(CardFormat::of_routed),
+            reserve,
+        )
+        .expect("the plan before the split");
+        placement::ArenaFloor::of(&pre).expect("the floor")
+    };
+    let step = inputs
+        .plan(&machine, PASS_CTX, &levers)
+        .unwrap_or_else(|e| panic!("the step's plan: {e}"));
+    let pass_inputs = inputs.clone().with_arena_at_floor();
+    let pass = pass_inputs
+        .plan(&machine, PASS_CTX, &levers)
+        .unwrap_or_else(|e| panic!("the pass's plan: {e}"));
+    let mut mapped = inputs.clone().with_arena_at_floor();
+    mapped.arena = Some(0);
+    let mapped = mapped
+        .plan(&machine, PASS_CTX, &levers)
+        .unwrap_or_else(|e| panic!("the pass's plan at a lever of 0: {e}"));
+    println!(
+        "kimi-k3 bp at {} GiB, ctx {PASS_CTX}: the floor {floor}; the step's arena {} B, paged {} \
+         B; the pass's arena {} B, paged {} B",
+        ROOM >> 30,
+        step.host.nvme_arena_bytes,
+        step.host.nvme_expert_bytes,
+        pass.host.nvme_arena_bytes,
+        pass.host.nvme_expert_bytes,
+    );
+    assert!(step.host.nvme_expert_bytes > 0, "the room pages experts");
+    assert_eq!(step.host.nvme_arena_bytes, 0, "the dial's arena past H/2");
+    assert_eq!(floor.slots, 37);
+    assert_eq!(pass.host.nvme_arena_bytes, floor.bytes);
+    assert_eq!(mapped.host.nvme_arena_bytes, 0);
+}
