@@ -789,7 +789,7 @@ gate-gpu-iq-quant:
 # bloomery-quantize's host side (crates/quantize, no card): the type-rule matcher on llama-quantize's K3.1 rule shapes, the
 # finite scan of every source type, --check's row comparison, the plan's per-tensor decisions and refusals, the argument parser.
 gate-quantize:
-    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-quantize --lib'
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-quantize --lib --test check --test resolve --test rules'
 
 # The host K-quant rules (gguf::kquant: Q4_K, Q5_K, Q6_K, Q8_0) against ggml's own quantizer (iq_quant_ref, just
 # build-iq-quant-ref) with and without an importance matrix, row for row over seeded row families, and the K3 fixture
@@ -4538,7 +4538,7 @@ dump-ref-kimi-k3:
 build-k3-quant-tree:
     BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=900 BLOOMERY_MODEL=kimi-k3 ./tools/box.sh 'bash tools/ref/build-k3-quant-tree.sh'
 
-# The same tree and pin with CUDA (GGML_CUDA=ON, sm_86) in its own build-cuda/ directory and sentinel directory /root/lcpp-kimik3-quant-cuda; `build/`
+# The same tree and pin with CUDA (GGML_CUDA=ON, built for the box cards' architecture) in its own build-cuda/ directory and sentinel directory /root/lcpp-kimik3-quant-cuda; `build/`
 # and the CPU pipeline's binaries are not touched. `k31-quant.sh imatrix --imatrix-gpu` runs this build's llama-imatrix. Niced; bound 7200 s.
 build-k3-quant-tree-cuda:
     BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=2400 BLOOMERY_MODEL=kimi-k3 ./tools/box.sh 'bash tools/ref/build-k3-quant-tree.sh --cuda'

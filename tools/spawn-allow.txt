@@ -74,3 +74,4 @@ crates/model-hf/src/remote.rs 1 a set's header reads, up to eight at once in a t
 crates/metal/src/arch/qwen3moe/session.rs 1 the open's pipeline build, scoped beside the weight load on the open's own thread, never pinned (macOS has no affinity call)
 crates/metal/src/trace.rs 2 a test's scripted load workers and a test's off-thread buffer, scoped by the test harness, never pinned (macOS has no affinity call)
 crates/model-hf/src/bin/prepare.rs 1 the --follow order test's landing thread, from a libtest thread that is never pinned
+crates/quantize/src/run.rs 3 the writer's scoped threads (the host conversion ahead of the writer; the expert-batch reader twice) borrow the mmapped set and the plan, which spawn_helper's 'static body cannot; bloomery-quantize never calls pin_caller, so they inherit no one-cpu mask
