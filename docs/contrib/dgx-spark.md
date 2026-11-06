@@ -71,7 +71,7 @@ carries) and `tools/oxide-host.sh` before `cargo oxide`. `tools/oxide-host.sh` r
 with `cargo oxide` only, for example:
 
 ```sh
-cargo oxide build --arch sm_121a -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve
+cargo oxide build --arch sm_121a -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve
 ```
 
 Recipes select `sm_121a` on a GB10 when `BLOOMERY_ARCH` is unset (`tools/arch.sh:15-35` at `c21e3b81`). That target

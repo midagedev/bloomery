@@ -520,7 +520,7 @@ last two. A flag the seat does not take is refused by name with the seat's usage
 | `mistrallarge4` | N or `auto` | no, slots step in turn | yes | no | yes (Pixtral) | |
 | `flint` | N or `auto` | | no | no | no | |
 | `musespark` | 1 | | yes | no | no | |
-| `solar2`, `nemotron`, `raon1` | 1 | | no | no | no | |
+| `solar2`, `nemotron`, `raon1`, `kimik3` | 1 | | no | no | no | |
 | `decide` | one request at a time | | no | yes | Clef only | `--head`, `--head-config` |
 
 `N` is any count, 1 by default. `1` is the seat's one slot, and `--parallel` above 1 or `auto` is refused by name. `--mmproj`

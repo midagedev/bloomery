@@ -305,6 +305,13 @@ pub trait Tiered: Seat + Sized + 'static {
         Ok(())
     }
 
+    /// `ctx` positions refused by name when the body cannot serve that many, which the plan knows
+    /// no family's bound of. [`run`] asks it of `--ctx` as given, before any plan, and of the
+    /// context the plan chose, so an unset `--ctx` is held to the bound too. The default has none.
+    fn check_ctx(_inputs: &PlanInputs<Self::H>, _ctx: usize) -> Result<(), GateError> {
+        Ok(())
+    }
+
     /// One of the seat's own flags (`SeatFlags::parse`'s `own`): `Ok(true)` took it.
     fn flags(flag: &str, value: &str, out: &mut Self::Flags) -> Result<bool, GateError>;
 
@@ -735,6 +742,9 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
     )?;
     let mut inputs = S::read(&split)?;
     S::configure(&mut inputs, levers.prefill_group())?;
+    if let Some(ctx) = a.ctx {
+        S::check_ctx(&inputs, ctx)?;
+    }
     let think = S::think(&inputs)?;
     let plan_levers = PlanLevers::from_levers(&levers)?;
     // The slot count and what named it (`from` on the `parallel` line); a seat of one sequence
@@ -972,6 +982,7 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
     }
     eprintln!("{}", asked.line());
     let slot_ctx = usize::try_from(asked.slot_ctx)?;
+    S::check_ctx(&inputs, slot_ctx)?;
     let plan = asked.plan;
     record::plan(place.name(), plan.machine, &plan).eprint();
     if let Some(v) = &image {

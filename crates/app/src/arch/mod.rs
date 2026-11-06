@@ -150,6 +150,23 @@ pub trait Batch: ChainBody + Rollback + Sized {
     /// The batches a prompt group runs layer by layer; whether it made any.
     fn group(m: &mut GpuModel<Self>, g: usize) -> Result<bool, GpuError>;
 
+    /// The prompt of `ids` from the model's position: the argmax after the last. The default runs
+    /// the ids as batches ([`Batch::batch`]) in one residency pass. A body with no rows pass
+    /// overrides it with the ids stepped one at a time ([`GpuModel::step`]), each step owning its
+    /// residency boundary, and its [`Batch::batch`] refuses by name.
+    fn prompt(m: &mut GpuModel<Self>, ids: &[u32]) -> Result<u32, GpuError> {
+        let what = Self::WHAT;
+        let token = prompt_pass(m, |m| {
+            m.run_rows(ids.len(), what, |gpu, w, body, head, pos| {
+                Self::batch(gpu, w, body, head, ids, pos)
+            })
+        })?;
+        token.ok_or(GpuError::State {
+            what,
+            missing: "the head's token after the prompt",
+        })
+    }
+
     /// The positions a cut to `n` keeps: every held position, for a body
     /// whose stores are per position.
     fn keepable(m: &GpuModel<Self>, n: u32) -> u32 {
@@ -217,19 +234,9 @@ impl<B: Batch> Open for B {
 }
 
 impl<B: Batch> Prompt for B {
-    /// The prompt in batches as one residency pass ([`prompt_pass`]): the
-    /// batch runs the ids and the head's token after the last is the argmax.
+    /// [`Batch::prompt`].
     fn prompt(m: &mut GpuModel<B>, ids: &[u32]) -> Result<u32, GpuError> {
-        let what = B::WHAT;
-        let token = prompt_pass(m, |m| {
-            m.run_rows(ids.len(), what, |gpu, w, body, head, pos| {
-                B::batch(gpu, w, body, head, ids, pos)
-            })
-        })?;
-        token.ok_or(GpuError::State {
-            what,
-            missing: "the head's token after the prompt",
-        })
+        B::prompt(m, ids)
     }
 }
 

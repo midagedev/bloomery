@@ -9,9 +9,10 @@
 //! A seat gives the clauses its own facts ([`Clauses`]): the model word, the
 //! records its server prints, the load and the listening record, the
 //! architecture word its load record names, the file's layers, the tags of its
-//! think span, the token that closes its turn, the context the server is asked
-//! for and what its body's cut keeps of a shared prefix ([`Cut`]); and what
-//! its chat request asks beside the turn ([`Ask`]).
+//! think span (none for a seat that serves plain text), the token that closes
+//! its turn, the context the server is asked for and what its body's cut keeps
+//! of a shared prefix ([`Cut`]); and what its chat request asks beside the
+//! turn ([`Ask`]).
 //!
 //! A seat that keeps a saved prompt cache (its server prints a `cache` line with a budget) is also
 //! held to what the cache is for: a conversation another one interrupted returns from the cache
@@ -47,8 +48,10 @@ pub struct Clauses {
     pub layers: u64,
     /// The tags of the model's think span, as its vocabulary spells them; for a model with no
     /// span (Muse Spark's reasoning is a message to `self`), the two markers of its protocol
-    /// the server must take out of the message.
-    pub think: [&'static str; 2],
+    /// the server must take out of the message. `None` for a model whose description names no
+    /// tags and whose seat serves its reasoning inline as plain text (Kimi K3): the message
+    /// then has no tag to leak.
+    pub think: Option<[&'static str; 2]>,
     /// The token that closes the model's turn, as its vocabulary spells it.
     pub turn_end: &'static str,
     /// The context the server is asked for.
@@ -471,6 +474,7 @@ fn chat(
     let leaked = c
         .think
         .iter()
+        .flatten()
         .any(|tag| reasoning.contains(tag) || content.contains(tag));
     let usage = &answer["usage"];
     let counted = usage["prompt_tokens"].as_u64().is_some_and(|n| n > 0)

@@ -309,7 +309,7 @@ mod gate {
             listening: &record::LISTENING_MISTRALLARGE4,
             arch: "mistral-large4",
             layers,
-            think: THINK,
+            think: Some(THINK),
             turn_end: TURN_END,
             ctx: CTX,
             // Every layer's store is a plane of positions, so the session's cut keeps every held

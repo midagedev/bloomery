@@ -1,5 +1,5 @@
 //! `bloomery-serve` — one server binary, one seat a model: `--model
-//! ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|nemotron|raon1|musespark|flint|mistrallarge4|host|decide` picks the seat
+//! ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|nemotron|raon1|musespark|flint|kimik3|mistrallarge4|host|decide` picks the seat
 //! (`serve_seats`, the shared seat modules), every other flag the seat's own,
 //! parsed by the seat's own parser, so each seat's flag set is exactly its
 //! per-model binary's. The
@@ -7,7 +7,7 @@
 //! picks the seat, and a bare start or `--help` prints [`drive::MODELS`],
 //! one line a seat with a working `--hf` example.
 //!
-//!     bloomery-serve [--model ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|nemotron|raon1|musespark|flint|mistrallarge4|host|decide]
+//!     bloomery-serve [--model ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|nemotron|raon1|musespark|flint|kimik3|mistrallarge4|host|decide]
 //!                    [-m PATH | --model-file PATH | --hf <repo>[@<rev>][:<quant>]]
 //!                    [--head <weights> [--head-config <file>]]
 //!                    [--config FILE] <the seat's own flags>
@@ -46,8 +46,8 @@
 //! the qwen3 seat, mimo2 the mimo2 seat, solar-open2 the solar2 seat, minimax-m3
 //! the minimaxm3 seat,
 //! nemotron_h and nemotron_h_moe the nemotron seat, raon1 the raon1 seat, muse-spark the musespark seat,
-//! flint the flint seat, mistral-large4 the mistrallarge4 seat and deepseek2 the
-//! host seat;
+//! flint the flint seat, kimi-k3 and kimi-k31 the kimik3 seat, mistral-large4 the mistrallarge4 seat and
+//! deepseek2 the host seat;
 //! a dense qwen35 file a generative seat serves generates with or without
 //! `--model qwen3`. The host seat also takes a file a card seat serves when no
 //! card is visible or llama-server's `-dev none`/`-ngl 0` asks for the host,
@@ -220,7 +220,7 @@ mod drive {
                         machine can serve, then `bloomery-serve --model NAME` to start it \
                         (docs/agents.md)";
 
-    const USAGE: &str = "usage: bloomery-serve [--model NAME[:VARIANT]|ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|nemotron|raon1|musespark|flint|mistrallarge4|host|decide] \
+    const USAGE: &str = "usage: bloomery-serve [--model NAME[:VARIANT]|ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|nemotron|raon1|musespark|flint|kimik3|mistrallarge4|host|decide] \
                          [--config FILE] [--revision REV] [--recommend] [--dry-run] [--json] \
                          [-m PATH | --model-file PATH | --hf <repo>[@<rev>][:<quant>]] [--head <weights> \
                          [--head-config <file>]] [--embd-model FILE | --embd-hf \
@@ -228,7 +228,7 @@ mod drive {
                          --embd-no-mmproj] [--embd-image-min-tokens N] [--embd-image-max-tokens N] \
                          <the chosen seat's own flags, as \
                          bloomery-serve-ds41, bloomery-serve-qwen38, the glm, the qwen3, the \
-                         mimo2, the solar2, the minimaxm3, the nemotron, the raon1, the musespark, the flint, the mistrallarge4, the host or the decide seat takes \
+                         mimo2, the solar2, the minimaxm3, the nemotron, the raon1, the musespark, the flint, the kimik3, the mistrallarge4, the host or the decide seat takes \
                          them> [llama-server's placement flags: -dev, -sm, -mg, -ts, -ngl, \
                          --cpu-moe, -fit, -fitt, -devd] | --list-devices | --version";
 
@@ -249,6 +249,7 @@ models (the --model word is optional with a model file: the file's architecture 
   raon1   Raon-1-mini                  -m <path>
   musespark Muse Spark Open 816B       -m <path>
   flint   Flint                       -m <path>
+  kimik3  Kimi K3 and K3.1             -m <path>
   mistrallarge4 Mistral Large 4 1T-A52B -m <path>
   host    a file on the CPU alone      -m <path>   (no card; -ngl 0 and -dev none ask for it)
   decide  a decision model by its head --hf bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M
@@ -277,6 +278,7 @@ models (the --model word is optional with a model file: the file's architecture 
         Raon1,
         MuseSpark,
         Flint,
+        KimiK3,
         MistralLarge4,
         /// The host seat: the file served on the CPU alone, no card in the plan
         /// (`serve_seats::host_seat`).
@@ -304,11 +306,12 @@ models (the --model word is optional with a model file: the file's architecture 
                 "raon1" => Ok(Word::Seat(Model::Raon1)),
                 "musespark" => Ok(Word::Seat(Model::MuseSpark)),
                 "flint" => Ok(Word::Seat(Model::Flint)),
+                "kimik3" => Ok(Word::Seat(Model::KimiK3)),
                 "mistrallarge4" => Ok(Word::Seat(Model::MistralLarge4)),
                 "host" => Ok(Word::Seat(Model::Host)),
                 serve::decide::WORD => Ok(Word::Decide),
                 other => Err(format!(
-                    "--model is ds41, qwen38, glm, qwen3, mimo2, solar2, minimaxm3, nemotron, raon1, musespark, flint, mistrallarge4, host or {}, not {other}",
+                    "--model is ds41, qwen38, glm, qwen3, mimo2, solar2, minimaxm3, nemotron, raon1, musespark, flint, kimik3, mistrallarge4, host or {}, not {other}",
                     serve::decide::WORD
                 )
                 .into()),
@@ -325,7 +328,7 @@ models (the --model word is optional with a model file: the file's architecture 
 
     impl Model {
         /// Every generative seat.
-        const ALL: [Model; 13] = [
+        const ALL: [Model; 14] = [
             Model::Ds41,
             Model::Qwen38,
             Model::Glm,
@@ -337,6 +340,7 @@ models (the --model word is optional with a model file: the file's architecture 
             Model::Raon1,
             Model::MuseSpark,
             Model::Flint,
+            Model::KimiK3,
             Model::MistralLarge4,
             Model::Host,
         ];
@@ -355,6 +359,7 @@ models (the --model word is optional with a model file: the file's architecture 
                 Model::Raon1 => "raon1",
                 Model::MuseSpark => "musespark",
                 Model::Flint => "flint",
+                Model::KimiK3 => "kimik3",
                 Model::MistralLarge4 => "mistrallarge4",
                 Model::Host => "host",
             }
@@ -391,6 +396,7 @@ models (the --model word is optional with a model file: the file's architecture 
                 Model::Raon1 => matches!(Arch::from_name(arch), Ok(Arch::Raon1)),
                 Model::MuseSpark => matches!(Arch::from_name(arch), Ok(Arch::MuseSpark)),
                 Model::Flint => matches!(Arch::from_name(arch), Ok(Arch::Flint)),
+                Model::KimiK3 => matches!(Arch::from_name(arch), Ok(Arch::KimiK3)),
                 Model::MistralLarge4 => matches!(Arch::from_name(arch), Ok(Arch::MistralLarge4)),
                 Model::Host => arch == "deepseek2",
             })
@@ -490,7 +496,7 @@ models (the --model word is optional with a model file: the file's architecture 
                     format!(
                         "--model needs a value (a catalog model's name, or ds41, qwen38, glm, \
                          qwen3, mimo2, solar2, minimaxm3, nemotron, raon1, musespark, flint, \
-                         mistrallarge4 or {}): {USAGE}",
+                         kimik3, mistrallarge4 or {}): {USAGE}",
                         serve::decide::WORD
                     ),
                 )
@@ -1338,6 +1344,7 @@ models (the --model word is optional with a model file: the file's architecture 
             Model::Raon1 => entry!(raon1),
             Model::MuseSpark => entry!(musespark),
             Model::Flint => entry!(flint),
+            Model::KimiK3 => entry!(kimi_k3),
             Model::MistralLarge4 => entry!(mistrallarge4),
             Model::Host => entry!(host_seat),
         }

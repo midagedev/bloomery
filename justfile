@@ -32,7 +32,7 @@ default:
 # 빠른 루프: 타입 검사만, 커널은 안 만든다. 의존을 고친 뒤 cargo가 박스 쪽 Cargo.lock을 고쳐 쓰면 lock-back.sh가
 # 그것을 이 트리로 가져온다 — box.sh는 한 방향으로만 싣는다.
 check:
-    ./tools/box.sh 'cargo check --workspace --all-targets --features gpu,bloomery-metal/pipeline-scan,bloomery-metal/encode-trace,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/solar2,bloomery-gpu-gates/minimaxm3,bloomery-gpu-gates/flint,bloomery-gpu-gates/gemma-embedding2,bloomery-gpu-gates/gemma4a,bloomery-gpu-gates/mistrallarge4,bloomery-gpu-gates/clef,bloomery-gpu-gates/hf,bloomery-gpu-gates/glm5next-hf,bloomery-gpu-glm5next/hf,bloomery-decision/safetensors'
+    ./tools/box.sh 'cargo check --workspace --all-targets --features gpu,bloomery-metal/pipeline-scan,bloomery-metal/encode-trace,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/solar2,bloomery-gpu-gates/minimaxm3,bloomery-gpu-gates/flint,bloomery-gpu-gates/kimik3,bloomery-gpu-gates/gemma-embedding2,bloomery-gpu-gates/gemma4a,bloomery-gpu-gates/mistrallarge4,bloomery-gpu-gates/clef,bloomery-gpu-gates/hf,bloomery-gpu-gates/glm5next-hf,bloomery-gpu-glm5next/hf,bloomery-decision/safetensors'
     ./tools/lock-back.sh
 
 # check와 같은 이유로 `--features gpu`. 이 피처를 켠 것이 기준 계기다(R26). V4.1 op 게이트의 피처
@@ -40,14 +40,14 @@ check:
 # V4.1 커널의 컴파일러 결함은 여기가 아니라 op 게이트 빌드에서 드러난다.
 # lint. 에러 0이 계약이고 경고 수는 RESULTS/AGENTS에 적힌 기준선과 비교한다.
 lint:
-    ./tools/box.sh 'cargo clippy --workspace --all-targets --features gpu,bloomery-metal/pipeline-scan,bloomery-metal/encode-trace,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/solar2,bloomery-gpu-gates/minimaxm3,bloomery-gpu-gates/flint,bloomery-gpu-gates/gemma-embedding2,bloomery-gpu-gates/gemma4a,bloomery-gpu-gates/mistrallarge4,bloomery-gpu-gates/clef,bloomery-gpu-gates/hf,bloomery-gpu-gates/glm5next-hf,bloomery-gpu-glm5next/hf,bloomery-decision/safetensors'
+    ./tools/box.sh 'cargo clippy --workspace --all-targets --features gpu,bloomery-metal/pipeline-scan,bloomery-metal/encode-trace,bloomery-gpu-gates/deepseek41,bloomery-gpu-gates/vision,bloomery-gpu-gates/glm5next,bloomery-gpu-gates/mimo2,bloomery-gpu-gates/solar2,bloomery-gpu-gates/minimaxm3,bloomery-gpu-gates/flint,bloomery-gpu-gates/kimik3,bloomery-gpu-gates/gemma-embedding2,bloomery-gpu-gates/gemma4a,bloomery-gpu-gates/mistrallarge4,bloomery-gpu-gates/clef,bloomery-gpu-gates/hf,bloomery-gpu-gates/glm5next-hf,bloomery-gpu-glm5next/hf,bloomery-decision/safetensors'
 
 # The build without `vision` of the bins that refuse an image request by name — serve_seats/ds41.rs:444 and glm.rs:825 (--mmproj),
 # decide.rs:545 (the Qwen3.5 seat's encoder), gate_glm5next_e2e.rs:5146 (--only media-seat). One bin takes one feature set (tools/recipes.py's
 # bin check), and every recipe that builds these bins builds them with `vision`, so only this check compiles the
 # `cfg(not(feature = "vision"))` branches. A cargo check writes no executable, so it replaces no bin another lane runs. mac-combos runs this shape.
 check-no-vision:
-    ./tools/box.sh 'cargo check -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,mistrallarge4,gemma-embedding2,hf,checkpoint --bin bloomery-serve --bin bloomery-serve-ds41 --bin gate_glm5next_e2e'
+    ./tools/box.sh 'cargo check -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --bin bloomery-serve --bin bloomery-serve-ds41 --bin gate_glm5next_e2e'
 
 # fmt는 맥에서 돈다. box.sh의 rsync가 단방향이라 박스에서 포맷하면 결과가 돌아오지
 # 않고 다음 명령에 덮여 사라진다(2026-09-19에 그렇게 한 번 날렸다). cargo fmt는 컴파일을
@@ -607,7 +607,7 @@ gate-gpu-mistrallarge4-xstream:
 [group('solo-real')]
 [group('v41-load')]
 gate-gpu-mistrallarge4-serve:
-    BLOOMERY_MODEL=mistral-large4 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_mistrallarge4_serve && D=target/mistrallarge4-serve-gate && rm -rf $D && mkdir -p $D && M=/models/Mistral-Large-4-1T-A52B-UD-IQ1_S/mmproj-BF16.gguf && if test -f $M; then P="--mmproj $M"; else P=""; fi && . tools/ref/ref-paths.sh && if test -f "$DSPARK"; then P="$P --draft $DSPARK"; fi && BLOOMERY_GATE_BOUND=1800 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_mistrallarge4_serve --dir $D $P'
+    BLOOMERY_MODEL=mistral-large4 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_mistrallarge4_serve && D=target/mistrallarge4-serve-gate && rm -rf $D && mkdir -p $D && M=/models/Mistral-Large-4-1T-A52B-UD-IQ1_S/mmproj-BF16.gguf && if test -f $M; then P="--mmproj $M"; else P=""; fi && . tools/ref/ref-paths.sh && if test -f "$DSPARK"; then P="$P --draft $DSPARK"; fi && BLOOMERY_GATE_BOUND=1800 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_mistrallarge4_serve --dir $D $P'
 
 # Mistral Large 4's adaptive expert residency (gate_mistrallarge4_residency's doc, `BLOOMERY_RESIDENCY`): three placed loads in turn.
 # Plan (a) (the A6000 alone) under `off` and under the word the unset rule resolves on its plan (`mid-p0-s1` where the plan has room),
@@ -653,7 +653,7 @@ gate-gpu-musespark-prefill:
 [group('solo')]
 [group('v41-load')]
 gate-gpu-musespark-twocard:
-    BLOOMERY_MODEL=muse-spark BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_musespark_prefill && BLOOMERY_GATE_BOUND=2400 bash tools/gpu-gate.sh gate_musespark_prefill --two-card && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_musespark_serve && D=target/musespark-serve-twocard && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=1800 bash tools/gpu-gate.sh gate_musespark_serve --dir $D'
+    BLOOMERY_MODEL=muse-spark BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_musespark_prefill && BLOOMERY_GATE_BOUND=2400 bash tools/gpu-gate.sh gate_musespark_prefill --two-card && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_musespark_serve && D=target/musespark-serve-twocard && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=1800 bash tools/gpu-gate.sh gate_musespark_serve --dir $D'
 
 # Muse Spark Open's load gate (gate_musespark_load's doc): the body's placed load of the gate plan proven against its plan —
 # every expert in one place and the stack bytes the file's, each segment on the card resident at the plan's buffers and nothing
@@ -676,7 +676,7 @@ gate-gpu-musespark-load:
 [group('solo-real')]
 [group('v41-load')]
 gate-gpu-musespark-serve:
-    BLOOMERY_MODEL=muse-spark BLOOMERY_CARD=a6000 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_musespark_serve && D=target/musespark-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=1800 bash tools/gpu-gate.sh gate_musespark_serve --dir $D'
+    BLOOMERY_MODEL=muse-spark BLOOMERY_CARD=a6000 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_musespark_serve && D=target/musespark-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=1800 bash tools/gpu-gate.sh gate_musespark_serve --dir $D'
 
 
 # Solar-Open2-250B end-to-end gate (gate_solar2_e2e's doc): the 36 KDA layers (beta = 2 sigmoid, softplus decay) and 12 NoPE gated GQA
@@ -729,7 +729,7 @@ gate-gpu-solar2-twocard:
 [group('solo-real')]
 [group('v41-load')]
 gate-gpu-solar2-serve:
-    BLOOMERY_MODEL=solar-open2 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_solar2_serve && D=target/solar2-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=600 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_solar2_serve --dir $D'
+    BLOOMERY_MODEL=solar-open2 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_solar2_serve && D=target/solar2-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=600 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_solar2_serve --dir $D'
 
 # The nemotron seat of bloomery-serve on Nemotron 3 Nano 4B Q4_K_M (gate_nemotron_serve's doc): `--plan` with no flag names its
 # default context (the ladder's rung, held by the ctx line and the rung above refused) and exits before any load, `--parallel 2` is
@@ -738,14 +738,14 @@ gate-gpu-solar2-serve:
 # server's template renders), serves that turn on /v1/chat/completions (usage counts its ids), resends an edited prompt as a
 # fresh run that keeps nothing and an extended one that keeps the held positions. One card.
 gate-gpu-nemotron-serve:
-    BLOOMERY_MODEL=nemotron_h ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_nemotron_serve && D=target/nemotron-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_nemotron_serve --dir $D'
+    BLOOMERY_MODEL=nemotron_h ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_nemotron_serve && D=target/nemotron-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_nemotron_serve --dir $D'
 
 # The same seat gate on the moe body (gate_nemotron_serve's doc, every clause one path over both
 # bodies): the Bolt fixture under the fixture tier (nemotron_h_moe, the fixture's four layers, any
 # card), the arch word and the layer count read from the file, the session's prompt call the body's
 # batched `GpuModel::prefill` (several ids; one id is a step). One card.
 gate-gpu-nemotron-h-moe-serve:
-    BLOOMERY_TIER=fixture BLOOMERY_MODEL=nemotron_h_moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_nemotron_serve && D=target/nemotron-h-moe-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_nemotron_serve --dir $D'
+    BLOOMERY_TIER=fixture BLOOMERY_MODEL=nemotron_h_moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_nemotron_serve && D=target/nemotron-h-moe-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_nemotron_serve --dir $D'
 
 # The host seat of bloomery-serve on DeepSeek-V2-Lite (gate_host_serve's doc), with no card visible: the gate opens no card and
 # takes no card lock, so it runs under tools/host-gate.sh, the lock-free runner. `--model host --plan` names the host stage, the
@@ -755,7 +755,7 @@ gate-gpu-nemotron-h-moe-serve:
 # (the divergence set pinned empty); the Qwen3.6 file (its profile's, read on the box) ends 65 with the host coverage list.
 # Real tier only: the deepseek2 family has no fixture file.
 gate-host-serve:
-    ./tools/box.sh 'bash tools/ref/real-only.sh gate-host-serve && q36=$(env -u BLOOMERY_REF_MODEL -u BLOOMERY_REF_MODEL_PROFILE BLOOMERY_MODEL=qwen35moe bash -c ". tools/ref/ref-paths.sh && printf %s \"\$MODEL\"") && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_host_serve && D=target/host-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=1200 bash tools/host-gate.sh gate_host_serve --dir $D --qwen36 "$q36"'
+    ./tools/box.sh 'bash tools/ref/real-only.sh gate-host-serve && q36=$(env -u BLOOMERY_REF_MODEL -u BLOOMERY_REF_MODEL_PROFILE BLOOMERY_MODEL=qwen35moe bash -c ". tools/ref/ref-paths.sh && printf %s \"\$MODEL\"") && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_host_serve && D=target/host-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=1200 bash tools/host-gate.sh gate_host_serve --dir $D --qwen36 "$q36"'
 
 # GLM-5.3-Flash 라우터(288개 중 8개, sigmoid, ×2.5 — `router::glm5next`)를 모델 없이 합성 입력으로 호스트 규칙과 맞춘다.
 # 규칙마다 절이 하나다: logits·ids·weights·batch는 비트, scores는 sigmoid 밴드, ties·guard·fault·graph는 명시한 값.
@@ -1116,7 +1116,7 @@ release-build VERSION:
 # lands beside the tarball (<tarball>.sitting; a tree stage's is target/release-dist/<version>-<tree>-tree.sitting), where
 # tools/release/publish.sh reads it.
 release-sitting VERSION CELLS *ARGS:
-    ./tools/box.sh '{{precheck}} && case " {{ARGS}} " in *" --binary tree "*) cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve;; esac && bash tools/release/sitting.sh --version {{VERSION}} --cells {{CELLS}} --hold-owner {{env_var_or_default("BLOOMERY_HOLD_OWNER", "rel")}} {{ARGS}}'
+    ./tools/box.sh '{{precheck}} && case " {{ARGS}} " in *" --binary tree "*) cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve;; esac && bash tools/release/sitting.sh --version {{VERSION}} --cells {{CELLS}} --hold-owner {{env_var_or_default("BLOOMERY_HOLD_OWNER", "rel")}} {{ARGS}}'
 
 build-decode:
     ./tools/box.sh 'cargo build --release -p bloomery-model --bin bloomery-decode'
@@ -1915,7 +1915,7 @@ gate-gpu-qwen35moe-mtp:
 # target). The card is the A6000: the DSpark draft's load holds the whole target on it, and Qwen3.6's
 # 29 GB does not fit the 24 GB card (the seat then refuses the draft by name).
 gate-gpu-qwen3-dspark:
-    BLOOMERY_MODEL=qwen35moe BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3-dspark && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_qwen3_dspark && D=target/qwen3-dspark-gate && rm -rf $D && mkdir -p $D && Q36=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen35moe.sh) && test -n "$Q36" && MINI=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/minicpmv47.sh) && test -n "$MINI" && Q30=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen3moe.sh) && test -n "$Q30" && bash tools/gpu-gate.sh gate_qwen3_dspark --qwen "$Q36" --qwen-draft /models/Qwen3.6-35B-A3B/dspark-redhat --sage /models/Sage-A1.5/Sage-A1.5-Q4_K_M.gguf --ornith /models/Ornith-1.5-35B-A3B/Ornith-1.5-35B-Q4_K_M.gguf --minicpm "$MINI" --minicpm-draft /models/MiniCPM-V-4.7-35B-A3B/dspark --qwen3moe "$Q30" --dir $D'
+    BLOOMERY_MODEL=qwen35moe BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3-dspark && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_qwen3_dspark && D=target/qwen3-dspark-gate && rm -rf $D && mkdir -p $D && Q36=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen35moe.sh) && test -n "$Q36" && MINI=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/minicpmv47.sh) && test -n "$MINI" && Q30=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen3moe.sh) && test -n "$Q30" && bash tools/gpu-gate.sh gate_qwen3_dspark --qwen "$Q36" --qwen-draft /models/Qwen3.6-35B-A3B/dspark-redhat --sage /models/Sage-A1.5/Sage-A1.5-Q4_K_M.gguf --ornith /models/Ornith-1.5-35B-A3B/Ornith-1.5-35B-Q4_K_M.gguf --minicpm "$MINI" --minicpm-draft /models/MiniCPM-V-4.7-35B-A3B/dspark --qwen3moe "$Q30" --dir $D'
 
 # Qwen3.6-35B-A3B's DSpark draft, RedHatAI's speculator (an HF directory on the box, `--draft DIR` names another): the dense layers on the card against a host f64 computation of the same layers from the file's bf16
 # weights (a block of 8 rows over 3 and over 2,100 context rows, the window 2,048), the captured pass replaying to the
@@ -1970,7 +1970,7 @@ gate-gpu-llama-dense:
 # through a scripted engine behind the same template, and answers /completion at temperature 0 with the ids generate_qwen3moe --last-step prints for the
 # same ids (run once the server has stopped, the file does not fit a card twice). One card; the gate lock.
 gate-gpu-llama-serve:
-    BLOOMERY_MODEL=nanbeige43 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_llama_serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe && D=target/llama-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_llama_serve --dir $D'
+    BLOOMERY_MODEL=nanbeige43 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_llama_serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe && D=target/llama-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_llama_serve --dir $D'
 
 # Body35's image rows on Clef-Flash at bartowski's Q8_0 (9.5 GB, either card), against the clefvis sets (set B's tower rows
 # as the spans' rows; set C's three prompts, their CPU twins and the C'' runs): the unit rows and the text rows a media call
@@ -2012,7 +2012,7 @@ gate-gpu-qwen35moe-media:
 # the two servers plan on the host's reading, which no admitted neighbour (a lane item beside the chain) lowers to the need.
 [group('v41-load')]
 gate-gpu-qwen38-media:
-    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen38-media && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_qwen38_media && D=target/qwen38-media-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=2400 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen38_media --dir $D'
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen38-media && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_qwen38_media && D=target/qwen38-media-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=2400 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen38_media --dir $D'
 
 # The decide seat of bloomery-serve (gate_clef_serve's doc): Clef-Flash at bartowski's Q5_K_M (6.9 GB, the
 # `qwen35` file of rev d7f376ea) with the release's head; the six refusals (a qwen35 file with no head, --model
@@ -2030,7 +2030,7 @@ gate-gpu-qwen38-media:
 # adds the clauses that start the seat from the hub with no projector flag (it fetches the repo's own projector and
 # serves images) and with --no-mmproj (it serves none): a network read. Either card.
 gate-gpu-clef-serve *ARGS:
-    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_clef_serve && D=target/clef-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_clef_serve --model /models/clef-flash/Cloudflare_clef-flash-Q5_K_M.gguf --head /models/clef-flash/hf/joint_head.safetensors --clef-model /root/models/clef-flash/Cloudflare_clef-flash-Q5_K_M.gguf --image-model /models/clef-flash/Cloudflare_clef-flash-Q8_0.gguf --mmproj /root/models/clef-flash/mmproj-Cloudflare_clef-flash-bf16.gguf --dir $D {{ARGS}}'
+    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_clef_serve && D=target/clef-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_clef_serve --model /models/clef-flash/Cloudflare_clef-flash-Q5_K_M.gguf --head /models/clef-flash/hf/joint_head.safetensors --clef-model /root/models/clef-flash/Cloudflare_clef-flash-Q5_K_M.gguf --image-model /models/clef-flash/Cloudflare_clef-flash-Q8_0.gguf --mmproj /root/models/clef-flash/mmproj-Cloudflare_clef-flash-bf16.gguf --dir $D {{ARGS}}'
 
 # The decide seat of bloomery-serve on lev (gate_lev_serve's doc): ggml-org/lev-GGUF's Q4_K_M (3.0 GB, a `qwen35`
 # file with `qwen35.decision.type = lev`, fetched into /root/models/lev-4b/) with no head flag; five refusals before
@@ -2040,7 +2040,7 @@ gate-gpu-clef-serve *ARGS:
 # prompts' ids; ARGS `--hf ggml-org/lev-GGUF:Q4_K_M` adds the clause that serves the file from the hub, no head flag, and
 # answers the first request as the `-m` server does (a network read). Either card.
 gate-gpu-lev-serve *ARGS:
-    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_lev_serve && D=target/lev-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_lev_serve --model /root/models/lev-4b/lev-Q4_K_M.gguf --head /models/clef-flash/hf/joint_head.safetensors --ref $BLOOMERY_DATA/lev/4b/ref --dir $D {{ARGS}}'
+    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_lev_serve && D=target/lev-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_lev_serve --model /root/models/lev-4b/lev-Q4_K_M.gguf --head /models/clef-flash/hf/joint_head.safetensors --ref $BLOOMERY_DATA/lev/4b/ref --dir $D {{ARGS}}'
 
 # clef_hidden on the box (ARGS as its doc: --model, --ids, --out, ...): a qwen35 file's prompt-only pass, every
 # position's final-norm hidden state to a file and a `clef hidden` record with the call's functional wall.
@@ -2205,7 +2205,7 @@ gate-gpu-minimaxm3-prefill:
 [group('solo-real')]
 [group('v41-load')]
 gate-gpu-minimaxm3-serve:
-    BLOOMERY_MODEL=minimax-m3 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_minimaxm3_serve && D=target/minimaxm3-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=1800 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_minimaxm3_serve --dir $D'
+    BLOOMERY_MODEL=minimax-m3 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_minimaxm3_serve && D=target/minimaxm3-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=1800 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_minimaxm3_serve --dir $D'
 
 # MiniMax-M3.1-Flash on plan (b′) (gate_minimaxm3_prefill's doc, its `--arm bp`): the stage on the A6000 and the expert tier on the 3090,
 # both planned under one card budget the gate sets, against the same plan with every tier segment on the stage card (the A6000 alone, no
@@ -2218,7 +2218,7 @@ gate-gpu-minimaxm3-serve:
 [group('solo')]
 [group('v41-load')]
 gate-gpu-minimaxm3-twocard:
-    BLOOMERY_MODEL=minimax-m3 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-minimaxm3-twocard && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features minimaxm3,checkpoint --release --bin gate_minimaxm3_prefill && BLOOMERY_GATE_BOUND=2400 bash tools/gpu-gate.sh gate_minimaxm3_prefill --arm bp && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_minimaxm3_serve && D=target/minimaxm3-serve-twocard && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=1800 bash tools/gpu-gate.sh gate_minimaxm3_serve --dir $D'
+    BLOOMERY_MODEL=minimax-m3 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-minimaxm3-twocard && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features minimaxm3,checkpoint --release --bin gate_minimaxm3_prefill && BLOOMERY_GATE_BOUND=2400 bash tools/gpu-gate.sh gate_minimaxm3_prefill --arm bp && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_minimaxm3_serve && D=target/minimaxm3-serve-twocard && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=1800 bash tools/gpu-gate.sh gate_minimaxm3_serve --dir $D'
 
 # Nemotron-H MoE (Lightning) with its 32-value experts on the card (Relu2Leg for the step, the 32-value GEMM for the
 # prompt): host, card (the 3090's room, split) and whole (the A6000's room, box.sh's pick) arms near the host path [derived: 8..12 min,
@@ -2252,7 +2252,7 @@ gate-gpu-gemma-embedding-head256:
 # greedy tokens with embedding calls in flight, and named refusals; the runner holds one card.
 [group('pool')]
 gate-gpu-gemma-embedding2-serve *ARGS:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-gemma-embedding2-serve && bash tools/gate.sh -p bloomery-gpu-gates --features hf --test sentence_prompts && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_gemma_embedding2_serve && D=target/embedding2-serve-gate-$(date +%s)-$$ && mkdir -p "$D" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_serve --dir "$D" {{ARGS}} && if [ -z "{{ARGS}}" ]; then BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_serve --dir "$D/audio" --audio; fi'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-gemma-embedding2-serve && bash tools/gate.sh -p bloomery-gpu-gates --features hf --test sentence_prompts && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_gemma_embedding2_serve && D=target/embedding2-serve-gate-$(date +%s)-$$ && mkdir -p "$D" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_serve --dir "$D" {{ARGS}} && if [ -z "{{ARGS}}" ]; then BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_serve --dir "$D/audio" --audio; fi'
 
 # EmbeddingGemma 2's encoder (gpu-gemma-embedding2) end to end on the Q8_0 file the sets are dumped from
 # (refset's gemma_embedding2::MODEL, held to its sha256; the sets' `# model` line names the same path): every
@@ -2264,7 +2264,7 @@ gate-gpu-gemma-embedding-e2e:
     BLOOMERY_MODEL=gemma-embedding ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gemma-embedding2,vision,deepseek41 --release --bin gate_gemma_embedding2_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_e2e --v1'
 
 gate-gpu-gemma-embedding-serve:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-gemma-embedding-serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_gemma_embedding2_serve && D=target/embedding-serve-gate-$(date +%s)-$$ && mkdir -p "$D" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_serve --v1 --dir "$D"'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-gemma-embedding-serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_gemma_embedding2_serve && D=target/embedding-serve-gate-$(date +%s)-$$ && mkdir -p "$D" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_gemma_embedding2_serve --v1 --dir "$D"'
 
 gate-gpu-gemma-embedding2-e2e *ARGS:
     ./tools/box.sh 'bash tools/gate.sh --gpu --oxide --release -p bloomery-gpu-gemma-embedding2 --lib -- --include-ignored'
@@ -2979,7 +2979,7 @@ gate-q38-serve-rules:
 # before the fetch (`tests/serve_preflight.rs`) run on builds without and with `vision`. Host only, no card or gate lock.
 [group('host')]
 gate-serve-draft-rules:
-    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next,clef,mimo2,solar2,minimaxm3,flint,mistrallarge4,gemma-embedding2,hf,checkpoint --bin bloomery-serve --bin bloomery-serve-ds41 --test serve_preflight && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,mistrallarge4,gemma-embedding2,hf,checkpoint --test serve_preflight'
+    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next,clef,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --bin bloomery-serve --bin bloomery-serve-ds41 --test serve_preflight && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --test serve_preflight'
 
 # The V4.1 binaries' `--place` word (`generate::Place`, behind the deepseek41 feature like bind): each alias and its card
 # list (`a6000+3090` is `bp`) planning the machine its plan function makes, a list word planning its own cards, and every
@@ -3492,7 +3492,7 @@ gate-gpu-qwen38-serve:
 # _decode_*): the qwen3moe file's --mmproj refusal and, on the Qwen3.6 file, the seat with its encoder.
 [group('pool')]
 gate-gpu-qwen3-serve:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3-serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_qwen3_serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe && D=target/qwen3-serve-gate && rm -rf $D && mkdir -p $D && Q36=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen35moe.sh) && test -n "$Q36" && Q38D=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen38d.sh) && test -n "$Q38D" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3_serve --model "$BLOOMERY_REF_MODEL" --model "$Q36" --model "$Q38D" --dir $D --images'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3-serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_qwen3_serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe && D=target/qwen3-serve-gate && rm -rf $D && mkdir -p $D && Q36=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen35moe.sh) && test -n "$Q36" && Q38D=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen38d.sh) && test -n "$Q38D" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3_serve --model "$BLOOMERY_REF_MODEL" --model "$Q36" --model "$Q38D" --dir $D --images'
 
 # bloomery-serve-qwen38 on the box, for a person to attach a client to (toktape records from it): the A6000 by
 # default (SERVE_PLACE=gate for the 3090), in local mode the cards in view, the port 8080 unless SERVE_PORT, a
@@ -3611,7 +3611,7 @@ depth-gpu-glm5next *ARMS:
 # BLOOMERY_BOX_ENV=BLOOMERY_DRY=1 nothing is built and no lease is taken: the plan and each binary's state.
 depth-serve *ARMS:
     @[ -n "${BLOOMERY_MODEL:-}" ] || { echo "depth-serve: BLOOMERY_MODEL is unset: name the model profile (tools/ref/models/<name>.sh), e.g. BLOOMERY_MODEL=mimo2 just depth-serve <tree>:<D>" >&2; exit 64; }
-    ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { here=$(basename "$PWD"); ours=; for a in {{ARMS}}; do t=${a#env=*:}; [ "${t%%:*}" != "$here" ] || ours=1; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve; fi; } && bash tools/ref/depth-serve.sh {{ARMS}}'
+    ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && { here=$(basename "$PWD"); ours=; for a in {{ARMS}}; do t=${a#env=*:}; [ "${t%%:*}" != "$here" ] || ours=1; done; if [ -n "$ours" ] && [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve; fi; } && bash tools/ref/depth-serve.sh {{ARMS}}'
 
 # The schemajump against Clef-Flash sitting: the Clef decide seat and a Qwen3.6 seat, both bloomery-serve, one lease on
 # the A6000, the arms alternating request by request (the design's §4; the cards are docs/cards/sj-*.card). Two windows
@@ -3632,7 +3632,7 @@ depth-serve *ARMS:
 # bloomery-serve-ds41 picks, with SJ_DS41_MODEL; this recipe builds that binary when the windows name it) and SJ_SUITES
 # other suite files (`tools/ref/clef/suite-hard.jsonl`, scored against its `.gold.jsonl`); the header of the runner has both.
 sj-vs-clef:
-    ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then case " $(printf %s "${SJ_WINDOWS:-qwen:on qwen:off}" | tr , " ") " in *" qwen:"*) cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve;; esac && case " $(printf %s "${SJ_WINDOWS:-}" | tr , " ") " in *" ds41:"*) cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41,vision,gemma-embedding2,hf --release --bin bloomery-serve-ds41;; esac; fi && bash tools/ref/sj-vs-clef.sh'
+    ./tools/box.sh "${BLOOMERY_AB_ROUNDS:+export BLOOMERY_AB_ROUNDS=$BLOOMERY_AB_ROUNDS && }"'{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then case " $(printf %s "${SJ_WINDOWS:-qwen:on qwen:off}" | tr , " ") " in *" qwen:"*) cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve;; esac && case " $(printf %s "${SJ_WINDOWS:-}" | tr , " ") " in *" ds41:"*) cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41,vision,gemma-embedding2,hf --release --bin bloomery-serve-ds41;; esac; fi && bash tools/ref/sj-vs-clef.sh'
 
 # Qwen3-30B-A3B decode-step kernel timeline (nsys, A6000, under the lease, lead-only): generate_qwen3moe's seed form at each
 # depth (default 6 4096), one prefill pass + BLOOMERY_NSYS_N - 1 replays, the cache height depth-qwen3moe.sh uses. The
@@ -4203,7 +4203,7 @@ gate-gpu-glm5next-residency:
 [group('solo')]
 [group('v41-load')]
 gate-gpu-glm5next-serve:
-    BLOOMERY_MODEL=glm5next BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-glm5next-serve && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,hf,glm5next-hf --release --bin generate_glm5next && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_glm5next_serve && D=target/glm-serve-gate && rm -rf $D && mkdir -p $D && bash tools/gpu-gate.sh gate_glm5next_serve --arm plain --dir $D/plain && bash tools/gpu-gate.sh gate_glm5next_serve --arm drafted --dir $D/drafted'
+    BLOOMERY_MODEL=glm5next BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-glm5next-serve && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,hf,glm5next-hf --release --bin generate_glm5next && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_glm5next_serve && D=target/glm-serve-gate && rm -rf $D && mkdir -p $D && bash tools/gpu-gate.sh gate_glm5next_serve --arm plain --dir $D/plain && bash tools/gpu-gate.sh gate_glm5next_serve --arm drafted --dir $D/drafted'
 
 # The GLM seat's image input beside its draft (gate_glm5next_serve --arm media): one server of --parallel 2 under
 # BLOOMERY_DRAFT=mtp BLOOMERY_RESIDENCY=off with --mmproj, the GLM-5.3 projector, then an image chat on one slot and a
@@ -4218,7 +4218,7 @@ gate-gpu-glm5next-serve:
 [group('solo')]
 [group('v41-load')]
 weekly-gpu-glm5next-media-serve:
-    BLOOMERY_MODEL=glm5next BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh weekly-gpu-glm5next-media-serve && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_glm5next_serve && D=target/glm-media-gate && rm -rf $D && mkdir -p $D && bash tools/gpu-gate.sh gate_glm5next_serve --arm media --dir $D --mmproj /models/mmproj/unsloth--GLM-5.3-Flash-GGUF/mmproj-BF16.gguf'
+    BLOOMERY_MODEL=glm5next BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh weekly-gpu-glm5next-media-serve && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_glm5next_serve && D=target/glm-media-gate && rm -rf $D && mkdir -p $D && bash tools/gpu-gate.sh gate_glm5next_serve --arm media --dir $D --mmproj /models/mmproj/unsloth--GLM-5.3-Flash-GGUF/mmproj-BF16.gguf'
 
 # The shipped `bloomery-serve` started once per image flag on the GLM-5.3 fixture, then by catalog name and through the agent contract
 # (gate_serve_start's header has the clauses): (s1) `-m <fixture>` with the serving defaults and one text chat; (s2) `--place a --mmproj
@@ -4246,10 +4246,10 @@ weekly-gpu-glm5next-media-serve:
 # refusals, the no-fit one with a pick's child, 6 s]; the bound is the runner's 900 s.
 [group('solo')]
 gate-gpu-serve-start-glm:
-    BLOOMERY_MODEL=glm5next BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-serve-start-glm && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_serve_start && D=target/serve-start-gate/glm && rm -rf $D && mkdir -p $D && bash tools/gpu-gate.sh gate_serve_start --family glm --dir $D'
-    ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-serve-start-glm && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,mistrallarge4,gemma-embedding2,hf,checkpoint --test serve_preflight -- --ignored --exact hw_a_device_list_alias_reaches_the_selected_seat'
-    ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-serve-start-glm && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,mistrallarge4,gemma-embedding2,hf,checkpoint --test serve_preflight -- --ignored --exact hw_preflight_normal_inputs_reach_the_fetch'
-    ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-serve-start-glm && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,mistrallarge4,gemma-embedding2,hf,checkpoint --test serve_preflight -- --ignored --exact hw_a_seat_word_alone_starts_by_name_and_refuses_offline'
+    BLOOMERY_MODEL=glm5next BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-serve-start-glm && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_serve_start && D=target/serve-start-gate/glm && rm -rf $D && mkdir -p $D && bash tools/gpu-gate.sh gate_serve_start --family glm --dir $D'
+    ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-serve-start-glm && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --test serve_preflight -- --ignored --exact hw_a_device_list_alias_reaches_the_selected_seat'
+    ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-serve-start-glm && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --test serve_preflight -- --ignored --exact hw_preflight_normal_inputs_reach_the_fetch'
+    ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-serve-start-glm && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --test serve_preflight -- --ignored --exact hw_a_seat_word_alone_starts_by_name_and_refuses_offline'
 
 # The same gate on the V4.1 fixture, clauses (s1) to (s10) (the file's architecture picks the seat; (s1) to (s3) read its plan from each
 # start's own log, and (s8)'s `--plan --json` runs end through `start::plan_exit`). The projector is the `# mmproj` line of the V4.1 vision set
@@ -4263,7 +4263,7 @@ gate-gpu-serve-start-glm:
 # `--plan` runs of about 3 s over the same set, 14 s + 10 s + 6 s]; the bound is the runner's 900 s.
 [group('solo')]
 gate-gpu-serve-start-ds41:
-    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-serve-start-ds41 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_serve_start && D=target/serve-start-gate/ds41 && rm -rf $D && mkdir -p $D && bash tools/gpu-gate.sh gate_serve_start --family ds41 --dir $D'
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-serve-start-ds41 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_serve_start && D=target/serve-start-gate/ds41 && rm -rf $D && mkdir -p $D && bash tools/gpu-gate.sh gate_serve_start --family ds41 --dir $D'
 
 # The MiMo seat of `bloomery-serve` (gate_mimo2_serve): the refusals before any load (--plan's default context, the one
 # slot, the tier card), one server at --ctx 4160 --parallel 1 holding its load and listening records, the three prompts'
@@ -4280,7 +4280,7 @@ gate-gpu-serve-start-ds41:
 [group('solo')]
 [group('v41-load')]
 weekly-gpu-mimo2-serve:
-    BLOOMERY_MODEL=mimo2 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh weekly-gpu-mimo2-serve && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_mimo2_serve && D=target/mimo2-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=1680 bash tools/gpu-gate.sh gate_mimo2_serve --dir $D'
+    BLOOMERY_MODEL=mimo2 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh weekly-gpu-mimo2-serve && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_mimo2_serve && D=target/mimo2-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=1680 bash tools/gpu-gate.sh gate_mimo2_serve --dir $D'
 
 # glm5next decode CLI, functional run (no timing): generate_glm5next feeds --tokens one step per id, then greedy -n
 # tokens. The gate placement on the 3090 unless --place a (and BLOOMERY_CARD=a6000). 3090, gate lock.
@@ -4541,3 +4541,18 @@ gate-gpu-kimik3-place:
     BLOOMERY_MODEL=kimi-k3 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-kimik3-place && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_kimi_k3_place --bin generate_kimi_k3 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu,deepseek41 --release --bin tier_server && BLOOMERY_GATE_BOUND=1200 bash tools/gpu-gate.sh gate_kimi_k3_place'
 
 # --- end kimik3place ---
+# --- kimik3serve ---
+
+# The Kimi K3 seat of bloomery-serve on the K3 fixture (gate_kimi_k3_serve's doc): the hybrid owner's seat over the placed body, one sequence, the
+# prompt stepped one id at a time. `--parallel 2` is refused by name before any plan; the residency lever is `off` unset (why `prefill_steps`) and
+# `off` set, and `mid-p0-s1` is refused by name; one server at ctx 4096 loads (arch kimi-k3, one slot, the file's layers), listens and answers
+# a chat turn, keeps the position the model stands at across requests (a shorter shared prefix re-feeds from an empty model, the delta state
+# taking no position back); a request that carries `tools` is answered with an error and no completion, and a plain turn after it is answered.
+# Fixture-only (tools/ref/fixture-only.sh): the real file's plan needs `--place bp` and the host tier; the reasoning-split and turn-end clauses
+# read the model's text and are the real file's (Tag::FileBound). One card (any idle one). Predicted wall [derived: three fixture loads of a few
+# seconds each, four plan-only starts, and a first start of the new binary's GPU code ~25 s (the solar2 seat's first-start measure)]: under
+# 3 min after a warm build.
+gate-gpu-kimik3-serve:
+    BLOOMERY_MODEL=kimi-k3 ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-kimik3-serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_kimi_k3_serve && D=target/kimik3-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=600 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_kimi_k3_serve --dir $D'
+
+# --- end kimik3serve ---
