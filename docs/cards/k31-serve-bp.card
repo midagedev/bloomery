@@ -2,11 +2,13 @@
 # shards, through bloomery-serve at the serving defaults on the box alone, --place bp (RTX A6000 + RTX 3090): the set is
 # larger than the host (251 GB), so the expert tier spills to nvme0 (the O_DIRECT tier) and the step is NVMe-bound.
 kind: baseline
-question: what decode and prompt rate does the K3.1 v1 set reach at --place bp on the box alone, D=512 and D=4096, through bloomery-serve
-term: decode tok/s at D=512, bloomery-serve from ~/repo/bloomery-k31rel (the tree's binary), --place bp, ctx unset, 2 rounds
+question: what decode and prompt rate does the K3.1 v1 set reach at --place bp on the box alone, D=512 and D=1536 at --ctx-size 2048, through bloomery-serve
+term: decode tok/s at D=512, bloomery-serve from ~/repo/bloomery-k31rel (the tree's binary), --place bp, --ctx-size 2048, 2 rounds
 unit: tok/s
 predict: 0.8..3.0
-condition: tools/ref/depth-serve.sh arms D=512 and D=4096 (bloomery-k31rel:512 bloomery-k31rel:4096), DEPTH_SERVE_PLACE=bp, the kimi-k3
+condition: tools/ref/depth-serve.sh arms D=512 and D=1536 (bloomery-k31rel:512 bloomery-k31rel:1536), DEPTH_SERVE_PLACE=bp, DEPTH_SERVE_CTX=2048 (the
+  K3.1 reader holds the context to the indexer's top_k, 2048: the selected attention is not in this engine, so past it the latent
+  attention would read every position and the file's own context, 391168, is refused by name), the kimi-k3
   profile with BLOOMERY_REF_MODEL the v1 set's first shard on /models (nvme0), the prose corpus ids of kimi-k3, one lease, the cards
   idle at the baseline read; the first row after a cold load is marked [cold] and not read
 reason: [derived] per token the routed experts active read ~25e9 weights at IQ1_S (0.195 B/weight) ~ 4.9 GB; the host holds ~230 GB of the
