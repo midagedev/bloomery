@@ -32,7 +32,7 @@ Map `@MAP@`: @MAP_TEXT@
 
 Total: @TOTAL_GB@ GB (10^9 bytes), in the shards below.
 
-The rules passed to `llama-quantize --tensor-type-file` (the first matching rule wins):
+The rules passed to `@QUANTIZER_BIN@ --tensor-type-file` (the first matching rule wins):
 
 ```
 @RULES@
@@ -52,8 +52,8 @@ and the flags of the run (the paths are the maker's):
 2. The importance matrix was computed with `llama-imatrix` over @IMATRIX_CHUNKS@ chunks of @IMATRIX_CTX@ tokens (@IMATRIX_TOKENS@
    tokens in all), on the CPU. At a context of at most 2048 positions the DSA selection (top-k 2048) keeps every position, so the K3
    graph computes K3.1 exactly there; that is why the K3-shaped file can stand in for it. The calibration text: @IMATRIX_CORPUS@
-   It is small and narrow (English technical documents and C++ source); it is not a general-purpose calibration set.
-3. `llama-quantize` (mainline llama.cpp, with `--allow-requantize` for the MXFP4 source) wrote the K3-shaped quantized set.
+   @CORPUS_NOTE@
+3. @QUANT_STEP@
 4. `gguf-splice.py` put the indexer tensors back (BF16, as `prepare` wrote them from the checkpoint), renamed the architecture word
    and its keys to `@ARCH@`, and added the `@ARCH@.attention.indexer.*` keys. Every other tensor's bytes are the quantizer's, copied
    and checked by sha256.

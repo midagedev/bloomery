@@ -1032,7 +1032,22 @@ render_card() { # <README.md to write> <the set's first shard (in the .partial d
     bcommit=$(git -C "$ROOT" rev-parse --short=9 HEAD 2> /dev/null) || { bcommit=unknown; say "the bloomery tree at $ROOT is not a git checkout (the box's copy has no .git): the card says the commit is unknown; K3Q_TOOLS_COMMIT=<sha> names it"; }
   fi
   toolsline="mainline llama.cpp \`$lcommit\` (llama-quantize sha256 \`$(sha_of "$Q" | cut -c1-12)\`, llama-imatrix sha256 \`$(sha_of "$IMAT" | cut -c1-12)\`); bloomery \`$bcommit\` (tools/ref/gguf-splice.py, tools/ref/k31-quant.sh)."
-  flags="llama-quantize --allow-requantize --imatrix <imatrix.gguf> --tensor-type-file <rules.txt> --output-tensor-type q6_k --token-embedding-type $TOKEMB --keep-split <k3-shaped-input.gguf> <output.gguf> ${QTYPE:-$TYPE} <threads>"
+  local qbin qstep cnote
+  if [ "$QUANTIZER" = bloomery ]; then
+    qbin=bloomery-quantize
+    flags="bloomery-quantize --imatrix <imatrix.gguf> --tensor-type-file <rules.txt> --output-tensor-type q6_k --token-embedding-type $TOKEMB --llama-plan <plan.tsv> <k3-shaped-input.gguf> <output.gguf> ${QTYPE:-$TYPE}"
+    qstep="\`bloomery-quantize\` (bloomery, \`crates/quantize\`) wrote the quantized set in one pass: the IQ routed experts on the card (a CUDA port of ggml's quantizers, byte-identical to them on the same input) and the K-quant trunk on the host (byte-identical to llama-quantize's plan and writer; the plan cross-checked against llama-quantize's own)."
+    toolsline="bloomery \`$bcommit\` (bloomery-quantize sha256 \`$(sha_of "$ROOT/target/release/bloomery-quantize" | cut -c1-12)\`, tools/ref/gguf-splice.py, tools/ref/k31-quant.sh); mainline llama.cpp \`$lcommit\` (llama-imatrix sha256 \`$(sha_of "$IMAT" | cut -c1-12)\`)."
+  else
+    qbin=llama-quantize
+    flags="llama-quantize --allow-requantize --imatrix <imatrix.gguf> --tensor-type-file <rules.txt> --output-tensor-type q6_k --token-embedding-type $TOKEMB --keep-split <k3-shaped-input.gguf> <output.gguf> ${QTYPE:-$TYPE} <threads>"
+    qstep="\`llama-quantize\` (mainline llama.cpp, with \`--allow-requantize\` for the MXFP4 source) wrote the K3-shaped quantized set."
+  fi
+  if printf '%s' "$note" | grep -qE 'calib=calib-c[0-9]'; then
+    cnote="It is small and narrow (English technical documents and C++ source); it is not a general-purpose calibration set."
+  else
+    cnote="A text given with --corpus: its maker describes it on this page."
+  fi
   splice classes --in "$first" --md > "$d/classes.md" || { rm -rf "$d"; exit 65; }
   splice list --in "$first" --gguf-py off | awk '/^shard / { n = split($3, p, "/"); t = $4; b = $6; sub(/^tensors=/, "", t); sub(/^bytes=/, "", b); rows = rows "| " $2 " | " p[n] " | " t " | " b " |\n" }
     END { printf "| shard | file | tensors | bytes |\n|---|---|---|---|\n%s", rows }' > "$d/shards.md"
@@ -1053,7 +1068,7 @@ render_card() { # <README.md to write> <the set's first shard (in the .partial d
     --set "NAME=$name" --set "ARCH=$ARCH" --set "MAP=$MAP" --set "MAP_TEXT=$maptext" --set "TOTAL_GB=$total" \
     --set "INDEXER_COUNT=$nlayers" --set "INDEXER_LAYERS=$layers" --set "IMATRIX_CHUNKS=$CHUNKS" --set "IMATRIX_CTX=$CTX" \
     --set "IMATRIX_TOKENS=$((CHUNKS * CTX))" --set "IMATRIX_CORPUS=$corpus" --set "SOURCE_REV=$srcrev" --set "TOOLS=$toolsline" \
-    --set "QUANT_FLAGS=$flags" --file "CLASS_TABLE=$d/classes.md" --file "RULES=$rules" --file "SHARD_TABLE=$d/shards.md" || { rm -rf "$d"; exit 65; }
+    --set "QUANT_FLAGS=$flags" --set "QUANTIZER_BIN=$qbin" --set "QUANT_STEP=$qstep" --set "CORPUS_NOTE=$cnote" --file "CLASS_TABLE=$d/classes.md" --file "RULES=$rules" --file "SHARD_TABLE=$d/shards.md" || { rm -rf "$d"; exit 65; }
   rm -rf "$d"
 }
 
