@@ -20,8 +20,8 @@ use gguf::Split;
 
 /// The two files: the lmstudio `Q4_K_M` the next model runs from, and
 /// unsloth's `UD-Q4_K_XL`, whose Q8_0 and Q5_K tensors are the format items.
-const Q4KM: &str = "/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-Q4_K_M.gguf";
-const UD: &str = "/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf";
+const Q4KM: &str = "/data/moved/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-Q4_K_M.gguf";
+const UD: &str = "/data/moved/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf";
 
 // PIN(2026-09-27): both files' description as `arch::qwen35moe::spec` reads it, line by line, but
 // the chat line — docs/research/modelspec-design.md §2b and §5 are what these were checked against.
@@ -219,9 +219,9 @@ fn hw_qwen35_dense_chat() {
 /// The in-file next-token layer on the three headers this round describes.
 /// A1 carries one shaped draft, A2 declares the layer and stores no tensor,
 /// A4 has no key. Headers only.
-const A1_UNSLOTH_MTP: &str = "/models/qwen36-hf/unsloth-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf";
+const A1_UNSLOTH_MTP: &str = "/data/moved/models/qwen36-hf/unsloth-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf";
 const A2_MINICPM: &str = "/models/MiniCPM-V-4.7-35B-A3B/MiniCPM-V-4_7-35B-A3B-Q4_K_M.gguf";
-const A4_Q4KM: &str = "/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-Q4_K_M.gguf";
+const A4_Q4KM: &str = "/data/moved/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-Q4_K_M.gguf";
 
 #[test]
 #[ignore = "needs the Qwen3.6 and MiniCPM headers on the box (just gate-qwen35moe-meta)"]
