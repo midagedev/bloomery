@@ -26,7 +26,8 @@
 //! `<|open|>response<|sep|>` … `<|close|>response<|sep|>`, [`ResponseTags`])
 //! has its tags taken out of the content: the one that opens the section where
 //! the span ends, and the one that closes it where it stands. They are markup,
-//! never the answer.
+//! never the answer, and so is what follows the close (the message's own
+//! `<|close|>message<|sep|>`): the answer ends with its section.
 
 use serde_json::Value;
 
@@ -310,7 +311,7 @@ enum Section {
     Opening,
     /// In the answer: up to its close tag is content.
     Answer,
-    /// Past the answer's close: the rest is content as it comes.
+    /// Past the answer's close: the rest is the message's own markup, dropped.
     Ended,
 }
 
@@ -468,10 +469,7 @@ impl ThinkSplit {
                         return out;
                     }
                 }
-                Section::Ended => {
-                    out.push(&rest.text, &rest.specials);
-                    return out;
-                }
+                Section::Ended => return out,
             }
         }
     }
@@ -752,8 +750,9 @@ mod tests {
     /// the span, `<|close|>think<|sep|>` ends it, the response's open tag
     /// and close tag are markup taken out of the content, however the text is
     /// cut into pushes; a prompt that opened the section itself (thinking off)
-    /// leaves no open tag to take out, and a tag cut short by the end of the
-    /// stream was text.
+    /// leaves no open tag to take out, a tag cut short by the end of the
+    /// stream was text, and what follows the answer's close (the message's
+    /// own close) is markup dropped. Mutant: the text past the close kept.
     #[test]
     fn a_response_section_is_markup_not_content() {
         let on = "<|open|>message assistant<|sep|><|open|>think<|sep|>";
@@ -761,7 +760,15 @@ mod tests {
         assert_eq!(ThinkEntry::of_prompt_with(on, K3), ThinkEntry::Open);
         assert_eq!(ThinkEntry::of_prompt_with(off, K3), ThinkEntry::Closed);
         let reply = "why<|close|>think<|sep|><|open|>response<|sep|>서울<|close|>response<|sep|>";
+        // The message's own close follows the answer's: markup, not content.
+        let whole = "why<|close|>think<|sep|><|open|>response<|sep|>서울<|close|>response<|sep|>\
+                     <|close|>message<|sep|>";
         for step in [1, 2, 3, 7, 1000] {
+            assert_eq!(
+                split_k3(on, whole, step),
+                ("why".to_owned(), "서울".to_owned()),
+                "whole message, step {step}"
+            );
             assert_eq!(
                 split_k3(on, reply, step),
                 ("why".to_owned(), "서울".to_owned()),
