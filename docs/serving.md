@@ -909,6 +909,8 @@ Structured output is served for `response_format` of type `json_schema` or `json
 - **One model a server**, and one expert tier card at most (`--place bp`).
 - **GLM-5.3** holds at most 16,384 positions a slot: a `--ctx-size` whose slot share passes it is refused at start,
   and a longer prompt answers `exceed_context_size_error`.
+- **Kimi K3 and K3.1 Pro** load at `--place bp` only, one slot. K3.1 Pro holds `--ctx-size` to 2,048 positions: the
+  reader runs the lightning indexer's selection up to its top-k, and a larger context is refused at the start by name.
 - **Small cards.** On a 12 to 16 GB card the split Qwen3 load's default context fits to the largest the plan holds.
   Agent clients with long system prompts want the whole context for one request there (`--parallel 1`).
 - **Repeatable tokens.** With adaptive residency on, a request's tokens follow the placement its passes ran on, and
