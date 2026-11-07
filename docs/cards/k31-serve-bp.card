@@ -24,3 +24,11 @@ decide-in: write the rows into the release notes' Kimi K3.1 table with these con
 decide-below: under 0.8: read the plan line (host room, nvme bytes) and the witness block (nvme0 state, the 3090's Xid lines) before
   writing a number; a tier that fell to the HDD or a card that fell off the bus is a fault, not a rate
 decide-above: beyond 3.0: read the plan line (more host residency than derived) before crediting
+outcome: 2026-11-07 try7 (DEPTH_SERVE_FOLD=depths, BLOOMERY_HOST_ROOM=252G, DEPTH_SERVE_REQ_BOUND=1800, 2 rounds): decode 3.30 / 3.32 tok/s @ D=512
+  and 2.42 / 2.42 @ D=1536; pp 2.71 / 2.84 @ D=512 and 2.70 / 2.66 @ D=1536; every row [cold] (1.2M..4.0M major faults a request, the
+  [shared] rows too: the set is larger than the host, so each request pages its experts and no request warms the next; the
+  rows repeat within 5 %, so the cold reading is this set's steady state on this box). Decode above the band's 3.0: the host
+  held 249 GB of experts (derived 230) and the page cache served part of the NVMe share. pp far under the derived 5..15: the
+  kimik3 serve seat steps the prompt one id at a time (Family::PREFILL_STEPS); the 256-row pass is generate_kimi_k3 --walk pass
+  only, not the server's, so pp ≈ tg. Earlier tries: try4 the user-plan check (the live host room moves the plan by ~0.6 GB
+  between loads), try5 plan drift for the same reason (→ the pinned room), try6 the 300 s request bound at D=1536.
