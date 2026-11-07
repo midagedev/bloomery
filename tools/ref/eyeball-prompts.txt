@@ -1,0 +1,4 @@
+# prompts eyeball-serve.sh sends, one a line: a Korean question, an English one, a code one
+대한민국의 수도는 어디이고, 그 도시를 처음 방문하는 사람에게 추천할 만한 곳 세 군데를 이유와 함께 짧게 알려줘.
+Explain in three sentences why the sky is blue, then give one sentence on why sunsets are red.
+Write a Python function that returns the n-th Fibonacci number iteratively, with a short docstring, and show its output for n = 10.
