@@ -248,6 +248,13 @@ A paged load serves differently:
 - V4.1 refuses a paged plan under an r8 pair that reads a sidecar (`BLOOMERY_R8=off` reads the source and gives the
   same bits). The release uses no sidecar.
 
+A paged set on two drives: a sidecar `<prefix>.shard-dirs` beside the shards (`<prefix>-00001-of-000NN.gguf`) lists,
+one absolute path a line, the directories that hold a byte-identical copy of every shard by file name (`#` and blank
+lines are passed over). The tier's reader opens one handle per copy and reads each expert's parts from the copy its
+expert id and part pick, so one layer's misses land on every drive at once; a listed directory that lacks a shard, or a
+copy whose length differs, is refused at the load by name. Without the sidecar the reader reads the shards where they
+are. The Kimi K3.1 Pro rows in the release notes were measured with the set on the box's two NVMe drives this way.
+
 NVMe arena eviction options are in the [lever registry](../crates/levers/src/registry.rs).
 
 ### 5.5 Adaptive residency
