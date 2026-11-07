@@ -20,3 +20,9 @@ decide-in: write the rows into the release notes' Kimi K3.1 table as the Spark c
 decide-below: under 3.5 (no gain over the box alone): the node's round trips cost more than the NVMe bytes they save; read the step's
   node wait in the witness and the tier_server log before writing a number; a lost node is a fault, not a rate
 decide-above: beyond 4.8: read the plan line (paged bytes) and the major faults before crediting
+# outcome 2026-11-07 try5 (DEPTH_SERVE_FOLD=depths, BLOOMERY_HOST_ROOM=252G, BLOOMERY_CARD_BUDGET=100G, 2 rounds, rc 0, one plan key):
+#  D=512 tg 4.24 / 4.05, pp 3.20 / 3.64; D=1536 tg 3.18 / 3.34, pp 3.53 / 3.30 (tok/s, r1 / r2); load 245-253 s; every row [cold]
+#  (0.9-3.3 M major faults). In the band (3.5..4.8 at D=512). The GB10 held 106.3 GB of experts under the 100G budget, 175 GB paged
+#  from the NVMe (not the 155 GB the card assumed at the node's whole 126.6 GB room: that room OOMed the node, try3, and drifted
+#  between loads, try4; the node needs a reserve term in the plan, post-tag triage). Earlier tries: try1 arm parse (fixed,
+#  1f0e52d1f), try2 serve card check (fixed, c4d7e1121), try3 node OOM, try4 plan drift.
