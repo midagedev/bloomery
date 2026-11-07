@@ -653,6 +653,15 @@ timing_cards_arm() {
       eval "$rec"
       # The record's cards are `<name>:<bytes>` in the devices' order, each space in a name written `_`.
       d0=${CARDS#\[} d0=${d0%\]} d0=$(sed -E 's/:[0-9]+//g' <<< "${d0//_/ }")
+      if [ -n "${PLACE_NODES:-${BLOOMERY_TIER_NODES:-}}" ]; then
+        # The expert tier on a node (the arm's PLACE_NODES, else the runner's own environment): the A6000 then one
+        # card a node, as the `ours` branch above.
+        PLACE_NODES=${PLACE_NODES:-$BLOOMERY_TIER_NODES}
+        # shellcheck source=tools/ref/arm-place.sh
+        . "${BASH_SOURCE[0]%/*}/arm-place.sh"
+        place_node_cards "$d0" "$CARDS" && return 0
+        return 1
+      fi
       if [[ $d0 =~ ^[^,]*A6000[^,]*,[^,]*3090[^,]*$ ]]; then
         # shellcheck disable=SC2034 # TWOCARD_DEVS is read by the runners that source this file
         TWOCARD_DEVS="${d0//,/ + }"
