@@ -1,0 +1,23 @@
+# k31rel. The first serving sitting of the Kimi K3.1 Pro IQ1_S set (v1: chat-rendered imatrix, bloomery-quantize), 580 GB over 31
+# shards, through bloomery-serve at the serving defaults on the box alone, --place bp (RTX A6000 + RTX 3090): the set is
+# larger than the host (251 GB), so the expert tier spills to nvme0 (the O_DIRECT tier) and the step is NVMe-bound.
+kind: baseline
+question: what decode and prompt rate does the K3.1 v1 set reach at --place bp on the box alone, D=512 and D=4096, through bloomery-serve
+term: decode tok/s at D=512, bloomery-serve from ~/repo/bloomery-k31rel (the tree's binary), --place bp, ctx unset, 2 rounds
+unit: tok/s
+predict: 0.8..3.0
+condition: tools/ref/depth-serve.sh arms D=512 and D=4096 (bloomery-k31rel:512 bloomery-k31rel:4096), DEPTH_SERVE_PLACE=bp, the kimi-k3
+  profile with BLOOMERY_REF_MODEL the v1 set's first shard on /models (nvme0), the prose corpus ids of kimi-k3, one lease, the cards
+  idle at the baseline read; the first row after a cold load is marked [cold] and not read
+reason: [derived] per token the routed experts active read ~25e9 weights at IQ1_S (0.195 B/weight) ~ 4.9 GB; the host holds ~230 GB of the
+  ~515 GB of experts, the cards ~65 GB and nvme0 the rest (~220 GB, 43 %): ~2.1 GB/token from nvme0 at the measured 5.0 GB/s (the
+  11-07 copy test) = 0.42 s, ~2.1 GB from host DRAM at ~40 GB/s = 0.05 s, the cards' part and the attention under them, so
+  ~0.5 s/token = 2 tok/s with the NVMe term dominant; the band's low end is the NVMe at random 4 KiB..1 MiB reads (half the
+  sequential rate), the high end a warmer residency than the even split. The prompt pass (k3fill, rows 256) streams the same
+  experts once per 256 rows: the v1 scoring's pass over 35,226 positions in ~5,400 s read 6.5 tok/s with a load per prompt, so
+  pp512 is expected at 5..15 tok/s
+decide-in: write the rows into the release notes' Kimi K3.1 table with these conditions (the box alone); the Spark tier cell is a
+  second sitting with its own card
+decide-below: under 0.8: read the plan line (host room, nvme bytes) and the witness block (nvme0 state, the 3090's Xid lines) before
+  writing a number; a tier that fell to the HDD or a card that fell off the bus is a fault, not a rate
+decide-above: beyond 3.0: read the plan line (more host residency than derived) before crediting
