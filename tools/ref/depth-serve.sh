@@ -415,8 +415,9 @@ ds_parse_arms() {
     case $rest in
       env=*)
         rest=${rest#env=}
-        case $rest in *:*) ;; *) arm_refuse "$a" "an env= list with no ':<tree>:<D>' after it" ;; esac
-        envs=${rest%%:*} rest=${rest#*:}
+        case $rest in *:*:*) ;; *) arm_refuse "$a" "an env= list with no ':<tree>:<D>' after it" ;; esac
+        # the list ends before the last ':<tree>:<D>', so a value may hold ':' (BLOOMERY_TIER_NODES=<ip>:<port>)
+        envs=${rest%:*:*} rest=${rest#"$envs":}
         [ -n "$envs" ] || arm_refuse "$a" "an empty env= list"
         ;;
     esac
