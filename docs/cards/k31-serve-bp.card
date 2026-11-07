@@ -10,7 +10,8 @@ condition: tools/ref/depth-serve.sh arms D=512 and D=1536 (bloomery-k31rel:512 b
   K3.1 reader holds the context to the indexer's top_k, 2048: the selected attention is not in this engine, so past it the latent
   attention would read every position and the file's own context, 391168, is refused by name), the kimi-k3
   profile with BLOOMERY_REF_MODEL the v1 set's first shard on /models (nvme0), the prose corpus ids of kimi-k3, one lease, the cards
-  idle at the baseline read; the first row after a cold load is marked [cold] and not read
+  idle at the baseline read; the first row after a cold load is marked [cold] and not read; BLOOMERY_HOST_ROOM=252G on
+  every arm (the live MemAvailable reading moved the host expert bytes by ~0.6 GB between loads, so the rows were not one key)
 reason: [derived] per token the routed experts active read ~25e9 weights at IQ1_S (0.195 B/weight) ~ 4.9 GB; the host holds ~230 GB of the
   ~515 GB of experts, the cards ~65 GB and nvme0 the rest (~220 GB, 43 %): ~2.1 GB/token from nvme0 at the measured 5.0 GB/s (the
   11-07 copy test) = 0.42 s, ~2.1 GB from host DRAM at ~40 GB/s = 0.05 s, the cards' part and the attention under them, so
