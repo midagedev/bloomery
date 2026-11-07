@@ -40,7 +40,7 @@
 #             renamed to $K3Q_ARCH, the dsa_config keys added; the shards that do not change are hard links; the source LICENSE copied
 #             in and the model card README.md filled from tools/ref/k31-model-card.md.in
 #             -> $K3Q_OUT_BASE/Kimi-K3.1-Pro-<type>[-<map>]/.
-#   upload    that directory to the Hub: `uvx --from huggingface_hub hf upload-large-folder <repo> <dir> --repo-type model` (resumable by
+#   upload    that directory to the Hub: `uvx --from 'huggingface_hub<2' hf upload-large-folder <repo> <dir> --repo-type model` (resumable by
 #             itself), refused by name without the splice step's `.done` marker, a README.md or a LICENSE; never prints the token.
 #   all       the three in that order (each its own lease and card).   rules, check: the type map; no box, no lease.
 #   calib     build the imatrix's calibration text only (the tokenizer loads the vocabulary of --in, no tensor): no lease, one thread
