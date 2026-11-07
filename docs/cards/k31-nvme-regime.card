@@ -1,0 +1,38 @@
+# k31rel. One request of Kimi K3.1 Pro IQ1_S at --place bp on the box alone (the 0.3.13 release binary, the release row's own
+# conditions: BLOOMERY_HOST_ROOM=252G, --ctx-size 2048, D=512, n_predict 128), with iostat on nvme0n1 beside it. The K3.1 plan
+# prints arena=0 (the sitting's plan lines: paged=154..259 GB, arena=0), so the host leg reads the experts the host does not hold
+# through the file mapping's page faults, one fault per compute thread, with the kernel's read-around (read_ahead_kb 128 on both
+# drives), never the O_DIRECT tier. The question is which regime the drive is in during decode: saturated (A: the queue is deep,
+# the drive near its 6.4 GB/s, so only fewer bytes or a second drive help) or starved (B: a shallow queue of 128 KiB reads, so
+# explicit large reads and a second drive both help). The two reading rounds (~/.cache/bloomery/specs/{k31speed,nvmeread}/report.md)
+# disagree on the stripe's gain because they assume different regimes; this one measurement settles it.
+kind: calibration
+question: during the decode phase of one K3.1 request at --place bp, how deep is nvme0n1's read queue (aqu-sz) and how large its reads (rareq-sz)?
+term: iostat -x 1 nvme0n1's aqu-sz averaged over the decode phase (the seconds after the prompt's timings-reported prompt_ms, until
+  the response), with rareq-sz (KiB) and rMB/s beside it, and the request's /proc/<pid>/io read_bytes delta
+unit: requests in queue
+predict: 2..24
+condition: the box alone, the cards idle at the lease's wait, the release tarball's bloomery-serve (sm86 member, sha 7cb7e5ad), -m the v1
+  set's first shard on /models (nvme0), --place bp --ctx-size 2048, BLOOMERY_HOST_ROOM=252G, one POST /completion of the first 512
+  prose ids with n_predict 128, temperature 0, ignore_eos, cache_prompt off; iostat -x -t 1 on nvme0n1 and nvme1n1 from before the
+  request to the response, read_ahead_kb and nr_requests recorded; the request's wall is not a rate (one cold request, no rounds)
+reason: [derived] the host pool's compute threads fault synchronously inside serve_column (crates/model/src/moe.rs, no read-ahead), so
+  the queue depth is at most the threads faulting at once, well under the drive's 1023 nr_requests, and each fault reads a
+  read-around window of at most read_ahead_kb = 128 KiB: regime B, aqu-sz in the low tens, rareq-sz near 128. Regime A would show
+  aqu-sz well above the thread count or rMB/s near 6,400; both reading rounds' predictions for the stripe (0 vs 4.8..6.1 tok/s) and
+  for explicit large reads (0 vs +2.6 tok/s) hang on this value, and the two-directory round's spec is written from it
+decide-in: regime B: the two-directory round carries explicit large reads (an NvTier reader at arena 0, 2 MiB reads per expert
+  part, queue depth per drive) and the shard split is priced at the two drives' sum only with reads in flight on both; raising
+  read_ahead_kb is the first one-line check
+decide-below: under 2: the drive is nearly idle during decode and the wall is elsewhere (DRAM, the cards, the host pool); re-read the
+  timeline before any NVMe round
+decide-above: above 24 with rMB/s near 6,400: regime A, the drive saturated; only fewer bytes (the rank split) and the second drive
+  help, and explicit large reads predict 0
+# outcome 2026-11-07 (one request, the sm86 tarball's bloomery-serve sha 7cb7e5ad, plan paged=259 GB arena=0, load 64 s, pp 2.69 tg 3.28
+#  tok/s, wall 229 s, 1.40 M major faults, /proc/<pid>/io read_bytes 417 GB over 640 positions = 0.65 GB a position): regime B, in
+#  the band. iostat nvme0n1 over the decode phase (38 s): aqu-sz 5.5 (p10/p50/p90 3.4/5.1/7.6, max 14), rareq-sz 94 KiB, r/s 15.8 k,
+#  rMB/s 1,460 (p90 1,955, max 2,875; 23 % of the drive's 6,400), r_await 0.34 ms, util 33 %; the prompt phase the same shape
+#  (aqu-sz 7.3, 94 KiB, 1,788 MB/s). nvme1n1 idle (3 MB/s). read_ahead_kb 128, nr_requests 1023 on both drives. So a decode step
+#  reads ~0.45 GB from nvme0 in ~2,200 faults of ~94 KiB at a queue of ~5: the drive is starved, the step is fault latency in
+#  series. decide-in applies: the lever is issue depth and read size (read_ahead_kb first, then explicit reads of a miss's three
+#  2 MiB runs after the router); a second drive predicts 0 until reads are in flight on both at once.

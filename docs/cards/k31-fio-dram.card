@@ -1,0 +1,31 @@
+# k31rel. After docs/cards/k31-fio-span.card and k31-fio-align.card, fio serves 1 MiB reads on these drives in ~0.7 ms at queue 4 under every
+# pattern tried (one shard, 31 shards, 4 KiB-aligned offsets), where the engine's reads take ~2.4 ms at the block layer (issue to complete)
+# at a similar depth; the IOMMU is in passthrough (iommu=pt), so DMA translation is not it. Two differences are left: the engine reads with
+# 16 blocking threads (pread, one in flight each) rather than one libaio thread, and its reads run while 32 compute threads stream the
+# host experts' bytes from DRAM (~150 GB/s, the dot kernels), which the NVMe DMA shares the memory controllers with. This probe: (a) fio
+# psync with 16 jobs x 1 read in flight, 2 MiB, 4 KiB-aligned, over the 31 shards (the reader's exact pattern); (b) the libaio 1 MiB
+# queue-4 cell alone, then the same cell while 32 `dd if=/dev/zero of=/dev/null bs=256M` processes stream memory (each a memcpy-class
+# load; nothing touches the drives); dd is killed by captured pid after.
+kind: calibration
+question: does the reader's thread pattern, or DRAM traffic beside the read, raise a 1-2 MiB read's completion latency from ~0.7 ms toward the engine's ~2.4?
+term: fio clat mean (us) per cell: psync 16x1 2 MiB; libaio 1 MiB qd4 alone; the same under 32 dd memory streams
+unit: us
+predict: 700..2500
+condition: tools/ref/k31-fio-dram.sh under one lease, 20 s a cell, nvme0 (and nvme1 for the psync cell)
+reason: [derived] a memory-bandwidth-bound host step leaves the memory controllers near saturation; a DMA write of 1 MiB that queues behind
+  that traffic can take the engine's 2.4 ms; if (b) under dd reads near 2 ms the term is the DRAM contention and the lever is a
+  reader that lands the layer's bytes before the compute (layer-ahead) or fewer host bytes (residency, the rank split); if (a) is
+  ~2 ms the term is the 16 blocking preads (two 1 MiB halves on nvme0's 1280 KiB cut and the thread pickup) and clause 3 of
+  specs/k31arena/spec.md names it; if neither moves, the remaining difference is the engine's own path (read with ftrace next)
+decide-in: whichever cell is near 2 ms names the term, as above
+decide-below: under 700: re-read the cells
+decide-above: above 2,500: more than the engine sees; the dd count was too high, re-run with 16
+# outcome 2026-11-07: psync 16 x 1 of 2 MiB: nvme0 4,758 us at 7.05 GB/s, nvme1 5,416 at 6.2 (32 MB in flight: bandwidth-bound, the
+#  latency is the queue); libaio 1 MiB qd4 alone 680 us 6.0 GB/s, under 32 dd memory streams 649 us 5.3 GB/s; psync16 under dd 4,891 us
+#  6.8 GB/s. Neither the thread pattern nor DRAM traffic slows a read below the drive's rate: the drive always delivers ~6-7 GB/s and the
+#  latency is in-flight bytes / that rate. Re-read of the engine's decode iostat with that rule (docs/cards/k31-arena-warm.card q2-q4:
+#  aqu-sz 4.6 / util 27 % = ~17 requests in flight while busy, ~12-17 MB a burst, r_await 2 ms = 12-17 MB / 6.8 GB/s): the engine's
+#  reads ARE at the drive's rate; a layer that misses reads ~2 experts (~12 MB) in ~2 ms, and ~1/3 of the layers miss (0.34 GB a position
+#  = 3.7 MB a layer averaged). [derived] drive ~70-85 ms a step + DRAM ~30 + cards ~10 = ~110-125 ms against the measured 263-280: the
+#  missing ~150 ms is in the engine's own step, outside the drive and the dot kernels (the per-layer card round trips, the tier's
+#  bookkeeping under its books lock, the join). The instrument is the engine's own profile (BLOOMERY_PROFILE=1), run next.

@@ -74,11 +74,13 @@ mod cli {
     use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu::{Gpu, GpuModel};
     use bloomery_gpu_gates::generate::{Place, TierRule};
+    use bloomery_gpu_gates::host_stats::{Probe, print_stats};
     use bloomery_gpu_gates::need;
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::{GateError, fnv_row, gpu_census, ref_model_path};
     use bloomery_levers::{
-        CARD_BUDGET, CARD_DONTNEED, CARD_MARGIN, HOST_LOCK, HOST_POPULATE, HostCfg, TIER_NODES,
+        CARD_BUDGET, CARD_DONTNEED, CARD_MARGIN, HOST_LOCK, HOST_POPULATE, HostCfg, STEP_STATS,
+        TIER_NODES,
     };
     use gguf::Split;
     use model::arch::kimi_k3::place::{PlaceError, PlanInputs, TIER_ROWS, tier_batch_at};
@@ -136,6 +138,50 @@ mod cli {
         Ok(ids)
     }
 
+    /// [`greedy`] under `BLOOMERY_STEP_STATS=1` on a placed load: the host tier read before the
+    /// first generated step and after each ([`Probe`]), the `stat step` lines and the summary
+    /// after the ids, and the tier's `nvtier` record after the prompt and after the steps (its
+    /// counters are since load, so the decode's fills are the difference).
+    fn greedy_probed(
+        m: &mut GpuModel<Body>,
+        prompt: &[u32],
+        n: usize,
+    ) -> Result<Vec<u32>, GateError> {
+        let mut ids = vec![Body::prompt(m, prompt)?];
+        print_nvtier(m)?;
+        let mut probes = vec![probe(m, None)?];
+        while ids.len() < n {
+            let last = ids[ids.len() - 1];
+            ids.push(m.step(&[last])?);
+            let p = probe(m, probes.last())?;
+            probes.push(p);
+        }
+        print_stats(&probes, 0);
+        print_nvtier(m)?;
+        Ok(ids)
+    }
+
+    /// A [`Probe`] of the placed body's host tier; the whole-card load has none.
+    fn probe(m: &GpuModel<Body>, prev: Option<&Probe>) -> Result<Probe, GateError> {
+        let placed = m
+            .body("generate_kimi_k3")?
+            .placed()
+            .ok_or("BLOOMERY_STEP_STATS reads a placed load's host tier; --place a has none")?;
+        Probe::read(placed.hybrid(), m.gpu(), prev)
+    }
+
+    /// The tier's `nvtier` record (counters since load); nothing on a load without an arena.
+    fn print_nvtier(m: &GpuModel<Body>) -> Result<(), GateError> {
+        let placed = m
+            .body("generate_kimi_k3")?
+            .placed()
+            .ok_or("BLOOMERY_STEP_STATS reads a placed load's host tier; --place a has none")?;
+        if let Some(r) = record::nvtier_of(placed.hybrid().nvme_tier().map(|t| &**t)) {
+            r.print();
+        }
+        Ok(())
+    }
+
     /// The tier cards the body serves: one, the stage card's neighbour. No sitting has shown the
     /// tier not slower, so the flag defaults to `a` and the rule never picks.
     const TIER_RULE: TierRule = TierRule {
@@ -146,13 +192,14 @@ mod cli {
 
     /// The levers this CLI acts on: the card budget and margin the plan is made under, the host
     /// set's load and the expert tier's nodes.
-    const ACTS_ON: [&str; 6] = [
+    const ACTS_ON: [&str; 7] = [
         CARD_BUDGET,
         CARD_MARGIN,
         HOST_POPULATE,
         HOST_LOCK,
         CARD_DONTNEED,
         TIER_NODES,
+        STEP_STATS,
     ];
 
     /// Every flag this CLI reads; any other argument is refused by name, never ignored.
@@ -653,7 +700,11 @@ mod cli {
                 score(&mut m, &rows, score_top)
             };
         }
-        let out = greedy(&mut m, &ids, n)?;
+        let out = if levers.step_stats() {
+            greedy_probed(&mut m, &ids, n)?
+        } else {
+            greedy(&mut m, &ids, n)?
+        };
         println!("ids {out:?}");
         println!("logits fnv1a64={:016x}", fnv_row(&m.logits()?));
         if let Some(tok) = tok {

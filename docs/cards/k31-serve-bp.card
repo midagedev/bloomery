@@ -1,6 +1,7 @@
 # k31rel. The first serving sitting of the Kimi K3.1 Pro IQ1_S set (v1: chat-rendered imatrix, bloomery-quantize), 580 GB over 31
 # shards, through bloomery-serve at the serving defaults on the box alone, --place bp (RTX A6000 + RTX 3090): the set is
-# larger than the host (251 GB), so the expert tier spills to nvme0 (the O_DIRECT tier) and the step is NVMe-bound.
+# larger than the host (251 GB), so the host leg pages the experts it does not hold from nvme0 (the plan prints arena=0: through the
+# file mapping's page faults, not the O_DIRECT tier; docs/cards/k31-nvme-regime.card) and the step is NVMe-bound.
 kind: baseline
 question: what decode and prompt rate does the K3.1 v1 set reach at --place bp on the box alone, D=512 and D=1536 at --ctx-size 2048, through bloomery-serve
 term: decode tok/s at D=512, bloomery-serve from ~/repo/bloomery-k31rel (the tree's binary), --place bp, --ctx-size 2048, 2 rounds

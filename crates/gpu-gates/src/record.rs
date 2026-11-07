@@ -3572,7 +3572,15 @@ pub static BLOOMERY_SERVE_DECIDE: &[&Kind] = kinds![
 ];
 
 /// What `generate_kimi_k3` prints, in the order it prints them.
-pub static GENERATE_KIMI_K3: &[&Kind] = &[&PLACE_UNSET, &PLAN, &PROMPT_PASS, &NEED];
+pub static GENERATE_KIMI_K3: &[&Kind] = &[
+    &PLACE_UNSET,
+    &PLAN,
+    &PROMPT_PASS,
+    &NEED,
+    &NVTIER,
+    &STAT_STEP_HOST,
+    &STAT_SUMMARY_HOST,
+];
 
 /// What `generate_glm5next` prints, in the order it prints them.
 pub static GENERATE_GLM5NEXT: &[&Kind] = &[

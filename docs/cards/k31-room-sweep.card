@@ -1,0 +1,32 @@
+# k31rel. The same one K3.1 bp request (docs/cards/k31-nvme-regime.card's conditions) at three host rooms, 252G, 232G and 212G: the
+# locked host set shrinks by 20 and 40 GB and the page cache grows by as much, so the bytes a token from the drive tell whether
+# K3.1's paged picks are a global hot set (a bigger cache holds it: bytes fall or hold) or one request's locality (bytes rise with the
+# lost lock). The k31ten research round's L3 (~/.cache/bloomery/specs/k31ten/report.md section 6.3): the miss-byte curve that decides
+# whether a dynamic hot set reaches 10 tok/s on the conservative scale. The plan's arena must stay 0 at every room (room.rs:787 step).
+kind: calibration
+question: how do the NVMe bytes a token of one K3.1 bp request move when the host room drops from 252G to 232G and 212G?
+term: /proc/<pid>/io read_bytes over the request divided by its 640 positions, GB a position, at BLOOMERY_HOST_ROOM=212G
+unit: GB a position
+predict: 0.4..1.2
+condition: tools/ref/k31-nvme-probe.sh three times under one lease (lease-hold.sh with this card), K31_PROBE_ENV=BLOOMERY_HOST_ROOM=<room>
+  (the later env word wins over the script's 252G), the same binary, ids and n_predict as the regime probe; each plan line must print
+  arena=0, else that row is not read (the split's step moved); the rows carry host_experts=, paged=, the bytes, the major faults and
+  the decode rate
+reason: [derived] at 252G the request read 0.65 GB a position (decode 0.45) with 4.9 % of picks missing against a 50 % paged share: a
+  hot set the cache holds. Losing 40 GB of lock (16 % of the locked experts) adds those experts' misses only if the cache does not
+  catch them: if the hot set is global and the cache grows to ~50 GB, bytes stay near 0.65 or fall; if the picks are request-local,
+  the lost lock's share of picks (~16 % x 0.5) adds ~0.5 GB. The band's low end is the global case, the high end the local one
+decide-in: between 0.4 and 1.2: read the three rows as a curve; bytes falling or flat under 0.65 = global hot set (L3 priced from the
+  curve, residency's dynamic set is the lever); rising toward 1.2 = request-local (a bigger lock, not a bigger cache, is the lever)
+decide-below: under 0.4 at 212G: the cache beats the lock outright; sweep lower rooms before the mirror sitting
+decide-above: above 1.2: the lost lock's experts were the hot ones (the lock set is rank-ordered by the plan, not by id); read the
+  plan's host set order before any residency work
+# outcome 2026-11-07: not read as the L3 curve — the split's step moved. 252G: arena=0, host 76910 experts (249.6 GB), tg 3.19 / pp 2.73,
+#  440 GB a request (0.69 GB a position), 1.49 M faults, decode nvme0 94 KiB at queue 5.6, 1,493 MB/s (the regime probe repeated
+#  within 3 %). 232G and 212G: the plan flipped to the arena (room.rs:787's step): host segment 6.5 GB, arena 229 / 207 GB,
+#  paged 502 GB, faults 777 / 15, reads 488 / 851 KiB at queue 9 / 7, 2.2 / 2.4 GB/s; bytes 634 / 704 GB a request (1.0 / 1.1 GB a
+#  position), tg 3.04 / 2.86. So a 229 GB arena LRU reads ~1.5x the bytes of the 249.6 GB locked set plus a few GB of page cache:
+#  the tier's arena does not keep K3.1's hot set as well as the plan's static host set does, whatever its size (the regime probe's
+#  32 GB arena read 1.6 GB a position). The cache-vs-lock curve (L3) needs a plan that keeps arena=0 under a smaller room, which
+#  the split's rule does not give; L3 is priced from the static set's hit rate instead, and the dynamic hot set, if any, is a
+#  residency question, not an arena one. The mirror's prediction keeps the 252G row as its base.

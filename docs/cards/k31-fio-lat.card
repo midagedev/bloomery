@@ -1,0 +1,33 @@
+# k31rel. docs/cards/k31-arena-warm.card's outcome: the warm arena's step is 92 layers x one batch of ~6-7 reads of ~560 KiB whose
+# r_await is ~2 ms, where the mapping route's reads of 270-400 KiB completed in ~0.5 ms. docs/cards/k31-fio-qd.card measured only
+# 2 MiB reads at queue 3/6/12 (5.1/6.6/6.7 GB/s on nvme0). This probe measures what the arena route pays: fio random O_DIRECT reads of
+# 512 KiB, 1 MiB and 2 MiB at queue depth 1, 4 and 8 on each drive (the model file itself as the target, read-only, 20 s a cell), reading
+# the completion latency (clat mean and p99) and the rate; and 2 MiB reads with fio's hugepage buffers (iomem=mmaphuge, if the box has
+# free huge pages) against malloc buffers, to see whether one physically contiguous 2 MiB buffer makes one request of the read.
+kind: calibration
+question: on nvme0n1 and nvme1n1, what is the completion latency of a random O_DIRECT read of 512 KiB / 1 MiB / 2 MiB at queue depth 1, 4 and 8?
+term: fio clat mean (us) per cell, with the rate (MB/s) beside it
+unit: us
+predict: 300..1200
+condition: tools/ref/k31-fio-lat.sh under one lease: fio --rw=randread --direct=1 --ioengine=libaio --time_based --runtime=20 per cell,
+  --filename the first shard on each drive (read-only), --bs 512k|1m|2m, --iodepth 1|4|8, a hugepage cell at 2m/4 (iomem=mmaphuge,
+  skipped by name if no huge pages are free); the json's read clat mean and p99 and bw are the row
+reason: [derived] the k31-fio-qd row (2 MiB at queue 3 = 5.1 GB/s = 2,550 reads/s = ~1.2 ms a 2 MiB read) puts a 512 KiB read near
+  0.3-0.4 ms if the drive pipelines its chunks, which is the mapping route's 0.5 ms; the arena route's 2 ms then comes from its
+  burst (16 reader threads at once) or its buffers, both fixable; a 2 ms clat at queue 4 for 512 KiB instead says the drive's
+  latency at that size is the floor and the lever is hiding the batch
+decide-in: the reader route's floor is ~0.5 ms a layer batch: the arena path is the K3.1 path and its round reads whole parts into
+  2 MiB-aligned (THP) arena memory with the mirror in the reader; prediction ~10 tok/s at 0.34 GB a position
+decide-below: under 300: the drives are faster than the arena route shows by 5x; the reader's own path (thread count, buffer, the 16-way
+  burst) is the defect; read crates/gpu/src/host's reader before the round
+decide-above: above 1200 at queue 4: the drive's latency is the floor; the lever is layer-ahead prefetch or several tokens a step,
+  and the arena round is sized for that
+# outcome 2026-11-07 (fio on the first shard of each drive, 20 s a cell, malloc buffers; no free huge pages so the mmaphuge cell was
+#  skipped by name): clat mean / rate — nvme0: 512k qd1 296 us 1.7 GB/s, qd4 463 us 4.4, qd8 719 us 5.8; 1m qd1 322 us 3.0, qd4 676 us
+#  6.0, qd8 1,224 us 6.7; 2m qd1 487 us 4.0, qd4 1,195 us 6.8, qd8 2,362 us 7.0. nvme1: 512k qd1 224 us 2.2, qd4 380 us 5.4, qd8 686 us
+#  6.0; 1m qd1 351 us 2.8, qd4 699 us 5.8; 2m qd1 524 us 3.7, qd4 1,320 us 6.2, qd8 2,677 us 6.2. In the band. A 2 MiB read alone
+#  completes in ~0.5 ms and the drive is at its rate from queue 4 (the latency then grows with the queue: bandwidth-bound). So a
+#  layer's batch of ~3.7 MB (docs/cards/k31-arena-warm.card: 0.34 GB a position / 92) is ~0.6-0.8 ms on one drive at its rate, ~0.4
+#  over two, where the arena route measured ~2 ms a request: decide-in: the reader's own path (16 threads, ~560 KiB block-layer
+#  cuts of a part read into 4 KiB-paged pinned memory, the burst) is the defect, not the drive. [derived] the arena route at the
+#  drive's latency: 92 x (0.7 + 0.33) ms + 10 = ~105 ms = ~9.5 tok/s at 0.34 GB a position on one drive, ~10.5 over two.

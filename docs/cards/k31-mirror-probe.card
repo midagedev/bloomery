@@ -1,0 +1,83 @@
+# k31rel. The k31mirror round's binary (the worker tree ~/repo/bloomery-k31mirror, built sm86 with the release's features) on the
+# regime probe's one request: the mapping path with posix_fadvise(WILLNEED) of each paged pick's three parts in 512 KiB pieces
+# before the layer computes, host-segment picks computed first, and the mirror copy on nvme1 (/mirror, sha-verified, named by the
+# sidecar beside the first shard) read for the (expert + part)-odd runs. docs/cards/k31-nvme-regime.card measured the base: 305 ms
+# a token, 0.45 GB from nvme0 in ~2,200 faults at queue ~5; docs/cards/k31-fio-qd.card the drives: ~1 ms a 2 MiB read, 5.1-6.7 GB/s
+# each from queue 3-6, 12 GB/s together.
+kind: calibration
+question: with the prefetch and the two-drive mirror, what decode rate does the same K3.1 bp request reach, and do both drives read?
+term: decode tok/s @ D=512, n_predict 128, one cold request, with iostat's decode-phase rMB/s and aqu-sz on nvme0n1 and nvme1n1 and the census record's advised=[a,b]
+unit: tok/s
+predict: 6.5..11.0
+condition: tools/ref/k31-nvme-probe.sh with K31_PROBE_SERVE=<the k31mirror tree's target/release/bloomery-serve>, the sidecar
+  /models/Kimi-K3.1-Pro-IQ1_S/Kimi-K3.1-Pro-IQ1_S.shard-dirs naming /mirror/Kimi-K3.1-Pro-IQ1_S, BLOOMERY_HOST_ROOM=252G, --place bp
+  --ctx-size 2048, the first 512 prose ids, n_predict 128, under one lease; the plan line must print arena=0 and host_experts=76910
+  as the regime probe's (else the row is not read); a row with nvme1n1 at ~0 MB/s is the mirror not read (the sidecar or the pick), a fault
+  count near the regime probe's 1.4 M is the prefetch not issued
+reason: [derived] the regime probe's step is ~30 ms DRAM + ~10 ms cards + ~265 ms of serial faults; with every paged part of a layer in
+  flight at once, a layer with one miss costs about one 2 MiB read (~1 ms, the three parts in parallel over two drives) and
+  ~0.78 misses a layer over 92 layers gives ~70-100 ms of NVMe wait: 110-140 ms a token = 7-9 tok/s; the page cache keeps the
+  regime probe's hit rate because the copies are picked by (e + part) parity and the host set reads copy 0. The band's low end
+  (6.5) is the prefetch landing late in a part of the layers (WILLNEED pieces queued behind each other) or the second drive at a
+  third of the reads; its high end (11) the DRAM term under the NVMe shadow as well
+decide-in: the mirror lands (the box gates of the touched owners, then the same-lease ab-decode the dispatch-path rule asks), the
+  K3.1 release rows are re-sat on it, and the notes name the sidecar and the two drives
+decide-below: under 6.5: read advised=[a,b] and the fault count first; a=b>0 with a high fault count means the advice did not keep
+  the pages (read the pieces' alignment and the cache pressure), a or b near 0 means the pick or the sidecar; nvme rMB/s near the
+  regime probe's means the calls were not issued before the compute
+decide-above: above 11: the DRAM term moved under the NVMe wait; re-read the timeline before writing the number into the notes
+# outcome 2026-11-07 (one request, arena=0 host_experts=76910, copies=2 advised=[2.72M, 2.77M] over 640 positions = ~8,600 fadvise
+#  calls a position, load 58 s): tg 3.23 / pp 2.74 tok/s, below the band, the base's 3.19-3.30. Major faults 554k against the base's
+#  1.4M (-60 %), 446 GB read (the base's 450). iostat decode: nvme0n1 aqu-sz 2.9, rareq-sz 130 KiB, 1,155 MB/s; nvme1n1 aqu-sz 0.3,
+#  rareq-sz 411 KiB, 303 MB/s: the advice reached the mirror at its size, nvme0's reads stayed fault-sized, and the queues stayed
+#  shallow. A second run with the sidecar off (prefetch only, one copy): tg 3.06, 654k faults, nvme0 1,391 MB/s at 146 KiB.
+#  Two causes, both from the code and the log: (1) HostLayer::prefetch issues the advice in series in the calling thread before any
+#  compute (moe.rs:3171, :3429, :3597); [derived] 8,600 calls x 15-30 us = 130-260 ms a token, the size of the fault latency it
+#  removed, so the step did not move (fix-1 round: issue through the pool). (2) The need line reads lock=false (BLOOMERY_HOST_LOCK
+#  unset): the 249.6 GB host set is page cache, not mlocked, and a host expert the paged stream evicted re-faults on copy 0 at fault
+#  size, never advised or mirrored: nvme0's fault-sized 1,155 MB/s. docs/cards/k31-host-lock-probe.card prices the lock; the fix-1
+#  addition advises and mirrors host ids when the set is not locked. The prediction stands for the fixed build; this row is the
+#  serial-advice build's.
+# outcome 2026-11-07, run 2 (the fix-1 build: the advice issued through the pool, the unlocked host ids advised on copy 0; one
+#  request, copies=2 advised=[7.91M, 2.77M] = ~16,700 calls a position, load 75 s): tg 3.73 / pp 3.53 tok/s (+15 % / +29 % on run 1),
+#  below the band. 391 GB read (0.61 GB a position), major faults 16.7k (run 1: 554k): every miss is advised before it is touched.
+#  iostat decode: nvme0n1 aqu-sz 2.5, rareq-sz 260 KiB, 1,226 MB/s; nvme1n1 aqu-sz 0.5, 360 KiB, 430 MB/s; r_await 0.4-0.5 ms.
+#  Step 268 ms = [derived] ~4.8 MB a layer at the achieved 1.66 GB/s x 92 layers: the drives still see ~3 requests at a time,
+#  so the layer's ~16 advised pieces are not in flight together, or something in the step's path is serial between them
+#  (direct reclaim in the advising threads with the cache full, a wait on in-flight pages that counts as no major fault, the
+#  per-layer issue). Next: a sampled profile of the step (tools/ref/k31-wchan-sample.sh: wchan per thread + a bpftrace fadvise64
+#  duration histogram) inside the same probe, before any further change.
+# outcome 2026-11-07, runs 3-4 (the fix-1 build again, with tools/ref/k31-wchan-sample.sh over 30 s of the step): tg 3.68 and 3.59
+#  (run 2 repeats within 4 %). Run 4's sample (44 threads, 232 rounds): threads running or idle in futex, folio_wait_bit under 2 % of
+#  the samples; bpftrace fadvise64: 1.81M calls in 30 s (~18,800 a step), 80.6 s of call time in 30 s of wall, 89 % of the calls at
+#  4-32 us (cached ranges), 11 % at 128 us-1 ms (the misses: 128 folios allocated with the cache full, one read submitted). The step
+#  is the issue of the misses: a missing expert's 12 pieces sit next to each other in the list, for_each_chunk hands one thread that
+#  contiguous share, and the layer waits at the barrier for the slowest thread, [derived] ~12 x 300 us = 3.6 ms a layer x 92 = the
+#  step. Two levers, each its own card: fix-2 (the list pulled by an atomic counter, so the misses spread over the threads) and
+#  docs/cards/k31-watermark-probe.card (kswapd keeps ~12 GB free so a miss's allocation does not reclaim in the advising thread).
+# outcome 2026-11-07, run 5 (the fix-1 build with perf record -e cpu-clock -g over 15 s of the step, /root/k31-mirror-probe5/perf*.txt):
+#  tg 3.74. The on-CPU profile holds ~3.3 cores' worth of samples: pool-1 and pool-2 ~30 % each (the iq1s dot 11.7 % each, the host
+#  step's wait_go spin 8 %, worker_main's spin 6.5 %), pool-3 5 %, every other pool thread ~1 %; no page-cache or readahead kernel
+#  symbol above 0.8 %. So the step is not CPU: the fadvise time bpftrace measured (2.7 threads' worth, 128 us-1 ms a missing
+#  piece) is time asleep inside the call, not the readahead's CPU. The next sample takes the off-CPU kernel stacks of the
+#  server's threads at every sleep (sched_switch, kstack) and the process's cgroup memory limits; the suspects are a sleep
+#  in the folio allocation (memcg charge, throttling) or a lock in the ext4 readahead path, each a different lever.
+# outcome 2026-11-07, runs 6-7 (the fix-2b build, the advice pulled by piece: tg 3.70 and 3.51, no change; sampler and a hardware-cycles
+#  perf over 15 s of the step, /root/k31-mirror-probe6/sample.txt and /root/k31-mirror-probe7/perf.data). fadvise64 thread-time 234 s
+#  per 30 s (fix-1: 80 s) with ~870 off-CPU switches inside the call: the issuers spin. perf -e cycles (NMI, sees IRQ-off code the
+#  cpu-clock profile of run 5 missed): native_queued_spin_lock_slowpath 23.9 % of all cycles, and of its samples 60.6 % are
+#  _raw_spin_lock_irq <- __filemap_add_folio <- page_cache_ra_unbounded (the mapping's i_pages lock, one per shard file, under which
+#  every 4 KiB folio of a 512 KiB piece is inserted), 29 % the lruvec lock (evict_folios 16.7 %, folio_batch_move_lru 12.5 %: reclaim
+#  and the LRU adds), 6 % rmap walks of the mapped pages being evicted. Off-CPU: 94.7k folio_wait_bit waits in filemap_fault per 30 s
+#  (the compute waiting on advised reads in flight; minor faults, so pgmajfault never showed them). So the page-cache fill of one
+#  mapping is serialized under its lock at ~512 KiB per ~300 us = ~1.7 GB/s, the measured drive rate, whatever the issue order;
+#  more issuers only spin. [derived] ~0.8 missing experts a layer (0.45-0.6 GB / 6.25 MB / 92), ~12 pieces: fix-3 issues from one
+#  thread per copy (sent). The design's floor with the lock gone: 92 x (issue ~0.5 + I/O ~0.6 + DRAM 0.33) ms + 10 = ~140-150 ms =
+#  ~6.5-7 tok/s; 10 needs the O_DIRECT arena at depth (docs/cards/k31-arena-warm.card) or layer-ahead prediction / speculation.
+# outcome 2026-11-07, run 8 (the fix-3 build, one issuer per copy): tg 3.38 / pp 3.04 tok/s, below the band and no better than fix-1;
+#  fadvise64 thread-time 15.8 s per 30 s (fix-2b: 234 s), 1.83M calls: the lock contention is gone and the step did not move. The
+#  mapping route's step is not its advice issue either. With the drive at 13 % util (nvme0 989 MB/s at 341 KiB, r_await 0.38 ms;
+#  nvme1 495), [derived] the drive's busy time is ~40 ms of the ~290 ms step: the step is a wait on something that is neither the
+#  drive's transfer, the lock, nor the dot kernels. The same gap holds on the arena route (docs/cards/k31-arena-warm.card: util
+#  27 % of 263 ms). Closed for this route: the k31mirror tree is not the tag's two-drive item at 3.4-3.7 tok/s; its sidecar API and
+#  the shard tools are kept for the reader; the gap is instrumented on the arena route (docs/cards/k31-arena-mem.card's sampled arm).

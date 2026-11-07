@@ -1,0 +1,23 @@
+# k31rel. docs/cards/k31-fio-span.card left one difference between fio's 0.7 ms and the engine's 2.4 ms for a ~1 MiB read at the same depth:
+# fio's random offsets are block-aligned (1 MiB), the engine's O_DIRECT reads start at any 4 KiB boundary (RunRead::of aligns a part's
+# run down to DIRECT_ALIGN = 4096, crates/gpu/src/host/nvtier.rs:3488, crates/engram/src/direct.rs:29). This probe is the span cell
+# with fio's blockalign=4k (random offsets 4 KiB-aligned), 1 MiB at queue 4 and 8, both drives, plus 2 MiB at queue 4 with blockalign=4k.
+kind: calibration
+question: do 4 KiB-aligned random 1-2 MiB O_DIRECT reads complete slower than 1 MiB-aligned ones on these drives?
+term: fio clat mean (us) per cell against docs/cards/k31-fio-span.card's rows (nvme0 1m qd4 740 us, qd8 1,229; nvme1 700 / 1,357)
+unit: us
+predict: 700..2500
+condition: tools/ref/k31-fio-align.sh under one lease: the span script's cells with --blockalign=4k, 20 s each
+reason: [derived] if the drive's internal unit is >= 1 MiB (a stripe across its dies), a 4 KiB-aligned 1 MiB read touches two units and
+  costs near two reads (~1.4-2.4 ms at queue 4-8), which is the engine's number; if the unit is 4-16 KiB the alignment costs ~0 and the
+  reader's term is elsewhere (its thread pickup or the publish)
+decide-in: above ~1,300 at queue 4: the arena round aligns each part's read to 1 MiB in the file (read the covering 1 MiB-aligned span; the
+  slot keeps the 4 KiB window) and the quantizer pads expert parts to 1 MiB in later sets; under ~900: alignment is not it and clause 3
+  of specs/k31arena/spec.md names the reader's own path
+decide-below: under 700: faster than aligned; re-read the cell
+decide-above: above 2,500: slower than the engine; the cell is wrong
+# outcome 2026-11-07: 4 KiB-aligned 1 MiB at qd4: nvme0 680 us 6.0 GB/s, nvme1 679 / 6.0; qd8 1,225 / 6.7 and 1,358 / 6.1; 2 MiB qd4 1,200 /
+#  6.8 and 1,318 / 6.2 — equal to the aligned rows. decide-in's second case: alignment is not it. What fio has not reproduced of the
+#  engine's reads: the DMA target (fio reuses a few MB of buffers; the engine lands reads anywhere in a 229 GB arena, so with the IOMMU
+#  translating, every request walks cold IOMMU page tables), the 16 blocking threads on 16 hardware queues, and the concurrent
+#  host compute. The IOMMU mode is read first (dmesg, /sys/class/iommu, the kernel command line); a DMA-span probe follows if it translates.

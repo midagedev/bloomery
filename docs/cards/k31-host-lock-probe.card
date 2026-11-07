@@ -1,0 +1,35 @@
+# k31rel. docs/cards/k31-mirror-probe.card's outcome (the mirror binary at 3.23 tok/s against a 3.2-3.3 base) left nvme0 reading
+# 1,155 MB/s in ~130 KiB requests (fault-sized) while nvme1 read 303 MB/s in ~411 KiB ones (advice-sized), and the serve log's
+# need line says the host set is populated but not locked (`cache=263 GB locked=0 lock=false`: BLOOMERY_HOST_LOCK is unset by
+# default). So the 249.6 GB host set competes in the page cache with the paged stream, and a host expert the LRU evicted re-faults
+# at fault size on copy 0, never advised and never mirrored: [derived] nvme0's bytes beyond twice nvme1's (~0.25 of the 0.45 GB a
+# token) are those re-faults. This probe is the same request with BLOOMERY_HOST_LOCK=1: the host set mlocked, so every miss is a
+# paged pick (advised, mirrored); no code changes. The box has 269.5 GB; locked 249.6 + OS 6.7 leaves ~13 GB of page cache for the
+# paged hot set, against the ~20 GB the LRU spread over everything before.
+kind: calibration
+question: with the host set mlocked, does the same K3.1 bp request on the mirror binary lose nvme0's fault-sized reads, and what does the decode rate do?
+term: decode tok/s @ D=512, n_predict 128, one cold request, with iostat's decode-phase rMB/s and rareq-sz on nvme0n1 and nvme1n1 and pgmajfault beside it
+unit: tok/s
+predict: 3.0..5.5
+condition: tools/ref/k31-nvme-probe.sh with K31_PROBE_SERVE the k31mirror tree's bloomery-serve (17252552-dirty, the serial-advice
+  build) and K31_PROBE_ENV=BLOOMERY_HOST_LOCK=1, BLOOMERY_HOST_ROOM=252G, --place bp --ctx-size 2048, the first 512 prose ids,
+  n_predict 128, under one lease; the serve log's need line must print lock=true (else the lever did not reach the load and the row
+  is not read) and the plan line arena=0, host_experts=76910
+reason: [derived] the mirror run's nvme0 reads split into ~0.1 GB a token of advised copy-0 reads (nvme1's share mirrored) and
+  ~0.25 GB of fault-sized host re-faults; locking removes the re-faults (-0.25 GB, -~120 ms of serial faults at the regime probe's
+  rate) but shrinks the paged hot set's cache from ~20 to ~13 GB, so the paged misses rise by an amount the LRU's shape decides:
+  the term derivation cannot fix. The serial advice issue (~8,600 calls a token, the fix-1 round) still costs ~130-260 ms, so the
+  rate stays near 3-5 until that lands; the row is read for the bytes and the request sizes first, the rate second
+decide-in: the host set is locked for K3.1 serving (the serving docs name BLOOMERY_HOST_LOCK=1 for it, or the plan locks when the
+  model pages), and the fix-1 build is probed on top of it
+decide-below: under 3.0: the paged misses grew more than the re-faults shrank (bytes a token above 0.45 GB with nvme0 at advice size):
+  the hot set needs the cache more than the host set needs the lock; the lever stays off and the fix-1 round advises and mirrors
+  host ids too when the set is not locked
+decide-above: above 5.5: the serial advice cost was overestimated; re-read the fix-1 prediction before the build
+# outcome 2026-11-07 (one request, need line locked=250285572096 cache=13087506432, lock=true, load 68 s): tg 1.33 / pp 1.46 tok/s,
+#  below the band; decide-below's case. 1,369 GB read over 640 positions = 2.14 GB a position (the unlocked mirror run's 0.70),
+#  21k major faults: every miss advised, both drives at advice size (nvme0 1,441 MB/s at 406 KiB, nvme1 1,461 at 392 KiB, each
+#  aqu-sz 1.2, util 26-30 %, kswapd0 at 20 %). With 13 GB of cache the paged hot set does not fit: [derived] ~340 of the ~740
+#  paged picks a token miss (46 %), where the LRU over the whole 580 GB with ~258 GB of cache served all but ~5 %. The lock stays off
+#  for K3.1; the fix-1 round advises the unlocked host ids on copy 0 (the populate's copy). The queues at 1.2 with every miss
+#  advised confirm cause (1): this build issues the advice in series, so the drives see one piece at a time.
