@@ -31,3 +31,7 @@ decide-above: above 260 ms: the path did not engage every layer (step_hits_under
 #  k31-arena-mem anon), pp 3.12 (2.6 before: the prompt's steps take the resident path too). iostat decode quarters: nvme0
 #  2.77 -> 2.69 -> 1.42 -> 1.41 GB/s at aqu 6.1 -> 2.9, rareq 1 MiB, r_await ~2.0 ms: the arena warm by the third quarter,
 #  nvme1 idle. [derived] +10 % at N=512 against the warm base; the steady-state half runs near the 4.5 the card predicted.
+# outcome 3 2026-11-07, the combined serve row (/root/k31-union-mirror-serve: bloomery-serve from b89cf5c9d = the union
+#  slabs + the reader's two-drive pick, the same probe at 232G, D=512 N=512, load 64 s): tg 4.97 tok/s, pp 3.91 (the base
+#  3.80 / 2.6; the union alone 4.18 / 3.12). iostat quarters, MB/s: nvme0n1 2098 1800 1750 851, nvme1n1 2084 1803 1749 851:
+#  the fills split evenly over the drives. [derived] +31 % decode at N=512 over the warm base; the step ~200 ms.
