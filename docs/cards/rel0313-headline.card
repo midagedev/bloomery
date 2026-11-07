@@ -13,3 +13,8 @@ decide-above: beyond 45.0: read the witness block and the plan line (the room, t
 #  35.21 / 36.29 @4096, pp 69 / 101 @512, 291 / 307 @4096 (majflt 74-121 k): below 36.0 = the plan drifted on the live host room
 #  (decide-below). The re-sit with the uploader killed: tg 42.22 / 40.91 @512, 38.30 / 38.75 @4096; pp 105.62 / 86.64 @512,
 #  354.37 / 319.47 @4096; load 60-65 s; majflt 133-281 k; green. The release's rows.
+# outcome 2026-11-07 on main 29fd27d60 (the shipped sm86 tarball's bloomery-serve, sha 2a14d50d…): two sittings. Sitting 5: tg 41.58 @512,
+#  35.26 @4096; pp 105.22 @512, 344.14 @4096; load 82 / 61 s; majflt 26-65 k; red on second_request_equals_first (the replay split at
+#  token 2, the top-2 gaps 1.538 against the near-tie band 1.485, residency mid-p31-s1 moving experts). Sitting 6, the same tarball:
+#  two rounds: tg 40.84 / 42.60 @512, 38.69 / 36.42 @4096; pp 124.12 / 126.50 @512, 359.46 / 350.23 @4096; load 55-61 s; majflt 34-95 k;
+#  the replay identical (PASS); green. In band; the release's rows are sitting 6's (the notes' table), sitting 5 named beside them.
