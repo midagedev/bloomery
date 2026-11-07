@@ -1002,11 +1002,28 @@ mod clauses {
             ("imatrix.chunk_size".to_string(), Value::U32(512)),
         ];
         write_gguf(&im, &im_kv, &tensors)?;
+        // the stand-in's weights whose rows are not whole Q4_K blocks (the fixture's narrowed 128-column tensors):
+        // llama-quantize falls back to another type there and this port refuses, so both tools get one explicit Q8_0 rule
+        let narrow: Vec<String> = standin
+            .iter_tensors()
+            .filter(|t| t.name.ends_with(".weight") && t.dims.len() >= 2 && t.dims[0] % 256 != 0)
+            .map(|t| t.name.replace('.', "\\."))
+            .collect();
+        let narrow_rule = (!narrow.is_empty()).then(|| format!("^({})$=q8_0", narrow.join("|")));
+        // llama-quantize takes the narrow rule through --tensor-type, ours through its rules file
+        let base_rules = format!(
+            "blk\\.{layer}\\.ffn_(gate|up)_exps\\.weight=IQ2_XXS\nffn_(down|gate|up)_exps\\.weight=IQ1_S\n"
+        );
         let rules = work.join("rules.txt");
+        std::fs::write(&rules, &base_rules)?;
+        let rules_ours = work.join("rules-ours.txt");
         std::fs::write(
-            &rules,
+            &rules_ours,
             format!(
-                "blk\\.{layer}\\.ffn_(gate|up)_exps\\.weight=IQ2_XXS\nffn_(down|gate|up)_exps\\.weight=IQ1_S\n"
+                "{base_rules}{}",
+                narrow_rule
+                    .as_ref()
+                    .map_or(String::new(), |r| format!("{r}\n"))
             ),
         )?;
         let (out_a, out_b) = (work.join("alone.gguf"), work.join("ours.gguf"));
@@ -1018,6 +1035,9 @@ mod clauses {
                 "--tensor-type-file".as_ref(),
                 rules.as_os_str(),
             ];
+            if let Some(r) = &narrow_rule {
+                a.extend([OsStr::new("--tensor-type"), OsStr::new(r)]);
+            }
             a.extend(flags);
             a.extend([
                 input.as_os_str(),
@@ -1033,7 +1053,7 @@ mod clauses {
             "--imatrix".as_ref(),
             im.as_os_str(),
             "--tensor-type-file".as_ref(),
-            rules.as_os_str(),
+            rules_ours.as_os_str(),
             "--check".as_ref(),
             "2".as_ref(),
         ];

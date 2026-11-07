@@ -61,6 +61,12 @@ punctuation, `.`, `[...]`, `\d \w \s`, groups with `|`, `* + ?`, `^ $`); a patte
 guessed at. Only `*_exps.weight` stacks of three or more dimensions are quantized here. With `--llama-plan` a tensor
 the rules and llama-quantize type differently is a refusal in either direction.
 
+The port writes no fallback type. llama-quantize's `convert_incompatible_tensor` swaps a type whose block does not
+divide a tensor's columns for another (Q4_K to Q5_0, Q5_K to Q5_1, Q6_K to Q8_0, the IQ and Q2/Q3 kinds to IQ4_NL); here
+a tensor whose columns are not a multiple of 256 under a K-quant type needs a rule naming a type the port writes
+(Q8_0), or the run is refused by name with the tensor. K3.1's `tight` map names `attn_k_b` and `ssm_f_b` Q8_0 by rule
+(`gen_rules` in `tools/ref/k31-quant.sh`), so those two never reach a K-quant type.
+
 ## What it refuses
 
 Nothing is turned into a plausible value.
