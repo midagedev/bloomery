@@ -8,3 +8,8 @@ reason: 0.3.12's sitting on the same file and cards read 40.83 and 40.94 tok/s a
 decide-in: write the rows into the release notes' table with these conditions
 decide-below: under 36.0: a lever or a plan drifted; read the plan line and the witness block before writing a number, compare with 0.3.12's bp rows in the same table
 decide-above: beyond 45.0: read the witness block and the plan line (the room, the place) before crediting
+# outcome 2026-11-07 on k31rel f1596bff4 (sm86 tarball's bloomery-serve sha 7cb7e5ad…): two sittings. The first, with the paused HF
+#  uploader holding 8.3 GB RSS (MemAvailable 249 GB before the load, 255.7 GB at the 16c710de2 sitting), read tg 34.28 / 40.00 @512,
+#  35.21 / 36.29 @4096, pp 69 / 101 @512, 291 / 307 @4096 (majflt 74-121 k): below 36.0 = the plan drifted on the live host room
+#  (decide-below). The re-sit with the uploader killed: tg 42.22 / 40.91 @512, 38.30 / 38.75 @4096; pp 105.62 / 86.64 @512,
+#  354.37 / 319.47 @4096; load 60-65 s; majflt 133-281 k; green. The release's rows.
