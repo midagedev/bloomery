@@ -782,6 +782,17 @@ impl GpuModel<Body> {
                             "a placed load without its placed side",
                         ))?
                         .attach_pass(gpu, made)?;
+                } else {
+                    // The step load's union slabs for one column: the host
+                    // tier's resident path (the hits' experts computed while
+                    // the misses fill) runs only through them.
+                    body.placed
+                        .as_mut()
+                        .ok_or(GpuError::shape(
+                            PLAN,
+                            "a placed load without its placed side",
+                        ))?
+                        .prepare_step_union()?;
                 }
                 refuse_scratch_past(
                     PLAN,

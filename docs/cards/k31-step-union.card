@@ -1,0 +1,28 @@
+# k31rel. The host tier's resident path (crates/model/src/moe.rs serve_column_resident -> serve_step_split: the hits' experts
+# computed while the misses' ticket is in flight, then the misses) runs only through HostRun's union slabs, which a K3.1 load
+# made only beside a placed pass (placed.rs attach_pass); the step load (generate_kimi_k3 without --walk pass, the serve seat)
+# took the fill-then-serve path: the probe's nvtier record reads step_hits_under_read_ns=0 (k31-step-stats.card). This change
+# prepares the one-column slabs on the step load too (body.rs open_placed_with, Placed::prepare_step_union).
+kind: calibration
+question: with the one-column union slabs on the K3.1 step load, does the resident path engage (step_hits_under_read_ns > 0) and by how much does the host leg shrink at the probe's cold shape?
+term: stat summary leg_us_mean at D=64 N=48 (the probe's shape, the same cold arena), nvtier step_hits_under_read_ns delta
+unit: us
+predict: 190000..260000
+condition: tools/ref/k31-step-stats.sh /root/k31-step-union at K31_SS_D=64 K31_SS_N=48, BLOOMERY_HOST_ROOM=232G, the same box state
+  as k31-step-stats.card's run (its leg_us_mean 343,418, fill 189 ms a step, 152 fills a step of 1,370 host picks: 11 % misses)
+reason: [derived] the leg becomes max(fill 189, the hits' dot 0.89 x 154 = 137) + the misses' dot 17 = ~206 ms when the
+  overlap is complete; the band's top allows the ticket to be found ready on some layers (then serve_column as before) and the
+  fill threads' contention with 32 computing lanes. Warm (fill 64): leg -> max(64, 137) + 17 = ~154 vs ~218: the step 278 -> ~220
+  ms, 4.5 tok/s, read in a later D=512 run
+decide-in: the step load keeps the slabs (and bloomery-serve's K3 seat with it); the warm row is read next at D=512
+decide-below: under 190 ms: the hits' dot was overestimated or the misses' share smaller; read the nvtier deltas before the next lever
+decide-above: above 260 ms: the path did not engage every layer (step_hits_under_read_ns small, union_small/batched zero): read
+  serve_column_resident's three conditions (ticket ready, plan fits, no arena id) against this load before any other change
+# outcome 2026-11-07 (/root/k31-step-union, same shape and box state as the probe): leg_us_mean 274,904 (the probe's 343,418:
+#  -68 ms, -20 %), leg_us_p50 249,403; just above the band, decide-above's reading in part. The path engaged:
+#  step_hits_under_read_ns delta 3.22 s over 47 steps = 68 ms a step of hits computed under the read (0 before), on the
+#  65 layers a step that missed (step_miss_layers delta 3,057 / 47); the 27 layers with no miss have nothing to overlap.
+#  The fill wall rose 189 -> 200 ms a step (step_fill_wall_ns delta 9.41 s: the fill threads now share the cores with the
+#  computing lanes). [derived] cold leg = fill 200 + the no-miss layers' dot ~45 + the misses' dot ~17 + ~13 = 275: the
+#  cold leg is now the drive's. Warm (fill ~64 over fewer miss layers) the leg is the dot's, ~155-170 ms: step ~225-240,
+#  4.2-4.5 tok/s; read next at D=512 N=128. straggle_max_us 25,754 once (a parked worker's late wake), parks unchanged.

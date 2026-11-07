@@ -265,6 +265,13 @@ impl Placed {
         Ok(())
     }
 
+    /// The host tier's union slabs for the one-column step ([`HostRun::prepare_union`] at one
+    /// column): the resident path of `HostLayer::experts_into` serves the step only through them.
+    /// Load-time only, on a load without a pass (a pass load makes them for its rows).
+    pub(super) fn prepare_step_union(&mut self) -> Result<(), GpuError> {
+        self.shell.hybrid.host_mut().prepare_union(1)
+    }
+
     /// Device bytes the placed pass holds; 0 on a load without it.
     pub(super) fn pass_bytes(&self) -> usize {
         self.pass.as_deref().map_or(0, PlacedPass::bytes)
