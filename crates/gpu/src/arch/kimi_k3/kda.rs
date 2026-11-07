@@ -18,7 +18,7 @@
 //! load ([`derive`]).
 
 use crate::arch::hybrid::{Acts, GqaCx, Site};
-use crate::arch::rows_kit::{RowsKit, has_columns, kgemv_rows, order, project_rows};
+use crate::arch::rows_kit::{RowsKit, collect_rows, has_columns, kgemv_rows, order, project_rows};
 use crate::linear::mixer_kda::{
     self, KdaBufs, KdaDecay, KdaDims, KdaFile, KdaIn, KdaProj, KdaRule, KdaState, KdaVecs,
 };
@@ -221,6 +221,7 @@ impl KdaProj for Step<'_> {
             gpu.enqueue_quantize_q8_1_layer(xn, act, l)?;
             for (i, t) in input.iter().enumerate().filter(|(_, t)| q8(t)) {
                 let mut win = window(&mut y, i, shape)?;
+                collect_rows(cx, t, xn, 1)?;
                 t.kgemv(cx, act, l, &mut win)?;
             }
         }
@@ -321,6 +322,7 @@ impl KdaProj for Rows<'_, '_> {
             gpu.enqueue_quantize_q8_1_layer(xn, act, l)?;
             let mut at = 0;
             for (t, rows) in joined {
+                collect_rows(cx, t, xn, m)?;
                 let mut win = WindowMut::<f32>::of_mut(&mut *self.kit.stage, 4 * at, rows * m)?;
                 t.kgemv(cx, act, l, &mut win)?;
                 at += rows * m;
@@ -331,6 +333,7 @@ impl KdaProj for Rows<'_, '_> {
                 .enqueue(gpu.stream(), self.kit.stage, shape.channels(), m, y.qkv)?;
             for (i, t) in rest.iter().enumerate().filter(|(_, t)| shared(t)) {
                 let mut win = window(&mut y, 3 + i, shape)?;
+                collect_rows(cx, t, xn, m)?;
                 kgemv_rows(cx, self.kit, (t, rows_of[i]), act, l, &mut win)?;
             }
         }

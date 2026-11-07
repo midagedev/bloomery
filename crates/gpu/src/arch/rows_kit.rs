@@ -121,6 +121,21 @@ pub(crate) fn has_columns(t: &Site) -> bool {
     }
 }
 
+/// The importance collector's hook for site `t` read over the `m` token-major rows of `x` in one
+/// launch (a caller that launches the m-column gemv itself calls it beside it): nothing when no
+/// collector is attached. A one-row launch is [`Site::project`], which feeds it itself.
+pub(crate) fn collect_rows(
+    cx: &GqaCx<'_>,
+    t: &Site,
+    x: &DeviceBuffer<f32>,
+    m: usize,
+) -> Result<(), GpuError> {
+    match crate::imatrix::collector() {
+        Some(c) => c.feed_dense(cx.gpu, t.name(), x, (m, t.k())),
+        None => Ok(()),
+    }
+}
+
 /// `y = W · x` for site `t` over the `m` token-major rows of `x`, its `rows`
 /// outputs of each row token-major into `y`: a site that [`has_columns`] in
 /// one launch over the rows (the gemv arm's m-column launch, or a K-quant's
@@ -148,6 +163,7 @@ pub(crate) fn project_rows(
         }
         return Ok(());
     }
+    collect_rows(cx, t, x, m)?;
     match t.ty().reads() {
         Form::F32 | Form::Q8x32 => site::gemv(cx.gpu, cx.g32, (t.ty(), cx.w, t.name()), x, m, y),
         Form::Q8x128 => {

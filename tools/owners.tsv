@@ -60,3 +60,4 @@ fixture_writer	refset	crates/model/src/fixture/mod.rs crates/model/src/fixture/p
 elem_kernels	kernel	crates/gpu/src/elem.rs
 device_seam	host	crates/device/src/*.rs crates/gpu/src/device.rs crates/metal/src/*.rs
 attn_res	kernel	crates/gpu/src/attn_res.rs
+imatrix_collector	kernel	crates/gpu/src/imatrix.rs

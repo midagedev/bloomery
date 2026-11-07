@@ -271,3 +271,4 @@ gate-gpu-kimik3-pp	family	kimi-k3	e2e	prompt_walks+attn_linear_gdn_kda+attn_late
 gate-gpu-kimik3-place	family	kimi-k3	load	weights_load+placement_sizing+tier_legs
 gate-gpu-kimik3-serve	family	kimi-k3	serve	seats_serve_engine+serve_toolcall
 gate-quantize-hf	family	kimi-k3	e2e	quant_iq_writer
+gate-gpu-kimik3-imatrix	family	kimi-k3	e2e	imatrix_collector+prompt_walks+attn_linear_gdn_kda+attn_latent_mla+moe_route

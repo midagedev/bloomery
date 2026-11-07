@@ -101,6 +101,7 @@ crates/hf/src/fetch.rs	HF_TOKEN,HOME,HF_HUB_OFFLINE	stays: the hub token for a g
 crates/metal/src/stream.rs	BLOOMERY_METAL_BREADCRUMB	stays: the Metal crash breadcrumb
 crates/hf/src/vocab/tiktoken/tests.rs	BLOOMERY_KIMI_K3_HF,BLOOMERY_KIMI_K3_GGUF	stays: the Kimi-K3 folder and the K3 GGUF header the vocabulary gate reads (cfg(test) only)
 crates/gpu-gates/src/bin/gate_iq_quant.rs	K3Q_TREE,K3Q_FIXTURE	stays: the llama.cpp tree whose llama-quantize the gate compares with, and the K3 fixture it quantizes
+crates/gpu-gates/src/bin/gate_kimi_k3_imatrix.rs	K3Q_TREE	stays: the llama.cpp tree whose llama-imatrix and llama-quantize the gate compares with
 crates/quantize/tests/common/mod.rs	BLOOMERY_DATA	stays: the data directory
 crates/quantize/tests/hw_fixture_e2e.rs	K3Q_TREE,K3Q_FIXTURE	stays: the llama.cpp tree whose llama-quantize the gate compares with, and the K3 fixture it quantizes
 crates/quantize/tests/hw_plan_equal.rs	K3Q_TREE,K3Q_FIXTURE,K3Q_PLAN_IN,K3Q_PLAN_RULES	stays: the llama.cpp tree whose dry-run plan the gate compares with, the K3 fixture, and the optional tight-room shape and rules file

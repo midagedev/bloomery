@@ -26,7 +26,7 @@
 
 use crate::GpuError;
 use crate::arch::hybrid::{Acts, GqaCx, Site};
-use crate::arch::rows_kit::{RowsKit, kgemv_rows, project_rows};
+use crate::arch::rows_kit::{RowsKit, collect_rows, kgemv_rows, project_rows};
 use crate::latent::LATENT;
 use crate::latent_gated::{AttendIn, AttnBufs, MlaDims, MlaKernels, ValueW, attend, attend_rows};
 use crate::linear::PASS_ROWS;
@@ -244,6 +244,7 @@ pub(crate) fn step(
         gpu.enqueue_quantize_q8_1_layer(b.xn, act, l)?;
         for (t, y) in input {
             if q8(t) {
+                collect_rows(cx, t, b.xn, 1)?;
                 t.kgemv(cx, act, l, y)?;
             } else {
                 rest.push((t, y));
@@ -340,6 +341,7 @@ pub(crate) fn rows(
         gpu.enqueue_quantize_q8_1_layer(b.xn, act, l)?;
         for (t, n, y) in input {
             if q8(t) {
+                collect_rows(cx, t, b.xn, m)?;
                 kgemv_rows(cx, &mut kit, (t, n), act, l, y)?;
             } else {
                 rest.push((t, n, y));

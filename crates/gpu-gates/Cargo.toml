@@ -910,3 +910,9 @@ required-features = ["gpu"]
 [[bin]]
 name = "gate_kimi_k3_place"
 required-features = ["gpu"]
+
+# kimik3-imatrix: Kimi K3's own prompt walk's importance matrix (generate_kimi_k3 --imatrix) against llama-imatrix's on the fixture: names, counts, the
+# column sums within the band derived in the gate, and bloomery-quantize over it.
+[[bin]]
+name = "gate_kimi_k3_imatrix"
+required-features = ["gpu"]

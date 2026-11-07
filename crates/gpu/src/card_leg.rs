@@ -162,6 +162,13 @@ pub struct LegBufs {
 }
 
 impl LegBufs {
+    /// The gate·up's rows the last run left: `ff` values a slot, slot `r · slots_per_col + j` the
+    /// activation the down reads for token `r`'s pick `j` (the importance collector's input).
+    #[must_use]
+    pub fn act_rows(&self) -> &DeviceBuffer<f32> {
+        &self.h
+    }
+
     /// The buffers for runs of `shape` whose down entries read [`DownAct::
     /// Q8Act`] (the K-quant, MXFP4 and IQ2_XXS, IQ2_XS, IQ2_S, IQ1_S, IQ1_M,
     /// IQ3_XXS, IQ3_S and IQ4_XS downs).

@@ -1160,6 +1160,19 @@ impl super::Body {
         let pass = pass
             .as_deref_mut()
             .ok_or(GpuError::state(PASS, "the pass's buffers"))?;
+        // The card's routed block feeds the importance collector; a hosted layer's experts run on
+        // the host tier, whose activations the card never holds.
+        if crate::imatrix::collector().is_some()
+            && let Some(l) = side.hosted.iter().position(|&h| h)
+        {
+            return Err(GpuError::shape(
+                PASS,
+                format!(
+                    "importance collection: layer {l} has experts on the host tier, whose \
+                     activations the card does not hold (place every expert on the cards)"
+                ),
+            ));
+        }
         let n = hp.n_embd;
         let stride = pass.shape.rows * n;
         let mut cx = step_cx(gpu, w, k, hp, *ctx);

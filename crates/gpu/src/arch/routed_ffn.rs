@@ -426,6 +426,9 @@ pub(crate) fn ffn<R: RouterEntry>(
                 fault: gpu.layer_sink(l)?,
             };
             k.router.route(stream, xn, &rin, route)?;
+            if let Some(c) = crate::imatrix::collector() {
+                c.feed_dense(gpu, &r.router, xn, (1, cx.hidden))?;
+            }
             let Stages { latent, normed } = stages;
             let mut lat = latent_of(l, r, latent.as_mut())?;
             // The experts' rows: the latent down's output, or the normed row.
@@ -622,6 +625,9 @@ pub(crate) fn ffn_rows<R: RouterEntry>(
             };
             k.router
                 .route_rows((stream, gpu, cx.g32), xn, &rin, m, rows)?;
+            if let Some(c) = crate::imatrix::collector() {
+                c.feed_dense(gpu, &r.router, xn, (m, cx.hidden))?;
+            }
             let Stages { latent, normed } = stages;
             let mut lat = latent_of(l, r, latent.as_mut())?;
             let ex: &DeviceBuffer<f32> = match lat.as_mut() {
@@ -695,5 +701,16 @@ fn routed_sum<R: RouterEntry>(
         n_card: R::N_EXPERT,
         rule,
     };
-    leg.enqueue(gpu, bufs, &run, Some(LegSum { w: weights, acc }))
+    leg.enqueue(gpu, bufs, &run, Some(LegSum { w: weights, acc }))?;
+    if let Some(c) = crate::imatrix::collector() {
+        // Every expert is resident, so `sel` is the picks' expert ids and the gate·up's rows the
+        // leg left are the down's input rows.
+        let shape = bufs.shape();
+        let dims = (m, shape.slots_per_col, shape.n, R::N_EXPERT);
+        c.feed_routed(gpu, &r.stacks[0], (xn, sel), dims, false)?;
+        c.feed_routed(gpu, &r.stacks[1], (xn, sel), dims, false)?;
+        let dims = (m, shape.slots_per_col, shape.ff, R::N_EXPERT);
+        c.feed_routed(gpu, &r.stacks[2], (bufs.act_rows(), sel), dims, true)?;
+    }
+    Ok(())
 }

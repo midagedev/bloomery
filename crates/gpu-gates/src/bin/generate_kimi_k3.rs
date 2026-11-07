@@ -7,6 +7,8 @@
 //!                            [--granule BYTES] [--walk steps|pass]
 //!     BLOOMERY_MODEL=kimi-k3 generate_kimi_k3 --score FILE [--score-top K] [--ctx C] [--place a|bp|gate]
 //!                            [--walk steps|pass]
+//!     BLOOMERY_MODEL=kimi-k3 generate_kimi_k3 --imatrix OUT --text FILE [--ctx C] [--chunks N]
+//!                            [--place a|bp|gate] [--walk steps|pass]
 //!
 //! Defaults: `-n 8`, `--ctx 512`, `--place a`, `--mode graph`. The model is `ref_model_path()`. The
 //! file is read as the plan reads it ([`PlanInputs::read_without_chat_for`]: every part the body
@@ -53,6 +55,16 @@
 //! positions read from the last pass's rows; a completion past the pass's rows is refused by name.
 //! An empty prompt or completion, a malformed line or prompt + completion past `--ctx` is
 //! refused by name before the model loads; an id past the vocabulary before the first row runs.
+//!
+//! `--imatrix OUT --text FILE` collects the importance matrix `llama-imatrix` writes, from this engine's
+//! own prompt walk: FILE (plain text) is tokenized as `llama-imatrix` does (special tokens added, none
+//! parsed), cut into chunks of `--ctx` ids (the remainder dropped; at least two chunks, as llama
+//! requires; `--chunks N` takes the first N), each chunk's first id is the BOS where the vocabulary
+//! adds one, and every chunk runs from an empty model through the prompt walk (`--walk pass` on a
+//! placed load). OUT is llama's GGUF form (`bloomery_gpu::imatrix`: `<weight>.in_sum2`, `.counts`;
+//! the head is not collected, as `llama-imatrix` without `--process-output`). A layer with experts on
+//! the host tier is refused by name: the card holds no activation of those. One `imatrix chunk=` line
+//! a chunk (its wall) and a closing `imatrix chunks=` line.
 //!
 //! The lines on stdout: `load` (the resident bytes, the context, seconds), `ids` (the generated
 //! ids), `logits` (an FNV-1a over the last row's bits) and, with the vocabulary's pieces, `text`.
@@ -211,7 +223,7 @@ mod cli {
     ];
 
     /// Every flag this CLI reads; any other argument is refused by name, never ignored.
-    const KNOWN: [&str; 11] = [
+    const KNOWN: [&str; 14] = [
         "--walk",
         "--tokens",
         "--prompt",
@@ -223,7 +235,69 @@ mod cli {
         "--granule",
         "--score",
         "--score-top",
+        "--imatrix",
+        "--text",
+        "--chunks",
     ];
+
+    /// `--imatrix`: the importance matrix of the text at `text` as `ctx`-id chunks (the first
+    /// `chunks` of them, all when `None`), each from an empty model, written to `out`.
+    fn imatrix(
+        m: &mut GpuModel<Body>,
+        tok: &Tokenizer,
+        (text, out): (&str, &str),
+        (ctx, chunks): (usize, Option<usize>),
+        walk_pass: bool,
+    ) -> Result<(), GateError> {
+        let raw = std::fs::read(text).map_err(|e| format!("--text {text}: read: {e}"))?;
+        let ids = tok.encode(&raw, true, false);
+        if ids.len() < 2 * ctx {
+            return Err(format!(
+                "generate_kimi_k3: --text {text} tokenizes to {} ids; at least {} (two chunks of                  --ctx {ctx}) are needed",
+                ids.len(),
+                2 * ctx
+            )
+            .into());
+        }
+        let n = chunks.map_or(ids.len() / ctx, |c| c.min(ids.len() / ctx));
+        if n < 2 {
+            return Err(format!("generate_kimi_k3: --chunks {chunks:?}: at least 2 chunks").into());
+        }
+        let bos = match (tok.add_bos(), tok.specials().bos) {
+            (true, Some(b)) => Some(b),
+            (true, None) => {
+                return Err("generate_kimi_k3: the vocabulary adds a BOS and names none".into());
+            }
+            (false, _) => None,
+        };
+        // A captured step replays its launches with the host's row counts of the capture: the walk is eager.
+        m.set_mode(StepMode::Eager);
+        let collector = bloomery_gpu::imatrix::attach();
+        for c in 0..n {
+            let mut chunk = ids[c * ctx..(c + 1) * ctx].to_vec();
+            if let Some(b) = bos {
+                chunk[0] = b;
+            }
+            m.reset()?;
+            let t = std::time::Instant::now();
+            if walk_pass {
+                m.prompt_placed(&chunk)?;
+            } else {
+                Body::prompt(m, &chunk)?;
+            }
+            println!(
+                "imatrix chunk={}/{n} tokens={ctx} wall_s={:.3}",
+                c + 1,
+                t.elapsed().as_secs_f64()
+            );
+        }
+        collector.write(std::path::Path::new(out), (ctx as u32, n as u32), text)?;
+        println!(
+            "imatrix chunks={n} chunk_size={ctx} entries={} wrote={out}",
+            collector.names().len()
+        );
+        Ok(())
+    }
 
     /// One line of the `--score` file: a prompt, the completion forced after it and, per
     /// completion position, the extra ids whose log-probabilities are printed beside the top.
@@ -560,6 +634,28 @@ mod cli {
         } else if args.iter().any(|a| a == "--score-top") {
             return Err("generate_kimi_k3: --score-top needs --score".into());
         }
+        let imat = flag(&args, "--imatrix")?;
+        let corpus = flag(&args, "--text")?;
+        let chunks: Option<usize> = flag(&args, "--chunks")?.map(|s| s.parse()).transpose()?;
+        if imat.is_some() {
+            if corpus.is_none() {
+                return Err("generate_kimi_k3: --imatrix needs --text FILE".into());
+            }
+            if scoring.is_some()
+                || tokens.is_some()
+                || text.is_some()
+                || args.iter().any(|a| a == "-n")
+            {
+                return Err(
+                    "generate_kimi_k3: --imatrix takes its prompt from --text: no --score, \
+                     --tokens, --prompt or -n"
+                        .into(),
+                );
+            }
+        } else if corpus.is_some() || chunks.is_some() {
+            return Err("generate_kimi_k3: --text and --chunks need --imatrix".into());
+        }
+        let free = scoring.is_none() && imat.is_none();
         let walk_pass = match flag(&args, "--walk")?.as_deref() {
             None | Some("steps") => false,
             Some("pass") => true,
@@ -567,7 +663,7 @@ mod cli {
                 return Err(format!("generate_kimi_k3: --walk is steps or pass, not {o}").into());
             }
         };
-        if scoring.is_none() && tokens.is_some() == text.is_some() && !plan_only {
+        if free && tokens.is_some() == text.is_some() && !plan_only {
             return Err("generate_kimi_k3: one prompt: --tokens a,b,c or --prompt TEXT".into());
         }
 
@@ -655,8 +751,7 @@ mod cli {
             .map(|f| read_score_rows(f, ctx))
             .transpose()?;
 
-        let tok = text
-            .is_some()
+        let tok = (text.is_some() || imat.is_some())
             .then(|| Tokenizer::from_gguf(&path))
             .transpose()?;
         let ids: Vec<u32> = match (&tokens, &text) {
@@ -665,17 +760,17 @@ mod cli {
                 .map(|t| t.trim().parse::<u32>())
                 .collect::<Result<_, _>>()?,
             (_, Some(t)) => tok.as_ref().ok_or("no tokenizer")?.encode(t, true, false),
-            _ if score_rows.is_some() => Vec::new(),
+            _ if !free => Vec::new(),
             _ => unreachable!("one prompt by the check above"),
         };
-        if score_rows.is_none() && (ids.is_empty() || n == 0) {
+        if free && (ids.is_empty() || n == 0) {
             return Err(format!(
                 "generate_kimi_k3: a prompt of {} ids and -n {n}: each is at least 1",
                 ids.len()
             )
             .into());
         }
-        if score_rows.is_none() && ids.len() + n > ctx {
+        if free && ids.len() + n > ctx {
             return Err(format!(
                 "generate_kimi_k3: a prompt of {} ids and {n} generated exceed --ctx {ctx}",
                 ids.len()
@@ -701,6 +796,10 @@ mod cli {
             m.layers().len(),
             t.elapsed().as_secs_f64()
         );
+        if let (Some(out), Some(file)) = (imat.as_deref(), corpus.as_deref()) {
+            let tok = tok.as_ref().ok_or("no tokenizer")?;
+            return imatrix(&mut m, tok, (file, out), (ctx, chunks), walk_pass);
+        }
         if let Some(rows) = score_rows {
             return if walk_pass {
                 score_pass(&mut m, &rows, score_top)

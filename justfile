@@ -4642,3 +4642,14 @@ gate-gpu-kimik3-serve:
     BLOOMERY_MODEL=kimi-k3 ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-kimik3-serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_kimi_k3_serve && D=target/kimik3-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=600 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_kimi_k3_serve --dir $D'
 
 # --- end kimik3serve ---
+# --- kimik3imatrix ---
+
+# Kimi K3's own importance matrix (generate_kimi_k3 --imatrix, bloomery_gpu::imatrix) against llama-imatrix's on the K3 fixture (gate_kimi_k3_imatrix's
+# doc): two chunks of 512 ids of one text; names (the reader opens both, every weight but the listed fused ones), counts equal exactly, every column of
+# in_sum2 within the derived band, and bloomery-quantize over our file writes a set that opens. The recipe's `arms` picks the walks: `a` (the whole-card
+# load, the prompt stepped) and `bp` (the placed load, --walk pass; BLOOMERY_CARD=both). Fixture-only.
+# [predicted wall: llama-imatrix 2 chunks on the CPU ~1 min, our two chunks stepped ~1 min, the requantize and the quantize ~1 min; under 6 min after a warm build]
+gate-gpu-kimik3-imatrix arms='a,bp':
+    BLOOMERY_MODEL=kimi-k3 BLOOMERY_CARD=${BLOOMERY_CARD:-both} ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-kimik3-imatrix && . tools/ref/ref-paths.sh && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_kimi_k3_imatrix --bin generate_kimi_k3 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-quantize && D=target/kimik3-imatrix-gate && rm -rf $D && mkdir -p $D && K3Q_TREE=$K3QUANT BLOOMERY_GATE_BOUND=1200 bash tools/gpu-gate.sh gate_kimi_k3_imatrix --dir $D --arms {{arms}}'
+
+# --- end kimik3imatrix ---

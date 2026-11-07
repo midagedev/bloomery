@@ -63,6 +63,7 @@ pub mod hc_gated;
 pub mod head;
 pub mod host;
 pub mod hybrid;
+pub mod imatrix;
 pub mod index_key;
 pub mod indexer;
 pub mod iq;
