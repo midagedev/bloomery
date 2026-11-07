@@ -3735,6 +3735,13 @@ nsys-gpu-qwen3moe-prefill *PROMPTS:
 nsys-gpu-ds41 *DEPTHS:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh '{{precheck}} && if [ -z "${BLOOMERY_DRY:-}" ]; then cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41; fi && bash tools/ref/nsys-ds41.sh {{DEPTHS}}'
 
+# K3.1 bp decode chain timeline (nsys, both cards, no lease: a trace, not a timing; tools/ref/nsys-k3.sh takes
+# /root/k31-probe.lock like k31-step-stats.sh): generate_kimi_k3 --place bp over the first K31_NS_D prose ids, -n K31_NS_N,
+# under BLOOMERY_STEP_STATS=1; per hosted layer the shadow, the host wait, the chain from the wait's end to the next
+# handoff (kernels, busy, launch gaps) and the tier card's slack, over the last K31_NS_W steps. The header has the cut.
+nsys-gpu-kimik3 OUT="/root/k31-nsys":
+    BLOOMERY_MODEL=kimi-k3 BLOOMERY_CARD=both ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_kimi_k3 && bash tools/ref/nsys-k3.sh {{OUT}}'
+
 # V4.1 prompt batch timeline (nsys, A6000, under the lease, lead-only): generate_ds41 --depth P -n 2 --mode graph --time at
 # each prompt length P (default 512), the window from the prompt's first kernel to the first replay, cut into layer-batches
 # at ds41_ffn_places and the joins against the run's stat lines; per layer-batch the route window, the union gap and the
