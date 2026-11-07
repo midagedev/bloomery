@@ -51,12 +51,13 @@ use bloomery_levers::{
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::dspark::DraftCardBytes;
+use model::arch::models::ReasoningFormat;
 use model::arch::place_hybrid::{PlaceError, PlanInputs};
 use model::placement::ctx_ask::{Chosen, DEFAULT_SLOTS, probe_of};
 use model::placement::workstation::{self, HostNeed, TierBatchBytes};
 use model::placement::{Machine, PlacementError, Plan, PlanLevers};
 use runtime::width::Mode as WidthMode;
-use serve::reasoning::ThinkTags;
+use serve::reasoning::{ResponseTags, ThinkTags};
 use serve::{EngineProps, ServeError};
 use tokenizer::Tokenizer;
 
@@ -1069,6 +1070,19 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
         .w("addr", server.local_addr()?)
         .eprint();
     Ok(server.run())
+}
+
+/// The tags the server splits the reply on, from the format a model's description names: the
+/// think span's, and the answer's section where the format has one.
+pub fn think_tags_of(format: ReasoningFormat) -> ThinkTags {
+    let (open, close) = format.think();
+    ThinkTags {
+        open,
+        close,
+        response: format
+            .response()
+            .map(|(open, close)| ResponseTags { open, close }),
+    }
 }
 
 #[cfg(test)]

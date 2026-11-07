@@ -10737,6 +10737,131 @@ mod tests {
         assert_eq!(off["content"], "Add.<|think:end|>Four.", "{off}");
     }
 
+    /// Kimi K3's template (the checked-in header table's) on `engine`, served on the tags its
+    /// description names: the think span and the response section.
+    fn k3_server(engine: Box<dyn crate::Engine>) -> SocketAddr {
+        const HEADER: &str = include_str!("../../model/tests/kimi_k3_hdr.kv.json");
+        let header: Value = serde_json::from_str(HEADER).expect("the header table is JSON");
+        let template = header["tokenizer.chat_template"]
+            .as_str()
+            .expect("the header table holds the chat template");
+        let tags = ThinkTags {
+            open: "<|open|>think<|sep|>",
+            close: "<|close|>think<|sep|>",
+            response: Some(crate::reasoning::ResponseTags {
+                open: "<|open|>response<|sep|>",
+                close: "<|close|>response<|sep|>",
+            }),
+        };
+        let server = Server::bind("127.0.0.1:0", engine, templated(template))
+            .expect("bind")
+            .with_think_tags(tags);
+        server.spawn().expect("spawn")
+    }
+
+    /// The reply Kimi K3 writes on a thinking prompt: the think text, the span's close, the
+    /// response's open, the answer and the response's close.
+    const K3_REPLY: &str = "Respond only.<|close|>think<|sep|><|open|>response<|sep|>서울입니다.<|close|>response<|sep|>";
+
+    /// Kimi K3's reply splits at its sections: the think text is `reasoning_content`, the
+    /// response's text is `content`, and none of the section markup is in either, in one answer
+    /// and as stream deltas alike. With thinking off the template opens the response itself,
+    /// so the reply has no reasoning and its close tag is still not content; `reasoning_format`
+    /// `none` serves the raw text.
+    #[test]
+    fn kimi_k3_sections_split_into_reasoning_and_content() {
+        let ask = |extra: &str, reply: &str| {
+            let addr = k3_server(Box::new(crate::ScriptedEngine::new(4096, reply)));
+            chat_message(
+                addr,
+                &format!(
+                    "{{\"messages\":[{{\"role\":\"user\",\"content\":\"수도?\"}}],\
+                     \"temperature\":0,\"max_tokens\":200{extra}}}"
+                ),
+            )
+        };
+        let m = ask("", K3_REPLY);
+        assert_eq!(m["reasoning_content"], "Respond only.", "{m}");
+        assert_eq!(m["content"], "서울입니다.", "{m}");
+        let off = ask(
+            ",\"chat_template_kwargs\":{\"enable_thinking\":false}",
+            "서울입니다.<|close|>response<|sep|>",
+        );
+        assert!(off.get("reasoning_content").is_none(), "{off}");
+        assert_eq!(off["content"], "서울입니다.", "{off}");
+        let raw = ask(",\"reasoning_format\":\"none\"", K3_REPLY);
+        assert!(raw.get("reasoning_content").is_none(), "{raw}");
+        assert_eq!(raw["content"], K3_REPLY, "{raw}");
+
+        let addr = k3_server(Box::new(crate::ScriptedEngine::new(4096, K3_REPLY)));
+        let (status, text) = roundtrip(
+            addr,
+            "POST",
+            "/v1/chat/completions",
+            r#"{"messages":[{"role":"user","content":"수도?"}],"temperature":0,
+                "max_tokens":200,"stream":true}"#,
+        );
+        assert_eq!(status, 200, "{text}");
+        let (mut reasoning, mut content) = (String::new(), String::new());
+        for line in text.lines().filter_map(|l| l.strip_prefix("data: ")) {
+            let Ok(v) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            let d = &v["choices"][0]["delta"];
+            reasoning.push_str(d["reasoning_content"].as_str().unwrap_or_default());
+            content.push_str(d["content"].as_str().unwrap_or_default());
+        }
+        assert_eq!(reasoning, "Respond only.", "{text}");
+        assert_eq!(content, "서울입니다.", "{text}");
+    }
+
+    /// A history turn with `reasoning_content` renders through K3's template as one think span
+    /// and one response section, the server adding no span of its own; the generation prompt
+    /// opens the think span, and with thinking off the response.
+    #[test]
+    fn kimi_k3_history_reasoning_renders_one_span() {
+        let addr = k3_server(Box::new(crate::MockEngine::new(64)));
+        let body = |extra: Value| {
+            let mut b = json!({ "messages": [
+                { "role": "user", "content": "수도?" },
+                { "role": "assistant", "content": "서울.", "reasoning_content": "생각." },
+                { "role": "user", "content": "인구?" },
+            ]});
+            b.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            b
+        };
+        let (status, answer) = applied(addr, &body(json!({})));
+        assert_eq!(status, 200, "{answer}");
+        let prompt = applied_prompt(&answer);
+        assert_eq!(
+            prompt.matches("<|open|>think<|sep|>").count(),
+            2,
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(
+                "<|open|>think<|sep|>생각.<|close|>think<|sep|><|open|>response<|sep|>서울.\
+                 <|close|>response<|sep|>"
+            ),
+            "{prompt}"
+        );
+        assert!(prompt.ends_with("<|open|>think<|sep|>"), "{prompt}");
+        let (status, answer) = applied(
+            addr,
+            &body(json!({ "chat_template_kwargs": { "enable_thinking": false } })),
+        );
+        assert_eq!(status, 200, "{answer}");
+        let prompt = applied_prompt(&answer);
+        assert!(prompt.ends_with("<|open|>response<|sep|>"), "{prompt}");
+        assert_eq!(
+            prompt.matches("<|open|>think<|sep|>").count(),
+            0,
+            "{prompt}"
+        );
+    }
+
     /// A structured-output request on a prompt that left the span open has it
     /// closed first, with the seat's close: on Solar-Open2's tags the
     /// generation opens with `<|think:end|>`, so the document is the content

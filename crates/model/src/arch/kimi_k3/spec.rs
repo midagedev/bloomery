@@ -13,13 +13,14 @@
 //! rest the sigmoid router over `situ` experts that run in a latent, their weighted sum normed
 //! before the up projection, beside the shared stack that reads the hidden row. Every sublayer and
 //! the head read the cross-layer residual's mix ([`Residual::AttnRes`]); no stream is carried
-//! beside the running sum. The file's tokenizer is `kimi-k2`'s.
+//! beside the running sum. The file's tokenizer is `kimi-k2`'s. Its template writes the reply in
+//! sections ([`REASONING`]): the think span, then the response.
 
 use gguf::Split;
 use models::shape::RouterBody;
 use models::{
     Arch, ChatSpec, DeltaKind, DeltaRule, Ffn, IndexKeys, KdaGate, LayerSpec, Mixer, ModelSpec,
-    Moe, Need, Residual, Selector, Source,
+    Moe, Need, ReasoningFormat, Residual, Selector, Source,
 };
 
 use super::hparams::{Hparams, INDEX_DIM, INDEX_HEADS, Kind};
@@ -103,11 +104,20 @@ pub const AVAILABLE: &[Available] = &[
     },
 ];
 
+/// The reply's sections as the template spells them (`otag`/`ctag` of `think` and `response`): the
+/// model writes the think span, then the response, and the answer is the response's text.
+pub const REASONING: ReasoningFormat = ReasoningFormat::ThinkThenResponse {
+    open: "<|open|>think<|sep|>",
+    close: "<|close|>think<|sep|>",
+    response_open: "<|open|>response<|sep|>",
+    response_close: "<|close|>response<|sep|>",
+};
+
 /// `split`'s description and roles, and the defaults the key read took.
 pub fn read(split: &Split) -> Result<Read, PlacementError> {
     let hp = Hparams::read(split)?;
     let tensors = roles::classify(split, &hp)?;
-    let chat = chat_of(split, None, None)?;
+    let chat = chat_of(split, None, Some(REASONING))?;
     if chat.pre != PRE {
         return Err(PlacementError::Metadata {
             key: "tokenizer.ggml.pre".to_string(),
@@ -296,7 +306,8 @@ mod tests {
             );
         }
         assert_eq!(spec.chat.pre, "kimi-k2");
-        assert!(spec.chat.tools.is_none() && spec.chat.reasoning.is_none());
+        assert!(spec.chat.tools.is_none());
+        assert_eq!(spec.chat.reasoning, Some(super::REASONING));
         assert!(read.defaults.is_empty(), "{:?}", read.defaults);
     }
 

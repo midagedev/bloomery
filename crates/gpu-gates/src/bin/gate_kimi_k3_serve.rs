@@ -16,9 +16,10 @@
 //! the delta layers' state takes no position back (`app::arch::kimi_k3`'s `Batch::cut`), so a
 //! request that shares less than the slot holds re-feeds its prompt from an empty model and the
 //! clause holds it to the counting rule alone ([`serve_gate::Cut::WhereItStands`]). K3's
-//! description names no reasoning tags and the seat serves the reasoning inline as plain text, so
-//! the reasoning-split clause holds the content alone (`Clauses::think` is `None`, `Ask::reasons`
-//! false). The model's facts are this file's: the turn end is written here as the model's
+//! description names the reply's sections (`kimi_k3::spec::REASONING`): the seat hands the server the
+//! think span's and the response section's tags, so the reasoning-split clause holds the message
+//! to a reasoning of its own and a content with neither the span's close nor the response's open
+//! in it (`Clauses::think` those two, `Ask::reasons` true). The model's facts are this file's: the turn end is written here as the model's
 //! vocabulary spells it.
 //!
 //! - `parallel_above_one_is_refused`: the shared clause.
@@ -32,10 +33,12 @@
 //!   one that runs the word it is given loads the churn machine over a body that cannot and the
 //!   refusal half is red.
 //! - `load_and_listen`, `chat_answers_a_turn`, `chat_splits_the_reasoning_at_the_models_tags`
-//!   (here: the content, with no tag to leak), `chat_ends_at_the_turn_end`,
+//!   (here: the reasoning in `reasoning_content`, the content with no section tag to leak),
+//!   `chat_ends_at_the_turn_end`,
 //!   `live_slot_keeps_the_prefix`: the shared clauses, see `shared/serve_gate.rs`. The chat request
 //!   carries no reasoning budget: K3's template opens the think span in the generation prompt and
-//!   the seat splits nothing.
+//!   the model closes it itself. FAIL-first: a seat that names no tags serves the span and the
+//!   section markup in `content`, and the reasoning-split clause is red.
 //! - `tools_request_is_refused`: a chat request that carries `tools` is answered with an error
 //!   (HTTP 400 or above, an `error.message`, no `choices`), never a completion with the tool calls
 //!   left in `content`: the template's tool-call markup is one no parser reads
@@ -84,13 +87,13 @@ mod gate {
     /// The words of the residency refusal a set word other than `off` gets.
     const RESIDENCY_REFUSED: &str = "BLOOMERY_RESIDENCY=mid-p0-s1 is refused";
 
-    /// The chat request the seat's turn is asked as: no reasoning budget (there is no span to
-    /// close) and no effort (the template reads its own default), and no reasoning required of
-    /// the message.
+    /// The chat request the seat's turn is asked as: no reasoning budget and no effort (the
+    /// template reads its own default), and the message holds reasoning, which the model writes
+    /// in the span the generation prompt opens.
     const ASK: serve_gate::Ask = serve_gate::Ask {
         budget: None,
         effort: None,
-        reasons: false,
+        reasons: true,
     };
 
     /// `--plan` of `args` with `BLOOMERY_RESIDENCY` set to `word`, or removed when it is `None`
@@ -251,7 +254,9 @@ mod gate {
             listening: &record::LISTENING_HYBRID,
             arch: "kimi-k3",
             layers,
-            think: None,
+            // The span's close and the response's open: markup between the reasoning and the
+            // answer, in neither.
+            think: Some(["<|close|>think<|sep|>", "<|open|>response<|sep|>"]),
             turn_end: TURN_END,
             ctx: CTX,
             // The delta layers' state takes no position back: a cut keeps the position the model

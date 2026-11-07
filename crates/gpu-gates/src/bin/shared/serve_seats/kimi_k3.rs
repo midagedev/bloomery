@@ -11,8 +11,9 @@
 //! given and of the context the plan chose, so an unset `--ctx` that fits past it is refused too.
 //!
 //! The chat surface is the model's own template, whose tool-call markup no parser reads, so a
-//! request that asks for tool calls is the server's refusal, and whose description names no
-//! reasoning tags, so the seat splits none and serves the reasoning inline.
+//! request that asks for tool calls is the server's refusal, and whose description names the
+//! reply's sections (`kimi_k3::spec::REASONING`), so the server splits the think span into
+//! `reasoning_content` and serves the response section's text as `content`.
 
 use bloomery_gpu_gates::generate::{Place, TierRule};
 use bloomery_gpu_gates::{GateError, record, side_seat};
@@ -20,13 +21,13 @@ use gguf::Split;
 use model::arch::Arch;
 use model::arch::kimi_k3::hparams::Hparams;
 use model::arch::kimi_k3::place::{self, PlanInputs};
-use model::arch::models::ReasoningFormat;
 use model::placement::PlacementError;
 use model::placement::workstation::TierBatchBytes;
 use serve::ServeError;
 use serve::reasoning::ThinkTags;
 
 use super::hybrid::Family;
+use super::tiered::think_tags_of;
 
 const NAME: &str = "bloomery-serve-kimik3";
 const USAGE: &str = "usage: bloomery-serve --model kimik3 [-m PATH | --hf <repo>[:<quant>]] \
@@ -113,14 +114,11 @@ impl Family for KimiK3 {
             .transpose()?)
     }
 
-    /// The description's tags when it names a think span; it names none today, and the seat then
-    /// serves the reasoning inline, as plain text.
+    /// The tags of the reply's sections the description names (the think span and the response
+    /// section): the server splits the reasoning out and takes the section markup out of the
+    /// content.
     fn think_tags(inputs: &PlanInputs) -> Result<Option<ThinkTags>, GateError> {
-        Ok(inputs
-            .spec
-            .chat
-            .reasoning
-            .map(|ReasoningFormat::ThinkSpan { open, close }| ThinkTags { open, close }))
+        Ok(inputs.spec.chat.reasoning.map(think_tags_of))
     }
 }
 

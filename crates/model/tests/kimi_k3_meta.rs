@@ -89,7 +89,7 @@ fn kimi_k3_header() {
     }
     if s.chat.pre != "kimi-k2"
         || s.chat.tools.is_some()
-        || s.chat.reasoning.is_some()
+        || s.chat.reasoning != Some(model::arch::kimi_k3::spec::REASONING)
         || s.chat.template.as_ref().is_none_or(|t| t.len() != 24_696)
     {
         bad.push(format!(

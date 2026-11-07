@@ -21,6 +21,12 @@
 //! content. A tag the vocabulary holds as one special token is a tag only
 //! where that token wrote it ([`SpecialTags`]): the same characters spelled
 //! by ordinary tokens are text.
+//!
+//! A template that writes the answer in a section of its own (Kimi K3's
+//! `<|open|>response<|sep|>` … `<|close|>response<|sep|>`, [`ResponseTags`])
+//! has its tags taken out of the content: the one that opens the section where
+//! the span ends, and the one that closes it where it stands. They are markup,
+//! never the answer.
 
 use serde_json::Value;
 
@@ -124,6 +130,19 @@ pub struct ThinkTags {
     pub open: &'static str,
     /// The template's `thinking_end_token`.
     pub close: &'static str,
+    /// The answer's section after the span, for a template that writes one.
+    pub response: Option<ResponseTags>,
+}
+
+/// The two tags of the section a template writes the answer in: markup the
+/// content never carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResponseTags {
+    /// What opens the answer, after the span's close (or in the generation
+    /// prompt, when thinking is off).
+    pub open: &'static str,
+    /// What ends the answer.
+    pub close: &'static str,
 }
 
 impl ThinkTags {
@@ -132,6 +151,7 @@ impl ThinkTags {
     pub const THINK: ThinkTags = ThinkTags {
         open: "<think>",
         close: "</think>",
+        response: None,
     };
 }
 
@@ -142,6 +162,7 @@ impl ThinkTags {
     pub(crate) const SOLAR: ThinkTags = ThinkTags {
         open: "<|think:start|>",
         close: "<|think:end|>",
+        response: None,
     };
 }
 
@@ -186,7 +207,8 @@ impl ReasoningFormat {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ThinkEntry {
     /// The prompt ends with the closed span (its trailing whitespace with
-    /// it): no reasoning is split or capped.
+    /// it), or with the answer's section already open: no reasoning is split
+    /// or capped.
     #[default]
     Closed,
     /// The prompt ends with the start tag (its trailing whitespace with it):
@@ -214,7 +236,9 @@ impl ThinkEntry {
         let end = prompt.trim_end();
         if end.ends_with(tags.open) {
             ThinkEntry::Open
-        } else if end.ends_with(tags.close) {
+        } else if end.ends_with(tags.close) || tags.response.is_some_and(|r| end.ends_with(r.open))
+        {
+            // The answer's section already open ends the span too.
             ThinkEntry::Closed
         } else {
             ThinkEntry::MayOpen
@@ -272,6 +296,22 @@ pub struct ThinkSplit {
     /// A span the model opens with its own `<think>` drops the whitespace
     /// after its `</think>` ([`ThinkSplit::trimming_after_opened`]).
     trim_after_opened: bool,
+    /// Where the answer's section stands, for tags that name one.
+    section: Section,
+    /// A content tail that could still grow into the section's tag.
+    tail: Marked,
+}
+
+/// How far the content is into the answer's section.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Section {
+    /// Before the answer's text: a leading open tag is taken out (a prompt
+    /// that opened the section itself leaves none).
+    Opening,
+    /// In the answer: up to its close tag is content.
+    Answer,
+    /// Past the answer's close: the rest is content as it comes.
+    Ended,
 }
 
 impl ThinkSplit {
@@ -300,6 +340,8 @@ impl ThinkSplit {
             trim_content: false,
             trimming: false,
             trim_after_opened: false,
+            section: Section::Opening,
+            tail: Marked::default(),
         }
     }
 
@@ -346,7 +388,16 @@ impl ThinkSplit {
     #[must_use]
     pub(crate) fn reading_specials(mut self, tok: &dyn Tokenizer) -> Self {
         let tags = [self.tags.open, self.tags.close];
-        self.specials = SpecialTags::of(tok, &[&tags[..], self.ends_too.as_slice()].concat());
+        let response = self.tags.response.map(|r| [r.open, r.close]);
+        self.specials = SpecialTags::of(
+            tok,
+            &[
+                &tags[..],
+                self.ends_too.as_slice(),
+                response.as_ref().map_or(&[][..], |r| &r[..]),
+            ]
+            .concat(),
+        );
         self
     }
 
@@ -378,7 +429,57 @@ impl ThinkSplit {
             self.trimming = ws == m.text.len();
             m.take_front(ws);
         }
-        m
+        self.in_section(m)
+    }
+
+    /// Text past the span with the answer's section tags taken out: the open
+    /// tag where the answer starts, the close tag where it ends. A tail that
+    /// could still grow into the tag it waits for is held to the next push or
+    /// to [`ThinkSplit::finish`]. Tags that name no section leave the text as it is.
+    fn in_section(&mut self, m: Marked) -> Marked {
+        let Some(tags) = self.tags.response else {
+            return m;
+        };
+        let mut rest = std::mem::take(&mut self.tail);
+        rest.push(&m.text, &m.specials);
+        let mut out = Marked::default();
+        loop {
+            match self.section {
+                Section::Opening => {
+                    if self.specials.at(&rest, 0, tags.open) {
+                        rest.take_front(tags.open.len());
+                    } else if held(tags.open, &rest.text) {
+                        self.tail = rest;
+                        return out;
+                    }
+                    self.section = Section::Answer;
+                }
+                Section::Answer => {
+                    if let Some(at) = self.specials.find(&rest, tags.close) {
+                        let front = rest.take_front(at);
+                        out.push(&front.text, &front.specials);
+                        rest.take_front(tags.close.len());
+                        self.section = Section::Ended;
+                    } else {
+                        let keep = partial_suffix(&rest.text, tags.close);
+                        let front = rest.take_front(rest.text.len() - keep);
+                        out.push(&front.text, &front.specials);
+                        self.tail = rest;
+                        return out;
+                    }
+                }
+                Section::Ended => {
+                    out.push(&rest.text, &rest.specials);
+                    return out;
+                }
+            }
+        }
+    }
+
+    /// The content tail held for a section tag, released: the stream ended
+    /// before the tag was whole, so it was text.
+    fn release_tail(&mut self) -> Marked {
+        std::mem::take(&mut self.tail)
     }
 
     /// Outside a span the model may still open. Leading whitespace and a
@@ -454,11 +555,15 @@ impl ThinkSplit {
             self.may_open = false;
             self.trimming = self.trim_content;
             let held = std::mem::take(&mut self.held);
-            return Split::content(self.past_span(held));
+            let mut m = self.past_span(held);
+            let tail = self.release_tail();
+            m.push(&tail.text, &tail.specials);
+            return Split::content(m);
         }
+        let tail = self.release_tail();
         Split {
             reasoning: std::mem::take(&mut self.held).text,
-            ..Split::default()
+            ..Split::content(tail)
         }
     }
 }
@@ -582,6 +687,7 @@ mod tests {
         const SOLAR: ThinkTags = ThinkTags {
             open: "<|think:start|>",
             close: "<|think:end|>",
+            response: None,
         };
         let open = "<|im:start|>assistant<|im:content|><|think:start|>";
         let closed = "<|im:start|>assistant<|im:content|><|think:start|><|think:end|>";
@@ -613,6 +719,84 @@ mod tests {
 
         let mut s = ThinkSplit::for_prompt(open);
         assert_eq!(s.push("a<|think:end|>b", &[]).content, "a<|think:end|>b");
+    }
+
+    /// Kimi K3's tags, as its template spells them (`otag`/`ctag`).
+    const K3: ThinkTags = ThinkTags {
+        open: "<|open|>think<|sep|>",
+        close: "<|close|>think<|sep|>",
+        response: Some(ResponseTags {
+            open: "<|open|>response<|sep|>",
+            close: "<|close|>response<|sep|>",
+        }),
+    };
+
+    /// The split of `text` fed as `pieces` of at most `step` chars, then
+    /// finished: (reasoning, content).
+    fn split_k3(prompt: &str, text: &str, step: usize) -> (String, String) {
+        let mut s = ThinkSplit::for_prompt_with(prompt, K3);
+        let chars: Vec<char> = text.chars().collect();
+        let (mut reasoning, mut content) = (String::new(), String::new());
+        for piece in chars.chunks(step) {
+            let p = s.push(&piece.iter().collect::<String>(), &[]);
+            reasoning.push_str(&p.reasoning);
+            content.push_str(&p.content);
+        }
+        let p = s.finish();
+        reasoning.push_str(&p.reasoning);
+        content.push_str(&p.content);
+        (reasoning, content)
+    }
+
+    /// A template that writes the answer in a section: the output starts in
+    /// the span, `<|close|>think<|sep|>` ends it, the response's open tag
+    /// and close tag are markup taken out of the content, however the text is
+    /// cut into pushes; a prompt that opened the section itself (thinking off)
+    /// leaves no open tag to take out, and a tag cut short by the end of the
+    /// stream was text.
+    #[test]
+    fn a_response_section_is_markup_not_content() {
+        let on = "<|open|>message assistant<|sep|><|open|>think<|sep|>";
+        let off = "<|open|>message assistant<|sep|><|open|>response<|sep|>";
+        assert_eq!(ThinkEntry::of_prompt_with(on, K3), ThinkEntry::Open);
+        assert_eq!(ThinkEntry::of_prompt_with(off, K3), ThinkEntry::Closed);
+        let reply = "why<|close|>think<|sep|><|open|>response<|sep|>서울<|close|>response<|sep|>";
+        for step in [1, 2, 3, 7, 1000] {
+            assert_eq!(
+                split_k3(on, reply, step),
+                ("why".to_owned(), "서울".to_owned()),
+                "step {step}"
+            );
+            assert_eq!(
+                split_k3(off, "서울<|close|>response<|sep|>", step),
+                (String::new(), "서울".to_owned()),
+                "off, step {step}"
+            );
+        }
+        assert_eq!(
+            split_k3(
+                on,
+                "why<|close|>think<|sep|><|open|>response<|sep|>ab<|close|>resp",
+                4
+            ),
+            ("why".to_owned(), "ab<|close|>resp".to_owned())
+        );
+        // The answer's own text reads on past a lookalike of the close.
+        assert_eq!(
+            split_k3(off, "a<|close|>x<|close|>response<|sep|>", 5),
+            (String::new(), "a<|close|>x".to_owned())
+        );
+        // No response open after the span: the text is the answer all the same.
+        assert_eq!(
+            split_k3(on, "why<|close|>think<|sep|>서울", 3),
+            ("why".to_owned(), "서울".to_owned())
+        );
+        // Tags with no section leave the content whole.
+        let mut s = ThinkSplit::for_prompt("<think>");
+        assert_eq!(
+            s.push("a</think><|open|>response<|sep|>b", &[]).content,
+            "<|open|>response<|sep|>b"
+        );
     }
 
     /// The opening whitespace dropped is C's `isspace` over bytes, as

@@ -49,8 +49,8 @@ pub struct Clauses {
     /// The tags of the model's think span, as its vocabulary spells them; for a model with no
     /// span (Muse Spark's reasoning is a message to `self`), the two markers of its protocol
     /// the server must take out of the message. `None` for a model whose description names no
-    /// tags and whose seat serves its reasoning inline as plain text (Kimi K3): the message
-    /// then has no tag to leak.
+    /// tags and whose seat serves its reasoning inline as plain text: the message then has no
+    /// tag to leak. A model whose reply has sections (Kimi K3) names the markup between them.
     pub think: Option<[&'static str; 2]>,
     /// The token that closes the model's turn, as its vocabulary spells it.
     pub turn_end: &'static str,

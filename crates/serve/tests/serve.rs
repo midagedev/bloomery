@@ -2288,6 +2288,7 @@ fn hw_minimaxm31_reasoning_splits_at_its_tags() {
     let think = serve::reasoning::ThinkTags {
         open: "<mm:think>",
         close: "</mm:think>",
+        response: None,
     };
     assert_eq!(think.open, template_tag(TEMPLATE, "think_begin_token"));
     assert_eq!(think.close, template_tag(TEMPLATE, "think_end_token"));

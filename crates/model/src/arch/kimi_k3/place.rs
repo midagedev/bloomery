@@ -458,8 +458,8 @@ mod tests {
     }
 
     /// The plan's description is the registry's: one reading of the file, whose chat surface is
-    /// the Kimi K2 pre-tokenizer and the file's template, with no tool-call or reasoning parser
-    /// named.
+    /// the Kimi K2 pre-tokenizer and the file's template, with no tool-call parser named and the
+    /// reasoning sections the template spells ([`spec::REASONING`]).
     #[test]
     fn the_plans_description_is_the_registrys() {
         let split = opened("kimi-k3-place-chat", &[]);
@@ -469,6 +469,7 @@ mod tests {
         let chat = &inputs.spec.chat;
         assert_eq!(chat.pre, "kimi-k2");
         assert_eq!(chat.template.as_deref(), Some("{{ messages }}"));
-        assert!(chat.tools.is_none() && chat.reasoning.is_none());
+        assert!(chat.tools.is_none());
+        assert_eq!(chat.reasoning, Some(super::spec::REASONING));
     }
 }

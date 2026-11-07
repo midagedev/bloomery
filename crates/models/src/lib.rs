@@ -992,6 +992,17 @@ pub enum ReasoningFormat {
         open: &'static str,
         close: &'static str,
     },
+    /// A reasoning span and then the answer in a section of its own: the model closes the
+    /// span with `close`, opens the answer with `response_open` and ends it with
+    /// `response_close`. The reasoning is between `open` and `close`; the answer is between
+    /// the response tags, which are markup and never part of it. Each tag is the text its
+    /// template writes (Kimi K3's `<|open|>think<|sep|>` …).
+    ThinkThenResponse {
+        open: &'static str,
+        close: &'static str,
+        response_open: &'static str,
+        response_close: &'static str,
+    },
 }
 
 impl ReasoningFormat {
@@ -1000,6 +1011,28 @@ impl ReasoningFormat {
         open: "<think>",
         close: "</think>",
     };
+
+    /// The tags of the reasoning span, of either format: what opens it and what ends it.
+    #[must_use]
+    pub const fn think(self) -> (&'static str, &'static str) {
+        match self {
+            ReasoningFormat::ThinkSpan { open, close }
+            | ReasoningFormat::ThinkThenResponse { open, close, .. } => (open, close),
+        }
+    }
+
+    /// The tags of the answer's own section, for a format that has one.
+    #[must_use]
+    pub const fn response(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            ReasoningFormat::ThinkSpan { .. } => None,
+            ReasoningFormat::ThinkThenResponse {
+                response_open,
+                response_close,
+                ..
+            } => Some((response_open, response_close)),
+        }
+    }
 
     /// The span a chat template opens (`formats`' table). `None`: the
     /// template opens no span, so the output is not split.
