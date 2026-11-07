@@ -26,3 +26,6 @@ decide-above: beyond 4.8: read the plan line (paged bytes) and the major faults 
 #  from the NVMe (not the 155 GB the card assumed at the node's whole 126.6 GB room: that room OOMed the node, try3, and drifted
 #  between loads, try4; the node needs a reserve term in the plan, post-tag triage). Earlier tries: try1 arm parse (fixed,
 #  1f0e52d1f), try2 serve card check (fixed, c4d7e1121), try3 node OOM, try4 plan drift.
+# outcome 2026-11-07 @portable (the 0.3.13 sm86 tarball's bloomery-serve, sha e3dd7df6…, same env as try5, 2 rounds, rc 0):
+#  D=512 tg 4.00 / 4.05, pp 3.16 / 3.59; D=1536 tg 3.17 / 3.23, pp 3.43 / 3.20 (r1 / r2); load 264-265 s; every row [cold]
+#  (0.9-3.3 M major faults); decode within 2 % of try5. The release's rows.

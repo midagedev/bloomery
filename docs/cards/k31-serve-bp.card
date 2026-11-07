@@ -32,3 +32,6 @@ decide-above: beyond 3.0: read the plan line (more host residency than derived) 
 #  kimik3 serve seat steps the prompt one id at a time (Family::PREFILL_STEPS); the 256-row pass is generate_kimi_k3 --walk pass
 #  only, not the server's, so pp ≈ tg. Earlier tries: try4 the user-plan check (the live host room moves the plan by ~0.6 GB
 #  between loads), try5 plan drift for the same reason (→ the pinned room), try6 the 300 s request bound at D=1536.
+# outcome 2026-11-07 @portable (the 0.3.13 sm86 tarball's bloomery-serve, sha e3dd7df6…, HOST_ROOM=252G, fold depths, 2 rounds, rc 0):
+#  D=512 tg 3.04 / 3.05, pp 2.62 / 2.67; D=1536 tg 2.27 / 2.34, pp 2.58 / 2.53 (r1 / r2); load 57-58 s; every row [cold]
+#  (1.4-4.4 M major faults); within 2 % between rounds, 5-8 % under the tree rows of try7 (cold scatter). The release's rows.
