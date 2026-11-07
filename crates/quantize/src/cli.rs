@@ -311,7 +311,7 @@ mod tests {
             "--hf-arch",
             "kimi-k3",
             "--hf-drop",
-            "blk.*.indexer.*",
+            "*.tmp.*",
             "--hf-shard-gib",
             "8",
             "16",
@@ -332,7 +332,7 @@ mod tests {
             (
                 std::path::Path::new("dir"),
                 Some("kimi-k3"),
-                &["blk.*.indexer.*".to_string()][..],
+                &["*.tmp.*".to_string()][..],
                 8
             )
         );
