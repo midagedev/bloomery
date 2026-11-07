@@ -1,0 +1,44 @@
+{
+  "name": "kimik31q",
+  "arch": "kimi-k3",
+  "source": "Kimi-K3.1-Pro folder, the local download of 2026-11-06 (no hub revision is recorded in it)",
+  "rev": "local-2026-11-06",
+  "expect": {"tensors": 497340, "data_bytes": 1561217377280},
+  "layers": [0, 3],
+  "layer_prefix": "language_model.model.layers.",
+  "keep": [
+    "language_model.model.embed_tokens.weight",
+    "language_model.lm_head.weight",
+    "language_model.model.norm.weight",
+    "language_model.model.output_attn_res_norm.weight",
+    "language_model.model.output_attn_res_proj.weight"
+  ],
+  "drop": ["vision_tower.", "mm_projector."],
+  "copy": [
+    "tiktoken.model",
+    "tokenization_kimi.py",
+    "tokenizer_config.json",
+    "generation_config.json"
+  ],
+  "widths": {"ff": {"keep": 256, "align": 256}},
+  "planes": [
+    {"base": "block_sparse_moe.experts.*.w1", "axis": "rows", "width": "ff",
+     "members": {"weight_packed": 1, "weight_scale": 1}},
+    {"base": "block_sparse_moe.experts.*.w3", "axis": "rows", "width": "ff",
+     "members": {"weight_packed": 1, "weight_scale": 1}},
+    {"base": "block_sparse_moe.experts.*.w2", "axis": "cols", "width": "ff",
+     "members": {"weight_packed": 2, "weight_scale": 32}}
+  ],
+  "config": {
+    "layer_count": "text_config.num_hidden_layers",
+    "widths": {"text_config.moe_intermediate_size": "ff"},
+    "per_layer": [],
+    "layer_names": [],
+    "layer_numbers": [
+      "text_config.linear_attn_config.kda_layers",
+      "text_config.linear_attn_config.full_attn_layers",
+      "text_config.dsa_config.dsa_layers"
+    ],
+    "set": {"text_config.num_shared_experts": 24}
+  }
+}

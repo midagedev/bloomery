@@ -38,6 +38,17 @@ fn main() -> ExitCode {
     }
 }
 
+/// The plan over the input the command line names: a GGUF split, or under `hf` a checkpoint folder read as the split
+/// `prepare` would write of it.
+#[cfg(feature = "gpu")]
+fn prepare(a: &quantize::cli::Args) -> quantize::Result<quantize::run::Prepared> {
+    #[cfg(feature = "hf")]
+    if let quantize::cli::Input::Hf(h) = &a.input {
+        return quantize::run::prepare_from(a, model_hf::quantize_source::open(h)?);
+    }
+    quantize::run::prepare(a)
+}
+
 /// The card as a [`Backend`]: one quantizer a kind, the bound tensor's importance on the card.
 #[cfg(feature = "gpu")]
 struct CardBackend<'a> {
@@ -112,7 +123,7 @@ fn go() -> Result<(), Error> {
         }
         Parsed::Run(a) => a,
     };
-    let prep = quantize::run::prepare(&a)?;
+    let prep = prepare(&a)?;
     if a.plan {
         let free = os::free_bytes(&a.out_dir()).ok();
         print!(

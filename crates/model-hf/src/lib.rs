@@ -16,8 +16,10 @@ pub mod folder;
 pub mod follow;
 pub mod model_file;
 pub mod part;
+pub mod quantize_source;
 pub mod remote;
 pub mod select;
+pub mod shards;
 
 pub use model_file::{ModelFile, Weights};
 

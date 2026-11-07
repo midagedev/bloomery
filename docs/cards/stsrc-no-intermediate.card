@@ -1,0 +1,25 @@
+# stsrc. bloomery-quantize --hf: the K3.1 quantize step reads the HF folder itself, with no intermediate GGUF set.
+# Derived from tools/ref/k31-quant.sh's own terms (K31_BYTES 1.56e12 derived, NVME_READ_GBS 1.6 the k3trace page-fault floor,
+# 1.0-1.6 GB/s measured; NVME_WRITE_GBS 1.5 derived, no measurement of its own: nvme0 left the bus on 2026-11-06 under this very
+# write) and the folder's own index (metadata.total_size 1,561,217,377,280 B, read 2026-11-07; the intermediate holds the same
+# tensors in the same bits, so its size is the folder's, MXFP4 experts repacked 1 to 1, not the 1.3 TB the brief names).
+# Today: prepare reads the folder (1.56e12 / 1.6e9 = 975 s) and writes the set (1.56e12 / 1.5e9 = 1040 s) in one pass, so its wall
+# is max(975, 1040) = 1040 s when the read and the write overlap and 975 + 1040 = 2015 s when they do not; then quantize reads the set
+# (975 s inside its own 4386 s, `k31-quant.sh quantize --pred-s`). With --hf the quantize step reads the same bytes once, from the
+# folder: the prepare step and its 1.56 TB write are gone and the read that remains is the one quantize already paid. The output
+# (580 GB), the card's time and the host rules do not move. The term is the saving: the prepare step's wall, 1040..2015 s [derived].
+kind: calibration
+question: how long does the step that --hf removes take, the prepare of the 1.56 TB K3.1 folder into the K3-shaped GGUF set, so what
+  does quantize --hf over the folder save against prepare plus quantize over the set?
+term: seconds of tools/ref/k31-quant.sh prepare (both prepare runs, the K3-shaped set and the indexer-only one, the first alone is
+  the saving) over /data/models/Kimi-K3.1-Pro (96 shards, 1.56e12 B) into /models, one reader thread, 251 GB RAM, nice -n 10
+unit: s
+predict: 1040..2015
+condition: a run of the existing prepare step by the lead (its log records its wall and bytes); the runner's own lock; no other
+  reader of /models in the window; nvme0 healthy (a device that dropped is a failed run, not a number)
+reason: prices --hf in the k31 pipeline's plan (the quantize step's predicted wall stays 4386 s over the folder) and says whether the
+  lead runs the prepare step at all before the final quantize
+decide-in: 1040..2015 s: the step is dropped from the pipeline, quantize --hf reads the folder, and the 1.56 TB intermediate is never written
+decide-below: below 1040 s the write is faster than 1.5 GB/s: the drive's write rate is then a measurement; re-price the saving from it
+decide-above: above 2015 s read and write do not share the drive well (or a stall): the saving is larger than priced and the NVMe
+  write rate is the term to measure before another large write to nvme0

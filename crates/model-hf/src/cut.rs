@@ -157,6 +157,11 @@ struct ConfigEdit {
     widths: Vec<(String, usize)>,
     per_layer: Vec<String>,
     layer_names: Vec<String>,
+    /// Lists of layer numbers counted from 1 (a config's `kda_layers`), reduced to the kept layers and renumbered.
+    layer_numbers: Vec<String>,
+    /// Values the cut gives outright, by dotted path: a count the width cut makes of another field (the shared experts
+    /// a narrowed expert width divides the shared projections into).
+    set: Vec<(String, Value)>,
 }
 
 /// A cut's rules, read from one JSON document.
@@ -236,6 +241,15 @@ impl<'a> Fields<'a> {
                     .ok_or_else(|| spec_err(format!("{what} holds a value that is not a string")))
             })
             .collect()
+    }
+
+    /// [`Fields::strings`] of a key a spec may leave out: none then.
+    fn strings_or_none(&mut self, key: &str) -> Result<Vec<String>, CutError> {
+        if self.map.contains_key(key) {
+            self.strings(key)
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     fn object(&mut self, key: &str) -> Result<Fields<'a>, CutError> {
@@ -371,6 +385,15 @@ fn parse_config(f: &mut Fields, widths: &[Width]) -> Result<ConfigEdit, CutError
         widths: by_width,
         per_layer: c.strings("per_layer")?,
         layer_names: c.strings("layer_names")?,
+        layer_numbers: c.strings_or_none("layer_numbers")?,
+        set: if c.map.contains_key("set") {
+            c.entries("set")?
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        },
     };
     c.finish()?;
     Ok(edit)
@@ -1092,6 +1115,26 @@ fn edit_config(spec: &Spec, text: &str) -> Result<String, CutError> {
                         out.push(Value::from(format!("{}{new}.{tail}", spec.layer_prefix)));
                     }
                 }
+            }
+        }
+        *at_path(&mut root, path)? = Value::Array(out);
+    }
+    for (path, value) in &edit.set {
+        *at_path(&mut root, path)? = value.clone();
+    }
+    for path in &edit.layer_numbers {
+        let numbers = at_path(&mut root, path)?
+            .as_array()
+            .ok_or_else(|| CutError::Config(format!("{path} is not an array")))?
+            .clone();
+        let mut out = Vec::new();
+        for n in numbers {
+            let n1 = n
+                .as_u64()
+                .filter(|&n| n >= 1)
+                .ok_or_else(|| CutError::Config(format!("{path} holds {n}, not a layer number")))?;
+            if let Some(new) = usize::try_from(n1 - 1).ok().and_then(|l| renumber.get(&l)) {
+                out.push(Value::from(to_u64(new + 1)));
             }
         }
         *at_path(&mut root, path)? = Value::Array(out);
@@ -3272,6 +3315,40 @@ pub(crate) mod tests {
                 "layer {i}: layer_types and the interval disagree"
             );
         }
+    }
+
+    /// The kimik31q spec cuts a K3.1 config to the layers it keeps: the layer count, the kinds' 1-based layer lists and
+    /// the indexer's renumbered, the expert width narrowed and the shared experts counted over it; nothing else moves.
+    #[test]
+    fn the_kimik31q_spec_edits_a_k31_config_to_two_layers() {
+        let spec = Spec::parse(include_str!(
+            "../../../tools/quant-fixture-cuts/kimik31q.json"
+        ))
+        .unwrap();
+        let real = json!({
+            "model_type": "kimi_k31",
+            "text_config": {
+                "num_hidden_layers": 93,
+                "moe_intermediate_size": 3072,
+                "num_shared_experts": 2,
+                "first_k_dense_replace": 1,
+                "linear_attn_config": {
+                    "full_attn_layers": [4, 8, 93],
+                    "kda_layers": [1, 2, 3, 5, 6, 7, 9],
+                },
+                "dsa_config": {"dsa_layers": [4, 8, 93], "index_topk": 2048},
+            },
+        });
+        let edited: Value =
+            serde_json::from_str(&edit_config(&spec, &real.to_string()).unwrap()).unwrap();
+        let mut want = real;
+        want["text_config"]["num_hidden_layers"] = json!(2);
+        want["text_config"]["moe_intermediate_size"] = json!(256);
+        want["text_config"]["num_shared_experts"] = json!(24);
+        want["text_config"]["linear_attn_config"]["full_attn_layers"] = json!([2]);
+        want["text_config"]["linear_attn_config"]["kda_layers"] = json!([1]);
+        want["text_config"]["dsa_config"]["dsa_layers"] = json!([2]);
+        assert_eq!(edited, want);
     }
 
     /// The qwen38nvfp4 spec over the real Flash-Next NVFP4 `config.json` keeps layers 0 to 3,

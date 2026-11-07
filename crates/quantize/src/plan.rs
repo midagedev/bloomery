@@ -9,6 +9,7 @@ use crate::imatrix::Imatrix;
 use crate::resolve::{self, Model, Options, TensorRef, layer_of};
 use crate::rules::Rules;
 use crate::scan::{SOURCE_TYPES, row_bytes};
+use crate::source::Source;
 use crate::{Error, Result};
 use gguf::iq_quant::IqKind;
 use gguf::kquant::KType;
@@ -182,7 +183,7 @@ fn readable(ty: GgmlType) -> bool {
 impl Plan {
     /// Decide every tensor of `set`; no file is written and none but the inputs' headers is read.
     pub fn build(
-        set: &gguf::Split,
+        set: &dyn Source,
         rules: &Rules,
         lcpp: Option<&LlamaPlan>,
         im: Option<&Imatrix>,
@@ -197,7 +198,9 @@ impl Plan {
             ));
         }
         // The order ggml's driver walks: the loader's map (by layer, then name), or under --keep-split the files'.
-        let mut ts: Vec<(usize, &gguf::TensorInfo)> = set.iter_tensors().collect();
+        let tensors = set.tensors();
+        let mut ts: Vec<(usize, &gguf::TensorInfo)> =
+            tensors.iter().map(|(s, t)| (*s, t)).collect();
         if a.keep_split {
             ts.sort_by_key(|(s, t)| (*s, t.offset));
         } else {

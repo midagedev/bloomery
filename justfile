@@ -809,6 +809,19 @@ gate-quantize-e2e:
 gate-quantize-plan:
     ./tools/box.sh '. tools/ref/ref-paths.sh && export BLOOMERY_DATA K3Q_TREE=$K3QUANT && bash tools/gate.sh --release -p bloomery-quantize --test hw_plan_equal -- --ignored --nocapture --test-threads=1'
 
+# The 2-layer cut of the real Kimi K3.1 folder (layers 0 and 3, the routed width 256, tools/quant-fixture-cuts/kimik31q.json)
+# into /models/fixtures/kimik31q (nvme0, about 9 GB; `fixture cut` refuses an existing directory): what gate-quantize-hf reads.
+cut-kimik31q:
+    ./tools/box.sh 'cargo build --release -p bloomery-model-hf --bin fixture && target/release/fixture cut ${K3Q_HF_FOLDER:-/data/models/Kimi-K3.1-Pro} /models/fixtures/kimik31q --spec tools/quant-fixture-cuts/kimik31q.json'
+
+# bloomery-quantize --hf (crates/quantize `Source`, crates/model-hf `quantize_source`): the checkpoint folder read as the split
+# `prepare` writes of it, without writing it. On a toy K3.1 folder and on the kimik31q cut (`just cut-kimik31q`): (a) the folder's
+# header is the prepared split's, key by key and tensor by tensor; (b) the set written from --hf equals, sha256 per shard, the set
+# written from the prepared split, same plan and imatrix; (c) a missing shard, a weight_scale with no weight and an E8M0 byte of
+# 255 each end at 1 by name with no file left. Host only (--cpu), the box's cores; K3Q_WORK is where the sets are written.
+gate-quantize-hf:
+    ./tools/box.sh '. tools/ref/ref-paths.sh && export BLOOMERY_DATA K3Q_WORK=/models/qhf-work && mkdir -p "$K3Q_WORK" && bash tools/gate.sh --release -p bloomery-model-hf --test quantize_hf -- --include-ignored --nocapture --test-threads=1'
+
 # gate-gpu-iq-quant's oracle: tools/ref/iq_quant_ref.cpp linked to the K3.1 quantization tree's libggml-base, into
 # $BLOOMERY_DATA/bin with the tree's commit and the library's md5 beside it. CPU only, no lease.
 build-iq-quant-ref:

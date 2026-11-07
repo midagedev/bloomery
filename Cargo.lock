@@ -468,6 +468,7 @@ dependencies = [
  "bloomery-levers",
  "bloomery-model",
  "bloomery-os",
+ "bloomery-quantize",
  "bloomery-refset",
  "bloomery-safetensors",
  "bloomery-threads",
