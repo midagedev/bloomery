@@ -4,6 +4,9 @@
 # a card) and two `ps -L` snapshots (per-thread CPU share), then a hardware-cycles perf of the engine thread alone.
 # Usage: K31_PROBE_SERVE=... K31_PROBE_ENV=... K31_PROBE_N=... k31-engine-sample.sh OUTDIR  (inside a lease-hold)
 set -u
+HERE=$(cd "${BASH_SOURCE[0]%/*}" && pwd)
+# shellcheck source=tools/gate-bound.sh
+source "$HERE/../gate-bound.sh"
 O=$1; export K31_PROBE_OUT=$O
 bash tools/ref/k31-nvme-probe.sh & P=$!
 until grep -q "generating" "$O/serve.log" 2>/dev/null; do sleep 2; kill -0 $P 2>/dev/null || exit 1; done
@@ -18,7 +21,7 @@ echo "engine-tid=$ET"
 if [ -n "$ET" ]; then
   perf record -e cycles -F 1999 -g -t "$ET" -o "$O/engine.perf" -- sleep 15 >/dev/null 2>&1
   perf report -i "$O/engine.perf" --no-children --stdio -g none --sort sym --percent-limit 1 2>/dev/null | grep -v "^#" | grep -v "^\s*$" | head -30 > "$O/engine-sym.txt"
-  timeout --kill-after=5 40 bpftrace -e "
+  bounded 40 bpftrace -e "
 tracepoint:sched:sched_switch /args->prev_pid == $ET && args->prev_state != 0/ { @t = nsecs; @k[kstack(8)] = count(); }
 tracepoint:sched:sched_switch /args->next_pid == $ET && @t/ { \$d = nsecs - @t; @off_us = hist(\$d / 1000); @off_total_ns = sum(\$d); @switches = count(); @t = 0; }
 interval:s:30 { exit(); }" > "$O/engine-off.txt" 2>&1

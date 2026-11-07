@@ -3,6 +3,9 @@
 # Usage (on the box, from the tree): tools/ref/k31-step-stats.sh [OUT] ; env K31_SS_D (prompt ids, 64), K31_SS_N (ids
 # generated, 48), K31_SS_ROOM (232G), K31_SS_MODEL (the K3.1 first shard), K31_SS_ENV (extra NAME=value words).
 set -u
+HERE=$(cd "${BASH_SOURCE[0]%/*}" && pwd)
+# shellcheck source=tools/gate-bound.sh
+source "$HERE/../gate-bound.sh"
 OUT=${1:-/root/k31-step-stats}
 D=${K31_SS_D:-64}; N=${K31_SS_N:-48}; ROOM=${K31_SS_ROOM:-232G}
 MODEL=${K31_SS_MODEL:-/models/Kimi-K3.1-Pro-IQ1_S/Kimi-K3.1-Pro-IQ1_S-00001-of-00031.gguf}
@@ -24,8 +27,8 @@ iostat -x -t 1 nvme0n1 nvme1n1 > "$OUT/iostat.log" 2>&1 &
 IPID=$!
 t0=$(date +%s)
 echo "start=$(date -Iseconds) D=$D N=$N room=$ROOM" | tee -a "$OUT/summary.txt"
-env BLOOMERY_REF_MODEL="$MODEL" BLOOMERY_HOST_ROOM="$ROOM" BLOOMERY_STEP_STATS=1 ${K31_SS_ENV:-} \
-  timeout --kill-after=10 3600 "$BIN" --place bp --ctx 2048 --mode graph --tokens "$TOKENS" -n "$N" \
+bounded 3600 env BLOOMERY_REF_MODEL="$MODEL" BLOOMERY_HOST_ROOM="$ROOM" BLOOMERY_STEP_STATS=1 ${K31_SS_ENV:-} \
+  "$BIN" --place bp --ctx 2048 --mode graph --tokens "$TOKENS" -n "$N" \
   > "$OUT/out.txt" 2> "$OUT/err.txt"
 rc=$?
 echo "rc=$rc wall_s=$(( $(date +%s) - t0 ))" | tee -a "$OUT/summary.txt"

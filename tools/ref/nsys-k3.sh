@@ -26,6 +26,9 @@
 # An interval holding the once-per-step marker (the first stage kernel that runs D + N - 1 times, or one fewer, with the
 # handoffs a whole number of steps) crosses a step and is left out. Only graph kernels are read (graphNodeId set).
 set -uo pipefail
+HERE=$(cd "${BASH_SOURCE[0]%/*}" && pwd)
+# shellcheck source=tools/gate-bound.sh
+source "$HERE/../gate-bound.sh"
 
 analyze() {
   python3 - "$@" << 'PY'
@@ -156,14 +159,14 @@ TOKENS=$(head -n "$D" "$IDS" | paste -sd, -)
 [ "$(echo "$TOKENS" | tr ',' '\n' | wc -l)" = "$D" ] || die "ids file shorter than $D"
 { sha256sum "$BIN"; "$NSYS" --version; echo "start=$(date -Iseconds) D=$D N=$N room=$ROOM W=$W"; } | tee "$OUT/summary.txt"
 t0=$(date +%s)
-env BLOOMERY_REF_MODEL="$MODEL" BLOOMERY_HOST_ROOM="$ROOM" BLOOMERY_STEP_STATS=1 ${K31_NS_ENV:-} \
-  timeout --kill-after=10 1800 "$NSYS" profile -t cuda --cuda-graph-trace=node --cuda-event-trace=false \
+bounded 1800 env BLOOMERY_REF_MODEL="$MODEL" BLOOMERY_HOST_ROOM="$ROOM" BLOOMERY_STEP_STATS=1 ${K31_NS_ENV:-} \
+  "$NSYS" profile -t cuda --cuda-graph-trace=node --cuda-event-trace=false \
   --sample=none --cpuctxsw=none -o "$OUT/k3" --force-overwrite true \
   "$BIN" --place bp --ctx 2048 --mode graph --tokens "$TOKENS" -n "$N" > "$OUT/out.txt" 2> "$OUT/err.txt"
 rc=$?
 echo "rc=$rc wall_s=$(( $(date +%s) - t0 ))" | tee -a "$OUT/summary.txt"
 grep '^load \|^stat summary\|^nvtier ' "$OUT/out.txt" "$OUT/err.txt" | tee -a "$OUT/summary.txt"
 [ "$rc" = 0 ] || exit "$rc"
-timeout 1800 "$NSYS" export --type sqlite --force-overwrite true -o "$OUT/k3.sqlite" "$OUT/k3.nsys-rep" > /dev/null || die "export failed"
-timeout 1800 "$NSYS" stats -q -r cuda_gpu_kern_sum,cuda_api_sum,cuda_gpu_mem_time_sum -f csv -o "$OUT/stats" "$OUT/k3.sqlite" > /dev/null 2>&1
+bounded 1800 "$NSYS" export --type sqlite --force-overwrite true -o "$OUT/k3.sqlite" "$OUT/k3.nsys-rep" > /dev/null || die "export failed"
+bounded 1800 "$NSYS" stats -q -r cuda_gpu_kern_sum,cuda_api_sum,cuda_gpu_mem_time_sum -f csv -o "$OUT/stats" "$OUT/k3.sqlite" > /dev/null 2>&1
 analyze "$OUT/k3.sqlite" "$W" "$(( D + N - 1 ))" | tee "$OUT/chain.txt"
