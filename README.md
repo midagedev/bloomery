@@ -346,12 +346,15 @@ every gate is shown to fail on its defect before the fix lands ([how](docs/perfo
 - DeepSeek V4.1 on one 24 GB card from a file with an r8 sidecar beside it is refused at the load by name (the NVMe
   tier does not fill from the sidecar yet); `BLOOMERY_R8=off` reads the source file with the same bits.
 - GLM-5.3 holds at most 16,384 positions a slot; a `--ctx-size` whose slot share is larger is refused at the start.
-- Kimi K3 and K3.1 Pro load at `--place bp` only (two cards, the host and the NVMe expert tier; the dense trunk alone
-  is past one 48 GB card). K3.1 Pro holds `--ctx-size` to 2,048 positions a slot: the reader runs the lightning
-  indexer's selection up to its top-k, and the sparse attention past it is not in the engine yet. The K3.1 set's chat
-  template is unsloth's Kimi-K3 template (the checkpoint ships none), and its importance matrix came from
-  `llama-imatrix`; the quantization itself was written by `bloomery-quantize`.
-- The expert tier on another machine (`BLOOMERY_TIER_NODES`) serves DeepSeek V4.1-Flash only, and the RAM arena
+- Kimi K3.1 Pro (our `IQ1_S` set, a Q4_K trunk) loads at `--place bp` only (two cards, the host and the NVMe expert
+  tier) and holds `--ctx-size` to 2,048 positions a slot: the reader runs the lightning indexer's selection up to its
+  top-k, and the sparse attention past it is not in the engine yet. The seat steps a prompt one id at a time (the prompt
+  rate equals the decode rate) and serves the model's think span as plain text. The set's chat template is unsloth's
+  Kimi-K3 template (the checkpoint ships none), and its importance matrix came from `llama-imatrix`; the quantization
+  itself was written by `bloomery-quantize`. Kimi K3 (unsloth's `UD-IQ1_S`, 594 GB) does not load at this tag: its
+  dense trunk is 51.4 GB, past one 48 GB card.
+- The expert tier on another machine (`BLOOMERY_TIER_NODES`, `tier_server`) serves DeepSeek V4.1-Flash, GLM-5.3, Qwen3.8,
+  Solar-Open2 and Kimi K3 / K3.1; a node serves no prompt batch (the batch is the host's), and the RAM arena
   (`BLOOMERY_NVME_ARENA`) refuses a plan with a rank file (`BLOOMERY_EXPERT_RANK`) by name.
 
 Every limit, by seat: [`docs/serving.md`](docs/serving.md#12-limits).
