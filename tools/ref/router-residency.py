@@ -2037,7 +2037,7 @@ def q38_engine_set(root, name, rows, chunk=None, complete=True, n_expert=512):
     lines = [
         "# router_trace — bloomery engine: the routed ids of every position the engine ran, in step "
         "order, as the host step port read them",
-        "# model\t/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+        "# model\t/data/moved/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
         "# model_file\tQwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
         "# arch\tqwen4exp",
         "# build\tgenerate_qwen3moe",

@@ -1737,7 +1737,7 @@ dump-ref-mistrallarge4 *VARIANT:
 # ref_mistrallarge4_mix256g_d3k, [dump-ref-mistrallarge4]'s over the same ids; predicted wall 6-14 min [derived:
 # docs/cards/mistrallarge4-mix256g-d3k-dump.card].
 dump-ref-mistrallarge4-mix256g *VARIANT:
-    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S={{ if VARIANT == '' { '300' } else { '600' } }} BLOOMERY_MODEL=mistral-large4 BLOOMERY_REF_MODEL=/models/Mistral-Large-4-1T-A52B-Mix-256G/Mistral-Large-4-1T-A52B-Mix-256G-00001-of-00006.gguf ./tools/box.sh 'MISTRALLARGE4_TAG=mix256g bash tools/ref/mistrallarge4-dump.sh {{VARIANT}}'
+    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S={{ if VARIANT == '' { '300' } else { '600' } }} BLOOMERY_MODEL=mistral-large4 BLOOMERY_REF_MODEL=/data/moved/models/Mistral-Large-4-1T-A52B-Mix-256G/Mistral-Large-4-1T-A52B-Mix-256G-00001-of-00006.gguf ./tools/box.sh 'MISTRALLARGE4_TAG=mix256g bash tools/ref/mistrallarge4-dump.sh {{VARIANT}}'
 
 # DSpark draft 오라클: ik `db517b69`에 `ik-dsv41-draft.py`만 얹은 트리(`/home/user/ik-dspark-draft`)를 짓고
 # dump_draft를 그 트리의 libllama·libggml에 링크한다. ik 빌드는 CPU 임대 아래서 돈다.
@@ -2099,7 +2099,7 @@ gate-gpu-qwen38-media:
 # adds the clauses that start the seat from the hub with no projector flag (it fetches the repo's own projector and
 # serves images) and with --no-mmproj (it serves none): a network read. Either card.
 gate-gpu-clef-serve *ARGS:
-    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_clef_serve && D=target/clef-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_clef_serve --model /models/clef-flash/Cloudflare_clef-flash-Q5_K_M.gguf --head /models/clef-flash/hf/joint_head.safetensors --clef-model /root/models/clef-flash/Cloudflare_clef-flash-Q5_K_M.gguf --image-model /models/clef-flash/Cloudflare_clef-flash-Q8_0.gguf --mmproj /root/models/clef-flash/mmproj-Cloudflare_clef-flash-bf16.gguf --dir $D {{ARGS}}'
+    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_clef_serve && D=target/clef-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_clef_serve --model /data/moved/models/clef-flash/Cloudflare_clef-flash-Q5_K_M.gguf --head /data/moved/models/clef-flash/hf/joint_head.safetensors --clef-model /root/models/clef-flash/Cloudflare_clef-flash-Q5_K_M.gguf --image-model /data/moved/models/clef-flash/Cloudflare_clef-flash-Q8_0.gguf --mmproj /root/models/clef-flash/mmproj-Cloudflare_clef-flash-bf16.gguf --dir $D {{ARGS}}'
 
 # The decide seat of bloomery-serve on lev (gate_lev_serve's doc): ggml-org/lev-GGUF's Q4_K_M (3.0 GB, a `qwen35`
 # file with `qwen35.decision.type = lev`, fetched into /root/models/lev-4b/) with no head flag; five refusals before
@@ -2109,7 +2109,7 @@ gate-gpu-clef-serve *ARGS:
 # prompts' ids; ARGS `--hf ggml-org/lev-GGUF:Q4_K_M` adds the clause that serves the file from the hub, no head flag, and
 # answers the first request as the `-m` server does (a network read). Either card.
 gate-gpu-lev-serve *ARGS:
-    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_lev_serve && D=target/lev-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_lev_serve --model /root/models/lev-4b/lev-Q4_K_M.gguf --head /models/clef-flash/hf/joint_head.safetensors --ref $BLOOMERY_DATA/lev/4b/ref --dir $D {{ARGS}}'
+    BLOOMERY_MODEL=qwen35 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_lev_serve && D=target/lev-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_lev_serve --model /root/models/lev-4b/lev-Q4_K_M.gguf --head /data/moved/models/clef-flash/hf/joint_head.safetensors --ref $BLOOMERY_DATA/lev/4b/ref --dir $D {{ARGS}}'
 
 # clef_hidden on the box (ARGS as its doc: --model, --ids, --out, ...): a qwen35 file's prompt-only pass, every
 # position's final-norm hidden state to a file and a `clef hidden` record with the call's functional wall.

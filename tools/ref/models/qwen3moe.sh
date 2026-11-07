@@ -46,7 +46,7 @@
 # shellcheck disable=SC2034
 MODEL_NAME=qwen3moe
 : "${IK:=/home/user/ik-idxkey}"
-MODEL=${BLOOMERY_REF_MODEL:-/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf}
+MODEL=${BLOOMERY_REF_MODEL:-/data/moved/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf}
 : "${REF_CTX:=512}"
 : "${REF_SET_CPU:=ref_qwen3moe}"
 : "${REF_SET_CUDA:=ref_cuda_qwen3moe}"

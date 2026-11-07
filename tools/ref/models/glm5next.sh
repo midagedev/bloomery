@@ -139,7 +139,7 @@
 # shellcheck disable=SC2034
 MODEL_NAME=glm5next
 : "${IK:=/home/user/ik-idxkey}"
-MODEL=${BLOOMERY_REF_MODEL:-/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf}
+MODEL=${BLOOMERY_REF_MODEL:-/data/moved/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf}
 : "${REF_CTX:=512}"
 : "${REF_SET_CPU:=ref_glm5next}"
 : "${REF_SET_CUDA:=ref_cuda_glm5next}"

@@ -39,11 +39,11 @@
 # shellcheck disable=SC2034
 MODEL_NAME=qwen35
 : "${IK:=/home/user/ik-idxkey}"
-MODEL=${BLOOMERY_REF_MODEL:-/models/clef-27b/clef-27b-Q4_K_M.gguf}
+MODEL=${BLOOMERY_REF_MODEL:-/data/moved/models/clef-27b/clef-27b-Q4_K_M.gguf}
 : "${LCPP:=/home/user/llama.cpp-mainline}"
 PROSE_IDS=${BLOOMERY_DATA:-/root/bloomery-data}/qwen35/corpus-prose.ids
 PROSE_SHA256=4bdf4171c7e1d0fd37d61b4fd13fdfb66c0dea1806d03b0398f851da5a350223
-FLASH_Q8=/models/clef-flash/Cloudflare_clef-flash-Q8_0.gguf
+FLASH_Q8=/data/moved/models/clef-flash/Cloudflare_clef-flash-Q8_0.gguf
 LEV_MODEL=/root/models/lev-4b/lev-Q4_K_M.gguf
 HIDDEN_SETS=(ref_qwen35_hidden_p64:64 ref_qwen35_hidden_p600:600 ref_qwen35_hidden_p4096:4096
   "ref_qwen35_flashq8_hidden_p64:64:$FLASH_Q8" "ref_qwen35_flashq8_hidden_p600:600:$FLASH_Q8"

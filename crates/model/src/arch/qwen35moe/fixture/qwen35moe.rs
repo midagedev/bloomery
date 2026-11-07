@@ -74,7 +74,7 @@ pub const STEM: &str = "qwen35moe-fixture";
 
 /// The real file `verify` opens when none is named: the profile's `MODEL`
 /// (`tools/ref/models/qwen35moe.sh`).
-pub const DEFAULT_MODEL: &str = "/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-Q4_K_M.gguf";
+pub const DEFAULT_MODEL: &str = "/data/moved/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-Q4_K_M.gguf";
 
 const TARGET_ARCH: &str = "qwen35moe";
 

@@ -219,7 +219,8 @@ fn hw_qwen35_dense_chat() {
 /// The in-file next-token layer on the three headers this round describes.
 /// A1 carries one shaped draft, A2 declares the layer and stores no tensor,
 /// A4 has no key. Headers only.
-const A1_UNSLOTH_MTP: &str = "/data/moved/models/qwen36-hf/unsloth-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf";
+const A1_UNSLOTH_MTP: &str =
+    "/data/moved/models/qwen36-hf/unsloth-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf";
 const A2_MINICPM: &str = "/models/MiniCPM-V-4.7-35B-A3B/MiniCPM-V-4_7-35B-A3B-Q4_K_M.gguf";
 const A4_Q4KM: &str = "/data/moved/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-Q4_K_M.gguf";
 

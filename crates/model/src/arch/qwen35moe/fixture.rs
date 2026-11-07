@@ -133,12 +133,12 @@ pub const DRAFT_FILE: &str = "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf";
 /// The real first shard `verify` opens when none is named: the profile's
 /// `QWEN38_FILE` (`tools/ref/models/qwen4exp.sh`).
 pub const DEFAULT_MODEL: &str =
-    "/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
+    "/data/moved/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
 /// The real shared MTP draft `verify` opens when none is named — shared, so
 /// the draft fixture borrows the target's `token_embd` and `output` as this
 /// load does.
 pub const DEFAULT_MTP_MODEL: &str =
-    "/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf";
+    "/data/moved/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf";
 
 const TARGET_ARCH: &str = "qwen4exp";
 

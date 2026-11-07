@@ -63,7 +63,8 @@ pub const STEM: &str = "qwen3moe-fixture";
 
 /// The real file `verify` opens when none is named: the profile's
 /// (`tools/ref/models/qwen3moe.sh`).
-pub const DEFAULT_MODEL: &str = "/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf";
+pub const DEFAULT_MODEL: &str =
+    "/data/moved/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf";
 
 const ARCH: &str = "qwen3moe";
 

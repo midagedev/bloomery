@@ -141,12 +141,12 @@ OUT=${Q3K_OUT:-$REF_BIN}
 # BLOOMERY_Q5K_MODEL names another.
 Q5K_MODEL=${BLOOMERY_Q5K_MODEL:-${BLOOMERY_V41_MODEL:?BLOOMERY_V41_MODEL unset — run through tools/box.sh, which exports it from the deepseek41 profile}}
 DSPARK_MODEL=${BLOOMERY_DSPARK_MODEL:-/models/DeepSeek-V4.1-Flash-DSpark/DeepSeek-V4.1-Flash-Fp8-128x742M-MXFP4_MOE.tl37.gguf}
-IQ3XXS_MODEL=${BLOOMERY_IQ3XXS_MODEL:-/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00002-of-00003.gguf}
+IQ3XXS_MODEL=${BLOOMERY_IQ3XXS_MODEL:-/data/moved/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00002-of-00003.gguf}
 MXFP4_MODEL=${BLOOMERY_MXFP4_MODEL:-/models/DeepSeek-V4.1-Flash-DSpark/DeepSeek-V4.1-Flash-Fp8-128x742M-MXFP4_MOE.tl37.gguf}
-QWEN_Q4_MODEL=${BLOOMERY_QWEN_Q4_MODEL:-/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf}
-QWEN_Q3_MODEL=${BLOOMERY_QWEN_Q3_MODEL:-/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00002-of-00003.gguf}
-GLM_Q2_IQ2XS_MODEL=${GLM_Q2_IQ2XS_MODEL:-/models/GLM-5.3-Flash-UD-Q2_K_XL/GLM-5.3-Flash-UD-Q2_K_XL-00002-of-00004.gguf}
-GLM_Q2_Q2K_MODEL=${GLM_Q2_Q2K_MODEL:-/models/GLM-5.3-Flash-UD-Q2_K_XL/GLM-5.3-Flash-UD-Q2_K_XL-00004-of-00004.gguf}
+QWEN_Q4_MODEL=${BLOOMERY_QWEN_Q4_MODEL:-/data/moved/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf}
+QWEN_Q3_MODEL=${BLOOMERY_QWEN_Q3_MODEL:-/data/moved/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00002-of-00003.gguf}
+GLM_Q2_IQ2XS_MODEL=${GLM_Q2_IQ2XS_MODEL:-/data/moved/models/GLM-5.3-Flash-UD-Q2_K_XL/GLM-5.3-Flash-UD-Q2_K_XL-00002-of-00004.gguf}
+GLM_Q2_Q2K_MODEL=${GLM_Q2_Q2K_MODEL:-/data/moved/models/GLM-5.3-Flash-UD-Q2_K_XL/GLM-5.3-Flash-UD-Q2_K_XL-00004-of-00004.gguf}
 mkdir -p "$OUT" "$BLOOMERY_DATA/ref"
 
 DUMPERS="q4k_x4_ref q6k_x4_ref q5f0_ref q5f1_ref q5k_x4_ref iq3xxs_ref mxfp4_x4_ref q8f0_ref iq4nl_ref iq3s_ref q2k_ref iq2xs_ref"

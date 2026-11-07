@@ -79,7 +79,7 @@ pub const STEM: &str = "glm53-fixture";
 /// The real first shard `verify` opens when none is named: the profile's
 /// (`tools/ref/models/glm5next.sh`).
 pub const DEFAULT_MODEL: &str =
-    "/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf";
+    "/data/moved/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf";
 
 const ARCH: &str = "glm5next";
 

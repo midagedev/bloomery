@@ -232,17 +232,17 @@ profile() {
       ;;
     qwen3moe)
       tree_tokref
-      SHARD=${BLOOMERY_QWEN3MOE_VOCAB:-/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf}
+      SHARD=${BLOOMERY_QWEN3MOE_VOCAB:-/data/moved/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf}
       SET=ref-tokenizer-qwen3moe
       ;;
     glm5next)
       tree_tokref
-      SHARD=/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf
+      SHARD=/data/moved/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf
       SET=ref-tokenizer-glm5next
       ;;
     qwen38)
       tree_tokref
-      SHARD=/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
+      SHARD=/data/moved/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
       SET=ref-tokenizer-qwen38
       ;;
     nemotron)
@@ -286,7 +286,7 @@ profile() {
       ORACLE_TREE=/home/user/llama.cpp-muse
       BUILD_PIN=ba3c05f71da85cd0439e84ba42b0478b24d5db16 BUILD_PATCH=
       TREE_FLAGS=()
-      SHARD=/models/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS-00001-of-00006.gguf
+      SHARD=/data/moved/models/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS-00001-of-00006.gguf
       SET=ref-tokenizer-musespark
       # Nemotron's flags, a mainline llama-tokenize too: the file sets add_bos_token, and the gate compares the text's own ids.
       REF_FLAGS=(--no-bos --no-escape)

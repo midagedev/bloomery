@@ -82,8 +82,7 @@ mod gate {
     use model::r8file::R8Source;
 
     /// The UD-Q3_K_XL file, first of three shards (90.0 GB).
-    const MODEL: &str =
-        "/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf";
+    const MODEL: &str = "/data/moved/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf";
 
     /// Cache rows of the engine child: the prompt and the steps, with room.
     const CTX: usize = 1024;

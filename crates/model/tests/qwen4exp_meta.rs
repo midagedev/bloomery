@@ -20,7 +20,8 @@ use model::arch::qwen35moe::place::UBATCH_PLANNED;
 
 /// The file: unsloth's `UD-Q4_K_XL`. Its first shard holds the header and no
 /// tensor.
-const Q38: &str = "/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
+const Q38: &str =
+    "/data/moved/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
 
 // PIN(2026-09-27): the file's description as `arch::qwen35moe::spec` reads it, line by line (the key
 // values checked against the header dump and llama.cpp's loader, src/models/qwen4exp.cpp:26-147).
@@ -997,7 +998,8 @@ const CARD_PLANS: [CardPlanRow; 16] = [
 // (`place::card_routed`), so every layer's stacks are the card's [the same header dump].
 const HOST_ONLY: [(usize, &str); 0] = [];
 /// The draft that uses the target's embedding and output matrix.
-const SHARED: &str = "/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf";
+const SHARED: &str =
+    "/data/moved/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf";
 
 /// The card rule's plan of the Qwen3.8 file (`place::PlanInputs::plan_with`
 /// under `Experts::Card`): the stacks it leaves on the host, each named with
@@ -1257,8 +1259,7 @@ fn hw_qwen4exp_card_plan() {
 
 /// The Q3 file: unsloth's `UD-Q3_K_XL`. Its first shard holds the header and
 /// no tensor.
-const Q3: &str =
-    "/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf";
+const Q3: &str = "/data/moved/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf";
 
 // PIN(2026-10-06): the Q3 file's dense card part and routed share [derived from its headers, as
 // CARD_DENSE's derivation reads the Q4 file's: every non-routed tensor but the PLE table on the

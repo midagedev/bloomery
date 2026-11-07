@@ -76,7 +76,7 @@ pub const STEM: &str = "solar2-fixture";
 /// The real first shard `verify` opens when none is named: the profile's
 /// (`tools/ref/models/solar-open2.sh`).
 pub const DEFAULT_MODEL: &str =
-    "/models/Solar-Open2-250B-Q4_K_M/Solar-Open2-250B-Q4_K_M-00001-of-00004.gguf";
+    "/data/moved/models/Solar-Open2-250B-Q4_K_M/Solar-Open2-250B-Q4_K_M-00001-of-00004.gguf";
 
 const ARCH: &str = "solar-open2";
 

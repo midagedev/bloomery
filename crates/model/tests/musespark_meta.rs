@@ -13,7 +13,7 @@ use std::fs;
 use models::{RopeMode, ToolFormat};
 
 /// The box's path of the first shard.
-const FILE: &str = "/models/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS-00001-of-00006.gguf";
+const FILE: &str = "/data/moved/models/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS-00001-of-00006.gguf";
 
 /// Its length, so a different file at the same path fails before the pins.
 const BYTES: u64 = 13_079_896;

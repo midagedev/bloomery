@@ -78,7 +78,7 @@
 # shellcheck disable=SC2034
 MODEL_NAME=qwen4exp
 : "${IK:=/home/user/ik-idxkey}"
-QWEN38_FILE=/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
+QWEN38_FILE=/data/moved/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
 MODEL=${BLOOMERY_REF_MODEL:-$QWEN38_FILE}
 : "${REF_CTX:=512}"
 : "${REF_SET_CPU:=ref_qwen4exp}"

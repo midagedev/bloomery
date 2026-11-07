@@ -95,7 +95,7 @@ pub const STEM: &str = "musespark-fixture";
 
 /// The real first shard `verify` opens when none is named: the profile's
 /// (`tools/ref/models/muse-spark.sh`).
-pub const DEFAULT_MODEL: &str = "/models/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS-00001-of-00006.gguf";
+pub const DEFAULT_MODEL: &str = "/data/moved/models/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS-00001-of-00006.gguf";
 
 const ARCH: &str = "muse-spark";
 
