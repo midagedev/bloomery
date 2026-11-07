@@ -1,0 +1,22 @@
+# k31rel. The Kimi K3.1 Pro IQ1_S set served with the DGX Spark as the expert tier node over the 10 GbE TCP link
+# (BLOOMERY_TIER_NODES=<spark>:9000, BLOOMERY_TIER_LINK=tcp): the plan takes the GB10 as the one tier card (126.6 GB of
+# routed experts) in place of the RTX 3090 (22 GB), so the NVMe share of the experts falls from 259 GB (the box-alone plan,
+# docs/cards/k31-serve-bp.card) to 155 GB; the host keeps 252 GB (BLOOMERY_HOST_ROOM=252G) and the A6000 its 12.9 GB.
+kind: baseline
+question: what decode rate does the K3.1 v1 set reach at --place bp with the Spark as the tier node, D=512 and D=1536 at --ctx-size 2048, through bloomery-serve
+term: decode tok/s at D=512, bloomery-serve from ~/repo/bloomery-k31rel, --place bp, --ctx-size 2048, the Spark tier node, 2 rounds, fold depths
+unit: tok/s
+predict: 3.5..4.8
+condition: tools/ref/depth-serve.sh arms D=512 and D=1536 with env=BLOOMERY_TIER_NODES=10.41.0.2:9000,BLOOMERY_TIER_LINK=tcp,BLOOMERY_HOST_ROOM=252G,
+  DEPTH_SERVE_PLACE=bp, DEPTH_SERVE_CTX=2048, DEPTH_SERVE_FOLD=depths, DEPTH_SERVE_REQ_BOUND=1800; tier_server from the same tree on the
+  Spark (/root/bloomery-gb10, the set's own copy at /models/Kimi-K3.1-Pro-IQ1_S, restarted per load by /root/k31-tier-loop.sh); the HF
+  upload of the set paused (SIGSTOP) for the sitting; every row expected [cold] as in the box-alone sitting (the set is larger than the host)
+reason: [derived] the box-alone rows read 3.30 tok/s = 0.30 s a token with 259 GB of the 515 GB of experts paged from nvme0 (the card
+  derived 0.42 s for that share at 5 GB/s sequential; the page cache served part of it). With 155 GB paged (0.6 of the share) the NVMe
+  term falls by ~0.4 of itself: ~0.30 - 0.4 x ~0.2 = ~0.22 s, plus the node's round trips (92 routed layers x 2 control messages over
+  TCP, ~0.3 ms each = ~0.05 s; the GB10 reads its share at its ~270 GB/s in ~10 ms) = ~0.25..0.28 s a token = 3.5..4 tok/s; the high end
+  if the page cache holds more of the smaller NVMe share
+decide-in: write the rows into the release notes' Kimi K3.1 table as the Spark cell, beside the box-alone rows, and the README's tier line
+decide-below: under 3.5 (no gain over the box alone): the node's round trips cost more than the NVMe bytes they save; read the step's
+  node wait in the witness and the tier_server log before writing a number; a lost node is a fault, not a rate
+decide-above: beyond 4.8: read the plan line (paged bytes) and the major faults before crediting
