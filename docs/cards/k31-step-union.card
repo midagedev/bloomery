@@ -26,3 +26,8 @@ decide-above: above 260 ms: the path did not engage every layer (step_hits_under
 #  computing lanes). [derived] cold leg = fill 200 + the no-miss layers' dot ~45 + the misses' dot ~17 + ~13 = 275: the
 #  cold leg is now the drive's. Warm (fill ~64 over fewer miss layers) the leg is the dot's, ~155-170 ms: step ~225-240,
 #  4.2-4.5 tok/s; read next at D=512 N=128. straggle_max_us 25,754 once (a parked worker's late wake), parks unchanged.
+# outcome 2 2026-11-07, the serve row (/root/k31-step-union-serve: bloomery-serve built from d0acb7d90, the serve probe at
+#  232G, D=512 N=512, one cold request, load 36 s): tg 4.18 tok/s (the same shape before: 3.80 k31-arena-warm.card, 3.59
+#  k31-arena-mem anon), pp 3.12 (2.6 before: the prompt's steps take the resident path too). iostat decode quarters: nvme0
+#  2.77 -> 2.69 -> 1.42 -> 1.41 GB/s at aqu 6.1 -> 2.9, rareq 1 MiB, r_await ~2.0 ms: the arena warm by the third quarter,
+#  nvme1 idle. [derived] +10 % at N=512 against the warm base; the steady-state half runs near the 4.5 the card predicted.

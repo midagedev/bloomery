@@ -15,7 +15,9 @@ TARBALL=${K31_PROBE_TARBALL:-$HOME/repo/bloomery-k31rel/target/release-dist/bloo
 MODEL=${K31_PROBE_MODEL:-/models/Kimi-K3.1-Pro-IQ1_S/Kimi-K3.1-Pro-IQ1_S-00001-of-00031.gguf}
 D=${K31_PROBE_D:-512}; N=${K31_PROBE_N:-128}; PORT=${K31_PROBE_PORT:-18182}
 IDS=${BLOOMERY_DATA:-/root/bloomery-data}/kimi-k3/corpus-prose.ids
-mkdir -p "$OUT"; rm -f "$OUT"/*
+mkdir -p "$OUT"
+# one K3.1 process on the box at a time: the probe lock the step-stats runner takes too
+exec 9>/root/k31-probe.lock; flock -w 7200 9 || die "k31-probe.lock held for 2 h" 75; rm -f "$OUT"/*
 die() { echo "k31-nvme-probe: $*" >&2; exit "${2:-1}"; }
 [ -n "${K31_PROBE_SERVE:-}" ] || [ -f "$TARBALL" ] || die "no tarball at $TARBALL" 66
 [ -f "$MODEL" ] || die "no model at $MODEL" 66
