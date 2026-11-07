@@ -49,6 +49,7 @@ pub mod iq_tables;
 pub mod kquant;
 pub mod qtype;
 pub mod quant;
+pub mod shard_dirs;
 pub mod v41;
 pub mod write;
 
