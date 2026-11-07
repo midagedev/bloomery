@@ -4,7 +4,7 @@
 # No person is in the loop. Signals are outcomes code can see (tools/review/signals.py); the model only proposes
 # (candidates.json); ledger.py writes the issue body, puts each candidate in force with its guards, renews a lesson
 # that was used and expires one that was not. A maintainer's one move is a veto (strike a line). The logins and the
-# issues-write token never share a job. The engine is chosen as in review.yml (REVIEW_ENGINE, then the fallback).
+# issues-write token never share a job. The engines are chosen as in review.yml (REVIEW_ENGINE, an ordered list).
 name: Shingler learner
 
 on:
@@ -27,9 +27,10 @@ concurrency:
 env:
   CLAUDE_CODE_VERSION: 2.1.284
   REVIEW_MODEL: claude-sonnet-5-5
+  REVIEW_MODEL_GLM: glm-5.3
   CODEX_VERSION: 0.160.0
   REVIEW_CODEX_MODEL: gpt-6.1-sol
-  REVIEW_ENGINE: ${{ vars.REVIEW_ENGINE || 'claude' }}
+  REVIEW_ENGINE: ${{ vars.REVIEW_ENGINE || 'glm,claude,codex' }}
 
 jobs:
   collect:
@@ -71,7 +72,7 @@ jobs:
     needs: collect
     if: needs.collect.outputs.has_signals == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45   # the learner may run on both engines, 15 + 15 minutes (tools/review/run.py MINUTES)
+    timeout-minutes: 60   # the learner may run on all three engines, 3 x 15 minutes (tools/review/run.py MINUTES)
     outputs:
       learned: ${{ steps.learn.outputs.done }}
     permissions:
@@ -86,16 +87,22 @@ jobs:
         with:
           name: signals
           path: ctx
-      # The logins, as in review.yml: each secret is read in this step only.
+      # The logins, as in review.yml: each secret is read in this step to say which engines have one, and again in the
+      # step that runs the engines.
       - name: Logins
         id: logins
         env:
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
           CODEX_HOME: ${{ runner.temp }}/codex-home
         run: |
           set -euo pipefail
-          claude=false; codex=false
+          glm=false; claude=false; codex=false
+          if [ -n "$ZAI_API_KEY" ]; then
+            echo "::add-mask::$ZAI_API_KEY"
+            glm=true
+          fi
           [ -z "$ANTHROPIC_API_KEY" ] || claude=true
           if [ -n "$CODEX_AUTH_JSON" ]; then
             mkdir -m 700 "$CODEX_HOME"
@@ -105,19 +112,23 @@ jobs:
             done || echo "::warning::CODEX_AUTH_JSON is not JSON"
             codex=true
           fi
-          case "$REVIEW_ENGINE" in
-            claude|codex) ;;
-            *) echo "::warning::REVIEW_ENGINE is '$REVIEW_ENGINE', not claude or codex; claude goes first" ;;
-          esac
-          printf 'claude=%s\ncodex=%s\n' "$claude" "$codex" >> "$GITHUB_OUTPUT"
-          echo "logins: claude=$claude codex=$codex; tried first: $REVIEW_ENGINE" | tee -a "$GITHUB_STEP_SUMMARY"
+          set -f
+          for w in $(printf '%s' "$REVIEW_ENGINE" | tr 'A-Z,' 'a-z '); do
+            case "$w" in
+              glm|claude|codex) ;;
+              *) echo "::warning::REVIEW_ENGINE names '$w', which is no engine (glm, claude, codex); it is skipped" ;;
+            esac
+          done
+          set +f
+          printf 'glm=%s\nclaude=%s\ncodex=%s\n' "$glm" "$claude" "$codex" >> "$GITHUB_OUTPUT"
+          echo "logins: glm=$glm claude=$claude codex=$codex; order: $REVIEW_ENGINE (engines it leaves out follow as glm, claude, codex)" | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/cache@v4
         with:
           path: ~/.npm
           key: npm-claude-code-${{ env.CLAUDE_CODE_VERSION }}-codex-${{ env.CODEX_VERSION }}
-      # A failed install leaves that engine out, as in review.yml.
+      # A failed install leaves that engine out, as in review.yml. glm runs the claude CLI.
       - name: Install Claude Code
-        if: steps.logins.outputs.claude == 'true'
+        if: steps.logins.outputs.claude == 'true' || steps.logins.outputs.glm == 'true'
         continue-on-error: true
         run: npm install -g "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
       - name: Install Codex
@@ -137,6 +148,7 @@ jobs:
       - name: Learn
         id: learn
         env:
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1'
           CODEX_HOME: ${{ runner.temp }}/codex-home

@@ -1,8 +1,8 @@
 # Shingler, the review bot
 
 A shingler hammers the slag out of a fresh bloom so the iron can be worked. Shingler does that to pull requests:
-every ready pull request gets one review from Claude or Codex (`.github/workflows/review.yml`; see Engines), and the
-review says yes or no: a CLEAN verdict approves, a MUST_FIX verdict requests changes. With no approvals required, a
+every ready pull request gets one review from the first engine that can (GLM, Claude or Codex;
+`.github/workflows/review.yml`; see Engines), and the review says yes or no: a CLEAN verdict approves, a MUST_FIX verdict requests changes. With no approvals required, a
 change request does not lock the merge button; it says "fix this first", and the bot's next review of a new head
 replaces it.
 `tools/review/post.py` decides the event in code, not the model: APPROVE needs the CLEAN verdict, the decision file agreeing, the validator finished, and no changed file under
@@ -31,7 +31,7 @@ issue (below) and, once settled, in `escape-catalog.md`.
 |---|---|---|
 | gate | read token | skips drafts, bots, the `no-review` label and a PR past `REVIEW_CAP` automatic reviews; finds the last reviewed head for an incremental review |
 | diagnostics | read token, no key | runs dryer and crapper (`tools/review/diagnostics.py`) on the changed Rust code |
-| review | the logins, read token | builds the context (diff, PR text, files, open bot issues), runs the reviewer, then the validator in a fresh context (`tools/review/run.py` on `run-claude.sh` or `run-codex.sh`), checks the output (`tools/review/post.py check`) |
+| review | the logins, read token | builds the context (diff, PR text, files, open bot issues), runs the reviewer, then the validator in a fresh context (`tools/review/run.py` on `run-claude.sh`, for the glm and claude engines, or `run-codex.sh`), checks the output (`tools/review/post.py check`) |
 | post | pull-requests and issues write, no key | files proven defects outside the PR as `review-bot` issues (at most 2, deduplicated by title), posts the review |
 | learner (weekly, its own workflow) | collect: read token; learn: the key; update: issues write | outcomes by code, lesson candidates by the model, the ledger issue (in force, renewed, expired) by `ledger.py` |
 
@@ -77,7 +77,7 @@ $0.20 a run).
 
 The workflow runs on `pull_request_target`, so a fork's PR gets the key. In exchange:
 - The workflow, the instructions and `tools/review/` come from the base branch; a PR cannot change what reviews it.
-- Claude executes nothing from the PR. It runs with its working directory in an empty output directory (so a PR's
+- Claude (the claude and glm engines) executes nothing from the PR. It runs with its working directory in an empty output directory (so a PR's
   `.claude/settings.json` hooks, `.mcp.json` and `CLAUDE.md` never load), the PR tree, base tree and context added
   read-only, `--permission-mode dontAsk`, Read only inside those four directories, Write only to the output
   directory, no Bash, no web, no subagents. A local test with a planted hook, a Bash request and reads and writes
@@ -92,19 +92,19 @@ The workflow runs on `pull_request_target`, so a fork's PR gets the key. In exch
   directory only, and use no network (`permissions.review.network.enabled=false`). The login
   (`$RUNNER_TEMP/codex-home/auth.json`) is in none of those. No `AGENTS.md` is loaded, no parent directory is a
   project root, Codex's user config and rules are skipped, hooks, plugins, memories, apps, image generation, web
-  search and sub-agents are off, commands get the core environment only, and `run.py` keeps `ANTHROPIC_API_KEY` out
-  of the Codex process.
+  search and sub-agents are off, commands get the core environment only, and `run.py` keeps `ANTHROPIC_API_KEY`, `ZAI_API_KEY` and a runner's
+  Anthropic endpoint and token out of the Codex process.
 - Before each Codex run, `run-codex.sh` checks the profile through `codex sandbox`: a read in the base tree and a
   write to the output directory must work, and a read of a file it puts beside `auth.json`, a write into the PR tree
   and a TCP connection to 1.1.1.1:443 must fail. If any goes the wrong way, or the sandbox does not start, Codex does
-  not run (exit 69) and Claude reviews. The check judges by what happened (the file read or not, written or not),
+  not run (exit 69) and the next engine reviews. The check judges by what happened (the file read or not, written or not),
   not by the error, since bubblewrap hides a path (`No such file or directory`) where Seatbelt refuses it
   (`Operation not permitted`). Measured with Codex 0.160.0 on macOS (Seatbelt) and as root in a privileged Ubuntu
   24.04 container on arm64 (bubblewrap): the reads and writes went as above and the connection failed. As a non-root
   user in that container bubblewrap did not start (the host's AppArmor user namespace gate, which the workflow's
   sysctl step opens on the runner), and the check kept Codex from running.
 - If a planted instruction still got a token into the output, `run.py` and `post.py check` refuse it: the value of
-  `ANTHROPIC_API_KEY`, every long string of `auth.json`, read before and after the run (Codex rewrites the file when
+  `ANTHROPIC_API_KEY` and `ZAI_API_KEY`, every long string of `auth.json`, read before and after the run (Codex rewrites the file when
   it refreshes), and token shapes such as a JWT. A review that quotes a JWT from the pull request (a test fixture,
   say) is therefore not posted. An engine writes its transcript and output to a private directory; `run.py` replaces
   the same strings there and only then copies them into the trace artifact and the job log, also when the run is
@@ -112,14 +112,23 @@ The workflow runs on `pull_request_target`, so a fork's PR gets the key. In exch
   log. The output directory may hold only regular files and directories: a symbolic link there (one to the login's
   directory, say) would put outside files into the copy of the output that the next engine reads, so `run.py` and
   `post.py check` refuse it like a credential. What stays: a token that leaves in another form (split or encoded) is
-  not caught, and whatever Codex reads is sent to OpenAI as model context, as Claude's reads go to Anthropic.
+  not caught, and whatever Codex reads is sent to OpenAI as model context, as Claude's reads go to Anthropic and glm's to z.ai.
 
 ## Engines
 
-`REVIEW_ENGINE`, a repository variable (`claude` when unset, or `codex`), names the engine tried first; the other is
-the fallback. Each is tried only when its login is there (the secret `ANTHROPIC_API_KEY` for Claude, the secret
-`CODEX_AUTH_JSON` for Codex) and its CLI installed. With only `ANTHROPIC_API_KEY`, Claude runs with the same script,
-model, flags and prompts as before Codex. What changes for that setup too:
+`REVIEW_ENGINE`, a repository variable, is an ordered, comma-separated list of engines (`glm,codex,claude`; one word
+is a list of one; `glm,claude,codex` when unset). The engines it names are tried in that order and the ones it leaves
+out follow in the order glm, claude, codex; a word that is no engine is named in the log and skipped. Each engine is tried
+only when its login is there and its CLI installed:
+
+| Engine | Login | Runs |
+|---|---|---|
+| `glm` | the secret `ZAI_API_KEY` | `run-claude.sh` with the key as `ANTHROPIC_AUTH_TOKEN`, `ZAI_BASE_URL` (default `https://api.z.ai/api/anthropic`) as `ANTHROPIC_BASE_URL` and `REVIEW_MODEL_GLM` (`glm-5.3`) as the model; the Claude Code CLI |
+| `claude` | the secret `ANTHROPIC_API_KEY` | `run-claude.sh` with `REVIEW_MODEL` (`claude-sonnet-5-5`); the Claude Code CLI |
+| `codex` | the secret `CODEX_AUTH_JSON` | `run-codex.sh`; the Codex CLI |
+
+With only `ANTHROPIC_API_KEY`, Claude runs with the same script, model, flags and prompts as before Codex. What
+changes for that setup too:
 - a run that has not finished after 20 minutes (reviewer), 10 (validator) or 15 (learner) is stopped and counts as
   failed;
 - a role counts as done only when this run left its files (below), so a validator or learner that wrote nothing
@@ -128,11 +137,21 @@ model, flags and prompts as before Codex. What changes for that setup too:
   week) instead of failing;
 - the usage JSON and marker carry `engine`, and the usage JSON keeps the whole last error message.
 
+Each engine's process gets its own login only. The glm process has no `ANTHROPIC_API_KEY`; the claude process has no
+`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN` or `CLAUDE_CODE_USE_*` switch a runner left behind; neither has
+`ZAI_API_KEY`. glm pins every model alias Claude Code can ask for (opus, sonnet, haiku, the small-fast and subagent
+models) to the one model, since z.ai answers an id it is given without saying what answered, and sets
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` to 1M because Claude Code enforces 200,000 for a model it does not know.
+
+z.ai streams each request's usage as zeros and reports the run's totals only in the final result, and Claude Code's
+own price list is applied to a model it does not know, while the coding plan is billed in prompts. So a glm run's usage
+JSON has `cost_usd` and `context_max` empty and `context_sum` from the totals (`tools/review/usage.py`).
+
 `CODEX_AUTH_JSON` holds a whole `auth.json` as `codex login` writes it (`~/.codex/auth.json` with file storage). A
 ChatGPT login has no per-run price, so its `cost_usd` is empty; an API key login (`codex login --with-api-key`)
 writes an `auth.json` too and goes in the same secret.
 
-`tools/review/run.py` runs each role (reviewer, validator, learner). It moves to the other engine when a run exits
+`tools/review/run.py` runs each role (reviewer, validator, learner). It moves to the next engine when a run exits
 non-zero (a usage or rate limit, a refused or expired login, a CLI error, Codex's failed sandbox check), runs past
 its minutes, or did not leave the role's files in the output directory: review.md with a verdict line and
 decision.txt for the reviewer; a new `<!-- validator: … -->` line in review.md for the validator (its
@@ -147,11 +166,14 @@ Which engine did each role is in the job summary (`reviewer: done by codex`) and
 Codex runs `gpt-6.1-sol` at `xhigh` effort; `CODEX_VERSION` pins the CLI at 0.160.0, the version this was tested
 with.
 
-When the stored login stops working, Codex fails with a login error, and the summary says so; while
-`ANTHROPIC_API_KEY` is set, Claude reviews instead. Run `codex login` again and replace the secret.
+When the stored login stops working, Codex fails with a login error, and the summary says so; the next engine in the
+order reviews instead. Run `codex login` again and replace the secret. A z.ai usage or rate limit (`429`, `[1308]`,
+`[1302]`) reads as a limit in the summary, and the next engine reviews.
 
 By hand, `run-codex.sh` takes `run-claude.sh`'s arguments and uses `~/.codex` when `CODEX_HOME` is unset, including
-the `AGENTS.md` there.
+the `AGENTS.md` there. `tools/review/local.py` (`just pre-review`) runs the reviewer on this machine: the first of `glm`
+and `claude` that `REVIEW_ENGINE` names, `claude` (the caller's own login) when it names neither, and `ZAI_API_KEY` in the
+environment for `glm`; it has no fallback and does not run Codex.
 
 ## Approve or request changes, and what that costs
 
@@ -196,7 +218,7 @@ mutation check in words for each new or changed test instead.
 ## Cost and token accounting
 
 GitHub-hosted runners are free for a public repository, so the runner minutes cost nothing; the cost is API tokens
-(or a ChatGPT plan's usage, for Codex on a ChatGPT login).
+(or a ChatGPT plan's usage, for Codex on a ChatGPT login, or z.ai coding-plan prompts, for glm).
 Every run keeps what a later optimization needs:
 - the job summary has one line per role (turns, requests, cost, the largest context, the summed context, output
   tokens, tool calls by tool, denials, distinct files read);
@@ -211,8 +233,9 @@ not the prose written. The knobs below act on that.
 
 | Knob | Now | Where |
 |---|---|---|
-| engine tried first | `claude` | `REVIEW_ENGINE` repository variable |
+| engines and their order | `glm,claude,codex` | `REVIEW_ENGINE` repository variable |
 | model, effort | `claude-sonnet-5-5`, high | `REVIEW_MODEL` in the workflow, `run-claude.sh` |
+| glm model, endpoint | `glm-5.3`, `https://api.z.ai/api/anthropic`, high | `REVIEW_MODEL_GLM` in the workflows, `ZAI_BASE_URL`, `tools/review/run.py` |
 | turns | reviewer 60, validator 30 | `run-claude.sh` |
 | Codex model, effort, CLI | `gpt-6.1-sol`, xhigh, 0.160.0 | `REVIEW_CODEX_MODEL`, `CODEX_VERSION` in the workflows, `run-codex.sh` |
 | Codex service tier | the account's default | `REVIEW_CODEX_TIER` (unset in the workflows; a tier the model does not offer fails the run), `run-codex.sh` |

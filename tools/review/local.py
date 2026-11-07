@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Shingler's reviewer on this machine, before a push: the PR review's own instructions, catalog and ledger, run through
-the base tree's tools/review/run-claude.sh under the caller's own Claude login (`just pre-review`).
+the base tree's tools/review/run-claude.sh under the caller's own Claude login (`just pre-review`), or on GLM when
+REVIEW_ENGINE selects glm (the workflow's glm engine, tools/review/run.py; the key is ZAI_API_KEY in the environment).
 
     tools/review/local.py [--base REF] [--full] [--minutes N] [--body FILE] [--no-pre-checks]
     tools/review/local.py --self-test
@@ -31,13 +32,16 @@ marker name that only a hand-run check-levers caught.
 Two pre-reviews run at once; a third waits on a flock slot. device-dirs.txt is cached by the base sha, and the
 summary's context time starts after the pre-checks.
 
-`claude --version` runs first on a real review. A binary that is on PATH and does not answer is a broken install.
+`claude --version` runs first on a real review, for glm too (the same CLI). A binary that is on PATH and does not answer
+is a broken install. Only glm and claude run here, one engine and no fallback: the first of them REVIEW_ENGINE
+names, claude when it names neither.
 
 Prints the verdict, the must-fix titles and where the output is (~/.cache/bloomery/pre-review/<branch>-<sha8>/).
 A CLEAN review also prints one line for the pull request body, with the full HEAD sha.
 A base that lacks commits origin/main has is behind it and is refused by name before the reviewer runs.
 A missing origin/main is not that case. A failed ancestry walk stops 70.
-Exit: 0 CLEAN; 1 MUST_FIX or a red pre-check; 75 no claude CLI, a broken install, or a role past --minutes (default 10); 64 usage,
+Exit: 0 CLEAN; 1 MUST_FIX or a red pre-check; 75 no claude CLI, a broken install, glm selected without ZAI_API_KEY, or a role
+past --minutes (default 10); 64 usage,
 or a base behind origin/main; 65 output post.py refused
 or a review with no verdict; 70 a context step or a git command that failed (named).
 The failure it blocks: a pull request whose first Shingler review is a MUST_FIX, each fold another 10-27 minute round.
@@ -63,11 +67,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from carry import GitSource, decide, reviewer_id  # noqa: E402
 from post import MARKER, VERDICT_RE, carry_review, footer  # noqa: E402
-from run import MINUTES, TIMEOUT, launch, produced  # noqa: E402
+from run import MINUTES, TIMEOUT, launch, produced, words  # noqa: E402
 sys.path.insert(0, os.path.dirname(HERE))
 from recipes import RecipeError, archive  # noqa: E402
 
 REPO = "midagedev/bloomery"
+LOCAL_ENGINES = ("glm", "claude")
 # (script, the path prefixes that run it): a text-only check of PR_TREE, run when the branch changes one of them
 PRE_CHECKS = (("tools/check-levers.sh", ("tools/", "justfile", ".cargo/", "crates/")),)
 NET_S = 60  # each gh or git fetch call: past it the step reads as unanswered, never as a hang
@@ -368,7 +373,13 @@ def diag(ctx, base_tree, base_sha, head, say):
                 f.write(NO_DIAG + "\n")
 
 
-def run_role(role, d, minutes, say):
+def local_engine(env):
+    """The first of LOCAL_ENGINES that REVIEW_ENGINE names; claude, the caller's own login, when it names neither."""
+    named = [w for w in words(env.get("REVIEW_ENGINE")) if w in LOCAL_ENGINES]
+    return named[0] if named else "claude"
+
+
+def run_role(role, d, minutes, say, engine="claude"):
     """One role through the base tree's run-claude.sh, by the workflow's own launcher (run.py): its own process group,
     stopped past the bound or when we are; its output in trace/<role>.log, whose summary line is printed. Its rc, TIMEOUT
     past the bound. A role that ends 0 without its output (run.py's produced: the validator's line in review.md, the
@@ -378,7 +389,7 @@ def run_role(role, d, minutes, say):
     with tempfile.TemporaryDirectory() as snap:
         before = os.path.join(snap, "out")
         shutil.copytree(paths[3], before)
-        rc = launch("claude", role, paths, dict(os.environ, REVIEW_SETTING_SOURCES="project"))
+        rc = launch(engine, role, paths, dict(os.environ, REVIEW_SETTING_SOURCES="project"))
         if rc == 0:
             reason = produced(role, paths[3], before)
             if reason:
@@ -423,6 +434,9 @@ def must_fix_titles(body):
 
 
 def review(args, stubbed=False, say=lambda m: print(m, file=sys.stderr)):
+    engine = local_engine(os.environ)
+    if engine == "glm" and not os.environ.get("ZAI_API_KEY"):
+        raise Stop(75, "pre-review: REVIEW_ENGINE selects glm and ZAI_API_KEY is not set; nothing was reviewed")
     slot = None if stubbed else review_slot(say)  # held until this review returns
     if not stubbed and not shutil.which("claude"):
         raise Stop(75, "pre-review: no claude CLI on PATH; nothing was reviewed")
@@ -470,7 +484,7 @@ def review(args, stubbed=False, say=lambda m: print(m, file=sys.stderr)):
                 roles = ()
                 carry_review(os.path.join(d, "ctx/carry.json"), os.path.join(d, "ctx/prev-review.md"), os.path.join(d, "out"))
             for role in roles:
-                rc = run_role(role, d, args.minutes, say)
+                rc = run_role(role, d, args.minutes, say, engine)
                 if rc == TIMEOUT:
                     raise Stop(75, f"pre-review: the {role} ran past {args.minutes} min; no verdict (push is your call); see {keep}")
                 if rc:
@@ -485,6 +499,7 @@ def review(args, stubbed=False, say=lambda m: print(m, file=sys.stderr)):
                             "--diff", os.path.join(d, "ctx/diff.patch"), "--pr-json", os.path.join(d, "ctx/pr.json"),
                             "--files", os.path.join(d, "ctx/files.txt"), "--device", os.path.join(d, "ctx/device-dirs.txt"),
                             "--base", os.path.join(d, "base"), "--secret-env", "ANTHROPIC_API_KEY",
+                            "--secret-env", "ZAI_API_KEY",
                             *[a for u in usages if os.path.isfile(u) for a in ("--usage", u)]],
                            capture_output=True, text=True)
         for x in ("ctx", "out", "trace"):
@@ -498,6 +513,7 @@ def review(args, stubbed=False, say=lambda m: print(m, file=sys.stderr)):
     titles = must_fix_titles(body)
     who = ("no reviewer: the approval of the reviewed head carries" if meta["mode"] == "carry"
            else "reviewer + validator" if args.full else "reviewer")
+    who += " on glm" if engine == "glm" else ""
     print(f"pre-review: {m.group(1)} — {meta['mode']} review of {head[:8]} against {args.base} "
           f"({who}, {time.time() - t0:.0f} s of which context {t_ctx:.0f} s)")
     for t in titles[:12]:
@@ -788,8 +804,9 @@ def self_test():
         open(os.path.join(repo, "a.txt"), "w").write("a\nb\n")
         sh("git", "commit", "-qam", "topic: one line")
 
-        def runner(text, sleep=0):
+        def runner(text, sleep=0, dump=None):
             open(stub, "w").write("#!/usr/bin/env bash\nout=$5\n" + (f"sleep {sleep}\n" if sleep else "")
+                                  + (f'env > "{dump}"\n' if dump else "")
                                   + f"cat > \"$out/review.md\" <<'EOF'\n{text}\nEOF\n"
                                   + "case \"$(head -1 \"$out/review.md\")\" in *MUST_FIX*) echo MUST_FIX ;; *) echo CLEAN ;; esac > \"$out/decision.txt\"\n")
 
@@ -811,11 +828,11 @@ def self_test():
         # origin/main at the base: the branch's base is not behind it. A later case moves it ahead.
         sh("git", "update-ref", "refs/remotes/origin/main", "basebr")
         try:
-            def go(text, sleep=0, minutes=10):
+            def go(text, sleep=0, minutes=10, dump=None):
                 a = argparse.Namespace(base="basebr", full=False, minutes=minutes, body=None, no_pre_checks=False)
                 msgs = []
                 try:
-                    runner(text, sleep)
+                    runner(text, sleep, dump)
                     return review(a, stubbed=True, say=msgs.append), msgs
                 except Stop as e:
                     return e.code, msgs + [e.msg]
@@ -825,6 +842,53 @@ def self_test():
                 rc, _ = go("**Verdict: CLEAN**: fine\n\n### Checked\nall")
             expect(rc == 0, f"a CLEAN review ends 0 (got {rc})")
             expect("$" not in buf.getvalue(), f"accounting that is not available is not printed as a cost: {buf.getvalue()!r}")
+            expect(" on glm" not in buf.getvalue(), f"a claude review does not name glm: {buf.getvalue()!r}")
+            # REVIEW_ENGINE selects the engine: the first of glm and claude it names, claude otherwise; glm needs
+            # ZAI_API_KEY, and its script runs with the key as the token, z.ai's endpoint and no ANTHROPIC_API_KEY
+            for spec, want in ((None, "claude"), ("glm", "glm"), ("codex,glm,claude", "glm"), ("claude,glm", "claude"),
+                               ("codex", "claude"), ("gpt", "claude"), ("", "claude")):
+                got = local_engine({} if spec is None else {"REVIEW_ENGINE": spec})
+                expect(got == want, f"REVIEW_ENGINE={spec!r} runs {want} here: {got}")
+            def routing(c):
+                return sorted(k for k in c if k.startswith(("ANTHROPIC_API", "ANTHROPIC_AUTH", "ANTHROPIC_BASE", "ZAI_", "REVIEW_", "CLAUDE_CODE_USE_")))
+
+            keys = ("REVIEW_ENGINE", "ZAI_API_KEY", "ANTHROPIC_API_KEY")
+            saved_keys = {k: os.environ.get(k) for k in keys}
+            try:
+                os.environ.update(REVIEW_ENGINE="glm", ANTHROPIC_API_KEY="sk-local-test")
+                os.environ.pop("ZAI_API_KEY", None)
+                rc, msgs = go("**Verdict: CLEAN**: should not run\n\n### Checked\nall")
+                expect(rc == 75 and "ZAI_API_KEY is not set" in msgs[-1],
+                       f"glm without ZAI_API_KEY ends 75 by name before any role: {rc} {msgs}")
+                os.environ["ZAI_API_KEY"] = "zai-local-test-key"
+                seen_env = os.path.join(t, "child.env")
+                shown = io.StringIO()
+                with contextlib.redirect_stdout(shown):
+                    rc, msgs = go("**Verdict: CLEAN**: fine\n\n### Checked\nall", dump=seen_env)
+                child = dict(l.split("=", 1) for l in open(seen_env).read().splitlines() if "=" in l)
+                expect(rc == 0 and "reviewer on glm" in shown.getvalue(), f"a glm review ends 0 and says so: {rc} {shown.getvalue()!r}")
+                expect("ANTHROPIC_API_KEY" not in child and "ZAI_API_KEY" not in child and child.get("REVIEW_RUN_ENGINE") == "glm"
+                       and child.get("ANTHROPIC_AUTH_TOKEN") == "zai-local-test-key"
+                       and child.get("ANTHROPIC_BASE_URL") == "https://api.z.ai/api/anthropic"
+                       and child.get("REVIEW_MODEL") == "glm-5.3" and child.get("REVIEW_SETTING_SOURCES") == "project",
+                       f"the glm role's script holds the z.ai login and no Anthropic key: {routing(child)}")
+                rc, msgs = go("**Verdict: CLEAN**: zai-local-test-key\n\n### Checked\nall")
+                expect(rc == 65 and "post.py check refused" in msgs[-1], f"a review that carries the z.ai key is refused 65: {rc} {msgs[-1:]}")
+                os.environ["REVIEW_ENGINE"] = "claude"
+                os.environ["ANTHROPIC_BASE_URL"] = "http://leftover.invalid"
+                os.environ["CLAUDE_CODE_USE_FOUNDRY"] = "1"
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc, _ = go("**Verdict: CLEAN**: fine\n\n### Checked\nall", dump=seen_env)
+                child = dict(l.split("=", 1) for l in open(seen_env).read().splitlines() if "=" in l)
+                expect(rc == 0 and child.get("ANTHROPIC_API_KEY") == "sk-local-test" and "ZAI_API_KEY" not in child
+                       and "ANTHROPIC_BASE_URL" not in child and "CLAUDE_CODE_USE_FOUNDRY" not in child
+                       and child.get("REVIEW_RUN_ENGINE") == "claude",
+                       f"the claude role keeps its own login and no runner's endpoint: {routing(child)}")
+            finally:
+                os.environ.pop("ANTHROPIC_BASE_URL", None)
+                os.environ.pop("CLAUDE_CODE_USE_FOUNDRY", None)
+                for k, v in saved_keys.items():
+                    os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
             head_sha = git("rev-parse", "HEAD").strip()
             expect(f"pre-review: PR body: Pre-review CLEAN at {head_sha}." in buf.getvalue().splitlines(),
                    f"a CLEAN review prints one PR-body line with the full HEAD sha: {buf.getvalue()!r}")
