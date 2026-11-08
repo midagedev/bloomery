@@ -426,8 +426,8 @@ mod gate {
         Split(u64, u64, u64),
     }
 
-    fn cut(inputs: &PlanInputs, machine: &Machine, levers: &PlanLevers) -> Cut {
-        match inputs.plan(machine, CTX as u64, levers) {
+    fn cut(inputs: &PlanInputs, machine: &Machine, ctx: u64, levers: &PlanLevers) -> Cut {
+        match inputs.plan(machine, ctx, levers) {
             Ok(plan) => {
                 let (stage, tier, host) = totals(&layer_splits(&plan));
                 Cut::Split(stage, tier, host)
@@ -437,17 +437,17 @@ mod gate {
         }
     }
 
-    /// The plans the card budgets give, one [`Budget`] per distinct split:
+    /// The plans the card budgets give at a context of `ctx` positions, one [`Budget`] per distinct split:
     /// the budgets between the first that plans and the first that leaves the tier idle (a plan
     /// is refused for room below the one and every expert sits on the stage above the other, the
     /// window being the experts' bytes and the allocator's shared granules), found by bisection
     /// from the header's budget and then scanned in 512 steps.
-    fn split_table(inputs: &PlanInputs, header: u64) -> Result<Vec<Budget>, GateError> {
+    fn split_table(inputs: &PlanInputs, ctx: u64, header: u64) -> Result<Vec<Budget>, GateError> {
         let machine = bp_machine(inputs)?;
         let top = header
             .checked_mul(2)
             .ok_or("the header's budget doubles past u64")?;
-        match cut(inputs, &machine, &under(top)) {
+        match cut(inputs, &machine, ctx, &under(top)) {
             Cut::Idle => {}
             Cut::Short(why) => {
                 return Err(
@@ -465,7 +465,7 @@ mod gate {
         let (mut short, mut plans) = (0u64, top);
         while plans - short > 1 {
             let mid = short + (plans - short) / 2;
-            if matches!(cut(inputs, &machine, &under(mid)), Cut::Short(_)) {
+            if matches!(cut(inputs, &machine, ctx, &under(mid)), Cut::Short(_)) {
                 short = mid;
             } else {
                 plans = mid;
@@ -474,7 +474,7 @@ mod gate {
         let first = plans;
         // The first budget that leaves the tier idle: bisect (not idle, idle).
         let (mut busy, mut idle) = (first, top);
-        if matches!(cut(inputs, &machine, &under(first)), Cut::Idle) {
+        if matches!(cut(inputs, &machine, ctx, &under(first)), Cut::Idle) {
             return Err(format!(
                 "the first budget that plans ({first} B) already leaves the tier idle: no split"
             )
@@ -482,7 +482,7 @@ mod gate {
         }
         while idle - busy > 1 {
             let mid = busy + (idle - busy) / 2;
-            if matches!(cut(inputs, &machine, &under(mid)), Cut::Idle) {
+            if matches!(cut(inputs, &machine, ctx, &under(mid)), Cut::Idle) {
                 idle = mid;
             } else {
                 busy = mid;
@@ -492,7 +492,7 @@ mod gate {
         let mut out: Vec<Budget> = Vec::new();
         let mut b = first;
         while b < idle {
-            if let Cut::Split(stage, tier, host) = cut(inputs, &machine, &under(b))
+            if let Cut::Split(stage, tier, host) = cut(inputs, &machine, ctx, &under(b))
                 && out
                     .last()
                     .is_none_or(|l| (l.stage, l.tier, l.host) != (stage, tier, host))
@@ -553,13 +553,13 @@ mod gate {
         };
         let of =
             |tier: u64| levers_of(CardBudget::Per(vec![(s.ordinal, stage), (t.ordinal, tier)]));
-        if matches!(cut(inputs, &machine, &of(stage)), Cut::Short(_)) {
+        if matches!(cut(inputs, &machine, CTX as u64, &of(stage)), Cut::Short(_)) {
             return Ok(None);
         }
         let (mut short, mut plans) = (0u64, stage);
         while plans - short > 1 {
             let mid = short + (plans - short) / 2;
-            if matches!(cut(inputs, &machine, &of(mid)), Cut::Short(_)) {
+            if matches!(cut(inputs, &machine, CTX as u64, &of(mid)), Cut::Short(_)) {
                 short = mid;
             } else {
                 plans = mid;
@@ -751,7 +751,7 @@ mod gate {
             return Err(format!("{PROMPT} + {STEPS} positions, the caches hold {CTX}").into());
         }
         let prompt = e2e::walk(PROMPT, inputs.hp.n_vocab);
-        let table = split_table(&inputs, header)?;
+        let table = split_table(&inputs, CTX as u64, header)?;
         let budget = pick_budget(&table)?;
         let host = levers.host();
         let want = whole(&prompt)?;
@@ -1670,7 +1670,7 @@ mod gate {
     fn pass_past_top_k(inputs: &PlanInputs, header: u64, host: HostCfg) -> Result<bool, GateError> {
         let path = k31_fixture(inputs)?;
         let inputs31 = PlanInputs::read_without_chat(&Split::open(&path)?)?;
-        let table = split_table(&inputs31, &bp_machine(&inputs31)?, DSA_CTX as u64, header)?;
+        let table = split_table(&inputs31, DSA_CTX as u64, header)?;
         let budget = pick_budget(&table)?;
         let shape = PASS_SHAPES[0];
         let (pass_inputs, machine, mut at) = pass_plan_inputs(&inputs31, budget, shape, false)?;
