@@ -71,6 +71,8 @@ struct Acc {
     ns_gather: u64,
     ns_span: u64,
     ns_slowest: u64,
+    ns_idle: u64,
+    ns_late: u64,
 }
 
 static LEVEL: OnceLock<u8> = OnceLock::new();
@@ -109,6 +111,13 @@ pub struct CallAcc {
     /// answer "is a dispatch slow because of the pool or because one worker is".
     ns_span: u64,
     ns_slowest: u64,
+    /// Profiled runs — the dispatch's wall less its chunks' mean busy time:
+    /// what an average participant spent outside its chunk, late to start or
+    /// done before the last one ended.
+    ns_idle: u64,
+    /// Profiled runs — the chunks' mean start after the dispatch began: the
+    /// wake share of `ns_idle`.
+    ns_late: u64,
 }
 
 impl CallAcc {
@@ -137,6 +146,11 @@ impl CallAcc {
         self.ns_slowest += slowest_ns;
     }
 
+    pub fn add_idle(&mut self, idle_ns: u64, late_ns: u64) {
+        self.ns_idle += idle_ns;
+        self.ns_late += late_ns;
+    }
+
     /// Fold a finished worker accumulator into this one. The row-parallel sites
     /// build one `CallAcc` per pool chunk and merge them after the join, so
     /// [`record`] still fires exactly once per call and the accumulator mutex
@@ -148,6 +162,8 @@ impl CallAcc {
         self.ns_gather += other.ns_gather;
         self.ns_span += other.ns_span;
         self.ns_slowest += other.ns_slowest;
+        self.ns_idle += other.ns_idle;
+        self.ns_late += other.ns_late;
     }
 
     /// Every stage scaled by `num/den` — a mixed group's per-type share of
@@ -166,6 +182,8 @@ impl CallAcc {
             ns_gather: f(self.ns_gather),
             ns_span: f(self.ns_span),
             ns_slowest: f(self.ns_slowest),
+            ns_idle: f(self.ns_idle),
+            ns_late: f(self.ns_late),
         }
     }
 }
@@ -198,6 +216,8 @@ pub fn record(
     e.ns_gather += acc.ns_gather;
     e.ns_span += acc.ns_span;
     e.ns_slowest += acc.ns_slowest;
+    e.ns_idle += acc.ns_idle;
+    e.ns_late += acc.ns_late;
 }
 
 /// The typeless sibling of [`record`]: a site that reads no weight matrix of its
@@ -313,7 +333,7 @@ pub fn report(wall_ns: u64, label: &str) -> String {
     );
     if lvl >= 2 {
         out.push_str(&format!(
-            "{:<20} {:<6} {:>8} {:>10} {:>10} {:>10} {:>7} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}\n",
+            "{:<20} {:<6} {:>8} {:>10} {:>10} {:>10} {:>7} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}\n",
             "site",
             "ty",
             "calls",
@@ -326,12 +346,24 @@ pub fn report(wall_ns: u64, label: &str) -> String {
             "dot ms",
             "gather ms",
             "span ms",
-            "slowest ms"
+            "slowest ms",
+            "idle ms",
+            "late ms"
         ));
     } else {
         out.push_str(&format!(
-            "{:<20} {:<6} {:>8} {:>10} {:>10} {:>10} {:>7} {:>10} {:>10}\n",
-            "site", "ty", "calls", "rows", "weight MB", "ms", "% wall", "span ms", "slowest ms"
+            "{:<20} {:<6} {:>8} {:>10} {:>10} {:>10} {:>7} {:>10} {:>10} {:>10} {:>10}\n",
+            "site",
+            "ty",
+            "calls",
+            "rows",
+            "weight MB",
+            "ms",
+            "% wall",
+            "span ms",
+            "slowest ms",
+            "idle ms",
+            "late ms"
         ));
     }
     for ((site, ty), a) in rows {
@@ -359,21 +391,25 @@ pub fn report(wall_ns: u64, label: &str) -> String {
         );
         if lvl >= 2 {
             out.push_str(&format!(
-                "{} {} {} {} {} {} {}\n",
+                "{} {} {} {} {} {} {} {} {}\n",
                 base,
                 ms(a.ns_quant_act),
                 ms(a.ns_dequant_w),
                 ms(a.ns_dot),
                 ms(a.ns_gather),
                 ms(a.ns_span),
-                ms(a.ns_slowest)
+                ms(a.ns_slowest),
+                ms(a.ns_idle),
+                ms(a.ns_late)
             ));
         } else {
             out.push_str(&format!(
-                "{} {} {}\n",
+                "{} {} {} {} {}\n",
                 base,
                 ms(a.ns_span),
-                ms(a.ns_slowest)
+                ms(a.ns_slowest),
+                ms(a.ns_idle),
+                ms(a.ns_late)
             ));
         }
     }

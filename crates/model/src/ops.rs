@@ -397,6 +397,8 @@ struct RowChunk {
     who: Option<usize>,
     /// The chunk's own wall, profiled runs only.
     busy_ns: u64,
+    /// When the chunk began, profiled runs only.
+    began: Option<Instant>,
     acc: profile::CallAcc,
     err: Option<crate::ModelError>,
 }
@@ -4192,28 +4194,39 @@ fn tile_cost_of(ty: GgmlType, k: usize, ne1: usize) -> Option<u64> {
 struct Lane {
     next: std::sync::atomic::AtomicUsize,
     end: usize,
-    /// Units per claim. Per lane, not per dispatch: cost-cut lanes differ in
-    /// unit count, and a lane of few expensive units claimed as one block
-    /// leaves its tail nothing to share.
+    /// The most units one claim takes. Per lane, not per dispatch: cost-cut
+    /// lanes differ in unit count, and a lane of few expensive units claimed
+    /// as one block leaves its tail nothing to share.
     block: usize,
+    /// The fewest units one claim takes while the lane holds that many: a
+    /// claim takes a quarter of what is left ([`STEAL_BLOCKS`]) between the
+    /// two, so the lane's claims shrink as it runs out.
+    floor: usize,
 }
 const MAX_LANES: usize = 64;
 
 impl Lane {
-    /// The lane over the walk's positions `start..end`: its steal block a
-    /// quarter of it ([`STEAL_BLOCKS`]), capped by the set's
-    /// [`RowSet::block_cap`]; with stealing off the whole lane is one block.
+    /// The lane over the walk's positions `start..end`: a claim takes a
+    /// quarter of what is left ([`STEAL_BLOCKS`]), at most a quarter of the
+    /// lane and at least a [`TAIL_BLOCKS`]-th of it. A set with a
+    /// [`RowSet::block_cap`] claims fixed blocks of a quarter of the lane
+    /// capped by it; with stealing off the whole lane is one block.
     fn of(start: usize, end: usize, steal: bool, total_rows: usize, cap: Option<usize>) -> Lane {
-        let block = if steal {
-            let block = ((end - start) / STEAL_BLOCKS).max(1);
-            cap.map_or(block, |cap| block.min(cap))
+        let (block, floor) = if steal {
+            let len = end - start;
+            let block = (len / STEAL_BLOCKS).max(1);
+            match cap {
+                Some(cap) => (block.min(cap), block.min(cap)),
+                None => (block, (len / TAIL_BLOCKS).clamp(1, block)),
+            }
         } else {
-            total_rows.max(1)
+            (total_rows.max(1), total_rows.max(1))
         };
         Lane {
             next: std::sync::atomic::AtomicUsize::new(start),
             end,
             block,
+            floor,
         }
     }
 
@@ -4222,13 +4235,22 @@ impl Lane {
     /// costs a read, not a write.
     #[inline]
     fn claim(&self) -> Option<Range<usize>> {
-        if self.next.load(std::sync::atomic::Ordering::Relaxed) >= self.end {
-            return None;
+        let mut from = self.next.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            if from >= self.end {
+                return None;
+            }
+            let take = ((self.end - from) / STEAL_BLOCKS).clamp(self.floor, self.block);
+            match self.next.compare_exchange_weak(
+                from,
+                from + take,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(from..self.end.min(from + take)),
+                Err(now) => from = now,
+            }
         }
-        let from = self
-            .next
-            .fetch_add(self.block, std::sync::atomic::Ordering::Relaxed);
-        (from < self.end).then(|| from..self.end.min(from + self.block))
     }
 }
 
@@ -4258,9 +4280,13 @@ fn parse_steal(v: Option<&str>) -> bool {
     }
 }
 
-/// Blocks a lane is cut into: the barrier waits for at most one block per
-/// participant once every block is claimed.
+/// The share of a lane one claim takes: a quarter of what is left of it, so
+/// the lane's owner starts on a quarter of the lane.
 const STEAL_BLOCKS: usize = 4;
+
+/// The smallest claim of a lane with no block cap is this share of it: a
+/// lane's claims shrink toward it as the lane runs out.
+const TAIL_BLOCKS: usize = 32;
 
 /// The most rows one steal block of a union pass takes: 18 groups of 8 rows,
 /// so a block's cells in each output column are 144 · 4 = 576 bytes, nine
@@ -4525,8 +4551,9 @@ impl Lanes {
 /// columns plus each column — and participant `t` starts on lane `t`: the
 /// pool splits the lane indices, not the rows, so every lane the cut balanced
 /// has the participant it was cut for. Otherwise the row split names the
-/// home lanes, as below. A lane's steal block is a quarter of it
-/// ([`STEAL_BLOCKS`]), capped by the set's [`RowSet::block_cap`].
+/// home lanes, as below. A claim takes a quarter of what is left of its lane
+/// ([`STEAL_BLOCKS`]), down to a [`TAIL_BLOCKS`]-th of the lane; a set with a
+/// [`RowSet::block_cap`] claims fixed blocks capped by it ([`Lane::of`]).
 ///
 /// With [`Lanes::Ccd`] the same cost rules cut each CCD's region of the walk
 /// into a lane for each of its participants ([`CcdCut`]); participant `t`
@@ -4596,8 +4623,17 @@ fn run_row_pool_with<S: RowSet>(
                 profile::add_chunk_busy(c.who.unwrap_or(i), c.busy_ns);
             }
         }
-        if let Some(span_ns) = span_ns {
+        if let (Some(span_ns), Some(t_span)) = (span_ns, t_span) {
             pacc.add_span(span_ns, chunks.iter().map(|c| c.busy_ns).max().unwrap_or(0));
+            let n = chunks.len().max(1) as u64;
+            let mean_busy = chunks.iter().map(|c| c.busy_ns).sum::<u64>() / n;
+            let late = chunks
+                .iter()
+                .filter_map(|c| c.began)
+                .map(|b| b.saturating_duration_since(t_span).as_nanos() as u64)
+                .sum::<u64>()
+                / n;
+            pacc.add_idle(span_ns.saturating_sub(mean_busy), late);
         }
         if let Some(t_gather) = t_gather {
             pacc.add_gather(t_gather.elapsed().as_nanos() as u64);
@@ -4702,6 +4738,7 @@ fn dispatch_flat<S: RowSet>(
             start: if tile { lane_bounds[r.start] } else { r.start },
             who: tile.then_some(r.start),
             busy_ns: 0,
+            began: t_busy,
             acc: profile::CallAcc::new(),
             err: None,
         };
@@ -4855,6 +4892,7 @@ fn dispatch_ccd<S: RowSet>(
             start: cut.first_unit(set, seat.first + seat.rank, total_rows + t),
             who: Some(t),
             busy_ns: 0,
+            began: t_busy,
             acc: profile::CallAcc::new(),
             err: None,
         };
@@ -7747,8 +7785,8 @@ mod tests {
 #[cfg(test)]
 mod ccd_tests {
     use super::{
-        CcdCut, Lanes, RowSet, Seat, WarmSpan, profile, run_row_pool_with, warm_lines, warm_share,
-        warm_touch, warm_walk,
+        CcdCut, Lane, Lanes, RowSet, STEAL_BLOCKS, Seat, TAIL_BLOCKS, WarmSpan, profile,
+        run_row_pool_with, warm_lines, warm_share, warm_touch, warm_walk,
     };
     use std::cell::Cell;
     use std::ops::Range;
@@ -8004,6 +8042,47 @@ mod ccd_tests {
         assert_eq!(regions, [960, 960, 840, 840]);
         let lanes: Vec<usize> = (0..4).map(|c| cut.firsts[c + 1] - cut.firsts[c]).collect();
         assert_eq!(lanes, [8, 8, 7, 7]);
+    }
+
+    /// A lane's claims partition it front to back: with no cap each takes a
+    /// quarter of what is left, never more than a quarter of the lane nor less
+    /// than its `TAIL_BLOCKS`-th, so the last claims are the floor's size; a
+    /// capped set claims fixed blocks of the cap, and with stealing off the
+    /// lane is one claim.
+    #[test]
+    fn a_lane_claims_shrink_to_its_floor_and_cover_it_once() {
+        let claims = |lane: &Lane| {
+            let mut v = Vec::new();
+            while let Some(r) = lane.claim() {
+                v.push(r);
+            }
+            v
+        };
+        let covers = |v: &[Range<usize>], start: usize, end: usize| {
+            assert_eq!(v.first().map(|r| r.start), Some(start));
+            assert_eq!(v.last().map(|r| r.end), Some(end));
+            assert!(v.windows(2).all(|w| w[0].end == w[1].start));
+        };
+        for (start, len) in [(0usize, 2880usize), (17, 1680), (5, 31), (3, 1)] {
+            let end = start + len;
+            let v = claims(&Lane::of(start, end, true, 99_999, None));
+            covers(&v, start, end);
+            let (block, floor) = ((len / STEAL_BLOCKS).max(1), (len / TAIL_BLOCKS).max(1));
+            let floor = floor.min(block);
+            assert_eq!(v[0].len(), block, "lane of {len}: the owner's first claim");
+            assert!(v.iter().all(|r| r.len() <= block));
+            assert!(v[..v.len() - 1].iter().all(|r| r.len() >= floor));
+            assert!(v.windows(2).all(|w| w[1].len() <= w[0].len()));
+            assert!(v.last().is_some_and(|r| r.len() <= floor));
+            let capped = claims(&Lane::of(start, end, true, 99_999, Some(18)));
+            covers(&capped, start, end);
+            let fixed = block.min(18);
+            assert!(capped[..capped.len() - 1].iter().all(|r| r.len() == fixed));
+            assert_eq!(
+                claims(&Lane::of(start, end, false, 99_999, None)),
+                vec![start..end]
+            );
+        }
     }
 
     /// A participant visits every lane once, its CCD's lanes first and its home

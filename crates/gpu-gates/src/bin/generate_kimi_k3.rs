@@ -141,7 +141,9 @@ mod cli {
     /// [`greedy`] under `BLOOMERY_STEP_STATS=1` on a placed load: the host tier read before the
     /// first generated step and after each ([`Probe`]), the `stat step` lines and the summary
     /// after the ids, and the tier's `nvtier` record after the prompt and after the steps (its
-    /// counters are since load, so the decode's fills are the difference).
+    /// counters are since load, so the decode's fills are the difference). With the host
+    /// profiler on, its table of the steps alone follows on stderr, as `bloomery-decode` prints
+    /// it: reset after the prompt, its wall the step loop's.
     fn greedy_probed(
         m: &mut GpuModel<Body>,
         prompt: &[u32],
@@ -150,14 +152,20 @@ mod cli {
         let mut ids = vec![Body::prompt(m, prompt)?];
         print_nvtier(m)?;
         let mut probes = vec![probe(m, None)?];
+        model::profile::reset();
+        let t_steps = std::time::Instant::now();
         while ids.len() < n {
             let last = ids[ids.len() - 1];
             ids.push(m.step(&[last])?);
             let p = probe(m, probes.last())?;
             probes.push(p);
         }
+        let steps_ns = u64::try_from(t_steps.elapsed().as_nanos()).unwrap_or(u64::MAX);
         print_stats(&probes, 0);
         print_nvtier(m)?;
+        if model::profile::enabled() {
+            eprintln!("{}", model::profile::report(steps_ns, "decode"));
+        }
         Ok(ids)
     }
 
