@@ -12,7 +12,12 @@
 #                                             The remote's output (stdout and stderr, in one stream) comes
 #                                             back on stdout, then the last 40 log lines of each red step; the exit
 #                                             code is the remote run's.
-#   tools/mac-remote.sh --self-test           the argument, config, track-name, dirty-tree, lock and ledger
+#   tools/mac-remote.sh --clones [--clean]    every Mac's clones (the pool's, or the one Mac of the config): each kept
+#                                             (a live lock holds it, this machine has a worktree of its name, or its last
+#                                             run is under CLONE_IDLE_DAYS old) or stale; --clean removes the stale ones.
+#                                             A run does the same by itself when the remote has under CLONE_MIN_GB free,
+#                                             so a full disk does not end the clone's push (`No space left on device`).
+#   tools/mac-remote.sh --self-test           the argument, config, track-name, dirty-tree, lock, clone and ledger
 #                                             rules and the ssh failure paths against a stub ssh, no remote
 #
 # The host is the one line of ~/.config/bloomery/mac-remote (`user@host`). It is not in the repository and
@@ -117,6 +122,8 @@ POOL_MIN_GB=${POOL_MIN_GB:-15}
 POOL_POLL=${POOL_POLL:-20}
 POOL_WAIT=${POOL_WAIT:-1800}
 RESV_DIR=$HOME/.cache/bloomery/mac-pool
+CLONE_IDLE_DAYS=${CLONE_IDLE_DAYS:-2} # a clone with no worktree of its name here is stale this many days after its last run
+CLONE_MIN_GB=${CLONE_MIN_GB:-$POOL_MIN_GB} # a run removes the stale clones first when the remote has less free
 
 SURVEY='{
 exec < /dev/null
@@ -238,6 +245,9 @@ pool_pick() {
   done
 }
 
+# The remote scripts' one mtime: a path's modification time in seconds, GNU or BSD stat, or now when neither reads it.
+RMTIME='mtime() { stat -f %m "$1" 2> /dev/null || stat -c %Y "$1" 2> /dev/null || echo "$now"; }'
+
 # --locks [--clean]: every Mac's slots and track locks (the pool's, or the one Mac of ~/.config/bloomery/mac-remote),
 # each lock `live` (its run goes, or its heartbeat is younger than LOCK_DEAD) or `dead`; --clean removes the dead ones.
 LOCKS='{
@@ -246,7 +256,7 @@ slots=$1 clean=$2 dead=$3
 base=$HOME/'"$RBASE"'
 mkdir -p "$base"
 now=$(date +%s)
-mtime() { stat -f %m "$1" 2> /dev/null || stat -c %Y "$1" 2> /dev/null || echo "$now"; }
+'"$RMTIME"'
 j=0
 while [ "$j" -lt "$slots" ]; do
   if ! command -v lockf > /dev/null; then st="unknown (no lockf)"
@@ -272,8 +282,71 @@ done
 exit 0
 }'
 
-locks_main() {
-  local clean=$1 a f rc=0 h
+locks_main() { each_mac "$LOCKS" "$SLOTS" "$1" "$LOCK_DEAD"; }
+
+# --clones [--clean], and a run's own pass on a low disk: the clones ~/repo/bloomery-mr/<track>, each kept for a reason
+# or stale. Kept: a live lock holds it (its run goes, or its heartbeat is younger than LOCK_DEAD), it is this run's
+# track, the runner's repository has a worktree of its name (`keep`, comma-separated), or its last run (the mtime of
+# its .git/index, which every run's checkout writes) is under `idle` days old. A stale clone is only a cache: removing
+# it costs that track's next run a cold build. Modes: list, clean, auto (clean, and only when the disk has under
+# `min` GB free; quiet otherwise).
+CLONES='{
+exec < /dev/null
+mode=$1 idle=$2 min=$3 dead=$4 keep=,$5, self=$6
+base=$HOME/'"$RBASE"'
+now=$(date +%s)
+'"$RMTIME"'
+gb() { df -k "$HOME" 2> /dev/null | awk "NR == 2 { printf \"%d\", \$4 / 1048576 }"; }
+free=$(gb)
+if [ "$mode" = auto ]; then
+  [ "${free:-0}" -lt "$min" ] || exit 0
+  echo "  the disk has ${free:-?} GB free, under $min GB: removing the stale clones"
+fi
+[ -d "$base" ] || { echo "  no clones"; exit 0; }
+n=0
+for c in "$base"/*; do
+  [ -d "$c" ] || continue
+  t=${c##*/}
+  n=$((n + 1))
+  if [ -e "$c/.git/index" ]; then last=$(mtime "$c/.git/index"); else last=$(mtime "$c"); fi
+  days=$(( (now - last) / 86400 ))
+  why=
+  l=$base/.lock-$t
+  if [ -d "$l" ]; then
+    rp=$(cat "$l/run-pid" 2> /dev/null || true)
+    hb=$(cat "$l/heartbeat" 2> /dev/null || mtime "$l")
+    if { [ -n "$rp" ] && kill -0 "$rp" 2> /dev/null; } || [ $((now - hb)) -lt "$dead" ]; then why="a live lock"; fi
+  fi
+  [ -n "$why" ] || [ "$t" != "$self" ] || why="this run"
+  [ -n "$why" ] || case $keep in *",$t,"*) why="a worktree of that name on the runner" ;; esac
+  [ -n "$why" ] || [ "$days" -ge "$idle" ] || why="last run under $idle d ago"
+  if [ -n "$why" ]; then
+    [ "$mode" = auto ] || echo "  clone $t: kept ($why), last run $days d ago"
+    continue
+  fi
+  kb=$(du -sk "$c" 2> /dev/null | awk "{ print \$1 }")
+  line="  clone $t: stale, last run $days d ago, $(( ${kb:-0} / 1048576 )) GB"
+  if [ "$mode" != list ]; then rm -rf "$c" && line="$line: removed"; fi
+  echo "$line"
+done
+[ "$n" -gt 0 ] || echo "  no clones"
+if [ "$mode" = list ]; then echo "  ${free:-?} GB free (--clean removes the stale clones)"
+else echo "  ${free:-?} GB free before, $(gb) GB after"; fi
+exit 0
+}'
+
+# local_tracks: the names of the runner repository's worktrees, comma-separated (the clones a run here may come back to).
+local_tracks() {
+  local w out=
+  while IFS= read -r w; do out="$out${w##*/},"; done < <(git -C "$HERE" worktree list --porcelain 2> /dev/null | sed -n 's/^worktree //p')
+  printf '%s' "${out%,}"
+}
+
+# each_mac SCRIPT ARG...: SCRIPT run with ARGs on every Mac of the pool (or the one Mac of the config), each Mac's lines
+# under its name, scrubbed; 75 when one did not answer, 64 when a config line is malformed.
+each_mac() {
+  local script=$1 a f rc=0 h
+  shift
   local -a names=()
   if compgen -G "$POOL_DIR/*" > /dev/null; then
     for f in "$POOL_DIR"/*; do [ -f "$f" ] && names+=("${f##*/}"); done
@@ -284,11 +357,13 @@ locks_main() {
     if [ "$a" = . ]; then CONF=$HOME/.config/bloomery/mac-remote; a="the second Mac"; else CONF=$POOL_DIR/$a; fi
     h=$(read_host) || { rc=64; continue; }
     echo "$a:"
-    ssh -o LogLevel=ERROR -o BatchMode=yes -o ConnectTimeout="$POOL_CONNECT" "$h" "bash -s -- $(qargs "$SLOTS" "$clean" "$LOCK_DEAD")" <<< "$LOCKS" 2> /dev/null |
+    ssh -o LogLevel=ERROR -o BatchMode=yes -o ConnectTimeout="$POOL_CONNECT" "$h" "bash -s -- $(qargs "$@")" <<< "$script" 2> /dev/null |
       scrub "" "${h%@*}" "${h#*@}" || { echo "  not reachable in $POOL_CONNECT s"; rc=75; }
   done
   return $rc
 }
+
+clones_main() { each_mac "$CLONES" "$1" "$CLONE_IDLE_DAYS" "$CLONE_MIN_GB" "$LOCK_DEAD" "$(local_tracks)" ""; }
 
 # track_of DIR: the remote clone's name, DIR's directory name, or 64 when it is not one word of [A-Za-z0-9._-].
 track_of() {
@@ -709,6 +784,10 @@ remote_main() {
     return 75
   }
 
+  # a low disk: the stale clones go before this run's push needs the room (quiet when the disk has CLONE_MIN_GB)
+  ssh "${SSH_OPTS[@]}" "$R" "bash -s -- $(qargs auto "$CLONE_IDLE_DAYS" "$CLONE_MIN_GB" "$LOCK_DEAD" "$(local_tracks)" "$track")" \
+    <<< "$CLONES" 2> /dev/null | scrub '' "$RUSER" "$RHOST" | sed 's/^  /mac-remote: /' >&2 || true
+
   # preflight, lock, clone and the ledger's size in one session
   printf '%s\n' "$PREP" > "$TMP/prep.sh"
   while :; do
@@ -874,6 +953,8 @@ push_clone() {
     SLPID=
   done
   say "mac-remote: git push to the remote clone failed twice:"; scrub "$RHOME" "$RUSER" "$RHOST" < "$TMP/push.log" | tail -5 >&2
+  ! grep -q 'No space left on device' "$TMP/push.log" ||
+    say "mac-remote: the remote disk is full and no clone was stale enough to remove: tools/mac-remote.sh --clones names each clone and why it is kept"
   return 75
 }
 
@@ -996,6 +1077,33 @@ os.execvp("bash", ["bash", "-s", "--", "tdead", "", "nightly-x", "2", "300", "1"
     case $out in *"lock tlive: dead"*"removed"*) ;; *) fail "--locks --clean did not remove the dead lock: $out" ;; esac
     [ ! -d "$lb/.lock-tlive" ] && [ -d "$lb/.lock-tfresh" ] || fail "--locks --clean removed the wrong locks: $out"
   fi
+
+  # the clones (the remote script run here, any OS): stale = no live lock, not this run's, no worktree of its name on
+  # the runner, last run CLONE_IDLE_DAYS or more ago; list removes nothing, clean removes only the stale, auto only on a
+  # low disk
+  local cr=$d/clonerem cb
+  cb=$cr/$RBASE
+  for t in old recent kept locked self; do mkdir -p "$cb/$t/.git"; : > "$cb/$t/.git/index"; done
+  for t in old kept locked self; do touch -t 202001010000 "$cb/$t/.git/index"; done
+  mkdir -p "$cb/.lock-locked"; date +%s > "$cb/.lock-locked/heartbeat"
+  out=$(HOME=$cr bash -s -- list 2 15 600 kept,other self <<< "$CLONES" 2>&1)
+  case $out in *"clone old: stale"*) ;; *) fail "--clones did not name the stale clone: $out" ;; esac
+  case $out in *"clone recent: kept (last run under 2 d ago)"*"clone self: kept (this run)"*) ;; *) fail "--clones did not keep the recent clone or this run's: $out" ;; esac
+  case $out in *"clone kept: kept (a worktree of that name on the runner)"*"clone locked: kept (a live lock)"*) ;; *) fail "--clones did not keep a worktree's clone or a locked one: $out" ;; esac
+  [ -d "$cb/old" ] || fail "--clones without --clean removed a clone"
+  out=$(HOME=$cr bash -s -- auto 2 0 600 kept,other self <<< "$CLONES" 2>&1)
+  [ -z "$out" ] && [ -d "$cb/old" ] || fail "a run's pass on a disk with room removed a clone or printed: $out"
+  out=$(HOME=$cr bash -s -- auto 2 999999999 600 kept,other self <<< "$CLONES" 2>&1)
+  case $out in *"under 999999999 GB"*"clone old: stale"*"removed"*) ;; *) fail "a run's pass on a low disk did not remove the stale clone: $out" ;; esac
+  for t in recent kept locked self; do [ -d "$cb/$t" ] || fail "the low-disk pass removed the kept clone $t"; done
+  [ ! -d "$cb/old" ] || fail "the low-disk pass left the stale clone"
+  touch -t 202001010000 "$cb/recent/.git/index"
+  out=$(HOME=$cr bash -s -- clean 2 15 600 kept self <<< "$CLONES" 2>&1)
+  case $out in *"clone recent: stale"*"removed"*) ;; *) fail "--clones --clean did not remove a clone gone stale: $out" ;; esac
+  [ -d "$cb/kept" ] && [ -d "$cb/locked" ] && [ -d "$cb/self" ] || fail "--clones --clean removed a kept clone: $out"
+  local lt
+  lt=$(local_tracks)
+  case ",$lt," in *",${HERE##*/},"*) ;; *) fail "the runner's own worktree is not among its tracks: $lt" ;; esac
 
   # track names
   [ "$(track_of /a/b/bloomery-x/)" = bloomery-x ] || fail "track_of a path with a trailing slash"
@@ -1328,9 +1436,10 @@ while [ $# -gt 0 ]; do
   case $1 in
     --self-test) [ $# = 1 ] || { say "mac-remote.sh: --self-test takes nothing"; exit 64; }; self_test; exit $? ;;
     --locks) case ${2:-} in '') locks_main 0; exit $? ;; --clean) locks_main 1; exit $? ;; *) say "mac-remote.sh: --locks takes only --clean"; exit 64 ;; esac ;;
+    --clones) case ${2:-} in '') clones_main list; exit $? ;; --clean) clones_main clean; exit $? ;; *) say "mac-remote.sh: --clones takes only --clean"; exit 64 ;; esac ;;
     --tree) [ $# -ge 2 ] || { say "mac-remote.sh: --tree needs a directory"; exit 64; }; TREE_ARG=$2; shift 2 ;;
     --fresh) FRESH=--fresh; shift ;;
-    -*) say "usage: tools/mac-remote.sh [--tree DIR] [--fresh] [BASE] | --self-test ('$1' is not one)"; exit 64 ;;
+    -*) say "usage: tools/mac-remote.sh [--tree DIR] [--fresh] [BASE] | --locks [--clean] | --clones [--clean] | --self-test ('$1' is not one)"; exit 64 ;;
     *) nb=$((nb + 1)); BASE_ARG_IN=$1; shift ;;
   esac
 done
