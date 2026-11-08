@@ -16,9 +16,11 @@
 //!
 //! [`step`] runs one row: [`front`] (1 to 4), then [`back`] (the core and 5). A family whose
 //! layer selects its keys (Kimi K3.1's indexer) runs [`front`], its own selection, then [`back`] with
-//! the core over the selected rows ([`attend_sel`]). [`rows`] runs a pass of 1 to [`PASS_ROWS`] rows in position order — a
-//! verify's rows or a prompt chunk — through the core's [`attend_rows`] with the projections'
-//! m-column launches ([`project_rows`]) before and after it. A family whose prompt runs wider
+//! the core over the selected rows ([`attend_sel`]). [`rows`] runs a pass of 1 to [`PASS_ROWS`]
+//! rows in position order — a verify's rows or a prompt chunk — as [`front_rows`] (1 to 4 with the
+//! projections' m-column launches, [`project_rows`]), the core's [`attend_rows`] over [`core`]'s
+//! parts, and [`out_rows`] (5); a family whose pass selects runs [`front_rows`], its own core over
+//! [`core`]'s parts a row at a time, then [`out_rows`]. A family whose prompt runs wider
 //! units reads the same [`MlaSites`] and [`MlaBufs`] from its own wide walk.
 //!
 //! The tensor names are the model crate's common spellings ([`model::arch::names`]), the ones
@@ -29,6 +31,7 @@
 use crate::GpuError;
 use crate::arch::hybrid::{Acts, GqaCx, Site};
 use crate::arch::rows_kit::{RowsKit, collect_rows, kgemv_rows, project_rows};
+use crate::fault::FaultSink;
 use crate::latent::LATENT;
 use crate::latent_gated::{
     AttendIn, AttnBufs, MlaDims, MlaKernels, Selection, ValueW, attend, attend_rows, attend_sel,
@@ -295,52 +298,114 @@ pub(crate) fn back(
     acts: &mut Acts,
     (sites, d): (&MlaSites, &MlaDims),
     l: usize,
-    b: MlaBufs<'_>,
+    mut b: MlaBufs<'_>,
     sel: Option<Selection<'_>>,
 ) -> Result<(), GpuError> {
-    let (gpu, w) = (cx.gpu, cx.w);
-    let fault = gpu.layer_sink(l)?;
-    let [_, _, kv_a_norm] = &sites.vecs;
-    let a = AttendIn {
-        kv: b.kv,
-        q: b.q,
-        gate: b.gate,
-        kv_norm: w.f32_buf(WHAT, kv_a_norm)?,
-        k_b: q8_planes(w, &sites.k_b)?,
-        v_b: value_w(w, &sites.v_b)?,
-        pos: b.pos,
-        n_keys: b.n_keys,
-        fault,
-    };
-    let s = AttnBufs {
-        qabs: b.qabs,
-        att: b.att,
-        av: b.av,
-        part_v: b.part_v,
-        part_ms: b.part_ms,
-    };
+    let gpu = cx.gpu;
+    let Core { a, s, cache, y } = core(cx.w, gpu.layer_sink(l)?, sites, &mut b)?;
     match sel {
-        None => attend(gpu, k, d, a, s, b.cache, b.gated)?,
-        Some(sel) => attend_sel(gpu, k, d, a, s, b.cache, sel, b.gated)?,
+        None => attend(gpu, k, d, a, s, cache, y)?,
+        Some(sel) => attend_sel(gpu, k, d, a, s, cache, sel, y)?,
     }
     sites.out.project(cx, acts, l, b.gated, b.out)
+}
+
+/// The core's parts over `b`'s rows ([`core`]): its inputs, its own buffers, the cache it writes
+/// and the gated heads it leaves (`b.gated`).
+pub(crate) struct Core<'a> {
+    pub(crate) a: AttendIn<'a>,
+    pub(crate) s: AttnBufs<'a>,
+    pub(crate) cache: &'a mut DeviceTensor<u16>,
+    pub(crate) y: &'a mut DeviceBuffer<f32>,
+}
+
+/// The core's parts over [`front`]'s or [`front_rows`]'s projections in `b`, with layer `l`'s
+/// weights from `w` and its fault word `fault`: what [`attend`], [`attend_rows`] and
+/// [`attend_sel`] read and write.
+pub(crate) fn core<'a>(
+    w: &'a Weights,
+    fault: FaultSink,
+    sites: &'a MlaSites,
+    b: &'a mut MlaBufs<'_>,
+) -> Result<Core<'a>, GpuError> {
+    let [_, _, kv_a_norm] = &sites.vecs;
+    let MlaBufs {
+        kv,
+        q,
+        gate,
+        pos,
+        n_keys,
+        qabs,
+        att,
+        av,
+        part_v,
+        part_ms,
+        cache,
+        gated,
+        ..
+    } = b;
+    Ok(Core {
+        a: AttendIn {
+            kv,
+            q,
+            gate,
+            kv_norm: w.f32_buf(WHAT, kv_a_norm)?,
+            k_b: q8_planes(w, &sites.k_b)?,
+            v_b: value_w(w, &sites.v_b)?,
+            pos,
+            n_keys,
+            fault,
+        },
+        s: AttnBufs {
+            qabs,
+            att,
+            av,
+            part_v,
+            part_ms,
+        },
+        cache,
+        y: gated,
+    })
 }
 
 /// Enqueue MLA layer `l` over a pass of `m` rows, 1 to [`PASS_ROWS`], in
 /// position order (module doc) on `b`'s buffers, each at least `m` rows of
 /// its width ([`MlaBufs`]), the projections' row-major outputs staged in
-/// `kit`. One row is [`step`]; a count past [`PASS_ROWS`] is refused by name.
+/// `kit`: [`front_rows`], the core over the rows ([`attend_rows`]),
+/// [`out_rows`]. One row is [`step`]; a count past [`PASS_ROWS`] is refused by
+/// name.
 pub(crate) fn rows(
     cx: &GqaCx<'_>,
     k: &MlaKernels,
     acts: &mut Acts,
     (sites, d): (&MlaSites, &MlaDims),
     (l, m): (usize, usize),
-    b: MlaBufs<'_>,
+    mut b: MlaBufs<'_>,
     mut kit: RowsKit<'_>,
 ) -> Result<(), GpuError> {
     if m == 1 {
         return step(cx, k, acts, (sites, d), l, b);
+    }
+    front_rows(cx, acts, (sites, d), (l, m), &mut b, &mut kit)?;
+    let gpu = cx.gpu;
+    let Core { a, s, cache, y } = core(cx.w, gpu.layer_sink(l)?, sites, &mut b)?;
+    attend_rows(gpu, k, d, m, a, s, cache, y)?;
+    out_rows(cx, acts, (sites, d), (l, m), &mut b, &mut kit)
+}
+
+/// The module doc's launches 1 to 4 of layer `l` over a pass of `m` rows, 1 to [`PASS_ROWS`], on
+/// `b`'s buffers, the projections' m-column launches staged in `kit`: each row [`front`]'s bits.
+/// One row is [`front`]; a count past [`PASS_ROWS`] is refused by name.
+pub(crate) fn front_rows(
+    cx: &GqaCx<'_>,
+    acts: &mut Acts,
+    (sites, d): (&MlaSites, &MlaDims),
+    (l, m): (usize, usize),
+    b: &mut MlaBufs<'_>,
+    kit: &mut RowsKit<'_>,
+) -> Result<(), GpuError> {
+    if m == 1 {
+        return front(cx, acts, (sites, d), l, b);
     }
     if !(2..=PASS_ROWS).contains(&m) {
         return Err(GpuError::shape(
@@ -350,8 +415,7 @@ pub(crate) fn rows(
     }
     let (gpu, w) = (cx.gpu, cx.w);
     let stream = gpu.stream();
-    let fault = gpu.layer_sink(l)?;
-    let [norm, q_a_norm, kv_a_norm] = &sites.vecs;
+    let [norm, q_a_norm, _] = &sites.vecs;
     gpu.elem().enqueue_rms_norm(
         stream,
         b.x,
@@ -374,7 +438,7 @@ pub(crate) fn rows(
         for (t, n, y) in input {
             if q8(t) {
                 collect_rows(cx, t, b.xn, m)?;
-                kgemv_rows(cx, &mut kit, (t, n), act, l, y)?;
+                kgemv_rows(cx, kit, (t, n), act, l, y)?;
             } else {
                 rest.push((t, n, y));
             }
@@ -383,7 +447,7 @@ pub(crate) fn rows(
         rest.extend(input);
     }
     for (t, n, y) in rest {
-        project_rows(cx, &mut kit, acts, (l, m), (t, n), b.xn, y)?;
+        project_rows(cx, kit, acts, (l, m), (t, n), b.xn, y)?;
     }
     gpu.elem().enqueue_rms_norm(
         stream,
@@ -395,33 +459,19 @@ pub(crate) fn rows(
         b.qr,
     )?;
     let q_b = (&sites.q_b, d.heads * d.head_k());
-    project_rows(cx, &mut kit, acts, (l, m), q_b, b.qr, b.q)?;
-    attend_rows(
-        gpu,
-        k,
-        d,
-        m,
-        AttendIn {
-            kv: b.kv,
-            q: b.q,
-            gate: b.gate,
-            kv_norm: w.f32_buf(WHAT, kv_a_norm)?,
-            k_b: q8_planes(w, &sites.k_b)?,
-            v_b: value_w(w, &sites.v_b)?,
-            pos: b.pos,
-            n_keys: b.n_keys,
-            fault,
-        },
-        AttnBufs {
-            qabs: b.qabs,
-            att: b.att,
-            av: b.av,
-            part_v: b.part_v,
-            part_ms: b.part_ms,
-        },
-        b.cache,
-        b.gated,
-    )?;
+    project_rows(cx, kit, acts, (l, m), q_b, b.qr, b.q)
+}
+
+/// Launch 5 of layer `l` over a pass of `m` rows: `attn_output` of the gated heads `b.gated` into
+/// `b.out`, the m-column launch staged in `kit` (one row is [`back`]'s launch).
+pub(crate) fn out_rows(
+    cx: &GqaCx<'_>,
+    acts: &mut Acts,
+    (sites, d): (&MlaSites, &MlaDims),
+    (l, m): (usize, usize),
+    b: &mut MlaBufs<'_>,
+    kit: &mut RowsKit<'_>,
+) -> Result<(), GpuError> {
     let out = (&sites.out, d.embd);
-    project_rows(cx, &mut kit, acts, (l, m), out, b.gated, b.out)
+    project_rows(cx, kit, acts, (l, m), out, b.gated, b.out)
 }

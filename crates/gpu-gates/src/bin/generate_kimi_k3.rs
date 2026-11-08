@@ -28,8 +28,8 @@
 //! on the host tier (`model::ops::ExpertForm::Situ`), the NVMe tier paging what the room cannot
 //! hold. The prompt walk is the body's `Prompt`: its ids stepped one at a time (`--walk steps`, the
 //! default), or as placed passes (`--walk pass`, a placed load only;
-//! [`bloomery_gpu::GpuModel::prompt_placed`]), a K3.1 file's passes cut at its indexer's top-k and
-//! the ids past it stepped. A pass load's plan is made apart from the step's:
+//! [`bloomery_gpu::GpuModel::prompt_placed`]), a K3.1 file's past
+//! its indexer's top-k too. A pass load's plan is made apart from the step's:
 //! the widest pass shape ([`bloomery_gpu::arch::kimi_k3::SHAPES`], rows by the latent mixers' inner
 //! rows) whose bytes the stage card's room holds as the prompt reserve, the expert tier's batch at
 //! its rows and the NVMe arena at its floor (`PlanInputs::with_arena_at_floor`). The
@@ -53,8 +53,6 @@
 //! f64. Under `--walk pass` a line's prompt and its completion but the last id run as one call of
 //! placed passes cut from the end ([`bloomery_gpu::GpuModel::score_placed`]), the completion's
 //! positions read from the last pass's rows; a completion past the pass's rows is refused by name.
-//! A K3.1 line that crosses its indexer's top-k is passed up to it and short of the completion,
-//! the rest stepped and the completion's positions read from each step's logits.
 //! An empty prompt or completion, a malformed line or prompt + completion past `--ctx` is
 //! refused by name before the model loads; an id past the vocabulary before the first row runs.
 //!

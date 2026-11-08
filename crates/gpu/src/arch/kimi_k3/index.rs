@@ -31,17 +31,20 @@
 //!
 //! A load whose context is at most `top_k` positions selects nothing ([`selects`]): every list it
 //! could make is the identity, whose attention is the dense walk's, so its layers run the dense
-//! walk and write no key row. A longer load runs the four steps at every step; a pass of rows
-//! (`super::rows`, `super::pass`) runs the dense attention and writes its rows' keys, so a pass
-//! whose last row would see more than `top_k` keys is refused by name ([`check_pass`]).
+//! walk and write no key row. A longer load runs the four steps at every step, and at every row of
+//! a pass of rows (`super::rows`, `super::pass`): steps 1 and 2 over the pass's rows at once
+//! ([`Index::project_pass`]: every row's key row written before any row picks), then step 3 and
+//! step 4 a row at a time in position order ([`attend_rows_sel`]), each row over its own count
+//! words ([`pass_words`]). A row reads only the key and cache rows below its own live count, so
+//! the pass's later rows are never read and each row is the step's launches at its position.
 
 use crate::arch::hybrid::{Acts, GqaCx, Site};
 use crate::arch::rows_kit::{RowsKit, project_rows};
 use crate::index_key::{IndexKeyInputArgs, IndexKeyKernels};
 use crate::indexer::{IndexerArgs, IndexerKernels, IndexerScratch};
-use crate::latent_gated::Selection;
+use crate::latent_gated::{AttendIn, AttnBufs, MlaDims, MlaKernels, Selection, attend_sel};
 use crate::site::{self, SiteTy};
-use crate::tensor::Window;
+use crate::tensor::{Window, WindowMut};
 use crate::weights::Weights;
 use crate::{DeviceTensor, FaultSink, Gpu, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -116,28 +119,28 @@ pub fn check_selection(ix: Option<&Indexer>, stride: usize) -> Result<usize, Gpu
     Ok(stride)
 }
 
-/// A pass of rows whose last row sees `keys` keys, refused by name on a file whose indexer picks
-/// fewer: the pass attends every key, which past `top_k` is not the file's attention. Names the
-/// first layer that runs the indexer, the count and `top_k`.
+/// The count words of a pass's rows from position `pos` over lists of `top_k` rows: row `t`'s
+/// [`count_words`] at `pos + t` in `out[t · WORDS ..]`. Refused by name: an `out` of other than
+/// whole rows, and a row at or past u32's last position.
 ///
 /// # Errors
-/// [`GpuError::Shape`] naming the layer, the count and `top_k`.
-pub fn check_pass(ix: Option<&Indexer>, keys: u64) -> Result<(), GpuError> {
-    let Some(ix) = ix else {
-        return Ok(());
+/// [`GpuError::Shape`] naming the refusal.
+pub fn pass_words(out: &mut [u32], pos: u32, top_k: u32) -> Result<(), GpuError> {
+    let n = out.len();
+    let (rows, []) = out.as_chunks_mut::<WORDS>() else {
+        return Err(GpuError::shape(
+            WHAT,
+            format!("{n} count words for a pass: a row holds {WORDS}"),
+        ));
     };
-    if ix.pass_attends_as_the_file(keys) {
-        return Ok(());
+    for (t, row) in rows.iter_mut().enumerate() {
+        let at = u32::try_from(t)
+            .ok()
+            .and_then(|t| pos.checked_add(t))
+            .ok_or_else(|| GpuError::shape(WHAT, "a pass row past u32's positions"))?;
+        *row = count_words(at, top_k)?;
     }
-    let layer = ix.first_layer();
-    Err(GpuError::shape(
-        WHAT,
-        format!(
-            "latent layer {layer:?}: a pass whose last row sees {keys} keys; the indexer picks \
-             top_k {} of them and a pass attends every key: step the positions past {}",
-            ix.top_k, ix.top_k
-        ),
-    ))
+    Ok(())
 }
 
 /// A K3.1 latent layer's indexer sites and the names of its key norm's gain and bias.
@@ -239,37 +242,56 @@ impl Index {
         )
     }
 
-    /// Step 1 for a pass's `m` rows after the layer's dense rows
-    /// ([`crate::arch::gated_mla::rows`]): `xn` the rows' attn-normed inputs, `pos` their positions,
-    /// and `proj` the buffer their projections land in (the layer's query latent, dead once the
-    /// attention ran).
+    /// The key rows, `[ctx][d]` f16, every row a step or a pass wrote.
+    pub(super) fn keys(&self) -> &DeviceTensor<u16> {
+        &self.keys
+    }
+
+    /// Steps 1 and 2 of the module doc for a pass's `m` rows, each projection's m-column launch
+    /// ([`project_rows`]: each column the one-row launch's bits) and the key launch over every
+    /// row: `xn` the rows' attn-normed inputs, `qr` their normed query latents, `pos` their
+    /// positions; the key projections land in `proj` (the layer's query latent before its norm,
+    /// dead once the norm ran), the heads' weights in `iw` (`[m][heads]`) and their queries in `iq`
+    /// (`[m][heads · d]`) for [`attend_rows_sel`].
     #[allow(
         clippy::too_many_arguments,
-        reason = "the launch context, the kernels, the forms and stage, the layer and rows, and the \
-                  three buffers, each named as the rows pass names it (rust-quality R8)"
+        reason = "the launch context, the kernels, the forms and stage, the layer and rows, the \
+                  rows' inputs and the three outputs, each named as the rows pass names it \
+                  (rust-quality R8)"
     )]
-    pub(super) fn keys_rows(
+    pub(super) fn project_pass(
         &mut self,
         cx: &GqaCx<'_>,
         k: &Kernels,
-        (acts, kit): (&mut Acts, RowsKit<'_>),
+        (acts, kit): (&mut Acts, &mut RowsKit<'_>),
         (l, m): (usize, usize),
-        xn: &DeviceBuffer<f32>,
-        pos: &DeviceBuffer<u32>,
+        (xn, qr, pos): (&DeviceBuffer<f32>, &DeviceBuffer<f32>, &DeviceBuffer<u32>),
         proj: &mut DeviceBuffer<f32>,
+        (iq, iw): (&mut DeviceBuffer<f32>, &mut DeviceBuffer<f32>),
     ) -> Result<(), GpuError> {
         let d = self.keys.cols();
-        if proj.len() < m * d {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "layer {l}: {m} rows' key projections of {d} in a buffer of {}",
-                    proj.len()
-                ),
-            ));
+        let (heads, hd) = (INDEX_HEADS, INDEX_HEADS * INDEX_DIM);
+        for (what, len, width) in [
+            ("key projections", proj.len(), d),
+            ("queries", iq.len(), hd),
+            ("weights", iw.len(), heads),
+        ] {
+            if len < m * width {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!("layer {l}: {m} rows' {what} of {width} in a buffer of {len}"),
+                ));
+            }
         }
-        let mut kit = kit;
-        project_rows(cx, &mut kit, acts, (l, m), (&self.sites.k, d), xn, proj)?;
+        let Sites {
+            q_b,
+            k: key,
+            proj: weights,
+            ..
+        } = &self.sites;
+        project_rows(cx, kit, acts, (l, m), (key, d), xn, proj)?;
+        project_rows(cx, kit, acts, (l, m), (weights, heads), xn, iw)?;
+        project_rows(cx, kit, acts, (l, m), (q_b, hd), qr, iq)?;
         self.write_keys((cx.gpu, cx.w), k, (l, m), proj, pos)
     }
 
@@ -382,6 +404,143 @@ pub fn enqueue_pick(
     )
 }
 
+/// What a pass's rows pick over ([`attend_rows_sel`]): the layer's key rows, every pass row's
+/// written; the rows' queries (`[m][heads · d]`), weights (`[m][heads]`) and count words
+/// (`[m][WORDS]`, [`pass_words`]); one row's score scratch, list and gathered rows, which each
+/// row reuses in turn.
+pub struct PassPick<'a> {
+    pub keys: &'a DeviceTensor<u16>,
+    pub iq: &'a DeviceBuffer<f32>,
+    pub iw: &'a DeviceBuffer<f32>,
+    pub words: &'a DeviceBuffer<u32>,
+    pub scratch: &'a mut IndexerScratch,
+    pub list: &'a mut DeviceBuffer<u32>,
+    pub gathered: &'a mut DeviceTensor<u16>,
+}
+
+/// `len` values of `buf` from row `t` of rows `len` wide.
+fn row_of<T>(buf: &DeviceBuffer<T>, t: usize, len: usize) -> Result<Window<'_, T>, GpuError> {
+    Window::<T>::of(buf, t * len * size_of::<T>(), len)
+}
+
+/// Steps 3 and 4 of the module doc for each of a pass's `m` rows in position order, after the
+/// pass wrote every row's key row ([`Index::project_pass`]) and before any row's cache row: row
+/// `t`'s list from its queries, weights and count words in `p` ([`enqueue_pick`]), then the core
+/// over the list ([`attend_sel`]: the row's cache row written, the list's rows gathered, the
+/// latent attention over them) on row `t` of `a`'s projections (each `m` rows of its width, the
+/// positions and live key counts a word a row), its gated heads into row `t` of `y`
+/// (`[m][heads · v_head]`). `s` holds one row's buffers. Each row's launches are the step's at its
+/// position: a row reads the key and cache rows below its live count alone, every one written by
+/// a step, an earlier row or itself. Refused by name: no rows, and a buffer shorter than `m` rows
+/// of its width; then as [`attend_sel`] refuses.
+///
+/// # Errors
+/// [`GpuError`] as above and from the launches.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "attend_sel's six, the pass's row count and what the rows pick over, each named as \
+              attend_sel names it (rust-quality R8)"
+)]
+pub fn attend_rows_sel(
+    gpu: &Gpu,
+    (mk, k): (&MlaKernels, &Kernels),
+    d: &MlaDims,
+    m: usize,
+    a: AttendIn<'_>,
+    s: AttnBufs<'_>,
+    cache: &mut DeviceTensor<u16>,
+    p: PassPick<'_>,
+    y: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    let (hk, row, hv) = (d.heads * d.head_k(), d.row(), d.heads * d.v_head);
+    let (hd, heads) = (INDEX_HEADS * INDEX_DIM, INDEX_HEADS);
+    let lens = [
+        ("kv", a.kv.len(), row),
+        ("q", a.q.len(), hk),
+        ("gate", a.gate.len(), hv),
+        ("pos", a.pos.len(), 1),
+        ("n_keys", a.n_keys.len(), 1),
+        ("iq", p.iq.len(), hd),
+        ("iw", p.iw.len(), heads),
+        ("words", p.words.len(), WORDS),
+        ("y", y.len(), hv),
+    ];
+    if m == 0 {
+        return Err(GpuError::shape(WHAT, "a pass of no rows"));
+    }
+    if let Some((what, len, width)) = lens.into_iter().find(|&(_, len, w)| len < m * w) {
+        return Err(GpuError::shape(
+            WHAT,
+            format!("a pass of {m} rows over {what} of {len}: {m} rows of {width}"),
+        ));
+    }
+    let PassPick {
+        keys,
+        iq,
+        iw,
+        words,
+        scratch,
+        list,
+        gathered,
+    } = p;
+    let AttnBufs {
+        qabs,
+        att,
+        av,
+        part_v,
+        part_ms,
+    } = s;
+    let stream = gpu.stream();
+    for t in 0..m {
+        let (ints, q_t, w_t) = (
+            row_of(words, t, WORDS)?,
+            row_of(iq, t, hd)?,
+            row_of(iw, t, heads)?,
+        );
+        enqueue_pick(stream, k, keys, (&q_t, &w_t), &ints, scratch, list)?;
+        let n = Window::<u32>::of(words, (t * WORDS + N_SEL_AT) * 4, 1)?;
+        let (kv, q, gate) = (
+            row_of(a.kv, t, row)?,
+            row_of(a.q, t, hk)?,
+            row_of(a.gate, t, hv)?,
+        );
+        let (pos, n_keys) = (row_of(a.pos, t, 1)?, row_of(a.n_keys, t, 1)?);
+        let mut yt = WindowMut::<f32>::of_mut(y, t * hv * 4, hv)?;
+        attend_sel(
+            gpu,
+            mk,
+            d,
+            AttendIn {
+                kv: &kv,
+                q: &q,
+                gate: &gate,
+                kv_norm: a.kv_norm,
+                k_b: a.k_b,
+                v_b: a.v_b,
+                pos: &pos,
+                n_keys: &n_keys,
+                fault: a.fault,
+            },
+            AttnBufs {
+                qabs: &mut *qabs,
+                att: &mut *att,
+                av: &mut *av,
+                part_v: &mut *part_v,
+                part_ms: &mut *part_ms,
+            },
+            cache,
+            Selection {
+                list: &*list,
+                n: &n,
+                stride: list.len(),
+                scratch: &mut *gathered,
+            },
+            &mut yt,
+        )?;
+    }
+    Ok(())
+}
+
 /// The kernels the indexer launches beside the step's.
 pub struct Kernels {
     key: IndexKeyKernels,
@@ -452,6 +611,30 @@ impl Sel {
     pub(super) fn words(&mut self, stream: &CudaStream, pos: u32) -> Result<(), GpuError> {
         self.host = count_words(pos, self.host[TOP_K_AT])?;
         Ok(self.words.copy_from_host(stream, &self.host)?)
+    }
+
+    /// The lists' width, `top_k`.
+    pub(super) fn top_k(&self) -> u32 {
+        self.host[TOP_K_AT]
+    }
+
+    /// What a pass's rows pick over ([`attend_rows_sel`]): `keys` the layer's key rows, `iq`, `iw`
+    /// and `words` the rows' own, this selection's scratch, list and gathered rows.
+    pub(super) fn pass_pick<'a>(
+        &'a mut self,
+        keys: &'a DeviceTensor<u16>,
+        (iq, iw): (&'a DeviceBuffer<f32>, &'a DeviceBuffer<f32>),
+        words: &'a DeviceBuffer<u32>,
+    ) -> PassPick<'a> {
+        PassPick {
+            keys,
+            iq,
+            iw,
+            words,
+            scratch: &mut self.scratch,
+            list: &mut self.list,
+            gathered: &mut self.gathered,
+        }
     }
 
     /// The selection [`Index::pick`] left, for the latent core ([`crate::latent_gated::attend_sel`]),

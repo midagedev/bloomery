@@ -1,10 +1,11 @@
 //! `kimi_k3` — Kimi K3 on the card: the step ([`body`]) over the delta layers ([`kda`]), the
 //! gated latent layers (the core Raon-1 shares, `crate::arch::gated_mla`; a K3.1 layer's over the
-//! rows its lightning indexer picks, [`check_selection`] and [`check_pass`] its refusals) and the routed block
-//! ([`moe`]), the cross-layer residual's mix ([`crate::attn_res`]) between them, and the state
-//! book of the step ([`state`]), the pass of up to eight rows ([`Pass`], [`Body::rows`]) and the
-//! placed body's prompt pass of up to [`SHAPES`]' widest rows ([`PassShape`],
-//! [`crate::GpuModel::prompt_placed`]), each row the step's bits. The model description is `model::arch::kimi_k3`.
+//! rows its lightning indexer picks, at a step and at every row of a pass, [`check_selection`] its
+//! refusal and [`attend_rows_sel`] a pass's rows) and the routed block ([`moe`]), the cross-layer
+//! residual's mix ([`crate::attn_res`]) between them, and the state book of the step ([`state`]),
+//! the pass of up to eight rows ([`Pass`], [`Body::rows`]) and the placed body's prompt pass of up
+//! to [`SHAPES`]' widest rows ([`PassShape`], [`crate::GpuModel::prompt_placed`]), each row the
+//! step's bits. The model description is `model::arch::kimi_k3`.
 
 mod body;
 mod kda;
@@ -14,8 +15,8 @@ mod state;
 mod tier;
 
 pub use body::index::{
-    Kernels as IndexKernels, N_SEL_AT, N_VIS_AT, TOP_K_AT, WORDS, check_pass, check_selection,
-    count_words, enqueue_keys, enqueue_pick,
+    Kernels as IndexKernels, N_SEL_AT, N_VIS_AT, PassPick, TOP_K_AT, WORDS, attend_rows_sel,
+    check_selection, count_words, enqueue_keys, enqueue_pick, pass_words,
 };
 pub use body::pass::{CHUNK, PassShape, PassTail, SHAPES, pass_bytes};
 pub use body::placed::Placed;

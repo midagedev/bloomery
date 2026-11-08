@@ -1,0 +1,18 @@
+# k31passdsa mutant iq-row0
+# clause: pass (gate_kimi_k3_dsa.rs pass_clauses) and pass past top-k (gate_kimi_k3_place.rs)
+# site: crates/gpu/src/arch/kimi_k3/index.rs:497 attend_rows_sel, every row's pick over the first row's index queries
+# expected red: "  pass: 8 rows from position 2044 across top-k 2048 through attend_rows_sel vs the steps: rows whose
+#   gated heads differ in a bit [2048, 2049, 2050, 2051] ...: FAIL" (rows 2045 to 2047 keep the identity list, which
+#   picks every row whatever the scores, so they stay their own; the rows past top-k drop other rows); and the
+#   placed and whole-card "FAIL pass past top-k, ..." arms whose rows past top-k pick from another row's queries
+--- a/crates/gpu/src/arch/kimi_k3/index.rs
++++ b/crates/gpu/src/arch/kimi_k3/index.rs
+@@ -494,7 +494,7 @@
+     for t in 0..m {
+         let (ints, q_t, w_t) = (
+             row_of(words, t, WORDS)?,
+-            row_of(iq, t, hd)?,
++            row_of(iq, 0, hd)?,
+             row_of(iw, t, heads)?,
+         );
+         enqueue_pick(stream, k, keys, (&q_t, &w_t), &ints, scratch, list)?;

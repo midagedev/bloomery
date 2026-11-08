@@ -18,7 +18,9 @@
 //! - the embedding is the host table's row per id, the positions and key counts per row;
 //! - the AttnRes mixes are one block a row, the banks at a stride of the pass's rows;
 //! - a mixer runs its chunks in position order through the rows pass's own launches
-//!   ([`super::rows`]; one row is the step's launch);
+//!   ([`super::rows`]; one row is the step's launch); on a load that selects, a latent layer picks
+//!   each row's list and runs its core a row at a time over the rows' count words, staged with the
+//!   positions ([`super::index::attend_rows_sel`]);
 //! - every projection runs at most [`CHUNK`] columns ([`rows_kit::project_rows`]): each column the
 //!   one-column launch's bits;
 //! - the router over the rows is what that many one-row routes write (`route_rows`);
@@ -28,16 +30,13 @@
 //! - the back adds `(card + tier) + host` per row, as the step's back does;
 //! - a layer the card holds whole runs the step's whole-card block on each row.
 //!
-//! A pass of more rows than the plan's shape, at a position the stores do not stand at, whose last
-//! row sees more keys than a K3.1 file's indexer picks (a pass attends every key, the selection's
-//! result only up to its top-k: [`super::index::check_pass`]), or on a load made without the pass's
-//! buffers is refused by name. A prompt that crosses the top-k is cut before anything is
-//! enqueued: the ids up to it as passes, the rest as steps (`app`'s kimi_k3 `Batch::prompt`, by
-//! [`Indexer::pass_prefix`]).
+//! A pass of more rows than the plan's shape, at a position the stores do not stand at, or on a
+//! load made without the pass's buffers is refused by name.
 
 use super::super::kda;
+use super::index::{self, WORDS};
 use super::placed::{Placed, Side};
-use super::rows::run_mixer_rows;
+use super::rows::{PassSel, run_mixer_rows};
 use super::{
     Ffn, Instance, KdaBuffers, Kernels, Layer, Mixer, MixerIo, MlaBuffers, mla_dims, step_cx,
 };
@@ -61,7 +60,7 @@ use crate::tensor::{Window, WindowMut, copy_row};
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, LAYER_HEAD, launch_u32};
 use cuda_core::DeviceBuffer;
-use model::arch::kimi_k3::hparams::{Hparams, Indexer};
+use model::arch::kimi_k3::hparams::{Hparams, INDEX_DIM, INDEX_HEADS, Indexer};
 use model::arch::kimi_k3::names;
 use model::placement::kernels::{DownAct, DownForms};
 use model::placement::workstation::TierLegScratch;
@@ -147,11 +146,13 @@ struct PassLens {
 
 /// The f32 buffers: the rows' (sum ×2, mixed, update, ffn_xn, shared, banks, act, acc, tier,
 /// routed, hsum, probs, weights), then a chunk's (xn, the delta mixer's eleven, the latent
-/// mixer's nine and its two partials, the stage, the shared stack's three).
-const F32S: usize = 14 + 1 + 11 + 9 + 2 + 1 + 3;
+/// mixer's nine and its two partials, the stage, the shared stack's three, the index queries and
+/// weights on a load that selects).
+const F32S: usize = 14 + 1 + 11 + 9 + 2 + 1 + 3 + 2;
 
-/// The u32 buffers: the rows' ids, card places, tier places, positions and key counts.
-const U32S: usize = 5;
+/// The u32 buffers: the rows' ids, card places, tier places, positions, key counts and count
+/// words on a load that selects.
+const U32S: usize = 6;
 
 impl PassLens {
     fn of(
@@ -171,6 +172,7 @@ impl PassLens {
         let (part_v, part_ms) = latent_gated::partials_lens_rows(md, ctx, shape.mla_rows);
         let (heads, row) = (md.heads, md.row());
         let ff = hp.dense_ff.max(hp.experts.shared_ff());
+        let pick = |len: usize| if index::selects(hp, ctx) { len } else { 0 };
         let wide = n.max(lat).max(ff);
         let stage = [kda::stage_len(kd), mla::stage_len(md), c * wide]
             .into_iter()
@@ -218,8 +220,10 @@ impl PassLens {
             c * ff,
             c * ff,
             c * ff,
+            pick(c * INDEX_HEADS * INDEX_DIM),
+            pick(c * INDEX_HEADS),
         ];
-        let u32s = [r * n_used, r * n_used, r * n_used, r, r];
+        let u32s = [r * n_used, r * n_used, r * n_used, r, r, pick(r * WORDS)];
         let leg = LegShape {
             cap: c,
             slots_per_col: n_used,
@@ -286,19 +290,24 @@ pub(super) struct PlacedPass {
     tsel: DeviceBuffer<u32>,
     pos: DeviceBuffer<u32>,
     keys: DeviceBuffer<u32>,
+    /// `[rows][WORDS]`: the rows' count words on a load that selects ([`index::pass_words`]).
+    words: DeviceBuffer<u32>,
     /// A chunk's: the mixer's normed rows, the mixers' intermediates, the stage, the shared
-    /// stack's gate, up and SiTU rows.
+    /// stack's gate, up and SiTU rows, the index queries and weights on a load that selects.
     xn: DeviceBuffer<f32>,
     kb: KdaBuffers,
     mb: MlaBuffers,
     stage: DeviceBuffer<f32>,
     glu: [DeviceBuffer<f32>; 3],
+    iq: DeviceBuffer<f32>,
+    iw: DeviceBuffer<f32>,
     leg: LegBufs,
     rk: RowKernels,
-    /// The host's staging of the rows' embeddings and positions.
+    /// The host's staging of the rows' embeddings, positions, key counts and count words.
     rows_host: Vec<f32>,
     pos_host: Vec<u32>,
     keys_host: Vec<u32>,
+    words_host: Vec<u32>,
     /// What [`pass_bytes`] counts for this pass.
     planned: u64,
 }
@@ -381,16 +390,20 @@ impl PlacedPass {
             },
             stage: next_f()?,
             glu: [next_f()?, next_f()?, next_f()?],
+            iq: next_f()?,
+            iw: next_f()?,
             ids: next_u()?,
             sel: next_u()?,
             tsel: next_u()?,
             pos: next_u()?,
             keys: next_u()?,
+            words: next_u()?,
             leg: LegBufs::for_down(stream, lens.leg, DownAct::Q8Act)?,
             rk: RowKernels::load(gpu.context())?,
             rows_host: vec![0.0; shape.rows * hp.n_embd],
             pos_host: vec![0; shape.rows],
             keys_host: vec![0; shape.rows],
+            words_host: vec![0; shape.rows * WORDS],
             planned: lens.bytes(),
         };
         let made = pass.bytes() as u64;
@@ -457,9 +470,17 @@ impl PlacedPass {
             &self.glu[0],
             &self.glu[1],
             &self.glu[2],
+            &self.iq,
+            &self.iw,
         ];
-        let u: [&DeviceBuffer<u32>; U32S] =
-            [&self.ids, &self.sel, &self.tsel, &self.pos, &self.keys];
+        let u: [&DeviceBuffer<u32>; U32S] = [
+            &self.ids,
+            &self.sel,
+            &self.tsel,
+            &self.pos,
+            &self.keys,
+            &self.words,
+        ];
         f.iter().map(|b| b.num_bytes()).sum::<usize>()
             + u.iter().map(|b| b.num_bytes()).sum::<usize>()
             + self.leg.bytes()
@@ -522,6 +543,8 @@ struct PassWalk<'a> {
     layers: &'a mut [Layer],
     router: &'a mut Instance,
     side: &'a Side,
+    /// The step's selection buffers on a load that selects, which a latent layer's rows reuse.
+    step_sel: Option<&'a mut index::Sel>,
     p: PassParts<'a>,
     /// The blocks' rule and the router's scale.
     rule: (Act, f32),
@@ -553,11 +576,14 @@ struct PassParts<'a> {
     tsel: &'a mut DeviceBuffer<u32>,
     pos: &'a DeviceBuffer<u32>,
     keys: &'a DeviceBuffer<u32>,
+    words: &'a DeviceBuffer<u32>,
     xn: &'a mut DeviceBuffer<f32>,
     kb: &'a mut KdaBuffers,
     mb: &'a mut MlaBuffers,
     stage: &'a mut DeviceBuffer<f32>,
     glu: &'a mut [DeviceBuffer<f32>; 3],
+    iq: &'a mut DeviceBuffer<f32>,
+    iw: &'a mut DeviceBuffer<f32>,
     leg: &'a mut LegBufs,
     rk: &'a RowKernels,
 }
@@ -574,6 +600,7 @@ impl PassWalk<'_> {
             lane,
             dims,
             layers,
+            step_sel,
             p,
             n,
             m,
@@ -624,6 +651,11 @@ impl PassWalk<'_> {
             let x = rows_of(input, c0 * n, cm * n)?;
             let pos = words_of(p.pos, c0, cm)?;
             let keys = words_of(p.keys, c0, cm)?;
+            let words = if step_sel.is_some() {
+                Some(words_of(p.words, c0 * WORDS, cm * WORDS)?)
+            } else {
+                None
+            };
             let mut y = rows_of_mut(out, c0 * n, cm * n)?;
             let io = MixerIo {
                 input: &x,
@@ -645,6 +677,15 @@ impl PassWalk<'_> {
                 (l, cm, &mut layer.mixer),
                 *dims,
                 io,
+                step_sel
+                    .as_deref_mut()
+                    .zip(words.as_deref())
+                    .map(|(sel, words)| PassSel {
+                        iq: &mut *p.iq,
+                        iw: &mut *p.iw,
+                        words,
+                        sel,
+                    }),
             )?;
         }
         if !banks {
@@ -1045,9 +1086,8 @@ impl super::Body {
     ///
     /// # Errors
     /// [`GpuError`], before anything is enqueued, for a load made without the pass, no ids or
-    /// more than the pass's rows, a `pos` the stores do not stand at, rows past the caches, a last
-    /// row past a K3.1 file's indexer top-k keys, taps armed, a [`PassTail::Last`] head of more
-    /// than one row; from the launches otherwise.
+    /// more than the pass's rows, a `pos` the stores do not stand at, rows past the caches, taps
+    /// armed, a [`PassTail::Last`] head of more than one row; from the launches otherwise.
     pub(super) fn placed_rows(
         &mut self,
         gpu: &Gpu,
@@ -1097,7 +1137,6 @@ impl super::Body {
                 ),
             ));
         }
-        super::index::check_pass(self.hp.indexer.as_ref(), u64::from(end))?;
         if self.taps.is_some() {
             return Err(GpuError::shape(
                 PASS,
@@ -1129,6 +1168,12 @@ impl super::Body {
             .copy_from_host(stream, &pass.pos_host[..m])?;
         WindowMut::<u32>::of_mut(&mut pass.keys, 0, m)?
             .copy_from_host(stream, &pass.keys_host[..m])?;
+        if let Some(sel) = self.s.mla.sel.as_ref() {
+            let host = &mut pass.words_host[..m * WORDS];
+            index::pass_words(host, pos, sel.top_k())?;
+            WindowMut::<u32>::of_mut(&mut pass.words, 0, m * WORDS)?
+                .copy_from_host(stream, host)?;
+        }
         self.walk_placed(gpu, w, m, tail)?;
         self.held = end;
         Ok(())
@@ -1155,6 +1200,7 @@ impl super::Body {
             ctx,
             out_score,
             placed,
+            s: step,
             ..
         } = self;
         let placed = placed
@@ -1204,11 +1250,14 @@ impl super::Body {
             tsel,
             pos,
             keys,
+            words,
             xn,
             kb,
             mb,
             stage,
             glu,
+            iq,
+            iw,
             leg,
             rk,
             ..
@@ -1222,6 +1271,7 @@ impl super::Body {
             layers: &mut layers[..],
             router,
             side: &*side,
+            step_sel: step.mla.sel.as_mut(),
             p: PassParts {
                 shape: *shape,
                 sum,
@@ -1241,11 +1291,14 @@ impl super::Body {
                 tsel,
                 pos: &*pos,
                 keys: &*keys,
+                words: &*words,
                 xn,
                 kb,
                 mb,
                 stage,
                 glu,
+                iq,
+                iw,
                 leg,
                 rk: &*rk,
             },
@@ -1314,8 +1367,8 @@ impl super::Body {
         self.placed.as_ref()?.pass.as_deref().map(PlacedPass::shape)
     }
 
-    /// The file's lightning indexer, `None` on a K3 file: its top-k bounds the keys a pass's last
-    /// row may see ([`super::index::check_pass`], [`Indexer::pass_prefix`]).
+    /// The file's lightning indexer, `None` on a K3 file: past its top-k a latent layer attends
+    /// the rows it picks, at a step and at every row of a pass ([`super::index`]).
     #[must_use]
     pub fn indexer(&self) -> Option<&Indexer> {
         self.hp.indexer.as_ref()
@@ -1361,12 +1414,9 @@ impl GpuModel<super::Body> {
     /// `n` rows, row-major (`n` rows of the vocabulary), each row the placed step's logits at its
     /// position: the passes are cut from the end, so the last holds the last `n` rows, and its
     /// rows run through the head (the host's projection [`HOST_HEAD_ROWS`] rows at a time, or a
-    /// card head's launches one row at a time). A walk that crosses a K3.1 file's indexer top-k
-    /// is cut before anything is enqueued, as `app`'s kimi_k3 `Batch::prompt` cuts a prompt
-    /// ([`Indexer::pass_prefix`]): passes up to the top-k and short of the scored rows, then the
-    /// rest stepped, each scored row the step's logits ([`GpuModel::step`], [`GpuModel::logits`]).
-    /// Refused by name: no ids, `n` of 0 or past the ids or the pass's rows, a load made without
-    /// the pass, and as [`super::Body::placed_rows`] refuses.
+    /// card head's launches one row at a time). Refused by name: no ids, `n` of 0 or past the ids
+    /// or the pass's rows, a load made without the pass, and as [`super::Body::placed_rows`]
+    /// refuses.
     ///
     /// # Errors
     /// [`GpuError`] as above, and the head's fault.
@@ -1387,13 +1437,6 @@ impl GpuModel<super::Body> {
             ));
         }
         let total = ids.len();
-        let passed = self
-            .body(WHAT)?
-            .indexer()
-            .map_or(total, |ix| ix.pass_prefix(u64::from(self.pos()), total));
-        if passed < total {
-            return self.score_crossing(ids, n, (rows, passed.min(total - n)));
-        }
         let head_len = total - rows.min(total);
         let mut out = Vec::new();
         self.run_rows(total, WHAT, |gpu, w, body, head, pos| {
@@ -1427,37 +1470,6 @@ impl GpuModel<super::Body> {
             head.enqueue(gpu, w)?;
             Ok(true)
         })?;
-        Ok(out)
-    }
-
-    /// [`GpuModel::score_placed`] of a walk past a K3.1 file's indexer top-k: the first `passed`
-    /// ids as placed passes of up to `rows` with no head (`passed` is at most the ids before the
-    /// last `n`, so no scored row is a pass's), then every other id stepped, the step selecting its
-    /// rows, the logits read after each of the last `n`.
-    fn score_crossing(
-        &mut self,
-        ids: &[u32],
-        n: usize,
-        (rows, passed): (usize, usize),
-    ) -> Result<Vec<f32>, GpuError> {
-        const WHAT: &str = "kimi_k3 GpuModel::score_placed";
-        if passed > 0 {
-            self.run_rows(passed, WHAT, |gpu, w, body, _head, pos| {
-                for (c, chunk) in ids[..passed].chunks(rows).enumerate() {
-                    let first = pos + launch_u32(WHAT, "row", c * rows)?;
-                    body.placed_rows(gpu, w, (chunk, first), PassTail::Open)?;
-                }
-                Ok(false)
-            })?;
-        }
-        let from = ids.len() - n;
-        let mut out = Vec::new();
-        for (i, &id) in ids.iter().enumerate().skip(passed) {
-            self.step(&[id])?;
-            if i >= from {
-                out.extend(self.logits()?);
-            }
-        }
         Ok(out)
     }
 }

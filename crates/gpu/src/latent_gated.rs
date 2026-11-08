@@ -158,6 +158,7 @@ impl MlaDims {
 }
 
 /// A resident per-head value projection, as [`attend`] reads it.
+#[derive(Clone, Copy)]
 pub enum ValueW<'a> {
     /// Q6_K words, `heads·v_head` rows of `LATENT`.
     Q6K(&'a DeviceTensor<u32>),

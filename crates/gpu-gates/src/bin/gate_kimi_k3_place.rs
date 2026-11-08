@@ -85,9 +85,14 @@
 //!   completion position whose top id is the stepped load's argmax there.
 //!
 //! - `pass past top-k`: the fixture made a K3.1 file at a top-k of 16 (seeded indexer tensors on
-//!   its latent layer), loaded with the pass at a context of 64 (the load selects): a prompt of 24
-//!   ids through `Batch::prompt` (16 as passes, 8 stepped) reads the token and the position of the
-//!   same ids stepped from a reset. Mutant: the split removed (the second pass is refused by name).
+//!   its latent layer), at a context of 64 (the load selects): a prompt of 24 ids in two calls, the
+//!   first of [`DSA_SPLIT`] ids, so the second's first pass runs rows on both sides of the top-k,
+//!   then [`STEPS`] greedy ids, reads the same ids stepped from a reset: the token, the position,
+//!   every logits row's bits (after the prompt and after each id fed back, so the key rows, the
+//!   caches and the delta stores the passes leave are the steps'). Once on the whole-card body
+//!   (`GpuModel::prompt_rows`, passes of eight) and once per pinned [`PASS_SHAPES`] on the placed
+//!   pass load through `Batch::prompt`. Mutant: the pass attends every key past top-k (the dense
+//!   rows on a load that selects): the rows past it read other rows than the step's.
 //!
 //! The prompt is the fixed walk of `e2e::walk` through the vocabulary: [`PROMPT`] ids, [`STEPS`]
 //! greedy ids.
@@ -139,7 +144,7 @@ mod gate {
     use std::sync::Arc;
 
     use app::Prompt;
-    use bloomery_gpu::arch::kimi_k3::{Body, CHUNK, PassShape, SHAPES, pass_bytes};
+    use bloomery_gpu::arch::kimi_k3::{Body, CHUNK, Pass, PassShape, SHAPES, pass_bytes};
     use bloomery_gpu::host::node;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::{Fault, FaultSite, Gpu, GpuError, GpuModel};
@@ -1365,6 +1370,9 @@ mod gate {
     /// segment (`flash::seg_keys`), so the list's gathered rows and the cache take the same flash
     /// form and the selection below the top-k is the dense walk's bits.
     const DSA_CTX: usize = 64;
+    /// The ids of [`pass_past_top_k`]'s first call: the second call's first pass starts here and
+    /// runs past the top-k.
+    const DSA_SPLIT: usize = 5;
 
     /// The K3 fixture as a K3.1 file: every key under `kimi-k31.` for `kimi-k3.`, the indexer's
     /// keys at a top-k of [`DSA_TOP_K`] on the latent layers, and their five tensors each (the
@@ -1460,76 +1468,136 @@ mod gate {
         Ok(path)
     }
 
-    /// `pass past top-k`: on a placed pass load of the K3 fixture made a K3.1 file at a top-k of
-    /// [`DSA_TOP_K`] and a context of [`DSA_CTX`] (the load selects), a prompt of top-k + 8 ids
-    /// through `Batch::prompt` (passes up to the top-k, steps after it) reads the token and the
-    /// position of the same ids stepped from a reset. Mutant: the split removed from
-    /// `Batch::prompt` (the whole prompt as passes): the second pass's last row sees 24 keys and is
-    /// refused by name, so the clause ends in that error. The card budget is the K3.1 file's own
-    /// pick under the header's budget `header` (the plan counts the indexer's tensors as dense).
+    /// `pass past top-k` (the module doc): the K3.1 fixture written, its arms run, the fixture
+    /// removed.
     fn pass_past_top_k(inputs: &PlanInputs, header: u64, host: HostCfg) -> Result<bool, GateError> {
         let path = k31_fixture(inputs)?;
-        let inputs31 = PlanInputs::read_without_chat(&Split::open(&path)?)?;
+        let ran = past_top_k_arms(&path, header, host);
+        let _ = std::fs::remove_dir_all(path.parent().ok_or("the fixture's directory")?);
+        ran
+    }
+
+    /// The greedy ids from `first`, the token after a prompt: [`STEPS`] ids and the logits row
+    /// after the prompt and after each id fed back.
+    fn greedy_from(m: &mut GpuModel<Body>, first: u32) -> Result<Run, GateError> {
+        let mut ids = vec![first];
+        let mut rows = vec![m.logits()?];
+        while ids.len() < STEPS {
+            let last = ids[ids.len() - 1];
+            ids.push(m.step(&[last])?);
+            rows.push(m.logits()?);
+        }
+        Ok(Run {
+            ids,
+            logits: m.logits()?,
+            rows,
+        })
+    }
+
+    /// Whether `m`'s load selects at [`DSA_CTX`] over the K3.1 fixture's top-k.
+    fn selects(m: &GpuModel<Body>) -> Result<bool, GateError> {
+        Ok(m.body(NAME)?
+            .indexer()
+            .is_some_and(|ix| DSA_CTX > ix.top_k && ix.top_k == DSA_TOP_K))
+    }
+
+    /// One arm's verdict: the run `got` at `got_pos` against the stepped run `want` at `want_pos`.
+    fn past_top_k_line(
+        arm: &str,
+        selects: bool,
+        (got, got_pos): (&Run, u32),
+        (want, want_pos): (&Run, u32),
+    ) -> Result<bool, GateError> {
+        let clause = format!("pass past top-k, {arm}");
+        tier::sc(&format!(
+            "{clause}: a prompt across the top-k reads the stepped token, position and logits rows"
+        ))?;
+        Ok(line(
+            selects && got_pos == want_pos && got.same_rows(want),
+            &clause,
+            &format!(
+                "top-k {DSA_TOP_K}, ctx {DSA_CTX}, the load selects: {selects}; {DSA_SPLIT} ids, \
+                 then {} more: token {} at position {got_pos}, ids {:?}; stepped: token {} at \
+                 position {want_pos}, ids {:?}; every logits row's bits equal: {}",
+                DSA_TOP_K + 8 - DSA_SPLIT,
+                got.ids[0],
+                got.ids,
+                want.ids[0],
+                want.ids,
+                got.same_rows(want)
+            ),
+        ))
+    }
+
+    /// The arms of `pass past top-k` over the K3.1 fixture at `path`: the whole-card body, then
+    /// the placed pass load at each of [`PASS_SHAPES`], its card budget the K3.1 file's own pick
+    /// under the header's budget `header` (the plan counts the indexer's tensors as dense).
+    fn past_top_k_arms(
+        path: &std::path::Path,
+        header: u64,
+        host: HostCfg,
+    ) -> Result<bool, GateError> {
+        let inputs31 = PlanInputs::read_without_chat(&Split::open(path)?)?;
+        let prompt = e2e::walk(DSA_TOP_K + 8, inputs31.hp.n_vocab);
+        let (head, rest) = prompt.split_at(DSA_SPLIT);
+        let mut pass = true;
+
+        let mut m = GpuModel::<Body>::open(Gpu::new()?, Split::open(path)?, DSA_CTX)?;
+        let mut rows = {
+            let (gpu, _, body) = m.body_parts(NAME)?;
+            Pass::new(gpu, body)?
+        };
+        let on = selects(&m)?;
+        m.prompt_rows(&mut rows, head)?;
+        let first = m.prompt_rows(&mut rows, rest)?;
+        let got_pos = m.pos();
+        let got = greedy_from(&mut m, first)?;
+        m.reset()?;
+        let first = m.step(&prompt)?;
+        let want_pos = m.pos();
+        let want = greedy_from(&mut m, first)?;
+        drop((m, rows));
+        pass &= past_top_k_line("whole card", on, (&got, got_pos), (&want, want_pos))?;
+
         let table = split_table(&inputs31, &bp_machine(&inputs31)?, DSA_CTX as u64, header)?;
         let budget = pick_budget(&table)?;
-        let shape = PASS_SHAPES[0];
-        let (pass_inputs, machine, mut at) = pass_plan_inputs(&inputs31, budget, shape, false)?;
-        // The stage card also holds the latent layers' key rows, beside the plan.
-        let split = Split::open(&path)?;
         let latent = inputs31
             .hp
             .kinds
             .iter()
             .filter(|k| **k == model::arch::kimi_k3::hparams::Kind::Mla)
             .count() as u64;
+        // The stage card also holds the latent layers' key rows, beside the plan.
         let extra = latent * (DSA_CTX as u64) * 256 + (1 << 20);
-        // Kept out of the expert budget, as the prompt reserve is: the split stays the pick's.
-        let reserve = pass_inputs.prompt_reserve + extra;
-        let pass_inputs = pass_inputs.with_prompt_reserve(reserve);
-        if let CardBudget::Per(cards) = &mut at.card_budget_bytes
-            && let Some(stage) = cards.first_mut()
-        {
-            stage.1 += extra;
-        }
-        let plan = pass_inputs.plan(&machine, DSA_CTX as u64, &at)?;
-        let mut m = GpuModel::<Body>::open_placed_pass(split, &plan, &pass_inputs, 0, host, shape)?;
-        m.set_mode(StepMode::Graph);
-        let selects = m
-            .body(NAME)?
-            .indexer()
-            .is_some_and(|ix| DSA_CTX > ix.top_k && ix.top_k == DSA_TOP_K);
-        let prompt = e2e::walk(DSA_TOP_K + 8, inputs31.hp.n_vocab);
-        let split_walk = Body::prompt(&mut m, &prompt);
-        let (got, got_pos, got_row) = match split_walk {
-            Ok(t) => (t, m.pos(), m.logits()?),
-            Err(e) => {
-                let _ = std::fs::remove_dir_all(path.parent().ok_or("the fixture's directory")?);
-                return Ok(line(
-                    false,
-                    "pass past top-k",
-                    &format!("{} ids through Batch::prompt: {e}", prompt.len()),
-                ));
+        for shape in PASS_SHAPES {
+            let (pass_inputs, machine, mut at) = pass_plan_inputs(&inputs31, budget, shape, false)?;
+            // Kept out of the expert budget, as the prompt reserve is: the split stays the pick's.
+            let reserve = pass_inputs.prompt_reserve + extra;
+            let pass_inputs = pass_inputs.with_prompt_reserve(reserve);
+            if let CardBudget::Per(cards) = &mut at.card_budget_bytes
+                && let Some(stage) = cards.first_mut()
+            {
+                stage.1 += extra;
             }
-        };
-        m.reset()?;
-        let want = m.step(&prompt)?;
-        let (want_pos, want_row) = (m.pos(), m.logits()?);
-        drop(m);
-        let _ = std::fs::remove_dir_all(path.parent().ok_or("the fixture's directory")?);
-        tier::sc(
-            "pass past top-k: a prompt across the top-k reads the stepped token and position",
-        )?;
-        Ok(line(
-            selects && got == want && got_pos == want_pos,
-            "pass past top-k",
-            &format!(
-                "top-k {DSA_TOP_K}, ctx {DSA_CTX}, the load selects: {selects}; {} ids through \
-                 Batch::prompt: token {got} at position {got_pos}; stepped: token {want} at \
-                 position {want_pos}; last logits row bits equal: {}",
-                prompt.len(),
-                fnv_row(&got_row) == fnv_row(&want_row)
-            ),
-        ))
+            let plan = pass_inputs.plan(&machine, DSA_CTX as u64, &at)?;
+            let split = Split::open(path)?;
+            let mut m =
+                GpuModel::<Body>::open_placed_pass(split, &plan, &pass_inputs, 0, host, shape)?;
+            m.set_mode(StepMode::Graph);
+            let on = selects(&m)?;
+            Body::prompt(&mut m, head)?;
+            let first = Body::prompt(&mut m, rest)?;
+            let got_pos = m.pos();
+            let got = greedy_from(&mut m, first)?;
+            m.reset()?;
+            let first = m.step(&prompt)?;
+            let want_pos = m.pos();
+            let want = greedy_from(&mut m, first)?;
+            drop(m);
+            let arm = format!("placed rows={} mla_rows={}", shape.rows, shape.mla_rows);
+            pass &= past_top_k_line(&arm, on, (&got, got_pos), (&want, want_pos))?;
+        }
+        Ok(pass)
     }
 
     fn pass_cli(inputs: &PlanInputs, budget: u64, host: HostCfg) -> Result<bool, GateError> {

@@ -13,9 +13,9 @@
 //! - a delta layer runs its rows through the mixer's own recurrence in position order on the
 //!   one-lane store in place ([`super::kda::rows`]); a latent layer appends its rows to the cache
 //!   and attends each to the keys up to its own position ([`mla::rows`]), and on a load that
-//!   selects ([`super::index`]) writes its rows' index keys after: a pass attends every key, which
-//!   is the selection's result while no row sees more than the indexer's top-k keys, so a pass
-//!   past that is refused by name ([`super::index::check_pass`]);
+//!   selects ([`super::index`]) runs its rows' projections and index keys at once and each row's
+//!   pick and core in position order, the step's launches at that row
+//!   ([`super::index::attend_rows_sel`], over the rows' count words [`super::index::pass_words`]);
 //! - the feed-forward block runs the routed block's rows ([`ffn::ffn_rows`]): the router a row,
 //!   the card leg's slots local to a row;
 //! - every projection is each row's one-row launch: the K-quant m-column gemv, the f32 and q8_0
@@ -33,6 +33,7 @@
 use super::super::kda;
 use super::super::moe::MoeDims;
 use super::super::state::Lane;
+use super::index::{self, WORDS};
 use super::{
     Body, Instance, KdaBuffers, Kernels, Layer, Mixer, MixerIo, MlaBuffers, Scratch, step_cx,
 };
@@ -53,6 +54,7 @@ use crate::tensor::{Window, WindowMut, copy_row};
 use crate::weights::{DevWeight, Weights};
 use crate::{Gpu, GpuError, LAYER_HEAD, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer};
+use model::arch::kimi_k3::hparams::{INDEX_DIM, INDEX_HEADS};
 use model::arch::kimi_k3::names;
 
 /// What the refusals of this file name.
@@ -70,14 +72,18 @@ pub enum Tail<'a> {
     Open,
 }
 
-/// The ids and the first position of a pass, staged on the card by one copy, and the embedding's
-/// per-row positions and live key counts the layers read.
+/// The ids and the first position of a pass, staged on the card by one copy, the embedding's
+/// per-row positions and live key counts the layers read, and on a load that selects the rows'
+/// count words ([`index::pass_words`]), staged by one copy more.
 struct PassIn {
     host: Vec<u32>,
     /// [`PASS_ROWS`] ids, then the first position.
     buf: DeviceBuffer<u32>,
     pos: DeviceBuffer<u32>,
     keys: DeviceBuffer<u32>,
+    words_host: Vec<u32>,
+    /// `[PASS_ROWS][WORDS]`.
+    words: DeviceBuffer<u32>,
 }
 
 impl PassIn {
@@ -88,7 +94,22 @@ impl PassIn {
             buf: u(PASS_ROWS + 1)?,
             pos: u(PASS_ROWS)?,
             keys: u(PASS_ROWS)?,
+            words_host: vec![0; PASS_ROWS * WORDS],
+            words: u(PASS_ROWS * WORDS)?,
         })
+    }
+
+    /// The count words of `m` rows from position `pos` over lists of `top_k` rows, in one copy.
+    fn stage_words(
+        &mut self,
+        stream: &CudaStream,
+        (pos, m): (u32, usize),
+        top_k: u32,
+    ) -> Result<(), GpuError> {
+        let host = &mut self.words_host[..m * WORDS];
+        index::pass_words(host, pos, top_k)?;
+        let mut dst = WindowMut::<u32>::of_mut(&mut self.words, 0, m * WORDS)?;
+        Ok(dst.copy_from_host(stream, host)?)
     }
 
     /// `ids` and the position `pos` of the first, in one copy that waits for the walks before it.
@@ -100,7 +121,7 @@ impl PassIn {
     }
 
     fn bytes(&self) -> usize {
-        [&self.buf, &self.pos, &self.keys]
+        [&self.buf, &self.pos, &self.keys, &self.words]
             .into_iter()
             .map(DeviceBuffer::num_bytes)
             .sum()
@@ -155,9 +176,10 @@ impl PassFfn {
 }
 
 /// A pass's own buffers: [`PASS_ROWS`] rows of each width the step has one of, the banked block
-/// inputs of every row, the stage a row-major projection's columns land in, and the routed
-/// block's rows. Made once ([`Pass::new`], load-time) and lent to every walk; it holds no state
-/// a walk leaves for the next, so a model's reset needs nothing of it.
+/// inputs of every row, the stage a row-major projection's columns land in, the routed block's
+/// rows, and on a load that selects the rows' index queries and weights. Made once
+/// ([`Pass::new`], load-time) and lent to every walk; it holds no state a walk leaves for the
+/// next, so a model's reset needs nothing of it.
 pub struct Pass {
     s: Scratch,
     /// `banks · PASS_ROWS · n` values: bank `b`'s row `t` at `b · PASS_ROWS · n + t · n`.
@@ -166,6 +188,10 @@ pub struct Pass {
     rk: RowKernels,
     ffn: PassFfn,
     input: PassIn,
+    /// `[PASS_ROWS][heads · d]` and `[PASS_ROWS][heads]` on a load that selects, one value
+    /// otherwise.
+    iq: DeviceBuffer<f32>,
+    iw: DeviceBuffer<f32>,
     n: usize,
 }
 
@@ -241,8 +267,13 @@ impl Pass {
             acts,
             router,
             ctx,
+            s: step,
             ..
         } = body;
+        let selects = step.mla.sel.is_some();
+        let pick = |width: usize| {
+            DeviceBuffer::<f32>::zeroed(stream, if selects { PASS_ROWS * width } else { 1 })
+        };
         add_row_forms(stream, acts, layers.iter().flat_map(Layer::sites))?;
         let n = hp.n_embd;
         let moe = MoeDims::of(hp);
@@ -265,6 +296,8 @@ impl Pass {
             rk: RowKernels::load(gpu.context())?,
             ffn,
             input: PassIn::new(stream)?,
+            iq: pick(INDEX_HEADS * INDEX_DIM)?,
+            iw: pick(INDEX_HEADS)?,
             n,
         })
     }
@@ -277,12 +310,30 @@ impl Pass {
             + self.stage.num_bytes()
             + self.ffn.bytes()
             + self.input.bytes()
+            + self.iq.num_bytes()
+            + self.iw.num_bytes()
     }
 }
 
+/// What a pass's latent layer selects with on a load that selects: the rows' index queries and
+/// weights (`[m][heads · d]`, `[m][heads]`), their count words (`[m][WORDS]`) and the step's
+/// selection buffers, which each row reuses in turn.
+pub(super) struct PassSel<'a> {
+    pub(super) iq: &'a mut DeviceBuffer<f32>,
+    pub(super) iw: &'a mut DeviceBuffer<f32>,
+    pub(super) words: &'a DeviceBuffer<u32>,
+    pub(super) sel: &'a mut index::Sel,
+}
+
 /// Layer `l`'s mixer over the pass's rows `io.input`: the delta layer's rows on its one-lane store
-/// in place, or the gated latent layer's on its cache, then its rows' index keys on a load that
-/// selects; the updates land in `io.out`.
+/// in place, or the gated latent layer's on its cache, over the rows its indexer picks for each
+/// row on a load that selects (`pick`, module doc); the updates land in `io.out`. A latent layer
+/// whose `pick` and the load's indexer disagree is refused by name.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the launch context, the kit, the layer, the dims, the buffers and the selection, \
+              each named as the step's mixer names it (rust-quality R8)"
+)]
 pub(super) fn run_mixer_rows(
     cx: &GqaCx<'_>,
     (k, acts, lane): (&Kernels, &mut Acts, &Lane),
@@ -290,6 +341,7 @@ pub(super) fn run_mixer_rows(
     (l, m, mixer): (usize, usize, &mut Mixer),
     (kd, md): (&KdaDims, &MlaDims),
     io: MixerIo<'_>,
+    pick: Option<PassSel<'_>>,
 ) -> Result<(), GpuError> {
     let MixerIo {
         input,
@@ -328,7 +380,7 @@ pub(super) fn run_mixer_rows(
             cache,
             index,
         } => {
-            let bufs = MlaBufs {
+            let mut bufs = MlaBufs {
                 x: input,
                 pos,
                 n_keys: keys,
@@ -347,17 +399,29 @@ pub(super) fn run_mixer_rows(
                 out,
                 cache,
             };
-            let layer_kit = RowsKit {
-                linear: kit.linear,
-                rows: kit.rows,
-                stage: &mut *kit.stage,
-            };
-            mla::rows(cx, &k.mla, acts, (&**sites, md), (l, m), bufs, layer_kit)?;
-            match (index.as_deref_mut(), k.index.as_ref()) {
-                (Some(ix), Some(ik)) => {
-                    ix.keys_rows(cx, ik, (acts, kit), (l, m), &*xn, pos, &mut mb.qa)
+            let mut kit = kit;
+            let sites = &**sites;
+            match (index.as_deref_mut(), k.index.as_ref(), pick) {
+                (_, None, None) => mla::rows(cx, &k.mla, acts, (sites, md), (l, m), bufs, kit),
+                (Some(ix), Some(ik), Some(p)) => {
+                    let PassSel { iq, iw, words, sel } = p;
+                    mla::front_rows(cx, acts, (sites, md), (l, m), &mut bufs, &mut kit)?;
+                    let ins = (&*bufs.xn, &*bufs.qr, bufs.pos);
+                    let into = (&mut *iq, &mut *iw);
+                    ix.project_pass(cx, ik, (acts, &mut kit), (l, m), ins, bufs.qa, into)?;
+                    let mla::Core { a, s, cache, y } =
+                        mla::core(cx.w, cx.gpu.layer_sink(l)?, sites, &mut bufs)?;
+                    let pick = sel.pass_pick(ix.keys(), (&*iq, &*iw), words);
+                    index::attend_rows_sel(cx.gpu, (&k.mla, ik), md, m, a, s, cache, pick, y)?;
+                    mla::out_rows(cx, acts, (sites, md), (l, m), &mut bufs, &mut kit)
                 }
-                _ => Ok(()),
+                _ => Err(GpuError::shape(
+                    ROWS,
+                    format!(
+                        "layer {l}: a pass's selection inputs and the load's indexer disagree \
+                         (a load that selects runs every pass row over its own list)"
+                    ),
+                )),
             }
         }
     }
@@ -372,8 +436,7 @@ impl Body {
     ///
     /// # Errors
     /// [`GpuError`], before anything is enqueued, for no ids or more than [`PASS_ROWS`], a `pos`
-    /// the stores do not stand at, rows past the caches, a last row that sees more keys than a
-    /// K3.1 file's indexer picks ([`super::index::check_pass`]), taps armed (a pass does not tap),
+    /// the stores do not stand at, rows past the caches, taps armed (a pass does not tap),
     /// a [`Tail::Head`] of another row count than the pass's or a [`Tail::Last`] of more than one
     /// row, and a `pass` made for another model; from the launches otherwise.
     pub fn rows(
@@ -412,7 +475,6 @@ impl Body {
                 ),
             ));
         }
-        super::index::check_pass(self.hp.indexer.as_ref(), u64::from(end))?;
         if self.taps.is_some() {
             return Err(GpuError::shape(
                 ROWS,
@@ -444,6 +506,10 @@ impl Body {
             _ => {}
         }
         pass.input.stage(gpu.stream(), ids, pos)?;
+        if let Some(sel) = self.s.mla.sel.as_ref() {
+            pass.input
+                .stage_words(gpu.stream(), (pos, m), sel.top_k())?;
+        }
         self.walk_rows(gpu, w, pass, m, tail)?;
         self.held = end;
         Ok(())
@@ -472,6 +538,7 @@ impl Body {
             router,
             ctx,
             out_score,
+            s: step,
             ..
         } = self;
         let Pass {
@@ -481,6 +548,8 @@ impl Body {
             rk,
             ffn: pass_ffn,
             input,
+            iq,
+            iw,
             ..
         } = pass;
         let n = hp.n_embd;
@@ -500,7 +569,7 @@ impl Body {
         } = s;
         let [pa, pb] = sum;
         embed_rows(gpu, w, (input, m), pa)?;
-        let (pos, keys) = (&input.pos, &input.keys);
+        let (pos, keys, words) = (&input.pos, &input.keys, &input.words);
         let mut pushed = 0usize;
         for (l, layer) in layers.iter_mut().enumerate() {
             let fault = gpu.layer_sink(l)?;
@@ -556,6 +625,12 @@ impl Body {
                 (l, m, &mut layer.mixer),
                 (kd, md),
                 io,
+                step.mla.sel.as_mut().map(|sel| PassSel {
+                    iq: &mut *iq,
+                    iw: &mut *iw,
+                    words,
+                    sel,
+                }),
             )?;
             // 4. The sums after the mixer: its updates alone on a banking layer, else the sums
             // plus them.
