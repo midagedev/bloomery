@@ -153,9 +153,7 @@ REF_DUMP_LEASE=1
 GLM_PROSE=glm5next/corpus-prose.ids
 GLM_PROSE_SHA256=8af07981c1749170b57d424cff5274b89be063c1eb44ffa3a443ddc16642bb64
 GLM_PROSE_ALL=glm5next/corpus-prose-all.ids
-# PIN-ME-glm256: the sha256 of $BLOOMERY_DATA/glm5next/corpus-prose-all.ids, the copy of the
-# tokenizer oracle's prose-all.nps.ids (see the header); the lead pins it after making the file.
-GLM_PROSE_ALL_SHA256=pin-me-sha256-of-glm5next-corpus-prose-all-ids
+GLM_PROSE_ALL_SHA256=b8a082ab41e4a4ac4291b8224dd8238b6293bef7f8e50adf0c7465ddfeaa03df
 : "${GLM_PROSE_FROM:=50000}"
 : "${LCPP27752:=/home/user/llama.cpp-pr27752}"
 : "${LCPP27752BIN:=$LCPP27752/build/bin/llama-bench}"
