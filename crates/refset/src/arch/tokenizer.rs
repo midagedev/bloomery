@@ -42,7 +42,8 @@ pub const ARCH: &str = "tokenizer";
 
 /// The vocabulary of the Qwen3-MoE file the engine runs, `$BLOOMERY_QWEN3MOE_VOCAB`
 /// when set.
-pub const QWEN3MOE_MODEL: &str = "/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf";
+pub const QWEN3MOE_MODEL: &str =
+    "/data/moved/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf";
 
 /// The tree `/home/user/ik-tilde`: ik main at `dad2cb3e5` plus the one line
 /// that puts `~` in the S class, whose `llama-tokenize` reads V4.1's

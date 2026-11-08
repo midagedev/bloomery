@@ -71,7 +71,7 @@ source tools/ref/clefvis/profile.sh
 IMG=$HERE/tools/ref/clefvis/images
 OUT=${CLEFVIS_SETS_ROOT:-$DATA}
 PY=${CLEFVIS_PYTHON:-/home/user/clef-venv/bin/python}
-SNAPSHOT=${CLEFVIS_SNAPSHOT:-/models/clef-flash/hf}
+SNAPSHOT=${CLEFVIS_SNAPSHOT:-/data/moved/models/clef-flash/hf}
 REVISION=17f0b0ad64efb65d273590632833508766b2aae6
 BOUND=${CLEFVIS_RUN_BOUND:-${CLEFVIS_BOUND:-1500}}
 CTX=4096

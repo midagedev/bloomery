@@ -1729,7 +1729,7 @@ dump-ref-mistrallarge4 *VARIANT:
     BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S={{ if VARIANT == '' { '300' } else { '540' } }} BLOOMERY_MODEL=mistral-large4 ./tools/box.sh 'bash tools/ref/mistrallarge4-dump.sh {{VARIANT}}'
 
 # The same two oracle sets on the Mix-256G file (refset family lcpp-mistrallarge4-mix256g; 233 GB in six shards,
-# /models/Mistral-Large-4-1T-A52B-Mix-256G): the profile's file moved by BLOOMERY_REF_MODEL and the sets named
+# /data/moved/models/Mistral-Large-4-1T-A52B-Mix-256G): the profile's file moved by BLOOMERY_REF_MODEL and the sets named
 # $BLOOMERY_DATA/ref_mistrallarge4_mix256g_{a,b} by MISTRALLARGE4_TAG, the dumper, tree, prompts and taps the UD-IQ1_S
 # recipe's. Predicted wall 1-5 min [derived: docs/cards/mistrallarge4-mix256g-dump.card], under the CPU lease and its card
 # (BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/mistrallarge4-mix256g-dump.card'); DUMP_DRY=1 in that variable prints

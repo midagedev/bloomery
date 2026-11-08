@@ -18,7 +18,7 @@ pub mod vis;
 /// owns the path until the model crate reads this architecture; a set of
 /// the file moved elsewhere is stale by this line, not by its name.
 pub const MODEL: &str =
-    "/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf";
+    "/data/moved/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf";
 
 /// The ik tree every glm5next oracle family is dumped from, and the one
 /// place a re-take of the oracle changes it.

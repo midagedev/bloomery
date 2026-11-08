@@ -14,7 +14,7 @@ const ROW: Row = Row {
     arch: ARCH,
     other_files: &[
         "/models/Muse-Spark-Open-816B-A42B-UD-Q4_K_XS/Muse-Spark-Open-816B-A42B-UD-Q4_K_XS-00001-of-00006.gguf",
-        "/models/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS-00002-of-00006.gguf",
+        "/data/moved/models/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS-00002-of-00006.gguf",
         "/models/elsewhere/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS-00001-of-00006.gguf",
     ],
     other_builds: &[

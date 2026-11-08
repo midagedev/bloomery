@@ -13,7 +13,7 @@ const ROW: Row = Row {
     arch: ARCH,
     other_files: &[
         "/models/Solar-Open2-250B-IQ4_XS/Solar-Open2-250B-IQ4_XS-00001-of-00004.gguf",
-        "/models/Solar-Open2-250B-Q4_K_M/Solar-Open2-250B-Q4_K_M-00002-of-00004.gguf",
+        "/data/moved/models/Solar-Open2-250B-Q4_K_M/Solar-Open2-250B-Q4_K_M-00002-of-00004.gguf",
         "/models/elsewhere/Solar-Open2-250B-Q4_K_M-00001-of-00004.gguf",
     ],
     other_builds: &["6ea215d17", "6ea215d17+pai-000000000000", "f711c8f3"],

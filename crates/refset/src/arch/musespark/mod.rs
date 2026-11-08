@@ -42,7 +42,7 @@ pub const COMMIT: &str = "ba3c05f71";
 /// The first shard of the UD-IQ2_XXS split set every musespark set is dumped from and the tree
 /// runs: the identity each set's `# model` line states. A set of the file moved elsewhere is
 /// stale by this line, not by its name.
-pub const MODEL: &str = "/models/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS-00001-of-00006.gguf";
+pub const MODEL: &str = "/data/moved/models/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS-00001-of-00006.gguf";
 
 /// The build every musespark set names: llama.cpp [`COMMIT`] and the first 12 hex digits of
 /// the md5 of the `libllama.so` built from it (`/home/user/llama.cpp-muse`, the tree the

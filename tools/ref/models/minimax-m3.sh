@@ -22,4 +22,4 @@
 MODEL_NAME=minimax-m3
 : "${IK:=/home/user/ik-idxkey}"
 : "${LCPP:=/home/user/llama.cpp-mainline-bolt}"
-MODEL=${BLOOMERY_REF_MODEL:-/models/MiniMax-M3.1-Flash}
+MODEL=${BLOOMERY_REF_MODEL:-/data/moved/models/MiniMax-M3.1-Flash}

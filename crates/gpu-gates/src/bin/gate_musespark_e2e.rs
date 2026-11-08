@@ -7,10 +7,11 @@
 //! dumps. The fixture tier (a 4-layer mini keeping the window pattern
 //! `[T,F,T,T]`: layers 0→1 and 1→2 the SWA→full and full→SWA transitions)
 //! runs the whole-card load, then the placed arms (`placed_near_whole_card`).
-//! The real tier runs the real file (`/models/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS`)
-//! as the placed load of the gate plan (`gate_card`: the 3090's bytes on the
-//! card in view, so nearly every routed expert is the host tier's)
-//! against the real sets `ref_musespark_{a,b,c,e}`.
+//! The real tier runs the real file
+//! (`/data/moved/models/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS`, the moved file) as the placed
+//! load of the gate plan (`gate_card`: the 3090's bytes on the card in view,
+//! so nearly every routed expert is the host tier's) against the real sets
+//! `ref_musespark_{a,b,c,e}`.
 //!
 //! The clauses are a list ([`CLAUSES`]); each prints lines ending in PASS or
 //! FAIL, and a step that raises the card's fault word is a FAIL naming the

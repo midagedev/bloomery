@@ -300,7 +300,7 @@ pub static MIMO2_BESIDE: BesideDraft = BesideDraft {
     file: DraftFile::ByCheckpoint(&[
         CheckpointFile {
             checkpoint: "MiMo-V2.6-Flash-MOPD",
-            path: "/models/MiMo-V2.6-Flash-MOPD/mtp-MiMo-V2.6-Flash-MOPD-Q8_0.gguf",
+            path: "/data/moved/models/MiMo-V2.6-Flash-MOPD/mtp-MiMo-V2.6-Flash-MOPD-Q8_0.gguf",
         },
         CheckpointFile {
             checkpoint: "MiMo-V2.6-Flash-RL",
@@ -650,7 +650,7 @@ mod tests {
         );
         assert_eq!(
             row.candidates()[0].path,
-            "/models/MiMo-V2.6-Flash-MOPD/mtp-MiMo-V2.6-Flash-MOPD-Q8_0.gguf"
+            "/data/moved/models/MiMo-V2.6-Flash-MOPD/mtp-MiMo-V2.6-Flash-MOPD-Q8_0.gguf"
         );
     }
 
@@ -681,7 +681,9 @@ mod tests {
         assert_eq!(
             row.pick_for(MOPD, None, &target),
             Ok((
-                PathBuf::from("/models/MiMo-V2.6-Flash-MOPD/mtp-MiMo-V2.6-Flash-MOPD-Q8_0.gguf"),
+                PathBuf::from(
+                    "/data/moved/models/MiMo-V2.6-Flash-MOPD/mtp-MiMo-V2.6-Flash-MOPD-Q8_0.gguf"
+                ),
                 DraftFrom::Family(MTP_LEVER)
             ))
         );

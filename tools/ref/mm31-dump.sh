@@ -22,7 +22,7 @@
 # same command with MM31_RESUME=1 (prefill from its last finished layer, greedy from its last finished step). A staged
 # directory already there without MM31_RESUME=1 is refused by name, never overwritten.
 #
-# The folder is BLOOMERY_MM31_FOLDER, default /models/MiniMax-M3.1-Flash: the dumper refuses a folder that is neither the
+# The folder is BLOOMERY_MM31_FOLDER, default /data/moved/models/MiniMax-M3.1-Flash: the dumper refuses a folder that is neither the
 # revision it pins (by the index's sha256) nor a cut of that revision (the `bloomery.fixture.*` keys of the first shard,
 # `dump_tf.py --kind` names which). A cut is the fixture tier: its `# fixture` line is refset's (`refset-check --fixture-line`
 # on its first shard, built here the way tools/ref/ref-paths.sh's fixture_line builds it), given to the dumper, and its sets are
