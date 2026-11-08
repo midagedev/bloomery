@@ -921,8 +921,8 @@ Structured output is served for `response_format` of type `json_schema` or `json
 - **One model a server**, and one expert tier card at most (`--place bp`).
 - **GLM-5.3** holds at most 16,384 positions a slot: a `--ctx-size` whose slot share passes it is refused at start,
   and a longer prompt answers `exceed_context_size_error`.
-- **Kimi K3.1 Pro** loads at `--place bp` only, one slot, and holds `--ctx-size` to 2,048 positions: the reader runs the
-  lightning indexer's selection up to its top-k, and a larger context is refused at the start by name. The seat steps a
+- **Kimi K3.1 Pro** loads at `--place bp` only, one slot. Past the lightning indexer's top-k (2,048 positions) the latent
+  layers attend the rows the indexer picks, so `--ctx-size` is not held to the top-k. The seat steps a
   prompt one id at a time and serves the model's think span as plain text (no `reasoning_content`). Kimi K3's
   `UD-IQ1_S` file does not load: its dense trunk is past one 48 GB card.
 - **Small cards.** On a 12 to 16 GB card the split Qwen3 load's default context fits to the largest the plan holds.
