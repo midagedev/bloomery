@@ -37,6 +37,7 @@ use super::{
     PlanLevers, PoolNeed, Role, RoutedRule, Row, Segment, card_bytes, per_expert, plan_routed,
     row_bytes,
 };
+use bloomery_levers::KvHost;
 
 /// Seed a routed plan and lower any explicit node ownership.
 #[allow(
@@ -279,6 +280,7 @@ pub fn routed_host<'a>(
             arena_columns: columns,
             table_bytes: 0,
             shadow_bytes: 0,
+            kv_host_bytes: 0,
             stage_kv_bytes: 0,
             reserve_bytes: 0,
             row_reserve_bytes: 0,
@@ -293,6 +295,7 @@ pub fn routed_host<'a>(
         budget_from_pool: false,
         expert_rank: None,
         kv_floor: None,
+        kv_host: KvHost::default(),
     })
 }
 

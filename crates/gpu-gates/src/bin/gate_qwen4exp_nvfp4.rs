@@ -321,6 +321,7 @@ mod gate {
             room: None,
             residency: Residency::Off,
             kv: KvQ8::F16,
+            kv_host: bloomery_levers::KvHost::Off,
         }
         .plan(file)?;
         let p = planned.facts();
@@ -712,6 +713,7 @@ mod gate {
             room: None,
             residency: Residency::Off,
             kv: KvQ8::F16,
+            kv_host: bloomery_levers::KvHost::Off,
         };
         let card_bytes = open.plan(model_of(path)?)?.facts().card_bytes;
         let short = match Tier::from_env()? {
@@ -936,6 +938,7 @@ mod gate {
             room: None,
             residency: Residency::Off,
             kv,
+            kv_host: bloomery_levers::KvHost::Off,
         }
         .plan(file)?;
         let page = os::page_bytes()?;

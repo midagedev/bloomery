@@ -1,6 +1,7 @@
 use std::num::NonZeroU64;
 use std::ops::Range;
 
+use bloomery_levers::KvHost;
 use gguf::GgmlType;
 
 use super::planner::capped;
@@ -33,6 +34,7 @@ fn budget_plan<'a>(model: &'a ModelTensors, machine: &'a Machine, budget: u64) -
             arena_columns: 1,
             table_bytes: 0,
             shadow_bytes: 0,
+            kv_host_bytes: 0,
             stage_kv_bytes: 0,
             reserve_bytes: 0,
             row_reserve_bytes: 0,
@@ -47,6 +49,7 @@ fn budget_plan<'a>(model: &'a ModelTensors, machine: &'a Machine, budget: u64) -
         budget_from_pool: false,
         expert_rank: None,
         kv_floor: None,
+        kv_host: KvHost::default(),
     }
 }
 /// A card running `layers`, with the head and the token embedding as

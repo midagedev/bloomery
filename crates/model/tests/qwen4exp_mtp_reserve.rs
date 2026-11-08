@@ -212,6 +212,7 @@ fn inputs() -> PlanInputs {
         room: (u64::MAX, model::placement::workstation::HostRead::Given),
         row_source: model::placement::RowTableSource::Split,
         arena: None,
+        kv_host_page: None,
     }
 }
 

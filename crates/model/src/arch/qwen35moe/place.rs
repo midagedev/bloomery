@@ -41,6 +41,7 @@
 //! fits. The draft program's arena holds a store walk of 64 or 512 rows
 //! ([`StoreRows`]), chosen by the plan from its room.
 
+use bloomery_levers::KvHost;
 use bloomery_placement::slots::{SeqTerms, Stores};
 use gguf::{GgmlType, Split};
 use models::headpick::{HeadRowsError, HeadSet, vocab_sha256};
@@ -205,6 +206,17 @@ pub struct PlanInputs {
     /// as its `given` ([`placement::expert_nvme_tier`]). A gate that plans an
     /// arm by an arena of its own sets it.
     pub arena: Option<u64>,
+    /// The page a host-capable room takes on the plan's stage card — the
+    /// least common multiple of the card's and the host's VMM granularities
+    /// (`gpu`'s `host_page`) — which the plan's page rounding for the K/V
+    /// planes reads under `BLOOMERY_KV_HOST` ([`PlanLevers::kv_host`]):
+    /// [`PlanInputs::room_padding`] rounds the planes at it under `spill`,
+    /// and a plan under `all` counts the planes' whole bytes against its
+    /// host room at it ([`PlanInputs::kv_host_bytes`]), refused by name
+    /// without it. `None` unset and under `off`; a binary that plans under
+    /// the lever reads it once and sets it, as a gate sets
+    /// [`PlanInputs::room`].
+    pub kv_host_page: Option<u64>,
 }
 
 /// Why a plan was refused.
@@ -366,29 +378,80 @@ fn refuse_other_program(spec: &ModelSpec) -> Result<(), PlacementError> {
 }
 
 impl PlanInputs {
+    /// `n` rounded up to `page`; `None` past u64.
+    fn whole(n: u64, page: u64) -> Option<u64> {
+        n.div_ceil(page).checked_mul(page)
+    }
+
+    /// The page a host-capable room takes ([`PlanInputs::kv_host_page`]),
+    /// refused by name where the binary that plans under `BLOOMERY_KV_HOST`
+    /// did not read it: the plan's page rounding for the planes has no page
+    /// to read.
+    fn kv_host_page_of(&self) -> Result<u64, PlacementError> {
+        self.kv_host_page.ok_or_else(|| PlacementError::Metadata {
+            key: "BLOOMERY_KV_HOST".to_owned(),
+            detail: "the page a host-capable room takes was not read; a binary that plans under \
+                     the lever reads it once (gpu's host_page) and sets PlanInputs::kv_host_page"
+                .to_owned(),
+        })
+    }
+
     /// Bytes beyond the positional rows that room-backed stores can hold:
     /// every buffer rounded independently on every resident slot, and the
-    /// device's one shared spare page. `page` is read when the stage card opens.
+    /// device's shared spare pages. `page` is read when the stage card opens.
+    /// `kv` is the K/V planes' backing (`BLOOMERY_KV_HOST`): under `spill` the
+    /// planes round at the page a host-capable room takes
+    /// ([`PlanInputs::kv_host_page`]), not the card's own granularity, and
+    /// the device holds that room's spare page beside the card rooms'; under
+    /// `all` the planes hold no card bytes, so they add no card padding and
+    /// their whole bytes sit on the host ([`PlanInputs::kv_host_bytes`]),
+    /// their room's spare page still on the card.
     pub fn room_padding(
         &self,
         ctx: u64,
         slots: u64,
         drafts: bool,
         page: u64,
+        kv: KvHost,
     ) -> Result<u64, PlacementError> {
         assert!(page > 0, "the device allocation granularity is positive");
-        let padding = |n: u64| n.div_ceil(page).checked_mul(page)?.checked_sub(n);
-        let planes = |g: &models::Gqa| -> Option<u64> {
+        let host_page = match kv {
+            KvHost::Off => None,
+            KvHost::Spill | KvHost::All => Some(self.kv_host_page_of()?),
+        };
+        let at = host_page.unwrap_or(page);
+        let padding = |n: u64, at: u64| Self::whole(n, at)?.checked_sub(n);
+        // The planes' padding at a page of the rooms' own.
+        let planes_at = |g: &models::Gqa, at: u64| -> Option<u64> {
             let values = u64::from(g.kv_heads)
                 .checked_mul(ctx)?
                 .checked_mul(u64::from(g.head_dim))?;
             let one = if self.kv.is_q8() {
-                padding(values)?.checked_add(padding(values / 16)?)?
+                padding(values, at)?.checked_add(padding(values / 16, at)?)?
             } else {
-                padding(values.checked_mul(2)?)?
+                padding(values.checked_mul(2)?, at)?
             };
             one.checked_mul(2)
         };
+        // The target's planes: none under `all` (a host-backed room holds
+        // them off the card), else at the page their rooms take — the card's
+        // own under `off`, a host-capable room's under `spill`.
+        let planes = |g: &models::Gqa| -> Option<u64> {
+            if kv == KvHost::All {
+                return Some(0);
+            }
+            planes_at(g, at)
+        };
+        // The draft's store stays on the card whatever the planes' backing.
+        let draft_planes = |g: &models::Gqa| -> Option<u64> { planes_at(g, page) };
+        // The card rooms' shared spare page, and a host-capable room's own
+        // beside it where the two pages differ.
+        let spare = page
+            + if kv != KvHost::Off && at != page {
+                at
+            } else {
+                0
+            };
         let count = || -> Option<u64> {
             let mut extra = 0u64;
             for layer in &self.spec.layers {
@@ -399,30 +462,71 @@ impl PlanInputs {
                             .div_ceil(u64::from(*pool))
                             .checked_mul(u64::from(*d))?
                             .checked_mul(2)?;
-                        extra = extra.checked_add(padding(bytes)?)?;
+                        extra = extra.checked_add(padding(bytes, page)?)?;
                     }
                 }
             }
             if drafts {
-                extra = extra.checked_add(planes(self.spec.gqa()?)?)?;
+                extra = extra.checked_add(draft_planes(self.spec.gqa()?)?)?;
             }
-            extra.checked_mul(slots)?.checked_add(page)
+            extra.checked_mul(slots)?.checked_add(spare)
         };
         count().ok_or_else(|| PlacementError::CardBytesPastU64 {
             card: "room-backed stores".to_owned(),
         })
     }
 
+    /// The whole bytes the K/V planes of a host-backed store
+    /// (`BLOOMERY_KV_HOST=all`) hold on the host at `ctx` positions over
+    /// `slots` resident sequences: every selecting layer's planes, each plane
+    /// buffer rounded at the page a host-capable room takes
+    /// ([`PlanInputs::kv_host_page`]) — the pages the rooms hold once their
+    /// sequences reach every position. What the plan counts against its host
+    /// room ([`Plan::kv_host_planes`]).
+    pub fn kv_host_bytes(&self, ctx: u64, slots: u64, page: u64) -> Result<u64, PlacementError> {
+        assert!(page > 0, "the page a host-capable room takes is positive");
+        let q8 = self.kv.is_q8();
+        let planes = |g: &models::Gqa| -> Option<u64> {
+            let values = u64::from(g.kv_heads)
+                .checked_mul(ctx)?
+                .checked_mul(u64::from(g.head_dim))?;
+            let one = if q8 {
+                Self::whole(values, page)?.checked_add(Self::whole(values / 16, page)?)?
+            } else {
+                Self::whole(values.checked_mul(2)?, page)?
+            };
+            one.checked_mul(2)
+        };
+        let count = || -> Option<u64> {
+            let mut whole = 0u64;
+            for layer in &self.spec.layers {
+                if let Mixer::Gqa(g) = &layer.mixer
+                    && g.select.is_some()
+                {
+                    whole = whole.checked_add(planes(g)?)?;
+                }
+            }
+            whole.checked_mul(slots)
+        };
+        count().ok_or_else(|| PlacementError::Metadata {
+            key: "the K/V planes on the host".to_owned(),
+            detail: "the planes' bytes over the resident slots pass u64".to_owned(),
+        })
+    }
+
     /// `machine`'s stage card with the page rounding of room-backed stores
     /// ([`PlanInputs::room_padding`]) reserved: what every plan of a load
-    /// that backs its stores by room counts before admission.
+    /// that backs its stores by room counts before admission. `kv` is the
+    /// K/V planes' backing ([`BLOOMERY_KV_HOST`]), as the plan's levers hold
+    /// it.
     pub fn reserve_room(
         &self,
         machine: &mut Machine,
         (ctx, slots, drafts): (u64, u64, bool),
         page: u64,
+        kv: KvHost,
     ) -> Result<(), PlacementError> {
-        let padding = self.room_padding(ctx, slots, drafts, page)?;
+        let padding = self.room_padding(ctx, slots, drafts, page, kv)?;
         machine.cards[0]
             .reserves
             .push(("store page rounding".to_owned(), padding));
@@ -516,6 +620,7 @@ impl PlanInputs {
                 Some(_) => placement::RowTableSource::Parts,
             },
             arena,
+            kv_host_page: None,
         })
     }
 
@@ -889,6 +994,15 @@ impl PlanInputs {
             };
             let floor = 2 * self.seq_state_bytes(ctx_max, beside.mtp);
             let room = plan.plan_at(&self.room);
+            // Under `all` the planes hold their bytes on the host, out of the
+            // room the plan was made at, refused by name past it
+            // ([`PlacementError::KvHostOverHost`]): before the PLE table's
+            // tier and the NVMe tier's split read the room, so both see the
+            // room the planes already took.
+            if levers.kv_host == KvHost::All {
+                let page = self.kv_host_page_of()?;
+                plan.kv_host_planes(self.kv_host_bytes(ctx_max, beside.slots as u64, page)?)?;
+            }
             let page = os::page_bytes().map_err(|e| PlacementError::Host(e.to_string()))?;
             self.place_rows(&mut plan, room, floor, ubatch, page)?;
             plan.host.step_slots(
@@ -2490,6 +2604,19 @@ impl KvBytes for KvLayout {
         own + ple
     }
 
+    /// A selecting layer's planes alone — the part a host-backed store
+    /// (`BLOOMERY_KV_HOST=all`) holds off the card; a plain attention
+    /// layer's cache is plain device tensors on the loads that read this
+    /// layout, so none of it moves.
+    fn plane_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
+        match (&self.select, self.kinds.get(layer)) {
+            (Some(_), Some(Kind::Attention)) => {
+                kv_plane_bytes(self.kv_heads, self.head_dim, self.q8, ctx_max)
+            }
+            _ => 0,
+        }
+    }
+
     fn stage_position_bytes(&self, ctx_max: u64) -> u64 {
         self.rope_row * ctx_max
     }
@@ -3125,8 +3252,8 @@ mod tests {
 
     use super::{
         DELTA_VERIFY_ROWS, Ffn, Kind, KvBytes, KvLayout, Mixer, ModelSpec, OutGate, PASS_ROWS,
-        PlacementError, delta_carry_bytes, delta_lane_bytes, delta_record_bytes, gdn_bytes,
-        ple_ring_bytes, recurrent_bytes, refuse_other_program,
+        PlaceError, PlacementError, delta_carry_bytes, delta_lane_bytes, delta_record_bytes,
+        gdn_bytes, ple_ring_bytes, recurrent_bytes, refuse_other_program,
     };
 
     /// A GQA mixer of `kv_heads` key heads of 256 values, rotating `rope_dims` values of
@@ -3516,6 +3643,190 @@ mod tests {
         let text = over.to_string();
         assert!(
             text.contains("BLOOMERY_KV_FLOOR") && text.contains("4097") && text.contains("4096"),
+            "{text}"
+        );
+    }
+
+    /// A qwen4exp plan under `BLOOMERY_KV_HOST=all` holds its K/V planes on
+    /// the host: the card's cache term drops the planes (the half GiB the
+    /// cap takes on this header's one attention layer), so the expert spread
+    /// gets their bytes as a floor's do — every expert back where the cap's
+    /// KV displaced all but 14 — while the pooled keys, the ring and the
+    /// stage rows stay counted. The host counts the planes' whole bytes,
+    /// every plane buffer rounded at the page a host-capable room takes, out
+    /// of the room the plan was made at, refused by name one byte under
+    /// their need; the plan's `kv_host` says the backing, and `all` beside a
+    /// `BLOOMERY_KV_FLOOR` is refused by name.
+    ///
+    /// FAIL-first: a plan that ignores the backing holds the cap's 14
+    /// experts and its cap's cache term.
+    #[test]
+    fn a_qwen4exp_plan_holds_its_kv_planes_on_the_host_under_all() {
+        use crate::arch::qwen35moe::hparams::tests::{keys, tensors};
+        use crate::arch::synthetic::{Ty, V, header_typed};
+        use crate::placement::PlanLevers;
+        use crate::placement::workstation::{HostNeed, HostRead};
+        use bloomery_levers::KvHost;
+        use runtime::stores::kv_plane_bytes;
+
+        let typed: Vec<_> = tensors()
+            .into_iter()
+            .map(|(n, d)| {
+                if n.contains(".ffn_gate_exps") || n.contains(".ffn_up_exps") {
+                    (n, vec![2_621_440, 1, 8], Ty::Q4K)
+                } else if n.contains(".ffn_down_exps") {
+                    (n, vec![2_097_152, 1, 8], Ty::Q8_0)
+                } else if n.ends_with(".attn_q.weight") {
+                    (n, vec![64, 8_192], Ty::F32)
+                } else {
+                    (n, d, Ty::F32)
+                }
+            })
+            .collect();
+        let pre = [("tokenizer.ggml.pre", V::Str("qwen35"))];
+        let keys: Vec<(&str, V)> = keys()
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    k,
+                    match k {
+                        "attention.key_length" | "attention.value_length" => V::U32(2_048),
+                        _ => v,
+                    },
+                )
+            })
+            .collect();
+        let path = header_typed("q4x-kvhost", "qwen4exp", &keys, &pre, &typed);
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let mut inputs = super::PlanInputs::describe_in(&split, (u64::MAX, HostRead::Given))
+            .expect("the file describes");
+        let _ = std::fs::remove_file(&path);
+        let page = 2u64 << 20;
+        inputs.kv_host_page = Some(page);
+        let small = crate::placement::workstation::CardSpec {
+            name: "small",
+            total_bytes: 7 << 28,
+            driver_reserve_bytes: 0,
+            device: None,
+            free_bytes: None,
+            held_by: None,
+            integrated: false,
+            margin_bytes: Some(64 << 20),
+            granule_bytes: crate::placement::workstation::GRANULE,
+        };
+        let machine = super::machine(
+            small,
+            crate::arch::qwen35moe::place::Stack::q8_blocks32(inputs.model.layers),
+            8,
+        );
+        // The one attention layer's planes, derived from its header shape:
+        // what leaves the card's cache term and lands on the host, each of
+        // the two plane buffers rounded at the host-capable page.
+        let g = inputs
+            .spec
+            .layers
+            .iter()
+            .find_map(|l| match &l.mixer {
+                Mixer::Gqa(g) if g.select.is_some() => Some((g.kv_heads, g.head_dim)),
+                _ => None,
+            })
+            .expect("a selecting layer");
+        let (heads, dim) = (u64::from(g.0), u64::from(g.1));
+        let planes = kv_plane_bytes(heads as usize, dim as usize, false, 65_536);
+        let whole_bytes = |n: u64, at: u64| n.div_ceil(at) * at;
+        let on_host = 2 * whole_bytes(heads * 65_536 * dim * 2, page);
+        assert!(
+            on_host >= planes && on_host - planes < 2 * page,
+            "the host bytes are the planes' two buffers page-rounded: {on_host} over {planes}"
+        );
+        let off = inputs
+            .plan_with(
+                &machine,
+                (65_536, 8),
+                &PlanLevers::default(),
+                super::Experts::Card,
+            )
+            .expect("the cap's plan");
+        assert_eq!(off.kv_host, KvHost::Off);
+        assert_eq!(
+            off.cards[0].experts, 14,
+            "the cap's KV displaces the experts"
+        );
+        let all = inputs
+            .plan_with(
+                &machine,
+                (65_536, 8),
+                &PlanLevers {
+                    kv_host: KvHost::All,
+                    ..PlanLevers::default()
+                },
+                super::Experts::Card,
+            )
+            .expect("the plan under all");
+        assert_eq!(all.kv_host, KvHost::All);
+        assert!(all.kv_floor.is_none(), "all needs no floor");
+        assert_eq!(
+            all.cards[0].experts,
+            inputs.model.experts * inputs.model.layers as u64,
+            "the planes' bytes give every expert back"
+        );
+        assert!(
+            all.cards[0].experts > off.cards[0].experts,
+            "the expert spread got the planes' bytes"
+        );
+        assert_eq!(
+            all.cards[0].kv_bytes,
+            off.cards[0].kv_bytes - planes,
+            "the cache term drops exactly the planes, the pooled keys and ring kept"
+        );
+        assert_eq!(
+            all.host.kv_host_bytes, on_host,
+            "the host holds the planes' whole bytes, both plane buffers rounded at the page"
+        );
+        // The room the plan was made at takes the planes or refuses by name:
+        // its need with them is the boundary, and the refusal is the planes'
+        // own (it runs before the PLE table's tier and the NVMe tier's split
+        // read the room).
+        let need = HostNeed::of(&all, 0).plan_bytes();
+        inputs.room = (need - 1, HostRead::Given);
+        let over = inputs
+            .plan_with(
+                &machine,
+                (65_536, 8),
+                &PlanLevers {
+                    kv_host: KvHost::All,
+                    ..PlanLevers::default()
+                },
+                super::Experts::Card,
+            )
+            .expect_err("one byte under the need is refused");
+        assert!(matches!(
+            &over,
+            PlaceError::Placement(PlacementError::KvHostOverHost { bytes, .. }) if *bytes == on_host
+        ));
+        let text = over.to_string();
+        assert!(
+            text.contains("BLOOMERY_KV_HOST") && text.contains("planes"),
+            "{text}"
+        );
+        // `all` beside a floor is refused by name: it already plans the
+        // spread at a zero card position.
+        inputs.room = (u64::MAX, HostRead::Given);
+        let both = inputs
+            .plan_with(
+                &machine,
+                (65_536, 8),
+                &PlanLevers {
+                    kv_host: KvHost::All,
+                    kv_floor: Some(4_096),
+                    ..PlanLevers::default()
+                },
+                super::Experts::Card,
+            )
+            .expect_err("all beside a floor is refused");
+        let text = both.to_string();
+        assert!(
+            text.contains("BLOOMERY_KV_HOST") && text.contains("BLOOMERY_KV_FLOOR"),
             "{text}"
         );
     }
@@ -4584,6 +4895,8 @@ mod tests {
     mod slots {
         use std::num::NonZeroU64;
 
+        use bloomery_levers::KvHost;
+
         use gguf::GgmlType;
         use models::headpick::HeadSet;
         use models::{
@@ -4747,6 +5060,7 @@ mod tests {
                 room: (u64::MAX, HostRead::Given),
                 row_source: placement::RowTableSource::Split,
                 arena: None,
+                kv_host_page: None,
             }
         }
 
@@ -4786,7 +5100,7 @@ mod tests {
                                     })
                                     .sum();
                                 let padding = inputs
-                                    .room_padding(ctx, slots, drafts, page)
+                                    .room_padding(ctx, slots, drafts, page, KvHost::Off)
                                     .expect("room padding");
                                 assert_eq!(
                                     raw * slots + padding,
@@ -4803,11 +5117,11 @@ mod tests {
             let (ctx, slots, page) = (16, 16, 2 << 20);
             let drafts = false;
             let padding = inputs
-                .room_padding(ctx, slots, drafts, page)
+                .room_padding(ctx, slots, drafts, page, KvHost::Off)
                 .expect("padding");
             let mut machine = machine();
             inputs
-                .reserve_room(&mut machine, (ctx, slots, drafts), page)
+                .reserve_room(&mut machine, (ctx, slots, drafts), page, KvHost::Off)
                 .expect("reserve");
             let levers = PlanLevers::default();
             let plan = inputs
@@ -4837,7 +5151,7 @@ mod tests {
                 (16, 1, u64::MAX),
             ] {
                 let e = inputs
-                    .room_padding(ctx, slots, drafts, page)
+                    .room_padding(ctx, slots, drafts, page, KvHost::Off)
                     .expect_err("overflow refuses");
                 assert!(
                     matches!(e, PlacementError::CardBytesPastU64 { ref card } if card == "room-backed stores")

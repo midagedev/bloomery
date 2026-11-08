@@ -1,6 +1,8 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use bloomery_levers::KvHost;
+
 use super::Role;
 use super::card_budget;
 use super::machine::{
@@ -189,6 +191,12 @@ pub struct HostTotals {
     pub table_bytes: u64,
     /// The cards' ring shadows, page-locked ([`KvBytes::shadow_bytes`]).
     pub shadow_bytes: u64,
+    /// The K/V planes a host-backed store holds on the host
+    /// (`BLOOMERY_KV_HOST=all`), page-rounded at the page a host-capable
+    /// room takes: 0 under `off` and `spill`. Set by [`Plan::kv_host_planes`]
+    /// past the headroom below, and counted with the shadows in the plan's
+    /// host need ([`workstation::HostNeed`]).
+    pub kv_host_bytes: u64,
     /// The host stage's cache ([`KvBytes::layer_bytes`] over its layers and
     /// the position rows beside it); 0 with a stage card.
     pub stage_kv_bytes: u64,
@@ -291,6 +299,12 @@ pub struct Plan<'a> {
     /// holds the floor's bytes while its `ctx_max` keeps the range and rows
     /// the rooms are planned at. None, every term at `ctx_max`.
     pub kv_floor: Option<u64>,
+    /// The K/V planes' backing the plan was made under
+    /// (`PlanLevers::kv_host`, `BLOOMERY_KV_HOST`): under [`KvHost::All`] the
+    /// cards' cache terms drop the planes ([`KvBytes::plane_bytes`]) and the
+    /// host holds them ([`HostTotals::kv_host_bytes`]); `spill` and `off`
+    /// leave the card terms as they were.
+    pub kv_host: KvHost,
 }
 
 /// What the load of one stage card does about the output head ([`Plan::head_site`]).

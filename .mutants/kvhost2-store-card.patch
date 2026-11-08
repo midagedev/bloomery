@@ -1,0 +1,26 @@
+# kvhost2 mutant store-card
+# clause: the bit-for-bit gate's kvhost clause (crates/gpu-gates/src/bin/gate_qwen4exp_e2e.rs,
+#   fn kv_host): under BLOOMERY_KV_HOST=all the load builds its selecting stores' K/V planes on
+#   the card anyway, so the planes hold card bytes and none on the host and the clause's
+#   "card bytes 0 and host bytes > 0" part reds (the logits and ids stay bit for bit: the
+#   backing moves no bit).
+# site: crates/gpu/src/arch/qwen3moe/scratch38.rs backing_of — All mapped to Backing::Card.
+# expected red: "kvhost: ... the planes' card bytes <n> and host bytes 0 (0 and > 0: FAIL)".
+
+--- a/crates/gpu/src/arch/qwen3moe/scratch38.rs	2026-11-09 05:12:35
++++ b/crates/gpu/src/arch/qwen3moe/scratch38.rs	2026-11-09 05:12:35
+@@ -95,13 +95,13 @@
+ /// the store's own mapping of the lever's typed word, one owner with the
+ /// lever row.
+ pub(super) fn backing_of(kv: bloomery_levers::KvHost) -> Backing {
+     match kv {
+         bloomery_levers::KvHost::Off => Backing::Card,
+         bloomery_levers::KvHost::Spill => Backing::Spill,
+-        bloomery_levers::KvHost::All => Backing::Host,
++        bloomery_levers::KvHost::All => Backing::Card,
+     }
+ }
+ 
+ /// A layer's store: the delta rule's recurrent state ([`LANES`] lane), its
+ /// lane's stamp (`linear::delta`'s module doc), conv ring, carry and verify
+ /// record ([`VERIFY_ROWS`] rows), or a

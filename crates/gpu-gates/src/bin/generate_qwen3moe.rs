@@ -463,7 +463,7 @@ mod cli {
     use bloomery_gpu::{Gpu, GpuModel, NemotronHModel, NemotronHMoeModel, Qwen3moeModel};
 
     use bloomery_gpu_gates::generate::{
-        Known, Place, card_words, lane_at, refuse_unknown, stage_page,
+        Known, Place, card_words, lane_at, refuse_unknown, stage_host_page, stage_page,
     };
     use bloomery_gpu_gates::host_stats::{Probe, print_stats};
     use bloomery_gpu_gates::llama_launch::{self, Launcher};
@@ -1346,7 +1346,7 @@ mod cli {
             }
         };
         let chosen = q38place::choose(flag, &gpu_census::census()?, |offer| {
-            let inputs = inputs38(file, levers)?;
+            let inputs = inputs38_at(file, levers, offer)?;
             let (draft, _) = draft38(levers, offer, logits, arms, ctx)?;
             let mtp = match draft {
                 Draft38::Off | Draft38::Lookup => None,
@@ -1380,6 +1380,17 @@ mod cli {
         let mut inputs = PlanInputs::describe(file)?;
         let kv = KvChoice::choose(None, levers.qwen3_kv_set())?.kv;
         inputs.kv = inputs.kv.in_q8_if(kv == KvQ8::Q8);
+        Ok(inputs)
+    }
+
+    /// [`inputs38`] for a load at `place`, the page a host-capable room takes
+    /// on its stage card read once under `BLOOMERY_KV_HOST`
+    /// ([`PlanInputs::kv_host_page`]).
+    fn inputs38_at(file: &Split, levers: &Levers, place: Place) -> Result<PlanInputs, GateError> {
+        let mut inputs = inputs38(file, levers)?;
+        if levers.kv_host() != bloomery_levers::KvHost::Off {
+            inputs.kv_host_page = Some(stage_host_page(place.card_specs()?[0])?);
+        }
         Ok(inputs)
     }
 
@@ -1419,7 +1430,7 @@ mod cli {
         (ctx, slots): (usize, usize),
         mtp: bool,
     ) -> Result<u64, GateError> {
-        let mut inputs = inputs38(file, levers)?;
+        let mut inputs = inputs38_at(file, levers, place)?;
         inputs.room = room.clone();
         let ub = u64::try_from(ubatch_for(ctx)?)?;
         let ctx_max = u64::try_from(ctx)?;
@@ -1552,7 +1563,12 @@ mod cli {
             }
         };
         let drafts = mtp.is_some();
-        inputs.reserve_room(&mut machine, (ctx, u64::try_from(slots)?, drafts), page)?;
+        inputs.reserve_room(
+            &mut machine,
+            (ctx, u64::try_from(slots)?, drafts),
+            page,
+            levers.kv_host(),
+        )?;
         if plans_ring(
             levers.xstream(),
             stage38(place),
@@ -1591,6 +1607,7 @@ mod cli {
             Some(floor) => r.u("kv_floor", floor),
             None => r,
         };
+        let r = r.w("kv_host", plan.kv_host.name());
         let r = r
             .u("host_experts", plan.host.experts)
             .u("card_experts", plan.cards[0].experts);
@@ -1710,6 +1727,7 @@ mod cli {
             bloomery_levers::QWEN38_EXPERTS,
             bloomery_levers::QWEN3_KV,
             bloomery_levers::KV_FLOOR,
+            bloomery_levers::KV_HOST,
             bloomery_levers::ROUTE_TRACE,
             bloomery_levers::DRAFT,
             bloomery_levers::MTP_HEAD_ROWS,
@@ -1763,6 +1781,13 @@ mod cli {
                 return Err(
                     "BLOOMERY_KV_FLOOR spreads a qwen4exp plan's experts at a KV floor; \
                      --dump-taps runs a qwen3moe file"
+                        .into(),
+                );
+            }
+            if levers.kv_host_set().is_some() {
+                return Err(
+                    "BLOOMERY_KV_HOST backs a qwen4exp store's K/V pages on the host; --dump-taps \
+                     runs a qwen3moe file"
                         .into(),
                 );
             }
@@ -2068,6 +2093,14 @@ mod cli {
         if family != Family::Qwen38 && levers.kv_floor().is_some() {
             return Err(format!(
                 "BLOOMERY_KV_FLOOR spreads a qwen4exp plan's experts at a KV floor; a {} file's \
+                 cache is plain device tensors, not rooms whose pages a fit backs",
+                family.name()
+            )
+            .into());
+        }
+        if family != Family::Qwen38 && levers.kv_host_set().is_some() {
+            return Err(format!(
+                "BLOOMERY_KV_HOST backs a qwen4exp store's K/V pages on the host; a {} file's \
                  cache is plain device tensors, not rooms whose pages a fit backs",
                 family.name()
             )
@@ -3011,7 +3044,7 @@ mod cli {
         lane: Lane,
         t: Instant,
     ) -> Result<(Qwen38Model, Residency), GateError> {
-        let mut inputs = inputs38(&file, levers)?;
+        let mut inputs = inputs38_at(&file, levers, place)?;
         inputs.room = room;
         let cap = serve_ctx(u64::try_from(ctx)?, &inputs.spec)?;
         let ub = ubatch_for(ctx)?;
@@ -3111,7 +3144,7 @@ mod cli {
         lane: Lane,
         t: Instant,
     ) -> Result<(Qwen38Model, Q38Cfg, Residency), GateError> {
-        let mut inputs = inputs38(&file, levers)?;
+        let mut inputs = inputs38_at(&file, levers, place)?;
         inputs.room = room;
         let cap = serve_ctx(u64::try_from(ctx)?, &inputs.spec)?;
         let ub = ubatch_for(ctx)?;

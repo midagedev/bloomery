@@ -2444,6 +2444,16 @@ pub fn allocation_granularity(device: usize) -> Result<usize, GpuError> {
     Ok(page)
 }
 
+/// The page a room that can back its pages on the host takes on visible
+/// device `device` ([`room::host::page_for`]): the least common multiple of
+/// the card's and the host's VMM granularities, a size `cuMemCreate` accepts
+/// at either location. A plan under `BLOOMERY_KV_HOST` reads it once for its
+/// page rounding of the planes; a card-only room keeps the card's own
+/// granularity ([`allocation_granularity`]).
+pub fn host_page(device: usize) -> Result<usize, GpuError> {
+    room::host::page_for(device)
+}
+
 /// The census row of the visible device at `ordinal` ([`census`]).
 pub(crate) fn device_info(
     ordinal: usize,

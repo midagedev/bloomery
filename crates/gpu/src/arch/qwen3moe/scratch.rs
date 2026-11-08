@@ -33,7 +33,7 @@ use crate::site::WideForms;
 use chain::arch::qwen3moe::router::ubatch_at;
 
 pub(super) use crate::recur::RecStore;
-use crate::room::{Roomed, Run, Views};
+use crate::room::{Backing, Roomed, Run, Views};
 use crate::rope_neox::{
     NeoxArgs, NeoxQ8Args, NeoxRowsArgs, PartialNeoxArgs, PartialNeoxQ8Args, RopeNeoxKernels,
     q8_plane_lens,
@@ -368,21 +368,25 @@ impl KvPlanes {
 
     /// Planes of `n_kv` key heads, `ctx` rows and `head` values in the `kv`
     /// format, each in a room named `what` (the store a fit's refusal
-    /// names): every head's `[ctx][·]` rows of a plane a run
-    /// (the f16 rows, or the q8_0 codes and scales [`q8_plane_lens`] counts), so
-    /// a fit backs the rows of the positions it reaches in every head of
-    /// every plane ([`Roomed::fit`]). Load-time only.
-    pub(super) fn roomed(
+    /// names) backed where `backing` says ([`Roomed::with_backing`]):
+    /// [`KvPlanes::roomed`] is the card choice. Every head's `[ctx][·]` rows
+    /// of a plane a run (the f16 rows, or the q8_0 codes and scales
+    /// [`q8_plane_lens`] counts), so a fit backs the rows of the positions it
+    /// reaches in every head of every plane ([`Roomed::fit`]). Load-time
+    /// only.
+    pub(super) fn roomed_backed(
         stream: &Arc<CudaStream>,
         (n_kv, ctx, head): (usize, usize, usize),
         kv: KvQ8,
         what: &'static str,
+        backing: Backing,
     ) -> Result<Roomed<KvPlanes>, GpuError> {
         fn planes<T, const N: usize>(
             stream: &Arc<CudaStream>,
             (n_kv, ctx): (usize, usize),
             row: usize,
             what: &'static str,
+            backing: Backing,
         ) -> Result<Roomed<[DeviceBuffer<T>; N]>, GpuError> {
             let runs: Vec<Run> = (0..n_kv)
                 .map(|h| Run {
@@ -392,20 +396,38 @@ impl KvPlanes {
                     rows: ctx,
                 })
                 .collect();
-            Roomed::new(Arc::clone(stream), n_kv * ctx * row, &runs, what, |b| b)
+            Roomed::with_backing(
+                Arc::clone(stream),
+                n_kv * ctx * row,
+                &runs,
+                what,
+                backing,
+                |b| b,
+            )
         }
         Ok(match kv {
-            KvQ8::F16 => planes::<u16, 2>(stream, (n_kv, ctx), head, what)?
+            KvQ8::F16 => planes::<u16, 2>(stream, (n_kv, ctx), head, what, backing)?
                 .map(|[k, v]| KvPlanes::F16 { k, v }),
             KvQ8::Q8 => {
                 let (codes, scales) = q8_plane_lens(head, 1, 1);
                 Roomed::join(
-                    planes::<u32, 2>(stream, (n_kv, ctx), codes, what)?,
-                    planes::<u16, 2>(stream, (n_kv, ctx), scales, what)?,
+                    planes::<u32, 2>(stream, (n_kv, ctx), codes, what, backing)?,
+                    planes::<u16, 2>(stream, (n_kv, ctx), scales, what, backing)?,
                     |[kq, vq], [kd, vd]| KvPlanes::Q8 { kq, kd, vq, vd },
                 )
             }
         })
+    }
+
+    /// [`KvPlanes::roomed_backed`] on the card ([`Backing::Card`]): the
+    /// planes every store but a host-backed one holds.
+    pub(super) fn roomed(
+        stream: &Arc<CudaStream>,
+        (n_kv, ctx, head): (usize, usize, usize),
+        kv: KvQ8,
+        what: &'static str,
+    ) -> Result<Roomed<KvPlanes>, GpuError> {
+        KvPlanes::roomed_backed(stream, (n_kv, ctx, head), kv, what, Backing::Card)
     }
 
     /// The layer's planes of `d`'s shape in the `kv` format. Load-time only.

@@ -479,7 +479,7 @@ use bloomery_gpu_gates::bind::{
     prefill_closing, put_back, seat_failure, slots_of,
 };
 use bloomery_gpu_gates::generate::{
-    BreakEven, DraftYield, FloorShort, Lane, Place, draft_yield, lane_of,
+    BreakEven, DraftYield, FloorShort, Lane, Place, draft_yield, lane_of, stage_host_page,
 };
 use bloomery_gpu_gates::need;
 use bloomery_gpu_gates::nodes::step_census;
@@ -789,6 +789,7 @@ impl Place38 {
             &mut machine,
             (ctx, u64::try_from(slots)?, mtp.is_some()),
             self.page,
+            levers.kv_host,
         )?;
         beside::reserve_on(
             &mut machine,
@@ -1834,6 +1835,11 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let kv_cache = KvChoice::choose(a.cache_type_k.as_deref(), levers.qwen3_kv_set())?;
     let kv = kv_cache.kv;
     inputs.kv = inputs.kv.in_q8_if(kv == KvQ8::Q8);
+    // The page a host-capable room takes on the stage card, read once under
+    // `BLOOMERY_KV_HOST`: every plan and reserve below rounds the planes at it.
+    if levers.kv_host() != bloomery_levers::KvHost::Off {
+        inputs.kv_host_page = Some(stage_host_page(stage)?);
+    }
     // The slot count first: it shapes the draft's window condition, the
     // context choice itself, and every plan the seat asks for, each counting
     // every sequence (`Plans::slots`). A set `--ctx-size` with no
@@ -2342,11 +2348,13 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         .w("card", machine.cards[0].name.as_str())
         .w("experts", experts_name(experts))
         .u("ctx_max", plan.ctx_max);
-    // The spread's floor, only where the lever moved it below the context.
+    // The spread's floor, only where the lever moved it below the context;
+    // the planes' backing the load's stores take.
     let line = match plan.kv_floor {
         Some(floor) => line.u("kv_floor", floor),
         None => line,
     };
+    let line = line.w("kv_host", plan.kv_host.name());
     let line = line
         .u("host_experts", plan.host.experts)
         .u("card_experts", plan.cards[0].experts);
@@ -2420,6 +2428,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let off_why = draft_off.clone();
     let open = SeatArgs {
         kv,
+        kv_host_page: inputs.kv_host_page,
         place: a.place,
         lane: lane.expect("a serving run probed the lane before the plan"),
         ctx,
@@ -2638,6 +2647,10 @@ struct SeatArgs {
     room: (u64, HostRead),
     /// The KV cache's format the main thread's plans counted ([`KvChoice::choose`]).
     kv: KvQ8,
+    /// The page a host-capable room takes, read under `BLOOMERY_KV_HOST`
+    /// ([`PlanInputs::kv_host_page`]): the engine thread plans from it, as
+    /// the main thread's plans did.
+    kv_host_page: Option<u64>,
     /// The plan the main thread's rules and records read, which the load's
     /// plan is held to.
     plan: PlanKey,
@@ -2759,6 +2772,9 @@ struct Q38 {
     /// them those another slot maps too, at its last `kv room` line
     /// ([`Q38::print_room`]).
     room: Vec<(usize, usize)>,
+    /// The host bytes each slot's K/V planes held at its last `kv room` line
+    /// (`BLOOMERY_KV_HOST`; 0 under `off`).
+    room_host: Vec<usize>,
     /// The copy stream and the pinned staging the prompt cache's saves are
     /// made on ([`Seat::snapshots_async`]); none with the cache off.
     lane: Option<SaveLane>,
@@ -2798,6 +2814,7 @@ impl Q38 {
         let mut inputs = PlanInputs::describe(model.header())?;
         inputs.room = a.room.clone();
         inputs.kv = inputs.kv.in_q8_if(a.kv == KvQ8::Q8);
+        inputs.kv_host_page = a.kv_host_page;
         let cap = serve_ctx(u64::try_from(a.ctx)?, &inputs.spec)?;
         let ub = a.ubatch.min(a.ctx);
         let ctx_ub = (u64::try_from(a.ctx)?, u64::try_from(ub)?);
@@ -3052,6 +3069,7 @@ impl Q38 {
             branch: std::cell::RefCell::new(vec![None; a.slots]),
             cut_line: vec![None; a.slots],
             room: vec![(0, 0); a.slots],
+            room_host: vec![0; a.slots],
             lane,
             #[cfg(feature = "vision")]
             vision,
@@ -3239,28 +3257,33 @@ impl Q38 {
     }
 
     /// The `kv room` line of the selected slot when the bytes its stores by
-    /// position hold on the card moved since its last one: the selecting
-    /// stores' and the draft store's pages get memory as a call reaches
-    /// them, and a reset gives back those the ended sequence left
-    /// (`Body38::store_room`), and a slot that took another's prefix maps
-    /// that slot's pages until either writes below it or resets
-    /// (`Body38::store_shared`). The line names the slot, its positions, the
-    /// bytes its pages hold, those of them another slot maps too, and their
-    /// unrounded layout bytes. The machine reserves page rounding separately
-    /// before admission.
+    /// position hold moved since its last one: the selecting stores' and the
+    /// draft store's pages get memory as a call reaches them, and a reset
+    /// gives back those the ended sequence left ([`Body38::store_room`]), a
+    /// slot that took another's prefix maps that slot's pages until either
+    /// writes below it or resets ([`Body38::store_shared`]), and under
+    /// `BLOOMERY_KV_HOST` the planes' pages back on the host
+    /// ([`Body38::kv_planes_room`]). The line names the slot, its positions,
+    /// the bytes its pages hold on the card, those of them another slot maps
+    /// too, the host bytes the planes hold, and their unrounded layout
+    /// bytes. The machine reserves page rounding separately before
+    /// admission.
     fn print_room(&mut self) -> Result<(), GateError> {
         let slot = self.s.selected();
         let body = self.s.model().body("bloomery-serve-qwen38")?;
         let ((mapped, layout), shared) = (body.store_room(), body.store_shared());
-        if self.room[slot] != (mapped, shared) {
+        let hosted = body.kv_planes_room().1;
+        if self.room[slot] != (mapped, shared) || self.room_host[slot] != hosted {
             Record::new(&record::KV_ROOM)
                 .u("slot", slot)
                 .u("positions", self.s.pos())
                 .u("mapped_bytes", mapped)
                 .u("shared_bytes", shared)
+                .u("kv_host_bytes", hosted)
                 .u("layout_bytes", layout)
                 .eprint();
             self.room[slot] = (mapped, shared);
+            self.room_host[slot] = hosted;
         }
         Ok(())
     }
@@ -4211,6 +4234,7 @@ mod tests {
             room: (u64::MAX, HostRead::Given),
             row_source: RowTableSource::Parts,
             arena: None,
+            kv_host_page: None,
         };
         let card = DeviceInfo {
             ordinal: 0,

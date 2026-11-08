@@ -104,6 +104,7 @@ pub fn tier_experts(
         &mut machine,
         (ctx, u64::try_from(slots)?, mtp.is_some()),
         page,
+        levers.kv_host,
     )?;
     beside::reserve_on(&mut machine, held);
     reserve_checkpoints(&mut machine, seqs, ctx)?;

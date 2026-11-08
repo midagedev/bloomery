@@ -36,7 +36,7 @@ pub use registry::{AUTOTUNE, PREPARE_Q8, SCHEMAJUMP, SPLIT_WALK, XSTREAM};
 pub use registry::{
     CARD_BUDGET, CARD_DONTNEED, CARD_MARGIN, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, EXPERT_RANK,
     FORCE_IDS, GEN_SLOTS, GEN_SLOTS_MAX, HOST_LANES, HOST_LANES_DEFAULT, HOST_LOCK, HOST_POPULATE,
-    HOST_ROOM, HOSTSTREAM, KV_FLOOR, LANE_PREFETCH, LANE_PREFETCH_DEFAULT, MTP_DRAFT,
+    HOST_ROOM, HOSTSTREAM, KV_FLOOR, KV_HOST, LANE_PREFETCH, LANE_PREFETCH_DEFAULT, MTP_DRAFT,
     MTP_HEAD_ROWS, MTP_WIDTH, MTP_WINDOWS, NEED_HOOK, NVTIER_BYTES, NVTIER_EVICT, NVTIER_MEM,
     NVTIER_READ, PIN_MAIN, PREFILL, PREFILL_CUT, PREFILL_CUT_MAX, PREFILL_GROUP,
     PREFILL_GROUP_DEFAULT, PREFILL_GROUP_MAX, QWEN3_KV, QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE,
@@ -1343,6 +1343,23 @@ impl Levers {
     #[must_use]
     pub fn kv_floor(&self) -> Option<u64> {
         self.count(KV_FLOOR)
+    }
+
+    /// `BLOOMERY_KV_HOST` as set: the K/V planes' backing word, `off`,
+    /// `spill` or `all`; `None` unset, which a load reads as `off`
+    /// ([`Levers::kv_host`]).
+    #[must_use]
+    pub fn kv_host_set(&self) -> Option<&'static str> {
+        self.word(KV_HOST)
+    }
+
+    /// `BLOOMERY_KV_HOST`: where a load's room-backed K/V planes back their
+    /// pages, as set, else [`KvHost::Off`] (the card's own memory).
+    #[must_use]
+    pub fn kv_host(&self) -> KvHost {
+        self.kv_host_set()
+            .and_then(KvHost::parse)
+            .unwrap_or(KvHost::Off)
     }
 
     /// `BLOOMERY_CHECK_FINITE`: the finite probe runs.
@@ -2996,6 +3013,47 @@ pub enum HostLanes {
     /// Each matrix's units laid over the pool's CCDs where the pool has a CCD
     /// map, flat where it has none.
     Ccd,
+}
+
+/// Where a load's room-backed K/V planes back their pages ([`KV_HOST`]): the
+/// typed word a binary hands its plan and its stores, one value a load. The
+/// default ([`KvHost::Off`]) is the card's own memory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KvHost {
+    /// The card's own memory only, the plan and the stores before the lever.
+    #[default]
+    Off,
+    /// The card's memory first; a page whose card memory the driver cannot
+    /// make for lack of free bytes is backed on the host. The plan is
+    /// [`KvHost::Off`]'s.
+    Spill,
+    /// Every plane page on the host: the plan counts the planes at no card
+    /// position and against its host room instead.
+    All,
+}
+
+impl KvHost {
+    /// The word the lever takes ([`KV_HOST`]'s three spellings), or `None` on
+    /// any other — the kind refuses it by name before this runs.
+    #[must_use]
+    pub fn parse(word: &str) -> Option<KvHost> {
+        match word {
+            "off" => Some(KvHost::Off),
+            "spill" => Some(KvHost::Spill),
+            "all" => Some(KvHost::All),
+            _ => None,
+        }
+    }
+
+    /// The word [`KvHost::parse`] took, the plan line's `kv_host=`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            KvHost::Off => "off",
+            KvHost::Spill => "spill",
+            KvHost::All => "all",
+        }
+    }
 }
 
 /// What an override cannot carry: a name read from the environment alone in

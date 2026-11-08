@@ -9,6 +9,7 @@ use super::room::{row_cache_reserve, row_read};
 use super::rule::card_heaps;
 use super::table::{CardTotals, HostTotals, Plan, Row, Segment};
 use super::workstation;
+use bloomery_levers::KvHost;
 
 /// The rounds [`plan_in_pool`] lowers the card budget before it refuses by
 /// name. A round lowers the budget by at least a [`workstation::GRANULE`], or
@@ -219,6 +220,7 @@ pub(super) fn totals<'a>(
         arena_columns: 1,
         table_bytes: host_tables,
         shadow_bytes,
+        kv_host_bytes: 0,
         stage_kv_bytes: 0,
         reserve_bytes,
         row_reserve_bytes: row_reserve,
@@ -249,6 +251,7 @@ pub(super) fn totals<'a>(
         budget_from_pool: false,
         expert_rank: None,
         kv_floor: None,
+        kv_host: KvHost::default(),
     })
 }
 
@@ -318,6 +321,28 @@ impl Plan<'_> {
     pub(super) fn host_stage_kv(&mut self, bytes: u64) {
         self.host.stage_kv_bytes = bytes;
         self.host.headroom_bytes -= i128::from(bytes);
+    }
+
+    /// The K/V planes a host-backed store holds on the host
+    /// (`BLOOMERY_KV_HOST=all`), `bytes` page-rounded at the page a
+    /// host-capable room takes, out of the plan's host headroom — refused by
+    /// name when the headroom cannot take them
+    /// ([`PlacementError::KvHostOverHost`]): the host room the plan reads is
+    /// the one the residency's churn pool and the load's host check read, so
+    /// the planes count against it before they do. The host's need counts
+    /// them ([`HostTotals::kv_host_bytes`], with the shadows).
+    pub fn kv_host_planes(&mut self, bytes: u64) -> Result<(), PlacementError> {
+        self.host.kv_host_bytes = bytes;
+        let before = self.host.headroom_bytes;
+        self.host.headroom_bytes -= i128::from(bytes);
+        if self.host.headroom_bytes < 0 {
+            // A headroom already below zero leaves the planes no host bytes.
+            return Err(PlacementError::KvHostOverHost {
+                bytes,
+                headroom: u64::try_from(before).unwrap_or(0),
+            });
+        }
+        Ok(())
     }
 
     pub(super) fn reserve_beside(&mut self, reserve: u64) -> Result<(), PlacementError> {

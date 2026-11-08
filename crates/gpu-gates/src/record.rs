@@ -303,7 +303,7 @@ pub static TP_TEXT: Kind = Kind {
 pub static PLAN38: Kind = Kind {
     name: "plan38",
     head: "plan",
-    doc: "A qwen3moe-family placement the engine is about to load by: its card, the architecture (a placed qwen3moe or qwen35moe file names it; a qwen4exp line does not), the expert rule (host or card), the context, the positions a plan's expert spread runs at when BLOOMERY_KV_FLOOR moves them below the context (kv_floor; absent when the spread runs at the context itself), where the routed experts sit (each layer's id prefix on the card, a placed line stating as n_l the fewest and the most one layer keeps; under plan (b′) the expert tier card and the next ids it holds), each plan card's device as the plan record names them, the card's free bytes at plan time when the census read them, the host room's reading the plan was made at (room) and the plan room it was held to (plan_room, the reading less the drift margin) when it was made at one, and — on the placed plan a run with --place unset took because the whole file did not fit the free bytes — why it did not; for a file with a row-gathered table (a qwen4exp file's PLE table), the tier the plan reads it from (rows, host or nvme) and the host room's reading that chose it (read), and, when the card holds a file tensor in another quantization than its file's (a BF16 head in MXFP8 planes), each such tensor as tensor:file type:card format (requantized; absent when there is none). A plan that holds the MTP draft beside the target also prints the rows of the draft's store walk its arena is made for (mtp_rows, 64 or 512) and why (mtp_rows_why: room, the plan with the 512-row arena holds and keeps every card expert the 64-row one keeps; displaces:N, it leaves the card N fewer experts; short, the card cannot hold it; reserve, a plan (b′) machine's reserve row names the smaller arena; asked, the inputs named the rows).",
+    doc: "A qwen3moe-family placement the engine is about to load by: its card, the architecture (a placed qwen3moe or qwen35moe file names it; a qwen4exp line does not), the expert rule (host or card), the context, the positions a plan's expert spread runs at when BLOOMERY_KV_FLOOR moves them below the context (kv_floor; absent when the spread runs at the context itself), where a qwen4exp plan's           selecting stores back their K/V planes (kv_host, off, spill or all; absent on another           family's line), where the routed experts sit (each layer's id prefix on the card, a placed line stating as n_l the fewest and the most one layer keeps; under plan (b′) the expert tier card and the next ids it holds), each plan card's device as the plan record names them, the card's free bytes at plan time when the census read them, the host room's reading the plan was made at (room) and the plan room it was held to (plan_room, the reading less the drift margin) when it was made at one, and — on the placed plan a run with --place unset took because the whole file did not fit the free bytes — why it did not; for a file with a row-gathered table (a qwen4exp file's PLE table), the tier the plan reads it from (rows, host or nvme) and the host room's reading that chose it (read), and, when the card holds a file tensor in another quantization than its file's (a BF16 head in MXFP8 planes), each such tensor as tensor:file type:card format (requantized; absent when there is none). A plan that holds the MTP draft beside the target also prints the rows of the draft's store walk its arena is made for (mtp_rows, 64 or 512) and why (mtp_rows_why: room, the plan with the 512-row arena holds and keeps every card expert the 64-row one keeps; displaces:N, it leaves the card N fewer experts; short, the card cannot hold it; reserve, a plan (b′) machine's reserve row names the smaller arena; asked, the inputs named the rows).",
     parts: &[
         key("place", Word, ""),
         key("card", Word, ""),
@@ -311,6 +311,7 @@ pub static PLAN38: Kind = Kind {
         key("experts", Word, ""),
         key("ctx_max", U64, "positions"),
         opt("kv_floor", U64, "positions"),
+        opt("kv_host", Word, ""),
         key("host_experts", U64, "experts"),
         key("card_experts", U64, "experts"),
         opt("n_l", Word, "experts"),
@@ -1145,12 +1146,13 @@ pub static TIER_CENSUS: Kind = Kind {
 pub static KV_ROOM: Kind = Kind {
     name: "kv_room",
     head: "kv room",
-    doc: "A slot's stores by position on the card when the bytes they hold moved since the slot's last line: the slot, its positions, the bytes its pages with memory of their own hold (the rows its sequence reached, by pages), the bytes of those pages another slot's stores map too (a prefix one took from the other), and the bytes the plan counts the stores at.",
+    doc: "A slot's stores by position on the card when the bytes they hold moved since the slot's last line: the slot, its positions, the bytes its pages with memory of their own hold (the rows its sequence reached, by pages), the bytes of those pages another slot's stores map too (a prefix one took from the other), the host bytes its K/V planes' pages hold where BLOOMERY_KV_HOST backs them off the card (kv_host_bytes; 0 under off, and absent on a line older than the lever), and the bytes the plan counts the stores at.",
     parts: &[
         key("slot", U64, ""),
         key("positions", U64, ""),
         key("mapped_bytes", U64, "B"),
         key("shared_bytes", U64, "B"),
+        opt("kv_host_bytes", U64, "B"),
         key("layout_bytes", U64, "B"),
     ],
 };

@@ -128,8 +128,8 @@ use super::program38::{
 };
 use super::scratch::{Io, KvPlanes, LANE, LaneWord, PassRecord, RecStore, RopeRows, StepParams};
 use super::scratch38::{
-    Arena38, LANES, PASS_ROWS, Ple38, Store38, Taps38, VERIFY_ROWS, WideRecord, dims, final_res,
-    no_carry, store_rule_bytes,
+    Arena38, KV_PLANES, LANES, PASS_ROWS, Ple38, Store38, Taps38, VERIFY_ROWS, WideRecord,
+    backing_of, dims, final_res, no_carry, store_rule_bytes,
 };
 use super::slot_pass::SlotIn;
 use super::swap38::{self, DEADLINE, LIVE_DELAY};
@@ -171,6 +171,7 @@ use crate::model::{
     SlotRows, Slots,
 };
 use crate::prompt_timing::{PromptStats, PromptTiming, nanos};
+use crate::room::Backing;
 use crate::rope_table::{RopeSpec, RopeTable};
 use crate::rows::{Laid, RowFormat, RowKernels, RowRead};
 use crate::site::ByName;
@@ -1307,6 +1308,11 @@ pub struct Body38 {
     /// sequence past the plan is refused by name.
     slots_planned: usize,
     slots_made: usize,
+    /// Where a selecting store's K/V planes back their pages
+    /// (`BLOOMERY_KV_HOST`, the plan's `kv_host` word as [`backing_of`]
+    /// maps it): the load's own stores and every [`Slots::new_seq`]'s take
+    /// it, the pooled keys and the raw key ring staying on the card.
+    kv_backing: Backing,
     /// A pass of several slots' input records, on a load planned for more
     /// than one sequence.
     slot_in: Option<SlotIn>,
@@ -1805,14 +1811,16 @@ impl Body38 {
         gpu.context().bind_to_thread()?;
         let stream = gpu.stream();
         let d = dims(router_dims, ctx);
-        // The plan's cache format is the one the stores take.
+        // The plan's cache format is the one the stores take, and its
+        // `kv_host` word where the planes' pages back.
         let kv = KvQ8::of(inputs.kv.is_q8());
+        let kv_backing = backing_of(plan.kv_host);
         let handle = gpu.stream_handle();
         let stores = kinds
             .iter()
             .map(|k| match k {
                 Kind38::Gdn => Store38::rec(stream),
-                Kind38::Qsa => Store38::qsa(&handle, &d, kv),
+                Kind38::Qsa => Store38::qsa(&handle, &d, kv, kv_backing),
             })
             .collect::<Result<Vec<_>, _>>()?;
         let (rec, sel) = store_rule_bytes(ctx, kv);
@@ -2096,6 +2104,7 @@ impl Body38 {
             ple_due: None,
             slots_planned: planned,
             slots_made: 1,
+            kv_backing,
             slot_in: (planned > 1).then(|| SlotIn::new(stream)).transpose()?,
             last_walk: TargetRows::Step,
             wrote: Wrote38::default(),
@@ -2455,6 +2464,21 @@ impl Body38 {
     pub fn store_shared(&self) -> usize {
         let draft = self.mtp.as_ref().map_or(0, Mtp38::store_shared);
         self.stores.iter().map(Store38::shared).sum::<usize>() + draft
+    }
+
+    /// The live sequence's selecting stores' K/V planes by position: the
+    /// card bytes and the host bytes their pages with memory of their own
+    /// hold, the room `BLOOMERY_KV_HOST` backs ([`Store38::kv_room`]) —
+    /// under `all` the card side is 0 and the host side grows with the
+    /// sequence, under `spill` the host side only what the card could not
+    /// make, under `off` the host side 0. The pooled keys, which stay on the
+    /// card, and the MTP draft's store are not part of it.
+    #[must_use]
+    pub fn kv_planes_room(&self) -> (usize, usize) {
+        self.stores
+            .iter()
+            .map(Store38::kv_room)
+            .fold((0, 0), |(c, h), (cc, hh)| (c + cc, h + hh))
     }
 
     /// The device bytes the planned slots' stores by position may still
@@ -3846,13 +3870,28 @@ impl Body38 {
     /// and one page ([`ResidencyGlue::free_bytes`]), and the fit runs once
     /// more. A second refusal, a machine that refuses to free and a load with
     /// no machine are the refusal, naming what the machine freed or why it
-    /// freed nothing. Never inside a capture.
+    /// freed nothing. The ordering under `BLOOMERY_KV_HOST=spill` is the
+    /// rule: the planes' pages back on the card first and spill to the host
+    /// on the card's own refusal, before any expert stack is freed for them
+    /// — a host page is cheaper than a demotion, whose experts the decode
+    /// steps keep hitting — so the machine's demote-for-bytes never runs for
+    /// the planes under `spill` (a fit of them that still runs out names the
+    /// host bytes, which no freed card bytes can make; the pooled keys, on
+    /// the card in every setting, keep the retry `off` runs).
     fn fit_stores(&mut self, pos: usize, rows: usize) -> Result<(), GpuError> {
         let through = pos + rows;
         let first = match self.fit_each(pos, through) {
             Ok(()) => return Ok(()),
             Err(e) => e,
         };
+        // A spilled fit of the planes that ran out of host bytes: the
+        // machine frees card bytes, which cannot make host memory.
+        if self.kv_backing == Backing::Spill
+            && let GpuError::NoRoom { what, .. } = &first
+            && *what == KV_PLANES
+        {
+            return Err(first);
+        }
         let GpuError::NoRoom { free, page, .. } = first else {
             return Err(first);
         };
@@ -5905,14 +5944,16 @@ impl Slots for Body38 {
         let stream = gpu.stream();
         let handle = gpu.stream_handle();
         let d = dims(self.s.route.dims(), self.ctx);
-        // The load's one cache format, read back from the live planes.
+        // The load's one cache format, read back from the live planes, and
+        // the planes' backing the load was made under.
         let kv = self.kv_format();
+        let backing = self.kv_backing;
         let stores = self
             .kinds()
             .into_iter()
             .map(|k| match k {
                 LayerKind38::Gdn => Store38::rec(stream),
-                LayerKind38::Qsa => Store38::qsa(&handle, &d, kv),
+                LayerKind38::Qsa => Store38::qsa(&handle, &d, kv, backing),
             })
             .collect::<Result<Vec<_>, _>>()?;
         let ckpt = Checkpoints::sequence(

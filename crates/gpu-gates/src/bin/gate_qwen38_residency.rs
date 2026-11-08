@@ -152,6 +152,19 @@
 //!   `Body38::fit_stores` removed (the squeezed call ends in `NoRoom`);
 //!   `restore_stacks` skipped in `SwapMachine::restore_tail` (the rooms'
 //!   released bytes stay above 0 and the third run's bits part).
+//! - `kvspill` (`BLOOMERY_KV_HOST=spill`, a third load planned under it
+//!   after the kvfloor clause's; real tier only like the gate): its plan is
+//!   the card-backed one's, its selecting stores' K/V planes backing on the
+//!   host wherever the card cannot make a page. A prompt call and steps with
+//!   the card as the load left it back every page the reach touches on the
+//!   card; then the card squeezed until it refuses a page, the same history
+//!   replayed from one clear (a clear keeps the reached pages) with steps
+//!   past the first run's reach: the growth asks the plane buffers' next
+//!   pages, the host takes them, no slot anywhere is withdrawn (the host
+//!   took the pages, not the machine; the pooled keys, already backed, ask
+//!   the card nothing) and the replayed ids are the first run's bit for
+//!   bit. Mutant: the store ignoring the lever, which makes the machine
+//!   withdraw for the pages instead.
 //! - `slots_drafted`: a drafted pass of two slots' verify rows folds each
 //!   slot's accepted rows — slot 0 keeping one of its three rows, slot 1
 //!   two of theirs — so the boundary that ends it reports 3 kept rows as
@@ -267,10 +280,20 @@ mod gate {
         card: &'m Machine,
         levers: &PlanLevers,
     ) -> Result<model::placement::Plan<'m>, GateError> {
+        plan_under_at(inputs, card, levers, CTX)
+    }
+
+    /// [`plan_under`] at a store context of `ctx` rows.
+    fn plan_under_at<'m>(
+        inputs: &'m PlanInputs,
+        card: &'m Machine,
+        levers: &PlanLevers,
+        ctx: usize,
+    ) -> Result<model::placement::Plan<'m>, GateError> {
         inputs
             .plan_with(
                 card,
-                (CTX as u64, u64::try_from(ubatch_for(CTX)?)?),
+                (ctx as u64, u64::try_from(ubatch_for(ctx)?)?),
                 levers,
                 Experts::Card,
             )
@@ -399,11 +422,24 @@ mod gate {
         host: bloomery_levers::HostCfg,
         ub: usize,
     ) -> Result<Qwen38Model, GateError> {
+        open_under_at(path, inputs, machine, (residency, levers), host, CTX, ub)
+    }
+
+    /// [`open_under`] at a store context of `ctx` rows.
+    fn open_under_at(
+        path: &Path,
+        inputs: &PlanInputs,
+        machine: Machine,
+        (residency, levers): (Residency, &PlanLevers),
+        host: bloomery_levers::HostCfg,
+        ctx: usize,
+        ub: usize,
+    ) -> Result<Qwen38Model, GateError> {
         let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
         if file.architecture() != Some("qwen4exp") {
             return Err(format!("{} is not qwen4exp", path.display()).into());
         }
-        let plan = plan_under(inputs, &machine, levers)?;
+        let plan = plan_under_at(inputs, &machine, levers, ctx)?;
         Ok(Body38::open_placed_residency(
             file,
             &plan,
@@ -1769,6 +1805,124 @@ mod gate {
         Ok(freed_ok && ids_ok && restored_ok && same_ok)
     }
 
+    /// The `kvspill` clause's store context: at it a selecting store's plane
+    /// buffers hold whole pages past the reach of its first run — every
+    /// head's rows through a [`FLOOR_PROMPT`]-id prompt and [`STREAM_STEPS`]
+    /// steps stay inside each buffer's first pages — and the reach that
+    /// crosses [`SPILL_STEPS`] steps past them asks the buffers' next pages,
+    /// pages the first run never touched.
+    const SPILL_CTX: usize = 8192;
+    /// The `kvspill` clause's greedy steps past the first run's, taking the
+    /// reach across the plane buffers' next pages at [`SPILL_CTX`].
+    const SPILL_STEPS: usize = 6_800;
+
+    /// `kvspill` (a load planned under `BLOOMERY_KV_HOST=spill`; its plan is
+    /// the card-backed one's, the stores' planes alone backing on the host
+    /// when the card cannot make a page): from a clear, a
+    /// [`FLOOR_PROMPT`]-id prompt call and [`STREAM_STEPS`] greedy steps with
+    /// the card as the load left it — the pages the reach touches back on
+    /// the card, the pooled keys' one page among them. Then the card
+    /// squeezed until it refuses a page ([`squeeze`], the kvfloor clause's)
+    /// and the same history replayed from one clear — a clear keeps the
+    /// reached pages — with [`SPILL_STEPS`] more greedy steps: the growth
+    /// asks the plane buffers' next pages, the card cannot make them and the
+    /// host takes them, so the store's K/V planes hold host bytes, no slot
+    /// anywhere is withdrawn (the host took the pages, not the machine; the
+    /// pooled keys, already backed, ask the card nothing) and the replayed
+    /// ids are the first run's bit for bit, the pages reading through the
+    /// same pointer whatever backs them. Mutant: the store ignoring `spill`
+    /// — the growth's pages refuse on the card, the machine withdraws
+    /// expert slots for them and the clause reds by a layer's withdrawn
+    /// count above 0.
+    fn kvspill_clause(
+        path: &Path,
+        inputs: &mut PlanInputs,
+        host: bloomery_levers::HostCfg,
+    ) -> Result<bool, GateError> {
+        let levers = PlanLevers {
+            kv_host: bloomery_levers::KvHost::Spill,
+            ..PlanLevers::default()
+        };
+        // The page a host-capable room takes, which the plan's store
+        // rounding under the lever and the clause's spilled rooms read.
+        let spec = tier::real_card(Place::A.on(&bloomery_gpu::census()?)?.card_specs()?[0]);
+        inputs.kv_host_page = Some(bloomery_gpu_gates::generate::stage_host_page(spec)?);
+        let ub = ubatch_for(SPILL_CTX)?;
+        let machine = residency_machine_under(inputs, ub, &levers)?;
+        let residency = {
+            let plan = plan_under_at(inputs, &machine, &levers, SPILL_CTX)?;
+            residency_of(&plan).ok_or(
+                "the spill plan's card experts leave no layer the machine's pinned, spare and one \
+                 that moves",
+            )?
+        };
+        let t0 = Instant::now();
+        let mut s = Session::from_model(
+            open_under_at(
+                path,
+                inputs,
+                machine,
+                (residency, &levers),
+                host,
+                SPILL_CTX,
+                ub,
+            )?,
+            SPILL_CTX as u32,
+        );
+        let b = s.model_mut().body_parts(NAME)?.2;
+        b.log_residency(0);
+        b.set_split_walk(SplitWalk::Off)?;
+        take_passes(&mut s)?;
+        println!(
+            "kvspill: {} at a context of {SPILL_CTX} under spill, load in {:.1} s",
+            word_of(&residency),
+            t0.elapsed().as_secs_f64()
+        );
+        let ids = prose_ids("qwen4exp", FLOOR_PROMPT)?;
+        let run = |s: &mut Session<Body38>, steps: usize| -> Result<Vec<u32>, GateError> {
+            let mut next = s.prompt(&ids, Want::Argmax)?.argmax();
+            let mut tokens = vec![next];
+            for _ in 0..steps {
+                next = s.step(next, Want::Argmax)?.argmax();
+                tokens.push(next);
+            }
+            Ok(tokens)
+        };
+        let loose = run(&mut s, STREAM_STEPS)?;
+        let idle = s.model().gpu().mem_info()?.0;
+        let _held = squeeze(s.model().gpu())?;
+        // One clear: the reached pages stay backed, the pooled keys' among
+        // them, so the replay asks only the pages past the first run's
+        // reach.
+        s.clear()?;
+        take_passes(&mut s)?;
+        let tight = run(&mut s, STREAM_STEPS + SPILL_STEPS)?;
+        let withdrawn = withdrawn_slots(&s)?;
+        let hosted = s.model().body(NAME)?.kv_planes_room().1;
+        let none_withdrawn = withdrawn.iter().all(|&(_, w)| w == 0);
+        let ids_ok = tight[..loose.len()] == loose[..];
+        println!(
+            "kvspill: with no page left, {} new steps put {} B of the planes on the host, \
+             withdrawn {:?} slots a layer over {} layers (0 everywhere: {}), and the replayed \
+             {} ids are the unsqueezed run's: {}",
+            SPILL_STEPS,
+            hosted,
+            withdrawn.iter().map(|&(_, w)| w).collect::<Vec<_>>(),
+            withdrawn.len(),
+            none_withdrawn,
+            loose.len(),
+            verdict(ids_ok)
+        );
+        let spill_ok = hosted > 0 && none_withdrawn;
+        println!(
+            "kvspill: the host took the pages, not the machine (idle free {} B before the \
+             squeeze, printed): {}",
+            idle,
+            verdict(spill_ok && ids_ok)
+        );
+        Ok(spill_ok && ids_ok)
+    }
+
     /// The load the slots clauses share: planned for the two slots it serves
     /// ([`PlanInputs::plan_with_slots`]; the gate's own load plans one, and
     /// a pass of several slots on it is refused by name), opened after the
@@ -1935,7 +2089,7 @@ mod gate {
         // PIN(2026-10-28): the plan read `MemAvailable`, which another process's load moves; the
         // room is the workstation's own, so the machine's host figure alone binds `refuse`. A
         // unified card's pool caps it (`Plan::plan_at`).
-        let inputs = PlanInputs::describe_in(
+        let mut inputs = PlanInputs::describe_in(
             &Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?,
             (PLAN_ROOM, HostRead::Given),
         )?;
@@ -2073,9 +2227,10 @@ mod gate {
         pass &= slots_drafted_clause(&mut s, &ids)?;
         pass &= commit_counts_clause(&mut s, &ids)?;
         // The card holds one load: the floored plan's own comes after the
-        // slots clauses'.
+        // slots clauses', and the spilled one's after it.
         drop(s);
         pass &= kvfloor_clause(path, &inputs, host, ub)?;
+        pass &= kvspill_clause(path, &mut inputs, host)?;
 
         if pass {
             println!("{NAME}: every clause passed");

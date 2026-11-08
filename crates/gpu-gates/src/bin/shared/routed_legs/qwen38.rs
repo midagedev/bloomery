@@ -198,7 +198,12 @@ fn machine(
     let slots = u64::try_from(seqs.slots).map_err(|e| Outcome::Red(e.to_string()))?;
     let drafts = false;
     inputs
-        .reserve_room(&mut machine, (ctx, slots, drafts), page)
+        .reserve_room(
+            &mut machine,
+            (ctx, slots, drafts),
+            page,
+            bloomery_levers::KvHost::Off,
+        )
         .map_err(|e| outcome_of(&e))?;
     reserve_checkpoints(&mut machine, seqs, ctx).map_err(|e| outcome_of(e.as_ref()))?;
     Ok(machine)

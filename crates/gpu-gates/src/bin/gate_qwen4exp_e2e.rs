@@ -263,6 +263,14 @@
 //!   selected decode flash) judged against ik's by (t)'s rule and bands: the cache's
 //!   quantization must not move the argmax past a named tie nor a layer output past
 //!   [`FREE_BAND`].
+//! - (kvh) the K/V planes on the host (`BLOOMERY_KV_HOST=all`): the model loaded
+//!   again with every selecting store's planes backed on the host, the same
+//!   512-id prose prompt and 16 greedy steps — the prompt's last logits row
+//!   and every step's id the card-backed load's bit for bit (the pages read
+//!   through the same pointer whatever backs them), and the planes holding no
+//!   card bytes and host bytes (the pooled keys, which stay on the card,
+//!   apart). The fixture tier runs it on the small file; the clause needs no
+//!   oracle, being the engine against itself.
 //! - (r) refusals: `Prompt38::parse` takes `step`, `pass`, `gemm` and `auto`
 //!   and refuses any other name by name; the image placeholder
 //!   the header's image placeholder (`ple.image_token_id`) as a step, as a pass and as a ubatch is refused by name
@@ -393,9 +401,9 @@ mod gate {
     use bloomery_gpu_gates::slots_gate::{self, Derived, Launches, PassAdapter, SlotsAdapter};
     use bloomery_gpu_gates::tier::{self, Tag, Tier};
     use bloomery_gpu_gates::{
-        Fnv1a64, GateError, RefManifest, checks_failed, ref_model_path, verdict,
+        Fnv1a64, GateError, RefManifest, checks_failed, prose_ids, ref_model_path, verdict,
     };
-    use bloomery_levers::{CARD_BUDGET, HostCfg};
+    use bloomery_levers::{CARD_BUDGET, HostCfg, KvHost};
     use cuda_core::{DeviceBuffer, sys};
     use gguf::Split;
     use gguf::quant::{GgmlType, half_to_f32};
@@ -644,7 +652,8 @@ mod gate {
         // The load reserves its stores' page rounding out of the card budget
         // (`Open38::plan`); the header's budget was planned without it.
         let page = bloomery_gpu_gates::generate::stage_page(card()?)?;
-        let rounding = inputs.room_padding(CTX as u64, 1, false, page)?;
+        let rounding =
+            inputs.room_padding(CTX as u64, 1, false, page, bloomery_levers::KvHost::Off)?;
         let plan_levers = tier::plan_levers(&file, &levers, rounding)?;
         let n_expert = inputs.spec.routed().map_or(0, |m| m.experts as usize);
         let cfg = Cfg {
@@ -833,11 +842,12 @@ mod gate {
     /// ([`PlanInputs::plan_with_slots`]).
     fn open_slots(experts: Experts, slots: usize) -> Result<Qwen38Model, GateError> {
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
-        Ok(open_at(experts, slots, ub, None, KvQ8::F16)?.model)
+        Ok(open_at(experts, slots, ub, None, (KvQ8::F16, KvHost::Off))?.model)
     }
 
     /// [`open_slots`] at a ubatch of `ub`, the host's room the reading's or
-    /// `room` given ([`PlanInputs::room`]), the K/V planes in `kv`; with the plan's facts, which the
+    /// `room` given ([`PlanInputs::room`]), the K/V planes in `kv` and backed
+    /// where `kv.1` says (`BLOOMERY_KV_HOST`); with the plan's facts, which the
     /// plan line prints and the structure clause holds the body to (each
     /// layer's card experts are the plan's own, read before the body is
     /// built), among them the tier the plan reads the PLE table from.
@@ -846,9 +856,10 @@ mod gate {
         slots: usize,
         ub: usize,
         room: Option<u64>,
-        kv: KvQ8,
+        kv: (KvQ8, KvHost),
     ) -> Result<Opened38, GateError> {
-        open_ctx(experts, slots, CTX, ub, room, kv)
+        let (kv, kv_host) = kv;
+        open_ctx(experts, slots, CTX, ub, room, (kv, kv_host))
     }
 
     /// [`open_at`] at a slot context of `ctx` rows.
@@ -858,8 +869,9 @@ mod gate {
         ctx: usize,
         ub: usize,
         room: Option<u64>,
-        kv: KvQ8,
+        kv: (KvQ8, KvHost),
     ) -> Result<Opened38, GateError> {
+        let (kv, kv_host) = kv;
         let file = open_split()?;
         let t = Instant::now();
         let card = card()?;
@@ -874,6 +886,7 @@ mod gate {
             room,
             residency: Residency::Off,
             kv,
+            kv_host,
         }
         .plan(file)?;
         let p = planned.facts();
@@ -1005,9 +1018,87 @@ mod gate {
     }
 
     /// (kv): the model loaded with a q8_0 cache (module doc).
+    /// The `kvhost` clause's prompt: ids of the qwen4exp prose corpus as one
+    /// ubatch call, growing every selecting store past its first pages.
+    const KV_HOST_PROMPT: usize = 512;
+    /// The `kvhost` clause's greedy steps after the prompt.
+    const KV_HOST_STEPS: usize = 16;
+
+    /// What one `kvhost` arm read: the prompt's last logits row, every id,
+    /// and the selecting stores' K/V planes' (card, host) bytes at the end.
+    type KvHostRun = (Vec<f32>, Vec<u32>, (usize, usize));
+
+    /// One arm of the `kvhost` clause: the load under `kv_host` (the plan's
+    /// levers `levers`), the prompt call of `ids` and [`KV_HOST_STEPS`]
+    /// greedy steps — the prompt's last logits row and every step's id — and
+    /// the selecting stores' K/V planes' card and host bytes at the end.
+    fn kv_host_arm(
+        levers: &PlanLevers,
+        kv_host: KvHost,
+        ids: &[u32],
+    ) -> Result<KvHostRun, GateError> {
+        let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
+        let mut m = Open38 {
+            card: card()?,
+            ctx: CTX,
+            ub,
+            experts: Experts::Host,
+            slots: 1,
+            plan_levers: levers,
+            host: cfg().host,
+            room: None,
+            residency: Residency::Off,
+            kv: KvQ8::F16,
+            kv_host,
+        }
+        .plan(open_split()?)?
+        .open()?
+        .model;
+        m.set_mode(StepMode::Graph);
+        m.body_parts("kv_host_arm")?
+            .2
+            .set_split_walk(SplitWalk::Off)?;
+        let mut next = m.prompt38(ids, Prompt38::Gemm)?;
+        let logits = m.logits()?;
+        let mut tokens = vec![next];
+        for _ in 0..KV_HOST_STEPS {
+            next = m.step(&[next])?;
+            tokens.push(next);
+        }
+        let room = m.body("kv_host_arm")?.kv_planes_room();
+        Ok((logits, tokens, room))
+    }
+
+    /// `BLOOMERY_KV_HOST=all`: the same load with its selecting stores' K/V
+    /// planes backed on the host is the card-backed one bit for bit — the
+    /// prompt's last logits row and every greedy step's id — and the planes
+    /// hold no card bytes and host bytes, the pages reading through the same
+    /// pointer whatever backs them.
+    fn kv_host() -> Result<bool, GateError> {
+        let ids = prose_ids("qwen4exp", KV_HOST_PROMPT)?;
+        let off = kv_host_arm(&cfg().plan_levers, KvHost::Off, &ids)?;
+        let all_levers = PlanLevers {
+            kv_host: KvHost::All,
+            ..cfg().plan_levers.clone()
+        };
+        let (logits, tokens, room) = kv_host_arm(&all_levers, KvHost::All, &ids)?;
+        let bits = |rows: &[f32]| rows.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        let (logits_ok, ids_ok) = (bits(&logits) == bits(&off.0), tokens == off.1);
+        let room_ok = room.0 == 0 && room.1 > 0;
+        println!(
+            "kvhost: {KV_HOST_PROMPT} ids and {KV_HOST_STEPS} greedy steps, the planes on the \
+             host: the prompt's logits row and every id the card-backed load's ({logits_ok}, \
+             {ids_ok}), the planes' card bytes {} and host bytes {} (0 and > 0: {room_ok}): {}",
+            room.0,
+            room.1,
+            verdict(logits_ok && ids_ok && room_ok)
+        );
+        Ok(logits_ok && ids_ok && room_ok)
+    }
+
     fn kv_q8(toks: &[u32], ties: &mut usize) -> Result<bool, GateError> {
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
-        let mut m = open_at(Experts::Host, 1, ub, None, KvQ8::Q8)?.model;
+        let mut m = open_at(Experts::Host, 1, ub, None, (KvQ8::Q8, KvHost::Off))?.model;
         let (got, want) = (m.body("kv_q8")?.store_bytes(), store_bytes_q8());
         let mut ok = got == want;
         println!(
@@ -4161,16 +4252,17 @@ mod gate {
     /// against `host`, (ii) and (iii).
     fn card_leg(toks: &[u32], host: &Run, man: &RefManifest) -> Result<bool, GateError> {
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
-        let Opened38 { model: mut m, plan } = match open_at(Experts::Card, 1, ub, None, KvQ8::F16) {
-            Ok(o) => o,
-            Err(e) => {
-                println!(
-                    "card leg: the card plan's load FAILED: {e} {}",
-                    verdict(false)
-                );
-                return Ok(false);
-            }
-        };
+        let Opened38 { model: mut m, plan } =
+            match open_at(Experts::Card, 1, ub, None, (KvQ8::F16, KvHost::Off)) {
+                Ok(o) => o,
+                Err(e) => {
+                    println!(
+                        "card leg: the card plan's load FAILED: {e} {}",
+                        verdict(false)
+                    );
+                    return Ok(false);
+                }
+            };
         let mut ok = guarded("structure", &mut m, |m| card_structure(m, &plan))?;
         ok &= guarded("places rule", &mut m, places_rule)?;
         ok &= guarded("vs host", &mut m, |m| card_vs_host(m, toks, host))?;
@@ -4224,6 +4316,7 @@ mod gate {
                     room: None,
                     residency: Residency::Off,
                     kv: KvQ8::F16,
+                    kv_host: bloomery_levers::KvHost::Off,
                 }
                 .plan(open_split()?)?
                 .open()
@@ -5043,7 +5136,7 @@ mod gate {
         let other: Vec<u32> = ids[n + 1..].to_vec();
         let last = ids[n];
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(SHARE_CTX)?;
-        let mut m = open_ctx(experts, 3, SHARE_CTX, ub, None, KvQ8::F16)?.model;
+        let mut m = open_ctx(experts, 3, SHARE_CTX, ub, None, (KvQ8::F16, KvHost::Off))?.model;
         let (at, ask) = (u32::try_from(SHARE_AT)?, u32::try_from(SHARE_AT + 3)?);
         let cut = u32::try_from(SHARE_CUT)?;
         m.body_parts("(y) share")?.2.set_checkpoints(true);
@@ -5217,6 +5310,7 @@ mod gate {
             room: None,
             residency: Residency::Off,
             kv: KvQ8::F16,
+            kv_host: bloomery_levers::KvHost::Off,
         }
         .plan(open_split()?)?
         .facts()
@@ -5225,13 +5319,19 @@ mod gate {
         let Opened38 {
             model: mut m,
             plan: host_plan,
-        } = open_at(Experts::Host, 1, ZUB, None, KvQ8::F16)?;
+        } = open_at(Experts::Host, 1, ZUB, None, (KvQ8::F16, KvHost::Off))?;
         let (want, host_faults) = z_runs(&mut m, toks, &prefill)?;
         drop(m);
         let Opened38 {
             model: mut m,
             plan: nvme_plan,
-        } = open_at(Experts::Host, 1, ZUB, Some(host_need - 1), KvQ8::F16)?;
+        } = open_at(
+            Experts::Host,
+            1,
+            ZUB,
+            Some(host_need - 1),
+            (KvQ8::F16, KvHost::Off),
+        )?;
         let (got, nvme_faults) = z_runs(&mut m, toks, &prefill)?;
         drop(m);
         let (host_tier, nvme_tier) = (host_plan.ple_tier, nvme_plan.ple_tier);
@@ -6123,6 +6223,8 @@ mod gate {
 
     /// (kv)'s clause line.
     const KV_CLAUSE: &str = "(kv) the q8_0 cache: store bytes, graph = eager = pass, D3K's step";
+    const KV_HOST_CLAUSE: &str =
+        "(kvh) BLOOMERY_KV_HOST=all: the planes on the host, the same bits";
 
     pub fn run() -> Result<(), GateError> {
         let mut ok = init()?;
@@ -6186,6 +6288,8 @@ mod gate {
         drop(m);
         tier::sc(KV_CLAUSE)?;
         ok &= kv_q8(&toks, &mut ties)?;
+        tier::sc(KV_HOST_CLAUSE)?;
+        ok &= kv_host()?;
         tier::sc("(z) the PLE table on the NVMe tier = on the host")?;
         ok &= ple_nvme(&toks)?;
         tier::sc("(y) resident slots: the plan's bytes and the harness's contracts")?;

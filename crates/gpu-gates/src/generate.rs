@@ -77,6 +77,15 @@ pub fn stage_page(stage: CardSpec) -> Result<u64, GateError> {
     )?)?)
 }
 
+/// The page a room that can back its pages on the host takes on `stage`'s
+/// device ([`bloomery_gpu::host_page`]): the least common multiple of the
+/// card's and the host's VMM granularities, which a plan under
+/// `BLOOMERY_KV_HOST` rounds the K/V planes at (`PlanInputs::kv_host_page`).
+pub fn stage_host_page(stage: CardSpec) -> Result<u64, GateError> {
+    let ordinal = Gpu::resolve_card(stage.name, stage.device)?;
+    Ok(u64::try_from(bloomery_gpu::host_page(ordinal)?)?)
+}
+
 /// Which placement the engine loads by: a stage card that runs every layer
 /// and the head, then the expert tier cards beside the host tier. The flag
 /// word is an alias — `a` (the stage on the largest visible card), `bp`

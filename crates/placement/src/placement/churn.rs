@@ -163,6 +163,7 @@ mod tests {
     use super::*;
     use crate::placement::workstation::{HostNeed, HostRead};
     use crate::placement::{Host, HostTotals, Machine, ModelTensors, Node};
+    use bloomery_levers::KvHost;
 
     /// A plan whose host leaves `headroom` bytes, and nothing else: the
     /// check reads the headroom alone.
@@ -185,6 +186,7 @@ mod tests {
                 arena_columns: 1,
                 table_bytes: 0,
                 shadow_bytes: 0,
+                kv_host_bytes: 0,
                 stage_kv_bytes: 0,
                 reserve_bytes: 0,
                 row_reserve_bytes: 0,
@@ -199,6 +201,7 @@ mod tests {
             budget_from_pool: false,
             expert_rank: None,
             kv_floor: None,
+            kv_host: KvHost::default(),
         }
     }
 

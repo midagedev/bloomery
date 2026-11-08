@@ -1,0 +1,23 @@
+# kvhost2 mutant plan-ignores
+# clause: the planner test (crates/model/src/arch/qwen35moe/place.rs,
+#   a_qwen4exp_plan_holds_its_kv_planes_on_the_host_under_all, beside
+#   a_qwen4exp_plan_spreads_its_experts_at_the_kv_floor): the plan does not drop the K/V planes
+#   from its cards' cache terms under all, so the expert spread keeps the cap's 14 experts and
+#   the cache term the cap's own, and the test's "every expert back", "more than off" and
+#   "drops exactly the planes" assertions red.
+# site: crates/placement/src/placement/planner.rs plan_rule — the PlanesOff view never built.
+# expected red: "test a_qwen4exp_plan_holds_its_kv_planes_on_the_host_under_all ... FAILED".
+
+diff --git a/crates/placement/src/placement/planner.rs b/crates/placement/src/placement/planner.rs
+index d83756cf8..56eb2c211 100644
+--- a/crates/placement/src/placement/planner.rs
++++ b/crates/placement/src/placement/planner.rs
+@@ -267,7 +267,7 @@ fn plan_rule<'a>(
+     // Under `all` the planes hold no card bytes: the plan counts every card's
+     // cache through the view that drops them ([`PlanesOff`]), the pooled
+     // keys, rings and stage rows staying at their own positions.
+-    let planes_off = (levers.kv_host == KvHost::All).then_some(PlanesOff { kv });
++    let planes_off = (levers.kv_host == KvHost::All && false).then_some(PlanesOff { kv });
+     let kv_counted = planes_off.as_ref().map_or(kv, |p| p as &dyn KvBytes);
+     let card_budget = &levers.card_budget_bytes;
+     let rank = levers.expert_rank.as_deref();

@@ -580,6 +580,15 @@ impl Machine {
 /// `ctx_max` tokens, and what a stage keeps beside it.
 pub trait KvBytes {
     fn layer_bytes(&self, layer: usize, ctx_max: u64) -> u64;
+    /// The bytes of `layer`'s K/V planes at `ctx_max` positions — the part of
+    /// [`KvBytes::layer_bytes`] a host-backed store (`BLOOMERY_KV_HOST=all`)
+    /// holds off the card, its pages on the host. The default is none: a
+    /// layer whose cache no host-capable room holds, the pooled keys and the
+    /// rings included.
+    fn plane_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
+        let _ = (layer, ctx_max);
+        0
+    }
     /// Bytes the stage that runs layer 0 holds at `ctx_max` positions beside
     /// its cache, one copy for every resident sequence: the rope rows its
     /// body copies to the card, one row a position (`gpu::rope_table::RopeRows`).

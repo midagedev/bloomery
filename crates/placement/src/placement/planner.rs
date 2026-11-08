@@ -11,6 +11,7 @@ use super::rule::{
 };
 use super::table::{Plan, Row};
 use super::{CardFormat, Role};
+use bloomery_levers::KvHost;
 use std::sync::Arc;
 
 /// The placement's levers, which a binary parses once
@@ -42,6 +43,14 @@ pub struct PlanLevers {
     /// their stores in rooms alone parses the lever; a plan handed one here
     /// is every plan that binary makes.
     pub kv_floor: Option<u64>,
+    /// The K/V planes' backing `BLOOMERY_KV_HOST` names: `all` plans the
+    /// planes ([`KvBytes::plane_bytes`]) at no card position, so the expert
+    /// spread gets their bytes, and counts them against the plan's host room
+    /// instead; `spill` and `off` leave the plan's card terms as they are.
+    /// Unset is [`KvHost::Off`]. `all` beside a `kv_floor` is refused by name
+    /// ([`PlacementError::KvHostFloor`]): it already plans the spread at a
+    /// zero card position.
+    pub kv_host: KvHost,
 }
 
 impl PlanLevers {
@@ -55,6 +64,7 @@ impl PlanLevers {
                 .map(|path| ExpertRank::read(path).map(Arc::new))
                 .transpose()?,
             kv_floor: levers.kv_floor(),
+            kv_host: levers.kv_host(),
         })
     }
 }
@@ -247,6 +257,18 @@ fn plan_rule<'a>(
         }
         floor => floor.unwrap_or(ctx_max),
     };
+    // `all` is a floor-0 plan for the planes and nothing may say another
+    // floor: the two levers name where the spread runs.
+    if levers.kv_host == KvHost::All
+        && let Some(floor) = levers.kv_floor
+    {
+        return Err(PlacementError::KvHostFloor { floor });
+    }
+    // Under `all` the planes hold no card bytes: the plan counts every card's
+    // cache through the view that drops them ([`PlanesOff`]), the pooled
+    // keys, rings and stage rows staying at their own positions.
+    let planes_off = (levers.kv_host == KvHost::All).then_some(PlanesOff { kv });
+    let kv_counted = planes_off.as_ref().map_or(kv, |p| p as &dyn KvBytes);
     let card_budget = &levers.card_budget_bytes;
     let rank = levers.expert_rank.as_deref();
     let tiers = machine.tiers.len();
@@ -277,7 +299,7 @@ fn plan_rule<'a>(
                 model,
                 machine,
                 (kv_at, ctx_max),
-                kv,
+                kv_counted,
                 &rows,
                 &stacks,
                 routed,
@@ -292,7 +314,7 @@ fn plan_rule<'a>(
     let none_held = vec![0u64; model.layers];
     let mut kv_bytes = Vec::with_capacity(machine.cards.len() + machine.tiers.len());
     for (c, card) in machine.cards.iter().enumerate() {
-        let (kv_card, shadow, stage_rows) = card_kv(card, kv, (kv_at, ctx_max));
+        let (kv_card, shadow, stage_rows) = card_kv(card, kv_counted, (kv_at, ctx_max));
         let eligible = match routed {
             Some(r) => eligible(card.layers.clone(), &stacks, model, r, false)?,
             None => Vec::new(),
@@ -314,7 +336,7 @@ fn plan_rule<'a>(
     }
     let mut tier_n_l: Vec<Vec<u64>> = Vec::with_capacity(machine.tiers.len());
     for (t, tier) in machine.tiers.iter().enumerate() {
-        let (kv_tier, shadow, _) = card_kv(tier, kv, (kv_at, ctx_max));
+        let (kv_tier, shadow, _) = card_kv(tier, kv_counted, (kv_at, ctx_max));
         let mut held = n_l.clone();
         for prev in &tier_n_l {
             for (h, p) in held.iter_mut().zip(prev) {
@@ -425,6 +447,7 @@ fn plan_rule<'a>(
     plan.reserve_beside(reserve)?;
     plan.expert_rank = levers.expert_rank.clone();
     plan.kv_floor = levers.kv_floor;
+    plan.kv_host = levers.kv_host;
     Ok(plan)
 }
 
@@ -581,6 +604,36 @@ fn host_stage_kv(
         .chain([kv.stage_position_bytes(ctx_max)])
         .try_fold(0u64, u64::checked_add)
         .ok_or_else(past)
+}
+
+/// `kv`'s per-layer bytes less its planes ([`KvBytes::plane_bytes`]): the
+/// view a plan under `BLOOMERY_KV_HOST=all` counts every card's cache by — a
+/// host-backed store holds the planes off the card, the pooled keys and the
+/// rings keeping their card bytes. Everything beside the planes is `kv`'s
+/// own answer.
+struct PlanesOff<'a> {
+    kv: &'a dyn KvBytes,
+}
+
+impl KvBytes for PlanesOff<'_> {
+    fn layer_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
+        self.kv
+            .layer_bytes(layer, ctx_max)
+            .checked_sub(self.kv.plane_bytes(layer, ctx_max))
+            .expect("a layer's planes are part of its bytes")
+    }
+
+    fn plane_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
+        self.kv.plane_bytes(layer, ctx_max)
+    }
+
+    fn shadow_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
+        self.kv.shadow_bytes(layer, ctx_max)
+    }
+
+    fn stage_position_bytes(&self, ctx_max: u64) -> u64 {
+        self.kv.stage_position_bytes(ctx_max)
+    }
 }
 
 /// A card's KV cache and its ring shadows over the layers its stage runs,

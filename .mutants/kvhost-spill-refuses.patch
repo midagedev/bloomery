@@ -1,0 +1,23 @@
+# kvhost mutant spill-refuses
+# clause: the spill gate (crates/gpu/src/room/mod.rs, the hw test
+#   hw_held_a_spill_room_backs_on_the_host_when_the_card_is_full in the same file's tests): the
+#   host fallback of a Spill room removed, so the fit past the card's bytes ends in the fit's
+#   named NoRoom instead of landing on the host.
+# site: crates/gpu/src/room/mod.rs Room::new_page — the Spill arm without its out-of-memory
+#   fallback to the host.
+# expected red: "  hw_held_a_spill_room_backs_on_the_host_when_the_card_is_full ... a fit past
+#   the card's bytes lands on the host: GpuError: NoRoom { what: \"the tests' spill planes\" ...
+#   FAIL"
+--- a/crates/gpu/src/room/mod.rs
++++ b/crates/gpu/src/room/mod.rs
+@@ -298,9 +298,6 @@
+             ))),
+             Backing::Host => Ok(Owned::Host(Arc::new(HostPage::new(device, self.page)?))),
+             Backing::Spill => match PhysicalAllocation::new(device, self.page) {
+                 Ok(card) => Ok(Owned::Card(Arc::new(card))),
+-                Err(source) if is_out_of_memory(&source) => {
+-                    Ok(Owned::Host(Arc::new(HostPage::new(device, self.page)?)))
+-                }
+                 Err(source) => Err(GpuError::Driver {
+                     op: Some("cuMemCreate"),
+                     source,

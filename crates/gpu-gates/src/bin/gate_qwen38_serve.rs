@@ -3640,6 +3640,7 @@ mod gate {
             &mut machine,
             (ctx, slots, drafted),
             stage.granule_bytes.get(),
+            bloomery_levers::KvHost::Off,
         )?;
         Ok(machine)
     }

@@ -31,7 +31,16 @@
 //! range reserved whole and every page backed at load, so it reads and
 //! launches as a plain buffer until the machine gives back the pages wholly
 //! past a slot ([`StackRoom::release_from`]) and backs them again
-//! ([`StackRoom::restore`]).
+//! ([`StackRoom::restore`]) — a stack's pages are always card memory
+//! ([`Backing::Card`]).
+//!
+//! A room's own memory can sit on the host instead of the card
+//! ([`Backing`]): a host page is mapped and granted to the device exactly as
+//! a card page and zeroed on the room's stream, so every kernel and capture
+//! over the store stays as it is; [`Room::mapped`] keeps naming the card
+//! bytes and [`Room::host_mapped`] names the host bytes. A [`Backing::Spill`]
+//! room backs a page on the host when the card cannot make its memory for
+//! lack of free bytes.
 //!
 //! Every writer calls `fit` and `own_from` first, outside capture, for all
 //! positions it can write. An unbacked page aliases the spare: a missed fit
@@ -44,11 +53,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use cuda_core::sys::CUdevice;
-use cuda_core::vmm::{self, Mapping, PhysicalAllocation, VirtualReservation};
+use cuda_core::vmm::{self, PhysicalAllocation, VirtualReservation};
 use cuda_core::{CudaStream, DeviceBuffer, DriverError};
 
 use crate::GpuError;
 use crate::tensor::DeviceTensor;
+
+pub(crate) mod host;
+
+use self::host::{HostPage, RawMap};
 
 const WHAT: &str = "room";
 
@@ -96,31 +109,90 @@ impl std::ops::Add for SharedPages {
     }
 }
 
+/// The memory a room backs its pages with, chosen at construction and held
+/// by every page the room gives memory of its own to: [`Room::new_page`]
+/// makes each page's memory where this says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Backing {
+    /// The device's own memory: today's only choice.
+    Card,
+    /// Host memory on the NUMA node the device names, mapped into the range
+    /// and reached over the device's link ([`host::HostPage`]).
+    Host,
+    /// The card's memory first; a page whose card memory the driver cannot
+    /// make for lack of free bytes is backed on the host instead. Any other
+    /// driver refusal stays the named refusal it is.
+    Spill,
+}
+
+/// The memory a page backs: the device's own, or host memory the device
+/// reaches over its link. One `Arc` a page; a share hands another room the
+/// same one (the `Clone` is the `Arc`'s hold).
+#[derive(Clone)]
+enum Owned {
+    Card(Arc<PhysicalAllocation>),
+    Host(Arc<HostPage>),
+}
+
+impl Owned {
+    /// The raw allocation handle, for a mapping.
+    fn handle(&self) -> cuda_core::sys::CUmemGenericAllocationHandle {
+        match self {
+            Owned::Card(a) => a.handle(),
+            Owned::Host(h) => h.handle(),
+        }
+    }
+
+    /// Whether the memory sits on the host.
+    fn is_host(&self) -> bool {
+        matches!(self, Owned::Host(_))
+    }
+
+    /// Rooms that hold this memory, the page's own room among them.
+    fn holders(&self) -> usize {
+        match self {
+            Owned::Card(a) => Arc::strong_count(a),
+            Owned::Host(h) => Arc::strong_count(h),
+        }
+    }
+
+    /// Whether two pages map the same memory.
+    fn same(a: &Owned, b: &Owned) -> bool {
+        match (a, b) {
+            (Owned::Card(x), Owned::Card(y)) => Arc::ptr_eq(x, y),
+            (Owned::Host(x), Owned::Host(y)) => Arc::ptr_eq(x, y),
+            _ => false,
+        }
+    }
+}
+
 /// A page of a room's range: its mapping, and the memory it maps other
 /// than the spare (its own, or another room's too after a share). The
 /// mapping drops first (unmapped), then this room's hold on the memory.
 struct Page {
-    _map: Mapping,
-    own: Option<Arc<PhysicalAllocation>>,
+    _map: RawMap,
+    own: Option<Owned>,
 }
 
-/// The page every page of `device`'s rooms with no memory of its own maps,
-/// and whether it was made just now (its bytes not set yet). One a device
-/// while any room holds it. Its bytes are no row's: nothing reads or
-/// writes them but an access past the rows in use.
+/// The page every page of `device`'s rooms of `page` bytes with no memory
+/// of its own maps, and whether it was made just now (its bytes not set
+/// yet). One a device and page size while any room holds it — a room that
+/// can back pages on the host may take a larger page than a card-only room
+/// ([`host::page_for`]). Its bytes are no row's: nothing reads or writes
+/// them but an access past the rows in use.
 fn spare(device: CUdevice, page: usize) -> Result<(Arc<PhysicalAllocation>, bool), GpuError> {
-    static SPARES: Mutex<Vec<(CUdevice, Weak<PhysicalAllocation>)>> = Mutex::new(Vec::new());
+    static SPARES: Mutex<Vec<(CUdevice, usize, Weak<PhysicalAllocation>)>> = Mutex::new(Vec::new());
     let mut spares = SPARES.lock().unwrap_or_else(PoisonError::into_inner);
-    spares.retain(|(_, s)| s.strong_count() > 0);
+    spares.retain(|(_, _, s)| s.strong_count() > 0);
     if let Some(s) = spares
         .iter()
-        .find(|(d, _)| *d == device)
-        .and_then(|(_, s)| s.upgrade())
+        .find(|(d, p, _)| *d == device && *p == page)
+        .and_then(|(_, _, s)| s.upgrade())
     {
         return Ok((s, false));
     }
     let s = Arc::new(PhysicalAllocation::new(device, page).map_err(driver("cuMemCreate"))?);
-    spares.push((device, Arc::downgrade(&s)));
+    spares.push((device, page, Arc::downgrade(&s)));
     Ok((s, true))
 }
 
@@ -129,6 +201,12 @@ fn driver(op: &'static str) -> impl Fn(DriverError) -> GpuError {
         op: Some(op),
         source,
     }
+}
+
+/// Whether a driver refusal is the device's own memory running out: the one
+/// a [`Backing::Spill`] room answers on the host.
+fn is_out_of_memory(source: &DriverError) -> bool {
+    source.0 == cuda_core::sys::cudaError_enum_CUDA_ERROR_OUT_OF_MEMORY
 }
 
 /// The reserved range of `N` buffers of one length, each at a page boundary,
@@ -141,13 +219,17 @@ pub(crate) struct Room {
     pages: Vec<Option<Page>>,
     /// Every buffer's runs, at their offsets in the range.
     runs: Vec<Run>,
+    /// Where a fit's pages get their memory ([`Backing`]).
+    backing: Backing,
     /// The positions whose rows lie on pages with memory of their own: a
     /// fit up to it backs nothing new.
     fitted: usize,
     /// The most positions a fit asked since the last settle.
     reach: usize,
-    /// The pages with memory of their own.
+    /// The pages with card memory of their own.
     mapped: usize,
+    /// The pages with host memory of their own.
+    hosted: usize,
     /// Whether a page may map memory another room maps too: set by a share
     /// on both rooms (the one it reads from through `&`), cleared once a
     /// scan finds none, so a sequence that never shared scans no page.
@@ -173,16 +255,26 @@ impl Room {
 
     /// Page `i` mapped read-write for the room's device to `own`, or to the
     /// spare without it, whatever mapped it before unmapped first.
-    fn back(&mut self, i: usize, own: Option<Arc<PhysicalAllocation>>) -> Result<(), GpuError> {
-        if self.pages[i].take().is_some_and(|p| p.own.is_some()) {
-            self.mapped -= 1;
+    fn back(&mut self, i: usize, own: Option<Owned>) -> Result<(), GpuError> {
+        if let Some(gone) = self.pages[i].take() {
+            match gone.own {
+                Some(Owned::Card(_)) => self.mapped -= 1,
+                Some(Owned::Host(_)) => self.hosted -= 1,
+                None => {}
+            }
         }
         let va = self.va(i);
-        let map = Mapping::new(va, self.page, own.as_deref().unwrap_or(&self.spare), 0)
-            .map_err(driver("cuMemMap"))?;
+        let handle = own
+            .as_ref()
+            .map_or_else(|| self.spare.handle(), Owned::handle);
+        let map = RawMap::new(va, self.page, handle, 0)?;
         vmm::set_access(va, self.page, &[self.stream.context().cu_device()])
             .map_err(driver("cuMemSetAccess"))?;
-        self.mapped += usize::from(own.is_some());
+        match own {
+            Some(Owned::Card(_)) => self.mapped += 1,
+            Some(Owned::Host(_)) => self.hosted += 1,
+            None => {}
+        }
         self.pages[i] = Some(Page { _map: map, own });
         Ok(())
     }
@@ -192,13 +284,30 @@ impl Room {
         self.reserve.base() + (i * self.page) as u64
     }
 
-    /// Memory of its own for one page, the context bound to the thread.
-    fn new_page(&self) -> Result<Arc<PhysicalAllocation>, GpuError> {
+    /// Memory of its own for one page, where the room's backing says
+    /// ([`Backing`]), the context bound to the thread. A `Spill` room whose
+    /// card memory the driver cannot make for lack of free bytes backs the
+    /// page on the host; any other driver refusal stays the refusal it is.
+    fn new_page(&self) -> Result<Owned, GpuError> {
         let ctx = self.stream.context();
         ctx.bind_to_thread()?;
-        let own =
-            PhysicalAllocation::new(ctx.cu_device(), self.page).map_err(driver("cuMemCreate"))?;
-        Ok(Arc::new(own))
+        let device = ctx.cu_device();
+        match self.backing {
+            Backing::Card => Ok(Owned::Card(Arc::new(
+                PhysicalAllocation::new(device, self.page).map_err(driver("cuMemCreate"))?,
+            ))),
+            Backing::Host => Ok(Owned::Host(Arc::new(HostPage::new(device, self.page)?))),
+            Backing::Spill => match PhysicalAllocation::new(device, self.page) {
+                Ok(card) => Ok(Owned::Card(Arc::new(card))),
+                Err(source) if is_out_of_memory(&source) => {
+                    Ok(Owned::Host(Arc::new(HostPage::new(device, self.page)?)))
+                }
+                Err(source) => Err(GpuError::Driver {
+                    op: Some("cuMemCreate"),
+                    source,
+                }),
+            },
+        }
     }
 
     /// The device's free bytes on this room's context, which the calling
@@ -223,9 +332,11 @@ impl Room {
 
     /// A fit's named refusal of page `i`, the driver's `source` in it: the
     /// store, the positions the fit asked, the bytes of new pages the fit
-    /// still asked, the page among the room's, the pages the room had
-    /// backed and the device's free bytes then. The asked bytes, the free
-    /// bytes (when readable) and the page are the error's numbers.
+    /// still asked, the page among the room's, the pages the room had backed
+    /// on the card and on the host (the host bytes named as bytes, what a
+    /// caller that spills reads) and the device's free bytes then. The asked
+    /// bytes, the free bytes (when readable) and the page are the error's
+    /// numbers.
     fn no_room(&self, positions: usize, i: usize, source: GpuError) -> GpuError {
         let asked = self.asks(positions);
         let free = self.free_bytes();
@@ -237,9 +348,12 @@ impl Room {
             what: self.what,
             detail: format!(
                 "a fit of {positions} positions asks {asked} B of new pages (backing page {i} \
-                 of {}, {} backed) and the device holds {said}",
+                 of {}, {} card-backed, {} host-backed, {} B of host memory) and the device \
+                 holds {said}",
                 self.pages.len(),
-                self.mapped
+                self.mapped,
+                self.hosted,
+                self.hosted * self.page
             ),
             source: Box::new(source),
             asked,
@@ -249,13 +363,13 @@ impl Room {
     }
 
     /// The memory page `i` maps, other than the spare.
-    fn own(&self, i: usize) -> Option<&Arc<PhysicalAllocation>> {
+    fn own(&self, i: usize) -> Option<&Owned> {
         self.pages[i].as_ref().and_then(|p| p.own.as_ref())
     }
 
     /// Whether page `i` maps memory another room maps too.
     fn is_shared(&self, i: usize) -> bool {
-        self.own(i).is_some_and(|o| Arc::strong_count(o) > 1)
+        self.own(i).is_some_and(|o| o.holders() > 1)
     }
 
     /// Whether page `i` touches a run's rows and holds, in every run it
@@ -287,12 +401,14 @@ impl Room {
     }
 
     /// `bytes` bytes from `src` to `dst` on the room's stream, in order
-    /// before any launch enqueued after.
+    /// before any launch enqueued after. Either side may be a host-backed
+    /// page: both are device-accessible addresses all the same.
     fn copy(&self, dst: u64, src: u64, bytes: usize) -> Result<(), GpuError> {
-        // SAFETY: both ranges are `bytes` bytes of device memory mapped
-        // read-write for this device (pages of rooms of this device, or a
-        // room's scratch mappings of new pages) that stay mapped until the
-        // stream has run the copy, and they do not overlap.
+        // SAFETY: both ranges are `bytes` bytes of device-accessible memory
+        // (card or host pages) mapped read-write for this device (pages of
+        // rooms of this device, or a room's scratch mappings of new pages)
+        // that stay mapped until the stream has run the copy, and they do
+        // not overlap.
         unsafe {
             cuda_core::simt::memory::memcpy_dtod_async(dst, src, bytes, self.stream.cu_stream())
         }
@@ -393,21 +509,24 @@ impl Room {
     }
 
     /// The device bytes of the pages wholly at or past byte `byte` of the
-    /// range that hold memory of their own: what [`Room::release_from`]
-    /// would free.
+    /// range that hold card memory of their own: what [`Room::release_from`]
+    /// would free. A host-backed page frees host bytes, not device bytes,
+    /// and counts for none here.
     pub(crate) fn tail_bytes(&self, byte: usize) -> u64 {
         let pages = (byte.div_ceil(self.page)..self.pages.len())
-            .filter(|&i| self.own(i).is_some())
+            .filter(|&i| self.own(i).is_some_and(|o| !o.is_host()))
             .count();
         (pages * self.page) as u64
     }
 
     /// Every page wholly at or past byte `byte` of the range given back to
-    /// the spare, its memory freed: the device bytes freed, 0 for pages
-    /// already on the spare. The caller has the device finished with every
-    /// call that could read those pages (a copy out of them included), and
-    /// nothing reads or writes them after. Never inside a capture. An error
-    /// leaves the pages given back so far given back.
+    /// the spare, its memory freed: the device bytes freed (the card-backed
+    /// pages among them counted; a host-backed page frees host bytes, not
+    /// device bytes), 0 for pages already on the spare. The caller has the
+    /// device finished with every call that could read those pages (a copy
+    /// out of them included), and nothing reads or writes them after. Never
+    /// inside a capture. An error leaves the pages given back so far given
+    /// back.
     pub(crate) fn release_from(&mut self, byte: usize) -> Result<u64, GpuError> {
         let give: Vec<usize> = (byte.div_ceil(self.page)..self.pages.len())
             .filter(|&i| self.own(i).is_some())
@@ -416,18 +535,23 @@ impl Room {
             return Ok(0);
         }
         self.stream.context().bind_to_thread()?;
+        let mut card = 0;
         for &i in &give {
+            let host = self.own(i).is_some_and(|o| o.is_host());
+            if !host {
+                card += 1;
+            }
             self.back(i, None)?;
         }
-        Ok((give.len() * self.page) as u64)
+        Ok((card * self.page) as u64)
     }
 
     /// Memory of its own, zeroed on `stream` (a stream of the room's
     /// context), for every page that holds a byte of `[from, to)` and maps
     /// the spare: the pages [`Room::release_from`] gave back, the device
-    /// bytes backed. The zeroing is in stream order: work enqueued on
-    /// `stream` after this sees zeros. An error leaves the pages backed so
-    /// far backed.
+    /// bytes backed (the card-backed pages among them counted). The zeroing
+    /// is in stream order: work enqueued on `stream` after this sees zeros.
+    /// An error leaves the pages backed so far backed.
     pub(crate) fn restore(
         &mut self,
         from: usize,
@@ -438,12 +562,16 @@ impl Room {
         let want: Vec<usize> = (from / self.page..end)
             .filter(|&i| self.own(i).is_none())
             .collect();
+        let mut card = 0;
         for &i in &want {
             let own = self.new_page()?;
+            if !own.is_host() {
+                card += 1;
+            }
             self.back(i, Some(own))?;
             self.zero_on(i, stream)?;
         }
-        Ok((want.len() * self.page) as u64)
+        Ok((card * self.page) as u64)
     }
 
     /// Refused by name unless `from` is a room of this one's layout on its
@@ -496,8 +624,8 @@ impl Room {
                 .own(i)
                 .ok_or(GpuError::state(WHAT, "the shared page's memory"))?;
             if self.below(i, positions) {
-                if !self.own(i).is_some_and(|o| Arc::ptr_eq(o, theirs)) {
-                    self.back(i, Some(Arc::clone(theirs)))?;
+                if !self.own(i).is_some_and(|o| Owned::same(o, theirs)) {
+                    self.back(i, Some(theirs.clone()))?;
                 }
                 moved.mapped += self.page;
             } else {
@@ -543,7 +671,7 @@ impl Room {
         for (k, &i) in moving.iter().enumerate() {
             let own = self.new_page()?;
             let va = scratch.base() + (k * self.page) as u64;
-            let map = Mapping::new(va, self.page, &own, 0).map_err(driver("cuMemMap"))?;
+            let map = RawMap::new(va, self.page, own.handle(), 0)?;
             vmm::set_access(va, self.page, &[self.stream.context().cu_device()])
                 .map_err(driver("cuMemSetAccess"))?;
             fresh.push((i, map, own, va));
@@ -560,10 +688,17 @@ impl Room {
         Ok(())
     }
 
-    /// Device bytes the pages with memory of their own hold, those that
-    /// map another room's memory too among them.
+    /// Card bytes the pages with card memory of their own hold, those that
+    /// map another room's card memory too among them ([`Room::host_mapped`]
+    /// names the host bytes; the plan and the residency machine read this as
+    /// device bytes).
     pub(crate) fn mapped(&self) -> usize {
         self.mapped * self.page
+    }
+
+    /// Host bytes the pages with host memory of their own hold.
+    pub(crate) fn host_mapped(&self) -> usize {
+        self.hosted * self.page
     }
 
     /// Device bytes of the pages that map memory another room maps too.
@@ -640,16 +775,21 @@ pub(crate) struct Roomed<V: Views> {
 
 impl<V: Views> Roomed<V> {
     /// `N` buffers of `len` elements in one reserve on `stream`'s device,
-    /// each at a page boundary, built into `V` by `build`; `runs` are the
-    /// rows of one buffer, which every buffer has at its own offset. Every
-    /// page maps the spare: the rows a fit reaches get memory of their own,
-    /// zeroed ([`Room::fit`]). `what` names the store the room backs, for
-    /// a fit's named refusal. Refused by name for a run past a buffer.
-    pub(crate) fn new<T, const N: usize>(
+    /// each at a page boundary, built into `V` by `build`, their pages
+    /// backed where `backing` says ([`Backing`]; [`Roomed::new`] is the card
+    /// choice); `runs` are the rows of one buffer, which every buffer has at
+    /// its own offset. Every page maps the spare: the rows a fit reaches get
+    /// memory of their own, zeroed ([`Room::fit`]). `what` names the store
+    /// the room backs, for a fit's named refusal. A room that can back
+    /// pages on the host takes a page both locations can create
+    /// ([`host::page_for`]) and is refused by name where the device cannot
+    /// host a VMM page. Refused by name for a run past a buffer.
+    pub(crate) fn with_backing<T, const N: usize>(
         stream: Arc<CudaStream>,
         len: usize,
         runs: &[Run],
         what: &'static str,
+        backing: Backing,
         build: impl FnOnce([DeviceBuffer<T>; N]) -> V,
     ) -> Result<Roomed<V>, GpuError> {
         let bytes = len
@@ -663,7 +803,10 @@ impl<V: Views> Roomed<V> {
         }
         let ctx = Arc::clone(stream.context());
         ctx.bind_to_thread()?;
-        let page = crate::allocation_granularity(ctx.ordinal())?;
+        let page = match backing {
+            Backing::Card => crate::allocation_granularity(ctx.ordinal())?,
+            Backing::Host | Backing::Spill => host::page_for(ctx.ordinal())?,
+        };
         let stride = vmm::align_size(bytes.max(1), page);
         let reserve =
             VirtualReservation::new(stride * N, page).map_err(driver("cuMemAddressReserve"))?;
@@ -680,9 +823,11 @@ impl<V: Views> Roomed<V> {
                     })
                 })
                 .collect(),
+            backing,
             fitted: 0,
             reach: 0,
             mapped: 0,
+            hosted: 0,
             lent: AtomicBool::new(false),
             page,
             spare,
@@ -710,6 +855,18 @@ impl<V: Views> Roomed<V> {
             views: ManuallyDrop::new(build(views)),
             rooms: vec![room],
         })
+    }
+
+    /// The card-backed choice of [`Roomed::with_backing`]: the buffers every
+    /// store today holds.
+    pub(crate) fn new<T, const N: usize>(
+        stream: Arc<CudaStream>,
+        len: usize,
+        runs: &[Run],
+        what: &'static str,
+        build: impl FnOnce([DeviceBuffer<T>; N]) -> V,
+    ) -> Result<Roomed<V>, GpuError> {
+        Roomed::with_backing(stream, len, runs, what, Backing::Card, build)
     }
 
     /// The same buffers and rooms held as `W`, built by `build`.
@@ -807,9 +964,16 @@ impl<V: Views> Roomed<V> {
         self.rooms.iter_mut().try_for_each(|r| r.own_from(pos))
     }
 
-    /// Device bytes the pages with memory of their own hold.
+    /// Card bytes the pages with card memory of their own hold, over every
+    /// room ([`Room::mapped`]).
     pub(crate) fn mapped(&self) -> usize {
         self.rooms.iter().map(Room::mapped).sum()
+    }
+
+    /// Host bytes the pages with host memory of their own hold, over every
+    /// room ([`Room::host_mapped`]).
+    pub(crate) fn host_mapped(&self) -> usize {
+        self.rooms.iter().map(Room::host_mapped).sum()
     }
 
     /// Device bytes of the pages that map memory another room maps too
@@ -862,8 +1026,10 @@ pub struct StackRoom {
 
 impl StackRoom {
     /// A stack of `words` `u32` words on `stream`'s device, every page
-    /// backed and zeroed on `stream`, and the buffer over its range. `what`
-    /// names the stack for a refusal.
+    /// backed and zeroed on `stream`, and the buffer over its range. A
+    /// residency machine's stacks are card memory always, so the pages'
+    /// backing is [`Backing::Card`] by name, not by default. `what` names
+    /// the stack for a refusal.
     pub fn new(
         stream: Arc<CudaStream>,
         words: usize,
@@ -878,7 +1044,14 @@ impl StackRoom {
             per: 1,
             rows: 1,
         }];
-        let mut roomed = Roomed::<DeviceBuffer<u32>>::new(stream, words, &whole, what, |[b]| b)?;
+        let mut roomed = Roomed::<DeviceBuffer<u32>>::with_backing(
+            stream,
+            words,
+            &whole,
+            what,
+            Backing::Card,
+            |[b]| b,
+        )?;
         roomed.fill()?;
         let mut view = None;
         let room = roomed.map(|b| view = Some(b));
@@ -1369,5 +1542,274 @@ mod tests {
         // The view is taken apart without a free before the room drops.
         drop(buf.into_raw_parts());
         drop(room);
+    }
+
+    /// A `Backing::Host` room of 4 pages fitted whole leaves the device's
+    /// free bytes within one page of what they were (a room's only card
+    /// memory is its spare, made at construction): the pages' memory sits
+    /// on the host, `host_mapped()` says the 4 pages and `mapped()` none; a
+    /// fresh fit's pages read back zeros and bytes written through the
+    /// buffer read back equal; a settle after a reach of one page leaves
+    /// one page of host memory; a fit of the pages that settle gave back
+    /// reads zeros again — the pages last held a written pattern, so a page
+    /// not zeroed reads it. Runs alone (`hw_held_`): the free bytes are the
+    /// device's, which a parallel test's allocation moves.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_held_a_host_room_backs_its_pages_on_the_host() {
+        let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
+        ctx.bind_to_thread().expect("the context binds");
+        let page = vmm::allocation_granularity(ctx.cu_device()).expect("the granularity");
+        let (row, rows) = (page / 2, 8);
+        let words = row / size_of::<u32>();
+        let runs = [Run {
+            at: 0,
+            row,
+            per: 1,
+            rows,
+        }];
+        let mut r: Roomed<[DeviceBuffer<u32>; 1]> = Roomed::with_backing(
+            Arc::clone(&stream),
+            rows * words,
+            &runs,
+            "the tests' host planes",
+            Backing::Host,
+            |b| b,
+        )
+        .expect("a host room");
+        let free = || {
+            crate::capsync::ctx_sync(&ctx, "the host room's check").expect("the context syncs");
+            crate::current_mem_info()
+                .expect("the device's free bytes")
+                .0
+        };
+        let before = free();
+        r.fit(rows).expect("a fit of every row");
+        let after = free();
+        assert!(
+            before.saturating_sub(after) <= page,
+            "a host fit takes no card bytes beyond the spare: {before} then {after}, page {page}"
+        );
+        assert_eq!(r.host_mapped(), 4 * page, "every page on the host");
+        assert_eq!(r.mapped(), 0, "no page on the card");
+        let read = |r: &Roomed<[DeviceBuffer<u32>; 1]>, j: usize| {
+            Window::<u32>::of(&r[0], j * row, words)
+                .expect("a backed row")
+                .to_host_vec(&stream)
+                .expect("a read")
+        };
+        let write = |r: &mut Roomed<[DeviceBuffer<u32>; 1]>, j: usize, v: u32| {
+            WindowMut::<u32>::of_mut(&mut r[0], j * row, words)
+                .expect("a backed row")
+                .copy_from_host(&stream, &vec![v; words])
+                .expect("a write");
+        };
+        for j in 0..rows {
+            assert_eq!(read(&r, j), vec![0u32; words], "row {j} of a fresh fit");
+        }
+        for j in 0..rows {
+            write(&mut r, j, j as u32 + 1);
+        }
+        for j in 0..rows {
+            assert_eq!(read(&r, j), vec![j as u32 + 1; words], "row {j} reads back");
+        }
+        r.settle().expect("a settle");
+        assert_eq!(
+            r.host_mapped(),
+            4 * page,
+            "a reach of every row keeps every page"
+        );
+        r.fit(1).expect("a fit");
+        r.settle().expect("a settle");
+        assert_eq!(
+            r.host_mapped(),
+            page,
+            "a reach of one row keeps the first page alone"
+        );
+        r.fit(rows).expect("a fit of every row again");
+        for j in 0..2 {
+            assert_eq!(
+                read(&r, j),
+                vec![j as u32 + 1; words],
+                "the kept page keeps its bytes"
+            );
+        }
+        for j in 2..rows {
+            assert_eq!(
+                read(&r, j),
+                vec![0u32; words],
+                "row {j} of a page backed again reads zero"
+            );
+        }
+        stream.synchronize().expect("the room's work finished");
+    }
+
+    /// A `Backing::Spill` room whose fit runs with the card squeezed to
+    /// under a page free backs its pages on the host: the fit completes —
+    /// the card cannot make a page's memory — `host_mapped()` holds pages,
+    /// and bytes written through the buffer read back equal. The squeezing
+    /// allocations are freed after. Runs alone (`hw_held_`): the squeeze
+    /// holds the device's free bytes, which a parallel test's allocation
+    /// would shift. FAIL-first: a spill that hands the card's refusal back.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_held_a_spill_room_backs_on_the_host_when_the_card_is_full() {
+        let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
+        ctx.bind_to_thread().expect("the context binds");
+        let page = vmm::allocation_granularity(ctx.cu_device()).expect("the granularity");
+        let (row, rows) = (page / 2, 4);
+        let words = row / size_of::<u32>();
+        let runs = [Run {
+            at: 0,
+            row,
+            per: 1,
+            rows,
+        }];
+        let mut r: Roomed<[DeviceBuffer<u32>; 1]> = Roomed::with_backing(
+            Arc::clone(&stream),
+            rows * words,
+            &runs,
+            "the tests' spill planes",
+            Backing::Spill,
+            |b| b,
+        )
+        .expect("a spill room");
+        let (free, _) = crate::current_mem_info().expect("the device's free bytes");
+        let bulk = DeviceBuffer::<u8>::zeroed(&stream, free.saturating_sub(8 * page) & !(page - 1))
+            .expect("the device's free bytes less a few pages");
+        let mut squeeze = Vec::new();
+        while crate::current_mem_info()
+            .expect("the device's free bytes")
+            .0
+            >= page
+        {
+            match PhysicalAllocation::new(ctx.cu_device(), page) {
+                Ok(card) => squeeze.push(card),
+                Err(_) => break,
+            }
+        }
+        r.fit(rows)
+            .expect("a fit past the card's bytes lands on the host");
+        assert!(r.host_mapped() > 0, "the spill backed pages on the host");
+        let read = |r: &Roomed<[DeviceBuffer<u32>; 1]>, j: usize| {
+            Window::<u32>::of(&r[0], j * row, words)
+                .expect("a backed row")
+                .to_host_vec(&stream)
+                .expect("a read")
+        };
+        for j in 0..rows {
+            WindowMut::<u32>::of_mut(&mut r[0], j * row, words)
+                .expect("a backed row")
+                .copy_from_host(&stream, &vec![j as u32 + 7; words])
+                .expect("a write");
+        }
+        for j in 0..rows {
+            assert_eq!(read(&r, j), vec![j as u32 + 7; words], "row {j} reads back");
+        }
+        drop(squeeze);
+        drop(bulk);
+        stream.synchronize().expect("the room's work finished");
+    }
+
+    /// Rooms share pages across backings, both ways: a card room's prefix
+    /// shared into a host room, then the host room shared into a card room
+    /// — the layout one buffer of four rows, two a page, so a share of three
+    /// positions maps the source's first page (whole rows of the prefix) and
+    /// copies the second (where the prefix ends); after
+    /// `own_from(1)` the destination's rows still equal the source's (the
+    /// page took its bytes with it), and a write to the destination leaves
+    /// the source's row as it was. Runs alone with the held room tests
+    /// (`hw_held_`).
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_held_rooms_share_across_backings() {
+        let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
+        let page = vmm::allocation_granularity(ctx.cu_device()).expect("the granularity");
+        let (row, rows) = (page / 2, 4);
+        let words = row / size_of::<u32>();
+        let runs = [Run {
+            at: 0,
+            row,
+            per: 1,
+            rows,
+        }];
+        let room = |backing: Backing| -> Roomed<[DeviceBuffer<u32>; 1]> {
+            Roomed::with_backing(
+                Arc::clone(&stream),
+                rows * words,
+                &runs,
+                "the tests' shared planes",
+                backing,
+                |b| b,
+            )
+            .expect("a room")
+        };
+        let read = |r: &Roomed<[DeviceBuffer<u32>; 1]>, j: usize| {
+            Window::<u32>::of(&r[0], j * row, words)
+                .expect("a backed row")
+                .to_host_vec(&stream)
+                .expect("a read")
+        };
+        let write = |r: &mut Roomed<[DeviceBuffer<u32>; 1]>, j: usize, v: u32| {
+            WindowMut::<u32>::of_mut(&mut r[0], j * row, words)
+                .expect("a backed row")
+                .copy_from_host(&stream, &vec![v; words])
+                .expect("a write");
+        };
+        let source = |backing: Backing| -> Roomed<[DeviceBuffer<u32>; 1]> {
+            let mut s = room(backing);
+            s.fit(rows).expect("a fit");
+            for j in 0..rows {
+                write(&mut s, j, j as u32 + 1);
+            }
+            s
+        };
+        // A card room's pages into a host room, then the other way.
+        for (side, other) in [
+            (Backing::Card, Backing::Host),
+            (Backing::Host, Backing::Card),
+        ] {
+            let a = source(side);
+            let mut b = room(other);
+            assert_eq!(
+                b.share(&a, 3).expect("a share across backings"),
+                SharedPages {
+                    mapped: page,
+                    copied: page
+                },
+                "{side:?} into {other:?}: the first page mapped, the second copied"
+            );
+            for j in 0..rows {
+                assert_eq!(read(&b, j), read(&a, j), "{other:?} row {j} of the share");
+            }
+            b.own_from(1).expect("an own from one");
+            for j in 0..rows {
+                assert_eq!(
+                    read(&b, j),
+                    read(&a, j),
+                    "{other:?} row {j} after the page took its own memory"
+                );
+            }
+            write(&mut b, 0, 999);
+            assert_eq!(
+                read(&b, 0),
+                vec![999; words],
+                "{other:?} row 0 after the write"
+            );
+            assert_eq!(
+                read(&a, 0),
+                vec![1; words],
+                "{side:?} row 0 stands after the write to {other:?}"
+            );
+            b.settle().expect("a settle");
+            for j in 0..rows {
+                assert_eq!(
+                    read(&a, j),
+                    vec![j as u32 + 1; words],
+                    "{side:?} row {j} stands"
+                );
+            }
+        }
+        stream.synchronize().expect("the rooms' work finished");
     }
 }

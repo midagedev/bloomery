@@ -643,6 +643,7 @@ fn accessors_read_their_rows() {
             SPLIT_WALK,
             QWEN3_KV,
             KV_FLOOR,
+            KV_HOST,
             LANE_PREFETCH,
             HOST_LANES,
             GEN_SLOTS,
@@ -817,6 +818,55 @@ fn kv_floor_takes_positions_and_a_binary_that_leaves_it_out_refuses_it() {
     let none: &[(&str, &str)] = &[];
     let left_out = read(&env(none), NO_LEVER).expect("an unset lever is no refusal");
     assert_eq!(left_out.kv_floor(), None);
+}
+
+/// `BLOOMERY_KV_HOST` takes one of `off`, `spill` and `all`, unset is `off`
+/// (the card's own memory, the plan before the lever), a value the kind does
+/// not take names the lever, and a binary that leaves the lever out refuses
+/// it set — the refusal every family whose stores are not rooms gives it.
+#[test]
+fn kv_host_takes_a_backing_word_and_a_binary_that_leaves_it_out_refuses_it() {
+    let host = |pairs: &[(&str, &str)]| read(&env(pairs), Scope::Every).map(|l| l.kv_host());
+    assert_eq!(host(&[]).unwrap(), KvHost::Off);
+    // Unset is not set: every family whose stores are not rooms refuses the
+    // lever only when it is set.
+    let unset = read(&[], Scope::Every).expect("nothing is set");
+    assert_eq!(unset.kv_host_set(), None);
+    for (word, kv) in [
+        ("off", KvHost::Off),
+        ("spill", KvHost::Spill),
+        ("all", KvHost::All),
+    ] {
+        assert_eq!(host(&[(KV_HOST, word)]).unwrap(), kv, "{word}");
+        assert_eq!(kv.name(), word, "{word}");
+    }
+    for bad in ["host", "card", "ALL", "0", ""] {
+        let Err(e) = host(&[(KV_HOST, bad)]) else {
+            panic!("{bad:?} is not a backing word and must be refused");
+        };
+        let text = e.to_string();
+        assert!(
+            text.contains(KV_HOST) && text.contains("off, spill, all"),
+            "{bad}: {text}"
+        );
+    }
+    let acts = Scope::Main {
+        bin: "b",
+        acts_on: &[KV_HOST],
+    };
+    assert_eq!(
+        read(&env(&[(KV_HOST, "all")]), acts).unwrap().kv_host(),
+        KvHost::All
+    );
+    let Err(e) = read(&env(&[(KV_HOST, "all")]), NO_LEVER) else {
+        panic!("a binary that leaves the backing out refuses it");
+    };
+    assert!(e.to_string().contains(KV_HOST), "{e}");
+    // A reading that left the lever out has it `off`, where the placement's
+    // reader asks.
+    let none: &[(&str, &str)] = &[];
+    let left_out = read(&env(none), NO_LEVER).expect("an unset lever is no refusal");
+    assert_eq!(left_out.kv_host(), KvHost::Off);
 }
 
 /// `BLOOMERY_NVTIER_EVICT` is read where the tier is built

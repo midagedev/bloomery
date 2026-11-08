@@ -517,6 +517,7 @@ fn qwen36_inputs() -> q35::PlanInputs {
         room: (u64::MAX, HostRead::Given),
         row_source: model::placement::RowTableSource::Split,
         arena: None,
+        kv_host_page: None,
     }
 }
 

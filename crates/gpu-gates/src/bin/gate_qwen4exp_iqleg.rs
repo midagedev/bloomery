@@ -607,6 +607,7 @@ mod gate {
             room: None,
             residency: Residency::Off,
             kv: KvQ8::F16,
+            kv_host: bloomery_levers::KvHost::Off,
         }
         .plan(file)?;
         let p = planned.facts();
