@@ -6,7 +6,8 @@
 //!     gate_kimi_k3_serve --dir <dir>
 //!
 //! The seat serves one sequence on one card (`--parallel` above 1 is refused by name), its prompt
-//! stepped one id at a time. Every server is `bloomery-serve --model kimik3 -m <file> …` beside
+//! run as placed passes of the widest shape its plan holds, or stepped one id at a time under
+//! `--prefill steps`. Every server is `bloomery-serve --model kimik3 -m <file> …` beside
 //! this binary, `BLOOMERY_REF_MODEL` removed from its environment. Logs per server in
 //! `<dir>/<name>/` (`server.err`, the answer).
 //!
@@ -23,15 +24,25 @@
 //! vocabulary spells it.
 //!
 //! - `parallel_above_one_is_refused`: the shared clause.
-//! - `residency_is_off_for_a_stepped_prompt`: `--plan` at [`CTX`] with `BLOOMERY_RESIDENCY` removed
-//!   from the environment prints the `residency lever` record at `off` with why `prefill_steps` and
-//!   no `residency host` record: each prompt id is a decode pass the adaptive rule would count,
-//!   and the body keeps the load's slot map for its life. `BLOOMERY_RESIDENCY=off` prints `off`
-//!   with why `set` and no pool. `BLOOMERY_RESIDENCY=mid-p0-s1` exits non-zero and its stderr
-//!   names the refusal (`tiered::check_residency_feed`), the plan record absent. FAIL-first: a seat
-//!   whose residency pick is the serving word prints it with why `place` and the unset half is red;
-//!   one that runs the word it is given loads the churn machine over a body that cannot and the
-//!   refusal half is red.
+//! - `residency_is_off_for_a_fixed_slot_map`: `--plan` at [`CTX`] with `BLOOMERY_RESIDENCY` removed
+//!   from the environment prints the `residency lever` record at `off` with why [`UNSET_WHY`] and
+//!   no `residency host` record: the body keeps the load's slot map for its life, so the residency
+//!   machine runs over none of its placements. `BLOOMERY_RESIDENCY=off` prints `off` with why `set`
+//!   and no pool. `BLOOMERY_RESIDENCY=mid-p0-s1` exits non-zero and its stderr names the refusal
+//!   (`tiered::refuse_fixed_slot_map`), the plan record absent. FAIL-first: a seat whose residency
+//!   pick is the serving word prints it with why `place` and the unset half is red; one that runs
+//!   the word it is given loads the churn machine over a body that cannot and the refusal half is
+//!   red.
+//! - `prompt_runs_as_passes`: a server at [`CTX`] names `prompt=pass` in its `listening` record,
+//!   prints the `prompt_pass` record of the shape its plan holds (R rows), and its `load` record
+//!   reads the same R rows off the loaded body (`pass_rows`), which `Batch::prompt` runs a prompt
+//!   by; a server under `--prefill steps` names `prompt=steps`, prints no `prompt_pass` record and
+//!   loads no pass. FAIL-first (`.mutants/k3seatpass-open-stepped.patch`: the seat plans the pass
+//!   and opens the stepped body): the pass server's `load` record has no `pass_rows` and the clause
+//!   is red.
+//! - `passes_answer_as_steps`: the two servers answer the same `/completion` (a prompt of
+//!   R + R/2 + 1 ids, two passes and a part, temperature 0, [`GENERATED`] ids) with the same ids
+//!   and stop.
 //! - `load_and_listen`, `chat_answers_a_turn`, `chat_splits_the_reasoning_at_the_models_tags`
 //!   (here: the reasoning in `reasoning_content`, the content with no section tag to leak),
 //!   `chat_ends_at_the_turn_end`,
@@ -66,7 +77,8 @@ mod gate {
 
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::serve_client::{
-        SeatGate, Served, check, curl, no_residency_host, residency_lever_is,
+        SeatGate, Served, check, completion_raw, curl, ids_of, json_of, no_residency_host,
+        residency_lever_is, server_log, stop_of, tokenized,
     };
     use bloomery_gpu_gates::{GateError, ref_model_path};
     use gguf::Split;
@@ -86,6 +98,18 @@ mod gate {
 
     /// The words of the residency refusal a set word other than `off` gets.
     const RESIDENCY_REFUSED: &str = "BLOOMERY_RESIDENCY=mid-p0-s1 is refused";
+
+    /// Why an unset residency is `off`: the body keeps its load's slot map for its life.
+    /// PIN(2026-11-08): `prefill_steps` -> `fixed_place`; the seat runs its prompt as passes, and
+    /// its `off` is the body's slot map, not a step feed.
+    const UNSET_WHY: &str = "fixed_place";
+
+    /// The ids each `/completion` of `passes_answer_as_steps` generates.
+    const GENERATED: usize = 8;
+
+    /// The text the pass clause's prompt is tokenized from, repeated to its length.
+    const PROMPT_TEXT: &str = "The river carried the boats past the old mill, and the miller \
+                               counted each one as it went by. ";
 
     /// The chat request the seat's turn is asked as: no reasoning budget and no effort (the
     /// template reads its own default), and the message holds reasoning, which the model writes
@@ -122,8 +146,8 @@ mod gate {
         })
     }
 
-    /// `residency_is_off_for_a_stepped_prompt` (the module header).
-    fn residency_is_off_for_a_stepped_prompt(
+    /// `residency_is_off_for_a_fixed_slot_map` (the module header).
+    fn residency_is_off_for_a_fixed_slot_map(
         c: &serve_gate::Clauses,
         dir: &Path,
     ) -> Result<bool, GateError> {
@@ -153,7 +177,7 @@ mod gate {
             Some("mid-p0-s1"),
         )?;
         let unset_ok = unset_status.success()
-            && residency_lever_is(&unset, "off", "prefill_steps")?
+            && residency_lever_is(&unset, "off", UNSET_WHY)?
             && no_residency_host(&unset)?;
         let off_ok = off_status.success()
             && residency_lever_is(&off, "off", "set")?
@@ -162,7 +186,7 @@ mod gate {
             && mid_text.contains(RESIDENCY_REFUSED)
             && mid.first(&record::PLAN)?.is_none();
         println!(
-            "residency: unset {:?} is off (prefill_steps) with no pool {unset_ok}; set off {:?} is \
+            "residency: unset {:?} is off ({UNSET_WHY}) with no pool {unset_ok}; set off {:?} is \
              off (set) with no pool {off_ok}; set mid-p0-s1 exits non-zero, names \
              {RESIDENCY_REFUSED:?} and prints no plan {mid_refused}",
             lever_line(&unset)?,
@@ -170,9 +194,135 @@ mod gate {
         );
         check(
             &mut ok,
-            "residency_is_off_for_a_stepped_prompt",
+            "residency_is_off_for_a_fixed_slot_map",
             unset_ok && off_ok && mid_refused,
         );
+        Ok(ok)
+    }
+
+    /// The prompt a pass clause server answers, from its URL and the `prompt_pass` rows it printed;
+    /// `None` asks none.
+    type PromptOf<'a> =
+        dyn Fn(&dyn Fn(&str) -> String, Option<u64>) -> Result<Option<Vec<u32>>, GateError> + 'a;
+
+    /// What one server of the pass clauses printed and answered.
+    struct Walked {
+        /// The `listening` record's `prompt` word.
+        prompt: Option<String>,
+        /// The `prompt_pass` record's rows.
+        planned: Option<u64>,
+        /// The `load` record's `pass_rows`.
+        loaded: Option<u64>,
+        /// The `/completion` answer's ids and stop.
+        answer: Option<(Vec<u32>, String)>,
+    }
+
+    /// A server at [`CTX`] in `<dir>/<name>` with `extra` flags: its walk records, and its
+    /// `/completion` of the prompt `ids` makes from the pass rows (none asked when `ids` gives
+    /// `None`). A server that never listens is a named error.
+    fn walked(
+        c: &serve_gate::Clauses,
+        (dir, name): (&Path, &str),
+        extra: &[&str],
+        ids: &PromptOf<'_>,
+    ) -> Result<Walked, GateError> {
+        let d = dir.join(name);
+        std::fs::create_dir_all(&d)?;
+        let file = ref_model_path()?;
+        let (cmd, mut all) = SeatGate {
+            model: c.model,
+            kinds: c.kinds,
+        }
+        .command(&file)?;
+        all.extend(
+            ["--port", "0", "--ctx", &c.ctx.to_string()]
+                .iter()
+                .chain(extra)
+                .map(|a| (*a).to_owned()),
+        );
+        let all: Vec<&str> = all.iter().map(String::as_str).collect();
+        let mut s = Served::spawn_cmd(cmd, &all, &d)?;
+        let err_log = d.join("server.err");
+        let addr = s
+            .address(&err_log, LISTEN_POLLS, Duration::from_secs(1))
+            .map_err(|e| format!("{name}: the server never listened: {e}"))?;
+        let records = server_log(&err_log, c.kinds)?;
+        let prompt = records
+            .one(c.listening)?
+            .opt_word("prompt")?
+            .map(str::to_owned);
+        let planned = match records.first(&record::PROMPT_PASS)? {
+            Some(r) => Some(r.u64("rows")?),
+            None => None,
+        };
+        let loaded = records.one(c.load)?.opt_u64("pass_rows")?;
+        let url = |p: &str| format!("http://{addr}{p}");
+        let answer = match ids(&url, planned)? {
+            Some(ids) => {
+                let (st, text) = completion_raw(&url, &ids, GENERATED, false)?;
+                std::fs::write(d.join("completion.json"), &text)?;
+                let v = json_of("/completion", st, &text)?;
+                Some((ids_of(&v["tokens"])?, stop_of(&v)?.to_owned()))
+            }
+            None => None,
+        };
+        println!("{name}: server stopped: {}", s.stop()?);
+        Ok(Walked {
+            prompt,
+            planned,
+            loaded,
+            answer,
+        })
+    }
+
+    /// `prompt_runs_as_passes` and `passes_answer_as_steps` (the module header): a pass server and
+    /// a `--prefill steps` server, one after the other.
+    fn prompt_runs_as_passes(c: &serve_gate::Clauses, dir: &Path) -> Result<bool, GateError> {
+        let mut ok = true;
+        // The prompt both servers answer: R + R/2 + 1 ids of the pass server's R rows, the text's
+        // ids repeated to that length; fixed once the pass server has made it.
+        let made = std::cell::RefCell::new(None::<Vec<u32>>);
+        let ids = |url: &dyn Fn(&str) -> String,
+                   rows: Option<u64>|
+         -> Result<Option<Vec<u32>>, GateError> {
+            if let Some(ids) = made.borrow().as_ref() {
+                return Ok(Some(ids.clone()));
+            }
+            let Some(rows) = rows else {
+                return Ok(None);
+            };
+            let len = usize::try_from(rows + rows / 2 + 1)?;
+            let text = tokenized(url, PROMPT_TEXT)?;
+            if text.is_empty() {
+                return Err("the pass clause's prompt text tokenizes to no id".into());
+            }
+            let ids: Vec<u32> = text.iter().copied().cycle().take(len).collect();
+            *made.borrow_mut() = Some(ids.clone());
+            Ok(Some(ids))
+        };
+        let pass = walked(c, (dir, "walk-pass"), &[], &ids)?;
+        let steps = walked(c, (dir, "walk-steps"), &["--prefill", "steps"], &ids)?;
+        let rows = pass.planned;
+        let runs = pass.prompt.as_deref() == Some("pass")
+            && rows.is_some_and(|r| r > 0)
+            && pass.loaded == rows
+            && steps.prompt.as_deref() == Some("steps")
+            && steps.planned.is_none()
+            && steps.loaded.is_none();
+        println!(
+            "walk: pass server prompt={:?}, prompt_pass rows {rows:?}, load pass_rows {:?}; \
+             --prefill steps server prompt={:?}, prompt_pass rows {:?}, load pass_rows {:?}: {runs}",
+            pass.prompt, pass.loaded, steps.prompt, steps.planned, steps.loaded
+        );
+        check(&mut ok, "prompt_runs_as_passes", runs);
+        let same = pass.answer.is_some() && pass.answer == steps.answer;
+        println!(
+            "answer: {} prompt ids; passes {:?}, steps {:?}: {same}",
+            made.borrow().as_ref().map_or(0, Vec::len),
+            pass.answer,
+            steps.answer
+        );
+        check(&mut ok, "passes_answer_as_steps", same);
         Ok(ok)
     }
 
@@ -266,7 +416,8 @@ mod gate {
         let dir = serve_gate::dir_of(&c)?;
         std::fs::create_dir_all(&dir)?;
         let mut ok = serve_gate::parallel_above_one_is_refused(&c, &dir)?;
-        ok &= residency_is_off_for_a_stepped_prompt(&c, &dir)?;
+        ok &= residency_is_off_for_a_fixed_slot_map(&c, &dir)?;
+        ok &= prompt_runs_as_passes(&c, &dir)?;
         ok &= serve_gate::served_with(&c, &dir, ASK)?;
         ok &= tools_request_is_refused(&c, &dir)?;
         serve_gate::finish(&c, ok)

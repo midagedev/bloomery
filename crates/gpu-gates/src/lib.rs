@@ -38,6 +38,8 @@ pub mod ik_q8_2;
 pub mod image_plan;
 #[cfg(feature = "gpu")]
 pub mod iq_rows;
+#[cfg(feature = "gpu")]
+pub mod kimi_k3_pass;
 pub mod kld;
 #[cfg(feature = "gpu")]
 pub mod kv_planes;
