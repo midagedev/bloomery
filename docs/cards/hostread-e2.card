@@ -1,0 +1,22 @@
+# ctxgrow E2: the rate a kernel reads pinned, device-mapped host memory over PCIe on the timing card, the term that prices
+# KV rows kept on the host (~/.cache design report §4 (d)). rig-log tools/hostread (hostread.cu, run.sh): sequential 16-byte
+# words over 4 GiB, then random whole rows of 1,536 / 576 / 4,096 bytes (a quarter of the buffer's rows), median of 9 launches.
+kind: calibration
+question: how fast does an A6000 kernel read pinned host memory, sequentially and as random KV-sized rows
+term: sequential zero-copy read GB/s, A6000, PCIe 4.0 x16, 4 GiB pinned mapped buffer, median of 9 launches
+unit: GB/s
+predict: 18.0..26.5
+condition: rig-log tools/hostread/run.sh under tools/ref/lease-hold.sh, both cards idle, CUDA_VISIBLE_DEVICES the A6000 by bus id
+reason: [derived] PCIe 4.0 x16 is 31.5 GB/s raw a direction; the box's pinned host-to-card copy read 26.28 GB/s (rig-log
+  docs/bloomery/facts.md:66), the ceiling a zero-copy read reaches at best; zero-copy reads by SM loads usually land under the
+  DMA copy (smaller requests in flight), so the floor is about 70 % of it. The random-row rows are read, not predicted: the
+  design report's 1–4 GB/s for 1.5 KB rows is an assumption this run replaces.
+decide-in: the ctxgrow plan's option (d) (KV rows on the host): its per-step cost at 32k / 128k / 256k is priced from these rows
+decide-below: under 18: read the link width and speed (nvidia-smi -q, PCIe generation) before reading the number
+decide-above: above 26.5: read the kernel for a cache effect (the buffer must exceed any on-card cache by far; 4 GiB does)
+# outcome 2026-11-08 (rig-log tools/hostread, the A6000 by bus id, lease held 12 s, gpu-apps [] before and after): sequential
+#  26.28 GB/s at each row size (4 GiB, median of 9); random whole rows, a quarter of the buffer's rows: 1,536 B 26.27,
+#  576 B 25.39, 4,096 B 26.27 GB/s. In band at its top: a zero-copy read reaches the DMA copy's 26.28. The rows read the
+#  link's rate, not the 1–4 GB/s the design report assumed for 1.5 KB rows. decide-in: option (d) prices a host KV row at
+#  the link's rate; Qwen3.8's selection at 256k (2,051 positions × 2,048 B × 12 layers = 50.4 MB a step) reads in 1.92 ms
+#  from the host against 0.075 ms on the card at 674 GB/s [derived].
