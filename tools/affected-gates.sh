@@ -8,6 +8,10 @@
 #   tools/affected-gates.sh … --no-box   # skip the box's dep-info (read-only ssh otherwise)
 #   tools/affected-gates.sh … --no-class # without the class stage, which is on: a gate of an F family (tools/families.tsv) stays only when
 #                                        # its family's files, its recipe or its own targets changed, each one left out named with its reason
+#   tools/affected-gates.sh … --fast    # the landing's list (the first line says `affected (fast)`): the class stage also leaves out a gate whose
+#                                        # every reached changed file is one family's own, keeping the gate of that family, the gates an owner of
+#                                        # owners.tsv names, the lib gate of a touched crate and the tooling gates; gate-batch.sh --fast-ledger
+#                                        # records its greens apart and a release batch does not read them
 #   tools/affected-gates.sh … --no-comment-only # without the comment-only rule, which is on: a Rust file of a workspace crate whose diff is comments
 #                                        # or layout only (equal tokens) selects no gate; the target of an include macro, a doc comment in a crate
 #                                        # whose doctests a gate runs and the lever registry stay selected, each named under `notes:`

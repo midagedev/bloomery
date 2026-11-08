@@ -282,6 +282,15 @@ blk_ptxspill() { tool_selftest ptx-spill-check.sh; }
 # scan-args.sh is the three scan recipes' refusal of a cargo feature given where the scan's own words go
 # (ptx-scan, sass-scan, lds-scan): its cases on a fixed feature list and the real crates/gpu-gates table.
 blk_scanargs() { tool_selftest scan-args.sh; }
+# whole-manifests: no gate-* recipe reads a package manifest as a file (recipes.py whole-manifests: rc 1 when one does). A script a box recipe
+# reaches that reads crates/gpu-gates/Cargo.toml (scan-args.sh does) hands every gate that manifest whole, so a new [[bin]] selects them all.
+blk_wholemanifests() {
+  if ! python3 "$(dirname "$0")/recipes.py" whole-manifests > /dev/null; then
+    echo "check-recipes: a gate-* recipe reads a package manifest whole: run \`python3 tools/recipes.py whole-manifests\` for the recipe, the manifest and the why" >&2
+    return 1
+  fi
+  echo "whole-manifests: no gate-* recipe reads a package manifest whole"
+}
 # narrow-scan.sh is `just narrow`'s box orchestration: the runner it ships to each side (one build per feature list, the
 # scanner embedded verbatim), the cut of the box's output into per-bin scan logs, the one-run-at-a-time lock on the
 # persistent remote dirs, its usage refusals, and the drift check against the ptx-scan recipe's build lines. No box.
@@ -1236,7 +1245,7 @@ proc_leg_gpu() {
 }
 
 BLOCKS=(prelude recipescheck gateclass selftest smoke cardorder cardtests lease boxtracks unsafecount archscan loadscan commentscan leverscan loadgroups lcppfit coldblocks leverarms slotsarm binlabel lcppwarm q38srv
-  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macsetup roundcheck macremote boxsh oxidehost oxidebackend seedtarget carry releasebuild releaseinstall releasepublish releasesitting releasepick releasebuildmac pytools boxqcodes fixturevariants fixturedirs dsparkread
+  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs wholemanifests narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macsetup roundcheck macremote boxsh oxidehost oxidebackend seedtarget carry releasebuild releaseinstall releasepublish releasesitting releasepick releasebuildmac pytools boxqcodes fixturevariants fixturedirs dsparkread
   refsetpublish orphan archowner treecommit archivepipe fnowner wt macgate boundedscan gatebound dumpdequant tokoracle ikpintree qdotrefargs quantmeasure)
 # blk_keyspec NAME: what a block's input key reads (tools/recipes.py static-key). Every block's is the whole tree: a
 # narrower key needs proof that the block reads nothing outside it, and a green run on a copy whose other files are

@@ -3,7 +3,7 @@
 # the box is reached only through the recipes (tools/box.sh) and each item keeps the bound and the
 # exit code its recipe's runner owns (tools/gate.sh, tools/gpu-gate.sh, 900 s). This script adds no
 # second bound.
-#   tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--tier real|fixture] [--ledger [--trust-rounds] [--no-gpu-hold] [--yield] | --round-ledger] [--rerun] [--no-canary] [--red-main-check] [--wait-hold [SECONDS]]
+#   tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--tier real|fixture] [--ledger [--trust-rounds] [--trust-fast] [--no-gpu-hold] [--yield] | --fast-ledger [--trust-rounds] [--no-gpu-hold] [--yield] | --round-ledger] [--rerun] [--no-canary] [--red-main-check] [--wait-hold [SECONDS]]
 #   tools/gate-batch.sh --classes     every recipe's class, the classifier below, and nothing else
 #   tools/gate-batch.sh --self-test [--part K|all]   the placement rules on a fixture justfile and the disk floor
 #                                      against a fake df (check-recipes runs it: every part at once, see self_test)
@@ -379,7 +379,15 @@
 #                             key is not re-run at landing; an agent saying "green" is not a record).
 #                             The tool cannot tell a move from a change, so the flag is that judgment.
 #   --round-ledger            the lead's, then the rounds'; writes the rounds'.
-# A skip names its source, `src=lead` or `src=round`, in run.log and the dry run. A rebase moves the
+#   --fast-ledger             the landing batch of a `just affected --fast` list (its first line says `affected (fast)`): the lead's, then
+#                             the rounds' with --trust-rounds, then its own file; writes the fast file, ${BLOOMERY_GATE_FAST_LEDGER:-~/.cache/
+#                             bloomery/gate-ledger-fast.tsv}. It is the lead's batch (it takes the GPU hold) and takes only such a list: --smoke,
+#                             --weekly, items and any other list are refused (64).
+#   --ledger --trust-fast     the lead's, then the fast file: only with this flag does a release-grade batch read a fast landing's greens. The
+#                             release batch (tools/release/publish.sh, tools/release/sitting.sh) never passes it, so a release re-runs what a fast
+#                             landing trusted. A list whose first line says `affected (fast)` is refused (64) under --ledger and --round-ledger.
+# A skip names its source, `src=lead`, `src=round` or `src=fast`, in run.log and the dry run; a fast batch's DONE line carries `ledger=fast`.
+# A rebase moves the
 # key of every item whose closure the landed commits touched, so a landing still reruns those; the
 # saving is in the items the rebase left alone.
 # Each item's input key is `tools/recipes.py key` (its section header lists the parts): its own target
@@ -548,7 +556,7 @@ CHAIN_SOLO_REAL='gate-gpu-ds41-residency-a gate-gpu-glm5next-e2e gate-gpu-glm5ne
 # self-test's numbers).
 PACK_BUDGET=262185889800
 
-USAGE="usage: tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--tier real|fixture] [--ledger [--trust-rounds] [--no-gpu-hold] [--yield] | --round-ledger] [--rerun] [--over-budget-ok] [--no-canary] [--red-main-check] [--wait-hold [SECONDS]] | --classes | --self-test [--part K|all]"
+USAGE="usage: tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--tier real|fixture] [--ledger [--trust-rounds] [--trust-fast] [--no-gpu-hold] [--yield] | --fast-ledger [--trust-rounds] [--no-gpu-hold] [--yield] | --round-ledger] [--rerun] [--over-budget-ok] [--no-canary] [--red-main-check] [--wait-hold [SECONDS]] | --classes | --self-test [--part K|all]"
 die() { echo "gate-batch: $*" >&2; exit "${RC:-64}"; }
 
 # The append, for the ledger and the times file: a ledger record's parts file first (its parts exist
@@ -1442,9 +1450,11 @@ if a[:2] == ["key", "--files"]:
         if f:
             print(f.replace("~", "\t"))
     sys.exit(0)
-items, i, pd = [], 1, None
+items, i, pd, led_files = [], 1, None, []
 while i < len(a):
     if a[i].startswith("--"):
+        if a[i] in ("--ledger", "--round-ledger", "--fast-ledger"):
+            led_files.append(a[i + 1])
         if a[i] == "--box-env":
             import os
             d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "fake-state")
@@ -1462,6 +1472,12 @@ green = set()
 if os.environ.get("FAKE_GREEN_FILE"):
     with open(os.environ["FAKE_GREEN_FILE"]) as fh:
         green = {ln.strip() for ln in fh if ln.strip()}
+# FAKE_LEDGER_READ=1: the ledger files the call names are read, a key in the first column of any is a skip (the real reader's rule, minus the hash shape)
+if os.environ.get("FAKE_LEDGER_READ") == "1":
+    for lf in led_files:
+        if os.path.exists(lf):
+            with open(lf) as fh:
+                green |= {ln.split("\t")[0] for ln in fh if ln.strip()}
 # FAKE_KEY_SALT: another key for the same item (another model file, say); FAKE_KEY_ERROR=1: the item is unkeyed.
 # A recheck is a key call without --ledger. FAKE_MOVE_ITEM: that item's recheck key differs from its plan key.
 # FAKE_RECHECK_ERROR_ITEM: that item's recheck line is an error. FAKE_RECHECK_RC: the recheck process fails.
@@ -1636,7 +1652,7 @@ FP
     # AWAIT: the fake's FAKE_AWAIT_MAP, DELAY: its FAKE_START_DELAY (the header above the fake)
     # The box queue's daemon is the twin cases' fake (fake-ssh, twinq/): no case reaches a real box.
     FAKE_AWAIT_MAP=${AWAIT:-} FAKE_START_DELAY=${DELAY:-} BOXQ_SSH="$t/tools/fake-ssh" BOXQ_POLL_S=0.2 \
-      BLOOMERY_GATE_TIMES=$times BLOOMERY_GATE_LEDGER=$t/lead-$tag.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-$tag.tsv \
+      BLOOMERY_GATE_TIMES=$times BLOOMERY_GATE_LEDGER=$t/lead-$tag.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-$tag.tsv BLOOMERY_GATE_FAST_LEDGER=${FASTF:-$t/fast-$tag.tsv} \
       "${runner[@]}" --out "$t/target/c-$tag" "${LFLAG:---round-ledger}" "$@" > "$t/out-$tag.log" 2>&1 || rc=$?
     printf '%s' "$rc"
   }
@@ -3813,6 +3829,29 @@ EOS
   printf '%s' "$rc" > "$t/rc-lbl-clean"
   rc_ok 'label: a clean work tree runs the batch' lbl-clean 1
   want 'label: … and the ledger row names the bare commit' "$t/rounds-lbl-clean.tsv" "$(printf '\t%s\t' "$(git -C "$t/lbl-clean" rev-parse --short=12 HEAD)")"
+  # The fast ledger, recorded then skipped (the header's «Ledgers»): a --fast-ledger batch of a fast list writes the fast file and no other,
+  # and its DONE line says ledger=fast; the same list again skips on it; a --ledger batch of the full list does not read the fast file (the
+  # release's rule) and runs, and with --trust-fast it skips. The fake key reads the ledger files named on its call (FAKE_LEDGER_READ=1).
+  printf '%s\n' 'affected (fast): a..b — 1 changed files, 1 of 2 gate-recipes selected (class-staged (fast): 1 kept, 0 left out)' '  gate-x  f [why]' > "$t/fast16.list"
+  printf '%s\n' 'affected: a..b — 1 changed files, 1 of 2 gate-recipes selected (class-staged: 1 kept, 0 left out)' '  gate-x  f [why]' > "$t/full16.list"
+  rc=$(LFLAG=--fast-ledger FAKE_LEDGER_READ=1 FASTF=$t/fast-rt.tsv steal_case ft-1 "gate-x	A	none	2	$d" -- --list "$t/fast16.list")
+  printf '%s' "$rc" > "$t/rc-ft-1"
+  rc_ok 'fast: a --fast-ledger batch of a fast list ends green' ft-1 1
+  want 'fast: … its DONE line says ledger=fast' "$t/target/c-ft-1/run.log" '^DONE total=1 red=0 tier=real skipped=0 ledger=fast wall='
+  want 'fast: … the fast file holds its green' "$t/fast-rt.tsv" "$(printf '^stub-gate-x\tgate-x\t')"
+  want_not 'fast: … the lead'"'"'s file holds none' "$t/lead-ft-1.tsv" 'gate-x'
+  rc=$(LFLAG=--fast-ledger FAKE_LEDGER_READ=1 FASTF=$t/fast-rt.tsv steal_case ft-2 "gate-x	A	none	2	$d" -- --list "$t/fast16.list")
+  printf '%s' "$rc" > "$t/rc-ft-2"
+  rc_ok 'fast: the same fast list again ends green' ft-2 1
+  want 'fast: … and the fast file skips it' "$t/target/c-ft-2/run.log" '^gate-x rc=skip '
+  rc=$(LFLAG=--ledger FAKE_LEDGER_READ=1 FASTF=$t/fast-rt.tsv steal_case ft-3 "gate-x	A	none	2	$d" -- --list "$t/full16.list")
+  printf '%s' "$rc" > "$t/rc-ft-3"
+  rc_ok 'fast: a --ledger batch of the full list ends green' ft-3 1
+  want 'fast: … and runs it: it does not read the fast file' "$t/target/c-ft-3/run.log" '^gate-x rc=0 '
+  rc=$(LFLAG=--ledger FAKE_LEDGER_READ=1 FASTF=$t/fast-rt.tsv steal_case ft-4 "gate-x	A	none	2	$d" -- --trust-fast --list "$t/full16.list")
+  printf '%s' "$rc" > "$t/rc-ft-4"
+  rc_ok 'fast: a --ledger --trust-fast batch ends green' ft-4 1
+  want 'fast: … and the fast file skips the item' "$t/target/c-ft-4/run.log" '^gate-x rc=skip '
   fi
   if gb_part 15; then
   # The dry run names the hold it would take and touches nothing; the options' refusals.
@@ -3827,6 +3866,17 @@ EOS
   grep -q '^gate-batch: gpu hold: none (only a --ledger batch takes it)$' <<< "$out" && pass '  … a --round-ledger batch says none' || fail '  … a --round-ledger batch says none' "$out"
   check 'hold: --no-gpu-hold without --ledger: 64, named' 64 "^gate-batch: --no-gpu-hold is the lead's: only a --ledger batch takes the GPU hold" "${gb[@]}" --dry-run --no-gpu-hold host
   check 'hold: --no-gpu-hold with --round-ledger: 64, named' 64 "^gate-batch: --no-gpu-hold is the lead's" "${gb[@]}" --dry-run --round-ledger --no-gpu-hold host
+  # The fast ledger (the header's «Ledgers»): a list whose first line says `affected (fast)` and the fast ledger belong together.
+  printf '%s\n' 'affected (fast): a..b — 1 changed files, 1 of 2 gate-recipes selected (class-staged (fast): 1 kept, 0 left out)' '  host  f [why]' > "$t/fast15.list"
+  printf '%s\n' 'affected: a..b — 1 changed files, 1 of 2 gate-recipes selected (class-staged: 1 kept, 0 left out)' '  host  f [why]' > "$t/full15.list"
+  check 'fast: --ledger refuses a fast list: 64, named' 64 'is a fast list .*only --fast-ledger takes it, never --ledger or --round-ledger' "${gb[@]}" --dry-run --ledger --list "$t/fast15.list"
+  check 'fast: --round-ledger refuses a fast list: 64, named' 64 'is a fast list .*only --fast-ledger takes it' "${gb[@]}" --dry-run --round-ledger --list "$t/fast15.list"
+  check 'fast: --fast-ledger refuses a list that is not fast: 64, named' 64 'does not say affected \(fast\)' "${gb[@]}" --dry-run --fast-ledger --list "$t/full15.list"
+  check 'fast: --fast-ledger refuses --smoke: 64, named' 64 '^gate-batch: --fast-ledger takes a --list FILE' "${gb[@]}" --dry-run --fast-ledger --smoke
+  check 'fast: --fast-ledger refuses items: 64, named' 64 '^gate-batch: --fast-ledger takes a --list FILE' "${gb[@]}" --dry-run --fast-ledger host
+  check 'fast: --fast-ledger refuses --weekly: 64, named' 64 '^gate-batch: --fast-ledger takes a --list FILE' "${gb[@]}" --dry-run --fast-ledger --weekly
+  check 'fast: --trust-fast without --ledger: 64, named' 64 '^gate-batch: --trust-fast goes with --ledger' "${gb[@]}" --dry-run --fast-ledger --trust-fast --list "$t/fast15.list"
+  check 'fast: --ledger and --fast-ledger are exclusive: 64, named' 64 'are exclusive' "${gb[@]}" --dry-run --ledger --fast-ledger --list "$t/fast15.list"
   check 'hold: a heartbeat period that is not whole seconds: 64, named' 64 "^gate-batch: BLOOMERY_GPU_HOLD_BEAT is whole seconds from 1 .*got 'abc'" \
     env BLOOMERY_GPU_HOLD_BEAT=abc "${gb[@]}" --dry-run host
   fi
@@ -4576,7 +4626,7 @@ if [ "${1:-}" = --self-test ]; then
     *) die "--self-test takes nothing else, or --part K|all; $USAGE" ;;
   esac
 fi
-OUT='' OUT_AUTO=0 SRC='' LIST='' DRY=0 LANES='' LEDGER=0 RERUN=0 LMODE='' TRUST=0 TIER_FLAG='' NOHOLD=0 BUDGET_OK=0 WAIT_HOLD='' YIELD=0
+OUT='' OUT_AUTO=0 SRC='' LIST='' DRY=0 LANES='' LEDGER=0 RERUN=0 LMODE='' TRUST=0 LFAST=0 TRUSTF=0 TIER_FLAG='' NOHOLD=0 BUDGET_OK=0 WAIT_HOLD='' YIELD=0
 CANARY=1 RED_MAIN=0
 ITEMS=()
 while [ $# -gt 0 ]; do
@@ -4588,11 +4638,14 @@ while [ $# -gt 0 ]; do
     --list) [ $# -ge 2 ] || die "--list needs a file; $USAGE"
       [ -z "$SRC" ] || die "--smoke, --weekly, --list and items are exclusive; $USAGE"; SRC=list; LIST=$2; shift 2 ;;
     --dry-run) DRY=1; shift ;;
-    --ledger) [ "$LMODE" != round ] || die "--ledger and --round-ledger are exclusive; $USAGE"
+    --ledger) [ "$LMODE" != round ] && [ "$LFAST" = 0 ] || die "--ledger, --fast-ledger and --round-ledger are exclusive; $USAGE"
       LEDGER=1 LMODE=lead; shift ;;
-    --round-ledger) [ "$LMODE" != lead ] || die "--ledger and --round-ledger are exclusive; $USAGE"
+    --round-ledger) [ "$LMODE" != lead ] || die "--ledger, --fast-ledger and --round-ledger are exclusive; $USAGE"
       LEDGER=1 LMODE=round; shift ;;
+    --fast-ledger) [ -z "$LMODE" ] || [ "$LFAST" = 1 ] || die "--ledger, --fast-ledger and --round-ledger are exclusive; $USAGE"
+      LEDGER=1 LMODE=lead LFAST=1; shift ;;
     --trust-rounds) TRUST=1; shift ;;
+    --trust-fast) TRUSTF=1; shift ;;
     --no-gpu-hold) NOHOLD=1; shift ;;
     --yield) YIELD=1; shift ;;
     --rerun) RERUN=1; shift ;;
@@ -4620,7 +4673,20 @@ if [ "$SRC" = list ]; then
 fi
 [ "$SRC" = smoke ] && ITEMS=("${SMOKE[@]}")
 [ "$RERUN" = 0 ] || [ "$LEDGER" = 1 ] || die "--rerun needs --ledger or --round-ledger; $USAGE"
-[ "$TRUST" = 0 ] || [ "$LMODE" = lead ] || die "--trust-rounds is the lead's: it goes with --ledger (a round's --round-ledger reads the rounds' file already); $USAGE"
+[ "$TRUST" = 0 ] || [ "$LMODE" = lead ] || die "--trust-rounds is the lead's: it goes with --ledger or --fast-ledger (a round's --round-ledger reads the rounds' file already); $USAGE"
+[ "$TRUSTF" = 0 ] || { [ "$LMODE" = lead ] && [ "$LFAST" = 0 ]; } || die "--trust-fast goes with --ledger (a --fast-ledger batch reads the fast file already); $USAGE"
+# A fast list and the fast ledger belong together: a release-grade batch never takes a list that left gates out by ownership, and a fast
+# batch takes no other list (the header's «Ledgers»). The list's first line is the one the plan reads (just's echo of the recipe line aside).
+if [ "$LFAST" = 1 ] && [ "$SRC" != list ]; then
+  die "--fast-ledger takes a --list FILE of \`just affected BASE --fast\` output, not --smoke, --weekly, --classes or items; $USAGE"
+fi
+if [ "$SRC" = list ] && [ "$LEDGER" = 1 ]; then
+  list_head=$(awk 'NF && !/^\.\/tools\/affected-gates\.sh / { print; exit }' "$LIST")
+  case $list_head in
+    "affected (fast):"*) [ "$LFAST" = 1 ] || die "$LIST is a fast list (its first line says affected (fast)): only --fast-ledger takes it, never --ledger or --round-ledger; $USAGE" ;;
+    *) [ "$LFAST" = 0 ] || die "--fast-ledger takes a fast list: the first line of $LIST does not say affected (fast); $USAGE" ;;
+  esac
+fi
 [ "$NOHOLD" = 0 ] || [ "$LMODE" = lead ] || die "--no-gpu-hold is the lead's: only a --ledger batch takes the GPU hold, so it goes with --ledger; $USAGE"
 [ "$YIELD" = 0 ] || [ "$LMODE" = lead ] || die "--yield is the follower's: it goes with --ledger (a --round-ledger batch already yields to the GPU hold); $USAGE"
 if [ "$YIELD" = 1 ]; then
@@ -4717,7 +4783,7 @@ if src == "list":
     # `just affected … 2>&1` puts just's echo of the recipe line above the output's `affected:` line.
     if head and head[0].startswith("./tools/affected-gates.sh ") and len(head) > 1:
         head = head[1:]
-    if head and head[0].startswith("affected:"):
+    if head and head[0].startswith(("affected:", "affected (fast):")):
         raw_items = [ln.split()[0] for ln in lines if ln.startswith(("  gate-", "  weekly-"))]
         where = [f"{listfile} (just affected output)"] * len(raw_items)
     else:
@@ -6418,11 +6484,14 @@ def_cmd_of() { # a deferred item's command as it would have run (the dry run nam
 
 LEAD_LEDGER=${BLOOMERY_GATE_LEDGER:-$HOME/.cache/bloomery/gate-ledger.tsv}
 ROUND_LEDGER=${BLOOMERY_GATE_ROUND_LEDGER:-$HOME/.cache/bloomery/gate-ledger-rounds.tsv}
+FAST_LEDGER=${BLOOMERY_GATE_FAST_LEDGER:-$HOME/.cache/bloomery/gate-ledger-fast.tsv}
 [ "$LEAD_LEDGER" != "$ROUND_LEDGER" ] || die "BLOOMERY_GATE_LEDGER and BLOOMERY_GATE_ROUND_LEDGER name one file ($LEAD_LEDGER): a round's green would land in the lead's ledger"
-# The file this batch writes, and the second file it reads (empty: none).
-if [ "$LMODE" = round ]; then LEDGER_FILE=$ROUND_LEDGER; else LEDGER_FILE=$LEAD_LEDGER; fi
-ALSO_READ=''
+[ "$FAST_LEDGER" != "$LEAD_LEDGER" ] && [ "$FAST_LEDGER" != "$ROUND_LEDGER" ] || die "BLOOMERY_GATE_FAST_LEDGER names the lead's or the rounds' file ($FAST_LEDGER): a fast green would land where a release reads it"
+# The file this batch writes, and the other files it reads (empty: none).
+if [ "$LMODE" = round ]; then LEDGER_FILE=$ROUND_LEDGER; elif [ "$LFAST" = 1 ]; then LEDGER_FILE=$FAST_LEDGER; else LEDGER_FILE=$LEAD_LEDGER; fi
+ALSO_READ='' ALSO_FAST=''
 if [ "$LMODE" = round ] || [ "$TRUST" = 1 ]; then ALSO_READ=$ROUND_LEDGER; fi
+if [ "$LFAST" = 1 ] || [ "$TRUSTF" = 1 ]; then ALSO_FAST=$FAST_LEDGER; fi
 LEDGER_PARTS=$LEDGER_FILE.parts
 
 # --wait-hold's wait (the header). A poll is box.sh's guard with no wait of its own — lease_guard 0, tools/ref/lease-probe.sh's one
@@ -6496,6 +6565,7 @@ ledger_plan() { # the box manifest, then every candidate's key and status (C_*),
   fi
   kargs=(key --manifest "$m" --box-env "${BLOOMERY_BOX_ENV:-}" --ledger "$LEAD_LEDGER" --parts-dir "$1/parts")
   [ -z "$ALSO_READ" ] || kargs+=(--round-ledger "$ALSO_READ")
+  [ -z "$ALSO_FAST" ] || kargs+=(--fast-ledger "$ALSO_FAST")
   [ -z "$merr" ] || kargs+=(--manifest-error "$merr")
   [ "$RERUN" = 0 ] || kargs+=(--rerun)
   rc=0
@@ -6722,7 +6792,7 @@ canary_say() { # the stage's one line: the dry run's first and the run's second
   else echo "gate-batch: canary stage: $CANARY_RUN run first in their lanes; the first one that ends red stops the batch (DONE canary=red); --no-canary runs without the stage"; fi
 }
 if [ "$LEDGER" = 1 ]; then
-  echo "gate-batch: ledger: reads $LEAD_LEDGER${ALSO_READ:+ and $ALSO_READ}, writes $LEDGER_FILE: $SKIP_N of $N items skip"
+  echo "gate-batch: ledger: reads $LEAD_LEDGER${ALSO_READ:+ and $ALSO_READ}${ALSO_FAST:+ and $ALSO_FAST}, writes $LEDGER_FILE: $SKIP_N of $N items skip"
 fi
 # The plan's lane-gap term (the header's «Plan alarm»): what a lane spends between its items, an item, as the last batches' own clocks
 # measured it (gap_prior), over the items a lane runs. The wall of the plan carries it; with no batch recorded it is 0.
@@ -7173,7 +7243,7 @@ red_attrib() {
   local -a nb=() bl=()
   [ "$LEDGER" = 1 ] || return 0
   item=$(item_of "$i")
-  row=$(last_green_row "$item" "$LEDGER_FILE" ${ALSO_READ:+"$ALSO_READ"})
+  row=$(last_green_row "$item" "$LEDGER_FILE" ${ALSO_READ:+"$ALSO_READ"} ${ALSO_FAST:+"$ALSO_FAST"})
   if [ -z "$row" ]; then
     printf ' last_green=none range=none'
     return 0
@@ -7941,6 +8011,7 @@ red=$((NT - green - skipped - yielded - ND))
 lane_s() { if [ -f "$OUT/lane-$1.s" ]; then cat "$OUT/lane-$1.s"; else echo 0; fi; }
 done_line="DONE total=$NT red=$red tier=$TIER"
 [ "$LEDGER" = 0 ] || done_line="$done_line skipped=$skipped"
+[ "$LFAST" = 0 ] || done_line="$done_line ledger=fast"
 [ "$yielded" = 0 ] || done_line="$done_line yielded=$yielded"
 # The plan alarm (the header): a wall past 1.5 × the plan is `slow=<ratio>` on the line and one stderr line naming the largest lane gap.
 wall_s=$(($(date +%s) - T0))

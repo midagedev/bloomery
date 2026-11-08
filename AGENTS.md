@@ -48,7 +48,9 @@ reference; what follows is the contract.
                               # a recipe names, the cargo globals, each manifest by table and each lever-registry row
                               # by the files that name it; builds nothing. A gate
                               # of an F family (tools/families.tsv) stays only when its family's files, its recipe or
-                              # its own targets changed, each left out one named with its reason; --no-class keeps all
+                              # its own targets changed, each left out one named with its reason; --no-class keeps all;
+                              # --fast keeps only the gates a change can have moved by ownership (families.tsv, owners.tsv,
+                              # the lib gate of a touched crate); its greens go to the fast ledger and a release does not read them
     just gate / smoke         # static checks, lint, fast library gates / the round loop's subset
     just gate-<name>          # one subsystem's tests, bounded, real exit code
     just gate-ptx-spill       # every PTX entry's spill/jit_local bytes against tools/ref/ptx-shapes.tsv

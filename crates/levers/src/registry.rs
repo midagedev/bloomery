@@ -1894,6 +1894,13 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          batch reads it, the lead's only under `--trust-rounds`.",
     ),
     path(
+        "BLOOMERY_GATE_FAST_LEDGER",
+        Some("gate-batch.sh"),
+        "Mac side: the fast ledger `tools/gate-batch.sh --fast-ledger` writes (the greens of a \
+         `just affected --fast` landing); the lead's `--ledger` reads it only under `--trust-fast`, so a \
+         release re-runs what a fast landing trusted.",
+    ),
+    path(
         "BLOOMERY_GATE_TIMES",
         Some("gate-batch.sh"),
         "Mac side: the gate wall-time file `tools/gate-batch.sh` balances its lanes by.",

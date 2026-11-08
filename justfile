@@ -253,6 +253,8 @@ check-recipes:
 # The gate-* recipes that read a file changed since the merge-base with BASE (default main), or in A..B (from merge-base(A, B) to B, as `git diff A...B`) — on the Mac, no build, runs nothing (tools/affected-gates.sh).
 # The class stage is on: a gate of an F family (tools/families.tsv) stays only when its family's files, its recipe or its own targets changed,
 # and each one left out is printed with its reason; `--no-class` keeps every gate the graph reaches.
+# `--fast`: the landing's list: a gate stays only when a change can have moved it by ownership (tools/families.tsv, tools/owners.tsv, the lib gate
+# of a touched crate); its greens go to `gate-batch.sh --fast-ledger`, which a release does not read.
 # `--narrow --scan BASE_LOG NEW_LOG …` (ptx-scan logs of the base and the change): the gates that run the changed host path.
 affected BASE='main' *ARGS:
     ./tools/affected-gates.sh {{BASE}} {{ARGS}}
