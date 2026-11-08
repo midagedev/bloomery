@@ -1010,14 +1010,23 @@ class ReachFactsStore(unittest.TestCase):
         def damage():
             for p, data in pristine.items():
                 p.write_bytes(data)
+            # The victims are picked by what the store would mask, not by the key order (the key holds
+            # sys.version, so the order differs between Pythons): an equal payload stored twice is one
+            # parse, so every twin of the tampered entry is tampered too (a pristine twin loaded first
+            # would serve its value), and the foreign entry's donor carries other facts than its own.
+            digest = lambda data: json.loads(data.partition(b"\n")[0])["digest"]
             tamper = next(p for p, data in pristine.items() if b'"println"' in data)
-            others = [p for p in pristine if p != tamper]
-            tampered = pristine[tamper].replace(b'"println"', b'"printlm"', 1)  # still valid JSON of the schema
-            tamper.write_bytes(tampered)
+            twins = [p for p, data in pristine.items() if digest(data) == digest(pristine[tamper])]
+            others = [p for p in pristine if p not in twins]
+            for p in twins:
+                p.write_bytes(pristine[p].replace(b'"println"', b'"printlm"', 1))  # still valid JSON of the schema
             truncated, foreign = others[0], others[1]
             truncated.write_bytes(pristine[truncated][:12])
-            foreign.write_bytes(pristine[others[2]])
-            return {tamper: "payload digest mismatch", truncated: "", foreign: "another entry's key"}
+            donor = next(p for p in others[2:] if digest(pristine[p]) != digest(pristine[foreign]))
+            foreign.write_bytes(pristine[donor])
+            named = {p: "payload digest mismatch" for p in twins}
+            named.update({truncated: "", foreign: "another entry's key"})
+            return named
 
         # FAIL-first: without the key and payload check the tampered entry is served, and the driver notices
         damage()
@@ -1026,7 +1035,7 @@ class ReachFactsStore(unittest.TestCase):
         self.assertIn("a damaged entry was served", done.stderr)
         named = damage()
         done = self.drive(ws, DAMAGE_DRIVER, ws.root, "real")
-        self.assertEqual(self.stats(done)["corrupt"], 3, done.stderr)
+        self.assertEqual(self.stats(done)["corrupt"], len(named), done.stderr)
         for path, why in named.items():
             self.assertRegex(done.stderr, rf"reach cache: {re.escape(str(path))}: .*{re.escape(why)}.*; recomputed")
         repaired = self.stats(self.drive(ws, DAMAGE_DRIVER, ws.root, "real"))
