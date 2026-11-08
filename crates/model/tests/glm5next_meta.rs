@@ -19,8 +19,7 @@ use gguf::Split;
 
 /// The file: unsloth's `UD-Q4_K_XL`, the quant whose routed stacks fit the
 /// host tier. Its first shard holds the header and no tensor.
-const GLM: &str =
-    "/data/moved/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf";
+const GLM: &str = "/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf";
 
 // PIN(2026-09-27): the file's description as `arch::glm5next::spec` reads it, line by line (the key
 // values checked against the header dump and ik's glm5next loader, src/llama-hparams.cpp).

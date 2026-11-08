@@ -726,7 +726,7 @@ def check_row(row, hub, scratch, picked=None):
 BOX_FILES = {
     "ds41": (("/models/DeepSeek-V4.1-Flash-1017-Q3_K_M/DeepSeek-V4.1-Flash-1017-Q3_K_M-00001-of-00010.gguf",
               "tools/ref/models/deepseek41.sh"),),
-    "glm": (("/data/moved/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf",
+    "glm": (("/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf",
              "tools/ref/models/glm5next.sh"),),
     "qwen38": (("/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
                 "tools/ref/models/qwen4exp.sh"),),
@@ -747,7 +747,7 @@ IK_TREE = "/home/" + "user/ik-idxkey"
 # text, and the key is a BOX_FILES path of `seat`, so a cited path that moved is a refusal.
 BoxException = collections.namedtuple("BoxException", "seat name box_size live_size reason expiry then cites")
 BOX_EXCEPTIONS = {
-    "/data/moved/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf": BoxException(
+    "/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf": BoxException(
         seat="glm", name="the GLM shard 1 exception", box_size=9429859, live_size=9429984,
         reason="ik, the GLM oracle, cannot open glm5-next (its llama-arch.cpp names glm5next) and the GLM reference sets "
                "are bound to this shard's path; the glm5-next file is staged at /models/GLM-5.3-Flash-UD-Q4_K_XL-glm5dash/",
@@ -2633,7 +2633,7 @@ def box_checks(check, raises):
                   "| `decide` | y | `bloomery-serve --hf bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M` |\n")
         box = {}
         for name, b in glm_files.items():
-            box[f"/data/moved/models/GLM-5.3-Flash-UD-Q4_K_XL/{name.rsplit('/', 1)[-1]}"] = (len(b), hashlib.sha256(b).hexdigest())
+            box[f"/models/GLM-5.3-Flash-UD-Q4_K_XL/{name.rsplit('/', 1)[-1]}"] = (len(b), hashlib.sha256(b).hexdigest())
         for root in ("/data/moved/models", "/root/models"):
             b = clef_file["Cloudflare_clef-flash-Q5_K_M.gguf"]
             box[f"{root}/clef-flash/Cloudflare_clef-flash-Q5_K_M.gguf"] = (len(b), hashlib.sha256(b).hexdigest())
@@ -2686,7 +2686,7 @@ def box_checks(check, raises):
         check("a box that equals the hub is green: every file ok by its marker", rc == 0 and "hf-arch-box files=8 ok=8 fail=0 unhashed=0" in text
               and "hf-arch rows=2 ok=2 red=0" in text and text.count("digest=marker verdict=ok") == 8, text)
         short = dict(box)
-        k = "/data/moved/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf"
+        k = "/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf"
         short[k] = (short[k][0] - 125, short[k][1])
         gone = "/root/models/clef-flash/Cloudflare_clef-flash-Q5_K_M.gguf"
         del short[gone]
@@ -2699,7 +2699,7 @@ def box_checks(check, raises):
         rc, text = run_live(nomark, runner=runner_of(nomark, hashed={}))
         check("a box with no digest is unhashed, and the run prints the hash command and its estimate", rc == 0
               and "digest=unhashed verdict=unhashed" in text and "hf-arch-box unhashed: 8 files" in text
-              and "box-facts --hash /data/moved/models/GLM-5.3-Flash-UD-Q4_K_XL/" in text and "wall ~" in text, text)
+              and "box-facts --hash /models/GLM-5.3-Flash-UD-Q4_K_XL/" in text and "wall ~" in text, text)
         asked = []
         hashes = {p: v[1] for p, v in box.items()}
         rc, text = run_live(box, runner=runner_of(box, hashed=hashes, asked=asked), box_hash=True)
@@ -2710,7 +2710,7 @@ def box_checks(check, raises):
         check("the digests a hash run read are in the cache the next run uses", rc == 0 and text.count(
             "digest=cache verdict=ok") == 8 and "unhashed:" not in text, text)
         stale = dict(hashes)
-        stale["/data/moved/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00002-of-00006.gguf"] = "f" * 64
+        stale["/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00002-of-00006.gguf"] = "f" * 64
         rc, text = run_live(box, cache="stale.tsv", runner=runner_of(box, hashed=stale), box_hash=True)
         check("a digest that differs after a hash run is a red row naming both", rc == 1 and "verdict=FAIL: digest box=" + "f" * 64 in text, text)
 

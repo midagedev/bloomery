@@ -237,7 +237,7 @@ profile() {
       ;;
     glm5next)
       tree_tokref
-      SHARD=/data/moved/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf
+      SHARD=/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf
       SET=ref-tokenizer-glm5next
       ;;
     qwen38)
