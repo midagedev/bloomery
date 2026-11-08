@@ -76,7 +76,10 @@
 #   --indexer FILE     the indexer tensors' GGUF (prepare's `--only` output)    [K3Q_INDEXER]
 #   --dsa-config FILE  the K3.1 config.json (text_config.dsa_config) -> the --kv keys of the splice     [K3Q_DSA_CONFIG]
 #   --arch NAME        the final architecture word (default kimi-k31)           [K3Q_ARCH]
-#   --out-base DIR     where the sets go (default /models)                      [K3Q_OUT_BASE]
+#   --out-base DIR     where the sets go; no default: the machine's env names it         [K3Q_OUT_BASE]
+#   K3Q_PREP_BASE      where prepare's K3-shaped source lands; no default. An intermediate the sets are cut from, never
+#                      served or gated, so it belongs on a drive the gates and the server do not read. The tree holds no
+#                      model path: both come from the machine's environment, and a step that needs one unset ends 64 by name.
 #   --force            remove the step's outputs and done marker by name, and run it again
 #   --dry-run          print every command with its card, bound and the derived wall; take no lease, write nothing, read headers only
 #   --detach           start the runner under setsid and return: pid, log and rc file are under $K3Q_WORK (poll `kill -0 <pid>`)
@@ -151,7 +154,7 @@ shift
 DRY=0 SMOKE=0 DETACH=0 FORCE=0 PRED=0 USE_LEASE=0 IMATRIX_GPU=${K3Q_IMATRIX_GPU:-0} SEQS=${K3Q_SEQS:-1} GPUQ=${K3Q_GPU_QUANT:-0} GPU_SET=${K3Q_GPU_SET:-} QUANTIZER=${K3Q_QUANTIZER:-}
 MAP=${K3Q_MAP:-tight} REPO=midagedev/Kimi-K3.1-Pro-GGUF HF=${K3Q_HF_FOLDER:-/data/models/Kimi-K3.1-Pro} LICENSE_F='' SRC_REV='' PREPARE_BIN='' FOLLOW='' SHARD_GIB='' MAX_TRUNK=''
 TYPE=IQ1_S CTX='' CHUNKS='' IN=${K3Q_IN:-} CORPUS=${K3Q_CORPUS:-} SPECIAL=${K3Q_CORPUS_SPECIAL:-0} INDEXER=${K3Q_INDEXER:-} DSA=${K3Q_DSA_CONFIG:-}
-ARCH=${K3Q_ARCH:-kimi-k31} THREADS=${K3Q_THREADS:-} REF='' OUT_BASE=${K3Q_OUT_BASE:-/models} BUMP_GU='' BUMP_DN='' BUMP_SET=0
+ARCH=${K3Q_ARCH:-kimi-k31} THREADS=${K3Q_THREADS:-} REF='' OUT_BASE=${K3Q_OUT_BASE:-} PREP_BASE=${K3Q_PREP_BASE:-} BUMP_GU='' BUMP_DN='' BUMP_SET=0
 while [ $# -gt 0 ]; do
   case $1 in
     --dry-run) DRY=1 ;;
@@ -249,6 +252,7 @@ IMAT=$TREE/build/bin/llama-imatrix
 TOKENIZE=$TREE/build/bin/llama-tokenize
 GSPLIT=$TREE/build/bin/llama-gguf-split
 [ "$SMOKE" = 1 ] && OUT_BASE=$WORK/out
+[ -n "$OUT_BASE" ] || die "K3Q_OUT_BASE (or --out-base) is unset: the tree holds no model path; the machine's env names where the sets go" 64
 [ -n "$REF" ] || REF=$ROOT/crates/model/tests/kimi_k3_tensors.tsv
 # Checked here, not in bound_of: a die inside $(...) ends only the substitution's subshell, and the step would start with no bound.
 case ${K3Q_BOUND_S-x} in x) ;; '' | *[!0-9]* | 0) die "K3Q_BOUND_S wants whole seconds above 0, got '${K3Q_BOUND_S}'" ;; esac
@@ -1193,7 +1197,8 @@ do_upload() {
 do_prepare() {
   CARD=none
   local bin=${PREPARE_BIN:-$ROOT/target/release/prepare} out_a out_b usage f bound marker key a_first i_first extra=() t0
-  out_a=$OUT_BASE/Kimi-K3.1-Pro-k3shape-src/Kimi-K3.1-Pro-k3shape
+  [ -n "$PREP_BASE" ] || die "K3Q_PREP_BASE is unset: the tree holds no model path; the machine's env names where prepare's source lands" 64
+  out_a=$PREP_BASE/Kimi-K3.1-Pro-k3shape-src/Kimi-K3.1-Pro-k3shape
   out_b=$WORK/indexer-only/Kimi-K3.1-Pro-indexer
   marker=$WORK/prepare.done
   bound=${K3Q_PREPARE_BOUND_S:-43200}
