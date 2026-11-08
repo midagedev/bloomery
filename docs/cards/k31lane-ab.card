@@ -1,0 +1,23 @@
+# The lane claim change (k31lane): a claim takes a quarter of what is left of its lane, floored at a 32nd of the lane,
+# through a CAS, in place of fixed quarter-lane blocks. Measured on K3.1's host leg beside its profile: the join idle
+# 28 -> 16..21 ms a step (-8..-12 ms of a ~150 ms leg - fill), the dispatch count unchanged. Every host row pool
+# claims this way, so the CPU decode of V4.1-Flash (bloomery-decode, every expert on the host) carries the same term:
+# its dispatches are shorter, so the tail each participant waits on is a smaller share of a shorter dispatch.
+kind: ab
+question: do geometric lane claims shorten the V4.1-Flash CPU decode step, by how much?
+term: decode tok/s @ n=8, the prompt's own depth, bloomery-decode (crates/model, the host engine), the box's host pool —
+  (k31lane2 − main) / main, paired by round
+unit: %
+predict: +1.5..+6.0
+rounds: 6
+condition: BLOOMERY_AB_ROUNDS=6 just ab-decode bloomery-k31lane2 from the main tree (both trees built with
+  just build-decode), the arm order rotated every round, one lease; no row carries [cpu-busy] or [other-busy]
+# derivation: [derived] K3.1: join idle 28 -> 16..21 ms a step over 92 layers x 2 dispatches = -0.04..-0.07 ms a dispatch,
+#   on dispatches of ~0.8 ms (gate/up lane) and ~0.4 ms (down): -5..-9 % of the leg's dispatch time. The V4.1 host step
+#   is the same two dispatches a layer over fewer, smaller experts; the join tail is ~block/2 a participant a dispatch
+#   and the new floor is a quarter of the old block at the tail, so the tail term drops by ~half: +1.5..+6 % of tok/s
+#   when the host leg is the whole step (bloomery-decode: no card). The CAS itself costs one more atomic per claim, ~0.
+decide-in: land k31lane2 as it is, its gate train after
+decide-below: keep the fixed blocks; the tail term was under the dispatch's own scatter — read the profile's idle/late
+  columns on V4.1 before another A/B
+decide-above: land it and re-derive the tail term (the old floor was worse than block/2)
