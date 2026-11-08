@@ -295,6 +295,19 @@ pub enum SwapRuleError {
         layer: usize,
         id: u32,
     },
+    /// A coldest-victim ask for more experts than the layer's live,
+    /// unpinned residents outside every flip in flight hold.
+    ColdestUnder {
+        layer: usize,
+        want: usize,
+        live: usize,
+    },
+    /// An expert taken off the card that is not a live, unpinned resident
+    /// outside every flip in flight.
+    TakeNotLive {
+        layer: usize,
+        id: u32,
+    },
     /// A stream index past the rule's streams.
     StreamOutOfRange {
         stream: usize,
@@ -446,6 +459,15 @@ impl fmt::Display for SwapRuleError {
             SwapRuleError::SettleEvict { layer, id } => write!(
                 f,
                 "a settled flip evicts layer {layer}'s expert {id}, which is not a live unpinned \
+                 resident outside every flip in flight"
+            ),
+            SwapRuleError::ColdestUnder { layer, want, live } => write!(
+                f,
+                "layer {layer}'s {want} coldest victims over its {live} live, unpinned residents"
+            ),
+            SwapRuleError::TakeNotLive { layer, id } => write!(
+                f,
+                "layer {layer}'s expert {id} taken off the card, which is not a live unpinned \
                  resident outside every flip in flight"
             ),
             SwapRuleError::StreamOutOfRange { stream, streams } => {
@@ -1643,6 +1665,112 @@ impl SwapRule {
         r
     }
 
+    /// Layer `layer`'s `k` coldest residents in the order a planning pass
+    /// evicts in — the live streams' blended heat, fewest uses first, then
+    /// the lower id — pinned, away and in-flight experts never one, exactly
+    /// the victims [`SwapRule::plan`] ranks. The blend is the planning
+    /// pass's own; the rule does not move. Refused by name: a layer past the
+    /// rule's, and `k` past the layer's live, unpinned residents.
+    pub fn coldest(&mut self, layer: usize, k: usize) -> Result<Vec<u32>, SwapRuleError> {
+        self.check_layer(layer)?;
+        let e = self.shape.experts;
+        self.blend();
+        let mut vict: Vec<(f64, u32)> = Vec::with_capacity(k);
+        let mut live = 0usize;
+        for ((&s, &c), id) in self.slot[layer * e..(layer + 1) * e]
+            .iter()
+            .zip(&self.counts[layer * e..(layer + 1) * e])
+            .zip(0u32..)
+        {
+            if s == Slot::Live {
+                live += 1;
+                keep_best(&mut vict, k, (c, id), vict_before);
+            }
+        }
+        if k > live {
+            return Err(SwapRuleError::ColdestUnder {
+                layer,
+                want: k,
+                live,
+            });
+        }
+        Ok(vict.into_iter().map(|(_, id)| id).collect())
+    }
+
+    /// Layer `layer`'s experts `ids` off its card set for good, a move the
+    /// rule did not make (a tail release the machine over the rule makes):
+    /// each must be a live, unpinned resident outside every flip in flight,
+    /// in the state the takes before it leave, and the layer's card set
+    /// bound — its capacity, so the seed its reset returns to — shrinks by
+    /// `ids.len()`. All or nothing; the counts do not move.
+    /// [`SwapRule::give`] grows the bound back.
+    pub fn take(&mut self, layer: usize, ids: &[u32]) -> Result<(), SwapRuleError> {
+        self.check_layer(layer)?;
+        let cap = self.capacity[layer].saturating_sub(ids.len());
+        if cap < self.pinned[layer] {
+            return Err(SwapRuleError::PinnedOverCapacity {
+                layer,
+                pinned: self.pinned[layer],
+                capacity: cap,
+            });
+        }
+        let e = self.shape.experts;
+        let mut done: Vec<usize> = Vec::with_capacity(ids.len());
+        let mut r = Ok(());
+        for &id in ids {
+            let i = match Self::index_of(layer, id, e) {
+                Ok(i) => i,
+                Err(x) => {
+                    r = Err(x);
+                    break;
+                }
+            };
+            if self.slot[i] != Slot::Live {
+                r = Err(SwapRuleError::TakeNotLive { layer, id });
+                break;
+            }
+            done.push(i);
+            self.slot[i] = Slot::Off;
+        }
+        match r {
+            Ok(()) => self.capacity[layer] = cap,
+            Err(_) => {
+                for &i in done.iter().rev() {
+                    self.slot[i] = Slot::Live;
+                }
+            }
+        }
+        r
+    }
+
+    /// Layer `layer`'s card set bound `k` more, a tail restored: its seed
+    /// and its reset target grow back with it, and no expert moves. Refused
+    /// by name: a layer past the rule's, and a bound past the experts the
+    /// layer's seed list ranks.
+    pub fn give(&mut self, layer: usize, k: usize) -> Result<(), SwapRuleError> {
+        self.check_layer(layer)?;
+        let e = self.shape.experts;
+        let ranked = self.rank[layer * e..(layer + 1) * e]
+            .iter()
+            .filter(|&&r| r != UNRANKED)
+            .count();
+        let cap = self.capacity[layer]
+            .checked_add(k)
+            .ok_or(SwapRuleError::Shape {
+                what: "a card set bound below usize::MAX",
+                value: k,
+            })?;
+        if cap > ranked {
+            return Err(SwapRuleError::SeedUnderCapacity {
+                layer,
+                seed: ranked,
+                capacity: cap,
+            });
+        }
+        self.capacity[layer] = cap;
+        Ok(())
+    }
+
     /// Whether the rule holds any decode history: a live stream's heat over 0,
     /// which only a kept row's fold writes ([`SwapRule::end_pass`]; a prompt
     /// call's rows are not counted, and its picks move no count), a stream's
@@ -2298,6 +2426,59 @@ mod tests {
             SwapRule::new_pinned(SwapParams::mid(0), shape, &seed, &[3], &[1, 1]).unwrap_err(),
             SwapRuleError::Shape { .. }
         ));
+    }
+
+    /// A tail release's rule half: the coldest are the victims a planning
+    /// pass would evict (fewest uses first, then the lower id, the pinned
+    /// never one), `take` empties the card set of exactly those with the
+    /// layer's bound — so its seed, the target its reset returns to —
+    /// shrinking by as many, all or nothing; `give` grows the bound back and
+    /// past the ranked seed is refused. Mutant: a coldest that includes the
+    /// pinned.
+    #[test]
+    fn a_tail_release_takes_the_coldest_and_shrinks_the_bound() {
+        let shape = Shape {
+            experts: 8,
+            top_k: 1,
+            max_rows: 2,
+        };
+        let seed: [&[u32]; 1] = [&[0, 1, 2, 3, 4]];
+        let mut r = SwapRule::new_pinned(params(2, 96, 1.5, 2.0, 1.0), shape, &seed, &[5], &[1])
+            .expect("a valid rule");
+        r.observe(0, 0, &[1]).expect("a row");
+        r.observe(0, 1, &[2]).expect("a row");
+        r.end_pass(KeptRows::of([0, 1])).expect("both kept");
+        r.plan(1).expect("boundary 1");
+        // 1 and 2 are warm, 3 and 4 cold at 0 uses, 0 pinned: the coldest
+        // two are 3 and 4, the order a planning pass evicts in.
+        assert_eq!(r.coldest(0, 2).expect("two coldest"), [3, 4]);
+        assert_eq!(
+            r.coldest(0, 5).expect_err("past the pool").to_string(),
+            "layer 0's 5 coldest victims over its 4 live, unpinned residents"
+        );
+        r.take(0, &[3, 4]).expect("two off the card");
+        assert_eq!(r.live(0).expect("a layer").collect::<Vec<_>>(), [0, 1, 2]);
+        assert_eq!(r.seed(0).expect("a layer"), [0, 1, 2]);
+        let before = r.clone();
+        assert_eq!(
+            r.take(0, &[0]).expect_err("the pinned one").to_string(),
+            "layer 0's expert 0 taken off the card, which is not a live unpinned resident \
+             outside every flip in flight"
+        );
+        assert_eq!(r, before, "a refused take leaves the rule unchanged");
+        r.give(0, 2).expect("the bound back");
+        assert_eq!(r.seed(0).expect("a layer"), [0, 1, 2, 3, 4]);
+        assert_eq!(
+            r.give(0, 4).expect_err("past the seed").to_string(),
+            "layer 0's seed list names 5 experts, fewer than its 9 card slots: the rule never \
+             fills an empty slot"
+        );
+        r.reset();
+        assert_eq!(
+            r.live(0).expect("a layer").collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4],
+            "the reset returns to the grown bound's seed"
+        );
     }
 
     /// An away expert is never admitted, however hot, and never in the card

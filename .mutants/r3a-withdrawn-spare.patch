@@ -1,0 +1,12 @@
+diff --git a/crates/gpu/src/host/swap.rs b/crates/gpu/src/host/swap.rs
+--- a/crates/gpu/src/host/swap.rs
++++ b/crates/gpu/src/host/swap.rs
+@@ -3630,7 +3630,7 @@ impl SwapMachine {
+                 row[s as usize] = SlotState::Spare;
+             }
+             for s in (cap - k)..cap {
+-                row[s] = SlotState::Withdrawn;
++                row[s] = SlotState::Spare;
+             }
+         }
+         self.agree(layer, slots, WHAT)?;

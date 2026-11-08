@@ -1372,7 +1372,9 @@ pub static RESIDENCY_PASS: Kind = Kind {
           boundary found still on the host and not resident, which the pass it opens serves from \
           the file, and the first of them as layer:expert:site:passes, the passes each has been \
           served from the file so far; and, when a prompt call ended in the pass before the boundary, the \
-          flips it picked (its admits over every layer and unit of the call).",
+          flips it picked (its admits over every layer and unit of the call); and the slots \
+          withdrawn over the machine's layers at the boundary: the tail releases less the \
+          restores, per layer in the slot ledger. Older records omit the withdrawn count.",
     parts: &[
         key("pass", Word, ""),
         key("boundary", U64, ""),
@@ -1397,6 +1399,7 @@ pub static RESIDENCY_PASS: Kind = Kind {
         opt("faulting", U64, ""),
         opt("faulting_first", Csv, ""),
         opt("picked", U64, ""),
+        opt("withdrawn", U64, ""),
     ],
 };
 
@@ -4454,7 +4457,8 @@ pub fn residency_pass_of(kind: PassKind, r: &PassReport) -> Record {
         .u("unresident", r.unresident.count())
         .csv("unresident_last", r.unresident.last().map(|u| u.mark()))
         .u("faulting", r.faulting.count())
-        .csv("faulting_first", r.faulting.first().map(|f| f.mark()));
+        .csv("faulting_first", r.faulting.first().map(|f| f.mark()))
+        .u("withdrawn", r.withdrawn);
     match r.picked {
         Some(picked) => rec.u("picked", picked),
         None => rec,

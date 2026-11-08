@@ -1,0 +1,12 @@
+diff --git a/crates/runtime/src/swaprule.rs b/crates/runtime/src/swaprule.rs
+--- a/crates/runtime/src/swaprule.rs
++++ b/crates/runtime/src/swaprule.rs
+@@ -1682,7 +1682,7 @@ impl SwapRule {
+             .zip(&self.counts[layer * e..(layer + 1) * e])
+             .zip(0u32..)
+         {
+-            if s == Slot::Live {
++            if matches!(s, Slot::Live | Slot::Pinned) {
+                 live += 1;
+                 keep_best(&mut vict, k, (c, id), vict_before);
+             }

@@ -1,0 +1,19 @@
+diff --git a/crates/gpu/src/host/swap.rs b/crates/gpu/src/host/swap.rs
+--- a/crates/gpu/src/host/swap.rs
++++ b/crates/gpu/src/host/swap.rs
+@@ -3597,14 +3597,7 @@ impl SwapMachine {
+             }
+         }
+         for &(src, dst, len) in &pack {
+-            // SAFETY: `src` and `dst` are the layer's stack slots a move
+-            // copies between, each `len` bytes of a live stack the caller
+-            // keeps allocated and in place until the machine is dropped
+-            // ([`SwapSource::dest`]); a move's source lies at or past the
+-            // capacity less `k`, its destination below it, so the two never
+-            // meet.
+-            let rc = unsafe { sys::cuMemcpyDtoDAsync_v2(dst, src, len, self.copy.cu_stream()) };
+-            cu(rc, "cuMemcpyDtoDAsync_v2 (SwapMachine::release_tail)")?;
++            let _ = (src, dst, len);
+         }
+         self.events[event].record(&self.copy)?;
+         stream.wait(&self.events[event])?;
