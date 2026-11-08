@@ -766,7 +766,7 @@ mod gate {
         pass &= node_family_and_records(&prompt, budget)?;
         pass &= guarded("pass", placed_pass(&inputs, budget, host));
         pass &= guarded("pass cli", pass_cli(&inputs, budget, host));
-        pass &= guarded("pass past top-k", pass_past_top_k(&inputs, budget, host));
+        pass &= guarded("pass past top-k", pass_past_top_k(&inputs, header, host));
         println!("{NAME}: {}", tier::tally_line());
         if !pass {
             return Err(checks_failed());
@@ -1580,8 +1580,10 @@ mod gate {
         let k3_prefix = format!("{K3}.");
         let split = open_split(Arch::KimiK3, RECIPE)?;
         let hp = &inputs.hp;
+        // One file: the fixture's split keys count its own tensors, not the indexer's added here.
         let mut kvs: Vec<(String, Value)> = split
             .iter_kv()
+            .filter(|(k, _)| !k.starts_with("split."))
             .map(|(k, v)| match (k, k.strip_prefix(k3_prefix.as_str())) {
                 (k, _) if k == GENERAL_ARCHITECTURE => (k.to_string(), Value::String(ARCH.into())),
                 (_, Some(rest)) => (format!("{ARCH}.{rest}"), v.clone()),
@@ -1663,26 +1665,27 @@ mod gate {
     /// through `Batch::prompt` (passes up to the top-k, steps after it) reads the token and the
     /// position of the same ids stepped from a reset. Mutant: the split removed from
     /// `Batch::prompt` (the whole prompt as passes): the second pass's last row sees 24 keys and is
-    /// refused by name, so the clause ends in that error.
-    fn pass_past_top_k(inputs: &PlanInputs, budget: u64, host: HostCfg) -> Result<bool, GateError> {
+    /// refused by name, so the clause ends in that error. The card budget is the K3.1 file's own
+    /// pick under the header's budget `header` (the plan counts the indexer's tensors as dense).
+    fn pass_past_top_k(inputs: &PlanInputs, header: u64, host: HostCfg) -> Result<bool, GateError> {
         let path = k31_fixture(inputs)?;
         let inputs31 = PlanInputs::read_without_chat(&Split::open(&path)?)?;
+        let table = split_table(&inputs31, &bp_machine(&inputs31)?, DSA_CTX as u64, header)?;
+        let budget = pick_budget(&table)?;
         let shape = PASS_SHAPES[0];
         let (pass_inputs, machine, mut at) = pass_plan_inputs(&inputs31, budget, shape, false)?;
-        // The stage card also holds the indexer's tensors and the latent layers' key rows.
+        // The stage card also holds the latent layers' key rows, beside the plan.
         let split = Split::open(&path)?;
-        let indexer: u64 = split
-            .iter_tensors()
-            .filter(|(_, t)| t.name.contains(".indexer."))
-            .map(|(_, t)| t.nbytes)
-            .sum();
         let latent = inputs31
             .hp
             .kinds
             .iter()
             .filter(|k| **k == model::arch::kimi_k3::hparams::Kind::Mla)
             .count() as u64;
-        let extra = indexer + latent * (DSA_CTX as u64) * 256 + (1 << 20);
+        let extra = latent * (DSA_CTX as u64) * 256 + (1 << 20);
+        // Kept out of the expert budget, as the prompt reserve is: the split stays the pick's.
+        let reserve = pass_inputs.prompt_reserve + extra;
+        let pass_inputs = pass_inputs.with_prompt_reserve(reserve);
         if let CardBudget::Per(cards) = &mut at.card_budget_bytes
             && let Some(stage) = cards.first_mut()
         {
