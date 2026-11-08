@@ -69,11 +69,12 @@ use runtime::swaprule::KeptRows;
 use super::HostExperts;
 use super::nvtier::NvTier;
 use super::swap::{
-    BoundaryAt, MachineCfg, Nvfp4From, PassReport, Piece, ResetReport, Residency, SwapSource,
-    Transform,
+    BoundaryAt, Freed, MachineCfg, Nvfp4From, PassReport, Piece, ResetReport, Residency,
+    SwapSource, Transform,
 };
 use super::{HostTier, PassKind};
 use crate::GpuError;
+use crate::room::StackRoom;
 use crate::tensor::DeviceTensor;
 use crate::weights::{DevWeight, Weights};
 
@@ -407,6 +408,11 @@ struct LayerParts {
     /// expert: the [`Plane::Scale`] part's source; empty for a stack read
     /// whole.
     scales: Vec<Vec<u8>>,
+    /// Per stack, its room when the load held it as one
+    /// ([`Weights::stack_room`]): the pages the machine gives back and backs
+    /// again. `None` for a plain buffer and for a planes stack; empty when
+    /// no stack of the layer is a room.
+    rooms: Vec<Option<Arc<StackRoom>>>,
 }
 
 /// What a part of an expert is of its stack: the stack's bytes whole (a
@@ -820,6 +826,15 @@ impl FileSwap {
                     false => Ok(Vec::new()),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let rooms = names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| {
+                    of.contains(&(i, Plane::Whole))
+                        .then(|| w.stack_room(n).cloned())
+                        .flatten()
+                })
+                .collect();
             out.push(Some(LayerParts {
                 tensors,
                 base,
@@ -827,6 +842,7 @@ impl FileSwap {
                 parts,
                 of,
                 scales,
+                rooms,
             }));
         }
         let first = out
@@ -1048,6 +1064,34 @@ impl FileSwap {
             })
     }
 
+    /// The room stacks of layer `layer` with the bytes one slot takes in
+    /// each, `slot` a slot of the layer or its end; the layer's stacks that
+    /// are plain buffers are not among them. Refused by name for a layer the
+    /// stage card holds no stack of and a slot past the layer's.
+    fn rooms_of(
+        &self,
+        layer: usize,
+        slot: usize,
+        what: &'static str,
+    ) -> Result<Vec<(&StackRoom, usize)>, GpuError> {
+        let p = self.layer(layer, what)?;
+        if slot > p.slots {
+            return Err(GpuError::shape(
+                what,
+                format!("layer {layer} slot {slot}: {} slots", p.slots),
+            ));
+        }
+        Ok(p.of
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, plane))| *plane == Plane::Whole)
+            .filter_map(|(part, &(stack, _))| {
+                let room = p.rooms.get(stack)?.as_deref()?;
+                Some((room, p.parts[part]))
+            })
+            .collect())
+    }
+
     /// Where the host reads stack `stack` of layer `layer`'s expert `id`: the
     /// sidecar's run when it holds the stack and the pair reads one, else the
     /// source's; a planes stack's codes run then its scales run, each in its
@@ -1217,6 +1261,51 @@ impl SwapSource for FileSwap {
             ));
         }
         Ok(p.base[part] + (slot as usize * p.parts[part]) as u64)
+    }
+
+    /// The pages of the layer's room stacks wholly at or past slot `from`
+    /// that hold memory.
+    fn stack_tail_bytes(&self, layer: usize, from: usize) -> Result<u64, GpuError> {
+        let mut bytes = 0;
+        for (room, per) in self.rooms_of(layer, from, "FileSwap::stack_tail_bytes")? {
+            bytes += room.tail_bytes(from * per)?;
+        }
+        Ok(bytes)
+    }
+
+    /// Every page of the layer's room stacks wholly at or past slot `from`
+    /// given back ([`StackRoom::release_from`]); a plain stack gives back
+    /// nothing.
+    fn release_stacks(&self, layer: usize, from: usize) -> Result<u64, GpuError> {
+        let mut freed = 0;
+        for (room, per) in self.rooms_of(layer, from, "FileSwap::release_stacks")? {
+            freed += room.release_from(from * per)?;
+        }
+        Ok(freed)
+    }
+
+    /// The pages of the layer's room stacks that hold a byte of slots
+    /// `from..to` backed again, zeroed on `stream` ([`StackRoom::restore`]).
+    fn restore_stacks(
+        &self,
+        layer: usize,
+        from: usize,
+        to: usize,
+        stream: &CudaStream,
+    ) -> Result<u64, GpuError> {
+        let mut backed = 0;
+        for (room, per) in self.rooms_of(layer, to, "FileSwap::restore_stacks")? {
+            backed += room.restore(from * per, to * per, stream)?;
+        }
+        Ok(backed)
+    }
+
+    /// The bytes the layer's room stacks have given back and not had backed
+    /// again; 0 for a layer this source holds no stack of (every layer of a
+    /// machine holds parts).
+    fn released_bytes(&self, layer: usize) -> u64 {
+        self.rooms_of(layer, 0, "FileSwap::released_bytes")
+            .map_or(0, |rooms| rooms.iter().map(|(r, _)| r.released()).sum())
     }
 
     /// The model's convert step of the staged part just copied to `dst`
@@ -1455,6 +1544,20 @@ impl ResidencyGlue {
         tier.swap_reseed(stream, order)
     }
 
+    /// Give back at least `bytes` device bytes of the stage card's expert
+    /// stacks: the same top `k` slots off every machine layer, the smallest
+    /// `k` that reaches them ([`HostTier::swap_free_bytes`]); the per-layer
+    /// report. Refused by name, the machine unchanged, without a machine and
+    /// when the floor forbids.
+    pub fn free_bytes<H: HostExperts>(
+        &mut self,
+        tier: &mut HostTier<H>,
+        stream: &CudaStream,
+        bytes: u64,
+    ) -> Result<Freed, GpuError> {
+        tier.swap_free_bytes(stream, bytes)
+    }
+
     /// Stop the machine before anything of the model is freed
     /// ([`HostTier::stop_swap`]); nothing without one.
     pub fn stop<H>(&mut self, tier: &mut HostTier<H>) {
@@ -1536,6 +1639,7 @@ mod tests {
                 parts,
                 of: vec![(0, Plane::Codes), (0, Plane::BlockScales)],
                 scales: vec![Vec::new()],
+                rooms: Vec::new(),
             })],
             union_tag: String::new(),
             convert: None,
@@ -1908,6 +2012,7 @@ mod tests {
             parts: parts.to_vec(),
             of: Vec::new(),
             scales: Vec::new(),
+            rooms: Vec::new(),
         })
     }
 

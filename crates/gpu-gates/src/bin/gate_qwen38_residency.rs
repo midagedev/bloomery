@@ -136,6 +136,22 @@
 //!   walk and its twin, both calls walked as two units, under its rule
 //!   (mutant: the return owed at every unit's back — the next unit's shadow
 //!   asks for a layer its sibling has not served, refused by name).
+//! - `kvfloor` (a growing sequence frees expert bytes; a third load, planned at
+//!   a KV floor of [`FLOOR_POSITIONS`] positions, after the slots clauses';
+//!   real tier only like the gate, no fixture runs a residency machine): a
+//!   [`FLOOR_PROMPT`]-id prompt call and [`STREAM_STEPS`] greedy steps from a
+//!   clear, three times, each from the machine's full capacity. With the card
+//!   as the load left it (what the machine withdrew is printed, not judged).
+//!   With the card squeezed until it refuses a page: the fit runs out whatever
+//!   the plan's slack, the same top slots are withdrawn from every layer, the
+//!   call completes, the reports' withdrawn bytes equal the page-and-parts
+//!   derivation and the ids are the first run's or part at a near tie. After
+//!   a restore of every withdrawn slot (no engine path restores one) every
+//!   layer's withdrawn count and the rooms' released bytes are 0, and the
+//!   third run is the first run's bit for bit. Mutants: the retry in
+//!   `Body38::fit_stores` removed (the squeezed call ends in `NoRoom`);
+//!   `restore_stacks` skipped in `SwapMachine::restore_tail` (the rooms'
+//!   released bytes stay above 0 and the third run's bits part).
 //! - `slots_drafted`: a drafted pass of two slots' verify rows folds each
 //!   slot's accepted rows — slot 0 keeping one of its three rows, slot 1
 //!   two of theirs — so the boundary that ends it reports 3 kept rows as
@@ -173,7 +189,9 @@ mod gate {
     use bloomery_gpu::arch::qwen3moe::{Body38, Qwen38Model, SplitWalk};
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::slots::Slot;
-    use bloomery_gpu::host::swap::{CallPick, CallReport, PassReport, Residency, SlotState};
+    use bloomery_gpu::host::swap::{
+        CallPick, CallReport, PassReport, Residency, SlotState, SwapSource,
+    };
     use bloomery_gpu::host::xstream::{Costs, XLayer, XMode, XReport};
     use bloomery_gpu_gates::flip;
     use bloomery_gpu_gates::generate::Place;
@@ -218,6 +236,15 @@ mod gate {
         card_us_fixed: 13.0,
         card_us_per_col: 0.16,
     };
+    /// The `kvfloor` clause's KV floor: the positions its plan spreads the
+    /// card experts at, so every position the prompt call grows the stores
+    /// by past it is bytes the plan gave to experts.
+    const FLOOR_POSITIONS: u64 = 64;
+    /// The `kvfloor` clause's prompt: ids of the qwen4exp prose corpus as
+    /// one call, far past [`FLOOR_POSITIONS`] and, with the greedy steps
+    /// after it, inside the first page of each store plane (a K or V row is
+    /// 1,024 B a position, a page 2 MiB).
+    const FLOOR_PROMPT: usize = STREAM_PROMPT;
     /// The `units` clause's prompt: the `stream` clause's, one ubatch the
     /// split walk cuts into two units of half its rows.
     const UNITS_PROMPT: usize = STREAM_PROMPT;
@@ -231,11 +258,20 @@ mod gate {
         inputs: &'m PlanInputs,
         card: &'m Machine,
     ) -> Result<model::placement::Plan<'m>, GateError> {
+        plan_under(inputs, card, &PlanLevers::default())
+    }
+
+    /// [`plan_of`] under `levers`.
+    fn plan_under<'m>(
+        inputs: &'m PlanInputs,
+        card: &'m Machine,
+        levers: &PlanLevers,
+    ) -> Result<model::placement::Plan<'m>, GateError> {
         inputs
             .plan_with(
                 card,
                 (CTX as u64, u64::try_from(ubatch_for(CTX)?)?),
-                &PlanLevers::default(),
+                levers,
                 Experts::Card,
             )
             .map_err(|e| format!("the plan: {e}").into())
@@ -251,11 +287,20 @@ mod gate {
     /// the largest whole GiB below them that does, each larger one printed
     /// with why it did not.
     fn residency_machine(inputs: &PlanInputs, ub: usize) -> Result<Machine, GateError> {
+        residency_machine_under(inputs, ub, &PlanLevers::default())
+    }
+
+    /// [`residency_machine`] for the plan made under `levers`.
+    fn residency_machine_under(
+        inputs: &PlanInputs,
+        ub: usize,
+        levers: &PlanLevers,
+    ) -> Result<Machine, GateError> {
         let card = tier::real_card(Place::A.on(&bloomery_gpu::census()?)?.card_specs()?[0]);
         let layers = inputs.stack();
         let at = |c: CardSpec| machine_for_experts(c, layers, ub as u64, Experts::Card);
         let why_not = |m: &Machine| -> Result<Option<String>, GateError> {
-            let plan = match plan_of(inputs, m) {
+            let plan = match plan_under(inputs, m, levers) {
                 Ok(plan) => plan,
                 Err(e) => return Ok(Some(e.to_string())),
             };
@@ -335,11 +380,30 @@ mod gate {
         host: bloomery_levers::HostCfg,
         ub: usize,
     ) -> Result<Qwen38Model, GateError> {
+        open_under(
+            path,
+            inputs,
+            machine,
+            (residency, &PlanLevers::default()),
+            host,
+            ub,
+        )
+    }
+
+    /// [`open`] for the plan made under `levers`.
+    fn open_under(
+        path: &Path,
+        inputs: &PlanInputs,
+        machine: Machine,
+        (residency, levers): (Residency, &PlanLevers),
+        host: bloomery_levers::HostCfg,
+        ub: usize,
+    ) -> Result<Qwen38Model, GateError> {
         let file = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
         if file.architecture() != Some("qwen4exp") {
             return Err(format!("{} is not qwen4exp", path.display()).into());
         }
-        let plan = plan_of(inputs, &machine)?;
+        let plan = plan_under(inputs, &machine, levers)?;
         Ok(Body38::open_placed_residency(
             file,
             &plan,
@@ -1396,6 +1460,315 @@ mod gate {
         Ok(ok)
     }
 
+    /// What one run of the `kvfloor` clause saw: the greedy ids, the prompt
+    /// call's last logits row and each id's top-1 margin (the call's first),
+    /// the device's free bytes after the clear, the most expert-stack bytes
+    /// the boundaries' reports held withdrawn, and each machine layer's
+    /// withdrawn slots at the end.
+    struct FloorRun {
+        tokens: Vec<u32>,
+        logits: Vec<f32>,
+        margins: Vec<f32>,
+        idle: usize,
+        withdrawn_bytes: u64,
+        withdrawn: Vec<(usize, usize)>,
+    }
+
+    impl FloorRun {
+        fn greedy(&self) -> Greedy<'_> {
+            Greedy {
+                logits: &self.logits,
+                tokens: &self.tokens,
+                margins: &self.margins,
+            }
+        }
+
+        /// The slots withdrawn from every layer, when it is the same count
+        /// on all of them.
+        fn k(&self) -> Option<usize> {
+            let k = self.withdrawn.first()?.1;
+            self.withdrawn.iter().all(|&(_, w)| w == k).then_some(k)
+        }
+    }
+
+    /// Device memory held until the card refuses one more page: buffers of a
+    /// gigabyte, halving to one page as the card refuses them, until less
+    /// than a page is free or a page-sized buffer is refused for lack of
+    /// memory (the driver keeps a reserve the free bytes count). Any other
+    /// refusal is refused by name.
+    fn squeeze(gpu: &bloomery_gpu::Gpu) -> Result<Vec<cuda_core::DeviceBuffer<u32>>, GateError> {
+        let page = gpu.allocation_granularity()?;
+        let mut held = Vec::new();
+        let mut chunk = 1usize << 30;
+        loop {
+            let free = gpu.mem_info()?.0;
+            if free < page {
+                return Ok(held);
+            }
+            let take = chunk.min(free / page * page);
+            match cuda_core::DeviceBuffer::<u32>::zeroed(gpu.stream(), take / 4) {
+                Ok(b) => held.push(b),
+                Err(_) if chunk > page => chunk /= 2,
+                Err(e) if e.0 == cuda_core::sys::cudaError_enum_CUDA_ERROR_OUT_OF_MEMORY => {
+                    return Ok(held);
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "the squeeze: a {take} B buffer refused with {free} B free: {e}"
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+
+    /// Each layer of the machine and the slots withdrawn from it.
+    fn withdrawn_slots(s: &Session<Body38>) -> Result<Vec<(usize, usize)>, GateError> {
+        let b = s.model().body(NAME)?;
+        let machine = b
+            .hybrid()
+            .swap()
+            .ok_or("the load runs no residency machine")?;
+        Ok(b.hybrid()
+            .slots()
+            .layers()
+            .map(|l| (l, machine.ledger().withdrawn(l)))
+            .collect())
+    }
+
+    /// The bytes the layers' stacks have given back and not had backed
+    /// again, by the rooms' own counters.
+    fn released_total(s: &Session<Body38>) -> Result<u64, GateError> {
+        let b = s.model().body(NAME)?;
+        let source = b
+            .residency_source()
+            .ok_or("the load has no residency source")?;
+        Ok(b.hybrid()
+            .slots()
+            .layers()
+            .map(|l| source.released_bytes(l))
+            .sum())
+    }
+
+    /// The bytes withdrawing `k` slots from every layer gives back, derived
+    /// from the page and each part's bytes a slot holds: a part's stack
+    /// lends the pages wholly at or past slot `cap - k`, `pages(cap) -
+    /// pages(cap - k)` of them, `pages` rounding bytes up to the page.
+    fn stack_bytes_gone(s: &Session<Body38>, k: usize) -> Result<u64, GateError> {
+        let b = s.model().body(NAME)?;
+        let machine = b
+            .hybrid()
+            .swap()
+            .ok_or("the load runs no residency machine")?;
+        let source = b
+            .residency_source()
+            .ok_or("the load has no residency source")?;
+        let page = s.model().gpu().allocation_granularity()? as u64;
+        let pages = |bytes: usize| (bytes as u64).div_ceil(page);
+        let mut gone = 0;
+        for l in b.hybrid().slots().layers() {
+            let cap = machine.ledger().row(l).map_or(0, <[SlotState]>::len);
+            for &part in source.part_bytes(l) {
+                gone += (pages(cap * part) - pages((cap - k) * part)) * page;
+            }
+        }
+        Ok(gone)
+    }
+
+    /// The sequence cleared and every withdrawn slot of every layer
+    /// restored, so the next run starts from the machine's full capacity: no
+    /// engine path restores a withdrawn tail (a reset leaves it withdrawn).
+    fn restore_all(s: &mut Session<Body38>) -> Result<(), GateError> {
+        s.clear()?;
+        take_passes(s)?;
+        let held = withdrawn_slots(s)?;
+        let tier = s.model_mut().body_parts(NAME)?.2.hybrid_mut();
+        for (l, k) in held {
+            if k > 0 {
+                tier.swap_restore_tail(l, k)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One run of the `kvfloor` clause from a clear: with `tight`, the card
+    /// squeezed until it refuses a page after the clear, the prompt call of
+    /// `ids`, then [`STREAM_STEPS`] greedy steps; the squeeze let go at the
+    /// end. An error is the named refusal of a call.
+    fn floor_run(s: &mut Session<Body38>, ids: &[u32], tight: bool) -> Result<FloorRun, GateError> {
+        s.clear()?;
+        take_passes(s)?;
+        let idle = s.model().gpu().mem_info()?.0;
+        let _held = if tight {
+            squeeze(s.model().gpu())?
+        } else {
+            Vec::new()
+        };
+        let out = s.prompt(ids, Want::Logits)?;
+        let mut next = out.argmax();
+        let Out::Logits { row, .. } = out else {
+            return Err("the prompt call returned no logits row".into());
+        };
+        let logits = row.to_vec();
+        let mut margins = vec![flip::head_margin(&logits)?];
+        let mut tokens = vec![next];
+        for _ in 0..STREAM_STEPS {
+            let out = s.step(next, Want::Logits)?;
+            next = out.argmax();
+            if let Out::Logits { row, .. } = out {
+                margins.push(flip::head_margin(row)?);
+            }
+            tokens.push(next);
+        }
+        let passes = take_passes(s)?;
+        Ok(FloorRun {
+            tokens,
+            logits,
+            margins,
+            idle,
+            withdrawn_bytes: passes
+                .iter()
+                .map(|(_, r)| r.withdrawn_bytes)
+                .max()
+                .unwrap_or(0),
+            withdrawn: withdrawn_slots(s)?,
+        })
+    }
+
+    /// `kvfloor` (a growing sequence frees expert bytes): the load planned
+    /// at a KV floor of [`FLOOR_POSITIONS`] positions, the same history of a
+    /// [`FLOOR_PROMPT`]-id prompt call and [`STREAM_STEPS`] greedy steps from
+    /// a clear, three times, each from the machine's full capacity. First
+    /// with the card as the load left it: what the machine withdrew, if
+    /// anything, is printed, not judged (the plan's slack decides it). Then
+    /// with the card squeezed until it refuses a page: the call's first page
+    /// has no room, so the fit runs out whatever the slack, the machine
+    /// withdraws the same top slots of every layer (the fewest whose stacks
+    /// give back the pages the stores ask and one more; every page of the
+    /// prompt's lies in the stores' first page of each plane, so the steps
+    /// ask nothing more), the fit runs again and the call completes; its
+    /// reports hold the stacks' bytes withdrawn, equal to the bytes the page
+    /// and the parts derive ([`stack_bytes_gone`]), and its greedy ids equal
+    /// the first run's or part at a near tie (a layer's card set is smaller,
+    /// so a token's experts sum in another split: `stream`'s rule). Then
+    /// every withdrawn slot restored ([`restore_all`]): every layer's
+    /// withdrawn count and the rooms' released bytes are 0, directly; and
+    /// the third run, with the card as the load left it, is the first run's
+    /// bit for bit (mutants: the fit's retry removed, which ends the
+    /// squeezed run's call in `NoRoom`; the restore's stack pages left
+    /// unbacked, which leaves the rooms' released bytes above 0 and the
+    /// third run's bits apart).
+    fn kvfloor_clause(
+        path: &Path,
+        inputs: &PlanInputs,
+        host: bloomery_levers::HostCfg,
+        ub: usize,
+    ) -> Result<bool, GateError> {
+        let levers = PlanLevers {
+            kv_floor: Some(FLOOR_POSITIONS),
+            ..PlanLevers::default()
+        };
+        let machine = residency_machine_under(inputs, ub, &levers)?;
+        let (residency, floored) = {
+            let plan = plan_under(inputs, &machine, &levers)?;
+            (
+                residency_of(&plan).ok_or(
+                    "the floored plan's card experts leave no layer with room for the \
+                     machine's pinned, spare and one that moves",
+                )?,
+                plan.kv_floor,
+            )
+        };
+        let t0 = Instant::now();
+        let mut s = Session::from_model(
+            open_under(path, inputs, machine, (residency, &levers), host, ub)?,
+            CTX as u32,
+        );
+        let b = s.model_mut().body_parts(NAME)?.2;
+        b.log_residency(0);
+        b.set_split_walk(SplitWalk::Off)?;
+        take_passes(&mut s)?;
+        println!(
+            "kvfloor: {} at a floor of {FLOOR_POSITIONS} positions, plan's floor {floored:?}, \
+             load in {:.1} s",
+            word_of(&residency),
+            t0.elapsed().as_secs_f64()
+        );
+        let ids = prose_ids("qwen4exp", FLOOR_PROMPT)?;
+        let loaded = withdrawn_slots(&s)?.iter().all(|&(_, w)| w == 0);
+        let room = floor_run(&mut s, &ids, false)?;
+        println!(
+            "kvfloor: the card as the load left it: idle free {} B, withdrawn {:?} slots a layer, \
+             {} B (printed, not judged)",
+            room.idle,
+            room.k(),
+            room.withdrawn_bytes
+        );
+        restore_all(&mut s)?;
+        let tight = match floor_run(&mut s, &ids, true) {
+            Ok(r) => r,
+            Err(e) => {
+                println!(
+                    "kvfloor: the call with no page left FAILED: {e} {}",
+                    verdict(false)
+                );
+                return Ok(false);
+            }
+        };
+        let k = tight.k().filter(|&k| k > 0);
+        let gone = match k {
+            Some(k) => stack_bytes_gone(&s, k)?,
+            None => 0,
+        };
+        let freed_ok = floored == Some(FLOOR_POSITIONS)
+            && loaded
+            && k.is_some()
+            && tight.withdrawn_bytes == gone;
+        let (dlogit, logits_ok, parted, ids_ok) = agree(&tight.greedy(), &room.greedy());
+        println!(
+            "kvfloor: with no page left, the machine withdrew {k:?} slots a layer over {} \
+             layers, {} B in the reports against {gone} B derived {freed_ok}; the prompt's logits \
+             max|diff| against the first run {dlogit} (under {GREEDY_MARGIN}: {logits_ok}; \
+             printed, not judged), {} greedy ids equal or parted at a near tie {ids_ok}{}: {}",
+            tight.withdrawn.len(),
+            tight.withdrawn_bytes,
+            tight.tokens.len(),
+            parted
+                .map(|i| format!(
+                    " (first parted at {i}, squeezed run's margin {:?})",
+                    tight.margins.get(i)
+                ))
+                .unwrap_or_default(),
+            verdict(freed_ok && ids_ok)
+        );
+        restore_all(&mut s)?;
+        let slots_back = withdrawn_slots(&s)?.iter().all(|&(_, w)| w == 0);
+        let released = released_total(&s)?;
+        let restored_ok = slots_back && released == 0;
+        println!(
+            "kvfloor: after the restore every layer's withdrawn count is 0 {slots_back}, the \
+             rooms' released bytes {released}: {}",
+            verdict(restored_ok)
+        );
+        let again = floor_run(&mut s, &ids, false)?;
+        let same_ok = again.tokens == room.tokens
+            && again.withdrawn_bytes == room.withdrawn_bytes
+            && again.logits.len() == room.logits.len()
+            && again
+                .logits
+                .iter()
+                .zip(&room.logits)
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+        println!(
+            "kvfloor: the third run, the card as the load left it (idle free {} B against {} B, \
+             printed), is the first run's ids, logits bits and withdrawn bytes: {}",
+            again.idle,
+            room.idle,
+            verdict(same_ok)
+        );
+        Ok(freed_ok && ids_ok && restored_ok && same_ok)
+    }
+
     /// The load the slots clauses share: planned for the two slots it serves
     /// ([`PlanInputs::plan_with_slots`]; the gate's own load plans one, and
     /// a pass of several slots on it is refused by name), opened after the
@@ -1699,6 +2072,10 @@ mod gate {
         let mut s = open_slots(path, &inputs, &machine, host, ub)?;
         pass &= slots_drafted_clause(&mut s, &ids)?;
         pass &= commit_counts_clause(&mut s, &ids)?;
+        // The card holds one load: the floored plan's own comes after the
+        // slots clauses'.
+        drop(s);
+        pass &= kvfloor_clause(path, &inputs, host, ub)?;
 
         if pass {
             println!("{NAME}: every clause passed");

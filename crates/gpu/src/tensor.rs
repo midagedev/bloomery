@@ -718,6 +718,25 @@ impl<T: DeviceCopy> DeviceTensor<T> {
         })
     }
 
+    /// A `rows × cols` tensor that owns `buf`, which holds exactly that many
+    /// elements: refused by name otherwise.
+    pub(crate) fn from_buf(
+        buf: DeviceBuffer<T>,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self, GpuError> {
+        if rows.checked_mul(cols) != Some(buf.len()) {
+            let detail = format!("a buffer of {} elements for {rows} × {cols}", buf.len());
+            return Err(GpuError::shape("DeviceTensor::from_buf", detail));
+        }
+        Ok(DeviceTensor { buf, rows, cols })
+    }
+
+    /// The tensor's buffer, the tensor gone.
+    pub(crate) fn into_buf(self) -> DeviceBuffer<T> {
+        self.buf
+    }
+
     /// Row count.
     pub fn rows(&self) -> usize {
         self.rows

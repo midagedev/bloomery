@@ -337,6 +337,14 @@
 //!   seed's missing 4 and 5 into the freed slot 5 and the restored 6 — and
 //!   a flip after it admits into 7; a restore with none left is refused by
 //!   name (its mutant: a restore that leaves the ledger as it was).
+//! - tail pages: over a source whose layer-2 stacks are a page room (8 slots
+//!   of 3 MiB), `release_tail(2)` reports the bytes of the pages wholly at or
+//!   past slot 6 freed, the device's free bytes grow by at least that, the
+//!   room holds the pages below with slots 0..6 reading back their words, the
+//!   boundaries after it record the withdrawn bytes; a restore of 1 twice backs
+//!   the pages of slot 6 and then of slot 7 and no others, and after the reset
+//!   slot 7 reads zero (its mutants: the machine's call to give the pages back
+//!   skipped; the restore's call to back them skipped).
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -355,12 +363,13 @@ mod gate {
     use bloomery_gpu::host::slots::{HOST, Slot, SlotMap};
     use bloomery_gpu::host::swap::{
         CallCfg, CallPick, CallReport, CardTable, HostSite, Leak, LeakReason, MachineCfg,
-        Nvfp4From, PassReport, Piece, Released, SlotState, SwapMachine, SwapSource, Transform,
-        set_leak_sink,
+        Nvfp4From, PassReport, Piece, SlotState, SwapMachine, SwapSource, Transform, set_leak_sink,
     };
     use bloomery_gpu::host::xstream::land_batch_size;
     use bloomery_gpu::hybrid::{Boundary, BoundaryShape, HostExperts, HostTier};
-    use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Graph, HostFlags};
+    use bloomery_gpu::{
+        DeviceTensor, Gpu, GpuError, Graph, HostFlags, StackRoom, Window, WindowMut,
+    };
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
     use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DriverError, LaunchConfig1D, sys};
@@ -576,6 +585,9 @@ mod gate {
         hold: Option<Arc<SourceHold>>,
         /// Paces every job's staging while it is on.
         pace: Option<Arc<Pace>>,
+        /// A page room standing for layer 2's stacks: the source gives its pages back
+        /// and backs them again at the machine's call.
+        rooms: Option<Arc<PageRooms>>,
     }
 
     /// A gate-side hold on the lane: once armed, the source blocks reading
@@ -724,6 +736,17 @@ mod gate {
                 faults,
                 prepared: AtomicU32::new(0),
             }
+        }
+    }
+
+    impl Synth {
+        /// The page room that stands for layer `layer`'s stacks, when the arm
+        /// has one: layer 2's alone.
+        fn page_room(&self, layer: usize) -> Option<&PageRooms> {
+            self.faults
+                .rooms
+                .as_deref()
+                .filter(|_| layer == LAYERS.start)
         }
     }
 
@@ -972,6 +995,108 @@ mod gate {
         fn release_host(&self, layer: usize, id: u32) -> Result<u64, GpuError> {
             self.resident[li(layer) * E + id as usize].store(false, Ordering::Release);
             Ok(EXPERT_BYTES)
+        }
+
+        fn stack_tail_bytes(&self, layer: usize, from: usize) -> Result<u64, GpuError> {
+            match self.page_room(layer) {
+                Some(r) => r.room.tail_bytes(from * ROOM_SLOT),
+                None => Ok(0),
+            }
+        }
+
+        fn release_stacks(&self, layer: usize, from: usize) -> Result<u64, GpuError> {
+            match self.page_room(layer) {
+                Some(r) => r.room.release_from(from * ROOM_SLOT),
+                None => Ok(0),
+            }
+        }
+
+        fn restore_stacks(
+            &self,
+            layer: usize,
+            from: usize,
+            to: usize,
+            stream: &CudaStream,
+        ) -> Result<u64, GpuError> {
+            match self.page_room(layer) {
+                Some(r) => r.room.restore(from * ROOM_SLOT, to * ROOM_SLOT, stream),
+                None => Ok(0),
+            }
+        }
+
+        fn released_bytes(&self, layer: usize) -> u64 {
+            self.page_room(layer).map_or(0, |r| r.room.released())
+        }
+    }
+
+    /// Bytes one slot takes in [`PageRooms`]' stack: not a page multiple, so
+    /// a slot straddles page boundaries as a routed stack's slot does.
+    const ROOM_SLOT: usize = 3 << 20;
+    /// Slots of that stack: layer 2's card slots in the tail clauses.
+    const ROOM_SLOTS: usize = 8;
+
+    /// A stack room standing for layer 2's stacks in the clause that gives
+    /// pages back: [`ROOM_SLOTS`] slots of [`ROOM_SLOT`] bytes, every page
+    /// backed, slot `s` holding the word `s + 1` throughout. The machine's
+    /// copies run against [`Stacks`], so the room's bytes are the clause's
+    /// own: what the machine's calls give back and back again.
+    struct PageRooms {
+        room: StackRoom,
+        view: Mutex<Option<DeviceBuffer<u32>>>,
+    }
+
+    impl std::fmt::Debug for PageRooms {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("PageRooms")
+        }
+    }
+
+    impl PageRooms {
+        fn new(gpu: &Gpu) -> Result<PageRooms, GateError> {
+            let words = ROOM_SLOT / 4;
+            let (mut view, room) = StackRoom::new(
+                gpu.stream_handle(),
+                ROOM_SLOTS * words,
+                "gate_swap's page room",
+            )?;
+            for s in 0..ROOM_SLOTS {
+                WindowMut::<u32>::of_mut(&mut view, s * ROOM_SLOT, words)?
+                    .copy_from_host(gpu.stream(), &vec![s as u32 + 1; words])?;
+            }
+            gpu.stream().synchronize()?;
+            Ok(PageRooms {
+                room,
+                view: Mutex::new(Some(view)),
+            })
+        }
+
+        /// Slot `s`'s words, read on the engine stream.
+        fn slot(&self, gpu: &Gpu, s: usize) -> Result<Vec<u32>, GateError> {
+            let held = self.view.lock().unwrap_or_else(PoisonError::into_inner);
+            let view = held
+                .as_ref()
+                .ok_or("gate_swap: the page room's view is gone")?;
+            Ok(Window::<u32>::of(view, s * ROOM_SLOT, ROOM_SLOT / 4)?.to_host_vec(gpu.stream())?)
+        }
+
+        /// Whether slots `0..upto` read back their own words.
+        fn intact(&self, gpu: &Gpu, upto: usize) -> Result<bool, GateError> {
+            for s in 0..upto {
+                if self.slot(gpu, s)? != vec![s as u32 + 1; ROOM_SLOT / 4] {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+    }
+
+    impl Drop for PageRooms {
+        fn drop(&mut self) {
+            // The view is taken apart without a free before the room drops.
+            let held = self.view.get_mut().unwrap_or_else(PoisonError::into_inner);
+            if let Some(view) = held.take() {
+                drop(view.into_raw_parts());
+            }
         }
     }
 
@@ -5170,7 +5295,9 @@ mod gate {
         ];
         let packed = released.victims == vec![5, 6]
             && released.moves == vec![(7, 7, 5)]
-            && released.withdrawn == 6..8 && row == want && withdrawn == 2;
+            && released.withdrawn == (6..8)
+            && row == want
+            && withdrawn == 2;
         let map = r.slots.slot(l, 7) == Some(Slot::Card(5))
             && r.slots.slot(l, 5) == Some(Slot::Host)
             && r.slots.slot(l, 6) == Some(Slot::Host);
@@ -5250,7 +5377,8 @@ mod gate {
         ];
         let packed = released.victims == vec![4, 5]
             && released.moves == vec![(6, 6, 4)]
-            && released.withdrawn == 6..8 && row == want;
+            && released.withdrawn == (6..8)
+            && row == want;
         drive(gpu, &mut r, &trace, 9..17, Copies::Prompt, Hold::None)?;
         let m = r.machine.as_mut().ok_or("gate_swap: no machine")?;
         let row: Vec<SlotState> = m.ledger().row(l).unwrap_or(&[]).to_vec();
@@ -5462,6 +5590,80 @@ mod gate {
              named {none_named}; the reset copies {} (want 2: the freed 5 and the restored 6) \
              back at the seed {reseeded}; a flip after it admitted into 7 {into7} {}",
             rep.copies,
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// tail pages: layer 2 at 8 slots, pinned 1, every pass routing 0, 1, 2, 3, over a source whose
+    /// layer-2 stacks are a page room (8 slots of 3 MiB, every page backed, slot `s` holding the
+    /// word `s + 1`). `release_tail(2)` reports bytes freed equal to the pages wholly at or past
+    /// slot 6 (derived here from the page and the slot), the device's free bytes grow by at least
+    /// that, the room holds exactly the pages below, slots 0..6 read back their words, and every
+    /// boundary after it records `withdrawn_bytes` of the same count. `restore_tail(1)` twice
+    /// backs the pages of slot 6 and then of slot 7 and no others; after the reset's drain slot 7
+    /// reads zero, the slots below still their words, and no byte is withdrawn. Its mutants: the
+    /// machine's call to give the pages back skipped (nothing freed); the restore's call to back
+    /// them skipped (the room stays short).
+    fn tail_pages(gpu: &Gpu, pm: &probe_kernels::LoadedModule) -> Result<bool, GateError> {
+        let page = gpu.allocation_granularity()?;
+        let pages = (ROOM_SLOTS * ROOM_SLOT).div_ceil(page);
+        let below = |slot: usize| (slot * ROOM_SLOT).div_ceil(page);
+        let (line, gone) = (6usize, (pages - below(6)) * page);
+        let rooms = Arc::new(PageRooms::new(gpu)?);
+        let warm = [0u32, 1, 2, 3];
+        let rows: Vec<&[u32]> = (0..12).map(|_| &warm[..]).collect();
+        let trace = tail_trace(&rows);
+        let faults = Faults {
+            rooms: Some(Arc::clone(&rooms)),
+            ..Faults::default()
+        };
+        let mut r = start(gpu, pm, map_with(8)?, faults, cfg_pin(DELAY, 1))?;
+        drive(gpu, &mut r, &trace, 0..9, Copies::Prompt, Hold::None)?;
+        let l = LAYERS.start;
+        let stream = gpu.stream();
+        let (free0, _) = gpu.mem_info()?;
+        let m = r.machine.as_mut().ok_or("gate_swap: no machine")?;
+        let released = m.release_tail(stream, &mut r.slots, l, 2)?;
+        let (free1, _) = gpu.mem_info()?;
+        let freed = gone > 0 && released.freed_bytes == gone as u64;
+        let grew = free1 >= free0 + gone;
+        let given = rooms.room.backed()? == pages * page - gone
+            && rooms.room.released() == gone as u64
+            && rooms.intact(gpu, line)?;
+        drive(gpu, &mut r, &trace, 9..12, Copies::Prompt, Hold::None)?;
+        let reported = r.reports.len() >= 10
+            && r.reports[9..]
+                .iter()
+                .all(|p| p.withdrawn_bytes == gone as u64);
+        if let Some(p) = r.reports.get(9) {
+            record::residency_pass(p).print();
+        }
+        let m = r.machine.as_mut().ok_or("gate_swap: no machine")?;
+        m.restore_tail(l, 1)?;
+        let after_one = pages.min(below(line).max((7 * ROOM_SLOT).div_ceil(page)));
+        let one = rooms.room.backed()? == after_one * page
+            && rooms.room.released() == ((pages - after_one) * page) as u64;
+        m.restore_tail(l, 1)?;
+        let whole = rooms.room.backed()? == pages * page && rooms.room.released() == 0;
+        m.reset(stream, &mut r.slots)?;
+        let zeroed = rooms.slot(gpu, 7)? == vec![0u32; ROOM_SLOT / 4] && rooms.intact(gpu, line)?;
+        let unbroken = r.err.is_none()
+            && r.machine
+                .as_ref()
+                .is_some_and(|m| m.broken().is_none() && m.ledger().withdrawn(l) == 0);
+        let ok = freed && grew && given && reported && one && whole && zeroed && unbroken;
+        println!(
+            "tail pages: release_tail(2) freed {} B (want the {gone} B of the pages past slot \
+             {line}, page {page} B) {freed}; the device's free bytes {free0} -> {free1} {grew}; the \
+             room holds the {} B below and slots 0..{line} read back {given}; the boundaries after \
+             it record withdrawn_bytes {} {reported}; a restore of 1 backed the pages of slot 6 \
+             alone ({after_one} of {pages} pages) {one}; a second the rest {whole}; after the \
+             reset's drain slot 7 reads zero and the slots below their words {zeroed}; machine \
+             unbroken {unbroken} {}",
+            released.freed_bytes,
+            pages * page - gone,
+            r.reports.get(9).map_or(u64::MAX, |p| p.withdrawn_bytes),
             verdict(ok)
         );
         Ok(ok)
@@ -5771,6 +5973,7 @@ mod gate {
         ok &= tail_withdrawn(&gpu, &pm)?;
         ok &= tail_floors(&gpu, &pm)?;
         ok &= tail_restore(&gpu, &pm)?;
+        ok &= tail_pages(&gpu, &pm)?;
         drop((a, b, h));
         let all: Vec<LeakReason> = leaks()?.iter().map(|l| l.reason).collect();
         let only_stall = all == [LeakReason::Join];

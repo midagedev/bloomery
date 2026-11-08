@@ -53,7 +53,7 @@ use crate::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap};
 use crate::parts::PartsRead;
 use crate::watchdog;
-use crate::weights::{CardOf, HEAD_TENSOR, Weights, head_tensor};
+use crate::weights::{CardOf, HEAD_TENSOR, StackRooms, Weights, head_tensor};
 use crate::{Gpu, GpuError, Graph, NodeInfo};
 use bloomery_levers::{ChurnHosting, HostCfg, NvTierMem};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
@@ -68,6 +68,7 @@ use model::placement::workstation::{self, ArenaGrant, HostNeed};
 use model::placement::{ArenaFloor, ExpertList, HeadSite, Plan};
 use model::r8file::R8Source;
 use runtime::costs::Store;
+use std::collections::BTreeSet;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
@@ -831,7 +832,8 @@ impl<B: ChainBody> GpuModel<B> {
         derive: impl FnOnce(&CudaStream, &Split, Range<usize>, &mut Weights) -> Result<(), GpuError>,
         body: impl FnOnce(&Gpu, Split, &Weights, HostResidency) -> Result<B, GpuError>,
     ) -> Result<GpuModel<B>, GpuError> {
-        let (p, residency) = placed_pre(&file, bytes, plan, card, host, (&[], 0), &[], derive)?;
+        let (p, residency) =
+            placed_pre(&file, bytes, plan, card, host, (&[], 0), &[], None, derive)?;
         let t_body = Instant::now();
         let body = body(&p.gpu, file, &p.weights, residency)?;
         placed_done(p, body, t_body.elapsed())
@@ -960,7 +962,19 @@ impl<B: ChainBody> GpuModel<B> {
             (&joined[..], pool.1 + hosted.1)
         };
         let file = Arc::new(file);
-        let (p, set) = placed_pre(&file, bytes, plan, card, host, extra, known, derive)?;
+        // Under a residency machine, the card's routed stacks the file's blocks fill are rooms
+        // (`StackRoom`), so a released tail gives its pages back; a load whose card bytes come
+        // from a part source keeps plain buffers.
+        let rooms = match (&residency.lever, &bytes) {
+            (Residency::Mid { .. }, CardBytes::File) => plan.machine.cards.get(card).map(|spec| {
+                spec.layers
+                    .clone()
+                    .flat_map(|l| residency.stacks.names(l))
+                    .collect::<BTreeSet<String>>()
+            }),
+            _ => None,
+        };
+        let (p, set) = placed_pre(&file, bytes, plan, card, host, extra, known, rooms, derive)?;
         let t_body = Instant::now();
         let glue = match residency.lever {
             Residency::Off => ResidencyGlue::off(),
@@ -2705,7 +2719,7 @@ pub trait PartsLoad: Send {
 /// once ([`HostNeed::read_room`]).
 #[allow(
     clippy::too_many_arguments,
-    reason = "the load's file and where its card bytes come from, its plan and card, the host's levers, the extra and known host runs, and the derive (rust-quality R8)"
+    reason = "the load's file and where its card bytes come from, its plan and card, the host's levers, the extra and known host runs, the stacks held as rooms and the derive (rust-quality R8)"
 )]
 fn placed_pre(
     file: &Split,
@@ -2715,6 +2729,7 @@ fn placed_pre(
     host: HostCfg,
     extra: (&[(usize, ExpertList)], u64),
     known: &[(usize, ExpertList)],
+    rooms: Option<BTreeSet<String>>,
     derive: impl FnOnce(&CudaStream, &Split, Range<usize>, &mut Weights) -> Result<(), GpuError>,
 ) -> Result<(PlacedPre, HostResidency), GpuError> {
     let what = "GpuModel::load_placed";
@@ -2761,10 +2776,18 @@ fn placed_pre(
         let context = t.elapsed();
         let t = Instant::now();
         let (mut weights, read) = match bytes {
-            CardBytes::File => (
-                Weights::load_placed(gpu.stream(), file, plan, card, host.card_dontneed)?,
-                None,
-            ),
+            CardBytes::File => {
+                let rooms = rooms.map(|names| StackRooms::new(names, gpu.stream_handle()));
+                let w = Weights::load_placed_rooms(
+                    gpu.stream(),
+                    file,
+                    plan,
+                    card,
+                    host.card_dontneed,
+                    rooms.as_ref(),
+                )?;
+                (w, None)
+            }
             CardBytes::Parts(parts) => {
                 let (w, read) = parts.load(gpu.stream(), plan, card, host.card_dontneed, room)?;
                 (w, Some(read))

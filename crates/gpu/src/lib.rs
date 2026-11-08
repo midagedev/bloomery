@@ -131,7 +131,7 @@ pub use graph::{
     op_write,
 };
 pub use model::{GpuModel, Slots};
-pub use room::SharedPages;
+pub use room::{SharedPages, StackRoom};
 pub use watchdog::Busy as EngineBusy;
 /// The engine over the DeepSeek-V2-Lite chain — what `GpuModel` alone named
 /// before the skeleton became generic over its architecture.
@@ -281,10 +281,17 @@ pub enum GpuError {
     /// still asked, the page it was backing among the room's, the pages
     /// the room had backed, and the device's free bytes then (or why they
     /// could not be read); `source` the driver's own refusal of the page.
+    /// `asked` is the bytes of new pages the failing room still asked,
+    /// `free` the device's free bytes then (when they could be read) and
+    /// `page` the room's page: the numbers a caller that can free bytes
+    /// takes the shortfall from.
     NoRoom {
         what: &'static str,
         detail: String,
         source: Box<GpuError>,
+        asked: usize,
+        free: Option<usize>,
+        page: usize,
     },
 }
 
@@ -304,6 +311,31 @@ impl GpuError {
             what,
             name: name.into(),
             need,
+        }
+    }
+
+    /// A [`GpuError::NoRoom`] with `note` added to its detail: what a caller
+    /// that tried to free card bytes and still ran out says of the attempt.
+    /// Any other error is returned as it is.
+    #[must_use]
+    pub(crate) fn noting_room(self, note: impl std::fmt::Display) -> GpuError {
+        match self {
+            GpuError::NoRoom {
+                what,
+                detail,
+                source,
+                asked,
+                free,
+                page,
+            } => GpuError::NoRoom {
+                what,
+                detail: format!("{detail}; {note}"),
+                source,
+                asked,
+                free,
+                page,
+            },
+            other => other,
         }
     }
 
@@ -607,6 +639,7 @@ impl std::fmt::Display for GpuError {
                 what,
                 detail,
                 source,
+                ..
             } => write!(f, "{what}: {detail}: {source}"),
             GpuError::Stalled {
                 what,

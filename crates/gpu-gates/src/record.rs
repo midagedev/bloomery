@@ -1374,7 +1374,9 @@ pub static RESIDENCY_PASS: Kind = Kind {
           served from the file so far; and, when a prompt call ended in the pass before the boundary, the \
           flips it picked (its admits over every layer and unit of the call); and the slots \
           withdrawn over the machine's layers at the boundary: the tail releases less the \
-          restores, per layer in the slot ledger. Older records omit the withdrawn count.",
+          restores, per layer in the slot ledger, and the device bytes the layers' stacks have \
+          given back and not had backed again (withdrawn_bytes). Older records omit the \
+          withdrawn count and the withdrawn bytes.",
     parts: &[
         key("pass", Word, ""),
         key("boundary", U64, ""),
@@ -1400,6 +1402,7 @@ pub static RESIDENCY_PASS: Kind = Kind {
         opt("faulting_first", Csv, ""),
         opt("picked", U64, ""),
         opt("withdrawn", U64, ""),
+        opt("withdrawn_bytes", U64, "B"),
     ],
 };
 
@@ -4457,12 +4460,13 @@ pub fn residency_pass_of(kind: PassKind, r: &PassReport) -> Record {
         .u("unresident", r.unresident.count())
         .csv("unresident_last", r.unresident.last().map(|u| u.mark()))
         .u("faulting", r.faulting.count())
-        .csv("faulting_first", r.faulting.first().map(|f| f.mark()))
-        .u("withdrawn", r.withdrawn);
-    match r.picked {
+        .csv("faulting_first", r.faulting.first().map(|f| f.mark()));
+    let rec = match r.picked {
         Some(picked) => rec.u("picked", picked),
         None => rec,
-    }
+    };
+    rec.u("withdrawn", r.withdrawn)
+        .u("withdrawn_bytes", r.withdrawn_bytes)
 }
 
 /// A helper thread's record: `name`, where it asked to run, the cpu it is

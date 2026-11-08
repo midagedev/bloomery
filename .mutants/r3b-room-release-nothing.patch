@@ -1,0 +1,17 @@
+# r3b mutant room-release-nothing
+# clause: the stack room's release (crates/gpu/src/room.rs, the hw test
+#   hw_held_a_stack_room_gives_back_the_pages_past_a_slot in the same file's tests): release_from frees
+#   nothing, so tail_bytes stays above 0 after a release, the freed bytes and the device's free bytes
+#   do not grow and the backed bytes stay the whole stack's. Red there; the gate_swap tail_pages clause
+#   and the residency kvfloor clause see no freed bytes either.
+--- a/crates/gpu/src/room.rs
++++ b/crates/gpu/src/room.rs
+@@ -412,7 +412,7 @@
+         let give: Vec<usize> = (byte.div_ceil(self.page)..self.pages.len())
+             .filter(|&i| self.own(i).is_some())
+             .collect();
+-        if give.is_empty() {
++        if give.is_empty() || byte < usize::MAX {
+             return Ok(0);
+         }
+         self.stream.context().bind_to_thread()?;

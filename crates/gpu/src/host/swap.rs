@@ -502,6 +502,48 @@ pub trait SwapSource: Send + Sync {
     /// by then. A lane has no read of it open: the landing follows its
     /// copy's staging.
     fn release_host(&self, layer: usize, id: u32) -> Result<u64, GpuError>;
+
+    /// The device bytes [`SwapSource::release_stacks`]`(layer, from)` would
+    /// give back: the pages of layer `layer`'s stacks that lie wholly at or
+    /// past slot `from` and hold memory. 0 by default, and for a source
+    /// whose stacks are plain buffers.
+    fn stack_tail_bytes(&self, layer: usize, from: usize) -> Result<u64, GpuError> {
+        let _ = (layer, from);
+        Ok(0)
+    }
+
+    /// Give back the device memory of the pages of layer `layer`'s stacks
+    /// that lie wholly at or past slot `from`: the device bytes freed. The
+    /// machine calls it after the copies that moved the layer's live experts
+    /// out of those slots have landed and no kernel launched after them
+    /// reads those slots (they are [`SlotState::Withdrawn`]); nothing reads
+    /// or writes them until [`SwapSource::restore_stacks`]. Nothing by
+    /// default: the stacks are plain buffers.
+    fn release_stacks(&self, layer: usize, from: usize) -> Result<u64, GpuError> {
+        let _ = (layer, from);
+        Ok(0)
+    }
+
+    /// Back again, zeroed on `stream` in stream order, every page of layer
+    /// `layer`'s stacks that holds a byte of slots `from..to` and gave its
+    /// memory back: the device bytes backed. Nothing by default.
+    fn restore_stacks(
+        &self,
+        layer: usize,
+        from: usize,
+        to: usize,
+        stream: &CudaStream,
+    ) -> Result<u64, GpuError> {
+        let _ = (layer, from, to, stream);
+        Ok(0)
+    }
+
+    /// The device bytes layer `layer`'s stacks have given back and not had
+    /// backed again. 0 by default.
+    fn released_bytes(&self, layer: usize) -> u64 {
+        let _ = layer;
+        0
+    }
 }
 
 // ------------------------------------------------------------------ tally
@@ -612,6 +654,17 @@ impl Tally {
 }
 
 // ----------------------------------------------------------------- ledger
+
+/// One tail release's rule outcome for [`SwapMachine::withdraw`]: the top
+/// `k` slots of `layer` withdrawn, `live` the layer's `(slot, id)` pairs,
+/// `victims` the rule's coldest-first ids, `event` the pack's copy event.
+struct Withdrawal<'a> {
+    layer: usize,
+    k: usize,
+    live: &'a [(u32, u32)],
+    victims: &'a [u32],
+    event: usize,
+}
 
 /// One card slot of one layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1377,6 +1430,9 @@ pub struct PassReport {
     /// releases since the load less the restores, per layer in the ledger
     /// ([`SlotLedger::withdrawn`]).
     pub withdrawn: usize,
+    /// The device bytes the stacks of the machine's layers have given back
+    /// and not had backed again at this boundary ([`SwapSource::released_bytes`]).
+    pub withdrawn_bytes: u64,
 }
 
 /// Where a residency boundary runs in the engine's pass order, with the
@@ -1645,12 +1701,25 @@ pub struct ResetReport {
 
 /// What one tail release did ([`SwapMachine::release_tail`]): the victims'
 /// ids, coldest first (the rule's order), the pack's moves each
-/// `(id, from, to)`, and the withdrawn slot range.
+/// `(id, from, to)`, the withdrawn slot range, and the device bytes the
+/// layer's stacks gave back ([`SwapSource::release_stacks`]; every page of the
+/// tail that held memory, 0 for plain stacks).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Released {
     pub victims: Vec<u32>,
     pub moves: Vec<(u32, u32, u32)>,
     pub withdrawn: Range<usize>,
+    pub freed_bytes: u64,
+}
+
+/// What [`SwapMachine::free_bytes`] did: the `k` slots released on every
+/// machine layer that has stacks, the device bytes that gave back in all, and
+/// each layer's release.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Freed {
+    pub k: usize,
+    pub bytes: u64,
+    pub layers: Vec<(usize, Released)>,
 }
 
 /// What a prompt call asks of the machine ([`SwapMachine::begin_call`]).
@@ -2652,6 +2721,11 @@ impl SwapMachine {
         (report.rereads, report.reread_bytes, report.reread_us) = self.rereads.take();
         report.unresident = std::mem::take(&mut self.unresident);
         report.withdrawn = self.layers.clone().map(|l| self.ledger.withdrawn(l)).sum();
+        report.withdrawn_bytes = self
+            .layers
+            .clone()
+            .map(|l| self.shared.source.released_bytes(l))
+            .sum();
         self.planned = Some(b);
         self.mirror_landing();
         report.boundary_us = micros(start);
@@ -3108,9 +3182,10 @@ impl SwapMachine {
                 self.moved.0 += bytes as u64;
             }
         }
-        let r = self.write_words(&self.changed, stream);
-        if r.is_ok() {
-            self.changed.clear();
+        let changed = std::mem::take(&mut self.changed);
+        let r = self.write_words(&changed, stream);
+        if r.is_err() {
+            self.changed = changed;
         }
         r
     }
@@ -3358,6 +3433,97 @@ impl SwapMachine {
         Ok(())
     }
 
+    /// The refusals of a release of layer `layer`'s top `k` slots, as `what`
+    /// makes them, with the machine unchanged: the layer's rule index and its
+    /// live `(slot, id)` pairs when the release may run
+    /// ([`SwapMachine::release_tail`] names each refusal).
+    fn tail_checked(
+        &self,
+        layer: usize,
+        k: usize,
+        what: &'static str,
+    ) -> Result<(usize, Vec<(u32, u32)>), GpuError> {
+        self.refuse_if_broken(what)?;
+        if self.call.is_some() {
+            return Err(GpuError::state(
+                what,
+                "a prompt call is open: retry at the next boundary, after end_call",
+            ));
+        }
+        let l = self.rule_layer(layer, what)?;
+        let row = self.ledger.row(layer).unwrap_or(&[]);
+        if self.shared.source.part_bytes(layer).is_empty() || row.is_empty() {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "layer {layer}: the machine takes no part in it (no expert parts or no card \
+                     slot)"
+                ),
+            ));
+        }
+        if k == 0 {
+            return Err(GpuError::shape(
+                what,
+                "a k of 0: name the slots to withdraw",
+            ));
+        }
+        let live: Vec<(u32, u32)> = row
+            .iter()
+            .enumerate()
+            .filter_map(|(s, &st)| match st {
+                SlotState::Live(e) => Some((s as u32, e)),
+                _ => None,
+            })
+            .collect();
+        let pinned = self.pinned(layer)?;
+        if live.len() < k + pinned + 1 {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "layer {layer}: {k} of {} live would leave {}, under the floor of {pinned} \
+                     pinned + 1 live: the machine holds a layer at pinned + spares + 1 slots",
+                    live.len(),
+                    live.len().saturating_sub(k)
+                ),
+            ));
+        }
+        if let Some((s, st)) = row.iter().enumerate().find(|(_, st)| {
+            !matches!(
+                st,
+                SlotState::Live(_) | SlotState::Spare | SlotState::Withdrawn
+            )
+        }) {
+            return Err(GpuError::protocol(
+                what,
+                format!(
+                    "layer {layer}: slot {s} is {st:?}, a flip or a call's move in flight: retry \
+                     at the next boundary"
+                ),
+            ));
+        }
+        let withdrawn = self.ledger.withdrawn(layer);
+        let cap = row.len() - withdrawn;
+        if row[cap..]
+            .iter()
+            .any(|s| !matches!(s, SlotState::Withdrawn))
+        {
+            return Err(GpuError::protocol(
+                what,
+                format!(
+                    "layer {layer}: its withdrawn slots are not its top {withdrawn}, so the \
+                     ledger is out of step"
+                ),
+            ));
+        }
+        if self.free.is_empty() {
+            return Err(GpuError::protocol(
+                what,
+                "every copy event held by a flip in flight: retry at the next boundary",
+            ));
+        }
+        Ok((l, live))
+    }
+
     /// Layer `layer`'s top `k` slots off the machine: the `k` coldest of its
     /// live experts — the rule's own victim order, the live streams' blended
     /// heat, fewest uses first then the lower id, pinned never one
@@ -3370,7 +3536,10 @@ impl SwapMachine {
     /// entry names them, no flip, pick, reset, reseed or return fills them,
     /// and the layer's capacity, as every path but
     /// [`SwapMachine::restore_tail`] reads it, is `k` less — the rule's card
-    /// set bound and reset target with it ([`SwapRule::take`]).
+    /// set bound and reset target with it ([`SwapRule::take`]). Once the pack's
+    /// copies have landed the layer's stacks give back the pages wholly at or
+    /// past the line ([`SwapSource::release_stacks`]), counted in
+    /// [`Released::freed_bytes`].
     ///
     /// The floor is the one [`SwapMachine::new`] holds, `pinned + spares + 1`
     /// slots: the release leaves the layer's spare slots as many as it found
@@ -3395,91 +3564,21 @@ impl SwapMachine {
         k: usize,
     ) -> Result<Released, GpuError> {
         const WHAT: &str = "SwapMachine::release_tail";
-        self.refuse_if_broken(WHAT)?;
-        if self.call.is_some() {
-            return Err(GpuError::state(
-                WHAT,
-                "a prompt call is open: retry at the next boundary, after end_call",
-            ));
-        }
-        let l = self.rule_layer(layer, WHAT)?;
-        let row = self.ledger.row(layer).unwrap_or(&[]);
-        if self.shared.source.part_bytes(layer).is_empty() || row.is_empty() {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "layer {layer}: the machine takes no part in it (no expert parts or no card \
-                     slot)"
-                ),
-            ));
-        }
-        if k == 0 {
-            return Err(GpuError::shape(
-                WHAT,
-                "a k of 0: name the slots to withdraw",
-            ));
-        }
-        let live: Vec<(u32, u32)> = row
-            .iter()
-            .enumerate()
-            .filter_map(|(s, &st)| match st {
-                SlotState::Live(e) => Some((s as u32, e)),
-                _ => None,
-            })
-            .collect();
-        let pinned = self.pinned(layer)?;
-        if live.len() < k + pinned + 1 {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "layer {layer}: {k} of {} live would leave {}, under the floor of {pinned} \
-                     pinned + 1 live: the machine holds a layer at pinned + spares + 1 slots",
-                    live.len(),
-                    live.len().saturating_sub(k)
-                ),
-            ));
-        }
-        if let Some((s, st)) = row.iter().enumerate().find(|(_, st)| {
-            !matches!(
-                st,
-                SlotState::Live(_) | SlotState::Spare | SlotState::Withdrawn
-            )
-        }) {
-            return Err(GpuError::protocol(
-                WHAT,
-                format!(
-                    "layer {layer}: slot {s} is {st:?}, a flip or a call's move in flight: retry \
-                     at the next boundary"
-                ),
-            ));
-        }
-        let withdrawn = self.ledger.withdrawn(layer);
-        let cap = row.len() - withdrawn;
-        if row[cap..]
-            .iter()
-            .any(|s| !matches!(s, SlotState::Withdrawn))
-        {
-            return Err(GpuError::protocol(
-                WHAT,
-                format!(
-                    "layer {layer}: its withdrawn slots are not its top {withdrawn}, so the \
-                     ledger is out of step"
-                ),
-            ));
-        }
-        if self.free.is_empty() {
-            return Err(GpuError::protocol(
-                WHAT,
-                "every copy event held by a flip in flight: retry at the next boundary",
-            ));
-        }
+        let (l, live) = self.tail_checked(layer, k, WHAT)?;
         let victims = self.rule.coldest(l, k).map_err(|e| rule_err(WHAT, e))?;
         self.rule.take(l, &victims).map_err(|e| rule_err(WHAT, e))?;
         let event = self
             .free
             .pop()
             .expect("the refusal above holds an event free");
-        let r = self.withdraw(layer, k, &live, &victims, event, stream, slots);
+        let w = Withdrawal {
+            layer,
+            k,
+            live: &live,
+            victims: &victims,
+            event,
+        };
+        let r = self.withdraw(w, stream, slots);
         match self.after_change(r, || format!("the tail release of layer {layer}")) {
             Ok(out) => {
                 self.free.push(event);
@@ -3494,19 +3593,20 @@ impl SwapMachine {
     /// recorded after those words, the pack's device copies behind it, the
     /// engine stream's wait for the pack's event, then the movers' words,
     /// the host map and the ledger — the freed slots the pack leaves
-    /// `Spare`, the top `k` `Withdrawn`. `live` is the layer's `(slot, id)`
-    /// pairs, `victims` the rule's coldest-first ids, `event` the pack's
-    /// copy event.
+    /// `Spare`, the top `k` `Withdrawn` ([`Withdrawal`]).
     fn withdraw(
         &mut self,
-        layer: usize,
-        k: usize,
-        live: &[(u32, u32)],
-        victims: &[u32],
-        event: usize,
+        w: Withdrawal<'_>,
         stream: &CudaStream,
         slots: &mut SlotMap,
     ) -> Result<Released, GpuError> {
+        let Withdrawal {
+            layer,
+            k,
+            live,
+            victims,
+            event,
+        } = w;
         const WHAT: &str = "SwapMachine::release_tail";
         let cap =
             self.ledger.row(layer).map_or(0, <[SlotState]>::len) - self.ledger.withdrawn(layer);
@@ -3626,16 +3726,110 @@ impl SwapMachine {
             for &s in &freed[moves.len()..] {
                 row[s as usize] = SlotState::Spare;
             }
-            for s in (cap - k)..cap {
-                row[s] = SlotState::Withdrawn;
-            }
+            row[cap - k..cap].fill(SlotState::Withdrawn);
         }
         self.agree(layer, slots, WHAT)?;
+        // The pack's copies have landed once the copy stream drains, and so has every
+        // engine launch before the boundary event the copy stream waited for; no launch
+        // after the victims' words names a slot at or past the line, so the pages wholly
+        // past it give their memory back.
+        let from = cap - k;
+        let freed_bytes = if source.stack_tail_bytes(layer, from)? > 0 {
+            self.drain_copies(WHAT)?;
+            source.release_stacks(layer, from)?
+        } else {
+            0
+        };
         Ok(Released {
             victims: victims.to_vec(),
             moves,
-            withdrawn: (cap - k)..cap,
+            withdrawn: from..cap,
+            freed_bytes,
         })
+    }
+
+    /// The same top `k` slots off every layer of the machine that holds
+    /// stage stacks ([`SwapMachine::release_tail`] on each), the smallest `k`
+    /// whose stacks give back at least `bytes` device bytes
+    /// ([`SwapSource::stack_tail_bytes`] over each layer's slots from its
+    /// capacity less `k`): the bytes a caller short of card memory asks for.
+    /// Refused by name, the machine unchanged: a broken machine, `bytes` of
+    /// 0, a machine with no layer of stacks, no `k` within the floor
+    /// (`pinned + 1` live on every layer) that reaches `bytes` — the refusal
+    /// names the most the floor allows — and every refusal the release of a
+    /// layer makes at that `k`, all checked before the first layer moves. An
+    /// error while the layers release (the machine breaks, as the release's
+    /// own) leaves the layers released before it released.
+    pub fn free_bytes(
+        &mut self,
+        stream: &CudaStream,
+        slots: &mut SlotMap,
+        bytes: u64,
+    ) -> Result<Freed, GpuError> {
+        const WHAT: &str = "SwapMachine::free_bytes";
+        self.refuse_if_broken(WHAT)?;
+        if bytes == 0 {
+            return Err(GpuError::shape(WHAT, "0 bytes: name the bytes to free"));
+        }
+        let source = Arc::clone(&self.shared.source);
+        let held: Vec<usize> = self
+            .layers
+            .clone()
+            .filter(|&l| {
+                !source.part_bytes(l).is_empty()
+                    && self.ledger.row(l).is_some_and(|r| !r.is_empty())
+            })
+            .collect();
+        if held.is_empty() {
+            return Err(GpuError::shape(
+                WHAT,
+                "no layer of the machine holds stage stacks",
+            ));
+        }
+        let mut most = usize::MAX;
+        for &l in &held {
+            let live = self.ledger.row(l).map_or(0, |row| {
+                row.iter()
+                    .filter(|s| matches!(s, SlotState::Live(_)))
+                    .count()
+            });
+            most = most.min(live.saturating_sub(self.pinned(l)? + 1));
+        }
+        let mut freed = 0u64;
+        let mut found = None;
+        for k in 1..=most {
+            freed = 0;
+            for &l in &held {
+                let row = self.ledger.row(l).map_or(0, <[SlotState]>::len);
+                freed += source.stack_tail_bytes(l, row - self.ledger.withdrawn(l) - k)?;
+            }
+            if freed >= bytes {
+                found = Some(k);
+                break;
+            }
+        }
+        let Some(k) = found else {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "{bytes} B to free: the floor of pinned + 1 live on every layer allows {most} \
+                     slots a layer, which give back {freed} B"
+                ),
+            ));
+        };
+        for &l in &held {
+            self.tail_checked(l, k, WHAT)?;
+        }
+        let mut out = Freed {
+            k,
+            ..Freed::default()
+        };
+        for &l in &held {
+            let r = self.release_tail(stream, slots, l, k)?;
+            out.bytes += r.freed_bytes;
+            out.layers.push((l, r));
+        }
+        Ok(out)
     }
 
     /// The lowest `k` withdrawn slots of layer `layer` — the ones nearest
@@ -3647,7 +3841,10 @@ impl SwapMachine {
     /// Refused by name, the machine unchanged: a broken machine, a prompt
     /// call open, `k` of 0, a layer outside the map or one the machine takes
     /// no part in, fewer than `k` withdrawn slots, and a slot of the
-    /// withdrawn tail that is not `Withdrawn`.
+    /// withdrawn tail that is not `Withdrawn`. The pages those slots lie on
+    /// that gave their memory back are backed again first, zeroed on the copy
+    /// stream ([`SwapSource::restore_stacks`]): a failure to back them leaves
+    /// the rule and the ledger as they were, the pages backed so far backed.
     pub fn restore_tail(&mut self, layer: usize, k: usize) -> Result<(), GpuError> {
         const WHAT: &str = "SwapMachine::restore_tail";
         self.refuse_if_broken(WHAT)?;
@@ -3684,6 +3881,11 @@ impl SwapMachine {
                 ),
             ));
         }
+        // The pages first, zeroed on the copy stream ahead of any fill of the slots: a
+        // refusal to back them leaves the rule and the ledger as they were.
+        self.shared
+            .source
+            .restore_stacks(layer, at, at + k, &self.copy)?;
         self.rule.give(l, k).map_err(|e| rule_err(WHAT, e))?;
         for st in &mut self.ledger.row_mut(layer)[at..at + k] {
             *st = SlotState::Spare;

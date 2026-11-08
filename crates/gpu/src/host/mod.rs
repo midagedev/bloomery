@@ -2001,6 +2001,45 @@ impl<H: HostExperts> HostTier<H> {
         self.swap_relayout(stream, None)
     }
 
+    /// At least `bytes` device bytes of the stage card's expert stacks given
+    /// back, on `stream` once its work has drained
+    /// ([`swap::SwapMachine::free_bytes`]): the same top slots off every
+    /// machine layer, the per-layer report. Refused by name, the machine
+    /// unchanged, when the load runs no machine, and as the machine refuses.
+    pub fn swap_free_bytes(
+        &mut self,
+        stream: &CudaStream,
+        bytes: u64,
+    ) -> Result<swap::Freed, GpuError> {
+        const WHAT: &str = "HostTier::swap_free_bytes";
+        let Some(m) = self.swap.as_mut() else {
+            return Err(GpuError::state(
+                WHAT,
+                "a residency machine: the load runs none, so no expert stack gives bytes back",
+            ));
+        };
+        drain_within(
+            stream,
+            m.deadline(),
+            "HostTier::swap_free_bytes: the engine stream before the release",
+        )?;
+        m.free_bytes(stream, &mut self.slots, bytes)
+    }
+
+    /// The lowest `k` withdrawn slots of layer `layer` restored
+    /// ([`swap::SwapMachine::restore_tail`]): their pages backed again, the
+    /// layer's capacity `k` more. Refused by name, the machine unchanged,
+    /// when the load runs no machine, and as the machine refuses.
+    pub fn swap_restore_tail(&mut self, layer: usize, k: usize) -> Result<(), GpuError> {
+        let Some(m) = self.swap.as_mut() else {
+            return Err(GpuError::state(
+                "HostTier::swap_restore_tail",
+                "a residency machine: the load runs none, so no slot is withdrawn",
+            ));
+        };
+        m.restore_tail(layer, k)
+    }
+
     /// [`HostTier::swap_reset`] to a new seed, `order[i]` the ranking of the
     /// machine's `i`-th layer ([`swap::SwapMachine::reseed`]).
     pub fn swap_reseed(

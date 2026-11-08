@@ -1178,11 +1178,14 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               `ctx_max` itself — today's plan. Only a load whose stores hold their rows in \
               rooms reads it: every other family's binary and file refuses it by name. A floor \
               above the context of a plan made under it is refused by name, and nothing clamps \
-              it. Until the residency machine frees card bytes for a growing sequence \
-              (the demote-for-bytes round), a load at a floor below its context can run out of \
-              card memory when a sequence grows past the floor; that failure is the room fit's \
-              named refusal (the store, the bytes the fit asked, the device's free bytes). The \
-              `plan` line prints `kv_floor=` beside `ctx_max=`.",
+              it. A sequence that grows past the floor's bytes with a residency machine \
+              running (`BLOOMERY_RESIDENCY`) frees card bytes: the machine releases the same \
+              top slots of every layer's expert stacks, the fewest that cover the shortfall \
+              and one page within the floor of pinned + 1 live a layer, and the fit runs once \
+              more. A load with no machine, or a floor the machine cannot free enough under, \
+              ends in the room fit's named refusal (the store, the bytes the fit asked, the \
+              device's free bytes, and the bytes the machine freed). The `plan` line prints \
+              `kv_floor=` beside `ctx_max=`.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

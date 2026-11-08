@@ -27,6 +27,12 @@
 //! ([`Room::settle`]). A page's memory is freed when the last room that maps
 //! it lets it go.
 //!
+//! A routed expert stack a residency machine runs over is a [`StackRoom`]: its
+//! range reserved whole and every page backed at load, so it reads and
+//! launches as a plain buffer until the machine gives back the pages wholly
+//! past a slot ([`StackRoom::release_from`]) and backs them again
+//! ([`StackRoom::restore`]).
+//!
 //! Every writer calls `fit` and `own_from` first, outside capture, for all
 //! positions it can write. An unbacked page aliases the spare: a missed fit
 //! can corrupt another room without a device fault, and a missed `own_from`
@@ -34,7 +40,7 @@
 
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use cuda_core::sys::CUdevice;
@@ -42,6 +48,7 @@ use cuda_core::vmm::{self, Mapping, PhysicalAllocation, VirtualReservation};
 use cuda_core::{CudaStream, DeviceBuffer, DriverError};
 
 use crate::GpuError;
+use crate::tensor::DeviceTensor;
 
 const WHAT: &str = "room";
 
@@ -203,31 +210,41 @@ impl Room {
         Ok(crate::current_mem_info()?.0)
     }
 
-    /// A fit's named refusal of page `i`, the driver's `source` in it: the
-    /// store, the positions the fit asked, the bytes of new pages the fit
-    /// still asked, the page among the room's, the pages the room had
-    /// backed and the device's free bytes then.
-    fn no_room(&self, positions: usize, i: usize, source: GpuError) -> GpuError {
-        let want = self.wanted(positions);
-        let asked = want
+    /// The bytes of new pages a fit of `positions` positions still asks: the
+    /// pages its rows lie on that map no memory of their own.
+    pub(crate) fn asks(&self, positions: usize) -> usize {
+        self.wanted(positions)
             .iter()
             .enumerate()
             .filter(|&(i, &w)| w && self.own(i).is_none())
             .count()
-            .saturating_mul(self.page);
-        let free = self.free_bytes().map_or_else(
-            |e| format!("free bytes unreadable ({e})"),
-            |free| format!("{free} B free"),
-        );
+            .saturating_mul(self.page)
+    }
+
+    /// A fit's named refusal of page `i`, the driver's `source` in it: the
+    /// store, the positions the fit asked, the bytes of new pages the fit
+    /// still asked, the page among the room's, the pages the room had
+    /// backed and the device's free bytes then. The asked bytes, the free
+    /// bytes (when readable) and the page are the error's numbers.
+    fn no_room(&self, positions: usize, i: usize, source: GpuError) -> GpuError {
+        let asked = self.asks(positions);
+        let free = self.free_bytes();
+        let said = match &free {
+            Ok(free) => format!("{free} B free"),
+            Err(e) => format!("free bytes unreadable ({e})"),
+        };
         GpuError::NoRoom {
             what: self.what,
             detail: format!(
                 "a fit of {positions} positions asks {asked} B of new pages (backing page {i} \
-                 of {}, {} backed) and the device holds {free}",
+                 of {}, {} backed) and the device holds {said}",
                 self.pages.len(),
                 self.mapped
             ),
             source: Box::new(source),
+            asked,
+            free: free.ok(),
+            page: self.page,
         }
     }
 
@@ -285,14 +302,18 @@ impl Room {
     /// Page `i`'s bytes zeroed on the room's stream, in order before any
     /// launch enqueued after.
     fn zero(&self, i: usize) -> Result<(), GpuError> {
+        self.zero_on(i, &self.stream)
+    }
+
+    /// Page `i`'s bytes zeroed on `stream`, a stream of the room's context,
+    /// in order before any work enqueued on it after.
+    fn zero_on(&self, i: usize, stream: &CudaStream) -> Result<(), GpuError> {
         let va = self.va(i);
         // SAFETY: `va` is the start of a page of this room's reservation,
         // `page` bytes long, mapped read-write for this device; the room
         // keeps a mapping there until it drops, after the device finished.
-        unsafe {
-            cuda_core::simt::memory::memset_d8_async(va, 0, self.page, self.stream.cu_stream())
-        }
-        .map_err(driver("cuMemsetD8Async"))
+        unsafe { cuda_core::simt::memory::memset_d8_async(va, 0, self.page, stream.cu_stream()) }
+            .map_err(driver("cuMemsetD8Async"))
     }
 
     /// The most positions whose rows lie on the pages the rows of the first
@@ -369,6 +390,60 @@ impl Room {
         };
         self.reach = 0;
         Ok(())
+    }
+
+    /// The device bytes of the pages wholly at or past byte `byte` of the
+    /// range that hold memory of their own: what [`Room::release_from`]
+    /// would free.
+    pub(crate) fn tail_bytes(&self, byte: usize) -> u64 {
+        let pages = (byte.div_ceil(self.page)..self.pages.len())
+            .filter(|&i| self.own(i).is_some())
+            .count();
+        (pages * self.page) as u64
+    }
+
+    /// Every page wholly at or past byte `byte` of the range given back to
+    /// the spare, its memory freed: the device bytes freed, 0 for pages
+    /// already on the spare. The caller has the device finished with every
+    /// call that could read those pages (a copy out of them included), and
+    /// nothing reads or writes them after. Never inside a capture. An error
+    /// leaves the pages given back so far given back.
+    pub(crate) fn release_from(&mut self, byte: usize) -> Result<u64, GpuError> {
+        let give: Vec<usize> = (byte.div_ceil(self.page)..self.pages.len())
+            .filter(|&i| self.own(i).is_some())
+            .collect();
+        if give.is_empty() {
+            return Ok(0);
+        }
+        self.stream.context().bind_to_thread()?;
+        for &i in &give {
+            self.back(i, None)?;
+        }
+        Ok((give.len() * self.page) as u64)
+    }
+
+    /// Memory of its own, zeroed on `stream` (a stream of the room's
+    /// context), for every page that holds a byte of `[from, to)` and maps
+    /// the spare: the pages [`Room::release_from`] gave back, the device
+    /// bytes backed. The zeroing is in stream order: work enqueued on
+    /// `stream` after this sees zeros. An error leaves the pages backed so
+    /// far backed.
+    pub(crate) fn restore(
+        &mut self,
+        from: usize,
+        to: usize,
+        stream: &CudaStream,
+    ) -> Result<u64, GpuError> {
+        let end = to.div_ceil(self.page).min(self.pages.len());
+        let want: Vec<usize> = (from / self.page..end)
+            .filter(|&i| self.own(i).is_none())
+            .collect();
+        for &i in &want {
+            let own = self.new_page()?;
+            self.back(i, Some(own))?;
+            self.zero_on(i, stream)?;
+        }
+        Ok((want.len() * self.page) as u64)
     }
 
     /// Refused by name unless `from` is a room of this one's layout on its
@@ -549,6 +624,12 @@ impl<T, const N: usize> Views for [DeviceBuffer<T>; N] {
     }
 }
 
+/// No buffers: the holder of a room whose buffer its owner took out
+/// ([`StackRoom`]).
+impl Views for () {
+    fn dissolve(self) {}
+}
+
 /// Buffers over one or more [`Room`]s and the rooms: the buffers read and
 /// write as any other (`Deref`), the rooms back their pages
 /// ([`Roomed::fit`]).
@@ -677,6 +758,12 @@ impl<V: Views> Roomed<V> {
         self.rooms.iter_mut().try_for_each(|r| r.fit(positions))
     }
 
+    /// The bytes of new pages a fit of `positions` positions still asks, over
+    /// every room ([`Room::asks`]).
+    pub(crate) fn asks(&self, positions: usize) -> usize {
+        self.rooms.iter().map(|r| r.asks(positions)).sum()
+    }
+
     /// Every row backed: what a read or write of the whole buffers takes.
     pub(crate) fn fill(&mut self) -> Result<(), GpuError> {
         self.fit(usize::MAX)
@@ -755,6 +842,131 @@ impl<V: Views> Drop for Roomed<V> {
         // SAFETY: the views are taken once, here, and never touched again;
         // the rooms drop after this body, unmapping what they addressed.
         unsafe { ManuallyDrop::take(&mut self.views) }.dissolve();
+    }
+}
+
+/// One routed expert stack held as a room: its buffer is reserved whole and
+/// every page of it backed at load, so with nothing released its address,
+/// length and bytes are a plain buffer's. A residency machine gives back the
+/// pages wholly at or past a slot of the stack ([`StackRoom::release_from`]) and
+/// backs them again ([`StackRoom::restore`]); the range stays reserved, and
+/// the pages given back map the device's spare page. The buffer
+/// [`StackRoom::new`] returns is a view over the room's range: its holder
+/// takes it apart without a free (`DeviceBuffer::into_raw_parts`) before the
+/// room drops, as [`Views::dissolve`] does for a store's.
+pub struct StackRoom {
+    room: Mutex<Roomed<()>>,
+    /// Device bytes of the pages given back and not backed again.
+    released: AtomicU64,
+}
+
+impl StackRoom {
+    /// A stack of `words` `u32` words on `stream`'s device, every page
+    /// backed and zeroed on `stream`, and the buffer over its range. `what`
+    /// names the stack for a refusal.
+    pub fn new(
+        stream: Arc<CudaStream>,
+        words: usize,
+        what: &'static str,
+    ) -> Result<(DeviceBuffer<u32>, StackRoom), GpuError> {
+        let bytes = words
+            .checked_mul(size_of::<u32>())
+            .ok_or_else(|| GpuError::shape(WHAT, format!("{words} words pass usize")))?;
+        let whole = [Run {
+            at: 0,
+            row: bytes,
+            per: 1,
+            rows: 1,
+        }];
+        let mut roomed = Roomed::<DeviceBuffer<u32>>::new(stream, words, &whole, what, |[b]| b)?;
+        roomed.fill()?;
+        let mut view = None;
+        let room = roomed.map(|b| view = Some(b));
+        let view = view.ok_or_else(|| GpuError::state(WHAT, "the stack's buffer"))?;
+        Ok((
+            view,
+            StackRoom {
+                room: Mutex::new(room),
+                released: AtomicU64::new(0),
+            },
+        ))
+    }
+
+    /// A `rows × cols` tensor of words held as a room: [`StackRoom::new`]
+    /// over `rows · cols` words, the buffer owned by the tensor. The tensor
+    /// is a view over the room's range; its holder takes it apart without a
+    /// free (`DeviceTensor::into_buf`, then `DeviceBuffer::into_raw_parts`)
+    /// before the room drops.
+    pub(crate) fn tensor(
+        stream: Arc<CudaStream>,
+        rows: usize,
+        cols: usize,
+        what: &'static str,
+    ) -> Result<(DeviceTensor<u32>, StackRoom), GpuError> {
+        let words = rows
+            .checked_mul(cols)
+            .ok_or_else(|| GpuError::shape(WHAT, format!("{rows} × {cols} words pass usize")))?;
+        let (buf, room) = StackRoom::new(stream, words, what)?;
+        // The buffer holds exactly `rows · cols` words, so the tensor takes it whole.
+        let w = DeviceTensor::from_buf(buf, rows, cols)?;
+        Ok((w, room))
+    }
+
+    /// `f` over the stack's one room, under the room's lock.
+    fn with<R>(&self, f: impl FnOnce(&mut Room) -> Result<R, GpuError>) -> Result<R, GpuError> {
+        let mut held = self.room.lock().unwrap_or_else(PoisonError::into_inner);
+        match held.rooms_mut() {
+            [room] => f(room),
+            _ => Err(GpuError::state(WHAT, "a stack room holds one room")),
+        }
+    }
+
+    /// The device bytes [`StackRoom::release_from`] `byte` would free: the
+    /// pages wholly at or past `byte` that hold memory.
+    pub fn tail_bytes(&self, byte: usize) -> Result<u64, GpuError> {
+        self.with(|r| Ok(r.tail_bytes(byte)))
+    }
+
+    /// Every page wholly at or past byte `byte` given back to the spare, its
+    /// memory freed: the device bytes freed ([`Room::release_from`], whose
+    /// contract on the device's work the caller keeps).
+    pub fn release_from(&self, byte: usize) -> Result<u64, GpuError> {
+        self.with(|r| {
+            let before = r.mapped();
+            let freed = r.release_from(byte);
+            self.released
+                .fetch_add(before.saturating_sub(r.mapped()) as u64, Ordering::Relaxed);
+            freed
+        })
+    }
+
+    /// Fresh memory, zeroed on `stream` in stream order, for every page that
+    /// holds a byte of `[from, to)` and maps the spare: the device bytes
+    /// backed ([`Room::restore`]).
+    pub fn restore(&self, from: usize, to: usize, stream: &CudaStream) -> Result<u64, GpuError> {
+        self.with(|r| {
+            let before = r.mapped();
+            let backed = r.restore(from, to, stream);
+            self.released
+                .fetch_sub(r.mapped().saturating_sub(before) as u64, Ordering::Relaxed);
+            backed
+        })
+    }
+
+    /// [`StackRoom::restore`] of every page from byte `from` on: the pages
+    /// [`StackRoom::release_from`]`(from)` gave back.
+    pub fn restore_from(&self, from: usize, stream: &CudaStream) -> Result<u64, GpuError> {
+        self.restore(from, usize::MAX, stream)
+    }
+
+    /// Device bytes of the pages given back and not backed again.
+    pub fn released(&self) -> u64 {
+        self.released.load(Ordering::Relaxed)
+    }
+
+    /// Device bytes the pages that hold memory take.
+    pub fn backed(&self) -> Result<usize, GpuError> {
+        self.with(|r| Ok(r.mapped()))
     }
 }
 
@@ -1066,5 +1278,96 @@ mod tests {
             .to_string();
         assert!(e.contains("backs no memory"), "{e}");
         stream.synchronize().expect("the rooms' work finished");
+    }
+
+    /// A stack room of 16 slots of 921,600 bytes, every page backed at the
+    /// load, gives back exactly the pages wholly at or past slot 10's first
+    /// byte: the count is derived here from the page and the slot, the
+    /// device's free bytes grow by at least that many pages, the slots below
+    /// read back their bytes, a second release frees nothing, and a restore
+    /// backs the pages again zeroed with the slots below untouched. Runs
+    /// alone (`hw_held_`): the free bytes are the device's, which a parallel
+    /// test's allocation moves. FAIL-first: a release that frees nothing.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_held_a_stack_room_gives_back_the_pages_past_a_slot() {
+        const PART: usize = 921_600;
+        const SLOTS: usize = 16;
+        const LINE: usize = 10;
+        let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
+        let page = vmm::allocation_granularity(ctx.cu_device()).expect("the granularity");
+        let pages = (SLOTS * PART).div_ceil(page);
+        let keep = (LINE * PART).div_ceil(page);
+        let gone = (pages - keep) * page;
+        assert!(gone > 0, "the line leaves whole pages past it");
+        assert!(
+            12 * PART >= keep * page,
+            "slot 12 lies wholly past the line"
+        );
+        let words = PART / size_of::<u32>();
+        let (mut buf, room) =
+            StackRoom::new(Arc::clone(&stream), SLOTS * words, "the tests' stack").expect("a room");
+        let base = buf.cu_deviceptr();
+        assert_eq!(room.backed().expect("backed"), pages * page, "every page");
+        for s in 0..SLOTS {
+            WindowMut::<u32>::of_mut(&mut buf, s * PART, words)
+                .expect("a slot")
+                .copy_from_host(&stream, &vec![s as u32 + 1; words])
+                .expect("a write");
+        }
+        stream.synchronize().expect("the writes");
+        let read = |buf: &DeviceBuffer<u32>, s: usize| {
+            Window::<u32>::of(buf, s * PART, words)
+                .expect("a slot")
+                .to_host_vec(&stream)
+                .expect("a read")
+        };
+        for s in 0..SLOTS {
+            assert_eq!(read(&buf, s), vec![s as u32 + 1; words], "slot {s} before");
+        }
+        assert_eq!(
+            room.tail_bytes(LINE * PART).expect("the tail"),
+            gone as u64,
+            "the tail the release would free"
+        );
+        ctx.bind_to_thread().expect("the context binds");
+        let (before, _) = crate::current_mem_info().expect("the device's free bytes");
+        let freed = room.release_from(LINE * PART).expect("a release");
+        assert_eq!(freed, gone as u64, "the pages wholly past slot {LINE}");
+        let (after, _) = crate::current_mem_info().expect("the device's free bytes");
+        assert!(
+            after >= before + gone,
+            "the device's free bytes grew by the pages: {before} then {after}, {gone} given back"
+        );
+        assert_eq!(room.backed().expect("backed"), keep * page);
+        assert_eq!(room.released(), gone as u64);
+        for s in 0..LINE {
+            assert_eq!(read(&buf, s), vec![s as u32 + 1; words], "slot {s} after");
+        }
+        assert_eq!(
+            room.release_from(LINE * PART).expect("a second release"),
+            0,
+            "pages already given back free nothing"
+        );
+        assert_eq!(room.released(), gone as u64);
+        assert_eq!(buf.cu_deviceptr(), base, "the address stays");
+        let backed = room.restore_from(LINE * PART, &stream).expect("a restore");
+        assert_eq!(backed, gone as u64, "the pages given back backed again");
+        assert_eq!(room.backed().expect("backed"), pages * page);
+        assert_eq!(room.released(), 0);
+        for s in 0..LINE {
+            assert_eq!(
+                read(&buf, s),
+                vec![s as u32 + 1; words],
+                "slot {s} restored"
+            );
+        }
+        for s in [12, SLOTS - 1] {
+            assert_eq!(read(&buf, s), vec![0u32; words], "slot {s} reads zero");
+        }
+        stream.synchronize().expect("the room's work finished");
+        // The view is taken apart without a free before the room drops.
+        drop(buf.into_raw_parts());
+        drop(room);
     }
 }

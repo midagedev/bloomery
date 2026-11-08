@@ -1327,6 +1327,9 @@ pub struct Body38 {
     /// lever runs one, over `hybrid`'s slot map through `slots`; every call
     /// nothing without one.
     residency_glue: ResidencyGlue,
+    /// The engine stream, which the residency machine's byte release waits
+    /// on ([`Body38::fit_stores`]).
+    engine: Arc<CudaStream>,
     /// The NVMe expert tier's arena, when the plan paged routed experts
     /// ([`Body38::nvme_tier`]).
     nvme_tier: Option<Arc<NvTier>>,
@@ -2099,6 +2102,7 @@ impl Body38 {
             plant: None,
             mtp: None,
             residency_glue,
+            engine: gpu.stream_handle(),
             nvme_tier,
             ckpt,
             ple_points: Vec::new(),
@@ -3823,16 +3827,82 @@ impl Body38 {
         hist: History,
         verify: Option<(Vec<u32>, bool)>,
     ) -> Result<(), GpuError> {
-        for s in &mut self.stores {
-            s.fit(pos as usize + rows)?;
-            s.own_from(pos as usize)?;
-        }
+        self.fit_stores(pos as usize, rows)?;
         self.staged = Some(Staged38 {
             pos,
             rows: launch_u32(WHAT, "positions", rows)?,
             hist,
             verify,
         });
+        Ok(())
+    }
+
+    /// The stores' rows of a call of `rows` from `pos` backed, and the pages
+    /// it writes from `pos` on this sequence's alone ([`Store38::fit`],
+    /// [`Store38::own_from`]). A card with no room for the pages the fit asks
+    /// ([`GpuError::NoRoom`]) is given expert bytes once: the residency
+    /// machine releases the same top slots of every layer's stacks, enough
+    /// bytes to cover what the stores still ask beyond the card's free bytes
+    /// and one page ([`ResidencyGlue::free_bytes`]), and the fit runs once
+    /// more. A second refusal, a machine that refuses to free and a load with
+    /// no machine are the refusal, naming what the machine freed or why it
+    /// freed nothing. Never inside a capture.
+    fn fit_stores(&mut self, pos: usize, rows: usize) -> Result<(), GpuError> {
+        let through = pos + rows;
+        let first = match self.fit_each(pos, through) {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+        let GpuError::NoRoom { free, page, .. } = first else {
+            return Err(first);
+        };
+        let free = match free.map_or_else(|| crate::current_mem_info().map(|m| m.0), Ok) {
+            Ok(free) => free,
+            Err(e) => {
+                return Err(first.noting_room(format!(
+                    "the residency machine was not asked: the card's free bytes are unreadable \
+                     ({e})"
+                )));
+            }
+        };
+        let asked: usize = self.stores.iter().map(|s| s.asks(through)).sum();
+        let want = asked.saturating_sub(free).saturating_add(page);
+        let engine = Arc::clone(&self.engine);
+        let freed = match self.residency_parts() {
+            Some(ResidencyParts { glue, hybrid, .. }) => {
+                glue.free_bytes(hybrid, &engine, want as u64)
+            }
+            None => Err(GpuError::state(
+                WHAT,
+                "a residency machine to free expert bytes for the stores",
+            )),
+        };
+        let freed = match freed {
+            Ok(f) => f,
+            Err(e) => {
+                return Err(first.noting_room(format!(
+                    "the residency machine freed 0 B of the {want} B the fit was short: {e}"
+                )));
+            }
+        };
+        self.fit_each(pos, through).map_err(|e| {
+            e.noting_room(format!(
+                "after the residency machine freed {} B of expert stacks ({} slots a layer over \
+                 {} layers)",
+                freed.bytes,
+                freed.k,
+                freed.layers.len()
+            ))
+        })
+    }
+
+    /// Every store fitted through `through` positions and its pages from
+    /// `pos` on made this sequence's own, store by store.
+    fn fit_each(&mut self, pos: usize, through: usize) -> Result<(), GpuError> {
+        for s in &mut self.stores {
+            s.fit(through)?;
+            s.own_from(pos)?;
+        }
         Ok(())
     }
 

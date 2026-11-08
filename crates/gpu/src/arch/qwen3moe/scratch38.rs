@@ -193,6 +193,15 @@ impl Store38 {
         self.rooms().try_for_each(|r| r.fit(positions))
     }
 
+    /// The bytes of new pages a fit of the first `positions` positions still
+    /// asks ([`Roomed::asks`]); none for a delta store.
+    pub(super) fn asks(&self, positions: usize) -> usize {
+        match self {
+            Store38::Rec(_) => 0,
+            Store38::Qsa { kv, pooled, .. } => kv.asks(positions) + pooled.asks(positions),
+        }
+    }
+
     /// A selecting store's pages a write from position `pos` on reaches given
     /// memory no other sequence's store maps ([`Room::own_from`]): every
     /// writer's first step after its fit. Never inside a capture.

@@ -16,6 +16,7 @@ use crate::mxfp4_sel::Nvfp4Stack;
 use crate::planes::Format as PlaneFormat;
 use crate::q5::{pack_q5_0, pack_q5_1};
 use crate::q8f32::{E4m3Scales, E4m3Weight};
+use crate::room::StackRoom;
 use crate::tensor::{DeviceTensor, window};
 use crate::upload::{Stage, UploadRing, bytes_of};
 use ::model::placement::host_lock::PageDrop;
@@ -33,6 +34,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::mem::ManuallyDrop;
 use std::ops::Range;
+use std::sync::Arc;
 
 /// The lm_head tensor's name, and the token embedding that serves as it when the file ties them.
 pub use ::model::placement::HEAD_TENSOR;
@@ -196,6 +198,17 @@ impl DevWeight {
             | DevWeight::Nvfp4Stack { k, .. }
             | DevWeight::Mxfp8 { k, .. }
             | DevWeight::Fp8B128 { k, .. } => *k,
+        }
+    }
+
+    /// The weight gone without a free of its stack, when it is a stack held
+    /// as a room ([`StackRoom`]): its tensor is a view over the room's range,
+    /// taken apart here so no `cuMemFree` reaches an address the room maps;
+    /// the caller drops the room after, and its drop drains the device. Any
+    /// other weight is dropped, as it would be anywhere.
+    fn dissolve_view(self) {
+        if let DevWeight::KQuant { w, .. } = self {
+            drop(w.into_buf().into_raw_parts());
         }
     }
 
@@ -393,6 +406,38 @@ pub struct Weights {
     /// The file ties its head to the token embedding ([`head_tensor`]): `output.weight` is the
     /// resident `token_embd.weight`.
     tied: bool,
+    /// The rooms of the stacks held as rooms ([`StackRooms`]), by the stack's name: the
+    /// resident weight of that name is a view over its room's range, so it never leaves the
+    /// map but through this type's drop.
+    rooms: BTreeMap<String, Arc<StackRoom>>,
+}
+
+impl Drop for Weights {
+    fn drop(&mut self) {
+        // A roomed stack's tensor is a view over its room's range: taken apart without a free
+        // here, before the rooms (a field) drop and unmap what it addressed.
+        for name in self.rooms.keys() {
+            if let Some(w) = self.by_name.remove(name) {
+                w.dissolve_view();
+            }
+        }
+    }
+}
+
+/// The stacks of a placed load held as rooms ([`StackRoom`]): the file tensors whose card
+/// upload is reserved whole, every page backed at load, and the stream the rooms reserve on.
+/// A tensor not named here, or not uploaded as file blocks ([`CardFormat::KQuant`]), is a
+/// plain buffer.
+pub(crate) struct StackRooms {
+    names: BTreeSet<String>,
+    stream: Arc<CudaStream>,
+}
+
+impl StackRooms {
+    /// The tensors `names` held as rooms on `stream`'s device.
+    pub(crate) fn new(names: BTreeSet<String>, stream: Arc<CudaStream>) -> StackRooms {
+        StackRooms { names, stream }
+    }
 }
 
 /// A weight's one plane and width in a format [`Weights::join_rows`] joins
@@ -472,14 +517,28 @@ impl Weights {
         card: usize,
         card_dontneed: bool,
     ) -> Result<Weights, GpuError> {
+        Weights::load_placed_rooms(stream, split, plan, card, card_dontneed, None)
+    }
+
+    /// [`Weights::load_placed`] with the stacks `rooms` names held as rooms
+    /// ([`StackRoom`]): each reserved whole with every page backed, so with
+    /// nothing released its address, length and bytes are a plain buffer's.
+    /// `None`: every stack a plain buffer.
+    pub(crate) fn load_placed_rooms(
+        stream: &CudaStream,
+        split: &Split,
+        plan: &Plan<'_>,
+        card: usize,
+        card_dontneed: bool,
+        rooms: Option<&StackRooms>,
+    ) -> Result<Weights, GpuError> {
         let mut release = card_dontneed.then(|| PageDrop::new(split));
         load_segments(
             stream,
             split,
-            plan.model,
-            &plan.rows,
-            card,
+            (plan.model, &plan.rows, card),
             release.as_mut(),
+            rooms,
         )
     }
 
@@ -501,7 +560,7 @@ impl Weights {
         rows: &[Row],
         card: usize,
     ) -> Result<Weights, GpuError> {
-        load_segments(stream, split, model, rows, card, None)
+        load_segments(stream, split, (model, rows, card), None, None)
     }
 
     /// Upload every tensor of `split` whose name `keep` accepts, each from
@@ -548,6 +607,7 @@ impl Weights {
         Weights {
             by_name,
             tied: false,
+            rooms: BTreeMap::new(),
         }
     }
 
@@ -590,7 +650,11 @@ impl Weights {
             );
         }
         ring.finish(stream)?;
-        Ok(Weights { by_name, tied })
+        Ok(Weights {
+            by_name,
+            tied,
+            rooms: BTreeMap::new(),
+        })
     }
 
     /// File `w` as a derived weight under `name`. The `derived.` prefix keeps
@@ -642,6 +706,7 @@ impl Weights {
     ) -> Result<(), GpuError> {
         const WHAT: &str = "Weights::join_rows";
         derived_slot_free(&self.by_name, &joint)?;
+        self.refuse_roomed(WHAT, parts)?;
         match parts.first().and_then(|&n| self.by_name.get(n)) {
             Some(DevWeight::F32 { .. }) => {
                 return self.join_plane_rows(
@@ -979,8 +1044,36 @@ impl Weights {
     /// buffers and [`Weights::get`] no longer finds it. `None` when no entry
     /// has exactly that name (a tied head is the embedding's entry, not its
     /// own); the caller names the error.
+    ///
+    /// # Panics
+    /// On a stack held as a room ([`Weights::stack_room`]): its tensor is a
+    /// view the weights' drop takes apart, never one a caller frees.
     pub fn take(&mut self, name: &str) -> Option<DevWeight> {
+        assert!(
+            !self.rooms.contains_key(name),
+            "Weights::take: {name} is a stack held as a room, which stays resident"
+        );
         self.by_name.remove(name)
+    }
+
+    /// The room of the stack `name` when the load held it as one
+    /// ([`StackRooms`]): the pages a residency machine gives back and backs
+    /// again. `None` for a plain buffer.
+    pub(crate) fn stack_room(&self, name: &str) -> Option<&Arc<StackRoom>> {
+        self.rooms.get(name)
+    }
+
+    /// Refused by name when one of `names` is a stack held as a room: the
+    /// callers below free the buffers of what they move out of the map.
+    fn refuse_roomed(&self, what: &'static str, names: &[&str]) -> Result<(), GpuError> {
+        match names.iter().find(|n| self.rooms.contains_key(**n)) {
+            Some(name) => Err(GpuError::tensor(
+                what,
+                *name,
+                "a plain buffer: it is a stack held as a room",
+            )),
+            None => Ok(()),
+        }
     }
 
     /// Re-upload the resident file tensor `name` of `split` in `format`, a
@@ -1009,6 +1102,7 @@ impl Weights {
             .shard(shard)
             .ok_or_else(|| GpuError::tensor(WHAT, name, "a shard the split holds"))?;
         let src = gguf.data(t)?;
+        self.refuse_roomed(WHAT, &[name])?;
         if self.by_name.remove(name).is_none() {
             return Err(GpuError::tensor(WHAT, name, "a resident weight"));
         }
@@ -1203,23 +1297,25 @@ fn placed_refusal(t: &ModelTensor, detail: String) -> GpuError {
     GpuError::shape(PLACED, format!("tensor {}: {detail}", t.name))
 }
 
-/// [`Weights::load_rows`], releasing each uploaded segment's file pages
+/// [`Weights::load_rows`] of `at` (the model's tensors, the placement rows
+/// and the card), releasing each uploaded segment's file pages
 /// through `release` when there is one, each as soon as its bytes are
-/// staged. One staging ring carries the whole load's copies and one
+/// staged, and holding the stacks `rooms` names as rooms. One staging ring
+/// carries the whole load's copies and one
 /// synchronize ends them. The file pages of the segments after the one
 /// being staged are read ahead of it ([`read_ahead`]), so the drive works
 /// while the host copies instead of between copies.
 fn load_segments(
     stream: &CudaStream,
     split: &Split,
-    model: &ModelTensors,
-    rows: &[Row],
-    card: usize,
+    at: (&ModelTensors, &[Row], usize),
     mut release: Option<&mut PageDrop<'_>>,
+    rooms: Option<&StackRooms>,
 ) -> Result<Weights, GpuError> {
+    let (model, rows, card) = at;
     stream.context().bind_to_thread()?;
-    let mut by_name = BTreeMap::new();
-    // The ring is made after `by_name` and drops before it: its drop drains
+    let mut weights = Weights::default();
+    // The ring is made after `weights` and drops before it: its drop drains
     // the copies, so no buffer of a refused load is freed while a copy still
     // writes it.
     let budget = rows
@@ -1255,13 +1351,20 @@ fn load_segments(
         |ahead| {
             for (i, &(t, seg)) in steps.iter().enumerate() {
                 ahead.begin(i).map_err(|e| GpuError::plan(PLACED, e))?;
-                let (dw, release_ranges) =
-                    upload_segment(&mut ring, stream, split, model.experts, t, seg)?;
-                if by_name.insert(t.name.clone(), dw).is_some() {
+                let (dw, room, release_ranges) =
+                    upload_segment(&mut ring, stream, split, model.experts, t, seg, rooms)?;
+                if weights.by_name.contains_key(&t.name) {
+                    if room.is_some() {
+                        dw.dissolve_view();
+                    }
                     return Err(placed_refusal(
                         t,
                         format!("has two segments on card {card}"),
                     ));
+                }
+                weights.by_name.insert(t.name.clone(), dw);
+                if let Some(room) = room {
+                    weights.rooms.insert(t.name.clone(), Arc::new(room));
                 }
                 // The reads of this step end before its pages are released,
                 // so none puts a page back.
@@ -1282,10 +1385,7 @@ fn load_segments(
             Ok(())
         },
     )?;
-    Ok(Weights {
-        by_name,
-        tied: false,
-    })
+    Ok(weights)
 }
 
 /// The file bytes of placement segment `seg` of tensor `t`, a stack of
@@ -1390,7 +1490,9 @@ impl<'f> SegmentFile<'f> {
 /// so a whole-tensor segment uploads from the mapping itself and an expert
 /// stack streams its spans without a gathered copy), and hand back the file
 /// bytes the caller may release now that they are staged — empty for a
-/// tensor a step reads from the file.
+/// tensor a step reads from the file. A stack `rooms` names is uploaded into
+/// a room, which comes back beside its weight: the weight's tensor is a view
+/// over the room, so the caller files the room before the weight can drop.
 fn upload_segment(
     ring: &mut UploadRing,
     stream: &CudaStream,
@@ -1398,7 +1500,8 @@ fn upload_segment(
     experts: u64,
     t: &ModelTensor,
     seg: &Segment,
-) -> Result<(DevWeight, PendingRelease), GpuError> {
+    rooms: Option<&StackRooms>,
+) -> Result<(DevWeight, Option<StackRoom>, PendingRelease), GpuError> {
     let Format::Card(format) = seg.format else {
         return Err(placed_refusal(t, format!("is on a card as {}", seg.format)));
     };
@@ -1421,7 +1524,15 @@ fn upload_segment(
         Some(list) if info.dims.len() == 3 => list.ids().iter().map(|&e| all[e as usize]).collect(),
         _ => all,
     });
-    let dw = upload_rows(stream, ring, PLACED, format, info, rows, &src, scale)?;
+    let (dw, room) = upload_rows_in(
+        stream,
+        ring,
+        (PLACED, format, rooms),
+        info,
+        rows,
+        &src,
+        scale,
+    )?;
     if u64::try_from(dw.resident_bytes()).ok() != Some(seg.resident_bytes) {
         // The upload's copies may still be running into the buffers this
         // error is about to drop; drain before they do.
@@ -1431,6 +1542,9 @@ fn upload_segment(
             dw.resident_bytes(),
             seg.resident_bytes
         );
+        if room.is_some() {
+            dw.dissolve_view();
+        }
         return Err(placed_refusal(t, detail));
     }
     let read_by_steps = matches!(t.role, Role::TokenEmbedding | Role::EngramTable);
@@ -1439,7 +1553,7 @@ fn upload_segment(
     } else {
         span_ranges(s, g.data_base() + info.offset, &spans)
     };
-    Ok((dw, release))
+    Ok((dw, room, release))
 }
 
 /// Pack and upload one file tensor in its kernel's device format, on a
@@ -1526,21 +1640,22 @@ fn upload_budget(t: &TensorInfo) -> usize {
 /// upload's device bytes against that size; `what` names the caller in both
 /// errors. `scale` is an NVFP4 tensor's scales ([`tensor_scales`]; a stack's
 /// those of the experts `rows` hold, in their order), which its planes
-/// carry.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "one upload's stream, ring, caller, format, tensor, rows, bytes and scale (rust-quality R8)"
-)]
-fn upload_rows(
+/// carry. `at` is the caller's name, the card format and the stacks held as
+/// rooms: a K-quant stack `rooms` names is uploaded into a room (every page
+/// backed and zeroed, the weight's tensor a view over it), which comes back
+/// beside the weight. On an error the view is taken apart before its room
+/// drops.
+fn upload_rows_in(
     stream: &CudaStream,
     ring: &mut UploadRing,
-    what: &'static str,
-    format: CardFormat,
+    at: (&'static str, CardFormat, Option<&StackRooms>),
     t: &TensorInfo,
     rows: usize,
     src: &[&[u8]],
     scale: Option<Vec<f32>>,
-) -> Result<DevWeight, GpuError> {
+) -> Result<(DevWeight, Option<StackRoom>), GpuError> {
+    let (what, format, rooms) = at;
+    let mut made = None;
     let name = t.name.as_str();
     let all_rows: u64 = t.dims[1..].iter().product();
     let layout = (rows as u64 <= all_rows)
@@ -1575,14 +1690,28 @@ fn upload_rows(
                 .ok_or_else(|| {
                     GpuError::shape(what, format!("tensor {name}: its word stream passes usize"))
                 })?;
-            let w = DeviceTensor::<u32>::zeroed(stream, rows, words / rows)?;
+            let cols = words / rows;
+            let (w, room) = match rooms.filter(|r| r.names.contains(name)) {
+                Some(r) => {
+                    let (w, room) = StackRoom::tensor(Arc::clone(&r.stream), rows, cols, what)?;
+                    (w, Some(room))
+                }
+                None => (DeviceTensor::<u32>::zeroed(stream, rows, cols)?, None),
+            };
             let stage = Stage {
                 what,
                 name,
                 dst: w.buf().cu_deviceptr(),
                 dst_bytes: w.buf().num_bytes(),
             };
-            ring.copy_bytes(stream, &stage, src, take)?;
+            if let Err(e) = ring.copy_bytes(stream, &stage, src, take) {
+                if room.is_some() {
+                    // The room drops after this, and its drop drains the copies.
+                    drop(w.into_buf().into_raw_parts());
+                }
+                return Err(e);
+            }
+            made = room;
             DevWeight::KQuant { ty: t.ty, w, k }
         }
         // The file's f32 bytes are the device's f32 bytes on this host; a run
@@ -1728,14 +1857,37 @@ fn upload_rows(
         // The upload's copies may still be running into the buffers this
         // error is about to drop; drain before they do.
         let _ = stream.synchronize();
-        return Err(GpuError::shape(
+        let err = GpuError::shape(
             what,
             format!(
                 "tensor {name}: {format:?} upload holds {} device bytes, its layout {size}",
                 dw.resident_bytes()
             ),
-        ));
+        );
+        if made.is_some() {
+            dw.dissolve_view();
+        }
+        return Err(err);
     }
+    Ok((dw, made))
+}
+
+/// [`upload_rows_in`] with every stack a plain buffer, the weight alone.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one upload's stream, ring, caller, format, tensor, rows, bytes and scale (rust-quality R8)"
+)]
+fn upload_rows(
+    stream: &CudaStream,
+    ring: &mut UploadRing,
+    what: &'static str,
+    format: CardFormat,
+    t: &TensorInfo,
+    rows: usize,
+    src: &[&[u8]],
+    scale: Option<Vec<f32>>,
+) -> Result<DevWeight, GpuError> {
+    let (dw, _) = upload_rows_in(stream, ring, (what, format, None), t, rows, src, scale)?;
     Ok(dw)
 }
 
