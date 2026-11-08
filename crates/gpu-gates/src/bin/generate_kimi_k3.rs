@@ -32,7 +32,7 @@
 //! its indexer's top-k too. A pass load's plan is made apart from the step's:
 //! the widest pass shape ([`bloomery_gpu::arch::kimi_k3::SHAPES`], rows by the latent mixers' inner
 //! rows) whose bytes the stage card's room holds as the prompt reserve, the expert tier's batch at
-//! its rows and the NVMe arena at its floor (`PlanInputs::with_arena_at_floor`). The
+//! its rows and the NVMe arena the dial gives, at least its floor (`PlanInputs::with_pass_arena`). The
 //! `prompt_pass` record after the plan's names the shape, its bytes, the room and the narrowest
 //! wider shape refused. `--walk steps` plans as the step does.
 //!

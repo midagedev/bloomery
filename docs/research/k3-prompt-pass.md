@@ -352,13 +352,13 @@ step's. (4) The rows projection is the common `HostHead`'s.
   `SHAPES` (rows 512 … 8, each with the latent mixers' inner run at 8, then 1). `generate_kimi_k3 --walk pass` plans
   each with the shape's bytes as the prompt reserve (`pass_bytes`, the same lens table the load allocates from, so a
   load whose buffers differ from the planned bytes is refused by name), the tier's batch at the shape's rows
-  (`tier_batch_at`) and the arena at its floor (`PlanInputs::with_arena_at_floor`), steps down on
+  (`tier_batch_at`) and at least the arena's floor (`PlanInputs::with_pass_arena`), steps down on
   `PlaceError::PromptOver` alone, and prints the choice as the `prompt_pass` record (rows, mla_rows, the reserve, the
   stage card's room beside the plan's other terms, the narrowest wider shape refused and its shortfall). `[derived]`:
   the K3 file takes (256, 1), ≈ 147 MB under its 25 card experts' 162.7 MB; the K3.1 quant (512, 8).
-- **The arena**: `with_arena_at_floor` gives the split the floor (`ArenaFloor::of`: 37 slots × 610.9 MB = 22.6 GB on
+- **The arena**: `with_pass_arena` gives the split the dial's arena, or the floor where the dial gives none (`ArenaFloor::of`: 37 slots × 610.9 MB = 22.6 GB on
   the real header) when no lever names one; at 250 GiB room the step plans paged 273.6 GB with no arena, the pass plan
-  296.2 GB with 22.6 GB (`kimi_k3_meta the_prompt_pass_plan_takes_the_arena_at_its_floor`). `--walk steps`, the
+  296.2 GB with 22.6 GB (`kimi_k3_meta the_prompt_pass_plan_takes_at_least_the_arenas_floor`; at 200 GiB both plans take the dial's 192.7 GB). `--walk steps`, the
   default, plans as before; the decode `--plan` lines before and after are the box's evidence (stage 3).
 - **The walk**: `sched::walk(Overlap { units: 1, cols: m, port: Batch })` over `BatchLeg`: the front runs the
   AttnRes mix over m rows, the mixers in chunks, the router and the latent down per 8 columns, the card and tier places;

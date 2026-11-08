@@ -1078,17 +1078,20 @@ fn kimi_k3_places_on_the_box() {
 /// The step's plan and the prompt pass's plan of the real header on the box's `bp` shape (the
 /// A6000 the stage with the head on the host, the 3090 the expert tier) at a host room past half
 /// the host leg, the box's: the step's plan takes the split dial's arena, none there, and the
-/// pass's (the same inputs [`PlanInputs::with_arena_at_floor`]) the arena at its floor, the
+/// pass's (the same inputs [`PlanInputs::with_pass_arena`]) the arena at its floor, the
 /// floor of the plan before the split ([`placement::ArenaFloor::of`]): the slots of two union
 /// batches of 16 ids and the lane's 5, 37, over one slot of every routed layer. A set lever of 0
 /// keeps the file mapping under the pass's inputs too. The pass's tier batch at one row is the
-/// step's. Mutants: the opt-in's arm left out of the split's `given`
-/// (the pass's arena 0), the floor read after the split.
+/// step's. Under H/2, where the dial gives the step an arena, the pass takes the same arena.
+/// Mutants: the opt-in's arm left out of the split's `given` (the pass's arena 0), the floor
+/// read after the split, the floor taken whatever the dial gives
+/// (`.mutants/arenapass-floor-always.patch`).
 #[test]
-fn the_prompt_pass_plan_takes_the_arena_at_its_floor() {
+fn the_prompt_pass_plan_takes_at_least_the_arenas_floor() {
     use model::arch::kimi_k3::place::{tier_batch, tier_batch_at};
     const PASS_CTX: u64 = 4096;
     const ROOM: u64 = 250 << 30;
+    const DIAL_ROOM: u64 = 200 << 30;
     let split = header();
     let mut inputs = PlanInputs::describe(&split).unwrap_or_else(|e| panic!("describe: {e}"));
     inputs.room = (ROOM, HostRead::Given);
@@ -1127,11 +1130,11 @@ fn the_prompt_pass_plan_takes_the_arena_at_its_floor() {
     let step = inputs
         .plan(&machine, PASS_CTX, &levers)
         .unwrap_or_else(|e| panic!("the step's plan: {e}"));
-    let pass_inputs = inputs.clone().with_arena_at_floor();
+    let pass_inputs = inputs.clone().with_pass_arena();
     let pass = pass_inputs
         .plan(&machine, PASS_CTX, &levers)
         .unwrap_or_else(|e| panic!("the pass's plan: {e}"));
-    let mut mapped = inputs.clone().with_arena_at_floor();
+    let mut mapped = inputs.clone().with_pass_arena();
     mapped.arena = Some(0);
     let mapped = mapped
         .plan(&machine, PASS_CTX, &levers)
@@ -1150,4 +1153,26 @@ fn the_prompt_pass_plan_takes_the_arena_at_its_floor() {
     assert_eq!(floor.slots, 37);
     assert_eq!(pass.host.nvme_arena_bytes, floor.bytes);
     assert_eq!(mapped.host.nvme_arena_bytes, 0);
+
+    // A room under H/2, where the dial gives the step an arena: the pass keeps the dial's arena.
+    let mut low = inputs.clone();
+    low.room = (DIAL_ROOM, HostRead::Given);
+    let step = low
+        .plan(&machine, PASS_CTX, &levers)
+        .unwrap_or_else(|e| panic!("the step's plan at {} GiB: {e}", DIAL_ROOM >> 30));
+    let low_pass = low.clone().with_pass_arena();
+    let pass = low_pass
+        .plan(&machine, PASS_CTX, &levers)
+        .unwrap_or_else(|e| panic!("the pass's plan at {} GiB: {e}", DIAL_ROOM >> 30));
+    println!(
+        "kimi-k3 bp at {} GiB, ctx {PASS_CTX}: the step's arena {} B, the pass's {} B",
+        DIAL_ROOM >> 30,
+        step.host.nvme_arena_bytes,
+        pass.host.nvme_arena_bytes,
+    );
+    assert!(
+        step.host.nvme_arena_bytes > floor.bytes,
+        "the dial gives an arena past the floor"
+    );
+    assert_eq!(pass.host.nvme_arena_bytes, step.host.nvme_arena_bytes);
 }

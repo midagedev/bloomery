@@ -812,6 +812,28 @@ pub fn expert_nvme_tier(
     room: u64,
     given: Option<u64>,
 ) -> Result<(), PlacementError> {
+    split_nvme_tier(plan, room, Grant::Given(given))
+}
+
+/// [`expert_nvme_tier`] with the lever unset for a load whose prompt passes read
+/// every paged id once a pass: the split dial's arena where the dial gives one,
+/// else the arena's floor ([`ArenaFloor::of`] on the plan before the split), so
+/// a paged plan reads its ids into an arena and never into a smaller one than
+/// the dial gives the step.
+pub fn expert_nvme_tier_for_passes(plan: &mut Plan<'_>, room: u64) -> Result<(), PlacementError> {
+    split_nvme_tier(plan, room, Grant::AtLeastFloor)
+}
+
+/// How [`split_nvme_tier`] sizes the arena.
+#[derive(Clone, Copy)]
+enum Grant {
+    /// [`nvme_arena_of`]'s `given`: the lever's value, or the dial's.
+    Given(Option<u64>),
+    /// The dial's arena, or its floor where the dial gives none.
+    AtLeastFloor,
+}
+
+fn split_nvme_tier(plan: &mut Plan<'_>, room: u64, grant: Grant) -> Result<(), PlacementError> {
     let model = plan.model;
     let need = workstation::HostNeed::of(plan, 0);
     // The exact sum: a need past u64 bytes reads `u64::MAX` in `bytes()`,
@@ -903,7 +925,13 @@ pub fn expert_nvme_tier(
         need: need.bytes(),
         least: ArenaFloor::of(plan)?,
     };
-    let arena = nvme_arena_of(&dial, given)?;
+    let arena = match grant {
+        Grant::Given(given) => nvme_arena_of(&dial, given)?,
+        Grant::AtLeastFloor => match nvme_arena_of(&dial, None)? {
+            0 => nvme_arena_of(&dial, Some(dial.least.bytes))?,
+            dialled => dialled,
+        },
+    };
     let room = room - arena;
     plan.host.nvme_arena_bytes = arena;
     // The prompt run-ahead's page-cache window, `2 W`, is a host reserve of

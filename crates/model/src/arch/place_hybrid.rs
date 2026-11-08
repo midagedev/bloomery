@@ -286,9 +286,9 @@ pub struct PlanInputs<H> {
     /// Whether the loader serves the common host-run NVMe arena. Opt-in only: a plan cannot
     /// promise paging merely because the placement can split the expert stacks.
     nvme_tier: bool,
-    /// Whether a split plan takes the arena at its floor when the lever leaves it unset
-    /// ([`PlanInputs::with_arena_at_floor`]); off, the split dial's default.
-    arena_at_floor: bool,
+    /// Whether a split plan takes at least the arena's floor when the lever leaves it unset
+    /// ([`PlanInputs::with_pass_arena`]); off, the split dial's default.
+    pass_arena: bool,
     /// The engine the refusals that name one name.
     engine: &'static str,
 }
@@ -415,7 +415,7 @@ impl<H> PlanInputs<H> {
             tier_reserve: None,
             stream_slot: 0,
             nvme_tier: false,
-            arena_at_floor: false,
+            pass_arena: false,
             engine,
         })
     }
@@ -465,15 +465,15 @@ impl<H> PlanInputs<H> {
     }
 
     /// `self` for a load whose prompt passes read every paged expert once a pass: a plan the NVMe
-    /// tier splits takes the arena at its floor ([`placement::ArenaFloor::of`] on the plan before
-    /// the split, the floor the dial reads) when `BLOOMERY_NVTIER_BYTES` is unset, so the paged
-    /// ids are read into the arena and not through the file mapping the host share is cached in.
-    /// A set lever is taken as it is (0 pages through the mapping). A plan that pages nothing
-    /// takes no arena.
+    /// tier splits takes the split dial's arena, or the arena's floor where the dial gives none
+    /// ([`placement::expert_nvme_tier_for_passes`]), when `BLOOMERY_NVTIER_BYTES` is unset, so the
+    /// paged ids are read into the arena and not through the file mapping the host share is cached
+    /// in, and the step decodes on the same arena the dial gives it. A set lever is taken as it is
+    /// (0 pages through the mapping). A plan that pages nothing takes no arena.
     #[must_use]
-    pub fn with_arena_at_floor(self) -> PlanInputs<H> {
+    pub fn with_pass_arena(self) -> PlanInputs<H> {
         PlanInputs {
-            arena_at_floor: true,
+            pass_arena: true,
             ..self
         }
     }
@@ -582,11 +582,10 @@ impl<H> PlanInputs<H> {
         )?;
         let need = HostNeed::of(&plan, 0).bytes();
         let room = plan.plan_at(&self.room);
-        let given = match self.arena {
-            None if self.arena_at_floor => Some(placement::ArenaFloor::of(&plan)?.bytes),
-            given => given,
-        };
-        placement::expert_nvme_tier(&mut plan, room, given)?;
+        match self.arena {
+            None if self.pass_arena => placement::expert_nvme_tier_for_passes(&mut plan, room)?,
+            given => placement::expert_nvme_tier(&mut plan, room, given)?,
+        }
         if plan.host.nvme_expert_bytes > 0 && !self.nvme_tier {
             return Err(PlaceError::NoNvmeTier {
                 paged: plan.host.nvme_expert_bytes,

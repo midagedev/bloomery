@@ -12,7 +12,7 @@
 //! The body has a placed prompt pass ([`Family::pass`]): the widest pass shape the plan holds at
 //! the seat's context ([`kimi_k3_pass::pick`], the rule `generate_kimi_k3 --walk pass` picks by),
 //! planned with the shape's bytes as the prompt reserve, the expert tier's batch at its rows and
-//! the NVMe arena at its floor, and loaded by [`GpuModel::open_placed_pass`]; each request's prompt
+//! the NVMe arena the dial gives, at least its floor, and loaded by [`GpuModel::open_placed_pass`]; each request's prompt
 //! then runs through `Batch::prompt`, which takes the pass. A plan that holds no shape loads the
 //! stepped body, and `--prefill steps` asks it; the `listening` record names the walk.
 //!

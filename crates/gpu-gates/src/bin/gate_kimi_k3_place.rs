@@ -1093,7 +1093,7 @@ mod gate {
         let pass = inputs
             .clone()
             .with_prompt_reserve(reserve)
-            .with_arena_at_floor();
+            .with_pass_arena();
         let mut machine = bp_machine_at(inputs, Some(shape.rows as u64))?;
         let head = if headless {
             machine.cards.iter_mut().for_each(|c| c.head = false);
@@ -1236,7 +1236,7 @@ mod gate {
 
         // The pass's machine and tier batch with no prompt reserve: the stage card's budget is
         // the gate's alone, so the experts split as with the reserve.
-        let short = inputs.clone().with_arena_at_floor();
+        let short = inputs.clone().with_pass_arena();
         let grown = tier_batch_at(&inputs.hp, shape.rows as u64)?.card()?
             - tier_batch(&inputs.hp)?.card()?;
         let (Some(s), Some(t)) = (

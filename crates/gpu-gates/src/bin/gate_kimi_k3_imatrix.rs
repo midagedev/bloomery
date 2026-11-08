@@ -355,7 +355,7 @@ fn bp_window() -> Result<Window, GateError> {
     let pass = inputs
         .clone()
         .with_prompt_reserve(pass_bytes(&inputs.hp, CTX, shape)?)
-        .with_arena_at_floor();
+        .with_pass_arena();
     let machine = bp_machine_at(&inputs, Some(shape.rows as u64))?;
     let table = split_table(&pass, &machine, CTX as u64, header)?;
     let budget = pick_budget(&table)?;
