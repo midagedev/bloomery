@@ -60,7 +60,7 @@ fn the_family_refuses_a_set_of_another_file() -> Result<(), RefError> {
     let set = dir.display().to_string();
     for other in [
         "/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-Q4_K_M.gguf",
-        "/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-Q8_0.gguf",
+        "/data/moved/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-Q8_0.gguf",
         "/models/elsewhere/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
     ] {
         match check(&dir, other, IK_BUILD, ARCH, true) {
@@ -209,7 +209,7 @@ fn the_mtp_family_refuses_a_set_of_another_draft() -> Result<(), RefError> {
     let dir = set_dir("mtp-draft")?;
     for draft in [
         None,
-        Some("/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-Q8_0.gguf"),
+        Some("/data/moved/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-Q8_0.gguf"),
     ] {
         write_mtp(&dir, MODEL, draft, MTP_BUILD);
         match MTP.check_set(&dir) {

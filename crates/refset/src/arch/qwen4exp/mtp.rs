@@ -17,7 +17,8 @@ use crate::family::{Build, Family, Identity};
 
 /// The shared MTP draft file every set of the family is dumped with and
 /// the tree runs: its one layer, no embedding and no output of its own.
-pub const DRAFT: &str = "/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf";
+pub const DRAFT: &str =
+    "/data/moved/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf";
 
 /// The qwen4exp family's beside-file draft ([`DRAFT`], for the target files
 /// that declare [`ARCH`]).

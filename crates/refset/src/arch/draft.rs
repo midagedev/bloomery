@@ -340,7 +340,8 @@ mod tests {
     /// `DraftFrom` cases. A wrong name in the row moves none of these.
     #[test]
     fn the_qwen4exp_row_answers_as_the_function_it_replaced_did() {
-        const PATH: &str = "/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf";
+        const PATH: &str =
+            "/data/moved/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf";
         const NAME: &str = "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf";
         // The replaced `draft_file`, body for body.
         fn old(set: Option<&Path>, target: &Path) -> (PathBuf, DraftFrom) {
