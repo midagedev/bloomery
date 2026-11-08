@@ -6,9 +6,8 @@
 //! position back, so a request shares a prefix with the slot only where the sequence stands
 //! (`app::arch::kimi_k3`). The body has one tier card and runs no residency but `off`, so the
 //! family says one tier card ([`TierRule`]) and a step-fed prompt ([`Family::PREFILL_STEPS`]).
-//! A K3.1 file's context is held to its indexer's top-k, where the body attends every position
-//! the selection would pick among ([`PlanInputs::check_ctx`]): the bound is asked of `--ctx` as
-//! given and of the context the plan chose, so an unset `--ctx` that fits past it is refused too.
+//! A K3.1 file runs every context ([`PlanInputs::check_ctx`]): past its indexer's top-k the
+//! latent layers attend the rows the indexer picks.
 //!
 //! The chat surface is the model's own template, whose tool-call markup no parser reads, so a
 //! request that asks for tool calls is the server's refusal, and whose description names the
@@ -88,8 +87,8 @@ impl Family for KimiK3 {
         PlanInputs::read_without_chat(split)
     }
 
-    /// [`PlanInputs::check_ctx`]: a K3.1 file's `--ctx` past its indexer's top-k is refused by that
-    /// function's own words.
+    /// [`PlanInputs::check_ctx`], which takes every context, a K3.1 file's past its indexer's
+    /// top-k included.
     fn check_ctx(inputs: &PlanInputs, ctx: usize) -> Result<(), GateError> {
         Ok(inputs.check_ctx(u64::try_from(ctx)?)?)
     }

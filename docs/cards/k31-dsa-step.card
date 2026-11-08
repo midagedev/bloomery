@@ -1,0 +1,35 @@
+# k31dsa. Kimi K3.1's selected attention (body::index, latent_gated::attend_sel): past the indexer's top-k (2048) a latent layer
+# attends the rows its lightning indexer picks, so the reader takes every context. Before this the K3.1 reader refused a context
+# past 2048, so there is no base arm at the same --ctx-size; this card's run is the first row at a context past top-k.
+# The step's terms per latent layer and token [derived: the code's byte and launch counts; 24 latent layers, the 120 indexer
+# tensors of k31-quantize.card / 5 a layer; the indexer matrices BF16, widened to F32 at load; ~700 GB/s a card]:
+#   indexer projections  attn_k 128x7168 + proj 32x7168 + attn_q_b 4096x1536 = 7,438,336 weights, F32 29.75 MB (Q8_0 7.90 MB);
+#                        x24 = 714 MB a token, ~1.0 ms; paid at every depth on a load whose context passes top-k
+#   score + top-k        D x 256 B of keys, D x 16 B of scores (one write, three top-k reads); D=4096: 1.1 MB, D=262,144: 71 MB;
+#                        x24 at 262,144 = 1.7 GB, ~2.4 ms, and D x 8,192 tensor-core MACs (51 GMAC a token at 262,144)
+#   gather + flash       2048 x 1152 B read, written and read again = 7.1 MB in place of D x 1152 B (D=262,144: 302 MB);
+#                        x24: 170 MB in place of 7.2 GB at 262,144, ~0.24 ms in place of ~10.4 ms
+#   launches             7 more a latent layer (3 gemvs, the key, score, top-k, gather): 168 a token, x c_node
+# At a context of top-k or fewer the load selects nothing and the step is the dense one, launch for launch.
+kind: baseline
+question: what decode rate does the K3.1 v1 set reach at --ctx-size 8192, D=512, through bloomery-serve at --place bp on the box alone, now that the reader takes a context past top-k
+term: decode tok/s at D=512, bloomery-serve from the tree carrying k31dsa, --place bp, --ctx-size 8192, 2 rounds
+unit: tok/s
+predict: 3.0..3.4
+condition: tools/ref/depth-serve.sh as k31-serve-bp try7 (DEPTH_SERVE_FOLD=depths, BLOOMERY_HOST_ROOM=252G, DEPTH_SERVE_REQ_BOUND=1800,
+  the kimi-k3 profile, the v1 set's first shard on /models, the prose corpus ids, one lease, the cards idle at the baseline read) with
+  DEPTH_SERVE_CTX=8192: the plan line must show the latent layers' rows on the cards (1,408 B a position, the 1,152 B cache row and
+  the 256 B index key; 24 layers: 277 MB at 8192, 69 MB at 2048); every row [cold] as in try7, read as that set's steady state when the rounds repeat within 5 %
+reason: [derived] the try7 row at --ctx-size 2048 read 3.30 / 3.32 tok/s @ D=512 (~300 ms a token, the NVMe expert tier dominant). At
+  8192 the step adds the indexer's ~1.0 ms of F32 projections, 168 launches and, at D=512, under 0.1 ms of score and gather bytes:
+  -1 % or less of the token while c_node is under 6 us, inside the rows' 5 % repeat, so the band is try7's row widened by that repeat; this row is the
+  first K3.1 number at a context past top-k and the reference the deep rows (D=4096, the KV at 262,144) are read against
+decide-in: write the row into the release notes' Kimi K3.1 table at --ctx-size 8192 with these conditions; the next sitting takes
+  D=4096 at --ctx-size 8192 (score and keys 27 MB, ~0.04 ms; the gather's 170 MB against the dense walk's 113 MB: the selection
+  reads fewer bytes than the walk only past D ~ 8,000, where 3 x 2048 rows and D x 272 B of keys and scores equal D rows) and the plan of
+  --ctx-size 262144
+decide-below: under 3.0: read the plan line first (the 208 MB more of latent rows than at 2048 take card room from the experts:
+  [derived] a token reads 4.9 GB of the 515 GB of experts, so a GB of experts moved to nvme0 costs ~9.5 MB a token at 5 GB/s in
+  place of 40 GB/s, ~1.7 ms, and 0.2 GB ~0.4 ms: not enough alone); with the plan's expert split equal to try7's, price the
+  indexer by a doubling probe of its projections before reading anything else
+decide-above: beyond 3.4: read the plan line (more host residency than try7) before crediting the step

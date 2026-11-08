@@ -31,12 +31,24 @@
 //! span there. Past it a token whose group reaches a wider cut than its own row's sums its keys in
 //! another order: a float-order band, not a bit pin.
 //!
+//! [`attend_sel`] is [`attend`] over a selection: a list of the cache rows the layer's indexer picked
+//! (Kimi K3.1, llama.cpp `src/models/kimi-k31.cpp`, `build_dsa_layer`). Steps 1 to 3 and 5 to 6 are
+//! [`attend`]'s; step 4 is two launches: the list's rows of the cache gathered in list order into a
+//! contiguous scratch (`latent::enqueue_kv_gather_sel`, the list's live length a device word), and the
+//! same latent attention over the scratch with that word as its key count (Mistral Large 4's rope
+//! layers run the same pair). The list is ascending (the indexer writes its picks in row order), so
+//! at a live count at or under the list's width, where the list is the identity, the scratch holds
+//! the cache's rows `0 ..= pos` in order and the attention over it is [`attend`]'s bit for bit while
+//! both heights take the same form of the split launch (`flash::segments_for`: both past
+//! `seg_keys`, as a 2,048-row list under a taller cache is). The current row is in the scratch only
+//! when the list picked it.
+//!
 //! What the file forces here: the NoPE extra part and the output gate; the widths are the
 //! caller's ([`MlaDims`]).
 
 use crate::fault::FaultSink;
 use crate::flash::{FlashGeom, FlashInputs, FlashSplitArgs, partials_ms_len, partials_v_len};
-use crate::latent::{LATENT, LatentExtraAppendArgs, LatentKernels, Rows};
+use crate::latent::{KvGatherSelArgs, LATENT, LatentExtraAppendArgs, LatentKernels, Rows};
 use crate::linear::PASS_ROWS;
 use crate::linear::out_gate::{OutGateArgs, OutGateKernels};
 use crate::model::{Q8_0GemvHeadsArgs, StepKernels};
@@ -241,6 +253,66 @@ pub struct AttendIn<'a> {
     pub fault: FaultSink,
 }
 
+/// The rows a selected attention reads ([`attend_sel`]): the indexer's list of cache rows, its
+/// live length and the scratch the rows are gathered into.
+pub struct Selection<'a> {
+    /// `[stride]`: the picked cache rows, ascending.
+    pub list: &'a DeviceBuffer<u32>,
+    /// One word: the list's live length, `min(pos + 1, stride)`; the gather's count and the
+    /// attention's key count over the scratch.
+    pub n: &'a DeviceBuffer<u32>,
+    /// The list's width: the most rows a token picks.
+    pub stride: usize,
+    /// `[stride][row]` f16: the gathered rows.
+    pub scratch: &'a mut DeviceTensor<u16>,
+}
+
+impl Selection<'_> {
+    /// Refuse by name a selection no launch here runs over `cache`: a scratch of another width than
+    /// the cache row or of other than `stride` rows, a list shorter than `stride`, a count of other
+    /// than one token, and a list at least the cache's height, under which the dense walk reads
+    /// the rows the list could name.
+    fn check(&self, d: &MlaDims, cache: &DeviceTensor<u16>) -> Result<(), GpuError> {
+        let (rows, cols) = (self.scratch.rows(), self.scratch.cols());
+        if cols != d.row() || rows != self.stride {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the selection's scratch is {rows}x{cols}; a list of {} rows gathers {} rows \
+                     of {}",
+                    self.stride,
+                    self.stride,
+                    d.row()
+                ),
+            ));
+        }
+        if self.list.len() < self.stride || self.n.len() != 1 {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a list of {} entries and {} count words; one token's list is {} entries and \
+                     one word",
+                    self.list.len(),
+                    self.n.len(),
+                    self.stride
+                ),
+            ));
+        }
+        if self.stride == 0 || self.stride >= cache.rows() {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a list of {} rows over a cache of {}: a selection picks fewer rows than the \
+                     cache holds",
+                    self.stride,
+                    cache.rows()
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The module doc's launches for one row: the cache row at `pos`
 /// written into `cache`, the gated heads into `y` (`[heads·v_head]`).
 pub fn attend(
@@ -250,6 +322,40 @@ pub fn attend(
     a: AttendIn<'_>,
     s: AttnBufs<'_>,
     cache: &mut DeviceTensor<u16>,
+    y: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    attend_one(gpu, k, d, a, s, (cache, None), y)
+}
+
+/// [`attend`] over the rows `sel` names (module doc): the cache row at `pos` written into `cache`,
+/// `sel`'s rows of the cache gathered into its scratch, the latent attention over them, the gated
+/// heads into `y`. A selection [`Selection::check`] refuses is refused by name before any launch.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "attend's six and the selection, each named as attend names it (rust-quality R8)"
+)]
+pub fn attend_sel(
+    gpu: &Gpu,
+    k: &MlaKernels,
+    d: &MlaDims,
+    a: AttendIn<'_>,
+    s: AttnBufs<'_>,
+    cache: &mut DeviceTensor<u16>,
+    sel: Selection<'_>,
+    y: &mut DeviceBuffer<f32>,
+) -> Result<(), GpuError> {
+    sel.check(d, cache)?;
+    attend_one(gpu, k, d, a, s, (cache, Some(sel)), y)
+}
+
+/// [`attend`]'s launches, step 4 over `sel`'s gathered rows when there is one.
+fn attend_one(
+    gpu: &Gpu,
+    k: &MlaKernels,
+    d: &MlaDims,
+    a: AttendIn<'_>,
+    s: AttnBufs<'_>,
+    (cache, sel): (&mut DeviceTensor<u16>, Option<Selection<'_>>),
     y: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
     d.check_heads(a.k_b, &a.v_b)?;
@@ -288,13 +394,35 @@ pub fn attend(
     )?;
     k.step
         .enqueue_gather(stream, a.q, &k.src, &k.dst, d.heads * d.extra, s.qabs)?;
+    let (kv, n_keys): (&DeviceTensor<u16>, &DeviceBuffer<u32>) = match sel {
+        None => (cache, a.n_keys),
+        Some(Selection {
+            list,
+            n,
+            stride,
+            scratch,
+        }) => {
+            k.latent.enqueue_kv_gather_sel(
+                stream,
+                KvGatherSelArgs {
+                    list,
+                    n,
+                    stride,
+                    src: cache,
+                    fault: a.fault,
+                    dst: &mut *scratch,
+                },
+            )?;
+            (scratch, n)
+        }
+    };
     gpu.flash().enqueue_flash_latent_split(
         stream,
         FlashSplitArgs {
             inputs: FlashInputs {
                 q: s.qabs,
-                kv: cache,
-                n_keys_buf: a.n_keys,
+                kv,
+                n_keys_buf: n_keys,
                 kq_scale: 1.0 / (d.head_k() as f32).sqrt(),
                 geom: FlashGeom {
                     tokens: 1,

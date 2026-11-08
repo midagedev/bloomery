@@ -885,6 +885,11 @@ required-features = ["gpu"]
 # kimik3-mla: Kimi K3's gated MLA layer on the card (latent_gated's launches at K3's geometry) against the llama.cpp graph in f64.
 [[bin]]
 name = "gate_kimi_k3_mla"
+# kimik3-dsa: Kimi K3.1's selected attention on the card (the index key, the lightning indexer's list, the latent core over the
+# list's rows) against host rules and the llama.cpp graph in f64.
+[[bin]]
+name = "gate_kimi_k3_dsa"
+required-features = ["gpu"]
 # kimik3-moe: Kimi K3's routed block (the common routed block with the latent pair, the routed-sum norm and the gated shared stack)
 # against the llama.cpp graph in f64, on the fixture's routed layers and on random tensors at the real widths.
 [[bin]]

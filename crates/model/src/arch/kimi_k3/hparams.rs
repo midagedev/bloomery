@@ -243,24 +243,12 @@ impl Hparams {
         self.indexer.as_ref().is_some_and(|ix| ix.layers[l])
     }
 
-    /// A context of `ctx` positions the engine runs: every context of a K3 file, and a K3.1
-    /// file's up to `attention.indexer.top_k`, where the indexer's selection is every position
-    /// and the dense latent attention is the file's. A longer context needs the selected
-    /// attention, which no body runs yet, so it is refused by the key's name and never attended
-    /// densely.
-    pub fn check_ctx(&self, ctx: u64) -> Result<(), PlacementError> {
-        match &self.indexer {
-            Some(ix) if ctx > ix.top_k as u64 => Err(PlacementError::Metadata {
-                key: format!("{}.attention.indexer.top_k", self.arch),
-                detail: format!(
-                    "is {}; a context of {ctx} positions is past it, where the indexer selects \
-                     that many and the latent attention here reads every position (the selected \
-                     attention is not in this engine)",
-                    ix.top_k
-                ),
-            }),
-            _ => Ok(()),
-        }
+    /// A context of `ctx` positions the engine runs: every context the plan holds, of a K3 file and
+    /// of a K3.1 file alike. Past a K3.1 file's `attention.indexer.top_k` its latent layers attend
+    /// the rows their indexer picks, the file's attention at any context; at or under it the
+    /// selection is every position and the dense latent attention is its result.
+    pub fn check_ctx(&self, _ctx: u64) -> Result<(), PlacementError> {
+        Ok(())
     }
 
     /// Whether layer `l` is a dense block, not a routed one.
@@ -383,6 +371,28 @@ impl Hparams {
 }
 
 impl Indexer {
+    /// Whether a pass of rows whose last row sees `keys` keys attends as the file does: a pass
+    /// attends every key it sees, a layer that runs the indexer the `top_k` best past that many.
+    #[must_use]
+    pub fn pass_attends_as_the_file(&self, keys: u64) -> bool {
+        keys <= self.top_k as u64
+    }
+
+    /// Of a prompt of `n` ids from position `pos`, the leading ids a pass of rows may take: those
+    /// whose keys stay within `top_k` ([`Indexer::pass_attends_as_the_file`]), none when `pos` is
+    /// already at or past it. The ids after them are the one-token step's, which selects.
+    #[must_use]
+    pub fn pass_prefix(&self, pos: u64, n: usize) -> usize {
+        let room = (self.top_k as u64).saturating_sub(pos);
+        usize::try_from(room).map_or(n, |room| room.min(n))
+    }
+
+    /// The first layer that runs the indexer, `None` on a list of none.
+    #[must_use]
+    pub fn first_layer(&self) -> Option<usize> {
+        self.layers.iter().position(|&runs| runs)
+    }
+
     /// A K3.1 file's indexer keys: the head count and key width the kernels run, a rope of no
     /// values (the key is not rotated), the LayerNorm's epsilon, the top-k, and the layers that
     /// run it, which are the latent layers and no other. Every other value, or a layer list that
@@ -1579,21 +1589,64 @@ pub(super) mod tests {
         .expect("a Q8_0 indexer matrix reads");
     }
 
-    /// A K3.1 file's context is held to the indexer's top-k: at it the selection is every
-    /// position, past it the selected attention would be needed and the check refuses by the
-    /// key's name. A K3 file has no such bound. Mutants: `>` to `>=`, the check dropped.
+    /// A K3.1 file runs every context: at its indexer's top-k the selection is every position, past
+    /// it the latent layers attend the rows the indexer picks, so a context of `top_k + 1` and one
+    /// of 262,144 positions (256k) run as a K3 file's do. Mutant: the bound past `top_k` put back.
     #[test]
-    fn a_k31_context_past_top_k_is_refused_by_name() {
+    fn a_k31_context_past_top_k_runs() {
         let hp = read31("ctx", &keys31(), &tensors31()).expect("the K3.1 header reads");
-        hp.check_ctx(1).expect("a short context runs");
-        hp.check_ctx(TOP_K).expect("a context of top-k runs");
-        let e = hp.check_ctx(TOP_K + 1).expect_err("past top-k").to_string();
-        assert!(
-            e.contains("kimi-k31.attention.indexer.top_k") && e.contains(&format!("{}", TOP_K + 1)),
-            "{e}"
-        );
+        for ctx in [1, TOP_K, TOP_K + 1, 262_144] {
+            hp.check_ctx(ctx)
+                .unwrap_or_else(|e| panic!("a context of {ctx} runs: {e}"));
+        }
         let k3 = read("ctx-k3", &keys(), &tensors()).expect("the K3 header reads");
         k3.check_ctx(1 << 20).expect("a K3 file has no bound");
+    }
+
+    /// A pass of rows attends as the file does up to the indexer's top-k keys and no further: the
+    /// rows pass refuses past it (`bloomery_gpu::arch::kimi_k3::check_pass`), so its last row's key
+    /// count `top_k + 1` is the first refused. The first layer that runs the indexer is the first
+    /// latent layer. Mutants: `<=` made `<`; the comparison against `top_k + 1`.
+    #[test]
+    fn a_pass_past_top_k_does_not_attend_as_the_file() {
+        let hp = read31("pass", &keys31(), &tensors31()).expect("the K3.1 header reads");
+        let ix = hp.indexer.as_ref().expect("a K3.1 file has an indexer");
+        let top = TOP_K;
+        for keys in [1, top - 1, top] {
+            assert!(ix.pass_attends_as_the_file(keys), "{keys} keys");
+        }
+        for keys in [top + 1, 262_144] {
+            assert!(!ix.pass_attends_as_the_file(keys), "{keys} keys");
+        }
+        let first = hp.kinds.iter().position(|k| *k == Kind::Mla);
+        assert_eq!(ix.first_layer(), first);
+    }
+
+    /// A prompt's ids a pass may take are those up to the indexer's top-k keys: all of a prompt
+    /// that ends at or before it, the ids up to it of one that crosses it, none from a position at
+    /// or past it; the pass that takes them sees `top_k` keys at most on its last row. Mutants: the
+    /// prefix the whole prompt (the split removed); `top_k - pos + 1`.
+    #[test]
+    fn a_prompt_past_top_k_is_passed_up_to_it_and_stepped_after() {
+        let hp = read31("prefix", &keys31(), &tensors31()).expect("the K3.1 header reads");
+        let ix = hp.indexer.as_ref().expect("a K3.1 file has an indexer");
+        let top = TOP_K as usize;
+        for (pos, n, want) in [
+            (0, top, top),
+            (0, top + 8, top),
+            (3, top + 8, top - 3),
+            (top as u64 - 1, 5, 1),
+            (top as u64, 5, 0),
+            (top as u64 + 9, 5, 0),
+            (0, 4, 4),
+        ] {
+            let got = ix.pass_prefix(pos, n);
+            assert_eq!(got, want, "pos {pos}, {n} ids");
+            assert!(
+                got == 0 || ix.pass_attends_as_the_file(pos + got as u64),
+                "pos {pos}, {n} ids"
+            );
+        }
     }
 
     /// The reader lists, and does not refuse, the keys of a K3.1 file it does not read: the
