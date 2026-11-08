@@ -248,6 +248,7 @@ pub(super) fn totals<'a>(
         card_budget,
         budget_from_pool: false,
         expert_rank: None,
+        kv_floor: None,
     })
 }
 

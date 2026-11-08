@@ -98,7 +98,15 @@
 //! never takes the room the residency needs; where not even the floor of the search leaves them, the
 //! context is the plain fit, the unset word resolves `off` (a set word is
 //! refused by name), and a
-//! `ctx experts-floor=unmet` line says why. An unset MTP draft yields to the
+//! `ctx experts-floor=unmet` line says why. The KV floor
+//! (`BLOOMERY_KV_FLOOR=<positions>`) moves where the spread runs, not the
+//! context: the plan counts its cache at the floor's positions and every
+//! other term at the context the choice above made, so the experts the
+//! context's KV would have displaced come back until a sequence grows past
+//! the floor (the room fit's named refusal then, until the residency
+//! machine frees bytes for it); the `plan` line prints `kv_floor=` beside
+//! `ctx_max=`, unset the plan of the context alone. An unset MTP draft
+//! yields to the
 //! context:
 //! when the drafted plan fits a context at most half the one the plain plan
 //! holds, or holds not even the floor, the draft goes off and a `draft
@@ -2333,7 +2341,13 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         .w("place", a.place.name())
         .w("card", machine.cards[0].name.as_str())
         .w("experts", experts_name(experts))
-        .u("ctx_max", plan.ctx_max)
+        .u("ctx_max", plan.ctx_max);
+    // The spread's floor, only where the lever moved it below the context.
+    let line = match plan.kv_floor {
+        Some(floor) => line.u("kv_floor", floor),
+        None => line,
+    };
+    let line = line
         .u("host_experts", plan.host.experts)
         .u("card_experts", plan.cards[0].experts);
     let line = match (machine.tiers.first(), plan.tier_n_l.first()) {

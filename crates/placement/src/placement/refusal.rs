@@ -76,6 +76,15 @@ pub enum PlacementError {
     /// with what says why.
     #[error("expert rank {file}: {detail}")]
     ExpertRank { file: String, detail: String },
+    /// The KV floor `BLOOMERY_KV_FLOOR` sets passes the plan's context: the
+    /// expert spread is planned at the floor, which never passes the cap
+    /// (`ctx_max`) the stores' rooms and rows are planned at.
+    #[error(
+        "the KV floor {floor} passes the plan's context {cap}: the expert spread is planned at \
+         BLOOMERY_KV_FLOOR's positions and never past the context the rooms' range and rows are \
+         reserved at; ask a context of at least the floor, or a smaller floor"
+    )]
+    KvFloor { floor: u64, cap: u64 },
     /// A host room under the floor of the NVMe expert tier: the plan's host
     /// terms outside the routed experts, and the transient reads of two
     /// layers' NVMe-tier experts and one layer's host experts beside them —

@@ -3391,6 +3391,135 @@ mod tests {
         }
     }
 
+    /// A qwen4exp plan spreads its experts at the KV floor the levers name
+    /// (`PlanLevers::kv_floor`, `BLOOMERY_KV_FLOOR`) and keeps every other
+    /// term at the context: on this header's one attention layer the 1 GiB
+    /// of K/V planes a 65,536-position cap takes holds 14 of the model's 32
+    /// experts, and a 4,096-position floor gives all 32 back; the plan's
+    /// `kv_floor` and cache term say so, and a floor above the context is
+    /// refused by name. Unset, the plan is the one the lever unset made:
+    /// its cache term is the cap's own KV.
+    ///
+    /// FAIL-first: a floor read at the cap holds the cap's experts and no
+    /// more.
+    #[test]
+    fn a_qwen4exp_plan_spreads_its_experts_at_the_kv_floor() {
+        use crate::arch::qwen35moe::hparams::tests::{keys, tensors};
+        use crate::arch::synthetic::{Ty, V, header_typed};
+        use crate::placement::PlanLevers;
+        use crate::placement::workstation::HostRead;
+
+        let typed: Vec<_> = tensors()
+            .into_iter()
+            .map(|(n, d)| {
+                // The program's card leg reads a Q4_K gate and up and a Q8_0
+                // down ([`PROGRAM`]); a stack of another type keeps its
+                // experts on the host.
+                if n.contains(".ffn_gate_exps") || n.contains(".ffn_up_exps") {
+                    (n, vec![2_621_440, 1, 8], Ty::Q4K)
+                } else if n.contains(".ffn_down_exps") {
+                    (n, vec![2_097_152, 1, 8], Ty::Q8_0)
+                } else if n.ends_with(".attn_q.weight") {
+                    (n, vec![64, 8_192], Ty::F32)
+                } else {
+                    (n, d, Ty::F32)
+                }
+            })
+            .collect();
+        let pre = [("tokenizer.ggml.pre", V::Str("qwen35"))];
+        // The attention layer's key width 2,048, so its K/V planes alone are
+        // half a GiB at the 65,536-position cap and a thirty-second of that
+        // at the 4,096-position floor.
+        let keys: Vec<(&str, V)> = keys()
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    k,
+                    match k {
+                        "attention.key_length" | "attention.value_length" => V::U32(2_048),
+                        _ => v,
+                    },
+                )
+            })
+            .collect();
+        let path = header_typed("q4x-kvfloor", "qwen4exp", &keys, &pre, &typed);
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let inputs = super::PlanInputs::describe_in(&split, (u64::MAX, HostRead::Given))
+            .expect("the file describes");
+        let _ = std::fs::remove_file(&path);
+        // A card of 1.75 GiB whose room the cap's 1 GiB of K/V planes and
+        // the model's 32 experts (~5 MB each) contend for: the cap holds
+        // some of them, the floor's KV gives the rest back.
+        let small = crate::placement::workstation::CardSpec {
+            name: "small",
+            total_bytes: 7 << 28,
+            driver_reserve_bytes: 0,
+            device: None,
+            free_bytes: None,
+            held_by: None,
+            integrated: false,
+            margin_bytes: Some(64 << 20),
+            granule_bytes: crate::placement::workstation::GRANULE,
+        };
+        let machine = super::machine(
+            small,
+            crate::arch::qwen35moe::place::Stack::q8_blocks32(inputs.model.layers),
+            8,
+        );
+        let levers = |floor: Option<u64>| PlanLevers {
+            kv_floor: floor,
+            ..PlanLevers::default()
+        };
+        let cap_plan = inputs
+            .plan_with(&machine, (65_536, 8), &levers(None), super::Experts::Card)
+            .expect("the cap's plan");
+        let cap = &cap_plan.cards[0];
+        let floored = inputs
+            .plan_with(
+                &machine,
+                (65_536, 8),
+                &levers(Some(4_096)),
+                super::Experts::Card,
+            )
+            .expect("the floor's plan");
+        assert_eq!(
+            cap.experts, 14,
+            "the cap's KV displaces the experts it cannot hold"
+        );
+        assert_eq!(
+            floored.cards[0].experts,
+            inputs.model.experts * inputs.model.layers as u64,
+            "the floor's KV gives every expert back"
+        );
+        assert_eq!(floored.kv_floor, Some(4_096));
+        assert!(cap_plan.kv_floor.is_none());
+        assert_eq!(floored.ctx_max, 65_536, "the cap stays the plan's context");
+        // The cache term is the floor's own — what a plan made at 4,096
+        // positions holds — and unset it is the cap's.
+        let floor_ctx = inputs
+            .plan_with(
+                &machine,
+                (4_096, 8),
+                &PlanLevers::default(),
+                super::Experts::Card,
+            )
+            .expect("a plan at the floor's context");
+        assert_eq!(floored.cards[0].kv_bytes, floor_ctx.cards[0].kv_bytes);
+        let over = inputs
+            .plan_with(
+                &machine,
+                (4_096, 8),
+                &levers(Some(4_097)),
+                super::Experts::Card,
+            )
+            .expect_err("a floor above the context is refused");
+        let text = over.to_string();
+        assert!(
+            text.contains("BLOOMERY_KV_FLOOR") && text.contains("4097") && text.contains("4096"),
+            "{text}"
+        );
+    }
+
     /// A qwen4exp file's stream slot is its widest routed expert, the gate, up and down at their
     /// file bytes: three Q8_0 rows of 64 values, 68 B each, or three NVFP4 rows, 36 B each, and
     /// each NVFP4 stack's four-byte tensor scale. A load of every expert on the host streams

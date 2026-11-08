@@ -12,6 +12,7 @@ mod bounds;
 mod early;
 mod floor;
 mod host_stage;
+mod kv_floor;
 mod legs;
 mod rank;
 
@@ -45,6 +46,7 @@ fn budget_plan<'a>(model: &'a ModelTensors, machine: &'a Machine, budget: u64) -
         card_budget: card_budget::CardBudget::Every(budget),
         budget_from_pool: false,
         expert_rank: None,
+        kv_floor: None,
     }
 }
 /// A card running `layers`, with the head and the token embedding as

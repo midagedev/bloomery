@@ -286,6 +286,11 @@ pub struct Plan<'a> {
     /// The router rank the plan took each routed layer's ids in
     /// (`PlanLevers::expert_rank`); none, the id prefix and the ids after it.
     pub expert_rank: Option<Arc<ExpertRank>>,
+    /// The KV floor the plan's expert spread ran at
+    /// (`PlanLevers::kv_floor`, `BLOOMERY_KV_FLOOR`): the plan's cache term
+    /// holds the floor's bytes while its `ctx_max` keeps the range and rows
+    /// the rooms are planned at. None, every term at `ctx_max`.
+    pub kv_floor: Option<u64>,
 }
 
 /// What the load of one stage card does about the output head ([`Plan::head_site`]).

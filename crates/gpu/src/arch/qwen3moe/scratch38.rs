@@ -132,9 +132,20 @@ impl Store38 {
             rows: pools,
         };
         Ok(Store38::Qsa {
-            kv: KvPlanes::roomed(stream, (d.n_kv, d.ctx, d.head), kv)?,
+            kv: KvPlanes::roomed(
+                stream,
+                (d.n_kv, d.ctx, d.head),
+                kv,
+                "a Qwen3.8 slot's K/V planes",
+            )?,
             ring: DeviceBuffer::zeroed(stream, qsa::RING_ROWS * geo::IDX_DIM)?,
-            pooled: Roomed::new(Arc::clone(stream), pools * geo::IDX_DIM, &[run], |[b]| b)?,
+            pooled: Roomed::new(
+                Arc::clone(stream),
+                pools * geo::IDX_DIM,
+                &[run],
+                "a Qwen3.8 slot's pooled keys",
+                |[b]| b,
+            )?,
         })
     }
 
@@ -829,8 +840,13 @@ mod tests {
                 for drafts in [false, true] {
                     let draft: Vec<_> = (0..if drafts { slots } else { 0 })
                         .map(|_| {
-                            KvPlanes::roomed(&stream, (geo::N_KV, ctx, geo::HEAD), kv)
-                                .expect("a draft store")
+                            KvPlanes::roomed(
+                                &stream,
+                                (geo::N_KV, ctx, geo::HEAD),
+                                kv,
+                                "the Qwen3.8 MTP draft's store",
+                            )
+                            .expect("a draft store")
                         })
                         .collect();
                     let raw = runtime::stores::selecting_rows_bytes(

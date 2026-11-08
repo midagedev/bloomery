@@ -367,7 +367,8 @@ impl KvPlanes {
     }
 
     /// Planes of `n_kv` key heads, `ctx` rows and `head` values in the `kv`
-    /// format, each in a room: every head's `[ctx][·]` rows of a plane a run
+    /// format, each in a room named `what` (the store a fit's refusal
+    /// names): every head's `[ctx][·]` rows of a plane a run
     /// (the f16 rows, or the q8_0 codes and scales [`q8_plane_lens`] counts), so
     /// a fit backs the rows of the positions it reaches in every head of
     /// every plane ([`Roomed::fit`]). Load-time only.
@@ -375,11 +376,13 @@ impl KvPlanes {
         stream: &Arc<CudaStream>,
         (n_kv, ctx, head): (usize, usize, usize),
         kv: KvQ8,
+        what: &'static str,
     ) -> Result<Roomed<KvPlanes>, GpuError> {
         fn planes<T, const N: usize>(
             stream: &Arc<CudaStream>,
             (n_kv, ctx): (usize, usize),
             row: usize,
+            what: &'static str,
         ) -> Result<Roomed<[DeviceBuffer<T>; N]>, GpuError> {
             let runs: Vec<Run> = (0..n_kv)
                 .map(|h| Run {
@@ -389,17 +392,16 @@ impl KvPlanes {
                     rows: ctx,
                 })
                 .collect();
-            Roomed::new(Arc::clone(stream), n_kv * ctx * row, &runs, |b| b)
+            Roomed::new(Arc::clone(stream), n_kv * ctx * row, &runs, what, |b| b)
         }
         Ok(match kv {
-            KvQ8::F16 => {
-                planes::<u16, 2>(stream, (n_kv, ctx), head)?.map(|[k, v]| KvPlanes::F16 { k, v })
-            }
+            KvQ8::F16 => planes::<u16, 2>(stream, (n_kv, ctx), head, what)?
+                .map(|[k, v]| KvPlanes::F16 { k, v }),
             KvQ8::Q8 => {
                 let (codes, scales) = q8_plane_lens(head, 1, 1);
                 Roomed::join(
-                    planes::<u32, 2>(stream, (n_kv, ctx), codes)?,
-                    planes::<u16, 2>(stream, (n_kv, ctx), scales)?,
+                    planes::<u32, 2>(stream, (n_kv, ctx), codes, what)?,
+                    planes::<u16, 2>(stream, (n_kv, ctx), scales, what)?,
                     |[kq, vq], [kd, vd]| KvPlanes::Q8 { kq, kd, vq, vd },
                 )
             }

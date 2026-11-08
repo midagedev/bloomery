@@ -642,6 +642,7 @@ fn accessors_read_their_rows() {
             XSTREAM,
             SPLIT_WALK,
             QWEN3_KV,
+            KV_FLOOR,
             LANE_PREFETCH,
             HOST_LANES,
             GEN_SLOTS,
@@ -765,6 +766,57 @@ fn expert_rank_takes_a_path_and_a_binary_that_leaves_it_out_refuses_it() {
     let none: &[(&str, &str)] = &[];
     let left_out = read(&env(none), NO_LEVER).expect("an unset lever is no refusal");
     assert_eq!(left_out.expert_rank(), None);
+}
+
+/// `BLOOMERY_KV_FLOOR` takes a whole number of positions from 1 to u32::MAX,
+/// unset is no floor, a value the kind does not take names the lever, and a
+/// binary that leaves the lever out refuses it set — the refusal every other
+/// family's load gives it.
+#[test]
+fn kv_floor_takes_positions_and_a_binary_that_leaves_it_out_refuses_it() {
+    let floor = |pairs: &[(&str, &str)]| read(&env(pairs), Scope::Every).map(|l| l.kv_floor());
+    assert_eq!(floor(&[]).unwrap(), None);
+    assert_eq!(floor(&[(KV_FLOOR, "4096")]).unwrap(), Some(4096));
+    assert_eq!(floor(&[(KV_FLOOR, "1")]).unwrap(), Some(1));
+    assert_eq!(
+        floor(&[(KV_FLOOR, "4294967295")]).unwrap(),
+        Some(4294967295),
+        "u32::MAX is the most the kind takes"
+    );
+    for bad in [
+        "0",
+        "-1",
+        "4096.5",
+        "abc",
+        "0x10",
+        "1e6",
+        "04096",
+        "4294967296",
+        "",
+    ] {
+        let Err(e) = floor(&[(KV_FLOOR, bad)]) else {
+            panic!("{bad:?} is not a position count and must be refused");
+        };
+        let text = e.to_string();
+        assert!(text.contains(KV_FLOOR), "{bad}: {text}");
+    }
+    let acts = Scope::Main {
+        bin: "b",
+        acts_on: &[KV_FLOOR],
+    };
+    assert_eq!(
+        read(&env(&[(KV_FLOOR, "4096")]), acts).unwrap().kv_floor(),
+        Some(4096)
+    );
+    let Err(e) = read(&env(&[(KV_FLOOR, "4096")]), NO_LEVER) else {
+        panic!("a binary that leaves the floor out refuses it");
+    };
+    assert!(e.to_string().contains(KV_FLOOR), "{e}");
+    // A reading that left the lever out has it unset, where the placement's
+    // reader asks.
+    let none: &[(&str, &str)] = &[];
+    let left_out = read(&env(none), NO_LEVER).expect("an unset lever is no refusal");
+    assert_eq!(left_out.kv_floor(), None);
 }
 
 /// `BLOOMERY_NVTIER_EVICT` is read where the tier is built

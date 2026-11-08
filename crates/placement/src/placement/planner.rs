@@ -34,6 +34,14 @@ pub struct PlanLevers {
     /// after it. The plan refuses by name a rank that disagrees with the
     /// model, and one on a plan that places no routed expert on a card.
     pub expert_rank: Option<Arc<ExpertRank>>,
+    /// The KV floor `BLOOMERY_KV_FLOOR` sets, in positions: the context the
+    /// expert spread is planned at, the plan's every other term at its own
+    /// `ctx_max`. Unset (`None`), the spread at `ctx_max` itself — the plan
+    /// made before the lever. A floor above the plan's `ctx_max` is refused
+    /// by name ([`PlacementError::KvFloor`]). A binary whose loads hold
+    /// their stores in rooms alone parses the lever; a plan handed one here
+    /// is every plan that binary makes.
+    pub kv_floor: Option<u64>,
 }
 
 impl PlanLevers {
@@ -46,6 +54,7 @@ impl PlanLevers {
                 .expert_rank()
                 .map(|path| ExpertRank::read(path).map(Arc::new))
                 .transpose()?,
+            kv_floor: levers.kv_floor(),
         })
     }
 }
@@ -224,6 +233,20 @@ fn plan_rule<'a>(
     routed: Option<RoutedRule>,
     reserve: u64,
 ) -> Result<Plan<'a>, PlacementError> {
+    // The positions the expert spread's KV term is read at: the floor the
+    // levers name, or the cap itself, so unset every term of the plan is
+    // read at `ctx_max` exactly as it was before the lever. A floor above
+    // the cap is refused by name: the spread never runs past the context
+    // the rooms' range and rows are reserved at.
+    let kv_at = match levers.kv_floor {
+        Some(floor) if floor > ctx_max => {
+            return Err(PlacementError::KvFloor {
+                floor,
+                cap: ctx_max,
+            });
+        }
+        floor => floor.unwrap_or(ctx_max),
+    };
     let card_budget = &levers.card_budget_bytes;
     let rank = levers.expert_rank.as_deref();
     let tiers = machine.tiers.len();
@@ -250,7 +273,15 @@ fn plan_rule<'a>(
     let card_budget = match card_budget {
         card_budget::CardBudget::Shares(shares) => {
             by_shares = resolve_shares(
-                shares, model, machine, ctx_max, kv, &rows, &stacks, routed, reserve,
+                shares,
+                model,
+                machine,
+                (kv_at, ctx_max),
+                kv,
+                &rows,
+                &stacks,
+                routed,
+                reserve,
             )?;
             &by_shares
         }
@@ -261,7 +292,7 @@ fn plan_rule<'a>(
     let none_held = vec![0u64; model.layers];
     let mut kv_bytes = Vec::with_capacity(machine.cards.len() + machine.tiers.len());
     for (c, card) in machine.cards.iter().enumerate() {
-        let (kv_card, shadow, stage_rows) = card_kv(card, kv, ctx_max);
+        let (kv_card, shadow, stage_rows) = card_kv(card, kv, (kv_at, ctx_max));
         let eligible = match routed {
             Some(r) => eligible(card.layers.clone(), &stacks, model, r, false)?,
             None => Vec::new(),
@@ -283,7 +314,7 @@ fn plan_rule<'a>(
     }
     let mut tier_n_l: Vec<Vec<u64>> = Vec::with_capacity(machine.tiers.len());
     for (t, tier) in machine.tiers.iter().enumerate() {
-        let (kv_tier, shadow, _) = card_kv(tier, kv, ctx_max);
+        let (kv_tier, shadow, _) = card_kv(tier, kv, (kv_at, ctx_max));
         let mut held = n_l.clone();
         for prev in &tier_n_l {
             for (h, p) in held.iter_mut().zip(prev) {
@@ -393,6 +424,7 @@ fn plan_rule<'a>(
     }
     plan.reserve_beside(reserve)?;
     plan.expert_rank = levers.expert_rank.clone();
+    plan.kv_floor = levers.kv_floor;
     Ok(plan)
 }
 
@@ -436,13 +468,13 @@ fn check_rank(
 /// bytes it may plan with.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the planner's own inputs: shares, model, machine, context, cache, rows, stacks, rule"
+    reason = "the planner's own inputs: shares, model, machine, contexts, cache, rows, stacks, rule"
 )]
 fn resolve_shares(
     shares: &[(u32, u64)],
     model: &ModelTensors,
     machine: &Machine,
-    ctx_max: u64,
+    spread: (u64, u64),
     kv: &dyn KvBytes,
     rows: &[Option<Row>],
     stacks: &[Vec<usize>],
@@ -476,7 +508,7 @@ fn resolve_shares(
             continue;
         }
         let tier = c >= machine.cards.len();
-        let (kv_card, _, stage_rows) = card_kv(card, kv, ctx_max);
+        let (kv_card, _, stage_rows) = card_kv(card, kv, spread);
         let layers = if tier {
             0..model.layers
         } else {
@@ -553,13 +585,12 @@ fn host_stage_kv(
 
 /// A card's KV cache and its ring shadows over the layers its stage runs,
 /// and the stage's rows beside the cache on the card that runs layer 0;
-/// none on a tier.
-fn card_kv(card: &Card, kv: &dyn KvBytes, ctx_max: u64) -> (u64, u64, u64) {
-    let kv_card = card
-        .layers
-        .clone()
-        .map(|l| kv.layer_bytes(l, ctx_max))
-        .sum();
+/// none on a tier. The cache is read at the expert spread's floor
+/// (`spread`, the cap itself unset), the shadows and the rows at the cap
+/// `ctx_max`: a room-backed cache holds its floor's pages while its range
+/// and the rows beside it exist at the cap.
+fn card_kv(card: &Card, kv: &dyn KvBytes, (spread, ctx_max): (u64, u64)) -> (u64, u64, u64) {
+    let kv_card = card.layers.clone().map(|l| kv.layer_bytes(l, spread)).sum();
     let shadow = card
         .layers
         .clone()

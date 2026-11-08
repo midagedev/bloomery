@@ -198,6 +198,7 @@ mod tests {
             card_budget: crate::placement::card_budget::CardBudget::Unset,
             budget_from_pool: false,
             expert_rank: None,
+            kv_floor: None,
         }
     }
 

@@ -128,6 +128,8 @@ fn driver(op: &'static str) -> impl Fn(DriverError) -> GpuError {
 /// and its pages. The pages drop before the reservation (field order), as the
 /// driver wants every mapping gone before its range is freed.
 pub(crate) struct Room {
+    /// The store this room backs, for a fit's named refusal.
+    what: &'static str,
     /// Every page of the range; none only after a remap failed.
     pages: Vec<Option<Page>>,
     /// Every buffer's runs, at their offsets in the range.
@@ -190,6 +192,43 @@ impl Room {
         let own =
             PhysicalAllocation::new(ctx.cu_device(), self.page).map_err(driver("cuMemCreate"))?;
         Ok(Arc::new(own))
+    }
+
+    /// The device's free bytes on this room's context, which the calling
+    /// fit has bound to the thread, for its named refusal; the reading's
+    /// own failure is that refusal's to name.
+    fn free_bytes(&self) -> Result<usize, GpuError> {
+        // The room's context is current on this thread: the fit's `new_page`
+        // bound it before the refusal this reading names.
+        Ok(crate::current_mem_info()?.0)
+    }
+
+    /// A fit's named refusal of page `i`, the driver's `source` in it: the
+    /// store, the positions the fit asked, the bytes of new pages the fit
+    /// still asked, the page among the room's, the pages the room had
+    /// backed and the device's free bytes then.
+    fn no_room(&self, positions: usize, i: usize, source: GpuError) -> GpuError {
+        let want = self.wanted(positions);
+        let asked = want
+            .iter()
+            .enumerate()
+            .filter(|&(i, &w)| w && self.own(i).is_none())
+            .count()
+            .saturating_mul(self.page);
+        let free = self.free_bytes().map_or_else(
+            |e| format!("free bytes unreadable ({e})"),
+            |free| format!("{free} B free"),
+        );
+        GpuError::NoRoom {
+            what: self.what,
+            detail: format!(
+                "a fit of {positions} positions asks {asked} B of new pages (backing page {i} \
+                 of {}, {} backed) and the device holds {free}",
+                self.pages.len(),
+                self.mapped
+            ),
+            source: Box::new(source),
+        }
     }
 
     /// The memory page `i` maps, other than the spare.
@@ -295,7 +334,9 @@ impl Room {
                 if self.own(i).is_some() {
                     continue;
                 }
-                let own = self.new_page()?;
+                let own = self
+                    .new_page()
+                    .map_err(|source| self.no_room(positions, i, source))?;
                 self.back(i, Some(own))?;
                 self.zero(i)?;
             }
@@ -521,11 +562,13 @@ impl<V: Views> Roomed<V> {
     /// each at a page boundary, built into `V` by `build`; `runs` are the
     /// rows of one buffer, which every buffer has at its own offset. Every
     /// page maps the spare: the rows a fit reaches get memory of their own,
-    /// zeroed ([`Room::fit`]). Refused by name for a run past a buffer.
+    /// zeroed ([`Room::fit`]). `what` names the store the room backs, for
+    /// a fit's named refusal. Refused by name for a run past a buffer.
     pub(crate) fn new<T, const N: usize>(
         stream: Arc<CudaStream>,
         len: usize,
         runs: &[Run],
+        what: &'static str,
         build: impl FnOnce([DeviceBuffer<T>; N]) -> V,
     ) -> Result<Roomed<V>, GpuError> {
         let bytes = len
@@ -546,6 +589,7 @@ impl<V: Views> Roomed<V> {
         let (spare, fresh) = spare(ctx.cu_device(), page)?;
         let base = reserve.base();
         let mut room = Room {
+            what,
             pages: (0..N * stride / page).map(|_| None).collect(),
             runs: (0..N)
                 .flat_map(|i| {
@@ -746,7 +790,8 @@ mod tests {
             .collect();
         let len = 2 * ctx_rows * half;
         let mut r: Roomed<[DeviceBuffer<u16>; 2]> =
-            Roomed::new(Arc::clone(&stream), len, &runs, |b| b).expect("a room");
+            Roomed::new(Arc::clone(&stream), len, &runs, "the tests' planes", |b| b)
+                .expect("a room");
         let at = (r[0].cu_deviceptr(), r[1].cu_deviceptr());
         assert_eq!(r.mapped(), 0, "no page before a fit");
         assert_eq!(r.whole(), 18 * page, "every page of both buffers");
@@ -814,8 +859,13 @@ mod tests {
             rows: ctx_rows + 1,
             ..runs[1]
         }];
-        let Err(e) = Roomed::<[DeviceBuffer<u16>; 2]>::new(Arc::clone(&stream), len, &past, |b| b)
-        else {
+        let Err(e) = Roomed::<[DeviceBuffer<u16>; 2]>::new(
+            Arc::clone(&stream),
+            len,
+            &past,
+            "the tests' planes",
+            |b| b,
+        ) else {
             panic!("a run past its buffer is refused");
         };
         assert!(e.to_string().contains("past a buffer"), "{e}");
@@ -825,8 +875,14 @@ mod tests {
             per: 4,
             rows: 4,
         }];
-        let mut p: Roomed<[DeviceBuffer<u16>; 1]> =
-            Roomed::new(Arc::clone(&stream), 4 * page / 2, &pooled, |b| b).expect("a room");
+        let mut p: Roomed<[DeviceBuffer<u16>; 1]> = Roomed::new(
+            Arc::clone(&stream),
+            4 * page / 2,
+            &pooled,
+            "the tests' pooled keys",
+            |b| b,
+        )
+        .expect("a room");
         for (positions, pages) in [(1, 1), (4, 1), (5, 2)] {
             p.fit(positions).expect("a fit");
             assert_eq!(
@@ -844,6 +900,53 @@ mod tests {
             Err(drain_error),
             "a room's failed drain stays on its retained context"
         );
+    }
+
+    /// A fit past the device's free bytes is refused by name: the store, the
+    /// positions, the bytes of new pages the fit asks, the page it was
+    /// backing among the room's, the pages the room had backed and the
+    /// device's free bytes, with the driver's own refusal. With the device
+    /// holding all but a few pages free, the first pages of a fit back and a
+    /// later one cannot.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_held_a_fit_past_the_free_bytes_is_refused_by_name() {
+        let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
+        let page = vmm::allocation_granularity(ctx.cu_device()).expect("the granularity");
+        ctx.bind_to_thread().expect("the context binds");
+        let (free, _) = crate::current_mem_info().expect("the device's free bytes");
+        let held = DeviceBuffer::<u8>::zeroed(&stream, free.saturating_sub(6 * page) & !(page - 1))
+            .expect("the device's free bytes less a few pages");
+        let runs = [Run {
+            at: 0,
+            row: page,
+            per: 1,
+            rows: 16,
+        }];
+        let mut r: Roomed<[DeviceBuffer<u16>; 1]> = Roomed::new(
+            Arc::clone(&stream),
+            16 * page / 2,
+            &runs,
+            "the refusal's store",
+            |b| b,
+        )
+        .expect("a room of 16 pages");
+        let Err(e) = r.fit(16) else {
+            panic!("a fit past the free bytes is refused");
+        };
+        let text = e.to_string();
+        assert!(text.contains("the refusal's store"), "{text}");
+        assert!(text.contains("a fit of 16 positions"), "{text}");
+        assert!(text.contains("asks "), "{text}");
+        assert!(
+            text.contains("backing page ") && text.contains(" of 16, "),
+            "{text}"
+        );
+        assert!(text.contains(" B free"), "{text}");
+        assert!(text.contains("cuMemCreate"), "{text}");
+        drop(r);
+        drop(held);
+        stream.synchronize().expect("the room's work finished");
     }
 
     /// Two rooms of one layout share a prefix's pages: the layout of
@@ -876,7 +979,14 @@ mod tests {
                 .collect()
         };
         let room = |rows: usize| -> Roomed<[DeviceBuffer<u16>; 2]> {
-            Roomed::new(Arc::clone(&stream), 2 * rows * half, &layout(rows), |b| b).expect("a room")
+            Roomed::new(
+                Arc::clone(&stream),
+                2 * rows * half,
+                &layout(rows),
+                "the tests' planes",
+                |b| b,
+            )
+            .expect("a room")
         };
         let byte = |h: usize, j: usize| (h * ctx_rows + j) * row;
         let value = |b: usize, h: usize, j: usize| (b * 100 + h * 40 + j + 1) as u16;

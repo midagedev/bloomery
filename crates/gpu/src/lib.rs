@@ -274,6 +274,18 @@ pub enum GpuError {
     /// what the protocol does not, or the file its page is shared through
     /// could not be made or opened. A tier lost this way is a lost card.
     Link { what: &'static str, detail: String },
+    /// A room's fit could not back the pages the rows a sequence reached
+    /// lie on: the device holds fewer free bytes than the fit asked, and
+    /// nothing made room. `what` names the store the room backs; `detail`
+    /// the fit's terms — the positions, the bytes of new pages the fit
+    /// still asked, the page it was backing among the room's, the pages
+    /// the room had backed, and the device's free bytes then (or why they
+    /// could not be read); `source` the driver's own refusal of the page.
+    NoRoom {
+        what: &'static str,
+        detail: String,
+        source: Box<GpuError>,
+    },
 }
 
 impl GpuError {
@@ -591,6 +603,11 @@ impl std::fmt::Display for GpuError {
                 "{what}: an earlier hybrid service failed and released the stream: {poison}"
             ),
             GpuError::Link { what, detail } => write!(f, "{what}: {detail}"),
+            GpuError::NoRoom {
+                what,
+                detail,
+                source,
+            } => write!(f, "{what}: {detail}: {source}"),
             GpuError::Stalled {
                 what,
                 waited,
@@ -621,6 +638,7 @@ impl std::error::Error for GpuError {
             GpuError::Model(e) => Some(&**e),
             GpuError::Plan { source, .. } => Some(&**source),
             GpuError::Unsettled { source, .. } => Some(&**source),
+            GpuError::NoRoom { source, .. } => Some(&**source),
             GpuError::Fault {
                 behind: Some(e), ..
             } => Some(&**e),
@@ -3080,12 +3098,7 @@ impl Gpu {
     /// `cuMemGetInfo` reports them.
     pub fn mem_info(&self) -> Result<(usize, usize), GpuError> {
         self.ctx.bind_to_thread()?;
-        let (mut free, mut total) = (0usize, 0usize);
-        // SAFETY: both out-pointers are live locals for the duration of the
-        // call, and this context is current on the calling thread (bound above).
-        let rc = unsafe { cuda_core::sys::cuMemGetInfo_v2(&mut free, &mut total) };
-        graph::cu(rc, "cuMemGetInfo")?;
-        Ok((free, total))
+        current_mem_info()
     }
 
     /// The driver's minimum allocation granularity for device memory on this
@@ -4100,4 +4113,16 @@ mod context_tests {
             other => panic!("a failure that is no refusal: {:?}", other.map(|_| ())),
         }
     }
+}
+
+/// `(free, total)` device bytes of the context current on the calling
+/// thread, as `cuMemGetInfo` reports them; a thread with no current context
+/// gets the driver's error, named.
+pub(crate) fn current_mem_info() -> Result<(usize, usize), GpuError> {
+    let (mut free, mut total) = (0usize, 0usize);
+    // SAFETY: both out-pointers are live locals for the duration of the call;
+    // the driver reads no other memory of ours.
+    let rc = unsafe { cuda_core::sys::cuMemGetInfo_v2(&mut free, &mut total) };
+    graph::cu(rc, "cuMemGetInfo")?;
+    Ok((free, total))
 }

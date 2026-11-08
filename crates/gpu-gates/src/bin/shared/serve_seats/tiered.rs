@@ -1382,6 +1382,7 @@ mod tests {
             card_budget: model::placement::card_budget::CardBudget::default(),
             budget_from_pool: false,
             expert_rank: None,
+            kv_floor: None,
         };
         let select = |n| {
             let mut plan = plan.clone();

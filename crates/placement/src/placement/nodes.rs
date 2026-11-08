@@ -292,6 +292,7 @@ pub fn routed_host<'a>(
         card_budget: super::card_budget::CardBudget::Unset,
         budget_from_pool: false,
         expert_rank: None,
+        kv_floor: None,
     })
 }
 

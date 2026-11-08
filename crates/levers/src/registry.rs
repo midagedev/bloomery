@@ -42,6 +42,7 @@ pub const ROUTE_TRACE: &str = "BLOOMERY_ROUTE_TRACE";
 pub const WARM_PROFILE: &str = "BLOOMERY_WARM_PROFILE";
 pub const QWEN38_EXPERTS: &str = "BLOOMERY_QWEN38_EXPERTS";
 pub const QWEN3_KV: &str = "BLOOMERY_QWEN3_KV";
+pub const KV_FLOOR: &str = "BLOOMERY_KV_FLOOR";
 pub const LANE_PREFETCH: &str = "BLOOMERY_LANE_PREFETCH";
 pub const HOST_LANES: &str = "BLOOMERY_HOST_LANES";
 pub const GEN_SLOTS: &str = "BLOOMERY_GEN_SLOTS";
@@ -1153,6 +1154,35 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               (`bloomery_gpu::kv_format`), whatever the file's container. The Qwen3.8 MTP \
               draft's store takes the same format. The qwen3 seat's `load` \
               line prints `cache=` and `cache_from=`, the Qwen3.8 seat's `setup` line.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: KV_FLOOR,
+        class: Class::A,
+        kind: Kind::Count {
+            min: 1,
+            max: u32::MAX as u64,
+            trim: false,
+        },
+        default: Unset::Means(
+            "the whole context: the spread and every other plan term at `ctx_max`",
+        ),
+        doc: "Placement (Qwen3.8, `generate_qwen3moe`, `bloomery-serve-qwen38` and \
+              `bloomery-serve --model qwen38`): the positions a plan spreads its routed experts \
+              at, `BLOOMERY_KV_FLOOR=<positions>`. The plan's every other term stays at the \
+              context it is made at (`ctx_max`, the `--ctx` choice): the rooms' reserved range \
+              and its page rounding, the stage rows, the scratch. Unset, the spread runs at \
+              `ctx_max` itself — today's plan. Only a load whose stores hold their rows in \
+              rooms reads it: every other family's binary and file refuses it by name. A floor \
+              above the context of a plan made under it is refused by name, and nothing clamps \
+              it. Until the residency machine frees card bytes for a growing sequence \
+              (the demote-for-bytes round), a load at a floor below its context can run out of \
+              card memory when a sequence grows past the floor; that failure is the room fit's \
+              named refusal (the store, the bytes the fit asked, the device's free bytes). The \
+              `plan` line prints `kv_floor=` beside `ctx_max=`.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

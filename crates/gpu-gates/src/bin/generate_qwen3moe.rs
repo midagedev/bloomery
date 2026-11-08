@@ -1573,8 +1573,9 @@ mod cli {
     /// card's free bytes when the census read them, the host room the plan
     /// was made at when it had one, the PLE table's tier and the reading of
     /// the host's room that chose it (`read`), and each plan card's device
-    /// (`record::plan_devices`). A plan whose PLE tier is not
-    /// one the reader takes is refused by name (`Plan::row_tier`).
+    /// (`record::plan_devices`). The spread's floor (`kv_floor`) prints only
+    /// where a lever moved it below the context. A plan whose PLE tier is
+    /// not one the reader takes is refused by name (`Plan::row_tier`).
     fn plan38_line(
         place: Place,
         experts: Experts,
@@ -1585,7 +1586,12 @@ mod cli {
             .w("place", place.name())
             .w("card", place.card_specs()?[0].name)
             .w("experts", experts_name(experts))
-            .u("ctx_max", plan.ctx_max)
+            .u("ctx_max", plan.ctx_max);
+        let r = match plan.kv_floor {
+            Some(floor) => r.u("kv_floor", floor),
+            None => r,
+        };
+        let r = r
             .u("host_experts", plan.host.experts)
             .u("card_experts", plan.cards[0].experts);
         let r = match (plan.machine.tiers.first(), plan.tier_n_l.first()) {
@@ -1703,6 +1709,7 @@ mod cli {
             bloomery_levers::STEP_STATS,
             bloomery_levers::QWEN38_EXPERTS,
             bloomery_levers::QWEN3_KV,
+            bloomery_levers::KV_FLOOR,
             bloomery_levers::ROUTE_TRACE,
             bloomery_levers::DRAFT,
             bloomery_levers::MTP_HEAD_ROWS,
@@ -1748,6 +1755,13 @@ mod cli {
             if card_set {
                 return Err(
                     "BLOOMERY_QWEN38_EXPERTS=card places a qwen4exp plan's routed experts; \
+                     --dump-taps runs a qwen3moe file"
+                        .into(),
+                );
+            }
+            if levers.kv_floor().is_some() {
+                return Err(
+                    "BLOOMERY_KV_FLOOR spreads a qwen4exp plan's experts at a KV floor; \
                      --dump-taps runs a qwen3moe file"
                         .into(),
                 );
@@ -2047,6 +2061,14 @@ mod cli {
             return Err(format!(
                 "BLOOMERY_QWEN38_EXPERTS=card places a qwen4exp plan's routed experts; a {} file \
                  has no host tier",
+                family.name()
+            )
+            .into());
+        }
+        if family != Family::Qwen38 && levers.kv_floor().is_some() {
+            return Err(format!(
+                "BLOOMERY_KV_FLOOR spreads a qwen4exp plan's experts at a KV floor; a {} file's \
+                 cache is plain device tensors, not rooms whose pages a fit backs",
                 family.name()
             )
             .into());

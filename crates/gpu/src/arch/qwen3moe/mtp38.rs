@@ -390,7 +390,12 @@ impl Mtp38 {
         // The draft's store in the target's cache format (the plan's), its
         // rows backed as the walks reach them ([`Mtp38::run_walk`]).
         let kv = KvQ8::of(mtp.kv_q8());
-        let store = KvPlanes::roomed(&gpu.stream_handle(), (geo::N_KV, ctx, geo::HEAD), kv)?;
+        let store = KvPlanes::roomed(
+            &gpu.stream_handle(),
+            (geo::N_KV, ctx, geo::HEAD),
+            kv,
+            "the Qwen3.8 MTP draft's store",
+        )?;
         stream.synchronize()?;
         let body = Mtp38 {
             names: Names::of(d.index, &w),
@@ -635,7 +640,12 @@ impl Mtp38 {
         let dims = (geo::N_KV, self.ctx, geo::HEAD);
         Ok(DraftSeq38 {
             graphs: Vec::new(),
-            store: KvPlanes::roomed(stream, dims, self.store.format())?,
+            store: KvPlanes::roomed(
+                stream,
+                dims,
+                self.store.format(),
+                "a Qwen3.8 draft slot's store",
+            )?,
             last: None,
             held: 0,
         })

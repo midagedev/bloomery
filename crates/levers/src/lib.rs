@@ -36,11 +36,11 @@ pub use registry::{AUTOTUNE, PREPARE_Q8, SCHEMAJUMP, SPLIT_WALK, XSTREAM};
 pub use registry::{
     CARD_BUDGET, CARD_DONTNEED, CARD_MARGIN, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, EXPERT_RANK,
     FORCE_IDS, GEN_SLOTS, GEN_SLOTS_MAX, HOST_LANES, HOST_LANES_DEFAULT, HOST_LOCK, HOST_POPULATE,
-    HOST_ROOM, HOSTSTREAM, LANE_PREFETCH, LANE_PREFETCH_DEFAULT, MTP_DRAFT, MTP_HEAD_ROWS,
-    MTP_WIDTH, MTP_WINDOWS, NEED_HOOK, NVTIER_BYTES, NVTIER_EVICT, NVTIER_MEM, NVTIER_READ,
-    PIN_MAIN, PREFILL, PREFILL_CUT, PREFILL_CUT_MAX, PREFILL_GROUP, PREFILL_GROUP_DEFAULT,
-    PREFILL_GROUP_MAX, QWEN3_KV, QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE, SCREEN, SPIN,
-    STEP_STATS, THREADS, TIER_LINK, TIER_NODES, TP_NODES, WARM_PROFILE, WORD_OPS,
+    HOST_ROOM, HOSTSTREAM, KV_FLOOR, LANE_PREFETCH, LANE_PREFETCH_DEFAULT, MTP_DRAFT,
+    MTP_HEAD_ROWS, MTP_WIDTH, MTP_WINDOWS, NEED_HOOK, NVTIER_BYTES, NVTIER_EVICT, NVTIER_MEM,
+    NVTIER_READ, PIN_MAIN, PREFILL, PREFILL_CUT, PREFILL_CUT_MAX, PREFILL_GROUP,
+    PREFILL_GROUP_DEFAULT, PREFILL_GROUP_MAX, QWEN3_KV, QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE,
+    SCREEN, SPIN, STEP_STATS, THREADS, TIER_LINK, TIER_NODES, TP_NODES, WARM_PROFILE, WORD_OPS,
 };
 
 #[cfg(test)]
@@ -1334,6 +1334,15 @@ impl Levers {
     #[must_use]
     pub fn qwen3_kv_set(&self) -> Option<&'static str> {
         self.word(QWEN3_KV)
+    }
+
+    /// `BLOOMERY_KV_FLOOR`: the positions a plan spreads its routed experts
+    /// at; `None` unset (the spread at the whole context) and in a reading
+    /// that did not parse the lever: a binary that leaves it out refuses it
+    /// by name when set, so for it the lever is unset.
+    #[must_use]
+    pub fn kv_floor(&self) -> Option<u64> {
+        self.count(KV_FLOOR)
     }
 
     /// `BLOOMERY_CHECK_FINITE`: the finite probe runs.

@@ -841,7 +841,7 @@ gguf 7 2 0
 # and stores, and the shared-module load), each with its SAFETY line or `# Safety` contract.
 # PIN(2026-11-08): gpu 3093 -> 3098 blocks, a new kernel entry, not old code relaxed: the importance collector
 # (crates/gpu/src/imatrix.rs: its two kernels' column loops and the feeds' device reads).
-gpu 3098 423 10
+gpu 3097 423 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
