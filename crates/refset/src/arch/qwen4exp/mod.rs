@@ -19,7 +19,7 @@ pub mod vis;
 /// owns the path until the model crate reads this architecture; a set of
 /// the file moved elsewhere is stale by this line, not by its name.
 pub const MODEL: &str =
-    "/data/moved/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
+    "/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
 
 /// The ik tree every qwen4exp oracle family is dumped from, and the one
 /// place a re-take of the oracle changes it.

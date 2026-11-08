@@ -98,7 +98,7 @@ case ${BLOOMERY_MODEL:-} in
     ROWS_FROM=node FAMILY=qvis SETPFX=ref_qwen4exp_vis ORACLE=$QVIS_LCPP BIN=$BINDIR/dump_mtmd_qvis
     MMPROJ=/models/mmproj/Qwen3.8-Flash-Next-GGUF/mmproj-BF16.gguf
     MMPROJ_SHA256=2e788f8c511d8093c7b43cb87b2fd7e14228340318057f8fb20c86df2efe2355
-    TEXT=/data/moved/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
+    TEXT=/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
     PROSE_IDS=$DATA/qwen4exp/corpus-prose.ids
     PROSE_SHA256=dca5f89b2903f9ffd2f4e20eec18a9fdf3561bcb531a721a114e4fab68e925be
     CASES=tools/ref/qvis/cases.tsv REQUESTS=tools/ref/qvis/requests.jsonl

@@ -42,8 +42,7 @@ use model::moe::HostScratch;
 use model::r8file::R8Source;
 use model::{ModelError, Tensor2};
 
-const Q38: &str =
-    "/data/moved/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
+const Q38: &str = "/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
 
 // PIN(2026-09-27): the routed stacks' types by layer, from the header dump (1,224 tensors): gate and
 // up q4_K but layer 2's q5_K; down q5_1 but the q8_0 of layers 2, 4, 30, 46 and 47.

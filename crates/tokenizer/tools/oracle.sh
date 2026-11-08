@@ -242,7 +242,7 @@ profile() {
       ;;
     qwen38)
       tree_tokref
-      SHARD=/data/moved/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
+      SHARD=/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
       SET=ref-tokenizer-qwen38
       ;;
     nemotron)

@@ -728,7 +728,7 @@ BOX_FILES = {
               "tools/ref/models/deepseek41.sh"),),
     "glm": (("/data/moved/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf",
              "tools/ref/models/glm5next.sh"),),
-    "qwen38": (("/data/moved/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+    "qwen38": (("/models/Qwen3.8-Flash-Next/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
                 "tools/ref/models/qwen4exp.sh"),),
     "qwen3": (("/data/moved/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf",
                "tools/ref/models/qwen3moe.sh"),),

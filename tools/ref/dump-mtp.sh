@@ -60,7 +60,7 @@ case $MODEL_NAME in
     ref_step_variant d1k || { echo "dump-mtp.sh: the qwen4exp profile has no d1k variant" >&2; exit 2; }
     TOKENS_FILE=$STEP_TOKENS_FILE TOKENS_SHA256=$STEP_TOKENS_SHA256
     # The refset family's DRAFT (crates/refset/src/arch/qwen4exp/mtp.rs): the set's `# draft_model` must name it.
-    QWEN38_MTP_DRAFT=/data/moved/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf
+    QWEN38_MTP_DRAFT=/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf
     # The fixture's is beside the fixture target under that name (refset's fixture family: the target's directory, `{dir}/{name}`).
     [ -z "$SET_PREFIX" ] || QWEN38_MTP_DRAFT=${FIXTURE_FILE%/*}/${QWEN38_MTP_DRAFT##*/}
     [ -f "$QWEN38_MTP_DRAFT" ] || { echo "dump-mtp.sh: no draft file at $QWEN38_MTP_DRAFT" >&2; exit 2; }
