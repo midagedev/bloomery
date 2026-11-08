@@ -366,10 +366,11 @@ every gate is shown to fail on its defect before the fix lands ([how](docs/perfo
 - GLM-5.3 holds at most 16,384 positions a slot; a `--ctx-size` whose slot share is larger is refused at the start.
 - Kimi K3.1 Pro (our `IQ1_S` set, a Q4_K trunk) loads at `--place bp` only (two cards, the host and the NVMe expert
   tier). Past the lightning indexer's top-k (2,048 positions) the latent layers attend the rows the indexer picks,
-  so `--ctx-size` is not held to the top-k. The seat runs a prompt as placed passes; the pass's plan keeps fewer experts in
-  the NVMe arena, so a step decodes slower than under `--prefill steps` (2.94 against 4.99 tok/s, the prompt 12.5
-  against 3.80, at 512 ids and 512 generated): steps is the faster pick when the reply is longer than about 1.3 times
-  the prompt. The seat serves the model's think span as plain text. The set's chat template is unsloth's
+  so `--ctx-size` is not held to the top-k. The seat runs a prompt as placed passes; the pass holds its buffers on the stage
+  card and fills the NVMe arena with each pass's experts, so a step decodes a little slower than under
+  `--prefill steps` (4.46 against 4.99 tok/s, the prompt 10.2 against 3.80, at 512 ids and 512 generated, one cold
+  request each, after 0.3.13): steps is the faster pick when the reply is longer than about 7 times the prompt
+  [derived from those rates]. The seat serves the model's think span as plain text. The set's chat template is unsloth's
   Kimi-K3 template (the checkpoint ships none), and its importance matrix came from `llama-imatrix`; the quantization
   itself was written by `bloomery-quantize`. Kimi K3 (unsloth's `UD-IQ1_S`, 594 GB) does not load at this tag: its
   dense trunk is 51.4 GB, past one 48 GB card.

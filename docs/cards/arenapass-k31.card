@@ -17,3 +17,10 @@ reason: [derived] the step's plan at 232G (arena 228.8 GB, 374 slots) decoded 4.
 decide-in: the next K3.1 seat default and the README's pass/steps limit (gone when decode is in band and the prompt holds ≥ 8)
 decide-below: under 4.5: read the plan line's arena and the nvtier record (copies=, slots) before suspecting the step
 decide-above: above 5.3: read the witness block and the plan line before crediting
+# outcome 2026-11-08 on arenapass 5a71362da (the tree's target/release/bloomery-serve, built in ~/repo/bloomery-k31main-narrow-head),
+#  one cold request, D=512, 512 generated, ctx 2048, 232G, two drives: tg 4.46 / pp 10.22, load 66 s; the plan arena=228534329344
+#  (374 slots) where the floor plan read 22.6 GB; listening prompt=pass; nvtier copies=2, misses 51,759, fill_bytes 342.1 GB,
+#  evictions 18,031. 0.04 under the band: decide-below read the arena (the dial's) and copies (2), so the gap to the steps load's
+#  4.99 is the pass's card reserve (card_experts 1885 against 1947) and the prompt union's churn in the arena, not the step.
+#  decide-in: the pass stays the default (165 s for 512 + 512 against 215 s on the floor arena and 237 s stepped); README's limit
+#  names steps as the pick past a reply of about 7 times the prompt [derived].
