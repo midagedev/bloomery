@@ -9328,6 +9328,10 @@ MAC_ENV = ("BLOOMERY_BOX", "BLOOMERY_CARD", "BLOOMERY_DATA", "BLOOMERY_FIXTURE_V
 # key holds its family's fixture directory only (KeyContext.fixture_dirs; the family's row of tools/fixture-dirs.tsv, the one
 # owner), as a variant's below holds its tag's, so a fixture written for one family moves no other family's key. An item whose
 # family cannot be told keeps every row of FIXTURE_ROOT: never under-keyed.
+# The roots a model directory lives under: the box's drive, and the one a model moved off it names by its full path (no link
+# stays behind). model_dir_of, MODEL_LITERAL, PROFILE_PATHS and the box-env test all read this list; FIXTURE_ROOT and
+# VARIANT_ROOT below stay under the first.
+MODEL_ROOTS = ("/models", "/data/moved/models")
 FIXTURE_ROOT = "/models/fixtures"
 # A fixture variant (tools/fixture-variants.tsv, tools/ref/ref-paths.sh): the family's fixture requantized to a tag's type map, its files
 # below VARIANT_ROOT/<tag>, beside the fixture root and not under it (ref-paths.sh moves the root to the tag's directory, and a variant
@@ -9470,10 +9474,10 @@ ANY_CARD = "BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any}"
 # The form on a tools/gpu-gate.sh call in a script, as tools/gate-batch.sh's walk reads a lane from it.
 ANY_CARD_CALL = re.compile(re.escape(ANY_CARD) + r"\s+(?:bash\s+|exec\s+)?[^\s;&|#'\"]*gpu-gate\.sh\b")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
-# A /models path as a literal: not the tail of a longer path (`tools/ref/models/x.sh`, `$HOME/models`,
+# A path under a MODEL_ROOTS root as a literal: not the tail of a longer path (`tools/ref/models/x.sh`, `$HOME/models`,
 # `${D}/models`, `$(pwd)/models`), but after a quote, `=`, a space, the `-` of a `${V:-/models/…}` default,
 # or a `\t`/`\n`/`\r` escape in a string.
-MODEL_LITERAL = re.compile(r"(?:(?<![A-Za-z0-9._+/~})])|(?<=\\[tnr]))/models/[A-Za-z0-9._+-]+(?:/[A-Za-z0-9._+-]+)*")
+MODEL_LITERAL = re.compile(r"(?:(?<![A-Za-z0-9._+/~})])|(?<=\\[tnr]))(?:" + "|".join(re.escape(r) for r in sorted(MODEL_ROOTS, key=len, reverse=True)) + r")/[A-Za-z0-9._+-]+(?:/[A-Za-z0-9._+-]+)*")
 # The files both sides read for model literals: the box manifest's model_dirs() and an item's key.
 MODEL_SCAN_EXT = (".rs", ".sh", ".py", ".toml", ".tsv")
 
@@ -9483,12 +9487,13 @@ def scans_for_models(rel: str) -> bool:
 
 
 def model_dir_of(path: str) -> str | None:
-    """The model directory /models/<name> a /models path lies in; None for /models itself or a path
-    outside it (a literal naming a file right under /models is its own entry)."""
-    f = path.split("/")
-    if len(f) < 3 or f[:2] != ["", "models"] or not f[2]:
-        return None
-    return "/".join(f[:3])
+    """The model directory <root>/<name> (root one of MODEL_ROOTS) a path lies in; None for a root itself or a path
+    outside every root (a literal naming a file right under a root is its own entry)."""
+    for root in MODEL_ROOTS:
+        if path.startswith(root + "/"):
+            name = path[len(root) + 1:].split("/", 1)[0]
+            return f"{root}/{name}" if name else None
+    return None
 
 
 def model_literal_dirs(text: str) -> set[str]:
@@ -10474,7 +10479,7 @@ class KeyContext:
         data = self.manifest_head.get("data", "")
         for e in self.box_env.split():
             k, _, v = e.partition("=")
-            if v.startswith("/") and not v.startswith("/models/") and not (data and (v == data or v.startswith(data.rstrip("/") + "/"))):
+            if v.startswith("/") and not v.startswith(tuple(r + "/" for r in MODEL_ROOTS)) and not (data and (v == data or v.startswith(data.rstrip("/") + "/"))):
                 return f"BLOOMERY_BOX_ENV's {k}={v} names a path the box manifest does not read"
         return None
 
@@ -10968,7 +10973,8 @@ def data_manifest(root: str, cache: HashCache, workers: int) -> tuple[list[tuple
     return lines, sum(files.values())
 
 
-PROFILE_PATHS = 'unset BLOOMERY_REF_MODEL; source "$1" > /dev/null || exit 3; for v in $(compgen -v); do case "${!v}" in /models/*) printf "%s\\n" "${!v}" ;; esac; done'
+PROFILE_PATHS = ('unset BLOOMERY_REF_MODEL; source "$1" > /dev/null || exit 3; for v in $(compgen -v); do case "${!v}" in '
+                 + "|".join(r + "/*" for r in MODEL_ROOTS) + ') printf "%s\\n" "${!v}" ;; esac; done')
 
 
 def profile_dirs(root: str, prof: str, env: dict[str, str]) -> set[str]:
@@ -13161,6 +13167,41 @@ def key_self_test(expect, pieces: tuple[str, ...]) -> None:
                 expect("/mod" "els/Dyn" in str(err), f"the dynamic profile's error does not name the directory: {err}")
             finally:
                 os.remove(dyn)
+            # A model moved off the box's drive is named by its full path under the second root: the profile that defines it
+            # yields that directory, and its manifest row reaches the key of an item that runs under the profile. Spelled in
+            # pieces, so that this file's own text names no directory a box manifest would list.
+            moved = "/da" "ta/moved/mod" "els/ZzMoved"
+            mprof = os.path.join(roots[0], "tools/ref/models/zz-moved.sh")
+            with open(mprof, "w", encoding="utf-8") as fh:
+                fh.write(f"MODEL={moved}/x.gguf\n")
+            try:
+                expect(profile_dirs(roots[0], "tools/ref/models/zz-moved.sh", penv) == {moved},
+                       f"a profile defining {moved}/x.gguf did not yield {moved}: {profile_dirs(roots[0], 'tools/ref/models/zz-moved.sh', penv)}")
+                expect(model_dir_of(moved) == moved and model_dir_of(moved + "/x.gguf") == moved and model_dir_of(os.path.dirname(moved)) is None
+                       and model_dir_of("/da" "ta/moved/other/x") is None, "model_dir_of: the second root's directory, its root or a path under neither")
+                with_row = manifest[:-1] + [f"model\t{moved}/x.gguf\t1\t2\t3\t4", "# end"]
+                without = manifest[:-1] + [f"model-dir\t{moved}\tabsent", "# end"]
+
+                def moved_parts(lines: list[str]) -> list[str]:
+                    write_manifest(lines)
+                    ps, err, _, _ = KeyContext(sa, mf, "", {"BLOOMERY_MODEL": "zz-moved"}, settings=settings).parts(items["gpu"])
+                    expect(err is None, f"the item under the moved profile: {err}")
+                    return ps
+
+                held, absent = moved_parts(with_row), moved_parts(without)
+                expect(any(f"{moved}/x.gguf" in x for x in held), f"the moved directory's model row is not in the key of an item under its profile: {held[-3:]}")
+                expect(item_key(held) != item_key(absent), "a file appearing under the moved directory did not move the key of an item under its profile")
+
+                def plain_key(lines: list[str]) -> str:
+                    write_manifest(lines)
+                    ps, err, _, _ = KeyContext(sa, mf, "", {}, settings=settings).parts(items["gpu"])
+                    expect(err is None, f"the item outside the moved profile: {err}")
+                    return item_key(ps)
+
+                expect(plain_key(with_row) == plain_key(without), "a file appearing under the moved directory moved the key of an item that does not open it")
+            finally:
+                os.remove(mprof)
+                write_manifest(manifest)
 
 
 def model_scope_self_test(expect, root: str, side: Side, settings: dict, manifest: list[str], mf: str) -> None:
