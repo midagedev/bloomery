@@ -18,3 +18,6 @@ decide-above: beyond 45.0: read the witness block and the plan line (the room, t
 #  token 2, the top-2 gaps 1.538 against the near-tie band 1.485, residency mid-p31-s1 moving experts). Sitting 6, the same tarball:
 #  two rounds: tg 40.84 / 42.60 @512, 38.69 / 36.42 @4096; pp 124.12 / 126.50 @512, 359.46 / 350.23 @4096; load 55-61 s; majflt 34-95 k;
 #  the replay identical (PASS); green. In band; the release's rows are sitting 6's (the notes' table), sitting 5 named beside them.
+# outcome 2026-11-08 on main 42c0cf5af (the tag's sm86 tarball d7dfc68d…, its bloomery-serve sha cf9fadae…): sitting 7, two rounds:
+#  tg 41.36 / 40.53 @512, 35.80 / 37.37 @4096; pp 113.64 / 107.04 @512, 345.99 / 337.81 @4096; load 57-87 s; majflt 28-88 k; the replay
+#  identical (PASS); green. In band; the release's rows are sitting 7's (the notes' table), sittings 5 and 6 of 29fd27d60 named beside them.
