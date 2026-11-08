@@ -8,7 +8,11 @@
 //!   word ([`Lane`]) is one device word that never moves.
 //! - A latent layer's cache: `[ctx][row]` f16, indexed by position and read only below the live
 //!   count, so a reset needs nothing of it: every row below the live count is written by its own
-//!   step before any launch reads it.
+//!   step before any launch reads it. A K3.1 latent layer's index key rows (`[ctx][128]` f16,
+//!   `body::index`) are the same on a load that selects: each row is written by its own step or
+//!   pass row, and the score reads only below the live count.
+//! - On a load that selects, the selection's count words (`body::index::Sel::words`): the live
+//!   rows, the list's width and the list's live length, rewritten by every refresh.
 //! - The position and the token ([`StepIn`]): the one refresh before each step. The embedding
 //!   writes the row's position and live key count from them.
 //!

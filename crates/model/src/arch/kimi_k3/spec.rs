@@ -7,9 +7,9 @@
 //! [`Selector::StreamTopK`] over index keys projected from the layer input, one per position and
 //! owned by the layer (so the plan holds the key row beside the latent row), and its query is
 //! projected from the RMS-normed query latent (`q_lora` above 0), where Mistral Large 4's is of
-//! the LayerNorm-normed input. The body runs no selected attention: up to the indexer's top-k the
-//! dense latent attention is the selection's result (the last row of [`AVAILABLE`]), and
-//! [`Hparams::check_ctx`] refuses a longer context. The first layer is a dense `situ` block and the
+//! the LayerNorm-normed input. The body runs the selection (the last row of [`AVAILABLE`]): past the
+//! indexer's top-k a latent layer attends the rows its indexer picks, and up to it the selection is
+//! every position, whose result is the dense latent attention. The first layer is a dense `situ` block and the
 //! rest the sigmoid router over `situ` experts that run in a latent, their weighted sum normed
 //! before the up projection, beside the shared stack that reads the hidden row. Every sublayer and
 //! the head read the cross-layer residual's mix ([`Residual::AttnRes`]); no stream is carried
@@ -89,11 +89,10 @@ pub const AVAILABLE: &[Available] = &[
     },
     Available {
         programs: &[Program::KimiK3Body],
-        at: "gpu/src/arch/gated_mla.rs (the dense latent attention is the K3.1 indexer's selection \
-             at a context of at most its top-k, where every position is picked; held by \
-             model/src/arch/kimi_k3/hparams.rs Hparams::check_ctx through place.rs \
-             PlanInputs::check_ctx, which refuses a longer context by the key \
-             `attention.indexer.top_k`)",
+        at: "gpu/src/arch/kimi_k3/index.rs (the K3.1 indexer's key rows, score and top-k over the \
+             common index_key and indexer kernels; the latent core over the picked rows, \
+             gpu/src/latent_gated.rs attend_sel; at a context of at most the top-k every position \
+             is picked and the dense latent attention is the selection's result)",
         runs: |n| match n {
             Need::StreamIndex { heads, d } => {
                 *heads as usize == INDEX_HEADS && *d as usize == INDEX_DIM

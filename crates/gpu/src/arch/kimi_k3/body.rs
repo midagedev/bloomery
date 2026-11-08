@@ -9,7 +9,8 @@
 //! 2. on every `attn_res.block_size`th layer, `x` is banked (the raw sum, not the mix);
 //! 3. the mixer: a delta layer ([`super::kda`]) or the gated latent layer
 //!    ([`crate::arch::gated_mla`], the one gated latent core both Raon-1 and K3 run), each
-//!    taking its own attn norm of the mix;
+//!    taking its own attn norm of the mix; a K3.1 latent layer of a load past the indexer's top-k
+//!    attends the rows its indexer picks ([`index`]);
 //! 4. the sum after the mixer is the mixer's update alone on a banking layer (the stream
 //!    restarts), else `x` plus the update;
 //! 5. the mix of the banks and that sum (`ffn_res_score`), the layer's `ffn_norm`, the
@@ -21,7 +22,7 @@
 //!
 //! Two row buffers ping-pong the sum, so the sum is back in the first after every layer.
 //! The state book is [`super::state`]'s: the delta layers' one-lane stores and the latent layers'
-//! caches.
+//! caches, and a K3.1 latent layer's index key rows ([`index`]).
 
 use super::kda::{self, KdaSites};
 use super::moe::{MoeDims, routed_of};
@@ -70,7 +71,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 #[path = "index.rs"]
-mod index;
+pub(super) mod index;
 #[path = "pass.rs"]
 pub(super) mod pass;
 #[path = "placed.rs"]
@@ -94,22 +95,19 @@ enum Mixer {
         sites: Box<KdaSites>,
         store: RecStore,
     },
-    /// The latent cache, `[ctx][row]` f16.
+    /// The latent cache, `[ctx][row]` f16, and a K3.1 layer's indexer with its key rows
+    /// ([`index::Index`]; `None` in a K3 file).
     Mla {
         sites: Box<MlaSites>,
         cache: DeviceTensor<u16>,
+        index: Option<Box<index::Index>>,
     },
 }
 
-/// One layer: its mixer, the indexer's key rows when the layer runs the indexer, its feed-forward
-/// block, the name of its `ffn_norm`, the names of its two AttnRes score vectors (the mixer's, the
-/// block's) and whether it banks its input.
+/// One layer: its mixer, its feed-forward block, the name of its `ffn_norm`, the names of its two
+/// AttnRes score vectors (the mixer's, the block's) and whether it banks its input.
 struct Layer {
     mixer: Mixer,
-    /// The index key rows of a K3.1 latent layer, `[ctx][width]` f16 ([`index::width`]); `None` on
-    /// a delta layer and in a K3 file. The plan counts them, so the load holds them; no step reads
-    /// or writes them, as the selected attention that fills them is not in this body.
-    index: Option<DeviceTensor<u16>>,
     ffn: Ffn,
     ffn_norm: String,
     scores: [String; 2],
@@ -121,7 +119,11 @@ impl Layer {
     fn sites(&self) -> Vec<&Site> {
         let mut out: Vec<&Site> = match &self.mixer {
             Mixer::Kda { sites, .. } => sites.sites().to_vec(),
-            Mixer::Mla { sites, .. } => sites.sites().to_vec(),
+            Mixer::Mla { sites, index, .. } => {
+                let mut v = sites.sites().to_vec();
+                v.extend(index.iter().flat_map(|ix| ix.sites()));
+                v
+            }
         };
         match &self.ffn {
             Ffn::Dense(g) => out.extend(g.sites()),
@@ -131,11 +133,12 @@ impl Layer {
     }
 
     fn store_bytes(&self) -> usize {
-        let mixer = match &self.mixer {
+        match &self.mixer {
             Mixer::Kda { store, .. } => store.bytes(),
-            Mixer::Mla { cache, .. } => cache.buf().num_bytes(),
-        };
-        mixer + self.index.as_ref().map_or(0, |rows| rows.buf().num_bytes())
+            Mixer::Mla { cache, index, .. } => {
+                cache.buf().num_bytes() + index.as_ref().map_or(0, |ix| ix.bytes())
+            }
+        }
     }
 }
 
@@ -152,7 +155,8 @@ struct MixerIo<'a> {
 }
 
 /// Layer `l`'s mixer over the row `io.input`: the delta layer's step on its one-lane store, or the
-/// gated latent layer's on its cache; the update lands in `io.out`.
+/// gated latent layer's on its cache, over the rows its indexer picks where the load selects
+/// ([`index`]); the update lands in `io.out`.
 fn run_mixer(
     cx: &GqaCx<'_>,
     (k, acts, lane): (&Kernels, &mut Acts, &Lane),
@@ -192,27 +196,63 @@ fn run_mixer(
             };
             kda::step(cx, &k.linear, acts, sites, (l, kd), st, bufs)
         }
-        Mixer::Mla { sites, cache } => {
-            let bufs = MlaBufs {
+        Mixer::Mla {
+            sites,
+            cache,
+            index,
+        } => {
+            let MlaBuffers {
+                qa,
+                qr,
+                kv,
+                gate,
+                q,
+                qabs,
+                att,
+                av,
+                gated,
+                part_v,
+                part_ms,
+                sel,
+            } = mb;
+            let mut bufs = MlaBufs {
                 x: input,
                 pos,
                 n_keys: keys,
                 xn,
-                qa: &mut mb.qa,
-                qr: &mut mb.qr,
-                kv: &mut mb.kv,
-                gate: &mut mb.gate,
-                q: &mut mb.q,
-                qabs: &mut mb.qabs,
-                att: &mut mb.att,
-                av: &mut mb.av,
-                gated: &mut mb.gated,
-                part_v: &mut mb.part_v,
-                part_ms: &mut mb.part_ms,
+                qa,
+                qr,
+                kv,
+                gate,
+                q,
+                qabs,
+                att,
+                av,
+                gated,
+                part_v,
+                part_ms,
                 out,
                 cache,
             };
-            mla::step(cx, &k.mla, acts, (&**sites, md), l, bufs)
+            let (Some(ix), Some(sel)) = (index.as_deref_mut(), sel.as_mut()) else {
+                return mla::step(cx, &k.mla, acts, (&**sites, md), l, bufs);
+            };
+            let ik = k.index.as_ref().ok_or(GpuError::state(
+                STEP,
+                "the indexer's kernels of a selecting load",
+            ))?;
+            mla::front(cx, acts, (&**sites, md), l, &mut bufs)?;
+            ix.pick(cx, ik, acts, l, (&*bufs.xn, &*bufs.qr, pos), sel)?;
+            let (parts, n) = sel.parts()?;
+            mla::back(
+                cx,
+                &k.mla,
+                acts,
+                (&**sites, md),
+                l,
+                bufs,
+                Some(parts.with(&n)),
+            )
         }
     }
 }
@@ -282,7 +322,8 @@ fn embed(
     )
 }
 
-/// The kernels the step launches beside the `Gpu`'s own and the router instance's.
+/// The kernels the step launches beside the `Gpu`'s own and the router instance's: the indexer's on
+/// a load that selects ([`index::selects`]).
 struct Kernels {
     kgemv: KGemvKernels,
     g32: Gemm32Kernels,
@@ -290,10 +331,11 @@ struct Kernels {
     linear: LinearKernels,
     mla: MlaKernels,
     attn_res: AttnResKernels,
+    index: Option<index::Kernels>,
 }
 
 impl Kernels {
-    fn load(gpu: &Gpu, mla: &MlaDims) -> Result<Kernels, GpuError> {
+    fn load(gpu: &Gpu, mla: &MlaDims, selects: bool) -> Result<Kernels, GpuError> {
         let ctx = gpu.context();
         Ok(Kernels {
             kgemv: KGemvKernels::load(gpu)?,
@@ -302,6 +344,7 @@ impl Kernels {
             linear: LinearKernels::load(ctx)?,
             mla: MlaKernels::load(gpu, mla, PASS_ROWS)?,
             attn_res: AttnResKernels::load(ctx)?,
+            index: selects.then(|| index::Kernels::load(gpu)).transpose()?,
         })
     }
 }
@@ -451,8 +494,10 @@ struct KdaBuffers {
     gated: DeviceBuffer<f32>,
 }
 
-/// The latent mixer's intermediates ([`MlaBufs`]).
+/// The latent mixer's intermediates ([`MlaBufs`]), and the step's selection buffers on a load that
+/// selects (`None` in a pass's).
 struct MlaBuffers {
+    sel: Option<index::Sel>,
     qa: DeviceBuffer<f32>,
     qr: DeviceBuffer<f32>,
     kv: DeviceBuffer<f32>,
@@ -498,6 +543,7 @@ impl Scratch {
                 gated: z(v)?,
             },
             mla: MlaBuffers {
+                sel: None,
                 qa: z(md.q_lora)?,
                 qr: z(md.q_lora)?,
                 kv: z(row)?,
@@ -548,7 +594,8 @@ impl Scratch {
         ]
         .into_iter()
         .map(DeviceBuffer::num_bytes)
-        .sum()
+        .sum::<usize>()
+            + m.sel.as_ref().map_or(0, index::Sel::bytes)
     }
 }
 
@@ -978,6 +1025,7 @@ impl Body {
                 Kind::Mla => Mixer::Mla {
                     sites: Box::new(MlaSites::load(file, w, &md, l)?),
                     cache: DeviceTensor::zeroed(stream, ctx, md.row())?,
+                    index: index::Index::load(stream, w, &hp, (l, ctx))?,
                 },
             };
             let (ffn, ffn_norm) = if hp.dense(l) {
@@ -993,12 +1041,8 @@ impl Body {
                 let (routed, norm) = routed_of((file, w), l, &moe, stacks)?;
                 (Ffn::Routed(routed), norm)
             };
-            let index = index::width(&hp, l)
-                .map(|d| DeviceTensor::zeroed(stream, ctx, d))
-                .transpose()?;
             layers.push(Layer {
                 mixer,
-                index,
                 ffn,
                 ffn_norm,
                 scores: [
@@ -1034,12 +1078,17 @@ impl Body {
             }
             _ => None,
         };
+        let selects = index::selects(&hp, ctx);
+        let mut s = Scratch::new(stream, n, (&kd, &md), ctx)?;
+        s.mla.sel = selects
+            .then(|| index::Sel::new(stream, &hp, md.row(), ctx))
+            .transpose()?;
         Ok(Body {
             placed,
             host_head: None,
             out_score,
-            k: Kernels::load(gpu, &md)?,
-            s: Scratch::new(stream, n, (&kd, &md), ctx)?,
+            k: Kernels::load(gpu, &md, selects)?,
+            s,
             banks: DeviceBuffer::zeroed(stream, bank_slots * n)?,
             step_in: StepIn::new(stream)?,
             lane: Lane::new(stream)?,
@@ -1200,6 +1249,12 @@ impl Body {
                 &[u32::try_from(t).map_err(|e| GpuError::shape(ALONE, e.to_string()))?],
             )?;
             embed(gpu, w, step_in, &mut sum[0])?;
+            if let Some(sel) = mb.sel.as_mut() {
+                sel.words(
+                    stream,
+                    u32::try_from(t).map_err(|e| GpuError::shape(ALONE, e.to_string()))?,
+                )?;
+            }
             mixed.copy_from_host(stream, &x)?;
             let io = MixerIo {
                 input: &*mixed,
@@ -1581,8 +1636,9 @@ impl ChainBody for Body {
         Ok(DecodeInput { token, pos })
     }
 
-    /// The token and the position: two copies. Refused by name, before either, off the position
-    /// the stores stand at.
+    /// The token and the position: two copies, and on a load that selects the count words of the
+    /// position ([`index::Sel::words`]), one more. Refused by name, before any, off the position the
+    /// stores stand at.
     fn refresh(&mut self, stream: &CudaStream, input: &DecodeInput) -> Result<(), GpuError> {
         if input.pos != self.held {
             return Err(GpuError::shape(
@@ -1609,6 +1665,9 @@ impl ChainBody for Body {
                 ),
                 input.pos,
             )?,
+        }
+        if let Some(sel) = self.s.mla.sel.as_mut() {
+            sel.words(stream, input.pos)?;
         }
         self.held = input.pos + 1;
         Ok(())
