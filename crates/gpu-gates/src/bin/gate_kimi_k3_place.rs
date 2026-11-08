@@ -1572,17 +1572,18 @@ mod gate {
     /// the fixture's bytes. Written under the temp directory; the path.
     fn k31_fixture(inputs: &PlanInputs) -> Result<std::path::PathBuf, GateError> {
         use bloomery_gpu_gates::{GateRng, write_gguf};
+        use gguf::arch::kimi_k3::{ARCH as K3, ARCH_K31 as ARCH};
         use gguf::quant::Q8Block;
-        use gguf::{GgmlType, Value};
+        use gguf::{GENERAL_ARCHITECTURE, GgmlType, Value};
         use model::arch::kimi_k3::hparams::{INDEX_DIM, INDEX_HEADS, Kind};
 
-        const ARCH: &str = "kimi-k31";
+        let k3_prefix = format!("{K3}.");
         let split = open_split(Arch::KimiK3, RECIPE)?;
         let hp = &inputs.hp;
         let mut kvs: Vec<(String, Value)> = split
             .iter_kv()
-            .map(|(k, v)| match (k, k.strip_prefix("kimi-k3.")) {
-                ("general.architecture", _) => (k.to_string(), Value::String(ARCH.into())),
+            .map(|(k, v)| match (k, k.strip_prefix(k3_prefix.as_str())) {
+                (k, _) if k == GENERAL_ARCHITECTURE => (k.to_string(), Value::String(ARCH.into())),
                 (_, Some(rest)) => (format!("{ARCH}.{rest}"), v.clone()),
                 _ => (k.to_string(), v.clone()),
             })
