@@ -365,8 +365,8 @@ every gate is shown to fail on its defect before the fix lands ([how](docs/perfo
   tier does not fill from the sidecar yet); `BLOOMERY_R8=off` reads the source file with the same bits.
 - GLM-5.3 holds at most 16,384 positions a slot; a `--ctx-size` whose slot share is larger is refused at the start.
 - Kimi K3.1 Pro (our `IQ1_S` set, a Q4_K trunk) loads at `--place bp` only (two cards, the host and the NVMe expert
-  tier) and holds `--ctx-size` to 2,048 positions a slot: the reader runs the lightning indexer's selection up to its
-  top-k, and the sparse attention past it is not in the engine yet. The seat steps a prompt one id at a time (the prompt
+  tier). Past the lightning indexer's top-k (2,048 positions) the latent layers attend the rows the indexer picks,
+  so `--ctx-size` is not held to the top-k. The seat steps a prompt one id at a time (the prompt
   rate is near the decode rate) and serves the model's think span as plain text. The set's chat template is unsloth's
   Kimi-K3 template (the checkpoint ships none), and its importance matrix came from `llama-imatrix`; the quantization
   itself was written by `bloomery-quantize`. Kimi K3 (unsloth's `UD-IQ1_S`, 594 GB) does not load at this tag: its
