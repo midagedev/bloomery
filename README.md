@@ -214,6 +214,24 @@ What each model needs in GPU memory, RAM and disk is in [`docs/models.md`](docs/
 Qwen3.6 run on a 24 GB card (or 12 to 16 GB, split onto the CPU by itself); Qwen3.8 wants 128 GB of RAM, GLM-5.3 and
 V4.1 256 GB, and less RAM runs with the overflow paged from NVMe.
 
+A paged run reads faster from two NVMe drives than from one: a byte-identical copy of the shards on a second drive,
+named by a `<prefix>.shard-dirs` sidecar beside the first shard ([`docs/serving.md` 5.4](docs/serving.md#54-when-the-host-cannot-hold-the-experts-either)),
+lets the NVMe tier's reader pick each expert's drive by id, so a layer's misses land on both drives at once. Measured
+on the 0.3.13 tarball's `bloomery-serve`, RTX A6000 + RTX 3090, one cold request of 512 ids then 128 generated, three
+rounds each, the host room pinned so the plan pages (`BLOOMERY_HOST_ROOM`), the same set with and without the sidecar
+(`docs/cards/mirror-ab-*.card`):
+
+| Model | Room | `--place` | Decode tok/s, one drive → two | Prompt tok/s, one drive → two |
+|---|---|---|---|---|
+| DeepSeek V4.1-Flash Q3_K_M | 80G | `bp` | 16.9 → 22.4 (+32 %) | 26.1 → 40.5 (+55 %) |
+| Mistral Large 4 UD-IQ1_S | 80G | `a` | 3.02 → 4.23 (+40 %) | 13.5 → 21.5 (+59 %) |
+| GLM-5.3-Flash UD-Q4_K_XL | 48G | `bp` | 5.51 → 8.22 (+49 %) | 30.3 → 54.0 (+78 %) |
+| Kimi K3.1 Pro IQ1_S | 232G | `bp` | 4.94 with two drives, in the [0.3.13 notes](https://github.com/midagedev/bloomery/releases/tag/v0.3.13) | 3.85 |
+
+One drive reads at ~4.2–4.7 GB/s on these runs and two at ~5.9–7.2 GB/s. The sidecar does nothing when the plan
+pages through the file mapping instead of the tier's arena (a room that moves under half the host leg's bytes prints
+`arena=0`); the gain is in the paged part of the step, so a plan that pages little reads near 0.
+
 ## Hardware
 
 What each platform needs is under [Install](#install), and what each model needs in GPU memory, RAM and disk is in

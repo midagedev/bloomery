@@ -1,0 +1,29 @@
+# The two-drive mirror on Mistral Large 4 UD-IQ1_S (1T, 223 GB on nvme1), a paged plan at BLOOMERY_HOST_ROOM=80G, the copy
+# on nvme0. The second of three models the mirror is read on after K3.1 (mirror-ab-v41.card first).
+kind: ab
+question: on a paged Mistral Large 4 plan does the sidecar's two-drive copy pick lift decode over the one-drive read, by how much?
+term: decode tok/s @ D=512, n_predict 128, --place unset (the plan picks), --ctx-size 4096, BLOOMERY_HOST_ROOM=80G, the
+  0.3.13 sm86 tarball's bloomery-serve; arm two = the set's <prefix>.shard-dirs sidecar naming /models' copy, arm one = no
+  sidecar; a fresh server and one cold request per row
+unit: %
+predict: +10..+40
+rounds: 3
+sd: 3.0 % docs/cards/k31-rel-serve.card, one cold paged request against the next on the same set (~3 %)
+condition: tools/ref/mirror-ab.sh under tools/ref/lease-hold.sh, both arms in one lease, the arm order rotated each round, the
+  copy on nvme0 verified by sha256 per shard; every row's nvtier record must say the plan paged (paged bytes > 0) and arm
+  two's iostat must show both drives reading, else the row is not read
+# derivation: [derived] no paged Mistral row exists on this box; the mechanism is the one K3.1 and V4.1 read (a layer's misses in
+#   flight on two drives instead of one), and the paged share at 80G of ~200 GB of experts is near V4.1's, so the band is
+#   V4.1's with a wider low end for the unknown step split (IQ1_S experts are small, so the host dot is a larger share)
+#   the plan builds the tier's RAM arena only when the room must move over half the host leg's bytes (BLOOMERY_NVTIER_BYTES's
+#   default rule); under that the paged part reads through the file mapping, where the sidecar does nothing. 128G on V4.1
+#   printed arena=0 (the first launch, stopped), so the room is 80G: the arena is the plan's own default, no arena lever set.
+decide-in: the mirror pays on a paged Mistral plan; a row beside V4.1's and K3.1's
+decide-below: under +10: read arm two's nvtier record (copies, fill_ns against the step) and the plan line before any change
+decide-above: above +40: read the witness block and arm one's iostat before crediting
+# outcome 2026-11-08 (/root/mirror-ab-ml4, the 0.3.13 sm86 tarball's bloomery-serve, --ctx-size 4096, --place unset -> a (A6000),
+#  BLOOMERY_HOST_ROOM=80G, D=512 N=128, 3 rounds, order rotated; plan: card_experts 23.4 GB, host 3.3 GB, paged 187.2 GB, arena 73.0 GB
+#  (the plan's default), load 12-14 s): tg one 3.03 / 3.01 / 3.01, two 4.25 / 4.22 / 4.23; pp one 13.09 / 13.71 / 13.73, two 21.54 /
+#  21.46 / 21.44. Effect tg +40.3 %, pp +59.0 %: at the band's top edge (ruler +-6.8 %). iostat over the request: arm one nvme1n1
+#  4,373-4,508 MB/s alone (the set's own drive), arm two nvme0n1 ~3,100 + nvme1n1 ~3,340 = ~6,440 MB/s: the second drive adds its
+#  rate. The rows repeat within 1 %. decide-in: a row beside V4.1's.
