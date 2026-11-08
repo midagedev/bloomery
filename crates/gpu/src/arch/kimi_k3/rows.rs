@@ -12,7 +12,10 @@
 //!   mix of a row reads only that row's;
 //! - a delta layer runs its rows through the mixer's own recurrence in position order on the
 //!   one-lane store in place ([`super::kda::rows`]); a latent layer appends its rows to the cache
-//!   and attends each to the keys up to its own position ([`mla::rows`]);
+//!   and attends each to the keys up to its own position ([`mla::rows`]), and on a load that
+//!   selects ([`super::index`]) writes its rows' index keys after: a pass attends every key, which
+//!   is the selection's result while no row sees more than the indexer's top-k keys, so a pass
+//!   past that is refused by name ([`super::index::check_pass`]);
 //! - the feed-forward block runs the routed block's rows ([`ffn::ffn_rows`]): the router a row,
 //!   the card leg's slots local to a row;
 //! - every projection is each row's one-row launch: the K-quant m-column gemv, the f32 and q8_0
@@ -199,6 +202,7 @@ fn scratch(
             gated: z(v)?,
         },
         mla: MlaBuffers {
+            sel: None,
             qa: z(md.q_lora)?,
             qr: z(md.q_lora)?,
             kv: z(row)?,
@@ -277,7 +281,8 @@ impl Pass {
 }
 
 /// Layer `l`'s mixer over the pass's rows `io.input`: the delta layer's rows on its one-lane store
-/// in place, or the gated latent layer's on its cache; the updates land in `io.out`.
+/// in place, or the gated latent layer's on its cache, then its rows' index keys on a load that
+/// selects; the updates land in `io.out`.
 pub(super) fn run_mixer_rows(
     cx: &GqaCx<'_>,
     (k, acts, lane): (&Kernels, &mut Acts, &Lane),
@@ -318,12 +323,16 @@ pub(super) fn run_mixer_rows(
             };
             kda::rows(cx, kit, acts, sites, (l, kd, m), st, bufs)
         }
-        Mixer::Mla { sites, cache } => {
+        Mixer::Mla {
+            sites,
+            cache,
+            index,
+        } => {
             let bufs = MlaBufs {
                 x: input,
                 pos,
                 n_keys: keys,
-                xn,
+                xn: &mut *xn,
                 qa: &mut mb.qa,
                 qr: &mut mb.qr,
                 kv: &mut mb.kv,
@@ -338,7 +347,18 @@ pub(super) fn run_mixer_rows(
                 out,
                 cache,
             };
-            mla::rows(cx, &k.mla, acts, (&**sites, md), (l, m), bufs, kit)
+            let layer_kit = RowsKit {
+                linear: kit.linear,
+                rows: kit.rows,
+                stage: &mut *kit.stage,
+            };
+            mla::rows(cx, &k.mla, acts, (&**sites, md), (l, m), bufs, layer_kit)?;
+            match (index.as_deref_mut(), k.index.as_ref()) {
+                (Some(ix), Some(ik)) => {
+                    ix.keys_rows(cx, ik, (acts, kit), (l, m), &*xn, pos, &mut mb.qa)
+                }
+                _ => Ok(()),
+            }
         }
     }
 }
@@ -352,8 +372,9 @@ impl Body {
     ///
     /// # Errors
     /// [`GpuError`], before anything is enqueued, for no ids or more than [`PASS_ROWS`], a `pos`
-    /// the stores do not stand at, rows past the caches, taps armed (a pass does not tap), a
-    /// [`Tail::Head`] of another row count than the pass's or a [`Tail::Last`] of more than one
+    /// the stores do not stand at, rows past the caches, a last row that sees more keys than a
+    /// K3.1 file's indexer picks ([`super::index::check_pass`]), taps armed (a pass does not tap),
+    /// a [`Tail::Head`] of another row count than the pass's or a [`Tail::Last`] of more than one
     /// row, and a `pass` made for another model; from the launches otherwise.
     pub fn rows(
         &mut self,
@@ -391,6 +412,7 @@ impl Body {
                 ),
             ));
         }
+        super::index::check_pass(self.hp.indexer.as_ref(), u64::from(end))?;
         if self.taps.is_some() {
             return Err(GpuError::shape(
                 ROWS,

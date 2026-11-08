@@ -4490,6 +4490,17 @@ gate-gpu-kimik3-mla:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_kimi_k3_mla && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_kimi_k3_mla'
 
 # --- end kimik3-mla ---
+# --- kimik3-dsa (Kimi K3.1's selected attention) ---------------------------------------------------------------------------------------
+
+# Kimi K3.1's selected attention on the card at the released file's indexer (32 heads of 128, top-k 2048) over a 4096-row cache and the
+# gated latent layer at 2 heads, seeded inputs, no model file (gate_kimi_k3_dsa's doc): the index key rows bit for bit, the list the
+# exact top-k of the card's scores and the graph's outside the tie band, the selected step bit-identical to the dense one below top-k,
+# the selected heads against llama.cpp's `build_dsa_layer` in f64 past it, the faults the launches raise, the shapes they refuse.
+# The launches are `arch::kimi_k3`'s `enqueue_keys`, `enqueue_pick` and `latent_gated::attend_sel`; the gate adds no kernel.
+gate-gpu-kimik3-dsa:
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_kimi_k3_dsa && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_kimi_k3_dsa'
+
+# --- end kimik3-dsa ---
 # --- kimik3kda (Kimi K3's KDA layer on the card) ---------------------------------------------------------------------------------------
 
 # Kimi K3's KDA layer through `mixer_kda::enqueue` (the bounded sigmoid decay at -5, the joined q/k/v convs, the full-rank gate, one step

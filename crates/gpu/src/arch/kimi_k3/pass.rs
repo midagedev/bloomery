@@ -28,9 +28,12 @@
 //! - the back adds `(card + tier) + host` per row, as the step's back does;
 //! - a layer the card holds whole runs the step's whole-card block on each row.
 //!
-//! A pass of more rows than the plan's shape, at a position the stores do not stand at, or on a
-//! load made without the pass's buffers is refused by name; the step's prompt is the caller's
-//! path then.
+//! A pass of more rows than the plan's shape, at a position the stores do not stand at, whose last
+//! row sees more keys than a K3.1 file's indexer picks (a pass attends every key, the selection's
+//! result only up to its top-k: [`super::index::check_pass`]), or on a load made without the pass's
+//! buffers is refused by name. A prompt that crosses the top-k is cut before anything is
+//! enqueued: the ids up to it as passes, the rest as steps (`app`'s kimi_k3 `Batch::prompt`, by
+//! [`Indexer::pass_prefix`]).
 
 use super::super::kda;
 use super::placed::{Placed, Side};
@@ -58,7 +61,7 @@ use crate::tensor::{Window, WindowMut, copy_row};
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, LAYER_HEAD, launch_u32};
 use cuda_core::DeviceBuffer;
-use model::arch::kimi_k3::hparams::Hparams;
+use model::arch::kimi_k3::hparams::{Hparams, Indexer};
 use model::arch::kimi_k3::names;
 use model::placement::kernels::{DownAct, DownForms};
 use model::placement::workstation::TierLegScratch;
@@ -363,6 +366,7 @@ impl PlacedPass {
                 gated: next_f()?,
             },
             mb: MlaBuffers {
+                sel: None,
                 qa: next_f()?,
                 qr: next_f()?,
                 kv: next_f()?,
@@ -1041,8 +1045,9 @@ impl super::Body {
     ///
     /// # Errors
     /// [`GpuError`], before anything is enqueued, for a load made without the pass, no ids or
-    /// more than the pass's rows, a `pos` the stores do not stand at, rows past the caches, taps
-    /// armed, a [`PassTail::Last`] head of more than one row; from the launches otherwise.
+    /// more than the pass's rows, a `pos` the stores do not stand at, rows past the caches, a last
+    /// row past a K3.1 file's indexer top-k keys, taps armed, a [`PassTail::Last`] head of more
+    /// than one row; from the launches otherwise.
     pub(super) fn placed_rows(
         &mut self,
         gpu: &Gpu,
@@ -1092,6 +1097,7 @@ impl super::Body {
                 ),
             ));
         }
+        super::index::check_pass(self.hp.indexer.as_ref(), u64::from(end))?;
         if self.taps.is_some() {
             return Err(GpuError::shape(
                 PASS,
@@ -1294,6 +1300,13 @@ impl super::Body {
     pub fn pass_shape(&self) -> Option<PassShape> {
         self.placed.as_ref()?.pass.as_deref().map(PlacedPass::shape)
     }
+
+    /// The file's lightning indexer, `None` on a K3 file: its top-k bounds the keys a pass's last
+    /// row may see ([`super::index::check_pass`], [`Indexer::pass_prefix`]).
+    #[must_use]
+    pub fn indexer(&self) -> Option<&Indexer> {
+        self.hp.indexer.as_ref()
+    }
 }
 
 impl GpuModel<super::Body> {
@@ -1335,9 +1348,12 @@ impl GpuModel<super::Body> {
     /// `n` rows, row-major (`n` rows of the vocabulary), each row the placed step's logits at its
     /// position: the passes are cut from the end, so the last holds the last `n` rows, and its
     /// rows run through the head (the host's projection [`HOST_HEAD_ROWS`] rows at a time, or a
-    /// card head's launches one row at a time). Refused by name: no ids, `n` of 0 or past the
-    /// ids or the pass's rows, a load made without the pass, and as
-    /// [`super::Body::placed_rows`] refuses.
+    /// card head's launches one row at a time). A walk that crosses a K3.1 file's indexer top-k
+    /// is cut before anything is enqueued, as `app`'s kimi_k3 `Batch::prompt` cuts a prompt
+    /// ([`Indexer::pass_prefix`]): passes up to the top-k and short of the scored rows, then the
+    /// rest stepped, each scored row the step's logits ([`GpuModel::step`], [`GpuModel::logits`]).
+    /// Refused by name: no ids, `n` of 0 or past the ids or the pass's rows, a load made without
+    /// the pass, and as [`super::Body::placed_rows`] refuses.
     ///
     /// # Errors
     /// [`GpuError`] as above, and the head's fault.
@@ -1358,6 +1374,13 @@ impl GpuModel<super::Body> {
             ));
         }
         let total = ids.len();
+        let passed = self
+            .body(WHAT)?
+            .indexer()
+            .map_or(total, |ix| ix.pass_prefix(u64::from(self.pos()), total));
+        if passed < total {
+            return self.score_crossing(ids, n, (rows, passed.min(total - n)));
+        }
         let head_len = total - rows.min(total);
         let mut out = Vec::new();
         self.run_rows(total, WHAT, |gpu, w, body, head, pos| {
@@ -1391,6 +1414,37 @@ impl GpuModel<super::Body> {
             head.enqueue(gpu, w)?;
             Ok(true)
         })?;
+        Ok(out)
+    }
+
+    /// [`GpuModel::score_placed`] of a walk past a K3.1 file's indexer top-k: the first `passed`
+    /// ids as placed passes of up to `rows` with no head (`passed` is at most the ids before the
+    /// last `n`, so no scored row is a pass's), then every other id stepped, the step selecting its
+    /// rows, the logits read after each of the last `n`.
+    fn score_crossing(
+        &mut self,
+        ids: &[u32],
+        n: usize,
+        (rows, passed): (usize, usize),
+    ) -> Result<Vec<f32>, GpuError> {
+        const WHAT: &str = "kimi_k3 GpuModel::score_placed";
+        if passed > 0 {
+            self.run_rows(passed, WHAT, |gpu, w, body, _head, pos| {
+                for (c, chunk) in ids[..passed].chunks(rows).enumerate() {
+                    let first = pos + launch_u32(WHAT, "row", c * rows)?;
+                    body.placed_rows(gpu, w, (chunk, first), PassTail::Open)?;
+                }
+                Ok(false)
+            })?;
+        }
+        let from = ids.len() - n;
+        let mut out = Vec::new();
+        for (i, &id) in ids.iter().enumerate().skip(passed) {
+            self.step(&[id])?;
+            if i >= from {
+                out.extend(self.logits()?);
+            }
+        }
         Ok(out)
     }
 }

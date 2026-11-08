@@ -84,6 +84,11 @@
 //!   same plan's stepped load's; `--score --walk pass` over the stepped ids prints a line a
 //!   completion position whose top id is the stepped load's argmax there.
 //!
+//! - `pass past top-k`: the fixture made a K3.1 file at a top-k of 16 (seeded indexer tensors on
+//!   its latent layer), loaded with the pass at a context of 64 (the load selects): a prompt of 24
+//!   ids through `Batch::prompt` (16 as passes, 8 stepped) reads the token and the position of the
+//!   same ids stepped from a reset. Mutant: the split removed (the second pass is refused by name).
+//!
 //! The prompt is the fixed walk of `e2e::walk` through the vocabulary: [`PROMPT`] ids, [`STEPS`]
 //! greedy ids.
 
@@ -761,6 +766,7 @@ mod gate {
         pass &= node_family_and_records(&prompt, budget)?;
         pass &= guarded("pass", placed_pass(&inputs, budget, host));
         pass &= guarded("pass cli", pass_cli(&inputs, budget, host));
+        pass &= guarded("pass past top-k", pass_past_top_k(&inputs, budget, host));
         println!("{NAME}: {}", tier::tally_line());
         if !pass {
             return Err(checks_failed());
@@ -1553,6 +1559,175 @@ mod gate {
 
     /// `generate_kimi_k3 --walk pass` at a budget that holds its widest shape at [`CTX`]: the
     /// `prompt_pass` record names that shape, and the run reads the same plan's load stepped.
+    /// The derived K3.1 file's indexer top-k: the prompt of [`pass_past_top_k`] crosses it.
+    const DSA_TOP_K: usize = 16;
+    /// Its cache rows: past the top-k, so the load selects, and at most the attention's one
+    /// segment (`flash::seg_keys`), so the list's gathered rows and the cache take the same flash
+    /// form and the selection below the top-k is the dense walk's bits.
+    const DSA_CTX: usize = 64;
+
+    /// The K3 fixture as a K3.1 file: every key under `kimi-k31.` for `kimi-k3.`, the indexer's
+    /// keys at a top-k of [`DSA_TOP_K`] on the latent layers, and their five tensors each (the
+    /// matrices Q8_0 of seeded values, the key norm's gain 1 and bias 0, F32), every other tensor
+    /// the fixture's bytes. Written under the temp directory; the path.
+    fn k31_fixture(inputs: &PlanInputs) -> Result<std::path::PathBuf, GateError> {
+        use bloomery_gpu_gates::{GateRng, write_gguf};
+        use gguf::quant::Q8Block;
+        use gguf::{GgmlType, Value};
+        use model::arch::kimi_k3::hparams::{INDEX_DIM, INDEX_HEADS, Kind};
+
+        const ARCH: &str = "kimi-k31";
+        let split = open_split(Arch::KimiK3, RECIPE)?;
+        let hp = &inputs.hp;
+        let mut kvs: Vec<(String, Value)> = split
+            .iter_kv()
+            .map(|(k, v)| match (k, k.strip_prefix("kimi-k3.")) {
+                ("general.architecture", _) => (k.to_string(), Value::String(ARCH.into())),
+                (_, Some(rest)) => (format!("{ARCH}.{rest}"), v.clone()),
+                _ => (k.to_string(), v.clone()),
+            })
+            .collect();
+        let latent: Vec<bool> = hp.kinds.iter().map(|k| *k == Kind::Mla).collect();
+        for (suffix, v) in [
+            (
+                "attention.indexer.head_count",
+                Value::U32(u32::try_from(INDEX_HEADS)?),
+            ),
+            (
+                "attention.indexer.key_length",
+                Value::U32(u32::try_from(INDEX_DIM)?),
+            ),
+            (
+                "attention.indexer.top_k",
+                Value::U32(u32::try_from(DSA_TOP_K)?),
+            ),
+            (
+                "attention.indexer.types",
+                Value::Array(latent.iter().map(|&b| Value::Bool(b)).collect()),
+            ),
+            ("attention.indexer.rope_dimension_count", Value::U32(0)),
+            ("attention.layer_norm_epsilon", Value::F32(1e-5)),
+        ] {
+            kvs.push((format!("{ARCH}.{suffix}"), v));
+        }
+        let mut decls: Vec<(String, Vec<u64>, GgmlType, Vec<u8>)> = split
+            .iter_tensors()
+            .map(|(_, t)| {
+                Ok((
+                    t.name.clone(),
+                    t.dims.clone(),
+                    t.ty,
+                    split.data(&t.name)?.to_vec(),
+                ))
+            })
+            .collect::<Result<_, GateError>>()?;
+        let mut r = GateRng(0x6b33_3164_7361_0001);
+        let mut q8 = |k: usize, n: usize| -> Result<Vec<u8>, GateError> {
+            let vals: Vec<f32> = (0..k * n).map(|_| r.uni(-0.05, 0.05)).collect();
+            let mut out = Vec::with_capacity(k * n / 32 * 34);
+            for c in vals.as_chunks::<32>().0 {
+                let b = Q8Block::quantize_ref(c).ok_or("a non-finite Q8_0 block")?;
+                out.extend_from_slice(&b.d.to_le_bytes());
+                out.extend(b.q.iter().map(|&q| q.to_le_bytes()[0]));
+            }
+            Ok(out)
+        };
+        let f32s = |v: f32| -> Vec<u8> { (0..INDEX_DIM).flat_map(|_| v.to_le_bytes()).collect() };
+        let (embd, q_lora, d) = (hp.n_embd, hp.mla.q_lora, INDEX_DIM);
+        for l in (0..hp.n_layer).filter(|&l| latent[l]) {
+            let blk = |stem: &str| format!("blk.{l}.indexer.{stem}");
+            // A matrix's dims are `[in, out]`, the ggml order: rows of `in` values, `out` of them.
+            for (stem, k, n) in [
+                ("attn_q_b.weight", q_lora, INDEX_HEADS * d),
+                ("attn_k.weight", embd, d),
+                ("proj.weight", embd, INDEX_HEADS),
+            ] {
+                let dims = vec![k as u64, n as u64];
+                decls.push((blk(stem), dims, GgmlType::Q8_0, q8(k, n)?));
+            }
+            for (stem, v) in [("k_norm.weight", 1.0), ("k_norm.bias", 0.0)] {
+                decls.push((blk(stem), vec![d as u64], GgmlType::F32, f32s(v)));
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("gate-kimi-k31-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("kimi-k31-fixture.gguf");
+        write_gguf(&path, &kvs, &decls)?;
+        println!("pass past top-k: model={}", path.display());
+        Ok(path)
+    }
+
+    /// `pass past top-k`: on a placed pass load of the K3 fixture made a K3.1 file at a top-k of
+    /// [`DSA_TOP_K`] and a context of [`DSA_CTX`] (the load selects), a prompt of top-k + 8 ids
+    /// through `Batch::prompt` (passes up to the top-k, steps after it) reads the token and the
+    /// position of the same ids stepped from a reset. Mutant: the split removed from
+    /// `Batch::prompt` (the whole prompt as passes): the second pass's last row sees 24 keys and is
+    /// refused by name, so the clause ends in that error.
+    fn pass_past_top_k(inputs: &PlanInputs, budget: u64, host: HostCfg) -> Result<bool, GateError> {
+        let path = k31_fixture(inputs)?;
+        let inputs31 = PlanInputs::read_without_chat(&Split::open(&path)?)?;
+        let shape = PASS_SHAPES[0];
+        let (pass_inputs, machine, mut at) = pass_plan_inputs(&inputs31, budget, shape, false)?;
+        // The stage card also holds the indexer's tensors and the latent layers' key rows.
+        let split = Split::open(&path)?;
+        let indexer: u64 = split
+            .iter_tensors()
+            .filter(|(_, t)| t.name.contains(".indexer."))
+            .map(|(_, t)| t.nbytes)
+            .sum();
+        let latent = inputs31
+            .hp
+            .kinds
+            .iter()
+            .filter(|k| **k == model::arch::kimi_k3::hparams::Kind::Mla)
+            .count() as u64;
+        let extra = indexer + latent * (DSA_CTX as u64) * 256 + (1 << 20);
+        if let CardBudget::Per(cards) = &mut at.card_budget_bytes
+            && let Some(stage) = cards.first_mut()
+        {
+            stage.1 += extra;
+        }
+        let plan = pass_inputs.plan(&machine, DSA_CTX as u64, &at)?;
+        let mut m = GpuModel::<Body>::open_placed_pass(split, &plan, &pass_inputs, 0, host, shape)?;
+        m.set_mode(StepMode::Graph);
+        let selects = m
+            .body(NAME)?
+            .indexer()
+            .is_some_and(|ix| DSA_CTX > ix.top_k && ix.top_k == DSA_TOP_K);
+        let prompt = e2e::walk(DSA_TOP_K + 8, inputs31.hp.n_vocab);
+        let split_walk = Body::prompt(&mut m, &prompt);
+        let (got, got_pos, got_row) = match split_walk {
+            Ok(t) => (t, m.pos(), m.logits()?),
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(path.parent().ok_or("the fixture's directory")?);
+                return Ok(line(
+                    false,
+                    "pass past top-k",
+                    &format!("{} ids through Batch::prompt: {e}", prompt.len()),
+                ));
+            }
+        };
+        m.reset()?;
+        let want = m.step(&prompt)?;
+        let (want_pos, want_row) = (m.pos(), m.logits()?);
+        drop(m);
+        let _ = std::fs::remove_dir_all(path.parent().ok_or("the fixture's directory")?);
+        tier::sc(
+            "pass past top-k: a prompt across the top-k reads the stepped token and position",
+        )?;
+        Ok(line(
+            selects && got == want && got_pos == want_pos,
+            "pass past top-k",
+            &format!(
+                "top-k {DSA_TOP_K}, ctx {DSA_CTX}, the load selects: {selects}; {} ids through \
+                 Batch::prompt: token {got} at position {got_pos}; stepped: token {want} at \
+                 position {want_pos}; last logits row bits equal: {}",
+                prompt.len(),
+                fnv_row(&got_row) == fnv_row(&want_row)
+            ),
+        ))
+    }
+
     fn pass_cli(inputs: &PlanInputs, budget: u64, host: HostCfg) -> Result<bool, GateError> {
         let shape = SHAPES
             .iter()

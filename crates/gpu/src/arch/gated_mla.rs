@@ -14,7 +14,9 @@
 //!
 //! and last, 5. `attn_output` into `out`.
 //!
-//! [`step`] runs one row. [`rows`] runs a pass of 1 to [`PASS_ROWS`] rows in position order — a
+//! [`step`] runs one row: [`front`] (1 to 4), then [`back`] (the core and 5). A family whose
+//! layer selects its keys (Kimi K3.1's indexer) runs [`front`], its own selection, then [`back`] with
+//! the core over the selected rows ([`attend_sel`]). [`rows`] runs a pass of 1 to [`PASS_ROWS`] rows in position order — a
 //! verify's rows or a prompt chunk — through the core's [`attend_rows`] with the projections'
 //! m-column launches ([`project_rows`]) before and after it. A family whose prompt runs wider
 //! units reads the same [`MlaSites`] and [`MlaBufs`] from its own wide walk.
@@ -28,7 +30,9 @@ use crate::GpuError;
 use crate::arch::hybrid::{Acts, GqaCx, Site};
 use crate::arch::rows_kit::{RowsKit, kgemv_rows, project_rows};
 use crate::latent::LATENT;
-use crate::latent_gated::{AttendIn, AttnBufs, MlaDims, MlaKernels, ValueW, attend, attend_rows};
+use crate::latent_gated::{
+    AttendIn, AttnBufs, MlaDims, MlaKernels, Selection, ValueW, attend, attend_rows, attend_sel,
+};
 use crate::linear::PASS_ROWS;
 use crate::site::{self, Form, SiteTy};
 use crate::tensor::DeviceTensor;
@@ -210,19 +214,33 @@ pub(crate) fn value_w<'w>(w: &'w Weights, v: &ValueHeads) -> Result<ValueW<'w>, 
     }
 }
 
-/// Enqueue MLA layer `l` at one row on `b`'s buffers (module doc).
+/// Enqueue MLA layer `l` at one row on `b`'s buffers (module doc): [`front`], then [`back`] with no
+/// selection.
 pub(crate) fn step(
     cx: &GqaCx<'_>,
     k: &MlaKernels,
     acts: &mut Acts,
     (sites, d): (&MlaSites, &MlaDims),
     l: usize,
-    b: MlaBufs<'_>,
+    mut b: MlaBufs<'_>,
+) -> Result<(), GpuError> {
+    front(cx, acts, (sites, d), l, &mut b)?;
+    back(cx, k, acts, (sites, d), l, b, None)
+}
+
+/// The module doc's launches 1 to 4 of layer `l` at one row: `b.xn` the normed input, `b.qa` and
+/// `b.qr` the query latent before and after its norm, `b.kv`, `b.gate` and `b.q` the projections
+/// [`back`] reads.
+pub(crate) fn front(
+    cx: &GqaCx<'_>,
+    acts: &mut Acts,
+    (sites, d): (&MlaSites, &MlaDims),
+    l: usize,
+    b: &mut MlaBufs<'_>,
 ) -> Result<(), GpuError> {
     let (gpu, w) = (cx.gpu, cx.w);
     let stream = gpu.stream();
-    let fault = gpu.layer_sink(l)?;
-    let [norm, q_a_norm, kv_a_norm] = &sites.vecs;
+    let [norm, q_a_norm, _] = &sites.vecs;
     gpu.elem().enqueue_rms_norm(
         stream,
         b.x,
@@ -264,32 +282,46 @@ pub(crate) fn step(
         1,
         b.qr,
     )?;
-    sites.q_b.project(cx, acts, l, b.qr, b.q)?;
-    attend(
-        gpu,
-        k,
-        d,
-        AttendIn {
-            kv: b.kv,
-            q: b.q,
-            gate: b.gate,
-            kv_norm: w.f32_buf(WHAT, kv_a_norm)?,
-            k_b: q8_planes(w, &sites.k_b)?,
-            v_b: value_w(w, &sites.v_b)?,
-            pos: b.pos,
-            n_keys: b.n_keys,
-            fault,
-        },
-        AttnBufs {
-            qabs: b.qabs,
-            att: b.att,
-            av: b.av,
-            part_v: b.part_v,
-            part_ms: b.part_ms,
-        },
-        b.cache,
-        b.gated,
-    )?;
+    sites.q_b.project(cx, acts, l, b.qr, b.q)
+}
+
+/// The core over [`front`]'s projections in `b` (the cache row, the absorb, the gather, the latent
+/// attention over the cache rows `0 ..= pos`, or over `sel`'s rows when there is one, the value
+/// projection, the output gate), then launch 5, `attn_output` into `b.out`.
+pub(crate) fn back(
+    cx: &GqaCx<'_>,
+    k: &MlaKernels,
+    acts: &mut Acts,
+    (sites, d): (&MlaSites, &MlaDims),
+    l: usize,
+    b: MlaBufs<'_>,
+    sel: Option<Selection<'_>>,
+) -> Result<(), GpuError> {
+    let (gpu, w) = (cx.gpu, cx.w);
+    let fault = gpu.layer_sink(l)?;
+    let [_, _, kv_a_norm] = &sites.vecs;
+    let a = AttendIn {
+        kv: b.kv,
+        q: b.q,
+        gate: b.gate,
+        kv_norm: w.f32_buf(WHAT, kv_a_norm)?,
+        k_b: q8_planes(w, &sites.k_b)?,
+        v_b: value_w(w, &sites.v_b)?,
+        pos: b.pos,
+        n_keys: b.n_keys,
+        fault,
+    };
+    let s = AttnBufs {
+        qabs: b.qabs,
+        att: b.att,
+        av: b.av,
+        part_v: b.part_v,
+        part_ms: b.part_ms,
+    };
+    match sel {
+        None => attend(gpu, k, d, a, s, b.cache, b.gated)?,
+        Some(sel) => attend_sel(gpu, k, d, a, s, b.cache, sel, b.gated)?,
+    }
     sites.out.project(cx, acts, l, b.gated, b.out)
 }
 
