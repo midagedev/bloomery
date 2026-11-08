@@ -1,0 +1,18 @@
+# k31dsa mutant list-relu
+# clause: list (gate_kimi_k3_dsa.rs:964-973) and separation list without the relu (:983-986)
+# site: crates/gpu/src/indexer.rs:126 relu(), the score kernel's relu dropped (PTX moves: ds41_indexer_score)
+# expected red (x4): "  list at {n} rows: ... scores outside the kernel band of our rule: N>0, rows off our rule's top-k N>0 ...: FAIL"
+# and "  separation list at 4096 rows: the card's list vs the graph without the relu: ~0 rows off, past 40: FAIL"
+diff --git a/crates/gpu/src/indexer.rs b/crates/gpu/src/indexer.rs
+index 25571da05..b9f08b969 100644
+--- a/crates/gpu/src/indexer.rs
++++ b/crates/gpu/src/indexer.rs
+@@ -123,7 +123,7 @@ pub fn weights_scale(n_head: usize, head_dim: usize) -> f32 {
+ /// `x` where it is above zero, `+0` elsewhere (NaN included).
+ #[inline(always)]
+ fn relu(x: f32) -> f32 {
+-    if x > 0.0 { x } else { 0.0 }
++    x
+ }
+ 
+ // ---------------------------------------------------------------- kernels
