@@ -338,7 +338,10 @@ mod gate {
     /// win, not to coincide with a default context.
     const FLAG_CTX: usize = 1536;
     /// A context past `ORACLE_POSITIONS`, the refusal the clause asks for.
-    const OVER_CTX: usize = 99_999;
+    // PIN(2026-11-08): past the raised bound of 262,144 (was 99,999, past the
+    // old 16,384); any value over `ORACLE_POSITIONS` and under the trained
+    // context answers the clause.
+    const OVER_CTX: usize = 300_000;
     /// The `ctx` clause's polls for the seat's pre-load lines, 1 s apart:
     /// the lines print at plan time, before the load's first-start JIT.
     const LINE_POLLS: usize = 90;

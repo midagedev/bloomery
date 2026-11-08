@@ -19,7 +19,7 @@
 #             rounded up to 256, an arm's own (depth-qwen3moe.sh's rule; docs/fair-measure.md 1.5): the
 #             row's `ctx=` names it. BLOOMERY_GEN_CTX fixes C for every ours arm and every server arm
 #             instead, e.g. at a serving height. The plan refuses more than the deepest context a
-#             reference set checks (place::ORACLE_POSITIONS, 16,384), and D + N <= C is checked before
+#             reference set checks (place::ORACLE_POSITIONS, 262,144), and D + N <= C is checked before
 #             the lease. The binary takes no --arm list, so an ours arm's warm-up is a process of its own
 #             (WARMUP r0, below), not a same-id PRIME in its load. The prompt is prose under this model's own
 #             vocabulary (models/glm5next.sh GLM_PROSE, its sha256 checked before the lease): the D

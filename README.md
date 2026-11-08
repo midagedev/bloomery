@@ -363,7 +363,7 @@ every gate is shown to fail on its defect before the fix lands ([how](docs/perfo
   IQ1_M, IQ2_XXS and IQ2_XS) run on the host tier.
 - DeepSeek V4.1 on one 24 GB card from a file with an r8 sidecar beside it is refused at the load by name (the NVMe
   tier does not fill from the sidecar yet); `BLOOMERY_R8=off` reads the source file with the same bits.
-- GLM-5.3 holds at most 16,384 positions a slot; a `--ctx-size` whose slot share is larger is refused at the start.
+- GLM-5.3 holds at most 262,144 positions a slot; a `--ctx-size` whose slot share is larger is refused at the start.
 - Kimi K3.1 Pro (our `IQ1_S` set, a Q4_K trunk) loads at `--place bp` only (two cards, the host and the NVMe expert
   tier). Past the lightning indexer's top-k (2,048 positions) the latent layers attend the rows the indexer picks,
   so `--ctx-size` is not held to the top-k. The seat runs a prompt as placed passes; the pass holds its buffers on the stage

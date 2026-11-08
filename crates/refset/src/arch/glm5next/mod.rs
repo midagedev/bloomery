@@ -46,12 +46,15 @@ pub const STEP_SETS: &[&str] = &[STEP4, STEP4_EVERY_NODE, D1K];
 /// Step 3,070 of the prose after a fused prefill, ik's k-pool indexer on
 /// (`--dsa`): past the 2,051 positions a latent layer keeps whole.
 pub const D3K_DSA: &str = "ref_glm5next_d3kdsa";
-/// Step 16,382 of the prose after a fused prefill, `--dsa`: the deepest
-/// context the program serves (`place::ORACLE_POSITIONS`).
+/// Step 16,382 of the prose after a fused prefill, `--dsa`.
 pub const D16K_DSA: &str = "ref_glm5next_d16kdsa";
+/// Step 262,142 of the prose-all corpus after a fused prefill, `--dsa`: the
+/// deepest context the program serves (`place::ORACLE_POSITIONS`, the
+/// 262,144-positions bar every model serves).
+pub const D256K_DSA: &str = "ref_glm5next_d256kdsa";
 
 /// The `--dsa` decode-step sets, by position.
-pub const DSA_SETS: &[&str] = &[D3K_DSA, D16K_DSA];
+pub const DSA_SETS: &[&str] = &[D3K_DSA, D16K_DSA, D256K_DSA];
 
 /// [`MODEL`], as a family's `runs`.
 fn model() -> Result<String, RefError> {

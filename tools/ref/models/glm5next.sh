@@ -152,6 +152,10 @@ REF_TOKENS=785,6722,315,9621,374
 REF_DUMP_LEASE=1
 GLM_PROSE=glm5next/corpus-prose.ids
 GLM_PROSE_SHA256=8af07981c1749170b57d424cff5274b89be063c1eb44ffa3a443ddc16642bb64
+GLM_PROSE_ALL=glm5next/corpus-prose-all.ids
+# PIN-ME-glm256: the sha256 of $BLOOMERY_DATA/glm5next/corpus-prose-all.ids, the copy of the
+# tokenizer oracle's prose-all.nps.ids (see the header); the lead pins it after making the file.
+GLM_PROSE_ALL_SHA256=pin-me-sha256-of-glm5next-corpus-prose-all-ids
 : "${GLM_PROSE_FROM:=50000}"
 : "${LCPP27752:=/home/user/llama.cpp-pr27752}"
 : "${LCPP27752BIN:=$LCPP27752/build/bin/llama-bench}"
@@ -206,9 +210,13 @@ GLM_MTP_SHA=425a2c1d
 #   d3kdsa   ik's k-pool indexer on (--dsa): a quiet prefill of 3,070 ids of prose, the step at
 #            position 3,070, -c 4096 — past the 2,051 positions a latent layer keeps whole, so the
 #            step's latent layers attend the 512 pools the indexer picks and their tail
-#   d16kdsa  the same at a quiet prefill of 16,382, the step at position 16,382, -c 16384: the
-#            deepest context the program serves (place::ORACLE_POSITIONS)
-#   Both --dsa steps sit at (q + 1) % 4 == 3, so the step's tail is three real cells and ik's
+#   d16kdsa  the same at a quiet prefill of 16,382, the step at position 16,382, -c 16384
+#   d256kdsa the same at a quiet prefill of 262,142, the step at position 262,142, -c 262144: the
+#            deepest context the program serves (place::ORACLE_POSITIONS), the user's 262,144-positions
+#            bar. Its ids are the prose-all corpus's first (GLM_PROSE_ALL): the 71,727-id prose runs
+#            short of a 262,142 prefill — repeating it would still be a valid bit-for-bit oracle of
+#            the selector, but the unrepeated text is there to take
+#   All three --dsa steps sit at (q + 1) % 4 == 3, so the step's tail is three real cells and ik's
 #   zero-filled tail slots (src/llama.cpp, inp_kpool_tail) name no cell at the step; its prefill
 #   rows past 2,051 with a shorter tail still list cell 0 there, which the model and mainline do
 #   not (build_glm5next.cpp; llama.cpp #27752 pads with a masked cell).
@@ -218,6 +226,14 @@ GLM_MTP_SHA=425a2c1d
 # README.md, md5 c6bb074439479420faffa33257424c00, the prose the qwen3moe and qwen35moe sets are of),
 # one id per line, 71,727 ids, copied out of tokenizer-glm5next/ so a rerun of that oracle on a moved
 # ik tree cannot change the ids a set is of; the sha256 below is the check.
+#   GLM_PROSE_ALL     the every-Markdown-under-ik twin of the prose, the same oracle's `prose-all.nps.ids`
+#   GLM_PROSE_ALL_SHA256  (4,560,650 ids, the set's manifest row), copied to
+#                    $BLOOMERY_DATA/glm5next/corpus-prose-all.ids the same way, for the d256kdsa
+#                    variant: the deepest set's 262,143 ids are its first, real text the whole way
+#                    (the 71,727-id prose repeats short of them). Make it with
+#                    cp "$BLOOMERY_DATA/ref-tokenizer-glm5next/prose-all.nps.ids" "$BLOOMERY_DATA/glm5next/corpus-prose-all.ids"
+#                    then pin the sha256 here (sha256sum of the copy; dump.sh refuses a file that no
+#                    longer has it, as for the prose).
 ref_step_variant() {
   local name=$1 every_node=0
   case $name in
@@ -230,11 +246,14 @@ ref_step_variant() {
     d1k)   STEP_SET=ref_glm5next_d1k;   STEP_CTX=2048; STEP_PREFILL=1024 ;;
     d3kdsa)  STEP_SET=ref_glm5next_d3kdsa;  STEP_CTX=4096;  STEP_PREFILL=3070;  STEP_ARGS+=(--dsa) ;;
     d16kdsa) STEP_SET=ref_glm5next_d16kdsa; STEP_CTX=16384; STEP_PREFILL=16382; STEP_ARGS+=(--dsa) ;;
+    d256kdsa) STEP_SET=ref_glm5next_d256kdsa; STEP_CTX=262144; STEP_PREFILL=262142; STEP_ARGS+=(--dsa) ;;
     *)     return 1 ;;
   esac
   case $name in
     d1k|d3kdsa|d16kdsa) STEP_TOKENS_FILE=$BLOOMERY_DATA/$GLM_PROSE
                         STEP_TOKENS_SHA256=$GLM_PROSE_SHA256 ;;
+    d256kdsa) STEP_TOKENS_FILE=$BLOOMERY_DATA/$GLM_PROSE_ALL
+              STEP_TOKENS_SHA256=$GLM_PROSE_ALL_SHA256 ;;
   esac
   # The fixture tier's long sets also hold ik's routes of the prefill's positions (dump_ref --prefill-routes): the picks, the raw
   # gathered scores and the final weights a gate plants into a batch-fed run of the same ids. This graph passes a routed scale
@@ -242,7 +261,7 @@ ref_step_variant() {
   # three nodes at llama-build-context.cpp:1536, 1539 and 1569 (ik-idxkey db517b69). A stem the graph does not build ends the dump
   # by name. The real tier's sets are as they were.
   if [ "${BLOOMERY_TIER:-real}" = fixture ]; then
-    case $name in d1k|d3kdsa|d16kdsa) STEP_ARGS+=(--prefill-routes "ffn_moe_topk,ffn_moe_weights,ffn_moe_weights_scaled") ;; esac
+    case $name in d1k|d3kdsa|d16kdsa|d256kdsa) STEP_ARGS+=(--prefill-routes "ffn_moe_topk,ffn_moe_weights,ffn_moe_weights_scaled") ;; esac
   fi
   if [ "$every_node" = 1 ]; then
     STEP_SET=${STEP_SET}_every_node

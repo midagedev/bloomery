@@ -1453,8 +1453,9 @@ dump-ref-ml4vis *ARGS:
     BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=600 BLOOMERY_MODEL=mistral-large4 ./tools/box.sh "bash tools/ref/clefvis/clefvis.sh --cpu {{ARGS}}"
 
 # GLM-5.3-Flash(glm5next) 오라클: 같은 덤프 도구를 glm5next 프로필로, ik를 CPU로 돌려 5토큰 배치 세트를
-# $BLOOMERY_DATA/ref_glm5next/에 뜬다. VARIANT(step4, d1k, d3kdsa, d16kdsa와 -every-node 접미사)를 주면 조용한 프리필 뒤 디코드 한 스텝을
-# 제 세트로 뜬다 — models/glm5next.sh. d1k는 $BLOOMERY_DATA/glm5next/corpus-prose.ids의 첫 1,025개 id를 읽는다(sha256 핀).
+# $BLOOMERY_DATA/ref_glm5next/에 뜬다. VARIANT(step4, d1k, d3kdsa, d16kdsa, d256kdsa와 -every-node 접미사)를 주면 조용한 프리필 뒤 디코드 한 스텝을
+# 제 세트로 뜬다 — models/glm5next.sh. d1k는 $BLOOMERY_DATA/glm5next/corpus-prose.ids의 첫 1,025개 id를 읽는다(sha256 핀);
+# d256kdsa는 $BLOOMERY_DATA/glm5next/corpus-prose-all.ids의 첫 262,143개 id를 읽는다(같은 핀, 프리필이 시간 걸리므로 BLOOMERY_DUMP_BOUND 상향).
 # 덤프마다 199.7 GB 샤드 집합 전체를 CPU 임대 아래서 올리므로 카드가 있어야 한다
 # (BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/glmref-dump.card').
 dump-ref-glm5next *VARIANT:
@@ -1487,8 +1488,8 @@ dump-ref-qwen4exp-nvfp4 IDS *ARGS:
 # ik's node dump of a family's fixture file (glm5next, qwen4exp, qwen35moe, deepseek41), into $BLOOMERY_DATA/fx_<the real twin's set>
 # (refset's fixture families): the same dumper and profile as the family's real recipe, the fixture first shard as the model,
 # the fixture file's `# fixture` line in the header (refset-check --fixture-line), and in the long variants (d1k, d3k, d3kdsa,
-# d16kdsa) ik's routes for the prefill's positions (dump_ref --prefill-routes). No VARIANT is the batch set; a VARIANT is the
-# real recipe's (step4, step4-every-node, d1k, d3k, d3kdsa, d16kdsa; deepseek41: step4-every-node, d1n-every-node,
+# d16kdsa, d256kdsa) ik's routes for the prefill's positions (dump_ref --prefill-routes). No VARIANT is the batch set; a VARIANT is the
+# real recipe's (step4, step4-every-node, d1k, d3k, d3kdsa, d16kdsa, d256kdsa; deepseek41: step4-every-node, d1n-every-node,
 # d1-every-node, d2-every-node). BLOOMERY_TIER=fixture is required (in the real tier: exit 64; the real sets have their own
 # recipes). Under the CPU lease and a card (BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/fxoracle-dump.card'); DUMP_DRY=1 in
 # that variable prints the dump and stops before the lease. Under BLOOMERY_FIXTURE_VARIANT=<tag> (tools/fixture-variants.tsv; not the
@@ -2361,9 +2362,9 @@ gate-gpu-glm-mla:
 
 # GLM-5.3-Flash's k-pool selector on the card (`latent::index_pool`, `kpool::kpool_score`, `qsa::qsa_topk_high`, the
 # V4.1 attention over the list): synthetic clauses against the host rules and the exact rule's bands, then every
-# latent layer teacher-forced on ik's --dsa step sets (refset `ik-glm5next-dsa`, `just dump-ref-glm5next d3kdsa`
-# and `d16kdsa`). Reads no weight but the file's `indexer_compressor_ape`. The two --dsa sets are ik's: Oracle clauses, deferred
-# to the real tier by name in the fixture tier; the synthetic clauses run on either file.
+# latent layer teacher-forced on ik's --dsa step sets (refset `ik-glm5next-dsa`, `just dump-ref-glm5next d3kdsa`,
+# `d16kdsa` and `d256kdsa`). Reads no weight but the file's `indexer_compressor_ape`. The three --dsa sets are ik's: Oracle
+# clauses, deferred to the real tier by name in the fixture tier; the synthetic clauses run on either file.
 gate-gpu-glm-sel:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_glm_sel && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm_sel'
 

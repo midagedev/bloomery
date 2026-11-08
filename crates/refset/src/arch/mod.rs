@@ -309,7 +309,7 @@ mod tests {
             std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         let sets_of = [
             ("fx-ik-glm5next", 4),
-            ("fx-ik-glm5next-dsa", 2),
+            ("fx-ik-glm5next-dsa", 3),
             ("fx-mtp-glm5next", 1),
             ("fx-ik-qwen4exp", 5),
             ("fx-hf-qwen4exp-nvfp4", 4),

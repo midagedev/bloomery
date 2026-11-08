@@ -20,6 +20,8 @@ pub const D1K: &str = "fx_ref_glm5next_d1k";
 pub const D3K_DSA: &str = "fx_ref_glm5next_d3kdsa";
 /// [`super::D16K_DSA`] on the fixture.
 pub const D16K_DSA: &str = "fx_ref_glm5next_d16kdsa";
+/// [`super::D256K_DSA`] on the fixture.
+pub const D256K_DSA: &str = "fx_ref_glm5next_d256kdsa";
 /// [`super::MTP_SET`] on the fixture.
 pub const MTP_SET: &str = "ref-mtp/fx_prose64_n64_k1";
 
@@ -59,7 +61,7 @@ pub static MTP: Family = Family {
 /// [`super::IK_DSA`] on the fixture.
 pub static IK_DSA: Family = Family {
     name: "fx-ik-glm5next-dsa",
-    sets: &[D3K_DSA, D16K_DSA],
+    sets: &[D3K_DSA, D16K_DSA, D256K_DSA],
     resolve: None,
     recipe: "BLOOMERY_TIER=fixture just dump-ref-fixture glm5next [VARIANT]",
     identity: Identity::FixtureManifest,
