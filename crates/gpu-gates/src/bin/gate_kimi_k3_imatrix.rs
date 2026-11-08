@@ -31,12 +31,43 @@
 //! layer 0 and 1.8e-1 in layer 3 (the median 1e-3 and 4e-2), a squared value doubling it. A routed stack's
 //! counts follow the router's top-k of scores computed on those activations, so the picks nearest the cut
 //! flip: 3 to 7 % of an expert's rows here, and a flipped row moves its column sums with it.
+//!
+//! The `bp` arm plans under a card budget. The fixture's experts (38 KB each) all fit the stage card, so the
+//! placed plan under no budget leaves the tier card without an expert and is refused by name, and a walk that
+//! never reaches the tier collects nothing through its leg. Before the arms run the gate plans the pass the
+//! child makes (the first shape `generate_kimi_k3 --walk pass` tries at [`CTX`]: its bytes the prompt reserve,
+//! the arena at its floor, the tier's batch at its rows), finds the window of card budgets from the header's
+//! (`shared/kimi_k3_budget.rs`, the place gate's finder, each card counting its uploads at
+//! [`kimi_k3_budget::GRANULE`]) and runs the `bp` child under the most even split with experts on both cards
+//! and none on the host, with the same `--granule`. The `a` arm plans as the file does. Clause
+//! `precondition tier [bp]`, before the arm's walk: the arm's own command with `--plan` plans the pass shape
+//! the window was found at, with experts on both cards and none on the host.
 
-use bloomery_gpu_gates::{GateError, beside, die_with_parent, ref_model_path, verdict};
+use bloomery_gpu::arch::kimi_k3::{CHUNK, PassShape, SHAPES, pass_bytes};
+use bloomery_gpu_gates::tier::{self, Tier};
+use bloomery_gpu_gates::{
+    GateError, beside, die_with_parent, open_split, record, ref_model_path, verdict,
+};
+use bloomery_levers::{CARD_BUDGET, CardBudget};
 use gguf::{GgmlType, Gguf};
+use model::arch::Arch;
+use model::arch::kimi_k3::place::PlanInputs;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use crate::kimi_k3_budget::{GRANULE, bp_machine_at, pick_budget, split_table};
+
+#[cfg(feature = "gpu")]
+#[allow(
+    dead_code,
+    reason = "the shared window finder serves several gates; each takes the helpers it reads"
+)]
+#[path = "shared/kimi_k3_budget.rs"]
+mod kimi_k3_budget;
+
+/// The recipe that runs the gate.
+const RECIPE: &str = "gate-gpu-kimik3-imatrix";
 
 /// The chunk length both engines run.
 const CTX: usize = 512;
@@ -282,6 +313,127 @@ fn compare(arm: &str, ours: &Path, llama: &Path) -> Result<bool, GateError> {
     Ok(names && counts && sums)
 }
 
+/// The `bp` arm's card budget and the split the gate's own plan of the pass makes under it.
+struct Window {
+    budget: u64,
+    /// The experts the stage card holds under `budget`, summed over the layers.
+    stage: u64,
+    /// The experts the tier card holds under `budget`.
+    tier: u64,
+    /// The pass shape the window was found at.
+    shape: PassShape,
+}
+
+/// The `bp` arm's [`Window`] (module doc): the plan `generate_kimi_k3 --walk pass --ctx CTX`
+/// makes at the first shape it tries, its window of card budgets from the fixture header's, and
+/// that window's most even split with experts on both cards and none on the host.
+fn bp_window() -> Result<Window, GateError> {
+    if Tier::from_env()? != Tier::Fixture {
+        return Err(format!(
+            "the bp arm's card budget is found over the fixture's experts: BLOOMERY_TIER=fixture \
+             just {RECIPE}"
+        )
+        .into());
+    }
+    let split = open_split(Arch::KimiK3, RECIPE)?;
+    let inputs = PlanInputs::read_without_chat_for(&split, CTX as u64)?;
+    let header = tier::budget_levers(
+        Tier::Fixture,
+        tier::header_budget(&split)?,
+        CardBudget::Unset,
+        0,
+    )?
+    .card_budget_bytes
+    .every()
+    .ok_or("the fixture tier plans under the header's one budget")?;
+    drop(split);
+    let shape = SHAPES
+        .iter()
+        .copied()
+        .find(|s| s.rows <= CTX.max(CHUNK))
+        .ok_or("no pass shape at the gate's context")?;
+    let pass = inputs
+        .clone()
+        .with_prompt_reserve(pass_bytes(&inputs.hp, CTX, shape)?)
+        .with_arena_at_floor();
+    let machine = bp_machine_at(&inputs, Some(shape.rows as u64))?;
+    let table = split_table(&pass, &machine, CTX as u64, header)?;
+    let budget = pick_budget(&table)?;
+    let at = table
+        .iter()
+        .find(|o| o.from == budget)
+        .ok_or("the picked budget is a row of the table")?;
+    Ok(Window {
+        budget,
+        stage: at.stage,
+        tier: at.tier,
+        shape,
+    })
+}
+
+/// `generate_kimi_k3 --imatrix ours` over `text` on `place` and `walk`: under `budget` (the `bp`
+/// arm's window) with the window's `--granule`, else as the file plans.
+fn walk_cmd(
+    ours: &Path,
+    text: &Path,
+    (place, walk): (&str, &str),
+    budget: Option<u64>,
+) -> Result<Command, GateError> {
+    let mut cmd = Command::new(beside("generate_kimi_k3")?);
+    cmd.arg("--imatrix")
+        .arg(ours)
+        .arg("--text")
+        .arg(text)
+        .args(["--ctx", &CTX.to_string(), "--chunks", &CHUNKS.to_string()])
+        .args(["--place", place, "--walk", walk]);
+    if let Some(budget) = budget {
+        cmd.env(CARD_BUDGET, budget.to_string())
+            .args(["--granule", &GRANULE.to_string()]);
+    }
+    Ok(cmd)
+}
+
+/// Clause `precondition tier [bp]`: the `bp` arm's command with `--plan` plans the window's pass
+/// shape with experts on the stage card and none on the host, and its tier card holds experts
+/// because a plan that leaves an expert tier card without one is refused by name. FAIL-first: the
+/// command without the budget plans every expert on the stage card and is refused so, as the
+/// arm's run is.
+fn precondition_tier(w: &Window, ours: &Path, text: &Path) -> Result<bool, GateError> {
+    let (ok, _, err) = run(
+        walk_cmd(ours, text, ("bp", "pass"), Some(w.budget))?.arg("--plan"),
+        "generate_kimi_k3 --plan",
+    )?;
+    let fields = || -> Result<[u64; 4], GateError> {
+        let log = record::Log::of(&err, record::GENERATE_KIMI_K3).named("generate_kimi_k3 --plan");
+        let (plan, pass) = (log.one(&record::PLAN)?, log.one(&record::PROMPT_PASS)?);
+        Ok([
+            plan.u64("card_experts")?,
+            plan.u64("host_experts")?,
+            pass.u64("rows")?,
+            pass.u64("mla_rows")?,
+        ])
+    };
+    let read = if ok {
+        fields().map_err(|e| e.to_string())
+    } else {
+        Err(tail(&err))
+    };
+    let want = [w.shape.rows as u64, w.shape.mla_rows as u64];
+    let held = read
+        .as_ref()
+        .is_ok_and(|&[card, host, rows, mla]| card > 0 && host == 0 && [rows, mla] == want);
+    println!(
+        "{} precondition tier [bp]: generate_kimi_k3 --plan under a card budget of {} B at --granule {GRANULE}: ok={ok}, [stage card experts, host experts, pass rows, latent rows] {read:?}; the window's pass {} rows ({} latent), its split stage {}, tier {}",
+        verdict(held),
+        w.budget,
+        w.shape.rows,
+        w.shape.mla_rows,
+        w.stage,
+        w.tier
+    );
+    Ok(held)
+}
+
 /// Clause `quantize`: `bloomery-quantize` over the fixture with `imatrix`.
 fn quantize_clause(
     dir: &Path,
@@ -392,6 +544,7 @@ fn gate() -> Result<(), GateError> {
         )
         .into());
     }
+    let window = arms.split(',').any(|a| a == "bp").then(bp_window);
     let text = dir.join("text.txt");
     std::fs::copy(TEXT_FILE, &text).map_err(|e| format!("{TEXT_FILE}: {e}"))?;
     let llama = dir.join("llama.imatrix.gguf");
@@ -428,14 +581,23 @@ fn gate() -> Result<(), GateError> {
             o => return Err(format!("--arms: {o} is a or bp").into()),
         };
         let ours = dir.join(format!("ours-{arm}.imatrix.gguf"));
+        let budget = match (arm, &window) {
+            ("bp", Some(Ok(w))) => {
+                all &= precondition_tier(w, &ours, &text)?;
+                Some(w.budget)
+            }
+            ("bp", Some(Err(e))) => {
+                println!(
+                    "{} precondition tier [bp]: no card budget window over the fixture: {e}",
+                    verdict(false)
+                );
+                all = false;
+                continue;
+            }
+            _ => None,
+        };
         let (ok, out, err) = run(
-            Command::new(beside("generate_kimi_k3")?)
-                .arg("--imatrix")
-                .arg(&ours)
-                .arg("--text")
-                .arg(&text)
-                .args(["--ctx", &CTX.to_string(), "--chunks", &CHUNKS.to_string()])
-                .args(["--place", place, "--walk", walk]),
+            &mut walk_cmd(&ours, &text, (place, walk), budget)?,
             "generate_kimi_k3",
         )?;
         if !ok {
