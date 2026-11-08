@@ -1,0 +1,19 @@
+# k31dsa mutant key-bias
+# OPTIONAL (not in the spec's list): the key group's only mutant
+# clause: key (gate_kimi_k3_dsa.rs:885-890)
+# site: crates/gpu/src/arch/kimi_k3/index.rs:334 enqueue_keys, the key norm's gain passed as its bias (host only)
+# expected red: "  key: the 4096 rows the steps wrote vs the key kernel's host rule: 4096 rows differ in a bit: FAIL"
+# stays green: the rows-pass key line (:917-923; both sides run the mutant)
+diff --git a/crates/gpu/src/arch/kimi_k3/index.rs b/crates/gpu/src/arch/kimi_k3/index.rs
+index 11f5f62e7..fa1fb16fd 100644
+--- a/crates/gpu/src/arch/kimi_k3/index.rs
++++ b/crates/gpu/src/arch/kimi_k3/index.rs
+@@ -331,7 +331,7 @@ pub fn enqueue_keys(
+         IndexKeyInputArgs {
+             x,
+             gain,
+-            bias,
++            bias: gain,
+             pos,
+             // Not read: the key turns no value (`n_dims` 0).
+             cs: x,
