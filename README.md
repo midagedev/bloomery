@@ -226,7 +226,7 @@ rounds each, the host room pinned so the plan pages (`BLOOMERY_HOST_ROOM`), the 
 | DeepSeek V4.1-Flash Q3_K_M | 80G | `bp` | 16.9 → 22.4 (+32 %) | 26.1 → 40.5 (+55 %) |
 | Mistral Large 4 UD-IQ1_S | 80G | `a` | 3.02 → 4.23 (+40 %) | 13.5 → 21.5 (+59 %) |
 | GLM-5.3-Flash UD-Q4_K_XL | 48G | `bp` | 5.51 → 8.22 (+49 %) | 30.3 → 54.0 (+78 %) |
-| Kimi K3.1 Pro IQ1_S | 232G | `bp` | 4.94 with two drives, in the [0.3.13 notes](https://github.com/midagedev/bloomery/releases/tag/v0.3.13) | 3.85 |
+| Kimi K3.1 Pro IQ1_S | 232G | `bp` | 2.94 with two drives (the prompt pass, the default); 4.99 under `--prefill steps`, in the [0.3.13 notes](https://github.com/midagedev/bloomery/releases/tag/v0.3.13) | 12.5; 3.80 under `--prefill steps` |
 
 One drive reads at ~4.2–4.7 GB/s on these runs and two at ~5.9–7.2 GB/s. The sidecar does nothing when the plan
 pages through the file mapping instead of the tier's arena (a room that moves under half the host leg's bytes prints
@@ -366,8 +366,10 @@ every gate is shown to fail on its defect before the fix lands ([how](docs/perfo
 - GLM-5.3 holds at most 16,384 positions a slot; a `--ctx-size` whose slot share is larger is refused at the start.
 - Kimi K3.1 Pro (our `IQ1_S` set, a Q4_K trunk) loads at `--place bp` only (two cards, the host and the NVMe expert
   tier). Past the lightning indexer's top-k (2,048 positions) the latent layers attend the rows the indexer picks,
-  so `--ctx-size` is not held to the top-k. The seat steps a prompt one id at a time (the prompt
-  rate is near the decode rate) and serves the model's think span as plain text. The set's chat template is unsloth's
+  so `--ctx-size` is not held to the top-k. The seat runs a prompt as placed passes; the pass's plan keeps fewer experts in
+  the NVMe arena, so a step decodes slower than under `--prefill steps` (2.94 against 4.99 tok/s, the prompt 12.5
+  against 3.80, at 512 ids and 512 generated): steps is the faster pick when the reply is longer than about 1.3 times
+  the prompt. The seat serves the model's think span as plain text. The set's chat template is unsloth's
   Kimi-K3 template (the checkpoint ships none), and its importance matrix came from `llama-imatrix`; the quantization
   itself was written by `bloomery-quantize`. Kimi K3 (unsloth's `UD-IQ1_S`, 594 GB) does not load at this tag: its
   dense trunk is 51.4 GB, past one 48 GB card.
