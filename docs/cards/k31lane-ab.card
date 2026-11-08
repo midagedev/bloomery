@@ -21,3 +21,10 @@ decide-in: land k31lane2 as it is, its gate train after
 decide-below: keep the fixed blocks; the tail term was under the dispatch's own scatter — read the profile's idle/late
   columns on V4.1 before another A/B
 decide-above: land it and re-derive the tail term (the old floor was worse than block/2)
+# outcome 2026-11-08 on k31lane2 05bad655c vs main 1d1a8c4f3, 6 rounds, quiet box (ab-decode, n=96, the fixture model, 11.5 ms a token):
+#  86.60 -> 86.46 tok/s, paired effect -0.12 % ± 1.6 (rows -0.02 -1.48 -1.03 -0.41 +2.06 +0.01): zero inside the ruler, below the band.
+#  A first run under a foreign gate_nvtier + ptxas read +3.8 % with one 70.1 outlier and is not admissible. The wrong term: on this
+#  model a dispatch is ~0.06 ms (11.5 ms step / 2 x 92... the fixture's few small layers), so the tail term is under the scatter; the
+#  K3.1 measurement (join idle 28 -> 16..21 ms a step on ~0.8 ms dispatches) was taken on the real set by the round, not under a lease.
+#  Decision: decide-below — the claim change does not land on this evidence; the profile's idle/late columns and the pool-rate bench
+#  (diagnostics) land; the claim change waits for a same-lease K3.1 A/B on the real set (its own card).
