@@ -84,11 +84,12 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 mod cli {
     use app::Prompt;
-    use bloomery_gpu::arch::kimi_k3::{Body, CHUNK, PassShape, SHAPES, pass_bytes};
+    use bloomery_gpu::arch::kimi_k3::{Body, PassShape};
     use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu::{Gpu, GpuModel};
     use bloomery_gpu_gates::generate::{Place, TierRule};
     use bloomery_gpu_gates::host_stats::{Probe, print_stats};
+    use bloomery_gpu_gates::kimi_k3_pass::{self, Picked};
     use bloomery_gpu_gates::need;
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::{GateError, fnv_row, gpu_census, ref_model_path};
@@ -509,61 +510,28 @@ mod cli {
         m
     }
 
-    /// The widest of [`SHAPES`] whose pass the plan holds: `inputs` with the shape's bytes at
-    /// `ctx` as the prompt reserve and the NVMe arena at its floor, planned on the machine `build`
-    /// makes at its rows (and on that machine headless when the stage card's dense trunk alone
-    /// refuses it, as [`plan_for`] plans). A shape wider than `ctx` is passed over unless it is
-    /// [`CHUNK`]'s. Each refused for its reserve ([`PlaceError::PromptOver`]) or for a dense trunk
-    /// that, with the shape's bytes beside it, passes the card's free bytes
-    /// ([`PlacementError::CardFreeFloor`] on the headless retry) steps down, and the narrowest
-    /// refused comes back beside the shape with the bytes it fell short by. Any other
-    /// refusal, and every shape refused, ends the run by name.
+    /// The widest pass shape the plan holds ([`kimi_k3_pass::pick`]), each shape planned as
+    /// [`plan_for`] plans: on the machine `build` makes at its rows, and on that machine headless
+    /// when the stage card's dense trunk alone refuses it. Every shape refused, and any refusal
+    /// the pick does not step down on, ends the run by name.
     fn pick_shape(
         inputs: &PlanInputs,
         build: &dyn Fn(u64) -> Result<Machine, GateError>,
         ctx: usize,
         levers: &PlanLevers,
         name: &str,
-    ) -> Result<(PassShape, Option<(PassShape, u64)>), GateError> {
-        let mut wider = None;
-        for &shape in SHAPES.iter().filter(|s| s.rows <= ctx.max(CHUNK)) {
-            let pass = inputs
-                .clone()
-                .with_prompt_reserve(pass_bytes(&inputs.hp, ctx, shape)?)
-                .with_arena_at_floor();
-            let machine = build(shape.rows as u64)?;
-            let tried = match pass.plan(&machine, ctx as u64, levers) {
+    ) -> Result<Picked, GateError> {
+        let attempt = |pass: &PlanInputs, machine: &Machine| -> Result<(), PlaceError> {
+            match pass.plan(machine, ctx as u64, levers) {
                 Err(PlaceError::Placement(PlacementError::CardFreeFloor(_))) => pass
-                    .plan(&headless_of(&machine), ctx as u64, levers)
+                    .plan(&headless_of(machine), ctx as u64, levers)
                     .map(drop),
                 other => other.map(drop),
-            };
-            match tried {
-                Ok(()) => return Ok((shape, wider)),
-                Err(PlaceError::PromptOver { short, .. }) => wider = Some((shape, short)),
-                // The head already on the host, the shape's own bytes beside the dense trunk
-                // pass the card's free bytes: a narrower shape holds fewer.
-                Err(PlaceError::Placement(PlacementError::CardFreeFloor(f))) => {
-                    wider = Some((shape, f.over));
-                }
-                Err(e) => {
-                    return Err(format!(
-                        "--place {name} --walk pass: the pass of {} rows ({} latent): {e}",
-                        shape.rows, shape.mla_rows
-                    )
-                    .into());
-                }
             }
-        }
-        Err(match wider {
-            Some((s, short)) => format!(
-                "--place {name} --walk pass: no pass shape fits the stage card; the narrowest, {} \
-                 rows ({} latent), is {short} B short",
-                s.rows, s.mla_rows
-            ),
-            None => format!("--place {name} --walk pass: no pass shape of --ctx {ctx}"),
-        }
-        .into())
+        };
+        kimi_k3_pass::pick(inputs, ctx, build, &attempt)
+            .map_err(|e| format!("--place {name} --walk pass: {e}"))?
+            .map_err(|no| format!("--place {name} --walk pass: {no}").into())
     }
 
     /// The plan on `machine` and the machine it is on. A placed plan (`placed` names its place)
@@ -719,12 +687,9 @@ mod cli {
         let pass = walk_pass
             .then(|| pick_shape(&inputs, &build, ctx, &plan_levers, chosen.place.name()))
             .transpose()?;
-        let machine = build(pass.map_or(TIER_ROWS, |(s, _)| s.rows as u64))?;
+        let machine = build(pass.map_or(TIER_ROWS, |p| p.shape.rows as u64))?;
         let inputs = match pass {
-            Some((shape, _)) => {
-                let reserve = pass_bytes(&inputs.hp, ctx, shape)?;
-                inputs.with_prompt_reserve(reserve).with_arena_at_floor()
-            }
+            Some(p) => kimi_k3_pass::inputs_for(&inputs, ctx, p.shape)?,
             None => inputs,
         };
         let headless = headless_of(&machine);
@@ -736,7 +701,7 @@ mod cli {
             placed.then(|| chosen.place.name()),
         )?;
         record::plan(chosen.place.name(), machine, &plan).eprint();
-        if let Some((shape, wider)) = pass {
+        if let Some(Picked { shape, wider }) = pass {
             record::prompt_pass(
                 (shape.rows, shape.mla_rows),
                 (inputs.prompt_reserve, reserve_room(&plan, 0)),
@@ -786,7 +751,7 @@ mod cli {
                 (&plan, &inputs),
                 levers.host(),
                 mode,
-                pass.map(|(s, _)| s),
+                pass.map(|p| p.shape),
             )?
         } else {
             open(split, ctx, mode)?

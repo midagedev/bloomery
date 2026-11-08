@@ -2242,7 +2242,7 @@ pub static LISTENING_SOLAR2: Kind = Kind {
 pub static LOAD_HYBRID: Kind = Kind {
     name: "load_hybrid",
     head: "load",
-    doc: "A hybrid seat's architecture, resident bytes, per-slot context, resident slots, layers, host and card expert counts, captured step nodes, prompt group, caller pin and load wall.",
+    doc: "A hybrid seat's architecture, resident bytes, per-slot context, resident slots, layers, host and card expert counts, captured step nodes, prompt group, caller pin, the rows of the prompt pass the loaded body holds (pass_rows; absent for a body loaded with none, whose prompt is stepped or batched) and load wall.",
     parts: &[
         key("arch", Word, ""),
         key("resident_bytes", U64, "B"),
@@ -2255,6 +2255,7 @@ pub static LOAD_HYBRID: Kind = Kind {
         key("group", U64, "batches"),
         key("pin_main", Word, ""),
         key("pinned", Bool, ""),
+        opt("pass_rows", U64, "rows"),
         lit(" in "),
         pos("load_s", F64(1), "s"),
         lit(" s"),
@@ -2265,11 +2266,12 @@ pub static LOAD_HYBRID: Kind = Kind {
 pub static LISTENING_HYBRID: Kind = Kind {
     name: "listening_hybrid",
     head: "bloomery-serve:",
-    doc: "A hybrid seat's placement, per-slot context, resident slots and listening address.",
+    doc: "A hybrid seat's placement, per-slot context, resident slots and listening address, and, for a family whose body has a prompt pass, how the load runs a prompt (prompt: pass, as placed passes of the prompt_pass record's rows, or steps, one id a decode step, by --prefill steps or because the plan holds no pass shape; absent for a body with no pass).",
     parts: &[
         key("place", Word, ""),
         key("ctx", U64, "positions"),
         key("slots", U64, ""),
+        opt("prompt", Word, ""),
         lit(" listening on http://"),
         pos("addr", Word, ""),
     ],
@@ -2977,10 +2979,13 @@ macro_rules! kinds {
 pub mod groups {
     /// `serve_seats/tiered.rs` (the gate bins' shared seat module).
     pub mod tiered {
-        use crate::record::{Kind, NEED, PLAN, RESIDENCY_LEVER};
+        use crate::record::{Kind, NEED, PLAN, PROMPT_PASS, RESIDENCY_LEVER};
 
         /// A tiered seat's run: the plan it loads and its need (`tiered::run`).
         pub const RUN: &[&Kind] = &[&PLAN, &NEED];
+
+        /// The prompt pass a seat's load opens, after its plan (`tiered::run`).
+        pub const PASS: &[&Kind] = &[&PROMPT_PASS];
 
         /// The selected load's residency lever record (`tiered::run`).
         pub const LEVER: &[&Kind] = &[&RESIDENCY_LEVER];
@@ -3396,6 +3401,7 @@ pub static BLOOMERY_SERVE_HYBRID: &[&Kind] = kinds![
     groups::tiered::LEVER,
     &[&PLACE_UNSET],
     groups::tiered::RUN,
+    groups::tiered::PASS,
     groups::residency38::HOST,
     groups::fetch::FETCH,
     groups::fetch::SET,
@@ -4958,6 +4964,7 @@ mod tests {
                     side_seat::SEAT,
                     tiered::LEVER,
                     tiered::RUN,
+                    tiered::PASS,
                     residency38::HOST,
                     hybrid::GROUP,
                     host_tier::ARENA,
