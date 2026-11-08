@@ -1,0 +1,18 @@
+# k31passdsa mutant keys-first-row
+# clause: pass past top-k (gate_kimi_k3_place.rs past_top_k_arms / past_top_k_line), every arm
+# site: crates/gpu/src/arch/kimi_k3/index.rs:295 Index::project_pass, the key launch at the first row alone
+#   (the rows after it pick over key rows no launch wrote: the causality the pass keeps, every row's key before any pick)
+# expected red: "FAIL pass past top-k, whole card: ..." and both "FAIL pass past top-k, placed ..." arms
+#   (the selecting rows score unwritten key rows as zero keys, and the steps after read them too)
+# gate_kimi_k3_dsa stays green: its pass clause writes the keys with its own enqueue_keys launch
+--- a/crates/gpu/src/arch/kimi_k3/index.rs
++++ b/crates/gpu/src/arch/kimi_k3/index.rs
+@@ -292,7 +292,7 @@
+         project_rows(cx, kit, acts, (l, m), (key, d), xn, proj)?;
+         project_rows(cx, kit, acts, (l, m), (weights, heads), xn, iw)?;
+         project_rows(cx, kit, acts, (l, m), (q_b, hd), qr, iq)?;
+-        self.write_keys((cx.gpu, cx.w), k, (l, m), proj, pos)
++        self.write_keys((cx.gpu, cx.w), k, (l, 1), proj, pos)
+     }
+ 
+     /// Steps 1 to 3 of the module doc at one row: `xn` the layer's attn-normed input, `qr` its

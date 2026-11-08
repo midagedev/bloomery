@@ -40,9 +40,15 @@
 //!    projection holding a NaN raises `CacheValue`, and a key position at the key rows' height
 //!    `CachePos`, from the key launch; each read with the launch's layer and cleared after.
 //! 6. `refusals`: a selection on a file with no indexer, a list of another width than top-k, a
-//!    pass whose last row sees more keys than top-k, a position at u32's last value, and every
-//!    selection shape `attend_sel` does not take are refused by name; a pass of exactly top-k keys
-//!    runs.
+//!    position at u32's last value, and every selection shape `attend_sel` does not take are
+//!    refused by name.
+//! 7. `pass`: a pass of [`ACROSS_M`] rows from position [`ACROSS_AT`], across top-k (its first
+//!    rows' lists the identity, its last rows' a pick of top-k of more rows), over a cache and key
+//!    rows holding the steps' rows below the pass and an f16 NaN from it: the rows' count words
+//!    from [`pass_words`], every row's key row from one launch of [`enqueue_keys`] at the pass's
+//!    rows, then [`attend_rows_sel`] (each row's pick and selected core in position order). Every
+//!    row's gated heads, and the key rows and cache rows the pass wrote, are the steps' bits; a
+//!    pass whose count words hold fewer rows than the pass is refused by name.
 //!
 //! The indexer's score pass has no fault word: a NaN query or weight scores as `relu` maps it, to
 //! 0, so this gate has no clause for one; a NaN key is raised by the key launch (clause 5).
@@ -55,8 +61,8 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 mod gate {
     use bloomery_gpu::arch::kimi_k3::{
-        IndexKernels, N_SEL_AT, check_pass, check_selection, count_words, enqueue_keys,
-        enqueue_pick,
+        IndexKernels, N_SEL_AT, PassPick, WORDS, attend_rows_sel, check_selection, count_words,
+        enqueue_keys, enqueue_pick, pass_words,
     };
     use bloomery_gpu::indexer::{HEAD_DIM, HEADS as IX_HEADS, IndexerScratch};
     use bloomery_gpu::latent::LATENT;
@@ -118,6 +124,9 @@ mod gate {
     const PASS_M: usize = 8;
     /// What a key row holds before a launch writes it: an f16 NaN no key the launch writes is.
     const KEY_FILL: u16 = 0x7e01;
+    /// The pass clause's first position and rows: across top-k, half its rows below it.
+    const ACROSS_AT: usize = TOP_K - ACROSS_M / 2;
+    const ACROSS_M: usize = 8;
     /// The fault clause's cache, list width and position.
     const F_CTX: usize = 128;
     const F_TOP_K: usize = 64;
@@ -579,6 +588,10 @@ mod gate {
         not_identity_list: Vec<usize>,
         saved: Vec<Saved>,
         keys: Vec<u16>,
+        /// The selected run's cache rows, `[CTX][ROW]` f16.
+        cache: Vec<u16>,
+        /// The selected step's gated heads at each position of the pass clause.
+        across: Vec<Vec<f32>>,
     }
 
     impl<'a> Dev<'a> {
@@ -788,6 +801,8 @@ mod gate {
                 not_identity_list: Vec::new(),
                 saved: Vec::new(),
                 keys: Vec::new(),
+                cache: Vec::new(),
+                across: Vec::new(),
             };
             for p in 0..CTX {
                 self.stage(&mut b, p)?;
@@ -807,6 +822,10 @@ mod gate {
                         }
                     }
                 }
+                if (ACROSS_AT..ACROSS_AT + ACROSS_M).contains(&p) {
+                    s.synchronize()?;
+                    out.across.push(b.y.to_host_vec(s)?);
+                }
                 if SAVES.contains(&p) {
                     s.synchronize()?;
                     let mut scores = ix.scratch.scores.to_host_vec(s)?;
@@ -823,6 +842,7 @@ mod gate {
             }
             s.synchronize()?;
             out.keys = ix.keys.buf().to_host_vec(s)?;
+            out.cache = b.cache.buf().to_host_vec(s)?;
             Ok(out)
         }
     }
@@ -849,6 +869,7 @@ mod gate {
         results.extend(selected_clauses(&l, &ks, &out));
         results.extend(fault_clauses(&dev)?);
         results.extend(refusal_clauses(&dev)?);
+        results.extend(pass_clauses(&dev, &out)?);
         let failed = results.iter().filter(|p| !**p).count();
         println!(
             "gate_kimi_k3_dsa: {} — {} clauses, {failed} failed",
@@ -1153,22 +1174,11 @@ mod gate {
                 "top_k picks 2048",
             ),
             refusal(
-                "a pass whose last row sees 2049 keys",
-                refused(check_pass(Some(&ixr), 2049)),
-                "latent layer Some(2): a pass whose last row sees 2049 keys",
-            ),
-            refusal(
                 "a step at position u32::MAX",
                 refused(count_words(u32::MAX, 2048)),
                 "u32's last value",
             ),
         ];
-        let runs = check_pass(Some(&ixr), 2048).is_ok() && check_pass(None, 1 << 20).is_ok();
-        println!(
-            "  refusal none for a pass of exactly top-k keys and for a K3 file's pass: {}",
-            verdict(runs)
-        );
-        res.push(runs);
         // `attend_sel` with one selection part of a wrong shape and the rest a 64-row list over a
         // 128-row cache.
         let mut m = dev.mla(F_CTX)?;
@@ -1208,5 +1218,174 @@ mod gate {
             "fewer rows than the cache holds",
         ));
         Ok(res)
+    }
+
+    /// The pass clause's buffers: the rows' inputs, one row's attention buffers, the pass's cache
+    /// and key rows, and one row's score scratch, list and gathered rows.
+    struct Across {
+        kv: DeviceBuffer<f32>,
+        q: DeviceBuffer<f32>,
+        gate: DeviceBuffer<f32>,
+        pos: DeviceBuffer<u32>,
+        n_keys: DeviceBuffer<u32>,
+        ik: DeviceBuffer<f32>,
+        iq: DeviceBuffer<f32>,
+        iw: DeviceBuffer<f32>,
+        cache: DeviceTensor<u16>,
+        keys: DeviceTensor<u16>,
+        one: Mla,
+        scratch: IndexerScratch,
+        list: DeviceBuffer<u32>,
+        gathered: DeviceTensor<u16>,
+        y: DeviceBuffer<f32>,
+    }
+
+    impl Dev<'_> {
+        /// The pass clause's buffers: the steps' rows below [`ACROSS_AT`] and [`KEY_FILL`] from
+        /// it in the cache and the key rows, the seeded inputs of the pass's rows; and its count
+        /// words from [`pass_words`].
+        fn across(&self, out: &RunOut) -> Result<(Across, DeviceBuffer<u32>), GateError> {
+            let s = self.gpu.stream();
+            let l = self.l;
+            let (a, e) = (ACROSS_AT, ACROSS_AT + ACROSS_M);
+            let hv = HEADS * V_HEAD;
+            let below = |rows: &[u16], width: usize| -> Vec<u16> {
+                let mut v = rows[..a * width].to_vec();
+                v.resize(CTX * width, KEY_FILL);
+                v
+            };
+            let pos: Vec<u32> = (a..e).map(u32::try_from).collect::<Result<_, _>>()?;
+            let n_keys: Vec<u32> = pos.iter().map(|p| p + 1).collect();
+            let mut words = vec![0u32; ACROSS_M * WORDS];
+            pass_words(&mut words, u32::try_from(a)?, u32::try_from(TOP_K)?)?;
+            let f = |v: &[f32]| DeviceBuffer::from_host(s, v);
+            let x = Across {
+                kv: f(&l.kv[a * ROW..e * ROW])?,
+                q: f(&l.q[a * HEADS * HEAD_K..e * HEADS * HEAD_K])?,
+                gate: f(&l.gate[a * hv..e * hv])?,
+                pos: DeviceBuffer::from_host(s, &pos)?,
+                n_keys: DeviceBuffer::from_host(s, &n_keys)?,
+                ik: f(&l.ik[a * HEAD_DIM..e * HEAD_DIM])?,
+                iq: f(&l.iq[a * IX_HEADS * HEAD_DIM..e * IX_HEADS * HEAD_DIM])?,
+                iw: f(&l.iw[a * IX_HEADS..e * IX_HEADS])?,
+                cache: DeviceTensor::upload(s, &below(&out.cache, ROW), CTX, ROW)?,
+                keys: DeviceTensor::upload(s, &below(&out.keys, HEAD_DIM), CTX, HEAD_DIM)?,
+                one: self.mla(CTX)?,
+                scratch: IndexerScratch::new(s, 1, CTX)?,
+                list: DeviceBuffer::zeroed(s, TOP_K)?,
+                gathered: DeviceTensor::zeroed(s, TOP_K, ROW)?,
+                y: DeviceBuffer::zeroed(s, ACROSS_M * hv)?,
+            };
+            Ok((x, DeviceBuffer::from_host(s, &words)?))
+        }
+
+        /// [`attend_rows_sel`] over `x`'s `m` rows, its count words `words`.
+        fn attend_across(
+            &self,
+            x: &mut Across,
+            m: usize,
+            words: &DeviceBuffer<u32>,
+        ) -> Result<(), GpuError> {
+            let Across {
+                kv,
+                q,
+                gate,
+                pos,
+                n_keys,
+                iq,
+                iw,
+                cache,
+                keys,
+                one,
+                scratch,
+                list,
+                gathered,
+                y,
+                ..
+            } = x;
+            attend_rows_sel(
+                self.gpu,
+                (&self.mk, &self.ik),
+                &self.d,
+                m,
+                AttendIn {
+                    kv,
+                    q,
+                    gate,
+                    kv_norm: &self.gain,
+                    k_b: (&self.kb.0, &self.kb.1),
+                    v_b: ValueW::Q8_0(&self.vb.0, &self.vb.1),
+                    pos,
+                    n_keys,
+                    fault: self.gpu.unlabelled_sink(),
+                },
+                AttnBufs {
+                    qabs: &mut one.qabs,
+                    att: &mut one.att,
+                    av: &mut one.av,
+                    part_v: &mut one.part_v,
+                    part_ms: &mut one.part_ms,
+                },
+                cache,
+                PassPick {
+                    keys,
+                    iq,
+                    iw,
+                    words,
+                    scratch,
+                    list,
+                    gathered,
+                },
+                y,
+            )
+        }
+    }
+
+    fn pass_clauses(dev: &Dev<'_>, out: &RunOut) -> Result<Vec<bool>, GateError> {
+        let s = dev.gpu.stream();
+        let (mut x, words) = dev.across(out)?;
+        enqueue_keys(
+            s,
+            &dev.ik,
+            (&dev.ix_gain, &dev.ix_bias, IX_EPS),
+            (&x.ik, &x.pos, ACROSS_M),
+            dev.gpu.unlabelled_sink(),
+            &mut x.keys,
+        )?;
+        dev.attend_across(&mut x, ACROSS_M, &words)?;
+        s.synchronize()?;
+        let fault = dev.gpu.fault()?;
+        let hv = HEADS * V_HEAD;
+        let y = x.y.to_host_vec(s)?;
+        let heads_off: Vec<usize> = (0..ACROSS_M)
+            .filter(|&t| {
+                out.across
+                    .get(t)
+                    .is_none_or(|want| !bits_equal(&y[t * hv..(t + 1) * hv], want))
+            })
+            .map(|t| ACROSS_AT + t)
+            .collect();
+        let (a, e) = (ACROSS_AT, ACROSS_AT + ACROSS_M);
+        let keys = x.keys.buf().to_host_vec(s)?;
+        let cache = x.cache.buf().to_host_vec(s)?;
+        let keys_same = keys[a * HEAD_DIM..e * HEAD_DIM] == out.keys[a * HEAD_DIM..e * HEAD_DIM];
+        let cache_same = cache[a * ROW..e * ROW] == out.cache[a * ROW..e * ROW];
+        let pass = fault.is_none() && heads_off.is_empty() && keys_same && cache_same;
+        println!(
+            "  pass: {ACROSS_M} rows from position {ACROSS_AT} across top-k {TOP_K} through \
+             attend_rows_sel vs the steps: rows whose gated heads differ in a bit {heads_off:?}, \
+             key rows the steps' bits: {}, cache rows the steps' bits: {}, fault {}: {}",
+            if keys_same { "yes" } else { "no" },
+            if cache_same { "yes" } else { "no" },
+            fault.map_or_else(|| "none".to_string(), |f| f.to_string()),
+            verdict(pass)
+        );
+        let short = Window::<u32>::of(&words, 0, 2 * WORDS)?;
+        let refusal_short = refusal(
+            "a pass of 8 rows over the count words of 2",
+            refused(dev.attend_across(&mut x, ACROSS_M, &short)),
+            "words of 6",
+        );
+        Ok(vec![pass, refusal_short])
     }
 }

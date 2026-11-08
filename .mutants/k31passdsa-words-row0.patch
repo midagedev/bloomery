@@ -1,0 +1,18 @@
+# k31passdsa mutant words-row0
+# clause: pass (gate_kimi_k3_dsa.rs pass_clauses) and pass past top-k (gate_kimi_k3_place.rs)
+# site: crates/gpu/src/arch/kimi_k3/index.rs:139 pass_words, every row's count words at the pass's first position
+#   (row t reads a live count t short: its own key row and the rows after the first out of its score and gather)
+# expected red: "  pass: 8 rows from position 2044 across top-k 2048 through attend_rows_sel vs the steps: rows whose
+#   gated heads differ in a bit [2045, 2046, 2047, 2048, 2049, 2050, 2051], ...: FAIL" (row 2044 alone is its own);
+#   and every "FAIL pass past top-k, ..." arm
+--- a/crates/gpu/src/arch/kimi_k3/index.rs
++++ b/crates/gpu/src/arch/kimi_k3/index.rs
+@@ -136,7 +136,7 @@
+     for (t, row) in rows.iter_mut().enumerate() {
+         let at = u32::try_from(t)
+             .ok()
+-            .and_then(|t| pos.checked_add(t))
++            .and_then(|t| pos.checked_add(t.min(0)))
+             .ok_or_else(|| GpuError::shape(WHAT, "a pass row past u32's positions"))?;
+         *row = count_words(at, top_k)?;
+     }
