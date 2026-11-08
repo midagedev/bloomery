@@ -1,0 +1,19 @@
+# The K3.1 prompt pass on the split dial's arena (expert_nvme_tier_for_passes) against the re-cut's floor arena. One K3.1
+# request at bp on the arenapass tree's bloomery-serve, the defaults (the pass), D=512, 512 generated, ctx 2048, 232G, two drives.
+kind: calibration
+question: does the pass's load decode at the step's rate once its plan keeps the dial's arena, and what does the prompt pass read then
+term: decode tok/s @ D=512, n_predict 512, one cold request, --place bp, --ctx-size 2048, BLOOMERY_HOST_ROOM=232G, the tree's bloomery-serve
+unit: tok/s
+predict: 4.5..5.3
+condition: tools/ref/k31-nvme-probe.sh with K31_PROBE_SERVE the arenapass tree's target/release/bloomery-serve, K31_PROBE_D=512,
+  K31_PROBE_N=512, K31_PROBE_ENV="BLOOMERY_HOST_ROOM=232G", the two-drive sidecar in place; the plan line beside it
+reason: [derived] the step's plan at 232G (arena 228.8 GB, 374 slots) decoded 4.99 under --prefill steps and the pass's floor
+  plan (arena 22.6 GB, 37 slots) 2.94 (k31-rel-serve.card outcome 2026-11-08). The pass's plan now takes the dial's arena; its
+  card holds the pass's reserve beside the experts (card_experts 1852 against the step's 1947 at 2048), about 5 % fewer card
+  experts [derived from the two plan lines], so the decode is the step's within the cold request's scatter.
+  The prompt rate is read, not predicted: the floor plan read 212 GB of host share through the mapping and 297 GB paged a pass;
+  this plan pages ~500 GB through the arena (O_DIRECT, two drives), most ids landing in the 374-slot arena after the first
+  pass.
+decide-in: the next K3.1 seat default and the README's pass/steps limit (gone when decode is in band and the prompt holds ≥ 8)
+decide-below: under 4.5: read the plan line's arena and the nvtier record (copies=, slots) before suspecting the step
+decide-above: above 5.3: read the witness block and the plan line before crediting
