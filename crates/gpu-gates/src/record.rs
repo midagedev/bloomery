@@ -1037,7 +1037,7 @@ pub static CLEF_ROWS: Kind = Kind {
 pub static NVTIER: Kind = Kind {
     name: "nvtier",
     head: "nvtier",
-    doc: "The NVMe expert tier's RAM arena on a paged load: the arena's budget (the bytes the load was granted), the arena the plan reserved and the arena the load was granted (they differ when the host's reading cut the arena at load), the paged experts it serves, the misses ensure read, the slots filled and their bytes and wall, the evictions, the resident bytes, the reads the page cache served, the drops of the model mapping's pages a read of the arena's ids brought in (the calls, the whole-page bytes named to the kernel, the wall on the reader's thread), the residency lane's reads of an id the arena serves (those that opened it filled and read its slot, and those that read the model file's mapping), and the prompt union's claims on the arena: the union calls that fit the arena whole (small) and those run in batches (batched), the ids its claims filled and the ids they found filled, and the ids claimed as keep (the hot set a call holds) and as transient (the cold end, the first victims); and the step port's pinned claims on the arena, counted apart from the union's: the ids they filled and the ids they found filled, the step layers whose claim had a miss (one a layer, not a pick), the wall those fills took as the step call measured it, and the host compute of the hit group while that fill was still in flight; whether the step port's card leg reads the arena (on) or why not (off_anon: an anonymous arena the card has no address of; off_expert_tier: a load with expert tier cards; off_cols: a page of more than one column a row; off_types: a covered layer's stack of a type no arena entry takes; off_words: a covered layer's part off a 4-byte word; off_slots: a covered layer with fewer slots than the ids a pass's rows hold at once; off_residency: the residency machine runs; unattached: the load attached none), the ids the step port held in their slots for the card leg to read; and the wall the fill reader's jobs ran, the prompt batches', the step's and the residency lane's victims' (each job's first unit's start to its last unit's end, counted when its wait saw it end).",
+    doc: "The NVMe expert tier's RAM arena on a paged load: the arena's budget (the bytes the load was granted), the arena the plan reserved and the arena the load was granted (they differ when the host's reading cut the arena at load), the paged experts it serves, the misses ensure read, the slots filled and their bytes and wall, the copies of the set the reader holds (1 with no sidecar, else 1 plus the sidecar's directories) and the fill bytes read from a copy other than the set's own, the evictions, the resident bytes, the reads the page cache served, the drops of the model mapping's pages a read of the arena's ids brought in (the calls, the whole-page bytes named to the kernel, the wall on the reader's thread), the residency lane's reads of an id the arena serves (those that opened it filled and read its slot, and those that read the model file's mapping), and the prompt union's claims on the arena: the union calls that fit the arena whole (small) and those run in batches (batched), the ids its claims filled and the ids they found filled, and the ids claimed as keep (the hot set a call holds) and as transient (the cold end, the first victims); and the step port's pinned claims on the arena, counted apart from the union's: the ids they filled and the ids they found filled, the step layers whose claim had a miss (one a layer, not a pick), the wall those fills took as the step call measured it, and the host compute of the hit group while that fill was still in flight; whether the step port's card leg reads the arena (on) or why not (off_anon: an anonymous arena the card has no address of; off_expert_tier: a load with expert tier cards; off_cols: a page of more than one column a row; off_types: a covered layer's stack of a type no arena entry takes; off_words: a covered layer's part off a 4-byte word; off_slots: a covered layer with fewer slots than the ids a pass's rows hold at once; off_residency: the residency machine runs; unattached: the load attached none), the ids the step port held in their slots for the card leg to read; and the wall the fill reader's jobs ran, the prompt batches', the step's and the residency lane's victims' (each job's first unit's start to its last unit's end, counted when its wait saw it end).",
     parts: &[
         key("budget", U64, "B"),
         key("arena_planned", U64, "B"),
@@ -1047,6 +1047,8 @@ pub static NVTIER: Kind = Kind {
         key("fills", U64, ""),
         key("fill_bytes", U64, "B"),
         key("fill_ns", U64, "ns"),
+        key("copies", U64, ""),
+        key("copy_bytes", U64, "B"),
         key("evictions", U64, ""),
         key("resident_bytes", U64, "B"),
         key("buffered_reads", U64, ""),
@@ -4210,6 +4212,8 @@ pub fn nvtier_of(tier: Option<&bloomery_gpu::host::nvtier::NvTier>) -> Option<Re
             .u("fills", s.fills)
             .u("fill_bytes", s.fill_bytes)
             .u("fill_ns", s.fill_ns)
+            .u("copies", s.copies)
+            .u("copy_bytes", s.copy_bytes)
             .u("evictions", s.evictions)
             .u("resident_bytes", s.resident_bytes)
             .u("buffered_reads", s.buffered_reads)
@@ -5218,6 +5222,8 @@ mod tests {
             .u("fills", 4)
             .u("fill_bytes", 5)
             .u("fill_ns", 6)
+            .u("copies", 1)
+            .u("copy_bytes", 0)
             .u("evictions", 7)
             .u("resident_bytes", 8)
             .u("buffered_reads", 9)

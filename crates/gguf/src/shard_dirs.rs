@@ -5,8 +5,8 @@
 //! [`copy_of`], so the units of one expert and of one layer's misses spread over the drives.
 //!
 //! The format is the one the file-mapping route's sidecar reader takes, so one sidecar serves
-//! both. Here only the names and lengths are checked (no digest at a load, no header compare:
-//! the tier reads byte ranges, not tensors).
+//! both. Here a copy is checked by name, length and sampled bytes ([`check_copy`]: no digest at
+//! a load, no header compare: the tier reads byte ranges, not tensors).
 
 use std::path::{Path, PathBuf};
 
@@ -119,8 +119,52 @@ pub fn copy_path(own: &Path, dir: &Path) -> PathBuf {
     dir.join(own.file_name().unwrap_or_default())
 }
 
-/// Hold the copy at `copy` to shard `own`: it must be a file of the shard's length. A missing
-/// copy and one of another length are refused by name, never read around.
+/// The bytes of each sampled window of a copy the load compares.
+const SAMPLE_BYTES: usize = 64 << 10;
+
+/// The windows between the first and the last that the load compares, evenly spaced.
+const SAMPLE_SPREAD: usize = 6;
+
+/// The `(offset, length)` windows of a file of `len` bytes that [`check_copy`] compares, by
+/// ascending offset: the first and the last [`SAMPLE_BYTES`] and one at each of
+/// [`SAMPLE_SPREAD`] offsets evenly spaced between. A file shorter than a window is one window.
+fn sampled_windows(len: u64) -> Vec<(u64, usize)> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let window = |at: u64| (at, (len - at).min(SAMPLE_BYTES as u64) as usize);
+    let last = len.saturating_sub(SAMPLE_BYTES as u64);
+    let spread =
+        (1..=SAMPLE_SPREAD as u64).map(|i| (len / (SAMPLE_SPREAD as u64 + 1) * i).min(last));
+    let mut at: Vec<u64> = std::iter::once(0)
+        .chain(spread)
+        .chain(std::iter::once(last))
+        .collect();
+    at.sort_unstable();
+    at.into_iter().map(window).collect()
+}
+
+/// The first byte at which `own` and `copy` differ inside a sampled window of a file of `len`
+/// bytes; `None` when every window is equal.
+fn first_sampled_difference(own: &Path, copy: &Path, len: u64) -> std::io::Result<Option<u64>> {
+    use std::os::unix::fs::FileExt;
+    let (a, b) = (std::fs::File::open(own)?, std::fs::File::open(copy)?);
+    let (mut x, mut y) = (vec![0u8; SAMPLE_BYTES], vec![0u8; SAMPLE_BYTES]);
+    for (at, n) in sampled_windows(len) {
+        a.read_exact_at(&mut x[..n], at)?;
+        b.read_exact_at(&mut y[..n], at)?;
+        if let Some(i) = x[..n].iter().zip(&y[..n]).position(|(p, q)| p != q) {
+            return Ok(Some(at + i as u64));
+        }
+    }
+    Ok(None)
+}
+
+/// Hold the copy at `copy` to shard `own`: it must be a file of the shard's length whose bytes
+/// equal the shard's in the sampled windows ([`sampled_windows`]: the first and last 64 KiB and
+/// 64 KiB at each of six offsets between). A missing copy, one of another length and one that
+/// differs in a window are refused by name, the last with the first differing offset, never
+/// read around. The whole-file digest is the copy script's, not a load's.
 pub fn check_copy(own: &Path, copy: &Path) -> Result<(), ShardDirsError> {
     let want = std::fs::metadata(own)
         .map_err(|e| bad(own, format!("its length: {e}")))?
@@ -136,7 +180,14 @@ pub fn check_copy(own: &Path, copy: &Path) -> Result<(), ShardDirsError> {
             copy,
             format!("{} B, the shard {}'s is {want} B", m.len(), own.display()),
         )),
-        Ok(_) => Ok(()),
+        Ok(_) => match first_sampled_difference(own, copy, want) {
+            Err(e) => Err(bad(copy, format!("comparing with {}: {e}", own.display()))),
+            Ok(Some(at)) => Err(bad(
+                copy,
+                format!("differs from the shard {} at byte {at}", own.display()),
+            )),
+            Ok(None) => Ok(()),
+        },
     }
 }
 
@@ -259,6 +310,66 @@ mod tests {
 
         std::fs::write(&copy, [7u8; 64]).unwrap();
         check_copy(&shard, &copy).unwrap();
+    }
+
+    /// A shard of `len` pseudo-random bytes and its byte-identical copy, in two scratch dirs.
+    fn shard_and_copy(name: &str, len: usize) -> (PathBuf, PathBuf, Vec<u8>) {
+        let own = scratch(&format!("{name}-own"));
+        let mirror = scratch(&format!("{name}-mirror"));
+        let shard = own.join("S-00001-of-00001.gguf");
+        let mut x = 0x9E37_79B9u32;
+        let bytes: Vec<u8> = (0..len)
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (x >> 24) as u8
+            })
+            .collect();
+        std::fs::write(&shard, &bytes).unwrap();
+        let copy = copy_path(&shard, &mirror);
+        std::fs::write(&copy, &bytes).unwrap();
+        (shard, copy, bytes)
+    }
+
+    #[test]
+    fn equal_copies_pass_and_a_changed_sampled_byte_is_refused_at_its_offset() {
+        let len = 1 << 20;
+        let (shard, copy, bytes) = shard_and_copy("bytes", len);
+        check_copy(&shard, &copy).unwrap();
+        let windows = sampled_windows(len as u64);
+        assert_eq!(windows.len(), 2 + SAMPLE_SPREAD);
+        // The start, a window in the middle of the file, and the very last byte.
+        for at in [0, windows[4].0 as usize + 17, len - 1] {
+            let mut changed = bytes.clone();
+            changed[at] ^= 0xFF;
+            std::fs::write(&copy, &changed).unwrap();
+            let err = check_copy(&shard, &copy).unwrap_err();
+            assert_eq!(err.path, copy.display().to_string());
+            assert!(
+                err.why.contains(&format!("byte {at}"))
+                    && err.why.contains(&shard.display().to_string()),
+                "{err}"
+            );
+        }
+        std::fs::write(&copy, &bytes).unwrap();
+        check_copy(&shard, &copy).unwrap();
+    }
+
+    #[test]
+    fn the_sampled_windows_stay_inside_the_file_in_order() {
+        assert!(sampled_windows(0).is_empty());
+        for len in [
+            1u64,
+            100,
+            SAMPLE_BYTES as u64,
+            3 * SAMPLE_BYTES as u64 + 5,
+            1 << 30,
+        ] {
+            let windows = sampled_windows(len);
+            assert!(windows.iter().all(|&(at, n)| n > 0 && at + n as u64 <= len));
+            assert!(windows.windows(2).all(|w| w[0].0 <= w[1].0), "{len}");
+            assert_eq!(windows.first().map(|w| w.0), Some(0));
+            assert_eq!(windows.last().map(|w| w.0 + w.1 as u64), Some(len));
+        }
     }
 
     #[test]

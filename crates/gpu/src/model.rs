@@ -59,6 +59,7 @@ use bloomery_levers::{ChurnHosting, HostCfg, NvTierMem};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use engram::direct::DIRECT_ALIGN;
 use gguf::Split;
+use gguf::shard_dirs::{shard_dirs, sidecar_path};
 use model::arch::Arch;
 use model::moe::HostLayer;
 use model::placement::churn::ChurnPool;
@@ -68,6 +69,7 @@ use model::placement::{ArenaFloor, ExpertList, HeadSite, Plan};
 use model::r8file::R8Source;
 use runtime::costs::Store;
 use std::ops::Range;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -2324,7 +2326,8 @@ pub(crate) fn arena_kind_of<'a>(
 /// integrated device by default ([`bloomery_levers::NvTierMem`]), its
 /// victims taken as the lever's rule asks ([`bloomery_levers::NvTierEvict`]). `None`
 /// on a plan that pages no routed expert or reserved no arena: the host
-/// leg reads the file mapping as it stands. Refused by name: a load
+/// leg reads the file mapping as it stands (a sidecar listing copies is then
+/// named on stderr, [`sidecar_unread_note`]). Refused by name: a load
 /// whose r8 pair reads a sidecar while the plan pages routed experts —
 /// the slot's bytes follow the sidecar resolution, which the tier does
 /// not carry yet.
@@ -2338,6 +2341,17 @@ pub fn nvme_tier(
     const WHAT: &str = "GpuModel::nvme_tier";
     if plan.host.nvme_expert_bytes == 0 {
         return Ok(None);
+    }
+    if let Some(first) = file.shard_path(0) {
+        let dirs = shard_dirs(first).map_err(|e| GpuError::plan(WHAT, e))?;
+        if let Some(note) = sidecar_unread_note(
+            sidecar_path(first).as_deref(),
+            dirs.len(),
+            plan.host.nvme_expert_bytes,
+            arena.granted,
+        ) {
+            eprintln!("{note}");
+        }
     }
     let levers = bloomery_levers::nvtier_levers().map_err(|e| GpuError::plan(WHAT, e))?;
     let pair = model::r8file::R8Pair::at_load(Arc::clone(file), r8)
@@ -2353,6 +2367,30 @@ pub fn nvme_tier(
     let source = PinnedSource(ctx);
     let mem = arena_kind_of(&source, levers.mem)?;
     NvTier::of_paged(plan, file, levers.direct, arena, mem, levers.evict).map(|t| t.map(Arc::new))
+}
+
+/// The load's line for a mirror sidecar it does not read: `sidecar` lists `copies` directories
+/// while the plan pages `paged` routed-expert bytes and the load granted the tier `granted` arena
+/// bytes. Only the tier's arena reads the copies, so a paged plan with no arena reads the file
+/// mapping and the sidecar stays unread. `None` with no sidecar directory, nothing paged, or an
+/// arena granted.
+fn sidecar_unread_note(
+    sidecar: Option<&Path>,
+    copies: usize,
+    paged: u64,
+    granted: u64,
+) -> Option<String> {
+    let sidecar = sidecar?;
+    (copies > 0 && paged > 0 && granted == 0).then(|| {
+        format!(
+            "nvtier: {} names {copies} copies, not read: this plan pages through the file \
+             mapping (arena=0); the copies are read through the tier's arena (a smaller \
+             {}, or {})",
+            sidecar.display(),
+            bloomery_levers::HOST_ROOM,
+            bloomery_levers::NVTIER_BYTES,
+        )
+    })
 }
 
 /// The host leg of a load on `plan`: the routed layers of `set` (the layers
@@ -3347,9 +3385,28 @@ impl<B: Instrumented> Engine for GpuModel<B> {
 
 #[cfg(test)]
 mod tests {
-    use super::{beside, refuse_partial_folder, refuse_reserve_past};
+    use super::{beside, refuse_partial_folder, refuse_reserve_past, sidecar_unread_note};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
+
+    /// A sidecar the load leaves unread is named: no sidecar directory, no paged bytes or an
+    /// arena granted say nothing; a sidecar over a paged plan with no arena names its path and
+    /// its copy count. Mutant: the arena test dropped, or the copy count left out.
+    #[test]
+    fn a_sidecar_over_a_plan_with_no_arena_is_named() {
+        let side = std::path::Path::new("/m/K.shard-dirs");
+        assert_eq!(sidecar_unread_note(None, 0, 100, 0), None);
+        assert_eq!(sidecar_unread_note(Some(side), 0, 100, 0), None);
+        assert_eq!(sidecar_unread_note(Some(side), 1, 100, 64), None);
+        assert_eq!(sidecar_unread_note(Some(side), 1, 0, 0), None);
+        let note = sidecar_unread_note(Some(side), 2, 100, 0).expect("a named line");
+        assert_eq!(
+            note,
+            "nvtier: /m/K.shard-dirs names 2 copies, not read: this plan pages through the file \
+             mapping (arena=0); the copies are read through the tier's arena (a smaller \
+             BLOOMERY_HOST_ROOM, or BLOOMERY_NVTIER_BYTES)"
+        );
+    }
 
     /// Buffers at the plan's reserve pass; one byte past it is refused by name with both figures
     /// and what the buffers are. Mutant: the comparison read `>=`, or reversed.
