@@ -1,0 +1,18 @@
+# k31dsa mutant refusals-pass-past-topk
+# clause: refusals, the pass past top_k (gate_kimi_k3_dsa.rs:1155-1159)
+# site: crates/model/src/arch/kimi_k3/hparams.rs:378 Indexer::pass_attends_as_the_file, top_k + 1 keys accepted (host only)
+# expected red: "  refusal a pass whose last row sees 2049 keys: ran without a refusal: FAIL"
+# also red on the host: a_pass_past_top_k_does_not_attend_as_the_file (hparams.rs:1619, "2049 keys")
+diff --git a/crates/model/src/arch/kimi_k3/hparams.rs b/crates/model/src/arch/kimi_k3/hparams.rs
+index 06fa0f366..c0e18b4b6 100644
+--- a/crates/model/src/arch/kimi_k3/hparams.rs
++++ b/crates/model/src/arch/kimi_k3/hparams.rs
+@@ -375,7 +375,7 @@ impl Indexer {
+     /// attends every key it sees, a layer that runs the indexer the `top_k` best past that many.
+     #[must_use]
+     pub fn pass_attends_as_the_file(&self, keys: u64) -> bool {
+-        keys <= self.top_k as u64
++        keys <= self.top_k as u64 + 1
+     }
+ 
+     /// Of a prompt of `n` ids from position `pos`, the leading ids a pass of rows may take: those

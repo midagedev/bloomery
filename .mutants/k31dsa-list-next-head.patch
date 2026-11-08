@@ -1,0 +1,19 @@
+# k31dsa mutant list-next-head
+# clause: list (gate_kimi_k3_dsa.rs:964-973)
+# site: crates/gpu/src/indexer.rs:311 ds41_indexer_score, head h scored with head h+1's weight (mod 32, in bounds; PTX moves)
+# w_out (:320-321) still writes the right weights, so the inputs check stays yes
+# expected red (x4): "  list at {n} rows: the score pass's query and weights the host's bits: yes, the list the exact
+#   top-2048 of the card's scores: yes, scores outside the kernel band of our rule: N>0, rows off our rule's top-k N>0 ...: FAIL"
+diff --git a/crates/gpu/src/indexer.rs b/crates/gpu/src/indexer.rs
+index 25571da05..c07511732 100644
+--- a/crates/gpu/src/indexer.rs
++++ b/crates/gpu/src/indexer.rs
+@@ -308,7 +308,7 @@ mod indexer_kernels {
+             thread::__unroll_config::<0>();
+             // SAFETY: 8i + g < HEADS, so the index is below HEADS·tokens <=
+             // w.len() (launch contract).
+-            wr[i] = mul_rn_f32(unsafe { *w.get_unchecked((8 * i + g) * tk + t) }, scale);
++            wr[i] = mul_rn_f32(unsafe { *w.get_unchecked(((8 * i + g + 1) % HEADS) * tk + t) }, scale);
+             i += 1;
+         }
+         if gb == 0 && wid == 0 {

@@ -1,0 +1,19 @@
+# k31dsa mutant identity-nsel
+# OPTIONAL (not in the spec's list): the list's live length written as its width
+# clause: identity (gate_kimi_k3_dsa.rs:996-1003)
+# site: crates/gpu/src/arch/kimi_k3/index.rs:78 count_words, N_SEL = top_k instead of min(pos + 1, top_k) (host only)
+# expected red: "  identity: positions 0 .. 2048 selected vs dense, bit for bit: 2048 differ (first at 0): FAIL"
+# past top_k the word is the same, so list, selected and refusals stay green
+diff --git a/crates/gpu/src/arch/kimi_k3/index.rs b/crates/gpu/src/arch/kimi_k3/index.rs
+index 11f5f62e7..ede40e422 100644
+--- a/crates/gpu/src/arch/kimi_k3/index.rs
++++ b/crates/gpu/src/arch/kimi_k3/index.rs
+@@ -75,7 +75,7 @@ pub fn count_words(pos: u32, top_k: u32) -> Result<[u32; WORDS], GpuError> {
+     let mut w = [0; WORDS];
+     w[N_VIS_AT] = n_vis;
+     w[TOP_K_AT] = top_k;
+-    w[N_SEL_AT] = n_vis.min(top_k);
++    w[N_SEL_AT] = top_k;
+     Ok(w)
+ }
+ 

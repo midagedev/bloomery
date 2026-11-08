@@ -1,0 +1,20 @@
+# k31dsa mutant list-scale
+# clause: list (gate_kimi_k3_dsa.rs:964-973, list_clauses)
+# site: crates/gpu/src/indexer.rs:820 IndexerKernels::with_shape, the weights' scale 1/sqrt(32*128) -> 1/sqrt(128) (host only, no PTX moves)
+# expected red (x4, at 2049, 2050, 3001, 4096 rows):
+#   "  list at {n} rows: the score pass's query and weights the host's bits: no, ...: FAIL"
+# weak mutant: a uniform positive scale keeps the order, so only the weights' bit check reds; the two
+# separation list lines at 4096 rows may also flip (beta = kernel + |rule - graph| grows: the card weights are ~5.7x the graph's)
+diff --git a/crates/gpu/src/indexer.rs b/crates/gpu/src/indexer.rs
+index 25571da05..a7b595d01 100644
+--- a/crates/gpu/src/indexer.rs
++++ b/crates/gpu/src/indexer.rs
+@@ -817,7 +817,7 @@ impl IndexerKernels {
+         Ok(IndexerKernels {
+             module,
+             blocks: blocks.max(1),
+-            scale: weights_scale(n_head, head_dim),
++            scale: weights_scale(1, head_dim),
+             n_dims,
+         })
+     }
