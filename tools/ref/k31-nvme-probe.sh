@@ -8,6 +8,8 @@
 #   K31_PROBE_SERVE    a built bloomery-serve to run instead of the tarball's (a tree's target/release binary)
 #   K31_PROBE_MODEL    the first shard (default /models/Kimi-K3.1-Pro-IQ1_S/Kimi-K3.1-Pro-IQ1_S-00001-of-00031.gguf)
 #   K31_PROBE_D / K31_PROBE_N   prompt ids and n_predict (default 512 / 128)
+#   K31_PROBE_CTX      the server's --ctx-size (default 2048)
+#   K31_PROBE_ARGS     extra server flags (e.g. --prefill steps), split on spaces
 #   K31_PROBE_ENV      extra NAME=value words for the server (e.g. BLOOMERY_NVTIER_BYTES=32G), split on spaces
 set -u
 OUT=${K31_PROBE_OUT:-/root/k31-nvme-probe}
@@ -37,7 +39,7 @@ sha256sum "$SERVE" | tee "$OUT/summary.txt"
 # the previous run's server may still be unmapping: its port must be free before this listener
 for i in $(seq 1 60); do ss -ltn 2>/dev/null | grep -q ":$PORT " || break; sleep 1; done
 ss -ltn 2>/dev/null | grep -q ":$PORT " && die "port $PORT still in use after 60 s" 75
-env -u BLOOMERY_REF_MODEL BLOOMERY_HOST_ROOM=252G ${K31_PROBE_ENV:-} timeout --kill-after=10 3600 "$SERVE" -m "$MODEL" --host 127.0.0.1 --port "$PORT" --place bp --ctx-size 2048 \
+env -u BLOOMERY_REF_MODEL BLOOMERY_HOST_ROOM=252G ${K31_PROBE_ENV:-} timeout --kill-after=10 3600 "$SERVE" -m "$MODEL" --host 127.0.0.1 --port "$PORT" --place bp --ctx-size "${K31_PROBE_CTX:-2048}" ${K31_PROBE_ARGS:-} \
   > "$OUT/serve.log" 2>&1 &
 SPID=$!; echo "$SPID" > "$OUT/serve.pid"
 t0=$(date +%s)

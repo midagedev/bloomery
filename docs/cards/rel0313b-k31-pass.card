@@ -1,0 +1,20 @@
+# The 0.3.13 re-release (K3.1's selected attention in the decode step and in the prompt passes, the kimik3 seat running a
+# prompt as placed passes). One K3.1 request on the re-release's sm86 tarball, past the indexer's top-k.
+kind: calibration
+question: does the re-release's seat run a 4096-id K3.1 prompt as passes past the top-k, and at what prompt rate against 0.3.13's stepped 3.85 tok/s
+term: prompt tok/s @ D=4096, n_predict 128, one cold request, --place bp, --ctx-size 8192, BLOOMERY_HOST_ROOM=232G, the tarball's bloomery-serve
+unit: tok/s
+predict: 5.0..12.0
+condition: tools/ref/k31-nvme-probe.sh with K31_PROBE_TARBALL the re-release's sm86 tarball, K31_PROBE_CTX=8192, K31_PROBE_D=4096,
+  K31_PROBE_N=128, K31_PROBE_ENV="BLOOMERY_HOST_ROOM=232G", the two-drive sidecar in place
+reason: [derived] docs/research/k3-prompt-pass.md §3: a pass of 512 rows reads each routed layer's union of experts once, NVMe-bound,
+  ≈ 11 tok/s (band 5.5-12) where the step reads ≈ 1.3 tok/s on one drive; 0.3.13's stepped K3.1 prompt read 3.85 tok/s on two drives
+  (k31-rel-serve.card). Past the top-k each latent layer adds the step's pick and selected core per row on the card, ≈ 0.8 s a 512-row
+  pass at D=4K [derived, k31passdsa report], small against the pass. The band's floor is 0.3.13's stepped rate plus a third.
+decide-in: the re-release notes' K3.1 row is this run (its conditions named), beside 0.3.13's stepped row
+decide-below: under 5.0: read the seat's prompt_pass and listening prompt= records first (a stepped fallback reads ≈ 3.9), then the
+  nvtier record (copies=) before any code is suspected
+decide-above: above 12.0: read the witness block and the plan line before crediting
+# outcome 2026-11-08 on the re-cut's sm86 tarball (79893871104b, bloomery-serve sha cd27f240…): pp 12.12 tok/s @ D=4096, tg 2.33
+#  (128 generated), ctx 8192, one cold request. 0.12 above the band's ceiling; the plan line read (ctx_max 8192, arena 22.6 GB, 37
+#  slots): the pass rate sits at the derivation's upper edge, credited. decide-in: the re-cut notes' 4,096 row.

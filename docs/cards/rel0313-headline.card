@@ -21,3 +21,7 @@ decide-above: beyond 45.0: read the witness block and the plan line (the room, t
 # outcome 2026-11-08 on main 42c0cf5af (the tag's sm86 tarball d7dfc68d…, its bloomery-serve sha cf9fadae…): sitting 7, two rounds:
 #  tg 41.36 / 40.53 @512, 35.80 / 37.37 @4096; pp 113.64 / 107.04 @512, 345.99 / 337.81 @4096; load 57-87 s; majflt 28-88 k; the replay
 #  identical (PASS); green. In band; the release's rows are sitting 7's (the notes' table), sittings 5 and 6 of 29fd27d60 named beside them.
+# outcome 2026-11-08 on rel3013 79893871104b (the re-cut's sm86 tarball 2d5e1100…, its bloomery-serve sha cd27f240…): sitting 8, two
+#  rounds: tg 40.80 / 38.15 @512, 24.29 / 33.29 @4096; pp 104.85 / 96.62 @512, 281.24 / 323.25 @4096; load 55-85 s; majflt 26-66 k; the
+#  replay split at token 5 of 13 inside the band (PASS); green. The 512 rows and round 2's 4096 row in band; round 1's 4096 row below it,
+#  with no code change behind it found (the re-cut touches K3.1 only; canon-check 2,016 entries identical). The re-cut notes carry all four.

@@ -25,3 +25,7 @@ decide-above: above 5.3: read the witness block and the nvtier record (copies, f
 #  0.2 % of each other (~1.63 GB/s each in arm 1, ~1.67 in arm 2): the reads split evenly over the drives. The SPIN arm's +1 % is
 #  inside one cold request's scatter, not the -34 ms k31lane's probe read on its own tree (that probe carried the Lane code beside the
 #  lever): no serving tip for SPIN; the lever stays a k31lane question. decide-in: the notes' K3.1 row is arm 1.
+# outcome 2026-11-08 on the re-cut's sm86 tarball (79893871104b, bloomery-serve sha cd27f240…), D=512, 512 generated, ctx 2048, each one
+#  cold request: passes (the default) tg 2.94 / pp 12.48; `--prefill steps` tg 4.99 / pp 3.80. Steps repeats the card's ~5. The pass's
+#  decode is its plan's NVMe arena at the floor (22.6 GB, 37 slots, against the step plan's 228.8 GB, 374 slots), not the step path: an
+#  engine follow-up. decide-in: the re-cut notes carry both rows; README's limits name steps as the pick for a long reply.
