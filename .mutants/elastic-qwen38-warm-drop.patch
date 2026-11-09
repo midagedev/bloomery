@@ -1,13 +1,11 @@
 --- a/crates/gpu-gates/src/bin/shared/serve_seats/qwen38.rs
 +++ b/crates/gpu-gates/src/bin/shared/serve_seats/qwen38.rs
-@@ -3111,9 +3111,7 @@
-         eprintln!("{line}");
-         // The settle after every card buffer the open makes, the ring included: what the card
-         // has free now is what serving leaves it.
--        if let Some(terms) = elastic {
--            settle_elastic(gpu, body, terms)?;
--        }
-+        let _ = elastic;
-         let mut census = record::host_tier::CensusSpan::default();
-         {
-             let b = s.model().body(WHAT)?;
+@@ -3230,7 +3230,7 @@
+             print_move(&e);
+         }
+         let fills = body.elastic_stats().fills;
+-        settle_elastic(body, terms, "warm", free)?;
++        let _ = (&mut *body, terms, free);
+         // The slots a fill backed hold nothing until an expert lands in them: the residency
+         // back to its seed, which the fill grew, puts the seed's next experts there, so the
+         // first request finds the card filled.

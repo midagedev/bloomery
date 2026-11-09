@@ -1232,7 +1232,7 @@ impl CardRoute38 {
         land: &[LandBatch],
     ) -> Result<(), GpuError> {
         let st = card.stacks(c.w, l)?;
-        let n_card = st.n_card;
+        let n_card = st.reach;
         let stack_slots = st.slots;
         let down = down_weight(WHAT, l, st.down_ty, st.down)?;
         let (gpu, stream, sink) = (c.gpu, c.gpu.stream(), c.gpu.layer_sink(l)?);
@@ -2419,7 +2419,7 @@ impl WideParts<'_> {
         trows: &DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         let n_tier = self.tier_k(l);
-        let n_card = self.card.n_card(l);
+        let n_card = self.card.reach(l);
         let (c, x) = (&self.c, &mut *self.x);
         let r = x
             .card
@@ -3013,7 +3013,7 @@ impl<'a> WideParts<'a> {
     fn widths(&self) -> Result<Vec<usize>, GpuError> {
         let x = &*self.x;
         let host = (0..self.plans.len())
-            .map(|l| geo::EXPERTS.saturating_sub(self.card.n_card(l)))
+            .map(|l| geo::EXPERTS.saturating_sub(self.card.live(l)))
             .max()
             .unwrap_or(0);
         unit_widths(self.m, x.split_walk, (x.load, x.split_costs.as_ref()), host)

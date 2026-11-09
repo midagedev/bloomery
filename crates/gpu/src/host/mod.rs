@@ -2034,6 +2034,15 @@ impl<H: HostExperts> HostTier<H> {
         self.swap.as_ref().and_then(swap::SwapMachine::quantum)
     }
 
+    /// The withdrawn slots a fill could restore a layer
+    /// ([`swap::SwapMachine::withdrawn_slots`]); 0 without a machine.
+    #[must_use]
+    pub fn swap_withdrawn_slots(&self) -> usize {
+        self.swap
+            .as_ref()
+            .map_or(0, swap::SwapMachine::withdrawn_slots)
+    }
+
     /// The lowest `k` withdrawn slots of layer `layer` restored
     /// ([`swap::SwapMachine::restore_tail`]): their pages backed again, the
     /// layer's capacity `k` more. Refused by name, the machine unchanged,

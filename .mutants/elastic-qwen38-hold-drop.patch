@@ -1,0 +1,11 @@
+--- a/crates/gpu/src/arch/qwen3moe/body38.rs
++++ b/crates/gpu/src/arch/qwen3moe/body38.rs
+@@ -5724,7 +5724,7 @@
+     /// A K/V fit's give-back is counted on the tenant's clock like a settle's,
+     /// and kept for the seat's record when the load is elastic.
+     fn gave_back(&mut self, asked: u64, freed: &FreedBytes) {
+-        self.elastic.gave_back(freed.bytes);
++        self.elastic.give_backs += 1;
+         if let Some(moves) = self.elastic_moves.as_mut() {
+             moves.push(Elastic::GiveBack {
+                 site: "fit",

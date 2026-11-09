@@ -13,6 +13,7 @@
 //! steady state after warm-up holds the give-back count at zero. Nothing here
 //! names a model: a family implements the trait by naming its machine parts.
 
+pub use ::model::placement::elastic::ElasticStats;
 use ::model::placement::elastic::{fill_allowed, fill_slots};
 
 use super::kv::{FreedBytes, KvRoomBody};
@@ -35,8 +36,18 @@ pub trait ElasticBody: KvRoomBody {
     /// quantum's terms. `None` for a body with no machine.
     fn expert_quantum(&self) -> Option<(u64, u64)>;
 
+    /// The slots the machine has withdrawn on every layer it holds stacks of:
+    /// the fewest over those layers, which is what one fill can restore a
+    /// layer. 0 for a body with no machine or nothing withdrawn.
+    fn withdrawn_slots(&self) -> usize;
+
     /// The counters this body's moves are tallied in.
     fn elastic_stats(&mut self) -> &mut ElasticStats;
+
+    /// The moves made where no caller had a record to print them
+    /// ([`KvRoomBody::gave_back`], a K/V fit's give-back), oldest first,
+    /// emptied by the call.
+    fn take_moves(&mut self) -> Vec<Elastic>;
 }
 
 /// What a fill backed: slots a layer, their device bytes, layers filled.
@@ -47,17 +58,9 @@ pub struct FilledBytes {
     pub layers: usize,
 }
 
-/// The tenant's moves since the load: what a binary's `stat elastic` line
-/// prints and a gate holds to zero give-backs in steady state.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ElasticStats {
-    pub give_backs: u64,
-    pub give_back_bytes: u64,
-    pub fills: u64,
-    pub fill_bytes: u64,
-    /// The boundary the last give-back ran at, for the fill's hold.
-    pub last_give_back: Option<u64>,
-}
+/// Why a settle held when the free bytes above the margin hold no whole quantum past the
+/// keep: the common case of a card that is full enough, which a quiet boundary does not print.
+pub const HELD_NO_QUANTUM: &str = "the free bytes above the margin hold no quantum past the keep";
 
 /// One move of the tenant, reported to the caller for its record line.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,14 +71,17 @@ pub enum Elastic {
         asked: u64,
         freed: FreedBytes,
     },
-    /// Withdrawn slots filled from `free` bytes above `margin`.
+    /// Withdrawn slots filled from `free` bytes above `margin`, by the settle
+    /// at `site`.
     Fill {
+        site: &'static str,
+        boundary: u64,
         free: u64,
         margin: u64,
         filled: FilledBytes,
     },
-    /// Nothing moved, and why (a quiet settle is not a failure).
-    Held { why: String },
+    /// Nothing moved at the settle at `site`, and why (a quiet settle is not a failure).
+    Held { site: &'static str, why: String },
 }
 
 /// Whether `e` is the card's own memory running out: a room's named refusal
@@ -126,9 +132,7 @@ pub fn with_room<B: ElasticBody, T>(
             ));
         }
     };
-    let stats = body.elastic_stats();
-    stats.give_backs += 1;
-    stats.give_back_bytes += freed.bytes;
+    body.elastic_stats().gave_back(freed.bytes);
     report(Elastic::GiveBack {
         site,
         asked: ask,
@@ -152,9 +156,9 @@ pub fn with_room<B: ElasticBody, T>(
 /// back (`site` names the settle) and a card above it fills the withdrawn
 /// slots the room past the margin and the keep allows
 /// (`placement::elastic::fill_slots`), the fill held for the boundaries
-/// after a give-back (`fill_allowed`). `boundary` counts the residency
-/// boundaries so far. The move, or why none ran, goes to `report` and the
-/// counters.
+/// after a give-back (`fill_allowed`), on the body's own boundary clock
+/// ([`ElasticStats::boundary`]). The move, or why none ran, goes to `report`
+/// and the counters; the card counts as read ([`ElasticStats::settled`]).
 ///
 /// # Errors
 ///
@@ -165,16 +169,13 @@ pub fn settle_to_margin<B: ElasticBody>(
     site: &'static str,
     free: u64,
     margin: u64,
-    boundary: u64,
     mut report: impl FnMut(Elastic),
 ) -> Result<(), GpuError> {
+    body.elastic_stats().settled();
     if free < margin {
         let want = margin - free;
         let freed = body.free_expert_bytes(want)?;
-        let stats = body.elastic_stats();
-        stats.give_backs += 1;
-        stats.give_back_bytes += freed.bytes;
-        stats.last_give_back = Some(boundary);
+        body.elastic_stats().gave_back(freed.bytes);
         report(Elastic::GiveBack {
             site,
             asked: want,
@@ -184,12 +185,15 @@ pub fn settle_to_margin<B: ElasticBody>(
     }
     let Some((layers, slot_bytes)) = body.expert_quantum() else {
         report(Elastic::Held {
+            site,
             why: "no residency machine".to_owned(),
         });
         return Ok(());
     };
-    if !fill_allowed(boundary, body.elastic_stats().last_give_back) {
+    let stats = *body.elastic_stats();
+    if !fill_allowed(stats.boundary, stats.last_give_back) {
         report(Elastic::Held {
+            site,
             why: "a give-back ran within the fill's hold".to_owned(),
         });
         return Ok(());
@@ -197,7 +201,8 @@ pub fn settle_to_margin<B: ElasticBody>(
     let slots = fill_slots(free, margin, layers, slot_bytes, usize::MAX);
     if slots == 0 {
         report(Elastic::Held {
-            why: "the free bytes above the margin hold no quantum past the keep".to_owned(),
+            site,
+            why: HELD_NO_QUANTUM.to_owned(),
         });
         return Ok(());
     }
@@ -205,17 +210,18 @@ pub fn settle_to_margin<B: ElasticBody>(
     match body.fill_expert_bytes(room) {
         Ok(filled) => {
             if filled.slots > 0 {
-                let stats = body.elastic_stats();
-                stats.fills += 1;
-                stats.fill_bytes += filled.bytes;
+                body.elastic_stats().filled(filled.bytes);
             }
             report(Elastic::Fill {
+                site,
+                boundary: stats.boundary,
                 free,
                 margin,
                 filled,
             });
         }
         Err(e) => report(Elastic::Held {
+            site,
             why: format!("the residency machine refused the fill: {e}"),
         }),
     }
@@ -232,6 +238,7 @@ mod tests {
         machine: bool,
         stats: ElasticStats,
         quantum: Option<(u64, u64)>,
+        withdrawn: usize,
     }
 
     fn oom() -> GpuError {
@@ -284,8 +291,16 @@ mod tests {
             self.quantum
         }
 
+        fn withdrawn_slots(&self) -> usize {
+            self.withdrawn
+        }
+
         fn elastic_stats(&mut self) -> &mut ElasticStats {
             &mut self.stats
+        }
+
+        fn take_moves(&mut self) -> Vec<Elastic> {
+            Vec::new()
         }
     }
 
@@ -296,6 +311,7 @@ mod tests {
             machine,
             stats: ElasticStats::default(),
             quantum: Some((3, 100)),
+            withdrawn: 4,
         }
     }
 
@@ -374,17 +390,17 @@ mod tests {
     fn a_settle_gives_back_below_the_margin_and_fills_above_it() {
         let mut b = body(0, true);
         let mut seen = Vec::new();
-        settle_to_margin(&mut b, "warm", 90, 100, 0, |e| seen.push(e)).expect("the give-back");
+        settle_to_margin(&mut b, "warm", 90, 100, |e| seen.push(e)).expect("the give-back");
         assert_eq!(b.calls, ["free 10"]);
         assert_eq!(b.stats.last_give_back, Some(0));
         let mut b = body(0, true);
-        settle_to_margin(&mut b, "warm", 100 + 12 * 300, 100, 0, |e| seen.push(e))
-            .expect("the fill");
+        settle_to_margin(&mut b, "warm", 100 + 12 * 300, 100, |e| seen.push(e)).expect("the fill");
         assert_eq!(b.calls, [format!("fill {}", 10 * 300)]);
         assert_eq!(b.stats.fills, 1);
         let mut held = body(0, true);
+        held.stats.boundary = 6;
         held.stats.last_give_back = Some(5);
-        settle_to_margin(&mut held, "warm", 100 + 12 * 300, 100, 6, |e| seen.push(e))
+        settle_to_margin(&mut held, "warm", 100 + 12 * 300, 100, |e| seen.push(e))
             .expect("the hold");
         assert!(held.calls.is_empty());
         assert!(matches!(seen.last(), Some(Elastic::Held { .. })));
@@ -396,10 +412,10 @@ mod tests {
         let mut b = body(0, false);
         b.quantum = None;
         let mut seen = Vec::new();
-        settle_to_margin(&mut b, "warm", 1_000, 100, 0, |e| seen.push(e)).expect("held");
+        settle_to_margin(&mut b, "warm", 1_000, 100, |e| seen.push(e)).expect("held");
         assert!(matches!(
             seen.as_slice(),
-            [Elastic::Held { why }] if why == "no residency machine"
+            [Elastic::Held { why, .. }] if why == "no residency machine"
         ));
     }
 }

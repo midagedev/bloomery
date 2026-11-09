@@ -1,0 +1,12 @@
+--- a/crates/gpu-gates/src/bin/shared/serve_seats/qwen38.rs
++++ b/crates/gpu-gates/src/bin/shared/serve_seats/qwen38.rs
+@@ -3835,8 +3835,7 @@
+     /// residency stays where use has taken it (only [`Seat::residency_reset`]
+     /// moves it back), and the other slots' drafts stand as they are.
+     fn reset(&mut self) -> Result<(), GateError> {
+-        self.reset_slot()?;
+-        self.quiet_boundary()
++        self.reset_slot()
+     }
+ 
+     /// [`app::Session::residency_reset`], its `residency reset` record on

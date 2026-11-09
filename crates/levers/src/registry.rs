@@ -1119,8 +1119,11 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         doc: "Qwen3.8 (`bloomery-serve-qwen38`) under a residency machine: `on` reserves each \
               layer's card expert stacks for the slots the plan's assumed terms could hold \
               (`placement::elastic::capacity`), the plan's experts backed and the rest withdrawn, \
-              and after the open — captures, drafts, slots, the expert stream's ring — reads the \
-              card's free bytes and settles them to the plan's margin (`settle_to_margin`): \
+              and after the open — captures, drafts, slots, the expert stream's ring, then a worst-case \
+              prompt pass (`elastic warm`) — reads the card's free bytes and settles them to the \
+              plan's margin (`settle_to_margin`), and again at a quiet boundary (a sequence's end) \
+              once a give-back's hold of `FILL_HOLD` boundaries is over (`elastic fill` at site \
+              `quiet`); the settle: \
               below it, the coldest experts go back to the host (`elastic give-back`); above it, \
               withdrawn slots fill from the host (`elastic fill`), two quanta kept; a settle that \
               moves nothing says why (`elastic held`), and `stat elastic` counts the moves. `off` \

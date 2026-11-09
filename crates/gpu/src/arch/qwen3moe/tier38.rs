@@ -411,7 +411,7 @@ impl BlockRoute38 {
             ));
         }
         let st = cl.stacks(w)?;
-        let n_tier = st.n_card;
+        let n_tier = st.reach;
         let at = self
             .counts
             .iter()

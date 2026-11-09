@@ -278,7 +278,18 @@
 //!   record and `stat elastic`; the clause holds the record's terms to each
 //!   other and the counts to the record, and the load serves after it. The
 //!   fixture's card decides which record (fill, give-back or held) — the
-//!   clause prints it as the reading;
+//!   clause prints it as the reading. The seat runs the worst-case pass (a
+//!   prompt of the ubatch, a step, a pass of the slots) before the settle,
+//!   and an `elastic warm` record names the bytes that pass left taken and
+//!   the reading the settle takes;
+//! - the fill clauses ([`elastic_fill_serves`], [`elastic_refills`], servers
+//!   of their own): a fill is served by the card — the filled slots' experts
+//!   are routed to it (the prompt's card picks rise over the static plan's)
+//!   and the ids are those of a static load whose plan holds the filled
+//!   experts — and serving fills back: a prompt that outgrows the free
+//!   bytes gives expert slots back through a K/V fit, small requests follow
+//!   (each a quiet boundary on the clock `stat elastic` prints), and the
+//!   fill runs at a quiet boundary once the hold after the give-back is over;
 //! - the width chooser's clause ([`width_cost`], a server of its own under
 //!   `BLOOMERY_DRAFT=mtp`, `BLOOMERY_RESIDENCY=off` and
 //!   `BLOOMERY_MTP_WIDTH=cost`): the prompt's steps (one token a request),
@@ -732,6 +743,16 @@ mod gate {
     const ELASTIC_AGREES: &str = "elastic_settle_agrees_with_its_reading";
     const ELASTIC_STAT: &str = "elastic_stat_counts_the_settle";
     const ELASTIC_SERVES: &str = "elastic_load_serves_after_the_settle";
+    /// The warm-up's pass record names its bytes and the settle takes its reading.
+    const ELASTIC_PASS: &str = "elastic_warm_pass_names_its_bytes_and_the_settle_reads_after_it";
+    /// A fill is served by the card: more picks hit it, and the ids are a static load's.
+    const ELASTIC_FILL_ROUTED: &str = "elastic_fill_routes_the_filled_experts_to_the_card";
+    const ELASTIC_FILL_EQUAL: &str = "elastic_fill_serves_the_ids_of_a_static_load_holding_them";
+    /// Serving fills back: a K/V give-back is recorded, the fill waits the hold, then runs.
+    const ELASTIC_FIT_RECORDED: &str = "elastic_kv_give_back_is_recorded";
+    const ELASTIC_REFILL_WAITS: &str = "elastic_refill_waits_for_the_hold_after_a_give_back";
+    const ELASTIC_REFILLS: &str = "elastic_refill_runs_at_a_quiet_boundary_after_the_hold";
+    const ELASTIC_REFILL_SERVES: &str = "elastic_server_serves_through_the_refill";
     /// The unhosted-pool clause's checks, one line each, and the unset
     /// word's one beside them.
     const CHURN_WHY: &str = "churn_unhosted_lever_record_names_the_asked_word";
@@ -2833,8 +2854,11 @@ mod gate {
     /// record's; then it answers a greedy request. Which record the fixture's
     /// card prints is the reading, not a pin: the clause prints it for the
     /// log. FAIL-first (`.mutants/elastic-qwen38-warm-drop.patch`, the settle
-    /// call removed from the seat): no settle record and no `stat elastic`,
-    /// red on the first and third checks alone.
+    /// call removed from the seat): no settle record, no `stat elastic` and no settle after
+    /// the pass, red on the settle-record, stat and pass checks and on no other. The pass
+    /// checks are FAIL-first too: `.mutants/elastic-qwen38-pass-skip.patch` (the pass
+    /// not run: `ids` 0 against the derived count) and `.mutants/elastic-qwen38-pass-read.patch`
+    /// (the settle taking the reading from before the pass, not its `free`).
     fn elastic_settles(dir: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
         let mut ok = true;
         let own = dir.join("elastic");
@@ -2879,9 +2903,24 @@ mod gate {
             println!("elastic server stopped: {}", served.stop()?);
         }
         let log = seat_log(&err_log)?;
-        let fills = log.all(&record::ELASTIC_FILL)?;
-        let give_backs = log.all(&record::ELASTIC_GIVE_BACK)?;
-        let helds = log.all(&record::ELASTIC_HELD)?;
+        let all_fills = log.all(&record::ELASTIC_FILL)?;
+        let all_give_backs = log.all(&record::ELASTIC_GIVE_BACK)?;
+        // The warm settle's records: a give-back a K/V fit made (site `fit`) or a quiet
+        // boundary's fill is a move of its own, counted by the stat but not the settle.
+        let at_warm = |site: Result<&str, _>| matches!(site, Ok("warm"));
+        let fills: Vec<_> = all_fills
+            .iter()
+            .filter(|f| at_warm(f.word("site")))
+            .collect();
+        let give_backs: Vec<_> = all_give_backs
+            .iter()
+            .filter(|g| at_warm(g.word("site")))
+            .collect();
+        let helds: Vec<_> = log
+            .all(&record::ELASTIC_HELD)?
+            .into_iter()
+            .filter(|h| at_warm(h.word("site")))
+            .collect();
         let settles = fills.len() + give_backs.len() + helds.len();
         for line in [
             record_line(&err_log, "elastic fill")?,
@@ -2912,18 +2951,19 @@ mod gate {
             _ => false,
         };
         check(&mut ok, ELASTIC_AGREES, agrees);
-        let stat = log.first(&record::STAT_ELASTIC)?;
+        // The last `stat elastic` counts every move the log holds, whatever its site.
+        let stat = log.all(&record::STAT_ELASTIC)?.pop();
         let counted = match &stat {
             Some(st) => {
-                st.u64("fills")? == fills.len() as u64
-                    && st.u64("give_backs")? == give_backs.len() as u64
+                st.u64("fills")? == all_fills.len() as u64
+                    && st.u64("give_backs")? == all_give_backs.len() as u64
                     && st.u64("fill_bytes")?
-                        == fills
+                        == all_fills
                             .iter()
                             .map(|f| f.u64("bytes"))
                             .sum::<Result<u64, _>>()?
                     && st.u64("give_back_bytes")?
-                        == give_backs
+                        == all_give_backs
                             .iter()
                             .map(|g| g.u64("freed"))
                             .sum::<Result<u64, _>>()?
@@ -2932,6 +2972,406 @@ mod gate {
         };
         check(&mut ok, ELASTIC_STAT, counted);
         check(&mut ok, ELASTIC_SERVES, served_ok);
+        // The warm-up's pass: one record, a prompt of ids, the bytes it left taken the
+        // difference of the two readings, and the settle takes the reading after it — a fill's
+        // free bytes are the pass's (the tie a settle that read before the pass breaks).
+        let warms = log.all(&record::ELASTIC_WARM)?;
+        let passed = match (warms.as_slice(), fills.first(), give_backs.first()) {
+            ([w], fill, give) => {
+                let (before, free) = (w.u64("free_before")?, w.u64("free")?);
+                let settle_reads = match (fill, give) {
+                    (Some(f), _) => f.u64("free")? == free,
+                    // A give-back or a hold prints no reading to tie to the pass's; only
+                    // that the settle ran.
+                    (None, Some(_)) => true,
+                    (None, None) => !helds.is_empty(),
+                };
+                for line in record_line(&err_log, "elastic warm")?.into_iter() {
+                    println!("elastic: {line}");
+                }
+                let want = w
+                    .u64("ubatch")?
+                    .min(w.u64("ctx")?.saturating_sub(16))
+                    .max(1);
+                println!(
+                    "elastic: the pass ran {} ids, derived {want}",
+                    w.u64("ids")?
+                );
+                w.u64("ids")? == want
+                    && w.u64("pass_bytes")? == before.saturating_sub(free)
+                    && settle_reads
+            }
+            _ => false,
+        };
+        check(&mut ok, ELASTIC_PASS, passed);
+        Ok(ok)
+    }
+
+    /// The server of an elastic clause: [`RESIDENCY_WORD`], the draft off, `BLOOMERY_ELASTIC`
+    /// `elastic`, on the gate card's budget ([`gate_card_budget`]).
+    fn elastic_cmd(levers: &bloomery_levers::Levers, elastic: bool) -> Result<Command, GateError> {
+        let mut cmd = Command::new(Served38::exe()?);
+        cmd.env(bloomery_levers::RESIDENCY, RESIDENCY_WORD)
+            .env(bloomery_levers::ELASTIC, if elastic { "on" } else { "off" })
+            .env(bloomery_levers::DRAFT, "off")
+            .env_remove(bloomery_levers::NVTIER_BYTES)
+            .env_remove(bloomery_levers::MTP_HEAD_ROWS)
+            .env_remove(bloomery_levers::MTP_DRAFT)
+            .env_remove(bloomery_levers::MTP_WIDTH);
+        gate_card_budget(&mut cmd, levers)?;
+        Ok(cmd)
+    }
+
+    /// The card budget `cmd`'s server will read, in bytes: the one [`gate_card_budget`] set, or
+    /// the inherited one. Refused by name when it is not a plain byte count.
+    fn card_budget_of(cmd: &Command) -> Result<u64, GateError> {
+        let set = cmd
+            .get_envs()
+            .find(|&(k, _)| k == bloomery_levers::CARD_BUDGET)
+            .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+            .or_else(|| std::env::var(bloomery_levers::CARD_BUDGET).ok());
+        set.as_deref()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .ok_or_else(|| {
+                "the card budget is not a plain byte count: the clause derives a wider one from it"
+                    .into()
+            })
+    }
+
+    /// One greedy `/completion` of `prompt` ids, `n` ids asked: the status and the ids.
+    fn ids_request(
+        url: &dyn Fn(&str) -> String,
+        prompt: &[u32],
+        n: usize,
+    ) -> Result<(u16, Vec<u32>), GateError> {
+        let body = json!({
+            "prompt": prompt, "n_predict": n, "temperature": 0,
+            "return_tokens": true, "cache_prompt": false,
+        });
+        let (st, reply) = curl(&url("/completion"), Some(&body), false)?;
+        let tokens = match st {
+            200 => ids_of(&json_of("/completion", st, &reply)?["tokens"])?,
+            _ => Vec::new(),
+        };
+        Ok((st, tokens))
+    }
+
+    /// `n` greedy requests of [`TURN_B`], one id each, each a reset of the slot (no prompt
+    /// cache): whether every one answered 200.
+    fn small_requests(url: &dyn Fn(&str) -> String, n: usize) -> Result<bool, GateError> {
+        let ids = rendered(url, json!([{ "role": "user", "content": TURN_B }]))?;
+        let mut all = true;
+        for _ in 0..n {
+            let (st, _) = ids_request(url, &ids, 1)?;
+            all &= st == 200;
+        }
+        Ok(all)
+    }
+
+    /// What a server of the fill clause answered and logged.
+    struct FillRun {
+        served: bool,
+        ids: Vec<u32>,
+        log: record::Log,
+    }
+
+    /// A server under `cmd` of [`CHURN_ARGS`] that answers one greedy request of [`TURN_A`] and
+    /// stops: its answer and its log. The request needs [`CHURN_MIN_TOKENS`] ids to count.
+    fn fill_run(dir: &Path, name: &str, mut cmd: Command) -> Result<FillRun, GateError> {
+        let own = dir.join(name);
+        std::fs::create_dir_all(&own)?;
+        let err_log = own.join("server.err");
+        let mut served = Served38::spawn_with(&CHURN_ARGS, &own, &mut cmd)?;
+        println!("{name} server pid {}", served.child.id());
+        let (ok, ids) = match served.address(&err_log, POLLS, POLL) {
+            Ok(addr) => {
+                let url = |p: &str| format!("http://{addr}{p}");
+                let ids = rendered(&url, json!([{ "role": "user", "content": TURN_A }]))?;
+                let (st, tokens) = ids_request(&url, &ids, CHURN_PREDICT)?;
+                println!("{name}: the request: HTTP {st}, {} ids", tokens.len());
+                (st == 200 && tokens.len() >= CHURN_MIN_TOKENS, tokens)
+            }
+            Err(e) => {
+                println!(
+                    "{name}: the server never listened: {e}; it said: {}",
+                    std::fs::read_to_string(&err_log).unwrap_or_default()
+                );
+                (false, Vec::new())
+            }
+        };
+        if served.child.try_wait()?.is_none() {
+            println!("{name} server stopped: {}", served.stop()?);
+        }
+        Ok(FillRun {
+            served: ok,
+            ids,
+            log: seat_log(&err_log)?,
+        })
+    }
+
+    /// The card's picks over a log: the `card` of every `tier census` span (the warm-up prints
+    /// none, so these are the requests').
+    fn card_picks(log: &record::Log) -> Result<u64, GateError> {
+        Ok(log
+            .all(&record::TIER_CENSUS)?
+            .iter()
+            .map(|c| c.u64("card"))
+            .sum::<Result<u64, _>>()?)
+    }
+
+    /// The plan's card experts a server's log names.
+    fn plan_card_experts(log: &record::Log) -> Result<Option<u64>, GateError> {
+        Ok(log
+            .first(&record::PLAN38)?
+            .map(|p| p.u64("card_experts"))
+            .transpose()?)
+    }
+
+    /// The fill clauses' first half (the module header): an elastic server that filled at its
+    /// warm settle is read against two static servers of the same plan, one without the lever
+    /// and one on a budget wider by the filled bytes (so its plan holds the filled experts from
+    /// the start). After the fill the card serves the filled slots: the same prompt's picks
+    /// that hit the card rise over the static plan's, and the ids are the wide static load's —
+    /// the same card path, bit for bit. A warm settle that did not fill (the fixture's card
+    /// decides) cannot show it and is red by name. FAIL-first: the leg's place bound back at
+    /// the live count (`.mutants/elastic-qwen38-reach-live.patch`) reads a filled slot as a
+    /// fault, and the request fails or the ids differ.
+    fn elastic_fill_serves(
+        dir: &Path,
+        levers: &bloomery_levers::Levers,
+    ) -> Result<bool, GateError> {
+        let mut ok = true;
+        let e = fill_run(dir, "elastic-fill", elastic_cmd(levers, true)?)?;
+        let st = fill_run(dir, "elastic-fill-static", elastic_cmd(levers, false)?)?;
+        let fill = e
+            .log
+            .all(&record::ELASTIC_FILL)?
+            .into_iter()
+            .find(|f| matches!(f.word("site"), Ok("warm")));
+        let Some(fill) = fill else {
+            println!(
+                "elastic-fill: the warm settle did not fill ({}); a fill is what the clause reads",
+                record_line(
+                    &dir.join("elastic-fill").join("server.err"),
+                    "elastic give-back"
+                )?
+                .or(record_line(
+                    &dir.join("elastic-fill").join("server.err"),
+                    "elastic held"
+                )?)
+                .unwrap_or_else(|| "no settle record".to_owned())
+            );
+            check(&mut ok, ELASTIC_FILL_ROUTED, false);
+            check(&mut ok, ELASTIC_FILL_EQUAL, false);
+            return Ok(ok);
+        };
+        let (hits_elastic, hits_static) = (card_picks(&e.log)?, card_picks(&st.log)?);
+        println!(
+            "elastic-fill: filled {} slots a layer over {} layers ({} B); card picks over the \
+             prompt: {hits_elastic} elastic, {hits_static} static",
+            fill.u64("slots")?,
+            fill.u64("layers")?,
+            fill.u64("bytes")?
+        );
+        check(
+            &mut ok,
+            ELASTIC_FILL_ROUTED,
+            e.served && st.served && hits_elastic > hits_static,
+        );
+        let mut wide = elastic_cmd(levers, false)?;
+        let widened = card_budget_of(&wide)?.saturating_add(fill.u64("bytes")?);
+        wide.env(bloomery_levers::CARD_BUDGET, widened.to_string());
+        let t = fill_run(dir, "elastic-fill-wide", wide)?;
+        let (have, want) = (
+            plan_card_experts(&t.log)?,
+            plan_card_experts(&e.log)?
+                .map(|n| n + fill.u64("slots").unwrap_or(0) * fill.u64("layers").unwrap_or(0)),
+        );
+        println!(
+            "elastic-fill: the wide static plan holds {have:?} card experts; the elastic plan \
+             plus its fill {want:?}"
+        );
+        check(
+            &mut ok,
+            ELASTIC_FILL_EQUAL,
+            e.served && t.served && have.is_some() && have == want && e.ids == t.ids,
+        );
+        Ok(ok)
+    }
+
+    /// The context of the refill clause's server, in positions: wide enough that a prompt can
+    /// outgrow the free bytes the warm settle leaves.
+    const REFILL_CTX: usize = 65_536;
+    /// The card bytes one position's K/V takes on a Qwen3.8 slot [derived, kvcommon §4.1:
+    /// 48 pages of 2 MiB every 4 096 positions].
+    const KV_BYTES_PER_POSITION: u64 = 48 * 2 * 1024 * 1024 / 4096;
+    /// Requests of the refill clause before its long prompt, and the most after it: the hold
+    /// counts quiet boundaries, so the clause sends small requests (each a reset) until a
+    /// fill shows or the hold has passed three times over.
+    const REFILL_BEFORE: usize = 20;
+
+    /// The `elastic give-back` records a log holds at site `fit` (a K/V fit short of bytes).
+    fn fit_give_backs(log: &record::Log) -> Result<usize, GateError> {
+        Ok(log
+            .all(&record::ELASTIC_GIVE_BACK)?
+            .into_iter()
+            .filter(|g| matches!(g.word("site"), Ok("fit")))
+            .count())
+    }
+
+    /// The fill clauses' second half (the module header): serving fills back. An elastic server
+    /// is first driven past the warm-up's clocks with small requests, then handed a prompt
+    /// whose K/V outgrows the free bytes the warm settle left (derived from its records: the
+    /// free bytes less the margin, over [`KV_BYTES_PER_POSITION`], and one more page step), so
+    /// a K/V fit gives expert slots back (`elastic give-back` at site `fit`). Small requests
+    /// follow, each a reset: the K/V pages return, and once the hold after the give-back
+    /// (`FILL_HOLD` quiet boundaries on the clock `stat elastic` prints) is over the next quiet
+    /// boundary fills at site `quiet`. The clause holds that fill to the hold from the clocks
+    /// the records print, and the server to answering throughout. FAIL-first: the K/V fit's
+    /// give-back stamping no hold (`.mutants/elastic-qwen38-hold-drop.patch`) fills before the
+    /// hold; the quiet boundary doing nothing (`.mutants/elastic-qwen38-quiet-drop.patch`)
+    /// never fills.
+    fn elastic_refills(dir: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
+        use model::placement::elastic::FILL_HOLD;
+        let mut ok = true;
+        let own = dir.join("elastic-refill");
+        std::fs::create_dir_all(&own)?;
+        let err_log = own.join("server.err");
+        let ctx = REFILL_CTX.to_string();
+        let args = [
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--parallel",
+            "1",
+            "--cache-ram",
+            "0",
+            "--ctx-size",
+            ctx.as_str(),
+        ];
+        let mut cmd = elastic_cmd(levers, true)?;
+        let mut served = Served38::spawn_with(&args, &own, &mut cmd)?;
+        println!("elastic-refill server pid {}", served.child.id());
+        let mut all_200 = true;
+        let quiet_fills = |err_log: &Path| -> Result<Vec<record::Fields>, GateError> {
+            Ok(seat_log(err_log)?
+                .all(&record::ELASTIC_FILL)?
+                .into_iter()
+                .filter(|f| matches!(f.word("site"), Ok("quiet")))
+                .collect())
+        };
+        let mut waited = false;
+        // Quiet fills and fit give-backs the log held before the long prompt: the clause reads
+        // only what comes after it.
+        let (mut fills_before, mut fits_before, mut gb_before) = (0usize, 0usize, 0u64);
+        match served.address(&err_log, POLLS, POLL) {
+            Ok(addr) => {
+                let url = |p: &str| format!("http://{addr}{p}");
+                all_200 &= small_requests(&url, REFILL_BEFORE)?;
+                let log = seat_log(&err_log)?;
+                fills_before = quiet_fills(&err_log)?.len();
+                fits_before = fit_give_backs(&log)?;
+                gb_before = log
+                    .all(&record::STAT_ELASTIC)?
+                    .last()
+                    .map_or(Ok(0), |s| s.u64("give_backs"))?;
+                let warm = log.one(&record::ELASTIC_WARM)?;
+                let settled = log
+                    .all(&record::ELASTIC_FILL)?
+                    .iter()
+                    .find(|f| matches!(f.word("site"), Ok("warm")))
+                    .map(|f| Ok::<_, GateError>(f.u64("free")?.saturating_sub(f.u64("bytes")?)))
+                    .transpose()?;
+                let (margin, free_after) =
+                    (warm.u64("margin")?, settled.unwrap_or(warm.u64("free")?));
+                let page_step = 4096u64;
+                let need = (free_after.saturating_sub(margin) / KV_BYTES_PER_POSITION)
+                    .div_ceil(page_step)
+                    * page_step
+                    + 2 * page_step;
+                println!(
+                    "elastic-refill: {free_after} B free after the warm settle, margin {margin} B: \
+                     a prompt of {need} positions outgrows it (ctx {REFILL_CTX})"
+                );
+                if need as usize + 64 > REFILL_CTX {
+                    println!(
+                        "elastic-refill: the context cannot outgrow the free bytes; raise \
+                         REFILL_CTX"
+                    );
+                    all_200 = false;
+                } else {
+                    let long: Vec<u32> = (0..need as u32).map(|i| 1000 + i % 5000).collect();
+                    let (st, _) = ids_request(&url, &long, 1)?;
+                    println!("elastic-refill: the long prompt: HTTP {st}");
+                    all_200 &= st == 200;
+                    // Quiet boundaries until the fill shows: three holds at most.
+                    for _ in 0..3 * FILL_HOLD {
+                        all_200 &= small_requests(&url, 1)?;
+                        if quiet_fills(&err_log)?.len() > fills_before {
+                            break;
+                        }
+                    }
+                    waited = true;
+                }
+            }
+            Err(e) => {
+                println!(
+                    "elastic-refill: the server never listened: {e}; it said: {}",
+                    std::fs::read_to_string(&err_log).unwrap_or_default()
+                );
+                all_200 = false;
+            }
+        }
+        if served.child.try_wait()?.is_none() {
+            println!("elastic-refill server stopped: {}", served.stop()?);
+        }
+        let log = seat_log(&err_log)?;
+        let fits = fit_give_backs(&log)?.saturating_sub(fits_before);
+        let fills: Vec<_> = quiet_fills(&err_log)?
+            .into_iter()
+            .skip(fills_before)
+            .collect();
+        let stats = log.all(&record::STAT_ELASTIC)?;
+        // The clock when the first fit give-back was printed: the first `stat elastic` that
+        // counts more give-backs than the log held before the long prompt.
+        let printed_at = stats
+            .iter()
+            .find(|s| s.u64("give_backs").is_ok_and(|n| n > gb_before))
+            .map(|s| s.u64("boundary"))
+            .transpose()?;
+        let filled_at = fills.first().map(|f| f.u64("boundary")).transpose()?;
+        for line in [
+            record_line(&err_log, "elastic give-back")?,
+            record_line(&err_log, "elastic fill")?,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            println!("elastic-refill: {line}");
+        }
+        println!(
+            "elastic-refill: {fits} fit give-backs, printed at boundary {printed_at:?}; quiet \
+             fill at boundary {filled_at:?}"
+        );
+        check(&mut ok, ELASTIC_FIT_RECORDED, waited && fits >= 1);
+        check(
+            &mut ok,
+            ELASTIC_REFILL_WAITS,
+            match (printed_at, filled_at) {
+                // The give-back stamped the boundary before the tick that printed it.
+                (Some(p), Some(f)) => f + 1 >= p + FILL_HOLD,
+                _ => false,
+            },
+        );
+        check(
+            &mut ok,
+            ELASTIC_REFILLS,
+            fills
+                .first()
+                .is_some_and(|f| f.u64("slots").is_ok_and(|n| n >= 1)),
+        );
+        check(&mut ok, ELASTIC_REFILL_SERVES, all_200);
         Ok(ok)
     }
 
@@ -5466,6 +5906,10 @@ mod gate {
         // The elastic expert stacks (the module header): its own server
         // under the residency word and `BLOOMERY_ELASTIC=on`.
         ok &= elastic_settles(dir, levers)?;
+        // A fill is served by the card, and serving fills back after a give-back (the module
+        // header): their own servers.
+        ok &= elastic_fill_serves(dir, levers)?;
+        ok &= elastic_refills(dir, levers)?;
         // The width chooser's server (the module header): the draft on, the
         // residency off, `BLOOMERY_MTP_WIDTH=cost`.
         ok &= width_cost(dir, prompt)?;

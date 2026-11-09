@@ -197,6 +197,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use ::model::placement::elastic::seed_tail;
 use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer, sys};
 use runtime::swaprule::{Flip, KeptRows, Shape, SwapParams, SwapRule};
 
@@ -1959,6 +1960,9 @@ struct Layout {
     /// Per layer, the slots past the live experts the stacks are reserved
     /// for: withdrawn until a fill restores them.
     withdrawn: Vec<usize>,
+    /// Per layer, the experts the seed list ranks past the live ones so a fill can grow the
+    /// rule's card set bound ([`seed_tail`]); empty where nothing is withdrawn.
+    tail: Vec<Vec<u32>>,
 }
 
 /// A flip live at a boundary as the ledger holds it.
@@ -2271,6 +2275,7 @@ impl SwapMachine {
             pinned: Vec::with_capacity(layers.len()),
             freed: Vec::new(),
             withdrawn: Vec::with_capacity(layers.len()),
+            tail: Vec::with_capacity(layers.len()),
         };
         for (i, l) in layers.enumerate() {
             let (cap, live) = (slots.capacity(l)?, slots.on_card(l)?);
@@ -2301,6 +2306,8 @@ impl SwapMachine {
                 ));
             }
             order.truncate(live);
+            out.tail
+                .push(seed_tail(n_expert, &order, &tier, cap - live));
             out.tier.push(tier);
             out.withdrawn.push(cap - live);
             if live == 0 {
@@ -2335,7 +2342,15 @@ impl SwapMachine {
         n_expert: usize,
         unrouted: &[usize],
     ) -> Result<SwapRule, GpuError> {
-        let seed: Vec<&[u32]> = layout.order.iter().map(Vec::as_slice).collect();
+        // The seed lists past the live experts hold the ranks a fill's slots take; the card
+        // set stays the first `capacity` of them.
+        let ranked: Vec<Vec<u32>> = layout
+            .order
+            .iter()
+            .zip(&layout.tail)
+            .map(|(o, t)| o.iter().chain(t).copied().collect())
+            .collect();
+        let seed: Vec<&[u32]> = ranked.iter().map(Vec::as_slice).collect();
         let away: Vec<&[u32]> = layout.tier.iter().map(Vec::as_slice).collect();
         let capacity: Vec<usize> = layout
             .order
@@ -3886,6 +3901,18 @@ impl SwapMachine {
     pub fn quantum(&self) -> Option<(u64, u64)> {
         let layers = self.held_layers().len();
         (layers > 0).then(|| (layers as u64, self.shared.ring.slot_bytes() as u64))
+    }
+
+    /// The withdrawn slots a fill could restore on every machine layer: the fewest
+    /// over the layers that hold stage stacks, 0 when none does
+    /// ([`SwapMachine::fill_bytes`] restores the same `k` on each).
+    #[must_use]
+    pub fn withdrawn_slots(&self) -> usize {
+        self.held_layers()
+            .iter()
+            .map(|&l| self.ledger.withdrawn(l))
+            .min()
+            .unwrap_or(0)
     }
 
     /// The withdrawn slots the card's free bytes can take back: the same

@@ -1,0 +1,11 @@
+--- a/crates/gpu-gates/src/bin/shared/serve_seats/qwen38.rs
++++ b/crates/gpu-gates/src/bin/shared/serve_seats/qwen38.rs
+@@ -3230,7 +3230,7 @@
+             print_move(&e);
+         }
+         let fills = body.elastic_stats().fills;
+-        settle_elastic(body, terms, "warm", free)?;
++        settle_elastic(body, terms, "warm", before)?;
+         // The slots a fill backed hold nothing until an expert lands in them: the residency
+         // back to its seed, which the fill grew, puts the seed's next experts there, so the
+         // first request finds the card filled.

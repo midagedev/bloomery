@@ -9,14 +9,115 @@
 //! smallest give-back, and the unit a fill is counted in. A fill never takes
 //! the last [`FILL_KEEP_QUANTA`] quanta above the margin, so a request's page
 //! growth within them never evicts what was just filled, and a fill waits
-//! [`FILL_HOLD`] boundaries after a give-back before it runs, so a card that
+//! [`FILL_HOLD`] quiet boundaries (a sequence's end) after a give-back before it runs, so a card that
 //! oscillates between the two settles instead of thrashing.
 
 /// Quanta of free bytes above the margin a fill leaves untouched.
 pub const FILL_KEEP_QUANTA: u64 = 2;
 
-/// Residency boundaries after a give-back before a fill may run.
+/// Quiet boundaries (a sequence's end) after a give-back before a fill may run.
 pub const FILL_HOLD: u64 = 16;
+
+/// Quiet boundaries between two looks at the card for a fill: a settle at
+/// boundary `b` is followed by the next look at `b + FILL_HOLD` at the
+/// earliest, so a request-by-request server reads the card once per hold and
+/// not at every request's end.
+pub const FILL_LOOK: u64 = FILL_HOLD;
+
+/// The tenant's moves since the load, and the boundary clock its hold counts
+/// in: a *quiet boundary* is a sequence's end (the seat ticks it,
+/// [`ElasticStats::tick`]), where the K/V rooms have given their pages past
+/// the floor back and no allocation is in flight. Every give-back, whoever
+/// ran it (a settle, a retried allocation, a K/V fit), stamps the clock
+/// through [`ElasticStats::gave_back`], so the fill's hold has one owner.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ElasticStats {
+    pub give_backs: u64,
+    pub give_back_bytes: u64,
+    pub fills: u64,
+    pub fill_bytes: u64,
+    /// Quiet boundaries since the load.
+    pub boundary: u64,
+    /// The boundary the last give-back ran at, for the fill's hold.
+    pub last_give_back: Option<u64>,
+    /// The boundary the card was last read for a settle at.
+    pub last_settle: Option<u64>,
+}
+
+impl ElasticStats {
+    /// A quiet boundary passed; the new boundary.
+    pub fn tick(&mut self) -> u64 {
+        self.boundary = self.boundary.saturating_add(1);
+        self.boundary
+    }
+
+    /// A give-back of `bytes` ran now.
+    pub fn gave_back(&mut self, bytes: u64) {
+        self.give_backs += 1;
+        self.give_back_bytes = self.give_back_bytes.saturating_add(bytes);
+        self.last_give_back = Some(self.boundary);
+    }
+
+    /// A fill that backed `bytes` ran now.
+    pub fn filled(&mut self, bytes: u64) {
+        self.fills += 1;
+        self.fill_bytes = self.fill_bytes.saturating_add(bytes);
+    }
+
+    /// The card was read for a settle now.
+    pub fn settled(&mut self) {
+        self.last_settle = Some(self.boundary);
+    }
+
+    /// Whether a quiet boundary should read the card for a fill: a layer has
+    /// a `withdrawn` slot to fill, the hold after the last give-back is over
+    /// ([`fill_allowed`]) and the card was not read within [`FILL_LOOK`]
+    /// boundaries. False costs nothing: no stream sync, no card read.
+    #[must_use]
+    pub fn fill_due(&self, withdrawn: usize) -> bool {
+        withdrawn > 0
+            && fill_allowed(self.boundary, self.last_give_back)
+            && self
+                .last_settle
+                .is_none_or(|at| self.boundary.saturating_sub(at) >= FILL_LOOK)
+    }
+}
+
+/// The place bound the card kernels read for a layer whose stacks hold
+/// `slots` slots and whose map has `live` experts on the card: the stacks'
+/// slots, not the live count. The live count moves with a give-back, a fill
+/// and every promotion into a spare slot, while a captured step holds the
+/// bound as a launch argument and a route table is sized by it; the slots
+/// are fixed at the load, every place the map can name is below them, and a
+/// slot no expert holds is named by no place. `None` when the stacks hold
+/// fewer slots than the live experts (a load the leg refuses by name).
+#[must_use]
+pub fn reach(live: usize, slots: usize) -> Option<usize> {
+    (slots >= live).then_some(slots)
+}
+
+/// The experts a layer's seed list ranks past its live experts, so the rule's card set bound can
+/// grow with a fill (`SwapRule::give` refuses a bound past the experts the seed ranks): every
+/// expert of the layer's `n_expert` that is neither one of the `live` experts the seed names nor
+/// on a tier card (`tier`), in id order. A fill's slots take them after the seed's own, so the
+/// first request sees a filled card, and the residency's heat reorders them from there. Empty
+/// when nothing is reserved past the live experts, so a load that reserves nothing keeps its
+/// seed list as it is.
+#[must_use]
+pub fn seed_tail(n_expert: usize, live: &[u32], tier: &[u32], reserved: usize) -> Vec<u32> {
+    if reserved == 0 {
+        return Vec::new();
+    }
+    let mut named = vec![false; n_expert];
+    for &id in live.iter().chain(tier) {
+        if let Some(n) = named.get_mut(id as usize) {
+            *n = true;
+        }
+    }
+    (0..n_expert as u32)
+        .filter(|&id| !named[id as usize])
+        .collect()
+}
 
 /// One slot on each of `layers` layers: `layers × slot_bytes`, saturating.
 #[must_use]
@@ -162,5 +263,96 @@ mod tests {
         assert!(!fill_allowed(10, Some(10)));
         assert!(!fill_allowed(10 + FILL_HOLD - 1, Some(10)));
         assert!(fill_allowed(10 + FILL_HOLD, Some(10)));
+    }
+
+    /// The place bound is the stacks' slots whatever the live count does: after
+    /// a fill and the promotions into the filled slots (live 94 → 117 of 117
+    /// slots) every place a map can name is below it, and after a give-back
+    /// (live 94 → 70) it does not move, so a captured step's argument and a
+    /// route table sized by it stay right. Stacks with fewer slots than live
+    /// experts have no bound.
+    ///
+    /// FAIL-first: a `reach` that returns the live count reds the first loop
+    /// at live 70 (it reads 70, not 117).
+    #[test]
+    fn the_place_bound_is_the_slots_and_covers_every_filled_place() {
+        let slots = 117;
+        for live in [70, 94, 100, 117] {
+            assert_eq!(reach(live, slots), Some(slots), "live {live}");
+        }
+        let live = 94;
+        for filled in 0..=(slots - live) {
+            let highest = live + filled - 1;
+            assert!(highest < reach(live, slots).unwrap(), "{filled} filled");
+        }
+        assert_eq!(reach(118, 117), None);
+        assert_eq!(reach(0, 0), Some(0));
+    }
+
+    /// The seed list past the live experts names the experts a fill's slots take: none when
+    /// nothing is reserved, else every expert neither live nor on a tier card, in id order.
+    ///
+    /// FAIL-first: a `seed_tail` that forgets the tier experts lists 3 and the rule refuses
+    /// it (an away expert in the seed); one that returns nothing leaves the rule unable to
+    /// fill past its spares, which the runtime's seed test shows.
+    #[test]
+    fn the_seed_tail_is_every_expert_neither_live_nor_on_a_tier_card() {
+        assert_eq!(seed_tail(8, &[5, 0, 2], &[3], 4), [1, 4, 6, 7]);
+        assert!(seed_tail(8, &[5, 0, 2], &[3], 0).is_empty());
+        assert_eq!(seed_tail(3, &[0, 1, 2], &[], 2), Vec::<u32>::new());
+    }
+
+    /// A give-back starts the fill's hold whoever ran it, on the quiet-boundary
+    /// clock: the fill is due [`FILL_HOLD`] boundaries after it and not before.
+    /// This is the sequence the serving gate holds: a give-back under K/V
+    /// growth, the K/V shrunk at the sequence's end, quiet boundaries, then
+    /// the fill.
+    ///
+    /// FAIL-first: a `gave_back` that leaves `last_give_back` unset (the
+    /// K/V fit's give-back stamped nothing) makes the first assertion in the
+    /// loop red at boundary 3.
+    #[test]
+    fn a_give_back_holds_the_fill_for_the_hold_on_the_quiet_clock() {
+        let mut s = ElasticStats::default();
+        for _ in 0..3 {
+            s.tick();
+        }
+        s.settled();
+        s.gave_back(4_096);
+        assert_eq!((s.give_backs, s.give_back_bytes), (1, 4_096));
+        assert_eq!(s.last_give_back, Some(3));
+        for _ in 0..FILL_HOLD - 1 {
+            s.tick();
+            assert!(!s.fill_due(5), "boundary {} is inside the hold", s.boundary);
+        }
+        s.tick();
+        assert_eq!(s.boundary, 3 + FILL_HOLD);
+        assert!(s.fill_due(5));
+    }
+
+    /// A quiet boundary reads the card only when a fill could run: nothing
+    /// withdrawn, a look within [`FILL_LOOK`] boundaries before, or the hold
+    /// still on is no read. A fill counts its bytes and a later give-back
+    /// restarts the hold.
+    ///
+    /// FAIL-first: a `fill_due` that ignores `withdrawn` reds the first
+    /// assertion; one that ignores `last_settle` reds the second.
+    #[test]
+    fn a_quiet_boundary_reads_the_card_only_when_a_fill_could_run() {
+        let mut s = ElasticStats::default();
+        assert!(!s.fill_due(0), "nothing withdrawn: nothing to fill");
+        assert!(s.fill_due(1));
+        s.settled();
+        s.tick();
+        assert!(!s.fill_due(1), "the card was read a boundary ago");
+        for _ in 0..FILL_LOOK {
+            s.tick();
+        }
+        assert!(s.fill_due(1));
+        s.filled(1_000);
+        s.filled(24);
+        assert_eq!((s.fills, s.fill_bytes), (2, 1_024));
+        s.gave_back(1);
+        assert!(!s.fill_due(1), "a give-back restarts the hold");
     }
 }
