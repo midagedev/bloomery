@@ -26,10 +26,7 @@ use std::sync::Arc;
 use bloomery_gpu::GpuError;
 use bloomery_gpu::host::PassKind;
 use bloomery_gpu::host::swap::{PassReport, Residency};
-use bloomery_gpu::host::swap_source::{
-    DEADLINE, FileSwap, LIVE_DELAY, ResidencySpec, hosted_stacks,
-};
-use bloomery_levers::ChurnHosting;
+use bloomery_gpu::host::swap_source::{FileSwap, ResidencySpec, hosted_stacks};
 use model::arch::mistrallarge4::place::PlanInputs;
 
 use crate::body::{Body, WHAT};
@@ -49,15 +46,12 @@ pub(crate) fn spec(
     inputs: &PlanInputs,
     routed_layers: usize,
 ) -> Result<ResidencySpec, GpuError> {
-    Ok(ResidencySpec {
+    Ok(ResidencySpec::hosted(
         lever,
-        pool: ChurnHosting::Hosted,
-        delay: LIVE_DELAY,
-        deadline: DEADLINE,
-        top_k: ffn::N_USED,
-        max_rows: MAX_ROWS,
-        stacks: Arc::new(hosted_stacks(&inputs.model, WHAT, (routed_layers, true))?),
-    })
+        ffn::N_USED,
+        MAX_ROWS,
+        Arc::new(hosted_stacks(&inputs.model, WHAT, (routed_layers, true))?),
+    ))
 }
 
 impl Body {
