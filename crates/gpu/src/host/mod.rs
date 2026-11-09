@@ -1633,12 +1633,13 @@ impl<H: HostExperts> HostTier<H> {
         m.return_pump(&self.slots, |_| port.routed_landed(key))
     }
 
-    /// Whether the residency machine's rule holds any decode history
-    /// ([`swap::SwapMachine::has_history`]): what a prompt call's end reads
-    /// to keep its placement only when the decode has none of its own.
-    /// False without a machine.
-    pub fn call_history(&self) -> bool {
-        self.swap.as_ref().is_some_and(|m| m.has_history())
+    /// Whether a prompt call that starts at position `start` returns its
+    /// placement at its end ([`swap::SwapMachine::call_history`]); read once,
+    /// at the call's start. A call at 0 begins a sequence and keeps its pick
+    /// whatever another sequence's decode left in the rule. False without a
+    /// machine.
+    pub fn call_history(&mut self, start: u32) -> bool {
+        self.swap.as_mut().is_some_and(|m| m.call_history(start))
     }
 
     /// End the open call ([`swap::SwapMachine::end_call`]), its placement

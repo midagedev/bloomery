@@ -1670,8 +1670,8 @@ impl GpuModel<Body> {
 
     /// `run`, a prompt call of `n` ids from the model's position, inside the
     /// call's host streaming ([`Body::stream_begin`], [`Body::stream_end`]):
-    /// before a decode history the call returns each layer to the set it
-    /// started with, else its placement stays. The call's own error first:
+    /// a call that continues a sequence holding decode heat returns each layer
+    /// to the set it started with, a call at position 0 keeps its placement. The call's own error first:
     /// an end refused after a failed call is its echo. Nothing more on a
     /// whole-card load or while the lever is off.
     fn streamed<T>(
@@ -1679,11 +1679,12 @@ impl GpuModel<Body> {
         n: usize,
         run: impl FnOnce(&mut GpuModel<Body>) -> Result<T, GpuError>,
     ) -> Result<T, GpuError> {
-        let end = self.pos() as usize + n;
+        let start = self.pos();
+        let end = start as usize + n;
         let history = {
             let (gpu, _, body) = self.body_parts(WHAT)?;
             // Read once: the call keeps no row, so the history does not move until its end.
-            let history = body.call_history();
+            let history = body.call_history(start);
             body.stream_begin(gpu.stream(), n, end, history)?;
             history
         };

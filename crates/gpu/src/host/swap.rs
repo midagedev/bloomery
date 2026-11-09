@@ -4260,11 +4260,11 @@ impl SwapMachine {
         self.agree(layer, slots, WHAT)
     }
 
-    /// Whether the rule holds any decode history ([`SwapRule::has_history`]):
-    /// what a caller reads to keep a call's placement only when the decode
-    /// has none of its own.
-    pub fn has_history(&self) -> bool {
-        self.rule.has_history()
+    /// Whether a prompt call starting at position `start` returns its
+    /// placement at its end ([`SwapRule::call_history`]); a call at 0 clears
+    /// the rule's heat first, the placement as it is.
+    pub fn call_history(&mut self, start: u32) -> bool {
+        self.rule.call_history(start)
     }
 
     /// End the open call on the engine stream `stream` with the host map

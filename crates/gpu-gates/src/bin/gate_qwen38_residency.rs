@@ -83,6 +83,11 @@
 //!   the first step's after it are the twin's bit for bit (mutants: the end
 //!   keeps before a history too; the end always restores; the walk's return
 //!   asked before the layer's serve, refused by name).
+//! - `newseq`: a call that starts a sequence (position 0, the model's
+//!   `reset` and no residency reset) after another request's decode keeps its
+//!   placement as a fresh server's does: the end keeps, restores none and
+//!   admitted experts (mutant: the end restores whenever the rule holds heat,
+//!   whatever the call's position).
 //! - `split` (the expert stream, `Body38::set_xstream`'s `split`, its rule
 //!   at the gate's [`SPLIT_COSTS`]: a host column dear enough that the
 //!   balance streams nearly every routed host expert the pick leaves, so the
@@ -1060,6 +1065,48 @@ mod gate {
             twin.end.restored,
             end.return_us,
             twin.end.return_us,
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// `newseq`: a second request after a first request's decode keeps its
+    /// pick. The first request is a 64-id prompt and eight greedy steps (the
+    /// rule holds its heat); the second starts at position 0 without a
+    /// residency reset (the model's `reset`, as a server's `cut(0)`), one
+    /// `stream` call: its end keeps the placement (kept, nothing restored,
+    /// experts admitted) and the rule holds no heat from the first request
+    /// when the call begins (mutant: `SwapRule::call_history` ignores the
+    /// call's position,
+    /// `.mutants/callkeep-history-ignores-pos.patch`: the end restores).
+    fn newseq_clause(s: &mut Session<Body38>) -> Result<bool, GateError> {
+        let ids = prose_ids("qwen4exp", STREAM_PROMPT)?;
+        let warm = prose_ids("qwen4exp", 64)?;
+        s.clear()?;
+        take_passes(s)?;
+        set_stream(s, XMode::Off)?;
+        let mut next = s.prompt(&warm, Want::Argmax)?.argmax();
+        for _ in 0..8 {
+            next = s.step(next, Want::Argmax)?.argmax();
+        }
+        take_passes(s)?;
+        let heated = rule_of(s)?.has_history();
+        s.model_mut().reset()?;
+        set_stream(s, XMode::Admit)?;
+        s.prompt(&ids, Want::Argmax)?;
+        let (_, end) = s.model_mut().body_parts(NAME)?.2.take_stream_records();
+        s.model_mut().body_parts(NAME)?.2.take_xstream_records();
+        take_passes(s)?;
+        set_stream(s, XMode::Off)?;
+        let end = end.ok_or("the second request's prompt opened no call")?;
+        record::call_report(&end).print();
+        let ok = heated && end.kept && end.restored == 0 && end.admitted > 0;
+        println!(
+            "newseq: a pos-0 call after another request's 8 greedy steps (the rule held heat \
+             {heated}): kept {}, restored {}, admitted {}: {}",
+            end.kept,
+            end.restored,
+            end.admitted,
             verdict(ok)
         );
         Ok(ok)
@@ -2216,6 +2263,7 @@ mod gate {
 
         pass &= stream_clause(&mut s)?;
         pass &= history_clause(&mut s)?;
+        pass &= newseq_clause(&mut s)?;
         pass &= split_clause(&mut s)?;
         pass &= history_split_clause(&mut s)?;
         pass &= units_clause(&mut s)?;

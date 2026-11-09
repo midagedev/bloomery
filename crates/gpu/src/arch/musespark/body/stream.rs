@@ -201,12 +201,12 @@ impl Body {
         }
     }
 
-    /// Whether the residency machine's rule holds a decode history ([`crate::host::HostTier::call_history`]): a
-    /// prompt call then returns its placement at its end. False on a whole-card load.
-    pub(super) fn call_history(&self) -> bool {
+    /// Whether a prompt call at position `start` returns its placement at its end
+    /// ([`crate::host::HostTier::call_history`]). False on a whole-card load.
+    pub(super) fn call_history(&mut self, start: u32) -> bool {
         self.placed
-            .as_ref()
-            .is_some_and(|p| p.hybrid.call_history())
+            .as_mut()
+            .is_some_and(|p| p.hybrid.call_history(start))
     }
 }
 

@@ -2496,14 +2496,18 @@ impl GpuModel<Body35> {
             body.prompt_walks = 0;
         }
         let (marks, keep, fold) = self.call_marks(tokens.len(), path, end)?;
-        // A call before a decode history ends with each layer back at the
-        // set it started with; without one (a fresh sequence) the call's
-        // placement stays. Read once, here: the call keeps no row.
+        // A call that continues a sequence holding decode heat ends with each
+        // layer back at the set it started with; a call at position 0 clears
+        // that heat and its placement stays
+        // ([`crate::host::HostTier::call_history`]). Read once, here: the
+        // call keeps no row.
+        let start = self.pos();
         let history = self
-            .body(WHAT_P)?
+            .body_parts(WHAT_P)?
+            .2
             .placed
-            .as_ref()
-            .is_some_and(|p| p.hybrid.call_history());
+            .as_mut()
+            .is_some_and(|p| p.hybrid.call_history(start));
         let r = self
             .stream_begin(path, tokens.len(), history)
             .and_then(|()| self.feed_marks(tokens, path, (&marks, keep, fold), unit, end.head()));

@@ -1,0 +1,19 @@
+# callkeep mutant history-ignores-pos
+# clause: unit test a_call_at_position_zero_keeps_its_pick_past_another_sequences_heat
+#   (crates/runtime/src/swaprule.rs) and the gate-gpu-qwen38-residency clause `newseq`
+# site: crates/runtime/src/swaprule.rs SwapRule::call_history, the position-0 clear gone
+#   (the pre-change rule: any heat ever is history, a second request's call returns its pick)
+# expected red: "a_call_at_position_zero_keeps_its_pick_past_another_sequences_heat ... FAILED"
+#   ("a second sequence's call keeps"); the gate: "newseq: ... kept false, restored N ...: FAIL"
+--- a/crates/runtime/src/swaprule.rs
++++ b/crates/runtime/src/swaprule.rs
+@@ -1797,9 +1797,6 @@
+     /// call past 0 continues a sequence whose decode routing is its own, so
+     /// the call returns its pick when the rule holds any heat.
+     pub fn call_history(&mut self, start: u32) -> bool {
+-        if start == 0 {
+-            self.clear_heat();
+-        }
+         self.has_history()
+     }
+ 

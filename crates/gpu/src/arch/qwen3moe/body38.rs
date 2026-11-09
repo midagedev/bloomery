@@ -4716,16 +4716,18 @@ impl GpuModel<Body38> {
         head: bool,
     ) -> Result<u32, GpuError> {
         const WHAT_P: &str = "qwen4exp prompt";
-        // A successful call before a decode history ends with each layer
-        // back at the set it started with: the decode has been routing
-        // experts of its own, and the call's picks — the prompt's hottest —
-        // put the pool back where they found it rather than leave the decode
-        // to churn back at the flip cap. Without a history (a fresh server)
-        // the call's placement stays, the gain it was run for. The history
-        // is read once, here: the call keeps no row, so it does not move
-        // until the end, and the walk returns each layer in the call's last
-        // unit on it.
-        let history = self.body(WHAT_P)?.hybrid().call_history();
+        // A successful call that continues a sequence holding decode heat
+        // ends with each layer back at the set it started with: that decode
+        // has been routing experts of its own, and the call's picks — the
+        // prompt's hottest — put the pool back where they found it rather
+        // than leave the decode to churn back at the flip cap. A call that
+        // starts a sequence (position 0) has no decode of its own: the heat
+        // is cleared and its placement stays, the gain it was run for
+        // ([`crate::host::HostTier::call_history`]). Read once, here: the
+        // call keeps no row, so it does not move until the end, and the walk
+        // returns each layer in the call's last unit on it.
+        let start = self.pos();
+        let history = self.body_parts(WHAT_P)?.2.hybrid.call_history(start);
         let r = self
             .stream_begin(resolved, tokens.len(), history)
             .and_then(|()| self.feed_marked(tokens, resolved, sink, head));
@@ -4780,8 +4782,8 @@ impl GpuModel<Body38> {
     /// End the prompt call's streaming ([`PromptStream::end`]): the ends'
     /// reports kept for [`Body38::take_stream_records`] and
     /// [`Body38::take_xstream_records`]. [`Body38::prompt38_with`]'s call
-    /// passes `kept` false before a decode history
-    /// ([`crate::host::HostTier::call_history`]): the decode's experts go
+    /// passes `kept` false when it continues a sequence
+    /// holding decode heat ([`crate::host::HostTier::call_history`]): the decode's experts go
     /// back on the card.
     fn stream_end(&mut self, kept: bool) -> Result<(), GpuError> {
         let (gpu, _, body) = self.body_parts("qwen4exp prompt streaming")?;

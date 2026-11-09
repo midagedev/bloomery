@@ -1775,12 +1775,32 @@ impl SwapRule {
     /// which only a kept row's fold writes ([`SwapRule::end_pass`]; a prompt
     /// call's rows are not counted, and its picks move no count), a stream's
     /// prior opens with ([`SwapRule::stream_open`]) and a reset or a stream's
-    /// close clears. What a prompt call's end reads: with history the decode
-    /// has been routing experts of its own, so the call puts the pool back
-    /// where it found it; without one (a fresh server) the call's placement
-    /// stays for the decode.
+    /// close clears.
     pub fn has_history(&self) -> bool {
         (0..self.live.len()).any(|stream| self.holds_rows(stream))
+    }
+
+    /// Zero every stream's heat and the blend, leaving the placement, the
+    /// streams' liveness and expected tokens, and the flips in flight as
+    /// they are: the decode routing of the sequence that ran before is
+    /// forgotten, the pool it shaped is not moved.
+    pub fn clear_heat(&mut self) {
+        self.heat.fill(0.0);
+        self.counts.fill(0.0);
+    }
+
+    /// Whether a prompt call that starts at position `start` ends with its
+    /// placement returned to where it began (true) or kept for the decode
+    /// after it (false): what a call's end reads, once, at its start. A call
+    /// at position 0 begins a sequence, and the heat the rule holds is
+    /// another sequence's, so it is cleared and the call keeps its pick; a
+    /// call past 0 continues a sequence whose decode routing is its own, so
+    /// the call returns its pick when the rule holds any heat.
+    pub fn call_history(&mut self, start: u32) -> bool {
+        if start == 0 {
+            self.clear_heat();
+        }
+        self.has_history()
     }
 
     /// Back to the seed: every layer's card set, its away experts away, no
@@ -3147,6 +3167,27 @@ mod tests {
         assert!(r.has_history(), "one kept row is history");
         r.reset();
         assert!(!r.has_history(), "a reset clears the history");
+    }
+
+    /// A call at position 0 begins a sequence: the heat the rule holds is
+    /// another sequence's, so the call keeps its pick (no history) and the
+    /// placement stays as it was; a call past 0 continues one and returns its
+    /// pick while heat is held (mutant: the position ignored, as
+    /// `.mutants/callkeep-history-ignores-pos.patch`).
+    #[test]
+    fn a_call_at_position_zero_keeps_its_pick_past_another_sequences_heat() {
+        let seed: [&[u32]; 1] = [&[0, 1, 2]];
+        let mut r = rule(params(4, 24, 3.0, 2.0, 0.9), 8, 1, &seed);
+        assert!(!r.call_history(0), "a fresh server's first call keeps");
+        r.observe(0, 0, &[1]).unwrap();
+        r.end_pass(KeptRows::prefix(1)).unwrap();
+        assert!(r.has_history(), "a decode left heat");
+        assert!(r.call_history(7), "a call past 0 continues: it returns");
+        assert!(r.has_history(), "and leaves the heat");
+        let placed = r.slot.clone();
+        assert!(!r.call_history(0), "a second sequence's call keeps");
+        assert!(!r.has_history(), "the other sequence's heat is gone");
+        assert_eq!(r.slot, placed, "the placement is not moved");
     }
 
     /// Settled flips move the card set at once and nothing else; a flip

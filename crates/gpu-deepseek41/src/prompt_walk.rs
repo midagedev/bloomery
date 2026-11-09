@@ -606,9 +606,9 @@ impl<R: RouterEntry, A: BatchAttention> Batch<'_, R, A> {
     /// Refused by name before anything runs: for no id and past the stores' positions. With the taps
     /// armed, each layer's output at the call's last position is copied to its tap. Under host
     /// streaming the groups run inside the call's streaming ([`PromptStream::begin`] and
-    /// [`PromptStream::end`]): before a decode history the call returns each layer to the set it
-    /// started with, else its placement stays. The media rows set for the call ([`BatchBufs::set_media`])
-    /// are taken here whatever the call returns; refused by name before anything runs: rows set for
+    /// [`PromptStream::end`]): a call that continues a sequence holding decode heat returns each layer to
+    /// the set it started with, a call at position 0 keeps its placement (`HostTier::call_history`). The media rows set for the call
+    /// ([`BatchBufs::set_media`]) are taken here whatever the call returns; refused by name before anything runs: rows set for
     /// another first position or width than the call's, or a span past its end, and after it a call
     /// that staged fewer rows than it held.
     pub fn prompt(&mut self, ids: &[u32], at: &mut u32) -> Result<bool, GpuError> {
@@ -631,7 +631,7 @@ impl<R: RouterEntry, A: BatchAttention> Batch<'_, R, A> {
             m.check_call(from, to, self.embd)?;
         }
         // Read once: the call keeps no row, so the history does not move until its end.
-        let history = self.hybrid.call_history();
+        let history = self.hybrid.call_history(from);
         let r = self
             .stream_begin(ids.len(), to, history)
             .and_then(|()| self.enqueue_call(ids, (from, to), &mut media, &mut *entering));
