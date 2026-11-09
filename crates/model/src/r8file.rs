@@ -26,7 +26,7 @@ use std::fs::{File, OpenOptions, TryLockError};
 use std::io;
 use std::ops::Range;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Instant;
@@ -1121,6 +1121,90 @@ fn announce(r8: &HostR8) {
         eprintln!("load host_tier {line}");
         seen.push(line);
     }
+}
+
+/// Re-record, in place, the source header digests of the sidecar at `path` for `source`, a
+/// source whose headers were patched (a fixture's recorded budget, `fixture::rebudget`) and whose
+/// every other input to the identity is the one the sidecar was made from. Only the 64 hex bytes
+/// of each digest that moved are written; a sidecar whose check fails on anything but a header
+/// digest is refused with that difference and left as it was, and so is one whose check still
+/// fails after the patch (its old digests are written back). Returns the count of digests
+/// rewritten, 0 when the sidecar already pairs with `source`.
+///
+/// # Errors
+/// The identity check's refusal of anything but a header digest, a digest record laid out other
+/// than as `convert` writes it, and the file's IO.
+pub fn record_headers(path: &Path, source: &Split) -> Result<usize, ModelError> {
+    let g = open_sidecar(path, Weights::Mapped { populate: false })?;
+    let now = Inputs::of(source, tensor_names(&g))?;
+    match check(path, &g, &now) {
+        Ok(()) => return Ok(0),
+        Err(R8Error::HeaderDigest { .. }) => {}
+        Err(e) => return Err(e.into()),
+    }
+    let recorded: Vec<String> = entries(path, &g, KEY_HEADERS, now.shards.len(), Value::as_str)?
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let base = g
+        .value_offset(KEY_HEADERS)
+        .expect("the reader records an offset for every value it parsed");
+    let found: Vec<String> = now.shards.iter().map(|s| sha256_hex(s.header)).collect();
+    drop(now);
+    drop(g);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| io_err(path, "open for the header digests", e))?;
+    let read = |at: u64, n: usize| -> Result<Vec<u8>, ModelError> {
+        let mut b = vec![0u8; n];
+        file.read_exact_at(&mut b, at)
+            .map_err(|e| io_err(path, "read the header digests", e))?;
+        Ok(b)
+    };
+    let laid_out = |detail: String| -> ModelError { key_err(path, KEY_HEADERS, detail).into() };
+    // An array value: its element type (8, a string), its count, then each string's u64 length and
+    // its bytes.
+    let tag = u32::from_le_bytes(read(base, 4)?.try_into().expect("four bytes"));
+    let count = u64::from_le_bytes(read(base + 4, 8)?.try_into().expect("eight bytes"));
+    if tag != 8 || count != recorded.len() as u64 {
+        return Err(laid_out(format!(
+            "is an array of type {tag} and {count} entries at byte {base}, the reader's of \
+             {} strings",
+            recorded.len()
+        )));
+    }
+    let mut at = base + 12;
+    let mut patches = Vec::new();
+    for (old, new) in recorded.iter().zip(&found) {
+        let len = u64::from_le_bytes(read(at, 8)?.try_into().expect("eight bytes"));
+        let bytes = read(at + 8, old.len())?;
+        if len != old.len() as u64 || bytes != old.as_bytes() || new.len() != old.len() {
+            return Err(laid_out(format!(
+                "entry at byte {at} is not the digest the reader parsed ({len} bytes, want {})",
+                old.len()
+            )));
+        }
+        if old != new {
+            patches.push((at + 8, old.as_bytes(), new.as_bytes()));
+        }
+        at += 8 + len;
+    }
+    let write = |restore: bool| -> Result<(), ModelError> {
+        for &(at, old, new) in &patches {
+            file.write_all_at(if restore { old } else { new }, at)
+                .map_err(|e| io_err(path, "write the header digests", e))?;
+        }
+        file.sync_data()
+            .map_err(|e| io_err(path, "sync the header digests", e))
+    };
+    write(false)?;
+    if let Err(e) = Sidecar::open(path, source, Weights::Mapped { populate: false }) {
+        write(true)?;
+        return Err(e);
+    }
+    Ok(patches.len())
 }
 
 fn open_sidecar(path: &Path, weights: Weights) -> Result<Gguf, ModelError> {

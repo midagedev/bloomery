@@ -31,14 +31,15 @@ use model::arch::models::{Ffn, LayerSpec, Moe};
 use model::arch::names::routed_stacks;
 use model::moe::HostLayer;
 use model::placement::accepts::{self, LegArms, Program};
-use model::placement::kernels::{self, DownForms};
+use model::placement::kernels::DownForms;
 use model::placement::{ModelTensors, Plan};
 use model::r8file::R8Source;
 
 use super::node::{NodeFamily, NodeOpen};
 use super::run::{HostRun, HostWidths};
 use super::tier::{
-    TierAct, TierBlock, TierCard, TierExperts, TierInput, TierIo, TierOpen, TierSet, TierShape,
+    ReplyRows, TierAct, TierBlock, TierCard, TierExperts, TierInput, TierIo, TierOpen, TierSet,
+    TierShape,
 };
 use crate::card_leg::{CardLeg, ExpertInput, LegBufs, LegRun, LegShape, LegStacks, STACK_ROLES};
 use crate::hybrid::{Hybrid, SlotMap};
@@ -194,7 +195,7 @@ impl LegTier {
     /// stacks, rows that differ from the tier's experts, and resident stacks
     /// on a layer off the tier are refused by name. The
     /// leg's buffers hold the columns in the forms the tier layers' downs
-    /// read ([`kernels::down`]), no down form on a tier of no layer.
+    /// read ([`LegStacks::down_act`]), no down form on a tier of no layer.
     /// Load-time only.
     pub fn new(
         gpu: &Gpu,
@@ -239,7 +240,7 @@ impl LegTier {
             };
             let stacks = LegStacks::of_arms(w, layer.names(), arms, STACK_ROLES)?;
             stacks.check(k, shape)?;
-            let (_, act) = kernels::down(stacks.down_ty()).ok_or(GpuError::state(
+            let act = stacks.down_act().ok_or(GpuError::state(
                 WHAT,
                 "the selected tier down's activation form",
             ))?;
@@ -394,6 +395,7 @@ impl LegOpen {
             n_used: self.n_used,
             rows: self.rows,
             act: TierAct::F32,
+            reply: ReplyRows::Whole,
         }
     }
 

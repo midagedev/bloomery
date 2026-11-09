@@ -1,15 +1,18 @@
 //! The launch of the M-row mat-vec family: the same weight read multiplied
 //! into [`MROWS`] activation rows, the kernels `kernels/matvec_rows.metal`.
 //!
-//! Four launches: the plain residual mat-vec ([`matvec_m`]), the segmented
+//! Five launches: the plain residual mat-vec ([`matvec_m`]), the segmented
 //! norm-on-load mat-vec of a layer's projections ([`matvec_seg_m`]), the
-//! gate-up pair with its SwiGLU epilogue ([`pair_m`]) and the head's logits
-//! with a per-row argmax ([`head_m`]). The segmented launch takes its input as
+//! gate-up pair with its SwiGLU epilogue ([`pair_m`]), the head's logits
+//! with a per-row argmax ([`head_m`]) and the gated delta net's head-normed
+//! out projection ([`headnorm_m`]). The segmented launch takes its input as
 //! the 1-row launch does, on the load ([`LoadNorm::Gain`]) or already normed by
 //! the hand-on that wrote it ([`LoadNorm::Scaled`]: M rows of the stream times
 //! the reader's gain, then M scale words); the pair and the head take only the
 //! hand-on's rows and scale words, and the hand-on over M rows is
-//! [`norm_next_m`]. Row m of any of them is the 1-row kernel's bits on row m's
+//! [`norm_next_m`]; the head-normed launch takes each row's own gated
+//! numerator and partial sums, the 1-row head-normed launch's contract. Row m
+//! of any of them is the 1-row kernel's bits on row m's
 //! input alone — the same lane map, the same per-lane accumulation order, the
 //! same SIMD reduction and the same epilogue; only the weights' read and their
 //! unpack is shared, which the kernel's own order argument states. The
@@ -26,7 +29,7 @@ use bloomery_device::{DeviceError, Elems, LAYER_NONE, Window, WindowMut};
 use crate::device::MetalDevice;
 use crate::encode::{Binding, Bindings, ComputeEncoder};
 use crate::fault::MetalFaultWord;
-use crate::geom::ExpertsGeom;
+use crate::geom::{DeltaGeom, ExpertsGeom};
 use crate::library::{Library, Pipeline};
 
 use super::head::{HEAD_SIMD_GROUPS, HEAD_THREADS, MAX_ROWS};
@@ -40,6 +43,7 @@ const MATVEC: &str = "matvec mrows";
 const SEG: &str = "matvec seg mrows";
 const PAIR: &str = "pair mrows";
 const HEAD: &str = "head mrows";
+const HEADNORM: &str = "headnorm mrows";
 const NEXT: &str = "norm next mrows";
 
 fn refuse(what: &'static str, detail: impl Into<String>) -> DeviceError {
@@ -63,6 +67,14 @@ fn a4(what: &'static str, quant: Quant) -> Result<(), DeviceError> {
         what,
         format!("{} has no M-row entry; the family holds A4", quant.name()),
     ))
+}
+
+/// Whether the M-row head-normed entry serves `quant` at `m` activation rows:
+/// the one rule, asked by the launch's own check and by the verify's walk (a
+/// layer the entry does not serve runs the 1-row launch once a row).
+#[must_use]
+pub const fn headnorm_m_serves(quant: Quant, m: usize) -> bool {
+    matches!(quant, Quant::A4) && m == MROWS
 }
 
 /// The norm's windows against `m` input rows of `cols` values: a gain of
@@ -103,6 +115,41 @@ pub struct MatvecMParams<'w> {
     pub x: Window<'w, f32, MetalDevice>,
     /// The outputs, `m` rows of `rows` values, which the launch adds into.
     pub y: WindowMut<'w, f32, MetalDevice>,
+}
+
+/// The M-row head-normed residual mat-vec: a gated delta net's out projection
+/// over [`MROWS`] activation rows, `y[m, r] += W[r, :] . (g[m, :] * the head
+/// scale of each column)`, each row's head scales computed from its own
+/// partial sums. Row `m` is the 1-row head-normed launch's
+/// ([`Kernels::headnorm_resid`]) bits on that row's inputs alone.
+pub struct HeadNormMParams<'w> {
+    /// The weight type. A4 today; the launch refuses the others by name.
+    pub quant: Quant,
+    /// The activation rows, [`MROWS`].
+    pub m: usize,
+    /// The output rows an activation row takes.
+    pub rows: usize,
+    /// The input columns: the delta geometry's value heads' own width.
+    pub cols: usize,
+    /// The out projection's weights.
+    pub weights: Window<'w, u8, MetalDevice>,
+    /// The gated numerators, `m` rows of `cols` values, starting on a
+    /// 16-byte boundary of their buffer.
+    pub g: Window<'w, f32, MetalDevice>,
+    /// The partial sums of the squares of the values: `m` rows of every
+    /// head's one partial a column block, the delta geometry's stride.
+    pub partials: Window<'w, f32, MetalDevice>,
+    /// The outputs, `m` rows of `rows` values `out_stride` apart, which the
+    /// launch adds into.
+    pub y: WindowMut<'w, f32, MetalDevice>,
+    /// Floats from one activation row's outputs to the next.
+    pub out_stride: usize,
+    /// The epsilon of the head norm.
+    pub eps: f32,
+    /// The fault word a raise lands in.
+    pub fault: &'w MetalFaultWord,
+    /// The layer a raise is recorded in.
+    pub layer: u32,
 }
 
 /// The segmented M-row mat-vec: the row segments of up to four tensors of one
@@ -293,6 +340,78 @@ fn check_matvec(
     Ok(MatvecMShape {
         nblocks: word(MATVEC, "the block count", nblocks)?,
         rows: word(MATVEC, "the row count", p.rows)?,
+        groups: p.rows.div_ceil(simdgroups * rows_per_simd_group),
+    })
+}
+
+struct HeadNormMShape {
+    nblocks: u32,
+    rows: u32,
+    stride: u32,
+    groups: usize,
+}
+
+/// The M-row head-normed launch's shape, refused by name as the 1-row
+/// head-normed launch's is, with the windows holding the M rows and the
+/// outputs' stride keeping the rows apart.
+fn check_headnorm_m(
+    d: &DeltaGeom,
+    p: &HeadNormMParams<'_>,
+    simdgroups: usize,
+    rows_per_simd_group: usize,
+) -> Result<HeadNormMShape, DeviceError> {
+    if !headnorm_m_serves(p.quant, p.m) {
+        return Err(refuse(
+            HEADNORM,
+            format!(
+                "the M-row head-normed entry runs A4 at M = {} rows; this launch is {} at M = {}",
+                MROWS,
+                p.quant.name(),
+                p.m
+            ),
+        ));
+    }
+    if p.rows == 0 {
+        return Err(refuse(HEADNORM, "no rows".to_string()));
+    }
+    if p.cols != d.value_heads * d.head_cols {
+        return Err(refuse(
+            HEADNORM,
+            format!(
+                "{} columns, the kernel's heads hold {} of {}",
+                p.cols, d.value_heads, d.head_cols
+            ),
+        ));
+    }
+    if p.out_stride < p.rows {
+        return Err(refuse(HEADNORM, "the output rows overlap".to_string()));
+    }
+    let nblocks = p.cols / p.quant.values_per_block();
+    let weight_bytes = super::weight_bytes(p.quant, p.rows, nblocks).ok_or_else(|| {
+        refuse(
+            HEADNORM,
+            format!("{} rows of {} columns wrap", p.rows, p.cols),
+        )
+    })?;
+    check_window_len(HEADNORM, "weights", p.weights.len(), weight_bytes)?;
+    check_window_len(HEADNORM, "g", p.g.len(), p.m * p.cols)?;
+    check_window_len(
+        HEADNORM,
+        "partials",
+        p.partials.len(),
+        p.m * d.partials_stride,
+    )?;
+    let y_len = (p.m - 1) * p.out_stride + p.rows;
+    check_window_len(HEADNORM, "y", p.y.len(), y_len)?;
+    let weights_start = p.weights.byte_range()?.start.get();
+    check_weights_align(HEADNORM, "weights", weights_start, p.quant.weight_align())?;
+    // The numerators are read as `float4`s, a row's span a multiple of four.
+    let g_start = p.g.byte_range()?.start.get();
+    float4_aligned(HEADNORM, "g", g_start)?;
+    Ok(HeadNormMShape {
+        nblocks: word(HEADNORM, "the block count", nblocks)?,
+        rows: word(HEADNORM, "the row count", p.rows)?,
+        stride: word(HEADNORM, "the output stride", p.out_stride)?,
         groups: p.rows.div_ceil(simdgroups * rows_per_simd_group),
     })
 }
@@ -671,6 +790,7 @@ pub(crate) struct Pipelines {
     seg_scaled: Pipeline,
     pair: Pipeline,
     head: Pipeline,
+    headnorm: Pipeline,
     /// The hand-on over M rows, whose row count is a launch's own.
     next: Pipeline,
 }
@@ -686,6 +806,7 @@ impl Pipelines {
             seg_scaled: of("a4_matvec_seg_scaled_m2")?,
             pair: of("a4_pair_swiglu_scaled_m2")?,
             head: of("a4_head_logits_scaled_m2")?,
+            headnorm: of("a4_matvec_headnorm_m2")?,
             next: library.pipeline("a4_norm_next_m")?,
         })
     }
@@ -734,6 +855,40 @@ impl Kernels {
         slot.set(Binding::of(&p.x)?)?;
         slot.set(Binding::of_mut(&p.y)?)?;
         slot.set(Binding::bytes(pack(&args))?)?;
+        let threads = self.threads_per_group();
+        slot.dispatch_groups(shape.groups, 1, threads)
+    }
+
+    /// Encode one M-row head-normed residual mat-vec dispatch on `encoder`:
+    /// a gated delta net's out projection over both rows, one launch. Nothing
+    /// is encoded for a launch that is refused.
+    #[must_use = "a refused launch encoded nothing"]
+    pub fn headnorm_m(
+        &self,
+        encoder: &mut ComputeEncoder<'_>,
+        p: HeadNormMParams<'_>,
+    ) -> Result<(), DeviceError> {
+        let shape = check_headnorm_m(
+            &self.geom.delta,
+            &p,
+            self.simdgroups,
+            self.rows_per_simd_group,
+        )?;
+        let args = args_bytes([
+            shape.rows,
+            shape.nblocks,
+            p.layer,
+            p.eps.to_bits(),
+            shape.stride,
+        ]);
+        encoder.set_pipeline(&self.matvec_rows.headnorm);
+        let mut slot = Bindings::new(encoder);
+        slot.set(Binding::of(&p.weights)?)?;
+        slot.set(Binding::of(&p.g)?)?;
+        slot.set(Binding::of(&p.partials)?)?;
+        slot.set(Binding::of_mut(&p.y)?)?;
+        slot.set(Binding::bytes(pack(&args))?)?;
+        slot.set(p.fault.binding())?;
         let threads = self.threads_per_group();
         slot.dispatch_groups(shape.groups, 1, threads)
     }

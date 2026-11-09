@@ -1,0 +1,12 @@
+diff --git a/crates/gpu/src/host/swap.rs b/crates/gpu/src/host/swap.rs
+--- a/crates/gpu/src/host/swap.rs
++++ b/crates/gpu/src/host/swap.rs
+@@ -3726,7 +3726,7 @@
+             for &s in &freed[moves.len()..] {
+                 row[s as usize] = SlotState::Spare;
+             }
+-            row[cap - k..cap].fill(SlotState::Withdrawn);
++            row[cap - k..cap].fill(SlotState::Spare);
+         }
+         self.agree(layer, slots, WHAT)?;
+         // The pack's copies have landed once the copy stream drains, and so has every

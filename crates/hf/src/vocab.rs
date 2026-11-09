@@ -37,6 +37,9 @@
 //! `post_processor` is read like the rows: absent, a ByteLevel that moves no id, or Llama 3's
 //! Sequence of one and a template that adds the BOS first — the token the exported BOS id names,
 //! and what makes the header's `add_bos_token` true.
+//!
+//! A folder with `tiktoken.model` and no `tokenizer.json`, or a model whose [`VocabSpec`] names a
+//! tiktoken row (`kimi-k2`), is read by [`tiktoken`] into the same [`Keys`].
 
 use std::collections::HashMap;
 use std::fs;
@@ -46,6 +49,8 @@ use gguf::Value;
 use serde_json::Value as Json;
 
 use crate::schema::{self, Fields, Rule::*, Type};
+
+mod tiktoken;
 
 /// Why the tokenizer was refused.
 #[derive(Debug, thiserror::Error)]
@@ -119,7 +124,7 @@ macro_rules! pre_tokenizer {
 /// `tokenizer.json` must repeat: [`ignores_merges`]). `Removed` with `invert` keeps the regex's
 /// matches and drops what lies between them, which `Isolated` keeps as pieces of their own; both
 /// regexes match every codepoint, so no gap exists and the two split alike.
-pub const PRE: [(&str, &str, bool); 6] = [
+pub const PRE: [(&str, &str, bool); 7] = [
     (
         "qwen35",
         pre_tokenizer!(qwen35_regex, "Isolated", false, false),
@@ -149,6 +154,20 @@ pub const PRE: [(&str, &str, bool); 6] = [
         pre_tokenizer!(llama3_regex, "Isolated", false, true),
         true,
     ),
+    // DeepSeek-V3's pipeline (DeepSeek-V4.1's folder carries it): three regex splits in turn,
+    // digits in threes, then runs of CJK, then the words, before ByteLevel without its own regex.
+    (
+        "deepseek-v3",
+        concat!(
+            r#"{"type":"Sequence","pretokenizers":["#,
+            r#"{"type":"Split","pattern":{"Regex":"\\p{N}{1,3}"},"behavior":"Isolated","invert":false},"#,
+            r#"{"type":"Split","pattern":{"Regex":"[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+"},"behavior":"Isolated","invert":false},"#,
+            r##"{"type":"Split","pattern":{"Regex":"[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+"},"behavior":"Isolated","invert":false},"##,
+            byte_level!(false, true, false),
+            "]}"
+        ),
+        false,
+    ),
     // Nemotron-3.5's pipeline, under the name its GGUF twin states; the tokenizer crate runs the
     // name, and `tekken`, as the Tekken regex.
     (
@@ -158,9 +177,13 @@ pub const PRE: [(&str, &str, bool); 6] = [
     ),
 ];
 
-/// The names of [`PRE`], as the refusal of an unknown one lists them.
+/// The names of [`PRE`] and of the tiktoken rows, as the refusal of an unknown one lists them.
 fn pre_names() -> String {
-    PRE.map(|(name, _, _)| name).join(", ")
+    PRE.map(|(name, _, _)| name)
+        .into_iter()
+        .chain(tiktoken::pre_names())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The `config.json` `model_type`s that name the row a folder's pipeline gets when several rows
@@ -248,8 +271,13 @@ const TOKENIZER: &Fields = &[
     ("truncation", Only("[null]")),
     ("padding", Only("[null]")),
     ("added_tokens", Read),
-    // NFC is written as `tokenizer.ggml.normalizer`, which serving applies.
-    ("normalizer", Only(r#"[null, {"type":"NFC"}]"#)),
+    // NFC is written as `tokenizer.ggml.normalizer`, which serving applies; an empty Sequence
+    // normalizes nothing, as null does.
+    // PIN(2026-11-04): the empty Sequence is DeepSeek-V4.1's normalizer.
+    (
+        "normalizer",
+        Only(r#"[null, {"type":"NFC"}, {"type":"Sequence","normalizers":[]}]"#),
+    ),
     // The row it is, in `PRE`; the keys of `keys` take it from there.
     ("pre_tokenizer", Read),
     // Read by [`post_processor`]: a ByteLevel that moves no id, or a Sequence of one and the
@@ -293,9 +321,28 @@ const TOKEN: &Fields = &[
     ("single_word", Only("[false]")),
     ("lstrip", Only("[false]")),
     ("rstrip", Only("[false]")),
+    // transformers' class tag of a token it serialized.
+    ("__type", Only(r#"["AddedToken"]"#)),
 ];
 
 const ID: &Fields = &[("id", Read)];
+
+/// Whether `tokenizer.json`'s normalizer changes no text: none, or a Sequence of none.
+fn plain(tok: &Json) -> bool {
+    tok["normalizer"].is_null()
+        || tok["normalizer"] == serde_json::json!({"type":"Sequence","normalizers":[]})
+}
+
+/// Whether an occurrence of `a` and one of `b` can share a character: one holds the other, or an
+/// end of one is the start of the other.
+fn overlap(a: &str, b: &str) -> bool {
+    let joins = |x: &str, y: &str| {
+        x.char_indices()
+            .skip(1)
+            .any(|(i, _)| y.starts_with(&x[i..]))
+    };
+    a.contains(b) || b.contains(a) || joins(a, b) || joins(b, a)
+}
 
 /// `tokenizer_config.json`.
 const TOKENIZER_CONFIG: &Fields = &[
@@ -311,6 +358,21 @@ const TOKENIZER_CONFIG: &Fields = &[
     ("add_eos_token", Read),
     ("chat_template", Read),
     ("add_prefix_space", Only("[false]")),
+    (
+        "legacy",
+        Ignore(
+            Type::Bool,
+            "the slow SentencePiece tokenizer's spacing rule; the folder's tokenizer is \
+             tokenizer.json's",
+        ),
+    ),
+    (
+        "sp_model_kwargs",
+        Ignore(
+            Type::Object,
+            "the slow SentencePiece model's options; the folder's tokenizer is tokenizer.json's",
+        ),
+    ),
     ("do_lower_case", Only("[false]")),
     ("split_special_tokens", Only("[false]")),
     // The reference's decoder cleans spaces by the pre-tokenizer's name (its `clean_spaces`),
@@ -402,6 +464,14 @@ const GENERATION: &Fields = &[
     ("bos_token_id", Read),
     ("eos_token_id", Read),
     ("pad_token_id", Read),
+    (
+        "max_length",
+        Ignore(
+            Type::Number,
+            "HF's generate stops at that many tokens; serving's limit is each request's, and no \
+             prompt's ids or logits depend on it",
+        ),
+    ),
     ("do_sample", Ignore(Type::Bool, SAMPLING)),
     ("temperature", Ignore(Type::Number, SAMPLING)),
     ("top_k", Ignore(Type::Number, SAMPLING)),
@@ -445,8 +515,9 @@ const GENERATION: &Fields = &[
 ];
 
 /// An added token's object at `path`, `id` with its id: the keys [`TOKEN`] names and HF's
-/// unnormalized matching.
-fn token(token: &Json, path: &str, id: bool) -> Result<(), Error> {
+/// unnormalized matching, which a normalized token also has when the tokenizer's normalizer
+/// changes no text (`plain`).
+fn token(token: &Json, path: &str, id: bool, plain: bool) -> Result<(), Error> {
     let tables: &[&Fields] = if id { &[ID, TOKEN] } else { &[TOKEN] };
     schema::check(token, path, tables).map_err(Error::Vocab)?;
     if token.get("special").is_some_and(|v| !v.is_boolean()) {
@@ -454,6 +525,9 @@ fn token(token: &Json, path: &str, id: bool) -> Result<(), Error> {
     }
     match token.get("normalized") {
         Some(Json::Bool(false)) => Ok(()),
+        // PIN(2026-11-04): DeepSeek-V4.1's added tokens are normalized under a normalizer that
+        // changes no text.
+        Some(Json::Bool(true)) if plain => Ok(()),
         None if token["special"] == true => Ok(()),
         _ => Err(Error::Vocab(format!("{path}.normalized must be false"))),
     }
@@ -522,9 +596,10 @@ impl VocabSpec {
     }
 
     /// The model's tokenizer has the [`PRE`] row `name`: [`keys`] refuses a `tokenizer.json`
-    /// whose pre-tokenizer is another row. A name no row has is refused here.
+    /// whose pre-tokenizer is another row. A name of a tiktoken row (`kimi-k2`) makes [`keys`]
+    /// read the folder's `tiktoken.model`. A name no row has is refused here.
     pub fn with_pre(mut self, name: &'static str) -> Result<Self, Error> {
-        if !PRE.iter().any(|&(row, _, _)| row == name) {
+        if !PRE.iter().any(|&(row, _, _)| row == name) && !tiktoken::is_pre(name) {
             return Err(Error::Vocab(format!(
                 "pre-tokenizer row {name:?} is not one of {}",
                 pre_names()
@@ -596,6 +671,7 @@ fn vocabulary<'a>(
     spec: &VocabSpec,
 ) -> Result<Vocabulary<'a>, Error> {
     let bad = |what: String| Error::Vocab(what);
+    let plain = plain(tok);
     let vocab = model["vocab"]
         .as_object()
         .ok_or_else(|| bad("tokenizer.json has no model.vocab".into()))?;
@@ -610,6 +686,7 @@ fn vocabulary<'a>(
         by_name.insert(t, id);
     }
     let mut added: HashMap<u32, (&str, bool)> = HashMap::new();
+    let (mut normalized, mut unnormalized) = (Vec::new(), Vec::new());
     for (i, a) in tok
         .get("added_tokens")
         .filter(|v| !v.is_null())
@@ -635,10 +712,26 @@ fn vocabulary<'a>(
                 "conflicting added token id {id} or content {t:?}"
             )));
         }
-        token(a, &format!("added_tokens[{i}]"), true)?;
+        token(a, &format!("added_tokens[{i}]"), true, plain)?;
         by_name.insert(t, id);
         added.insert(id, (t, a["special"] == true));
         by_id.insert(id, t);
+        if a["normalized"] == true {
+            normalized.push(t);
+        } else {
+            unnormalized.push(t);
+        }
+    }
+    // HF cuts the unnormalized added tokens out of the text before it looks for the normalized
+    // ones in what is left, where serving looks for both in one leftmost-longest pass: the two
+    // cut alike only while no token of one kind can share a character with one of the other.
+    for &n in &normalized {
+        if let Some(&u) = unnormalized.iter().find(|&&u| overlap(n, u)) {
+            return Err(bad(format!(
+                "added tokens {n:?} (normalized) and {u:?} (unnormalized) can overlap in a text, \
+                 which HF cuts at the unnormalized one first"
+            )));
+        }
     }
     if let Some(decoder) = tc.get("added_tokens_decoder") {
         let decoder = decoder
@@ -646,7 +739,7 @@ fn vocabulary<'a>(
             .ok_or_else(|| bad("added_tokens_decoder is not an object".into()))?;
         for (id, t) in decoder {
             let path = format!("added_tokens_decoder[{id}]");
-            token(t, &path, false)?;
+            token(t, &path, false, plain)?;
             let entry = id.parse::<u32>().ok().and_then(|id| added.get(&id));
             if !entry.is_some_and(|&(content, special)| {
                 t["content"].as_str() == Some(content)
@@ -683,7 +776,7 @@ fn vocabulary<'a>(
     }
     for (field, t) in declared {
         if !t.is_string() {
-            token(t, field, false)?;
+            token(t, field, false, plain)?;
         }
         let content = t.as_str().or_else(|| t["content"].as_str());
         if !content.is_some_and(|c| added.values().any(|&(t, special)| t == c && special)) {
@@ -763,6 +856,7 @@ fn special_ids(
     generation: &Json,
     spec: &VocabSpec,
     added: &HashMap<u32, (&str, bool)>,
+    plain: bool,
 ) -> Result<SpecialIds, Error> {
     let bad = |what: String| Error::Vocab(what);
     let mut ids = Vec::new();
@@ -772,7 +866,7 @@ fn special_ids(
             Json::Null => None,
             Json::String(s) => Some(s.as_str()),
             v => {
-                token(v, &format!("{kind}_token"), false)?;
+                token(v, &format!("{kind}_token"), false, plain)?;
                 Some(v.get("content").and_then(Json::as_str).ok_or_else(|| {
                     bad(format!("{kind}_token {v} is not a token or an added token"))
                 })?)
@@ -969,7 +1063,30 @@ fn post_processor<'a>(
     Ok(Some(token))
 }
 
-/// The `tokenizer.*` keys of the repo at `dir`.
+/// The chat template of the repo at `dir`: `chat_template.jinja`, else `tokenizer_config.json`'s
+/// (`tc`) `chat_template`; a value that is not a string is refused by name.
+fn chat_template(dir: &Path, tc: &Json) -> Result<Option<String>, Error> {
+    match fs::read_to_string(dir.join("chat_template.jinja")) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match tc.get("chat_template").filter(|v| !v.is_null()) {
+                Some(v) => Ok(Some(
+                    v.as_str()
+                        .ok_or_else(|| Error::Vocab(format!("chat_template {v} is not a string")))?
+                        .to_string(),
+                )),
+                None => Ok(None),
+            }
+        }
+        Err(e) => Err(Error::Io(
+            dir.join("chat_template.jinja").display().to_string(),
+            e,
+        )),
+    }
+}
+
+/// The `tokenizer.*` keys of the repo at `dir`: [`tiktoken`]'s when the model names a tiktoken
+/// row, or the folder has `tiktoken.model` and no `tokenizer.json`; else `tokenizer.json`'s.
 ///
 /// # Errors
 ///
@@ -990,8 +1107,14 @@ fn post_processor<'a>(
 /// boolean, and a `chat_template` that is not a string, each by name.
 pub fn keys(dir: &Path, spec: &VocabSpec) -> Result<Keys, Error> {
     let bad = |what: String| Error::Vocab(what);
+    if spec.pre.is_some_and(tiktoken::is_pre)
+        || (!dir.join("tokenizer.json").exists() && dir.join("tiktoken.model").exists())
+    {
+        return tiktoken::keys(dir, spec);
+    }
     let read = |file: &str| crate::read_json(dir, file, Error::Io, Error::Json);
-    let tok = read("tokenizer.json")?.ok_or_else(|| bad("no tokenizer.json".into()))?;
+    let tok = read("tokenizer.json")?
+        .ok_or_else(|| bad("no tokenizer.json (and no tiktoken.model)".into()))?;
     let tc = read("tokenizer_config.json")?.unwrap_or_else(|| serde_json::json!({}));
     let generation = read("generation_config.json")?.unwrap_or_else(|| serde_json::json!({}));
     for (file, value, table) in [
@@ -1057,7 +1180,7 @@ pub fn keys(dir: &Path, spec: &VocabSpec) -> Result<Keys, Error> {
             Value::String("NFC".into()),
         ));
     }
-    let (ids, stop) = special_ids(&tc, &generation, spec, &added)?;
+    let (ids, stop) = special_ids(&tc, &generation, spec, &added, plain(&tok))?;
     let bos = ids
         .iter()
         .find(|(k, _)| k == "tokenizer.ggml.bos_token_id")
@@ -1089,26 +1212,7 @@ pub fn keys(dir: &Path, spec: &VocabSpec) -> Result<Keys, Error> {
         }
         out.push((format!("tokenizer.ggml.{key}"), Value::Bool(b)));
     }
-    let template = match fs::read_to_string(dir.join("chat_template.jinja")) {
-        Ok(t) => Some(t),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            match tc.get("chat_template").filter(|v| !v.is_null()) {
-                Some(v) => Some(
-                    v.as_str()
-                        .ok_or_else(|| bad(format!("chat_template {v} is not a string")))?
-                        .to_string(),
-                ),
-                None => None,
-            }
-        }
-        Err(e) => {
-            return Err(Error::Io(
-                dir.join("chat_template.jinja").display().to_string(),
-                e,
-            ));
-        }
-    };
-    if let Some(t) = template {
+    if let Some(t) = chat_template(dir, &tc)? {
         out.push(("tokenizer.chat_template".to_string(), Value::String(t)));
     }
     let mut stop = stop
@@ -1431,6 +1535,7 @@ mod tests {
             ["tokenizer.json", "", "padding", null, {"length":8}],
             ["tokenizer.json", "", "added_tokens", "$", {"id":3}],
             ["tokenizer.json", "", "normalizer", null, {"type":"NFD"}],
+            ["tokenizer.json", "", "normalizer", {"type":"Sequence","normalizers":[]}, {"type":"Sequence","normalizers":[{"type":"NFC"}]}],
             ["tokenizer.json", "", "pre_tokenizer", "$", {"type":"Whitespace"}],
             ["tokenizer.json", "", "post_processor", null, {"type":"TemplateProcessing"}],
             ["tokenizer.json", "", "decoder", "$", {"type":"WordPiece"}],
@@ -1452,12 +1557,14 @@ mod tests {
             ["tokenizer.json", "/added_tokens/0", "single_word", false, true],
             ["tokenizer.json", "/added_tokens/0", "lstrip", false, true],
             ["tokenizer.json", "/added_tokens/0", "rstrip", false, true],
+            ["tokenizer.json", "/added_tokens/0", "__type", "AddedToken", "Token"],
             ["tokenizer_config.json", "/added_tokens_decoder/3", "content", "$", "<think>"],
             ["tokenizer_config.json", "/added_tokens_decoder/3", "special", true, false],
             ["tokenizer_config.json", "/added_tokens_decoder/3", "normalized", false, true],
             ["tokenizer_config.json", "/added_tokens_decoder/3", "single_word", false, true],
             ["tokenizer_config.json", "/added_tokens_decoder/3", "lstrip", false, true],
             ["tokenizer_config.json", "/added_tokens_decoder/3", "rstrip", false, true],
+            ["tokenizer_config.json", "/added_tokens_decoder/3", "__type", "AddedToken", "Token"],
             ["tokenizer_config.json", "", "added_tokens_decoder", {}, []],
             ["tokenizer_config.json", "", "additional_special_tokens", ["<|im_end|>"], ["<think>"]],
             ["tokenizer_config.json", "", "extra_special_tokens", {"end":"<|im_end|>"}, "<|im_end|>"],
@@ -1470,6 +1577,8 @@ mod tests {
             ["tokenizer_config.json", "", "add_eos_token", false, 1],
             ["tokenizer_config.json", "", "chat_template", "t", [{"template":"t"}]],
             ["tokenizer_config.json", "", "add_prefix_space", false, true],
+            ["tokenizer_config.json", "", "legacy", true, "yes"],
+            ["tokenizer_config.json", "", "sp_model_kwargs", {}, "none"],
             ["tokenizer_config.json", "", "do_lower_case", false, true],
             ["tokenizer_config.json", "", "split_special_tokens", false, true],
             ["tokenizer_config.json", "", "clean_up_tokenization_spaces", true, 1],
@@ -1498,6 +1607,7 @@ mod tests {
             ["generation_config.json", "", "bos_token_id", 3, [3, 4]],
             ["generation_config.json", "", "eos_token_id", [3, 4], [3, "4"]],
             ["generation_config.json", "", "pad_token_id", 4, [4, 3]],
+            ["generation_config.json", "", "max_length", 1048576, "long"],
             ["generation_config.json", "", "do_sample", true, "yes"],
             ["generation_config.json", "", "temperature", 1.0, "hot"],
             ["generation_config.json", "", "top_k", 20, "20"],
@@ -1881,8 +1991,12 @@ mod tests {
     fn trim_offsets_moves_no_row_and_the_other_byte_level_options_do() {
         for (name, spelled, _) in PRE {
             let mut row: Json = serde_json::from_str(spelled).unwrap();
-            let trim = row["pretokenizers"][1]["trim_offsets"].as_bool().unwrap();
-            row["pretokenizers"][1]["trim_offsets"] = (!trim).into();
+            // The ByteLevel part is the last of the pipeline.
+            let last = row["pretokenizers"].as_array().unwrap().len() - 1;
+            let trim = row["pretokenizers"][last]["trim_offsets"]
+                .as_bool()
+                .unwrap();
+            row["pretokenizers"][last]["trim_offsets"] = (!trim).into();
             // A row that differs only by `trim_offsets` is its row — the one a folder without a
             // `model_type` naming it reads, and for `llama-bpe` the one `llama` names.
             let found = pre_row(Some(&row), None).unwrap().0;
@@ -1897,7 +2011,7 @@ mod tests {
             }
             for option in ["add_prefix_space", "use_regex"] {
                 let mut moved: Json = serde_json::from_str(spelled).unwrap();
-                moved["pretokenizers"][1][option] = true.into();
+                moved["pretokenizers"][last][option] = true.into();
                 assert!(pre_row(Some(&moved), None).is_err(), "{name} {option}");
             }
         }
@@ -2086,6 +2200,79 @@ mod tests {
         let user_defined = types.iter().filter(|t| **t == Value::I32(4)).count();
         assert_eq!(user_defined, 16);
         remove(&dir);
+    }
+
+    /// DeepSeek-V4.1-Flash-1017's tokenizer files (`deepseek-v4.1-flash-1017-tokenizer-files.json.gz`:
+    /// the folder's `tokenizer.json` with the vocabulary cut to ids 0 to 2 and `a`, `b`, `ab`
+    /// and the merges to theirs, then its `tokenizer_config.json` and `config.json` whole) are
+    /// the `deepseek-v3` row. Their normalizer is an empty Sequence, so the 47 added tokens
+    /// marked normalized match as written, as do the tokenizer config's serialized
+    /// `AddedToken`s; the BOS is 0 and the one stop id the config's EOS 1. Under NFC a
+    /// normalized added token is refused by name, and so is a normalized one that an
+    /// unnormalized one can overlap. Mutant (red at the overlap assertion): `overlap` dropped.
+    #[test]
+    fn the_deepseek_v41_tokenizer_files_open_as_the_deepseek_v3_row() {
+        let path = format!(
+            "{}/tests/fixtures/deepseek-v4.1-flash-1017-tokenizer-files.json.gz",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let mut raw = Vec::new();
+        std::io::Read::read_to_end(
+            &mut flate2::read::GzDecoder::new(std::fs::File::open(path).unwrap()),
+            &mut raw,
+        )
+        .unwrap();
+        let mut files: Json = serde_json::from_slice(&raw).unwrap();
+        let open = |files: &Json| {
+            let texts: Vec<(&str, String)> =
+                ["tokenizer.json", "tokenizer_config.json", "config.json"]
+                    .into_iter()
+                    .map(|name| (name, files[name].to_string()))
+                    .collect();
+            let dir = repo(
+                &texts
+                    .iter()
+                    .map(|(n, t)| (*n, t.as_str()))
+                    .collect::<Vec<_>>(),
+            );
+            let keys = super::keys(&dir, &spec_of(&dir).with_pre("deepseek-v3").unwrap());
+            remove(&dir);
+            keys
+        };
+        let keys = open(&files).unwrap();
+        let value = |key: &str| get(&keys.keys, &format!("tokenizer.ggml.{key}")).cloned();
+        assert_eq!(value("pre"), Some(Value::String("deepseek-v3".into())));
+        assert_eq!(value("bos_token_id"), Some(Value::U32(0)));
+        assert_eq!(value("normalizer"), None);
+        assert_eq!((keys.stop.as_slice(), keys.added.len()), (&[1][..], 1283));
+        let plain = files["tokenizer.json"]["normalizer"].clone();
+        files["tokenizer.json"]["normalizer"] = serde_json::json!({"type": "NFC"});
+        let e = open(&files).unwrap_err().to_string();
+        assert!(e.contains("normalized must be false"), "{e}");
+        // A normalized `cde` beside an unnormalized `cd`: HF reads `cde` as `cd`, `e`, the one
+        // pass `cde`, so the pair is refused by name, as is an unnormalized `ef` that `cde`'s
+        // end begins.
+        files["tokenizer.json"]["normalizer"] = plain;
+        let added = |id: u32, content: &str, normalized: bool| {
+            serde_json::json!({"id": id, "content": content, "single_word": false,
+                "lstrip": false, "rstrip": false, "normalized": normalized, "special": false})
+        };
+        let tokens = files["tokenizer.json"]["added_tokens"]
+            .as_array_mut()
+            .unwrap();
+        tokens.push(added(3, "cde", true));
+        tokens.push(added(4, "cd", false));
+        let e = open(&files).unwrap_err().to_string();
+        assert!(
+            e.contains(r#""cde" (normalized) and "cd" (unnormalized)"#),
+            "{e}"
+        );
+        files["tokenizer.json"]["added_tokens"][1284]["content"] = "ef".into();
+        let e = open(&files).unwrap_err().to_string();
+        assert!(
+            e.contains(r#""cde" (normalized) and "ef" (unnormalized)"#),
+            "{e}"
+        );
     }
 
     /// The `lfm2` row holds `ignore_merges` to its own value, both ways: LFM3's pipeline with the

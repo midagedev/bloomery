@@ -1,9 +1,9 @@
 //! A fixture variant: a family's fixture requantized by ik's `llama-quantize` to one type map, so a
 //! quant type's train gate runs on a small file. This module owns the table (`tools/fixture-variants.tsv`),
 //! the map's expansion over the source's tensor names, the `--custom-q` argument that makes the
-//! quantizer retype exactly those tensors, the recording of the variant's own card budget
-//! ([`record_budget`], after the quantizer wrote the trunk's), and the check that a written variant
-//! differs from its source by the map alone.
+//! quantizer retype exactly those tensors, and the check that a written variant differs from its
+//! source by the map alone; [`super::rebudget`] records the variant's own card budget after the
+//! quantizer wrote the trunk's.
 //!
 //! A table row is `tag<TAB>family<TAB>scope<TAB>map<TAB>recipes<TAB>why`. The map is `role=type`
 //! words: `role` is a tensor name between `blk.<L>.` and `.weight`, or the name of a tensor outside the
@@ -19,7 +19,6 @@
 //! budget keeps the trunk's value).
 
 use std::collections::{BTreeSet, HashMap};
-use std::io::{Seek, Write};
 
 use gguf::{GgmlType, Split, Value};
 
@@ -377,95 +376,6 @@ pub fn custom_q(tag: &str, source: &Split, retypes: &[Retype]) -> Result<String,
 #[must_use]
 pub fn override_kv(tag: &str) -> String {
     format!("{KEY_VARIANT}=str:{tag}")
-}
-
-/// Record `budget` as [`KEY_CARD_BUDGET`] on every shard of `variant`'s set
-/// that holds the key, in place: the value is a u64, so the eight bytes of it
-/// are written and no other byte of the file moves, and the set is reopened
-/// to read the key back. Returns the value the shards held, which they must
-/// agree on; the quantizer copied the trunk's, which the family's planner
-/// replaces with the variant's own ([`super::budget::choose_written`]).
-///
-/// # Errors
-/// No shard holding the key, a shard whose value is not a u64, shards that
-/// disagree on it, or a file the patch cannot write or read back.
-pub fn record_budget(tag: &str, variant: &Split, budget: u64) -> Result<u64, FixtureError> {
-    let mut was = None;
-    for i in 0..variant.shard_count() {
-        let (Some(shard), Some(path)) = (variant.shard(i), variant.shard_path(i)) else {
-            continue;
-        };
-        let Some(value) = shard.value(KEY_CARD_BUDGET) else {
-            continue;
-        };
-        let Value::U64(old) = value else {
-            return Err(err(
-                tag,
-                format!(
-                    "{} holds {KEY_CARD_BUDGET} as {value:?}, not a u64 (the patch writes eight \
-                     bytes)",
-                    path.display()
-                ),
-            ));
-        };
-        let at = shard
-            .value_offset(KEY_CARD_BUDGET)
-            .expect("the reader records an offset for every value it parsed");
-        if let Some(w) = was
-            && w != *old
-        {
-            return Err(err(
-                tag,
-                format!(
-                    "{} holds {KEY_CARD_BUDGET} {old}, an earlier shard's {w}",
-                    path.display()
-                ),
-            ));
-        }
-        was = Some(*old);
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(path)
-            .map_err(|e| super::io_err(path, "open for the budget patch", e))?;
-        file.seek(std::io::SeekFrom::Start(at))
-            .and_then(|_| file.write_all(&budget.to_le_bytes()))
-            .map_err(|e| super::io_err(path, "write the budget", e))?;
-    }
-    let Some(was) = was else {
-        return Err(err(
-            tag,
-            format!("no shard holds {KEY_CARD_BUDGET} to record the budget on"),
-        ));
-    };
-    // The patch moved eight bytes inside one value; the reopened set must read
-    // them back as the budget it now holds.
-    let first = variant.shard_path(0).ok_or_else(|| {
-        err(
-            tag,
-            format!("the set names no first shard to read {KEY_CARD_BUDGET} back from"),
-        )
-    })?;
-    let again =
-        Split::open(first).map_err(|e| err(tag, format!("reading {KEY_CARD_BUDGET} back: {e}")))?;
-    for i in 0..again.shard_count() {
-        let (Some(shard), Some(path)) = (again.shard(i), again.shard_path(i)) else {
-            continue;
-        };
-        match shard.value(KEY_CARD_BUDGET) {
-            Some(Value::U64(v)) if *v == budget => {}
-            Some(got) => {
-                return Err(err(
-                    tag,
-                    format!(
-                        "{KEY_CARD_BUDGET} reads back as {got:?} in {}, want {budget}",
-                        path.display()
-                    ),
-                ));
-            }
-            None => {}
-        }
-    }
-    Ok(was)
 }
 
 fn kv_diff(

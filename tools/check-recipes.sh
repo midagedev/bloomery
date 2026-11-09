@@ -76,9 +76,10 @@ blk_recipescheck() {
 blk_gateclass() {
   python3 "$(dirname "$0")/gate_class.py" check
 }
+# blk_selftest K: part K of the recipes.py self-test (its SELFTEST_PARTS parts hold every job once; plain --self-test runs them all).
 blk_selftest() {
-  if ! python3 "$(dirname "$0")/recipes.py" --self-test; then
-    echo "check-recipes: the recipes.py self-test failed" >&2
+  if ! python3 "$(dirname "$0")/recipes.py" --self-test --part "$1"; then
+    echo "check-recipes: the recipes.py self-test part $1 failed" >&2
     return 1
   fi
 }
@@ -281,6 +282,15 @@ blk_ptxspill() { tool_selftest ptx-spill-check.sh; }
 # scan-args.sh is the three scan recipes' refusal of a cargo feature given where the scan's own words go
 # (ptx-scan, sass-scan, lds-scan): its cases on a fixed feature list and the real crates/gpu-gates table.
 blk_scanargs() { tool_selftest scan-args.sh; }
+# whole-manifests: no gate-* recipe reads a package manifest as a file (recipes.py whole-manifests: rc 1 when one does). A script a box recipe
+# reaches that reads crates/gpu-gates/Cargo.toml (scan-args.sh does) hands every gate that manifest whole, so a new [[bin]] selects them all.
+blk_wholemanifests() {
+  if ! python3 "$(dirname "$0")/recipes.py" whole-manifests > /dev/null; then
+    echo "check-recipes: a gate-* recipe reads a package manifest whole: run \`python3 tools/recipes.py whole-manifests\` for the recipe, the manifest and the why" >&2
+    return 1
+  fi
+  echo "whole-manifests: no gate-* recipe reads a package manifest whole"
+}
 # narrow-scan.sh is `just narrow`'s box orchestration: the runner it ships to each side (one build per feature list, the
 # scanner embedded verbatim), the cut of the box's output into per-bin scan logs, the one-run-at-a-time lock on the
 # persistent remote dirs, its usage refusals, and the drift check against the ptx-scan recipe's build lines. No box.
@@ -302,6 +312,12 @@ blk_mutantrun() { tool_selftest mutant-run.sh; }
 # under tools/static-sched.py: its job list, its scheduling, its rc/wall capture, its skip lines and its red-step naming are
 # tested against stub jobs, no cargo, no check script.
 blk_macstatic() { tool_selftest mac-static.sh; }
+# mac-setup.sh names every host tool the Mac static tier needs (python3 and the modules tools/nightly/install.sh names, just,
+# rsync ≥ 3, git, mac-check.sh's prereqs): each check and its install line against stub tools on a scratch PATH, no install.
+blk_macsetup() { tool_selftest mac-setup.sh; }
+# round-check.sh type-checks the shapes recipes.py combos selects on the box: its refusals, the remote directory, the rc, the
+# ledger and the on-box loop against a stub recipes.py, box.sh and cargo, no box.
+blk_roundcheck() { tool_selftest round-check.sh; }
 # mac-remote.sh sends a tree to the second Mac and runs mac-static there: its argument, config-file, track-name,
 # dirty-tree, lock and ledger rules, and (on macOS) the whole flow against a stub ssh that runs the "remote" in a
 # fake home, are tested here, no remote and no cargo.
@@ -325,6 +341,11 @@ blk_seedtarget() { tool_selftest seed-target.sh; }
 # not run, and a mutant of each guard that does run it), the seed choice, the read-only seed, and the in-flight rule of
 # `retire`, on scratch git repos with stub seed-target and mac-disk, no cargo, no box.
 blk_wt() { tool_selftest wt.sh; }
+# sweep.sh retires every LANDED or PRUNABLE worktree beside the main tree through mac-disk, then the box's track dirs of
+# exactly those names and the second Mac's stale clones: the selection (an Orca path skipped), the box names (never a live
+# track), the in-flight stop (75, no box-tracks or mac-remote), --dry-run and the unconfigured skips, on a scratch git repo
+# with stub mac-disk, box-tracks, mac-remote and ssh, no box.
+blk_sweep() { tool_selftest sweep.sh; }
 # mac-gate.sh runs the Metal gate on a Mac: the refusals (another host, a box card name, a macOS below the floor, no device), the
 # bound and the lock, on a stub gate binary, on any host.
 blk_macgate() { tool_selftest mac-gate.sh; }
@@ -343,6 +364,9 @@ blk_ikpintree() { tool_selftest ref/ik-pin-tree.sh; }
 # build-qdot-ref.sh builds only the dumpers it is named: a NAME that is not one dumper, two names in one argument included, is 64 and builds
 # nothing. Tested on a stub g++, no ik, no box.
 blk_qdotrefargs() { tool_selftest ref/build-qdot-ref.sh; }
+# The quantizer timing runner's arguments and its summary of the probe's lines, on a fixture of them (no card, no lease, no
+# box). The path is composed: a literal name would make the gate batch's walk read this file as a script that takes the lease.
+blk_quantmeasure() { local what=measure; tool_selftest "ref/quant-$what.sh"; }
 # carry.sh is the release's carry check (tools/release/carry.tsv against the commit released): its carried, lacking,
 # pending, unknown-hash and malformed-row verdicts in a temp git repo, no box. The release-build recipe runs it before
 # its box command: a recipe that stops calling it ends the check silently, so the call is held here.
@@ -390,6 +414,14 @@ blk_releasesitting() {
   fi
   printf '%s\n' "${out##*$'\n'}"
 }
+# pick.sh is the release picker at the ask: the pick rule (W unless the HEAD delta proves in 25 minutes; an unproven delta, no usable
+# watermark and W equal to HEAD each named), the watermark file's two forms and every way W is unusable, and the table's rows
+# (README and versions, archives, rotation, sitting, needs-gpu PRs), on a temporary repository and stub tools, then a mutant of each
+# guard that its group of cases must turn red; no box, no gh.
+blk_releasepick() { tool_selftest release/pick.sh; }
+# build-mac.sh's refusals on a temporary repository, on any OS: a HEAD that is not the release's commit (the tag's, or --commit's before
+# the tag exists), a tag that names another commit, a dirty tracked file and an archive that would be unsigned, then a mutant of each guard.
+blk_releasebuildmac() { tool_selftest release/build-mac.sh; }
 # Every Python tool's own tests, on the Mac and the Linux host nightly (seconds in all): a self-test that no check runs rots. A tool
 # that grows one is listed here, and the comparison (unit pytools.list) fails on one that is not. Each tool is a unit of its own
 # (pytools.K, the K-th line, run from the repository root), so the scheduler bounds them with every other unit.
@@ -440,10 +472,17 @@ pytools_list() {
     "tools/ref/draft-vocab.py --self-test"
     "tools/ref/ds41copy.py --self-test"
     "tools/ref/ds41pp.py self-test"
+    "tools/ref/engram-relayout.py --self-test"
     "tools/ref/flat-imatrix.py --self-test"
     "tools/ref/gguf-ranges.py --self-test"
     "tools/ref/gguf-respell.py --self-test"
+    "tools/ref/gguf-splice.py --self-test"
     "tools/ref/hidden-diff.py --self-test"
+    "tools/ref/imatrix-diff.py --self-test"
+    "tools/ref/k31-calib-gen.py --self-test"
+    "tools/ref/k31-calib-render.py --self-test"
+    "tools/ref/k31-eval.py --self-test"
+    "tools/ref/kernel-model.py --self-test"
     "tools/ref/lev_ref.py --self-test"
     "tools/ref/loop-floor.py --self-test"
     "tools/ref/nsys-bridge.py --self-test"
@@ -453,6 +492,7 @@ pytools_list() {
     "tools/ref/qwen4exp-nvfp4-oracle-test.py --self-test"
     "tools/ref/route-trace-chat.py --self-test"
     "tools/ref/router-coverage.py --self-test"
+    "tools/ref/router-rank.py --self-test"
     "tools/ref/router-residency.py --self-test"
     "tools/ref/set-diff.py --self-test"
     "tools/ref/source-inspection-test.py --self-test"
@@ -1210,8 +1250,8 @@ proc_leg_gpu() {
 }
 
 BLOCKS=(prelude recipescheck gateclass selftest smoke cardorder cardtests lease boxtracks unsafecount archscan loadscan commentscan leverscan loadgroups lcppfit coldblocks leverarms slotsarm binlabel lcppwarm q38srv
-  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macremote boxsh oxidehost oxidebackend seedtarget carry releasebuild releaseinstall releasepublish releasesitting pytools boxqcodes fixturevariants fixturedirs dsparkread
-  refsetpublish orphan archowner treecommit archivepipe fnowner wt macgate boundedscan gatebound dumpdequant tokoracle ikpintree qdotrefargs)
+  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs wholemanifests narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macsetup roundcheck macremote boxsh oxidehost oxidebackend seedtarget carry releasebuild releaseinstall releasepublish releasesitting releasepick releasebuildmac pytools boxqcodes fixturevariants fixturedirs dsparkread
+  refsetpublish orphan archowner treecommit archivepipe fnowner wt sweep macgate boundedscan gatebound dumpdequant tokoracle ikpintree qdotrefargs quantmeasure)
 # blk_keyspec NAME: what a block's input key reads (tools/recipes.py static-key). Every block's is the whole tree: a
 # narrower key needs proof that the block reads nothing outside it, and a green run on a copy whose other files are
 # missing or empty is no proof (a scan of the justfile or crates/ passes on empty input). procleg is never skipped.
@@ -1221,13 +1261,17 @@ blk_keyspec() {
     *) echo tree ;;
   esac
 }
-# units: the blocks as the scheduler runs them, one a line: gate-batch's self-test runs as its parts (`--part K`, the
-# count its SELFTEST_PARTS line holds) and pytools as its list check and one unit a tool, so the scheduler sees each one's
-# own wall and slot.
+# units: the blocks as the scheduler runs them, one a line: gate-batch's self-test and recipes.py's run as their parts
+# (`--part K`, the count the SELFTEST_PARTS line of each holds) and pytools as its list check and one unit a tool, so the
+# scheduler sees each one's own wall and slot.
 units() {
   local b k parts
   for b in "${BLOCKS[@]}"; do
-    if [ "$b" = pytools ]; then
+    if [ "$b" = selftest ]; then
+      parts=$(sed -n 's/^SELFTEST_PARTS = \([1-9][0-9]*\)$/\1/p' "$(dirname "$0")/recipes.py")
+      [ -n "$parts" ] || { echo "check-recipes: tools/recipes.py has no SELFTEST_PARTS line" >&2; return 70; }
+      for ((k = 1; k <= parts; k++)); do echo "selftest.$k"; done
+    elif [ "$b" = pytools ]; then
       echo pytools.list
       pytools_list
       for ((k = 1; k <= ${#selftests[@]}; k++)); do echo "pytools.$k"; done
@@ -1242,12 +1286,19 @@ units() {
 }
 # jobs: every unit as a line of tools/static-sched.py's JOBS, run from the repository root. procleg, the cpu-guard
 # live pair, runs alone.
+# jobs [SLOTS]: SLOTS is the scheduler's slot count the weights are drawn for (default: the cpu count, as tools/static-sched.py takes it).
 jobs() {
-  local u list
+  local u list attr attrs
   list=$(units) || return
+  # The weight of each recipes.py self-test part on that host (a part that loads the key graph peaks at 2.2 to 3.9 GiB resident; the comment at
+  # SELFTEST_GRAPH_PARTS in tools/recipes.py has the measurement and the rule).
+  attrs=$(python3 "$(dirname "$0")/recipes.py" selftest-attrs ${1:+--slots "$1"}) || return
   printf 'check-recipes.procleg\talone\t-\tbash tools/check-recipes.sh --block procleg\n'
   for u in $list; do
-    printf 'check-recipes.%s\t-\t%s\tbash tools/check-recipes.sh --block %s\n' "$u" "$(blk_keyspec "${u%%.*}")" "$u"
+    attr=-
+    case $u in selftest.*) attr=$(printf '%s\n' "$attrs" | awk -F'\t' -v k="${u#selftest.}" '$1 == k { print $2 }') ;; esac
+    [ -n "$attr" ] || { echo "check-recipes: tools/recipes.py selftest-attrs names no weight for $u" >&2; return 70; }
+    printf 'check-recipes.%s\t%s\t%s\tbash tools/check-recipes.sh --block %s\n' "$u" "$attr" "$(blk_keyspec "${u%%.*}")" "$u"
   done
 }
 # report DIR: the blocks' verdict from a tools/static-sched.py run's DIR, in this file's order, procleg first: a green
@@ -1283,8 +1334,8 @@ report() {
 
 case ${1:-} in
   --jobs)
-    [ $# = 1 ] || { echo "check-recipes.sh: --jobs takes nothing" >&2; exit 64; }
-    jobs
+    { [ $# = 1 ] || { [ $# = 3 ] && [ "$2" = --slots ]; }; } || { echo "check-recipes.sh: --jobs takes nothing, or --slots N" >&2; exit 64; }
+    jobs "${3:-}"
     exit 0
     ;;
   --block)
@@ -1303,7 +1354,7 @@ case ${1:-} in
     exit $?
     ;;
   '') ;;
-  *) echo "usage: tools/check-recipes.sh [--jobs | --block UNIT | --report DIR]" >&2; exit 64 ;;
+  *) echo "usage: tools/check-recipes.sh [--jobs [--slots N] | --block UNIT | --report DIR]" >&2; exit 64 ;;
 esac
 # Every block at once is ~60 processes, some of them parallel themselves: one scheduler, tools/static-sched.py, runs
 # them at most a cpu count at once, the longest recorded first (tools/mac-static.sh gives it this file's jobs beside its

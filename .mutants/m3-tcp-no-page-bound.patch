@@ -1,0 +1,12 @@
+--- a/crates/gpu/src/host/link/tcp.rs	2026-11-04 23:40:28
++++ b/crates/gpu/src/host/link/tcp.rs	2026-11-04 23:40:28
+@@ -510,7 +510,8 @@
+             len > 0
+                 && at.is_multiple_of(4)
+                 && len.is_multiple_of(4)
+-                && at.checked_add(len).is_some_and(|end| end <= page.bytes())
++                // MUTANT M3: no bound at the page's end.
++                && at.checked_add(len).is_some()
+         })
+         .ok_or_else(|| {
+             Stop::Refused(format!(

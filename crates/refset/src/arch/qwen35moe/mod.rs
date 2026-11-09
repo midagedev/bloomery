@@ -11,7 +11,7 @@ pub mod vis;
 
 /// The file every qwen35moe set is dumped from and the tree runs. The
 /// family owns the path until the model crate reads this architecture.
-pub const MODEL: &str = "/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-Q4_K_M.gguf";
+pub const MODEL: &str = "/data/moved/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-Q4_K_M.gguf";
 
 /// The ik tree every qwen35moe oracle family is dumped from, and the one
 /// place a re-take of the oracle changes it.

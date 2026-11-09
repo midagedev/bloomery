@@ -1,0 +1,16 @@
+# k31dsa mutant fault-key-past-cache
+# clause: fault, the key launch's position (gate_kimi_k3_dsa.rs:1098-1102)
+# site: crates/gpu/src/index_key.rs:220 ds41_index_key_input, the CachePos raise deleted; guard and return kept (PTX moves)
+# expected red: "  fault a key position 128 over 128 key rows (the key launch): nothing raised: FAIL"
+diff --git a/crates/gpu/src/index_key.rs b/crates/gpu/src/index_key.rs
+index 3f33c4f07..e060f3f45 100644
+--- a/crates/gpu/src/index_key.rs
++++ b/crates/gpu/src/index_key.rs
+@@ -217,7 +217,6 @@ mod index_key_kernels {
+         let row = unsafe { *pos.get_unchecked(t) } as usize;
+         if row >= rows as usize {
+             if lane == 0 {
+-                fault.raise(FaultSite::CachePos);
+             }
+             return;
+         }

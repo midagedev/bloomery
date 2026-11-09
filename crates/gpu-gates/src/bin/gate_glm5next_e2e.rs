@@ -475,7 +475,7 @@ mod gate {
     use std::time::Instant;
 
     use app::arch::glm5next::{GlmCfg, open_pair};
-    use app::mtp::{MtpBody, MtpDraft, Parked};
+    use app::mtp::{MtpBody, MtpDraft, Parked, open_draft, prompt_media};
     use app::{Loaded, OpenArgs, OpenLog, Session, SessionError};
     use bloomery_gpu::GpuError;
     use bloomery_gpu::fault::{Fault, FaultSite, LAYER_HEAD};
@@ -3201,7 +3201,7 @@ mod gate {
         s.select_slot(0)?;
         s.model_mut().set_mode(StepMode::Graph);
         s.add_slots(SLOTS)?;
-        let draft = MtpDraft::open(s.model(), PrefillMode::Batch, StepMode::Eager)?;
+        let draft = open_draft(s.model(), PrefillMode::Batch, StepMode::Eager)?;
         let mut spec = s.with_draft::<MtpDraft<Body>, PAIR>(draft, &mut Quiet)?;
         let mut parked = vec![spec.draft().park(); SLOTS];
         let t = Instant::now();
@@ -3423,7 +3423,7 @@ mod gate {
         reset_drafted(s, spec)?;
         runtime::Draft::prompt(spec.draft_mut(), s, head)?;
         let joined_h = spec.draft_mut().take_joined();
-        let first = spec.draft_mut().prompt_media(s, ids, spans)?;
+        let first = prompt_media(spec.draft_mut(), s, ids, spans)?;
         let store = sdm_store(s)?;
         let joined_k = spec.draft_mut().take_joined();
         Ok(Continued {
@@ -3452,7 +3452,7 @@ mod gate {
         let (_, prop_t, acc_t) = sdm_passes(s, spec, ids, first_t)?;
         // The drafted media call at groups of one batch.
         reset_drafted(s, spec)?;
-        let first_m = spec.draft_mut().prompt_media(s, ids, spans)?;
+        let first_m = prompt_media(spec.draft_mut(), s, ids, spans)?;
         let media = sdm_store(s)?;
         let joined_m = spec.draft_mut().take_joined();
         let (run_m, prop_m, acc_m) = sdm_passes(s, spec, ids, first_m)?;
@@ -4459,11 +4459,7 @@ mod gate {
     /// is: each slot of a pass holds its own, as `app::mtp::pass_slots` takes
     /// them.
     fn d_open(s: &Session<Body>) -> Result<MtpDraft<Body>, GateError> {
-        Ok(MtpDraft::open(
-            s.model(),
-            PrefillMode::Batch,
-            StepMode::Eager,
-        )?)
+        Ok(open_draft(s.model(), PrefillMode::Batch, StepMode::Eager)?)
     }
 
     /// `slot`'s drafted run from its reset, as (sd)'s starts: every id of

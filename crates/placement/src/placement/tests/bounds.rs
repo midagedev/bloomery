@@ -253,6 +253,7 @@ fn a_node_host_projection_keeps_non_routed_rows_on_node_zero() {
                 &NoKv,
                 &PlanLevers {
                     card_budget_bytes: budget.into(),
+                    ..PlanLevers::default()
                 },
                 RoutedRule::PerType(|_| Some(CardFormat::KQuant)),
             )
@@ -669,6 +670,31 @@ fn a_union_recounts_uploads_selected_forms_and_capacity() {
         union_plan(&plan, &wrong),
         Err(PlacementError::Stages(_))
     ));
+}
+
+/// A routed down's form is its stack's at its row width ([`crate::kernels::down_act`]): an MXFP4
+/// down of 256 values reads the 128-value form, a rank's part of 1,152 the 32-value one, so the
+/// plan prices the leg's buffers in the form the load makes. Mutant: the form read by type alone
+/// gives the 128-value form at 1,152.
+#[test]
+fn a_routed_downs_form_follows_its_row_width() {
+    use crate::kernels::DownAct;
+    use crate::placement::machine::routed_down_acts;
+    for (k, want) in [(256, DownAct::Q8Act), (1152, DownAct::Q8Blocks32)] {
+        let mut model = legged(&[[GgmlType::MXFP4; 3]]);
+        for t in model
+            .tensors
+            .iter_mut()
+            .filter(|t| t.name == "ffn_down_exps.weight")
+        {
+            t.dims[0] = k;
+        }
+        assert_eq!(
+            routed_down_acts(&model).collect::<Vec<_>>(),
+            [(0, want)],
+            "{k}"
+        );
+    }
 }
 
 /// Scratch enters each expert candidate's footprint monotonically.

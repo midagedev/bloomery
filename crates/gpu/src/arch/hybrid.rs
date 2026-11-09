@@ -501,6 +501,9 @@ impl Site {
     ) -> Result<(), GpuError> {
         let gpu = cx.gpu;
         let key = (self.ty, cx.w, self.name.as_str());
+        if let Some(c) = crate::imatrix::collector() {
+            c.feed_dense(gpu, &self.name, x, (1, self.k))?;
+        }
         match self.reads() {
             // Q8_0's form: the f32 rows on this gemv arm.
             Form::F32 | Form::Q8x32 => site::gemv(gpu, cx.g32, key, x, 1, y),

@@ -21,6 +21,8 @@ pub mod ctx_ladder;
 #[cfg(feature = "deepseek41")]
 pub mod ds41_media;
 pub mod ds41_meta;
+#[cfg(all(feature = "deepseek41", feature = "checkpoint"))]
+pub mod ds41_preflight;
 pub mod engine;
 pub mod flash_band;
 pub mod flip;
@@ -36,6 +38,9 @@ pub mod ik_q8_2;
 pub mod image_plan;
 #[cfg(feature = "gpu")]
 pub mod iq_rows;
+#[cfg(feature = "gpu")]
+#[path = "arch/kimi_k3_pass.rs"]
+pub mod kimi_k3_pass;
 pub mod kld;
 #[cfg(feature = "gpu")]
 pub mod kv_planes;
@@ -196,6 +201,22 @@ fn failure_status(refused: bool) -> std::process::ExitCode {
 /// [`exit_with`]. One spelling for every gate, as [`verdict`] is for a check.
 pub fn checks_failed() -> GateError {
     "FAILED: one or more checks above did not pass".into()
+}
+
+/// The build every rank of a tensor-parallel group must share (the fingerprint's `build`): the
+/// clean source commit `tools/box.sh` builds from, the package version and the profile. A build
+/// without a clean commit (none, `unknown` or `-dirty`) is refused by name: two such builds of
+/// other sources would agree.
+pub fn rank_build() -> Result<String, GateError> {
+    let commit = option_env!("BLOOMERY_GIT_COMMIT")
+        .filter(|c| (8..=40).contains(&c.len()) && c.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or("rank build: a clean source commit is required; build through tools/box.sh")?;
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    Ok(format!("{commit} {} {profile}", env!("CARGO_PKG_VERSION")))
 }
 
 /// The optional `--bench-arm` prefix, refused unless it selects an arm.
@@ -789,6 +810,12 @@ impl Fnv1a64 {
     pub fn value(self) -> u64 {
         self.0
     }
+}
+
+/// FNV-1a over the bits of a logits row: how two processes' rows are held equal.
+#[must_use]
+pub fn fnv_row(row: &[f32]) -> u64 {
+    Fnv1a64::default().f32s(row).value()
 }
 
 /// Same length and the same bits at every index — the bit-identity contract

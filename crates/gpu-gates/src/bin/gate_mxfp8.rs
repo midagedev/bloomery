@@ -31,6 +31,11 @@
 //! Each gemv also runs on the same columns read through a window that starts
 //! one f32 past a 16-byte boundary (`gemv.x_off4`): the same checks.
 //!
+//! An MXFP8 gemv of four or more columns also runs by every way the
+//! load-time picker races there (`autotune::Mcol::racing`, through
+//! `enqueue_e4m3_gemv_way`), token-major and row-major (`ways`): the same
+//! checks, so a pick changes no output bit.
+//!
 //! At one column each shape also runs through `site::resident_gemv`
 //! (`decode`), the launch by resident form that glm5next's decode step runs
 //! for every projection (`gpu-glm5next`'s `body::gemv`: the latent layer's
@@ -80,13 +85,28 @@
 //! An id past the stack writes its slot NaN and raises `ExpertId`, the other
 //! slot keeping its bits; an MXFP8 stack is refused by name.
 //!
+//! MXFP8 rows of a K that is no multiple of 128 (`ktail`): a tensor-parallel
+//! rank's part of DeepSeek-V4.1's shared down at four ranks (5,120 rows of
+//! 576) and at two (of 1,152), and 9 rows of 96. A row's scale words end in a
+//! word only partly its own (`e4m3_planes`, `ceil(k / 128)` words a row), so
+//! the gemv at one and more columns, the decode and the listed rows hold the
+//! `written`, `band` and `bits` checks there too; the wide tile reads whole
+//! 128-value records and refuses such a K by name (`plane-shape`).
+//!
+//! The picker (`autotune::tune`) over the MXFP8 tensors above, on a cost
+//! store of its own (`autotune`): a first run measures every signature, four
+//! to eight columns of each `(rows, k)` the staged entries read (`miss`); a
+//! second reads every pick back, the same ways, and times nothing (`hit`);
+//! an entry that names a way its signature does not race is timed again and
+//! every other read (`bad_entry`).
+//!
 //! And the load's refusals, each naming the tensor: an MXFP8 scale byte 0xFF
-//! (E8M0's NaN), a value byte 0x7F (E4M3's NaN) of either type, an MXFP8 row
-//! of 96 values (no whole scale word), an FP8_B128 scale that is not finite,
-//! and an FP8_B128 scale a value times leaves f32's range. Both launchers
+//! (E8M0's NaN), a value byte 0x7F (E4M3's NaN) of either type, an FP8_B128
+//! scale that is not finite, and an FP8_B128 scale a value times leaves f32's
+//! range. Both launchers
 //! refuse malformed planes of either type with one diagnostic (`plane-shape`:
 //! K misaligned, a wrong scale-row count, a wrong scale width), and the tile
-//! a column count whose sizes overflow.
+//! a column count whose sizes overflow and an MXFP8 K tail.
 //!
 //! The band. Every term `w_j · x_j` enters its lane by one fused multiply-add
 //! of `w_j = v_j · d` rounded once to f32, as the host dequant `w` the band is
@@ -119,8 +139,10 @@ fn main() -> std::process::ExitCode {
 
 mod gate {
     use crate::dense_file::{by_name, check, columns, decl, host_rows, mma_neighbours, q8_0_bytes};
+    use bloomery_gpu::autotune::{self, Mcol, Tuned};
     use bloomery_gpu::gemm::{Gemm32Kernels, GemmInput, GemmKernels, GemmRoute};
     use bloomery_gpu::head::{Head, HeadNorm};
+    use bloomery_gpu::host::costs::{Source, Store};
     use bloomery_gpu::q8f32::{
         E4m3GemvArgs, E4m3Scales, E4m3Weight, GemvOut, Mxfp8GemvIdsArgs, SelArgs, e4m3_planes,
     };
@@ -149,14 +171,15 @@ mod gate {
     /// `ssm_f_b` (`dims` 1,536 × 16,384, 16,384 × 4,096 and 128 × 8,192,
     /// `dims[0]` the row width): a short row, the row a lane walks in whole
     /// trips, and the one-word-a-lane row. `attn_q_b`'s and `attn_output`'s
-    /// rows are multiples of 512, so their four, six and eight columns run
-    /// MXFP8's staged walks (four, and the wide stage past four).
+    /// rows are multiples of 512, so their four to six and eight columns run
+    /// MXFP8's staged walks (four, and the wide stage past four) and every
+    /// way the picker races there.
     pub(crate) const SHAPES: [Shape; 3] = [
         Shape {
             stem: "blk.3.attn_q_b",
             rows: 16_384,
             k: 1536,
-            ms: &[1, 2, 3, 4, 6, WIDE],
+            ms: &[1, 2, 3, 4, 5, 6, WIDE],
             seed: 0x5eed_0801,
         },
         Shape {
@@ -181,7 +204,11 @@ mod gate {
     /// MXFP8 row counts that leave the last block of eight rows partly empty,
     /// at four columns: the staged walk (`k` a multiple of 512) and, at `k`
     /// 384, the unstaged one; nine rows also at seven columns, the wide stage.
-    const TAILS: [Shape; 4] = [
+    /// Then the K tails (module doc, `ktail`), no wide column among them.
+    // PIN(2026-11-03): an MXFP8 row of 96 values was a load refusal (no whole
+    // scale word); its planes now pad the row's last scale word, so it joins
+    // the K tails beside 576 and 1,152.
+    const TAILS: [Shape; 7] = [
         Shape {
             stem: "tail.r1",
             rows: 1,
@@ -209,6 +236,27 @@ mod gate {
             k: 384,
             ms: &[4],
             seed: 0x5eed_0873,
+        },
+        Shape {
+            stem: "ktail.tp4_shexp_down",
+            rows: 5120,
+            k: 576,
+            ms: &[1, 3, 8],
+            seed: 0x5eed_0874,
+        },
+        Shape {
+            stem: "ktail.tp2_shexp_down",
+            rows: 5120,
+            k: 1152,
+            ms: &[1, 4, 8],
+            seed: 0x5eed_0875,
+        },
+        Shape {
+            stem: "ktail.r9k96",
+            rows: 9,
+            k: 96,
+            ms: &[1, 2],
+            seed: 0x5eed_0876,
         },
     ];
 
@@ -369,7 +417,6 @@ mod gate {
         let mut nan_value = mxfp8_bytes(8, 256, 8);
         nan_value[9 * 33 + 5] = 0x7F;
         decls.push(decl("nan_value.weight", mx, (8, 256), nan_value));
-        decls.push(decl("k96.weight", mx, (8, 96), mxfp8_bytes(8, 96, 9)));
         let b128 = GgmlType::FP8_B128;
         let mut inf_scale = fp8_b128_bytes(8, 256, 10);
         inf_scale[5 * 132..][..4].copy_from_slice(&f32::INFINITY.to_le_bytes());
@@ -473,7 +520,6 @@ mod gate {
         for (tag, name, want) in [
             ("mxfp8", "nan_scale.weight", "E8M0's NaN"),
             ("mxfp8", "nan_value.weight", "byte 0x7f"),
-            ("mxfp8", "k96.weight", "have no Mxfp8Planes layout"),
             ("fp8_b128", "b128_inf_scale.weight", "not finite"),
             ("fp8_b128", "b128_nan_value.weight", "byte 0xff"),
             ("fp8_b128", "b128_past_f32.weight", "leaves f32's range"),
@@ -520,6 +566,122 @@ mod gate {
             ok &= plane_shapes(gpu, &g32, (scales_of(ty), tag))?;
         }
         ok &= normalized_head(gpu, dir)?;
+        ok &= autotune_case(gpu, &split, dir)?;
+        Ok(ok)
+    }
+
+    /// The picker over this file's MXFP8 weights (`autotune::tune`) on a
+    /// store of its own (module doc, `autotune`).
+    fn autotune_case(gpu: &Gpu, split: &Split, dir: &Path) -> Result<bool, GateError> {
+        let shapes: Vec<&Shape> = SHAPES.iter().chain(&TAILS).collect();
+        let names: Vec<String> = shapes.iter().map(|s| shape_name(s, "mxfp8")).collect();
+        let w = Weights::load_where(gpu.stream(), split, |n| names.iter().any(|m| m == n))?;
+        let mut sigs: Vec<(usize, usize)> = shapes
+            .iter()
+            .filter(|s| s.k.is_multiple_of(512))
+            .map(|s| (s.rows, s.k))
+            .collect();
+        sigs.sort_unstable();
+        sigs.dedup();
+        let want = sigs.len() * (1..=8).filter(|&m| !Mcol::racing(m).is_empty()).count();
+        let store_dir = dir.join("autotune-store");
+        let store = Store::at(store_dir.clone());
+        let first = autotune::tune(gpu, &w, "gate_mxfp8", &store)?;
+        let second = autotune::tune(gpu, &w, "gate_mxfp8", &store)?;
+        let entry = std::fs::read_dir(&store_dir)?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "costs"))
+            .ok_or("the picker's store holds no entry")?;
+        let bad: String = std::fs::read_to_string(&entry)?
+            .lines()
+            .map(|l| {
+                if l.starts_with("way\t") {
+                    format!("way\t{:016x}\t9\n", 9.0f64.to_bits())
+                } else {
+                    format!("{l}\n")
+                }
+            })
+            .collect();
+        std::fs::write(&entry, bad)?;
+        let third = autotune::tune(gpu, &w, "gate_mxfp8", &store)?;
+        let measured = |t: &Tuned| {
+            t.picks
+                .iter()
+                .filter(|p| p.from == Source::Measured)
+                .count()
+        };
+        let ways = |t: &Tuned| t.picks.iter().map(|p| (p.sig, p.way)).collect::<Vec<_>>();
+        let moved = first.picks.iter().filter(|p| p.way != Mcol::Rule).count();
+        let mut ok = true;
+        for (clause, pass, shown) in [
+            (
+                "miss",
+                first.picks.len() == want && measured(&first) == want,
+                format!(
+                    "picks={} want={want} measured={} moved={moved} wall_ms={}",
+                    first.picks.len(),
+                    measured(&first),
+                    first.wall.as_millis()
+                ),
+            ),
+            (
+                "hit",
+                measured(&second) == 0 && ways(&second) == ways(&first),
+                format!(
+                    "measured={} same_ways={}",
+                    measured(&second),
+                    ways(&second) == ways(&first)
+                ),
+            ),
+            (
+                "bad_entry",
+                measured(&third) == 1 && third.picks.len() == want,
+                format!("measured={} picks={}", measured(&third), third.picks.len()),
+            ),
+        ] {
+            println!("mxfp8 clause=autotune.{clause} {shown} {}", verdict(pass));
+            ok &= pass;
+        }
+        Ok(ok)
+    }
+
+    /// Every way the picker races at `m` columns (`Mcol::racing`) in both
+    /// layouts, through `enqueue_e4m3_gemv_way` (module doc, `ways`).
+    fn ways_case(
+        gpu: &Gpu,
+        w: E4m3Weight<'_>,
+        (x, x_dev): (&[f32], &DeviceBuffer<f32>),
+        (rows, k, m): (usize, usize, usize),
+        (wf, shown): (&[Vec<f32>], &str),
+    ) -> Result<bool, GateError> {
+        let stream = gpu.stream();
+        let walk = |r: usize, c: usize| byte_rule(&wf[r], &x[c * k..][..k]);
+        let token_major = |at: usize| (at % rows, at / rows);
+        let row_major = |at: usize| (at / m, at % m);
+        let mut ok = true;
+        for &way in Mcol::racing(m) {
+            for out in [GemvOut::TokenMajor, GemvOut::RowMajor] {
+                let mut y_dev = DeviceBuffer::from_host(stream, &vec![f32::NAN; m * rows])?;
+                let a = E4m3GemvArgs {
+                    w,
+                    x: x_dev,
+                    m,
+                    out,
+                    y: &mut y_dev,
+                };
+                gpu.q8f32().enqueue_e4m3_gemv_way(stream, a, way)?;
+                stream.synchronize()?;
+                let y = y_dev.to_host_vec(stream)?;
+                let index: &(dyn Fn(usize) -> (usize, usize) + Sync) = match out {
+                    GemvOut::TokenMajor => &token_major,
+                    GemvOut::RowMajor => &row_major,
+                };
+                let shown = format!("{shown} way={} out={out:?}", way.word());
+                ok &= check(("mxfp8", "ways"), &shown, (&y, x, k), wf, index, &walk);
+            }
+        }
         Ok(ok)
     }
 
@@ -650,7 +812,7 @@ mod gate {
             ("k-zero", 1, 0, 1, 0),
             ("rows-zero", 0, 32, 0, 1),
             ("k-overflow", 0, usize::MAX / 4 + 1, 0, 0),
-            ("k-alignment", 8, 40, 8, 1),
+            ("k-alignment", 8, 36, 8, 2),
             ("scale-rows", 8, 32, 9, 1),
             ("scale-width", 8, 32, 8, 2),
         ] {
@@ -738,7 +900,32 @@ mod gate {
             "{tag} clause=plane-shape case=column-overflow tile={tile:?} mma={mma:?} {}",
             verdict(pass)
         );
-        Ok(ok && pass)
+        ok &= pass;
+        if scales == E4m3Scales::Mxfp8 {
+            // A K tail (576: four whole scale words and half of a fifth) the
+            // gemv reads: the wide entries, which walk whole 128-value
+            // records, refuse it by name.
+            let qs = DeviceTensor::<u32>::zeroed(gpu.stream(), 8, 144)?;
+            let e = DeviceTensor::<u32>::zeroed(gpu.stream(), 8, 5)?;
+            let x = DeviceBuffer::<f32>::zeroed(gpu.stream(), 576)?;
+            let w = E4m3Weight {
+                qs: &qs,
+                e: &e,
+                scales,
+            };
+            let tile = g32.enqueue_e4m3_tile(gpu.stream(), w, &x, 1, &mut y);
+            let mma = g32.enqueue_e4m3_mma(gpu.stream(), w, &x, 1, &mut y);
+            let pass = [&tile, &mma].iter().all(|r| {
+                r.as_ref()
+                    .is_err_and(|e| e.to_string().contains("whole 128-value records"))
+            });
+            println!(
+                "{tag} clause=plane-shape case=k-tail-wide tile={tile:?} mma={mma:?} {}",
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        Ok(ok)
     }
 
     /// Parts of the E4M3 type `ty` joined into one weight, as a model joins
@@ -1012,6 +1199,10 @@ mod gate {
                     &|at| (at % wf.len(), at / wf.len()),
                     &walk,
                 );
+            }
+            if !wide && file_ty == GgmlType::MXFP8 && m >= 4 {
+                let e4m3 = w.e4m3("gate_mxfp8", &name)?;
+                ok &= ways_case(gpu, e4m3, (&x, &x_dev), (rows, k, m), (&wf, &shown))?;
             }
             // The listed-row clause lists three rows, more than a shorter
             // matrix may list.

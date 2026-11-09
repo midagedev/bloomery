@@ -1,0 +1,11 @@
+--- a/crates/model/src/arch/kimi_k3/roles.rs
++++ b/crates/model/src/arch/kimi_k3/roles.rs
+@@ -70,7 +70,7 @@
+ pub(super) fn stems_of((mixer, dense): (Kind, bool)) -> Vec<&'static [Stem]> {
+     let mixer = match mixer {
+         Kind::Kda => KDA,
+-        Kind::Mla => MLA,
++        Kind::Mla => KDA,
+     };
+     vec![mixer, MIX, if dense { DENSE } else { ROUTED }]
+ }

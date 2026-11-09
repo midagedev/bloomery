@@ -30,6 +30,7 @@ const OWN_LOAD: &[&str] = &[
     "nemotron_h_moe",
     "gemma-embedding",
     "gemma-embedding2",
+    "kimi-k3",
 ];
 
 /// The engine for whichever architecture a file declares, one arm per

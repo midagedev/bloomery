@@ -1,0 +1,20 @@
+# ctxfloor mutant room-raw
+# clause: R1, a fit past the device's free bytes refused by name (crates/gpu/src/room.rs, the
+#   hw test hw_held_a_fit_past_the_free_bytes_is_refused_by_name in the same file's tests)
+# site: crates/gpu/src/room.rs Room::fit, new_page's driver error passed through raw (the
+#   pre-change line), the named NoRoom refusal gone
+# expected red: "  hw_held_a_fit_past_the_free_bytes_is_refused_by_name ... the refusal's store: FAIL"
+#   (the raw driver error carries none of the named terms the test asserts)
+--- a/crates/gpu/src/room.rs
++++ b/crates/gpu/src/room.rs
+@@ -338,9 +338,7 @@
+                 if self.own(i).is_some() {
+                     continue;
+                 }
+-                let own = self
+-                    .new_page()
+-                    .map_err(|source| self.no_room(positions, i, source))?;
++                let own = self.new_page()?;
+                 self.back(i, Some(own))?;
+                 self.zero(i)?;
+             }

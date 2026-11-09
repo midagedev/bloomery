@@ -1,0 +1,38 @@
+# k31rel. docs/cards/k31-room-sweep.card's 232G row (the plan flipped to a 229 GB arena, host segment 6.5 GB) read 1.0 GB a position
+# over one 640-position request and was ruled worse than the static host set; but that request starts with an empty arena where the
+# static set starts populated (250 GB warm), so the row's bytes hold the arena's fill (229 GB) plus its misses, not its steady state.
+# The fadvise route meanwhile measures a page-cache fill ceiling near 1.7 GB/s whatever the issue order (docs/cards/k31-mirror-probe.card
+# runs 2-6), so the O_DIRECT reader into an anonymous arena (no page cache, no rmap, no TLB shootdowns) is the candidate path, and its
+# one unmeasured term is the warm arena's bytes a position. This probe is the 232G row with n_predict 1024 (the decode alone
+# ~0.9 GB x 1024 at 3 tok/s: ~6 min), reading iostat's rMB/s and the token rate over the decode's course: a warming arena reads
+# fewer bytes a position as it fills, and the last 128 positions' rate is the steady-state estimate. No code changes.
+kind: calibration
+question: over 1024 decode positions on the 229 GB arena plan, do bytes a position fall from ~1.0 GB toward the static set's 0.45-0.7, and what is the last quarter's decode rate?
+term: decode tok/s @ D=512 over n_predict 1024 on the 0.3.13 binary at BLOOMERY_HOST_ROOM=232G (arena=229 GB), with iostat rMB/s per decode quarter beside it
+unit: tok/s
+predict: 2.8..4.5
+condition: tools/ref/k31-nvme-probe.sh with K31_PROBE_N=1024 and K31_PROBE_ENV=BLOOMERY_HOST_ROOM=232G (the later env wins), the 0.3.13 sm86 tarball's
+  bloomery-serve, --place bp --ctx-size 2048, the first 512 prose ids, under one lease; the plan line must print arena near
+  229 GB (else the plan did not flip and the row is not read); the decode's iostat split into quarters of ~256 positions
+reason: [derived] the room sweep's 232G row: 634 GB over 640 positions with the arena filling from empty; if the arena's victim rule
+  keeps a hot set, the fill is ~229 GB of that and the misses ~0.6 GB a position early, falling toward the static set's ~0.5 as it
+  fills; at the reader's 2.2 GB/s a 0.5 GB position is ~230 ms + ~40 = 3.7 tok/s in the last quarter. If the bytes do not fall,
+  the arena's victim rule does not keep the hot set and the reader needs a real LRU before it is the K3.1 path
+decide-in: the arena is the K3.1 decode path to build on: the mirror moves into the reader (two directories, the drive with fewer reads
+  in flight per read), the reader's depth and read size are raised (2 MiB parts, both drives), and a populate of the arena at load
+  from the rank file replaces the empty start
+decide-below: under 2.8 or bytes flat near 1.0 GB a position: the arena's victim rule is the defect (read crates/gpu/src/host for the
+  slot choice) and is fixed before any reader lever; the fadvise route stays the shipped path at 3.7
+decide-above: above 4.5: the warm arena beats the static set already; the mirror-in-reader round is the next and the fadvise route
+  is dropped
+# outcome 2026-11-07 (one request, plan arena=228815781760 host_experts=76910 at 6.5 GB paged=502 GB, n_predict 1024, 139 major
+#  faults, 984 GB over 1,536 positions): tg 3.80 / pp 2.57 tok/s, in the band. nvme0 per decode quarter (256 positions each):
+#  q1 2,283 MB/s = 0.59 GB a position (the fill), q2 1,320 = 0.34, q3 1,299 = 0.33, q4 1,420 = 0.36; aqu-sz 4.6-8.9, rareq-sz
+#  ~560 KiB, r_await 1.9-2.3 ms; nvme1 idle (the tier's reader knows no mirror). decide-in: the warm arena keeps the hot set better
+#  than the populated static set (0.34 against the mapping's 0.45-0.6 GB a position), so the O_DIRECT reader is the K3.1 path to build
+#  on. But the step did not fall with the bytes: [derived] 0.34 GB / 92 = 3.7 MB a layer = ~6-7 requests of ~560 KiB, in flight
+#  together for ~2 ms (r_await), + DRAM 0.33 ms, x 92 = ~215-250 ms: the layer's batch latency, not the bytes, is the step, on
+#  this route as on the mapping's. The 560 KiB requests are the block layer's cut of a ~2 MiB part read into 4 KiB-paged arena
+#  memory (max_segments 128); the drive's latency at that size and depth is the next measurement (docs/cards/k31-fio-lat.card):
+#  at ~0.5 ms a batch the route reaches [derived] 92 x 0.85 + 10 = ~90 ms = ~10 tok/s; at 2 ms it stays near 4.5 and the lever
+#  is hiding the batch (layer-ahead prefetch, several tokens a step).

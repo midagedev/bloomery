@@ -18,7 +18,7 @@ pub mod dense;
 
 /// The file every qwen35 set is dumped from and the tree runs: Clef's text
 /// backbone through mainline's converter and `llama-quantize` Q4_K_M.
-pub const MODEL: &str = "/models/clef-27b/clef-27b-Q4_K_M.gguf";
+pub const MODEL: &str = "/data/moved/models/clef-27b/clef-27b-Q4_K_M.gguf";
 
 /// The mainline commit every qwen35 set names in its `# build` line.
 // PIN(2026-10-02): /home/user/llama.cpp-mainline at its HEAD, the tree that
@@ -39,7 +39,7 @@ pub const HIDDEN_SETS: &[&str] = &[P64, P600, P4096];
 
 /// Clef-Flash (32 layers, width 4,096) as bartowski publishes it at Q8_0:
 /// every projection Q8_0, β and α F32.
-pub const MODEL_FLASH_Q8: &str = "/models/clef-flash/Cloudflare_clef-flash-Q8_0.gguf";
+pub const MODEL_FLASH_Q8: &str = "/data/moved/models/clef-flash/Cloudflare_clef-flash-Q8_0.gguf";
 
 /// The same 64, 600 and 4,096 prose ids (Clef-Flash's tokenizer is the
 /// 27B's, byte for byte) through [`MODEL_FLASH_Q8`].

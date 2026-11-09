@@ -41,6 +41,7 @@ pub mod card;
 pub mod catalog;
 pub mod csf;
 pub mod dspark;
+pub mod engram;
 pub mod fetch;
 pub mod modelopt;
 pub mod quant_config;
@@ -443,9 +444,10 @@ fn tag_of(name: &str) -> String {
     base[at..].to_ascii_uppercase()
 }
 
-/// Checkpoint candidates for a download estimate: all safetensors files and top-level JSON
-/// configs and Jinja templates. `None` without a top-level index. A resolve reads the index
-/// to select and require its shards; this listing alone does not prove completeness.
+/// Checkpoint candidates for a download estimate: all safetensors files, top-level JSON
+/// configs and Jinja templates, and the two files a tiktoken tokenizer reads ([`TIKTOKEN_FILES`]).
+/// `None` without a top-level index. A resolve reads the index to select and require its shards;
+/// this listing alone does not prove completeness.
 pub fn checkpoint_files(entries: &[Entry]) -> Option<Vec<Entry>> {
     entries
         .iter()
@@ -459,12 +461,18 @@ pub fn checkpoint_files(entries: &[Entry]) -> Option<Vec<Entry>> {
         })
 }
 
+/// The top-level files a folder holds its tiktoken vocabulary in (Kimi's: [`vocab`] reads them).
+const TIKTOKEN_FILES: [&str; 2] = ["tiktoken.model", "tokenization_kimi.py"];
+
 fn checkpoint_config(entry: &Entry) -> bool {
-    !entry.path.contains('/') && (entry.path.ends_with(".json") || entry.path.ends_with(".jinja"))
+    !entry.path.contains('/')
+        && (entry.path.ends_with(".json")
+            || entry.path.ends_with(".jinja")
+            || TIKTOKEN_FILES.contains(&entry.path.as_str()))
 }
 
-/// The checkpoint's index, shards named by its `weight_map` and top-level JSON configs and
-/// Jinja templates, in listing order. Every shard must be a relative path present in `entries`.
+/// The checkpoint's index, shards named by its `weight_map`, top-level JSON configs, Jinja
+/// templates and [`TIKTOKEN_FILES`], in listing order. Every shard must be a relative path present in `entries`.
 pub(crate) fn checkpoint_manifest(
     repo: &str,
     entries: &[Entry],
@@ -1090,6 +1098,56 @@ mod tests {
             check: Check::GitSha1,
             digest: "0".repeat(40),
         }
+    }
+
+    /// A Kimi folder's vocabulary is `tiktoken.model` and `tokenization_kimi.py`; a download of the
+    /// checkpoint takes both beside its configs, and no other top-level or nested file.
+    #[test]
+    fn a_checkpoint_fetch_takes_the_tiktoken_files() {
+        let paths = [
+            "model.safetensors.index.json",
+            "model-00001-of-00002.safetensors",
+            "config.json",
+            "chat_template.jinja",
+            "tiktoken.model",
+            "tokenization_kimi.py",
+            "configuration_kimi_k3.py",
+            "media_utils.py",
+            "sub/tiktoken.model",
+            "sub/tokenization_kimi.py",
+            "README.md",
+        ];
+        let entries: Vec<Entry> = paths.iter().map(|p| entry(p)).collect();
+        let got = |files: Vec<Entry>| files.into_iter().map(|e| e.path).collect::<Vec<_>>();
+        let want = [
+            "model.safetensors.index.json",
+            "model-00001-of-00002.safetensors",
+            "config.json",
+            "chat_template.jinja",
+            "tiktoken.model",
+            "tokenization_kimi.py",
+        ];
+        assert_eq!(got(checkpoint_files(&entries).unwrap()), want);
+        let index =
+            std::env::temp_dir().join(format!("tiktoken-manifest-{}.json", std::process::id()));
+        std::fs::write(
+            &index,
+            br#"{"weight_map":{"a":"model-00001-of-00002.safetensors"}}"#,
+        )
+        .unwrap();
+        let listed = checkpoint_manifest("a/b", &entries, &index).map(got);
+        std::fs::remove_file(&index).unwrap();
+        assert_eq!(
+            listed.unwrap(),
+            [
+                "model.safetensors.index.json",
+                "model-00001-of-00002.safetensors",
+                "config.json",
+                "chat_template.jinja",
+                "tiktoken.model",
+                "tokenization_kimi.py",
+            ]
+        );
     }
 
     fn pick_of(files: &[&str], model: &str) -> Option<String> {

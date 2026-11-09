@@ -1,0 +1,15 @@
+# bloomery-quantize's card rate on one real routed-expert stack, A6000, IQ1_S: the quantize call's weights/s with the card,
+# PCIe and host terms apart. The band is the two rows docs/research/iq-quant-card.md holds, both taken unleased beside a
+# 64-thread llama-imatrix: the whole call at 14.3 s a 9.865e9-weight stack (6.9e8 weights/s, tools/ref/k31-quant.sh
+# GPU_STACK_S) and the search kernel alone at 1.09e9 weights/s. A leased quiet host moves the host and PCIe terms, not the
+# search, so the call's rate sits at or above the unleased one and below the search kernel's own rate [derived].
+kind: calibration
+question: what rate does the card quantizer reach on a K3.1 routed-expert stack on a quiet machine, and which term is the wall?
+term: weights/s of one quantize call over a whole IQ1_S stack of ne0 3584, 3072 rows, 896 experts (9.865e9 weights) in batches of 32 experts, MXFP4 source, A6000, `iq_quant_probe` via tools/ref/quant-measure.sh
+unit: Mweights/s
+predict: 690..1090
+condition: just quant-measure in one lease on the A6000 (tools/ref/timing-card.sh), the witness blocks showing no other process on the card and a quiet host (loadavg and /proc/pressure/io at their start and end); the stack is read from the K3.1 set on its drive, so a cold page cache reads at the drive's rate under the card's time (the probe's read term says which)
+reason: sets the card term of the --plan wall of bloomery-quantize (CARD_WEIGHTS_PER_S in crates/quantize/src/plan.rs, now the unleased rows' 1.09e9 and 8.3e8 search rates) and GPU_STACK_S in tools/ref/k31-quant.sh, which the K3.1 production run's card-set wall multiplies by 254 stacks; why now: the first release of the binary, whose docs carry no speed until a leased number exists
+decide-in: keep GPU_STACK_S and the plan's rates, and add this lease to docs/research/iq-quant-card.md's measured row
+decide-below: set GPU_STACK_S to the leased value and look at the terms: a host or PCIe term over the search means the flow, not the kernel, is the next lever (asynchronous upload, bulk host words)
+decide-above: set GPU_STACK_S to the leased value and shorten the production run's card-set wall by the same ratio

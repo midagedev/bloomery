@@ -1,0 +1,12 @@
+--- a/crates/gpu-gates/src/bin/shared/serve_seats/hybrid.rs
++++ b/crates/gpu-gates/src/bin/shared/serve_seats/hybrid.rs
+@@ -312,7 +312,8 @@
+         group: a.group,
+         slots: a.slots,
+     };
+-    let loaded = match a.flags.pass.take() {
++    // mutant k3seatpass-open-stepped: the seat plans the pass and opens the stepped body.
++    let loaded = match a.flags.pass.take().filter(|_| false) {
+         Some((inputs, open)) => open_pass(file, (&inputs, open), &machine, (a.ctx, cfg), &mut log)?,
+         None => {
+             let args = OpenArgs {

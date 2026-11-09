@@ -19,8 +19,8 @@ use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::kv_format::KvQ8;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::GateError;
-use bloomery_gpu_gates::generate::stage_page;
-use bloomery_levers::HostCfg;
+use bloomery_gpu_gates::generate::{stage_host_page, stage_page};
+use bloomery_levers::{HostCfg, KvHost};
 use gguf::Split;
 use model::arch::qwen35moe::place::{
     Experts, PlaceError, PlanInputs, card_route_run, machine_for_route, widen_card_route,
@@ -66,6 +66,9 @@ pub struct Open38<'a> {
     pub residency: Residency,
     /// The KV cache's format: the plan counts its bytes and the load allocates it.
     pub kv: KvQ8,
+    /// Where the K/V planes back their pages (`BLOOMERY_KV_HOST`): the plan's
+    /// terms and the load's stores take it.
+    pub kv_host: KvHost,
 }
 
 /// What the plan the load was made by holds, as a gate prints it.
@@ -121,6 +124,9 @@ impl<'a> Open38<'a> {
             inputs.room = (r, HostRead::Given);
         }
         inputs.kv = inputs.kv.in_q8_if(self.kv == KvQ8::Q8);
+        if self.kv_host != KvHost::Off {
+            inputs.kv_host_page = Some(stage_host_page(self.card)?);
+        }
         let ub = u64::try_from(self.ub)?;
         let form = inputs.route_form(bloomery_gpu::NATIVE_FP4);
         let mut machine = machine_for_route(self.card, inputs.stack(), ub, self.experts, form);
@@ -129,6 +135,7 @@ impl<'a> Open38<'a> {
             &mut machine,
             (u64::try_from(self.ctx)?, u64::try_from(self.slots)?, drafts),
             page,
+            self.kv_host,
         )?;
         let (machine, ()) = widen_card_route(
             machine,

@@ -44,6 +44,10 @@ pub struct Available {
     pub runs: fn(&Need) -> bool,
 }
 
+/// The programs whose trunk mixes delta layers and gated latent layers over the situ GLU blocks and
+/// the card leg's routed stacks: each runs the rows and type pins that trunk needs alike.
+const LATENT_TRUNK: &[Program] = &[Program::Raon1Body, Program::KimiK3Body];
+
 /// Everything the programs run that a [`Need`] names, beside the rows a
 /// family's own code keeps ([`rows`]). A need no row covers is an item of
 /// [`check`]; a row removed makes its needs items.
@@ -803,8 +807,8 @@ pub const AVAILABLE: &[Available] = &[
         },
     },
     Available {
-        programs: &[Program::Raon1Body],
-        at: "gpu/src/arch/raon1/mla.rs (the absorbed heads over gpu/src/latent.rs LATENT, \
+        programs: LATENT_TRUNK,
+        at: "gpu/src/arch/gated_mla.rs (the absorbed heads over gpu/src/latent.rs LATENT, \
              latent_extra_rms_append)",
         runs: |n| {
             matches!(
@@ -818,24 +822,24 @@ pub const AVAILABLE: &[Available] = &[
         },
     },
     Available {
-        programs: &[Program::Raon1Body],
+        programs: LATENT_TRUNK,
         at: "gpu/src/latent.rs latent_extra_rms_append (the extra values first, raw, at most 128)",
         runs: |n| matches!(n, Need::LatentPe { width } if (1..=128).contains(width)),
     },
     Available {
-        programs: &[Program::Raon1Body],
-        at: "gpu/src/arch/raon1/mla.rs (attn_gate, then gpu/src/linear/out_gate.rs)",
+        programs: LATENT_TRUNK,
+        at: "gpu/src/arch/gated_mla.rs (attn_gate, then gpu/src/linear/out_gate.rs)",
         runs: |n| matches!(n, Need::LatentOutGate),
     },
     Available {
-        programs: &[Program::Raon1Body],
-        at: "gpu/src/arch/raon1/ffn.rs Glu (the gate and up sites, gpu/src/elem.rs enqueue_situ, the \
+        programs: LATENT_TRUNK,
+        at: "gpu/src/arch/routed_ffn.rs Glu (the gate and up sites, gpu/src/elem.rs enqueue_situ, the \
              down site)",
         runs: |n| matches!(n, Need::Situ { ff } if ff.is_multiple_of(32)),
     },
     Available {
-        programs: &[Program::Raon1Body],
-        at: "gpu/src/arch/raon1/ffn.rs (the card leg's gate·up `_sel` under kquant::Act::Situ, \
+        programs: LATENT_TRUNK,
+        at: "gpu/src/arch/routed_ffn.rs (the card leg's gate·up `_sel` under kquant::Act::Situ, \
              SITU_LINEAR_BETA)",
         runs: |n| {
             matches!(
@@ -848,8 +852,8 @@ pub const AVAILABLE: &[Available] = &[
         },
     },
     Available {
-        programs: &[Program::Raon1Body],
-        at: "gpu/src/arch/raon1/ffn.rs Routed.shared (the shared expert's Glu block, added after \
+        programs: LATENT_TRUNK,
+        at: "gpu/src/arch/routed_ffn.rs Routed.shared (the shared expert's Glu block, added after \
              the routed sum)",
         runs: |n| {
             matches!(
@@ -862,8 +866,8 @@ pub const AVAILABLE: &[Available] = &[
         },
     },
     Available {
-        programs: &[Program::Raon1Body],
-        at: "gpu/src/arch/raon1/ffn.rs Routed.shared (gpu/src/elem.rs enqueue_situ between the \
+        programs: LATENT_TRUNK,
+        at: "gpu/src/arch/routed_ffn.rs Routed.shared (gpu/src/elem.rs enqueue_situ between the \
              shared expert's gate·up and down sites, SITU_LINEAR_BETA)",
         runs: |n| {
             matches!(
@@ -889,12 +893,12 @@ pub const AVAILABLE: &[Available] = &[
         },
     },
     Available {
-        programs: &[Program::Raon1Body],
+        programs: LATENT_TRUNK,
         at: "gpu/src/arch/raon1/body.rs Mixer::Rda (the state, the stamp and the conv ring, one lane)",
         runs: |n| matches!(n, Need::RecurrentState),
     },
     Available {
-        programs: &[Program::Raon1Body],
+        programs: LATENT_TRUNK,
         at: "gpu/src/arch/raon1/body.rs Mixer (a delta or a latent mixer per layer's kind)",
         runs: |n| matches!(n, Need::MixedTrunk),
     },
@@ -1592,7 +1596,7 @@ const RAON1_FFN: &[GgmlType] = &[
 /// rows: the types it reads are those `row` takes, so a type the table gains
 /// is admitted with no edit here.
 struct RowPin {
-    program: Program,
+    programs: &'static [Program],
     role: Role,
     /// As [`TypePin::matrices`].
     matrices: bool,
@@ -1618,7 +1622,7 @@ struct RowPin {
 /// types its row takes or the table row it follows.
 const ROW_PINS: &[RowPin] = &[
     RowPin {
-        program: Program::FlintBody,
+        programs: &[Program::FlintBody],
         role: Role::Attention,
         matrices: true,
         names: None,
@@ -1626,7 +1630,7 @@ const ROW_PINS: &[RowPin] = &[
         row: h128_projection,
     },
     RowPin {
-        program: Program::FlintBody,
+        programs: &[Program::FlintBody],
         role: Role::DenseFfn,
         matrices: true,
         names: None,
@@ -1634,7 +1638,7 @@ const ROW_PINS: &[RowPin] = &[
         row: gated_block_site,
     },
     RowPin {
-        program: Program::FlintBody,
+        programs: &[Program::FlintBody],
         role: Role::SharedExpert,
         matrices: true,
         names: None,
@@ -1642,7 +1646,7 @@ const ROW_PINS: &[RowPin] = &[
         row: gated_block_site,
     },
     RowPin {
-        program: Program::FlintBody,
+        programs: &[Program::FlintBody],
         role: Role::TokenEmbedding,
         matrices: true,
         names: None,
@@ -1650,7 +1654,7 @@ const ROW_PINS: &[RowPin] = &[
         row: |ty| embed_of_widened(ty).is_some(),
     },
     RowPin {
-        program: Program::FlintBody,
+        programs: &[Program::FlintBody],
         role: Role::Head,
         matrices: true,
         names: None,
@@ -1664,7 +1668,7 @@ const ROW_PINS: &[RowPin] = &[
     // `gate_qwen4exp_e2e` runs on the fixture variant `q38dense`. The shared expert's down has K = 640, not whole
     // super-blocks of 256, so no q8_1 family reads it: its own pin keeps the f32-row types.
     RowPin {
-        program: Program::Qwen38Body,
+        programs: &[Program::Qwen38Body],
         role: Role::Attention,
         matrices: true,
         names: None,
@@ -1672,7 +1676,7 @@ const ROW_PINS: &[RowPin] = &[
         row: |ty| dense_projected(ty).is_some(),
     },
     RowPin {
-        program: Program::Qwen38Body,
+        programs: &[Program::Qwen38Body],
         role: Role::SharedExpert,
         matrices: true,
         names: None,
@@ -1680,7 +1684,7 @@ const ROW_PINS: &[RowPin] = &[
         row: |ty| dense_projected(ty).is_some(),
     },
     RowPin {
-        program: Program::Qwen38Body,
+        programs: &[Program::Qwen38Body],
         role: Role::SharedExpert,
         matrices: true,
         names: Some(|n| n.ends_with(".ffn_down_shexp.weight")),
@@ -1692,7 +1696,7 @@ const ROW_PINS: &[RowPin] = &[
     // q8_0 alone; each type is a launch of `site.rs`, which the family's e2e
     // gate runs on its mixer fixture variants.
     RowPin {
-        program: Program::Glm5nextBody,
+        programs: &[Program::Glm5nextBody],
         role: Role::Attention,
         matrices: true,
         names: Some(|n| {
@@ -1708,7 +1712,7 @@ const ROW_PINS: &[RowPin] = &[
     // read, so these two rows keep BF16 where the qwen3moe body's
     // (`head_of_widened`, `embed_of_widened`) do not.
     RowPin {
-        program: Program::Qwen38Body,
+        programs: &[Program::Qwen38Body],
         role: Role::Head,
         matrices: true,
         names: None,
@@ -1716,7 +1720,7 @@ const ROW_PINS: &[RowPin] = &[
         row: |ty| crate::placement::kernels::head(ty).is_some(),
     },
     RowPin {
-        program: Program::Qwen38Body,
+        programs: &[Program::Qwen38Body],
         role: Role::TokenEmbedding,
         matrices: true,
         names: None,
@@ -1724,7 +1728,7 @@ const ROW_PINS: &[RowPin] = &[
         row: |ty| crate::placement::kernels::embed(ty).is_some(),
     },
     RowPin {
-        program: Program::Qwen3moeBody,
+        programs: &[Program::Qwen3moeBody],
         role: Role::Attention,
         matrices: true,
         names: None,
@@ -1732,7 +1736,7 @@ const ROW_PINS: &[RowPin] = &[
         row: |ty| qwen3moe_dense(ty).is_some(),
     },
     RowPin {
-        program: Program::Qwen3moeBody,
+        programs: &[Program::Qwen3moeBody],
         role: Role::Head,
         matrices: true,
         names: None,
@@ -1740,7 +1744,7 @@ const ROW_PINS: &[RowPin] = &[
         row: |ty| head_of_widened(ty).is_some(),
     },
     RowPin {
-        program: Program::Qwen3moeBody,
+        programs: &[Program::Qwen3moeBody],
         role: Role::TokenEmbedding,
         matrices: true,
         names: None,
@@ -1748,7 +1752,7 @@ const ROW_PINS: &[RowPin] = &[
         row: |ty| embed_of_widened(ty).is_some(),
     },
     RowPin {
-        program: Program::Glm5nextBody,
+        programs: &[Program::Glm5nextBody],
         role: Role::TokenEmbedding,
         matrices: true,
         names: None,
@@ -1756,7 +1760,7 @@ const ROW_PINS: &[RowPin] = &[
         row: GgmlType::has_dequant,
     },
     RowPin {
-        program: Program::Mimo2Body,
+        programs: &[Program::Mimo2Body],
         role: Role::TokenEmbedding,
         matrices: true,
         names: None,
@@ -1764,7 +1768,7 @@ const ROW_PINS: &[RowPin] = &[
         row: GgmlType::has_dequant,
     },
     RowPin {
-        program: Program::Solar2Body,
+        programs: &[Program::Solar2Body],
         role: Role::TokenEmbedding,
         matrices: true,
         names: None,
@@ -1772,7 +1776,7 @@ const ROW_PINS: &[RowPin] = &[
         row: GgmlType::has_dequant,
     },
     RowPin {
-        program: Program::GemmaEmbedding2Body,
+        programs: &[Program::GemmaEmbedding2Body],
         role: Role::TokenEmbedding,
         matrices: true,
         names: None,
@@ -1780,7 +1784,7 @@ const ROW_PINS: &[RowPin] = &[
         row: GgmlType::has_dequant,
     },
     RowPin {
-        program: Program::GemmaEmbedding2Body,
+        programs: &[Program::GemmaEmbedding2Body],
         role: Role::EngramDense,
         matrices: true,
         names: Some(per_layer_model_proj),
@@ -1788,7 +1792,7 @@ const ROW_PINS: &[RowPin] = &[
         row: GgmlType::has_dequant,
     },
     RowPin {
-        program: Program::Qwen3moeBody,
+        programs: &[Program::Qwen3moeBody],
         role: Role::RoutedExperts,
         matrices: true,
         names: Some(routed_gate_up),
@@ -1796,7 +1800,7 @@ const ROW_PINS: &[RowPin] = &[
         row: prompt_leg_gate_up,
     },
     RowPin {
-        program: Program::Qwen3moeBody,
+        programs: &[Program::Qwen3moeBody],
         role: Role::RoutedExperts,
         matrices: true,
         names: Some(routed_down),
@@ -1804,7 +1808,7 @@ const ROW_PINS: &[RowPin] = &[
         row: prompt_leg_down,
     },
     RowPin {
-        program: Program::Qwen35Body,
+        programs: &[Program::Qwen35Body],
         role: Role::SharedExpert,
         matrices: true,
         names: None,
@@ -1812,7 +1816,7 @@ const ROW_PINS: &[RowPin] = &[
         row: |ty| qwen35_shared(ty).is_some(),
     },
     RowPin {
-        program: Program::Qwen35Body,
+        programs: &[Program::Qwen35Body],
         role: Role::RoutedExperts,
         matrices: true,
         names: Some(routed_gate_up),
@@ -1820,7 +1824,7 @@ const ROW_PINS: &[RowPin] = &[
         row: prompt_leg_gate_up,
     },
     RowPin {
-        program: Program::Qwen35Body,
+        programs: &[Program::Qwen35Body],
         role: Role::RoutedExperts,
         matrices: true,
         names: Some(routed_down),
@@ -1828,7 +1832,7 @@ const ROW_PINS: &[RowPin] = &[
         row: prompt_leg_down,
     },
     RowPin {
-        program: Program::Raon1Body,
+        programs: LATENT_TRUNK,
         role: Role::Head,
         matrices: true,
         names: None,
@@ -1836,7 +1840,7 @@ const ROW_PINS: &[RowPin] = &[
         row: |ty| head_of_widened(ty).is_some(),
     },
     RowPin {
-        program: Program::Raon1Body,
+        programs: LATENT_TRUNK,
         role: Role::TokenEmbedding,
         matrices: true,
         names: None,
@@ -1844,7 +1848,7 @@ const ROW_PINS: &[RowPin] = &[
         row: |ty| embed_of_widened(ty).is_some(),
     },
     RowPin {
-        program: Program::Raon1Body,
+        programs: LATENT_TRUNK,
         role: Role::RoutedExperts,
         matrices: true,
         names: Some(routed_gate_up),
@@ -1852,7 +1856,7 @@ const ROW_PINS: &[RowPin] = &[
         row: crate::placement::kernels::card_gate_up_runs,
     },
     RowPin {
-        program: Program::Raon1Body,
+        programs: LATENT_TRUNK,
         role: Role::RoutedExperts,
         matrices: true,
         names: Some(routed_down),
@@ -1860,7 +1864,7 @@ const ROW_PINS: &[RowPin] = &[
         row: resident_down_runs,
     },
     RowPin {
-        program: Program::NemotronHMoeBody,
+        programs: &[Program::NemotronHMoeBody],
         role: Role::SharedExpert,
         matrices: false,
         names: None,
@@ -1869,7 +1873,7 @@ const ROW_PINS: &[RowPin] = &[
         row: |ty| ty == BOLT_LEG || ty == GgmlType::Q8_0 || ty == GgmlType::NVFP4,
     },
     RowPin {
-        program: Program::MuseSparkBody,
+        programs: &[Program::MuseSparkBody],
         role: Role::TokenEmbedding,
         matrices: true,
         names: None,
@@ -2016,6 +2020,46 @@ const SIGMOID_ROUTERS: &[(u32, u32)] = &[(288, 8), (256, 8), (320, 8), (128, 6)]
 /// same pick (`sigmoid_16_8`).
 const MUSE_ROUTERS: &[(u32, u32)] = &[(256, 8), (16, 8)];
 
+/// The item for a dense matrix the host engine cannot multiply: a quantized matrix of a role it
+/// runs (`ops` over `qdot`) whose type has no fused kernel at its row width. A norm gain or
+/// bias (one dim, or f32) is not a matrix, and a routed stack is the routed arm's.
+fn host_matrix_unrun(t: &ModelTensor) -> Option<Need> {
+    let matrix = t.dims.len() >= 2 && t.ty != GgmlType::F32;
+    let runs_matmul = matches!(
+        t.role,
+        Role::Attention | Role::DenseFfn | Role::SharedExpert | Role::Router | Role::Head
+    );
+    let k = usize::try_from(t.dims.first().copied().unwrap_or(0)).unwrap_or(usize::MAX);
+    (matrix && runs_matmul && !qdot::fuses(t.ty, k)).then_some(Need::WeightFormat {
+        what: "host matmul (no fused qdot kernel)",
+        ty: t.ty,
+    })
+}
+
+/// What the host engine (`crates/model`) runs of a described file, one row per site: the router
+/// that picks the top experts of a softmax, the SwiGLU feed-forward and the ungated shared
+/// expert. The attention mixers, the recurrent layers, the hyper-connections and the gated
+/// shared expert have no host owner yet, so a file that needs one lists it by name. The
+/// deepseek2 file the engine runs whole has no description ([`Arch::Deepseek2`] has no reader);
+/// the seat serves it by its architecture string.
+pub const HOST_AVAILABLE: &[Available] = &[
+    Available {
+        programs: &[Program::Host],
+        at: "model/src/moe.rs route_with (softmax over the experts, top-k by probability)",
+        runs: |n| routes(n, &[RouterBody::Softmax]),
+    },
+    Available {
+        programs: &[Program::Host],
+        at: "model/src/ffn.rs dense_ffn_with (SwiGLU)",
+        runs: |n| matches!(n, Need::DenseFfn { .. }),
+    },
+    Available {
+        programs: &[Program::Host],
+        at: "model/src/arch/deepseek2/forward.rs (the shared expert, ungated)",
+        runs: ungated_shared,
+    },
+];
+
 /// The type pins of `program` (every program's when `None`), [`TYPE_PINS`]
 /// then [`ROW_PINS`], that tensor `t` is of a type none of reads, as items:
 /// with a program, each pin of its role (and name) whose types do not hold
@@ -2037,14 +2081,7 @@ fn weight_formats(program: Option<Program>, t: &ModelTensor) -> Vec<Need> {
         .chain(
             ROW_PINS
                 .iter()
-                .filter(|pin| {
-                    takes(
-                        std::slice::from_ref(&pin.program),
-                        pin.role,
-                        pin.matrices,
-                        pin.names,
-                    )
-                })
+                .filter(|pin| takes(pin.programs, pin.role, pin.matrices, pin.names))
                 .map(|pin| (pin.what, (pin.row)(t.ty))),
         )
         .collect();
@@ -2109,7 +2146,26 @@ pub fn check_with(
     model: &ModelTensors,
     available: &[Available],
 ) -> Vec<Unimplemented> {
-    let program = program_of(spec.arch);
+    check_for(spec, model, available, program_of(spec.arch))
+}
+
+/// Every part of `spec` (with its tensors `model`) that the host engine does not run, as
+/// [`check`] lists them for a card program: the needs no [`HOST_AVAILABLE`] row covers, the
+/// routed stacks and matrices `qdot` has no fused kernel for, and the model-wide parts (the
+/// pre-tokenizer, the tool parser). A start with no card, or one that asks for the host, ends
+/// `unsupported` with this list for a file it is not empty for.
+#[must_use]
+pub fn check_host(spec: &ModelSpec, model: &ModelTensors) -> Vec<Unimplemented> {
+    check_for(spec, model, HOST_AVAILABLE, Some(Program::Host))
+}
+
+/// [`check_with`] for `program`, which is the architecture's own except for the host.
+fn check_for(
+    spec: &ModelSpec,
+    model: &ModelTensors,
+    available: &[Available],
+    program: Option<Program>,
+) -> Vec<Unimplemented> {
     let mut out = Vec::new();
     let mut at = |layer: Option<usize>, need: Need| {
         let f = Unimplemented {
@@ -2175,6 +2231,13 @@ pub fn check_with(
                         at(t.layer, Need::RoutedFormat(t.ty));
                     }
                 }
+                // The host engine holds every stack: it passes when a qdot
+                // fused kernel serves the type at the stack's row width.
+                Some(Program::Host) => {
+                    if routed_unrun(t, |_| false) {
+                        at(t.layer, Need::RoutedFormat(t.ty));
+                    }
+                }
                 // The one still to be written needs a card expert kernel for
                 // the type.
                 None => {
@@ -2187,6 +2250,7 @@ pub fn check_with(
                 // by name and part (the default expert rule's card formats
                 // would pass q3_K and q6_K gate·up to the load's refusal).
                 Some(Program::Qwen3moeBody | Program::Qwen35Body | Program::Raon1Body) => {}
+                Some(Program::KimiK3Body) => {}
                 // These bodies are dense: a routed stack is an item.
                 Some(Program::NemotronHBody | Program::GemmaEmbedding2Body) => {
                     at(t.layer, Need::RoutedFormat(t.ty));
@@ -2214,6 +2278,11 @@ pub fn check_with(
             }
         }
         for need in weight_formats(program, t) {
+            at(t.layer, need);
+        }
+        if program == Some(Program::Host)
+            && let Some(need) = host_matrix_unrun(t)
+        {
             at(t.layer, need);
         }
     }
@@ -2682,11 +2751,17 @@ mod tests {
                     role: pin.role,
                     ..matrix("", pin.role, ty)
                 };
-                let item = weight_formats(Some(pin.program), &t)
-                    .iter()
-                    .any(|n| n.to_string() == format!("{ty} {}", pin.what));
-                let is_matrix = t.dims.len() >= 2 && ty != GgmlType::F32;
-                assert_eq!(item, !(pin.row)(ty) && (!pin.matrices || is_matrix), "{ty}");
+                for &program in pin.programs {
+                    let item = weight_formats(Some(program), &t)
+                        .iter()
+                        .any(|n| n.to_string() == format!("{ty} {}", pin.what));
+                    let is_matrix = t.dims.len() >= 2 && ty != GgmlType::F32;
+                    assert_eq!(
+                        item,
+                        !(pin.row)(ty) && (!pin.matrices || is_matrix),
+                        "{program:?} {ty}"
+                    );
+                }
             }
         }
     }
@@ -3110,6 +3185,82 @@ mod tests {
                 "{ty}"
             );
         }
+    }
+
+    /// The host engine's rows cover the softmax router, the SwiGLU feed-forward and the ungated
+    /// shared expert, and none of the mixers, recurrent layers or gated shared experts a Qwen3.6
+    /// layer needs: those are listed by name, and no card program's row stands in for them.
+    /// FAIL-first: a row of [`super::HOST_AVAILABLE`] removed lists its need.
+    #[test]
+    fn the_host_rows_cover_what_the_engine_runs_and_list_the_rest() {
+        use super::{HOST_AVAILABLE, Program};
+        let runs = |n: &Need| {
+            HOST_AVAILABLE
+                .iter()
+                .any(|a| a.programs.contains(&Program::Host) && (a.runs)(n))
+        };
+        assert!(runs(&Need::DenseFfn { ff: 6144 }));
+        assert!(runs(&Need::Shared {
+            ff: 2048,
+            sigmoid_gate: false
+        }));
+        for (what, need) in [
+            (
+                "the sigmoid-gated shared expert",
+                Need::Shared {
+                    ff: 512,
+                    sigmoid_gate: true,
+                },
+            ),
+            ("the output gate", Need::OutGate),
+            ("a short conv", Need::ShortConv { taps: 4 }),
+            ("hyper-connections", Need::Hc { streams: 4 }),
+            (
+                "a grouped-query flash",
+                Need::Gqa {
+                    head: 256,
+                    value: 256,
+                    group: 8,
+                    window: None,
+                    sinks: false,
+                    scaled: false,
+                },
+            ),
+        ] {
+            assert!(!runs(&need), "{what}");
+        }
+    }
+
+    /// A routed stack and a dense matrix the host engine lists when `qdot` has no fused kernel
+    /// for the type at the row width, and only then.
+    #[test]
+    fn the_host_lists_a_matrix_and_a_stack_qdot_cannot_multiply() {
+        let tensor = |role: Role, ty: GgmlType, dims: Vec<u64>| ModelTensor {
+            name: "blk.0.w.weight".to_owned(),
+            shard: 0,
+            layer: Some(0),
+            role,
+            ty,
+            dims,
+            file_bytes: 0,
+            gathered_rows: None,
+        };
+        assert!(
+            super::host_matrix_unrun(&tensor(Role::Attention, GgmlType::Q4_K, vec![2048, 2048]))
+                .is_none()
+        );
+        let bad =
+            super::host_matrix_unrun(&tensor(Role::Attention, GgmlType::Q4_K, vec![100, 2048]))
+                .expect("a width no fused kernel takes");
+        assert!(bad.to_string().contains("host matmul"), "{bad}");
+        // A norm gain is no matrix, and an f32 router is not read by a fused kernel.
+        assert!(
+            super::host_matrix_unrun(&tensor(Role::FfnNorm, GgmlType::F32, vec![2048])).is_none()
+        );
+        assert!(
+            super::host_matrix_unrun(&tensor(Role::Router, GgmlType::F32, vec![2048, 64]))
+                .is_none()
+        );
     }
 
     /// The items [`super::check`] lists for a glm5next file holding

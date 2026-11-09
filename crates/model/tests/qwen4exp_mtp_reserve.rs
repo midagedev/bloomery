@@ -30,8 +30,8 @@ use model::arch::models::{
 };
 use model::arch::qwen35moe::mtp::BorrowedHead;
 use model::arch::qwen35moe::place::{
-    Experts, FileTensor, KvLayout, MtpInputs, PlanInputs, UBATCH_PLANNED, mtp_head_act_bytes,
-    mtp_tensors,
+    Experts, FileTensor, KvLayout, MtpInputs, PlanInputs, StoreRows, UBATCH_PLANNED,
+    mtp_head_act_bytes, mtp_tensors,
 };
 use model::placement::workstation::{CONTEXT, GRANULE, MARGIN, SCRATCH};
 use model::placement::{
@@ -97,6 +97,7 @@ fn description() -> ModelSpec {
             latent: None,
             pre_exp_norm: false,
             post_exp_norm: None,
+            sum_norm: false,
             act: Act::SwiGlu { limit: None },
             router: Router {
                 score: Score::Softmax,
@@ -211,6 +212,7 @@ fn inputs() -> PlanInputs {
         room: (u64::MAX, model::placement::workstation::HostRead::Given),
         row_source: model::placement::RowTableSource::Split,
         arena: None,
+        kv_host_page: None,
     }
 }
 
@@ -255,6 +257,7 @@ fn draft() -> MtpDraft {
                 latent: None,
                 pre_exp_norm: false,
                 post_exp_norm: None,
+                sum_norm: false,
                 act: Act::SwiGlu { limit: None },
                 router: Router {
                     score: Score::Softmax,
@@ -458,11 +461,21 @@ const EXPERT_BYTES: u64 = 2 * (640 * 2560 / 256 * 144) + 2560 * 640 / 32 * 34;
 // draft's card bytes. The host room is now capped at the pool, so a pool short
 // of the need splits the host's experts onto the NVMe tier down to the split's
 // floor, and the break is a named placement refusal there, never `PoolOver`.
+///
+/// Held at each arena the plan chooses between ([`StoreRows`]): the draft's bytes are counted
+/// once whichever store walk it holds; the plan's choice between the two is
+/// `the_store_walk_*` in place.rs.
 #[test]
 fn a_drafted_plan_on_one_pool_counts_the_draft_once() {
+    for rows in [StoreRows::Least, StoreRows::Most] {
+        counts_the_draft_once(rows);
+    }
+}
+
+fn counts_the_draft_once(rows: StoreRows) {
     let inputs = inputs();
     let levers = PlanLevers::default();
-    let q8 = mtp(BorrowedHead::Q8_0);
+    let q8 = mtp(BorrowedHead::Q8_0).asking(rows);
     // The plan's host headroom, its host experts paged from the NVMe tier and
     // what the pool holds past its cards and host, or its refusal.
     let plan = |experts, slots, pool| {

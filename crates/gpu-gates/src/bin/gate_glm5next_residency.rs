@@ -171,7 +171,7 @@ mod gate {
     use std::time::Instant;
 
     use app::arch::glm5next::{GlmCfg, open_nextn, open_resident};
-    use app::mtp::MtpDraft;
+    use app::mtp::{MtpDraft, open_draft};
     use app::{Loaded, OpenArgs, Session, SessionError};
     use bloomery_gpu::GpuError;
     use bloomery_gpu::host::PassKind;
@@ -1143,7 +1143,7 @@ mod gate {
         let t = Instant::now();
         s.clear()?;
         s.model_mut().body_parts(NAME)?.2.take_residency_passes();
-        let draft = MtpDraft::open(s.model(), PrefillMode::Batch, StepMode::Eager)?;
+        let draft = open_draft(s.model(), PrefillMode::Batch, StepMode::Eager)?;
         let mut spec = s.with_draft::<MtpDraft<Body>, PAIR>(draft, &mut Quiet)?;
         let first = spec.prompt(s, ids)?;
         let mut w = Windows::default();

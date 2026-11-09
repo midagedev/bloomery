@@ -1,0 +1,11 @@
+--- a/crates/gpu/src/linear/conv.rs
++++ b/crates/gpu/src/linear/conv.rs
+@@ -452,7 +452,7 @@
+ fn kda_decay<const GATE: u32>(f: f32, dt: f32, sa: f32, lb: f32) -> f32 {
+     const { assert!(GATE == KDA_GATE_SIGMOID || GATE == KDA_GATE_SOFTPLUS) };
+     if GATE == KDA_GATE_SIGMOID {
+-        let r = mul_rn_f32(f + dt, sa);
++        let r = mul_rn_f32(f, sa);
+         expf_ik(mul_rn_f32(lb, sigmoid(-r)))
+     } else {
+         expf_ik(mul_rn_f32(softplus(f + dt), sa))

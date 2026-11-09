@@ -1,0 +1,13 @@
+diff --git a/crates/gpu/src/host/swap.rs b/crates/gpu/src/host/swap.rs
+--- a/crates/gpu/src/host/swap.rs
++++ b/crates/gpu/src/host/swap.rs
+@@ -3887,9 +3887,6 @@
+             .source
+             .restore_stacks(layer, at, at + k, &self.copy)?;
+         self.rule.give(l, k).map_err(|e| rule_err(WHAT, e))?;
+-        for st in &mut self.ledger.row_mut(layer)[at..at + k] {
+-            *st = SlotState::Spare;
+-        }
+         Ok(())
+     }
+ 

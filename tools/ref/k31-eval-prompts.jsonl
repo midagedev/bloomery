@@ -1,0 +1,150 @@
+{"id": "en-01", "cat": "en", "prompt": "Explain why the sky appears blue during the day but red at sunset, in two short paragraphs."}
+{"id": "en-02", "cat": "en", "prompt": "What is the difference between a mortgage with a fixed rate and one with an adjustable rate? Give an example with numbers."}
+{"id": "en-03", "cat": "en", "prompt": "Write a short, vivid description of a fishing village waking up before dawn."}
+{"id": "en-04", "cat": "en", "prompt": "Summarize the main causes of the First World War for a high school student."}
+{"id": "en-05", "cat": "en", "prompt": "I have three eggs, a bell pepper, half an onion and some cheddar. Suggest a quick dinner and give the steps."}
+{"id": "en-06", "cat": "en", "prompt": "Explain how vaccines train the immune system without making a person sick."}
+{"id": "en-07", "cat": "en", "prompt": "Give me five tips for staying focused when working from home, each with a one-sentence reason."}
+{"id": "en-08", "cat": "en", "prompt": "What are the trade-offs between renting and buying a home for someone who may move in three years?"}
+{"id": "en-09", "cat": "en", "prompt": "Describe how a bill becomes a law in the United States, step by step."}
+{"id": "en-10", "cat": "en", "prompt": "Write a polite email asking a landlord to fix a leaking kitchen faucet that has dripped for two weeks."}
+{"id": "en-11", "cat": "en", "prompt": "Why did the Roman Republic become an empire? Keep the answer under 150 words."}
+{"id": "en-12", "cat": "en", "prompt": "Explain the idea of opportunity cost with an everyday example."}
+{"id": "en-13", "cat": "en", "prompt": "What happens in the human body during a 10 kilometer run, from the first minute to the last?"}
+{"id": "en-14", "cat": "en", "prompt": "Compare the plots of Romeo and Juliet and West Side Story in a short table-free paragraph."}
+{"id": "en-15", "cat": "en", "prompt": "Write a limerick about a cat who learns to use a smartphone."}
+{"id": "en-16", "cat": "en", "prompt": "How does compound interest work? Show the result of 1,000 dollars at 5 percent for 10 years."}
+{"id": "en-17", "cat": "en", "prompt": "Explain the greenhouse effect and name two common misunderstandings about it."}
+{"id": "en-18", "cat": "en", "prompt": "Give a beginner's plan for learning to play the guitar in three months."}
+{"id": "en-19", "cat": "en", "prompt": "What is the Monty Hall problem and why does switching doors help?"}
+{"id": "en-20", "cat": "en", "prompt": "Describe the life cycle of a star like our Sun."}
+{"id": "en-21", "cat": "en", "prompt": "Draft a short speech for a retirement party of a beloved high school teacher."}
+{"id": "en-22", "cat": "en", "prompt": "Explain what a central bank does and why interest rate changes affect inflation."}
+{"id": "en-23", "cat": "en", "prompt": "List the pros and cons of electric cars for a family that drives 40 miles a day."}
+{"id": "en-24", "cat": "en", "prompt": "What is the difference between weather and climate? Use one example for each."}
+{"id": "en-25", "cat": "en", "prompt": "Tell me about the history of the printing press and its effect on literacy."}
+{"id": "en-26", "cat": "en", "prompt": "Write the opening paragraph of a mystery novel set on a night train through the Alps."}
+{"id": "en-27", "cat": "en", "prompt": "How should I prepare for a job interview for a project manager role? Give a checklist."}
+{"id": "en-28", "cat": "en", "prompt": "Explain how a refrigerator keeps food cold, without equations."}
+{"id": "en-29", "cat": "en", "prompt": "What are the main differences between Stoicism and Epicureanism?"}
+{"id": "en-30", "cat": "en", "prompt": "Write a product description for a reusable stainless steel water bottle, around 80 words."}
+{"id": "en-31", "cat": "en", "prompt": "Explain photosynthesis to a ten year old."}
+{"id": "en-32", "cat": "en", "prompt": "Why is sleep important for memory? Describe what happens in each stage."}
+{"id": "en-33", "cat": "en", "prompt": "What are the strengths and weaknesses of democracy as a system of government?"}
+{"id": "en-34", "cat": "en", "prompt": "Give me a three day itinerary for a first visit to Lisbon, with a rough budget."}
+{"id": "en-35", "cat": "en", "prompt": "Explain the difference between correlation and causation, with a medical example."}
+{"id": "en-36", "cat": "en", "prompt": "Write a dialogue between a customer and a barista who got the order wrong."}
+{"id": "en-37", "cat": "en", "prompt": "What is inflation, and who loses and who gains from it?"}
+{"id": "en-38", "cat": "en", "prompt": "Describe how the internet routes a web page request from a laptop to a server."}
+{"id": "en-39", "cat": "en", "prompt": "What should a first-time manager do in the first thirty days?"}
+{"id": "en-40", "cat": "en", "prompt": "Write a haiku sequence of three poems about autumn rain."}
+{"id": "en-41", "cat": "en", "prompt": "Explain the main ideas of evolution by natural selection and one common objection."}
+{"id": "en-42", "cat": "en", "prompt": "How do airplanes stay in the air? Cover lift, thrust and drag briefly."}
+{"id": "en-43", "cat": "en", "prompt": "Suggest a weekly meal prep plan for someone who wants high protein and low cost."}
+{"id": "en-44", "cat": "en", "prompt": "Explain the trolley problem and how a utilitarian and a deontologist would answer."}
+{"id": "en-45", "cat": "en", "prompt": "What is a black hole, and what would happen to someone falling into one?"}
+{"id": "en-46", "cat": "en", "prompt": "Write a thank-you note to a colleague who covered my shifts during a family emergency."}
+{"id": "en-47", "cat": "en", "prompt": "Describe the causes and effects of the 2008 financial crisis in plain language."}
+{"id": "en-48", "cat": "en", "prompt": "How do I politely decline a wedding invitation from a distant relative?"}
+{"id": "en-49", "cat": "en", "prompt": "Explain how a bill of exchange worked in medieval trade."}
+{"id": "en-50", "cat": "en", "prompt": "Write a short bedtime story about a lighthouse keeper and a lost seagull."}
+{"id": "ko-01", "cat": "ko", "prompt": "서울에서 부산까지 KTX로 여행할 때 챙기면 좋은 것들을 알려주세요."}
+{"id": "ko-02", "cat": "ko", "prompt": "전세와 월세의 차이를 사회초년생에게 설명해 주세요. 장단점도 함께요."}
+{"id": "ko-03", "cat": "ko", "prompt": "요즘 회사에서 자꾸 야근을 시키는데, 상사에게 정중하게 거절하는 말투를 알려주세요."}
+{"id": "ko-04", "cat": "ko", "prompt": "김치찌개를 맛있게 끓이는 방법을 순서대로 알려주세요."}
+{"id": "ko-05", "cat": "ko", "prompt": "조선시대 과거 시험은 어떤 방식으로 치러졌는지 간단히 설명해 주세요."}
+{"id": "ko-06", "cat": "ko", "prompt": "새벽에 자꾸 잠이 깨는데 원인이 뭘까요? 생활 습관 위주로 알려주세요."}
+{"id": "ko-07", "cat": "ko", "prompt": "한국의 사계절 중 가을에 가볼 만한 국내 여행지 세 곳을 추천해 주세요."}
+{"id": "ko-08", "cat": "ko", "prompt": "친구가 빌린 돈을 갚지 않고 연락을 피합니다. 관계를 해치지 않고 말을 꺼내는 방법이 있을까요?"}
+{"id": "ko-09", "cat": "ko", "prompt": "'우물 안 개구리'라는 속담의 뜻과 유래를 설명해 주세요."}
+{"id": "ko-10", "cat": "ko", "prompt": "첫 직장 면접에서 '자기소개를 해보세요'라는 질문에 어떻게 답하면 좋을지 예시를 들어 주세요."}
+{"id": "ko-11", "cat": "ko", "prompt": "한글이 만들어진 원리를 초성, 중성, 종성의 관점에서 쉽게 설명해 주세요."}
+{"id": "ko-12", "cat": "ko", "prompt": "월급이 250만 원인 사회초년생이 한 달 생활비를 어떻게 나누면 좋을지 예산표를 짜 주세요."}
+{"id": "ko-13", "cat": "ko", "prompt": "미세먼지가 심한 날 건강을 지키는 방법을 알려주세요."}
+{"id": "ko-14", "cat": "ko", "prompt": "어머니 생신에 쓸 짧은 축하 편지를 따뜻한 말투로 써 주세요."}
+{"id": "ko-15", "cat": "ko", "prompt": "반려견을 처음 키우는 사람이 알아야 할 것들을 체크리스트로 정리해 주세요."}
+{"id": "ko-16", "cat": "ko", "prompt": "국민연금은 어떤 제도인지, 그리고 왜 보험료를 내야 하는지 설명해 주세요."}
+{"id": "ko-17", "cat": "ko", "prompt": "비 오는 날 퇴근길 풍경을 묘사하는 짧은 글을 써 주세요."}
+{"id": "ko-18", "cat": "ko", "prompt": "한국 전쟁이 일어난 배경을 중학생이 이해하기 쉽게 설명해 주세요."}
+{"id": "ko-19", "cat": "ko", "prompt": "카페에서 일할 때 진상 손님을 만나면 어떻게 대응해야 하나요?"}
+{"id": "ko-20", "cat": "ko", "prompt": "인공지능이 일자리에 미치는 영향에 대해 긍정적인 면과 부정적인 면을 균형 있게 이야기해 주세요."}
+{"id": "ko-21", "cat": "ko", "prompt": "추석에 친척들이 결혼 언제 하냐고 물을 때 센스 있게 넘기는 대답을 몇 가지 알려주세요."}
+{"id": "ko-22", "cat": "ko", "prompt": "된장과 고추장의 차이는 무엇이고, 각각 어떤 요리에 어울리나요?"}
+{"id": "ko-23", "cat": "ko", "prompt": "이사 후 해야 할 행정 절차(전입신고, 확정일자 등)를 순서대로 알려주세요."}
+{"id": "ko-24", "cat": "ko", "prompt": "'눈치'라는 한국어 단어는 영어로 정확히 옮기기 어렵다고 하는데, 그 이유를 설명해 주세요."}
+{"id": "ko-25", "cat": "ko", "prompt": "운동을 시작했다가 삼일 만에 포기하는 습관을 고치려면 어떻게 해야 할까요?"}
+{"id": "ko-26", "cat": "ko", "prompt": "제주도 한 달 살기를 계획 중입니다. 숙소와 교통에서 주의할 점을 알려주세요."}
+{"id": "ko-27", "cat": "ko", "prompt": "블록체인이 무엇인지 컴퓨터를 잘 모르는 부모님께 설명하듯 말해 주세요."}
+{"id": "ko-28", "cat": "ko", "prompt": "겨울철 난방비를 줄이는 현실적인 방법을 다섯 가지만 알려주세요."}
+{"id": "ko-29", "cat": "ko", "prompt": "이순신 장군이 명량 해전에서 승리한 이유를 설명해 주세요."}
+{"id": "ko-30", "cat": "ko", "prompt": "회의에서 말수가 적은 팀원이 의견을 낼 수 있게 하려면 팀장은 어떻게 해야 할까요?"}
+{"id": "ko-31", "cat": "ko", "prompt": "고등학생 아들이 스마트폰만 보고 공부를 안 합니다. 대화를 시작하는 방법을 조언해 주세요."}
+{"id": "ko-32", "cat": "ko", "prompt": "비빔밥의 유래와 지역별 특징을 간단히 소개해 주세요."}
+{"id": "ko-33", "cat": "ko", "prompt": "짧은 시 한 편을 써 주세요. 주제는 '퇴근 후 편의점'입니다."}
+{"id": "ko-34", "cat": "ko", "prompt": "주식 투자를 처음 시작하는 사람이 피해야 할 흔한 실수는 무엇인가요?"}
+{"id": "ko-35", "cat": "ko", "prompt": "한국어에서 존댓말과 반말을 구분해 쓰는 기준을 외국인 친구에게 설명해 주세요."}
+{"id": "ko-36", "cat": "ko", "prompt": "우리 동네 도서관에서 독서 모임을 만들고 싶은데 어떻게 시작하면 될까요?"}
+{"id": "ko-37", "cat": "ko", "prompt": "장마철에 집 안 곰팡이를 예방하는 방법을 알려주세요."}
+{"id": "ko-38", "cat": "ko", "prompt": "'감사합니다'와 '고맙습니다'는 어떻게 다른가요?"}
+{"id": "ko-39", "cat": "ko", "prompt": "해외여행 중 여권을 잃어버렸을 때 해야 할 일을 순서대로 알려주세요."}
+{"id": "ko-40", "cat": "ko", "prompt": "태양계의 행성들을 크기 순서대로 나열하고 각각 한 줄씩 특징을 설명해 주세요."}
+{"id": "ko-41", "cat": "ko", "prompt": "퇴사를 고민하고 있습니다. 결정하기 전에 스스로에게 물어봐야 할 질문들을 정리해 주세요."}
+{"id": "ko-42", "cat": "ko", "prompt": "김밥을 쌀 때 밥이 질어지지 않게 하는 요령이 있나요?"}
+{"id": "ko-43", "cat": "ko", "prompt": "아이에게 거짓말이 왜 나쁜지 일곱 살 눈높이로 설명해 주세요."}
+{"id": "ko-44", "cat": "ko", "prompt": "지하철에서 임산부 배려석이 왜 필요한지 의견을 말해 주세요."}
+{"id": "ko-45", "cat": "ko", "prompt": "대학생이 장학금을 받기 위해 준비할 수 있는 것들을 알려주세요."}
+{"id": "ko-46", "cat": "ko", "prompt": "독감과 감기의 차이를 증상 중심으로 설명해 주세요."}
+{"id": "ko-47", "cat": "ko", "prompt": "어르신께 카카오톡 사용법을 가르쳐 드릴 때 유의할 점이 있을까요?"}
+{"id": "ko-48", "cat": "ko", "prompt": "한옥의 구조적 특징과 온돌의 원리를 알려주세요."}
+{"id": "ko-49", "cat": "ko", "prompt": "동료가 내 아이디어를 자기 것처럼 발표했습니다. 어떻게 대처해야 할까요?"}
+{"id": "ko-50", "cat": "ko", "prompt": "올해 읽은 책 중 한 권을 골라 독후감을 쓴다고 생각하고, 도입부 두 문단만 써 주세요."}
+{"id": "code-01", "cat": "code", "prompt": "Write a Rust function that returns the n-th Fibonacci number using u128 and returns None on overflow."}
+{"id": "code-02", "cat": "code", "prompt": "Explain what this C++ code does and whether it has undefined behaviour:\n\nint f(int* p, int n) { int s = 0; for (int i = 0; i <= n; ++i) s += p[i]; return s; }"}
+{"id": "code-03", "cat": "code", "prompt": "Write a Python function that merges overlapping intervals in a list of (start, end) tuples. Include a short docstring."}
+{"id": "code-04", "cat": "code", "prompt": "Give a bash one-liner that lists the ten largest files under the current directory, with sizes in human-readable form."}
+{"id": "code-05", "cat": "code", "prompt": "Fix the bug in this Python code:\n\ndef average(xs):\n    total = 0\n    for x in xs:\n        total += x\n    return total / len(xs)\n\nIt crashes on an empty list; I want it to return 0.0 instead."}
+{"id": "code-06", "cat": "code", "prompt": "Write a C++ class template for a fixed-capacity ring buffer with push_back, pop_front and size, without heap allocation."}
+{"id": "code-07", "cat": "code", "prompt": "Explain the difference between `&str` and `String` in Rust, with a small example of each."}
+{"id": "code-08", "cat": "code", "prompt": "Write a shell script that backs up a directory into a timestamped tar.gz and keeps only the last five backups."}
+{"id": "code-09", "cat": "code", "prompt": "Implement binary search in Python that returns the leftmost index of a target in a sorted list, or -1."}
+{"id": "code-10", "cat": "code", "prompt": "What does this Rust code print, and why?\n\nlet v = vec![1, 2, 3];\nlet w: Vec<i32> = v.iter().map(|x| x * 2).filter(|x| *x > 2).collect();\nprintln!(\"{:?}\", w);"}
+{"id": "code-11", "cat": "code", "prompt": "Write a Python generator that yields all prime numbers below a given limit using a sieve."}
+{"id": "code-12", "cat": "code", "prompt": "Explain what a data race is and show a minimal C++ example with std::thread that has one."}
+{"id": "code-13", "cat": "code", "prompt": "Write a Rust function that parses a string like \"3x4\" into a (u32, u32) tuple and returns a Result with a descriptive error."}
+{"id": "code-14", "cat": "code", "prompt": "Rewrite this loop in idiomatic Python:\n\nresult = []\nfor i in range(len(names)):\n    if len(names[i]) > 3:\n        result.append(names[i].upper())"}
+{"id": "code-15", "cat": "code", "prompt": "Write a bash function that retries a command up to three times with a two second delay between attempts."}
+{"id": "code-16", "cat": "code", "prompt": "Explain how `std::move` works in C++ and when it is wrong to use it."}
+{"id": "code-17", "cat": "code", "prompt": "Implement a least-recently-used cache in Python with get and put in O(1)."}
+{"id": "code-18", "cat": "code", "prompt": "What is wrong with this shell snippet and how do I fix it?\n\nfor f in $(ls *.txt); do cp $f /backup/; done"}
+{"id": "code-19", "cat": "code", "prompt": "Write a Rust program that reads lines from stdin and prints the number of distinct words, case-insensitive."}
+{"id": "code-20", "cat": "code", "prompt": "Show how to read a CSV file with a header row into a list of dictionaries in Python without using pandas."}
+{"id": "code-21", "cat": "code", "prompt": "Write a C++ function that reverses the words in a std::string in place, keeping the spaces as they are."}
+{"id": "code-22", "cat": "code", "prompt": "Explain the borrow checker error \"cannot borrow `v` as mutable because it is also borrowed as immutable\" with a small example and a fix."}
+{"id": "code-23", "cat": "code", "prompt": "Write a Python decorator that measures and prints the execution time of the decorated function."}
+{"id": "code-24", "cat": "code", "prompt": "Give me a `jq` command that extracts the `name` field of every object in the array under `.items` of a JSON file."}
+{"id": "code-25", "cat": "code", "prompt": "Implement quicksort in Rust for a mutable slice of i32, in place."}
+{"id": "code-26", "cat": "code", "prompt": "Explain what a Python context manager is and write one that temporarily changes the working directory."}
+{"id": "code-27", "cat": "code", "prompt": "Write a `find` command that deletes all `.log` files older than 14 days under /var/tmp, and explain each flag."}
+{"id": "code-28", "cat": "code", "prompt": "What is the time complexity of the following Python code, and can it be improved?\n\ndef has_dup(xs):\n    for i in range(len(xs)):\n        for j in range(i + 1, len(xs)):\n            if xs[i] == xs[j]:\n                return True\n    return False"}
+{"id": "code-29", "cat": "code", "prompt": "Write a C++ program that reads integers from a file named input.txt and prints their median."}
+{"id": "code-30", "cat": "code", "prompt": "Show how to define and use a trait with a default method in Rust, with two implementing structs."}
+{"id": "code-31", "cat": "code", "prompt": "Write a Python function that validates an IPv4 address string and returns True or False, with no external libraries."}
+{"id": "code-32", "cat": "code", "prompt": "Write a Rust function that returns the longest common prefix of a slice of strings."}
+{"id": "code-33", "cat": "code", "prompt": "Convert this Python 2 snippet to Python 3 and explain the changes:\n\nprint \"total:\", total\nfor k, v in d.iteritems():\n    print k, v"}
+{"id": "code-34", "cat": "code", "prompt": "Write a C++ lambda that sorts a vector of pairs by the second element descending, then by the first element ascending."}
+{"id": "code-35", "cat": "code", "prompt": "Explain how to use `git rebase -i` to squash the last three commits into one, step by step."}
+{"id": "code-36", "cat": "code", "prompt": "Write a Python class for a 2D vector with addition, dot product and a readable repr."}
+{"id": "code-37", "cat": "code", "prompt": "Find the bug:\n\nfn first_word(s: &String) -> &str {\n    let bytes = s.as_bytes();\n    for (i, &b) in bytes.iter().enumerate() {\n        if b == b' ' { return &s[0..i]; }\n    }\n    &s[0..s.len()]\n}\n\nIt works, but my reviewer says the signature is not ideal. What do they mean?"}
+{"id": "code-38", "cat": "code", "prompt": "Write an awk command that prints the sum of the third column of a whitespace-separated file."}
+{"id": "code-39", "cat": "code", "prompt": "Implement a thread-safe counter in C++ using std::atomic, and explain the memory order you chose."}
+{"id": "code-40", "cat": "code", "prompt": "Write a Python script that takes a directory path and prints a tree of its files, indented by depth."}
+{"id": "code-41", "cat": "code", "prompt": "Explain the difference between a mutex and a semaphore, with a short pseudo-code example of each."}
+{"id": "code-42", "cat": "code", "prompt": "Write a Rust enum for a simple arithmetic expression (numbers, add, multiply) and a function that evaluates it."}
+{"id": "code-43", "cat": "code", "prompt": "Write a SQL query that returns the top three customers by total order amount from tables customers(id, name) and orders(id, customer_id, amount)."}
+{"id": "code-44", "cat": "code", "prompt": "Write a Python function that flattens an arbitrarily nested list of lists of integers, without recursion."}
+{"id": "code-45", "cat": "code", "prompt": "Explain why this C++ code may crash and how to fix it:\n\nstd::vector<int> v = {1,2,3};\nfor (auto it = v.begin(); it != v.end(); ++it) {\n    if (*it == 2) v.push_back(4);\n}"}
+{"id": "code-46", "cat": "code", "prompt": "Write a shell command pipeline that counts how many times each HTTP status code appears in an nginx access log."}
+{"id": "code-47", "cat": "code", "prompt": "Write a Rust function using iterators that returns the sum of squares of the even numbers in a slice of i64."}
+{"id": "code-48", "cat": "code", "prompt": "Explain what a closure is in Python and write an example that counts how many times it has been called."}
+{"id": "code-49", "cat": "code", "prompt": "Write a Makefile for a small C project with main.c and util.c that builds with -Wall -O2 and has a clean target."}
+{"id": "code-50", "cat": "code", "prompt": "Describe, with code, how to use Python's `asyncio.gather` to fetch three URLs concurrently with a timeout."}

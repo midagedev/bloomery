@@ -98,6 +98,9 @@ generate_ds41 ds41_engram_key_norm 0 0
 generate_ds41 ds41_expert_gate_up 0 0
 generate_ds41 ds41_ffn_card_acc 0 0
 generate_ds41 ds41_ffn_card_acc_10 0 0
+# PIN(2026-11-05): ds41_ffn_card_acc_16 and ds41_ffn_card_acc_2, new entries, at 0 spill and 0 JIT local bytes [derived: the sm_86 cc 8.6 scan's 0/0 (tools/ref/ptx-shapes.tsv): the same body as ds41_ffn_card_acc_4 at other slot counts], until a scan on this table's arch and capability.
+generate_ds41 ds41_ffn_card_acc_16 0 0
+generate_ds41 ds41_ffn_card_acc_2 0 0
 generate_ds41 ds41_ffn_card_acc_4 0 0
 generate_ds41 ds41_ffn_card_acc_4_tier 0 0
 generate_ds41 ds41_ffn_card_acc_8 0 0
@@ -130,7 +133,11 @@ generate_ds41 ds41_glue_embed_q3k 0 0
 generate_ds41 ds41_glue_embed_q5k 0 0
 generate_ds41 ds41_glue_engram_rows 0 0
 generate_ds41 ds41_glue_engram_rows_iq4nl 0 0
+# PIN(2026-11-03): ds41_glue_engram_rows_mxfp8, a new entry, at ds41_glue_engram_rows_iq4nl's 0 spill and 0 JIT local bytes [derived: the same body with a byte decode in place of the nibble one], not measured at this arch until a scan runs.
+generate_ds41 ds41_glue_engram_rows_mxfp8 0 0
 generate_ds41 ds41_glue_engram_rows_q3k 0 0
+# PIN(2026-11-05): ds41_glue_engram_rows_q6k, a new entry, at 0 spill and 0 JIT local bytes [derived: the sm_86 scan's 0/0 (tools/ref/ptx-shapes.tsv; one thread per value, no local array)], until a scan on this table's arch and capability.
+generate_ds41 ds41_glue_engram_rows_q6k 0 0
 generate_ds41 ds41_groups_to_tokens 0 0
 generate_ds41 ds41_hc_fold 0 0
 generate_ds41 ds41_hc_mean 0 0
@@ -372,6 +379,8 @@ generate_ds41 kda_conv_prep_sp2 0 0
 generate_ds41 kda_delta 0 0
 generate_ds41 kda_delta_lanes 0 0
 generate_ds41 kda_write_gate 0 0
+# PIN(2026-11-06): ffn_handoff_n_tier, a new entry, at 0 spill and 0 JIT local bytes [derived: the sm_86 cc 8.6 scan's 0/0 (tools/ref/ptx-shapes.tsv): 30 registers, no local array], until a scan on this table's arch and capability.
+generate_ds41 ffn_handoff_n_tier 0 0
 generate_ds41 kpool_score 0 0
 generate_ds41 kq_card_gather 0 0
 generate_ds41 kq_gate_up_act_q4k 0 0
@@ -568,6 +577,11 @@ generate_ds41 sigmoid_256_8_router 0 0
 generate_ds41 sigmoid_256_8_router_pick 0 0
 generate_ds41 sigmoid_320_8_router 0 0
 generate_ds41 sigmoid_320_8_router_pick 0 0
+# PIN(2026-11-05): sigmoid_896_16_router, sigmoid_896_16_router_pick, sigmoid_8_2_router and sigmoid_8_2_router_pick, new entries, at 0 spill and 0 JIT local bytes [derived: the sm_86 cc 8.6 scan's 0/0 (tools/ref/ptx-shapes.tsv): the same body as sigmoid_128_6_router at other counts], until a scan on this table's arch and capability.
+generate_ds41 sigmoid_896_16_router 0 0
+generate_ds41 sigmoid_896_16_router_pick 0 0
+generate_ds41 sigmoid_8_2_router 0 0
+generate_ds41 sigmoid_8_2_router_pick 0 0
 generate_ds41 sigmoid_floor_256_6_router 0 0
 generate_ds41 sigmoid_floor_256_6_router_pick 0 0
 generate_ds41 sigmoid_rows 0 0
@@ -584,6 +598,8 @@ generate_ds41 swiglu_rule_rows 0 0
 generate_ds41 tier_fault_copy 0 0
 generate_ds41 touch 0 0
 generate_ds41 weighted_sum 0 0
+# PIN(2026-11-05): word_add at 0/0 [derived: the sm_86 scan's 0/0, one thread of reductions, no local array], until a scan on this table's arch and capability.
+generate_ds41 word_add 0 0
 gate_qwen3vl_tower vis_add_f32 0 0
 gate_qwen3vl_tower vis_attn 0 0
 gate_qwen3vl_tower vis_attn_group 0 0
@@ -612,3 +628,12 @@ gate_qwen3vl_tower vis_row_op 0 0
 gate_qwen3vl_tower vis_silu_mul 0 0
 gate_qwen3vl_tower vis_silu_mul_clamp 0 0
 gate_qwen3vl_tower vis_unfold 0 0
+# PIN(2026-11-06): attn_res_mix, a new entry (Kimi K3's AttnRes bank mix), at 0 spill and 0 JIT local bytes [derived: the sm_86 cc 8.6 scan's 0/0 (tools/ref/ptx-shapes.tsv)], until a scan on this table's arch and capability.
+generate_ds41 attn_res_mix 0 0
+# PIN(2026-11-07): the IQ1_S/IQ2_XXS card quantizer's three entries (iq_quant_finish, iq_quant_subs, iq_src_f32) at the cc 8.6 scan's values (tools/ref/ptx-shapes.tsv, ptxas 13.3.73 sm_86: 0 spill; JIT local 280, 1096, 0 B), not measured on cc 12.0 (the table's card) until a GB10 scan runs.
+generate_ds41 iq_quant_finish 0 280
+generate_ds41 iq_quant_subs 0 1096
+# PIN(2026-11-08): the importance collector's two entries (imat_dense_sum2, imat_routed_sum2, crates/gpu/src/imatrix.rs) at the cc 8.6 scan's values (tools/ref/ptx-shapes.tsv, ptxas 13.3.73 sm_86: 0 spill, 0 B JIT local), not measured on cc 12.0 (the table's card) until a GB10 scan runs.
+generate_ds41 imat_dense_sum2 0 0
+generate_ds41 imat_routed_sum2 0 0
+generate_ds41 iq_src_f32 0 0

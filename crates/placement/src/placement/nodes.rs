@@ -37,6 +37,7 @@ use super::{
     PlanLevers, PoolNeed, Role, RoutedRule, Row, Segment, card_bytes, per_expert, plan_routed,
     row_bytes,
 };
+use bloomery_levers::KvHost;
 
 /// Seed a routed plan and lower any explicit node ownership.
 #[allow(
@@ -53,6 +54,14 @@ pub fn loaded_routed<'a>(
     reserve: u64,
     owned: Option<&[u64]>,
 ) -> Result<Plan<'a>, PlacementError> {
+    if let (Some(rank), Some(_)) = (&levers.expert_rank, owned) {
+        return Err(PlacementError::ExpertRank {
+            file: rank.path().to_string(),
+            detail: "explicit node-owned id ranges keep their id blocks; a rank orders only the \
+                     plan's own tier cards"
+                .to_string(),
+        });
+    }
     let stage = Machine {
         tiers: Vec::new(),
         nodes: machine.nodes.iter().take(1).cloned().collect(),
@@ -174,6 +183,7 @@ pub fn lower_routed(plan: &mut Plan<'_>, owned: &[u64]) -> Result<(), PlacementE
     )?;
     lowered.host.arena_columns = plan.host.arena_columns;
     lowered.budget_from_pool = plan.budget_from_pool;
+    lowered.expert_rank = plan.expert_rank.clone();
     *plan = lowered;
     Ok(())
 }
@@ -270,6 +280,8 @@ pub fn routed_host<'a>(
             arena_columns: columns,
             table_bytes: 0,
             shadow_bytes: 0,
+            kv_host_bytes: 0,
+            stage_kv_bytes: 0,
             reserve_bytes: 0,
             row_reserve_bytes: 0,
             pool_card_bytes: 0,
@@ -281,6 +293,9 @@ pub fn routed_host<'a>(
         tier_n_l: Vec::new(),
         card_budget: super::card_budget::CardBudget::Unset,
         budget_from_pool: false,
+        expert_rank: None,
+        kv_floor: None,
+        kv_host: KvHost::default(),
     })
 }
 

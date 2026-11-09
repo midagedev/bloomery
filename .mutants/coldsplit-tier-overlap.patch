@@ -1,0 +1,13 @@
+--- a/crates/placement/src/placement/rank.rs
++++ b/crates/placement/src/placement/rank.rs
+@@ -286,8 +286,9 @@
+         let mut end = experts;
+         let mut tier_lists = Vec::with_capacity(tiers.len());
+         for &own in tiers {
++            // mutant coldsplit-tier-overlap: every tier takes the block the first one did, so two cards hold the same ids.
+             tier_lists.push(cut(end - own, end)?);
+-            end -= own;
++            end = experts;
+         }
+         Ok((stage_list, tier_lists))
+     }

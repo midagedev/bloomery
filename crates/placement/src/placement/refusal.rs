@@ -41,7 +41,8 @@ pub enum PlacementError {
         experts: String,
         why: qdot::QdotError,
     },
-    /// The cards' layer ranges do not cover the model once, in order, with one head.
+    /// The cards' layer ranges do not cover the model once, in order, with at most one head, or
+    /// a plan with no card head does not leave the head's tensors on the host.
     #[error("stage map: {0}")]
     Stages(String),
     /// The host tier's lock, or its residency query, failed: the span and the
@@ -70,6 +71,39 @@ pub enum PlacementError {
     /// An expert list that is not one: a repeated id, an id past the stack.
     #[error("expert list: {0}")]
     Experts(String),
+    /// A router rank (`BLOOMERY_EXPERT_RANK`) the plan cannot place: a file
+    /// that is not a rank, or one that disagrees with the model or the plan,
+    /// with what says why.
+    #[error("expert rank {file}: {detail}")]
+    ExpertRank { file: String, detail: String },
+    /// The KV floor `BLOOMERY_KV_FLOOR` sets passes the plan's context: the
+    /// expert spread is planned at the floor, which never passes the cap
+    /// (`ctx_max`) the stores' rooms and rows are planned at.
+    #[error(
+        "the KV floor {floor} passes the plan's context {cap}: the expert spread is planned at \
+         BLOOMERY_KV_FLOOR's positions and never past the context the rooms' range and rows are \
+         reserved at; ask a context of at least the floor, or a smaller floor"
+    )]
+    KvFloor { floor: u64, cap: u64 },
+    /// The K/V planes' backing `BLOOMERY_KV_HOST=all` set while
+    /// `BLOOMERY_KV_FLOOR` names a spread: `all` already plans the planes at
+    /// a zero card position, so two levers saying where the spread runs is
+    /// ambiguous.
+    #[error(
+        "BLOOMERY_KV_HOST=all holds the K/V planes on the host, which plans the expert spread at \
+         a zero card position already; BLOOMERY_KV_FLOOR={floor} names another one, and the two \
+         together do not say where the spread runs: set one"
+    )]
+    KvHostFloor { floor: u64 },
+    /// The K/V planes a host-backed store holds on the host
+    /// (`BLOOMERY_KV_HOST=all`) pass the plan's host room: what the room
+    /// leaves past the plan's host need.
+    #[error(
+        "BLOOMERY_KV_HOST=all holds the K/V planes, {bytes} B, on the host, and the plan leaves \
+         the host {headroom} B: free host memory, a smaller context, or the planes on the card \
+         (BLOOMERY_KV_HOST off or spill)"
+    )]
+    KvHostOverHost { bytes: u64, headroom: u64 },
     /// A host room under the floor of the NVMe expert tier: the plan's host
     /// terms outside the routed experts, and the transient reads of two
     /// layers' NVMe-tier experts and one layer's host experts beside them —

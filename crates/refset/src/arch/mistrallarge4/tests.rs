@@ -43,7 +43,7 @@ const ROW_MIX256G: Row = Row {
     arch: ARCH,
     other_files: &[
         MODEL,
-        "/models/Mistral-Large-4-1T-A52B-Mix-256G/Mistral-Large-4-1T-A52B-Mix-256G-00002-of-00006.gguf",
+        "/data/moved/models/Mistral-Large-4-1T-A52B-Mix-256G/Mistral-Large-4-1T-A52B-Mix-256G-00002-of-00006.gguf",
         "/models/elsewhere/Mistral-Large-4-1T-A52B-Mix-256G-00001-of-00006.gguf",
     ],
     other_builds: ROW.other_builds,

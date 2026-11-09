@@ -1,0 +1,23 @@
+# kvhost mutant alloc-card
+# clause: the host room gate (crates/gpu/src/room/mod.rs, the hw test
+#   hw_held_a_host_room_backs_its_pages_on_the_host in the same file's tests): the host owner
+#   allocates on the card, so the fit's four pages leave the device's free bytes and the
+#   "no card bytes beyond the spare" clause reds.
+# site: crates/gpu/src/room/host.rs HostPage::new — the prop's location set to the device, not
+#   the host NUMA node the device names.
+# expected red: "  hw_held_a_host_room_backs_its_pages_on_the_host ... a host fit takes no card
+#   bytes beyond the spare: ... FAIL"
+--- a/crates/gpu/src/room/host.rs
++++ b/crates/gpu/src/room/host.rs
+@@ -141,7 +141,8 @@
+     /// The allocation; the driver's refusal names the call, and it leaves
+     /// the device's own free bytes untouched.
+     pub(crate) fn new(device: CUdevice, bytes: usize) -> Result<HostPage, GpuError> {
+-        let placing = placing(device)?;
+-        let mut prop = pinned_prop();
+-        at_host_node(&mut prop, placing.id);
++        let _placing = placing(device)?;
++        let mut prop = pinned_prop();
++        prop.location.type_ = sys::CUmemLocationType_enum_CU_MEM_LOCATION_TYPE_DEVICE;
++        sys::set_mem_location_id(&mut prop.location, device);
+         let mut handle: sys::CUmemGenericAllocationHandle = 0;

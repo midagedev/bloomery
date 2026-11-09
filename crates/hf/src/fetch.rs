@@ -1140,6 +1140,30 @@ pub(crate) mod tests {
         b.iter().map(|b| format!("{b:02x}")).collect()
     }
 
+    /// `dir/curl` as the fake the engine runs in curl's place, mode 0o755, written by a child
+    /// shell so this process never holds the script open for writing: a fork in another test
+    /// thread (every engine curl spawn is one) inherits an open write fd until it execs, and
+    /// the engine's exec of the script then gets ETXTBSY.
+    pub(super) fn fake_curl(dir: &Path, text: &str) -> PathBuf {
+        let script = dir.join("curl");
+        let mut sh = Command::new("sh")
+            .arg("-c")
+            .arg("cat >\"$1\" && chmod 755 \"$1\"")
+            .arg("fake-curl")
+            .arg(&script)
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("sh");
+        sh.stdin
+            .take()
+            .expect("sh stdin")
+            .write_all(text.as_bytes())
+            .expect("script bytes");
+        let ended = sh.wait().expect("sh end");
+        assert!(ended.success(), "writing {script:?}: {ended}");
+        script
+    }
+
     /// A served repo under `dir/hub` as `file://` resolves it, one file
     /// `path` of `content`, and a client caching under `dir/cache`.
     pub(super) fn served(dir: &Path, repo: &str, path: &str, content: &[u8]) -> (Client, Entry) {
@@ -1516,8 +1540,6 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn concurrent_fetches_share_one_download() {
-        use std::os::unix::fs::PermissionsExt;
-
         let d = std::env::current_dir().unwrap();
         if d.join("curl").is_file() {
             let (mut c, e) = served(&d, "a/b", "sub/m.gguf", &content());
@@ -1526,13 +1548,10 @@ pub(crate) mod tests {
             return;
         }
         let d = scratch("concurrent-fetch");
-        let script = d.join("curl");
-        fs::write(
-            &script,
+        fake_curl(
+            &d,
             "#!/bin/sh\ncd -- \"$(dirname -- \"$0\")\" || exit 1\nprintf x >> calls\nsleep 1\nexec curl \"$@\"\n",
-        )
-        .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        );
         // Both processes use the same partial file, including the same resume offset.
         let (c, e) = served(&d, "a/b", "sub/m.gguf", &content());
         let dest = cache_path(&c.root, "a/b", &e.path).unwrap();
@@ -1933,12 +1952,8 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn a_listing_page_without_its_headers_is_an_error() {
-        use std::os::unix::fs::PermissionsExt;
-
         let d = scratch("listing-no-headers");
-        let script = d.join("curl");
-        fs::write(&script, "#!/bin/sh\nprintf '[]'\n").unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let script = fake_curl(&d, "#!/bin/sh\nprintf '[]'\n");
         let c = Client {
             base: "http://127.0.0.1:1".to_owned(),
             token: None,

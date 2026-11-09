@@ -1,0 +1,11 @@
+--- a/crates/gpu/src/linear/mixer_kda.rs
++++ b/crates/gpu/src/linear/mixer_kda.rs
+@@ -155,7 +155,7 @@
+     /// Load-time only.
+     pub fn of_file(what: &'static str, f: KdaFile, rule: KdaRule) -> Result<KdaDims, GpuError> {
+         let bad = |detail: String| Err(GpuError::shape(what, detail));
+-        if f.head_dim != HEAD {
++        if f.head_dim == 0 {
+             return bad(format!(
+                 "kda.head_dim {}: the kernels tile {HEAD} values a head",
+                 f.head_dim

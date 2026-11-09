@@ -18,10 +18,13 @@ A checklist for a person or a coding agent (Claude Code, Codex) who wants to run
    all-RAM one. Which models page and what a paged load changes are in
    [Serving](serving.md#54-when-the-host-cannot-hold-the-experts-either).
 5. **Warm up first.** Send one request and discard its numbers. Adaptive residency then moves the experts the model
-   calls most onto the card, so the first requests run slower than later ones. `BLOOMERY_RESIDENCY=off` gives
-   repeatable tokens at some speed. On a paged plan the unset residency is already off. The Qwen3.8 and GLM-5.3 prompt
-   cache (`--cache-ram`) restores a repeated prefix, so a repeated prompt is faster than its first send: send a
-   different prompt for each timed request, or `--cache-ram 0`, when you time prefill.
+   calls most onto the card, so the first requests run slower than later ones. The default residency (`mid-p<P>-s1`)
+   starts with S = 1 expert a layer off the card, so its bits differ from `BLOOMERY_RESIDENCY=off` before the first
+   flip, and a repeated request can answer differently from its first send at a near-tie: the host and the card sum
+   one expert in different orders. `BLOOMERY_RESIDENCY=off` gives repeatable tokens at some speed. On a paged plan the
+   unset residency is already off. The Qwen3.8 and GLM-5.3 prompt cache (`--cache-ram`) restores a repeated prefix, so
+   a repeated prompt is faster than its first send: send a different prompt for each timed request, or `--cache-ram 0`,
+   when you time prefill.
 6. **Read the speed from the response's `timings`**, not from wall time that includes the download or the load:
    `predicted_per_second` (decode), `prompt_per_second` (prefill), `draft_n` and `draft_n_accepted` (the MTP draft).
 7. **Compare with llama-server on equal terms**: the same GGUF file, the same `--ctx-size`, the same `--parallel`

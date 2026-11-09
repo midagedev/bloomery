@@ -1,6 +1,7 @@
 use std::num::NonZeroU64;
 use std::ops::Range;
 
+use bloomery_levers::KvHost;
 use gguf::GgmlType;
 
 use super::planner::capped;
@@ -11,7 +12,10 @@ use super::*;
 mod bounds;
 mod early;
 mod floor;
+mod host_stage;
+mod kv_floor;
 mod legs;
+mod rank;
 
 /// A plan of no rows under `budget`, for a planner [`plan_in_pool`]
 /// calls: only its budget is read.
@@ -30,6 +34,8 @@ fn budget_plan<'a>(model: &'a ModelTensors, machine: &'a Machine, budget: u64) -
             arena_columns: 1,
             table_bytes: 0,
             shadow_bytes: 0,
+            kv_host_bytes: 0,
+            stage_kv_bytes: 0,
             reserve_bytes: 0,
             row_reserve_bytes: 0,
             pool_card_bytes: 0,
@@ -41,6 +47,9 @@ fn budget_plan<'a>(model: &'a ModelTensors, machine: &'a Machine, budget: u64) -
         tier_n_l: Vec::new(),
         card_budget: card_budget::CardBudget::Every(budget),
         budget_from_pool: false,
+        expert_rank: None,
+        kv_floor: None,
+        kv_host: KvHost::default(),
     }
 }
 /// A card running `layers`, with the head and the token embedding as

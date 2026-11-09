@@ -300,6 +300,51 @@
 //! read in again (its mutant: no prepare in the machine's one decision,
 //! which finds each not resident: the pick refused by name, the boundary's
 //! victims and the end's expert sent on, none read in again).
+//!
+//! Tail releases ([`SwapMachine::release_tail`],
+//! [`SwapMachine::restore_tail`]): layer 2 at 8 card slots, pinned 1, one
+//! spare — the machine's own shape, a mover possible only through a landed
+//! flip holding its admit in the top slot.
+//! - tail pack: one landed flip admits expert 7 into slot 7 (its victim the
+//!   colder 2); the heat then — every pass routing 0, 1, 3, 4 and 7, never
+//!   5 or 6 — makes 5 and 6 the coldest, and `release_tail(2)` demotes
+//!   exactly those, moves the admit of slot 7 into 5's freed slot 5 by
+//!   device-to-device copies and withdraws the top slots 6, 7: every live
+//!   expert's slot bytes read back equal its source bytes, the card's map
+//!   copy names no slot at or past 6 and agrees with the host map and the
+//!   ledger (withdrawn slots included), and the pass after the release
+//!   serves the moved admit from its new slot, clean (its mutant: the
+//!   pack's copies skipped).
+//! - tail withdrawn: no flip before the release (every pass routing 0, 1,
+//!   2, 3): the heat makes 4 and 5 the coldest, and `release_tail(2)`
+//!   demotes them, moves the expert of slot 6 into 4's freed slot 4 and
+//!   withdraws 6, 7; a later flip that wants the host expert 4 lands in the
+//!   freed slot 5, never a withdrawn 6 or 7, and the reset after it returns
+//!   the layer to the release's shrunk seed with 6, 7 withdrawn still; the
+//!   boundary's record shows the withdrawn count (its mutant: the withdrawn
+//!   slots left `Spare`).
+//! - tail floors: pinned 5, every pass routing the pinned 0, 1, 2, 3: a
+//!   release of 1 takes the coldest unpinned expert (5), never a pinned one
+//!   though its count ties, keeps every pinned slot; a release of 2 is past
+//!   the floor (`pinned + 1` live) and refused by name, as are a k of 0, a
+//!   call open, a layer the machine takes no part in and one outside the
+//!   map — each with the machine unchanged and unbroken (its mutant: a
+//!   coldest that admits the pinned).
+//! - tail restore: after the withdrawn arm's release, a restore of 3 is
+//!   refused by name (2 withdrawn) and one of 1 twice turns 6 then 7
+//!   `Spare` — the lowest withdrawn first, so the withdrawn stay the row's
+//!   top — the layer's capacity and its seed back, so a reset copies the
+//!   seed's missing 4 and 5 into the freed slot 5 and the restored 6 — and
+//!   a flip after it admits into 7; a restore with none left is refused by
+//!   name (its mutant: a restore that leaves the ledger as it was).
+//! - tail pages: over a source whose layer-2 stacks are a page room (8 slots
+//!   of 3 MiB), `release_tail(2)` reports the bytes of the pages wholly at or
+//!   past slot 6 freed, the device's free bytes grow by at least that, the
+//!   room holds the pages below with slots 0..6 reading back their words, the
+//!   boundaries after it record the withdrawn bytes; a restore of 1 twice backs
+//!   the pages of slot 6 and then of slot 7 and no others, and after the reset
+//!   slot 7 reads zero (its mutants: the machine's call to give the pages back
+//!   skipped; the restore's call to back them skipped).
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -317,12 +362,14 @@ mod gate {
     use bloomery_gpu::host::lane::{LANE_THREADS, LaneStats, RING_SLOTS};
     use bloomery_gpu::host::slots::{HOST, Slot, SlotMap};
     use bloomery_gpu::host::swap::{
-        CallCfg, CallPick, CallReport, HostSite, Leak, LeakReason, MachineCfg, Nvfp4From,
-        PassReport, Piece, SlotState, SwapMachine, SwapSource, Transform, set_leak_sink,
+        CallCfg, CallPick, CallReport, CardTable, HostSite, Leak, LeakReason, MachineCfg,
+        Nvfp4From, PassReport, Piece, SlotState, SwapMachine, SwapSource, Transform, set_leak_sink,
     };
     use bloomery_gpu::host::xstream::land_batch_size;
     use bloomery_gpu::hybrid::{Boundary, BoundaryShape, HostExperts, HostTier};
-    use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Graph, HostFlags};
+    use bloomery_gpu::{
+        DeviceTensor, Gpu, GpuError, Graph, HostFlags, StackRoom, Window, WindowMut,
+    };
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
     use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DriverError, LaunchConfig1D, sys};
@@ -538,6 +585,9 @@ mod gate {
         hold: Option<Arc<SourceHold>>,
         /// Paces every job's staging while it is on.
         pace: Option<Arc<Pace>>,
+        /// A page room standing for layer 2's stacks: the source gives its pages back
+        /// and backs them again at the machine's call.
+        rooms: Option<Arc<PageRooms>>,
     }
 
     /// A gate-side hold on the lane: once armed, the source blocks reading
@@ -686,6 +736,17 @@ mod gate {
                 faults,
                 prepared: AtomicU32::new(0),
             }
+        }
+    }
+
+    impl Synth {
+        /// The page room that stands for layer `layer`'s stacks, when the arm
+        /// has one: layer 2's alone.
+        fn page_room(&self, layer: usize) -> Option<&PageRooms> {
+            self.faults
+                .rooms
+                .as_deref()
+                .filter(|_| layer == LAYERS.start)
         }
     }
 
@@ -934,6 +995,108 @@ mod gate {
         fn release_host(&self, layer: usize, id: u32) -> Result<u64, GpuError> {
             self.resident[li(layer) * E + id as usize].store(false, Ordering::Release);
             Ok(EXPERT_BYTES)
+        }
+
+        fn stack_tail_bytes(&self, layer: usize, from: usize) -> Result<u64, GpuError> {
+            match self.page_room(layer) {
+                Some(r) => r.room.tail_bytes(from * ROOM_SLOT),
+                None => Ok(0),
+            }
+        }
+
+        fn release_stacks(&self, layer: usize, from: usize) -> Result<u64, GpuError> {
+            match self.page_room(layer) {
+                Some(r) => r.room.release_from(from * ROOM_SLOT),
+                None => Ok(0),
+            }
+        }
+
+        fn restore_stacks(
+            &self,
+            layer: usize,
+            from: usize,
+            to: usize,
+            stream: &CudaStream,
+        ) -> Result<u64, GpuError> {
+            match self.page_room(layer) {
+                Some(r) => r.room.restore(from * ROOM_SLOT, to * ROOM_SLOT, stream),
+                None => Ok(0),
+            }
+        }
+
+        fn released_bytes(&self, layer: usize) -> u64 {
+            self.page_room(layer).map_or(0, |r| r.room.released())
+        }
+    }
+
+    /// Bytes one slot takes in [`PageRooms`]' stack: not a page multiple, so
+    /// a slot straddles page boundaries as a routed stack's slot does.
+    const ROOM_SLOT: usize = 3 << 20;
+    /// Slots of that stack: layer 2's card slots in the tail clauses.
+    const ROOM_SLOTS: usize = 8;
+
+    /// A stack room standing for layer 2's stacks in the clause that gives
+    /// pages back: [`ROOM_SLOTS`] slots of [`ROOM_SLOT`] bytes, every page
+    /// backed, slot `s` holding the word `s + 1` throughout. The machine's
+    /// copies run against [`Stacks`], so the room's bytes are the clause's
+    /// own: what the machine's calls give back and back again.
+    struct PageRooms {
+        room: StackRoom,
+        view: Mutex<Option<DeviceBuffer<u32>>>,
+    }
+
+    impl std::fmt::Debug for PageRooms {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("PageRooms")
+        }
+    }
+
+    impl PageRooms {
+        fn new(gpu: &Gpu) -> Result<PageRooms, GateError> {
+            let words = ROOM_SLOT / 4;
+            let (mut view, room) = StackRoom::new(
+                gpu.stream_handle(),
+                ROOM_SLOTS * words,
+                "gate_swap's page room",
+            )?;
+            for s in 0..ROOM_SLOTS {
+                WindowMut::<u32>::of_mut(&mut view, s * ROOM_SLOT, words)?
+                    .copy_from_host(gpu.stream(), &vec![s as u32 + 1; words])?;
+            }
+            gpu.stream().synchronize()?;
+            Ok(PageRooms {
+                room,
+                view: Mutex::new(Some(view)),
+            })
+        }
+
+        /// Slot `s`'s words, read on the engine stream.
+        fn slot(&self, gpu: &Gpu, s: usize) -> Result<Vec<u32>, GateError> {
+            let held = self.view.lock().unwrap_or_else(PoisonError::into_inner);
+            let view = held
+                .as_ref()
+                .ok_or("gate_swap: the page room's view is gone")?;
+            Ok(Window::<u32>::of(view, s * ROOM_SLOT, ROOM_SLOT / 4)?.to_host_vec(gpu.stream())?)
+        }
+
+        /// Whether slots `0..upto` read back their own words.
+        fn intact(&self, gpu: &Gpu, upto: usize) -> Result<bool, GateError> {
+            for s in 0..upto {
+                if self.slot(gpu, s)? != vec![s as u32 + 1; ROOM_SLOT / 4] {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+    }
+
+    impl Drop for PageRooms {
+        fn drop(&mut self) {
+            // The view is taken apart without a free before the room drops.
+            let held = self.view.get_mut().unwrap_or_else(PoisonError::into_inner);
+            if let Some(view) = held.take() {
+                drop(view.into_raw_parts());
+            }
         }
     }
 
@@ -5052,6 +5215,460 @@ mod gate {
         Ok((plain(gpu, pm, faults, DELAY)?, pace))
     }
 
+    // ------------------------------------------------------- tail releases
+
+    /// A seed map with layer 2 holding `l2` card slots (its experts `0..l2`
+    /// in slot order), every other layer its `N_L` share: the tail-release
+    /// clauses' own layer shape.
+    fn map_with(l2: usize) -> Result<SlotMap, GateError> {
+        let mut rows = vec![HOST; L * E];
+        for (i, &n) in N_L.iter().enumerate() {
+            let cap = if i == 0 { l2 } else { n };
+            for e in 0..cap {
+                rows[i * E + e] = e as u32;
+            }
+        }
+        Ok(SlotMap::from_rows(LAYERS, E, rows)?)
+    }
+
+    /// [`cfg`] with layer 2's pinned count `pin0`.
+    fn cfg_pin(delay: u64, pin0: usize) -> MachineCfg {
+        MachineCfg {
+            pinned: [pin0, PINNED, PINNED, 0].to_vec(),
+            ..cfg(delay, DEADLINE)
+        }
+    }
+
+    /// A trace of one-row, one-kept-row passes whose layer 2 routes `rows`,
+    /// one row each in order, every other layer [0, 1, 2, 3]: the
+    /// tail-release clauses' heat.
+    fn tail_trace(rows: &[&[u32]]) -> Trace {
+        Trace {
+            passes: rows
+                .iter()
+                .map(|ids| {
+                    let mut row = [[0u32, 1, 2, 3]; L];
+                    row[0].copy_from_slice(ids);
+                    (vec![row], 1)
+                })
+                .collect(),
+        }
+    }
+
+    /// tail pack: layer 2 at 8 slots, pinned 1, one landed flip holding its
+    /// admit in the top slot 7 (its victim the colder id 2), so the heat at
+    /// the release — every pass routing 0, 1, 3, 4 and 7, never 5 or 6 —
+    /// makes 5 and 6 the coldest: `release_tail(2)` demotes exactly those,
+    /// moves the admit of slot 7 into 5's freed slot 5 by device copies and
+    /// withdraws the top slots 6,7. Every live expert's slot bytes read back
+    /// equal its source bytes, the card's map copy names no slot at or past
+    /// 6 and is off the host map and the ledger by nothing (withdrawn slots
+    /// included), and the pass after the release serves the moved admit from
+    /// its new slot, clean. Its mutant: the pack's copies skipped (the moved
+    /// slot keeps the victim's bytes).
+    fn tail_pack(gpu: &Gpu, pm: &probe_kernels::LoadedModule) -> Result<bool, GateError> {
+        let a = [0u32, 1, 3, 7];
+        let b = [0u32, 1, 4, 7];
+        let rows: Vec<&[u32]> = (0..9)
+            .map(|p| if p % 2 == 0 { &a[..] } else { &b[..] })
+            .chain([&a[..]])
+            .collect();
+        let trace = tail_trace(&rows);
+        let mut r = start(gpu, pm, map_with(8)?, Faults::default(), cfg_pin(DELAY, 1))?;
+        drive(gpu, &mut r, &trace, 0..9, Copies::Prompt, Hold::None)?;
+        let driven = r.err.is_none() && r.flips.len() == 1;
+        let l = LAYERS.start;
+        let stream = gpu.stream();
+        let m = r.machine.as_mut().ok_or("gate_swap: no machine")?;
+        let released = m.release_tail(stream, &mut r.slots, l, 2)?;
+        let row: Vec<SlotState> = m.ledger().row(l).unwrap_or(&[]).to_vec();
+        let withdrawn = m.ledger().withdrawn(l);
+        let want = vec![
+            SlotState::Live(0),
+            SlotState::Live(1),
+            SlotState::Spare,
+            SlotState::Live(3),
+            SlotState::Live(4),
+            SlotState::Live(7),
+            SlotState::Withdrawn,
+            SlotState::Withdrawn,
+        ];
+        let packed = released.victims == vec![5, 6]
+            && released.moves == vec![(7, 7, 5)]
+            && released.withdrawn == (6..8)
+            && row == want
+            && withdrawn == 2;
+        let map = r.slots.slot(l, 7) == Some(Slot::Card(5))
+            && r.slots.slot(l, 5) == Some(Slot::Host)
+            && r.slots.slot(l, 6) == Some(Slot::Host);
+        let mut snap = snap_alloc(stream, l)?;
+        snap_fill(stream, &r.card.stacks, l, &mut snap)?;
+        let mut holds = true;
+        for (s, st) in row.iter().enumerate() {
+            if let SlotState::Live(e) = st {
+                holds &= slot_holds(stream, &snap, l, s as u32, *e)?;
+            }
+        }
+        let machine = r.machine.as_ref().ok_or("gate_swap: no machine")?;
+        let table = CardTable::read(&r.card.view, &r.slots, Some(machine), stream)?;
+        let check = table.check(&r.slots, Some(machine.ledger()))?;
+        let entries = &table.entries()[..E];
+        let words = entries[7] == 5
+            && entries[5] == HOST
+            && entries[6] == HOST
+            && entries.iter().all(|&e| e == HOST || e < 6)
+            && (check.vs_map, check.vs_ledger, check.doubled) == (0, Some(0), 0);
+        drive(gpu, &mut r, &trace, 9..10, Copies::Prompt, Hold::None)?;
+        let after = r.err.is_none() && clean(&r.values) && r.values.len() == 10;
+        let ok = driven && packed && map && holds && words && after;
+        println!(
+            "tail pack: 8 slots, a landed flip's admit at 7, the coldest 5 and 6 demoted and \
+             moved {:?} (want 7: 7 to 5) {packed}; every live slot its expert's bytes {holds}; \
+             withdrawn {withdrawn} (want 2), the map names slot 5 for 7 and no slot past 5, the \
+             card's copy off the map and the ledger by ({}, {:?}, {}) (want 0, Some(0), 0); the \
+             pass after clean {after}; error {} {}",
+            released.moves,
+            check.vs_map,
+            check.vs_ledger,
+            check.doubled,
+            show(&r.err),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// tail withdrawn: layer 2 at 8 slots, pinned 1, no flip before the
+    /// release (every pass routing 0, 1, 2, 3), so the heat makes 4 and 5
+    /// the coldest: `release_tail(2)` demotes them, moves the expert of slot
+    /// 6 into 4's freed slot 4 and withdraws the top slots 6,7. A later flip
+    /// that wants the host expert 4 lands it in the freed slot 5, never a
+    /// withdrawn 6 or 7; the reset after it returns the layer to the
+    /// release's shrunk seed with 6,7 withdrawn still, and the boundary's
+    /// record shows the withdrawn count. Its mutant: the withdrawn slots
+    /// left `Spare`.
+    fn tail_withdrawn(gpu: &Gpu, pm: &probe_kernels::LoadedModule) -> Result<bool, GateError> {
+        let warm = [0u32, 1, 2, 3];
+        let hot = [0u32, 1, 6, 4];
+        let more = [0u32, 1, 2, 4];
+        let rows: Vec<&[u32]> = (0..9)
+            .map(|_| &warm[..])
+            .chain([&hot[..]])
+            .chain((0..7).map(|_| &more[..]))
+            .chain((0..2).map(|_| &warm[..]))
+            .collect();
+        let trace = tail_trace(&rows);
+        let mut r = start(gpu, pm, map_with(8)?, Faults::default(), cfg_pin(DELAY, 1))?;
+        drive(gpu, &mut r, &trace, 0..9, Copies::Prompt, Hold::None)?;
+        let driven = r.err.is_none() && r.flips.is_empty();
+        let l = LAYERS.start;
+        let stream = gpu.stream();
+        let m = r.machine.as_mut().ok_or("gate_swap: no machine")?;
+        let released = m.release_tail(stream, &mut r.slots, l, 2)?;
+        let row: Vec<SlotState> = m.ledger().row(l).unwrap_or(&[]).to_vec();
+        let want = vec![
+            SlotState::Live(0),
+            SlotState::Live(1),
+            SlotState::Live(2),
+            SlotState::Live(3),
+            SlotState::Live(6),
+            SlotState::Spare,
+            SlotState::Withdrawn,
+            SlotState::Withdrawn,
+        ];
+        let packed = released.victims == vec![4, 5]
+            && released.moves == vec![(6, 6, 4)]
+            && released.withdrawn == (6..8)
+            && row == want;
+        drive(gpu, &mut r, &trace, 9..17, Copies::Prompt, Hold::None)?;
+        let m = r.machine.as_mut().ok_or("gate_swap: no machine")?;
+        let row: Vec<SlotState> = m.ledger().row(l).unwrap_or(&[]).to_vec();
+        let flip_landed = r.err.is_none()
+            && r.flips.len() == 1
+            && row[..6]
+                == [
+                    SlotState::Live(0),
+                    SlotState::Live(1),
+                    SlotState::Live(2),
+                    SlotState::Live(3),
+                    SlotState::Spare,
+                    SlotState::Live(4),
+                ][..]
+            && row[6..] == [SlotState::Withdrawn, SlotState::Withdrawn];
+        let reported = r.reports.len() >= 10
+            && r.reports[9].withdrawn == 2
+            && r.reports[9..].iter().all(|p| p.withdrawn == 2);
+        if let Some(p) = r.reports.get(9) {
+            record::residency_pass(p).print();
+        }
+        let rep = m.reset(stream, &mut r.slots)?;
+        let row: Vec<SlotState> = m.ledger().row(l).unwrap_or(&[]).to_vec();
+        let kept = rep.diff == 0
+            && rep.copies == 0
+            && m.ledger().withdrawn(l) == 2
+            && row[6..] == [SlotState::Withdrawn, SlotState::Withdrawn];
+        drive(
+            gpu,
+            &mut r,
+            &trace,
+            17..rows.len(),
+            Copies::Prompt,
+            Hold::None,
+        )?;
+        let after = r.err.is_none() && clean(&r.values) && r.values.len() == rows.len();
+        let ok = driven && packed && flip_landed && reported && kept && after;
+        println!(
+            "tail withdrawn: the coldest 4 and 5 demoted, the expert of slot 6 moved to 4 \
+             {packed}; a flip wanting the host 4 landed it in slot 5 (never a withdrawn 6 or 7) \
+             {flip_landed}; the boundary's record says withdrawn={} (want 2) {reported}; the \
+             reset diff {} copies {} keeps 6,7 withdrawn {kept}; {} passes clean {after}; error \
+             {} {}",
+            r.reports.get(9).map_or(usize::MAX, |p| p.withdrawn),
+            rep.diff,
+            rep.copies,
+            r.values.len(),
+            show(&r.err),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// tail floors: layer 2 at 8 slots, pinned 5, every pass routing the
+    /// pinned 0, 1, 2, 3: a release of 1 takes the coldest unpinned expert
+    /// (5), never a pinned one though its count ties, and keeps every pinned
+    /// slot; a release of 2 is past the floor (`pinned + 1` live) and
+    /// refused by name, as are a k of 0, a call open, a layer the machine
+    /// takes no part in and one outside the map — each with the machine
+    /// unchanged (its ledger and the host map as they stood) and unbroken.
+    /// Its mutant: a coldest that admits the pinned.
+    fn tail_floors(gpu: &Gpu, pm: &probe_kernels::LoadedModule) -> Result<bool, GateError> {
+        let warm = [0u32, 1, 2, 3];
+        let rows: Vec<&[u32]> = (0..9).map(|_| &warm[..]).collect();
+        let trace = tail_trace(&rows);
+        let mut r = start(gpu, pm, map_with(8)?, Faults::default(), cfg_pin(DELAY, 5))?;
+        drive(gpu, &mut r, &trace, 0..9, Copies::Prompt, Hold::None)?;
+        let driven = r.err.is_none();
+        let l = LAYERS.start;
+        let stream = gpu.stream();
+        let m = r.machine.as_mut().ok_or("gate_swap: no machine")?;
+        let ledger_was = m.ledger().clone();
+        let map_was = r.slots.stage_view();
+        let past = m
+            .release_tail(stream, &mut r.slots, l, 2)
+            .err()
+            .map(|e| e.to_string());
+        let zero = m
+            .release_tail(stream, &mut r.slots, l, 0)
+            .err()
+            .map(|e| e.to_string());
+        let no_part = m
+            .release_tail(stream, &mut r.slots, LAYERS.end - 1, 1)
+            .err()
+            .map(|e| e.to_string());
+        let outside = m
+            .release_tail(stream, &mut r.slots, LAYERS.end + 3, 1)
+            .err()
+            .map(|e| e.to_string());
+        m.boundary(stream, &mut r.slots)?;
+        m.begin_call(stream, CallCfg { floor: 1 })?;
+        let in_call = m
+            .release_tail(stream, &mut r.slots, l, 1)
+            .err()
+            .map(|e| e.to_string());
+        m.end_call(stream, &mut r.slots, true)?;
+        let unchanged =
+            m.ledger() == &ledger_was && r.slots.stage_view() == map_was && m.broken().is_none();
+        let named = |e: &Option<String>, what: &str| e.as_deref().is_some_and(|e| e.contains(what));
+        let floor = named(&past, "under the floor of 5 pinned + 1");
+        let k_zero = named(&zero, "a k of 0");
+        let part = named(&no_part, "takes no part");
+        let out = named(&outside, "outside the machine's layers");
+        let call = named(&in_call, "a prompt call is open");
+        let released = m.release_tail(stream, &mut r.slots, l, 1)?;
+        let unpinned = released.victims == vec![5]
+            && m.ledger().withdrawn(l) == 1
+            && (0u32..5).all(|e| r.slots.slot(l, e) == Some(Slot::Card(e)));
+        let ok = driven && unchanged && floor && k_zero && part && out && call && unpinned;
+        println!(
+            "tail floors: pinned 5, a release of 2 {past:?} named the floor {floor}, a k of 0 \
+             {zero:?} named {k_zero}, layer {} {no_part:?} named its no part {part}, a layer \
+             outside {outside:?} named {out}, a release in a call {in_call:?} named {call}; each \
+             left the machine unchanged {unchanged}; a release of 1 took the coldest unpinned \
+             {:?} and no pinned slot {unpinned} {}",
+            LAYERS.end - 1,
+            released.victims,
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// tail restore: after the withdrawn arm's release (victims 4 and 5, the
+    /// expert of slot 6 moved to 4, the top slots 6,7 withdrawn), a restore
+    /// of 3 is refused by name (2 withdrawn) and one of 1 twice turns 6 then
+    /// 7 `Spare` — the lowest withdrawn first, so the withdrawn stay the
+    /// row's top — the layer's capacity and its seed back, so a reset copies
+    /// the seed's missing 4 and 5 into the freed slot 5 and the restored 6 —
+    /// and a flip after it admits into 7; a restore with none left is
+    /// refused by name. Its mutant: a restore that leaves the ledger as it
+    /// was.
+    fn tail_restore(gpu: &Gpu, pm: &probe_kernels::LoadedModule) -> Result<bool, GateError> {
+        let warm = [0u32, 1, 2, 3];
+        let hot7 = [0u32, 1, 2, 7];
+        let rows: Vec<&[u32]> = (0..9)
+            .map(|_| &warm[..])
+            .chain((0..8).map(|_| &hot7[..]))
+            .collect();
+        let trace = tail_trace(&rows);
+        let mut r = start(gpu, pm, map_with(8)?, Faults::default(), cfg_pin(DELAY, 1))?;
+        drive(gpu, &mut r, &trace, 0..9, Copies::Prompt, Hold::None)?;
+        let l = LAYERS.start;
+        let stream = gpu.stream();
+        let m = r.machine.as_mut().ok_or("gate_swap: no machine")?;
+        let released = m.release_tail(stream, &mut r.slots, l, 2)?;
+        let packed = released.victims == vec![4, 5] && released.moves == vec![(6, 6, 4)];
+        let ledger_was = m.ledger().clone();
+        let past = m.restore_tail(l, 3).err().map(|e| e.to_string());
+        let unchanged = m.ledger() == &ledger_was;
+        m.restore_tail(l, 1)?;
+        let mid = m.restore_tail(l, 2).err().map(|e| e.to_string());
+        m.restore_tail(l, 1)?;
+        let row: Vec<SlotState> = m.ledger().row(l).unwrap_or(&[]).to_vec();
+        let spare_again = m.ledger().withdrawn(l) == 0
+            && row[6..] == [SlotState::Spare, SlotState::Spare]
+            && mid.is_some();
+        let none = m.restore_tail(l, 1).err().map(|e| e.to_string());
+        let named = |e: &Option<String>, what: &str| e.as_deref().is_some_and(|e| e.contains(what));
+        let past_named = named(&past, "3 slots to restore over 2 withdrawn");
+        let mid_named = named(&mid, "2 slots to restore over 1 withdrawn");
+        let none_named = named(&none, "1 slots to restore over 0 withdrawn");
+        let rep = m.reset(stream, &mut r.slots)?;
+        let row: Vec<SlotState> = m.ledger().row(l).unwrap_or(&[]).to_vec();
+        let reseeded = rep.diff == 0
+            && rep.copies == 2
+            && row[..7]
+                == [
+                    SlotState::Live(0),
+                    SlotState::Live(1),
+                    SlotState::Live(2),
+                    SlotState::Live(3),
+                    SlotState::Live(6),
+                    SlotState::Live(4),
+                    SlotState::Live(5),
+                ][..]
+            && row[7] == SlotState::Spare;
+        drive(
+            gpu,
+            &mut r,
+            &trace,
+            9..rows.len(),
+            Copies::Prompt,
+            Hold::None,
+        )?;
+        let row: Vec<SlotState> = r
+            .machine
+            .as_ref()
+            .ok_or("gate_swap: no machine")?
+            .ledger()
+            .row(l)
+            .unwrap_or(&[])
+            .to_vec();
+        let into7 = r.err.is_none()
+            && r.flips.len() == 1
+            && row[7] == SlotState::Live(7)
+            && clean(&r.values);
+        let ok = packed
+            && past_named
+            && unchanged
+            && mid_named
+            && spare_again
+            && none_named
+            && reseeded
+            && into7;
+        println!(
+            "tail restore: a restore of 3 over 2 withdrawn {past:?} named {past_named} and left \
+             the ledger {unchanged}; one of 1 twice turned 6 then 7 Spare {spare_again} (the \
+             second over 1 withdrawn {mid:?} named {mid_named}), one with none left {none:?} \
+             named {none_named}; the reset copies {} (want 2: the freed 5 and the restored 6) \
+             back at the seed {reseeded}; a flip after it admitted into 7 {into7} {}",
+            rep.copies,
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
+    /// tail pages: layer 2 at 8 slots, pinned 1, every pass routing 0, 1, 2, 3, over a source whose
+    /// layer-2 stacks are a page room (8 slots of 3 MiB, every page backed, slot `s` holding the
+    /// word `s + 1`). `release_tail(2)` reports bytes freed equal to the pages wholly at or past
+    /// slot 6 (derived here from the page and the slot), the device's free bytes grow by at least
+    /// that, the room holds exactly the pages below, slots 0..6 read back their words, and every
+    /// boundary after it records `withdrawn_bytes` of the same count. `restore_tail(1)` twice
+    /// backs the pages of slot 6 and then of slot 7 and no others; after the reset's drain slot 7
+    /// reads zero, the slots below still their words, and no byte is withdrawn. Its mutants: the
+    /// machine's call to give the pages back skipped (nothing freed); the restore's call to back
+    /// them skipped (the room stays short).
+    fn tail_pages(gpu: &Gpu, pm: &probe_kernels::LoadedModule) -> Result<bool, GateError> {
+        let page = gpu.allocation_granularity()?;
+        let pages = (ROOM_SLOTS * ROOM_SLOT).div_ceil(page);
+        let below = |slot: usize| (slot * ROOM_SLOT).div_ceil(page);
+        let (line, gone) = (6usize, (pages - below(6)) * page);
+        let rooms = Arc::new(PageRooms::new(gpu)?);
+        let warm = [0u32, 1, 2, 3];
+        let rows: Vec<&[u32]> = (0..12).map(|_| &warm[..]).collect();
+        let trace = tail_trace(&rows);
+        let faults = Faults {
+            rooms: Some(Arc::clone(&rooms)),
+            ..Faults::default()
+        };
+        let mut r = start(gpu, pm, map_with(8)?, faults, cfg_pin(DELAY, 1))?;
+        drive(gpu, &mut r, &trace, 0..9, Copies::Prompt, Hold::None)?;
+        let l = LAYERS.start;
+        let stream = gpu.stream();
+        let (free0, _) = gpu.mem_info()?;
+        let m = r.machine.as_mut().ok_or("gate_swap: no machine")?;
+        let released = m.release_tail(stream, &mut r.slots, l, 2)?;
+        let (free1, _) = gpu.mem_info()?;
+        let freed = gone > 0 && released.freed_bytes == gone as u64;
+        let grew = free1 >= free0 + gone;
+        let given = rooms.room.backed()? == pages * page - gone
+            && rooms.room.released() == gone as u64
+            && rooms.intact(gpu, line)?;
+        drive(gpu, &mut r, &trace, 9..12, Copies::Prompt, Hold::None)?;
+        let reported = r.reports.len() >= 10
+            && r.reports[9..]
+                .iter()
+                .all(|p| p.withdrawn_bytes == gone as u64);
+        if let Some(p) = r.reports.get(9) {
+            record::residency_pass(p).print();
+        }
+        let m = r.machine.as_mut().ok_or("gate_swap: no machine")?;
+        m.restore_tail(l, 1)?;
+        let after_one = pages.min(below(line).max((7 * ROOM_SLOT).div_ceil(page)));
+        let one = rooms.room.backed()? == after_one * page
+            && rooms.room.released() == ((pages - after_one) * page) as u64;
+        m.restore_tail(l, 1)?;
+        let whole = rooms.room.backed()? == pages * page && rooms.room.released() == 0;
+        m.reset(stream, &mut r.slots)?;
+        let zeroed = rooms.slot(gpu, 7)? == vec![0u32; ROOM_SLOT / 4] && rooms.intact(gpu, line)?;
+        let unbroken = r.err.is_none()
+            && r.machine
+                .as_ref()
+                .is_some_and(|m| m.broken().is_none() && m.ledger().withdrawn(l) == 0);
+        let ok = freed && grew && given && reported && one && whole && zeroed && unbroken;
+        println!(
+            "tail pages: release_tail(2) freed {} B (want the {gone} B of the pages past slot \
+             {line}, page {page} B) {freed}; the device's free bytes {free0} -> {free1} {grew}; the \
+             room holds the {} B below and slots 0..{line} read back {given}; the boundaries after \
+             it record withdrawn_bytes {} {reported}; a restore of 1 backed the pages of slot 6 \
+             alone ({after_one} of {pages} pages) {one}; a second the rest {whole}; after the \
+             reset's drain slot 7 reads zero and the slots below their words {zeroed}; machine \
+             unbroken {unbroken} {}",
+            released.freed_bytes,
+            pages * page - gone,
+            r.reports.get(9).map_or(u64::MAX, |p| p.withdrawn_bytes),
+            verdict(ok)
+        );
+        Ok(ok)
+    }
+
     fn lane_stats(run: &Run) -> Result<LaneStats, GateError> {
         Ok(run
             .machine
@@ -5352,6 +5969,11 @@ mod gate {
         ok &= s7_boundary(&gpu, &pm, &trace, &a)?;
         ok &= s7_load(&gpu, &pm)?;
         ok &= evicted(&gpu, &pm, &trace, &a, &[&a, &b, &h])?;
+        ok &= tail_pack(&gpu, &pm)?;
+        ok &= tail_withdrawn(&gpu, &pm)?;
+        ok &= tail_floors(&gpu, &pm)?;
+        ok &= tail_restore(&gpu, &pm)?;
+        ok &= tail_pages(&gpu, &pm)?;
         drop((a, b, h));
         let all: Vec<LeakReason> = leaks()?.iter().map(|l| l.reason).collect();
         let only_stall = all == [LeakReason::Join];

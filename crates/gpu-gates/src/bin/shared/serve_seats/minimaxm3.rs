@@ -159,7 +159,6 @@ use bloomery_gpu_gates::side_seat;
 use bloomery_levers::Levers;
 use gguf::Split;
 use model::arch::Arch;
-use model::arch::models::ReasoningFormat;
 use model::arch::place_hybrid::PlanInputs;
 use model::placement::workstation::TierBatchBytes;
 use model::placement::{PlacementError, Plan};
@@ -522,7 +521,7 @@ impl Tiered for MiniMax {
     /// The tags the model's description names for its think span.
     fn think(inputs: &PlanInputs<Self::H>) -> Result<Option<ThinkTags>, GateError> {
         match inputs.spec.chat.reasoning {
-            Some(ReasoningFormat::ThinkSpan { open, close }) => Ok(Some(ThinkTags { open, close })),
+            Some(format) => Ok(Some(tiered::think_tags_of(format))),
             None => Err(format!("the {} description names no reasoning tags", Self::FAMILY).into()),
         }
     }

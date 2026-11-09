@@ -20,8 +20,11 @@
 //! served and the host reads, and the tier's fault copy. Per row it holds
 //! the image the stage card's handoff writes — each tier's places of the
 //! routed slots, then the stage card's q8_1 activation, which every tier
-//! reads — and the rows the tiers' downs computed, one per routed slot, each
-//! tier its own slots, which the stage card's join reads in place.
+//! reads — and the rows the tiers' downs computed, one per place at the
+//! place's position, each tier its own, which the stage card's join reads
+//! in place. The handoff orders the places: in slot order, or a tier's
+//! slots first by rank (V4.1's), so the tier's rows come back packed at the
+//! front.
 //!
 //! A tier's launches write their rows into the tier card's own memory
 //! ([`TierIo::rows`]), and one copy a layer moves the go's columns of them
@@ -74,15 +77,17 @@ use cuda_host::cuda_module;
 use model::placement::Machine;
 use model::placement::devices::DeviceInfo;
 
-use super::link::{Crossing, Link, LinkEnd, PostCols, Reader, Span};
+use super::link::{Crossing, Link, LinkEnd, Peer, PostCols, Reader, RemoteEnd, RemoteWire, Span};
 use super::node::TierNode;
+use super::node::block::NodeBlock;
 use super::page::MAX_ROWS;
 use super::slots::{MAX_TIERS, Slot, SlotMap};
 use super::step::{Boundary, Chain, RELEASE};
 use crate::fault::{FAULT_NONE, Fault};
-use crate::graph::{Graph, cu, mem_batch, op_add, op_barrier_sys, op_wait_geq};
+use crate::graph::{Graph, cu, op_add, op_barrier_sys, op_wait_geq};
 use crate::tensor::{WindowMut, window};
 use crate::weights::Weights;
+use crate::words::{WordOps, WordSide};
 use crate::{FaultSink, Gpu, GpuError, Q8Act};
 use bloomery_levers::TierLink;
 use model::ops::DEFER_MAX_COLS;
@@ -356,6 +361,14 @@ impl TierImageLayout {
     pub fn words(&self) -> usize {
         self.x + self.x_len
     }
+
+    /// The word after this tier's places, where a handoff of a
+    /// [`ReplyRows::Packed`] tier writes its tier slots' count: inside the
+    /// places' line, which the layout keeps a word longer for it.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.sel + self.n_used * self.cols
+    }
 }
 
 /// The activation a row's tier image carries, the architecture's choice
@@ -382,6 +395,21 @@ impl TierAct {
     }
 }
 
+/// Which of a row's routed rows a tier's done carries back to the stage
+/// card's page over a mirrored link, the architecture's choice
+/// ([`TierShape::reply`]); the shared page carries nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplyRows {
+    /// Every slot's row of the columns the chain uses.
+    Whole,
+    /// The handoff puts the tier's places of its tier slots first, by rank,
+    /// so the tier's rows come back packed at the front, and writes their
+    /// count after the places ([`TierImageLayout::count`]), which the go
+    /// carries: the done carries that many rows from the front. One column a
+    /// row.
+    Packed,
+}
+
 /// The tier page's layout over `tiers` tiers: each tier's flag lines, then
 /// per row its image (each tier's places, the shared q8_1 activation), then
 /// per row its routed rows (`n_used · cols · hidden` f32, slot-major), which
@@ -397,6 +425,7 @@ pub struct TierLayout {
     sel_stride: usize,
     image_stride: usize,
     rows_stride: usize,
+    reply: ReplyRows,
 }
 
 impl TierLayout {
@@ -420,7 +449,9 @@ impl TierLayout {
     /// else refused by name): the places `n_used · cols`, the activation's
     /// codes and scales — `q3_u64` and `d8_len` are the whole staging's, its
     /// `cols` columns — or its `cols · hidden` f32, and the routed rows
-    /// `n_used · cols · hidden` f32.
+    /// `n_used · cols · hidden` f32. A [`ReplyRows::Packed`] shape takes one
+    /// column a row, else it is refused by name, and its places' line a word
+    /// more for the count.
     pub fn with_cols(
         shape: TierShape,
         cols: usize,
@@ -434,6 +465,7 @@ impl TierLayout {
             n_used,
             rows,
             act,
+            reply,
         } = shape;
         if !(1..=MAX_ROWS).contains(&rows)
             || !(1..=MAX_TIERS).contains(&tiers)
@@ -450,10 +482,23 @@ impl TierLayout {
                 ),
             ));
         }
+        if reply == ReplyRows::Packed && cols != 1 {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("a packed reply of rows of {cols} columns: it counts the rows of one"),
+            ));
+        }
         let o = || GpuError::shape(WHAT, "the page's size passes usize");
         let q3_words = q3_u64.checked_mul(2).ok_or_else(o)?;
         let places = n_used.checked_mul(cols).ok_or_else(o)?;
-        let sel_stride = places.next_multiple_of(64);
+        let count = match reply {
+            ReplyRows::Whole => 0,
+            ReplyRows::Packed => 1,
+        };
+        let sel_stride = places
+            .checked_add(count)
+            .ok_or_else(o)?
+            .next_multiple_of(64);
         let q3 = sel_stride.checked_mul(tiers).ok_or_else(o)?;
         let d8 = q3
             .checked_add(q3_words)
@@ -492,6 +537,7 @@ impl TierLayout {
             sel_stride,
             image_stride,
             rows_stride,
+            reply,
         };
         l.bytes().ok_or_else(o)?;
         Ok(l)
@@ -508,7 +554,8 @@ impl TierLayout {
     }
 
     /// Bytes in one row's go and done posts of a chain of `cols` columns,
-    /// including their generation words.
+    /// including their generation words: a packed reply's done at most, its
+    /// every slot's row.
     #[must_use]
     pub fn wire_bytes(&self, cols: usize) -> [usize; 2] {
         let crossings = self.crossings();
@@ -576,8 +623,9 @@ impl TierLayout {
     /// Every counter of the page and the bytes it publishes, as a link that
     /// mirrors the page carries them: per tier and row the go, which
     /// publishes the row's image, and the done, which publishes the columns
-    /// of the row's routed rows its chain uses and the tier's fault copy and
-    /// counts in its progress word.
+    /// of the row's routed rows its chain uses — of a packed reply the rows
+    /// its tier's count word in that image names — and the tier's fault copy,
+    /// and counts in its progress word.
     fn crossings(&self) -> Vec<Crossing> {
         let image = 4 * self.image.words();
         let rows = 4 * self.image.n_used * self.image.cols * self.image.hidden;
@@ -586,6 +634,19 @@ impl TierLayout {
             .flat_map(|(t, r)| {
                 let fault = self.word_off(t, TWord::Fault);
                 let go = self.image_off(r)..self.image_off(r) + image;
+                let routed = self.rows_off(r)..self.rows_off(r) + rows;
+                let routed = match self.reply {
+                    ReplyRows::Whole => Span {
+                        bytes: routed,
+                        cols: self.image.cols,
+                        count: None,
+                    },
+                    ReplyRows::Packed => Span::counted(
+                        routed,
+                        self.image_off(r) + 4 * (t * self.sel_stride + self.image.count()),
+                        4 * self.image.hidden,
+                    ),
+                };
                 [
                     Crossing {
                         counter: self.word_off(t, TWord::Go(r)),
@@ -596,13 +657,7 @@ impl TierLayout {
                     Crossing {
                         counter: self.word_off(t, TWord::Cnt(r)),
                         reader: Reader::Stage,
-                        spans: vec![
-                            Span {
-                                bytes: self.rows_off(r)..self.rows_off(r) + rows,
-                                cols: self.image.cols,
-                            },
-                            Span::whole(fault..fault + 8),
-                        ],
+                        spans: vec![routed, Span::whole(fault..fault + 8)],
                         prog: Some(self.word_off(t, TWord::Prog)),
                     },
                 ]
@@ -610,14 +665,15 @@ impl TierLayout {
             .collect()
     }
 
-    /// One tier's end, with its relay tail apart from every other tier's.
+    /// One tier's end of the remote page `link`, on its wire, with its relay
+    /// tail apart from every other tier's.
     fn remote_end(
         &self,
         link: &Link,
         index: usize,
         side: Reader,
         ip: std::net::IpAddr,
-    ) -> Result<super::link::RdmaEnd, GpuError> {
+    ) -> Result<RemoteEnd, GpuError> {
         self.check_tier(index)?;
         let n = 2 * self.rows;
         let bytes = TierPage::bytes_of(*self, "the remote tier page")?;
@@ -628,7 +684,7 @@ impl TierLayout {
             .skip(index * n)
             .take(n)
             .collect();
-        link.rdma_end(tail, crossings, side, ip)
+        link.remote_end(tail, crossings, side, ip)
     }
 
     /// Bytes the page holds.
@@ -640,14 +696,16 @@ impl TierLayout {
 }
 
 /// The shapes a tier is cut for: the model width, the routed slots a token,
-/// the rows in flight, and the activation its image carries; the columns a
-/// row carries are [`TierCard::open_cols`]'s.
+/// the rows in flight, the activation its image carries and the rows its
+/// done carries back; the columns a row carries are
+/// [`TierCard::open_cols`]'s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TierShape {
     pub hidden: usize,
     pub n_used: usize,
     pub rows: usize,
     pub act: TierAct,
+    pub reply: ReplyRows,
 }
 
 /// One row's windows over the page as the stage card's launches address
@@ -720,10 +778,15 @@ impl TierPage {
         Self::over(stage, layout, link)
     }
 
-    /// A page of this process alone, with one RDMA end per remote tier.
-    pub(super) fn remote(stage: &Gpu, layout: TierLayout) -> Result<TierPage, GpuError> {
+    /// A page of this process alone, with one end per remote tier over
+    /// `wire`, which each tier node meets with its own page's end.
+    pub(super) fn remote(
+        stage: &Gpu,
+        layout: TierLayout,
+        wire: RemoteWire,
+    ) -> Result<TierPage, GpuError> {
         let bytes = Self::bytes_of(layout, "TierPage::remote")?;
-        let link = Link::remote(stage.context(), bytes, layout.crossings().len())?;
+        let link = Link::remote(stage.context(), bytes, layout.crossings().len(), wire)?;
         Self::over(stage, layout, link)
     }
 
@@ -858,7 +921,7 @@ impl TierPage {
         // checked the row); each outlives every graph that captured this
         // batch, as for the boundary's own go.
         unsafe {
-            mem_batch(
+            boundary.words().batch(
                 stream,
                 &mut ops[..5 + k],
                 "cuStreamBatchMemOp_v2 (hybrid go, tier)",
@@ -898,7 +961,7 @@ impl TierPage {
         // the row); each outlives every graph that captured this batch, as
         // for the boundary's own wait.
         unsafe {
-            mem_batch(
+            boundary.words().batch(
                 stream,
                 &mut ops[..2 + 2 * k],
                 "cuStreamBatchMemOp_v2 (hybrid wait, tier)",
@@ -934,6 +997,15 @@ impl TierPage {
 
     fn counters(&self, tier: usize) -> impl Iterator<Item = usize> + '_ {
         self.layout.counters(tier)
+    }
+
+    /// Bytes this process's ends of the link posted for tier `tier`'s dones
+    /// ([`Link::posted_bytes`]).
+    pub(super) fn posted_bytes(&self, tier: usize) -> u64 {
+        let dones: Vec<usize> = (0..self.layout.rows)
+            .map(|r| self.off(tier, TWord::Cnt(r)))
+            .collect();
+        self.link.posted_bytes(&dones)
     }
 
     /// Release every wait of both cards on the page's words that is still
@@ -983,14 +1055,14 @@ mod tier_kernels {
 
 /// What the tier's layer computes, supplied by the architecture: over the
 /// staged activation `act` (its first `cols` columns, in the form
-/// [`TierShape::act`] names), each routed slot whose place in `sel`
-/// (`n_used` places a column, a tier slot or [`super::slots::HOST`]) is a
-/// tier slot runs its expert and writes its down output over
-/// `rows[j · hidden ..]` for its routed slot `j` (column `j / n_used`); no
-/// other row is written. `rows` is the tier card's own buffer
-/// (`n_used · cols · hidden` of the tier's columns), which the protocol
-/// copies to the row's routed rows on the page after the launches. The
-/// staging holds the tier's columns
+/// [`TierShape::act`] names), each place in `sel` (`n_used` places a
+/// column, a tier slot or [`super::slots::HOST`], in the order the stage
+/// card's handoff gave them) that is a tier slot runs its expert and writes
+/// its down output over `rows[j · hidden ..]` for its position `j` (column
+/// `j / n_used`); no other row is written. `rows` is the tier card's own
+/// buffer (`n_used · cols · hidden` of the tier's columns), which the
+/// protocol copies to the row's routed rows on the page after the launches.
+/// The staging holds the tier's columns
 /// ([`TierCard::open_cols`]), of which a go of the step or the pair fills
 /// one and a [`Chain::Cols`] go its width.
 pub struct TierIo<'a> {
@@ -1054,6 +1126,15 @@ pub trait TierExperts {
     /// default the batch service's copy of the block's down outputs.
     fn block_rows(&self) -> BlockRows {
         BlockRows::Staged
+    }
+
+    /// Whether a block reads, of its input, only the q3 plane and scales of
+    /// its q8_1 form ([`TierBlock::act`]'s [`Q8Act::q3`] and [`Q8Act::d8`]),
+    /// the form a [`TierAct::Q8`] image carries: a tier on a node runs blocks
+    /// only then, sent those planes alone, and its experts are otherwise a
+    /// batch's host's. By default it reads more.
+    fn block_planes(&self) -> bool {
+        false
     }
 }
 
@@ -1121,6 +1202,11 @@ pub struct TierStats {
     pub replays: u64,
     pub feeds: u64,
     pub captures: u64,
+    /// Bytes this process's ends of a mirrored or remote link posted for the
+    /// tier's dones (the rows, the fault copy, the generation word): with the
+    /// tier's card in this process every done's, on a tier node none (the
+    /// node's end posts them), 0 on the shared page.
+    pub posted_bytes: u64,
 }
 
 /// One row's routed rows on the page as the tier's copy out writes them (the
@@ -1161,6 +1247,9 @@ pub(crate) struct TierWork {
     graphs: [Option<Graph>; TIER_CHAINS],
     experts: Box<dyn TierExperts>,
     module: tier_kernels::LoadedModule,
+    /// How this card adds to the page's words: a layer's go take-back and
+    /// its done ([`super::word_ops`]).
+    words: WordOps,
     /// The staged activation and places a layer's kernels read, copied in
     /// from the row's image.
     act: Staged,
@@ -1224,10 +1313,12 @@ impl TierWork {
         // SAFETY: this crate owns the embedded device bundle produced for the
         // module above; its launcher checks the launch contract.
         let module = unsafe { crate::shared_module!(tier_kernels, &ctx)? };
+        let words = super::word_ops(&ctx, stream)?;
         Ok(TierWork {
             graphs: std::array::from_fn(|_| None),
             experts,
             module,
+            words,
             sel: DeviceBuffer::zeroed(stream, cols * shape.n_used)?,
             out: DeviceBuffer::zeroed(stream, cols * shape.n_used * shape.hidden)?,
             act,
@@ -1277,6 +1368,18 @@ impl TierWork {
     /// Nodes of the graph held in slot `i`; `None` when none is held.
     fn graph_nodes(&self, i: usize) -> Option<usize> {
         self.graphs[i].as_ref().map(Graph::node_count)
+    }
+
+    /// How this card adds to the page's words, which sets its graphs' nodes
+    /// a layer ([`TierCard::nodes_per_layer`]).
+    pub(super) fn word_side(&self) -> WordSide {
+        self.words.side()
+    }
+
+    /// The card's page-word operations, its side and the driver version it
+    /// was chosen under.
+    pub(super) fn word_ops(&self) -> &WordOps {
+        &self.words
     }
 
     /// Bind the work to a page laid out by `layout` as tier `index`, `end`
@@ -1359,21 +1462,30 @@ impl TierWork {
         Ok(layout)
     }
 
-    /// Bind this node's own page and connect its RDMA end to the stage's endpoint.
+    /// Bind this node's own page, its end on the wire of the stage's `peer`,
+    /// connected to it, as tier `index` of `tiers`, `ip` the control socket's
+    /// local address; what the stage's end needs to meet this one. A TCP end
+    /// dials the stage's listener and names the address it dialed from, so
+    /// its endpoint is read after the connect.
     pub(super) fn bind_remote(
         &mut self,
         tiers: usize,
         index: usize,
-        peer: &bloomery_verbs::Endpoint,
+        peer: &Peer,
         ip: std::net::IpAddr,
-    ) -> Result<bloomery_verbs::Endpoint, GpuError> {
+    ) -> Result<Peer, GpuError> {
         let layout = self.binding_layout(tiers, index)?;
         let bytes = TierPage::bytes_of(layout, "TierWork::bind_remote")?;
-        let mut link = Link::remote(self.gpu.context(), bytes, layout.crossings().len())?;
+        let mut link = Link::remote(
+            self.gpu.context(),
+            bytes,
+            layout.crossings().len(),
+            peer.wire(),
+        )?;
         link.store(layout.word_off(index, TWord::Fault), FAULT_NONE);
         let mut end = layout.remote_end(&link, index, Reader::Tier, ip)?;
+        end.connect(0x200, peer)?;
         let endpoint = end.endpoint(0x200);
-        end.connect(endpoint.psn, peer)?;
         link.keep_remote(end);
         self.bind(layout, index, link.own_end(), link.post_cols());
         self.link = Some(link);
@@ -1471,6 +1583,22 @@ impl TierWork {
             .enqueue_block(&self.gpu, &self.weights, layer, io)
     }
 
+    /// The work's shape.
+    pub(super) fn shape(&self) -> TierShape {
+        self.shape
+    }
+
+    /// What a tier node's blocks need of this work: its architecture's
+    /// block scratch bytes and where it leaves a block's rows, when it runs
+    /// blocks from the q8_1 planes a [`TierAct::Q8`] image carries
+    /// ([`TierExperts::block_planes`]); `None` when it runs no block, or
+    /// none from those planes alone.
+    pub(super) fn block_kind(&self) -> Option<(usize, BlockRows)> {
+        let scratch = self.experts.block_bytes();
+        (self.shape.act == TierAct::Q8 && self.experts.block_planes() && scratch != 0)
+            .then(|| (scratch, self.experts.block_rows()))
+    }
+
     /// Wait until the tier's stream has drained.
     pub(super) fn sync(&self) -> Result<(), GpuError> {
         self.gpu.stream().synchronize()?;
@@ -1546,6 +1674,7 @@ impl TierWork {
         let TierWork {
             experts,
             module,
+            words,
             act,
             sel,
             out,
@@ -1563,6 +1692,7 @@ impl TierWork {
         Ok(Parts {
             experts: &mut **experts,
             module,
+            words,
             act,
             sel,
             out,
@@ -1735,15 +1865,100 @@ impl TierCard {
     }
 
     /// Device bytes of the architecture's prompt-batch block scratch on the
-    /// tier card ([`TierExperts::block_bytes`]), when it is in this process.
+    /// tier card ([`TierExperts::block_bytes`]): its own in this process, a
+    /// node's as its block open named them; a node that opened no block
+    /// staging is refused by name.
     pub fn block_bytes(&self) -> Result<usize, GpuError> {
-        Ok(self.work()?.experts.block_bytes())
+        match &self.side {
+            TierSide::Here(w) => Ok(w.experts.block_bytes()),
+            TierSide::Node(n) => Ok(Self::opened_block(n, &self.name)?.scratch),
+        }
     }
 
     /// Where the architecture's block rows reach the set's rows
-    /// ([`TierExperts::block_rows`]), when the card is in this process.
+    /// ([`TierExperts::block_rows`]): a node's as its block open named it; a
+    /// node that opened no block staging is refused by name.
     pub fn block_rows(&self) -> Result<BlockRows, GpuError> {
-        Ok(self.work()?.experts.block_rows())
+        match &self.side {
+            TierSide::Here(w) => Ok(w.experts.block_rows()),
+            TierSide::Node(n) => Ok(Self::opened_block(n, &self.name)?.rows),
+        }
+    }
+
+    /// The node `n`'s block staging, refused by name before its block open
+    /// made one.
+    fn opened_block(n: &TierNode, name: &str) -> Result<NodeBlock, GpuError> {
+        n.block().ok_or_else(|| {
+            GpuError::shape(
+                WHAT,
+                format!(
+                    "the tier {name} on the node at {}: it opened no block staging \
+                     (TierCard::open_node_block)",
+                    n.addr()
+                ),
+            )
+        })
+    }
+
+    /// On a node, open its block staging for blocks of up to `cap` tokens
+    /// ([`TierNode::block_open`]) unless an earlier open made it; nothing
+    /// for a card of this process. The stage card's context is current on
+    /// return.
+    pub(super) fn open_node_block(&mut self, cap: usize) -> Result<(), GpuError> {
+        if let TierSide::Node(n) = &mut self.side
+            && n.block().is_none()
+        {
+            n.block_open(cap)?;
+        }
+        self.rebind_stage()
+    }
+
+    /// The node's block staging, once its block open made one; `None` for a
+    /// card of this process.
+    pub(super) fn node_block(&self) -> Option<NodeBlock> {
+        match &self.side {
+            TierSide::Here(_) => None,
+            TierSide::Node(n) => n.block(),
+        }
+    }
+
+    /// Send layer `layer`'s block of `cols` tokens to the node: each slot's
+    /// tier place and the columns' q3 plane and scales `planes`, of which
+    /// `sent` slots are the tier's ([`TierNode::block_send`]); a card of
+    /// this process is refused by name.
+    pub(super) fn block_send(
+        &mut self,
+        (layer, cols): (usize, usize),
+        places: &[u32],
+        planes: (&[u8], &[u8]),
+        sent: usize,
+    ) -> Result<(), GpuError> {
+        match &mut self.side {
+            TierSide::Here(_) => Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the tier {}: a block request to a card of this process",
+                    self.name
+                ),
+            )),
+            TierSide::Node(n) => n.block_send((layer, cols), places, planes, sent),
+        }
+    }
+
+    /// The rows of the block [`TierCard::block_send`] sent, the node's reply
+    /// read by `deadline` ([`TierNode::block_rows`]); a card of this process
+    /// is refused by name.
+    pub(super) fn block_rows_of(&mut self, deadline: Instant) -> Result<&[u8], GpuError> {
+        match &mut self.side {
+            TierSide::Here(_) => Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the tier {}: a block reply from a card of this process",
+                    self.name
+                ),
+            )),
+            TierSide::Node(n) => n.block_rows(deadline),
+        }
     }
 
     /// Which experts the tier holds.
@@ -1807,12 +2022,24 @@ impl TierCard {
     }
 
     /// Nodes per tier layer of a captured tier graph whose image carries
-    /// `act`: the go wait, the copies in ([`TierAct::copies`]), the
+    /// `act`, on a card that adds to the page's words on `side`: the go wait
+    /// and its take-back, the copies in ([`TierAct::copies`]), the
     /// architecture's launches (`launches`), the routed rows' copy out and
     /// the signal; the graph's last layer adds the fault copy.
     #[must_use]
-    pub const fn nodes_per_layer(act: TierAct, launches: usize) -> usize {
-        1 + act.copies() + launches + 1 + 1
+    pub const fn nodes_per_layer(act: TierAct, launches: usize, side: WordSide) -> usize {
+        word_batch_nodes(side) + act.copies() + launches + 1 + word_batch_nodes(side)
+    }
+
+    /// The side the tier's card adds to the page's words on: the work's own
+    /// here, and on a node the side its last capture's reply named; `None`
+    /// on a node before its first capture.
+    #[must_use]
+    pub fn word_side(&self) -> Option<WordSide> {
+        match &self.side {
+            TierSide::Here(w) => Some(w.word_side()),
+            TierSide::Node(n) => n.word_side(),
+        }
     }
 
     /// Nodes of `chain`'s captured tier graph; `None` before its first
@@ -1892,7 +2119,7 @@ impl TierCard {
                 let mut end = layout.remote_end(&page.link, index, Reader::Stage, n.local_ip()?)?;
                 let endpoint = end.endpoint(0x100);
                 let peer = n.bind_remote(layout.tiers, index, &endpoint)?;
-                end.connect(endpoint.psn, &peer)?;
+                end.connect(0x100, &peer)?;
                 page.link.keep_remote(end);
             }
             TierSide::Node(n) => {
@@ -1994,10 +2221,13 @@ impl TierCard {
         self.rebind_stage()
     }
 
+    /// Whether the tier runs a prompt batch's blocks: its architecture's
+    /// block scratch in this process, or on a node, the block staging its
+    /// block open made ([`TierCard::open_node_block`]).
     pub(super) fn supports_blocks(&self) -> bool {
         match &self.side {
             TierSide::Here(work) => work.experts.block_bytes() != 0,
-            TierSide::Node(_) => false,
+            TierSide::Node(n) => n.block().is_some(),
         }
     }
 
@@ -2142,9 +2372,12 @@ impl TierCard {
     }
 
     /// Release the remote reader's waits and drain its stream, keeping its relay stopped.
+    /// Nothing for a lost node: no card of this process waits on its page, and a node that
+    /// loses this process releases its own words ([`TierWork::release_opened`]).
     pub(super) fn release_remote(&mut self, page: &TierPage) -> Result<(), GpuError> {
         if page.link.is_remote()
             && let TierSide::Node(n) = &mut self.side
+            && n.lost().is_none()
         {
             n.release_remote()?;
         }
@@ -2312,6 +2545,7 @@ impl Staged {
 struct Parts<'a> {
     experts: &'a mut dyn TierExperts,
     module: &'a tier_kernels::LoadedModule,
+    words: &'a WordOps,
     act: &'a mut Staged,
     sel: &'a mut DeviceBuffer<u32>,
     out: &'a mut DeviceBuffer<f32>,
@@ -2359,7 +2593,7 @@ impl Parts<'_> {
         // checked above), which the host tier drops after its tier cards and
         // so after every graph that captured this batch.
         unsafe {
-            mem_batch(
+            self.words.batch(
                 stream,
                 &mut [op_wait_geq(go, 1), op_add(go, u32::MAX)],
                 "cuStreamBatchMemOp_v2 (tier go)",
@@ -2447,7 +2681,7 @@ impl Parts<'_> {
         // in the page (row checked above), which the host tier drops after
         // its tier cards and so after every graph that captured this batch.
         unsafe {
-            mem_batch(
+            self.words.batch(
                 stream,
                 &mut [
                     op_barrier_sys(),
@@ -2457,6 +2691,17 @@ impl Parts<'_> {
                 "cuStreamBatchMemOp_v2 (tier signal)",
             )
         }
+    }
+}
+
+/// Nodes of a captured page-word batch whose adds follow a wait or a system
+/// barrier (a layer's go take-back, its signal) on `side`: the one batch of
+/// memory operations, or that batch's other operations and one `word_add`
+/// launch ([`WordOps::batch`]).
+const fn word_batch_nodes(side: WordSide) -> usize {
+    match side {
+        WordSide::Memop => 1,
+        WordSide::Kernel => 2,
     }
 }
 
@@ -2482,8 +2727,8 @@ pub(super) mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     use super::{
-        TIER_CHAINS, TIER_FLAGS, TWord, TierAct, TierLayout, TierPage, TierSet, TierShape,
-        chain_slot,
+        ReplyRows, Span, TIER_CHAINS, TIER_FLAGS, TWord, TierAct, TierLayout, TierPage, TierSet,
+        TierShape, chain_slot,
     };
     use crate::Gpu;
     use crate::host::slots::{HOST, Slot, SlotMap, TIER};
@@ -2533,6 +2778,7 @@ pub(super) mod tests {
             n_used: 1,
             rows: 1,
             act: TierAct::F32,
+            reply: ReplyRows::Whole,
         };
         let mut work = super::TierWork::open(gpu, weights, Box::new(Empty(dropped)), shape, 1)
             .expect("empty work");
@@ -2697,6 +2943,7 @@ pub(super) mod tests {
         n_used: 6,
         rows: 2,
         act: TierAct::Q8,
+        reply: ReplyRows::Packed,
     };
 
     /// V4.1's tier page of one tier: two rows of six slots over 4096 values,
@@ -2731,6 +2978,42 @@ pub(super) mod tests {
         assert!(TierLayout::new(TierShape { rows: 5, ..V41 }, 512, 32, 1).is_err());
         assert!(TierLayout::new(V41, 512, 32, 0).is_err());
         assert!(TierLayout::new(V41, 512, 32, 9).is_err());
+    }
+
+    /// V4.1's packed reply: each row's done counts its rows, `hidden` f32
+    /// each, by the word after tier 0's places in that row's image, which the
+    /// row's go carries; the page's offsets are a whole reply's, the count
+    /// inside the places' line. A whole reply's done carries its rows by
+    /// columns, and a packed reply of rows of two columns is refused by name.
+    #[test]
+    fn a_packed_reply_counts_its_rows_by_a_word_its_go_carries() {
+        let packed = TierLayout::new(V41, 512, 32, 1).expect("V4.1's tier page");
+        let whole = TierShape {
+            reply: ReplyRows::Whole,
+            ..V41
+        };
+        let whole = TierLayout::new(whole, 512, 32, 1).expect("a whole reply's page");
+        let i = packed.image(0).expect("tier 0");
+        assert_eq!((i.count(), i.q3), (6, 64));
+        assert_eq!(Some(i), whole.image(0).ok());
+        assert_eq!(packed.bytes(), whole.bytes());
+        let (pc, wc) = (packed.crossings(), whole.crossings());
+        for r in 0..2 {
+            let (go, done) = (&pc[2 * r], &pc[2 * r + 1]);
+            let word = packed.image_off(r) + 4 * 6;
+            assert!(
+                go.spans[0].bytes.contains(&word),
+                "row {r}'s go carries its count"
+            );
+            let rows = packed.rows_off(r)..packed.rows_off(r) + 4 * 6 * 4096;
+            assert_eq!(done.spans[0], Span::counted(rows.clone(), word, 4 * 4096));
+            assert_eq!(wc[2 * r + 1].spans[0], Span::whole(rows));
+            assert_eq!(done.spans[1..], wc[2 * r + 1].spans[1..]);
+        }
+        assert!(matches!(
+            TierLayout::with_cols(V41, 2, 512, 32, 1),
+            Err(crate::GpuError::Shape { detail, .. }) if detail.contains("a packed reply")
+        ));
     }
 
     /// A release interrupted after any store leaves a loss marker before
@@ -2839,6 +3122,7 @@ pub(super) mod tests {
             n_used: 8,
             rows: 2,
             act: TierAct::F32,
+            reply: ReplyRows::Whole,
         };
         let l = TierLayout::new(glm, 0, 0, 1).expect("GLM's tier page");
         let i = l.image(0).expect("tier 0");
@@ -2870,6 +3154,7 @@ pub(super) mod tests {
             n_used: 10,
             rows: 1,
             act: TierAct::F32,
+            reply: ReplyRows::Whole,
         };
         let l = TierLayout::with_cols(q38, 4, 0, 0, 1).expect("Qwen3.8's tier page");
         let i = l.image(0).expect("tier 0");

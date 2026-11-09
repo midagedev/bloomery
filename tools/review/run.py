@@ -4,10 +4,17 @@
     tools/review/run.py reviewer|validator|learner BASE_TREE PR_TREE CTX OUT TRACE
     tools/review/run.py --self-test
 
-The engines are tools/review/run-claude.sh and run-codex.sh, which take the same arguments. REVIEW_ENGINE (claude,
-the default, or codex) names the one tried first; the other is the fallback. An engine is tried only when its login is
-there (ANTHROPIC_API_KEY for claude, CODEX_HOME/auth.json for codex, which the workflow writes from a secret) and its
-CLI is on PATH.
+The engines are glm, claude and codex. glm and claude both run tools/review/run-claude.sh (headless Claude Code), glm on
+GLM through z.ai's Anthropic-compatible endpoint; codex runs run-codex.sh; all take the same arguments. REVIEW_ENGINE is
+an ordered, comma-separated list (`glm,codex,claude`; one word is a list of one): the engines it names are tried in that
+order, then the ones it leaves out in the order glm, claude, codex. A word that is no engine is named and skipped. Unset,
+the order is glm, claude, codex. An engine is tried only when its login is there (ZAI_API_KEY for glm, ANTHROPIC_API_KEY
+for claude, CODEX_HOME/auth.json for codex, which the workflow writes from a secret) and its CLI is on PATH (claude for
+glm and claude). Each engine's child process gets its own login only: glm gets the key as ANTHROPIC_AUTH_TOKEN with
+ZAI_BASE_URL (default https://api.z.ai/api/anthropic) as ANTHROPIC_BASE_URL and REVIEW_MODEL_GLM (default glm-5.3) as
+its model, claude gets neither a base URL, a token nor a cloud switch (CLAUDE_CODE_USE_*) of a runner's, and codex
+neither key. REVIEW_RUN_ENGINE names the
+engine to the script, which passes it to usage.py.
 
 An attempt fails when the run exits non-zero (run-codex.sh exits 69 when its sandbox check fails), overruns the
 role's MINUTES (its process group is stopped), its usage (tools/review/usage.py) is an error, or OUT lacks what this
@@ -19,8 +26,8 @@ not a failure here: `post.py check` refuses it after the validator.
 
 An engine writes its transcript, usage and output (stdout and stderr) to a private directory outside TRACE. When the
 run ends, by any path but SIGKILL, run.py replaces every credential in those files and only then copies them into
-TRACE and the output to stderr: the value of ANTHROPIC_API_KEY, every long string of CODEX_HOME/auth.json before and
-after the run (Codex rewrites the file when it refreshes its tokens), and token shapes. A run killed outright leaves
+TRACE and the output to stderr: the values of ANTHROPIC_API_KEY and ZAI_API_KEY, every long string of
+CODEX_HOME/auth.json before and after the run (Codex rewrites the file when it refreshes its tokens), and token shapes. A run killed outright leaves
 nothing in TRACE. OUT is checked after every run: a credential in it, or anything there but regular files and
 directories (a symbolic link could pull a file from outside into the next copy of OUT), ends the role with exit 3, OUT
 emptied, no fallback, and nothing posted.
@@ -44,11 +51,21 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from post import TOKEN_RE, VALIDATOR_LINE, VERDICT_RE, secret_file_values, secrets_in, unsafe_entries  # noqa: E402
 
-ENGINES = ("claude", "codex")
+ENGINES = ("glm", "claude", "codex")
+# The script run-<runner>.sh an engine runs, which is also the CLI it needs.
+RUNNER = {"glm": "claude", "claude": "claude", "codex": "codex"}
+# What can point Claude Code at an endpoint or a cloud other than the one its engine names.
+ROUTES = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+          "CLAUDE_CODE_USE_FOUNDRY")
+GLM_BASE_URL = "https://api.z.ai/api/anthropic"
+GLM_MODEL = "glm-5.3"
+# Claude Code enforces 200000 for a model it does not know; glm-5.3 takes 1M.
+GLM_CONTEXT_TOKENS = "1310720"
 NO_ENGINE = 75
 SANDBOX_CHECK_FAILED = 69
 TIMEOUT = 124
-# Per engine run; a role that falls back can take twice this. The workflows' timeout-minutes hold both.
+# Per engine run; a role that falls back through every engine can take three times this. The workflows'
+# timeout-minutes hold all three.
 MINUTES = {"reviewer": 20, "validator": 10, "learner": 15}
 REASONS = (
     ("limit", re.compile(r"usage limit|rate.?limit|quota|\b429\b|credit balance|too many requests|at capacity"
@@ -57,17 +74,32 @@ REASONS = (
 )
 
 
-def order(preferred, available):
-    first = preferred if preferred in ENGINES else "claude"
-    return [e for e in (first, *[x for x in ENGINES if x != first]) if available.get(e) is None]
+def words(spec):
+    """The distinct words of a REVIEW_ENGINE value, in order."""
+    return list(dict.fromkeys(w.strip().lower() for w in (spec or "").split(",") if w.strip()))
+
+
+def order(spec, available):
+    """The engines that can run, in REVIEW_ENGINE's order, then the others in ENGINES order."""
+    named = [w for w in words(spec) if w in ENGINES]
+    return [e for e in (*named, *[x for x in ENGINES if x not in named]) if available.get(e, "unknown") is None]
 
 
 def available_engines(env):
     """{engine: None when it can run, else why not}."""
     home = env.get("CODEX_HOME") or os.path.expanduser("~/.codex")
-    login = {"claude": bool(env.get("ANTHROPIC_API_KEY")), "codex": os.path.isfile(os.path.join(home, "auth.json"))}
-    return {e: None if login[e] and shutil.which(e, path=env.get("PATH")) else "no login" if not login[e]
-            else "not installed" for e in ENGINES}
+    login = {"glm": bool(env.get("ZAI_API_KEY")), "claude": bool(env.get("ANTHROPIC_API_KEY")),
+             "codex": os.path.isfile(os.path.join(home, "auth.json"))}
+    out = {}
+    for e in ENGINES:
+        cli = RUNNER[e]
+        if not login[e]:
+            out[e] = "no login"
+        elif not shutil.which(cli, path=env.get("PATH")):
+            out[e] = "not installed" if cli == e else f"{cli} CLI not installed"
+        else:
+            out[e] = None
+    return out
 
 
 def read(path):
@@ -132,7 +164,7 @@ def failure(engine, role, rc, usage, out, before, log):
 
 
 def credentials(env):
-    vals = [("env:ANTHROPIC_API_KEY", env.get("ANTHROPIC_API_KEY", ""))]
+    vals = [(f"env:{n}", env.get(n, "")) for n in ("ANTHROPIC_API_KEY", "ZAI_API_KEY")]
     home = env.get("CODEX_HOME") or os.path.expanduser("~/.codex")
     return vals + secret_file_values(os.path.join(home, "auth.json"))
 
@@ -162,14 +194,31 @@ def publish(raw, trace, role, values):
             sys.stderr.write(text if text.endswith("\n") else text + "\n")
 
 
-def launch(engine, role, paths, env):
-    """Run one engine's script in its own process group, its output in <role>.log of the TRACE it is given; the other
-    engine's credential stays out of its environment. The group is stopped when the run overruns MINUTES[role] or
-    run.py is stopped."""
-    script = os.path.join(paths[0], "tools", "review", f"run-{engine}.sh")
-    child = dict(env)
+def child_env(engine, env):
+    """The environment one engine's script runs under: its own login, no other engine's and no runner's routing. glm
+    is the claude script on z.ai's endpoint: the key becomes ANTHROPIC_AUTH_TOKEN, and every model alias Claude Code
+    might ask for is pinned to the one model, since z.ai answers an id it is given without saying what it is."""
+    child = {k: v for k, v in env.items() if k != "ZAI_API_KEY" and k not in ROUTES}
+    child["REVIEW_RUN_ENGINE"] = engine
     if engine == "codex":
         child.pop("ANTHROPIC_API_KEY", None)
+    elif engine == "glm":
+        model = env.get("REVIEW_MODEL_GLM") or GLM_MODEL
+        child.pop("ANTHROPIC_API_KEY", None)
+        child.update(ANTHROPIC_BASE_URL=env.get("ZAI_BASE_URL") or GLM_BASE_URL, ANTHROPIC_AUTH_TOKEN=env["ZAI_API_KEY"],
+                     REVIEW_MODEL=model, ANTHROPIC_MODEL=model, ANTHROPIC_DEFAULT_OPUS_MODEL=model,
+                     ANTHROPIC_DEFAULT_SONNET_MODEL=model, ANTHROPIC_DEFAULT_HAIKU_MODEL=model,
+                     ANTHROPIC_SMALL_FAST_MODEL=model, CLAUDE_CODE_SUBAGENT_MODEL=model)
+        child.setdefault("CLAUDE_CODE_MAX_CONTEXT_TOKENS", GLM_CONTEXT_TOKENS)
+        child.setdefault("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+    return child
+
+
+def launch(engine, role, paths, env):
+    """Run one engine's script in its own process group, its output in <role>.log of the TRACE it is given, under
+    child_env. The group is stopped when the run overruns MINUTES[role] or run.py is stopped."""
+    script = os.path.join(paths[0], "tools", "review", f"run-{RUNNER[engine]}.sh")
+    child = child_env(engine, env)
     with open(os.path.join(paths[4], f"{role}.log"), "wb") as log:
         p = subprocess.Popen(["bash", script, role, *paths], env=child, stdin=subprocess.DEVNULL, stdout=log,
                              stderr=subprocess.STDOUT, start_new_session=True)
@@ -202,7 +251,11 @@ def run_role(role, paths, env, run=launch, say=print):
     except (OSError, ValueError):
         dead = {}
     avail = available_engines(env)
-    tried = [e for e in order(env.get("REVIEW_ENGINE", "claude"), avail) if e not in dead]
+    spec = env.get("REVIEW_ENGINE", "")
+    tried = [e for e in order(spec, avail) if e not in dead]
+    for w in words(spec):
+        if w not in ENGINES:
+            say(f"{role}: REVIEW_ENGINE names '{w}', which is no engine ({', '.join(ENGINES)}); skipped")
     for e in ENGINES:
         if avail[e]:
             say(f"{role}: {e} not tried ({avail[e]})")
@@ -264,7 +317,7 @@ def self_test():
             os.mkdir(p)
         paths, home, bindir = paths[:5], paths[5], paths[6]
         out, trace = paths[3], paths[4]
-        for e in ENGINES:
+        for e in sorted(set(RUNNER.values())):
             open(os.path.join(bindir, e), "w").write("#!/bin/sh\n")
             os.chmod(os.path.join(bindir, e), 0o755)
         auth = os.path.join(home, "auth.json")
@@ -305,8 +358,8 @@ def self_test():
         # array; a new line alone is enough.
         assert run_role("reviewer", paths, env, fake({"codex": limit, "claude": ok_c}), lines.append) == 0
         assert calls == [("codex", "reviewer"), ("claude", "reviewer")], calls
-        assert not os.path.exists(os.path.join(out, "partial.md")) and "limit" in lines[0], lines
-        assert lines[-1] == "reviewer: done by claude after codex failed", lines
+        assert not os.path.exists(os.path.join(out, "partial.md")) and "limit" in lines[1], lines
+        assert lines[0] == "reviewer: glm not tried (no login)" and lines[-1] == "reviewer: done by claude after codex failed", lines
         assert "fakefake" not in open(os.path.join(trace, "reviewer.codex.failed.ndjson")).read()
         assert open(os.path.join(trace, "reviewer.engine")).read() == "claude\n"
         calls.clear()
@@ -331,21 +384,110 @@ def self_test():
         with contextlib.redirect_stderr(io.StringIO()):
             assert run_role("reviewer", paths, env, fake({"codex": unsafe, "claude": auth_err}), lines.append) == 75
         assert sorted(os.listdir(out)) == before, os.listdir(out)
-        assert "codex failed (sandbox check failed: the network was open)" in lines[0], lines
-        assert "claude failed (auth" in lines[1] and "fake" not in "".join(lines), lines
+        assert "codex failed (sandbox check failed: the network was open)" in lines[1], lines
+        assert "claude failed (auth" in lines[2] and "fake" not in "".join(lines), lines
+
+        # Three engines, in REVIEW_ENGINE's order, the rest after in glm, claude, codex order. A word that is no
+        # engine is named and skipped. Each failed engine's trace keeps the key out; a key in OUT ends the role 3.
+        key = "zai-test-key-value"
+        env3 = dict(env, ZAI_API_KEY=key, REVIEW_ENGINE="codex,glm")
+        limit_z = (1, {"is_error": True, "error": "API Error: Request rejected (429) \u00b7 [1308][Usage limit reached "
+                       "for 5 hour. Your limit will reset at 2026-10-06 16:23:45]"}, {})
+        ok_g = (0, {"is_error": False, "engine": "glm"}, good, f"the endpoint echoed {key}\n")
+        reset()
+        with contextlib.redirect_stderr(io.StringIO()):
+            assert run_role("reviewer", paths, env3, fake({"codex": limit, "glm": limit_z, "claude": ok_c}),
+                            lines.append) == 0
+        assert calls == [("codex", "reviewer"), ("glm", "reviewer"), ("claude", "reviewer")], calls
+        assert lines[-1] == "reviewer: done by claude after codex, glm failed" and "glm failed (limit:" in lines[-2], lines
+        reset()
+        with contextlib.redirect_stderr(io.StringIO()):
+            assert run_role("reviewer", paths, dict(env3, REVIEW_ENGINE=""), fake({"glm": ok_g}), lines.append) == 0
+        assert calls == [("glm", "reviewer")] and lines == ["reviewer: done by glm"], (calls, lines)
+        assert open(os.path.join(trace, "reviewer.engine")).read() == "glm\n"
+        text = open(os.path.join(trace, "reviewer.log")).read()
+        assert key not in text and "the endpoint echoed [credential removed]" in text, text
+        reset()
+        assert run_role("reviewer", paths, dict(env, REVIEW_ENGINE="gpt, claude,claude"), fake({"claude": ok_c}),
+                        lines.append) == 0
+        assert lines == ["reviewer: REVIEW_ENGINE names 'gpt', which is no engine (glm, claude, codex); skipped",
+                         "reviewer: glm not tried (no login)", "reviewer: done by claude"], lines
+        reset()
+        leak_z = (0, ok, {**good, "review.md": f"**Verdict: CLEAN**: {key}\n"})
+        assert run_role("reviewer", paths, dict(env3, REVIEW_ENGINE="glm"), fake({"glm": leak_z}), lines.append) == 3
+        assert os.listdir(out) == [] and calls == [("glm", "reviewer")] and "env:ZAI_API_KEY" in lines[-1], lines
+        reset()
+        open(os.path.join(out, "review.md"), "w").write(good["review.md"])
+        open(os.path.join(out, "decision.txt"), "w").write(good["decision.txt"])
+        # The documented z.ai refusals read as a limit, like the others.
+        for msg in (limit_z[1]["error"], "API Error: 429 [1302][Rate limit reached for requests]"):
+            assert failure("glm", "reviewer", 1, {"is_error": True, "error": msg}, out, out, "").startswith("limit:"), msg
+
+        # A glm login with no claude CLI is "claude CLI not installed"; no key is "no login".
+        nobin = os.path.join(d, "nobin")
+        os.mkdir(nobin)
+        assert available_engines({"ZAI_API_KEY": key, "PATH": nobin})["glm"] == "claude CLI not installed"
+        assert available_engines({"ANTHROPIC_API_KEY": key, "PATH": nobin})["claude"] == "not installed"
+        assert available_engines({"ANTHROPIC_API_KEY": key, "PATH": bindir})["glm"] == "no login"
+        assert available_engines({"ZAI_API_KEY": key, "PATH": bindir, "CODEX_HOME": home})["glm"] is None
+        reset()
+        assert run_role("learner", paths, {"ZAI_API_KEY": key, "REVIEW_ENGINE": "glm", "PATH": nobin, "CODEX_HOME": home},
+                        fake({}), lines.append) == NO_ENGINE
+        assert "learner: glm not tried (claude CLI not installed)" in lines and calls == [], (calls, lines)
+
+        # The order rule: REVIEW_ENGINE's engines first, in its order, then the rest as ENGINES lists them.
+        every = dict.fromkeys(ENGINES)
+        assert words(" Codex , ,glm,codex") == ["codex", "glm"] and words("") == [] and words(None) == []
+        assert order("", every) == ["glm", "claude", "codex"]
+        assert order("codex", every) == ["codex", "glm", "claude"]
+        assert order("claude,glm", every) == ["claude", "glm", "codex"]
+        assert order("glm,codex,claude", every) == ["glm", "codex", "claude"]
+        assert order("gpt,codex", every) == ["codex", "glm", "claude"]
+        assert order("codex,glm", dict(every, glm="no login")) == ["codex", "claude"]
+
+        # What each engine's script is started with, seen by a script that dumps its environment: the key is the
+        # token only glm holds, no engine holds another's login, and a runner's leftover endpoint never reaches claude.
+        stubs = os.path.join(paths[0], "tools", "review")
+        os.makedirs(stubs)
+        for runner in ("claude", "codex"):
+            open(os.path.join(stubs, f"run-{runner}.sh"), "w").write(f'env > "{d}/env.$REVIEW_RUN_ENGINE"\n')
+        parent = dict(env, ZAI_API_KEY=key, ANTHROPIC_BASE_URL="http://leftover.invalid", ANTHROPIC_AUTH_TOKEN="leftover",
+                      CLAUDE_CODE_USE_FOUNDRY="1", REVIEW_MODEL="claude-sonnet-5-5", PATH=os.environ["PATH"])
+
+        def child(engine, **extra):
+            assert launch(engine, "reviewer", paths, dict(parent, **extra)) == 0
+            return dict(line.split("=", 1) for line in read(os.path.join(d, f"env.{engine}")).splitlines() if "=" in line)
+
+        g = child("glm")
+        assert "ANTHROPIC_API_KEY" not in g and "ZAI_API_KEY" not in g, sorted(g)
+        assert (g["ANTHROPIC_AUTH_TOKEN"], g["ANTHROPIC_BASE_URL"], g["REVIEW_MODEL"]) == (key, GLM_BASE_URL, GLM_MODEL), g
+        pinned = {g[n] for n in ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                                 "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_SMALL_FAST_MODEL", "CLAUDE_CODE_SUBAGENT_MODEL")}
+        assert pinned == {GLM_MODEL} and g["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == GLM_CONTEXT_TOKENS, g
+        g = child("glm", ZAI_BASE_URL="http://z.invalid", REVIEW_MODEL_GLM="glm-x", CLAUDE_CODE_MAX_CONTEXT_TOKENS="5")
+        assert (g["ANTHROPIC_BASE_URL"], g["REVIEW_MODEL"], g["ANTHROPIC_MODEL"], g["CLAUDE_CODE_MAX_CONTEXT_TOKENS"]) == (
+            "http://z.invalid", "glm-x", "glm-x", "5"), g
+        c = child("claude")
+        assert c["ANTHROPIC_API_KEY"] == "sk-test-key-value" and c["REVIEW_MODEL"] == "claude-sonnet-5-5", c
+        assert not {"ZAI_API_KEY", "CLAUDE_CODE_USE_FOUNDRY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"} & set(c), sorted(c)
+        x = child("codex")
+        assert not {"ZAI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"} & set(x), sorted(x)
+        assert "CLAUDE_CODE_USE_FOUNDRY" not in g, sorted(g)
+        assert ("env:ZAI_API_KEY", key) in credentials(parent)
+        os.remove(os.path.join(stubs, "run-codex.sh"))
 
         # No Codex CLI: only Claude runs. A learner that leaves no candidates.json fails, as does one that leaves the
         # previous run's; an empty array is fine.
         reset()
         os.remove(os.path.join(bindir, "codex"))
         assert run_role("learner", paths, env, fake({"claude": (0, ok, {})}), lines.append) == NO_ENGINE
-        assert lines[0] == "learner: codex not tried (not installed)" and "no candidates.json" in lines[1], lines
+        assert lines[1] == "learner: codex not tried (not installed)" and "no candidates.json" in lines[2], lines
         reset()
         learned = (0, ok, {"candidates.json": "[]"})
         assert run_role("learner", paths, env, fake({"claude": learned}), lines.append) == 0
         reset()
         assert run_role("learner", paths, env, fake({"claude": (0, ok, {})}), lines.append) == NO_ENGINE
-        assert "candidates.json is not from this run" in lines[1], lines
+        assert "candidates.json is not from this run" in lines[2], lines
 
         # A link in OUT (here to the login's directory): exit 3, OUT emptied, the login untouched, no fallback.
         reset()
@@ -375,7 +517,7 @@ def self_test():
         # The time limit stops the whole process group, a grandchild included. The pid file can still be empty
         # right after launch returns, and a killed grandchild can linger as a zombie until it is reaped: wait
         # for a whole pid, then count only a live process as outliving the limit.
-        os.makedirs(os.path.join(paths[0], "tools", "review"))
+        os.makedirs(os.path.join(paths[0], "tools", "review"), exist_ok=True)
         pid = os.path.join(d, "pid")
         script = os.path.join(paths[0], "tools", "review", "run-claude.sh")
         open(script, "w").write(f"sleep 60 & echo $! > {pid}; wait\n")

@@ -1,0 +1,12 @@
+--- a/crates/engram/src/lib.rs
++++ b/crates/engram/src/lib.rs
+@@ -326,7 +326,8 @@
+             });
+         }
+         // Inside the tensor's bytes, which end inside the file (above).
+-        let base = tensor_base + base_row * row_bytes;
++        // mutant engramlayout-base-row: every site reads from the tensor's row 0.
++        let base = tensor_base;
+ 
+         let page = page_size() as u64;
+ 

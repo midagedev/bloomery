@@ -76,7 +76,7 @@ pub const STEM: &str = "solar2-fixture";
 /// The real first shard `verify` opens when none is named: the profile's
 /// (`tools/ref/models/solar-open2.sh`).
 pub const DEFAULT_MODEL: &str =
-    "/models/Solar-Open2-250B-Q4_K_M/Solar-Open2-250B-Q4_K_M-00001-of-00004.gguf";
+    "/data/moved/models/Solar-Open2-250B-Q4_K_M/Solar-Open2-250B-Q4_K_M-00001-of-00004.gguf";
 
 const ARCH: &str = "solar-open2";
 
@@ -202,6 +202,7 @@ fn card_experts(split: &Split, budget: Option<u64>) -> Result<CardExperts, Fixtu
     let machine = workstation::plan_gate(inputs.model.layers);
     let levers = PlanLevers {
         card_budget_bytes: budget.into(),
+        ..PlanLevers::default()
     };
     let plan = inputs
         .plan(&machine, BUDGET_CTX, &levers)

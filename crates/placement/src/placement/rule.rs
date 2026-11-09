@@ -12,16 +12,35 @@ use super::table::{Row, Segment};
 use super::{CardFormat, Role};
 use crate::kernels;
 
-/// Which card runs each layer, which ends with the head, and which holds
-/// the token embedding when one does.
+/// Which stage runs each layer, which ends with the head when a card does, and
+/// which holds the token embedding when one does. A stage is a card, by its
+/// index, or the host: with no stage card the host is the one stage, index 0,
+/// and runs every layer, the head and the embedding. A plan whose cards carry
+/// no head leaves the head tensor on the host, read in place, as one that
+/// holds no embedding leaves the table there.
 pub(super) struct Stages {
     pub(super) of_layer: Vec<usize>,
-    head: usize,
+    pub(super) head: Option<usize>,
     pub(super) embedding: Option<usize>,
+    /// The host runs the stage: no stage card is in the plan.
+    pub(super) host: bool,
 }
 
 impl Stages {
     pub(super) fn new(layers: usize, cards: &[Card]) -> Result<Stages, PlacementError> {
+        if cards.is_empty() {
+            if layers == 0 {
+                return Err(PlacementError::Stages(
+                    "the model has no layer for the host stage to run".to_owned(),
+                ));
+            }
+            return Ok(Stages {
+                of_layer: vec![0; layers],
+                head: None,
+                embedding: None,
+                host: true,
+            });
+        }
         let mut of_layer = Vec::with_capacity(layers);
         for (c, card) in cards.iter().enumerate() {
             if card.layers.start != of_layer.len() || card.layers.is_empty() {
@@ -41,11 +60,15 @@ impl Stages {
             )));
         }
         let heads: Vec<usize> = (0..cards.len()).filter(|&c| cards[c].head).collect();
-        let &[head] = heads.as_slice() else {
-            return Err(PlacementError::Stages(format!(
-                "{} cards carry the head, not one",
-                heads.len()
-            )));
+        let head = match heads.as_slice() {
+            [] => None,
+            &[c] => Some(c),
+            many => {
+                return Err(PlacementError::Stages(format!(
+                    "{} cards carry the head, at most one does",
+                    many.len()
+                )));
+            }
         };
         let embeds: Vec<usize> = (0..cards.len())
             .filter(|&c| cards[c].token_embedding)
@@ -70,19 +93,37 @@ impl Stages {
             of_layer,
             head,
             embedding,
+            host: false,
         })
     }
 
-    /// The card whose stage uses `t`: its layer's, the head's for the head,
-    /// the first stage's for a model-level tensor and for one never loaded
-    /// ([`Role::Unused`], whose layer need not be one the model runs).
+    /// The card whose stage uses `t`: its layer's, the head's for the head
+    /// (the first stage's when the head stays on the host, which
+    /// [`place_whole`] reads from [`Stages::head`]), the first stage's for a
+    /// model-level tensor and for one never loaded ([`Role::Unused`], whose
+    /// layer need not be one the model runs).
     fn stage_of(&self, t: &ModelTensor, layers: usize) -> Result<usize, PlacementError> {
         match (t.role, t.layer) {
-            (Role::Head, _) => Ok(self.head),
+            (Role::Head, _) => Ok(self.head.unwrap_or(self.of_layer[0])),
             (Role::Unused, _) | (_, None) => Ok(self.of_layer[0]),
             (_, Some(_)) => Ok(self.of_layer[layer_of(t, layers)?]),
         }
     }
+}
+
+/// `t`, which `stages`' stage runs whole, as a segment: on the stage card in
+/// the card format, or where the host stage runs it, the file's bytes in
+/// place.
+fn stage_segment(
+    model: &ModelTensors,
+    t: &ModelTensor,
+    stages: &Stages,
+    stage: usize,
+) -> Result<Segment, PlacementError> {
+    if stages.host {
+        return Ok(in_place(Device::Host, Format::HostFile, None, t.file_bytes));
+    }
+    card_segment(model, t, stage, rows_of(t), None)
 }
 
 /// Rows as the loader counts them: the product of every dim past the row width.
@@ -296,15 +337,15 @@ pub(super) fn place_whole(
         | Role::EngramDense
         | Role::EngramGain => {
             layer_of(t, layers)?;
-            (
-                card_segment(model, t, stage, rows_of(t), None)?,
-                t.file_bytes,
-            )
+            (stage_segment(model, t, stages, stage)?, t.file_bytes)
         }
-        Role::Head => (
-            card_segment(model, t, stage, rows_of(t), None)?,
-            t.file_bytes,
-        ),
+        Role::Head => match stages.head {
+            Some(_) => (stage_segment(model, t, stages, stage)?, t.file_bytes),
+            None => (
+                in_place(Device::Host, Format::HostFile, None, t.file_bytes),
+                t.file_bytes,
+            ),
+        },
         Role::TokenEmbedding => match stages.embedding {
             Some(card) => (
                 card_segment(model, t, card, rows_of(t), None)?,
@@ -550,7 +591,7 @@ pub type LegPair = fn(GgmlType, GgmlType, bool) -> bool;
 
 impl RoutedRule {
     /// The card format stack `t` loads in, `None` where the rule reads none.
-    pub(super) fn format(self, t: &ModelTensor) -> Result<Option<CardFormat>, PlacementError> {
+    pub fn format(self, t: &ModelTensor) -> Result<Option<CardFormat>, PlacementError> {
         match self {
             Self::PerType(f) => Ok(f(t.ty)),
             Self::Leg { gate_up, down, .. } => match ExpertPart::of_name(&t.name) {

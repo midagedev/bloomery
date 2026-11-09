@@ -223,6 +223,17 @@ has() {
 g() { git -c user.email=t@t -c user.name=t -c commit.gpgsign=false "$@"; }
 bash "$HERE/selftest.sh" --self-test --output-only
 check output-directory-contracts "$?" 0
+# mkdir_lock: of eight takers that race for one directory, exactly one wins, in each of 20 rounds. A mkdir that reads the
+# directory another taker made as its own lets two win.
+for k in $(seq 20); do
+  racers=()
+  for j in 1 2 3 4 5 6 7 8; do
+    (mkdir_lock "$T/lock.$k" && echo "$k") &
+    racers+=("$!")
+  done
+  wait "${racers[@]}"
+done > "$T/lock.won"
+check mkdir-lock-one-winner "$(sort "$T/lock.won" | uniq -d | wc -l | tr -d ' ') $(wc -l < "$T/lock.won" | tr -d ' ')" "0 20"
 # mkrepo DIR: a repository with one commit and one tracked file.
 mkrepo() {
   git init -q --template= "$1" && echo a > "$1/f" && g -C "$1" add f && g -C "$1" commit -q -m one
@@ -469,9 +480,11 @@ for ru_mon in $ru_monitors; do
     check "$tag" "$r|$(sed 's/^\(\[bound\] cannot clear process group\) .*/\1/' "$T/$tag.out" | tr '\n' ' ')" "returned|$want"
   done
 done
-# Printing the log fails (a closed stdout): a unit that passed reports cat's code, and one that failed keeps its own.
+# Printing the log fails (a stdout open only for reading): a unit that passed reports cat's code, and one that failed keeps
+# its own. Each unit prints a line, so cat has a write to fail. A closed stdout is no such case for every cat: uutils' ends
+# 0 there.
 r=$(env UNITS="$HERE/units.sh" GB="$ROOT/tools/gate-bound.sh" UNIT_TIMEOUT="$T/ru-bin/stub-timeout" LOG="$T/ru-cat.log" \
-  bash -c 'source "$UNITS"; source "$GB"; for c in "exit 0" "exit 3"; do run_unit "$c" "$LOG" 60 >&- 2> /dev/null; echo "rc=$UNIT_RC"; done')
+  bash -c 'source "$UNITS"; source "$GB"; for c in "echo x; exit 0" "echo x; exit 3"; do run_unit "$c" "$LOG" 60 1< /dev/null 2> /dev/null; echo "rc=$UNIT_RC"; done')
 check run-unit-print-fails "$(tr '\n' ' ' <<< "$r")" "rc=1 rc=3 "
 
 echo "tree-commit self-test: $([ "$fails" = 0 ] && echo ok || echo FAILED) ($checks checks, $fails failures)"

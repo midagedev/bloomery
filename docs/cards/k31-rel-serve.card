@@ -1,0 +1,31 @@
+# 0.3.13 (main 29fd27d60). The K3.1 Pro IQ1_S serve row on the release tarball's own bloomery-serve, after the two host levers
+# landed (docs/cards/k31-step-union.card outcome 3: the step load's one-column union slabs and the NVMe tier reader's two-drive
+# pick through the <prefix>.shard-dirs sidecar; tg 4.97 / pp 3.91 on the k31rel tree's binary at b89cf5c9d). Two arms, the
+# serving defaults with the host room pinned, then the same request with BLOOMERY_SPIN=300000 (the pool's workers keep
+# spinning through the fill wait: k31lane's probe read -34 ms a step on the tree's binary, not landed as a default).
+kind: calibration
+question: does the release tarball's bloomery-serve repeat the combined row (tg ~5 at 232G, two drives), and what does the SPIN lever add on it?
+term: decode tok/s @ D=512, n_predict 512, one cold request, --place bp, --ctx-size 2048, BLOOMERY_HOST_ROOM=232G, the tarball's bloomery-serve
+unit: tok/s
+predict: 4.6..5.3
+condition: tools/ref/k31-nvme-probe.sh with K31_PROBE_TARBALL the sm86 release-dist tarball of 29fd27d60 (K31_PROBE_SERVE unset),
+  K31_PROBE_ENV="BLOOMERY_HOST_ROOM=232G", D=512 N=512, the sidecar in place; a second run with BLOOMERY_SPIN=300000 added, read beside it
+reason: [derived] the tree's binary at b89cf5c9d read 4.97 at this shape; the release binary carries the same host path (the commits
+  after it are paths, docs and the probes' bound forms: no kernel or host dispatch change, ptx-scan identical), so the band is that row
+  +-6 % (one cold request scatters ~3 % between rounds on this set). The SPIN arm: -34 ms on a ~200 ms step [derived from k31lane's
+  probe] = ~5.8-6.0, read beside the band, not against it
+decide-in: the release notes' K3.1 row is this run (its conditions and the sidecar named); the SPIN arm's number goes in the serving tip
+  as a lever the user sets, not a default
+decide-below: under 4.6: the tarball's binary differs from the tree's (sha256 beside the plan line, the nvtier record's copies= field:
+  a missing sidecar on the box's /models copy reads copies=1) before any code is suspected
+decide-above: above 5.3: read the witness block and the nvtier record (copies, fill_bytes) before crediting
+# outcome 2026-11-07 (the sm86 tarball of 29fd27d60, sha256 2a14d50d…, /root/k31-rel-serve-1 and -2, each one cold request, load 36 s):
+#  arm 1 (232G, the defaults otherwise): tg 4.94 tok/s, pp 3.85, wall 237 s; arm 2 (+ BLOOMERY_SPIN=300000): tg 4.99, pp 4.00, wall
+#  231 s. In band: the release binary repeats the tree's combined row (4.97 / 3.91). iostat over each run: nvme0n1 and nvme1n1 within
+#  0.2 % of each other (~1.63 GB/s each in arm 1, ~1.67 in arm 2): the reads split evenly over the drives. The SPIN arm's +1 % is
+#  inside one cold request's scatter, not the -34 ms k31lane's probe read on its own tree (that probe carried the Lane code beside the
+#  lever): no serving tip for SPIN; the lever stays a k31lane question. decide-in: the notes' K3.1 row is arm 1.
+# outcome 2026-11-08 on the re-cut's sm86 tarball (79893871104b, bloomery-serve sha cd27f240…), D=512, 512 generated, ctx 2048, each one
+#  cold request: passes (the default) tg 2.94 / pp 12.48; `--prefill steps` tg 4.99 / pp 3.80. Steps repeats the card's ~5. The pass's
+#  decode is its plan's NVMe arena at the floor (22.6 GB, 37 slots, against the step plan's 228.8 GB, 374 slots), not the step path: an
+#  engine follow-up. decide-in: the re-cut notes carry both rows; README's limits name steps as the pick for a long reply.

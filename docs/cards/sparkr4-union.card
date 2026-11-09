@@ -1,0 +1,28 @@
+# Round sparkr4 card A (kind baseline: one arm, no ruler). The prompt path's regime at P = 4096 on today's main,
+# read on the workstation alone before any node round: the r4prompt design (the Spark serving prompt blocks over
+# the TCP wire) derives its pp512 gain from the host union, not the card — S0 (09-29#pfxprose, plan (a), P512
+# prose) read union 45.72, card_in 11.53, wait 16.23, enqueue 3.90 ms a layer-batch
+# (tools/flow/ds41_prefill.py:2204-2222), so the prose prompt is union-bound at P512 and a 50 GB node's v1 leg
+# (28-30 ms) hides under it: pp512 +5..+8 % (D3a) [derived, r4prompt 1.5]. At P4096 the S0 row does not
+# account: union 44.19 x 320 layer-batches = 14.1 s is more than the chain's 10.88 s, so the stat's denominator
+# is not 320 (the row has no n_lb). The v1 leg hides at P4096 only when the union a layer-batch stays >= 38 ms.
+# Band [derived]: the S0 P512 anchor 45.72 and its three rounds 46.12, 45.94, 45.11, widened to the +-5 % the
+# same runner scatters between windows.
+kind: baseline
+question: at P = 4096 on today's main, plan (a), is the prose prompt's host union a layer-batch above the v1
+  node leg (>= 38 ms), and over how many served layer-batches does the stat line average?
+term: stat prefill lb union_ms (with n_lb, card_in, card_out, wait, enqueue beside it) @ P = 512 and 4096, the
+  first P ids of corpus-prose.ids, generate_ds41 --mode graph -n 2, plan (a), A6000, BLOOMERY_STEP_STATS=1
+unit: ms
+predict: 43.4..48.0
+condition: one lease on the A6000 (just time-gpu-ds41 --tokens <the prose ids> --depth P -n 2, P 512 then 4096,
+  BLOOMERY_STEP_STATS=1), every lever at its default; the P512 union is the predicted row, the P4096 row is
+  printed with its n_lb in the same sitting; the witness shows no [other-busy] or [cpu-busy]
+reason: the S0 anchor S0.p512.prose.union 45.723 (tools/flow/ds41_prefill.py:2204, 09-29#pfxprose, main e577ac9)
+decide-in: P512 union-bound confirmed; when P4096's union >= 38 ms and union x n_lb is within 10 % of the chain,
+  the r4prompt A/B card B is written for both P; else for P512 only, and the q8 go plus the pipelined reply
+  land before any P4096 A/B
+decide-below: the host union moved since 09-29: re-read the routes and slots a layer-batch (stat prefill front)
+  and redo r4prompt 1.5 before card B
+decide-above: the union got slower (the per-expert W term): the node's share is larger than derived, redo
+  r4prompt 1.5 with the measured union

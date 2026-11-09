@@ -1,0 +1,12 @@
+--- a/tools/ref/engram-relayout.py
++++ b/tools/ref/engram-relayout.py
+@@ -200,7 +200,8 @@
+ def fold(path, name, q, k):
+     """The converter's gate: q * k, each product rounded to f32 once (a product of two f32 values is exact in a double)."""
+     try:
+-        return struct.pack(f"<{len(q)}f", *(a * b for a, b in zip(q, k)))
++        # mutant engramlayout-gate-q-only: the gate is q alone, k not folded in.
++        return struct.pack(f"<{len(q)}f", *(a for a, b in zip(q, k)))
+     except OverflowError as e:
+         raise Refusal(65, f"{path}: the fold of {name} passes the f32 range") from e
+ 

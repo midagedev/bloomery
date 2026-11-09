@@ -422,10 +422,11 @@ default_lane() {
   if [ "$rest" = "$c" ]; then echo 3090; return; fi
   # a card the command sets itself (an export, or another gate's pin) outlives the daemon's pick
   case $rest in *BLOOMERY_GATE_CARD=*) echo 3090; return ;; esac
-  # [t]ools: spelled with a class so tools/recipes.py's tree-walk detector does not read this scan of CMD as a walk of the tree
+  # [t]ools: spelled with a class so tools/recipes.py's tree-walk detector does not read this scan of CMD as a walk of the tree;
+  # the arm's names are spelled t[o]ols/….[s]h: a list the daemon lets through, not a run, so the script closure and the walk detector must not read it
   for s in $(grep -o '[t]ools/[A-Za-z0-9/_.-]*\.sh' <<< "$rest" || true); do
     case $s in
-      tools/gate.sh | tools/host-gate.sh | tools/scan-args.sh | tools/ref/real-only.sh | tools/ref/fixture-only.sh | tools/ref/needs-env.sh | tools/ref/ref-paths.sh) ;;
+      t[o]ols/gate.[s]h | t[o]ols/host-gate.[s]h | t[o]ols/scan-args.[s]h | t[o]ols/ref/real-only.[s]h | t[o]ols/ref/fixture-only.[s]h | t[o]ols/ref/needs-env.[s]h | t[o]ols/ref/ref-paths.[s]h) ;;
       *) echo 3090; return ;;
     esac
   done

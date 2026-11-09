@@ -50,14 +50,18 @@ scan_file() {
 scan_tree() {
   local root=$1 allow=$2 f rel n bad=0 want line rule at text have
   local -a files
-  local tmp
+  local tmp hits
   tmp=$(mktemp "${TMPDIR:-/tmp}/check-bounded.XXXXXX") || return 2
+  # One file's hits go through a file, not a process substitution: bash 3.2 (macOS) keeps the
+  # substitution's descriptor open past the loop, and a tree of hundreds of scripts runs out of them.
+  hits=$(mktemp "${TMPDIR:-/tmp}/check-bounded-hits.XXXXXX") || return 2
   while IFS= read -r f; do files+=("$f"); done < <(cd "$root" && find tools -name '*.sh' | LC_ALL=C sort)
   : > "$tmp"
   for rel in "${files[@]}"; do
     # The checker's own fixtures are the lines it must refuse; its self-test reads them.
     [ "$rel" != tools/check-bounded.sh ] || continue
     n=0
+    scan_file "$root/$rel" > "$hits"
     while IFS= read -r line; do
       [ -n "$line" ] || continue
       rule=${line%% *}
@@ -68,7 +72,7 @@ scan_tree() {
         timeout) n=$((n + 1)) ;;
         *) echo "check-bounded: $rel:$at: [$rule] $text" >> "$tmp"; bad=1 ;;
       esac
-    done < <(scan_file "$root/$rel")
+    done < "$hits"
     [ "$n" = 0 ] && continue
     want=$(awk -v f="$rel" '$1 == f { print $2 }' "$allow")
     [ -n "$want" ] || want=0
@@ -84,7 +88,7 @@ scan_tree() {
     [ "$have" -gt 0 ] || { echo "check-bounded: tools/bounded-allow.txt: $f has no direct \`timeout\` line left (entry says $want)" >> "$tmp"; bad=1; }
   done < "$allow"
   cat "$tmp"
-  rm -f "$tmp"
+  rm -f "$tmp" "$hits"
   return "$bad"
 }
 

@@ -22,6 +22,8 @@
 | MiniMax-M3 | [`UD-IQ4_XS`](https://huggingface.co/unsloth/MiniMax-M3-GGUF) (unsloth) | GPU + CPU experts (the plan sizes the share to the card); one slot (`minimaxm3` seat). Unverified: no gate runs on this file; MiniMax-M3.1-Flash is the MiniMax the gates hold |
 | Raon-1-mini-preview | `raon-1-mini-preview-Q4_K_M.gguf` (by `-m`) | whole on one card, one slot (`raon1` seat); its DFlash2 draft (`dflash-raon-1-mini-preview-Q8_0.gguf`) beside it |
 | Solar-Open2-250B | [`Q4_K_M`](https://huggingface.co/llamaraspberryrabbit/Solar-Open2-250B-GGUF) (llamaraspberryrabbit) | GPU + CPU experts; one slot (`solar2` seat); on two cards under `--place bp` (the stage card and an expert tier) |
+| Kimi K3 | [`UD-IQ1_S`](https://huggingface.co/unsloth/Kimi-K3-GGUF) (unsloth, 594 GB) | does not load at this tag: its dense trunk (51.4 GB) is past one 48 GB card; the `kimik3` seat and its gates hold the architecture on a fixture cut from this file |
+| Kimi K3.1 Pro | [`IQ1_S`](https://huggingface.co/midagedev/Kimi-K3.1-Pro-GGUF) (midagedev; 580 GB, written by `bloomery-quantize` from Moonshot's MXFP4 checkpoint, the chat template unsloth's Kimi-K3 one) | two cards, the host and the NVMe expert tier (`--place bp` only; the Q4_K trunk fits a 48 GB card); one slot (`kimik3` seat); the sparse attention past the indexer's top-k (2,048) attends the rows the indexer picks; the prompt run as passes (`--prefill steps` steps it); the think span served as plain text |
 | lev | [`Q4_K_M`](https://huggingface.co/ggml-org/lev-GGUF) (ggml-org) | whole on one GPU; its label readout in the file |
 | DeepSeek-V2-Lite-Chat | [`Q3_K_M`](https://huggingface.co/mradermacher/DeepSeek-V2-Lite-Chat-GGUF) (mradermacher) | CPU or GPU; the first model, still gated |
 

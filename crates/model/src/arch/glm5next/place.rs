@@ -108,21 +108,22 @@ pub fn card_leg_bytes(n: usize, ff: usize, used: usize, downs: DownForms) -> usi
 
 /// The routed layers of `model` the card experts run ([`leg_runs`] of the
 /// body's program, its plan rule's arms), each with its stacks' `[gate, up,
-/// down]` types, read from the headers alone.
-fn carded_layers(model: &ModelTensors) -> impl Iterator<Item = (usize, [GgmlType; 3])> + '_ {
-    let ty = |name: &str| {
+/// down]` types and the down's row width, read from the headers alone.
+fn carded_layers(model: &ModelTensors) -> impl Iterator<Item = (usize, [GgmlType; 3], u64)> + '_ {
+    let info = |name: &str| {
         model
             .tensors
             .iter()
             .find(|t| t.role == Role::RoutedExperts && t.name == name)
-            .map(|t| t.ty)
+            .map(|t| (t.ty, t.dims.first().copied().unwrap_or(0)))
     };
     (0..model.layers)
         .filter_map(move |l| {
-            let [g, u, d] = routed_stacks(l).map(|name| ty(&name));
-            Some((l, [g?, u?, d?]))
+            let [g, u, d] = routed_stacks(l).map(|name| info(&name));
+            let (d, k) = d?;
+            Some((l, [g?.0, u?.0, d], k))
         })
-        .filter(|&(_, tys)| leg_runs(Program::Glm5nextBody, tys) == Some(true))
+        .filter(|&(_, tys, _)| leg_runs(Program::Glm5nextBody, tys) == Some(true))
 }
 
 /// The down forms of the card leg's buffers a prompt batch runs the card
@@ -133,17 +134,19 @@ fn carded_layers(model: &ModelTensors) -> impl Iterator<Item = (usize, [GgmlType
 fn card_leg_forms(model: &ModelTensors) -> DownForms {
     down_forms(
         carded_layers(model)
-            .filter(|&(_, [g, _, d])| !card_tiles_run(g, d))
-            .map(|(_, [_, _, d])| d),
+            .filter(|&(_, [g, _, d], _)| !card_tiles_run(g, d))
+            .map(|(_, [_, _, d], k)| (d, k)),
     )
 }
 
-/// The activation forms the down stacks of types `downs` read ([`kernels::down`]); a type with no
-/// down entry adds none.
-fn down_forms(downs: impl Iterator<Item = GgmlType>) -> DownForms {
+/// The activation forms the down stacks of types and row widths `downs` read
+/// ([`kernels::down_act`]); a type with no down entry adds none.
+fn down_forms(downs: impl Iterator<Item = (GgmlType, u64)>) -> DownForms {
     downs
-        .filter_map(kernels::down)
-        .fold(DownForms::NONE, |forms, (_, act)| forms.with(act))
+        .filter(|&(ty, _)| kernels::down(ty).is_some())
+        .fold(DownForms::NONE, |forms, (ty, k)| {
+            forms.with(kernels::down_act(ty, k))
+        })
 }
 
 /// Tokens a chunk of the tier's prompt-batch service runs at most: the
@@ -1927,8 +1930,8 @@ mod tests {
         /// FP4-Local checkpoint ships its attention) is placed on the stage
         /// card in its own two planes at the bytes the card loader allocates,
         /// beside a Q8_0 projection of the same shape in Q8_0's planes; one
-        /// whose row is no whole number of scale words (49 blocks) is refused
-        /// by the plan naming it.
+        /// whose row ends inside a scale word (49 blocks) is placed with that
+        /// word whole.
         #[test]
         fn an_mxfp8_attention_projection_is_placed_in_its_planes() {
             use crate::placement::{CardFormat, Device, Format};
@@ -1981,14 +1984,22 @@ mod tests {
                     "{name}"
                 );
             }
+            // PIN(2026-11-03): a row of 49 blocks was refused while the planes
+            // held k/128 scale words a row; they hold ceil(k/128), so the row
+            // places at its codes and 13 words.
             let mut i = inputs();
             i.model
                 .tensors
                 .push(projection("blk.3.attn_q_b.weight", mxfp8, 1568));
-            match i.plan(&machine, CTX, &PlanLevers::default()) {
-                Err(e) => assert!(e.to_string().contains("blk.3.attn_q_b.weight"), "{e}"),
-                Ok(_) => panic!("49 blocks a row placed in whole scale words"),
-            }
+            let plan = i
+                .plan(&machine, CTX, &PlanLevers::default())
+                .expect("49 blocks a row");
+            let row = plan
+                .rows
+                .iter()
+                .find(|r| i.model.tensors[r.tensor].name == "blk.3.attn_q_b.weight")
+                .expect("its row");
+            assert_eq!(row.segments[0].resident_bytes, 16_384 * (1568 + 4 * 13));
         }
 
         /// The card leg's reserve follows the card layers' types: a file whose
@@ -2240,6 +2251,7 @@ mod tests {
         fn nvme_room_is_capped_by_the_unified_pool() {
             let levers = PlanLevers {
                 card_budget_bytes: bloomery_levers::CardBudget::Every(1 << 30),
+                ..PlanLevers::default()
             };
             for slots in [1, 2, 4] {
                 let ample = unified(1 << 40);
@@ -2276,6 +2288,7 @@ mod tests {
         fn nextn_nvme_room_is_capped_by_the_unified_pool() {
             let levers = PlanLevers {
                 card_budget_bytes: bloomery_levers::CardBudget::Every(1 << 30),
+                ..PlanLevers::default()
             };
             let nextn = nextn();
             for slots in [1, 2, 4] {
@@ -2317,6 +2330,7 @@ mod tests {
         fn node_nvme_room_is_capped_by_the_unified_pool() {
             let levers = PlanLevers {
                 card_budget_bytes: bloomery_levers::CardBudget::Every(1 << 30),
+                ..PlanLevers::default()
             };
             for ranks in [1, 2, 4] {
                 let wide = routed(1 << 40);
@@ -2466,6 +2480,7 @@ mod tests {
             let (m, nextn) = (machine(LAYERS), nextn());
             let levers = PlanLevers {
                 card_budget_bytes: Some(1 << 30).into(),
+                ..PlanLevers::default()
             };
             let ample = routed(u64::MAX);
             let whole = ample
@@ -2501,6 +2516,7 @@ mod tests {
             let unset = PlanLevers::default();
             let whole = PlanLevers {
                 card_budget_bytes: Some(u64::MAX).into(),
+                ..PlanLevers::default()
             };
             let nextn = nextn();
             let draft = nextn.model.tensors[1].file_bytes;

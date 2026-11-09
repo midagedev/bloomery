@@ -730,7 +730,9 @@ struct A4T {
     // dmin term. The lane's two code words and the scale-and-bias pair (the
     // two 16-bit fields sit at byte 32, scale in the low half) are read as
     // 32-bit words, the same bits as 16-bit reads in fewer, wider loads; a
-    // launch checks that the weights start on a 4-byte boundary.
+    // launch checks that the weights start on a 4-byte boundary. Each product
+    // accumulates by `fma`: the library's safe math mode contracts no multiply
+    // and add on its own, and the M-row loop is bound by their issue.
     static inline float partial(device const Block & blk,
                                 const thread Lane & lane) {
         device const uint32_t * q = blk.qs + 2 * lane.iq;
@@ -740,10 +742,10 @@ struct A4T {
         const uint32_t words[4] = {w0 & 0xFFFFu, w0 >> 16, w1 & 0xFFFFu, w1 >> 16};
         float4 acc = {0.f, 0.f, 0.f, 0.f};
         FOR_UNROLL (short m = 0; m < 4; ++m) {
-            acc[0] += lane.yl[4 * m + 0] * (words[m] & 0x000F);
-            acc[1] += lane.yl[4 * m + 1] * (words[m] & 0x00F0);
-            acc[2] += lane.yl[4 * m + 2] * (words[m] & 0x0F00);
-            acc[3] += lane.yl[4 * m + 3] * (words[m] & 0xF000);
+            acc[0] = fma(lane.yl[4 * m + 0], float(words[m] & 0x000F), acc[0]);
+            acc[1] = fma(lane.yl[4 * m + 1], float(words[m] & 0x00F0), acc[1]);
+            acc[2] = fma(lane.yl[4 * m + 2], float(words[m] & 0x0F00), acc[2]);
+            acc[3] = fma(lane.yl[4 * m + 3], float(words[m] & 0xF000), acc[3]);
         }
         return Pair::scale_of_word(sb) * ((acc[0] + 1.f/16.f * acc[1]) +
                                           (1.f/256.f * acc[2] + 1.f/4096.f * acc[3]))
@@ -773,14 +775,15 @@ struct A4T {
     // inputs at once, the group's code words masked and widened once and
     // shared, the per-input products the only work the sharing adds. Each
     // input's accumulator takes `partial`'s own value order (the words in
-    // order, each lane's four nibble terms) and the finishing expression is
-    // `partial`'s own, so the M-row row loop's row m is the 1-row kernel's
-    // bits on row m's input; THIS ORDER IS THE GATE. A code, a nibble masked
-    // in place, is `(float)(word & mask)`, widened as the float whose bits
-    // are the mask under the exponent of 2^23, less 2^23: the same exact
-    // value (a mask is under 2^23) with no integer-to-float conversion, the
-    // high half of the register constant under the 16-bit mask. `lanes[m]`
-    // holds input m's loaded share; `sum[m]` is the caller's running sum.
+    // order, each lane's four nibble terms, each by `fma`) and the finishing
+    // expression is `partial`'s own, so the M-row row loop's row m is the
+    // 1-row kernel's bits on row m's input; THIS ORDER IS THE GATE. A code, a
+    // nibble masked in place, is `(float)(word & mask)`, widened as the float
+    // whose bits are the mask under the exponent of 2^23, less 2^23: the same
+    // exact value (a mask is under 2^23) with no integer-to-float conversion,
+    // the high half of the register constant under the 16-bit mask.
+    // `lanes[m]` holds input m's loaded share; `sum[m]` is the caller's
+    // running sum.
     template <short N>
     static inline void partial_rows(const thread Words & wd,
                                     const thread Lane * lanes,
@@ -796,10 +799,10 @@ struct A4T {
                                        as_type<float>((words[w] & 0x0F00u) | 0x4B000000u) - 8388608.f,
                                        as_type<float>((words[w] & 0xF000u) | 0x4B000000u) - 8388608.f);
             FOR_UNROLL (short m = 0; m < N; ++m) {
-                acc[m][0] += lanes[m].yl[4 * w + 0] * code[0];
-                acc[m][1] += lanes[m].yl[4 * w + 1] * code[1];
-                acc[m][2] += lanes[m].yl[4 * w + 2] * code[2];
-                acc[m][3] += lanes[m].yl[4 * w + 3] * code[3];
+                acc[m][0] = fma(lanes[m].yl[4 * w + 0], code[0], acc[m][0]);
+                acc[m][1] = fma(lanes[m].yl[4 * w + 1], code[1], acc[m][1]);
+                acc[m][2] = fma(lanes[m].yl[4 * w + 2], code[2], acc[m][2]);
+                acc[m][3] = fma(lanes[m].yl[4 * w + 3], code[3], acc[m][3]);
             }
         }
         FOR_UNROLL (short m = 0; m < N; ++m) {
@@ -817,6 +820,27 @@ struct A4T {
                                      float lo,
                                      float hi) {
         return lo * partial(blk, lane);
+    }
+
+    // The M-row form of `partial_head`: the group's contribution to N loaded
+    // inputs (`partial_rows`'s own, so row m's is `partial`'s bits on row m's
+    // input) with the head's one scale applied to the finished contribution,
+    // `partial_head`'s own rule; THIS ORDER IS THE GATE. `lo[m]` is input m's
+    // head's scale of this block; `hi` has no M-row form, a group sitting
+    // whole inside one head.
+    template <short N>
+    static inline void partial_head_rows(const thread Words & wd,
+                                         const thread Lane * lanes,
+                                         const thread float * lo,
+                                         thread float * sum) {
+        float block[N];
+        FOR_UNROLL (short m = 0; m < N; ++m) {
+            block[m] = 0.f;
+        }
+        partial_rows<N>(wd, lanes, block);
+        FOR_UNROLL (short m = 0; m < N; ++m) {
+            sum[m] += lo[m] * block[m];
+        }
     }
 
     static inline float2 head_scales(threadgroup const float * scales, int ib) {

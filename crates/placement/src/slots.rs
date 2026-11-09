@@ -134,6 +134,12 @@ impl KvBytes for SlotsOf<'_> {
             .saturating_mul(self.slots)
     }
 
+    fn plane_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
+        self.kv
+            .plane_bytes(layer, ctx_max)
+            .saturating_mul(self.slots)
+    }
+
     fn shadow_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
         self.kv
             .shadow_bytes(layer, ctx_max)
@@ -207,6 +213,10 @@ mod tests {
             }
         }
 
+        fn plane_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
+            if layer == 1 { 4 * ctx_max } else { 0 }
+        }
+
         fn shadow_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
             if layer == 1 { 3 * ctx_max } else { 0 }
         }
@@ -271,8 +281,8 @@ mod tests {
         assert_eq!(t.plan_beside(u64::MAX), u64::MAX);
     }
 
-    /// (t2) The plan's view: every layer's bytes and shadows times `slots`,
-    /// whatever the layer.
+    /// (t2) The plan's view: every layer's bytes, planes and shadows times
+    /// `slots`, whatever the layer.
     #[test]
     fn slots_of_multiplies_every_layer() {
         let t = terms();
@@ -281,6 +291,7 @@ mod tests {
             for layer in 0..3 {
                 for c in [1, 4096] {
                     assert_eq!(view.layer_bytes(layer, c), n * Toy.layer_bytes(layer, c));
+                    assert_eq!(view.plane_bytes(layer, c), n * Toy.plane_bytes(layer, c));
                     assert_eq!(view.shadow_bytes(layer, c), n * Toy.shadow_bytes(layer, c));
                 }
             }

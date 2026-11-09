@@ -17,16 +17,20 @@ main family's gates every 7 days and any other family's every 30. A gate of an F
 
   due    the rotation's gates with no green ledger row at their current input key (tools/recipes.py key, as gate-batch.sh --ledger
          computes it) and whose last green row, of any key, is as old as their family's rotation (families.tsv `rotation_days`: 7 days for a
-         main family, 30 for any other; a common or a tooling gate 7; `--days N` sets one number for every gate) or missing. Output: a `--list` file for
-         tools/gate-batch.sh, grouped by family (the BLOOMERY_MODEL of the recipe's box line, else the default profile: gate-batch.sh's
+         main family, 30 for any other; a common or a tooling gate 7; `--days N` sets one number for every gate) or missing; and, whatever
+         its date, every owed gate: one of a kind the fixture tier defers (real-only, real-file, no-fixture, needs-env) that was green
+         before and has no green row at its current key, so a change moved a file its clauses read and no landing ran it
+         (`tools/recipes.py affected` prints such gates under `real-tier owed:`). Output: a `--list` file for tools/gate-batch.sh, the owed
+         gates first (their own block), then grouped by family (the BLOOMERY_MODEL of the recipe's box line, else the default profile: gate-batch.sh's
          family()), the stalest family first, each gate with its predicted wall (the median of its last 5 rows of the times file, 45 s
          where it has none: gate-batch.sh's expected()) and the total. A needs-env gate is listed and the batch defers it, so the list
          never hides a gate that nothing can run unattended. --with-weekly puts every `weekly-*` recipe first, then every CUDA
          gate on a GGUF input (`mac_gguf_cuda`, the set a mac landing defers) that the list does not already name, then the due
          gates that are not weekly (`just weekly`): one batch, one ledger read, one sitting.
-         The key status comes from one `tools/gate-batch.sh --ledger --dry-run` over the gates stale by date: it reads the box once
-         (the manifest, through tools/box.sh) and only when some gate is stale by date. When it cannot, every gate stale by date is
-         listed as due with `key unknown` and the reason on stderr: the batch's own ledger check skips any that is green at its key.
+         The key status comes from one `tools/gate-batch.sh --ledger --dry-run` over the gates stale by date and the deferred-kind gates
+         fresh by date: it reads the box once (the manifest, through tools/box.sh). When it cannot, every gate stale by date is listed as
+         due with `key unknown` and the reason on stderr (the batch's own ledger check skips any that is green at its key), and no gate
+         fresh by date is listed.
   check  rc 1 naming each family whose gates (the same set) have no green ledger row newer than their rotation (as `due`). tools/release/publish.sh
          runs it before a release is published and stops on rc 1. A family of needs-env gates alone is printed `env` and not counted: it
          runs only on a machine that sets its variable, which this ledger's batches defer by name.
@@ -113,6 +117,7 @@ class Entry:
     wall_src: str
     status: str  # a status of the batch's ledger plan (run, never, error, deferred), or key-unknown
     detail: str
+    owed: bool = False  # a deferred-kind gate green before at another key: a change moved a file its clauses read (listed first)
 
 
 # ---------------------------------------------------------------------------------------------- the classifier
@@ -288,20 +293,25 @@ def due_entries(
     days: float | None,
     key_of: Callable[[list[str]], dict[str, tuple[str, str]]],
 ) -> tuple[list[Entry], str]:
-    """The gates due, and the reason their key status is unknown ('' when it is known): stale by date first (no green row of any key,
-    or the newest as old as the gate's rotation: its family's days, or `days` for every gate when given), then the key status of those
-    alone; a gate green at its current key is not due."""
+    """The gates due, and the reason their key status is unknown ('' when it is known). Stale by date: no green row of any key, or
+    the newest as old as the gate's rotation (its family's days, or `days` for every gate when given). Owed: a gate of a kind the
+    fixture tier defers (DEFERRED_KINDS) that was green before and has no green row at its current key, whatever its date — a change
+    moved a file its clauses read, and no landing runs it (`tools/recipes.py affected` names it under `real-tier owed:`). The key
+    status is asked of the stale gates and of every deferred-kind gate fresh by date; a gate green at its current key is not due."""
     stale = []
+    fresh = []
     for g in gates:
         lg = last.get(g.name)
         age = None if lg is None else now - lg
         if age is None or age >= window(g, days):
             stale.append((g, lg, age))
+        elif g.kind in DEFERRED_KINDS:
+            fresh.append((g, lg, age))
     keys: dict[str, tuple[str, str]] = {}
     unknown = ""
-    if stale:
+    if stale or fresh:
         try:
-            keys = key_of([g.name for g, _, _ in stale])
+            keys = key_of([g.name for g, _, _ in stale + fresh])
         except RotationError as e:
             unknown = str(e)
     out = []
@@ -313,7 +323,13 @@ def due_entries(
         if status == "skip":
             continue
         wall, src = expected(times, g.name)
-        out.append(Entry(g, lg, age, wall, src, status, detail))
+        out.append(Entry(g, lg, age, wall, src, status, detail, owed=status == "run" and lg is not None and g.kind in DEFERRED_KINDS))
+    for g, lg, age in fresh:
+        # Fresh by date and its key unknown: the date rule stands, so it is not listed.
+        if unknown or keys[g.name][0] != "run":
+            continue
+        wall, src = expected(times, g.name)
+        out.append(Entry(g, lg, age, wall, src, "run", keys[g.name][1], owed=True))
     return out, unknown
 
 
@@ -356,6 +372,8 @@ def reason(e: Entry) -> str:
         return "the batch never skips it"
     if e.status == "error":
         return f"key not computed ({e.detail})"
+    if e.owed:
+        return "key moved: owed to the real tier (a change moved a file its clauses read, and a fixture-tier landing defers it)"
     return "no green row at its current key" if e.last is None else "key moved"
 
 
@@ -375,7 +393,8 @@ def format_list(
     n_def = len(entries) - len(runs)
     defaults = [e.gate.name for e in runs if e.wall_src == "default"]
     out = [
-        f"# rotation due: tier {tier}, no green row at the current key and none newer than {days_text(days)}, {now.strftime(DATE_FMT)}",
+        f"# rotation due: tier {tier}, no green row at the current key and none newer than {days_text(days)}, or owed (a deferred gate whose key"
+        f" moved since its last green row), {now.strftime(DATE_FMT)}",
         f"# ledger {ledger_path}; times {times_path}",
         f"# {len(entries)} gate(s) due: {len(runs)} run, predicted {total} s (gate-times medians, {DEFAULT_S} s where a gate has no row"
         + (f": {len(defaults)} so)" if defaults else ")")
@@ -384,6 +403,13 @@ def format_list(
     if unknown:
         out.append(f"# key status unknown ({unknown}): every gate stale by date is listed; the batch's ledger check skips any green at its key")
     mac = list(mac or [])
+    owed = [e for e in entries if e.owed and not (weekly and e.gate.weekly)]
+    if owed:
+        out.append(f"# owed to the real tier first: {len(owed)} gate(s) a change reached since their last green run, whatever its date")
+        for e in sorted(owed, key=lambda e: (-staleness(e), e.gate.name)):
+            sec = f"{e.wall} s ({e.wall_src})"
+            out.append(f"# {e.gate.name}: {e.gate.kind}, {sec}, {age_text(e)}, {reason(e)}")
+            out.append(e.gate.name)
     if weekly or mac:
         note = f"# the {len(weekly)} weekly-* recipes"
         if mac:
@@ -392,7 +418,7 @@ def format_list(
         out.append(note)
         out += [g.name for g in weekly]
         out += mac
-    for fam, es in by_family([e for e in entries if not (weekly and e.gate.weekly)]):
+    for fam, es in by_family([e for e in entries if not (weekly and e.gate.weekly) and not e.owed]):
         wall = sum(e.wall for e in es if e.status != "deferred")
         out.append(f"# family {fam}: {len(es)} gate(s), {wall} s, stalest {'never' if es[0].age is None else age_text(es[0])[len('last green '):]}")
         for e in es:
@@ -670,17 +696,25 @@ def self_test() -> int:
         status_of = lambda n: due[n].status if n in due else None  # noqa: E731
         expect(status_of("gate-oldkey") == "run", "due: a gate green at an old key and last run 8 d ago is due")
         expect(status_of("gate-never") == "run" and due["gate-never"].last is None, "due: a gate that never ran is due, with no last green row")
-        expect("gate-recent" not in due, "due: a gate whose last run, of any key, is 3 d old is not due though its key moved")
+        expect("gate-recent" in due and due["gate-recent"].owed and due["gate-recent"].status == "run",
+               "due: a real-only gate whose key moved since its green run 3 d ago is due, owed, though its date is fresh")
+        expect(due["gate-oldkey"].owed and not due["gate-never"].owed and not due["weekly-w"].owed,
+               "due: owed is a deferred kind green before at another key (gate-oldkey); never green (gate-never) and a weekly are not")
         expect("gate-edge" in due, "due: a gate whose last run is exactly N d old is due")
         expect("weekly-w" in due, "due: a weekly last run 30 d ago at a moved key is due")
-        expect("gate-recent" not in keyed[0] and "gate-fresh" in keyed[0], f"due: the key status is asked of the gates stale by date alone: {keyed[0]}")
+        expect("gate-recent" in keyed[0] and "gate-fresh" in keyed[0], f"due: the key status is asked of the stale gates and the fresh deferred ones: {keyed[0]}")
         expect(status_of("gate-env") == "deferred" and due["gate-env"].last is None if "gate-env" in due else False, "due: a needs-env gate that never ran is listed, deferred")
         entries1, _ = due_entries(gates, last, times, now, 1, keys({"gate-fresh": "skip"}))
         expect({e.gate.name for e in entries1} >= {"gate-recent", "gate-edge"} and "gate-fresh" not in {e.gate.name for e in entries1},
                "due: --days 1 makes the 3 d gate due and still not the one green at its key")
         keyed.clear()
-        due_entries(gates, {g.name: now for g in gates}, times, now, 7, keys({}))
-        expect(keyed == [], "due: no gate stale by date asks nothing of the box")
+        fresh_all, _ = due_entries(gates, {g.name: now for g in gates}, times, now, 7, keys({n: "skip" for n in names}))
+        expect(keyed == [[n for n in names if n != "weekly-w"]] and fresh_all == [],
+               f"due: every gate fresh by date asks the key of the deferred kinds alone (not the weekly), and green keys list none: {keyed}")
+        recent_only = {"gate-recent": "run"} | {n: "skip" for n in names if n != "gate-recent"}
+        fresh_one, _ = due_entries(gates, {g.name: now for g in gates}, times, now, 7, keys(recent_only))
+        expect([e.gate.name for e in fresh_one] == ["gate-recent"] and fresh_one[0].owed,
+               f"due: a fresh gate whose key moved is listed, owed: {[e.gate.name for e in fresh_one]}")
         # A key status that cannot be read lists every gate stale by date, with the reason.
 
         def broken(names: list[str]) -> dict[str, tuple[str, str]]:
@@ -700,10 +734,12 @@ def self_test() -> int:
         text = format_list(entries, [], 7, "real", now, led, times_path, "")
         items = [ln for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
         expect(all(re.fullmatch(r"(gate|weekly)-[a-z]+", ln) for ln in items), f"format_list: every non-comment line is a bare recipe name: {items}")
-        expect(items == ["gate-never", "gate-env", "gate-edge", "weekly-w", "gate-oldkey"], f"format_list: families stalest first, a gate no row names first: {items}")
+        expect(items == ["gate-oldkey", "gate-edge", "gate-recent", "gate-never", "gate-env", "weekly-w"],
+               f"format_list: the owed gates first (stalest first), then families stalest first, a gate no row names first: {items}")
+        expect("# owed to the real tier first: 3 gate(s)" in text, "format_list: the owed block names its count")
         expect("# family fb: 1 gate(s), 45 s, stalest never" in text, "format_list: a family line with its wall and its stalest gate")
-        # predicted total: oldkey 40 + never 45 + edge 100 + weekly 45 = 230 (gate-env is deferred, gate-fresh is skipped)
-        expect("# 5 gate(s) due: 4 run, predicted 230 s" in text, f"format_list: the total counts what runs: {text.splitlines()[2]}")
+        # predicted total: oldkey 40 + edge 100 + recent 45 + never 45 + weekly 45 = 275 (gate-env is deferred, gate-fresh is skipped)
+        expect("# 6 gate(s) due: 5 run, predicted 275 s" in text, f"format_list: the total counts what runs: {text.splitlines()[2]}")
         expect("1 wait(s) for an environment variable" in text, "format_list: the needs-env gate is counted apart")
         fams = [f for f, _ in by_family(entries)]
         expect(fams == ["fb", "fc", "fa"], f"by_family: never green first, then the stalest: {fams}")
@@ -711,7 +747,8 @@ def self_test() -> int:
         weekly = [g for g in gates if g.weekly]
         text_w = format_list(entries, weekly, 7, "real", now, led, times_path, "")
         items_w = [ln for ln in text_w.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
-        expect(items_w[0] == "weekly-w" and items_w.count("weekly-w") == 1, f"format_list: with the weeklies, they come first and once: {items_w}")
+        expect(items_w[:4] == ["gate-oldkey", "gate-edge", "gate-recent", "weekly-w"] and items_w.count("weekly-w") == 1,
+               f"format_list: with the weeklies, the owed gates first, then the weeklies once: {items_w}")
         expect(format_list([], [], 7, "real", now, led, times_path, "").count("\n") == 3, "format_list: nothing due is three comment lines")
         expect("key status unknown (box down)" in format_list(entries_u, [], 7, "real", now, led, times_path, "box down"), "format_list: an unknown key status is said in the list")
 
@@ -770,7 +807,7 @@ def self_test() -> int:
             with contextlib.redirect_stderr(io.StringIO()):
                 rc = cmd_due(args, now, keys({"gate-fresh": "skip"}), rs2, {}, no_tables)
             written = open(out_path, encoding="utf-8").read()
-            expect(rc == 0 and written.splitlines()[3] == "# the 1 weekly-* recipes first, then the due gates" and "weekly-w" in written
+            expect(rc == 0 and "# the 1 weekly-* recipes first, then the due gates" in written.splitlines() and "weekly-w" in written
                    and "gate-oldkey" in written and "gate-fresh" not in written, f"cmd_due: the list file written (rc {rc}): {written}")
             # A CUDA gate on a GGUF fixture is not a rotation gate. The weekly list without the mac union omits it;
             # due --with-weekly names it once. A checkpoint-folder CUDA gate stays off. A gate already due is not repeated.
@@ -790,7 +827,7 @@ def self_test() -> int:
             with contextlib.redirect_stderr(io.StringIO()):
                 rc = cmd_due(args_mac, now, keys({"gate-fresh": "skip"}), rs_mac, {}, no_tables)
             items_mac = bare(open(out_mac, encoding="utf-8").read())
-            expect(rc == 0 and items_mac.count("gate-macgguf") == 1 and items_mac[0] == "weekly-w",
+            expect(rc == 0 and items_mac.count("gate-macgguf") == 1 and items_mac.index("gate-macgguf") == items_mac.index("weekly-w") + 1,
                    f"weekly union: due --with-weekly names the CUDA GGUF gate once, after the weekly recipes: {items_mac}")
             expect("gate-foldkeep" not in items_mac, f"weekly union: a checkpoint-folder CUDA gate stays off: {items_mac}")
             expect(items_mac.count("gate-never") == 1, f"weekly union: a gate already due is not listed twice: {items_mac}")
@@ -857,7 +894,7 @@ def self_test() -> int:
             out_f = os.path.join(tmp, "f-due.list")
             args_f = argparse.Namespace(days=7.0, ledger=led_old, tier="real", classes=f_cls_path, with_weekly=False, out=out_f)
             with contextlib.redirect_stderr(io.StringIO()):
-                rc = cmd_due(args_f, now, keys({}), rs_f, f_gates, no_tables)
+                rc = cmd_due(args_f, now, keys({"gate-prof": "skip"}), rs_f, f_gates, no_tables)
             items_f = bare(open(out_f, encoding="utf-8").read())
             expect(rc == 0 and sorted(items_f) == ["gate-fx-new", "gate-fx-old", "gate-fy-real"],
                    f"cmd_due: an F gate last green 8 d ago is due, one 6 d ago is not, a landing gate of no F family never is: {items_f}")
@@ -905,10 +942,10 @@ def self_test() -> int:
             expect(res_t == {"fm (F family)": False, "fo (F family)": True, "fo2 (F family)": False, "fo": True, "fm": True, "deepseek2": True},
                    f"tiers: with each family's own rotation the main family 8 d is red, the other family 8 d ok, the other family 31 d red: {res_t}")
             expect(all(check_families(tg, t_last, now, 40)[i][3] for i in range(len(res_t))), "tiers: --days 40 sets one number for every gate")
-            entries_t, _ = due_entries(tg, t_last, times, now, None, keys({}))
+            entries_t, _ = due_entries(tg, t_last, times, now, None, keys({"gate-c": "skip"}))
             due_t = {e.gate.name for e in entries_t}
             expect(due_t == {"gate-m", "gate-o31"}, f"tiers: due asks a main gate at 7 d and an other gate at 30 d: {sorted(due_t)}")
-            entries_t, _ = due_entries(tg, t_last, times, now, 7, keys({}))
+            entries_t, _ = due_entries(tg, t_last, times, now, 7, keys({"gate-c": "skip"}))
             expect({e.gate.name for e in entries_t} == {"gate-m", "gate-o8", "gate-o31", "weekly-o"}, "tiers: --days 7 holds every gate to 7 d")
             argst = argparse.Namespace(days=None, ledger=t_led, classes=t_path)
             buf = io.StringIO()

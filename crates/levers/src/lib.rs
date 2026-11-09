@@ -32,16 +32,16 @@ use std::sync::OnceLock;
 
 mod registry;
 use registry::REGISTRY;
+pub use registry::{AUTOTUNE, PREPARE_Q8, SCHEMAJUMP, SPLIT_WALK, XSTREAM};
 pub use registry::{
-    CARD_BUDGET, CARD_DONTNEED, CARD_MARGIN, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, FORCE_IDS,
-    GEN_SLOTS, GEN_SLOTS_MAX, HOST_LANES, HOST_LANES_DEFAULT, HOST_LOCK, HOST_POPULATE, HOST_ROOM,
-    HOSTSTREAM, LANE_PREFETCH, LANE_PREFETCH_DEFAULT, MTP_DRAFT, MTP_HEAD_ROWS, MTP_WIDTH,
-    MTP_WINDOWS, NEED_HOOK, NVTIER_BYTES, NVTIER_EVICT, NVTIER_MEM, NVTIER_READ, PIN_MAIN, PREFILL,
-    PREFILL_GROUP, PREFILL_GROUP_DEFAULT, PREFILL_GROUP_MAX, QWEN3_KV, QWEN38_EXPERTS, R8,
-    RESIDENCY, ROUTE_TRACE, SCREEN, SPIN, STEP_STATS, THREADS, TIER_LINK, TIER_NODES, TP_NODES,
-    WARM_PROFILE,
+    CARD_BUDGET, CARD_DONTNEED, CARD_MARGIN, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, EXPERT_RANK,
+    FORCE_IDS, GEN_SLOTS, GEN_SLOTS_MAX, HOST_LANES, HOST_LANES_DEFAULT, HOST_LOCK, HOST_POPULATE,
+    HOST_ROOM, HOSTSTREAM, KV_FLOOR, KV_HOST, LANE_PREFETCH, LANE_PREFETCH_DEFAULT, MTP_DRAFT,
+    MTP_HEAD_ROWS, MTP_WIDTH, MTP_WINDOWS, NEED_HOOK, NVTIER_BYTES, NVTIER_EVICT, NVTIER_MEM,
+    NVTIER_READ, PIN_MAIN, PREFILL, PREFILL_CUT, PREFILL_CUT_MAX, PREFILL_GROUP,
+    PREFILL_GROUP_DEFAULT, PREFILL_GROUP_MAX, QWEN3_KV, QWEN38_EXPERTS, R8, RESIDENCY, ROUTE_TRACE,
+    SCREEN, SPIN, STEP_STATS, THREADS, TIER_LINK, TIER_NODES, TP_NODES, WARM_PROFILE, WORD_OPS,
 };
-pub use registry::{PREPARE_Q8, SCHEMAJUMP, SPLIT_WALK, XSTREAM};
 
 #[cfg(test)]
 mod tests;
@@ -882,6 +882,9 @@ pub(crate) enum Scope<'a> {
     /// The expert tiers' nodes ([`tier_nodes`]), read where a load takes its
     /// tier cards, below every binary's `main`.
     TierNodes,
+    /// How a card adds to its page words ([`word_ops`]), read where the
+    /// owner of a card's words opens, below every binary's `main`.
+    WordOps,
     /// The cards' budget ([`card_budget`]), read where a placement meets the
     /// census, below every binary's `main`, which still refuses it in a
     /// binary that does not act on it; and the cards' margin
@@ -926,6 +929,7 @@ pub(crate) fn reading(env: &[(OsString, OsString)], scope: Scope<'_>) -> Reading
     };
     let link = |name: &str| name == TIER_LINK;
     let nodes = |name: &str| name == TIER_NODES;
+    let words = |name: &str| name == WORD_OPS;
     let hook = |name: &str| name == NEED_HOOK;
     let margin = |name: &str| name == CARD_MARGIN;
     let mut entries = Vec::new();
@@ -937,6 +941,7 @@ pub(crate) fn reading(env: &[(OsString, OsString)], scope: Scope<'_>) -> Reading
                     || nvtier(row.name)
                     || link(row.name)
                     || nodes(row.name)
+                    || words(row.name)
                     || hook(row.name)
                     || margin(row.name)
                     || acts_on.contains(&row.name)
@@ -950,6 +955,7 @@ pub(crate) fn reading(env: &[(OsString, OsString)], scope: Scope<'_>) -> Reading
             (Site::Parsed { .. }, Scope::Need) if hook(row.name) || row.name == HOST_LOCK => true,
             (Site::Parsed { .. }, Scope::TierLink) if link(row.name) => true,
             (Site::Parsed { .. }, Scope::TierNodes) if nodes(row.name) || link(row.name) => true,
+            (Site::Parsed { .. }, Scope::WordOps) if words(row.name) => true,
             (Site::Parsed { .. }, Scope::CardBudget)
                 if row.name == CARD_BUDGET || margin(row.name) =>
             {
@@ -980,9 +986,13 @@ pub(crate) fn reading(env: &[(OsString, OsString)], scope: Scope<'_>) -> Reading
             },
         }
     }
-    let rdma = entries
+    let link = entries
         .iter()
-        .any(|e| e.row.name == TIER_LINK && e.value == Some(Value::Word("rdma")));
+        .find(|e| e.row.name == TIER_LINK)
+        .and_then(|e| match &e.value {
+            Some(Value::Word(w)) => Some(*w),
+            _ => None,
+        });
     let nodes_of = |name: &str| {
         entries
             .iter()
@@ -992,10 +1002,15 @@ pub(crate) fn reading(env: &[(OsString, OsString)], scope: Scope<'_>) -> Reading
                 _ => None,
             })
     };
-    for name in [TIER_NODES, TP_NODES] {
+    // An expert tier's page crosses over either wire; a tensor-parallel run's
+    // gathers take RDMA ends alone.
+    for (name, links, need) in [
+        (TIER_NODES, &["rdma", "tcp"][..], "rdma or tcp"),
+        (TP_NODES, &["rdma"][..], "rdma"),
+    ] {
         if let Some((entry, addrs)) = nodes_of(name)
             && addrs.iter().any(|a| !a.ip().is_loopback())
-            && !rdma
+            && !link.is_some_and(|w| links.contains(&w))
         {
             refused.push(Refusal {
                 name: name.to_string(),
@@ -1003,7 +1018,7 @@ pub(crate) fn reading(env: &[(OsString, OsString)], scope: Scope<'_>) -> Reading
                     .set
                     .clone()
                     .expect("node addresses came from a set lever"),
-                why: Why::Value(format!("a node off this host requires {TIER_LINK}=rdma")),
+                why: Why::Value(format!("a node off this host requires {TIER_LINK}={need}")),
             });
         }
     }
@@ -1181,6 +1196,14 @@ impl Levers {
         Levers::usize_of(PREFILL_GROUP, n)
     }
 
+    /// `BLOOMERY_PREFILL_CUT`: the positions a V4.1 prompt pass carries at
+    /// most, 1 to [`PREFILL_CUT_MAX`].
+    #[must_use]
+    pub fn prefill_cut(&self) -> usize {
+        let n = Levers::defaulted(PREFILL_CUT, self.count(PREFILL_CUT));
+        Levers::usize_of(PREFILL_CUT, n)
+    }
+
     /// `BLOOMERY_ENGRAM_HELPER`: V4.1 step rows read by a helper thread.
     #[must_use]
     pub fn engram_helper(&self) -> bool {
@@ -1212,6 +1235,22 @@ impl Levers {
             None => CardBudget::Unset,
             Some(Value::CardBudget(b)) => b.clone(),
             v => panic!("{CARD_MARGIN} holds {v:?}, not a card byte list"),
+        }
+    }
+
+    /// `BLOOMERY_EXPERT_RANK`: the router-rank file the plan orders each
+    /// layer's experts by; `None` unset (id order). Also `None` in a reading
+    /// that did not parse the lever: the placement's one reader
+    /// (`PlanLevers::from_levers`) serves every binary that plans, and a
+    /// binary that leaves the lever out has it refused by name at
+    /// [`at_main`] when set, so for it the lever is unset.
+    #[must_use]
+    pub fn expert_rank(&self) -> Option<&Path> {
+        let entry = self.entries.iter().find(|e| e.row.name == EXPERT_RANK)?;
+        match &entry.value {
+            None => None,
+            Some(Value::Path(p)) => Some(p),
+            v => panic!("{EXPERT_RANK} holds {v:?}, not a path"),
         }
     }
 
@@ -1295,6 +1334,32 @@ impl Levers {
     #[must_use]
     pub fn qwen3_kv_set(&self) -> Option<&'static str> {
         self.word(QWEN3_KV)
+    }
+
+    /// `BLOOMERY_KV_FLOOR`: the positions a plan spreads its routed experts
+    /// at; `None` unset (the spread at the whole context) and in a reading
+    /// that did not parse the lever: a binary that leaves it out refuses it
+    /// by name when set, so for it the lever is unset.
+    #[must_use]
+    pub fn kv_floor(&self) -> Option<u64> {
+        self.count(KV_FLOOR)
+    }
+
+    /// `BLOOMERY_KV_HOST` as set: the K/V planes' backing word, `off`,
+    /// `spill` or `all`; `None` unset, which a load reads as `off`
+    /// ([`Levers::kv_host`]).
+    #[must_use]
+    pub fn kv_host_set(&self) -> Option<&'static str> {
+        self.word(KV_HOST)
+    }
+
+    /// `BLOOMERY_KV_HOST`: where a load's room-backed K/V planes back their
+    /// pages, as set, else [`KvHost::Off`] (the card's own memory).
+    #[must_use]
+    pub fn kv_host(&self) -> KvHost {
+        self.kv_host_set()
+            .and_then(KvHost::parse)
+            .unwrap_or(KvHost::Off)
     }
 
     /// `BLOOMERY_CHECK_FINITE`: the finite probe runs.
@@ -1445,6 +1510,13 @@ impl Levers {
     #[must_use]
     pub fn prepare_q8(&self) -> bool {
         self.flag(PREPARE_Q8)
+    }
+
+    /// `BLOOMERY_AUTOTUNE`: a server makes its load-time kernel picks (the
+    /// default), or runs today's rule with no timing and no store.
+    #[must_use]
+    pub fn autotune(&self) -> bool {
+        self.flag(AUTOTUNE)
     }
 
     /// The host tier's load settings: [`HOST_POPULATE`], [`HOST_LOCK`],
@@ -2943,6 +3015,47 @@ pub enum HostLanes {
     Ccd,
 }
 
+/// Where a load's room-backed K/V planes back their pages ([`KV_HOST`]): the
+/// typed word a binary hands its plan and its stores, one value a load. The
+/// default ([`KvHost::Off`]) is the card's own memory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KvHost {
+    /// The card's own memory only, the plan and the stores before the lever.
+    #[default]
+    Off,
+    /// The card's memory first; a page whose card memory the driver cannot
+    /// make for lack of free bytes is backed on the host. The plan is
+    /// [`KvHost::Off`]'s.
+    Spill,
+    /// Every plane page on the host: the plan counts the planes at no card
+    /// position and against its host room instead.
+    All,
+}
+
+impl KvHost {
+    /// The word the lever takes ([`KV_HOST`]'s three spellings), or `None` on
+    /// any other — the kind refuses it by name before this runs.
+    #[must_use]
+    pub fn parse(word: &str) -> Option<KvHost> {
+        match word {
+            "off" => Some(KvHost::Off),
+            "spill" => Some(KvHost::Spill),
+            "all" => Some(KvHost::All),
+            _ => None,
+        }
+    }
+
+    /// The word [`KvHost::parse`] took, the plan line's `kv_host=`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            KvHost::Off => "off",
+            KvHost::Spill => "spill",
+            KvHost::All => "all",
+        }
+    }
+}
+
 /// What an override cannot carry: a name read from the environment alone in
 /// some file, which a value handed over would never reach.
 const NO_OVERRIDE: &str = "a flag cannot set it: a reader of it takes its value from the \
@@ -3303,6 +3416,9 @@ pub enum TierLink {
     /// Two pages, each with its own pump thread posting RDMA writes to the
     /// other.
     Rdma,
+    /// Two pages, each with its own pump thread posting framed writes to the
+    /// other over one TCP stream, and a receiver thread landing the other's.
+    Tcp,
 }
 
 /// `BLOOMERY_TIER_LINK` from the process environment, parsed as [`at_main`]
@@ -3315,7 +3431,38 @@ pub fn tier_link() -> Result<TierLink, LeverError> {
         None | Some(Value::Word("shared")) => Ok(TierLink::Shared),
         Some(Value::Word("loopback")) => Ok(TierLink::Loopback),
         Some(Value::Word("rdma")) => Ok(TierLink::Rdma),
-        v => panic!("{TIER_LINK} holds {v:?}, not shared, loopback or rdma"),
+        Some(Value::Word("tcp")) => Ok(TierLink::Tcp),
+        v => panic!("{TIER_LINK} holds {v:?}, not shared, loopback, rdma or tcp"),
+    }
+}
+
+/// How a card adds to its page words ([`WORD_OPS`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WordOps {
+    /// `auto`, and unset: the side the driver's answer to one atomic-reduction
+    /// stream memory operation picks.
+    Auto,
+    /// The atomic-reduction stream memory operation.
+    Memop,
+    /// A kernel of system-scope adds.
+    Kernel,
+}
+
+/// `BLOOMERY_WORD_OPS` from the process environment, parsed as [`at_main`]
+/// parses it, and refused when it is set to a value its kind does not take
+/// and when a retired name is set. Nothing else.
+pub fn word_ops() -> Result<WordOps, LeverError> {
+    let env = process_env();
+    Ok(word_ops_of(&read(&env, Scope::WordOps)?))
+}
+
+/// [`word_ops`] of a reading that holds the row.
+fn word_ops_of(levers: &Levers) -> WordOps {
+    match &levers.entry(WORD_OPS).value {
+        None | Some(Value::Word("auto")) => WordOps::Auto,
+        Some(Value::Word("memop")) => WordOps::Memop,
+        Some(Value::Word("kernel")) => WordOps::Kernel,
+        v => panic!("{WORD_OPS} holds {v:?}, not auto, memop or kernel"),
     }
 }
 
@@ -3332,7 +3479,7 @@ pub fn tier_ip(ip: std::net::IpAddr) -> bool {
 /// `BLOOMERY_TIER_NODES` from the process environment ([`TIER_NODES`]),
 /// parsed as [`at_main`] parses it, and refused when it is set to a value its
 /// kind does not take and when a retired name is set: the address of each
-/// expert tier's node, in tier order; empty when unset. An off-host node requires RDMA.
+/// expert tier's node, in tier order; empty when unset. An off-host node requires RDMA or TCP.
 pub fn tier_nodes() -> Result<Vec<SocketAddr>, LeverError> {
     let env = process_env();
     let levers = read(&env, Scope::TierNodes)?;

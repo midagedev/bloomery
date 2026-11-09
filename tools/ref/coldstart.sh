@@ -5,8 +5,8 @@
 #
 #   tools/ref/coldstart.sh <binary> [the server's own flags…]
 #     e.g. tools/ref/coldstart.sh target/release/bloomery-serve \
-#            -m /models/clef-flash/Cloudflare_clef-flash-Q3_K_S.gguf \
-#            --head /models/clef-flash/hf/joint_head.safetensors
+#            -m /data/moved/models/clef-flash/Cloudflare_clef-flash-Q3_K_S.gguf \
+#            --head /data/moved/models/clef-flash/hf/joint_head.safetensors
 #
 # Arms, in this order (COLDSTART_ARMS overrides, space separated):
 #   count    an empty cache, the start under `strace -f -e trace=openat`: every embedded-bundle load

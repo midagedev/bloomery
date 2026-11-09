@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -19,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 
 
@@ -867,6 +869,223 @@ print(json.dumps({"parts": parts, "error": error, "never": never}))
             self.assertTrue(any(part.startswith("file\tcrates/dep/src/fresh.rs\t") for part in result["parts"]), result)
 
 
+FACTS_DRIVER = r"""
+import importlib.util
+import json
+import os
+import sys
+import time
+from pathlib import Path
+root = Path(sys.argv[1])
+os.chdir(root)
+sys.path.insert(0, str(root / "tools"))
+spec = importlib.util.spec_from_file_location("loaded_recipes", "tools/recipes.py")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+from bloomery import reach_cache
+mode = sys.argv[2]
+
+def fresh(text, test=False):
+    return module.rust_facts.__wrapped__(text, test)
+
+def same(a, b):
+    return (a.units, a.binds, a.exported) == (b.units, b.binds, b.exported)
+
+def tree_reach():
+    side = module.make_side(str(root))
+    return side.tree, module.reach_of(side.tree)
+
+def refuse(*_):
+    raise AssertionError("computed where the store should have served")
+"""
+
+STALE_DRIVER = r"""
+tree, reach = tree_reach()
+if mode == "mutant":
+    # the entry's key forgets the file's bytes: an edited file is served its old parse
+    real_key = reach_cache._facts_key
+    reach_cache._facts_key = lambda code, test, text: real_key(code, test, "")
+
+def served(text, test=False, compute=module.rust_facts):
+    reach_cache._LIVE.clear()
+    return reach_cache.facts(reach, text, test, compute)
+
+old = Path("crates/dep/src/used.rs").read_text()
+new = old + "pub fn added_by_the_edit() {}\n"
+assert not same(fresh(old), fresh(new)), "the edit must change the parse"
+assert same(served(old), fresh(old))
+assert reach_cache.STATS["misses"] == 1 and reach_cache.STATS["stores"] == 1, reach_cache.STATS
+entry = max(Path(reach_cache.store_dir()).rglob("*.json"), key=lambda p: p.stat().st_mtime_ns)
+long_ago = time.time() - 7200
+os.utime(entry, (long_ago, long_ago))
+assert same(served(old, compute=refuse), fresh(old))
+assert reach_cache.STATS["hits"] == 1, reach_cache.STATS
+assert time.time() - entry.stat().st_mtime < 600, "a hit must refresh the entry's age, or it is evicted while in use"
+assert same(served(new), fresh(new)), "a stale unit was served after the edit"
+assert not same(served(old, True), served(new, True)), "a stale unit was served in the test view"
+print("fresh after the edit; hit refreshed the entry")
+"""
+
+SHARE_DRIVER = r"""
+tree, reach = tree_reach()
+if mode == "mutant":
+    # the entry's key names the tree: no other tree can read it
+    real_key = reach_cache._facts_key
+    reach_cache._facts_key = lambda code, test, text: real_key(code + os.getcwd(), test, text)
+reach_cache.prepare(reach)
+for (f, test), facts in reach._facts.items():
+    assert same(facts, fresh(reach._text[f], test)), f
+print(json.dumps(reach_cache.STATS))
+"""
+
+DAMAGE_DRIVER = r"""
+tree, reach = tree_reach()
+if mode == "mutant":
+    # an entry is taken as it reads: no key or payload check
+    reach_cache._verify = lambda head, key, body: None
+reach_cache.prepare(reach)
+for (f, test), facts in reach._facts.items():
+    assert same(facts, fresh(reach._text[f], test)), "a damaged entry was served: " + f
+print(json.dumps(reach_cache.STATS))
+"""
+
+
+class ReachFactsStore(unittest.TestCase):
+    """The reach's per-file facts, kept by content under HOME: shared by equal trees, never stale, damage named."""
+
+    def drive(self, ws, body, root, mode, *, env=None, ok=True):
+        done = subprocess.run([sys.executable, "-c", FACTS_DRIVER + body, str(root), mode], cwd=ws.root,
+                              env=env or ws.env, text=True, capture_output=True, timeout=300)
+        if ok:
+            self.assertEqual(done.returncode, 0, f"stdout: {done.stdout}\nstderr: {done.stderr}")
+        return done
+
+    def stats(self, done):
+        return json.loads(done.stdout.strip().splitlines()[-1])
+
+    def entries(self, ws):
+        return sorted((ws.home / ".cache" / "bloomery" / "reach-facts").rglob("*.json"))
+
+    def test_an_edited_file_is_never_served_its_old_parse(self):
+        ws = Workspace(self, runtime_files())
+        self.drive(ws, STALE_DRIVER, ws.root, "real")
+        # FAIL-first: the mutant that forgets the file's bytes in the key is caught by the same checks
+        done = self.drive(ws, STALE_DRIVER, ws.root, "mutant", ok=False)
+        self.assertNotEqual(done.returncode, 0, "a key that ignores the file's bytes passed the stale check")
+        self.assertIn("a stale unit was served", done.stderr)
+
+    def test_equal_trees_share_entries_and_an_edit_parses_only_its_file(self):
+        ws = Workspace(self, runtime_files())
+        second = ws.base / "second"
+        shutil.copytree(ws.root, second, ignore=shutil.ignore_patterns(".git", "target"))
+        first = self.stats(self.drive(ws, SHARE_DRIVER, ws.root, "real"))
+        self.assertGreater(first["misses"], 0, first)
+        self.assertEqual(first["hits"], 0, first)
+
+        def shared(stats):
+            return stats["misses"] == 0 and stats["hits"] == first["misses"]
+
+        again = self.stats(self.drive(ws, SHARE_DRIVER, second, "real"))
+        self.assertTrue(shared(again), (first, again))
+        # an edit re-parses the file it touched (its views), nothing else
+        used = second / "crates/dep/src/used.rs"
+        used.write_text(used.read_text().replace("used1", "used2"))
+        edited = self.stats(self.drive(ws, SHARE_DRIVER, second, "real"))
+        self.assertTrue(1 <= edited["misses"] <= 2, edited)
+        self.assertEqual(edited["hits"] + edited["misses"], first["misses"], edited)
+        # FAIL-first: entries keyed by the tree's path are not shared, and the check says so
+        other = ws.base / "third"
+        shutil.copytree(ws.root, other, ignore=shutil.ignore_patterns(".git", "target"))
+        self.stats(self.drive(ws, SHARE_DRIVER, ws.root, "mutant"))
+        mutant = self.stats(self.drive(ws, SHARE_DRIVER, other, "mutant"))
+        self.assertFalse(shared(mutant), mutant)
+
+    def test_damaged_entries_are_named_and_recomputed_never_served(self):
+        ws = Workspace(self, runtime_files())
+        self.drive(ws, SHARE_DRIVER, ws.root, "real")
+        pristine = {p: p.read_bytes() for p in self.entries(ws)}
+        self.assertGreater(len(pristine), 4, pristine)
+
+        def damage():
+            for p, data in pristine.items():
+                p.write_bytes(data)
+            # The victims are picked by what the store would mask, not by the key order (the key holds
+            # sys.version, so the order differs between Pythons): an equal payload stored twice is one
+            # parse, so every twin of the tampered entry is tampered too (a pristine twin loaded first
+            # would serve its value), and the foreign entry's donor carries other facts than its own.
+            digest = lambda data: json.loads(data.partition(b"\n")[0])["digest"]
+            tamper = next(p for p, data in pristine.items() if b'"println"' in data)
+            twins = [p for p, data in pristine.items() if digest(data) == digest(pristine[tamper])]
+            others = [p for p in pristine if p not in twins]
+            for p in twins:
+                p.write_bytes(pristine[p].replace(b'"println"', b'"printlm"', 1))  # still valid JSON of the schema
+            truncated, foreign = others[0], others[1]
+            truncated.write_bytes(pristine[truncated][:12])
+            donor = next(p for p in others[2:] if digest(pristine[p]) != digest(pristine[foreign]))
+            foreign.write_bytes(pristine[donor])
+            named = {p: "payload digest mismatch" for p in twins}
+            named.update({truncated: "", foreign: "another entry's key"})
+            return named
+
+        # FAIL-first: without the key and payload check the tampered entry is served, and the driver notices
+        damage()
+        done = self.drive(ws, DAMAGE_DRIVER, ws.root, "mutant", ok=False)
+        self.assertNotEqual(done.returncode, 0, "unchecked entries passed")
+        self.assertIn("a damaged entry was served", done.stderr)
+        named = damage()
+        done = self.drive(ws, DAMAGE_DRIVER, ws.root, "real")
+        self.assertEqual(self.stats(done)["corrupt"], len(named), done.stderr)
+        for path, why in named.items():
+            self.assertRegex(done.stderr, rf"reach cache: {re.escape(str(path))}: .*{re.escape(why)}.*; recomputed")
+        repaired = self.stats(self.drive(ws, DAMAGE_DRIVER, ws.root, "real"))
+        self.assertEqual((repaired["corrupt"], repaired["misses"]), (0, 0), repaired)
+
+    def test_a_store_that_cannot_be_used_is_a_miss_not_a_failure(self):
+        ws = Workspace(self, runtime_files())
+        env = dict(ws.env, HOME="/dev/null/no-home", XDG_CACHE_HOME="/dev/null/no-home/.cache")
+        done = self.drive(ws, SHARE_DRIVER, ws.root, "real", env=env)
+        stats = self.stats(done)
+        self.assertEqual((stats["stores"], stats["hits"], stats["corrupt"]), (0, 0, 0), stats)
+        self.assertGreater(stats["misses"], 0, stats)
+        self.assertEqual(done.stderr, "")
+
+    def test_the_store_is_bounded_least_recently_used_first(self):
+        import time
+        source = (SOURCE_ROOT / "tools/bloomery/reach_cache.py").read_text()
+
+        def load(text, name):
+            module = types.ModuleType(name)
+            module.__file__ = str(SOURCE_ROOT / "tools/bloomery/reach_cache.py")
+            exec(compile(text, module.__file__, "exec"), module.__dict__)
+            return module
+
+        def check(module):
+            with tempfile.TemporaryDirectory(prefix="reach-prune-") as tmp:
+                root = Path(tmp)
+                now = time.time()
+                for i in range(10):
+                    shard = root / f"{i % 3:02x}"
+                    shard.mkdir(exist_ok=True)
+                    path = shard / f"{i:064x}.json"
+                    path.write_bytes(b"x" * 1000)
+                    os.utime(path, (now - 1000 + 10 * i, now - 1000 + 10 * i))
+                stale, fresh = root / "00" / "old.tmp", root / "00" / "new.tmp"
+                stale.write_bytes(b"t")
+                fresh.write_bytes(b"t")
+                os.utime(stale, (now - 7200, now - 7200))
+                self.assertEqual(module.prune(cap=10000, keep=5000, root=str(root)), 0, "at the cap nothing goes")
+                self.assertEqual((stale.exists(), fresh.exists()), (False, True), "only an old temporary file goes")
+                self.assertEqual(module.prune(cap=9000, keep=4500, root=str(root)), 6)
+                left = sorted(p.name for p in root.rglob("*.json"))
+                self.assertEqual(left, [f"{i:064x}.json" for i in range(6, 10)], "the least recently used go first")
+
+        check(load(source, "reach_cache_under_test"))
+        # FAIL-first: a pruner that removes the newest first is caught by the same check
+        with self.assertRaises(AssertionError):
+            check(load(source.replace("entries.sort()", "entries.sort(reverse=True)"), "reach_cache_mutant"))
+
+
 def main() -> int:
     global SOURCE_ROOT
     parser = argparse.ArgumentParser(description=__doc__)
@@ -875,7 +1094,9 @@ def main() -> int:
                         help="checkout whose production CLI/helpers are copied into each fixture")
     args = parser.parse_args()
     SOURCE_ROOT = args.source_root.resolve()
-    suite = unittest.defaultTestLoader.loadTestsFromTestCase(RecipeKeyCLI)
+    suite = unittest.TestSuite()
+    for case in (RecipeKeyCLI, ReachFactsStore):
+        suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(case))
     filters = [s for s in os.environ.get("RECIPES_KEY_TEST_FILTER", "").split(",") if s]
     if filters:
         suite = unittest.TestSuite(test for test in suite if any(s in test.id() for s in filters))

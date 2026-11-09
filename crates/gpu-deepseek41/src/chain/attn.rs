@@ -38,8 +38,9 @@
 //!    whatever the other rows run between them;
 //! 7. the attention over the window ⧺ the stream's compressed rows read
 //!    through the list, then the inverse rope of its output;
-//! 8. wo_a, its groups in one launch (`q8_0_gemv_heads`, or the q8_1 form of
-//!    the heads and `dense`'s Q3_K block diagonal), and wo_b (with its
+//! 8. wo_a, its groups in one launch (`q8_0_gemv_heads`, the q8_1 form of
+//!    the heads and `dense`'s Q3_K block diagonal, `dense`'s Q5_K one, or
+//!    `mxfp8_gemv`'s block diagonal), and wo_b (with its
 //!    input's q8_1 form first when it is a K-quant);
 //! 9. HC_POST and the ffn's fold in one launch.
 //!
@@ -77,6 +78,9 @@ use std::ops::Range;
 
 use bloomery_gpu::cand::{CandKernels, CandScratch, CandShape, CompactArgs, RemapArgs, SelectArgs};
 use bloomery_gpu::fused::FusedKernels;
+use bloomery_gpu::host::rank::Sums;
+use bloomery_gpu::index_key;
+use bloomery_gpu::indexer::{self, IndexerArgs, IndexerKernels, IndexerScratch};
 use bloomery_gpu::model::{Q8_0GemvHeadsArgs, StepKernels};
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{
@@ -89,6 +93,7 @@ use model::arch::deepseek41::names;
 use model::arch::deepseek41::plan::Planner;
 
 use crate::attn::{self as attn_op, AttnArgs, AttnKernels, CommitArgs, SelectedRows, Staged};
+use crate::chain::join::TRUNK;
 use crate::compress::{
     self, CompGeom, CompressKernels, PoolArgs, RowsArgs, W_GROUPS, W_PERSISTS, w_persist, w_read,
     w_row,
@@ -98,8 +103,7 @@ use crate::hc::{
     HC_MAX_TOKENS, HC_MIX, HC_PIECE, HC_STREAMS, HcFn, HcFnArgs, HcKernels, HcPostArgs,
     HcPreScratch,
 };
-use crate::index_key::{self, IndexKeyArgs, IndexKeyKernels};
-use crate::indexer::{self, IndexerArgs, IndexerKernels, IndexerScratch};
+use crate::index_key::{CompIndexKeyKernels, IndexKeyArgs};
 use crate::params::{ImageLayout, Table};
 use crate::rope::{KvAppendArgs, RopeKernels, TailShape};
 use crate::transpose::TransposeKernels;
@@ -583,7 +587,7 @@ struct Kernels {
     rope: RopeKernels,
     attn: AttnKernels,
     comp: CompressKernels,
-    key: IndexKeyKernels,
+    key: CompIndexKeyKernels,
     /// Loaded when a layer of the card runs the indexer.
     index: Option<IndexerKernels>,
     step: StepKernels,
@@ -865,9 +869,9 @@ impl AttnChain {
             rope: RopeKernels::load(ctx)?,
             attn: AttnKernels::load(ctx)?,
             comp: CompressKernels::load(ctx)?,
-            key: IndexKeyKernels::load(ctx)?,
+            key: CompIndexKeyKernels::load(ctx)?,
             index: any_indexer
-                .then(|| IndexerKernels::load(ctx, hp))
+                .then(|| crate::indexer::kernels(ctx, hp))
                 .transpose()?,
             step: StepKernels::load(ctx)?,
             dense: DenseKernels::load(ctx)?,
@@ -1347,11 +1351,13 @@ impl AttnChain {
         layer: usize,
         io: AttnIo<'_>,
     ) -> Result<(), GpuError> {
-        self.enqueue_layer_of(gpu, w, layer, 0, io)
+        self.enqueue_layer_of(gpu, w, layer, 0, io, None)
     }
 
     /// [`AttnChain::enqueue_layer`] reading row `row`'s words, which its
-    /// [`enqueue_step_of`](Self::enqueue_step_of) gathered.
+    /// [`enqueue_step_of`](Self::enqueue_step_of) gathered. On a rank of a
+    /// tensor-parallel load the output projection's result is the rank's part,
+    /// and `join` sums the ranks' parts before HC_POST reads it.
     pub fn enqueue_layer_of(
         &mut self,
         gpu: &Gpu,
@@ -1359,6 +1365,7 @@ impl AttnChain {
         layer: usize,
         row: usize,
         io: AttnIo<'_>,
+        join: Option<&mut Sums>,
     ) -> Result<(), GpuError> {
         let lp = layer
             .checked_sub(self.layers.start)
@@ -1535,6 +1542,9 @@ impl AttnChain {
         k.attn.enqueue(stream, args)?;
         enqueue_output(&cx, lp, s)?;
         fork.join()?;
+        if let Some(join) = join {
+            join.join(gpu, TRUNK, &mut s.out)?;
+        }
 
         let post = HcPostArgs {
             x: &s.out,
@@ -1824,11 +1834,18 @@ fn enqueue_output(cx: &Cx<'_>, lp: &LayerPlan, s: &mut Scratch) -> Result<(), Gp
             (d.o_lora_rank, d.group_k),
             &mut s.wo_a,
         )?,
+        Dense::Mxfp8(wa) => cx.gpu.q8f32().enqueue_mxfp8_gemv_heads(
+            stream,
+            wa,
+            &s.y,
+            (d.o_lora_rank, d.group_k),
+            &mut s.wo_a,
+        )?,
         _ => {
             return Err(GpuError::Tensor {
                 what: WHAT,
                 name: n.out_a.clone(),
-                need: "Q3_K, Q5_K or Q8_0",
+                need: "Q3_K, Q5_K, Q8_0 or MXFP8",
             });
         }
     }

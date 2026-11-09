@@ -33,7 +33,7 @@ use std::path::Path;
 
 use memchr::memmem::Finder;
 
-pub use decode::{Decoder, SpaceCleaner};
+pub use decode::{Decoder, SpaceCleaner, byte_decoder};
 pub use unicode::byte_to_cpt_table;
 pub use vocab::{Specials, attr};
 
@@ -1705,6 +1705,22 @@ mod tests {
             assert_eq!(&cleaned.decode(&ids), want, "{text:?}");
             assert_eq!(
                 &raw.decode(&raw.encode(text, false, false)),
+                text,
+                "{text:?}"
+            );
+        }
+    }
+
+    /// The `deepseek-llm` row loads from a header and decodes as the reference does with
+    /// `clean_spaces` false: a space before `?`, `.` or `'s` stays. FAIL-first: a name added to
+    /// `CLEAN_SPACES` fails it.
+    #[test]
+    fn the_deepseek_llm_row_loads_and_cleans_no_spaces() {
+        let tok = from_header(&byte_header("deepseek-llm")).unwrap();
+        assert!(tok.space_cleaner().is_none());
+        for text in ["What ?", "Hello , world", "it 's", "你好 。 x  "] {
+            assert_eq!(
+                &tok.decode(&tok.encode(text, false, false)),
                 text,
                 "{text:?}"
             );

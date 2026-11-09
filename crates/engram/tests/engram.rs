@@ -663,6 +663,163 @@ fn hw_engram_two_d_table_rows_are_unchanged() {
     }
 }
 
+/// The model file at `path` of `kvs` and `tensors`, each tensor F32.
+fn write_model(
+    path: &std::path::Path,
+    kvs: &[(String, gguf::Value)],
+    tensors: &[(String, Vec<u64>, Vec<u8>)],
+) {
+    use gguf::write::{Layout, TensorDecl, Writer};
+    let decls = tensors
+        .iter()
+        .map(|(name, dims, bytes)| TensorDecl {
+            name: name.clone(),
+            dims: dims.clone(),
+            type_id: 0,
+            nbytes: bytes.len() as u64,
+        })
+        .collect();
+    let mut w = Writer::new(
+        std::io::BufWriter::new(File::create(path).unwrap()),
+        Layout::new(kvs, decls).unwrap(),
+    )
+    .unwrap();
+    for (name, _, bytes) in tensors {
+        w.tensor(name, bytes).unwrap();
+    }
+    w.finish()
+        .unwrap()
+        .into_inner()
+        .unwrap()
+        .sync_all()
+        .unwrap();
+}
+
+/// Two sites (blocks 1 and 3), two buckets each of a 2-gram hash, rows of
+/// 32 f32: site 0 has 3 + 5 rows, site 1 7 + 11.
+const CONCAT_PRIMES: [u64; 4] = [3, 5, 7, 11];
+const CONCAT_WIDTH: u64 = 32;
+
+/// The same toy Engram in both layouts under `dir`: bloomery's one table a
+/// site with the canonical keys, and llama.cpp's one table of both sites'
+/// rows with its `ple.*` keys. The rows are the same bytes.
+fn write_both_layouts(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    use gguf::Value;
+    let kv = |k: &str, v: Value| (format!("deepseek41.{k}"), v);
+    let arr = |v: &[u64]| Value::Array(v.iter().map(|&x| Value::U64(x)).collect());
+    let arch = (
+        gguf::GENERAL_ARCHITECTURE.to_string(),
+        Value::String("deepseek41".to_string()),
+    );
+    let rows = [8u64, 18];
+    let row_bytes = CONCAT_WIDTH * 4;
+    let site_bytes: Vec<Vec<u8>> = rows
+        .iter()
+        .enumerate()
+        .map(|(e, &r)| random_bytes(40 + e as u64, r * row_bytes))
+        .collect();
+    let mult = [3u64, 5, 7, 9];
+    let token_map = [0u64, 1, 2, 3, 1];
+    let per_site = dir.join("per-site.gguf");
+    write_model(
+        &per_site,
+        &[
+            arch.clone(),
+            kv("engram.layer_ids", arr(&[1, 3])),
+            kv("engram.head_count", Value::U32(2)),
+            kv("engram.max_ngram_size", Value::U32(2)),
+            kv("engram.key_length", Value::U32(CONCAT_WIDTH as u32)),
+            kv("engram.pad_id", Value::U32(0)),
+            kv("engram.multipliers", arr(&mult)),
+            kv("engram.primes", arr(&CONCAT_PRIMES)),
+            kv("engram.offsets", arr(&[0, 3, 0, 7])),
+            kv("engram.token_map", arr(&token_map)),
+        ],
+        &[
+            (
+                "blk.1.engram_embd.weight".to_string(),
+                vec![CONCAT_WIDTH, rows[0]],
+                site_bytes[0].clone(),
+            ),
+            (
+                "blk.3.engram_embd.weight".to_string(),
+                vec![CONCAT_WIDTH, rows[1]],
+                site_bytes[1].clone(),
+            ),
+        ],
+    );
+    let concat = dir.join("concat.gguf");
+    write_model(
+        &concat,
+        &[
+            arch,
+            kv("ple.layers", arr(&[1, 3])),
+            kv("ple.heads_per_ngram", Value::U32(2)),
+            kv("ple.ngram_size", Value::U32(2)),
+            kv(
+                "embedding_length_per_layer_input",
+                Value::U32(CONCAT_WIDTH as u32),
+            ),
+            kv("engram.pad_token_id", Value::U32(0)),
+            kv("ple.layer_multipliers", arr(&mult)),
+            kv("ple.head_vocab_sizes", arr(&CONCAT_PRIMES)),
+            kv("ple.head_offsets", arr(&[0, 3, 8, 15])),
+            kv("engram.token_map", arr(&token_map)),
+        ],
+        &[(
+            "per_layer_token_embd.weight".to_string(),
+            vec![CONCAT_WIDTH, rows[0] + rows[1]],
+            site_bytes.concat(),
+        )],
+    );
+    (per_site, concat)
+}
+
+/// llama.cpp's concatenated table opens as the same sites as bloomery's one
+/// table a site: each site's row count, and every row of it the same bytes
+/// under the same id — site 1's rows read from its base row in the one
+/// table — and the same hash. Mutant: a site that ignores its base row reads
+/// site 0's rows for site 1.
+#[test]
+#[ignore = "hw: the box's disk-backed target directory"]
+fn hw_engram_concatenated_sites_are_the_per_site_tables() {
+    let scratch = Scratch::new("concat");
+    let (per_site, concat) = write_both_layouts(&scratch.0);
+    let a = Engram::open([&per_site]).expect("the per-site layout opens");
+    let b = Engram::open([&concat]).expect("the concatenated layout opens");
+    let (ha, hb) = (a.hash(), b.hash());
+    assert_eq!((ha.layer_ids(), ha.n_cols()), (hb.layer_ids(), hb.n_cols()));
+    for e in 0..2 {
+        let per = |h: &engram::Hash| {
+            (
+                h.primes(e).unwrap().to_vec(),
+                h.offsets(e).unwrap().to_vec(),
+                h.multipliers(e).unwrap().to_vec(),
+            )
+        };
+        assert_eq!(per(ha), per(hb), "site {e}: the two key sets are one hash");
+    }
+    assert_eq!(a.sites().len(), 2);
+    for (e, (x, y)) in a.sites().iter().zip(b.sites()).enumerate() {
+        assert_eq!(
+            (x.rows(), x.row_bytes()),
+            (y.rows(), y.row_bytes()),
+            "site {e}"
+        );
+        assert_eq!(y.name(), "per_layer_token_embd.weight");
+        for id in 0..x.rows() as u32 {
+            assert_eq!(x.row(id).unwrap(), y.row(id).unwrap(), "site {e} row {id}");
+        }
+        let past = x.rows() as u32;
+        assert!(
+            matches!(y.row(past), Err(EngramError::RowOutOfRange { .. })),
+            "site {e}"
+        );
+    }
+    let base = header_offset(&concat, "per_layer_token_embd.weight");
+    assert_eq!(b.sites()[1].file_offset(0), base + 8 * CONCAT_WIDTH * 4);
+}
+
 /// A table in bloomery's F8 rows (a private type the split sizes, one byte a
 /// value) opens with rows of its width in bytes, each the file's bytes.
 #[test]

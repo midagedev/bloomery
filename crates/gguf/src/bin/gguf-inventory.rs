@@ -17,6 +17,11 @@
 //! A block is MoE iff it owns a `*_exps` tensor. Dense-per-token is then
 //! total − routed_exps − engram by construction.
 //!
+//! `--engram` prints instead the Engram layout owner's reading of the set
+//! ([`gguf::engram::EngramTables`]): the layout, then one line a site — its
+//! layer, the tensor its rows are in, its base row, its rows, their type and
+//! width — from the headers alone, or the owner's refusal (exit 1).
+//!
 //! Per-token active bytes use the metadata's `<arch>.expert_count` and
 //! `<arch>.expert_used_count` (top-k): routed/token = Σ over MoE blocks of
 //! (exps bytes × top-k / expert count), exact integer division. A top-k above the expert
@@ -27,6 +32,7 @@ use std::env;
 use std::fs;
 use std::process::ExitCode;
 
+use gguf::engram::EngramTables;
 use gguf::{GgmlType, Inventory, ggml_type_info, inventory_of};
 
 struct Shard {
@@ -194,8 +200,47 @@ fn known_bytes(shards: &[Shard]) -> Result<u64, String> {
     Ok(total)
 }
 
+/// The `--engram` lines of the set: the layout and each site's table run.
+fn engram_lines(shards: &[Shard]) -> Result<Vec<String>, String> {
+    let arch = shards
+        .iter()
+        .find_map(|s| s.inv.value("general.architecture"))
+        .and_then(|v| v.as_str())
+        .ok_or("the set has no general.architecture")?;
+    let facts = gguf::arch::engram_facts(arch)
+        .ok_or_else(|| format!("the architecture {arch} has no Engram"))?;
+    let carrier = shards
+        .iter()
+        .find(|s| gguf::facts::carries(&s.inv.meta, arch, &facts.layer_ids))
+        .ok_or_else(|| format!("no shard holds {arch}'s Engram layer list"))?;
+    let find = |name: &str| {
+        shards
+            .iter()
+            .flat_map(|s| &s.inv.tensors)
+            .find(|t| t.name == name)
+            .map(|t| (t.dims.clone(), t.type_id))
+    };
+    let tables = EngramTables::read(&carrier.inv.meta, arch, facts, find)
+        .map_err(|e| e.to_string())?
+        .ok_or("the set lists no Engram site")?;
+    let mut out = vec![format!(
+        "engram layout={:?} sites={}",
+        tables.layout,
+        tables.sites.len()
+    )];
+    for site in &tables.sites {
+        let ty = ggml_type_info(site.type_id).map_or("?", |(name, _, _)| name);
+        out.push(format!(
+            "engram site layer={} tensor={} base_row={} rows={} type={ty} width={}",
+            site.layer, site.tensor, site.base_row, site.rows, site.width
+        ));
+    }
+    Ok(out)
+}
+
 fn main() -> ExitCode {
     let mut md_path: Option<String> = None;
+    let mut engram = false;
     let mut paths: Vec<String> = Vec::new();
     let mut args = env::args().skip(1);
     while let Some(a) = args.next() {
@@ -207,16 +252,17 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             },
+            "--engram" => engram = true,
             flag if flag.starts_with('-') => {
                 eprintln!("gguf-inventory: unknown flag {flag}");
-                eprintln!("usage: gguf-inventory [--markdown PATH] FILE...");
+                eprintln!("usage: gguf-inventory [--markdown PATH | --engram] FILE...");
                 return ExitCode::from(2);
             }
             p => paths.push(p.to_string()),
         }
     }
-    if paths.is_empty() {
-        eprintln!("usage: gguf-inventory [--markdown PATH] FILE...");
+    if paths.is_empty() || (engram && md_path.is_some()) {
+        eprintln!("usage: gguf-inventory [--markdown PATH | --engram] FILE...");
         return ExitCode::from(2);
     }
 
@@ -233,6 +279,21 @@ fn main() -> ExitCode {
                 return ExitCode::from(1);
             }
         }
+    }
+
+    if engram {
+        return match engram_lines(&shards) {
+            Ok(lines) => {
+                for l in lines {
+                    println!("{l}");
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("gguf-inventory: {e}");
+                ExitCode::from(1)
+            }
+        };
     }
 
     // The union over shards is the model; a name in two shards would be a

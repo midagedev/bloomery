@@ -71,6 +71,7 @@ pub fn spec_of(hp: &Hparams, chat: models::ChatSpec) -> Result<ModelSpec, Placem
                         latent,
                         pre_exp_norm: false,
                         post_exp_norm: None,
+                        sum_norm: false,
                         act: Act::ReluSqr,
                         router,
                         shared: Some(shared),

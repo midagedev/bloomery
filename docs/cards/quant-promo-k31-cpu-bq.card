@@ -1,0 +1,15 @@
+# Promo speed row 3/3 (K3.1, host rule of bloomery-quantize): `bloomery-quantize --cpu` over the same set, imatrix and rules, a
+# 900 s window. No rate of this path is measured anywhere: the smoke's 5.4 Mweights/s/thread is llama-quantize's. The same
+# `quantize_row_iq1_s_impl` rule runs serially per sub-block either way, so the prediction is llama-quantize's rate (214,
+# row 2) with a wide band for the thread pool's row-chunking and for gguf::iq_quant being a port compiled for znver3, not ggml's
+# baseline x86-64 build. [derived; the band is a guess, not a model]
+kind: calibration
+question: what weights/s does bloomery-quantize --cpu reach on all cores over K3.1's IQ1_S routed-expert stacks, against llama-quantize's?
+term: Mweights/s over the IQ1_S stacks that finish in a 900 s window (each 9.865e9 weights), from the binary's per-tensor lines; `--cpu`, the pool's thread count printed in the first line (`host rule, N threads`), imatrix kimi-k31-c8192x4.imatrix.gguf, rules-IQ1_S.txt
+unit: Mweights/s
+predict: 150..300
+condition: the same lease, input, imatrix, rules and quiet host as the llama-quantize window, run in the same sitting right after it; the thread count in the line is recorded beside llama-quantize's 64 (docs/quantize.md names no thread flag: if N is not 64 the chart row says so)
+reason: fills the `--cpu` row of the promo's speed chart (CPU-only users of the binary) and tells whether the host rule is a fair stand-in for llama-quantize's; why now: the binary ships with `--cpu` and no number for it
+decide-in: the chart shows `--cpu` beside llama-quantize as the same speed; the card is the speed-up
+decide-below: look at the pool's chunking (crates/quantize/src/host.rs, for_each_chunk) before the chart shows `--cpu`; a path slower than the reference is a finding for its own issue
+decide-above: the host rule is faster than ggml's own build (znver3 codegen); the chart shows it and the line names the compile flags as the cause to be checked

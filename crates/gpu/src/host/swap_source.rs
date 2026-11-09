@@ -69,11 +69,12 @@ use runtime::swaprule::KeptRows;
 use super::HostExperts;
 use super::nvtier::NvTier;
 use super::swap::{
-    BoundaryAt, MachineCfg, Nvfp4From, PassReport, Piece, ResetReport, Residency, SwapSource,
-    Transform,
+    BoundaryAt, Freed, MachineCfg, Nvfp4From, PassReport, Piece, ResetReport, Residency,
+    SwapSource, Transform,
 };
 use super::{HostTier, PassKind};
 use crate::GpuError;
+use crate::room::StackRoom;
 use crate::tensor::DeviceTensor;
 use crate::weights::{DevWeight, Weights};
 
@@ -131,6 +132,14 @@ pub trait FileStacks: Send + Sync {
 /// place, on the machine's copy stream. The copies of later parts and the
 /// flip's event follow it on the stream.
 pub trait Convert: Send + Sync {
+    /// Whether the step rewrites part `part` of an expert: the parts it
+    /// unpacks with the sizes it was built from, which every card layer of
+    /// the load holds alike ([`one_layout`]); a part it leaves as staged may
+    /// differ from layer to layer. Every part unless a step names fewer.
+    fn converts(&self, _part: usize) -> bool {
+        true
+    }
+
     /// Enqueue on `stream` the conversion of part `part` at `dst`.
     fn convert(
         &self,
@@ -399,6 +408,11 @@ struct LayerParts {
     /// expert: the [`Plane::Scale`] part's source; empty for a stack read
     /// whole.
     scales: Vec<Vec<u8>>,
+    /// Per stack, its room when the load held it as one
+    /// ([`Weights::stack_room`]): the pages the machine gives back and backs
+    /// again. `None` for a plain buffer and for a planes stack; empty when
+    /// no stack of the layer is a room.
+    rooms: Vec<Option<Arc<StackRoom>>>,
 }
 
 /// What a part of an expert is of its stack: the stack's bytes whole (a
@@ -652,10 +666,15 @@ fn tensor_scales(split: &Split, t: &ModelTensor, experts: u64) -> Result<Vec<u8>
 }
 
 /// The one convert step is built from the first card layer's parts: a card
-/// layer of other parts would be unpacked with the wrong sizes, so a load
-/// with a convert step refuses it by name. `first` is the layer `layers[0]`
-/// holds.
-fn one_layout(first: usize, layers: &[Option<LayerParts>]) -> Result<(), GpuError> {
+/// layer whose converted parts (`converts`) are of other sizes would be
+/// unpacked with the wrong sizes, so a load with a convert step refuses it by
+/// name. A part the step leaves as staged may differ. `first` is the layer
+/// `layers[0]` holds.
+fn one_layout(
+    first: usize,
+    layers: &[Option<LayerParts>],
+    converts: impl Fn(usize) -> bool,
+) -> Result<(), GpuError> {
     let mut held = layers
         .iter()
         .enumerate()
@@ -663,7 +682,11 @@ fn one_layout(first: usize, layers: &[Option<LayerParts>]) -> Result<(), GpuErro
     let Some((l0, p0)) = held.next() else {
         return Ok(());
     };
-    match held.find(|(_, p)| p.parts != p0.parts) {
+    let differs = |p: &LayerParts| {
+        p.parts.len() != p0.parts.len()
+            || (0..p.parts.len()).any(|k| converts(k) && p.parts[k] != p0.parts[k])
+    };
+    match held.find(|(_, p)| differs(p)) {
         None => Ok(()),
         Some((l, p)) => Err(GpuError::shape(
             "FileSwap::new",
@@ -803,6 +826,15 @@ impl FileSwap {
                     false => Ok(Vec::new()),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            let rooms = names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| {
+                    of.contains(&(i, Plane::Whole))
+                        .then(|| w.stack_room(n).cloned())
+                        .flatten()
+                })
+                .collect();
             out.push(Some(LayerParts {
                 tensors,
                 base,
@@ -810,6 +842,7 @@ impl FileSwap {
                 parts,
                 of,
                 scales,
+                rooms,
             }));
         }
         let first = out
@@ -819,8 +852,8 @@ impl FileSwap {
             .ok_or_else(|| GpuError::shape(WHAT, "no layer of the card holds routed stacks"))?;
         let t0 = first.tensors[0].clone();
         let convert = stacks.open(&t0.dims, &first.parts, pair.r8().sidecar().is_some(), ctx)?;
-        if convert.is_some() {
-            one_layout(layers.start, &out)?;
+        if let Some(c) = &convert {
+            one_layout(layers.start, &out, |k| c.converts(k))?;
         }
         Ok(FileSwap {
             tier: OnceLock::new(),
@@ -1031,6 +1064,34 @@ impl FileSwap {
             })
     }
 
+    /// The room stacks of layer `layer` with the bytes one slot takes in
+    /// each, `slot` a slot of the layer or its end; the layer's stacks that
+    /// are plain buffers are not among them. Refused by name for a layer the
+    /// stage card holds no stack of and a slot past the layer's.
+    fn rooms_of(
+        &self,
+        layer: usize,
+        slot: usize,
+        what: &'static str,
+    ) -> Result<Vec<(&StackRoom, usize)>, GpuError> {
+        let p = self.layer(layer, what)?;
+        if slot > p.slots {
+            return Err(GpuError::shape(
+                what,
+                format!("layer {layer} slot {slot}: {} slots", p.slots),
+            ));
+        }
+        Ok(p.of
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, plane))| *plane == Plane::Whole)
+            .filter_map(|(part, &(stack, _))| {
+                let room = p.rooms.get(stack)?.as_deref()?;
+                Some((room, p.parts[part]))
+            })
+            .collect())
+    }
+
     /// Where the host reads stack `stack` of layer `layer`'s expert `id`: the
     /// sidecar's run when it holds the stack and the pair reads one, else the
     /// source's; a planes stack's codes run then its scales run, each in its
@@ -1200,6 +1261,51 @@ impl SwapSource for FileSwap {
             ));
         }
         Ok(p.base[part] + (slot as usize * p.parts[part]) as u64)
+    }
+
+    /// The pages of the layer's room stacks wholly at or past slot `from`
+    /// that hold memory.
+    fn stack_tail_bytes(&self, layer: usize, from: usize) -> Result<u64, GpuError> {
+        let mut bytes = 0;
+        for (room, per) in self.rooms_of(layer, from, "FileSwap::stack_tail_bytes")? {
+            bytes += room.tail_bytes(from * per)?;
+        }
+        Ok(bytes)
+    }
+
+    /// Every page of the layer's room stacks wholly at or past slot `from`
+    /// given back ([`StackRoom::release_from`]); a plain stack gives back
+    /// nothing.
+    fn release_stacks(&self, layer: usize, from: usize) -> Result<u64, GpuError> {
+        let mut freed = 0;
+        for (room, per) in self.rooms_of(layer, from, "FileSwap::release_stacks")? {
+            freed += room.release_from(from * per)?;
+        }
+        Ok(freed)
+    }
+
+    /// The pages of the layer's room stacks that hold a byte of slots
+    /// `from..to` backed again, zeroed on `stream` ([`StackRoom::restore`]).
+    fn restore_stacks(
+        &self,
+        layer: usize,
+        from: usize,
+        to: usize,
+        stream: &CudaStream,
+    ) -> Result<u64, GpuError> {
+        let mut backed = 0;
+        for (room, per) in self.rooms_of(layer, to, "FileSwap::restore_stacks")? {
+            backed += room.restore(from * per, to * per, stream)?;
+        }
+        Ok(backed)
+    }
+
+    /// The bytes the layer's room stacks have given back and not had backed
+    /// again; 0 for a layer this source holds no stack of (every layer of a
+    /// machine holds parts).
+    fn released_bytes(&self, layer: usize) -> u64 {
+        self.rooms_of(layer, 0, "FileSwap::released_bytes")
+            .map_or(0, |rooms| rooms.iter().map(|(r, _)| r.released()).sum())
     }
 
     /// The model's convert step of the staged part just copied to `dst`
@@ -1438,6 +1544,20 @@ impl ResidencyGlue {
         tier.swap_reseed(stream, order)
     }
 
+    /// Give back at least `bytes` device bytes of the stage card's expert
+    /// stacks: the same top `k` slots off every machine layer, the smallest
+    /// `k` that reaches them ([`HostTier::swap_free_bytes`]); the per-layer
+    /// report. Refused by name, the machine unchanged, without a machine and
+    /// when the floor forbids.
+    pub fn free_bytes<H: HostExperts>(
+        &mut self,
+        tier: &mut HostTier<H>,
+        stream: &CudaStream,
+        bytes: u64,
+    ) -> Result<Freed, GpuError> {
+        tier.swap_free_bytes(stream, bytes)
+    }
+
     /// Stop the machine before anything of the model is freed
     /// ([`HostTier::stop_swap`]); nothing without one.
     pub fn stop<H>(&mut self, tier: &mut HostTier<H>) {
@@ -1519,6 +1639,7 @@ mod tests {
                 parts,
                 of: vec![(0, Plane::Codes), (0, Plane::BlockScales)],
                 scales: vec![Vec::new()],
+                rooms: Vec::new(),
             })],
             union_tag: String::new(),
             convert: None,
@@ -1891,24 +2012,37 @@ mod tests {
             parts: parts.to_vec(),
             of: Vec::new(),
             scales: Vec::new(),
+            rooms: Vec::new(),
         })
     }
 
-    /// A load with a convert step takes card layers of one layout only, and
-    /// names the first layer of another layout. Mutant: the check skipped (or
-    /// comparing only neighbours past the first) — the layer 7 arm catches it.
+    /// A load with a convert step takes card layers whose converted parts are
+    /// of one layout only, and names the first layer of another; a part the
+    /// step leaves as staged (V4.1's Q5_K down beside its Q4_K one) may
+    /// differ. Mutant: the check skipped (or comparing only neighbours past
+    /// the first) — the layer 7 arm catches it; comparing every part — the
+    /// down arm catches it.
     #[test]
     fn a_convert_step_refuses_a_layer_of_other_parts_by_name() {
+        let gate_up = |k: usize| k < 2;
         let same = [None, held(&[4096, 4096, 8192]), held(&[4096, 4096, 8192])];
-        assert!(one_layout(4, &same).is_ok(), "one layout passes");
-        assert!(one_layout(4, &[None, None]).is_ok(), "no held layer passes");
+        assert!(one_layout(4, &same, gate_up).is_ok(), "one layout passes");
+        assert!(
+            one_layout(4, &[None, None], gate_up).is_ok(),
+            "no held layer passes"
+        );
+        let down = [held(&[4096, 4096, 10240]), held(&[4096, 4096, 8192])];
+        assert!(
+            one_layout(4, &down, gate_up).is_ok(),
+            "a part the step leaves as staged may differ"
+        );
         let other = [
             held(&[4096, 4096, 8192]),
             None,
             held(&[4096, 4096, 8192]),
             held(&[6144, 6144, 16384]),
         ];
-        match one_layout(4, &other) {
+        match one_layout(4, &other, gate_up) {
             Err(GpuError::Shape { what, detail }) => {
                 assert_eq!(what, "FileSwap::new");
                 assert_eq!(

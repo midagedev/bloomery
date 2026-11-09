@@ -7,7 +7,7 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
 
     python3 tools/recipes.py check            # the target checks of `just check-recipes`, one feature set a bin, and the plan files records-refresh writes (presence)
     python3 tools/recipes.py targets [RECIPE]  # recipe -> cargo targets, scripts, input count
-    python3 tools/recipes.py affected [BASE | A..B] [--no-box] [--all-recipes] [--narrow [--scan BASE_LOG NEW_LOG]...] [--no-class] [--no-comment-only]
+    python3 tools/recipes.py affected [BASE | A..B] [--no-box] [--all-recipes] [--narrow [--scan BASE_LOG NEW_LOG]...] [--no-class | --fast] [--no-comment-only] [--classes FILE | --no-owed]
     python3 tools/recipes.py release-list [TAG | TAG..HEAD] [--wall]  # the release batch's list: the real tier (common and tooling gates, the main and the new families' gates), affected and the CUDA GGUF gates in scope; the other families' gates left out by name
     python3 tools/recipes.py scan-set [REV]    # the bins whose ptx-scans cover every kernel carrier: bin<TAB>features<TAB>carriers (just narrow scans them)
     python3 tools/recipes.py ships [--rev REV] [--base REV] FILE...  # the FILEs inside the shipped closure (tools/release/build.sh's bins at its features), with why; exit 1 when any is (tools/release/late-commit.sh)
@@ -18,7 +18,9 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
     python3 tools/recipes.py gaps [CRATE...] [--rev REV] [--list]  # per crate: recipes whose key holds a file of it, recipes whose targets reach code of it, the gap; exit 1 on a gap of a pinned crate (KEY_REACH_PINS)
     python3 tools/recipes.py rows              # tools/gate-paths.tsv as narrow() reads it: each `derive` row's gates written out, line for line (cached by tree)
     python3 tools/recipes.py reach FILE... [--brief] [--row] [--mac-landing]  # the gates whose targets can run the file's code, each with a chain (--brief: the reason; --mac-landing: the list a mac-crate change runs)
-    python3 tools/recipes.py key --manifest F [--ledger L [--round-ledger R]] ITEM...  # the green ledger's key per item
+    python3 tools/recipes.py whole-manifests         # the recipes that read a package manifest whole (rc 1 when a gate-* recipe does)
+    python3 tools/recipes.py key --manifest F [--ledger L [--round-ledger R] [--fast-ledger F]] ITEM...  # the green ledger's key per item
+    python3 tools/recipes.py key --files ITEM  # the tree files ITEM's key reads, one a line (gate-batch.sh's red-line attribution)
     python3 tools/recipes.py box-manifest      # on the box, through tools/box.sh: the key's box part
     python3 tools/recipes.py box-command RECIPE  # the recipe's box.sh command, verbatim (tools/mac-check.sh derives from it)
     python3 tools/recipes.py opens [RECIPE...] [--explain]  # per recipe, whether a target it builds or runs reaches the fixture fence (tools/gate-batch.sh's real-file deferral)
@@ -28,6 +30,7 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
     python3 tools/recipes.py orphan-tests      # every #[test] no gate-* or lab-* recipe runs on the box
     python3 tools/recipes.py expand [--justfile F]  # every recipe as just runs it, each top-level variable replaced by its value in this environment
     python3 tools/recipes.py --self-test [--serial]  # its sections run as forked processes; --serial: one after another in this one
+    python3 tools/recipes.py --self-test --part K    # part K of SELFTEST_PARTS (check-recipes runs one scheduler job a part): its sections one child after another
 
 `affected` prints the gate-* recipes whose inputs a diff touches; nothing runs. BASE (default
 `main`) compares the working tree, uncommitted and untracked files included, with the merge base of
@@ -65,6 +68,10 @@ when the change can have moved it — the family's own file changed, the recipe'
 a representative one and the pick reaches a changed file, or the family was added since the last release tag. The gate it leaves out is printed
 with its reason, in the same `left out` block the ptx-scan stage uses. With `--no-class` that stage is not applied and every gate the graph
 reaches stays.
+`--fast` (the landing's list; the summary line says `affected (fast)`) changes only that stage: a file that the globs of one or more families match is
+those families' own, and a gate every reached changed file of which is a family's own is left out unless it is one of those families',
+an owner its class row names owns a changed file, or it builds a lib or test target of a package a changed file lies in. A tooling gate stays.
+A file no family glob matches (a script, a cargo global, common code) keeps every gate it reaches. gate-batch.sh --fast-ledger records its greens apart.
 A change whose selecting files all sit under `MAC_CRATES` does not select a CUDA gate on a GGUF input (`mac_landing_deferred`); the gate is
 printed under `deferred`. `release-list` is the release batch's list, the real tier (`real_tier`): every common and tooling gate the batch
 runs, every gate of a main family (families.tsv tier) or of a family new since TAG, the weekly and check recipes of those, then affected(TAG)
@@ -285,7 +292,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 
 _REACH_LOADED_CODE = sys._getframe().f_code
@@ -3178,12 +3185,17 @@ def changed_files(spec: str) -> tuple[list[str], str | None, str | None, str]:
 def cmd_affected(args: argparse.Namespace) -> int:
     if args.scan and not args.narrow:
         raise RecipeError("--scan needs --narrow")
+    if args.fast and not args.class_stage:
+        raise RecipeError("--fast is a mode of the class stage: it cannot go with --no-class")
     # Every scan log and the table are read before the diff: one the tool cannot vouch for is refused first.
     scans = [(read_scan(x), read_scan(y)) for x, y in args.scan or []]
     if args.narrow:
         load_gate_paths()  # a table this tool cannot read is refused before the diff is
     changed, a_rev, b_rev, a_label = changed_files(args.base)
     prefix = "" if args.all_recipes else GATE_PREFIX
+    # The fixture tier's classifier runs beside the selection (it is the slow part); its rows name the picks a landing defers.
+    # It reads the class tables, so `--no-class` (a tree without them) turns the owed block off with the class stage.
+    owed_src = OwedClasses(args.classes, ROOT) if prefix == GATE_PREFIX and args.owed and args.class_stage else None
     tmp = tempfile.mkdtemp(prefix="recipes-affected-")
     try:
         b = make_side(archive(b_rev, os.path.join(tmp, "b")) if b_rev else ROOT)
@@ -3214,14 +3226,26 @@ def cmd_affected(args: argparse.Namespace) -> int:
         ctables = None
         if args.class_stage:
             ctables = class_tables(b.tree.root)
-            stage = class_narrow(picks, changed, ctables, lambda n: class_reach(n, changed, a, b),
-                                 families_new_since(ROOT, ctables))
+            # select() read a manifest by table and left a comment-only file out; class_reach lists every file a recipe's inputs name. Fast mode
+            # takes only the files that selected the recipe, so a manifest whose view did not move reaches nothing.
+            sel_files = {s.recipe: set(s.files) for s in sels} if args.fast else {}
+
+            def reach(n: str) -> tuple[list[str], list[str], bool]:
+                reached, own, text = class_reach(n, changed, a, b)
+                if n in sel_files:
+                    reached, own = [f for f in reached if f in sel_files[n]], [f for f in own if f in sel_files[n]]
+                return reached, own, text
+
+            stage = class_narrow(picks, changed, ctables, reach, families_new_since(ROOT, ctables), args.fast,
+                                 lambda n: class_lib_touch(n, changed, a, b))
             picks = {n: why for n, why in picks.items() if n in stage.kept}
         deferred = mac_landing_deferred(sels, picks, b.recipes, b.tree.root) if prefix == GATE_PREFIX else []
         for n, _reason in deferred:
             picks.pop(n, None)
         vitems = variant_items(list(picks), a, b, changed, prefix) if prefix == GATE_PREFIX else []
-        class_note = f"class-staged: {len(stage.kept)} kept, {len(stage.left_out)} left out" if stage else "class stage off (--no-class)"
+        class_note = (f"class-staged{' (fast)' if args.fast else ''}: {len(stage.kept)} kept, {len(stage.left_out)} left out"
+                      if stage else "class stage off (--no-class)")
+        head = "affected (fast)" if args.fast else "affected"
         mac_note = f", {len(deferred)} deferred to weekly (CUDA gate, GGUF input)" if deferred else ""
         lever_why = tables.levers.summary()
         lever_note = f"; {lever_why}" if lever_why else ""
@@ -3231,10 +3255,10 @@ def cmd_affected(args: argparse.Namespace) -> int:
             lever_note += f"; {tables.comments.summary()}"
         if narrowed:
             by_derivation = f"; {len(nar.derived)} files by derivation" if nar.derived else ""
-            print(f"affected: {rng} — {len(changed)} changed files, {len(picks)} of {total} {prefix or ''}recipes selected "
+            print(f"{head}: {rng} — {len(changed)} changed files, {len(picks)} of {total} {prefix or ''}recipes selected "
                   f"(narrowed from {len(sels)} by ptx-scan{by_derivation}; {class_note}){weekly}{mac_note}{lever_note}")
         else:
-            print(f"affected: {rng} — {len(changed)} changed files, {len(picks)} of {total} {prefix or ''}recipes selected"
+            print(f"{head}: {rng} — {len(changed)} changed files, {len(picks)} of {total} {prefix or ''}recipes selected"
                   + f" ({class_note})" + weekly + mac_note + lever_note)
         if nar is not None:
             for r in nar.full:
@@ -3248,11 +3272,11 @@ def cmd_affected(args: argparse.Namespace) -> int:
                 print(f"narrow:   one chain, {d.chain}")
 
         def class_rule(n: str) -> str:
-            """The class rule that kept a family pick (the common and the tooling ones have nothing to say)."""
+            """The class rule that kept a family pick, and the fast rule that kept a common one (a tooling pick has nothing to say)."""
             if stage is None or ctables is None:
                 return ""
             row = ctables.gates.get(n)
-            if row is None or row.cls != "family":
+            if row is None or (row.cls != "family" and not stage.kept[n].startswith("fast: ")):
                 return ""
             return f"  ({stage.kept[n]})"
 
@@ -3296,6 +3320,9 @@ def cmd_affected(args: argparse.Namespace) -> int:
                   "weekly and the release batch run them:")
             for n, reason in deferred:
                 print(f"  - {n}  ({reason})")
+        if owed_src is not None:
+            for line in owed_lines(real_tier_owed(picks, owed_src.rows(bool(picks))), owed_src.source):
+                print(line)
         print(f"unmapped ({len(unmapped)}):")
         for u in unmapped:
             print(f"  {u}")
@@ -3336,7 +3363,90 @@ def cmd_affected(args: argparse.Namespace) -> int:
             print(f"  {n}")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+        if owed_src is not None:
+            owed_src.close()
     return 0
+
+
+class OwedClasses:
+    """The fixture tier's class rows for `affected`'s owed block: `--classes FILE` (a saved `tools/gate-batch.sh --tier fixture
+    --classes`), else the classifier started at once and read only when a gate is selected (`rows(True)`); a run that selects
+    none stops it unread."""
+
+    def __init__(self, path: str | None, root: str):
+        self.path = path
+        self.proc: subprocess.Popen | None = None
+        self.t0 = time.monotonic()
+        self.source = f"--classes {path}" if path else "tools/gate-batch.sh --tier fixture --classes"
+        if path is None:
+            self.proc = subprocess.Popen([os.path.join(root, "tools", "gate-batch.sh"), "--tier", "fixture", "--classes"],
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=root)
+
+    def rows(self, wanted: bool) -> dict[str, tuple[str, str]] | None:
+        if not wanted:
+            return None
+        if self.path is not None:
+            try:
+                with open(self.path, encoding="utf-8") as fh:
+                    return parse_class_rows(fh.read())
+            except OSError as e:
+                raise RecipeError(f"--classes {self.path}: {e.strerror}") from e
+        assert self.proc is not None, "a classifier is started whenever no --classes file is named"
+        out, err = self.proc.communicate()
+        self.source += f", {time.monotonic() - self.t0:.0f} s"
+        if self.proc.returncode != 0:
+            raise RecipeError(f"`tools/gate-batch.sh --tier fixture --classes` failed (exit {self.proc.returncode}): {err.strip()[-300:]}"
+                              " (--no-owed skips the owed block)")
+        return parse_class_rows(out)
+
+    def close(self) -> None:
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.wait()
+
+
+def real_tier_owed(picks: Iterable[str], rows: dict[str, tuple[str, str]] | None) -> list[tuple[str, str]]:
+    """The picks a fixture-tier landing defers to the real tier, each with its kind: class D of a kind in DEFERRED_KINDS, by the
+    batch's own classifier rows (never re-implemented). Their clauses read a file the change moved and no landing runs them, so the
+    real tier owes them a run (tools/rotation.py due lists them first). A pick the rows do not name is a named error: the
+    classifier and the justfile disagree. No rows (nothing selected) is no owed gate."""
+    if rows is None:
+        return []
+    picks = list(picks)
+    missing = [n for n in picks if n not in rows]
+    if missing:
+        raise RecipeError(f"the classifier names no class for {len(missing)} selected gate(s): {' '.join(missing[:6])}")
+    return [(n, rows[n][1]) for n in picks if rows[n][0] == "D" and rows[n][1] in DEFERRED_KINDS]
+
+
+def owed_lines(owed: list[tuple[str, str]], source: str) -> list[str]:
+    """`affected`'s owed block: one `real-tier owed:` line a batch list can take (the names after the colon), then a line a gate."""
+    out = [f"real-tier owed ({len(owed)}): " + " ".join(n for n, _ in owed)]
+    if owed:
+        out.append(f"  a fixture-tier landing defers each (classes from {source}); run them in the real tier "
+                   "(`tools/gate-batch.sh --tier real --ledger ITEM…`) or leave them to `tools/rotation.py due`, which lists them first:")
+        out += [f"  - {n}  ({kind})" for n, kind in owed]
+    return out
+
+
+def owed_self_test(expect) -> None:
+    """The owed block on synthetic class rows: each deferred kind is owed, a landing class or a real-tier-only kind is not, a pick the
+    rows do not name is a named error, and the block's first line is the names a batch list takes."""
+    rows = {"gate-ro": ("D", "real-only"), "gate-rf": ("D", "real-file"), "gate-nf": ("D", "no-fixture"), "gate-env": ("D", "needs-env"),
+            "gate-land": ("F", "balanced"), "gate-var": ("D", "variant"), "gate-fx": ("D", "fixture-only"), "gate-solo": ("X", "solo")}
+    got = real_tier_owed(["gate-land", "gate-ro", "gate-var", "gate-rf", "gate-fx", "gate-nf", "gate-solo", "gate-env"], rows)
+    expect(got == [("gate-ro", "real-only"), ("gate-rf", "real-file"), ("gate-nf", "no-fixture"), ("gate-env", "needs-env")],
+           f"owed: every deferred kind in pick order, no landing gate, variant or fixture-only item: {got}")
+    expect(real_tier_owed(["gate-land"], rows) == [] and real_tier_owed([], None) == [], "owed: a landing gate alone, or no rows, owes nothing")
+    try:
+        real_tier_owed(["gate-new"], rows)
+        expect(False, "owed: a pick the classifier does not name was accepted")
+    except RecipeError as e:
+        expect("gate-new" in str(e), f"owed: the unnamed pick is named: {e}")
+    lines = owed_lines(got, "--classes x")
+    expect(lines[0] == "real-tier owed (4): gate-ro gate-rf gate-nf gate-env" and lines[-1] == "  - gate-env  (needs-env)",
+           f"owed: the names line and one line a gate: {lines}")
+    expect(owed_lines([], "x") == ["real-tier owed (0): "], f"owed: nothing owed is one line: {owed_lines([], 'x')}")
 
 
 def print_triggers(trig: list["Trigger"], width: int) -> None:
@@ -3492,6 +3602,14 @@ KEY_REACH_PINS = {
 }
 
 
+# PIN(2026-11-06): the recipes that build a shipped bin at the release feature list although the bin runs no code of the crates
+# those features link (the shipped-bin rule above forces the list): bloomery-quantize reads GGUF sets and never the hub or a
+# checkpoint folder. Each name is held to that by the recipe's own text: it must build only bloomery-quantize at the release list.
+KEY_REACH_RELEASE_LIST_ONLY = {
+    "gate-gpu-iq-quant": "bloomery-quantize (the shipped quantizer) is built at the release list and reads no hub or checkpoint code",
+}
+
+
 def _gate_recipes(side: Side) -> list[str]:
     return [n for n in sorted(side.recipes, key=lambda n: side.recipes[n].line) if n.startswith((GATE_PREFIX, WEEKLY_PREFIX))]
 
@@ -3529,7 +3647,7 @@ def key_reach_gap(side: Side, crate: str, names: list[str] | None = None) -> lis
     """The recipes whose key holds a file of `crate` while none of their targets reaches code of it. A recipe that
     builds no cargo target (a script that walks the tree) has no target to ask and is not counted."""
     held = [n for n in key_holders(side, crate, names if names is not None else _gate_recipes(side)) if side.graph.inputs(n).targets]
-    got = set(reach_holders(side, crate, held))
+    got = set(reach_holders(side, crate, held)) | set(KEY_REACH_RELEASE_LIST_ONLY)
     return [n for n in held if n not in got]
 
 
@@ -3547,7 +3665,7 @@ def cmd_gaps(args: argparse.Namespace) -> int:
         rows = []
         for c in crates:
             held = key_holders(side, c, names)
-            got = set(reach_holders(side, c, held))
+            got = set(reach_holders(side, c, held)) | set(KEY_REACH_RELEASE_LIST_ONLY)
             rows.append((len(held) - len(got), c, len(held), len(got), [n for n in held if n not in got]))
     finally:
         if tmp:
@@ -5056,7 +5174,9 @@ class Reach:
     def facts(self, rk: RootKey, f: str) -> RustFacts:
         key = (f, rk[2])
         if key not in self._facts:
-            self._facts[key] = rust_facts(self.text(f), rk[2])
+            from bloomery import reach_cache
+
+            self._facts[key] = reach_cache.facts(self, self.text(f), rk[2], rust_facts)
         return self._facts[key]
 
     def mods(self, rk: RootKey) -> dict[tuple[str, ...], str]:
@@ -6112,6 +6232,8 @@ def row_derivation(tree: Tree, graph: Graph, gates: list[str], matched: list[str
                 if t is None:
                     continue
                 own, _ = tree.tree_of(t.src, test=True)
+                # a module the recipe's features leave out of its own tree names nothing the gate runs
+                own = {f for f in own if graph.inputs(n).match(f) is not None}
                 hit = next((f for f in sorted(own) if any(names_module(named_paths(tree.read(f)), p, kids) for p, kids in paths)), None)
                 if hit:
                     named[n] = (kind, tname or "", hit, "::".join(paths[0][0]))
@@ -9163,6 +9285,31 @@ def orphan_tests(tree: Tree, recipes: dict[str, Recipe], prefixes: tuple[str, ..
     return orphans, list(dict.fromkeys(errors)), checked  # a module several targets include is read once per target
 
 
+def whole_manifest_reads(side: Side) -> list[tuple[str, str, str]]:
+    """(recipe, package manifest, why) for every recipe that reads a package manifest as a file, in the justfile's order: such a
+    recipe is selected by any edit of that manifest, a new [[bin]] included (ManifestUse.whole)."""
+    out: list[tuple[str, str, str]] = []
+    for n in side.recipes:
+        ri = side.graph.inputs(n)
+        for m in sorted(ri.manifests.whole):
+            out.append((n, m, ri.match(m) or "a manifest read whole"))
+    return out
+
+
+def cmd_whole_manifests(args: argparse.Namespace) -> int:
+    """`whole-manifests`: the recipes that read a package manifest whole, `recipe<TAB>manifest<TAB>why` a line; rc 1 when a gate-*
+    recipe is among them (its selection then follows every edit of the manifest, a new [[bin]] included)."""
+    rows = whole_manifest_reads(make_side(ROOT))
+    for n, m, why in rows:
+        print(f"{n}\t{m}\t{why}")
+    gates = sorted({n for n, _, _ in rows if n.startswith(GATE_PREFIX)})
+    if gates:
+        print(f"whole-manifests: {len(gates)} gate-* recipe(s) read a package manifest whole: {' '.join(gates[:6])}"
+              f"{' …' if len(gates) > 6 else ''}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_orphan_tests(args: argparse.Namespace) -> int:
     tree = Tree(ROOT)
     recipes = load_justfile(args.justfile or os.path.join(ROOT, "justfile"))
@@ -9225,6 +9372,10 @@ MAC_ENV = ("BLOOMERY_BOX", "BLOOMERY_CARD", "BLOOMERY_DATA", "BLOOMERY_FIXTURE_V
 # key holds its family's fixture directory only (KeyContext.fixture_dirs; the family's row of tools/fixture-dirs.tsv, the one
 # owner), as a variant's below holds its tag's, so a fixture written for one family moves no other family's key. An item whose
 # family cannot be told keeps every row of FIXTURE_ROOT: never under-keyed.
+# The roots a model directory lives under: the box's drive, and the one a model moved off it names by its full path (no link
+# stays behind). model_dir_of, MODEL_LITERAL, PROFILE_PATHS and the box-env test all read this list; FIXTURE_ROOT and
+# VARIANT_ROOT below stay under the first.
+MODEL_ROOTS = ("/models", "/data/moved/models")
 FIXTURE_ROOT = "/models/fixtures"
 # A fixture variant (tools/fixture-variants.tsv, tools/ref/ref-paths.sh): the family's fixture requantized to a tag's type map, its files
 # below VARIANT_ROOT/<tag>, beside the fixture root and not under it (ref-paths.sh moves the root to the tag's directory, and a variant
@@ -9367,10 +9518,10 @@ ANY_CARD = "BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any}"
 # The form on a tools/gpu-gate.sh call in a script, as tools/gate-batch.sh's walk reads a lane from it.
 ANY_CARD_CALL = re.compile(re.escape(ANY_CARD) + r"\s+(?:bash\s+|exec\s+)?[^\s;&|#'\"]*gpu-gate\.sh\b")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
-# A /models path as a literal: not the tail of a longer path (`tools/ref/models/x.sh`, `$HOME/models`,
+# A path under a MODEL_ROOTS root as a literal: not the tail of a longer path (`tools/ref/models/x.sh`, `$HOME/models`,
 # `${D}/models`, `$(pwd)/models`), but after a quote, `=`, a space, the `-` of a `${V:-/models/…}` default,
 # or a `\t`/`\n`/`\r` escape in a string.
-MODEL_LITERAL = re.compile(r"(?:(?<![A-Za-z0-9._+/~})])|(?<=\\[tnr]))/models/[A-Za-z0-9._+-]+(?:/[A-Za-z0-9._+-]+)*")
+MODEL_LITERAL = re.compile(r"(?:(?<![A-Za-z0-9._+/~})])|(?<=\\[tnr]))(?:" + "|".join(re.escape(r) for r in sorted(MODEL_ROOTS, key=len, reverse=True)) + r")/[A-Za-z0-9._+-]+(?:/[A-Za-z0-9._+-]+)*")
 # The files both sides read for model literals: the box manifest's model_dirs() and an item's key.
 MODEL_SCAN_EXT = (".rs", ".sh", ".py", ".toml", ".tsv")
 
@@ -9380,12 +9531,13 @@ def scans_for_models(rel: str) -> bool:
 
 
 def model_dir_of(path: str) -> str | None:
-    """The model directory /models/<name> a /models path lies in; None for /models itself or a path
-    outside it (a literal naming a file right under /models is its own entry)."""
-    f = path.split("/")
-    if len(f) < 3 or f[:2] != ["", "models"] or not f[2]:
-        return None
-    return "/".join(f[:3])
+    """The model directory <root>/<name> (root one of MODEL_ROOTS) a path lies in; None for a root itself or a path
+    outside every root (a literal naming a file right under a root is its own entry)."""
+    for root in MODEL_ROOTS:
+        if path.startswith(root + "/"):
+            name = path[len(root) + 1:].split("/", 1)[0]
+            return f"{root}/{name}" if name else None
+    return None
 
 
 def model_literal_dirs(text: str) -> set[str]:
@@ -10128,9 +10280,13 @@ def part_id(line: str) -> tuple[str, ...]:
 class KeyContext:
     """Keys for the items of one batch: one tree, one box manifest, one caller environment."""
 
-    def __init__(self, side: Side, manifest_path: str | None, box_env: str = "", environ: dict[str, str] | None = None, manifest_error: str | None = None, settings: dict | None = None):
+    def __init__(self, side: Side, manifest_path: str | None, box_env: str = "", environ: dict[str, str] | None = None, manifest_error: str | None = None, settings: dict | None = None, files_only: bool = False):
         self.side = side
         self.box_env = box_env
+        # files_only: `parts` stops after the file and global parts, which need no box manifest (`key --files`); `blind_files` then
+        # holds the ones among them whose digest left out a member's own version.
+        self.files_only = files_only
+        self.blind_files: set[str] = set()
         env = dict(os.environ) if environ is None else environ
         self.env = env
         self.mac = [f"mac-env\t{v}\t{tier_of([], env.get(v)) if v == 'BLOOMERY_TIER' else env[v] if v in env else '<unset>'}" for v in MAC_ENV]
@@ -10367,7 +10523,7 @@ class KeyContext:
         data = self.manifest_head.get("data", "")
         for e in self.box_env.split():
             k, _, v = e.partition("=")
-            if v.startswith("/") and not v.startswith("/models/") and not (data and (v == data or v.startswith(data.rstrip("/") + "/"))):
+            if v.startswith("/") and not v.startswith(tuple(r + "/" for r in MODEL_ROOTS)) and not (data and (v == data or v.startswith(data.rstrip("/") + "/"))):
                 return f"BLOOMERY_BOX_ENV's {k}={v} names a path the box manifest does not read"
         return None
 
@@ -10388,7 +10544,7 @@ class KeyContext:
             argv = shlex.split(args) if args else []
         except ValueError as err:
             return [], f"ARGS {args!r}: {err}", None, ""
-        if self.manifest_error:
+        if self.manifest_error and not self.files_only:
             return [], self.manifest_error, None, ""
         try:
             ri = graph.key_inputs(name)
@@ -10462,6 +10618,7 @@ class KeyContext:
         # reads are not modeled, and a file the item names or walks is read as data: those keep every byte.
         reader = self.version_read(files) if scope == "closure" else None
         blind = scope == "closure" and reader is None
+        self.blind_files = set()
         for rel in sorted(files):
             # a package manifest the closure reads by table is keyed on that view (manifest_view, the reader
             # selection uses); one read whole, named by the item, or in a tree-scoped key, on its bytes
@@ -10469,14 +10626,23 @@ class KeyContext:
             own = blind and rel in tree.manifest_paths and rel not in named
             try:
                 if wants is None:
-                    parts.append(self.file_part(rel, own and not any(rel.startswith(d) for d in ri.prefixes)))
+                    left_out = own and not any(rel.startswith(d) for d in ri.prefixes)
+                    parts.append(self.file_part(rel, left_out))
                 else:
+                    left_out = own
                     parts.append(self.view_part(rel, wants, own))
+                if left_out:
+                    self.blind_files.add(rel)
             except OSError as err:
                 return [], f"cannot read {rel}: {err.strerror}", None, ""
             except RecipeError as err:
                 return [], str(err), None, ""
-        parts += self.globals(blind and "Cargo.lock" not in named)
+        lock_blind = blind and "Cargo.lock" not in named
+        parts += self.globals(lock_blind)
+        if lock_blind and any(p.startswith("global\tCargo.lock\t") and not p.endswith("\tabsent") for p in parts):
+            self.blind_files.add("Cargo.lock")
+        if self.files_only:
+            return parts, None, never, ""
         card = "none"
         for e in eff:
             k, _, v = e.partition("=")
@@ -10545,7 +10711,7 @@ class LedgerRecord:
 
 class Ledger:
     """The green ledger, read-only here: `key recipe item commit date tree`, appended by gate-batch.sh.
-    `src` names whose runner wrote it: `lead` (gate-batch.sh --ledger) or `round` (--round-ledger)."""
+    `src` names whose runner wrote it: `lead` (gate-batch.sh --ledger), `round` (--round-ledger) or `fast` (--fast-ledger)."""
 
     def __init__(self, path: str, src: str = "lead"):
         self.path = path
@@ -10608,14 +10774,44 @@ def ledger_status(key: str, name: str, item: str, parts: list[str], ledgers: lis
     return "run", f"no green record of {name}"
 
 
+def key_input_files(ctx: KeyContext, item: str) -> list[tuple[str, bool]]:
+    """The tree files `item`'s key reads, as (path, blind): the file, link and manifest parts and the global parts that name a
+    file, in the key's order. `blind` marks one whose digest leaves out a workspace member's own version (a commit that changes
+    only that value moved nothing). `ctx` is files_only: no box manifest is needed. A named RecipeError when the key has no parts."""
+    parts, err, _, _ = ctx.parts(item)
+    if err is not None:
+        raise RecipeError(err)
+    out: list[tuple[str, bool]] = []
+    for part in parts:
+        f = part.split("\t")
+        if f[0] in ("file", "link", "manifest") or (f[0] == "global" and f[1] != "oxide-rev" and f[2] != "absent"):
+            out.append((f[1], f[1] in ctx.blind_files))
+    return out
+
+
+def cmd_key_files(args: argparse.Namespace) -> int:
+    """`key --files ITEM`: the files the item's key reads, one path a line, a member-version-blind one followed by a tab and
+    `blind` (key_input_files). It reads no manifest, ledger or box."""
+    if len(args.items) != 1:
+        raise RecipeError("--files takes exactly one ITEM")
+    ctx = KeyContext(make_side(ROOT), None, args.box_env or "", files_only=True)
+    for rel, blind in key_input_files(ctx, args.items[0]):
+        print(f"{rel}\tblind" if blind else rel)
+    return 0
+
+
 def cmd_key(args: argparse.Namespace) -> int:
+    if args.files:
+        return cmd_key_files(args)
     side = make_side(ROOT)
     ctx = KeyContext(side, args.manifest, args.box_env or "", manifest_error=args.manifest_error)
-    if args.round_ledger and not args.ledger:
-        raise RecipeError("--round-ledger reads a second ledger beside --ledger; give --ledger too")
+    if (args.round_ledger or args.fast_ledger) and not args.ledger:
+        raise RecipeError("--round-ledger and --fast-ledger read a ledger beside --ledger; give --ledger too")
     ledgers = [Ledger(args.ledger)] if args.ledger else []
     if args.round_ledger:
         ledgers.append(Ledger(args.round_ledger, "round"))
+    if args.fast_ledger:
+        ledgers.append(Ledger(args.fast_ledger, "fast"))
     for led in ledgers:
         if led.bad:
             print(f"recipes.py key: {led.path}: {led.bad} malformed line(s) ignored (they cannot skip an item)", file=sys.stderr)
@@ -10823,7 +11019,8 @@ def data_manifest(root: str, cache: HashCache, workers: int) -> tuple[list[tuple
     return lines, sum(files.values())
 
 
-PROFILE_PATHS = 'unset BLOOMERY_REF_MODEL; source "$1" > /dev/null || exit 3; for v in $(compgen -v); do case "${!v}" in /models/*) printf "%s\\n" "${!v}" ;; esac; done'
+PROFILE_PATHS = ('unset BLOOMERY_REF_MODEL; source "$1" > /dev/null || exit 3; for v in $(compgen -v); do case "${!v}" in '
+                 + "|".join(r + "/*" for r in MODEL_ROOTS) + ') printf "%s\\n" "${!v}" ;; esac; done')
 
 
 def profile_dirs(root: str, prof: str, env: dict[str, str]) -> set[str]:
@@ -12483,11 +12680,23 @@ def key_detectors_self_test(expect, real: Side) -> None:
         expect(hit is None, f"the walk detector flags {hit}: every gate that runs it would be keyed on the whole tree")
 
 
-def key_self_test(expect, real: Side, section: str | None = None) -> None:
-    """Independent key contracts, each on its own scratch tree and manifest."""
+# The key contracts' pieces, in the order key_self_test runs them. A piece is independent of the others when it has a scratch tree and
+# manifest of its own: a call builds one and runs the pieces it is given on it, so they share its cold start (the first key of a fresh
+# tree reads the whole source corpus). Which pieces share a call is KEY_JOBS; all eight in one call is not a supported shape (its second
+# `inputs` block, which then runs after the `globals` ones, fails).
+KEY_PIECES = ("inputs", "globals.loop", "globals.member", "globals.bump", "globals.files", "fixtures", "variants", "scope")
+
+
+def key_self_test(expect, pieces: tuple[str, ...]) -> None:
+    """The key contracts of the given KEY_PIECES, on one scratch tree and manifest."""
     from unittest.mock import patch
 
-    assert section in (None, "inputs", "globals", "fixtures", "variants", "scope"), section
+    assert set(pieces) <= set(KEY_PIECES), pieces
+
+    def want(piece: str) -> bool:
+        assert piece in KEY_PIECES, piece
+        return piece in pieces
+
     meta = cargo_metadata(ROOT)
     settings = justfile_settings(os.path.join(ROOT, "justfile"))
     with tempfile.TemporaryDirectory(prefix="recipes-keytest-") as tmp, patch.dict(os.environ, {"HOME": tmp}):
@@ -12565,7 +12774,7 @@ def key_self_test(expect, real: Side, section: str | None = None) -> None:
         fx_file = f"model\t{FIXTURE_ROOT}/qwen38/q-00001-of-00001.gguf\t100\t1\t2\t3"
         fixture_free = [ln for ln in manifest[:-1] if not ln.startswith(f"model-dir\t{FIXTURE_ROOT}\t")]
 
-        if section is None or section == "inputs":
+        if want("inputs"):
             expect(keys(sa) == base, "the same inputs gave another key")
             # The same tree at a second absolute path: the copy renamed there and back (a symlink would not
             # do — Tree takes the realpath).
@@ -12586,53 +12795,79 @@ def key_self_test(expect, real: Side, section: str | None = None) -> None:
             cpu_lib = sorted(f for f in sa.graph.inputs("gate-sampler").files if f.startswith("crates/sampler/src/"))
             m = edit(cpu_lib[0], append("\n// key probe\n"))
             expect({"cpu", "mac", "fmt"} <= m and "gpu" not in m, f"{cpu_lib[0]} moves {sorted(m)}")
-        if section is None or section == "globals":
+        if want("globals.loop"):
             for g in KEY_GLOBALS:
                 m = edit(g, append("\n# key probe\n"))
                 expect(m == set(items), f"{g} moves {sorted(m)}, not every key")
-            # A workspace member's own version (its `[package]` table, its `[[package]]` entry in Cargo.lock) is a label no gate reads: a
-            # release's bump moves no key of an item whose reads are modeled and that reads no version out of a manifest, and the
-            # whole-tree keys (their reads are not modeled) still move. Any other edit of the same files moves every key, as the probes
-            # above. Added 2026-11-03 (relkey, after the 0.3.12 bump re-keyed all 212 items of the release batch); FAIL-first: on the
-            # code before it, the first clause below fails (every key moves).
-            def with_edits(edits: list[tuple[str, Callable[[str], str]]], fn):
-                saved: dict[str, str] = {}
-                try:
-                    for rel, change in edits:
-                        with open(os.path.join(roots[0], rel), encoding="utf-8") as fh:
-                            saved[rel] = fh.read()
-                        changed = change(saved[rel])
-                        expect(changed != saved[rel], f"the probe edit of {rel} changed nothing")
-                        with open(os.path.join(roots[0], rel), "w", encoding="utf-8") as fh:
-                            fh.write(changed)
-                    return fn()
-                finally:
-                    for rel, text in saved.items():
-                        with open(os.path.join(roots[0], rel), "w", encoding="utf-8") as fh:
-                            fh.write(text)
+        # A workspace member's own version (its `[package]` table, its `[[package]]` entry in Cargo.lock) is a label no gate reads: a
+        # release's bump moves no key of an item whose reads are modeled and that reads no version out of a manifest, and the
+        # whole-tree keys (their reads are not modeled) still move. Any other edit of the same files moves every key, as the probes
+        # above. Added 2026-11-03 (relkey, after the 0.3.12 bump re-keyed all 212 items of the release batch); FAIL-first: on the
+        # code before it, the first clause below fails (every key moves).
+        def with_edits(edits: list[tuple[str, Callable[[str], str]]], fn):
+            saved: dict[str, str] = {}
+            try:
+                for rel, change in edits:
+                    with open(os.path.join(roots[0], rel), encoding="utf-8") as fh:
+                        saved[rel] = fh.read()
+                    changed = change(saved[rel])
+                    expect(changed != saved[rel], f"the probe edit of {rel} changed nothing")
+                    with open(os.path.join(roots[0], rel), "w", encoding="utf-8") as fh:
+                        fh.write(changed)
+                return fn()
+            finally:
+                for rel, text in saved.items():
+                    with open(os.path.join(roots[0], rel), "w", encoding="utf-8") as fh:
+                        fh.write(text)
 
-            bump_toml = lambda t: re.sub(r'(?m)^version = "([^"]*)"', r'version = "\1-probe"', t, count=1)  # noqa: E731
-            bump_lock = lambda t: re.sub(r'(?m)^(name = "bloomery-gpu-gates"\nversion = "[^"]*)"', r'\1-probe"', t, count=1)  # noqa: E731
-            bump_ext = lambda t: re.sub(r'(?m)^(name = "[^"]*"\nversion = "[^"]*)("\nsource = )', r'\1-probe\2', t, count=1)  # noqa: E731
-            drop_dep = lambda t: re.sub(r'(?m)^(name = "bloomery-gpu-gates"\nversion = "[^"]*"\ndependencies = \[\n) "[^"]*",\n', r'\1', t, count=1)  # noqa: E731
-            read_version = lambda t: t + "\nsed -n 's/^version = \"\\(.*\\)\"/\\1/p' crates/gpu-gates/Cargo.toml\n"  # noqa: E731
-            modeled = {k: items[k] for k in ("gpu", "cpu", "args")}  # the items whose reads are modeled (the closure scope)
-            member = [("crates/gpu-gates/Cargo.toml", bump_toml), ("Cargo.lock", bump_lock)]
+        bump_toml = lambda t: re.sub(r'(?m)^version = "([^"]*)"', r'version = "\1-probe"', t, count=1)  # noqa: E731
+        bump_lock = lambda t: re.sub(r'(?m)^(name = "bloomery-gpu-gates"\nversion = "[^"]*)"', r'\1-probe"', t, count=1)  # noqa: E731
+        bump_ext = lambda t: re.sub(r'(?m)^(name = "[^"]*"\nversion = "[^"]*)("\nsource = )', r'\1-probe\2', t, count=1)  # noqa: E731
+        drop_dep = lambda t: re.sub(r'(?m)^(name = "bloomery-gpu-gates"\nversion = "[^"]*"\ndependencies = \[\n) "[^"]*",\n', r'\1', t, count=1)  # noqa: E731
+        read_version = lambda t: t + "\nsed -n 's/^version = \"\\(.*\\)\"/\\1/p' crates/gpu-gates/Cargo.toml\n"  # noqa: E731
+        modeled = {k: items[k] for k in ("gpu", "cpu", "args")}  # the items whose reads are modeled (the closure scope)
+        member = [("crates/gpu-gates/Cargo.toml", bump_toml), ("Cargo.lock", bump_lock)]
+        if want("globals.member"):
             m = with_edits(member, lambda: moved(keys(sa)))
             expect(m == {"mac", "fmt"}, f"a workspace member's version bump (manifest and lock) moves {sorted(m)}, not only the whole-tree keys")
             for edit_one in member:
                 m = with_edits([edit_one], lambda: moved(keys(sa, only=modeled)))
                 expect(not m, f"a workspace member's version bump in {edit_one[0]} alone moves {sorted(m)}")
-            for what, edits in (("a dependency's version in Cargo.lock", [("Cargo.lock", bump_ext)]),
-                                ("a dependency's version beside the member's", member + [("Cargo.lock", bump_ext)]),
-                                ("a member entry's dependency list in Cargo.lock", member + [("Cargo.lock", drop_dep)]),
-                                ("another edit of the member's manifest beside its version", member + [("crates/gpu-gates/Cargo.toml", lambda t: t.replace("publish = false", "publish = true", 1))])):
+        if want("globals.bump"):
+            # the manifest edit moves the keys that read crates/gpu-gates/Cargo.toml: the gpu item builds that package and the args item's
+            # script reads the file; the cpu item's closure holds no box.sh case arm that names a script reading it (tools/box.sh spells that
+            # list so the script closure does not follow it), so it stays
+            for what, edits, want_moved in (("a dependency's version in Cargo.lock", [("Cargo.lock", bump_ext)], set(modeled)),
+                                            ("a dependency's version beside the member's", member + [("Cargo.lock", bump_ext)], set(modeled)),
+                                            ("a member entry's dependency list in Cargo.lock", member + [("Cargo.lock", drop_dep)], set(modeled)),
+                                            ("another edit of the member's manifest beside its version",
+                                             member + [("crates/gpu-gates/Cargo.toml", lambda t: t.replace("publish = false", "publish = true", 1))], {"gpu", "args"})):
                 m = with_edits(edits, lambda: moved(keys(sa, only=modeled)))
-                expect(m == set(modeled), f"{what} moves {sorted(m)}, not every key")
+                expect(m == want_moved, f"{what} moves {sorted(m)}, not {sorted(want_moved)}")
             # an item with an input that reads a version out of a manifest keeps it: the key with that reader in the tree moves with the bump
             with_reader = with_edits([("tools/gpu-gate.sh", read_version)], lambda: keys(sa, only=modeled))
             m = with_edits([("tools/gpu-gate.sh", read_version)] + member, lambda: {k for k, v in keys(sa, only=modeled).items() if v != with_reader[k]})
             expect(m == set(modeled), f"a script that reads a manifest's version: the bump moves {sorted(m)}, not every key")
+        if want("globals.files"):
+            # `key --files` (tools/gate-batch.sh's red-line attribution): the files an item's key reads, from no box manifest, the global parts
+            # that name a file included, and a member's manifest and the lock marked blind where their digest leaves out its version. Added
+            # 2026-11-03 (rf-follow); FAIL-first: on the code before it there is no files_only (KeyContext takes no such argument), and with the
+            # blind mark dropped the third clause fails.
+            def files_of(item: str) -> dict[str, bool]:
+                return dict(key_input_files(KeyContext(sa, None, "", {}, settings=settings, files_only=True), item))
+
+            gf, cf = files_of(items["gpu"]), files_of(items["cpu"])
+            gate_src = "crates/gpu-gates/src/bin/gate_q4k_sel.rs"
+            expect(gf.get(gate_src) is False and gate_src not in cf, f"key --files: the gate's own source is {gf.get(gate_src)} for the gate and {cf.get(gate_src)} for the CPU item")
+            expect("oxide-rev" not in gf and all(g in gf for g in KEY_GLOBALS), f"key --files: the global parts that name a file are not all listed: {sorted(g for g in KEY_GLOBALS if g not in gf)}")
+            expect(gf.get("crates/gpu-gates/Cargo.toml") is True and gf.get("Cargo.lock") is True and gf.get("Cargo.toml") is False,
+                   f"key --files: a member's manifest and the lock are blind, the workspace manifest is not: {[gf.get(k) for k in ('crates/gpu-gates/Cargo.toml', 'Cargo.lock', 'Cargo.toml')]}")
+            full_parts = KeyContext(sa, mf, "", {}, settings=settings).parts(items["gpu"])[0]
+            expect(set(gf) == {x.split("\t")[1] for x in full_parts if x.split("\t")[0] in ("file", "link", "manifest") or (x.startswith("global\t") and x.split("\t")[1] != "oxide-rev")},
+                   "key --files: the files are not the key's file, link, manifest and global parts")
+            with_reader_files = with_edits([("tools/gpu-gate.sh", read_version)], lambda: files_of(items["gpu"]))
+            expect(not any(with_reader_files.values()), f"key --files: an item with an input that reads a version marks {sorted(k for k, v in with_reader_files.items() if v)} blind")
+            expect(files_of(items["mac"]).get("Cargo.lock") is False and len(files_of(items["mac"])) > len(gf), "key --files: a whole-tree item keeps every byte: no file blind, every tree file listed")
             # an item that names the lock reads it as a file: its version is part of what the item reads
             named_lock = "gate-gpu-q4k-sel@BLOOMERY_GATE_CARD=3090:./Cargo.lock"
             expect(with_edits([("Cargo.lock", bump_lock)], lambda: one(named_lock)) != one(named_lock), "an item that names Cargo.lock is blind to a member's version in it")
@@ -12658,7 +12893,7 @@ def key_self_test(expect, real: Side, section: str | None = None) -> None:
             reads = lambda line: VERSION_READ.search(line) is not None  # noqa: E731
             expect(reads("v=$(sed -n 's/^version = \"\\(.*\\)\"/\\1/p' \"crates/$c/Cargo.toml\")") and reads("grep version Cargo.lock"), "VERSION_READ: a line that reads a version out of a manifest is not one")
             expect(not reads('meta=$(cargo metadata --format-version 1 --manifest-path "$ROOT/Cargo.toml")') and not reads("banner: LLVM version 21") and not reads("$ROOT/Cargo.toml"), "VERSION_READ: a line that names no version read is one")
-        if section is None or section == "inputs":
+        if want("inputs"):
             m = edit("justfile", append("\n# key probe\n"), side_fresh=True)
             expect(m == {"mac", "fmt"}, f"a justfile comment moves {sorted(m)}")
             m = edit("justfile", lambda s: s.replace("bash tools/gpu-gate.sh gate_q4k_sel'", "bash tools/gpu-gate.sh gate_q4k_sel '", 1), side_fresh=True)
@@ -12692,7 +12927,7 @@ def key_self_test(expect, real: Side, section: str | None = None) -> None:
                 st_real, _ = ledger_status(k_real, "gate-gpu-q4k-sel", items["gpu"], [], [Ledger(lp)])
                 st_fix, _ = ledger_status(k_fix, "gate-gpu-q4k-sel", items["gpu"], [], [Ledger(lp)])
             expect(st_real == "run" and st_fix == "skip", f"a fixture-tier green and the ledger: the real item {st_real}, the fixture one {st_fix}")
-        if section is None or section == "fixtures":
+        if want("fixtures"):
             # The fixture directory's rows belong to the fixture tier's keys alone: a real key does not move with them, a fixture key
             # does, and the row of a file inside a family's directory is one (the manifest lists below a subdirectory there).
             # PIN(2026-10-13): re-pinned, not loosened — a key holds its family's fixture directory (KeyContext.fixture_dirs), so a
@@ -12828,7 +13063,7 @@ def key_self_test(expect, real: Side, section: str | None = None) -> None:
             expect(fam_keys(fx_rows(sizes)) == kf, f"{FIXTURE_DIRS} restored keys another way")
             write_manifest(manifest)
             expect(keys(sa) == base, "the base manifest, restored after the family clauses, keys another way")
-        if section is None or section == "variants":
+        if want("variants"):
             # A fixture variant's files (VARIANT_ROOT, beside FIXTURE_ROOT) belong to the keys of the items that run under its tag: no other
             # item's key moves with them, an item under the tag moves with its own directory's rows and its table row, and not with another tag's.
             vdirs = lambda tag: [f"model\t{VARIANT_ROOT}/{tag}\tdir", f"model\t{VARIANT_ROOT}/{tag}/glm5next\tdir"]  # noqa: E731
@@ -12879,7 +13114,7 @@ def key_self_test(expect, real: Side, section: str | None = None) -> None:
                     fh.write(vtable_old)
                 write_manifest(manifest)
             expect(keys(sa) == base, "the base manifest, restored after the variant clauses, keys another way")
-        if section is None or section == "scope":
+        if want("scope"):
             for i in range(1, nfixed - 1):
                 mut = list(manifest)
                 mut[i] = mut[i] + "x"
@@ -12982,6 +13217,41 @@ def key_self_test(expect, real: Side, section: str | None = None) -> None:
                 expect("/mod" "els/Dyn" in str(err), f"the dynamic profile's error does not name the directory: {err}")
             finally:
                 os.remove(dyn)
+            # A model moved off the box's drive is named by its full path under the second root: the profile that defines it
+            # yields that directory, and its manifest row reaches the key of an item that runs under the profile. Spelled in
+            # pieces, so that this file's own text names no directory a box manifest would list.
+            moved = "/da" "ta/moved/mod" "els/ZzMoved"
+            mprof = os.path.join(roots[0], "tools/ref/models/zz-moved.sh")
+            with open(mprof, "w", encoding="utf-8") as fh:
+                fh.write(f"MODEL={moved}/x.gguf\n")
+            try:
+                expect(profile_dirs(roots[0], "tools/ref/models/zz-moved.sh", penv) == {moved},
+                       f"a profile defining {moved}/x.gguf did not yield {moved}: {profile_dirs(roots[0], 'tools/ref/models/zz-moved.sh', penv)}")
+                expect(model_dir_of(moved) == moved and model_dir_of(moved + "/x.gguf") == moved and model_dir_of(os.path.dirname(moved)) is None
+                       and model_dir_of("/da" "ta/moved/other/x") is None, "model_dir_of: the second root's directory, its root or a path under neither")
+                with_row = manifest[:-1] + [f"model\t{moved}/x.gguf\t1\t2\t3\t4", "# end"]
+                without = manifest[:-1] + [f"model-dir\t{moved}\tabsent", "# end"]
+
+                def moved_parts(lines: list[str]) -> list[str]:
+                    write_manifest(lines)
+                    ps, err, _, _ = KeyContext(sa, mf, "", {"BLOOMERY_MODEL": "zz-moved"}, settings=settings).parts(items["gpu"])
+                    expect(err is None, f"the item under the moved profile: {err}")
+                    return ps
+
+                held, absent = moved_parts(with_row), moved_parts(without)
+                expect(any(f"{moved}/x.gguf" in x for x in held), f"the moved directory's model row is not in the key of an item under its profile: {held[-3:]}")
+                expect(item_key(held) != item_key(absent), "a file appearing under the moved directory did not move the key of an item under its profile")
+
+                def plain_key(lines: list[str]) -> str:
+                    write_manifest(lines)
+                    ps, err, _, _ = KeyContext(sa, mf, "", {}, settings=settings).parts(items["gpu"])
+                    expect(err is None, f"the item outside the moved profile: {err}")
+                    return item_key(ps)
+
+                expect(plain_key(with_row) == plain_key(without), "a file appearing under the moved directory moved the key of an item that does not open it")
+            finally:
+                os.remove(mprof)
+                write_manifest(manifest)
 
 
 def model_scope_self_test(expect, root: str, side: Side, settings: dict, manifest: list[str], mf: str) -> None:
@@ -13313,6 +13583,14 @@ def ledger_self_test(expect) -> None:
         expect(st == "skip" and "src=lead" in det, f"a key in both skips on the lead's: {st} {det}")
         st, det = ledger_status(k_round, "gate-y", "gate-y", [], leds[:1])
         expect(st == "run", f"the lead ledger alone must not skip a round's green: {st} {det}")
+        fastf = os.path.join(d, "fast.tsv")
+        with open(fastf, "w") as fh:
+            fh.write(f"{k_none}\tgate-q\tgate-q\tc3\t2026-11-08T09:00:00+0900\t/t/fast\n")
+        fled = [*leds, Ledger(fastf, "fast")]
+        st, det = ledger_status(k_none, "gate-q", "gate-q", [], fled)
+        expect(st == "skip" and det.split(" tree=")[0].endswith("src=fast"), f"a fast ledger's green skips as src=fast: {st} {det}")
+        st, det = ledger_status(k_none, "gate-q", "gate-q", [], leds)
+        expect(st == "run", f"the lead's and the rounds' ledgers alone must not skip a fast green: {st} {det}")
         st, det = ledger_status(k_none, "gate-q", "gate-q", [], leds)
         expect(st == "run" and "no green record of gate-q" in det, f"unknown item: {st} {det}")
         st, det = ledger_status(k_none, "gate-y", "gate-y", [], leds)
@@ -14837,10 +15115,11 @@ def _expecting(fails: list[str]) -> Callable[[bool, str], None]:
     return expect
 
 
-def _forked(jobs: list[tuple[str, Callable[[list[str]], None]]], serial: bool = False) -> tuple[list[str], list[tuple[str, float]]]:
+def _forked(jobs: list[tuple[str, Callable[[list[str]], None]]], serial: bool = False, limit: int = 0) -> tuple[list[str], list[tuple[str, float]]]:
     """The failures of every job, in job order, and each job's wall seconds. Each job runs in a forked child of this process (`serial`: in this one), so
     the parsed real tree is shared copy-on-write while each job's temp directories, environment and working directory stay
-    its own. A job that raises reports its traceback as a failure; a child that ends without a report is a failure naming it."""
+    its own. `limit`: at most that many children at once (0: all at once; 1: one after another, each still in a child of its own). A job that raises
+    reports its traceback as a failure; a child that ends without a report is a failure naming it."""
     import multiprocessing
     import traceback
 
@@ -14862,8 +15141,22 @@ def _forked(jobs: list[tuple[str, Callable[[list[str]], None]]], serial: bool = 
             times.append((name, secs))
         return out, times
     ctx = multiprocessing.get_context("fork")
-    started = []
+
+    def collect(entry) -> None:
+        name, proc, recv = entry
+        try:
+            got, secs = recv.recv()
+            out.extend(got)
+            times.append((name, secs))
+        except EOFError:
+            proc.join()
+            out.append(f"{name}: its process ended without a report (exit code {proc.exitcode})")
+        proc.join()
+
+    started: list = []
     for name, job in jobs:
+        if limit and len(started) >= limit:
+            collect(started.pop(0))
         recv, send = ctx.Pipe(duplex=False)
 
         def child(name: str = name, job: Callable[[list[str]], None] = job, send=send) -> None:
@@ -14874,15 +15167,8 @@ def _forked(jobs: list[tuple[str, Callable[[list[str]], None]]], serial: bool = 
         proc.start()
         send.close()
         started.append((name, proc, recv))
-    for name, proc, recv in started:
-        try:
-            got, secs = recv.recv()
-            out.extend(got)
-            times.append((name, secs))
-        except EOFError:
-            proc.join()
-            out.append(f"{name}: its process ended without a report (exit code {proc.exitcode})")
-        proc.join()
+    for entry in started:
+        collect(entry)
     return out, times
 
 
@@ -15230,10 +15516,12 @@ def _st_real_tree(fails: list[str], side: Side) -> None:
     # PIN(2026-10-23): gate-gpu-minimaxm3-twocard and gate-gpu-musespark-twocard join them; each runs its serve gate, which builds bloomery-serve.
     # PIN(2026-10-26): gate-gpu-llama-serve joins them; its recipe builds bloomery-serve beside its own bin.
     # PIN(2026-11-02): gate-gpu-mistrallarge4-serve joins them; its recipe builds bloomery-serve beside its own bin.
+    # PIN(2026-11-04): gate-host-serve joins them; its recipe builds bloomery-serve for the host seat beside its own bin.
+    # PIN(2026-11-06): gate-gpu-kimik3-serve joins them; its recipe builds bloomery-serve beside its own bin, whose K3 seat names the module.
     expect(dspark == {"gate-gpu-clef-serve", "gate-gpu-ds41-chat", "gate-gpu-ds41-draft", "gate-gpu-ds41-dspark-loop",
-                      "gate-gpu-ds41-prefill", "gate-gpu-ds41-tier", "gate-gpu-ds41-twocard", "gate-gpu-gemma-embedding-serve", "gate-gpu-gemma-embedding2-serve", "gate-gpu-glm5next-serve",
-                      "gate-gpu-lev-serve", "gate-gpu-llama-serve", "gate-gpu-minimaxm3-serve", "gate-gpu-minimaxm3-twocard", "gate-gpu-mistrallarge4-serve", "gate-gpu-musespark-serve", "gate-gpu-musespark-twocard", "gate-gpu-nemotron-h-moe-serve", "gate-gpu-nemotron-serve",
-                      "gate-gpu-qwen3-dspark", "gate-gpu-qwen3-serve", "gate-gpu-qwen38-media", "gate-gpu-serve-start-ds41", "gate-gpu-serve-start-glm", "gate-gpu-solar2-serve", "gate-ptx-spill", "gate-serve-draft-rules"},
+                      "gate-gpu-ds41-engram-layout", "gate-gpu-ds41-prefill", "gate-gpu-ds41-tier", "gate-gpu-ds41-twocard", "gate-gpu-gemma-embedding-serve", "gate-gpu-gemma-embedding2-serve", "gate-gpu-glm5next-serve",
+                      "gate-gpu-kimik3-serve", "gate-gpu-lev-serve", "gate-gpu-llama-serve", "gate-gpu-minimaxm3-serve", "gate-gpu-minimaxm3-twocard", "gate-gpu-mistrallarge4-serve", "gate-gpu-musespark-serve", "gate-gpu-musespark-twocard", "gate-gpu-nemotron-h-moe-serve", "gate-gpu-nemotron-serve",
+                      "gate-gpu-qwen3-dspark", "gate-gpu-qwen3-serve", "gate-gpu-qwen38-media", "gate-gpu-serve-start-ds41", "gate-gpu-serve-start-glm", "gate-gpu-solar2-serve", "gate-host-serve", "gate-ptx-spill", "gate-serve-draft-rules"},
            f"shared/ds41_dspark.rs (a #[path] module of the bins that name it) selects {sorted(dspark)}")
     hybrid = sel("crates/gpu/src/hybrid.rs")
     expect("gate-gpu-e2e" in hybrid and "gate-ops" not in hybrid and len(hybrid) < len(gates) - 20,
@@ -15262,7 +15550,7 @@ def _st_real_tree(fails: list[str], side: Side) -> None:
     # PIN(2026-10-20): gate-q38-serve-rules also runs the lib's serve_client tests and record schema includes.
     # PIN(2026-10-23): gate-gpu-rope-writers compiles the lib tests and their record schema includes.
     # PIN(2026-10-26): gate-gpu-llama-dense compiles the lib tests (its kv_planes:: clause) and their record schema includes.
-    expect(schema == {"gate-gpu-gates-lib", "gate-gpu-llama-dense", "gate-gpu-rope-writers", "gate-ds41-oracle", "gate-ds41-kld", "gate-ds41-bind", "gate-ds41-place", "gate-q38-serve-rules", "weekly-gpu-ds41-flowcounts"}, f"a record schema selects {sorted(schema)}")
+    expect(schema == {"gate-gpu-ds41-engram-layout", "gate-gpu-gates-lib", "gate-gpu-llama-dense", "gate-gpu-rope-writers", "gate-ds41-oracle", "gate-ds41-kld", "gate-ds41-bind", "gate-ds41-place", "gate-q38-serve-rules", "weekly-gpu-ds41-flowcounts"}, f"a record schema selects {sorted(schema)}")
     flow = graph.inputs("weekly-gpu-ds41-flowcounts")
     expect(flow.match("tools/bloomery/hf.py") is None, "flowcounts must not key the unrelated hub reader through self-test prose")
     for path in ("tools/bloomery/records.py", "tools/flow/routes.py", "tools/gpu-ab.py", "tools/ref/tdist.py"):
@@ -15522,7 +15810,7 @@ def _st_host_crates(fails: list[str], side: Side) -> None:
     # PIN(2026-10-29): qdot joined: its threads dependency's sysfs sibling lookup is Linux-only;
     # `cargo test -p bloomery-qdot` passes natively on macOS, replacing its threads rejection below.
     expect(
-        pure_now == ["bloomery-decision", "bloomery-device", "bloomery-embed", "bloomery-gguf", "bloomery-hf", "bloomery-jinja", "bloomery-levers", "bloomery-models", "bloomery-os", "bloomery-placement", "bloomery-qdot", "bloomery-record", "bloomery-refset", "bloomery-runtime", "bloomery-safetensors", "bloomery-sampler", "bloomery-serve", "bloomery-tokenizer", "bloomery-verbs", "bloomery-vision"],
+        pure_now == ["bloomery-decision", "bloomery-device", "bloomery-embed", "bloomery-gguf", "bloomery-hf", "bloomery-jinja", "bloomery-levers", "bloomery-models", "bloomery-os", "bloomery-placement", "bloomery-qdot", "bloomery-quantize", "bloomery-record", "bloomery-refset", "bloomery-runtime", "bloomery-safetensors", "bloomery-sampler", "bloomery-serve", "bloomery-tokenizer", "bloomery-verbs", "bloomery-vision"],
         f"pure: the real tree's pure crates are {pure_now} — a new member of the set is proven by `just mac-test` before this list takes it",
     )
     # the host chain's Linux-only items are the one owner's now, behind its own cfg, so a crate that holds
@@ -15542,12 +15830,13 @@ def _st_host_crates(fails: list[str], side: Side) -> None:
     # that crate.
     # PIN(2026-10-21): bloomery-device joined with the device contract's pure tests; bloomery-metal is an empty library off macOS.
     # PIN(2026-10-21): bloomery-record joined: the record core lifted out of gpu-gates
+    # PIN(2026-11-06): bloomery-quantize joined: the card quantizer's host rule and plan, native tests pass under `just mac-test`.
     # PIN(2026-10-22): bloomery-chain joined: the qwen3moe chain plan, host data moved out of bloomery-gpu.
     expect(
         host_now
         == [
             "bloomery-app", "bloomery-chain", "bloomery-decision", "bloomery-device", "bloomery-embed", "bloomery-engram", "bloomery-engram-lab", "bloomery-gguf", "bloomery-hf",
-            "bloomery-jinja", "bloomery-levers", "bloomery-metal", "bloomery-model", "bloomery-model-hf", "bloomery-models", "bloomery-os", "bloomery-placement", "bloomery-qdot", "bloomery-record", "bloomery-refset",
+            "bloomery-jinja", "bloomery-levers", "bloomery-metal", "bloomery-model", "bloomery-model-hf", "bloomery-models", "bloomery-os", "bloomery-placement", "bloomery-qdot", "bloomery-quantize", "bloomery-record", "bloomery-refset",
             "bloomery-runtime", "bloomery-safetensors", "bloomery-sampler", "bloomery-serve", "bloomery-threads", "bloomery-tokenizer", "bloomery-verbs",
             "bloomery-vision",
         ],
@@ -15609,9 +15898,55 @@ def _st_mutations(fails: list[str], side: Side, part: int, parts: int) -> None:
 
 
 
+def selftest_parts_self_test(expect) -> None:
+    """The self-test's own scaffolding: the partition of its jobs, a part's job selection and the one-at-a-time child runner."""
+    names = ["a", "b", "c"]
+    check = lambda groups: selftest_partition_problems("job", names, groups)  # noqa: E731
+    expect(check([("a", "b"), ("c",)]) == [], f"parts: a partition is refused: {check([('a', 'b'), ('c',)])}")
+    expect(check([("a",), ("c",)]) == ["job 'b' is in no group"], f"parts: a job left in no part: {check([('a',), ('c',)])}")
+    expect(check([("a", "b"), ("b", "c")]) == ["job 'b' is in groups 1 and 2"], f"parts: a job in two parts: {check([('a', 'b'), ('b', 'c')])}")
+    expect(check([("a", "b", "c"), ("d",)]) == ["job group 2 names 'd', which is none"], f"parts: a part naming no job: {check([('a', 'b', 'c'), ('d',)])}")
+    expect(check([("a", "b", "c"), ()]) == ["job group 2 is empty"], f"parts: an empty part: {check([('a', 'b', 'c'), ()])}")
+    jobs = [(n, False, lambda f: None) for n in names]
+    expect([j[0] for j in selftest_part_jobs(jobs, (("c", "a"), ("b",)), 1)] == ["a", "c"], "parts: part 1 is not its jobs in run order")
+    expect([j[0] for j in selftest_part_jobs(jobs, (("c", "a"), ("b",)), 2)] == ["b"], "parts: part 2 is not its job")
+    for bad in (0, 3):
+        expect(_raises(lambda bad=bad: selftest_part_jobs(jobs, (("c", "a"), ("b",)), bad), "--part takes 1..2"), f"parts: part {bad} of 2 is not a named error")
+    # check-recipes.sh makes one scheduler job of each part, from the SELFTEST_PARTS line above
+    for slots in (4, SELFTEST_PARTS):
+        r = subprocess.run(["bash", os.path.join(ROOT, "tools", "check-recipes.sh"), "--jobs", "--slots", str(slots)], capture_output=True, text=True)
+        listed = [tuple(line.split("\t")[:2]) for line in r.stdout.splitlines() if line.startswith("check-recipes.selftest")]
+        want = [(f"check-recipes.selftest.{k}", selftest_attr(k, slots)) for k in range(1, SELFTEST_PARTS + 1)]
+        expect(listed == want, f"parts: check-recipes.sh --jobs --slots {slots} lists {listed} (rc {r.returncode}), not the {SELFTEST_PARTS} parts with their weights")
+    # a host with fewer slots than parts weighs the parts that load the key graph two slots each; a host with a slot a part does not
+    small, large = (tuple(selftest_attr(k, n) for k in range(1, SELFTEST_PARTS + 1)) for n in (4, SELFTEST_PARTS))
+    expect(small == ("cpus=2",) * SELFTEST_GRAPH_PARTS + ("-",) * (SELFTEST_PARTS - SELFTEST_GRAPH_PARTS), f"parts: weights on 4 slots: {small}")
+    expect(large == ("-",) * SELFTEST_PARTS, f"parts: weights on {SELFTEST_PARTS} slots: {large}")
+    # a limit of 1 runs the children one after another, whole: no child starts before the one before it has ended
+    with tempfile.TemporaryDirectory(prefix="recipes-forked-") as tmp:
+        def napper(k: int) -> Callable[[list[str]], None]:
+            def job(f: list[str]) -> None:
+                t0 = time.time()
+                time.sleep(0.2)
+                with open(os.path.join(tmp, str(k)), "w", encoding="utf-8") as fh:
+                    fh.write(f"{t0!r} {time.time()!r}")
+
+            return job
+
+        fails, times = _forked([(f"n{k}", napper(k)) for k in range(3)], limit=1)
+        spans = []
+        for k in range(3):
+            with open(os.path.join(tmp, str(k)), encoding="utf-8") as fh:
+                t0, t1 = (float(x) for x in fh.read().split())
+            spans.append((t0, t1))
+        expect(fails == [] and [n for n, _ in times] == ["n0", "n1", "n2"], f"parts: one-at-a-time children: {fails}, {times}")
+        expect(all(spans[k][1] <= spans[k + 1][0] for k in range(2)), f"parts: a child started before the one before it ended: {spans}")
+
+
 def _st_selection(fails: list[str], side: Side) -> None:
     expect = _expecting(fails)
     recipes = side.recipes
+    selftest_parts_self_test(expect)
 
     # a changed recipe text selects that recipe and no other
     import copy
@@ -15670,7 +16005,10 @@ def _st_selection(fails: list[str], side: Side) -> None:
 # Otherwise the pick is left out with the reason `class: family gate of X, no file of X changed (rep F)`.
 #
 # The stage never adds a pick and never drops a common or a tooling one (the design's check 6): both are named
-# errors, not a quiet pass.
+# errors, not a quiet pass. `--fast` is the one exception for a common pick (class_narrow's `fast`): a changed file that exactly one
+# family's globs match is that family's own, and a gate every reached changed file of which is such a file is left out unless it is
+# the owning family's, an owner its row names owns a changed file, or it builds a lib or test target of a package a changed file lies
+# in; the reach is the files that selected the recipe, and a family gate keeps rule (a) only for a file no family owns.
 
 def _gate_class():
     """tools/gate_class.py, the one owner of the class tables, their tiers and the scope of a gate."""
@@ -15792,63 +16130,115 @@ class ClassStage:
     left_out: dict[str, str]  # recipe -> the reason it was left out
 
 
-def class_check6(picks: dict[str, str], kept: dict[str, str], left_out: dict[str, str], tables) -> None:
-    """The stage's own check: it never adds a pick and never drops a common or a tooling one."""
+def class_check6(picks: dict[str, str], kept: dict[str, str], left_out: dict[str, str], tables, fast: bool = False) -> None:
+    """The stage's own check: it never adds a pick and never drops a tooling one; it never drops a common one either, except
+    in fast mode, where a common gate every reached changed file of which is one family's own may go."""
     added = set(kept) - set(picks)
     if added:
         raise RecipeError(f"the class stage added {len(added)} pick(s): {' '.join(sorted(added)[:6])}")
     for n in left_out:
         row = tables.gates.get(n)
-        if row is None or row.cls in ("common", "tooling"):
+        if row is None or row.cls == "tooling" or (row.cls == "common" and not fast):
             cls = row.cls if row is not None else "unclassed"
             raise RecipeError(f"the class stage dropped the {cls} pick {n}")
 
 
-def class_narrow(picks: dict[str, str], changed: list[str], tables, reach, new_families: set[str]) -> ClassStage:
+def class_lib_touch(n: str, changed: list[str], a: Side | None, b: Side) -> bool:
+    """Whether recipe `n` builds a lib or test target of a package that has a changed file: the lib gate of a touched crate."""
+    side = b if n in b.recipes else a
+    if side is None or n not in side.recipes:
+        return False
+    for pname, kind, _tname, _feats in side.graph.inputs(n).targets:
+        if kind not in ("lib", "test"):
+            continue
+        pkg = side.tree.packages.get(pname)
+        if pkg is not None and any(f.startswith(pkg.dir + "/") for f in changed):
+            return True
+    return False
+
+
+def class_narrow(picks: dict[str, str], changed: list[str], tables, reach, new_families: set[str],
+                 fast: bool = False, lib_touch=None) -> ClassStage:
     """The class stage of `affected`: the picks it keeps and the ones it leaves out.
 
     `picks` is the recipe -> why map of the stage before (select()'s picks or narrow()'s); `changed` the changed
     files; `tables` the three class tables; `reach` the recipe -> (the changed files it reaches through the
     dependency graph, the changed files that are its own target's, whether its own text changed) reader;
     `new_families` the families added since the last release tag.
+
+    `fast` is the landing's mode (`affected --fast`): a changed file the globs of one or more families match is those families'
+    own and moves no gate of another family and no common gate that does not test it, so a gate stays only when a reached changed
+    file is nobody's (no family glob matches it), or the gate is one of those families', or an owner it names owns a changed file, or `lib_touch(n)` says it builds
+    a lib or test target of a package a changed file lies in. Its tooling gates and the picks with no row stay.
     """
     kept: dict[str, str] = {}
     left_out: dict[str, str] = {}
+    pre = "fast: " if fast else "class: "
+    owner_of: dict[str, str] = {}  # file -> the families whose globs match it, `a+b`; absent: no family glob matches (nobody's)
+    if fast:
+        for f in changed:
+            hits = sorted(name for name, fam in tables.families.items() if any(class_glob(g).match(f) for g in fam.globs))
+            if hits:
+                owner_of[f] = "+".join(hits)
     for n in picks:
         row = tables.gates.get(n)
         if row is None:
-            kept[n] = "class: no class row, so a common gate"
+            kept[n] = f"{pre}no row, so a common gate" if fast else "class: no class row, so a common gate"
             continue
-        if row.cls in ("common", "tooling"):
+        if row.cls == "tooling" or (row.cls == "common" and not fast):
             kept[n] = f"class: {row.cls}"
+            continue
+        if row.cls == "common":
+            reached, own, text = reach(n)
+            globs = [g for o in row.owners for g in tables.owners[o].globs]
+            owned = next((f for f in changed if any(class_glob(g).match(f) for g in globs)), None)
+            nobody = next((f for f in reached if f not in owner_of), None)
+            if text:
+                kept[n] = "fast: the recipe's own text changed"
+            elif own:
+                kept[n] = f"fast: the recipe's own target file {own[0]} changed"
+            elif owned is not None:
+                kept[n] = f"fast: an owner of the gate owns {owned}"
+            elif lib_touch is not None and lib_touch(n):
+                kept[n] = "fast: the lib gate of a touched crate"
+            elif nobody is not None:
+                kept[n] = f"fast: the recipe reaches {nobody}, which no family owns"
+            elif reached:
+                left_out[n] = f"fast: common gate, every reached file is {owner_of[reached[0]]}'s own ({reached[0]})"
+            else:
+                kept[n] = "fast: reaches no changed file of a family's own"
             continue
         fam = tables.families.get(row.family)
         if fam is None:
             raise RecipeError(f"the class row of {n} names the family {row.family}, which families.tsv does not hold")
         reached, own, text = reach(n)
         hit = next((f for f in changed if any(class_glob(g).match(f) for g in fam.globs)), None)
+        nobody = next((f for f in reached if f not in owner_of), None) if fast else None
         if text:
             kept[n] = "class: the recipe's own text changed"
         elif own:
             kept[n] = f"class: the recipe's own target file {own[0]} changed"
         elif hit is not None:
             kept[n] = f"class: the family {row.family}'s own file {hit} changed"
-        elif fam.rep == "R" and reached:
-            kept[n] = f"class: {row.family} is a representative family and the recipe reaches {reached[0]}"
+        elif fam.rep == "R" and reached and (not fast or nobody is not None):
+            why = nobody if fast else reached[0]
+            kept[n] = f"class: {row.family} is a representative family and the recipe reaches {why}"
         elif row.family in new_families:
             kept[n] = f"class: the family {row.family} was added since the last release tag"
+        elif fast and fam.rep == "R" and reached:
+            left_out[n] = f"fast: family gate of {row.family}, every reached file is {owner_of[reached[0]]}'s own ({reached[0]})"
         else:
-            left_out[n] = f"class: family gate of {row.family}, no file of {row.family} changed (rep {fam.rep})"
-    class_check6(picks, kept, left_out, tables)
+            left_out[n] = f"{pre}family gate of {row.family}, no file of {row.family} changed (rep {fam.rep})"
+    class_check6(picks, kept, left_out, tables, fast)
     return ClassStage({n: kept[n] for n in picks if n in kept}, left_out)
 
 
 def class_stage(picks: dict[str, str], changed: list[str], tables, reach, new_families: set[str],
-                enabled: bool) -> ClassStage:
+                enabled: bool, fast: bool = False, lib_touch=None) -> ClassStage:
     """The class stage, unless `--no-class` turned it off: then the picks stand as they are."""
     if not enabled:
         return ClassStage(dict(picks), {})
-    return class_narrow(picks, changed, tables, reach, new_families)
+    return class_narrow(picks, changed, tables, reach, new_families, fast, lib_touch)
 
 
 def class_picks(changed: list[str], a: Side | None, b: Side, tables, root: str = ROOT) -> ClassStage:
@@ -16117,21 +16507,23 @@ def class_stage_self_test(fails: list[str]) -> None:
 
         write("tools/families.tsv", "# family\trep\ttier\tglobs\trotation_days\tfixture\n"
               "fam-rep\tR\tmain\tcrates/fam-rep/**\t7\tno\n"
-              "fam-fix\tF\tother\tcrates/fam-fix/**\t30\tno\n"
-              "fam-new\tF\tother\tcrates/fam-new/**\t30\tno\n")
-        write("tools/owners.tsv", "# owner\tkind\tglobs\nown-a\tkernel\tcrates/fam-rep/a.rs\n")
+              "fam-fix\tF\tother\tcrates/fam-fix/** crates/shared/**\t30\tno\n"
+              "fam-new\tF\tother\tcrates/fam-new/** crates/shared/**\t30\tno\n")
+        write("tools/owners.tsv", "# owner\tkind\tglobs\nown-a\tkernel\tcrates/fam-rep/a.rs\nown-b\tkernel\tcrates/fam-fix/b.rs\n")
         write("tools/gate-class.tsv", "# recipe\tclass\tfamily\ttopic\towners\n"
               "gate-rep\tfamily\tfam-rep\tkernel\town-a\n"
               "gate-env\tfamily\tfam-rep\tby-hand\t-\n"
               "gate-fix\tfamily\tfam-fix\tkernel\t-\n"
               "gate-new\tfamily\tfam-new\tkernel\t-\n"
               "gate-com\tcommon\t\thost\t-\n"
+              "gate-own\tcommon\t\thost\town-b\n"
+              "gate-lib\tcommon\t\tlib\t-\n"
               "gate-tool\ttooling\t\thost\t-\n")
         write("crates/fam-rep/a.rs", "// a\n")
         write("crates/fam-fix/b.rs", "// b\n")
         write("crates/fam-new/c.rs", "// c\n")
         tables = class_tables(root)
-        expect(sorted(tables.gates) == ["gate-com", "gate-env", "gate-fix", "gate-new", "gate-rep", "gate-tool"],
+        expect(sorted(tables.gates) == ["gate-com", "gate-env", "gate-fix", "gate-lib", "gate-new", "gate-own", "gate-rep", "gate-tool"],
                f"class: the synthetic table loads: {sorted(tables.gates)}")
 
         # the synthetic reach: the changed files a recipe reaches, the changed files that are its own target's,
@@ -16179,6 +16571,46 @@ def class_stage_self_test(fails: list[str]) -> None:
                "class: check 6 refuses a pick the stage added")
         expect(refused(lambda: class_check6(picks, {}, {"gate-com": "why"}, tables), "dropped the common pick"),
                "class: check 6 refuses a common pick the stage dropped")
+        # fast mode (`affected --fast`): a changed file one family owns moves no gate of another family and no common gate that
+        # does not test it; a shared-glob file, an owner's file and the lib gate of a touched crate keep theirs
+        fast_gates = ["gate-rep", "gate-env", "gate-fix", "gate-new", "gate-com", "gate-own", "gate-lib", "gate-tool"]
+
+        def fstage(files: list[str], fast: bool) -> ClassStage:
+            return class_narrow({n: "why" for n in fast_gates}, files, tables, lambda n: (list(files), [], False), set(),
+                                fast, lambda n: n == "gate-lib")
+
+        own_file = ["crates/fam-fix/b.rs"]  # fam-fix's alone
+        full, quick = fstage(own_file, False), fstage(own_file, True)
+        expect("gate-rep" in full.kept and "gate-rep" in quick.left_out and "gate-rep" not in quick.kept,
+               f"fast: an R family gate of Y that reaches X's own file is kept in full mode and left out in fast mode: {quick.left_out.get('gate-rep')}")
+        want = "fast: family gate of fam-rep, every reached file is fam-fix's own (crates/fam-fix/b.rs)"
+        expect(quick.left_out.get("gate-rep") == want, f"fast: the reason names the owner and the file: {quick.left_out.get('gate-rep')!r}")
+        expect("gate-com" in full.kept and "gate-com" in quick.left_out and "gate-com" not in quick.kept,
+               f"fast: a common gate with no owners match is kept in full mode and left out in fast mode: {quick.left_out.get('gate-com')}")
+        expect(quick.left_out.get("gate-com") == "fast: common gate, every reached file is fam-fix's own (crates/fam-fix/b.rs)",
+               f"fast: the common gate's reason: {quick.left_out.get('gate-com')!r}")
+        expect("gate-own" in full.kept and "gate-own" in quick.kept, "fast: a common gate whose owner's glob matches the file is kept in both modes")
+        expect("gate-lib" in full.kept and "gate-lib" in quick.kept, "fast: the lib gate of the file's package is kept in both modes")
+        expect("gate-fix" in full.kept and "gate-fix" in quick.kept, "fast: the family that owns the file keeps its own gate in both modes")
+        expect("gate-tool" in full.kept and "gate-tool" in quick.kept, "fast: a tooling gate is kept in both modes")
+        shared = ["crates/shared/s.rs"]  # the globs of two families
+        full, quick = fstage(shared, False), fstage(shared, True)
+        expect(all(n in full.kept for n in fast_gates), f"fast: a shared-glob file keeps every gate in full mode: {full.left_out}")
+        expect("gate-fix" in quick.kept and "gate-new" in quick.kept and "gate-lib" in quick.kept and "gate-tool" in quick.kept,
+               f"fast: a shared-glob file keeps the gates of the two families whose globs match it, the lib gate and the tooling one: {quick.left_out}")
+        expect(quick.left_out.get("gate-rep") == "fast: family gate of fam-rep, every reached file is fam-fix+fam-new's own (crates/shared/s.rs)",
+               f"fast: … and leaves out a third family's R gate: {quick.left_out.get('gate-rep')!r}")
+        expect("gate-com" in quick.left_out and "gate-own" in quick.left_out, f"fast: … and the common gates with no owner, own target or lib match: {sorted(quick.left_out)}")
+        quick = fstage(["tools/box.sh"], True)
+        expect("gate-com" in quick.kept and "gate-rep" in quick.kept and "gate-tool" in quick.kept,
+               f"fast: a file no glob matches is nobody's and keeps what reaches it: {quick.left_out}")
+        expect(refused(lambda: class_check6({"gate-tool": "why"}, {}, {"gate-tool": "why"}, tables, True), "dropped the tooling pick"),
+               "fast: check 6 still refuses a tooling pick the stage dropped")
+        expect(refused(lambda: class_check6({"gate-com": "why"}, {}, {"gate-com": "why"}, tables), "dropped the common pick"),
+               "fast: check 6 refuses a common pick the full stage dropped")
+        expect(build_parser().parse_args(["affected", "--fast"]).fast is True and build_parser().parse_args(["affected"]).fast is False,
+               "fast: `--fast` is a flag of affected and off by default")
+
         # the stage is on by default (no flag drops the F gate whose family did not change) and `--no-class` keeps it
         parser = build_parser()
         on = parser.parse_args(["affected"]).class_stage
@@ -16296,16 +16728,91 @@ def class_stage_self_test(fails: list[str]) -> None:
     print(f"class stage self-test: {'ok' if not fails else f'{len(fails)} failure(s)'} ({time.monotonic() - t0:.1f} s)")
 
 
-def self_test(serial: bool = False) -> int:
-    side = make_side(ROOT)
-    gates = [n for n in side.recipes if n.startswith(GATE_PREFIX)]
-    # The children inherit the real tree's input and reach memos copy-on-write.
-    for name in gates:
-        side.graph.inputs(name)
-        reach_of(side.tree).gate_files(side.graph, name)
+# The key contracts' jobs: each tuple is one call of key_self_test, so its pieces share one scratch tree's cold start. Every KEY_PIECES
+# name stands in exactly one tuple (selftest_partition_problems holds it).
+KEY_JOBS: tuple[tuple[str, ...], ...] = (
+    ("inputs",),
+    ("globals.loop",),
+    ("globals.member", "globals.files"),
+    ("globals.bump",),
+    ("fixtures", "variants"),
+    ("scope",),
+)
+
+# The self-test's parts. `--self-test --part K` runs the jobs of SELFTEST_TABLE[K - 1] one after another, each in a child process of its
+# own, and tools/check-recipes.sh makes one job of tools/static-sched.py of each part, so the scheduler sees each part's own wall and slot
+# (it reads the count from the next line). Plain `--self-test` runs every job at once. Every job stands in exactly one part
+# (selftest_partition_problems holds it). A part's cost is the sum of its jobs' and, when one reads the real tree, that tree's setup
+# once; a part line of the check-recipes log lists every job's seconds, setup included. The table packs the parts to one size (the
+# longest is a key job that cannot be cut further without another cold start); re-pack it when a job grows past the longest part.
+SELFTEST_PARTS = 8
+# Parts 1..SELFTEST_GRAPH_PARTS hold the key contracts. Each loads the reach cache's whole graph for a scratch tree of its own and peaks at
+# 2.2 to 3.9 GiB resident (`/usr/bin/time -l bash tools/check-recipes.sh --block selftest.K`, Mac, two runs). On a host with fewer slots
+# than parts, selftest_attr weighs each of them cpus=2: a 4-core, 16 GiB host runs two at once, not four beside other jobs. A host with a
+# slot a part starts every part together and keeps the one-wave wall (a 10-slot Mac at cpus=2 holds five key parts and waits a second wave:
+# 453 s against 284 s). tools/check-recipes.sh reads the part count from the next line.
+SELFTEST_GRAPH_PARTS = 6
+SELFTEST_TABLE: tuple[tuple[str, ...], ...] = (
+    ("key inputs",),
+    ("key globals.bump",),
+    ("key scope",),
+    ("key globals.member+globals.files",),
+    ("key globals.loop",),
+    ("key fixtures+variants",),
+    ("basics", "real tree", "pure crates", "host crates", "mutations 1/2", "mutations 2/2", "selection", "orphan-tests", "narrow", "class stage", "dispatch", "key detectors"),
+    ("narrow table", "small tools", "key reach"),
+)
+
+
+def selftest_attr(part: int, slots: int) -> str:
+    """The tools/static-sched.py attribute of part `part` on a scheduler of `slots` slots: `cpus=2` for a part that loads the key graph when
+    the host has fewer slots than parts, `-` otherwise."""
+    return "cpus=2" if part <= SELFTEST_GRAPH_PARTS and slots < SELFTEST_PARTS else "-"
+
+
+def cmd_selftest_attrs(args: argparse.Namespace) -> int:
+    if args.slots is not None and args.slots < 1:
+        raise RecipeError(f"selftest-attrs: --slots takes a positive whole number, not {args.slots}")
+    slots = args.slots or os.cpu_count()
+    if not slots:
+        raise RecipeError("selftest-attrs: no cpu count (os.cpu_count() is None); pass --slots")
+    for k in range(1, SELFTEST_PARTS + 1):
+        print(f"{k}\t{selftest_attr(k, slots)}")
+    return 0
+
+
+def selftest_partition_problems(what: str, items: list[str], groups: Sequence[Sequence[str]]) -> list[str]:
+    """What keeps `groups` from being a partition of `items`, each a line: an item in no group or in two, a group that names no item
+    and an empty group. No problem is a partition."""
+    problems: list[str] = []
+    seen: dict[str, int] = {}
+    for k, group in enumerate(groups, 1):
+        if not group:
+            problems.append(f"{what} group {k} is empty")
+        for item in group:
+            if item not in items:
+                problems.append(f"{what} group {k} names {item!r}, which is none")
+            elif item in seen:
+                problems.append(f"{what} {item!r} is in groups {seen[item]} and {k}")
+            else:
+                seen[item] = k
+    problems += [f"{what} {item!r} is in no group" for item in items if item not in seen]
+    return problems
+
+
+def selftest_part_jobs(jobs: list, table: Sequence[Sequence[str]], part: int) -> list:
+    """The jobs of part `part` (1-based) of `table`, in the jobs' run order."""
+    if not 1 <= part <= len(table):
+        raise RecipeError(f"--part takes 1..{len(table)}, not {part}")
+    return [job for job in jobs if job[0] in table[part - 1]]
+
+
+def _selftest_jobs(get_side: Callable[[], Side]) -> list[tuple[str, bool, Callable[[list[str]], None]]]:
+    """The self-test's jobs in run order, each `(name, whether it reads the real tree, the job)`. `get_side` is the real tree, parsed once per process."""
 
     def small(f: list[str]) -> None:
         expect = _expecting(f)
+        side = get_side()
         scan_set_self_test(expect, side)  # the scan set
         ships_self_test(expect)  # the shipped closure and the release feature list
         manifest_self_test(expect)  # a package manifest read by table
@@ -16328,36 +16835,78 @@ def self_test(serial: bool = False) -> int:
 
     def narrow(f: list[str]) -> None:
         expect = _expecting(f)
-        narrow_self_test(expect, side)  # affected --narrow
+        narrow_self_test(expect, get_side())  # affected --narrow
         lever_rows_self_test(expect)  # the lever registry read by row
         variant_items_self_test(expect)
+        owed_self_test(expect)  # affected's real-tier owed block
 
     # Independent sections, each on the same parsed real tree: they run side by side, the wall is the longest one.
-    jobs: list[tuple[str, Callable[[list[str]], None]]] = [
-        ("basics", lambda f: _st_basics(f, side)),
-        ("real tree", lambda f: _st_real_tree(f, side)),
-        ("pure crates", lambda f: _st_pure_crates(f, side)),
-        ("host crates", lambda f: _st_host_crates(f, side)),
-        ("mutations 1/2", lambda f: _st_mutations(f, side, 0, 2)),
-        ("mutations 2/2", lambda f: _st_mutations(f, side, 1, 2)),
-        ("selection", lambda f: _st_selection(f, side)),
-        ("orphan-tests", lambda f: orphan_self_test(_expecting(f), side)),
-        ("narrow", narrow),
-        ("narrow table", lambda f: narrow_table_self_test(_expecting(f), side)),
-        ("dispatch", lambda f: dispatch_self_test(_expecting(f), side)),
-        ("class stage", lambda f: class_stage_self_test(f)),
-        ("small tools", small),
-        ("key detectors", lambda f: key_detectors_self_test(_expecting(f), side)),
-        *[(f"key {section}", lambda f, section=section: key_self_test(_expecting(f), side, section))
-          for section in ("inputs", "globals", "fixtures", "variants", "scope")],
-        ("key reach", lambda f: key_reach_self_test(_expecting(f), side)),
+    jobs: list[tuple[str, bool, Callable[[list[str]], None]]] = [
+        ("basics", True, lambda f: _st_basics(f, get_side())),
+        ("real tree", True, lambda f: _st_real_tree(f, get_side())),
+        ("pure crates", True, lambda f: _st_pure_crates(f, get_side())),
+        ("host crates", True, lambda f: _st_host_crates(f, get_side())),
+        ("mutations 1/2", True, lambda f: _st_mutations(f, get_side(), 0, 2)),
+        ("mutations 2/2", True, lambda f: _st_mutations(f, get_side(), 1, 2)),
+        ("selection", True, lambda f: _st_selection(f, get_side())),
+        ("orphan-tests", True, lambda f: orphan_self_test(_expecting(f), get_side())),
+        ("narrow", True, narrow),
+        ("narrow table", True, lambda f: narrow_table_self_test(_expecting(f), get_side())),
+        ("dispatch", True, lambda f: dispatch_self_test(_expecting(f), get_side())),
+        ("class stage", False, lambda f: class_stage_self_test(f)),
+        ("small tools", True, small),
+        ("key detectors", True, lambda f: key_detectors_self_test(_expecting(f), get_side())),
+        *[("key " + "+".join(group), False, lambda f, group=group: key_self_test(_expecting(f), group)) for group in KEY_JOBS],
+        ("key reach", True, lambda f: key_reach_self_test(_expecting(f), get_side())),
     ]
-    fails, times = _forked(jobs, serial)
+    return jobs
+
+
+def self_test(serial: bool = False, part: int | None = None) -> int:
+    held: list[Side] = []
+
+    def get_side() -> Side:
+        # The children inherit the real tree's input and reach memos copy-on-write.
+        if not held:
+            side = make_side(ROOT)
+            for name in [n for n in side.recipes if n.startswith(GATE_PREFIX)]:
+                side.graph.inputs(name)
+                reach_of(side.tree).gate_files(side.graph, name)
+            held.append(side)
+        return held[0]
+
+    jobs = _selftest_jobs(get_side)
+    names = [name for name, _, _ in jobs]
+    problems = selftest_partition_problems("self-test job", names, SELFTEST_TABLE)
+    problems += selftest_partition_problems("key piece", list(KEY_PIECES), KEY_JOBS)
+    if len(SELFTEST_TABLE) != SELFTEST_PARTS:
+        problems.append(f"SELFTEST_PARTS is {SELFTEST_PARTS}, SELFTEST_TABLE holds {len(SELFTEST_TABLE)} parts")
+    key_jobs = {"key " + "+".join(group) for group in KEY_JOBS}
+    graph_parts = {k for k, part in enumerate(SELFTEST_TABLE, 1) if key_jobs & set(part)}
+    if graph_parts != set(range(1, SELFTEST_GRAPH_PARTS + 1)):
+        problems.append(f"SELFTEST_GRAPH_PARTS is {SELFTEST_GRAPH_PARTS}, the parts that hold a key contract are {sorted(graph_parts)}")
+    if problems:
+        raise RecipeError("the self-test's parts do not hold each job once: " + "; ".join(problems))
+    label = "self-test"
+    if part is not None:
+        jobs = selftest_part_jobs(jobs, SELFTEST_TABLE, part)
+        label = f"self-test part {part}/{SELFTEST_PARTS}"
+    setup = 0.0
+    if any(needs for _, needs, _ in jobs):
+        t0 = time.monotonic()
+        get_side()
+        setup = time.monotonic() - t0
+    fails, times = _forked([(name, job) for name, _, job in jobs], serial, 1 if part is not None else 0)
     for f in fails:
         print(f"self-test FAIL: {f}", file=sys.stderr)
-    print("self-test: slowest sections: " + ", ".join(f"{n} {t:.0f} s" for n, t in sorted(times, key=lambda x: -x[1])[:3]))
-    print("self-test: key sections: " + ", ".join(f"{n} {t:.0f} s" for n, t in times if n.startswith("key")))
-    print(f"self-test: {'FAIL' if fails else 'ok'} ({len(gates)} gate recipes, {len(fails)} failures)")
+    if part is not None:
+        rows = sorted(times, key=lambda x: -x[1])
+        print(f"{label}: sections: " + ", ".join(f"{n} {t:.0f} s" for n, t in rows) + f"; setup {setup:.0f} s")
+    else:
+        print(f"{label}: slowest sections: " + ", ".join(f"{n} {t:.0f} s" for n, t in sorted(times, key=lambda x: -x[1])[:3]))
+        print(f"{label}: key sections: " + ", ".join(f"{n} {t:.0f} s" for n, t in times if n.startswith("key")))
+    gates = f"{len([n for n in held[0].recipes if n.startswith(GATE_PREFIX)])} gate recipes, " if held else ""
+    print(f"{label}: {'FAIL' if fails else 'ok'} ({len(jobs)} sections, {gates}{len(fails)} failures)")
     return 1 if fails else 0
 
 
@@ -16365,6 +16914,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--serial", action="store_true", help="with --self-test: run its sections one after another in this process (a debugger, a traceback in order)")
+    ap.add_argument("--part", type=int, metavar="K", help=f"with --self-test: only part K of {SELFTEST_PARTS}, its sections one after another (tools/check-recipes.sh runs each part as a job of its own)")
     sub = ap.add_subparsers(dest="cmd")
     c = sub.add_parser("check")
     c.add_argument("--justfile")
@@ -16381,7 +16931,10 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--narrow", action="store_true", help=f"the gates that run the changed host path, when every --scan pair is identical or added (the rule and {GATE_PATHS}: the section above narrow())")
     a.add_argument("--scan", nargs=2, action="append", metavar=("BASE_LOG", "NEW_LOG"), help="a pair of `just ptx-scan <bin>` logs, the base tree's and the change's (repeatable)")
     a.add_argument("--no-class", dest="class_stage", action="store_false", help="turn the class stage off: keep every gate the graph reaches (by default a family gate stays only when the change can have moved it, by the class tables)")
+    a.add_argument("--fast", action="store_true", help="the landing's list: the class stage also leaves out a gate whose every reached changed file is one family's own (tools/families.tsv), unless the gate is that family's, an owner it names (tools/owners.tsv) owns a changed file, or it is the lib gate of a touched crate; its greens go to gate-batch.sh --fast-ledger and a release does not read them")
     a.add_argument("--no-comment-only", dest="comment_only", action="store_false", help="turn the comment-only rule off: a Rust file whose diff is comments or layout selects the gates that read it like any changed file (by default it selects none)")
+    a.add_argument("--classes", metavar="FILE", help="a saved `tools/gate-batch.sh --tier fixture --classes` for the owed block (by default the classifier runs beside the selection)")
+    a.add_argument("--no-owed", dest="owed", action="store_false", help="no `real-tier owed:` block: the selected gates a fixture-tier landing defers to the real tier (it costs the classifier's run)")
     ss = sub.add_parser("scan-set", help="the bins whose ptx-scans cover every kernel carrier, one line each: bin<TAB>features<TAB>the carriers it covers (tools/narrow-scan.sh scans them)")
     ss.add_argument("rev", nargs="?", help="the commit to read (a git archive of it); default the working tree")
     ss.add_argument("--ship", action="store_true", help=f"the shipped bins at the release features (tools/release/build.sh) are the first picks; {SCAN_SHIP_ENV}=1 does the same")
@@ -16397,6 +16950,8 @@ def build_parser() -> argparse.ArgumentParser:
     pcm.add_argument("head_log", metavar="HEAD_LOG")
     pcm.add_argument("--base-label", default="base")
     pcm.add_argument("--head-label", default="head")
+    sa = sub.add_parser("selftest-attrs", help="the self-test's parts and the tools/static-sched.py attribute of each on this host: K<TAB>attr (tools/check-recipes.sh --jobs)")
+    sa.add_argument("--slots", type=int, help="the scheduler's slot count (default: the cpu count, as static-sched.py takes it)")
     sb = sub.add_parser("ship-bins", help="the shipped bins and the release features: bin<TAB>features (tools/release/build.sh)")
     sb.add_argument("--rev", help="read build.sh at this commit; default the working tree")
     w = sub.add_parser("why", help="the gate-* recipes whose key holds each FILE and the edge that brought it in; --recipe R: R's shortest dependency chain to the file's crate, per cargo target")
@@ -16423,13 +16978,18 @@ def build_parser() -> argparse.ArgumentParser:
     k.add_argument("--ledger", help="the ledger file: status skip | run | rerun | never | error instead of key")
     k.add_argument("--round-ledger", help="with --ledger: a second ledger, the rounds' (gate-batch.sh --round-ledger, "
                    "--trust-rounds); a key green there skips too, after the first ledger, as src=round")
+    k.add_argument("--fast-ledger", help="with --ledger: the fast landings' ledger (gate-batch.sh --fast-ledger, --trust-fast); a key green there skips too, "
+                   "after the other ledgers, as src=fast")
     k.add_argument("--rerun", action="store_true", help="with --ledger: no item skips")
     k.add_argument("--parts-dir", help="write each item's labelled parts to DIR/<index>.parts")
     k.add_argument("--parts", dest="show_parts", action="store_true", help="print each item's labelled parts")
+    k.add_argument("--files", action="store_true", help="with one ITEM: the tree files its key reads, one path a line (a member-version-blind one "
+                   "followed by a tab and `blind`); no manifest, ledger or box is read")
     bc = sub.add_parser("box-command", help="the single-quoted argument of RECIPE's one tools/box.sh line, verbatim (tools/mac-check.sh)")
     bc.add_argument("recipe")
     ot = sub.add_parser("orphan-tests", help="every #[test] no gate-* or lab-* recipe runs on the box, one `path:line name — why` line each")
     ot.add_argument("--justfile")
+    sub.add_parser("whole-manifests", help="the recipes that read a package manifest whole, recipe<TAB>manifest<TAB>why a line; rc 1 when a gate-* recipe does")
     pc = sub.add_parser("pure-crates", help="the crates tools/mac-check.sh test runs natively on the Mac, each rejected one with its reason")
     pc.add_argument("--names", action="store_true", help="the pure crates' names only, one a line")
     hn = sub.add_parser("host-nightly", help="the units tools/nightly/run.sh runs on a Linux host with no card and no model files: name<TAB>command, in run order")
@@ -16463,8 +17023,11 @@ def main(argv: list[str]) -> int:
     ap = build_parser()
     args = ap.parse_args(argv)
     try:
+        if args.part is not None and not args.self_test:
+            print("recipes.py: --part takes --self-test", file=sys.stderr)
+            return 64
         if args.self_test:
-            return self_test(args.serial)
+            return self_test(args.serial, args.part)
         if args.cmd == "check":
             return cmd_check(args)
         if args.cmd == "targets":
@@ -16493,6 +17056,8 @@ def main(argv: list[str]) -> int:
             return cmd_box_command(args)
         if args.cmd == "orphan-tests":
             return cmd_orphan_tests(args)
+        if args.cmd == "whole-manifests":
+            return cmd_whole_manifests(args)
         if args.cmd == "pure-crates":
             return cmd_pure_crates(args)
         if args.cmd == "host-nightly":
@@ -16509,6 +17074,8 @@ def main(argv: list[str]) -> int:
             return cmd_expand(args)
         if args.cmd == "rows":
             return cmd_rows(args)
+        if args.cmd == "selftest-attrs":
+            return cmd_selftest_attrs(args)
         if args.cmd == "release-list":
             return cmd_release_list(args)
         ap.print_help()

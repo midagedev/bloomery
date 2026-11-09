@@ -56,8 +56,8 @@ use crate::gemm::{
 };
 use crate::host::node::{NodeFamily, NodeOpen};
 use crate::host::tier::{
-    BlockRows, TierAct, TierBlock, TierCard, TierExperts, TierInput, TierIo, TierOpen, TierSet,
-    TierShape,
+    BlockRows, ReplyRows, TierAct, TierBlock, TierCard, TierExperts, TierInput, TierIo, TierOpen,
+    TierSet, TierShape,
 };
 use crate::hybrid::{HOST, SlotMap};
 use crate::q38::{Q38Kernels, TierRowsPackArgs};
@@ -82,6 +82,7 @@ const SHAPE: TierShape = TierShape {
     n_used: geo::N_USED,
     rows: 1,
     act: TierAct::F32,
+    reply: ReplyRows::Whole,
 };
 
 /// Qwen3.8's tier as a tier node opens it ([`crate::host::node::serve`]):

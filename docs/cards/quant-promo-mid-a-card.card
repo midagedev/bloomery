@@ -1,0 +1,16 @@
+# Promo mid-size run, arm A: bloomery-quantize (card) then llama-quantize over its set, MiMo-V2.6-Flash-RL MXFP4 (167 GB, 141 routed-
+# expert stacks of 4096 x 2048 x 256 = 2.147e9 weights, 3.028e11 weights in all; header read on the box 11-06), end to end from the
+# first read to the last byte of the final file. [derived] Stage 1: card 3.028e11 / 7.4e8 (the production rate) = 409 s, the
+# 65.6 GB card set written in series at 1.5 GB/s = 44 s, the 167 GB read (104 s at the drive's 1.6 GB/s floor) under the card's
+# shadow IF the input sits on /models (nvme0); stage 2: llama-quantize reads the set (41 s), requantizes the 5.9e9 Q8_0 trunk weights
+# (at most 28 s at the IQ rate) and writes the 63 GB final (42 s), partly overlapped: 60-110 s. Sum ~540 s.
+kind: calibration
+question: how long does the card path take from MXFP4 source to final GGUF on a 167 GB MoE (MiMo-V2.6-Flash-RL), against llama-quantize alone?
+term: seconds, wall of `bloomery-quantize` (card, batch 32) plus `llama-quantize` over its set (64 threads), first read to last byte, input on /models nvme, outputs on the other drive, imatrix and rules fixed (see docs/research/quant-promo.md), A6000
+unit: s
+predict: 450..750
+condition: one lease on the A6000 (tools/ref/lease-hold.sh) with the witness blocks showing no other process on either card and a quiet host; the input is read once cold (drop nothing; the page cache holds what K3.1 left, which is not this file); the two stages are timed apart and the sum is the term; the input's drive is named in the row (a copy that stayed on /data's HDD makes the run read-bound and is a different row)
+reason: fills the mid-size card row of the promo's speed chart and the end-to-end (two stage) wall that the K3.1 pipeline's derived 5450 s predicts for the same method
+decide-in: use it as the chart's card row; the ratio to arm C is the headline
+decide-below: a stage-1 term under 400 s means the card rate beat the production log: report it and set GPU_STACK_S; a stage-2 term far under 60 s is the trunk's smallness, not a finding
+decide-above: find the term: stage-1 read over the card means the drive, not the card, bounds a mid-size file (say so on the chart); stage 2 over 150 s means llama-quantize's set read or the Q8_0 requantize is slower than derived

@@ -10,7 +10,7 @@ use crate::family::{Build, Family, Identity};
 /// owns the path until the model crate reads this architecture; a set of
 /// the file moved elsewhere is stale by this line, not by its name.
 pub const MODEL: &str =
-    "/models/MiMo-V2.6-Flash-MOPD/MiMo-V2.6-Flash-MOPD-MXFP4-00001-of-00002.gguf";
+    "/data/moved/models/MiMo-V2.6-Flash-MOPD/MiMo-V2.6-Flash-MOPD-MXFP4-00001-of-00002.gguf";
 
 /// The ik tree every mimo2 oracle family is dumped from, and the one
 /// place a re-take of the oracle changes it.

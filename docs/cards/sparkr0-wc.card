@@ -1,0 +1,38 @@
+# Round sparkr0 (kind profile: no A/B, no ruler). The one term of the Spark tier plan the workstation alone
+# can fix: wc, the card shadow the tier reply lands under.
+# Source: sparktier report 4.4 (the model, wc = 170 [assumption] = ~82 MB at ~480 GB/s) and 8 (expected 170,
+# below 120 stop Q3_K_M); band 120..220 = the same 82 MB at 685 and 374 GB/s [derived here].
+# Paper decomposition [derived], plan (a), layers 2..39, k = live card slots a layer = 6 - m = 4.13 prose /
+# 4.72 code (m from #1162 v41split: 71.1 and 48.8 host slots over 38 layers):
+# ds41_expert_gate_up 13.3 + 13.6 k us, q4k_gemv_sel down 9.7 + 10.5 k us: rig-log plan-ledger.md:1181 (E1: 37
+# and 28 us at k = 1.74; 745 and 632 GB/s), extended to k = 4..5.
+# + quantize_sel ~2.2 us + shared expert 34 us (gate+up 10.14 MB at 556 GB/s, q8_1 ~2.2, Q4_K down 6.64 MB at
+# 487 GB/s: plan-ledger.md:1182) + ~5 us of node gaps = 164 prose / 178 code.
+# The table column bridge - exposed starts at the handoff end and adds ds41_hc_pre ~10 us and the go gap ~4
+# us: ~178 prose / ~192 code. Spread +-15 % [assumption: the slope, k beyond E1 range].
+# Model rerun (sparktier decode.py, summed or compact reply, f = 0.24, code): gain at a = 110 / 140 / 170 =
+# +0.67 / +0.23 / -0.61 ms at wc = 120, +0.77 / +0.53 / +0.29 ms at wc = 170.
+kind: profile
+question: what is wc, the card expert + shared expert window a layer of the V4.1 decode step, the shadow a
+  Spark tier reply must land under, and does it stay at or above the 120 us below which the Q3_K_M node plan
+  stops?
+term: wc, us a layer, mean over layers 2..39 and the timed replays: from the first card-expert kernel after
+  the layer handoff to the end of the shared expert; one value per arm, prose and code, at decode depth 512
+  (the first 512 ids of corpus-prose.ids and corpus-code.ids, n 8, 7 replays), generate_ds41 --mode graph
+  --place a, A6000
+unit: us
+predict: 120..220
+condition: tools/ref/nsys-ds41.sh in one lease on the A6000 (just nsys-gpu-ds41 prose:512 code:512), every
+  lever at its default; the run guarantees its own cut: the [boundary] line says OK, the per-routed-layer
+  table holds 40 joins (join k is layer k), the witness shows no [other-busy] or [cpu-busy] and a warm file
+  (pgmajfault); wc is read from the saved sqlite per layer (first kernel after ds41_hc_pre to the kernel
+  before ds41_ffn_post*), and the table column bridge - exposed is its cross-check, about 15 us longer
+decide-in: continue to the one-row-reply round (R1/R2) as planned when the mean is 170 or more; between 120
+  and 170 first rerun the sparktier decode model at the measured wc (code rows turn negative at a = 140..170)
+  and write the tighter bar on a into the R3 card
+decide-below: stop the Q3_K_M decode plan for the Spark node (sparktier report 8): at wc = 120 the code gain
+  at a = 140 is +0.23 ms (+1.1 %), at the ruler edge (+-0.8 % at six rounds), and it is negative below wc ~
+  100 [derived, decode.py rerun]; the capacity regime (Q4_K_M, R5) does not depend on wc and stays open
+decide-above: more shadow than modelled: rerun the sparktier decode model at the measured wc, raise the
+  break-even a, and read the card kernels (ds41_expert_gate_up, q4k_gemv_sel) before the node, because the
+  shadow, not the host leg, is then the longer leg to shorten

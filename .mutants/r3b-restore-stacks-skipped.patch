@@ -1,0 +1,19 @@
+# r3b mutant restore-stacks-skipped
+# clause: gate_swap tail_pages (restore half) and gate_qwen38_residency kvfloor (after the restore):
+#   restore_tail turns the slots Spare without backing the released pages again, so the stand-in room
+#   stays short of pages (gate_swap: the pages after one restore and the whole room after the second
+#   read FAIL) and the rooms' released bytes stay above 0 after the gate's restore (kvfloor: the
+#   restore pin reads FAIL, and the third run writes into the spare page, its bits apart from the first).
+--- a/crates/gpu/src/host/swap.rs
++++ b/crates/gpu/src/host/swap.rs
+@@ -3865,9 +3865,7 @@
+         }
+         // The pages first, zeroed on the copy stream ahead of any fill of the slots: a
+         // refusal to back them leaves the rule and the ledger as they were.
+-        self.shared
+-            .source
+-            .restore_stacks(layer, at, at + k, &self.copy)?;
++        let _ = (at, &self.copy);
+         self.rule.give(l, k).map_err(|e| rule_err(WHAT, e))?;
+         for st in &mut self.ledger.row_mut(layer)[at..at + k] {
+             *st = SlotState::Spare;

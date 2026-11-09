@@ -1,0 +1,30 @@
+# The lane claim change (k31lane): a claim takes a quarter of what is left of its lane, floored at a 32nd of the lane,
+# through a CAS, in place of fixed quarter-lane blocks. Measured on K3.1's host leg beside its profile: the join idle
+# 28 -> 16..21 ms a step (-8..-12 ms of a ~150 ms leg - fill), the dispatch count unchanged. Every host row pool
+# claims this way, so the CPU decode of V4.1-Flash (bloomery-decode, every expert on the host) carries the same term:
+# its dispatches are shorter, so the tail each participant waits on is a smaller share of a shorter dispatch.
+kind: ab
+question: do geometric lane claims shorten the V4.1-Flash CPU decode step, by how much?
+term: decode tok/s @ n=8, the prompt's own depth, bloomery-decode (crates/model, the host engine), the box's host pool —
+  (k31lane2 − main) / main, paired by round
+unit: %
+predict: +1.5..+6.0
+rounds: 6
+condition: BLOOMERY_AB_ROUNDS=6 just ab-decode bloomery-k31lane2 from the main tree (both trees built with
+  just build-decode), the arm order rotated every round, one lease; no row carries [cpu-busy] or [other-busy]
+# derivation: [derived] K3.1: join idle 28 -> 16..21 ms a step over 92 layers x 2 dispatches = -0.04..-0.07 ms a dispatch,
+#   on dispatches of ~0.8 ms (gate/up lane) and ~0.4 ms (down): -5..-9 % of the leg's dispatch time. The V4.1 host step
+#   is the same two dispatches a layer over fewer, smaller experts; the join tail is ~block/2 a participant a dispatch
+#   and the new floor is a quarter of the old block at the tail, so the tail term drops by ~half: +1.5..+6 % of tok/s
+#   when the host leg is the whole step (bloomery-decode: no card). The CAS itself costs one more atomic per claim, ~0.
+decide-in: land k31lane2 as it is, its gate train after
+decide-below: keep the fixed blocks; the tail term was under the dispatch's own scatter — read the profile's idle/late
+  columns on V4.1 before another A/B
+decide-above: land it and re-derive the tail term (the old floor was worse than block/2)
+# outcome 2026-11-08 on k31lane2 05bad655c vs main 1d1a8c4f3, 6 rounds, quiet box (ab-decode, n=96, the fixture model, 11.5 ms a token):
+#  86.60 -> 86.46 tok/s, paired effect -0.12 % ± 1.6 (rows -0.02 -1.48 -1.03 -0.41 +2.06 +0.01): zero inside the ruler, below the band.
+#  A first run under a foreign gate_nvtier + ptxas read +3.8 % with one 70.1 outlier and is not admissible. The wrong term: on this
+#  model a dispatch is ~0.06 ms (11.5 ms step / 2 x 92... the fixture's few small layers), so the tail term is under the scatter; the
+#  K3.1 measurement (join idle 28 -> 16..21 ms a step on ~0.8 ms dispatches) was taken on the real set by the round, not under a lease.
+#  Decision: decide-below — the claim change does not land on this evidence; the profile's idle/late columns and the pool-rate bench
+#  (diagnostics) land; the claim change waits for a same-lease K3.1 A/B on the real set (its own card).

@@ -24,6 +24,8 @@
 # shape, a red one too, names each red shape at the end, and prints the ones the list leaves out by name.
 #
 #   tools/mac-check.sh check|lint|fmt|fmt-check|test|combos [--base SPEC] [--ledger FILE]
+#   tools/mac-check.sh prereqs       every piece the cargo modes need (the toolchain, the env file, cuda.h, the sysroot,
+#                                    libclang), each missing one named with how it is made; runs no cargo (tools/mac-setup.sh)
 #   tools/mac-check.sh --self-test   the derivation, the refusals, the ratchet, the target directory,
 #                                    the test totals, the toolchain and prerequisite checks against a
 #                                    fake HOME, and the disk floor against a fake df; runs no cargo
@@ -949,9 +951,9 @@ CARGO
 
 case ${1:-} in
   --self-test) [ $# = 1 ] || { say "mac-check.sh: --self-test takes nothing"; exit 64; }; self_test; exit $? ;;
-  check | lint | fmt | fmt-check | test) [ $# = 1 ] || { say "mac-check.sh: one mode, got $#: $*"; exit 64; } ;;
+  check | lint | fmt | fmt-check | test | prereqs) [ $# = 1 ] || { say "mac-check.sh: one mode, got $#: $*"; exit 64; } ;;
   combos) : ;; # its own block takes --base SPEC and --ledger FILE
-  *) say "usage: tools/mac-check.sh check|lint|fmt|fmt-check|test|combos | --self-test"; exit 64 ;;
+  *) say "usage: tools/mac-check.sh check|lint|fmt|fmt-check|test|combos|prereqs | --self-test"; exit 64 ;;
 esac
 MODE=$1
 [[ $TARGET =~ ^[a-z0-9_]+(-[a-z0-9_]+)*-linux-gnu$ ]] || { say "mac-check.sh: BLOOMERY_CHECK_TARGET='$TARGET' is not a Linux triple (<arch>-unknown-linux-gnu)"; exit 64; }
@@ -989,6 +991,19 @@ if [ "$HOST" = "$BOX_TARGET" ]; then
 fi
 CHANNEL=$(channel) || exit $?
 TC=$HOME/.rustup/toolchains/$CHANNEL-$HOST/bin
+
+# prereqs: every piece the cargo modes need (lint's covers check and combos), each missing one named once with how it is
+# made, and no cargo run (tools/mac-setup.sh --check calls it).
+if [ "$MODE" = prereqs ]; then
+  rc=0
+  out=$( (load_env && export PATH="$TC:$PATH" && prereqs lint "$TC"); r1=$?
+    (export PATH="$TC:$PATH" && prereqs fmt "$TC" && prereqs test "$TC"); r2=$?
+    [ "$r1" = 0 ] && [ "$r2" = 0 ]) 2>&1 || rc=69
+  [ -z "$out" ] || printf '%s\n' "$out" | awk '!seen[$0]++' >&2
+  [ "$rc" = 0 ] || exit "$rc"
+  echo "mac-check: prereqs ok (toolchain $CHANNEL-$HOST with clippy and rustfmt, the $TARGET std, the env file, cuda.h, the sysroot, libclang)"
+  exit 0
+fi
 
 if [ "$MODE" = test ]; then
   CRATES=$(python3 "$HERE/tools/recipes.py" pure-crates --names) || exit $?

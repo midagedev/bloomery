@@ -1,0 +1,12 @@
+--- a/crates/gpu/src/arch/raon1/mla.rs
++++ b/crates/gpu/src/arch/raon1/mla.rs
+@@ -452,8 +452,7 @@
+             y: &mut *s.qabs,
+         },
+     )?;
+-    k.step
+-        .enqueue_gather(stream, a.q, &k.src, &k.dst, d.heads * d.extra, s.qabs)?;
++    // mutant kimik3mla-rope-lanes-dropped: the rope lanes never reach the absorbed query.
+     gpu.flash().enqueue_flash_latent_split(
+         stream,
+         FlashSplitArgs {

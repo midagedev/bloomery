@@ -1,0 +1,19 @@
+# k31passdsa mutant dense-past-topk
+# clause: pass past top-k (gate_kimi_k3_place.rs past_top_k_arms / past_top_k_line), every arm
+# site: crates/gpu/src/arch/kimi_k3/rows.rs:405 run_mixer_rows, a selecting load's latent layer runs the dense rows
+#   (mla::rows: every key, no index key written); the arms after it are unreachable (a warning, not an error)
+# expected red: "FAIL pass past top-k, whole card: ..." and "FAIL pass past top-k, placed rows=16 mla_rows=8: ...",
+#   "... mla_rows=1: ...": the rows past top-k attend every key, and the steps after read key rows no pass wrote
+# gate_kimi_k3_dsa stays green: its pass clause drives attend_rows_sel itself
+# the dense pass at a load that does not select (the K3 fixture's gates) is the same code: they stay green
+--- a/crates/gpu/src/arch/kimi_k3/rows.rs
++++ b/crates/gpu/src/arch/kimi_k3/rows.rs
+@@ -402,7 +402,7 @@
+             let mut kit = kit;
+             let sites = &**sites;
+             match (index.as_deref_mut(), k.index.as_ref(), pick) {
+-                (_, None, None) => mla::rows(cx, &k.mla, acts, (sites, md), (l, m), bufs, kit),
++                (_, _, _) => mla::rows(cx, &k.mla, acts, (sites, md), (l, m), bufs, kit),
+                 (Some(ix), Some(ik), Some(p)) => {
+                     let PassSel { iq, iw, words, sel } = p;
+                     mla::front_rows(cx, acts, (sites, md), (l, m), &mut bufs, &mut kit)?;

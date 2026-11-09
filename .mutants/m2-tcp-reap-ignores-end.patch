@@ -1,0 +1,12 @@
+--- a/crates/gpu/src/host/link/tcp.rs	2026-11-04 23:40:28
++++ b/crates/gpu/src/host/link/tcp.rs	2026-11-04 23:40:28
+@@ -384,7 +384,8 @@
+         let Some(conn) = &self.conn else {
+             return Ok(true);
+         };
+-        if let Some(why) = conn.shared.ended.get() {
++        // MUTANT M2: a reap does not look at why the wire ended.
++        if let Some(why) = conn.shared.ended.get().filter(|_| false) {
+             if self.told {
+                 return Ok(true);
+             }

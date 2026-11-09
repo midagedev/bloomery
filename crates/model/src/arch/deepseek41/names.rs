@@ -3,10 +3,13 @@
 //! the ones only some layers carry. Which layers carry those is
 //! [`LayerKind`](super::hparams::LayerKind)'s answer, decided by probing these
 //! names. Anything that formats a `blk.` literal elsewhere in `crates/model/src`
-//! is a name this table does not yet own.
+//! is a name this table does not yet own. The names every family spells alike,
+//! the lightning indexer's key and query projections and score weights among
+//! them, are [`crate::arch::names`]' and re-exported here.
 
 pub use crate::arch::names::{
-    ffn_down_shexp, ffn_gate_shexp, ffn_up_shexp, indexer_k_norm, output, output_norm, token_embd,
+    ffn_down_shexp, ffn_gate_shexp, ffn_up_shexp, indexer_attn_k, indexer_attn_q_b, indexer_k_norm,
+    indexer_proj, output, output_norm, token_embd,
 };
 
 /// `output_hc_fn.weight` — the hyper-connection head's mix of the streams
@@ -202,23 +205,6 @@ pub fn indexer_compressor_ape(block: usize) -> String {
     format!("blk.{block}.indexer_compressor_ape.weight")
 }
 
-/// `blk.{block}.indexer.attn_k.weight` — the index key projection of a pooled
-/// row. Its presence is what makes a block an index-key owner.
-pub fn indexer_attn_k(block: usize) -> String {
-    format!("blk.{block}.indexer.attn_k.weight")
-}
-
-/// `blk.{block}.indexer.attn_q_b.weight` — the indexer's query projection. Its
-/// presence is what makes a block run the top-k selection.
-pub fn indexer_attn_q_b(block: usize) -> String {
-    format!("blk.{block}.indexer.attn_q_b.weight")
-}
-
-/// `blk.{block}.indexer.proj.weight` — the indexer's per-head score weights.
-pub fn indexer_proj(block: usize) -> String {
-    format!("blk.{block}.indexer.proj.weight")
-}
-
 /// `blk.{block}.engram_embd.weight` — the engram table, read by gathered
 /// rows. Its presence is what makes a block an engram site.
 pub fn engram_embd(block: usize) -> String {
@@ -241,4 +227,17 @@ pub fn engram_q(block: usize) -> String {
 /// one key per stream and the value they share.
 pub fn engram_wkv(block: usize) -> String {
     format!("blk.{block}.engram_wkv.weight")
+}
+
+/// `blk.{block}.engram_kv.weight` — [`engram_wkv`] under llama.cpp's
+/// converter's name (`EngramLayout::Concatenated` files).
+pub fn engram_kv(block: usize) -> String {
+    format!("blk.{block}.engram_kv.weight")
+}
+
+/// `blk.{block}.engram_gate.weight` — llama.cpp's converter's fold of the two
+/// gains, `engram_q ⊙ engram_k` rounded to f32 once, one row per stream
+/// (`EngramLayout::Concatenated` files).
+pub fn engram_gate(block: usize) -> String {
+    format!("blk.{block}.engram_gate.weight")
 }

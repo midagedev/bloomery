@@ -2288,6 +2288,7 @@ fn hw_minimaxm31_reasoning_splits_at_its_tags() {
     let think = serve::reasoning::ThinkTags {
         open: "<mm:think>",
         close: "</mm:think>",
+        response: None,
     };
     assert_eq!(think.open, template_tag(TEMPLATE, "think_begin_token"));
     assert_eq!(think.close, template_tag(TEMPLATE, "think_end_token"));
@@ -2905,6 +2906,53 @@ fn hw_tools_under_an_unparsed_markup_are_refused() {
         &chat_body(json!({ "tools": tools })),
     );
     assert_eq!(r.status, 200, "{}", r.body);
+}
+
+/// Kimi K3's own chat template (the one in its checked-in header table,
+/// `crates/model/tests/kimi_k3_hdr.kv.json`), which the K3 seat of `bloomery-serve` serves: it
+/// parses, its tool-call markup (`<|open|>tools<|sep|>` tags) is one no parser here reads
+/// ([`serve::dsml::ToolFormat::Unparsed`]), a plain turn and `/apply-template` run (the
+/// generation prompt opens the model's think span), and a request that asks for tool calls is
+/// refused, never answered with the calls left in `content`.
+///
+/// Today that refusal is a 500 from the template engine, not the 501 `tool_scan` raises: the
+/// template renders its tool declarations with `dictsort(case_sensitive=true)`, `is float`,
+/// `float`, `int(base=16)`, `format` and `sort`, which `crates/jinja` does not have, and the
+/// render comes before the scan. With those filters the same request reaches the 501.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_kimi_k3_template_serves_a_plain_turn_and_refuses_tools() {
+    const HEADER: &str = include_str!("../../model/tests/kimi_k3_hdr.kv.json");
+    let header: Value = serde_json::from_str(HEADER).expect("the header table is JSON");
+    let source = header["tokenizer.chat_template"]
+        .as_str()
+        .expect("the header table holds the chat template");
+    let parsed = serve::ChatTemplate::parse(source).expect("K3's template parses");
+    assert_eq!(
+        serve::dsml::ToolFormat::of_chat_template(&parsed),
+        serve::dsml::ToolFormat::Unparsed
+    );
+    let addr = common::start_templated(Box::new(serve::MockEngine::new(4096)), source);
+    let r = post(addr, "/v1/chat/completions", &chat_body(json!({})));
+    assert_eq!(r.status, 200, "{}", r.body);
+    let r = post(addr, "/apply-template", &chat_body(json!({})));
+    assert_eq!(r.status, 200, "{}", r.body);
+    let prompt = r.json()["prompt"].as_str().expect("a prompt").to_owned();
+    assert!(prompt.ends_with("<|open|>think<|sep|>"), "{prompt}");
+    let tools =
+        json!([{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]);
+    let r = post(
+        addr,
+        "/v1/chat/completions",
+        &chat_body(json!({ "tools": tools })),
+    );
+    println!("K3 tools request: {} {}", r.status, r.body);
+    assert!(matches!(r.status, 500 | 501), "{}", r.body);
+    assert!(r.json()["choices"].is_null(), "answered: {}", r.body);
+    assert!(r.json()["error"]["message"].is_string(), "{}", r.body);
+    // The refusal leaves the server serving: a plain turn after it answers.
+    let r = post(addr, "/v1/chat/completions", &chat_body(json!({})));
+    assert_eq!(r.status, 200, "after the refusal: {}", r.body);
 }
 
 /// `ignore_eos` bans every end-of-generation id, as llama-server's

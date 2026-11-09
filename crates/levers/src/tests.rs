@@ -42,9 +42,9 @@ fn retired() -> impl Iterator<Item = &'static LeverSpec> {
 /// Whether the pool reads it: it is on every binary's list.
 /// The rows read below every binary's `main` (the pool's two, the host's
 /// room, the NVMe tier's four, [`nvtier_levers`], the tier link,
-/// [`tier_link`], the tiers' nodes, [`tier_nodes`], the need hook,
-/// [`need_levers`], and the cards' margin, [`card_margin`]), which no
-/// `at_main` list refuses.
+/// [`tier_link`], the tiers' nodes, [`tier_nodes`], the page words' adds,
+/// [`word_ops`], the need hook, [`need_levers`], and the cards' margin,
+/// [`card_margin`]), which no `at_main` list refuses.
 fn pool(r: &LeverSpec) -> bool {
     r.name == CARD_MARGIN
         || r.name == THREADS
@@ -57,6 +57,7 @@ fn pool(r: &LeverSpec) -> bool {
         || r.name == NVTIER_EVICT
         || r.name == TIER_LINK
         || r.name == TIER_NODES
+        || r.name == WORD_OPS
 }
 
 /// The Direct rows `by` reads.
@@ -255,6 +256,32 @@ fn prefill_group_default_is_the_rows() {
     assert_eq!(*d, PREFILL_GROUP_DEFAULT.to_string());
 }
 
+/// `BLOOMERY_PREFILL_CUT` takes 1 to [`PREFILL_CUT_MAX`] positions, reads
+/// unset as the most a pass holds (in a binary that does not act on it
+/// too, where the body reads it at open), and refuses 0 and anything above
+/// that by name with its range.
+#[test]
+fn prefill_cut_takes_one_to_the_pass_size_and_refuses_the_rest() {
+    let cut = |pairs: &[(&str, &str)]| read(&env(pairs), Scope::Every).map(|l| l.prefill_cut());
+    let most = usize::try_from(PREFILL_CUT_MAX).unwrap();
+    assert_eq!(cut(&[]).unwrap(), most);
+    let other = read(&env::<&str>(&[]), NO_LEVER).expect("nothing is set");
+    assert_eq!(other.prefill_cut(), most);
+    for (v, want) in [("1", 1), ("128", 128), ("256", 256), ("512", 512)] {
+        assert_eq!(cut(&[(PREFILL_CUT, v)]).unwrap(), want, "{v}");
+    }
+    for bad in ["0", "513", "1024", "", "2k", "-1"] {
+        let Err(e) = cut(&[(PREFILL_CUT, bad)]) else {
+            panic!("{bad:?} is outside 1 to {PREFILL_CUT_MAX} and must be refused");
+        };
+        let text = e.to_string();
+        assert!(
+            text.contains(PREFILL_CUT) && text.contains("a whole number from 1 to 512"),
+            "{bad:?}: {text}"
+        );
+    }
+}
+
 /// `BLOOMERY_LANE_PREFETCH`'s row is a parsed same-binary arm taking `on`
 /// and `off`, its default [`LANE_PREFETCH_DEFAULT`] (what the host union
 /// holds in a binary that does not act on it), and its accessor reads unset
@@ -431,6 +458,7 @@ fn accessors_read_their_rows() {
     assert!(unset.ced());
     assert_eq!(unset.prefill(), "batch");
     assert_eq!(unset.prefill_group(), 2);
+    assert_eq!(unset.prefill_cut(), 512);
     assert!(unset.engram_helper());
     assert!(!unset.step_stats());
     assert_eq!(unset.card_budget(), CardBudget::Unset);
@@ -440,6 +468,7 @@ fn accessors_read_their_rows() {
     assert_eq!(unset.mtp_head_rows(), None);
     assert_eq!(unset.mtp_draft(), None);
     assert_eq!(unset.route_trace(), None);
+    assert_eq!(unset.expert_rank(), None);
     assert!(!unset.check_finite());
     assert!(!unset.mtp_windows());
     assert_eq!(unset.qwen38_experts(), "card");
@@ -451,6 +480,7 @@ fn accessors_read_their_rows() {
     assert_eq!(unset.nvtier_mem(), NvTierMem::Auto);
     assert_eq!(unset.gen_slots(), 1);
     assert!(!unset.prepare_q8());
+    assert!(unset.autotune());
     assert_eq!(
         unset.host(),
         HostCfg {
@@ -469,10 +499,12 @@ fn accessors_read_their_rows() {
             (CED, "off"),
             (PREFILL, "steps"),
             (PREFILL_GROUP, "1"),
+            (PREFILL_CUT, "256"),
             (ENGRAM_HELPER, "0"),
             (STEP_STATS, "1"),
             (CARD_BUDGET, "38G"),
             (CARD_MARGIN, "1G"),
+            (EXPERT_RANK, "/data/rank.tsv"),
             (PIN_MAIN, "0"),
             (DRAFT, "dspark"),
             (MTP_HEAD_ROWS, "/data/rows.txt"),
@@ -498,6 +530,7 @@ fn accessors_read_their_rows() {
             (PREFILL_GROUP, "8"),
             (GEN_SLOTS, "2"),
             (PREPARE_Q8, "1"),
+            (AUTOTUNE, "off"),
         ]),
         Scope::Every,
     )
@@ -507,6 +540,7 @@ fn accessors_read_their_rows() {
     assert!(!set.ced());
     assert_eq!(set.prefill(), "steps");
     assert_eq!(set.prefill_group(), 8);
+    assert_eq!(set.prefill_cut(), 256);
     assert!(!set.engram_helper());
     assert!(set.step_stats());
     assert_eq!(set.card_budget(), CardBudget::Every(38 << 30));
@@ -521,6 +555,7 @@ fn accessors_read_their_rows() {
     assert!(set.mtp_windows());
     assert_eq!(set.warm_profile(), Some(Path::new("/data/warm.bin")));
     assert_eq!(set.route_trace(), Some(Path::new("/data/trace")));
+    assert_eq!(set.expert_rank(), Some(Path::new("/data/rank.tsv")));
     assert!(set.check_finite());
     assert_eq!(set.residency(), Some("mid-p40-s1"));
     assert_eq!(set.qwen38_experts(), "card");
@@ -551,6 +586,7 @@ fn accessors_read_their_rows() {
     }
     assert_eq!(set.gen_slots(), 2);
     assert!(set.prepare_q8());
+    assert!(!set.autotune());
     assert_eq!(
         set.host(),
         HostCfg {
@@ -571,10 +607,12 @@ fn accessors_read_their_rows() {
             CED,
             PREFILL,
             PREFILL_GROUP,
+            PREFILL_CUT,
             ENGRAM_HELPER,
             STEP_STATS,
             CARD_BUDGET,
             CARD_MARGIN,
+            EXPERT_RANK,
             HOST_ROOM,
             NVTIER_BYTES,
             NVTIER_READ,
@@ -583,6 +621,7 @@ fn accessors_read_their_rows() {
             TIER_LINK,
             TIER_NODES,
             TP_NODES,
+            WORD_OPS,
             PIN_MAIN,
             DRAFT,
             MTP_HEAD_ROWS,
@@ -603,13 +642,16 @@ fn accessors_read_their_rows() {
             XSTREAM,
             SPLIT_WALK,
             QWEN3_KV,
+            KV_FLOOR,
+            KV_HOST,
             LANE_PREFETCH,
             HOST_LANES,
             GEN_SLOTS,
             FORCE_IDS,
             SCREEN,
             SCHEMAJUMP,
-            PREPARE_Q8
+            PREPARE_Q8,
+            AUTOTUNE
         ]
     );
 }
@@ -694,6 +736,137 @@ fn the_need_hook_is_read_below_main() {
         panic!("a binary that leaves the lock out refuses it");
     };
     assert!(e.to_string().contains(HOST_LOCK), "{e}");
+}
+
+/// `BLOOMERY_EXPERT_RANK` takes a non-empty path, unset is no rank, an empty value
+/// is refused by name, and a binary that leaves the lever out refuses it.
+#[test]
+fn expert_rank_takes_a_path_and_a_binary_that_leaves_it_out_refuses_it() {
+    let rank = |pairs: &[(&str, &str)]| {
+        read(&env(pairs), Scope::Every).map(|l| l.expert_rank().map(Path::to_path_buf))
+    };
+    assert_eq!(rank(&[]).unwrap(), None);
+    assert_eq!(
+        rank(&[(EXPERT_RANK, "/data/rank.tsv")]).unwrap(),
+        Some(PathBuf::from("/data/rank.tsv"))
+    );
+    let Err(e) = rank(&[(EXPERT_RANK, "")]) else {
+        panic!("an empty path is refused");
+    };
+    assert!(e.to_string().contains(EXPERT_RANK), "{e}");
+    let acts = Scope::Main {
+        bin: "b",
+        acts_on: &[EXPERT_RANK],
+    };
+    assert!(read(&env(&[(EXPERT_RANK, "/data/rank.tsv")]), acts).is_ok());
+    let Err(e) = read(&env(&[(EXPERT_RANK, "/data/rank.tsv")]), NO_LEVER) else {
+        panic!("a binary that leaves the rank out refuses it");
+    };
+    assert!(e.to_string().contains(EXPERT_RANK), "{e}");
+    // A reading that left the lever out has it unset, where the placement's reader asks.
+    let none: &[(&str, &str)] = &[];
+    let left_out = read(&env(none), NO_LEVER).expect("an unset lever is no refusal");
+    assert_eq!(left_out.expert_rank(), None);
+}
+
+/// `BLOOMERY_KV_FLOOR` takes a whole number of positions from 1 to u32::MAX,
+/// unset is no floor, a value the kind does not take names the lever, and a
+/// binary that leaves the lever out refuses it set — the refusal every other
+/// family's load gives it.
+#[test]
+fn kv_floor_takes_positions_and_a_binary_that_leaves_it_out_refuses_it() {
+    let floor = |pairs: &[(&str, &str)]| read(&env(pairs), Scope::Every).map(|l| l.kv_floor());
+    assert_eq!(floor(&[]).unwrap(), None);
+    assert_eq!(floor(&[(KV_FLOOR, "4096")]).unwrap(), Some(4096));
+    assert_eq!(floor(&[(KV_FLOOR, "1")]).unwrap(), Some(1));
+    assert_eq!(
+        floor(&[(KV_FLOOR, "4294967295")]).unwrap(),
+        Some(4294967295),
+        "u32::MAX is the most the kind takes"
+    );
+    for bad in [
+        "0",
+        "-1",
+        "4096.5",
+        "abc",
+        "0x10",
+        "1e6",
+        "04096",
+        "4294967296",
+        "",
+    ] {
+        let Err(e) = floor(&[(KV_FLOOR, bad)]) else {
+            panic!("{bad:?} is not a position count and must be refused");
+        };
+        let text = e.to_string();
+        assert!(text.contains(KV_FLOOR), "{bad}: {text}");
+    }
+    let acts = Scope::Main {
+        bin: "b",
+        acts_on: &[KV_FLOOR],
+    };
+    assert_eq!(
+        read(&env(&[(KV_FLOOR, "4096")]), acts).unwrap().kv_floor(),
+        Some(4096)
+    );
+    let Err(e) = read(&env(&[(KV_FLOOR, "4096")]), NO_LEVER) else {
+        panic!("a binary that leaves the floor out refuses it");
+    };
+    assert!(e.to_string().contains(KV_FLOOR), "{e}");
+    // A reading that left the lever out has it unset, where the placement's
+    // reader asks.
+    let none: &[(&str, &str)] = &[];
+    let left_out = read(&env(none), NO_LEVER).expect("an unset lever is no refusal");
+    assert_eq!(left_out.kv_floor(), None);
+}
+
+/// `BLOOMERY_KV_HOST` takes one of `off`, `spill` and `all`, unset is `off`
+/// (the card's own memory, the plan before the lever), a value the kind does
+/// not take names the lever, and a binary that leaves the lever out refuses
+/// it set — the refusal every family whose stores are not rooms gives it.
+#[test]
+fn kv_host_takes_a_backing_word_and_a_binary_that_leaves_it_out_refuses_it() {
+    let host = |pairs: &[(&str, &str)]| read(&env(pairs), Scope::Every).map(|l| l.kv_host());
+    assert_eq!(host(&[]).unwrap(), KvHost::Off);
+    // Unset is not set: every family whose stores are not rooms refuses the
+    // lever only when it is set.
+    let unset = read(&[], Scope::Every).expect("nothing is set");
+    assert_eq!(unset.kv_host_set(), None);
+    for (word, kv) in [
+        ("off", KvHost::Off),
+        ("spill", KvHost::Spill),
+        ("all", KvHost::All),
+    ] {
+        assert_eq!(host(&[(KV_HOST, word)]).unwrap(), kv, "{word}");
+        assert_eq!(kv.name(), word, "{word}");
+    }
+    for bad in ["host", "card", "ALL", "0", ""] {
+        let Err(e) = host(&[(KV_HOST, bad)]) else {
+            panic!("{bad:?} is not a backing word and must be refused");
+        };
+        let text = e.to_string();
+        assert!(
+            text.contains(KV_HOST) && text.contains("off, spill, all"),
+            "{bad}: {text}"
+        );
+    }
+    let acts = Scope::Main {
+        bin: "b",
+        acts_on: &[KV_HOST],
+    };
+    assert_eq!(
+        read(&env(&[(KV_HOST, "all")]), acts).unwrap().kv_host(),
+        KvHost::All
+    );
+    let Err(e) = read(&env(&[(KV_HOST, "all")]), NO_LEVER) else {
+        panic!("a binary that leaves the backing out refuses it");
+    };
+    assert!(e.to_string().contains(KV_HOST), "{e}");
+    // A reading that left the lever out has it `off`, where the placement's
+    // reader asks.
+    let none: &[(&str, &str)] = &[];
+    let left_out = read(&env(none), NO_LEVER).expect("an unset lever is no refusal");
+    assert_eq!(left_out.kv_host(), KvHost::Off);
 }
 
 /// `BLOOMERY_NVTIER_EVICT` is read where the tier is built
@@ -2322,24 +2495,43 @@ fn a_reading_refuses_everything_at_once() {
     assert_eq!(e.to_string().lines().count(), 4, "{e}");
 }
 
+/// The page words' reading ([`Scope::WordOps`]): unset is `auto`, each word
+/// its side, a word the row does not take refused by name, and every
+/// binary's `main` acts on it.
+#[test]
+fn word_ops_reads_each_word_and_refuses_the_rest() {
+    let side = |pairs: &[(&str, &str)]| read(&env(pairs), Scope::WordOps).map(|l| word_ops_of(&l));
+    assert_eq!(side(&[]).unwrap(), WordOps::Auto);
+    for (word, want) in [
+        ("auto", WordOps::Auto),
+        ("memop", WordOps::Memop),
+        ("kernel", WordOps::Kernel),
+    ] {
+        assert_eq!(side(&[(WORD_OPS, word)]).unwrap(), want, "{word}");
+    }
+    let e = side(&[(WORD_OPS, "atomic")]).expect_err("a word the row does not take");
+    assert!(e.to_string().contains(WORD_OPS), "{e}");
+    assert!(read(&env(&[(WORD_OPS, "kernel")]), NO_LEVER).is_ok());
+}
+
 /// The pool reads its two levers alone — any other lever, whatever its value,
 /// is its binary's — and refuses a retired name.
 #[test]
-fn remote_nodes_require_private_addresses_and_rdma() {
+fn remote_nodes_require_private_addresses_and_rdma_or_tcp() {
     for address in ["10.0.0.2:7340", "172.16.0.2:7340", "192.168.0.2:7340"] {
-        for link in ["shared", "loopback", "rdma"] {
+        for link in ["shared", "loopback", "rdma", "tcp"] {
             let values = env(&[(TIER_NODES, address), (TIER_LINK, link)]);
             let got = read(&values, Scope::TierNodes);
-            if link == "rdma" {
-                let parsed = got.expect("a private RDMA node");
+            if link == "rdma" || link == "tcp" {
+                let parsed = got.expect("a private node over RDMA or TCP");
                 assert!(
                     matches!(&parsed.entry(TIER_NODES).value, Some(Value::Addrs(a)) if a.len() == 1 && a[0].to_string() == address)
                 );
             } else {
                 assert!(
-                    got.expect_err("an off-host node needs RDMA")
+                    got.expect_err("an off-host node needs RDMA or TCP")
                         .to_string()
-                        .contains("requires BLOOMERY_TIER_LINK=rdma")
+                        .contains("requires BLOOMERY_TIER_LINK=rdma or tcp")
                 );
             }
         }
@@ -2395,6 +2587,10 @@ fn tp_nodes_take_the_tier_rules_and_never_sit_beside_tier_nodes() {
     for (pairs, want) in [
         (
             vec![(TP_NODES, "198.18.4.1:7340")],
+            "a node off this host requires BLOOMERY_TIER_LINK=rdma",
+        ),
+        (
+            vec![(TP_NODES, "198.18.4.1:7340"), (TIER_LINK, "tcp")],
             "a node off this host requires BLOOMERY_TIER_LINK=rdma",
         ),
         (

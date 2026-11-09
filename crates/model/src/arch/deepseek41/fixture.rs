@@ -65,8 +65,9 @@ pub const D_MIN: f32 = 1.0 / 8192.0;
 pub const D_MAX: f32 = 1.0 / 512.0;
 
 /// The routed experts' ff the fixture writes in place of the source's 2,304,
-/// on the routed stacks, the shared expert and the draft: a multiple of 256
-/// (`gpu-deepseek41`'s `chain/ffn.rs` refuses any other).
+/// on the routed stacks, the shared expert and the draft: a whole number of
+/// every down form's K unit (`placement::kernels::card_k_unit`), the unit
+/// `gpu-deepseek41`'s `chain/ffn.rs` checks a down's K against.
 pub const FIXTURE_FF: u64 = 512;
 
 /// The positions the card budget's plan runs at: the V4.1 gates' context
@@ -144,6 +145,7 @@ fn card_experts(split: &Split, budget: Option<u64>) -> Result<CardExperts, Fixtu
     let machine = workstation::plan_gate(inputs.model.layers);
     let levers = PlanLevers {
         card_budget_bytes: budget.into(),
+        ..PlanLevers::default()
     };
     let plan = inputs
         .plan(&machine, BUDGET_CTX, &levers)

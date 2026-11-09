@@ -39,10 +39,11 @@ pub use slots::{SlotRange, SlotRowOrder, SlotRows, Slots, SlotsOut, slots_a_pass
 
 use slots::{ParkedSlot, PoisonWhy, SlotFault, SlotGraphs, SlotSet};
 
+use crate::autotune;
 use crate::best::{self, Best};
 use crate::fault::Fault;
 use crate::graph::MappedHost;
-use crate::head::{Head, HeadNorm};
+use crate::head::{Head, HeadNorm, HostHead};
 use crate::host::leg_tier;
 use crate::host::nvtier::{ArenaKind, ArenaPages, NvTier, PageSource};
 use crate::host::refuse_expert_tiers;
@@ -52,20 +53,24 @@ use crate::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
 use crate::hybrid::{Boundary, BoundaryShape, Chain, HostResidency, Hybrid, Refusal, SlotMap};
 use crate::parts::PartsRead;
 use crate::watchdog;
-use crate::weights::{CardOf, HEAD_TENSOR, Weights, head_tensor};
+use crate::weights::{CardOf, HEAD_TENSOR, StackRooms, Weights, head_tensor};
 use crate::{Gpu, GpuError, Graph, NodeInfo};
 use bloomery_levers::{ChurnHosting, HostCfg, NvTierMem};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use engram::direct::DIRECT_ALIGN;
 use gguf::Split;
+use gguf::shard_dirs::{shard_dirs, sidecar_path};
 use model::arch::Arch;
 use model::moe::HostLayer;
 use model::placement::churn::ChurnPool;
 use model::placement::need_hook;
 use model::placement::workstation::{self, ArenaGrant, HostNeed};
-use model::placement::{ArenaFloor, ExpertList, Plan};
+use model::placement::{ArenaFloor, ExpertList, HeadSite, Plan};
 use model::r8file::R8Source;
+use runtime::costs::Store;
+use std::collections::BTreeSet;
 use std::ops::Range;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -168,6 +173,15 @@ pub trait ChainBody: Sized {
     /// final RMS norm unless the body's own last launch is the final norm.
     fn head_norm(&self) -> HeadNorm {
         HeadNorm::Rms
+    }
+
+    /// The output head's host side, once, when the plan this load opened leaves the head on the
+    /// host (no stage card carries it, [`HeadSite::Host`]): the model then builds its one head
+    /// from it ([`Head::host`]) where a card head would be, and a body that returns `None` there
+    /// is refused by name at the load. `None` (the default) for a body whose card carries the
+    /// head, and for a stage card that ends no pipeline.
+    fn take_host_head(&mut self) -> Option<HostHead> {
+        None
     }
 
     /// Device bytes this body holds resident: caches, arena, step module.
@@ -521,7 +535,8 @@ struct PlacedPre {
     gpu: Gpu,
     weights: Weights,
     layers: Range<usize>,
-    head: bool,
+    /// What this card's load does about the output head, the plan's ([`Plan::head_site`]).
+    head: HeadSite,
     ctx_max: usize,
     /// The prelude's phases; the body and the head are timed after it.
     times: LoadTimes,
@@ -817,7 +832,8 @@ impl<B: ChainBody> GpuModel<B> {
         derive: impl FnOnce(&CudaStream, &Split, Range<usize>, &mut Weights) -> Result<(), GpuError>,
         body: impl FnOnce(&Gpu, Split, &Weights, HostResidency) -> Result<B, GpuError>,
     ) -> Result<GpuModel<B>, GpuError> {
-        let (p, residency) = placed_pre(&file, bytes, plan, card, host, (&[], 0), &[], derive)?;
+        let (p, residency) =
+            placed_pre(&file, bytes, plan, card, host, (&[], 0), &[], None, derive)?;
         let t_body = Instant::now();
         let body = body(&p.gpu, file, &p.weights, residency)?;
         placed_done(p, body, t_body.elapsed())
@@ -946,7 +962,19 @@ impl<B: ChainBody> GpuModel<B> {
             (&joined[..], pool.1 + hosted.1)
         };
         let file = Arc::new(file);
-        let (p, set) = placed_pre(&file, bytes, plan, card, host, extra, known, derive)?;
+        // Under a residency machine, the card's routed stacks the file's blocks fill are rooms
+        // (`StackRoom`), so a released tail gives its pages back; a load whose card bytes come
+        // from a part source keeps plain buffers.
+        let rooms = match (&residency.lever, &bytes) {
+            (Residency::Mid { .. }, CardBytes::File) => plan.machine.cards.get(card).map(|spec| {
+                spec.layers
+                    .clone()
+                    .flat_map(|l| residency.stacks.names(l))
+                    .collect::<BTreeSet<String>>()
+            }),
+            _ => None,
+        };
+        let (p, set) = placed_pre(&file, bytes, plan, card, host, extra, known, rooms, derive)?;
         let t_body = Instant::now();
         let glue = match residency.lever {
             Residency::Off => ResidencyGlue::off(),
@@ -1216,6 +1244,24 @@ impl<B: ChainBody> GpuModel<B> {
             Some(host) => host.refusal_poison(),
             None => None,
         })
+    }
+
+    /// Time the bit-equal ways of the kernel signatures this model's
+    /// resident weights reach and install the picks on its card
+    /// ([`autotune::tune`], the store's entries under `build`): load-time,
+    /// before any capture, so every capture reads them and none changes while
+    /// the model serves. A model that holds a capture or a parked slot is
+    /// refused by name, and so is a card that holds picks already.
+    pub fn autotune(&self, build: &str, store: &Store) -> Result<autotune::Tuned, GpuError> {
+        if self.graphs.any() || !self.parked.is_empty() {
+            return Err(GpuError::protocol(
+                "GpuModel::autotune",
+                "the model holds a capture or a parked slot: picks come before both",
+            ));
+        }
+        let tuned = autotune::tune(&self.gpu, &self.weights, build, store)?;
+        self.gpu.q8f32().install(tuned.table())?;
+        Ok(tuned)
     }
 
     /// Capture the whole chain — every resident layer plus the head — into
@@ -2074,13 +2120,19 @@ impl<B: ChainBody> GpuModel<B> {
     /// [`GpuModel::body_parts`] beside the head's normed rows of the last
     /// `step` or prompt call on the card ([`GpuModel::head_normed`]'s rows,
     /// not read back), for a body's launch on the engine stream that reads
-    /// them where they sit. Refused as `head_normed` is.
+    /// them where they sit. Refused as `head_normed` is, and for a head read on the host.
     pub(crate) fn body_parts_normed(
         &mut self,
         what: &'static str,
     ) -> Result<(&Gpu, &Weights, &mut B, &DeviceBuffer<f32>), GpuError> {
         self.refuse_one_pass(what)?;
         let head = self.heads.first().ok_or(no_head(what))?;
+        if head.reads_on_host() {
+            return Err(GpuError::shape(
+                what,
+                "the head is read on the host: its normed rows are not on the card",
+            ));
+        }
         Ok((&self.gpu, &self.weights, &mut *self.body, head.normed()))
     }
 
@@ -2288,7 +2340,8 @@ pub(crate) fn arena_kind_of<'a>(
 /// integrated device by default ([`bloomery_levers::NvTierMem`]), its
 /// victims taken as the lever's rule asks ([`bloomery_levers::NvTierEvict`]). `None`
 /// on a plan that pages no routed expert or reserved no arena: the host
-/// leg reads the file mapping as it stands. Refused by name: a load
+/// leg reads the file mapping as it stands (a sidecar listing copies is then
+/// named on stderr, [`sidecar_unread_note`]). Refused by name: a load
 /// whose r8 pair reads a sidecar while the plan pages routed experts —
 /// the slot's bytes follow the sidecar resolution, which the tier does
 /// not carry yet.
@@ -2302,6 +2355,17 @@ pub fn nvme_tier(
     const WHAT: &str = "GpuModel::nvme_tier";
     if plan.host.nvme_expert_bytes == 0 {
         return Ok(None);
+    }
+    if let Some(first) = file.shard_path(0) {
+        let dirs = shard_dirs(first).map_err(|e| GpuError::plan(WHAT, e))?;
+        if let Some(note) = sidecar_unread_note(
+            sidecar_path(first).as_deref(),
+            dirs.len(),
+            plan.host.nvme_expert_bytes,
+            arena.granted,
+        ) {
+            eprintln!("{note}");
+        }
     }
     let levers = bloomery_levers::nvtier_levers().map_err(|e| GpuError::plan(WHAT, e))?;
     let pair = model::r8file::R8Pair::at_load(Arc::clone(file), r8)
@@ -2317,6 +2381,30 @@ pub fn nvme_tier(
     let source = PinnedSource(ctx);
     let mem = arena_kind_of(&source, levers.mem)?;
     NvTier::of_paged(plan, file, levers.direct, arena, mem, levers.evict).map(|t| t.map(Arc::new))
+}
+
+/// The load's line for a mirror sidecar it does not read: `sidecar` lists `copies` directories
+/// while the plan pages `paged` routed-expert bytes and the load granted the tier `granted` arena
+/// bytes. Only the tier's arena reads the copies, so a paged plan with no arena reads the file
+/// mapping and the sidecar stays unread. `None` with no sidecar directory, nothing paged, or an
+/// arena granted.
+fn sidecar_unread_note(
+    sidecar: Option<&Path>,
+    copies: usize,
+    paged: u64,
+    granted: u64,
+) -> Option<String> {
+    let sidecar = sidecar?;
+    (copies > 0 && paged > 0 && granted == 0).then(|| {
+        format!(
+            "nvtier: {} names {copies} copies, not read: this plan pages through the file \
+             mapping (arena=0); the copies are read through the tier's arena (a smaller \
+             {}, or {})",
+            sidecar.display(),
+            bloomery_levers::HOST_ROOM,
+            bloomery_levers::NVTIER_BYTES,
+        )
+    })
 }
 
 /// The host leg of a load on `plan`: the routed layers of `set` (the layers
@@ -2631,7 +2719,7 @@ pub trait PartsLoad: Send {
 /// once ([`HostNeed::read_room`]).
 #[allow(
     clippy::too_many_arguments,
-    reason = "the load's file and where its card bytes come from, its plan and card, the host's levers, the extra and known host runs, and the derive (rust-quality R8)"
+    reason = "the load's file and where its card bytes come from, its plan and card, the host's levers, the extra and known host runs, the stacks held as rooms and the derive (rust-quality R8)"
 )]
 fn placed_pre(
     file: &Split,
@@ -2641,6 +2729,7 @@ fn placed_pre(
     host: HostCfg,
     extra: (&[(usize, ExpertList)], u64),
     known: &[(usize, ExpertList)],
+    rooms: Option<BTreeSet<String>>,
     derive: impl FnOnce(&CudaStream, &Split, Range<usize>, &mut Weights) -> Result<(), GpuError>,
 ) -> Result<(PlacedPre, HostResidency), GpuError> {
     let what = "GpuModel::load_placed";
@@ -2654,6 +2743,9 @@ fn placed_pre(
         .filter(|&c| c > 0)
         .ok_or_else(|| GpuError::shape(what, format!("the plan's ctx_max {}", plan.ctx_max)))?;
     let layers = spec.layers.clone();
+    // Refused before the card opens or a byte is read: a plan with no head card that does not
+    // leave the head tensors on the host has no head for any body to build.
+    let head = plan.head_site(card).map_err(|e| GpuError::plan(what, e))?;
     let (extra, extra_bytes) = extra;
     // The hook answers before the load opens its card or reads a byte in: a
     // broker that refuses the load holds nothing of the load's.
@@ -2684,10 +2776,18 @@ fn placed_pre(
         let context = t.elapsed();
         let t = Instant::now();
         let (mut weights, read) = match bytes {
-            CardBytes::File => (
-                Weights::load_placed(gpu.stream(), file, plan, card, host.card_dontneed)?,
-                None,
-            ),
+            CardBytes::File => {
+                let rooms = rooms.map(|names| StackRooms::new(names, gpu.stream_handle()));
+                let w = Weights::load_placed_rooms(
+                    gpu.stream(),
+                    file,
+                    plan,
+                    card,
+                    host.card_dontneed,
+                    rooms.as_ref(),
+                )?;
+                (w, None)
+            }
             CardBytes::Parts(parts) => {
                 let (w, read) = parts.load(gpu.stream(), plan, card, host.card_dontneed, room)?;
                 (w, Some(read))
@@ -2720,7 +2820,7 @@ fn placed_pre(
             gpu,
             weights,
             layers,
-            head: spec.head,
+            head,
             ctx_max,
             times: LoadTimes {
                 plan: None,
@@ -2857,11 +2957,12 @@ fn stage_rows(what: &'static str, plan: &Plan<'_>, card: usize) -> Result<u64, G
 }
 
 /// The placed load after its body, which took `built`: the output head the
-/// card carries, over the body's weights, and the model over all of it, with
-/// the load's phases.
+/// card carries, over the body's weights, or the host head the body hands over
+/// when the plan reads it on the host, and the model over all of it, with the
+/// load's phases.
 fn placed_done<B: ChainBody>(
     p: PlacedPre,
-    body: B,
+    mut body: B,
     built: Duration,
 ) -> Result<GpuModel<B>, GpuError> {
     let PlacedPre {
@@ -2873,9 +2974,21 @@ fn placed_done<B: ChainBody>(
         mut times,
     } = p;
     let t = Instant::now();
-    let head = head
-        .then(|| Head::of(&gpu, &weights, body.head_eps(), body.head_norm()))
-        .transpose()?;
+    let head = match head {
+        HeadSite::Card => Some(Head::of(&gpu, &weights, body.head_eps(), body.head_norm())?),
+        HeadSite::Elsewhere => None,
+        // The plan reads the head on the host and this load ends the pipeline: a body that hands
+        // over no host side would otherwise load whole and fail at its first step's `no_head`.
+        HeadSite::Host => {
+            let host = body.take_host_head().ok_or_else(|| {
+                GpuError::state(
+                    "GpuModel::load_placed",
+                    "the plan carries the head on no card and this body took no host head to read it",
+                )
+            })?;
+            Some(Head::host(&gpu, host)?)
+        }
+    };
     times.body = built;
     times.head = t.elapsed();
     let mut model = GpuModel::new(Resident {
@@ -3295,9 +3408,28 @@ impl<B: Instrumented> Engine for GpuModel<B> {
 
 #[cfg(test)]
 mod tests {
-    use super::{beside, refuse_partial_folder, refuse_reserve_past};
+    use super::{beside, refuse_partial_folder, refuse_reserve_past, sidecar_unread_note};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
+
+    /// A sidecar the load leaves unread is named: no sidecar directory, no paged bytes or an
+    /// arena granted say nothing; a sidecar over a paged plan with no arena names its path and
+    /// its copy count. Mutant: the arena test dropped, or the copy count left out.
+    #[test]
+    fn a_sidecar_over_a_plan_with_no_arena_is_named() {
+        let side = std::path::Path::new("/m/K.shard-dirs");
+        assert_eq!(sidecar_unread_note(None, 0, 100, 0), None);
+        assert_eq!(sidecar_unread_note(Some(side), 0, 100, 0), None);
+        assert_eq!(sidecar_unread_note(Some(side), 1, 100, 64), None);
+        assert_eq!(sidecar_unread_note(Some(side), 1, 0, 0), None);
+        let note = sidecar_unread_note(Some(side), 2, 100, 0).expect("a named line");
+        assert_eq!(
+            note,
+            "nvtier: /m/K.shard-dirs names 2 copies, not read: this plan pages through the file \
+             mapping (arena=0); the copies are read through the tier's arena (a smaller \
+             BLOOMERY_HOST_ROOM, or BLOOMERY_NVTIER_BYTES)"
+        );
+    }
 
     /// Buffers at the plan's reserve pass; one byte past it is refused by name with both figures
     /// and what the buffers are. Mutant: the comparison read `>=`, or reversed.

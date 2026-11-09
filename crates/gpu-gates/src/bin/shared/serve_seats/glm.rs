@@ -173,7 +173,7 @@
 //! set for media). Refused by name: `--mmproj` beside `--prefill steps` (a span's rows enter only
 //! through the batched call) and in a build without the `vision` feature. The NextN draft is
 //! planned and loaded as without `--mmproj`, and stays on for a request that holds an image: its
-//! prompt walk is the text call's over the media call's units (`app::mtp::MtpDraft::prompt_media`,
+//! prompt walk is the text call's over the media call's units (`app::mtp::prompt_media`,
 //! [`SlotDrafts::prefill_media`]), the call a draft prompt of its own that opens its one
 //! residency pass. At a span's positions the draft reads the span's row, the row the target
 //! consumed there, in place of the image token's embedding, paired with the target's hidden row
@@ -249,7 +249,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use app::arch::glm5next::{GlmCfg, open_nextn_slots, open_resident_slots};
-use app::mtp::{MtpBody, MtpDraft};
+use app::mtp::{MtpBody, open_draft};
 use app::{OpenLog, RowsLog, Session, SessionError};
 use bloomery_gpu::checkpoint::saved::SaveLane;
 use bloomery_gpu::host::swap::Residency;
@@ -1330,7 +1330,7 @@ impl Glm {
         let drafted = match a.draft_off {
             Some(_) => SlotDrafts::none(),
             None => SlotDrafts::open(&mut s, a.slots, a.width, &mut PairCapture, |m| {
-                MtpDraft::open(m, prefill, StepMode::Eager)
+                open_draft(m, prefill, StepMode::Eager)
             })?,
         };
         let lane = match a.cache_ram {

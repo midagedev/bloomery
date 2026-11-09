@@ -371,6 +371,7 @@ fn a_per_card_budget_caps_each_card_by_its_own_entry() {
     };
     let list = |entries: &[(u32, u64)]| PlanLevers {
         card_budget_bytes: card_budget::CardBudget::Per(entries.to_vec()),
+        ..PlanLevers::default()
     };
     let named = on(Some(1));
     let p = plan(&model, &named, 4096, &NoKv, &list(&[(0, 1), (1, half)])).expect("plans");
@@ -430,6 +431,7 @@ fn shares_become_a_budget_per_card_from_the_plans_terms() {
     };
     let shares = |entries: &[(u32, u64)]| PlanLevers {
         card_budget_bytes: card_budget::CardBudget::Shares(entries.to_vec()),
+        ..PlanLevers::default()
     };
     let roomy = on(HEAD + 24 * EXPERT, 24 * EXPERT);
     let p = plan(&model, &roomy, 4096, &NoKv, &shares(&[(0, 3), (1, 1)])).expect("plans");
@@ -549,6 +551,7 @@ fn the_budget_floor_counts_what_the_caller_holds_beside_the_plan() {
     let plan_at = |budget: u64, beside: u64| {
         let levers = PlanLevers {
             card_budget_bytes: Some(budget).into(),
+            ..PlanLevers::default()
         };
         plan_routed_reserving(
             &model,
@@ -1079,5 +1082,21 @@ fn the_row_room_counts_the_hosts_base_page() {
     assert!(
         e.to_string()
             .contains("NVFP4 row bytes are not whole groups")
+    );
+
+    // An MXFP8 row of 256 values is a 256 B code plane and an 8 B scale plane, each on two pages.
+    let table = &mut model.tensors[0];
+    table.ty = GgmlType::MXFP8;
+    table.dims = vec![256, 100];
+    table.file_bytes = 264 * 100;
+    table.gathered_rows = Some(1);
+    for (source, pages) in [(RowTableSource::Split, 2), (RowTableSource::Parts, 4)] {
+        assert_eq!(row_room(&model, 1, 4096, source).unwrap(), pages * 4096);
+    }
+    model.tensors[0].file_bytes = 263 * 100;
+    let e = row_room(&model, 1, 4096, RowTableSource::Parts).unwrap_err();
+    assert!(
+        e.to_string()
+            .contains("MXFP8 row bytes are not whole groups")
     );
 }

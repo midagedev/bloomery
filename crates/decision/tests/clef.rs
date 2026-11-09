@@ -47,10 +47,10 @@ fn requests_dir() -> PathBuf {
 }
 
 /// The Flash GGUF `tools/ref/clef_ref.py`'s round quantized; the tokenizer reads its header only.
-const CLEF_GGUF: &str = "/models/clef-flash/clef-flash-Q4_K_M.gguf";
+const CLEF_GGUF: &str = "/data/moved/models/clef-flash/clef-flash-Q4_K_M.gguf";
 
 /// The release snapshot's head, beside the model files.
-const CLEF_HEAD: &str = "/models/clef-flash/hf/joint_head.safetensors";
+const CLEF_HEAD: &str = "/data/moved/models/clef-flash/hf/joint_head.safetensors";
 
 /// bartowski's Clef-Flash Q5_K_M in llama.cpp's Clef layout (`general.architecture = clef`, the
 /// head inside the file, 6,982,686,880 bytes; HF commit `5fcdd9ba`).

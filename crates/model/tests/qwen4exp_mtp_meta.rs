@@ -427,7 +427,10 @@ fn hw_qwen4exp_mtp_plan() {
                 .map(|l| model::placement::KvBytes::layer_bytes(&inputs.kv, l, ctx))
                 .sum::<u64>()
                 + ctx * DRAFT_KV_ROW
-                + model::arch::qwen35moe::place::mtp_arena_bytes(u64::from(full.draft.vocab))
+                + model::arch::qwen35moe::place::mtp_arena_bytes(
+                    u64::from(full.draft.vocab),
+                    model::arch::qwen35moe::place::StoreRows::Least.rows(),
+                )
                 + model::placement::KvBytes::stage_position_bytes(&inputs.kv, ctx)
         };
         let (mut lo, mut hi) = (1u64, KERNEL_POSITIONS);

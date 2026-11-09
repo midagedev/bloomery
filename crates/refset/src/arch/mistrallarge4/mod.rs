@@ -59,8 +59,7 @@ pub const MODEL: &str =
 /// The first shard of the Mix-256G split set (233 GB in six shards, the second real file of the
 /// architecture) every `ref_mistrallarge4_mix256g_*` set is dumped from: the identity its
 /// `# model` line states, the spelling of `just dump-ref-mistrallarge4-mix256g`.
-pub const MODEL_MIX256G: &str =
-    "/models/Mistral-Large-4-1T-A52B-Mix-256G/Mistral-Large-4-1T-A52B-Mix-256G-00001-of-00006.gguf";
+pub const MODEL_MIX256G: &str = "/data/moved/models/Mistral-Large-4-1T-A52B-Mix-256G/Mistral-Large-4-1T-A52B-Mix-256G-00001-of-00006.gguf";
 
 /// The build every mistrallarge4 set names: llama.cpp [`COMMIT`] and the first 12 hex digits of
 /// the md5 of the `libllama.so` built from it (`/home/user/llama.cpp-ml4`, the tree the

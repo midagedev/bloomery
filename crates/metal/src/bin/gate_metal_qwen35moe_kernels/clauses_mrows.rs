@@ -10,7 +10,9 @@
 //! embed). The scaled clauses feed them the rows the 1-row hand-on writes row
 //! by row and hold them to the 1-row norm-on-load launch's bits (the bits the
 //! 1-row scaled launch stores), and the hand-on's own clause holds each row of
-//! its output to the 1-row hand-on's.
+//! its output to the 1-row hand-on's. The delta out projection's entry holds
+//! each row to the 1-row head-normed launch's bits on that row's own gated
+//! numerator and partial sums.
 //!
 //! The M-row family holds A4, the kind an MLX 4-bit folder of a Bf16 scale
 //! pair opens as, so every clause launches A4 over synthetic weights
@@ -25,8 +27,8 @@ use bloomery_device::fault::FaultSite;
 use bloomery_device::{Buffer, Device, DeviceError, Elems};
 use bloomery_metal::buffer::MetalBuffer;
 use bloomery_metal::kernels::{
-    HEAD_SIMD_GROUPS, HeadMParams, HeadParams, LoadNorm, MROWS, MatvecMParams, NormNextMParams,
-    NormNextParams, PairMParams, Quant, SegMParams, Segment,
+    HEAD_SIMD_GROUPS, HeadMParams, HeadNormMParams, HeadParams, LoadNorm, MROWS, MatvecMParams,
+    NormNextMParams, NormNextParams, PARTIALS_PER_HEAD, PairMParams, Quant, SegMParams, Segment,
 };
 
 use super::clauses_experts::{
@@ -38,8 +40,8 @@ use super::common::{self, BadArg, LAYER};
 use super::oracle;
 use super::synthetic;
 use super::{
-    ACT_PAD, Harness, Launch, ModeSpec, OUT_GUARD, SENTINEL_BITS, SegLaunch, VALUE_PAD,
-    WEIGHT_TAIL, check_guards, padded, weight_pad,
+    ACT_PAD, Harness, HeadNormLaunch, Launch, ModeSpec, OUT_GUARD, SENTINEL_BITS, SegLaunch,
+    VALUE_PAD, WEIGHT_TAIL, check_guards, padded, weight_pad,
 };
 
 /// The epsilon every M-row norm takes.
@@ -537,6 +539,172 @@ pub fn matvec(h: &Harness<'_>) -> Clause {
          bits; a NaN input row is NaN in its own row only"
             .to_string(),
     ))
+}
+
+/// One M-row head-normed residual mat-vec launch of a clause: `M` rows of
+/// `rows` outputs over the delta geometry's `cols` columns, `g` holding the
+/// numerators, `partials` the partial sums and `y0` the output's own rows,
+/// which the launch adds into.
+struct HeadNormCase<'a> {
+    rows: usize,
+    cols: usize,
+    weights: &'a [u8],
+    g: &'a [f32],
+    partials: &'a [f32],
+    y0: &'a [f32],
+}
+
+impl HeadNormCase<'_> {
+    /// The launch's outputs read back, the window's guards checked.
+    fn run(&self, h: &Harness<'_>) -> Result<Vec<f32>, String> {
+        let (device, stream) = (h.device, h.stream);
+        let (m, rows, cols) = (M, self.rows, self.cols);
+        let partials_len = h.geom().delta.partials_stride;
+        let sentinel = f32::from_bits(SENTINEL_BITS);
+        let pad = weight_pad(QUANT);
+        let weights_buf = device
+            .upload(stream, &padded(0xFFu8, pad, self.weights, WEIGHT_TAIL))
+            .map_err(why)?;
+        let g_buf = device
+            .upload(stream, &padded(sentinel, ACT_PAD, self.g, 1))
+            .map_err(why)?;
+        let partials_buf = device
+            .upload(stream, &padded(sentinel, VALUE_PAD, self.partials, 1))
+            .map_err(why)?;
+        let mut y = device
+            .upload(stream, &padded(sentinel, OUT_GUARD, self.y0, OUT_GUARD))
+            .map_err(why)?;
+        h.encode(|encoder| {
+            h.kernels.headnorm_m(
+                encoder,
+                HeadNormMParams {
+                    quant: QUANT,
+                    m,
+                    rows,
+                    cols,
+                    weights: weights_buf.window(Elems(pad), Elems(self.weights.len()))?,
+                    g: g_buf.window(Elems(ACT_PAD), Elems(m * cols))?,
+                    partials: partials_buf.window(Elems(VALUE_PAD), Elems(m * partials_len))?,
+                    y: y.window_mut(Elems(OUT_GUARD), Elems(m * rows))?,
+                    out_stride: rows,
+                    eps: EPS,
+                    fault: device.fault_word(),
+                    layer: LAYER,
+                },
+            )
+        })?;
+        read_guards(h, &y, m * rows)
+    }
+}
+
+/// The M-row head-normed residual mat-vec at the delta out projection's shape
+/// — the 27B's residual width over the instance's delta heads, the weights'
+/// biases live so the bias fold is held too: every row of M = 2 is the 1-row
+/// head-normed launch's bits on that row's own numerator, partials and
+/// residual; a row whose one head's partials are not finite raises the gate
+/// site and is NaN in its own row only, the other row its exact bits.
+pub fn headnorm(h: &Harness<'_>) -> Clause {
+    let delta = &h.geom().delta;
+    let cols = delta.head_cols * delta.value_heads;
+    let partials_len = delta.partials_stride;
+    let weights = matrix(HIDDEN, cols, 0x5310);
+    // The rows carry different numerators and different partials, so a row
+    // reading the other's is a defect the bits catch.
+    let g = x_rows(M, cols, 0x5320 + M as u64);
+    // Partials are sums of squares: positive, as the 1-row clauses draw them,
+    // and each row scaled apart so its head scales are its own.
+    let partials: Vec<f32> = (0..M)
+        .flat_map(|m| {
+            super::clauses_norm::head_partials(delta)
+                .into_iter()
+                .map(move |v| v * (1.0 + 0.5 * m as f32))
+        })
+        .collect();
+    // The residual is drawn non-zero, so the launch that overwrites instead
+    // of adding leaves its own bits.
+    let y0 = x_rows(M, HIDDEN, 0x5340 + M as u64);
+    let alone = |g: &[f32], partials: &[f32], row: usize| -> Result<Vec<f32>, String> {
+        h.headnorm(&HeadNormLaunch {
+            quant: QUANT,
+            rows: HIDDEN,
+            cols,
+            weights: &weights,
+            g: &g[row * cols..(row + 1) * cols],
+            partials: &partials[row * partials_len..(row + 1) * partials_len],
+            y0: &y0[row * HIDDEN..(row + 1) * HIDDEN],
+            eps: EPS,
+            layer: LAYER,
+        })
+    };
+    let run_case = |g: &[f32], partials: &[f32]| -> Result<Vec<f32>, String> {
+        HeadNormCase {
+            rows: HIDDEN,
+            cols,
+            weights: &weights,
+            g,
+            partials,
+            y0: &y0,
+        }
+        .run(h)
+    };
+    h.clear_fault()?;
+    let got =
+        run_case(&g, &partials).map_err(|e| format!("the delta out shape {HIDDEN}x{cols}: {e}"))?;
+    common::expect_clean(h, "the M-row head-normed mat-vec")?;
+    for row in 0..M {
+        let want = alone(&g, &partials, row)
+            .map_err(|e| format!("the delta out shape {HIDDEN}x{cols}: row {row}: {e}"))?;
+        row_diff(&got[row * HIDDEN..(row + 1) * HIDDEN], &want, row)
+            .map_err(|e| format!("the delta out shape {HIDDEN}x{cols}: {e}"))?;
+    }
+    // One row's head whose partials are not finite, each row in turn: the
+    // gate site raised, that row NaN where the 1-row kernel's are, the other
+    // row the clean 1-row bits.
+    for nan_row in 0..M {
+        let mut bad = partials.clone();
+        bad[nan_row * partials_len + 3 * PARTIALS_PER_HEAD + 1] = f32::NAN;
+        h.clear_fault()?;
+        let got = run_case(&g, &bad).map_err(|e| format!("a NaN partials row {nan_row}: {e}"))?;
+        common::expect_fault(h, "a NaN partials row", FaultSite::LinearGate)?;
+        for row in 0..M {
+            let mine = &got[row * HIDDEN..(row + 1) * HIDDEN];
+            if row == nan_row {
+                h.clear_fault()?;
+                let want = alone(&g, &bad, row)
+                    .map_err(|e| format!("a NaN partials row {nan_row}: {e}"))?;
+                common::expect_fault(
+                    h,
+                    "the 1-row launch of a NaN partials row",
+                    FaultSite::LinearGate,
+                )?;
+                for (r, (a, b)) in mine.iter().zip(&want).enumerate() {
+                    if a.is_nan() != b.is_nan() {
+                        return Err(format!(
+                            "the NaN row {nan_row} kept output {r} {:?}, the 1-row kernel's {b:?}",
+                            mine[r]
+                        ));
+                    }
+                    if !a.is_nan() && a.to_bits() != b.to_bits() {
+                        return Err(format!(
+                            "the NaN row {nan_row}'s finite output {r} is {a:?}, the 1-row \
+                             kernel's {b:?}"
+                        ));
+                    }
+                }
+                continue;
+            }
+            let want =
+                alone(&g, &bad, row).map_err(|e| format!("a NaN partials row {nan_row}: {e}"))?;
+            row_diff(mine, &want, row).map_err(|e| format!("a NaN partials row {nan_row}: {e}"))?;
+        }
+        h.clear_fault()?;
+    }
+    Ok(Verdict::Noted(format!(
+        "{HIDDEN}x{cols} over {} heads: every row of M = 2 is the 1-row head-normed launch's \
+         bits on its own numerator, partials and residual; a NaN partials row raised linear_gate \
+         and stayed NaN in its own row",
+        delta.value_heads
+    )))
 }
 
 /// The segmented M-row mat-vec at the 27B's two P1 segment groups, every row
@@ -1038,8 +1206,10 @@ pub fn head_scaled(h: &Harness<'_>) -> Clause {
 /// The buffers the refusal cases launch over: the weights of one small
 /// tensor (`weights_len` bytes at the window's offset in its padded buffer),
 /// four activation rows, a gain, an output window, the hand-on's output
-/// (`out`, whose window starts on 16 bytes), the routed ids and four pick
-/// words.
+/// (`out`, whose window starts on 16 bytes), the routed ids, four pick words,
+/// and the head-normed launch's own: the delta geometry's columns (`hn_cols`)
+/// with their weights (`hn_weights_len` bytes), two numerator rows and two
+/// partials rows.
 struct RefusalBufs {
     weights: MetalBuffer<u8>,
     weights_len: usize,
@@ -1049,6 +1219,11 @@ struct RefusalBufs {
     out: MetalBuffer<f32>,
     ids: MetalBuffer<i32>,
     picks: MetalBuffer<u32>,
+    hn_weights: MetalBuffer<u8>,
+    hn_weights_len: usize,
+    hn_cols: usize,
+    hn_g: MetalBuffer<f32>,
+    hn_partials: MetalBuffer<f32>,
 }
 
 /// The tensor's weights in `weights`, the window exactly its `len` bytes: the
@@ -1101,6 +1276,12 @@ pub fn refusals(h: &Harness<'_>) -> Clause {
     let g = gain(cols, 0x4F92);
     let (device, stream) = (h.device, h.stream);
     let sentinel = f32::from_bits(SENTINEL_BITS);
+    // The head-normed launch's own shape: the delta geometry's columns, at
+    // the same row count.
+    let delta = &h.geom().delta;
+    let hn_cols = delta.head_cols * delta.value_heads;
+    let hn_weights = matrix(rows, hn_cols, 0x4F94);
+    let hn_partials_len = delta.partials_stride;
     let mut bufs = RefusalBufs {
         weights: device
             .upload(
@@ -1139,6 +1320,26 @@ pub fn refusals(h: &Harness<'_>) -> Clause {
             .map_err(why)?,
         ids: device.upload(stream, &[0i32; 8]).map_err(why)?,
         picks: device.upload(stream, &[u32::MAX; 4]).map_err(why)?,
+        hn_weights: device
+            .upload(
+                stream,
+                &padded(0xFFu8, weight_pad(QUANT), &hn_weights, WEIGHT_TAIL),
+            )
+            .map_err(why)?,
+        hn_weights_len: hn_weights.len(),
+        hn_cols,
+        hn_g: device
+            .upload(
+                stream,
+                &padded(sentinel, ACT_PAD, &x_rows(4, hn_cols, 0x4F95), 1),
+            )
+            .map_err(why)?,
+        hn_partials: device
+            .upload(
+                stream,
+                &padded(sentinel, VALUE_PAD, &x_rows(4, hn_partials_len, 0x4F96), 1),
+            )
+            .map_err(why)?,
     };
     let segs = [Segment {
         cols,
@@ -1216,6 +1417,101 @@ pub fn refusals(h: &Harness<'_>) -> Clause {
         ),
     ];
     let count = common::refuse_launches(h, "matvec mrows", &mut bufs, matvec_cases, untouched)?;
+
+    // The head-normed M-row launch's own cases: an M the family holds no
+    // entry of, a quant without one, a window too short for the M rows at
+    // their strides, and an output stride that would overlap the rows.
+    let headnorm_launch = |b: &mut RefusalBufs,
+                           enc: &mut bloomery_metal::encode::ComputeEncoder<'_>,
+                           quant: Quant,
+                           m: usize,
+                           g_words: usize,
+                           partials_words: usize,
+                           y_words: usize,
+                           out_stride: usize| {
+        h.kernels.headnorm_m(
+            enc,
+            HeadNormMParams {
+                quant,
+                m,
+                rows,
+                cols: b.hn_cols,
+                weights: b
+                    .hn_weights
+                    .window(Elems(weight_pad(QUANT)), Elems(b.hn_weights_len))?,
+                g: b.hn_g.window(Elems(ACT_PAD), Elems(g_words))?,
+                partials: b
+                    .hn_partials
+                    .window(Elems(VALUE_PAD), Elems(partials_words))?,
+                y: b.y.window_mut(Elems(OUT_GUARD), Elems(y_words))?,
+                out_stride,
+                eps: EPS,
+                fault: h.device.fault_word(),
+                layer: LAYER,
+            },
+        )
+    };
+    let both = (2 * hn_cols, 2 * hn_partials_len, 2 * rows);
+    let headnorm_cases: Vec<BadArg<'_, RefusalBufs>> = vec![
+        BadArg::new(
+            "the head-normed M of 1",
+            "this launch is a4 at M = 1",
+            Box::new(|b, enc| {
+                headnorm_launch(b, enc, QUANT, 1, hn_cols, hn_partials_len, rows, rows)
+            }),
+        ),
+        BadArg::new(
+            "the head-normed M of 3",
+            "this launch is a4 at M = 3",
+            Box::new(|b, enc| {
+                headnorm_launch(
+                    b,
+                    enc,
+                    QUANT,
+                    3,
+                    3 * hn_cols,
+                    3 * hn_partials_len,
+                    3 * rows,
+                    rows,
+                )
+            }),
+        ),
+        BadArg::new(
+            "the head-normed A8 family",
+            "this launch is a8",
+            Box::new(|b, enc| headnorm_launch(b, enc, Quant::A8, 2, both.0, both.1, both.2, rows)),
+        ),
+        BadArg::new(
+            "a short head-normed g window",
+            "the g window",
+            Box::new(move |b, enc| {
+                headnorm_launch(b, enc, QUANT, 2, both.0 - 1, both.1, both.2, rows)
+            }),
+        ),
+        BadArg::new(
+            "a short head-normed partials window",
+            "the partials window",
+            Box::new(move |b, enc| {
+                headnorm_launch(b, enc, QUANT, 2, both.0, both.1 - 1, both.2, rows)
+            }),
+        ),
+        BadArg::new(
+            "a short head-normed y window",
+            "the y window",
+            Box::new(move |b, enc| {
+                headnorm_launch(b, enc, QUANT, 2, both.0, both.1, both.2 - 1, rows)
+            }),
+        ),
+        BadArg::new(
+            "an output stride below the rows",
+            "the output rows overlap",
+            Box::new(move |b, enc| {
+                headnorm_launch(b, enc, QUANT, 2, both.0, both.1, both.2, rows - 1)
+            }),
+        ),
+    ];
+    let count =
+        count + common::refuse_launches(h, "headnorm mrows", &mut bufs, headnorm_cases, untouched)?;
 
     // One scale word for two rows: the scaled input holds a word a row.
     let seg_case = BadArg::new(
@@ -1391,6 +1687,22 @@ pub fn refusals(h: &Harness<'_>) -> Clause {
         Box::new(|b: &mut RefusalBufs, enc| next_launch(b, enc, QUANT, 2, cols, 2 * cols + 2, EPS)),
         |h, b| common::moved(h, &b.out, |v| v.to_bits() != SENTINEL_BITS),
     )?;
+    // Zeroed again, so a word that is not zero is the head-normed launch's
+    // write and not the plain launch's above.
+    bufs.y = device
+        .upload(
+            stream,
+            &padded(0.0f32, OUT_GUARD, &vec![0.0f32; 4 * rows], OUT_GUARD),
+        )
+        .map_err(why)?;
+    common::accepted_writes(
+        h,
+        &mut bufs,
+        Box::new(|b: &mut RefusalBufs, enc| {
+            headnorm_launch(b, enc, QUANT, 2, both.0, both.1, both.2, rows)
+        }),
+        |h, b| common::moved(h, &b.y, |v| *v != 0.0),
+    )?;
     Ok(Verdict::Noted(format!(
         "{count} refusals by name, nothing written; the well-formed launches write"
     )))
@@ -1403,6 +1715,10 @@ pub fn table<'a>(h: &'a Harness<'a>) -> Vec<(&'static str, super::ClauseRun<'a>)
         (
             "mrows_matvec",
             Box::new(move || matvec(h)) as super::ClauseRun<'a>,
+        ),
+        (
+            "mrows_headnorm",
+            Box::new(move || headnorm(h)) as super::ClauseRun<'a>,
         ),
         ("mrows_seg", Box::new(move || seg(h))),
         ("mrows_next", Box::new(move || hand_on(h))),

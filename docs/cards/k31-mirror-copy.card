@@ -1,0 +1,8 @@
+# k31rel. The Kimi K3.1 Pro IQ1_S set (31 shards, 580 GB, /models on nvme0) copied to /mirror/Kimi-K3.1-Pro-IQ1_S on nvme1 (the
+# root drive, 772 GB free after k3shape went) for the mirror round (~/.cache/bloomery/specs/k31mirror/spec.md): the NVMe expert
+# tier reads each expert part from whichever drive has fewer reads in flight. Every shard's sha256 is checked against the
+# source's after the copy; the sidecar the engine reads is written by the lead after the reader lands, not here.
+kind: exclusive
+reason: the copy reads nvme0 at its full rate and writes nvme1 for its whole length, so any timed row beside it is [other-busy]; it
+  needs the box to itself for the IO, not the cards
+minutes: 20..40

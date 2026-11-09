@@ -91,6 +91,7 @@
 
 use std::collections::BTreeSet;
 
+use bloomery_gpu::index_key::HT_SCALE;
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{DeviceTensor, Gpu};
 use bloomery_gpu_deepseek41::body::STEP_TOKENS;
@@ -99,7 +100,6 @@ use bloomery_gpu_deepseek41::chain::attn::{
 };
 use bloomery_gpu_deepseek41::compress::StepInts;
 use bloomery_gpu_deepseek41::hc::HC_MIX;
-use bloomery_gpu_deepseek41::index_key::HT_SCALE;
 use bloomery_gpu_deepseek41::params::{ImageDims, ImageLayout, StepImage, Table, rope_specs};
 use bloomery_gpu_gates::act_rule::{self, Q3K_BYTES, QK_K, Rule, q8_var};
 use bloomery_gpu_gates::ik_q8_2::{self, QK};
@@ -2012,7 +2012,7 @@ fn cand_wire(cx: &Cx<'_>, tally: &mut Tally) -> Result<(), GateError> {
                 .copy_from_host(stream, &activations(4 * hp.n_embd, 1, seed))?;
             bufs.fold_in
                 .copy_from_host(stream, &activations(hp.n_embd, 1, seed + 5))?;
-            piece.enqueue_layer_of(gpu, &w, src, r, bufs.io(&kinds[0]))?;
+            piece.enqueue_layer_of(gpu, &w, src, r, bufs.io(&kinds[0]), None)?;
             stream.synchronize()?;
             let taps = piece.taps();
             let sel = taps
@@ -2033,7 +2033,7 @@ fn cand_wire(cx: &Cx<'_>, tally: &mut Tally) -> Result<(), GateError> {
                 .copy_from_host(stream, &activations(hp.n_embd, 1, seed + 5))?;
             let poison = vec![u32::MAX; bufs.lists[st].len()];
             bufs.lists[st].copy_from_host(stream, &poison)?;
-            piece.enqueue_layer_of(gpu, &w, consumer, r, bufs.io(&kinds[1]))?;
+            piece.enqueue_layer_of(gpu, &w, consumer, r, bufs.io(&kinds[1]), None)?;
             stream.synchronize()?;
             let taps = piece.taps();
             let sel = taps

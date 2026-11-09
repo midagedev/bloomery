@@ -1,0 +1,13 @@
+# Promo mid-size run, arm B: `bloomery-quantize --cpu` then llama-quantize over its set, same input, imatrix and rules as arm A.
+# [derived] Stage 1 at llama-quantize's measured expert rate (214 Mweights/s, K3.1, contended): 3.028e11 / 2.14e8 = 1415 s, the set
+# write (44 s) in series; stage 2 as arm A (60-110 s). Sum ~1545 s; the band carries 150..300 Mweights/s (row 3 of the K3.1 cards).
+kind: calibration
+question: how long does the host rule of bloomery-quantize (no card) take on the same 167 GB MoE, against llama-quantize alone and the card?
+term: seconds, wall of `bloomery-quantize --cpu` plus `llama-quantize` over its set (64 threads), first read to last byte, input and outputs as arm A, imatrix and rules as arm A, no card opened
+unit: s
+predict: 1100..2100
+condition: the same lease, input drive, quiet host and recorded thread count as arms A and C, in the same sitting; the card is idle (the witness shows no process on it); the two stages are timed apart
+reason: fills the `--cpu` mid-size row (what a machine without a card gets from the binary) and lets the chart split card speed from tool speed; why now: no `--cpu` rate is measured anywhere
+decide-in: the chart shows B beside C as the same CPU speed on a real model
+decide-below: B beats the reference on the host alone: report it with the compile-flag difference (znver3 against baseline x86-64) as the first suspect
+decide-above: the host rule is slower than ggml's: read host.rs's chunking before the chart shows B, and file the gap

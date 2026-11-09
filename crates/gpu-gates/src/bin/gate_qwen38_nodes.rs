@@ -79,16 +79,25 @@ mod q38_history;
 mod q38place;
 
 #[cfg(feature = "gpu")]
+#[path = "shared/node_proc.rs"]
+#[allow(
+    dead_code,
+    reason = "the gate starts, signals, kills and reaps its children; the lines left after an exit serve another gate"
+)]
+mod node_proc;
+
+#[cfg(feature = "gpu")]
 mod gate {
-    use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
-    use std::process::{Child, Command, ExitStatus, Stdio};
+    use std::process::Command;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    use super::node_proc::{Proc, tier_server, tier_server_command};
     use app::Session;
     use bloomery_gpu::GpuError;
     use bloomery_gpu::arch::qwen3moe::NODE_FAMILY;
@@ -100,10 +109,10 @@ mod gate {
     use bloomery_gpu::host::slots::SlotMap;
     use bloomery_gpu::host::step::Chain;
     use bloomery_gpu::host::swap::Residency;
-    use bloomery_gpu::host::tier::{TierAct, TierCard, TierOpen, TierSet, TierShape};
+    use bloomery_gpu::host::tier::{ReplyRows, TierAct, TierCard, TierOpen, TierSet, TierShape};
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::{
-        GateError, beside, checks_failed, data_dir, prose_ids, ref_model_path, verdict,
+        GateError, checks_failed, data_dir, prose_ids, ref_model_path, verdict,
     };
     use bloomery_gpu_gates::{record, tier};
     use bloomery_levers::{
@@ -355,6 +364,7 @@ mod gate {
     ) -> Result<Result<Plan<'a>, String>, GateError> {
         let levers = PlanLevers {
             card_budget_bytes: Some(gib << 30).into(),
+            ..PlanLevers::default()
         };
         let inputs = &c.inputs;
         let planned = if c.node_host {
@@ -484,146 +494,12 @@ mod gate {
         Ok(ok && pre)
     }
 
-    /// A child process whose output this process prints, each line under
-    /// `tag`, and passes on: stdout's lines through [`Proc::lines`], stderr
-    /// kept whole.
-    struct Proc {
-        child: Child,
-        lines: Receiver<String>,
-        err: Arc<Mutex<String>>,
-        stderr_reader: Option<std::thread::JoinHandle<()>>,
-        tag: &'static str,
-    }
-
-    impl Proc {
-        fn spawn(mut cmd: Command, tag: &'static str) -> Result<Proc, GateError> {
-            bloomery_gpu_gates::die_with_parent(&mut cmd);
-            let mut child = cmd
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .map_err(|e| format!("{tag}: spawn: {e}"))?;
-            let (tx, lines) = mpsc::channel();
-            let out = child.stdout.take().ok_or("a child with no stdout")?;
-            std::thread::spawn(move || {
-                for line in BufReader::new(out).lines().map_while(Result::ok) {
-                    println!("[{tag}] {line}");
-                    if tx.send(line).is_err() {
-                        break;
-                    }
-                }
-            });
-            let err = Arc::new(Mutex::new(String::new()));
-            let mut stderr = child.stderr.take().ok_or("a child with no stderr")?;
-            let kept = Arc::clone(&err);
-            let stderr_reader = std::thread::spawn(move || {
-                let mut b = [0u8; 4096];
-                while let Ok(n) = stderr.read(&mut b) {
-                    if n == 0 {
-                        break;
-                    }
-                    let text = String::from_utf8_lossy(&b[..n]).into_owned();
-                    for l in text.lines() {
-                        eprintln!("[{tag}] {l}");
-                    }
-                    kept.lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push_str(&text);
-                }
-            });
-            Ok(Proc {
-                child,
-                lines,
-                err,
-                stderr_reader: Some(stderr_reader),
-                tag,
-            })
-        }
-
-        /// The first stdout line starting with `prefix`, waited for within
-        /// `within`.
-        fn wait_line(&self, prefix: &str, within: Duration) -> Result<String, GateError> {
-            let end = Instant::now() + within;
-            loop {
-                let left = end.saturating_duration_since(Instant::now());
-                match self.lines.recv_timeout(left) {
-                    Ok(l) if l.starts_with(prefix) => return Ok(l),
-                    Ok(_) => {}
-                    Err(e) => {
-                        return Err(format!("{}: no line {prefix:?} ({e})", self.tag).into());
-                    }
-                }
-            }
-        }
-
-        /// The process's exit, waited for within `within`, with its stderr
-        /// read to the end; `None` past it.
-        fn wait_within(&mut self, within: Duration) -> Result<Option<ExitStatus>, GateError> {
-            let end = Instant::now() + within;
-            loop {
-                if let Some(s) = self.child.try_wait()? {
-                    if let Some(reader) = self.stderr_reader.take() {
-                        reader
-                            .join()
-                            .map_err(|_| format!("{}: stderr reader panicked", self.tag))?;
-                    }
-                    return Ok(Some(s));
-                }
-                if Instant::now() > end {
-                    return Ok(None);
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        }
-
-        fn signal(&self, sig: &str) -> Result<(), GateError> {
-            let pid = self.child.id().to_string();
-            let s = Command::new("kill").args([sig, &pid]).status()?;
-            if !s.success() {
-                return Err(format!("kill {sig} {pid}: {s}").into());
-            }
-            Ok(())
-        }
-
-        /// Write `line` to the process's stdin.
-        fn say(&mut self, line: &str) -> Result<(), GateError> {
-            let stdin = self.child.stdin.as_mut().ok_or("a child with no stdin")?;
-            stdin.write_all(line.as_bytes())?;
-            stdin.flush()?;
-            Ok(())
-        }
-
-        fn stderr(&self) -> String {
-            self.err
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
-        }
-    }
-
-    impl Drop for Proc {
-        fn drop(&mut self) {
-            if let Ok(None) = self.child.try_wait() {
-                drop(self.child.kill());
-                drop(self.child.wait());
-            }
-        }
-    }
-
+    /// Node 1's command: [`tier_server_command`] with `host_room` as its host
+    /// room when one is given.
     fn node1_command(model: Option<&Path>, host_room: Option<u64>) -> Result<Command, GateError> {
-        let mut cmd = Command::new(beside("tier_server")?);
-        cmd.args(["--listen", "127.0.0.1:0"])
-            .env_remove(TIER_NODES)
-            .env_remove(CARD_BUDGET)
-            .env_remove(HOST_POPULATE)
-            .env_remove(HOST_LOCK)
-            .env_remove(CARD_DONTNEED);
+        let mut cmd = tier_server_command(model)?;
         if let Some(room) = host_room {
             cmd.env(bloomery_levers::HOST_ROOM, room.to_string());
-        }
-        if let Some(m) = model {
-            cmd.arg("-m").arg(m);
         }
         Ok(cmd)
     }
@@ -634,10 +510,7 @@ mod gate {
         model: Option<&Path>,
         host_room: Option<u64>,
     ) -> Result<(Proc, SocketAddr), GateError> {
-        let p = Proc::spawn(node1_command(model, host_room)?, "node 1")?;
-        let line = p.wait_line("listening on ", Duration::from_secs(120))?;
-        let addr = line["listening on ".len()..].parse()?;
-        Ok((p, addr))
+        tier_server(node1_command(model, host_room)?, "node 1")
     }
 
     /// Node 0 as a child of this binary in `mode`'s arguments, with the
@@ -811,6 +684,7 @@ mod gate {
                 n_used: 1,
                 rows: 1,
                 act: TierAct::F32,
+                reply: ReplyRows::Whole,
             },
             cols: 1,
             layers: plan.model.layers,
@@ -1131,6 +1005,7 @@ mod gate {
                 plan_shape()?,
                 &PlanLevers {
                     card_budget_bytes: Some(gib << 30).into(),
+                    ..PlanLevers::default()
                 },
                 Experts::Card,
             )?;
@@ -1503,7 +1378,7 @@ mod gate {
             "--node0".to_string(),
             gib.to_string(),
             out.display().to_string(),
-            n1.child.id().to_string(),
+            n1.id().to_string(),
         ];
         let mut n0 = node0(&args, addr, c.node_host)?;
         let status = n0
@@ -1568,6 +1443,7 @@ mod gate {
                 plan_shape()?,
                 &PlanLevers {
                     card_budget_bytes: Some(gib << 30).into(),
+                    ..PlanLevers::default()
                 },
                 Experts::Card,
             )?
@@ -1942,7 +1818,7 @@ mod gate {
                 cmd.arg("120");
                 let stopped = Proc::spawn(cmd, "node 1")?;
                 stopped.signal("-STOP")?;
-                println!("children: {} {}", running.child.id(), stopped.child.id());
+                println!("children: {} {}", running.id(), stopped.id());
                 loop {
                     std::thread::sleep(Duration::from_secs(1));
                 }
@@ -1963,7 +1839,7 @@ mod gate {
                 .map(str::parse::<u32>)
                 .collect::<Result<Vec<_>, _>>()?;
             assert_eq!(pids.len(), 2, "{line}");
-            parent.child.kill()?;
+            parent.kill()?;
             let ended = parent.wait_within(Duration::from_secs(10))?;
             let deadline = Instant::now() + Duration::from_secs(5);
             let mut alive = pids;
@@ -2051,7 +1927,7 @@ mod gate {
                 if !stopped {
                     return Err("the child did not stop before registration".into());
                 }
-                parent.child.kill()?;
+                parent.kill()?;
                 if parent.wait_within(Duration::from_secs(10))?.is_none() {
                     return Err("the gate parent did not exit".into());
                 }
@@ -2062,7 +1938,7 @@ mod gate {
                 if !status.success() {
                     return Err(format!("continue child {pid}: {status}").into());
                 }
-                let output = parent.lines.recv_timeout(Duration::from_secs(5));
+                let output = parent.next_line(Duration::from_secs(5));
                 if !matches!(output, Err(std::sync::mpsc::RecvTimeoutError::Disconnected)) {
                     return Err(
                         format!("the server executed or kept stdout open: {output:?}").into(),

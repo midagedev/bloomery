@@ -1,0 +1,13 @@
+diff --git a/crates/gpu/src/host/swap.rs b/crates/gpu/src/host/swap.rs
+index ab47ef2a3..8333896a3 100644
+--- a/crates/gpu/src/host/swap.rs
++++ b/crates/gpu/src/host/swap.rs
+@@ -3601,7 +3601,7 @@ impl SwapMachine {
+         // ([`SwapSource::dest`]); its source lies at or past the capacity less
+         // `k`, its destination below it, so the two never meet.
+         for &(src, dst, len) in &pack {
+-            super::tier::copy_page(&self.copy, dst, src, len)?;
++            let _ = (src, dst, len);
+         }
+         self.events[event].record(&self.copy)?;
+         stream.wait(&self.events[event])?;

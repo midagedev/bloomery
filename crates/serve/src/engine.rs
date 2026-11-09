@@ -1220,6 +1220,35 @@ pub struct EngineProps {
     /// held to its reference engine's on this model. It bounds nothing: the
     /// server serves `n_ctx`.
     pub ctx_verified: Option<u64>,
+    /// The load-time kernel picks, on an engine that makes them.
+    pub autotune: Option<AutotuneProps>,
+}
+
+/// The load-time kernel picks (`engine.autotune`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AutotuneProps {
+    /// `on`, or `off`: today's rule, no timing and no store.
+    pub mode: String,
+    /// The wall the picks took at load [ms].
+    pub ms: u64,
+    /// Every signature's pick.
+    pub picks: Vec<PickProps>,
+}
+
+/// One kernel signature's pick.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PickProps {
+    /// The kernel family.
+    pub kernel: String,
+    /// The signature within it (`rows=… k=… m=…`).
+    pub signature: String,
+    /// The way it runs: `rule` is today's.
+    pub way: String,
+    /// `measured` at this load, or `stored` from an earlier one.
+    pub from: String,
+    /// The medians of the rule and of the way [ns a launch].
+    pub rule_ns: u64,
+    pub way_ns: u64,
 }
 
 /// The model file (`engine.model`), from its header.

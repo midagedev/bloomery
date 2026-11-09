@@ -50,12 +50,12 @@
 MODEL_NAME=mimo2
 : "${IK:=/home/user/ik-mimo2}"
 : "${REF_BIN_NAME:=bin-mimo2}"
-MODEL=${BLOOMERY_REF_MODEL:-/models/MiMo-V2.6-Flash-MOPD/MiMo-V2.6-Flash-MOPD-MXFP4-00001-of-00002.gguf}
+MODEL=${BLOOMERY_REF_MODEL:-/data/moved/models/MiMo-V2.6-Flash-MOPD/MiMo-V2.6-Flash-MOPD-MXFP4-00001-of-00002.gguf}
 : "${REF_CTX:=512}"
 : "${REF_SET_CPU:=ref_mimo2}"
 : "${REF_SET_CUDA:=ref_cuda_mimo2}"
 # "The capital of France is" under this model's tokenizer: what `$IK/build/bin/llama-tokenize
-# -m /models/MiMo-V2.6-Flash-RL/MiMo-V2.6-Flash-RL-MXFP4-00001-of-00002.gguf -p "The capital of France is"
+# -m /data/moved/models/MiMo-V2.6-Flash-RL/MiMo-V2.6-Flash-RL-MXFP4-00001-of-00002.gguf -p "The capital of France is"
 # --ids --log-disable --no-parse-special` prints (it loads the vocabulary only; the RL checkpoint's
 # vocabulary is MOPD's — 152,576 tokens, merges and types byte-identical between the two files'
 # headers). Five ids and no BOS: the file sets tokenizer.ggml.add_bos_token to false, so the first

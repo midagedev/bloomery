@@ -157,6 +157,7 @@ pub const Q30_KEPT: &[&str] = &[
     "gemm_weight_edge",
     "tensor_resid_stores",
     "tensor_seg_out",
+    "tensor_h16_stage",
     "tensor_routed_block_rows",
     "tensor_tile_no_raise",
 ];
@@ -952,7 +953,7 @@ pub const GDN48_MUTANTS: &[Mutant] = &[
         edits: &[(
             "for (uint head = tiisg; head < BLOOMERY_DELTA_VALUE_HEADS; head += 32u) {",
             "for (uint head = tiisg; head < 32u; head += 32u) {",
-            1,
+            2,
         )],
     },
     Mutant {
@@ -1082,7 +1083,7 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[(
             "sum / float(BLOOMERY_DELTA_HEAD_COLS)",
             "sum / float(BLOOMERY_DELTA_HEAD_COLS * 2)",
-            1,
+            2,
         )],
     },
     Mutant {
@@ -1093,12 +1094,12 @@ pub const MUTANTS: &[Mutant] = &[
             (
                 "raise(faults, args.layer, BLOOMERY_FAULT_SITE_LINEAR_GATE);",
                 "",
-                1,
+                2,
             ),
             (
                 "raise(faults, layer, BLOOMERY_FAULT_SITE_LINEAR_GATE);",
                 "",
-                1,
+                2,
             ),
         ],
     },
@@ -1255,8 +1256,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "a4_matvec",
         why: "one nibble of an A4 word pairs the lane value beside it",
         edits: &[(
-            "acc[1] += lane.yl[4 * m + 1] * (words[m] & 0x00F0);",
-            "acc[1] += lane.yl[4 * m + 2] * (words[m] & 0x00F0);",
+            "acc[1] = fma(lane.yl[4 * m + 1], float(words[m] & 0x00F0), acc[1]);",
+            "acc[1] = fma(lane.yl[4 * m + 2], float(words[m] & 0x00F0), acc[1]);",
             1,
         )],
     },
@@ -3228,6 +3229,50 @@ pub const MUTANTS: &[Mutant] = &[
         )],
     },
     Mutant {
+        name: "mrows_headnorm_scales_swapped",
+        clause: "mrows_headnorm",
+        why: "each activation row of the M-row head-normed out projection takes the other row's head scales",
+        edits: &[(
+            "lo[m] = Q::head_scales(scales + m * BLOOMERY_DELTA_VALUE_HEADS, ib).x;",
+            "lo[m] = Q::head_scales(scales + (M - 1 - m) * BLOOMERY_DELTA_VALUE_HEADS, ib).x;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mrows_headnorm_scale_per_value",
+        clause: "mrows_headnorm",
+        why: "the head scale multiplies every loaded value of its head, not the block's finished contribution: the same sum in another order, other bits in some groups",
+        edits: &[(
+            concat!(
+                "            FOR_UNROLL (short row = 0; row < NR0; ++row) {\n",
+                "                Q::template partial_head_rows<M>(wd[row], lanes, lo, sumf[row]);\n",
+                "            }\n"
+            ),
+            concat!(
+                "            FOR_UNROLL (short m = 0; m < M; ++m) {\n",
+                "                lanes[m].sumy *= lo[m];\n",
+                "                FOR_UNROLL (short k = 0; k < 16; ++k) {\n",
+                "                    lanes[m].yl[k] *= lo[m];\n",
+                "                }\n",
+                "            }\n",
+                "            FOR_UNROLL (short row = 0; row < NR0; ++row) {\n",
+                "                Q::template partial_rows<M>(wd[row], lanes, sumf[row]);\n",
+                "            }\n"
+            ),
+            1,
+        )],
+    },
+    Mutant {
+        name: "mrows_headnorm_partials_first",
+        clause: "mrows_headnorm",
+        why: "every activation row's head scales are computed from the first row's partial sums",
+        edits: &[(
+            "sum += partials[(ulong)m * pstride + head * BLOOMERY_DELTA_COLUMN_BLOCKS + j];",
+            "sum += partials[head * BLOOMERY_DELTA_COLUMN_BLOCKS + j];",
+            1,
+        )],
+    },
+    Mutant {
         name: "mrows_norm_gain",
         clause: "mrows_seg",
         why: "the M-row norm load drops the gain of a value",
@@ -3352,6 +3397,16 @@ pub const TENSOR_MUTANTS: &[Mutant] = &[
         clause: "tensor_gemm_a4",
         why: "the residual epilogue stores the product over the output instead of adding to it",
         edits: &[("*p = RESID ? *p + ct[i] : ct[i];", "*p = ct[i];", 1)],
+    },
+    Mutant {
+        name: "tensor_h16_stage",
+        clause: "tensor_gemm_half_rows",
+        why: "the tensor-op tile stages a half row's chunk with its four runs pairwise swapped",
+        edits: &[(
+            "        dst[g] = *(device const half4 *)(xr + 4 * g);",
+            "        dst[g] = *(device const half4 *)(xr + 4 * (g ^ 1));",
+            1,
+        )],
     },
     Mutant {
         name: "tensor_seg_out",

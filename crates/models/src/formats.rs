@@ -29,5 +29,5 @@ pub(crate) fn span_of(template: &str) -> Option<ReasoningFormat> {
     SPANS
         .iter()
         .copied()
-        .find(|&ReasoningFormat::ThinkSpan { open, .. }| template.contains(open))
+        .find(|format| template.contains(format.think().0))
 }

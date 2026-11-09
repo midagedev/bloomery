@@ -1,0 +1,15 @@
+# kcal on our Spark (GB10, sm_121a): the same bench as kcal-a6000, the arch the staged walk and the slab entry were tuned on.
+# GB10: 273 GB/s of unified memory, 48 SMs [datasheet, kernel-picks.md section 3.1]; the 27 MB weight of 10240x2560 floors at
+# 117 us [derived]. juliankang4's staged walk is 4 to 7 % faster at four columns and level at three [measured: GB10, section 1].
+kind: profile
+question: does the staged MXFP8 walk beat the plain walk at four columns on GB10 as ea840911c measured, on our Spark?
+term: staged / plain mean us a launch ratio, mxfp8_10240x2560_m4, weights cycled over 512 MiB, graph replay, GB10 (bench_picks --time)
+unit: ratio
+predict: 0.92..1.00
+condition: bench-picks.sh holds the lease in BLOOMERY_LOCK_DIR under tools/box.sh's local mode with /root/spark-lead.hold up
+  (spark-box.sh), no bench hold up, no other compute process on the GPU (the gpu-apps line); each pair's candidates gave equal
+  bits on their first launch; the pair's A/A arm lands within 1 % of 1
+decide-in: staged 0 to 8 % faster on our Spark: juliankang4's GB10 row reproduces; the model's sm_121a constants come from it
+decide-below: staged more than 8 % faster: more than the cited span; re-read the stage-cost term (barrier a step) on GB10
+decide-above: staged not faster (ratio above 1.00): the GB10 row does not reproduce on this Spark; check the clock and power
+  counters in the witness and send the lead both rows

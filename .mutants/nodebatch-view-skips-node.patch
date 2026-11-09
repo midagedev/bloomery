@@ -1,0 +1,11 @@
+--- a/crates/gpu/src/host/slots.rs	2026-11-05 05:34:52
++++ b/crates/gpu/src/host/slots.rs	2026-11-05 05:34:52
+@@ -679,7 +679,7 @@
+     #[must_use]
+     pub fn slot(&self, layer: usize, id: u32) -> Option<Slot> {
+         self.map.slot(layer, id).map(|s| match s {
+-            Slot::Tier { tier, .. } if self.on_node(tier) => Slot::Host,
++            Slot::Tier { tier, slot } if self.on_node(tier) => Slot::Tier { tier, slot },
+             s => s,
+         })
+     }

@@ -1,0 +1,16 @@
+--- a/crates/gpu/src/arch/raon1/mla.rs
++++ b/crates/gpu/src/arch/raon1/mla.rs
+@@ -607,9 +607,11 @@
+                 kv: cache,
+                 n_keys_buf: &n_keys,
+                 kq_scale: 1.0 / (d.head_k() as f32).sqrt(),
++                // mutant kimik3mla-causal-off: every row of the pass is one head of a single token, so
++                // each sees all the pass's keys.
+                 geom: FlashGeom {
+-                    tokens: m,
+-                    heads: d.heads,
++                    tokens: 1,
++                    heads: m * d.heads,
+                     rope_dims: d.extra,
+                     latent_dims: LATENT,
+                 },

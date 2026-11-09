@@ -226,6 +226,7 @@ fn a_unified_pool_lowers_the_card_budget_to_the_tiers_floor() {
     // shortfall past the card's whole budget.
     let given = PlanLevers {
         card_budget_bytes: Some(96 << 30).into(),
+        ..PlanLevers::default()
     };
     for (m, levers, short) in [(&off, &unset, 1), (&on, &given, 1), (&on, &unset, full + 1)] {
         let (got, calls) = run(m, levers, &|_| short, 0);

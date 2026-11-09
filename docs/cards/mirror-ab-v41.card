@@ -1,0 +1,34 @@
+# The two-drive mirror (the NVMe tier reader's copy pick, landed for 0.3.13) on a model other than K3.1: V4.1-Flash
+# Q3_K_M at a host room that pages (80G of its ~300 GB of experts), bp, the r8 pair off (a paged plan refuses it by
+# name). K3.1 measured the mirror only beside the union slabs (k31-step-union.card outcome 2 -> 3: 4.18 -> 4.97 tok/s);
+# here the mirror is the one difference between the arms, so its own size is read.
+kind: ab
+question: on a paged V4.1-Flash plan does the sidecar's two-drive copy pick lift decode over the one-drive read, by how much?
+term: decode tok/s @ D=512, n_predict 128, --place bp, --ctx-size 4096, BLOOMERY_HOST_ROOM=80G, BLOOMERY_R8=off, the
+  0.3.13 sm86 tarball's bloomery-serve; arm two = the set's <prefix>.shard-dirs sidecar naming /mirror's copy, arm one =
+  no sidecar; a fresh server and one cold request per row
+unit: %
+predict: +12..+40
+rounds: 3
+sd: 3.0 % docs/cards/k31-rel-serve.card and k31-step-union.card outcome 2/3, one cold paged request against the next on the same set (~3 %)
+condition: tools/ref/mirror-ab.sh under tools/ref/lease-hold.sh, both arms in one lease, the arm order rotated each round, the
+  copy on nvme1 verified by sha256 per shard (tools/ref/k31-mirror-copy.sh); every row's nvtier record must say the plan paged
+  (paged bytes > 0) and arm two's iostat must show nvme1n1 reading beside nvme0n1, else the row is not read
+# derivation: [derived] at a 128 GB host room with no tier card V4.1 decoded 19.4-19.6 tok/s against ~40 all in RAM (README's
+#   Spark-tier table, generate_ds41): a ~51 ms step of which ~26 ms is the one drive's fill wall, serial at a shallow queue.
+#   The mirror splits a layer's misses over two drives at once (K3.1: the fill 189 -> 130 ms a step on the base binary), so
+#   -10..-13 ms of 51 = +25..+35 %; bp's tier card holds part of the paged set here, so the paged share and the effect are
+#   smaller: the band's low end
+#   the plan builds the tier's RAM arena only when the room must move over half the host leg's bytes (BLOOMERY_NVTIER_BYTES's
+#   default rule); under that the paged part reads through the file mapping, where the sidecar does nothing. 128G on V4.1
+#   printed arena=0 (the first launch, stopped), so the room is 80G: the arena is the plan's own default, no arena lever set.
+decide-in: the mirror pays on a paged V4.1 plan; a README row with the conditions and the sidecar named, beside the K3.1 row
+decide-below: under +12: read arm two's nvtier record (copies, fill_bytes, fill_ns against the step) and the plan line (paged
+  bytes, the tier card's share) before any change; a plan that pages little reads near 0 by construction
+decide-above: above +40: read the witness block and arm one's iostat (a queue-starved single drive reads lower than its rate)
+# outcome 2026-11-08 (/root/mirror-ab-v41, the 0.3.13 sm86 tarball's bloomery-serve, --place bp --ctx-size 4096, BLOOMERY_HOST_ROOM=80G
+#  BLOOMERY_R8=off, D=512 N=128, 3 rounds, order rotated; plan: card_experts 45.0 GB, host 5.8 GB, paged 184.7 GB, arena 63.7 GB
+#  (the plan's default), load 36-39 s): tg one 16.93 / 16.92 / 16.99, two 22.42 / 22.48 / 22.32; pp one 26.28 / 25.99 / 26.00, two
+#  40.48 / 40.64 / 40.31. Effect tg +32.2 %, pp +55.1 %: in band (ruler +-6.8 %). iostat over the request: arm one nvme0n1 4,177 MB/s
+#  alone (32 s), arm two nvme0n1 3,148 + nvme1n1 2,780 = 5,928 MB/s (23 s): the second drive adds its rate, the first's queue is no
+#  longer the wall. The rows repeat within 0.5 % (the same request on a cold arena each time). decide-in: a README row.

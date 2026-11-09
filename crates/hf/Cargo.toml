@@ -22,15 +22,18 @@ bloomery-placement = { path = "../placement" }
 # description only, so hf does not close a cycle.
 bloomery-runtime = { path = "../runtime" }
 bloomery-safetensors = { path = "../safetensors" }
+# `engram` decodes tokens by the tokenizer's byte-level alphabet, its one owner; the folder reader's
+# vocabulary also runs through the tokenizer in tests/.
+bloomery-tokenizer = { path = "../tokenizer" }
 # `quant_config` matches compressed-tensors' `re:` module patterns.
 regex = "1.13.1"
 serde_json = "=1.0.151"
 sha1 = "0.10"
 thiserror = { workspace = true }
+# `engram` normalizes token texts as Hugging Face's tokenizers does, with the crate it uses.
+unicode-normalization-alignments = "=0.1.12"
 
 [dev-dependencies]
 # The checkpoint headers in tests/fixtures are kept gzipped.
 flate2 = "1.1.10"
 sha2 = { workspace = true }
-# The vocabulary the folder reader derives runs through the tokenizer in tests/.
-bloomery-tokenizer = { path = "../tokenizer" }

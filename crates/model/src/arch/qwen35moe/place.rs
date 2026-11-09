@@ -38,8 +38,10 @@
 //! with the full head, byte for byte. Under
 //! [`Experts::Card`] ([`PlanInputs::plan_mtp_with`]) the target's expert rule
 //! spreads within its card's budget less the draft's card bytes, so the sum
-//! fits.
+//! fits. The draft program's arena holds a store walk of 64 or 512 rows
+//! ([`StoreRows`]), chosen by the plan from its room.
 
+use bloomery_levers::KvHost;
 use bloomery_placement::slots::{SeqTerms, Stores};
 use gguf::{GgmlType, Split};
 use models::headpick::{HeadRowsError, HeadSet, vocab_sha256};
@@ -204,6 +206,17 @@ pub struct PlanInputs {
     /// as its `given` ([`placement::expert_nvme_tier`]). A gate that plans an
     /// arm by an arena of its own sets it.
     pub arena: Option<u64>,
+    /// The page a host-capable room takes on the plan's stage card — the
+    /// least common multiple of the card's and the host's VMM granularities
+    /// (`gpu`'s `host_page`) — which the plan's page rounding for the K/V
+    /// planes reads under `BLOOMERY_KV_HOST` ([`PlanLevers::kv_host`]):
+    /// [`PlanInputs::room_padding`] rounds the planes at it under `spill`,
+    /// and a plan under `all` counts the planes' whole bytes against its
+    /// host room at it ([`PlanInputs::kv_host_bytes`]), refused by name
+    /// without it. `None` unset and under `off`; a binary that plans under
+    /// the lever reads it once and sets it, as a gate sets
+    /// [`PlanInputs::room`].
+    pub kv_host_page: Option<u64>,
 }
 
 /// Why a plan was refused.
@@ -365,29 +378,80 @@ fn refuse_other_program(spec: &ModelSpec) -> Result<(), PlacementError> {
 }
 
 impl PlanInputs {
+    /// `n` rounded up to `page`; `None` past u64.
+    fn whole(n: u64, page: u64) -> Option<u64> {
+        n.div_ceil(page).checked_mul(page)
+    }
+
+    /// The page a host-capable room takes ([`PlanInputs::kv_host_page`]),
+    /// refused by name where the binary that plans under `BLOOMERY_KV_HOST`
+    /// did not read it: the plan's page rounding for the planes has no page
+    /// to read.
+    fn kv_host_page_of(&self) -> Result<u64, PlacementError> {
+        self.kv_host_page.ok_or_else(|| PlacementError::Metadata {
+            key: "BLOOMERY_KV_HOST".to_owned(),
+            detail: "the page a host-capable room takes was not read; a binary that plans under \
+                     the lever reads it once (gpu's host_page) and sets PlanInputs::kv_host_page"
+                .to_owned(),
+        })
+    }
+
     /// Bytes beyond the positional rows that room-backed stores can hold:
     /// every buffer rounded independently on every resident slot, and the
-    /// device's one shared spare page. `page` is read when the stage card opens.
+    /// device's shared spare pages. `page` is read when the stage card opens.
+    /// `kv` is the K/V planes' backing (`BLOOMERY_KV_HOST`): under `spill` the
+    /// planes round at the page a host-capable room takes
+    /// ([`PlanInputs::kv_host_page`]), not the card's own granularity, and
+    /// the device holds that room's spare page beside the card rooms'; under
+    /// `all` the planes hold no card bytes, so they add no card padding and
+    /// their whole bytes sit on the host ([`PlanInputs::kv_host_bytes`]),
+    /// their room's spare page still on the card.
     pub fn room_padding(
         &self,
         ctx: u64,
         slots: u64,
         drafts: bool,
         page: u64,
+        kv: KvHost,
     ) -> Result<u64, PlacementError> {
         assert!(page > 0, "the device allocation granularity is positive");
-        let padding = |n: u64| n.div_ceil(page).checked_mul(page)?.checked_sub(n);
-        let planes = |g: &models::Gqa| -> Option<u64> {
+        let host_page = match kv {
+            KvHost::Off => None,
+            KvHost::Spill | KvHost::All => Some(self.kv_host_page_of()?),
+        };
+        let at = host_page.unwrap_or(page);
+        let padding = |n: u64, at: u64| Self::whole(n, at)?.checked_sub(n);
+        // The planes' padding at a page of the rooms' own.
+        let planes_at = |g: &models::Gqa, at: u64| -> Option<u64> {
             let values = u64::from(g.kv_heads)
                 .checked_mul(ctx)?
                 .checked_mul(u64::from(g.head_dim))?;
             let one = if self.kv.is_q8() {
-                padding(values)?.checked_add(padding(values / 16)?)?
+                padding(values, at)?.checked_add(padding(values / 16, at)?)?
             } else {
-                padding(values.checked_mul(2)?)?
+                padding(values.checked_mul(2)?, at)?
             };
             one.checked_mul(2)
         };
+        // The target's planes: none under `all` (a host-backed room holds
+        // them off the card), else at the page their rooms take — the card's
+        // own under `off`, a host-capable room's under `spill`.
+        let planes = |g: &models::Gqa| -> Option<u64> {
+            if kv == KvHost::All {
+                return Some(0);
+            }
+            planes_at(g, at)
+        };
+        // The draft's store stays on the card whatever the planes' backing.
+        let draft_planes = |g: &models::Gqa| -> Option<u64> { planes_at(g, page) };
+        // The card rooms' shared spare page, and a host-capable room's own
+        // beside it where the two pages differ.
+        let spare = page
+            + if kv != KvHost::Off && at != page {
+                at
+            } else {
+                0
+            };
         let count = || -> Option<u64> {
             let mut extra = 0u64;
             for layer in &self.spec.layers {
@@ -398,30 +462,71 @@ impl PlanInputs {
                             .div_ceil(u64::from(*pool))
                             .checked_mul(u64::from(*d))?
                             .checked_mul(2)?;
-                        extra = extra.checked_add(padding(bytes)?)?;
+                        extra = extra.checked_add(padding(bytes, page)?)?;
                     }
                 }
             }
             if drafts {
-                extra = extra.checked_add(planes(self.spec.gqa()?)?)?;
+                extra = extra.checked_add(draft_planes(self.spec.gqa()?)?)?;
             }
-            extra.checked_mul(slots)?.checked_add(page)
+            extra.checked_mul(slots)?.checked_add(spare)
         };
         count().ok_or_else(|| PlacementError::CardBytesPastU64 {
             card: "room-backed stores".to_owned(),
         })
     }
 
+    /// The whole bytes the K/V planes of a host-backed store
+    /// (`BLOOMERY_KV_HOST=all`) hold on the host at `ctx` positions over
+    /// `slots` resident sequences: every selecting layer's planes, each plane
+    /// buffer rounded at the page a host-capable room takes
+    /// ([`PlanInputs::kv_host_page`]) — the pages the rooms hold once their
+    /// sequences reach every position. What the plan counts against its host
+    /// room ([`Plan::kv_host_planes`]).
+    pub fn kv_host_bytes(&self, ctx: u64, slots: u64, page: u64) -> Result<u64, PlacementError> {
+        assert!(page > 0, "the page a host-capable room takes is positive");
+        let q8 = self.kv.is_q8();
+        let planes = |g: &models::Gqa| -> Option<u64> {
+            let values = u64::from(g.kv_heads)
+                .checked_mul(ctx)?
+                .checked_mul(u64::from(g.head_dim))?;
+            let one = if q8 {
+                Self::whole(values, page)?.checked_add(Self::whole(values / 16, page)?)?
+            } else {
+                Self::whole(values.checked_mul(2)?, page)?
+            };
+            one.checked_mul(2)
+        };
+        let count = || -> Option<u64> {
+            let mut whole = 0u64;
+            for layer in &self.spec.layers {
+                if let Mixer::Gqa(g) = &layer.mixer
+                    && g.select.is_some()
+                {
+                    whole = whole.checked_add(planes(g)?)?;
+                }
+            }
+            whole.checked_mul(slots)
+        };
+        count().ok_or_else(|| PlacementError::Metadata {
+            key: "the K/V planes on the host".to_owned(),
+            detail: "the planes' bytes over the resident slots pass u64".to_owned(),
+        })
+    }
+
     /// `machine`'s stage card with the page rounding of room-backed stores
     /// ([`PlanInputs::room_padding`]) reserved: what every plan of a load
-    /// that backs its stores by room counts before admission.
+    /// that backs its stores by room counts before admission. `kv` is the
+    /// K/V planes' backing ([`BLOOMERY_KV_HOST`]), as the plan's levers hold
+    /// it.
     pub fn reserve_room(
         &self,
         machine: &mut Machine,
         (ctx, slots, drafts): (u64, u64, bool),
         page: u64,
+        kv: KvHost,
     ) -> Result<(), PlacementError> {
-        let padding = self.room_padding(ctx, slots, drafts, page)?;
+        let padding = self.room_padding(ctx, slots, drafts, page, kv)?;
         machine.cards[0]
             .reserves
             .push(("store page rounding".to_owned(), padding));
@@ -515,6 +620,7 @@ impl PlanInputs {
                 Some(_) => placement::RowTableSource::Parts,
             },
             arena,
+            kv_host_page: None,
         })
     }
 
@@ -888,6 +994,15 @@ impl PlanInputs {
             };
             let floor = 2 * self.seq_state_bytes(ctx_max, beside.mtp);
             let room = plan.plan_at(&self.room);
+            // Under `all` the planes hold their bytes on the host, out of the
+            // room the plan was made at, refused by name past it
+            // ([`PlacementError::KvHostOverHost`]): before the PLE table's
+            // tier and the NVMe tier's split read the room, so both see the
+            // room the planes already took.
+            if levers.kv_host == KvHost::All {
+                let page = self.kv_host_page_of()?;
+                plan.kv_host_planes(self.kv_host_bytes(ctx_max, beside.slots as u64, page)?)?;
+            }
             let page = os::page_bytes().map_err(|e| PlacementError::Host(e.to_string()))?;
             self.place_rows(&mut plan, room, floor, ubatch, page)?;
             plan.host.step_slots(
@@ -978,13 +1093,32 @@ impl PlanInputs {
     /// [`MtpInputs::card_bytes`], else the plan is refused by name; the
     /// stage card's own bound and headroom then hold the sum, and the tier
     /// plans as without the draft.
+    ///
+    /// The draft's store walk takes the rows the plan's room allows
+    /// ([`MtpPlan::store`], `choose_store_rows`): the larger arena where it
+    /// costs the card no expert, else the smaller.
     pub fn plan_mtp_with<'a>(
+        &'a self,
+        machine: &'a Machine,
+        shape: (u64, u64),
+        levers: &PlanLevers,
+        mtp: &'a MtpInputs,
+        experts: Experts,
+    ) -> Result<MtpPlan<'a>, PlaceError> {
+        choose_store_rows(mtp, machine, |rows| {
+            self.plan_mtp_with_rows(machine, shape, levers, mtp, experts, rows)
+        })
+    }
+
+    /// [`PlanInputs::plan_mtp_with`] with the draft's arena at `rows`.
+    fn plan_mtp_with_rows<'a>(
         &'a self,
         machine: &'a Machine,
         (ctx_max, ubatch): (u64, u64),
         levers: &PlanLevers,
         mtp: &'a MtpInputs,
         experts: Experts,
+        store: StoreRows,
     ) -> Result<MtpPlan<'a>, PlaceError> {
         check_shape(ctx_max, ubatch)?;
         let [card] = machine.cards.as_slice() else {
@@ -992,8 +1126,8 @@ impl PlanInputs {
                 cards: machine.cards.len(),
             });
         };
-        let (draft, reserve) = mtp.draft_plan(ctx_max)?;
-        let arena = mtp.arena_bytes();
+        let (draft, reserve) = mtp.draft_plan_at(ctx_max, store)?;
+        let arena = mtp.arena_bytes_at(store);
         if !machine.tiers.is_empty() {
             check_draft_reserve(machine, Some(reserve))?;
             let plan = self.target(
@@ -1017,6 +1151,8 @@ impl PlanInputs {
                 draft,
                 map_bytes: mtp.map_bytes,
                 arena_bytes: arena,
+                store,
+                store_why: StoreWhy::Asked,
             });
         }
         check_draft_reserve(machine, None)?;
@@ -1061,6 +1197,8 @@ impl PlanInputs {
             draft,
             map_bytes: mtp.map_bytes,
             arena_bytes: arena,
+            store,
+            store_why: StoreWhy::Asked,
         })
     }
 
@@ -1076,14 +1214,41 @@ impl PlanInputs {
     pub fn plan_mtp_with_slots<'a>(
         &'a self,
         machine: &'a Machine,
-        (ctx_max, ubatch): (u64, u64),
+        shape: (u64, u64),
         levers: &PlanLevers,
         mtp: &'a MtpInputs,
         experts: Experts,
         slots: usize,
     ) -> Result<MtpPlan<'a>, PlaceError> {
+        choose_store_rows(mtp, machine, |rows| {
+            self.plan_mtp_with_slots_rows(machine, shape, levers, mtp, experts, slots, rows)
+        })
+    }
+
+    /// [`PlanInputs::plan_mtp_with_slots`] with the draft's arena at `rows`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "plan_mtp_with_slots's six and the rows (rust-quality R8)"
+    )]
+    fn plan_mtp_with_slots_rows<'a>(
+        &'a self,
+        machine: &'a Machine,
+        (ctx_max, ubatch): (u64, u64),
+        levers: &PlanLevers,
+        mtp: &'a MtpInputs,
+        experts: Experts,
+        slots: usize,
+        store: StoreRows,
+    ) -> Result<MtpPlan<'a>, PlaceError> {
         if slots == 1 {
-            return self.plan_mtp_with(machine, (ctx_max, ubatch), levers, mtp, experts);
+            return self.plan_mtp_with_rows(
+                machine,
+                (ctx_max, ubatch),
+                levers,
+                mtp,
+                experts,
+                store,
+            );
         }
         check_shape(ctx_max, ubatch)?;
         if slots == 0 {
@@ -1094,8 +1259,8 @@ impl PlanInputs {
                 cards: machine.cards.len(),
             });
         };
-        let (draft, reserve) = mtp.draft_plan_of(ctx_max, slots)?;
-        let arena = mtp.arena_bytes();
+        let (draft, reserve) = mtp.draft_plan_of(ctx_max, slots, store)?;
+        let arena = mtp.arena_bytes_at(store);
         let terms = self.seq_terms(Some(mtp));
         let rows = terms.plan_beside(slots as u64);
         let kv = terms.slots_of(slots as u64);
@@ -1124,6 +1289,8 @@ impl PlanInputs {
                 draft,
                 map_bytes: mtp.map_bytes,
                 arena_bytes: arena,
+                store,
+                store_why: StoreWhy::Asked,
             });
         }
         check_draft_reserve(machine, None)?;
@@ -1170,6 +1337,8 @@ impl PlanInputs {
             draft,
             map_bytes: mtp.map_bytes,
             arena_bytes: arena,
+            store,
+            store_why: StoreWhy::Asked,
         })
     }
 
@@ -1213,8 +1382,9 @@ fn draft_card_bytes(d: &placement::CardTotals, map_bytes: u64) -> u64 {
 }
 
 /// Card bytes the MTP draft's program arena holds at a vocabulary of `vocab`
-/// [derived: the arena `MtpArena::new` allocates
-/// for eight rows — its input record 65 u32 (a store walk's 64 ids); the hidden
+/// and a store walk of `rows` rows [derived: the arena `MtpArena::new` allocates
+/// for eight rows — its input record, one word and a store walk's `rows` ids;
+/// the hidden
 /// rows in and the last row's own copy 2 · (81,920 + 10,240) f32; the
 /// embedding, the mix and sub-layer outputs and the shared expert's rows, 7 ·
 /// 20,480 f32; the input pack 163,840 f32; the streams 81,920 f32; the mix
@@ -1229,22 +1399,109 @@ fn draft_card_bytes(d: &placement::CardTotals, map_bytes: u64) -> u64 {
 /// the head's input and logits' rows 20,480 f32 each; the head's logits 8 ·
 /// `vocab` f32; the readback 18 u32, its ticket count, the stand-in map word
 /// and the chain's 10 words; the taps none (the engine's walk arms none) —
-/// 1,212,160 + 8 · `vocab` f32 and 793 u32; then the store walk's arena for 64
-/// rows, 5,049,938 values: the hidden rows 655,360, the embedding 163,840 and
-/// its positions and key counts 128, the pack 1,310,720 and its 32-value q8
-/// blocks over 256 columns of 5,120 (codes, scales and sums, 20 words a
-/// 64-value step) 409,600, the streams 655,360, the wide mix's scratch
-/// 1,573,696 (the normed streams and the up's rows 655,360 each, the q8 of the
-/// normed streams 204,800, the down's dots and the bottleneck 20,480 each, its
-/// q8 6,400, its BF16 pairs 10,240 and refusals 64, the inject's dots and
-/// the weights 256 each), the mix 163,840 and
-/// its q8 51,200, the keys and values 65,536, and the two one-expert tables
-/// of 256 and 64 slots, 524 and 134 words — four bytes a value].
+/// 1,212,160 + 8 · `vocab` f32 and 728 u32 beside the input record; then the
+/// store walk's arena for `rows` rows ([`mtp_store_words`]) — four bytes a
+/// value].
+///
+/// A load whose arena differs from this count is refused by name
+/// (`Mtp38::arm`), so a restated constant here that drifts from the gpu
+/// crate's (`MTP_STORE_ROWS_LEAST`, `MTP_STORE_ROWS_MOST`,
+/// `MTP_FLASH_SEGMENTS`, `GEMM_BN`) fails the load.
 ///
 /// [`MtpArena::new`]: bloomery_gpu::arch::qwen3moe::Mtp38
 #[must_use]
-pub fn mtp_arena_bytes(vocab: u64) -> u64 {
-    4 * (1_212_160 + 8 * vocab + 49_536 * MTP_FLASH_SEGMENTS + 793 + 5_049_938)
+pub fn mtp_arena_bytes(vocab: u64, rows: u64) -> u64 {
+    4 * (1_212_160
+        + 8 * vocab
+        + 49_536 * MTP_FLASH_SEGMENTS
+        + 728
+        + 1
+        + rows
+        + mtp_store_words(rows))
+}
+
+/// Values of the store walk's arena for `rows` rows (a multiple of
+/// [`GEMM_BN`]): per row the hidden rows 10,240, the embedding 2,560, its
+/// position and key count 2, the pack 20,480 and its 32-value q8 blocks over
+/// four columns of 5,120 (codes, scales and sums, 20 words a 64-value step)
+/// 6,400, the streams 10,240, the wide mix's scratch 24,589 (the normed
+/// streams and the up's rows 10,240 each, the q8 of the normed streams 3,200,
+/// the down's dots and the bottleneck 324 and 320, its q8 100, its BF16 pairs
+/// 160 and refusal 1, the inject's weights 4), the mix 2,560 and its q8 800,
+/// the keys and values 1,024 — 78,895 values; and the two one-expert route
+/// tables, over `4 · rows` and `rows` slots ([`route_table_words`]).
+const fn mtp_store_words(rows: u64) -> u64 {
+    78_895 * rows + route_table_words(4 * rows) + route_table_words(rows)
+}
+
+/// Words of a one-expert route table for `slots` slots (`GemmRoute::new`):
+/// the slot list and the all-zero ids, `slots` each, the tiles (`2 · (slots /
+/// GEMM_BN + 1)` words, an expert's most) and the tile and refusal counts.
+const fn route_table_words(slots: u64) -> u64 {
+    2 * slots + 2 * (slots / GEMM_BN + 1) + 2
+}
+
+/// The GEMM's slot tile, `gemm::GEMM_BN` restated.
+const GEMM_BN: u64 = 64;
+
+/// The widths of the draft's store walk a plan chooses between: the rows of
+/// the arena it runs in, the columns of its GEMMs. The prompt's rows are
+/// walked in runs of this many, so the wider walk launches an eighth of the
+/// walks; its arena is 141,399,832 B larger ([`mtp_arena_bytes`]).
+/// `MTP_STORE_ROWS_LEAST` and `MTP_STORE_ROWS_MOST` of the gpu crate,
+/// restated; `gate_qwen4exp_mtp`'s arena clause holds them equal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreRows {
+    /// 64 rows: the arena a plan keeps when the wider one costs it a card
+    /// expert or the plan.
+    Least,
+    /// 512 rows: the arena a plan takes when it has the room.
+    Most,
+}
+
+impl StoreRows {
+    /// The rows of the store walk's arena.
+    #[must_use]
+    pub const fn rows(self) -> u64 {
+        match self {
+            StoreRows::Least => 64,
+            StoreRows::Most => 512,
+        }
+    }
+}
+
+/// Why a plan holds the store walk's rows it holds ([`MtpPlan::store`]),
+/// printed with the plan (`record::PLAN38`'s `mtp_rows_why`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreWhy {
+    /// [`StoreRows::Most`]: the plan with the larger arena holds and keeps
+    /// every card expert the plan with the smaller one keeps.
+    Room,
+    /// [`StoreRows::Least`]: the larger arena leaves the card `experts` fewer
+    /// routed experts.
+    Displaces { experts: u64 },
+    /// [`StoreRows::Least`]: the plan with the larger arena is refused (the
+    /// card's bound).
+    Short,
+    /// [`StoreRows::Least`]: a plan (b′) machine's stage card holds the
+    /// draft's bytes as the caller's reserve row, which names the arena.
+    Reserve,
+    /// The inputs named the rows ([`MtpInputs::asking`]).
+    Asked,
+}
+
+impl StoreWhy {
+    /// The word the plan's record prints.
+    #[must_use]
+    pub fn word(self) -> String {
+        match self {
+            StoreWhy::Room => "room".to_string(),
+            StoreWhy::Displaces { experts } => format!("displaces:{experts}"),
+            StoreWhy::Short => "short".to_string(),
+            StoreWhy::Reserve => "reserve".to_string(),
+            StoreWhy::Asked => "asked".to_string(),
+        }
+    }
 }
 
 /// The decode flash's segments a row of the MTP program's arena holds
@@ -1295,6 +1552,12 @@ pub struct MtpPlan<'a> {
     /// beside the draft's card bytes; the load's `Mtp38::arm` holds the arena
     /// it allocates to it.
     pub arena_bytes: u64,
+    /// The rows of the draft's store walk the arena holds ([`StoreRows`]),
+    /// which `arena_bytes` counts; the load's `Mtp38::arm` allocates the
+    /// arena for them.
+    pub store: StoreRows,
+    /// Why the plan holds those rows.
+    pub store_why: StoreWhy,
     /// The card's usable bytes (capped by the card budget) less the target's
     /// and the draft's card terms; the margin is inside it.
     pub headroom_bytes: i128,
@@ -1917,6 +2180,51 @@ fn reserve_rows(card: &Card, name: &str) -> Vec<u64> {
         .collect()
 }
 
+/// The plan of the MTP draft `mtp` beside the target on `machine`, at the
+/// store walk's rows its room allows. `plan_at` plans at given rows.
+///
+/// The rule, in one place: [`StoreRows::Most`] when the plan with the larger
+/// arena holds and keeps every routed expert on the card that the plan with
+/// the smaller one keeps (so it costs no card expert, and no slot or context
+/// either, which the same plan at the same slots and context holds);
+/// [`StoreRows::Least`] otherwise. Inputs that name their rows
+/// ([`MtpInputs::asking`]) plan at them, and a plan (b′) machine's stage card
+/// holds the draft's bytes as the caller's reserve row, which names the
+/// smaller arena ([`MtpInputs::card_bytes_of`]).
+fn choose_store_rows<'a>(
+    mtp: &MtpInputs,
+    machine: &Machine,
+    plan_at: impl Fn(StoreRows) -> Result<MtpPlan<'a>, PlaceError>,
+) -> Result<MtpPlan<'a>, PlaceError> {
+    if let Some(rows) = mtp.asked {
+        return plan_at(rows);
+    }
+    if !machine.tiers.is_empty() {
+        let mut plan = plan_at(StoreRows::Least)?;
+        plan.store_why = StoreWhy::Reserve;
+        return Ok(plan);
+    }
+    let mut least = plan_at(StoreRows::Least)?;
+    match plan_at(StoreRows::Most) {
+        Ok(mut most) => {
+            let (kept, held) = (least.plan.cards[0].experts, most.plan.cards[0].experts);
+            if held >= kept {
+                most.store_why = StoreWhy::Room;
+                Ok(most)
+            } else {
+                least.store_why = StoreWhy::Displaces {
+                    experts: kept - held,
+                };
+                Ok(least)
+            }
+        }
+        Err(_) => {
+            least.store_why = StoreWhy::Short;
+            Ok(least)
+        }
+    }
+}
+
 /// The stage cards' [`MTP_RESERVE`] rows against `want`: none for `None`,
 /// exactly one of `want` bytes on the one stage card for `Some`; anything
 /// else is refused by name ([`PlaceError::DraftReserve`]).
@@ -2296,6 +2604,19 @@ impl KvBytes for KvLayout {
         own + ple
     }
 
+    /// A selecting layer's planes alone — the part a host-backed store
+    /// (`BLOOMERY_KV_HOST=all`) holds off the card; a plain attention
+    /// layer's cache is plain device tensors on the loads that read this
+    /// layout, so none of it moves.
+    fn plane_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
+        match (&self.select, self.kinds.get(layer)) {
+            (Some(_), Some(Kind::Attention)) => {
+                kv_plane_bytes(self.kv_heads, self.head_dim, self.q8, ctx_max)
+            }
+            _ => 0,
+        }
+    }
+
     fn stage_position_bytes(&self, ctx_max: u64) -> u64 {
         self.rope_row * ctx_max
     }
@@ -2476,7 +2797,7 @@ pub struct FileTensor {
 /// What a plan with an MTP draft is made from ([`PlanInputs::plan_mtp`]):
 /// the draft's description, its file's tensors as a one-layer model on a
 /// card of its own ([`MtpInputs::machine`]), and its store.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct MtpInputs {
     /// The layer, its head rows the list the head reads or the full head.
     pub draft: MtpDraft,
@@ -2501,33 +2822,51 @@ pub struct MtpInputs {
     /// ([`mtp_head_act_bytes`]). [`MtpInputs::from_parts`] reads no target,
     /// so it records the Q8_0 form.
     pub borrowed_head: mtp::BorrowedHead,
+    /// The store walk's rows when the inputs name them
+    /// ([`MtpInputs::asking`]); `None` leaves the plan to choose them from
+    /// its room ([`StoreRows`], `choose_store_rows`).
+    asked: Option<StoreRows>,
 }
 
 impl MtpInputs {
-    /// Card bytes the draft's program arena holds: [`mtp_arena_bytes`] at
-    /// the draft's vocabulary and its borrowed head's activation
-    /// ([`mtp_head_act_bytes`]). The one owner of the arena term: the
-    /// reserve the target's expert rule spreads within
-    /// ([`MtpInputs::draft_plan`]), the drafted plan's card bound and its
+    /// These inputs with the store walk's rows named: the plan holds `rows`
+    /// whatever its room, and refuses by name when the card cannot hold them.
+    /// For a gate that pins one arena; a load leaves the rows to the plan.
+    #[must_use]
+    pub fn asking(mut self, rows: StoreRows) -> MtpInputs {
+        self.asked = Some(rows);
+        self
+    }
+
+    /// Card bytes the draft's program arena holds at `rows`:
+    /// [`mtp_arena_bytes`] at the draft's vocabulary and its borrowed head's
+    /// activation ([`mtp_head_act_bytes`]). The one owner of the arena term:
+    /// the reserve the target's expert rule spreads within
+    /// ([`MtpInputs::draft_plan_at`]), the drafted plan's card bound and its
     /// [`MtpPlan::arena_bytes`] all take it from here.
     #[must_use]
-    pub fn arena_bytes(&self) -> u64 {
-        mtp_arena_bytes(u64::from(self.draft.vocab))
+    pub fn arena_bytes_at(&self, rows: StoreRows) -> u64 {
+        mtp_arena_bytes(u64::from(self.draft.vocab), rows.rows())
             + mtp_head_act_bytes(self.borrowed_head, u64::from(self.draft.hidden))
     }
 
     /// The draft's plan at `ctx_max` positions on its own card
     /// ([`MtpInputs::machine`]), and the bytes it adds to the target's card:
     /// its granules, its store, the head's row map and its program's arena
-    /// ([`MtpInputs::arena_bytes`]). Refused by name when the plan keeps a
-    /// routed expert off the card.
-    fn draft_plan(&self, ctx_max: u64) -> Result<(Plan<'_>, u64), PlaceError> {
-        self.draft_plan_of(ctx_max, 1)
+    /// at `rows` ([`MtpInputs::arena_bytes_at`]). Refused by name when the
+    /// plan keeps a routed expert off the card.
+    fn draft_plan_at(&self, ctx_max: u64, rows: StoreRows) -> Result<(Plan<'_>, u64), PlaceError> {
+        self.draft_plan_of(ctx_max, 1, rows)
     }
 
-    /// [`MtpInputs::draft_plan`] for a load that serves `slots` resident
+    /// [`MtpInputs::draft_plan_at`] for a load that serves `slots` resident
     /// sequences: the draft's store counts them all.
-    fn draft_plan_of(&self, ctx_max: u64, slots: usize) -> Result<(Plan<'_>, u64), PlaceError> {
+    fn draft_plan_of(
+        &self,
+        ctx_max: u64,
+        slots: usize,
+        rows: StoreRows,
+    ) -> Result<(Plan<'_>, u64), PlaceError> {
         // The draft's own plan is a plan of its one layer, whose sequence is
         // its store; the rows its walks read are the target's `beside`.
         let terms = SeqTerms {
@@ -2551,7 +2890,7 @@ impl MtpInputs {
                 experts: self.model.experts,
             });
         }
-        let bytes = draft_card_bytes(&draft.cards[0], self.map_bytes) + self.arena_bytes();
+        let bytes = draft_card_bytes(&draft.cards[0], self.map_bytes) + self.arena_bytes_at(rows);
         Ok((draft, bytes))
     }
 
@@ -2576,7 +2915,8 @@ impl MtpInputs {
     /// [`MtpInputs::card_bytes`] for a load that serves `slots` resident
     /// sequences: the reserve [`PlanInputs::plan_mtp_with_slots`] checks a
     /// plan (b′) machine for, from the one owner of both,
-    /// [`MtpInputs::draft_plan_of`].
+    /// [`MtpInputs::draft_plan_of`], at the arena a plan (b′) machine holds:
+    /// the named rows, else [`StoreRows::Least`] ([`StoreWhy::Reserve`]).
     pub fn card_bytes_of(&self, ctx_max: u64, slots: usize) -> Result<u64, PlaceError> {
         if ctx_max == 0 || ctx_max > KERNEL_POSITIONS {
             return Err(PlaceError::Positions { ctx_max });
@@ -2584,7 +2924,9 @@ impl MtpInputs {
         if slots == 0 {
             return Err(PlaceError::Slots { slots });
         }
-        self.draft_plan_of(ctx_max, slots).map(|(_, bytes)| bytes)
+        let rows = self.asked.unwrap_or(StoreRows::Least);
+        self.draft_plan_of(ctx_max, slots, rows)
+            .map(|(_, bytes)| bytes)
     }
 
     /// The MTP draft `draft` read against the target `target` that `inputs`
@@ -2821,6 +3163,7 @@ impl MtpInputs {
             kv,
             map_bytes,
             borrowed_head: mtp::BorrowedHead::Q8_0,
+            asked: None,
         })
     }
 
@@ -2909,8 +3252,8 @@ mod tests {
 
     use super::{
         DELTA_VERIFY_ROWS, Ffn, Kind, KvBytes, KvLayout, Mixer, ModelSpec, OutGate, PASS_ROWS,
-        PlacementError, delta_carry_bytes, delta_lane_bytes, delta_record_bytes, gdn_bytes,
-        ple_ring_bytes, recurrent_bytes, refuse_other_program,
+        PlaceError, PlacementError, delta_carry_bytes, delta_lane_bytes, delta_record_bytes,
+        gdn_bytes, ple_ring_bytes, recurrent_bytes, refuse_other_program,
     };
 
     /// A GQA mixer of `kv_heads` key heads of 256 values, rotating `rope_dims` values of
@@ -3107,6 +3450,7 @@ mod tests {
         );
         let levers = PlanLevers {
             card_budget_bytes: bloomery_levers::CardBudget::default(),
+            ..PlanLevers::default()
         };
         for ubatch in [1, 8, 512, 4096] {
             for (input, tier) in [
@@ -3174,6 +3518,319 @@ mod tests {
         }
     }
 
+    /// A qwen4exp plan spreads its experts at the KV floor the levers name
+    /// (`PlanLevers::kv_floor`, `BLOOMERY_KV_FLOOR`) and keeps every other
+    /// term at the context: on this header's one attention layer the 1 GiB
+    /// of K/V planes a 65,536-position cap takes holds 14 of the model's 32
+    /// experts, and a 4,096-position floor gives all 32 back; the plan's
+    /// `kv_floor` and cache term say so, and a floor above the context is
+    /// refused by name. Unset, the plan is the one the lever unset made:
+    /// its cache term is the cap's own KV.
+    ///
+    /// FAIL-first: a floor read at the cap holds the cap's experts and no
+    /// more.
+    #[test]
+    fn a_qwen4exp_plan_spreads_its_experts_at_the_kv_floor() {
+        use crate::arch::qwen35moe::hparams::tests::{keys, tensors};
+        use crate::arch::synthetic::{Ty, V, header_typed};
+        use crate::placement::PlanLevers;
+        use crate::placement::workstation::HostRead;
+
+        let typed: Vec<_> = tensors()
+            .into_iter()
+            .map(|(n, d)| {
+                // The program's card leg reads a Q4_K gate and up and a Q8_0
+                // down ([`PROGRAM`]); a stack of another type keeps its
+                // experts on the host.
+                if n.contains(".ffn_gate_exps") || n.contains(".ffn_up_exps") {
+                    (n, vec![2_621_440, 1, 8], Ty::Q4K)
+                } else if n.contains(".ffn_down_exps") {
+                    (n, vec![2_097_152, 1, 8], Ty::Q8_0)
+                } else if n.ends_with(".attn_q.weight") {
+                    (n, vec![64, 8_192], Ty::F32)
+                } else {
+                    (n, d, Ty::F32)
+                }
+            })
+            .collect();
+        let pre = [("tokenizer.ggml.pre", V::Str("qwen35"))];
+        // The attention layer's key width 2,048, so its K/V planes alone are
+        // half a GiB at the 65,536-position cap and a thirty-second of that
+        // at the 4,096-position floor.
+        let keys: Vec<(&str, V)> = keys()
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    k,
+                    match k {
+                        "attention.key_length" | "attention.value_length" => V::U32(2_048),
+                        _ => v,
+                    },
+                )
+            })
+            .collect();
+        let path = header_typed("q4x-kvfloor", "qwen4exp", &keys, &pre, &typed);
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let inputs = super::PlanInputs::describe_in(&split, (u64::MAX, HostRead::Given))
+            .expect("the file describes");
+        let _ = std::fs::remove_file(&path);
+        // A card of 1.75 GiB whose room the cap's 1 GiB of K/V planes and
+        // the model's 32 experts (~5 MB each) contend for: the cap holds
+        // some of them, the floor's KV gives the rest back.
+        let small = crate::placement::workstation::CardSpec {
+            name: "small",
+            total_bytes: 7 << 28,
+            driver_reserve_bytes: 0,
+            device: None,
+            free_bytes: None,
+            held_by: None,
+            integrated: false,
+            margin_bytes: Some(64 << 20),
+            granule_bytes: crate::placement::workstation::GRANULE,
+        };
+        let machine = super::machine(
+            small,
+            crate::arch::qwen35moe::place::Stack::q8_blocks32(inputs.model.layers),
+            8,
+        );
+        let levers = |floor: Option<u64>| PlanLevers {
+            kv_floor: floor,
+            ..PlanLevers::default()
+        };
+        let cap_plan = inputs
+            .plan_with(&machine, (65_536, 8), &levers(None), super::Experts::Card)
+            .expect("the cap's plan");
+        let cap = &cap_plan.cards[0];
+        let floored = inputs
+            .plan_with(
+                &machine,
+                (65_536, 8),
+                &levers(Some(4_096)),
+                super::Experts::Card,
+            )
+            .expect("the floor's plan");
+        assert_eq!(
+            cap.experts, 14,
+            "the cap's KV displaces the experts it cannot hold"
+        );
+        assert_eq!(
+            floored.cards[0].experts,
+            inputs.model.experts * inputs.model.layers as u64,
+            "the floor's KV gives every expert back"
+        );
+        assert_eq!(floored.kv_floor, Some(4_096));
+        assert!(cap_plan.kv_floor.is_none());
+        assert_eq!(floored.ctx_max, 65_536, "the cap stays the plan's context");
+        // The cache term is the floor's own — what a plan made at 4,096
+        // positions holds — and unset it is the cap's.
+        let floor_ctx = inputs
+            .plan_with(
+                &machine,
+                (4_096, 8),
+                &PlanLevers::default(),
+                super::Experts::Card,
+            )
+            .expect("a plan at the floor's context");
+        assert_eq!(floored.cards[0].kv_bytes, floor_ctx.cards[0].kv_bytes);
+        let over = inputs
+            .plan_with(
+                &machine,
+                (4_096, 8),
+                &levers(Some(4_097)),
+                super::Experts::Card,
+            )
+            .expect_err("a floor above the context is refused");
+        let text = over.to_string();
+        assert!(
+            text.contains("BLOOMERY_KV_FLOOR") && text.contains("4097") && text.contains("4096"),
+            "{text}"
+        );
+    }
+
+    /// A qwen4exp plan under `BLOOMERY_KV_HOST=all` holds its K/V planes on
+    /// the host: the card's cache term drops the planes (the half GiB the
+    /// cap takes on this header's one attention layer), so the expert spread
+    /// gets their bytes as a floor's do — every expert back where the cap's
+    /// KV displaced all but 14 — while the pooled keys, the ring and the
+    /// stage rows stay counted. The host counts the planes' whole bytes,
+    /// every plane buffer rounded at the page a host-capable room takes, out
+    /// of the room the plan was made at, refused by name one byte under
+    /// their need; the plan's `kv_host` says the backing, and `all` beside a
+    /// `BLOOMERY_KV_FLOOR` is refused by name.
+    ///
+    /// FAIL-first: a plan that ignores the backing holds the cap's 14
+    /// experts and its cap's cache term.
+    #[test]
+    fn a_qwen4exp_plan_holds_its_kv_planes_on_the_host_under_all() {
+        use crate::arch::qwen35moe::hparams::tests::{keys, tensors};
+        use crate::arch::synthetic::{Ty, V, header_typed};
+        use crate::placement::PlanLevers;
+        use crate::placement::workstation::{HostNeed, HostRead};
+        use bloomery_levers::KvHost;
+        use runtime::stores::kv_plane_bytes;
+
+        let typed: Vec<_> = tensors()
+            .into_iter()
+            .map(|(n, d)| {
+                if n.contains(".ffn_gate_exps") || n.contains(".ffn_up_exps") {
+                    (n, vec![2_621_440, 1, 8], Ty::Q4K)
+                } else if n.contains(".ffn_down_exps") {
+                    (n, vec![2_097_152, 1, 8], Ty::Q8_0)
+                } else if n.ends_with(".attn_q.weight") {
+                    (n, vec![64, 8_192], Ty::F32)
+                } else {
+                    (n, d, Ty::F32)
+                }
+            })
+            .collect();
+        let pre = [("tokenizer.ggml.pre", V::Str("qwen35"))];
+        let keys: Vec<(&str, V)> = keys()
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    k,
+                    match k {
+                        "attention.key_length" | "attention.value_length" => V::U32(2_048),
+                        _ => v,
+                    },
+                )
+            })
+            .collect();
+        let path = header_typed("q4x-kvhost", "qwen4exp", &keys, &pre, &typed);
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let mut inputs = super::PlanInputs::describe_in(&split, (u64::MAX, HostRead::Given))
+            .expect("the file describes");
+        let _ = std::fs::remove_file(&path);
+        let page = 2u64 << 20;
+        inputs.kv_host_page = Some(page);
+        let small = crate::placement::workstation::CardSpec {
+            name: "small",
+            total_bytes: 7 << 28,
+            driver_reserve_bytes: 0,
+            device: None,
+            free_bytes: None,
+            held_by: None,
+            integrated: false,
+            margin_bytes: Some(64 << 20),
+            granule_bytes: crate::placement::workstation::GRANULE,
+        };
+        let machine = super::machine(
+            small,
+            crate::arch::qwen35moe::place::Stack::q8_blocks32(inputs.model.layers),
+            8,
+        );
+        // The one attention layer's planes, derived from its header shape:
+        // what leaves the card's cache term and lands on the host, each of
+        // the two plane buffers rounded at the host-capable page.
+        let g = inputs
+            .spec
+            .layers
+            .iter()
+            .find_map(|l| match &l.mixer {
+                Mixer::Gqa(g) if g.select.is_some() => Some((g.kv_heads, g.head_dim)),
+                _ => None,
+            })
+            .expect("a selecting layer");
+        let (heads, dim) = (u64::from(g.0), u64::from(g.1));
+        let planes = kv_plane_bytes(heads as usize, dim as usize, false, 65_536);
+        let whole_bytes = |n: u64, at: u64| n.div_ceil(at) * at;
+        let on_host = 2 * whole_bytes(heads * 65_536 * dim * 2, page);
+        assert!(
+            on_host >= planes && on_host - planes < 2 * page,
+            "the host bytes are the planes' two buffers page-rounded: {on_host} over {planes}"
+        );
+        let off = inputs
+            .plan_with(
+                &machine,
+                (65_536, 8),
+                &PlanLevers::default(),
+                super::Experts::Card,
+            )
+            .expect("the cap's plan");
+        assert_eq!(off.kv_host, KvHost::Off);
+        assert_eq!(
+            off.cards[0].experts, 14,
+            "the cap's KV displaces the experts"
+        );
+        let all = inputs
+            .plan_with(
+                &machine,
+                (65_536, 8),
+                &PlanLevers {
+                    kv_host: KvHost::All,
+                    ..PlanLevers::default()
+                },
+                super::Experts::Card,
+            )
+            .expect("the plan under all");
+        assert_eq!(all.kv_host, KvHost::All);
+        assert!(all.kv_floor.is_none(), "all needs no floor");
+        assert_eq!(
+            all.cards[0].experts,
+            inputs.model.experts * inputs.model.layers as u64,
+            "the planes' bytes give every expert back"
+        );
+        assert!(
+            all.cards[0].experts > off.cards[0].experts,
+            "the expert spread got the planes' bytes"
+        );
+        assert_eq!(
+            all.cards[0].kv_bytes,
+            off.cards[0].kv_bytes - planes,
+            "the cache term drops exactly the planes, the pooled keys and ring kept"
+        );
+        assert_eq!(
+            all.host.kv_host_bytes, on_host,
+            "the host holds the planes' whole bytes, both plane buffers rounded at the page"
+        );
+        // The room the plan was made at takes the planes or refuses by name:
+        // its need with them is the boundary, and the refusal is the planes'
+        // own (it runs before the PLE table's tier and the NVMe tier's split
+        // read the room).
+        let need = HostNeed::of(&all, 0).plan_bytes();
+        inputs.room = (need - 1, HostRead::Given);
+        let over = inputs
+            .plan_with(
+                &machine,
+                (65_536, 8),
+                &PlanLevers {
+                    kv_host: KvHost::All,
+                    ..PlanLevers::default()
+                },
+                super::Experts::Card,
+            )
+            .expect_err("one byte under the need is refused");
+        assert!(matches!(
+            &over,
+            PlaceError::Placement(PlacementError::KvHostOverHost { bytes, .. }) if *bytes == on_host
+        ));
+        let text = over.to_string();
+        assert!(
+            text.contains("BLOOMERY_KV_HOST") && text.contains("planes"),
+            "{text}"
+        );
+        // `all` beside a floor is refused by name: it already plans the
+        // spread at a zero card position.
+        inputs.room = (u64::MAX, HostRead::Given);
+        let both = inputs
+            .plan_with(
+                &machine,
+                (65_536, 8),
+                &PlanLevers {
+                    kv_host: KvHost::All,
+                    kv_floor: Some(4_096),
+                    ..PlanLevers::default()
+                },
+                super::Experts::Card,
+            )
+            .expect_err("all beside a floor is refused");
+        let text = both.to_string();
+        assert!(
+            text.contains("BLOOMERY_KV_HOST") && text.contains("BLOOMERY_KV_FLOOR"),
+            "{text}"
+        );
+    }
+
     /// A qwen4exp file's stream slot is its widest routed expert, the gate, up and down at their
     /// file bytes: three Q8_0 rows of 64 values, 68 B each, or three NVFP4 rows, 36 B each, and
     /// each NVFP4 stack's four-byte tensor scale. A load of every expert on the host streams
@@ -3231,6 +3888,7 @@ mod tests {
         workstation::reserve_stream_staging(&mut host_only, words.stream_slot(host).unwrap());
         let levers = PlanLevers {
             card_budget_bytes: bloomery_levers::CardBudget::default(),
+            ..PlanLevers::default()
         };
         let how = Hosting {
             lock: false,
@@ -3771,6 +4429,7 @@ mod tests {
             let (model, machine) = (model(), machine(131 * MIB));
             let levers = PlanLevers {
                 card_budget_bytes: Some(2 * MIB).into(),
+                ..PlanLevers::default()
             };
             let card = card_plan(&model, &machine, &levers, 0);
             let host = placement::plan_host_routed(&model, &machine, 4096, &NoKv, &levers)
@@ -3803,7 +4462,7 @@ mod tests {
         };
 
         use super::super::{
-            FileTensor, MtpInputs, MtpLoad, mtp_arena_bytes, mtp_tensors, mtp_widened,
+            FileTensor, MtpInputs, MtpLoad, StoreRows, mtp_arena_bytes, mtp_tensors, mtp_widened,
         };
         use crate::arch::synthetic::header;
         use crate::placement::{self, CardFormat, Device, PlanLevers, Role, RoutedRule};
@@ -3825,12 +4484,28 @@ mod tests {
         // PIN(2026-10-24): the HC bottleneck's BF16 pairs and refusal add 64 · 644 = 41,216 B.
         #[test]
         fn the_mtp_arena_formula() {
-            assert_eq!(mtp_arena_bytes(248_320), 48_849_324);
+            assert_eq!(mtp_arena_bytes(248_320, 64), 48_849_324);
             assert_eq!(
-                mtp_arena_bytes(248_320),
+                mtp_arena_bytes(248_320, 64),
                 4 * (1_212_160 + 8 * 248_320 + 49_536 * 80 + 793 + 5_049_938)
             );
-            assert_eq!(mtp_arena_bytes(248_321) - mtp_arena_bytes(248_320), 4 * 8);
+            assert_eq!(
+                mtp_arena_bytes(248_321, 64) - mtp_arena_bytes(248_320, 64),
+                4 * 8
+            );
+            // The wider store walk [derived: 78,895 · 512 = 40,394,240 values and the
+            // two route tables of 2,048 and 512 slots, 4,164 and 1,044 words, 40,399,448 where 64
+            // rows hold 5,049,938; the input record's 512 ids where it holds 64, 1,241 u32 where it
+            // holds 793].
+            assert_eq!(mtp_arena_bytes(248_320, 512), 190_249_156);
+            assert_eq!(
+                mtp_arena_bytes(248_320, 512),
+                4 * (1_212_160 + 8 * 248_320 + 49_536 * 80 + 1_241 + 40_399_448)
+            );
+            assert_eq!(
+                mtp_arena_bytes(248_320, 512) - mtp_arena_bytes(248_320, 64),
+                141_399_832
+            );
         }
 
         /// Qwen3.8's MTP layer as `mtp_of` reads the shared file.
@@ -3874,6 +4549,7 @@ mod tests {
                         latent: None,
                         pre_exp_norm: false,
                         post_exp_norm: None,
+                        sum_norm: false,
                         act: Act::SwiGlu { limit: None },
                         router: Router {
                             score: Score::Softmax,
@@ -3986,7 +4662,7 @@ mod tests {
                     .iter()
                     .all(|t| !matches!(t.load, MtpLoad::Widened(_)))
             );
-            let plan = m.draft_plan(4096).unwrap().0;
+            let plan = m.draft_plan_at(4096, StoreRows::Least).unwrap().0;
             assert!(plan.violations().is_empty(), "{:?}", plan.violations());
             assert_eq!(plan.n_l, [512]);
             for t in &m.model.tensors {
@@ -4039,7 +4715,7 @@ mod tests {
                     f.nbytes = f.dims.iter().product::<u64>() * ty.type_size().unwrap();
                 }
                 let m = MtpInputs::from_parts(draft(HeadSet::Full), &stored).unwrap();
-                let plan = m.draft_plan(4096).unwrap().0;
+                let plan = m.draft_plan_at(4096, StoreRows::Least).unwrap().0;
                 assert!(plan.violations().is_empty(), "{:?}", plan.violations());
                 for (name, ty) in parts {
                     let row = plan
@@ -4219,6 +4895,8 @@ mod tests {
     mod slots {
         use std::num::NonZeroU64;
 
+        use bloomery_levers::KvHost;
+
         use gguf::GgmlType;
         use models::headpick::HeadSet;
         use models::{
@@ -4229,8 +4907,8 @@ mod tests {
 
         use super::super::{
             Beside, Experts, KvLayout, MtpInputs, PlaceError, PlanInputs, ROUTE_UNIT_RESERVE,
-            RouteForm, UBATCH_PLANNED, card_route_run, draft_card_bytes, machine_bp,
-            route_unit_bytes, slot_resident_bytes, tier_batch_of, widen_card_route,
+            RouteForm, StoreRows, StoreWhy, UBATCH_PLANNED, card_route_run, draft_card_bytes,
+            machine_bp, route_unit_bytes, slot_resident_bytes, tier_batch_of, widen_card_route,
         };
         use super::mtp::{draft, file};
         use crate::placement::workstation::HostRead;
@@ -4295,6 +4973,7 @@ mod tests {
                     latent: None,
                     pre_exp_norm: false,
                     post_exp_norm: None,
+                    sum_norm: false,
                     act: Act::SwiGlu { limit: None },
                     router: Router {
                         score: Score::Softmax,
@@ -4381,6 +5060,7 @@ mod tests {
                 room: (u64::MAX, HostRead::Given),
                 row_source: placement::RowTableSource::Split,
                 arena: None,
+                kv_host_page: None,
             }
         }
 
@@ -4420,7 +5100,7 @@ mod tests {
                                     })
                                     .sum();
                                 let padding = inputs
-                                    .room_padding(ctx, slots, drafts, page)
+                                    .room_padding(ctx, slots, drafts, page, KvHost::Off)
                                     .expect("room padding");
                                 assert_eq!(
                                     raw * slots + padding,
@@ -4437,11 +5117,11 @@ mod tests {
             let (ctx, slots, page) = (16, 16, 2 << 20);
             let drafts = false;
             let padding = inputs
-                .room_padding(ctx, slots, drafts, page)
+                .room_padding(ctx, slots, drafts, page, KvHost::Off)
                 .expect("padding");
             let mut machine = machine();
             inputs
-                .reserve_room(&mut machine, (ctx, slots, drafts), page)
+                .reserve_room(&mut machine, (ctx, slots, drafts), page, KvHost::Off)
                 .expect("reserve");
             let levers = PlanLevers::default();
             let plan = inputs
@@ -4471,7 +5151,7 @@ mod tests {
                 (16, 1, u64::MAX),
             ] {
                 let e = inputs
-                    .room_padding(ctx, slots, drafts, page)
+                    .room_padding(ctx, slots, drafts, page, KvHost::Off)
                     .expect_err("overflow refuses");
                 assert!(
                     matches!(e, PlacementError::CardBytesPastU64 { ref card } if card == "room-backed stores")
@@ -4586,7 +5266,7 @@ mod tests {
 
         /// The draft's plan of `slots` slots, its store times the slots, and
         /// the bytes it adds to the target's card.
-        fn draft_of(mtp: &MtpInputs, slots: u64) -> (Plan<'_>, u64) {
+        fn draft_of(mtp: &MtpInputs, slots: u64, rows: StoreRows) -> (Plan<'_>, u64) {
             let kv = Times { kv: &mtp.kv, slots };
             let plan = placement::plan_routed(
                 &mtp.model,
@@ -4597,7 +5277,7 @@ mod tests {
                 RoutedRule::PerType(CardFormat::of_routed),
             )
             .expect("the draft's plan");
-            let bytes = draft_card_bytes(&plan.cards[0], mtp.map_bytes) + mtp.arena_bytes();
+            let bytes = draft_card_bytes(&plan.cards[0], mtp.map_bytes) + mtp.arena_bytes_at(rows);
             (plan, bytes)
         }
 
@@ -4683,7 +5363,7 @@ mod tests {
                         n,
                     )
                     .expect("the drafted plan");
-                let (draft_want, reserve) = draft_of(&mtp, slots);
+                let (draft_want, reserve) = draft_of(&mtp, slots, drafted.store);
                 assert_eq!(view(&drafted.draft), view(&draft_want), "{n} slots");
                 let mut want = target(&inputs, &machine, slots, reserve);
                 want.host.arena_columns = columns;
@@ -4854,7 +5534,7 @@ mod tests {
                         n,
                     )
                     .expect("the drafted plan");
-                let (_, reserve) = draft_of(&mtp, n as u64);
+                let (_, reserve) = draft_of(&mtp, n as u64, drafted.store);
                 let t = &drafted.plan.cards[0];
                 assert_eq!(t.reserve_bytes, 64 << 20, "{n} slots");
                 assert_eq!(
@@ -5005,6 +5685,7 @@ mod tests {
             inputs.room = (pool, HostRead::Given);
             let whole = PlanLevers {
                 card_budget_bytes: Some(u64::MAX).into(),
+                ..PlanLevers::default()
             };
             for n in [1, 2] {
                 match inputs.plan_with_slots(
@@ -5064,6 +5745,7 @@ mod tests {
         fn nvme_room_is_capped_by_the_unified_pool() {
             let levers = PlanLevers {
                 card_budget_bytes: bloomery_levers::CardBudget::Every(1 << 30),
+                ..PlanLevers::default()
             };
             let mut inputs = routed(inputs());
             for slots in [1, 2, 4] {
@@ -5119,6 +5801,7 @@ mod tests {
         fn node_nvme_room_is_capped_by_the_unified_pool() {
             let levers = PlanLevers {
                 card_budget_bytes: bloomery_levers::CardBudget::Every(1 << 30),
+                ..PlanLevers::default()
             };
             let mut inputs = routed(inputs());
             for ranks in [1, 2, 4] {
@@ -5203,6 +5886,7 @@ mod tests {
             for budget in [None, Some(32 << 20), Some(u64::MAX)] {
                 let levers = PlanLevers {
                     card_budget_bytes: budget.into(),
+                    ..PlanLevers::default()
                 };
                 for owned in [[0, 512], [256, 256], [511, 1]] {
                     let result = inputs.plan_nodes(
@@ -5258,6 +5942,7 @@ mod tests {
                         (CTX, UBATCH_PLANNED.min(CTX)),
                         &PlanLevers {
                             card_budget_bytes: Some(0).into(),
+                            ..PlanLevers::default()
                         },
                         &[256, 256],
                     )
@@ -5311,6 +5996,7 @@ mod tests {
                     (CTX, UBATCH_PLANNED.min(CTX)),
                     &PlanLevers {
                         card_budget_bytes: Some(u64::MAX).into(),
+                        ..PlanLevers::default()
                     },
                     &[0, 512],
                 ),
@@ -5386,11 +6072,163 @@ mod tests {
             }
         }
 
-        /// A plan (b′) machine that reserves the draft's card bytes for the
-        /// slots it plans (`MtpInputs::card_bytes_of`, the serve seat's
-        /// reserve) passes the drafted plan's reserve check at 1, 2 and 4
-        /// slots; the one-sequence reserve (`MtpInputs::card_bytes`) is
-        /// refused by name at 2, the draft's store counting both.
+        /// The draft's inputs, its store walk's rows named (`Some`) or left to the plan.
+        fn mtp_of(rows: Option<StoreRows>) -> MtpInputs {
+            let mtp =
+                MtpInputs::from_parts(draft(HeadSet::Full), &file()).expect("the draft's inputs");
+            match rows {
+                Some(rows) => mtp.asking(rows),
+                None => mtp,
+            }
+        }
+
+        /// A one-card drafted plan of the synthetic file's routed stacks at `usable` card
+        /// bytes under the card expert rule, its draft's rows named (`Some`) or left to the
+        /// plan (`None`); `None` when the plan is refused.
+        fn store_plan(
+            inputs: &PlanInputs,
+            usable: u64,
+            rows: Option<StoreRows>,
+        ) -> Option<((u64, u64), StoreRows, StoreWhy)> {
+            let mut machine = machine();
+            machine.cards[0].usable_bytes = usable;
+            let mtp = mtp_of(rows);
+            let plan = inputs
+                .plan_mtp_with(
+                    &machine,
+                    (CTX, UBATCH_PLANNED.min(CTX)),
+                    &PlanLevers::default(),
+                    &mtp,
+                    Experts::Card,
+                )
+                .ok()?;
+            let total = usable - u64::try_from(plan.headroom_bytes).ok()?;
+            Some((
+                (plan.plan.cards[0].experts, total),
+                plan.store,
+                plan.store_why,
+            ))
+        }
+
+        /// `inputs` with 16 routed Q4_K experts on every layer (35,389,440 B each, 2.2 GB in
+        /// all): a card holds them whole, or some on the host.
+        fn routed_few(mut inputs: PlanInputs) -> PlanInputs {
+            for l in 0..LAYERS {
+                inputs.model.tensors.push(ModelTensor {
+                    name: format!("blk.{l}.ffn_gate_exps.weight"),
+                    shard: 0,
+                    layer: Some(l),
+                    role: Role::RoutedExperts,
+                    ty: GgmlType::Q4_K,
+                    dims: vec![2560, 24_576, 16],
+                    file_bytes: 16 * 24_576 * 10 * 144,
+                    gathered_rows: None,
+                });
+            }
+            inputs.model.experts = 16;
+            inputs
+        }
+
+        /// The card sizes, a MiB apart, from three experts below the card that holds every
+        /// expert and the smaller arena, to an expert past the card that also holds the larger
+        /// one: where the larger arena fits beside every expert, costs some, or the smaller
+        /// arena already costs some.
+        fn store_sizes(inputs: &PlanInputs) -> impl Iterator<Item = u64> {
+            let expert = 35_389_440u64;
+            let (whole, _, _) =
+                store_plan(inputs, 1 << 40, Some(StoreRows::Least)).expect("the roomy plan");
+            let extra = mtp_of(None).arena_bytes_at(StoreRows::Most)
+                - mtp_of(None).arena_bytes_at(StoreRows::Least);
+            let total = whole.1;
+            let (from, to) = (total - 3 * expert, total + extra + expert);
+            (0..=(to - from) >> 20).map(move |mib| from + (mib << 20))
+        }
+
+        /// A room that holds the larger arena beside the same card experts: the plan takes 512
+        /// rows, `Room`, and its card experts are the 64-row plan's.
+        #[test]
+        fn the_store_walk_takes_512_rows_where_the_room_holds_them() {
+            let inputs = routed_few(inputs());
+            let mut fits = 0;
+            for usable in store_sizes(&inputs) {
+                let Some((experts, rows, why)) = store_plan(&inputs, usable, None) else {
+                    continue;
+                };
+                let (least, ..) = store_plan(&inputs, usable, Some(StoreRows::Least))
+                    .expect("the smaller arena's plan");
+                if why == StoreWhy::Room {
+                    fits += 1;
+                    assert_eq!(rows, StoreRows::Most, "{usable} B");
+                    assert_eq!(experts.0, least.0, "{usable} B: no card expert displaced");
+                }
+            }
+            assert!(fits > 0, "no card size in the sweep leaves the room");
+        }
+
+        /// A room where the larger arena would displace a card expert: the plan keeps 64
+        /// rows, `Displaces` naming the experts it would cost, and the plan with the larger arena
+        /// asked for holds exactly that many fewer.
+        #[test]
+        fn the_store_walk_keeps_64_rows_where_512_displace_an_expert() {
+            let inputs = routed_few(inputs());
+            let mut displaced = 0;
+            for usable in store_sizes(&inputs) {
+                let Some((experts, rows, why)) = store_plan(&inputs, usable, None) else {
+                    continue;
+                };
+                if let StoreWhy::Displaces { experts: cost } = why {
+                    displaced += 1;
+                    assert_eq!(rows, StoreRows::Least, "{usable} B");
+                    assert!(cost > 0, "{usable} B");
+                    let (most, ..) = store_plan(&inputs, usable, Some(StoreRows::Most))
+                        .expect("the larger arena's plan");
+                    assert_eq!(experts.0 - most.0, cost, "{usable} B");
+                }
+            }
+            assert!(
+                displaced > 0,
+                "no card size in the sweep displaces an expert"
+            );
+        }
+
+        /// A card that holds the smaller arena and not the larger one, with no card expert to
+        /// displace (the host rule): the plan keeps 64 rows, `Short`; one byte more takes 512,
+        /// `Room`. Named rows are the plan's whatever the room (`Asked`).
+        #[test]
+        fn the_store_walk_is_short_by_the_cards_bound() {
+            let inputs = inputs();
+            let extra = mtp_of(None).arena_bytes_at(StoreRows::Most)
+                - mtp_of(None).arena_bytes_at(StoreRows::Least);
+            let plan = |usable: u64, rows: Option<StoreRows>| {
+                let mut machine = machine();
+                machine.cards[0].usable_bytes = usable;
+                let mtp = mtp_of(rows);
+                inputs
+                    .plan_mtp_with(
+                        &machine,
+                        (CTX, UBATCH_PLANNED.min(CTX)),
+                        &PlanLevers::default(),
+                        &mtp,
+                        Experts::Host,
+                    )
+                    .map(|p| (p.store, p.store_why, p.headroom_bytes))
+            };
+            let (rows, why, _) = plan(1 << 40, None).expect("the roomy plan");
+            assert_eq!((rows, why), (StoreRows::Most, StoreWhy::Room));
+            let (.., headroom) = plan(1 << 40, Some(StoreRows::Least)).expect("the least plan");
+            let total = (1u64 << 40) - u64::try_from(headroom).expect("headroom");
+            let (rows, why, _) = plan(total + extra - 1, None).expect("the tight plan");
+            assert_eq!((rows, why), (StoreRows::Least, StoreWhy::Short));
+            let (rows, why, _) = plan(total + extra, None).expect("the fitting plan");
+            assert_eq!((rows, why), (StoreRows::Most, StoreWhy::Room));
+            assert!(
+                plan(total + extra - 1, Some(StoreRows::Most)).is_err(),
+                "the named larger arena past the card is refused"
+            );
+            let (rows, why, _) = plan(1 << 40, Some(StoreRows::Least)).expect("asked");
+            assert_eq!((rows, why), (StoreRows::Least, StoreWhy::Asked));
+        }
+
         #[test]
         fn bp_reserves_the_drafts_slots() {
             let inputs = inputs();
@@ -5419,6 +6257,14 @@ mod tests {
                     "{n} slots: {:?}",
                     r.err()
                 );
+                // The stage card's reserve row names the arena: the smaller one.
+                if let Ok(plan) = r {
+                    assert_eq!(
+                        (plan.store, plan.store_why),
+                        (StoreRows::Least, StoreWhy::Reserve),
+                        "{n} slots"
+                    );
+                }
             }
             let one = mtp.card_bytes(CTX).expect("one sequence's card bytes");
             let two = mtp

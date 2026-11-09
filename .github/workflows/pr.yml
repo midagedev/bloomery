@@ -28,7 +28,9 @@ concurrency:
 jobs:
   contrib-check-t0:
     name: contrib-check t0
-    runs-on: ubuntu-latest
+    # ubuntu-24.04, not ubuntu-latest: latest moved to 26.04, whose default timeout, sort, cat and mkdir are uutils
+    # coreutils, and six tool self-tests read GNU's behaviour (#1150). Back to latest once the tools hold on both.
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - name: Checkout
@@ -69,7 +71,9 @@ jobs:
             pr-check-x86-64-v3-${{ runner.os }}-
 
       - name: Python packages the tool self-tests import
-        run: sudo apt-get install -y --no-install-recommends python3-numpy python3-pil
+        # apt-get update first: the runner image's package lists go stale against the mirror within days (python3-pil
+        # 404 on 2026-11-08, three main runs red on nothing of ours).
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends python3-numpy python3-pil
 
       # A fixed CPU level, not contrib-check's own `native`: runners differ in CPU (Zen 3 and Zen 4 EPYCs, AVX-512 on
       # one only) and restore one cache. Under `native` the flag string is the same on every runner, so cargo would reuse
@@ -90,7 +94,9 @@ jobs:
   # "Never"). It runs beside t0, not after it, so it adds no wall.
   lint:
     name: lint (clippy ratchet)
-    runs-on: ubuntu-latest
+    # ubuntu-24.04, not ubuntu-latest: latest moved to 26.04, whose default timeout, sort, cat and mkdir are uutils
+    # coreutils, and six tool self-tests read GNU's behaviour (#1150). Back to latest once the tools hold on both.
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - name: Checkout
@@ -120,7 +126,7 @@ jobs:
       # bindgen needs libclang itself (libclang1-18) and clang's builtin headers (libclang-common-18-dev) —
       # the same 18 the nightly host's machine installs (tools/nightly/install.sh).
       - name: Install libclang
-        run: sudo apt-get install -y --no-install-recommends libclang1-18 libclang-common-18-dev
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libclang1-18 libclang-common-18-dev
 
       # The CUDA 13.3 headers crates/gpu and the crates linking it bindgen, fetched and sha256-checked from
       # the one pinned list (tools/nightly/cuda-debs.tsv, shared with the nightly installer); the cache

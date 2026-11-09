@@ -6,10 +6,11 @@
 //!
 //! **Parts.** An expert is three parts in stack order: gate and up (`ff` rows
 //! of `n_embd` values each) and down (`n_embd` rows of `ff`), of the types the
-//! layer's file tensors hold (`accepts::ds41_pair`: Q3_K and Q4_K for the
-//! fused layer, the common leg's types for the rest). On the card each part
-//! of slot `s` is the file's bytes of that expert at byte `s · part` of its
-//! layer's stack, which the placed load uploads as file bytes in slot order.
+//! layer's file tensors hold (`accepts::ds41_pair`: Q3_K with a q4_K or q5_K
+//! down for the fused layer, the common leg's types for the rest). On the card
+//! each part of slot `s` is the file's bytes of that expert at byte `s · part`
+//! of its layer's stack, which the placed load uploads as file bytes in slot
+//! order — a q5_K down's part its own, larger bytes.
 //!
 //! **The unpack.** The host reads its routed gates and ups from the r8
 //! sidecar when the load reads one (`BLOOMERY_R8`), so those are the bytes
@@ -720,6 +721,12 @@ struct R8Unpack {
 }
 
 impl Convert for R8Unpack {
+    /// The gate and the up, staged from the sidecar; the down is the file's
+    /// bytes, of the layer's own type.
+    fn converts(&self, part: usize) -> bool {
+        part < 2
+    }
+
     fn convert(
         &self,
         part: usize,

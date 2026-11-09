@@ -1210,6 +1210,7 @@ fn hw_qwen4exp_card_plan() {
             + MARGIN;
         let levers = PlanLevers {
             card_budget_bytes: Some(floor).into(),
+            ..PlanLevers::default()
         };
         let pair = (
             inputs.plan_with(
@@ -1256,8 +1257,7 @@ fn hw_qwen4exp_card_plan() {
 
 /// The Q3 file: unsloth's `UD-Q3_K_XL`. Its first shard holds the header and
 /// no tensor.
-const Q3: &str =
-    "/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf";
+const Q3: &str = "/data/moved/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf";
 
 // PIN(2026-10-06): the Q3 file's dense card part and routed share [derived from its headers, as
 // CARD_DENSE's derivation reads the Q4 file's: every non-routed tensor but the PLE table on the
@@ -1713,6 +1713,7 @@ fn hw_qwen4exp_q3_card_plan() {
             + MARGIN;
         let levers = PlanLevers {
             card_budget_bytes: Some(floor).into(),
+            ..PlanLevers::default()
         };
         let pair = (
             inputs.plan_with(

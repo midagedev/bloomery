@@ -1,0 +1,9 @@
+# Prerequisite of the three mid-size arms: an imatrix for MiMo-V2.6-Flash-RL. None exists; the arms need one file (llama-quantize
+# requires it for IQ1_S). Not a measurement of the quantizer: the job holds the card and the host cores alone, so it takes the
+# lease as an exclusive hold. [derived, loose] one pass over the 167 GB weights at --seqs N covers the chunks: read 104 s (nvme at
+# the 1.6 GB/s floor) .. 835 s (assuming 0.2 GB/s for /data's HDD, unmeasured), plus the card's matmul time; the runner's own plan
+# line (k31-quant.sh imatrix --dry-run, adapted) prices it before the start. Whether the quant tree 78feec062 loads arch `mimo2`
+# is unchecked: a refusal there ends the card and the lead picks another route (docs/research/quant-promo.md, open item 2).
+kind: exclusive
+reason: llama-imatrix on the A6000 (-ngl 0, op offload) and the host cores for the whole run; a timed arm beside it would be contended, and the importance matrix is the input of all three timed arms; why now: the arms cannot start without it
+minutes: 10..40

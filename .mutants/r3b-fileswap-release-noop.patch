@@ -1,0 +1,16 @@
+# r3b mutant fileswap-release-noop
+# clause: gate_qwen38_residency kvfloor (the squeezed run): FileSwap::release_stacks reports the bytes
+#   the rooms would give back but releases none, so the machine withdraws the slots and the fit's retry
+#   still finds the card full: the squeezed call ends in NoRoom (naming the bytes the machine "freed")
+#   and the clause reads FAIL.
+--- a/crates/gpu/src/host/swap_source.rs
++++ b/crates/gpu/src/host/swap_source.rs
+@@ -1279,7 +1279,7 @@
+     fn release_stacks(&self, layer: usize, from: usize) -> Result<u64, GpuError> {
+         let mut freed = 0;
+         for (room, per) in self.rooms_of(layer, from, "FileSwap::release_stacks")? {
+-            freed += room.release_from(from * per)?;
++            freed += room.tail_bytes(from * per)?;
+         }
+         Ok(freed)
+     }

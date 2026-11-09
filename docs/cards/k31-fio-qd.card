@@ -1,0 +1,29 @@
+# k31rel. The drives' random-read rate at the K3.1 expert run size, read from the set's own shard files with fio: 2 MiB reads,
+# O_DIRECT, queue depth 3, 6 and 12, nvme0 (/models) alone, nvme1 (/mirror, the root drive) alone, and both at once. The one term
+# the k31ten research round (~/.cache/bloomery/specs/k31ten/report.md section 6.2) could not fix: the arena probe gave 3.25 GB/s at
+# queue 15 on ~624 KiB reads (util 54 %), the dd sequential 6.4 GB/s, and the mirror round's prediction scale (5.6 vs 8.3 tok/s)
+# hangs on which of the two a layer's few 2 MiB runs at a shallow queue get. 20 s a point, nine points.
+kind: calibration
+question: what read bandwidth do nvme0 and nvme1 give on 2 MiB random O_DIRECT reads of the K3.1 shards at queue depth 3, 6 and 12, alone and together?
+term: fio read bandwidth per drive, MB/s, at bs=2M direct=1 iodepth 3/6/12 (libaio, one job a drive, randread over the first 8 shards' bytes), 20 s a point
+unit: MB/s at queue 6 on nvme0 alone
+predict: 2500..5500
+condition: tools/ref/k31-fio-qd.sh under one lease (lease-hold.sh with this card), the box idle, read-only (--readonly) over
+  /models/Kimi-K3.1-Pro-IQ1_S and /mirror/Kimi-K3.1-Pro-IQ1_S shards 1-8, direct IO, the page cache not dropped (direct reads bypass
+  it); the nine rows print bandwidth, IOPS and mean latency per drive
+reason: [derived] the arena probe's 3.25 GB/s at queue 15 with 624 KiB requests means ~2.8 ms a request; if latency is per request
+  rather than per byte, 2 MiB requests at queue 6 give 6 x 2 MiB / 2.8 ms = 4.5 GB/s; if the drive is bandwidth-limited near
+  3.3 GB/s for random reads of this shape, queue 6 gives ~3 GB/s. The band spans both; the research round's optimistic scale is
+  the upper half, its conservative scale the lower
+decide-in: write the per-queue table into the k31mirror prediction (the mirror's NVMe term = a miss's runs at the measured rate of each
+  drive, 2:1 split) and the sitting card; the research round's scale is picked by this number
+decide-below: under 2,500: the drive's random-read rate at 2 MiB is the limit; the mirror's gain is the second drive's full rate and
+  the byte cut (L3) moves ahead of the order change (L2)
+decide-above: above 5,500: latency-bound, not bandwidth; the depth of the prefetch (all of a layer's parts at once) is the lever and
+  the research round's optimistic scale holds
+# outcome 2026-11-07 (fio 3.36, bs 2M direct randread over shards 1-8, 20 s a point; max_sectors_kb nvme0 1280, nvme1 512):
+#  nvme0 alone 5,124 / 6,613 / 6,707 MB/s at qd 3 / 6 / 12 (lat 1.07 / 1.81 / 3.58 ms); nvme1 alone 5,297 / 5,894 / 5,899
+#  (1.08 / 2.04 / 4.07 ms); both at once nvme0 6,261-6,716 + nvme1 5,815-5,915 = 12.1-12.6 GB/s aggregate, each drive unmoved by the
+#  other. decide-above: above the band at qd 6 (6,613): the drives are latency-bound at a shallow queue (one 2 MiB read ~1 ms, full
+#  rate from qd 6), so the arena probe's 3.25 GB/s was the reader's 624 KiB request shape, not the drive; the research round's
+#  optimistic scale holds and the prefetch depth (every part of a layer's misses in flight at once, both drives) is the lever.

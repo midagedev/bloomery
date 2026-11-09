@@ -384,7 +384,7 @@ impl CardExperts {
             }
             let stacks = LegStacks::of_arms(w, layer.names(), arms, STACK_ROLES)?;
             stacks.check(n_card, family.shape(n, ff, 1))?;
-            let (_, act) = kernels::down(stacks.down_ty()).ok_or(GpuError::state(
+            let act = stacks.down_act().ok_or(GpuError::state(
                 what,
                 "the selected card down's activation form",
             ))?;
@@ -1007,6 +1007,7 @@ mod tests {
                     latent: None,
                     pre_exp_norm: false,
                     post_exp_norm: None,
+                    sum_norm: false,
                     act: models::Act::SwiGlu { limit: None },
                     router: Router {
                         score: Score::Sigmoid,

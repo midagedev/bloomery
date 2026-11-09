@@ -190,7 +190,7 @@ mod gate {
             listening: &record::LISTENING_MUSESPARK,
             arch: "muse-spark",
             layers,
-            think: MARKERS,
+            think: Some(MARKERS),
             turn_end: TURN_END,
             ctx: CTX,
             // Every layer's store is a plane of positions, so the session's cut keeps every

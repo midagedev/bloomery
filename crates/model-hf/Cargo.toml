@@ -18,6 +18,8 @@ bloomery-hf = { path = "../hf" }
 # The `prepare` bin reads its one lever, `BLOOMERY_PREPARE_Q8`.
 bloomery-levers = { path = "../levers" }
 bloomery-model = { path = "../model" }
+# `--hf` of bloomery-quantize reads a checkpoint folder as the split `prepare` writes: the quantizer's `Source`.
+bloomery-quantize = { path = "../quantize" }
 bloomery-safetensors = { path = "../safetensors" }
 bloomery-threads = { path = "../threads" }
 # A whole stored tensor is read past the page cache through the one direct reader.

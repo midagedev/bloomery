@@ -353,6 +353,19 @@ where
     Ok((flags, rest, notes))
 }
 
+/// Whether `args` and llama-server's placement variables ask for the host stage
+/// ([`llama_place::Flags::host_ask`]), read exactly as [`Launcher::placed`] reads them, for the
+/// caller that picks the seat before the launcher resolves the cards. A flag or variable that
+/// cannot be read is its refusal, as `placed` gives it.
+#[cfg(feature = "gpu")]
+pub fn host_ask<A: AsRef<OsStr> + Clone + From<String>>(
+    args: &[A],
+) -> Result<Option<String>, GateError> {
+    let env = llama_env(std::env::vars_os())?;
+    let (flags, _, _) = seat_view(args, &env, SERVE)?;
+    Ok(flags.host_ask())
+}
+
 /// The process's arguments as [`Launcher::start`] left them, argv[0] first. A binary that did not
 /// start through it has none installed, and reading them is a bug a panic names.
 #[cfg(feature = "gpu")]
@@ -663,6 +676,8 @@ pub struct Resolved {
 /// `flags` on `target`: the refusals and levers that need no device ([`Flags::levers`]), then, for
 /// the flags that read one, the cards ([`Flags::place`]), the card shares ([`Flags::budget`]) and
 /// the margins ([`Flags::margin`]) against the census `census` reads, which is asked only then.
+/// The flags that ask for the host ([`Flags::host_ask`]) stop after the levers: no card is named,
+/// the census is read for nothing, and the note says what the ask planned.
 pub fn resolve(
     flags: &Flags,
     target: &Target<'_>,
@@ -674,6 +689,13 @@ pub fn resolve(
         word: None,
         notes: levers.notes,
     };
+    if let Some(ask) = flags.host_ask() {
+        out.notes.push(format!(
+            "llama flag {ask}: every layer, the head and the embedding run on the host stage, no \
+             card in the plan"
+        ));
+        return Ok(out);
+    }
     if flags.needs_census() {
         let census = census()?;
         if let Some(cards) = flags.place(&census)? {

@@ -1,0 +1,23 @@
+# What importance collection (generate_kimi_k3 --imatrix, bloomery_gpu::imatrix) adds to the K3 prompt walk. One launch a linear a call:
+# a dense linear reads its input rows once (rows x k f32) and adds x^2 per column, one thread a column with the rows in a loop, so a launch is
+# k/256 blocks each walking `rows` loads in turn; a routed stack walks rows x used picks, each a read-modify-write of its expert's column.
+# Predicted [derived], per position at K3.1's walk: ~14 dense feeds a layer (q/k/v or q_a/kv_a/q_b, o, the gate and the f/g/beta sites, the router,
+# the shared gate/up/down, the latent down and up) x 60 layers = ~840 feeds, each position's row loaded once per feed at a dependent-load
+# latency of 0.4-1 us (L2 miss to DRAM on the A6000, one load in flight per thread): 840 x 0.4..1 us = 0.34-0.84 ms; the routed stacks
+# add 3 stacks x 16 picks x 60 layers = 2,880 read-modify-writes at 0.4-1 us: 1.2-2.9 ms. Per position 1.5-3.7 ms, against the walk's own
+# 154 ms a position at bp (35,000 positions in ~1.5 h, the --score pass's rate: 6.5 positions/s): 1.0-2.4 %, widened to 0.2..3 % for the
+# launch-bound rows. The weights' bytes stream once a pass either way; the collector adds none of them.
+# K3.1 real file, 27 chunks x 8192 = 221,184 positions at 6.5 positions/s: 34,000 s (9.5 h) for the walk, +0.2..3 % = +0.02..0.28 h for
+# collection. The fixture (hidden 512, four layers, 8 experts of 2 used) is launch-bound: its rows are walked one a step in the eager
+# mode, ~50 collector launches a position at ~5 us each = ~0.25 ms against a ~3 ms eager step: ~8 %, a launch-bound shape the K3.1 pass
+# does not have (rows per launch there are the pass's 512).
+kind: profile
+question: what share of the K3 prompt walk's wall does importance collection add?
+term: wall of `generate_kimi_k3 --imatrix` per chunk over the same walk with no collector, percent, fixture, --place a, ctx 512, A6000
+unit: %
+predict: 0.2..12
+condition: the fixture's two chunks of 512 ids, eager steps, BLOOMERY_CARD=a6000, through tools/gpu-gate.sh's gate lock; the walk without the
+  collector is the gate_kimi_k3_e2e prompt of the same ids
+decide-in: keep the collector on the walk and run the K3.1 estimate above; note the fixture's launch-bound share apart from the pass's
+decide-below: the collector costs less than predicted: nothing to do
+decide-above: the launch count or the dependent loads were underpriced: batch the feeds of a layer into one launch before the K3.1 run

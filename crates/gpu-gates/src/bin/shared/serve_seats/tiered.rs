@@ -51,12 +51,13 @@ use bloomery_levers::{
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::dspark::DraftCardBytes;
-use model::arch::place_hybrid::{PlaceError, PlanInputs};
+use model::arch::models::ReasoningFormat;
+use model::arch::place_hybrid::{PlaceError, PlanInputs, reserve_room};
 use model::placement::ctx_ask::{Chosen, DEFAULT_SLOTS, probe_of};
 use model::placement::workstation::{self, HostNeed, TierBatchBytes};
 use model::placement::{Machine, PlacementError, Plan, PlanLevers};
 use runtime::width::Mode as WidthMode;
-use serve::reasoning::ThinkTags;
+use serve::reasoning::{ResponseTags, ThinkTags};
 use serve::{EngineProps, ServeError};
 use tokenizer::Tokenizer;
 
@@ -225,6 +226,42 @@ pub fn read_file(path: &Path) -> Result<Read, GateError> {
     })
 }
 
+/// The plan of a load that runs its prompt as passes: the inputs and the machine the load plans
+/// on (the prompt reserve the pass's bytes, the expert tier's batch at its rows), and the
+/// `prompt_pass` record's facts: the pass's rows and its inner run's, and the narrowest wider pass
+/// refused with the bytes it fell short by.
+pub struct PassPlan<H> {
+    pub inputs: PlanInputs<H>,
+    pub machine: Machine,
+    pub rows: (usize, usize),
+    pub wider: Option<((usize, usize), u64)>,
+}
+
+/// The plan a seat's pass is tried by ([`Tiered::pass_plan`]'s `attempt`): the run's plan of the
+/// inputs on the machine, at the chosen context and slots.
+pub type PassAttempt<'a, H> = dyn Fn(&PlanInputs<H>, &Machine) -> Result<(), PlaceError> + 'a;
+
+/// The run's machine at a tier batch of the seat's choice ([`Tiered::pass_plan`]'s `build`).
+pub type BuildMachine<'a> = dyn Fn(Option<TierBatchBytes>) -> Result<Machine, GateError> + 'a;
+
+/// How a seat's load runs a prompt, for a body that has a prompt pass ([`Tiered::pass_plan`]).
+pub enum Walk<H> {
+    /// The plan holds a pass.
+    Pass(Box<PassPlan<H>>),
+    /// The load steps the prompt, one id a decode step, for the reason given.
+    Steps(String),
+}
+
+impl<H> Walk<H> {
+    /// The word the `listening` record's `prompt` part prints.
+    fn word(&self) -> &'static str {
+        match self {
+            Walk::Pass(_) => "pass",
+            Walk::Steps(_) => "steps",
+        }
+    }
+}
+
 /// A serving seat whose file one architecture (or one set of them) names and whose routed experts
 /// the plan keeps on the card and on the host: what its family owns, and the load that opens it.
 pub trait Tiered: Seat + Sized + 'static {
@@ -296,12 +333,43 @@ pub trait Tiered: Seat + Sized + 'static {
         false
     }
 
+    /// Whether the body keeps its load's slot map for its life, and so serves no residency but
+    /// `off`: unset resolves `off` as on a placement the residency machine does not run over (why
+    /// `fixed_place`), and a set word other than `off` is refused by name before the model is
+    /// fetched and before the plan ([`refuse_fixed_slot_map`]). The default runs the machine.
+    const SLOT_MAP_FIXED: bool = false;
+
+    /// How the load runs a prompt, for a body that has a prompt pass: asked once the context
+    /// (`ctx`) and the step's plan are chosen, with the run's machine at a tier batch of the
+    /// seat's choice (`build`: the placement's, the side model's and the image encoder's reserves
+    /// on it) and the plan the run makes (`attempt`, at `ctx` and the slots). [`Walk::Pass`] is
+    /// the plan the load runs instead of the step's, its `prompt_pass` record after the plan's;
+    /// [`Walk::Steps`] keeps the step's plan and prints why. Either names the walk in the
+    /// `listening` record. `None` (the default) is a body with no pass, which prints neither.
+    fn pass_plan(
+        _flags: &mut Self::Flags,
+        _inputs: &PlanInputs<Self::H>,
+        _place: Place,
+        _ctx: usize,
+        _build: &BuildMachine<'_>,
+        _attempt: &PassAttempt<'_, Self::H>,
+    ) -> Result<Option<Walk<Self::H>>, GateError> {
+        Ok(None)
+    }
+
     /// The file's plan inputs, its own `place::read`.
     fn read(split: &Split) -> Result<PlanInputs<Self::H>, PlacementError>;
 
     /// Price the selected prompt schedule before any context probe or allocation.
     /// A family whose schedule has fixed buffers keeps its header-derived inputs.
     fn configure(_inputs: &mut PlanInputs<Self::H>, _group: usize) -> Result<(), GateError> {
+        Ok(())
+    }
+
+    /// `ctx` positions refused by name when the body cannot serve that many, which the plan knows
+    /// no family's bound of. [`run`] asks it of `--ctx` as given, before any plan, and of the
+    /// context the plan chose, so an unset `--ctx` is held to the bound too. The default has none.
+    fn check_ctx(_inputs: &PlanInputs<Self::H>, _ctx: usize) -> Result<(), GateError> {
         Ok(())
     }
 
@@ -412,6 +480,10 @@ pub trait Tiered: Seat + Sized + 'static {
         plan: &Plan<'_>,
     ) -> Result<Option<ResidencyPick>, GateError> {
         // The hybrid bodies host every churn pool and feed the prompt in batches.
+        if Self::SLOT_MAP_FIXED {
+            return fixed_slot_map_pick(levers, plan, false, Self::FAMILY, Self::UNHOSTED_POOL)
+                .map(Some);
+        }
         residency_pick(levers, place, plan, false, Self::UNHOSTED_POOL).map(Some)
     }
 
@@ -459,6 +531,40 @@ pub fn check_residency_feed(
         }
     }
     Ok(())
+}
+
+/// A set `BLOOMERY_RESIDENCY` other than `off`, refused by name for a `family` whose body keeps its
+/// load's slot map for its life ([`Tiered::SLOT_MAP_FIXED`]).
+pub fn refuse_fixed_slot_map(levers: &Levers, family: &str) -> Result<(), GateError> {
+    match levers.residency() {
+        Some(word) if word != "off" => Err(format!(
+            "BLOOMERY_RESIDENCY={word} is refused: the {family} body keeps its load's slot map \
+             for its life (BLOOMERY_RESIDENCY off)"
+        )
+        .into()),
+        _ => Ok(()),
+    }
+}
+
+/// `BLOOMERY_RESIDENCY` for a body that keeps its load's slot map for its life
+/// ([`Tiered::SLOT_MAP_FIXED`]), resolved without reporting: a set word other than `off` refused
+/// by name ([`refuse_fixed_slot_map`]), unset `off` as on a placement the residency machine does
+/// not run over (why `fixed_place`). `prefill_steps` is the seat's step feed, which also refuses a
+/// set word other than `off` ([`check_residency_feed`]).
+pub fn fixed_slot_map_pick(
+    levers: &Levers,
+    plan: &Plan<'_>,
+    prefill_steps: bool,
+    family: &str,
+    carry: UnhostedPool,
+) -> Result<ResidencyPick, GateError> {
+    check_residency_feed(levers, prefill_steps, carry)?;
+    refuse_fixed_slot_map(levers, family)?;
+    let pick = levers.residency_at(ResidencyAt {
+        prefill_steps,
+        ..ResidencyAt::FIXED
+    });
+    residency::at_plan(carry, plan, 0, pick)
 }
 
 /// `BLOOMERY_RESIDENCY` for a tiered seat, resolved without reporting: [`run`] prints only
@@ -680,6 +786,9 @@ pub fn check<S: Tiered>(
         }
         if let Some(levers) = levers {
             check_residency_feed(levers, S::prefill_steps(&a.1), S::UNHOSTED_POOL)?;
+            if S::SLOT_MAP_FIXED {
+                refuse_fixed_slot_map(levers, S::FAMILY)?;
+            }
             if S::DRAFTS
                 && let Some(d) = drafting_of(levers)?
             {
@@ -704,7 +813,7 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
     model::ops::set_host_lanes(levers.host_lanes());
     record::require(record::groups::tiered::RUN, "tiered::run");
     arm_screen(levers.screen());
-    let (a, flags) = a;
+    let (a, mut flags) = a;
     let side = side.read()?;
     let path = ref_model_path()?;
     let Read {
@@ -735,6 +844,9 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
     )?;
     let mut inputs = S::read(&split)?;
     S::configure(&mut inputs, levers.prefill_group())?;
+    if let Some(ctx) = a.ctx {
+        S::check_ctx(&inputs, ctx)?;
+    }
     let think = S::think(&inputs)?;
     let plan_levers = PlanLevers::from_levers(&levers)?;
     // The slot count and what named it (`from` on the `parallel` line); a seat of one sequence
@@ -972,8 +1084,70 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
     }
     eprintln!("{}", asked.line());
     let slot_ctx = usize::try_from(asked.slot_ctx)?;
-    let plan = asked.plan;
+    S::check_ctx(&inputs, slot_ctx)?;
+    // The prompt walk of a body that has a pass, at the context the step's plan chose: the run's
+    // machine at the tier batch the seat names, its plan the run's at that context and slots. A
+    // folder's part reads and the stream's staging are reserves this machine does not carry, so a
+    // pass beside either is refused by name.
+    let plain_machine = source.is_none() && staged.is_none();
+    let image_reserve = image.as_ref().and_then(|o| o.seat.reserve);
+    let build = |tier_batch: Option<TierBatchBytes>| -> Result<Machine, GateError> {
+        if !plain_machine {
+            return Err(format!(
+                "the {} seat's prompt pass is planned on a machine with no folder part reads or \
+                 stream staging",
+                S::FAMILY
+            )
+            .into());
+        }
+        let mut m = S::machine(
+            place,
+            tier_batch,
+            draft_seat(place, spark.as_ref())?,
+            inputs.model.layers,
+        )?;
+        beside::reserve_on(
+            &mut m,
+            Beside {
+                image: image_reserve,
+                embedding,
+            },
+        );
+        Ok(m)
+    };
+    let at = asked.slot_ctx;
+    let attempt = |pass: &PlanInputs<S::H>, m: &Machine| -> Result<(), PlaceError> {
+        pass.plan_with_slots(m, at, &plan_levers, n).map(drop)
+    };
+    let walk = S::pass_plan(&mut flags, &inputs, place, slot_ctx, &build, &attempt)?;
+    let walk_word = walk.as_ref().map(Walk::word);
+    let (passed, stepped) = match walk {
+        Some(Walk::Pass(p)) => {
+            let PassPlan {
+                inputs,
+                machine,
+                rows,
+                wider,
+            } = *p;
+            (Some((inputs, machine, rows, wider)), None)
+        }
+        Some(Walk::Steps(why)) => (None, Some(why)),
+        None => (None, None),
+    };
+    let plan = match &passed {
+        Some((pass, on, ..)) => pass
+            .plan_with_slots(on, at, &plan_levers, n)
+            .map_err(|e| format!("--place {}: the prompt pass's plan: {e}", place.name()))?,
+        None => asked.plan,
+    };
     record::plan(place.name(), plan.machine, &plan).eprint();
+    if let Some((pass, _, rows, wider)) = &passed {
+        record::require(record::groups::tiered::PASS, "tiered::run");
+        record::prompt_pass(*rows, (pass.prompt_reserve, reserve_room(&plan, 0)), *wider).eprint();
+    }
+    if let Some(why) = &stepped {
+        eprintln!("prompt steps: {why}");
+    }
     if let Some(v) = &image {
         vision_seat::seat_record(v).eprint();
     }
@@ -1051,13 +1225,30 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
         Some(tags) => server.with_think_tags(tags),
         None => server,
     };
-    S::listening()
+    let listening = S::listening()
         .w("place", place.name())
         .u("ctx", slot_ctx)
-        .u("slots", slots)
-        .w("addr", server.local_addr()?)
-        .eprint();
+        .u("slots", slots);
+    match walk_word {
+        Some(word) => listening.w("prompt", word),
+        None => listening,
+    }
+    .w("addr", server.local_addr()?)
+    .eprint();
     Ok(server.run())
+}
+
+/// The tags the server splits the reply on, from the format a model's description names: the
+/// think span's, and the answer's section where the format has one.
+pub fn think_tags_of(format: ReasoningFormat) -> ThinkTags {
+    let (open, close) = format.think();
+    ThinkTags {
+        open,
+        close,
+        response: format
+            .response()
+            .map(|(open, close)| ResponseTags { open, close }),
+    }
 }
 
 #[cfg(test)]
@@ -1178,6 +1369,8 @@ mod tests {
                 arena_columns: 1,
                 table_bytes: 0,
                 shadow_bytes: 0,
+                kv_host_bytes: 0,
+                stage_kv_bytes: 0,
                 reserve_bytes: 0,
                 row_reserve_bytes: 0,
                 pool_card_bytes: 0,
@@ -1189,6 +1382,9 @@ mod tests {
             tier_n_l: Vec::new(),
             card_budget: model::placement::card_budget::CardBudget::default(),
             budget_from_pool: false,
+            expert_rank: None,
+            kv_floor: None,
+            kv_host: bloomery_levers::KvHost::Off,
         };
         let select = |n| {
             let mut plan = plan.clone();

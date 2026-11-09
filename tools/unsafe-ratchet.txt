@@ -803,7 +803,48 @@ gguf 7 2 0
 # product helper in place of one a term, and the chunk record's cells are written in one loop.
 # PIN(2026-11-03): gpu 2992 -> 2993 blocks: split_mma launches the high parts' term after the others and the seed, a
 # second block beside its loop's, with its SAFETY line.
-gpu 2993 413 10
+# PIN(2026-11-03): gpu 2993 -> 2995 blocks, 413 -> 414 fns, new code, not old code relaxed: `elem::mxfp8_embed_value`,
+# the MXFP8 row decode (the fn and its scale and value byte loads), each with its SAFETY line.
+# PIN(2026-11-04): gpu 2995 -> 2996 blocks, new code, not old code relaxed: the Qwen3.6 draft's 256-row store walk calls
+# KvPlanes::append_256 (an unsafe fn: its key, value and query rows must be the planes' own, pairwise distinct), with its SAFETY.
+# PIN(2026-11-05): gpu 2996 -> 2997 blocks, new code, not old code relaxed: the TCP link's SO_BUSY_POLL setsockopt (host/link/tcp.rs busy_poll), with its SAFETY line.
+# PIN(2026-11-05): gpu 2997 -> 3007 blocks, 414 -> 415 fns, new code, not old code relaxed: the page words' owner
+# (words.rs: `WordOps::batch`, an unsafe fn with mem_batch's contract, its memop arm, its two kernel-side enqueues, the
+# module load and the kernel's system-scope add), graph.rs's two reads of a memory operation's union (its kind, an add's
+# fields), and host/mod.rs's probe (the driver version, the barrier and the raw reduction), each with its SAFETY line.
+# PIN(2026-11-03): gpu 3007 -> 3012 blocks, not old code relaxed: a tensor-parallel rank's sums (host/rank.rs
+# `Sums`). Three moved from gpu-glm5next's tp::gather, which comes down by 3: the part's window over the rank's
+# own page, the join's one-batch counter operations (mem_batch) and the rank-order sum. Two are new code: the
+# separate post's and wait's counter operations of a slot posted early and summed later. Each call is in a block
+# of its own with its SAFETY line; the sums hold the page past every launch they enqueue.
+# PIN(2026-11-05): gpu 3012 -> 3017 blocks, 415 -> 417 fns, new code, not old code relaxed: a prompt batch's block on a
+# tier node — batch.rs's `dtoh_mapped_at` (the block's q8_1 planes into the leg's rows) and `htod_bytes` (the request's
+# bytes into the node's staging), two unsafe fns with their copies, graph.rs's `MappedHost::bytes_at` (the planes read
+# for the request) and node.rs's `run_block` (the request's landing copies and the rows' copy back), each with its
+# SAFETY line.
+# PIN(2026-11-05): gpu 3017 -> 3021 blocks, new code, not old code relaxed: card_slots.rs's two new kernel entries
+# `ds41_ffn_card_acc_2` and `ds41_ffn_card_acc_16` (the 2- and 16-slot weighted sums K3's routed block runs), two blocks
+# each as in the other counts' entries, each with its SAFETY line.
+# PIN(2026-11-06): gpu 3021 -> 3036 blocks, 417 -> 419 fns, new code, not old code relaxed: attn_res.rs, Kimi K3's
+# AttnRes bank mix kernel entry `attn_res_mix` and its row helper (15 blocks, 2 unsafe fns, each with its SAFETY line).
+# PIN(2026-11-06): gpu 3036 -> 3041 blocks, a new kernel entry, not old code relaxed: ffn_handoff_n_tier (host/handoff.rs,
+# the tier handoff at any slot count, Kimi K3's 16) adds five blocks: the activation copy, the id and weight load, the
+# place loads, the slot writes and the sequence word, each with its SAFETY line.
+# PIN(2026-11-06): gpu 3036 -> 3079 blocks, 419 -> 421 fns, moved code, not old code relaxed: the lightning indexer's
+# three kernel entries (`ds41_indexer_score`, `ds41_indexer_topk`, `ds41_index_key_input`), their launchers and the
+# index-key cores (`load4`, `ht_warp`) moved from gpu-deepseek41 (-42 blocks, -2 fns there), unchanged but for the
+# one extra `shared_module!` block the index-key loader's split into the common input form and V4.1's compressor
+# form needs (+1 block in total); each with its SAFETY line or `# Safety` contract.
+# Both land together: 3036 + 5 + 43 = 3084 blocks, 421 fns.
+# PIN(2026-11-07): gpu 3084 -> 3093 blocks, 421 -> 423 fns, new code, not old code relaxed: the IQ1_S/IQ2_XXS card quantizer
+# (crates/gpu/src/iq_quant.rs: the two unchecked table readers `byte_at` and `mxfp4_value`, the three kernel bodies' reads
+# and stores, and the shared-module load), each with its SAFETY line or `# Safety` contract.
+# PIN(2026-11-08): gpu 3093 -> 3098 blocks, a new kernel entry, not old code relaxed: the importance collector
+# (crates/gpu/src/imatrix.rs: its two kernels' column loops and the feeds' device reads).
+# PIN(2026-11-09): gpu 3097 -> 3103 blocks, new code, not old code relaxed: a room page backed by host memory
+# (crates/gpu/src/room/host.rs: the host-NUMA cuMemCreate and its release, the raw map and unmap, the device
+# attribute reads), each with its SAFETY line; cuda-core's VMM wrappers make device memory only.
+gpu 3103 423 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -840,7 +881,17 @@ gpu 2993 413 10
 # PIN(2026-11-01): gpu-deepseek41 397 -> 402 blocks, new code, not old code relaxed: index_key.rs's
 # input-projected index key append (Mistral Large 4's): the position read, the row, gain, bias and rope-table
 # loads, and the store, each with its SAFETY line.
-gpu-deepseek41 402 44 0
+# PIN(2026-11-03): gpu-deepseek41 402 -> 404 blocks, new code, not old code relaxed: glue.rs's MXFP8 engram row
+# kernel `ds41_glue_engram_rows_mxfp8` (its decode call and its store), each with its SAFETY line.
+# PIN(2026-11-05): gpu-deepseek41 404/44 -> 407/45 blocks/fns, new code, not old code relaxed: the packed tier reply's
+# tier_position (chain/ffn/tier.rs, an unsafe fn with its contract and three indexed reads, each with its SAFETY line)
+# PIN(2026-11-05): gpu-deepseek41 407 -> 408 blocks, new code, not old code relaxed: the batch route's copies of each
+# chunk's q8_1 planes into the block's planes a tier node is sent (chain/ffn/batch.rs), with its SAFETY line.
+# PIN(2026-11-05): gpu-deepseek41 408/45 -> 413/47 blocks/fns, new code, not old code relaxed: glue.rs's Q6_K engram row
+# kernel `ds41_glue_engram_rows_q6k` (its decode call and its store) and the two unsafe fns it decodes through,
+# `image_byte` (the covering-word read) and `q6k_row_value` (the three byte reads and the scale word read), each with
+# its `# Safety` contract or SAFETY line.
+gpu-deepseek41 371 45 0
 # PIN(2026-10-24): gpu-flint starts at 2 blocks, 0 fns and 0 impls: step and prompt
 # call the checked common attention binding with staged distinct positions, each with SAFETY.
 gpu-flint 2 0 0
@@ -937,7 +988,8 @@ gpu-gemma4a 11 0 0
 # (tp::gather) writes its part into its own mapped page through a window, posts and waits on the page's counters
 # (mem_batch) and adds the parts in rank order (Gathers::enqueue_sum), each call in a block of its own with its
 # SAFETY line; the rank holds the page past every launch it enqueues.
-gpu-glm5next 7 0 0
+# PIN(2026-11-03): gpu-glm5next 7 -> 4 blocks: tp::gather moved to the shared owner (gpu's host/rank.rs `Sums`).
+gpu-glm5next 4 0 0
 # PIN(2026-10-23): gpu-mimo2 0 -> 5 blocks, 0 -> 1 fns: enqueue_append propagates the
 # K192 cache-writer contract to one-token and consecutive prompt/slot callers within each ring.
 # Each call has its SAFETY invariant; no device operation changes.
@@ -1148,6 +1200,7 @@ placement 0 0 0
 # ik's mul_mat_iq1_m_q8_K (its pack, block step, one-column dot and column tile, each a target_feature AVX2 fn) and
 # the IQ1_S wide tile (its group walk and the column-pointer fill it shares with IQ2_XXS's).
 qdot 281 132 0
+quantize 0 0 0
 record 0 0 0
 refset 0 0 0
 runtime 0 0 0

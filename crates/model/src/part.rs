@@ -244,13 +244,46 @@ pub struct StoredPlane {
     pub runs: Vec<(PathBuf, Range<u64>)>,
 }
 
-/// A row-gathered table where its source stores it: F8 values, or NVFP4
-/// codes with a separate plane of block scales, at one tensor `scale`.
+/// A row-gathered table where its source stores it: F8 values, or NVFP4 or
+/// MXFP8 values with a separate plane of block scales, at one tensor `scale`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StoredRows {
     pub values: StoredPlane,
     pub block_scales: Option<StoredPlane>,
     pub scale: f32,
+}
+
+impl StoredPlane {
+    /// The file byte runs that hold rows `rows` of the plane, in row order; rows past the plane's
+    /// runs are not in it.
+    #[must_use]
+    pub fn rows_at(&self, rows: Range<u64>) -> Vec<(PathBuf, Range<u64>)> {
+        let mut out = Vec::new();
+        let mut first = 0u64;
+        for (path, at) in &self.runs {
+            let held = (at.end - at.start) / self.row_bytes.max(1);
+            let (lo, hi) = (rows.start.max(first), rows.end.min(first + held));
+            if lo < hi {
+                let start = at.start + (lo - first) * self.row_bytes;
+                out.push((path.clone(), start..start + (hi - lo) * self.row_bytes));
+            }
+            first += held;
+        }
+        out
+    }
+}
+
+impl StoredRows {
+    /// The file byte runs that hold rows `rows` of both planes, the values' then the block
+    /// scales'.
+    #[must_use]
+    pub fn rows_at(&self, rows: Range<u64>) -> Vec<(PathBuf, Range<u64>)> {
+        let mut out = self.values.rows_at(rows.clone());
+        if let Some(scales) = &self.block_scales {
+            out.extend(scales.rows_at(rows));
+        }
+        out
+    }
 }
 
 /// Where a load reads its tensors.

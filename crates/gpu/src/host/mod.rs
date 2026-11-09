@@ -113,6 +113,7 @@ pub mod node;
 pub mod nvtier;
 pub mod page;
 pub mod prompt_stream;
+pub mod rank;
 pub mod residency;
 pub mod route_trace;
 pub mod run;
@@ -128,15 +129,17 @@ pub mod xstream;
 
 pub use leg::{BatchLeg, LegTimer, ServeNote, StepLeg};
 pub use link::{
-    Crossing, GatherLoop, GatherSet, GatherShape, Gathers, PostCols, RdmaEnd, Reader, Span,
-    link_tail,
+    Crossing, GatherLoop, GatherSet, GatherShape, Gathers, Peer, PeerPath, PostCols, RdmaEnd,
+    Reader, RemoteWire, Span, TcpEnd, TcpPeer, link_tail, paths,
 };
 
 use crate::GpuError;
 use crate::fault::{Fault, LAYER_NONE};
+use crate::graph::{MappedHost, cu, mem_batch, op_add, op_barrier_sys};
 use crate::tensor::DeviceTensor;
+use crate::words::{WordOps, WordSide};
 use batch::{BatchKey, BatchPort, BatchService, ServeTimes, Tier};
-use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer};
+use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer, DriverError, sys};
 use model::placement::Machine;
 use model::{Tensor2, Tensor2View};
 use page::{MAX_ROWS, Word};
@@ -144,7 +147,7 @@ use residency::HostResidency;
 use route_trace::RouteTrace;
 use runtime::swaprule::KeptRows;
 use runtime::xsplit;
-use slots::{MAX_TIERS, Slot, SlotMap};
+use slots::{BatchSlots, MAX_TIERS, Slot, SlotMap};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -337,6 +340,10 @@ pub struct HybridStats {
     /// was in the service's exclusion set and so not computed, summed. A
     /// refused column counts in neither this nor `batch_host_slots`.
     pub batch_excluded_slots: u64,
+    /// Of the slots batch services' columns listed, those the service left
+    /// to a tier's batch leg of its layer-batch, summed: the tiers' share,
+    /// which the host did not compute.
+    pub batch_tier_slots: u64,
     /// Services, step or batch, that met input the card should already have
     /// refused ([`HostTier::refusal`] names the first).
     pub refusals: u64,
@@ -956,6 +963,11 @@ pub struct HostTier<H> {
     health: Health,
     /// Which experts each layer's card stack holds; the host serves the rest.
     slots: SlotMap,
+    /// The tiers on a node with no batch leg, bit `t` tier `t`: each node's
+    /// once attached ([`HostTier::attach_tiers`]), none once the batch port's
+    /// legs are made ([`HostTier::prepare_tier_batch`]). A prompt batch reads
+    /// their entries as the host's ([`HostTier::batch_slots`]).
+    nodes: u32,
     step: StepPort,
     /// The batch service's scratch and counters, and the port's sets once a
     /// caller made them ([`HostTier::prepare_batch`]).
@@ -1126,6 +1138,7 @@ impl<H: HostExperts> HostTier<H> {
             unserved: None,
             health: Health::default(),
             slots,
+            nodes: 0,
             step: StepPort::new(boundary, layers),
             batch: BatchService::default(),
             port: None,
@@ -1988,6 +2001,45 @@ impl<H: HostExperts> HostTier<H> {
         self.swap_relayout(stream, None)
     }
 
+    /// At least `bytes` device bytes of the stage card's expert stacks given
+    /// back, on `stream` once its work has drained
+    /// ([`swap::SwapMachine::free_bytes`]): the same top slots off every
+    /// machine layer, the per-layer report. Refused by name, the machine
+    /// unchanged, when the load runs no machine, and as the machine refuses.
+    pub fn swap_free_bytes(
+        &mut self,
+        stream: &CudaStream,
+        bytes: u64,
+    ) -> Result<swap::Freed, GpuError> {
+        const WHAT: &str = "HostTier::swap_free_bytes";
+        let Some(m) = self.swap.as_mut() else {
+            return Err(GpuError::state(
+                WHAT,
+                "a residency machine: the load runs none, so no expert stack gives bytes back",
+            ));
+        };
+        drain_within(
+            stream,
+            m.deadline(),
+            "HostTier::swap_free_bytes: the engine stream before the release",
+        )?;
+        m.free_bytes(stream, &mut self.slots, bytes)
+    }
+
+    /// The lowest `k` withdrawn slots of layer `layer` restored
+    /// ([`swap::SwapMachine::restore_tail`]): their pages backed again, the
+    /// layer's capacity `k` more. Refused by name, the machine unchanged,
+    /// when the load runs no machine, and as the machine refuses.
+    pub fn swap_restore_tail(&mut self, layer: usize, k: usize) -> Result<(), GpuError> {
+        let Some(m) = self.swap.as_mut() else {
+            return Err(GpuError::state(
+                "HostTier::swap_restore_tail",
+                "a residency machine: the load runs none, so no slot is withdrawn",
+            ));
+        };
+        m.restore_tail(layer, k)
+    }
+
     /// [`HostTier::swap_reset`] to a new seed, `order[i]` the ranking of the
     /// machine's `i`-th layer ([`swap::SwapMachine::reseed`]).
     pub fn swap_reseed(
@@ -2071,7 +2123,12 @@ impl<H: HostExperts> HostTier<H> {
         let mut page = match (tiers.iter().find_map(TierCard::node), kind) {
             (None, _) => TierPage::new(stage, tiers[0].gpu()?, layout, kind)?,
             (Some(_), bloomery_levers::TierLink::Shared) => TierPage::across(stage, layout)?,
-            (Some(_), bloomery_levers::TierLink::Rdma) => TierPage::remote(stage, layout)?,
+            (Some(_), bloomery_levers::TierLink::Rdma) => {
+                TierPage::remote(stage, layout, link::RemoteWire::Rdma)?
+            }
+            (Some(_), bloomery_levers::TierLink::Tcp) => {
+                TierPage::remote(stage, layout, link::RemoteWire::Tcp)?
+            }
             (Some(addr), kind @ bloomery_levers::TierLink::Loopback) => {
                 return Err(GpuError::shape(
                     WHAT,
@@ -2092,6 +2149,10 @@ impl<H: HostExperts> HostTier<H> {
         self.step.parallel_wait = !tiers
             .iter()
             .any(|t| t.node().is_none() && t.resident_bytes() == 0);
+        self.nodes = (0u32..)
+            .zip(&tiers)
+            .filter(|(_, t)| t.node().is_some())
+            .fold(0, |m, (i, _)| m | 1 << i);
         self.tiers = tiers;
         self.tier_page = Some(page);
         Ok(())
@@ -2104,6 +2165,14 @@ impl<H: HostExperts> HostTier<H> {
     /// to the service. Load-time only.
     pub fn mark_unserved(&mut self, l: usize) {
         self.unserved.get_or_insert(l);
+    }
+
+    /// The step port waits for each go on the calling thread alone, not over
+    /// the process-wide pool: for a load whose host computes no expert, as a
+    /// rank of a tensor-parallel load, where other ranks in the process need
+    /// the pool to serve the goes this port's go waits on. Load-time only.
+    pub fn wait_go_alone(&mut self) {
+        self.step.parallel_wait = false;
     }
 
     /// Attach `trace`: from here on every one-row step's service records
@@ -2194,10 +2263,18 @@ impl<H: HostExperts> HostTier<H> {
         first
     }
 
-    /// What each tier has done since load, in tier order.
+    /// What each tier has done since load, in tier order, with the bytes
+    /// this process's ends of the page's link posted for its dones.
     #[must_use]
     pub fn tier_stats(&self) -> Vec<tier::TierStats> {
-        self.tiers.iter().map(TierCard::stats).collect()
+        self.tiers
+            .iter()
+            .enumerate()
+            .map(|(t, card)| tier::TierStats {
+                posted_bytes: self.tier_page.as_ref().map_or(0, |p| p.posted_bytes(t)),
+                ..card.stats()
+            })
+            .collect()
     }
 
     /// The experts of layer `layer` the tier cards hold, summed over the
@@ -2249,6 +2326,12 @@ impl<H: HostExperts> HostTier<H> {
             "an expert tier (HostTier::attach_tiers)",
         ))?;
         Ok((hsum, page.rows_of(row)?))
+    }
+
+    /// How the stage card adds to the page words ([`WordOps`]), as the
+    /// boundary opened them: the load's report, `word_ops=… driver=…`.
+    pub fn word_ops(&self) -> &WordOps {
+        self.step.boundary.words()
     }
 
     /// Enqueue a tier layer's go of layer `layer`, row `row`, on the stage
@@ -2338,9 +2421,11 @@ impl<H: HostExperts> HostTier<H> {
     }
 
     /// The refusal of an untiered route of a layer whose expert tier holds
-    /// experts: without its tier places the tier would not serve the block.
+    /// experts a batch routes to it ([`HostTier::batch_slots`]): without its
+    /// tier places the tier would not serve the block. A tier on a node
+    /// routes none: the batch's host serves its experts.
     fn refuse_untiered_route(&self, what: &'static str, layer: usize) -> Result<(), GpuError> {
-        if !self.tiers.is_empty() && self.slots.on_tier(layer)? > 0 {
+        if !self.tiers.is_empty() && self.batch_slots()?.on_tier(layer)? > 0 {
             return Err(GpuError::shape(
                 what,
                 format!(
@@ -2412,8 +2497,8 @@ impl<H: HostExperts> HostTier<H> {
     /// Both batch sets free, at a group's start ([`BatchPort::begin`]); a
     /// poisoned tier is refused first, as [`BEGIN_GROUP`], so a call after a
     /// failed service — a lost tier card among them — enqueues nothing. A
-    /// route to a tier on a node is refused before its download: the port
-    /// makes no leg for it ([`HostTier::enqueue_download_tiered_pitched`]).
+    /// tier on a node has no leg: the batch's host serves its experts
+    /// ([`HostTier::batch_slots`]).
     pub fn begin_group(&mut self) -> Result<(), GpuError> {
         self.health.refuse_if_poisoned(BEGIN_GROUP)?;
         self.port_mut(BEGIN_GROUP)?.begin();
@@ -2795,6 +2880,17 @@ impl<H: HostExperts> HostTier<H> {
         &self.slots
     }
 
+    /// The slot map as a prompt batch reads it: the experts of a tier on a
+    /// node with no batch leg are the host's, whose batch service serves them
+    /// in the node's place; a node whose leg the batch port made
+    /// ([`HostTier::prepare_tier_batch`]) serves its own, as it does for the
+    /// decode step, which reads [`HostTier::slots`]. A card side decides a
+    /// batch's tiered layers by it. Refused by name only for a node mask the
+    /// map does not name, which the attach never makes.
+    pub fn batch_slots(&self) -> Result<BatchSlots<'_>, GpuError> {
+        BatchSlots::new(&self.slots, self.nodes)
+    }
+
     /// The boundary to enqueue a chain's handoffs on, and the slot map that
     /// says which of a layer's slots the card computes.
     pub fn boundary_and_slots(&mut self) -> (&mut Boundary, &SlotMap) {
@@ -2834,6 +2930,7 @@ impl<H: HostExperts> HostTier<H> {
             batch_host_slots: b.batch_host_slots,
             batch_ns: b.batch_ns,
             batch_excluded_slots: b.batch_excluded_slots,
+            batch_tier_slots: b.batch_tier_slots,
             refusals: t.refusals,
             resets: t.resets,
             last_poison: t.last_poison,
@@ -3270,7 +3367,9 @@ impl<H: HostExperts> HostTier<H> {
         let t = Tier {
             experts: &mut self.experts,
             health: &mut self.health,
-            slots: &self.slots,
+            slots: BatchSlots::new(&self.slots, self.nodes)?,
+            // No tier is attached (refuse_tier_batch above), so no leg.
+            legs: 0,
             fault: self.fault.as_ref(),
             hidden: h.hidden,
             n_used: h.n_used,
@@ -3500,13 +3599,131 @@ fn count_ids(
     Ok(())
 }
 
+/// The page words' operations of the card whose context is `ctx`
+/// ([`WordOps`]), opened where the owner of its words opens: the side
+/// `BLOOMERY_WORD_OPS` names, or under `auto` the side the driver's answer
+/// to one atomic-reduction stream memory operation picks ([`probe_words`]),
+/// with the driver's version beside it for the load to report
+/// ([`HostTier::word_ops`]). Prints nothing. Load-time only.
+pub(crate) fn word_ops(ctx: &Arc<CudaContext>, stream: &CudaStream) -> Result<WordOps, GpuError> {
+    const WHAT: &str = "word_ops";
+    let mut driver = 0;
+    // SAFETY: `driver` is a live out-pointer for the call.
+    let rc = unsafe { sys::cuDriverGetVersion(&mut driver) };
+    cu(rc, "cuDriverGetVersion")?;
+    let asked = bloomery_levers::word_ops().map_err(|e| GpuError::plan(WHAT, e))?;
+    let (side, probe) = match asked {
+        bloomery_levers::WordOps::Memop => (WordSide::Memop, None),
+        bloomery_levers::WordOps::Kernel => (WordSide::Kernel, None),
+        bloomery_levers::WordOps::Auto => {
+            let (side, word) = probe_words(ctx, stream)?;
+            (side, Some(word))
+        }
+    };
+    WordOps::open(ctx, side, driver, probe)
+}
+
+/// The probe of [`word_ops`] on `stream` (not capturing, else refused by
+/// name): a system barrier, which either side needs and which a refusal
+/// fails here by name, then one add of 1 to a zeroed scratch word, whose
+/// answer picks the side ([`word_side`]), and the word read back once the
+/// stream drained: 1 after the memory operation, 0 after a refusal, any
+/// other value refused by name. Returns the side and the scratch word, which
+/// the owner keeps.
+fn probe_words(
+    ctx: &Arc<CudaContext>,
+    stream: &CudaStream,
+) -> Result<(WordSide, MappedHost), GpuError> {
+    const WHAT: &str = "word_ops probe";
+    if crate::graph::capturing(stream)? {
+        return Err(GpuError::state(WHAT, "a stream that is not capturing"));
+    }
+    let word = MappedHost::new(ctx, 4, "cuMemHostAlloc (word_ops probe)")?;
+    // SAFETY: the batch names no address.
+    unsafe {
+        mem_batch(
+            stream,
+            &mut [op_barrier_sys()],
+            "cuStreamBatchMemOp_v2 (word_ops probe, barrier)",
+        )?;
+    }
+    let mut add = [op_add(word.dev_at(0), 1)];
+    // SAFETY: the add's address is the scratch word, the page's first u32,
+    // which stays allocated past the synchronize below (the owner keeps it);
+    // the raw call hands back the driver's answer as it is.
+    let rc = unsafe { sys::cuStreamBatchMemOp_v2(stream.cu_stream(), 1, add.as_mut_ptr(), 0) };
+    let side = word_side(rc)?;
+    stream.synchronize()?;
+    let want = u32::from(side == WordSide::Memop);
+    match word.atomic_u32(0).map(|w| w.load(Ordering::Acquire)) {
+        Some(got) if got == want => Ok((side, word)),
+        got => Err(GpuError::protocol(
+            WHAT,
+            format!(
+                "the scratch word holds {got:?} after the driver answered {rc} to one add of 1; \
+                 the {} side expects {want}",
+                side.word()
+            ),
+        )),
+    }
+}
+
+/// The side the driver's answer `rc` to one atomic-reduction stream memory
+/// operation picks: it ran, the memory operations; refused as an invalid
+/// value, a driver that does not take the reduction, the kernel; any other
+/// answer refused by name.
+fn word_side(rc: sys::CUresult) -> Result<WordSide, GpuError> {
+    match rc {
+        sys::cudaError_enum_CUDA_SUCCESS => Ok(WordSide::Memop),
+        sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE => Ok(WordSide::Kernel),
+        _ => Err(GpuError::Driver {
+            op: Some("cuStreamBatchMemOp_v2 (word_ops probe, add)"),
+            source: DriverError(rc),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         Drain, OpenCall, PassKind, SERVED_TIERS, await_within, count_ids, drain_of, pass_kept,
-        refuse_tier_count, union_probe,
+        refuse_tier_count, union_probe, word_side,
     };
     use crate::GpuError;
+    use crate::words::WordSide;
+    use cuda_core::sys;
+
+    /// The probe's decision table: the add ran, the memory operations; the
+    /// driver refused it as an invalid value, the kernel; any other answer
+    /// is the probe's error, naming the call (mutants: the two sides
+    /// swapped, every refusal taken as the kernel).
+    #[test]
+    fn word_side_is_the_probe_s_answer() {
+        assert_eq!(
+            word_side(sys::cudaError_enum_CUDA_SUCCESS).unwrap(),
+            WordSide::Memop
+        );
+        assert_eq!(
+            word_side(sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE).unwrap(),
+            WordSide::Kernel
+        );
+        for rc in [
+            sys::cudaError_enum_CUDA_ERROR_NOT_SUPPORTED,
+            sys::cudaError_enum_CUDA_ERROR_INVALID_HANDLE,
+            sys::cudaError_enum_CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED,
+        ] {
+            match word_side(rc) {
+                Err(GpuError::Driver {
+                    op: Some(op),
+                    source,
+                }) => {
+                    assert!(op.contains("word_ops probe, add"), "{op}");
+                    assert_eq!(source.0, rc);
+                }
+                other => panic!("answer {rc}: {other:?}, want the probe's driver error"),
+            }
+        }
+    }
     use std::time::Duration;
 
     /// The union probe fits the union a load prepared: a Qwen3.8 load of a 64-column batch over

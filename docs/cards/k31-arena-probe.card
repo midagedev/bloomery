@@ -1,0 +1,41 @@
+# k31rel. The same one request as docs/cards/k31-nvme-regime.card, with the NVMe expert tier's own reader in place of the mapping's
+# faults: BLOOMERY_NVTIER_BYTES=32G makes the K3.1 bp plan carry a RAM arena (the split's default gives 0 at this room), so the
+# experts the host does not lock are read by NvTier (O_DIRECT pread, 16 reader threads, one read per expert part of ~2 MiB, the
+# arena an LRU of ~5,100 experts at 6.25 MB) instead of ~94 KiB faults at a queue of ~5. The host's locked share drops by the arena
+# (249 → ~217 GB), so the paged share rises from 259 to ~291 GB. No code changes. The mirror round (the set on both drives, the
+# reader picking the drive per read) attaches to this reader, so this probe prices that round's base before any code is written.
+kind: calibration
+question: with a 32 GiB arena, what decode rate does the same K3.1 bp request reach, and does the tier's reader keep the drive busier than the faults did?
+term: decode tok/s @ D=512, n_predict 128, one cold request, with iostat nvme0n1's decode-phase rareq-sz, aqu-sz and rMB/s beside it
+unit: tok/s
+predict: 5.5..9.0
+condition: tools/ref/k31-nvme-probe.sh with K31_PROBE_ENV=BLOOMERY_NVTIER_BYTES=32G (the 0.3.13 sm86 tarball's bloomery-serve,
+  BLOOMERY_HOST_ROOM=252G, --place bp --ctx-size 2048, the first 512 prose ids, n_predict 128, iostat beside it) under one lease
+  after the read_ahead A/B's, read_ahead_kb back at 128; the plan line must print arena=34359738368 (else the lever did not reach
+  the plan and the row is not read), and its host_experts= and paged= are recorded beside the regime probe's (76910, 259192872960)
+reason: [derived] the regime probe's step is 305 ms, of which ~270 ms is ~2,200 faults of ~94 KiB in series at a queue of ~5
+  (r_await 0.34 ms, concurrency ~2.4-6); the reader issues a miss expert's three ~2 MiB parts at once through 16 threads, so a
+  layer with one miss costs ~1 ms (6 MiB at 6.4 GB/s plus one latency) and a token of ~72 misses over 92 layers ~70-100 ms of
+  NVMe in series with ~30 ms of DRAM and ~10 ms of cards: 110-140 ms = 7-9 tok/s at the regime probe's 0.45 GB a token. The term
+  derivation cannot fix is the arena's hit rate against the page cache's: the probe's 0.45 GB a token is 4.9 % of the picks
+  missing, far under the 43 % paged share, so the cache re-serves most paged picks; a 32 GiB LRU of the hottest paged experts
+  must do the same or the NVMe bytes rise toward 4 GB a token (625 ms at 6.4 GB/s, slower than today). The band's low end is a
+  partial hit rate, its high end the full one
+decide-in: the explicit-read path is the K3.1 decode path: the mirror round lands on NvTier (the sidecar's directories opened per
+  shard, the drive with fewer reads in flight picked per read) and the serving docs name BLOOMERY_NVTIER_BYTES for K3.1 until
+  the split's default plans the arena for it; the mirror's prediction is this row's NVMe term halved
+decide-below: under 5.5: read the bytes a token (/proc/<pid>/io) first: above ~1 GB the LRU misses what the page cache held
+  (the arena is too small or its victim rule is wrong for K3.1's routing) and the next lever is the arena size (64G, 96G) or a
+  fadvise prefetch on the mapping instead of the reader; near 0.45 GB with a low rate the reader's queue is not the drive's
+  (read the reader stats record by kind) before the mirror
+decide-above: above 9.0: the DRAM or card term was overestimated; re-read the timeline from the record before the mirror's prediction
+# outcome 2026-11-07 (one request, arena=34359738368 arena_slots=56, host_experts 76910 at 215 GB, paged 294 GB, load 52 s): tg 2.04 /
+#  pp 2.09 tok/s, below the band. /proc/<pid>/io 1,026 GB over 640 positions = 1.6 GB a position (the mapping's run: 0.65) with 730
+#  major faults: the reader took every miss from the drive (the tier drops a paged stack's pages after each read; the arena is
+#  staging, not a hot set), where the mapping path's page cache re-served most paged picks. iostat decode: aqu-sz 15, rareq-sz
+#  624 KiB, 3,254 MB/s, r_await 2.79 ms, util 54 %: the queue and the read size the reader was built for, and the step (491 ms)
+#  = 1.6 GB / 3.25 GB/s, so at this depth the drive gives ~3.3 GB/s on ~624 KiB random reads, not its 6.4 sequential. decide-below's
+#  first case: the bytes. The K3.1 path keeps the mapping (its hits) and gains the reader's depth by prefetching exactly a layer's
+#  miss runs into the page cache after the router (posix_fadvise WILLNEED per part, every pick, the mirror chosen by expert parity
+#  so the cache holds each expert once): [derived] 0.45 GB a token at ~3.3 GB/s = ~140 ms + ~40 ms = ~5.5 tok/s on one drive,
+#  ~70 + 40 = ~9 tok/s over two. The mirror round (k31mirror) is redirected to that design; NvTier is untouched.

@@ -1,0 +1,16 @@
+# k31dsa mutant fault-count-past-cache
+# clause: fault, the gather (gate_kimi_k3_dsa.rs:1072-1076)
+# site: crates/gpu/src/latent.rs:633 kv_gather_sel, the CachePos raise deleted; the row >= rows guard and its return kept (PTX moves)
+# expected red: "  fault a list entry 128 over a cache of 128 rows (the gather): nothing raised: FAIL"
+diff --git a/crates/gpu/src/latent.rs b/crates/gpu/src/latent.rs
+index 4d7a1c59b..873e0f3fa 100644
+--- a/crates/gpu/src/latent.rs
++++ b/crates/gpu/src/latent.rs
+@@ -630,7 +630,6 @@ mod latent_kernels {
+         let row = unsafe { *list.get_unchecked(b) } as usize;
+         if row >= rows as usize {
+             if thread::threadIdx_x() == 0 {
+-                fault.raise(FaultSite::CachePos);
+             }
+             return; // block-uniform
+         }

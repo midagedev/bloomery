@@ -1,0 +1,19 @@
+# k31dsa mutant identity-shift
+# clause: identity (gate_kimi_k3_dsa.rs:996-1003)
+# site: crates/gpu/src/latent.rs:630 kv_gather_sel, every list entry read as the next cache row (guard and fault kept; PTX moves)
+# expected red: "  identity: positions 0 .. 2048 selected vs dense, bit for bit: 2048 differ (first at 0): FAIL"
+# also red: the four "  selected at {n} keys: ... rel-L2 ... (band 4e-3): FAIL" lines; maybe "  the run raised no fault: ... CachePos ...: FAIL"
+# if row 4095's list keeps itself (4096 >= rows); stays green: "  identity: the list is 0 ..= pos at positions [0, 63, 64, 2047]"
+diff --git a/crates/gpu/src/latent.rs b/crates/gpu/src/latent.rs
+index 4d7a1c59b..c17850b73 100644
+--- a/crates/gpu/src/latent.rs
++++ b/crates/gpu/src/latent.rs
+@@ -627,7 +627,7 @@ mod latent_kernels {
+             return;
+         }
+         // SAFETY: b < tokens·stride <= list.len() (the launch contract).
+-        let row = unsafe { *list.get_unchecked(b) } as usize;
++        let row = unsafe { *list.get_unchecked(b) } as usize + 1;
+         if row >= rows as usize {
+             if thread::threadIdx_x() == 0 {
+                 fault.raise(FaultSite::CachePos);

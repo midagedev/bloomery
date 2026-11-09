@@ -36,9 +36,13 @@
 //! prompt feeds every position in order. The step's record slot is its
 //! position's: the pick and the fault word are read before the next step.
 //!
-//! Not here: the policy (when to draft, how many), filling the draft's rows
-//! from a prompt walk without the head, and keeping the hidden row of a chain
-//! step. The hidden row is the host's to set or tap between settled steps.
+//! A row of a walk is that step with the join's hidden row read where it
+//! sits: a host-written row, the arena's `x` (the row a settled step leaves)
+//! or a row of the rows arena (a pass's or a verify's final residual). The
+//! draft's own residual stream is a buffer of its own, swapped in as the
+//! arena's `x` while a row's layer encodes, so the draft's scratch never
+//! overwrites the target's step row. The policy (when to draft, how many) is
+//! `runtime::mtp`'s, and the session is its host (`host.rs`).
 
 use core::sync::atomic::Ordering;
 use core::time::Duration;
@@ -56,7 +60,8 @@ use model::part::Part;
 use safetensors::{Dtype, Safetensors};
 
 use super::super::arena::{
-    self, Arena, LayerBufs, PartSource, bytes_of, load_layer, load_site, load_values, slot_of,
+    self, Arena, LayerBufs, PartSource, RECORD_SLOTS, bytes_of, load_layer, load_site, load_values,
+    slot_of,
 };
 use super::super::check::{AttnLayout, FfnLayout, LayerLayout, Layout, MixerLayout, Site, Values};
 use super::super::ops::{Feed, MetalOps, all};
@@ -66,6 +71,11 @@ use crate::kernels::{EmbedParams, HiddenRow, Kernels, MatvecParams, Mode, MtpJoi
 use crate::residency::Alloc;
 use crate::stream::GpuInterval;
 use chain::arch::qwen3moe::plan::LayerPlan;
+
+mod host;
+
+pub use host::MtpArena;
+use host::{Held, STORE_ROWS};
 
 const WHAT: &str = "qwen35moe mtp";
 
@@ -477,8 +487,12 @@ struct MtpBufs {
     hid: MetalBuffer<f32>,
     /// The join's output: the embedding half, then the hidden half.
     join: MetalBuffer<f32>,
-    /// The draft token's id, written by the host.
-    id: MetalBuffer<u32>,
+    /// The draft's own residual stream: the fusion projection writes it and
+    /// it is swapped in as the arena's `x` while the layer encodes, so the
+    /// target's `x` (the step's final row) is never the draft's scratch.
+    x: MetalBuffer<f32>,
+    /// The ids of a walk's rows, written by the host: row `j`'s in word `j`.
+    ids: MetalBuffer<u32>,
 }
 
 /// An opened draft: its buffers, and where in the plan its layer's shape is.
@@ -487,6 +501,25 @@ pub(super) struct Mtp {
     /// The plan layer the draft's walk reads.
     plan_layer: usize,
     eps: f32,
+    /// The positions of the current sequence the draft's K/V holds: a walk
+    /// may start at or below it, never past it.
+    held: Held,
+    /// The hidden row a walk over the target's rows joins: the row before
+    /// the target's output norm, or after it.
+    reading: HiddenRow,
+}
+
+impl Mtp {
+    /// The draft's store after the session's reset: it holds nothing.
+    pub(super) fn emptied(&mut self) {
+        self.held.empty();
+    }
+
+    /// The draft's store after the session was cut back to `pos`: it holds
+    /// no position past it.
+    pub(super) fn cut_to(&mut self, pos: u32) {
+        self.held.cut_to(pos);
+    }
 }
 
 /// What [`Session::open_mtp`] made.
@@ -590,8 +623,9 @@ impl Session {
             Ok(b)
         };
         let (emb, hid, join) = (scratch(hidden)?, scratch(hidden)?, scratch(2 * hidden)?);
-        let mut id = alloc.buffer::<u32>(Elems(1))?;
-        id.zero();
+        let x = scratch(hidden)?;
+        let mut ids = alloc.buffer::<u32>(Elems(STORE_ROWS))?;
+        ids.zero();
         let weight_bytes = bytes_of(&fc)
             + bytes_of(&head_norm)
             + bytes_of(&gain_emb)
@@ -606,7 +640,8 @@ impl Session {
             emb,
             hid,
             join,
-            id,
+            x,
+            ids,
         };
         staged.commit();
         let (plan_layer, eps) = (seed.layer, seed.eps);
@@ -614,6 +649,8 @@ impl Session {
             bufs,
             plan_layer,
             eps,
+            held: Held::default(),
+            reading: HiddenRow::Post,
         });
         Ok(MtpOpened {
             weight_bytes,
@@ -713,42 +750,68 @@ impl Session {
             self.drop_ahead(a)?;
         }
         let mtp = self.mtp.as_mut().expect("checked above");
-        mtp.bufs.id.pages().store(0, id, Ordering::Relaxed)?;
+        mtp.bufs.ids.pages().store(0, id, Ordering::Relaxed)?;
+        let row = DraftRow {
+            id: 0,
+            pos,
+            hidden: HiddenAt::Own(0),
+            reading: hidden,
+            kind: RowKind::Full,
+        };
+        let gpu_s = self.submit_rows(&[row])?;
+        let id = self
+            .arena
+            .step_id
+            .pages()
+            .load(slot_of(pos), Ordering::Relaxed)?;
+        Ok((Drafted { id, pos }, gpu_s))
+    }
+
+    /// `rows` as one command buffer, committed and waited: row `j` reads the id
+    /// in word `j` of the draft's ids and the hidden row its place names, in
+    /// order, each reading the K/V rows the ones before it appended. The
+    /// caller has written the ids and the host's hidden rows, refused what a
+    /// walk refuses and left no token running ahead. Returns the buffer's GPU
+    /// seconds. A fault any row raised poisons the session as a step's does.
+    fn submit_rows(&mut self, rows: &[DraftRow]) -> Result<f64, SessionError> {
+        let mtp = self
+            .mtp
+            .as_mut()
+            .ok_or_else(|| mtp_refuse("no sidecar is open (`open_mtp` first)"))?;
         let seed_plan: &LayerPlan = self
             .plans
             .get(mtp.plan_layer)
             .ok_or_else(|| mtp_refuse("the draft layer's plan is not in the file's"))?;
         let mut recording = self.stream.begin()?;
         let mut enc = recording.token_encoder()?;
-        let encoded = encode_draft(
+        let encoded = encode_rows(
             &mut enc,
             &mut self.arena,
+            &self.rows.x,
             &self.kernels,
             mtp,
             seed_plan,
-            pos,
-            hidden,
+            rows,
         );
         enc.end();
         encoded?;
         let stamps = recording.stamps();
         let signalled = self.stream.submit_signalled(recording)?;
         let settled = self.stream.settle(signalled)?;
-        let slot = slot_of(pos);
-        if let Some(fault) = self.arena.faults[slot].read_settled(&settled)? {
-            self.poisoned = Some(fault);
-            return Err(SessionError::Fault(fault));
-        }
-        let gpu_s = match stamps.interval(STAMP_WAIT)? {
-            GpuInterval::Ran(s) => s,
-            GpuInterval::StillRunning => {
-                return Err(mtp_refuse(
-                    "the draft step's buffer still runs after its settle",
-                ));
+        // The rows are consecutive positions: the first of them cover every
+        // record slot a row raised into.
+        for row in rows.iter().take(RECORD_SLOTS) {
+            if let Some(fault) = self.arena.faults[slot_of(row.pos)].read_settled(&settled)? {
+                self.poisoned = Some(fault);
+                return Err(SessionError::Fault(fault));
             }
-        };
-        let id = self.arena.step_id.pages().load(slot, Ordering::Relaxed)?;
-        Ok((Drafted { id, pos }, gpu_s))
+        }
+        match stamps.interval(STAMP_WAIT)? {
+            GpuInterval::Ran(s) => Ok(s),
+            GpuInterval::StillRunning => {
+                Err(mtp_refuse("the draft's buffer still runs after its settle"))
+            }
+        }
     }
 
     /// `n` draft steps at one position over one hidden row, each its own
@@ -795,20 +858,72 @@ fn layer_bytes(l: &LayerBufs) -> u64 {
     n + bytes_of(&l.ffn.gate) + bytes_of(&l.ffn.up) + bytes_of(&l.ffn.down) + bytes_of(&l.ffn.norm)
 }
 
-/// The draft step's groups on `enc`: the embedding of the token, the join, the
-/// fusion projection, the draft layer's walk and the head, each closed by a
-/// barrier. The arena's layer list and head norm are the draft's for the
-/// walk and are put back whatever the walk returns.
-fn encode_draft(
+/// Where a draft row reads the hidden row its join takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HiddenAt {
+    /// Row `i` of the draft's own host-written rows.
+    Own(usize),
+    /// The arena's `x`: the row a settled step leaves.
+    Step,
+    /// Row `i` of the rows arena's residual: a pass's or a verify's final
+    /// rows.
+    Rows(usize),
+}
+
+/// What a draft row runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowKind {
+    /// The join, the fusion projection and the layer's cache append
+    /// ([`walk::store`]): the row's keys and values and nothing else.
+    Store,
+    /// The whole step: the layer, the draft's norm and the head's pick.
+    Full,
+}
+
+/// One row of a draft walk: the token at `pos` (word `id` of the draft's
+/// ids), its hidden row and what the row runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DraftRow {
+    id: usize,
+    pos: u32,
+    hidden: HiddenAt,
+    /// Which hidden row the join takes the row as.
+    reading: HiddenRow,
+    kind: RowKind,
+}
+
+/// The groups of `rows` on `enc`, each row's closed by a barrier: the
+/// embedding of the row's token, the join, the fusion projection, then the
+/// layer's walk, whole with the head or as far as its cache append. The
+/// arena's layer list, head norm and residual stream are the draft's for the
+/// walk and are put back whatever the walk returns; the join reads the
+/// target's own residual (`x` of the step, `rows_x`' rows) before that.
+fn encode_rows(
     enc: &mut crate::encode::ComputeEncoder<'_>,
     arena: &mut Arena,
+    rows_x: &MetalBuffer<f32>,
     kernels: &Kernels,
     mtp: &mut Mtp,
     plan: &LayerPlan,
-    pos: u32,
-    hidden: HiddenRow,
+    rows: &[DraftRow],
 ) -> Result<(), SessionError> {
-    let slot = slot_of(pos);
+    for row in rows {
+        encode_row(enc, arena, rows_x, kernels, mtp, plan, *row)?;
+    }
+    Ok(())
+}
+
+/// One row of a walk: [`encode_rows`]' groups of it.
+fn encode_row(
+    enc: &mut crate::encode::ComputeEncoder<'_>,
+    arena: &mut Arena,
+    rows_x: &MetalBuffer<f32>,
+    kernels: &Kernels,
+    mtp: &mut Mtp,
+    plan: &LayerPlan,
+    row: DraftRow,
+) -> Result<(), SessionError> {
+    let slot = slot_of(row.pos);
     let h = arena.hidden;
     {
         let b = &mut mtp.bufs;
@@ -819,23 +934,28 @@ fn encode_draft(
                 table: arena.embed.window(Elems(0), arena.embed.len())?,
                 vocab: arena.vocab,
                 cols: h,
-                ids: b.id.window(Elems(0), b.id.len())?,
+                ids: b.ids.window(Elems(row.id), Elems(1))?,
                 out: b.emb.window_mut(Elems(0), Elems(h))?,
                 fault: &arena.faults[slot],
                 layer: LAYER,
             },
         )?;
         enc.memory_barrier();
+        let hid = match row.hidden {
+            HiddenAt::Own(i) => b.hid.window(Elems(i * h), Elems(h))?,
+            HiddenAt::Step => arena.x.window(Elems(0), Elems(h))?,
+            HiddenAt::Rows(i) => rows_x.window(Elems(i * h), Elems(h))?,
+        };
         kernels.mtp_join(
             enc,
             MtpJoinParams {
                 cols: h,
                 emb: all(&b.emb)?,
-                hid: all(&b.hid)?,
+                hid,
                 gain_emb: all(&b.gain_emb)?,
                 gain_hid: all(&b.gain_hid)?,
                 gain_out: all(&arena.head_norm)?,
-                hidden,
+                hidden: row.reading,
                 y: b.join.window_mut(Elems(0), Elems(2 * h))?,
                 eps: mtp.eps,
                 fault: &arena.faults[slot],
@@ -851,24 +971,30 @@ fn encode_draft(
                 cols: 2 * h,
                 weights: b.fc.window(Elems(0), b.fc.len())?,
                 x: all(&b.join)?,
-                y: arena.x.window_mut(Elems(0), Elems(h))?,
+                y: b.x.window_mut(Elems(0), Elems(h))?,
                 mode: Mode::Store,
             },
         )?;
         enc.memory_barrier();
     }
+    std::mem::swap(&mut arena.x, &mut mtp.bufs.x);
     std::mem::swap(&mut arena.layers, &mut mtp.bufs.layers);
     std::mem::swap(&mut arena.head_norm, &mut mtp.bufs.head_norm);
     let walked = {
-        let mut ops = MetalOps::new(enc, arena, kernels, pos, Feed::Host, true);
+        let full = row.kind == RowKind::Full;
+        let mut ops = MetalOps::new(enc, arena, kernels, row.pos, Feed::Host, full);
         let cx = LayerCtx {
             layer: 0,
             plan,
             m: 1,
             last: true,
         };
-        walk::layer(&mut ops, cx).and_then(|()| ops.head(1))
+        match row.kind {
+            RowKind::Store => walk::store(&mut ops, cx),
+            RowKind::Full => walk::layer(&mut ops, cx).and_then(|()| ops.head(1)),
+        }
     };
+    std::mem::swap(&mut arena.x, &mut mtp.bufs.x);
     std::mem::swap(&mut arena.layers, &mut mtp.bufs.layers);
     std::mem::swap(&mut arena.head_norm, &mut mtp.bufs.head_norm);
     walked

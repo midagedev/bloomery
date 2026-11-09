@@ -4,16 +4,27 @@
 //! handoff and the join and the tier's go and wait in the same batches:
 //!
 //! - `ds41_ffn_handoff_tier` writes the handoff as `ds41_ffn_handoff` does and
-//!   the row's tier image: each slot's tier place from the map's tier view
-//!   ([`TierPiece`]'s card copy), the norm's q8_1 codes and scales of the
-//!   activation; the tier places also go to a card buffer the join reads.
+//!   the row's tier image: the slots' tier places from the map's tier view
+//!   ([`TierPiece`]'s card copy) in rank order — each tier slot (a place
+//!   below the layer's tier experts) at its rank, the tier slots before it in
+//!   slot order, then every other slot's place — and the norm's q8_1 codes
+//!   and scales of the activation; the tier places also go, in slot order, to
+//!   a card buffer the join reads. The tier's launches write a place's down
+//!   output at the place's position, so its rows come back packed: the tier
+//!   slot of rank `r` at row `r`, `k` rows for `k` tier slots — the rule of
+//!   a packed block ([`bloomery_gpu::host::tier::BlockRows::Packed`]), set
+//!   by the places alone, so the tier runs no launch of its own for it. The
+//!   handoff writes `k` after the tier's places
+//!   ([`bloomery_gpu::host::tier::TierImageLayout::count`]), and the go
+//!   carries it, so a mirrored link's done carries those `k` rows alone
+//!   ([`bloomery_gpu::host::tier::ReplyRows::Packed`]).
 //! - `ds41_ffn_post_tier` (`_streams_tier` without the fold) is the join with
 //!   the card sum over the slots on the stage card or on the tier, in the
 //!   router's pick order, each slot's down output read from the stage card's
-//!   rows or, for a tier slot, from the tier's rows through the mapping:
-//!   [`card_sum_elem`]'s rule over that mask, then [`join_elem`]. With the
-//!   union of both cards' experts on one card the combine reads the same
-//!   values in the same order, so the two agree bit for bit.
+//!   rows or, for a tier slot, from the tier's rows at its rank through the
+//!   mapping: [`card_sum_elem`]'s rule over that mask, then [`join_elem`].
+//!   With the union of both cards' experts on one card the combine reads the
+//!   same values in the same order, so the two agree bit for bit.
 //!
 //! The tier's own layer ([`Ds41Tier`], the architecture's
 //! [`TierExperts`]) is the stage card's routed launches over the tier's
@@ -45,13 +56,17 @@ mod tier_kernels {
     /// activation value `d < n`: thread `d` copies `x[d]` to the image's word
     /// `x_at + d`; threads `s < 6` copy slot `s`'s id and weight to words
     /// `ids_at + s` and `wts_at + s`, write `sel[s] = map[row_off + id]` and
-    /// `tsel[s] = tmap[row_off + id]` and the tier place to the tier image's
-    /// word `tsel_at + s` (an id not below `n_expert` raises
-    /// [`FaultSite::ExpertId`] and both places are [`HOST`]); threads `d <
-    /// nq` copy the q8_1 code `q3[d]` to the tier image's words `q3_at + 2d`
-    /// (low half) and `q3_at + 2d + 1`; threads `d < nd` copy `d8[d]` to word
-    /// `d8_at + d`; thread 0 copies the sequence word. The go that follows
-    /// orders every write here before its generation and the tier's go.
+    /// `tsel[s] = tmap[row_off + id]` (an id not below `n_expert` raises
+    /// [`FaultSite::ExpertId`] and both places are [`HOST`]) and the tier
+    /// place to the tier image's word `tsel_at + p` at slot `s`'s position
+    /// `p` ([`tier_position`]: its rank among the slots whose tier place is
+    /// below `n_tier` when its own is, else the count of those slots plus
+    /// the other slots before it), and thread 0 the count of those slots to
+    /// word `tsel_at + 6`; threads `d < nq` copy the q8_1 code
+    /// `q3[d]` to the tier image's words `q3_at + 2d` (low half) and `q3_at +
+    /// 2d + 1`; threads `d < nd` copy `d8[d]` to word `d8_at + d`; thread 0
+    /// copies the sequence word. The go that follows orders every write here
+    /// before its generation and the tier's go.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
@@ -77,7 +92,7 @@ mod tier_kernels {
             wts_at >= ids_at + 6,
             x_at >= wts_at + 6,
             image.len() >= x_at + n,
-            q3_at >= tsel_at + 6,
+            q3_at >= tsel_at + 7,
             d8_at >= q3_at + 2 * nq,
             timage.len() >= d8_at + nd,
             sel.len() >= 6,
@@ -91,6 +106,7 @@ mod tier_kernels {
         tmap: &[u32],
         row_off: u32,
         n_expert: u32,
+        n_tier: u32,
         x: &[f32],
         seq: &[u32],
         q3: &[u64],
@@ -134,17 +150,25 @@ mod tier_kernels {
                 fault.raise(FaultSite::ExpertId);
                 (HOST, HOST)
             };
+            // SAFETY: d < 6, ids_in.len() >= 6 and tmap.len() >= row_off +
+            // n_expert by the launch contract.
+            let (p, k) = unsafe { tier_position(ids_in, tmap, [row_off, n_expert, n_tier], d) };
             // SAFETY: d < 6 <= sel.len() and tsel.len(); ids_at + d and wts_at
             // + d lie in the routing's two spans of the image, apart from each
-            // other, from seq_at and from the activation; tsel_at + d lies in
-            // the tier image's places, below q3_at; thread d is each of those
-            // words' only writer.
+            // other, from seq_at and from the activation; p < 6, so tsel_at +
+            // p lies in the tier image's places, and tsel_at + 6 is the count's
+            // word after them, both below q3_at; the six slots' positions are
+            // 0..6 each once, so thread d is each of those words' only writer,
+            // and thread 0 the count's.
             unsafe {
                 *image.get_unchecked_mut(ids_at as usize + d) = id;
                 *image.get_unchecked_mut(wts_at as usize + d) = w.to_bits();
                 *sel.get_unchecked_mut(d) = place;
                 *tsel.get_unchecked_mut(d) = tplace;
-                *timage.get_unchecked_mut(tsel_at as usize + d) = tplace;
+                *timage.get_unchecked_mut(tsel_at as usize + p) = tplace;
+                if d == 0 {
+                    *timage.get_unchecked_mut(tsel_at as usize + N_USED) = k as u32;
+                }
             }
         }
         if d < nq as usize {
@@ -314,12 +338,52 @@ mod tier_kernels {
     }
 }
 
+/// Slot `s`'s position in a row's tier image, of the six slots `ids_in`
+/// routes, `[row_off, n_expert, n_tier]` the layer's, and the tier slots'
+/// count: a slot is a tier slot when its tier place — `tmap[row_off + id]`
+/// for an id below `n_expert`, [`HOST`] for any other, the place the
+/// handoff writes — is below `n_tier`, the rule the join reads the tier's
+/// rows by. A tier slot's position is its rank, the tier slots before it in
+/// slot order; any other slot's is the tier slots' count plus the other
+/// slots before it. The six positions are 0..6, each once.
+///
+/// SAFETY: `s < 6`, `ids_in.len() >= 6` and `tmap.len() >= row_off +
+/// n_expert`.
+#[inline(always)]
+unsafe fn tier_position(ids_in: &[u32], tmap: &[u32], layer: [u32; 3], s: usize) -> (usize, usize) {
+    let [row_off, n_expert, n_tier] = layer;
+    let (mut tier, mut before, mut own) = (0usize, 0usize, false);
+    let mut j = 0usize;
+    while j < N_USED {
+        // SAFETY: j < 6 <= ids_in.len() by this fn's contract.
+        let id = unsafe { *ids_in.get_unchecked(j) };
+        // SAFETY: id < n_expert, so row_off + id < tmap.len() by this fn's
+        // contract.
+        let on = id < n_expert
+            && unsafe { *tmap.get_unchecked(row_off as usize + id as usize) } < n_tier;
+        if on {
+            tier += 1;
+            if j < s {
+                before += 1;
+            }
+        }
+        if j == s {
+            own = on;
+        }
+        j += 1;
+    }
+    let p = if own { before } else { tier + s - before };
+    (p, tier)
+}
+
 /// Value `d`'s combine of a tier layer, then HC_POST of it: slot `j` is on
 /// the stage card when its place `sel[j]` is below `n[0]` — its down output
 /// is `a.down`'s — and on the tier when its tier place `tsel[j]` is below
-/// `n[1]` — its down output is `trows`' (`rows` each, slot-major) — and
-/// [`combine_elem`] runs over that mask; every other slot's rows are never
-/// read. The combine's `y`, the four new stream values and `pre`.
+/// `n[1]` — its down output is `trows`' row at its rank, the slots before it
+/// whose tier place is below `n[1]` (`rows` a row, packed: the handoff's
+/// [`tier_position`]) — and [`combine_elem`] runs over that mask; every
+/// other row is never read. The combine's `y`, the four new stream values
+/// and `pre`.
 ///
 /// SAFETY: `d < rows`, `down.len()` and `trows.len() >= 6 * rows`,
 /// `w.len()`, `sel.len()` and `tsel.len() >= 6`, `hsum.len()` and
@@ -336,6 +400,7 @@ unsafe fn combine_post_tier_at(
     let mut dv = [0.0f32; N_USED];
     let mut wv = [0.0f32; N_USED];
     let mut on = [false; N_USED];
+    let mut rank = 0usize;
     let mut j = 0usize;
     while j < N_USED {
         // SAFETY: j < 6 <= sel.len(), tsel.len() and w.len() by this fn's
@@ -347,17 +412,22 @@ unsafe fn combine_post_tier_at(
                 *a.w.get_unchecked(j),
             )
         };
+        let tier = tplace < n[1];
         if place < n[0] {
             on[j] = true;
             wv[j] = wj;
             // SAFETY: j < 6 and d < rows, so j·rows + d < 6·rows <=
             // down.len() by this fn's contract.
             dv[j] = unsafe { *a.down.get_unchecked(j * rows + d) };
-        } else if tplace < n[1] {
+        } else if tier {
             on[j] = true;
             wv[j] = wj;
-            // SAFETY: as above, for trows.
-            dv[j] = unsafe { *trows.get_unchecked(j * rows + d) };
+            // SAFETY: rank <= j < 6 and d < rows, so rank·rows + d < 6·rows
+            // <= trows.len() by this fn's contract.
+            dv[j] = unsafe { *trows.get_unchecked(rank * rows + d) };
+        }
+        if tier {
+            rank += 1;
         }
         j += 1;
     }
@@ -495,6 +565,7 @@ impl FfnPiece {
                 detail: format!("layer {layer} holds no tier expert: its handoff is the plain one"),
             });
         }
+        let n_tier = hybrid.on_tier_of(STAGE_TIER, layer)?;
         let card = self.check_card(layer, i, card)?;
         let lw = LayerWeights::resolve(
             &self.cfg[i],
@@ -525,7 +596,7 @@ impl FfnPiece {
             &tier.module,
             stream,
             &h,
-            tier.places.buf(),
+            (tier.places.buf(), n_tier),
             &r.act_x,
             (target, ttarget),
             n,
@@ -630,9 +701,10 @@ impl FfnPiece {
 
 /// Enqueue `ds41_ffn_handoff_tier`: `h`'s routing and the target's
 /// activation into the target's image, the stage card's places into
-/// `sel.0`, the tier's (from `tmap`, the map's tier view) into `sel.1` and
-/// the tier image, and `act`'s q8_1 codes and scales into the tier image.
-/// One launch.
+/// `sel.0`, the tier's (from `tmap`, the map's tier view) into `sel.1` in
+/// slot order and into the tier image in rank order (the tier slots, those
+/// below the layer's `n_tier` tier experts, first), and `act`'s q8_1 codes
+/// and scales into the tier image. One launch.
 #[allow(
     clippy::too_many_arguments,
     reason = "one launch's routing, maps, activation, targets and places (rust-quality R8)"
@@ -641,7 +713,7 @@ fn enqueue_handoff_tier(
     module: &tier_kernels::LoadedModule,
     stream: &CudaStream,
     h: &Handoff<'_>,
-    tmap: &DeviceBuffer<u32>,
+    (tmap, n_tier): (&DeviceBuffer<u32>, usize),
     act: &Q8Act,
     (target, ttarget): (HandoffTarget<'_>, TierTarget<'_>),
     n: usize,
@@ -672,6 +744,17 @@ fn enqueue_handoff_tier(
             ),
         });
     }
+    if tl.count() != tl.sel + N_USED {
+        return Err(GpuError::Shape {
+            what: WHAT,
+            detail: format!(
+                "the tier image counts its tier slots at word {}; the handoff writes the count at \
+                 word {}, after one column's {N_USED} places",
+                tl.count(),
+                tl.sel + N_USED
+            ),
+        });
+    }
     let grid = launch_u32(WHAT, "grid", n.div_ceil(256))?;
     let cfg = LaunchConfig1D::new(grid, 256, 0);
     let prep = module.prepare_ds41_ffn_handoff_tier(cfg)?;
@@ -684,6 +767,7 @@ fn enqueue_handoff_tier(
         tmap,
         launch_u32(WHAT, "row_off", h.row_off)?,
         launch_u32(WHAT, "n_expert", h.n_expert)?,
+        launch_u32(WHAT, "n_tier", n_tier)?,
         target.x,
         target.seq,
         act.q3(),
@@ -710,14 +794,15 @@ fn enqueue_handoff_tier(
 /// The V4.1 tier card's computation ([`TierExperts`]): per tier layer the
 /// stage card's routed launches over the tier's stacks, into the tier's
 /// rows; over a prompt batch's block, the tile path. Its scratch — the
-/// slots' SwiGLU outputs and their q8_1, and the tile path's for a block of
-/// the host union's columns — is made at load.
+/// slots' SwiGLU outputs and, when a layer holds tier experts, their q8_1
+/// and the tile path's for a block of the host union's columns — is made at
+/// load.
 pub struct Ds41Tier {
     experts: ExpertKernels,
     h: DeviceBuffer<f32>,
-    act_h: Q8Act,
+    act_h: Option<Q8Act>,
     batch: FfnBatchKernels,
-    tile: Q3TileScratch,
+    tile: Option<Q3TileScratch>,
     layers: Range<usize>,
     /// Per layer of `layers`, the experts the tier holds and the layer's
     /// `swiglu_clamp_exp`.
@@ -755,14 +840,16 @@ impl Ds41Tier {
             })?;
             let stacks = CardStacks::of(w, l)?;
             // The tier's image carries the activation's Q3_K plane and scales
-            // alone, which the common card leg's gate·up entries do not read
-            // (`accepts::ds41_pair`): the plan puts only the fused layer on a
-            // tier, and a stack of the common leg's types is refused by name.
-            if stacks.is_some_and(|s| !s.fused()) {
+            // alone, which the common card leg's gate·up entries do not read,
+            // and the tier's own launches decode a q4_K down alone
+            // (`accepts::ds41_pair` at `tier`): the plan puts only the fused
+            // layer's q4_K triple on a tier, and a stack of the common leg's
+            // types or of another down is refused by name.
+            if stacks.is_some_and(|s| !s.fused() || s.down_ty() != GgmlType::Q4_K) {
                 return Err(GpuError::Tensor {
                     what: WHAT,
                     name: names::ffn_down_exps(l),
-                    need: "the fused layer's stacks (q3_K gate and up, q4_K down) on an expert tier",
+                    need: "the fused layer with a q4_K down on an expert tier",
                 });
             }
             match (k, stacks) {
@@ -793,11 +880,17 @@ impl Ds41Tier {
             cfg.push((k, kind.swiglu_limit));
         }
         let stream = gpu.stream();
-        let tile = Q3TileScratch::new(stream, UNION_MAX_COLS * N_USED, n, ff)?;
+        // Only a layer with tier experts runs (`tier_layer`), each a fused one.
+        let held = cfg.iter().any(|&(k, _)| k > 0);
+        let tile = held
+            .then(|| Q3TileScratch::new(stream, UNION_MAX_COLS * N_USED, n, ff))
+            .transpose()?;
         Ok(Ds41Tier {
             experts: ExpertKernels::load(gpu.context())?,
             h: DeviceBuffer::zeroed(stream, N_USED * ff)?,
-            act_h: Q8Act::with_k(stream, N_USED, ff)?,
+            act_h: held
+                .then(|| Q8Act::with_k(stream, N_USED, ff))
+                .transpose()?,
             batch: FfnBatchKernels::load(gpu.context())?,
             tile,
             layers,
@@ -828,7 +921,12 @@ impl TierExperts for Ds41Tier {
     /// The tile path's scratch, for blocks of up to [`UNION_MAX_COLS`]
     /// tokens.
     fn block_bytes(&self) -> usize {
-        self.tile.device_bytes()
+        self.tile.as_ref().map_or(0, Q3TileScratch::device_bytes)
+    }
+
+    /// The tile path reads the q3 plane and its scales alone.
+    fn block_planes(&self) -> bool {
+        true
     }
 
     fn enqueue_block(
@@ -855,7 +953,13 @@ impl TierExperts for Ds41Tier {
             layer,
             limit,
         };
-        enqueue_tiled_experts(gpu, &self.batch, &t, &mut self.tile, io.down)
+        let tile = self.tile.as_mut().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "the tile scratch of a tier with a tier layer (Ds41Tier::new)",
+        })?;
+        // No q5_K tile module: a tier layer's down is the q4_K triple's by
+        // the load's own refusal above, so the dispatch never asks for one.
+        enqueue_tiled_experts(gpu, &self.batch, None, &t, tile, io.down)
     }
 
     fn enqueue_layer(
@@ -879,6 +983,10 @@ impl TierExperts for Ds41Tier {
                     .to_string(),
             });
         };
+        let act_h = self.act_h.as_mut().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "the slots' q8_1 scratch of a tier with a tier layer (Ds41Tier::new)",
+        })?;
         let stream = gpu.stream();
         let args = ExpertGateUp {
             wg: s.gate,
@@ -899,11 +1007,11 @@ impl TierExperts for Ds41Tier {
             n_card: k,
         };
         gpu.q4k_sel()
-            .enqueue_quantize_sel(stream, &q, gpu.layer_sink(layer)?, &mut self.act_h)?;
+            .enqueue_quantize_sel(stream, &q, gpu.layer_sink(layer)?, act_h)?;
         gpu.q4k_sel().enqueue_gemv_q4k_sel(
             stream,
             s.down,
-            &self.act_h,
+            act_h,
             io.sel,
             N_USED,
             self.n_embd,

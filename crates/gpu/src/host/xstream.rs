@@ -1945,11 +1945,7 @@ fn micros(t0: Instant) -> u64 {
 /// The card's free and total bytes now.
 fn card_mem(ctx: &Arc<CudaContext>) -> Result<(u64, u64), GpuError> {
     ctx.bind_to_thread()?;
-    let (mut free, mut total) = (0usize, 0usize);
-    // SAFETY: the context is current on this thread (bound above) and both
-    // outputs are live locals the call writes.
-    let rc = unsafe { sys::cuMemGetInfo_v2(&mut free, &mut total) };
-    cu(rc, "cuMemGetInfo (xstream ring)")?;
+    let (free, total) = crate::current_mem_info()?;
     Ok((free as u64, total as u64))
 }
 

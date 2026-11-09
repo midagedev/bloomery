@@ -1,0 +1,29 @@
+# ctxgrow E7: one reserved range, its first half card memory and its second half host memory, both cuMemCreate'd
+# (location DEVICE vs HOST_NUMA) and mapped side by side; an unchanged kernel reads both through one pointer. Prices a
+# KV store whose tail pages live on the host with no kernel change (a room page backed by a host handle), and the cost
+# of moving one page from card to host at its address. rig-log tools/hostvmm (hostvmm.cu, run.sh): 2 GiB a half,
+# sequential 16-byte words and a quarter of a half's rows at random (1,536 and 2,048 B), median of 9 launches; then 8
+# pages moved one at a time.
+kind: calibration
+question: does an A6000 kernel read host-located VMM pages through the same pointer as card pages, and how fast
+term: sequential read GB/s of the host-located half, A6000, PCIe 4.0 x16, 2 GiB, median of 9 launches
+unit: GB/s
+predict: 18.0..26.5
+condition: rig-log tools/hostvmm/run.sh under tools/ref/lease-hold.sh, both cards idle, CUDA_VISIBLE_DEVICES the A6000 by bus id
+reason: [derived] a host-located VMM page is pinned host memory reached over the same link as a mapped pinned buffer,
+  which read 26.28 GB/s sequential and 25.4-26.3 GB/s as random KV-sized rows on this card (hostread-e2); the band is
+  E2's. The card half (~674 GB/s, the plan's card rate), the both-halves row read and the page move's time are read,
+  not predicted.
+decide-in: the ctxgrow plan's option (d) by rooms: a growing KV store backs its pages past the card's floor with host
+  handles in its one range, the kernels unchanged, instead of a page table over row pages (the design report's R7)
+decide-below: under 18: read whether the driver placed the pages where asked (the attribute and the location printed)
+decide-above: above 26.5: read the kernel for a cache effect (2 GiB exceeds any on-card cache by far)
+# outcome 2026-11-09 (rig-log tools/hostvmm, the A6000 by bus id, driver API 13040, host_numa_vmm 1, granularity 2 MiB
+#  both locations, lease held 6 s, gpu-apps [] before and after): the host half reads 26.27 GB/s sequential (2 GiB, median
+#  of 9), in band at its top, the same as a mapped pinned buffer (hostread-e2); the card half 712.2 GB/s. Random rows, a
+#  quarter of a half's rows: 1,536 B card 597.4 / host 26.24 / both halves 52.5 GB/s; 2,048 B 641.2 / 26.25 / 52.6 GB/s
+#  (the both-halves read takes half the host-only time: the host rows bound it, the card rows hide under them). Values
+#  read back equal in both halves through the one pointer. Moving a 2 MiB page card -> host at its address (a host
+#  handle created, the page copied, both unmapped, the host handle mapped in its place): median 402 / 317 us over 8
+#  pages, max 887 us; the card's free bytes rose by exactly 8 pages; the moved pages read back equal. decide-in: a room
+#  page backed by a host handle is option (d) with no kernel change: a KV store's tail pages go to the host in place.

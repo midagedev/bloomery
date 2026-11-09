@@ -1,0 +1,15 @@
+# r3b mutant load-no-rooms
+# clause: gate_qwen38_residency kvfloor (the squeezed run): a residency load keeps its routed stacks
+#   plain buffers, so no stack can give a page back: free_bytes refuses by name (no k reaches the bytes)
+#   and the squeezed call ends in NoRoom noting that refusal; the clause reads FAIL.
+--- a/crates/gpu/src/model.rs
++++ b/crates/gpu/src/model.rs
+@@ -966,7 +966,7 @@
+         // (`StackRoom`), so a released tail gives its pages back; a load whose card bytes come
+         // from a part source keeps plain buffers.
+         let rooms = match (&residency.lever, &bytes) {
+-            (Residency::Mid { .. }, CardBytes::File) => plan.machine.cards.get(card).map(|spec| {
++            (Residency::Mid { .. }, CardBytes::File) if false => plan.machine.cards.get(card).map(|spec| {
+                 spec.layers
+                     .clone()
+                     .flat_map(|l| residency.stacks.names(l))

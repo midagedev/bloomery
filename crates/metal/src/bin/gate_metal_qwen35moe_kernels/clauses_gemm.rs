@@ -127,9 +127,8 @@ pub enum Rows {
     /// The f32 rows, cast as the kernel stages them.
     F32,
     /// The rows through [`bloomery_metal::kernels::Kernels::gemm_x`] in the
-    /// same command buffer: half rows where the path takes them (the gate
-    /// refuses a path that does but handed f32 rows back, and one that does
-    /// not but cast).
+    /// same command buffer: half rows for the f16 operand, f32 rows for the
+    /// f32 operand (the gate refuses any other rows handed back).
     Cast,
 }
 
@@ -141,22 +140,18 @@ fn half_rows(h: &Harness<'_>, len: usize) -> Result<bloomery_metal::MetalBuffer<
         .map_err(why)
 }
 
-/// The rows `gemm_x` handed back, against the path's own rule.
-fn check_cast(h: &Harness<'_>, x: &GemmX<'_>) -> Result<(), DeviceError> {
+/// The rows `gemm_x` handed back, against the operand's rule: half rows for
+/// the f16 operand on either path, f32 rows for the f32 operand.
+fn check_cast(x: &GemmX<'_>, operand: Operand) -> Result<(), DeviceError> {
     let half = matches!(x, GemmX::F16 { .. });
-    if half == h.kernels.gemm_takes_half() {
+    if half == (operand == Operand::F16) {
         return Ok(());
     }
     Err(DeviceError::Range {
         what: "gate cast",
         detail: format!(
-            "gemm_x handed back {} rows on a path whose f16 GEMMs {} half rows",
+            "gemm_x handed back {} rows for the {operand:?} operand",
             if half { "half" } else { "f32" },
-            if h.kernels.gemm_takes_half() {
-                "read"
-            } else {
-                "do not read"
-            }
         ),
     })
 }
@@ -211,7 +206,7 @@ pub fn launch_gemm_as(
                         layer: LAYER,
                     },
                 )?;
-                check_cast(h, &x)?;
+                check_cast(&x, launch.operand)?;
                 x
             }
         };
@@ -326,7 +321,7 @@ pub fn launch_gemm_seg_as(
                         layer: LAYER,
                     },
                 )?;
-                check_cast(h, &x)?;
+                check_cast(&x, launch.operand)?;
                 x
             }
         };
@@ -1159,14 +1154,13 @@ pub fn gemm_range(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     )))
 }
 
-/// The half-row GEMMs: on a path whose f16 GEMMs read half rows, the
-/// activations cast once ([`Rows::Cast`]) give the f32-row entries' outputs
+/// The half-row GEMMs, on either path: the f16 operand's activations cast
+/// once ([`Rows::Cast`]) give the f32-row entries' outputs
 /// bit for bit — the dense A4 cases at both epilogues, the residual's at f32
 /// rows strided wider than their columns, and the segmented group — and the
 /// cast's range check is the staging's: an activation past the half range,
 /// or NaN, raises the activation quantizer's site and every output is the
-/// f32-row entry's bits, the faulted row's NaN among them. A path whose f16
-/// GEMMs do not read half rows gets its f32 rows back from the cast.
+/// f32-row entry's bits, the faulted row's NaN among them.
 pub fn gemm_half_rows(h: &Harness<'_>, mlx: &Fixture, sites: &Sites) -> Clause {
     half_rows_over(h, &a4_cases(h, mlx, sites)?, a4_seg_group(mlx, sites)?)
 }
@@ -1276,15 +1270,11 @@ pub(super) fn half_rows_over(h: &Harness<'_>, cases: &[Case<'_>], group: SegGrou
     }
     h.clear_fault()?;
     Ok(Verdict::Noted(format!(
-        "{} dense {:?} cases at both epilogues and the segmented group, the cast rows' bits the \
-         f32 rows' ({}); the range fault and NaN rows through the cast",
+        "{} dense {:?} cases at both epilogues and the segmented group, the half rows' bits the \
+         f32 rows' ({} path); the range fault and NaN rows through the cast",
         cases.len(),
         case.quant,
-        if h.kernels.gemm_takes_half() {
-            "half rows"
-        } else {
-            "f32 rows handed back"
-        }
+        h.kernels.gemm_path().name()
     )))
 }
 

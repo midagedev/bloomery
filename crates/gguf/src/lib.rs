@@ -44,9 +44,12 @@ pub mod card;
 pub mod digest;
 pub mod engram;
 pub mod facts;
+pub mod iq_quant;
 pub mod iq_tables;
+pub mod kquant;
 pub mod qtype;
 pub mod quant;
+pub mod shard_dirs;
 pub mod v41;
 pub mod write;
 
@@ -234,6 +237,10 @@ pub enum LoadError {
     /// The Engram companion file of a set ([`engram::attach_companion`]).
     #[error("engram companion {path}: {detail}")]
     Companion { path: String, detail: String },
+    /// An Engram table the header's sites cannot be read from
+    /// ([`engram::EngramTables::read`]).
+    #[error("engram table {name}: {detail}")]
+    EngramTable { name: String, detail: String },
     /// A header fact the file states wrongly or twice ([`facts`]).
     #[error("{0}")]
     Fact(Box<facts::FactError>),

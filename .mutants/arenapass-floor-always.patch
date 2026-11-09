@@ -1,0 +1,14 @@
+--- a/crates/placement/src/placement/room.rs
++++ b/crates/placement/src/placement/room.rs
+@@ -927,10 +927,7 @@
+     };
+     let arena = match grant {
+         Grant::Given(given) => nvme_arena_of(&dial, given)?,
+-        Grant::AtLeastFloor => match nvme_arena_of(&dial, None)? {
+-            0 => nvme_arena_of(&dial, Some(dial.least.bytes))?,
+-            dialled => dialled,
+-        },
++        Grant::AtLeastFloor => nvme_arena_of(&dial, Some(dial.least.bytes))?,
+     };
+     let room = room - arena;
+     plan.host.nvme_arena_bytes = arena;

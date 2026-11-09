@@ -237,7 +237,7 @@ mod cli {
     use crate::gen_time::Windows;
     use crate::glm_place;
     use app::arch::glm5next::{GlmCfg, open_nextn, open_pair, open_resident, open_resident_slots};
-    use app::mtp::MtpDraft;
+    use app::mtp::{MtpDraft, open_draft};
     use app::{Loaded, OpenArgs, OpenLog, RowsLog, Session, SessionError};
     use bloomery_gpu::Gpu;
     use bloomery_gpu::host::node::node_cards;
@@ -1334,7 +1334,7 @@ mod cli {
     /// every kept token the target's own argmax; the lines the module doc
     /// names, the `residency pass` records last.
     fn drafted_run(s: &mut Session<Body>, a: &Arm<'_>, width: WidthMode) -> Result<(), GateError> {
-        let draft = MtpDraft::open(s.model(), a.prefill, StepMode::Eager)?;
+        let draft = open_draft(s.model(), a.prefill, StepMode::Eager)?;
         let mut spec = s.with_draft::<Choosing<MtpDraft<Body>>, VERIFY_ROWS>(
             draft.choosing(width)?,
             &mut PairCapture,
@@ -1718,6 +1718,7 @@ mod cli {
                     name: "split".into(),
                     dims: vec![64, ROWS],
                     bytes: ROWS * ROW_BYTES,
+                    card: None,
                     whole_bytes: 0,
                     block: [64, 1],
                     cut: Some(Cut { dim: 1, unit: 1 }),
@@ -1726,6 +1727,7 @@ mod cli {
                     name: "whole".into(),
                     dims: vec![64],
                     bytes: WHOLE,
+                    card: None,
                     whole_bytes: 0,
                     block: [64, 1],
                     cut: None,

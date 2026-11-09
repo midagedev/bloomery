@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/midagedev/bloomery/releases/tag/v0.3.12">0.3.12 release notes</a> ·
+  <a href="https://github.com/midagedev/bloomery/releases/tag/v0.3.13">0.3.13 release notes</a> ·
   <a href="docs/models.md">Models</a> ·
   <a href="docs/serving.md">Serving</a> ·
   <a href="docs/agents.md">Agents</a> ·
@@ -58,6 +58,9 @@ fast card set, see [Which coding agent](docs/agents.md#which-coding-agent).
   mlx-community's 4-bit folders as downloaded. Q4_K_M GGUF files run, unverified (Qwen3.6 also from `UD-Q4_K_XL`).
   Ornith-1.5-35B and MiniCPM-V 4.7 35B-A3B (Q4_K_M, text only) run, unverified. Prompts run in batched passes, and a
   follow-up turn reads only its new messages ([below](#apple-silicon)).
+- **A quantizer that writes the final set.** `bloomery-quantize` writes a GGUF set's routed-expert stacks as IQ1_S or
+  IQ2_XXS on the card and every other tensor by the host's K-quant rules, the metadata and shard layout as
+  `llama-quantize` writes them, byte-identical to its output for the same input and options ([`docs/quantize.md`](docs/quantize.md)).
 - **llama-server compatible.** The same HTTP API (OpenAI and Anthropic), GGUF files and flag spellings, including the
   placement flags (`-dev`, `-ts`, `-ngl`, `--cpu-moe`, `-ot`, `--fit`) with llama's meaning. Your client works
   unchanged ([Use](#use)).
@@ -81,8 +84,8 @@ and Homebrew all take the latest release. To build from source instead: [`docs/B
 The release carries a GB10 archive (`linux-aarch64-cuda-sm121a`, built for the GB10's FP4 tensor cores, its GPU code
 compiled ahead) and a linux/arm64 variant of the Docker image `ghcr.io/midagedev/bloomery` made from it. On a GB10
 the installer picks that archive and Docker pulls that variant by itself. The machine needs DGX OS 7 (Ubuntu 24.04,
-glibc 2.39) and an NVIDIA driver of R580 or newer (CUDA 13). 0.3.12's GB10 archive is added to the release when it is
-ready; until then the installer stops at its download by name, and `install.sh --version v0.3.11` installs 0.3.11.
+glibc 2.39) and an NVIDIA driver of R580 or newer (CUDA 13). 0.3.13's GB10 archive is added to the release when it is
+ready; until then the installer stops at its download by name, and `install.sh --version v0.3.12` installs 0.3.12.
 
 ```sh
 # Docker (needs the host's NVIDIA Container Toolkit; model downloads live in the bloomery-cache volume)
@@ -117,12 +120,12 @@ docker run --gpus all -p 8080:8080 -v bloomery-cache:/root/.cache/bloomery \
   ghcr.io/midagedev/bloomery --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M
 
 # or the plain tarball
-tar -xzf bloomery-0.3.12-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.3.12-linux-x86_64-cuda-sm86
+tar -xzf bloomery-0.3.13-linux-x86_64-cuda-sm86.tar.gz && cd bloomery-0.3.13-linux-x86_64-cuda-sm86
 bin/bloomery-serve --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M
 ```
 
 The tarballs are on the [releases page](https://github.com/midagedev/bloomery/releases)
-([0.3.12](https://github.com/midagedev/bloomery/releases/tag/v0.3.12)).
+([0.3.13](https://github.com/midagedev/bloomery/releases/tag/v0.3.13)).
 
 From 0.3.11 the release carries an archive for the RTX 50 series (`linux-x86_64-cuda-sm120a`, compute capability 12.0:
 the RTX 5090 and the RTX PRO Blackwell cards), built for the Blackwell FP4 and FP8 tensor cores. The installer takes it
@@ -145,7 +148,7 @@ The Mac needs macOS 26.2 or newer; the binaries are signed and notarized. The se
 brew install midagedev/tap/bloomery
 bloomery-serve-metal -m PATH/Qwen3.6-35B-A3B-Q4_K_M.gguf
 
-# or the same installer as on Linux (bloomery-0.3.12-macos-arm64-metal.tar.gz on the releases page)
+# or the same installer as on Linux (bloomery-0.3.13-macos-arm64-metal.tar.gz on the releases page)
 curl -fsSL https://raw.githubusercontent.com/midagedev/bloomery/main/tools/release/install.sh | sh
 ~/.local/bin/bloomery-serve-metal -m PATH/Qwen3.6-35B-A3B-Q4_K_M.gguf
 ```
@@ -211,6 +214,24 @@ What each model needs in GPU memory, RAM and disk is in [`docs/models.md`](docs/
 Qwen3.6 run on a 24 GB card (or 12 to 16 GB, split onto the CPU by itself); Qwen3.8 wants 128 GB of RAM, GLM-5.3 and
 V4.1 256 GB, and less RAM runs with the overflow paged from NVMe.
 
+A paged run reads faster from two NVMe drives than from one: a byte-identical copy of the shards on a second drive,
+named by a `<prefix>.shard-dirs` sidecar beside the first shard ([`docs/serving.md` 5.4](docs/serving.md#54-when-the-host-cannot-hold-the-experts-either)),
+lets the NVMe tier's reader pick each expert's drive by id, so a layer's misses land on both drives at once. Measured
+on the 0.3.13 tarball's `bloomery-serve`, RTX A6000 + RTX 3090, one cold request of 512 ids then 128 generated, three
+rounds each, the host room pinned so the plan pages (`BLOOMERY_HOST_ROOM`), the same set with and without the sidecar
+(`docs/cards/mirror-ab-*.card`):
+
+| Model | Room | `--place` | Decode tok/s, one drive → two | Prompt tok/s, one drive → two |
+|---|---|---|---|---|
+| DeepSeek V4.1-Flash Q3_K_M | 80G | `bp` | 16.9 → 22.4 (+32 %) | 26.1 → 40.5 (+55 %) |
+| Mistral Large 4 UD-IQ1_S | 80G | `a` | 3.02 → 4.23 (+40 %) | 13.5 → 21.5 (+59 %) |
+| GLM-5.3-Flash UD-Q4_K_XL | 48G | `bp` | 5.51 → 8.22 (+49 %) | 30.3 → 54.0 (+78 %) |
+| Kimi K3.1 Pro IQ1_S | 232G | `bp` | 2.94 with two drives (0.3.13's binary, the prompt pass, the default; known limits give the pass on main); 4.99 under `--prefill steps`, in the [0.3.13 notes](https://github.com/midagedev/bloomery/releases/tag/v0.3.13) | 12.5; 3.80 under `--prefill steps` |
+
+One drive reads at ~4.2–4.7 GB/s on these runs and two at ~5.9–7.2 GB/s. The sidecar does nothing when the plan
+pages through the file mapping instead of the tier's arena (a room that moves under half the host leg's bytes prints
+`arena=0`); the gain is in the paged part of the step, so a plan that pages little reads near 0.
+
 ## Hardware
 
 What each platform needs is under [Install](#install), and what each model needs in GPU memory, RAM and disk is in
@@ -225,12 +246,12 @@ Ada cards (sm_89) have no report yet, and AMD GPUs are not supported yet. On an 
 accelerators for the prompt's GEMMs. What each part of the machine costs in a decode step:
 [`docs/HARDWARE.md`](docs/HARDWARE.md).
 
-## Status (0.3.12)
+## Status (0.3.13)
 
 Four common machines, one table each, tok/s. Every other record (two cards, older releases, other cards and Macs, the
 reference engines) is in [`docs/numbers.md`](docs/numbers.md), with its machine and conditions. Each table names the
-release or commit it was measured on; 0.3.12's own rows, Mistral Large 4's among them, are in its
-[release notes](https://github.com/midagedev/bloomery/releases/tag/v0.3.12).
+release or commit it was measured on; 0.3.13's own rows, the DGX Spark expert tier's among them, are in its
+[release notes](https://github.com/midagedev/bloomery/releases/tag/v0.3.13).
 
 **One RTX 3090 24 GB**, on our workstation (32-core AVX2 host, 256 GB of RAM, the 3090 at its 250 W cap): the tagged
 0.3.10 tree at the serving defaults (`--place` unset, every lever unset, speculative drafts on where a model has one, no
@@ -326,7 +347,7 @@ release's check:
 Output is checked layer by layer against ik_llama.cpp (V4.1: PPL 2.2401 against 2.2378, same top token 97.46 %), and
 every gate is shown to fail on its defect before the fix lands ([how](docs/performance.md#how-it-is-verified)).
 
-## Known limits (0.3.12)
+## Known limits (0.3.13)
 
 - DeepSeek V4.1 on two cards (`--place bp`) is not faster than one card (`--place a`). Unset `--place` picks `a`.
 - The `nemotron`, `raon1`, `solar2` and `musespark` seats serve one slot; `--parallel` above 1 is refused by name.
@@ -336,13 +357,26 @@ every gate is shown to fail on its defect before the fix lands ([how](docs/perfo
   types stay on the host.
 - Muse Spark Open always thinks: a turn's first tokens are its reasoning, so a short `max_tokens` can end with empty
   `content`.
-- MiniMax-M3 (not M3.1) was not checked for 0.3.12; each family's newest model was.
+- MiniMax-M3 (not M3.1) was not checked for 0.3.13; each family's newest model was.
 - Flint's greedy text has no CPU or llama.cpp referee yet; the card path's gates and the serving checks hold it.
 - DeepSeek V4.1 runs routed experts on a card only as Q3_K gate·up with a Q4_K down; other expert types (ISTA-DASLab's
   IQ1_M, IQ2_XXS and IQ2_XS) run on the host tier.
 - DeepSeek V4.1 on one 24 GB card from a file with an r8 sidecar beside it is refused at the load by name (the NVMe
   tier does not fill from the sidecar yet); `BLOOMERY_R8=off` reads the source file with the same bits.
 - GLM-5.3 holds at most 16,384 positions a slot; a `--ctx-size` whose slot share is larger is refused at the start.
+- Kimi K3.1 Pro (our `IQ1_S` set, a Q4_K trunk) loads at `--place bp` only (two cards, the host and the NVMe expert
+  tier). Past the lightning indexer's top-k (2,048 positions) the latent layers attend the rows the indexer picks,
+  so `--ctx-size` is not held to the top-k. The seat runs a prompt as placed passes; the pass holds its buffers on the stage
+  card and fills the NVMe arena with each pass's experts, so a step decodes a little slower than under
+  `--prefill steps` (4.46 against 4.99 tok/s, the prompt 10.2 against 3.80, at 512 ids and 512 generated, one cold
+  request each, after 0.3.13): steps is the faster pick when the reply is longer than about 7 times the prompt
+  [derived from those rates]. The seat serves the model's think span as plain text. The set's chat template is unsloth's
+  Kimi-K3 template (the checkpoint ships none), and its importance matrix came from `llama-imatrix`; the quantization
+  itself was written by `bloomery-quantize`. Kimi K3 (unsloth's `UD-IQ1_S`, 594 GB) does not load at this tag: its
+  dense trunk is 51.4 GB, past one 48 GB card.
+- The expert tier on another machine (`BLOOMERY_TIER_NODES`, `tier_server`) serves DeepSeek V4.1-Flash, GLM-5.3, Qwen3.8,
+  Solar-Open2 and Kimi K3 / K3.1; a node serves no prompt batch (the batch is the host's), and the RAM arena
+  (`BLOOMERY_NVME_ARENA`) refuses a plan with a rank file (`BLOOMERY_EXPERT_RANK`) by name.
 
 Every limit, by seat: [`docs/serving.md`](docs/serving.md#12-limits).
 
@@ -371,6 +405,7 @@ start screen), [@Burntgogi](https://github.com/Burntgogi) (the common owners eve
 | [`docs/claude-code.md`](docs/claude-code.md) | Claude Code on a local model, on an NVIDIA card or a Mac, with measured first-turn times |
 | [`docs/pi.md`](docs/pi.md) | pi on a local model: the smallest first request of the surveyed agents, on an NVIDIA card or a Mac |
 | [`docs/dsh.md`](docs/dsh.md) | DeepSeek Harness (dsh) on DeepSeek-V4.1-Flash: the server, the profile patch, what to expect |
+| [`docs/quantize.md`](docs/quantize.md) | `bloomery-quantize`: the final quantized set in one pass (IQ1_S and IQ2_XXS experts on the card, the trunk by the host's K-quant rules), how its bytes are proved, the resource timeline |
 | [`docs/models.md`](docs/models.md) | Recommended files and what each model needs |
 | [`docs/numbers.md`](docs/numbers.md) | Every measured table beyond the Status tables: two cards, older releases, other cards and Macs |
 | [`docs/performance.md`](docs/performance.md) | Number conditions, why it is fast, verification, recorded sessions |

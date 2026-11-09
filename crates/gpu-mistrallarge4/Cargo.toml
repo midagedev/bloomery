@@ -9,10 +9,10 @@ license = "MIT"
 workspace = true
 
 # The Mistral Large 4 program: host code only, no `#[cuda_module]` of its own. It composes the
-# kernels of `bloomery-gpu` (the norms, the LayerNorm, the rope, the fused key append, the 576-wide
-# latent flash, the q8_0 gemvs, the softmax router, the head) and of `bloomery-gpu-deepseek41` (the
-# lightning indexer, the selected 512-wide walk, the common routed block); it is built with
-# `cargo oxide` because those crates are.
+# kernels of `bloomery-gpu` (the norms, the LayerNorm, the rope, the fused key append, the lightning
+# indexer and its input-form key, the 576-wide latent flash, the q8_0 gemvs, the softmax router, the
+# head) and of `bloomery-gpu-deepseek41` (the selected 512-wide walk, the common routed block); it
+# is built with `cargo oxide` because those crates are.
 [dependencies]
 cuda-core.workspace = true
 bloomery-gpu = { path = "../gpu" }

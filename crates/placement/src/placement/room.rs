@@ -195,9 +195,9 @@ pub(super) fn row_cache_reserve(model: &ModelTensors, rows: &[Row]) -> u64 {
 /// `positions` positions from the NVMe tier: per table, its rows a position
 /// ([`ModelTensor::gathered_rows`]) for every position, each physical plane of
 /// a row on at most `1 + ceil((plane bytes - 1) / page)` host base pages.
-/// Split rows are packed; NVFP4 part-source rows have separate code and scale
-/// planes. The ids are hashed, so a call's rows are counted on pages of their
-/// own, and each plane may straddle a page boundary. The reader
+/// Split rows are packed; NVFP4 and MXFP8 part-source rows have separate code
+/// and scale planes. The ids are hashed, so a call's rows are counted on pages
+/// of their own, and each plane may straddle a page boundary. The reader
 /// advises and copies one call at a time, so one call's pages are what must
 /// stay resident until its copy. A table with no per-token row count, or a
 /// room past u64, is refused by name.
@@ -217,17 +217,20 @@ pub fn row_room(
             })?;
             let bytes = row_bytes(t)?;
             let span = |bytes: u64| 1 + bytes.saturating_sub(1).div_ceil(page);
-            let pages = match (source, t.ty) {
-                (RowTableSource::Parts, GgmlType::NVFP4_ROWS) => {
-                    if !bytes.is_multiple_of(9) {
-                        return Err(PlacementError::tensor(
-                            t,
-                            "NVFP4 row bytes are not whole groups",
-                        ));
-                    }
-                    let groups = bytes / 9;
-                    span(groups * 8) + span(groups)
+            // A group of `group` bytes is its codes and one scale byte, each in its own plane.
+            let planes = |group: u64, name: &str| {
+                if !bytes.is_multiple_of(group) {
+                    return Err(PlacementError::tensor(
+                        t,
+                        format!("{name} row bytes are not whole groups"),
+                    ));
                 }
+                let groups = bytes / group;
+                Ok(span(groups * (group - 1)) + span(groups))
+            };
+            let pages = match (source, t.ty) {
+                (RowTableSource::Parts, GgmlType::NVFP4_ROWS) => planes(9, "NVFP4")?,
+                (RowTableSource::Parts, GgmlType::MXFP8) => planes(33, "MXFP8")?,
                 _ => span(bytes),
             };
             positions
@@ -809,6 +812,28 @@ pub fn expert_nvme_tier(
     room: u64,
     given: Option<u64>,
 ) -> Result<(), PlacementError> {
+    split_nvme_tier(plan, room, Grant::Given(given))
+}
+
+/// [`expert_nvme_tier`] with the lever unset for a load whose prompt passes read
+/// every paged id once a pass: the split dial's arena where the dial gives one,
+/// else the arena's floor ([`ArenaFloor::of`] on the plan before the split), so
+/// a paged plan reads its ids into an arena and never into a smaller one than
+/// the dial gives the step.
+pub fn expert_nvme_tier_for_passes(plan: &mut Plan<'_>, room: u64) -> Result<(), PlacementError> {
+    split_nvme_tier(plan, room, Grant::AtLeastFloor)
+}
+
+/// How [`split_nvme_tier`] sizes the arena.
+#[derive(Clone, Copy)]
+enum Grant {
+    /// [`nvme_arena_of`]'s `given`: the lever's value, or the dial's.
+    Given(Option<u64>),
+    /// The dial's arena, or its floor where the dial gives none.
+    AtLeastFloor,
+}
+
+fn split_nvme_tier(plan: &mut Plan<'_>, room: u64, grant: Grant) -> Result<(), PlacementError> {
     let model = plan.model;
     let need = workstation::HostNeed::of(plan, 0);
     // The exact sum: a need past u64 bytes reads `u64::MAX` in `bytes()`,
@@ -900,7 +925,13 @@ pub fn expert_nvme_tier(
         need: need.bytes(),
         least: ArenaFloor::of(plan)?,
     };
-    let arena = nvme_arena_of(&dial, given)?;
+    let arena = match grant {
+        Grant::Given(given) => nvme_arena_of(&dial, given)?,
+        Grant::AtLeastFloor => match nvme_arena_of(&dial, None)? {
+            0 => nvme_arena_of(&dial, Some(dial.least.bytes))?,
+            dialled => dialled,
+        },
+    };
     let room = room - arena;
     plan.host.nvme_arena_bytes = arena;
     // The prompt run-ahead's page-cache window, `2 W`, is a host reserve of

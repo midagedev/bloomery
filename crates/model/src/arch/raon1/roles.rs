@@ -22,20 +22,8 @@ const GATES: &[Stem] = &[
 /// An RDA layer's mixer: the common [`kda`] head and tail around the two gates.
 const RDA: &[Stem] = &join::<16>(&[kda::HEAD, GATES, kda::TAIL]);
 
-/// A latent layer's mixer: the query and key-value latents with their norms, the absorbed
-/// per-head up projections, the output gate and the output projection.
-const MLA: &[Stem] = &[
-    req("attn_norm.weight", Role::Attention),
-    req("attn_q_a.weight", Role::Attention),
-    req("attn_q_a_norm.weight", Role::Attention),
-    req("attn_q_b.weight", Role::Attention),
-    req("attn_kv_a_mqa.weight", Role::Attention),
-    req("attn_kv_a_norm.weight", Role::Attention),
-    req("attn_k_b.weight", Role::Attention),
-    req("attn_v_b.weight", Role::Attention),
-    req("attn_gate.weight", Role::Attention),
-    req("attn_output.weight", Role::Attention),
-];
+/// A latent layer's mixer, the common `delta_mla` owner's.
+use crate::arch::delta_mla::MLA;
 
 /// A dense layer's feed-forward block and every layer's hyper-connection tensors, the common
 /// table's.

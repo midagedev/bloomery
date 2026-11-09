@@ -1334,6 +1334,7 @@ fn hw_fixture_v41_budget() {
     let at = |budget: Option<u64>, ctx: u64, slots: usize| -> Result<Vec<u64>, String> {
         let levers = PlanLevers {
             card_budget_bytes: budget.into(),
+            ..PlanLevers::default()
         };
         let slots = NonZeroUsize::new(slots).unwrap();
         inputs
@@ -1342,9 +1343,10 @@ fn hw_fixture_v41_budget() {
             .map_err(|e| e.to_string())
     };
     let ctx = v41::BUDGET_CTX;
-    // f0 and f1 are the source's first two layers, whose Q5_K down no card
-    // kernel runs: their experts stay on the host.
-    let want = |n: u64| -> Vec<u64> { (0..layers).map(|l| if l < 2 { 0 } else { n }).collect() };
+    // f0 and f1 are the source's first two layers: the fused layer reads
+    // their Q5_K down by type, so they take card experts like the rest.
+    // PIN(2026-11-06): was 0 on both until the fused down read its type.
+    let want = |n: u64| -> Vec<u64> { (0..layers).map(|_| n).collect() };
     assert_eq!(
         at(None, ctx, 1).unwrap(),
         want(experts),
@@ -2768,6 +2770,7 @@ fn hw_fixture_q38_budget() {
         );
         let levers = PlanLevers {
             card_budget_bytes: budget.into(),
+            ..PlanLevers::default()
         };
         inputs
             .plan_with_slots(
@@ -3314,6 +3317,7 @@ fn hw_fixture_glm_budget() {
     let with_nextn = |budget: Option<u64>, ctx: u64| -> Result<Vec<u64>, String> {
         let levers = PlanLevers {
             card_budget_bytes: budget.into(),
+            ..PlanLevers::default()
         };
         inputs
             .plan_nextn(&machine, ctx, &levers, &nextn)
@@ -3323,6 +3327,7 @@ fn hw_fixture_glm_budget() {
     let plain = |budget: Option<u64>, ctx: u64| -> Result<Vec<u64>, String> {
         let levers = PlanLevers {
             card_budget_bytes: budget.into(),
+            ..PlanLevers::default()
         };
         inputs
             .plan(&machine, ctx, &levers)
@@ -5348,6 +5353,7 @@ fn hw_fixture_solar_budget() {
     let counts = |budget: Option<u64>| -> Vec<u64> {
         let levers = PlanLevers {
             card_budget_bytes: budget.into(),
+            ..PlanLevers::default()
         };
         inputs
             .plan(&machine, ctx, &levers)

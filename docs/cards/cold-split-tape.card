@@ -1,0 +1,21 @@
+# Round cold-split-tape (kind profile): the cold-split node decode (the coldsplit A/B: 48.9 tok/s mean, pp 210.5 at n 96,
+# prose P 512, depth 512) recorded as a toktape run for the clip: the same Korean prompt served by bloomery-serve-ds41 at the
+# 128 GB room with the Spark tier and BLOOMERY_EXPERT_RANK, one request, the tape's per-token stamps being the clip's clock.
+kind: profile
+question: does the cold-split tape's decode rate reproduce the A/B row (~49 at n 96, depth 512; shallower here) so the clip's
+  replay is the measured ratio against the alone tape (20.9), and does ttft read the pp 210 row?
+term: tokens/s (the tape's timings.predicted_per_second) @ one request, 256 tokens, the prompt in
+  rig-log tools/v41-korean.tape's first Korean question, bloomery-serve-ds41 at --place a (BLOOMERY_HOST_ROOM=128G,
+  BLOOMERY_NVTIER_BYTES=60G, BLOOMERY_R8=off) and at --place bp with the Spark tier (BLOOMERY_TIER_NODES,
+  BLOOMERY_TIER_LINK=tcp, BLOOMERY_CARD_BUDGET=110G, BLOOMERY_HOST_LOCK=1), A6000 stage
+unit: tok/s
+predict: 46..54
+condition: one binary (the train tree's commit) on the box and the Spark's tier_server from it; each server its own
+  process, the Spark's caches dropped before the node open; a warm-up request before the recorded one (the recorded
+  request is the second); the alone arm's tape predicted_per_second 18..21; tapes sanitised (tape-sanitize.py) before
+  they leave the box
+decide-in: the clip replays both tapes at their own stamps; the numbers on screen are the tapes' and the sitting's,
+  each named
+decide-below: under 46: the chat path (sampling, the serve loop) costs more than generate_ds41's step; read the tape's
+  pms gaps against the sitting's p50
+decide-above: over 54: the shallower depth saved more than the attention term; write the depth beside the number

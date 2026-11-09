@@ -10,12 +10,19 @@ use std::net::{Shutdown, TcpStream};
 use std::time::{Duration, Instant};
 
 /// The protocol's version, the census's first word: a node of another
-/// version is refused by name.
-pub(super) const VERSION: u32 = 7;
+/// version is refused by name. Version 9 is a prompt batch's block on the
+/// node: the block open and the block request with its packed rows.
+pub(super) const VERSION: u32 = 9;
 
-/// The longest frame either side takes: an open's rows are the largest, a
-/// few hundred kilobytes.
-pub const MAX_FRAME: usize = 1 << 26;
+/// The longest frame either side takes. A prompt block's reply is the
+/// largest, an f32 row for every slot of the block the node computes; a
+/// block open whose largest request or reply would pass it is refused by
+/// name ([`super::block::check_frames`]).
+pub const MAX_FRAME: usize = 1 << 27;
+
+/// The longest body a frame's write copies behind its head; a longer one is
+/// written from where it lies.
+const INLINE: usize = 1 << 16;
 
 /// How long one read or write of the stream blocks: a wait looks at its
 /// deadline, and the server at its stage side's progress, this often.
@@ -30,12 +37,14 @@ pub enum Tag {
     Launch = 4,
     Capture = 5,
     Enqueue = 6,
+    Block = 7,
     Drain = 8,
     ClearFault = 9,
     Fault = 10,
     Close = 11,
     Reset = 12,
     Release = 13,
+    BlockOpen = 14,
     Ok = 100,
     Err = 101,
 }
@@ -49,12 +58,14 @@ impl Tag {
             Tag::Launch,
             Tag::Capture,
             Tag::Enqueue,
+            Tag::Block,
             Tag::Drain,
             Tag::ClearFault,
             Tag::Fault,
             Tag::Close,
             Tag::Reset,
             Tag::Release,
+            Tag::BlockOpen,
             Tag::Ok,
             Tag::Err,
         ]
@@ -117,6 +128,12 @@ impl Out {
         for &x in v {
             self.u64(x);
         }
+        self
+    }
+
+    /// `v` with no length word before it: the caller wrote its length.
+    pub fn raw(&mut self, v: &[u8]) -> &mut Out {
+        self.0.extend_from_slice(v);
         self
     }
 
@@ -265,6 +282,23 @@ fn late(what: &str) -> io::Error {
     )
 }
 
+/// Write all of `buf` to `s` by `deadline`, a slice at a time.
+fn write_whole(s: &mut TcpStream, buf: &[u8], deadline: Instant) -> io::Result<()> {
+    let mut at = 0;
+    while at < buf.len() {
+        match s.write(&buf[at..]) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => at += n,
+            Err(e) if slice_over(&e) || e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+        if Instant::now() > deadline {
+            return Err(late("a frame's write"));
+        }
+    }
+    Ok(())
+}
+
 impl Channel {
     pub(super) fn local_ip(&self) -> io::Result<std::net::IpAddr> {
         self.s.local_addr().map(|a| a.ip())
@@ -284,27 +318,23 @@ impl Channel {
         })
     }
 
-    /// Send one frame, whole by `deadline`.
+    /// Send one frame, whole by `deadline`: its head, and its body copied
+    /// behind it up to [`INLINE`] bytes, else written from where it lies.
     pub(super) fn send(&mut self, tag: Tag, body: &[u8], deadline: Instant) -> io::Result<()> {
         let len = u32::try_from(body.len() + 1)
             .ok()
             .filter(|&n| n as usize <= MAX_FRAME)
             .ok_or_else(|| io::Error::other(format!("a frame of {} bytes", body.len())))?;
+        let inline = body.len() <= INLINE;
         self.outbuf.clear();
         self.outbuf.extend_from_slice(&len.to_le_bytes());
         self.outbuf.push(tag as u8);
-        self.outbuf.extend_from_slice(body);
-        let mut at = 0;
-        while at < self.outbuf.len() {
-            match self.s.write(&self.outbuf[at..]) {
-                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                Ok(n) => at += n,
-                Err(e) if slice_over(&e) || e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
-            }
-            if Instant::now() > deadline {
-                return Err(late("a frame's write"));
-            }
+        if inline {
+            self.outbuf.extend_from_slice(body);
+        }
+        write_whole(&mut self.s, &self.outbuf, deadline)?;
+        if !inline {
+            write_whole(&mut self.s, body, deadline)?;
         }
         Ok(())
     }
@@ -392,7 +422,7 @@ impl Channel {
 
 #[cfg(test)]
 mod tests {
-    use super::{Channel, In, MAX_FRAME, Out, Polled, Tag};
+    use super::{Channel, INLINE, In, MAX_FRAME, Out, Polled, Tag};
     use std::io::{ErrorKind, Write};
     use std::net::{TcpListener, TcpStream};
     use std::time::{Duration, Instant};
@@ -405,6 +435,7 @@ mod tests {
         let mut o = Out::default();
         o.u8(7).u32(0xdead_beef).u64(1 << 40).str("qwen4exp");
         o.u32s(&[1, 2, 3]).u64s(&[9, 1 << 33]).u8(1);
+        o.len(3).raw(b"abc");
         let mut i = In::new(o.done());
         assert_eq!(i.u8("a").unwrap(), 7);
         assert_eq!(i.u32("b").unwrap(), 0xdead_beef);
@@ -413,6 +444,7 @@ mod tests {
         assert_eq!(i.u32s("e").unwrap(), [1, 2, 3]);
         assert_eq!(i.u64s("f").unwrap(), [9, 1 << 33]);
         assert!(i.flag("g").unwrap());
+        assert_eq!(i.bytes("h").unwrap(), b"abc");
         assert!(i.end().is_ok());
         assert!(i.u8("past").is_err());
         assert!(In::new(&[2]).flag("flag").is_err());
@@ -491,5 +523,33 @@ mod tests {
                 .kind(),
             ErrorKind::TimedOut
         );
+    }
+
+    /// A frame whose body passes [`INLINE`], written from where it lies
+    /// behind its head, reads back whole and in order, and so does a small
+    /// frame after it on the same stream.
+    #[test]
+    fn a_frame_past_inline_reads_back_whole() {
+        let l = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let w = TcpStream::connect(l.local_addr().expect("its address")).expect("a connect");
+        let mut rx = Channel::new(l.accept().expect("an accept").0).expect("a channel");
+        let body: Vec<u8> = (0..3 * INLINE + 5).map(|i| (i % 251) as u8).collect();
+        let sent = body.clone();
+        let writer = std::thread::spawn(move || {
+            let mut tx = Channel::new(w).expect("a channel");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            tx.send(Tag::Block, &sent, deadline)
+                .expect("the large frame");
+            tx.send(Tag::Ok, b"end", deadline).expect("the small frame");
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        assert_eq!(rx.recv(deadline).expect("a frame"), Tag::Block);
+        assert!(
+            rx.body() == body.as_slice(),
+            "the large body read back other bytes"
+        );
+        assert_eq!(rx.recv(deadline).expect("a frame"), Tag::Ok);
+        assert_eq!(rx.body(), b"end");
+        writer.join().expect("the writer");
     }
 }

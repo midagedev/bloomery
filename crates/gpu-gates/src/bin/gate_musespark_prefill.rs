@@ -424,6 +424,7 @@ mod gate {
             + inputs.prompt_reserve;
         Ok(PlanLevers {
             card_budget_bytes: Some(no_experts + share(c.expert_bytes)).into(),
+            ..PlanLevers::default()
         })
     }
 

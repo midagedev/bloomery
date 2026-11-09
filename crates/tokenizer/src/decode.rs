@@ -5,7 +5,10 @@ use crate::unicode::{byte_to_cpt_table, decode_lenient, encode_cpt};
 use crate::vocab::attr;
 use crate::{Error, Tokenizer};
 
-fn byte_decoder() -> [Option<u8>; 324] {
+/// GPT-2's byte-level alphabet backwards: the byte each alphabet codepoint stands for, indexed
+/// by codepoint.
+#[must_use]
+pub fn byte_decoder() -> [Option<u8>; 324] {
     let mut table = [None; 324];
     for (b, &cpt) in byte_to_cpt_table().iter().enumerate() {
         table[cpt as usize] = Some(b as u8);

@@ -15,10 +15,12 @@ pub const SPIN: &str = "BLOOMERY_SPIN";
 pub const CED: &str = "BLOOMERY_CED";
 pub const PREFILL: &str = "BLOOMERY_PREFILL";
 pub const PREFILL_GROUP: &str = "BLOOMERY_PREFILL_GROUP";
+pub const PREFILL_CUT: &str = "BLOOMERY_PREFILL_CUT";
 pub const ENGRAM_HELPER: &str = "BLOOMERY_ENGRAM_HELPER";
 pub const STEP_STATS: &str = "BLOOMERY_STEP_STATS";
 pub const CARD_BUDGET: &str = "BLOOMERY_CARD_BUDGET";
 pub const CARD_MARGIN: &str = "BLOOMERY_CARD_MARGIN";
+pub const EXPERT_RANK: &str = "BLOOMERY_EXPERT_RANK";
 pub const PIN_MAIN: &str = "BLOOMERY_PIN_MAIN";
 pub const DRAFT: &str = "BLOOMERY_DRAFT";
 pub const CHECK_FINITE: &str = "BLOOMERY_CHECK_FINITE";
@@ -40,6 +42,8 @@ pub const ROUTE_TRACE: &str = "BLOOMERY_ROUTE_TRACE";
 pub const WARM_PROFILE: &str = "BLOOMERY_WARM_PROFILE";
 pub const QWEN38_EXPERTS: &str = "BLOOMERY_QWEN38_EXPERTS";
 pub const QWEN3_KV: &str = "BLOOMERY_QWEN3_KV";
+pub const KV_FLOOR: &str = "BLOOMERY_KV_FLOOR";
+pub const KV_HOST: &str = "BLOOMERY_KV_HOST";
 pub const LANE_PREFETCH: &str = "BLOOMERY_LANE_PREFETCH";
 pub const HOST_LANES: &str = "BLOOMERY_HOST_LANES";
 pub const GEN_SLOTS: &str = "BLOOMERY_GEN_SLOTS";
@@ -52,9 +56,11 @@ pub const NVTIER_EVICT: &str = "BLOOMERY_NVTIER_EVICT";
 pub const TIER_LINK: &str = "BLOOMERY_TIER_LINK";
 pub const TIER_NODES: &str = "BLOOMERY_TIER_NODES";
 pub const TP_NODES: &str = "BLOOMERY_TP_NODES";
+pub const WORD_OPS: &str = "BLOOMERY_WORD_OPS";
 pub const SCREEN: &str = "BLOOMERY_SCREEN";
 pub const SCHEMAJUMP: &str = "BLOOMERY_SCHEMAJUMP";
 pub const PREPARE_Q8: &str = "BLOOMERY_PREPARE_Q8";
+pub const AUTOTUNE: &str = "BLOOMERY_AUTOTUNE";
 
 /// The largest `BLOOMERY_PREFILL_GROUP`: the batches a V4.1 prompt group
 /// holds at most, which the body's buffers are sized for.
@@ -63,6 +69,11 @@ pub const PREFILL_GROUP_MAX: u64 = 8;
 /// `BLOOMERY_PREFILL_GROUP` unset: the row's default, the group GLM-5.3's
 /// plan reserves a prompt batch's units for and MiMo-V2.6-Flash's load runs.
 pub const PREFILL_GROUP_DEFAULT: u64 = 2;
+
+/// The largest `BLOOMERY_PREFILL_CUT`, and its default when unset: the
+/// positions a V4.1 prompt pass carries at most, which is the host union's
+/// column count and what the body's batch buffers are sized for.
+pub const PREFILL_CUT_MAX: u64 = 512;
 
 /// `BLOOMERY_LANE_PREFETCH` unset: the row's default, which the host
 /// union holds in a binary that does not act on the lever
@@ -220,6 +231,30 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         },
     },
     LeverSpec {
+        name: PREFILL_CUT,
+        class: Class::A,
+        kind: Kind::Count {
+            min: 1,
+            max: PREFILL_CUT_MAX,
+            trim: false,
+        },
+        default: Unset::Is("512"),
+        doc: "V4.1 `generate_ds41`: the positions a prompt pass carries at most; a call of `n` \
+              positions runs `ceil(n / cut)` passes of near-equal size, so a call of 512 under \
+              256 is two passes of 256. The group pipeline (`BLOOMERY_PREFILL_GROUP`) overlaps \
+              one pass's host serve with the next pass's card route, so a call that is one pass \
+              overlaps nothing; cutting it into passes gives the pipeline something to \
+              overlap, at the cost of reading each host expert once a pass. Unset is one pass \
+              up to 512 positions, the most a pass holds; a value above 512 or 0 is refused by \
+              name. `1` runs a pass a position, is no use and is accepted. The cut moves no \
+              bits: the prefill gate holds a call to the decode steps' bits under 256 as under \
+              the default. The `load` line prints `cut=`.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
         name: ENGRAM_HELPER,
         class: Class::A,
         kind: Kind::Flag,
@@ -309,6 +344,31 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               card named twice, a card the census does not list, shares (`<n>x`), a list on a \
               plan whose tier cards are another node's, and a margin that leaves a card no \
               usable byte. `M` and `G` are binary units.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: EXPERT_RANK,
+        class: Class::C,
+        kind: Kind::Path,
+        default: Unset::Means(
+            "id order: the stage card keeps each layer's id prefix and each expert tier the ids \
+             after it",
+        ),
+        doc: "Placement: a router-rank file (`tools/ref/router-rank.py rank`): each routed \
+              layer's experts, every id once, hottest first. The stage card's prefix becomes \
+              the layer's hottest `n_l` ids and each expert tier's block the layer's coldest \
+              ids (tier 0 the coldest `own` ids, the next tier the next-coldest block), the \
+              host the middle; adaptive residency (`BLOOMERY_RESIDENCY`) still moves experts \
+              between the stage card and the host from there. The counts per layer are the \
+              plan's, unchanged. The `plan` record names the file (`expert_rank=`). Refused \
+              by name: a file that cannot be read or is not a rank (no final newline, a layer \
+              or an id twice, an id past `n_expert`, a layer with other than `n_expert` ids), \
+              a rank whose layers or `n_expert` differ from the model's routed layers, a plan \
+              that places no routed expert on a card, and explicit node-owned id ranges \
+              (`placement::nodes`), which keep their id blocks.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,
@@ -414,7 +474,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
     LeverSpec {
         name: TIER_LINK,
         class: Class::M,
-        kind: Kind::Words(&["shared", "loopback", "rdma"]),
+        kind: Kind::Words(&["shared", "loopback", "rdma", "tcp"]),
         default: Unset::Is("shared"),
         doc: "How the expert tier cards' page crosses between the stage card and the tier \
               cards. `shared` is one host-mapped page every card reaches. `loopback` gives the \
@@ -426,6 +486,11 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               queue pair, the posts sent as RDMA writes between two queue pairs on the \
               machine's first RoCE v2 port for local tiers, or on the control socket's local \
               IPv4 RoCE port for node tiers. It needs `libibverbs.so.1` and an active RoCE port. \
+              `tcp` is the loopback's two pages, each held by its own end with its own pump \
+              thread, the posts sent as framed writes over one TCP stream between the two ends \
+              and landed by a receiver thread on each, with an ack for each post; local tiers \
+              meet on the loopback address, a node's tier on the control channel's. It needs no \
+              NIC beyond TCP. \
               Each pump spins on one core while the load lives. Read where the host tier takes \
               its tier cards.",
         site: Site::Parsed {
@@ -441,11 +506,14 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         doc: "Where a placed load's expert tiers run: the address of each tier's node, in the \
               plan's tier order, one a tier, where a `tier_server` process serves that tier's \
               card over its control channel. A loopback node can map the stage's file under \
-              `/dev/shm`. A private or 198.18.0.0/15 IPv4 node off this host requires `BLOOMERY_TIER_LINK=rdma`: \
-              each process holds its own page and exchanges its endpoint on the channel. The \
+              `/dev/shm`. A private or 198.18.0.0/15 IPv4 node off this host requires `BLOOMERY_TIER_LINK=rdma` \
+              or `tcp`: each process holds its own page and exchanges its endpoint on the channel \
+              (over `tcp`, the stage's listener on the channel's local address, which the node \
+              dials). The \
               channel has no authentication and belongs on a trusted network. The plan takes \
               each tier card from its node's census. \
-              Qwen3.8's load opens a tier on a node; the other families refuse one by name. \
+              Qwen3.8's, V4.1's, GLM's and Solar-Open2's loads open a tier on a node, which \
+              `tier_server` serves when built with that family's feature. \
               Read where a load takes its tier cards.",
         site: Site::Parsed {
             left: &[],
@@ -464,6 +532,26 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               requires `BLOOMERY_TIER_LINK=rdma`, and `BLOOMERY_TIER_NODES` is not set beside \
               it. GLM-5.3-Flash's `--place tp --plan` reads it. Read where a load takes its \
               placement.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: WORD_OPS,
+        class: Class::A,
+        kind: Kind::Words(&["auto", "memop", "kernel"]),
+        default: Unset::Is("auto"),
+        doc: "How a card adds to the counting words of the host tier's and the expert tiers' \
+              pages (a go, a take-back, a done): `memop` by the driver's atomic-reduction stream \
+              memory operation, inside the batch of waits, writes and barriers around it; \
+              `kernel` by a one-thread kernel of system-scope adds launched in the batch's place, \
+              the waits, writes and barriers staying memory operations. `auto` asks the driver \
+              once where a card's words are opened: one atomic-reduction memory operation on a \
+              scratch word, `kernel` when the driver refuses it as an invalid value, `memop` when \
+              it runs, and any other answer refused by name. The two words give the same bits; \
+              a go or a wait is one graph node more on `kernel`. `memop` and `kernel` are the \
+              same-binary arms. Read where the host tier's boundary and each tier card open.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,
@@ -655,8 +743,11 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               highest, and none while no width beats the plain step by its margin. A \
               single-sequence pass can cut a full proposal to a prefix. Batched MTP rounds \
               price all active slots together, choose proposal depths before drafting and \
-              pack complete windows within the body's row bounds. Widths never change a \
-              generated token. `fixed` verifies every proposal whole, the same-binary arm. A drafting \
+              pack complete windows within the body's row bounds. While no expert moves \
+              (`BLOOMERY_RESIDENCY=off`) widths never change a generated token; under adaptive \
+              residency a flip lands a fixed number of passes after it is planned, so a width \
+              that changes the pass sequence moves the token a flip lands at, and a reply can \
+              differ at a near-tie. `fixed` verifies every proposal whole, the same-binary arm. A drafting \
               server prints an `mtp width` record a request under `cost`. Refused by name on a \
               run that drafts nothing. Read once at `main`, the policy every window of the \
               process runs by; no setter changes it between calls.",
@@ -833,7 +924,13 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         doc: "Adaptive expert residency (`host::swap`): `off` keeps the load's slot map for the \
               model's life; `mid-p<P>-s<S>` runs the residency rule's `mid` parameters over the \
               stage card's routed stacks, the first P seed experts of each layer never a victim \
-              and S slots a layer freed for flips in flight. The rule plans every 4 kept rows, \
+              and S slots a layer freed for flips in flight. The load frees those S slots at its \
+              start (their experts go to the host), so a `mid` word begins S experts a layer off \
+              the card that `off` keeps there on the same plan: its bits differ from `off`'s \
+              before the first flip lands, the host (Q8_2_X4, 32-value activation blocks) and \
+              the card (q8_1, 128-value blocks) summing one expert in different orders, and a \
+              reply after other traffic can differ from the first at a near-tie. The rule plans \
+              every 4 kept rows, \
               not every 4 passes, so a drafted pass of several kept rows swaps at the same \
               kept-token rate a plain one does; the rows past 4 carry to the next plan. Its cap \
               is a churn guard, not link-sized: the copies one planning pass issues are a few \
@@ -1064,6 +1161,76 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         },
     },
     LeverSpec {
+        name: KV_FLOOR,
+        class: Class::A,
+        kind: Kind::Count {
+            min: 1,
+            max: u32::MAX as u64,
+            trim: false,
+        },
+        default: Unset::Means(
+            "the whole context: the spread and every other plan term at `ctx_max`",
+        ),
+        doc: "Placement (Qwen3.8, `generate_qwen3moe`, `bloomery-serve-qwen38` and \
+              `bloomery-serve --model qwen38`): the positions a plan spreads its routed experts \
+              at, `BLOOMERY_KV_FLOOR=<positions>`. The plan's every other term stays at the \
+              context it is made at (`ctx_max`, the `--ctx` choice): the rooms' reserved range \
+              and its page rounding, the stage rows, the scratch. Unset, the spread runs at \
+              `ctx_max` itself — today's plan. Only a load whose stores hold their rows in \
+              rooms reads it: every other family's binary and file refuses it by name. A floor \
+              above the context of a plan made under it is refused by name, and nothing clamps \
+              it. A sequence that grows past the floor's bytes with a residency machine \
+              running (`BLOOMERY_RESIDENCY`) frees card bytes: the machine releases the same \
+              top slots of every layer's expert stacks, the fewest that cover the shortfall \
+              and one page within the floor of pinned + 1 live a layer, and the fit runs once \
+              more. A load with no machine, or a floor the machine cannot free enough under, \
+              ends in the room fit's named refusal (the store, the bytes the fit asked, the \
+              device's free bytes, and the bytes the machine freed). The `plan` line prints \
+              `kv_floor=` beside `ctx_max=`.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: KV_HOST,
+        class: Class::A,
+        kind: Kind::Words(&["off", "spill", "all"]),
+        default: Unset::Means(
+            "off, the card's own memory; a family whose stores are not rooms reads it unset",
+        ),
+        doc: "Qwen3.8's K/V planes' backing (`generate_qwen3moe`, `bloomery-serve-qwen38` and \
+              `bloomery-serve --model qwen38`): where a selecting store's room backs \
+              the pages its K/V planes hold. `off` is the card's own memory, \
+              today's plan. `spill` backs a page on the host only when the \
+              driver cannot make the card's for lack of free bytes — the plan \
+              is `off`'s, and a fit that runs out of host bytes names them \
+              (`GpuError::NoRoom`); a host page is cheaper than the residency \
+              machine freeing expert stacks for it, so under `spill` the \
+              machine's demote-for-bytes never runs for the planes. `all` \
+              holds every plane page on the host: the plan counts the planes \
+              at no card position, so the expert spread gets their bytes as \
+              `BLOOMERY_KV_FLOOR`'s floor does (the pooled keys and the raw \
+              key ring keep their card bytes, and so does the MTP draft's \
+              store), and the planes' whole bytes, page-rounded at the page a \
+              host-capable room takes, are counted against the plan's host \
+              room, refused by name past it. The planes' rows reach the device \
+              through the same pointer whatever the backing, so every run's \
+              bits are `off`'s. The pooled keys and the ring stay on the card \
+              in every setting (the indexer scans the pooled keys every \
+              step). Set with `BLOOMERY_KV_FLOOR`, `all` is refused by name \
+              (it already plans at a zero floor; two levers saying where the \
+              spread runs is ambiguous), and every family whose stores are \
+              not rooms refuses the lever set, by name, where it refuses \
+              `BLOOMERY_KV_FLOOR`. The `plan` line prints `kv_host=` beside \
+              `kv_floor=`, and the seat's `kv room` line names the host bytes \
+              the planes hold (`kv_host_bytes`).",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
         name: LANE_PREFETCH,
         class: Class::A,
         kind: Kind::OnOff,
@@ -1222,6 +1389,25 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               `hf-qwen4exp-nvfp4`, the `_bf16` sets against the others), so it is asked for, \
               never a default. `--keep-bf16`, which asks for the stored form, is refused \
               beside it.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: AUTOTUNE,
+        class: Class::A,
+        kind: Kind::OnOff,
+        default: Unset::Is("on"),
+        doc: "A server's load-time kernel picks (`bloomery_gpu::autotune`): `on` times, after the \
+              load and before any capture, the bit-equal ways to run each kernel signature the \
+              model's weights reach (today: the MXFP8 gemv at four to eight columns), keeps a way \
+              only where it beats today's rule on every repeat by more than the repeats' spread, \
+              and keeps each pick in the cost store (`$BLOOMERY_COSTS`) under the card, the \
+              driver, the build and the signature, so a later load reads it and times nothing; \
+              `off` runs today's rule with no timing and no store read or write. The ways give \
+              the same bits. The load prints each pick and the wall; `/props`' `engine.autotune` \
+              lists them. A seat's `--autotune` replaces it.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,
@@ -1780,6 +1966,13 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          batch reads it, the lead's only under `--trust-rounds`.",
     ),
     path(
+        "BLOOMERY_GATE_FAST_LEDGER",
+        Some("gate-batch.sh"),
+        "Mac side: the fast ledger `tools/gate-batch.sh --fast-ledger` writes (the greens of a \
+         `just affected --fast` landing); the lead's `--ledger` reads it only under `--trust-fast`, so a \
+         release re-runs what a fast landing trusted.",
+    ),
+    path(
         "BLOOMERY_GATE_TIMES",
         Some("gate-batch.sh"),
         "Mac side: the gate wall-time file `tools/gate-batch.sh` balances its lanes by.",
@@ -1850,6 +2043,16 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         "The MiniMax-M3.1-Flash checkpoint folder or its fixture cut: `tools/ref/mm31-dump.sh` \
          dumps it (the tool profile's model when unset) and the folder reader's gate opens it by \
          its map.",
+    ),
+    path(
+        "BLOOMERY_KIMI_K3_HF",
+        None,
+        "The moonshotai/Kimi-K3 folder whose tokenizer files and config.json the hf crate's Kimi K3 vocabulary gate reads.",
+    ),
+    path(
+        "BLOOMERY_KIMI_K3_GGUF",
+        None,
+        "The K3 GGUF whose first shard's header the hf crate's Kimi K3 vocabulary gate holds the folder's vocabulary to, the box's UD-IQ1_S when unset.",
     ),
     path(
         "BLOOMERY_MM31_HF",
@@ -2261,6 +2464,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         "The model attention gate's handshake with the child it runs of its own test \
          binary: the file the lever child writes.",
     ),
+    runner(
+        "BLOOMERY_FOLLOW_DIR",
+        Some("release/pick.sh"),
+        "`tools/release/pick.sh`: the directory whose `W` file names the newest commit the daily \
+         real-tier pass found green (default `~/.cache/bloomery/follow`).",
+    ),
     LeverSpec {
         name: "BLOOMERY_GATE_BOUND",
         class: Class::R,
@@ -2354,6 +2563,13 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         "Mac side: the ssh host of the GB10 that built the release's GB10 archive; \
          `tools/release/publish.sh` verifies, fetches and uploads it from there. Unset: the \
          release carries no GB10 archive.",
+    ),
+    runner(
+        "BLOOMERY_GB10_REMOTE",
+        Some("release/publish.sh"),
+        "Mac side: the directory on BLOOMERY_GB10_BOX that holds the GB10 archive's tree \
+         (`target/release-dist` under it), read by `tools/release/publish.sh` and `tools/release/pick.sh`. \
+         Unset: the box's directory, BLOOMERY_REMOTE.",
     ),
     runner(
         "BLOOMERY_GEN_CTX",

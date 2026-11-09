@@ -25,7 +25,7 @@ use crate::kv_format::KvQ8;
 use crate::linear::{self, LinearShape};
 use crate::ple;
 use crate::qsa::{self, QsaScratch};
-use crate::room::{Room, Roomed, Run, SharedPages};
+use crate::room::{Backing, Room, Roomed, Run, SharedPages};
 use crate::route_softmax::{RouterDims, RouterOut};
 use crate::site::ByName;
 use crate::tensor::WindowMut;
@@ -87,6 +87,21 @@ pub(super) const LANES: usize = 1;
 /// `runtime::stores` owns the count.
 pub(super) const VERIFY_ROWS: usize = stores::DELTA_VERIFY_ROWS;
 
+/// What a selecting store's K/V planes' room is named, for a fit's refusal
+/// and the ordering the fit's retry reads ([`Body38::fit_stores`]).
+pub(super) const KV_PLANES: &str = "a Qwen3.8 slot's K/V planes";
+
+/// The room backing the `BLOOMERY_KV_HOST` lever names for the K/V planes:
+/// the store's own mapping of the lever's typed word, one owner with the
+/// lever row.
+pub(super) fn backing_of(kv: bloomery_levers::KvHost) -> Backing {
+    match kv {
+        bloomery_levers::KvHost::Off => Backing::Card,
+        bloomery_levers::KvHost::Spill => Backing::Spill,
+        bloomery_levers::KvHost::All => Backing::Host,
+    }
+}
+
 /// A layer's store: the delta rule's recurrent state ([`LANES`] lane), its
 /// lane's stamp (`linear::delta`'s module doc), conv ring, carry and verify
 /// record ([`VERIFY_ROWS`] rows), or a
@@ -121,9 +136,16 @@ impl Store38 {
     }
 
     /// A selecting store of `ctx` positions over the planes `d` cuts, its
-    /// K/V planes in the load's cache format `kv` (the index keys f16), no
-    /// row backed until a fit reaches it, zeroed then on `stream`.
-    pub(super) fn qsa(stream: &Arc<CudaStream>, d: &Dims, kv: KvQ8) -> Result<Store38, GpuError> {
+    /// K/V planes in the load's cache format `kv` (the index keys f16) and
+    /// backed where `backing` says ([`backing_of`], `BLOOMERY_KV_HOST`), its
+    /// pooled keys always on the card (the indexer scans them every step),
+    /// no row backed until a fit reaches it, zeroed then on `stream`.
+    pub(super) fn qsa(
+        stream: &Arc<CudaStream>,
+        d: &Dims,
+        kv: KvQ8,
+        backing: Backing,
+    ) -> Result<Store38, GpuError> {
         let pools = qsa::pools_for(d.ctx);
         let run = Run {
             at: 0,
@@ -132,9 +154,15 @@ impl Store38 {
             rows: pools,
         };
         Ok(Store38::Qsa {
-            kv: KvPlanes::roomed(stream, (d.n_kv, d.ctx, d.head), kv)?,
+            kv: KvPlanes::roomed_backed(stream, (d.n_kv, d.ctx, d.head), kv, KV_PLANES, backing)?,
             ring: DeviceBuffer::zeroed(stream, qsa::RING_ROWS * geo::IDX_DIM)?,
-            pooled: Roomed::new(Arc::clone(stream), pools * geo::IDX_DIM, &[run], |[b]| b)?,
+            pooled: Roomed::new(
+                Arc::clone(stream),
+                pools * geo::IDX_DIM,
+                &[run],
+                "a Qwen3.8 slot's pooled keys",
+                |[b]| b,
+            )?,
         })
     }
 
@@ -152,6 +180,17 @@ impl Store38 {
         match self {
             Store38::Rec(_) => 0,
             Store38::Qsa { kv, pooled, .. } => kv.mapped() + pooled.mapped(),
+        }
+    }
+
+    /// The card bytes and the host bytes a selecting store's K/V planes'
+    /// pages with memory of their own hold — the room the
+    /// `BLOOMERY_KV_HOST` lever backs ([`backing_of`]), the pooled keys
+    /// apart; (0, 0) for a delta store.
+    pub(super) fn kv_room(&self) -> (usize, usize) {
+        match self {
+            Store38::Rec(_) => (0, 0),
+            Store38::Qsa { kv, .. } => (kv.mapped(), kv.host_mapped()),
         }
     }
 
@@ -180,6 +219,15 @@ impl Store38 {
     /// ([`Room::fit`]). Never inside a capture.
     pub(super) fn fit(&mut self, positions: usize) -> Result<(), GpuError> {
         self.rooms().try_for_each(|r| r.fit(positions))
+    }
+
+    /// The bytes of new pages a fit of the first `positions` positions still
+    /// asks ([`Roomed::asks`]); none for a delta store.
+    pub(super) fn asks(&self, positions: usize) -> usize {
+        match self {
+            Store38::Rec(_) => 0,
+            Store38::Qsa { kv, pooled, .. } => kv.asks(positions) + pooled.asks(positions),
+        }
     }
 
     /// A selecting store's pages a write from position `pos` on reaches given
@@ -735,7 +783,7 @@ mod tests {
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_room_admission_counts_every_slots_whole_pages() {
-        use super::{KvPlanes, KvQ8, Store38, dims};
+        use super::{Backing, KvPlanes, KvQ8, Store38, dims};
         use model::arch::models::{
             Act, Arch, ChatSpec, Ffn, Gqa, LayerSpec, Mixer, ModelSpec, OutGate, PoolRule,
             Residual, Rope, RopeMode, Selector,
@@ -811,6 +859,7 @@ mod tests {
             room: (u64::MAX, HostRead::Given),
             row_source: RowTableSource::Split,
             arena: None,
+            kv_host_page: None,
         };
         let router = RouterDims::of(MoeShape {
             rule: rules::SOFTMAX_NORM_GATED,
@@ -823,14 +872,20 @@ mod tests {
             for slots in [1, 16] {
                 let stores: Vec<_> = (0..slots)
                     .map(|_| {
-                        Store38::qsa(&stream, &dims(router, ctx), kv).expect("a selecting store")
+                        Store38::qsa(&stream, &dims(router, ctx), kv, Backing::Card)
+                            .expect("a selecting store")
                     })
                     .collect();
                 for drafts in [false, true] {
                     let draft: Vec<_> = (0..if drafts { slots } else { 0 })
                         .map(|_| {
-                            KvPlanes::roomed(&stream, (geo::N_KV, ctx, geo::HEAD), kv)
-                                .expect("a draft store")
+                            KvPlanes::roomed(
+                                &stream,
+                                (geo::N_KV, ctx, geo::HEAD),
+                                kv,
+                                "the Qwen3.8 MTP draft's store",
+                            )
+                            .expect("a draft store")
                         })
                         .collect();
                     let raw = runtime::stores::selecting_rows_bytes(
@@ -845,7 +900,13 @@ mod tests {
                     let whole = stores.iter().map(Store38::whole).sum::<usize>()
                         + draft.iter().map(|s| s.whole()).sum::<usize>();
                     let padding = inputs
-                        .room_padding(ctx as u64, slots as u64, drafts, page)
+                        .room_padding(
+                            ctx as u64,
+                            slots as u64,
+                            drafts,
+                            page,
+                            bloomery_levers::KvHost::Off,
+                        )
                         .expect("admitted padding");
                     assert_eq!(
                         raw + padding,

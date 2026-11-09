@@ -30,4 +30,4 @@
 MODEL_NAME=muse-spark
 : "${IK:=/home/user/ik-idxkey}"
 : "${LCPP:=/home/user/llama.cpp-muse}"
-MODEL=${BLOOMERY_REF_MODEL:-/models/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS-00001-of-00006.gguf}
+MODEL=${BLOOMERY_REF_MODEL:-/data/moved/models/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS/Muse-Spark-Open-816B-A42B-UD-IQ2_XXS-00001-of-00006.gguf}

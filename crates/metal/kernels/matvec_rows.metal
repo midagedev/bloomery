@@ -18,13 +18,17 @@
 //                             over inputs the join already normed: M rows of
 //                             x . gain and M scale words (SCALED, the 1-row
 //                             scaled entries' rule)
+//   a4_matvec_headnorm_m2     the gated delta net's out projection: the
+//                             head-normed residual mat-vec, each row's head
+//                             scales computed from its own partial sums
 //   a4_norm_next_m            the plain residual's hand-on over M rows: each
 //                             row times the next launch's gain, and that
 //                             launch's scale a row, the 1-row norm_next's bits
 //
 // THE ORDER IS THE GATE. Activation row m of any entry here is the 1-row
 // kernel's bits on row m's input alone (matvec_q4k.metal's matvec_rows, its
-// segmented and head entries, experts.metal's pair): the lane map is the same
+// segmented and head entries and its head-normed out projection,
+// experts.metal's pair): the lane map is the same
 // Q::lane_of of the same thread index, each row's share of the input is
 // loaded in the same block order (first_block + k . block_stride) into its
 // own registers (Q::load_rows takes Q::load's operations per row), its squares
@@ -64,13 +68,14 @@ using namespace metal;
 
 #pragma METAL fp contract(off)
 
-// The plain M-row entries' argument block, bound by value at slot 3: the 1-row
-// MatvecArgs' four words and the output stride between the M rows.
+// The plain M-row entries' argument block, bound by value at slot 3 (the
+// head-normed entry's at slot 4): the 1-row MatvecArgs' four words and the
+// output stride between the M rows.
 struct MatvecMArgs {
     uint  rows;     // output rows an activation row takes
     uint  nblocks;  // input columns / the type's block values
     uint  layer;    // the layer a raise is recorded in
-    float eps;      // the norm's epsilon (read by the norm variants only)
+    float eps;      // the norm's epsilon (read by the norm and head-norm variants)
     uint  stride;   // floats from one activation row's outputs to the next
 };
 
@@ -107,7 +112,7 @@ constexpr short mrow_nr0() {
 // here is unrolled: the weight rows' reads are issued together before the
 // first is used, and no register array is indexed by a loop variable.
 template <typename Q, short M, bool NORM, bool RESID, bool ROW_RAISE = true,
-          bool SCALED = false>
+          bool SCALED = false, bool HEADNORM = false>
 inline void matvec_rows_m(device const typename Q::Block * W,
                           device const float      * x,
                           device float            * y,
@@ -119,9 +124,12 @@ inline void matvec_rows_m(device const typename Q::Block * W,
                           int first_row,
                           int rows,
                           uint out_stride,
-                          ushort tiisg) {
+                          ushort tiisg,
+                          threadgroup const float * scales = nullptr) {
     constexpr short NR0 = mrow_nr0();
     static_assert(!(NORM && SCALED), "a scaled input is normed once, by its join");
+    static_assert(!HEADNORM || (RESID && !NORM && !SCALED),
+                  "the head-normed rows add a plain load's dots into the residual");
     const int nb = nblocks;
     if (first_row >= rows) {
         return;
@@ -167,8 +175,27 @@ inline void matvec_rows_m(device const typename Q::Block * W,
             wd[row] = Q::words_of(rp[row][ib], lane);
         }
         Q::template load_rows<NORM ? LOAD_NORM : LOAD_PLAIN, M>(lanes, xp, row_span, gp, sum_sq);
-        FOR_UNROLL (short row = 0; row < NR0; ++row) {
-            Q::template partial_rows<M>(wd[row], lanes, sumf[row]);
+        if constexpr (HEADNORM) {
+            // A value a row's numerator cannot carry, or a group sum that
+            // left the finite range: the gate's site is raised, and the sums
+            // it is in are not finite either, so the rows are NaN.
+            FOR_UNROLL (short m = 0; m < M; ++m) {
+                if (!Q::sums_finite(lanes[m])) {
+                    raise(faults, layer, BLOOMERY_FAULT_SITE_LINEAR_GATE);
+                }
+            }
+            // The block's head scale of each row, the 1-row arm's own ask.
+            float lo[M];
+            FOR_UNROLL (short m = 0; m < M; ++m) {
+                lo[m] = Q::head_scales(scales + m * BLOOMERY_DELTA_VALUE_HEADS, ib).x;
+            }
+            FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                Q::template partial_head_rows<M>(wd[row], lanes, lo, sumf[row]);
+            }
+        } else {
+            FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                Q::template partial_rows<M>(wd[row], lanes, sumf[row]);
+            }
         }
         xp += Q::block_stride() * Q::values_per_block();
         if (NORM) {
@@ -288,6 +315,75 @@ kernel void head_logits_m_kernel(device const typename Q::Block *weights [[buffe
     matvec_rows_m<Q, M, false, false, false, true>(weights, x, logits, (int)args.nblocks,
                                                    args.eps, args.layer, gain, faults,
                                                    first_row, (int)args.rows, args.stride, tiisg);
+}
+
+// The gated delta net's out projection over M activation rows: the 1-row
+// head-normed residual mat-vec (matvec_q4k.metal's matvec_headnorm_kernel)
+// with the weights' read and their unpack the only thing the M rows share.
+// Each row's head scales are computed once per threadgroup into threadgroup
+// memory, SIMD group 0 running the 1-row kernel's loop over that row's
+// partial sums before the one barrier (row m's at `m * heads`), and
+// matvec_rows_m's HEADNORM arm scales each block's finished contribution by
+// its row's head scale, the 1-row partial_head's own rule. The argument block is the family's MatvecMArgs:
+// the numerators' and the partials' row strides the kernel derives, a
+// numerator row the launch's columns and a partials row the heads' own
+// table.
+//
+// THE ORDER IS THE GATE. Activation row m of this entry is the 1-row kernel's
+// bits on row m's inputs alone: the lane map is the same Q::lane_of of the
+// same thread index, the row's share of its numerator is loaded in the same
+// block order (first_block + k . block_stride) into its own registers, its
+// head scales are the 1-row loop's own sum order (j = 0 .. column blocks) and
+// its rsqrt on its own partial sums, its dot is accumulated per weight row by
+// Q::partial_rows in partial's own value order with the head scale applied to
+// the finished block contribution (Q::partial_head_rows, partial_head's
+// rule), and the finished lane sums take the same simd_sum.
+//
+// A head whose sum or scale is not finite raises the linear-gate site and is
+// NaN in that row only; a value a row's numerator cannot carry, or a group
+// sum that left the finite range, raises the same site (Q::sums_finite, the
+// 1-row arm's own ask), and the other row's writes are its exact bits.
+template <typename Q, short M>
+kernel void matvec_headnorm_m_kernel(device const typename Q::Block * W [[buffer(0)]],
+                                     device const float      * g [[buffer(1)]],
+                                     device const float      * partials [[buffer(2)]],
+                                     device float            * y [[buffer(3)]],
+                                     constant MatvecMArgs    & args [[buffer(4)]],
+                                     device atomic_uint      * faults [[buffer(5)]],
+                                     uint3  tgpig [[threadgroup_position_in_grid]],
+                                     ushort tiisg [[thread_index_in_simdgroup]],
+                                     ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float scales[M * BLOOMERY_DELTA_VALUE_HEADS];
+    // A lane a head, a further round for each SIMD width of heads: the 1-row
+    // kernel's loop, a row's partial sums at a time. A partials row is the
+    // heads' own table, the instance's delta geometry.
+    const uint pstride = BLOOMERY_DELTA_VALUE_HEADS * BLOOMERY_DELTA_COLUMN_BLOCKS;
+    if (sgitg == 0) {
+        for (uint head = tiisg; head < BLOOMERY_DELTA_VALUE_HEADS; head += 32u) {
+            FOR_UNROLL (short m = 0; m < M; ++m) {
+                float sum = 0.f;
+                for (short j = 0; j < BLOOMERY_DELTA_COLUMN_BLOCKS; ++j) {
+                    sum += partials[(ulong)m * pstride + head * BLOOMERY_DELTA_COLUMN_BLOCKS + j];
+                }
+                const float mean = sum / float(BLOOMERY_DELTA_HEAD_COLS);
+                const float s = rsqrt(mean + args.eps);
+                if (!isfinite(sum) || !isfinite(s)) {
+                    // A head the norm cannot take is NaN, not a zero head:
+                    // its values are then not finite and the rows that read
+                    // them are NaN.
+                    raise(faults, args.layer, BLOOMERY_FAULT_SITE_LINEAR_GATE);
+                    scales[m * BLOOMERY_DELTA_VALUE_HEADS + head] = NAN;
+                } else {
+                    scales[m * BLOOMERY_DELTA_VALUE_HEADS + head] = s;
+                }
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    matvec_rows_m<Q, M, false, true, true, false, true>(
+        W, g, y, (int)args.nblocks, args.eps, args.layer, nullptr, faults,
+        simd_first_row(tgpig.x, sgitg), (int)args.rows, args.stride, tiisg, scales);
 }
 
 // The M-row gate-up pair: pair_slot's (experts.metal) walk with M activation
@@ -471,11 +567,24 @@ kernel void pair_swiglu_m_kernel(device const typename Q::Block * gate [[buffer(
                                            ushort tiisg [[thread_index_in_simdgroup]],   \
                                            ushort sgitg [[simdgroup_index_in_threadgroup]]);
 
+#define MROW_HEADNORM_ENTRY(NAME, Q, BQ, M)                                             \
+    template [[host_name(NAME)]]                                                        \
+    kernel void matvec_headnorm_m_kernel<Q, M>(device const BQ * W [[buffer(0)]],        \
+                                               device const float * g [[buffer(1)]],      \
+                                               device const float * partials [[buffer(2)]],\
+                                               device float * y [[buffer(3)]],            \
+                                               constant MatvecMArgs & args [[buffer(4)]], \
+                                               device atomic_uint * faults [[buffer(5)]], \
+                                               uint3 tgpig [[threadgroup_position_in_grid]],\
+                                               ushort tiisg [[thread_index_in_simdgroup]],\
+                                               ushort sgitg [[simdgroup_index_in_threadgroup]]);
+
 MROW_MATVEC_ENTRY("a4_matvec_resid_m2", A4, block_mlx_a4, 2)
 MROW_SEG_ENTRY("a4_matvec_seg_m2", A4, block_mlx_a4, 2, false)
 MROW_SEG_ENTRY("a4_matvec_seg_scaled_m2", A4, block_mlx_a4, 2, true)
 MROW_PAIR_ENTRY("a4_pair_swiglu_scaled_m2", A4, block_mlx_a4, 2)
 MROW_HEAD_ENTRY("a4_head_logits_scaled_m2", A4, block_mlx_a4, 2)
+MROW_HEADNORM_ENTRY("a4_matvec_headnorm_m2", A4, block_mlx_a4, 2)
 
 // The plain residual's hand-on over M rows (norm_next_kernel's own body, one
 // threadgroup a row): the stream's row r, which the out projection already

@@ -26,9 +26,10 @@
 //! - the delta rule: the rows launch that leaves the lane ring
 //!   (`Kernels::delta_rows_ring`), row `r`'s end state in the lane of position
 //!   `from + r + 1` ([`lanes::Verify`]);
-//! - the delta layer's out projection: the one-row head-normed mat-vec once a
-//!   row, since the family has no M-row entry of it. Its weights are read once
-//!   a row.
+//! - the delta layer's out projection: the M-row head-normed mat-vec over both
+//!   rows (`Kernels::headnorm_m`) when the out projection is A4, the family's
+//!   own quant; a type it holds no entry of runs the one-row launch once a
+//!   row, its weights read once a row.
 //!
 //! The rows sit in the rows arena at the stride the layer's P1 writes: the
 //! segmented M-row mat-vec stores row `r`'s outputs `out_end` values after row
@@ -58,8 +59,8 @@ use crate::device::MetalDevice;
 use crate::encode::ComputeEncoder;
 use crate::kernels::{
     AttentionRowsParams, AttnCache, AttnLayer, BiasRowsParams, DeltaRowStrides, HEAD_SIMD_GROUPS,
-    HeadMParams, HeadNormParams, Kernels, LoadNorm, MatvecMParams, NormNextMParams, PairMParams,
-    Quant, SegMParams, segments_for_window,
+    HeadMParams, HeadNormMParams, HeadNormParams, Kernels, LoadNorm, MROWS, MatvecMParams,
+    NormNextMParams, PairMParams, Quant, SegMParams, headnorm_m_serves, segments_for_window,
 };
 use bloomery_device::Window;
 
@@ -603,21 +604,88 @@ impl MetalOps<'_, '_> {
         )
     }
 
-    /// Layer `l`'s delta out projection of the verify's rows: the head-normed
-    /// residual mat-vec a row at a time, each over its own numerator and
-    /// partial sums, into its own residual row. The rows write disjoint
-    /// outputs, so one barrier closes them all.
+    /// Layer `l`'s delta out projection of the verify's rows: the M-row
+    /// head-normed mat-vec over both rows where [`headnorm_m_serves`] the out
+    /// projection's type at `m` (the family's own quant, the out weights read
+    /// once), each row over its own numerator and partial sums into its own
+    /// residual row; any other type the pass serves runs the one-row launch a
+    /// row at a time. The rows write disjoint outputs, so one barrier closes
+    /// them all.
     fn verify_delta_out(&mut self, l: usize, m: usize) -> Result<(), SessionError> {
-        for r in 0..m {
-            self.verify_delta_out_row(l, m, r)?;
+        let out_quant = match &self.arena.layers[l].mixer {
+            MixerBufs::Delta(d) => d.out_quant,
+            MixerBufs::Attention(_) | MixerBufs::ShortConv(_) => {
+                return Err(ChainError::shape(
+                    WHAT,
+                    format!("layer {l}: a delta op on a layer of another mixer"),
+                )
+                .into());
+            }
+        };
+        if headnorm_m_serves(out_quant, m) {
+            self.verify_delta_out_m(l)?;
+        } else {
+            for r in 0..m {
+                self.verify_delta_out_row(l, m, r)?;
+            }
         }
         self.enc.memory_barrier();
         Ok(())
     }
 
+    /// Layer `l`'s delta out projection over both verify rows in one M-row
+    /// launch: each row's own gated numerator and partial sums, into its own
+    /// residual row. No barrier: the caller closes the rows' writes.
+    fn verify_delta_out_m(&mut self, l: usize) -> Result<(), SessionError> {
+        let m = MROWS;
+        let slot = self.rows_slot(m);
+        let Some(ctx) = self.rows.as_mut() else {
+            return no_rows();
+        };
+        let rows = &mut *ctx.arena;
+        let Arena {
+            layers,
+            faults,
+            eps,
+            hidden,
+            geom,
+            ..
+        } = &mut *self.arena;
+        let MixerBufs::Delta(d) = &layers[l].mixer else {
+            return Err(ChainError::shape(
+                WHAT,
+                format!("layer {l}: a delta op on a layer of another mixer"),
+            )
+            .into());
+        };
+        let d_geom = &geom.delta;
+        let cols = d_geom.value_heads * d_geom.head_cols;
+        self.kernels.headnorm_m(
+            self.enc,
+            HeadNormMParams {
+                quant: d.out_quant,
+                m,
+                rows: *hidden,
+                cols,
+                weights: all(&d.out)?,
+                g: rows.mix.window(Elems(0), Elems(m * cols))?,
+                partials: rows
+                    .delta_partials
+                    .window(Elems(0), Elems(m * d_geom.partials_stride))?,
+                y: rows.x.window_mut(Elems(0), Elems(m * *hidden))?,
+                out_stride: *hidden,
+                eps: *eps,
+                fault: &faults[slot],
+                layer: layer_word(l),
+            },
+        )?;
+        Ok(())
+    }
+
     /// Row `r` of layer `l`'s delta out projection: the one-row head-normed
     /// residual mat-vec over the row's numerator and partial sums, into the
-    /// row's residual row. No barrier: the rows write disjoint outputs.
+    /// row's residual row — the launch a type with no M-row entry takes. No
+    /// barrier: the rows write disjoint outputs.
     fn verify_delta_out_row(&mut self, l: usize, m: usize, r: usize) -> Result<(), SessionError> {
         let slot = self.rows_slot(m);
         let Some(ctx) = self.rows.as_mut() else {
@@ -936,16 +1004,20 @@ impl VerifyOps<'_, '_> {
             GroupKind::AttnFlash => o.verify_attn_core(layer, m),
             GroupKind::AttnOut => o.verify_attn_out(layer, m),
             GroupKind::DeltaCore => o.verify_delta_core(layer, m),
-            GroupKind::DeltaOut => {
-                let Part::Row(row) = part else {
-                    return Err(refuse(
-                        "a delta out group of a verify names no row".to_string(),
-                    ));
-                };
-                o.verify_delta_out_row(layer, m, row)?;
-                o.enc.memory_barrier();
-                Ok(())
-            }
+            GroupKind::DeltaOut => match part {
+                Part::Row(row) => {
+                    o.verify_delta_out_row(layer, m, row)?;
+                    o.enc.memory_barrier();
+                    Ok(())
+                }
+                // The whole out, one group: the launch the walk itself runs,
+                // its own barrier with it.
+                Part::Whole => o.verify_delta_out(layer, m),
+                Part::Half(_) => Err(refuse(
+                    "a delta out group of a verify names a half, not a row or the whole"
+                        .to_string(),
+                )),
+            },
             GroupKind::HandOn => {
                 let Part::Half(half) = part else {
                     return Err(refuse(

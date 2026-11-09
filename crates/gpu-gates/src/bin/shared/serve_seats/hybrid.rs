@@ -8,6 +8,10 @@
 //! the same way: the load on the engine thread, the `load` record, the
 //! prompt call, the step, the keep rule and the tags the model's own
 //! description names.
+//!
+//! A family whose body has a prompt pass ([`Family::PASS`]) names the pass its plan holds
+//! ([`Family::pass`]); the seat plans the load at it and opens it, or steps the prompt where the
+//! plan holds none or `--prefill steps` asks it, and names the walk in its records.
 
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -15,18 +19,19 @@ use std::time::{Duration, Instant};
 
 use app::arch::{Batch, HybridCfg, SequenceSlots};
 use app::{Loaded, OpenArgs, OpenLog, Prompt, Session, SessionError};
-use bloomery_gpu::GpuModel;
 use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::host::served::TierBody;
+use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::{ChainBody, StepMode};
+use bloomery_gpu::{GpuError, GpuModel};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::bind::{Seat, note_line};
-use bloomery_gpu_gates::generate::{Lane, Place};
+use bloomery_gpu_gates::generate::{Lane, Place, TierRule};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::side_seat;
+use bloomery_levers::{HostCfg, Levers, ResidencyPick};
 use gguf::Split;
 use model::arch::Arch;
-use model::arch::models::ReasoningFormat;
 use model::arch::place_hybrid::PlanInputs;
 use model::placement::workstation::TierBatchBytes;
 use model::placement::{Machine, PlacementError, Plan};
@@ -34,7 +39,22 @@ use runtime::Target as _;
 use serve::reasoning::ThinkTags;
 use serve::{CacheNote, Saved, ServeError};
 
-use super::tiered::{self, Open, Tiered};
+use super::tiered::{self, BuildMachine, Open, PassAttempt, PassPlan, Tiered, Walk};
+
+/// The open of a family's prompt pass ([`Family::pass`]): the body by the plan its pass inputs
+/// made, with the pass's buffers beside it.
+pub type PassOpen<F> = Box<
+    dyn FnOnce(
+            Split,
+            &Plan<'_>,
+            &PlanInputs<<F as Family>::H>,
+            HostCfg,
+        ) -> Result<GpuModel<<F as Family>::Body>, GpuError>
+        + Send,
+>;
+
+/// The pass a family's plan holds and its open, or why the plan holds none.
+pub type Passed<F> = Result<(PassPlan<<F as Family>::H>, PassOpen<F>), String>;
 
 /// What a hybrid seat's family gives the common owner: its body, its plan
 /// inputs, and the words its refusals and its records name.
@@ -44,7 +64,7 @@ pub trait Family: Sized + 'static {
     type Body: Batch<Inputs = PlanInputs<Self::H>> + TierBody<Experts = HostRun>;
 
     /// The family's hyperparameters: what its plan inputs are read for.
-    type H;
+    type H: Clone + Send + 'static;
 
     /// The binary's name, its records' owner and the `note` line's.
     const NAME: &'static str;
@@ -59,11 +79,53 @@ pub trait Family: Sized + 'static {
     /// The files the seat serves.
     const SERVES: &'static str;
 
+    /// The family's input to the common unset rule and the tier cards its body serves
+    /// ([`Tiered::TIER_RULE`]). The default serves none, and a placement that names a tier card is
+    /// refused by name.
+    const TIER_RULE: TierRule = TierRule::UNTIERED;
+
+    /// Whether the body keeps its load's slot map for its life, and so serves no residency but
+    /// `off` ([`Tiered::SLOT_MAP_FIXED`]). The default runs the residency machine.
+    const SLOT_MAP_FIXED: bool = false;
+
+    /// Whether the body has a prompt pass ([`Family::pass`]): the seat then takes
+    /// `--prefill pass|steps`, which a family with none refuses by name.
+    const PASS: bool = false;
+
+    /// The pass the plan at `ctx` holds on `place` and its open ([`Tiered::pass_plan`]'s
+    /// `build` and `attempt`), or why it holds none; asked only of a family with
+    /// [`Family::PASS`]. A family that says it has a pass and names none is refused by name.
+    fn pass(
+        _inputs: &PlanInputs<Self::H>,
+        _place: Place,
+        _ctx: usize,
+        _build: &BuildMachine<'_>,
+        _attempt: &PassAttempt<'_, Self::H>,
+    ) -> Result<Passed<Self>, GateError> {
+        Err(format!(
+            "the {} family says it has a prompt pass and names none (Family::pass)",
+            Self::FAMILY
+        )
+        .into())
+    }
+
+    /// The rows of the prompt pass the loaded body holds, which its prompt runs by; `None` for a
+    /// body loaded with none (the default).
+    fn pass_rows(_m: &GpuModel<Self::Body>) -> Result<Option<usize>, GateError> {
+        Ok(None)
+    }
+
     /// Whether `arch` is a file this seat serves.
     fn accepts(arch: Arch) -> bool;
 
     /// The file's plan inputs, its own reading.
     fn read(split: &Split) -> Result<PlanInputs<Self::H>, PlacementError>;
+
+    /// `ctx` positions refused by name when the body cannot serve that many; asked of the context
+    /// as given, before any plan, and of the context the plan chose ([`Tiered::check_ctx`]).
+    fn check_ctx(_inputs: &PlanInputs<Self::H>, _ctx: usize) -> Result<(), GateError> {
+        Ok(())
+    }
 
     /// Price the chosen prompt group before the common context probes.
     fn configure(_inputs: &mut PlanInputs<Self::H>, _group: usize) -> Result<(), GateError> {
@@ -98,11 +160,37 @@ pub trait Family: Sized + 'static {
 
     /// The tags the model's description names for its think span, which the
     /// server splits the reasoning on ([`serve::Server::with_think_tags`]); the
-    /// description of every file of the family names them.
-    fn think_tags(inputs: &PlanInputs<Self::H>) -> Result<ThinkTags, GateError> {
+    /// description of every file of the family names them. A family whose
+    /// description names none and serves plain text says `None`.
+    fn think_tags(inputs: &PlanInputs<Self::H>) -> Result<Option<ThinkTags>, GateError> {
         match inputs.spec.chat.reasoning {
-            Some(ReasoningFormat::ThinkSpan { open, close }) => Ok(ThinkTags { open, close }),
+            Some(format) => Ok(Some(tiered::think_tags_of(format))),
             None => Err(format!("the {} description names no reasoning tags", Self::FAMILY).into()),
+        }
+    }
+}
+
+/// `--prefill`: how a family with a prompt pass runs a prompt.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Prefill {
+    /// As passes; the plan must hold one.
+    Pass,
+    /// One id a decode step, the stepped load.
+    Steps,
+}
+
+/// The hybrid seat's own flags and what its plan hands the open: `--prefill` as given, and the
+/// pass the plan holds with its open ([`Family::pass`]).
+pub struct Flags<F: Family> {
+    prefill: Option<Prefill>,
+    pass: Option<(PlanInputs<F::H>, PassOpen<F>)>,
+}
+
+impl<F: Family> Default for Flags<F> {
+    fn default() -> Self {
+        Flags {
+            prefill: None,
+            pass: None,
         }
     }
 }
@@ -171,12 +259,12 @@ impl<F: Family> OpenLog<F::Body> for Log<F> {
 
 impl<F: Family> Log<F> {
     /// The `load` record of `m`, with every planned slot ready.
-    fn record(&self, m: &GpuModel<F::Body>) {
+    fn record(&self, m: &GpuModel<F::Body>) -> Result<(), GateError> {
         if let Some((card, rate)) = &self.lane {
             record::lane(card, rate).eprint();
         }
         let total = self.t.elapsed();
-        F::load_record()
+        let r = F::load_record()
             .w("arch", <F::Body as ChainBody>::arch().name())
             .u("resident_bytes", m.resident_bytes())
             .u("ctx", self.ctx)
@@ -187,18 +275,22 @@ impl<F: Family> Log<F> {
             .u("graph_nodes", self.graph_nodes)
             .u("group", self.group)
             .w("pin_main", if self.pin_main { "on" } else { "off" })
-            .w("pinned", self.pinned)
-            .f("load_s", total.as_secs_f64())
-            .eprint();
+            .w("pinned", self.pinned);
+        let r = match F::pass_rows(m)? {
+            Some(rows) => r.u("pass_rows", rows),
+            None => r,
+        };
+        r.f("load_s", total.as_secs_f64()).eprint();
         record::eprint_load_phases(m, total, self.opened);
         record::host_tier::eprint_nvtier(m.body(F::NAME).ok().and_then(|b| b.hybrid().nvme_tier()));
+        Ok(())
     }
 }
 
 /// The session of the file at `a.path` on `a.place`, the step captured, the
 /// `load` record on stderr, on the calling thread, pinned to the dispatcher's
 /// cpu slot when asked.
-fn open_session<F: Family>(a: Open<()>) -> Result<Hybrid<F>, GateError> {
+fn open_session<F: Family>(mut a: Open<Flags<F>>) -> Result<Hybrid<F>, GateError> {
     record::require(record::groups::hybrid::GROUP, "hybrid seat");
     let pinned = a.pin_main && threads::pool().pin_caller();
     let file = Split::open(&a.path).map_err(|e| format!("open {}: {e}", a.path.display()))?;
@@ -217,24 +309,29 @@ fn open_session<F: Family>(a: Open<()>) -> Result<Hybrid<F>, GateError> {
         _family: PhantomData,
     };
     let machine = a.machine;
-    let args = OpenArgs {
-        place: a.place.name(),
-        machine: move |_| machine.clone(),
-        ctx: a.ctx,
-        mode: StepMode::Graph,
-        cfg: HybridCfg {
-            place: a.plan,
-            host: a.host,
-            residency: a.residency,
-            group: a.group,
-            slots: a.slots,
-        },
+    let cfg = HybridCfg {
+        place: a.plan,
+        host: a.host,
+        residency: a.residency,
+        group: a.group,
+        slots: a.slots,
     };
-    let mut s = Loaded::<F::Body>::open(file, args, &mut log)?
-        .ok_or("the open stopped at its plan")?
-        .ready(&mut log)?;
+    let loaded = match a.flags.pass.take() {
+        Some((inputs, open)) => open_pass(file, (&inputs, open), &machine, (a.ctx, cfg), &mut log)?,
+        None => {
+            let args = OpenArgs {
+                place: a.place.name(),
+                machine: move |_| machine.clone(),
+                ctx: a.ctx,
+                mode: StepMode::Graph,
+                cfg,
+            };
+            Loaded::<F::Body>::open(file, args, &mut log)?.ok_or("the open stopped at its plan")?
+        }
+    };
+    let mut s = loaded.ready(&mut log)?;
     <F::Body as Batch>::Sequences::add(&mut s, a.slots)?;
-    log.record(s.model());
+    log.record(s.model())?;
     let mut census = record::host_tier::CensusSpan::default();
     census.mark("load", record::census_of(s.model().body(F::NAME)?.hybrid()));
     Ok(Hybrid {
@@ -242,6 +339,35 @@ fn open_session<F: Family>(a: Open<()>) -> Result<Hybrid<F>, GateError> {
         ctx: a.ctx,
         census,
     })
+}
+
+/// The load of a family's prompt pass: the plan of the pass's `inputs` on the run's `machine` at
+/// `ctx` (`app::Open::plan`, as [`Loaded::open`] plans), handed to `log`, then the body by `open`
+/// with the pass's buffers, in graph mode. The pass's load keeps its slot map, so a residency
+/// other than [`Residency::Off`] is refused by name.
+fn open_pass<F: Family>(
+    file: Split,
+    (inputs, open): (&PlanInputs<F::H>, PassOpen<F>),
+    machine: &Machine,
+    (ctx, cfg): (usize, HybridCfg),
+    log: &mut Log<F>,
+) -> Result<Loaded<F::Body>, GateError> {
+    if cfg.residency != Residency::Off {
+        return Err(format!(
+            "the {} prompt pass's load keeps its slot map: residency {:?} is refused \
+             (BLOOMERY_RESIDENCY off)",
+            F::FAMILY,
+            cfg.residency
+        )
+        .into());
+    }
+    let plan = <F::Body as app::Open>::plan(inputs, machine, ctx, &cfg)?;
+    log.plan("", inputs, machine, &plan)?;
+    let held = u32::try_from(plan.ctx_max)
+        .map_err(|_| format!("the plan's ctx_max {} passes u32", plan.ctx_max))?;
+    let mut m = open(file, &plan, inputs, cfg.host)?;
+    m.set_mode(StepMode::Graph);
+    Ok(Loaded::from_model(m, cfg, held))
 }
 
 impl<F: Family> Seat for Hybrid<F> {
@@ -331,7 +457,7 @@ fn no_cache<F: Family>() -> String {
 
 impl<F: Family> Tiered for Hybrid<F> {
     type H = F::H;
-    type Flags = ();
+    type Flags = Flags<F>;
 
     const NAME: &'static str = F::NAME;
     const USAGE: &'static str = F::USAGE;
@@ -339,6 +465,7 @@ impl<F: Family> Tiered for Hybrid<F> {
     const ALIAS: &'static str = F::ALIAS;
     const FAMILY: &'static str = F::FAMILY;
     const SERVES: &'static str = F::SERVES;
+    const TIER_RULE: TierRule = F::TIER_RULE;
     const RESIDENT: bool = <<F::Body as Batch>::Sequences as SequenceSlots<F::Body>>::RESIDENT;
     const ONE_PASS: bool = false;
 
@@ -354,12 +481,87 @@ impl<F: Family> Tiered for Hybrid<F> {
         F::configure(inputs, group)
     }
 
-    fn flags(_flag: &str, _value: &str, _out: &mut ()) -> Result<bool, GateError> {
-        Ok(false)
+    fn check_ctx(inputs: &PlanInputs<Self::H>, ctx: usize) -> Result<(), GateError> {
+        F::check_ctx(inputs, ctx)
+    }
+
+    fn prefill_steps(flags: &Flags<F>) -> bool {
+        flags.prefill == Some(Prefill::Steps)
+    }
+
+    const SLOT_MAP_FIXED: bool = F::SLOT_MAP_FIXED;
+
+    /// The common machine's pick ([`tiered::residency_pick`]) with the seat's prompt feed, or,
+    /// for a body that keeps its load's slot map, `off` ([`tiered::fixed_slot_map_pick`]); a
+    /// step-fed body is `off` unset and refuses any other word by name.
+    fn residency(
+        levers: &Levers,
+        flags: &Flags<F>,
+        place: Place,
+        plan: &Plan<'_>,
+    ) -> Result<Option<ResidencyPick>, GateError> {
+        let steps = Self::prefill_steps(flags);
+        if F::SLOT_MAP_FIXED {
+            return tiered::fixed_slot_map_pick(
+                levers,
+                plan,
+                steps,
+                F::FAMILY,
+                Self::UNHOSTED_POOL,
+            )
+            .map(Some);
+        }
+        tiered::residency_pick(levers, place, plan, steps, Self::UNHOSTED_POOL).map(Some)
+    }
+
+    /// `--prefill pass|steps`, for a family whose body has a prompt pass; any other word, and the
+    /// flag on a family with none, refused by name.
+    fn flags(flag: &str, value: &str, out: &mut Flags<F>) -> Result<bool, GateError> {
+        if flag != "--prefill" {
+            return Ok(false);
+        }
+        if !F::PASS {
+            return Err(format!("--prefill: the {} body has no prompt pass", F::FAMILY).into());
+        }
+        out.prefill = Some(match value {
+            "pass" => Prefill::Pass,
+            "steps" => Prefill::Steps,
+            other => return Err(format!("--prefill is pass or steps, not {other}").into()),
+        });
+        Ok(true)
+    }
+
+    /// The family's pass at `ctx` ([`Family::pass`]), its open kept in `flags` for the engine
+    /// thread: unless `--prefill steps` asks the stepped load, which plans nothing more. A plan
+    /// that holds no pass steps the prompt and says why, refused by name under `--prefill pass`.
+    fn pass_plan(
+        flags: &mut Flags<F>,
+        inputs: &PlanInputs<F::H>,
+        place: Place,
+        ctx: usize,
+        build: &BuildMachine<'_>,
+        attempt: &PassAttempt<'_, F::H>,
+    ) -> Result<Option<Walk<F::H>>, GateError> {
+        if !F::PASS {
+            return Ok(None);
+        }
+        if flags.prefill == Some(Prefill::Steps) {
+            return Ok(Some(Walk::Steps("--prefill steps".to_owned())));
+        }
+        match F::pass(inputs, place, ctx, build, attempt)? {
+            Ok((plan, open)) => {
+                flags.pass = Some((plan.inputs.clone(), open));
+                Ok(Some(Walk::Pass(Box::new(plan))))
+            }
+            Err(why) if flags.prefill == Some(Prefill::Pass) => {
+                Err(format!("--place {} --prefill pass: {why}", place.name()).into())
+            }
+            Err(why) => Ok(Some(Walk::Steps(why))),
+        }
     }
 
     fn think(inputs: &PlanInputs<Self::H>) -> Result<Option<ThinkTags>, GateError> {
-        F::think_tags(inputs).map(Some)
+        F::think_tags(inputs)
     }
 
     fn tier_batch(

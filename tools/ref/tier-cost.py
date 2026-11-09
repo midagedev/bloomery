@@ -63,15 +63,16 @@ def summarize(pairs):
 def measurement_host_room_test():
     from recipes import _close, rust_lex
 
-    source = (Path(__file__).resolve().parents[2] /
-              'crates/gpu-gates/src/bin/gate_qwen38_nodes.rs').read_text()
-    _, shape = rust_lex(source)
+    bins = Path(__file__).resolve().parents[2] / 'crates/gpu-gates/src/bin'
+    source = (bins / 'gate_qwen38_nodes.rs').read_text()
+    shared = (bins / 'shared/node_proc.rs').read_text()
 
-    def function(name):
+    def function(name, text=source):
+        _, shape = rust_lex(text)
         start = re.search(r'\bfn ' + name + r'\(', shape).start()
         end = _close(shape, shape.index('{', start))
         assert end is not None, f'{name}: unclosed body'
-        return source[start:end + 1]
+        return text[start:end + 1]
 
     run = function('run')
     branch = run.index('} else {', run.index('if arm == "local" {')) + len('} else {')
@@ -96,8 +97,10 @@ mod bloomery_levers {
         })
     }
 }
-fn beside(name: &str) -> Result<PathBuf, GateError> {
-    Ok(std::env::current_exe()?.with_file_name(name))
+mod bloomery_gpu_gates {
+    pub fn beside(name: &str) -> Result<std::path::PathBuf, super::GateError> {
+        Ok(std::env::current_exe()?.with_file_name(name))
+    }
 }
 struct Common { node_host: bool }
 struct Proc;
@@ -113,7 +116,11 @@ impl Proc {
     fn wait_line(&self, _: &str, _: Duration) -> Result<String, GateError> { unreachable!() }
 }
 '''
-    probe += room + '\n' + function('node1_command') + '\n' + function('node1')
+    consts = '\n'.join(re.search(r'pub const ' + name + r': [^;]+;', shared).group()
+                        for name in ('LISTENING', 'BIND_WITHIN'))
+    probe += room + '\n' + consts + '\n' + function('tier_server_command', shared)
+    probe += '\n' + function('tier_server', shared) + '\n' + function('node1_command')
+    probe += '\n' + function('node1')
     probe += '\nfn measurement(node_host: bool) -> Result<(), GateError> {\n'
     probe += 'let c = Common { node_host };\n' + launch + '\nOk(())\n}\n'
     probe += ('fn main() { for host in [false, true] {\n'

@@ -1,0 +1,12 @@
+--- a/crates/gpu-deepseek41/src/chain/glue.rs
++++ b/crates/gpu-deepseek41/src/chain/glue.rs
+@@ -1072,7 +1072,8 @@
+             }
+             let (gain_k, gain_q) = match en.gains(layer) {
+                 EngramGains::Pair { key, query } => (Gain::Weight(key), Gain::Weight(query)),
+-                EngramGains::Folded { gate } => (Gain::Ones, Gain::Weight(gate)),
++                // mutant engramlayout-gate-dropped: the folded gate read as gains of ones.
++                EngramGains::Folded { gate: _ } => (Gain::Ones, Gain::Ones),
+             };
+             sites.push(EngramSite {
+                 layer,

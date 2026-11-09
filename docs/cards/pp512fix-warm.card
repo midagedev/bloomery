@@ -1,0 +1,17 @@
+# The warm P=512 prompt at --place bp (depth-serve fold mode, the [shared] rows) measured 0.3.13's shipped binary at
+# 153..178 tok/s against 66b85794's 207..232 (rel0313-pp512-warm) and bracketed the loss to be69d0950..41be83849
+# (rel0313-pp512-bis2). Round pp512fix found the cause by the server's `picked` record: 099df4a6a priced a stream pick by
+# the batch's rows, so a 511-id batch read every routed id count at scale T_MAX.div_ceil(511) = 2 and doubled the picks
+# (second request: 767..806 picked before, 324..358 after, no lease). This A/B times the fix (pp512fix, one file) against
+# the shipped binary.
+kind: ab
+question: does pricing the stream pick by the cut give the warm P=512 prompt at --place bp back its 66b85794 rate?
+term: pp tok/s @ P = 512, prose corpus, A6000+3090 --place bp, serving defaults, the [shared] rows - (pp512fix - portable) / portable
+unit: %
+predict: 15..40
+rounds: 8
+sd: 5 % the warm A/B's shared rows scatter 4..6 % an arm (0.3.13 153..178, 66b85794 207..232); a P=512 row is [shared] in half the rounds, so 8 rounds give ~4 warm rows an arm
+condition: BLOOMERY_MODEL=deepseek41, DEPTH_SERVE_FOLD=depths, depths 4096 and 512 on one server a round, arms portable (the 0.3.13 tarball's bloomery-serve) and bloomery-pp512fix (target/release at the fix), BLOOMERY_AB_ROUNDS=8, DEPTH_SERVE_PLACE=bp, BLOOMERY_TIMING_CARDS=a6000+3090; the K3.1 download is done and the NVMe->HDD move is SIGSTOPped for the window; the K3.1 conversion (prepare --follow, host-light) may run
+decide-in: the fix is the cause; land it, and read the tg rows: the round predicts about -2 tok/s decode [derived] (the doubled picks staged more experts), reported beside the pp gain, not traded silently
+decide-below: below 15 %: a second term remains in be69d0950..41be83849; the round's `picked` instrument on the fix tree names what the second request still stages
+decide-above: above 40 %: more than the whole loss; read both arms' plan lines and the [cold]/[shared] marks before crediting

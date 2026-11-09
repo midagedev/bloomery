@@ -443,7 +443,7 @@ mod cli {
     use super::taps;
     use super::xstream_rule::{Stage, plans_ring, xstream_rule};
     use app::arch::qwen3moe::Q38Cfg;
-    use app::mtp::{MtpBody, MtpDraft, WindowDraft};
+    use app::mtp::{MtpBody, MtpDraft, WindowDraft, open_draft};
     use app::{Session, SessionError};
     use bloomery_gpu::arch::nemotron_h::{Body as BodyNh, PASS_ROWS as NH_PASS_ROWS};
     use bloomery_gpu::arch::nemotron_h_moe::{Body as BodyNhMoe, PASS_ROWS_MAX};
@@ -463,7 +463,7 @@ mod cli {
     use bloomery_gpu::{Gpu, GpuModel, NemotronHModel, NemotronHMoeModel, Qwen3moeModel};
 
     use bloomery_gpu_gates::generate::{
-        Known, Place, card_words, lane_at, refuse_unknown, stage_page,
+        Known, Place, card_words, lane_at, refuse_unknown, stage_host_page, stage_page,
     };
     use bloomery_gpu_gates::host_stats::{Probe, print_stats};
     use bloomery_gpu_gates::llama_launch::{self, Launcher};
@@ -1346,7 +1346,7 @@ mod cli {
             }
         };
         let chosen = q38place::choose(flag, &gpu_census::census()?, |offer| {
-            let inputs = inputs38(file, levers)?;
+            let inputs = inputs38_at(file, levers, offer)?;
             let (draft, _) = draft38(levers, offer, logits, arms, ctx)?;
             let mtp = match draft {
                 Draft38::Off | Draft38::Lookup => None,
@@ -1380,6 +1380,17 @@ mod cli {
         let mut inputs = PlanInputs::describe(file)?;
         let kv = KvChoice::choose(None, levers.qwen3_kv_set())?.kv;
         inputs.kv = inputs.kv.in_q8_if(kv == KvQ8::Q8);
+        Ok(inputs)
+    }
+
+    /// [`inputs38`] for a load at `place`, the page a host-capable room takes
+    /// on its stage card read once under `BLOOMERY_KV_HOST`
+    /// ([`PlanInputs::kv_host_page`]).
+    fn inputs38_at(file: &Split, levers: &Levers, place: Place) -> Result<PlanInputs, GateError> {
+        let mut inputs = inputs38(file, levers)?;
+        if levers.kv_host() != bloomery_levers::KvHost::Off {
+            inputs.kv_host_page = Some(stage_host_page(place.card_specs()?[0])?);
+        }
         Ok(inputs)
     }
 
@@ -1419,7 +1430,7 @@ mod cli {
         (ctx, slots): (usize, usize),
         mtp: bool,
     ) -> Result<u64, GateError> {
-        let mut inputs = inputs38(file, levers)?;
+        let mut inputs = inputs38_at(file, levers, place)?;
         inputs.room = room.clone();
         let ub = u64::try_from(ubatch_for(ctx)?)?;
         let ctx_max = u64::try_from(ctx)?;
@@ -1552,7 +1563,12 @@ mod cli {
             }
         };
         let drafts = mtp.is_some();
-        inputs.reserve_room(&mut machine, (ctx, u64::try_from(slots)?, drafts), page)?;
+        inputs.reserve_room(
+            &mut machine,
+            (ctx, u64::try_from(slots)?, drafts),
+            page,
+            levers.kv_host(),
+        )?;
         if plans_ring(
             levers.xstream(),
             stage38(place),
@@ -1573,8 +1589,9 @@ mod cli {
     /// card's free bytes when the census read them, the host room the plan
     /// was made at when it had one, the PLE table's tier and the reading of
     /// the host's room that chose it (`read`), and each plan card's device
-    /// (`record::plan_devices`). A plan whose PLE tier is not
-    /// one the reader takes is refused by name (`Plan::row_tier`).
+    /// (`record::plan_devices`). The spread's floor (`kv_floor`) prints only
+    /// where a lever moved it below the context. A plan whose PLE tier is
+    /// not one the reader takes is refused by name (`Plan::row_tier`).
     fn plan38_line(
         place: Place,
         experts: Experts,
@@ -1585,7 +1602,13 @@ mod cli {
             .w("place", place.name())
             .w("card", place.card_specs()?[0].name)
             .w("experts", experts_name(experts))
-            .u("ctx_max", plan.ctx_max)
+            .u("ctx_max", plan.ctx_max);
+        let r = match plan.kv_floor {
+            Some(floor) => r.u("kv_floor", floor),
+            None => r,
+        };
+        let r = r.w("kv_host", plan.kv_host.name());
+        let r = r
             .u("host_experts", plan.host.experts)
             .u("card_experts", plan.cards[0].experts);
         let r = match (plan.machine.tiers.first(), plan.tier_n_l.first()) {
@@ -1703,6 +1726,8 @@ mod cli {
             bloomery_levers::STEP_STATS,
             bloomery_levers::QWEN38_EXPERTS,
             bloomery_levers::QWEN3_KV,
+            bloomery_levers::KV_FLOOR,
+            bloomery_levers::KV_HOST,
             bloomery_levers::ROUTE_TRACE,
             bloomery_levers::DRAFT,
             bloomery_levers::MTP_HEAD_ROWS,
@@ -1749,6 +1774,20 @@ mod cli {
                 return Err(
                     "BLOOMERY_QWEN38_EXPERTS=card places a qwen4exp plan's routed experts; \
                      --dump-taps runs a qwen3moe file"
+                        .into(),
+                );
+            }
+            if levers.kv_floor().is_some() {
+                return Err(
+                    "BLOOMERY_KV_FLOOR spreads a qwen4exp plan's experts at a KV floor; \
+                     --dump-taps runs a qwen3moe file"
+                        .into(),
+                );
+            }
+            if levers.kv_host_set().is_some() {
+                return Err(
+                    "BLOOMERY_KV_HOST backs a qwen4exp store's K/V pages on the host; --dump-taps \
+                     runs a qwen3moe file"
                         .into(),
                 );
             }
@@ -2047,6 +2086,22 @@ mod cli {
             return Err(format!(
                 "BLOOMERY_QWEN38_EXPERTS=card places a qwen4exp plan's routed experts; a {} file \
                  has no host tier",
+                family.name()
+            )
+            .into());
+        }
+        if family != Family::Qwen38 && levers.kv_floor().is_some() {
+            return Err(format!(
+                "BLOOMERY_KV_FLOOR spreads a qwen4exp plan's experts at a KV floor; a {} file's \
+                 cache is plain device tensors, not rooms whose pages a fit backs",
+                family.name()
+            )
+            .into());
+        }
+        if family != Family::Qwen38 && levers.kv_host_set().is_some() {
+            return Err(format!(
+                "BLOOMERY_KV_HOST backs a qwen4exp store's K/V pages on the host; a {} file's \
+                 cache is plain device tensors, not rooms whose pages a fit backs",
                 family.name()
             )
             .into());
@@ -2989,7 +3044,7 @@ mod cli {
         lane: Lane,
         t: Instant,
     ) -> Result<(Qwen38Model, Residency), GateError> {
-        let mut inputs = inputs38(&file, levers)?;
+        let mut inputs = inputs38_at(&file, levers, place)?;
         inputs.room = room;
         let cap = serve_ctx(u64::try_from(ctx)?, &inputs.spec)?;
         let ub = ubatch_for(ctx)?;
@@ -3089,7 +3144,7 @@ mod cli {
         lane: Lane,
         t: Instant,
     ) -> Result<(Qwen38Model, Q38Cfg, Residency), GateError> {
-        let mut inputs = inputs38(&file, levers)?;
+        let mut inputs = inputs38_at(&file, levers, place)?;
         inputs.room = room;
         let cap = serve_ctx(u64::try_from(ctx)?, &inputs.spec)?;
         let ub = ubatch_for(ctx)?;
@@ -3200,10 +3255,11 @@ mod cli {
             None => "full".to_string(),
         };
         println!(
-            "load draft=mtp resident={} arena={} head={head_line} card_bytes={} in {:.1} s \
-             (runtime value)",
+            "load draft=mtp resident={} arena={} store_rows={} head={head_line} card_bytes={} \
+             in {:.1} s (runtime value)",
             draft.resident_bytes(),
             draft.arena_bytes(),
+            draft.store_walk_rows(),
             plan.draft_card_bytes() + plan.arena_bytes,
             t.elapsed().as_secs_f64()
         );
@@ -3365,7 +3421,7 @@ mod cli {
     ) -> Result<(), GateError> {
         let mut s = Session::from_model(m, u32::try_from(run.ctx)?);
         let path = cfg.prompt;
-        let mut draft = MtpDraft::open(s.model(), path, cfg.draft)?;
+        let mut draft = open_draft(s.model(), path, cfg.draft)?;
         if run.windows {
             draft.keep_windows();
         }

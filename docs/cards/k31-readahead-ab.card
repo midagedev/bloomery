@@ -1,0 +1,34 @@
+# k31rel. The one-line check docs/cards/k31-nvme-regime.card's outcome names: K3.1 at --place bp pages its NVMe experts through the file
+# mapping's faults (arena=0), each fault reading ~94 KiB at a queue of ~5, the drive at 23 % of its rate. read_ahead_kb bounds the
+# kernel's read-around on a mapping miss (sysfs-block: "Maximum number of kilobytes to read-ahead for filesystems on this block
+# device"); at 2048 one miss could pull a whole 2.08 MiB expert run instead of a 16th of it. The one term derivation cannot fix is
+# whether the mapping's misses still get read-around at all: mm/filemap.c's do_sync_mmap_readahead stops reading around once a
+# mapping has seen many misses (MMAP_LOTSAMISS), and the probe's 94 KiB average (fault_around_bytes 65536 plus some read-around)
+# says the mapping sits near that edge. No code changes; the box setting is written for the changed arm and restored after.
+kind: ab
+question: does read_ahead_kb 2048 on nvme0n1 shorten the K3.1 decode step at --place bp against the box's 128?
+term: decode tok/s @ D=512, n_predict 128, one cold request a server, (2048 - 128) / 128, paired by round
+unit: %
+predict: +15..+70
+rounds: 3
+sd: 5 % docs/cards/k31-serve-bp.card outcome try7 and @portable, cold rows of one setting repeat within 5 %
+condition: tools/ref/k31-readahead-ab.sh under one lease (lease-hold.sh with this card): each arm is tools/ref/k31-nvme-probe.sh (the
+  0.3.13 sm86 tarball's bloomery-serve, BLOOMERY_HOST_ROOM=252G, --place bp --ctx-size 2048, the first 512 prose ids, n_predict 128,
+  iostat beside it) with /sys/block/nvme0n1/queue/read_ahead_kb at 128 or 2048, the order rotated every round, the value restored to
+  128 at the end whatever happens; each arm's plan line must print the same paged= and host_experts= as the regime probe's
+  (259192872960, 76910), else the row is a plan-drift row and not read; iostat's decode-phase rareq-sz is read beside the rate
+decide-in: the setting goes into rig-log configs (a udev rule for nvme0n1 and nvme1n1) and the serving docs name it; the explicit-read
+  round (fadvise WILLNEED / an O_DIRECT reader at arena 0) is priced from the changed arm's remaining fault count
+decide-below: under +15 with rareq-sz still near 94 KiB: the kernel dropped read-around on this mapping (MMAP_LOTSAMISS) and the
+  setting does not reach it; the explicit-read round is the first lever and read_ahead_kb stays 128. Under +15 with rareq-sz near
+  2 MiB: the read-around reached the drive but the step did not move; re-read the timeline (the faults were not the serial term)
+decide-above: above +70: the fault count fell more than 16x or the page cache kept more between layers; read the changed arm's
+  pgmajfault delta before crediting, and price the explicit-read round at 0 (the setting already took the term)
+# outcome 2026-11-07 (stopped after round 2: the probe's server teardown (580 GB unmapped) outlived the 1 s before the next arm's
+#  listener, so r1-changed and r2-base failed port-in-use; the two rows that ran are one base and one changed, unpaired, read
+#  because the effect is far outside the ruler): base r1 tg 3.30 / pp 2.65 tok/s, 450 GB read, 1.52 M major faults; changed r2
+#  (read_ahead_kb 2048) tg 1.99 / pp 1.84, 974 GB read, 1.36 M major faults: -40 %, the bytes 2.2x. The read-around reached the
+#  drive (bytes doubled, faults barely fewer) but is centred on the fault, so half of every window is bytes the step never uses,
+#  and the step grew with the bytes. decide-below's second case: the setting stays 128 and the explicit-read round is the lever
+#  (the reader reads exactly a miss's three runs, nothing before them). The probe script now waits for the server's exit and the
+#  port's release between arms.

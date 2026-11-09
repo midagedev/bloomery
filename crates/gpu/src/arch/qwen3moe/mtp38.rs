@@ -76,7 +76,7 @@
 //! A store walk ([`WalkMode::Store`], the prompt's warmup) stops after the
 //! append: a later row reads a row's keys and values and nothing else of
 //! it, so the walk computes them alone. It runs over up to
-//! [`MTP_STORE_ROWS`] rows at once through the launches the ubatch walk
+//! [`Mtp38::store_walk_rows`] rows at once through the launches the ubatch walk
 //! (`wide38`) runs, in its own buffers:
 //! - the embedding rows, a media prompt call's span rows copied over the
 //!   rows of their positions (the row the target consumed there in place of
@@ -390,7 +390,12 @@ impl Mtp38 {
         // The draft's store in the target's cache format (the plan's), its
         // rows backed as the walks reach them ([`Mtp38::run_walk`]).
         let kv = KvQ8::of(mtp.kv_q8());
-        let store = KvPlanes::roomed(&gpu.stream_handle(), (geo::N_KV, ctx, geo::HEAD), kv)?;
+        let store = KvPlanes::roomed(
+            &gpu.stream_handle(),
+            (geo::N_KV, ctx, geo::HEAD),
+            kv,
+            "the Qwen3.8 MTP draft's store",
+        )?;
         stream.synchronize()?;
         let body = Mtp38 {
             names: Names::of(d.index, &w),
@@ -635,7 +640,12 @@ impl Mtp38 {
         let dims = (geo::N_KV, self.ctx, geo::HEAD);
         Ok(DraftSeq38 {
             graphs: Vec::new(),
-            store: KvPlanes::roomed(stream, dims, self.store.format())?,
+            store: KvPlanes::roomed(
+                stream,
+                dims,
+                self.store.format(),
+                "a Qwen3.8 draft slot's store",
+            )?,
             last: None,
             held: 0,
         })
@@ -846,19 +856,27 @@ pub const MTP_ROWS: usize = PASS_ROWS;
 /// a refresh runs.
 pub const MTP_GRAPH_ROWS: usize = VERIFY_ROWS;
 
-/// The program's [`WalkBounds::STORE_ROWS`] ([`WalkMode::Store`]): the columns
-/// of its GEMMs, and the rows of the store arena it runs in. A store walk
-/// enqueues launch by launch through the store's append and no further, up to
-/// these rows through the wide launches (module doc): the rows' keys and
-/// values, which are all a later row reads of them. A row's stored bits are
-/// a function of that row's inputs alone, within the q8 activations' error
-/// of an [`WalkMode::Eager`] walk's.
-pub const MTP_STORE_ROWS: usize = 64;
+/// The least rows a load's store arena holds ([`Mtp38::store_walk_rows`]): the
+/// arena a plan keeps when the wider one costs it a card expert
+/// (`model::arch::qwen35moe::place::StoreRows::Least`, restated; the arena
+/// clause of `gate_qwen4exp_mtp` holds the two equal).
+pub const MTP_STORE_ROWS_LEAST: usize = 64;
+
+/// The most rows a load's store arena holds, and the program's
+/// [`WalkBounds::STORE_ROWS`] ([`WalkMode::Store`]): the columns of its
+/// GEMMs, and the rows of the store arena it runs in when the plan has the
+/// room (`StoreRows::Most`). A store walk enqueues launch by launch through
+/// the store's append and no further, up to the load's rows
+/// ([`Mtp38::store_walk_rows`]) through the wide launches (module doc): the rows'
+/// keys and values, which are all a later row reads of them. A row's stored
+/// bits are a function of that row's inputs alone, within the q8 activations'
+/// error of an [`WalkMode::Eager`] walk's.
+pub const MTP_STORE_ROWS_MOST: usize = 512;
 
 impl WalkBounds for Mtp38 {
     const WALK_ROWS: usize = MTP_ROWS;
     const GRAPH_ROWS: usize = MTP_GRAPH_ROWS;
-    const STORE_ROWS: usize = MTP_STORE_ROWS;
+    const STORE_ROWS: usize = MTP_STORE_ROWS_MOST;
 }
 
 /// Values of a row's streams, the target's hidden row.
@@ -1110,8 +1128,11 @@ const CHAIN_POS: usize = IN_IDS + MTP_ROWS;
 
 /// The most readback pairs one walk of several sequences' chains fills, the
 /// store arena's position words less the fault word and its site mask
-/// ([`Mtp38::read_chains`]).
-pub(super) const CHAIN_PAIRS: usize = MTP_STORE_ROWS / 2 - 1;
+/// ([`Mtp38::read_chains`]). The words are the least arena's
+/// ([`MTP_STORE_ROWS_LEAST`]); a round's chains are bounded by its walk
+/// ([`MTP_ROWS`]) and the readback reads these words alone, so a wider arena
+/// reads back no more.
+pub(super) const CHAIN_PAIRS: usize = MTP_STORE_ROWS_LEAST / 2 - 1;
 
 /// A gate's taps of an eager walk: the streams `eh_proj` wrote (`m · 4 ·
 /// 2560`), the router's logits, ids and weights, `slots` and `logits` a row
@@ -1228,12 +1249,15 @@ impl TapBufs {
     }
 }
 
-/// A store walk's own buffers for up to [`MTP_STORE_ROWS`] rows,
+/// A store walk's own buffers for up to [`Mtp38::store_walk_rows`] rows,
 /// token-major (module doc): the hidden rows, the embedding with its
 /// positions and key counts, the pack and its q8 blocks over the `4·m`
 /// packed columns, the streams, the wide mix's scratch, the mix and its q8
 /// blocks, k and v, and the two one-expert tables (`4·m` and `m` slots).
 struct StoreArena {
+    /// The rows every buffer below is made for: the plan's
+    /// ([`Mtp38::arm`]).
+    width: usize,
     h: DeviceBuffer<f32>,
     emb: DeviceBuffer<f32>,
     /// The rows' positions; between store walks, which write them before
@@ -1255,12 +1279,13 @@ struct StoreArena {
 }
 
 impl StoreArena {
-    fn new(stream: &CudaStream, geometry: Geometry) -> Result<StoreArena, GpuError> {
-        let r = MTP_STORE_ROWS;
+    fn new(stream: &CudaStream, geometry: Geometry, rows: usize) -> Result<StoreArena, GpuError> {
+        let r = rows;
         let f = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
         let u = |n: usize| DeviceBuffer::<u32>::zeroed(stream, n);
         let (h, cols) = (geo::HIDDEN, geo::STREAMS * r);
         Ok(StoreArena {
+            width: rows,
             h: f(r * WIDE)?,
             emb: f(r * h)?,
             pos: u(r)?,
@@ -1300,7 +1325,7 @@ impl StoreArena {
 }
 
 /// The program's buffers for up to [`MTP_ROWS`] rows, token-major, and a
-/// store walk's for up to [`MTP_STORE_ROWS`] (`st`).
+/// store walk's for up to [`Mtp38::store_walk_rows`] (`st`).
 struct MtpArena {
     /// The walk's record — `pos0`, then the rows' tokens — and its windows.
     inbox: Inbox,
@@ -1370,13 +1395,14 @@ impl MtpArena {
         dims: RouterDims,
         vocab: usize,
         head_act: bool,
+        store_rows: usize,
     ) -> Result<MtpArena, GpuError> {
         let r = MTP_ROWS;
         let f = |n: usize| DeviceBuffer::<f32>::zeroed(stream, n);
         let u = |n: usize| DeviceBuffer::<u32>::zeroed(stream, n);
         let h = geo::HIDDEN;
-        let inbox = Inbox::new(stream, IN_IDS + MTP_STORE_ROWS)?;
-        // SAFETY: word IN_POS0 of the inbox's IN_IDS + MTP_STORE_ROWS device
+        let inbox = Inbox::new(stream, IN_IDS + store_rows)?;
+        // SAFETY: word IN_POS0 of the inbox's IN_IDS + store_rows device
         // words, and the inbox moves into the arena beside the window (a
         // move of the handle, not of the allocation), where it outlives it.
         let pos0 = unsafe { param_view::<u32>(inbox.dev(), IN_POS0, 1) };
@@ -1426,7 +1452,7 @@ impl MtpArena {
             no_map: u(1)?,
             chain: u(2 * MTP_GRAPH_ROWS + 2)?,
             taps: None,
-            st: StoreArena::new(stream, geometry)?,
+            st: StoreArena::new(stream, geometry, store_rows)?,
             vocab,
         })
     }
@@ -1573,8 +1599,10 @@ pub(super) struct MtpCtx<'a> {
 impl Mtp38 {
     /// The program's arena beside the loaded body: the router's dims, the
     /// vocabulary the head writes and the rope table's rows, which must
-    /// cover the store's positions, held to `arena` device bytes — the plan's
-    /// count ([`model::arch::qwen35moe::place::mtp_arena_bytes`] and, for a
+    /// cover the store's positions, with a store walk of `store_rows` rows
+    /// (the plan's, [`MtpPlan::store`](model::arch::qwen35moe::place::MtpPlan)),
+    /// held to `arena` device bytes — the plan's count
+    /// ([`model::arch::qwen35moe::place::mtp_arena_bytes`] and, for a
     /// Q6_K head,
     /// [`model::arch::qwen35moe::place::mtp_head_act_bytes`]). Load-time
     /// only.
@@ -1582,10 +1610,18 @@ impl Mtp38 {
         &mut self,
         stream: &CudaStream,
         dims: RouterDims,
-        vocab: usize,
-        rope_rows: usize,
-        arena: u64,
+        (vocab, rope_rows): (usize, usize),
+        (store_rows, arena): (usize, u64),
     ) -> Result<(), GpuError> {
+        if store_rows != MTP_STORE_ROWS_LEAST && store_rows != MTP_STORE_ROWS_MOST {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a store walk of {store_rows} rows; the arena is made for \
+                     {MTP_STORE_ROWS_LEAST} or {MTP_STORE_ROWS_MOST}"
+                ),
+            ));
+        }
         if self.ctx > rope_rows {
             return Err(GpuError::shape(
                 WHAT,
@@ -1614,7 +1650,7 @@ impl Mtp38 {
             }
         }
         let q6k = matches!(self.head_w, BorrowedHead::Q6K { .. });
-        let a = MtpArena::new(stream, dims, vocab, q6k)?;
+        let a = MtpArena::new(stream, dims, vocab, q6k, store_rows)?;
         let got = a.bytes() as u64;
         if got != arena {
             return Err(GpuError::shape(
@@ -1683,6 +1719,14 @@ impl Mtp38 {
     #[must_use]
     pub fn arena_bytes(&self) -> usize {
         self.a.as_ref().map_or(0, MtpArena::bytes)
+    }
+
+    /// The rows of the store walk this load's arena holds, the plan's choice
+    /// ([`MTP_STORE_ROWS_LEAST`] or [`MTP_STORE_ROWS_MOST`]); 0 before
+    /// [`Mtp38::arm`].
+    #[must_use]
+    pub fn store_walk_rows(&self) -> usize {
+        self.a.as_ref().map_or(0, |a| a.st.width)
     }
 
     /// Arm (or disarm) the taps of the eager walks ([`MtpTaps`]): `eh_proj`'s
@@ -1919,6 +1963,15 @@ impl Mtp38 {
         let rows = call_rows(feed, mode)?;
         let (m, own, pos0) = (feed.count(), rows.is_none(), feed.pos0());
         refuse_rows::<Mtp38>(WHAT, mode, m)?;
+        if mode == WalkMode::Store && m > self.store_walk_rows() {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "a walk of {m} rows; this load's Store walk takes 1..={}",
+                    self.store_walk_rows()
+                ),
+            ));
+        }
         if pos0 as usize + m > ctx {
             return Err(GpuError::shape(
                 WHAT,
@@ -1980,7 +2033,7 @@ impl Mtp38 {
 
     /// One sequence's rows of a store walk of several sequences' rows
     /// ([`GpuModel::draft_store_slots`](crate::GpuModel::draft_store_slots),
-    /// which holds the walk to the store arena's [`MTP_STORE_ROWS`]), staged
+    /// which holds the walk to the store arena's [`Mtp38::store_walk_rows`]), staged
     /// at rows `at ..` of the store arena: `feed` checked as a store walk
     /// into `head` on this sequence, the live one ([`Mtp38::checked`]), and
     /// its hidden rows copied in. Refused by name as [`Mtp38::run_walk`]
@@ -2324,7 +2377,8 @@ impl Mtp38 {
         stream: &CudaStream,
         blocks: &[ChainBlock],
     ) -> Result<Vec<Proposal>, GpuError> {
-        let out = self.arena_ref()?.st.pos.to_host_vec(stream)?;
+        let pos = &self.arena_ref()?.st.pos;
+        let out = Window::<u32>::of(pos, 0, 2 * CHAIN_PAIRS + 2)?.to_host_vec(stream)?;
         let (Some(&word), Some(&sites)) = (out.get(2 * CHAIN_PAIRS), out.get(2 * CHAIN_PAIRS + 1))
         else {
             return Err(GpuError::state(
@@ -2426,7 +2480,7 @@ impl Mtp38 {
         let word = size_of::<u32>();
         for r in rows {
             // SAFETY: the rows' ids — words `at .. at + m` of the inbox's
-            // IN_IDS + MTP_STORE_ROWS, the own id's one word, or one word of
+            // IN_IDS + store_rows, the own id's one word, or one word of
             // the chains' readback — and their first position's inbox word,
             // each inside its buffer ([`WalkRows`]); the windows live for the
             // embedding's enqueue.
@@ -3288,10 +3342,16 @@ fn read_draft(a: &MtpArena, stream: &CudaStream, m: usize) -> Result<Proposal, G
 // A walk's rows fit the eh_proj run and the m-column kernels; a store
 // walk's inbox holds an eager walk's rows too.
 const _: () = assert!(
-    MTP_ROWS <= 8 && MTP_GRAPH_ROWS <= MTP_ROWS && EH_COLS == 8 && MTP_ROWS <= MTP_STORE_ROWS
+    MTP_ROWS <= 8
+        && MTP_GRAPH_ROWS <= MTP_ROWS
+        && EH_COLS == 8
+        && MTP_ROWS <= MTP_STORE_ROWS_LEAST
+        && MTP_STORE_ROWS_LEAST <= MTP_STORE_ROWS_MOST
 );
-// A round of chains' positions fit the inbox beside its ids.
-const _: () = assert!(CHAIN_POS + MTP_GRAPH_ROWS * MTP_ROWS <= IN_IDS + MTP_STORE_ROWS);
+// A round of chains' positions fit the inbox beside its ids, and its readback
+// the store arena's position words, whichever arena the plan chose.
+const _: () = assert!(CHAIN_POS + MTP_GRAPH_ROWS * MTP_ROWS <= IN_IDS + MTP_STORE_ROWS_LEAST);
+const _: () = assert!(2 * CHAIN_PAIRS + 2 <= MTP_STORE_ROWS_LEAST);
 
 #[cfg(test)]
 mod tests {

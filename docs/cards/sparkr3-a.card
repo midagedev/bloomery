@@ -1,0 +1,37 @@
+# Round sparkr3 (kind profile: no A/B, no ruler). The one term of the Spark tier plan only the cable and the
+# Spark can fix: a, the exposed tier round trip a layer inside the engine, from the go leaving node 0 until the
+# tier rows are readable by its card.
+# Source: sparktier report 4.2 (a_sum in [110, 170] [derived]: go one way ~26 us = half the 8 KiB RTT 50-53 us,
+# the compact reply ~34 us one way, node-side chain floor 25-60 us [assumption], pump/poll hops 15-40 us
+# [assumption]; a compact reply adds ~10 us over a summed row) and 8; the R0 result (rig-log
+# log/2026-11-04.md#sparkr0-wc: wc = 150.7 prose / 167.1 code us a layer) tightened the bar [derived, the
+# sparktier 4.3 model rerun at the measured wc]: break-even a = 197-198 us prose, 173-178 us code; at a = 140
+# prose +5.2..+7.2 %, code +2.4..+2.9 %; at a = 170 prose +2.8..+3.7 %, code +0.4..+1.1 % (inside the six-round
+# ruler, +-0.8 %).
+# Link facts: 10GbE direct, MTU 1500, busy-poll both ends, the Spark's shallow-idle unit up for the run
+# (rig-log log/2026-11-04.md#spark-wire-tuning: 8 KiB p50 50.2 us, p99 116.4; 16 KiB p50 67.0).
+kind: profile
+question: what is a, the exposed per-layer tier round trip of a V4.1 decode step with the Spark as the expert
+  tier node over the TCP wire, and does it land at or below the 140 us at which both corpora's decode gain is
+  claimable at six rounds?
+term: a, us a layer, mean over layers 2..39 and the timed replays: from the go frame leaving the host pump
+  until the layer's join sees the tier rows (the tier done word), one value per arm, prose and code, decode
+  depth 512 (the first 512 ids of corpus-prose.ids and corpus-code.ids, n 8, 7 replays), the compact reply,
+  BLOOMERY_TIER_LINK=tcp, the ws's cards as plan (a) and the Spark holding the tier image
+unit: us
+predict: 110..175
+condition: the r1wire and r2compact changes landed, the tier_server built natively on the Spark from the same
+  commit (rig-log tools/bloomery-follow/spark-box.sh), cpuidle-shallow started on the Spark for the run and
+  stopped after; one lease on the A6000; the witness shows no [other-busy] or [cpu-busy] and a warm file
+  (pgmajfault unmoved between the pre and post witness); the per-layer a is read from the step's profile
+  records (BLOOMERY_PROFILE=1, the tier leg's go and join stamps), its cross-check the link_probe --tcp RTT
+  table on the cable taken in the same sitting (8 KiB p50 within 50..60 us, else the link, not the engine,
+  moved)
+decide-in: at or below 140: open the same-lease decode A/B card (ws alone vs ws+Spark, prose and code at depth
+  512, six rounds, an A/A arm; the predicted effect from the model rerun at the measured a and wc); between
+  140 and 175: the prose A/B only, the code rows need 13 rounds (+-0.5 %) and are not opened tonight
+decide-below: less than 110: the chain floor and hop assumptions were high: rerun the model at the measured a,
+  write the larger predicted effect into the A/B card, and open both corpora
+decide-above: above 175: the decode plan at Q3_K_M stops (code negative, prose inside the ruler above 198);
+  read where the time goes (pump hop, node-side H2D/D2H, the wire's ack) before any A/B; the capacity regime
+  (Q4_K_M, R5) stays open and does not depend on a

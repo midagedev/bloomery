@@ -2,13 +2,15 @@
 //! and tensor table alone.
 //!
 //! The refusals are [`super::check`]'s, the open's own, every one rather than
-//! the first. The plan adds what the open does not print: the bytes the open
-//! would make buffers of, beside the room the device reports
-//! (`recommendedMaxWorkingSetSize`, a device query) and the host's free memory
-//! now (`vm_stat`: other processes included, which the census's count of this
-//! process's own buffers is not). The two room numbers are printed side by
-//! side and judge nothing: the census's rule is the open's, and this plan
-//! states what each says.
+//! the first — the room rule's ([`super::check::room`]) among them, the load's
+//! bytes held to the device's free bytes, so a load too large for the device
+//! is refused here as it is at the open. The plan adds what the open does not
+//! print: the bytes the open would make buffers of, beside the room the device
+//! reports (`recommendedMaxWorkingSetSize`, a device query) and the host's free
+//! memory now (`vm_stat`: other processes included, which the census's count
+//! of this process's own buffers is not). The two room numbers are printed
+//! side by side and judge nothing here: the census's free bytes are what the
+//! open's room rule holds the load to, and this plan states what each says.
 //!
 //! A GGUF file whose data section is cut short (a header fetched by a range
 //! read) is read from its header and tensor table alone ([`open_plan_header`]);
@@ -178,6 +180,63 @@ pub struct DeviceRoom {
     pub recommended: u64,
     /// `currentAllocatedSize` less nothing: what this process holds (none yet).
     pub allocated: u64,
+    /// The census's free bytes: the working set less this process's
+    /// allocation and the host's available memory, the smaller — the room the
+    /// open's rule holds the load's bytes to.
+    pub free: u64,
+}
+
+/// The cache rows of an open that asked for none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Unasked {
+    /// The rows the open takes.
+    pub ctx: usize,
+    /// The default the binary names, at most the file's `context_length`:
+    /// `ctx` unless the device's room cut it.
+    pub default: usize,
+    /// The device's free bytes the cut was judged at; none when the census
+    /// could not be read, and the open reads it again.
+    pub free: Option<u64>,
+}
+
+impl Unasked {
+    /// The line a binary prints when the room cut the default, naming both
+    /// counts and the room: none when the default stands.
+    #[must_use]
+    pub fn note(&self) -> Option<String> {
+        let free = self.free?;
+        (self.ctx < self.default).then(|| {
+            format!(
+                "--ctx unset: a cache of {} rows, the largest whose session fits the device's \
+                 free bytes ({free}); the default is {} rows",
+                self.ctx, self.default
+            )
+        })
+    }
+}
+
+/// The cache rows of an open of `model` that asked for none: the smaller of
+/// `cap` and the file's `context_length`, cut to the largest cache whose
+/// session fits the device's free bytes when that default's does not
+/// ([`super::check::unasked_ctx`]). A file with no `context_length` count is
+/// refused by name.
+pub fn unasked_ctx(split: &Split, cap: usize, model: &Path) -> Result<Unasked, String> {
+    let train = split
+        .arch_get_u64("context_length")
+        .and_then(|v| usize::try_from(v).ok())
+        .ok_or_else(|| {
+            format!(
+                "{}: {} is absent or not a count",
+                model.display(),
+                split.arch_key("context_length")
+            )
+        })?;
+    let default = cap.min(train);
+    let free = device_room().ok().map(|d| d.free);
+    let ctx = free.map_or(default, |free| {
+        super::check::unasked_ctx(split, default, free)
+    });
+    Ok(Unasked { ctx, default, free })
 }
 
 /// The default device's room, or the reason there is none.
@@ -194,6 +253,7 @@ pub fn device_room() -> Result<DeviceRoom, String> {
         name: info.name,
         recommended: info.total_bytes,
         allocated: MetalCensus::allocated_of(&default).map_err(|e| e.to_string())?,
+        free: info.free_bytes,
     })
 }
 
@@ -349,8 +409,9 @@ pub fn render(
     lines.push(format!("plan: ctx={ctx}"));
     match device {
         Ok(d) => lines.push(format!(
-            "plan: device={:?} recommended_max_working_set_bytes={} allocated_bytes={}",
-            d.name, d.recommended, d.allocated
+            "plan: device={:?} recommended_max_working_set_bytes={} allocated_bytes={} \
+             free_bytes={}",
+            d.name, d.recommended, d.allocated, d.free
         )),
         Err(e) => lines.push(format!("plan: device=unavailable ({e})")),
     }
@@ -394,6 +455,7 @@ pub fn render(
 
 fn bytes_lines(b: &Bytes, device: &Result<DeviceRoom, String>) -> Vec<String> {
     let total = b.total();
+    let held = b.held();
     let mut lines = vec![
         format!("plan: bytes weights {}", tally(&b.weights)),
         format!("plan: bytes kv {}", tally(&b.kv)),
@@ -406,9 +468,19 @@ fn bytes_lines(b: &Bytes, device: &Result<DeviceRoom, String>) -> Vec<String> {
              between)",
             tally(&total)
         ),
+        format!(
+            "plan: bytes copies {} (made after the open: a pass's mark copies and the \
+             checkpoints the budget grants)",
+            tally(&b.copies)
+        ),
+        format!(
+            "plan: bytes held {} (total and copies: the bytes the room rule holds to the \
+             device's free bytes)",
+            tally(&held)
+        ),
     ];
     if let Ok(d) = device {
-        let over = i128::from(total.paged) - i128::from(d.recommended);
+        let over = i128::from(held.paged) - i128::from(d.recommended);
         lines.push(format!(
             "plan: room paged_minus_recommended_bytes={over} (negative: the upper bound is under \
              the device's working set; the census's rule is the open's, not this line)"

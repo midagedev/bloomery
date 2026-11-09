@@ -12,7 +12,8 @@
 //! | `-fit`, `-fitc` | the plan always fits; `-fit off` and another `-fitc` than the seats' floor are refused |
 //! | `-fitt` | `BLOOMERY_CARD_MARGIN`, the bytes a card keeps free, which replace the plan's own margin ([`Flags::margin`]): one value is every device's margin, a list one per listed device; with no card named, every visible card has its margin and the load's own rule picks among them (a second card as an expert tier where the family's rule takes one) |
 //! | `-devd` | `BLOOMERY_DSPARK_CARD` on the ds41 seat |
-//! | `-sm row`, `-sm tensor`, `-dev none` | refused: bloomery has no row split and no CPU-only seat |
+//! | `-dev none`, `-ngl 0` | the host stage ([`Flags::host_ask`]): every layer, the head and the embedding on the host, no card in the plan; the one-binary server seats the file on its host seat |
+//! | `-sm row`, `-sm tensor` | refused: bloomery has no row split |
 //!
 //! [`take`] cuts these flags out of a seat's arguments. What a flag comes to is a lever
 //! ([`Flags::levers`], no device read) or a `--place` word ([`Flags::place`], against the census):
@@ -109,10 +110,12 @@ pub struct Flags {
     /// The flags that name cards (`-dev`, `-sm`, `-ts`, `-mg`), as the note prints them.
     placing: Vec<String>,
     dev: Option<Vec<u32>>,
-    split: Option<Split>,
+    /// `-sm` as given, and the split it names.
+    split: Option<(String, Split)>,
     /// `-ts` as given, and its shares, one per listed device.
     shares: Option<(String, Vec<f64>)>,
-    main_gpu: Option<i64>,
+    /// `-mg` as given, and its index.
+    main_gpu: Option<(String, i64)>,
     ngl: Option<Ngl>,
     /// The expert flag as given, and what it asks.
     moe: Option<(String, Moe)>,
@@ -120,8 +123,13 @@ pub struct Flags {
     /// `-fitt` as given, and its margins in MiB, one per value.
     fit_target: Option<(String, Vec<u64>)>,
     fit_ctx: Option<u64>,
-    draft: Option<u32>,
+    /// `-devd` as given, and its ordinal.
+    draft: Option<(String, u32)>,
 }
+
+/// The word of the host seat (`bloomery-serve --model host`): the one seat the flags that ask for
+/// the host ([`Flags::host_ask`]) place. A card seat refuses the ask by name.
+pub const HOST_SEAT: &str = "host";
 
 /// The seat and file the flags place: the seat's word (`Model::word` of the server), the file's
 /// layer count and the floor of an unset `--ctx`.
@@ -345,10 +353,10 @@ impl Flags {
     }
 
     fn names_cards(&self) -> bool {
-        self.dev.is_some()
-            || self.split == Some(Split::None)
+        self.dev.as_ref().is_some_and(|d| !d.is_empty())
+            || self.split.as_ref().is_some_and(|(_, s)| *s == Split::None)
             || self.shares.is_some()
-            || self.main_gpu.is_some_and(|g| g != 0)
+            || self.main_gpu.as_ref().is_some_and(|(_, g)| *g != 0)
     }
 
     fn set(&mut self, arg: &str, name: &str, v: &str) -> Result<(), GateError> {
@@ -356,7 +364,12 @@ impl Flags {
         if is(DEVICE) {
             once(&mut self.dev, arg, "the device list", devices(arg, v)?)?;
         } else if is(SPLIT) {
-            once(&mut self.split, arg, "the split mode", split_mode(v)?)?;
+            once(
+                &mut self.split,
+                arg,
+                "the split mode",
+                (format!("{arg} {v}"), split_mode(v)?),
+            )?;
         } else if is(TENSOR_SPLIT) {
             once(
                 &mut self.shares,
@@ -368,7 +381,12 @@ impl Flags {
             let g = v
                 .parse()
                 .map_err(|_| format!("{arg} {v:?}: no device index"))?;
-            once(&mut self.main_gpu, arg, "the main device", g)?;
+            once(
+                &mut self.main_gpu,
+                arg,
+                "the main device",
+                (format!("{arg} {v}"), g),
+            )?;
         } else if is(GPU_LAYERS) {
             once(&mut self.ngl, arg, "the layer count", gpu_layers(v)?)?;
         } else if is(N_CPU_MOE) {
@@ -398,13 +416,64 @@ impl Flags {
                 &mut self.draft,
                 arg,
                 "the draft's device",
-                draft_device(arg, v)?,
+                (format!("{arg} {v}"), draft_device(arg, v)?),
             )?;
         }
         if is(DEVICE) || is(SPLIT) || is(TENSOR_SPLIT) || is(MAIN_GPU) {
             self.placing.push(format!("{arg} {v}"));
         }
         Ok(())
+    }
+
+    /// The flags that ask for the host stage — `-dev none` (no device at all) or `-ngl 0` (no
+    /// layer offloaded) — as the one line that names them: every layer, the head and the embedding
+    /// plan on the host with no card in the plan, and the one-binary server seats the file on its
+    /// host seat. `None` when no flag asks.
+    #[must_use]
+    pub fn host_ask(&self) -> Option<String> {
+        let mut asked: Vec<&str> = Vec::new();
+        if self.dev.as_ref().is_some_and(|d| d.is_empty()) {
+            asked.push("-dev none");
+        }
+        if self.ngl == Some(Ngl::Layers(0)) {
+            asked.push("-ngl 0");
+        }
+        (!asked.is_empty()).then(|| asked.join(" "))
+    }
+
+    /// Every flag that names a card, a card's bytes or the routed experts' place beside the host
+    /// ask `ask` is refused by name: the host stage's plan holds no card to place, and every
+    /// routed expert sits on it already.
+    fn refuse_beside_host(&self, ask: &str) -> Result<(), GateError> {
+        let mut named: Vec<&str> = Vec::new();
+        if let Some((flag, _)) = &self.split {
+            named.push(flag);
+        }
+        if let Some((flag, _)) = &self.shares {
+            named.push(flag);
+        }
+        if let Some((flag, _)) = &self.main_gpu {
+            named.push(flag);
+        }
+        if let Some((flag, _)) = &self.draft {
+            named.push(flag);
+        }
+        if let Some((flag, _)) = &self.fit_target {
+            named.push(flag);
+        }
+        if let Some((flag, _)) = &self.moe {
+            named.push(flag);
+        }
+        if named.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "{ask} asks for the host, and {} beside it names a card, a card's bytes or the \
+             routed experts' place: the host stage runs every layer with no card in the plan and \
+             every routed expert on it",
+            named.join(", ")
+        )
+        .into())
     }
 
     /// The expert flag `flag` asked for `rule`; one flag names the experts' place.
@@ -438,6 +507,17 @@ impl Flags {
                 t.ctx_floor
             )
             .into());
+        }
+        if let Some(ask) = self.host_ask() {
+            if t.seat != HOST_SEAT {
+                return Err(format!(
+                    "{ask}: the flags ask for the host stage, which is the host seat's (`bloomery-serve \
+                     --model host`); the {} seat runs on a card",
+                    t.seat
+                )
+                .into());
+            }
+            self.refuse_beside_host(&ask)?;
         }
         if let Some(Ngl::Layers(n)) = self.ngl {
             full_offload(n, t.layers)?;
@@ -477,9 +557,10 @@ impl Flags {
     /// `-devd`: the card the DSpark draft opens on, where the seat has a draft that opens on a named
     /// card.
     fn draft_lever(&self, t: &Target<'_>, out: &mut Levers) -> Result<(), GateError> {
-        let Some(ordinal) = self.draft else {
+        let Some((_, ordinal)) = &self.draft else {
             return Ok(());
         };
+        let ordinal = *ordinal;
         if !names_draft_card(t.seat) {
             return Err(format!(
                 "-devd CUDA{ordinal}: this seat's draft opens on no card a flag names"
@@ -501,7 +582,7 @@ impl Flags {
     /// `-sm layer` those with a share under `-ts`. The largest runs every layer and the rest hold
     /// experts, in size order.
     pub fn place(&self, census: &[DeviceInfo]) -> Result<Option<Cards>, GateError> {
-        if let Some(o) = self.draft {
+        if let Some((_, o)) = self.draft {
             device(census, o, "-devd")?;
         }
         let Some((chosen, split)) = self.chosen(census)? else {
@@ -660,7 +741,7 @@ impl Flags {
             return Ok(None);
         }
         let listed = self.listed(census)?;
-        let split = self.split.unwrap_or(Split::Layer);
+        let split = self.split.as_ref().map_or(Split::Layer, |&(_, s)| s);
         let chosen = match split {
             Split::None => vec![self.main_card(&listed)?],
             Split::Layer => self.shared(&listed)?,
@@ -685,7 +766,7 @@ impl Flags {
 
     /// `-sm none`: the listed device `-mg` indexes (the first by default).
     fn main_card<'a>(&self, listed: &[&'a DeviceInfo]) -> Result<&'a DeviceInfo, GateError> {
-        let at = self.main_gpu.unwrap_or(0);
+        let at = self.main_gpu.as_ref().map_or(0, |&(_, g)| g);
         usize::try_from(at)
             .ok()
             .and_then(|i| listed.get(i).copied())
@@ -705,7 +786,7 @@ impl Flags {
 
     /// `-sm layer`: the listed devices with a share under `-ts`, all of them without it.
     fn shared<'a>(&self, listed: &[&'a DeviceInfo]) -> Result<Vec<&'a DeviceInfo>, GateError> {
-        if let Some(g) = self.main_gpu
+        if let Some(&(_, g)) = self.main_gpu.as_ref()
             && g != 0
         {
             return Err(format!(
@@ -864,11 +945,12 @@ fn ranked(census: &[DeviceInfo]) -> Result<Vec<u32>, GateError> {
         .collect())
 }
 
-/// `-dev`'s value: `CUDA<N>` names, each once. `none` (no device at all) is refused: no seat runs
-/// on the CPU alone.
+/// `-dev`'s value: `CUDA<N>` names, each once; `none` (no device at all, the empty list) asks for
+/// the host stage ([`Flags::host_ask`]), and a name beside it in one list is refused as no CUDA
+/// device.
 fn devices(flag: &str, v: &str) -> Result<Vec<u32>, GateError> {
     if v == "none" {
-        return Err(format!("{flag} none: no seat runs on the CPU alone").into());
+        return Ok(Vec::new());
     }
     let mut out: Vec<u32> = Vec::new();
     for name in v.split(',') {
@@ -941,9 +1023,12 @@ fn gpu_layers(v: &str) -> Result<Ngl, GateError> {
 }
 
 /// `-ngl N` is a full offload: llama-server counts the output layer as one more, so every layer
-/// and the output are `N >= layers + 1`. A smaller count leaves a layer on the CPU, which no seat
-/// does.
+/// and the output are `N >= layers + 1`. `0` asks for the host stage ([`Flags::host_ask`]). Any
+/// other count that leaves a layer on the CPU, which no seat does, is refused.
 fn full_offload(n: u64, layers: Option<u64>) -> Result<(), GateError> {
+    if n == 0 {
+        return Ok(());
+    }
     let layers =
         layers.ok_or("-ngl N is compared with the file's block_count, and the file states none")?;
     if n > layers {
@@ -1207,12 +1292,18 @@ mod tests {
     fn each_llama_variable_is_its_flags_value() {
         let one = |var: &str, value: &str| env_flags("", &[(var, value)]).0;
         assert_eq!(one("LLAMA_ARG_DEVICE", "CUDA1,CUDA0").dev, Some(vec![1, 0]));
-        assert_eq!(one("LLAMA_ARG_SPLIT_MODE", "none").split, Some(Split::None));
+        assert_eq!(
+            one("LLAMA_ARG_SPLIT_MODE", "none").split,
+            Some(("LLAMA_ARG_SPLIT_MODE none".to_owned(), Split::None))
+        );
         assert_eq!(
             one("LLAMA_ARG_TENSOR_SPLIT", "3/1").shares,
             Some(("LLAMA_ARG_TENSOR_SPLIT 3/1".to_owned(), vec![3.0, 1.0]))
         );
-        assert_eq!(one("LLAMA_ARG_MAIN_GPU", "1").main_gpu, Some(1));
+        assert_eq!(
+            one("LLAMA_ARG_MAIN_GPU", "1").main_gpu,
+            Some(("LLAMA_ARG_MAIN_GPU 1".to_owned(), 1))
+        );
         assert_eq!(
             one("LLAMA_ARG_N_GPU_LAYERS", "99").ngl,
             Some(Ngl::Layers(99))
@@ -1282,7 +1373,7 @@ mod tests {
                 "tensor",
                 "--place tp over BLOOMERY_TP_NODES",
             ),
-            ("LLAMA_ARG_DEVICE", "none", "no seat runs on the CPU alone"),
+            ("LLAMA_ARG_DEVICE", "none,CUDA0", "is no CUDA device"),
             ("LLAMA_ARG_DEVICE", "", "is no CUDA device"),
             ("LLAMA_ARG_N_GPU_LAYERS", "many", "a count, auto or all"),
             ("LLAMA_ARG_TENSOR_SPLIT", "1,x", "is no share"),
@@ -1424,15 +1515,16 @@ mod tests {
         assert_eq!(rest, args);
     }
 
-    /// `-dev` names CUDA devices once each: `none`, another backend's name, a repeat and a device
-    /// the census lacks are refused by name.
+    /// `-dev` names CUDA devices once each: another backend's name, a repeat and a device the
+    /// census lacks are refused by name; `none` names no device and asks for the host.
     #[test]
     fn dev_names_cuda_devices_only() {
-        assert!(refused("-dev none").contains("no seat runs on the CPU alone"));
         assert!(refused("-dev Vulkan0").contains("\"Vulkan0\" is no CUDA device"));
         assert!(refused("-dev CUDA").contains("is no CUDA device"));
         assert!(refused("-dev CUDA+1").contains("is no CUDA device"));
         assert!(refused("-dev CUDA0,CUDA0").contains("CUDA0 twice"));
+        assert!(refused("-dev none,CUDA0").contains("\"none\" is no CUDA device"));
+        assert_eq!(flags("-dev none").host_ask().as_deref(), Some("-dev none"));
         let e = placed_err("-dev CUDA2", &two());
         assert!(
             e.starts_with("-dev CUDA2: no such device (visible: cuda0 NVIDIA RTX A6000"),
@@ -1558,15 +1650,16 @@ mod tests {
         assert!(refused("-sm tensor").contains("--place tp over BLOOMERY_TP_NODES"));
     }
 
-    /// `-ngl` is a full offload: `all`, `auto`, a negative count and a count past the layers and the
-    /// output layer pass; a count that leaves a layer on the CPU (one short, none) is refused with
-    /// the count that passes, and so is a count with no layer count to compare.
+    /// `-ngl` is a full offload: `all`, `auto`, a negative count and a count past the layers and
+    /// the output layer pass; a count that leaves a layer on the CPU (one short) is refused with
+    /// the count that passes, and so is a count with no layer count to compare. `0` is no
+    /// offload: the host seat takes it as its ask, a card seat refuses it.
     #[test]
     fn ngl_is_a_full_offload_only() {
         for ok in ["all", "auto", "-1", "-2", "62", "99"] {
             assert!(levers(&format!("-ngl {ok}"), "ds41").is_ok(), "-ngl {ok}");
         }
-        for short in ["61", "0", "30"] {
+        for short in ["61", "30"] {
             let e = levers(&format!("-ngl {short}"), "ds41").expect_err(short);
             assert!(
                 e.contains("use -ngl all, auto, or 62 and more"),
@@ -1583,6 +1676,74 @@ mod tests {
             .to_string();
         assert!(e.contains("file's block_count"), "{e}");
         assert!(flags("-ngl all").levers(&blind).is_ok());
+        let host = Target {
+            layers: None,
+            ..target(HOST_SEAT)
+        };
+        assert!(flags("-ngl 0").levers(&host).is_ok());
+        let e = levers("-ngl 0", "ds41").expect_err("a card seat");
+        assert!(e.contains("the flags ask for the host stage"), "{e}");
+    }
+
+    /// `-dev none` and `-ngl 0` ask for the host stage and every flag that names a card, a card's
+    /// bytes or the routed experts' place beside the ask is refused by name; the ask resolves to
+    /// no `--place` word and no census read, with one line that says what it planned.
+    #[test]
+    fn dev_none_and_ngl_zero_ask_for_the_host() {
+        assert_eq!(flags("").host_ask(), None);
+        assert_eq!(flags("-dev none").host_ask().as_deref(), Some("-dev none"));
+        assert_eq!(flags("-ngl 0").host_ask().as_deref(), Some("-ngl 0"));
+        assert_eq!(
+            flags("--device none -ngl 0").host_ask().as_deref(),
+            Some("-dev none -ngl 0")
+        );
+        let (f, _) = env_flags("", &[("LLAMA_ARG_N_GPU_LAYERS", "0")]);
+        assert_eq!(f.host_ask().as_deref(), Some("-ngl 0"));
+        let resolved_on = |seat: &str, line: &str| {
+            crate::llama_launch::resolve(&flags(line), &target(seat), || {
+                Err::<Vec<DeviceInfo>, GateError>("the census is read for nothing".into())
+            })
+        };
+        let resolved = |line: &str| resolved_on(HOST_SEAT, line);
+        for line in ["-dev none", "-ngl 0", "-dev none -ngl 0"] {
+            let r = resolved(line).expect(line);
+            assert_eq!((&r.word, &r.set), (&None, &Vec::new()), "{line}: {r:?}");
+            assert!(
+                r.notes[0].contains("no card in the plan"),
+                "{line}: {:?}",
+                r.notes
+            );
+            assert!(flags(line).place(&two()).expect(line).is_none());
+        }
+        for (line, why) in [
+            ("-dev none -sm layer", "-sm layer"),
+            ("-ngl 0 -ts 1,1", "-ts 1,1"),
+            ("-dev none -mg 0", "-mg 0"),
+            ("-dev none -devd CUDA1", "-devd CUDA1"),
+            ("-ngl 0 -fitt 512", "-fitt 512"),
+            ("-dev none --cpu-moe", "--cpu-moe"),
+        ] {
+            let e = resolved(line).expect_err(line).to_string();
+            assert!(
+                e.contains(why) && e.contains("asks for the host"),
+                "{line}: {e}"
+            );
+        }
+        assert!(resolved("-dev none -fitc 4096").is_ok());
+        // A card seat does not take the ask: it runs on a card, and the host seat is asked for by
+        // name.
+        for line in ["-dev none", "-ngl 0"] {
+            let e = resolved_on("ds41", line).expect_err(line).to_string();
+            assert!(
+                e.contains("the flags ask for the host stage") && e.contains("--model host"),
+                "{line}: {e}"
+            );
+        }
+        // `-ngl N` past zero keeps its named refusal beside the ask.
+        let e = resolved("-dev none -ngl 30")
+            .expect_err("-ngl 30")
+            .to_string();
+        assert!(e.contains("use -ngl all, auto, or 62 and more"), "{e}");
     }
 
     /// `--cpu-moe` and what equals it set the qwen38 lever and name it; every other seat is refused
@@ -1860,7 +2021,7 @@ mod tests {
             "{e}"
         );
         assert!(refused("-devd CUDA0,CUDA1").contains("the draft opens on one card"));
-        assert!(refused("-devd none").contains("no seat runs on the CPU alone"));
+        assert!(refused("-devd none").contains("the draft opens on one card"));
         assert!(placed_err("-devd CUDA5", &two()).starts_with("-devd CUDA5: no such device"));
         assert_eq!(word("-devd CUDA1", &two()), None);
     }

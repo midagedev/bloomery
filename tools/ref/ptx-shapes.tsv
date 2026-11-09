@@ -70,6 +70,8 @@ generate_ds41   ds41_expert_gate_up                      0           0
 generate_ds41   ds41_expert_gate_up_tiles                0           0
 generate_ds41   ds41_ffn_card_acc                        0           0
 generate_ds41   ds41_ffn_card_acc_10                     0           0
+generate_ds41   ds41_ffn_card_acc_16                     0           0
+generate_ds41   ds41_ffn_card_acc_2                      0           0
 generate_ds41   ds41_ffn_card_acc_4                      0           0
 generate_ds41   ds41_ffn_card_acc_4_tier                 0           0
 generate_ds41   ds41_ffn_card_acc_8                      0           0
@@ -107,6 +109,9 @@ generate_ds41   ds41_glue_embed_q5k                      0           0
 generate_ds41   ds41_glue_engram_rows                    0           0
 generate_ds41   ds41_glue_engram_rows_q3k                0           0
 generate_ds41   ds41_glue_engram_rows_iq4nl              0           0
+# PIN(2026-11-03): ds41_glue_engram_rows_mxfp8, a new entry, at ds41_glue_engram_rows_iq4nl's 0 spill and 0 JIT local bytes [derived: the same body with a byte decode in place of the nibble one], not measured at this arch until a scan runs.
+generate_ds41   ds41_glue_engram_rows_mxfp8              0           0
+generate_ds41   ds41_glue_engram_rows_q6k                0           0
 generate_ds41   ds41_groups_to_tokens                    0           0
 generate_ds41   ds41_hc_fold                             0           0
 generate_ds41   ds41_hc_mean                             0           0
@@ -385,6 +390,8 @@ generate_ds41   head_norm_neox_append_256_whole          0           0
 generate_ds41   head_norm_neox_append_512                0           0
 generate_ds41   head_norm_neox_append_q8                 0           0
 generate_ds41   head_norm_neox_append_rows               0           0
+generate_ds41   imat_dense_sum2                          0           0
+generate_ds41   imat_routed_sum2                         0           0
 generate_ds41   index_key_ln_append                      0           0
 generate_ds41   index_pool                               0           0
 generate_ds41   iq1_m_gate_up_sel                        0           0
@@ -414,6 +421,7 @@ generate_ds41   kda_conv_prep_sp2                       16           8
 generate_ds41   kda_delta                                0           0
 generate_ds41   kda_delta_lanes                          0           0
 generate_ds41   kda_write_gate                           0           0
+generate_ds41   ffn_handoff_n_tier                       0           0
 generate_ds41   kpool_score                              0           0
 generate_ds41   kq_card_gather                           0           0
 generate_ds41   kq_gate_up_act_q4k                       0           0
@@ -453,7 +461,7 @@ generate_ds41   mxfp8_gemv                               0           0
 # is the contributor's own sm_86 reading (sm_86-cc12.1.tsv).
 # PIN(2026-10-26): 28 -> 60 spill bytes and 16 -> 24 JIT local bytes (sm_86 ptxas 13.3.73, cc 8.6 JIT of gate-ptx-spill's run). The
 # entry sits at the 64-register cap of four blocks of 256 an SM; cuda-oxide moved from the fork's rev to NVIDIA/cuda-rust 9df9e7cef561 (stable 1.99.1), and the PTX of 1507 of 1585 scanned entries moved with it (just canon-check; 1483 of them by `ld.global.nc` loads and the placement they allow).
-generate_ds41   mxfp8_gemv_ids                          60          24
+generate_ds41   mxfp8_gemv_ids                          16           8
 generate_ds41   mxfp8_gemv_mcol                          0           0
 # PIN(2026-10-27): mxfp8_gemv_mcol_staged, a new entry, at the sm_121a GB10 scan's 0 spill and 0 JIT local bytes.
 generate_ds41   mxfp8_gemv_mcol_staged                   0           0
@@ -618,6 +626,10 @@ generate_ds41   sigmoid_256_6_router                     0           0
 generate_ds41   sigmoid_256_6_router_pick                0           0
 generate_ds41   sigmoid_320_8_router                     0           0
 generate_ds41   sigmoid_320_8_router_pick                0           0
+generate_ds41   sigmoid_896_16_router                    0           0
+generate_ds41   sigmoid_896_16_router_pick               0           0
+generate_ds41   sigmoid_8_2_router                       0           0
+generate_ds41   sigmoid_8_2_router_pick                  0           0
 generate_ds41   sigmoid_rows                         0           0
 generate_ds41   situ_rows                                0           0
 generate_ds41   softplus_rows                        0           0
@@ -628,6 +640,7 @@ generate_ds41   swiglu_quant32_sel                       0           0
 generate_ds41   tier_fault_copy                          0           0
 generate_ds41   touch                                    0           0
 generate_ds41   weighted_sum                             0           0
+generate_ds41   word_add                                 0           0
 generate_ds41	mul_rows	0	0
 generate_ds41	mix_rows	0	0
 generate_ds41	scale_rows	0	0
@@ -694,3 +707,11 @@ gate_qwen3vl_tower   vis_silu_mul_clamp                 0           0
 gate_qwen3vl_tower   vis_unfold                         0           0
 
 # PIN(2026-10-17): mamba2_conv_rows measured spill=0 jit_local=0 by gate-ptx-spill s-job of the same tree: a flat one-thread-one-item pre-pass, no arrays held across calls.
+# PIN(2026-11-04): mxfp8_gemv_ids in generate_ds41 down to spill 16, jit_local 8 on sm_86 (#1154, 6490d03f3: the
+# MXFP8 planes take ceil(K/128) scale words; the gate read both columns below their pins).
+
+generate_ds41   attn_res_mix                             0           0
+# PIN(2026-11-07): the IQ1_S/IQ2_XXS card quantizer (crates/gpu/src/iq_quant.rs): iq_quant_finish keeps its per-thread scratch arrays (280 B of JIT local) and iq_quant_subs, which calls a device function, keeps the sub-block search's arrays (1096 B); ptxas spills nothing. Measured: ptxas 13.3.73, sm_86, JIT on the RTX A6000 cc 8.6, CUDA 13.4.
+generate_ds41   iq_quant_finish                          0           280
+generate_ds41   iq_quant_subs                            0           1096
+generate_ds41   iq_src_f32                               0           0

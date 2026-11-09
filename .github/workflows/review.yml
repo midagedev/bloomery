@@ -6,20 +6,22 @@
 # pull_request_target, so a fork's pull request gets the API key, and the trust rules that follow from it:
 # - This file, the instructions and tools/review/ come from the base branch. A pull request cannot change what
 #   reviews it.
-# - The PR head is checked out as data. The diagnostics parse it, and Claude reads it with Read/Grep/Glob only (no
-#   Bash, no web). Codex reads it with shell commands, and the PR's text can steer which commands the model runs,
+# - The PR head is checked out as data. The diagnostics parse it, and Claude (the claude and glm engines) reads it with
+#   Read/Grep/Glob only (no Bash, no web). Codex reads it with shell commands, and the PR's text can steer which commands the model runs,
 #   scripts from the PR included. Those commands run in a sandbox (tools/review/run-codex.sh): they read the trees,
 #   CTX, the Codex install and system paths such as /usr and /etc, write only OUT, and have no network. Before each
 #   run a sandbox check tries a read beside the login, a write into the PR tree and a connection; if one works, Codex
 #   does not run.
-# - The engine: REVIEW_ENGINE (a repository variable; claude when unset) is tried first and the other engine is the
-#   fallback, each only when its login is there (tools/review/run.py). With no engine able to review, the run ends
-#   without a review and says why in the summary.
+# - The engines: REVIEW_ENGINE (a repository variable; glm,claude,codex when unset) is an ordered, comma-separated list.
+#   The engines it names are tried in that order, the ones it leaves out after them in the order glm, claude, codex, each
+#   only when its login is there (tools/review/run.py). glm is Claude Code on GLM through z.ai's Anthropic-compatible
+#   endpoint (the secret ZAI_API_KEY), claude is Claude Code on ANTHROPIC_API_KEY, codex is Codex on its stored login.
+#   With no engine able to review, the run ends without a review and says why in the summary.
 # - A rebase does not make a new review of the same patches (tools/review/carry.py): when the new head's commits are the
 #   patches the bot approved, the approval carries and no model runs (mode=carry); when some changed, the reviewer reads
 #   only those (mode=interdiff). The reviewer's own tree ids and the ledger version in the earlier review's marker must
 #   equal today's, and only an approval carries. A replacement pull request names the one it replaces ("Supersedes #N").
-# - The logins and the write token never share a job: `review` holds ANTHROPIC_API_KEY and the Codex login
+# - The logins and the write token never share a job: `review` holds ZAI_API_KEY, ANTHROPIC_API_KEY and the Codex login
 #   (CODEX_AUTH_JSON, written to a file outside the trees) with a read-only token, `post` holds pull-requests and
 #   issues write and no login. post.py refuses to post output that carries a login or a token-shaped string, and
 #   files at most two issues a run.
@@ -44,9 +46,10 @@ concurrency:
 env:
   CLAUDE_CODE_VERSION: 2.1.284
   REVIEW_MODEL: claude-sonnet-5-5
+  REVIEW_MODEL_GLM: glm-5.3
   CODEX_VERSION: 0.160.0
   REVIEW_CODEX_MODEL: gpt-6.1-sol
-  REVIEW_ENGINE: ${{ vars.REVIEW_ENGINE || 'claude' }}
+  REVIEW_ENGINE: ${{ vars.REVIEW_ENGINE || 'glm,claude,codex' }}
   # The automatic reviews a pull request gets before it needs a workflow_dispatch run (a carry is not one: no model ran).
   REVIEW_CAP: 5
 
@@ -189,8 +192,9 @@ jobs:
     needs: [gate, diagnostics]
     if: always() && needs.gate.outputs.run == 'true'
     runs-on: ubuntu-latest
-    # Each role may run on both engines: reviewer 20 + 20 minutes, validator 10 + 10 (tools/review/run.py MINUTES).
-    timeout-minutes: 75
+    # Each role may run on all three engines: reviewer 3 x 20 minutes, validator 3 x 10 (tools/review/run.py MINUTES),
+    # and 15 for the context and the installs.
+    timeout-minutes: 105
     permissions:
       contents: read
       pull-requests: read
@@ -294,18 +298,24 @@ jobs:
             echo "The diagnostics job did not finish; no dryer or crapper results for this review." > ctx/diagnostics.md; fi
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
           echo "context: mode=$mode diff=$(wc -l < ctx/diff.patch) lines files=$(wc -l < ctx/files.txt)" | tee -a "$GITHUB_STEP_SUMMARY"
-      # The logins: each secret is read in this step only. The Codex login becomes CODEX_HOME/auth.json, outside the
-      # trees and OUT, and every long string in it is masked in the log; the cleanup step below deletes it.
+      # The logins: each secret is read in this step to say which engines have one (the steps that run an engine or check
+      # its output read it again, as ANTHROPIC_API_KEY always was). The Codex login becomes CODEX_HOME/auth.json,
+      # outside the trees and OUT, and every long string in it is masked in the log; the cleanup step below deletes it.
       - name: Logins
         id: logins
         if: steps.ctx.outputs.mode != 'carry'
         env:
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON }}
           CODEX_HOME: ${{ runner.temp }}/codex-home
         run: |
           set -euo pipefail
-          claude=false; codex=false
+          glm=false; claude=false; codex=false
+          if [ -n "$ZAI_API_KEY" ]; then
+            echo "::add-mask::$ZAI_API_KEY"
+            glm=true
+          fi
           [ -z "$ANTHROPIC_API_KEY" ] || claude=true
           if [ -n "$CODEX_AUTH_JSON" ]; then
             mkdir -m 700 "$CODEX_HOME"
@@ -315,20 +325,24 @@ jobs:
             done || echo "::warning::CODEX_AUTH_JSON is not JSON"
             codex=true
           fi
-          case "$REVIEW_ENGINE" in
-            claude|codex) ;;
-            *) echo "::warning::REVIEW_ENGINE is '$REVIEW_ENGINE', not claude or codex; claude goes first" ;;
-          esac
-          printf 'claude=%s\ncodex=%s\n' "$claude" "$codex" >> "$GITHUB_OUTPUT"
-          echo "logins: claude=$claude codex=$codex; tried first: $REVIEW_ENGINE" | tee -a "$GITHUB_STEP_SUMMARY"
+          set -f
+          for w in $(printf '%s' "$REVIEW_ENGINE" | tr 'A-Z,' 'a-z '); do
+            case "$w" in
+              glm|claude|codex) ;;
+              *) echo "::warning::REVIEW_ENGINE names '$w', which is no engine (glm, claude, codex); it is skipped" ;;
+            esac
+          done
+          set +f
+          printf 'glm=%s\nclaude=%s\ncodex=%s\n' "$glm" "$claude" "$codex" >> "$GITHUB_OUTPUT"
+          echo "logins: glm=$glm claude=$claude codex=$codex; order: $REVIEW_ENGINE (engines it leaves out follow as glm, claude, codex)" | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/cache@v4
         if: steps.ctx.outputs.mode != 'carry'
         with:
           path: ~/.npm
           key: npm-claude-code-${{ env.CLAUDE_CODE_VERSION }}-codex-${{ env.CODEX_VERSION }}
-      # A failed install leaves that engine out (run.py finds no CLI) and the other one still runs.
+      # A failed install leaves that engine out (run.py finds no CLI) and the others still run. glm runs the claude CLI.
       - name: Install Claude Code
-        if: steps.logins.outputs.claude == 'true'
+        if: steps.logins.outputs.claude == 'true' || steps.logins.outputs.glm == 'true'
         continue-on-error: true
         run: npm install -g "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
       # The Codex sandbox is bubblewrap, which needs unprivileged user namespaces; Ubuntu's AppArmor gate denies them.
@@ -351,6 +365,7 @@ jobs:
         id: review
         if: steps.ctx.outputs.mode != 'carry'
         env:
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1'
           CODEX_HOME: ${{ runner.temp }}/codex-home
@@ -369,6 +384,7 @@ jobs:
         id: validate
         if: steps.review.outputs.done == 'true'
         env:
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1'
           CODEX_HOME: ${{ runner.temp }}/codex-home
@@ -387,12 +403,13 @@ jobs:
         id: check
         if: steps.validate.outputs.done == 'true' || steps.ctx.outputs.mode == 'carry'
         env:
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CODEX_HOME: ${{ runner.temp }}/codex-home
         run: |
           python3 base/tools/review/post.py check --out out --diff ctx/diff.patch --pr-json ctx/pr.json --files ctx/files.txt \
             --device ctx/device-dirs.txt \
-            --base "$PWD/base" --secret-env ANTHROPIC_API_KEY --secret-file "$CODEX_HOME/auth.json" \
+            --base "$PWD/base" --secret-env ZAI_API_KEY --secret-env ANTHROPIC_API_KEY --secret-file "$CODEX_HOME/auth.json" \
             --usage trace/reviewer.usage.json --usage trace/validator.usage.json
       - name: Delete the Codex login
         if: always()

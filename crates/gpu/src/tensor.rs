@@ -718,6 +718,25 @@ impl<T: DeviceCopy> DeviceTensor<T> {
         })
     }
 
+    /// A `rows × cols` tensor that owns `buf`, which holds exactly that many
+    /// elements: refused by name otherwise.
+    pub(crate) fn from_buf(
+        buf: DeviceBuffer<T>,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self, GpuError> {
+        if rows.checked_mul(cols) != Some(buf.len()) {
+            let detail = format!("a buffer of {} elements for {rows} × {cols}", buf.len());
+            return Err(GpuError::shape("DeviceTensor::from_buf", detail));
+        }
+        Ok(DeviceTensor { buf, rows, cols })
+    }
+
+    /// The tensor's buffer, the tensor gone.
+    pub(crate) fn into_buf(self) -> DeviceBuffer<T> {
+        self.buf
+    }
+
     /// Row count.
     pub fn rows(&self) -> usize {
         self.rows
@@ -858,6 +877,24 @@ impl Q8Act {
         Q8Act::alloc("Q8Act::with_tier_cols", stream, cols, k)
     }
 
+    /// The super-blocks of a column of `k` values, `k` checked as `what`.
+    fn super_blocks(what: &'static str, k: usize) -> Result<usize, GpuError> {
+        if !k.is_multiple_of(256) || !(256..=Q8ACT_MAX_K).contains(&k) {
+            return Err(GpuError::shape(
+                what,
+                format!("k must be a multiple of 256 in 256..={Q8ACT_MAX_K}, got {k}"),
+            ));
+        }
+        Ok(k / 256)
+    }
+
+    /// A column's q3 plane words and scales of `k` values, as the planes
+    /// hold them column after column ([`Q8Act::q3`], [`Q8Act::d8`]).
+    pub(crate) fn q3_d8_words(k: usize) -> Result<(usize, usize), GpuError> {
+        let n_sb = Q8Act::super_blocks("Q8Act::q3_d8_words", k)?;
+        Ok((64 * n_sb.div_ceil(2), 2 * n_sb))
+    }
+
     /// The planes for `m` columns of `k` values, `k` checked here.
     fn alloc(
         what: &'static str,
@@ -865,13 +902,7 @@ impl Q8Act {
         m: usize,
         k: usize,
     ) -> Result<Self, GpuError> {
-        if !k.is_multiple_of(256) || !(256..=Q8ACT_MAX_K).contains(&k) {
-            return Err(GpuError::shape(
-                what,
-                format!("k must be a multiple of 256 in 256..={Q8ACT_MAX_K}, got {k}"),
-            ));
-        }
-        let n_sb = k / 256;
+        let n_sb = Q8Act::super_blocks(what, k)?;
         Ok(Q8Act {
             q3: DeviceBuffer::zeroed(stream, m * 64 * n_sb.div_ceil(2))?,
             q4: DeviceBuffer::zeroed(stream, m * 256 * n_sb.div_ceil(4))?,
@@ -921,6 +952,12 @@ impl Q8Act {
     #[must_use]
     pub fn d8(&self) -> &DeviceBuffer<f32> {
         &self.d8
+    }
+
+    /// [`Q8Act::q3`] and [`Q8Act::d8`] to write: a tier node lands a
+    /// block's planes, the stage card's bytes, there.
+    pub(crate) fn q3_d8_mut(&mut self) -> (&mut DeviceBuffer<u64>, &mut DeviceBuffer<f32>) {
+        (&mut self.q3, &mut self.d8)
     }
 }
 

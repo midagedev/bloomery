@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use gguf::write::{Layout, TensorDecl, Writer};
 use gguf::{GENERAL_ARCHITECTURE, GgmlType, Split, Value};
 
-use super::{Row, Scope, check, custom_q, expand, override_kv, parse_table, record_budget, row};
+use super::super::rebudget::record as record_budget;
+use super::{Row, Scope, check, custom_q, expand, override_kv, parse_table, row};
 use crate::fixture::{Budget, CardBudget, CardExperts, FixtureError, KEY_CARD_BUDGET, KEY_VARIANT};
 
 const TABLE_ROW: &str = "v1\tfam\ttrunk\tffn_gate_exps=iq3_s ffn_up_exps=iq3_s ffn_down_exps=iq4_xs\tgate-a gate-b\ta reason";
@@ -756,7 +757,7 @@ fn record_budget_rewrites_only_the_value() {
     // offset moves a byte the window does not hold.
     const TO: u64 = 0x0100_0000_0000_0008;
     let var = open(&first);
-    let was = record_budget("v1", &var, TO).expect("the trunk's budget");
+    let was = record_budget(&var, TO).expect("the trunk's budget");
     assert_eq!(was, TRUNK_BUDGET, "the quantizer copied the trunk's");
     drop(var);
     for (i, before) in before.iter().enumerate() {
@@ -782,7 +783,7 @@ fn record_budget_rewrites_only_the_value() {
     set(&mut kvs, KEY_CARD_BUDGET, Value::String("sixteen".into()));
     let strung = write(&d.0, "u", &kvs, &variant_tensors(&tensors), 1);
     red(
-        record_budget("v1", &open(&strung), TO),
+        record_budget(&open(&strung), TO),
         &[KEY_CARD_BUDGET, "not a u64"],
     );
     assert_eq!(

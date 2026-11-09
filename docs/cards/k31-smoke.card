@@ -1,0 +1,22 @@
+# k31quant. The chain's smoke on the K3 fixture (152 MB, K3's vocabulary and shapes): a stand-in with MXFP4 experts, strip, imatrix 2
+# chunks at ctx 512, quantize on ONE thread with the tight type map (the first sitting, 2026-11-06 01:26Z, used the K3 UD map and measured
+# 5.36 Mweights/s/thread; this one repeats the one term under the tight map), splice with --arch kimi-k31 and the model card. The one term derivation cannot fix is
+# the quantizer's rate: mainline's IQ1_S quantizer on MXFP4 source rows. [The first sitting's derived band was 1..4 and its measurement
+# 5.36, 4.72 Mweights (9 expert tensors of 256 x 256 x 8) in 881 ms; the experts' type and path are the same under the tight map, only the
+# trunk's types differ and it is 0.03 GB here, so the repeat predicts the same rate within the 1-thread scatter, 4.5..6.5.]
+kind: calibration
+question: what rate does llama-quantize (mainline 78feec062, IQ1_S and IQ2_XXS targets with an imatrix, MXFP4 source) reach on one thread?
+term: Mweights/s on one thread, the fixture's 9 routed-expert tensors (4.72 Mweights) requantized from MXFP4, the 'quantize time' line of
+  llama-quantize with --keep-split over a 3-shard set; the line includes the read and write of 152 MB, so the figure is a lower bound
+unit: Mweights/s/thread
+predict: 4.5..6.5
+condition: the smoke runs under one CPU lease from `k31-quant.sh smoke --lease` (lease_take with this card; without --lease it takes none and
+  measures nothing), CUDA hidden, quantize on one thread (nthreads 1), the box otherwise idle by the lease's own wait; the smoke's walls are
+  the smoke's, not claims
+reason: confirms QUANT_RATE_MW (5.4 in tools/ref/k31-quant.sh, the quantize card's 13.96 ks) under the tight map, and proves each flag of the
+  chain (strip, imatrix at a short ctx, quantize with --tensor-type-file, --keep-split and the tight map, splice with --arch, --link, the
+  model card and the LICENSE) on real llama.cpp output before the 1.56 TB run
+decide-in: keep QUANT_RATE_MW 5.4 and the quantize card's derived 3.9 h for the 1.56 TB run; the lead queues the real chain
+decide-below: below 4.5 Mweights/s/thread set QUANT_RATE_MW to the measured rate in tools/ref/k31-quant.sh and move the quantize card's band
+  down by the same ratio (the 40-thread scaling term is unmeasured either way)
+decide-above: above 6.5 Mweights/s/thread set QUANT_RATE_MW to the measured rate and shorten the quantize card's wall by the same ratio

@@ -61,7 +61,7 @@ fn the_family_refuses_a_set_of_another_file() -> Result<(), RefError> {
     let set = dir.display().to_string();
     for other in [
         "/models/MiMo-V2.6-Flash-RL/MiMo-V2.6-Flash-RL-MXFP4-00001-of-00002.gguf",
-        "/models/MiMo-V2.6-Flash-MOPD/mtp-MiMo-V2.6-Flash-MOPD-Q8_0.gguf",
+        "/data/moved/models/MiMo-V2.6-Flash-MOPD/mtp-MiMo-V2.6-Flash-MOPD-Q8_0.gguf",
         "/models/elsewhere/MiMo-V2.6-Flash-MOPD-MXFP4-00001-of-00002.gguf",
     ] {
         match check(&dir, other, IK_BUILD, ARCH, true) {

@@ -17,6 +17,8 @@ pub use gguf::card::{
 };
 use models::Role;
 
+use crate::placement::{ModelTensor, PlacementError};
+
 pub mod attention;
 pub mod ffn;
 
@@ -120,11 +122,44 @@ pub fn host_stack(ty: GgmlType, k: usize) -> Result<(), qdot::QdotError> {
 }
 
 /// The widest K of a q8_1 activation column ([`DownAct::Q8Act`], [`SiteAct::Q8x128`]): the widest
-/// K-quant input of the models this engine runs, a dense FFN down of 24,576 values (Mistral Large
-/// 4's lead layer); DeepSeek-V4.1's `hc_{attn,ffn}_fn`, which read all four residual streams, take
-/// 4 × 5120. The one owner: the card's `Q8Act` refuses a width past it at load, and a header
-/// check reads the same number.
-pub const Q8_ACT_MAX_K: usize = 24_576;
+/// K-quant input of the models this engine runs, a dense FFN down of 33,792 values (Kimi K3's
+/// lead layer, a Q6_K site); Mistral Large 4's lead layer takes 24,576, and DeepSeek-V4.1's
+/// `hc_{attn,ffn}_fn`, which read all four residual streams, 4 × 5120. The one owner: the card's
+/// `Q8Act` refuses a width past it at load, [`check_q8_act_width`] refuses it at the plan, and a
+/// header check reads the same number.
+pub const Q8_ACT_MAX_K: usize = 33_792;
+
+/// Whether the dense matrix `t` fits the card's q8_1 activation: a site of a dense role
+/// (attention, hyper-connection, shared expert, dense FFN) that reads q8_1 columns
+/// ([`SiteAct::Q8x128`]) contracts `dims[0]` values per row, and a width past [`Q8_ACT_MAX_K`] is
+/// refused by name here, at the plan, where the card's `Q8Act` would refuse it after the load
+/// has read the file.
+///
+/// # Errors
+///
+/// [`PlacementError::Tensor`] naming the tensor, its type and the width.
+pub fn check_q8_act_width(t: &ModelTensor) -> Result<(), PlacementError> {
+    let dense_role = matches!(
+        t.role,
+        Role::Attention | Role::HyperConnection | Role::SharedExpert | Role::DenseFfn
+    );
+    let (true, Some(&k), Some(entry)) =
+        (dense_role && t.dims.len() >= 2, t.dims.first(), dense(t.ty))
+    else {
+        return Ok(());
+    };
+    if entry.reads_at(k) == SiteAct::Q8x128 && k > Q8_ACT_MAX_K as u64 {
+        return Err(PlacementError::tensor(
+            t,
+            format!(
+                "a {} site reads q8_1 columns of {k} values, past the card activation's \
+                 {Q8_ACT_MAX_K} (kernels::Q8_ACT_MAX_K)",
+                t.ty
+            ),
+        ));
+    }
+    Ok(())
+}
 
 /// The card bytes of the q8_1 activation of `cols` columns of `k` values
 /// ([`DownAct::Q8Act`], [`SiteAct::Q8x128`]): the five planes at `n_sb = k / 256`
@@ -449,28 +484,51 @@ pub const fn card_relu2_runs(ty: GgmlType) -> bool {
     card_sel32_runs(ty) || card_planes_runs(ty)
 }
 
+/// The values a [`DownAct::Q8Act`] column holds whole: its super-blocks of 256.
+pub const Q8_ACT_UNIT: u64 = 256;
+
+/// Whether the common card leg runs a routed down stack of type `ty` over the 32-value
+/// [`DownAct::Q8Blocks32`]: the entries of that form ([`down`]), and MXFP4, whose down reads
+/// either form (`mxfp4_gemv_sel` over a `Q8Act` or a `Q8Blocks32`).
+#[must_use]
+pub const fn down_reads_blocks32(ty: GgmlType) -> bool {
+    matches!(
+        down(ty),
+        Some((DownEntry::Mxfp4, _) | (_, DownAct::Q8Blocks32))
+    )
+}
+
+/// The activation form a routed down stack of type `ty` whose rows hold `k` values is read
+/// over: its entry's [`DownAct::Q8Act`] when `k` fills whole [`Q8_ACT_UNIT`]s, else the 32-value
+/// [`DownAct::Q8Blocks32`]. A part of an MXFP4 stack cut to a K off the 256 unit (a
+/// tensor-parallel rank's) so reads the 32-value form ([`down_reads_blocks32`]); a type of
+/// 256-value blocks has no such K, and a type the leg has no 32-value entry for is refused by
+/// the leg by name. Every card leg's buffers and its launch take the form from here.
+#[must_use]
+pub const fn down_act(ty: GgmlType, k: u64) -> DownAct {
+    match down(ty) {
+        Some((_, DownAct::Q8Act)) if k.is_multiple_of(Q8_ACT_UNIT) => DownAct::Q8Act,
+        _ => DownAct::Q8Blocks32,
+    }
+}
+
 /// The K unit a card tensor's layout and kernel keep whole, beyond its format block.
-/// MXFP4 stacks need 256 values and MXFP8 planes 128. Other entries follow their activation:
-/// Q8Act needs 256, Q8Blocks32 needs 32, and f32 has no block. The tensor's role selects the
-/// routed down or dense site entry, so NVFP4 needs 32 for routed down and 256 for a dense site.
-/// A tensor-parallel part keeps this unit whole ([`crate::placement::tp::card_blocks`]).
+/// A routed stack follows the narrowest form its down reads ([`down_act`]): 32 where it reads
+/// the 32-value [`DownAct::Q8Blocks32`] ([`down_reads_blocks32`], MXFP4 among them), else the
+/// [`Q8_ACT_UNIT`]. A dense site follows its activation: Q8x128 needs 256, Q8x32 and Q8Blocks32
+/// need 32, and the f32 rows add nothing to the format's block (MXFP8's planes take any K of
+/// whole 32-value blocks). The tensor's role selects the routed down or dense site entry, so
+/// NVFP4 needs 32 for routed down and 256 for a dense site. A tensor-parallel part keeps this
+/// unit whole ([`crate::placement::tp::card_blocks`]).
 #[must_use]
 pub const fn card_k_unit(ty: GgmlType, role: Role) -> u64 {
-    if matches!(gate_up(ty), Some(GateUpEntry::Mxfp4)) {
-        return 256;
-    }
-    if matches!(dense(ty), Some(SiteEntry::Mxfp8)) {
-        return 128;
-    }
     match role {
-        Role::RoutedExperts => match down(ty) {
-            Some((_, DownAct::Q8Act)) => 256,
-            Some((_, DownAct::Q8Blocks32)) => 32,
-            None => 1,
-        },
+        Role::RoutedExperts if down_reads_blocks32(ty) => 32,
+        Role::RoutedExperts if down(ty).is_some() => Q8_ACT_UNIT,
+        Role::RoutedExperts => 1,
         _ => match dense(ty) {
             Some(entry) => match entry.reads() {
-                SiteAct::Q8x128 => 256,
+                SiteAct::Q8x128 => Q8_ACT_UNIT,
                 SiteAct::Q8x32 | SiteAct::Q8Blocks32 => 32,
                 SiteAct::F32 => 1,
             },
@@ -787,6 +845,46 @@ mod tests {
                 (GgmlType::NVFP4_ROWS, DownAct::Q8Blocks32),
             ]
         );
+    }
+
+    /// A routed down is read over its entry's form at a K of whole 256-value super-blocks and
+    /// over the 32-value form at any other K; the routed K unit is 32 for the types whose down
+    /// reads that form, MXFP4 among them, and 256 for the others. A rank's part of 2,304
+    /// (576 at four ranks, 1,152 at two) is such a K.
+    #[test]
+    fn a_down_off_the_super_block_reads_the_32_value_form() {
+        for k in [2304, 1280] {
+            assert_eq!(down_act(GgmlType::MXFP4, k), DownAct::Q8Act, "{k}");
+        }
+        for k in [576, 1152, 32] {
+            assert_eq!(down_act(GgmlType::MXFP4, k), DownAct::Q8Blocks32, "{k}");
+        }
+        assert_eq!(down_act(GgmlType::NVFP4, 2304), DownAct::Q8Blocks32);
+        assert_eq!(down_act(GgmlType::Q4_K, 2304), DownAct::Q8Act);
+        let routed: Vec<_> = ALL
+            .iter()
+            .filter(|&&ty| down(ty).is_some())
+            .map(|&ty| (ty, card_k_unit(ty, Role::RoutedExperts)))
+            .filter(|&(_, unit)| unit == 32)
+            .map(|(ty, _)| ty)
+            .collect();
+        assert_eq!(
+            routed,
+            [
+                GgmlType::Q5_0,
+                GgmlType::Q5_1,
+                GgmlType::Q8_0,
+                GgmlType::MXFP4,
+                GgmlType::NVFP4,
+                GgmlType::IQ4_NL,
+                GgmlType::NVFP4_ROWS,
+            ]
+        );
+        assert_eq!(
+            card_k_unit(GgmlType::Q4_K, Role::RoutedExperts),
+            Q8_ACT_UNIT
+        );
+        assert_eq!(card_k_unit(GgmlType::MXFP8, Role::DenseFfn), 1);
     }
 
     /// An ungated up runs the down entries of the 32-value form, and no other:
@@ -1222,6 +1320,38 @@ mod tests {
         assert!(gate_up(GgmlType::Q8_0).is_some() && !card_gate_up_runs(GgmlType::Q8_0));
         assert!(down(GgmlType::Q6_K).is_some() && card_down_runs(GgmlType::Q6_K));
         assert!(down(GgmlType::Q5_0).is_some() && !card_down_runs(GgmlType::Q5_0));
+    }
+
+    /// A dense site whose q8_1 column is as wide as the widest the engine runs (Kimi K3's lead
+    /// layer's Q6_K down, 33,792 values) passes the plan's check, and one a super-block wider is
+    /// refused by name with its width. A routed stack and a site of the f32 rows are not the
+    /// check's. Mutant: [`Q8_ACT_MAX_K`] left at 24,576, which refuses K3's down.
+    #[test]
+    fn a_dense_q8_1_column_past_the_activation_cap_is_refused_by_name() {
+        let site = |role, ty, k: u64| ModelTensor {
+            name: "layer0.down.weight".to_owned(),
+            shard: 0,
+            layer: Some(0),
+            role,
+            ty,
+            dims: vec![k, 7168],
+            file_bytes: 0,
+            gathered_rows: None,
+        };
+        let widest = Q8_ACT_MAX_K as u64;
+        assert_eq!(widest, 33_792, "K3's dense down is the widest q8_1 column");
+        assert!(check_q8_act_width(&site(Role::DenseFfn, GgmlType::Q6_K, widest)).is_ok());
+        let past = site(Role::DenseFfn, GgmlType::Q6_K, widest + 256);
+        let err = check_q8_act_width(&past).expect_err("a column past the cap is refused");
+        let said = err.to_string();
+        for word in ["layer0.down.weight", "q6_K", "34048", "33792"] {
+            assert!(said.contains(word), "{word} missing from: {said}");
+        }
+        // The f32 rows and a routed stack read no q8_1 column the activation holds.
+        assert!(check_q8_act_width(&site(Role::DenseFfn, GgmlType::F32, widest + 256)).is_ok());
+        assert!(
+            check_q8_act_width(&site(Role::RoutedExperts, GgmlType::Q6_K, widest + 256)).is_ok()
+        );
     }
 
     /// A type id the enum does not name has no row in any operation.

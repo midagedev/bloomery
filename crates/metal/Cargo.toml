@@ -123,10 +123,10 @@ workspace = true
 # census of the devices a backend opens).
 bloomery-device = { path = "../device" }
 bloomery-placement = { path = "../placement" }
-# The generation loop's target (`arch/qwen3moe/target.rs`) and the server's
-# engine over any target (`server.rs`, every OS: host code only): the loop,
-# its stop rule and its cut reasons, and the HTTP API's `Engine`, the file's
-# vocabulary and the sampler chain, every seat's owners.
+# The generation loop's target (`arch/qwen3moe/target.rs`): the loop, its
+# stop rule and its cut reasons, and the HTTP API's `Engine` over any target
+# (`serve::TargetEngine`), the file's vocabulary and the sampler chain, every
+# seat's owners.
 bloomery-runtime = { path = "../runtime" }
 bloomery-serve = { path = "../serve" }
 # The shape table the kernels' instances are rows of (`src/instance.rs`), and

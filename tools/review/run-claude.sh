@@ -12,6 +12,8 @@
 # the user scope only (the runner has none). The full stream-json transcript goes to TRACE/<role>.ndjson and its token
 # and tool accounting (tools/review/usage.py) to TRACE/<role>.usage.json; TRACE is outside OUT, so the run cannot
 # touch it and nothing in it is posted. The exit code is claude's, and a result that reports an error is exit 1.
+# The glm engine (tools/review/run.py) runs this script too, under z.ai's endpoint and key, which run.py puts in the
+# environment (ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN, REVIEW_MODEL); REVIEW_RUN_ENGINE names the engine to usage.py.
 # REVIEW_SETTING_SOURCES=project runs it on a maintainer's machine under their own login without loading their user
 # settings (OUT has no project settings); the workflow leaves it unset.
 set -euo pipefail
@@ -51,6 +53,6 @@ rc=0
 ) > "$transcript" || rc=$?
 
 prc=0
-python3 "$base/tools/review/usage.py" "$role" "$transcript" "$trace/$role.usage.json" || prc=$?
+python3 "$base/tools/review/usage.py" "$role" "$transcript" "$trace/$role.usage.json" "${REVIEW_RUN_ENGINE:-claude}" || prc=$?
 [ "$rc" -ne 0 ] || rc=$prc
 exit "$rc"

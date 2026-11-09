@@ -1,0 +1,11 @@
+--- a/crates/gpu/src/host/node.rs
++++ b/crates/gpu/src/host/node.rs
+@@ -2177,7 +2177,7 @@
+             }
+             BlockRows::Staged => {
+                 for (j, _) in r.places.iter().enumerate().filter(|&(_, &p)| p != HOST) {
+-                    self.reply.raw(bytes_of(&b.host[j * n..(j + 1) * n]));
++                    self.reply.raw(&vec![0u8; 4 * n]);
+                 }
+             }
+         }

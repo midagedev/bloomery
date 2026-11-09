@@ -465,6 +465,7 @@ mod gate {
                 room: Some(PLAN_ROOM),
                 residency: Residency::Off,
                 kv: KvQ8::F16,
+                kv_host: bloomery_levers::KvHost::Off,
             }
             .plan(file)?;
             let p = planned.facts();
@@ -1395,6 +1396,7 @@ mod gate {
             host: levers.host(),
             plan_levers: PlanLevers {
                 card_budget_bytes: Some(budget).into(),
+                ..PlanLevers::default()
             },
         };
 

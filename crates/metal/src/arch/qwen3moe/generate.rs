@@ -12,18 +12,19 @@
 //!
 //! [`greedy_lookup`] is the same loop over the lookup draft
 //! ([`runtime::Speculative`] of [`runtime::Lookup`] behind the width chooser
-//! [`runtime::width::Choosing`], two rows a verify): the ids it picks are
-//! [`greedy`]'s, and the passes it ran, the rows each kept, the wall of each
-//! and the chooser's account of them are in the result for a caller that
-//! prints them.
+//! [`runtime::width::Choosing`], two rows a verify), and [`greedy_mtp`] over
+//! the MTP draft the session opened ([`Session::mtp_draft`]): the ids they
+//! pick are [`greedy`]'s, and the passes they ran, the rows each kept, the wall
+//! of each and the chooser's account of them are in the result for a caller
+//! that prints them.
 
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use runtime::width::{Chosen, GateState, Mode, Wall};
+use runtime::width::{Chosen, Clock, GateState, Mode, Wall};
 use runtime::{
-    Advance, Choosing, Committed, Lookup, NoTokens, PassSink, Plain, Speculative, Stop, StopReason,
-    Tally, Target, WidthError,
+    Advance, Choosing, Committed, Draft, Lookup, NoTokens, PassSink, Plain, Speculative, Stop,
+    StopReason, Tally, Target, WidthError,
 };
 
 use super::session::{Session, SessionError, StepMode};
@@ -97,12 +98,12 @@ pub struct Generated {
     /// the rows it ran and the rows it kept, and whether it verified a
     /// proposal. A plain run's passes are each one row.
     pub commits: Vec<Committed>,
-    /// The width chooser's account of a lookup run ([`greedy_lookup`]); a
-    /// plain run has none.
+    /// The width chooser's account of a drafted run ([`greedy_lookup`],
+    /// [`greedy_mtp`]); a plain run has none.
     pub width: Option<WidthAccount>,
 }
 
-/// What the width chooser did over a lookup run, read when the run ended.
+/// What the width chooser did over a drafted run, read when the run ended.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WidthAccount {
     /// The mode the run ran under.
@@ -128,8 +129,8 @@ impl WidthAccount {
     /// chooser's count started over. The chooser's passes and windows are the
     /// loop's own: a count that differs is of another run and is refused by
     /// name.
-    fn read(
-        chooser: &mut Choosing<Lookup>,
+    fn read<D, C: Clock>(
+        chooser: &mut Choosing<D, C>,
         commits: &[Committed],
     ) -> Result<WidthAccount, GenError> {
         let mode = chooser.mode();
@@ -289,17 +290,61 @@ pub fn greedy_lookup<F>(
 where
     F: FnMut(u32),
 {
-    s.verify_serves()?;
     let draft =
         <Lookup as Chosen<Session>>::choosing_by(Lookup::new(), width, Lookup::RULE, Wall::new())?;
+    greedy_drafted(s, draft, prompt, budget, eog, on_id)
+}
+
+/// [`greedy_lookup`] over the MTP draft the session opened ([`Session::open_mtp`])
+/// behind the same chooser, by the chooser's default rule: each pass proposes
+/// the one id the draft layer predicts from the target's last hidden row, and
+/// the chooser verifies it in one pass of two rows or runs one step. The draft
+/// is `runtime::mtp::MtpDraft` with the session as its host, the window policy
+/// and chooser the CUDA drafts run; the ids are [`greedy`]'s, bit for bit,
+/// whatever the draft proposes. A session whose layer reads the target's hidden
+/// row as `pre` or `post` sets it first ([`Session::set_mtp_reading`]).
+///
+/// # Errors
+/// As [`greedy_lookup`], and the session's refusal by name when no sidecar is
+/// open.
+pub fn greedy_mtp<F>(
+    s: &mut Session,
+    prompt: &[u32],
+    budget: usize,
+    eog: &[u32],
+    width: Mode,
+    on_id: F,
+) -> Result<Generated, GenError>
+where
+    F: FnMut(u32),
+{
+    let draft = s.mtp_draft()?.choosing(width)?;
+    greedy_drafted(s, draft, prompt, budget, eog, on_id)
+}
+
+/// The loop of a draft behind the chooser, two rows a verify: the ids are
+/// [`greedy`]'s, the chooser's account is in the result.
+fn greedy_drafted<D, F>(
+    s: &mut Session,
+    draft: Choosing<D>,
+    prompt: &[u32],
+    budget: usize,
+    eog: &[u32],
+    on_id: F,
+) -> Result<Generated, GenError>
+where
+    D: Draft<Session>,
+    F: FnMut(u32),
+{
+    s.verify_serves()?;
     // A pass with no proposal is one step, and the next pass may be a verify,
     // which drops the token a chained step ran ahead: its device time is a
     // whole step, where a host-fed step costs the wake and the encode the
     // chain hides. The chooser reads those host-fed walls as the plain step's
-    // cost.
+    // cost. A draft that reads the step's residual needs no token ahead of it.
     let chained = s.argmax_mode();
     s.set_argmax_mode(StepMode::HostFed)?;
-    let mut spec: Speculative<Choosing<Lookup>, 2> = Speculative::new(draft);
+    let mut spec: Speculative<Choosing<D>, 2> = Speculative::new(draft);
     let out = greedy_with(s, &mut spec, prompt, budget, eog, on_id);
     s.set_argmax_mode(chained)?;
     let mut out = out?;

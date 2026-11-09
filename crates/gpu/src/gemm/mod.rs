@@ -88,7 +88,7 @@ pub(crate) use f32tile::{
     land_values, mma_launch, mma_launch_words, mma_tile_origin, store_refused, tile_launch,
 };
 pub use f32tile::{Mxfp8NormGateArgs, ProductOut};
-pub use gemm32::{GateUp32Args, Gemm32Args, Gemm32Weight};
+pub use gemm32::{GateUp32Args, Gemm32Args, Gemm32Weight, Q8_0pEntry};
 pub use grouped::{GemmArgs, GemmInput, GemmWeight};
 pub use kernels::GemmKernels;
 pub use kernels32::Gemm32Kernels;

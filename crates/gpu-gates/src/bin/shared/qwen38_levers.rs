@@ -8,6 +8,8 @@
 pub const ACTS_ON: &[&str] = &[
     bloomery_levers::QWEN38_EXPERTS,
     bloomery_levers::QWEN3_KV,
+    bloomery_levers::KV_FLOOR,
+    bloomery_levers::KV_HOST,
     bloomery_levers::CARD_BUDGET,
     bloomery_levers::PIN_MAIN,
     bloomery_levers::HOST_LANES,
@@ -26,5 +28,6 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::STEP_STATS,
     bloomery_levers::SCREEN,
     bloomery_levers::SCHEMAJUMP,
+    bloomery_levers::AUTOTUNE,
     bloomery_gpu::arch::qwen3moe::ubatch::UBATCH_ENV,
 ];

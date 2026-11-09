@@ -12,8 +12,8 @@
 //!   [`FaultSite::ExpertId`]. A lane `e >= used` of a `sel_pitch` wider than
 //!   `used` is [`HOST`] and reads no id (the router's shared slot); an
 //!   `ids_pitch` wider than `used` leaves the router's extra words unread.
-//! - **Sum** (`ds41_ffn_card_acc` for six slots a token, `_8` for eight,
-//!   `_10` for ten, any other count refused by name): value `d` of token `t`
+//! - **Sum** (`ds41_ffn_card_acc` for six slots a token, `_2`, `_4`, `_8`, `_9`,
+//!   `_10` and `_16` for the other counts, any other count refused by name): value `d` of token `t`
 //!   is `acc = fma(down[(Nt + j)·n + d], w[Nt·p/N + j], acc)` from zero for
 //!   each slot `j` whose place is below `n_card`, in ascending `j` (this
 //!   order is the gate, `runtime::combine::card_sum`), `p` the weights' pitch
@@ -49,6 +49,8 @@ const THREADS: u32 = 256;
 // The kernels' launch attributes spell the block as a literal.
 const _: () = assert!(THREADS == 256);
 
+/// Slots a token of the `_2` sum, whose contract spells it as a literal.
+pub const SLOTS_2: usize = 2;
 /// Slots a token of the `_4` sum, whose contract spells it as a literal.
 pub const SLOTS_4: usize = 4;
 /// Slots a token of the six-slot sum, whose contract spells it as a literal.
@@ -59,11 +61,15 @@ pub const SLOTS_8: usize = 8;
 pub const SLOTS_9: usize = 9;
 /// Slots a token of the `_10` sum, whose contract spells it as a literal.
 pub const SLOTS_10: usize = 10;
+/// Slots a token of the `_16` sum, whose contract spells it as a literal.
+pub const SLOTS_16: usize = 16;
 
 /// The routed slot counts the sum has an entry for: one entry per count,
 /// picked at launch, and every other count refused by name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CardSlots {
+    /// Two slots a token (Kimi K3's gate fixture).
+    Two,
     /// Four slots a token (MiniMax-M3).
     Four,
     /// Six slots a token (DeepSeek-V4.1).
@@ -75,6 +81,8 @@ pub enum CardSlots {
     /// Ten slots a token, the router's weights at a pitch of eleven
     /// (Qwen3.8).
     Ten,
+    /// Sixteen slots a token (Kimi K3).
+    Sixteen,
 }
 
 impl CardSlots {
@@ -82,11 +90,13 @@ impl CardSlots {
     #[must_use]
     pub const fn of(n_used: usize) -> Option<CardSlots> {
         match n_used {
+            SLOTS_2 => Some(CardSlots::Two),
             SLOTS_4 => Some(CardSlots::Four),
             SLOTS_6 => Some(CardSlots::Six),
             SLOTS_8 => Some(CardSlots::Eight),
             SLOTS_9 => Some(CardSlots::Nine),
             SLOTS_10 => Some(CardSlots::Ten),
+            SLOTS_16 => Some(CardSlots::Sixteen),
             _ => None,
         }
     }
@@ -95,11 +105,13 @@ impl CardSlots {
     #[must_use]
     pub const fn n(self) -> usize {
         match self {
+            CardSlots::Two => SLOTS_2,
             CardSlots::Four => SLOTS_4,
             CardSlots::Six => SLOTS_6,
             CardSlots::Eight => SLOTS_8,
             CardSlots::Nine => SLOTS_9,
             CardSlots::Ten => SLOTS_10,
+            CardSlots::Sixteen => SLOTS_16,
         }
     }
 
@@ -107,12 +119,21 @@ impl CardSlots {
     #[must_use]
     const fn entry(self) -> &'static str {
         match self {
+            CardSlots::Two => "ds41_ffn_card_acc_2",
             CardSlots::Four => "ds41_ffn_card_acc_4",
             CardSlots::Six => "ds41_ffn_card_acc",
             CardSlots::Eight => "ds41_ffn_card_acc_8",
             CardSlots::Nine => "ds41_ffn_card_acc_9",
             CardSlots::Ten => "ds41_ffn_card_acc_10",
+            CardSlots::Sixteen => "ds41_ffn_card_acc_16",
         }
+    }
+
+    /// Whether the join entries ([`CardSlotKernels::enqueue_card_join`]) are
+    /// built for this count: the sum alone is, at 2 and 16 slots.
+    #[must_use]
+    pub(crate) const fn joins(self) -> bool {
+        !matches!(self, CardSlots::Two | CardSlots::Sixteen)
     }
 
     /// The count `n_used` refused by name, as the launchers report it.
@@ -120,7 +141,18 @@ impl CardSlots {
         GpuError::Shape {
             what: "ds41_ffn_card_acc",
             detail: format!(
-                "{n_used} routed slots a token: the card sum's entries are built for 4, 6, 8, 9 and 10"
+                "{n_used} routed slots a token: the card sum's entries are built for 2, 4, 6, 8, 9, 10 and 16"
+            ),
+        }
+    }
+
+    /// The count `n_used` refused by name by the join, whose entries are built
+    /// for fewer counts than the sum's.
+    pub(crate) fn join_refusal(n_used: usize) -> GpuError {
+        GpuError::Shape {
+            what: "card_sum_join",
+            detail: format!(
+                "{n_used} routed slots a token: the join's entries are built for 4, 6, 8, 9 and 10"
             ),
         }
     }
@@ -416,6 +448,90 @@ mod card_slots_kernels {
         // helper's contract asks for at SLOTS_9 slots.
         let v =
             unsafe { card_acc_at::<SLOTS_9>(down, w, sel, n, n_card, w_pitch as usize, fault, i) };
+        // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
+        unsafe { *acc.get_unchecked_mut(i) = v };
+    }
+
+    /// [`ds41_ffn_card_acc`] of two slots a token ([`card_acc_at`]).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            w_pitch >= 2,
+            down.len() >= 2 * n * m,
+            w.len() >= w_pitch * m,
+            sel.len() >= 2 * m,
+            acc.len() >= n * m
+        )
+    )]
+    pub fn ds41_ffn_card_acc_2(
+        down: &[f32],
+        w: &[f32],
+        sel: &[u32],
+        n: u32,
+        m: u32,
+        n_card: u32,
+        w_pitch: u32,
+        fault: FaultSink,
+        mut acc: DisjointSlice<f32>,
+    ) {
+        let (n, m) = (n as usize, m as usize);
+        let i = thread::index_1d().get();
+        if i >= n * m {
+            return;
+        }
+        // SAFETY: i < n·m, and the launch contract gives every length the
+        // helper's contract asks for at SLOTS_2 slots.
+        let v =
+            unsafe { card_acc_at::<SLOTS_2>(down, w, sel, n, n_card, w_pitch as usize, fault, i) };
+        // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
+        unsafe { *acc.get_unchecked_mut(i) = v };
+    }
+
+    /// [`ds41_ffn_card_acc`] of sixteen slots a token ([`card_acc_at`]).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            w_pitch >= 16,
+            down.len() >= 16 * n * m,
+            w.len() >= w_pitch * m,
+            sel.len() >= 16 * m,
+            acc.len() >= n * m
+        )
+    )]
+    pub fn ds41_ffn_card_acc_16(
+        down: &[f32],
+        w: &[f32],
+        sel: &[u32],
+        n: u32,
+        m: u32,
+        n_card: u32,
+        w_pitch: u32,
+        fault: FaultSink,
+        mut acc: DisjointSlice<f32>,
+    ) {
+        let (n, m) = (n as usize, m as usize);
+        let i = thread::index_1d().get();
+        if i >= n * m {
+            return;
+        }
+        // SAFETY: i < n·m, and the launch contract gives every length the
+        // helper's contract asks for at SLOTS_16 slots.
+        let v =
+            unsafe { card_acc_at::<SLOTS_16>(down, w, sel, n, n_card, w_pitch as usize, fault, i) };
         // SAFETY: i < n·m <= acc.len(); thread i is acc[i]'s only writer.
         unsafe { *acc.get_unchecked_mut(i) = v };
     }
@@ -1002,6 +1118,18 @@ impl CardSlotKernels {
                     stream, &prep, down, a.w, a.sel, n, m, n_card, w_pitch, a.fault, acc,
                 )?;
             }
+            CardSlots::Two => {
+                let prep = mo.prepare_ds41_ffn_card_acc_2(cfg)?;
+                mo.ds41_ffn_card_acc_2(
+                    stream, &prep, down, a.w, a.sel, n, m, n_card, w_pitch, a.fault, acc,
+                )?;
+            }
+            CardSlots::Sixteen => {
+                let prep = mo.prepare_ds41_ffn_card_acc_16(cfg)?;
+                mo.ds41_ffn_card_acc_16(
+                    stream, &prep, down, a.w, a.sel, n, m, n_card, w_pitch, a.fault, acc,
+                )?;
+            }
         }
         Ok(())
     }
@@ -1022,7 +1150,9 @@ impl CardSlotKernels {
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         const WHAT: &str = "card_sum_join";
-        CardSlots::of(a.n_used).ok_or_else(|| CardSlots::refusal(a.n_used))?;
+        CardSlots::of(a.n_used)
+            .filter(|s| s.joins())
+            .ok_or_else(|| CardSlots::join_refusal(a.n_used))?;
         let shape = (a.n_used, a.w_pitch);
         let (cfg, nm) = slots_launch(WHAT, (a.n, a.m), shape, a.shared.gate)?;
         short(
@@ -1105,6 +1235,27 @@ mod tests {
         for m in [&two, &union, &hosted, &hosted_union] {
             assert_eq!(store(m, true), DownStore::F32);
         }
+    }
+
+    /// The sum is built for 2, 4, 6, 8, 9, 10 and 16 slots a token and the join
+    /// for the five of them it always was: the new counts are the sum's alone,
+    /// and a count between them is the sum's refusal. Mutant: `joins` true for
+    /// every count, which lets the join launch an entry that reads no slot of
+    /// 2 or 16.
+    #[test]
+    fn the_sum_has_two_counts_the_join_does_not() {
+        for n in [2, 4, 6, 8, 9, 10, 16] {
+            let s = CardSlots::of(n).expect("a count the sum is built for");
+            assert_eq!(s.n(), n);
+            assert_eq!(s.joins(), ![2, 16].contains(&n), "{n} slots");
+        }
+        for n in [0, 1, 3, 5, 7, 11, 12, 15, 17] {
+            assert_eq!(CardSlots::of(n), None, "{n} slots");
+        }
+        let join = CardSlots::join_refusal(16).to_string();
+        assert!(join.contains("16 routed slots") && join.contains("4, 6, 8, 9 and 10"));
+        let sum = CardSlots::refusal(5).to_string();
+        assert!(sum.contains("2, 4, 6, 8, 9, 10 and 16"), "{sum}");
     }
 
     /// Both card sum launchers refuse empty or overflowing geometry and
@@ -1261,7 +1412,9 @@ mod tests {
             (state >> 40) as f32 / (1u64 << 24) as f32 - 0.5
         };
         let mut red = Vec::new();
-        for n_used in [SLOTS_4, SLOTS_6, SLOTS_8, SLOTS_9, SLOTS_10] {
+        for n_used in [
+            SLOTS_2, SLOTS_4, SLOTS_6, SLOTS_8, SLOTS_9, SLOTS_10, SLOTS_16,
+        ] {
             let w_pitch = if n_used == SLOTS_10 {
                 n_used + 1
             } else {
@@ -1281,7 +1434,7 @@ mod tests {
             for stray in [None, Some(N_CARD), Some(HOST - 1)] {
                 let mut sel = base.clone();
                 if let Some(p) = stray {
-                    sel[n_used + 3] = p;
+                    sel[n_used + 3.min(n_used - 1)] = p;
                 }
                 let on = |s: usize| sel[s] < N_CARD;
                 // A slot the sum must not read holds NaN, its weight too.
@@ -1331,10 +1484,12 @@ mod tests {
                         }
                         let args = ((&down[..], &w[..], &sel[..]), (N, N_CARD, w_pitch), (t, d));
                         let want = match n_used {
+                            SLOTS_2 => rule::<SLOTS_2>(args.0, args.1, args.2),
                             SLOTS_4 => rule::<SLOTS_4>(args.0, args.1, args.2),
                             SLOTS_6 => rule::<SLOTS_6>(args.0, args.1, args.2),
                             SLOTS_8 => rule::<SLOTS_8>(args.0, args.1, args.2),
                             SLOTS_9 => rule::<SLOTS_9>(args.0, args.1, args.2),
+                            SLOTS_16 => rule::<SLOTS_16>(args.0, args.1, args.2),
                             _ => rule::<SLOTS_10>(args.0, args.1, args.2),
                         };
                         g.to_bits() != want.to_bits()
@@ -1362,7 +1517,9 @@ mod tests {
         }
         // A card of no expert: every place is the host's, and the sum is
         // zeros with nothing raised.
-        for n_used in [SLOTS_4, SLOTS_6, SLOTS_8, SLOTS_9, SLOTS_10] {
+        for n_used in [
+            SLOTS_2, SLOTS_4, SLOTS_6, SLOTS_8, SLOTS_9, SLOTS_10, SLOTS_16,
+        ] {
             let sel = DeviceBuffer::from_host(stream, &vec![HOST; M * n_used]).expect("sel");
             let z = DeviceBuffer::from_host(stream, &vec![f32::NAN; M * n_used * N]).expect("z");
             let mut acc = DeviceBuffer::from_host(stream, &[1.0f32; N * M]).expect("acc");

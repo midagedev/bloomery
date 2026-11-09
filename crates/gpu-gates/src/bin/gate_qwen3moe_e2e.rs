@@ -1176,6 +1176,7 @@ mod gate {
             CTX,
             &PlanLevers {
                 card_budget_bytes: Some(PLACED_BUDGET).into(),
+                ..PlanLevers::default()
             },
         )?;
         let line = q
@@ -1206,6 +1207,7 @@ mod gate {
                 "a budget above free",
                 PlanLevers {
                     card_budget_bytes: Some(usable).into(),
+                    ..PlanLevers::default()
                 },
             ),
         ];
@@ -1274,6 +1276,7 @@ mod gate {
         let q = PlaceQ3::qwen3(&file, Place::parse("cuda0")?, ctx, KvQ8::F16)?;
         let levers = PlanLevers {
             card_budget_bytes: Some(PLACED_BUDGET).into(),
+            ..PlanLevers::default()
         };
         let plan = q.plan(ctx, &levers)?;
         for line in q.records(&plan, None)? {
@@ -1684,8 +1687,8 @@ mod gate {
     /// forms (a `Q8Blocks32` down, the 32-value route GEMMs), the Q6_K file's
     /// through the 128-value ones.
     const Z_FILES: [&str; 2] = [
-        "/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q8_0.gguf",
-        "/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q6_K.gguf",
+        "/data/moved/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q8_0.gguf",
+        "/data/moved/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q6_K.gguf",
     ];
 
     /// The ids (z)'s pass arm prefills: several passes, the last short.
@@ -1741,6 +1744,7 @@ mod gate {
         let budget = pick(&q)?;
         let levers = PlanLevers {
             card_budget_bytes: Some(budget).into(),
+            ..PlanLevers::default()
         };
         let plan = q.plan(CTX, &levers)?;
         for line in q.records(&plan, None)? {

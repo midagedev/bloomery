@@ -7,7 +7,7 @@
 //!                    (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C]
 //!                    [--print-ids] [--ignore-eos] [--repeat N] [--profile [N]]
 //!                    [--profile-layers] [--step-times [N]] [--prefill batch|steps]
-//!                    [--pass-times U] [--logits-hash [N]] [--draft lookup]
+//!                    [--pass-times U] [--logits-hash [N]] [--draft lookup|mtp]
 //!                    [--mtp SIDECAR [--mtp-hidden pre|post] [--draft-step-times [N]]]
 //!     generate_metal [-m PATH | --hf REPO] --mtp SIDECAR --mtp-check DIR/FAMILY [--ctx C]
 //!     generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
@@ -20,7 +20,9 @@
 //! variable are each a named error and exit 2. The file opens once, for the
 //! tokenizer, the plan's check and the session.
 //!
-//! Defaults: N 32, C the smaller of 4096 and the file's `context_length`. A
+//! Defaults: N 32, C the smaller of 4096 and the file's `context_length`, cut
+//! to the largest cache whose session fits the device's free bytes (stderr,
+//! and `--plan`'s line after `plan: ctx=`, name the cut). A
 //! flag given twice takes its last value, but `-m` and `--hf` (above).
 //! `--prompt` tokenizes the text with the file's own vocabulary (`tokenizer`,
 //! the specials the header asks for, no chat template — the CUDA CLI runs
@@ -37,7 +39,7 @@
 //! depth of real text then is not cut short; the summary prints
 //! `ignore_eos=true`.
 //!
-//! `--draft lookup` (off by default; `lookup` is the one draft) runs the loop
+//! `--draft lookup` (off by default) runs the loop
 //! over the lookup draft (`runtime::Speculative` of `runtime::Lookup` behind
 //! the width chooser, `runtime::width::Choosing`, as the CUDA family runs it):
 //! a pass proposes the one id the context's n-grams name and the chooser
@@ -54,12 +56,21 @@
 //! `--print-ids` of the runs is one compare. The file's layers must be ones the
 //! verify pass serves (a dense A4 FFN, attention and delta layers:
 //! `Session::verify_serves`); any other file is refused by name before the
-//! run. `BLOOMERY_MTP_WIDTH` set beside no `--draft` is refused by name. Each run's summary
+//! run. `BLOOMERY_MTP_WIDTH` set beside no `--draft` is refused by name.
+//!
+//! `--draft mtp` (needs `--mtp SIDECAR`) is the same loop over the MTP draft the
+//! sidecar opened: `runtime::mtp::MtpDraft` with the session as its host behind
+//! the same chooser, the draft layer proposing the one id it predicts from the
+//! target's last hidden row (`--mtp-hidden`'s reading of it). The prompt
+//! call walks the draft over each unit as it completes, so its steps run with no token
+//! ahead. The ids are the plain run's, bit for bit, whatever the draft
+//! proposes; `--draft mtp` without `--mtp` is refused by name. Each run's summary
 //! block adds, after `stop=`:
 //!
-//!     draft=lookup draft_width=<cost|fixed> draft_proposals=<passes that
+//!     draft=<lookup|mtp> draft_width=<cost|fixed> draft_proposals=<passes that
 //!     verified a proposal> draft_accepted=<drafts the argmax kept>
-//!     draft_partial=<proposals that kept one row> draft_steps=<passes that
+//!     draft_accept_rate=<draft_accepted over draft_proposals, `none` with no
+//!     proposal> draft_partial=<proposals that kept one row> draft_steps=<passes that
 //!     verified no proposal: none was made, or the gate was closed>
 //!     draft_verify_ms=<the verify passes' mean wall>
 //!     draft_verify_after_verify_ms=<that of those that follow a verify>
@@ -75,9 +86,9 @@
 //!     draft_rates=<the gate's rate of the step and of the verify, positions
 //!     a millisecond>
 //!     discarded_ahead=<tokens a chain step ran ahead that a verify dropped,
-//!     the session's count so far; the lookup's own steps run none>
+//!     the session's count so far; the drafts' own steps run none>
 //!
-//! `--profile [N]` with `--draft lookup` adds the verify's own profile after the
+//! `--profile [N]` with `--draft lookup` or `mtp` adds the verify's own profile after the
 //! step's, N verifies of two rows each way, each verify keeping both rows. The
 //! `vprof` lines are the step profile's, a command buffer a group, waited: the
 //! groups' GPU time and bytes a verify (`--profile-layers` a layer each), the
@@ -191,9 +202,10 @@
 //! device buffer) and prints, on stdout, what the open would find: the
 //! description, the room the device and the host report beside the bytes the
 //! open would make buffers of, every refusal the open's checks meet (not the
-//! first alone), and a last line, `plan: opens` (exit 0) or `plan: refused, N
-//! items` (exit 3). A file whose data section is cut short is read as a header
-//! alone. A folder or file the open refuses before the plan can check it is a
+//! first alone) — the room rule's among them, a load whose bytes pass the
+//! device's free bytes — and a last line, `plan: opens` (exit 0) or
+//! `plan: refused, N items` (exit 3). A file whose data section is cut short
+//! is read as a header alone. A folder or file the open refuses before the plan can check it is a
 //! named error and exit 3; a header the plan cannot read is a named error and
 //! exit 64; a repo it cannot fetch is a named error and exit 1. `--hf` fetches
 //! what the cache lacks before the plan reads it. It takes no generation flag.
@@ -224,7 +236,7 @@ mod cli {
     use bloomery_metal::arch::qwen3moe::{
         check,
         count::{GroupKind, KINDS},
-        generate::{Generated, greedy, greedy_lookup},
+        generate::{Generated, greedy, greedy_lookup, greedy_mtp},
         mtp_check, plan,
         session::{
             DraftTimes, Op, PassOut, PassSample, ProfileGroup, Session, StateOut, StepMode,
@@ -267,22 +279,23 @@ mod cli {
     const CTX_DEFAULT: usize = 4096;
 
     const USAGE: &str = "\
-generate_metal [-m PATH | --hf REPO] (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids] [--ignore-eos] [--repeat N] [--profile [N]] [--profile-layers] [--step-times [N]] [--prefill batch|steps] [--pass-times U[,U…]] [--logits-hash [N]] [--draft lookup] [--mtp SIDECAR [--mtp-hidden pre|post] [--draft-step-times [N]]]
+generate_metal [-m PATH | --hf REPO] (--prompt <text> | --tokens a,b,c) [-n N] [--ctx C] [--print-ids] [--ignore-eos] [--repeat N] [--profile [N]] [--profile-layers] [--step-times [N]] [--prefill batch|steps] [--pass-times U[,U…]] [--logits-hash [N]] [--draft lookup|mtp] [--mtp SIDECAR [--mtp-hidden pre|post] [--draft-step-times [N]]]
 generate_metal [-m PATH | --hf REPO] --mtp SIDECAR --mtp-check DIR/FAMILY [--ctx C]
 generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
   the model is a GGUF file (its first shard) or a checkpoint folder, named by -m,
   by --hf (fetched into the cache) or by $BLOOMERY_REF_MODEL; defaults N 32, --ctx the smaller of 4096
-  and the file's context_length; --plan reads the header alone and prints
+  and the file's context_length, cut to the largest that fits the device's free bytes; --plan reads the header alone and prints
   every refusal the open would make, the bytes it would allocate and the
   room (exit 0 opens, 3 refused, 64 a header it cannot read); --print-ids prints the ids, not the text;
   --ignore-eos stops nothing at an end-of-generation id (the picks stay the device's argmax, unmasked);
   --repeat N runs the prompt N times on one open, each run with its own summary block;
   --draft lookup runs the loop over the lookup draft, two rows a verify, the same ids as
-  the plain run and the accept counts and the verify's wall beside the step's printed;
+  the plain run and the accept counts and the verify's wall beside the step's printed,
+  --draft mtp (needs --mtp) over the MTP draft layer the sidecar opened;
   BLOOMERY_MTP_WIDTH=cost (unset) lets the width chooser verify a proposal only while its kept rows
   repay the verify's wall, =fixed verifies every proposal (it needs --draft);
   --profile [N] (default 32) steps N more tokens after the summary, each
-  group's GPU time and bytes printed (with --draft lookup, N two-row verifies
+  group's GPU time and bytes printed (with --draft, N two-row verifies
   after them, each group's, then each buffer's and the gaps between);
   --profile-layers adds a layer each;
   --step-times [N] (default 32) steps N more tokens in each mode, the step
@@ -333,11 +346,13 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         Ids(Vec<u32>),
     }
 
-    /// The draft a run's loop proposes with: none, or the lookup's.
+    /// The draft a run's loop proposes with: none, the lookup's or the MTP
+    /// layer's.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Draft {
         None,
         Lookup,
+        Mtp,
     }
 
     impl Draft {
@@ -345,7 +360,17 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         fn from_name(s: &str) -> Result<Draft, String> {
             match s {
                 "lookup" => Ok(Draft::Lookup),
-                _ => Err(format!("--draft {s}: lookup is the one draft")),
+                "mtp" => Ok(Draft::Mtp),
+                _ => Err(format!("--draft {s}: lookup or mtp")),
+            }
+        }
+
+        /// The name the run's summary prints.
+        fn name(self) -> &'static str {
+            match self {
+                Draft::None => "none",
+                Draft::Lookup => "lookup",
+                Draft::Mtp => "mtp",
             }
         }
     }
@@ -372,7 +397,7 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         /// `--logits-hash [N]`: the tokens whose logits are hashed.
         logits_hash: Option<usize>,
         prefill: PrefillMode,
-        /// `--draft lookup`: the loop proposes with the lookup draft.
+        /// `--draft lookup|mtp`: the loop proposes with that draft.
         draft: Draft,
         /// `BLOOMERY_MTP_WIDTH`: the width chooser's mode behind the draft;
         /// `Cost` unset, as the CUDA family's.
@@ -593,13 +618,16 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
             && draft == Draft::None
         {
             return Err(format!(
-                "{}={w}: it picks the width a drafted window verifies; give --draft lookup",
+                "{}={w}: it picks the width a drafted window verifies; give --draft lookup or mtp",
                 bloomery_levers::MTP_WIDTH
             ));
         }
         let width = WidthMode::of(width)
             .map_err(|_| format!("{}: cost or fixed", bloomery_levers::MTP_WIDTH))?;
         let mtp = flag("--mtp")?.map(std::path::PathBuf::from);
+        if draft == Draft::Mtp && mtp.is_none() {
+            return Err("--draft mtp: the draft layer is the sidecar's; give --mtp SIDECAR".into());
+        }
         let mtp_hidden = match flag("--mtp-hidden")?.as_deref() {
             None | Some("post") => HiddenRow::Post,
             Some("pre") => HiddenRow::Pre,
@@ -658,21 +686,6 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
                 Ok(Some(c))
             }
         }
-    }
-
-    /// The smaller of the default cap and `split`'s `context_length`.
-    fn default_ctx(split: &gguf::Split, model: &std::path::Path) -> Result<usize, String> {
-        let train = split
-            .arch_get_u64("context_length")
-            .and_then(|v| usize::try_from(v).ok())
-            .ok_or_else(|| {
-                format!(
-                    "{}: {} is absent or not a count",
-                    model.display(),
-                    split.arch_key("context_length")
-                )
-            })?;
-        Ok(CTX_DEFAULT.min(train))
     }
 
     /// The generated text as it completes: the tokenizer's streaming
@@ -851,8 +864,8 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
     /// Each verify keeps both rows, so the session stands two positions on
     /// each; the second row's id is the first's. A group's bytes are the step
     /// group's at the verify's first position: the weights once, so a group
-    /// the verify runs a row at a time (the delta layers' out projection)
-    /// counts each launch's.
+    /// the verify runs a row at a time (a delta out projection the M-row
+    /// head-normed entry does not serve) counts each launch's.
     fn profile_verify_run(s: &mut Session, p: &Profile, mut id: u32) -> Result<(), String> {
         let m = VERIFY_PROFILE_ROWS;
         let rows = s.ctx() - s.pos() as usize;
@@ -1374,19 +1387,38 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         ctx: Option<usize>,
     ) -> Result<plan::Printed, plan::OpenError> {
         let header = plan::open_plan_header(model)?;
-        let ctx = match ctx {
-            Some(c) => c,
-            None => default_ctx(header.split(), model).map_err(plan::OpenError::Unreadable)?,
+        let (ctx, unasked) = match ctx {
+            Some(c) => (c, None),
+            None => {
+                let u = plan::unasked_ctx(header.split(), CTX_DEFAULT, model)
+                    .map_err(plan::OpenError::Unreadable)?;
+                (u.ctx, Some(u))
+            }
         };
-        let outcome = check::check(header.split(), ctx);
-        Ok(plan::render(
+        let device = plan::device_room();
+        let free = match &device {
+            Ok(d) => Ok(d.free),
+            Err(e) => Err(e.clone()),
+        };
+        let outcome = check::check_room(header.split(), ctx, free);
+        let mut printed = plan::render(
             model,
             header.data,
             ctx,
             &outcome,
-            &plan::device_room(),
+            &device,
             &plan::HostMemory::probe(),
-        ))
+        );
+        // The room's cut of the default, right after the line naming the rows.
+        if let Some(note) = unasked.and_then(|u| u.note()) {
+            let at = printed
+                .lines
+                .iter()
+                .position(|l| l.starts_with("plan: ctx="))
+                .map_or(printed.lines.len(), |i| i + 1);
+            printed.lines.insert(at, format!("plan: {note}"));
+        }
+        Ok(printed)
     }
 
     /// A repeated run's ids against the first run's, which a greedy run of the
@@ -1456,16 +1488,16 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
                 eprintln!("decode_rest_ms={:.2}", mean * 1e3);
             }
         }
-        if draft == Draft::Lookup {
-            print_draft(out, session);
+        if draft != Draft::None {
+            print_draft(out, session, draft);
         }
         eprintln!("residency_requests={}", session.residency().requests);
     }
 
-    /// The `draft_*` lines of a `--draft lookup` run: what its passes were
+    /// The `draft_*` lines of a `--draft` run: what its passes were
     /// ([`Generated::tally`]), the verify's mean wall beside the step's and
     /// the width chooser's account ([`Generated::width`]).
-    fn print_draft(out: &Generated, session: &Session) {
+    fn print_draft(out: &Generated, session: &Session, draft: Draft) {
         let t = out.tally();
         let ms = |d: Option<Duration>| {
             d.map_or_else(
@@ -1473,12 +1505,20 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
                 |d| format!("{:.2}", d.as_secs_f64() * 1e3),
             )
         };
-        eprintln!("draft=lookup");
+        eprintln!("draft={}", draft.name());
         if let Some(w) = &out.width {
             eprintln!("draft_width={}", w.mode.word());
         }
         eprintln!("draft_proposals={}", t.proposals);
         eprintln!("draft_accepted={}", t.accepted);
+        if t.proposals == 0 {
+            eprintln!("draft_accept_rate=none");
+        } else {
+            eprintln!(
+                "draft_accept_rate={:.3}",
+                t.accepted as f64 / t.proposals as f64
+            );
+        }
         eprintln!("draft_partial={}", t.partial);
         eprintln!("draft_steps={}", t.steps);
         eprintln!("draft_verify_ms={}", ms(t.verify_wall));
@@ -1532,10 +1572,16 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
             return Err("the prompt has no ids".into());
         }
         // The cache rows: the asked count, else the smaller of the default cap and the file's
-        // `context_length`.
+        // `context_length`, cut to the largest whose session fits the device's room.
         let ctx = match a.ctx {
             Some(c) => c,
-            None => default_ctx(file.header(), &model.path)?,
+            None => {
+                let unasked = plan::unasked_ctx(file.header(), CTX_DEFAULT, &model.path)?;
+                if let Some(note) = unasked.note() {
+                    eprintln!("generate_metal: {note}");
+                }
+                unasked.ctx
+            }
         };
         // The library is the instance the file's shape selects, by the check `--plan` prints.
         let instance = Session::instance_of_model(&file, ctx).map_err(|e| e.to_string())?;
@@ -1567,6 +1613,9 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
                 "mtp_open weight_bytes={} kv_bytes={} allocated_bytes={with}",
                 opened.weight_bytes, opened.kv_bytes
             );
+            session
+                .set_mtp_reading(a.mtp_hidden)
+                .map_err(|e| e.to_string())?;
         }
         if let Some(stem) = &a.mtp_check {
             return mtp_check_run(&mut session, stem);
@@ -1583,6 +1632,7 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
                 Draft::Lookup => {
                     greedy_lookup(session, &prompt, a.n, eog, a.width, |id| stream.id(id))
                 }
+                Draft::Mtp => greedy_mtp(session, &prompt, a.n, eog, a.width, |id| stream.id(id)),
             }
             .map_err(|e| e.to_string())?;
             #[cfg(feature = "encode-trace")]
@@ -1652,7 +1702,7 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
                 .ok_or("a profile of no token: the run picked none")?;
             let decode_ms = (out.passes > 0).then(|| decode_s / out.passes as f64 * 1e3);
             profile_run(&mut session, p, id, decode_ms)?;
-            if a.draft == Draft::Lookup {
+            if a.draft != Draft::None {
                 let id = *out
                     .ids
                     .last()

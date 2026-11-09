@@ -12,7 +12,14 @@
 //!                           [--slot-ctx S] [--queue-depth Q] [--park-ram MIB] [--slot-save-path DIR]
 //!                           [--mmproj FILE | --no-mmproj] [--image-min-tokens N]
 //!                           [--image-max-tokens N] [-ub N | --ubatch-size N]
-//!                           [--cache-type-k f16|q8_0]
+//!                           [--cache-type-k f16|q8_0] [--autotune on|off]
+//!
+//! `--autotune` makes the load's kernel picks (`bloomery_gpu::autotune`) after the load and
+//! before the first capture: a set word wins, then the `BLOOMERY_AUTOTUNE` lever's; unset, `on`.
+//! `on` prints an `autotune pick` line a kernel signature (the way it runs, `measured` now or
+//! `stored` by an earlier load, the rule's and the way's median per launch) and an `autotune`
+//! line with the wall, and `/props`' `engine.autotune` lists the same; `off` runs today's rule
+//! with no timing and no store read or write.
 //!
 //! `--cache-type-k` is the KV cache's format, llama-server's flag and words: a set word wins, then
 //! the `BLOOMERY_QWEN3_KV` lever's; unset, f16, whatever the file's container
@@ -91,7 +98,15 @@
 //! never takes the room the residency needs; where not even the floor of the search leaves them, the
 //! context is the plain fit, the unset word resolves `off` (a set word is
 //! refused by name), and a
-//! `ctx experts-floor=unmet` line says why. An unset MTP draft yields to the
+//! `ctx experts-floor=unmet` line says why. The KV floor
+//! (`BLOOMERY_KV_FLOOR=<positions>`) moves where the spread runs, not the
+//! context: the plan counts its cache at the floor's positions and every
+//! other term at the context the choice above made, so the experts the
+//! context's KV would have displaced come back until a sequence grows past
+//! the floor (the room fit's named refusal then, until the residency
+//! machine frees bytes for it); the `plan` line prints `kv_floor=` beside
+//! `ctx_max=`, unset the plan of the context alone. An unset MTP draft
+//! yields to the
 //! context:
 //! when the drafted plan fits a context at most half the one the plain plan
 //! holds, or holds not even the floor, the draft goes off and a `draft
@@ -440,19 +455,22 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use app::mtp::{MtpBody, MtpDraft};
+use app::mtp::MtpBody;
 use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
 use bloomery_gpu::arch::qwen3moe::{
     Body38, CHECKPOINT_EVERY, Folder38, Model38, Prompt38, Seq38, TargetRows, checkpoint_budget38,
     checkpoint_price38, point_row_budget38, seq38_bytes,
 };
+use bloomery_gpu::autotune::{MCOL_KERNEL, Mcol};
 use bloomery_gpu::checkpoint::bytes;
 use bloomery_gpu::checkpoint::saved::SaveLane;
+use bloomery_gpu::host::costs::{Source, Store};
 use bloomery_gpu::host::route_trace::RouteTrace;
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::kv_format::{KvChoice, KvQ8};
+use bloomery_gpu::model::ChainBody;
 use bloomery_gpu::model::StepMode;
-use bloomery_gpu::{Gpu, GpuError};
+use bloomery_gpu::{Gpu, GpuError, GpuModel};
 use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{
     AutoSlots, CacheRam, Cached, ChatSurface, Landing, Listen, Pass, PutBack, Seat, SeatEngine,
@@ -461,7 +479,7 @@ use bloomery_gpu_gates::bind::{
     prefill_closing, put_back, seat_failure, slots_of,
 };
 use bloomery_gpu_gates::generate::{
-    BreakEven, DraftYield, FloorShort, Lane, Place, draft_yield, lane_of,
+    BreakEven, DraftYield, FloorShort, Lane, Place, draft_yield, lane_of, stage_host_page,
 };
 use bloomery_gpu_gates::need;
 use bloomery_gpu_gates::nodes::step_census;
@@ -499,8 +517,8 @@ use runtime::width::Mode as WidthMode;
 #[cfg(feature = "vision")]
 use serve::media::{MediaFeed, SharedMediaModel};
 use serve::{
-    CacheNote, DraftProps, Drafted, EngineProps, Pending, ResidencyReset, Saved, ServeError,
-    SharedPrefix, StateError,
+    AutotuneProps, CacheNote, DraftProps, Drafted, EngineProps, Pending, PickProps, ResidencyReset,
+    Saved, ServeError, SharedPrefix, StateError,
 };
 use tokenizer::Tokenizer;
 
@@ -529,7 +547,8 @@ const USAGE: &str = "usage: bloomery-serve-qwen38 [--host H] [--port P] \
                      [--slot-ctx S] [--queue-depth Q] [--park-ram MIB] [--slot-save-path DIR] \
                      [--mmproj FILE | --no-mmproj] [--image-min-tokens N] \
                      [--image-max-tokens N] [-ub N | --ubatch-size N] \
-                     [--cache-type-k f16|q8_0] [--plan] [--api-key KEY] [--api-key-file FNAME]";
+                     [--cache-type-k f16|q8_0] [--autotune on|off] [--plan] [--api-key KEY] \
+                     [--api-key-file FNAME]";
 
 /// The context a slot asks before the context is chosen (the placement's
 /// offer, the draft's window): the plan every Qwen3.8 measurement ran at, and
@@ -770,6 +789,7 @@ impl Place38 {
             &mut machine,
             (ctx, u64::try_from(slots)?, mtp.is_some()),
             self.page,
+            levers.kv_host,
         )?;
         beside::reserve_on(
             &mut machine,
@@ -1479,6 +1499,8 @@ pub(crate) struct Args {
     ubatch: Option<usize>,
     /// `--cache-type-k`: the KV cache's format ([`KvChoice::choose`]).
     cache_type_k: Option<String>,
+    /// `--autotune`: the load-time kernel picks, over `BLOOMERY_AUTOTUNE` ([`autotune_picks`]).
+    autotune: Option<bool>,
     /// `--plan`: the records before the load, then exit.
     plan_only: bool,
 }
@@ -1502,6 +1524,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
         api_keys: serve::flag::ApiKeys::default(),
         ubatch: None,
         cache_type_k: None,
+        autotune: None,
         plan_only: false,
     };
     let mut slots = SlotFlags::default();
@@ -1535,6 +1558,7 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
             f if serve::flag::KEYS.contains(&f) => a.api_keys.add(f, v)?,
             f if serve::flag::UBATCH.contains(&f) => a.ubatch = Some(serve::flag::number(flag, v)?),
             "--cache-type-k" => a.cache_type_k = Some(v.to_owned()),
+            "--autotune" => a.autotune = Some(autotune_word(v)?),
             "--cache-type-v" => {
                 return Err(
                     "--cache-type-v does not exist: the qwen4exp cache quantizes its K and V \
@@ -1559,6 +1583,70 @@ fn parse_args(args: &[String]) -> Result<Args, GateError> {
     }
     bloomery_gpu_gates::bind::check_slot_ctx(a.ctx, a.parallel)?;
     Ok(a)
+}
+
+/// `--autotune`'s word: `on` or `off`.
+fn autotune_word(v: &str) -> Result<bool, GateError> {
+    match v {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => Err(format!("--autotune takes on or off, not {v:?}").into()),
+    }
+}
+
+/// The load-time kernel picks of `m` under `on` ([`GpuModel::autotune`], the cost store under
+/// this build), before the first capture: an `autotune pick` line a signature and one
+/// `autotune` line with the wall; an error names `--autotune off`. Under `off` one line says
+/// today's rule runs, and nothing is timed, read or written. `/props`' `engine.autotune` is the
+/// return.
+fn autotune_picks<B: ChainBody>(m: &GpuModel<B>, on: bool) -> Result<AutotuneProps, GateError> {
+    if !on {
+        eprintln!("autotune off: today's rule, no timing and no store");
+        return Ok(AutotuneProps {
+            mode: "off".to_owned(),
+            ..AutotuneProps::default()
+        });
+    }
+    let t = m.autotune(serve::VERSION, &Store::shared()).map_err(|e| {
+        format!("autotune: {e}; --autotune off loads with today's rule and no store")
+    })?;
+    let ns = |us: f64| (us * 1e3).round() as u64;
+    let mut picks = Vec::with_capacity(t.picks.len());
+    for p in &t.picks {
+        eprintln!(
+            "autotune pick kernel={MCOL_KERNEL} {} way={} from={} rule_us={:.2} way_us={:.2}",
+            p.sig,
+            p.way.word(),
+            p.from.word(),
+            p.rule_us,
+            p.way_us
+        );
+        picks.push(PickProps {
+            kernel: MCOL_KERNEL.to_owned(),
+            signature: p.sig.to_string(),
+            way: p.way.word().to_owned(),
+            from: p.from.word().to_owned(),
+            rule_ns: ns(p.rule_us),
+            way_ns: ns(p.way_us),
+        });
+    }
+    let measured = t
+        .picks
+        .iter()
+        .filter(|p| p.from == Source::Measured)
+        .count();
+    eprintln!(
+        "autotune on signatures={} measured={measured} stored={} picked={} in {:.3} s (runtime value)",
+        t.picks.len(),
+        t.picks.len() - measured,
+        t.picks.iter().filter(|p| p.way != Mcol::Rule).count(),
+        t.wall.as_secs_f64()
+    );
+    Ok(AutotuneProps {
+        mode: "on".to_owned(),
+        ms: u64::try_from(t.wall.as_millis())?,
+        picks,
+    })
 }
 
 /// The levers (unless `read_levers` is false), flags and ubatch size ([`ubatch_rule`]) [`run`]
@@ -1747,6 +1835,11 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let kv_cache = KvChoice::choose(a.cache_type_k.as_deref(), levers.qwen3_kv_set())?;
     let kv = kv_cache.kv;
     inputs.kv = inputs.kv.in_q8_if(kv == KvQ8::Q8);
+    // The page a host-capable room takes on the stage card, read once under
+    // `BLOOMERY_KV_HOST`: every plan and reserve below rounds the planes at it.
+    if levers.kv_host() != bloomery_levers::KvHost::Off {
+        inputs.kv_host_page = Some(stage_host_page(stage)?);
+    }
     // The slot count first: it shapes the draft's window condition, the
     // context choice itself, and every plan the seat asks for, each counting
     // every sequence (`Plans::slots`). A set `--ctx-size` with no
@@ -2223,7 +2316,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         let (gdn, qsa) = layer_counts(&inputs);
         checkpoint_budget38(gdn, qsa, u64::try_from(ctx)?)?
     })?;
-    let (plan, draft_bytes) = match &mtp_inputs {
+    let (plan, draft_bytes, store) = match &mtp_inputs {
         None => (
             inputs.plan_with_slots(
                 &machine,
@@ -2233,6 +2326,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
                 slots,
             )?,
             0,
+            None,
         ),
         Some(mi) => {
             let with = inputs.plan_mtp_with_slots(
@@ -2244,7 +2338,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
                 slots,
             )?;
             let bytes = with.draft_card_bytes() + with.arena_bytes;
-            (with.plan, bytes)
+            (with.plan, bytes, Some((with.store, with.store_why)))
         }
     };
     // PIN(2026-10-23): the planner's slot-aware arena floor replaces the one-column
@@ -2253,7 +2347,15 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         .w("place", a.place.name())
         .w("card", machine.cards[0].name.as_str())
         .w("experts", experts_name(experts))
-        .u("ctx_max", plan.ctx_max)
+        .u("ctx_max", plan.ctx_max);
+    // The spread's floor, only where the lever moved it below the context;
+    // the planes' backing the load's stores take.
+    let line = match plan.kv_floor {
+        Some(floor) => line.u("kv_floor", floor),
+        None => line,
+    };
+    let line = line.w("kv_host", plan.kv_host.name());
+    let line = line
         .u("host_experts", plan.host.experts)
         .u("card_experts", plan.cards[0].experts);
     let line = match (machine.tiers.first(), plan.tier_n_l.first()) {
@@ -2267,6 +2369,12 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         None => line,
     };
     let line = record::with_room(line, plan.host.room.as_ref());
+    let line = match store {
+        Some((rows, why)) => line
+            .u("mtp_rows", rows.rows())
+            .w("mtp_rows_why", why.word()),
+        None => line,
+    };
     let line = line
         .csv("devices", record::plan_devices(&machine))
         .w("cuda_order", record::cuda_order());
@@ -2320,6 +2428,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let off_why = draft_off.clone();
     let open = SeatArgs {
         kv,
+        kv_host_page: inputs.kv_host_page,
         place: a.place,
         lane: lane.expect("a serving run probed the lane before the plan"),
         ctx,
@@ -2351,6 +2460,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         width,
         cache_ram: cache.ram,
         vision,
+        autotune: a.autotune.unwrap_or(levers.autotune()),
     };
     let engine = SeatEngine::spawn(
         move || Q38::open(open),
@@ -2537,6 +2647,10 @@ struct SeatArgs {
     room: (u64, HostRead),
     /// The KV cache's format the main thread's plans counted ([`KvChoice::choose`]).
     kv: KvQ8,
+    /// The page a host-capable room takes, read under `BLOOMERY_KV_HOST`
+    /// ([`PlanInputs::kv_host_page`]): the engine thread plans from it, as
+    /// the main thread's plans did.
+    kv_host_page: Option<u64>,
     /// The plan the main thread's rules and records read, which the load's
     /// plan is held to.
     plan: PlanKey,
@@ -2590,6 +2704,8 @@ struct SeatArgs {
     /// (`GpuModel::enable_media`) and its tower is opened after the captures
     /// ([`vision_seat::open_resident`]).
     vision: Option<vision_seat::Opened>,
+    /// Whether the load makes its kernel picks before the first capture ([`autotune_picks`]).
+    autotune: bool,
 }
 
 /// The Qwen3.8 session on the engine thread: the session over the model,
@@ -2656,12 +2772,17 @@ struct Q38 {
     /// them those another slot maps too, at its last `kv room` line
     /// ([`Q38::print_room`]).
     room: Vec<(usize, usize)>,
+    /// The host bytes each slot's K/V planes held at its last `kv room` line
+    /// (`BLOOMERY_KV_HOST`; 0 under `off`).
+    room_host: Vec<usize>,
     /// The copy stream and the pinned staging the prompt cache's saves are
     /// made on ([`Seat::snapshots_async`]); none with the cache off.
     lane: Option<SaveLane>,
     /// The resident image encoder under `--mmproj` ([`vision_seat::open_resident`]).
     #[cfg(feature = "vision")]
     vision: Option<vision_seat::Resident>,
+    /// The load's kernel picks, `/props`' `engine.autotune`.
+    autotune: AutotuneProps,
 }
 
 impl Q38 {
@@ -2693,6 +2814,7 @@ impl Q38 {
         let mut inputs = PlanInputs::describe(model.header())?;
         inputs.room = a.room.clone();
         inputs.kv = inputs.kv.in_q8_if(a.kv == KvQ8::Q8);
+        inputs.kv_host_page = a.kv_host_page;
         let cap = serve_ctx(u64::try_from(a.ctx)?, &inputs.spec)?;
         let ub = a.ubatch.min(a.ctx);
         let ctx_ub = (u64::try_from(a.ctx)?, u64::try_from(ub)?);
@@ -2823,10 +2945,11 @@ impl Q38 {
                 None => "full".to_string(),
             };
             eprintln!(
-                "load draft=mtp resident={} arena={} head={head} card_bytes={bytes} (the \
-                 plan's {}) in {:.1} s (runtime value)",
+                "load draft=mtp resident={} arena={} store_rows={} head={head} \
+                 card_bytes={bytes} (the plan's {}) in {:.1} s (runtime value)",
                 d.resident_bytes(),
                 d.arena_bytes(),
+                d.store_walk_rows(),
                 a.draft_bytes,
                 t.elapsed().as_secs_f64(),
             );
@@ -2839,6 +2962,7 @@ impl Q38 {
                     .eprint();
             }
         }
+        let autotune = autotune_picks(&m, a.autotune)?;
         let counts = m.body(WHAT)?.step_launches();
         let nodes = m.capture_step()?;
         eprintln!("{}", step_census(nodes, counts, &m.step_graph_nodes()?)?);
@@ -2874,7 +2998,7 @@ impl Q38 {
         }
         let drafts = match (a.mtp, a.lookup) {
             (true, _) => SlotDrafts::open(&mut s, a.slots, a.width, &mut Captures, |m| {
-                MtpDraft::open(m, Prompt38::Auto, StepMode::Graph)
+                app::mtp::open_draft(m, Prompt38::Auto, StepMode::Graph)
             })?,
             (false, true) => {
                 let drafts = SlotDrafts::lookup(&mut s, a.slots, a.width, &mut Captures)?;
@@ -2945,9 +3069,11 @@ impl Q38 {
             branch: std::cell::RefCell::new(vec![None; a.slots]),
             cut_line: vec![None; a.slots],
             room: vec![(0, 0); a.slots],
+            room_host: vec![0; a.slots],
             lane,
             #[cfg(feature = "vision")]
             vision,
+            autotune,
         })
     }
 
@@ -3131,28 +3257,33 @@ impl Q38 {
     }
 
     /// The `kv room` line of the selected slot when the bytes its stores by
-    /// position hold on the card moved since its last one: the selecting
-    /// stores' and the draft store's pages get memory as a call reaches
-    /// them, and a reset gives back those the ended sequence left
-    /// (`Body38::store_room`), and a slot that took another's prefix maps
-    /// that slot's pages until either writes below it or resets
-    /// (`Body38::store_shared`). The line names the slot, its positions, the
-    /// bytes its pages hold, those of them another slot maps too, and their
-    /// unrounded layout bytes. The machine reserves page rounding separately
-    /// before admission.
+    /// position hold moved since its last one: the selecting stores' and the
+    /// draft store's pages get memory as a call reaches them, and a reset
+    /// gives back those the ended sequence left ([`Body38::store_room`]), a
+    /// slot that took another's prefix maps that slot's pages until either
+    /// writes below it or resets ([`Body38::store_shared`]), and under
+    /// `BLOOMERY_KV_HOST` the planes' pages back on the host
+    /// ([`Body38::kv_planes_room`]). The line names the slot, its positions,
+    /// the bytes its pages hold on the card, those of them another slot maps
+    /// too, the host bytes the planes hold, and their unrounded layout
+    /// bytes. The machine reserves page rounding separately before
+    /// admission.
     fn print_room(&mut self) -> Result<(), GateError> {
         let slot = self.s.selected();
         let body = self.s.model().body("bloomery-serve-qwen38")?;
         let ((mapped, layout), shared) = (body.store_room(), body.store_shared());
-        if self.room[slot] != (mapped, shared) {
+        let hosted = body.kv_planes_room().1;
+        if self.room[slot] != (mapped, shared) || self.room_host[slot] != hosted {
             Record::new(&record::KV_ROOM)
                 .u("slot", slot)
                 .u("positions", self.s.pos())
                 .u("mapped_bytes", mapped)
                 .u("shared_bytes", shared)
+                .u("kv_host_bytes", hosted)
                 .u("layout_bytes", layout)
                 .eprint();
             self.room[slot] = (mapped, shared);
+            self.room_host[slot] = hosted;
         }
         Ok(())
     }
@@ -3660,6 +3791,7 @@ impl Seat for Q38 {
     /// file, its width and its resident bytes as the card's `draft`
     /// class.
     fn props(&self, mut p: EngineProps) -> EngineProps {
+        p.autotune = Some(self.autotune.clone());
         if self.drafts.looks_up() {
             return lookup_props(p);
         }
@@ -4102,6 +4234,7 @@ mod tests {
             room: (u64::MAX, HostRead::Given),
             row_source: RowTableSource::Parts,
             arena: None,
+            kv_host_page: None,
         };
         let card = DeviceInfo {
             ordinal: 0,
@@ -4171,6 +4304,7 @@ mod tests {
             latent: None,
             pre_exp_norm: false,
             post_exp_norm: None,
+            sum_norm: false,
             act: Act::SwiGlu { limit: None },
             router: Router {
                 score: Score::Softmax,

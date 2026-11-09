@@ -1,6 +1,7 @@
 //! The KDA mixer of one layer over `m` rows: the one launch sequence every
-//! KDA family runs (GLM-5.3-Flash, Solar-Open2), over the family's own
-//! projections ([`KdaProj`]) and the buffers its body lends ([`KdaBufs`]).
+//! KDA family runs (GLM-5.3-Flash, Solar-Open2, Raon-1, Kimi K3), over the
+//! family's own projections ([`KdaProj`]) and the buffers its body lends
+//! ([`KdaBufs`]).
 //! The step is `m` = 1; a prompt batch is its `m` rows in position order,
 //! bit for bit the steps (the conv and the delta step walk the rows in order).
 //!
@@ -27,6 +28,17 @@
 //! [`CORE_LAUNCHES`] (one more with a write gate, [`KdaRule::launches`]) plus
 //! what the family's projections launch.
 //!
+//! Kimi K3 runs this sequence as it is, with the rule `Sigmoid { lower_bound: -5 }`
+//! at `beta_scale` 1 (`build_kda_layer` of llama.cpp's `kimi-k3.cpp`: the decay
+//! `exp(lb · σ(−ssm_a · (f + dt)))`, β = σ(b), the output `RMSNorm(o) · σ(g)`). Its
+//! three separate q, k and v convs are the one depthwise conv over the joined
+//! channels with the three tap sets joined in that order, and its head count is
+//! the shape's. What differs is the gate's projection: `ssm_g` is one full-rank
+//! matrix, so a K3 [`KdaProj::input`] writes `z` straight from `xn` and leaves
+//! `ga` unread and unwritten (the body lends a buffer of any size for it).
+//! [`KdaDims::of_file`] is the load-time check of a file's numbers against what
+//! the kernels tile.
+//!
 //! The mixer never clamps the state; the delta step raises its fault site
 //! when the state stops being finite.
 
@@ -36,7 +48,7 @@ use crate::linear::conv::{KdaBetaScale, KdaConvArgs, KdaGateRule};
 use crate::linear::delta::{DeltaArgs, DeltaLanesArgs, KdaLanesArgs};
 use crate::linear::norm_gate::{GdnGate, NormGateArgs};
 use crate::linear::write_gate::WriteGateArgs;
-use crate::linear::{LinearKernels, LinearShape};
+use crate::linear::{CONV_TAPS, HEAD, KHeadMap, LinearKernels, LinearShape};
 use crate::{Gpu, GpuError};
 
 /// The launches the mixer makes itself (1 and 3-5 of the module doc).
@@ -119,6 +131,68 @@ pub struct KdaDims {
     pub shape: LinearShape,
     pub rms_eps: f32,
     pub rule: KdaRule,
+}
+
+/// The numbers a KDA layer's file gives for [`KdaDims::of_file`]: its hidden
+/// width, its heads (as many query/key as value heads, every KDA family's
+/// shape), `kda.head_dim`, `ssm.conv_kernel` and `layer_norm_rms_epsilon`.
+#[derive(Clone, Copy, Debug)]
+pub struct KdaFile {
+    pub embd: usize,
+    pub heads: usize,
+    pub head_dim: usize,
+    pub conv_taps: usize,
+    pub rms_eps: f32,
+}
+
+impl KdaDims {
+    /// The dims of a KDA layer from the numbers its file gives, each refused
+    /// by name when the kernels have no geometry for it: a head width other
+    /// than [`HEAD`] or a conv of other than [`CONV_TAPS`] taps (both are
+    /// compiled into the kernels), no head, a hidden width that is not a
+    /// positive multiple of 32 (the norm's), an epsilon that is not a positive
+    /// finite number, and a rule no conv-prep entry runs ([`KdaRule::check`]).
+    /// Load-time only.
+    pub fn of_file(what: &'static str, f: KdaFile, rule: KdaRule) -> Result<KdaDims, GpuError> {
+        let bad = |detail: String| Err(GpuError::shape(what, detail));
+        if f.head_dim != HEAD {
+            return bad(format!(
+                "kda.head_dim {}: the kernels tile {HEAD} values a head",
+                f.head_dim
+            ));
+        }
+        if f.conv_taps != CONV_TAPS {
+            return bad(format!(
+                "ssm.conv_kernel {}: the kernels take a conv of {CONV_TAPS} taps",
+                f.conv_taps
+            ));
+        }
+        if f.heads == 0 {
+            return bad("no KDA head".to_owned());
+        }
+        if f.embd == 0 || !f.embd.is_multiple_of(32) {
+            return bad(format!(
+                "embedding length {}: the norm takes a positive multiple of 32",
+                f.embd
+            ));
+        }
+        if !(f.rms_eps.is_finite() && f.rms_eps > 0.0) {
+            return bad(format!(
+                "rms epsilon {}: the norms take a positive finite one",
+                f.rms_eps
+            ));
+        }
+        Ok(KdaDims {
+            embd: f.embd,
+            shape: LinearShape {
+                n_k: f.heads,
+                n_v: f.heads,
+                map: KHeadMap::Tiled,
+            },
+            rms_eps: f.rms_eps,
+            rule: rule.check(what)?,
+        })
+    }
 }
 
 /// A layer's resident f32 vectors, resolved once at load by the family.

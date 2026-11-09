@@ -137,11 +137,26 @@ pub static TIER_COST: Kind = Kind {
     doc: "Plan (b') decode with a local or node tier after the same warm history.",
 };
 
+/// The placed prompt pass's rows the plan took, before the load.
+pub static PROMPT_PASS: Kind = Kind {
+    name: "prompt_pass",
+    head: "prompt pass",
+    doc: "The placed prompt pass a placed load runs a prompt by, after its plan record: the rows of one pass (rows) and of its latent mixers' inner run (mla_rows), the pass's card bytes the plan reserved (reserve) and the stage card's room beside the plan's terms (left), which holds the prompt reserve and the tier's places together, and, when a wider shape was refused, the narrowest of those as rows/mla_rows and the bytes it fell short by (wider, short; absent when the widest shape fit).",
+    parts: &[
+        key("rows", U64, "rows"),
+        key("mla_rows", U64, "rows"),
+        key("reserve", U64, "B"),
+        key("left", U64, "B"),
+        opt("wider", Word, "rows/mla_rows"),
+        opt("short", U64, "B"),
+    ],
+};
+
 /// Where the placement puts the experts, before the load.
 pub static PLAN: Kind = Kind {
     name: "plan",
     head: "plan",
-    doc: "The placement the engine is about to load by: its card, context, where the experts sit, the routed-expert bytes the plan pages through the NVMe tier (paged), the RAM arena they page through (arena) and the slots it holds (arena_slots), 0 and 0 and 0 on a plan that pages nothing, the host room's reading the plan was made at (room) and the plan room it was held to (plan_room, the reading less the drift margin) when it was made at one, and each plan card's device (role:name:ordinal:usable bytes; the role is stage, tier<i> for an expert tier card by its place among the tier cards, or holder for a card that joins the plan to hold a reserve, a draft's, and no expert; by-name for a card a census-free plan opens by its name) under the CUDA enumeration order in force, with the card's free bytes at plan time when the census read them, and, when the card holds a file tensor in another quantization than its file's (a BF16 head in MXFP8 planes), each such tensor as tensor:file type:card format (requantized; absent when there is none).",
+    doc: "The placement the engine is about to load by: its card, context, where the experts sit, the routed-expert bytes the plan pages through the NVMe tier (paged), the RAM arena they page through (arena) and the slots it holds (arena_slots), 0 and 0 and 0 on a plan that pages nothing, the host room's reading the plan was made at (room) and the plan room it was held to (plan_room, the reading less the drift margin) when it was made at one, and each plan card's device (role:name:ordinal:usable bytes; the role is stage, tier<i> for an expert tier card by its place among the tier cards, or holder for a card that joins the plan to hold a reserve, a draft's, and no expert; by-name for a card a census-free plan opens by its name) under the CUDA enumeration order in force, with the card's free bytes at plan time when the census read them, and, when the card holds a file tensor in another quantization than its file's (a BF16 head in MXFP8 planes), each such tensor as tensor:file type:card format (requantized; absent when there is none), and, when the plan took each routed layer's experts in a router rank's order (BLOOMERY_EXPERT_RANK), the rank file's path (expert_rank, last; absent when there is none).",
     parts: &[
         key("place", Word, ""),
         key("card", Word, ""),
@@ -170,6 +185,7 @@ pub static PLAN: Kind = Kind {
         opt("devices", Csv, ""),
         opt("cuda_order", Word, ""),
         opt("requantized", Csv, "tensor:file type:card format"),
+        opt("expert_rank", Text, "router-rank file"),
     ],
 };
 
@@ -197,18 +213,105 @@ pub static TP_RANK: Kind = Kind {
     ],
 };
 
+/// One rank's preflight ledger of a tensor-parallel load.
+pub static TP_NEED: Kind = Kind {
+    name: "tp_need",
+    head: "tp need",
+    doc: "One rank's preflight ledger (generate_ds41 --preflight), in rank order, from the folder's headers alone: its rank among the ranks, its node, its pool, each item it needs (its parts of the split tensors, the whole tensors, the KV cache and ring shadows, the table rows' host staging and the page cache their reads keep, the gather slots, the card's context and scratch, and the most one part's read holds), their total, what they leave of the pool, and the folder bytes and runs the rank reads (its read-set).",
+    parts: &[
+        key("rank", U64, ""),
+        lit("/"),
+        pos("ranks", U64, "ranks"),
+        key("node", Word, ""),
+        key("pool", U64, "B"),
+        key("split", U64, "B"),
+        key("whole", U64, "B"),
+        key("kv", U64, "B"),
+        key("shadow", U64, "B"),
+        key("row_staging", U64, "B"),
+        key("row_cache", U64, "B"),
+        key("gathers", U64, "B"),
+        key("scratch", U64, "B"),
+        key("load_peak", U64, "B"),
+        key("total", U64, "B"),
+        key("left", U64, "B"),
+        key("reads", U64, "B"),
+        key("read_runs", U64, "runs"),
+    ],
+};
+
+/// The `tp_need` record of `ledger`, a rank of `ranks`, whose read-set is `reads`.
+///
+/// # Panics
+///
+/// On a need whose total passes u64, which `placement::tp::preflight` refuses before a ledger.
+pub fn tp_need(
+    ledger: &model::placement::tp::RankLedger,
+    ranks: usize,
+    reads: &[(std::path::PathBuf, std::ops::Range<u64>)],
+) -> Record {
+    let need = &ledger.need;
+    let total = need
+        .total()
+        .expect("placement::tp::preflight refuses a total past u64");
+    let mut r = Record::new(&TP_NEED)
+        .u("rank", ledger.rank)
+        .u("ranks", ranks)
+        .w("node", &ledger.node)
+        .u("pool", ledger.pool_bytes);
+    for (item, bytes) in need.items() {
+        r = r.u(item, bytes);
+    }
+    r.u("total", total)
+        .u("left", ledger.pool_bytes.saturating_sub(total))
+        .u(
+            "reads",
+            reads.iter().map(|(_, at)| at.end - at.start).sum::<u64>(),
+        )
+        .u("read_runs", reads.len())
+}
+
+/// One rank's run of a tensor-parallel greedy run.
+pub static TP_RUN: Kind = Kind {
+    name: "tp_run",
+    head: "tp run",
+    doc: "One rank's tensor-parallel greedy run (generate_ds41 --place tp), after the run: its rank among the ranks, the context the group agreed on, its load's wall time and device bytes, the prompt positions it stepped and their wall time, and the generated tokens it stepped and their rate.",
+    parts: &[
+        key("rank", U64, ""),
+        lit("/"),
+        pos("ranks", U64, "ranks"),
+        key("ctx", U64, "positions"),
+        key("load_s", F64(3), "s"),
+        key("resident_bytes", U64, "B"),
+        key("prompt", U64, "positions"),
+        key("prompt_s", F64(3), "s"),
+        key("decoded", U64, "tokens"),
+        key("decode_tps", F64(3), "tok/s"),
+    ],
+};
+
+/// The decode of a tensor-parallel run's tokens.
+pub static TP_TEXT: Kind = Kind {
+    name: "tp_text",
+    head: "tp text",
+    doc: "Rank 0's generated tokens decoded by the folder's tokenizer, as a quoted string (generate_ds41 --place tp).",
+    parts: &[key("text", Text, "")],
+};
+
 /// Where a qwen3moe-family placement puts the routed experts, before the
 /// load.
 pub static PLAN38: Kind = Kind {
     name: "plan38",
     head: "plan",
-    doc: "A qwen3moe-family placement the engine is about to load by: its card, the architecture (a placed qwen3moe or qwen35moe file names it; a qwen4exp line does not), the expert rule (host or card), the context, where the routed experts sit (each layer's id prefix on the card, a placed line stating as n_l the fewest and the most one layer keeps; under plan (b′) the expert tier card and the next ids it holds), each plan card's device as the plan record names them, the card's free bytes at plan time when the census read them, the host room's reading the plan was made at (room) and the plan room it was held to (plan_room, the reading less the drift margin) when it was made at one, and — on the placed plan a run with --place unset took because the whole file did not fit the free bytes — why it did not; for a file with a row-gathered table (a qwen4exp file's PLE table), the tier the plan reads it from (rows, host or nvme) and the host room's reading that chose it (read), and, when the card holds a file tensor in another quantization than its file's (a BF16 head in MXFP8 planes), each such tensor as tensor:file type:card format (requantized; absent when there is none).",
+    doc: "A qwen3moe-family placement the engine is about to load by: its card, the architecture (a placed qwen3moe or qwen35moe file names it; a qwen4exp line does not), the expert rule (host or card), the context, the positions a plan's expert spread runs at when BLOOMERY_KV_FLOOR moves them below the context (kv_floor; absent when the spread runs at the context itself), where a qwen4exp plan's           selecting stores back their K/V planes (kv_host, off, spill or all; absent on another           family's line), where the routed experts sit (each layer's id prefix on the card, a placed line stating as n_l the fewest and the most one layer keeps; under plan (b′) the expert tier card and the next ids it holds), each plan card's device as the plan record names them, the card's free bytes at plan time when the census read them, the host room's reading the plan was made at (room) and the plan room it was held to (plan_room, the reading less the drift margin) when it was made at one, and — on the placed plan a run with --place unset took because the whole file did not fit the free bytes — why it did not; for a file with a row-gathered table (a qwen4exp file's PLE table), the tier the plan reads it from (rows, host or nvme) and the host room's reading that chose it (read), and, when the card holds a file tensor in another quantization than its file's (a BF16 head in MXFP8 planes), each such tensor as tensor:file type:card format (requantized; absent when there is none). A plan that holds the MTP draft beside the target also prints the rows of the draft's store walk its arena is made for (mtp_rows, 64 or 512) and why (mtp_rows_why: room, the plan with the 512-row arena holds and keeps every card expert the 64-row one keeps; displaces:N, it leaves the card N fewer experts; short, the card cannot hold it; reserve, a plan (b′) machine's reserve row names the smaller arena; asked, the inputs named the rows).",
     parts: &[
         key("place", Word, ""),
         key("card", Word, ""),
         opt("arch", Word, ""),
         key("experts", Word, ""),
         key("ctx_max", U64, "positions"),
+        opt("kv_floor", U64, "positions"),
+        opt("kv_host", Word, ""),
         key("host_experts", U64, "experts"),
         key("card_experts", U64, "experts"),
         opt("n_l", Word, "experts"),
@@ -220,9 +323,58 @@ pub static PLAN38: Kind = Kind {
         opt("why", Word, ""),
         opt("rows", Word, ""),
         opt("read", Word, ""),
+        opt("mtp_rows", U64, "rows"),
+        opt("mtp_rows_why", Word, ""),
         opt("devices", Csv, ""),
         opt("cuda_order", Word, ""),
         opt("requantized", Csv, "tensor:file type:card format"),
+    ],
+};
+
+/// Where the host seat's plan puts the model, before the load.
+pub static PLAN_HOST: Kind = Kind {
+    name: "plan_host",
+    head: "plan",
+    doc: "The host seat's plan, before the load: every layer, the head and the embedding on the \
+          one host stage (the layer range the file's block_count spans), no card in the plan.",
+    parts: &[
+        key("stage", Word, ""),
+        key("layers", Word, "layers"),
+        key("head", Word, ""),
+    ],
+};
+
+/// The host seat's model in memory.
+pub static LOAD_HOST: Kind = Kind {
+    name: "load_host",
+    head: "load",
+    doc: "The host seat's model: its architecture, the file's tensor bytes its mapping holds \
+          (the need record's bytes), the positions the target holds (`ctx`), the sequences it \
+          holds (`slots`: one, the target holds no more), the layers it runs, and the load's wall.",
+    parts: &[
+        key("arch", Word, ""),
+        key("resident_bytes", U64, "B"),
+        key("ctx", U64, "positions"),
+        key("slots", U64, ""),
+        key("layers", U64, ""),
+        lit(" in "),
+        pos("load_s", F64(1), "s"),
+        lit(" s"),
+    ],
+};
+
+/// The host seat's address.
+pub static LISTENING_HOST: Kind = Kind {
+    name: "listening_host",
+    head: "bloomery-serve-host:",
+    doc: "The host seat's placement (the host stage, no card), the context its one slot serves, \
+          the slots it serves and the address it listens on.",
+    parts: &[
+        key("place", Word, ""),
+        key("ctx", U64, "positions"),
+        key("slots", U64, ""),
+        lit(" listening on http://"),
+        pos("addr", Word, ""),
     ],
 };
 
@@ -286,6 +438,7 @@ pub static LOAD: Kind = Kind {
         key("ced", Text, ""),
         opt("prefill_refusal", Text, ""),
         key("group", U64, "batches"),
+        key("cut", U64, "positions"),
         lit(" in "),
         pos("load_s", F64(1), "s"),
         lit(" s (runtime value)"),
@@ -754,11 +907,12 @@ pub static STEP0: Kind = Kind {
 pub static STAT_PREFILL: Kind = Kind {
     name: "stat_prefill",
     head: "stat prefill",
-    doc: "The host tier's batch services since load: layers, columns, host slots and the union calls' wall.",
+    doc: "The host tier's batch services since load: layers, columns, host slots, the slots left to the tiers' batch legs and the union calls' wall.",
     parts: &[
         key("union_layers", U64, ""),
         key("union_cols", U64, ""),
         key("union_host_slots", U64, ""),
+        key("union_tier_slots", U64, ""),
         key("union_ms", F64(1), "ms"),
     ],
 };
@@ -885,7 +1039,7 @@ pub static CLEF_ROWS: Kind = Kind {
 pub static NVTIER: Kind = Kind {
     name: "nvtier",
     head: "nvtier",
-    doc: "The NVMe expert tier's RAM arena on a paged load: the arena's budget (the bytes the load was granted), the arena the plan reserved and the arena the load was granted (they differ when the host's reading cut the arena at load), the paged experts it serves, the misses ensure read, the slots filled and their bytes and wall, the evictions, the resident bytes, the reads the page cache served, the drops of the model mapping's pages a read of the arena's ids brought in (the calls, the whole-page bytes named to the kernel, the wall on the reader's thread), the residency lane's reads of an id the arena serves (those that opened it filled and read its slot, and those that read the model file's mapping), and the prompt union's claims on the arena: the union calls that fit the arena whole (small) and those run in batches (batched), the ids its claims filled and the ids they found filled, and the ids claimed as keep (the hot set a call holds) and as transient (the cold end, the first victims); and the step port's pinned claims on the arena, counted apart from the union's: the ids they filled and the ids they found filled, the step layers whose claim had a miss (one a layer, not a pick), the wall those fills took as the step call measured it, and the host compute of the hit group while that fill was still in flight; whether the step port's card leg reads the arena (on) or why not (off_anon: an anonymous arena the card has no address of; off_expert_tier: a load with expert tier cards; off_cols: a page of more than one column a row; off_types: a covered layer's stack of a type no arena entry takes; off_words: a covered layer's part off a 4-byte word; off_slots: a covered layer with fewer slots than the ids a pass's rows hold at once; off_residency: the residency machine runs; unattached: the load attached none), the ids the step port held in their slots for the card leg to read; and the wall the fill reader's jobs ran, the prompt batches', the step's and the residency lane's victims' (each job's first unit's start to its last unit's end, counted when its wait saw it end).",
+    doc: "The NVMe expert tier's RAM arena on a paged load: the arena's budget (the bytes the load was granted), the arena the plan reserved and the arena the load was granted (they differ when the host's reading cut the arena at load), the paged experts it serves, the misses ensure read, the slots filled and their bytes and wall, the copies of the set the reader holds (1 with no sidecar, else 1 plus the sidecar's directories) and the fill bytes read from a copy other than the set's own, the evictions, the resident bytes, the reads the page cache served, the drops of the model mapping's pages a read of the arena's ids brought in (the calls, the whole-page bytes named to the kernel, the wall on the reader's thread), the residency lane's reads of an id the arena serves (those that opened it filled and read its slot, and those that read the model file's mapping), and the prompt union's claims on the arena: the union calls that fit the arena whole (small) and those run in batches (batched), the ids its claims filled and the ids they found filled, and the ids claimed as keep (the hot set a call holds) and as transient (the cold end, the first victims); and the step port's pinned claims on the arena, counted apart from the union's: the ids they filled and the ids they found filled, the step layers whose claim had a miss (one a layer, not a pick), the wall those fills took as the step call measured it, and the host compute of the hit group while that fill was still in flight; whether the step port's card leg reads the arena (on) or why not (off_anon: an anonymous arena the card has no address of; off_expert_tier: a load with expert tier cards; off_cols: a page of more than one column a row; off_types: a covered layer's stack of a type no arena entry takes; off_words: a covered layer's part off a 4-byte word; off_slots: a covered layer with fewer slots than the ids a pass's rows hold at once; off_residency: the residency machine runs; unattached: the load attached none), the ids the step port held in their slots for the card leg to read; and the wall the fill reader's jobs ran, the prompt batches', the step's and the residency lane's victims' (each job's first unit's start to its last unit's end, counted when its wait saw it end).",
     parts: &[
         key("budget", U64, "B"),
         key("arena_planned", U64, "B"),
@@ -895,6 +1049,8 @@ pub static NVTIER: Kind = Kind {
         key("fills", U64, ""),
         key("fill_bytes", U64, "B"),
         key("fill_ns", U64, "ns"),
+        key("copies", U64, ""),
+        key("copy_bytes", U64, "B"),
         key("evictions", U64, ""),
         key("resident_bytes", U64, "B"),
         key("buffered_reads", U64, ""),
@@ -990,12 +1146,13 @@ pub static TIER_CENSUS: Kind = Kind {
 pub static KV_ROOM: Kind = Kind {
     name: "kv_room",
     head: "kv room",
-    doc: "A slot's stores by position on the card when the bytes they hold moved since the slot's last line: the slot, its positions, the bytes its pages with memory of their own hold (the rows its sequence reached, by pages), the bytes of those pages another slot's stores map too (a prefix one took from the other), and the bytes the plan counts the stores at.",
+    doc: "A slot's stores by position on the card when the bytes they hold moved since the slot's last line: the slot, its positions, the bytes its pages with memory of their own hold (the rows its sequence reached, by pages), the bytes of those pages another slot's stores map too (a prefix one took from the other), the host bytes its K/V planes' pages hold where BLOOMERY_KV_HOST backs them off the card (kv_host_bytes; 0 under off, and absent on a line older than the lever), and the bytes the plan counts the stores at.",
     parts: &[
         key("slot", U64, ""),
         key("positions", U64, ""),
         key("mapped_bytes", U64, "B"),
         key("shared_bytes", U64, "B"),
+        opt("kv_host_bytes", U64, "B"),
         key("layout_bytes", U64, "B"),
     ],
 };
@@ -1064,6 +1221,22 @@ pub static LINK_GATHER: Kind = Kind {
         key("stale_words", U64, ""),
         key("host_wrong", U64, ""),
         key("digest", Word, ""),
+    ],
+};
+
+/// One rank's path to a peer in `link_probe`.
+pub static LINK_PATH: Kind = Kind {
+    name: "link_path",
+    head: "link path",
+    doc: "One rank's RDMA path to a peer in link_probe: the two ranks, the local and the peer's fabric address the two ends agreed on, the RoCE device and GID index of the local address, and the flow label its packets carry.",
+    parts: &[
+        key("rank", U64, ""),
+        key("peer", U64, ""),
+        key("local", Word, ""),
+        key("remote", Word, ""),
+        key("dev", Word, ""),
+        key("gid_index", U64, ""),
+        key("flow_label", U64, ""),
     ],
 };
 
@@ -1201,7 +1374,11 @@ pub static RESIDENCY_PASS: Kind = Kind {
           boundary found still on the host and not resident, which the pass it opens serves from \
           the file, and the first of them as layer:expert:site:passes, the passes each has been \
           served from the file so far; and, when a prompt call ended in the pass before the boundary, the \
-          flips it picked (its admits over every layer and unit of the call).",
+          flips it picked (its admits over every layer and unit of the call); and the slots \
+          withdrawn over the machine's layers at the boundary: the tail releases less the \
+          restores, per layer in the slot ledger, and the device bytes the layers' stacks have \
+          given back and not had backed again (withdrawn_bytes). Older records omit the \
+          withdrawn count and the withdrawn bytes.",
     parts: &[
         key("pass", Word, ""),
         key("boundary", U64, ""),
@@ -1226,6 +1403,8 @@ pub static RESIDENCY_PASS: Kind = Kind {
         opt("faulting", U64, ""),
         opt("faulting_first", Csv, ""),
         opt("picked", U64, ""),
+        opt("withdrawn", U64, ""),
+        opt("withdrawn_bytes", U64, "B"),
     ],
 };
 
@@ -2072,7 +2251,7 @@ pub static LISTENING_SOLAR2: Kind = Kind {
 pub static LOAD_HYBRID: Kind = Kind {
     name: "load_hybrid",
     head: "load",
-    doc: "A hybrid seat's architecture, resident bytes, per-slot context, resident slots, layers, host and card expert counts, captured step nodes, prompt group, caller pin and load wall.",
+    doc: "A hybrid seat's architecture, resident bytes, per-slot context, resident slots, layers, host and card expert counts, captured step nodes, prompt group, caller pin, the rows of the prompt pass the loaded body holds (pass_rows; absent for a body loaded with none, whose prompt is stepped or batched) and load wall.",
     parts: &[
         key("arch", Word, ""),
         key("resident_bytes", U64, "B"),
@@ -2085,6 +2264,7 @@ pub static LOAD_HYBRID: Kind = Kind {
         key("group", U64, "batches"),
         key("pin_main", Word, ""),
         key("pinned", Bool, ""),
+        opt("pass_rows", U64, "rows"),
         lit(" in "),
         pos("load_s", F64(1), "s"),
         lit(" s"),
@@ -2095,11 +2275,12 @@ pub static LOAD_HYBRID: Kind = Kind {
 pub static LISTENING_HYBRID: Kind = Kind {
     name: "listening_hybrid",
     head: "bloomery-serve:",
-    doc: "A hybrid seat's placement, per-slot context, resident slots and listening address.",
+    doc: "A hybrid seat's placement, per-slot context, resident slots and listening address, and, for a family whose body has a prompt pass, how the load runs a prompt (prompt: pass, as placed passes of the prompt_pass record's rows, or steps, one id a decode step, by --prefill steps or because the plan holds no pass shape; absent for a body with no pass).",
     parts: &[
         key("place", Word, ""),
         key("ctx", U64, "positions"),
         key("slots", U64, ""),
+        opt("prompt", Word, ""),
         lit(" listening on http://"),
         pos("addr", Word, ""),
     ],
@@ -2807,10 +2988,13 @@ macro_rules! kinds {
 pub mod groups {
     /// `serve_seats/tiered.rs` (the gate bins' shared seat module).
     pub mod tiered {
-        use crate::record::{Kind, NEED, PLAN, RESIDENCY_LEVER};
+        use crate::record::{Kind, NEED, PLAN, PROMPT_PASS, RESIDENCY_LEVER};
 
         /// A tiered seat's run: the plan it loads and its need (`tiered::run`).
         pub const RUN: &[&Kind] = &[&PLAN, &NEED];
+
+        /// The prompt pass a seat's load opens, after its plan (`tiered::run`).
+        pub const PASS: &[&Kind] = &[&PROMPT_PASS];
 
         /// The selected load's residency lever record (`tiered::run`).
         pub const LEVER: &[&Kind] = &[&RESIDENCY_LEVER];
@@ -2990,6 +3174,9 @@ pub static GATE_GEMMA_EMBEDDING2_SERVE: &[&Kind] = kinds![
 
 /// What `generate_ds41` prints, in the order it prints them.
 pub static GENERATE_DS41: &[&Kind] = &[
+    &TP_NEED,
+    &TP_RUN,
+    &TP_TEXT,
     &PLACE_UNSET,
     &WARM_LOAD,
     &WARM_SAVE,
@@ -3223,6 +3410,7 @@ pub static BLOOMERY_SERVE_HYBRID: &[&Kind] = kinds![
     groups::tiered::LEVER,
     &[&PLACE_UNSET],
     groups::tiered::RUN,
+    groups::tiered::PASS,
     groups::residency38::HOST,
     groups::fetch::FETCH,
     groups::fetch::SET,
@@ -3321,6 +3509,16 @@ pub static BLOOMERY_SERVE_NEMOTRON: &[&Kind] = kinds![
     groups::bind::CACHE,
 ];
 
+/// What the host seat of `bloomery-serve` prints, all on stderr: a `--hf`
+/// repo's resolve lines (printed by the server before the seat registers),
+/// the plan, the need, the load and the address. No cache notes (the seat
+/// runs no prompt cache) and no rounds (it serves one slot).
+pub static BLOOMERY_SERVE_HOST: &[&Kind] = kinds![
+    groups::fetch::FETCH,
+    groups::fetch::SET,
+    &[&PLAN_HOST, &NEED, &LOAD_HOST, &LISTENING_HOST],
+];
+
 /// What the raon1 seat of `bloomery-serve` prints, all on stderr: the
 /// placement and why (`place unset`), the embedding side seat when one is
 /// named, the draft rule, a `--hf` repo's resolve lines, the plan, the load
@@ -3388,6 +3586,17 @@ pub static BLOOMERY_SERVE_DECIDE: &[&Kind] = kinds![
     groups::fetch::SET,
     groups::vision_seat::RECORDS,
     &[&LISTENING_DECIDE],
+];
+
+/// What `generate_kimi_k3` prints, in the order it prints them.
+pub static GENERATE_KIMI_K3: &[&Kind] = &[
+    &PLACE_UNSET,
+    &PLAN,
+    &PROMPT_PASS,
+    &NEED,
+    &NVTIER,
+    &STAT_STEP_HOST,
+    &STAT_SUMMARY_HOST,
 ];
 
 /// What `generate_glm5next` prints, in the order it prints them.
@@ -3494,8 +3703,9 @@ pub static PROBE_NVREAD: &[&Kind] = &[&NVREAD];
 /// The readback result that `h2d_probe` prints.
 pub static H2D_PROBE: &[&Kind] = &[&H2D_READBACK];
 
-/// The record `link_probe` prints under `--gather`: one line a rank.
-pub static LINK_PROBE: &[&Kind] = &[&LINK_GATHER];
+/// The records `link_probe` prints: a line a peer path, and under `--gather`
+/// one line a rank.
+pub static LINK_PROBE: &[&Kind] = &[&LINK_PATH, &LINK_GATHER];
 
 /// The width chooser's state on `r`, a `draft summary` or an `mtp width`
 /// record: the gate's width, each width's cost median in ms (`-` while
@@ -3701,7 +3911,38 @@ pub fn plan(place: &str, machine: &Machine, plan: &Plan<'_>) -> Record {
     let r = r
         .csv("devices", plan_devices(machine))
         .w("cuda_order", cuda_order());
-    with_requantized(r, plan.model)
+    let r = with_requantized(r, plan.model);
+    with_expert_rank(r, plan.expert_rank.as_deref())
+}
+
+/// The `prompt_pass` record: a pass of `rows` rows whose latent mixers run `mla_rows` at a
+/// time, its `reserve` bytes, the stage card's `left` room beside the plan's terms (which holds
+/// the prompt and the tier reserves together), and the narrowest wider shape the plan refused
+/// (`rows`, `mla_rows`, the bytes it fell short by).
+pub fn prompt_pass(
+    (rows, mla_rows): (usize, usize),
+    (reserve, left): (u64, u64),
+    wider: Option<((usize, usize), u64)>,
+) -> Record {
+    let r = Record::new(&PROMPT_PASS)
+        .u("rows", rows)
+        .u("mla_rows", mla_rows)
+        .u("reserve", reserve)
+        .u("left", left);
+    match wider {
+        Some(((w, wm), short)) => r.w("wider", format!("{w}/{wm}")).u("short", short),
+        None => r,
+    }
+}
+
+/// `r` with the `expert_rank` part, the rank file the plan took each routed
+/// layer's experts in, none printed when the plan took the id order; it is the
+/// kind's last part, so the caller has put every other before it.
+pub fn with_expert_rank(r: Record, rank: Option<&model::placement::ExpertRank>) -> Record {
+    match rank {
+        Some(rank) => r.w("expert_rank", rank.path()),
+        None => r,
+    }
 }
 
 /// Each card of `machine` as the `plan` record's `devices` field names it: its
@@ -3986,6 +4227,8 @@ pub fn nvtier_of(tier: Option<&bloomery_gpu::host::nvtier::NvTier>) -> Option<Re
             .u("fills", s.fills)
             .u("fill_bytes", s.fill_bytes)
             .u("fill_ns", s.fill_ns)
+            .u("copies", s.copies)
+            .u("copy_bytes", s.copy_bytes)
             .u("evictions", s.evictions)
             .u("resident_bytes", s.resident_bytes)
             .u("buffered_reads", s.buffered_reads)
@@ -4220,10 +4463,12 @@ pub fn residency_pass_of(kind: PassKind, r: &PassReport) -> Record {
         .csv("unresident_last", r.unresident.last().map(|u| u.mark()))
         .u("faulting", r.faulting.count())
         .csv("faulting_first", r.faulting.first().map(|f| f.mark()));
-    match r.picked {
+    let rec = match r.picked {
         Some(picked) => rec.u("picked", picked),
         None => rec,
-    }
+    };
+    rec.u("withdrawn", r.withdrawn)
+        .u("withdrawn_bytes", r.withdrawn_bytes)
 }
 
 /// A helper thread's record: `name`, where it asked to run, the cpu it is
@@ -4730,6 +4975,7 @@ mod tests {
                     side_seat::SEAT,
                     tiered::LEVER,
                     tiered::RUN,
+                    tiered::PASS,
                     residency38::HOST,
                     hybrid::GROUP,
                     host_tier::ARENA,
@@ -4994,6 +5240,8 @@ mod tests {
             .u("fills", 4)
             .u("fill_bytes", 5)
             .u("fill_ns", 6)
+            .u("copies", 1)
+            .u("copy_bytes", 0)
             .u("evictions", 7)
             .u("resident_bytes", 8)
             .u("buffered_reads", 9)
@@ -5090,6 +5338,21 @@ mod tests {
         assert_eq!(
             plan38,
             "plan place=a card=A6000 experts=card ctx_max=4096 host_experts=11735 card_experts=12841"
+        );
+        let drafted = Record::new(&PLAN38)
+            .w("place", "a")
+            .w("card", "GB10")
+            .w("experts", "card")
+            .u("ctx_max", 4096)
+            .u("host_experts", 0)
+            .u("card_experts", 14_336)
+            .u("mtp_rows", 512)
+            .w("mtp_rows_why", "room")
+            .line();
+        assert_eq!(
+            drafted,
+            "plan place=a card=GB10 experts=card ctx_max=4096 host_experts=0 card_experts=14336 \
+             mtp_rows=512 mtp_rows_why=room"
         );
         let decide = Record::new(&LISTENING_DECIDE)
             .w("model", "m-Q3_K_M.gguf")
@@ -5339,6 +5602,38 @@ mod tests {
         plan card bytes 23113320896 (dense 3891325376 + experts 19221995520) host bytes \
         239830005760\n\
         plan (b′): A6000 (GPU1) 48642009536 B, tier 3090 (GPU0) 881 experts 14777118720 B";
+
+    /// A rank's ledger prints every item of its need, their total, what they leave of the pool
+    /// and its read-set's bytes and runs.
+    #[test]
+    fn a_tp_need_line_names_every_item() {
+        use model::placement::tp::{RankLedger, RankNeed};
+        let need = RankNeed {
+            split: 10,
+            whole: 2,
+            kv: 3,
+            ..RankNeed::default()
+        };
+        let ledger = RankLedger {
+            rank: 1,
+            node: "n1".into(),
+            pool_bytes: 100,
+            need,
+        };
+        let reads = [("a".into(), 0..5), ("a".into(), 9..12)];
+        let line = tp_need(&ledger, 4, &reads).line();
+        for part in [
+            "split=10",
+            "kv=3",
+            "load_peak=0",
+            "total=15",
+            "left=85",
+            "reads=8",
+            "read_runs=2",
+        ] {
+            assert!(line.contains(part), "{part} in {line}");
+        }
+    }
 
     /// Every kind of every binary's list, rendered by [`Record`] with every
     /// part given (each flag set) and with every optional part left out, reads
@@ -5601,6 +5896,67 @@ mod tests {
         let plan = Log::of(&named, BLOOMERY_SERVE_QWEN3).one(&PLAN38).unwrap();
         let want = format!("output.weight:{}:mxfp8_planes", GgmlType::BF16);
         assert_eq!(plan.csv("requantized"), Ok(vec![want.as_str()]), "{named}");
+    }
+
+    /// A plan line names the rank file the plan took its experts in, last, and
+    /// a plan in id order prints no part, both through [`plan`], the line every
+    /// binary prints. Mutant: `plan` leaving out its `with_expert_rank` call,
+    /// or the helper printing nothing.
+    #[test]
+    fn a_plan_line_names_the_rank_the_plan_took_its_experts_in() {
+        use gguf::GgmlType;
+        use model::placement::{
+            ExpertRank, KvBytes, ModelTensor, ModelTensors, PlanLevers, Role, plan_with,
+        };
+        struct NoKv;
+        impl KvBytes for NoKv {
+            fn layer_bytes(&self, _: usize, _: u64) -> u64 {
+                0
+            }
+        }
+        let model = ModelTensors {
+            tensors: vec![ModelTensor {
+                name: "ffn_gate_exps.weight".to_string(),
+                shard: 0,
+                layer: Some(0),
+                role: Role::RoutedExperts,
+                ty: GgmlType::Q4_K,
+                dims: vec![256, 4, 8],
+                file_bytes: 0,
+                gathered_rows: None,
+            }],
+            layers: 1,
+            experts: 8,
+            experts_used: 2,
+            bf16_words: |_| false,
+        };
+        let machine = workstation::plan_on(workstation::A6000, 1);
+        let kv = NoKv;
+        let in_id_order = plan_with(&model, &machine, 1088, &kv, None).expect("a plan");
+        let plain = plan("cuda0", &machine, &in_id_order).line();
+        assert!(!plain.contains("expert_rank"), "{plain}");
+        let rank = ExpertRank::parse(
+            "/data/router/v41-rank.tsv",
+            "# router-rank\tn_expert=8\tn_used=2\tsets=a\tpositions=1\n0\t7,6,5,4,3,2,1,0\n",
+        )
+        .expect("a rank over eight experts");
+        let levers = PlanLevers {
+            expert_rank: Some(std::sync::Arc::new(rank)),
+            ..PlanLevers::default()
+        };
+        let by_rank = model::placement::plan(&model, &machine, 1088, &kv, &levers)
+            .expect("a plan under the rank");
+        let named = plan("cuda0", &machine, &by_rank).line();
+        let fields = Log::of(&named, BLOOMERY_SERVE_DS41).one(&PLAN).unwrap();
+        assert_eq!(
+            fields.text("expert_rank"),
+            Ok("/data/router/v41-rank.tsv"),
+            "{named}"
+        );
+        assert!(
+            named.ends_with("expert_rank=/data/router/v41-rank.tsv"),
+            "{named}"
+        );
     }
 
     /// An optional part the line leaves out reads as absent, and the parts

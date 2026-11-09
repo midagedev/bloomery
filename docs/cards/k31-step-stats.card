@@ -1,0 +1,45 @@
+# k31rel. The engine-thread sample of the arena route (tools/ref/k31-engine-sample.sh, /root/k31-engine-sample, serve at
+# BLOOMERY_HOST_ROOM=232G, D=512, tg 3.60) read the decode thread's cycles as dot_iq1s_q8k_avx2 45.7 % + host::step::wait_go
+# 35.4 % of its on-CPU time (77 % of wall), the rest futex waits of 1-4 ms (30 a step, 64 ms), and the 16 nvtier-fill
+# threads' pread64 at 2.4 ms a call (the block layer's own issue-to-complete, 1-8 ms at 0.5-2 MiB: a layer's misses drain at
+# the drive's rate, ~13 MB in flight). The decode thread is the pool's caller lane, so its dot share is every lane's:
+# [derived] per 278 ms step the host experts' dot is ~100 ms (0.457 x 0.77 x 278; 4.45 GB at ~44 GB/s over 32 lanes, half
+# the kernel's 84 GB/s microbench rate, ml4-iq1rate.card), the wait for the card's go ~75 ms (0.354 x 0.77 x 278), the fill
+# waits ~64 ms, other ~40. The "DRAM 30 ms + cards 10 ms" of the earlier timeline was two misreads: the host dot is
+# compute-bound on IQ1_S, and the card's per-layer chain is ~0.8 ms, not ~0.1. This probe reads the same step with the
+# engine's own counters instead of a sampler: generate_kimi_k3 under BLOOMERY_STEP_STATS=1 (host_stats::Probe: leg_us the
+# host wall from go seen to signal summed over the step's services, gap_* the card's time from the host's signal to the
+# next go, parks and straggle), and the nvtier record before and after the steps (fill_ns, fill_bytes, misses).
+kind: calibration
+question: how does one K3.1 bp decode step at the 232G arena plan split between the host leg (fill wait + experts) and the card's chain, by the engine's counters?
+term: stat summary leg_us_mean (host wall per step, summed over 92 services) beside the step's wall and gap_p50_us
+unit: us
+predict: 150000..210000
+condition: generate_kimi_k3 --place bp --ctx 2048 --mode graph, the first 64 prose ids, -n 48, BLOOMERY_HOST_ROOM=232G
+  BLOOMERY_STEP_STATS=1, the K3.1 Pro IQ1_S file at /models, both cards (BLOOMERY_CARD=both), one process, no lease (a
+  counter read, not a timing); tools/ref/k31-step-stats.sh
+reason: [derived] leg = dot ~100 + fill ~64 + dispatch ~10 = 150-210 ms of a ~280 ms step; the card's gaps p50 0.5-1.0 ms,
+  summed 50-90 ms; nvtier fill_ns delta / 48 steps ~60-70 ms, fill_bytes ~0.34 GB a step (k31-arena-warm.card)
+decide-in: the step is host-bound in two terms the sampler named: the fix round targets the host leg first (the fill
+  wait overlapped with the hits' dot, then the IQ1_S lane rate), the card's chain second
+decide-below: under 150 ms: the host leg is smaller than the sample said and the card's chain (gaps) holds the rest: nsys of
+  the per-layer chain before any host work
+decide-above: above 210 ms: the host leg is the whole step; the gaps are near zero and the card is waiting on the host every
+  layer: the IQ1_S dot and the fill are the only terms
+# outcome 2026-11-07 (/root/k31-step-stats, generate_kimi_k3 ed6f95ed, D=64 N=48, load 33.6 s, 47 probed steps, the arena cold:
+#  this run has only 112 positions, the arena warms over ~250): leg_us_mean 343,418, above the band; gap_p50 726-730 us every
+#  step (min 115-480, max 770-1110), straggle_us 94-490 (max 5.4 ms once), parks 1,800-2,700 a step, host_slots 1,370 of the
+#  1,472 picks (93 %), majflt 0. nvtier over the 47 steps: fills 7,153 (152 a step), fill_bytes 47.3 GB (1.0 GB a step, cold),
+#  step_fill_wall 8.90 s (189 ms a step), 6.6 MB a fill. So the cold leg = fill 189 + host experts ~154 ms, and the card's
+#  chain = 92 x 0.73 = 67 ms: 343 + 67 = 410 ms a step, 2.4 tok/s in this window. Read at the warm fill of
+#  k31-arena-warm.card (0.34 GB a step = ~64 ms at this rate): leg ~218 + card 67 = ~285 ms, the 278 ms step measured at
+#  D=512. The step, named: host experts ~150 ms (1,370 picks x 6.6 MB = 9.0 GB a step at ~60 GB/s over 32 lanes; the
+#  kernel's microbench 84 GB/s puts the floor at ~107, DRAM's 148 at ~61), fill wait ~64 (serial, under nothing), the
+#  card's chain ~67 (0.73 ms a layer, the go after the host's signal). decide-above's case: the host leg is the step; the
+#  earlier "DRAM 30 + cards 10" was 9.0 GB read as 4.45 and the card's per-layer chain read as a launch count. Levers in
+#  order: the fill under the hits' dot (host/step.rs: dispatch the filled picks' rows, join the fill, then the misses;
+#  -min(64, ~140) ms), the reader's mirror (nvme1 idle the whole run: -32 ms of fill, or 0 once overlapped), the card's
+#  per-layer chain (nsys; 0.73 ms is ~100 launches or a cross-card sync), the lane rate (60 -> 84 GB/s: dispatch and
+#  parks, BLOOMERY_THREADS=64 is refused by the physical-core pin). 10 tok/s is not reachable at 9.0 GB a step on the host:
+#  the host floor alone is ~107 ms; the ceiling with every lever is ~5.5-6.5 tok/s until more picks leave the host (the
+#  node tier) or the IQ1_S lane rate rises.

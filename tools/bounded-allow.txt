@@ -2,6 +2,7 @@
 # A child started with a bound goes through run_bounded, bounded, lease_bounded or bounded_bg (tools/gate-bound.sh); what
 # stays here is text that must spell `timeout`, never a child a runner supervises itself. Each line: a file, the exact
 # count of such lines in it, and why they may stay. A file with more fails, and so does an entry above its file's count.
+tools/gate-bound.sh 1 bound_timeout's `timeout --version`, which reads the name of the monitor and starts no child
 tools/gpu-gate.sh 2 the self-test's ordinary-bin and compiled-lib fixtures: each real runner under a failsafe timeout, independent of the runtime bound the case judges
 tools/ref/cards.sh 1 cards_view's nvidia-smi query, the same substitution beside its `command -v timeout` branch (a Mac has none), cut at 30 s
 tools/ref/lease.sh 3 the witness's nvidia-smi query, a substitution beside its `command -v timeout` branch (a Mac has none), cut at 30 s, the runner's signal waits for it; the self-test's restore-pid stub; the perf-own-timeout case's real `timeout`, the parent whose identity the case checks

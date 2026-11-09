@@ -31,6 +31,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 pub mod arch;
 pub mod attention_h128;
 mod attention_h128_ring;
+pub mod attn_res;
+pub mod autotune;
 pub mod best;
 pub mod cand;
 pub mod capsync;
@@ -61,13 +63,18 @@ pub mod hc_gated;
 pub mod head;
 pub mod host;
 pub mod hybrid;
+pub mod imatrix;
+pub mod index_key;
+pub mod indexer;
 pub mod iq;
+pub mod iq_quant;
 pub mod iq_sel;
 pub mod kpool;
 pub mod kquant;
 pub mod kv_format;
 pub mod lane;
 pub mod latent;
+pub mod latent_gated;
 pub mod linear;
 pub mod mamba2;
 pub mod mamba2_ssd;
@@ -115,6 +122,7 @@ pub(crate) mod view;
 pub mod waits;
 pub(crate) mod watchdog;
 pub mod weights;
+pub mod words;
 
 pub use fault::{FAULT_NONE, FAULT_WORDS, Fault, FaultSink, FaultSite, LAYER_HEAD, LAYER_NONE};
 pub use graph::{
@@ -123,7 +131,7 @@ pub use graph::{
     op_write,
 };
 pub use model::{GpuModel, Slots};
-pub use room::SharedPages;
+pub use room::{SharedPages, StackRoom};
 pub use watchdog::Busy as EngineBusy;
 /// The engine over the DeepSeek-V2-Lite chain — what `GpuModel` alone named
 /// before the skeleton became generic over its architecture.
@@ -266,6 +274,25 @@ pub enum GpuError {
     /// what the protocol does not, or the file its page is shared through
     /// could not be made or opened. A tier lost this way is a lost card.
     Link { what: &'static str, detail: String },
+    /// A room's fit could not back the pages the rows a sequence reached
+    /// lie on: the device holds fewer free bytes than the fit asked, and
+    /// nothing made room. `what` names the store the room backs; `detail`
+    /// the fit's terms — the positions, the bytes of new pages the fit
+    /// still asked, the page it was backing among the room's, the pages
+    /// the room had backed, and the device's free bytes then (or why they
+    /// could not be read); `source` the driver's own refusal of the page.
+    /// `asked` is the bytes of new pages the failing room still asked,
+    /// `free` the device's free bytes then (when they could be read) and
+    /// `page` the room's page: the numbers a caller that can free bytes
+    /// takes the shortfall from.
+    NoRoom {
+        what: &'static str,
+        detail: String,
+        source: Box<GpuError>,
+        asked: usize,
+        free: Option<usize>,
+        page: usize,
+    },
 }
 
 impl GpuError {
@@ -284,6 +311,31 @@ impl GpuError {
             what,
             name: name.into(),
             need,
+        }
+    }
+
+    /// A [`GpuError::NoRoom`] with `note` added to its detail: what a caller
+    /// that tried to free card bytes and still ran out says of the attempt.
+    /// Any other error is returned as it is.
+    #[must_use]
+    pub(crate) fn noting_room(self, note: impl std::fmt::Display) -> GpuError {
+        match self {
+            GpuError::NoRoom {
+                what,
+                detail,
+                source,
+                asked,
+                free,
+                page,
+            } => GpuError::NoRoom {
+                what,
+                detail: format!("{detail}; {note}"),
+                source,
+                asked,
+                free,
+                page,
+            },
+            other => other,
         }
     }
 
@@ -583,6 +635,12 @@ impl std::fmt::Display for GpuError {
                 "{what}: an earlier hybrid service failed and released the stream: {poison}"
             ),
             GpuError::Link { what, detail } => write!(f, "{what}: {detail}"),
+            GpuError::NoRoom {
+                what,
+                detail,
+                source,
+                ..
+            } => write!(f, "{what}: {detail}: {source}"),
             GpuError::Stalled {
                 what,
                 waited,
@@ -613,6 +671,7 @@ impl std::error::Error for GpuError {
             GpuError::Model(e) => Some(&**e),
             GpuError::Plan { source, .. } => Some(&**source),
             GpuError::Unsettled { source, .. } => Some(&**source),
+            GpuError::NoRoom { source, .. } => Some(&**source),
             GpuError::Fault {
                 behind: Some(e), ..
             } => Some(&**e),
@@ -2385,6 +2444,16 @@ pub fn allocation_granularity(device: usize) -> Result<usize, GpuError> {
     Ok(page)
 }
 
+/// The page a room that can back its pages on the host takes on visible
+/// device `device` ([`room::host::page_for`]): the least common multiple of
+/// the card's and the host's VMM granularities, a size `cuMemCreate` accepts
+/// at either location. A plan under `BLOOMERY_KV_HOST` reads it once for its
+/// page rounding of the planes; a card-only room keeps the card's own
+/// granularity ([`allocation_granularity`]).
+pub fn host_page(device: usize) -> Result<usize, GpuError> {
+    room::host::page_for(device)
+}
+
 /// The census row of the visible device at `ordinal` ([`census`]).
 pub(crate) fn device_info(
     ordinal: usize,
@@ -2975,6 +3044,20 @@ impl Gpu {
         Gpu::with_device(Gpu::resolve_card(name, device)?)
     }
 
+    /// `with_device` on visible device `ordinal` (the driver's, under `CUDA_VISIBLE_DEVICES`): a tool that has no
+    /// plan opens the card its `--card N` names. An ordinal no visible device has is refused by name with how many
+    /// are visible.
+    pub fn open_ordinal(ordinal: usize) -> Result<Gpu, GpuError> {
+        let visible = census()?.len();
+        if ordinal >= visible {
+            return Err(GpuError::shape(
+                "Gpu::open_ordinal",
+                format!("card {ordinal}: {visible} visible device(s)"),
+            ));
+        }
+        Gpu::with_device(ordinal)
+    }
+
     /// The ordinal of the visible device a plan's card is, with every refusal
     /// of [`Gpu::open_card`] that names a card and none of its context or
     /// module load: what a load checks before it starts work beside the open.
@@ -3058,12 +3141,7 @@ impl Gpu {
     /// `cuMemGetInfo` reports them.
     pub fn mem_info(&self) -> Result<(usize, usize), GpuError> {
         self.ctx.bind_to_thread()?;
-        let (mut free, mut total) = (0usize, 0usize);
-        // SAFETY: both out-pointers are live locals for the duration of the
-        // call, and this context is current on the calling thread (bound above).
-        let rc = unsafe { cuda_core::sys::cuMemGetInfo_v2(&mut free, &mut total) };
-        graph::cu(rc, "cuMemGetInfo")?;
-        Ok((free, total))
+        current_mem_info()
     }
 
     /// The driver's minimum allocation granularity for device memory on this
@@ -4078,4 +4156,16 @@ mod context_tests {
             other => panic!("a failure that is no refusal: {:?}", other.map(|_| ())),
         }
     }
+}
+
+/// `(free, total)` device bytes of the context current on the calling
+/// thread, as `cuMemGetInfo` reports them; a thread with no current context
+/// gets the driver's error, named.
+pub(crate) fn current_mem_info() -> Result<(usize, usize), GpuError> {
+    let (mut free, mut total) = (0usize, 0usize);
+    // SAFETY: both out-pointers are live locals for the duration of the call;
+    // the driver reads no other memory of ours.
+    let rc = unsafe { cuda_core::sys::cuMemGetInfo_v2(&mut free, &mut total) };
+    graph::cu(rc, "cuMemGetInfo")?;
+    Ok((free, total))
 }

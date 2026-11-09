@@ -1,0 +1,27 @@
+kind: baseline
+question: what are 0.3.13's headline decode and prompt rates for V4.1-Flash UD-IQ3_XXS at the serving defaults on the release tarball's bloomery-serve, --place bp (RTX A6000 + RTX 3090) and --place a (RTX 3090 alone)
+term: decode tok/s of V4.1-Flash at D=512, the release tarball's bloomery-serve, --place bp, ctx unset
+unit: tok/s
+predict: 36.0..45.0
+condition: one hold, tools/release/sitting.sh through just release-sitting 0.3.13 --binary portable; cells target/release-dist/cells-0.3.13.tsv; tools/ref/depth-serve.sh arms D=512 and D=4096, 2 rounds, each round a fresh server with every lever unset and ctx unset
+reason: 0.3.12's sitting on the same file and cards read 40.83 and 40.94 tok/s at D=512 (36.46 and 36.07 at D=4096, pp 111..124 at 512 and 331..340 at 4096) [measured]; nothing since changes the two-card decode path with no lever set (the expert tier and the rank file are opt-in and unset here), so the band is 0.3.12's rows ±10 %; the `a` cell (the 3090 alone) is read beside it with no band of its own: its one reference is the README's one-3090 row of the 0.3.10 tree (34.73 tg at D=512, pp 167 at 512 and 300 at 4096, ctx 4300)
+decide-in: write the rows into the release notes' table with these conditions
+decide-below: under 36.0: a lever or a plan drifted; read the plan line and the witness block before writing a number, compare with 0.3.12's bp rows in the same table
+decide-above: beyond 45.0: read the witness block and the plan line (the room, the place) before crediting
+# outcome 2026-11-07 on k31rel f1596bff4 (sm86 tarball's bloomery-serve sha 7cb7e5ad…): two sittings. The first, with the paused HF
+#  uploader holding 8.3 GB RSS (MemAvailable 249 GB before the load, 255.7 GB at the 16c710de2 sitting), read tg 34.28 / 40.00 @512,
+#  35.21 / 36.29 @4096, pp 69 / 101 @512, 291 / 307 @4096 (majflt 74-121 k): below 36.0 = the plan drifted on the live host room
+#  (decide-below). The re-sit with the uploader killed: tg 42.22 / 40.91 @512, 38.30 / 38.75 @4096; pp 105.62 / 86.64 @512,
+#  354.37 / 319.47 @4096; load 60-65 s; majflt 133-281 k; green. The release's rows.
+# outcome 2026-11-07 on main 29fd27d60 (the shipped sm86 tarball's bloomery-serve, sha 2a14d50d…): two sittings. Sitting 5: tg 41.58 @512,
+#  35.26 @4096; pp 105.22 @512, 344.14 @4096; load 82 / 61 s; majflt 26-65 k; red on second_request_equals_first (the replay split at
+#  token 2, the top-2 gaps 1.538 against the near-tie band 1.485, residency mid-p31-s1 moving experts). Sitting 6, the same tarball:
+#  two rounds: tg 40.84 / 42.60 @512, 38.69 / 36.42 @4096; pp 124.12 / 126.50 @512, 359.46 / 350.23 @4096; load 55-61 s; majflt 34-95 k;
+#  the replay identical (PASS); green. In band; the release's rows are sitting 6's (the notes' table), sitting 5 named beside them.
+# outcome 2026-11-08 on main 42c0cf5af (the tag's sm86 tarball d7dfc68d…, its bloomery-serve sha cf9fadae…): sitting 7, two rounds:
+#  tg 41.36 / 40.53 @512, 35.80 / 37.37 @4096; pp 113.64 / 107.04 @512, 345.99 / 337.81 @4096; load 57-87 s; majflt 28-88 k; the replay
+#  identical (PASS); green. In band; the release's rows are sitting 7's (the notes' table), sittings 5 and 6 of 29fd27d60 named beside them.
+# outcome 2026-11-08 on rel3013 79893871104b (the re-cut's sm86 tarball 2d5e1100…, its bloomery-serve sha cd27f240…): sitting 8, two
+#  rounds: tg 40.80 / 38.15 @512, 24.29 / 33.29 @4096; pp 104.85 / 96.62 @512, 281.24 / 323.25 @4096; load 55-85 s; majflt 26-66 k; the
+#  replay split at token 5 of 13 inside the band (PASS); green. The 512 rows and round 2's 4096 row in band; round 1's 4096 row below it,
+#  with no code change behind it found (the re-cut touches K3.1 only; canon-check 2,016 entries identical). The re-cut notes carry all four.

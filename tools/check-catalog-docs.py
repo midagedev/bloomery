@@ -72,6 +72,8 @@ OUTSIDE_MODELS = {
     "lev": "a decision model: the catalog holds chat models",
     "raon-1-mini-preview": "the raon1 seat has no catalog row yet",
     "deepseek-v2-lite-chat": "the first model, still gated, with no catalog row",
+    "kimi-k3": "the kimik3 seat has no catalog row yet (a two-card, 594 GB load)",
+    "kimi-k3.1-pro": "our own set, not uploaded yet; the kimik3 seat has no catalog row",
 }
 # Catalog models with no row in docs/models.md, and why.
 UNDOCUMENTED = {

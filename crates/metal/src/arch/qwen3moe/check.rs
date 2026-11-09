@@ -2,6 +2,12 @@
 //! tensor table alone: the one owner of every refusal the open makes before it
 //! allocates a buffer.
 //!
+//! The room rule ([`room`]) is the one refusal the header alone cannot decide:
+//! the bytes the load asks of the driver held to the device's free bytes, a
+//! reading the caller hands over (the open the census's, the plan the same
+//! figure). [`check_room`] appends its refusal to a clean check's items, so
+//! the plan's verdict and the open's are one rule's.
+//!
 //! [`check`] reads the file's description (the architecture verdict), the
 //! plan of each layer's two halves at the types Metal's mat-vecs launch, and
 //! the arena's own shape, type and geometry rules over the tensors the plan
@@ -37,13 +43,14 @@ use gguf::Split;
 use gguf::quant::GgmlType;
 use model::arch::models::{Act, Ffn, LayerSpec, Mixer as SpecMixer, ModelSpec};
 use model::arch::names;
+use runtime::seqstate::Price;
 
 use super::arena::LANES;
 use super::rows::RowsLens;
-use super::session::{PROJECTED, SITES, SessionError, WHAT, pass_rows_max};
+use super::session::{CHECKPOINT_EVERY, PROJECTED, SITES, SessionError, WHAT, pass_rows_max};
 use crate::geom::Geometry;
 use crate::instance::{self, Instance};
-use crate::kernels::{HeadMap, MAX_SEGMENTS, Quant, segments_for_keys, shared_entry};
+use crate::kernels::{HeadMap, MAX_SEGMENTS, Quant, SNAPS, segments_for_keys, shared_entry};
 
 /// The arena's name in a refusal.
 const ARENA: &str = "qwen35moe arena";
@@ -464,7 +471,8 @@ pub struct Summary {
 }
 
 /// What [`check`] found: the description, every refusal, and the checked file
-/// when there is no refusal.
+/// when there is no refusal ([`check_room`] appends the room rule's item
+/// beside a `checked` that stays, for the byte lines the plan prints).
 pub struct Outcome {
     pub spec: Option<Summary>,
     pub items: Vec<Item>,
@@ -543,6 +551,114 @@ pub fn check(split: &Split, ctx: usize) -> Outcome {
         checked: if items.is_empty() { checked } else { None },
         items,
     }
+}
+
+/// [`check`] with the open's room rule ([`room`]) appended as one more item:
+/// the plan's verdict and the open's cannot disagree. `free` is the device's
+/// free bytes as the census reads them, or the reason they could not be read,
+/// which is a refusal of its own. A clean check's `checked` stays beside the
+/// item, for the byte lines the plan prints with it; the open runs [`room`]
+/// itself, on the far side of `checked_or_first`. The plan prices the
+/// checkpoints at the binaries' spacing, [`CHECKPOINT_EVERY`].
+#[must_use]
+pub fn check_room(split: &Split, ctx: usize, free: Result<u64, String>) -> Outcome {
+    let mut outcome = check(split, ctx);
+    let Some(checked) = &outcome.checked else {
+        return outcome;
+    };
+    let refused = match free {
+        Ok(free) => room(split, checked, CHECKPOINT_EVERY, free).err(),
+        Err(e) => Some(super::session::refuse(format!(
+            "the device's free bytes could not be read: {e}"
+        ))),
+    };
+    if let Some(error) = refused {
+        outcome.items.push(Item { layer: None, error });
+    }
+    outcome
+}
+
+/// The open's room rule: the bytes the session asks of the driver — every
+/// class [`Bytes`] counts, the open's buffers and the copies it makes later
+/// with checkpoints every `every` positions, the requested total — held to
+/// `free`, the device's free bytes as the census reads them (the working set
+/// less this process's allocation and the host's available memory, the
+/// smaller). The requested side is the ask itself; the paged figure is an
+/// upper bound the driver's own count can fall short of, and a rule that read
+/// it would refuse loads the driver holds. A load that passes the room is
+/// refused by name, with the largest cache of rows that fits taken from the
+/// byte formula itself, before any buffer is made.
+pub fn room(split: &Split, checked: &Checked, every: u32, free: u64) -> Result<(), SessionError> {
+    let bytes = checked.bytes_at(every)?;
+    if fits_room(&bytes, free) {
+        return Ok(());
+    }
+    let ctx = checked.layout.ctx;
+    Err(room_refusal(
+        &bytes,
+        free,
+        largest_ctx_of(split, ctx, every, free),
+    ))
+}
+
+/// Whether a session of `bytes` fits `free` bytes of the device's room: the
+/// requested total of every class it holds, the copies among them, against
+/// the free bytes. The room rule's one comparison; [`room`] words its refusal.
+#[must_use]
+pub fn fits_room(bytes: &Bytes, free: u64) -> bool {
+    bytes.held().requested <= free
+}
+
+/// The cache rows of an open that asked for none, at most `cap`: `cap` when
+/// its session fits `free` bytes of the device's room (checkpoints at
+/// [`CHECKPOINT_EVERY`], the binaries' spacing), else the largest cache below
+/// it that fits. `cap` again when even one row does not fit, or the file has
+/// another refusal, so the open refuses it by name.
+#[must_use]
+pub fn unasked_ctx(split: &Split, cap: usize, free: u64) -> usize {
+    largest_ctx_of(split, cap, CHECKPOINT_EVERY, free).unwrap_or(cap)
+}
+
+/// The refusal of a session that asks `bytes` of the driver against `free`
+/// bytes of room: the requested total, the room, and the largest cache of
+/// rows that fits when [`largest_ctx_of`] found one.
+fn room_refusal(bytes: &Bytes, free: u64, largest_ctx: Option<usize>) -> SessionError {
+    let asked = bytes.held().requested;
+    super::session::refuse(match largest_ctx {
+        Some(rows) => format!(
+            "the load asks {asked} bytes of the driver and the device's free bytes are {free}; a \
+             cache of {rows} rows fits"
+        ),
+        None => format!(
+            "the load asks {asked} bytes of the driver and the device's free bytes are {free}"
+        ),
+    })
+}
+
+/// The largest cache of at most `ctx` rows whose session fits `free` bytes:
+/// the byte formula itself at each candidate, exact because every class that
+/// scales with the cache's rows — the kv caches, the rope tables, the
+/// attention partials, the rows arena, the checkpoints — never shrinks as the
+/// rows grow. `None` when even one row does not fit.
+fn largest_ctx_of(split: &Split, ctx: usize, every: u32, free: u64) -> Option<usize> {
+    let fits = |rows: usize| {
+        check(split, rows)
+            .checked
+            .is_some_and(|checked| checked.bytes_at(every).is_ok_and(|b| fits_room(&b, free)))
+    };
+    if !fits(1) {
+        return None;
+    }
+    let (mut lo, mut hi) = (1, ctx);
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    Some(lo)
 }
 
 /// The plan of layer `l`'s mixer of kind `kind`, at the lists `sites`: the
@@ -1615,9 +1731,13 @@ impl Tally {
     }
 }
 
-/// The bytes the open makes buffers of, by class: the file's weights, the
+/// The bytes a session makes buffers of, by class: the file's weights, the
 /// attention caches, the delta layers' state and rings, the token arena's
-/// other buffers, and the rows arena.
+/// other buffers and the rows arena, which the open makes, and the copies the
+/// session makes after it: a pass's mark copies ([`SNAPS`] of each delta
+/// layer's lane and ring, made at the open or by the first pass that asks)
+/// and the checkpoints [`Price::budget`] grants at the cache's rows (a buffer
+/// a store a point, made a point at a time).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Bytes {
     pub weights: Tally,
@@ -1625,27 +1745,46 @@ pub struct Bytes {
     pub state: Tally,
     pub scratch: Tally,
     pub rows: Tally,
+    pub copies: Tally,
 }
 
 impl Bytes {
-    /// All classes together.
+    /// The classes the open makes buffers of, together: every class but the
+    /// copies.
     #[must_use]
     pub fn total(&self) -> Tally {
-        [self.weights, self.kv, self.state, self.scratch, self.rows]
-            .iter()
-            .fold(Tally::default(), |a, t| Tally {
-                buffers: a.buffers + t.buffers,
-                requested: a.requested + t.requested,
-                paged: a.paged + t.paged,
-            })
+        sum(&[self.weights, self.kv, self.state, self.scratch, self.rows])
+    }
+
+    /// Every class the session can hold, the copies among them: the room
+    /// rule's figure.
+    #[must_use]
+    pub fn held(&self) -> Tally {
+        sum(&[self.total(), self.copies])
     }
 }
 
+/// The tallies `parts` summed.
+fn sum(parts: &[Tally]) -> Tally {
+    parts.iter().fold(Tally::default(), |a, t| Tally {
+        buffers: a.buffers + t.buffers,
+        requested: a.requested + t.requested,
+        paged: a.paged + t.paged,
+    })
+}
+
 impl Checked {
-    /// The bytes the open makes buffers of: every buffer the arena makes, and
-    /// the rows arena of the pass the session holds, from the lengths the
-    /// open sizes them by.
+    /// [`Checked::bytes_at`] with checkpoints every [`CHECKPOINT_EVERY`]
+    /// positions, the binaries' spacing.
     pub fn bytes(&self) -> Result<Bytes, SessionError> {
+        self.bytes_at(CHECKPOINT_EVERY)
+    }
+
+    /// The bytes a session with checkpoints every `every` positions makes
+    /// buffers of: every buffer the arena makes and the rows arena of the pass
+    /// the session holds, from the lengths the open sizes them by, and the
+    /// copies it makes after the open ([`Bytes::copies`]).
+    pub fn bytes_at(&self, every: u32) -> Result<Bytes, SessionError> {
         let (g, geom) = (&self.layout, &self.geom);
         let mut b = Bytes::default();
         let f32s = |n: usize| count(n) * 4;
@@ -1771,7 +1910,54 @@ impl Checked {
         for bytes in lens.buffer_bytes() {
             b.rows.add(bytes);
         }
+        b.copies = self.copies(every)?;
         Ok(b)
+    }
+
+    /// The copies a session makes after the open ([`Bytes::copies`]): one
+    /// buffer of the [`SNAPS`] lane copies and one of the ring copies when a
+    /// layer is a delta layer, and the checkpoints' buffers, one a store a
+    /// point, for the points [`Price::budget`] grants at the cache's rows with
+    /// a point every `every` positions. The stores are the session's: a delta
+    /// layer's state lane and conv ring, a short conv layer's ring.
+    fn copies(&self, every: u32) -> Result<Tally, SessionError> {
+        let f32s = |n: usize| count(n) * 4;
+        let (mut stores, mut lanes, mut rings) = (Vec::new(), 0usize, 0usize);
+        for layer in &self.layout.layers {
+            match &layer.mixer {
+                MixerLayout::Delta(d) => {
+                    let lane = d.state / LANES;
+                    stores.extend([lane, d.ring]);
+                    lanes += SNAPS * lane;
+                    rings += SNAPS * d.ring;
+                }
+                MixerLayout::ShortConv(c) => stores.push(c.ring),
+                MixerLayout::Attention(_) => {}
+            }
+        }
+        let mut t = Tally::default();
+        if lanes > 0 {
+            t.add(f32s(lanes));
+            t.add(f32s(rings));
+        }
+        if stores.is_empty() {
+            return Ok(t);
+        }
+        let point: u64 = stores.iter().map(|&n| f32s(n)).sum();
+        let budget = Price {
+            point_bytes: point,
+            every,
+        }
+        .budget(count(self.layout.ctx))
+        .map_err(|e| {
+            super::session::refuse(format!("the checkpoints at {} rows: {e}", self.layout.ctx))
+        })?;
+        for _ in 0..budget / point {
+            for &n in &stores {
+                t.add(f32s(n));
+            }
+        }
+        Ok(t)
     }
 }
 
@@ -2428,6 +2614,112 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// The open's room rule: a load whose requested bytes pass the device's
+    /// free bytes is refused naming them, the room and the largest cache of
+    /// rows that fits, and the same tally with the kv a quarter lighter
+    /// opens. The largest cache that fits comes from the byte formula itself:
+    /// a room one byte under the load at 64 rows names the 63 below it.
+    #[test]
+    fn a_load_past_the_free_bytes_is_refused_by_name() {
+        let at_kv = |kv: u64| Bytes {
+            weights: Tally {
+                buffers: 507,
+                requested: 18_550_716_416,
+                paged: 18_553_241_600,
+            },
+            kv: Tally {
+                buffers: 96,
+                requested: kv,
+                paged: kv,
+            },
+            state: Tally::default(),
+            scratch: Tally {
+                buffers: 256,
+                requested: 3_643_120,
+                paged: 7_700_480,
+            },
+            rows: Tally {
+                buffers: 16,
+                requested: 313_808_912,
+                paged: 313_835_520,
+            },
+            copies: Tally::default(),
+        };
+        let free = 19_069_665_280u64;
+        let over = at_kv(402_653_184);
+        assert_eq!(over.total().requested, 19_270_821_632);
+        assert!(!fits_room(&over, free), "the load passes the free bytes");
+        let text = room_refusal(&over, free, Some(1024)).to_string();
+        assert!(
+            text.contains("19270821632") && text.contains("19069665280") && text.contains("1024"),
+            "{text}"
+        );
+        let under = at_kv(100_663_296);
+        assert_eq!(under.total().requested, 18_968_831_744);
+        assert!(fits_room(&under, free), "the quarter-kv load fits");
+        let mut copied = at_kv(100_663_296);
+        let past = free - copied.total().requested + 1;
+        copied.copies = Tally {
+            buffers: 2,
+            requested: past,
+            paged: past,
+        };
+        assert!(
+            !fits_room(&copied, free),
+            "the session's copies count against the free bytes"
+        );
+        let t = Synthetic::new();
+        let split = t.split();
+        let checked = check(&split, 64).checked.expect("a clean table");
+        let asked = checked.bytes().expect("the bytes").held().requested;
+        let refused =
+            room(&split, &checked, CHECKPOINT_EVERY, asked - 1).expect_err("a byte past the room");
+        assert!(
+            refused.to_string().contains("a cache of 63 rows"),
+            "{refused}"
+        );
+    }
+
+    /// The copies a session makes after the open: the lane and ring copies of
+    /// its one delta layer ([`SNAPS`] of each, one buffer apiece) and the
+    /// checkpoints' buffers, a lane and a ring a point, for the points the
+    /// spacing grants (64 rows: one mark and the open's point at 2048, four
+    /// and that point at 16). An open that asks no rows fits the largest
+    /// cache whose copies fit too.
+    #[test]
+    fn the_session_copies_count_in_the_room() {
+        let t = Synthetic::new();
+        let split = t.split();
+        let checked = check(&split, 64).checked.expect("a clean table");
+        let (lane, ring) = checked
+            .layout
+            .layers
+            .iter()
+            .find_map(|l| match &l.mixer {
+                MixerLayout::Delta(d) => Some((d.state / LANES, d.ring)),
+                _ => None,
+            })
+            .expect("a delta layer");
+        let f32s = |n: usize| count(n) * 4;
+        for (every, points) in [(CHECKPOINT_EVERY, 2u64), (16, 5)] {
+            let copies = checked.bytes_at(every).expect("the bytes").copies;
+            let snaps = u64::try_from(SNAPS).expect("SNAPS fits u64");
+            assert_eq!(copies.buffers, 2 + 2 * points, "every {every}");
+            assert_eq!(
+                copies.requested,
+                snaps * f32s(lane + ring) + points * f32s(lane + ring),
+                "every {every}"
+            );
+        }
+        let held = checked.bytes().expect("the bytes").held().requested;
+        assert_eq!(
+            unasked_ctx(&split, 64, held),
+            64,
+            "a room of exactly the load"
+        );
+        assert_eq!(unasked_ctx(&split, 64, held - 1), 63, "a byte under it");
     }
 
     /// A dense Llama file opens at an instance made at open with the no-norm,

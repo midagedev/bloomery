@@ -1,4 +1,7 @@
 use std::ops::Range;
+use std::sync::Arc;
+
+use bloomery_levers::KvHost;
 
 use super::Role;
 use super::card_budget;
@@ -6,6 +9,7 @@ use super::machine::{
     Device, ExpertList, Format, Machine, ModelTensor, ModelTensors, stack_experts,
 };
 use super::planner::capped;
+use super::rank::ExpertRank;
 use super::refusal::{PlacementError, Violation};
 use super::rule::{card_buffers, card_heaps, per_expert, routed_row_on_as, row_bytes, rows_of};
 use super::workstation;
@@ -181,10 +185,21 @@ pub struct HostTotals {
     /// capped at the step port's width, set by the plan's maker before the
     /// split runs; 1 for a plan that steps one column.
     pub arena_columns: u64,
-    /// Row-gathered tables held on the host.
+    /// Dense tensors held on the host: the row-gathered tables, and with no
+    /// stage card every tensor the host stage runs, the file's bytes in
+    /// place.
     pub table_bytes: u64,
     /// The cards' ring shadows, page-locked ([`KvBytes::shadow_bytes`]).
     pub shadow_bytes: u64,
+    /// The K/V planes a host-backed store holds on the host
+    /// (`BLOOMERY_KV_HOST=all`), page-rounded at the page a host-capable
+    /// room takes: 0 under `off` and `spill`. Set by [`Plan::kv_host_planes`]
+    /// past the headroom below, and counted with the shadows in the plan's
+    /// host need ([`workstation::HostNeed`]).
+    pub kv_host_bytes: u64,
+    /// The host stage's cache ([`KvBytes::layer_bytes`] over its layers and
+    /// the position rows beside it); 0 with a stage card.
+    pub stage_kv_bytes: u64,
     /// The machine's host reserves and [`HostTotals::row_reserve_bytes`],
     /// and on a plan the NVMe expert tier split, the prompt run-ahead's
     /// page-cache window ([`expert_nvme_tier`]).
@@ -261,11 +276,13 @@ pub struct Plan<'a> {
     pub host: HostTotals,
     pub nvme_bytes: u64,
     /// Per layer: how many experts its stage card holds (the ids are its
-    /// routed stacks' segments on that card, [`Segment::experts`]).
+    /// routed stacks' segments on that card, [`Segment::experts`]: the id
+    /// prefix, or under a rank the layer's hottest).
     pub n_l: Vec<u64>,
     /// Per tier of [`Machine::tiers`], per layer: how many experts the tier
     /// holds — the ids after the stage card's `n_l` and the earlier
-    /// tiers'. The host holds the rest.
+    /// tiers', or under a rank the layer's coldest, tier 0 the coldest block.
+    /// The host holds the rest.
     pub tier_n_l: Vec<Vec<u64>>,
     /// The card byte budget the plan was made under: a card planned with
     /// `min(usable, budget)` usable bytes, its budget [`card_budget::of`]
@@ -274,6 +291,91 @@ pub struct Plan<'a> {
     /// The card budget is the one [`plan_in_pool`] lowered to the NVMe
     /// expert tier's floor, not one the caller gave.
     pub budget_from_pool: bool,
+    /// The router rank the plan took each routed layer's ids in
+    /// (`PlanLevers::expert_rank`); none, the id prefix and the ids after it.
+    pub expert_rank: Option<Arc<ExpertRank>>,
+    /// The KV floor the plan's expert spread ran at
+    /// (`PlanLevers::kv_floor`, `BLOOMERY_KV_FLOOR`): the plan's cache term
+    /// holds the floor's bytes while its `ctx_max` keeps the range and rows
+    /// the rooms are planned at. None, every term at `ctx_max`.
+    pub kv_floor: Option<u64>,
+    /// The K/V planes' backing the plan was made under
+    /// (`PlanLevers::kv_host`, `BLOOMERY_KV_HOST`): under [`KvHost::All`] the
+    /// cards' cache terms drop the planes ([`KvBytes::plane_bytes`]) and the
+    /// host holds them ([`HostTotals::kv_host_bytes`]); `spill` and `off`
+    /// leave the card terms as they were.
+    pub kv_host: KvHost,
+}
+
+/// What the load of one stage card does about the output head ([`Plan::head_site`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadSite {
+    /// The card ends its stage with the head: its weights hold the head tensors.
+    Card,
+    /// No card carries the head and this card runs the last layer: the head tensors stay in the
+    /// file, read in place, and the load's body hands the model the head's host side.
+    Host,
+    /// Another stage ends the pipeline: this load carries no head.
+    Elsewhere,
+}
+
+impl Plan<'_> {
+    /// What the load of stage card `card` does about the output head. With a card carrying the
+    /// head, that card is [`HeadSite::Card`] and the others [`HeadSite::Elsewhere`]. With none the
+    /// head is read on the host: [`HeadSite::Host`] for the card that runs the last layer,
+    /// [`HeadSite::Elsewhere`] for the others.
+    ///
+    /// # Errors
+    ///
+    /// [`PlacementError::Stages`] naming the tensor and where it sits, when no card carries the
+    /// head and a head row is not one host-file segment: the host head reads nothing else.
+    pub fn head_site(&self, card: usize) -> Result<HeadSite, PlacementError> {
+        let cards = &self.machine.cards;
+        if cards.iter().any(|c| c.head) {
+            return Ok(if cards.get(card).is_some_and(|c| c.head) {
+                HeadSite::Card
+            } else {
+                HeadSite::Elsewhere
+            });
+        }
+        let elsewhere: Vec<String> = self
+            .rows
+            .iter()
+            .filter(|r| self.model.tensors[r.tensor].role == Role::Head)
+            .filter(|r| {
+                !matches!(
+                    r.segments.as_slice(),
+                    [s] if s.device == Device::Host && s.format == Format::HostFile
+                )
+            })
+            .map(|r| {
+                format!(
+                    "{} {:?}",
+                    self.model.tensors[r.tensor].name,
+                    r.segments
+                        .iter()
+                        .map(|s| (s.device, s.format))
+                        .collect::<Vec<_>>()
+                )
+            })
+            .collect();
+        if !elsewhere.is_empty() {
+            return Err(PlacementError::Stages(format!(
+                "each stage card carries no head and the plan does not leave its tensors on the \
+                 host, read in place from the file, which the host head stage reads (device, \
+                 format): {}",
+                elsewhere.join("; ")
+            )));
+        }
+        let last = cards
+            .get(card)
+            .is_some_and(|c| c.layers.end == self.model.layers);
+        Ok(if last {
+            HeadSite::Host
+        } else {
+            HeadSite::Elsewhere
+        })
+    }
 }
 
 /// The one-stage reference of a one-expert-tier plan: the stage holds the union
@@ -367,6 +469,7 @@ pub fn union_plan<'a>(plan: &Plan<'a>, flat: &'a Machine) -> Result<Plan<'a>, Pl
     out.tier_n_l.clear();
     out.card_budget = card_budget::CardBudget::default();
     out.budget_from_pool = false;
+    out.expert_rank = None;
     let (heaps, _) = card_heaps(model, flat, &out.rows);
     let card = &flat.cards[0];
     let total = &mut out.cards[0];

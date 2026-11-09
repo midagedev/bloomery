@@ -25,6 +25,7 @@
 //! flat weight stream, the one count the loader's staging and the packings
 //! that pin it must agree on.
 
+pub mod autotune;
 pub mod combine;
 pub mod costs;
 pub mod dspark;
@@ -32,6 +33,7 @@ pub mod hc_gated;
 pub mod layer;
 mod lookup;
 pub mod msa;
+pub mod mtp;
 pub mod prompt;
 pub mod qsa;
 pub mod savemap;

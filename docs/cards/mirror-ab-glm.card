@@ -1,0 +1,32 @@
+# The two-drive mirror on GLM-5.3-Flash UD-Q4_K_XL (186 GB; today on the HDD after the 11-06 move, so both copies are made:
+# nvme1 as the set's own directory, nvme0 as the mirror), a paged plan at BLOOMERY_HOST_ROOM=48G. The third of three models.
+kind: ab
+question: on a paged GLM-5.3-Flash plan does the sidecar's two-drive copy pick lift decode over the one-drive read, by how much?
+term: decode tok/s @ D=512, n_predict 128, --place unset (the plan picks), --ctx-size 4096, BLOOMERY_HOST_ROOM=48G, the
+  0.3.13 sm86 tarball's bloomery-serve; arm two = the set's <prefix>.shard-dirs sidecar naming /models' copy, arm one = no
+  sidecar; a fresh server and one cold request per row
+unit: %
+predict: +10..+40
+rounds: 3
+sd: 3.0 % docs/cards/k31-rel-serve.card, one cold paged request against the next on the same set (~3 %)
+condition: tools/ref/mirror-ab.sh under tools/ref/lease-hold.sh, both arms in one lease, the arm order rotated each round, both
+  copies verified by sha256 per shard; every row's nvtier record must say the plan paged (paged bytes > 0) and arm two's
+  iostat must show both drives reading, else the row is not read
+# derivation: [derived] the same mechanism as V4.1's card; GLM's experts at Q4_K_XL are larger a pick than IQ1_S, so the fill share
+#   of the step is nearer V4.1's; the paged share at 48G of ~124 GB of experts is the largest of the three, so the band is the
+#   same with the expectation nearer its middle
+#   the plan builds the tier's RAM arena only when the room must move over half the host leg's bytes (BLOOMERY_NVTIER_BYTES's
+#   default rule); under that the paged part reads through the file mapping, where the sidecar does nothing. 128G on V4.1
+#   printed arena=0 (the first launch, stopped), so the room is 80G: the arena is the plan's own default, no arena lever set.
+#   80G on GLM printed arena=0 too (paged 51.5 GB of 123.6 GB of host experts is under half; the launch was stopped): the room
+#   is 48G, where ~76 GB of the host leg must move, over half, so the plan builds its default arena.
+decide-in: the mirror pays on a paged GLM plan; a row beside the other two
+decide-below: under +10: read arm two's nvtier record (copies, fill_ns against the step) and the plan line before any change
+decide-above: above +40: read the witness block and arm one's iostat before crediting
+# outcome 2026-11-08 (/root/mirror-ab-glm, the 0.3.13 sm86 tarball's bloomery-serve, --ctx-size 4096, --place unset -> bp (A6000 stage,
+#  the 3090 tier), BLOOMERY_HOST_ROOM=48G, D=512 N=128, 3 rounds, order rotated; plan: card_experts 39.1 GB, host 3.5 GB, paged
+#  120.0 GB, arena 34.1 GB (the plan's default), load 32-35 s): tg one 5.52 / 5.52 / 5.50, two 8.02 / 8.57 / 8.06; pp one 30.27 /
+#  30.26 / 30.27, two 54.07 / 53.93 / 53.99. Effect tg +49.0 %, pp +78.4 %: above the band (+40), decide-above's case. arm one's
+#  iostat: nvme1n1 4,681-4,731 MB/s alone (the set's own drive, queue-bound under its rate); arm two nvme0n1 ~3,610 + nvme1n1 ~3,600
+#  = ~7,210 MB/s (1.5x one drive's), so the effect past the band is the single drive reading under its rate, as decide-above names;
+#  the witness block shows nothing else on the box. The rows repeat within 1 % but round 2's arm two (8.57, the others 8.02-8.06).

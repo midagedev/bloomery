@@ -4301,6 +4301,7 @@ mod gate {
             + c.expert_bytes / 2;
         Ok(PlanLevers {
             card_budget_bytes: Some(kept).into(),
+            ..PlanLevers::default()
         })
     }
 

@@ -13,7 +13,9 @@ checkpoint_folder	load	crates/model-hf/src/folder.rs crates/model-hf/src/arch/mo
 prompt_walks	prompt	crates/gpu/src/host/prompt_stream.rs crates/gpu/src/host/batch.rs crates/gpu/src/host/run.rs crates/gpu/src/host/step.rs crates/runtime/src/prompt.rs crates/runtime/src/splitwalk.rs crates/runtime/src/xsplit.rs crates/gpu/src/prompt_timing.rs
 seats_app	seat	crates/app/src/lib.rs crates/app/src/dspark.rs crates/app/src/mtp.rs
 seats_serve_engine	seat	crates/serve/src/engine.rs crates/serve/src/worker.rs crates/serve/src/sched.rs crates/serve/src/models.rs crates/serve/src/genloop.rs crates/serve/src/slotfile.rs
-drafts_mtp	draft	crates/model/src/arch/draft.rs crates/gpu/src/mtp.rs crates/runtime/src/speculative.rs crates/runtime/src/combine.rs crates/runtime/src/width.rs crates/runtime/src/lookup.rs crates/app/src/mtp.rs
+serve_host_seat	serve	crates/gpu-gates/src/bin/shared/serve_seats/host_seat.rs crates/serve/src/target_engine.rs
+placement_host_stage	placement	crates/placement/src/placement/rule.rs crates/placement/src/placement/planner.rs crates/placement/src/placement/table.rs crates/placement/src/placement/pool.rs crates/placement/src/placement/tests/host_stage.rs
+drafts_mtp	draft	crates/model/src/arch/draft.rs crates/gpu/src/mtp.rs crates/runtime/src/speculative.rs crates/runtime/src/combine.rs crates/runtime/src/width.rs crates/runtime/src/lookup.rs crates/app/src/mtp.rs crates/runtime/src/mtp.rs crates/runtime/src/mtp/*.rs
 drafts_dspark	draft	crates/model/src/arch/dspark.rs crates/gpu/src/dspark/*.rs crates/runtime/src/dspark.rs crates/runtime/src/selector.rs
 residency	residency	crates/gpu/src/host/residency.rs crates/gpu/src/host/census.rs crates/runtime/src/warmprof.rs crates/gpu/src/host/swap_source.rs crates/runtime/src/swaprule.rs
 serve_http_api	serve	crates/serve/src/api.rs crates/serve/src/http.rs crates/serve/src/oaicompl.rs crates/serve/src/anthropic.rs crates/serve/src/responses.rs crates/serve/src/sampling.rs crates/serve/src/stop.rs crates/serve/src/logprobs.rs crates/serve/src/promptcache.rs crates/serve/src/preflight.rs crates/serve/src/reasoning.rs crates/serve/src/flag.rs crates/serve/src/listener.rs crates/serve/src/event.rs crates/serve/src/exit.rs
@@ -24,6 +26,7 @@ serve_embed	serve	crates/serve/src/embed.rs crates/serve/src/embeddings.rs crate
 constrain	constrain	crates/serve/src/constrain/mod.rs crates/serve/src/constrain/program.rs crates/serve/src/constrain/schema.rs crates/serve/src/constrain/vocab.rs crates/serve/src/decide.rs crates/serve/src/systemone.rs
 decision_head	constrain	crates/decision/src/head.rs crates/decision/src/generative.rs crates/decision/src/request.rs crates/decision/src/rows.rs
 quant_iq	quant	crates/gpu/src/iq.rs crates/gpu/src/iq_sel.rs
+quant_iq_writer	quant	crates/gpu/src/iq_quant.rs crates/gguf/src/iq_quant.rs crates/gguf/src/iq_quant/tests.rs crates/gguf/src/kquant.rs crates/gguf/src/kquant/tests.rs crates/quantize/src/lib.rs crates/quantize/src/imatrix.rs crates/quantize/src/meta.rs crates/quantize/src/resolve.rs crates/quantize/tests/check.rs crates/quantize/tests/resolve.rs crates/quantize/tests/rules.rs crates/quantize/src/check.rs crates/quantize/src/cli.rs crates/quantize/src/host.rs crates/quantize/src/plan.rs crates/quantize/src/rules.rs crates/quantize/src/run.rs crates/quantize/src/scan.rs crates/gpu-gates/src/bin/bloomery_quantize.rs crates/quantize/src/source.rs crates/model-hf/src/quantize_source.rs crates/model-hf/src/shards.rs crates/model-hf/tests/quantize_hf.rs
 quant_q4k	quant	crates/gpu/src/q4k_sel.rs crates/gpu/src/kquant/mod.rs crates/gpu/src/kquant/sel.rs crates/gpu/src/kquant/tiles.rs crates/gpu/src/kquant/walk.rs crates/gpu/src/kquant/act.rs
 quant_q5k	quant	crates/gpu/src/q5.rs crates/gpu/src/q5_1_sel.rs crates/gpu/src/kquant/q5k.rs
 quant_q6k	quant	crates/gpu/src/q6k_ids.rs crates/gpu/src/q6k_sel.rs
@@ -33,11 +36,11 @@ quant_gated	quant	crates/gpu/src/gated_quant.rs crates/gpu/src/quant_sel.rs crat
 quant_gemm	quant	crates/gpu/src/gemm/mod.rs crates/gpu/src/gemm/act.rs crates/gpu/src/gemm/act32.rs crates/gpu/src/gemm/gemm32.rs crates/gpu/src/gemm/grouped.rs crates/gpu/src/gemm/kernels.rs crates/gpu/src/gemm/kernels32.rs crates/gpu/src/gemm/f32tile.rs crates/gpu/src/gemm/remap.rs crates/gpu/src/gemm/swiglu.rs
 quant_host_qdot	quant	crates/qdot/src/lib.rs crates/gguf/src/quant.rs
 attn_gqa	attn	crates/gpu/src/flash_gqa.rs crates/gpu/src/flash_gqa_prefill.rs crates/gpu/src/flash_gqa_prefill_512.rs crates/gpu/src/flash.rs crates/gpu/src/rope_neox.rs crates/gpu/src/rope_norm.rs crates/gpu/src/rope_table.rs
-attn_latent_mla	attn	crates/gpu/src/latent.rs crates/gpu-glm5next/src/mla.rs
+attn_latent_mla	attn	crates/gpu/src/latent.rs crates/gpu/src/latent_gated.rs crates/gpu-glm5next/src/mla.rs
 attn_linear_gdn_kda	recur	crates/gpu/src/linear/conv.rs crates/gpu/src/linear/delta.rs crates/gpu/src/linear/mixer_kda.rs crates/gpu/src/linear/norm_gate.rs crates/gpu/src/linear/out_gate.rs crates/gpu-glm5next/src/kda.rs crates/model/src/arch/kda.rs
 recur_mamba2	recur	crates/gpu/src/mamba2.rs crates/gpu/src/mamba2_ssd.rs crates/model/src/mamba2.rs crates/gpu/src/recur.rs
 recur_state	recur	crates/runtime/src/seqstate.rs crates/runtime/src/state.rs
-attn_ds41_csa_hca	attn	crates/gpu-deepseek41/src/attn.rs crates/gpu-deepseek41/src/compress.rs crates/gpu-deepseek41/src/indexer.rs crates/gpu-deepseek41/src/index_key.rs crates/gpu-deepseek41/src/hc.rs crates/gpu/src/hc_gated.rs
+attn_ds41_csa_hca	attn	crates/gpu-deepseek41/src/attn.rs crates/gpu-deepseek41/src/compress.rs crates/gpu-deepseek41/src/indexer.rs crates/gpu-deepseek41/src/index_key.rs crates/gpu/src/indexer.rs crates/gpu/src/index_key.rs crates/gpu-deepseek41/src/hc.rs crates/gpu/src/hc_gated.rs
 moe_route	moe	crates/gpu/src/moe_fused.rs crates/gpu/src/router.rs crates/gpu/src/route_core.rs crates/gpu/src/route_body.rs crates/gpu/src/route_softmax.rs crates/gpu/src/cand.rs crates/gpu/src/gemm/route.rs
 kv_pool_checkpoint	kv	crates/gpu/src/kpool.rs crates/gpu/src/checkpoint.rs crates/gpu/src/checkpoint/planes.rs crates/gpu/src/checkpoint/saved.rs crates/gpu/src/checkpoint/staging.rs crates/runtime/src/stores.rs crates/runtime/src/savemap.rs crates/model/src/kv.rs
 graph_fault	graph	crates/gpu/src/graph.rs crates/gpu/src/lane.rs crates/gpu/src/fault.rs crates/gpu/src/watchdog.rs crates/gpu/src/capsync.rs
@@ -56,3 +59,5 @@ model_host_ops	host	crates/model/src/ops.rs crates/model/src/ffn.rs crates/model
 fixture_writer	refset	crates/model/src/fixture/mod.rs crates/model/src/fixture/plan.rs crates/model/src/fixture/spec.rs crates/model/src/fixture/write.rs crates/model/src/fixture/budget.rs crates/model/src/fixture/fill.rs
 elem_kernels	kernel	crates/gpu/src/elem.rs
 device_seam	host	crates/device/src/*.rs crates/gpu/src/device.rs crates/metal/src/*.rs
+attn_res	kernel	crates/gpu/src/attn_res.rs
+imatrix_collector	kernel	crates/gpu/src/imatrix.rs

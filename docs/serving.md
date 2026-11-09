@@ -248,6 +248,18 @@ A paged load serves differently:
 - V4.1 refuses a paged plan under an r8 pair that reads a sidecar (`BLOOMERY_R8=off` reads the source and gives the
   same bits). The release uses no sidecar.
 
+A paged set on two drives: a sidecar `<prefix>.shard-dirs` beside the shards (`<prefix>-00001-of-000NN.gguf`) lists,
+one absolute path a line, the directories that hold a byte-identical copy of every shard by file name (`#` and blank
+lines are passed over). The tier's reader opens one handle per copy and reads each expert's parts from the copy its
+expert id and part pick, so one layer's misses land on every drive at once. The load refuses by name a listed directory
+that lacks a shard, a copy whose length differs, and a copy whose bytes differ from the shard's in the first and last
+64 KiB or in six more 64 KiB windows spread over the file (the whole-file digest is the copy script's job). Only the
+tier's arena reads the copies: a plan that pages through the file mapping (`arena=0` on the plan line) leaves the
+sidecar unread and the load prints `nvtier: <sidecar> names N copies, not read` naming the room and arena levers. The
+`nvtier` record's `copies=` is the set's own plus the listed directories (1 without a sidecar) and `copy_bytes=` the
+fill bytes read from the copies. Without the sidecar the reader reads the shards where they are. The Kimi K3.1 Pro rows
+in the release notes were measured with the set on the box's two NVMe drives this way.
+
 NVMe arena eviction options are in the [lever registry](../crates/levers/src/registry.rs).
 
 ### 5.5 Adaptive residency
@@ -349,8 +361,8 @@ This starts as `bloomery-serve -m /models/Qwen3.8-Flash-Next-FP4-Local --ctx-siz
 One value a setting, chosen in this order:
 
 1. **The command line.** A flag that stands for a `BLOOMERY_*` lever replaces it: `-ub` replaces
-   `BLOOMERY_QWEN3_UBATCH`, `--cache-type-k` replaces `BLOOMERY_QWEN3_KV`, and the placement flags replace the levers
-   they set.
+   `BLOOMERY_QWEN3_UBATCH`, `--cache-type-k` replaces `BLOOMERY_QWEN3_KV`, `--autotune` replaces `BLOOMERY_AUTOTUNE`,
+   and the placement flags replace the levers they set.
 2. **The settings file** (`--config`). Its entries count as the command line's against the variables and levers below.
 3. **llama-server's variables.** A `LLAMA_ARG_*` variable is read as its flag (section 7.3), so it also replaces the
    lever: `LLAMA_ARG_UBATCH=48` beside `BLOOMERY_QWEN3_UBATCH=64` runs 48.
@@ -456,6 +468,17 @@ prints one line a choice.
 
 **`timings`** in an answer carry llama-server's fields and `cache_ms`, the prompt cache's work before the prompt.
 
+**Kernel picks at load.** The qwen38 seat times, after the load and before its first capture, each way to run a kernel
+that gives the same output bits (today the MXFP8 projections at four to eight columns, the widths a drafted pass
+verifies), each on weights read from the card's memory rather than its L2, as a decode step reads them. A way replaces
+the built-in rule only when it is faster on every one of five repeats by more than the repeats' spread. The load prints
+an `autotune pick` line for each kernel shape and an `autotune` line with the time it took, and `/props`'
+`engine.autotune` lists the same. Each pick is kept in the cost store (`$BLOOMERY_COSTS`, else
+`~/.cache/bloomery/costs`) under the card, the driver, the build and the shape, so the next load of the same card and
+build reads it and times nothing; an entry that does not decode is timed again. A store that cannot be created, locked,
+read or written stops the load, and the error names `--autotune off`. `--autotune off` (or `BLOOMERY_AUTOTUNE=off`)
+runs the built-in rule with no timing and no store.
+
 ### 8.3 Stopping
 
 `SIGINT` or `SIGTERM` admits no new request, ends the engine between its calls and exits 0 after one stderr line naming
@@ -502,14 +525,14 @@ last two. A flag the seat does not take is refused by name with the seat's usage
 |---|---|---|---|---|---|---|
 | `ds41` | N or `auto` | yes, two slots' rows a pass | yes | no | yes | |
 | `glm` | N or `auto` | yes, drafted windows too | yes | no | yes | `--prefill batch\|steps` |
-| `qwen38` | N or `auto` | yes, drafted and lookup windows too, except under `--place bp` | yes | 1 to 4096 | yes | `--cache-type-k f16\|q8_0` |
+| `qwen38` | N or `auto` | yes, drafted and lookup windows too, except under `--place bp` | yes | 1 to 4096 | yes | `--cache-type-k f16\|q8_0`, `--autotune on\|off` |
 | `qwen3` | N or `auto` | on a whole-card load; a placed load steps in turn | no | a file with no routed expert | yes | `--cache-type-k f16\|q8_0` |
 | `mimo2` | N or `auto` | yes, two slots' rows a pass | yes | no | no | `--prefill batch\|steps` |
 | `minimaxm3` | N or `auto` | no, slots step in turn | yes | no | no | |
 | `mistrallarge4` | N or `auto` | no, slots step in turn | yes | no | yes (Pixtral) | |
 | `flint` | N or `auto` | | no | no | no | |
 | `musespark` | 1 | | yes | no | no | |
-| `solar2`, `nemotron`, `raon1` | 1 | | no | no | no | |
+| `solar2`, `nemotron`, `raon1`, `kimik3` | 1 | | no | no | no | |
 | `decide` | one request at a time | | no | yes | Clef only | `--head`, `--head-config` |
 
 `N` is any count, 1 by default. `1` is the seat's one slot, and `--parallel` above 1 or `auto` is refused by name. `--mmproj`
@@ -898,6 +921,11 @@ Structured output is served for `response_format` of type `json_schema` or `json
 - **One model a server**, and one expert tier card at most (`--place bp`).
 - **GLM-5.3** holds at most 16,384 positions a slot: a `--ctx-size` whose slot share passes it is refused at start,
   and a longer prompt answers `exceed_context_size_error`.
+- **Kimi K3.1 Pro** loads at `--place bp` only, one slot. Past the lightning indexer's top-k (2,048 positions) the latent
+  layers attend the rows the indexer picks, so `--ctx-size` is not held to the top-k. The seat runs a
+  prompt as placed passes (`--prefill steps` steps it: a faster decode, a slower prompt; README's known limits give the
+  numbers) and serves the model's think span as plain text (no `reasoning_content`). Kimi K3's
+  `UD-IQ1_S` file does not load: its dense trunk is past one 48 GB card.
 - **Small cards.** On a 12 to 16 GB card the split Qwen3 load's default context fits to the largest the plan holds.
   Agent clients with long system prompts want the whole context for one request there (`--parallel 1`).
 - **Repeatable tokens.** With adaptive residency on, a request's tokens follow the placement its passes ran on, and

@@ -64,9 +64,9 @@ use bloomery_gpu::cores::q3k_row_dot;
 use bloomery_gpu::gemm::{
     DownW, GateUp, Gemm32Kernels, GemmAct, GemmKernels, GemmWeight, enqueue_gemm_batch,
 };
-use bloomery_gpu::hybrid::{BatchKey, ServeTimes};
+use bloomery_gpu::hybrid::{BatchKey, BlockPlanes, ServeTimes};
 use bloomery_gpu::kquant::TileScratch;
-use bloomery_gpu::kquant::tiles::{GatherPlanes, gather, gather_plane};
+use bloomery_gpu::kquant::tiles::{GatherPlanes, KquantTileKernels, gather, gather_plane};
 use bloomery_gpu::q4k_sel::{TileBlock, TileWork, tile_block, tile_cap};
 use bloomery_gpu::{FaultSink, FaultSite, col_sums, store_cols};
 use cuda_core::{CudaContext, IntoResult, sys};
@@ -876,16 +876,22 @@ pub struct TiledBlock<'a> {
 /// ([`TileScratch::enqueue_table`]), the q8_1 planes gathered by table entry
 /// (`ds41_card_gather`), the gate·up (`ds41_expert_gate_up_tiles`) into the
 /// SwiGLU outputs by entry, their q8_1 form
-/// ([`TileScratch::enqueue_quantize_h`]) and the Q4_K down
-/// (`q4k_gemv_tiles`), which scatters each entry's rows to its slot's rows of
-/// `down` (slot-major, `n_embd` a slot); a slot whose place is [`HOST`] is
-/// left as it was. Each weight row is read once for up to eight slots. The
-/// table's size is a device value: no launch here reads it on the host. The
-/// stage card's batch shadow and the expert tier's batch service both run
-/// it, each over its own scratch. Asynchronous, allocation-free.
+/// ([`TileScratch::enqueue_quantize_h`]) and the down by the down stack's
+/// type ([`accepts::DS41_FUSED_DOWNS`]) — a Q4_K down `q4k_gemv_tiles`
+/// scatters, a Q5_K one `q5k_gemv_tiles` ([`q5k_tiles`], held exactly where a
+/// load read a fused layer with a q5_K down) over the same table and q8_1
+/// form — each entry's rows to its slot's rows of `down` (slot-major,
+/// `n_embd` a slot); a slot whose place is [`HOST`] is left as it was. Each
+/// weight row is read once for up to eight slots. A down of another type, or
+/// a q5_K one with no tile module held, is a named refusal that launches
+/// nothing. The table's size is a device value: no launch here reads it on
+/// the host. The stage card's batch shadow and the expert tier's batch
+/// service both run it, each over its own scratch. Asynchronous,
+/// allocation-free.
 pub fn enqueue_tiled_experts(
     gpu: &Gpu,
     kernels: &FfnBatchKernels,
+    q5k_tiles: Option<&KquantTileKernels>,
     t: &TiledBlock<'_>,
     s: &mut Q3TileScratch,
     down: &mut DeviceBuffer<f32>,
@@ -895,6 +901,24 @@ pub fn enqueue_tiled_experts(
     let n_sb = n / 256;
     let slots_n = t.cols.saturating_sub(t.col0) * N_USED;
     let n_experts = t.stacks.gate.rows() / ff;
+    // Resolved before the first launch: a down no tile entry reads refuses
+    // the block whole, and the q5_K tile module is a load's to hold (the
+    // tier's layers are the q4_K triple by its own refusal, so it holds none).
+    let q5k_tiles = match t.stacks.down_ty() {
+        GgmlType::Q4_K => None,
+        GgmlType::Q5_K => Some(q5k_tiles.ok_or_else(|| GpuError::State {
+            what: WHAT,
+            missing: "the q5_K tile down of a fused layer with a q5_K down, which a load of no \
+                      such layer does not hold",
+        })?),
+        _ => {
+            return Err(GpuError::Tensor {
+                what: WHAT,
+                name: names::ffn_down_exps(layer),
+                need: "the fused layer's q4_K or q5_K down (accepts::DS41_FUSED_DOWNS)",
+            });
+        }
+    };
     if slots_n == 0 || slots_n > s.tile.slots() || t.sel.len() < slots_n || down.len() < slots_n * n
     {
         return Err(GpuError::Shape {
@@ -951,12 +975,20 @@ pub fn enqueue_tiled_experts(
         kernels.enqueue_gate_up_tiles(stream, &g, fault, &mut h)?;
     }
     s.tile.enqueue_quantize_h(gpu, slots_n, n_experts, fault)?;
-    gpu.q4k_sel().enqueue_gemv_q4k_tiles(
-        stream,
-        &s.tile.down(t.stacks.down, n, slots_n, n_experts),
-        fault,
-        down,
-    )
+    match q5k_tiles {
+        None => gpu.q4k_sel().enqueue_gemv_q4k_tiles(
+            stream,
+            &s.tile.down(t.stacks.down, n, slots_n, n_experts),
+            fault,
+            down,
+        ),
+        Some(tiles) => tiles.enqueue_gemv_q5k_tiles(
+            stream,
+            &s.tile.down(t.stacks.down, n, slots_n, n_experts),
+            fault,
+            down,
+        ),
+    }
 }
 
 /// Tokens one run of the common card leg covers in a block of a layer on it
@@ -1456,8 +1488,8 @@ pub struct FfnBatch {
     /// A chunk's scratch: the norm's
     /// f32 output a second time (discarded) and, per token count `m` (index
     /// `m − 1`), its q8_1 form; the HC_PRE mixes; the shared expert's SwiGLU
-    /// output (token-major), its q8_1 form per token count and its down
-    /// output row-major.
+    /// output (token-major), its q8_1 form per token count when a shared
+    /// down reads it ([`Reads`], else none) and its down output row-major.
     normed: DeviceBuffer<f32>,
     act_x: Vec<Q8Act>,
     mixes: DeviceBuffer<f32>,
@@ -1467,13 +1499,26 @@ pub struct FfnBatch {
     /// The block's card experts: per token the norm's q8_1 planes (q3 and
     /// d8, as the chunk's scratch lays out a column) and the tile path's
     /// scratch ([`Q3TileScratch`]) — both the streamed passes' — the default
-    /// block's GEMM scratch ([`GemmScratch`]) and the down output by slot,
-    /// which every path writes the same rows of.
+    /// block's GEMM scratch ([`GemmScratch`]), the two for a file with a fused
+    /// layer ([`Reads`], else none) with the q5_K tile module such a layer's
+    /// down asks for, the layer's map row as the block's route fill reads it —
+    /// the slot map lives outside the batch, so the route, which holds it,
+    /// copies the row (the row a pick moves is copied again by the route that
+    /// runs under it) — and the down output by slot, which every path writes
+    /// the same rows of.
     q3_all: DeviceBuffer<u64>,
     d8_all: DeviceBuffer<f32>,
     down_all: DeviceBuffer<f32>,
-    tile: Q3TileScratch,
-    gemm: GemmScratch,
+    tile: Option<Q3TileScratch>,
+    gemm: Option<GemmScratch>,
+    /// The q5_K tile down of a fused layer with a q5_K down
+    /// ([`Reads::fused_q5k_down`]); `None` where no fused layer's down is
+    /// q5_K, so a q4_K-only file loads no module for it.
+    q5k_tiles: Option<KquantTileKernels>,
+    map_row: DeviceBuffer<u32>,
+    /// The activation forms the piece's layers read, which the scratch above
+    /// and the leg's buffers hold ([`FfnPiece::reads`]).
+    reads: Reads,
     /// With an expert tier, per token each slot's place in the tier's routed
     /// stacks, which the route writes and the tier computes by; and per
     /// batch of a group the shadow's copy of a tiered block's routing — the
@@ -1545,26 +1590,22 @@ impl Q3TileScratch {
 /// ([`enqueue_block_experts`]): the block's normed rows in the GEMM's q8_1
 /// form (a column a token — the route's norm quantized again, whose bytes
 /// the norm's fused launch defines equal to its own, bit for bit), the gate
-/// and up products (slot-major, `ff` a slot), the SwiGLU's q8_1 form (a
-/// column a slot) and the layer's map row as the block's route fill reads
-/// it — the slot map lives outside the batch, so the route, which holds it,
-/// copies the row (the row a pick moves is copied again by the route that
-/// runs under it).
+/// and up products (slot-major, `ff` a slot) and the SwiGLU's q8_1 form (a
+/// column a slot).
 struct GemmScratch {
     act_x: GemmAct,
     g: DeviceBuffer<f32>,
     u: DeviceBuffer<f32>,
     act_down: GemmAct,
-    map_row: DeviceBuffer<u32>,
 }
 
 impl GemmScratch {
     /// The scratch for blocks of up to `cap` tokens of `n_embd` through
-    /// experts of `ff` over `n_expert` experts, on `stream`'s card. Load-time
-    /// only; the shapes the GEMM family does not take are its named refusal.
+    /// experts of `ff`, on `stream`'s card. Load-time only; the shapes the
+    /// GEMM family does not take are its named refusal.
     fn new(
         stream: &CudaStream,
-        (cap, n_embd, ff, n_expert): (usize, usize, usize, usize),
+        (cap, n_embd, ff): (usize, usize, usize),
     ) -> Result<GemmScratch, GpuError> {
         let slots = cap * N_USED;
         Ok(GemmScratch {
@@ -1572,31 +1613,28 @@ impl GemmScratch {
             g: DeviceBuffer::zeroed(stream, slots * ff)?,
             u: DeviceBuffer::zeroed(stream, slots * ff)?,
             act_down: GemmAct::new(stream, slots, ff)?,
-            map_row: DeviceBuffer::zeroed(stream, n_expert)?,
         })
     }
 
     /// Device bytes of the scratch.
     fn bytes(&self) -> usize {
-        self.act_x.bytes()
-            + self.g.num_bytes()
-            + self.u.num_bytes()
-            + self.act_down.bytes()
-            + self.map_row.num_bytes()
+        self.act_x.bytes() + self.g.num_bytes() + self.u.num_bytes() + self.act_down.bytes()
     }
 }
 
 impl FfnBatch {
     /// The buffers for groups of up to `sets` batches of up to `cap` tokens
     /// (at most [`UNION_MAX_COLS`], the host union's columns) of rows of
-    /// `n_embd` through experts of `ff`, on `gpu`; with `tier`, the tier
-    /// places of a model with an expert tier.
-    pub fn new(
+    /// `n_embd` through experts of `ff`, on `gpu`, holding the activation
+    /// forms `reads` names and no other ([`FfnPiece::reads`]); with `tier`,
+    /// the tier places of a model with an expert tier.
+    pub(crate) fn new(
         gpu: &Gpu,
         n_embd: usize,
         ff: usize,
         [cap, sets]: [usize; 2],
         tier: bool,
+        reads: Reads,
     ) -> Result<FfnBatch, GpuError> {
         if cap == 0 || cap > UNION_MAX_COLS || sets == 0 {
             return Err(GpuError::Shape {
@@ -1637,15 +1675,31 @@ impl FfnBatch {
                 .collect::<Result<_, _>>()?,
             mixes: z(c * HC_MIX)?,
             sh_h: z(c * ff)?,
-            act_sh: counts
-                .map(|m| Q8Act::with_k(stream, m, ff))
-                .collect::<Result<_, _>>()?,
+            act_sh: if reads.sh_q8_1 {
+                counts
+                    .map(|m| Q8Act::with_k(stream, m, ff))
+                    .collect::<Result<_, _>>()?
+            } else {
+                Vec::new()
+            },
             sh_raw: z(c * n_embd)?,
             q3_all: DeviceBuffer::zeroed(stream, cap * 64 * n_sb.div_ceil(2))?,
             d8_all: z(cap * 2 * n_sb)?,
             down_all: z(slot_cols * n_embd)?,
-            tile: Q3TileScratch::new(stream, slot_cols, n_embd, ff)?,
-            gemm: GemmScratch::new(stream, (cap, n_embd, ff, N_EXPERT))?,
+            tile: reads
+                .fused
+                .then(|| Q3TileScratch::new(stream, slot_cols, n_embd, ff))
+                .transpose()?,
+            gemm: reads
+                .fused
+                .then(|| GemmScratch::new(stream, (cap, n_embd, ff)))
+                .transpose()?,
+            q5k_tiles: reads
+                .fused_q5k_down
+                .then(|| KquantTileKernels::load(ctx, gpu.fault_word()))
+                .transpose()?,
+            map_row: DeviceBuffer::zeroed(stream, N_EXPERT)?,
+            reads,
             tsel: if tier {
                 Some(DeviceBuffer::zeroed(stream, slot_cols)?)
             } else {
@@ -1738,7 +1792,8 @@ impl FfnBatch {
             n: self.n_embd,
             ff: self.ff,
         };
-        self.leg = Some((CardLeg::load(gpu)?, LegBufs::new(gpu.stream(), shape)?));
+        let bufs = LegBufs::for_downs(gpu.stream(), shape, self.reads.leg)?;
+        self.leg = Some((CardLeg::load(gpu)?, bufs));
         Ok(())
     }
 
@@ -1766,8 +1821,9 @@ impl FfnBatch {
             + self.ids.num_bytes()
             + self.sel.num_bytes()
             + self.q3_all.num_bytes()
-            + self.tile.device_bytes()
-            + self.gemm.bytes()
+            + self.tile.as_ref().map_or(0, Q3TileScratch::device_bytes)
+            + self.gemm.as_ref().map_or(0, GemmScratch::bytes)
+            + self.map_row.num_bytes()
             + self.tsel.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self.ssel.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self.leg.as_ref().map_or(0, |(_, b)| b.bytes())
@@ -1826,14 +1882,16 @@ impl FfnBatch {
     /// host into the host tier's next batch set, and the event they complete
     /// at ([`Hybrid::enqueue_download`]); for a `tiered` layer the slots'
     /// tier places too ([`Hybrid::enqueue_download_tiered`]), which a batch
-    /// made without them refuses by name. Asynchronous. Refused while both
-    /// sets hold a layer not uploaded yet.
+    /// made without them refuses by name, and with `planes` the block's q8_1
+    /// planes the route copied ([`Hybrid::enqueue_download_planes`]), which
+    /// a tier on a node is sent. Asynchronous. Refused while both sets hold
+    /// a layer not uploaded yet.
     pub fn enqueue_download<H: HostExperts>(
         &self,
         gpu: &Gpu,
         tier: &mut Hybrid<H>,
         key: BatchKey,
-        tiered: bool,
+        (tiered, planes): (bool, bool),
     ) -> Result<(), GpuError> {
         self.check_key(key)?;
         let xw = [&self.x, &self.weights];
@@ -1841,6 +1899,13 @@ impl FfnBatch {
             return tier.enqueue_download(gpu.stream(), xw, &self.ids, key);
         }
         let tsel = self.tsel()?;
+        if planes {
+            let planes = BlockPlanes {
+                q3: &self.q3_all,
+                d8: &self.d8_all,
+            };
+            return tier.enqueue_download_planes(gpu.stream(), xw, &self.ids, planes, &[tsel], key);
+        }
         tier.enqueue_download_tiered(gpu.stream(), xw, &self.ids, &[tsel], key)
     }
 
@@ -2112,16 +2177,19 @@ impl FfnPiece {
     /// batch whether it is a media position — the block's media tokens pick
     /// with that bias: the router's scores once over the block, then a pick
     /// launch per run of tokens of one kind
-    /// ([`RouterKernels::enqueue_router_rows_runs`]). Returns the router's
-    /// pick launches and, on a layer with card experts, the map row's copy.
-    /// Asynchronous, allocation-free without `vl`.
+    /// ([`RouterKernels::enqueue_router_rows_runs`]). With `planes`, each
+    /// chunk's q8_1 codes and scales are copied into the block's planes, two
+    /// copies a chunk, which the download sends a tier on a node
+    /// ([`FfnBatch::enqueue_download`]). Returns the router's pick launches
+    /// and, on a layer with card experts, the map row's copy. Asynchronous,
+    /// allocation-free without `vl`.
     pub fn enqueue_batch_route(
         &mut self,
         gpu: &Gpu,
         bl: &BatchLayer<'_>,
         b: &mut FfnBatch,
         io: &BlockIo<'_>,
-        slots: &DeviceTensor<u32>,
+        (slots, planes): (&DeviceTensor<u32>, bool),
         vl: Option<(&DeviceBuffer<f32>, &[bool])>,
     ) -> Result<usize, GpuError> {
         let (layer, lw) = (bl.layer, &bl.lw);
@@ -2151,6 +2219,19 @@ impl FfnPiece {
                 &mut x,
                 fault,
             )?;
+            if planes {
+                let (m, at) = (chunk.m, chunk.at);
+                let act_x = &b.act_x[m - 1];
+                let (q, d) = (act_x.q3().len() / m, act_x.d8().len() / m);
+                // SAFETY: the copies read the chunk's own scratch and write
+                // its tokens' columns of the block's planes, both on the
+                // engine stream, which orders them after the norm that wrote
+                // the scratch and before the download that reads the planes.
+                unsafe {
+                    dtod(stream, &mut b.q3_all, at * q, act_x.q3(), m * q)?;
+                    dtod(stream, &mut b.d8_all, at * d, act_x.d8(), m * d)?;
+                }
+            }
         }
         let t = u - at;
         let picks = {
@@ -2219,7 +2300,7 @@ impl FfnPiece {
             // row, which nothing but the blocks' route fills read, every one
             // of them behind this route in stream order.
             unsafe {
-                dtod(stream, &mut b.gemm.map_row, 0, &row, self.n_expert)?;
+                dtod(stream, &mut b.map_row, 0, &row, self.n_expert)?;
             }
         }
         Ok(picks + usize::from(c.n_card > 0))
@@ -2568,6 +2649,11 @@ impl FfnPiece {
             }
             match path {
                 CardPath::Gemm => {
+                    let gemm = b.gemm.as_mut().ok_or(GpuError::State {
+                        what: WHAT,
+                        missing: "the GEMM scratch of a batch whose file has a fused layer \
+                                  (FfnBatch::new)",
+                    })?;
                     let t = u - at;
                     let (gty, dty) = (
                         GemmWeight::from_ggml(s.gate_up_ty())?,
@@ -2576,25 +2662,25 @@ impl FfnPiece {
                     let table = self.gemm_route_at(layer, c.n_card)?;
                     let sink = gpu.layer_sink(layer)?;
                     let x = span(WHAT, &b.x, at * n, t * n)?;
-                    gpu.enqueue_quantize_gemm(&x, t, &mut b.gemm.act_x, sink)?;
+                    gpu.enqueue_quantize_gemm(&x, t, &mut gemm.act_x, sink)?;
                     let ids = span(WHAT, &b.ids, at * N_USED, slots_n)?;
                     enqueue_gemm_batch(
                         (&b.kernels.gemm, &b.kernels.g32),
                         gpu.stream(),
                         &ids,
-                        &b.gemm.map_row,
-                        GateUp::Grouped(gty, [s.gate, s.up], &b.gemm.act_x),
+                        &b.map_row,
+                        GateUp::Grouped(gty, [s.gate, s.up], &gemm.act_x),
                         DownW::Grouped(
                             dty,
                             s.down,
                             Act::SwigluClamp { limit: c.limit },
-                            &mut b.gemm.act_down,
+                            &mut gemm.act_down,
                             &mut down,
                         ),
                         (t, c.n_card),
                         (N_USED, ff, n),
                         sink,
-                        (&mut b.gemm.g, &mut b.gemm.u),
+                        (&mut gemm.g, &mut gemm.u),
                         (&*sel, &mut self.routes[table]),
                     )
                 }
@@ -2609,7 +2695,19 @@ impl FfnPiece {
                         layer,
                         limit: c.limit,
                     };
-                    enqueue_tiled_experts(gpu, &b.kernels, &t, &mut b.tile, &mut down)
+                    let tile = b.tile.as_mut().ok_or(GpuError::State {
+                        what: WHAT,
+                        missing: "the tile scratch of a batch whose file has a fused layer \
+                                  (FfnBatch::new)",
+                    })?;
+                    enqueue_tiled_experts(
+                        gpu,
+                        &b.kernels,
+                        b.q5k_tiles.as_ref(),
+                        &t,
+                        tile,
+                        &mut down,
+                    )
                 }
             }
         } else {
@@ -2755,6 +2853,13 @@ impl FfnPiece {
             }
         }
         let act = if lw.sh_down.reads_q8_1() {
+            if b.act_sh.is_empty() {
+                return Err(GpuError::State {
+                    what: WHAT,
+                    missing: "the shared down's q8_1 scratch of a batch whose layers read it \
+                              (FfnBatch::new)",
+                });
+            }
             let act_sh = count_of(&mut b.act_sh, m)?;
             gpu.enqueue_quantize_q8_1_layer(&b.sh_h, act_sh, layer)?;
             Some(&b.act_sh[m - 1])
@@ -2925,14 +3030,52 @@ fn count_of<T>(by_count: &mut [T], m: usize) -> Result<&mut T, GpuError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CardAccTier, FfnBatchKernels};
+    use super::{CardAccTier, FfnBatchKernels, Q3TileScratch, TiledBlock, enqueue_tiled_experts};
     use bloomery_gpu::host::handoff::{Handoff, HandoffKernels};
     use bloomery_gpu::host::page::HandoffLayout;
     use bloomery_gpu::host::step::HandoffTarget;
     use bloomery_gpu::host::tier::{TierImageLayout, TierTarget};
     use bloomery_gpu::hybrid::HOST;
-    use bloomery_gpu::{FaultSite, Gpu, GpuError, Window};
+    use bloomery_gpu::kquant::tiles::KquantTileKernels;
+    use bloomery_gpu::{DeviceTensor, FaultSite, Gpu, GpuError, Q8Act, Window};
     use cuda_core::DeviceBuffer;
+
+    /// A rank's part of V4.1's experts (ff 576 at four ranks, an MXFP4 routed
+    /// down and an MXFP8 shared down) makes its decode row and its prompt
+    /// batch, the leg's buffers included, holding the forms its downs read
+    /// and no other: no fused-layer scratch, no shared q8_1, the leg's 32-value
+    /// form alone. Mutant: an unconditional `Q8Act::with_k(.., ff)` in either
+    /// constructor is refused at 576.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-ds41-lib` runs it on the box"]
+    fn hw_a_ranks_ff_makes_only_the_forms_its_downs_read() {
+        use super::{FfnBatch, LEG_PIECE};
+        use crate::chain::ffn::{FfnRow, Reads};
+        use crate::router::N_USED;
+        use gguf::quant::GgmlType;
+        use model::placement::kernels::{self, DownAct, DownForms};
+        const N: usize = 512;
+        const FF: usize = 576;
+        let reads =
+            Reads::default().with_layer(Some([GgmlType::MXFP4; 3]), [GgmlType::MXFP8; 3], FF);
+        assert!(!reads.fused && !reads.sh_q8_1, "{reads:?}");
+        assert_eq!(reads.leg, DownForms::of(DownAct::Q8Blocks32));
+        let gpu = Gpu::new().expect("card");
+        let row = FfnRow::new(gpu.stream(), N, FF, reads).expect("the decode row");
+        assert!(row.act_h.is_none() && row.act_sh.is_none());
+        let mut batch = FfnBatch::new(&gpu, N, FF, [8, 1], false, reads).expect("the prompt batch");
+        assert!(batch.act_sh.is_empty() && batch.tile.is_none() && batch.gemm.is_none());
+        batch.prepare_leg(&gpu).expect("the leg's buffers");
+        let (_, bufs) = batch.leg.as_ref().expect("the leg");
+        let want = kernels::leg_bytes(
+            LEG_PIECE as u64,
+            N_USED as u64,
+            N as u64,
+            FF as u64,
+            reads.leg,
+        );
+        assert_eq!(bufs.bytes() as u64, want);
+    }
 
     /// The handoff's places feed the production tier sum, not a readback
     /// alone: every routed row belongs to exactly one of host, card and
@@ -3134,6 +3277,129 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// The tile path's down by the down stack's type
+    /// ([`enqueue_tiled_experts`]): over the same table, gathered planes and
+    /// quantized `h` the path leaves in its scratch, a q5_K down's rows are
+    /// `q5k_gemv_tiles`'s own direct launch's bit for bit and a q4_K down's
+    /// `q4k_gemv_tiles`'s, the host slot's rows untouched; a down of another
+    /// type, or a q5_K one where no tile module is held, is a named refusal
+    /// that launches nothing. Mutant: the q5_K arm dispatching to the q4_K
+    /// tiles (`.mutants/fused-q5k-tiles.patch`).
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-ds41-lib` runs it on the box"]
+    fn hw_the_tiled_down_dispatches_by_its_type() {
+        use crate::chain::ffn::CardStacks;
+        use gguf::quant::GgmlType;
+        let (n, ff, experts, layer) = (512usize, 512usize, 4usize, 3usize);
+        let gpu = Gpu::new().expect("a card");
+        let stream = gpu.stream();
+        let stack = |ty: GgmlType, rows: usize, k: usize, seed: u64, row_k: usize| {
+            let rb = ty.type_size().expect("a size") as usize * (row_k / 256);
+            DeviceTensor::upload(
+                stream,
+                &super::super::tests::stack_words(&super::super::tests::kquant_bytes(
+                    ty, rows, k, seed,
+                )),
+                rows,
+                rb / 4,
+            )
+            .expect("the stack")
+        };
+        let gate = stack(GgmlType::Q3_K, experts * ff, n, 0x51, n);
+        let up = stack(GgmlType::Q3_K, experts * ff, n, 0x52, n);
+        let down_of = |ty| stack(ty, experts * n, ff, 0x53 + ty.as_u32() as u64, ff);
+        let downs = [
+            (GgmlType::Q4_K, down_of(GgmlType::Q4_K)),
+            (GgmlType::Q5_K, down_of(GgmlType::Q5_K)),
+            (GgmlType::Q6_K, down_of(GgmlType::Q6_K)),
+        ];
+        let kernels = FfnBatchKernels::load(gpu.context()).expect("the batch module");
+        let q5k_tiles =
+            KquantTileKernels::load(gpu.context(), gpu.fault_word()).expect("the tile module");
+        // One token's q8_1 planes: the block's column, quantized for real.
+        let x: Vec<f32> = (0..n).map(|i| ((i % 13) as f32 - 6.0) / 6.0).collect();
+        let x_dev = DeviceBuffer::from_host(stream, &x).expect("x");
+        let mut act_x = Q8Act::with_k(stream, 1, n).expect("the x form");
+        gpu.enqueue_quantize_q8_1(&x_dev, &mut act_x)
+            .expect("the quantize");
+        let q3 = DeviceBuffer::from_host(stream, &act_x.q3().to_host_vec(stream).unwrap())
+            .expect("the codes");
+        let d8 = DeviceBuffer::from_host(stream, &act_x.d8().to_host_vec(stream).unwrap())
+            .expect("the scales");
+        // Slot 2 is the host's: its rows are nobody's to write.
+        let sel: Vec<u32> = vec![0, 1, HOST, 3, 0, 1];
+        let sel_dev = DeviceBuffer::from_host(stream, &sel).expect("the places");
+        let slots = sel.len();
+        let nan = vec![f32::NAN; slots * n];
+        let read = |b: &DeviceBuffer<f32>| b.to_host_vec(stream).unwrap();
+        let same = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits());
+        let mut scratch = Q3TileScratch::new(stream, slots, n, ff).expect("the tile scratch");
+        let fault = gpu.layer_sink(layer).unwrap();
+        let host_kept = |rows: &[f32]| same(&rows[2 * n..3 * n], &nan[2 * n..3 * n]);
+        let (q4, q5, q6) = (&downs[0], &downs[1], &downs[2]);
+        for (ty, w, module) in [(q4.0, &q4.1, None), (q5.0, &q5.1, Some(&q5k_tiles))] {
+            let stacks = CardStacks::fused_over(&gate, &up, w, ty);
+            let t = TiledBlock {
+                stacks,
+                q3: &q3,
+                d8: &d8,
+                col0: 0,
+                cols: 1,
+                sel: &sel_dev,
+                layer,
+                limit: 7.0,
+            };
+            let mut got = DeviceBuffer::from_host(stream, &nan).expect("the down rows");
+            enqueue_tiled_experts(&gpu, &kernels, module, &t, &mut scratch, &mut got)
+                .unwrap_or_else(|e| panic!("the {ty} tile path: {e}"));
+            let mut want = DeviceBuffer::from_host(stream, &nan).expect("the reference rows");
+            let down = scratch.tile.down(w, n, slots, experts);
+            match ty {
+                GgmlType::Q4_K => gpu
+                    .q4k_sel()
+                    .enqueue_gemv_q4k_tiles(stream, &down, fault, &mut want)
+                    .unwrap(),
+                _ => q5k_tiles
+                    .enqueue_gemv_q5k_tiles(stream, &down, fault, &mut want)
+                    .unwrap(),
+            }
+            let (got, want) = (read(&got), read(&want));
+            assert!(
+                same(&got, &want),
+                "the {ty} tiles' rows are the entry's own"
+            );
+            assert!(host_kept(&got), "the host slot's rows are untouched");
+            assert!(gpu.take_fault().unwrap().is_none(), "no fault from {ty}");
+        }
+        // A down of another type, and a q5_K one with no tile module held, are
+        // named refusals that launch nothing.
+        for (ty, w, module) in [(q6.0, &q6.1, Some(&q5k_tiles)), (q5.0, &q5.1, None)] {
+            let stacks = CardStacks::fused_over(&gate, &up, w, ty);
+            let t = TiledBlock {
+                stacks,
+                q3: &q3,
+                d8: &d8,
+                col0: 0,
+                cols: 1,
+                sel: &sel_dev,
+                layer,
+                limit: 7.0,
+            };
+            let mut got = DeviceBuffer::from_host(stream, &nan).expect("the down rows");
+            let err = enqueue_tiled_experts(&gpu, &kernels, module, &t, &mut scratch, &mut got)
+                .expect_err("the refusal");
+            assert!(
+                if matches!(ty, GgmlType::Q5_K) {
+                    err.to_string().contains("q5_K")
+                } else {
+                    err.to_string().contains("ffn_down_exps")
+                },
+                "the refusal names its cause: {err}"
+            );
+            assert!(same(&read(&got), &nan), "no down row written");
         }
     }
 }

@@ -22,7 +22,7 @@ pub const ARCH: &str = "solar-open2";
 /// The first shard of the Q4_K_M split set every solar2 set is dumped from and the tree runs: the identity each set's `# model`
 /// line states. A set of the file moved elsewhere is stale by this line, not by its name.
 pub const MODEL: &str =
-    "/models/Solar-Open2-250B-Q4_K_M/Solar-Open2-250B-Q4_K_M-00001-of-00004.gguf";
+    "/data/moved/models/Solar-Open2-250B-Q4_K_M/Solar-Open2-250B-Q4_K_M-00001-of-00004.gguf";
 
 /// The build every solar2 set names: llama.cpp `6ea215d17` with prometheusAIR's patch (`solar_open2.patch`, sha256
 /// `d2906be2c009...`), the tree the profile's `PAI` names.

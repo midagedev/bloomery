@@ -9,6 +9,7 @@ measurements and the full README: https://github.com/midagedev/bloomery
 | File | What it serves |
 |---|---|
 | `bin/bloomery-serve` | every seat in one binary (the model file's architecture picks it; `--help` lists them): llama-server's HTTP API (`/v1/chat/completions`, `/completion`, streaming) for DeepSeek-V4.1-Flash, GLM-5.3-Flash, Qwen3.8-Flash-Next, Qwen3.6-35B-A3B, Qwen3-30B-A3B, MiMo-V2.6-Flash, and Cloudflare Clef-Flash's SystemOne API (`POST /v1/systemone`) as its decide seat |
+| `bin/bloomery-quantize` | IQ1_S and IQ2_XXS quantization of a GGUF set's routed-expert stacks on the card (or `--cpu`), byte-identical to ggml's, so that `llama-quantize` over its output copies them and quantizes the trunk: `bin/bloomery-quantize --help`, `--plan` first; the page is `docs/quantize.md` in the repository (https://github.com/midagedev/bloomery/blob/main/docs/quantize.md) |
 | `serving.md` | the server's reference: its routes, the request fields each reads or refuses, the error objects, each seat's flags and the order of settings |
 
 ## Requirements
@@ -43,8 +44,8 @@ There are three Linux archives; the installer picks the one for the machine.
 
 ## Run
 
-Without unpacking by hand, the installer fetches the latest release, checks its sha256 and puts a
-`bloomery-serve` symlink into `~/.local/bin`:
+Without unpacking by hand, the installer fetches the latest release, checks its sha256 and puts
+symlinks to `bloomery-serve` and `bloomery-quantize` into `~/.local/bin`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/midagedev/bloomery/main/tools/release/install.sh | sh

@@ -74,8 +74,10 @@
 //! Here each layer whose down stack is q4_K puts on the card half of the
 //! experts the two sets' tokens use — every token has ids on both sides — in
 //! slots numbered against the id order, so the translation is not the
-//! identity. Layers whose down stack has no device format (q5_K) are all host,
-//! as in every plan.
+//! identity. A layer of another down (q5_K, layers 0 and 1 of the real file) is
+//! all host in this gate's map: its uploads, its op-path composition and the
+//! ik-composed bands here are the q4_K triple's, and the q5_K down's own
+//! dispatch is the lib gate's clause (`chain::ffn`'s `hw_` test).
 //!
 //! The shared expert runs in the file's format, as the piece runs it: q8_0
 //! gate·up on the f32 activation and a q8_0 down, or Q3_K gate·up on the
@@ -1266,7 +1268,7 @@ mod gate {
     ) -> Result<(), bloomery_gpu::GpuError> {
         let card = lc
             .stacks
-            .map(|s| CardStacks::fused_over(&s.gate, &s.up, &s.down));
+            .map(|s| CardStacks::fused_over(&s.gate, &s.up, &s.down, GgmlType::Q4_K));
         let fio = FfnIo {
             streams: &io.streams,
             fold_in: &io.fold_in,

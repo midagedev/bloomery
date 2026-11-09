@@ -1,0 +1,24 @@
+# Round smallroom-tape (kind profile): the two decodes the smallroom sitting measured, recorded as toktape runs for the
+# clip — the same Korean prompt served by bloomery-serve at the 128 GB room alone (NVMe tier) and at the same room with
+# the Spark tier, one request each, the tape's per-token stamps being the clip's clock. The sitting read decode
+# 19.4-19.6 against 34.7-35.0 tok/s at n 96, prose P 512, depth 512 (smallroom-decode); a chat request of ~100 prompt
+# tokens and 256 generated tokens sits at a shallower depth, so the tape's predicted_per_second should read at or above
+# the sitting's rows by the attention term's share [derived: depth 512 -> ~150 is under 1 ms a step of the 51 and 29 ms].
+kind: profile
+question: do the tapes' decode rates reproduce the sitting's two rows (alone ~19.5, with the Spark ~35) so the clip's
+  replay is the measured ratio, and does prefill (ttft) read the sitting's 29 against 106 pp?
+term: tokens/s (the tape's timings.predicted_per_second) @ one request, 256 tokens, the prompt in
+  rig-log tools/v41-korean.tape's first Korean question, bloomery-serve-ds41 at --place a (BLOOMERY_HOST_ROOM=128G,
+  BLOOMERY_NVTIER_BYTES=60G, BLOOMERY_R8=off) and at --place bp with the Spark tier (BLOOMERY_TIER_NODES,
+  BLOOMERY_TIER_LINK=tcp, BLOOMERY_CARD_BUDGET=110G, BLOOMERY_HOST_LOCK=1), A6000 stage
+unit: tok/s
+predict: 34..37
+condition: one binary (the train tree's commit) on the box and the Spark's tier_server from it; each server its own
+  process, the Spark's caches dropped before the node open; a warm-up request before the recorded one (the recorded
+  request is the second); the alone arm's tape predicted_per_second 18..21; tapes sanitised (tape-sanitize.py) before
+  they leave the box
+decide-in: the clip replays both tapes at their own stamps; the numbers on screen are the tapes' and the sitting's,
+  each named
+decide-below: under 34: the chat path (sampling, the serve loop) costs more than generate_ds41's step; read the tape's
+  pms gaps against the sitting's p50
+decide-above: over 37: the shallower depth saved more than the attention term; write the depth beside the number

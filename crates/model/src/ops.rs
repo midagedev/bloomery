@@ -397,6 +397,8 @@ struct RowChunk {
     who: Option<usize>,
     /// The chunk's own wall, profiled runs only.
     busy_ns: u64,
+    /// When the chunk began, profiled runs only.
+    began: Option<Instant>,
     acc: profile::CallAcc,
     err: Option<crate::ModelError>,
 }
@@ -676,14 +678,18 @@ pub enum GroupInput<'a> {
     /// x / (1 + exp(-alpha x)) * (y + 1)` ([`qdot::swiglu_oai`]; `limit` finite
     /// and not negative).
     SwigluOai(&'a Tensor2, &'a Tensor2, f32, f32),
+    /// (`gate`, `up`, `beta`, `linear_beta`) — the SiTU rule feeds the pair's weight
+    /// ([`ExpertForm::Situ`], `situ_into`'s contract: `beta` and `linear_beta` finite and
+    /// positive).
+    Situ(&'a Tensor2, &'a Tensor2, f32, f32),
     /// (`up`) — `relu(up)²` feeds the pair's weight: the ungated expert form
     /// ([`ExpertForm::Relu2`]), whose layer holds no gate stack.
     Relu2(&'a Tensor2),
 }
 
 /// The combine a [`GroupInput::Swiglu`], [`GroupInput::SwigluClamp`],
-/// [`GroupInput::SwigluOai`] or [`GroupInput::Relu2`] input stands for: the blocks it reads and the one
-/// call every path makes of them ([`InputCombine::write_par`]).
+/// [`GroupInput::SwigluOai`], [`GroupInput::Situ`] or [`GroupInput::Relu2`] input stands for: the
+/// blocks it reads and the one call every path makes of them ([`InputCombine::write_par`]).
 #[derive(Clone, Copy)]
 enum InputCombine<'a> {
     /// `silu(gate) · up`, clamped with `limit`.
@@ -698,6 +704,13 @@ enum InputCombine<'a> {
         up: &'a Tensor2,
         alpha: f32,
         limit: f32,
+    },
+    /// The SiTU rule of `gate` and `up` ([`situ_into`]).
+    Situ {
+        gate: &'a Tensor2,
+        up: &'a Tensor2,
+        beta: f32,
+        linear_beta: f32,
     },
     /// `relu(up)²`.
     Relu2 { up: &'a Tensor2 },
@@ -716,6 +729,12 @@ impl InputCombine<'_> {
                 alpha,
                 limit,
             } => swiglu_oai_into(&gate.data, &up.data, *alpha, *limit, out),
+            InputCombine::Situ {
+                gate,
+                up,
+                beta,
+                linear_beta,
+            } => situ_into(&gate.data, &up.data, *beta, *linear_beta, out),
             InputCombine::Relu2 { up } => relu2_into(&up.data, out),
         }
     }
@@ -732,6 +751,12 @@ impl InputCombine<'_> {
                 alpha,
                 limit,
             } => swiglu_oai_into(gate.col(t), up.col(t), *alpha, *limit, out),
+            InputCombine::Situ {
+                gate,
+                up,
+                beta,
+                linear_beta,
+            } => situ_into(gate.col(t), up.col(t), *beta, *linear_beta, out),
             InputCombine::Relu2 { up } => relu2_into(up.col(t), out),
         }
     }
@@ -739,7 +764,9 @@ impl InputCombine<'_> {
     /// The profiler site the combine's time records under.
     fn site(&self) -> &'static str {
         match self {
-            InputCombine::Swiglu { .. } | InputCombine::SwigluOai { .. } => "swiglu",
+            InputCombine::Swiglu { .. }
+            | InputCombine::SwigluOai { .. }
+            | InputCombine::Situ { .. } => "swiglu",
             InputCombine::Relu2 { .. } => "relu2",
         }
     }
@@ -754,7 +781,8 @@ impl<'a> GroupInput<'a> {
             GroupInput::Ready(x) => x.view(),
             GroupInput::Swiglu(gate, _)
             | GroupInput::SwigluClamp(gate, _, _)
-            | GroupInput::SwigluOai(gate, _, _, _) => gate.view(),
+            | GroupInput::SwigluOai(gate, _, _, _)
+            | GroupInput::Situ(gate, _, _, _) => gate.view(),
             GroupInput::Relu2(up) => up.view(),
         }
     }
@@ -792,6 +820,12 @@ impl<'a> GroupInput<'a> {
                 up,
                 alpha,
                 limit,
+            }),
+            GroupInput::Situ(gate, up, beta, linear_beta) => Some(InputCombine::Situ {
+                gate,
+                up,
+                beta,
+                linear_beta,
             }),
             GroupInput::Relu2(up) => Some(InputCombine::Relu2 { up }),
         }
@@ -2267,6 +2301,33 @@ fn swiglu_oai_into(gate: &[f32], up: &[f32], alpha: f32, limit: f32, out: &mut [
     }
 }
 
+/// The SiTU rule into `out`, in the card's op order (`gpu::kquant::act::situ`, the rule the card
+/// leg's gate·up kernels run): each scale by its f32 reciprocal, the tanh, the scale back, σ with
+/// ik's exponential ([`qdot::expf_ik_scalar`], bit-equal to the device's), then the two products
+/// `(a · s) · v`. The tanh is the host libm's where the card's is libdevice's, so a value can
+/// differ from the card's by ulps and the host-versus-card contract is a relative L2, not bits.
+/// A NaN or an infinity in `gate` or `up` is refused by name after the loop (tanh and σ would
+/// write an infinite sum as a finite value); the loop itself carries no branch.
+fn situ_into(gate: &[f32], up: &[f32], beta: f32, linear_beta: f32, out: &mut [f32]) {
+    assert!(
+        beta.is_finite() && beta > 0.0 && linear_beta.is_finite() && linear_beta > 0.0,
+        "situ: beta and linear beta must be finite and positive, got {beta} and {linear_beta}"
+    );
+    let (rb, rl) = (1.0 / beta, 1.0 / linear_beta);
+    let mut invalid = false;
+    for ((o, &g), &u) in out.iter_mut().zip(gate).zip(up) {
+        invalid |= !(g.is_finite() && u.is_finite());
+        let a = (g * rb).tanh() * beta;
+        let s = 1.0 / (1.0 + qdot::expf_ik_scalar(0.0 - g));
+        let v = (u * rl).tanh() * linear_beta;
+        *o = (a * s) * v;
+    }
+    if invalid {
+        let bad = gate.iter().chain(up).find(|v| !v.is_finite());
+        panic!("situ: non-finite gate or up sum {bad:?}");
+    }
+}
+
 /// `relu(up)²` into `out`: `r = max(up[i], 0)` then `r · r` of the f32,
 /// written once — the one call every relu² combine makes, on a claimant or on
 /// the caller. A NaN or an infinity in `up` is refused by name after the loop
@@ -2300,9 +2361,9 @@ fn combine_timed(combine: InputCombine<'_>) -> (Tensor2, u64) {
     let lvl = profile::level();
     let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
     let (rows, cols) = match combine {
-        InputCombine::Swiglu { gate, .. } | InputCombine::SwigluOai { gate, .. } => {
-            (gate.ne0, gate.ne1)
-        }
+        InputCombine::Swiglu { gate, .. }
+        | InputCombine::SwigluOai { gate, .. }
+        | InputCombine::Situ { gate, .. } => (gate.ne0, gate.ne1),
         InputCombine::Relu2 { up } => (up.ne0, up.ne1),
     };
     let mut out = Tensor2::scratch(rows, cols);
@@ -2479,7 +2540,8 @@ fn group_core(
             None => (SlotBlock::Input(xin), None),
             Some(combine) => {
                 if let InputCombine::Swiglu { gate, up, .. }
-                | InputCombine::SwigluOai { gate, up, .. } = combine
+                | InputCombine::SwigluOai { gate, up, .. }
+                | InputCombine::Situ { gate, up, .. } = combine
                     && (up.ne0, up.ne1) != (gate.ne0, gate.ne1)
                 {
                     return Err(crate::ModelError::Shape {
@@ -4536,8 +4598,17 @@ fn run_row_pool_with<S: RowSet>(
                 profile::add_chunk_busy(c.who.unwrap_or(i), c.busy_ns);
             }
         }
-        if let Some(span_ns) = span_ns {
+        if let (Some(span_ns), Some(t_span)) = (span_ns, t_span) {
             pacc.add_span(span_ns, chunks.iter().map(|c| c.busy_ns).max().unwrap_or(0));
+            let n = chunks.len().max(1) as u64;
+            let mean_busy = chunks.iter().map(|c| c.busy_ns).sum::<u64>() / n;
+            let late = chunks
+                .iter()
+                .filter_map(|c| c.began)
+                .map(|b| b.saturating_duration_since(t_span).as_nanos() as u64)
+                .sum::<u64>()
+                / n;
+            pacc.add_idle(span_ns.saturating_sub(mean_busy), late);
         }
         if let Some(t_gather) = t_gather {
             pacc.add_gather(t_gather.elapsed().as_nanos() as u64);
@@ -4642,6 +4713,7 @@ fn dispatch_flat<S: RowSet>(
             start: if tile { lane_bounds[r.start] } else { r.start },
             who: tile.then_some(r.start),
             busy_ns: 0,
+            began: t_busy,
             acc: profile::CallAcc::new(),
             err: None,
         };
@@ -4795,6 +4867,7 @@ fn dispatch_ccd<S: RowSet>(
             start: cut.first_unit(set, seat.first + seat.rank, total_rows + t),
             who: Some(t),
             busy_ns: 0,
+            began: t_busy,
             acc: profile::CallAcc::new(),
             err: None,
         };
@@ -5168,6 +5241,10 @@ pub enum ExpertForm {
     /// ([`qdot::swiglu_oai`]'s contract, `limit` finite and not negative). The
     /// layer holds the same stacks as [`ExpertForm::Gated`].
     GatedOai { alpha: f32, limit: f32 },
+    /// Gated SiTU: `[gate, up, down]`, the combine `beta · tanh(gate / beta) · σ(gate) ·
+    /// linear_beta · tanh(up / linear_beta)` ([`situ_into`]'s contract, `beta` and `linear_beta`
+    /// finite and positive). The layer holds the same stacks as [`ExpertForm::Gated`].
+    Situ { beta: f32, linear_beta: f32 },
     /// Ungated relu²: `[up, down]`, the combine `relu(up·x)²`
     /// ([`relu2_into`]). A layer of this form holds no gate stack, and the
     /// union reads its up where the gated form reads the gate and the up.
@@ -5215,6 +5292,7 @@ impl ExpertForm {
         match self {
             ExpertForm::Gated { limit } => swiglu_into(gate, up, Some(limit), out),
             ExpertForm::GatedOai { alpha, limit } => swiglu_oai_into(gate, up, alpha, limit, out),
+            ExpertForm::Situ { beta, linear_beta } => situ_into(gate, up, beta, linear_beta, out),
             ExpertForm::Relu2 => relu2_into(up, out),
         }
     }
@@ -5470,7 +5548,7 @@ impl UnionStack {
 }
 
 /// Where a union call's combines come from and go: slot `q` of expert `d` is
-/// its form's combine — `silu(gate) · up` (clamped with the limit) or the OAI
+/// its form's combine — `silu(gate) · up` (clamped with the limit), the OAI or the SiTU
 /// rule of its gate and up columns, or `relu(up)²` of its up column — in `gu`, quantized
 /// in `ty`'s encoding into slot `q` of `qc`.
 #[derive(Clone, Copy)]
@@ -5511,6 +5589,11 @@ impl Combines<'_> {
                     let gate = &self.gu[(2 * o + t) * self.ff..][..self.ff];
                     let up = &self.gu[(2 * o + m + t) * self.ff..][..self.ff];
                     swiglu_oai_into(gate, up, alpha, limit, par);
+                }
+                ExpertForm::Situ { beta, linear_beta } => {
+                    let gate = &self.gu[(2 * o + t) * self.ff..][..self.ff];
+                    let up = &self.gu[(2 * o + m + t) * self.ff..][..self.ff];
+                    situ_into(gate, up, beta, linear_beta, par);
                 }
                 // A relu² layer's first pass wrote the up at the slot itself.
                 ExpertForm::Relu2 => {
@@ -6015,7 +6098,9 @@ impl<'c, 'w> UnionCall<'c, 'w> {
     fn gu_cells(&self) -> usize {
         let cells = self.plan.slots() * self.gate.n;
         match self.form {
-            ExpertForm::Gated { .. } | ExpertForm::GatedOai { .. } => 2 * cells,
+            ExpertForm::Gated { .. } | ExpertForm::GatedOai { .. } | ExpertForm::Situ { .. } => {
+                2 * cells
+            }
             ExpertForm::Relu2 => cells,
         }
     }
@@ -6288,7 +6373,7 @@ impl<'c, 'w> UnionCall<'c, 'w> {
         // A relu² layer's first pass reads the up alone: one pair an expert,
         // the up's slots the store's shape.
         let (pass, site, rec) = match self.form {
-            ExpertForm::Gated { .. } | ExpertForm::GatedOai { .. } => {
+            ExpertForm::Gated { .. } | ExpertForm::GatedOai { .. } | ExpertForm::Situ { .. } => {
                 (UnionPass::GateUp, "host_gate_up", &[self.gate, self.up][..])
             }
             ExpertForm::Relu2 => (UnionPass::Up, "host_up", &[self.up][..]),
@@ -6898,6 +6983,57 @@ mod tests {
         unit_tile_cost,
     };
     use gguf::{GgmlType, Gguf};
+
+    /// The host's SiTU combine is the card's rule at its own betas: `beta · tanh(g / beta) ·
+    /// σ(g) · lb · tanh(u / lb)` against the f64 reference over the gate's and the up's whole
+    /// useful range, each value within 1e-5 relative (the host's tanh and the device's differ by
+    /// ulps, so the contract between them is a relative error, not bits); an infinity or a NaN in
+    /// either input is refused by name where the rule would write a finite value. The tolerance is
+    /// ten times the rule's own f32 rounding: about 8 ulp (2⁻²³ each) over the four scalings, the
+    /// two tanh, ik's exponential, the add and the divide, and the two products, under 1e-6.
+    /// Mutants: the gate scaled by the up's beta, and the check of the inputs left out.
+    #[test]
+    fn the_host_situ_combine_is_the_rule_at_its_betas() {
+        use super::ExpertForm;
+        let (beta, lb) = (8.0f32, 25.0f32);
+        let n = 1024;
+        let gate: Vec<f32> = (0..n).map(|i| (i as f32 - 512.0) * 0.07).collect();
+        let up: Vec<f32> = (0..n)
+            .map(|i| ((i * 37 % n) as f32 - 512.0) * 0.1)
+            .collect();
+        let mut out = vec![0f32; n];
+        ExpertForm::Situ {
+            beta,
+            linear_beta: lb,
+        }
+        .combine_into(&gate, &up, &mut out);
+        for ((&g, &u), &o) in gate.iter().zip(&up).zip(&out) {
+            let (g, u) = (f64::from(g), f64::from(u));
+            let (b, l) = (f64::from(beta), f64::from(lb));
+            let want = b * (g / b).tanh() * (1.0 / (1.0 + (-g).exp())) * (l * (u / l).tanh());
+            let err = (f64::from(o) - want).abs();
+            assert!(
+                err <= 1e-5 * want.abs() + 1e-30,
+                "g {g}, u {u}: {o} against {want}"
+            );
+        }
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for in_up in [false, true] {
+                let (mut g, mut u) = (gate.clone(), up.clone());
+                *(if in_up { &mut u } else { &mut g })
+                    .last_mut()
+                    .expect("a value") = bad;
+                let caught = std::panic::catch_unwind(|| {
+                    super::situ_into(&g, &u, beta, lb, &mut vec![0f32; n]);
+                });
+                let msg = caught
+                    .expect_err("a non-finite sum is refused")
+                    .downcast::<String>()
+                    .expect("a formatted message");
+                assert!(msg.starts_with("situ: non-finite"), "{msg}");
+            }
+        }
+    }
 
     #[test]
     fn expert_range_protection_preserves_values_and_bounds_large_activated_inputs() {

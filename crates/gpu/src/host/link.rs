@@ -20,8 +20,10 @@
 //!   in process, one pump thread driving both ends; the RDMA link
 //!   ([`Link::rdma`]) carries it as RDMA writes between two queue pairs on
 //!   one RoCE port, each end with its own device context and pump thread
-//!   ([`rdma::RdmaEnd`]), which is what one node holds of a link between
-//!   two.
+//!   ([`rdma::RdmaEnd`]); the TCP link ([`Link::tcp`]) carries it as framed
+//!   writes over one TCP stream on the machine's loopback, each end with its
+//!   own pump and receiver threads ([`tcp::TcpEnd`]). An RDMA or a TCP end is
+//!   what one node holds of a link between two.
 //!
 //! A tier served by another process on the same machine (a tier node,
 //! [`super::node`]) reaches a shared page through a file under `/dev/shm`
@@ -30,7 +32,11 @@
 //! ([`Link::open_across`]): one physical page, at its own address on each
 //! side, so each word is still one location and each side's host reaches it
 //! as the shared page's. The loopback's tier side is a page of the stage
-//! card's process, so a tier on a node takes no loopback.
+//! card's process, so a tier on a node takes no loopback. A tier node on
+//! this machine or another can instead hold a page of its own
+//! ([`Link::remote`]): each process's end of the link, RDMA or TCP
+//! ([`RemoteEnd`]), meets the other's through the [`Peer`] the two send each
+//! other over the node's control channel.
 //!
 //! The host touches the page's flag words through the link alone: it reads a
 //! word ([`Link::load`]), stores one ([`Link::store`]),
@@ -42,8 +48,10 @@
 //! it raises any.
 
 mod gather;
+mod path;
 mod pump;
 mod rdma;
+mod tcp;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -59,9 +67,11 @@ use threads::helper::{HelperError, Placement, spawn_helper};
 use crate::GpuError;
 use crate::graph::{MappedHost, SHARED_PAGE, cu};
 pub use gather::{GatherLoop, GatherSet, GatherShape, Gathers};
+pub use path::{PeerPath, paths};
 pub use pump::{Crossing, PostCols, Reader, Span};
 use pump::{Half, Move, Page, TAIL_LINE, Wire};
 pub use rdma::RdmaEnd;
+pub use tcp::{TcpEnd, TcpPeer};
 
 /// How long a reset, release or drop waits for an end's posts in flight to
 /// finish, and a release or drop then for the posts it aborted.
@@ -105,12 +115,92 @@ struct Mirror<P = MappedHost> {
     run_on: Option<(usize, u32)>,
 }
 
-/// This process's ends of remote links, sharing its one page.
-#[derive(Default)]
+/// This process's ends of remote links, sharing its one page, each over
+/// the page's one wire.
 struct Remote {
     pumps: Vec<Pump>,
     ends: Vec<Arc<dyn Side>>,
     counters: Vec<Vec<usize>>,
+    wire: RemoteWire,
+}
+
+/// The wire a remote page's ends cross ([`Link::remote`]): RDMA writes, or
+/// framed writes over a TCP stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteWire {
+    Rdma,
+    Tcp,
+}
+
+/// What one end of a remote link tells the other over the node's control
+/// channel so the two meet ([`RemoteEnd::endpoint`]), by its wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Peer {
+    Rdma(bloomery_verbs::Endpoint),
+    Tcp(TcpPeer),
+}
+
+impl Peer {
+    /// The wire the peer's end crosses.
+    #[must_use]
+    pub fn wire(&self) -> RemoteWire {
+        match self {
+            Peer::Rdma(_) => RemoteWire::Rdma,
+            Peer::Tcp(_) => RemoteWire::Tcp,
+        }
+    }
+}
+
+/// One end of a remote page's link, unconnected or connected, until the
+/// page keeps it ([`Link::keep_remote`]).
+pub(super) enum RemoteEnd {
+    Rdma(RdmaEnd),
+    Tcp(TcpEnd),
+}
+
+impl RemoteEnd {
+    /// What the other end needs to meet this one: an RDMA end's queue pair
+    /// and region, its sends starting at `psn`; a TCP end's listener on the
+    /// stage's side, and on the tier's side the address it dialed from once
+    /// connected ([`TcpEnd::endpoint`]).
+    pub(super) fn endpoint(&self, psn: u32) -> Peer {
+        match self {
+            RemoteEnd::Rdma(e) => Peer::Rdma(e.endpoint(psn)),
+            RemoteEnd::Tcp(e) => Peer::Tcp(e.endpoint()),
+        }
+    }
+
+    /// Meet the other end, `peer`, an RDMA end's sends starting at `psn`,
+    /// and start the pump thread; a peer of the other wire is refused by
+    /// name before anything connects.
+    pub(super) fn connect(&mut self, psn: u32, peer: &Peer) -> Result<(), GpuError> {
+        match (&mut *self, peer) {
+            (RemoteEnd::Rdma(e), Peer::Rdma(p)) => e.connect(psn, p),
+            (RemoteEnd::Tcp(e), Peer::Tcp(p)) => e.connect(p),
+            (end, peer) => Err(GpuError::shape(
+                "the remote tier link",
+                format!(
+                    "a {:?} peer for a {:?} end: both ends of a link cross one wire",
+                    peer.wire(),
+                    end.wire()
+                ),
+            )),
+        }
+    }
+
+    fn wire(&self) -> RemoteWire {
+        match self {
+            RemoteEnd::Rdma(_) => RemoteWire::Rdma,
+            RemoteEnd::Tcp(_) => RemoteWire::Tcp,
+        }
+    }
+
+    fn into_parts(self) -> (Option<Pump>, Arc<dyn Side>) {
+        match self {
+            RemoteEnd::Rdma(e) => e.into_parts(),
+            RemoteEnd::Tcp(e) => e.into_parts(),
+        }
+    }
 }
 
 impl Drop for Remote {
@@ -174,6 +264,9 @@ trait Side<P = MappedHost>: Send + Sync {
     fn reset_reader(&self, off: usize);
     /// Why the end stopped carrying for good.
     fn broken(&self) -> Option<String>;
+    /// Bytes the end posted for the counters at bytes `counters` it writes
+    /// ([`Half::posted`]).
+    fn posted(&self, counters: &[usize]) -> u64;
     /// This end's page.
     fn page(&self) -> &P;
 }
@@ -238,6 +331,10 @@ impl<W: Wire, P: Page> Side<P> for End<W, P> {
 
     fn broken(&self) -> Option<String> {
         self.lock().0.broken().map(str::to_string)
+    }
+
+    fn posted(&self, counters: &[usize]) -> u64 {
+        self.lock().0.posted(counters)
     }
 
     fn page(&self) -> &P {
@@ -407,8 +504,9 @@ impl LinkEnd {
 impl Link {
     /// The link of kind `kind` over `bytes` zeroed bytes of page: the shared
     /// page, allocated in `stage`, or mirrored pages, whose ends carry
-    /// `crossings` ([`Link::loopback`], [`Link::rdma`]) and refuse one by name
-    /// ([`Half::new`]). Load-time only; `stage` is current on return.
+    /// `crossings` ([`Link::loopback`], [`Link::rdma`], [`Link::tcp`]) and
+    /// refuse one by name ([`Half::new`]). Load-time only; `stage` is current
+    /// on return.
     pub(super) fn new(
         kind: TierLink,
         stage: &Arc<CudaContext>,
@@ -423,6 +521,7 @@ impl Link {
             }
             TierLink::Loopback => Link::loopback(stage, tier, bytes, crossings, what),
             TierLink::Rdma => Link::rdma(stage, tier, bytes, crossings, what),
+            TierLink::Tcp => Link::tcp(stage, tier, bytes, crossings),
         }
     }
 
@@ -598,14 +697,14 @@ impl Link {
         let (dev, gid) = bloomery_verbs::first_roce_v2()
             .map_err(|e| GpuError::shape(what, format!("the RDMA link: {e}")))?;
         let post_cols = PostCols::default();
+        let path = PeerPath::port(dev, gid);
         let open = |side, page: &Arc<MappedHost>| {
             RdmaEnd::new(
                 Arc::clone(page),
                 tail,
                 crossings.clone(),
                 side,
-                &dev,
-                gid,
+                &path,
                 post_cols.clone(),
             )
         };
@@ -632,20 +731,113 @@ impl Link {
         })
     }
 
-    /// A local page with room for every remote end's relay tail.
+    /// The TCP link on one machine: the two pages ([`Link::pages`]), each
+    /// held by a TCP end with its own stream, receiver thread and pump thread,
+    /// the tier's end dialing the stage's listener on the loopback address.
+    /// Load-time only; `stage` is current on return.
+    fn tcp(
+        stage: &Arc<CudaContext>,
+        tier: &Arc<CudaContext>,
+        bytes: usize,
+        crossings: Vec<Crossing>,
+    ) -> Result<Link, GpuError> {
+        let (tail, page, tier) = Link::pages(stage, tier, bytes, crossings.len())?;
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let post_cols = PostCols::default();
+        let open = |side, page: &Arc<MappedHost>| {
+            TcpEnd::new(
+                Arc::clone(page),
+                tail,
+                crossings.clone(),
+                side,
+                ip,
+                post_cols.clone(),
+            )
+        };
+        let (mut s, mut t) = (open(Reader::Stage, &page)?, open(Reader::Tier, &tier)?);
+        // The tier's dial waits in the stage's listen queue until its accept.
+        t.connect(&s.endpoint())?;
+        s.connect(&t.endpoint())?;
+        let (s_pump, stage_end) = s.into_parts();
+        let (t_pump, tier_end) = t.into_parts();
+        Ok(Link {
+            mirror: Some(Mirror {
+                pumps: s_pump.into_iter().chain(t_pump).collect(),
+                stage: stage_end,
+                tier: tier_end,
+                #[cfg(test)]
+                run_on: None,
+            }),
+            remote: None,
+            page,
+            counters: Vec::new(),
+            path: None,
+            post_cols,
+        })
+    }
+
+    /// A local page with room for every remote end's relay tail, whose ends
+    /// cross `wire` ([`Link::remote_end`]).
     pub(super) fn remote(
         ctx: &Arc<CudaContext>,
         bytes: usize,
         crossings: usize,
+        wire: RemoteWire,
     ) -> Result<Link, GpuError> {
         let (_, total) = link_tail(bytes, crossings);
         let mut link = Self::shared(ctx, total, Vec::new())?;
-        link.remote = Some(Remote::default());
+        link.remote = Some(Remote {
+            pumps: Vec::new(),
+            ends: Vec::new(),
+            counters: Vec::new(),
+            wire,
+        });
         Ok(link)
     }
 
+    /// An unconnected end over this remote page on its wire, carrying
+    /// `crossings` with their tail lines from byte `tail`, on side `side`, at
+    /// `ip`, the control socket's local address: the RDMA end on that
+    /// address's RoCE port, or the TCP end (the stage's listening there).
+    /// A page that is not remote is refused by name.
+    pub(super) fn remote_end(
+        &self,
+        tail: usize,
+        crossings: Vec<Crossing>,
+        side: Reader,
+        ip: std::net::IpAddr,
+    ) -> Result<RemoteEnd, GpuError> {
+        let remote = self.remote.as_ref().ok_or(GpuError::State {
+            what: "the remote tier link",
+            missing: "a remote page (Link::remote)",
+        })?;
+        Ok(match remote.wire {
+            RemoteWire::Rdma => RemoteEnd::Rdma(self.rdma_end(tail, crossings, side, ip)?),
+            RemoteWire::Tcp => RemoteEnd::Tcp(self.tcp_end(tail, crossings, side, ip)?),
+        })
+    }
+
+    /// An unconnected TCP end over this page: on the stage's side its
+    /// listener at `ip`.
+    fn tcp_end(
+        &self,
+        tail: usize,
+        crossings: Vec<Crossing>,
+        side: Reader,
+        ip: std::net::IpAddr,
+    ) -> Result<TcpEnd, GpuError> {
+        TcpEnd::new(
+            Arc::clone(&self.page),
+            tail,
+            crossings,
+            side,
+            ip,
+            self.post_cols.clone(),
+        )
+    }
+
     /// An unconnected end over this page, on the control socket's RoCE port.
-    pub(super) fn rdma_end(
+    fn rdma_end(
         &self,
         tail: usize,
         crossings: Vec<Crossing>,
@@ -665,8 +857,7 @@ impl Link {
             tail,
             crossings,
             side,
-            &dev,
-            gid,
+            &PeerPath::port(dev, gid),
             self.post_cols.clone(),
         )
     }
@@ -678,7 +869,7 @@ impl Link {
     }
 
     /// Keep a connected end and its pump until this page drops.
-    pub(super) fn keep_remote(&mut self, end: RdmaEnd) {
+    pub(super) fn keep_remote(&mut self, end: RemoteEnd) {
         let remote = self.remote.as_mut().expect("a remote page holds its ends");
         let (pump, side) = end.into_parts();
         remote.pumps.extend(pump);
@@ -845,6 +1036,19 @@ impl Link {
         }
     }
 
+    /// Bytes this process's ends posted for the generations of the counters
+    /// at bytes `counters`, their spans and generation words: on mirrored
+    /// pages both ends', on a remote page this process's; 0 on the shared
+    /// page, which posts nothing.
+    pub(super) fn posted_bytes(&self, counters: &[usize]) -> u64 {
+        let ends: Vec<&dyn Side> = match (&self.remote, &self.mirror) {
+            (Some(r), _) => r.ends.iter().map(|e| &**e).collect(),
+            (None, Some(m)) => vec![&*m.stage, &*m.tier],
+            (None, None) => Vec::new(),
+        };
+        ends.iter().map(|e| e.posted(counters)).sum()
+    }
+
     /// Why mirrored pages stopped carrying for good: a relay that stepped by
     /// neither 0 nor 1, a post the wire failed, or a pump thread that ended.
     /// `None` on the shared page.
@@ -977,7 +1181,8 @@ pub(super) mod tests {
                 Ok(())
             }
         }
-        let mut link = Link::remote(ctx, bytes, crossings.len()).expect("a remote page");
+        let mut link =
+            Link::remote(ctx, bytes, crossings.len(), RemoteWire::Rdma).expect("a remote page");
         let (tail, _) = link_tail(bytes, crossings.len());
         let half = Half::new(
             crossings.clone(),
@@ -1011,6 +1216,7 @@ pub(super) mod tests {
             pumps: Vec::new(),
             counters: vec![end.counters()],
             ends: vec![end],
+            wire: RemoteWire::Rdma,
         });
         link
     }

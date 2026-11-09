@@ -1,0 +1,34 @@
+# k31rel. docs/cards/k31-fio-lat.card: a 2 MiB random read alone completes in ~0.5 ms and the drive is at its rate from queue 4, while the
+# arena route (docs/cards/k31-arena-warm.card) sees ~2 ms a request at 560 KiB. The reader's memory is 4 KiB-aligned pinned host memory
+# (cuMemHostAlloc, PORTABLE|DEVICEMAP, crates/gpu/src/model.rs ~2263) under BLOOMERY_NVTIER_MEM=auto, so a part's one pread of ~2 MiB is
+# cut by the block layer into ~4 requests of <= 512 KiB (max_segments 128 x 4 KiB); the anonymous kind (BLOOMERY_NVTIER_MEM=anon, an
+# mmap with no huge-page request) is the other memory the reader can take. This probe is the warm-arena request (232G room, n_predict
+# 512, the same first 512 ids) once under each kind, reading the decode's last-half rMB/s, rareq-sz and r_await beside the rate, and
+# one fio cell that mimics the reader (16 jobs x queue 1, 2 MiB random O_DIRECT reads of the first shard) for the drive's latency under
+# that pattern. No code changes.
+kind: calibration
+question: does the arena's memory kind (pinned against anonymous) change the reader's request size and latency, and what does fio see at 16 x queue 1 of 2 MiB?
+term: decode tok/s @ D=512 over n_predict 512 at BLOOMERY_HOST_ROOM=232G, per memory kind, with the last half's iostat beside it; fio clat at 16 x qd1 2 MiB
+unit: tok/s
+predict: 3.5..5.0
+condition: tools/ref/k31-arena-mem.sh under one lease: fio first (20 s), then tools/ref/k31-nvme-probe.sh with K31_PROBE_N=512 and
+  K31_PROBE_ENV="BLOOMERY_HOST_ROOM=232G BLOOMERY_NVTIER_MEM=pinned" then "... =anon" (the 0.3.13 sm86 tarball's bloomery-serve); each plan
+  line must print arena near 229 GB; the rows are read with the warm-up in mind (the second half of the decode)
+reason: [derived] if the 2 ms is the block layer's cut and queueing of 16 threads' 2 MiB preads into 4 KiB-paged memory, anonymous memory
+  changes little (also 4 KiB pages) and the fio cell shows ~1-1.5 ms at 16 x qd1 (16 x 2 MiB in flight = 32 MB / 6.8 GB/s = 4.7 ms
+  of queue... no: a layer's batch is ~6 reads, not 16; the cell bounds the reader's worst case). If pinned memory's DMA path is the
+  term, anon reads at the fio latency and the last half's rate rises toward 92 x (0.7 + 0.33) + 10 ms = ~9 tok/s. The band is wide
+  because the 229 GB arena warms over the first ~250 positions
+decide-in: the arena round takes the memory kind the faster row names and adds the huge-page request (MADV_HUGEPAGE on the anonymous
+  arena) so a part is one or two requests; the mirror goes into the reader
+decide-below: under 3.5 on both: the reader's job shape (one job a layer, 16 threads, the publish after all three parts) is the term;
+  the round reads reader.rs before any memory change
+decide-above: above 5.0: the memory kind was the term; the round pins that kind as the default for a paging model
+# outcome 2026-11-07 (/root/k31-arena-mem-pinned, -anon; the 0.3.13 sm86 tarball's bloomery-serve, 232G, D=512 N=512): tg 3.30
+#  pinned, 3.59 anon; both under the band, decide-below's case (the memory kind moves ~8 %, not the term). The block layer's
+#  picture is the same on both: requests 0.5-2 MiB (nvme0's 1280 KiB cut), issue-to-complete 1-8 ms (p50 ~2.5 ms), 104,607
+#  requests 95.6 GB pinned / 85,672 and 88.9 GB anon; iostat over the anon run: nvme0 busy every second at 2.2 GB/s mean
+#  (max 5.2), aqu-sz 5.2, r_await 2.15 ms, nvme1 idle (one second of 435 MB/s). The 2 ms is a layer's misses draining at the
+#  drive's rate with ~5 x 1 MiB in flight, not a per-request latency; the term is the fill's serial place in the layer
+#  (k31-step-stats.card names the step). The anon kind stays the default candidate; the round reads reader.rs's job shape
+#  (one job a layer, the publish after all three parts, the dot after the publish) before any memory change.

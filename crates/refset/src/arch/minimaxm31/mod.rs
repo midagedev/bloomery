@@ -30,7 +30,7 @@ pub const ARCH: &str = "minimax-m3";
 
 /// The first shard of the checkpoint folder every minimaxm31 set is dumped from: the identity each set's `# model` line states.
 /// A set of the folder moved elsewhere, or of a cut of it, is stale by this line, not by its name.
-pub const MODEL: &str = "/models/MiniMax-M3.1-Flash/model-00001-of-00048.safetensors";
+pub const MODEL: &str = "/data/moved/models/MiniMax-M3.1-Flash/model-00001-of-00048.safetensors";
 
 /// The build every minimaxm31 set names: transformers' and torch's release numbers and the first 12 hex digits of the md5 of
 /// `tools/ref/mm31/dump_tf.py`, the writer. `the_writer_pin_is_the_source_in_the_tree` holds it to the tree.

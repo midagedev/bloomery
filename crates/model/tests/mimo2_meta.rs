@@ -17,20 +17,22 @@ use gguf::{Gguf, Split, Value};
 
 /// The file: ggml's RL conversion, MXFP4 experts and a Q8_0 dense tier. Its
 /// first shard holds the header and no tensor.
-const MIMO: &str = "/models/MiMo-V2.6-Flash-RL/MiMo-V2.6-Flash-RL-MXFP4-00001-of-00002.gguf";
+const MIMO: &str =
+    "/data/moved/models/MiMo-V2.6-Flash-RL/MiMo-V2.6-Flash-RL-MXFP4-00001-of-00002.gguf";
 
 /// The separate MTP file, whose 51 blocks carry only the next-token three:
 /// the target reader refuses it by a trunk tensor it does not carry; the
 /// sidecar reader (`mimo2::mtp::mtp_of`) reads it beside a target.
-const MTP: &str = "/models/MiMo-V2.6-Flash-RL/mtp-MiMo-V2.6-Flash-RL-MXFP4.gguf";
+const MTP: &str = "/data/moved/models/MiMo-V2.6-Flash-RL/mtp-MiMo-V2.6-Flash-RL-MXFP4.gguf";
 
 /// The MOPD checkpoint's target (the file the ik oracle is dumped from), its
 /// own Q8_0 sidecar, and the RL checkpoint's Q8_0 sidecar as the type
 /// census's header stub (`tools/type-census.py build`, which writes
 /// `<root>/<org>/<repo>/<file>`: a sparse file of the real header, read by
 /// header alone).
-const MOPD: &str = "/models/MiMo-V2.6-Flash-MOPD/MiMo-V2.6-Flash-MOPD-MXFP4-00001-of-00002.gguf";
-const MOPD_MTP: &str = "/models/MiMo-V2.6-Flash-MOPD/mtp-MiMo-V2.6-Flash-MOPD-Q8_0.gguf";
+const MOPD: &str =
+    "/data/moved/models/MiMo-V2.6-Flash-MOPD/MiMo-V2.6-Flash-MOPD-MXFP4-00001-of-00002.gguf";
+const MOPD_MTP: &str = "/data/moved/models/MiMo-V2.6-Flash-MOPD/mtp-MiMo-V2.6-Flash-MOPD-Q8_0.gguf";
 const RL_MTP_STUB: &str = "/models/census-stubs-a134239f/ggml-org/MiMo-V2.6-Flash-RL-GGUF/mtp-MiMo-V2.6-Flash-RL-Q8_0.gguf";
 
 // PIN(2026-10-07): the file's description as `arch::mimo2::spec` reads it, line by line (the key

@@ -20,12 +20,13 @@
 //! ik line numbers are those of the tree the V4.1 oracle sets were built from
 //! (`tools/ref/models/deepseek41.sh`'s `IK`).
 
-use gguf::Split;
 use gguf::arch::deepseek41::{
     CANDIDATE_BLOCK, CANDIDATE_SOURCE, CANDIDATE_TOPK, ENGRAM, IK_SQRT_SOFTPLUS, gating_func,
 };
+use gguf::engram::{EngramLayout, EngramTables};
 use gguf::facts::{self, Fact, FactError};
 use gguf::quant::GgmlType;
+use gguf::{LoadError, Split};
 
 use super::names;
 use crate::ModelError;
@@ -39,6 +40,18 @@ fn fact_error(e: FactError) -> PlacementError {
     PlacementError::Metadata {
         key: e.key().to_string(),
         detail: e.detail(),
+    }
+}
+
+/// The Engram table owner's refusal, by the tensor or the key it names.
+fn load_error(e: LoadError) -> PlacementError {
+    match e {
+        LoadError::EngramTable { name, detail } => PlacementError::Tensor { name, detail },
+        LoadError::Fact(f) => fact_error(*f),
+        other => PlacementError::Tensor {
+            name: ENGRAM.concat_table.to_string(),
+            detail: other.to_string(),
+        },
     }
 }
 
@@ -192,15 +205,7 @@ impl RowTypes {
     }
 
     fn read(split: &Split, engram: Option<&Engram>) -> Result<RowTypes, PlacementError> {
-        let ty = |name: String| {
-            split
-                .find(&name)
-                .map(|(_, t)| t.ty)
-                .ok_or_else(|| PlacementError::Tensor {
-                    name,
-                    detail: "is not in the file".to_string(),
-                })
-        };
+        let ty = |name| ty_in(split, name);
         let token_embd = ty(names::token_embd())?;
         let Some(engram) = engram else {
             return Ok(RowTypes {
@@ -208,21 +213,18 @@ impl RowTypes {
                 engram: None,
             });
         };
-        let mut tables = engram
-            .layer_ids
-            .iter()
-            .map(|&l| (l, ty(names::engram_embd(l))));
-        let (first, table) = tables.next().ok_or_else(|| PlacementError::Tensor {
+        let mut tables = engram.tables.sites.iter();
+        let first = tables.next().ok_or_else(|| PlacementError::Tensor {
             name: names::engram_embd(0),
             detail: "no engram site names a table".to_string(),
         })?;
-        let table = table?;
-        for (l, t) in tables {
-            let t = t?;
+        let table = GgmlType::from_u32(first.type_id);
+        for s in tables {
+            let t = GgmlType::from_u32(s.type_id);
             if t != table {
                 return Err(PlacementError::Tensor {
-                    name: names::engram_embd(l),
-                    detail: format!("is {t}, layer {first}'s table is {table}"),
+                    name: s.tensor.clone(),
+                    detail: format!("is {t}, layer {}'s table is {table}", first.layer),
                 });
             }
         }
@@ -424,6 +426,9 @@ pub struct Engram {
     pub max_ngram: usize,
     /// `engram.key_length` — values in one table row.
     pub key_length: usize,
+    /// Where each site's rows are in the file, by its layout: the one owner
+    /// ([`EngramTables`]) every reader of a site's table asks.
+    pub tables: EngramTables,
 }
 
 impl Engram {
@@ -438,6 +443,48 @@ impl Engram {
     pub fn embedding_width(&self) -> usize {
         self.rows_per_token() * self.key_length
     }
+
+    /// The file's layout of the tables, which names the site's other tensors.
+    #[must_use]
+    pub fn layout(&self) -> EngramLayout {
+        self.tables.layout
+    }
+
+    /// Site `layer`'s projection of its gathered rows, under the layout's
+    /// name ([`names::engram_wkv`] or [`names::engram_kv`]).
+    #[must_use]
+    pub fn wkv(&self, layer: usize) -> String {
+        match self.layout() {
+            EngramLayout::PerSite => names::engram_wkv(layer),
+            EngramLayout::Concatenated => names::engram_kv(layer),
+        }
+    }
+
+    /// Site `layer`'s gains, as the layout stores them.
+    #[must_use]
+    pub fn gains(&self, layer: usize) -> EngramGains {
+        match self.layout() {
+            EngramLayout::PerSite => EngramGains::Pair {
+                key: names::engram_k(layer),
+                query: names::engram_q(layer),
+            },
+            EngramLayout::Concatenated => EngramGains::Folded {
+                gate: names::engram_gate(layer),
+            },
+        }
+    }
+}
+
+/// An engram site's RMS gains as a file stores them, one row per stream
+/// each.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EngramGains {
+    /// The key's gain and the query's, applied each to its own normalized
+    /// row.
+    Pair { key: String, query: String },
+    /// Their product, one row per stream, applied once to the dot's
+    /// product (llama.cpp's converter's `engram_gate`).
+    Folded { gate: String },
 }
 
 /// One rope as ik's graph passes it to `ggml_rope_ext` for a layer
@@ -539,6 +586,9 @@ pub struct LayerKind {
     /// `ffn_down_shexp`'s type: whether the shared expert's down projection
     /// reads its input as is or in q8_1 decides a launch of the step.
     pub shared_down: GgmlType,
+    /// `ffn_gate_shexp`'s and `ffn_up_shexp`'s types: the shared gate·up runs
+    /// a fused pair, or a gemv each over the f32 row with buffers of its own.
+    pub shared_gate_up: [GgmlType; 2],
     /// The types of the layer's routed gate, up and down stacks in stack
     /// order, `None` where the file holds none of them.
     pub routed_types: Option<[GgmlType; 3]>,
@@ -564,14 +614,15 @@ impl Hparams {
     /// Whether some layer's routed stacks run on the common card leg: a
     /// layer of types the chain's card experts run
     /// ([`crate::placement::accepts::leg_runs`]) that is not the fused layer
-    /// ([`crate::placement::accepts::DS41_LEG`]).
+    /// ([`crate::placement::accepts::ds41_fused`], whose q5_K down among them
+    /// the fused launches read, not the leg's).
     #[must_use]
     pub fn on_leg(&self) -> bool {
-        use crate::placement::accepts::{DS41_LEG, Program, leg_runs};
+        use crate::placement::accepts::{Program, ds41_fused, leg_runs};
         self.layers
             .iter()
             .filter_map(|k| k.routed_types)
-            .any(|t| t != DS41_LEG && leg_runs(Program::Deepseek41Chain, t) == Some(true))
+            .any(|t| !ds41_fused(t) && leg_runs(Program::Deepseek41Chain, t) == Some(true))
     }
 
     /// Everything from `split`'s headers; a missing or malformed key, or a
@@ -898,11 +949,16 @@ impl Engram {
                 format!("is {max_ngram}; the hash needs a 2-gram"),
             ));
         }
+        let find = |n: &str| split.find(n).map(|(_, t)| (t.dims.clone(), t.ty.as_u32()));
+        let tables = EngramTables::read(split.keys(), arch(split), &ENGRAM, find)
+            .map_err(load_error)?
+            .ok_or_else(|| metadata(split, key, "lists no site"))?;
         Ok(Engram {
             layer_ids,
             n_head,
             max_ngram,
             key_length: fact_count(split, &ENGRAM.key_length)?,
+            tables,
         })
     }
 }
@@ -1337,17 +1393,26 @@ fn layer_kinds(
             },
             swiglu_limit: tables.swiglu[l],
             swiglu_limit_shared: tables.swiglu_shared[l],
-            shared_down: split
-                .find(&names::ffn_down_shexp(l))
-                .map(|(_, t)| t.ty)
-                .ok_or_else(|| PlacementError::Tensor {
-                    name: names::ffn_down_shexp(l),
-                    detail: "is not in the file".to_string(),
-                })?,
+            shared_down: ty_in(split, names::ffn_down_shexp(l))?,
+            shared_gate_up: [
+                ty_in(split, names::ffn_gate_shexp(l))?,
+                ty_in(split, names::ffn_up_shexp(l))?,
+            ],
             routed_types: routed_types(split, l),
         });
     }
     Ok(layers)
+}
+
+/// The type of tensor `name`, refused by name when the file holds none.
+fn ty_in(split: &Split, name: String) -> Result<GgmlType, PlacementError> {
+    match split.find(&name) {
+        Some((_, t)) => Ok(t.ty),
+        None => Err(PlacementError::Tensor {
+            name,
+            detail: "is not in the file".to_string(),
+        }),
+    }
 }
 
 /// The types of layer `l`'s routed gate, up and down stacks, `None` unless
@@ -1422,8 +1487,10 @@ fn collapse(split: &Split, model: Model) -> Result<Collapse, PlacementError> {
     })
 }
 
-/// Layer `l`'s engram site: it carries a table exactly when `engram.layer_ids`
-/// lists it (ik asserts the one direction, build_deepseek4.cpp:1545).
+/// Layer `l`'s engram site: exactly when `engram.layer_ids` lists it (ik
+/// asserts the one direction, build_deepseek4.cpp:1545). Every listed
+/// site's rows are in the file ([`Engram::tables`] refuses one that is not);
+/// a per-site table of a layer the list does not name is refused here.
 fn engram_site(
     split: &Split,
     engram: Option<&Engram>,
@@ -1431,19 +1498,14 @@ fn engram_site(
 ) -> Result<Option<usize>, PlacementError> {
     let table = names::engram_embd(l);
     let site = engram.and_then(|e| e.layer_ids.iter().position(|&x| x == l));
-    match (split.find(&table).is_some(), site) {
-        (true, Some(s)) => Ok(Some(s)),
-        (false, None) => Ok(None),
-        (true, None) => Err(metadata(
+    if site.is_none() && split.find(&table).is_some() {
+        return Err(metadata(
             split,
             "engram.layer_ids",
             format!("does not list layer {l}, which carries {table}"),
-        )),
-        (false, Some(_)) => Err(PlacementError::Tensor {
-            name: table,
-            detail: format!("is not in the file, and engram.layer_ids lists layer {l}"),
-        }),
+        ));
     }
+    Ok(site)
 }
 
 /// The layers before the first routed one: ik's `n_layer_dense_lead`, which

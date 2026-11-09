@@ -226,7 +226,7 @@ dependencies = [
 
 [[package]]
 name = "bloomery-gpu-gates"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "bloomery-app",
  "bloomery-chain",
@@ -251,6 +251,7 @@ dependencies = [
  "bloomery-model-hf",
  "bloomery-os",
  "bloomery-qdot",
+ "bloomery-quantize",
  "bloomery-record",
  "bloomery-refset",
  "bloomery-runtime",
@@ -396,6 +397,7 @@ dependencies = [
  "sha1",
  "sha2",
  "thiserror",
+ "unicode-normalization-alignments",
 ]
 
 [[package]]
@@ -466,6 +468,7 @@ dependencies = [
  "bloomery-levers",
  "bloomery-model",
  "bloomery-os",
+ "bloomery-quantize",
  "bloomery-refset",
  "bloomery-safetensors",
  "bloomery-threads",
@@ -514,6 +517,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloomery-quantize"
+version = "0.1.0"
+dependencies = [
+ "bloomery-gguf",
+ "bloomery-os",
+ "bloomery-threads",
+ "thiserror",
+]
+
+[[package]]
 name = "bloomery-record"
 version = "0.1.0"
 
@@ -553,13 +566,14 @@ version = "0.1.0"
 
 [[package]]
 name = "bloomery-serve"
-version = "0.3.13"
+version = "0.3.14"
 dependencies = [
  "bloomery-decision",
  "bloomery-embed",
  "bloomery-gguf",
  "bloomery-jinja",
  "bloomery-models",
+ "bloomery-runtime",
  "bloomery-sampler",
  "bloomery-threads",
  "bloomery-tokenizer",

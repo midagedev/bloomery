@@ -23,6 +23,7 @@ gate-ds41-open	family	deepseek41	meta	arch_registry
 gate-ds41-oracle	tooling		harness	-
 gate-ds41-place	family	glm5next	place	placement_sizing+tier_legs
 gate-ds41-plan	family	deepseek41	host	-
+gate-ds41-reads	family	deepseek41	host	-
 gate-dspark-read	family	deepseek41	draft	drafts_dspark
 gate-emb2-mel	family	gemma4a	media	serve_media
 gate-embed	common		host	ple_embed
@@ -46,6 +47,7 @@ gate-gpu-ds41-chain-ffn	family	deepseek41	kernel	moe_route
 gate-gpu-ds41-chat	family	deepseek41	e2e	seats_app
 gate-gpu-ds41-draft	family	deepseek41	draft	drafts_mtp
 gate-gpu-ds41-dspark-loop	family	deepseek41	draft	drafts_dspark
+gate-gpu-ds41-engram-layout	family	deepseek41	e2e	engram_verbs
 gate-gpu-ds41-lib	family	deepseek41	host	-
 gate-gpu-ds41-long	family	deepseek41	e2e	graph_fault
 gate-gpu-ds41-media	family	deepseek41	media	serve_media+prompt_walks
@@ -55,6 +57,7 @@ gate-gpu-ds41-prefill	family	deepseek41	e2e	prompt_walks
 gate-gpu-ds41-residency-a	family	deepseek41	residency	residency+prompt_walks
 gate-gpu-ds41-step	family	deepseek41	e2e	graph_fault+attn_ds41_csa_hca+moe_route
 gate-gpu-ds41-tier	family	deepseek41	tier	tier_legs
+gate-gpu-ds41-tp	family	deepseek41	e2e	placement_nodes+moe_route
 gate-gpu-ds41-twocard	family	deepseek41	tier	tier_legs+placement_sizing
 gate-gpu-ds41-unpack	common		residency	residency
 gate-gpu-dspark-experts	family	deepseek41	draft	drafts_dspark
@@ -98,6 +101,11 @@ gate-gpu-head	common		kernel	head_sample
 gate-gpu-hybrid	common		tier	tier_legs+moe_route
 gate-gpu-iq	common		kernel	quant_iq
 gate-gpu-iq-sel	common		kernel	quant_iq
+gate-gpu-iq-quant	common		kernel	quant_iq_writer
+gate-quantize	common		kernel	quant_iq_writer
+gate-quantize-oracle	common		kernel	quant_iq_writer
+gate-quantize-e2e	common		e2e	quant_iq_writer
+gate-quantize-plan	common		kernel	quant_iq_writer
 gate-gpu-kquant	common		kernel	quant_q4k+quant_q5k+quant_q8
 gate-gpu-lev-serve	family	qwen35	serve	seats_serve_engine+constrain
 gate-gpu-lib	common		lib	graph_fault+weights_load+kv_pool_checkpoint+tier_legs
@@ -201,7 +209,9 @@ gate-gpu-vision-hw	common		kernel	serve_media
 gate-gpu-vision-lib	common		lib	serve_media
 gate-gpu-xstream	common		tier	tier_legs
 gate-hf	common		host	refset_readers
+gate-host-serve	common		serve	serve_host_seat
 gate-hf-minimax	tooling		by-hand	-
+gate-hf-vocab-kimi-k3	tooling		by-hand	-
 gate-hf-vocab-qwen38	tooling		by-hand	-
 gate-safetensors	common		host	refset_readers
 gate-jinja	common		host	tokenizer_jinja
@@ -249,5 +259,17 @@ gate-gpu-raon1-e2e	family	raon1	e2e	graph_fault+attn_linear_gdn_kda+attn_latent_
 gate-gpu-raon1-attn	family	raon1	kernel	attn_linear_gdn_kda+attn_latent_mla
 gate-raon1-meta	family	raon1	meta	arch_registry
 gate-raon1-tokenizer	family	raon1	tokenizer	tokenizer_jinja
+gate-kimi-k3-tokenizer	family	kimi-k3	tokenizer	tokenizer_jinja
 # dfl-wire
 gate-gpu-raon1-dflash	family	raon1	draft	drafts_dspark
+gate-kimi-k3-meta	family	kimi-k3	meta	arch_registry
+gate-gpu-kimik3-mla	family	kimi-k3	kernel	attn_latent_mla
+gate-gpu-kimik3-dsa	family	kimi-k3	kernel	attn_latent_mla+attn_ds41_csa_hca
+gate-gpu-kimik3-kda	family	kimi-k3	kernel	attn_linear_gdn_kda
+gate-gpu-kimik3-moe	family	kimi-k3	kernel	tier_legs+moe_route+quant_iq+quant_q6k+elem_kernels
+gate-gpu-kimik3-e2e	family	kimi-k3	e2e	graph_fault+attn_linear_gdn_kda+attn_latent_mla+moe_route+attn_res+elem_kernels
+gate-gpu-kimik3-pp	family	kimi-k3	e2e	prompt_walks+attn_linear_gdn_kda+attn_latent_mla+moe_route+attn_res+elem_kernels
+gate-gpu-kimik3-place	family	kimi-k3	load	weights_load+placement_sizing+tier_legs
+gate-gpu-kimik3-serve	family	kimi-k3	serve	seats_serve_engine+serve_toolcall
+gate-quantize-hf	family	kimi-k3	e2e	quant_iq_writer
+gate-gpu-kimik3-imatrix	family	kimi-k3	e2e	imatrix_collector+prompt_walks+attn_linear_gdn_kda+attn_latent_mla+moe_route

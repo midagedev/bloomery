@@ -83,9 +83,21 @@ pub fn enqueue_us(stream: &CudaStream) -> Result<f64, GpuError> {
     Ok(least)
 }
 
-/// The key of `ctx`'s device and this host a measured value is kept under: the card's UUID,
-/// the driver's version, the host CPU's model and logical CPUs, and the effective host kernels.
+/// The key of `ctx`'s device and this host a measured value is kept under: the card and the
+/// driver ([`card_key`]), the host CPU's model and logical CPUs, and the effective host kernels.
 pub fn device_key(ctx: &CudaContext) -> Result<String, GpuError> {
+    // The host's online CPUs, not the calling thread's mask: a load runs pinned.
+    // SAFETY: sysconf reads a constant of the running system.
+    let cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+    Ok(format!(
+        "{} {}",
+        card_key(ctx)?,
+        runtime::costs::cpu_key("/proc/cpuinfo".as_ref(), cpus, model::ops::host_kernels())?
+    ))
+}
+
+/// The key of `ctx`'s card alone: its UUID and the driver's version.
+pub fn card_key(ctx: &CudaContext) -> Result<String, GpuError> {
     let uuid = crate::raw_device_uuid(ctx.cu_device())?;
     let mut driver = 0;
     cu(
@@ -97,13 +109,6 @@ pub fn device_key(ctx: &CudaContext) -> Result<String, GpuError> {
     for b in uuid {
         let _ = write!(key, "{b:02x}");
     }
-    // The host's online CPUs, not the calling thread's mask: a load runs pinned.
-    // SAFETY: sysconf reads a constant of the running system.
-    let cpus = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
-    let _ = write!(
-        key,
-        " driver={driver} {}",
-        runtime::costs::cpu_key("/proc/cpuinfo".as_ref(), cpus, model::ops::host_kernels())?
-    );
+    let _ = write!(key, " driver={driver}");
     Ok(key)
 }

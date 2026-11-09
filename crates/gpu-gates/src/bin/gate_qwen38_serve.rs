@@ -3640,6 +3640,7 @@ mod gate {
             &mut machine,
             (ctx, slots, drafted),
             stage.granule_bytes.get(),
+            bloomery_levers::KvHost::Off,
         )?;
         Ok(machine)
     }
@@ -5150,6 +5151,7 @@ mod gate {
             let machine = route_machine(&inputs, card, (ub, c), experts, (1, drafted))?;
             let plan_levers = PlanLevers {
                 card_budget_bytes: Some(budget).into(),
+                ..PlanLevers::default()
             };
             Ok(inputs
                 .plan_target(

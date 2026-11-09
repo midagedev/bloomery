@@ -94,6 +94,10 @@ mod dspark;
 mod quiet;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_pair.rs"]
+mod ds41_pair;
+
+#[cfg(feature = "deepseek41")]
 #[path = "shared/ds41_tier.rs"]
 #[allow(
     dead_code,
@@ -741,11 +745,18 @@ mod gate {
         let hybrid: Vec<usize> = (0..layers)
             .filter(|&l| plan.n_l.get(l).is_some_and(|&n| n > 0))
             .collect();
+        // The tier holds experts on exactly the hybrid layers the pair rule lets a tier run.
+        let mut admitted = Vec::new();
+        for &l in &hybrid {
+            if crate::ds41_pair::tier_admits(&inputs.hp, l)? {
+                admitted.push(l);
+            }
+        }
         let mut pass = true;
-        if hybrid != tier_layers {
+        if admitted != tier_layers {
             println!(
                 "FAIL sets: the tier holds experts on layers {tier_layers:?}, the stage's hybrid \
-                 layers are {hybrid:?}"
+                 layers the pair rule admits on a tier are {admitted:?} (hybrid {hybrid:?})"
             );
             pass = false;
         }

@@ -338,3 +338,159 @@ fn hw_engram_cache_serves_table_bytes() {
         "a hit on a pending slot must be refused, not served"
     );
 }
+
+/// The public V4.1 set in llama.cpp's layout: one table of every site's rows
+/// (`per_layer_token_embd.weight`) and the hash under the `ple.*` keys.
+const UPSTREAM_DIR: &str = "/models/DeepSeek-V4.1-Flash-1017-UD-IQ3_XXS";
+
+/// The model's two layouts hash alike and place each site's rows: the public
+/// set in llama.cpp's layout (one table, its bucket offsets counted from the
+/// table's row 0) and the gates' per-site set give every bucket of every site
+/// the same row id for each of corpus-code's first 3000 tokens; their sites
+/// hold as many rows; and in the one table each site's last row is readable,
+/// the one past it is refused, and the next site's first row starts at the
+/// byte after it. Headers and those rows only: no model is opened.
+#[test]
+#[ignore = "hw: needs the box, both V4.1 splits and the token streams"]
+fn hw_engram_both_layouts_hash_alike() {
+    const TOKENS: usize = 3000;
+    let upstream = Engram::open_dir(UPSTREAM_DIR).unwrap_or_else(|e| {
+        panic!("no engram table under {UPSTREAM_DIR} ({e}). Do not skip this test.")
+    });
+    let site_wise = open();
+    let (one, each) = (upstream.sites(), site_wise.sites());
+    assert_eq!(one.len(), each.len(), "the two sets' Engram sites");
+    for (s, (site, twin)) in one.iter().zip(each).enumerate() {
+        assert_eq!(site.rows(), twin.rows(), "site {s}: its rows in both sets");
+        assert_eq!(
+            site.name(),
+            one[0].name(),
+            "site {s}: the public set's sites share one table"
+        );
+        let last = u32::try_from(site.rows() - 1).expect("a site's row ids are u32");
+        assert!(site.row(last).is_ok(), "site {s}: its last row");
+        assert!(
+            matches!(site.row(last + 1), Err(EngramError::RowOutOfRange { .. })),
+            "site {s}: the row past its last is refused"
+        );
+        if let Some(next) = one.get(s + 1) {
+            assert_eq!(
+                site.file_offset(last) + site.row_bytes(),
+                next.file_offset(0),
+                "site {s} ends where site {} begins",
+                s + 1
+            );
+        }
+    }
+    let stream = corpus("code");
+    let tokens = stream.get(..TOKENS).unwrap_or_else(|| {
+        panic!(
+            "corpus-code has {} tokens and this gate reads the first {TOKENS}; \
+             rerun `just engram-corpus`",
+            stream.len()
+        )
+    });
+    let mut ids = Vec::new();
+    walk(upstream.hash(), tokens, |site, bucket, id| {
+        ids.push((site, bucket, id));
+    });
+    let mut at = 0;
+    walk(site_wise.hash(), tokens, |site, bucket, id| {
+        assert_eq!(
+            ids.get(at),
+            Some(&(site, bucket, id)),
+            "walk entry {at}: the two layouts hash this bucket to other rows"
+        );
+        at += 1;
+    });
+    assert_eq!(at, ids.len(), "both walks visit every bucket once");
+}
+
+/// The V4.1 fixture and its upstream twin (`just fixture-engram-upstream`;
+/// `tools/ref/engram-relayout.py twin` names the twin's directory).
+const FIXTURE_DIR: &str = "/models/fixtures/v41";
+const TWIN_DIR: &str = "/models/fixture-variants/engram-upstream/v41";
+
+/// The fixture and its upstream twin read the same rows: for each of
+/// corpus-prose's first 3000 tokens, every bucket of every site hashes to
+/// the same row id in both, and that row decodes (`gguf::quant::dequant_row`)
+/// to the same f32 bits in both — the twin's Q6_K rows are the fixture's
+/// Q3_K rows transcoded exactly, each site's run at its base row of the one
+/// table. Headers and those rows only: no model is opened.
+#[test]
+#[ignore = "hw: needs the box, the V4.1 fixture, its upstream twin and the token streams"]
+fn hw_engram_fixture_and_twin_read_the_same_rows() {
+    const TOKENS: usize = 3000;
+    let open_at = |dir: &str| {
+        Engram::open_dir(dir).unwrap_or_else(|e| {
+            panic!(
+                "no engram table under {dir} ({e}); `just fixture-engram-upstream` writes the \
+                 twin. Do not skip this test."
+            )
+        })
+    };
+    let (per_site, twin) = (open_at(FIXTURE_DIR), open_at(TWIN_DIR));
+    let (each, one) = (per_site.sites(), twin.sites());
+    assert_eq!(each.len(), one.len(), "the two sets' Engram sites");
+    for (s, (a, b)) in each.iter().zip(one).enumerate() {
+        assert_eq!(a.rows(), b.rows(), "site {s}: its rows in both sets");
+        assert_eq!(
+            b.name(),
+            one[0].name(),
+            "site {s}: the twin's sites share one table"
+        );
+    }
+    let ty = |site: &engram::Site| gguf::GgmlType::from_u32(site.type_id());
+    let width = |site: &engram::Site| {
+        let t = ty(site);
+        let (Some(block), Some(bytes)) = (t.blck_size(), t.type_size()) else {
+            panic!("{}: {t} is not sized", site.name())
+        };
+        usize::try_from(site.row_bytes() / bytes * block).expect("a row's width is a usize")
+    };
+    let decode = |site: &engram::Site, id: u32, out: &mut [f32]| {
+        let bytes = site
+            .row(id)
+            .unwrap_or_else(|e| panic!("{} row {id}: {e}", site.name()));
+        gguf::quant::dequant_row(ty(site), bytes, out)
+            .unwrap_or_else(|e| panic!("{} row {id}: {e}", site.name()));
+    };
+    let stream = corpus("prose");
+    let tokens = stream.get(..TOKENS).unwrap_or_else(|| {
+        panic!(
+            "corpus-prose has {} tokens and this gate reads the first {TOKENS}; \
+             rerun `just engram-corpus`",
+            stream.len()
+        )
+    });
+    let mut ids = Vec::new();
+    walk(twin.hash(), tokens, |site, bucket, id| {
+        ids.push((site, bucket, id));
+    });
+    let mut at = 0;
+    walk(per_site.hash(), tokens, |site, bucket, id| {
+        assert_eq!(
+            ids.get(at),
+            Some(&(site, bucket, id)),
+            "walk entry {at}: the two layouts hash this bucket to other rows"
+        );
+        let n = width(&each[site]);
+        assert_eq!(
+            n,
+            width(&one[site]),
+            "site {site}: its row width in both sets"
+        );
+        let (mut x, mut y) = (vec![0f32; n], vec![0f32; n]);
+        decode(&each[site], id, &mut x);
+        decode(&one[site], id, &mut y);
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+        assert!(
+            bits(&x) == bits(&y),
+            "site {site} row {id}: the twin's {} row does not decode to the fixture's {} row",
+            ty(&one[site]),
+            ty(&each[site])
+        );
+        at += 1;
+    });
+    assert_eq!(at, ids.len(), "both walks visit every bucket once");
+}

@@ -17,6 +17,8 @@
 | `openbmb/MiniCPM-V-4.7-35B-A3B-FP8` | `25f6715c91b8e528d45532d4a3cbcb206c59fb47` | compressed-tensors FP8 per channel |
 | `openbmb/MiniCPM-V-4.7-35B-A3B-int4` | `1fe0fee8ba1e05a3180fb306b05ccc4a75cc4c86` | compressed-tensors pack-quantized int4, group 128 |
 | `MiniMaxAI/MiniMax-M3.1-Flash` | `76faee1b4ac0f412e547781172e94548a6526a88` | `mxfp8` method: MXFP8 dense, `nvfp4-pack-quantized` experts (compressed-tensors tensor names) |
+| `moonshotai/Kimi-K3` | (the hub's main on 2026-11-06; no revision recorded) | compressed-tensors `mxfp4-pack-quantized` (group 32, E8M0 U8 scale) on the routed experts, BF16 elsewhere; `kimi_k3` with a `kimi_linear` text config of 93 layers, 69 KDA and 24 latent |
+| `moonshotai/Kimi-K3.1-Pro` | (the hub's main on 2026-11-06; no revision recorded) | the same quantization (its ignore list adds the router and the latent projections); `kimi_k31`, adding `dsa_config` (the indexer on the 24 latent layers) |
 
 Bolt's two files list 27,921 modules (15 MB); they are cut to the first module of each algorithm (`quantized_layers`) and the first group (`config_groups`), the rest unchanged.
 

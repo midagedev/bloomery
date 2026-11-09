@@ -1,0 +1,17 @@
+# r3b mutant machine-release-skipped
+# clause: gate_swap tail_pages (crates/gpu-gates/src/bin/gate_swap.rs): the machine's release_tail packs
+#   and withdraws as before but never asks the source to release the stacks' pages, so Released.freed_bytes
+#   is 0 and the stand-in room stays whole: the clause reads FAIL on the freed bytes against the
+#   page-derived bytes and on the device's free bytes not growing. The residency kvfloor clause's
+#   squeezed run ends in NoRoom.
+--- a/crates/gpu/src/host/swap.rs
++++ b/crates/gpu/src/host/swap.rs
+@@ -3718,7 +3718,7 @@
+         let from = cap - k;
+         let freed_bytes = if source.stack_tail_bytes(layer, from)? > 0 {
+             self.drain_copies(WHAT)?;
+-            source.release_stacks(layer, from)?
++            0
+         } else {
+             0
+         };

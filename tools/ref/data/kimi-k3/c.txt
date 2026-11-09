@@ -1,0 +1,5 @@
+use std::collections::HashMap;
+
+/// Counts how many times each word appears in the text.
+pub fn word_counts(text: &str) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();

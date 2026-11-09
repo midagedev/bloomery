@@ -213,8 +213,14 @@ impl Glue {
             need(WHAT, "params", 4 * params.len(), at_byte + site_bytes)?;
             let at_byte = launch_u32(WHAT, "site rows", at_byte)?;
             let mut x = span_mut(WHAT, &mut b.x, t * rows_values, rows_values)?;
-            self.table
-                .enqueue(&self.module, stream, self.shape, (params, at_byte), &mut x)?;
+            self.table.enqueue(
+                &self.module,
+                stream,
+                self.shape,
+                (params, at_byte),
+                gpu.layer_sink(layer)?,
+                &mut x,
+            )?;
         }
         let wide = (HC_STREAMS + 1) * ROW;
         let wkv = Dense::of(w, &site.wkv, rows_values, wide)?;
@@ -240,7 +246,7 @@ impl Glue {
             stream,
             KeyNormArgs {
                 kv: &kv,
-                gain: gain(w, &site.gain_k, HC_STREAMS * ROW)?,
+                gain: gain(w, &site.gain_k, self.ones.as_ref())?,
                 eps: self.eps,
                 hc: HC_STREAMS,
                 m,
@@ -255,7 +261,7 @@ impl Glue {
                 x: a.streams,
                 kn: &kn,
                 kv: &kv,
-                gain: gain(w, &site.gain_q, HC_STREAMS * ROW)?,
+                gain: gain(w, &site.gain_q, self.ones.as_ref())?,
                 eps: self.eps,
                 hc: HC_STREAMS,
                 m,
@@ -287,13 +293,17 @@ fn check_tokens(what: &'static str, b: &GlueBatch, m: usize) -> Result<(), GpuEr
 /// in flight beside every other's rather than behind the one before it. The
 /// bytes are the table's, as [`StepRows`] reads them for a step.
 pub struct PromptRows {
-    engram: Arc<Engram>,
+    engram: Arc<Tables>,
     embd: RowLayout,
     embd_bytes: usize,
     n_cols: usize,
     row_bytes: usize,
+    /// The columns of each site's rows read, as [`StepRows`] reads them.
+    cols: Range<usize>,
     cap: usize,
     ctx: Vec<u64>,
+    /// One token's ids of every column of every site.
+    all: Vec<u32>,
     /// `[token][site][n_cols]` for the batch's tokens, and per site the same
     /// ids in token order, the site's one prefetch.
     ids: Vec<u32>,
@@ -309,15 +319,17 @@ impl StepRows {
     /// tokens: every buffer a fill writes allocated here.
     #[must_use]
     pub fn prompt_rows(&self, cap: usize) -> PromptRows {
-        let sites = self.engram.sites().len();
+        let sites = self.engram.count();
         PromptRows {
             engram: Arc::clone(&self.engram),
             embd: self.embd.clone(),
             embd_bytes: self.embd_bytes,
             n_cols: self.n_cols,
             row_bytes: self.row_bytes,
+            cols: self.cols.clone(),
             cap,
             ctx: vec![0; self.ctx.len()],
+            all: vec![0; self.all.len()],
             ids: vec![0; cap * sites * self.n_cols],
             site_ids: (0..sites)
                 .map(|_| Vec::with_capacity(cap * self.n_cols))
@@ -362,7 +374,7 @@ impl PromptRows {
             });
         }
         let is_media = |k: usize| media.get(k).copied().unwrap_or(false);
-        let sites = self.engram.sites().len();
+        let sites = self.engram.count();
         let token_ids = sites * self.n_cols;
         let mut t = 0;
         for plan in plans {
@@ -387,7 +399,13 @@ impl PromptRows {
                     continue;
                 }
                 let ids = &mut self.ids[(t + k) * token_ids..][..token_ids];
-                token_rows(&self.engram, &mut self.ctx, window, ids, self.n_cols)?;
+                token_rows(
+                    &self.engram,
+                    (&mut self.ctx, window),
+                    &mut self.all,
+                    ids,
+                    &self.cols,
+                )?;
             }
             t += m;
         }
@@ -397,7 +415,7 @@ impl PromptRows {
                 list.extend_from_slice(&self.ids[(k * sites + s) * self.n_cols..][..self.n_cols]);
             }
         }
-        for (site, list) in self.engram.sites().iter().zip(&self.site_ids) {
+        for (site, list) in self.engram.sites().zip(&self.site_ids) {
             site.prefetch(list).map_err(|e| GpuError::plan(WHAT, e))?;
         }
         let site_bytes = self.n_cols * self.row_bytes;
@@ -410,7 +428,6 @@ impl PromptRows {
             for ((site, ids), dst) in self
                 .engram
                 .sites()
-                .iter()
                 .zip(self.ids[k * token_ids..][..token_ids].chunks_exact(self.n_cols))
                 .zip(out.chunks_exact_mut(site_bytes))
             {
@@ -430,7 +447,7 @@ impl PromptRows {
     /// Tokens `range` of the last fill's engram rows: per token, every site's
     /// rows in site order.
     pub fn engram(&self, range: std::ops::Range<usize>) -> Result<&[u8], GpuError> {
-        let token = self.engram.sites().len() * self.n_cols * self.row_bytes;
+        let token = self.engram.count() * self.n_cols * self.row_bytes;
         self.rows_of(&self.engram_rows, token, range)
     }
 

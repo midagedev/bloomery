@@ -99,9 +99,14 @@
 //!   (the set's `cache_s_lL`, `cache_k_lL`, `cache_v_lL`): each layer's
 //!   store distance from ik's, the ubatch run's over the pass run's, within
 //!   [`PROMPT_RATIO`]; then the step at position 1,024 free-running from each
-//!   run's own state: each layer's output distance from ik's `l_out`, and the
-//!   logits' from ik's `result_output`, the ubatch run's over the pass run's
-//!   within [`STEP_RATIO`]; the three argmaxes printed.
+//!   run's own state: each layer's output distance and the logits' from the
+//!   pass run's, our own rule's sequential realization, within
+//!   [`STEP_PASS_REL`] — the batch is judged against our own rule, not ik's
+//!   prompt: a run's distance from ik's `l_out` and `result_output` mixes the
+//!   two engines' activation rules into the reading, and the ratio of the two
+//!   runs' distances reads their sum orders through that mix, a quantity with
+//!   no band to derive (both distances printed beside); the three argmaxes
+//!   printed.
 //! - (w) the ubatch size moves no bit: the same 1,024 ids on the GEMM path at
 //!   each size of [`W_SIZES`] (ubatches of 512 x 2; 1,000 and 24; 100 x 10
 //!   and 24), and at [`U_GATE`] in two calls cut at [`W_CUT`], leave the last
@@ -290,7 +295,7 @@
 //!   and after each wide prompt every layer's map of the wide arm is the
 //!   card copy's row followed by the shared expert's HOST entry
 //!   (`Placed::stale_maps`), on both runs; every call's logits row within
-//!   [`FREE_BAND`] of the off run's (relative), the ids equal or parting at
+//!   [`FLIPS_BAND`] of the off run's (relative), the ids equal or parting at
 //!   a near tie ([`GREEDY_MARGIN`]). `c1` (green-only): the history twice gives the same ids and
 //!   logits bit for bit. `c7`: a residency reset brings every live set back
 //!   to its seed. `admit`: the history once more with the prompt calls'
@@ -498,32 +503,36 @@ mod gate {
     /// that; a wiring fault still reads order one.
     const U_L0_REL_Q32: f64 = 1e-2;
 
-    /// PIN(2026-09-27): (d)'s bound on the step at position 1,024 free-running
-    /// from each run's own state — each layer's output distance from ik's and
-    /// the logits' — the ubatch run's over the pass run's. Derivation: past
-    /// layer 0 the two runs' first difference (Δ, [`U_L0_REL`]) grows at every
-    /// q8_1 re-quantization by code flips until the ubatch run is another q8_1
-    /// realization of the same rule (gate_qwen3moe's GEMM_SPREAD_RATIO note),
-    /// statistically the pass run's twin against ik; one step from each state
-    /// reads about 1. A wiring fault — another layer's weight, a token off by
-    /// one, a stale route row — adds an error of order one to distances of
-    /// 1e-2 to 0.3, a ratio above 3 on every layer it reaches.
-    const STEP_RATIO: f64 = 1.5;
-
-    /// PIN(2026-10-11): [`STEP_RATIO`] for the placed load's wide arm: the
-    /// stores' [`PROMPT_RATIO`], 2.5. Derivation: the ratio is one step's output
-    /// distance from ik after the ubatch run's own state over the pass run's,
-    /// and each distance is one excursion of the state it started from, not an
-    /// average (the whole-card load's per-layer ratios scatter about 1 on
-    /// the log scale, the pass run's distance jumping at single layers). The
-    /// placed pass run is the host's 8-bit rule, another realization of the
-    /// same rule, so its denominator has its own excursions. The bound is
-    /// [`PROMPT_RATIO`]'s: √(1 + (d_wp/d_pi)²) with the two runs' own distance
-    /// up to 2.3 d_pi is 2.5. A wiring fault adds an error of order one to
-    /// distances of 1e-2 to 0.3, a ratio above 3 on every layer it reaches
-    /// ([`STEP_RATIO`]'s note). The last logits keep [`STEP_RATIO`]: they are
-    /// the one tensor all layers' excursions average into.
-    const PLACED_STEP_RATIO: f64 = 2.5;
+    /// PIN(2026-11-05): (d)'s bound on the step at position 1,024
+    /// free-running from each run's own state — each layer's output distance
+    /// and the logits' from the pass run's, our own rule's sequential
+    /// realization (‖ubatch − pass‖ / ‖pass‖). The judge is ours, not ik's:
+    /// a run's distance from ik's taps mixes the two engines' activation
+    /// rules with the run's own sum order, and the ratio of the two runs'
+    /// distances reads that mix — seven f32 realizations of one rule
+    /// scattered it from 0.35 to 1.75, so no band could be derived from the
+    /// code's terms; this distance can. Derivation: the step's launches are
+    /// the same eager one-token path on both arms, so with equal stores the
+    /// step is bit for bit equal and the whole distance is the prompt's
+    /// store divergence propagated one step. Layer 0's store sits within
+    /// [`U_L0_REL`] of the pass run's (the same codes, the sums' rounding
+    /// alone); past it every re-quantization flips codes until the runs are
+    /// two independent realizations of one 8-bit rule, a projection then
+    /// reading its input's two-sided gap ([`quant_gap_two_sided`], (f)'s
+    /// premise: about 2e-2 at the worst site), and the GDN state's map — the
+    /// decay, β and the normed k all at most 1 — does not amplify what a
+    /// layer carries. The residual composes the per-layer differences — each
+    /// at its largest reading's gap, the readings adding to the update, not
+    /// summing their gaps — in quadrature over the 40 layers:
+    /// √40 · 2e-2 ≈ 0.13, the step's read-out adding its own layer's store
+    /// distance, of the same order: 0.15. The band is that with headroom.
+    /// The placed load adds no term of another kind — its plan's card/host
+    /// split is both runs', so the host's 8-bit rule is common to them and
+    /// only the host port's sum orders join — so one band serves both loads.
+    /// A wiring fault — another layer's weight, a token off by one, a stale
+    /// route row — adds an error of order one, past the band by 5× on every
+    /// layer it reaches.
+    const STEP_PASS_REL: f64 = 2e-1;
 
     /// PIN(2026-09-28): (d)'s bound on a layer's store distance from ik (a
     /// recurrent state and the conv ring's rows ik keeps, or the K and V rows,
@@ -939,6 +948,48 @@ mod gate {
     /// independent: √40 · 4e-2 ≈ 0.25. The step sets' one step starts from
     /// ik's own state, so the same composition bounds it.
     const FREE_BAND: f64 = 0.26;
+
+    /// PIN(2026-11-05): (e)'s bound on the residency run's calls against the
+    /// off run's (‖on − off‖ / ‖off‖, the worst call). Two of our runs on
+    /// one placed plan, the on run forced to the off run's ids, so their sum
+    /// orders are equal and the whole distance is the tier the machine moved
+    /// experts to. Per moved site the card's q8_1 activation rule (per 128
+    /// values) meets the host's ik 8-bit rule (per 32): the gap
+    /// [`quant_gap_two_sided`] measures, about 2e-2 at the worst site, and
+    /// (o9)'s whole-unit reading of the same class at the logits is 1.9e-2
+    /// to 2.26e-2 ([`COMMON_WIDE_REL`]'s note). The sites: the rule admits
+    /// an expert only when the last four kept rows routed to it at least
+    /// twice and three times its victim's count, so a landed flip's admit
+    /// carries a leading pick share and its victim and the load's freed seed
+    /// spares (one a layer) at most a third of it, and one spare a layer
+    /// holds the standing deviation at one admit; the churn lands 360 flips
+    /// before the second prompt, each standing until a later flip returns
+    /// it. The carry: the GDN state (30 of the 40 layers) and the attention
+    /// K/V rows hold every site's difference for the rest of the history —
+    /// the state's map damps a difference only along each token's normed k
+    /// (decay·(1−β) and decay, both at most 1) and the residual adds every
+    /// layer's — so the injections compose in quadrature over the landed
+    /// sites: √(360 + 400/9) · 2e-2 ≈ 0.40 at a degenerate pick share, the
+    /// sequential form's 0.177 at the leading share the rule's cut implies.
+    /// The fourth term no code line derives: the router's top-8 turns the
+    /// carried difference into expert swaps at the draws whose 8/9 margin it
+    /// crosses — the fixture tier carries `router_tie` and
+    /// [`FREE_FLIPS_MAX`] because our routes flip at near ties against a
+    /// reference — each swap replacing its draw's 2e-2 same-expert gap with
+    /// a different-expert gap of the tie weight's order, a draw that any
+    /// ulp-scale move of either run re-rolls: the prompt form's own error is
+    /// at most 2e-6 (gate_linear's `PROMPT_BAND`), five orders under the
+    /// reading, yet the isolation runs — one GDN prompt product at a time in
+    /// f64, the split unchanged — moved the reading from that 0.177 to
+    /// 0.430. The band holds every reading of that scatter with the
+    /// arithmetic under it: 0.5. A wiring fault — the maps kept as the load
+    /// built them — reads another expert's weights or none at every draw of
+    /// the affected ids: (o9)'s swapped-route-block fault read 4.8e-1
+    /// through one unit where the full split read 2.26e-2, and over this
+    /// history the same class saturates the two runs' decorrelation (two
+    /// unrelated logits rows stand √2 apart), 2.8× the band; the map line
+    /// names the layers first.
+    const FLIPS_BAND: f64 = 0.5;
 
     /// The layer stores' bytes at [`CTX`] rows, derived from the header:
     /// each attention layer's K and V planes, `2 · n_kv · ctx · 256` f16;
@@ -2495,33 +2546,23 @@ mod gate {
         for (l, (a, b)) in ub.step_taps.iter().zip(&pass.step_taps).enumerate() {
             let want = tap(&man, &format!("l_out-{l}"))?;
             let want = last_rows(&want, HIDDEN, 1).ok_or("l_out")?;
-            let (da, db) = (rel_to(a, want), rel_to(b, want));
-            let r = worse(0.0, da / db.max(f64::MIN_POSITIVE));
+            let (d, da, db) = (rel_to(a, b), rel_to(a, want), rel_to(b, want));
             println!(
-                "{label}prompt step layer={l} l_out from ik: ubatch {da:.3e} pass {db:.3e} ratio \
-                 {r:.2} (printed)"
+                "{label}prompt step layer={l} l_out: ubatch from the pass run {d:.3e}; from ik \
+                 ubatch {da:.3e} pass {db:.3e} (printed)"
             );
-            if r > worst_out.0 {
-                worst_out = (r, l);
+            if d > worst_out.0 {
+                worst_out = (d, l);
             }
         }
         let ik_logits = tap(&man, "result_output")?;
         let vocab = m.body("wide_arm")?.vocab();
         let ik_last = last_rows(&ik_logits, vocab, 1).ok_or("result_output")?;
-        let (lu, lp) = (
-            rel_to(&ub.step_logits, ik_last),
-            rel_to(&pass.step_logits, ik_last),
-        );
-        let r_logits = worse(0.0, lu / lp.max(f64::MIN_POSITIVE));
-        let step_band = if label.is_empty() {
-            STEP_RATIO
-        } else {
-            PLACED_STEP_RATIO
-        };
-        let pass_s = worst_out.0 <= step_band && r_logits <= STEP_RATIO;
+        let d_logits = rel_to(&ub.step_logits, &pass.step_logits);
+        let pass_s = worst_out.0 <= STEP_PASS_REL && d_logits <= STEP_PASS_REL;
         println!(
-            "{label}prompt step {p}: worst l_out ratio {:.2} at layer {}, logits from ik ubatch {lu:.3e} \
-             pass {lp:.3e} ratio {r_logits:.2} (band {step_band}); argmax ubatch={} pass={} \
+            "{label}prompt step {p}: worst l_out from the pass run {:.3e} at layer {}, logits from \
+             the pass run {d_logits:.3e} (band {STEP_PASS_REL:.0e}); argmax ubatch={} pass={} \
              ik={} (printed) {}",
             worst_out.0,
             worst_out.1,
@@ -3284,6 +3325,7 @@ mod gate {
         let q = PlaceQ3::qwen35(&file, Place::parse("cuda0")?, o)?;
         let levers = PlanLevers {
             card_budget_bytes: Some(placed_budget()).into(),
+            ..PlanLevers::default()
         };
         let plan = q.plan(CTX, &levers)?;
         for line in q.records(&plan, None)? {
@@ -3554,7 +3596,7 @@ mod gate {
         let mut ok = finite;
         let (mut worst, mut over, mut parted, mut far) = ((0usize, 0.0f64), vec![], vec![], vec![]);
         for i in 0..n {
-            let band = e_band(&call(got, i), &call(want, i))?;
+            let band = e_band(&call(got, i), &call(want, i), FREE_BAND)?;
             ok &= band.ok();
             if band.worst.1 > worst.1 {
                 worst = (i, band.worst.1);
@@ -3643,6 +3685,7 @@ mod gate {
         let budget = q.budget_for_card_experts(CTX, want, placed_budget())?;
         let levers = PlanLevers {
             card_budget_bytes: Some(budget).into(),
+            ..PlanLevers::default()
         };
         let plan = q.plan(CTX, &levers)?;
         for line in q.records(&plan, None)? {
@@ -3829,6 +3872,7 @@ mod gate {
         let budget = pick(&q)?;
         let levers = PlanLevers {
             card_budget_bytes: Some(budget).into(),
+            ..PlanLevers::default()
         };
         let plan = q.plan(CTX, &levers)?;
         for line in q.records(&plan, None)? {
@@ -4332,6 +4376,7 @@ mod gate {
         let q = PlaceQ3::qwen35(&file, Place::parse("cuda0")?, o)?.streaming()?;
         let levers = PlanLevers {
             card_budget_bytes: Some(placed_budget()).into(),
+            ..PlanLevers::default()
         };
         let plan = q.plan(CTX, &levers)?;
         let mid = residency_clauses::mid_of(&plan.n_l);
@@ -4490,11 +4535,12 @@ mod gate {
     ///   before its second prompt, and after each wide prompt every layer's
     ///   map is the card copy's row followed by the shared expert's HOST
     ///   entry (`Placed::stale_maps`: none), on the residency run and the off
-    ///   run alike; every call's logits row within [`FREE_BAND`] of the off
-    ///   run's, relative (‖Δ‖/‖off‖) — the card and the host sum a token's
-    ///   experts in another split with another 8-bit rule, the difference
-    ///   (o2)'s band bounds on a layer's output, taken here through the
-    ///   head —, and the ids equal or, where they first part, the residency
+    ///   run alike; every call's logits row within [`FLIPS_BAND`] of the off
+    ///   run's, relative (‖Δ‖/‖off‖) — the tier the machine moved experts
+    ///   to, another 8-bit rule per moved site, carried by the GDN state and
+    ///   the attention K/V rows over the history and re-injected at every
+    ///   boundary a flip lands ([`FLIPS_BAND`]'s note) —, and the ids equal
+    ///   or, where they first part, the residency
     ///   run's top-1 margin below [`GREEDY_MARGIN`] (a near tie). Mutant: the maps
     ///   kept as the load built them (`PlacedSide::refresh_maps` returning at
     ///   once): the first prompt's maps still name the spare experts the
@@ -4541,7 +4587,7 @@ mod gate {
         };
         let first = e_history(&mut on, &ids, Some(&off_seen.tokens))?;
         // `flips`
-        let band = e_band(&first, &off_seen)?;
+        let band = e_band(&first, &off_seen, FLIPS_BAND)?;
         let maps_ok = first.stale.iter().chain(&off_seen.stale).all(Vec::is_empty);
         let flips = first.landed > 0 && maps_ok && band.ok();
         println!(
@@ -4607,11 +4653,14 @@ mod gate {
 
     /// How a run's calls stand from the off run's: the call whose logits
     /// row stands farthest ([`e_distance`]: its index, ‖Δ‖/‖off‖ and the
-    /// largest single |Δ|), whether every call has its row, where the greedy
-    /// ids first part and whether the run's top-1 margin there is a near tie
+    /// largest single |Δ|), the band the verdict reads ([`FLIPS_BAND`] on
+    /// (e)'s runs against the off run's, [`FREE_BAND`] on the whole-card
+    /// loads' arms), whether every call has its row, where the greedy ids
+    /// first part and whether the run's top-1 margin there is a near tie
     /// ([`GREEDY_MARGIN`]).
     struct Band {
         worst: (usize, f64, f32),
+        band: f64,
         rows: usize,
         same_len: bool,
         parted: Option<usize>,
@@ -4619,24 +4668,30 @@ mod gate {
     }
 
     impl Band {
-        /// Every row within [`FREE_BAND`] of the off run's (relative), the
+        /// Every row within the band it was built with (relative), the
         /// ids equal or parting at a near tie.
         fn ok(&self) -> bool {
-            self.same_len && self.worst.1 <= FREE_BAND && self.near
+            self.same_len && self.worst.1 <= self.band && self.near
         }
 
         fn line(&self) -> String {
             format!(
-                "{} calls' logits within {FREE_BAND} of the off run's, relative: worst {:.3e} at \
+                "{} calls' logits within {} of the off run's, relative: worst {:.3e} at \
                  call {} (largest single logit {:.3e}); greedy ids part at {:?} (equal or a near \
                  tie: {})",
-                self.rows, self.worst.1, self.worst.0, self.worst.2, self.parted, self.near
+                self.rows,
+                self.band,
+                self.worst.1,
+                self.worst.0,
+                self.worst.2,
+                self.parted,
+                self.near
             )
         }
     }
 
-    /// `run`'s calls against the off run's ([`Band`]).
-    fn e_band(run: &Seen, off: &Seen) -> Result<Band, GateError> {
+    /// `run`'s calls against the off run's ([`Band`]), judged against `band`.
+    fn e_band(run: &Seen, off: &Seen, band: f64) -> Result<Band, GateError> {
         let worst = run
             .rows
             .iter()
@@ -4653,6 +4708,7 @@ mod gate {
         };
         Ok(Band {
             worst,
+            band,
             rows: run.rows.len(),
             same_len: run.rows.len() == off.rows.len(),
             parted,
@@ -4794,7 +4850,7 @@ mod gate {
             .sum();
         let kept = first.end.as_ref().is_some_and(|e| e.kept);
         let returned = second.end.as_ref().is_some_and(|e| !e.kept);
-        let band = e_band(streamed, off)?;
+        let band = e_band(streamed, off, FLIPS_BAND)?;
         let ok = layers_ok
             && kept
             && returned

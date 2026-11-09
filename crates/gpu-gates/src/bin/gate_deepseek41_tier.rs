@@ -3,7 +3,9 @@
 //! (`crate::gate_card::plan_gate`: the 3090's bytes in the real tier, the largest visible card
 //! under the header's card budget in the fixture tier), two `Gpu`s on it. Each routed layer's card
 //! list is its id prefix `[0, n_l)`. The tiered plan moves the last `k3` ([`tier_depth`]) of
-//! them, ids `n_l - k3 .. n_l`, from card 0 to device 1 (the tier) through
+//! them, ids `n_l - k3 .. n_l`, from card 0 to device 1 (the tier) in each layer the pair rule
+//! admits on an expert tier (`accepts::ds41_pair` at `tier`: the fused layer's q4_K down; a q5_K
+//! down stays whole on the stage card, as the placement's own tier plan keeps it) through
 //! the placement's own split (`placement::routed_row`): the (b′) shape, the
 //! stage the first ids and the tier the next ones, on the gate machine
 //! with (b′)'s tier card and its prompt-batch reserves beside the stage card
@@ -89,9 +91,43 @@
 //!   the step's, not on its bits. Preconditions: the calls ran two batches
 //!   as one group of [`BATCH_GROUP`], the every-position call handed rows
 //!   over from both batches, and it sent every tier layer a routed slot.
+//! - `--bnode` (B9): the tier on a node. The gate serves the tiered plan's tier from a
+//!   `tier_server` beside it on a free loopback port (`shared/node_proc.rs`) and runs the stage as
+//!   its own child (`--bnode-stage`), whose environment alone names that port
+//!   (`BLOOMERY_TIER_NODES`) and the TCP link (`BLOOMERY_TIER_LINK=tcp`), so no other clause's
+//!   load takes either. The stage feeds B7's prompt of [`BATCH_P`] positions one decode step per
+//!   position, the node serving its tier experts, then as one prompt batch, whose every tiered
+//!   layer-batch sends the node its block and lands the node's rows (`host::node::block`); each
+//!   is followed by [`BATCH_STEPS`] greedy steps, and the call is walked against the steps
+//!   (`logits_band::walk`), within the logits band as B7's is. Across the call the node's batch
+//!   leg is served and settled once a block, every tier layer is sent a routed slot, no decode
+//!   layer is asked of the node, and the slots the host left to the node's leg
+//!   (`stats().batch_tier_slots`) are the node's routed slots (`stats().layer_hits`): the host
+//!   serves none of them. Then the stage opens the same plan with its tier a card of this process
+//!   and runs the call and its steps again: tokens and logits bit for bit the node's — the node
+//!   runs the same block on the same q8_1 bytes, so its rows are the tier card's — and the host's
+//!   batch slots, those it served and those it left to the tier's leg, the same counts. The residency
+//!   lever resolves for a batch feed (its `why` is not `prefill_steps`). The node exits 0 once
+//!   the stage closed its load. Precondition: the steps sent every tier layer a routed slot
+//!   through the node, and the stage's tier is on the node.
+//! - `--rank` (B10): the plan with a router rank (`BLOOMERY_EXPERT_RANK`). The gate writes a
+//!   rank file from the model's own routed layers, each layer's ids in a stride order that is not
+//!   the id order, and runs this binary as a child (`--rank-stage`) whose environment alone names
+//!   it, so no other clause's plan takes it. The child's gate plan names the file, keeps the
+//!   counts of the plan without it (`n_l`, the tier depth, the card's experts), and holds in each
+//!   routed stack the layer's hottest `n_l` ranked ids on the card, not its id prefix. Under it
+//!   the child runs T1: the tiered carve of that plan answers the reference load of the same plan
+//!   bit for bit, its stage graph has the reference's node count, every tier layer was sent a
+//!   routed slot. That is the slot map, the tier and the host set over lists that are no id
+//!   prefix. The child then leaves the [`PROMPT`] positions of its tiered run, and the gate feeds
+//!   the same ids over the tiered carve of the plan without the file and walks the child's
+//!   positions against its own within the logits band (`logits_band::walk`). The two plans keep
+//!   other experts on the card and the host, and a card expert and a host expert are not one
+//!   result bit for bit, so across plans the rows sit within the band, not on bits.
 //!
 //! Every clause is self-consistency (the tiered load against the reference load or against the
-//! same file fed another way), so the fixture tier runs all of them; each names its tag once
+//! same file fed another way, B10 the same plan under another expert order), so the fixture tier
+//! runs all of them; each names its tag once
 //! through `crate::ds41_tier::sc` before it runs, and the closing line counts them.
 
 #[cfg(feature = "deepseek41")]
@@ -112,6 +148,18 @@ mod dspark;
 mod gate_card;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_pair.rs"]
+mod ds41_pair;
+
+#[cfg(feature = "deepseek41")]
+#[path = "shared/node_proc.rs"]
+#[allow(
+    dead_code,
+    reason = "B9 starts and reaps its two children; stdin, signals, kills and stderr serve gate_qwen38_nodes"
+)]
+mod node_proc;
+
+#[cfg(feature = "deepseek41")]
 #[path = "shared/ds41_tier.rs"]
 #[allow(
     dead_code,
@@ -121,7 +169,10 @@ mod ds41_tier;
 
 #[cfg(feature = "deepseek41")]
 mod gate {
-    use std::time::Instant;
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::time::{Duration, Instant};
 
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::host::batch::TierBatchStats;
@@ -134,15 +185,17 @@ mod gate {
         TIER_MAP_BEFORE_UPLOAD, TierOpen,
     };
     use bloomery_gpu_gates::logits_band::{self, Positions};
-    use bloomery_gpu_gates::{GateError, checks_failed, prose_ids};
+    use bloomery_gpu_gates::{GateError, checks_failed, prose_ids, record};
     use bloomery_levers::{
-        CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, R8,
+        CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, EXPERT_RANK, HOST_LOCK, HOST_POPULATE, Levers,
+        R8, ResidencyAt, ResidencyWhy, TIER_LINK, TIER_NODES, TierLink,
     };
     use cuda_core::DeviceBuffer;
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::place::PlanInputs;
     use model::arch::deepseek41::place::tier_batch;
+    use model::placement::workstation::DeviceId;
     use model::placement::{self, Device, ExpertList, Machine, Plan, Role, Row, workstation};
     use runtime::swaprule::KeptRows;
 
@@ -189,10 +242,12 @@ mod gate {
     /// The most the every-position call's features may sit from the steps': the RMS |Δ| over
     /// the steps' RMS |x|, every value of every position. A tap that reads another position or
     /// layer sits near or past 1; the two sum orders sit far under it.
-    // PIN(2026-10-31): the grouped GEMM's sum order; real 0.0789, fixture 0.0644 (against the step one
-    // position earlier: 0.944, 1.245), x2. Not derived: the taps sit past the layers that compound the
-    // first routed seam's sum-order distance.
-    const FEATURE_REL_PIN: f64 = 0.16;
+    // PIN(2026-11-04): with layers 0·1's routed experts on the cards, the prompt call runs them by the
+    // tile GEMM and the steps by the `_sel` gemv, so the first routed seam's sum-order distance now
+    // opens at layer 0 and every layer compounds it: real 0.1156, fixture 0.1656 (against the step one
+    // position earlier: 0.944, 1.246), x1.5. With the seam at layer 2 it read 0.0789 real, 0.0644
+    // fixture, under 0.16. Not derived.
+    const FEATURE_REL_PIN: f64 = 0.25;
     /// The batches a group holds that `--batch2`'s call must run as.
     const BATCH_GROUP: usize = 2;
     /// Greedy steps after a prompt call.
@@ -203,6 +258,19 @@ mod gate {
     const TIER_DEVICE: usize = 1;
     /// The go deadline and the grace a lost card is named within, plus room.
     const LOST_BOUND_S: f64 = 25.0;
+    /// The argument B9's stage child runs under ([`node_case`]).
+    const NODE_STAGE: &str = "--bnode-stage";
+    /// How long B9's stage child may take: its tiered load, the steps, the prompt call and the
+    /// greedy steps after each.
+    const NODE_STAGE_WITHIN: Duration = Duration::from_secs(600);
+    /// How long the node may take to exit once the stage has ended.
+    const NODE_CLOSE_WITHIN: Duration = Duration::from_secs(60);
+    /// The argument B10's child runs under ([`rank_case`]).
+    const RANK_STAGE: &str = "--rank-stage";
+    /// How long B10's child may take: its plans, one tiered load and the prompt's steps.
+    const RANK_STAGE_WITHIN: Duration = Duration::from_secs(600);
+    /// The file B10's child writes its run to, beside the rank file it ran under.
+    const RANK_ROWS: &str = "rows.bin";
 
     struct Args {
         union: bool,
@@ -215,6 +283,12 @@ mod gate {
         blost: bool,
         bfirst: bool,
         bfeat: bool,
+        bnode: bool,
+        rank: bool,
+        /// B9's stage, the child [`node_case`] runs: alone, never beside a clause.
+        bnode_stage: bool,
+        /// B10's stage, the child [`rank_case`] runs: alone, never beside a clause.
+        rank_stage: bool,
     }
 
     impl Args {
@@ -232,7 +306,8 @@ mod gate {
 
     fn parse_args() -> Result<Args, GateError> {
         const USAGE: &str = "usage: gate_deepseek41_tier [--union] [--fault] [--lost] [--two] \
-                             [--batch] [--batch2] [--bfault] [--blost] [--bfirst] [--bfeat]";
+                             [--batch] [--batch2] [--bfault] [--blost] [--bfirst] [--bfeat] \
+                             [--bnode] [--rank]";
         let mut a = Args {
             union: false,
             fault: false,
@@ -244,6 +319,10 @@ mod gate {
             blost: false,
             bfirst: false,
             bfeat: false,
+            bnode: false,
+            rank: false,
+            bnode_stage: false,
+            rank_stage: false,
         };
         for arg in std::env::args().skip(1) {
             match arg.as_str() {
@@ -257,10 +336,27 @@ mod gate {
                 "--blost" => a.blost = true,
                 "--bfirst" => a.bfirst = true,
                 "--bfeat" => a.bfeat = true,
+                "--bnode" => a.bnode = true,
+                "--rank" => a.rank = true,
+                NODE_STAGE => a.bnode_stage = true,
+                RANK_STAGE => a.rank_stage = true,
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             }
         }
-        if !(a.on_load() || a.two || a.bfirst || a.bfeat) {
+        let clause = a.on_load() || a.two || a.bfirst || a.bfeat || a.bnode || a.rank;
+        for (on, stage, owner) in [
+            (a.bnode_stage, NODE_STAGE, "B9's"),
+            (a.rank_stage, RANK_STAGE, "B10's"),
+        ] {
+            if on && (clause || a.bnode_stage == a.rank_stage) {
+                return Err(format!(
+                    "{stage} is {owner} stage, which the gate runs as a child of its own: never \
+                     beside a clause or the other stage"
+                )
+                .into());
+            }
+        }
+        if !(clause || a.bnode_stage || a.rank_stage) {
             return Err(USAGE.into());
         }
         Ok(a)
@@ -362,14 +458,19 @@ mod gate {
 
     /// `plan` on `machine` (the gate plan's with the tier card,
     /// [`tier_machine`]) with the last `k3` experts of each routed stack's
-    /// card-0 list, in id order, moved to device [`TIER_DEVICE`]; a stack
-    /// whose card list holds `k3` or fewer is refused by name. With `twice`,
-    /// the first stack's tier list also keeps its first expert on card 0 (an
-    /// expert on two devices). The host segments stay as they are, so the
-    /// host set is the plan's.
+    /// card-0 list, in id order, moved to device [`TIER_DEVICE`], in each
+    /// layer whose gate and down types (`hp`'s layer table) the pair rule
+    /// admits on an expert tier (`accepts::ds41_pair` at `tier`); a layer it
+    /// keeps off a tier keeps its card-0 lists whole, where the engine's tier
+    /// refuses it (`Ds41Tier::new`). A stack of a tier layer whose card list
+    /// holds `k3` or fewer is refused by name. With `twice`, the first stack
+    /// the tier takes also keeps its first tier expert on card 0 (an expert on
+    /// two devices). The host segments stay as they are, so the host set is
+    /// the plan's.
     fn tiered<'a>(
         plan: &Plan<'a>,
         machine: &'a Machine,
+        hp: &Hparams,
         k3: usize,
         twice: bool,
     ) -> Result<Plan<'a>, GateError> {
@@ -388,6 +489,9 @@ mod gate {
             let layer = t
                 .layer
                 .ok_or_else(|| format!("{}: a routed stack without a layer", t.name))?;
+            if !crate::ds41_pair::tier_admits(hp, layer)? {
+                continue;
+            }
             let ids = card
                 .experts
                 .as_ref()
@@ -457,6 +561,9 @@ mod gate {
         stage_nodes: Option<usize>,
     }
 
+    /// A staged call's run and what it sent the node tier, when the stage ran one.
+    type Staged = (Run, Option<Sent>);
+
     impl Run {
         fn push(&mut self, token: u32, logits: Vec<f32>) {
             self.tokens.push(token);
@@ -476,14 +583,8 @@ mod gate {
     /// the pair passes, all in graph mode from a reset; then the prompt and
     /// [`EAGER_STEPS`] steps eagerly from a reset.
     fn union_run(m: &mut Deepseek41Model, prompt: &[u32]) -> Result<Run, GateError> {
-        let mut run = Run::default();
-        m.set_mode(StepMode::Graph);
-        m.reset()?;
-        let mut tok = 0;
-        for &id in prompt {
-            tok = m.step(&[id])?;
-            run.push(tok, m.logits()?);
-        }
+        let mut run = rank_run(m, prompt)?;
+        let mut tok = *run.tokens.last().ok_or("T1: empty prompt")?;
         run.stage_nodes = Some(m.step_graph_nodes()?.len());
         for _ in 0..STEPS {
             tok = m.step(&[tok])?;
@@ -524,21 +625,32 @@ mod gate {
     struct Sent {
         first: usize,
         hits: Vec<u64>,
+        /// Tier layers the host asked of the tier (replayed or enqueued).
+        issued: u64,
         stats: TierBatchStats,
+        /// The host's batch slots: those it served, and those it left to a
+        /// tier's batch leg (`HybridStats::batch_host_slots`,
+        /// `batch_tier_slots`).
+        host_slots: u64,
+        tier_slots: u64,
     }
 
-    /// The tier's per-layer hits and batch counters since load; `None`
-    /// without a tier.
+    /// The tier's per-layer hits, layers asked and batch counters since load;
+    /// `None` without a tier.
     fn tier_counts(m: &Deepseek41Model) -> Result<Option<Sent>, GateError> {
         let hybrid = m.body(NAME)?.hybrid();
+        let st = hybrid.stats();
         Ok(hybrid.tiers().first().map(|t| Sent {
             first: t.set().layers().start,
             hits: t.stats().layer_hits,
+            issued: t.stats().issued,
             stats: hybrid
                 .tier_batch_stats()
                 .first()
                 .copied()
                 .unwrap_or_default(),
+            host_slots: st.batch_host_slots,
+            tier_slots: st.batch_tier_slots,
         }))
     }
 
@@ -549,12 +661,15 @@ mod gate {
         Some(Sent {
             first: a.first,
             hits: a.hits.iter().zip(&b.hits).map(|(a, b)| a - b).collect(),
+            issued: a.issued - b.issued,
             stats: TierBatchStats {
                 served: a.stats.served - b.stats.served,
                 settles: a.stats.settles - b.stats.settles,
                 settle_early: a.stats.settle_early - b.stats.settle_early,
                 settle_ns: a.stats.settle_ns - b.stats.settle_ns,
             },
+            host_slots: a.host_slots - b.host_slots,
+            tier_slots: a.tier_slots - b.tier_slots,
         })
     }
 
@@ -695,6 +810,7 @@ mod gate {
         let levers = bloomery_levers::at_main(&[
             ENGRAM_HELPER,
             CARD_BUDGET,
+            EXPERT_RANK,
             HOST_POPULATE,
             HOST_LOCK,
             CARD_DONTNEED,
@@ -756,6 +872,15 @@ mod gate {
                 "B8: the feature tap through a tiered prompt call hands over the call's own rows, \
                  near the steps'",
             ),
+            (
+                args.bnode,
+                "B9: one batch over a tier on a node: the node computes its block, within the \
+                 logits band of the steps and bit for bit the same plan's with its tier a card",
+            ),
+            (
+                args.rank,
+                "B10: a router rank moves the experts' homes, not the tokens",
+            ),
         ] {
             if on {
                 crate::ds41_tier::sc(name)?;
@@ -781,21 +906,70 @@ mod gate {
             &bloomery_gpu_gates::tier::plan_levers(&split()?, &levers, reserve)?,
             reserve,
         )?;
-        let tplan = tiered(&plan, &tmachine, k3, false)?;
+        let tplan = tiered(&plan, &tmachine, &inputs.hp, k3, false)?;
         let tier_layers: Vec<usize> = (0..inputs.model.layers)
             .filter(|&l| tplan.n_l.get(l) != plan.n_l.get(l))
             .collect();
+        let whole: Vec<usize> = (0..inputs.model.layers)
+            .filter(|&l| plan.n_l.get(l).is_some_and(|&n| n > 0) && !tier_layers.contains(&l))
+            .collect();
         println!(
             "plan: gate card {card}, {} experts on it by the id prefix; tier: the last {k3} of each \
-             routed layer's list on {} layers ({} experts), stage keeps the rest",
+             tier layer's list on {} layers ({} experts), stage keeps the rest and, whole, layers \
+             {whole:?} the pair rule keeps off a tier",
             plan.cards[0].experts,
             tier_layers.len(),
             k3 * tier_layers.len()
         );
+        if args.rank_stage {
+            let base = inputs.plan(
+                &machine,
+                workstation::CTX_MAX,
+                &model::placement::PlanLevers {
+                    expert_rank: None,
+                    ..cfg.place.clone()
+                },
+            )?;
+            let mut pass = rank_plan(&plan, &base)?;
+            let Some(rank) = plan.expert_rank.as_deref() else {
+                return rank_verdict(false);
+            };
+            let prompt = prose_ids("engram", PROMPT)?;
+            let mut reference = open(split()?, &plan, None, &meta)?;
+            let want = union_run(&mut reference, &prompt)?;
+            drop(reference);
+            let mut m = open(split()?, &tplan, Some(tier_open()), &meta)?;
+            let got = union_run(&mut m, &prompt)?;
+            pass &= tiered_is_reference(
+                (
+                    "B10",
+                    "B10 (the tiered load under the rank is the reference load under it)",
+                ),
+                &m,
+                (&want, &got),
+                &tier_layers,
+            )?;
+            drop(m);
+            write_rows(
+                &Path::new(rank.path()).with_file_name(RANK_ROWS),
+                &got,
+                prompt.len(),
+            )?;
+            return rank_verdict(pass);
+        }
+        if args.bnode_stage {
+            let ids = prose_ids("engram", BATCH_P2)?;
+            let node = node_open(&card, device)?;
+            let m = open(split()?, &tplan, Some(node), &meta)?;
+            let (mut pass, got) = node_stage(m, &levers, &ids[..BATCH_P], &tier_layers)?;
+            let local = open(split()?, &tplan, Some(tier_open()), &meta)?;
+            pass &= node_exact(local, &ids[..BATCH_P], got)?;
+            return stage_verdict(pass);
+        }
         let mut pass = true;
 
         if args.two {
-            let bad = tiered(&plan, &tmachine, k3, true)?;
+            let bad = tiered(&plan, &tmachine, &inputs.hp, k3, true)?;
             let t0 = Instant::now();
             match open(split()?, &bad, Some(tier_open()), &meta) {
                 Err(e @ GpuError::Plan { what, .. })
@@ -818,6 +992,21 @@ mod gate {
                     pass = false;
                 }
             }
+        }
+
+        if args.bnode {
+            pass &= node_case(&path)?;
+        }
+        if args.rank {
+            pass &= rank_case(
+                &path,
+                (&inputs, &plan, &tplan),
+                (&meta, tier_open()),
+                &levers,
+            )?;
+        }
+        if (args.bnode || args.rank) && !(args.on_load() || args.bfirst || args.bfeat) {
+            return verdict(pass);
         }
 
         let prompt = prose_ids("engram", PROMPT)?;
@@ -888,52 +1077,12 @@ mod gate {
         if let Some(want) = &want.union {
             if args.union {
                 let got = union_run(&mut m, &prompt)?;
-                pass &= same("T1 (step, 32 steps, pairs, eager)", want, &got);
-                if got.stage_nodes != want.stage_nodes {
-                    println!(
-                        "FAIL T1 structure: stage graph of {:?} nodes, the reference's {:?}",
-                        got.stage_nodes, want.stage_nodes
-                    );
-                    pass = false;
-                } else {
-                    println!(
-                        "ok T1 structure: stage graph of {:?} nodes, the reference's",
-                        got.stage_nodes
-                    );
-                }
-                let body = m.body(NAME)?;
-                let tier = body
-                    .hybrid()
-                    .tiers()
-                    .first()
-                    .ok_or("the tiered load holds no tier card")?;
-                let st = tier.stats();
-                let first = tier.set().layers().start;
-                let missing: Vec<usize> = tier_layers
-                    .iter()
-                    .copied()
-                    .filter(|&l| st.layer_hits.get(l - first).copied().unwrap_or(0) == 0)
-                    .collect();
-                let hits: u64 = st.layer_hits.iter().sum();
-                println!(
-                    "tier: {} layers asked, {} settles ({} early), hits {hits} over {} layers; graph \
-                     nodes step {:?} pair {:?}",
-                    st.issued,
-                    st.settles,
-                    st.settle_early,
-                    tier_layers.len(),
-                    tier.graph_nodes(Chain::Step),
-                    tier.graph_nodes(Chain::Pair)
-                );
-                if missing.is_empty() {
-                    println!("ok precondition: every tier layer was sent a routed slot");
-                } else {
-                    println!(
-                        "FAIL precondition: tier layers {missing:?} were sent no routed slot; T1 proves \
-                         nothing there"
-                    );
-                    pass = false;
-                }
+                pass &= tiered_is_reference(
+                    ("T1", "T1 (step, 32 steps, pairs, eager)"),
+                    &m,
+                    (want, &got),
+                    &tier_layers,
+                )?;
             }
             if args.fault {
                 let first = *tier_layers
@@ -997,6 +1146,620 @@ mod gate {
             return Err(checks_failed());
         }
         println!("PASSED: {NAME}");
+        Ok(())
+    }
+
+    /// B9 (module header), the gate's side: a `tier_server` serving `model` on a free loopback
+    /// port, then this binary as the stage under [`NODE_STAGE`], with the node's address and the
+    /// TCP link in its environment alone. Both must end 0 within their bounds, the node once the
+    /// stage has closed its load; a child past its bound is killed and the clause fails by name.
+    fn node_case(model: &str) -> Result<bool, GateError> {
+        if !bloomery_levers::tier_nodes()?.is_empty() {
+            return Err(format!("{TIER_NODES} is set: B9 sets it for its stage alone").into());
+        }
+        let (mut node, addr) = crate::node_proc::tier_server(
+            crate::node_proc::tier_server_command(Some(Path::new(model)))?,
+            "B9 node",
+        )?;
+        println!("B9: tier_server pid {} serves on {addr}", node.id());
+        let mut cmd = Command::new(std::env::current_exe()?);
+        cmd.arg(NODE_STAGE)
+            .env(TIER_NODES, addr.to_string())
+            .env(TIER_LINK, "tcp");
+        let mut stage = crate::node_proc::Proc::spawn(cmd, "B9 stage")?;
+        println!("B9: stage pid {}", stage.id());
+        let mut pass = match stage.wait_within(NODE_STAGE_WITHIN)? {
+            Some(s) if s.success() => {
+                println!("ok B9 stage: it exited 0");
+                true
+            }
+            Some(s) => {
+                println!("FAIL B9 stage: {s}");
+                false
+            }
+            None => {
+                println!("FAIL B9 stage: still running after {NODE_STAGE_WITHIN:?}; killed");
+                false
+            }
+        };
+        drop(stage);
+        match node.wait_within(NODE_CLOSE_WITHIN)? {
+            Some(s) if s.success() => {
+                println!("ok B9 node: it exited 0 once the stage closed its load");
+            }
+            Some(s) => {
+                println!("FAIL B9 node: {s}");
+                pass = false;
+            }
+            None => {
+                println!(
+                    "FAIL B9 node: still running {NODE_CLOSE_WITHIN:?} after the stage ended; \
+                     killed"
+                );
+                pass = false;
+            }
+        }
+        Ok(pass)
+    }
+
+    /// B9's tier on the node `BLOOMERY_TIER_NODES` names, over the link `BLOOMERY_TIER_LINK`
+    /// names, which must be TCP: the stage's environment [`node_case`] set. Another count of
+    /// nodes or another link is refused by name.
+    fn node_open(card: &str, device: Option<DeviceId>) -> Result<TierOpen, GateError> {
+        let nodes = bloomery_levers::tier_nodes()?;
+        let [addr] = nodes.as_slice() else {
+            return Err(format!(
+                "{NODE_STAGE}: {TIER_NODES} names {} nodes; B9's stage takes the one the gate \
+                 serves",
+                nodes.len()
+            )
+            .into());
+        };
+        let link = bloomery_levers::tier_link()?;
+        if link != TierLink::Tcp {
+            return Err(format!("{NODE_STAGE}: {TIER_LINK} is {link:?}; B9 runs over tcp").into());
+        }
+        Ok(TierOpen {
+            card: TIER_DEVICE,
+            name: card.to_string(),
+            device,
+            node: Some(*addr),
+        })
+    }
+
+    /// B9 (module header), the stage's side, on `m`, the tiered load with its tier on the node:
+    /// the residency lever as a batch feed resolves it, `ids` fed one decode step each and then as
+    /// one prompt call, each followed by greedy steps, the call walked against the steps, and what
+    /// the call and the steps sent the node tier. Returns the verdict and the call's run and
+    /// counters, which [`node_exact`] reads. A refused call is the clause's failure, named.
+    fn node_stage(
+        mut m: Deepseek41Model,
+        levers: &Levers,
+        ids: &[u32],
+        tier_layers: &[usize],
+    ) -> Result<(bool, Option<Staged>), GateError> {
+        let pick = levers.residency_at(ResidencyAt {
+            serving_place: false,
+            check_finite: false,
+            route_trace: false,
+            prefill_steps: false,
+        });
+        record::residency_lever(pick).print();
+        let mut pass = pick.why != ResidencyWhy::PrefillSteps;
+        println!(
+            "{} B9 residency: the lever resolves {} ({:?}) for a batch feed",
+            if pass { "ok" } else { "FAIL" },
+            pick.word,
+            pick.why
+        );
+        {
+            let tier = m
+                .body(NAME)?
+                .hybrid()
+                .tiers()
+                .first()
+                .ok_or("the tiered load holds no tier card")?;
+            match tier.node() {
+                Some(a) => println!(
+                    "ok B9 structure: the tier {} runs on the node at {a}",
+                    tier.name()
+                ),
+                None => {
+                    println!(
+                        "FAIL B9 structure: the tier {} is a card of this process",
+                        tier.name()
+                    );
+                    pass = false;
+                }
+            }
+        }
+        let before = tier_counts(&m)?;
+        let want = steps_run(&mut m, ids)?;
+        let steps = sent_between(before, tier_counts(&m)?);
+        pass &= node_served("B9 steps", steps.as_ref(), tier_layers);
+        let (got, sent) = match batch_run(&mut m, ids) {
+            Ok(r) => r,
+            Err(e) => {
+                println!("FAIL B9: the prompt call over the node tier: {e}");
+                return Ok((false, None));
+            }
+        };
+        pass &= in_band(
+            "B9 (one batch over the node tier against the steps, then greedy steps)",
+            &want,
+            &got,
+        );
+        pass &= node_batch_served("B9", sent.as_ref(), tier_layers);
+        drop(m);
+        Ok((pass, Some((got, sent))))
+    }
+
+    /// B9's exactness, on `m`, the same plan with its tier a card of this process: `ids` as one
+    /// prompt call and its greedy steps ([`batch_run`]), tokens and logits bit for bit `got`'s run,
+    /// the node's, and the host's batch slots — served, and left to the tier's leg — `got`'s
+    /// counts. The node runs the tier card's block on the q8_1 bytes the tier card quantizes for
+    /// itself, and its rows land where the tier card's copy puts them, so the call is the same
+    /// program on the same inputs, and the host serves what it serves beside a tier card.
+    fn node_exact(
+        mut m: Deepseek41Model,
+        ids: &[u32],
+        got: Option<Staged>,
+    ) -> Result<bool, GateError> {
+        let Some((got, node)) = got else {
+            println!("FAIL B9 exact: no prompt call over the node to compare");
+            return Ok(false);
+        };
+        let (want, card) = batch_run(&mut m, ids)?;
+        let mut pass = same(
+            "B9 exact (the call over the node against the same plan's with its tier a card)",
+            &want,
+            &got,
+        );
+        let (Some(node), Some(card)) = (node, card) else {
+            println!("FAIL B9 exact slots: a load holds no tier card");
+            return Ok(false);
+        };
+        let ok = (node.host_slots, node.tier_slots) == (card.host_slots, card.tier_slots);
+        println!(
+            "{} B9 exact slots: over the call over the node the host served {} slots and left {} \
+             to the node's leg; with the tier a card it served {} and left {} to the card's leg",
+            if ok { "ok" } else { "FAIL" },
+            node.host_slots,
+            node.tier_slots,
+            card.host_slots,
+            card.tier_slots
+        );
+        pass &= ok;
+        Ok(pass)
+    }
+
+    /// T1's checks on `m`, the tiered load, after `union_run` left `got`: the run is the
+    /// reference's `want` bit for bit, the stage graph has the reference's node count, and every
+    /// layer of `tier_layers` was sent at least one routed slot over the run, or the clause proves
+    /// nothing there. `tag` names the clause on the lines, `what` the run.
+    fn tiered_is_reference(
+        (tag, what): (&str, &str),
+        m: &Deepseek41Model,
+        (want, got): (&Run, &Run),
+        tier_layers: &[usize],
+    ) -> Result<bool, GateError> {
+        let mut pass = same(what, want, got);
+        if got.stage_nodes != want.stage_nodes {
+            println!(
+                "FAIL {tag} structure: stage graph of {:?} nodes, the reference's {:?}",
+                got.stage_nodes, want.stage_nodes
+            );
+            pass = false;
+        } else {
+            println!(
+                "ok {tag} structure: stage graph of {:?} nodes, the reference's",
+                got.stage_nodes
+            );
+        }
+        let body = m.body(NAME)?;
+        let tier = body
+            .hybrid()
+            .tiers()
+            .first()
+            .ok_or("the tiered load holds no tier card")?;
+        let st = tier.stats();
+        let first = tier.set().layers().start;
+        let missing: Vec<usize> = tier_layers
+            .iter()
+            .copied()
+            .filter(|&l| st.layer_hits.get(l - first).copied().unwrap_or(0) == 0)
+            .collect();
+        let hits: u64 = st.layer_hits.iter().sum();
+        println!(
+            "tier: {} layers asked, {} settles ({} early), hits {hits} over {} layers; graph \
+             nodes step {:?} pair {:?}",
+            st.issued,
+            st.settles,
+            st.settle_early,
+            tier_layers.len(),
+            tier.graph_nodes(Chain::Step),
+            tier.graph_nodes(Chain::Pair)
+        );
+        if missing.is_empty() {
+            println!("ok {tag} precondition: every tier layer was sent a routed slot");
+        } else {
+            println!(
+                "FAIL {tag} precondition: tier layers {missing:?} were sent no routed slot; {tag} \
+                 proves nothing there"
+            );
+            pass = false;
+        }
+        Ok(pass)
+    }
+
+    /// B10 (module header), the gate's side: a rank file for `plan`'s model ([`write_rank`]), then
+    /// this binary as the child under [`RANK_STAGE`] with the file in its environment alone, and
+    /// the prompt fed one step a position over the tiered carve of `tplan`, the plan without the
+    /// file. The child must end 0 within its bound and leave its run beside the rank file; its
+    /// positions are walked against the gate's within the logits band. A child past its bound is
+    /// killed and the clause fails by name.
+    fn rank_case(
+        model: &str,
+        (inputs, plan, tplan): (&PlanInputs, &Plan<'_>, &Plan<'_>),
+        (meta, tier): (&BodyMeta, TierOpen),
+        levers: &Levers,
+    ) -> Result<bool, GateError> {
+        if levers.expert_rank().is_some() || plan.expert_rank.is_some() {
+            return Err(format!("{EXPERT_RANK} is set: B10 sets it for its stage alone").into());
+        }
+        let dir = std::env::temp_dir().join(format!("bloomery-b10-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let _clean = RemoveDir(dir.clone());
+        let file = write_rank(&dir, inputs, plan)?;
+        println!("B10: rank file {}", file.display());
+        let mut cmd = Command::new(std::env::current_exe()?);
+        cmd.arg(RANK_STAGE).env(EXPERT_RANK, &file);
+        let mut stage = crate::node_proc::Proc::spawn(cmd, "B10 stage")?;
+        println!("B10: stage pid {}", stage.id());
+        let ended = stage.wait_within(RANK_STAGE_WITHIN)?;
+        drop(stage);
+        match ended {
+            Some(s) if s.success() => println!("ok B10 stage: it exited 0"),
+            Some(s) => {
+                println!("FAIL B10 stage: {s}");
+                return Ok(false);
+            }
+            None => {
+                println!("FAIL B10 stage: still running after {RANK_STAGE_WITHIN:?}; killed");
+                return Ok(false);
+            }
+        }
+        let got = read_rows(&dir.join(RANK_ROWS))?;
+        let mut m = open(Split::open(model)?, tplan, Some(tier), meta)?;
+        let want = rank_run(&mut m, &prose_ids("engram", PROMPT)?)?;
+        drop(m);
+        Ok(in_band(
+            "B10 (the prompt's steps under the rank against the plan without it)",
+            &want,
+            &got,
+        ))
+    }
+
+    /// The prompt `ids` fed one decode step per position on `m`, graph mode from a reset: each
+    /// position's argmax and logits row.
+    fn rank_run(m: &mut Deepseek41Model, ids: &[u32]) -> Result<Run, GateError> {
+        let mut run = Run::default();
+        m.set_mode(StepMode::Graph);
+        m.reset()?;
+        for &id in ids {
+            let tok = m.step(&[id])?;
+            run.push(tok, m.logits()?);
+        }
+        Ok(run)
+    }
+
+    /// `run`'s first `n` positions' tokens and logits rows in `path`: the position count and the
+    /// row width as two little-endian `u32`s, the tokens, then the rows' `f32`s, all
+    /// little-endian.
+    fn write_rows(path: &Path, run: &Run, n: usize) -> Result<(), GateError> {
+        use std::io::Write;
+        let (Some(tokens), Some(rows)) = (run.tokens.get(..n), run.logits.get(..n)) else {
+            return Err(format!("B10: the run holds fewer than {n} positions").into());
+        };
+        let width = rows.first().map_or(0, Vec::len);
+        let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+        f.write_all(&u32::try_from(n)?.to_le_bytes())?;
+        f.write_all(&u32::try_from(width)?.to_le_bytes())?;
+        for t in tokens {
+            f.write_all(&t.to_le_bytes())?;
+        }
+        for row in rows {
+            if row.len() != width {
+                return Err(format!(
+                    "B10: a logits row of {} values, the first has {width}",
+                    row.len()
+                )
+                .into());
+            }
+            for x in row {
+                f.write_all(&x.to_le_bytes())?;
+            }
+        }
+        f.flush()?;
+        Ok(())
+    }
+
+    /// The run [`write_rows`] wrote; a file of another size than its two counts give is refused
+    /// by name.
+    fn read_rows(path: &Path) -> Result<Run, GateError> {
+        let bytes = std::fs::read(path).map_err(|e| format!("B10: {}: {e}", path.display()))?;
+        let word = |at: usize| -> Result<[u8; 4], GateError> {
+            bytes
+                .get(at..at + 4)
+                .and_then(|b| b.try_into().ok())
+                .ok_or_else(|| "B10: the stage's rows file is cut short".into())
+        };
+        let n = usize::try_from(u32::from_le_bytes(word(0)?))?;
+        let width = usize::try_from(u32::from_le_bytes(word(4)?))?;
+        let want = 8 + 4 * n + 4 * n * width;
+        if bytes.len() != want {
+            return Err(format!(
+                "B10: the stage's rows file holds {} bytes, {n} positions of {width} values take \
+                 {want}",
+                bytes.len()
+            )
+            .into());
+        }
+        let tokens = (0..n)
+            .map(|i| word(8 + 4 * i).map(u32::from_le_bytes))
+            .collect::<Result<Vec<_>, _>>()?;
+        let rows_at = 8 + 4 * n;
+        let logits = (0..n)
+            .map(|i| {
+                (0..width)
+                    .map(|j| word(rows_at + 4 * (i * width + j)).map(f32::from_le_bytes))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Run {
+            tokens,
+            logits,
+            stage_nodes: None,
+        })
+    }
+
+    /// A directory removed when dropped.
+    struct RemoveDir(PathBuf);
+
+    impl Drop for RemoveDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The rank file for `plan`'s model in `dir`: the format of `tools/ref/router-rank.py`, every
+    /// routed layer's `n_expert` ids once in a stride order. The stride is the smallest of 3 or
+    /// more with no factor in common with `n_expert`, offset by the layer, so a layer's first ids
+    /// are neither its id prefix nor the same ids of another layer. No count of routed experts
+    /// that has no such stride, and no model whose routed stacks differ in expert count, has a
+    /// rank: refused by name.
+    fn write_rank(dir: &Path, inputs: &PlanInputs, plan: &Plan<'_>) -> Result<PathBuf, GateError> {
+        fn gcd(a: u64, b: u64) -> u64 {
+            if b == 0 { a } else { gcd(b, a % b) }
+        }
+        let n = plan.model.experts;
+        let stride = (3..n)
+            .find(|&s| gcd(s, n) == 1)
+            .ok_or_else(|| format!("B10: {n} experts have no stride of 3 or more coprime to it"))?;
+        let mut layers = BTreeSet::new();
+        for t in &plan.model.tensors {
+            if t.role == Role::RoutedExperts {
+                layers.insert(
+                    t.layer
+                        .ok_or_else(|| format!("{}: a routed stack without a layer", t.name))?,
+                );
+            }
+        }
+        if layers.is_empty() {
+            return Err("B10: the model has no routed layer".into());
+        }
+        let mut text = format!(
+            "# router-rank\tn_expert={n}\tn_used={}\tsets=gate-b10\tpositions=1\n",
+            u64::try_from(inputs.hp.experts.n_used)?
+        );
+        for layer in layers {
+            let ids: Vec<String> = (0..n)
+                .map(|i| ((i * stride + layer as u64) % n).to_string())
+                .collect();
+            text.push_str(&format!("{layer}\t{}\n", ids.join(",")));
+        }
+        let file = dir.join("rank.tsv");
+        std::fs::write(&file, text)?;
+        Ok(file)
+    }
+
+    /// B10's plan clauses on `plan`, the gate plan under the rank, against `base`, the same plan
+    /// without it: it names a rank; its counts (`n_l`, the tier's, the card's experts) are
+    /// `base`'s; each routed stack's card list is the layer's hottest `n_l` ranked ids; and the
+    /// rank moved a card list off the id prefix, or the clause proves nothing.
+    fn rank_plan(plan: &Plan<'_>, base: &Plan<'_>) -> Result<bool, GateError> {
+        let Some(rank) = plan.expert_rank.as_deref() else {
+            println!(
+                "FAIL B10 plan: the plan names no rank: {EXPERT_RANK} did not reach the planner"
+            );
+            return Ok(false);
+        };
+        println!(
+            "B10: the plan names the rank {} ({} layers, sets {}, {} positions)",
+            rank.path(),
+            rank.layers().count(),
+            rank.sets(),
+            rank.positions()
+        );
+        let mut pass = true;
+        let same_counts = plan.n_l == base.n_l
+            && plan.tier_n_l == base.tier_n_l
+            && plan.cards[0].experts == base.cards[0].experts;
+        println!(
+            "{} B10 plan counts: n_l, the tier's and the card's {} experts are the plan without \
+             the rank's",
+            if same_counts { "ok" } else { "FAIL" },
+            plan.cards[0].experts
+        );
+        pass &= same_counts;
+        let (mut stacks, mut moved) = (0usize, 0usize);
+        let mut wrong = Vec::new();
+        for row in &plan.rows {
+            let t = &plan.model.tensors[row.tensor];
+            if t.role != Role::RoutedExperts {
+                continue;
+            }
+            let Some(card) = row.segments.iter().find(|s| s.device == Device::Card(0)) else {
+                continue;
+            };
+            let layer = t
+                .layer
+                .ok_or_else(|| format!("{}: a routed stack without a layer", t.name))?;
+            let have = card
+                .experts
+                .as_ref()
+                .ok_or_else(|| format!("{}: a card segment without experts", t.name))?
+                .ids();
+            let hottest = rank
+                .ranked(layer)
+                .and_then(|ids| ids.get(..have.len()))
+                .map(|ids| {
+                    let mut ids = ids.to_vec();
+                    ids.sort_unstable();
+                    ids
+                });
+            stacks += 1;
+            if hottest.as_deref() != Some(have) {
+                wrong.push(t.name.clone());
+            }
+            if have.iter().copied().ne(0..u32::try_from(have.len())?) {
+                moved += 1;
+            }
+        }
+        if wrong.is_empty() {
+            println!(
+                "ok B10 plan lists: the card list of each of {stacks} routed stacks is its \
+                 layer's hottest ranked ids"
+            );
+        } else {
+            println!(
+                "FAIL B10 plan lists: stacks {wrong:?} are not their layer's hottest ranked ids"
+            );
+            pass = false;
+        }
+        if moved == 0 {
+            println!(
+                "FAIL B10 precondition: the rank left every card list its id prefix; the clause \
+                 proves nothing"
+            );
+            pass = false;
+        } else {
+            println!(
+                "ok B10 precondition: the rank moved the card list of {moved} of {stacks} stacks \
+                 off the id prefix"
+            );
+        }
+        Ok(pass)
+    }
+
+    fn rank_verdict(pass: bool) -> Result<(), GateError> {
+        if !pass {
+            return Err(checks_failed());
+        }
+        println!("PASSED: {NAME} {RANK_STAGE}");
+        Ok(())
+    }
+
+    /// The precondition of B9 `what`: the steps sent every layer of `tier_layers` at least one
+    /// routed slot through the node.
+    fn node_served(what: &str, sent: Option<&Sent>, tier_layers: &[usize]) -> bool {
+        let Some(sent) = sent else {
+            println!("FAIL {what} precondition: the tiered load holds no tier card");
+            return false;
+        };
+        let hit = |l: usize| {
+            l.checked_sub(sent.first)
+                .and_then(|i| sent.hits.get(i))
+                .copied()
+                .unwrap_or(0)
+        };
+        let missing: Vec<usize> = tier_layers
+            .iter()
+            .copied()
+            .filter(|&l| hit(l) == 0)
+            .collect();
+        let slots: u64 = tier_layers.iter().map(|&l| hit(l)).sum();
+        println!(
+            "{what} node: stats().issued {}, stats().layer_hits {slots} over {} tier layers",
+            sent.issued,
+            tier_layers.len()
+        );
+        if missing.is_empty() {
+            println!(
+                "ok {what} precondition: the steps sent every tier layer a slot through the node"
+            );
+            true
+        } else {
+            println!(
+                "FAIL {what} precondition: tier layers {missing:?} were sent no routed slot by the \
+                 steps; the clause proves nothing there"
+            );
+            false
+        }
+    }
+
+    /// B9 `what`'s pin on the prompt call: the node computed its experts' block of every tiered
+    /// layer-batch — its batch leg served and settled once a block, a routed slot on every layer
+    /// of `tier_layers`, no decode layer asked of it — and the host left it exactly the node's
+    /// slots: those the host's batch services left to a tier's leg are the slots the legs sent
+    /// the node, so the host served none of them.
+    // PIN(2026-11-05): inverted from "the call sends the node nothing" — the node now serves its
+    // block of a prompt batch (`host::node::block`), so the host no longer serves its experts.
+    fn node_batch_served(what: &str, sent: Option<&Sent>, tier_layers: &[usize]) -> bool {
+        let Some(sent) = sent else {
+            println!("FAIL {what} node: the tiered load holds no tier card");
+            return false;
+        };
+        let hit = |l: usize| {
+            l.checked_sub(sent.first)
+                .and_then(|i| sent.hits.get(i))
+                .copied()
+                .unwrap_or(0)
+        };
+        let missing: Vec<usize> = tier_layers
+            .iter()
+            .copied()
+            .filter(|&l| hit(l) == 0)
+            .collect();
+        let slots: u64 = tier_layers.iter().map(|&l| hit(l)).sum();
+        let st = sent.stats;
+        let ok = st.served > 0
+            && st.settles == st.served
+            && missing.is_empty()
+            && sent.issued == 0
+            && sent.tier_slots == slots;
+        println!(
+            "{} {what} node: over the prompt call tier_batch_stats().served {} (settles {}, {:.2} ms \
+             waited), stats().issued moved {}, stats().layer_hits on the {} tier layers {slots} \
+             (none on {missing:?}); the host's batch slots: {} left to the node's leg, {} served",
+            if ok { "ok" } else { "FAIL" },
+            st.served,
+            st.settles,
+            st.settle_ns as f64 / 1e6,
+            sent.issued,
+            tier_layers.len(),
+            sent.tier_slots,
+            sent.host_slots
+        );
+        ok
+    }
+
+    /// B9's stage child's end: its checks' verdict, which [`node_case`] reads as its exit status.
+    fn stage_verdict(pass: bool) -> Result<(), GateError> {
+        if !pass {
+            return Err(checks_failed());
+        }
+        println!("PASSED: {NAME} {NODE_STAGE}");
         Ok(())
     }
 

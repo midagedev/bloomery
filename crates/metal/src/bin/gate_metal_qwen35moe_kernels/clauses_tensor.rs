@@ -13,6 +13,9 @@
 //!   bits as the same tensor run alone.
 //! - `tensor_gemm_range`: `gemm_range` on these kernels — the f16 operand's
 //!   range check raises the quantizer's site and makes the row NaN.
+//! - `tensor_gemm_half_rows`: `gemm_half_rows` on these kernels — the f16
+//!   operand over half rows cast once is the f32-row entries' bits, dense and
+//!   segmented, and the cast's range check is the staging's.
 //! - `tensor_grouped_q4k`, `tensor_grouped_q6k`, `tensor_grouped_a4`: the
 //!   routed pair and down over the route table's tiles, both operands,
 //!   within the tensor path's band; an activation past the half range the
@@ -23,7 +26,8 @@
 //!   (`clauses_synth`).
 //!
 //! A row that runs its A4 sites only has `tensor_gemm_a4`, `tensor_gemm_seg`
-//! (its A4 group) and `tensor_grouped_a4`, at its own sites.
+//! (its A4 group), `tensor_gemm_half_rows` and `tensor_grouped_a4`, at its
+//! own sites.
 
 use bloomery_device::conformance::Clause;
 
@@ -88,6 +92,12 @@ pub fn table<'a>(
             on(tensor, fixture, clauses_gemm::gemm_range),
         ),
         (
+            "tensor_gemm_half_rows",
+            on(tensor, mlx, move |h, f| {
+                clauses_gemm::gemm_half_rows(h, f, sites)
+            }),
+        ),
+        (
             "tensor_grouped_q4k",
             on(tensor, fixture, clauses_route::tensor_grouped_q4k),
         ),
@@ -123,6 +133,12 @@ pub fn shaped<'a>(
             "tensor_gemm_seg",
             on(tensor, mlx, move |h, f| {
                 clauses_gemm::gemm_seg_a4(h, f, sites)
+            }),
+        ),
+        (
+            "tensor_gemm_half_rows",
+            on(tensor, mlx, move |h, f| {
+                clauses_gemm::gemm_half_rows(h, f, sites)
             }),
         ),
         (

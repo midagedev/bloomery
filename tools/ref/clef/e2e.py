@@ -8,7 +8,7 @@
     tools/ref/clef/e2e.py --self-test
 
 `run` starts the server (`--bin`, default target/release/bloomery-serve) on FILE (`-m FILE`) with the
-release's head (`--head`, default /models/clef-flash/hf/joint_head.safetensors), or on `--hf REPO:QUANT`
+release's head (`--head`, default /data/moved/models/clef-flash/hf/joint_head.safetensors), or on `--hf REPO:QUANT`
 with the head the seat finds for the repo (`--head` only when given), `BLOOMERY_REF_MODEL` left out of its environment, POSTs every request of
 `tools/ref/clef/suite.jsonl` (English) and `suite-ko.jsonl` (Korean) that has an official row
 (`<data>/clef/flash/ref/reference.jsonl` and `ref-ko/reference.jsonl`, `--data` default $BLOOMERY_DATA or
@@ -49,7 +49,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 SUITES = (("en", "tools/ref/clef/suite.jsonl", "clef/flash/ref/reference.jsonl"),
           ("ko", "tools/ref/clef/suite-ko.jsonl", "clef/flash/ref-ko/reference.jsonl"))
-HEAD = "/models/clef-flash/hf/joint_head.safetensors"
+HEAD = "/data/moved/models/clef-flash/hf/joint_head.safetensors"
 
 
 def top(a: dict) -> tuple[str, float]:

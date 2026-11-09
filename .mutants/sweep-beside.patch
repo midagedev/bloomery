@@ -1,0 +1,16 @@
+# sweep mutant beside
+# clause: (a) only a worktree beside the main tree is retired; an Orca workspace is skipped by name
+#   (tools/sweep.sh --self-test)
+# site: tools/sweep.sh sweep_main step 1, the parent-directory test dropped (the basename prefix alone picks)
+# expected red: "sweep: self-test FAIL: (a) retire calls: disk.log is [retire …/bloomery-landed⏎retire …/bloomery-pr⏎retire …/orca/bloomery-orca] …"
+--- a/tools/sweep.sh
++++ b/tools/sweep.sh
+@@ -120,7 +120,7 @@
+       skipped=$((skipped + 1))
+       continue
+     fi
+-    if [ "$(dirname "$paths")" = "$parent" ] && case $name in "$mb"-?*) true ;; *) false ;; esac; then
++    if case $name in "$mb"-?*) true ;; *) false ;; esac; then
+       picked="$picked$paths"$'\n'
+     else
+       out "skip $paths (not beside the main tree)"

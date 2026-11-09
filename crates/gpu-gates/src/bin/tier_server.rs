@@ -10,15 +10,17 @@
 //!
 //! The model file is `-m`'s, else `$BLOOMERY_REF_MODEL`: this node's own
 //! copy, which must hold the rows node 0's plan gives the tier with node 0's
-//! headers and bytes (each row's sha256). It serves Qwen3.8's tier family,
-//! and V4.1's, GLM's and Solar-Open2's when built with the `deepseek41`,
+//! headers and bytes (each row's sha256). It serves Qwen3.8's and Kimi K3's tier
+//! families, and V4.1's, GLM's and Solar-Open2's when built with the `deepseek41`,
 //! `glm5next` or `solar2` feature; an open of another family is refused by
 //! name. The explicit
 //! listen address is loopback, private or 198.18.0.0/15 IPv4. Off-host nodes bind their
-//! own RDMA pages over this control channel, which has no authentication and belongs on a trusted network.
+//! own RDMA or TCP pages over this control channel, which has no authentication and belongs on a trusted
+//! network.
 //! A port of 0 takes a free
-//! one. The server prints `listening on <ip:port>` once bound, serves one
-//! load, and exits 0 once node 0 closes that load, whether node 0's side of
+//! one. The server prints `listening on <ip:port>` once bound and
+//! `word_ops=<memop|kernel> driver=<cuDriverGetVersion>` once a load's tier
+//! opens, serves one load, and exits 0 once node 0 closes that load, whether node 0's side of
 //! it came up or failed; a connection that opened no tier (a census, a
 //! refused open) leaves it serving the next. A lost node 0 ends it with the
 //! named loss.
@@ -80,6 +82,7 @@ mod server {
             &file,
             &[
                 NODE_FAMILY,
+                bloomery_gpu::arch::kimi_k3::NODE_FAMILY,
                 #[cfg(feature = "deepseek41")]
                 bloomery_gpu_deepseek41::NODE_FAMILY,
                 #[cfg(feature = "glm5next")]
@@ -87,6 +90,7 @@ mod server {
                 #[cfg(feature = "solar2")]
                 bloomery_gpu_solar2::NODE_FAMILY,
             ],
+            |words| println!("{words}"),
         )?;
         println!("node 0 closed the load");
         Ok(())

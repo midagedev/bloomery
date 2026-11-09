@@ -13,7 +13,10 @@
 //! sidecar replaced at its path is opened anew, and a sidecar opened for one
 //! source is refused by name beside another source's split of the same names
 //! and shapes. Releasing a resident sidecar's pages is refused by name and
-//! leaves its bytes as they were. No clause reads a model file.
+//! leaves its bytes as they were. A sidecar re-records the source header
+//! digests a header patch moved (`record_headers`) and nothing else, and one
+//! whose source differs elsewhere is refused and left as it was. No clause
+//! reads a model file.
 
 #[path = "common/r8layer.rs"]
 mod r8layer;
@@ -1065,4 +1068,82 @@ fn a_resident_sidecar_is_not_released() {
         "page drop: a resident sidecar is refused; the mapped one releases {} B",
         drop.bytes()
     );
+}
+
+/// `record_headers` re-records the source header digests a header patch moved, and nothing else:
+/// the bytes that change are one digest's 64, the sidecar then opens and verifies against the
+/// patched source, and a second call writes nothing. A sidecar whose source differs elsewhere too
+/// is refused by that difference and left byte for byte as it was: a shard's length (refused
+/// before any write) and a stack head beside a header byte (the patch is written back). Mutants:
+/// the digest write skipped (the open after it refuses); the offset past the length prefix off by
+/// eight (bytes outside the digest move); the write-back dropped (the refused sidecar's bytes
+/// moved).
+#[test]
+fn record_headers_rewrites_only_the_moved_digests() {
+    let base = dir("record-headers");
+    let first = write_source(&base, "src");
+    let side = base.join("side.gguf");
+    r8file::convert(&Split::open(&first).unwrap(), &names(), &side, &mut |_| {}).unwrap();
+    let before = std::fs::read(&side).unwrap();
+    let note = find_bytes(&first, b"synthetic source");
+    flip(&first, note, 0x01);
+    let split = Split::open(&first).unwrap();
+    assert!(matches!(
+        r8_err(Sidecar::open(&side, &split, LAZY)),
+        R8Error::HeaderDigest { .. }
+    ));
+    assert_eq!(r8file::record_headers(&side, &split).unwrap(), 1);
+    let after = std::fs::read(&side).unwrap();
+    assert_eq!(before.len(), after.len(), "the patch moves no length");
+    let moved: Vec<usize> = (0..before.len())
+        .filter(|&i| before[i] != after[i])
+        .collect();
+    let want = gguf::digest::sha256_hex(split.shard(0).unwrap().header_bytes());
+    let at = find_bytes(&side, want.as_bytes()) as usize;
+    assert!(
+        !moved.is_empty() && moved.iter().all(|&i| (at..at + 64).contains(&i)),
+        "only the first shard's digest moves: {moved:?}, the digest at {at}"
+    );
+    let opened = Sidecar::open(&side, &split, LAZY).unwrap();
+    r8file::verify(&split, &opened, &mut |_| {}).unwrap();
+    drop(opened);
+    assert_eq!(r8file::record_headers(&side, &split).unwrap(), 0);
+    assert_eq!(
+        std::fs::read(&side).unwrap(),
+        after,
+        "a second call writes nothing"
+    );
+    drop(split);
+
+    // A shard's length differs as well: refused by it before any write.
+    let second = base.join("src-00002-of-00002.gguf");
+    let kept = std::fs::read(&second).unwrap();
+    let mut longer = kept.clone();
+    longer.extend_from_slice(&[0; 32]);
+    std::fs::write(&second, longer).unwrap();
+    let e = r8_err(r8file::record_headers(&side, &Split::open(&first).unwrap()));
+    assert!(matches!(e, R8Error::ShardBytes { .. }), "{e}");
+    assert_eq!(
+        std::fs::read(&side).unwrap(),
+        after,
+        "the refusal writes nothing"
+    );
+    std::fs::write(&second, kept).unwrap();
+
+    // A stack head differs beside the header: the digest patch is written, the open after it
+    // refuses the head, and the sidecar gets its old digests back.
+    flip(&first, note, 0x01);
+    let (head, _) = data_at(&first, G0);
+    flip(&first, head, 0x10);
+    let e = r8_err(r8file::record_headers(&side, &Split::open(&first).unwrap()));
+    assert!(
+        matches!(&e, R8Error::Head { tensor, .. } if tensor == G0),
+        "{e}"
+    );
+    assert_eq!(
+        std::fs::read(&side).unwrap(),
+        after,
+        "the refused patch is written back"
+    );
+    std::fs::remove_dir_all(&base).unwrap();
 }

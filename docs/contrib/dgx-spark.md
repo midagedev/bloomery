@@ -71,7 +71,7 @@ carries) and `tools/oxide-host.sh` before `cargo oxide`. `tools/oxide-host.sh` r
 with `cargo oxide` only, for example:
 
 ```sh
-cargo oxide build --arch sm_121a -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve
+cargo oxide build --arch sm_121a -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve
 ```
 
 Recipes select `sm_121a` on a GB10 when `BLOOMERY_ARCH` is unset (`tools/arch.sh:15-35` at `c21e3b81`). That target
@@ -83,15 +83,11 @@ overrides the detected target; set it when invoking recipes from a machine witho
 card is compute capability 12.0 (the RTX 50 series) builds `sm_120a`, and other machines keep `sm_86`.
 
 The release's GB10 archive (`bloomery-<version>-linux-aarch64-cuda-sm121a.tar.gz`) is this build, packed: `sm_121a`
-and the features above, `checkpoint` among them. The maintainers build it on their x86_64 box with the cross toolchain
-(`BLOOMERY_RELEASE_TARGET=aarch64 just release-build <version>`; the box names the aarch64 libc as `QEMU_LD_PREFIX`): the
-host code comes from the cross gcc for GB10's cores, and each bundle's PTX is compiled by the CUDA toolkit's
-`ptxas -arch=<the bundle's target>` on the build host (`oxart_ptxas`, no card there), the build printing the ptxas
-version, so a first start compiles nothing; their PTX stays in the binary as `.oxart.ptx` for a driver that refuses the
-compiled code. The build runs `bloomery-serve --version` under `qemu-aarch64` before and after the cubins are packed (it
-says "not run" where qemu is absent). The build machine has no GB10: a contributor's Spark run checks the archive once
-before a release is tagged. Building it on a GB10 itself still works (`tools/release/build.sh` there with `BLOOMERY_BOX_LOCAL=1`, where
-`oxart_jit --cubin` links the cubins on the Spark's own card). It needs no toolchain to run: from 0.3.11 the release
+and the features above, `checkpoint` among them. The maintainers build it natively on a DGX Spark (`tools/release/build.sh` there with `BLOOMERY_BOX_LOCAL=1`, where
+`oxart_jit --cubin` links the cubins on the Spark's own card), so a first start compiles nothing. The toolchain is
+`docs/BUILD.md`'s, CUDA 13.3's headers included: a Spark's own CUDA 13.0 packages lack `cuGraphNodeGetParams`, and
+bindgen ends E0425 without them. The cross build on an x86_64 machine (`BLOOMERY_RELEASE_TARGET=aarch64`) still
+builds, but its cubins are refused by a GB10's driver and JIT-compiled at the first start, so the release does not use it. It needs no toolchain to run: from 0.3.11 the release
 carries it, and `tools/release/install.sh` picks it on a GB10 and links `bloomery-serve` into `~/.local/bin`.
 
 ### 2.2 First placement and the models to try

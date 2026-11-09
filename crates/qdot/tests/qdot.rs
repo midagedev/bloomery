@@ -1316,7 +1316,7 @@ fn model_file(ty: GgmlType) -> String {
     );
     match ty {
         GgmlType::IQ3_XXS => std::env::var("BLOOMERY_IQ3XXS_MODEL").unwrap_or_else(|_| {
-            "/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00002-of-00003.gguf"
+            "/data/moved/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00002-of-00003.gguf"
                 .into()
         }),
         GgmlType::MXFP4 => std::env::var("BLOOMERY_MXFP4_MODEL").unwrap_or_else(|_| {
@@ -5905,8 +5905,7 @@ fn iq_tile_synthetic(ty: GgmlType, block: usize, gran: usize, ks: &[usize], ends
 /// tensor of `ty` against the seeded columns: tile = `dot_row` per column.
 fn iq_tile_real(ty: GgmlType, block: usize, gran: usize) {
     // The first shard of the file `tools/ref/build-qdot-ref.sh` names for the dumps.
-    let first =
-        "/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf";
+    let first = "/data/moved/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf";
     let (name, k, row_bytes, bytes) = split_rows(first, ty, block, gran, "exps", TILE_ROWS);
     let calls = assert_tile_matches(
         ty,
@@ -6282,7 +6281,7 @@ fn hw_q6k_tile_matches_dot_row() {
     );
     eprintln!("q6k tile: {name} (k = {k}): {calls} calls, c = 1..=8, bit-identical");
 
-    let first = "/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-Q4_K_M.gguf";
+    let first = "/data/moved/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-Q4_K_M.gguf";
     let (name, k, row_bytes, bytes) = split_rows(first, ty, 210, 256, "ffn_down_exps", TILE_ROWS);
     let calls = assert_tile_matches(
         ty,

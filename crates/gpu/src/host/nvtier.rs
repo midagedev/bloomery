@@ -101,7 +101,7 @@
 
 use std::ops::Range;
 use std::os::unix::fs::FileExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
@@ -110,6 +110,7 @@ use std::time::{Duration, Instant};
 use bloomery_levers::NvTierEvict;
 use engram::direct::{AnonMap, DIRECT_ALIGN, DirectFile, aligned_span};
 use gguf::Split;
+use gguf::shard_dirs::{check_copy, copy_of, copy_path, shard_dirs};
 use model::moe::{Claim, PinRelease, PinToken, Ticket, TicketWait, TierError, TierPin, TierSlots};
 use model::placement::host_lock::{HostFile, HostSet, PageDrop, expert_runs, page_bytes};
 use model::placement::paged_drop::{Mark, drop_runs, overlap_of};
@@ -463,17 +464,56 @@ fn open_shard(
         WHAT,
         format!("{name}: shard {shard} has no path"),
     ))?;
-    let file = if direct {
-        DirectFile::open(path)
-    } else {
-        DirectFile::open_buffered(path)
-    }
-    .map_err(|e| GpuError::plan(WHAT, e))?;
+    let file = open_file(path, direct).map_err(|e| GpuError::plan(WHAT, e))?;
     if files.len() <= shard {
         files.resize(shard + 1, None);
     }
     files[shard] = Some(Arc::new(file));
     Ok(())
+}
+
+/// Open the fills' handle of shard `shard`'s copy in each of `dirs` (the set's
+/// sidecar, [`shard_dirs`]) into `copies` (by shard) unless they are there,
+/// the way [`open_shard`] opened the shard's own file. Each copy must be a
+/// file of the shard's length whose sampled bytes equal the shard's
+/// ([`check_copy`]): a missing one, a short one and one that differs are
+/// refused by name at the build, never read around.
+fn open_copies(
+    split: &Split,
+    copies: &mut Vec<Option<Vec<Arc<DirectFile>>>>,
+    dirs: &[PathBuf],
+    shard: usize,
+    direct: bool,
+) -> Result<(), GpuError> {
+    const WHAT: &str = "NvTier::of_paged";
+    if copies.get(shard).is_some_and(Option::is_some) {
+        return Ok(());
+    }
+    let own = split
+        .shard_path(shard)
+        .ok_or(GpuError::shape(WHAT, format!("shard {shard} has no path")))?;
+    let mut opened = Vec::with_capacity(dirs.len());
+    for dir in dirs {
+        let copy = copy_path(own, dir);
+        check_copy(own, &copy).map_err(|e| GpuError::plan(WHAT, e))?;
+        opened.push(Arc::new(
+            open_file(&copy, direct).map_err(|e| GpuError::plan(WHAT, e))?,
+        ));
+    }
+    if copies.len() <= shard {
+        copies.resize(shard + 1, None);
+    }
+    copies[shard] = Some(opened);
+    Ok(())
+}
+
+/// `path` opened `O_DIRECT` (`direct`) or through the page cache.
+fn open_file(path: &Path, direct: bool) -> Result<DirectFile, engram::EngramError> {
+    if direct {
+        DirectFile::open(path)
+    } else {
+        DirectFile::open_buffered(path)
+    }
 }
 
 /// One part of one expert as its files hold it — static per (layer, id,
@@ -998,6 +1038,10 @@ struct LayerArena {
     /// The fills' handle of each of the split's shards a run of the arena's
     /// lies in, by shard; a drop advises the shard's mapping.
     files: Arc<[Option<Arc<DirectFile>>]>,
+    /// The other copies of each shard ([`open_copies`]), in the sidecar's
+    /// order, by shard; empty for a set without a sidecar. A fill reads copy
+    /// `copy_of(id, part, n)` ([`LayerArena::file_of`]).
+    copies: Arc<[Vec<Arc<DirectFile>>]>,
     /// The plan's stack-row tensors' names, for the attach's mapping.
     names: [String; PARTS],
     /// Per id: its parts' runs, by stack row.
@@ -1296,6 +1340,24 @@ impl LayerArena {
             .expect("a run's shard opened at the build")
     }
 
+    /// The handle a fill of expert `id`'s part `part` reads shard `shard`
+    /// through: copy `(id + part) % n` of the shard's `n` copies, the shard's
+    /// own file for a set with one.
+    fn file_of(&self, shard: usize, id: u32, part: usize) -> &Arc<DirectFile> {
+        match self.copy_index_of(shard, id, part) {
+            0 => self.file(shard),
+            c => &self.copies[shard][c - 1],
+        }
+    }
+
+    /// The index of the copy (0 the set's own) a fill of expert `id`'s part
+    /// `part` reads shard `shard` from: the one pick [`LayerArena::file_of`]
+    /// and the fill's byte counts share.
+    fn copy_index_of(&self, shard: usize, id: u32, part: usize) -> usize {
+        let others = self.copies.get(shard).map_or(0, Vec::len);
+        copy_of(id, part, 1 + others)
+    }
+
     /// The stack row and the expert whose run in shard `shard` holds the
     /// page of byte `at`, for a refusal to name; `None` when no run does.
     fn owner_at(&self, shard: usize, at: u64, page: u64) -> Option<(usize, u32)> {
@@ -1511,6 +1573,11 @@ pub struct NvTierStats {
     pub fill_bytes: u64,
     /// Wall the fills took, summed (ns) — beside the bytes, the fill rate.
     pub fill_ns: u64,
+    /// Copies of the set the reader holds: the set's own and one a directory
+    /// its sidecar lists. Constant over the load.
+    pub copies: u64,
+    /// The part of `fill_bytes` read from a copy other than the set's own.
+    pub copy_bytes: u64,
     /// Slots evicted for a later miss.
     pub evictions: u64,
     /// Bytes the arena holds filled — never above the budget.
@@ -1582,6 +1649,7 @@ struct Stats {
     fills: AtomicU64,
     fill_bytes: AtomicU64,
     fill_ns: AtomicU64,
+    copy_bytes: AtomicU64,
     evictions: AtomicU64,
     resident_bytes: AtomicU64,
     buffered_reads: AtomicU64,
@@ -1877,6 +1945,9 @@ pub struct NvTier {
     slot_set: u64,
     /// The routed-expert bytes the plan pages on the NVMe tier.
     paged: u64,
+    /// The copies of the set the fills read: the set's own plus the sidecar's
+    /// directories.
+    copies: u64,
     /// One buffered handle per shard, once [`NvTier::audit_on`] turned the
     /// audit on.
     audit: OnceLock<Vec<(PathBuf, std::fs::File)>>,
@@ -2078,6 +2149,29 @@ impl NvTier {
         mem: ArenaKind<'_>,
         evict: NvTierEvict,
     ) -> Result<Option<NvTier>, GpuError> {
+        if plan.host.nvme_expert_bytes == 0 || arena.granted == 0 {
+            return Ok(None);
+        }
+        let dirs = match split.shard_path(0) {
+            Some(first) => shard_dirs(first).map_err(|e| GpuError::plan("NvTier::of_paged", e))?,
+            None => Vec::new(),
+        };
+        Self::of_paged_with_copies(plan, split, direct, arena, mem, evict, &dirs)
+    }
+
+    /// [`NvTier::of_paged`] with the copies' directories named by the caller
+    /// instead of read from the set's sidecar: the same checks, the same
+    /// reads, `dirs` in the order the sidecar would list them. `of_paged`
+    /// calls this with what the sidecar lists.
+    pub fn of_paged_with_copies(
+        plan: &Plan<'_>,
+        split: &Arc<Split>,
+        direct: bool,
+        arena: ArenaGrant,
+        mem: ArenaKind<'_>,
+        evict: NvTierEvict,
+        dirs: &[PathBuf],
+    ) -> Result<Option<NvTier>, GpuError> {
         const WHAT: &str = "NvTier::of_paged";
         if plan.host.nvme_expert_bytes == 0 || arena.granted == 0 {
             return Ok(None);
@@ -2136,6 +2230,7 @@ impl NvTier {
         }
         // The shards' direct handles, by shard, opened as a run names them.
         let mut files: Vec<Option<Arc<DirectFile>>> = Vec::new();
+        let mut copies: Vec<Option<Vec<Arc<DirectFile>>>> = Vec::new();
         let mut arenas: Vec<Option<LayerArena>> = (0..model.layers).map(|_| None).collect();
         let mut slot_sizes = Vec::new();
         for (l, rows) in rows_of.iter().enumerate() {
@@ -2164,6 +2259,7 @@ impl NvTier {
                 for &(codes, scales) in &runs {
                     for r in std::iter::once(codes).chain(scales) {
                         open_shard(split, &mut files, r.shard, direct, &t.name)?;
+                        open_copies(split, &mut copies, dirs, r.shard, direct)?;
                     }
                 }
                 lens[p] = runs.first().map_or((0, 0), |&(codes, scales)| {
@@ -2195,6 +2291,7 @@ impl NvTier {
                 dev: None,
                 part_of: OnceLock::new(),
                 files: Arc::new([]),
+                copies: Arc::new([]),
                 names: std::array::from_fn(|p| {
                     rows.get(p).map(|t| t.name.clone()).unwrap_or_default()
                 }),
@@ -2206,9 +2303,12 @@ impl NvTier {
                 idle: Mutex::new(Vec::new()),
             });
         }
+        let copies: Arc<[Vec<Arc<DirectFile>>]> =
+            copies.into_iter().map(Option::unwrap_or_default).collect();
         let files: Arc<[Option<Arc<DirectFile>>]> = files.into();
         for arena in arenas.iter_mut().flatten() {
             arena.files = Arc::clone(&files);
+            arena.copies = Arc::clone(&copies);
         }
         let least = ArenaFloor::of(plan).map_err(|e| GpuError::plan(WHAT, e))?;
         let count =
@@ -2222,6 +2322,7 @@ impl NvTier {
             split,
             mem,
         )?;
+        tier.copies = 1 + dirs.len() as u64;
         if evict == NvTierEvict::Heat {
             tier.count_routes();
         }
@@ -2318,6 +2419,7 @@ impl NvTier {
             slots: count,
             slot_set: slot_sizes.iter().sum::<usize>() as u64,
             paged,
+            copies: 1,
             audit: OnceLock::new(),
             split: Arc::clone(split),
             page,
@@ -2477,6 +2579,8 @@ impl NvTier {
             fills: s.fills.load(Ordering::Relaxed),
             fill_bytes: s.fill_bytes.load(Ordering::Relaxed),
             fill_ns: s.fill_ns.load(Ordering::Relaxed),
+            copies: self.copies,
+            copy_bytes: s.copy_bytes.load(Ordering::Relaxed),
             evictions: s.evictions.load(Ordering::Relaxed),
             resident_bytes: s.resident_bytes.load(Ordering::Relaxed),
             buffered_reads: s.buffered_reads.load(Ordering::Relaxed),
@@ -3514,10 +3618,14 @@ fn read_of(arena: &LayerArena, p: &Pick) -> PickRead {
         parts: std::array::from_fn(|part| {
             let r = parts.get(part)?;
             let at = slot_off + arena.windows[part];
-            let codes = RunRead::of(arena.file(r.codes.shard), at, r.codes);
-            let scales = r
-                .scales
-                .map(|s| RunRead::of(arena.file(s.shard), at + window_bytes(r.codes.len, 0), s));
+            let codes = RunRead::of(arena.file_of(r.codes.shard, p.id, part), at, r.codes);
+            let scales = r.scales.map(|s| {
+                RunRead::of(
+                    arena.file_of(s.shard, p.id, part),
+                    at + window_bytes(r.codes.len, 0),
+                    s,
+                )
+            });
             Some(PartRead { codes, scales })
         }),
     }
@@ -3610,14 +3718,20 @@ fn count_fill(
     claim: Option<Claim>,
 ) {
     let mut bytes = 0u64;
+    let mut copy_bytes = 0u64;
     for p in picks {
-        for r in arena.parts_of(p.id).iter().flat_map(PartRange::runs) {
-            bytes += r.len as u64;
-            if !arena.file(r.shard).is_direct() {
-                stats.buffered_reads.fetch_add(1, Ordering::Relaxed);
-                stats
-                    .buffered_bytes
-                    .fetch_add(r.len as u64, Ordering::Relaxed);
+        for (part, range) in arena.parts_of(p.id).iter().enumerate() {
+            for r in range.runs() {
+                bytes += r.len as u64;
+                if arena.copy_index_of(r.shard, p.id, part) != 0 {
+                    copy_bytes += r.len as u64;
+                }
+                if !arena.file(r.shard).is_direct() {
+                    stats.buffered_reads.fetch_add(1, Ordering::Relaxed);
+                    stats
+                        .buffered_bytes
+                        .fetch_add(r.len as u64, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -3631,6 +3745,7 @@ fn count_fill(
         of_claim.fetch_add(picks.len() as u64, Ordering::Relaxed);
     }
     stats.fill_bytes.fetch_add(bytes, Ordering::Relaxed);
+    stats.copy_bytes.fetch_add(copy_bytes, Ordering::Relaxed);
     stats.fill_ns.fetch_add(wall_ns, Ordering::Relaxed);
     stats.resident_bytes.fetch_add(
         picks.len() as u64 * arena.slot_bytes as u64,
@@ -5537,6 +5652,144 @@ pub(super) mod tests {
         assert_eq!(open_reads(&arena, &[3, 4]), [0, 0]);
         let free = super::claim_slots(0, &arena, &mut books.lock().unwrap(), &[3], Claim::Step);
         assert!(free.is_ok(), "no slot was left filling");
+    }
+
+    /// A pick's part reads copy `(id + part) % n` of its shard's `n` copies, the
+    /// shard's own file for a set with no sidecar: the three parts of one
+    /// expert land on different copies, and the planes' block scales read the
+    /// part's copy. FAIL-first: every part read the shard's own file.
+    #[test]
+    fn a_part_reads_the_copy_id_plus_part_modulo_n() {
+        use engram::direct::DirectFile;
+        use std::sync::Arc;
+        let scratch = Scratch::new("copy-pick");
+        let files: Vec<Arc<DirectFile>> = (0..3)
+            .map(|c| {
+                let path = scratch.0.join(format!("copy{c}"));
+                std::fs::write(&path, [c as u8; 16]).unwrap();
+                Arc::new(DirectFile::open_buffered(&path).unwrap())
+            })
+            .collect();
+        let path_of = |arena: &super::LayerArena, id: u32, part: usize| {
+            let pick = super::Pick {
+                slot: 0,
+                id,
+                gone: None,
+            };
+            let read = super::read_of(arena, &pick);
+            read.parts[part]
+                .as_ref()
+                .unwrap()
+                .codes
+                .file
+                .path()
+                .to_path_buf()
+        };
+        let mut arena = arena_of(4, 1);
+        arena.files = shards_of([Arc::clone(&files[0])]);
+        for id in 0..4 {
+            for part in 0..PARTS {
+                assert_eq!(path_of(&arena, id, part), files[0].path(), "n=1");
+            }
+        }
+        for n in [2usize, 3] {
+            arena.copies = Arc::new([files[1..n].to_vec()]);
+            for id in 0..4u32 {
+                for part in 0..PARTS {
+                    let want = files[(id as usize + part) % n].path();
+                    assert_eq!(path_of(&arena, id, part), want, "n={n} id={id} part={part}");
+                }
+            }
+        }
+        // The planes' scales: the part's copy too.
+        arena.parts[1][2].scales = Some(super::Run {
+            shard: 0,
+            at: 0,
+            len: 1,
+        });
+        let pick = super::Pick {
+            slot: 0,
+            id: 1,
+            gone: None,
+        };
+        let read = super::read_of(&arena, &pick);
+        let part = read.parts[2].as_ref().unwrap();
+        assert_eq!(part.codes.file.path(), files[0].path());
+        assert_eq!(part.scales.as_ref().unwrap().file.path(), files[0].path());
+    }
+
+    /// A fill counts the bytes of the parts it read from a copy other than the
+    /// set's own beside `fill_bytes`, by the pick `(id + part) % n` makes.
+    /// FAIL-first: every part counted as the set's own.
+    #[test]
+    fn a_fill_counts_the_bytes_it_read_from_other_copies() {
+        use engram::direct::DirectFile;
+        use std::sync::Arc;
+        let scratch = Scratch::new("copy-count");
+        let path = scratch.0.join("copy1");
+        std::fs::write(&path, [1u8; 16]).unwrap();
+        let mut arena = arena_of(4, 2);
+        arena.parts = vec![[one_run(0, 0, 7, 0); PARTS]; 4];
+        let picks = |ids: &[u32]| {
+            ids.iter()
+                .enumerate()
+                .map(|(slot, &id)| super::Pick {
+                    slot,
+                    id,
+                    gone: None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let count = |arena: &super::LayerArena, ids: &[u32]| {
+            let stats = super::Stats::default();
+            super::count_fill(&stats, arena, &picks(ids), 0, None);
+            (
+                stats.fill_bytes.load(Ordering::Relaxed),
+                stats.copy_bytes.load(Ordering::Relaxed),
+            )
+        };
+        assert_eq!(count(&arena, &[0, 1]), (6 * 7, 0));
+        arena.copies = Arc::new([vec![Arc::new(DirectFile::open_buffered(&path).unwrap())]]);
+        // Expert 0 reads copy 1 for its part 1, expert 1 for its parts 0 and 2.
+        assert_eq!(count(&arena, &[0, 1]), (6 * 7, 3 * 7));
+    }
+
+    /// The build opens a handle per copy the sidecar lists and refuses a copy
+    /// that is missing or not the shard's length by name, before any fill.
+    /// FAIL-first: a short copy opened and failed at its first fill.
+    #[test]
+    fn a_missing_or_short_copy_is_refused_at_the_open() {
+        let scratch = Scratch::new("copy-open");
+        let split = split_in(&scratch);
+        let own = split.shard_path(0).unwrap().to_path_buf();
+        let len = std::fs::metadata(&own).unwrap().len();
+        let mirror = scratch.0.join("mirror");
+        std::fs::create_dir_all(&mirror).unwrap();
+        let dirs = [mirror.clone()];
+        let copy = super::copy_path(&own, &mirror);
+        let open = |dirs: &[std::path::PathBuf]| {
+            let mut copies = Vec::new();
+            super::open_copies(&split, &mut copies, dirs, 0, false).map(|()| copies)
+        };
+
+        let err = format!(
+            "{:?}",
+            open(&dirs).err().expect("a missing copy is refused")
+        );
+        assert!(err.contains(&copy.display().to_string()), "{err}");
+        assert!(err.contains("missing"), "{err}");
+
+        std::fs::write(&copy, vec![0u8; len as usize - 1]).unwrap();
+        let err = format!("{:?}", open(&dirs).err().expect("a short copy is refused"));
+        assert!(err.contains(&copy.display().to_string()), "{err}");
+        assert!(err.contains(&format!("{} B", len - 1)), "{err}");
+
+        std::fs::copy(&own, &copy).unwrap();
+        let copies = open(&dirs).unwrap();
+        assert_eq!(copies[0].as_ref().unwrap().len(), 1);
+        assert_eq!(copies[0].as_ref().unwrap()[0].path(), copy);
+        // No sidecar: one copy, no handle beyond the shard's own.
+        assert!(open(&[]).unwrap()[0].as_ref().unwrap().is_empty());
     }
 
     /// A pick over an evicted slot reads over its pages in place: the bytes
@@ -7546,6 +7799,7 @@ pub(super) mod tests {
             dev: None,
             part_of: std::sync::OnceLock::new(),
             files: shards_of([file]),
+            copies: std::sync::Arc::new([]),
             names: Default::default(),
             parts: vec![[part; PARTS]; n_expert as usize],
             of_id: (0..n_expert).map(|_| AtomicU32::new(0)).collect(),

@@ -1,0 +1,14 @@
+--- a/crates/gpu/src/host/link/tcp.rs	2026-11-04 23:40:28
++++ b/crates/gpu/src/host/link/tcp.rs	2026-11-04 23:40:28
+@@ -369,6 +369,11 @@
+                 self.buf.extend_from_slice(&w.to_le_bytes());
+             }
+         }
++        // MUTANT M1: the post's first two frames swap places on the wire.
++        let sizes: Vec<usize> = moves.iter().filter(|m| m.len > 0).map(|m| HEAD + m.len).collect();
++        if sizes.len() >= 2 {
++            self.buf[..sizes[0] + sizes[1]].rotate_left(sizes[0]);
++        }
+         self.last = self.seq;
+         conn.shared.sent.store(self.seq, Ordering::Release);
+         let wrote = lock(&conn.tx).write_all(&self.buf);

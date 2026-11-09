@@ -1,0 +1,17 @@
+# Every P=512 row of 0.3.13's sitting and of the two bisect A/Bs is [cold] (38k..81k major faults a request: a bp plan pages
+# its paged layers from the NVMe on the first prompt), so the 59..124 scatter so far compares cold reads, not builds. This
+# A/B reads the warm P=512 row: DEPTH_SERVE_FOLD=depths serves D=4096 and D=512 on one server a round in the rotated order,
+# so half the rounds give each arm a P=512 row that follows the D=4096 request ([shared], warm pages and ring). Three arms
+# in one lease: the shipped 0.3.13 binary, the 66b85794 build (before the suspects) and be69d0950 (518c109d8's Q5_K-down
+# card experts plus its two FileSwap follow-ups, which a bp plan needs to open).
+kind: ab
+question: at a warm P=512 prompt, is the shipped 0.3.13 bloomery-serve slower than the 66b85794 build at --place bp, and does be69d0950 already carry the difference?
+term: pp tok/s @ P = 512, prose corpus, A6000+3090 --place bp, serving defaults, the [shared] rows (second request of a round's server) - (0.3.13 - 66b85794) / 66b85794
+unit: %
+predict: -45..-10
+rounds: 8
+sd: 5 % the cold rows' scatter is the only P 512 scatter measured (0.3.13 60.05, 59.00, 67.77, 103.94; 66b85794 112.76, 122.82, 102.20); warm rows are expected tighter; a P=512 row is [shared] in half the rounds (the rotation puts D=4096 first in the other half), so 8 rounds give 4 warm rows an arm
+condition: BLOOMERY_MODEL=deepseek41, DEPTH_SERVE_FOLD=depths, BLOOMERY_DEPTHS="4096 512", arms bloomery@portable (the sm86 tarball's member), bloomery-follow (target/release at 66b85794), bloomery-bis518 (target/release at be69d0950), BLOOMERY_AB_ROUNDS=8, DEPTH_SERVE_PLACE=bp, BLOOMERY_TIMING_CARDS=a6000+3090; the term is read on the [shared] P=512 rows, the fold audit prints shared - first per arm
+decide-in: the warm prompt is slower on this side of 66b85794: if be69d0950's shared rows sit with 0.3.13's the cause is 518c109d8's card-expert move on layers 0 and 1 (fewer card experts per routed layer at the same bytes), else bisect 22b6345d3 and 99c7977dc next
+decide-below: below -45 %: the warm difference is larger than the cold one; read each arm's plan line (n_l, the paged set) before crediting a commit
+decide-above: above -10 %: the P=512 "regression" was the cold first request; the sitting's P=512 cell needs the fold (a warm row) and the notes state no regression

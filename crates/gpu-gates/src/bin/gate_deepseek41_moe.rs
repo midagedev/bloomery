@@ -9,7 +9,8 @@
 //!   `_weights_norm` in the simulation), every layer;
 //! - `routed`: `ds41_expert_gate_up` for `ffn_moe_gate_par` and `q4k_sel`'s
 //!   gemv for `ffn_moe_down`, at the layers whose down stack is q4_K — a
-//!   q5_K down (layers 0 and 1) is the host tier's in every plan;
+//!   q5_K down (layers 0 and 1) runs the fused dispatch the lib gate pins,
+//!   not this site's launches;
 //! - `shared`: the shared expert's gate·up·SwiGLU for `ffn_up_gate` and its
 //!   down projection for `ffn_shexp`, every layer, in the file's format —
 //!   `ds41_shexp_gate_up` and `q8_0_gemv` on a q8_0 file,
@@ -1104,7 +1105,8 @@ mod gate {
                 first_routed = false;
             } else {
                 println!(
-                    "routed layer={l} skipped: ffn_down_exps is {} — the host tier's in every plan",
+                    "routed layer={l} skipped: ffn_down_exps is {} — this site pins the q4_K \
+                     down's launches alone; a q5_K down runs the fused dispatch the lib gate pins",
                     ly.down_ty
                 );
             }

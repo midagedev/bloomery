@@ -1,0 +1,11 @@
+--- a/crates/gpu-deepseek41/src/chain/ffn/tier.rs	2026-11-04 23:10:07
++++ b/crates/gpu-deepseek41/src/chain/ffn/tier.rs	2026-11-04 23:10:07
+@@ -414,7 +414,7 @@
+             wv[j] = wj;
+             // SAFETY: rank <= j < 6 and d < rows, so rank·rows + d < 6·rows
+             // <= trows.len() by this fn's contract.
+-            dv[j] = unsafe { *trows.get_unchecked(rank * rows + d) };
++            dv[j] = unsafe { *trows.get_unchecked(j * rows + d) };
+         }
+         if tier {
+             rank += 1;

@@ -571,6 +571,20 @@ impl Folder {
         Ok((self.dir.join(file), map, st.file_range(name)?))
     }
 
+    /// The folder's directory.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Each shard's path with the bytes of its header (the length and the JSON), which every
+    /// open of the folder reads, in the order the index first names the shards.
+    pub fn headers(&self) -> Vec<(std::path::PathBuf, std::ops::Range<u64>)> {
+        self.shards
+            .iter()
+            .map(|(f, st)| (self.dir.join(f), 0..st.data as u64))
+            .collect()
+    }
+
     /// Every tensor name, sorted.
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.by_name.keys().map(String::as_str)
@@ -673,6 +687,22 @@ fn entry(name: &str, v: &Value, data_len: usize) -> Result<Entry, Error> {
 /// writer the tests and synthetic heads use.
 #[must_use]
 pub fn write(tensors: &[(&str, &str, &[usize], &[u8])]) -> Vec<u8> {
+    let entries: Vec<(&str, &str, &[usize], usize)> = tensors
+        .iter()
+        .map(|&(name, dtype, shape, raw)| (name, dtype, shape, raw.len()))
+        .collect();
+    let mut out = header(&entries);
+    for (_, _, _, raw) in tensors {
+        out.extend_from_slice(raw);
+    }
+    out
+}
+
+/// The bytes before a safetensors file's data, its header length and header, for tensors
+/// `(name, dtype, shape, data bytes)` laid out in the given order: a writer that streams the data
+/// after it ([`write`]).
+#[must_use]
+pub fn header(tensors: &[(&str, &str, &[usize], usize)]) -> Vec<u8> {
     // The header text is built by hand: the entries keep the given order, which a `Value` map
     // without `preserve_order` would sort.
     let json = |v: &Value| v.to_string();
@@ -683,16 +713,16 @@ pub fn write(tensors: &[(&str, &str, &[usize], &[u8])]) -> Vec<u8> {
     };
     let mut text = String::from(r#"{"__metadata__":{"format":"pt"}"#);
     let mut at = 0usize;
-    for (name, dtype, shape, raw) in tensors {
+    for &(name, dtype, shape, len) in tensors {
         text.push(',');
-        text.push_str(&json(&Value::from(*name)));
+        text.push_str(&json(&Value::from(name)));
         text.push_str(&format!(
             r#":{{"dtype":{},"shape":{},"data_offsets":{}}}"#,
-            json(&Value::from(*dtype)),
+            json(&Value::from(dtype)),
             ints(shape),
-            ints(&[at, at + raw.len()]),
+            ints(&[at, at + len]),
         ));
-        at += raw.len();
+        at += len;
     }
     text.push('}');
     while !text.len().is_multiple_of(8) {
@@ -700,9 +730,6 @@ pub fn write(tensors: &[(&str, &str, &[usize], &[u8])]) -> Vec<u8> {
     }
     let mut out = (text.len() as u64).to_le_bytes().to_vec();
     out.extend_from_slice(text.as_bytes());
-    for (_, _, _, raw) in tensors {
-        out.extend_from_slice(raw);
-    }
     out
 }
 

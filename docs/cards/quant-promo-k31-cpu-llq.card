@@ -1,0 +1,15 @@
+# Promo speed row 2/3 (K3.1, CPU, the reference): llama-quantize (mainline 78feec062) at 64 threads over the same K3.1 set, imatrix
+# and rules, a 900 s window, rate from the runner's 120 s progress file. The centre is the measured production attempt of
+# 2026-11-06 22:15-22:27 (/root/k31quant/quantize.progress: experts 3 -> 16 in 600 s = 13 stacks, 46.2 s a stack = 214 Mweights/s,
+# 64 threads, `nice -n 10 ionice -c2 -n7`, trunk tensors inside the window, so a floor of the expert rate), inside
+# docs/cards/k31-quantize.card's 120..260 band. [derived from that file]
+kind: calibration
+question: what weights/s does llama-quantize reach on 64 threads over K3.1's routed-expert stacks to IQ1_S with the real imatrix, on a quiet machine?
+term: Mweights/s of the routed-expert stacks (9.865e9 weights each) between the first and last progress sample of a 900 s window, llama-quantize 78feec062, 64 threads, CUDA_VISIBLE_DEVICES empty, imatrix kimi-k31-c8192x4.imatrix.gguf, rules-IQ1_S.txt, tight map
+unit: Mweights/s
+predict: 190..290
+condition: the window runs under tools/ref/lease-hold.sh with no other CPU-heavy process (the witness blocks and /proc/pressure/io at start and end), at normal priority (the 11-06 attempt ran at nice 10, which is why the band's floor sits under its 214); the first three dense tensors are outside the rate (samples from the first expert); the run is killed by `timeout 900`, its partial output removed by name
+reason: fills the CPU reference row of the promo's speed chart and prices the quantize step of tools/ref/k31-quant.sh (QUANT_RATE_MW x QUANT_EFF_THREADS = 216 Mweights/s derived, 214 seen contended); why now: the promo needs the baseline a leased run backs
+decide-in: use the leased value as the chart's CPU reference and keep QUANT_RATE_MW and QUANT_EFF_THREADS
+decide-below: the 11-06 attempt's nice and ionice were not the cause; check the thread count in the log's first line and SMT placement, and report the chart's ratio with this lower baseline noted
+decide-above: set QUANT_EFF_THREADS to rate / 5.4 and note that the speed ratio of the chart shrinks by the same factor

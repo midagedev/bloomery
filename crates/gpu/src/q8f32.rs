@@ -19,8 +19,8 @@
 //! MXFP8 (`GgmlType::MXFP8`: OCP MX blocks of 32 F8_E4M3 values and one E8M0
 //! scale) is read by the same walk ([`ByteBlocks`]) from two planes fixed at
 //! load ([`e4m3_planes`]): `qs` the value bytes laid out as Q8_0's codes,
-//! and `e` the blocks' scale bytes in row order, four to a u32 word, `k/128`
-//! words per row (so `k` is a multiple of 128). A byte's value is its E4M3
+//! and `e` the blocks' scale bytes in row order, four to a u32 word,
+//! `ceil(k/128)` words per row (`k` a multiple of 32). A byte's value is its E4M3
 //! value and a block's scale `2^(E − 127)`, each exact in f32, so each term
 //! is the reference's product. `mxfp8_gemv` and `mxfp8_gemv_mcol` are
 //! `q8_0_gemv` and `q8_0_gemv_mcol` over those planes, under the same
@@ -87,6 +87,7 @@
 //! rows raises [`FaultSite::TokenId`] and writes its row NaN.
 
 use crate::GpuError;
+use crate::autotune::{Mcol, McolSig, Picks};
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::half_bits_to_f32;
 use crate::gemm::{
@@ -95,7 +96,7 @@ use crate::gemm::{
 };
 use crate::launch_u32;
 use crate::planes::{self, Format};
-use crate::tensor::DeviceTensor;
+use crate::tensor::{DeviceTensor, Window, WindowMut};
 use crate::upload::pack_planes;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::vector::{F32x4, as_vectors};
@@ -104,7 +105,7 @@ use cuda_device::{
 };
 use cuda_host::cuda_module;
 use gguf::quant::GgmlType;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 // --------------------------------------------------------------- cores
 //
@@ -962,6 +963,13 @@ pub(crate) trait ByteBlocks {
 
     /// Block `b`'s scale from the element [`ByteBlocks::scale_at`] loaded.
     fn scale(at: Self::Scale, b: usize) -> f32;
+
+    /// The blocks a row of `k` values takes in the scale plane, the stride
+    /// from a row's first block to the next row's: its `k / 32` blocks.
+    #[inline(always)]
+    fn row_blocks(k: usize) -> usize {
+        k >> 5
+    }
 }
 
 /// Q8_0 in the q8f32 planes (module doc): a byte is a signed code, a block's
@@ -1032,6 +1040,13 @@ impl ByteBlocks for Mxfp8Bytes {
     fn scale(word: u32, b: usize) -> f32 {
         let e = (word >> (8 * (b & 3))) & 0xFF;
         f32::from_bits(if e == 0 { 0x0040_0000 } else { e << 23 })
+    }
+
+    /// A row's whole scale words, four blocks a word ([`E4m3Scales::e_cols`]):
+    /// a row whose blocks end inside a word starts the next row on the next.
+    #[inline(always)]
+    fn row_blocks(k: usize) -> usize {
+        k.div_ceil(128) << 2
     }
 }
 
@@ -1137,7 +1152,8 @@ unsafe fn block_step<F: ByteBlocks>(
     let b = wd + 4 * s;
     // SAFETY: w = 32s + lane < k/4 by this function's contract, so the code
     // word wq + 32s is below row*k/4 + k/4 <= qs.len(), its block b = wd + 4s
-    // = row*k/32 + w/8 below row*k/32 + k/32, whose scales d holds, and quad
+    // = row*F::row_blocks(k) + w/8 below row*F::row_blocks(k) + k/32, whose
+    // scales d holds, and quad
     // w below k/4 = xq.len().
     let (q, at, v) = unsafe {
         (
@@ -1167,7 +1183,7 @@ fn word_dot<F: ByteBlocks>(f: f32, q: u32, d: f32, x: F32x4) -> f32 {
 /// `F` against a single activation column. The weight at value `kk` of `row`
 /// is `v·d`, with `v` the value of the byte in word `qs[row·k/4 + kk/4]`,
 /// byte `kk%4` ([`ByteBlocks::value`]), and `d` the scale of block
-/// `row·k/32 + kk/32` ([`ByteBlocks::scale`]): the values the reference's
+/// `row·F::row_blocks(k) + kk/32` ([`ByteBlocks::scale`]): the values the reference's
 /// dequantizer produces. `x` is read from base `x0`, so a caller can dot
 /// against a slice of a wider buffer without subslicing it. Lane L owns
 /// whole code words — words `L, L + 32, L + 64, …` below `k/4`, word `w`
@@ -1186,7 +1202,7 @@ fn word_dot<F: ByteBlocks>(f: f32, q: u32, d: f32, x: F32x4) -> f32 {
 /// # Safety
 ///
 /// `qs.len() >= (row + 1) * k/4`, `d` holds the scales of blocks below
-/// `(row + 1) * k/32`, `x.len() >= x0 + k`, `k` a positive multiple of 32,
+/// `row * F::row_blocks(k) + k/32`, `x.len() >= x0 + k`, `k` a positive multiple of 32,
 /// `lane < 32`. The body reads `qs`, `d` and `x` unchecked within those
 /// bounds.
 #[inline(always)]
@@ -1205,7 +1221,7 @@ pub(crate) unsafe fn blocks_lane_partial_1col<F: ByteBlocks>(
     // Step 0 of the lane's walk: its word and that word's scale; a step
     // moves both on by 32 words and 4 scales.
     let wq = row * words + lane;
-    let wd = row * (k >> 5) + (lane >> 3);
+    let wd = row * F::row_blocks(k) + (lane >> 3);
     // SAFETY: x0 + k <= x.len() by the caller contract.
     let xr = unsafe { x.get_unchecked(x0..x0 + k) };
     let mut f = 0.0f32;
@@ -1216,7 +1232,7 @@ pub(crate) unsafe fn blocks_lane_partial_1col<F: ByteBlocks>(
         while w < words {
             let b = wd - (lane >> 3) + (w >> 3);
             // SAFETY: w < k/4 by the loop guard, so word row*k/4 + w, its
-            // block row*k/32 + w/8 and values 4w .. 4w + 3 of xr are inside
+            // block row*F::row_blocks(k) + w/8 and values 4w .. 4w + 3 of xr are inside
             // qs, d and xr by the caller contract.
             let (q, at, xv) = unsafe {
                 (
@@ -1336,7 +1352,7 @@ unsafe fn block_code<F: ByteBlocks>(
 /// # Safety
 ///
 /// `qs.len() >= (row + 1) * k/4`, `d` holds the scales of blocks below
-/// `(row + 1) * k/32`, `x.len() >= x0 + (M - 1) * x_col + k`, `k` a positive
+/// `row * F::row_blocks(k) + k/32`, `x.len() >= x0 + (M - 1) * x_col + k`, `k` a positive
 /// multiple of 32, `M` in 1..=8, `lane < 32`. The body reads `qs`, `d` and
 /// `x` unchecked within those bounds.
 #[inline(always)]
@@ -1362,7 +1378,7 @@ pub(crate) unsafe fn blocks_lane_partials_mcol<F: ByteBlocks, const M: usize>(
     let words = k >> 2;
     let steps = k / Q8_STEP;
     let wq = row * words + lane;
-    let wd = row * (k >> 5) + (lane >> 3);
+    let wd = row * F::row_blocks(k) + (lane >> 3);
     let span = (M - 1) * x_col + k;
     // SAFETY: x0 + (M-1)*x_col + k <= x.len() by the caller contract.
     let xr = unsafe { x.get_unchecked(x0..x0 + span) };
@@ -1374,7 +1390,7 @@ pub(crate) unsafe fn blocks_lane_partials_mcol<F: ByteBlocks, const M: usize>(
         let mut w = lane;
         while w < words {
             // SAFETY: w < k/4 by the loop guard: the code word row*k/4 + w
-            // and its block row*k/32 + w/8 are inside qs and d.
+            // and its block row*F::row_blocks(k) + w/8 are inside qs and d.
             let (q, dv) =
                 unsafe { block_code::<F>(qs, d, wq - lane + w, wd - (lane >> 3) + (w >> 3), 0) };
             macro_rules! col_scalar {
@@ -1556,6 +1572,9 @@ pub(crate) const STAGED_COLS: usize = 4;
 /// launch's idle.
 pub(crate) const STAGED_MAX_COLS: usize = 8;
 
+/// The values every row's `k` is a multiple of for [`blocks_gemv_mcol_staged`].
+pub(crate) const STAGED_K: usize = 512;
+
 /// Shared f32 values of [`blocks_gemv_mcol_staged`]'s two stages of `cols`
 /// columns: one step's 128 values of each column a stage.
 const fn staged_shared(cols: usize) -> usize {
@@ -1581,7 +1600,7 @@ const fn staged_shared(cols: usize) -> usize {
 /// Every thread of the 256-wide block calls it converged; `1 <= m <= M <=
 /// 8`, `m` the same in every thread; `sh` is the block's own
 /// `staged_shared(M)` shared values, 16-byte aligned; `qs` holds `n_rows ·
-/// k/4` words and `d` the scales of `n_rows · k/32` blocks; `k` a positive
+/// k/4` words and `d` the scales of `n_rows · F::row_blocks(k)` blocks; `k` a positive
 /// multiple of 512; `x` holds `m · k` values from a 16-byte aligned base;
 /// every `row · y_row + c · y_col` for `row < n_rows`, `c < m` inside `y`, no
 /// two the same.
@@ -1614,7 +1633,7 @@ unsafe fn blocks_gemv_mcol_staged<F: ByteBlocks, const M: usize>(
     // but walks no row.
     let live = row < n_rows as usize;
     let wq = row * (k >> 2) + lane;
-    let wd = row * (k >> 5) + (lane >> 3);
+    let wd = row * F::row_blocks(k) + (lane >> 3);
     // SAFETY: x.len() >= m·k by this fn's contract.
     let xs = unsafe { x.get_unchecked(0..m * k) };
     // The base is 16-byte aligned and m·k a multiple of 4 by this fn's
@@ -2288,8 +2307,11 @@ mod q8f32_kernels {
 
     /// `q8_0_gemv` for an MXFP8 weight in its two planes (module doc): the
     /// same skeleton and lane walk under [`Mxfp8Bytes`], one f32 activation
-    /// column. `k` a multiple of 128 (host-validated, so a row's scales are
-    /// whole `e` words).
+    /// column. `k` a multiple of 32 (host-validated), a row's scales
+    /// `ceil(k / 128)` whole `e` words ([`Mxfp8Bytes::row_blocks`]). Row `r`
+    /// reads `x` from `(r / rows_per_head) · x_head_stride`, the block
+    /// diagonal of `n_heads` groups; one group (`rows_per_head = n_rows`,
+    /// stride 0) is the plain gemv.
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -2297,10 +2319,18 @@ mod q8f32_kernels {
         block = (256, 1, 1),
         requires = (
             4 * qs.len() >= n_rows * k,
-            128 * e.len() >= n_rows * k,
-            x.len() >= k,
+            e.len() >= n_rows * e_cols,
+            128 * e_cols >= k,
+            128 * e_cols <= k + 127,
+            rows_per_head >= 1,
+            n_heads >= 1,
+            x.len() >= (n_heads - 1) * x_head_stride + k,
             y.len() >= n_rows
         )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the flat arguments (rust-quality R8)"
     )]
     pub fn mxfp8_gemv(
         qs: &[u32],
@@ -2308,19 +2338,33 @@ mod q8f32_kernels {
         x: &[f32],
         n_rows: u32,
         k: u32,
+        e_cols: u32,
+        rows_per_head: u32,
+        n_heads: u32,
+        x_head_stride: u32,
         mut y: DisjointSlice<f32>,
     ) {
+        // e_cols only bounds e in the launch contract (ceil(k / 128) words a row).
+        let _ = e_cols;
         let t = thread::index_1d().get() % 256;
         let row = (thread::index_1d().get() / 256) * 8 + t / 32;
         if row >= n_rows as usize {
             return;
         }
+        let h = row / rows_per_head as usize;
+        // The contract cannot bind n_rows to n_heads·rows_per_head (no
+        // division in its grammar); this guard keeps the x window inside x.
+        if h >= n_heads as usize {
+            return;
+        }
         let lane = warp::lane_id() as usize;
+        let x0 = h * x_head_stride as usize;
         // SAFETY: row < n_rows puts the row's words and its blocks' scales
-        // inside qs and e (the contract's 4·qs.len() and 128·e.len() bounds:
-        // block b's scale is in word b/4), and x.len() >= k is the one column
-        // the body reads from x0 = 0.
-        let f = unsafe { blocks_lane_partial_1col::<Mxfp8Bytes>(qs, e, x, k, row, 0, lane) };
+        // inside qs and e (the contract's 4·qs.len() bound, and its e_cols =
+        // ceil(k/128) words a row over n_rows rows: block b's scale is in
+        // word row·e_cols + b/4, `Mxfp8Bytes::row_blocks`), and h < n_heads
+        // puts the window x0 = h·x_head_stride .. x0 + k inside x.
+        let f = unsafe { blocks_lane_partial_1col::<Mxfp8Bytes>(qs, e, x, k, row, x0, lane) };
         let s = warp::reduce_sum_f32(f);
         if lane == 0 {
             // SAFETY: row < n_rows <= y.len() by the launch contract, and only
@@ -2331,7 +2375,7 @@ mod q8f32_kernels {
 
     /// `q8_0_gemv_mcol` for an MXFP8 weight in its two planes: column c of
     /// `y` is bit for bit `mxfp8_gemv`'s `m = 1` output on column c, row r's
-    /// column c at `y[c*n_rows+r]`. `k` a multiple of 128.
+    /// column c at `y[c*n_rows+r]`. `k` a multiple of 32.
     #[kernel]
     #[launch_bounds(256)]
     #[launch_contract(
@@ -2339,7 +2383,9 @@ mod q8f32_kernels {
         block = (256, 1, 1),
         requires = (
             4 * qs.len() >= n_rows * k,
-            128 * e.len() >= n_rows * k,
+            e.len() >= n_rows * e_cols,
+            128 * e_cols >= k,
+            128 * e_cols <= k + 127,
             x.len() >= m_cols * k,
             y.len() >= n_rows * m_cols
         )
@@ -2354,19 +2400,23 @@ mod q8f32_kernels {
         x: &[f32],
         n_rows: u32,
         k: u32,
+        e_cols: u32,
         m_cols: u32,
         y_row: u32,
         y_col: u32,
         mut y: DisjointSlice<f32>,
     ) {
+        // e_cols only bounds e in the launch contract (ceil(k / 128) words a row).
+        let _ = e_cols;
         let t = thread::index_1d().get() % 256;
         let row = (thread::index_1d().get() / 256) * 8 + t / 32;
         if row >= n_rows as usize {
             return;
         }
         let lane = warp::lane_id() as usize;
-        // SAFETY: row < n_rows puts this row's words and scales inside
-        // qs and e; x.len() >= m_cols*k covers every input column.
+        // SAFETY: row < n_rows puts this row's words and scales inside qs
+        // and e (the contract's e_cols = ceil(k/128) scale words a row);
+        // x.len() >= m_cols*k covers every input column.
         let Some(f) = (unsafe {
             blocks_lane_partials_m::<Mxfp8Bytes>(qs, e, x, k, row, 0, k as usize, m_cols, lane)
         }) else {
@@ -2400,7 +2450,9 @@ mod q8f32_kernels {
         block = (256, 1, 1),
         requires = (
             4 * qs.len() >= n_rows * k,
-            128 * e.len() >= n_rows * k,
+            e.len() >= n_rows * e_cols,
+            128 * e_cols >= k,
+            128 * e_cols <= k + 127,
             x.len() >= 4 * k,
             y.len() >= n_rows * 4
         )
@@ -2415,10 +2467,13 @@ mod q8f32_kernels {
         x: &[f32],
         n_rows: u32,
         k: u32,
+        e_cols: u32,
         y_row: u32,
         y_col: u32,
         mut y: DisjointSlice<f32>,
     ) {
+        // e_cols only bounds e in the launch contract (ceil(k / 128) words a row).
+        let _ = e_cols;
         static mut STAGE: SharedArray<f32, { staged_shared(STAGED_COLS) }, 16> =
             SharedArray::UNINIT;
         // SAFETY: STAGE is this block's own shared allocation of
@@ -2457,7 +2512,9 @@ mod q8f32_kernels {
         block = (256, 1, 1),
         requires = (
             4 * qs.len() >= n_rows * k,
-            128 * e.len() >= n_rows * k,
+            e.len() >= n_rows * e_cols,
+            128 * e_cols >= k,
+            128 * e_cols <= k + 127,
             m > 4,
             m <= 8,
             x.len() >= m * k,
@@ -2474,11 +2531,14 @@ mod q8f32_kernels {
         x: &[f32],
         n_rows: u32,
         k: u32,
+        e_cols: u32,
         m: u32,
         y_row: u32,
         y_col: u32,
         mut y: DisjointSlice<f32>,
     ) {
+        // e_cols only bounds e in the launch contract (ceil(k / 128) words a row).
+        let _ = e_cols;
         static mut STAGE: SharedArray<f32, { staged_shared(STAGED_MAX_COLS) }, 16> =
             SharedArray::UNINIT;
         // SAFETY: STAGE is this block's own shared allocation of
@@ -3009,7 +3069,9 @@ mod q8f32_kernels {
         block = (256, 1, 1),
         requires = (
             4 * qs.len() >= n_matrix * k,
-            128 * e.len() >= n_matrix * k,
+            e.len() >= n_matrix * e_cols,
+            128 * e_cols >= k,
+            128 * e_cols <= k + 127,
             ids.len() >= n_rows,
             x.len() >= m_cols * k,
             y.len() >= n_rows * m_cols
@@ -3027,11 +3089,15 @@ mod q8f32_kernels {
         n_rows: u32,
         n_matrix: u32,
         k: u32,
+        e_cols: u32,
         m_cols: u32,
         fault: FaultSink,
         y: DisjointSlice<f32>,
     ) {
-        // SAFETY: the launch contract bounds each buffer; the host checks k and m.
+        // e_cols only bounds e in the launch contract (ceil(k / 128) words a row).
+        let _ = e_cols;
+        // SAFETY: the launch contract bounds each buffer, e at e_cols =
+        // ceil(k/128) words a matrix row; the host checks k and m.
         unsafe {
             blocks_gemv_ids::<Mxfp8Bytes>(
                 (qs, e),
@@ -3052,6 +3118,9 @@ mod q8f32_kernels {
 pub struct Q8F32Kernels {
     module: q8f32_kernels::LoadedModule,
     pub(crate) dense_mma: bool,
+    /// The card's load-time picks ([`crate::autotune`]), installed once;
+    /// unset, every launch takes today's rule.
+    picks: OnceLock<Picks>,
 }
 
 impl Q8F32Kernels {
@@ -3063,6 +3132,15 @@ impl Q8F32Kernels {
         Ok(Q8F32Kernels {
             module,
             dense_mma: crate::dense_mma(ctx)?,
+            picks: OnceLock::new(),
+        })
+    }
+
+    /// Install `picks` for every later launch: once, before any capture
+    /// reads them; a second install is refused by name.
+    pub(crate) fn install(&self, picks: Picks) -> Result<(), GpuError> {
+        self.picks.set(picks).map_err(|_| {
+            GpuError::protocol("Q8F32Kernels::install", "the card holds picks already")
         })
     }
 
@@ -3391,6 +3469,7 @@ impl Q8F32Kernels {
             rows,
             launch_u32(what, "n_matrix", n_matrix)?,
             launch_u32(what, "k", k)?,
+            launch_u32(what, "e_cols", e.cols())?,
             launch_u32(what, "m", m)?,
             fault,
             y,
@@ -3406,20 +3485,45 @@ impl Q8F32Kernels {
     /// `m = 1` launch of column c bit for bit; an MXFP8 weight at `m >=`
     /// [`STAGED_COLS`] with `k` a multiple of 512 and `x` from a 16-byte
     /// aligned base runs `mxfp8_gemv_mcol_staged` (`m =` [`STAGED_COLS`]) or
-    /// `mxfp8_gemv_mcol_staged_wide`, the same bits. `k` must be
-    /// a multiple of 128 and `e` `k / 128` words a row over the same rows;
-    /// another geometry is a named error. Asynchronous, allocation-free, capturable.
+    /// `mxfp8_gemv_mcol_staged_wide`, the same bits, unless the card's
+    /// picks name another way for the weight's rows, `k` and `m`
+    /// ([`crate::autotune::Mcol`], the same bits). `k` must be
+    /// a multiple of the format's block (MXFP8 32, FP8_B128 128) and `e`
+    /// `ceil(k / 128)` words a row over the same rows
+    /// ([`E4m3Weight::dimensions`]); another geometry is a named error. Asynchronous, allocation-free, capturable.
     pub fn enqueue_e4m3_gemv(
         &self,
         stream: &CudaStream,
         a: E4m3GemvArgs<'_>,
     ) -> Result<(), GpuError> {
+        self.e4m3_gemv(stream, a, None)
+    }
+
+    /// [`Self::enqueue_e4m3_gemv`] by `way` whatever the card picked: what
+    /// the picker times. A launch the staged entries cannot take (an
+    /// FP8_B128 weight, `k` no multiple of 512, `x` off 16 bytes) runs
+    /// the rule's entry under every way.
+    pub fn enqueue_e4m3_gemv_way(
+        &self,
+        stream: &CudaStream,
+        a: E4m3GemvArgs<'_>,
+        way: Mcol,
+    ) -> Result<(), GpuError> {
+        self.e4m3_gemv(stream, a, Some(way))
+    }
+
+    fn e4m3_gemv(
+        &self,
+        stream: &CudaStream,
+        a: E4m3GemvArgs<'_>,
+        way: Option<Mcol>,
+    ) -> Result<(), GpuError> {
         let E4m3GemvArgs { w, x, m, out, y } = a;
         let what = "enqueue_e4m3_gemv";
-        let (n_rows, k) = w.dimensions(what)?;
-        check_gemv_geometry(what, n_rows, k, x.len(), m, y.len())?;
-        let n_rows = launch_u32(what, "n_rows", n_rows)?;
-        let k = launch_u32(what, "k", k)?;
+        let (rows, k_len) = w.dimensions(what)?;
+        check_gemv_geometry(what, rows, k_len, x.len(), m, y.len())?;
+        let n_rows = launch_u32(what, "n_rows", rows)?;
+        let k = launch_u32(what, "k", k_len)?;
         let cfg = LaunchConfig1D::new(n_rows.div_ceil(8), 256, 0);
         let (qs, e) = (w.qs.buf(), w.e.buf());
         let module = &self.module;
@@ -3427,7 +3531,9 @@ impl Q8F32Kernels {
             match w.scales {
                 E4m3Scales::Mxfp8 => {
                     let prep = module.prepare_mxfp8_gemv(cfg)?;
-                    module.mxfp8_gemv(stream, &prep, qs, e, x, n_rows, k, y)?;
+                    let e_cols = launch_u32(what, "e_cols", w.e.cols())?;
+                    module
+                        .mxfp8_gemv(stream, &prep, qs, e, x, n_rows, k, e_cols, n_rows, 1, 0, y)?;
                 }
                 E4m3Scales::Fp8B128 => {
                     let prep = module.prepare_fp8_b128_gemv(cfg)?;
@@ -3436,27 +3542,52 @@ impl Q8F32Kernels {
             }
             return Ok(());
         }
+        let cols = m;
         let m = launch_u32(what, "m", m)?;
         let (y_row, y_col) = match out {
             GemvOut::RowMajor => (m, 1),
             GemvOut::TokenMajor => (1, n_rows),
         };
-        let staged = k.is_multiple_of(512) && x.cu_deviceptr().is_multiple_of(16);
+        let staged = k_len.is_multiple_of(STAGED_K) && x.cu_deviceptr().is_multiple_of(16);
         match w.scales {
-            E4m3Scales::Mxfp8 if staged && m as usize == STAGED_COLS => {
-                let prep = module.prepare_mxfp8_gemv_mcol_staged(cfg)?;
-                module
-                    .mxfp8_gemv_mcol_staged(stream, &prep, qs, e, x, n_rows, k, y_row, y_col, y)?;
-            }
-            E4m3Scales::Mxfp8 if staged && m as usize > STAGED_COLS => {
-                let prep = module.prepare_mxfp8_gemv_mcol_staged_wide(cfg)?;
-                module.mxfp8_gemv_mcol_staged_wide(
-                    stream, &prep, qs, e, x, n_rows, k, m, y_row, y_col, y,
-                )?;
-            }
             E4m3Scales::Mxfp8 => {
-                let prep = module.prepare_mxfp8_gemv_mcol(cfg)?;
-                module.mxfp8_gemv_mcol(stream, &prep, qs, e, x, n_rows, k, m, y_row, y_col, y)?;
+                let l = Mxfp8Cols {
+                    qs,
+                    e,
+                    n_rows,
+                    k,
+                    e_cols: launch_u32(what, "e_cols", w.e.cols())?,
+                    y_strides: (y_row, y_col),
+                    cfg,
+                };
+                let sig = McolSig {
+                    rows,
+                    k: k_len,
+                    m: cols,
+                };
+                let way =
+                    way.unwrap_or_else(|| self.picks.get().map_or(Mcol::Rule, |p| p.mcol(sig)));
+                match way {
+                    Mcol::Split if staged && cols > STAGED_COLS => {
+                        self.mxfp8_cols(stream, &l, x, (STAGED_COLS, true), y)?;
+                        let rest = cols - STAGED_COLS;
+                        let x_rest = Window::<f32>::of(
+                            x,
+                            size_of::<f32>() * STAGED_COLS * sig.k,
+                            rest * sig.k,
+                        )?;
+                        let at = match out {
+                            GemvOut::RowMajor => STAGED_COLS,
+                            GemvOut::TokenMajor => STAGED_COLS * sig.rows,
+                        };
+                        let mut y_rest =
+                            WindowMut::<f32>::of_mut(y, size_of::<f32>() * at, y.len() - at)?;
+                        let rest_staged = rest == STAGED_COLS;
+                        self.mxfp8_cols(stream, &l, &x_rest, (rest, rest_staged), &mut y_rest)?;
+                    }
+                    Mcol::Plain => self.mxfp8_cols(stream, &l, x, (cols, false), y)?,
+                    _ => self.mxfp8_cols(stream, &l, x, (cols, staged), y)?,
+                }
             }
             E4m3Scales::Fp8B128 => {
                 let prep = module.prepare_fp8_b128_gemv_mcol(cfg)?;
@@ -3464,6 +3595,110 @@ impl Q8F32Kernels {
                     .fp8_b128_gemv_mcol(stream, &prep, qs, e, x, n_rows, k, m, y_row, y_col, y)?;
             }
         }
+        Ok(())
+    }
+
+    /// `n` columns of `l`'s weight from `x` into `y` at `l`'s strides: the
+    /// staged entry at [`STAGED_COLS`] and the wide stage past it when
+    /// `staged`, else `_mcol`.
+    fn mxfp8_cols(
+        &self,
+        stream: &CudaStream,
+        l: &Mxfp8Cols<'_>,
+        x: &DeviceBuffer<f32>,
+        (n, staged): (usize, bool),
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let Mxfp8Cols {
+            qs,
+            e,
+            n_rows,
+            k,
+            e_cols,
+            y_strides: (y_row, y_col),
+            cfg,
+        } = *l;
+        let module = &self.module;
+        let m = launch_u32("enqueue_e4m3_gemv", "m", n)?;
+        if staged && n == STAGED_COLS {
+            let prep = module.prepare_mxfp8_gemv_mcol_staged(cfg)?;
+            module.mxfp8_gemv_mcol_staged(
+                stream, &prep, qs, e, x, n_rows, k, e_cols, y_row, y_col, y,
+            )?;
+        } else if staged && n > STAGED_COLS {
+            let prep = module.prepare_mxfp8_gemv_mcol_staged_wide(cfg)?;
+            module.mxfp8_gemv_mcol_staged_wide(
+                stream, &prep, qs, e, x, n_rows, k, e_cols, m, y_row, y_col, y,
+            )?;
+        } else {
+            let prep = module.prepare_mxfp8_gemv_mcol(cfg)?;
+            module.mxfp8_gemv_mcol(
+                stream, &prep, qs, e, x, n_rows, k, e_cols, m, y_row, y_col, y,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Enqueue the block diagonal of MXFP8 weight `w` at one f32 input: row
+    /// `r` against the weight's `k` values of `x` from `(r / rows_per_head) ·
+    /// x_head_stride`, the `w.rows() / rows_per_head` groups covering every
+    /// row, one f32 a row in `y`. Each is `mxfp8_gemv`'s row on that window,
+    /// bit for bit. Another scale format, rows that are not whole groups or
+    /// short buffers are named errors. Asynchronous, allocation-free,
+    /// capturable.
+    pub fn enqueue_mxfp8_gemv_heads(
+        &self,
+        stream: &CudaStream,
+        w: E4m3Weight<'_>,
+        x: &DeviceBuffer<f32>,
+        (rows_per_head, x_head_stride): (usize, usize),
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_mxfp8_gemv_heads";
+        if w.scales != E4m3Scales::Mxfp8 {
+            return Err(GpuError::shape(
+                what,
+                "the block diagonal reads MXFP8 planes",
+            ));
+        }
+        let (n_rows, k) = w.dimensions(what)?;
+        if rows_per_head == 0 || !n_rows.is_multiple_of(rows_per_head) {
+            return Err(GpuError::shape(
+                what,
+                format!("{n_rows} rows are not whole groups of {rows_per_head}"),
+            ));
+        }
+        let n_heads = n_rows / rows_per_head;
+        let need_x = (n_heads - 1)
+            .checked_mul(x_head_stride)
+            .and_then(|v| v.checked_add(k));
+        if need_x.is_none_or(|n| x.len() < n) || y.len() < n_rows {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "{n_heads} groups of {rows_per_head} rows of {k} values at stride \
+                     {x_head_stride}: x.len() {} or y.len() {} is short",
+                    x.len(),
+                    y.len()
+                ),
+            ));
+        }
+        let cfg = LaunchConfig1D::new(launch_u32(what, "n_rows", n_rows)?.div_ceil(8), 256, 0);
+        let prep = self.module.prepare_mxfp8_gemv(cfg)?;
+        self.module.mxfp8_gemv(
+            stream,
+            &prep,
+            w.qs.buf(),
+            w.e.buf(),
+            x,
+            launch_u32(what, "n_rows", n_rows)?,
+            launch_u32(what, "k", k)?,
+            launch_u32(what, "e_cols", w.e.cols())?,
+            launch_u32(what, "rows_per_head", rows_per_head)?,
+            launch_u32(what, "n_heads", n_heads)?,
+            launch_u32(what, "x_head_stride", x_head_stride)?,
+            y,
+        )?;
         Ok(())
     }
 
@@ -3967,11 +4202,28 @@ impl E4m3Scales {
             E4m3Scales::Fp8B128 => GgmlType::FP8_B128,
         }
     }
+
+    /// The file's record, whose block a row holds whole: MXFP8's 32 values,
+    /// FP8_B128's 128.
+    pub(crate) fn planes(self) -> Format {
+        match self {
+            E4m3Scales::Mxfp8 => Format::Mxfp8,
+            E4m3Scales::Fp8B128 => Format::Fp8B128,
+        }
+    }
+
+    /// The `e` plane's words a row of `k` values (a whole number of the
+    /// format's blocks) in either format: `ceil(k / 128)`, MXFP8's last word
+    /// holding the blocks of a row's tail and zero past them.
+    #[must_use]
+    pub fn e_cols(k: usize) -> usize {
+        k.div_ceil(128)
+    }
 }
 
 /// An E4M3 weight resident in its two planes ([`e4m3_planes`]): `qs` rows
-/// × `k / 4` words of value bytes, `e` rows × `k / 128` words of the block
-/// scales `scales` names.
+/// × `k / 4` words of value bytes, `e` rows × `ceil(k / 128)` words of the
+/// block scales `scales` names ([`E4m3Scales::e_cols`]).
 #[derive(Clone, Copy)]
 pub struct E4m3Weight<'a> {
     pub qs: &'a DeviceTensor<u32>,
@@ -3980,7 +4232,9 @@ pub struct E4m3Weight<'a> {
 }
 
 impl E4m3Weight<'_> {
-    /// Check plane alignment and matching shapes; return rows and k.
+    /// Check plane alignment and matching shapes; return rows and k: `k` a
+    /// positive multiple of the format's block (MXFP8 32, FP8_B128 128) and
+    /// `e` [`E4m3Scales::e_cols`] words a row.
     pub(crate) fn dimensions(self, what: &'static str) -> Result<(usize, usize), GpuError> {
         let rows = self.qs.rows();
         let k = self.qs.cols().checked_mul(4).ok_or_else(|| {
@@ -3989,17 +4243,18 @@ impl E4m3Weight<'_> {
                 format!("E4M3 planes: 4 * {} words overflows k", self.qs.cols()),
             )
         })?;
+        // An E4M3 record's code bytes are its values, one byte each.
+        let (block, e_cols) = (self.scales.planes().code_bytes(), E4m3Scales::e_cols(k));
         if rows == 0
             || k == 0
-            || !k.is_multiple_of(128)
+            || !k.is_multiple_of(block)
             || self.e.rows() != rows
-            || self.e.cols() != k / 128
+            || self.e.cols() != e_cols
         {
             return Err(GpuError::shape(
                 what,
                 format!(
-                    "E4M3 planes: rows={rows} must be positive, k={k} a positive multiple of 128 and e {rows}x{}; got {}x{}",
-                    k / 128,
+                    "E4M3 planes: rows={rows} must be positive, k={k} a positive multiple of {block} and e {rows}x{e_cols}; got {}x{}",
                     self.e.rows(),
                     self.e.cols()
                 ),
@@ -4007,6 +4262,32 @@ impl E4m3Weight<'_> {
         }
         Ok((rows, k))
     }
+
+    /// [`E4m3Weight::dimensions`] for an entry that walks whole 128-value
+    /// records (the wide tiles): a `k` off 128 is refused by name.
+    pub(crate) fn records(self, what: &'static str) -> Result<(usize, usize), GpuError> {
+        let (rows, k) = self.dimensions(what)?;
+        if !k.is_multiple_of(128) {
+            return Err(GpuError::shape(
+                what,
+                format!("E4M3 planes of k={k}: this entry reads whole 128-value records"),
+            ));
+        }
+        Ok((rows, k))
+    }
+}
+
+/// An MXFP8 m-column launch's fixed parts: the planes, the geometry, row
+/// r's column c at `y[r·y_strides.0 + c·y_strides.1]`, and the grid.
+#[derive(Clone, Copy)]
+struct Mxfp8Cols<'a> {
+    qs: &'a DeviceBuffer<u32>,
+    e: &'a DeviceBuffer<u32>,
+    n_rows: u32,
+    k: u32,
+    e_cols: u32,
+    y_strides: (u32, u32),
+    cfg: LaunchConfig1D,
 }
 
 /// [`Q8F32Kernels::enqueue_e4m3_gemv`]'s arguments: the weight, `m`
@@ -4022,11 +4303,12 @@ pub struct E4m3GemvArgs<'a> {
 /// The two planes of `rows` rows of `k` values of an E4M3 file type
 /// (`scales.ggml()`, `bytes` exactly the rows'): `qs` the value bytes in row
 /// order as little-endian words, `k / 4` a row, and `e` one word a 128
-/// values, `k / 128` a row: MXFP8's four scale bytes of those values in
-/// block order, or FP8_B128's block scale. Either type's 128 values are 132
-/// file bytes. `k` must be a positive multiple of 128; a block the type's
-/// check refuses (`gguf::quant::check_mxfp8`, `check_fp8_b128`) is refused
-/// by name with its row.
+/// values, `ceil(k / 128)` a row: MXFP8's four scale bytes of those values
+/// in block order (a row's last word zero past its blocks), or FP8_B128's
+/// block scale. Either type's 128 values are 132 file bytes. `k` must be a
+/// positive multiple of the type's block (MXFP8 32, FP8_B128 128); a block
+/// the type's check refuses (`gguf::quant::check_mxfp8`, `check_fp8_b128`) is
+/// refused by name with its row.
 pub fn e4m3_planes(
     scales: E4m3Scales,
     bytes: &[u8],
@@ -4034,15 +4316,17 @@ pub fn e4m3_planes(
     k: usize,
 ) -> Result<(Vec<u32>, Vec<u32>), GpuError> {
     let what = "q8f32::e4m3_planes";
-    let ty = scales.ggml();
-    if rows == 0 || k == 0 || !k.is_multiple_of(128) {
+    let (ty, format) = (scales.ggml(), scales.planes());
+    // An E4M3 record's code bytes are its values, one byte each.
+    let block = format.code_bytes();
+    if rows == 0 || k == 0 || !k.is_multiple_of(block) {
         return Err(GpuError::shape(
             what,
-            format!("rows {rows} must be positive and k {k} a positive multiple of 128"),
+            format!("rows {rows} must be positive and k {k} a positive multiple of {block}"),
         ));
     }
-    let row_bytes = (k / 128)
-        .checked_mul(132)
+    let row_bytes = (k / block)
+        .checked_mul(format.record_bytes())
         .ok_or_else(|| GpuError::shape(what, format!("{ty} row byte count overflows")))?;
     let Some(want) = rows.checked_mul(row_bytes) else {
         return Err(GpuError::shape(
@@ -4059,11 +4343,7 @@ pub fn e4m3_planes(
             ),
         ));
     }
-    let format = match scales {
-        E4m3Scales::Mxfp8 => Format::Mxfp8,
-        E4m3Scales::Fp8B128 => Format::Fp8B128,
-    };
-    planes::split_vecs(what, format, k / 128, rows, bytes)
+    planes::split_vecs(what, format, k / block, rows, bytes)
 }
 
 /// [`Q8F32Kernels::enqueue_q8_0_gemv_heads_mcol`]'s arguments. The strides
@@ -4170,21 +4450,23 @@ pub(crate) fn bf16_mxfp8_planes(
     let count = rows
         .checked_mul(k)
         .ok_or_else(|| GpuError::shape(WHAT, "value count passes usize"))?;
-    if rows == 0 || k == 0 || !k.is_multiple_of(128) || count.checked_mul(2) != Some(src.len()) {
+    if rows == 0 || k == 0 || !k.is_multiple_of(32) || count.checked_mul(2) != Some(src.len()) {
         return Err(GpuError::shape(
             WHAT,
             format!("{rows} rows of {k} do not match {} BF16 bytes", src.len()),
         ));
     }
-    let row_blocks = k / 32;
+    let (row_blocks, e_cols) = (k / 32, E4m3Scales::e_cols(k));
     pack_planes(
         WHAT,
         src,
         (rows, 2 * k),
-        [k / 4, k / 128],
+        [k / 4, e_cols],
         |first, src, qs, scales| {
             for (local, bytes) in src.as_chunks::<64>().0.iter().enumerate() {
                 let block = first * row_blocks + local;
+                // The block's scale byte: byte b % 4 of word b / 4 of its row's words.
+                let (row, b) = (local / row_blocks, local % row_blocks);
                 let values: [f32; 32] = std::array::from_fn(|i| {
                     f32::from_bits(
                         u32::from(u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]])) << 16,
@@ -4195,7 +4477,7 @@ pub(crate) fn bf16_mxfp8_planes(
                 }
                 let amax = values.iter().fold(f32::MIN_POSITIVE, |a, v| a.max(v.abs()));
                 let exponent = ((amax / 448.0).log2().ceil() as i32).clamp(-127, 127);
-                scales[local / 4] |= ((exponent + 127) as u32) << (8 * (local % 4));
+                scales[row * e_cols + b / 4] |= ((exponent + 127) as u32) << (8 * (b % 4));
                 let scale = 2.0f32.powi(exponent);
                 let inverse = 2.0f32.powi(-exponent);
                 for (i, value) in values.into_iter().enumerate() {
@@ -4236,10 +4518,12 @@ mod tests {
 
     #[test]
     fn bf16_head_encoding_refuses_bad_shapes_and_non_finite_values() {
+        // PIN(2026-11-03): a row of 32 values is a whole MXFP8 block now (`ceil(k / 128)` scale
+        // words a row); the refused width off the block is 48, where it was 32.
         for (rows, k, len) in [
             (0, 128, 0),
             (1, 0, 0),
-            (1, 32, 64),
+            (1, 48, 96),
             (1, 128, 255),
             (usize::MAX, 128, 0),
         ] {
@@ -4264,7 +4548,21 @@ mod tests {
         assert_eq!(scales[0], 247);
         let (codes, scales) = bf16_mxfp8_planes(&[0; 256], 1, 128).unwrap();
         assert_eq!(codes, vec![0; 32]);
-        assert_eq!(scales, [0]);
+        assert_eq!(scales, [0]); // Two rows of 576 values (18 blocks, five scale words a row): block g's
+        // amax 448·2^(g − 20) gives scale byte 107 + g at byte b % 4 of word
+        // 5r + b / 4, and the last word's two bytes past a row's blocks stay 0.
+        let (rows, k) = (2, 576);
+        let mut bytes = vec![0u8; 2 * rows * k];
+        for g in 0..rows * k / 32 {
+            let amax = 448.0f32 * 2.0f32.powi(g as i32 - 20);
+            bytes[64 * g..][..2].copy_from_slice(&((amax.to_bits() >> 16) as u16).to_le_bytes());
+        }
+        let (_, scales) = bf16_mxfp8_planes(&bytes, rows, k).unwrap();
+        let mut want = vec![0u32; rows * 5];
+        for (r, b) in (0..rows).flat_map(|r| (0..18).map(move |b| (r, b))) {
+            want[5 * r + b / 4] |= (107 + 18 * r as u32 + b as u32) << (8 * (b % 4));
+        }
+        assert_eq!(scales, want);
     }
 
     #[test]

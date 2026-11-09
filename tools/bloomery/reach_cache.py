@@ -1,32 +1,39 @@
-"""Private JSON snapshots of recipes.Reach's structural graph (never per-recipe reach decisions).
+"""The reach's per-file facts, kept by content, and the snapshot guard of a key run.
 
-The source corpus is content-addressed independently of git, and observed Tree reads/probes are validated
-again before publication and key output. Hydration accepts only the fixed Reach schema below; no code objects,
-pickle, dynamic imports or arbitrary object construction enter the cache protocol.
+`Reach.facts` parses a file once per (text, cfg(test)) and that parse is a pure function of those two and of the
+analysis code, so its result is stored under the digest of exactly that: the entry is shared by every tree, and a tree
+whose files changed pays the parse of those files only. An entry is hydrated only through the fixed schema below (no
+code objects, pickle, dynamic imports or arbitrary object construction) and is checked against its own key and
+payload digest; a damaged entry is named on stderr and recomputed. The store is bounded: `prune` removes the
+least-recently-used entries (by mtime, refreshed on a hit older than an hour) once the directory holds more than
+CAP_BYTES, down to KEEP_BYTES, at the exit of a process that stored something.
+
+`prepare` runs the structural walk of a key request under observation and `current` re-checks it, so source that moves
+while a key is assembled is refused rather than keyed.
 """
 from __future__ import annotations
 
-import dataclasses
+import atexit
 import contextlib
-import hashlib
+import dataclasses
 import functools
+import hashlib
 import json
 import os
 import stat
 import sys
 import tempfile
 import time
-import types
-import typing
 
 _REACH_LOADED_CODE = sys._getframe().f_code
 
-VERSION = 2
-STATE = ("idents", "lib_root", "lib_roots", "_mods", "_bases", "_macros", "_exported", "_text",
-         "_traits", "ids", "nodes", "adj", "file_root", "builds", "_rules", "_own_rules",
-         "_dispatch", "_rows_nodes", "_enum_nodes", "_family_dirs", "_facts")
-_SCALARS = (str, int, bool)
-_CONTAINERS = {"list": list, "tuple": tuple, "set": set, "frozenset": frozenset}
+VERSION = 3
+CAP_BYTES = 1 << 30
+KEEP_BYTES = CAP_BYTES * 3 // 4
+TOUCH_AFTER = 3600
+STATS = {"hits": 0, "live": 0, "misses": 0, "stores": 0, "corrupt": 0, "evicted": 0, "off": 0}
+_LIVE: dict[tuple[str, bool], object] = {}
+_BODIES: dict[str, object] = {}
 
 
 def _digest(data):
@@ -206,248 +213,283 @@ def current(reach):
         return False
 
 
-def _encode(value):
-    if value is None or type(value) in _SCALARS:
-        return value
-    if isinstance(value, (list, tuple, set, frozenset)):
-        return [type(value).__name__, [v if v is None or type(v) in _SCALARS else _encode(v) for v in value]]
-    if isinstance(value, dict):
-        return ["dict", [[k if k is None or type(k) in _SCALARS else _encode(k),
-                          v if v is None or type(v) in _SCALARS else _encode(v)] for k, v in value.items()]]
-    name = type(value).__name__
-    if name == "RustFacts":
-        return [name, _encode([list(value.units[:value.uses]), list(value.binds), value.exported])]
-    if name == "RuleSet":
-        return [name, _encode(value.rules)]
-    if name in ("Unit", "ImplHead", "Dispatch"):
-        return [name, {f: v if (v := getattr(value, f)) is None or type(v) in _SCALARS else _encode(v)
-                       for f in _record_types(type(value))}]
-    raise ValueError("unsupported Reach field " + name)
+# ---- the facts store ----
+
+_STR = frozenset({str})
+_UNIT_FIELDS = ("kind", "ctx", "name", "line", "sites", "idents", "macro_calls", "includes", "literals", "impl",
+                "names", "methods", "test")
+_HEAD_FIELDS = ("params", "self_head", "self_args", "trait", "trait_args", "text")
+_SCHEMA_OK: set[int] = set()
+_PRUNE_ARMED = []
 
 
-def _decode(value, module):
-    if value is None or type(value) in _SCALARS:
-        return value
-    if not isinstance(value, list) or len(value) != 2 or not isinstance(value[0], str):
-        raise ValueError("invalid Reach value")
-    name, body = value
-    if name in _CONTAINERS:
-        if not isinstance(body, list):
-            raise ValueError("invalid Reach container")
-        return _CONTAINERS[name](v if v is None or type(v) in _SCALARS else _decode(v, module) for v in body)
-    if name == "dict":
-        if not isinstance(body, list):
-            raise ValueError("invalid Reach map")
-        out = {}
-        for row in body:
-            if not isinstance(row, list) or len(row) != 2:
-                raise ValueError("invalid Reach map entry")
-            key, val = (_decode(v, module) for v in row)
-            if key in out:
-                raise ValueError("duplicate Reach map entry")
-            out[key] = val
-        return out
-    if name == "RustFacts":
-        args = _decode(body, module)
-        if not isinstance(args, list) or len(args) != 3:
-            raise ValueError("invalid Rust facts")
-        return module.RustFacts(*args)
-    if name == "RuleSet":
-        return module.RuleSet(_decode(body, module))
-    if name in ("Unit", "ImplHead", "Dispatch"):
-        cls = getattr(module, name)
-        if not isinstance(body, dict) or set(body) != {f.name for f in dataclasses.fields(cls)}:
-            raise ValueError("invalid Reach record schema")
-        return cls(**{k: _decode(v, module) for k, v in body.items()})
-    raise ValueError("foreign Reach record")
+def store_dir():
+    return os.path.join(os.path.expanduser("~"), ".cache", "bloomery", "reach-facts")
 
 
-@functools.cache
-def _record_types(cls):
-    return typing.get_type_hints(cls)
+def _check_schema(module):
+    """The codec is written against these fields; a record that grew one fails here, by name, not as a stale entry."""
+    if id(module) in _SCHEMA_OK:
+        return
+    for cls, names in ((module.Unit, _UNIT_FIELDS), (module.ImplHead, _HEAD_FIELDS)):
+        if tuple(f.name for f in dataclasses.fields(cls)) != names:
+            raise module.RecipeError(f"reach_cache: {cls.__name__} fields changed; update the facts codec ({names})")
+    _SCHEMA_OK.add(id(module))
 
 
-@functools.cache
-def _typed(annotation):
-    """Compile the fixed schema once; every value still gets strict container/record checks."""
-    origin, args = typing.get_origin(annotation), typing.get_args(annotation)
-    if origin in (typing.Union, types.UnionType):
-        checks = tuple(_typed(a) for a in args)
-        return lambda value: any(check(value) for check in checks)
-    if origin in (list, set, frozenset) or (origin is tuple and len(args) == 2 and args[1] is Ellipsis):
-        element = args[0]
-        if element in _SCALARS:
-            return lambda value: type(value) is origin and all(type(v) is element for v in value)
-        check = _typed(element)
-        return lambda value: type(value) is origin and all(check(v) for v in value)
-    if origin is dict:
-        key, item = (_typed(a) for a in args)
-        return lambda value: type(value) is dict and all(key(k) and item(v) for k, v in value.items())
-    if origin is tuple:
-        checks = tuple(_typed(a) for a in args)
-        return lambda value: (type(value) is tuple and len(value) == len(checks)
-                              and all(check(v) for v, check in zip(value, checks)))
-    if dataclasses.is_dataclass(annotation):
-        fields = tuple((k, _typed(a)) for k, a in _record_types(annotation).items())
-        return lambda value: type(value) is annotation and all(check(getattr(value, k)) for k, check in fields)
-    return lambda value: type(value) is annotation
+def _facts_code(reach):
+    """The digest of the analysis code that parses (recipes.py and this file by their bytes, never their paths, so
+    trees with equal code share entries), or None when the code on disk is not the code running: the store is then
+    off for this process, and `prepare` refuses the run by name."""
+    code = reach.__dict__.get("_facts_code")
+    if code is None:
+        module = sys.modules[type(reach).__module__]
+        try:
+            parts = [_code_identity(module, module.RecipeError)[1], _code_identity(sys.modules[__name__], module.RecipeError)[1]]
+            code = _digest(_json([VERSION, sys.version, parts]))
+        except (OSError, module.RecipeError):
+            code = ""
+        reach.__dict__["_facts_code"] = code
+    return code or None
 
 
-def _validate(state, tree, module):
-    """Validate node/root/unit identity and every edge/rule/dispatch index before touching a live Reach."""
-    if not isinstance(state, dict) or set(state) != set(STATE):
-        raise ValueError("invalid Reach state schema")
-    roots = {(p.name, t.src, test) for p in tree.packages.values() for t in p.targets for test in (False, True)}
-    root = tuple[str, str, bool]
-    hit = tuple[root, str, int]
-    mod = tuple[str, ...]
-    schemas = {
-        "idents": dict[str, set[str]], "lib_root": dict[str, root], "lib_roots": set[root],
-        "_mods": dict[root, dict[mod, str]], "_bases": dict[root, dict[str, list[mod]]],
-        "_macros": dict[root, dict[str, list[tuple[str, int]]]],
-        "_exported": dict[str, dict[str, list[tuple[str, int]]]], "_text": dict[str, str],
-        "_traits": dict[tuple, list[tuple[hit, frozenset[str], str]]],
-        "ids": dict[hit, int], "nodes": list[hit], "adj": list[list[tuple[int, str]]],
-        "file_root": dict[str, root], "builds": dict[str, str],
-        "_rules": module.RuleSet, "_own_rules": dict[root, module.RuleSet],
-        "_dispatch": dict[root, module.Dispatch], "_rows_nodes": dict[int, module.Dispatch],
-        "_enum_nodes": frozenset[int], "_family_dirs": tuple[str, ...],
-        "_facts": dict[tuple[str, bool], module.RustFacts],
-    }
-    for key, annotation in schemas.items():
-        if not _typed(annotation)(state[key]):
-            raise ValueError("invalid Reach field type: " + key)
-    for (f, test), facts in state["_facts"].items():
-        if f not in state["_text"] or not _typed(tuple[module.Unit, ...])(facts.units):
-            raise ValueError("invalid Reach fact provenance")
-        if not _typed(tuple[tuple[mod, mod, str, bool], ...])(facts.binds) or not _typed(frozenset[str])(facts.exported):
-            raise ValueError("invalid Reach import facts")
-    for f, text in state["_text"].items():
-        if not f.endswith("/<doctests>.rs"):
-            with open(os.path.join(tree.root, f), encoding="utf-8", errors="replace") as fh:
-                if fh.read() != text:
-                    raise ValueError("invalid Reach source provenance")
-    nodes, adj, ids = state["nodes"], state["adj"], state["ids"]
-    if not isinstance(nodes, list) or not isinstance(adj, list) or len(nodes) != len(adj):
-        raise ValueError("invalid Reach adjacency")
-    if ids != {h: i for i, h in enumerate(nodes)} or len(ids) != len(nodes):
-        raise ValueError("invalid Reach node index")
-    def index(i):
-        if type(i) is not int or not 0 <= i < len(nodes):
-            raise ValueError("invalid Reach node reference")
-    for rk, f, k in nodes:
-        if rk not in roots or not isinstance(f, str) or type(k) is not int or k < -1:
-            raise ValueError("invalid Reach node identity")
-        if k >= 0:
-            facts = state["_facts"].get((f, rk[2]))
-            if not isinstance(facts, module.RustFacts) or k >= len(facts.units):
-                raise ValueError("invalid Reach unit index")
-    for edges in adj:
-        if not isinstance(edges, list):
-            raise ValueError("partial Reach graph")
-        for i, why in edges:
-            index(i)
-            if not isinstance(why, str):
-                raise ValueError("invalid Reach edge")
-    for rk, mods in state["_mods"].items():
-        if rk not in roots or not isinstance(mods, dict) or mods.get(()) != rk[1]:
-            raise ValueError("invalid Reach module root")
-    for rs in [state["_rules"], *state["_own_rules"].values()]:
-        if not isinstance(rs, module.RuleSet):
-            raise ValueError("invalid Reach rules")
-        for i, f, why, groups, name in rs.rules:
-            index(i)
-            if nodes[i][1] != f or not isinstance(why, str) or (name is not None and not isinstance(name, str)):
-                raise ValueError("invalid Reach rule identity")
-            for group in groups:
-                for j in group:
-                    index(j)
-    for rk, dispatch in state["_dispatch"].items():
-        if rk not in roots or not isinstance(dispatch, module.Dispatch):
-            raise ValueError("invalid Reach dispatch")
-        index(dispatch.node)
-        for i in dispatch.enumerators:
-            index(i)
-        for i, rows in dispatch.entries.items():
-            index(i)
-            if any(type(r) is not int or not 0 <= r < len(dispatch.rows) for r in rows):
-                raise ValueError("invalid Reach dispatch row")
-    if state["_rows_nodes"] != {d.node: d for d in state["_dispatch"].values()}:
-        raise ValueError("invalid Reach dispatch index")
-    if any(rk not in roots for rk in state["lib_roots"] | set(state["_own_rules"])):
-        raise ValueError("invalid Reach root index")
-    # Reconstructible indexes must agree with their canonical owners, not merely be in range.
-    expected_libs = {p.name: (p.name, p.lib().src, False) for p in tree.packages.values() if p.lib() is not None}
-    if state["lib_root"] != expected_libs or state["lib_roots"] != set(expected_libs.values()):
-        raise ValueError("invalid Reach library root index")
-    expected_files = {}
-    for rk in expected_libs.values():
-        for f in state["_mods"][rk].values():
-            expected_files.setdefault(f, rk)
-    if state["file_root"] != expected_files:
-        raise ValueError("invalid Reach file owner index")
-    for rk, by in state["_bases"].items():
-        expected = {}
-        for path, f in state["_mods"][rk].items():
-            if not path or state["_mods"][rk].get(path[:-1]) != f:
-                expected.setdefault(f, []).append(path)
-        if by != expected:
-            raise ValueError("invalid Reach module base index")
-    for rk, names in state["_macros"].items():
-        expected = {}
-        for f in sorted(set(state["_mods"][rk].values())):
-            for name, indexes in state["_facts"][(f, rk[2])].macro_named.items():
-                expected.setdefault(name, []).extend((f, i) for i in indexes)
-        if names != expected:
-            raise ValueError("invalid Reach macro index")
-    for pkg, names in state["_exported"].items():
-        rk = expected_libs.get(pkg)
-        expected = {} if rk is None else {
-            name: [(f, i) for f, i in hits if name in state["_facts"][(f, rk[2])].exported]
-            for name, hits in state["_macros"][rk].items()}
-        if names != expected:
-            raise ValueError("invalid Reach exported macro index")
-    for values in state["_traits"].values():
-        if any(h not in ids for h, _, _ in values):
-            raise ValueError("invalid Reach trait unit index")
-    if state["_enum_nodes"] != frozenset(i for d in state["_dispatch"].values() for i in d.enumerators):
-        raise ValueError("invalid Reach enumerator index")
+def _facts_key(code, test, text):
+    sha = hashlib.sha256()
+    sha.update(code.encode() + (b"\0t\0" if test else b"\0f\0"))
+    sha.update(text.encode("utf-8", "surrogatepass"))
+    return sha.hexdigest()
+
+
+def _strs(value):
+    if type(value) is not list or not _STR.issuperset(map(type, value)):
+        raise ValueError("invalid string list")
+    return value
+
+
+def _opt_path(value):
+    return None if value is None else tuple(_strs(value))
+
+
+def _path_list(value):
+    if type(value) is not list:
+        raise ValueError("invalid path list")
+    return tuple([tuple(_strs(p)) for p in value])
+
+
+def _enc_facts(value):
+    heads, at = [], {}
+
+    def head(h):
+        if h is None:
+            return -1
+        if h not in at:
+            at[h] = len(heads)
+            heads.append([sorted(h.params), None if h.self_head is None else list(h.self_head),
+                          [list(a) for a in h.self_args], None if h.trait is None else list(h.trait),
+                          [list(a) for a in h.trait_args], h.text])
+        return at[h]
+
+    units = [[u.kind, list(u.ctx), u.name, u.line, [list(s) for s in u.sites], sorted(u.idents), sorted(u.macro_calls),
+              list(u.includes), list(u.literals), head(u.impl), sorted(u.names), sorted(u.methods), u.test]
+             for u in value.units[:value.uses]]
+    return {"u": units, "h": heads, "b": [[list(c), list(p), n, pub] for c, p, n, pub in value.binds],
+            "x": sorted(value.exported)}
+
+
+def _dec_head(row, module):
+    if type(row) is not list or len(row) != len(_HEAD_FIELDS):
+        raise ValueError("invalid impl head")
+    params, self_head, self_args, trait, trait_args, text = row
+    if type(text) is not str:
+        raise ValueError("invalid impl head text")
+    return module.ImplHead(frozenset(_strs(params)), _opt_path(self_head), _path_list(self_args), _opt_path(trait),
+                           _path_list(trait_args), text)
+
+
+def _dec_facts(body, module):
+    if type(body) is not dict or set(body) != {"u", "h", "b", "x"}:
+        raise ValueError("invalid facts schema")
+    if type(body["h"]) is not list or type(body["u"]) is not list or type(body["b"]) is not list:
+        raise ValueError("invalid facts lists")
+    heads = [_dec_head(h, module) for h in body["h"]]
+    units = []
+    for row in body["u"]:
+        if type(row) is not list or len(row) != len(_UNIT_FIELDS):
+            raise ValueError("invalid unit")
+        kind, ctx, name, line, sites, idents, calls, incs, lits, impl, names, methods, test = row
+        if (type(kind) is not str or (name is not None and type(name) is not str) or type(line) is not int
+                or type(test) is not bool or type(impl) is not int or not -1 <= impl < len(heads)):
+            raise ValueError("invalid unit field")
+        units.append(module.Unit(kind, tuple(_strs(ctx)), name, line, _path_list(sites), frozenset(_strs(idents)),
+                                 frozenset(_strs(calls)), tuple(_strs(incs)), tuple(_strs(lits)),
+                                 heads[impl] if impl >= 0 else None, frozenset(_strs(names)),
+                                 frozenset(_strs(methods)), test))
+    binds = []
+    for row in body["b"]:
+        if type(row) is not list or len(row) != 4 or type(row[2]) is not str or type(row[3]) is not bool:
+            raise ValueError("invalid use leaf")
+        binds.append((tuple(_strs(row[0])), tuple(_strs(row[1])), row[2], row[3]))
+    return module.RustFacts(units, binds, frozenset(_strs(body["x"])))
+
+
+def _damaged(path, why):
+    STATS["corrupt"] += 1
+    print(f"reach cache: {path}: {why}; recomputed", file=sys.stderr)
+    with contextlib.suppress(OSError):
+        os.unlink(path)
+
+
+def _verify(head, key, body):
+    """Whether this header, under this key, vouches for these payload bytes; raises the reason when it does not."""
+    if type(head) is not dict or set(head) != {"v", "key", "digest"} or head["v"] != VERSION:
+        raise ValueError("foreign version or header")
+    if head["key"] != key:
+        raise ValueError("another entry's key")
+    if head["digest"] != _digest(body):
+        raise ValueError("payload digest mismatch")
+
+
+def _load(path, key, module):
+    """The entry's facts, or None for none or a damaged one (named, and removed so the recomputation replaces it)."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None  # no entry, or no usable store (a HOME that is not a directory): a miss either way
+    try:
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+            raise ValueError("not a private regular file")
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        line, sep, body = raw.partition(b"\n")
+        head = json.loads(line)
+        if not sep:
+            raise ValueError("no header line")
+        _verify(head, key, body)
+        # equal payloads are one parse: a file whose two cfg(test) views read alike is stored twice
+        value = _BODIES.get(head["digest"])
+        if value is None:
+            value = _BODIES[head["digest"]] = _dec_facts(json.loads(body), module)
+    except (OSError, ValueError, TypeError, KeyError, IndexError, RecursionError) as exc:
+        _damaged(path, str(exc) or type(exc).__name__)
+        return None
+    if time.time() - st.st_mtime > TOUCH_AFTER:
+        with contextlib.suppress(OSError):
+            os.utime(path)
+    return value
+
+
+def _store(path, key, value):
+    """Write the entry; a store that cannot be written (read-only HOME, full disk) is a miss, never a failure."""
+    body = json.dumps(_enc_facts(value), separators=(",", ":")).encode()
+    data = json.dumps({"v": VERSION, "key": key, "digest": _digest(body)}, separators=(",", ":")).encode() + b"\n" + body
+    shard, tmp = os.path.dirname(path), None
+    try:
+        root = os.path.dirname(shard)
+        os.makedirs(root, mode=0o700, exist_ok=True)
+        st = os.lstat(root)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+            return
+        os.makedirs(shard, mode=0o700, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=shard, suffix=".tmp", delete=False) as fh:
+            tmp = fh.name
+            fh.write(data)
+        os.replace(tmp, path)
+        tmp = None
+    except OSError:
+        return
+    finally:
+        if tmp is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+    STATS["stores"] += 1
+    if not _PRUNE_ARMED:
+        _PRUNE_ARMED.append(atexit.register(prune))
+
+
+def prune(cap=CAP_BYTES, keep=KEEP_BYTES, root=None):
+    """Past `cap` bytes of entries, remove the least recently used (oldest mtime) until `keep` remain, and any
+    temporary file older than an hour; the number of entries removed."""
+    root = root or store_dir()
+    now = time.time()
+    entries, total = [], 0
+    try:
+        shards = [e.path for e in os.scandir(root) if e.is_dir(follow_symlinks=False)]
+    except OSError:
+        return 0
+    for shard in shards:
+        try:
+            files = list(os.scandir(shard))
+        except OSError:
+            continue
+        for e in files:
+            try:
+                st = e.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            if e.name.endswith(".tmp"):
+                if now - st.st_mtime > 3600:
+                    with contextlib.suppress(OSError):
+                        os.unlink(e.path)
+            elif e.name.endswith(".json"):
+                entries.append((st.st_mtime, e.path, st.st_size))
+                total += st.st_size
+    if total <= cap:
+        return 0
+    entries.sort()
+    removed = 0
+    for _, path, size in entries:
+        if total <= keep:
+            break
+        try:
+            os.unlink(path)
+        except OSError:
+            continue
+        total -= size
+        removed += 1
+    STATS["evicted"] += removed
+    return removed
+
+
+def facts(reach, text, test, compute):
+    """`compute(text, test)` (the file's RustFacts), served from the store when an entry of these exact bytes under
+    this analysis code exists. The caller has read `text` through the tree, so the read is observed whatever serves
+    the parse."""
+    live = _LIVE.get((text, test))
+    if live is not None:
+        STATS["live"] += 1
+        return live
+    code = _facts_code(reach)
+    if code is None:
+        STATS["off"] += 1
+        return compute(text, test)
+    module = sys.modules[type(reach).__module__]
+    _check_schema(module)
+    key = _facts_key(code, test, text)
+    path = os.path.join(store_dir(), key[:2], key + ".json")
+    value = _load(path, key, module)
+    if value is None:
+        STATS["misses"] += 1
+        value = compute(text, test)
+        _store(path, key, value)
+    else:
+        STATS["hits"] += 1
+    _LIVE[(text, test)] = value
+    return value
 
 
 def prepare(reach):
+    """Materialize the whole structural graph (every target root, test views included) under observation, so every
+    read of the analysis is recorded, and bind that record to the tree for `current`. Closure, environment and
+    architecture decisions stay lazy."""
     tree = reach.tree
     module = sys.modules[type(reach).__module__]
     identity, corpus = _identity(tree), _corpus(tree)
-    # Reach's eager initializer may have walked before this snapshot. Neither a miss nor a hit
-    # may pass those unprotected local walks on to Graph's later key-input discovery.
+    # Reach's eager initializer may have walked before this snapshot. Those unprotected local walks must not
+    # pass on to Graph's later key-input discovery.
     tree._walk_cache.clear()
     tree.unresolved.clear()
-    namespace = _digest(tree.root.encode())
-    directory = os.path.join(os.path.expanduser("~"), ".cache", "bloomery", "reach", namespace)
-    path = os.path.join(directory, "graph.json")
-    try:
-        st = os.lstat(path)
-        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
-            raise ValueError("non-private Reach cache")
-        with open(path, encoding="utf-8") as fh:
-            payload = json.load(fh)
-        if (not isinstance(payload, dict) or set(payload) != {"version", "identity", "corpus", "observed", "state", "digest"}
-                or payload["version"] != VERSION or payload["identity"] != identity or payload["corpus"] != corpus
-                or payload["digest"] != _digest(_json(payload["state"])) or not _holds(tree, payload["observed"])):
-            raise ValueError("stale Reach cache")
-        state = _decode(payload["state"], module)
-        _validate(state, tree, module)
-        # Complete validation precedes hydration; partial or foreign data cannot affect a live graph.
-        if _identity(tree) != identity or _corpus(tree) != corpus or not _holds(tree, payload["observed"]):
-            raise module.RecipeError("source tree changed during reach cache validation")
-        reach.__dict__.update(state)
-        # Resolver results are a recomputable per-analysis memo, not structural graph state.
-        # Discard any eager results made before this validated snapshot was installed.
-        reach._resolved.clear()
-        reach._key_identity, reach._key_snapshot, reach._key_observed = identity, corpus, payload["observed"]
-        return
-    except (OSError, ValueError, TypeError, KeyError, IndexError, AttributeError, RecursionError):
-        pass
     saw = {}
     tree._saw.append(saw)
     try:
@@ -478,30 +520,26 @@ def prepare(reach):
     observed = _observed(tree, saw)
     if _identity(tree) != identity or _corpus(tree) != corpus or not _holds(tree, observed):
         raise module.RecipeError("source tree changed during reach analysis")
-    state = {k: getattr(reach, k) for k in STATE}
-    _validate(state, tree, module)
-    encoded = _encode(state)
-    payload = {"version": VERSION, "identity": identity, "corpus": corpus, "observed": observed,
-               "state": encoded, "digest": _digest(_json(encoded))}
     reach._key_identity, reach._key_snapshot, reach._key_observed = identity, corpus, observed
-    # A read-only HOME is a cache miss, not a key failure. Computation above remains authoritative.
-    temporary = None
-    try:
-        os.makedirs(directory, mode=0o700, exist_ok=True)
-        ds = os.lstat(directory)
-        if not stat.S_ISDIR(ds.st_mode) or ds.st_uid != os.getuid() or ds.st_mode & 0o077:
-            return
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory, delete=False) as fh:
-            temporary = fh.name
-            # Keep publication in the C encoder, not dump's millions of per-token Python writes.
-            fh.write(json.dumps(payload, separators=(",", ":")))
-            fh.flush()
-            os.fsync(fh.fileno())
-        reach.validate()
-        os.replace(temporary, path)
-        temporary = None
-    except OSError:
-        pass
-    finally:
-        if temporary is not None:
-            os.unlink(temporary)
+
+
+def main(argv):
+    root = store_dir()
+    if argv == ["stats"]:
+        count = size = 0
+        for base, _, names in os.walk(root):
+            for name in names:
+                if name.endswith(".json"):
+                    count += 1
+                    size += os.lstat(os.path.join(base, name)).st_size
+        print(f"{root}: {count} entries, {size} bytes (cap {CAP_BYTES}, kept down to {KEEP_BYTES})")
+        return 0
+    if argv == ["prune"]:
+        print(f"{root}: {prune()} entries removed")
+        return 0
+    print("usage: reach_cache.py stats | prune", file=sys.stderr)
+    return 64
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

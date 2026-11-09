@@ -221,6 +221,7 @@ pub fn layer_line(layer: &LayerSpec) -> String {
             Residual::Hc => "hc",
             Residual::AlphaBeta { .. } => "alpha-beta",
             Residual::Sandwich { .. } => "sandwich",
+            Residual::AttnRes { .. } => "attn-res",
         },
         if layer.extras.is_empty() {
             String::new()

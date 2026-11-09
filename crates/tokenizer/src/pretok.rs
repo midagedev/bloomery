@@ -1,9 +1,10 @@
 //! The pre-tokenizers of the vocabularies this crate runs, as the reference
 //! runs them: [`Pre::DeepseekV3`] (`deepseek-v3`, `hunyuan-dense`,
-//! `joyai-llm`), [`Pre::Qwen2`] (`qwen2`, `solar-open`), [`Pre::Glm4`] (`glm4`),
-//! [`Pre::Qwen35`] (`qwen35`), [`Pre::Llama3`] (`llama-bpe`, `lfm2`), [`Pre::Tekken`] (`tekken`, `pixtral`),
-//! [`Pre::TekkenNum3`] (`tekken-num3`), [`Pre::MiniMaxM2`] (`minimax-m2`), [`Pre::Gpt4o`] (`gpt-4o`),
-//! [`Pre::Gemma4`] (`gemma4`), [`Pre::Raon`] (`raon`) and [`Pre::Flint`] (`flint`).
+//! `joyai-llm`), [`Pre::DeepseekLlm`] (`deepseek-llm`), [`Pre::Qwen2`] (`qwen2`, `solar-open`),
+//! [`Pre::Glm4`] (`glm4`), [`Pre::Qwen35`] (`qwen35`), [`Pre::Llama3`] (`llama-bpe`, `lfm2`),
+//! [`Pre::Tekken`] (`tekken`, `pixtral`), [`Pre::TekkenNum3`] (`tekken-num3`),
+//! [`Pre::MiniMaxM2`] (`minimax-m2`), [`Pre::Gpt4o`] (`gpt-4o`), [`Pre::Gemma4`] (`gemma4`),
+//! [`Pre::Raon`] (`raon`), [`Pre::KimiK2`] (`kimi-k2`) and [`Pre::Flint`] (`flint`).
 //!
 //! ## deepseek-v3
 //!
@@ -29,6 +30,38 @@
 //! The matchers below are those three regexes under ECMAScript semantics
 //! (leftmost start, alternatives in order, greedy quantifiers that back off),
 //! written out by hand; none of them can match the empty string.
+//!
+//! ## deepseek-llm
+//!
+//! The reference applies six regexes in turn (its DEEPSEEK_LLM type):
+//!
+//! 1. `[\r\n]`
+//! 2. `\s?[A-Za-zµÀ-ÖØ-öø-ƺ…]+`, the class a list of 87 ranges ([`LLM_LETTERS`])
+//! 3. `\s?[!-/:-~！-／：-～‘-‟　-。]+`
+//! 4. `\s+$`
+//! 5. `[一-龥ࠀ-一가-퟿]+`
+//! 6. `\p{N}+`
+//!
+//! None has a hand-written splitter there, so all six go through its `std::regex` fallback, which
+//! re-splits every piece the previous regex left, as deepseek-v3's three do ([`resplit`]). The
+//! fallback has two forms. Only regex 6 names a Unicode category, and only it runs on the
+//! collapsed text (one byte per codepoint, [`crate::unicode::collapse`]) with `\p{N}` rewritten
+//! as "its collapsed byte, plus `0-9`". Regexes 1 to 5 run as a `std::wregex` over the
+//! codepoints themselves, ranges and all, after the reference has written every non-ASCII
+//! whitespace codepoint as 0x0B: `\s` is ASCII whitespace there, so a codepoint of the reference's
+//! whitespace set is `\s` and no member of any class, whatever range holds it. That is `　`
+//! (U+3000), which opens the last range of regex 3, and the whitespace codepoints inside the
+//! one range regex 5 spells from U+0800. [`match_llm_run`] is that reading of a class.
+//!
+//! Three consequences of the cascade, each a case of the unit tests: regex 3's class holds
+//! `:-~`, the ASCII letters too, so a piece regex 2 took whole is cut again at its non-ASCII
+//! letters (`Ωmega` is `Ω`, `mega`); a run of numbers is never cut in words (no `\p{N}{1,3}`);
+//! and `\r` and `\n` are pieces of one codepoint each, `\r\n` two. `\s+$` ends a piece's own
+//! trailing whitespace only, the end of a piece being the end of input for it
+//! ([`split_trailing_space`]). The reference sets `clean_spaces` false for this name; this
+//! crate cleans no spaces ([`crate::vocab`]'s `CLEAN_SPACES` does not hold it). No folder's
+//! `tokenizer.json` spells this pipeline, so the name has no reading that runs as a Hugging Face
+//! one does ([`Pre::hf_reading`]).
 //!
 //! ## qwen2
 //!
@@ -170,6 +203,27 @@
 //! optional space with the newlines and slashes after it; a run of whitespace ending in a
 //! newline; a whitespace run but its last space when a word follows. The reference applies NFC
 //! before this ([`Pre::nfc`]). [`split_raon`] is that function line for line.
+//!
+//! ## kimi-k2
+//!
+//! One regex in Kimi's `tokenization_kimi.py`, which the reference runs as the hand-written
+//! `unicode_regex_split_custom_kimi_k2` (its `\p{Han}+` row only triggers the function), in the
+//! order of its branches: a run of Han, the nine literal ranges of `unicode_cpt_is_han`
+//! ([`is_han`]); a run of letters that are not Han behind one optional character that is no letter,
+//! number, `\r` or `\n` (a space, a tab, a mark, a symbol), with the contraction
+//! `'s|'t|'m|'d|'re|'ve|'ll` of either case after it; a run of numbers cut in words of three from
+//! its start; a run of punctuation behind an optional space with the newlines after it; a
+//! whitespace run ending in a newline; a whitespace run but its last space when a word follows.
+//!
+//! It is the llama3 splitter's shape with four differences. A Han run is a word of its own and
+//! never joins a letter run, and a space before it is a word apart. Every letter of a run is one
+//! class: `HelloWorld` is a word, where the regex's capital and lowercase classes would cut it.
+//! A mark is no letter, so it ends a run, and the optional character before a run may be a mark.
+//! The contraction hangs on the letter run: after no letter, `'s` is the optional character and a
+//! letter, so it is a word of two.
+//! No NFC step runs, the UTF-8 reader is the strict one ([`Pre::strict_utf8`]), and no word is
+//! taken whole ([`Pre::ignore_merges`]). No folder's `tokenizer.json` spells the pipeline (Kimi's
+//! tokenizer is a tiktoken one), so the name has no Hugging Face reading.
 //!
 //! ## flint
 //!
@@ -664,6 +718,195 @@ fn match_flint(c: &[u8], i: usize, hi: usize) -> usize {
     match_space(c, i, hi)
 }
 
+/// Regex 2 of `deepseek-llm`, `\s?[A-Za-zµÀ-ÖØ-öø-ƺ…]+`: the class as the sorted, disjoint ranges
+/// `(first, last)` its characters spell, a single character `(x, x)`.
+const LLM_LETTERS: [(u32, u32); 87] = [
+    (0x0041, 0x005A),
+    (0x0061, 0x007A),
+    (0x00B5, 0x00B5),
+    (0x00C0, 0x00D6),
+    (0x00D8, 0x00F6),
+    (0x00F8, 0x01BA),
+    (0x01BC, 0x01BF),
+    (0x01C4, 0x0293),
+    (0x0295, 0x02AF),
+    (0x0370, 0x0373),
+    (0x0376, 0x0376),
+    (0x0377, 0x0377),
+    (0x037B, 0x037D),
+    (0x037F, 0x037F),
+    (0x0386, 0x0386),
+    (0x0388, 0x038A),
+    (0x038C, 0x038C),
+    (0x038E, 0x03A1),
+    (0x03A3, 0x03F5),
+    (0x03F7, 0x0481),
+    (0x048A, 0x052F),
+    (0x0531, 0x0556),
+    (0x10A0, 0x10C5),
+    (0x13A0, 0x13F5),
+    (0x13F8, 0x13FD),
+    (0x1C90, 0x1CBA),
+    (0x1CBD, 0x1CBF),
+    (0x1D00, 0x1D2B),
+    (0x1D6B, 0x1D77),
+    (0x1D79, 0x1D9A),
+    (0x1E00, 0x1F15),
+    (0x1F18, 0x1F1D),
+    (0x1F20, 0x1F45),
+    (0x1F48, 0x1F4D),
+    (0x1F50, 0x1F57),
+    (0x1F59, 0x1F59),
+    (0x1F5B, 0x1F5B),
+    (0x1F5D, 0x1F5D),
+    (0x1F5F, 0x1F7D),
+    (0x1F80, 0x1FB4),
+    (0x1FB6, 0x1FBC),
+    (0x1FBE, 0x1FBE),
+    (0x1FC2, 0x1FC4),
+    (0x1FC6, 0x1FCC),
+    (0x1FD0, 0x1FD3),
+    (0x1FD6, 0x1FDB),
+    (0x1FE0, 0x1FEC),
+    (0x1FF2, 0x1FF4),
+    (0x1FF6, 0x1FFC),
+    (0x2102, 0x2102),
+    (0x2107, 0x2107),
+    (0x210A, 0x2113),
+    (0x2115, 0x2115),
+    (0x2119, 0x211D),
+    (0x2124, 0x2124),
+    (0x2126, 0x2126),
+    (0x2128, 0x2128),
+    (0x212A, 0x212D),
+    (0x212F, 0x2134),
+    (0x2139, 0x2139),
+    (0x213C, 0x213F),
+    (0x2145, 0x2149),
+    (0x214E, 0x214E),
+    (0x2183, 0x2183),
+    (0x2184, 0x2184),
+    (0x2C00, 0x2C7B),
+    (0x2C7E, 0x2CE4),
+    (0x2CEB, 0x2CEE),
+    (0x2CF2, 0x2CF2),
+    (0x2CF3, 0x2CF3),
+    (0xA640, 0xA66D),
+    (0xA680, 0xA69B),
+    (0xA722, 0xA76F),
+    (0xA771, 0xA787),
+    (0xA78B, 0xA78E),
+    (0xAB70, 0xABBF),
+    (0xFB00, 0xFB06),
+    (0xFB13, 0xFB17),
+    (0xFF21, 0xFF3A),
+    (0xFF41, 0xFF5A),
+    (0x10400, 0x1044F),
+    (0x104B0, 0x104D3),
+    (0x104D8, 0x104FB),
+    (0x10C80, 0x10CB2),
+    (0x10CC0, 0x10CF2),
+    (0x118A0, 0x118DF),
+    (0x1E900, 0x1E943),
+];
+
+/// Whether `cpt` is in the class of `deepseek-llm`'s regex 2 ([`LLM_LETTERS`]).
+fn is_llm_letter(cpt: u32) -> bool {
+    let i = LLM_LETTERS.partition_point(|&(_, last)| last < cpt);
+    LLM_LETTERS.get(i).is_some_and(|&(first, _)| first <= cpt)
+}
+
+/// Whether `cpt` is in the class of `deepseek-llm`'s regex 3, `[!-/:-~！-／：-～‘-‟　-。]`: ASCII
+/// punctuation, symbols and letters (the digits sit between its first two ranges), their fullwidth
+/// forms, the quotation marks U+2018..=U+201F and U+3000..=U+3002.
+fn is_llm_symbol(cpt: u32) -> bool {
+    matches!(cpt, 0x21..=0x2F | 0x3A..=0x7E)
+        || matches!(cpt, 0xFF01..=0xFF0F | 0xFF1A..=0xFF5E)
+        || matches!(cpt, 0x2018..=0x201F | 0x3000..=0x3002)
+}
+
+/// Whether `cpt` is in the class of `deepseek-llm`'s regex 5, `[一-龥ࠀ-一가-퟿]`: its first two
+/// ranges (U+4E00..=U+9FA5 and U+0800..=U+4E00) are one run, and the third is U+AC00..=U+D7FF.
+fn is_llm_wide(cpt: u32) -> bool {
+    matches!(cpt, 0x0800..=0x9FA5 | 0xAC00..=0xD7FF)
+}
+
+/// `[class]+` at `i`, under the reference's `std::wregex` reading (the module docs): the codepoints of
+/// `class` that are not whitespace, `c` the collapsed bytes of `cpts`, whose 0x0B and ASCII
+/// whitespace are the reference's `\s`. Its length, 0 for none.
+fn match_llm_run(cpts: &[u32], c: &[u8], i: usize, hi: usize, class: fn(u32) -> bool) -> usize {
+    (i..hi)
+        .take_while(|&k| !is_space(c[k]) && class(cpts[k]))
+        .count()
+}
+
+/// `\s?[class]+` at `i`: a whitespace codepoint first, and only when a run of `class` follows it
+/// (a greedy `?` backs off when the run fails, and a whitespace codepoint is no member of `class`).
+fn match_llm_spaced_run(
+    cpts: &[u32],
+    c: &[u8],
+    i: usize,
+    hi: usize,
+    class: fn(u32) -> bool,
+) -> usize {
+    if is_space(c[i]) {
+        let n = match_llm_run(cpts, c, i + 1, hi, class);
+        if n > 0 {
+            return 1 + n;
+        }
+    }
+    match_llm_run(cpts, c, i, hi, class)
+}
+
+/// `\s+$` over each piece of `pieces` (lengths, in codepoints): the piece's trailing run of
+/// whitespace is a piece of its own and the text before it another, and a piece with no
+/// trailing whitespace stays as it is. `$` is the end of the piece, and the leftmost start that
+/// reaches it is the run's first codepoint.
+fn split_trailing_space(pieces: &[usize], out: &mut Vec<usize>, c: &[u8]) {
+    out.clear();
+    let mut lo = 0;
+    for &len in pieces {
+        let hi = lo + len;
+        let tail = c[lo..hi].iter().rev().take_while(|&&x| is_space(x)).count();
+        if tail == 0 || tail == len {
+            out.push(len);
+        } else {
+            out.extend([len - tail, tail]);
+        }
+        lo = hi;
+    }
+}
+
+/// The six regexes of `deepseek-llm` in turn over one text fragment, each re-splitting the
+/// pieces of the one before it; the words' lengths come back in `s.a`.
+fn split_deepseek_llm<'s>(cpts: &[u32], s: &'s mut Scratch) -> &'s [usize] {
+    let c = &s.collapsed;
+
+    s.a.clear();
+    if !cpts.is_empty() {
+        s.a.push(cpts.len());
+    }
+    // `[\r\n]`
+    resplit(&s.a, &mut s.b, |i, _| usize::from(is_newline(c[i])));
+    // `\s?[A-Za-zµÀ-ÖØ-öø-ƺ…]+`
+    resplit(&s.b, &mut s.a, |i, hi| {
+        match_llm_spaced_run(cpts, c, i, hi, is_llm_letter)
+    });
+    // `\s?[!-/:-~！-／：-～‘-‟　-。]+`
+    resplit(&s.a, &mut s.b, |i, hi| {
+        match_llm_spaced_run(cpts, c, i, hi, is_llm_symbol)
+    });
+    // `\s+$`
+    split_trailing_space(&s.b, &mut s.a, c);
+    // `[一-龥ࠀ-一가-퟿]+`
+    resplit(&s.a, &mut s.b, |i, hi| {
+        match_llm_run(cpts, c, i, hi, is_llm_wide)
+    });
+    // `\p{N}+`, over the collapsed bytes
+    resplit(&s.b, &mut s.a, |i, hi| match_number(c, i, hi, usize::MAX));
+    &s.a
+}
+
 /// Re-split every piece of `pieces` (lengths, in codepoints) with a matcher
 /// `m(i, hi)` that returns the match length at `i` inside `[.., hi)`, 0 for
 /// none. Unmatched runs become pieces of their own.
@@ -707,6 +950,12 @@ pub(crate) struct Scratch {
 pub(crate) enum Pre {
     /// `deepseek-v3`, `hunyuan-dense`, `joyai-llm`: three regexes in turn.
     DeepseekV3,
+    /// `deepseek-v3` as a Hugging Face `tokenizer.json` runs it: classes are Unicode 14.0's, and
+    /// BPE skips a byte its vocabulary lacks. Never named in a header; a vocabulary with
+    /// `tokenizer.bloomery.eog_token_ids` gets it.
+    DeepseekV3Hf,
+    /// `deepseek-llm`: six regexes in turn, five of them over the codepoints themselves.
+    DeepseekLlm,
     /// `qwen2`, `solar-open`: the reference's hand-written splitter, one number
     /// a word. Solar's `tokenizer.json` carries qwen2's regex verbatim.
     Qwen2,
@@ -758,16 +1007,20 @@ pub(crate) enum Pre {
     /// `raon`: the reference's hand-written splitter with the CJK run, the letter run joined by
     /// single spaces and the digits in threes from the end; the text is NFC-normalized first.
     Raon,
+    /// `kimi-k2`: the reference's hand-written splitter with the Han run, the letter run with its
+    /// contraction, digits in threes from the start, the punctuation run and the whitespace rules.
+    KimiK2,
     /// `flint`: numbers, CJK, then the reference's collapsed case/mark regex.
     Flint,
 }
 
 impl Pre {
     /// The names this crate runs, as `tokenizer.ggml.pre` spells them.
-    pub(crate) const NAMES: [(&'static str, Pre); 17] = [
+    pub(crate) const NAMES: [(&'static str, Pre); 19] = [
         ("deepseek-v3", Pre::DeepseekV3),
         ("hunyuan-dense", Pre::DeepseekV3),
         ("joyai-llm", Pre::DeepseekV3),
+        ("deepseek-llm", Pre::DeepseekLlm),
         ("qwen2", Pre::Qwen2),
         ("solar-open", Pre::Qwen2),
         ("glm4", Pre::Glm4),
@@ -781,6 +1034,7 @@ impl Pre {
         ("gpt-4o", Pre::Gpt4o),
         ("gemma4", Pre::Gemma4),
         ("raon", Pre::Raon),
+        ("kimi-k2", Pre::KimiK2),
         ("flint", Pre::Flint),
     ];
 
@@ -788,6 +1042,7 @@ impl Pre {
     /// own case; `None` for a name no folder's `tokenizer.json` spells.
     pub(crate) fn hf_reading(self) -> Option<Pre> {
         match self {
+            Pre::DeepseekV3 => Some(Pre::DeepseekV3Hf),
             Pre::Qwen2 => Some(Pre::Qwen2Hf),
             Pre::Qwen35 => Some(Pre::Qwen35Hf),
             Pre::Llama3 => Some(Pre::Llama3Hf),
@@ -826,12 +1081,13 @@ impl Pre {
     /// Whether the reference decodes UTF-8 strictly, independently of NFC.
     /// An overlong form is not a codepoint there; older readers accept it. The trees that read
     /// `gpt-4o`, `raon`, `flint`, `tekken` (every tree that maps `pixtral` to it has the check)
-    /// and `tekken-num3` (a name younger than the check) reject it; the trees the other names'
-    /// sets are read by (ik, the Solar-Open2 patch, mainline before the check) accept it.
+    /// `tekken-num3` (a name younger than the check) and `kimi-k2` (read by the same mainline tree)
+    /// reject it; the trees the other names' sets are read by (ik, the Solar-Open2 patch, mainline
+    /// before the check) accept it.
     pub(crate) fn strict_utf8(self) -> bool {
         matches!(
             self,
-            Pre::Raon | Pre::Flint | Pre::Gpt4o | Pre::Tekken | Pre::TekkenNum3
+            Pre::Raon | Pre::Flint | Pre::Gpt4o | Pre::Tekken | Pre::TekkenNum3 | Pre::KimiK2
         )
     }
 
@@ -840,6 +1096,8 @@ impl Pre {
         match self {
             Pre::Gemma4 => Spelling::Metaspace,
             Pre::DeepseekV3
+            | Pre::DeepseekV3Hf
+            | Pre::DeepseekLlm
             | Pre::Qwen2
             | Pre::Glm4
             | Pre::Qwen35
@@ -854,6 +1112,7 @@ impl Pre {
             | Pre::MiniMaxM2
             | Pre::Gpt4o
             | Pre::Raon
+            | Pre::KimiK2
             | Pre::Flint => Spelling::ByteLevel,
         }
     }
@@ -864,14 +1123,15 @@ impl Pre {
 pub(crate) fn split<'s>(pre: Pre, cpts: &[u32], s: &'s mut Scratch) -> &'s [usize] {
     s.collapsed.clear();
     let class: fn(u32) -> u8 = match pre {
-        Pre::Qwen35Hf | Pre::Qwen2Hf | Pre::Llama3Hf => collapse_hf,
+        Pre::Qwen35Hf | Pre::Qwen2Hf | Pre::Llama3Hf | Pre::DeepseekV3Hf => collapse_hf,
         Pre::MiniMaxM2Hf | Pre::TekkenHf => collapse_cased,
         _ => collapse,
     };
     s.collapsed.extend(cpts.iter().map(|&cp| class(cp)));
     match pre {
-        Pre::DeepseekV3 => split_ordered(cpts, s, match_word),
+        Pre::DeepseekV3 | Pre::DeepseekV3Hf => split_ordered(cpts, s, match_word),
         Pre::Flint => split_ordered(cpts, s, match_flint),
+        Pre::DeepseekLlm => split_deepseek_llm(cpts, s),
         Pre::Qwen2 => {
             split_custom(cpts, &s.collapsed, 1, &mut s.b);
             &s.b
@@ -895,6 +1155,10 @@ pub(crate) fn split<'s>(pre: Pre, cpts: &[u32], s: &'s mut Scratch) -> &'s [usiz
         }
         Pre::Raon => {
             split_raon(cpts, &s.collapsed, &mut s.b);
+            &s.b
+        }
+        Pre::KimiK2 => {
+            split_kimi_k2(cpts, &s.collapsed, &mut s.b);
             &s.b
         }
     }
@@ -969,6 +1233,74 @@ fn split_raon(cpts: &[u32], c: &[u8], out: &mut Vec<usize>) {
             } else {
                 pos + 1
             };
+        }
+        out.push(pos - start);
+    }
+}
+
+/// `unicode_cpt_is_han`: the reference's nine literal ranges, not the `\p{Han}` property. It counts
+/// all of `U+F900..U+FAFF`, unassigned codepoints too, and has nothing from `U+30000` up. Its
+/// extensions C to F are the one range `U+2A700..U+2EBEF` here.
+fn is_han(cpt: u32) -> bool {
+    matches!(
+        cpt,
+        0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xF900..=0xFAFF
+            | 0x20000..=0x2A6DF
+            | 0x2A700..=0x2EBEF
+            | 0x2F800..=0x2FA1F
+    )
+}
+
+/// `unicode_regex_split_custom_kimi_k2` over one fragment: `cpts` its codepoints, `c` their
+/// collapsed bytes; the words' lengths go to `out`. Each branch is the reference's, in its order.
+fn split_kimi_k2(cpts: &[u32], c: &[u8], out: &mut Vec<usize>) {
+    out.clear();
+    let end = cpts.len();
+    // The reference's flags read as empty past the fragment.
+    let han = |p: usize| p < end && is_han(cpts[p]);
+    let flag_letter = |p: usize| p < end && is_letter(c[p]);
+    let letter = |p: usize| flag_letter(p) && !han(p);
+    let number = |p: usize| p < end && is_number(c[p]);
+    let space = |p: usize| p < end && is_space(c[p]);
+    let punct = |p: usize| p < end && !space(p) && !flag_letter(p) && !number(p);
+    let mut pos = 0;
+    while pos < end {
+        let start = pos;
+        let lead = usize::from(cpts[pos] == u32::from(b' '));
+        if han(pos) {
+            // `[\p{Han}]+`
+            while han(pos) {
+                pos += 1;
+            }
+        } else if letter(pos)
+            || (!flag_letter(pos) && !number(pos) && !is_newline(c[pos]) && letter(pos + 1))
+        {
+            // `[^\r\n\p{L}\p{N}]?` (a mark is none of `\p{L}`), the letters that are not Han, and
+            // the contraction: the run of letters is the same class whatever their case.
+            pos += usize::from(!letter(pos));
+            while letter(pos) {
+                pos += 1;
+            }
+            // The reference's `unicode_tolower` maps no codepoint above U+007F to a letter of the
+            // contractions, so the ASCII lowercase of the collapsed byte is its comparison.
+            pos += contraction(c, pos, end, |k| c[k].to_ascii_lowercase());
+        } else if number(pos) {
+            // `\p{N}{1,3}`
+            pos += DigitRule::Front(3).at(c, pos, end);
+        } else if punct(pos + lead) {
+            // ` ?[^\s\p{L}\p{N}]+[\r\n]*`
+            pos += lead;
+            while punct(pos) {
+                pos += 1;
+            }
+            while pos < end && is_newline(c[pos]) {
+                pos += 1;
+            }
+        } else {
+            // `\s*[\r\n]+`, `\s+(?!\S)`, `\s+`; no alternative: one codepoint.
+            pos += match_space(c, pos, end).max(1);
         }
         out.push(pos - start);
     }
@@ -1197,7 +1529,7 @@ fn split_custom(cpts: &[u32], c: &[u8], digits: usize, out: &mut Vec<usize>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Pre, Scratch, split};
+    use super::{LLM_LETTERS, Pre, Scratch, is_llm_letter, is_llm_symbol, is_llm_wide, split};
 
     /// Every name the table runs is one the crate says it runs and the
     /// refusal of another lists.
@@ -1303,6 +1635,125 @@ mod tests {
         }
     }
 
+    /// `deepseek-llm` is a row of its own: the reference maps the name to its DEEPSEEK_LLM type,
+    /// whose six regexes `deepseek_llm_cases` runs. No folder's `tokenizer.json` spells that
+    /// pipeline, so it has no Hugging Face reading and the explicit stop list refuses it by
+    /// name. FAIL-first: a row that names another splitter, or a reading that is invented, fails.
+    #[test]
+    fn deepseek_llm_is_a_row_with_no_hf_reading() {
+        assert_eq!(
+            crate::named(&Pre::NAMES, "deepseek-llm"),
+            Some(Pre::DeepseekLlm)
+        );
+        assert!(crate::runs_pre_tokenizer("deepseek-llm"));
+        assert_eq!(Pre::DeepseekLlm.hf_reading(), None);
+        assert!(!Pre::hf_names().contains("deepseek-llm"));
+        assert!(!Pre::DeepseekLlm.ignore_merges() && !Pre::DeepseekLlm.nfc());
+        assert!(!Pre::DeepseekLlm.strict_utf8());
+    }
+
+    /// The six regexes of `deepseek-llm` in turn, each case's pieces derived by hand from the
+    /// regexes (the reference's `std::wregex` for the first five, over codepoints whose
+    /// non-ASCII whitespace is `\s`; the collapsed text for `\p{N}+`). Each case names what it
+    /// holds: a letter run takes one leading whitespace, regex 3's class holds the ASCII letters
+    /// and so cuts a piece at its non-ASCII letters, `\r` and `\n` are pieces of their own, a
+    /// piece's trailing whitespace is a piece, a CJK run takes no leading space, a run of numbers
+    /// is not cut in words, and a whitespace codepoint is no member of a class that spans it.
+    #[test]
+    fn deepseek_llm_cases() {
+        let cases: &[(&str, &[&str])] = &[
+            // Regex 2: `\s?` and a run of letters.
+            ("Hello world", &["Hello", " world"]),
+            ("a  b", &["a", " ", " b"]),
+            ("\tfoo", &["\tfoo"]),
+            ("a\u{a0}b", &["a", "\u{a0}b"]),
+            ("don't", &["don", "'", "t"]),
+            ("x = y;", &["x", " =", " y", ";"]),
+            // Regex 3 cuts a piece at its non-ASCII letters: `:-~` holds the ASCII letters.
+            ("Ωmega", &["Ω", "mega"]),
+            ("x éa", &["x", " é", "a"]),
+            // Regex 1: a newline or a carriage return is a piece of one codepoint.
+            ("a\r\nb", &["a", "\r", "\n", "b"]),
+            ("\n\nHello", &["\n", "\n", "Hello"]),
+            ("  \n x", &["  ", "\n", " x"]),
+            // Regex 4: a piece's trailing whitespace is a piece.
+            ("foo  ", &["foo", "  "]),
+            ("你好  ", &["你好", "  "]),
+            ("你好\u{3000}", &["你好", "\u{3000}"]),
+            ("你好  吗", &["你好", "  ", "吗"]),
+            // Only a piece's end: a codepoint no other regex takes keeps its inner whitespace.
+            ("😀 😀", &["😀 😀"]),
+            ("😀 😀 ", &["😀 😀", " "]),
+            ("😀  x", &["😀", " ", " x"]),
+            ("¿ \t", &["¿", " \t"]),
+            // Regex 5: a CJK run, with no leading space of its own.
+            ("a中文b", &["a", "中文", "b"]),
+            (" 你", &[" ", "你"]),
+            ("Hello, 世界!", &["Hello", ",", " ", "世界", "!"]),
+            ("你好！ 再见。", &["你好", "！", " ", "再见", "。"]),
+            // U+3000 and the U+2000 spaces are inside regex 5's range and regex 3's, and are
+            // whitespace in the reference's wregex text: no member of either class.
+            ("你\u{3000}好", &["你", "\u{3000}", "好"]),
+            ("你\u{2003}好", &["你", "\u{2003}", "好"]),
+            ("，\u{3000}、", &["，", "\u{3000}", "、"]),
+            // Regex 6: a run of numbers, in any script, is one piece whatever its length.
+            ("1234567", &["1234567"]),
+            ("abc123def", &["abc", "123", "def"]),
+            ("x²³ ١٢٣٤4", &["x", "²³", " ", "١٢٣٤4"]),
+            ("", &[]),
+        ];
+        for &(text, want) in cases {
+            let got = words(Pre::DeepseekLlm, text);
+            assert_eq!(got, want, "{text:?}");
+            assert_eq!(got.concat(), text, "the pieces tile {text:?}");
+        }
+    }
+
+    /// The codepoints a class spec spells, as the reference's `std::wregex` reads a bracket
+    /// expression of single characters and `x-y` ranges.
+    fn class_members(spec: &str) -> Vec<bool> {
+        let chars: Vec<char> = spec.chars().collect();
+        let mut member = vec![false; 0x11_0000];
+        let mut i = 0;
+        while i < chars.len() {
+            let (first, last, used) = match chars.get(i + 1) {
+                Some('-') if i + 2 < chars.len() => (chars[i], chars[i + 2], 3),
+                _ => (chars[i], chars[i], 1),
+            };
+            assert!(first <= last, "range {first:?}-{last:?} of {spec:?}");
+            member[first as usize..=last as usize].fill(true);
+            i += used;
+        }
+        member
+    }
+
+    /// The three classes of `deepseek-llm` equal the bracket expressions the reference spells,
+    /// on every codepoint: regex 2's 87-range list (as ik's source writes it), regex 3's and
+    /// regex 5's. The characters whose NFC form is another codepoint (U+1F7D, U+1FBE, U+1FD3,
+    /// U+1FDB, U+2126, U+212A), U+3000 and the ends U+0800 and U+D7FF are written as escapes, so
+    /// no editor can change what is compared. FAIL-first: a range off by one codepoint, or one
+    /// dropped, fails.
+    #[test]
+    fn deepseek_llm_classes_are_the_references() {
+        const LETTERS: &str = "A-Za-zµÀ-ÖØ-öø-ƺƼ-ƿǄ-ʓʕ-ʯͰ-ͳͶͷͻ-ͽͿΆΈ-ΊΌΎ-ΡΣ-ϵϷ-ҁҊ-ԯԱ-ՖႠ-ჅᎠ-Ᏽᏸ-ᏽᲐ-ᲺᲽ-Ჿᴀ-ᴫᵫ-ᵷᵹ-ᶚḀ-ἕἘ-Ἕἠ-ὅὈ-Ὅὐ-ὗὙὛὝὟ-\u{1F7D}ᾀ-ᾴᾶ-ᾼ\u{1FBE}ῂ-ῄῆ-ῌῐ-\u{1FD3}ῖ-\u{1FDB}ῠ-Ῥῲ-ῴῶ-ῼℂℇℊ-ℓℕℙ-ℝℤ\u{2126}ℨ\u{212A}-ℭℯ-ℴℹℼ-ℿⅅ-ⅉⅎↃↄⰀ-ⱻⱾ-ⳤⳫ-ⳮⳲⳳꙀ-ꙭꚀ-ꚛꜢ-ꝯꝱ-ꞇꞋ-ꞎꭰ-ꮿﬀ-ﬆﬓ-ﬗＡ-Ｚａ-ｚ𐐀-𐑏𐒰-𐓓𐓘-𐓻𐲀-𐲲𐳀-𐳲𑢠-𑣟𞤀-𞥃";
+        const SYMBOLS: &str = "!-/:-~！-／：-～‘-‟\u{3000}-。";
+        const WIDE: &str = "一-龥\u{800}-一가-\u{D7FF}";
+        for (name, spec, class) in [
+            ("regex 2", LETTERS, is_llm_letter as fn(u32) -> bool),
+            ("regex 3", SYMBOLS, is_llm_symbol),
+            ("regex 5", WIDE, is_llm_wide),
+        ] {
+            let member = class_members(spec);
+            for (cpt, &want) in member.iter().enumerate() {
+                assert_eq!(class(cpt as u32), want, "{name}: U+{cpt:04X}");
+            }
+        }
+        // The table is what `partition_point` needs: ascending and disjoint.
+        for pair in LLM_LETTERS.windows(2) {
+            assert!(pair[0].0 <= pair[0].1 && pair[0].1 < pair[1].0, "{pair:?}");
+        }
+    }
+
     /// The qwen2 splitter's alternatives, one case each, as its reference
     /// function splits them: contractions case-blind, one digit per word, a
     /// leading space or symbol taken by a word, a space kept before
@@ -1363,6 +1814,109 @@ mod tests {
         for &(text, want) in cases {
             assert_eq!(words(Pre::Raon, text), want, "{text:?}");
         }
+    }
+
+    /// The kimi-k2 splitter's branches, one case each, as the reference's function splits them
+    /// (derived from its code, not from our output): a Han run is a word of its own and a space
+    /// before it a word apart, kana and Hangul are letters, the optional character before a run is
+    /// any non-letter but a newline (a space, a tab, a mark, a symbol), a mark ends a run, case is no
+    /// boundary, a contraction of either case ends a run and a short one does not, digits are cut in
+    /// threes from the run's start, a punctuation run keeps its newlines but not its slashes, and a
+    /// whitespace run gives its last space to the word after it.
+    ///
+    /// FAIL-first: with the digits cut from the run's end (raon's rule) "1234567" reads 1|234|567,
+    /// and with the contraction list dropped "it's" reads it|'s; the rows below fail both.
+    #[test]
+    fn kimi_k2_cases() {
+        let cases: &[(&str, &[&str])] = &[
+            ("hello world", &["hello", " world"]),
+            ("Hello,世界!", &["Hello", ",", "世界", "!"]),
+            (" 中文", &[" ", "中文"]),
+            ("日本語のテキスト", &["日本語", "のテキスト"]),
+            ("漢字와 한글混用", &["漢字", "와", " 한글", "混用"]),
+            ("HelloWorld iPhone", &["HelloWorld", " iPhone"]),
+            (
+                "it's WE'RE I'm you'LL he'd can't've",
+                &[
+                    "it's", " WE'RE", " I'm", " you'LL", " he'd", " can't", "'ve",
+                ],
+            ),
+            (
+                "x're x'r x'l x' '",
+                &["x're", " x", "'r", " x", "'l", " x", "'", " '"],
+            ),
+            (
+                "rock'n'roll it\u{2019}s",
+                &["rock", "'n", "'roll", " it", "\u{2019}s"],
+            ),
+            (
+                "\u{4dbf}\u{4dc0} \u{9fff}\u{a000}",
+                &["\u{4dbf}", "\u{4dc0}", " ", "\u{9fff}", "\u{a000}"],
+            ),
+            (
+                "\u{2a6df}\u{2a6e0}\u{30000}x \u{2a6e0} \u{30000}",
+                &[
+                    "\u{2a6df}",
+                    "\u{2a6e0}\u{30000}x",
+                    " \u{2a6e0}",
+                    " \u{30000}",
+                ],
+            ),
+            (
+                "e\u{301}a \u{301}\u{301}",
+                &["e", "\u{301}a", " \u{301}\u{301}"],
+            ),
+            ("中\u{301}文", &["中", "\u{301}", "文"]),
+            ("12", &["12"]),
+            ("1234567", &["123", "456", "7"]),
+            (
+                "x1y22 $12 \u{663}\u{664}\u{665}\u{666}",
+                &[
+                    "x",
+                    "1",
+                    "y",
+                    "22",
+                    " $",
+                    "12",
+                    " ",
+                    "\u{663}\u{664}\u{665}",
+                    "\u{666}",
+                ],
+            ),
+            ("x = y;", &["x", " =", " y", ";"]),
+            (
+                "//c a/\nb ?/\r\n",
+                &["//", "c", " a", "/\n", "b", " ?/\r\n"],
+            ),
+            ("a\u{1c}b \u{1c}\u{1d}", &["a", "\u{1c}b", " \u{1c}\u{1d}"]),
+            ("hello\n\nworld", &["hello", "\n\n", "world"]),
+            ("a  b", &["a", " ", " b"]),
+            ("a \n b", &["a", " \n", " b"]),
+            ("\t\tHello", &["\t", "\tHello"]),
+            (
+                "a\u{a0}b\u{85}\u{85}c",
+                &["a", "\u{a0}b", "\u{85}", "\u{85}c"],
+            ),
+            ("end ", &["end", " "]),
+            ("  ", &["  "]),
+            (" ", &[" "]),
+        ];
+        for &(text, want) in cases {
+            assert_eq!(words(Pre::KimiK2, text), want, "{text:?}");
+        }
+    }
+
+    /// `kimi-k2` is a row of its own: the reference's splitter, its tree's strict UTF-8 reader, no
+    /// NFC, no whole-token words, and no Hugging Face reading (Kimi publishes no `tokenizer.json`
+    /// that spells it), so the explicit stop list refuses it by name.
+    #[test]
+    fn kimi_k2_is_a_row_with_no_hf_reading() {
+        assert_eq!(crate::named(&Pre::NAMES, "kimi-k2"), Some(Pre::KimiK2));
+        assert!(crate::runs_pre_tokenizer("kimi-k2"));
+        assert_eq!(Pre::KimiK2.hf_reading(), None);
+        assert!(!Pre::hf_names().contains("kimi-k2"));
+        assert!(!Pre::KimiK2.ignore_merges() && !Pre::KimiK2.nfc());
+        assert!(Pre::KimiK2.strict_utf8());
     }
 
     /// The glm4 splitter is qwen2's but for its number branch: a run of
@@ -1535,17 +2089,12 @@ mod tests {
         assert_eq!(Pre::Llama3.hf_reading(), Some(Pre::Llama3Hf));
     }
 
-    /// Qwen3's regex split as Hugging Face's `tokenizers` runs it: every text of the pinned corpus
-    /// (`hf_pieces_qwen2.py`: contractions in every case, letters and marks and numbers against
-    /// each other, spaces, symbols, code, every Unicode version's codepoints) is cut into pieces of
-    /// the byte lengths its pre-tokenizer gives.
-    ///
-    /// FAIL-first: with the reference's splitter in its place, the texts of codepoints Unicode 15.0
-    /// added and the `ſ` contractions fail; with marks in the letter run, the mark texts.
-    #[test]
-    fn qwen2_hf_pieces_are_hugging_faces() {
+    /// Every text of the pinned corpus `crates/hf/tests/fixtures/<fixture>.json.gz` is cut by
+    /// `pre` into pieces of the byte lengths Hugging Face's `tokenizers` gives, the first 20
+    /// texts that differ named.
+    fn hf_pieces(pre: Pre, fixture: &str) {
         let path = format!(
-            "{}/../hf/tests/fixtures/qwen2-hf-pieces.json.gz",
+            "{}/../hf/tests/fixtures/{fixture}.json.gz",
             env!("CARGO_MANIFEST_DIR")
         );
         let corpus: serde_json::Value = serde_json::from_reader(flate2::read::GzDecoder::new(
@@ -1561,7 +2110,7 @@ mod tests {
             let want: Vec<u64> = serde_json::from_value(case["pieces"].clone()).unwrap();
             let cpts: Vec<u32> = text.chars().map(u32::from).collect();
             let mut at = 0;
-            let ours: Vec<u64> = split(Pre::Qwen2Hf, &cpts, &mut s)
+            let ours: Vec<u64> = split(pre, &cpts, &mut s)
                 .iter()
                 .map(|&n| {
                     let bytes: usize = cpts[at..at + n]
@@ -1590,6 +2139,29 @@ mod tests {
         );
     }
 
+    /// Qwen3's regex split as Hugging Face's `tokenizers` runs it: every text of the pinned corpus
+    /// (`hf_pieces_qwen2.py`: contractions in every case, letters and marks and numbers against
+    /// each other, spaces, symbols, code, every Unicode version's codepoints) is cut into pieces of
+    /// the byte lengths its pre-tokenizer gives.
+    ///
+    /// FAIL-first: with the reference's splitter in its place, the texts of codepoints Unicode 15.0
+    /// added and the `ſ` contractions fail; with marks in the letter run, the mark texts.
+    #[test]
+    fn qwen2_hf_pieces_are_hugging_faces() {
+        hf_pieces(Pre::Qwen2Hf, "qwen2-hf-pieces");
+    }
+
+    /// DeepSeek-V3's three regexes as Hugging Face's `tokenizers` runs them over DeepSeek-V4.1's
+    /// `tokenizer.json`: every text of the pinned corpus (`hf_pieces_deepseek.py`, the qwen2
+    /// corpus's texts) is cut into pieces of the byte lengths its pre-tokenizer gives.
+    ///
+    /// FAIL-first: with the reference's classes in its place, the texts of codepoints Unicode 15.0
+    /// added fail.
+    #[test]
+    fn deepseek_v3_hf_pieces_are_hugging_faces() {
+        hf_pieces(Pre::DeepseekV3Hf, "deepseek-v3-hf-pieces");
+    }
+
     /// MiniMax's regex split as Hugging Face's `tokenizers` runs it: every text of the pinned corpus
     /// (`hf_pieces_minimax.py`: contractions in every case, letters of every category against
     /// each other, marks, digits, spaces, symbols, every Unicode version's codepoints) is cut into
@@ -1602,50 +2174,7 @@ mod tests {
     /// texts; with the prefix never left out or the capitals never given back, the mark texts.
     #[test]
     fn minimax_m2_hf_pieces_are_hugging_faces() {
-        let path = format!(
-            "{}/../hf/tests/fixtures/minimax-hf-pieces.json.gz",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        let corpus: serde_json::Value = serde_json::from_reader(flate2::read::GzDecoder::new(
-            std::fs::File::open(&path).unwrap_or_else(|e| panic!("{path}: {e}")),
-        ))
-        .unwrap();
-        let cases = corpus["cases"].as_array().unwrap();
-        assert!(cases.len() >= 11_000, "{} cases in {path}", cases.len());
-        let mut s = Scratch::default();
-        let mut failures = Vec::new();
-        for case in cases {
-            let text = case["text"].as_str().unwrap();
-            let want: Vec<u64> = serde_json::from_value(case["pieces"].clone()).unwrap();
-            let cpts: Vec<u32> = text.chars().map(u32::from).collect();
-            let mut at = 0;
-            let ours: Vec<u64> = split(Pre::MiniMaxM2Hf, &cpts, &mut s)
-                .iter()
-                .map(|&n| {
-                    let bytes: usize = cpts[at..at + n]
-                        .iter()
-                        .map(|&c| char::from_u32(c).unwrap().len_utf8())
-                        .sum();
-                    at += n;
-                    bytes as u64
-                })
-                .collect();
-            if ours != want {
-                failures.push(format!("{text:?}: ours {ours:?}, HF {want:?}"));
-            }
-        }
-        assert!(
-            failures.is_empty(),
-            "{} of {} texts:\n{}",
-            failures.len(),
-            cases.len(),
-            failures
-                .iter()
-                .take(20)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
+        hf_pieces(Pre::MiniMaxM2Hf, "minimax-hf-pieces");
     }
 
     /// The `minimax-m2` regex's alternatives, one case each, derived from the

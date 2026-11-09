@@ -804,6 +804,19 @@ impl MappedHost {
         Some(unsafe { std::slice::from_raw_parts_mut(self.host_at(off).cast::<f32>(), len) })
     }
 
+    /// The `len` bytes at byte `off`, for the host to read; `None` past the
+    /// allocation. The owner's protocol keeps the card from writing the span
+    /// while the slice lives.
+    pub(crate) fn bytes_at(&self, off: usize, len: usize) -> Option<&[u8]> {
+        if off.checked_add(len).is_none_or(|end| end > self.bytes) {
+            return None;
+        }
+        // SAFETY: the span is inside the allocation (checked above); no host
+        // write aliases it while `&self` is held, and the owner's protocol
+        // keeps the card off it.
+        Some(unsafe { std::slice::from_raw_parts(self.host_at(off).cast_const(), len) })
+    }
+
     /// A copy of the `len` f32 at byte `off`, when inside the allocation.
     pub(crate) fn f32_copy(&self, off: usize, len: usize) -> Option<Vec<f32>> {
         if !off.is_multiple_of(4) || !self.holds(off, len) {
@@ -910,6 +923,49 @@ pub fn op_add(addr: sys::CUdeviceptr, value: u32) -> sys::CUstreamBatchMemOpPara
         alias: 0,
     };
     p
+}
+
+/// The kind of `op`, an operation one of the constructors above made.
+fn op_kind(op: &sys::CUstreamBatchMemOpParams) -> sys::CUstreamBatchMemOpType {
+    // SAFETY: every member of the union opens with its operation type (the
+    // driver's layout), and every operation here is one of this file's
+    // constructors' over zeroed bytes, so the field is initialized.
+    unsafe { op.operation }
+}
+
+/// Whether `op` is a system-scope barrier ([`op_barrier_sys`]).
+pub(crate) fn is_barrier(op: &sys::CUstreamBatchMemOpParams) -> bool {
+    op_kind(op) == sys::CUstreamBatchMemOpType_enum_CU_STREAM_MEM_OP_BARRIER
+}
+
+/// The address and value of `op` when it is an add ([`op_add`]); `None` for
+/// every other kind. An atomic reduction of another operator, width or
+/// flags, which no constructor here makes, is refused by name as `what`'s.
+pub(crate) fn add_of(
+    op: &sys::CUstreamBatchMemOpParams,
+    what: &'static str,
+) -> Result<Option<(sys::CUdeviceptr, u32)>, GpuError> {
+    if op_kind(op) != sys::CUstreamBatchMemOpType_enum_CU_STREAM_MEM_OP_ATOMIC_REDUCTION {
+        return Ok(None);
+    }
+    // SAFETY: the operation type names the reduction member as the one the
+    // constructor wrote.
+    let r = unsafe { op.atomicReduction };
+    let add = r.reductionOp
+        == sys::CUstreamAtomicReductionOpType_enum_CU_STREAM_ATOMIC_REDUCTION_OP_ADD
+        && r.dataType
+            == sys::CUstreamAtomicReductionDataType_enum_CU_STREAM_ATOMIC_REDUCTION_UNSIGNED_32
+        && r.flags == 0;
+    match u32::try_from(r.value) {
+        Ok(by) if add => Ok(Some((r.address, by))),
+        _ => Err(GpuError::shape(
+            what,
+            format!(
+                "an atomic reduction (operator {}, type {}, flags {}, value {}) that is no u32 add",
+                r.reductionOp, r.dataType, r.flags, r.value
+            ),
+        )),
+    }
 }
 
 /// Enqueue `ops` on `stream` as one batch of stream memory operations: one

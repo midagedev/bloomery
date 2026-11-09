@@ -1,0 +1,11 @@
+--- a/crates/gpu/src/host/batch.rs
++++ b/crates/gpu/src/host/batch.rs
+@@ -1566,7 +1566,7 @@
+                     }
+                     Some(Slot::Card(_)) => {}
+                     Some(Slot::Tier { tier, .. })
+-                        if tier < MAX_TIERS && t.legs >> tier & 1 == 1 => {}
++                        if tier < MAX_TIERS || t.legs >> tier & 1 == 1 => {}
+                     Some(Slot::Tier { tier, .. }) => return Err(no_leg(layer, id, tier)),
+                     None => unknown = unknown.or(Some((s, id))),
+                 }

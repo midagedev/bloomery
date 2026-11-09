@@ -98,7 +98,8 @@ fn family_of(arch: Arch) -> Option<&'static dyn Adapter> {
         | Arch::GemmaEmbedding2
         | Arch::Flint
         | Arch::MuseSpark
-        | Arch::MistralLarge4 => None,
+        | Arch::MistralLarge4
+        | Arch::KimiK3 => None,
     }
 }
 
@@ -125,6 +126,8 @@ fn skip_of(arch: Arch) -> &'static str {
         | Arch::Flint
         | Arch::MuseSpark
         | Arch::MistralLarge4 => "no program",
+        // Whole-card: its routed stacks load as the file holds them and no plan splits them.
+        Arch::KimiK3 => "no adapter",
     }
 }
 
@@ -1049,6 +1052,7 @@ fn rooms_of(
 fn budget(bytes: u64) -> PlanLevers {
     PlanLevers {
         card_budget_bytes: Some(bytes).into(),
+        ..PlanLevers::default()
     }
 }
 

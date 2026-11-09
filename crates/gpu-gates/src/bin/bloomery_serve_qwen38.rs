@@ -379,6 +379,7 @@ mod tests {
 
     /// Every accessor the seat calls on `Levers`, with the levers it reads.
     const READS: &[(&str, &[&str])] = &[
+        ("autotune", &[bloomery_levers::AUTOTUNE]),
         ("draft", &[bloomery_levers::DRAFT]),
         (
             "host",
@@ -390,6 +391,7 @@ mod tests {
             ],
         ),
         ("host_lanes", &[bloomery_levers::HOST_LANES]),
+        ("kv_host", &[bloomery_levers::KV_HOST]),
         ("mtp_draft", &[bloomery_levers::MTP_DRAFT]),
         ("mtp_head_rows", &[bloomery_levers::MTP_HEAD_ROWS]),
         ("mtp_width", &[bloomery_levers::MTP_WIDTH]),
@@ -406,7 +408,7 @@ mod tests {
     ];
 
     /// The lever `PlanLevers::from_levers` reads for the seat's plans.
-    const PLAN_READS: &[&str] = &[bloomery_levers::CARD_BUDGET];
+    const PLAN_READS: &[&str] = &[bloomery_levers::CARD_BUDGET, bloomery_levers::KV_FLOOR];
 
     /// Each call of the seat that reads a Direct lever in place, with the lever.
     const DIRECT_READS: &[(&str, &str)] = &[(

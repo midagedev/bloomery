@@ -67,7 +67,11 @@ and the host units from `python3 tools/recipes.py host-nightly`.
 workspaces. Called-source edits must invalidate a recorded green result even when size and mtime stay unchanged.
 Absolute paths and raw identifiers retain conservative owner/dependency bounds when structural resolution is
 uncertain; Cargo-selected roots and declared Rust modules are source regardless of their filename suffix.
-The persistent structural cache must preserve these inputs across fresh processes.
+The persistent structural cache must preserve these inputs across fresh processes. It keeps the reach's per-file parses
+by content (the file's bytes, cfg(test) and the analysis code) under `~/.cache/bloomery/reach-facts`, so every checkout with
+the same bytes shares an entry and an edit re-parses only the files it touched; the directory is held to 1 GiB, least
+recently used first (`python3 tools/bloomery/reach_cache.py stats` or `prune`), and a damaged entry is named on stderr and
+recomputed.
 Repeated input validation reuses stable source hashes within the process. Rewrites with the same size and
 modification time still invalidate their consumers; recently modified files are hashed again.
 The selected profiles of every box call remain inputs, including shell defaults and inherited model overrides.
@@ -106,8 +110,9 @@ nightly sets `x86-64-v3` for its own machine (`tools/nightly/run.sh:55`), and bo
 Output: a header (commit, host, CPU features, toolchain, `RUSTFLAGS`, bound, log directory), one line per unit,
 `<name> rc=<n> <seconds>s`, under a red one its failing tests or first red lines and its log path, then
 `DONE tier=… total=… red=… wall=…s`. Each unit's log is in `target/contrib-check/<time>.<unique>/<name>.log`. Every unit, in
-both tiers, runs under a bound of `CONTRIB_UNIT_BOUND` seconds (default 1200) through GNU `timeout`, or `gtimeout` when
-only that is installed; a host with neither (macOS as shipped) runs units unbounded, and the header says so. Exit: 0
+both tiers, runs under a bound of `CONTRIB_UNIT_BOUND` seconds (default 1200) through a monitor that keeps GNU `timeout`'s
+exit codes: `timeout`, or `gnutimeout` or `gtimeout` where `timeout` is uutils', or `tools/ref/stub-timeout.py` with
+neither (`bound_timeout` in `tools/gate-bound.sh`); the header names it. Exit: 0
 every unit green, 1 a unit red, 64 usage, 69 a prerequisite is missing (named, with how it is made), 70 a list the
 script reads is empty, `--only` matches no unit, or `git status` fails in the tree (whether it is clean is unknown, so
 no commit is named). `CONTRIB_INJECT_FAIL=1` adds one deliberately failing unit, so the red path can be shown to fail

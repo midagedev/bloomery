@@ -5,7 +5,8 @@ What is installed on it, and the commands that made each piece. Commands only; t
 
 The account also runs CI runners, so nothing below edits a shell profile or touches `~/.local/bin`: the runner
 sets its own `PATH` (`~/opt/bloomery-bin:~/.cargo/bin:/usr/bin:…`) in every remote script. Present already on a
-stock macOS: `git`, `rsync`, `curl`, the Xcode command line tools (`/Library/Developer/CommandLineTools/usr/lib/libclang.dylib`).
+stock macOS: `git`, `curl`, the Xcode command line tools (`/Library/Developer/CommandLineTools/usr/lib/libclang.dylib`).
+Its `/usr/bin/rsync` is openrsync (protocol 29), which `tools/mac-setup.sh --check` refuses: step 5 puts a Homebrew rsync first.
 
 Run each step on the second Mac (`ssh "$(cat ~/.config/bloomery/mac-remote)" bash -s < step.sh`). `tools/mac-remote.sh`
 checks every piece in one preflight and names a missing one with its step number (rc 69).
@@ -31,10 +32,10 @@ Installed: uv 0.13.0, Python 3.14.8 (the lead's Mac runs 3.14.7), numpy 2.5.1, P
 
 ## 2. just, at the version of the lead's Mac (recipes.py parses `just --dump --dump-format json`)
 
-    curl -sSfL -o just.tgz https://github.com/casey/just/releases/download/1.58.0/just-1.58.0-aarch64-apple-darwin.tar.gz
+    curl -sSfL -o just.tgz https://github.com/casey/just/releases/download/1.59.0/just-1.59.0-aarch64-apple-darwin.tar.gz
     tar -xzf just.tgz just && cp just ~/opt/bloomery-bin/just
 
-Installed: just 1.58.0. The runner refuses (69) a remote `just --version` that differs from the local one.
+Installed: just 1.59.0. The runner refuses (69) a remote `just --version` that differs from the local one.
 
 ## 3. Rust: rustup without profile edits, then every component rust-toolchain.toml pins and the cross-check target
 
@@ -55,6 +56,14 @@ through the rustup proxy has nothing to add during a run.
 (The recipe in the header of `tools/mac-check.sh` takes the same two trees from the box, `ws:/usr/local/cuda-13.3/include`
 and `ws:/usr/include`; a second Mac that must not drift from the first copies from it.) When `~/opt` on the lead's Mac
 changes, run the first command again.
+
+## 5. rsync 3 or newer (the sync's checksum compare and the mtime rules; macOS's own is openrsync, protocol 29)
+
+Homebrew's, linked into the runner's bin so no profile changes; the runner's `PATH` puts `~/opt/bloomery-bin` first.
+
+    export HOMEBREW_NO_AUTO_UPDATE=1; /opt/homebrew/bin/brew install -q rsync
+    ln -sf /opt/homebrew/bin/rsync ~/opt/bloomery-bin/rsync
+    PATH=$HOME/opt/bloomery-bin:/usr/bin:/bin rsync --version | head -1    # rsync  version 3.5.1  protocol version 33
 
 ## Layout and upkeep
 

@@ -21,4 +21,4 @@
 MODEL_NAME=solar-open2
 : "${IK:=/home/user/ik-idxkey}"
 : "${PAI:=/home/user/llama.cpp-solar2}"
-MODEL=${BLOOMERY_REF_MODEL:-/models/Solar-Open2-250B-Q4_K_M/Solar-Open2-250B-Q4_K_M-00001-of-00004.gguf}
+MODEL=${BLOOMERY_REF_MODEL:-/data/moved/models/Solar-Open2-250B-Q4_K_M/Solar-Open2-250B-Q4_K_M-00001-of-00004.gguf}

@@ -29,6 +29,12 @@ pub struct Geometry35 {
 }
 
 impl Geometry35 {
+    /// The launches one attention layer adds for one more busy slot of a pass on f16 planes: the flash's segment pass
+    /// and merge, and the rope with the append unless the head is 256, whose append runs once over every slot's rows.
+    pub fn attn_slot_launches(&self) -> usize {
+        if self.head == 256 { 2 } else { 3 }
+    }
+
     /// The geometry `split`'s header gives: every attention layer's heads and every delta layer's state shape must
     /// agree, else the file is refused by name here, before a derivation is written against a mixed one. A trunk of
     /// attention layers alone is legal: its description holds no delta layer, and the delta fields are zero.
@@ -352,8 +358,8 @@ pub struct Slots35 {
     /// The context the load was opened at.
     pub ctx: usize,
     pub geom: Geometry35,
-    /// The sequence-bound launches one more busy slot adds to a captured pass (a delta layer's conv and delta, an
-    /// attention layer's rope-append, flash segment pass and merge, and the embedding).
+    /// The sequence-bound launches one more busy slot adds to a captured pass: the embedding and each attention layer's
+    /// [`Geometry35::attn_slot_launches`]; a delta layer's conv and step run once over every slot's rows.
     pub nodes_slot: usize,
     pub load: Load,
 }
@@ -490,8 +496,14 @@ impl PassAdapter for Slots35 {
         Ok(Launches {
             n: self.nodes_slot,
             terms: format!(
-                "the embedding 1 + {} attention layers' flash segment pass and merge 2",
-                self.geom.n_attn
+                "the embedding 1 + {} attention layers' {} {}",
+                self.geom.n_attn,
+                if self.geom.head == 256 {
+                    "flash segment pass and merge"
+                } else {
+                    "rope with append, flash segment pass and merge"
+                },
+                self.geom.attn_slot_launches()
             ),
         })
     }

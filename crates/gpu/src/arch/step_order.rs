@@ -293,7 +293,9 @@ pub const MINIMAXM3: &[FaultSite] = &[
 /// meet them, then the sites only a GQA layer meets; the sites the step
 /// never raises follow. Raon-1 (`arch::raon1`) runs the same order: an RDA
 /// layer launches a KDA layer's sites, and a latent layer's cache append
-/// and visible count stand where a GQA layer's do.
+/// and visible count stand where a GQA layer's do. Kimi K3 (`arch::kimi_k3`)
+/// runs it too: its delta and latent layers are those layers' launches, and
+/// the cross-layer mix raises the product site the norm's launch raises.
 pub const SOLAR2: &[FaultSite] = &[
     TokenId,
     F32Product,
@@ -347,6 +349,7 @@ pub fn of(arch: model::arch::Arch) -> StepOrder {
         // runnable step.
         Arch::Flint => ("Flint", FaultSite::ALL),
         Arch::MistralLarge4 => ("MistralLarge4", FaultSite::ALL),
+        Arch::KimiK3 => ("KimiK3", SOLAR2),
     };
     StepOrder { arch: name, sites }
 }
@@ -358,7 +361,7 @@ mod tests {
 
     /// Every architecture; a new one is a compile error here until it is
     /// listed (and [`of`] gives it a table).
-    fn every_arch() -> [Arch; 16] {
+    fn every_arch() -> [Arch; 17] {
         let all = [
             Arch::Deepseek2,
             Arch::Deepseek41,
@@ -376,6 +379,7 @@ mod tests {
             Arch::Flint,
             Arch::MuseSpark,
             Arch::MistralLarge4,
+            Arch::KimiK3,
         ];
         for a in all {
             match a {
@@ -394,7 +398,8 @@ mod tests {
                 | Arch::GemmaEmbedding2
                 | Arch::Flint
                 | Arch::MuseSpark
-                | Arch::MistralLarge4 => {}
+                | Arch::MistralLarge4
+                | Arch::KimiK3 => {}
             }
         }
         all
@@ -423,6 +428,15 @@ mod tests {
     fn every_step_order_is_named_as_its_architecture() {
         for arch in every_arch() {
             assert_eq!(of(arch).arch, format!("{arch:?}"));
+        }
+    }
+
+    /// Raon-1 and Kimi K3 run Solar's order: their delta and latent layers launch the sites its
+    /// linear-attention and GQA layers do.
+    #[test]
+    fn raon1_and_kimi_k3_run_the_solar2_order() {
+        for arch in [Arch::Raon1, Arch::KimiK3] {
+            assert_eq!(of(arch).sites, SOLAR2, "{arch:?}");
         }
     }
 

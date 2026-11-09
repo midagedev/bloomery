@@ -217,7 +217,7 @@ use std::time::Instant;
 mod q3place;
 use app::arch::qwen3moe::{GEMM_FROM, Prompt35};
 use app::dspark::CardDspark;
-use app::mtp::{MtpBody, MtpDraft};
+use app::mtp::{MtpBody, open_draft};
 use q3place::Seqs;
 
 use bloomery_gpu::arch::qwen3moe::ubatch::{UBATCH_ENV, ubatch_size};
@@ -1630,7 +1630,7 @@ impl Q35Mtp {
         let mut s = app::Session::from_model(m, at);
         let mut log = Quiet;
         let drafted = SlotDrafts::<Body35, MTP_ROWS>::open(&mut s, 1, width, &mut log, |m| {
-            MtpDraft::open(m, Prompt35, StepMode::Eager)
+            open_draft(m, Prompt35, StepMode::Eager)
         })?;
         let (layer, resident, scratch) = {
             let d = s

@@ -1,0 +1,12 @@
+--- a/crates/placement/src/accepts.rs
++++ b/crates/placement/src/accepts.rs
+@@ -457,7 +457,8 @@
+ #[must_use]
+ pub const fn ds41_pair(gate_up: GgmlType, down: GgmlType, tier: bool) -> bool {
+     if matches!(gate_up, GgmlType::Q3_K) {
+-        matches!(down, GgmlType::Q4_K) || (!tier && matches!(down, GgmlType::Q5_K))
++        // mutant fused-q5k-pair: the q5_K down stays off every card.
++        matches!(down, GgmlType::Q4_K)
+     } else {
+         !tier
+     }

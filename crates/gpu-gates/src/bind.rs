@@ -110,11 +110,13 @@ pub struct Listen<'a> {
     pub side: Option<SideEngine>,
 }
 
-/// The server over a seat's `engine`: the sampler crate's chain, the fatal
+/// The server over a seat's `engine` (a [`SeatEngine`], or any other
+/// `serve::Engine` a seat holds — the host seat's `TargetEngine`): the sampler
+/// crate's chain, the fatal
 /// linger every seat keeps, the seat's own slots as the server's, and the side
 /// model beside it. The seat prints its own `listening` record from the bound
 /// server and runs it.
-pub fn bind_server(engine: SeatEngine, l: Listen<'_>) -> Result<Server, ServeError> {
+pub fn bind_server<E: Engine + 'static>(engine: E, l: Listen<'_>) -> Result<Server, ServeError> {
     let slots = slot_config(&l);
     let config = ServerConfig {
         model_alias: l.alias,

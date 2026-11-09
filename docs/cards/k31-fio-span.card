@@ -1,0 +1,25 @@
+# k31rel. docs/cards/k31-arena-mem.card: pinned (tg 3.3) and anonymous (3.59) arena memory give the same block-layer picture (requests of
+# 512 KiB-2 MiB, service time mostly 1-4 ms, ~7 in flight, ~3 GB/s in the prompt phase), so the memory kind is not the term. fio
+# (docs/cards/k31-fio-lat.card) served 1 MiB reads at 0.7 ms / 6 GB/s at queue 4 — but over ONE 19 GB shard, where the engine's reads
+# are random over all 31 shards (580 GB) of a 4 TB drive. If the drive's address-translation cache covers 19 GB and not 580 GB, its
+# latency over the full span is the engine's 2 ms, and no reader change recovers it: the levers are then the second drive (the mirror)
+# and hiding the latency. This probe is fio over all 31 shards of each drive, 1 MiB random O_DIRECT reads at queue 4 and 8, 20 s a cell.
+kind: calibration
+question: over all 31 shards of a drive (580 GB span), what is the completion latency of a random O_DIRECT 1 MiB read at queue 4 and 8?
+term: fio clat mean (us) per cell with the rate beside it, against the one-shard rows (nvme0 1m qd4 676 us 6.0 GB/s, qd8 1,224 us 6.7; nvme1 699 / 5.8, 1,366 / 6.1)
+unit: us
+predict: 650..2500
+condition: tools/ref/k31-fio-span.sh under one lease: fio --rw=randread --direct=1 --ioengine=libaio --bs=1m --iodepth 4|8 --time_based
+  --runtime=20 --readonly --norandommap, --filename the 31 shards joined by ':' (fio spreads the random reads over them), per drive
+reason: [derived] the arena route's requests are ~1 MiB at ~7 in flight and complete in ~2.4 ms where the one-shard fio row says ~0.7-1.2;
+  the one difference left between the two is the span; a 4 TB enterprise drive's L2P holds the whole drive in its DRAM, so the band's low
+  end is the one-shard latency (the span is not it, the reader is) and its high end the engine's 2.4 ms (the span is it)
+decide-in: near 650-900: the drive is not the term over the full span and the reader is (clause 3 of specs/k31arena/spec.md names it from the
+  code: the pread split, the pickup, the publish); near 2,000-2,500: the drive's latency over the span is the floor, the arena round's
+  clauses are the mirror in the reader (halves the batch) and the layer-ahead prefetch, and the fadvise/arena choice is by bytes
+decide-below: under 650: the one-shard rows were pessimistic; re-run them before reading anything
+decide-above: above 2,500: slower than the engine sees; the cell's queue or files are wrong, re-read the fio line
+# outcome 2026-11-07: nvme0 qd4 740 us 5.35 GB/s, qd8 1,229 us 6.7; nvme1 qd4 700 us 5.8, qd8 1,357 us 6.1 — the one-shard rows within
+#  10 %: the span is not the term, decide-in's first case: the reader is. One difference left between fio and the engine's reads:
+#  fio's random offsets are bs-aligned (1 MiB), the engine's runs start at 4 KiB-aligned file offsets (RunRead::of aligns to
+#  DIRECT_ALIGN); a 1 MiB read that straddles the drive's internal stripe costs two. docs/cards/k31-fio-align.card tests it.

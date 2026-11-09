@@ -1,5 +1,5 @@
 //! `bloomery-serve` — one server binary, one seat a model: `--model
-//! ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|nemotron|raon1|musespark|flint|mistrallarge4|decide` picks the seat
+//! ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|nemotron|raon1|musespark|flint|kimik3|mistrallarge4|host|decide` picks the seat
 //! (`serve_seats`, the shared seat modules), every other flag the seat's own,
 //! parsed by the seat's own parser, so each seat's flag set is exactly its
 //! per-model binary's. The
@@ -7,7 +7,7 @@
 //! picks the seat, and a bare start or `--help` prints [`drive::MODELS`],
 //! one line a seat with a working `--hf` example.
 //!
-//!     bloomery-serve [--model ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|nemotron|raon1|musespark|flint|mistrallarge4|decide]
+//!     bloomery-serve [--model ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|nemotron|raon1|musespark|flint|kimik3|mistrallarge4|host|decide]
 //!                    [-m PATH | --model-file PATH | --hf <repo>[@<rev>][:<quant>]]
 //!                    [--head <weights> [--head-config <file>]]
 //!                    [--config FILE] <the seat's own flags>
@@ -46,9 +46,13 @@
 //! the qwen3 seat, mimo2 the mimo2 seat, solar-open2 the solar2 seat, minimax-m3
 //! the minimaxm3 seat,
 //! nemotron_h and nemotron_h_moe the nemotron seat, raon1 the raon1 seat, muse-spark the musespark seat,
-//! flint the flint seat and mistral-large4 the mistrallarge4 seat;
+//! flint the flint seat, kimi-k3 and kimi-k31 the kimik3 seat, mistral-large4 the mistrallarge4 seat and
+//! deepseek2 the host seat;
 //! a dense qwen35 file a generative seat serves generates with or without
-//! `--model qwen3`. With no model word a file keeps the decision selection rules: a file with no head
+//! `--model qwen3`. The host seat also takes a file a card seat serves when no
+//! card is visible or llama-server's `-dev none`/`-ngl 0` asks for the host,
+//! and refuses by name (65, the coverage list) a file the host engine cannot
+//! run. With no model word a file keeps the decision selection rules: a file with no head
 //! that no generative seat serves is refused by name, saying what would seat it (`--head`, a row's `--hf`
 //! repo, or a file that carries its head); a
 //! file whose architecture no seat serves is refused by name listing the
@@ -80,7 +84,9 @@
 //! the class `no-device` (status 69, with its `error` event); after
 //! `--version`, `--help` and the arguments' check below, a driver below R580
 //! (CUDA 13), or one whose `libcuda.so.1` does not load, ends the start with
-//! what it reported.
+//! what it reported; a start whose file picks its seat, or that names the host
+//! seat, goes on without a driver (the host seat takes it, and a card seat's
+//! file is refused for the driver once the seat is known).
 //!
 //! The arguments are checked as far as that needs no model, card or network before the driver is
 //! asked and before `--hf` fetches anything (`drive::early_named`): with `--model WORD`, `--help` or `-h`
@@ -214,7 +220,7 @@ mod drive {
                         machine can serve, then `bloomery-serve --model NAME` to start it \
                         (docs/agents.md)";
 
-    const USAGE: &str = "usage: bloomery-serve [--model NAME[:VARIANT]|ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|nemotron|raon1|musespark|flint|mistrallarge4|decide] \
+    const USAGE: &str = "usage: bloomery-serve [--model NAME[:VARIANT]|ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|nemotron|raon1|musespark|flint|kimik3|mistrallarge4|host|decide] \
                          [--config FILE] [--revision REV] [--recommend] [--dry-run] [--json] \
                          [-m PATH | --model-file PATH | --hf <repo>[@<rev>][:<quant>]] [--head <weights> \
                          [--head-config <file>]] [--embd-model FILE | --embd-hf \
@@ -222,7 +228,7 @@ mod drive {
                          --embd-no-mmproj] [--embd-image-min-tokens N] [--embd-image-max-tokens N] \
                          <the chosen seat's own flags, as \
                          bloomery-serve-ds41, bloomery-serve-qwen38, the glm, the qwen3, the \
-                         mimo2, the solar2, the minimaxm3, the nemotron, the raon1, the musespark, the flint, the mistrallarge4 or the decide seat takes \
+                         mimo2, the solar2, the minimaxm3, the nemotron, the raon1, the musespark, the flint, the kimik3, the mistrallarge4, the host or the decide seat takes \
                          them> [llama-server's placement flags: -dev, -sm, -mg, -ts, -ngl, \
                          --cpu-moe, -fit, -fitt, -devd] | --list-devices | --version";
 
@@ -243,7 +249,9 @@ models (the --model word is optional with a model file: the file's architecture 
   raon1   Raon-1-mini                  -m <path>
   musespark Muse Spark Open 816B       -m <path>
   flint   Flint                       -m <path>
+  kimik3  Kimi K3 and K3.1             -m <path>
   mistrallarge4 Mistral Large 4 1T-A52B -m <path>
+  host    a file on the CPU alone      -m <path>   (no card; -ngl 0 and -dev none ask for it)
   decide  a decision model by its head --hf bartowski/Cloudflare_clef-flash-GGUF:Q5_K_M
   decide  a decision model in its file --hf ggml-org/lev-GGUF:Q4_K_M";
 
@@ -270,7 +278,11 @@ models (the --model word is optional with a model file: the file's architecture 
         Raon1,
         MuseSpark,
         Flint,
+        KimiK3,
         MistralLarge4,
+        /// The host seat: the file served on the CPU alone, no card in the plan
+        /// (`serve_seats::host_seat`).
+        Host,
     }
 
     /// A `--model` word: a generative seat's, or the decide seat's.
@@ -294,10 +306,12 @@ models (the --model word is optional with a model file: the file's architecture 
                 "raon1" => Ok(Word::Seat(Model::Raon1)),
                 "musespark" => Ok(Word::Seat(Model::MuseSpark)),
                 "flint" => Ok(Word::Seat(Model::Flint)),
+                "kimik3" => Ok(Word::Seat(Model::KimiK3)),
                 "mistrallarge4" => Ok(Word::Seat(Model::MistralLarge4)),
+                "host" => Ok(Word::Seat(Model::Host)),
                 serve::decide::WORD => Ok(Word::Decide),
                 other => Err(format!(
-                    "--model is ds41, qwen38, glm, qwen3, mimo2, solar2, minimaxm3, nemotron, raon1, musespark, flint, mistrallarge4 or {}, not {other}",
+                    "--model is ds41, qwen38, glm, qwen3, mimo2, solar2, minimaxm3, nemotron, raon1, musespark, flint, kimik3, mistrallarge4, host or {}, not {other}",
                     serve::decide::WORD
                 )
                 .into()),
@@ -314,7 +328,7 @@ models (the --model word is optional with a model file: the file's architecture 
 
     impl Model {
         /// Every generative seat.
-        const ALL: [Model; 12] = [
+        const ALL: [Model; 14] = [
             Model::Ds41,
             Model::Qwen38,
             Model::Glm,
@@ -326,7 +340,9 @@ models (the --model word is optional with a model file: the file's architecture 
             Model::Raon1,
             Model::MuseSpark,
             Model::Flint,
+            Model::KimiK3,
             Model::MistralLarge4,
+            Model::Host,
         ];
 
         /// The seat's word, as errors and the usage name it.
@@ -343,7 +359,9 @@ models (the --model word is optional with a model file: the file's architecture 
                 Model::Raon1 => "raon1",
                 Model::MuseSpark => "musespark",
                 Model::Flint => "flint",
+                Model::KimiK3 => "kimik3",
                 Model::MistralLarge4 => "mistrallarge4",
+                Model::Host => "host",
             }
         }
 
@@ -356,7 +374,10 @@ models (the --model word is optional with a model file: the file's architecture 
         /// Whether a file of the `general.architecture` `arch` is this seat's. The qwen3 seat
         /// serves a file by the program that runs its description's layers
         /// ([`bloomery_gpu_gates::qwen_seat::Family::of`]), so it answers `None` without the
-        /// first shard `file`; the other seats by the architecture alone. `qwen4exp` is not an
+        /// first shard `file`; the host seat serves `deepseek2` by name, the one architecture
+        /// whose file the host engine runs whole (it takes any other file only as a start with no
+        /// card or by the host ask, and refuses one the host engine cannot run by its coverage
+        /// list); the other seats by the architecture alone. `qwen4exp` is not an
         /// `Arch` name, which is why the seat of such a file is read from the string, and the glm
         /// seat takes both spellings of its architecture through [`Arch::from_name`].
         fn serves_arch(self, arch: &str, file: Option<&Split>) -> Option<bool> {
@@ -375,7 +396,9 @@ models (the --model word is optional with a model file: the file's architecture 
                 Model::Raon1 => matches!(Arch::from_name(arch), Ok(Arch::Raon1)),
                 Model::MuseSpark => matches!(Arch::from_name(arch), Ok(Arch::MuseSpark)),
                 Model::Flint => matches!(Arch::from_name(arch), Ok(Arch::Flint)),
+                Model::KimiK3 => matches!(Arch::from_name(arch), Ok(Arch::KimiK3)),
                 Model::MistralLarge4 => matches!(Arch::from_name(arch), Ok(Arch::MistralLarge4)),
+                Model::Host => arch == "deepseek2",
             })
         }
     }
@@ -473,7 +496,7 @@ models (the --model word is optional with a model file: the file's architecture 
                     format!(
                         "--model needs a value (a catalog model's name, or ds41, qwen38, glm, \
                          qwen3, mimo2, solar2, minimaxm3, nemotron, raon1, musespark, flint, \
-                         mistrallarge4 or {}): {USAGE}",
+                         kimik3, mistrallarge4 or {}): {USAGE}",
                         serve::decide::WORD
                     ),
                 )
@@ -508,6 +531,12 @@ models (the --model word is optional with a model file: the file's architecture 
             .join(", ")
     }
 
+    /// Whether a card is visible: the census holds one. A census that cannot be read (a driver
+    /// the start chose to go on without, at its driver door) is no card, not a refusal here.
+    fn card_visible() -> bool {
+        gpu_census::census().is_ok_and(|census| !census.is_empty())
+    }
+
     /// The seat the model file's ([`ref_model_path`]) first shard holds: the one
     /// generative seat that serves the file ([`Model::serves`]). A file of a decision
     /// row's backbone (`qwen35`, Clef's) here has no head: a generative seat
@@ -516,8 +545,12 @@ models (the --model word is optional with a model file: the file's architecture 
     /// says what would seat it. Any other file, and a shard that names no architecture, is refused by name
     /// listing the seat words; an explicit seat word that is not the file's seat is
     /// refused naming the file's. A file the Qwen3.5 body runs (Qwen3.6, a dense
-    /// `llama` trunk) is the qwen3 seat's.
-    fn seat_of_file(word: Option<Word>) -> Result<Model, GateError> {
+    /// `llama` trunk) is the qwen3 seat's. The host seat takes the file when the
+    /// placement flags ask for it (`ask`, `-dev none` or `-ngl 0`), when no card is
+    /// visible and the start named no card seat, and when it is asked for by name;
+    /// its own coverage check then refuses a file the host engine cannot run. A
+    /// card seat asked for by name beside the ask is refused by name.
+    fn seat_of_file(word: Option<Word>, ask: Option<&str>) -> Result<Model, GateError> {
         let generative = matches!(word, Some(Word::Seat(Model::Qwen3)));
         let path = ref_model_path()?;
         model_file::with_header(&path, |split| {
@@ -557,15 +590,42 @@ models (the --model word is optional with a model file: the file's architecture 
                             path.display()
                         );
                     }
-                    let seat = Model::ALL
-                        .iter()
-                        .copied()
-                        .find(|m| m.serves(split))
-                        .ok_or_else(|| {
-                            Refusal::new(Code::Unsupported, no_seat(&path, split, a))
-                                .offering(&["--recommend", "--json"])
-                        })?;
+                    let seat = match word {
+                        Some(Word::Seat(Model::Host)) => Model::Host,
+                        Some(Word::Seat(card)) => {
+                            if let Some(ask) = ask {
+                                return Err(Refusal::new(
+                                    Code::Usage,
+                                    format!(
+                                        "--model {} beside {ask}: the flags ask for the host, and \
+                                         the host seat is --model host",
+                                        card.word()
+                                    ),
+                                )
+                                .offering(&["--model", "host"])
+                                .into());
+                            }
+                            Model::ALL
+                                .iter()
+                                .copied()
+                                .find(|m| m.serves(split))
+                                .ok_or_else(|| {
+                                    Refusal::new(Code::Unsupported, no_seat(&path, split, a))
+                                        .offering(&["--recommend", "--json"])
+                                })?
+                        }
+                        _ if ask.is_some() || !card_visible() => Model::Host,
+                        _ => Model::ALL
+                            .iter()
+                            .copied()
+                            .find(|m| m.serves(split))
+                            .ok_or_else(|| {
+                                Refusal::new(Code::Unsupported, no_seat(&path, split, a))
+                                    .offering(&["--recommend", "--json"])
+                            })?,
+                    };
                     if let Some(Word::Seat(word)) = word
+                        && word != Model::Host
                         && !word.serves(split)
                     {
                         return Err(Refusal::new(
@@ -774,9 +834,19 @@ models (the --model word is optional with a model file: the file's architecture 
             }
             return refuse(Code::Usage, e);
         }
-        // A driver that cannot run the CUDA 13 code ends the start before any download.
-        if let Err(e) = serve::preflight::driver(&start::driver_found()) {
-            return refuse(Code::NoDevice, e.into());
+        // A driver that cannot run the CUDA 13 code ends a start that names a card seat, a head or
+        // a catalog model before any download. A start with a file for the file to pick its seat
+        // (no model word, or the host seat's) goes on with no card: the host seat takes it, or
+        // refuses a file it cannot run by name, and a file a card seat serves is refused for the
+        // driver once the seat is known.
+        let driver = serve::preflight::driver(&start::driver_found());
+        let host_start = name.is_none()
+            && !asked("--head")
+            && matches!(word, None | Some(Word::Seat(Model::Host)));
+        if let Err(e) = &driver
+            && !host_start
+        {
+            return refuse(Code::NoDevice, e.clone().into());
         }
         if llama_launch::serve_option(&args, llama_place::LIST_DEVICES) {
             match llama_launch::answer_list_devices(&args) {
@@ -859,6 +929,11 @@ models (the --model word is optional with a model file: the file's architecture 
             Err(e) => return refuse(Code::Usage, e),
         };
         if let Some(from) = from {
+            // The decision seat's backbone runs on a card: the driver the door let a file start
+            // go on without is asked for here.
+            if let Err(e) = &driver {
+                return refuse(Code::NoDevice, e.clone().into());
+            }
             if let Err(e) = decide::check_side(&side) {
                 return refuse(Code::Usage, e);
             }
@@ -872,10 +947,21 @@ models (the --model word is optional with a model file: the file's architecture 
             start::note_seat(serve::decide::WORD);
             return start::ended(NAME, decide::run(&rest, from, repo.as_deref()));
         }
-        let seat = match seat_of_file(word) {
+        // The placement flags' host ask (`-dev none`, `-ngl 0`), read the way the launcher
+        // reads them, decides the seat before the launcher resolves the cards it names.
+        let host_ask = match llama_launch::host_ask(&rest) {
+            Ok(v) => v,
+            Err(e) => return refuse(Code::Usage, e),
+        };
+        let seat = match seat_of_file(word, host_ask.as_deref()) {
             Ok(v) => v,
             Err(e) => return refuse(Code::Refused, e),
         };
+        if seat != Model::Host
+            && let Err(e) = driver
+        {
+            return refuse(Code::NoDevice, e.into());
+        }
         start::note_seat(seat.word());
         // llama-server's placement flags and variables, read once the seat is known: the levers some
         // are, and the `--place` word the others come to.
@@ -955,19 +1041,22 @@ models (the --model word is optional with a model file: the file's architecture 
 
     impl Machine {
         /// The census, the stage card's class (the largest visible card's, which `--place a`
-        /// stages on) in this build, the host's room and the cache's free bytes.
+        /// stages on) in this build, the host's room and the cache's free bytes. An empty census
+        /// is a zero-card machine, not an error: no row of the catalog plans on it (every pick
+        /// says why), and a `-m` start seats its file on the host seat.
         fn read() -> Result<Machine, GateError> {
             let census = gpu_census::census()?;
-            let stage = census
-                .iter()
-                .max_by_key(|d| d.total_bytes)
-                .ok_or_else(|| Refusal::new(Code::NoDevice, "no CUDA device is visible"))?;
-            let class = stage.card_class(bloomery_gpu::NATIVE_FP4).ok_or_else(|| {
-                Refusal::new(
-                    Code::NoDevice,
-                    format!("{}: the census read no compute capability", stage.name),
-                )
-            })?;
+            let class = match census.iter().max_by_key(|d| d.total_bytes) {
+                Some(stage) => stage.card_class(bloomery_gpu::NATIVE_FP4).ok_or_else(|| {
+                    Refusal::new(
+                        Code::NoDevice,
+                        format!("{}: the census read no compute capability", stage.name),
+                    )
+                })?,
+                // No card: the class of a build without the native FP4 products, which orders
+                // no row the `card_bytes` of zero does not refuse already.
+                None => model::placement::devices::CardClass::Ampere,
+            };
             let (host_room, _) = model::placement::workstation::host_available_read()?;
             let cache_root = model_file::cache_root()?;
             let cache_free = catalog::cache_free_bytes(&cache_root)?;
@@ -1255,7 +1344,9 @@ models (the --model word is optional with a model file: the file's architecture 
             Model::Raon1 => entry!(raon1),
             Model::MuseSpark => entry!(musespark),
             Model::Flint => entry!(flint),
+            Model::KimiK3 => entry!(kimi_k3),
             Model::MistralLarge4 => entry!(mistrallarge4),
+            Model::Host => entry!(host_seat),
         }
     }
 
@@ -1941,6 +2032,13 @@ models (the --model word is optional with a model file: the file's architecture 
                     .any(|l| l.starts_with(&decide) && l.contains("--frobnicate")),
                 "{both}"
             );
+        }
+
+        /// The host seat's word is the seat the launcher's host ask is placed for: the flags a
+        /// card seat refuses are the ones this seat takes.
+        #[test]
+        fn the_host_seat_is_the_seat_the_host_ask_is_for() {
+            assert_eq!(Model::Host.word(), llama_place::HOST_SEAT);
         }
 
         #[test]

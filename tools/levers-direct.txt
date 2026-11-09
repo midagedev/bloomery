@@ -41,6 +41,7 @@ crates/gpu-gates/src/lib.rs	BLOOMERY_REF_CUDA,BLOOMERY_REF_SET	gatestoml
 crates/gpu-gates/src/kld.rs	BLOOMERY_KLD_FILE	gatestoml
 crates/gpu-gates/src/bin/gate_block.rs	BLOOMERY_REF_CPU_SET	gatestoml
 crates/gpu-gates/src/bin/gate_vision_encoder.rs	BLOOMERY_VISION_SET	gatestoml
+crates/gpu-gates/src/bin/gate_host_serve.rs	BLOOMERY_DATA	stays: the data directory
 crates/gpu-gates/src/bin/gate_ds41_media.rs	BLOOMERY_VISION_SET	gatestoml
 crates/gpu-gates/src/bin/gate_ds41_serve.rs	BLOOMERY_VISION_SET	gatestoml
 # Runner handshakes (audit TL-7).
@@ -92,8 +93,16 @@ crates/decision/tests/lev.rs	BLOOMERY_DATA	stays: the data directory
 crates/vision/tests/common/mod.rs	BLOOMERY_VISION_SET	stays: the vision reference set
 crates/gpu-gates/src/tier.rs	BLOOMERY_TIER	stays: the tier a gate runs in, read once here and checked against the file it opens
 crates/gpu-gates/src/model_file/fetch.rs	BLOOMERY_CACHE,BLOOMERY_REF_MODEL,HOME	stays: a server's --hf cache, and the model named once beside the gates' variable
+crates/gpu-gates/src/bin/shared/ds41_tp.rs	HOME	stays: the TP head's record of the source files it checked, under the user's cache beside the hub's
 crates/metal/src/model_arg.rs	BLOOMERY_CACHE,HOME	stays: the Metal server's --hf cache, read where gpu-gates' fetch reads it
 crates/runtime/src/costs.rs	BLOOMERY_COSTS,HOME	stays: the cost store's directory, read where every load's expert stream and split walk keep their timings
 crates/model-hf/src/folder/scales.rs	BLOOMERY_SCALES,HOME	stays: the scale store's directory, read where a folder's open places the block scales it reads back
 crates/hf/src/fetch.rs	HF_TOKEN,HOME,HF_HUB_OFFLINE	stays: the hub token for a gated repo, and its file; the hub's own switch to stay offline
 crates/metal/src/stream.rs	BLOOMERY_METAL_BREADCRUMB	stays: the Metal crash breadcrumb
+crates/hf/src/vocab/tiktoken/tests.rs	BLOOMERY_KIMI_K3_HF,BLOOMERY_KIMI_K3_GGUF	stays: the Kimi-K3 folder and the K3 GGUF header the vocabulary gate reads (cfg(test) only)
+crates/gpu-gates/src/bin/gate_iq_quant.rs	K3Q_TREE,K3Q_FIXTURE	stays: the llama.cpp tree whose llama-quantize the gate compares with, and the K3 fixture it quantizes
+crates/gpu-gates/src/bin/gate_kimi_k3_imatrix.rs	K3Q_TREE	stays: the llama.cpp tree whose llama-imatrix and llama-quantize the gate compares with
+crates/quantize/tests/common/mod.rs	BLOOMERY_DATA	stays: the data directory
+crates/quantize/tests/hw_fixture_e2e.rs	K3Q_TREE,K3Q_FIXTURE	stays: the llama.cpp tree whose llama-quantize the gate compares with, and the K3 fixture it quantizes
+crates/quantize/tests/hw_plan_equal.rs	K3Q_TREE,K3Q_FIXTURE,K3Q_PLAN_IN,K3Q_PLAN_RULES	stays: the llama.cpp tree whose dry-run plan the gate compares with, the K3 fixture, and the optional tight-room shape and rules file
+crates/model-hf/tests/quantize_hf.rs	K3Q_WORK,K3Q_HF_CUT	stays: where the gate writes its sets, and the kimik31q cut folder when it is not under the fixture root

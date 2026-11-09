@@ -97,7 +97,8 @@ pub use head::{HEAD_K, HEAD_SIMD_GROUPS, HEAD_THREADS, HeadParams};
 pub use headnorm::HeadNormParams;
 pub use matvec::{LoadNorm, MatvecParams, Mode, NormOnLoad, Quant};
 pub use matvec_rows::{
-    HeadMParams, MROWS, MatvecMParams, NormNextMParams, PairMParams, SegMParams,
+    HeadMParams, HeadNormMParams, MROWS, MatvecMParams, NormNextMParams, PairMParams, SegMParams,
+    headnorm_m_serves,
 };
 pub use norm::NormRowsParams;
 pub use norm::{HiddenRow, MtpJoinParams};
@@ -484,46 +485,14 @@ impl Kernels {
                 count,
             )?,
             f32_seg: library.pipeline_with_simdgroups("f32_matvec_seg", count)?,
-            q4k_gemm: gemm::GemmPipelines::new(
-                library.gemm_library(),
-                "gemm_q4k",
-                library.gemm_path(),
-            )?,
-            q6k_gemm: gemm::GemmPipelines::new(
-                library.gemm_library(),
-                "gemm_q6k",
-                library.gemm_path(),
-            )?,
-            a4_gemm: gemm::GemmPipelines::new(
-                library.gemm_library(),
-                "gemm_a4",
-                library.gemm_path(),
-            )?,
-            a8_gemm: gemm::GemmPipelines::new(
-                library.gemm_library(),
-                "gemm_a8",
-                library.gemm_path(),
-            )?,
-            a4h_gemm: gemm::GemmPipelines::new(
-                library.gemm_library(),
-                "gemm_a4h",
-                library.gemm_path(),
-            )?,
-            a8h_gemm: gemm::GemmPipelines::new(
-                library.gemm_library(),
-                "gemm_a8h",
-                library.gemm_path(),
-            )?,
-            q8_0_gemm: gemm::GemmPipelines::new(
-                library.gemm_library(),
-                "gemm_q8_0",
-                library.gemm_path(),
-            )?,
-            q5k_gemm: gemm::GemmPipelines::new(
-                library.gemm_library(),
-                "gemm_q5k",
-                library.gemm_path(),
-            )?,
+            q4k_gemm: gemm::GemmPipelines::new(library.gemm_library(), "gemm_q4k")?,
+            q6k_gemm: gemm::GemmPipelines::new(library.gemm_library(), "gemm_q6k")?,
+            a4_gemm: gemm::GemmPipelines::new(library.gemm_library(), "gemm_a4")?,
+            a8_gemm: gemm::GemmPipelines::new(library.gemm_library(), "gemm_a8")?,
+            a4h_gemm: gemm::GemmPipelines::new(library.gemm_library(), "gemm_a4h")?,
+            a8h_gemm: gemm::GemmPipelines::new(library.gemm_library(), "gemm_a8h")?,
+            q8_0_gemm: gemm::GemmPipelines::new(library.gemm_library(), "gemm_q8_0")?,
+            q5k_gemm: gemm::GemmPipelines::new(library.gemm_library(), "gemm_q5k")?,
             gemm_cast: library.pipeline("gemm_cast_rows")?,
             gemm_path: library.gemm_path(),
             headnorm: library.pipeline_with_simdgroups("q4k_matvec_headnorm_resid", count)?,

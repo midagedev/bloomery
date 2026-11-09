@@ -239,6 +239,7 @@ mod gate {
             (Tier::Real, _) => Ok(PlanLevers::default()),
             (Tier::Fixture, CardBudget::Every(b)) => Ok(PlanLevers {
                 card_budget_bytes: CardBudget::Every(b),
+                ..PlanLevers::default()
             }),
             (Tier::Fixture, other) => Err(format!(
                 "{GATE}: BLOOMERY_CARD_BUDGET is {other:?}; the fixture tier sets it to the one \
@@ -320,6 +321,7 @@ mod gate {
             room: None,
             residency: Residency::Off,
             kv: KvQ8::F16,
+            kv_host: bloomery_levers::KvHost::Off,
         }
         .plan(file)?;
         let p = planned.facts();
@@ -711,6 +713,7 @@ mod gate {
             room: None,
             residency: Residency::Off,
             kv: KvQ8::F16,
+            kv_host: bloomery_levers::KvHost::Off,
         };
         let card_bytes = open.plan(model_of(path)?)?.facts().card_bytes;
         let short = match Tier::from_env()? {
@@ -720,6 +723,7 @@ mod gate {
         let budget_bytes = (card_bytes + spec.margin()).saturating_sub(short);
         let budget = PlanLevers {
             card_budget_bytes: Some(budget_bytes).into(),
+            ..PlanLevers::default()
         };
         open.plan_levers = &budget;
         let planned = open.plan(model_of(path)?)?;
@@ -878,7 +882,7 @@ mod gate {
         }
         m.reset()?;
         let mut session = app::Session::from_model(m, CTX as u32);
-        let draft = app::mtp::MtpDraft::open(session.model(), Prompt38::Auto, StepMode::Graph)?;
+        let draft = app::mtp::open_draft(session.model(), Prompt38::Auto, StepMode::Graph)?;
         let mut spec =
             session.with_draft::<app::mtp::MtpDraft<Body38>, 4>(draft, &mut crate::quiet::Quiet)?;
         let first = spec.prompt(&mut session, prompt)?;
@@ -934,6 +938,7 @@ mod gate {
             room: None,
             residency: Residency::Off,
             kv,
+            kv_host: bloomery_levers::KvHost::Off,
         }
         .plan(file)?;
         let page = os::page_bytes()?;

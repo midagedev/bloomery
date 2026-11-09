@@ -16,6 +16,7 @@ use crate::mxfp4_sel::Nvfp4Stack;
 use crate::planes::Format as PlaneFormat;
 use crate::q5::{pack_q5_0, pack_q5_1};
 use crate::q8f32::{E4m3Scales, E4m3Weight};
+use crate::room::StackRoom;
 use crate::tensor::{DeviceTensor, window};
 use crate::upload::{Stage, UploadRing, bytes_of};
 use ::model::placement::host_lock::PageDrop;
@@ -33,6 +34,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::mem::ManuallyDrop;
 use std::ops::Range;
+use std::sync::Arc;
 
 /// The lm_head tensor's name, and the token embedding that serves as it when the file ties them.
 pub use ::model::placement::HEAD_TENSOR;
@@ -131,8 +133,8 @@ pub enum DevWeight {
     },
     /// bloomery's MXFP8 file tensor (`GgmlType::MXFP8`) in the two planes of
     /// `q8f32::e4m3_planes` (`CardFormat::Mxfp8Planes`): `qs` rows × k/4
-    /// value words, `e` rows × k/128 scale words (four E8M0 bytes a word).
-    /// `k` is a multiple of 128.
+    /// value words, `e` rows × ceil(k/128) scale words (four E8M0 bytes a
+    /// word, a row's last word zero past its blocks). `k` is a multiple of 32.
     Mxfp8 {
         qs: DeviceTensor<u32>,
         e: DeviceTensor<u32>,
@@ -199,6 +201,17 @@ impl DevWeight {
         }
     }
 
+    /// The weight gone without a free of its stack, when it is a stack held
+    /// as a room ([`StackRoom`]): its tensor is a view over the room's range,
+    /// taken apart here so no `cuMemFree` reaches an address the room maps;
+    /// the caller drops the room after, and its drop drains the device. Any
+    /// other weight is dropped, as it would be anywhere.
+    fn dissolve_view(self) {
+        if let DevWeight::KQuant { w, .. } = self {
+            drop(w.into_buf().into_raw_parts());
+        }
+    }
+
     /// The device buffers this weight holds, in bytes, in allocation order:
     /// each buffer's element count times its element size, read from the
     /// buffers themselves — what was allocated, never recomputed from the
@@ -256,8 +269,17 @@ const PARTS: &str = "Weights::add_parts";
 /// multiplies; its part carries the scale ([`TensorPart::scale`]). A load checks every part it plans here before it reads any
 /// ([`Weights::add_parts`] checks each again with its bytes).
 pub fn part_format(t: &TensorInfo) -> Result<(CardFormat, usize), GpuError> {
+    part_format_as(t, None)
+}
+
+/// [`part_format`] in the card format `card` when given (a load's own choice for the tensor,
+/// such as a routed stack its plan holds as the file's blocks), else the type's.
+pub(crate) fn part_format_as(
+    t: &TensorInfo,
+    card: Option<CardFormat>,
+) -> Result<(CardFormat, usize), GpuError> {
     file_slot(&t.name)?;
-    let format = file_format(t).ok_or_else(|| {
+    let format = card.or_else(|| file_format(t)).ok_or_else(|| {
         GpuError::shape(
             PARTS,
             format!(
@@ -280,11 +302,12 @@ pub fn part_format(t: &TensorInfo) -> Result<(CardFormat, usize), GpuError> {
     Ok((format, bytes))
 }
 
-/// Each part's format, shape, scales, spans and staging bytes, checked before anything moves; a
-/// name `held` already holds is refused.
+/// Each part's format (`card`'s, else its type's), shape, scales, spans and staging bytes,
+/// checked before anything moves; a name `held` already holds is refused.
 fn part_formats(
     parts: &[TensorPart<'_>],
     held: impl Fn(&str) -> bool,
+    card: impl Fn(&TensorInfo) -> Option<CardFormat>,
 ) -> Result<(Vec<CardFormat>, usize), GpuError> {
     let mut seen = BTreeSet::new();
     let mut budget = 0usize;
@@ -294,7 +317,7 @@ fn part_formats(
         if !seen.insert(t.name.as_str()) || held(&t.name) {
             return Err(GpuError::shape(PARTS, format!("{} given twice", t.name)));
         }
-        let (format, bytes) = part_format(t)?;
+        let (format, bytes) = part_format_as(t, card(t))?;
         formats.push(format);
         let want = match t.dims.as_slice() {
             [_, _, experts] => *experts,
@@ -353,7 +376,7 @@ pub(crate) fn stage_parts(
     held: impl Fn(&str) -> bool,
     card: impl Fn(&TensorInfo) -> Option<CardFormat>,
 ) -> Result<Vec<(String, DevWeight)>, GpuError> {
-    let (formats, _) = part_formats(parts, held)?;
+    let (formats, _) = part_formats(parts, held, &card)?;
     let mut added = Vec::with_capacity(parts.len());
     for (p, format) in parts.iter().zip(formats) {
         let t = &p.info;
@@ -361,7 +384,7 @@ pub(crate) fn stage_parts(
             stream,
             ring,
             PARTS,
-            card(t).unwrap_or(format),
+            format,
             t,
             tensor_rows(t),
             &p.spans,
@@ -383,6 +406,38 @@ pub struct Weights {
     /// The file ties its head to the token embedding ([`head_tensor`]): `output.weight` is the
     /// resident `token_embd.weight`.
     tied: bool,
+    /// The rooms of the stacks held as rooms ([`StackRooms`]), by the stack's name: the
+    /// resident weight of that name is a view over its room's range, so it never leaves the
+    /// map but through this type's drop.
+    rooms: BTreeMap<String, Arc<StackRoom>>,
+}
+
+impl Drop for Weights {
+    fn drop(&mut self) {
+        // A roomed stack's tensor is a view over its room's range: taken apart without a free
+        // here, before the rooms (a field) drop and unmap what it addressed.
+        for name in self.rooms.keys() {
+            if let Some(w) = self.by_name.remove(name) {
+                w.dissolve_view();
+            }
+        }
+    }
+}
+
+/// The stacks of a placed load held as rooms ([`StackRoom`]): the file tensors whose card
+/// upload is reserved whole, every page backed at load, and the stream the rooms reserve on.
+/// A tensor not named here, or not uploaded as file blocks ([`CardFormat::KQuant`]), is a
+/// plain buffer.
+pub(crate) struct StackRooms {
+    names: BTreeSet<String>,
+    stream: Arc<CudaStream>,
+}
+
+impl StackRooms {
+    /// The tensors `names` held as rooms on `stream`'s device.
+    pub(crate) fn new(names: BTreeSet<String>, stream: Arc<CudaStream>) -> StackRooms {
+        StackRooms { names, stream }
+    }
 }
 
 /// A weight's one plane and width in a format [`Weights::join_rows`] joins
@@ -462,14 +517,28 @@ impl Weights {
         card: usize,
         card_dontneed: bool,
     ) -> Result<Weights, GpuError> {
+        Weights::load_placed_rooms(stream, split, plan, card, card_dontneed, None)
+    }
+
+    /// [`Weights::load_placed`] with the stacks `rooms` names held as rooms
+    /// ([`StackRoom`]): each reserved whole with every page backed, so with
+    /// nothing released its address, length and bytes are a plain buffer's.
+    /// `None`: every stack a plain buffer.
+    pub(crate) fn load_placed_rooms(
+        stream: &CudaStream,
+        split: &Split,
+        plan: &Plan<'_>,
+        card: usize,
+        card_dontneed: bool,
+        rooms: Option<&StackRooms>,
+    ) -> Result<Weights, GpuError> {
         let mut release = card_dontneed.then(|| PageDrop::new(split));
         load_segments(
             stream,
             split,
-            plan.model,
-            &plan.rows,
-            card,
+            (plan.model, &plan.rows, card),
             release.as_mut(),
+            rooms,
         )
     }
 
@@ -491,7 +560,7 @@ impl Weights {
         rows: &[Row],
         card: usize,
     ) -> Result<Weights, GpuError> {
-        load_segments(stream, split, model, rows, card, None)
+        load_segments(stream, split, (model, rows, card), None, None)
     }
 
     /// Upload every tensor of `split` whose name `keep` accepts, each from
@@ -524,7 +593,7 @@ impl Weights {
         parts: &[TensorPart<'_>],
     ) -> Result<(), GpuError> {
         let held = |name: &str| self.by_name.contains_key(name);
-        let (_, budget) = part_formats(parts, held)?;
+        let (_, budget) = part_formats(parts, held, |_| None)?;
         stream.context().bind_to_thread()?;
         let mut ring = UploadRing::new(stream, budget)?;
         let added = stage_parts(stream, &mut ring, parts, held, |_| None)?;
@@ -538,6 +607,7 @@ impl Weights {
         Weights {
             by_name,
             tied: false,
+            rooms: BTreeMap::new(),
         }
     }
 
@@ -580,7 +650,11 @@ impl Weights {
             );
         }
         ring.finish(stream)?;
-        Ok(Weights { by_name, tied })
+        Ok(Weights {
+            by_name,
+            tied,
+            rooms: BTreeMap::new(),
+        })
     }
 
     /// File `w` as a derived weight under `name`. The `derived.` prefix keeps
@@ -632,6 +706,7 @@ impl Weights {
     ) -> Result<(), GpuError> {
         const WHAT: &str = "Weights::join_rows";
         derived_slot_free(&self.by_name, &joint)?;
+        self.refuse_roomed(WHAT, parts)?;
         match parts.first().and_then(|&n| self.by_name.get(n)) {
             Some(DevWeight::F32 { .. }) => {
                 return self.join_plane_rows(
@@ -661,7 +736,7 @@ impl Weights {
                 return self.join_byte_rows(
                     stream,
                     (parts, joint),
-                    32,
+                    |k| k / 32,
                     |w| match w {
                         DevWeight::Q8_0 { qs, d, k } => Some((qs, d, *k)),
                         _ => None,
@@ -673,7 +748,7 @@ impl Weights {
                 return self.join_byte_rows(
                     stream,
                     (parts, joint),
-                    128,
+                    E4m3Scales::e_cols,
                     |w| match w {
                         DevWeight::Mxfp8 { qs, e, k } => Some((qs, e, *k)),
                         _ => None,
@@ -685,7 +760,7 @@ impl Weights {
                 return self.join_byte_rows(
                     stream,
                     (parts, joint),
-                    128,
+                    E4m3Scales::e_cols,
                     |w| match w {
                         DevWeight::Fp8B128 { qs, e, k } => Some((qs, e, *k)),
                         _ => None,
@@ -849,7 +924,7 @@ impl Weights {
 
     /// [`Weights::join_rows`] over parts in two planes, one byte a value
     /// (Q8_0, MXFP8 or FP8_B128): every part resident in the first part's format at its
-    /// width `k`, a `scale_values`-value scale an entry of the scale plane,
+    /// width `k`, `scale_cols(k)` entries a row of the scale plane,
     /// their rows one after another in each of the two planes (`qs` words,
     /// the scales), filed as `joint` in that format — every row the bits its
     /// own tensor holds. `planes` reads a part's planes and width, `None` for
@@ -860,7 +935,7 @@ impl Weights {
         &mut self,
         stream: &CudaStream,
         (parts, joint): (&[&str], String),
-        scale_values: usize,
+        scale_cols: fn(usize) -> usize,
         planes: PartPlanes<S>,
         wrap: fn(DeviceTensor<u32>, DeviceTensor<S>, usize) -> DevWeight,
     ) -> Result<(), GpuError> {
@@ -878,7 +953,7 @@ impl Weights {
             let want = *width.get_or_insert(k);
             if k != want
                 || qs.cols() != want / 4
-                || d.cols() != want / scale_values
+                || d.cols() != scale_cols(want)
                 || qs.rows() != d.rows()
             {
                 return Err(GpuError::shape(
@@ -905,15 +980,15 @@ impl Weights {
         let qs = unsafe { DeviceTensor::<u32>::unfilled(stream, rows, k / 4)? };
         // SAFETY: as the codes, each part's scales are copied whole below, so
         // every scale element is written; a failed copy drops it unread.
-        let d = unsafe { DeviceTensor::<S>::unfilled(stream, rows, k / scale_values)? };
+        let d = unsafe { DeviceTensor::<S>::unfilled(stream, rows, scale_cols(k))? };
         let (qs_base, d_base) = (qs.buf().cu_deviceptr(), d.buf().cu_deviceptr());
         let mut at = 0usize;
         for (part_qs, part_d) in found {
             let n = part_d.rows();
-            let (words, scales) = (n * (k / 4), n * (k / scale_values));
+            let (words, scales) = (n * (k / 4), n * scale_cols(k));
             let qs_off = u64::try_from(at * (k / 4) * size_of::<u32>())
                 .map_err(|_| GpuError::shape(WHAT, format!("row {at} passes u64")))?;
-            let d_off = u64::try_from(at * (k / scale_values) * size_of::<S>())
+            let d_off = u64::try_from(at * scale_cols(k) * size_of::<S>())
                 .map_err(|_| GpuError::shape(WHAT, format!("row {at} passes u64")))?;
             // SAFETY: rows `at .. at + n` of each plane lie inside the joint's
             // `rows` (the parts' rows sum to `rows`), and each window over the
@@ -969,8 +1044,36 @@ impl Weights {
     /// buffers and [`Weights::get`] no longer finds it. `None` when no entry
     /// has exactly that name (a tied head is the embedding's entry, not its
     /// own); the caller names the error.
+    ///
+    /// # Panics
+    /// On a stack held as a room ([`Weights::stack_room`]): its tensor is a
+    /// view the weights' drop takes apart, never one a caller frees.
     pub fn take(&mut self, name: &str) -> Option<DevWeight> {
+        assert!(
+            !self.rooms.contains_key(name),
+            "Weights::take: {name} is a stack held as a room, which stays resident"
+        );
         self.by_name.remove(name)
+    }
+
+    /// The room of the stack `name` when the load held it as one
+    /// ([`StackRooms`]): the pages a residency machine gives back and backs
+    /// again. `None` for a plain buffer.
+    pub(crate) fn stack_room(&self, name: &str) -> Option<&Arc<StackRoom>> {
+        self.rooms.get(name)
+    }
+
+    /// Refused by name when one of `names` is a stack held as a room: the
+    /// callers below free the buffers of what they move out of the map.
+    fn refuse_roomed(&self, what: &'static str, names: &[&str]) -> Result<(), GpuError> {
+        match names.iter().find(|n| self.rooms.contains_key(**n)) {
+            Some(name) => Err(GpuError::tensor(
+                what,
+                *name,
+                "a plain buffer: it is a stack held as a room",
+            )),
+            None => Ok(()),
+        }
     }
 
     /// Re-upload the resident file tensor `name` of `split` in `format`, a
@@ -999,6 +1102,7 @@ impl Weights {
             .shard(shard)
             .ok_or_else(|| GpuError::tensor(WHAT, name, "a shard the split holds"))?;
         let src = gguf.data(t)?;
+        self.refuse_roomed(WHAT, &[name])?;
         if self.by_name.remove(name).is_none() {
             return Err(GpuError::tensor(WHAT, name, "a resident weight"));
         }
@@ -1193,23 +1297,25 @@ fn placed_refusal(t: &ModelTensor, detail: String) -> GpuError {
     GpuError::shape(PLACED, format!("tensor {}: {detail}", t.name))
 }
 
-/// [`Weights::load_rows`], releasing each uploaded segment's file pages
+/// [`Weights::load_rows`] of `at` (the model's tensors, the placement rows
+/// and the card), releasing each uploaded segment's file pages
 /// through `release` when there is one, each as soon as its bytes are
-/// staged. One staging ring carries the whole load's copies and one
+/// staged, and holding the stacks `rooms` names as rooms. One staging ring
+/// carries the whole load's copies and one
 /// synchronize ends them. The file pages of the segments after the one
 /// being staged are read ahead of it ([`read_ahead`]), so the drive works
 /// while the host copies instead of between copies.
 fn load_segments(
     stream: &CudaStream,
     split: &Split,
-    model: &ModelTensors,
-    rows: &[Row],
-    card: usize,
+    at: (&ModelTensors, &[Row], usize),
     mut release: Option<&mut PageDrop<'_>>,
+    rooms: Option<&StackRooms>,
 ) -> Result<Weights, GpuError> {
+    let (model, rows, card) = at;
     stream.context().bind_to_thread()?;
-    let mut by_name = BTreeMap::new();
-    // The ring is made after `by_name` and drops before it: its drop drains
+    let mut weights = Weights::default();
+    // The ring is made after `weights` and drops before it: its drop drains
     // the copies, so no buffer of a refused load is freed while a copy still
     // writes it.
     let budget = rows
@@ -1245,13 +1351,20 @@ fn load_segments(
         |ahead| {
             for (i, &(t, seg)) in steps.iter().enumerate() {
                 ahead.begin(i).map_err(|e| GpuError::plan(PLACED, e))?;
-                let (dw, release_ranges) =
-                    upload_segment(&mut ring, stream, split, model.experts, t, seg)?;
-                if by_name.insert(t.name.clone(), dw).is_some() {
+                let (dw, room, release_ranges) =
+                    upload_segment(&mut ring, stream, split, model.experts, t, seg, rooms)?;
+                if weights.by_name.contains_key(&t.name) {
+                    if room.is_some() {
+                        dw.dissolve_view();
+                    }
                     return Err(placed_refusal(
                         t,
                         format!("has two segments on card {card}"),
                     ));
+                }
+                weights.by_name.insert(t.name.clone(), dw);
+                if let Some(room) = room {
+                    weights.rooms.insert(t.name.clone(), Arc::new(room));
                 }
                 // The reads of this step end before its pages are released,
                 // so none puts a page back.
@@ -1272,10 +1385,7 @@ fn load_segments(
             Ok(())
         },
     )?;
-    Ok(Weights {
-        by_name,
-        tied: false,
-    })
+    Ok(weights)
 }
 
 /// The file bytes of placement segment `seg` of tensor `t`, a stack of
@@ -1380,7 +1490,9 @@ impl<'f> SegmentFile<'f> {
 /// so a whole-tensor segment uploads from the mapping itself and an expert
 /// stack streams its spans without a gathered copy), and hand back the file
 /// bytes the caller may release now that they are staged — empty for a
-/// tensor a step reads from the file.
+/// tensor a step reads from the file. A stack `rooms` names is uploaded into
+/// a room, which comes back beside its weight: the weight's tensor is a view
+/// over the room, so the caller files the room before the weight can drop.
 fn upload_segment(
     ring: &mut UploadRing,
     stream: &CudaStream,
@@ -1388,7 +1500,8 @@ fn upload_segment(
     experts: u64,
     t: &ModelTensor,
     seg: &Segment,
-) -> Result<(DevWeight, PendingRelease), GpuError> {
+    rooms: Option<&StackRooms>,
+) -> Result<(DevWeight, Option<StackRoom>, PendingRelease), GpuError> {
     let Format::Card(format) = seg.format else {
         return Err(placed_refusal(t, format!("is on a card as {}", seg.format)));
     };
@@ -1411,7 +1524,15 @@ fn upload_segment(
         Some(list) if info.dims.len() == 3 => list.ids().iter().map(|&e| all[e as usize]).collect(),
         _ => all,
     });
-    let dw = upload_rows(stream, ring, PLACED, format, info, rows, &src, scale)?;
+    let (dw, room) = upload_rows_in(
+        stream,
+        ring,
+        (PLACED, format, rooms),
+        info,
+        rows,
+        &src,
+        scale,
+    )?;
     if u64::try_from(dw.resident_bytes()).ok() != Some(seg.resident_bytes) {
         // The upload's copies may still be running into the buffers this
         // error is about to drop; drain before they do.
@@ -1421,6 +1542,9 @@ fn upload_segment(
             dw.resident_bytes(),
             seg.resident_bytes
         );
+        if room.is_some() {
+            dw.dissolve_view();
+        }
         return Err(placed_refusal(t, detail));
     }
     let read_by_steps = matches!(t.role, Role::TokenEmbedding | Role::EngramTable);
@@ -1429,7 +1553,7 @@ fn upload_segment(
     } else {
         span_ranges(s, g.data_base() + info.offset, &spans)
     };
-    Ok((dw, release))
+    Ok((dw, room, release))
 }
 
 /// Pack and upload one file tensor in its kernel's device format, on a
@@ -1516,21 +1640,22 @@ fn upload_budget(t: &TensorInfo) -> usize {
 /// upload's device bytes against that size; `what` names the caller in both
 /// errors. `scale` is an NVFP4 tensor's scales ([`tensor_scales`]; a stack's
 /// those of the experts `rows` hold, in their order), which its planes
-/// carry.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "one upload's stream, ring, caller, format, tensor, rows, bytes and scale (rust-quality R8)"
-)]
-fn upload_rows(
+/// carry. `at` is the caller's name, the card format and the stacks held as
+/// rooms: a K-quant stack `rooms` names is uploaded into a room (every page
+/// backed and zeroed, the weight's tensor a view over it), which comes back
+/// beside the weight. On an error the view is taken apart before its room
+/// drops.
+fn upload_rows_in(
     stream: &CudaStream,
     ring: &mut UploadRing,
-    what: &'static str,
-    format: CardFormat,
+    at: (&'static str, CardFormat, Option<&StackRooms>),
     t: &TensorInfo,
     rows: usize,
     src: &[&[u8]],
     scale: Option<Vec<f32>>,
-) -> Result<DevWeight, GpuError> {
+) -> Result<(DevWeight, Option<StackRoom>), GpuError> {
+    let (what, format, rooms) = at;
+    let mut made = None;
     let name = t.name.as_str();
     let all_rows: u64 = t.dims[1..].iter().product();
     let layout = (rows as u64 <= all_rows)
@@ -1565,14 +1690,28 @@ fn upload_rows(
                 .ok_or_else(|| {
                     GpuError::shape(what, format!("tensor {name}: its word stream passes usize"))
                 })?;
-            let w = DeviceTensor::<u32>::zeroed(stream, rows, words / rows)?;
+            let cols = words / rows;
+            let (w, room) = match rooms.filter(|r| r.names.contains(name)) {
+                Some(r) => {
+                    let (w, room) = StackRoom::tensor(Arc::clone(&r.stream), rows, cols, what)?;
+                    (w, Some(room))
+                }
+                None => (DeviceTensor::<u32>::zeroed(stream, rows, cols)?, None),
+            };
             let stage = Stage {
                 what,
                 name,
                 dst: w.buf().cu_deviceptr(),
                 dst_bytes: w.buf().num_bytes(),
             };
-            ring.copy_bytes(stream, &stage, src, take)?;
+            if let Err(e) = ring.copy_bytes(stream, &stage, src, take) {
+                if room.is_some() {
+                    // The room drops after this, and its drop drains the copies.
+                    drop(w.into_buf().into_raw_parts());
+                }
+                return Err(e);
+            }
+            made = room;
             DevWeight::KQuant { ty: t.ty, w, k }
         }
         // The file's f32 bytes are the device's f32 bytes on this host; a run
@@ -1656,25 +1795,23 @@ fn upload_rows(
             } else {
                 E4m3Scales::Fp8B128
             };
+            let e_cols = E4m3Scales::e_cols(k);
             let (qs, e) = if t.ty == GgmlType::BF16 {
                 let (qs, e) = crate::q8f32::bf16_mxfp8_planes(&flat_of(src, take)?, rows, k)
                     .map_err(|err| GpuError::shape(what, format!("tensor {name}: {err}")))?;
                 (
                     upload_packed(stream, ring, what, name, &qs, rows, k / 4)?,
-                    upload_packed(stream, ring, what, name, &e, rows, k / 128)?,
+                    upload_packed(stream, ring, what, name, &e, rows, e_cols)?,
                 )
             } else {
-                let format = match scales {
-                    E4m3Scales::Mxfp8 => PlaneFormat::Mxfp8,
-                    E4m3Scales::Fp8B128 => PlaneFormat::Fp8B128,
-                };
+                let format = scales.planes();
                 upload_split(
                     stream,
                     ring,
                     (what, name),
-                    (format, k / 128),
+                    (format, k / format.code_bytes()),
                     (src, take),
-                    (rows, k / 4, k / 128),
+                    (rows, k / 4, e_cols),
                 )?
             };
             match scales {
@@ -1720,14 +1857,37 @@ fn upload_rows(
         // The upload's copies may still be running into the buffers this
         // error is about to drop; drain before they do.
         let _ = stream.synchronize();
-        return Err(GpuError::shape(
+        let err = GpuError::shape(
             what,
             format!(
                 "tensor {name}: {format:?} upload holds {} device bytes, its layout {size}",
                 dw.resident_bytes()
             ),
-        ));
+        );
+        if made.is_some() {
+            dw.dissolve_view();
+        }
+        return Err(err);
     }
+    Ok((dw, made))
+}
+
+/// [`upload_rows_in`] with every stack a plain buffer, the weight alone.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one upload's stream, ring, caller, format, tensor, rows, bytes and scale (rust-quality R8)"
+)]
+fn upload_rows(
+    stream: &CudaStream,
+    ring: &mut UploadRing,
+    what: &'static str,
+    format: CardFormat,
+    t: &TensorInfo,
+    rows: usize,
+    src: &[&[u8]],
+    scale: Option<Vec<f32>>,
+) -> Result<DevWeight, GpuError> {
+    let (dw, _) = upload_rows_in(stream, ring, (what, format, None), t, rows, src, scale)?;
     Ok(dw)
 }
 
@@ -2075,7 +2235,7 @@ mod tests {
                 spans,
                 scale: None,
             };
-            if !std::panic::catch_unwind(|| part_formats(&[part], |_| false))
+            if !std::panic::catch_unwind(|| part_formats(&[part], |_| false, |_| None))
                 .is_ok_and(|result| result.is_err())
             {
                 accepted.push((dims, nbytes));
@@ -2093,7 +2253,7 @@ mod tests {
             spans: vec![&[0u8; 72], &[0u8; 72]],
             scale: None,
         };
-        assert!(part_formats(&[part], |_| false).is_ok());
+        assert!(part_formats(&[part], |_| false, |_| None).is_ok());
     }
 
     /// Every type with a card format takes a part, and of the types a tensor scale multiplies only
@@ -2115,7 +2275,7 @@ mod tests {
                 spans: vec![&bytes],
                 scale: row.ty.reads_scale().then(|| vec![1.0]),
             };
-            let result = part_formats(&[part], |_| false);
+            let result = part_formats(&[part], |_| false, |_| None);
             if row.card.layout.is_some() && (!row.ty.reads_scale() || row.ty == GgmlType::NVFP4) {
                 assert!(result.is_ok(), "{}: {result:?}", row.ty);
             } else {
@@ -2155,7 +2315,7 @@ mod tests {
         let row = [32, 2];
         let none = |_: &str| false;
         let ok = [part("a", q8, &row, None), part("b", wide, &row, None)];
-        let (formats, budget) = part_formats(&ok, none).unwrap_or_else(|e| panic!("{e}"));
+        let (formats, budget) = part_formats(&ok, none, |_| None).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(formats.len(), 2);
         // Q8_0 [32, 2] stages 68 plane bytes, F32 [32, 2] 256.
         assert_eq!(budget, 68 + 256);
@@ -2164,7 +2324,7 @@ mod tests {
             nv("n", &[64, 2], Some(vec![0.5])),
             nv("s", &[64, 1, 3], Some(vec![0.5; 3])),
         ];
-        assert!(part_formats(&scaled, none).is_ok());
+        assert!(part_formats(&scaled, none, |_| None).is_ok());
         for (bad, says) in [
             (
                 vec![part("a", q8, &row, None), part("a", wide, &row, None)],
@@ -2192,13 +2352,13 @@ mod tests {
                 "reads 0 finite tensor scales",
             ),
         ] {
-            let e = part_formats(&bad, none)
+            let e = part_formats(&bad, none, |_| None)
                 .map(|_| ())
                 .unwrap_err()
                 .to_string();
             assert!(e.contains(says), "{e}");
         }
-        let e = part_formats(&ok[..1], |name| name == "a")
+        let e = part_formats(&ok[..1], |name| name == "a", |_| None)
             .map(|_| ())
             .unwrap_err();
         assert!(e.to_string().contains("a given twice"), "{e}");

@@ -1,0 +1,16 @@
+# sweep mutant box-live
+# clause: (b) box removal gets the retired names and their stale -suffix dirs, never a live track
+#   (tools/sweep.sh --self-test)
+# site: tools/sweep.sh box_pick, a live row whose name starts with the retired name picked in every mode
+# expected red: "sweep: self-test FAIL: (b) box-tracks calls: box.log is [list⏎--remove bloomery-landed bloomery-landed-base bloomery-landed-x] …"
+--- a/tools/sweep.sh
++++ b/tools/sweep.sh
+@@ -83,7 +83,7 @@
+       [ -n "$name" ] || continue
+       case $state in
+         stale) [ "$name" = "$b" ] || case $name in "$b"-?*) ;; *) continue ;; esac ;;
+-        live) [ "$dry" = 1 ] && [ "$name" = "$b" ] || continue ;;
++        live) case $name in "$b" | "$b"-?*) ;; *) continue ;; esac ;;
+         aux) [ "$dry" = 1 ] && [ "$owner" = "$b" ] || continue ;;
+         *) continue ;;
+       esac

@@ -1,0 +1,11 @@
+--- a/crates/model/src/arch/kimi_k3/hparams.rs
++++ b/crates/model/src/arch/kimi_k3/hparams.rs
+@@ -240,7 +240,7 @@
+     /// `attn_res.block_size`th layer, the first included.
+     #[must_use]
+     pub fn banks(&self, l: usize) -> bool {
+-        l.is_multiple_of(self.attn_res_block)
++        (l + 1).is_multiple_of(self.attn_res_block)
+     }
+ 
+     /// The delta layers' inner width: the heads' channels.

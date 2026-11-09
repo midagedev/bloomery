@@ -289,6 +289,7 @@ pub fn two_card(
     let ctx = u64::try_from(ctx)?;
     let budget = PlanLevers {
         card_budget_bytes: Some(TWO_BUDGET).into(),
+        ..PlanLevers::default()
     };
     let plan = inputs.plan(&two, ctx, &budget)?;
     let on_tier = plan.tier_n_l.first().cloned().unwrap_or_default();

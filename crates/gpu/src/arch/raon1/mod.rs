@@ -1,6 +1,7 @@
 //! `raon1` — Raon-1-mini on one card: the chain ([`body`]), Raon_mHC's
 //! streams ([`mhc`]), the SiTU feed-forward blocks and the 128/6 router
-//! ([`ffn`]), the RDA layer ([`rda`]) and the gated latent layer ([`mla`]);
+//! ([`crate::arch::routed_ffn`]), the RDA layer ([`rda`]) and the gated latent layer
+//! ([`crate::arch::gated_mla`], whose wide arm is [`mla`]);
 //! the passes of several rows — a verify, a prompt call's chunks — and the
 //! taps a block draft reads ([`rows`]), over the RDA stores' lanes
 //! ([`state`]); and a prompt's units of more rows than a pass, which run the
@@ -8,9 +9,8 @@
 //! `model::arch::raon1`.
 
 mod body;
-mod ffn;
 mod mhc;
-pub mod mla;
+mod mla;
 pub mod rda;
 mod rows;
 mod state;
@@ -18,6 +18,6 @@ mod state;
 mod synth;
 mod wide;
 
+pub use crate::route_body::sigmoid_128_6;
 pub use body::Body;
-pub use ffn::sigmoid_128_6;
 pub use mhc::{HC_OUT, STREAMS};

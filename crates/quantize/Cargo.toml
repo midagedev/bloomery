@@ -1,0 +1,20 @@
+[package]
+name = "bloomery-quantize"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+description = "bloomery-quantize's host side: the plan, the checks and the set writer of the IQ1_S/IQ2_XXS quantizer; the card is a Backend the binary supplies"
+
+[lib]
+name = "quantize"
+
+[lints]
+workspace = true
+
+[dependencies]
+bloomery-gguf = { path = "../gguf" }
+# The host rule's rows run on the resident pool (`--cpu`).
+bloomery-threads = { path = "../threads" }
+bloomery-os.workspace = true
+thiserror.workspace = true

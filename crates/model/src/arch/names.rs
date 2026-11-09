@@ -182,6 +182,30 @@ pub fn indexer_k_norm(l: usize) -> String {
     blk(l, "indexer.k_norm.weight")
 }
 
+/// The stem of `blk.{l}.indexer.k_norm.bias` — the bias of the index key's LayerNorm, whose gain
+/// is [`indexer_k_norm`]; a family spells the full name `blk(l, INDEXER_K_NORM_B)`.
+pub const INDEXER_K_NORM_B: &str = "indexer.k_norm.bias";
+
+/// `blk.{l}.indexer.attn_k.weight` — the index-key projection of a pooled row. Its presence is
+/// what makes a layer an index-key owner.
+#[must_use]
+pub fn indexer_attn_k(l: usize) -> String {
+    blk(l, "indexer.attn_k.weight")
+}
+
+/// `blk.{l}.indexer.attn_q_b.weight` — the indexer's query projection. Its presence is what makes
+/// a layer run the top-k selection.
+#[must_use]
+pub fn indexer_attn_q_b(l: usize) -> String {
+    blk(l, "indexer.attn_q_b.weight")
+}
+
+/// `blk.{l}.indexer.proj.weight` — the indexer's per-head score weights.
+#[must_use]
+pub fn indexer_proj(l: usize) -> String {
+    blk(l, "indexer.proj.weight")
+}
+
 // ----------------------------------------------------- the KDA mixer's names ([`crate::arch::kda`])
 
 /// `blk.{l}.ssm_conv1d_{part}.weight` — the conv taps of the `q`, `k` or `v` channels, one set per
@@ -201,6 +225,12 @@ pub fn ssm_f_a(l: usize) -> String {
 #[must_use]
 pub fn ssm_f_b(l: usize) -> String {
     blk(l, "ssm_f_b.weight")
+}
+
+/// `blk.{l}.ssm_g.weight` — the delta layer's output gate projection, one value for each channel.
+#[must_use]
+pub fn ssm_g(l: usize) -> String {
+    blk(l, "ssm_g.weight")
 }
 
 /// `blk.{l}.ssm_g_a.weight` — the output gate's down projection.
@@ -295,7 +325,7 @@ mod tests {
     #[test]
     fn the_per_layer_names_are_the_gguf_spellings() {
         type Name = fn(usize) -> String;
-        let table: [(Name, &str); 30] = [
+        let table: [(Name, &str); 33] = [
             (attn_norm, "attn_norm.weight"),
             (attn_q, "attn_q.weight"),
             (attn_k, "attn_k.weight"),
@@ -318,6 +348,9 @@ mod tests {
             (indexer_k_proj, "indexer.k_proj.weight"),
             (indexer_q_norm, "indexer.q_norm.weight"),
             (indexer_k_norm, "indexer.k_norm.weight"),
+            (indexer_attn_k, "indexer.attn_k.weight"),
+            (indexer_attn_q_b, "indexer.attn_q_b.weight"),
+            (indexer_proj, "indexer.proj.weight"),
             (ssm_f_a, "ssm_f_a.weight"),
             (ssm_f_b, "ssm_f_b.weight"),
             (ssm_g_a, "ssm_g_a.weight"),
@@ -331,6 +364,7 @@ mod tests {
             assert_eq!(name(7), format!("blk.7.{stem}"));
         }
         assert_eq!(ffn_down_shexp(7), "blk.7.ffn_down_shexp.weight");
+        assert_eq!(blk(7, INDEXER_K_NORM_B), "blk.7.indexer.k_norm.bias");
         assert_eq!(ssm_conv1d(7, 'q'), "blk.7.ssm_conv1d_q.weight");
         assert_eq!(ssm_conv1d(7, 'v'), "blk.7.ssm_conv1d_v.weight");
     }
@@ -392,6 +426,13 @@ pub fn attn_k_b(l: usize) -> String {
 #[must_use]
 pub fn attn_v_b(l: usize) -> String {
     blk(l, "attn_v_b.weight")
+}
+
+/// `blk.{l}.attn_gate.weight` — the latent layer's output gate projection, one value for each
+/// value the heads write.
+#[must_use]
+pub fn attn_gate(l: usize) -> String {
+    blk(l, "attn_gate.weight")
 }
 
 /// The sub-layer a hyper-connection mix feeds: the mixer or the feed-forward block.

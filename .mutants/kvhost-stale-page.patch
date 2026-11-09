@@ -1,0 +1,25 @@
+# kvhost mutant stale-page
+# clause: the share-across-backings gate (crates/gpu/src/room/mod.rs, the hw test
+#   hw_held_rooms_share_across_backings in the same file's tests): own_from skips the copy for
+#   a page it backs on the host, so the host room's page keeps the fresh allocation's bytes
+#   instead of the source's rows.
+# site: crates/gpu/src/room/mod.rs Room::own_from — the copy into the scratch mapping skipped
+#   for a host-backed fresh page.
+# expected red: "  hw_held_rooms_share_across_backings ... Host row 0 after the page took its
+#   own memory: ... FAIL" (the card-into-host direction; the host-into-card direction copies
+#   a card page and stays green)
+--- a/crates/gpu/src/room/mod.rs
++++ b/crates/gpu/src/room/mod.rs
+@@ -676,6 +676,10 @@
+                 .map_err(driver("cuMemSetAccess"))?;
+             fresh.push((i, map, own, va));
+         }
+-        let sent =
+-            (fresh.iter()).try_for_each(|&(i, _, _, va)| self.copy(va, self.va(i), self.page));
++        let sent = (fresh.iter()).try_for_each(|&(i, _, ref own, va)| {
++            if own.is_host() {
++                return Ok(());
++            }
++            self.copy(va, self.va(i), self.page)
++        });
+         let waited = self.stream.synchronize();

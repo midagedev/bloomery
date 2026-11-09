@@ -26,6 +26,10 @@
 //! `ds41_ffn_handoff_10_cols_tier` is `_10_cols`'s of such a layer, every
 //! column's tier places and activation into the row's tier image
 //! ([`HandoffKernels::enqueue_handoff_cols_tier`]).
+//! `ffn_handoff_n_tier` is the same writes of a layer at any slot count, the count a
+//! launch argument ([`HandoffKernels::enqueue_handoff_tier_n`]): a model whose router picks a
+//! count the per-count entries are not built for (Kimi K3's 16) uses it, and the per-count
+//! entries stay as they are.
 
 use std::fmt;
 use std::sync::Arc;
@@ -931,6 +935,111 @@ mod handoff_kernels {
             );
         }
     }
+
+    /// The handoff of a tier layer at `n_used` slots a token, the count a launch argument: the
+    /// writes of [`ds41_ffn_handoff_8_tier`] with `n_used` in place of eight. Thread `d < n`
+    /// copies the activation's value `d` into the host image and the tier image; threads `s <
+    /// n_used` copy slot `s`'s id and weight into the host image and write its place in the
+    /// stage card's stacks (`sel`) and in the tier's (`tsel`, and the tier image's places). An id
+    /// not below `n_expert` raises [`FaultSite::ExpertId`] there and its places are [`HOST`].
+    /// Thread 0 copies the region's sequence word. The go that follows orders every write before
+    /// its generation.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            ids_in.len() >= n_used,
+            w_in.len() >= n_used,
+            map.len() >= row_off + n_expert,
+            tmap.len() >= row_off + n_expert,
+            x.len() >= n,
+            seq.len() >= 1,
+            n >= n_used,
+            ids_at >= seq_at + 1,
+            wts_at >= ids_at + n_used,
+            x_at >= wts_at + n_used,
+            image.len() >= x_at + n,
+            tx_at >= tsel_at + n_used,
+            timage.len() >= tx_at + n,
+            sel.len() >= n_used,
+            tsel.len() >= n_used
+        )
+    )]
+    pub fn ffn_handoff_n_tier(
+        ids_in: &[u32],
+        w_in: &[f32],
+        map: &[u32],
+        tmap: &[u32],
+        row_off: u32,
+        n_expert: u32,
+        n_used: u32,
+        x: &[f32],
+        seq: &[u32],
+        n: u32,
+        seq_at: u32,
+        ids_at: u32,
+        wts_at: u32,
+        x_at: u32,
+        tsel_at: u32,
+        tx_at: u32,
+        fault: FaultSink,
+        mut image: DisjointSlice<u32>,
+        mut timage: DisjointSlice<u32>,
+        mut sel: DisjointSlice<u32>,
+        mut tsel: DisjointSlice<u32>,
+    ) {
+        let d = thread::index_1d().get();
+        if d >= n as usize {
+            return;
+        }
+        // SAFETY: d < n <= x.len(), x_at + d < x_at + n <= image.len() and tx_at + d < tx_at + n <=
+        // timage.len() by the launch contract; the words past x_at and past tx_at are the
+        // activation's alone, and thread d is each word's only writer.
+        unsafe {
+            let v = (*x.get_unchecked(d)).to_bits();
+            *image.get_unchecked_mut(x_at as usize + d) = v;
+            *timage.get_unchecked_mut(tx_at as usize + d) = v;
+        }
+        if d < n_used as usize {
+            // SAFETY: d < n_used <= ids_in.len() and w_in.len() by the launch contract.
+            let (id, w) = unsafe { (*ids_in.get_unchecked(d), *w_in.get_unchecked(d)) };
+            let (place, tplace) = if id < n_expert {
+                // SAFETY: id < n_expert, so row_off + id < map.len() and tmap.len() by the launch
+                // contract.
+                unsafe {
+                    (
+                        *map.get_unchecked(row_off as usize + id as usize),
+                        *tmap.get_unchecked(row_off as usize + id as usize),
+                    )
+                }
+            } else {
+                fault.raise(FaultSite::ExpertId);
+                (HOST, HOST)
+            };
+            // SAFETY: d < n_used <= sel.len() and tsel.len(); ids_at + d and wts_at + d lie in the
+            // routing's two spans, tsel_at + d in the places' span, which the contract keeps apart
+            // from each other, from seq_at and from the activations, all inside their images; thread
+            // d is each of those words' only writer.
+            unsafe {
+                *image.get_unchecked_mut(ids_at as usize + d) = id;
+                *image.get_unchecked_mut(wts_at as usize + d) = w.to_bits();
+                *sel.get_unchecked_mut(d) = place;
+                *tsel.get_unchecked_mut(d) = tplace;
+                *timage.get_unchecked_mut(tsel_at as usize + d) = tplace;
+            }
+        }
+        if d == 0 {
+            // SAFETY: seq.len() >= 1, and seq_at < ids_at is inside the image and no other span's
+            // word, by the launch contract; thread 0 alone writes it.
+            unsafe { *image.get_unchecked_mut(seq_at as usize) = *seq.get_unchecked(0) };
+        }
+    }
 }
 
 /// What a handoff entry of `N` slots reads ([`handoff_at`]): its arguments
@@ -1478,6 +1587,59 @@ impl HandoffKernels {
         Ok(())
     }
 
+    /// [`HandoffKernels::enqueue_handoff_tier`] at any slot count (`ffn_handoff_n_tier`): the
+    /// boundary's `n_used` slots, one to the activation's width, the count a launch argument. A
+    /// layout whose slot counts differ between the boundary and the tier image, a tier image that
+    /// is not the f32 activation of one column, and a count past the activation are refused by
+    /// name. One launch. Asynchronous, allocation-free, capturable.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one launch's routing, maps, targets, sink and places (rust-quality R8)"
+    )]
+    pub fn enqueue_handoff_tier_n(
+        &self,
+        stream: &CudaStream,
+        h: &Handoff<'_>,
+        tmap: &DeviceBuffer<u32>,
+        (target, ttarget): (HandoffTarget<'_>, TierTarget<'_>),
+        fault: FaultSink,
+        (sel, tsel): (&mut DeviceBuffer<u32>, &mut DeviceBuffer<u32>),
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "ffn_handoff_n_tier";
+        let (lay, tl) = (target.layout, ttarget.layout);
+        check_tier_n(&lay, &tl)?;
+        let n = lay.hidden;
+        let grid = launch_u32(WHAT, "grid", n.div_ceil(HANDOFF_THREADS as usize))?;
+        let cfg = LaunchConfig1D::new(grid, HANDOFF_THREADS, 0);
+        let prep = self.module.prepare_ffn_handoff_n_tier(cfg)?;
+        self.module.ffn_handoff_n_tier(
+            stream,
+            &prep,
+            h.ids,
+            h.weights,
+            h.map,
+            tmap,
+            launch_u32(WHAT, "row_off", h.row_off)?,
+            launch_u32(WHAT, "n_expert", h.n_expert)?,
+            launch_u32(WHAT, "n_used", lay.n_used)?,
+            target.x,
+            target.seq,
+            launch_u32(WHAT, "n", n)?,
+            launch_u32(WHAT, "seq_at", lay.seq)?,
+            launch_u32(WHAT, "ids_at", lay.ids)?,
+            launch_u32(WHAT, "wts_at", lay.weights)?,
+            launch_u32(WHAT, "x_at", lay.x)?,
+            launch_u32(WHAT, "tsel_at", tl.sel)?,
+            launch_u32(WHAT, "tx_at", tl.x)?,
+            fault,
+            target.image,
+            ttarget.image,
+            sel,
+            tsel,
+        )?;
+        Ok(())
+    }
+
     /// Enqueue the handoff of `m` columns of ten slots in one launch
     /// (`ds41_ffn_handoff_10_cols`): column `c`'s routing — `h`'s ids and
     /// weights from word `c·pitch`, `pitch` words a column — and its
@@ -1654,6 +1816,32 @@ fn check_tier(lay: &HandoffLayout, tl: &TierImageLayout) -> Result<HandoffSlots,
     slots.map_err(|e| GpuError::shape("HandoffKernels::enqueue_handoff_tier", e.to_string()))
 }
 
+/// [`HandoffKernels::enqueue_handoff_tier_n`]'s layout contract, by name before the launch: the
+/// boundary carries at least one slot and no more than the activation's values, the tier image
+/// the same slot count and the activation in f32, one column.
+fn check_tier_n(lay: &HandoffLayout, tl: &TierImageLayout) -> Result<(), GpuError> {
+    if lay.n_used == 0
+        || lay.n_used > lay.hidden
+        || tl.n_used != lay.n_used
+        || tl.x_len != lay.hidden
+        || tl.q3_words != 0
+        || tl.d8_len != 0
+        || tl.cols != 1
+    {
+        return Err(GpuError::Shape {
+            what: "HandoffKernels::enqueue_handoff_tier_n",
+            detail: format!(
+                "the boundary carries {} slots of {} values and the tier image {} slots of {} f32 \
+                 values, {} code words, {} scales and {} columns; the entry hands over matching \
+                 slots (at least one, no more than the activation's values) and the activation \
+                 in f32, one column",
+                lay.n_used, lay.hidden, tl.n_used, tl.x_len, tl.q3_words, tl.d8_len, tl.cols
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// [`HandoffKernels::enqueue_handoff_cols`]'s refusals, by name before the
 /// launch: a layout of another slot count, `m` of 0, a pitch under ten, and a
 /// `sel` of `sel_len` places shorter than `m` columns of ten.
@@ -1740,7 +1928,9 @@ pub struct Places<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{HandoffRefused, HandoffSlots, check_cols, check_cols_tier, check_tier};
+    use super::{
+        HandoffRefused, HandoffSlots, check_cols, check_cols_tier, check_tier, check_tier_n,
+    };
     use crate::host::page::HandoffLayout;
     use crate::host::tier::TierImageLayout;
 
@@ -1865,5 +2055,52 @@ mod tests {
         }
         assert!(check_cols(&lay, (11, 0), 80).is_err(), "no columns");
         assert!(check_cols(&lay, (9, 2), 80).is_err(), "a pitch under ten");
+    }
+
+    /// The any-count tier handoff takes every slot count from one to the activation's width and
+    /// refuses, by name, a mismatched image, a count of zero or past the activation, and a
+    /// tier image that is not one f32 column.
+    #[test]
+    fn the_any_count_tier_handoff_takes_every_count_and_refuses_a_bad_image() {
+        for n_used in 0..=HIDDEN + 2 {
+            let lay = HandoffLayout {
+                n_used,
+                ..boundary()
+            };
+            let tl = TierImageLayout {
+                n_used,
+                x: n_used,
+                ..image(1)
+            };
+            assert_eq!(
+                check_tier_n(&lay, &tl).is_ok(),
+                (1..=HIDDEN).contains(&n_used),
+                "{n_used} slots"
+            );
+        }
+        let lay = HandoffLayout {
+            n_used: 2,
+            ..boundary()
+        };
+        let tl = TierImageLayout {
+            n_used: 2,
+            x: 2,
+            ..image(1)
+        };
+        assert!(check_tier_n(&lay, &tl).is_ok());
+        let bad = [
+            TierImageLayout { n_used: 3, ..tl },
+            TierImageLayout {
+                x_len: HIDDEN + 1,
+                ..tl
+            },
+            TierImageLayout { q3_words: 1, ..tl },
+            TierImageLayout { d8_len: 1, ..tl },
+            TierImageLayout { cols: 2, ..tl },
+        ];
+        for b in bad {
+            let e = check_tier_n(&lay, &b).expect_err("a layout the entry does not take");
+            assert!(e.to_string().contains("enqueue_handoff_tier_n"), "{e}");
+        }
     }
 }

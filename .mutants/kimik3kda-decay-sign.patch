@@ -1,0 +1,11 @@
+--- a/crates/gpu/src/linear/conv.rs
++++ b/crates/gpu/src/linear/conv.rs
+@@ -453,7 +453,7 @@
+     const { assert!(GATE == KDA_GATE_SIGMOID || GATE == KDA_GATE_SOFTPLUS) };
+     if GATE == KDA_GATE_SIGMOID {
+         let r = mul_rn_f32(f + dt, sa);
+-        expf_ik(mul_rn_f32(lb, sigmoid(-r)))
++        expf_ik(mul_rn_f32(lb, sigmoid(r)))
+     } else {
+         expf_ik(mul_rn_f32(softplus(f + dt), sa))
+     }

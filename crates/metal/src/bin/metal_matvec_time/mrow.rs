@@ -13,13 +13,13 @@
 //! the join's normed rows, the only form the M-row pair and head have.
 //!
 //! The shapes are the 27B step's own mat-vec launches — the two P1 segment
-//! groups, the attention out, the dense FFN's down and gate-up, and the head
+//! groups, the delta layers' head-normed out projection, the attention out,
+//! the dense FFN's down and gate-up, and the head
 //! over the whole vocabulary — and the `mean` row is the step's M-row
 //! mat-vec time over its 1-row time: each shape's ratio weighted by its share
-//! of the 1-row step, its launches a step (48 delta layers, 16 attention
-//! layers, 64 FFNs, one head) times the 1-row arm's own median. The delta
-//! layers' out projection — the head-normed residual mat-vec — has no M-row
-//! entry and no row here: its share is the one the mean leaves out.
+//! of the 1-row step, its launches a step (48 delta layers — the P1 and the
+//! out projection each —, 16 attention layers, 64 FFNs, one head) times the
+//! 1-row arm's own median.
 //!
 //! The bands the `expect` lines name are the MTP design's M-row decomposition
 //! of a verify pass: the family earns its place only while the measured ratio
@@ -33,9 +33,9 @@ use bloomery_metal::buffer::MetalBuffer;
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::instance::{FfnAxes, Key, QWEN35MOE_GDN48, QWEN35MOE_GQA6, open_key};
 use bloomery_metal::kernels::{
-    HEAD_SIMD_GROUPS, HeadMParams, HeadParams, Kernels, LoadNorm, MROWS, MatvecMParams,
-    MatvecParams, Mode, PairMParams, PairParams, Quant, SIMD_GROUPS_PER_GROUP, SegMParams,
-    SegParams, Segment,
+    HEAD_SIMD_GROUPS, HeadMParams, HeadNormMParams, HeadNormParams, HeadParams, Kernels, LoadNorm,
+    MROWS, MatvecMParams, MatvecParams, Mode, PARTIALS_PER_HEAD, PairMParams, PairParams, Quant,
+    SIMD_GROUPS_PER_GROUP, SegMParams, SegParams, Segment,
 };
 
 use super::{
@@ -54,6 +54,12 @@ const DELTA_SEGMENTS: [usize; 4] = [10_240, 6144, 48, 48];
 const ATTN_SEGMENTS: [usize; 3] = [12_288, 1024, 1024];
 const OUT_COLS: usize = 6144;
 
+/// The delta out projection's columns (the 48 value heads' own width) and the
+/// partial sums a row of the delta step leaves, the axes the opened
+/// instance's delta holds (`QWEN35MOE_GDN48.key.delta`).
+const DELTA_COLS: usize = 48 * 128;
+const DELTA_PARTIALS: usize = 48 * PARTIALS_PER_HEAD;
+
 const QUANT: Quant = Quant::A4;
 
 /// The M the family runs, beside the 1-row arm.
@@ -70,6 +76,8 @@ enum MShape {
         name: &'static str,
         segments: &'static [usize],
     },
+    /// The gated delta net's out projection: the head-normed residual mat-vec.
+    HeadNorm,
     /// The plain mat-vec, adding into the stream.
     Matvec {
         name: &'static str,
@@ -83,11 +91,12 @@ enum MShape {
 }
 
 /// The shapes of the 27B's step.
-const SHAPES: [MShape; 6] = [
+const SHAPES: [MShape; 7] = [
     MShape::Seg {
         name: "delta_p1",
         segments: &DELTA_SEGMENTS,
     },
+    MShape::HeadNorm,
     MShape::Seg {
         name: "attn_p1",
         segments: &ATTN_SEGMENTS,
@@ -107,22 +116,25 @@ const SHAPES: [MShape; 6] = [
 ];
 
 /// Each shape's launches in one 27B step, in the shapes' order: the 48 gated
-/// delta layers' P1, the 16 attention layers' P1 and out projection, the 64
-/// layers' dense FFNs (a gate-up and a down each), and the one head.
-const STEP_LAUNCHES: [u32; SHAPES.len()] = [48, 16, 16, 64, 64, 1];
+/// delta layers' P1 and out projection, the 16 attention layers' P1 and out
+/// projection, the 64 layers' dense FFNs (a gate-up and a down each), and the
+/// one head.
+const STEP_LAUNCHES: [u32; SHAPES.len()] = [48, 48, 16, 16, 64, 64, 1];
 
 /// Where the `mean` row's weights come from.
 const STEP_BASIS: &str = "the 27B step's launches a shape times the 1-row arm's median";
 
 /// The band the design's M-row decomposition predicts for the weighted mean at
-/// M = 2.
+/// M = 2. The delta out shape is inside the mean; the band is re-derived from
+/// the device run.
 const EXPECT: (f64, f64) = (1.05, 1.20);
 
 /// The band the kernels' own instruction counts predict for the same mean:
 /// each shape's time is the larger of its DRAM time and its arithmetic's, the
 /// arithmetic being the loop's issue slots at 65 to 100 % of the GPU's issue
 /// rate (16 cores of four schedulers at 1.296 GHz), and the 1-row time the
-/// shape's own 1-row median.
+/// shape's own 1-row median. The delta out shape is inside the mean; the band
+/// is re-derived from the device run.
 const DERIVED: (f64, f64) = (0.95, 1.50);
 
 impl MShape {
@@ -130,6 +142,7 @@ impl MShape {
     fn cols(&self) -> usize {
         match self {
             Self::Seg { .. } | Self::Pair | Self::Head => HIDDEN,
+            Self::HeadNorm => DELTA_COLS,
             Self::Matvec { cols, .. } => *cols,
         }
     }
@@ -138,6 +151,7 @@ impl MShape {
     fn out_words(&self) -> usize {
         match self {
             Self::Seg { segments, .. } => segments.iter().sum(),
+            Self::HeadNorm => HIDDEN,
             Self::Matvec { .. } | Self::Pair => self.rows_of(),
             Self::Head => VOCAB,
         }
@@ -163,6 +177,7 @@ impl MShape {
                     .collect::<Vec<_>>()
                     .join("+")
             ),
+            Self::HeadNorm => format!("mrow delta_out headnorm a4 {HIDDEN}x{DELTA_COLS} resid"),
             Self::Matvec { name, rows, cols } => {
                 format!("mrow {name} a4 {rows}x{cols} resid")
             }
@@ -218,7 +233,8 @@ impl MShape {
 
 /// One shape's shared buffers: the working set every arm reads, the
 /// activation rows every arm's M rows come from, the gain (whose first words
-/// are the scaled entries' scale words), and the pair's one id.
+/// are the scaled entries' scale words), the delta heads' partial sums (the
+/// head-normed entry's two rows), and the pair's one id.
 struct ShapeBufs {
     weights: MetalBuffer<u8>,
     /// The one tensor's bytes (the window every dispatch takes).
@@ -227,6 +243,7 @@ struct ShapeBufs {
     copies: usize,
     x: MetalBuffer<f32>,
     gain: MetalBuffer<f32>,
+    partials: MetalBuffer<f32>,
     ids: MetalBuffer<i32>,
 }
 
@@ -368,17 +385,19 @@ pub(super) fn main(run: &Run) -> ExitCode {
 }
 
 /// The pipelines whose resources the probe prints: the 1-row entries of the
-/// four launches and the M-row entries the verify runs.
-const PIPELINES: [&str; 9] = [
+/// five launches and the M-row entries the verify runs.
+const PIPELINES: [&str; 11] = [
     "a4_matvec_resid",
     "a4_matvec_seg",
     "a4_pair_swiglu",
     "a4_head_logits",
+    "a4_matvec_headnorm_resid",
     "a4_matvec_resid_m2",
     "a4_matvec_seg_m2",
     "a4_matvec_seg_scaled_m2",
     "a4_pair_swiglu_scaled_m2",
     "a4_head_logits_scaled_m2",
+    "a4_matvec_headnorm_m2",
 ];
 
 /// One `pipeline` row an entry: the most threads a threadgroup of it may hold
@@ -454,6 +473,18 @@ fn shape_bufs(device: &MetalDevice, shape: &MShape, at: u64) -> Result<ShapeBufs
     let gain = device
         .upload(stream, &vec![1.0f32; shape.cols()])
         .map_err(why)?;
+    // The head-normed entry's two rows of partial sums, drawn positive and
+    // finite so the head scales are: the scales' work is the same whatever
+    // the values.
+    let partials = device
+        .upload(
+            stream,
+            &super::oracle::activations(M * DELTA_PARTIALS, 0x5D50 + at, 1.0)
+                .into_iter()
+                .map(f32::abs)
+                .collect::<Vec<_>>(),
+        )
+        .map_err(why)?;
     let ids = device.upload(stream, &[0i32]).map_err(why)?;
     Ok(ShapeBufs {
         weights,
@@ -462,6 +493,7 @@ fn shape_bufs(device: &MetalDevice, shape: &MShape, at: u64) -> Result<ShapeBufs
         copies,
         x,
         gain,
+        partials,
         ids,
     })
 }
@@ -590,6 +622,51 @@ fn time_one(
                                 gain: gain()?,
                                 eps: EPS,
                             },
+                            fault: device.fault_word(),
+                            layer: LAYER_NONE,
+                        },
+                    )
+                    .map_err(|e| e.to_string()),
+                (MShape::HeadNorm, 1) => kernels
+                    .headnorm_resid(
+                        encoder,
+                        HeadNormParams {
+                            quant: QUANT,
+                            rows: HIDDEN,
+                            cols: DELTA_COLS,
+                            weights: w,
+                            g: bufs.x.window(Elems(0), Elems(DELTA_COLS)).map_err(why)?,
+                            partials: bufs
+                                .partials
+                                .window(Elems(0), Elems(DELTA_PARTIALS))
+                                .map_err(why)?,
+                            y: out,
+                            eps: EPS,
+                            fault: device.fault_word(),
+                            layer: LAYER_NONE,
+                        },
+                    )
+                    .map_err(|e| e.to_string()),
+                (MShape::HeadNorm, _) => kernels
+                    .headnorm_m(
+                        encoder,
+                        HeadNormMParams {
+                            quant: QUANT,
+                            m,
+                            rows: HIDDEN,
+                            cols: DELTA_COLS,
+                            weights: w,
+                            g: bufs
+                                .x
+                                .window(Elems(0), Elems(m * DELTA_COLS))
+                                .map_err(why)?,
+                            partials: bufs
+                                .partials
+                                .window(Elems(0), Elems(m * DELTA_PARTIALS))
+                                .map_err(why)?,
+                            y: out,
+                            out_stride: HIDDEN,
+                            eps: EPS,
                             fault: device.fault_word(),
                             layer: LAYER_NONE,
                         },
@@ -756,12 +833,14 @@ mod tests {
     }
 
     /// The launches a step makes are one count a shape, in the shapes' order,
-    /// and the P1 of 48 delta layers outweighs the 16 attention layers'.
+    /// and the P1 and the out projection of 48 delta layers outweigh the 16
+    /// attention layers'.
     #[test]
     fn the_step_launches_are_a_count_a_shape() {
         assert_eq!(STEP_LAUNCHES.len(), SHAPES.len());
         assert_eq!(STEP_LAUNCHES[0], 48);
-        assert_eq!(STEP_LAUNCHES[1], 16);
+        assert_eq!(STEP_LAUNCHES[1], 48);
+        assert_eq!(STEP_LAUNCHES[2], 16);
         assert!(matches!(
             SHAPES[0],
             MShape::Seg {
@@ -769,13 +848,14 @@ mod tests {
                 ..
             }
         ));
+        assert!(matches!(SHAPES[1], MShape::HeadNorm));
         assert!(matches!(
-            SHAPES[1],
+            SHAPES[2],
             MShape::Seg {
                 name: "attn_p1",
                 ..
             }
         ));
-        assert!(matches!(SHAPES[5], MShape::Head));
+        assert!(matches!(SHAPES[6], MShape::Head));
     }
 }

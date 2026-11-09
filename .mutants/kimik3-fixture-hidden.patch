@@ -1,0 +1,11 @@
+--- a/crates/model/src/arch/kimi_k3/fixture.rs
++++ b/crates/model/src/arch/kimi_k3/fixture.rs
+@@ -57,7 +57,7 @@
+ pub const LAYER_MAP: [usize; 4] = [0, 46, 83, 84];
+ 
+ /// The hidden the mini writes: `embedding_length`, the residual stream and the router's row.
+-pub const HIDDEN: u64 = 512;
++pub const HIDDEN: u64 = 256;
+ /// The heads the mini writes: the latent layer's query heads and the delta layers' key and value
+ /// heads. The delta head's width stays the real file's 128.
+ pub const HEADS: u64 = 2;

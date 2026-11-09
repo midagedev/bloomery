@@ -47,7 +47,8 @@ use super::session::SessionError;
 use crate::buffer::MetalBuffer;
 use crate::fault::MetalFaultWord;
 use crate::geom::Geometry;
-use crate::kernels::{HeadMap, Quant, Segment, segments_for_window};
+use crate::geometry::MROWS;
+use crate::kernels::{HeadMap, Quant, Segment, headnorm_m_serves, segments_for_window};
 use crate::residency::Alloc;
 
 const WHAT: &str = "qwen35moe arena";
@@ -956,6 +957,7 @@ impl Arena {
                 match &l.mixer {
                     MixerBufs::Delta(d) => Layer::Delta {
                         qkv: d.p1.projection(),
+                        out_one_at: headnorm_m_serves(d.out_quant, MROWS).then_some(MROWS),
                         ffn,
                         residual,
                     },

@@ -9,12 +9,10 @@ use gguf::Split;
 use models::KdaGate;
 
 use super::roles::{KINDS, stems_of};
+use crate::arch::delta_mla::{self, Mla, Situ};
 use crate::arch::hybrid::{layers_agree, no_nextn};
 use crate::arch::noaux::{self, Experts};
-use crate::arch::{
-    dims_agree, finite_positive, kda, meta_usize, metadata, n_vocab, optional_f32, per_layer_count,
-    positive, unread_keys_of,
-};
+use crate::arch::{dims_agree, finite_positive, kda, metadata, n_vocab, positive, unread_keys_of};
 use crate::placement::PlacementError;
 
 /// What a layer mixes with, from `attention.head_count_kv`.
@@ -24,39 +22,6 @@ pub enum Kind {
     Rda,
     /// 1 key head: a gated latent-attention layer without a rope.
     Mla,
-}
-
-/// The latent layers' widths.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Mla {
-    /// `attention.q_lora_rank`: the query latent's values.
-    pub q_lora: usize,
-    /// `attention.kv_lora_rank`: the key and value latent's values, the width of the value the
-    /// heads attend over before their up projection.
-    pub kv_lora: usize,
-    /// `attention.key_length_mla`: a query head's values: the no-position values then the
-    /// unrotated ones.
-    pub head_k: usize,
-    /// `attention.value_length_mla`: a head's output values.
-    pub head_v: usize,
-    /// `rope.dimension_count`: the key values beside the latent that no rope turns, shared by
-    /// every head.
-    pub pe: usize,
-}
-
-impl Mla {
-    /// A query head's values before the absorption: `head_k` less the unrotated ones.
-    #[must_use]
-    pub fn nope(&self) -> usize {
-        self.head_k - self.pe
-    }
-
-    /// The cached row's values a position: the latent and the unrotated key values
-    /// (`attention.key_length`).
-    #[must_use]
-    pub fn row(&self) -> usize {
-        self.kv_lora + self.pe
-    }
 }
 
 /// The hyper-connection (Raon_mHC) keys.
@@ -77,15 +42,6 @@ impl Hc {
     pub fn mix_dim(&self) -> usize {
         2 * self.streams + (self.streams - 1) * (self.streams - 1)
     }
-}
-
-/// The `situ` activation's keys: the gate's and the up path's bounds.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Situ {
-    /// `activation.situ_beta`: the gate's bound.
-    pub gate_beta: f32,
-    /// `activation.situ_linear_beta`: the up path's bound.
-    pub value_beta: f32,
 }
 
 /// The hyperparameters of one raon1 file.
@@ -179,29 +135,12 @@ impl Hparams {
         no_nextn(split)?;
         let n_embd = positive(split, "embedding_length")?;
         let n_head = positive(split, "attention.head_count")?;
-        let kinds = kinds(split, n_layer)?;
+        let kinds = delta_mla::kinds(split, n_layer, (Kind::Rda, Kind::Mla))?;
         let mla = Mla::read(split)?;
+        value_length_agrees(split, &mla)?;
         let kda = kda::read(split, n_head, &mut defaults)?;
-        let gate = match optional_f32(split, "kda.gate_lower_bound")? {
-            Some(lower_bound) if lower_bound.is_finite() && lower_bound < 0.0 => {
-                KdaGate::Sigmoid { lower_bound }
-            }
-            Some(lower_bound) => {
-                return Err(metadata(
-                    split,
-                    "kda.gate_lower_bound",
-                    format!("is {lower_bound}; the bounded decay needs a finite bound below 0"),
-                ));
-            }
-            None => {
-                defaults.push(
-                    "kda.gate_lower_bound = softplus decay (absent, src/models/raon1.cpp)"
-                        .to_string(),
-                );
-                KdaGate::Softplus
-            }
-        };
-        let dense_lead = dense_lead_of(split, n_layer)?;
+        let gate = kda::gate(split, "src/models/raon1.cpp", &mut defaults)?;
+        let dense_lead = delta_mla::dense_lead_of(split, n_layer)?;
         let hp = Hparams {
             n_layer,
             n_embd,
@@ -282,27 +221,7 @@ impl Hparams {
                 dims.extend(kda::tail_dims(self.n_embd, self.n_head, self.kda.head_dim));
                 dims
             }
-            Kind::Mla => {
-                let m = &self.mla;
-                let (q, kv, k, v) = (
-                    m.q_lora as u64,
-                    m.kv_lora as u64,
-                    m.head_k as u64,
-                    m.head_v as u64,
-                );
-                vec![
-                    ("attn_norm.weight", vec![e]),
-                    ("attn_q_a.weight", vec![e, q]),
-                    ("attn_q_a_norm.weight", vec![q]),
-                    ("attn_q_b.weight", vec![q, h * k]),
-                    ("attn_kv_a_mqa.weight", vec![e, m.row() as u64]),
-                    ("attn_kv_a_norm.weight", vec![kv]),
-                    ("attn_k_b.weight", vec![m.nope() as u64, kv, h]),
-                    ("attn_v_b.weight", vec![kv, v, h]),
-                    ("attn_gate.weight", vec![e, h * v]),
-                    ("attn_output.weight", vec![h * v, e]),
-                ]
-            }
+            Kind::Mla => self.mla.dims(e, h).to_vec(),
         };
         dims.push(("ffn_norm.weight", vec![e]));
         if self.dense(l) {
@@ -332,51 +251,6 @@ impl Hparams {
 /// A sublayer's mix scalars: `alpha_pre`, `alpha_post`, `alpha_z` and `eta`.
 pub const HC_SCALES: u64 = 4;
 
-impl Mla {
-    fn read(split: &Split) -> Result<Mla, PlacementError> {
-        let mla = Mla {
-            q_lora: positive(split, "attention.q_lora_rank")?,
-            kv_lora: positive(split, "attention.kv_lora_rank")?,
-            head_k: positive(split, "attention.key_length_mla")?,
-            head_v: positive(split, "attention.value_length_mla")?,
-            pe: positive(split, "rope.dimension_count")?,
-        };
-        if mla.pe >= mla.head_k {
-            return Err(metadata(
-                split,
-                "attention.key_length_mla",
-                format!(
-                    "is {}, not above rope.dimension_count {}: a head needs values besides the \
-                     unrotated ones",
-                    mla.head_k, mla.pe
-                ),
-            ));
-        }
-        // The cache holds the latent and the unrotated values as the key, and the latent as the
-        // value: the generic key and value lengths say so, and the body reads the rows by them.
-        for (key, want, what) in [
-            (
-                "attention.key_length",
-                mla.row(),
-                "kv_lora_rank + rope.dimension_count",
-            ),
-            ("attention.value_length", mla.kv_lora, "kv_lora_rank"),
-        ] {
-            let got = positive(split, key)?;
-            if got != want {
-                return Err(metadata(
-                    split,
-                    key,
-                    format!(
-                        "is {got}, not {what} ({want}): the cached row is the latent and its unrotated values"
-                    ),
-                ));
-            }
-        }
-        Ok(mla)
-    }
-}
-
 impl Hc {
     fn read(split: &Split) -> Result<Hc, PlacementError> {
         let streams = positive(split, "hyper_connection.count")?;
@@ -395,56 +269,22 @@ impl Hc {
     }
 }
 
-impl Situ {
-    fn read(split: &Split) -> Result<Situ, PlacementError> {
-        Ok(Situ {
-            gate_beta: finite_positive(split, "activation.situ_beta")?,
-            value_beta: finite_positive(split, "activation.situ_linear_beta")?,
-        })
-    }
-}
-
-/// `leading_dense_block_count`, required, below the layer count: a trunk with no routed layer
-/// is another reader's decision.
-fn dense_lead_of(split: &Split, n_layer: usize) -> Result<usize, PlacementError> {
-    let key = "leading_dense_block_count";
-    let lead = meta_usize(split, key)?;
-    if lead >= n_layer {
+/// The cache holds the latent as the value: the generic `attention.value_length` is the latent's
+/// width, and the body reads the rows by it.
+fn value_length_agrees(split: &Split, mla: &Mla) -> Result<(), PlacementError> {
+    let got = positive(split, "attention.value_length")?;
+    if got != mla.kv_lora {
         return Err(metadata(
             split,
-            key,
-            format!("is {lead} for {n_layer} layers; at least one layer must route"),
+            "attention.value_length",
+            format!(
+                "is {got}, not kv_lora_rank ({}): the cached row is the latent and its unrotated \
+                 values",
+                mla.kv_lora
+            ),
         ));
     }
-    Ok(lead)
-}
-
-/// Every layer's kind from `attention.head_count_kv`: 0 an RDA layer, 1 a latent one, as
-/// llama.cpp's loader decides it; both kinds are in the file.
-fn kinds(split: &Split, n_layer: usize) -> Result<Vec<Kind>, PlacementError> {
-    let key = "attention.head_count_kv";
-    let kinds = per_layer_count(split, key, n_layer)?
-        .into_iter()
-        .enumerate()
-        .map(|(l, kv)| match kv {
-            0 => Ok(Kind::Rda),
-            1 => Ok(Kind::Mla),
-            other => Err(metadata(
-                split,
-                key,
-                format!("is {other} at layer {l}; 0 marks a delta layer, 1 a latent one"),
-            )),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let rda = kinds.iter().filter(|k| **k == Kind::Rda).count();
-    if rda == 0 || rda == n_layer {
-        return Err(metadata(
-            split,
-            key,
-            format!("has {rda} delta layers of {n_layer}; the trunk mixes both kinds"),
-        ));
-    }
-    Ok(kinds)
+    Ok(())
 }
 
 #[cfg(test)]

@@ -26,6 +26,20 @@ use safetensors::{Dtype, Folder, Raw};
 use crate::folder::Constant;
 use crate::folder::scales::Decoded;
 
+/// `runs` in order, merged where they overlap or lie at most `gap` apart: a reader reads
+/// through so short a gap rather than list each run.
+pub fn merge_runs(mut runs: Vec<Range<u64>>, gap: u64) -> Vec<Range<u64>> {
+    runs.sort_unstable_by_key(|r| r.start);
+    let mut out: Vec<Range<u64>> = Vec::with_capacity(runs.len().min(16));
+    for r in runs {
+        match out.last_mut() {
+            Some(last) if r.start <= last.end.saturating_add(gap) => last.end = last.end.max(r.end),
+            _ => out.push(r),
+        }
+    }
+    out
+}
+
 /// The most stored bytes one direct read of a stack's sources holds, unless a single source is
 /// larger ([`Checkpoint::read_stack`]).
 const STACK_READ_MAX: u64 = 32 << 20;
@@ -142,6 +156,12 @@ impl Checkpoint {
         self
     }
 
+    /// The folder the checkpoint reads.
+    #[must_use]
+    pub fn folder(&self) -> &Folder {
+        &self.folder
+    }
+
     /// The tensors the map makes, by name.
     #[cfg(test)]
     pub(crate) fn made(&self) -> &BTreeMap<String, Made> {
@@ -218,6 +238,50 @@ impl Checkpoint {
         Ok(self
             .whole_sources(name, m, p)?
             .unwrap_or_else(|| self.placed(m)))
+    }
+
+    /// The file byte runs [`Source::read`] of part `p` reads, in source order, each stored
+    /// tensor's runs merged where they lie at most `gap` apart ([`merge_runs`]): a part that cuts
+    /// its sources' rows, each weight's and block scale's runs of it ([`modelopt::part_runs`]);
+    /// any other part, every stored tensor of the sources it reads whole; a constant, none.
+    ///
+    /// # Errors
+    ///
+    /// A tensor the map does not make, and a refusal of [`modelopt::part_runs`], by name.
+    pub fn reads(&self, p: &Planned, gap: u64) -> Result<Vec<(PathBuf, Range<u64>)>, Error> {
+        let name = p.info.name.as_str();
+        if self.constants.contains_key(name) {
+            return Ok(vec![]);
+        }
+        let m = self
+            .made
+            .get(name)
+            .ok_or_else(|| refuse(name, "is not one the map makes"))?;
+        let runs = match (&p.at, self.whole_sources(name, m, p)?) {
+            (Some(At::Along(dim, r)), None) if m.step.is_none() => modelopt::part_runs(
+                |n| self.folder.raw(n),
+                &self.placed(m),
+                m.role,
+                &m.dims,
+                (*dim, r.clone()),
+            )?,
+            _ => stored(&self.read_from(name, m, p)?)
+                .map(|n| {
+                    let whole = 0..self.folder.raw(n)?.bytes.len() as u64;
+                    Ok((n.to_string(), vec![whole]))
+                })
+                .collect::<Result<_, Error>>()?,
+        };
+        let mut out = Vec::new();
+        for (n, runs) in runs {
+            let (path, at) = self.folder.file_range(&n)?;
+            out.extend(
+                merge_runs(runs, gap)
+                    .into_iter()
+                    .map(|r| (path.clone(), at.start + r.start..at.start + r.end)),
+            );
+        }
+        Ok(out)
     }
 
     /// The sources part `p` of `name`, made as `m`, streams in bounded direct reads

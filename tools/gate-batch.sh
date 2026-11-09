@@ -3,7 +3,7 @@
 # the box is reached only through the recipes (tools/box.sh) and each item keeps the bound and the
 # exit code its recipe's runner owns (tools/gate.sh, tools/gpu-gate.sh, 900 s). This script adds no
 # second bound.
-#   tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--tier real|fixture] [--ledger [--trust-rounds] [--no-gpu-hold] | --round-ledger] [--rerun] [--no-canary] [--red-main-check] [--wait-hold [SECONDS]]
+#   tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--tier real|fixture] [--ledger [--trust-rounds] [--trust-fast] [--no-gpu-hold] [--yield] | --fast-ledger [--trust-rounds] [--no-gpu-hold] [--yield] | --round-ledger] [--rerun] [--no-canary] [--red-main-check] [--wait-hold [SECONDS]]
 #   tools/gate-batch.sh --classes     every recipe's class, the classifier below, and nothing else
 #   tools/gate-batch.sh --self-test [--part K|all]   the placement rules on a fixture justfile and the disk floor
 #                                      against a fake df (check-recipes runs it: every part at once, see self_test)
@@ -296,6 +296,19 @@
 # its own line (`<item> rc=deferred <real-only|no-fixture|real-file|variant|fixture-only> lane=- tier=<real|fixture> deferred=1`), counted in `total=` and in no other rc class; a
 # yielded item (`rc=yield`, above) is counted the same way, in `yielded=` when any did. Exit 0
 # iff every rc is 0 (or deferred, yielded, or a ledger skip).
+# Red attribution. With a ledger (--ledger or --round-ledger) a red item's line (final rc not 0 and not 75) gains, before `item=`,
+#   last_green=<commit>@<date> tier=<real|fixture> card=<card>   the item's newest green ledger row of any key in the files this
+#                                                                batch reads: the commit and date it recorded, and the tier and
+#                                                                card its parts file (<ledger>.parts/<key>.parts) says it ran at;
+#                                                                `last_green=none` when no row names the item; a row whose parts
+#                                                                were not kept prints `tier=unknown card=unknown`
+#   range=<last_green>..<head> commits=<n> touching=[<%h %an>; …]  the commits between them that touched a file the item's key reads
+#                                                                (`recipes.py key --files`), the newest three; a version-only edit of a
+#                                                                member's manifest or Cargo.lock, which the key is blind to, is not one
+# The item matches by recipe, other env entries and ARGS, whatever its card entry (BLOOMERY_GATE_CARD), so a green on the other card
+# shows with its card. `range=` is `unknown (<why>)` when the green's commit is not in this repository (a `-dirty` suffix is cut), the
+# file list cannot be read, or this tree is no repository; a green at this very commit prints `commits=0 touching=none`: no commit
+# changed anything the key reads, so the red is the run's, not a change's. Never a guessed range. A batch without a ledger adds nothing.
 # --red-main-check is off unless named. An item whose final rc is a red gate — not 0, not a yield,
 # not rc 75 (contention, which retries above and is not a verdict) — is run once more from the local
 # origin/main: the same recipe, the same args and the same box env, so the same card, and no second
@@ -366,7 +379,15 @@
 #                             key is not re-run at landing; an agent saying "green" is not a record).
 #                             The tool cannot tell a move from a change, so the flag is that judgment.
 #   --round-ledger            the lead's, then the rounds'; writes the rounds'.
-# A skip names its source, `src=lead` or `src=round`, in run.log and the dry run. A rebase moves the
+#   --fast-ledger             the landing batch of a `just affected --fast` list (its first line says `affected (fast)`): the lead's, then
+#                             the rounds' with --trust-rounds, then its own file; writes the fast file, ${BLOOMERY_GATE_FAST_LEDGER:-~/.cache/
+#                             bloomery/gate-ledger-fast.tsv}. It is the lead's batch (it takes the GPU hold) and takes only such a list: --smoke,
+#                             --weekly, items and any other list are refused (64).
+#   --ledger --trust-fast     the lead's, then the fast file: only with this flag does a release-grade batch read a fast landing's greens. The
+#                             release batch (tools/release/publish.sh, tools/release/sitting.sh) never passes it, so a release re-runs what a fast
+#                             landing trusted. A list whose first line says `affected (fast)` is refused (64) under --ledger and --round-ledger.
+# A skip names its source, `src=lead`, `src=round` or `src=fast`, in run.log and the dry run; a fast batch's DONE line carries `ledger=fast`.
+# A rebase moves the
 # key of every item whose closure the landed commits touched, so a landing still reruns those; the
 # saving is in the items the rebase left alone.
 # Each item's input key is `tools/recipes.py key` (its section header lists the parts): its own target
@@ -464,6 +485,17 @@
 # the lead's own next step needs.
 # --dry-run prints the hold it
 # would take and touches nothing.
+# --yield (with --ledger): the follower's mode, a batch of background work that gives way to everything else on the box. It writes the
+# lead's ledger like the lead's batch, takes no GPU hold (--no-gpu-hold is implied), runs in the V4.1 load queue's idle-fill class
+# (BLOOMERY_V41_CLASS=4) and the box queue's `fill` class (BLOOMERY_Q_CLASS, unless the caller names one), and yields as a round
+# batch does, to more than the GPU hold: every box call of the batch has BLOOMERY_BOX_WAIT=0, so an item that finds the timing
+# lease or a sitting's hold up (tools/ref/lease-probe.sh's guard) or the lead's own hold on this side (tools/box.sh --hold) ends
+# rc 75 at once, and an item whose gpu-gate.sh call finds a batch hold up ends 75 at its first probe (BLOOMERY_HOLD_YIELD=1). Such
+# an item ends `rc=yield held by <what>: not retried (the follower yields; the next pass runs it again)` — <what> is `timing-lease`,
+# `hold:<owner>` (a sitting's or this side's hold) or `batch-hold:<owner>`, comma-joined when several are up. It counts in the DONE
+# line's `yielded=`, writes no times row and no ledger record (`ledger=yield`), and leaves the exit code 0: a yield is no red gate.
+# The next pass over the same list runs it, since nothing was recorded. A plain card-lock 75 (another run holds the card) keeps
+# today's wait and retry. A --round-ledger batch already yields to the GPU hold and takes no --yield.
 # Stopping a batch (INT/TERM, and a lane found dead): the trap signals only the pids written at spawn under DIR (lane-*.pid,
 # lane-*.child), then the box.sh calls the items registered. `just` does not take the box.sh under it with it on Linux (dash keeps a
 # sh between them; the Mac's sh execs it), so each item's `just` runs with BLOOMERY_BOX_PIDDIR=DIR/lane-<L>.box (the pack's:
@@ -524,7 +556,7 @@ CHAIN_SOLO_REAL='gate-gpu-ds41-residency-a gate-gpu-glm5next-e2e gate-gpu-glm5ne
 # self-test's numbers).
 PACK_BUDGET=262185889800
 
-USAGE="usage: tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--tier real|fixture] [--ledger [--trust-rounds] [--no-gpu-hold] | --round-ledger] [--rerun] [--over-budget-ok] [--no-canary] [--red-main-check] [--wait-hold [SECONDS]] | --classes | --self-test [--part K|all]"
+USAGE="usage: tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--tier real|fixture] [--ledger [--trust-rounds] [--trust-fast] [--no-gpu-hold] [--yield] | --fast-ledger [--trust-rounds] [--no-gpu-hold] [--yield] | --round-ledger] [--rerun] [--over-budget-ok] [--no-canary] [--red-main-check] [--wait-hold [SECONDS]] | --classes | --self-test [--part K|all]"
 die() { echo "gate-batch: $*" >&2; exit "${RC:-64}"; }
 
 # The append, for the ledger and the times file: a ledger record's parts file first (its parts exist
@@ -661,7 +693,7 @@ try_waits() {
     index($0, t) == 1 { on = 1; next }
     /^=== try / { on = 0 }
     on && match($0, /after [0-9]+ s: the command starts/) { split(substr($0, RSTART + 6), a, " "); w += a[1] }
-    on && match($0, /^gpu-gate\.sh: waited [0-9]+ s for the (gate lock|V4\.1 load lock|batch hold)/) { split(substr($0, RSTART + 20), a, " "); w += a[1] }
+    on && match($0, /^gpu-gate\.sh: waited [0-9]+ s for the (gate lock|V4\.1 load lock|batch hold|sitting hold)/) { split(substr($0, RSTART + 20), a, " "); w += a[1] }
     END { print w + 0 }' "$1"
 }
 
@@ -678,6 +710,26 @@ hold75_owner() {
     on && match($0, /the batch hold [^ ]+ \(owner [^)]+\) (was still up after [0-9]+ s \(CARD_BOUND [0-9]+ s\)|is up: yielding at the first probe)/) {
       s = substr($0, RSTART, RLENGTH); sub(/.*\(owner /, "", s); sub(/\).*/, "", s); print s; exit
     }' "$1"
+}
+
+# guard75_owner <log> <try>: what the try's rc 75 names when it ended on the box's guard instead of a gate lock — tools/ref/lease-probe.sh's
+# lease_guard with no wait (a --yield batch's items run with BLOOMERY_BOX_WAIT=0): `timing-lease` when the lease was held,
+# `hold:<owner>` for each sitting hold up (and for the lead's own hold on this side, tools/box.sh's `the box is on hold for <owner>`),
+# comma-joined in the order printed — or '' when the 75 was not the guard's (a card lock, the V4.1 load lock, a GPU batch hold).
+guard75_owner() {
+  awk -v t="=== try $2 " '
+    index($0, t) == 1 { on = 1; next }
+    /^=== try / { on = 0 }
+    on && /^\[guard\] .*the box is busy and BLOOMERY_BOX_WAIT=0 does not wait: the command did not run \(rc 75\)/ { busy = 1 }
+    on && /^\[guard\]   the timing lease .* is held/ { add("timing-lease") }
+    on && match($0, /^\[guard\]   hold [^ ]+ owner=[A-Za-z0-9_]+/) {
+      s = substr($0, RSTART, RLENGTH); sub(/.* owner=/, "", s); add("hold:" s)
+    }
+    on && match($0, /^box\.sh: the box is on hold for [A-Za-z0-9_]+/) {
+      s = substr($0, RSTART, RLENGTH); sub(/.*hold for /, "", s); busy = 1; add("hold:" s)
+    }
+    function add(w) { out = out (out == "" ? "" : ",") w }
+    END { if (busy && out != "") print out }' "$1"
 }
 
 # The disk floor, the header's «Disk floor». floor_gib resolves the floor once (the constant, or
@@ -744,7 +796,7 @@ disk_ok() { # $1 a path whose volume must hold the floor free; one verdict line,
 # builds on never split across parts), and runs the fixture, the helpers and the locals above and between them itself.
 # `--self-test` starts every part and sums their counts; `--self-test --part K` runs one (K, or `all`: the parts one
 # after another in this process, the serial form). The summary names the three slowest cases.
-SELFTEST_PARTS=19
+SELFTEST_PARTS=22
 self_test() {
   local self t h n=0 bad=0 out rc real_classes part=${1:-all} case_t0=$SECONDS
   gb_part() {
@@ -1262,6 +1314,7 @@ for kv in ${BLOOMERY_BOX_ENV:-}; do export "$kv"; done
 word=${*##* }
 for d in ${FAKE_START_DELAY:-}; do [ "${d%%=*}" != "$word" ] || sleep "${d#*=}"; done
 printf '%s\t%s\n' "${BLOOMERY_BOX_ENV:-}" "$*" >> "$st/box.log"
+printf '%s\t%s\t%s\n' "${BLOOMERY_BOX_WAIT-unset}" "${BLOOMERY_Q_CLASS-unset}" "$*" >> "$st/callenv.log" # the call's own env: the guard's wait and the queue class
 # FAKE_RC83=<n> (the item's env): the first n calls end 83 as tools/box.sh does when a job of another tree holds the dir lock.
 if [ -n "${FAKE_RC83:-}" ] && [ "$(cat "$st/rc83.n" 2> /dev/null || echo 0)" -lt "$FAKE_RC83" ]; then
   echo $(($(cat "$st/rc83.n" 2> /dev/null || echo 0) + 1)) > "$st/rc83.n"
@@ -1288,6 +1341,25 @@ while [ "$n" -lt "${FAKE_DEFER:-0}" ]; do
   echo "deferred(real) oracle: fake clause $n"
   n=$((n + 1))
 done
+# FAKE_GUARD75=<lease | hold=<owner> | lease+hold=<owner> | local=<owner>>: box.sh's guard in front of the call. A call whose env has
+# BLOOMERY_BOX_WAIT=0 ends 75 at once, naming what is up as tools/ref/lease-probe.sh words it (local: this side's own hold, tools/box.sh);
+# any other waits FAKE_HOLD_WAIT seconds first and ends 75 at its bound.
+if [ -n "${FAKE_GUARD75:-}" ]; then
+  if [ "${BLOOMERY_BOX_WAIT:-}" = 0 ]; then
+    echo '[guard] 2026-11-03T00:00:00Z the box is busy and BLOOMERY_BOX_WAIT=0 does not wait: the command did not run (rc 75):' >&2
+  else
+    sleep "${FAKE_HOLD_WAIT:-0}"
+    echo "[guard] 2026-11-03T00:30:00Z still busy after 1800 s (the bound, BLOOMERY_BOX_WAIT=${BLOOMERY_BOX_WAIT:-1800}): the command did not run (rc 75):" >&2
+  fi
+  case $FAKE_GUARD75 in
+    local=*) echo "box.sh: the box is on hold for ${FAKE_GUARD75#local=} (5m ago): a freeze — rc 75, contention, not a failure: the call did not run" >&2 ;;
+    *)
+      case $FAKE_GUARD75 in lease*) echo '[guard]   the timing lease /root/bloomery-cpu.lock is held (a sitting runs); its holders:' >&2 ;; esac
+      case $FAKE_GUARD75 in *hold=*) echo "[guard]   hold /root/bloomery-${FAKE_GUARD75##*hold=}-hold owner=${FAKE_GUARD75##*hold=} up=0h00m05s since=1 — its owner passes with BLOOMERY_HOLD_OWNER" >&2 ;; esac
+      ;;
+  esac
+  exit 75
+fi
 # The rc 75 tools/gpu-gate.sh ends on at a bound, for the retry and yield cases: FAKE_CARD75=1 the plain
 # card-lock queue, FAKE_HOLD75=<owner> a GPU hold another batch put up (that bound's line names its owner).
 # A call with BLOOMERY_HOLD_YIELD=1 in its env ends at once, as gpu-gate.sh does at its first probe; any other waits FAKE_HOLD_WAIT seconds first.
@@ -1364,9 +1436,25 @@ if a[:1] == ["opens"]:
     for n in a[1:]:
         print(table.get(n, f"none\t{n}"))
     sys.exit(0)
-items, i, pd = [], 1, None
+if a[:2] == ["key", "--files"]:
+    # `key --files ITEM`: FAKE_FILES (comma separated, `path~blind` for a member-version-blind one) or FAKE_FILES_RC (it fails)
+    import os
+    d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "fake-state")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "filescalls.log"), "a") as fh:
+        fh.write(a[2] + "\n")
+    if os.environ.get("FAKE_FILES_RC"):
+        sys.stderr.write("stub key --files failed\n")
+        sys.exit(int(os.environ["FAKE_FILES_RC"]))
+    for f in os.environ.get("FAKE_FILES", "").split(","):
+        if f:
+            print(f.replace("~", "\t"))
+    sys.exit(0)
+items, i, pd, led_files = [], 1, None, []
 while i < len(a):
     if a[i].startswith("--"):
+        if a[i] in ("--ledger", "--round-ledger", "--fast-ledger"):
+            led_files.append(a[i + 1])
         if a[i] == "--box-env":
             import os
             d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "fake-state")
@@ -1384,6 +1472,12 @@ green = set()
 if os.environ.get("FAKE_GREEN_FILE"):
     with open(os.environ["FAKE_GREEN_FILE"]) as fh:
         green = {ln.strip() for ln in fh if ln.strip()}
+# FAKE_LEDGER_READ=1: the ledger files the call names are read, a key in the first column of any is a skip (the real reader's rule, minus the hash shape)
+if os.environ.get("FAKE_LEDGER_READ") == "1":
+    for lf in led_files:
+        if os.path.exists(lf):
+            with open(lf) as fh:
+                green |= {ln.split("\t")[0] for ln in fh if ln.strip()}
 # FAKE_KEY_SALT: another key for the same item (another model file, say); FAKE_KEY_ERROR=1: the item is unkeyed.
 # A recheck is a key call without --ledger. FAKE_MOVE_ITEM: that item's recheck key differs from its plan key.
 # FAKE_RECHECK_ERROR_ITEM: that item's recheck line is an error. FAKE_RECHECK_RC: the recheck process fails.
@@ -1558,7 +1652,7 @@ FP
     # AWAIT: the fake's FAKE_AWAIT_MAP, DELAY: its FAKE_START_DELAY (the header above the fake)
     # The box queue's daemon is the twin cases' fake (fake-ssh, twinq/): no case reaches a real box.
     FAKE_AWAIT_MAP=${AWAIT:-} FAKE_START_DELAY=${DELAY:-} BOXQ_SSH="$t/tools/fake-ssh" BOXQ_POLL_S=0.2 \
-      BLOOMERY_GATE_TIMES=$times BLOOMERY_GATE_LEDGER=$t/lead-$tag.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-$tag.tsv \
+      BLOOMERY_GATE_TIMES=$times BLOOMERY_GATE_LEDGER=$t/lead-$tag.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-$tag.tsv BLOOMERY_GATE_FAST_LEDGER=${FASTF:-$t/fast-$tag.tsv} \
       "${runner[@]}" --out "$t/target/c-$tag" "${LFLAG:---round-ledger}" "$@" > "$t/out-$tag.log" 2>&1 || rc=$?
     printf '%s' "$rc"
   }
@@ -1731,7 +1825,7 @@ JF
   rc_ok 'chain: two any-form members end green' ch-excl 4
   if no_overlap "$t/fake-state/seq.log" gen_x gen_ge; then pass 'chain: no two members overlap (the mutex)'
   else fail 'chain: no two members overlap (the mutex)' "$(awk '$0 ~ /gen_x$|gen_ge$/' "$t/fake-state/ran.log" | tr '\n' ' ')"; fi
-  mutant_of ch-nomutex 's|^  mkdir "$CHAIN_MUTEX" 2> /dev/null \|\| return 1$|  true # MUTANT ch-nomutex|' '# MUTANT ch-nomutex$'
+  mutant_of ch-nomutex 's|^  mkdir_lock "$CHAIN_MUTEX" \|\| return 1$|  true # MUTANT ch-nomutex|' '# MUTANT ch-nomutex$'
   # The e2e member starts 6 s late, longer than any 5 s slice: each member is held for the other's start line, so the overlap shows
   # however late a process starts.
   rc=$(AWAIT='gen_x=gen_ge gen_ge=gen_x' DELAY='gen_ge=6' MTAG=ch-nomutex steal_case ch-exclm "steal-fix	A	3090	5	$d" "plain-any	B	a6000	5	$d" "v41-any	B	a6000	5	$d" "gate-gpu-glm5next-e2e	B	a6000	5	$d" \
@@ -2388,7 +2482,7 @@ HK
   rc_ok 'pool: two pool items in two lanes end green' pool-lanes 2
   if no_overlap "$t/fake-state/seq.log" gen_pl gen_p2; then pass 'pool: two pool items never overlap (the mutex)'
   else fail 'pool: two pool items never overlap (the mutex)' "the intervals crossed"; fi
-  mutant_of pk-nopool 's|^pool_take() { until mkdir "\$POOL_MUTEX" 2> /dev/null; do sleep 1; done; }$|pool_take() { true; } # MUTANT pk-nopool|' '# MUTANT pk-nopool$'
+  mutant_of pk-nopool 's|^pool_take() { until mkdir_lock "\$POOL_MUTEX"; do sleep 1; done; }$|pool_take() { true; } # MUTANT pk-nopool|' '# MUTANT pk-nopool$'
   rc=$(AWAIT='gen_pl=gen_p2 gen_p2=gen_pl' MTAG=pk-nopool steal_case pool-lanesm "pool-any	A	3090	4	$d" "pool-two	B	a6000	4	$d" \
     -- pool-any@FAKE_SLEEP=4 pool-two@FAKE_SLEEP=4)
   printf '%s' "$rc" > "$t/rc-pool-lanesm"
@@ -2942,9 +3036,6 @@ HK
     '^DONE total=2 red=0 tier=fixture skipped=0 wall=[0-9]+s plan=[0-9]+s( slow=[0-9]+\.[0-9]{2})? laneA=0s laneB=0s deferred=2 real_file=2 deferred_list=[^ ]*/c-rf-only/deferred.list$'
   want_not '  … has no other kind in it' "$t/target/c-rf-only/run.log" '^DONE .*(real_only|no_fixture)='
   want_no_row '  … and made no box call at all' "$t/fake-state/box.log" '1'
-  check "real-file: the tree's own recipes.py reaches the fence for a gate that opens the model, and not for one that opens none" 0 \
-    '^gate-gpu-p1	D	real-file	-	family deepseek2: .* bloomery-gpu-gates:bin:gate_p1 reaches the fixture fence at crates/gpu-gates/src/bin/gate_p1\.rs:[0-9]+ \(' bash "$self" --tier fixture --classes
-  real_classes=$out
   # The fixture table is tools/fixture-dirs.tsv's: a table this reader cannot read is a named error.
   cp "$t/tools/fixture-dirs.tsv" "$t/fixture-dirs.good"
   rm -f "$t/tools/fixture-dirs.tsv"
@@ -2957,6 +3048,13 @@ HK
   { cat "$t/fixture-dirs.good"; printf '%s\t%s\n' qwen4exp v41x; } > "$t/tools/fixture-dirs.tsv"
   check "no-fixture: a family in the table twice: a named error" 65 'line 7: the family .qwen4exp. is in the table twice' "${gb[@]}" --tier fixture --classes
   cp "$t/fixture-dirs.good" "$t/tools/fixture-dirs.tsv"
+  fi
+  if gb_part 21; then
+  # The tree's own classification of every recipe is one CPU-bound python process, the longest single case of the file: it and the two
+  # cases that read its output are a part of their own, so part 13's other cases run beside it, not behind it.
+  check "real-file: the tree's own recipes.py reaches the fence for a gate that opens the model, and not for one that opens none" 0 \
+    '^gate-gpu-p1	D	real-file	-	family deepseek2: .* bloomery-gpu-gates:bin:gate_p1 reaches the fixture fence at crates/gpu-gates/src/bin/gate_p1\.rs:[0-9]+ \(' bash "$self" --tier fixture --classes
+  real_classes=$out
   # The real table: the tree's own tools/fixture-dirs.tsv parses, and the family it names runs (a converted V4.1 gate is balanced, not deferred).
   check "no-fixture: the tree's own tools/fixture-dirs.tsv is a table this runner reads" 0 '^gate-gpu-ds41-step	F	balanced	' printf '%s\n' "$real_classes"
   out=$real_classes
@@ -3366,7 +3464,9 @@ PY
   # INT/TERM (stop): TERM to the batch's own pid, once its item runs.
   fi
   local slow_s='steal-slow@FAKE_SLEEP=20'
-  if gb_part 15; then
+  if gb_part 22; then
+  # The stop, die and reap cases and the hold's end-of-life cases are a part of their own: they share no file or variable with the hold
+  # cases of part 15 (each sets its own state), and both halves are sleep-bound.
   printf '%s\n' "$slow_s	A	3090	30	$d" > "$t/times-hold-stop.tsv"
   fresh_state "$t/target/c-hold-stop"
   BLOOMERY_GATE_TIMES=$t/times-hold-stop.tsv BLOOMERY_GATE_LEDGER=$t/lead-hold-stop.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-hold-stop.tsv \
@@ -3729,6 +3829,29 @@ EOS
   printf '%s' "$rc" > "$t/rc-lbl-clean"
   rc_ok 'label: a clean work tree runs the batch' lbl-clean 1
   want 'label: … and the ledger row names the bare commit' "$t/rounds-lbl-clean.tsv" "$(printf '\t%s\t' "$(git -C "$t/lbl-clean" rev-parse --short=12 HEAD)")"
+  # The fast ledger, recorded then skipped (the header's «Ledgers»): a --fast-ledger batch of a fast list writes the fast file and no other,
+  # and its DONE line says ledger=fast; the same list again skips on it; a --ledger batch of the full list does not read the fast file (the
+  # release's rule) and runs, and with --trust-fast it skips. The fake key reads the ledger files named on its call (FAKE_LEDGER_READ=1).
+  printf '%s\n' 'affected (fast): a..b — 1 changed files, 1 of 2 gate-recipes selected (class-staged (fast): 1 kept, 0 left out)' '  gate-x  f [why]' > "$t/fast16.list"
+  printf '%s\n' 'affected: a..b — 1 changed files, 1 of 2 gate-recipes selected (class-staged: 1 kept, 0 left out)' '  gate-x  f [why]' > "$t/full16.list"
+  rc=$(LFLAG=--fast-ledger FAKE_LEDGER_READ=1 FASTF=$t/fast-rt.tsv steal_case ft-1 "gate-x	A	none	2	$d" -- --list "$t/fast16.list")
+  printf '%s' "$rc" > "$t/rc-ft-1"
+  rc_ok 'fast: a --fast-ledger batch of a fast list ends green' ft-1 1
+  want 'fast: … its DONE line says ledger=fast' "$t/target/c-ft-1/run.log" '^DONE total=1 red=0 tier=real skipped=0 ledger=fast wall='
+  want 'fast: … the fast file holds its green' "$t/fast-rt.tsv" "$(printf '^stub-gate-x\tgate-x\t')"
+  want_not 'fast: … the lead'"'"'s file holds none' "$t/lead-ft-1.tsv" 'gate-x'
+  rc=$(LFLAG=--fast-ledger FAKE_LEDGER_READ=1 FASTF=$t/fast-rt.tsv steal_case ft-2 "gate-x	A	none	2	$d" -- --list "$t/fast16.list")
+  printf '%s' "$rc" > "$t/rc-ft-2"
+  rc_ok 'fast: the same fast list again ends green' ft-2 1
+  want 'fast: … and the fast file skips it' "$t/target/c-ft-2/run.log" '^gate-x rc=skip '
+  rc=$(LFLAG=--ledger FAKE_LEDGER_READ=1 FASTF=$t/fast-rt.tsv steal_case ft-3 "gate-x	A	none	2	$d" -- --list "$t/full16.list")
+  printf '%s' "$rc" > "$t/rc-ft-3"
+  rc_ok 'fast: a --ledger batch of the full list ends green' ft-3 1
+  want 'fast: … and runs it: it does not read the fast file' "$t/target/c-ft-3/run.log" '^gate-x rc=0 '
+  rc=$(LFLAG=--ledger FAKE_LEDGER_READ=1 FASTF=$t/fast-rt.tsv steal_case ft-4 "gate-x	A	none	2	$d" -- --trust-fast --list "$t/full16.list")
+  printf '%s' "$rc" > "$t/rc-ft-4"
+  rc_ok 'fast: a --ledger --trust-fast batch ends green' ft-4 1
+  want 'fast: … and the fast file skips the item' "$t/target/c-ft-4/run.log" '^gate-x rc=skip '
   fi
   if gb_part 15; then
   # The dry run names the hold it would take and touches nothing; the options' refusals.
@@ -3743,6 +3866,17 @@ EOS
   grep -q '^gate-batch: gpu hold: none (only a --ledger batch takes it)$' <<< "$out" && pass '  … a --round-ledger batch says none' || fail '  … a --round-ledger batch says none' "$out"
   check 'hold: --no-gpu-hold without --ledger: 64, named' 64 "^gate-batch: --no-gpu-hold is the lead's: only a --ledger batch takes the GPU hold" "${gb[@]}" --dry-run --no-gpu-hold host
   check 'hold: --no-gpu-hold with --round-ledger: 64, named' 64 "^gate-batch: --no-gpu-hold is the lead's" "${gb[@]}" --dry-run --round-ledger --no-gpu-hold host
+  # The fast ledger (the header's «Ledgers»): a list whose first line says `affected (fast)` and the fast ledger belong together.
+  printf '%s\n' 'affected (fast): a..b — 1 changed files, 1 of 2 gate-recipes selected (class-staged (fast): 1 kept, 0 left out)' '  host  f [why]' > "$t/fast15.list"
+  printf '%s\n' 'affected: a..b — 1 changed files, 1 of 2 gate-recipes selected (class-staged: 1 kept, 0 left out)' '  host  f [why]' > "$t/full15.list"
+  check 'fast: --ledger refuses a fast list: 64, named' 64 'is a fast list .*only --fast-ledger takes it, never --ledger or --round-ledger' "${gb[@]}" --dry-run --ledger --list "$t/fast15.list"
+  check 'fast: --round-ledger refuses a fast list: 64, named' 64 'is a fast list .*only --fast-ledger takes it' "${gb[@]}" --dry-run --round-ledger --list "$t/fast15.list"
+  check 'fast: --fast-ledger refuses a list that is not fast: 64, named' 64 'does not say affected \(fast\)' "${gb[@]}" --dry-run --fast-ledger --list "$t/full15.list"
+  check 'fast: --fast-ledger refuses --smoke: 64, named' 64 '^gate-batch: --fast-ledger takes a --list FILE' "${gb[@]}" --dry-run --fast-ledger --smoke
+  check 'fast: --fast-ledger refuses items: 64, named' 64 '^gate-batch: --fast-ledger takes a --list FILE' "${gb[@]}" --dry-run --fast-ledger host
+  check 'fast: --fast-ledger refuses --weekly: 64, named' 64 '^gate-batch: --fast-ledger takes a --list FILE' "${gb[@]}" --dry-run --fast-ledger --weekly
+  check 'fast: --trust-fast without --ledger: 64, named' 64 '^gate-batch: --trust-fast goes with --ledger' "${gb[@]}" --dry-run --fast-ledger --trust-fast --list "$t/fast15.list"
+  check 'fast: --ledger and --fast-ledger are exclusive: 64, named' 64 'are exclusive' "${gb[@]}" --dry-run --ledger --fast-ledger --list "$t/fast15.list"
   check 'hold: a heartbeat period that is not whole seconds: 64, named' 64 "^gate-batch: BLOOMERY_GPU_HOLD_BEAT is whole seconds from 1 .*got 'abc'" \
     env BLOOMERY_GPU_HOLD_BEAT=abc "${gb[@]}" --dry-run host
   fi
@@ -3903,7 +4037,7 @@ EOS
   if [ "$(cat "$t/rc-rm-mut")" = 1 ]; then pass 'red-main mutant: the batch stays red'
   else fail 'red-main mutant: the batch stays red' "rc=$(cat "$t/rc-rm-mut")"; fi
   want 'red-main mutant: without the recheck the red line names no main verdict' "$t/target/c-rm-mut/run.log" \
-    '^steal-fix rc=1 [0-9]+s try=1 lane=A tier=real ledger=red item=steal-fix@FAKE_RC=1$'
+    '^steal-fix rc=1 [0-9]+s try=1 lane=A tier=real ledger=red last_green=none range=none item=steal-fix@FAKE_RC=1$'
   if [ ! -e "$t/mainwt/fake-state/box.log" ]; then pass 'red-main mutant: the main tree was not run'
   else fail 'red-main mutant: the main tree was not run' "$(cat "$t/mainwt/fake-state/box.log")"; fi
   rm -rf "$t/mainwt/fake-state"
@@ -3912,7 +4046,7 @@ EOS
   if [ "$(cat "$t/rc-rm-also")" = 1 ]; then pass 'red-main: main red too, the batch stays red'
   else fail 'red-main: main red too, the batch stays red' "rc=$(cat "$t/rc-rm-also")"; fi
   want 'red-main: the line says main=also-red, before item=' "$t/target/c-rm-also/run.log" \
-    '^steal-fix rc=1 [0-9]+s try=1 lane=A tier=real ledger=red main=also-red item=steal-fix@FAKE_RC=1$'
+    '^steal-fix rc=1 [0-9]+s try=1 lane=A tier=real ledger=red main=also-red last_green=none range=none item=steal-fix@FAKE_RC=1$'
   want_row 'red-main: the batch run kept the 3090' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_GATE_CARD=3090/ && $2 ~ /gen_f$/'
   want_row 'red-main: the main run used that same card and the same binary name' "$t/mainwt/fake-state/box.log" '$1 ~ /BLOOMERY_GATE_CARD=3090/ && $2 ~ /gen_f$/'
   bn=$(grep -c 'gen_f$' "$t/fake-state/box.log" || true)
@@ -3940,7 +4074,7 @@ EOS
   if [ "$(cat "$t/rc-rm-only")" = 1 ]; then pass 'red-main: main green, the batch stays red'
   else fail 'red-main: main green, the batch stays red' "rc=$(cat "$t/rc-rm-only")"; fi
   want 'red-main: the line says main=batch-only' "$t/target/c-rm-only/run.log" \
-    '^steal-fix rc=1 [0-9]+s try=1 lane=A tier=real ledger=red main=batch-only item=steal-fix@FAKE_RC=1$'
+    '^steal-fix rc=1 [0-9]+s try=1 lane=A tier=real ledger=red main=batch-only last_green=none range=none item=steal-fix@FAKE_RC=1$'
   rm -rf "$t/mainwt/fake-state"
   # A recipe the batch has and origin/main does not is not a red main: just exits 1, which is not a
   # verdict. FAIL-first: without the --show check the line says also-red.
@@ -3952,13 +4086,13 @@ EOS
   rc=$(MTAG=red-norecipe steal_case rm-norec-m "steal-fix@FAKE_RC=1	A	3090	2	$d" -- --red-main-check 'steal-fix@FAKE_RC=1')
   printf '%s' "$rc" > "$t/rc-rm-norec-m"
   want 'red-main mutant: without the recipe check a missing recipe is main=also-red' "$t/target/c-rm-norec-m/run.log" \
-    '^steal-fix rc=1 [0-9]+s try=1 lane=A tier=real ledger=red main=also-red item=steal-fix@FAKE_RC=1$'
+    '^steal-fix rc=1 [0-9]+s try=1 lane=A tier=real ledger=red main=also-red last_green=none range=none item=steal-fix@FAKE_RC=1$'
   rc=$(steal_case rm-norec "steal-fix@FAKE_RC=1	A	3090	2	$d" -- --red-main-check 'steal-fix@FAKE_RC=1')
   printf '%s' "$rc" > "$t/rc-rm-norec"
   if [ "$(cat "$t/rc-rm-norec")" = 1 ]; then pass 'red-main: a recipe main lacks keeps the batch red'
   else fail 'red-main: a recipe main lacks keeps the batch red' "rc=$(cat "$t/rc-rm-norec")"; fi
   want 'red-main: a recipe origin/main lacks is main=unrun' "$t/target/c-rm-norec/run.log" \
-    '^steal-fix rc=1 [0-9]+s try=1 lane=A tier=real ledger=red main=unrun item=steal-fix@FAKE_RC=1$'
+    '^steal-fix rc=1 [0-9]+s try=1 lane=A tier=real ledger=red main=unrun last_green=none range=none item=steal-fix@FAKE_RC=1$'
   want 'red-main: the log names the missing recipe' "$t/target/c-rm-norec/g-steal-fix.log" \
     '=== main recheck: origin/main has no recipe steal-fix'
   rc=$(steal_case rm-green "host	B	none	2	$d" -- --red-main-check host)
@@ -3971,12 +4105,12 @@ EOS
   rc=$(steal_case rm-unrun "steal-fix@FAKE_RC=1	A	3090	2	$d" -- --red-main-check 'steal-fix@FAKE_RC=1')
   printf '%s' "$rc" > "$t/rc-rm-unrun"
   want 'red-main: no checkout is main=unrun, and the batch stays red' "$t/target/c-rm-unrun/run.log" \
-    '^steal-fix rc=1 [0-9]+s try=1 lane=A tier=real ledger=red main=unrun item=steal-fix@FAKE_RC=1$'
+    '^steal-fix rc=1 [0-9]+s try=1 lane=A tier=real ledger=red main=unrun last_green=none range=none item=steal-fix@FAKE_RC=1$'
   unset GATE_BATCH_MAIN_TREE FAKE_MAIN_RC BLOOMERY_REMOTE
   rc=$(steal_case rm-off "steal-fix@FAKE_RC=1	A	3090	2	$d" -- 'steal-fix@FAKE_RC=1')
   printf '%s' "$rc" > "$t/rc-rm-off"
   want 'red-main: off, the red line is the one it always printed' "$t/target/c-rm-off/run.log" \
-    '^steal-fix rc=1 [0-9]+s try=1 lane=A tier=real ledger=red item=steal-fix@FAKE_RC=1$'
+    '^steal-fix rc=1 [0-9]+s try=1 lane=A tier=real ledger=red last_green=none range=none item=steal-fix@FAKE_RC=1$'
   check 'red-main: the dry run names the recheck' 0 \
     '^gate-batch: red-main-check: a red item is run once more from origin/main' \
     "${gb[@]}" --dry-run --red-main-check host
@@ -4185,7 +4319,7 @@ EOS
   want 'bulk: a green lane item'"'"'s line stays pending' "$t/target/c-bulk-n/run.log" \
     '^steal-fix rc=0 [0-9]+s try=1 lane=A tier=real ledger=pending$'
   want 'bulk: the red item'"'"'s line is red at once' "$t/target/c-bulk-n/run.log" \
-    '^host rc=1 [0-9]+s try=1 lane=[AB] tier=real ledger=red item=host@FAKE_RC=1$'
+    '^host rc=1 [0-9]+s try=1 lane=[AB] tier=real ledger=red last_green=none range=none item=host@FAKE_RC=1$'
   want 'bulk: the lane item is recorded when the phase recheck returns' "$t/target/c-bulk-n/run.log" '^ledger steal-fix recorded$'
   want 'bulk: the other lane item is recorded' "$t/target/c-bulk-n/run.log" '^ledger plain-any recorded$'
   want 'bulk: the pack item is recorded' "$t/target/c-bulk-n/run.log" '^ledger sr-a6000 recorded$'
@@ -4223,6 +4357,150 @@ EOS
   want_count 'bulk: both items of a failed recheck read unkeyed' "$t/target/c-bulk-rc/run.log" '^ledger .* unkeyed$' 2
   want 'bulk: the process failure is named' "$t/out-bulk-rc.log" 'the key recheck of steal-fix.*failed \(rc=1\)'
   want_absent 'bulk: a failed recheck records nothing' "$t/rounds-bulk-rc.tsv"
+  fi
+  if gb_part 20; then
+  # --yield (the header's «--yield»): the lead's --ledger batch that gives way to everything else. Each item's box call carries
+  # BLOOMERY_BOX_WAIT=0, so box.sh's guard ends 75 at once on the timing lease or a hold; the item's box env carries
+  # BLOOMERY_HOLD_YIELD=1 (a GPU batch hold ends it at the first probe) and the idle-fill class, and no GPU hold goes up. Such an item
+  # ends rc=yield naming what is up, is not retried, writes no times row and no ledger record, and leaves the batch green. The fake
+  # box's FAKE_GUARD75 ends a call as the guard does (FAKE_HOLD_WAIT: the seconds a call that waits spends first). Mutants (FAIL-first):
+  # the wait left unset, so the guard waits and the item retries to a red 75; the guard's owner unread, so the 75 is a plain lock queue.
+  # (each mutant is also the fast-retry copy: the defect it shows is a red 75 after ten retries)
+  mutant_of yf-nowait 's/^RETRY_WAIT=30$/RETRY_WAIT=1/;s#^  export BLOOMERY_BOX_WAIT=0 BLOOMERY_Q_CLASS=.*#  :#' '^  :$'
+  mutant_of yf-noguard 's/^RETRY_WAIT=30$/RETRY_WAIT=1/;s#^        \[ -n "\$yowner" \] || yowner=\$(guard75_owner "\$log" "\$try")#        :#' '^        :$'
+  yf_case() { # <tag> <guard word> <want owner ERE>: one --yield batch of two items, the first met by the guard
+    local tag=$1 word=$2 owner=$3 wre=${2//+/\\+}
+    rc=$(GBFAST=1 LFLAG=--ledger steal_case "$tag" "plain-any	B	a6000	10	$d" "steal-bal	A	3090	10	$d" -- --yield "plain-any@FAKE_GUARD75=$word" steal-bal)
+    printf '%s' "$rc" > "$t/rc-$tag"
+    rc_ok "yield: a --yield batch whose item meets $word ends green" "$tag" 2
+    want "yield: $word: the item ends rc=yield naming it, not retried" "$t/target/c-$tag/run.log" \
+      "^plain-any rc=yield held by $owner: not retried \\(the follower yields; the next pass runs it again\\) [0-9]+s try=1 lane=[AB] tier=real ledger=yield item=plain-any@FAKE_GUARD75=$wre\$"
+    want "yield: $word: the DONE line counts it" "$t/target/c-$tag/run.log" '^DONE total=2 red=0 tier=real skipped=0 yielded=1 wall=[0-9]+s'
+    want "yield: $word: the lane moved on and recorded its next item" "$t/target/c-$tag/run.log" '^ledger steal-bal recorded$'
+    want_not "yield: $word: nothing recorded for the yielded item" "$t/lead-$tag.tsv" 'plain-any'
+    want_no_row "yield: $word: no times row for it" "$t/times-$tag.tsv" '$1 ~ /^plain-any@FAKE_GUARD75/'
+    want_row "yield: $word: one call, no retry" "$t/fake-state/box.log" '$1 ~ /FAKE_GUARD75/ { c++ } END { if (c == 1) print c }'
+    want_not "yield: $word: the line carries no attribution" "$t/target/c-$tag/run.log" '^plain-any rc=yield .*last_green='
+  }
+  yf_case yf-lease lease 'timing-lease'
+  yf_case yf-hold hold=sit 'hold:sit'
+  yf_case yf-both lease+hold=sit 'timing-lease,hold:sit'
+  yf_case yf-local local=cc 'hold:cc'
+  want_row 'yield: each item call has no guard wait and the idle-fill queue class (the last case above)' "$t/fake-state/callenv.log" '$1 == "0" && $2 == "fill" && $3 ~ /gpu-gate/ { c++ } END { if (c == 2) print c }'
+  want_row '  … and its box env has the GPU-hold yield and the idle-fill load class, no batch owner' "$t/fake-state/box.log" \
+    '$2 ~ /gpu-gate/ && $1 ~ /BLOOMERY_HOLD_YIELD=1/ && $1 ~ /BLOOMERY_V41_CLASS=4/ && $1 !~ /BLOOMERY_BATCH_OWNER/ { c++ } END { if (c == 2) print c }'
+  rc=$(GBFAST=1 LFLAG=--ledger steal_case yf-gpu "plain-any	B	a6000	10	$d" -- --yield 'plain-any@FAKE_HOLD75=leadbatch')
+  printf '%s' "$rc" > "$t/rc-yf-gpu"
+  rc_ok 'yield: a --yield batch whose item meets a GPU batch hold ends green' yf-gpu 1
+  want '  … the item names the batch hold' "$t/target/c-yf-gpu/run.log" '^plain-any rc=yield held by batch-hold:leadbatch: not retried \(the follower yields; the next pass runs it again\) [0-9]+s try=1 '
+  if [ ! -e "$t/fake-state/hold.log" ] && [ ! -e "$t/target/c-yf-gpu/gpuhold.pid" ]; then pass '  … and the batch took no GPU hold itself'
+  else fail '  … and the batch took no GPU hold itself' "hold.log or gpuhold.pid exists"; fi
+  rc=$(GBFAST=1 LFLAG=--ledger steal_case yf-card "plain-any	B	a6000	10	$d" -- --yield 'plain-any@FAKE_CARD75=1')
+  printf '%s' "$rc" > "$t/rc-yf-card"
+  if [ "$(cat "$t/rc-yf-card")" = 1 ] && grep -Eq '^plain-any rc=75 [0-9]+s try=11 lane=[AB] ' "$t/target/c-yf-card/run.log" && ! grep -q 'yielded=' "$t/target/c-yf-card/run.log"; then
+    pass 'yield: a plain card-lock rc 75 keeps the retry in a --yield batch (try=11, red)'
+  else fail 'yield: a plain card-lock rc 75 keeps the retry in a --yield batch (try=11, red)' "rc=$(cat "$t/rc-yf-card") $(tail -2 "$t/target/c-yf-card/run.log" 2>/dev/null)"; fi
+  rc=$(GBFAST=1 LFLAG=--ledger steal_case yf-lead "plain-any	B	a6000	10	$d" -- 'plain-any@FAKE_GUARD75=lease')
+  printf '%s' "$rc" > "$t/rc-yf-lead"
+  if [ "$(cat "$t/rc-yf-lead")" = 1 ] && grep -Eq '^plain-any rc=75 [0-9]+s try=11 lane=[AB] ' "$t/target/c-yf-lead/run.log"; then
+    pass "yield: the lead's --ledger batch (no --yield) keeps waiting on the guard (try=11, red)"
+  else fail "yield: the lead's --ledger batch (no --yield) keeps waiting on the guard (try=11, red)" "rc=$(cat "$t/rc-yf-lead") $(tail -2 "$t/target/c-yf-lead/run.log" 2>/dev/null)"; fi
+  want_row '  … and its item calls carry neither the guard bound nor a queue class' "$t/fake-state/callenv.log" '$3 ~ /gpu-gate/ && $1 == "unset" && $2 == "unset" { c++ } END { if (c >= 1) print c }'
+  for m in nowait noguard; do
+    rc=$(GBFAST=1 MTAG=yf-$m LFLAG=--ledger steal_case yf-$m "plain-any	B	a6000	10	$d" -- --yield 'plain-any@FAKE_GUARD75=lease')
+    printf '%s' "$rc" > "$t/rc-yf-$m"
+    if [ "$(cat "$t/rc-yf-$m")" = 1 ] && grep -Eq '^plain-any rc=75 [0-9]+s try=11 lane=[AB] ' "$t/target/c-yf-$m/run.log" && ! grep -q 'rc=yield' "$t/target/c-yf-$m/run.log"; then
+      pass "yield mutant $m: without it the item retries to a red 75 (try=11)"
+    else fail "yield mutant $m: without it the item retries to a red 75 (try=11)" "rc=$(cat "$t/rc-yf-$m") $(tail -2 "$t/target/c-yf-$m/run.log" 2>/dev/null)"; fi
+  done
+  check 'yield: --yield without --ledger is refused' 64 "^gate-batch: --yield is the follower's: it goes with --ledger" "${gb[@]}" --dry-run --yield plain-any
+  check 'yield: --yield with --round-ledger is refused' 64 "^gate-batch: --yield is the follower's: it goes with --ledger" "${gb[@]}" --dry-run --round-ledger --yield plain-any
+  out=$(BLOOMERY_GATE_TIMES=$t/times.tsv BLOOMERY_GATE_LEDGER=$t/lead-dry-yf.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-dry-yf.tsv "${gb[@]}" --dry-run --ledger --yield plain-any 2>&1) || true
+  if grep -q '^gate-batch: gpu hold: none (--yield: the follower takes none)' <<< "$out"; then pass 'yield: the dry run says the follower takes no GPU hold'
+  else fail 'yield: the dry run says the follower takes no GPU hold' "$(grep 'gpu hold' <<< "$out")"; fi
+  # Red attribution (the header's «Red attribution»): a red item says where the ledger last had it green and which commits since touched
+  # the files its key reads. The case repository: A the green, B and F touch the item's source, C a document, D only bumps the member
+  # manifest's version, E edits that manifest otherwise. The files come from the stub's `key --files`: the source, and the manifest
+  # marked blind. Mutants (FAIL-first): the lookup gone, so the line says `none`; the blind filter gone, so D counts.
+  ar="$t/attr-repo"
+  git init -q --template= "$ar" || { echo "gate-batch: self-test: the attribution repository could not be made" >&2; return 70; }
+  ar_commit() { # <author> <epoch> <message>: commit what is staged, as that author at that time
+    GIT_AUTHOR_DATE="@$2 +0000" GIT_COMMITTER_DATE="@$2 +0000" git -C "$ar" -c user.email=t@t -c "user.name=$1" -c commit.gpgsign=false commit -q -m "$3" \
+      || { echo "gate-batch: self-test: the attribution repository's commit $3 failed" >&2; return 70; }
+  }
+  mkdir -p "$ar/crates/x" "$ar/docs"
+  printf 'one\n' > "$ar/crates/x/a.rs"; printf 'doc\n' > "$ar/docs/y.md"
+  printf '[package]\nname = "x"\nversion = "0.1.0"\nedition = "2021"\n' > "$ar/Cargo.toml"
+  git -C "$ar" add -A && ar_commit Zed 1793600000 A || return 70
+  ar_a=$(git -C "$ar" rev-parse --short=12 HEAD)
+  printf 'two\n' > "$ar/crates/x/a.rs"; git -C "$ar" add -A && ar_commit Alice 1793600060 B || return 70
+  ar_b=$(git -C "$ar" rev-parse --short=7 HEAD)
+  printf 'doc2\n' > "$ar/docs/y.md"; git -C "$ar" add -A && ar_commit Bob 1793600120 C || return 70
+  sed -i.bak 's/0\.1\.0/0.1.1/' "$ar/Cargo.toml" && rm -f "$ar/Cargo.toml.bak"; git -C "$ar" add -A && ar_commit Carol 1793600180 D || return 70
+  sed -i.bak 's/2021/2024/' "$ar/Cargo.toml" && rm -f "$ar/Cargo.toml.bak"; git -C "$ar" add -A && ar_commit Dave 1793600240 E || return 70
+  ar_e=$(git -C "$ar" rev-parse --short=7 HEAD)
+  printf 'three\n' > "$ar/crates/x/a.rs"; git -C "$ar" add -A && ar_commit 'Erin Fox' 1793600300 F || return 70
+  ar_f=$(git -C "$ar" rev-parse --short=7 HEAD)
+  ar_h=$(git -C "$ar" rev-parse HEAD | cut -c1-12)
+  ar_key() { printf '%064d' "$1"; } # a valid key (64 hex digits); the stub's rows are not
+  # ar_seed <tag> <key n> <item> <commit> <date> <boxenv> <card>: one green row of the lead's ledger for the case, with the parts file the batch writes
+  ar_seed() {
+    local led=$t/lead-$1.tsv
+    mkdir -p "$led.parts"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(ar_key "$2")" "${3%%@*}" "$3" "$4" "$5" /x/tree >> "$led"
+    printf 'v\tk\nitem\targs\t[]\nitem\tboxenv\t%s\nitem\tcard\t%s\nmac-env\tBLOOMERY_TIER\t<unset>\n' "$6" "$7" > "$led.parts/$(ar_key "$2").parts"
+  }
+  ar_case() { # <tag> <env…>: a red batch on the attribution repository, the lead's ledger as seeded
+    local tag=$1
+    shift
+    rc=$(export "$@" GIT_DIR="$ar/.git" GIT_WORK_TREE="$ar" LFLAG=--ledger; steal_case "$tag" "plain-any	B	a6000	10	$d" -- plain-any@FAKE_RC=1)
+    printf '%s' "$rc" > "$t/rc-$tag"
+  }
+  # the newest row (by date) is the second line of the file, the older one the first: the lookup reads the date, not the order
+  rm -f "$t/lead-at-red.tsv"; rm -rf "$t/lead-at-red.tsv.parts"
+  ar_seed at-red 1 plain-any@FAKE_RC=1,BLOOMERY_GATE_CARD=3090 "$(git -C "$ar" rev-parse --short=12 "$ar_b^")" 2026-11-01T09:00:00+0900 BLOOMERY_GATE_CARD=3090 3090
+  ar_seed at-red 2 plain-any@FAKE_RC=1,BLOOMERY_GATE_CARD=3090 "$ar_a" 2026-11-02T09:00:00+0900 BLOOMERY_GATE_CARD=3090 3090
+  ar_seed at-red 3 other-recipe "$ar_h" 2026-11-03T09:00:00+0900 '' none
+  ar_case at-red FAKE_FILES='crates/x/a.rs,Cargo.toml~blind'
+  if [ "$(cat "$t/rc-at-red")" = 1 ] && grep -Eq "^plain-any rc=1 [0-9]+s try=1 lane=[AB] tier=real ledger=red last_green=$ar_a@2026-11-02T09:00:00\\+0900 tier=real card=3090 range=$ar_a\\.\\.$ar_h commits=3 touching=\\[$ar_f Erin Fox; $ar_e Dave; $ar_b Alice\\] item=plain-any@FAKE_RC=1\$" "$t/target/c-at-red/run.log"; then
+    pass 'attribution: a red item names its newest green (the other card), the range, three commits and the top ones, the version-only bump and the document left out'
+  else fail 'attribution: a red item names its newest green (the other card), the range, three commits and the top ones, the version-only bump and the document left out' "rc=$(cat "$t/rc-at-red") $(grep '^plain-any' "$t/target/c-at-red/run.log" 2>&1)"; fi
+  want_row '  … the file list was asked for the item as the batch keys it' "$t/fake-state/filescalls.log" '$1 == "plain-any@FAKE_RC=1,BLOOMERY_GATE_CARD=a6000" { c++ } END { if (c == 1) print c }'
+  want '  … the stdout line is the same' "$t/out-at-red.log" "^plain-any rc=1 .* last_green=$ar_a@2026-11-02T09:00:00\\+0900 tier=real card=3090 range=$ar_a\\.\\.$ar_h commits=3 touching=\\["
+  # the same repository with the version-only commit counted: the filter off shows commit D
+  mutant_of at-noblind 's#log -G[^ ]* #log #' 'log --format=.%ct %h %an. "\$base\.\.\$head" -- \$\{bl'
+  mutant_of at-nolookup 's#^  row=$(last_green_row "$item" .*#  row=""#' '^  row=""$'
+  for m in noblind nolookup; do
+    rm -f "$t/lead-at-$m.tsv"; rm -rf "$t/lead-at-$m.tsv.parts"
+    ar_seed at-$m 2 plain-any@FAKE_RC=1,BLOOMERY_GATE_CARD=3090 "$ar_a" 2026-11-02T09:00:00+0900 BLOOMERY_GATE_CARD=3090 3090
+    rc=$(export FAKE_FILES='crates/x/a.rs,Cargo.toml~blind' GIT_DIR="$ar/.git" GIT_WORK_TREE="$ar" MTAG=at-$m LFLAG=--ledger; steal_case at-$m "plain-any	B	a6000	10	$d" -- plain-any@FAKE_RC=1)
+    printf '%s' "$rc" > "$t/rc-at-$m"
+  done
+  want 'attribution mutant: without the blind filter the version-only commit counts (commits=4)' "$t/target/c-at-noblind/run.log" " range=$ar_a\\.\\.$ar_h commits=4 touching=\\["
+  want 'attribution mutant: without the lookup the line says none' "$t/target/c-at-nolookup/run.log" '^plain-any rc=1 .* last_green=none range=none item=plain-any@FAKE_RC=1$'
+  rm -f "$t/lead-at-none.tsv"; rm -rf "$t/lead-at-none.tsv.parts"
+  ar_seed at-none 4 other-recipe "$ar_a" 2026-11-02T09:00:00+0900 '' none
+  ar_case at-none FAKE_FILES='crates/x/a.rs'
+  want 'attribution: an item no ledger row names says last_green=none, plainly' "$t/target/c-at-none/run.log" '^plain-any rc=1 [0-9]+s try=1 lane=[AB] tier=real ledger=red last_green=none range=none item=plain-any@FAKE_RC=1$'
+  want_no_row '  … and asks for no file list' "$t/fake-state/filescalls.log" '1'
+  rm -f "$t/lead-at-same.tsv"; rm -rf "$t/lead-at-same.tsv.parts"
+  ar_seed at-same 5 plain-any@FAKE_RC=1,BLOOMERY_GATE_CARD=a6000 "$ar_h" 2026-11-03T09:00:00+0900 BLOOMERY_GATE_CARD=a6000 a6000
+  ar_case at-same FAKE_FILES='crates/x/a.rs'
+  want 'attribution: a green at this very commit says no commit changed anything the key reads' "$t/target/c-at-same/run.log" " tier=real card=a6000 range=$ar_h\\.\\.$ar_h commits=0 touching=none item=plain-any@FAKE_RC=1\$"
+  rm -f "$t/lead-at-alien.tsv"; rm -rf "$t/lead-at-alien.tsv.parts"
+  ar_seed at-alien 6 plain-any@FAKE_RC=1,BLOOMERY_GATE_CARD=a6000 0123456789ab 2026-11-03T09:00:00+0900 'BLOOMERY_TIER=fixture BLOOMERY_GATE_CARD=a6000' a6000
+  ar_case at-alien FAKE_FILES='crates/x/a.rs'
+  want 'attribution: a green at a commit this repository lacks has no range, and the fixture tier is read from its parts' "$t/target/c-at-alien/run.log" \
+    ' last_green=0123456789ab@2026-11-03T09:00:00\+0900 tier=fixture card=a6000 range=unknown \(0123456789ab is not a commit of this repository\) item=plain-any@FAKE_RC=1$'
+  rm -f "$t/lead-at-nofiles.tsv"; rm -rf "$t/lead-at-nofiles.tsv.parts"
+  ar_seed at-nofiles 7 plain-any@FAKE_RC=1,BLOOMERY_GATE_CARD=a6000 "$ar_a" 2026-11-02T09:00:00+0900 BLOOMERY_GATE_CARD=a6000 a6000
+  rm -rf "$t/lead-at-nofiles.tsv.parts"
+  ar_case at-nofiles FAKE_FILES_RC=3
+  want 'attribution: a file list that cannot be read, or parts that were not kept, are said, not guessed' "$t/target/c-at-nofiles/run.log" \
+    " last_green=$ar_a@2026-11-02T09:00:00\\+0900 tier=unknown card=unknown range=$ar_a\\.\\.$ar_h commits=unknown touching=unknown \\(key --files failed: stub key --files failed\\) item=plain-any@FAKE_RC=1\$"
+  rc=$(export GIT_DIR="$ar/.git" GIT_WORK_TREE="$ar" LFLAG=--no-canary; steal_case at-plain "plain-any	B	a6000	10	$d" -- plain-any@FAKE_RC=1)
+  printf '%s' "$rc" > "$t/rc-at-plain"
+  want 'attribution: a batch without a ledger adds nothing to a red line' "$t/target/c-at-plain/run.log" '^plain-any rc=1 [0-9]+s try=1 lane=[AB] tier=real item=plain-any@FAKE_RC=1$'
   fi
   # One row per case (seconds, then the name). A miss is a case the summary cannot name.
   [ -f "$t/case-times.tsv" ] || : > "$t/case-times.tsv"
@@ -4348,7 +4626,7 @@ if [ "${1:-}" = --self-test ]; then
     *) die "--self-test takes nothing else, or --part K|all; $USAGE" ;;
   esac
 fi
-OUT='' OUT_AUTO=0 SRC='' LIST='' DRY=0 LANES='' LEDGER=0 RERUN=0 LMODE='' TRUST=0 TIER_FLAG='' NOHOLD=0 BUDGET_OK=0 WAIT_HOLD=''
+OUT='' OUT_AUTO=0 SRC='' LIST='' DRY=0 LANES='' LEDGER=0 RERUN=0 LMODE='' TRUST=0 LFAST=0 TRUSTF=0 TIER_FLAG='' NOHOLD=0 BUDGET_OK=0 WAIT_HOLD='' YIELD=0
 CANARY=1 RED_MAIN=0
 ITEMS=()
 while [ $# -gt 0 ]; do
@@ -4360,12 +4638,16 @@ while [ $# -gt 0 ]; do
     --list) [ $# -ge 2 ] || die "--list needs a file; $USAGE"
       [ -z "$SRC" ] || die "--smoke, --weekly, --list and items are exclusive; $USAGE"; SRC=list; LIST=$2; shift 2 ;;
     --dry-run) DRY=1; shift ;;
-    --ledger) [ "$LMODE" != round ] || die "--ledger and --round-ledger are exclusive; $USAGE"
+    --ledger) [ "$LMODE" != round ] && [ "$LFAST" = 0 ] || die "--ledger, --fast-ledger and --round-ledger are exclusive; $USAGE"
       LEDGER=1 LMODE=lead; shift ;;
-    --round-ledger) [ "$LMODE" != lead ] || die "--ledger and --round-ledger are exclusive; $USAGE"
+    --round-ledger) [ "$LMODE" != lead ] || die "--ledger, --fast-ledger and --round-ledger are exclusive; $USAGE"
       LEDGER=1 LMODE=round; shift ;;
+    --fast-ledger) [ -z "$LMODE" ] || [ "$LFAST" = 1 ] || die "--ledger, --fast-ledger and --round-ledger are exclusive; $USAGE"
+      LEDGER=1 LMODE=lead LFAST=1; shift ;;
     --trust-rounds) TRUST=1; shift ;;
+    --trust-fast) TRUSTF=1; shift ;;
     --no-gpu-hold) NOHOLD=1; shift ;;
+    --yield) YIELD=1; shift ;;
     --rerun) RERUN=1; shift ;;
     --over-budget-ok) BUDGET_OK=1; shift ;;
     --no-canary) CANARY=0; shift ;;
@@ -4391,8 +4673,27 @@ if [ "$SRC" = list ]; then
 fi
 [ "$SRC" = smoke ] && ITEMS=("${SMOKE[@]}")
 [ "$RERUN" = 0 ] || [ "$LEDGER" = 1 ] || die "--rerun needs --ledger or --round-ledger; $USAGE"
-[ "$TRUST" = 0 ] || [ "$LMODE" = lead ] || die "--trust-rounds is the lead's: it goes with --ledger (a round's --round-ledger reads the rounds' file already); $USAGE"
+[ "$TRUST" = 0 ] || [ "$LMODE" = lead ] || die "--trust-rounds is the lead's: it goes with --ledger or --fast-ledger (a round's --round-ledger reads the rounds' file already); $USAGE"
+[ "$TRUSTF" = 0 ] || { [ "$LMODE" = lead ] && [ "$LFAST" = 0 ]; } || die "--trust-fast goes with --ledger (a --fast-ledger batch reads the fast file already); $USAGE"
+# A fast list and the fast ledger belong together: a release-grade batch never takes a list that left gates out by ownership, and a fast
+# batch takes no other list (the header's «Ledgers»). The list's first line is the one the plan reads (just's echo of the recipe line aside).
+if [ "$LFAST" = 1 ] && [ "$SRC" != list ]; then
+  die "--fast-ledger takes a --list FILE of \`just affected BASE --fast\` output, not --smoke, --weekly, --classes or items; $USAGE"
+fi
+if [ "$SRC" = list ] && [ "$LEDGER" = 1 ]; then
+  list_head=$(awk 'NF && !/^\.\/tools\/affected-gates\.sh / { print; exit }' "$LIST")
+  case $list_head in
+    "affected (fast):"*) [ "$LFAST" = 1 ] || die "$LIST is a fast list (its first line says affected (fast)): only --fast-ledger takes it, never --ledger or --round-ledger; $USAGE" ;;
+    *) [ "$LFAST" = 0 ] || die "--fast-ledger takes a fast list: the first line of $LIST does not say affected (fast); $USAGE" ;;
+  esac
+fi
 [ "$NOHOLD" = 0 ] || [ "$LMODE" = lead ] || die "--no-gpu-hold is the lead's: only a --ledger batch takes the GPU hold, so it goes with --ledger; $USAGE"
+[ "$YIELD" = 0 ] || [ "$LMODE" = lead ] || die "--yield is the follower's: it goes with --ledger (a --round-ledger batch already yields to the GPU hold); $USAGE"
+if [ "$YIELD" = 1 ]; then
+  # The follower is background work: no GPU hold, the idle-fill classes, and no box call that waits for the sitting it should give way to.
+  NOHOLD=1
+  export BLOOMERY_BOX_WAIT=0 BLOOMERY_Q_CLASS="${BLOOMERY_Q_CLASS:-fill}"
+fi
 # The GPU hold (the header): the lead's batch takes it; its owner names this batch on the box and in each item's box env.
 HOLD_ON=0 HOLD_UP=0 HOLD_OWNER='' HOLD_BEAT=${BLOOMERY_GPU_HOLD_BEAT:-60}
 case $HOLD_BEAT in
@@ -4482,7 +4783,7 @@ if src == "list":
     # `just affected … 2>&1` puts just's echo of the recipe line above the output's `affected:` line.
     if head and head[0].startswith("./tools/affected-gates.sh ") and len(head) > 1:
         head = head[1:]
-    if head and head[0].startswith("affected:"):
+    if head and head[0].startswith(("affected:", "affected (fast):")):
         raw_items = [ln.split()[0] for ln in lines if ln.startswith(("  gate-", "  weekly-"))]
         where = [f"{listfile} (just affected output)"] * len(raw_items)
     else:
@@ -6183,11 +6484,14 @@ def_cmd_of() { # a deferred item's command as it would have run (the dry run nam
 
 LEAD_LEDGER=${BLOOMERY_GATE_LEDGER:-$HOME/.cache/bloomery/gate-ledger.tsv}
 ROUND_LEDGER=${BLOOMERY_GATE_ROUND_LEDGER:-$HOME/.cache/bloomery/gate-ledger-rounds.tsv}
+FAST_LEDGER=${BLOOMERY_GATE_FAST_LEDGER:-$HOME/.cache/bloomery/gate-ledger-fast.tsv}
 [ "$LEAD_LEDGER" != "$ROUND_LEDGER" ] || die "BLOOMERY_GATE_LEDGER and BLOOMERY_GATE_ROUND_LEDGER name one file ($LEAD_LEDGER): a round's green would land in the lead's ledger"
-# The file this batch writes, and the second file it reads (empty: none).
-if [ "$LMODE" = round ]; then LEDGER_FILE=$ROUND_LEDGER; else LEDGER_FILE=$LEAD_LEDGER; fi
-ALSO_READ=''
+[ "$FAST_LEDGER" != "$LEAD_LEDGER" ] && [ "$FAST_LEDGER" != "$ROUND_LEDGER" ] || die "BLOOMERY_GATE_FAST_LEDGER names the lead's or the rounds' file ($FAST_LEDGER): a fast green would land where a release reads it"
+# The file this batch writes, and the other files it reads (empty: none).
+if [ "$LMODE" = round ]; then LEDGER_FILE=$ROUND_LEDGER; elif [ "$LFAST" = 1 ]; then LEDGER_FILE=$FAST_LEDGER; else LEDGER_FILE=$LEAD_LEDGER; fi
+ALSO_READ='' ALSO_FAST=''
 if [ "$LMODE" = round ] || [ "$TRUST" = 1 ]; then ALSO_READ=$ROUND_LEDGER; fi
+if [ "$LFAST" = 1 ] || [ "$TRUSTF" = 1 ]; then ALSO_FAST=$FAST_LEDGER; fi
 LEDGER_PARTS=$LEDGER_FILE.parts
 
 # --wait-hold's wait (the header). A poll is box.sh's guard with no wait of its own — lease_guard 0, tools/ref/lease-probe.sh's one
@@ -6261,6 +6565,7 @@ ledger_plan() { # the box manifest, then every candidate's key and status (C_*),
   fi
   kargs=(key --manifest "$m" --box-env "${BLOOMERY_BOX_ENV:-}" --ledger "$LEAD_LEDGER" --parts-dir "$1/parts")
   [ -z "$ALSO_READ" ] || kargs+=(--round-ledger "$ALSO_READ")
+  [ -z "$ALSO_FAST" ] || kargs+=(--fast-ledger "$ALSO_FAST")
   [ -z "$merr" ] || kargs+=(--manifest-error "$merr")
   [ "$RERUN" = 0 ] || kargs+=(--rerun)
   rc=0
@@ -6487,7 +6792,7 @@ canary_say() { # the stage's one line: the dry run's first and the run's second
   else echo "gate-batch: canary stage: $CANARY_RUN run first in their lanes; the first one that ends red stops the batch (DONE canary=red); --no-canary runs without the stage"; fi
 }
 if [ "$LEDGER" = 1 ]; then
-  echo "gate-batch: ledger: reads $LEAD_LEDGER${ALSO_READ:+ and $ALSO_READ}, writes $LEDGER_FILE: $SKIP_N of $N items skip"
+  echo "gate-batch: ledger: reads $LEAD_LEDGER${ALSO_READ:+ and $ALSO_READ}${ALSO_FAST:+ and $ALSO_FAST}, writes $LEDGER_FILE: $SKIP_N of $N items skip"
 fi
 # The plan's lane-gap term (the header's «Plan alarm»): what a lane spends between its items, an item, as the last batches' own clocks
 # measured it (gap_prior), over the items a lane runs. The wall of the plan carries it; with no batch recorded it is 0.
@@ -6539,6 +6844,8 @@ hold_path() { bash "$ROOT/tools/gpu-gate.sh" --gpuhold path 2> /dev/null || echo
 hold_say() { # the dry run's line: the hold this batch would take
   if [ "$HOLD_ON" = 1 ]; then
     echo "gate-batch: gpu hold: would put $(hold_path) up on the box as $HOLD_OWNER, refreshed every ${HOLD_BEAT} s; each item gets BLOOMERY_BATCH_OWNER=$HOLD_OWNER, and other tracks' tools/gpu-gate.sh runs wait until the batch ends"
+  elif [ "$YIELD" = 1 ]; then
+    echo "gate-batch: gpu hold: none (--yield: the follower takes none)"
   elif [ "$LMODE" = lead ]; then
     echo "gate-batch: gpu hold: off (--no-gpu-hold)"
   else
@@ -6900,6 +7207,104 @@ fi
 # replace, its dir lock held). Waits for that holder to end: a READONLY box.sh probe of the lock named on the try's 83 line, every
 # RETRY_WAIT seconds, up to DIRLOCK_WAIT. 0 when the lock is free or cannot be probed (the item's one retry then runs at once and
 # its own box.sh decides), 1 when it was still held at the bound. Every step is a `=== ` line of the item's log.
+# Red attribution (the header's «Red attribution»). last_green_row <item> <ledger file…> prints `key<TAB>commit<TAB>date<TAB>file` of the
+# newest row (by its date; the later one on a tie) of a green run of the item in those ledgers, whatever card entry
+# (BLOOMERY_GATE_CARD) either side spells: the item's recipe, its other env entries and its ARGS match, so a green on the other card is
+# found and says so. Nothing is printed when no row names the item; a ledger that is not there is skipped.
+last_green_row() {
+  local item=$1 f
+  local -a fs=()
+  shift
+  for f in "$@"; do [ ! -f "$f" ] || fs+=("$f"); done
+  [ ${#fs[@]} -gt 0 ] || return 0
+  awk -F'\t' -v item="$item" '
+    function norm(it,   name, rest, env, args, n, parts, i, out, p) {
+      name = it; rest = ""; env = ""; args = ""
+      if (match(it, /^[A-Za-z0-9_-]+/)) { name = substr(it, 1, RLENGTH); rest = substr(it, RLENGTH + 1) }
+      if (substr(rest, 1, 1) == "@") {
+        rest = substr(rest, 2); p = index(rest, ":")
+        if (p) { env = substr(rest, 1, p - 1); args = substr(rest, p + 1) } else { env = rest }
+      } else if (substr(rest, 1, 1) == ":") { args = substr(rest, 2) }
+      n = split(env, parts, ",")
+      out = ""
+      for (i = 1; i <= n; i++) if (parts[i] != "" && parts[i] !~ /^BLOOMERY_GATE_CARD=/) out = out (out == "" ? "" : ",") parts[i]
+      return name "\t" out "\t" args
+    }
+    BEGIN { want = norm(item); best = ""; split(want, w, "\t"); rname = w[1] }
+    NF == 6 && $2 == rname && length($1) == 64 && norm($3) == want && $5 >= best { best = $5; row = $1 "\t" $4 "\t" $5 "\t" FILENAME }
+    END { if (row != "") print row }' "${fs[@]}" 2> /dev/null || true
+}
+
+# red_attrib <plan index>: ` last_green=… range=…` for the red item, as the header's «Red attribution» words it. Prints nothing for a batch
+# without a ledger. The files the item's key reads come from `recipes.py key --files` (one call a red item, tens of seconds on the
+# Mac); the commits are the tree's git history between the green's commit and its HEAD.
+red_attrib() {
+  local i=$1 item row key lg date file parts tier card base head bfull hfull files fl err why rows n top
+  local -a nb=() bl=()
+  [ "$LEDGER" = 1 ] || return 0
+  item=$(item_of "$i")
+  row=$(last_green_row "$item" "$LEDGER_FILE" ${ALSO_READ:+"$ALSO_READ"} ${ALSO_FAST:+"$ALSO_FAST"})
+  if [ -z "$row" ]; then
+    printf ' last_green=none range=none'
+    return 0
+  fi
+  IFS=$'\t' read -r key lg date file <<< "$row"
+  parts=$file.parts/$key.parts
+  tier=unknown card=unknown
+  if [ -r "$parts" ]; then
+    card=$(awk -F'\t' '$1 == "item" && $2 == "card" { print $3; exit }' "$parts")
+    tier=$(awk -F'\t' '
+      $1 == "item" && $2 == "boxenv" && $3 ~ /(^| )BLOOMERY_TIER=fixture( |$)/ { t = "fixture" }
+      $1 == "mac-env" && $2 == "BLOOMERY_TIER" && $3 == "fixture" { t = "fixture" }
+      END { print (t == "" ? "real" : t) }' "$parts")
+    [ -n "$card" ] || card=unknown
+  fi
+  printf ' last_green=%s@%s tier=%s card=%s' "$lg" "$date" "$tier" "$card"
+  base=${lg%-dirty}
+  hfull=$(git -C "$ROOT" rev-parse HEAD 2> /dev/null) || hfull=''
+  if [ -z "$hfull" ]; then
+    printf ' range=unknown (%s has no git history)' "$ROOT"
+    return 0
+  fi
+  head=${hfull:0:12}
+  if ! bfull=$(git -C "$ROOT" rev-parse --verify --quiet "$base^{commit}" 2> /dev/null); then
+    printf ' range=unknown (%s is not a commit of this repository)' "$lg"
+    return 0
+  fi
+  if [ "$bfull" = "$hfull" ]; then
+    printf ' range=%s..%s commits=0 touching=none' "$base" "$head"
+    return 0
+  fi
+  err=$LWORK/attrib-$i.err
+  if ! files=$(python3 "$ROOT/tools/recipes.py" key --files "$item" --box-env "${BLOOMERY_BOX_ENV:-}" 2> "$err" < /dev/null) || [ -z "$files" ]; then
+    why=$(tail -1 "$err" 2> /dev/null || true)
+    printf ' range=%s..%s commits=unknown touching=unknown (key --files failed: %s)' "$base" "$head" "${why:-no files}"
+    return 0
+  fi
+  while IFS= read -r fl; do
+    [ -n "$fl" ] || continue
+    case $fl in
+      *$'\t'blind) bl+=("${fl%$'\t'blind}") ;;
+      *) nb+=("$fl") ;;
+    esac
+  done <<< "$files"
+  # A member's own version is the one thing its manifest and the lock may change without moving the key (recipes.py's MEMBER_VERSION):
+  # for those files a commit counts only when it changes a line other than a `version` line.
+  rows=$(
+    {
+      [ ${#nb[@]} -eq 0 ] || git -C "$ROOT" log --format='%ct %h %an' "$base..$head" -- ${nb[@]+"${nb[@]}"}
+      [ ${#bl[@]} -eq 0 ] || git -C "$ROOT" log -G'^([^v]|v[^e]|ve[^r])' --format='%ct %h %an' "$base..$head" -- ${bl[@]+"${bl[@]}"}
+    } 2> /dev/null | sort -s -rn -k1,1 | awk '!seen[$2]++'
+  ) || rows=''
+  n=$(printf '%s' "$rows" | grep -c . || true)
+  if [ "$n" = 0 ]; then
+    printf ' range=%s..%s commits=0 touching=none' "$base" "$head"
+    return 0
+  fi
+  top=$(printf '%s\n' "$rows" | awk 'NR <= 3 { sub(/^[0-9]+ /, ""); printf "%s%s", (NR > 1 ? "; " : ""), $0 }')
+  printf ' range=%s..%s commits=%s touching=[%s]' "$base" "$head" "$n" "$top"
+}
+
 wait_dirlock() {
   local log=$1 try=$2 lock ids t0 rc out
   lock=$(awk -v t="=== try $try " 'index($0, t) == 1 { on = 1; next } /^=== try / { on = 0 } on' "$log" |
@@ -6944,7 +7349,12 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
   # The batch's own runs pass its GPU hold: the owner joins the call's env here, never box_env_of's (which feeds the ledger key).
   [ "$HOLD_UP" != 1 ] || benv="${benv:+$benv }BLOOMERY_BATCH_OWNER=$HOLD_OWNER"
   # The lead's landing batch is class 1 of the V4.1 load queue (tools/gpu-gate.sh's header): in the call's env, never the key's.
-  [ "$LMODE" != lead ] || benv="${benv:+$benv }BLOOMERY_V41_CLASS=1"
+  # A --yield batch is class 4, idle fill, and yields to a GPU hold at the first probe as a round batch does.
+  if [ "$YIELD" = 1 ]; then
+    benv="${benv:+$benv }BLOOMERY_V41_CLASS=4 BLOOMERY_HOLD_YIELD=1"
+  elif [ "$LMODE" = lead ]; then
+    benv="${benv:+$benv }BLOOMERY_V41_CLASS=1"
+  fi
   # A round batch's item yields to the lead's GPU hold at tools/gpu-gate.sh's first probe, not at its bound (rc 75 naming the owner,
   # which run_item reads below): in the call's env, never the key's. The lead's batch and a plain one wait as before.
   [ "$LMODE" != round ] || benv="${benv:+$benv }BLOOMERY_HOLD_YIELD=1"
@@ -7010,6 +7420,15 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
           echo "=== rc 75 (the GPU hold of $yowner still up): a round batch yields to the lead's hold — not retried" >> "$log"
           break
         fi
+      elif [ "$YIELD" = 1 ]; then
+        # The follower yields to the GPU hold, the timing lease and every hold of a sitting or of the lead's (the header's --yield).
+        yowner=$(hold75_owner "$log" "$try")
+        [ -z "$yowner" ] || yowner="batch-hold:$yowner"
+        [ -n "$yowner" ] || yowner=$(guard75_owner "$log" "$try")
+        if [ -n "$yowner" ]; then
+          echo "=== rc 75 ($yowner still up): the follower yields — not retried; the next pass runs it again" >> "$log"
+          break
+        fi
       fi
       if [ "$try" -lt "$TRIES_MAX" ]; then
         echo "=== rc 75 (lock contention): retry in ${RETRY_WAIT} s" >> "$log"
@@ -7022,7 +7441,11 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
   s=$(($(date +%s) - t0))
   if [ -n "$yowner" ]; then
     rcl=yield
-    line="${P_STEM[$i]} rc=yield held by $yowner: not retried (a round batch yields to the lead's hold) ${s}s try=$try lane=$lane tier=$TIER"
+    if [ "$YIELD" = 1 ]; then
+      line="${P_STEM[$i]} rc=yield held by $yowner: not retried (the follower yields; the next pass runs it again) ${s}s try=$try lane=$lane tier=$TIER"
+    else
+      line="${P_STEM[$i]} rc=yield held by $yowner: not retried (a round batch yields to the lead's hold) ${s}s try=$try lane=$lane tier=$TIER"
+    fi
   else
     rcl=$rc
     line="${P_STEM[$i]} rc=$rc ${s}s try=$try lane=$lane tier=$TIER"
@@ -7050,6 +7473,10 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
   # --red-main-check (the header): one more run of a red gate, from origin/main, before the line is printed.
   if [ "$RED_MAIN" = 1 ] && [ -z "$yowner" ] && [ "$rc" != 0 ] && [ "$rc" != 75 ]; then
     line="$line main=$(main_recheck "$i" "$benv" "$log")"
+  fi
+  # A red gate says where it was last green and what changed since (the header's «Red attribution»).
+  if [ "$LEDGER" = 1 ] && [ -z "$yowner" ] && [ "$rc" != 0 ] && [ "$rc" != 75 ]; then
+    line="$line$(red_attrib "$i")"
   fi
   [ -z "${P_ITEM[$i]}" ] || line="$line item=${P_ITEM[$i]}"
   echo "$line" >> "$RUNLOG"
@@ -7112,7 +7539,7 @@ stealable() { # $1 = plan index, $2 = lane
 }
 
 # The chain (class C, the header): one member at a time batch-wide, both lanes feeding it.
-CHAIN_MUTEX=$OUT/chain.lock # taken (mkdir) before a member's run, released (rmdir) when it returns
+CHAIN_MUTEX=$OUT/chain.lock # taken (mkdir_lock, tools/nightly/units.sh) before a member's run, released (rmdir) when it returns
 tagged_neighbour() { # $1 = plan index: a pool or big-host item (D5's groups)
   case " ${P_TAG[$1]:-} " in *' pool '*|*' big-host '*) return 0 ;; *) return 1 ;; esac
 }
@@ -7123,7 +7550,7 @@ tagged_neighbour() { # $1 = plan index: a pool or big-host item (D5's groups)
 # (bounded by the running item's BLOOMERY_GATE_BOUND).
 POOL_MUTEX=$OUT/pool.lock
 pool_tagged() { case " ${P_TAG[$1]:-} " in *' pool '*) return 0 ;; *) return 1 ;; esac; }
-pool_take() { until mkdir "$POOL_MUTEX" 2> /dev/null; do sleep 1; done; }
+pool_take() { until mkdir_lock "$POOL_MUTEX"; do sleep 1; done; }
 pool_rel() { rmdir "$POOL_MUTEX" 2> /dev/null || true; }
 run_pooled() { # $1 = plan index, $2..: run the item under the pool mutex when it is pool-tagged
   local i=$1
@@ -7182,7 +7609,7 @@ chain_skip_take() { # $1 = lane: a member green on a candidate's key skips at 0 
 chain_take() { # $1 = lane: the mutex first (a lane that loses it holds no claim it must honour), then
   # the member D3 gives this lane's card, its placement rewritten onto it (as a steal's is), run, release
   local lane=$1 i card cards
-  mkdir "$CHAIN_MUTEX" 2> /dev/null || return 1
+  mkdir_lock "$CHAIN_MUTEX" || return 1
   i=''
   i=$(chain_next "$lane") || { rmdir "$CHAIN_MUTEX" 2> /dev/null || true; return 1; }
   claim_item "$i" "chain-$lane" || { rmdir "$CHAIN_MUTEX" 2> /dev/null || true; return 1; }
@@ -7584,6 +8011,7 @@ red=$((NT - green - skipped - yielded - ND))
 lane_s() { if [ -f "$OUT/lane-$1.s" ]; then cat "$OUT/lane-$1.s"; else echo 0; fi; }
 done_line="DONE total=$NT red=$red tier=$TIER"
 [ "$LEDGER" = 0 ] || done_line="$done_line skipped=$skipped"
+[ "$LFAST" = 0 ] || done_line="$done_line ledger=fast"
 [ "$yielded" = 0 ] || done_line="$done_line yielded=$yielded"
 # The plan alarm (the header): a wall past 1.5 × the plan is `slow=<ratio>` on the line and one stderr line naming the largest lane gap.
 wall_s=$(($(date +%s) - T0))

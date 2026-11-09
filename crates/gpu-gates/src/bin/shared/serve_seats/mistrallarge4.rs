@@ -222,6 +222,7 @@ const WHOSE: &str = "a mistrallarge4 body's";
 const THINK: ThinkTags = ThinkTags {
     open: "[THINK]",
     close: "[/THINK]",
+    response: None,
 };
 
 /// The seat's own flags: `--cache-ram` and the image input's.

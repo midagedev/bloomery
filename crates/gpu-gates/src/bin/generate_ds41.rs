@@ -11,6 +11,27 @@
 //!                   [--place PLACE] [--mode eager|graph] [--time [--warm W]]
 //!                   [--logits] [--warm-save]
 //!     generate_ds41 --records-schema
+//!     generate_ds41 --preflight <folder> --ranks N[,N...] [--ctx C]
+//!     generate_ds41 --place tp --ranks FILE --rank R (--folder DIR | --store DIR) [flags]
+//!
+//! `--place tp`, in a build with the `checkpoint` feature (a build without it
+//! refuses it by name), runs one rank of a tensor-parallel greedy run of an
+//! original checkpoint folder (`shared/ds41_tp.rs`).
+//!
+//! `--preflight`, in a build with the `checkpoint` feature (a build without it
+//! refuses the flag by name), reads the original checkpoint folder's headers
+//! alone (`model_hf::folder::open`) and prints a `tp need` record for each rank of
+//! each rank count `--ranks` lists: what the rank needs of its pool by item
+//! (`model_hf::arch::deepseek41::preflight`, at `--ctx` positions of one
+//! sequence, one position a step) and the folder bytes its read-set holds
+//! (`model_hf::arch::deepseek41::rank_reads`). Every rank's pool is this
+//! node's (its one device's census, `placement::tp::RankPool::of`): the ranks'
+//! own pools are their open's. The node's device must allocate from host
+//! memory, since a rank's need counts host and device bytes in one pool; a
+//! card of its own memory is refused by name. A rank count the cuts or a pool refuse is
+//! refused by name after the others print, with every item the short rank
+//! needs; no card is allocated or loaded (the census only reads the device's
+//! memory).
 //!
 //! Defaults: prompt 0 (none when `--depth` is given), N 32, C the serving
 //! context (`workstation::CTX_MAX`), place `a` (the common unset rule,
@@ -216,7 +237,10 @@
 //! `--serve-feed`, `--dump-table FILE` and `--card-table FILE` are the
 //! generate binaries' shared diagnosis flags (`generate::Diag`, whose doc is
 //! theirs). They act on the plain runs of the prompt flags, and each is
-//! refused by name beside a draft, the finite probe and `BLOOMERY_GEN_SLOTS`.
+//! refused by name beside a draft, the finite probe and `BLOOMERY_GEN_SLOTS`;
+//! `--top2` alone also reads a draft's passes (the same pass the greedy run
+//! takes, its rows read back as it picks), and is refused beside the finite
+//! probe.
 //! `--repeat` does not mix with `--arm`: an arm list's runs start from the
 //! session's clear, which sends the residency back to its seed, and
 //! `--repeat`'s from `Target::reset`, which keeps it. `--card-table` needs
@@ -337,6 +361,14 @@ mod gen_slots;
 #[path = "shared/state_back.rs"]
 mod state_back;
 
+#[cfg(all(feature = "deepseek41", feature = "checkpoint"))]
+#[path = "shared/ds41_rank.rs"]
+mod ds41_rank;
+
+#[cfg(all(feature = "deepseek41", feature = "checkpoint"))]
+#[path = "shared/ds41_tp.rs"]
+mod tp;
+
 #[cfg(feature = "deepseek41")]
 mod drive {
     use std::num::NonZeroUsize;
@@ -344,6 +376,8 @@ mod drive {
     use std::path::Path;
     use std::time::{Duration, Instant};
 
+    #[cfg(feature = "checkpoint")]
+    use crate::tp::run as tp_run;
     use app::arch::deepseek41::Ds41Cfg;
     use app::warm::{WarmFile, WarmLoad, WarmSave};
     use app::{Loaded, OpenArgs, OpenLog, RowsLog, Session, SessionError};
@@ -357,6 +391,8 @@ mod drive {
     };
     use bloomery_gpu_deepseek41::chain::attn::SUB_TOKENS;
     use bloomery_gpu_deepseek41::swap;
+    #[cfg(feature = "checkpoint")]
+    use bloomery_gpu_gates::ds41_preflight::preflight;
     use bloomery_gpu_gates::generate::{
         Diag, Lane, NoEog, Place, PlaceWhy, Residence, ServeFeed, TopRows, before_path, card_table,
         dump_table, lane_at, mode_name, place_table, read_table, repeat_runs, seed_path,
@@ -367,9 +403,10 @@ mod drive {
     use bloomery_gpu_gates::record::{self, Record};
     use bloomery_gpu_gates::{Fnv1a64, GateError, data_dir, ref_model_path, residency};
     use bloomery_levers::{
-        CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, GEN_SLOTS, HOST_LANES,
-        HOST_LOCK, HOST_POPULATE, HOSTSTREAM, Levers, MTP_WIDTH, PIN_MAIN, PREFILL, PREFILL_GROUP,
-        R8, RESIDENCY, ResidencyAt, ResidencyPick, STEP_STATS, WARM_PROFILE,
+        CARD_BUDGET, CARD_DONTNEED, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, EXPERT_RANK,
+        GEN_SLOTS, HOST_LANES, HOST_LOCK, HOST_POPULATE, HOSTSTREAM, Levers, MTP_WIDTH, PIN_MAIN,
+        PREFILL, PREFILL_CUT, PREFILL_GROUP, R8, RESIDENCY, ResidencyAt, ResidencyPick, STEP_STATS,
+        WARM_PROFILE,
     };
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
@@ -377,8 +414,8 @@ mod drive {
     use model::placement::{Machine, Plan, PlanLevers, workstation};
     use runtime::width::{Choosing, Chosen, Mode as WidthMode, Rule, Wall};
     use runtime::{
-        Advance, Committed, GenOutcome, Lookup, PassSink, Speculative, Stop, StopReason, Target,
-        Want,
+        Advance, Committed, GenOutcome, Lookup, PassSink, Pick, Picked, RowLogits, Speculative,
+        Stop, StopReason, Target, Want,
     };
 
     use crate::draft::{Draft, open_dspark};
@@ -677,7 +714,7 @@ mod drive {
     /// The depth tables' sequence, `lcg_prompt` of `tools/ref/lease.sh`: 100000,
     /// then an LCG walk over [1000, 91000). awk computes it in doubles, so this
     /// does too — past the second id the exact 64-bit LCG is another sequence.
-    fn depth_ids(n: usize) -> Vec<u32> {
+    pub(crate) fn depth_ids(n: usize) -> Vec<u32> {
         let mut out = Vec::with_capacity(n);
         let mut s: f64 = 12345.0;
         for i in 0..n {
@@ -751,9 +788,11 @@ mod drive {
         CED,
         PREFILL,
         PREFILL_GROUP,
+        PREFILL_CUT,
         ENGRAM_HELPER,
         STEP_STATS,
         CARD_BUDGET,
+        EXPERT_RANK,
         PIN_MAIN,
         HOST_LANES,
         DRAFT,
@@ -770,7 +809,35 @@ mod drive {
         bloomery_gpu_gates::llama_place::DRAFT_CARD,
     ];
 
+    /// `--preflight` in a build without the `checkpoint` feature, refused by name.
+    #[cfg(not(feature = "checkpoint"))]
+    fn preflight(_args: &[String]) -> Result<(), GateError> {
+        Err(
+            "--preflight: a checkpoint folder is opened by a build with the checkpoint feature"
+                .into(),
+        )
+    }
+
+    /// `--place tp` in a build without the `checkpoint` feature, refused by name.
+    #[cfg(not(feature = "checkpoint"))]
+    fn tp_run(_args: &[String], _levers: &Levers) -> Result<(), GateError> {
+        Err(
+            "--place tp: a rank's checkpoint folder is opened by a build with the checkpoint feature"
+                .into(),
+        )
+    }
+
     pub fn run() -> Result<(), GateError> {
+        let args: Vec<String> = std::env::args().collect();
+        if args.iter().any(|a| a == "--preflight") {
+            record::at_main("generate_ds41", record::GENERATE_DS41);
+            return preflight(&args[1..]);
+        }
+        if args.windows(2).any(|w| w[0] == "--place" && w[1] == "tp") {
+            let levers = bloomery_levers::at_main(ACTS_ON)?;
+            record::at_main("generate_ds41", record::GENERATE_DS41);
+            return tp_run(&args[1..], &levers);
+        }
         // llama-server's placement flags and variables come out of the arguments, and the levers
         // they are replace the environment's, before any lever is read.
         let seat = || -> Result<&'static str, GateError> { Ok("ds41") };
@@ -1130,9 +1197,26 @@ mod drive {
             return Err("generate_ds41: a draft or the finite probe runs one arm".into());
         };
         let a = &r.a;
-        if let Some(flag) = a.diag.set().first() {
+        // `--top2` reads a draft's passes too ([`TopPick`]); the other flags act on the plain runs.
+        let top2_ok = draft != Draft::Off;
+        if let Some(flag) = a
+            .diag
+            .set()
+            .into_iter()
+            .find(|&f| !(f == "--top2" && top2_ok))
+        {
             return Err(format!(
-                "{flag} acts on the plain runs: not under a draft or the finite probe"
+                "{flag} acts on the plain runs{}: not under {}",
+                if flag == "--top2" {
+                    " and a draft's passes"
+                } else {
+                    ""
+                },
+                if flag == "--top2" {
+                    "the finite probe"
+                } else {
+                    "a draft or the finite probe"
+                }
             )
             .into());
         }
@@ -2095,6 +2179,7 @@ mod drive {
                 None => load,
             };
             load.u("group", b.prefill_group_lever())
+                .u("cut", b.prefill_cut_lever())
                 .f("load_s", total.as_secs_f64())
                 .print();
             if let Some(times) = m.load_times() {
@@ -2165,7 +2250,8 @@ mod drive {
     }
 
     /// The host tier's batch services since `base`, the arm's start, one
-    /// line: the layers served, the columns and host slots they carried, and the union calls'
+    /// line: the layers served, the columns and host slots they carried, the slots they left
+    /// to the tiers' batch legs (a tier node's block among them), and the union calls'
     /// wall — the part of a batched feed the card waits on the host; then
     /// the last call's needs and its split, then its host-streaming picks
     /// and end when it streamed.
@@ -2179,6 +2265,10 @@ mod drive {
             .u(
                 "union_host_slots",
                 s.batch_host_slots - base.batch_host_slots,
+            )
+            .u(
+                "union_tier_slots",
+                s.batch_tier_slots - base.batch_tier_slots,
             )
             .f("union_ms", (s.batch_ns - base.batch_ns) as f64 / 1e6)
             .print();
@@ -2334,7 +2424,7 @@ mod drive {
         let time = FeedTime {
             n: depth,
             passes: if batch {
-                body::batch_count(called) + usize::from(f.serve)
+                s.model().body("generate_ds41")?.prefill_batch_count(called) + usize::from(f.serve)
             } else {
                 depth
             },
@@ -2604,6 +2694,27 @@ mod drive {
         }
     }
 
+    /// `--top2` under a draft: the pick that takes each row's argmax as the pass found it and, while
+    /// the run still wants a row, reads the row behind it ([`TopRows::read`] names a row whose
+    /// largest entry is another id). Rows are picked in position order, one a kept token.
+    struct TopPick<'a>(&'a mut TopRows);
+
+    impl Pick<Session<Body>> for TopPick<'_> {
+        fn pick(
+            &mut self,
+            t: &mut Session<Body>,
+            r: usize,
+            argmax: u32,
+        ) -> Result<u32, SessionError> {
+            if self.0.wants() {
+                self.0
+                    .read(t.row_logits(r)?, argmax)
+                    .map_err(SessionError::Caller)?;
+            }
+            Ok(argmax)
+        }
+    }
+
     /// `decode` under `BLOOMERY_DRAFT`: passes of `spec` until `-n` tokens are
     /// out, each timed around the proposal, the pair pass and the draft's
     /// update — the lookup's push, or the DSpark draft's features. The draft
@@ -2630,8 +2741,19 @@ mod drive {
             probes: Vec::new(),
             n_gen: a.n_gen,
         };
+        let mut tops = TopRows::new(&a.diag);
+        if tops.wants() {
+            tops.read(&s.model().logits()?, first)?;
+        }
         let stop = stop_at_n(s, a)?;
-        let out = runtime::generate(s, spec, f.ids, first, &stop, &mut sink)?;
+        // The same pass the greedy run takes (`Speculative::pass` is `pass_picking` by `Argmax`),
+        // its rows read as `--top2` asks.
+        let out = if tops.wants() {
+            let mut picked = Picked::new(&mut *spec, TopPick(&mut tops));
+            runtime::generate(s, &mut picked, f.ids, first, &stop, &mut sink)?
+        } else {
+            runtime::generate(s, spec, f.ids, first, &stop, &mut sink)?
+        };
         ran_to_n(&out)?;
         after(spec)?;
         let passes = sink.passes;
@@ -2645,6 +2767,7 @@ mod drive {
         }
         feed_time.print();
         print_draft_rows(a, first, &sink.emitted, &passes);
+        tops.finish(None)?;
         if a.logits {
             print_logits(s.model())?;
         }

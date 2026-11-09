@@ -400,12 +400,14 @@ pub(crate) fn file_block(w: &[u32], g: usize) -> (f32, [u32; 4]) {
 /// Lane `lane`'s partial of one row of a file-layout stream against one
 /// q8_1 column, the module doc's rule: row `row`'s block `b` is block `row ·
 /// n_blk + b` of the stream ([`file_block`]), the column's words are read as
-/// in [`lane_partials`] from `q0` and its scales from `d0`.
+/// in [`lane_partials`] from `q0` and its scales from `d0`, block `b`'s at `d0
+/// + (b >> d_shift)`: `d_shift` 2 for a `Q8Act` column (one scale a 128-value
+/// block), 0 for a `crate::q5::Q8Blocks32` column (one a block).
 ///
-/// The caller keeps `n_blk` a multiple of 4 (so a row is whole words), `w`
-/// holding the stream through the last block of row `row` ([`file_block`]'s
-/// boundary), `q.len() >= q0 + 256 · ceil(n_blk / 32)`, `d8.len() >= d0 +
-/// n_blk / 4` and `lane < 32` (rust-quality R28).
+/// The caller keeps `d_shift` 0 or 2 and `n_blk` a multiple of `1 << d_shift`,
+/// `w` holding the stream through the last block of row `row`
+/// ([`file_block`]'s boundary), `q.len() >= q0 + 256 · ceil(n_blk / 32)`,
+/// `d8.len() >= d0 + (n_blk >> d_shift)` and `lane < 32` (rust-quality R28).
 #[allow(
     clippy::too_many_arguments,
     reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
@@ -419,6 +421,7 @@ pub(crate) fn lane_partial_file(
     d8: &[f32],
     q0: usize,
     d0: usize,
+    d_shift: usize,
     lane: usize,
 ) -> f32 {
     let g0 = row * n_blk;
@@ -431,8 +434,8 @@ pub(crate) fn lane_partial_file(
         let dec = decode_block(qs);
         let qb = q0 + 256 * (b >> 5) + (b & 31);
         // SAFETY: qb + 224 < q0 + 256·ceil(n_blk/32) for b < n_blk, so the
-        // eight words qb + 32i are inside the column, and scale d0 + b/4
-        // inside its scales, both by this fn's contract.
+        // eight words qb + 32i are inside the column, and scale d0 + (b >>
+        // d_shift) inside its scales, both by this fn's contract.
         let (x, dx) = unsafe {
             (
                 [
@@ -445,7 +448,7 @@ pub(crate) fn lane_partial_file(
                     *q.get_unchecked(qb + 192),
                     *q.get_unchecked(qb + 224),
                 ],
-                *d8.get_unchecked(d0 + (b >> 2)),
+                *d8.get_unchecked(d0 + (b >> d_shift)),
             )
         };
         f = block_fma(&dec, &x, dw, dx, f);

@@ -1,0 +1,28 @@
+# kvhost2 mutant spill-off
+# clause: the residency gate's kvspill clause
+#   (crates/gpu-gates/src/bin/gate_qwen38_residency.rs, fn kvspill_clause): the store ignores
+#   BLOOMERY_KV_HOST=spill and backs every plane page on the card, so the squeezed run's growth
+#   past the first run's reach meets the card's refusal, the fit's retry frees expert stacks
+#   and the machine withdraws slots — the clause's "0 everywhere" reds by a withdrawn count
+#   above 0 (and the planes hold no host bytes).
+# site: crates/gpu/src/arch/qwen3moe/scratch38.rs backing_of — Spill mapped to Backing::Card.
+# expected red: "kvspill: ... withdrawn [k, k, ...] slots a layer over 12 layers (0 everywhere:
+#   FAIL)".
+
+--- a/crates/gpu/src/arch/qwen3moe/scratch38.rs	2026-11-09 05:12:35
++++ b/crates/gpu/src/arch/qwen3moe/scratch38.rs	2026-11-09 05:12:35
+@@ -94,13 +94,13 @@
+ /// The room backing the `BLOOMERY_KV_HOST` lever names for the K/V planes:
+ /// the store's own mapping of the lever's typed word, one owner with the
+ /// lever row.
+ pub(super) fn backing_of(kv: bloomery_levers::KvHost) -> Backing {
+     match kv {
+         bloomery_levers::KvHost::Off => Backing::Card,
+-        bloomery_levers::KvHost::Spill => Backing::Spill,
++        bloomery_levers::KvHost::Spill => Backing::Card,
+         bloomery_levers::KvHost::All => Backing::Host,
+     }
+ }
+ 
+ /// A layer's store: the delta rule's recurrent state ([`LANES`] lane), its
+ /// lane's stamp (`linear::delta`'s module doc), conv ring, carry and verify

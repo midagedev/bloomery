@@ -1,0 +1,35 @@
+# Round nodebatch, third sitting (kind profile): the ws+Spark decode rate under the DSpark draft against ws alone under
+# the same draft. The second sitting (nodebatch-decode-lock, 2026-11-05 07:40) read the node arm's warm step at
+# 26.4..27.0 ms (last10 p50) against plan (a)'s 19.4..19.7 ms with the host set locked (the decode steps fault no
+# more: the lock smoke's majflt 10 over 159 steps), so the gap is the node's round trip a a layer: 7 ms a step =
+# 40 x ~175 us, the top of the sparkr3-a band. A plain step pays a once a position. A DSpark pass pays a once for
+# its 1 + accepts positions (the 11-05 06:02 smoke over the node: 32 positions in 22 passes, a 0.603), so the draft
+# amortizes a, and the question is whether that flips the sign against ws alone under the same draft.
+# [derived] plan (a) under the draft: a two-row pass's card front is the one-row's 17 ms plus the second row's
+# attention and the routed experts the two rows do not share (1.0..1.5 x), 19.4..29 ms a pass, 1.45 positions a pass
+# (32/22) -> 50..75 tok/s(positions). The node arm: the same pass plus a x 40 = 7 ms -> 26.4..36 ms a pass -> 40..55
+# tok/s(positions). The ratio node / plain = pass_a / (pass_a + 7) = 0.73..0.81: the draft does not flip the sign; it
+# raises both. The measured value is the node arm's tok/s(positions); the plan (a) arm beside it is the paired
+# reference, and the ratio is the number read against 0.73..0.81.
+kind: profile
+question: under the DSpark draft on both arms, does the ws with the Spark decode at, above or below ws alone, and does
+  the draft's amortization of the node round trip move the ratio above the plain decode's 0.58 (27.0 / 46.0 p50)?
+term: tok/s(positions) @ n=96, prose P 512, depth 512, A6000 stage, the draft on the 3090 as a holder in both arms
+  (BLOOMERY_DRAFT=dspark BLOOMERY_DSPARK_CARD=3090); the node arm --place bp with the Spark tier over tcp
+  (BLOOMERY_TIER_NODES, BLOOMERY_TIER_LINK=tcp, BLOOMERY_HOST_LOCK=1), the plain arm --place a; both under
+  BLOOMERY_CARD_BUDGET=90G, the prompt as one batch, residency unset (mid on both); the one-card runner mode (the
+  two-card mode refuses an a arm under the draft)
+unit: tok/s
+predict: 40..55
+condition: one binary (the nodebatch tree), every arm's load its own process; the Spark's tier_server loop up from the
+  same tree, its caches dropped before the sitting, free >= 100 GB; no [cpu-busy] on a counted row; rows marked
+  [cold] stand with that mark; 4 rounds
+decide-in: the ratio node / plain inside 0.73..0.81 says a is the whole gap and the draft only scales it: the lever is
+  a itself (profile the link with the engine's stamps, BLOOMERY_PROFILE=1, before any other change) or a pass with
+  more rows; write both arms' positions rates beside the plain sitting's in the morning report
+decide-below: below 40: the draft's two rows double the node's served ids and the node leg grows past the card front
+  (read the node arm's host_slots and its `time pass` rows against the plain sitting's 26.5 ms); the draft is off
+  the node path until the node's leg is read
+decide-above: above 55: the two-row pass costs less than 1.0 x on the card or a is amortized further than a pass
+  (the node answers both rows in one trip); write the ws+Spark draft headline with its interval and run the plan
+  (a) arm's draft number as the ws-alone draft headline beside it

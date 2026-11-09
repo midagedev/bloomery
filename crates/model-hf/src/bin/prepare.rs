@@ -2,14 +2,23 @@
 //! (`gguf::Split`). The folder's quantization config places each tensor in a format
 //! (`hf::quant_config`), the model's map names it, says how its role reads it and moves it into
 //! the program's layout (`model_hf::arch::qwen35moe::Checkpoint`, qwen4exp's and Qwen3.6's reader,
-//! or `model_hf::arch::qwen3moe::Checkpoint`, Qwen3-MoE's), and one table writes each format as
+//! `model_hf::arch::qwen3moe::Checkpoint`, Qwen3-MoE's, or `model_hf::arch::kimi_k3::Checkpoint`,
+//! Kimi K3's and K3.1's), and one table writes each format as
 //! its GGUF type (`hf::modelopt::normalize`). The map is the one the config's `model_type` names,
 //! among the maps `model_hf::arch::with_split_map` reads.
 //!
 //!     prepare <folder> <out prefix> [--shard-gib <n>] [--keep-bf16]
+//!             [--drop <glob>]... [--only <glob>]... [--arch <word>]
+//!             [--follow <list> [--follow-stall <seconds>] [--follow-poll <seconds>]] [--room <bytes>]
 //!
 //! writes `<out prefix>-00001-of-0000N.gguf` and on, each shard at most `n` GiB (48 by default)
 //! unless one tensor with its scale and file layout is larger, the metadata in the first.
+//! `--drop` leaves out the tensors whose GGUF name a glob matches (`*` any run of characters, `?`
+//! one) and `--only` keeps those and no others; each flag may repeat, the two do not combine, and
+//! a pattern that matches no tensor is refused by name. A split of a selection is checked by
+//! opening it and holding its tensors to the plan's, where a whole split is read as the program
+//! reads a model. `--arch <word>` writes the header under another of the map's architecture
+//! words: a K3.1 folder as `kimi-k3` takes `--drop 'blk.*.indexer.*'` and has no indexer keys.
 //! A quantized tensor keeps its stored format (NVFP4, MXFP8, FP8), and a BF16 matrix stays BF16,
 //! the head and the token embedding among them; the server reads each through its BF16 site.
 //! BF16 and F32 expert stacks are refused by name. An F32 matrix the map reads as Q8_0 is
@@ -21,10 +30,29 @@
 //! (1,271,398,400 bytes of BF16 against 34 bytes a 32 values). The output shard paths must
 //! not exist. A private temporary directory holds the entire split until it passes the
 //! server's reader; the first shard is published last. A persistent `<out prefix>.prepare.lock`
-//! file serializes writers of that prefix. The disk must hold the split and a tenth more.
+//! file serializes writers of that prefix. The disk must hold the split and a tenth more, or the
+//! `--room <bytes>` a caller states when it frees the input behind the writer (`--follow` with a
+//! deleter of the shards the writer has closed): the plan then refuses by name below that many
+//! free bytes instead.
 //! One line per tensor, a summary line, and exit status 1 with the error on any failure. Before
 //! any shard is written, the tokenizer serving builds from the header is checked to split text
 //! and stop generation where Hugging Face's does.
+//!
+//! `--follow <list>` writes the split behind the download that is filling the folder. The list
+//! is the download's own, `path<TAB>bytes` a line (`model_hf::follow`); a shard is complete at
+//! its listed bytes or with a `<shard>.done` sidecar beside it. The plan comes from the config
+//! and the index (`FolderMap::stored`) before any shard is there, so the config, the index and
+//! the files beside the shards (the tokenizer's) must be complete first: put them first in the
+//! download. Each shard that completes is opened and its header held to the config's table, and
+//! an output shard is written once every input shard it reads is complete, in whatever order
+//! they finish. A tensor is made whole in memory and streamed to its output shard one at a
+//! time: the largest, a layer's stacked routed experts, is one allocation of its length, so the
+//! peak is that tensor and the page cache of the shard being read. Output shards are staged in
+//! `<out prefix>.follow/`, each renamed into place and marked `<shard>.done` once its bytes are
+//! synced: a rerun with the same arguments skips every marked shard, removes a partial one, and
+//! refuses a stage another plan made. After the last shard the split is checked and published as
+//! a whole. A wait refuses by name once no listed byte has arrived for `--follow-stall`
+//! seconds (600 by default), polling every `--follow-poll` seconds (10 by default).
 //!
 //!     prepare <folder> --plan
 //!
@@ -35,12 +63,13 @@
 //! It is the stored form, which `--keep-bf16` names too; it takes no `--shard-gib` and refuses
 //! `BLOOMERY_PREPARE_Q8=1`, whose rewrite it does not plan.
 
+use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bloomery_levers::PREPARE_Q8;
 use gguf::Value;
@@ -48,9 +77,15 @@ use gguf::write::{Layout, Writer};
 use hf::modelopt::{self, Normal, Use};
 use model_hf::arch::{self, MapUse};
 use model_hf::folder::{self, FolderMap, Make, Planned};
+use model_hf::follow::Follow;
+use model_hf::select::Select;
+use model_hf::shards::plan_shards;
 
 const USAGE: &str = concat!(
     "usage: prepare <folder> <out prefix> [--shard-gib <n>] [--keep-bf16]\n",
+    "                [--drop <glob>]... [--only <glob>]... [--arch <word>]\n",
+    "                [--follow <list> [--follow-stall <seconds>] [--follow-poll <seconds>]]\n",
+    "                [--room <bytes>]\n",
     "       prepare <folder> --plan"
 );
 
@@ -75,13 +110,42 @@ fn main() -> ExitCode {
 /// The split of the folder `args` name, or with `--plan` its plan; `q8` (`BLOOMERY_PREPARE_Q8`)
 /// writes its BF16 matrices the map reads as Q8_0, and its F32 matrices, in Q8_0.
 fn run(args: &[String], q8: bool) -> Res<()> {
+    run_in(args, q8, 1 << 30)
+}
+
+/// [`run`] with the byte count of the `--shard-gib` unit: a test's shards are kilobytes.
+fn run_in(args: &[String], q8: bool, unit: u64) -> Res<()> {
     let (mut shard_gib, mut keep_bf16, mut plan, mut paths) = (None, false, false, vec![]);
+    let (mut drop, mut only, mut arch) = (vec![], vec![], None);
+    let (mut follow, mut stall, mut poll) = (None, None, None);
+    let mut room = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--shard-gib" => shard_gib = Some(it.next().ok_or(USAGE)?.parse::<u64>()?),
             "--keep-bf16" => keep_bf16 = true,
             "--plan" => plan = true,
+            "--drop" => drop.push(it.next().ok_or(USAGE)?.clone()),
+            "--only" => only.push(it.next().ok_or(USAGE)?.clone()),
+            "--arch" => {
+                if arch.replace(it.next().ok_or(USAGE)?.clone()).is_some() {
+                    return Err("--arch given twice".into());
+                }
+            }
+            "--follow" => {
+                if follow.replace(it.next().ok_or(USAGE)?.clone()).is_some() {
+                    return Err("--follow given twice".into());
+                }
+            }
+            "--follow-stall" => stall = Some(seconds("--follow-stall", it.next().ok_or(USAGE)?)?),
+            "--follow-poll" => poll = Some(seconds("--follow-poll", it.next().ok_or(USAGE)?)?),
+            "--room" => {
+                let v = it.next().ok_or(USAGE)?;
+                let bytes = v.parse::<u64>().map_err(|e| format!("--room {v}: {e}"))?;
+                if room.replace(bytes).is_some() {
+                    return Err("--room given twice".into());
+                }
+            }
             _ => paths.push(a),
         }
     }
@@ -89,26 +153,52 @@ fn run(args: &[String], q8: bool) -> Res<()> {
         let [dir] = paths[..] else {
             return Err(USAGE.into());
         };
-        if shard_gib.is_some() || q8 {
+        if shard_gib.is_some()
+            || q8
+            || !drop.is_empty()
+            || !only.is_empty()
+            || arch.is_some()
+            || follow.is_some()
+            || stall.is_some()
+            || poll.is_some()
+            || room.is_some()
+        {
             return Err(format!(
                 "--plan prints the folder's stored form and writes no shard: it takes no \
-                 --shard-gib, and {PREPARE_Q8}=1 asks for a Q8_0 rewrite it does not plan"
+                 --shard-gib, --drop, --only, --arch, --follow or --room, and {PREPARE_Q8}=1 asks for a \
+                 Q8_0 rewrite it does not plan"
             )
             .into());
         }
         return print_plan(Path::new(dir));
     }
+    let options = folder::Options {
+        arch,
+        select: Select::of(drop, only)?,
+    };
     let shard_gib = shard_gib.unwrap_or(48);
     let [dir, prefix] = paths[..] else {
         return Err(USAGE.into());
     };
+    if follow.is_none() && (stall.is_some() || poll.is_some()) {
+        return Err(
+            "--follow-stall and --follow-poll bound a wait for the download --follow \
+                    reads: give --follow <list>"
+                .into(),
+        );
+    }
+    let follow = follow.map(|list| FollowFlags {
+        list: PathBuf::from(list),
+        stall: stall.unwrap_or(Duration::from_secs(600)),
+        poll: poll.unwrap_or(Duration::from_secs(10)),
+    });
     if keep_bf16 && q8 {
         return Err(format!(
             "--keep-bf16 keeps the BF16 matrices {PREPARE_Q8}=1 asks to write as Q8_0: set one"
         )
         .into());
     }
-    let limit = u64::checked_mul(shard_gib, 1 << 30)
+    let limit = u64::checked_mul(shard_gib, unit)
         .filter(|&l| l > 0)
         .ok_or_else(|| {
             format!("--shard-gib {shard_gib}: not a shard size of 1 GiB or more in u64 bytes")
@@ -122,6 +212,9 @@ fn run(args: &[String], q8: bool) -> Res<()> {
             prefix,
             limit,
             q8,
+            options: &options,
+            follow: follow.as_ref(),
+            room,
         },
     )
     .ok_or_else(|| {
@@ -141,31 +234,126 @@ struct WriteSplit<'a> {
     limit: u64,
     /// Whether a BF16 or F32 matrix is rewritten as Q8_0.
     q8: bool,
+    /// The architecture word and the tensors the split holds.
+    options: &'a folder::Options,
+    /// The download to follow, when the folder's shards are still arriving.
+    follow: Option<&'a FollowFlags>,
+    /// The free bytes the output directory must hold at the plan, when the caller states one.
+    room: Option<u64>,
+}
+
+/// `--follow` and its two bounds.
+struct FollowFlags {
+    list: PathBuf,
+    stall: Duration,
+    poll: Duration,
+}
+
+/// A number of seconds above zero, for the flag `flag`.
+fn seconds(flag: &str, text: &str) -> Res<Duration> {
+    let secs: f64 = text
+        .parse()
+        .map_err(|_| format!("{flag} {text:?}: not a number of seconds"))?;
+    if secs <= 0.0 {
+        return Err(format!("{flag} {text:?}: not above zero seconds").into());
+    }
+    Duration::try_from_secs_f64(secs)
+        .map_err(|e| format!("{flag} {text:?}: not a number of seconds: {e}").into())
 }
 
 impl MapUse for WriteSplit<'_> {
     type Out = Res<()>;
 
     fn with<M: FolderMap>(self) -> Res<()> {
-        write_as::<M>(self.dir, self.prefix, self.limit, self.q8)
+        write_as::<M>(&self)
     }
 }
 
-/// The split of the folder `dir`, read by the map `M`, written at `prefix`.
-fn write_as<M: FolderMap>(dir: &Path, prefix: &str, limit: u64, q8: bool) -> Res<()> {
-    let folder::Read {
+/// The split of the folder `job.dir`, read by the map `M`, written at `job.prefix`.
+fn write_as<M: FolderMap>(job: &WriteSplit<'_>) -> Res<()> {
+    let WriteSplit {
+        dir,
+        prefix,
+        limit,
+        q8,
+        options,
+        follow,
+        room,
+    } = *job;
+    let whole = options.select == Select::All;
+    let Some(flags) = follow else {
+        let folder::Read {
+            checkpoint,
+            folder,
+            plan,
+            planned,
+            kvs,
+            ..
+        } = folder::read_with::<M>(dir, q8, options)?;
+        let split = lay_out(planned, &kvs, limit, prefix, &plan, room)?;
+        let get = |n: &str| folder.raw(n);
+        return write_split(
+            prefix,
+            split.layouts.clone(),
+            |no, w| write_tensors(w, &split.shards[no], &checkpoint, &plan, get),
+            |first| check_split(first, &split.held, whole),
+        );
+    };
+
+    let mut run = Follow::new(dir, &flags.list, flags.stall, flags.poll)?;
+    run.say(|line| println!("prepare: {line}"));
+    let stage = PathBuf::from(format!("{prefix}.follow"));
+    let folder::Staged {
         checkpoint,
-        folder,
         plan,
         planned,
         kvs,
         ..
-    } = folder::read::<M>(dir, q8)?;
+    } = run.plan::<M>(&stage.join("shell"), q8, options)?;
+    let split = lay_out(planned, &kvs, limit, prefix, &plan, room)?;
+    let needs = split
+        .shards
+        .iter()
+        .map(|shard| run.needs(&plan, shard))
+        .collect::<Result<Vec<_>, _>>()?;
+    let staging = Staging {
+        prefix,
+        dir: &stage,
+        key: plan_key(&split, limit, q8, options),
+    };
+    write_follow(
+        &staging,
+        &split,
+        &needs,
+        &mut run,
+        |f, no, w| write_tensors(w, &split.shards[no], &checkpoint, &plan, |n| f.raw(n)),
+        |first| check_split(first, &split.held, whole),
+    )
+}
 
+/// A split planned: its shards' tensors and layouts, and the names of every tensor it holds.
+struct SplitPlan<S> {
+    shards: Vec<Vec<Planned<S>>>,
+    layouts: Vec<Layout>,
+    held: BTreeSet<String>,
+}
+
+/// The shards `planned` fills to `limit` bytes, checked against the free space of `prefix`'s
+/// directory (the split and a tenth more, or `room` bytes when the caller states the floor it
+/// keeps free behind the writer), with the summary line.
+fn lay_out<S>(
+    planned: Vec<Planned<S>>,
+    kvs: &[(String, Value)],
+    limit: u64,
+    prefix: &str,
+    plan: &hf::quant_config::Plan,
+    room: Option<u64>,
+) -> Res<SplitPlan<S>> {
+    let held: BTreeSet<String> = planned.iter().map(|p| p.decl.name.clone()).collect();
     let tensors = planned.len();
-    let shards = plan_shards(planned, &kvs, limit)?;
+    let (shards, layouts): (Vec<_>, Vec<_>) = plan_shards(planned, kvs, limit)?.into_iter().unzip();
     let count = shards.len();
-    let total = shards.iter().try_fold(0u64, |sum, (_, layout)| {
+    let total = layouts.iter().try_fold(0u64, |sum, layout| {
         sum.checked_add(layout.file_len())
             .ok_or("the split's file sizes overflow u64")
     })?;
@@ -175,14 +363,24 @@ fn write_as<M: FolderMap>(dir: &Path, prefix: &str, limit: u64, q8: bool) -> Res
         .unwrap_or(Path::new("."));
     let free = model::fileio::free_bytes(out_dir)
         .map_err(|e| format!("statvfs {}: {e}", out_dir.display()))?;
-    let needed = total
-        .checked_add(total / 10)
-        .ok_or("the split's file sizes and free-space margin overflow u64")?;
+    let needed = match room {
+        Some(room) => room,
+        None => total
+            .checked_add(total / 10)
+            .ok_or("the split's file sizes and free-space margin overflow u64")?,
+    };
     if free < needed {
-        return Err(format!(
-            "{}: {free} bytes free; the split needs {total} and a tenth more",
-            out_dir.display()
-        )
+        return Err(match room {
+            Some(room) => format!(
+                "{}: {free} bytes free; --room asks for {room} (the split is {total})",
+                out_dir.display()
+            ),
+            None => format!(
+                "{}: {free} bytes free; the split needs {total} and a tenth more (--room <bytes> \
+                 states a lower floor when the input is freed behind the writer)",
+                out_dir.display()
+            ),
+        }
         .into());
     }
     println!(
@@ -191,98 +389,150 @@ fn write_as<M: FolderMap>(dir: &Path, prefix: &str, limit: u64, q8: bool) -> Res
         plan.refused.len(),
         plan.input_scales.len()
     );
-
-    let get = |n: &str| folder.raw(n);
-    let mut tensor_scales: std::collections::HashMap<String, Vec<f32>> =
-        std::collections::HashMap::default();
-    let (shards, layouts): (Vec<_>, Vec<_>) = shards.into_iter().unzip();
-    write_split(
-        prefix,
+    Ok(SplitPlan {
+        shards,
         layouts,
-        |no, w| {
-            for p in &shards[no] {
-                let t = Instant::now();
-                let name = &p.decl.name;
-                match &p.make {
-                    Make::Scale { of } => {
-                        let s = tensor_scales
-                            .remove(of)
-                            .ok_or_else(|| format!("{name}: {of} gave no scale"))?;
-                        w.tensor(
-                            name,
-                            &s.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
-                        )?;
-                    }
-                    Make::Constant(c) => {
-                        w.tensor(name, &c.bytes())?;
-                    }
-                    Make::Tensor(m) if m.role == Use::Rows => {
-                        // A row table's parts, one at a time, all with the table's one scale.
-                        let (mut failed, mut scale) = (None, vec![]);
-                        let parts = m.parts(&plan, get).map_while(|n| match n {
-                            Ok(n) => {
-                                scale = n.scale;
-                                Some(n.bytes)
-                            }
-                            Err(e) => {
-                                failed = Some(e);
-                                None
-                            }
-                        });
-                        let written = w.tensor_parts(name, parts);
-                        if let Some(e) = failed {
-                            return Err(e.into());
-                        }
-                        written?;
-                        tensor_scales.insert(name.clone(), scale);
-                    }
-                    Make::Tensor(m) => {
-                        let mut n: Normal = modelopt::normalize(get, &m.placed(&plan)?, m.role)?;
-                        if let Some(moves) = checkpoint.mover(name, &m.steps) {
-                            moves(&mut n)?;
-                        }
-                        if n.type_id != p.decl.type_id {
-                            return Err(format!(
-                                "{name}: type {}, declared {}",
-                                n.type_id, p.decl.type_id
-                            )
-                            .into());
-                        }
-                        w.tensor(name, &n.bytes)?;
-                        if !n.scale.is_empty() {
-                            tensor_scales.insert(name.clone(), n.scale);
-                        }
-                    }
-                }
-                println!(
-                    "prepare: {name} type={} bytes={} secs={:.3}",
-                    p.decl.type_id,
-                    p.decl.nbytes,
-                    t.elapsed().as_secs_f64()
-                );
+        held,
+    })
+}
+
+/// The tensors of one output shard, each made of the folder's through `get` and written.
+fn write_tensors<'a, M: FolderMap>(
+    w: &mut Writer<BufWriter<File>>,
+    shard: &[Planned<M::Step>],
+    checkpoint: &M,
+    plan: &hf::quant_config::Plan,
+    get: impl Fn(&str) -> Result<safetensors::Raw<'a>, safetensors::Error> + Copy,
+) -> Res<()> {
+    // A tensor's scales reach the `.scale` that follows it, in the same shard.
+    let mut tensor_scales: HashMap<String, Vec<f32>> = HashMap::default();
+    for p in shard {
+        let t = Instant::now();
+        let name = &p.decl.name;
+        match &p.make {
+            Make::Scale { of } => {
+                let s = tensor_scales
+                    .remove(of)
+                    .ok_or_else(|| format!("{name}: {of} gave no scale"))?;
+                w.tensor(
+                    name,
+                    &s.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>(),
+                )?;
             }
-            Ok(())
-        },
-        |first| {
-            // The split opens as the server opens it, its hyperparameters and layers whole.
-            let split = gguf::Split::open(first)?;
-            let read = model::arch::spec(&split)?;
-            println!(
-                "prepare: the split opens: {} layers, {} tensors",
-                read.spec.layers.len(),
-                split.tensor_count()
-            );
-            Ok(())
-        },
+            Make::Constant(c) => {
+                w.tensor(name, &c.bytes())?;
+            }
+            Make::Tensor(m) if m.role == Use::Rows => {
+                // A row table's parts, one at a time, all with the table's one scale.
+                let (mut failed, mut scale) = (None, vec![]);
+                let parts = m.parts(plan, get).map_while(|n| match n {
+                    Ok(n) => {
+                        scale = n.scale;
+                        Some(n.bytes)
+                    }
+                    Err(e) => {
+                        failed = Some(e);
+                        None
+                    }
+                });
+                let written = w.tensor_parts(name, parts);
+                if let Some(e) = failed {
+                    return Err(e.into());
+                }
+                written?;
+                tensor_scales.insert(name.clone(), scale);
+            }
+            Make::Tensor(m) => {
+                let mut n: Normal = modelopt::normalize(get, &m.placed(plan)?, m.role)?;
+                if let Some(moves) = checkpoint.mover(name, &m.steps) {
+                    moves(&mut n)?;
+                }
+                if n.type_id != p.decl.type_id {
+                    return Err(
+                        format!("{name}: type {}, declared {}", n.type_id, p.decl.type_id).into(),
+                    );
+                }
+                w.tensor(name, &n.bytes)?;
+                if !n.scale.is_empty() {
+                    tensor_scales.insert(name.clone(), n.scale);
+                }
+            }
+        }
+        println!(
+            "prepare: {name} type={} bytes={} secs={:.3}",
+            p.decl.type_id,
+            p.decl.nbytes,
+            t.elapsed().as_secs_f64()
+        );
+    }
+    Ok(())
+}
+
+/// The split opening at `first` holds the tensors the plan holds; a whole split also opens as
+/// the server opens it, its hyperparameters and layers whole.
+fn check_split(first: &Path, held: &BTreeSet<String>, whole: bool) -> Res<()> {
+    let split = gguf::Split::open(first)?;
+    let tensors: BTreeSet<String> = split.iter_tensors().map(|(_, t)| t.name.clone()).collect();
+    if tensors != *held || split.tensor_count() != held.len() {
+        return Err(format!(
+            "the split opens with {} tensors, where the plan holds {}",
+            split.tensor_count(),
+            held.len()
+        )
+        .into());
+    }
+    if !whole {
+        println!(
+            "prepare: the split opens with the {} tensors of its selection",
+            split.tensor_count()
+        );
+        return Ok(());
+    }
+    let read = model::arch::spec(&split)?;
+    println!(
+        "prepare: the split opens: {} layers, {} tensors",
+        read.spec.layers.len(),
+        split.tensor_count()
+    );
+    Ok(())
+}
+
+/// What a staged split must equal for a rerun to resume it: the plan's shards, their layouts and
+/// tensors, and the arguments that shaped them.
+fn plan_key<S>(split: &SplitPlan<S>, limit: u64, q8: bool, options: &folder::Options) -> String {
+    let mut fnv = 0xcbf2_9ce4_8422_2325u64;
+    let mut mix = |bytes: &[u8]| {
+        for b in bytes {
+            fnv = (fnv ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for (shard, layout) in split.shards.iter().zip(&split.layouts) {
+        mix(&layout.file_len().to_le_bytes());
+        for p in shard {
+            mix(p.decl.name.as_bytes());
+            mix(&p.decl.type_id.to_le_bytes());
+            mix(&p.decl.nbytes.to_le_bytes());
+            p.decl.dims.iter().for_each(|d| mix(&d.to_le_bytes()));
+        }
+    }
+    format!(
+        "prepare-follow-1 shards={} tensors={} fnv={fnv:016x} limit={limit} q8={q8} arch={:?} select={:?}",
+        split.shards.len(),
+        split.held.len(),
+        options.arch,
+        options.select
     )
 }
 
-fn write_split(
-    prefix: &str,
-    layouts: Vec<Layout>,
-    mut write: impl FnMut(usize, &mut Writer<BufWriter<File>>) -> Res<()>,
-    validate: impl FnOnce(&Path) -> Res<()>,
-) -> Res<()> {
+/// The paths of the `count` shards of the split at `prefix`.
+fn shard_paths(prefix: &str, count: usize) -> Vec<PathBuf> {
+    (1..=count)
+        .map(|no| PathBuf::from(format!("{prefix}-{no:05}-of-{count:05}.gguf")))
+        .collect()
+}
+
+/// The persistent lock file of the output at `prefix`, held, and its path.
+fn lock_output(prefix: &str) -> Res<(File, String)> {
     let lock_path = format!("{prefix}.prepare.lock");
     let lock = std::fs::OpenOptions::new()
         .read(true)
@@ -292,24 +542,236 @@ fn write_split(
         .open(&lock_path)
         .map_err(|e| format!("{lock_path}: open lock: {e}"))?;
     match lock.try_lock() {
-        Ok(()) => {}
+        Ok(()) => Ok((lock, lock_path)),
         Err(std::fs::TryLockError::WouldBlock) => {
-            return Err(format!("{prefix}: prepare output is busy").into());
+            Err(format!("{prefix}: prepare output is busy").into())
         }
-        Err(std::fs::TryLockError::Error(e)) => {
-            return Err(format!("{lock_path}: lock: {e}").into());
+        Err(std::fs::TryLockError::Error(e)) => Err(format!("{lock_path}: lock: {e}").into()),
+    }
+}
+
+/// Where a followed split is staged: the output prefix, the stage directory and the key of the
+/// plan it holds the shards of.
+struct Staging<'a> {
+    prefix: &'a str,
+    dir: &'a Path,
+    key: String,
+}
+
+/// The split written shard by shard as the input shards complete ([`Follow::run`]), each staged
+/// under `stage` and marked done, then checked and published as `write_split` does. Any failure
+/// keeps the marked shards: a rerun with the same plan resumes from them.
+fn write_follow<S>(
+    staging: &Staging<'_>,
+    split: &SplitPlan<S>,
+    needs: &[BTreeSet<String>],
+    run: &mut Follow,
+    mut write: impl FnMut(&Follow, usize, &mut Writer<BufWriter<File>>) -> Res<()>,
+    validate: impl FnOnce(&Path) -> Res<()>,
+) -> Res<()> {
+    let Staging {
+        prefix,
+        dir: stage,
+        key,
+    } = staging;
+    let (lock, lock_path) = lock_output(prefix)?;
+    let count = split.layouts.len();
+    let paths = shard_paths(prefix, count);
+    let file = |no: usize| {
+        paths[no]
+            .file_name()
+            .expect("a shard has a filename")
+            .to_owned()
+    };
+    let marker = |no: usize| {
+        let mut name = file(no);
+        name.push(".done");
+        stage.join(name)
+    };
+    let result = (|| -> Res<()> {
+        for path in &paths {
+            match std::fs::symlink_metadata(path) {
+                Ok(_) => return Err(format!("{}: output already exists", path.display()).into()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("{}: stat: {e}", path.display()).into()),
+            }
+        }
+        let key_path = stage.join("plan.key");
+        // The plan has made the stage for its shell; a stage with a key holds a plan's shards.
+        std::fs::create_dir_all(stage)?;
+        match std::fs::read_to_string(&key_path) {
+            Ok(have) if have == *key => {
+                for entry in std::fs::read_dir(stage)? {
+                    let path = entry?.path();
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or_default();
+                    let stray = name.ends_with(".part")
+                        || (name.ends_with(".gguf")
+                            && !stage.join(format!("{name}.done")).exists());
+                    if stray {
+                        println!(
+                            "prepare: removing the partial staged shard {}",
+                            path.display()
+                        );
+                        std::fs::remove_file(&path)?;
+                    }
+                }
+            }
+            Ok(have) => {
+                return Err(format!(
+                    "{}: staged by another plan ({have:?}), this one is {key:?}; remove it to \
+                     start over",
+                    stage.display()
+                )
+                .into());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let held = std::fs::read_dir(stage)?
+                    .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                    .find(|n| n.ends_with(".gguf") || n.ends_with(".done"));
+                if let Some(name) = held {
+                    return Err(format!(
+                        "{}: holds {name} and no plan.key; remove it to start over",
+                        stage.display()
+                    )
+                    .into());
+                }
+                std::fs::write(&key_path, key)?;
+            }
+            Err(e) => return Err(format!("{}: {e}", key_path.display()).into()),
+        }
+        let done: Vec<bool> = (0..count).map(|no| marker(no).exists()).collect();
+        for no in (0..count).filter(|&no| done[no]) {
+            let at = stage.join(file(no));
+            let len = std::fs::metadata(&at)
+                .map_err(|e| format!("{}: marked done: {e}", at.display()))?
+                .len();
+            if len != split.layouts[no].file_len() {
+                return Err(format!(
+                    "{}: marked done at {len} bytes, where the plan's shard is {}",
+                    at.display(),
+                    split.layouts[no].file_len()
+                )
+                .into());
+            }
+            println!(
+                "prepare: {} is staged and marked done: skipped",
+                at.display()
+            );
+        }
+        run.run(needs, done, |f, no| {
+            let t = Instant::now();
+            let part = stage.join(format!("{}.part", file(no).to_string_lossy()));
+            let wrote = (|| -> Res<()> {
+                let mut w = Writer::new(
+                    BufWriter::new(File::create_new(&part)?),
+                    split.layouts[no].clone(),
+                )?;
+                write(f, no, &mut w)?;
+                w.finish()?
+                    .into_inner()
+                    .map_err(|e| e.into_error())?
+                    .sync_all()?;
+                std::fs::rename(&part, stage.join(file(no)))?;
+                File::create_new(marker(no))?.sync_all()?;
+                Ok(())
+            })();
+            if let Err(e) = wrote {
+                let _ = std::fs::remove_file(&part);
+                return Err(folder::Error::Refused(format!(
+                    "output shard {} of {count}: {e}",
+                    no + 1
+                )));
+            }
+            println!(
+                "prepare: staged output shard {} of {count}, {} bytes, {:.1} s",
+                no + 1,
+                split.layouts[no].file_len(),
+                t.elapsed().as_secs_f64()
+            );
+            Ok(())
+        })?;
+        validate(&stage.join(file(0)))?;
+        publish(stage, &paths)
+    })();
+    let mut cleanup = vec![];
+    match &result {
+        Ok(()) => {
+            if let Err(e) = std::fs::remove_dir_all(stage) {
+                cleanup.push(format!("{}: remove the stage: {e}", stage.display()));
+            }
+        }
+        Err(_) => {
+            let marked = (0..count).filter(|&no| marker(no).exists()).count();
+            println!(
+                "prepare: {marked} of {count} output shards stay staged in {}; a rerun with the \
+                 same arguments resumes from them",
+                stage.display()
+            );
         }
     }
+    if let Err(e) = lock.unlock() {
+        cleanup.push(format!("{lock_path}: unlock: {e}"));
+    }
+    if cleanup.is_empty() {
+        result
+    } else {
+        let cleanup = cleanup.join("; ");
+        match result {
+            Ok(()) => Err(format!("split published; cleanup failed: {cleanup}").into()),
+            Err(e) => Err(format!("{e}; cleanup failed: {cleanup}").into()),
+        }
+    }
+}
+
+/// The staged shards of `paths` (by file name under `stage`) moved to their paths. The first
+/// shard is the entry point, so its siblings are published before it and it appears last; a
+/// shard that cannot be published puts back the ones that were, and a path that exists is never
+/// replaced.
+fn publish(stage: &Path, paths: &[PathBuf]) -> Res<()> {
+    let staged = |path: &Path| stage.join(path.file_name().expect("a shard has a filename"));
+    let mut published: Vec<&PathBuf> = vec![];
+    for path in paths.iter().rev() {
+        if let Err(e) = model::fileio::rename_noreplace(&staged(path), path) {
+            let restore: Vec<String> = published
+                .iter()
+                .filter_map(|p| {
+                    std::fs::rename(p, staged(p))
+                        .err()
+                        .map(|e| format!("{}: take back: {e}", p.display()))
+                })
+                .collect();
+            let restore = if restore.is_empty() {
+                String::new()
+            } else {
+                format!("; {}", restore.join("; "))
+            };
+            return Err(format!("{}: publish: {e}{restore}", path.display()).into());
+        }
+        published.push(path);
+    }
+    for path in paths {
+        println!("prepare: wrote {}", path.display());
+    }
+    Ok(())
+}
+
+fn write_split(
+    prefix: &str,
+    layouts: Vec<Layout>,
+    mut write: impl FnMut(usize, &mut Writer<BufWriter<File>>) -> Res<()>,
+    validate: impl FnOnce(&Path) -> Res<()>,
+) -> Res<()> {
+    let (lock, lock_path) = lock_output(prefix)?;
     let count = layouts.len();
-    let paths: Vec<_> = (1..=count)
-        .map(|no| PathBuf::from(format!("{prefix}-{no:05}-of-{count:05}.gguf")))
-        .collect();
+    let paths = shard_paths(prefix, count);
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_nanos();
     let stage = PathBuf::from(format!("{prefix}.part.{}.{nonce}", std::process::id()));
     let mut staged = false;
-    let mut published = vec![];
     let result = (|| {
         for path in &paths {
             match std::fs::symlink_metadata(path) {
@@ -327,26 +789,9 @@ fn write_split(
             w.finish()?;
         }
         validate(&stage.join(paths[0].file_name().expect("a shard has a filename")))?;
-        // The first shard is the entry point; its siblings are immutable before it appears.
-        for path in paths.iter().rev() {
-            let part = stage.join(path.file_name().expect("a shard has a filename"));
-            model::fileio::rename_noreplace(&part, path)
-                .map_err(|e| format!("{}: publish: {e}", path.display()))?;
-            published.push(path);
-        }
-        for path in &paths {
-            println!("prepare: wrote {}", path.display());
-        }
-        Ok(())
+        publish(&stage, &paths)
     })();
     let mut cleanup = vec![];
-    if result.is_err() {
-        for path in published {
-            if let Err(e) = std::fs::remove_file(path) {
-                cleanup.push(format!("{}: remove published shard: {e}", path.display()));
-            }
-        }
-    }
     if staged && let Err(e) = std::fs::remove_dir_all(&stage) {
         cleanup.push(format!("{}: remove temporary split: {e}", stage.display()));
     }
@@ -375,56 +820,6 @@ fn print_plan(dir: &Path) -> Res<()> {
         opened.tokenizer.n_vocab()
     );
     Ok(())
-}
-
-fn plan_shards<S>(
-    planned: Vec<Planned<S>>,
-    kvs: &[(String, Value)],
-    limit: u64,
-) -> Res<Vec<(Vec<Planned<S>>, Layout)>> {
-    let tensors32 =
-        i32::try_from(planned.len()).map_err(|_| "too many tensors for a GGUF split")?;
-    let shard_keys = |no: u16, count: u16| {
-        let mut keys = if no == 0 { kvs.to_vec() } else { vec![] };
-        keys.extend([
-            ("split.no".to_string(), Value::U16(no)),
-            ("split.count".to_string(), Value::U16(count)),
-            ("split.tensors.count".to_string(), Value::I32(tensors32)),
-        ]);
-        keys
-    };
-    let mut shards: Vec<Vec<Planned<S>>> = vec![vec![]];
-    let mut pending = planned.into_iter().peekable();
-    while let Some(p) = pending.next() {
-        let mut group = vec![p];
-        if pending
-            .peek()
-            .is_some_and(|p| matches!(p.make, Make::Scale { .. }))
-        {
-            group.push(pending.next().expect("the scale was just inspected"));
-        }
-        let no = shards.len() - 1;
-        let no16 = u16::try_from(no).map_err(|_| "too many shards for a GGUF split")?;
-        let last = &mut shards[no];
-        let declarations = last.iter().chain(&group).map(|p| p.decl.clone()).collect();
-        // split.count has the same U16 width for every final count.
-        let candidate = Layout::new(&shard_keys(no16, 1), declarations)?;
-        if !last.is_empty() && candidate.file_len() > limit {
-            shards.push(group);
-        } else {
-            last.extend(group);
-        }
-    }
-    let count16 = u16::try_from(shards.len()).map_err(|_| "too many shards for a GGUF split")?;
-    shards
-        .into_iter()
-        .enumerate()
-        .map(|(no, shard)| {
-            let keys = shard_keys(u16::try_from(no)?, count16);
-            let layout = Layout::new(&keys, shard.iter().map(|p| p.decl.clone()).collect())?;
-            Ok((shard, layout))
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -1231,5 +1626,419 @@ mod tests {
             let e = run(&args, q8).unwrap_err().to_string();
             assert_eq!(e.contains("--keep-bf16"), q8, "q8={q8}: {e}");
         }
+    }
+}
+
+/// A toy Kimi folder, built as the integration tests build theirs.
+#[cfg(test)]
+#[path = "../../tests/common/kimi_toy.rs"]
+mod kimi_toy;
+
+#[cfg(test)]
+mod follow_tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
+    use std::time::Duration;
+
+    use super::{kimi_toy, run_in};
+
+    /// One `--shard-gib` is a mebibyte here, so the toy's twenty megabytes make eleven shards.
+    const UNIT: u64 = 1 << 20;
+
+    /// The toy folder's shards in the order they land in the tests: layers 3, 1, 2, 0, then the
+    /// head, which every output shard of the head's tensors waits on. The vision tower's shard,
+    /// which no tensor reads, is the sixth.
+    const LANDING: [&str; 5] = [
+        "model-00004-of-00006.safetensors",
+        "model-00002-of-00006.safetensors",
+        "model-00003-of-00006.safetensors",
+        "model-00001-of-00006.safetensors",
+        "model-00005-of-00006.safetensors",
+    ];
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("prepare-follow-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// `prepare` run in process over `args`, its refusal as text.
+    fn prepare(args: &[&str]) -> Result<(), String> {
+        let args: Vec<String> = args.iter().map(ToString::to_string).collect();
+        run_in(&args, false, UNIT).map_err(|e| e.to_string())
+    }
+
+    /// `prepare folder prefix` of every tensor in shards of 2 MiB, with `extra` flags. A whole
+    /// Kimi split is refused until the program reads the type of its tensors, so a split of all of
+    /// them is a selection (`--only '*'`), checked by its tensor set.
+    fn split(folder: &Path, prefix: &Path, extra: &[&str]) -> Result<(), String> {
+        let mut args = vec![folder.to_str().unwrap(), prefix.to_str().unwrap()];
+        args.extend(["--only", "*", "--shard-gib", "2"]);
+        args.extend(extra);
+        prepare(&args)
+    }
+
+    /// [`split`] following the listing at `list`, bounded by `stall` seconds.
+    fn follow(folder: &Path, prefix: &Path, list: &Path, stall: &str) -> Result<(), String> {
+        split(
+            folder,
+            prefix,
+            &[
+                "--follow",
+                list.to_str().unwrap(),
+                "--follow-poll",
+                "0.02",
+                "--follow-stall",
+                stall,
+            ],
+        )
+    }
+
+    /// The listing of a toy folder: every file beside the shards and every shard, `path<TAB>bytes`.
+    fn list(dir: &Path, shards: &kimi_toy::Shards, out: &Path) {
+        let mut text = String::new();
+        for f in [
+            "config.json",
+            "generation_config.json",
+            "tokenizer_config.json",
+            "tiktoken.model",
+            "tokenization_kimi.py",
+            "model.safetensors.index.json",
+        ] {
+            text += &format!("{f}\t{}\n", std::fs::metadata(dir.join(f)).unwrap().len());
+        }
+        for (file, tensors) in shards {
+            text += &format!("{file}\t{}\n", kimi_toy::shard_bytes(tensors).len());
+        }
+        std::fs::write(out, text).unwrap();
+    }
+
+    /// The shards of a split at `prefix`, by their names after the prefix, with their bytes.
+    fn written(prefix: &Path) -> Vec<(String, Vec<u8>)> {
+        let (dir, stem) = (
+            prefix.parent().unwrap(),
+            prefix.file_name().unwrap().to_str().unwrap(),
+        );
+        let mut out: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter_map(|p| {
+                let name = p.file_name()?.to_str()?.strip_prefix(stem)?.to_string();
+                name.ends_with(".gguf")
+                    .then(|| (name, std::fs::read(&p).unwrap()))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The split of the finished toy folder, written without a follow: what every follow must
+    /// equal.
+    fn reference() -> &'static Vec<(String, Vec<u8>)> {
+        static REFERENCE: OnceLock<Vec<(String, Vec<u8>)>> = OnceLock::new();
+        REFERENCE.get_or_init(|| {
+            let root = scratch("reference");
+            let folder = root.join("folder");
+            kimi_toy::write_folder(&folder, true, None);
+            split(&folder, &root.join("whole"), &[]).unwrap();
+            let out = written(&root.join("whole"));
+            std::fs::remove_dir_all(&root).unwrap();
+            out
+        })
+    }
+
+    /// The staged shards marked done under `stage`.
+    fn marked(stage: &Path) -> Vec<String> {
+        let Ok(dir) = std::fs::read_dir(stage) else {
+            return vec![];
+        };
+        let mut names: Vec<String> = dir
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".gguf.done"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A shard file arriving as a download does: its first half, a pause, the rest.
+    fn deliver(dir: &Path, file: &str, bytes: &[u8], pause: Duration) {
+        use std::io::Write;
+        let at = dir.join(file);
+        let (head, tail) = bytes.split_at(bytes.len() / 2);
+        std::fs::write(&at, head).unwrap();
+        std::thread::sleep(pause);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&at)
+            .unwrap()
+            .write_all(tail)
+            .unwrap();
+    }
+
+    /// A toy K3.1 folder with its config, tokenizer files and index and none of its shards, and
+    /// the listing of all of them at `root/list.tsv`.
+    fn bare(root: &Path) -> (PathBuf, kimi_toy::Shards, PathBuf) {
+        let folder = root.join("folder");
+        let shards = kimi_toy::write_folder(&folder, true, Some(&[]));
+        let list_path = root.join("list.tsv");
+        list(&folder, &shards, &list_path);
+        (folder, shards, list_path)
+    }
+
+    fn put(folder: &Path, shards: &kimi_toy::Shards, files: &[&str]) {
+        for file in files {
+            std::fs::write(folder.join(file), kimi_toy::shard_bytes(&shards[*file])).unwrap();
+        }
+    }
+
+    /// The split `--follow` writes behind a download whose shards land out of order and in two
+    /// halves is the split of the finished folder, byte for byte; output shards are staged while
+    /// the last shard they need has not landed, and no stage is left.
+    #[test]
+    fn a_followed_split_is_the_finished_folders_split_whatever_order_its_shards_land_in() {
+        let reference = reference();
+        assert!(reference.len() >= 3, "{} output shards", reference.len());
+        let root = scratch("order");
+        let (folder, shards, list_path) = bare(&root);
+        let (followed, stage) = (root.join("followed"), root.join("followed.follow"));
+        let landing = {
+            let (folder, stage) = (folder.clone(), stage.clone());
+            std::thread::spawn(move || {
+                let mut before_the_head = 0;
+                for (n, file) in LANDING.iter().enumerate() {
+                    if n == LANDING.len() - 1 {
+                        // The head is the last shard a tensor reads: an output shard must be
+                        // staged before it lands.
+                        let until = std::time::Instant::now() + Duration::from_secs(30);
+                        while marked(&stage).is_empty() && std::time::Instant::now() < until {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        before_the_head = marked(&stage).len();
+                    }
+                    let bytes = kimi_toy::shard_bytes(&shards[*file]);
+                    deliver(&folder, file, &bytes, Duration::from_millis(900));
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                before_the_head
+            })
+        };
+        // The landing takes longer than the stall bound and never goes that long without a byte.
+        follow(&folder, &followed, &list_path, "3").unwrap();
+        assert!(
+            landing.join().unwrap() >= 1,
+            "no output shard was staged before the head landed"
+        );
+        assert_eq!(&written(&followed), reference);
+        assert!(
+            !stage.exists(),
+            "the stage is removed once the split is published"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A download that stops is refused by name once nothing has grown for the stall bound, with
+    /// the output shards its landed shards complete staged; a stage of another plan is refused; a
+    /// rerun of the same plan after the rest lands skips the staged shards, removes a partial one
+    /// and an unmarked one, and writes the finished folder's split.
+    #[test]
+    fn a_stalled_follow_is_refused_by_name_and_its_rerun_resumes_from_the_staged_shards() {
+        let reference = reference();
+        let root = scratch("resume");
+        let (folder, shards, list_path) = bare(&root);
+        let (followed, stage) = (root.join("followed"), root.join("followed.follow"));
+        put(&folder, &shards, &LANDING[..2]);
+
+        let stalled = follow(&folder, &followed, &list_path, "1").unwrap_err();
+        assert!(
+            stalled.contains("no listed byte arrived for 1 s"),
+            "{stalled}"
+        );
+        assert!(
+            stalled.contains("model-00003-of-00006.safetensors"),
+            "{stalled}"
+        );
+        let staged = marked(&stage);
+        assert!(
+            !staged.is_empty() && staged.len() < reference.len(),
+            "{staged:?}"
+        );
+        let stamps: Vec<_> = staged
+            .iter()
+            .map(|d| {
+                let shard = stage.join(d.strip_suffix(".done").unwrap());
+                (
+                    shard.clone(),
+                    std::fs::metadata(&shard).unwrap().modified().unwrap(),
+                )
+            })
+            .collect();
+        assert!(
+            written(&followed).is_empty(),
+            "a split was published before it was whole"
+        );
+
+        // Another plan's stage is refused, and left as it is.
+        let other = split(
+            &folder,
+            &followed,
+            &[
+                "--shard-gib",
+                "3",
+                "--follow",
+                list_path.to_str().unwrap(),
+                "--follow-stall",
+                "1",
+            ],
+        )
+        .unwrap_err();
+        assert!(other.contains("staged by another plan"), "{other}");
+        assert_eq!(marked(&stage), staged);
+
+        // A partial shard and an unmarked one, as a crash leaves them.
+        let names: Vec<String> = (1..=reference.len())
+            .map(|n| format!("followed-{n:05}-of-{:05}.gguf", reference.len()))
+            .collect();
+        let todo: Vec<&String> = names
+            .iter()
+            .filter(|n| !staged.contains(&format!("{n}.done")))
+            .collect();
+        std::fs::write(stage.join(format!("{}.part", todo[0])), b"partial").unwrap();
+        std::fs::write(stage.join(todo[1]), b"unmarked").unwrap();
+
+        put(&folder, &shards, &LANDING[2..]);
+        follow(&folder, &followed, &list_path, "60").unwrap();
+        assert_eq!(&written(&followed), reference);
+        for (shard, stamp) in stamps {
+            let published = followed.with_file_name(shard.file_name().unwrap());
+            assert_eq!(
+                std::fs::metadata(published).unwrap().modified().unwrap(),
+                stamp,
+                "{} was written again",
+                shard.display()
+            );
+        }
+        assert!(!stage.exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A shard whose header disagrees with the config is refused by name when it completes,
+    /// before an output shard reads it: a tensor of another shape, one of another dtype, one the
+    /// header lacks and one the config does not derive and the map does not skip.
+    #[test]
+    fn a_shard_whose_header_disagrees_with_the_config_is_refused_by_name() {
+        let file = LANDING[3];
+        let case = |tag: &str, edit: &dyn Fn(&mut kimi_toy::Rows) -> String| {
+            let root = scratch(tag);
+            let (folder, mut shards, _) = bare(&root);
+            let name = edit(shards.get_mut(file).unwrap());
+            list(&folder, &shards, &root.join("list.tsv"));
+            put(&folder, &shards, &[file]);
+            let err = follow(&folder, &root.join("out"), &root.join("list.tsv"), "5").unwrap_err();
+            assert!(marked(&root.join("out.follow")).is_empty());
+            std::fs::remove_dir_all(&root).unwrap();
+            (name, err)
+        };
+        let (name, err) = case("shape", &|ts| {
+            let t = ts
+                .iter_mut()
+                .find(|t| t.2.len() == 2 && t.2[0] != t.2[1])
+                .unwrap();
+            t.2.reverse();
+            t.0.clone()
+        });
+        assert!(err.starts_with(&format!("{name}: {file} stores")), "{err}");
+        assert!(err.contains("the config derives"), "{err}");
+        let (name, err) = case("dtype", &|ts| {
+            let t = ts
+                .iter_mut()
+                .find(|t| t.1 == safetensors::Dtype::Bf16)
+                .unwrap();
+            t.1 = safetensors::Dtype::F32;
+            t.3 = vec![0; t.3.len() * 2];
+            t.0.clone()
+        });
+        assert!(err.starts_with(&format!("{name}: {file} stores")), "{err}");
+        let (name, err) = case("lacking", &|ts| ts.remove(0).0);
+        assert_eq!(
+            err,
+            format!("{name}: the config derives it in {file}; its header does not hold it")
+        );
+        let (name, err) = case("extra", &|ts| {
+            let name = "language_model.model.layers.0.surprise.weight".to_string();
+            ts.push((name.clone(), safetensors::Dtype::Bf16, vec![2], vec![0; 4]));
+            name
+        });
+        assert_eq!(
+            err,
+            format!(
+                "{name}: {file} holds it; the config derives no such tensor and the map does not skip it"
+            )
+        );
+    }
+
+    /// What the plan reads is waited for and what is missing is named: a shard the listing gives
+    /// no size is refused at once, and a plan file that never completes ends the wait.
+    #[test]
+    fn a_listing_without_a_shard_and_a_plan_file_that_never_lands_are_refused_by_name() {
+        let root = scratch("plan");
+        let (folder, shards, list_path) = bare(&root);
+        let text = std::fs::read_to_string(&list_path).unwrap();
+        let without: String = text
+            .lines()
+            .filter(|l| !l.starts_with(LANDING[2]))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        std::fs::write(&list_path, without).unwrap();
+        let err = follow(&folder, &root.join("out"), &list_path, "5").unwrap_err();
+        assert_eq!(
+            err,
+            format!("{}: the listing names no size for it", LANDING[2])
+        );
+
+        list(&folder, &shards, &list_path);
+        std::fs::remove_file(folder.join("tiktoken.model")).unwrap();
+        std::fs::remove_file(folder.join("tokenization_kimi.py")).unwrap();
+        let err = follow(&folder, &root.join("out"), &list_path, "0.3").unwrap_err();
+        assert!(
+            err.contains("the plan waits on tiktoken.model, tokenization_kimi.py"),
+            "{err}"
+        );
+        assert!(!root.join("out.follow").join("plan.key").exists());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The flags' refusals, each before the plan is read: a bound without `--follow`, a number
+    /// that is no number of seconds, `--follow` twice or with `--plan`, and a listing that is
+    /// not there.
+    #[test]
+    fn the_follow_flags_are_refused_by_name() {
+        let root = scratch("flags");
+        let (folder, out) = (root.join("folder"), root.join("out"));
+        let run = |extra: &[&str]| {
+            let mut args = vec![folder.to_str().unwrap(), out.to_str().unwrap()];
+            args.extend(extra);
+            prepare(&args).unwrap_err()
+        };
+        assert!(
+            run(&["--follow-stall", "5"]).contains("bound a wait for the download --follow reads")
+        );
+        assert!(run(&["--follow-poll", "5"]).contains("give --follow <list>"));
+        assert!(run(&["--follow", "a", "--follow", "b"]).contains("--follow given twice"));
+        for bad in ["0", "-1", "abc", "NaN", "inf"] {
+            let e = run(&["--follow", "a", "--follow-poll", bad]);
+            assert!(
+                e.starts_with(&format!("--follow-poll {bad:?}: not ")),
+                "{bad}: {e}"
+            );
+        }
+        assert!(run(&["--follow", "a", "--follow-stall", "0"]).contains("not above zero seconds"));
+        let e = prepare(&[folder.to_str().unwrap(), "--plan", "--follow", "a"]).unwrap_err();
+        assert!(e.contains("--plan prints the folder's stored form"), "{e}");
+        let missing = root.join("no-list.tsv");
+        kimi_toy::write_folder(&folder, true, Some(&[]));
+        let e = run(&["--follow", missing.to_str().unwrap()]);
+        assert!(e.contains("no-list.tsv"), "{e}");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

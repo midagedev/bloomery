@@ -289,7 +289,7 @@ unsafe fn block_scan(v: u32, lane: u32, wid: usize, wsum: *mut u32) -> (u32, u32
 /// `top`, and how many keys lie in the bins above it. Thread `tid` owns the
 /// `PER` bins `top − PER·tid − j`, counts `c[j]`; they total at least
 /// `need >= 1`. Every thread calls it and gets the same pair. This module's
-/// top-k passes and V4.1's indexer (`bloomery_gpu_deepseek41::indexer`) pick
+/// top-k passes and V4.1's indexer (`crate::indexer`) pick
 /// their bins through it.
 ///
 /// # Safety
@@ -483,7 +483,7 @@ unsafe fn coarse(
 /// One refining pass: count into `fine`, by the bits `(key >> shift) &
 /// 0x7ff`, the keys of the `n` scores at `scores[sbase ..]` whose bits above
 /// `shift + 11` equal `prefix`; then this thread's bins. This module's top-k
-/// passes and V4.1's indexer (`bloomery_gpu_deepseek41::indexer`) refine through it.
+/// passes and V4.1's indexer (`crate::indexer`) refine through it.
 ///
 /// # Safety
 /// `fine` points at [`FINE_BINS`] words of this block's shared memory used by

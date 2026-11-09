@@ -1,6 +1,6 @@
 [package]
 name = "bloomery-gpu-gates"
-version = "0.3.13"
+version = "0.3.14"
 edition = "2024"
 publish = false
 license = "MIT"
@@ -13,6 +13,8 @@ bloomery-os.workspace = true
 # Host only: the engram row hash, which the V4.1 plan gate runs the plan's n-grams through.
 bloomery-engram = { path = "../engram" }
 bloomery-gguf = { path = "../gguf" }
+# `bloomery-quantize`'s plan, checks and set writer (host only); the binary supplies the card's backend.
+bloomery-quantize = { path = "../quantize", optional = true }
 # Host only: every reference set's reader and the check of which file it was dumped from — the
 # node dumps' manifest (re-exported from `lib.rs`), the draft sets, greedy files, KLD bases and
 # the vision set.
@@ -125,6 +127,7 @@ checkpoint = ["hf"]
 # GLM-5.3-Flash read from its Hugging Face checkpoint folder: `generate_glm5next --place tp`.
 glm5next-hf = ["glm5next", "checkpoint"]
 gpu = [
+    "dep:bloomery-quantize",
     "dep:bloomery-gpu",
     "dep:bloomery-chain",
     "dep:bloomery-device",
@@ -165,6 +168,9 @@ mimo2 = ["gpu", "dep:bloomery-gpu-mimo2", "bloomery-app/mimo2"]
 solar2 = ["gpu", "dep:bloomery-gpu-solar2", "bloomery-app/solar2"]
 minimaxm3 = ["gpu", "dep:bloomery-gpu-minimaxm3", "bloomery-app/minimaxm3"]
 flint = ["gpu", "dep:bloomery-gpu-flint", "bloomery-app/flint"]
+# The Kimi K3 seat of `bloomery-serve` (serve_seats/kimi_k3.rs) and its gate: the body lives in `bloomery-gpu` itself, so the
+# feature adds no dependency; `deepseek41` brings the serve crate and the app crate the seat sits on.
+kimik3 = ["gpu"]
 gemma-embedding2 = ["gpu", "gemma4a", "dep:bloomery-gpu-vision", "dep:bloomery-gpu-gemma-embedding2", "dep:bloomery-serve"]
 gemma4a = ["gpu", "dep:bloomery-gpu-gemma4a", "dep:bloomery-vision"]
 mistrallarge4 = ["gpu", "dep:bloomery-gpu-deepseek41", "dep:bloomery-gpu-mistrallarge4", "bloomery-app/mistrallarge4"]
@@ -185,7 +191,7 @@ required-features = ["deepseek41"]
 [[bin]]
 name = "bloomery-serve"
 path = "src/bin/bloomery_serve.rs"
-required-features = ["glm5next", "clef", "mimo2", "solar2", "minimaxm3", "flint", "mistrallarge4", "gemma-embedding2", "hf"]
+required-features = ["glm5next", "clef", "mimo2", "solar2", "minimaxm3", "flint", "kimik3", "mistrallarge4", "gemma-embedding2", "hf"]
 
 [[bin]]
 name = "bloomery-serve-ds41"
@@ -276,6 +282,10 @@ required-features = ["deepseek41"]
 [[bin]]
 name = "gate_deepseek41_step"
 required-features = ["deepseek41"]
+
+[[bin]]
+name = "gate_deepseek41_tp"
+required-features = ["deepseek41", "checkpoint"]
 
 [[bin]]
 name = "gate_ds41_serve"
@@ -393,12 +403,22 @@ required-features = ["deepseek41", "solar2"]
 name = "gate_minimaxm3_serve"
 required-features = ["deepseek41", "minimaxm3"]
 
+# kimik3-serve: the Kimi K3 seat of bloomery-serve over the fixture file: the start order, one chat, the finish token, a cut that
+# keeps the position or nothing, the tools request refused by name, `--parallel` above one refused.
+[[bin]]
+name = "gate_kimi_k3_serve"
+required-features = ["deepseek41", "kimik3"]
+
 [[bin]]
 name = "gate_mimo2_serve"
 required-features = ["glm5next", "clef", "mimo2"]
 
 [[bin]]
 name = "cnode_probe"
+required-features = ["gpu"]
+
+[[bin]]
+name = "bench_picks"
 required-features = ["gpu"]
 
 [[bin]]
@@ -451,6 +471,19 @@ required-features = ["gpu"]
 
 [[bin]]
 name = "gate_iq_sel"
+required-features = ["gpu"]
+
+[[bin]]
+name = "gate_iq_quant"
+required-features = ["gpu"]
+
+[[bin]]
+name = "iq_quant_probe"
+required-features = ["gpu"]
+
+[[bin]]
+name = "bloomery-quantize"
+path = "src/bin/bloomery_quantize.rs"
 required-features = ["gpu"]
 
 [[bin]]
@@ -555,6 +588,10 @@ required-features = ["deepseek41"]
 
 [[bin]]
 name = "gate_nemotron_serve"
+required-features = ["deepseek41"]
+
+[[bin]]
+name = "gate_host_serve"
 required-features = ["deepseek41"]
 
 [[bin]]
@@ -835,7 +872,52 @@ required-features = ["gpu"]
 name = "gate_raon1_attn"
 required-features = ["gpu"]
 
+# kimik3kda: Kimi K3's KDA layer through `mixer_kda` at 2 and 96 heads of 128 against llama.cpp's graph in f64.
+[[bin]]
+name = "gate_kimi_k3_kda"
+required-features = ["gpu"]
+
 # dfl-wire: Raon-1's DFlash2 draft: its load, the V4.1 DSpark file refused, and its first block against the host oracle's.
 [[bin]]
 name = "gate_raon1_dflash"
+required-features = ["gpu"]
+
+# kimik3-mla: Kimi K3's gated MLA layer on the card (latent_gated's launches at K3's geometry) against the llama.cpp graph in f64.
+[[bin]]
+name = "gate_kimi_k3_mla"
+# kimik3-dsa: Kimi K3.1's selected attention on the card (the index key, the lightning indexer's list, the latent core over the
+# list's rows) against host rules and the llama.cpp graph in f64.
+[[bin]]
+name = "gate_kimi_k3_dsa"
+required-features = ["gpu"]
+# kimik3-moe: Kimi K3's routed block (the common routed block with the latent pair, the routed-sum norm and the gated shared stack)
+# against the llama.cpp graph in f64, on the fixture's routed layers and on random tensors at the real widths.
+[[bin]]
+name = "gate_kimi_k3_moe"
+required-features = ["gpu"]
+
+# kimik3-body: Kimi K3's decode step (the delta and gated latent layers, the latent MoE blocks, the AttnRes mixes, the head) over the fixture file against mainline llama.cpp's node dumps of it.
+[[bin]]
+name = "gate_kimi_k3_e2e"
+required-features = ["gpu"]
+
+# kimik3pp: Kimi K3's pass of up to eight rows through the chain, each row the decode step's bits, over the fixture file.
+[[bin]]
+name = "gate_kimi_k3_pp"
+required-features = ["gpu"]
+
+# Kimi K3's end-to-end decode CLI: a prompt of ids or text walked one id a step, then greedy ids (gate_kimi_k3_e2e runs it).
+[[bin]]
+name = "generate_kimi_k3"
+required-features = ["gpu"]
+
+# kimik3place: Kimi K3's placed load (the stage card, the expert tier card in process and on a loopback node, the host row) against the whole-card body, over the fixture file.
+[[bin]]
+name = "gate_kimi_k3_place"
+required-features = ["gpu"]
+
+# kimik3-imatrix: Kimi K3's own prompt walk's importance matrix (generate_kimi_k3 --imatrix) against llama-imatrix's on the fixture: names, counts, the
+# column sums within the band derived in the gate, and bloomery-quantize over it.
+[[bin]]
+name = "gate_kimi_k3_imatrix"
 required-features = ["gpu"]

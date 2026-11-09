@@ -18,7 +18,7 @@ const ROW: Row = Row {
     arch: ARCH,
     other_files: &[
         "/models/fixtures/minimaxm31/model-00001-of-00002.safetensors",
-        "/models/MiniMax-M3.1-Flash/model-00002-of-00048.safetensors",
+        "/data/moved/models/MiniMax-M3.1-Flash/model-00002-of-00048.safetensors",
         "/models/elsewhere/model-00001-of-00048.safetensors",
         "/models/MiniMax-M3-UD-IQ4_XS/MiniMax-M3-UD-IQ4_XS-00001-of-00006.gguf",
     ],
