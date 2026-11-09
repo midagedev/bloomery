@@ -281,7 +281,16 @@ mod q38_arch;
 mod quiet;
 
 #[cfg(feature = "gpu")]
+#[allow(
+    dead_code,
+    reason = "the shared runner serves several gates; each takes the helpers it reads"
+)]
+#[path = "shared/e2e.rs"]
+mod e2e;
+
+#[cfg(feature = "gpu")]
 mod gate {
+    use crate::e2e::rel;
     use std::path::{Path, PathBuf};
     use std::time::Instant;
 
@@ -567,21 +576,6 @@ mod gate {
     /// 1.415e-2) carried to this model's 48 layers, not a Qwen3.8 forced
     /// arm, which neither gate has; a forced arm's worst layer replaces it.
     const FREE_BAND: f64 = 0.10;
-
-    /// `‖a − b‖ / ‖b‖` in f64; infinite on a NaN or a length mismatch, so
-    /// neither passes a band.
-    fn rel(a: &[f32], b: &[f32]) -> f64 {
-        if a.len() != b.len() {
-            return f64::INFINITY;
-        }
-        let (mut num, mut den) = (0.0f64, 0.0f64);
-        for (&x, &y) in a.iter().zip(b) {
-            num += (f64::from(x) - f64::from(y)).powi(2);
-            den += f64::from(y).powi(2);
-        }
-        let r = (num / den.max(f64::MIN_POSITIVE)).sqrt();
-        if r.is_nan() { f64::INFINITY } else { r }
-    }
 
     /// The first index of the largest value, and the largest value of the
     /// rest: the head's tie rule.
