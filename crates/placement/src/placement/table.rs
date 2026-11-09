@@ -122,8 +122,13 @@ pub struct CardTotals {
     /// The selected reserves; a tier leg's descriptor bound is replaced by
     /// its actual resident layers' scratch.
     pub reserve_bytes: u64,
+    /// The card bytes the model's first prompt pass makes beyond the load's
+    /// uploads (its batch buffers at the largest call), reserved out of the
+    /// expert budget by the model's plan ([`CardTotals::grow_prompt`]); 0 for
+    /// a plan that counts none.
+    pub prompt_bytes: u64,
     /// usable − dense − experts − rounding − KV − stage rows − scratch −
-    /// context − reserves, usable capped by the plan's card budget; the
+    /// context − reserves − prompt, usable capped by the plan's card budget; the
     /// margin is inside it.
     pub headroom_bytes: i128,
 }
@@ -135,20 +140,26 @@ impl CardTotals {
     /// does.
     #[must_use]
     pub fn bytes(&self) -> u64 {
-        let sum: u128 = [
-            self.dense_bytes,
-            self.expert_bytes,
-            self.rounding_bytes,
-            self.kv_bytes,
-            self.stage_rows_bytes,
-            self.scratch_bytes,
-            self.context_bytes,
-            self.reserve_bytes,
-        ]
-        .into_iter()
-        .map(u128::from)
-        .sum();
+        let sum: u128 = self.terms().into_iter().map(|(_, b)| u128::from(b)).sum();
         u64::try_from(sum).unwrap_or(u64::MAX)
+    }
+
+    /// Every term [`CardTotals::bytes`] sums, by the name the records and
+    /// refusals give it: the one list both the sum and a message naming the
+    /// terms read ([`super::card_made`]).
+    #[must_use]
+    pub fn terms(&self) -> [(&'static str, u64); 9] {
+        [
+            ("dense", self.dense_bytes),
+            ("experts", self.expert_bytes),
+            ("rounding", self.rounding_bytes),
+            ("kv", self.kv_bytes),
+            ("stage_rows", self.stage_rows_bytes),
+            ("scratch", self.scratch_bytes),
+            ("context", self.context_bytes),
+            ("reserves", self.reserve_bytes),
+            ("prompt", self.prompt_bytes),
+        ]
     }
 
     /// `bytes` more in the card's KV class, out of its headroom: the one way
@@ -157,6 +168,24 @@ impl CardTotals {
     /// expert budget), so the headroom stays usable less every term.
     pub fn grow_kv(&mut self, bytes: u64) {
         self.kv_bytes += bytes;
+        self.headroom_bytes -= i128::from(bytes);
+    }
+
+    /// `bytes` more in the card's reserves, out of its headroom: a draft's
+    /// card bytes planned beside the target's totals (the MTP plan's draft term
+    /// is the reserve the expert rule spread within, never a row of the
+    /// target's totals), so the card-byte invariant's count holds both.
+    pub fn grow_reserve(&mut self, bytes: u64) {
+        self.reserve_bytes += bytes;
+        self.headroom_bytes -= i128::from(bytes);
+    }
+
+    /// `bytes` more in the card's prompt term, out of its headroom: the card
+    /// bytes the first prompt pass makes (the model's one formula of them,
+    /// reserved out of the expert budget before the experts fill), so the
+    /// card-byte invariant's count at the first prompt holds them.
+    pub fn grow_prompt(&mut self, bytes: u64) {
+        self.prompt_bytes += bytes;
         self.headroom_bytes -= i128::from(bytes);
     }
 }

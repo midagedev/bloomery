@@ -16,6 +16,10 @@
 //! them. [`Session::with_draft`] then captures the verify passes, one a
 //! width its draft may propose.
 //!
+//! A model the placed path loaded by its plan is held to that plan's card
+//! bytes: the log's [`CardWatch`] takes the card-byte invariant's reading
+//! after the load, after the first prompt call and after the first step.
+//!
 //! What a model adds is its [`Open`], [`Prompt`] and [`Keep`], under
 //! [`arch`]. A body loaded by its own constructor, with no placement plan,
 //! becomes a session through [`Session::from_model`].
@@ -47,6 +51,7 @@ use bloomery_gpu::model::{
 };
 use bloomery_gpu::{Fault, GpuError, GpuModel};
 use gguf::Split;
+use model::placement::card_made::{CardPhase, CardReading};
 use model::placement::{Machine, Plan};
 use runtime::prompt::CallEnd;
 use runtime::seqstate::Kept;
@@ -303,6 +308,55 @@ pub trait OpenLog<B: Open> {
     fn prompt_buffers(&mut self, _m: &GpuModel<B>) -> Result<(), SessionError> {
         Ok(())
     }
+
+    /// What the session does with the card-byte invariant's readings
+    /// ([`CardWatch`]), asked once the model loaded and kept for the session's
+    /// life. No default: every open says how its card is watched.
+    fn card_watch(&mut self) -> Result<Box<dyn CardWatch>, SessionError>;
+}
+
+/// What a session does with each reading of the card-byte invariant
+/// ([`bloomery_gpu::card_bytes`]): the bytes a run made on its card against
+/// the plan's count, taken after the load, after the first prompt call and
+/// after the first step ([`CardPhase`]), each once. A watch where the card is
+/// held refuses a reading past the plan, or one that could not be measured;
+/// one on a card it does not hold records it. An error ends the call that
+/// took the reading.
+pub trait CardWatch: Send {
+    fn card(&mut self, reading: &CardReading) -> Result<(), SessionError>;
+}
+
+/// A session's watch over its card, and the phases it has read.
+struct CardSeat {
+    watch: Box<dyn CardWatch>,
+    prompt: bool,
+    step: bool,
+}
+
+impl CardSeat {
+    /// The watch over `model`'s card, the load's reading handed to it. A
+    /// model [`Open::open`] loaded by its plan without keeping the plan's card
+    /// (a load past the placed path, [`GpuModel::plan_card`]) has no count to
+    /// hold its bytes to, and is refused by name rather than left unwatched.
+    fn open<B: ChainBody>(
+        model: &GpuModel<B>,
+        watch: Box<dyn CardWatch>,
+    ) -> Result<CardSeat, SessionError> {
+        let reading = model.card_reading(CardPhase::Load)?.ok_or_else(|| {
+            SessionError::Refused(
+                "the body's open loaded by the plan but kept none of its card \
+                 (GpuModel::plan_card): the card-byte invariant has no count to read it against"
+                    .to_owned(),
+            )
+        })?;
+        let mut seat = CardSeat {
+            watch,
+            prompt: false,
+            step: false,
+        };
+        seat.watch.card(&reading)?;
+        Ok(seat)
+    }
 }
 
 /// What the caller prints when a draft's verify pass is captured
@@ -318,6 +372,9 @@ pub struct Loaded<B: Open> {
     model: GpuModel<B>,
     cfg: B::Cfg,
     ctx: u32,
+    /// The watch over the model's card ([`CardSeat`]); `None` for a model
+    /// its own constructor loaded ([`Loaded::from_model`]).
+    card: Option<CardSeat>,
 }
 
 impl<B: Open> Loaded<B> {
@@ -356,10 +413,12 @@ impl<B: Open> Loaded<B> {
         let mut model = B::open(file, &inputs, &plan, &args.cfg)?;
         model.set_mode(args.mode);
         log.load(&model)?;
+        let card = Some(CardSeat::open(&model, log.card_watch()?)?);
         Ok(Some(Loaded {
             model,
             cfg: args.cfg,
             ctx,
+            card,
         }))
     }
 
@@ -367,7 +426,20 @@ impl<B: Open> Loaded<B> {
     /// (a gate's hand-built plan), nothing captured, in `cfg`'s schedule,
     /// whose caches hold `ctx` positions: what [`Loaded::open`] returns.
     pub fn from_model(model: GpuModel<B>, cfg: B::Cfg, ctx: u32) -> Loaded<B> {
-        Loaded { model, cfg, ctx }
+        Loaded {
+            model,
+            cfg,
+            ctx,
+            card: None,
+        }
+    }
+
+    /// The load watched by `watch` from here, as [`Loaded::open`] watches
+    /// its own: the load's reading taken now and handed to it. A model loaded
+    /// by no plan of the placed path is refused by name.
+    pub fn watched(mut self, watch: Box<dyn CardWatch>) -> Result<Loaded<B>, SessionError> {
+        self.card = Some(CardSeat::open(&self.model, watch)?);
+        Ok(self)
     }
 
     /// The model, before any capture.
@@ -389,6 +461,7 @@ impl<B: Open> Loaded<B> {
             mut model,
             cfg,
             ctx,
+            card,
         } = self;
         if model.mode() == StepMode::Graph {
             let nodes = model.capture_step()?;
@@ -409,6 +482,7 @@ impl<B: Open> Loaded<B> {
             round: Vec::new(),
             tapped: Vec::new(),
             cleared: None,
+            card,
         })
     }
 }
@@ -504,6 +578,10 @@ pub struct Session<B: ChainBody> {
     tapped: Vec<f32>,
     /// The residency reset the last clear made, until taken.
     cleared: Option<ResetReport>,
+    /// The watch over the model's card ([`CardSeat`]); `None` for a model
+    /// loaded by no plan of the placed path or opened by its own
+    /// constructor ([`Session::from_model`]).
+    card: Option<CardSeat>,
 }
 
 impl<B: ChainBody> Session<B> {
@@ -523,7 +601,44 @@ impl<B: ChainBody> Session<B> {
             round: Vec::new(),
             tapped: Vec::new(),
             cleared: None,
+            card: None,
         }
+    }
+
+    /// The session watched by `watch` from here, as one [`Loaded::open`]
+    /// made: the load's reading taken now and handed to it, then the first
+    /// prompt call's and the first step's. A model loaded by no plan of the
+    /// placed path is refused by name.
+    pub fn watched(mut self, watch: Box<dyn CardWatch>) -> Result<Session<B>, SessionError> {
+        self.card = Some(CardSeat::open(&self.model, watch)?);
+        Ok(self)
+    }
+
+    /// The card-byte invariant's reading at `phase` (the first prompt call's
+    /// or the first step's), handed to the session's watch once a load: a
+    /// later call of the same phase reads nothing, and so does a session with
+    /// no watch. The session's own prompt calls and its steps (a plain step,
+    /// a verify, a pass of several slots) make it; a caller that drives the
+    /// model past them ([`Session::model_mut`], or a draft's own prompt call,
+    /// which runs the body's call itself) calls it after its first prompt call
+    /// and its first step.
+    pub fn card_check(&mut self, phase: CardPhase) -> Result<(), SessionError> {
+        let Some(seat) = &mut self.card else {
+            return Ok(());
+        };
+        let done = match phase {
+            CardPhase::Load => return Ok(()),
+            CardPhase::FirstPrompt => &mut seat.prompt,
+            CardPhase::FirstStep => &mut seat.step,
+        };
+        if *done {
+            return Ok(());
+        }
+        *done = true;
+        if let Some(reading) = self.model.card_reading(phase)? {
+            seat.watch.card(&reading)?;
+        }
+        Ok(())
     }
 
     /// Row `r` as a read left it in the session's row: refused by name when
@@ -637,7 +752,9 @@ impl<B: ChainBody> Session<B> {
     pub fn step_ahead(&mut self, id: u32, ahead: bool) -> Result<(u32, StepAhead), SessionError> {
         self.idle("step")?;
         let within = if ahead { self.ctx } else { 0 };
-        Ok(self.model.step_ahead(id, within)?)
+        let out = self.model.step_ahead(id, within)?;
+        self.card_check(CardPhase::FirstStep)?;
+        Ok(out)
     }
 
     /// Refused while a verify's rows, or a pass of several slots' verify
@@ -701,6 +818,7 @@ impl<B: MediaBody> Session<B> {
             return Err(SessionError::Refused(why));
         }
         let argmax = prompt_pass(self.model_mut(), |m| B::prefill_media(m, ids, media))?;
+        self.card_check(CardPhase::FirstPrompt)?;
         self.read(argmax, want)
     }
 }
@@ -761,7 +879,9 @@ where
     /// a select between would move them onto another slot's sequence.
     pub fn step_slots(&mut self, rows: &[(usize, &[u32])]) -> Result<SlotsOut, SessionError> {
         self.idle("step_slots")?;
-        Ok(self.model.step_slots(rows)?)
+        let out = self.model.step_slots(rows)?;
+        self.card_check(CardPhase::FirstStep)?;
+        Ok(out)
     }
 
     /// Capture every pass a round of slots `0..slots` runs when each busy
@@ -807,6 +927,7 @@ where
         self.idle("verify_slots")?;
         let out = self.model.verify_slots(rows)?;
         self.slots_waiting = Some(rows.len());
+        self.card_check(CardPhase::FirstStep)?;
         Ok(out)
     }
 
@@ -1173,7 +1294,9 @@ impl<B: Prompt> Session<B> {
     pub fn prompt_call(&mut self, ids: &[u32], end: CallEnd) -> Result<Option<u32>, SessionError> {
         self.idle("prompt")?;
         let _busy = self.model.prompt_busy();
-        Ok(B::prompt_call(&mut self.model, ids, end)?)
+        let out = B::prompt_call(&mut self.model, ids, end)?;
+        self.card_check(CardPhase::FirstPrompt)?;
+        Ok(out)
     }
 }
 
@@ -1192,12 +1315,14 @@ impl<B: Prompt + Keep> Target for Session<B> {
         self.idle("prompt")?;
         let _busy = self.model.prompt_busy();
         let argmax = B::prompt(&mut self.model, ids)?;
+        self.card_check(CardPhase::FirstPrompt)?;
         self.read(argmax, want)
     }
 
     fn step(&mut self, id: u32, want: Want) -> Result<Out<'_>, SessionError> {
         self.idle("step")?;
         let argmax = self.model.step(&[id])?;
+        self.card_check(CardPhase::FirstStep)?;
         self.read(argmax, want)
     }
 
@@ -1242,6 +1367,7 @@ impl<B: Prompt + Keep + Rows + Rollback> Verify for Session<B> {
             fetched: false,
             best_fetched: false,
         });
+        self.card_check(CardPhase::FirstStep)?;
         Ok(out)
     }
 

@@ -36,6 +36,7 @@
 # Its lock directory is never /root (64).
 # Where /root/bloomery-cpu.lock exists (the box, as lease_take reads it), BLOOMERY_BOX_CARD=local and a BLOOMERY_LOCK_DIR other
 # than /root are refused (64): the run would hold no lock the box's gates and sittings take.
+# BLOOMERY_CARD_HELD: exported as 1 to the binary once every lock is held (its card-byte invariant then refuses, never only records).
 # BLOOMERY_GATE_GDB=1: the binary runs under gdb, which prints every thread's stack when a signal ends it.
 # BLOOMERY_TIER=real|fixture (unset: real) and BLOOMERY_FIXTURE_MODEL: the fixture tier (tools/box.sh resolves both, see
 # tools/ref/ref-paths.sh). A run asking for the V4.1 load lock takes none when its tier is fixture AND its
@@ -632,7 +633,7 @@ PY
     return 1
   }
   local gate_args=()
-  local gate_env=(env -u BLOOMERY_BOX_CARD -u BLOOMERY_GATE_BOUND -u BLOOMERY_GATE_V41_LOAD -u BLOOMERY_GATE_STACKS -u BLOOMERY_GATE_GDB -u CUDA_VISIBLE_DEVICES
+  local gate_env=(env -u BLOOMERY_BOX_CARD -u BLOOMERY_CARD_HELD -u BLOOMERY_GATE_BOUND -u BLOOMERY_GATE_V41_LOAD -u BLOOMERY_GATE_STACKS -u BLOOMERY_GATE_GDB -u CUDA_VISIBLE_DEVICES
     -u BLOOMERY_TIER -u CARGO_BUILD_TARGET -u BLOOMERY_FIXTURE_MODEL -u BLOOMERY_REF_MODEL -u BLOOMERY_BATCH_OWNER -u BLOOMERY_HOLD_YIELD -u BLOOMERY_GATE_BUILD_BOUND -u BLOOMERY_V41_CLASS -u BLOOMERY_V41_PRED_S
     -u GATE_TEST_PACE -u GATE_TIMEOUT_PID -u STUB_ORDER -u STUB_ID -u STUB_COMPUTE_UUID -u STUB_COMPUTE_RC PATH="$t/bin:$PATH")
   # gate <out file> <BLOOMERY_GATE_CARD> <lease file> [K=V…]: one run of the runner, its rc (TL=<dir>: the dir its locks and its
@@ -2909,6 +2910,8 @@ case $GOT in
   local) ON="this machine's card(s), the local gate lock" ;;
   *) ON="the $GOT" ;;
 esac
+# Every lock is held: the binary's card-byte invariant refuses a reading past its plan (crates/gpu-gates/src/card_bytes.rs).
+export BLOOMERY_CARD_HELD=1
 exe_link
 echo "gpu-gate.sh: $NAME on $ON (asked $([ "$CARD" = local ] && echo "$ASK" || echo "$CARD"))$([ "$V41" = 0 ] || echo ', V4.1 load lock')$TIER_NOTE" >&2
 # The run's own wall, its locks' waits outside it, is the closing line: a recipe that runs several

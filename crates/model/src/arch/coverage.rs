@@ -33,6 +33,9 @@ use models::{
 
 use crate::placement::{CardFormat, ModelTensor, ModelTensors, Role, Unimplemented};
 
+pub mod reach;
+pub use reach::diff;
+
 /// One thing a program runs: the need it covers, and where it lives.
 #[derive(Clone, Copy)]
 pub struct Available {

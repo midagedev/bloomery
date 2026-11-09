@@ -856,6 +856,9 @@ where
             Some(spec) => {
                 print_widths(spec);
                 let next = drafted(spec, s)?;
+                // The window's prompt call runs the body's call itself (`Host::prompt_with`),
+                // past `Session::prompt_call`'s reading.
+                s.card_check(model::placement::card_made::CardPhase::FirstPrompt)?;
                 if retain {
                     spec.draft_mut().draft_mut().retain_prompt(s)?;
                 }

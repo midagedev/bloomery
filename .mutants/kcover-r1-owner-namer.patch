@@ -1,0 +1,17 @@
+# kcover mutant r1-owner-namer
+# clause: R1, an owner passes a kernel file only when the gate naming it is kept on the file's change: a common gate, or a family
+#   gate whose family's globs name the file (tools/gate_class.py kernel_findings)
+# site: tools/gate_class.py kernel_findings, any gate naming the owner passes the file
+# expected red: "gate_class self-test FAIL: kernel rule: an owner only a family gate names, whose family's globs omit the file,
+#   does not pass it: []" from `python3 tools/gate_class.py --self-test` (rc 1)
+--- a/tools/gate_class.py
++++ b/tools/gate_class.py
+@@ -459,7 +459,7 @@
+     for f in sorted(kr.launchers):
+         if f in kr.skipped:
+             continue
+-        owned = any(row.cls != "family" or _matches(tables.families[row.family].globs, f)
++        owned = any(True
+                     for o, orow in tables.owners.items() if _matches(orow.globs, f) for row in namers.get(o, ()))
+         launch = kr.launchers[f]
+         if owned or OWN in launch.values():

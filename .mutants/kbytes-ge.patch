@@ -1,0 +1,11 @@
+--- a/crates/placement/src/placement/card_made.rs
++++ b/crates/placement/src/placement/card_made.rs
+@@ -118,7 +118,7 @@
+     #[must_use]
+     pub fn past(&self) -> Option<u64> {
+         let (made, planned) = (self.made(), self.planned());
+-        (made > planned).then(|| made - planned)
++        (made >= planned).then(|| made - planned)
+     }
+ 
+     /// The plan's terms as one `name=bytes` list, in [`CardTotals::terms`]'s

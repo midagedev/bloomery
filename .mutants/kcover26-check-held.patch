@@ -1,0 +1,15 @@
+# kcover26 mutant check-held
+# clause: check_rows names a table row the run does not find (check_rows_names_each_direction)
+# site: check_rows reports one direction only
+# run: cargo test -p bloomery-model --lib check_rows_names_each_direction
+# red (rc=101): thread 'arch::coverage::reach::tests::check_rows_names_each_direction' (241163710) panicked at crates/model/src/arch/coverage/reach.rs:571:9:
+--- a/crates/model/src/arch/coverage/reach.rs
++++ b/crates/model/src/arch/coverage/reach.rs
+@@ -488,6 +488,7 @@
+         .line()
+     };
+     held.difference(&found)
++        .filter(|_| false)
+         .map(|g| format!("the table holds a row the run does not find: {}", line(g)))
+         .chain(
+             found

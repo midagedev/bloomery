@@ -3081,7 +3081,8 @@ impl Q38 {
         // Every prompt call copies the recurrent stores at its marks: the
         // checkpoints a later request's cut and a saved state come from.
         m.body_parts(WHAT)?.2.set_checkpoints(true);
-        let mut s = app::Session::from_model(m, u32::try_from(a.ctx)?);
+        let mut s = app::Session::from_model(m, u32::try_from(a.ctx)?)
+            .watched(bloomery_gpu_gates::card_bytes::watch()?)?;
         let residency = a.residency != Residency::Off;
         if residency {
             // A request's passes are not known at load: the log grows as it
@@ -3351,7 +3352,10 @@ impl Q38 {
             .2
             .hybrid_mut()
             .route_prompt(pos, ids.len())?;
-        Ok(m.prompt38(ids, Prompt38::Step)?)
+        let next = m.prompt38(ids, Prompt38::Step)?;
+        self.s
+            .card_check(model::placement::card_made::CardPhase::FirstPrompt)?;
+        Ok(next)
     }
 
     /// The drafted seat's keep rule, its one owner: a prefix of `at`

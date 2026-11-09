@@ -210,4 +210,22 @@ mod tests {
         assert_eq!((card.weights, card.scratch), (1_128_026_112, 2_016_768_000));
         assert_eq!(card.total(), 3_144_794_112);
     }
+
+    /// The figure a gate plans its tower by (the media seat's cap of 256 merged tokens) is the sum
+    /// of the buffers it allocates, counted by hand: the weights, then per-patch buffers at 1,024
+    /// patches (the patch values, three block buffers, the qkv and attention rows, the fused gate
+    /// and up and the SwiGLU output in bf16, the RoPE table in f32) and per-token buffers at 256
+    /// tokens (the merger's convolution, linear, fused gate and up, SwiGLU and output rows).
+    #[test]
+    fn the_card_figure_at_the_media_seats_cap_is_its_buffers_sum() {
+        let (patches, tokens) = (1024_u64, 256_u64);
+        let per_patch_bf16 = 1176 + 3 * 1024 + 3072 + 1024 + 8192 + 4096;
+        let per_token_bf16 = 2 * 4096 + 20_480 + 10_240 + 4096;
+        let scratch = patches * (2 * per_patch_bf16 + 4 * 64) + tokens * 2 * per_token_bf16;
+        let card = of(&hp(), 256);
+        assert_eq!(card.scratch, scratch);
+        assert_eq!(card.scratch, 64_536_576);
+        assert_eq!(card.total(), 1_128_026_112 + scratch);
+        assert_eq!(card.total(), 1_192_562_688);
+    }
 }

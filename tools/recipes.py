@@ -3321,8 +3321,14 @@ def cmd_affected(args: argparse.Namespace) -> int:
             for n, reason in deferred:
                 print(f"  - {n}  ({reason})")
         if owed_src is not None:
-            for line in owed_lines(real_tier_owed(picks, owed_src.rows(bool(picks))), owed_src.source):
+            held = fixture_held(stage.kept, ctables) if stage is not None and ctables is not None else {}
+            owed = real_tier_owed([n for n in picks if n not in held], owed_src.rows(bool(picks)))
+            for line in owed_lines(owed, owed_src.source):
                 print(line)
+            if held:
+                print(f"real-tier held ({len(held)}), owed on the fixture tier, which a landing runs:")
+                for n, why in held.items():
+                    print(f"  - {n}  ({why})")
         print(f"unmapped ({len(unmapped)}):")
         for u in unmapped:
             print(f"  {u}")
@@ -3447,6 +3453,32 @@ def owed_self_test(expect) -> None:
     expect(lines[0] == "real-tier owed (4): gate-ro gate-rf gate-nf gate-env" and lines[-1] == "  - gate-env  (needs-env)",
            f"owed: the names line and one line a gate: {lines}")
     expect(owed_lines([], "x") == ["real-tier owed (0): "], f"owed: nothing owed is one line: {owed_lines([], 'x')}")
+    # An other family with a fixture is held to the fixture tier when the stage kept its gate by representative reach alone; its own
+    # file, a main family's reach and an other family with no fixture stay owed.
+    gc = _gate_class()
+    fam = lambda n, rep, tier, fx: gc.FamilyRow(n, rep, tier, (f"crates/{n}/**",), gc.TIER_DAYS[tier], fx)  # noqa: E731
+    tabs = gc.Tables({n: gc.GateRow(n, "family", f, "e2e", ()) for n, f in (("gate-ox", "ox"), ("gate-ox2", "ox"), ("gate-on", "on"), ("gate-mm", "mm"))}
+                     | {"gate-c": gc.GateRow("gate-c", "common", "", "host", ())},
+                     {"ox": fam("ox", "R", "other", True), "on": fam("on", "R", "other", False), "mm": fam("mm", "R", "main", True)}, {})
+    kept = {"gate-ox": f"class: ox {REP_REACH} crates/gpu/src/lib.rs", "gate-ox2": "class: the family ox's own file crates/ox/a.rs changed",
+            "gate-on": f"class: on {REP_REACH} crates/gpu/src/lib.rs", "gate-mm": f"class: mm {REP_REACH} crates/gpu/src/lib.rs", "gate-c": "class: common"}
+    held = fixture_held(kept, tabs)
+    expect(list(held) == ["gate-ox"], f"owed: only an other family with a fixture kept by reach alone is held to the fixture tier: {held}")
+    with tempfile.TemporaryDirectory() as d:
+        led_path = os.path.join(d, "lead.tsv")
+        keys = {"fx": "a" * 64, "rl": "b" * 64, "mac": "c" * 64, "gone": "d" * 64}
+        with open(led_path, "w") as fh:
+            for k in keys.values():
+                fh.write(f"{k}\tgate-x\tgate-x\tc1\t2026-11-09T09:00:00+0900\t/t\n")
+        os.makedirs(led_path + ".parts")
+        for name, parts in (("fx", "item\tboxenv\tBLOOMERY_GATE_CARD=3090 BLOOMERY_TIER=fixture\n"), ("rl", "item\tboxenv\tBLOOMERY_GATE_CARD=3090\n"),
+                            ("mac", "mac-env\tBLOOMERY_TIER\tfixture\n")):
+            with open(os.path.join(led_path + ".parts", keys[name] + ".parts"), "w") as fh:
+                fh.write("item\tname\tgate-x\n" + parts)
+        led = Ledger(led_path)
+        tiers = [led.tier_of(keys[n]) for n in ("fx", "rl", "mac", "gone")]
+        expect(tiers == [FIXTURE_TIER, REAL_TIER, FIXTURE_TIER, ""],
+               f"ledger: a record's tier from its parts, the box env's or the Mac's BLOOMERY_TIER; no parts kept is unknown: {tiers}")
 
 
 def print_triggers(trig: list["Trigger"], width: int) -> None:
@@ -5146,6 +5178,7 @@ class Reach:
         self.adj: list[list[tuple[int, str]] | None] = []
         self._gates: dict[tuple[str, str], dict[int, tuple[int, str]]] = {}
         self._gate_files: dict[tuple[str, str], dict[str, int]] = {}
+        self._kept_files: dict[tuple[str, str, frozenset[str]], dict[str, int]] = {}
         self.file_root: dict[str, RootKey] = {}
         for rk in self.lib_root.values():
             for f in self.mods(rk).values():
@@ -5775,14 +5808,15 @@ class Reach:
         return self._gates[key]
 
     def _close(self, graph: Graph, n: str, open_rows: frozenset[int] | None,
-               extra: set[Hit] | None = None) -> dict[int, tuple[int, str]]:
+               extra: set[Hit] | None = None, kept_out: frozenset[str] = frozenset()) -> dict[int, tuple[int, str]]:
         """The closure of gate `n`'s targets; `open_rows`, when given, are the only rows of the registry's table whose
-        entries its dispatch edges lead to, until a unit that walks every row is reached."""
+        entries its dispatch edges lead to, until a unit that walks every row is reached. A file of `kept_out` is read as
+        not linked: no chain enters it."""
         self.dispatches()
         cut = open_rows is not None and bool(self._rows_nodes)
         held: list[tuple[int, int, str]] = []
         ri = graph.inputs(n)
-        linked = set(ri.files)
+        linked = set(ri.files) - kept_out
         sets = [self.rules()]
         par: dict[int, tuple[int, str]] = {}
         said: set[str] = set()
@@ -5889,6 +5923,18 @@ class Reach:
                     out.setdefault(self.nodes[m][1], m)
             self._gate_files[key] = out
         return self._gate_files[key]
+
+    def gate_files_kept_out(self, graph: Graph, n: str, kept_out: frozenset[str]) -> dict[str, int]:
+        """file -> the first unit of it gate `n`'s reach holds when no chain may enter a file of `kept_out` (gate_class.py's
+        kernel rule keeps a family gate out of every other family's own files: a seat or a tower the registry dispatches to
+        is that family's launch, not this gate's). The registry's rows the gate cannot open are cut as in `gate`."""
+        key = (n, graph.recipes[n].text, kept_out)
+        if key not in self._kept_files:
+            out: dict[str, int] = {}
+            for m in self._close(graph, n, self.rows_open(graph, n), kept_out=kept_out):
+                out.setdefault(self.nodes[m][1], m)
+            self._kept_files[key] = out
+        return self._kept_files[key]
 
     def prepare(self) -> None:
         """Materialize and persist the structural graph, never recipe/profile-specific cuts.
@@ -10699,6 +10745,9 @@ def item_key(parts: list[str]) -> str:
     return sha256_text("\n".join(parts) + "\n")
 
 
+FIXTURE_TIER, REAL_TIER = "fixture", "real"  # the tiers a batch runs in (tools/gate-batch.sh --tier)
+
+
 @dataclass
 class LedgerRecord:
     key: str
@@ -10740,6 +10789,21 @@ class Ledger:
                 return [ln for ln in fh.read().split("\n") if ln]
         except OSError:
             return None
+
+    def tier_of(self, key: str) -> str:
+        """The tier a green record ran in, from its key's parts (the ledger line carries none): `fixture` when an `item boxenv`
+        part sets BLOOMERY_TIER=fixture or a `mac-env BLOOMERY_TIER fixture` part is there (tools/gate-batch.sh red_attrib reads it
+        the same way), else `real`; `` when the parts were not kept."""
+        parts = self.parts_of(key)
+        if parts is None:
+            return ""
+        for p in parts:
+            f = p.split("\t")
+            if f[:2] == ["item", "boxenv"] and len(f) > 2 and "BLOOMERY_TIER=fixture" in f[2].split():
+                return FIXTURE_TIER
+            if f == ["mac-env", "BLOOMERY_TIER", FIXTURE_TIER]:
+                return FIXTURE_TIER
+        return REAL_TIER
 
     def why(self, name: str, item: str, parts: list[str]) -> str:
         """Why an item that has no green record at its key runs: what moved since its last green."""
@@ -12953,7 +13017,7 @@ def key_self_test(expect, pieces: tuple[str, ...]) -> None:
             rows, default = fixture_table(sa.tree.read(FIXTURE_DIRS), sa.tree.read(REF_PATHS))
             expect(default == DEFAULT_PROFILE, f"ref-paths.sh's default profile {default} is not DEFAULT_PROFILE {DEFAULT_PROFILE}")
             expect([rows.get(f) for f in ("qwen4exp", "deepseek41", "glm5next", "qwen35moe", "deepseek2")] == ["qwen38", "v41", "glm5next", "qwen35moe", "self"]
-                   and "mimo2" not in rows and rows["qwen35"] == "self", f"the real fixture table, read: {rows}")
+                   and "raon1" not in rows and rows["qwen35"] == "self", f"the real fixture table, read: {rows}")
             fam = {
                 "q4": "gate-gpu-qwen4exp-e2e",  # BLOOMERY_MODEL=qwen4exp: qwen38
                 "glm": "gate-gpu-glm-sel",  # glm5next: glm5next
@@ -13712,7 +13776,7 @@ def ref_paths_self_test(expect) -> None:
         for f in ("ref-paths.sh", "dspark-path.sh", "gguf-ranges.py"):
             shutil.copyfile(os.path.join(src, f), os.path.join(tmp, "tools/ref", f))
         shutil.copyfile(os.path.join(ROOT, FIXTURE_DIRS), os.path.join(tmp, FIXTURE_DIRS))
-        for fam in ("qwen4exp", "deepseek2", "glm5next", "mimo2", "newfam"):
+        for fam in ("qwen4exp", "deepseek2", "glm5next", "raon1", "newfam"):
             with open(os.path.join(tmp, f"tools/ref/models/{fam}.sh"), "w", encoding="utf-8") as fh:
                 fh.write(f"MODEL_NAME={fam}\nMODEL=${{BLOOMERY_REF_MODEL:-/models/real/{fam}.gguf}}\n")
         root = os.path.join(tmp, "fixtures")
@@ -13749,7 +13813,7 @@ def ref_paths_self_test(expect) -> None:
         expect(rc == 0 and out.strip() == f"/x/own.gguf|{first}", f"ref-paths: a caller's own file does not win, or the fixture is not named: {rc} {out!r}")
         rc, out, err = run("deepseek2", f"{show}; fixture_budget; echo budget-rc=$?", BLOOMERY_TIER="fixture")
         expect(rc == 0 and out.split() == ["/models/real/deepseek2.gguf|", "budget-rc=0"], f"ref-paths: a small family does not stand: {rc} {out!r} {err!r}")
-        for fam in ("mimo2", "newfam"):
+        for fam in ("raon1", "newfam"):
             rc, out, err = run(fam, show, BLOOMERY_TIER="fixture")
             expect(rc == 66 and out == "" and f"the family '{fam}' has no fixture yet" in err and "exit 66" in err, f"ref-paths: {fam} has no fixture: {rc} {out!r} {err!r}")
         rc, out, err = run("qwen4exp", show, BLOOMERY_TIER="both")
@@ -16157,6 +16221,25 @@ def class_lib_touch(n: str, changed: list[str], a: Side | None, b: Side) -> bool
     return False
 
 
+REP_REACH = "is a representative family and the recipe reaches"  # the class stage's rule for an R family's gate kept by reach alone
+
+
+def fixture_held(kept: dict[str, str], tables) -> dict[str, str]:
+    """The kept picks the real tier does not owe: a gate of an `other` family that has a fixture (families.tsv tier and fixture)
+    that the class stage kept only because its representative family reaches a changed file, which a common file does. Such a
+    family is owed on the fixture tier; its real gates are owed on its own files, its recipe's text or its own targets (the stage's
+    other rules), or by name (tools/rotation.py due --real). Recipe -> the reason."""
+    out: dict[str, str] = {}
+    for n, why in kept.items():
+        row = tables.gates.get(n)
+        if row is None or row.cls != "family":
+            continue
+        fam = tables.families[row.family]
+        if fam.tier == "other" and fam.fixture and why.startswith(f"class: {row.family} {REP_REACH} "):
+            out[n] = f"{row.family} is an other family with a fixture, kept by its representative reach alone: the fixture tier runs it"
+    return out
+
+
 def class_narrow(picks: dict[str, str], changed: list[str], tables, reach, new_families: set[str],
                  fast: bool = False, lib_touch=None) -> ClassStage:
     """The class stage of `affected`: the picks it keeps and the ones it leaves out.
@@ -16222,7 +16305,7 @@ def class_narrow(picks: dict[str, str], changed: list[str], tables, reach, new_f
             kept[n] = f"class: the family {row.family}'s own file {hit} changed"
         elif fam.rep == "R" and reached and (not fast or nobody is not None):
             why = nobody if fast else reached[0]
-            kept[n] = f"class: {row.family} is a representative family and the recipe reaches {why}"
+            kept[n] = f"class: {row.family} {REP_REACH} {why}"
         elif row.family in new_families:
             kept[n] = f"class: the family {row.family} was added since the last release tag"
         elif fast and fam.rep == "R" and reached:

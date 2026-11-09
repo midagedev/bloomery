@@ -138,6 +138,10 @@ mod gate {
             fx::D16K_DSA,
             "BLOOMERY_TIER=fixture just dump-ref-fixture glm5next d16kdsa",
         ),
+        (
+            fx::D256K_DSA,
+            "BLOOMERY_TIER=fixture just dump-ref-fixture glm5next d256kdsa",
+        ),
     ];
     /// The fixture-oracle clauses this gate declares (`tier::expect_fixture_oracle`): one a set of
     /// [`FIXTURE_SETS`].

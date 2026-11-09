@@ -24,12 +24,13 @@ use super::{
 use crate::placement::PlacementError;
 
 /// Every fixture family's spec, read by the fixture tool and the gates' budget admission.
-pub const FIXTURE_SPECS: [fn() -> crate::fixture::FixtureSpec; 11] = [
+pub const FIXTURE_SPECS: [fn() -> crate::fixture::FixtureSpec; 12] = [
     deepseek41::fixture::spec,
     qwen3moe::fixture::spec,
     qwen35moe::fixture::spec,
     qwen35moe::fixture::qwen35moe::spec,
     glm5next::fixture::spec,
+    mimo2::fixture::spec,
     solar2::fixture::spec,
     nemotron_h::fixture::spec,
     nemotron_h_moe::fixture::spec,
@@ -275,7 +276,16 @@ pub static ROWS: &[ArchRow] = &[
         read: Some(mimo2::spec::read),
         draft: Some(draft::mimo2_usable),
         coverage: None,
-        fixture: None,
+        fixture: Some(Fixture::Gguf(FixtureRow {
+            family: "mimo2",
+            repo: "ggml-org/MiMo-V2.6-Flash-RL-GGUF",
+            quant: "MXFP4",
+            // The revision the census stub of the file pins (tools/census/stubs.tsv).
+            rev: Some("b0b2d0fb0b56611c761e075425c88989faf1ed1f"),
+            draft: DraftSource::NotFetchable(
+                "the MTP sidecar is a file of its own, and the fixture writes none of it yet",
+            ),
+        })),
     },
     ArchRow {
         arch: Some(Arch::MiniMaxM3),
@@ -441,6 +451,48 @@ pub static PROFILE_CUTS: &[ProfileCut] = &[
         },
     },
 ];
+
+/// A GGUF fixture of a gate profile that no row names: a second cut of a row's architecture from
+/// the same source header, beside the row's own fixture (a row holds one [`Fixture`]). Only the
+/// clauses that name the profile read it; `fixture plan`, `generate`, `fetch` and `verify` take it
+/// by `--profile`. The directory is the profile's row in `tools/fixture-dirs.tsv`.
+#[derive(Clone, Copy)]
+pub struct ProfileFixture {
+    /// The `BLOOMERY_MODEL` profile whose row in `tools/fixture-dirs.tsv` names the directory. No
+    /// row of [`ROWS`] holds it as one of its strings.
+    pub profile: &'static str,
+    /// The canonical architecture string of the row whose reader reads the fixture and whose
+    /// [`FixtureRow`] names its hub source.
+    pub arch: &'static str,
+    /// The fixture's directory under the fixture root.
+    pub family: &'static str,
+    /// The cut's spec.
+    pub spec: fn() -> crate::fixture::FixtureSpec,
+}
+
+/// Every profile's GGUF fixture, in table order.
+pub static PROFILE_FIXTURES: &[ProfileFixture] = &[
+    ProfileFixture {
+        // Kimi K3 at the real file's widths and counts: the mini's dispatch classes are not the real
+        // file's (`tools/kcover/unreached.tsv`), the full-shape cut's are.
+        profile: "kimi-k3-full",
+        arch: "kimi-k3",
+        family: "kimik3full",
+        spec: kimi_k3::fixture::full_spec,
+    },
+    ProfileFixture {
+        // Muse Spark at the real file's widths and counts, for the same reason.
+        profile: "muse-spark-full",
+        arch: "muse-spark",
+        family: "musesparkfull",
+        spec: musespark::fixture::full_spec,
+    },
+];
+
+/// The profile fixture of `profile`.
+pub fn profile_fixture(profile: &str) -> Option<&'static ProfileFixture> {
+    PROFILE_FIXTURES.iter().find(|p| p.profile == profile)
+}
 
 /// The row whose strings include `arch`.
 pub fn row_of(arch: &str) -> Option<&'static ArchRow> {
@@ -612,6 +664,7 @@ mod tests {
                 "qwen4exp",
                 "qwen35moe",
                 "glm5next",
+                "mimo2",
                 "solar-open2",
                 "nemotron_h",
                 "nemotron_h_moe",
@@ -689,6 +742,47 @@ mod tests {
                 ROWS.iter()
                     .all(|r| r.fixture.is_none_or(|fx| fx.family() != family)),
                 "{family}: a row's fixture is already this directory"
+            );
+        }
+    }
+
+    /// A profile fixture is for a profile no row names, the directory `tools/fixture-dirs.tsv`
+    /// gives that profile, a spec of the architecture its row's reader reads and whose row has a
+    /// GGUF fixture (its hub source), and a family no row's fixture or profile cut already is.
+    #[test]
+    fn a_profile_fixture_is_its_profiles_directory() {
+        assert!(!PROFILE_FIXTURES.is_empty(), "no profile fixture to hold");
+        for p in PROFILE_FIXTURES {
+            let (profile, family) = (p.profile, p.family);
+            assert!(
+                row_of(profile).is_none(),
+                "{profile}: a row names it, so its fixture is the row's"
+            );
+            assert_eq!(
+                refset::fixture::dir_of(profile),
+                Some(family),
+                "{profile}: tools/fixture-dirs.tsv gives the profile another directory"
+            );
+            assert_eq!(
+                (p.spec)().arch,
+                p.arch,
+                "{profile}: the spec's architecture"
+            );
+            assert!(
+                fixture_of(p.arch).is_some(),
+                "{profile}: {} has no GGUF fixture row to name the source",
+                p.arch
+            );
+            assert!(
+                ROWS.iter()
+                    .all(|r| r.fixture.is_none_or(|fx| fx.family() != family))
+                    && PROFILE_CUTS.iter().all(|c| c.cut.family != family),
+                "{family}: a row's fixture or a profile cut is already this directory"
+            );
+            assert_ne!(
+                (p.spec)().stem,
+                fixture_spec(p.arch).map(|s| s.stem).unwrap_or_default(),
+                "{profile}: the row's fixture and the profile's share file names"
             );
         }
     }

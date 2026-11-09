@@ -259,6 +259,12 @@ impl<F: Family> OpenLog<F::Body> for Log<F> {
     fn prompt_buffers(&mut self, _m: &GpuModel<F::Body>) -> Result<(), SessionError> {
         Ok(())
     }
+
+    /// The card-byte invariant's readings, printed and refused as this process's
+    /// card hold says ([`bloomery_gpu_gates::card_bytes::watch`]).
+    fn card_watch(&mut self) -> Result<Box<dyn app::CardWatch>, SessionError> {
+        bloomery_gpu_gates::card_bytes::watch()
+    }
 }
 
 impl<F: Family> Log<F> {
@@ -371,7 +377,7 @@ fn open_pass<F: Family>(
         .map_err(|_| format!("the plan's ctx_max {} passes u32", plan.ctx_max))?;
     let mut m = open(file, &plan, inputs, cfg.host)?;
     m.set_mode(StepMode::Graph);
-    Ok(Loaded::from_model(m, cfg, held))
+    Ok(Loaded::from_model(m, cfg, held).watched(log.card_watch()?)?)
 }
 
 impl<F: Family> Seat for Hybrid<F> {
@@ -399,13 +405,18 @@ impl<F: Family> Seat for Hybrid<F> {
         self.census
             .steps(Some(self.s.model().body(F::NAME)?.hybrid()));
         let next = <F::Body as Prompt>::prompt(self.s.model_mut(), ids)?;
+        self.s
+            .card_check(model::placement::card_made::CardPhase::FirstPrompt)?;
         self.census
             .prompt(Some(self.s.model().body(F::NAME)?.hybrid()));
         Ok(next)
     }
 
     fn step(&mut self, last: u32) -> Result<u32, GateError> {
-        Ok(self.s.model_mut().step(&[last])?)
+        let next = self.s.model_mut().step(&[last])?;
+        self.s
+            .card_check(model::placement::card_made::CardPhase::FirstStep)?;
+        Ok(next)
     }
 
     fn logits_into(&self, row: &mut [f32]) -> Result<(), GateError> {

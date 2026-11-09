@@ -1,0 +1,16 @@
+# kcover26 mutant width
+# clause: the diff names a width on each side
+# site: classes() records no Width
+# run: cargo test -p bloomery-model --test kcover kcover_diff_names_each_kind
+# red (rc=101): a width edit: real side {}, fixture side {}, want {Width} on each
+--- a/crates/model/src/arch/coverage/reach.rs
++++ b/crates/model/src/arch/coverage/reach.rs
+@@ -110,7 +110,7 @@
+                 .map_or_else(|| format!("type {}", t.ty.as_u32()), str::to_string);
+         add(ClassKind::Pin, format!("{s} {ty}"));
+         if let [rows_of, rows, ..] = t.dims[..] {
+-            add(ClassKind::Width, format!("{s} {rows_of}x{rows}"));
++            let _ = (rows_of, rows);
+         }
+     }
+     for layer in &read.spec.layers {

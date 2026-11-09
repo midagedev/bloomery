@@ -98,6 +98,7 @@ mod gate {
     use bloomery_gpu_gates::qwen3moe::f16_logical_bits;
     use bloomery_gpu_gates::rope_gate::cache_bits;
     use bloomery_gpu_gates::rounding::{U, gamma};
+    use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{
         GateError, NAN_F16 as NAN16, RefManifest, activations, bits_equal, checks_failed,
         mask_bits_in, ref_dir_named, ref_model_path, ref_tensor_logical_in, verdict,
@@ -2967,7 +2968,8 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        bloomery_levers::at_main(&[])?;
+        // The fixture tier's runner exports the family's card budget; this gate plans no card.
+        bloomery_levers::at_main(&tier::acts_on(&[])?)?;
         let gpu = Gpu::new()?;
         let k = FlashGqaKernels::load(gpu.context())?;
         let a = RopeNeoxKernels::load(gpu.context())?;
@@ -2989,59 +2991,67 @@ mod gate {
                 .into());
             }
         };
-        let want = |c: &str| only.as_ref().is_none_or(|o| o.iter().any(|x| x == c));
+        // A clause the tier decides to run: the seeded-data clauses run in both tiers, and `G`,
+        // ik's sets dumped from the real file, is left to the real tier by name.
+        let want = |c: &str, tag: Tag| -> Result<bool, GateError> {
+            if only.as_ref().is_some_and(|o| !o.iter().any(|x| x == c)) {
+                return Ok(false);
+            }
+            tier::run_clause(c, tag)
+        };
         let mut ok = true;
-        if want("F0") {
+        if want("F0", Tag::SelfConsistency)? {
             ok &= owner();
         }
-        if want("A") {
+        if want("A", Tag::SelfConsistency)? {
             ok &= append_clauses(&a, &gpu)?;
         }
-        if want("F1") {
+        if want("F1", Tag::SelfConsistency)? {
             ok &= f1(&k, &gpu)?;
         }
-        if want("F2") {
+        if want("F2", Tag::SelfConsistency)? {
             ok &= f2(&k, &gpu)?;
         }
-        if want("F3") {
+        if want("F3", Tag::SelfConsistency)? {
             ok &= f3(&k, &gpu)?;
         }
-        if want("F4") {
+        if want("F4", Tag::SelfConsistency)? {
             ok &= f4(&k, &gpu)?;
         }
-        if want("F5") {
+        if want("F5", Tag::SelfConsistency)? {
             ok &= f5(&k, &gpu)?;
         }
-        if want("F6") {
+        if want("F6", Tag::SelfConsistency)? {
             ok &= f6(&k, &gpu)?;
         }
-        if want("F7") {
+        if want("F7", Tag::SelfConsistency)? {
             ok &= f7(&k, &gpu)?;
         }
-        if want("F8") {
+        if want("F8", Tag::SelfConsistency)? {
             ok &= f8(&k, &gpu)?;
         }
-        if want("F9") {
+        if want("F9", Tag::SelfConsistency)? {
             ok &= f9(&k, &gpu)?;
         }
-        if want("G") {
+        if want("G", Tag::Oracle)? {
             ok &= ik_sets(&k, &a, &gpu)?;
         }
-        if want("W1") {
+        if want("W1", Tag::SelfConsistency)? {
             ok &= w1(&k, &a, &gpu)?;
         }
-        if want("W2") {
+        if want("W2", Tag::SelfConsistency)? {
             ok &= w2(&k, &a, &gpu, W2_ROWS)?;
         }
-        if want("W3") {
+        if want("W3", Tag::SelfConsistency)? {
             ok &= w3(&k, &a, &gpu)?;
         }
-        if want("W4") {
+        if want("W4", Tag::SelfConsistency)? {
             ok &= w4(&k, &a, &gpu)?;
         }
         if let Some(o) = &only {
             println!("gate_mimo2_flash: PARTIAL run, clauses {o:?} only — not the gate");
         }
+        println!("gate_mimo2_flash: {}", tier::tally_line());
         println!("gate_mimo2_flash: {}", verdict(ok));
         if !ok {
             return Err(checks_failed());

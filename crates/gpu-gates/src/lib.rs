@@ -18,6 +18,8 @@ pub mod beside;
 pub mod bind;
 pub mod block;
 pub mod capture;
+#[cfg(feature = "gpu")]
+pub mod card_bytes;
 pub mod ctx_ladder;
 #[cfg(feature = "deepseek41")]
 pub mod ds41_media;

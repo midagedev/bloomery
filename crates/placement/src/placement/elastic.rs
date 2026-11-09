@@ -150,8 +150,8 @@ pub fn fill_allowed(boundary: u64, last_give_back: Option<u64>) -> bool {
 /// The most card bytes a fill could ever take back from a plan's card: the
 /// terms the plan assumed rather than summed from the file (its context,
 /// scratch and reserve bytes) and the headroom it left past the margin. The
-/// dense, expert, rounding, K/V and stage-row bytes are exact sums and never
-/// come back.
+/// dense, expert, rounding, K/V, stage-row and prompt-pass bytes are exact
+/// sums and never come back.
 #[must_use]
 pub fn reclaimable(totals: &super::CardTotals, margin: u64) -> u64 {
     let past_margin = totals
@@ -244,6 +244,7 @@ mod tests {
             scratch_bytes: 100,
             context_bytes: 200,
             reserve_bytes: 300,
+            prompt_bytes: 0,
             headroom_bytes: headroom,
         };
         assert_eq!(reclaimable(&totals(700), 400), 900);

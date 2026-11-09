@@ -1,0 +1,15 @@
+# kcover26 mutant musefull-mini-key
+# clause: the full-shape Muse Spark cut writes the source's widths and counts
+# site: Full keeps the mini's Set rules
+# run: cargo test -p bloomery-model --test kcover kcover_table_holds_the_checked_in_headers
+# red (rc=101): musesparkfull: reading the fixture: tensor token_embd.weight: has other dims than the keys give the tensor (45 such: token_embd.weight [8192, 202048] (want [1024, 202048]), output.weight [8192, 202048] (want [1024, 202048]), output_norm.weight [8192] (want [1024]), blk.0.attn_norm.weight [8192] (want [1024]), blk.0.attn_q.weight [8192, 8192] (want [1024, 1024]), blk.0.attn_k.weight [8192, 1024] (want [1024, 128]), blk.0.attn_v.weight [8192, 1024] (want [1024, 128]), blk.0.attn_gate.weight [8192, 8192] (want [1024, 1024]), blk.0.attn_output.weight [8192, 8192] (want [1024, 1024]), blk.0.attn_resid_alpha.weight [8192] (want [1024]), blk.0.attn_resid_beta.weight [8192] (want [1024]), blk.0.ffn_norm.weight [8192] (want [1024]), blk.0.ffn_latent_down.weight [8192, 4096] (want [1024, 512]), blk.0.ffn_pre_exp_norm.weight [4096] (want [512]), blk.0.ffn_gate_inp.weight [8192, 256] (want [1024, 16]), blk.0.exp_probs_b.bias [256] (want [16]), blk.0.ffn_gate_exps.weight [4096, 4096, 256] (want [512, 256, 16]), blk.0.ffn_up_exps.weight [4096, 4096, 256] (want [512, 256, 16]), blk.0.ffn_down_exps.weight [4096, 4096, 256] (want [256, 512, 16]), blk.0.ffn_post_exp_norm.weight [4096] (want [512]), blk.0.ffn_latent_up.weight [4096, 8192] (want [512, 1024]), blk.0.post_ffw_norm.weight [8192] (want [1024]), blk.0.ffn_resid_alpha.weight [8192] (want [1024]), blk.0.ffn_resid_beta.weight [8192] (want [1024]), blk.1.attn_norm.weight [8192] (want [1024]), blk.1.attn_q.weight [8192, 8192] (want [1024, 1024]), blk.1.attn_k.weight [8192, 1024] (want [1024, 128]), blk.1.attn_v.weight [8192, 1024] (want [1024, 128]), blk.1.attn_gate.weight [8192, 8192] (want [1024, 1024]), blk.1.attn_output.weight [8192, 8192] (want [1024, 1024]), blk.1.attn_resid_alpha.weight [8192] (want [1024]), blk.1.attn_resid_beta.weight [8192] (want [1024]), blk.1.ffn_norm.weight [8192] (want [1024]), blk.1.ffn_latent_down.weight [8192, 4096] (want [1024, 512]), blk.1.ffn_pre_exp_norm.weight [4096] (want [512]), blk.1.ffn_gate_inp.weight [8192, 256] (want [1024, 16]), blk.1.exp_probs_b.bias [256] (want [16]), blk.1.ffn_gate_exps.weight [4096, 4096, 256] (want [512, 256, 16]), blk.1.ffn_up_exps.weight [4096, 4096, 256] (want [512, 256, 16]), blk.1.ffn_down_exps.weight [4096, 4096, 256] (want [256, 512, 16]), blk.1.ffn_post_exp_norm.weight [4096] (want [512]), blk.1.ffn_latent_up.weight [4096, 8192] (want [512, 1024]), blk.1.post_ffw_norm.weight [8192] (want [1024]), blk.1.ffn_resid_alpha.weight [8192] (want [1024]), blk.1.ffn_resid_beta.weight [8192] (want [1024]))
+--- a/crates/model/src/arch/musespark/fixture.rs
++++ b/crates/model/src/arch/musespark/fixture.rs
+@@ -446,7 +446,6 @@
+ impl Family for Full {
+     fn key_rule(&self, suffix: &str) -> Option<KeyRule> {
+         match key_rule(suffix) {
+-            Some(KeyRule::Set(_)) => Some(KeyRule::Copy),
+             rule => rule,
+         }
+     }

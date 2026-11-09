@@ -17,14 +17,17 @@
 //! A seat that keeps a saved prompt cache (its server prints a `cache` line with a budget) is also
 //! held to what the cache is for: a conversation another one interrupted returns from the cache
 //! ([`saved_state_returns`]); a seat with none skips that clause by name.
+//!
+//! Every seat is held to its plan's card bytes at the most context it serves
+//! ([`card_bytes_hold_at_max_ctx`], the arm `serve_client` owns).
 
 use std::path::Path;
 use std::time::Duration;
 
 use bloomery_gpu_gates::record;
 use bloomery_gpu_gates::serve_client::{
-    SeatGate, Served, check, completion_raw, curl, greedy, ids_of, json_of, repeated_ids,
-    server_log, tokenized,
+    MAX_CTX, MaxCtx, PREFIX_TEXT, SeatGate, Served, card_bytes_hold_at_max_ctx, check,
+    completion_raw, curl, greedy, ids_of, json_of, repeated_ids, server_log, tokenized,
 };
 use bloomery_gpu_gates::tier::{self, Tag};
 use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path};
@@ -141,16 +144,6 @@ const PREFIX: &str = "live_slot_keeps_the_prefix";
 
 /// The tokens each request of the prefix clause asks for at most.
 const PREFIX_TOKENS: u64 = 8;
-
-/// The fixed text every prompt of the prefix clause opens with: long enough
-/// that the questions sit past a page of ids, short enough that the prompts
-/// stay well under half of every seat's context.
-const PREFIX_TEXT: &str = "The harbour office kept the keeper's ledger beside its maps: every \
-                           ship that passed the point, the wind, the tide and the names she read \
-                           through the glass, one page an evening for forty years. The clerks \
-                           still open the ledger first when a fishing boat asks about the weather \
-                           before dawn, and the newest page carries the same square hand as the \
-                           oldest.";
 
 /// The question the prefix clause's first prompt asks after [`PREFIX_TEXT`].
 const Q1: &str = "Which page did the clerk open first?";
@@ -312,6 +305,19 @@ pub fn served_with(c: &Clauses, dir: &Path, ask: Ask) -> Result<bool, GateError>
     }
     ok &= saved_state_returns(c, &err_log, &url, &d)?;
     println!("server stopped: {}", s.stop()?);
+    ok &= card_bytes_hold_at_max_ctx(
+        MAX_CTX,
+        &MaxCtx {
+            dir: &dir.join("max-ctx"),
+            kinds: c.kinds,
+            listening: c.listening,
+        },
+        || {
+            let (cmd, mut all) = seat(c).command(&ref_model_path()?)?;
+            all.extend(["--port", "0"].iter().map(|a| (*a).to_owned()));
+            Ok((cmd, all))
+        },
+    )?;
     Ok(ok)
 }
 

@@ -467,6 +467,12 @@ mod cli {
             }
             Ok(())
         }
+
+        /// The card-byte invariant's readings, printed and refused as this process's
+        /// card hold says ([`bloomery_gpu_gates::card_bytes::watch`]).
+        fn card_watch(&mut self) -> Result<Box<dyn app::CardWatch>, SessionError> {
+            bloomery_gpu_gates::card_bytes::watch()
+        }
     }
 
     /// `--place tp`: the plan of each rank of the checkpoint folder `BLOOMERY_REF_MODEL` names,

@@ -1,0 +1,17 @@
+# kcover mutant r5-key-owed
+# clause: R5, a moved key alone owes no held gate: its real-tier run is owed only by its own change or by name
+#   (tools/rotation.py Gate.held, due_entries)
+# site: tools/rotation.py Gate.held, always False: the held gate takes the deferred kinds' date and key rule
+# expected red: `python3 tools/rotation.py --self-test` (rc 1) ends in "RotationError: --real fo: no real-tier gate of an other
+#   family with a fixture is named so" (the self-test's request by name finds no held gate) before its FAIL lines print
+--- a/tools/rotation.py
++++ b/tools/rotation.py
+@@ -127,7 +127,7 @@
+     def held(self) -> bool:
+         """A real-tier gate (a deferred kind) of an `other` family with a fixture: no date owes it, only its family's own change
+         since its last real-tier green or a request by name (`--real`)."""
+-        return self.scope.fixture_tier and self.kind in DEFERRED_KINDS
++        return False
+ 
+ 
+ @dataclasses.dataclass

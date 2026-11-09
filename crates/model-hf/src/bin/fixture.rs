@@ -14,10 +14,17 @@
 //!                           [--table FILE]
 //!     fixture variant-budget <variant first shard>
 //!     fixture rebudget <fixture first shard> [--card-budget B]
+//!     fixture reach [--root DIR] [--table FILE]
+//!     fixture reach-check [--root DIR] [--table FILE]
 //!     fixture registry
 //!
 //! The spec is the family's whose architecture the first file declares (for `verify`, the
-//! fixture's, which is its source's); an architecture with no spec is refused by name.
+//! fixture's, which is its source's); an architecture with no spec is refused by name. A profile
+//! fixture (`registry::PROFILE_FIXTURES`, a second cut of a row's architecture) is planned and
+//! generated with `--profile P`, fetched by its directory name, and verified by `--profile P` or by
+//! its file name, which starts with its spec's stem. `reach` prints, and `reach-check` checks
+//! against `tools/kcover/unreached.tsv`, what each GGUF fixture cannot reach of the census stubs
+//! present under the stub root and of its own source (`reach`'s doc).
 //! Flags of `plan` and `generate`: `--seed N`, `--card-budget B` (bytes, or `nM`/`nG` as
 //! `BLOOMERY_CARD_BUDGET` takes them; the spec's budget when absent, a fixed one or the
 //! cap its family's plan of the written file chooses), `--shard-bytes B` (tensor data a shard
@@ -32,7 +39,7 @@
 //! listed size with its header (fetched through the hf crate's client) at the front, in a
 //! directory beside `<out dir>` that is removed afterwards; the family's draft is the repo's
 //! file its family's source row names, when the row has one (a row can say its draft is not
-//! fetchable, and `fetch` then skips it by name, in its line and in its closing `fetch done` line). A family name (`v41`, `qwen3moe`, `qwen38`, `qwen35moe`, `glm5next`, `solar2`, `nemotron`, `nemotron-bolt`, `musespark`, `mistrallarge4-e128`)
+//! fetchable, and `fetch` then skips it by name, in its line and in its closing `fetch done` line). A family name (`v41`, `qwen3moe`, `qwen38`, `qwen35moe`, `glm5next`, `mimo2`, `solar2`, `nemotron`, `nemotron-bolt`, `musespark`, `mistrallarge4-e128`, `kimik3`, and a profile fixture's `kimik3full`, `musesparkfull`, which fetch its architecture's row)
 //! reads its row of the registry (`model::arch::registry`): repo, quant and revision; a `<repo>:<quant>` takes `main`, a `<repo>@<rev>:<quant>` its `rev`.
 //! After writing, it runs `verify`'s check against the sparse sources it still holds, and a
 //! fixture that fails it is removed with its sidecar, so a failed fetch leaves nothing.
@@ -99,12 +106,16 @@ const USAGE: &str = "usage: fixture plan <real first shard> [--draft <real draft
        fixture variant-check <variant first shard> --source <fixture first shard> --tag T [--table FILE]
        fixture variant-budget <variant first shard>
        fixture rebudget <fixture first shard> [--card-budget B]
+       fixture reach [--root DIR] [--table FILE]
+       fixture reach-check [--root DIR] [--table FILE]
        fixture registry
-flags of plan and generate: --seed N --card-budget B --shard-bytes B --tensors a,b,... --draft-tensors a,b,...
-flags of fetch: the same but --draft, and --rev R";
+flags of plan and generate: --profile P --seed N --card-budget B --shard-bytes B --tensors a,b,... --draft-tensors a,b,...
+flags of fetch: the same but --draft and --profile (a profile fixture's directory names it), and --rev R
+flags of verify: --profile P (else a profile fixture's file names it) --source F --draft-source F";
 
 /// The flags `plan` and `generate` take.
-const PLAN_FLAGS: [&str; 6] = [
+const PLAN_FLAGS: [&str; 7] = [
+    "--profile",
     "--draft",
     "--seed",
     "--card-budget",
@@ -124,7 +135,9 @@ const FETCH_FLAGS: [&str; 6] = [
 /// The flags `cut` takes.
 const CUT_FLAGS: [&str; 3] = ["--spec", "--shard-bytes", "--card-budget"];
 /// The flags `verify` takes.
-const VERIFY_FLAGS: [&str; 2] = ["--source", "--draft-source"];
+const VERIFY_FLAGS: [&str; 3] = ["--profile", "--source", "--draft-source"];
+/// The flags `reach` and `reach-check` take.
+const REACH_FLAGS: [&str; 2] = ["--root", "--table"];
 /// The flags `variant-rules` takes.
 const RULES_FLAGS: [&str; 2] = ["--tag", "--table"];
 /// The flags `variant-check` takes.
@@ -158,6 +171,7 @@ fn run(args: &[String]) -> Res<()> {
         "variant-budget" => &[],
         "rebudget" => &["--card-budget"],
         "registry" => &[],
+        "reach" | "reach-check" => &REACH_FLAGS,
         _ => return Err(USAGE.into()),
     };
     let a = Args::parse(cmd, takes, rest)?;
@@ -172,6 +186,8 @@ fn run(args: &[String]) -> Res<()> {
         ("variant-check", [variant]) => variant_check(variant, &a),
         ("variant-budget", [variant]) => variant_budget(variant),
         ("rebudget", [first]) => rebudget(first, a.card_budget),
+        ("reach", []) => reach(&a, false),
+        ("reach-check", []) => reach(&a, true),
         ("registry", []) => {
             print!("{}", registry::print());
             Ok(())
@@ -183,6 +199,8 @@ fn run(args: &[String]) -> Res<()> {
 /// The command line after the verb.
 struct Args {
     paths: Vec<String>,
+    profile: Option<String>,
+    root: Option<String>,
     draft: Option<String>,
     source: Option<String>,
     draft_source: Option<String>,
@@ -202,6 +220,8 @@ impl Args {
     fn parse(cmd: &str, takes: &[&str], args: &[String]) -> Res<Args> {
         let mut a = Args {
             paths: Vec::new(),
+            profile: None,
+            root: None,
             draft: None,
             source: None,
             draft_source: None,
@@ -232,6 +252,8 @@ impl Args {
             let list = |v: String| v.split(',').map(str::to_string).collect::<Vec<_>>();
             match arg.as_str() {
                 "--draft" => a.draft = Some(value()?),
+                "--profile" => a.profile = Some(value()?),
+                "--root" => a.root = Some(value()?),
                 "--source" => a.source = Some(value()?),
                 "--draft-source" => a.draft_source = Some(value()?),
                 "--spec" => a.spec = Some(value()?),
@@ -283,9 +305,40 @@ fn open(path: &str) -> Res<Split> {
 }
 
 /// The spec of the family whose architecture `split` (opened from `path`)
-/// declares.
-fn spec_of(split: &Split, path: &str) -> Res<FixtureSpec> {
+/// declares: the profile fixture `profile` names (`--profile`, refused for another architecture),
+/// else the profile fixture of that architecture whose file stem `path`'s file name starts with (a
+/// written profile fixture names its spec), else the row's.
+fn spec_of(split: &Split, path: &str, profile: Option<&str>) -> Res<FixtureSpec> {
     let arch = split.architecture();
+    if let Some(p) = profile {
+        let fx = registry::profile_fixture(p).ok_or_else(|| {
+            let known: Vec<&str> = registry::PROFILE_FIXTURES
+                .iter()
+                .map(|p| p.profile)
+                .collect();
+            format!("--profile {p} is no profile fixture (the profiles: {known:?})")
+        })?;
+        let row = registry::row_of(fx.arch).map(|r| r.names);
+        if !arch.is_some_and(|a| row.is_some_and(|names| names.contains(&a))) {
+            return Err(format!(
+                "{path}: architecture {arch:?}, the profile {p} is a cut of {}",
+                fx.arch
+            )
+            .into());
+        }
+        return Ok((fx.spec)());
+    }
+    let name = Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if let Some(spec) = registry::PROFILE_FIXTURES
+        .iter()
+        .map(|p| (p.spec)())
+        .find(|spec| Some(spec.arch) == arch && name.starts_with(&format!("{}-", spec.stem)))
+    {
+        return Ok(spec);
+    }
     arch.and_then(registry::fixture_spec).ok_or_else(|| {
         let known: Vec<&str> = registry::FIXTURE_SPECS
             .iter()
@@ -352,7 +405,7 @@ fn print_files(what: &str, p: &FilePlan) -> Res<u64> {
 
 fn plan(source: &str, a: &Args) -> Res<()> {
     let split = open(source)?;
-    let spec = spec_of(&split, source)?;
+    let spec = spec_of(&split, source, a.profile.as_deref())?;
     let opts = a.options(&spec);
     let draft = a.draft.as_deref().map(open).transpose()?;
     let p = fixture::plan(&spec, &split, draft.as_ref(), &opts)?;
@@ -406,7 +459,7 @@ fn peak_rss_kib() -> i64 {
 
 fn generate(source: &str, out: &str, a: &Args) -> Res<()> {
     let split = open(source)?;
-    let spec = spec_of(&split, source)?;
+    let spec = spec_of(&split, source, a.profile.as_deref())?;
     let opts = a.options(&spec);
     let draft = a.draft.as_deref().map(open).transpose()?;
     println!(
@@ -471,7 +524,16 @@ fn fetch(target: &str, out: &str, a: &Args) -> Res<()> {
         )
         .into());
     }
-    let (r, rev) = match registry::fixtures().find(|s| s.family == target) {
+    // A profile fixture is fetched from its architecture's row's source, under its own spec.
+    let profile = registry::PROFILE_FIXTURES
+        .iter()
+        .find(|p| p.family == target)
+        .map(|p| p.profile);
+    let row_family = profile
+        .and_then(registry::profile_fixture)
+        .and_then(|p| registry::fixture_of(p.arch))
+        .map_or(target, |row| row.family);
+    let (r, rev) = match registry::fixtures().find(|s| s.family == row_family) {
         Some(s) => (
             RepoRef {
                 repo: s.repo.to_string(),
@@ -513,7 +575,7 @@ fn fetch(target: &str, out: &str, a: &Args) -> Res<()> {
     tmp.push(format!(".fetch.{}", std::process::id()));
     let tmp = PathBuf::from(tmp);
     std::fs::create_dir(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
-    let done = fetch_into(&r, &rev, out, a, &tmp);
+    let done = fetch_into(&r, &rev, out, a, profile, &tmp);
     match (done, std::fs::remove_dir_all(&tmp)) {
         (done, Ok(())) => done,
         (Ok(()), Err(e)) => Err(format!("remove {}: {e}", tmp.display()).into()),
@@ -522,7 +584,14 @@ fn fetch(target: &str, out: &str, a: &Args) -> Res<()> {
 }
 
 /// The body of [`fetch`], the sparse sources under `tmp`.
-fn fetch_into(r: &RepoRef, rev: &str, out: &str, a: &Args, tmp: &Path) -> Res<()> {
+fn fetch_into(
+    r: &RepoRef,
+    rev: &str,
+    out: &str,
+    a: &Args,
+    profile: Option<&str>,
+    tmp: &Path,
+) -> Res<()> {
     let client = Client::new(tmp.to_path_buf())?;
     if client.offline {
         return Err(RemoteError::Offline.into());
@@ -553,7 +622,7 @@ fn fetch_into(r: &RepoRef, rev: &str, out: &str, a: &Args, tmp: &Path) -> Res<()
         "fixture: fetch source header sha256={}",
         fixture::header_sha256(&split)
     );
-    let spec = spec_of(&split, &first)?;
+    let spec = spec_of(&split, &first, profile)?;
     let row = registry::fixture_of(spec.arch)
         .ok_or_else(|| format!("{first}: the {} family has no fixture row", spec.arch))?;
     let mut draft_path: Option<String> = None;
@@ -656,7 +725,7 @@ fn verify(first: &str, a: &Args) -> Res<()> {
         return verify_folder(path.parent().unwrap_or(Path::new(".")), a);
     }
     let fx = open(first)?;
-    let spec = spec_of(&fx, first)?;
+    let spec = spec_of(&fx, first, a.profile.as_deref())?;
     let source = a.source.clone().unwrap_or_else(spec.default_source);
     verify_fixture(first, &fx, &spec, &source, a.draft_source.as_deref())
 }
@@ -920,7 +989,7 @@ fn variant_check(variant: &str, a: &Args) -> Res<()> {
     let row = variant_row(a)?;
     let source = a.source.as_deref().ok_or("variant-check needs --source")?;
     let (src, var) = (open(source)?, open(variant)?);
-    let spec = spec_of(&src, source)?;
+    let spec = spec_of(&src, source, None)?;
     let mut line = |l: &str| println!("{l}");
     let s = fixture::variant_check(&row, &src, &var, spec.card_budget, &mut line)?;
     println!(
@@ -947,7 +1016,7 @@ fn variant_budget(variant: &str) -> Res<()> {
                     model::fixture::KEY_VARIANT
                 )
             })?;
-        (tag, spec_of(&var, variant)?)
+        (tag, spec_of(&var, variant, None)?)
     };
     let r = fixture::rebudget(&spec, Path::new(variant), None)
         .map_err(|e| format!("variant {tag}: {e}"))?;
@@ -976,7 +1045,7 @@ fn variant_budget(variant: &str) -> Res<()> {
 /// and the r8 sidecar's record of the headers that moved; `given` replaces the plan. The closing
 /// line names each of the three, and what was absent.
 fn rebudget(first: &str, given: Option<u64>) -> Res<()> {
-    let spec = spec_of(&open(first)?, first)?;
+    let spec = spec_of(&open(first)?, first, None)?;
     let r = fixture::rebudget(&spec, Path::new(first), given)?;
     let how = match r.chosen {
         BudgetChosen::Fixed => "the family's budget is fixed: kept",
@@ -1004,6 +1073,179 @@ fn rebudget(first: &str, given: Option<u64>) -> Res<()> {
         r.was,
         r.now
     );
+    Ok(())
+}
+
+/// One fixture `reach` holds real headers against: its directory, its spec and its source's
+/// first shard.
+struct ReachFixture {
+    dir: &'static str,
+    spec: FixtureSpec,
+    source: String,
+}
+
+/// The GGUF fixtures of the row whose strings include `arch`: the row's own and its profiles'.
+fn reach_fixtures(arch: &str) -> Vec<ReachFixture> {
+    let Some(row) = registry::row_of(arch) else {
+        return Vec::new();
+    };
+    let canonical = row.canonical();
+    let Some(own) = registry::fixture_of(canonical) else {
+        return Vec::new();
+    };
+    let with = |dir: &'static str, spec: FixtureSpec| ReachFixture {
+        dir,
+        source: (spec.default_source)(),
+        spec,
+    };
+    let mut out: Vec<ReachFixture> = registry::fixture_spec(canonical)
+        .map(|spec| with(own.family, spec))
+        .into_iter()
+        .collect();
+    out.extend(
+        registry::PROFILE_FIXTURES
+            .iter()
+            .filter(|p| p.arch == canonical)
+            .map(|p| with(p.family, (p.spec)())),
+    );
+    out
+}
+
+/// `reach` and `reach-check` (`model::arch::coverage::reach`): every census stub set of
+/// `tools/census/stubs.tsv` under the stub root (`--root`, else `refset::census::ROOT`), and every
+/// GGUF fixture's own source, held against each fixture of its architecture, the fixture planned
+/// from its source's header (the spec's default source: the file the fixture is generated from).
+/// A pair's real header is named `census/<set>` or `source/<fixture dir>`. `reach` prints the
+/// table rows on stdout (`tools/kcover/unreached.tsv`'s format, no header); `reach-check` holds
+/// them to the table (`--table`, else the repo's) and fails on any difference, naming each.
+/// Status lines go to stderr: a stub or a source not on this machine, an architecture with no
+/// GGUF fixture and a file its reader refuses are each a named skip, and the closing line counts
+/// the pairs, the rows, the skips and the census rows of pairs not computed here.
+fn reach(a: &Args, check: bool) -> Res<()> {
+    use model::arch::coverage::reach::{self as kreach, Reach, Row, check_rows, parse_table};
+    use std::collections::HashMap;
+
+    let root = PathBuf::from(
+        a.root
+            .clone()
+            .unwrap_or_else(|| refset::census::ROOT.to_string()),
+    );
+    let manifest = refset::census::Manifest::read(Path::new(refset::census::MANIFEST))?;
+    let table_path = a.table.clone().unwrap_or_else(|| kreach::TABLE.to_string());
+    let table_text =
+        std::fs::read_to_string(&table_path).map_err(|e| format!("{table_path}: {e}"))?;
+    let table = parse_table(&table_text)?;
+    let variants = fixture::variant_parse_table(
+        &std::fs::read_to_string(VARIANT_TABLE).map_err(|e| format!("{VARIANT_TABLE}: {e}"))?,
+    )?;
+
+    // The real headers: each present stub set, then each fixture's present source.
+    let mut reals: Vec<(String, String)> = Vec::new();
+    let mut skipped = 0usize;
+    for set in manifest.sets() {
+        let name = format!("census/{}", set.name());
+        let first = set.check(&root);
+        match first {
+            Ok(first) => reals.push((name, first.to_string_lossy().into_owned())),
+            Err(e) if !set.paths(&root)[0].exists() => {
+                eprintln!("fixture: reach skip {name}: not on this machine ({e})");
+                skipped += 1;
+            }
+            Err(e) => return Err(format!("{name}: {e}").into()),
+        }
+    }
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for row in registry::ROWS {
+        for f in reach_fixtures(row.canonical()) {
+            if Path::new(&f.source).exists() {
+                sources.push((format!("source/{}", f.dir), f.source));
+            } else {
+                eprintln!(
+                    "fixture: reach skip source/{}: {} is not on this machine",
+                    f.dir, f.source
+                );
+                skipped += 1;
+            }
+        }
+    }
+    reals.extend(sources);
+
+    let mut cache: HashMap<&'static str, Result<Reach, String>> = HashMap::new();
+    let (mut pairs, mut rows, mut differ) = (0usize, 0usize, Vec::new());
+    let mut computed: Vec<(String, String)> = Vec::new();
+    for (name, first) in &reals {
+        let split = open(first)?;
+        let arch = split.architecture().unwrap_or("<missing>").to_string();
+        let fixtures = reach_fixtures(&arch);
+        if fixtures.is_empty() {
+            eprintln!("fixture: reach skip {name}: architecture {arch} has no GGUF fixture");
+            skipped += 1;
+            continue;
+        }
+        let real = match model::arch::spec(&split) {
+            Ok(real) => real,
+            Err(e) => {
+                eprintln!("fixture: reach skip {name}: the reader refuses it: {e}");
+                skipped += 1;
+                continue;
+            }
+        };
+        for f in fixtures {
+            let reach = cache.entry(f.dir).or_insert_with(|| {
+                if !Path::new(&f.source).exists() {
+                    return Err(format!("its source {} is not on this machine", f.source));
+                }
+                let source =
+                    Split::open(&f.source).map_err(|e| format!("open {}: {e}", f.source))?;
+                Reach::of(f.dir, &f.spec, &source).map_err(|e| e.to_string())
+            });
+            let reach = match reach {
+                Ok(reach) => reach,
+                Err(e) => {
+                    eprintln!("fixture: reach skip {} against {name}: {e}", f.dir);
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let gaps = reach.gaps(&real, &variants)?;
+            let found = gaps.len();
+            pairs += 1;
+            rows += found;
+            computed.push((f.dir.to_string(), name.clone()));
+            if check {
+                differ.extend(check_rows(&table, f.dir, name, &gaps));
+            } else {
+                for gap in gaps {
+                    let row = Row {
+                        fixture: f.dir.to_string(),
+                        real: name.clone(),
+                        gap,
+                    };
+                    println!("{}", row.line());
+                }
+            }
+            eprintln!("fixture: reach {} against {name}: {found} rows", f.dir);
+        }
+    }
+    let unchecked = table
+        .iter()
+        .filter(|r| !r.real.starts_with("tests/"))
+        .filter(|r| {
+            !computed
+                .iter()
+                .any(|(f, n)| *f == r.fixture && *n == r.real)
+        })
+        .count();
+    eprintln!(
+        "fixture: reach done pairs={pairs} rows={rows} skipped={skipped} unchecked={unchecked} \
+         (table rows of pairs not computed here)"
+    );
+    if !differ.is_empty() {
+        for d in &differ {
+            eprintln!("fixture: reach-check {d}");
+        }
+        return Err(format!("{} rows differ from {table_path}", differ.len()).into());
+    }
     Ok(())
 }
 

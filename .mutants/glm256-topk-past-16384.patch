@@ -1,0 +1,19 @@
+# glm256 mutant topk-past-16384: the top-k's launch clamped at the old oracle bound
+# clause: 9 `ik select` on the d256kdsa sets (gate_glm_sel.rs, FIXTURE_SETS / the real loop)
+# site: crates/gpu/src/qsa.rs enqueue_topk_high — the launch's `ctx` (the cache the top-k scans,
+#   pools_for(ctx) pools) capped at 16,384 positions: a context past the old bound sees only its
+#   first 4,096 pools, so the list is cut from the wrong scores there and right at or under it.
+# expected red (fixture tier): "ik select fx_ref_glm5next_d256kdsa layer <L>: ... FAIL" — the
+#   `exact` term (our list = ik's cells) — while the fx d3kdsa and fx d16kdsa clauses stay green.
+# base green first; applied alone, gate run, reversed (tree clean after).
+diff --git a/crates/gpu/src/qsa.rs b/crates/gpu/src/qsa.rs
+--- a/crates/gpu/src/qsa.rs
++++ b/crates/gpu/src/qsa.rs
+@@ -2277,6 +2277,7 @@ impl QsaKernels {
+         a: TopkHighArgs<'_>,
+     ) -> Result<(), GpuError> {
+         let what = "qsa::enqueue_topk_high";
++        let a = TopkHighArgs { ctx: a.ctx.min(16_384), ..a };
+         let pools = pools_for(a.ctx);
+         let width = list_width(a.kept);
+         if a.m == 0 || a.kept == 0 || a.ctx == 0 {

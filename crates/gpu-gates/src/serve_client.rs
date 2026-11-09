@@ -14,7 +14,8 @@
 //! file held to its digest and sent as base64 ([`gguf::digest::sha256_file`], [`base64`]) and the
 //! prefix clauses of a seat that keeps a shared prefix
 //! ([`edit_and_extension`]) and of one whose prompt cache holds a saved
-//! state's checkpoints ([`prefix_restore`]).
+//! state's checkpoints ([`prefix_restore`]), and the card-byte invariant's arm every seat gate
+//! runs on a server planned at the model's limit ([`card_bytes_hold_at_max_ctx`]).
 
 use std::fs::File;
 use std::io::Write;
@@ -25,6 +26,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::record::{self, Kind, Log, Record};
+use crate::tier::{self, Tag};
 use crate::{GateError, die_with_parent, verdict};
 
 /// An image file's bytes as the base64 a `data:` URL carries.
@@ -1452,6 +1454,140 @@ pub fn repeated_ids(
     }
     ids.truncate(len);
     Ok(ids)
+}
+
+/// The fixed text the prefix clause's prompts open with and the max-ctx arm repeats to its rows:
+/// long enough that a question sits past a page of ids, short enough that the prompts stay well
+/// under half of every seat's context.
+pub const PREFIX_TEXT: &str = "The harbour office kept the keeper's ledger beside its maps: every \
+                               ship that passed the point, the wind, the tide and the names she \
+                               read through the glass, one page an evening for forty years. The \
+                               clerks still open the ledger first when a fishing boat asks about \
+                               the weather before dawn, and the newest page carries the same \
+                               square hand as the oldest.";
+
+/// The max-ctx arm's clause name.
+pub const MAX_CTX: &str = "card_bytes_hold_at_max_ctx";
+
+/// The max-ctx arm's prompt, in ids, where the seat prints no `prompt pass` record.
+const MAX_CTX_IDS: usize = 512;
+
+/// Polls of a second that bound the wait for the max-ctx server to listen: a cold load of the
+/// whole host set.
+const MAX_CTX_POLLS: usize = 1000;
+
+/// What a seat's gate gives the max-ctx arm ([`card_bytes_hold_at_max_ctx`]).
+pub struct MaxCtx<'a> {
+    /// The directory the arm's server writes its `server.out` and `server.err` to.
+    pub dir: &'a Path,
+    /// The record kinds the seat's server prints (its binary's registered list).
+    pub kinds: &'static [&'static Kind],
+    /// The seat's listening record, which names the context it planned.
+    pub listening: &'static Kind,
+}
+
+/// `card_bytes_hold_at_max_ctx`, the one owner of the card-byte invariant's arm: a server given
+/// no `--ctx` and no `BLOOMERY_CARD_BUDGET` plans its one slot at the model's limit on the whole
+/// card, fitted down only where that plan is short (`placement::ctx_ask`), loads, answers one
+/// prompt of the prompt pass's rows (the `prompt pass` record's `rows`; [`MAX_CTX_IDS`] where
+/// the seat prints none) and one step after it, and prints the invariant's three readings:
+/// exactly one `card bytes` record at each of `load`, `first-prompt` and `first-step`, each
+/// `within` its plan, and no `card unmeasured` record. A reading missing, past or unmeasured is
+/// red, and the line names its phase; where the gate holds the card (`BLOOMERY_CARD_HELD`) a past
+/// reading also ends the server's call by name, and the line is that refusal.
+///
+/// `spawn` gives the seat's server command (its levers set) and its arguments after the program,
+/// `--port 0` among them and no `--ctx`; the arm removes `BLOOMERY_CARD_BUDGET` from the command.
+/// `clause` names the arm's line, so a gate that runs it on more than one server tells them apart.
+/// The arm is [`Tag::SelfConsistency`]: it compares the run with its own plan on any file. The
+/// result is whether the clause held (`true` where the tier does not run it).
+///
+/// FAIL-first: a plan that leaves a term out of its card's count
+/// (`.mutants/kbytes-term-dropped.patch`) reads `past` at `load`; one that leaves a prompt chunk's
+/// attention buffers out of the GLM plan's reserve
+/// (`.mutants/glm256fix-reserve-without-attn.patch`) reads `past` at `first-prompt`; a seat whose
+/// drafted prompt or verify call skips the session's reading (`.mutants/kcover4b-*.patch`) reads no
+/// record at that phase.
+pub fn card_bytes_hold_at_max_ctx(
+    clause: &str,
+    at: &MaxCtx<'_>,
+    spawn: impl FnOnce() -> Result<(Command, Vec<String>), GateError>,
+) -> Result<bool, GateError> {
+    if !tier::run_clause(clause, Tag::SelfConsistency)? {
+        return Ok(true);
+    }
+    let mut ok = true;
+    check(&mut ok, clause, max_ctx_server(clause, at, spawn)?);
+    Ok(ok)
+}
+
+/// The arm's server, its one request and its readings: whether every phase read once, within.
+fn max_ctx_server(
+    clause: &str,
+    at: &MaxCtx<'_>,
+    spawn: impl FnOnce() -> Result<(Command, Vec<String>), GateError>,
+) -> Result<bool, GateError> {
+    std::fs::create_dir_all(at.dir)?;
+    let (mut cmd, args) = spawn()?;
+    cmd.env_remove(bloomery_levers::CARD_BUDGET);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut s = Served::spawn_cmd(cmd, &args, at.dir)?;
+    let err_log = at.dir.join("server.err");
+    let addr = match s.address(&err_log, MAX_CTX_POLLS, Duration::from_secs(1)) {
+        Ok(addr) => addr,
+        Err(e) => {
+            println!("{clause}: the server never listened: {e}");
+            return Ok(false);
+        }
+    };
+    let url = |p: &str| format!("http://{addr}{p}");
+    let records = server_log(&err_log, at.kinds)?;
+    let ctx = records.one(at.listening)?.u64("ctx")?;
+    let prints_pass = at
+        .kinds
+        .iter()
+        .any(|k| std::ptr::eq(*k, &record::PROMPT_PASS));
+    let pass = if prints_pass {
+        records.first(&record::PROMPT_PASS)?
+    } else {
+        None
+    };
+    let rows = match pass {
+        Some(pass) => usize::try_from(pass.u64("rows")?)?,
+        None => MAX_CTX_IDS,
+    };
+    let ids = repeated_ids(&url, PREFIX_TEXT, rows)?[..rows].to_vec();
+    let asked = greedy(&url, ids, 2, at.dir, "max_ctx", false);
+    println!("server stopped: {}", s.stop()?);
+    if let Err(e) = asked {
+        println!("{clause}: the prompt of {rows} ids and its step at ctx {ctx}: {e}");
+        return Ok(false);
+    }
+    let records = server_log(&err_log, at.kinds)?;
+    let mut held = true;
+    for phase in ["load", "first-prompt", "first-step"] {
+        let here: Vec<_> = records
+            .all(&record::CARD_BYTES)?
+            .into_iter()
+            .filter(|r| r.word("phase").is_ok_and(|p| p == phase))
+            .collect();
+        let within = match here.as_slice() {
+            [one] => one.word("verdict")? == "within",
+            _ => false,
+        };
+        println!(
+            "{clause}: ctx {ctx}, a prompt of {rows} ids: {} card bytes record(s) at {phase} {:?}, \
+             within {within}",
+            here.len(),
+            here.iter().map(|r| r.line().to_owned()).collect::<Vec<_>>()
+        );
+        held &= within;
+    }
+    let unmeasured = records.all(&record::CARD_UNMEASURED)?;
+    for u in &unmeasured {
+        println!("{clause}: {}", u.line());
+    }
+    Ok(held && unmeasured.is_empty())
 }
 
 /// A shared prefix restores from the host cache: A of `t.a_len` ids is

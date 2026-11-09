@@ -1,0 +1,15 @@
+# kcover26 mutant mimo2-kinds-kv
+# clause: each planned fixture reads through its family's kind check as its source's cut (kcover_each_planned_fixture_is_its_cut)
+# site: mimo2 check_kinds wants the source's 48 KV-head counts, not the map's
+# run: cargo test -p bloomery-model --test kcover kcover_each_planned_fixture_is_its_cut
+# red (rc=101): mimo2: the fixture's the hyperparameters: Hparams { n_layer: 2, n_trunk: 2, n_embd: 4096, n_head: 64, kv_heads: [4, 8], head_k: 192, head_v: 128, window: 128, kinds: [Full, Swa], rope_dims: 64, rope_base: 10000000.0, rope_base_swa: 10000.0, value_scale: 0.707, rms_eps: 1e-6, n_ctx_train: 1048576, n_vocab: 152576, n_expert: 256, n_used: 8, expert_ff: 2048, dense_ff: Some(16384), weights_scale: 1.0, defaults: ["nextn_predict_layers = 0 (absent)", "expert_weights_scale = 1 (absent, no scale node)"] }, the cut's Hparams { n_layer: 2, n_trunk: 2, n_embd: 4096, n_head: 64, kv_heads: [4, 8, 8, 8, 8, 4, 8, 8, 8, 8, 8, 4, 8, 8, 8, 8, 8, 4, 8, 8, 8, 8, 8, 4, 8, 8, 8, 8, 8, 4, 8, 8, 8, 8, 8, 4, 8, 8, 8, 8, 8, 4, 8, 8, 8, 8, 8, 4], head_k: 192, head_v: 128, window: 128, kinds: [Full, Swa], rope_dims: 64, rope_base: 10000000.0, rope_base_swa: 10000.0, value_scale: 0.707, rms_eps: 1e-6, n_ctx_train: 1048576, n_vocab: 152576, n_expert: 256, n_used: 8, expert_ff: 2048, dense_ff: Some(16384), weights_scale: 1.0, defaults: ["nextn_predict_layers = 0 (absent)", "expert_weights_scale = 1 (absent, no scale node)"] }
+--- a/crates/model/src/arch/mimo2/fixture.rs
++++ b/crates/model/src/arch/mimo2/fixture.rs
+@@ -215,7 +215,6 @@
+     let want = Hparams {
+         n_layer: spec.layers.len(),
+         n_trunk: spec.layers.len(),
+-        kv_heads: at(&src.kv_heads),
+         kinds: spec.layers.iter().map(|&l| src.kinds[l]).collect(),
+         ..src.clone()
+     };

@@ -1,0 +1,11 @@
+--- a/crates/placement/src/placement/card_made.rs
++++ b/crates/placement/src/placement/card_made.rs
+@@ -152,7 +152,7 @@
+             "an integrated device: its free reading is the host's room, not the card's".to_owned(),
+         );
+     }
+-    spec.held_by.map(|held| {
++    spec.held_by.filter(|_| false).map(|held| {
+         format!("other processes hold the device ({held}), and the reading is the device's")
+     })
+ }

@@ -1,0 +1,16 @@
+# kcover R4b mutant q38-unwatched: the Qwen3.8 seat opens its session with no watch
+# effect: the seat prints no `card bytes` record at all
+# expected red: Qwen3.8 plain and drafted max-ctx arms: "0 card bytes record(s) at load", "... at first-prompt", "... at first-step", each within false
+# not run on the Mac (device crates); the lead runs it on the box, base green first, reversed after.
+--- a/crates/gpu-gates/src/bin/shared/serve_seats/qwen38.rs
++++ b/crates/gpu-gates/src/bin/shared/serve_seats/qwen38.rs
+@@ -2969,8 +2969,7 @@
+         // Every prompt call copies the recurrent stores at its marks: the
+         // checkpoints a later request's cut and a saved state come from.
+         m.body_parts(WHAT)?.2.set_checkpoints(true);
+-        let mut s = app::Session::from_model(m, u32::try_from(a.ctx)?)
+-            .watched(bloomery_gpu_gates::card_bytes::watch()?)?;
++        let mut s = app::Session::from_model(m, u32::try_from(a.ctx)?);
+         let residency = a.residency != Residency::Off;
+         if residency {
+             // A request's passes are not known at load: the log grows as it

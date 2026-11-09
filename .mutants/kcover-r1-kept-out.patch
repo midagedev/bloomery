@@ -1,0 +1,18 @@
+# kcover mutant r1-kept-out
+# clause: R1, a family gate's chain is kept out of every other family's own files (a seat of the one-binary server, a tower the
+#   image crate's lib dispatches to), so a tower kernel is its tower's family's launch alone (tools/gate_class.py read_kernel_reach)
+# site: tools/gate_class.py read_kernel_reach, kept_out empty: the static reach through crates/gpu-vision/src/lib.rs's Tower
+#   dispatch and the seat registry holds every vision kernel for every tower gate
+# expected red: "gate_class self-test FAIL: read_kernel_reach: crates/gpu-vision/src/pos_half.rs is launched by the gates of
+#   ['nemotron_h'] alone: [... 'glm5next', ...]" from `python3 tools/gate_class.py --self-test` (rc 1)
+--- a/tools/gate_class.py
++++ b/tools/gate_class.py
+@@ -432,7 +432,7 @@
+         row = tables.gates.get(n)
+         if row is None or row.cls != "family":
+             continue
+-        kept_out = frozenset(every - files[row.family] - set(kernels))
++        kept_out = frozenset()
+         held = reach.gate_files_kept_out(graph, n, kept_out)
+         for f in kernels:
+             if f in held:

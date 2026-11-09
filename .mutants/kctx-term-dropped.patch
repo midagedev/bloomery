@@ -1,0 +1,11 @@
+--- a/crates/placement/src/placement/table.rs
++++ b/crates/placement/src/placement/table.rs
+@@ -150,7 +150,7 @@
+             ("stage_rows", self.stage_rows_bytes),
+             ("scratch", self.scratch_bytes),
+             ("context", self.context_bytes),
+-            ("reserves", self.reserve_bytes),
++            ("reserves", 0),
+         ]
+     }
+ 

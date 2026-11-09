@@ -927,7 +927,7 @@ Structured output is served for `response_format` of type `json_schema` or `json
   Another aarch64 machine builds from source with `BLOOMERY_ARCH` setting the CUDA arch. The AVX2 kernels are x86-64
   only; a quant type without an aarch64 kernel runs through a scalar mirror there.
 - **One model a server**, and one expert tier card at most (`--place bp`).
-- **GLM-5.3** holds at most 16,384 positions a slot: a `--ctx-size` whose slot share passes it is refused at start,
+- **GLM-5.3** holds at most 262,144 positions a slot: a `--ctx-size` whose slot share passes it is refused at start,
   and a longer prompt answers `exceed_context_size_error`.
 - **Kimi K3.1 Pro** loads at `--place bp` only, one slot. Past the lightning indexer's top-k (2,048 positions) the latent
   layers attend the rows the indexer picks, so `--ctx-size` is not held to the top-k. The seat runs a

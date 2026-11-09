@@ -1,0 +1,23 @@
+# Round glm256: ik's CPU node dump d256kdsa of the GLM-5.3-Flash UD-Q4_K_XL split set (six shards, 199,707,321,347 B):
+# a quiet prefill of the first 262,142 ids of corpus-prose-all.ids, then one decode step at position 262,142 with
+# --dsa, -c 262144 (tools/ref/models/glm5next.sh), the set gate-gpu-glm-sel reads to hold ORACLE_POSITIONS 262,144.
+# `just dump-ref-glm5next d256kdsa` under this card, BLOOMERY_DUMP_BOUND=21600. The wall is populate + prefill + step +
+# write, in turn; the prefill is the term this dump fixes (no long GLM prefill has been timed on this box).
+# Minutes [derived]:
+#   populate  cold 2.5-3.1 min (glmref-dump.card's 1.07-1.33 GB/s single stream), warm < 0.5 min.
+#   prefill   the memo's 1.15 TFLOP for 32 tokens is ~36 GFLOP a token, so 262,142 ids are ~9.4 PFLOP; ik's CPU
+#             prefill on 32 cores at an effective 0.6-2.0 TFLOP/s is 78-260 min. DSA's indexer scans every earlier
+#             key once a token: ~262,142^2/2 x 4,096 MAC x 2 = ~0.28 PFLOP, under 5 % of the matmuls.
+#   step      one token at depth 262,142 with --dsa: under a minute; write: the nodes, under a minute.
+#   80-265 min in all.
+kind: exclusive
+reason: dump_ref runs ik on 32 CPU threads for hours and populates the whole 199.7 GB split set into the page cache;
+  beside a timed run or a gate batch it would take their cores, memory bandwidth and cache, so it holds the lease;
+  why now: the glm256 landing needs the set (gate-gpu-glm-sel's 262,142 case) and the box is otherwise idle
+minutes: 80..265
+# Outcome (2026-11-09 15:40 KST, lead): stopped at 2 h 10 min of prefill, no set written. The fixture's d256kdsa dump
+# (7 layers, the same widths, the same ids) had taken 7,836 s, its route rows' times quadratic in the position
+# (10 % in 115 s, 50 % in 2,334 s): attention, not the matmuls the prediction priced, is the term. Scaled to the real
+# file's 46 layers that is ~14 h [derived], past the 6 h bound. The prediction's miss: the prefill term left out the
+# O(n^2) attention of the dense prefill. User's call: the 262k check stays on the fixture set; the real recipe refuses
+# d256kdsa by name.

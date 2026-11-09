@@ -1,0 +1,16 @@
+# kcover26 mutant pin
+# clause: the diff names a type pin on each side
+# site: classes() records no Pin
+# run: cargo test -p bloomery-model --test kcover kcover_diff_names_each_kind
+# red (rc=101): a pin edit: real side {}, fixture side {}, want {Pin} on each
+--- a/crates/model/src/arch/coverage/reach.rs
++++ b/crates/model/src/arch/coverage/reach.rs
+@@ -108,7 +108,7 @@
+         let ty =
+             t.ty.name()
+                 .map_or_else(|| format!("type {}", t.ty.as_u32()), str::to_string);
+-        add(ClassKind::Pin, format!("{s} {ty}"));
++        let _ = ty;
+         if let [rows_of, rows, ..] = t.dims[..] {
+             add(ClassKind::Width, format!("{s} {rows_of}x{rows}"));
+         }

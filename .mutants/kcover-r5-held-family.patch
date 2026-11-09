@@ -1,0 +1,16 @@
+# kcover mutant r5-held-family
+# clause: R5, `rotation.py check` names a family whose gates are all held instead of dropping it (tools/rotation.py cmd_check)
+# site: tools/rotation.py cmd_check, the held families' loop reads no gate
+# expected red: "rotation self-test FAIL: check: a family whose gates are all held is named, not dropped" from
+#   `python3 tools/rotation.py --self-test` (rc 1)
+--- a/tools/rotation.py
++++ b/tools/rotation.py
+@@ -736,7 +736,7 @@
+             print(f"RED  {fam}: {len(gs)} gate(s), {when}; none is newer than {days_text(args.days) if args.days is not None else f'{min(g.days for g in gs)} d'}: "
+                   f"{' '.join(g.name for g in gs[:8])}" + (" …" if len(gs) > 8 else ""))
+     counted = {fam for fam, _, _, _ in check_families(gates, last, now, args.days)}
+-    for fam, gs, _, _ in check_families([g for g in every if g.held], {}, now, args.days):
++    for fam, gs, _, _ in check_families([], {}, now, args.days):
+         if fam not in counted:
+             print(f"held {fam}: {len(gs)} gate(s), each a real-tier gate of an other family with a fixture, owed only on its family's own "
+                   f"change or by name (`due --real`), so no date holds it: {' '.join(g.name for g in gs[:8])}" + (" …" if len(gs) > 8 else ""))

@@ -31,11 +31,12 @@ bloomery-os.workspace = true
 # The GLM name map reads a Hugging Face checkpoint's config.json.
 serde_json = "=1.0.151"
 thiserror = { workspace = true }
+# The `fixture` bin's `reach` reads the census stubs' manifest, and its budget gate the fixture
+# root, through the reference-set reader.
+bloomery-refset = { path = "../refset" }
 
 [dev-dependencies]
 # The GLM name map's tests read the hf crate's gzipped checkpoint fixtures.
 flate2 = "1.1.10"
 # The fixture test holds a written file to the digest of its bytes.
 sha2 = { workspace = true }
-# The `fixture` bin's budget gate reads the fixture root through the reference-set reader.
-bloomery-refset = { path = "../refset" }

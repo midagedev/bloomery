@@ -1,0 +1,14 @@
+# kcover R4b mutant session-prompt-unread: Session::prompt_call takes no first-prompt reading
+# effect: a plain prompt call prints no record at first-prompt
+# expected red: V4.1 max-ctx arm (V41::prompt_call through Session::prompt_call): "0 card bytes record(s) at first-prompt [], within false"; also the GLM and Qwen3.8 plain arms (SlotDrafts::prefill_by calls Session::prompt_call there)
+# not run on the Mac (device crates); the lead runs it on the box, base green first, reversed after.
+--- a/crates/app/src/lib.rs
++++ b/crates/app/src/lib.rs
+@@ -1290,7 +1290,6 @@
+         self.idle("prompt")?;
+         let _busy = self.model.prompt_busy();
+         let out = B::prompt_call(&mut self.model, ids, end)?;
+-        self.card_check(CardPhase::FirstPrompt)?;
+         Ok(out)
+     }
+ }

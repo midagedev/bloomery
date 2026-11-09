@@ -1,0 +1,17 @@
+# kcover mutant r5-affected-held
+# clause: R5, `affected` holds from its real-tier owed block only an other family's gate that has a fixture and was kept by
+#   representative reach alone (tools/recipes.py fixture_held)
+# site: tools/recipes.py fixture_held, the fixture condition dropped: an other family with no fixture is held too
+# expected red: "FAIL: owed: only an other family with a fixture kept by reach alone is held to the fixture tier" from the
+#   recipes self-test's owed section (`python3 tools/recipes.py --self-test`, its part holding owed_self_test) (rc 1)
+--- a/tools/recipes.py
++++ b/tools/recipes.py
+@@ -16235,7 +16235,7 @@
+         if row is None or row.cls != "family":
+             continue
+         fam = tables.families[row.family]
+-        if fam.tier == "other" and fam.fixture and why.startswith(f"class: {row.family} {REP_REACH} "):
++        if fam.tier == "other" and why.startswith(f"class: {row.family} {REP_REACH} "):
+             out[n] = f"{row.family} is an other family with a fixture, kept by its representative reach alone: the fixture tier runs it"
+     return out
+ 

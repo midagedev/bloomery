@@ -318,8 +318,8 @@ mod gate {
     use bloomery_gpu_gates::prompts::MARGIN_FLOOR;
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::serve_client::{
-        self, Served, agree, curl, ids_of, json_of, metric, parse_ids, plan_run, server_log,
-        slot_action, sse_event, sse_events, stop_of,
+        self, MAX_CTX, MaxCtx, Served, agree, card_bytes_hold_at_max_ctx, curl, ids_of, json_of,
+        metric, parse_ids, plan_run, server_log, slot_action, sse_event, sse_events, stop_of,
     };
     use bloomery_gpu_gates::{GateError, checks_failed, data_dir, ref_model_path, verdict};
     use gguf::{Gguf, Split};
@@ -1472,6 +1472,34 @@ mod gate {
             refused.contains("before listening") && refused.contains(&named) && !planned,
         );
         Ok(ok)
+    }
+
+    /// The card-byte invariant at the most context the seat serves
+    /// ([`card_bytes_hold_at_max_ctx`]): [`SERVER_ARGS`] less its `--ctx`, so the seat plans its
+    /// one slot at the model's limit (`KERNEL_POSITIONS`, fitted down where the gate card is
+    /// short), and no draft (unset). FAIL-first: a plan that leaves a term out of its card's
+    /// count (`.mutants/kbytes-term-dropped.patch`) reads `past` at `load`; a prompt or step the
+    /// session does not read (`.mutants/kcover4b-session-step-unread.patch`) leaves its phase with
+    /// no record.
+    fn card_bytes_at_max_ctx(a: &Args) -> Result<bool, GateError> {
+        let own = a.dir.join("max-ctx");
+        card_bytes_hold_at_max_ctx(
+            MAX_CTX,
+            &MaxCtx {
+                dir: &own,
+                kinds: record::BLOOMERY_SERVE_DS41,
+                listening: &record::LISTENING,
+            },
+            || {
+                Ok((
+                    Command::new(Served::exe()?),
+                    SERVER_ARGS[..8]
+                        .iter()
+                        .map(|arg| (*arg).to_owned())
+                        .collect(),
+                ))
+            },
+        )
     }
 
     /// The `ctx` clause (module header): a server with no `--ctx` (one slot,
@@ -3535,6 +3563,7 @@ mod gate {
         ok &= ctx_default(&a, &place)?;
         ok &= slots(&a)?;
         ok &= slots_refuse_dspark(&a)?;
+        ok &= card_bytes_at_max_ctx(&a)?;
         if ok {
             println!("weekly-gpu-ds41-serve: PASS");
             Ok(())
