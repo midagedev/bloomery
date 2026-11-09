@@ -128,7 +128,16 @@ mod glm5next_tier;
 mod quiet;
 
 #[cfg(feature = "glm5next")]
+#[allow(
+    dead_code,
+    reason = "the shared runner serves several gates; each takes the helpers it reads"
+)]
+#[path = "shared/e2e.rs"]
+mod e2e;
+
+#[cfg(feature = "glm5next")]
 mod gate {
+    use crate::e2e::rel;
     use std::time::Instant;
 
     use app::Session;
@@ -417,20 +426,6 @@ mod gate {
             flipped: swap.is_some(),
             rel: r,
         })
-    }
-
-    /// `‖a − b‖ / ‖b‖` in f64; infinite on a NaN or a length mismatch.
-    fn rel(a: &[f32], b: &[f32]) -> f64 {
-        if a.len() != b.len() {
-            return f64::INFINITY;
-        }
-        let (mut num, mut den) = (0.0f64, 0.0f64);
-        for (&x, &y) in a.iter().zip(b) {
-            num += (f64::from(x) - f64::from(y)).powi(2);
-            den += f64::from(y).powi(2);
-        }
-        let r = (num / den.max(f64::MIN_POSITIVE)).sqrt();
-        if r.is_nan() { f64::INFINITY } else { r }
     }
 
     /// The first index of the largest value, and the largest of the rest:
