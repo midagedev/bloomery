@@ -36,6 +36,7 @@ pub mod churn;
 pub mod ctx;
 pub mod ctx_ask;
 pub mod devices;
+pub mod elastic;
 pub mod need_hook;
 pub mod nodes;
 pub mod paged_drop;

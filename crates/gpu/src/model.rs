@@ -68,7 +68,7 @@ use model::placement::workstation::{self, ArenaGrant, HostNeed};
 use model::placement::{ArenaFloor, ExpertList, HeadSite, Plan};
 use model::r8file::R8Source;
 use runtime::costs::Store;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
@@ -965,12 +965,21 @@ impl<B: ChainBody> GpuModel<B> {
         // Under a residency machine, the card's routed stacks the file's blocks fill are rooms
         // (`StackRoom`), so a released tail gives its pages back; a load whose card bytes come
         // from a part source keeps plain buffers.
+        // An elastic load's stacks are reserved for their layer's capacity, the plan's rows
+        // backed and the rest left for the machine's fill.
         let rooms = match (&residency.lever, &bytes) {
             (Residency::Mid { .. }, CardBytes::File) => plan.machine.cards.get(card).map(|spec| {
-                spec.layers
-                    .clone()
-                    .flat_map(|l| residency.stacks.names(l))
-                    .collect::<BTreeSet<String>>()
+                let mut names = BTreeSet::new();
+                let mut capacity = BTreeMap::new();
+                for l in spec.layers.clone() {
+                    for name in residency.stacks.names(l) {
+                        if let Some(c) = residency.stacks.capacity(l) {
+                            capacity.insert(name.clone(), c);
+                        }
+                        names.insert(name);
+                    }
+                }
+                (names, capacity)
             }),
             _ => None,
         };
@@ -2729,7 +2738,7 @@ fn placed_pre(
     host: HostCfg,
     extra: (&[(usize, ExpertList)], u64),
     known: &[(usize, ExpertList)],
-    rooms: Option<BTreeSet<String>>,
+    rooms: Option<(BTreeSet<String>, BTreeMap<String, usize>)>,
     derive: impl FnOnce(&CudaStream, &Split, Range<usize>, &mut Weights) -> Result<(), GpuError>,
 ) -> Result<(PlacedPre, HostResidency), GpuError> {
     let what = "GpuModel::load_placed";
@@ -2777,7 +2786,9 @@ fn placed_pre(
         let t = Instant::now();
         let (mut weights, read) = match bytes {
             CardBytes::File => {
-                let rooms = rooms.map(|names| StackRooms::new(names, gpu.stream_handle()));
+                let rooms = rooms.map(|(names, capacity)| {
+                    StackRooms::new(names, gpu.stream_handle()).with_capacity(capacity)
+                });
                 let w = Weights::load_placed_rooms(
                     gpu.stream(),
                     file,

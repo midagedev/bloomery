@@ -176,7 +176,7 @@ impl<T: DeviceCopy> DerefMut for RoomTensor<T> {
 
 /// What a body's rooms hold of the card's expert stacks after a fit asked them to give bytes
 /// back.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FreedBytes {
     pub bytes: u64,
     /// Slots a layer gave back.

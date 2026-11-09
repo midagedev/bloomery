@@ -69,7 +69,7 @@ use runtime::swaprule::KeptRows;
 use super::HostExperts;
 use super::nvtier::NvTier;
 use super::swap::{
-    BoundaryAt, Freed, MachineCfg, Nvfp4From, PassReport, Piece, ResetReport, Residency,
+    BoundaryAt, Filled, Freed, MachineCfg, Nvfp4From, PassReport, Piece, ResetReport, Residency,
     SwapSource, Transform,
 };
 use super::{HostTier, PassKind};
@@ -100,6 +100,16 @@ pub trait FileStacks: Send + Sync {
     /// builds its map over the run, and the machine's per-layer lists (its
     /// pinned counts) cover the map's layers. `None`: the card's layers.
     fn map_layers(&self) -> Option<usize> {
+        None
+    }
+
+    /// The slots layer `layer`'s card stacks are reserved for when the load is
+    /// elastic: at least the plan's live count, the rest withdrawn until the
+    /// residency machine fills them (`SlotMap::reserve_card`,
+    /// [`crate::room::StackRoom::with_backed`]). `None`: the plan's count, a
+    /// stack that only shrinks.
+    fn capacity(&self, layer: usize) -> Option<usize> {
+        let _ = layer;
         None
     }
 
@@ -227,6 +237,9 @@ pub struct PlanStacks {
     types: Vec<Option<[GgmlType; 3]>>,
     map_layers: Option<usize>,
     unrouted: Vec<usize>,
+    /// Per layer, the slots its card stacks reserve ([`FileStacks::capacity`]);
+    /// empty when the load is not elastic.
+    capacity: Vec<Option<usize>>,
 }
 
 /// The stacks of a hybrid family whose routed layers are one run of `run_len` layers: the common stack names
@@ -294,7 +307,26 @@ impl PlanStacks {
             types,
             map_layers: facts.map_layers,
             unrouted: facts.unrouted,
+            capacity: Vec::new(),
         })
+    }
+
+    /// These stacks with layer `l`'s card stacks reserved for `capacity[l]`
+    /// slots ([`FileStacks::capacity`]): an elastic load's. A list longer than
+    /// the model's layers is refused by name.
+    pub fn with_capacity(mut self, capacity: Vec<Option<usize>>) -> Result<PlanStacks, GpuError> {
+        if capacity.len() > self.types.len() {
+            return Err(GpuError::shape(
+                self.what,
+                format!(
+                    "{} capacities for {} layers",
+                    capacity.len(),
+                    self.types.len()
+                ),
+            ));
+        }
+        self.capacity = capacity;
+        Ok(self)
     }
 
     /// Layer `l`'s gate·up type and down type, as [`FileStacks::types`] lists
@@ -350,6 +382,10 @@ impl FileStacks for PlanStacks {
 
     fn map_layers(&self) -> Option<usize> {
         self.map_layers
+    }
+
+    fn capacity(&self, layer: usize) -> Option<usize> {
+        self.capacity.get(layer).copied().flatten()
     }
 
     fn unrouted(&self) -> Vec<usize> {
@@ -1284,6 +1320,17 @@ impl SwapSource for FileSwap {
         Ok(freed)
     }
 
+    /// The pages of the layer's room stacks holding a byte of slots `from..to`
+    /// that map the spare ([`StackRoom::unbacked`]); a plain stack backs
+    /// nothing.
+    fn restore_stack_bytes(&self, layer: usize, from: usize, to: usize) -> Result<u64, GpuError> {
+        let mut bytes = 0;
+        for (room, per) in self.rooms_of(layer, to, "FileSwap::restore_stack_bytes")? {
+            bytes += room.unbacked(from * per, to * per)?;
+        }
+        Ok(bytes)
+    }
+
     /// The pages of the layer's room stacks that hold a byte of slots
     /// `from..to` backed again, zeroed on `stream` ([`StackRoom::restore`]).
     fn restore_stacks(
@@ -1556,6 +1603,26 @@ impl ResidencyGlue {
         bytes: u64,
     ) -> Result<Freed, GpuError> {
         tier.swap_free_bytes(stream, bytes)
+    }
+
+    /// Fill at most `bytes` device bytes of the stage card's withdrawn expert
+    /// slots: the same lowest `k` slots back on every machine layer, the
+    /// largest `k` whose pages fit ([`HostTier::swap_fill_bytes`]); the
+    /// per-layer report, `k` of 0 when nothing fits. Refused by name, the
+    /// machine unchanged, without a machine.
+    pub fn fill_bytes<H: HostExperts>(
+        &mut self,
+        tier: &mut HostTier<H>,
+        bytes: u64,
+    ) -> Result<Filled, GpuError> {
+        tier.swap_fill_bytes(bytes)
+    }
+
+    /// The machine's elastic quantum, the layers it holds stacks of and one
+    /// slot's bytes ([`HostTier::swap_quantum`]); `None` without a machine.
+    #[must_use]
+    pub fn quantum<H: HostExperts>(&self, tier: &HostTier<H>) -> Option<(u64, u64)> {
+        tier.swap_quantum()
     }
 
     /// Stop the machine before anything of the model is freed

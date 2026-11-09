@@ -637,6 +637,59 @@ pub static CAPTURE_PAIR: Kind = Kind {
     parts: &[key("pair_graph_nodes", U64, "nodes")],
 };
 
+/// The elastic expert tenant's give-back: expert bytes returned so a later
+/// allocation fits ([`bloomery_gpu::Elastic::GiveBack`]).
+pub static ELASTIC_GIVE_BACK: Kind = Kind {
+    name: "elastic_give_back",
+    head: "elastic give-back",
+    doc: "Expert stacks given back to the host so an allocation at `site` could be made: the bytes asked, the bytes freed, the slots a layer and the layers that gave them.",
+    parts: &[
+        key("site", Word, ""),
+        key("asked", U64, "B"),
+        key("freed", U64, "B"),
+        key("slots", U64, "slots"),
+        key("layers", U64, "layers"),
+    ],
+};
+
+/// The elastic expert tenant's fill: withdrawn slots backed again from the
+/// card's free bytes ([`bloomery_gpu::Elastic::Fill`]).
+pub static ELASTIC_FILL: Kind = Kind {
+    name: "elastic_fill",
+    head: "elastic fill",
+    doc: "Withdrawn expert slots filled from the card's free bytes above its margin after a settle: the free bytes read, the margin kept, the slots a layer, the layers and the device bytes backed.",
+    parts: &[
+        key("free", U64, "B"),
+        key("margin", U64, "B"),
+        key("slots", U64, "slots"),
+        key("layers", U64, "layers"),
+        key("bytes", U64, "B"),
+    ],
+};
+
+/// A settle that moved nothing, and why ([`bloomery_gpu::Elastic::Held`]).
+pub static ELASTIC_HELD: Kind = Kind {
+    name: "elastic_held",
+    head: "elastic held",
+    doc: "A settle of the elastic expert tenant that moved nothing: why.",
+    parts: &[key("why", Text, "")],
+};
+
+/// The elastic expert tenant's counters since the load
+/// ([`bloomery_gpu::ElasticStats`]): a gate holds `give_backs` to 0 in steady
+/// state after the warm-up.
+pub static STAT_ELASTIC: Kind = Kind {
+    name: "stat_elastic",
+    head: "stat elastic",
+    doc: "The elastic expert tenant's moves since the load: give-backs and their bytes, fills and their bytes.",
+    parts: &[
+        key("give_backs", U64, ""),
+        key("give_back_bytes", U64, "B"),
+        key("fills", U64, ""),
+        key("fill_bytes", U64, "B"),
+    ],
+};
+
 /// The prompt batch's buffers.
 pub static PREFILL_BYTES: Kind = Kind {
     name: "prefill_bytes",
@@ -2987,6 +3040,21 @@ macro_rules! kinds {
 /// in the generate and chat lists by hand, which `tools/ref/cold-blocks.sh`
 /// and `tools/ref/depth-glm5next.sh` read as exact print sets.
 pub mod groups {
+    /// `room::elastic` (the elastic expert tenant), printed by any seat with a
+    /// residency machine.
+    pub mod elastic {
+        use crate::record::{ELASTIC_FILL, ELASTIC_GIVE_BACK, ELASTIC_HELD, Kind, STAT_ELASTIC};
+
+        /// A settle's move and the tenant's counters (`shared/elastic.rs`:
+        /// `elastic::settle`, `elastic::stat`).
+        pub const GROUP: &[&Kind] = &[
+            &ELASTIC_GIVE_BACK,
+            &ELASTIC_FILL,
+            &ELASTIC_HELD,
+            &STAT_ELASTIC,
+        ];
+    }
+
     /// `serve_seats/tiered.rs` (the gate bins' shared seat module).
     pub mod tiered {
         use crate::record::{Kind, NEED, PLAN, PROMPT_PASS, RESIDENCY_LEVER};
@@ -3336,6 +3404,7 @@ pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = kinds![
     groups::host_tier::ARENA,
     groups::host_tier::CENSUS,
     &[&KV_ROOM],
+    groups::elastic::GROUP,
 ];
 
 /// What the Qwen3 seat of `bloomery-serve` prints, all on stderr: the

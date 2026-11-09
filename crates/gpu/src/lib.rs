@@ -131,6 +131,9 @@ pub use graph::{
     op_write,
 };
 pub use model::{GpuModel, Slots};
+pub use room::elastic::{
+    Elastic, ElasticBody, ElasticStats, FilledBytes, settle_to_margin, with_room,
+};
 pub use room::kv::{FreedBytes, KvBacking, KvRoomBody, RoomTensor, fit_rooms, kv_backing};
 pub use room::{SharedPages, StackRoom};
 pub use watchdog::Busy as EngineBusy;

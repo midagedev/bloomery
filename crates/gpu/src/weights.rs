@@ -425,18 +425,37 @@ impl Drop for Weights {
 }
 
 /// The stacks of a placed load held as rooms ([`StackRoom`]): the file tensors whose card
-/// upload is reserved whole, every page backed at load, and the stream the rooms reserve on.
-/// A tensor not named here, or not uploaded as file blocks ([`CardFormat::KQuant`]), is a
-/// plain buffer.
+/// upload is reserved whole, every page the plan's rows lie on backed at load, and the stream
+/// the rooms reserve on. A stack named in `capacity` is reserved for that many slots, the
+/// plan's rows backed and the rest left for the residency machine's fill
+/// ([`StackRoom::with_backed`]); one not named there is reserved for its rows alone. A tensor
+/// not named here, or not uploaded as file blocks ([`CardFormat::KQuant`]), is a plain buffer.
 pub(crate) struct StackRooms {
     names: BTreeSet<String>,
     stream: Arc<CudaStream>,
+    capacity: BTreeMap<String, usize>,
 }
 
 impl StackRooms {
-    /// The tensors `names` held as rooms on `stream`'s device.
+    /// The tensors `names` held as rooms on `stream`'s device, each reserved for its rows.
     pub(crate) fn new(names: BTreeSet<String>, stream: Arc<CudaStream>) -> StackRooms {
-        StackRooms { names, stream }
+        StackRooms {
+            names,
+            stream,
+            capacity: BTreeMap::new(),
+        }
+    }
+
+    /// [`StackRooms::new`] with the stacks `capacity` names reserved for that many slots: a
+    /// capacity below a stack's uploaded rows is refused by name at the upload.
+    pub(crate) fn with_capacity(mut self, capacity: BTreeMap<String, usize>) -> StackRooms {
+        self.capacity = capacity;
+        self
+    }
+
+    /// The slots stack `name` is reserved for, when the capacity names it.
+    fn capacity_of(&self, name: &str) -> Option<usize> {
+        self.capacity.get(name).copied()
     }
 }
 
@@ -1676,6 +1695,17 @@ fn upload_rows_in(
         let detail = format!("tensor {name} holds {held} bytes, {rows} rows need {need}");
         return Err(GpuError::shape(what, detail));
     };
+    if let Some(slots) = rooms.and_then(|r| r.capacity_of(name))
+        && format != CardFormat::KQuant
+    {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "tensor {name}: a capacity of {slots} slots on a {format:?} stack: only a stack \
+                 uploaded as file blocks is a room the residency machine fills"
+            ),
+        ));
+    }
     let dw = match format {
         // The gates' packing verbatim (gate_p1/gate_p9): the whole row span as
         // one word stream, so the kernels' byte-offset row addressing sees
@@ -1693,7 +1723,18 @@ fn upload_rows_in(
             let cols = words / rows;
             let (w, room) = match rooms.filter(|r| r.names.contains(name)) {
                 Some(r) => {
-                    let (w, room) = StackRoom::tensor(Arc::clone(&r.stream), rows, cols, what)?;
+                    let slots = r.capacity_of(name).unwrap_or(rows);
+                    if slots < rows {
+                        return Err(GpuError::shape(
+                            what,
+                            format!(
+                                "tensor {name}: a capacity of {slots} slots below its {rows} \
+                                 uploaded rows"
+                            ),
+                        ));
+                    }
+                    let (w, room) =
+                        StackRoom::tensor_backed(Arc::clone(&r.stream), slots, cols, rows, what)?;
                     (w, Some(room))
                 }
                 None => (DeviceTensor::<u32>::zeroed(stream, rows, cols)?, None),

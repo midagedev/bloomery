@@ -2027,10 +2027,30 @@ impl<H: HostExperts> HostTier<H> {
         m.free_bytes(stream, &mut self.slots, bytes)
     }
 
+    /// The residency machine's elastic quantum ([`swap::SwapMachine::quantum`]);
+    /// `None` without a machine.
+    #[must_use]
+    pub fn swap_quantum(&self) -> Option<(u64, u64)> {
+        self.swap.as_ref().and_then(swap::SwapMachine::quantum)
+    }
+
     /// The lowest `k` withdrawn slots of layer `layer` restored
     /// ([`swap::SwapMachine::restore_tail`]): their pages backed again, the
     /// layer's capacity `k` more. Refused by name, the machine unchanged,
     /// when the load runs no machine, and as the machine refuses.
+    /// Fill at most `bytes` device bytes of withdrawn stage slots on every
+    /// machine layer ([`swap::SwapMachine::fill_bytes`]); refused by name on a
+    /// load that runs no machine.
+    pub fn swap_fill_bytes(&mut self, bytes: u64) -> Result<swap::Filled, GpuError> {
+        let Some(m) = self.swap.as_mut() else {
+            return Err(GpuError::state(
+                "HostTier::swap_fill_bytes",
+                "a residency machine: the load runs none, so no slot is withdrawn",
+            ));
+        };
+        m.fill_bytes(bytes)
+    }
+
     pub fn swap_restore_tail(&mut self, layer: usize, k: usize) -> Result<(), GpuError> {
         let Some(m) = self.swap.as_mut() else {
             return Err(GpuError::state(
