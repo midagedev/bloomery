@@ -94,6 +94,20 @@
 //!   pass load through `Batch::prompt`. Mutant: the pass attends every key past top-k (the dense
 //!   rows on a load that selects): the rows past it read other rows than the step's.
 //!
+//! - `room`: the stores' rooms of that whole-card K3.1 body (a latent layer's cached rows and
+//!   index key rows, the buffers `Hparams::pos_bufs` declares) map no page on a fresh load, the
+//!   pages of the rows the prompt and the steps reached on the card alone (`room_mapped`: some,
+//!   none on the host), and none after a reset. Mutants (`.mutants/kvc-k31-*.patch`): `reset`
+//!   leaves the pages mapped, the passes and the step fit no row (the pages never map, the rows
+//!   read the spare).
+//!
+//! - `kvspill`: the plan of the K3.1 fixture under `BLOOMERY_KV_HOST=spill` with a floor counts
+//!   the host-able cached rows' pages past the floor against its host room, the key rows never,
+//!   as the stage card's host page rounds them: latent layers x (pages of the cached run at the
+//!   context - pages at the floor) x the page [derived here from the header's widths, not read
+//!   from the plan's owner]. Mutants (`.mutants/kvc-k31-*.patch`): the host count left out of
+//!   the plan, the floor's pages not taken off.
+//!
 //! The prompt is the fixed walk of `e2e::walk` through the vocabulary: [`PROMPT`] ids, [`STEPS`]
 //! greedy ids.
 
@@ -148,12 +162,14 @@ mod gate {
     use bloomery_gpu::host::node;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::{Fault, FaultSite, Gpu, GpuError, GpuModel};
+    use bloomery_gpu_gates::generate::{Place, stage_host_page};
     use bloomery_gpu_gates::tier::{self, Tier};
     use bloomery_gpu_gates::{
         GateError, beside, checks_failed, die_with_parent, fnv_row, open_split, ref_model_path,
     };
     use bloomery_levers::{
-        CARD_BUDGET, CARD_DONTNEED, CardBudget, HOST_LOCK, HOST_POPULATE, HostCfg, TIER_NODES,
+        CARD_BUDGET, CARD_DONTNEED, CardBudget, HOST_LOCK, HOST_POPULATE, HostCfg, KvHost,
+        TIER_NODES,
     };
     use gguf::Split;
     use model::arch::Arch;
@@ -1529,6 +1545,66 @@ mod gate {
         ))
     }
 
+    /// Clause `room` (the module doc): the stores' rooms of the whole-card K3.1 body back no
+    /// page before a row is written (`fresh`), the pages of the rows a prompt and its steps
+    /// reached on the card alone after them (`used`: some, none on the host, the load having no
+    /// spill), and none again after a reset (`settled`).
+    fn room_line(
+        fresh: (usize, usize),
+        used: (usize, usize),
+        settled: (usize, usize),
+    ) -> Result<bool, GateError> {
+        tier::sc("room: the stores' pages are backed as far as the positions written reach")?;
+        Ok(line(
+            fresh == (0, 0) && used.0 > 0 && used.1 == 0 && settled == (0, 0),
+            "room",
+            &format!(
+                "mapped (card, host) bytes: fresh {fresh:?}, after the prompt and {STEPS} steps \
+                 {used:?}, after a reset {settled:?}"
+            ),
+        ))
+    }
+
+    /// Clause `kvspill` (the module doc): the plan's host bytes under `spill` with a floor of
+    /// [`KV_FLOOR`] positions at a context of [`KV_CTX`] on the stage card's host page, against
+    /// the value derived from the cached row's width (a latent layer's `kv_lora` + rope
+    /// values, f16) and the page; `off` counts none.
+    fn kv_spill(inputs: &PlanInputs) -> Result<bool, GateError> {
+        const KV_CTX: u64 = 262_144;
+        const KV_FLOOR: u64 = 8_192;
+        tier::sc("kvspill: the plan counts the pages past the floor against its host room")?;
+        let page = stage_host_page(Place::Bp.on_host()?.card_specs()?[0])?;
+        let mut inputs = inputs.clone();
+        inputs.kv_host_page = Some(page);
+        let machine = bp_machine(&inputs)?;
+        let held = |host: KvHost| -> Result<u64, GateError> {
+            let levers = PlanLevers {
+                kv_floor: Some(KV_FLOOR),
+                kv_host: host,
+                ..PlanLevers::default()
+            };
+            Ok(inputs.plan(&machine, KV_CTX, &levers)?.host.kv_host_bytes)
+        };
+        let latent = inputs
+            .hp
+            .kinds
+            .iter()
+            .filter(|k| **k == model::arch::kimi_k3::hparams::Kind::Mla)
+            .count() as u64;
+        let row = 2 * (inputs.hp.mla.kv_lora + inputs.hp.mla.pe) as u64;
+        let pages = |positions: u64| (positions * row).div_ceil(page);
+        let want = latent * (pages(KV_CTX) - pages(KV_FLOOR)) * page;
+        let (spill, off) = (held(KvHost::Spill)?, held(KvHost::Off)?);
+        Ok(line(
+            spill == want && off == 0,
+            "kvspill",
+            &format!(
+                "host bytes under spill {spill}, derived {want} ({latent} latent layers, row \
+                 {row} B, page {page} B); under off {off}"
+            ),
+        ))
+    }
+
     /// The arms of `pass past top-k` over the K3.1 fixture at `path`: the whole-card body, then
     /// the placed pass load at each of [`PASS_SHAPES`], its card budget the K3.1 file's own pick
     /// under the header's budget `header` (the plan counts the indexer's tensors as dense).
@@ -1548,16 +1624,21 @@ mod gate {
             Pass::new(gpu, body)?
         };
         let on = selects(&m)?;
+        let fresh = m.body(NAME)?.room_mapped();
         m.prompt_rows(&mut rows, head)?;
         let first = m.prompt_rows(&mut rows, rest)?;
         let got_pos = m.pos();
         let got = greedy_from(&mut m, first)?;
+        let used = m.body(NAME)?.room_mapped();
         m.reset()?;
+        let settled = m.body(NAME)?.room_mapped();
         let first = m.step(&prompt)?;
         let want_pos = m.pos();
         let want = greedy_from(&mut m, first)?;
         drop((m, rows));
         pass &= past_top_k_line("whole card", on, (&got, got_pos), (&want, want_pos))?;
+        pass &= room_line(fresh, used, settled)?;
+        pass &= kv_spill(&inputs31)?;
 
         let table = split_table(&inputs31, &bp_machine(&inputs31)?, DSA_CTX as u64, header)?;
         let budget = pick_budget(&table)?;

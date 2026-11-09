@@ -44,7 +44,8 @@ const USAGE: &str = "usage: bloomery-serve --model kimik3 [-m PATH | --hf <repo>
                      [--chat-template-file PATH] [--place W] [--plan] [--prefill pass|steps] \
                      [--queue-depth Q] [--slot-save-path DIR] [--api-key KEY] [--api-key-file FNAME]";
 
-/// The placement, host load, residency, caller and expert tier node settings the seat acts on.
+/// The placement, host load, residency, caller, expert tier node and K/V (floor, host backing)
+/// settings the seat acts on.
 /// There is no prompt group: a prompt runs as passes of the plan's shape, or stepped.
 pub const ACTS_ON: &[&str] = &[
     bloomery_levers::CARD_BUDGET,
@@ -59,6 +60,8 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::SCREEN,
     bloomery_levers::SCHEMAJUMP,
     bloomery_levers::TIER_NODES,
+    bloomery_levers::KV_FLOOR,
+    bloomery_levers::KV_HOST,
 ];
 
 /// Architecture-specific facts; the common owner plans and serves the slot.

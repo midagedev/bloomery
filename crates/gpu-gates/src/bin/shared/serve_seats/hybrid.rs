@@ -34,7 +34,7 @@ use gguf::Split;
 use model::arch::Arch;
 use model::arch::place_hybrid::PlanInputs;
 use model::placement::workstation::TierBatchBytes;
-use model::placement::{Machine, PlacementError, Plan};
+use model::placement::{KvDefault, Machine, PlacementError, Plan};
 use runtime::Target as _;
 use serve::reasoning::ThinkTags;
 use serve::{CacheNote, Saved, ServeError};
@@ -87,6 +87,10 @@ pub trait Family: Sized + 'static {
     /// Whether the body keeps its load's slot map for its life, and so serves no residency but
     /// `off` ([`Tiered::SLOT_MAP_FIXED`]). The default runs the residency machine.
     const SLOT_MAP_FIXED: bool = false;
+
+    /// What the load takes for the K/V levers it leaves unset ([`Tiered::KV_DEFAULT`]). The
+    /// default is none.
+    const KV_DEFAULT: Option<KvDefault> = None;
 
     /// Whether the body has a prompt pass ([`Family::pass`]): the seat then takes
     /// `--prefill pass|steps`, which a family with none refuses by name.
@@ -490,6 +494,7 @@ impl<F: Family> Tiered for Hybrid<F> {
     }
 
     const SLOT_MAP_FIXED: bool = F::SLOT_MAP_FIXED;
+    const KV_DEFAULT: Option<KvDefault> = F::KV_DEFAULT;
 
     /// The common machine's pick ([`tiered::residency_pick`]) with the seat's prompt feed, or,
     /// for a body that keeps its load's slot map, `off` ([`tiered::fixed_slot_map_pick`]); a
