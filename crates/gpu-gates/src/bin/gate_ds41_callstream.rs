@@ -21,7 +21,9 @@
 //!
 //! - `kvgrow` (the stores grow past the card's free bytes; runs first, in both modes): a call, then
 //!   the same call on a card squeezed until it refuses a page — the body frees expert bytes for the
-//!   first fit and the ids and logits are the free call's (mutant:
+//!   first fit and the squeezed call's prompt logits sit in the free call's band and its first
+//!   different step is a near tie, the given-up experts' host sum joining the card's by an add,
+//!   not the same association (mutant:
 //!   `.mutants/kvc-ds41-fit-rooms-removed.patch`, the squeezed call ends in `NoRoom`).
 //! - `s2` (DEMOTE: a streamed expert gives the bits a card-resident one
 //!   does): call A, [`S2_P`] prose ids in one batch, streams — its pick
@@ -380,7 +382,7 @@ mod gate {
     /// and [`KVGROW_STEPS`] steps with streaming off, then the same call after a reset on a card
     /// squeezed until it refuses a page: the rooms' first fit finds no page, the body frees
     /// expert bytes for it (`fit_rooms`) and fits once more. The squeezed call's ids and logits
-    /// equal the free call's, and card experts were given up. Mutant:
+    /// sit in the free call's band, and card experts were given up. Mutant:
     /// `.mutants/kvc-ds41-fit-rooms-removed.patch` (the squeezed call ends in `NoRoom`).
     fn kvgrow(s: &mut Session<Body>) -> Result<bool, GateError> {
         set_stream(s, false)?;
@@ -405,13 +407,35 @@ mod gate {
         let squeezed = squeezed?;
         let experts = |sets: &[Vec<u32>]| sets.iter().map(Vec::len).sum::<usize>();
         let given = experts(&seed).saturating_sub(experts(&card_sets(s)?));
-        let same = free.out == squeezed.out;
+        // The given-up experts are served by the host leg, whose sum joins the card's by an
+        // add: the routed output's f32 association is the placement's, so the bits move with
+        // it. The squeezed call sits within the prefill gate's band of the free call's on the
+        // prompt's last row (a stale slot or an unbacked page is far outside it), and its
+        // first different step is a near tie, as `s3` reads it.
+        let mut band = LogitsBand::new();
+        band.add(&squeezed.row, &free.row);
+        let first = free
+            .out
+            .iter()
+            .zip(&squeezed.out)
+            .position(|(a, b)| a.argmax != b.argmax);
+        let near = first.is_none_or(|i| squeezed.out[i].margin < GREEDY_MARGIN);
+        let same = band.ok() && near;
         let ok = same && given > 0 && backed == 0;
         println!(
             "kvgrow: the card squeezed by {buffers} buffers over rooms backing {backed} B, the \
-             call of {} ids and {KVGROW_STEPS} steps gave up {given} card experts and its ids \
-             and logits are the free call's: {same}: {}",
+             call of {} ids and {KVGROW_STEPS} steps gave up {given} card experts; its prompt \
+             logits sit in the band of the free call's (clear top-1 {} of {} disagree, max \
+             |Δlogit| {:.3e}, rms {:.3e}) and its first different step is {}: {same}: {}",
             ids.len(),
+            band.disagree,
+            band.clear,
+            band.max,
+            band.rms(),
+            match first {
+                None => "none (same tokens)".to_owned(),
+                Some(i) => format!("{i}, margin {:.3}", squeezed.out[i].margin),
+            },
             verdict(ok)
         );
         s.clear()?;
