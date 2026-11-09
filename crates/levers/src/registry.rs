@@ -1182,8 +1182,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               context is no more has no floor, and a set `BLOOMERY_KV_HOST=all` takes none, \
               which plans at a zero floor itself); unset in `generate_qwen3moe`, and `off` in \
               both, the spread runs at `ctx_max` itself. Only a load whose stores hold their \
-              rows in rooms reads it: every other family's binary and file refuses it by name, \
-              `off` too. A floor above the context of a plan made under it is refused by \
+              rows in rooms reads it, a family that declares its rooms (`KvBytes::rooms`; today \
+              Qwen3.8): the plan of any other load refuses a set count by name (`KvUnroomed`), \
+              as every other family's binary and file refuses the lever, `off` too. A floor above the context of a plan made under it is refused by \
               name, and nothing clamps it. A sequence that grows past the floor's bytes with a \
               residency machine running (`BLOOMERY_RESIDENCY`) frees card bytes: the machine \
               releases the same top slots of every layer's expert stacks, the fewest that cover \
@@ -1226,9 +1227,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               bits are `off`'s. The pooled keys and the ring stay on the card in every setting \
               (the indexer scans the pooled keys every step). Set with a numeric \
               `BLOOMERY_KV_FLOOR`, `all` is refused by name (it already plans at a zero floor; \
-              two levers saying where the spread runs is ambiguous), and every family whose \
-              stores are not rooms refuses the lever set, by name, where it refuses \
-              `BLOOMERY_KV_FLOOR`. The `plan` line prints `kv_host=` beside `kv_floor=`, and \
+              two levers saying where the spread runs is ambiguous), and every load that \
+              declares no rooms (today every family but Qwen3.8) refuses a set `spill` or `all` \
+              by name (`KvUnroomed`) where it refuses `BLOOMERY_KV_FLOOR`; unset and `off` pass. The `plan` line prints `kv_host=` beside `kv_floor=`, and \
               the seat's `kv room` line names the host bytes the planes hold \
               (`kv_host_bytes`).",
         site: Site::Parsed {

@@ -3,6 +3,7 @@ use std::num::NonZeroU64;
 use std::ops::Range;
 
 use gguf::GgmlType;
+use runtime::stores::PosLayout;
 
 use super::devices;
 use super::refusal::PlacementError;
@@ -580,14 +581,14 @@ impl Machine {
 /// `ctx_max` tokens, and what a stage keeps beside it.
 pub trait KvBytes {
     fn layer_bytes(&self, layer: usize, ctx_max: u64) -> u64;
-    /// The bytes of `layer`'s K/V planes at `ctx_max` positions — the part of
-    /// [`KvBytes::layer_bytes`] a host-backed store (`BLOOMERY_KV_HOST=all`)
-    /// holds off the card, its pages on the host. The default is none: a
-    /// layer whose cache no host-capable room holds, the pooled keys and the
-    /// rings included.
-    fn plane_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
-        let _ = (layer, ctx_max);
-        0
+    /// The by-position buffers this load holds in rooms ([`PosLayout`]): the part of
+    /// [`KvBytes::layer_bytes`] whose pages a room backs as far as the sequence reaches. The plan
+    /// reads them at the expert spread's floor (`BLOOMERY_KV_FLOOR`) and every other byte of the
+    /// layer at the cap, the `Select` buffers' pages off the card under `BLOOMERY_KV_HOST=all`.
+    /// The default is none: a load whose stores are plain buffers plans every byte at the cap
+    /// under any floor, so the lever cannot under-count a store no room backs.
+    fn rooms(&self) -> Option<&PosLayout> {
+        None
     }
     /// Bytes the stage that runs layer 0 holds at `ctx_max` positions beside
     /// its cache, one copy for every resident sequence: the rope rows its

@@ -95,6 +95,15 @@ pub enum PlacementError {
          together do not say where the spread runs: set one"
     )]
     KvHostFloor { floor: u64 },
+    /// A K/V lever set on a load whose cache declares no rooms ([`KvBytes::rooms`]): the lever
+    /// reads only rooms, so planning the cache at the cap under it would be a lever that does
+    /// nothing.
+    #[error(
+        "{lever}={value} is set, and this load's cache declares no rooms, so the lever would \
+         change nothing; only a family that declares rooms (today Qwen3.8) takes it: unset it \
+         (or `off`)"
+    )]
+    KvUnroomed { lever: &'static str, value: String },
     /// The K/V planes a host-backed store holds on the host
     /// (`BLOOMERY_KV_HOST=all`) pass the plan's host room: what the room
     /// leaves past the plan's host need.

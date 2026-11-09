@@ -5,13 +5,33 @@
 
 use super::*;
 use bloomery_levers::KvFloor;
+use runtime::stores::{Access, PosBuf, PosLayout};
 
 /// 18 B of KV a position a layer (72 B a position over the four layers) and
 /// 4 B of stage rows a position: ten positions of KV or twenty of rows take
 /// one [`EXPERT`].
 struct Kv;
 
+/// The four layers' 18 B a position, one scanned buffer each: all of the layer, so a floor
+/// reads all of it.
+static KV_ROOMS: std::sync::LazyLock<PosLayout> = std::sync::LazyLock::new(|| {
+    let layer = || {
+        vec![PosBuf {
+            what: "kv",
+            row: 18,
+            per: 1,
+            runs: 1,
+            access: Access::Scan,
+        }]
+    };
+    PosLayout::new((0..4).map(|_| layer()).collect())
+});
+
 impl KvBytes for Kv {
+    fn rooms(&self) -> Option<&PosLayout> {
+        Some(&KV_ROOMS)
+    }
+
     fn layer_bytes(&self, _layer: usize, ctx_max: u64) -> u64 {
         18 * ctx_max
     }

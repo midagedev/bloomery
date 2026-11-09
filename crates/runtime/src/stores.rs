@@ -351,6 +351,196 @@ pub const fn selecting_bytes(
         + index_ring_bytes(idx_dim, pool)
 }
 
+/// How a step reads a by-position buffer: every row (`Scan`) or a bounded list of rows (`Select`).
+/// The architecture fact that decides where a buffer's pages may live: a scanned buffer is read
+/// whole every step, so a host page would cost the step its whole size at the host link's rate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Access {
+    Scan,
+    Select { rows: u64 },
+}
+
+/// Where a by-position buffer's pages may live, read from its [`Access`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Class {
+    /// The card only.
+    Card,
+    /// The card or the host.
+    Host,
+}
+
+impl Access {
+    /// A `Scan` buffer is card-only, a `Select` buffer may sit on the host.
+    #[must_use]
+    pub const fn class(self) -> Class {
+        match self {
+            Access::Scan => Class::Card,
+            Access::Select { .. } => Class::Host,
+        }
+    }
+}
+
+/// One by-position buffer of a layer's store: `runs` runs of `rows(ctx)` rows of `row` bytes, one
+/// row every `per` positions (a pooled key's row covers `per`). `runs` is the head-run count a
+/// room pages each run of apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PosBuf {
+    pub what: &'static str,
+    pub row: u64,
+    pub per: u64,
+    pub runs: u64,
+    pub access: Access,
+}
+
+impl PosBuf {
+    /// Rows of one run over `positions` positions: the last partial row counted whole.
+    #[must_use]
+    pub fn rows(&self, positions: u64) -> u64 {
+        positions.div_ceil(self.per)
+    }
+
+    /// One run's bytes over `positions` positions.
+    #[must_use]
+    pub fn run_bytes(&self, positions: u64) -> u64 {
+        self.rows(positions).saturating_mul(self.row)
+    }
+
+    /// The buffer's exact bytes over `positions` positions.
+    #[must_use]
+    pub fn bytes(&self, positions: u64) -> u64 {
+        self.run_bytes(positions).saturating_mul(self.runs)
+    }
+}
+
+/// Every layer's by-position buffers, times the sequences that hold them; the fixed stores (rings,
+/// recurrent and compressor states) are not in it. One declaration for the plan's floor and
+/// padding terms and the card body's room constructors.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PosLayout {
+    layers: std::sync::Arc<[Vec<PosBuf>]>,
+    slots: u64,
+}
+
+impl PosLayout {
+    /// The layout of one sequence: `layers[l]` is layer `l`'s buffers.
+    #[must_use]
+    pub fn new(layers: Vec<Vec<PosBuf>>) -> PosLayout {
+        PosLayout {
+            layers: layers.into(),
+            slots: 1,
+        }
+    }
+
+    /// The same layout held by `slots` sequences: every byte count times `slots`.
+    #[must_use]
+    pub fn times(&self, slots: u64) -> PosLayout {
+        PosLayout {
+            layers: std::sync::Arc::clone(&self.layers),
+            slots: self.slots.saturating_mul(slots),
+        }
+    }
+
+    /// Layer `layer`'s buffers; none past the layers it names.
+    #[must_use]
+    pub fn buffers(&self, layer: usize) -> &[PosBuf] {
+        self.layers.get(layer).map_or(&[], Vec::as_slice)
+    }
+
+    /// `layer`'s exact by-position bytes over `positions` positions.
+    #[must_use]
+    pub fn bytes(&self, layer: usize, positions: u64) -> u64 {
+        self.sum(layer, |_| true, |b| b.bytes(positions))
+    }
+
+    /// The bytes of `layer`'s `Select` buffers over `positions` positions: the part a host-backed
+    /// room holds off the card.
+    #[must_use]
+    pub fn host_able(&self, layer: usize, positions: u64) -> u64 {
+        self.sum(
+            layer,
+            |b| b.access.class() == Class::Host,
+            |b| b.bytes(positions),
+        )
+    }
+
+    /// `layer`'s bytes over `positions` positions with every run rounded up to whole pages of
+    /// `page(class)`, the class of a buffer being its [`Access::class`]; a buffer whose class
+    /// has no page (`None`) holds none. A room backs whole pages run by run.
+    #[must_use]
+    pub fn paged(&self, layer: usize, positions: u64, page: impl Fn(Class) -> Option<u64>) -> u64 {
+        self.sum(
+            layer,
+            |b| page(b.access.class()).is_some(),
+            |b| {
+                let page = page(b.access.class()).expect("filtered to the classes with a page");
+                b.run_bytes(positions)
+                    .div_ceil(page)
+                    .saturating_mul(page)
+                    .saturating_mul(b.runs)
+            },
+        )
+    }
+
+    /// The bytes `layer`'s buffers hold past their exact rows at `positions` positions when every
+    /// buffer (its runs together) is rounded up to whole pages of `page(class)`: a class with no
+    /// page (`None`) holds none and adds none. The rounding the plan reserves at the cap; `None`
+    /// past u64.
+    #[must_use]
+    pub fn padding(
+        &self,
+        layer: usize,
+        positions: u64,
+        page: impl Fn(Class) -> Option<u64>,
+    ) -> Option<u64> {
+        let mut extra = 0u64;
+        for b in self.buffers(layer) {
+            let Some(page) = page(b.access.class()) else {
+                continue;
+            };
+            let bytes = b.bytes(positions);
+            let whole = bytes.div_ceil(page).checked_mul(page)?;
+            extra = extra.checked_add(whole - bytes)?;
+        }
+        extra.checked_mul(self.slots)
+    }
+
+    /// `layer`'s `Select` buffers over `positions` positions, each buffer (its runs together)
+    /// rounded up to whole pages of `page`, per sequence, then times the slots: what a host room holds
+    /// once its sequences reach every position; `None` past u64.
+    #[must_use]
+    pub fn host_whole(&self, layer: usize, positions: u64, page: u64) -> Option<u64> {
+        let mut whole = 0u64;
+        for b in self.buffers(layer) {
+            if b.access.class() != Class::Host {
+                continue;
+            }
+            let bytes = b.bytes(positions);
+            whole = whole.checked_add(bytes.div_ceil(page).checked_mul(page)?)?;
+        }
+        whole.checked_mul(self.slots)
+    }
+
+    /// Layers the layout names.
+    #[must_use]
+    pub fn layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    fn sum(
+        &self,
+        layer: usize,
+        keep: impl Fn(&PosBuf) -> bool,
+        of: impl Fn(&PosBuf) -> u64,
+    ) -> u64 {
+        self.buffers(layer)
+            .iter()
+            .filter(|b| keep(b))
+            .map(of)
+            .fold(0u64, u64::saturating_add)
+            .saturating_mul(self.slots)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -599,5 +789,135 @@ mod tests {
         ] {
             assert_eq!(pooled_rows(ctx, 4), want, "ctx {ctx}");
         }
+    }
+}
+
+#[cfg(test)]
+mod pos_layout_tests {
+    use super::{Access, Class, PosBuf, PosLayout, kv_plane_bytes, selecting_rows_bytes};
+
+    const MIB2: u64 = 2 << 20;
+
+    /// One selecting layer as Qwen3.8 holds it: K and V planes of `[ctx][head]` runs, one run a
+    /// kv head, f16 or q8_0 (data and scales), and a pooled key a pool of 4, scanned.
+    fn selecting_layer(q8: bool) -> Vec<PosBuf> {
+        let select = Access::Select { rows: 2_051 };
+        let plane = |what, row| PosBuf {
+            what,
+            row,
+            per: 1,
+            runs: 2,
+            access: select,
+        };
+        let mut bufs = if q8 {
+            vec![
+                plane("k data", 256),
+                plane("k scales", 16),
+                plane("v data", 256),
+                plane("v scales", 16),
+            ]
+        } else {
+            vec![plane("k", 512), plane("v", 512)]
+        };
+        bufs.push(PosBuf {
+            what: "pooled",
+            row: 256,
+            per: 4,
+            runs: 1,
+            access: Access::Scan,
+        });
+        bufs
+    }
+
+    fn layout(q8: bool) -> PosLayout {
+        PosLayout::new(vec![vec![], selecting_layer(q8)])
+    }
+
+    /// The descriptor's bytes are the size rules' bytes in both cache layouts, its host-able part
+    /// is the planes alone, and a layer it does not name is empty.
+    #[test]
+    fn bytes_and_host_able_follow_the_size_rules() {
+        for q8 in [false, true] {
+            let l = layout(q8);
+            for ctx in [0u64, 1, 4, 5, 2_051, 8_192, 262_144] {
+                assert_eq!(
+                    l.bytes(1, ctx),
+                    selecting_rows_bytes(2, 256, q8, 128, 4, ctx as usize),
+                    "q8 {q8} ctx {ctx}"
+                );
+                assert_eq!(l.host_able(1, ctx), kv_plane_bytes(2, 256, q8, ctx));
+            }
+            assert_eq!((l.bytes(0, 4096), l.bytes(7, 4096)), (0, 0));
+        }
+    }
+
+    /// The class is the access fact: scanned is card-only, selected may sit on the host.
+    #[test]
+    fn a_scanned_buffer_is_card_class_and_a_selected_one_host_class() {
+        assert_eq!(Access::Scan.class(), Class::Card);
+        assert_eq!(Access::Select { rows: 1 }.class(), Class::Host);
+    }
+
+    /// A room backs whole pages run by run: at 8,192 positions each 512 B plane run is 4 MiB, 2
+    /// pages, and the pooled run (2,048 rows of 256 B = 0.5 MiB) one page, the design's 226.5 MB a
+    /// 12-layer slot.
+    #[test]
+    fn paged_rounds_each_run_not_the_buffer() {
+        let l = layout(false);
+        let page = |_| Some(MIB2);
+        // K and V, 2 runs each, 2 pages a run, and one pooled page.
+        assert_eq!(l.paged(1, 8_192, page), (2 * 2 * 2 + 1) * MIB2);
+        assert_eq!(l.paged(1, 8_192, page) * 12, 226_492_416);
+        // A class with no page holds none: the host classes off the card.
+        let card_only = |c| (c == Class::Card).then_some(MIB2);
+        assert_eq!(l.paged(1, 8_192, card_only), MIB2);
+        // The runs of a buffer round apart: two runs of 3 MiB are 4 MiB each, though the buffer's
+        // 6 MiB is whole pages (no padding).
+        let odd = PosLayout::new(vec![vec![PosBuf {
+            what: "odd",
+            row: 3 << 20,
+            per: 1,
+            runs: 2,
+            access: Access::Scan,
+        }]]);
+        assert_eq!(odd.paged(0, 1, |_| Some(MIB2)), 8 << 20);
+        assert_eq!(odd.padding(0, 1, |_| Some(MIB2)), Some(0));
+    }
+
+    /// The padding rounds each buffer, its runs together (the plan's reserve at the cap), per
+    /// sequence and then times the slots; a class with no page adds none.
+    #[test]
+    fn padding_rounds_each_buffer_per_sequence() {
+        let l = layout(false);
+        let page = |_| Some(MIB2);
+        // ctx 5: K = 5 · 1,024 B → 2 MiB − 5,120; V the same; pooled 2 rows · 256 B.
+        let want = 2 * (MIB2 - 5 * 1_024) + (MIB2 - 2 * 256);
+        assert_eq!(l.padding(1, 5, page), Some(want));
+        assert_eq!(l.times(3).padding(1, 5, page), Some(3 * want));
+        let card_only = |c| (c == Class::Card).then_some(MIB2);
+        assert_eq!(l.padding(1, 5, card_only), Some(MIB2 - 2 * 256));
+        assert_eq!(l.padding(1, 5, |_| None), Some(0));
+        assert_eq!(l.times(u64::MAX).padding(1, 5, page), None);
+    }
+
+    /// The host room's whole bytes: the selected buffers rounded per buffer per sequence, times the
+    /// slots; the scanned ones none.
+    #[test]
+    fn host_whole_counts_the_selected_buffers_only() {
+        let l = layout(false);
+        // ctx 5: K and V each 5,120 B of 2 runs → one page apiece.
+        assert_eq!(l.host_whole(1, 5, MIB2), Some(2 * MIB2));
+        assert_eq!(l.times(4).host_whole(1, 5, MIB2), Some(8 * MIB2));
+        assert_eq!(l.host_whole(0, 5, MIB2), Some(0));
+    }
+
+    /// Slots scale every byte count and compose.
+    #[test]
+    fn times_scales_every_count_and_composes() {
+        let l = layout(false);
+        let two = l.times(2).times(3);
+        assert_eq!(two.bytes(1, 4_096), 6 * l.bytes(1, 4_096));
+        assert_eq!(two.host_able(1, 4_096), 6 * l.host_able(1, 4_096));
+        assert_eq!(l.times(u64::MAX).bytes(1, 4_096), u64::MAX);
     }
 }

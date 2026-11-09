@@ -1,30 +1,28 @@
 # r3b mutant fit-retry-removed
-# clause: gate_qwen38_residency kvfloor (the squeezed run): Body38::fit_stores asks the machine for the
-#   bytes and withdraws the slots, then returns the first NoRoom without running the fit again, so the
-#   squeezed prompt call ends in GpuError::NoRoom naming the bytes freed and the clause prints
-#   "the call with under a page free FAILED" and reads FAIL.
---- a/crates/gpu/src/arch/qwen3moe/body38.rs
-+++ b/crates/gpu/src/arch/qwen3moe/body38.rs
-@@ -3886,15 +3886,13 @@
-                 )));
-             }
-         };
--        self.fit_each(pos, through).map_err(|e| {
--            e.noting_room(format!(
--                "after the residency machine freed {} B of expert stacks ({} slots a layer over \
--                 {} layers)",
--                freed.bytes,
--                freed.k,
--                freed.layers.len()
--            ))
--        })
-+        Err(first.noting_room(format!(
-+            "after the residency machine freed {} B of expert stacks ({} slots a layer over \
-+             {} layers)",
-+            freed.bytes,
-+            freed.k,
-+            freed.layers.len()
-+        )))
-     }
+# clause: gate_qwen38_residency kvfloor (the squeezed run): room::kv::fit_rooms (the one fit every
+#   room body runs; Body38::fit_stores calls it) asks the machine for the bytes and withdraws the
+#   slots, then returns the first NoRoom without running the fit again, so the squeezed prompt call
+#   ends in GpuError::NoRoom naming the bytes freed and the clause prints
+#   "the call with under a page free FAILED" and reads FAIL. Also red in the unit test
+#   `a_refused_fit_asks_the_machine_once_and_fits_again` (gate-gpu-lib).
+--- a/crates/gpu/src/room/kv.rs
++++ b/crates/gpu/src/room/kv.rs
+@@ -251,13 +251,11 @@ pub fn fit_rooms<B: KvRoomBody>(body: &mut B, pos: usize, rows: usize) -> Result
+             )));
+         }
+     };
+-    body.fit_each(pos, through).map_err(|e| {
+-        e.noting_room(format!(
+-            "after the residency machine freed {} B of expert stacks ({} slots a layer over {} \
+-             layers)",
+-            freed.bytes, freed.slots, freed.layers
+-        ))
+-    })
++    Err(first.noting_room(format!(
++        "after the residency machine freed {} B of expert stacks ({} slots a layer over {} \
++         layers)",
++        freed.bytes, freed.slots, freed.layers
++    )))
+ }
  
-     /// Every store fitted through `through` positions and its pages from
+ impl<T: DeviceCopy> Views for DeviceTensor<T> {

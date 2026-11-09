@@ -301,7 +301,7 @@ pub struct Plan<'a> {
     pub kv_floor: Option<u64>,
     /// The K/V planes' backing the plan was made under
     /// (`PlanLevers::kv_host`, `BLOOMERY_KV_HOST`): under [`KvHost::All`] the
-    /// cards' cache terms drop the planes ([`KvBytes::plane_bytes`]) and the
+    /// cards' cache terms drop the host-able rooms ([`KvBytes::rooms`]) and the
     /// host holds them ([`HostTotals::kv_host_bytes`]); `spill` and `off`
     /// leave the card terms as they were.
     pub kv_host: KvHost,

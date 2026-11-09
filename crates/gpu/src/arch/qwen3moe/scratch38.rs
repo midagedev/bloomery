@@ -25,6 +25,7 @@ use crate::kv_format::KvQ8;
 use crate::linear::{self, LinearShape};
 use crate::ple;
 use crate::qsa::{self, QsaScratch};
+use crate::room::kv::kv_backing;
 use crate::room::{Backing, Room, Roomed, Run, SharedPages};
 use crate::route_softmax::{RouterDims, RouterOut};
 use crate::site::ByName;
@@ -32,6 +33,7 @@ use crate::tensor::WindowMut;
 use cuda_core::{CudaStream, DeviceBuffer};
 use runtime::hc_gated::Geometry;
 use runtime::stores;
+use runtime::stores::Access;
 use std::sync::Arc;
 
 /// The most tokens an eager pass walks: the m-column kernels' width.
@@ -87,19 +89,26 @@ pub(super) const LANES: usize = 1;
 /// `runtime::stores` owns the count.
 pub(super) const VERIFY_ROWS: usize = stores::DELTA_VERIFY_ROWS;
 
-/// What a selecting store's K/V planes' room is named, for a fit's refusal
-/// and the ordering the fit's retry reads ([`Body38::fit_stores`]).
+/// What a selecting store's K/V planes' room is named, for a fit's refusal.
 pub(super) const KV_PLANES: &str = "a Qwen3.8 slot's K/V planes";
 
-/// The room backing the `BLOOMERY_KV_HOST` lever names for the K/V planes:
-/// the store's own mapping of the lever's typed word, one owner with the
-/// lever row. `margin` is the plan's card margin (`Card::margin_bytes`), the
-/// free bytes a `spill` room keeps on the card.
-pub(super) fn backing_of(kv: bloomery_levers::KvHost, margin: u64) -> Backing {
-    match kv {
-        bloomery_levers::KvHost::Off => Backing::Card,
-        bloomery_levers::KvHost::Spill => Backing::Spill { margin },
-        bloomery_levers::KvHost::All => Backing::Host,
+/// How a selecting layer's planes are read: the selector's top-k rows of them a step, so a page
+/// may sit on the host.
+pub(super) const PLANES_ACCESS: Access = Access::Select { rows: 2_048 };
+
+/// The `BLOOMERY_KV_HOST` lever's typed word and the plan's card margin
+/// (`Card::margin_bytes`), what [`KvLevers::backing`] maps to a room's backing for a buffer: one
+/// map of the lever word (`kv_backing`), the class rule for each buffer's access.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct KvLevers {
+    pub(super) word: bloomery_levers::KvHost,
+    pub(super) margin: u64,
+}
+
+impl KvLevers {
+    /// The backing a buffer read as `access` takes under the lever.
+    pub(super) fn backing(self, access: Access) -> Backing {
+        kv_backing(self.word, access, self.margin).into()
     }
 }
 
@@ -138,14 +147,15 @@ impl Store38 {
 
     /// A selecting store of `ctx` positions over the planes `d` cuts, its
     /// K/V planes in the load's cache format `kv` (the index keys f16) and
-    /// backed where `backing` says ([`backing_of`], `BLOOMERY_KV_HOST`), its
-    /// pooled keys always on the card (the indexer scans them every step),
-    /// no row backed until a fit reaches it, zeroed then on `stream`.
+    /// backed where the lever says for a selected buffer ([`KvLevers::backing`],
+    /// `BLOOMERY_KV_HOST`), its pooled keys where it says for a scanned one
+    /// (the card: the indexer scans them every step), no row backed until a
+    /// fit reaches it, zeroed then on `stream`.
     pub(super) fn qsa(
         stream: &Arc<CudaStream>,
         d: &Dims,
         kv: KvQ8,
-        backing: Backing,
+        levers: KvLevers,
     ) -> Result<Store38, GpuError> {
         let pools = qsa::pools_for(d.ctx);
         let run = Run {
@@ -155,13 +165,20 @@ impl Store38 {
             rows: pools,
         };
         Ok(Store38::Qsa {
-            kv: KvPlanes::roomed_backed(stream, (d.n_kv, d.ctx, d.head), kv, KV_PLANES, backing)?,
+            kv: KvPlanes::roomed_backed(
+                stream,
+                (d.n_kv, d.ctx, d.head),
+                kv,
+                KV_PLANES,
+                levers.backing(PLANES_ACCESS),
+            )?,
             ring: DeviceBuffer::zeroed(stream, qsa::RING_ROWS * geo::IDX_DIM)?,
-            pooled: Roomed::new(
+            pooled: Roomed::with_backing(
                 Arc::clone(stream),
                 pools * geo::IDX_DIM,
                 &[run],
                 "a Qwen3.8 slot's pooled keys",
+                levers.backing(Access::Scan),
                 |[b]| b,
             )?,
         })
@@ -784,7 +801,7 @@ mod tests {
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_room_admission_counts_every_slots_whole_pages() {
-        use super::{Backing, KvPlanes, KvQ8, Store38, dims};
+        use super::{KvLevers, KvPlanes, KvQ8, Store38, dims};
         use model::arch::models::{
             Act, Arch, ChatSpec, Ffn, Gqa, LayerSpec, Mixer, ModelSpec, OutGate, PoolRule,
             Residual, Rope, RopeMode, Selector,
@@ -873,8 +890,16 @@ mod tests {
             for slots in [1, 16] {
                 let stores: Vec<_> = (0..slots)
                     .map(|_| {
-                        Store38::qsa(&stream, &dims(router, ctx), kv, Backing::Card)
-                            .expect("a selecting store")
+                        Store38::qsa(
+                            &stream,
+                            &dims(router, ctx),
+                            kv,
+                            KvLevers {
+                                word: bloomery_levers::KvHost::Off,
+                                margin: 0,
+                            },
+                        )
+                        .expect("a selecting store")
                     })
                     .collect();
                 for drafts in [false, true] {

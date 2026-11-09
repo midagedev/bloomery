@@ -128,8 +128,8 @@ use super::program38::{
 };
 use super::scratch::{Io, KvPlanes, LANE, LaneWord, PassRecord, RecStore, RopeRows, StepParams};
 use super::scratch38::{
-    Arena38, KV_PLANES, LANES, PASS_ROWS, Ple38, Store38, Taps38, VERIFY_ROWS, WideRecord,
-    backing_of, dims, final_res, no_carry, store_rule_bytes,
+    Arena38, KvLevers, LANES, PASS_ROWS, Ple38, Store38, Taps38, VERIFY_ROWS, WideRecord, dims,
+    final_res, no_carry, store_rule_bytes,
 };
 use super::slot_pass::SlotIn;
 use super::swap38::{self, DEADLINE, LIVE_DELAY};
@@ -171,13 +171,13 @@ use crate::model::{
     SlotRows, Slots,
 };
 use crate::prompt_timing::{PromptStats, PromptTiming, nanos};
-use crate::room::Backing;
 use crate::rope_table::{RopeSpec, RopeTable};
 use crate::rows::{Laid, RowFormat, RowKernels, RowRead};
 use crate::site::ByName;
 use crate::tensor::{WindowMut, to_host};
 use crate::weights::{Weights, tensor_scales};
 use crate::{Branch, DeviceTensor, Gpu, GpuError, SharedPages, StagedRows, launch_u32, ple, qsa};
+use crate::{FreedBytes, KvRoomBody, fit_rooms};
 use bloomery_levers::{ChurnHosting, HostCfg};
 use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, sys};
 use engram::Hash;
@@ -1308,11 +1308,12 @@ pub struct Body38 {
     /// sequence past the plan is refused by name.
     slots_planned: usize,
     slots_made: usize,
-    /// Where a selecting store's K/V planes back their pages
-    /// (`BLOOMERY_KV_HOST`, the plan's `kv_host` word as [`backing_of`]
-    /// maps it): the load's own stores and every [`Slots::new_seq`]'s take
-    /// it, the pooled keys and the raw key ring staying on the card.
-    kv_backing: Backing,
+    /// Where a selecting store's rooms back their pages
+    /// (`BLOOMERY_KV_HOST`, the plan's `kv_host` word as [`KvLevers::backing`]
+    /// maps it for each buffer's access): the load's own stores and every
+    /// [`Slots::new_seq`]'s take it, the planes following the word, the
+    /// pooled keys (scanned) and the raw key ring staying on the card.
+    kv_levers: KvLevers,
     /// A pass of several slots' input records, on a load planned for more
     /// than one sequence.
     slot_in: Option<SlotIn>,
@@ -1816,13 +1817,16 @@ impl Body38 {
         // stage card's margin free.
         let kv = KvQ8::of(inputs.kv.is_q8());
         let margin = plan.machine.cards.first().map_or(0, |c| c.margin_bytes);
-        let kv_backing = backing_of(plan.kv_host, margin);
+        let kv_levers = KvLevers {
+            word: plan.kv_host,
+            margin,
+        };
         let handle = gpu.stream_handle();
         let stores = kinds
             .iter()
             .map(|k| match k {
                 Kind38::Gdn => Store38::rec(stream),
-                Kind38::Qsa => Store38::qsa(&handle, &d, kv, kv_backing),
+                Kind38::Qsa => Store38::qsa(&handle, &d, kv, kv_levers),
             })
             .collect::<Result<Vec<_>, _>>()?;
         let (rec, sel) = store_rule_bytes(ctx, kv);
@@ -2106,7 +2110,7 @@ impl Body38 {
             ple_due: None,
             slots_planned: planned,
             slots_made: 1,
-            kv_backing,
+            kv_levers,
             slot_in: (planned > 1).then(|| SlotIn::new(stream)).transpose()?,
             last_walk: TargetRows::Step,
             wrote: Wrote38::default(),
@@ -3881,70 +3885,7 @@ impl Body38 {
     /// host bytes, which no freed card bytes can make; the pooled keys, on
     /// the card in every setting, keep the retry `off` runs).
     fn fit_stores(&mut self, pos: usize, rows: usize) -> Result<(), GpuError> {
-        let through = pos + rows;
-        let first = match self.fit_each(pos, through) {
-            Ok(()) => return Ok(()),
-            Err(e) => e,
-        };
-        // A spilled fit of the planes that ran out of host bytes: the
-        // machine frees card bytes, which cannot make host memory.
-        if matches!(self.kv_backing, Backing::Spill { .. })
-            && let GpuError::NoRoom { what, .. } = &first
-            && *what == KV_PLANES
-        {
-            return Err(first);
-        }
-        let GpuError::NoRoom { free, page, .. } = first else {
-            return Err(first);
-        };
-        let free = match free.map_or_else(|| crate::current_mem_info().map(|m| m.0), Ok) {
-            Ok(free) => free,
-            Err(e) => {
-                return Err(first.noting_room(format!(
-                    "the residency machine was not asked: the card's free bytes are unreadable \
-                     ({e})"
-                )));
-            }
-        };
-        let asked: usize = self.stores.iter().map(|s| s.asks(through)).sum();
-        let want = asked.saturating_sub(free).saturating_add(page);
-        let engine = Arc::clone(&self.engine);
-        let freed = match self.residency_parts() {
-            Some(ResidencyParts { glue, hybrid, .. }) => {
-                glue.free_bytes(hybrid, &engine, want as u64)
-            }
-            None => Err(GpuError::state(
-                WHAT,
-                "a residency machine to free expert bytes for the stores",
-            )),
-        };
-        let freed = match freed {
-            Ok(f) => f,
-            Err(e) => {
-                return Err(first.noting_room(format!(
-                    "the residency machine freed 0 B of the {want} B the fit was short: {e}"
-                )));
-            }
-        };
-        self.fit_each(pos, through).map_err(|e| {
-            e.noting_room(format!(
-                "after the residency machine freed {} B of expert stacks ({} slots a layer over \
-                 {} layers)",
-                freed.bytes,
-                freed.k,
-                freed.layers.len()
-            ))
-        })
-    }
-
-    /// Every store fitted through `through` positions and its pages from
-    /// `pos` on made this sequence's own, store by store.
-    fn fit_each(&mut self, pos: usize, through: usize) -> Result<(), GpuError> {
-        for s in &mut self.stores {
-            s.fit(through)?;
-            s.own_from(pos)?;
-        }
-        Ok(())
+        fit_rooms(self, pos, rows)
     }
 
     /// The staged call of `rows` from `pos` launched: the stores' count past
@@ -5648,6 +5589,40 @@ impl MediaBody for Body38 {
     }
 }
 
+/// The rooms `fit_stores` runs: every selecting store's, the residency machine the one that
+/// frees expert bytes for them.
+impl KvRoomBody for Body38 {
+    const WHAT: &'static str = WHAT;
+
+    fn fit_each(&mut self, pos: usize, through: usize) -> Result<(), GpuError> {
+        for s in &mut self.stores {
+            s.fit(through)?;
+            s.own_from(pos)?;
+        }
+        Ok(())
+    }
+
+    fn asks(&self, through: usize) -> usize {
+        self.stores.iter().map(|s| s.asks(through)).sum()
+    }
+
+    fn free_expert_bytes(&mut self, want: u64) -> Result<FreedBytes, GpuError> {
+        let engine = Arc::clone(&self.engine);
+        let Some(ResidencyParts { glue, hybrid, .. }) = self.residency_parts() else {
+            return Err(GpuError::state(
+                WHAT,
+                "a residency machine to free expert bytes for the stores",
+            ));
+        };
+        let freed = glue.free_bytes(hybrid, &engine, want)?;
+        Ok(FreedBytes {
+            bytes: freed.bytes,
+            slots: freed.k,
+            layers: freed.layers.len(),
+        })
+    }
+}
+
 impl ChainBody for Body38 {
     type Input = DecodeInput38;
     type Host = Body38;
@@ -5951,13 +5926,13 @@ impl Slots for Body38 {
         // The load's one cache format, read back from the live planes, and
         // the planes' backing the load was made under.
         let kv = self.kv_format();
-        let backing = self.kv_backing;
+        let levers = self.kv_levers;
         let stores = self
             .kinds()
             .into_iter()
             .map(|k| match k {
                 LayerKind38::Gdn => Store38::rec(stream),
-                LayerKind38::Qsa => Store38::qsa(&handle, &d, kv, backing),
+                LayerKind38::Qsa => Store38::qsa(&handle, &d, kv, levers),
             })
             .collect::<Result<Vec<_>, _>>()?;
         let ckpt = Checkpoints::sequence(

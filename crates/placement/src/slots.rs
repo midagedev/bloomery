@@ -8,6 +8,8 @@
 
 use std::num::NonZeroU64;
 
+use runtime::stores::PosLayout;
+
 use crate::placement::KvBytes;
 
 /// One sequence's per-layer stores on a load: the bytes each layer holds at
@@ -102,6 +104,7 @@ impl<'a> SeqTerms<'a> {
         SlotsOf {
             kv: self.layers.kv,
             slots,
+            rooms: self.layers.kv.rooms().map(|r| r.times(slots)),
         }
     }
 
@@ -121,10 +124,12 @@ impl<'a> SeqTerms<'a> {
 /// A [`KvBytes`] times `slots` ([`SeqTerms::slots_of`]): each layer's cache
 /// and its ring shadows held `slots` times over. A product past u64 bytes is
 /// `u64::MAX`, which no card or host holds.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct SlotsOf<'a> {
     kv: &'a dyn KvBytes,
     slots: u64,
+    /// The load's rooms held by every slot ([`PosLayout::times`]).
+    rooms: Option<PosLayout>,
 }
 
 impl KvBytes for SlotsOf<'_> {
@@ -134,10 +139,8 @@ impl KvBytes for SlotsOf<'_> {
             .saturating_mul(self.slots)
     }
 
-    fn plane_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
-        self.kv
-            .plane_bytes(layer, ctx_max)
-            .saturating_mul(self.slots)
+    fn rooms(&self) -> Option<&PosLayout> {
+        self.rooms.as_ref()
     }
 
     fn shadow_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
@@ -196,8 +199,26 @@ pub fn split_ctx(total: u64, slots: u64, floor: NonZeroU64) -> Result<u64, Split
 mod tests {
     use std::num::NonZeroU64;
 
+    use std::sync::LazyLock;
+
+    use runtime::stores::{Access, PosBuf, PosLayout};
+
     use super::{SeqTerms, SplitError, Stores, split_ctx};
     use crate::placement::KvBytes;
+
+    /// Layer 1's planes of the toy: 4 B a position, selected.
+    static TOY_ROOMS: LazyLock<PosLayout> = LazyLock::new(|| {
+        PosLayout::new(vec![
+            vec![],
+            vec![PosBuf {
+                what: "planes",
+                row: 4,
+                per: 1,
+                runs: 1,
+                access: Access::Select { rows: 1 },
+            }],
+        ])
+    });
 
     /// Layer 0 a fixed state of 1,000 B; layer 1 7 B a position, with a ring
     /// shadow of 3 B a position; any layer past those 99 B, which a sum over
@@ -213,8 +234,8 @@ mod tests {
             }
         }
 
-        fn plane_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
-            if layer == 1 { 4 * ctx_max } else { 0 }
+        fn rooms(&self) -> Option<&PosLayout> {
+            Some(&TOY_ROOMS)
         }
 
         fn shadow_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
@@ -291,7 +312,8 @@ mod tests {
             for layer in 0..3 {
                 for c in [1, 4096] {
                     assert_eq!(view.layer_bytes(layer, c), n * Toy.layer_bytes(layer, c));
-                    assert_eq!(view.plane_bytes(layer, c), n * Toy.plane_bytes(layer, c));
+                    let rooms = view.rooms().expect("the toy's rooms times the slots");
+                    assert_eq!(rooms.host_able(layer, c), n * TOY_ROOMS.host_able(layer, c));
                     assert_eq!(view.shadow_bytes(layer, c), n * Toy.shadow_bytes(layer, c));
                 }
             }

@@ -71,8 +71,9 @@ use crate::placement::{
 use gguf::digest::hex;
 
 use runtime::stores::{
-    DELTA_VERIFY_ROWS, F32_BYTES, delta_carry_bytes, delta_lane_bytes, delta_record_bytes,
-    index_ring_bytes, kv_plane_bytes, ple_ring_bytes, recurrent_bytes, selecting_rows_bytes,
+    Access, Class, DELTA_VERIFY_ROWS, F16_BYTES, F32_BYTES, PosBuf, PosLayout, delta_carry_bytes,
+    delta_lane_bytes, delta_record_bytes, index_ring_bytes, kv_plane_bytes, ple_ring_bytes,
+    recurrent_bytes, selecting_rows_bytes,
 };
 pub use runtime::stores::{PASS_ROWS, conv_ring_rows, ple_ring_rows};
 
@@ -378,11 +379,6 @@ fn refuse_other_program(spec: &ModelSpec) -> Result<(), PlacementError> {
 }
 
 impl PlanInputs {
-    /// `n` rounded up to `page`; `None` past u64.
-    fn whole(n: u64, page: u64) -> Option<u64> {
-        n.div_ceil(page).checked_mul(page)
-    }
-
     /// The page a host-capable room takes ([`PlanInputs::kv_host_page`]),
     /// refused by name where the binary that plans under `BLOOMERY_KV_HOST`
     /// did not read it: the plan's page rounding for the planes has no page
@@ -419,60 +415,61 @@ impl PlanInputs {
             KvHost::Off => None,
             KvHost::Spill | KvHost::All => Some(self.kv_host_page_of()?),
         };
-        let at = host_page.unwrap_or(page);
-        let padding = |n: u64, at: u64| Self::whole(n, at)?.checked_sub(n);
-        // The planes' padding at a page of the rooms' own.
-        let planes_at = |g: &models::Gqa, at: u64| -> Option<u64> {
-            let values = u64::from(g.kv_heads)
-                .checked_mul(ctx)?
-                .checked_mul(u64::from(g.head_dim))?;
-            let one = if self.kv.is_q8() {
-                padding(values, at)?.checked_add(padding(values / 16, at)?)?
-            } else {
-                padding(values.checked_mul(2)?, at)?
-            };
-            one.checked_mul(2)
+        // A host-class room rounds at the page its backing takes — the card's own under `off`, a
+        // host-capable room's under `spill`, none under `all` (it holds no card bytes); a
+        // card-class room, the pooled keys and the draft's store, at the card's page.
+        let pages = |class: Class| match class {
+            Class::Card => Some(page),
+            Class::Host => match kv {
+                KvHost::Off => Some(page),
+                KvHost::Spill => host_page,
+                KvHost::All => None,
+            },
         };
-        // The target's planes: none under `all` (a host-backed room holds
-        // them off the card), else at the page their rooms take — the card's
-        // own under `off`, a host-capable room's under `spill`.
-        let planes = |g: &models::Gqa| -> Option<u64> {
-            if kv == KvHost::All {
-                return Some(0);
-            }
-            planes_at(g, at)
-        };
-        // The draft's store stays on the card whatever the planes' backing.
-        let draft_planes = |g: &models::Gqa| -> Option<u64> { planes_at(g, page) };
         // The card rooms' shared spare page, and a host-capable room's own
         // beside it where the two pages differ.
         let spare = page
-            + if kv != KvHost::Off && at != page {
-                at
-            } else {
-                0
+            + match host_page {
+                Some(at) if kv != KvHost::Off && at != page => at,
+                _ => 0,
             };
-        let count = || -> Option<u64> {
-            let mut extra = 0u64;
-            for layer in &self.spec.layers {
-                if let Mixer::Gqa(g) = &layer.mixer {
-                    extra = extra.checked_add(planes(g)?)?;
-                    if let Some(Selector::TokenPool { d, pool, .. }) = &g.select {
-                        let bytes = ctx
-                            .div_ceil(u64::from(*pool))
-                            .checked_mul(u64::from(*d))?
-                            .checked_mul(2)?;
-                        extra = extra.checked_add(padding(bytes, page)?)?;
-                    }
-                }
-            }
-            if drafts {
-                extra = extra.checked_add(draft_planes(self.spec.gqa()?)?)?;
-            }
-            extra.checked_mul(slots)?.checked_add(spare)
-        };
-        count().ok_or_else(|| PlacementError::CardBytesPastU64 {
+        let rooms = self.rooms_declared()?;
+        let past = || PlacementError::CardBytesPastU64 {
             card: "room-backed stores".to_owned(),
+        };
+        let mut extra = 0u64;
+        for layer in 0..rooms.layers() {
+            extra = rooms
+                .padding(layer, ctx, pages)
+                .and_then(|p| extra.checked_add(p))
+                .ok_or_else(past)?;
+        }
+        if drafts {
+            let g = self.spec.gqa().ok_or_else(past)?;
+            let draft = PosLayout::new(vec![plane_bufs(
+                (g.kv_heads as usize, g.head_dim as usize),
+                self.kv.is_q8(),
+                Access::Scan,
+            )]);
+            extra = draft
+                .padding(0, ctx, |_| Some(page))
+                .and_then(|p| extra.checked_add(p))
+                .ok_or_else(past)?;
+        }
+        extra
+            .checked_mul(slots)
+            .and_then(|e| e.checked_add(spare))
+            .ok_or_else(past)
+    }
+
+    /// The layout's rooms, refused by name on a layout that declares none (a file without the
+    /// selector: its stores are plain buffers).
+    fn rooms_declared(&self) -> Result<&PosLayout, PlacementError> {
+        self.kv.rooms().ok_or_else(|| PlacementError::Metadata {
+            key: "the stores' rooms".to_owned(),
+            detail: "this layout declares none: a file without the selector holds its cache in \
+                     plain buffers"
+                .to_owned(),
         })
     }
 
@@ -485,33 +482,19 @@ impl PlanInputs {
     /// room ([`Plan::kv_host_planes`]).
     pub fn kv_host_bytes(&self, ctx: u64, slots: u64, page: u64) -> Result<u64, PlacementError> {
         assert!(page > 0, "the page a host-capable room takes is positive");
-        let q8 = self.kv.is_q8();
-        let planes = |g: &models::Gqa| -> Option<u64> {
-            let values = u64::from(g.kv_heads)
-                .checked_mul(ctx)?
-                .checked_mul(u64::from(g.head_dim))?;
-            let one = if q8 {
-                Self::whole(values, page)?.checked_add(Self::whole(values / 16, page)?)?
-            } else {
-                Self::whole(values.checked_mul(2)?, page)?
-            };
-            one.checked_mul(2)
-        };
-        let count = || -> Option<u64> {
-            let mut whole = 0u64;
-            for layer in &self.spec.layers {
-                if let Mixer::Gqa(g) = &layer.mixer
-                    && g.select.is_some()
-                {
-                    whole = whole.checked_add(planes(g)?)?;
-                }
-            }
-            whole.checked_mul(slots)
-        };
-        count().ok_or_else(|| PlacementError::Metadata {
+        let rooms = self.rooms_declared()?;
+        let past = || PlacementError::Metadata {
             key: "the K/V planes on the host".to_owned(),
             detail: "the planes' bytes over the resident slots pass u64".to_owned(),
-        })
+        };
+        let mut whole = 0u64;
+        for layer in 0..rooms.layers() {
+            whole = rooms
+                .host_whole(layer, ctx, page)
+                .and_then(|w| whole.checked_add(w))
+                .ok_or_else(past)?;
+        }
+        whole.checked_mul(slots).ok_or_else(past)
     }
 
     /// `machine`'s stage card with the page rounding of room-backed stores
@@ -2286,8 +2269,14 @@ pub struct KvLayout {
     /// The selector's key width and each layer's pool (0 on a GDN layer);
     /// `None` on a qwen35moe file.
     select: Option<(usize, Vec<usize>)>,
+    /// The selector's rows kept per query (`top_k`); 0 without the selector.
+    top_k: u64,
     /// An attention layer's K/V planes in q8_0's layout.
     q8: bool,
+    /// The by-position buffers a load of this layout holds in rooms: the selecting layers'
+    /// K/V planes and pooled keys ([`KvLayout::rooms_of`]); `None` on a layout whose stores are
+    /// plain buffers (a file without the selector).
+    rooms: Option<PosLayout>,
     /// The stage rope table, in bytes a position: `rope.dimension_count`
     /// f32. The body copies one table at load, not one per sequence. A media
     /// sequence's own table is outside this count.
@@ -2322,6 +2311,7 @@ impl KvLayout {
         let mut pools = Vec::with_capacity(spec.layers.len());
         let mut gdn: Option<&DeltaRule> = None;
         let mut attn = None;
+        let mut top_k = 0u64;
         for (layer, l) in spec.layers.iter().enumerate() {
             let refuse = |what: &str| unsized_layer(layer, what);
             match &l.mixer {
@@ -2336,7 +2326,12 @@ impl KvLayout {
                         Some(Selector::TokenPool { pool: 0, .. }) => {
                             return Err(refuse("a token-pool selector of no positions a pool"));
                         }
-                        Some(Selector::TokenPool { d, pool, .. }) => (*pool as usize, Some(*d)),
+                        Some(Selector::TokenPool {
+                            d, pool, top_k: k, ..
+                        }) => {
+                            top_k = u64::from(*k);
+                            (*pool as usize, Some(*d))
+                        }
                         Some(_) => return Err(refuse("a GQA layer selecting by another rule")),
                     };
                     let shape = (g.kv_heads, g.head_dim, idx_dim);
@@ -2375,7 +2370,7 @@ impl KvLayout {
             )
         });
         let (kv_heads, head_dim, idx_dim) = attn.unwrap_or((0, 0, None));
-        Ok(KvLayout {
+        let mut layout = KvLayout {
             kinds,
             recurrent,
             replay: if record_rows > 0 {
@@ -2388,23 +2383,61 @@ impl KvLayout {
             kv_heads: kv_heads as usize,
             head_dim: head_dim as usize,
             select: idx_dim.map(|d| (d as usize, pools)),
+            top_k,
             q8: false,
+            rooms: None,
             rope_row: spec.gqa().map_or(0, |g| u64::from(g.rope.dims)) * F32_BYTES,
-        })
+        };
+        layout.rooms = layout.rooms_of();
+        Ok(layout)
+    }
+
+    /// The by-position buffers of the layout's selecting layers, `None` on a layout without the
+    /// selector: K and V planes of `kv_heads` runs of `[ctx][head]` (f16, or q8_0's data and
+    /// scales), read by the selector's top-k (`Select`), and the pooled keys of a pool of
+    /// positions, which the indexer scans every step (`Scan`).
+    fn rooms_of(&self) -> Option<PosLayout> {
+        let (idx_dim, pools) = self.select.as_ref()?;
+        let planes = plane_bufs(
+            (self.kv_heads, self.head_dim),
+            self.q8,
+            Access::Select { rows: self.top_k },
+        );
+        let layers = self
+            .kinds
+            .iter()
+            .zip(pools)
+            .map(|(kind, &pool)| match kind {
+                Kind::Attention => {
+                    let mut bufs = planes.clone();
+                    bufs.push(PosBuf {
+                        what: "pooled keys",
+                        row: *idx_dim as u64 * F16_BYTES,
+                        per: pool as u64,
+                        runs: 1,
+                        access: Access::Scan,
+                    });
+                    bufs
+                }
+                Kind::DeltaRule => Vec::new(),
+            })
+            .collect();
+        Some(PosLayout::new(layers))
     }
 
     /// The same layout with an attention layer's K/V planes in q8_0's
     /// two-plane layout.
     #[must_use]
-    pub const fn in_q8(mut self) -> KvLayout {
+    pub fn in_q8(mut self) -> KvLayout {
         self.q8 = true;
+        self.rooms = self.rooms_of();
         self
     }
 
     /// [`KvLayout::in_q8`] when `q8`, else the same layout: the one place a
     /// chosen cache format reaches the plan's layout.
     #[must_use]
-    pub const fn in_q8_if(self, q8: bool) -> KvLayout {
+    pub fn in_q8_if(self, q8: bool) -> KvLayout {
         if q8 { self.in_q8() } else { self }
     }
 
@@ -2587,6 +2620,32 @@ impl KvLayout {
     }
 }
 
+/// A GQA layer's K and V planes as by-position buffers: `kv_heads` runs of `[ctx][head]` each,
+/// f16, or q8_0's data and scales ([`kv_plane_bytes`]'s layouts).
+fn plane_bufs((kv_heads, head_dim): (usize, usize), q8: bool, access: Access) -> Vec<PosBuf> {
+    let (runs, head) = (kv_heads as u64, head_dim as u64);
+    let plane = |what, row| PosBuf {
+        what,
+        row,
+        per: 1,
+        runs,
+        access,
+    };
+    if q8 {
+        vec![
+            plane("K data", head),
+            plane("K scales", head / 16),
+            plane("V data", head),
+            plane("V scales", head / 16),
+        ]
+    } else {
+        vec![
+            plane("K plane", head * F16_BYTES),
+            plane("V plane", head * F16_BYTES),
+        ]
+    }
+}
+
 impl KvBytes for KvLayout {
     fn layer_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
         let ple = match self.ple {
@@ -2604,17 +2663,11 @@ impl KvBytes for KvLayout {
         own + ple
     }
 
-    /// A selecting layer's planes alone — the part a host-backed store
-    /// (`BLOOMERY_KV_HOST=all`) holds off the card; a plain attention
-    /// layer's cache is plain device tensors on the loads that read this
-    /// layout, so none of it moves.
-    fn plane_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
-        match (&self.select, self.kinds.get(layer)) {
-            (Some(_), Some(Kind::Attention)) => {
-                kv_plane_bytes(self.kv_heads, self.head_dim, self.q8, ctx_max)
-            }
-            _ => 0,
-        }
+    /// The selecting layers' planes and pooled keys, the stores a room backs; a plain attention
+    /// layer's cache is plain device tensors on the loads that read this layout, so none of it
+    /// moves.
+    fn rooms(&self) -> Option<&PosLayout> {
+        self.rooms.as_ref()
     }
 
     fn stage_position_bytes(&self, ctx_max: u64) -> u64 {
@@ -3350,7 +3403,9 @@ mod tests {
             kv_heads: 2,
             head_dim: 256,
             select: Some((128, vec![0, 0, 4])),
+            top_k: 2048,
             q8: false,
+            rooms: None,
             rope_row: 64 * 4,
         };
         assert_eq!(kv.layer_bytes(0, 4096), 3_596_288 + 294_916 + 530_448);
@@ -3946,7 +4001,9 @@ mod tests {
                 128,
                 (0..48).map(|l| if l % 4 == 3 { 4 } else { 0 }).collect(),
             )),
+            top_k: 0,
             q8: false,
+            rooms: None,
             rope_row: 64 * 4,
         };
         let checkpoint = 36 * 4_126_736 + 696_320 + 12 * 2816;
@@ -3996,7 +4053,9 @@ mod tests {
             kv_heads: 2,
             head_dim: 256,
             select: None,
+            top_k: 0,
             q8: false,
+            rooms: None,
             rope_row: 64 * 4,
         };
         assert_eq!(layout(0).layer_bytes(0, 4096), plain.0);
@@ -4021,7 +4080,9 @@ mod tests {
             kv_heads: 4,
             head_dim: 128,
             select: None,
+            top_k: 0,
             q8: false,
+            rooms: None,
             rope_row: 128 * 4,
         };
         let f16 = plain.layer_bytes(0, 4096);
@@ -4038,7 +4099,9 @@ mod tests {
             kv_heads: 2,
             head_dim: 256,
             select: Some((128, vec![4])),
+            top_k: 0,
             q8: false,
+            rooms: None,
             rope_row: 64 * 4,
         };
         let sel = selecting.layer_bytes(0, 4096);
@@ -5061,6 +5124,37 @@ mod tests {
                 row_source: placement::RowTableSource::Split,
                 arena: None,
                 kv_host_page: None,
+            }
+        }
+
+        /// The layout's declared rooms hold exactly its positional rows: every attention layer's
+        /// buffers sum to the size rule's rows in either cache format, a delta layer holds none,
+        /// and the host-able part is the planes alone.
+        ///
+        /// FAIL-first: a pooled buffer of `per: pool + 1` (or the q8 scales row `head / 8`)
+        /// disagrees with `attention_bytes` at the first context.
+        #[test]
+        fn the_declared_rooms_are_the_positional_rows() {
+            for q8 in [false, true] {
+                let kv = inputs().kv.in_q8_if(q8);
+                let rooms = kv.rooms().expect("the selector's layout declares rooms");
+                for layer in 0..LAYERS {
+                    for ctx in [0u64, 1, 4, 5, 4_096, 262_144] {
+                        let (rows, host) = match kv.kinds[layer] {
+                            super::Kind::Attention => (
+                                kv.attention_bytes(layer, ctx).0,
+                                runtime::stores::kv_plane_bytes(kv.kv_heads, kv.head_dim, q8, ctx),
+                            ),
+                            super::Kind::DeltaRule => (0, 0),
+                        };
+                        assert_eq!(
+                            rooms.bytes(layer, ctx),
+                            rows,
+                            "q8 {q8} layer {layer} ctx {ctx}"
+                        );
+                        assert_eq!(rooms.host_able(layer, ctx), host);
+                    }
+                }
             }
         }
 

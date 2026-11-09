@@ -1141,12 +1141,13 @@ pub static TIER_CENSUS: Kind = Kind {
     ],
 };
 
-/// A Qwen3.8 slot's stores by position on the card: the bytes their backed
-/// pages hold and the bytes the plan counts them at.
+/// A slot's stores that a family holds in rooms, by position on the card: the bytes their backed
+/// pages hold and the bytes the plan counts them at. The fields and the line are the kind's own
+/// whichever family prints it; only a family that declares rooms prints one.
 pub static KV_ROOM: Kind = Kind {
     name: "kv_room",
     head: "kv room",
-    doc: "A slot's stores by position on the card when the bytes they hold moved since the slot's last line: the slot, its positions, the bytes its pages with memory of their own hold (the rows its sequence reached, by pages), the bytes of those pages another slot's stores map too (a prefix one took from the other), the host bytes its K/V planes' pages hold where BLOOMERY_KV_HOST backs them off the card (kv_host_bytes; 0 under off, and absent on a line older than the lever), and the bytes the plan counts the stores at.",
+    doc: "A slot's room-backed stores (a family that declares rooms prints it) by position on the card when the bytes they hold moved since the slot's last line: the slot, its positions, the bytes its pages with memory of their own hold (the rows its sequence reached, by pages), the bytes of those pages another slot's stores map too (a prefix one took from the other), the host bytes its K/V planes' pages hold where BLOOMERY_KV_HOST backs them off the card (kv_host_bytes; 0 under off, and absent on a line older than the lever), and the bytes the plan counts the stores at.",
     parts: &[
         key("slot", U64, ""),
         key("positions", U64, ""),

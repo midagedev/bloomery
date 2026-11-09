@@ -48,7 +48,7 @@ pub struct PlanLevers {
     /// where a `kv_floor` above the context is refused by name.
     pub kv_floor_default: Option<u64>,
     /// The K/V planes' backing `BLOOMERY_KV_HOST` names: `all` plans the
-    /// planes ([`KvBytes::plane_bytes`]) at no card position, so the expert
+    /// host-able rooms ([`KvBytes::rooms`]'s `Select` buffers) at no card position, so the expert
     /// spread gets their bytes, and counts them against the plan's host room
     /// instead; `spill` and `off` leave the plan's card terms as they are.
     /// The type's default is [`KvHost::Off`]. `all` beside a `kv_floor` is refused by name
@@ -282,6 +282,29 @@ pub fn plan_host_routed_reserving<'a>(
 /// `routed` gives them, their ids by `levers.expert_rank` when it names one
 /// ([`ExpertRank::split`]), refused by name when the rank disagrees with the
 /// model's routed layers or the plan places no routed expert on a card.
+/// A load whose cache declares no rooms refuses a K/V lever set to something it would have to
+/// read: a floor count, or `BLOOMERY_KV_HOST` `spill` or `all`. Unset and `off` pass.
+fn refuse_unroomed(kv: &dyn KvBytes, levers: &PlanLevers) -> Result<(), PlacementError> {
+    if kv.rooms().is_some() {
+        return Ok(());
+    }
+    if let Some(floor) = levers.kv_floor {
+        return Err(PlacementError::KvUnroomed {
+            lever: bloomery_levers::KV_FLOOR,
+            value: floor.to_string(),
+        });
+    }
+    let host = match levers.kv_host {
+        KvHost::Off => return Ok(()),
+        KvHost::Spill => "spill",
+        KvHost::All => "all",
+    };
+    Err(PlacementError::KvUnroomed {
+        lever: bloomery_levers::KV_HOST,
+        value: host.to_owned(),
+    })
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "the planners' one body: the model, machine, context and cache, and the rule's three inputs"
@@ -312,6 +335,7 @@ fn plan_rule<'a>(
         None => levers.kv_floor_default.filter(|&floor| floor < ctx_max),
     };
     let kv_at = floor_in_force.unwrap_or(ctx_max);
+    refuse_unroomed(kv, levers)?;
     // `all` is a floor-0 plan for the planes and nothing may say another
     // floor: the two levers name where the spread runs.
     if levers.kv_host == KvHost::All
@@ -319,11 +343,13 @@ fn plan_rule<'a>(
     {
         return Err(PlacementError::KvHostFloor { floor });
     }
-    // Under `all` the planes hold no card bytes: the plan counts every card's
-    // cache through the view that drops them ([`PlanesOff`]), the pooled
-    // keys, rings and stage rows staying at their own positions.
-    let planes_off = (levers.kv_host == KvHost::All).then_some(PlanesOff { kv });
-    let kv_counted = planes_off.as_ref().map_or(kv, |p| p as &dyn KvBytes);
+    // Under `all` the host-able rooms hold no card bytes: the plan counts every card's cache
+    // through the view that drops them ([`KvView`]), the rest of the layer at the cap.
+    let kv_counted = KvView {
+        kv,
+        host: levers.kv_host,
+    };
+    let kv_counted = &kv_counted;
     let card_budget = &levers.card_budget_bytes;
     let rank = levers.expert_rank.as_deref();
     let tiers = machine.tiers.len();
@@ -553,7 +579,7 @@ fn resolve_shares(
     model: &ModelTensors,
     machine: &Machine,
     spread: (u64, u64),
-    kv: &dyn KvBytes,
+    kv: &KvView<'_>,
     rows: &[Option<Row>],
     stacks: &[Vec<usize>],
     routed: Option<RoutedRule>,
@@ -661,51 +687,53 @@ fn host_stage_kv(
         .ok_or_else(past)
 }
 
-/// `kv`'s per-layer bytes less its planes ([`KvBytes::plane_bytes`]): the
-/// view a plan under `BLOOMERY_KV_HOST=all` counts every card's cache by — a
-/// host-backed store holds the planes off the card, the pooled keys and the
-/// rings keeping their card bytes. Everything beside the planes is `kv`'s
-/// own answer.
-struct PlanesOff<'a> {
+/// `kv` as the plan counts a card's cache: where the expert spread's floor reads it, the rooms'
+/// by-position buffers at the floor and every other byte of a layer at the cap (a load whose
+/// stores declare no rooms plans every byte at the cap, whatever the floor), the host-able
+/// rooms' bytes dropped under `BLOOMERY_KV_HOST=all`.
+struct KvView<'a> {
     kv: &'a dyn KvBytes,
+    host: KvHost,
 }
 
-impl KvBytes for PlanesOff<'_> {
-    fn layer_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
-        self.kv
-            .layer_bytes(layer, ctx_max)
-            .checked_sub(self.kv.plane_bytes(layer, ctx_max))
-            .expect("a layer's planes are part of its bytes")
-    }
-
-    fn plane_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
-        self.kv.plane_bytes(layer, ctx_max)
-    }
-
-    fn shadow_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
-        self.kv.shadow_bytes(layer, ctx_max)
-    }
-
-    fn stage_position_bytes(&self, ctx_max: u64) -> u64 {
-        self.kv.stage_position_bytes(ctx_max)
+impl KvView<'_> {
+    /// `layer`'s card bytes with the spread read at `spread` positions and the context at `cap`.
+    fn layer_at(&self, layer: usize, spread: u64, cap: u64) -> u64 {
+        let whole = self.kv.layer_bytes(layer, cap);
+        let Some(rooms) = self.kv.rooms() else {
+            return whole;
+        };
+        let fixed = whole.saturating_sub(rooms.bytes(layer, cap));
+        let dropped = if self.host == KvHost::All {
+            rooms.host_able(layer, spread)
+        } else {
+            0
+        };
+        fixed
+            .saturating_add(rooms.bytes(layer, spread))
+            .saturating_sub(dropped)
     }
 }
 
 /// A card's KV cache and its ring shadows over the layers its stage runs,
 /// and the stage's rows beside the cache on the card that runs layer 0;
-/// none on a tier. The cache is read at the expert spread's floor
-/// (`spread`, the cap itself unset), the shadows and the rows at the cap
-/// `ctx_max`: a room-backed cache holds its floor's pages while its range
-/// and the rows beside it exist at the cap.
-fn card_kv(card: &Card, kv: &dyn KvBytes, (spread, ctx_max): (u64, u64)) -> (u64, u64, u64) {
-    let kv_card = card.layers.clone().map(|l| kv.layer_bytes(l, spread)).sum();
+/// none on a tier. The rooms' cache is read at the expert spread's floor
+/// (`spread`, the cap itself unset), every other cache byte, the shadows and
+/// the rows at the cap `ctx_max`: a room-backed cache holds its floor's pages
+/// while its range and the rows beside it exist at the cap.
+fn card_kv(card: &Card, kv: &KvView<'_>, (spread, ctx_max): (u64, u64)) -> (u64, u64, u64) {
+    let kv_card = card
+        .layers
+        .clone()
+        .map(|l| kv.layer_at(l, spread, ctx_max))
+        .sum();
     let shadow = card
         .layers
         .clone()
-        .map(|l| kv.shadow_bytes(l, ctx_max))
+        .map(|l| kv.kv.shadow_bytes(l, ctx_max))
         .sum();
     let rows = if card.layers.contains(&0) {
-        kv.stage_position_bytes(ctx_max)
+        kv.kv.stage_position_bytes(ctx_max)
     } else {
         0
     };

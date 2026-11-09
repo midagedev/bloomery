@@ -61,6 +61,7 @@ use crate::GpuError;
 use crate::tensor::DeviceTensor;
 
 pub(crate) mod host;
+pub(crate) mod kv;
 
 use self::host::{HostPage, RawMap};
 
@@ -371,6 +372,7 @@ impl Room {
             asked,
             free: free.ok(),
             page: self.page,
+            spill: matches!(self.backing, Backing::Spill { .. }),
         }
     }
 
@@ -788,8 +790,7 @@ pub(crate) struct Roomed<V: Views> {
 impl<V: Views> Roomed<V> {
     /// `N` buffers of `len` elements in one reserve on `stream`'s device,
     /// each at a page boundary, built into `V` by `build`, their pages
-    /// backed where `backing` says ([`Backing`]; [`Roomed::new`] is the card
-    /// choice); `runs` are the rows of one buffer, which every buffer has at
+    /// backed where `backing` says ([`Backing`]); `runs` are the rows of one buffer, which every buffer has at
     /// its own offset. Every page maps the spare: the rows a fit reaches get
     /// memory of their own, zeroed ([`Room::fit`]). `what` names the store
     /// the room backs, for a fit's named refusal. A room that can back
@@ -869,8 +870,8 @@ impl<V: Views> Roomed<V> {
         })
     }
 
-    /// The card-backed choice of [`Roomed::with_backing`]: the buffers every
-    /// store today holds.
+    /// The card-backed choice of [`Roomed::with_backing`], for the room tests.
+    #[cfg(test)]
     pub(crate) fn new<T, const N: usize>(
         stream: Arc<CudaStream>,
         len: usize,

@@ -131,6 +131,7 @@ pub use graph::{
     op_write,
 };
 pub use model::{GpuModel, Slots};
+pub use room::kv::{FreedBytes, KvBacking, KvRoomBody, RoomTensor, fit_rooms, kv_backing};
 pub use room::{SharedPages, StackRoom};
 pub use watchdog::Busy as EngineBusy;
 /// The engine over the DeepSeek-V2-Lite chain — what `GpuModel` alone named
@@ -284,7 +285,9 @@ pub enum GpuError {
     /// `asked` is the bytes of new pages the failing room still asked,
     /// `free` the device's free bytes then (when they could be read) and
     /// `page` the room's page: the numbers a caller that can free bytes
-    /// takes the shortfall from.
+    /// takes the shortfall from. `spill` is set when the room that ran out
+    /// is a spill room (its pages go to the host past the card's margin):
+    /// freed card bytes cannot cure it.
     NoRoom {
         what: &'static str,
         detail: String,
@@ -292,6 +295,7 @@ pub enum GpuError {
         asked: usize,
         free: Option<usize>,
         page: usize,
+        spill: bool,
     },
 }
 
@@ -327,12 +331,14 @@ impl GpuError {
                 asked,
                 free,
                 page,
+                spill,
             } => GpuError::NoRoom {
                 what,
                 detail: format!("{detail}; {note}"),
                 source,
                 asked,
                 free,
+                spill,
                 page,
             },
             other => other,

@@ -14,6 +14,7 @@ mod early;
 mod floor;
 mod host_stage;
 mod kv_floor;
+mod kv_rooms;
 mod legs;
 mod rank;
 
