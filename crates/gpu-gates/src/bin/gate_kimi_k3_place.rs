@@ -1568,7 +1568,10 @@ mod gate {
     /// Clause `kvspill` (the module doc): the plan's host bytes under `spill` with a floor of
     /// [`KV_FLOOR`] positions at a context of [`KV_CTX`] on the stage card's host page, against
     /// the value derived from the cached row's width (a latent layer's `kv_lora` + rope
-    /// values, f16) and the page; `off` counts none.
+    /// values, f16) and the page; `off` counts none. The machine is the `bp` pair's stage card
+    /// alone: the stores and their host pages are the stage's, a tier card holds none, and at the
+    /// whole card's room (no card budget here) the stage holds every routed expert of the small
+    /// file, which leaves a tier card idle and the plan refused (`IdleTier`).
     fn kv_spill(inputs: &PlanInputs) -> Result<bool, GateError> {
         const KV_CTX: u64 = 262_144;
         const KV_FLOOR: u64 = 8_192;
@@ -1576,7 +1579,9 @@ mod gate {
         let page = stage_host_page(Place::Bp.on_host()?.card_specs()?[0])?;
         let mut inputs = inputs.clone();
         inputs.kv_host_page = Some(page);
-        let machine = bp_machine(&inputs)?;
+        let mut machine = bp_machine(&inputs)?;
+        machine.tiers.clear();
+        machine.nodes.truncate(1);
         let held = |host: KvHost| -> Result<u64, GateError> {
             let levers = PlanLevers {
                 kv_floor: Some(KV_FLOOR),
