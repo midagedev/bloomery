@@ -1,0 +1,15 @@
+# gate-rel-length mutant
+# clause: unit test rel_tests::rel_is_zero_on_equal_and_infinite_on_a_hole (crates/gpu-gates/src/bin/shared/e2e.rs)
+# site: e2e::rel, the length check gone (the pre-change gate_qwen35moe_moe body: zip stops at the shorter side)
+# expected red: "assertion failed: rel(&a, &a[..2]).is_infinite()"
+--- a/crates/gpu-gates/src/bin/shared/e2e.rs	2026-11-09 21:15:09
++++ b/crates/gpu-gates/src/bin/shared/e2e.rs	2026-11-09 21:15:09
+@@ -18,7 +18,7 @@
+ /// `‖got − want‖ / ‖want‖` in f64, normalised by `want`; infinite on a NaN or
+ /// an infinity in either vector or a length mismatch, so none passes a band.
+ pub fn rel(got: &[f32], want: &[f32]) -> f64 {
+-    if got.len() != want.len() || got.iter().chain(want).any(|v| !v.is_finite()) {
++    if got.iter().chain(want).any(|v| !v.is_finite()) {
+         return f64::INFINITY;
+     }
+     let (mut num, mut den) = (0.0f64, 0.0f64);
