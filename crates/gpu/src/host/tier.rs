@@ -292,6 +292,19 @@ impl TierOpen {
             })
             .collect())
     }
+
+    /// The tier cards of a family whose host tier serves one tier
+    /// ([`Self::of_machine`] and [`super::refuse_tier_count`] as `what`): the open
+    /// every such body's constructor starts with, before anything uploads.
+    ///
+    /// # Errors
+    /// A tier-node lever of another count than the machine's tiers, or more
+    /// tier cards than the host tier serves, each by name.
+    pub fn one_of(machine: &Machine, what: &'static str) -> Result<Vec<TierOpen>, GpuError> {
+        let tiers = Self::of_machine(machine)?;
+        super::refuse_tier_count(what, tiers.len())?;
+        Ok(tiers)
+    }
 }
 
 // ------------------------------------------------------------------ page
