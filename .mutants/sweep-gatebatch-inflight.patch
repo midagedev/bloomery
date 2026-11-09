@@ -1,0 +1,17 @@
+# sweep mutant gatebatch-inflight
+# clause: (c) only mac-disk's LIVE refusal is a run in flight; a target/gate-batch/ left to be moved by hand is an
+#   ordinary refusal and the next names still retire
+#   (tools/sweep.sh --self-test)
+# site: tools/sweep.sh sweep_main step 2, the gate-batch refusal read as in flight (every later name blocked until a human moves it)
+# expected red: "sweep: self-test FAIL: (c3) rc 75, want 1: …"
+--- a/tools/sweep.sh
++++ b/tools/sweep.sh
+@@ -142,7 +142,7 @@
+       retired="$retired$(basename "$path")"$'\n'
+       nret=$((nret + 1))
+     elif [ "$rc" = 1 ]; then
+-      inflight=$(grep -E '^refused .*: LIVE: ' <<< "$mout" | head -n 1)
++      inflight=$(grep -E '^refused .*: (LIVE: |target/gate-batch/ exists)' <<< "$mout" | head -n 1)
+       [ -z "$inflight" ] || break
+       refused=$((refused + 1))
+     else

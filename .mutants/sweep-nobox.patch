@@ -1,0 +1,16 @@
+# sweep mutant nobox
+# clause: (e) no box configured on this machine: step 3 skipped with one line, rc 0
+#   (tools/sweep.sh --self-test)
+# site: tools/sweep.sh box_configured, an ssh with no ws entry read as a box
+# expected red: "sweep: self-test FAIL: (e) box-tracks was called with no box: list …"
+--- a/tools/sweep.sh
++++ b/tools/sweep.sh
+@@ -63,7 +63,7 @@
+   hn=$(ssh -G ws 2> /dev/null | awk '$1 == "hostname" { print $2; exit }')
+   if [ -n "$hn" ] && [ "$hn" != ws ]; then return 0; fi
+   BOX_WHY="BLOOMERY_BOX is unset and ssh has no entry for ws"
+-  return 1
++  return 0
+ }
+ 
+ # remote_configured: 0 when mac-remote.sh has a Mac to reach.

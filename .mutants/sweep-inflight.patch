@@ -1,0 +1,16 @@
+# sweep mutant inflight
+# clause: (c) a mac-disk in-flight refusal ends 75 and calls neither box-tracks nor mac-remote
+#   (tools/sweep.sh --self-test)
+# site: tools/sweep.sh sweep_main step 2, the in-flight refusal counted as an ordinary refusal and the loop going on
+# expected red: "sweep: self-test FAIL: (c) rc 1, want 75: …"
+--- a/tools/sweep.sh
++++ b/tools/sweep.sh
+@@ -143,7 +143,7 @@
+       nret=$((nret + 1))
+     elif [ "$rc" = 1 ]; then
+       inflight=$(grep -E '^refused .*: LIVE: ' <<< "$mout" | head -n 1)
+-      [ -z "$inflight" ] || break
++      [ -z "$inflight" ] || { inflight=''; refused=$((refused + 1)); continue; }
+       refused=$((refused + 1))
+     else
+       step_failed retire "$rc"

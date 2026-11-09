@@ -1,0 +1,16 @@
+# sweep mutant dryrun
+# clause: (d) --dry-run calls no remover
+#   (tools/sweep.sh --self-test)
+# site: tools/sweep.sh sweep_main step 3, the dry-run branch gone: box-tracks --remove runs under --dry-run
+# expected red: "sweep: self-test FAIL: (d) box-tracks calls: box.log is [list⏎--remove bloomery-landed bloomery-landed-base], want [list]"
+--- a/tools/sweep.sh
++++ b/tools/sweep.sh
+@@ -167,7 +167,7 @@
+       bpick=$(box_pick "$brows" "$retired" "$dry")
+       if [ -z "$bpick" ]; then
+         out "box: no directory of the retired names on the box"
+-      elif [ "$dry" = 1 ]; then
++      elif false; then
+         box_n=$(grep -c . <<< "$bpick")
+         out "box: would run tools/box-tracks.sh --remove $(tr '\n' ' ' <<< "$bpick")"
+       else

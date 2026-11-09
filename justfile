@@ -1161,6 +1161,11 @@ wt-new NAME BASE='':
 wt-retire NAME:
     bash tools/wt.sh retire {{NAME}}
 
+# Retire every LANDED or PRUNABLE worktree beside the main tree (tools/sweep.sh: mac-disk retire, then the box's track dirs of
+# those names and the second Mac's stale clones); `--dry-run` changes nothing. 75: a run is in flight, the next sweep retries.
+sweep *ARGS:
+    bash tools/sweep.sh {{ARGS}}
+
 # 1-4의 첫 tok/s. 같은 임대 안에서 ik를 같은 파일·같은 조건으로 한 번 더 잰다.
 # The prebuilt Linux release (tools/release/build.sh's header: the checks it runs on the binaries before it packs):
 # built on the box from a committed tree, with this commit as the binaries' --version. The tarball lands in the box
