@@ -1,0 +1,14 @@
+# kcover R4b mutant verify-slots-unread: Session::verify_slots takes no first-step reading
+# effect: a first decode that is a pass of several slots' verify rows prints no `card bytes` record at first-step
+# expected red: NO ARM IN THIS CHANGE REACHES IT (--parallel 1). Same --parallel 2 drafted variant as step-slots-unread
+# not run on the Mac (device crates); kept so the lead can run it when an arm reaches the wiring.
+--- a/crates/app/src/lib.rs
++++ b/crates/app/src/lib.rs
+@@ -924,7 +924,6 @@
+         self.idle("verify_slots")?;
+         let out = self.model.verify_slots(rows)?;
+         self.slots_waiting = Some(rows.len());
+-        self.card_check(CardPhase::FirstStep)?;
+         Ok(out)
+     }
+ 

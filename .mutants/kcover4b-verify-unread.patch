@@ -1,0 +1,14 @@
+# kcover R4b mutant verify-unread: Session::verify takes no first-step reading
+# effect: the drafted first decode (a window's verify) prints no `card bytes` record at first-step
+# expected red: GLM and Qwen3.8 drafted max-ctx arms (card_bytes_hold_at_max_ctx_drafted): "0 card bytes record(s) at first-step [], within false"; the plain arms stay green
+# not run on the Mac (device crates); the lead runs it on the box, base green first, reversed after.
+--- a/crates/app/src/lib.rs
++++ b/crates/app/src/lib.rs
+@@ -1362,7 +1362,6 @@
+             fetched: false,
+             best_fetched: false,
+         });
+-        self.card_check(CardPhase::FirstStep)?;
+         Ok(out)
+     }
+ 

@@ -15,6 +15,7 @@ use bloomery_gpu_deepseek41::body::{
 };
 use gguf::Split;
 use model::arch::deepseek41::place::PlanInputs;
+use model::placement::card_made::CardPhase;
 use model::placement::{Machine, Plan};
 use runtime::prompt::CallEnd;
 use runtime::{Tapped, TappedPrompt, Target};
@@ -213,7 +214,11 @@ impl TappedPrompt for Session<Body> {
         });
         match refused {
             Some(e) => Err(e),
-            None => called,
+            None => {
+                let next = called?;
+                self.card_check(CardPhase::FirstPrompt)?;
+                Ok(next)
+            }
         }
     }
 }

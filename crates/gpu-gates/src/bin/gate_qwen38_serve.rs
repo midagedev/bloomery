@@ -545,9 +545,10 @@ mod gate {
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::record::{self, Fields, ReadError};
     use bloomery_gpu_gates::serve_client::{
-        LookupCompletion, PrefixRestore, agree, curl, draft_counts, ids_of, json_of, metric,
-        parse_ids, prefix_restore, server_log, shared_system_prompt, slot_action, slot_erased,
-        sse_event, sse_events, stepped_completion, stop_of, tokenized,
+        LookupCompletion, MAX_CTX, MaxCtx, PrefixRestore, agree, card_bytes_hold_at_max_ctx, curl,
+        draft_counts, ids_of, json_of, metric, parse_ids, prefix_restore, server_log,
+        shared_system_prompt, slot_action, slot_erased, sse_event, sse_events, stepped_completion,
+        stop_of, tokenized,
     };
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
@@ -5344,6 +5345,7 @@ mod gate {
         // (the module header): its own server, sampled requests that step,
         // the round records on.
         ok &= slots_sampled_rounds(dir)?;
+        ok &= card_bytes_at_max_ctx(dir, false)?;
         Ok(ok)
     }
 
@@ -5378,6 +5380,44 @@ mod gate {
             mtp.card_bytes_of(u64::try_from(CTX)?, slots)?,
         )?;
         Ok((mtp, plan_levers))
+    }
+
+    /// The card-byte invariant at the most context the seat serves
+    /// ([`card_bytes_hold_at_max_ctx`]): [`DEFAULT_ARGS`] and one slot, so the seat plans its slot
+    /// at the model's limit (`KERNEL_POSITIONS`, fitted down where the card is short), under the
+    /// plain arm's levers or, for `drafted`, the drafted arm's (the draft on, the fixed window):
+    /// the drafted prompt and verify calls run past the session's own prompt and step calls, so
+    /// each is held to its three readings on its own server. FAIL-first: a seat that opens its
+    /// session unwatched (`.mutants/kcover4b-q38-unwatched.patch`) prints no `card bytes` record,
+    /// and the clause names `load`, `first-prompt` and `first-step`.
+    fn card_bytes_at_max_ctx(dir: &Path, drafted: bool) -> Result<bool, GateError> {
+        let label = if drafted { "drafted" } else { "plain" };
+        let own = dir.join(format!("max-ctx-{label}"));
+        card_bytes_hold_at_max_ctx(
+            &format!("{MAX_CTX}_{label}"),
+            &MaxCtx {
+                dir: &own,
+                kinds: record::BLOOMERY_SERVE_QWEN38,
+                listening: &record::LISTENING38,
+            },
+            || {
+                let mut cmd = Command::new(Served38::exe()?);
+                cmd.env(bloomery_levers::RESIDENCY, "off");
+                if drafted {
+                    cmd.env(bloomery_levers::DRAFT, "mtp")
+                        .env(bloomery_levers::MTP_WIDTH, "fixed");
+                } else {
+                    cmd.env(bloomery_levers::DRAFT, "off")
+                        .env_remove(bloomery_levers::MTP_WIDTH);
+                }
+                let args = DEFAULT_ARGS
+                    .iter()
+                    .chain(&["--parallel", "1"])
+                    .map(|a| (*a).to_owned())
+                    .collect();
+                Ok((cmd, args))
+            },
+        )
     }
 
     /// `cmd`'s `BLOOMERY_CARD_BUDGET` for a drafting load of `slots` resident
@@ -5507,6 +5547,7 @@ mod gate {
         );
         println!("server stopped: {}", served.stop()?);
         ok &= slot_file(dir, levers, ids)?;
+        ok &= card_bytes_at_max_ctx(dir, true)?;
         Ok(ok)
     }
 

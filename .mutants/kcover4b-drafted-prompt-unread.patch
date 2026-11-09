@@ -1,0 +1,14 @@
+# kcover R4b mutant drafted-prompt-unread: SlotDrafts::prefill_by takes no first-prompt reading after the draft's prompt call
+# effect: the drafted prompt call (Host::prompt_with) prints no `card bytes` record at first-prompt
+# expected red: GLM and Qwen3.8 drafted max-ctx arms: "0 card bytes record(s) at first-prompt [], within false"; the plain arms stay green
+# not run on the Mac (device crates); the lead runs it on the box, base green first, reversed after.
+--- a/crates/gpu-gates/src/bin/shared/serve_seats/drafted.rs
++++ b/crates/gpu-gates/src/bin/shared/serve_seats/drafted.rs
+@@ -858,7 +858,6 @@
+                 let next = drafted(spec, s)?;
+                 // The window's prompt call runs the body's call itself (`Host::prompt_with`),
+                 // past `Session::prompt_call`'s reading.
+-                s.card_check(model::placement::card_made::CardPhase::FirstPrompt)?;
+                 if retain {
+                     spec.draft_mut().draft_mut().retain_prompt(s)?;
+                 }

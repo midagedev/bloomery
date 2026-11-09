@@ -1,0 +1,15 @@
+# kcover R4b mutant q38-steps-prompt-unread: Qwen3.8's prefill_steps takes no first-prompt reading
+# effect: BLOOMERY_PREFILL=steps prompts print no `card bytes` record at first-prompt
+# expected red: NO ARM IN THIS CHANGE REACHES IT: it needs the max-ctx server started with BLOOMERY_PREFILL=steps (a third Qwen3.8 arm call); then `0 card bytes record(s) at first-prompt`
+# not run on the Mac (device crates); kept so the lead can run it when an arm reaches the wiring.
+--- a/crates/gpu-gates/src/bin/shared/serve_seats/qwen38.rs
++++ b/crates/gpu-gates/src/bin/shared/serve_seats/qwen38.rs
+@@ -3110,8 +3110,6 @@
+             .hybrid_mut()
+             .route_prompt(pos, ids.len())?;
+         let next = m.prompt38(ids, Prompt38::Step)?;
+-        self.s
+-            .card_check(model::placement::card_made::CardPhase::FirstPrompt)?;
+         Ok(next)
+     }
+ 

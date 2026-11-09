@@ -3379,6 +3379,7 @@ pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = kinds![
     groups::host_tier::ARENA,
     groups::host_tier::CENSUS,
     &[&KV_ROOM],
+    groups::card_bytes::WATCH,
 ];
 
 /// What the Qwen3 seat of `bloomery-serve` prints, all on stderr: the

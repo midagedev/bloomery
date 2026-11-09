@@ -270,6 +270,12 @@
 //! records, not held: the checkpoint rule keeps every fed position only for
 //! a request that extends all of them.
 //!
+//! `plain` and `drafted` each end with one more server, the card-byte invariant's arm
+//! (`serve_client::card_bytes_hold_at_max_ctx`): `--place gate` with no `--ctx`, under the arm's
+//! levers, one prompt and one step, exactly one `card bytes` record at `load`, `first-prompt`
+//! and `first-step`, each within the plan (the drafted server's prompt and verify calls run past
+//! the session's own prompt and step calls, so each arm reads its own).
+//!
 //! Logs and the CLI's output go to `--dir`. The server and the CLI inherit
 //! this binary's environment, so the levers they act on are the seat's
 //! (`ACTS_ON`, the same list): one the seat would refuse is refused here, at
@@ -295,9 +301,9 @@ mod gate {
     use bloomery_gpu_gates::record::{self, Log};
     use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
     use bloomery_gpu_gates::serve_client::{
-        self, PrefixRestore, agree, base64, beside, check, completion, curl, draft_counts, ids_of,
-        json_of, metric, parse_ids, plan_run, prefix_restore, rendered, server_log, stop_of,
-        tokenized,
+        self, MAX_CTX, MaxCtx, PrefixRestore, agree, base64, beside, card_bytes_hold_at_max_ctx,
+        check, completion, curl, draft_counts, ids_of, json_of, metric, parse_ids, plan_run,
+        prefix_restore, rendered, server_log, stop_of, tokenized,
     };
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path};
@@ -541,6 +547,16 @@ mod gate {
         (bloomery_levers::STEP_STATS, "1"),
     ];
 
+    /// `bloomery-serve` beside this binary under the arm's levers: the draft and the residency
+    /// are the arm's, never this binary's environment's.
+    fn server_command(levers: Levers) -> Result<Command, GateError> {
+        let mut cmd = Command::new(beside("bloomery-serve")?);
+        cmd.env_remove(bloomery_levers::DRAFT)
+            .env_remove(bloomery_levers::RESIDENCY)
+            .envs(levers.iter().copied());
+        Ok(cmd)
+    }
+
     /// The server this binary started: `serve_client::Served` under the
     /// arm's levers.
     struct Served(serve_client::Served);
@@ -550,10 +566,7 @@ mod gate {
         /// levers, stdout to `<dir>/server.out` and stderr to
         /// `<dir>/server.err`.
         fn spawn(args: &[&str], dir: &Path, levers: Levers) -> Result<Served, GateError> {
-            let mut cmd = Command::new(beside("bloomery-serve")?);
-            cmd.env_remove(bloomery_levers::DRAFT)
-                .env_remove(bloomery_levers::RESIDENCY)
-                .envs(levers.iter().copied());
+            let cmd = server_command(levers)?;
             Ok(Served(serve_client::Served::spawn_cmd(cmd, args, dir)?))
         }
     }
@@ -2472,6 +2485,40 @@ mod gate {
         Ok(ok)
     }
 
+    /// The card-byte invariant at the most context the seat serves
+    /// ([`card_bytes_hold_at_max_ctx`]) on a server under `levers`: [`SERVER_ARGS`] less its
+    /// `--ctx`, so the seat plans its one slot at the model's limit (`ORACLE_POSITIONS`, fitted
+    /// down where the gate card is short). `label` is the arm's (`plain`, `drafted`): the
+    /// drafted prompt and verify calls run past the session's own prompt and step calls, so
+    /// each is held to its three readings on its own server. FAIL-first: a plan that leaves a
+    /// prompt chunk's attention buffers (`place::prompt_attn_bytes`) out of its reserve
+    /// (`.mutants/glm256fix-reserve-without-attn.patch`) reads `past` at `first-prompt` whenever
+    /// the base run's slack there is under those bytes.
+    fn card_bytes_at_max_ctx(dir: &Path, levers: Levers, label: &str) -> Result<bool, GateError> {
+        let own = dir.join(format!("max-ctx-{label}"));
+        card_bytes_hold_at_max_ctx(
+            &format!("{MAX_CTX}_{label}"),
+            &MaxCtx {
+                dir: &own,
+                kinds: record::BLOOMERY_SERVE_GLM,
+                listening: &record::LISTENING_GLM,
+            },
+            || {
+                let mut args = SERVER_ARGS.to_vec();
+                let at = args
+                    .iter()
+                    .position(|a| *a == "--ctx")
+                    .ok_or("SERVER_ARGS names no --ctx")?;
+                args.remove(at);
+                args.remove(at);
+                Ok((
+                    server_command(levers)?,
+                    args.into_iter().map(str::to_owned).collect(),
+                ))
+            },
+        )
+    }
+
     /// The plain arm (the module header).
     fn plain(dir: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
         let mut ok = unset_rule(dir)?;
@@ -2542,6 +2589,7 @@ mod gate {
         ok &= draft_only(dir, &ids, &reference)?;
         ok &= slots_one_pass(dir)?;
         ok &= unset_load(dir)?;
+        ok &= card_bytes_at_max_ctx(dir, PLAIN, "plain")?;
         Ok(ok)
     }
 
@@ -2748,6 +2796,7 @@ mod gate {
         ok &= width_cost(dir, &ids, &first)?;
         ok &= split_refused(dir)?;
         ok &= slots_flow_together(dir)?;
+        ok &= card_bytes_at_max_ctx(dir, DRAFTED, "drafted")?;
 
         let (reference, cli_log) = cli(dir, DRAFTED, &ids, true)?;
         let cli_passes = passes(&cli_log)?;

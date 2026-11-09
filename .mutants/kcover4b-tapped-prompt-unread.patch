@@ -1,0 +1,14 @@
+# kcover R4b mutant tapped-prompt-unread: V4.1's DSpark prompt_tapped takes no first-prompt reading
+# effect: a DSpark-drafted prompt call prints no `card bytes` record at first-prompt
+# expected red: NO ARM IN THIS CHANGE REACHES IT: it needs the V4.1 max-ctx server under BLOOMERY_DRAFT=dspark (the gate's `drafted` branch, gate_ds41_serve.rs `drafted()`); then `0 card bytes record(s) at first-prompt`
+# not run on the Mac (device crates); kept so the lead can run it when an arm reaches the wiring.
+--- a/crates/app/src/arch/deepseek41/mod.rs
++++ b/crates/app/src/arch/deepseek41/mod.rs
+@@ -216,7 +216,6 @@
+             Some(e) => Err(e),
+             None => {
+                 let next = called?;
+-                self.card_check(CardPhase::FirstPrompt)?;
+                 Ok(next)
+             }
+         }

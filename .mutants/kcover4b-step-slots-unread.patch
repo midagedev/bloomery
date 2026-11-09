@@ -1,0 +1,14 @@
+# kcover R4b mutant step-slots-unread: Session::step_slots takes no first-step reading
+# effect: a first decode that is a pass of several slots' steps prints no `card bytes` record at first-step
+# expected red: NO ARM IN THIS CHANGE REACHES IT (the max-ctx arms run --parallel 1). Would be red on a --parallel 2 variant of the arm (GLM `slots`, Qwen3.8 slots server, V4.1 `--slots`) whose first decode is a round: `0 card bytes record(s) at first-step`
+# not run on the Mac (device crates); kept so the lead can run it when an arm reaches the wiring.
+--- a/crates/app/src/lib.rs
++++ b/crates/app/src/lib.rs
+@@ -877,7 +877,6 @@
+     pub fn step_slots(&mut self, rows: &[(usize, &[u32])]) -> Result<SlotsOut, SessionError> {
+         self.idle("step_slots")?;
+         let out = self.model.step_slots(rows)?;
+-        self.card_check(CardPhase::FirstStep)?;
+         Ok(out)
+     }
+ 

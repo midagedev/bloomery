@@ -1,0 +1,14 @@
+# kcover R4b mutant session-step-unread: Session's Target::step takes no first-step reading
+# effect: every plain step prints no record at first-step
+# expected red: V4.1 max-ctx arm (V41::step steps by Target::step): "0 card bytes record(s) at first-step [], within false"; also GLM plain (Glm::step through SlotDrafts::step_reading); Qwen3.8 steps by step_ahead, which keeps its own reading
+# not run on the Mac (device crates); the lead runs it on the box, base green first, reversed after.
+--- a/crates/app/src/lib.rs
++++ b/crates/app/src/lib.rs
+@@ -1317,7 +1317,6 @@
+     fn step(&mut self, id: u32, want: Want) -> Result<Out<'_>, SessionError> {
+         self.idle("step")?;
+         let argmax = self.model.step(&[id])?;
+-        self.card_check(CardPhase::FirstStep)?;
+         self.read(argmax, want)
+     }
+ 

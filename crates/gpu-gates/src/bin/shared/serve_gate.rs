@@ -19,15 +19,15 @@
 //! ([`saved_state_returns`]); a seat with none skips that clause by name.
 //!
 //! Every seat is held to its plan's card bytes at the most context it serves
-//! ([`card_bytes_hold_at_max_ctx`]).
+//! ([`card_bytes_hold_at_max_ctx`], the arm `serve_client` owns).
 
 use std::path::Path;
 use std::time::Duration;
 
 use bloomery_gpu_gates::record;
 use bloomery_gpu_gates::serve_client::{
-    SeatGate, Served, check, completion_raw, curl, greedy, ids_of, json_of, repeated_ids,
-    server_log, tokenized,
+    MAX_CTX, MaxCtx, PREFIX_TEXT, SeatGate, Served, card_bytes_hold_at_max_ctx, check,
+    completion_raw, curl, greedy, ids_of, json_of, repeated_ids, server_log, tokenized,
 };
 use bloomery_gpu_gates::tier::{self, Tag};
 use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path};
@@ -141,23 +141,9 @@ const CHAT: &str = "chat_splits_the_reasoning_at_the_models_tags";
 const ENDED: &str = "chat_ends_at_the_turn_end";
 const ANSWERED: &str = "chat_answers_a_turn";
 const PREFIX: &str = "live_slot_keeps_the_prefix";
-const MAX_CTX: &str = "card_bytes_hold_at_max_ctx";
-
-/// The prompt's ids at the most context where the seat prints no `prompt pass` record.
-const CALL_IDS: usize = 512;
 
 /// The tokens each request of the prefix clause asks for at most.
 const PREFIX_TOKENS: u64 = 8;
-
-/// The fixed text every prompt of the prefix clause opens with: long enough
-/// that the questions sit past a page of ids, short enough that the prompts
-/// stay well under half of every seat's context.
-const PREFIX_TEXT: &str = "The harbour office kept the keeper's ledger beside its maps: every \
-                           ship that passed the point, the wind, the tide and the names she read \
-                           through the glass, one page an evening for forty years. The clerks \
-                           still open the ledger first when a fishing boat asks about the weather \
-                           before dawn, and the newest page carries the same square hand as the \
-                           oldest.";
 
 /// The question the prefix clause's first prompt asks after [`PREFIX_TEXT`].
 const Q1: &str = "Which page did the clerk open first?";
@@ -319,87 +305,20 @@ pub fn served_with(c: &Clauses, dir: &Path, ask: Ask) -> Result<bool, GateError>
     }
     ok &= saved_state_returns(c, &err_log, &url, &d)?;
     println!("server stopped: {}", s.stop()?);
-    if tier::run_clause(MAX_CTX, Tag::SelfConsistency)? {
-        check(&mut ok, MAX_CTX, card_bytes_hold_at_max_ctx(c, dir)?);
-    }
+    ok &= card_bytes_hold_at_max_ctx(
+        MAX_CTX,
+        &MaxCtx {
+            dir: &dir.join("max-ctx"),
+            kinds: c.kinds,
+            listening: c.listening,
+        },
+        || {
+            let (cmd, mut all) = seat(c).command(&ref_model_path()?)?;
+            all.extend(["--port", "0"].iter().map(|a| (*a).to_owned()));
+            Ok((cmd, all))
+        },
+    )?;
     Ok(ok)
-}
-
-/// `card_bytes_hold_at_max_ctx`: a server with no `--ctx` and `BLOOMERY_CARD_BUDGET` removed
-/// plans its one slot at the model's limit on the whole card, fitted down only where that plan is
-/// short (`placement::ctx_ask`), loads, answers one prompt of the prompt pass's rows (the
-/// `prompt pass` record's `rows`; [`CALL_IDS`] where the seat prints none) and one step after it,
-/// and prints the card-byte invariant's three readings: exactly one `card bytes` record at each of
-/// `load`, `first-prompt` and `first-step`, each `within` its plan, and no `card unmeasured`
-/// record. A reading missing, past or unmeasured is red: where the gate holds the card
-/// (`BLOOMERY_CARD_HELD`) a past reading also ends the server's call by name.
-/// FAIL-first: a plan that leaves a term out of its card's count
-/// (`.mutants/kbytes-term-dropped.patch`) reads `past` at `load` and the clause is red.
-fn card_bytes_hold_at_max_ctx(c: &Clauses, dir: &Path) -> Result<bool, GateError> {
-    let d = dir.join("max-ctx");
-    std::fs::create_dir_all(&d)?;
-    let file = ref_model_path()?;
-    let (mut cmd, mut all) = seat(c).command(&file)?;
-    cmd.env_remove("BLOOMERY_CARD_BUDGET");
-    all.extend(["--port", "0"].iter().map(|a| (*a).to_owned()));
-    let all: Vec<&str> = all.iter().map(String::as_str).collect();
-    let mut s = Served::spawn_cmd(cmd, &all, &d)?;
-    let err_log = d.join("server.err");
-    let addr = match s.address(&err_log, LISTEN_POLLS, Duration::from_secs(1)) {
-        Ok(addr) => addr,
-        Err(e) => {
-            println!("{MAX_CTX}: the server never listened: {e}");
-            return Ok(false);
-        }
-    };
-    let url = |p: &str| format!("http://{addr}{p}");
-    let records = server_log(&err_log, c.kinds)?;
-    let ctx = records.one(c.listening)?.u64("ctx")?;
-    let prints_pass = c
-        .kinds
-        .iter()
-        .any(|k| std::ptr::eq(*k, &record::PROMPT_PASS));
-    let pass = if prints_pass {
-        records.first(&record::PROMPT_PASS)?
-    } else {
-        None
-    };
-    let rows = match pass {
-        Some(pass) => usize::try_from(pass.u64("rows")?)?,
-        None => CALL_IDS,
-    };
-    let ids = repeated_ids(&url, PREFIX_TEXT, rows)?[..rows].to_vec();
-    let asked = greedy(&url, ids, 2, &d, "max_ctx", false);
-    println!("server stopped: {}", s.stop()?);
-    if let Err(e) = asked {
-        println!("{MAX_CTX}: the prompt of {rows} ids and its step at ctx {ctx}: {e}");
-        return Ok(false);
-    }
-    let records = server_log(&err_log, c.kinds)?;
-    let mut held = true;
-    for phase in ["load", "first-prompt", "first-step"] {
-        let at: Vec<_> = records
-            .all(&record::CARD_BYTES)?
-            .into_iter()
-            .filter(|r| r.word("phase").is_ok_and(|p| p == phase))
-            .collect();
-        let within = match at.as_slice() {
-            [one] => one.word("verdict")? == "within",
-            _ => false,
-        };
-        println!(
-            "{MAX_CTX}: ctx {ctx}, a prompt of {rows} ids: {} card bytes record(s) at {phase} {:?}, \
-             within {within}",
-            at.len(),
-            at.iter().map(|r| r.line().to_owned()).collect::<Vec<_>>()
-        );
-        held &= within;
-    }
-    let unmeasured = records.all(&record::CARD_UNMEASURED)?;
-    for u in &unmeasured {
-        println!("{MAX_CTX}: {}", u.line());
-    }
-    Ok(held && unmeasured.is_empty())
 }
 
 /// The budget a server's `cache` line prints (`cache ram=<bytes> …`), `None` for a server that

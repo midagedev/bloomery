@@ -614,9 +614,11 @@ impl<B: ChainBody> Session<B> {
     /// The card-byte invariant's reading at `phase` (the first prompt call's
     /// or the first step's), handed to the session's watch once a load: a
     /// later call of the same phase reads nothing, and so does a session with
-    /// no watch. The session's own prompt and step calls make it; a caller
-    /// that drives the model past them ([`Session::model_mut`]) calls it after
-    /// its first prompt call and its first step.
+    /// no watch. The session's own prompt calls and its steps (a plain step,
+    /// a verify, a pass of several slots) make it; a caller that drives the
+    /// model past them ([`Session::model_mut`], or a draft's own prompt call,
+    /// which runs the body's call itself) calls it after its first prompt call
+    /// and its first step.
     pub fn card_check(&mut self, phase: CardPhase) -> Result<(), SessionError> {
         let Some(seat) = &mut self.card else {
             return Ok(());
@@ -874,7 +876,9 @@ where
     /// a select between would move them onto another slot's sequence.
     pub fn step_slots(&mut self, rows: &[(usize, &[u32])]) -> Result<SlotsOut, SessionError> {
         self.idle("step_slots")?;
-        Ok(self.model.step_slots(rows)?)
+        let out = self.model.step_slots(rows)?;
+        self.card_check(CardPhase::FirstStep)?;
+        Ok(out)
     }
 
     /// Capture every pass a round of slots `0..slots` runs when each busy
@@ -920,6 +924,7 @@ where
         self.idle("verify_slots")?;
         let out = self.model.verify_slots(rows)?;
         self.slots_waiting = Some(rows.len());
+        self.card_check(CardPhase::FirstStep)?;
         Ok(out)
     }
 
@@ -1359,6 +1364,7 @@ impl<B: Prompt + Keep + Rows + Rollback> Verify for Session<B> {
             fetched: false,
             best_fetched: false,
         });
+        self.card_check(CardPhase::FirstStep)?;
         Ok(out)
     }
 

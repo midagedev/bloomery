@@ -1,0 +1,14 @@
+# kcover R4b mutant q38-watch-kinds: BLOOMERY_SERVE_QWEN38 loses the card_bytes group
+# effect: card_bytes::watch() requires the group at the open and panics by name; check-records schema --strict also reds
+# expected red: Qwen3.8 max-ctx arms: "the server never listened: the server exited ... before listening" with the panic naming card_bytes::watch
+# not run on the Mac (device crates); the lead runs it on the box, base green first, reversed after.
+--- a/crates/gpu-gates/src/record.rs
++++ b/crates/gpu-gates/src/record.rs
+@@ -3379,7 +3379,6 @@
+     groups::host_tier::ARENA,
+     groups::host_tier::CENSUS,
+     &[&KV_ROOM],
+-    groups::card_bytes::WATCH,
+ ];
+ 
+ /// What the Qwen3 seat of `bloomery-serve` prints, all on stderr: the

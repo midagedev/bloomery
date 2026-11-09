@@ -32,7 +32,8 @@ pub enum CardPhase {
     Load,
     /// The first prompt call done.
     FirstPrompt,
-    /// The first step done.
+    /// The first step done: a plain step, a verify of a draft's window, or a pass of several
+    /// slots, whichever the run takes first.
     FirstStep,
 }
 
