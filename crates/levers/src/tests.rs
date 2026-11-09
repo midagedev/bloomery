@@ -3262,3 +3262,33 @@ fn a_set_words_least_fewest_holds_its_own_p() {
         assert_eq!(residency_word_least_fewest(word), None, "{word}");
     }
 }
+
+/// `Levers::draft_word` reads the row's words as `DraftWord`s: each parses,
+/// unset is `None`, and a word outside `allowed` is refused by name.
+#[test]
+fn draft_word_is_typed_and_checked_against_the_seat() {
+    use crate::DraftWord::{Dspark, Lookup, Mtp, Off};
+    let all = [Lookup, Dspark, Mtp, Off];
+    for (text, want) in [
+        ("lookup", Lookup),
+        ("dspark", Dspark),
+        ("mtp", Mtp),
+        ("off", Off),
+    ] {
+        let set = read(&env(&[(DRAFT, text)]), Scope::Every).expect("a word the row takes");
+        assert_eq!(set.draft_word(&all), Ok(Some(want)));
+        assert_eq!(want.as_str(), text);
+    }
+    let unset = read(&env::<&str>(&[]), Scope::Every).expect("nothing set");
+    assert_eq!(unset.draft_word(&[Mtp]), Ok(None));
+    let set = read(&env(&[(DRAFT, "dspark")]), Scope::Every).expect("a word the row takes");
+    let refused = set
+        .draft_word(&[Mtp, Off])
+        .expect_err("dspark is outside the seat's set");
+    assert_eq!(refused.word, Dspark);
+    assert_eq!(refused.allowed, [Mtp, Off]);
+    assert!(
+        refused.to_string().contains("BLOOMERY_DRAFT=dspark"),
+        "{refused}"
+    );
+}

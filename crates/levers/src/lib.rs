@@ -617,6 +617,72 @@ impl Phase {
     }
 }
 
+/// The words of `BLOOMERY_DRAFT`'s row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DraftWord {
+    Lookup,
+    Dspark,
+    Mtp,
+    Off,
+}
+
+impl DraftWord {
+    /// Every word the row takes.
+    pub const ALL: [DraftWord; 4] = [
+        DraftWord::Lookup,
+        DraftWord::Dspark,
+        DraftWord::Mtp,
+        DraftWord::Off,
+    ];
+
+    /// The word as the row spells it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DraftWord::Lookup => "lookup",
+            DraftWord::Dspark => "dspark",
+            DraftWord::Mtp => "mtp",
+            DraftWord::Off => "off",
+        }
+    }
+
+    fn of(word: &str) -> DraftWord {
+        match word {
+            "lookup" => DraftWord::Lookup,
+            "dspark" => DraftWord::Dspark,
+            "mtp" => DraftWord::Mtp,
+            "off" => DraftWord::Off,
+            other => panic!("{DRAFT} holds {other:?}, a word its row does not take"),
+        }
+    }
+}
+
+impl std::fmt::Display for DraftWord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A `BLOOMERY_DRAFT` word the row takes but the reading seat's architecture
+/// does not; a seat words its own refusal from `word`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DraftRefused {
+    pub word: DraftWord,
+    pub allowed: Vec<DraftWord>,
+}
+
+impl std::fmt::Display for DraftRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{DRAFT}={}: this seat takes ", self.word)?;
+        for (i, w) in self.allowed.iter().enumerate() {
+            write!(f, "{}{w}", if i == 0 { "" } else { ", " })?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for DraftRefused {}
+
 /// Who reads a name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Site {
@@ -1280,6 +1346,27 @@ impl Levers {
     #[must_use]
     pub fn draft(&self) -> Option<&'static str> {
         self.word(DRAFT)
+    }
+
+    /// `BLOOMERY_DRAFT` as a [`DraftWord`], read for a seat whose architecture
+    /// takes the words in `allowed`: `None` unset (the seat's own rule), a
+    /// word the row takes but `allowed` does not is a [`DraftRefused`].
+    ///
+    /// # Errors
+    ///
+    /// [`DraftRefused`] naming the word and the set the seat takes.
+    pub fn draft_word(&self, allowed: &[DraftWord]) -> Result<Option<DraftWord>, DraftRefused> {
+        let Some(word) = self.draft().map(DraftWord::of) else {
+            return Ok(None);
+        };
+        if allowed.contains(&word) {
+            Ok(Some(word))
+        } else {
+            Err(DraftRefused {
+                word,
+                allowed: allowed.to_vec(),
+            })
+        }
     }
 
     /// `BLOOMERY_MTP_HEAD_ROWS`: the MTP draft's head, `full` or a row
