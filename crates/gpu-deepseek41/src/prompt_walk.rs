@@ -62,7 +62,7 @@ use bloomery_gpu::{Gpu, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
 use model::embed::EmbedTable;
 use runtime::layer::FfnKind;
-use runtime::prompt::{call_batches, call_end, groups};
+use runtime::prompt::{call_batches, call_end, call_groups, heat_call};
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
 
 use crate::shared_routed::Routed;
@@ -602,7 +602,7 @@ pub struct Batch<'a, R: RouterEntry, A: BatchAttention> {
 
 impl<R: RouterEntry, A: BatchAttention> Batch<'_, R, A> {
     /// Feed `ids` from position `at` in units of at most `t_max` positions and enqueue the head after
-    /// the last: the groups of [`groups`] run one after the other, and `at` is raised to the call's end.
+    /// the last: the groups of [`call_groups`] run one after the other, and `at` is raised to the call's end.
     /// Refused by name before anything runs: for no id and past the stores' positions. With the taps
     /// armed, each layer's output at the call's last position is copied to its tap. Under host
     /// streaming the groups run inside the call's streaming ([`PromptStream::begin`] and
@@ -630,18 +630,14 @@ impl<R: RouterEntry, A: BatchAttention> Batch<'_, R, A> {
         if let Some(m) = &media {
             m.check_call(from, to, self.embd)?;
         }
-        // Read once: the call keeps no row, so the history does not move until its end.
         let history = self.hybrid.call_history(from);
-        let r = self
-            .stream_begin(ids.len(), to, history)
-            .and_then(|()| self.enqueue_call(ids, (from, to), &mut media, &mut *entering));
-        // The call's own error first: an end refused after a failed call is its echo.
-        let ended =
-            self.bufs
-                .stream
-                .end(&mut *self.hybrid, self.gpu.stream(), r.is_ok() && !history);
-        r?;
-        ended?;
+        heat_call(
+            self,
+            history,
+            |w, returns| w.stream_begin(ids.len(), to, returns),
+            |w| w.enqueue_call(ids, (from, to), &mut media, &mut *entering),
+            |w, kept, _| w.bufs.stream.end(&mut *w.hybrid, w.gpu.stream(), kept),
+        )?;
         if let Some(m) = &media {
             m.check_staged()?;
         }
@@ -674,7 +670,7 @@ impl<R: RouterEntry, A: BatchAttention> Batch<'_, R, A> {
         )
     }
 
-    /// The call's units from `from` to `to` over `ids`, the groups of [`groups`] one after the other.
+    /// The call's units from `from` to `to` over `ids`, the groups of [`call_groups`] one after the other.
     fn enqueue_call(
         &mut self,
         ids: &[u32],
@@ -683,13 +679,9 @@ impl<R: RouterEntry, A: BatchAttention> Batch<'_, R, A> {
         entering: &mut dyn Entering,
     ) -> Result<(), GpuError> {
         let units = call_batches(from, to, &[to], self.bufs.t_max);
-        for gr in groups(units.len(), self.bufs.group) {
-            let runs = &units[gr];
-            let (Some(first), Some(end)) = (runs.first(), runs.last()) else {
-                continue;
-            };
-            let seg = &ids[(first.start - from) as usize..(end.end - from) as usize];
-            self.enqueue_group(seg, runs, end.end == to, (media, &mut *entering))?;
+        for gr in call_groups(&units, from, to, self.bufs.group) {
+            let runs = &units[gr.units];
+            self.enqueue_group(&ids[gr.ids], runs, gr.last, (media, &mut *entering))?;
         }
         Ok(())
     }
