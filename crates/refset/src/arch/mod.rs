@@ -153,6 +153,14 @@ mod tests {
     /// of the real file, and its name keeps its sets off a cut of another width's paths.
     const CUT_WORDS: [&str; 1] = ["e128"];
 
+    /// The fixture sets that have no real twin, each with the reason the real file has none.
+    // PIN(2026-11-09): the GLM selector's 262,142 step is checked on the fixture only; the real
+    // file's CPU prefill of 262,142 ids runs past the dump bound (docs/cards/glmref-d256k.card).
+    const FIXTURE_ONLY: [(&str, &str); 1] = [(
+        "fx_ref_glm5next_d256kdsa",
+        "the real file's CPU prefill of 262,142 ids runs past the dump bound",
+    )];
+
     /// One row an architecture: `families` answers with the first row of a name, so a second row would hide its families.
     #[test]
     fn each_architecture_has_one_row() {
@@ -370,6 +378,9 @@ mod tests {
             assert_eq!(fx.identity, identity, "{name}: identity");
             assert_eq!(fx.sets.len(), count, "{name}: sets");
             for set in fx.sets {
+                if FIXTURE_ONLY.iter().any(|&(s, _)| s == *set) {
+                    continue;
+                }
                 let twin = match set.strip_prefix("ref-mtp/fx_") {
                     Some(rest) => format!("ref-mtp/{rest}"),
                     None => set

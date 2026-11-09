@@ -114,7 +114,7 @@ mod gate {
     use model::arch::Arch;
     use model::arch::glm5next::names;
     use refset::arch::glm5next::fixture as fx;
-    use refset::arch::glm5next::{D3K_DSA, D16K_DSA, D256K_DSA, IK_DSA};
+    use refset::arch::glm5next::{D3K_DSA, D16K_DSA, IK_DSA};
     use refset::ik::{Layout, plain_is_logical, ref_ints, ref_tensor_logical_masked_in};
     use runtime::qsa::{Qsa, Tie, select_by};
 
@@ -438,7 +438,7 @@ mod gate {
         // Clauses 7–10 read ik's `--dsa` sets, dumped from the real file: Oracle clauses, left to
         // the real tier by name.
         let mut split = None;
-        for set in [D3K_DSA, D16K_DSA, D256K_DSA] {
+        for set in [D3K_DSA, D16K_DSA] {
             if !tier::run_clause(
                 &format!("7-10 ik: every latent layer teacher-forced on the --dsa set {set}"),
                 Tag::Oracle,

@@ -1455,7 +1455,7 @@ dump-ref-ml4vis *ARGS:
 # GLM-5.3-Flash(glm5next) 오라클: 같은 덤프 도구를 glm5next 프로필로, ik를 CPU로 돌려 5토큰 배치 세트를
 # $BLOOMERY_DATA/ref_glm5next/에 뜬다. VARIANT(step4, d1k, d3kdsa, d16kdsa, d256kdsa와 -every-node 접미사)를 주면 조용한 프리필 뒤 디코드 한 스텝을
 # 제 세트로 뜬다 — models/glm5next.sh. d1k는 $BLOOMERY_DATA/glm5next/corpus-prose.ids의 첫 1,025개 id를 읽는다(sha256 핀);
-# d256kdsa는 $BLOOMERY_DATA/glm5next/corpus-prose-all.ids의 첫 262,143개 id를 읽는다(같은 핀, 프리필이 시간 걸리므로 BLOOMERY_DUMP_BOUND 상향).
+# d256kdsa는 fixture에서만 뜬다(`just dump-ref-fixture glm5next d256kdsa`): 실제 파일의 262,142 CPU 프리필은 덤프 상한을 넘으므로 이 레시피는 이름으로 거절한다.
 # 덤프마다 199.7 GB 샤드 집합 전체를 CPU 임대 아래서 올리므로 카드가 있어야 한다
 # (BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/glmref-dump.card').
 dump-ref-glm5next *VARIANT:
@@ -2362,8 +2362,8 @@ gate-gpu-glm-mla:
 
 # GLM-5.3-Flash's k-pool selector on the card (`latent::index_pool`, `kpool::kpool_score`, `qsa::qsa_topk_high`, the
 # V4.1 attention over the list): synthetic clauses against the host rules and the exact rule's bands, then every
-# latent layer teacher-forced on ik's --dsa step sets (refset `ik-glm5next-dsa`, `just dump-ref-glm5next d3kdsa`,
-# `d16kdsa` and `d256kdsa`). Reads no weight but the file's `indexer_compressor_ape`. The three --dsa sets are ik's: Oracle
+# latent layer teacher-forced on ik's --dsa step sets (refset `ik-glm5next-dsa`, `just dump-ref-glm5next d3kdsa` and
+# `d16kdsa`; the fixture adds `d256kdsa`). Reads no weight but the file's `indexer_compressor_ape`. The --dsa sets are ik's: Oracle
 # clauses, deferred to the real tier by name in the fixture tier; the synthetic clauses run on either file.
 gate-gpu-glm-sel:
     BLOOMERY_MODEL=glm5next ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_glm_sel && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_glm_sel'

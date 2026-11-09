@@ -15,3 +15,9 @@ reason: dump_ref runs ik on 32 CPU threads for hours and populates the whole 199
   beside a timed run or a gate batch it would take their cores, memory bandwidth and cache, so it holds the lease;
   why now: the glm256 landing needs the set (gate-gpu-glm-sel's 262,142 case) and the box is otherwise idle
 minutes: 80..265
+# Outcome (2026-11-09 15:40 KST, lead): stopped at 2 h 10 min of prefill, no set written. The fixture's d256kdsa dump
+# (7 layers, the same widths, the same ids) had taken 7,836 s, its route rows' times quadratic in the position
+# (10 % in 115 s, 50 % in 2,334 s): attention, not the matmuls the prediction priced, is the term. Scaled to the real
+# file's 46 layers that is ~14 h [derived], past the 6 h bound. The prediction's miss: the prefill term left out the
+# O(n^2) attention of the dense prefill. User's call: the 262k check stays on the fixture set; the real recipe refuses
+# d256kdsa by name.

@@ -213,7 +213,10 @@ GLM_MTP_SHA=425a2c1d
 #            deepest context the program serves (place::ORACLE_POSITIONS), the user's 262,144-positions
 #            bar. Its ids are the prose-all corpus's first (GLM_PROSE_ALL): the 71,727-id prose runs
 #            short of a 262,142 prefill — repeating it would still be a valid bit-for-bit oracle of
-#            the selector, but the unrepeated text is there to take
+#            the selector, but the unrepeated text is there to take. Dumped on the fixture only
+#            (just dump-ref-fixture glm5next d256kdsa, 2 h 11 min on the box's CPU): the real
+#            file's CPU prefill of 262,142 ids is ~14 h [derived from the fixture's 7 layers and
+#            the real file's 46], past the dump bound, so the real recipe refuses this variant
 #   All three --dsa steps sit at (q + 1) % 4 == 3, so the step's tail is three real cells and ik's
 #   zero-filled tail slots (src/llama.cpp, inp_kpool_tail) name no cell at the step; its prefill
 #   rows past 2,051 with a shorter tail still list cell 0 there, which the model and mainline do
@@ -244,7 +247,10 @@ ref_step_variant() {
     d1k)   STEP_SET=ref_glm5next_d1k;   STEP_CTX=2048; STEP_PREFILL=1024 ;;
     d3kdsa)  STEP_SET=ref_glm5next_d3kdsa;  STEP_CTX=4096;  STEP_PREFILL=3070;  STEP_ARGS+=(--dsa) ;;
     d16kdsa) STEP_SET=ref_glm5next_d16kdsa; STEP_CTX=16384; STEP_PREFILL=16382; STEP_ARGS+=(--dsa) ;;
-    d256kdsa) STEP_SET=ref_glm5next_d256kdsa; STEP_CTX=262144; STEP_PREFILL=262142; STEP_ARGS+=(--dsa) ;;
+    d256kdsa) [ "${BLOOMERY_TIER:-real}" = fixture ] || {
+                echo "glm5next: d256kdsa is a fixture set (BLOOMERY_TIER=fixture just dump-ref-fixture glm5next d256kdsa): the real file's CPU prefill of 262,142 ids runs past the dump bound" >&2
+                exit 64; }
+              STEP_SET=ref_glm5next_d256kdsa; STEP_CTX=262144; STEP_PREFILL=262142; STEP_ARGS+=(--dsa) ;;
     *)     return 1 ;;
   esac
   case $name in

@@ -553,12 +553,13 @@ impl PlanRefusal for PlaceError {
 }
 
 /// The deepest context the plan serves: ik's `--dsa` step set at position
-/// 262,142 of a 262,144-position context (`tools/ref/models/glm5next.sh`,
-/// variant `d256kdsa`), the deepest reference the selector is checked at.
-// PIN(2026-11-08): the 262,144-positions bar every model serves a slot at;
-// the d256kdsa set (refset `ik-glm5next-dsa`) checks the selector at
-// position 262,142 the way d16kdsa checked it at 16,382. Was 16,384, the
-// d16kdsa set's context — a verification bound, not a kernel limit.
+/// 262,142 of a 262,144-position context on the fixture
+/// (`tools/ref/models/glm5next.sh`, variant `d256kdsa`, refset
+/// `fx-ik-glm5next-dsa`), the deepest reference the selector is checked at.
+// PIN(2026-11-09): the 262,144-positions bar every model serves a slot at;
+// the fixture's d256kdsa set checks the selector at position 262,142, the
+// real file's d16kdsa set at 16,382. Was 16,384, the d16kdsa set's
+// context — a verification bound, not a kernel limit.
 pub const ORACLE_POSITIONS: u64 = 262_144;
 
 /// The most visible positions at which the token-pool indexer keeps every
