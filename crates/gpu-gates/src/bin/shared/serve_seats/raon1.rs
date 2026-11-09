@@ -78,7 +78,7 @@ use bloomery_gpu_gates::need;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::side_seat;
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
-use bloomery_levers::Levers;
+use bloomery_levers::{DraftWord, Levers};
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::dflash2::Hparams as DraftHparams;
@@ -252,19 +252,21 @@ struct OpenDraft {
 
 /// The draft word and width combinations this seat can serve without reading a model: the word
 /// and the width chooser's mode.
-fn draft_word(levers: &Levers) -> Result<(Option<&str>, WidthMode), GateError> {
+const DRAFT_WORDS: [DraftWord; 2] = [DraftWord::Dspark, DraftWord::Off];
+
+fn draft_asked(levers: &Levers) -> Result<(Option<DraftWord>, WidthMode), GateError> {
     let width = WidthMode::of(levers.mtp_width())?;
+    let word = levers.draft_word(&DRAFT_WORDS).map_err(|e| {
+        format!(
+            "BLOOMERY_DRAFT={}: the raon1 seat serves its DFlash2 draft (dspark), off or unset",
+            e.word
+        )
+    })?;
     bloomery_gpu_gates::bind::refuse_plain_width(
         levers,
-        (levers.draft() == Some("off")).then_some("BLOOMERY_DRAFT=off"),
+        (word == Some(DraftWord::Off)).then_some("BLOOMERY_DRAFT=off"),
     )?;
-    match levers.draft() {
-        word @ (None | Some("off" | "dspark")) => Ok((word, width)),
-        Some(w) => Err(format!(
-            "BLOOMERY_DRAFT={w}: the raon1 seat serves its DFlash2 draft (dspark), off or unset"
-        )
-        .into()),
-    }
+    Ok((word, width))
 }
 
 /// What `BLOOMERY_DRAFT` resolves to for a target at `target` (`split` opened), before any
@@ -277,11 +279,11 @@ fn draft_of(
     think: Result<Think, String>,
 ) -> Result<(Option<OpenDraft>, String), GateError> {
     let set = refset::arch::draft::dspark_lever().map(PathBuf::from);
-    let (word, width) = draft_word(levers)?;
-    if word == Some("off") {
+    let (word, width) = draft_asked(levers)?;
+    if word == Some(DraftWord::Off) {
         return Ok((None, "BLOOMERY_DRAFT=off".to_owned()));
     }
-    let every = word == Some("dspark");
+    let every = word == Some(DraftWord::Dspark);
     let (path, from) = match raon1_dflash::pick(set.as_deref(), target)? {
         Pick::File(path, from) => (path, from),
         Pick::Absent(dirs) => {
@@ -597,7 +599,7 @@ pub fn check(
     bloomery_gpu_gates::bind::check_seat(read_levers.then_some(ACTS_ON), args, |args, levers| {
         let a = SeatFlags::parse_one_sequence(args, USAGE, "raon1")?;
         if let Some(levers) = levers {
-            draft_word(levers)?;
+            draft_asked(levers)?;
         }
         Ok(a)
     })

@@ -69,7 +69,7 @@ mod tests {
     use bloomery_gpu::arch::qwen3moe::Prompt38;
     use bloomery_gpu::kv_format::{KvChoice, KvFrom, KvQ8};
     use bloomery_gpu_gates::GateError;
-    use bloomery_levers::Draft38Off;
+    use bloomery_levers::{Draft38Off, DraftWord};
     use model::placement::workstation::{A6000, RTX_3090};
 
     use super::qwen38::{
@@ -259,7 +259,7 @@ mod tests {
         let header = || gguf::Split::header_only("mtp".into(), &layout).unwrap();
         let ask = |layer: &Result<Option<gguf::Split>, String>,
                    reader: Result<(), &str>,
-                   word: Option<&str>,
+                   word: Option<DraftWord>,
                    run: (bool, Option<Draft38Off>)| {
             folder_draft_for(layer, |_| reader.map_err(GateError::from), word, run)
         };
@@ -282,7 +282,7 @@ mod tests {
                 },
             ),
         ] {
-            let e = ask(&layer, reader, Some("mtp"), (true, None))
+            let e = ask(&layer, reader, Some(DraftWord::Mtp), (true, None))
                 .expect_err("BLOOMERY_DRAFT=mtp without a folder MTP layer the draft reads")
                 .to_string();
             assert!(
@@ -294,11 +294,17 @@ mod tests {
             }
             let off = ask(&layer, reader, None, (true, None)).unwrap();
             assert_eq!(off, (false, Some(why)));
-            let set = ask(&layer, reader, Some("off"), (false, Some(Draft38Off::Set))).unwrap();
+            let set = ask(
+                &layer,
+                reader,
+                Some(DraftWord::Off),
+                (false, Some(Draft38Off::Set)),
+            )
+            .unwrap();
             assert_eq!(set, (false, Some(Draft38Off::Set)));
         }
         let layer = Ok(Some(header()));
-        for word in [None, Some("mtp")] {
+        for word in [None, Some(DraftWord::Mtp)] {
             assert_eq!(
                 ask(&layer, Ok(()), word, (true, None)).unwrap(),
                 (true, None)

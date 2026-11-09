@@ -298,8 +298,11 @@ pub trait OpenLog<B: Open> {
     /// The one-token step's capture and its node count (graph mode).
     fn capture(&mut self, nodes: usize) -> Result<(), SessionError>;
 
-    /// The prompt call's buffers, made ([`Open::prepare`]).
-    fn prompt_buffers(&mut self, m: &GpuModel<B>) -> Result<(), SessionError>;
+    /// The prompt call's buffers, made ([`Open::prepare`]); a log that prints
+    /// nothing of them leaves it.
+    fn prompt_buffers(&mut self, _m: &GpuModel<B>) -> Result<(), SessionError> {
+        Ok(())
+    }
 }
 
 /// What the caller prints when a draft's verify pass is captured

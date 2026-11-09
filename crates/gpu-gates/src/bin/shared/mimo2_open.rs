@@ -76,10 +76,6 @@ impl OpenLog<Body> for Log {
     fn capture(&mut self, _nodes: usize) -> Result<(), SessionError> {
         Ok(())
     }
-
-    fn prompt_buffers(&mut self, _m: &Mimo2Model) -> Result<(), SessionError> {
-        Ok(())
-    }
 }
 
 /// The session of `file` at `ctx` positions on the gate placement

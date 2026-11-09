@@ -241,7 +241,7 @@ use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::side_seat;
 use bloomery_gpu_gates::vision_seat::{self, Opened, PleImage, TextFacts};
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
-use bloomery_levers::{Draft38At, Draft38Off, Levers, draft38_unset};
+use bloomery_levers::{Draft38At, Draft38Off, DraftWord, Levers, draft38_unset};
 use gguf::Split;
 use gguf::quant::GgmlType;
 use model::arch::models::{Mixer, RopeMode};
@@ -2280,18 +2280,20 @@ const FOLDER_NO_MTP: &str = "a checkpoint folder's mtp.* tensors are not read";
 /// `BLOOMERY_DRAFT` `mtp`, `off` or unset on a checkpoint folder, whose next-token layer the load
 /// does not read: set `mtp` is refused by name, `off` and unset take the plain path and print why
 /// on `load draft=off`.
-fn folder_choice(draft: Option<&str>) -> Result<Choice, GateError> {
+fn folder_choice(draft: Option<DraftWord>) -> Result<Choice, GateError> {
     match draft {
-        Some("mtp") => Err(format!(
+        Some(DraftWord::Mtp) => Err(format!(
             "BLOOMERY_DRAFT=mtp: {FOLDER_NO_MTP}; serve the folder with BLOOMERY_DRAFT unset or \
              off, or a GGUF file that carries the layer"
         )
         .into()),
-        Some("off") => Ok(Choice::Plain(Draft38Off::Set.to_string())),
+        Some(DraftWord::Off) => Ok(Choice::Plain(Draft38Off::Set.to_string())),
         None => Ok(Choice::Plain(FOLDER_NO_MTP.to_owned())),
-        Some(other) => {
-            Err(format!("BLOOMERY_DRAFT {other:?} is not an in-file draft decision").into())
-        }
+        Some(other) => Err(format!(
+            "BLOOMERY_DRAFT {:?} is not an in-file draft decision",
+            other.as_str()
+        )
+        .into()),
     }
 }
 
@@ -2318,8 +2320,8 @@ fn decide_q35(
     let forbid_set = |why: String| -> Result<Choice, GateError> {
         Err(format!("BLOOMERY_DRAFT=mtp: {why}").into())
     };
-    match levers.draft() {
-        Some("mtp") => {
+    match served::asked(levers)? {
+        Some(DraftWord::Mtp) => {
             if media {
                 return forbid_set(MEDIA_DRAFT.to_owned());
             }
@@ -2338,7 +2340,7 @@ fn decide_q35(
             }
             Ok(layer_choice(file))
         }
-        Some("off") => Ok(Choice::Plain(Draft38Off::Set.to_string())),
+        Some(DraftWord::Off) => Ok(Choice::Plain(Draft38Off::Set.to_string())),
         None => {
             let at = Draft38At {
                 place_a: whole && place_name == "a",
@@ -2522,7 +2524,8 @@ pub(crate) fn check(
                 WidthMode::of(levers.mtp_width())?;
                 bind::refuse_plain_width(
                     levers,
-                    (levers.draft() == Some("off")).then_some("BLOOMERY_DRAFT=off"),
+                    (served::asked(levers)? == Some(DraftWord::Off))
+                        .then_some("BLOOMERY_DRAFT=off"),
                 )?;
                 served::draft_slots(a.parallel, served_draft(word), true)?;
                 if word == Word::Mtp {
@@ -2568,7 +2571,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let width = WidthMode::of(levers.mtp_width())?;
     bind::refuse_plain_width(
         &levers,
-        (levers.draft() == Some("off")
+        (served::asked(&levers)? == Some(DraftWord::Off)
             || (matches!(arch, Family::Qwen3moe) && levers.draft().is_none()))
         .then_some("no draft selected"),
     )?;
@@ -2722,7 +2725,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         && matches!(word, Word::Off | Word::Mtp)
     {
         Some(if weights.is_folder() {
-            folder_choice(levers.draft())?
+            folder_choice(served::asked(&levers)?)?
         } else {
             decide_q35(
                 &levers,
@@ -2906,7 +2909,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
 
 #[cfg(test)]
 mod tests {
-    use super::{Choice, folder_choice, parse_args};
+    use super::{Choice, DraftWord, folder_choice, parse_args};
     use model::placement::workstation::{A6000, RTX_3090};
 
     /// The open's round shape is the body's fact: Qwen3.6's body settles a
@@ -2957,7 +2960,10 @@ mod tests {
     /// name, and `off` and unset take the plain path and say why.
     #[test]
     fn a_checkpoint_folder_serves_no_next_token_layer() {
-        let e = folder_choice(Some("mtp")).err().unwrap().to_string();
+        let e = folder_choice(Some(DraftWord::Mtp))
+            .err()
+            .unwrap()
+            .to_string();
         assert!(
             e.contains("BLOOMERY_DRAFT=mtp") && e.contains("mtp.* tensors are not read"),
             "{e}"
@@ -2966,11 +2972,14 @@ mod tests {
             panic!("unset is the plain path");
         };
         assert!(why.contains("mtp.* tensors are not read"), "{why}");
-        let Ok(Choice::Plain(why)) = folder_choice(Some("off")) else {
+        let Ok(Choice::Plain(why)) = folder_choice(Some(DraftWord::Off)) else {
             panic!("off is the plain path");
         };
         assert_eq!(why, "BLOOMERY_DRAFT=off");
-        let e = folder_choice(Some("dspark")).err().unwrap().to_string();
+        let e = folder_choice(Some(DraftWord::Dspark))
+            .err()
+            .unwrap()
+            .to_string();
         assert!(e.contains("is not an in-file draft decision"), "{e}");
     }
 }

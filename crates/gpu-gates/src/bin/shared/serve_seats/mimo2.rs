@@ -266,10 +266,6 @@ impl OpenLog<Body> for Log {
         self.graph_nodes = nodes;
         Ok(())
     }
-
-    fn prompt_buffers(&mut self, _m: &Mimo2Model) -> Result<(), SessionError> {
-        Ok(())
-    }
 }
 
 impl Log {

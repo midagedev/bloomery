@@ -1,0 +1,25 @@
+# openlog mutant pair-rows-ignored
+# clause: unit test a_capture_of_another_row_count_is_refused_by_name
+#   (crates/gpu-gates/src/capture.rs); no gate drives a wrong row count (the window's widths are fixed
+#   by the type), so the unit test is the only clause
+# site: crates/gpu-gates/src/capture.rs check_pair, the row count unchecked
+#   (the pre-change GLM PairCapture: any `rows` records a pair line)
+# expected red: "a_capture_of_another_row_count_is_refused_by_name ... FAILED"
+--- a/crates/gpu-gates/src/capture.rs
++++ b/crates/gpu-gates/src/capture.rs
+@@ -27,13 +27,8 @@
+ /// The refusal of a verify capture whose row count is not the pair pass's
+ /// `expect`.
+ pub fn check_pair(rows: usize, expect: usize) -> Result<(), String> {
+-    if rows == expect {
+-        Ok(())
+-    } else {
+-        Err(format!(
+-            "a verify capture of {rows} rows; the pair pass runs {expect}"
+-        ))
+-    }
++    let _ = (rows, expect);
++    Ok(())
+ }
+ 
+ /// The pair pass's `capture_pair` record of its graph's `nodes`, once the
