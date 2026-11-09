@@ -162,11 +162,14 @@ impl MapCheck {
     }
 }
 
-/// A layer's experts on one card, the stage's or a tier's: how many each of
-/// its routed stacks holds, the stacks' names, and the gate·up's and the
+/// A layer's experts on one card, the stage's or a tier's: how many are live
+/// and how many slots each of its routed stacks holds (at least as many: an
+/// elastic load reserves more), the stacks' names, and the gate·up's and the
 /// down's types.
 pub(super) struct LegLayer {
     n_card: usize,
+    /// The slots each stack is made for: its rows over the rows an expert takes.
+    slots: usize,
     gate: String,
     up: String,
     down: String,
@@ -187,9 +190,10 @@ impl LegLayer {
     pub(super) fn stacks<'w>(&self, w: &'w Weights) -> Result<Stacks38<'w>, GpuError> {
         Ok(Stacks38 {
             n_card: self.n_card,
-            gate: stack(w, &self.gate, self.gate_up_ty, self.n_card * geo::FF)?,
-            up: stack(w, &self.up, self.gate_up_ty, self.n_card * geo::FF)?,
-            down: stack(w, &self.down, self.down_ty, self.n_card * geo::HIDDEN)?,
+            slots: self.slots,
+            gate: stack(w, &self.gate, self.gate_up_ty, self.slots * geo::FF)?,
+            up: stack(w, &self.up, self.gate_up_ty, self.slots * geo::FF)?,
+            down: stack(w, &self.down, self.down_ty, self.slots * geo::HIDDEN)?,
             gate_up_ty: self.gate_up_ty,
             down_ty: self.down_ty,
         })
@@ -205,9 +209,12 @@ impl LegLayer {
 }
 
 /// A layer's card experts as the ubatch route reads them: their count, the
-/// three resident stacks ([`Card38::stacks`]) and their types.
+/// slots the stacks hold, the three resident stacks ([`Card38::stacks`]) and
+/// their types.
 pub(super) struct Stacks38<'w> {
     pub(super) n_card: usize,
+    /// The slots each stack holds, at least `n_card`: the rows of a stack over an expert's.
+    pub(super) slots: usize,
     pub(super) gate: StackW<'w>,
     pub(super) up: StackW<'w>,
     pub(super) down: StackW<'w>,
@@ -270,7 +277,7 @@ impl SelRun {
         down: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         let stacks = cl.leg_stacks(w)?;
-        stacks.check(cl.n_card, self.bufs.shape())?;
+        stacks.check(cl.slots, self.bufs.shape())?;
         let run = LegRun {
             layer: l,
             stacks: &stacks,
@@ -377,6 +384,7 @@ pub(super) fn leg_layers(
         stack(w, &down, down_ty, slots * geo::HIDDEN)?;
         per.push(Some(LegLayer {
             n_card,
+            slots,
             gate,
             up,
             down,

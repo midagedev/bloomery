@@ -1233,6 +1233,7 @@ impl CardRoute38 {
     ) -> Result<(), GpuError> {
         let st = card.stacks(c.w, l)?;
         let n_card = st.n_card;
+        let stack_slots = st.slots;
         let down = down_weight(WHAT, l, st.down_ty, st.down)?;
         let (gpu, stream, sink) = (c.gpu, c.gpu.stream(), c.gpu.layer_sink(l)?);
         let pitch = geo::N_USED + 1;
@@ -1479,7 +1480,7 @@ impl CardRoute38 {
         match ring {
             Some(r) => {
                 let leg = card.leg_stacks(c.w, l)?;
-                with_ring(&leg, n_card, r, ctx, (geo::FF, geo::HIDDEN), |blk| {
+                with_ring(&leg, stack_slots, r, ctx, (geo::FF, geo::HIDDEN), |blk| {
                     r.with_union(ctx, geo::EXPERTS, |union_map| run(Some((union_map, blk))))
                 })
             }
