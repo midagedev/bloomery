@@ -207,6 +207,11 @@ pub trait KvRoomBody {
     ///
     /// The machine's refusal, or a body with no machine.
     fn free_expert_bytes(&mut self, want: u64) -> Result<FreedBytes, GpuError>;
+
+    /// A give-back that [`fit_rooms`] asked for `asked` bytes and the machine made
+    /// (`freed`): the body counts it and keeps it for its caller's record. Nothing by
+    /// default, for a body that tallies no moves.
+    fn gave_back(&mut self, _asked: u64, _freed: &FreedBytes) {}
 }
 
 /// The rooms of `body` fitted through `pos + rows` positions. A fit that runs out of card bytes
@@ -251,6 +256,7 @@ pub fn fit_rooms<B: KvRoomBody>(body: &mut B, pos: usize, rows: usize) -> Result
             )));
         }
     };
+    body.gave_back(want as u64, &freed);
     body.fit_each(pos, through).map_err(|e| {
         e.noting_room(format!(
             "after the residency machine freed {} B of expert stacks ({} slots a layer over {} \

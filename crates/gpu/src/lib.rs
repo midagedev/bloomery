@@ -132,7 +132,7 @@ pub use graph::{
 };
 pub use model::{GpuModel, Slots};
 pub use room::elastic::{
-    Elastic, ElasticBody, ElasticStats, FilledBytes, settle_to_margin, with_room,
+    Elastic, ElasticBody, ElasticStats, FilledBytes, HELD_NO_QUANTUM, settle_to_margin, with_room,
 };
 pub use room::kv::{FreedBytes, KvBacking, KvRoomBody, RoomTensor, fit_rooms, kv_backing};
 pub use room::{SharedPages, StackRoom};

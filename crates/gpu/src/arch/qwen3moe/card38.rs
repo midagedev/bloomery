@@ -25,12 +25,18 @@
 //! the same slots by the same map, so which expert runs where has one
 //! owner.
 //!
-//! Each layer's card count is the map's ([`SlotMap::on_card`]), read once at
-//! load, where each of the layer's three routed stacks is held to that
-//! count's rows and to the type the plan lists for it ([`Qwen38Stacks`], the
-//! residency's source of the same types) ([`Card38::new`]): a stack of other
-//! rows would leave slots that neither side sums, and one of another type
-//! would be read in a layout it is not in.
+//! Each layer's card count is the map's ([`SlotMap::on_card`]), read at load,
+//! where each of the layer's three routed stacks is held to the map's
+//! capacity in rows (the live count on a load that reserves nothing more) and
+//! to the type the plan lists for it ([`Qwen38Stacks`], the residency's source
+//! of the same types) ([`Card38::new`]): a stack of other rows would leave
+//! slots that neither side sums, and one of another type would be read in a
+//! layout it is not in. The count the kernels bound a place by is not the live
+//! count but the stacks' slots ([`Card38::reach`]): the live count moves with
+//! every give-back, fill and promotion while a captured step holds the bound
+//! as an argument, and a place the map names is a slot of the stacks. What
+//! reads the live count itself ([`Card38::live`]) follows the machine at a
+//! residency boundary ([`Card38::follow`]).
 //!
 //! On a layer an expert tier holds experts of (a two-card load, `tier38`)
 //! the step's and the verify's card leg runs the same launches but the card
@@ -67,7 +73,9 @@ use cuda_core::DeviceBuffer;
 use gguf::GgmlType;
 use model::arch::names::routed_stacks;
 use model::placement::accepts::{self, Program};
+use model::placement::elastic::reach;
 use model::placement::kernels::DownAct;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// What the map check's refusals name.
 const WHAT: &str = "qwen4exp card leg";
@@ -167,9 +175,12 @@ impl MapCheck {
 /// elastic load reserves more), the stacks' names, and the gate·up's and the
 /// down's types.
 pub(super) struct LegLayer {
+    /// The live experts at the load.
     n_card: usize,
     /// The slots each stack is made for: its rows over the rows an expert takes.
     slots: usize,
+    /// The place bound every kernel reads ([`reach`]): the slots.
+    reach: usize,
     gate: String,
     up: String,
     down: String,
@@ -189,7 +200,7 @@ impl LegLayer {
     /// [`leg_layers`] refuses.
     pub(super) fn stacks<'w>(&self, w: &'w Weights) -> Result<Stacks38<'w>, GpuError> {
         Ok(Stacks38 {
-            n_card: self.n_card,
+            reach: self.reach,
             slots: self.slots,
             gate: stack(w, &self.gate, self.gate_up_ty, self.slots * geo::FF)?,
             up: stack(w, &self.up, self.gate_up_ty, self.slots * geo::FF)?,
@@ -208,12 +219,13 @@ impl LegLayer {
     }
 }
 
-/// A layer's card experts as the ubatch route reads them: their count, the
-/// slots the stacks hold, the three resident stacks ([`Card38::stacks`]) and
-/// their types.
+/// A layer's card experts as the ubatch route reads them: the place bound,
+/// the slots the stacks hold, the three resident stacks ([`Card38::stacks`])
+/// and their types.
 pub(super) struct Stacks38<'w> {
-    pub(super) n_card: usize,
-    /// The slots each stack holds, at least `n_card`: the rows of a stack over an expert's.
+    /// The places the route reads as the card's: below this ([`reach`]).
+    pub(super) reach: usize,
+    /// The slots each stack holds: the rows of a stack over an expert's.
     pub(super) slots: usize,
     pub(super) gate: StackW<'w>,
     pub(super) up: StackW<'w>,
@@ -284,7 +296,7 @@ impl SelRun {
             normed: x,
             m,
             sel,
-            n_card: cl.n_card,
+            n_card: cl.reach,
             rule: Act::SiluMul,
         };
         self.leg.enqueue_rows(gpu, &mut self.bufs, &run, down)
@@ -308,6 +320,9 @@ pub(super) struct Card38 {
     /// Per layer, whether the step and the verify run it without a host leg
     /// ([`Card38::hostless`]).
     hostless: Vec<bool>,
+    /// Per layer, the experts the map holds on the card as of the last residency
+    /// boundary that moved them ([`Card38::follow`]); the load's count until then.
+    live: Vec<AtomicUsize>,
     /// [`Card38::down_store`].
     down: DownStore,
     /// [`Card38::blocks32_gate_up`].
@@ -359,12 +374,12 @@ pub(super) fn leg_layers(
     let mut per = Vec::with_capacity(layers);
     for l in 0..layers {
         let (n_card, slots) = on(l)?;
-        if slots < n_card {
+        let Some(bound) = reach(n_card, slots) else {
             return Err(GpuError::shape(
                 WHAT,
                 format!("layer {l}: {slots} stack slots below its {n_card} live experts"),
             ));
-        }
+        };
         let [gate, up, down] = routed_stacks(l);
         if n_card == 0 {
             if let Some(n) = [&gate, &up, &down].into_iter().find(|n| w.get(n).is_some()) {
@@ -385,6 +400,7 @@ pub(super) fn leg_layers(
         per.push(Some(LegLayer {
             n_card,
             slots,
+            reach: bound,
             gate,
             up,
             down,
@@ -495,9 +511,14 @@ impl Card38 {
         } else {
             None
         };
+        let live = per
+            .iter()
+            .map(|c| AtomicUsize::new(c.as_ref().map_or(0, |c| c.n_card)))
+            .collect();
         Ok(Card38 {
             layers: per,
             hostless,
+            live,
             down: DownStore::of_load(map, keep_host),
             blocks32_gate_up,
             run,
@@ -547,9 +568,39 @@ impl Card38 {
         self.down
     }
 
-    /// Layer `l`'s card experts: 0 on a layer without them.
-    pub(super) fn n_card(&self, l: usize) -> usize {
-        self.layer(l).map_or(0, |c| c.n_card)
+    /// The place bound layer `l`'s kernels and route tables read
+    /// ([`reach`]): the stacks' slots, fixed for the load. 0 on a layer
+    /// without card experts.
+    pub(super) fn reach(&self, l: usize) -> usize {
+        self.layer(l).map_or(0, |c| c.reach)
+    }
+
+    /// Layer `l`'s experts on the card as of the load or the last
+    /// [`Card38::follow`]: what the walk's cost rules count host experts
+    /// from. 0 on a layer without card experts.
+    pub(super) fn live(&self, l: usize) -> usize {
+        self.live.get(l).map_or(0, |n| n.load(Ordering::Relaxed))
+    }
+
+    /// Layer `l`'s live count read from the map again, at a residency
+    /// boundary (a give-back, a fill): the one place the count is written.
+    /// Refused by name past the stacks' slots. A layer without card experts
+    /// is left as it is.
+    pub(super) fn follow(&self, l: usize, live: usize) -> Result<(), GpuError> {
+        let Some(cl) = self.layer(l) else {
+            return Ok(());
+        };
+        if reach(live, cl.slots).is_none() {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "layer {l}: {live} live experts on the card in {} stack slots",
+                    cl.slots
+                ),
+            ));
+        }
+        self.live[l].store(live, Ordering::Relaxed);
+        Ok(())
     }
 
     fn layer(&self, l: usize) -> Option<&LegLayer> {
@@ -603,12 +654,14 @@ impl Card38 {
             .join(";")
     }
 
-    /// The distinct card counts of the layers with card experts, ascending:
-    /// what the ubatch route builds its route tables over. The placement's
-    /// spread keeps every eligible layer's count within one, so a plan of
-    /// this program holds at most two.
+    /// The distinct place bounds ([`Card38::reach`]) of the layers with card
+    /// experts, ascending: what the ubatch route builds its route tables over,
+    /// sized once at the load so a fill allocates nothing. The placement's
+    /// spread keeps every eligible layer's live count within one and a
+    /// capacity adds the same slots to each, so a plan of this program holds
+    /// at most two.
     pub(super) fn card_counts(&self) -> Vec<usize> {
-        let mut counts: Vec<usize> = self.layers.iter().flatten().map(|c| c.n_card).collect();
+        let mut counts: Vec<usize> = self.layers.iter().flatten().map(|c| c.reach).collect();
         counts.sort_unstable();
         counts.dedup();
         counts
@@ -703,7 +756,7 @@ impl Card38 {
             sel,
             n: geo::HIDDEN,
             m,
-            n_card: cl.n_card,
+            n_card: cl.reach,
             n_used: SLOTS,
             w_pitch: W_PITCH,
             fault: c.gpu.layer_sink(l)?,
@@ -750,7 +803,7 @@ impl Card38 {
             sel,
             n: geo::HIDDEN,
             m,
-            n_card: cl.n_card,
+            n_card: cl.reach,
             n_used: SLOTS,
             w_pitch: W_PITCH,
             shared: SharedJoin {
@@ -796,7 +849,7 @@ impl Card38 {
                 sh,
                 n: geo::HIDDEN,
                 m,
-                n_card: cl.n_card,
+                n_card: cl.reach,
                 n_tier,
                 fault: c.gpu.layer_sink(l)?,
                 y,

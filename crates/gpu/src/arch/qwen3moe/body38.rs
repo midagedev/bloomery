@@ -178,7 +178,7 @@ use crate::site::ByName;
 use crate::tensor::{WindowMut, to_host};
 use crate::weights::{Weights, tensor_scales};
 use crate::{Branch, DeviceTensor, Gpu, GpuError, SharedPages, StagedRows, launch_u32, ple, qsa};
-use crate::{ElasticBody, ElasticStats, FilledBytes, FreedBytes, KvRoomBody, fit_rooms};
+use crate::{Elastic, ElasticBody, ElasticStats, FilledBytes, FreedBytes, KvRoomBody, fit_rooms};
 use bloomery_levers::{ChurnHosting, HostCfg};
 use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, sys};
 use engram::Hash;
@@ -1343,6 +1343,10 @@ pub struct Body38 {
     nvme_tier: Option<Arc<NvTier>>,
     /// The elastic tenant's moves since the load ([`ElasticBody`]).
     elastic: ElasticStats,
+    /// An elastic load's give-backs made inside a K/V fit, which no caller
+    /// had a record to print, until [`ElasticBody::take_moves`]; `None` on a
+    /// load that is not elastic (nothing would empty it).
+    elastic_moves: Option<Vec<Elastic>>,
     /// The recurrent stores on the host at chosen positions, and the PLE
     /// hash's history at each, ascending: the points a cut behind the fed
     /// positions restores. A prompt call takes them only while `marks` is on.
@@ -1799,6 +1803,7 @@ impl Body38 {
                     (ubatch, route_run, counted, slots),
                     &stacks,
                 )?;
+                body.elastic_moves = elastic.then(Vec::new);
                 if let Some(mut d) = draft {
                     let rows = body.rope.table.len() / body.rope.width;
                     let store = mtp.map_or(0, |(_, _, p)| p.store.rows());
@@ -2042,7 +2047,7 @@ impl Body38 {
             n_used: geo::N_USED,
         };
         let hosted: Vec<usize> =
-            HostRun::viewed(run, machine, (|l| card.n_card(l), geo::EXPERTS)).collect();
+            HostRun::viewed(run, machine, (|l| card.live(l), geo::EXPERTS)).collect();
         let mut experts = crate::model::host_run(
             gpu.context(),
             plan,
@@ -2211,6 +2216,7 @@ impl Body38 {
             engine: gpu.stream_handle(),
             nvme_tier,
             elastic: ElasticStats::default(),
+            elastic_moves: None,
             ckpt,
             ple_points: Vec::new(),
             point_rows: Vec::new(),
@@ -5707,11 +5713,25 @@ impl KvRoomBody for Body38 {
             ));
         };
         let freed = glue.free_bytes(hybrid, &engine, want)?;
+        self.follow_live()?;
         Ok(FreedBytes {
             bytes: freed.bytes,
             slots: freed.k,
             layers: freed.layers.len(),
         })
+    }
+
+    /// A K/V fit's give-back is counted on the tenant's clock like a settle's,
+    /// and kept for the seat's record when the load is elastic.
+    fn gave_back(&mut self, asked: u64, freed: &FreedBytes) {
+        self.elastic.gave_back(freed.bytes);
+        if let Some(moves) = self.elastic_moves.as_mut() {
+            moves.push(Elastic::GiveBack {
+                site: "fit",
+                asked,
+                freed: *freed,
+            });
+        }
     }
 }
 
@@ -5724,6 +5744,7 @@ impl ElasticBody for Body38 {
             ));
         };
         let filled = glue.fill_bytes(hybrid, room)?;
+        self.follow_live()?;
         Ok(FilledBytes {
             bytes: filled.bytes,
             slots: filled.k,
@@ -5735,8 +5756,33 @@ impl ElasticBody for Body38 {
         self.residency_glue.quantum(&self.hybrid)
     }
 
+    fn withdrawn_slots(&self) -> usize {
+        self.residency_glue.withdrawn_slots(&self.hybrid)
+    }
+
     fn elastic_stats(&mut self) -> &mut ElasticStats {
         &mut self.elastic
+    }
+
+    fn take_moves(&mut self) -> Vec<Elastic> {
+        self.elastic_moves
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    }
+}
+
+impl Body38 {
+    /// The card leg's live counts read from the slot map again, after the
+    /// residency machine moved slots (a give-back, a fill): the one place the
+    /// count readers follow the machine ([`Card38::follow`]); the kernels'
+    /// place bound is the stacks' slots and does not move.
+    fn follow_live(&self) -> Result<(), GpuError> {
+        let map = self.hybrid.slots();
+        for l in map.layers() {
+            self.card.follow(l, map.on_card(l)?)?;
+        }
+        Ok(())
     }
 }
 
@@ -5955,6 +6001,7 @@ impl ChainBody for Body38 {
         self.staged = None;
         self.plant = None;
         self.card_leg = MapCheck::of(self.hybrid.slots(), self.tier.is_some())?;
+        self.residency_moved()?;
         self.wide.split = None;
         self.wide.force = None;
         if let Some(t) = self.wide.taps.as_mut() {
@@ -6327,6 +6374,16 @@ impl Body38 {
 
 impl TierBody for Body38 {
     type Experts = HostRun;
+
+    /// An elastic load's live counts follow the map after a boundary, a reset or a reseed (a
+    /// promotion into a withdrawn-then-filled slot and a reset both move the count a fill
+    /// leaves alone); a load that is not elastic keeps the counts it loaded with.
+    fn residency_moved(&self) -> Result<(), GpuError> {
+        if self.elastic_moves.is_some() {
+            self.follow_live()?;
+        }
+        Ok(())
+    }
 
     fn hybrid(&self) -> &Hybrid<HostRun> {
         &self.hybrid

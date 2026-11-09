@@ -1625,6 +1625,13 @@ impl ResidencyGlue {
         tier.swap_quantum()
     }
 
+    /// The slots one fill could restore a layer ([`HostTier::swap_withdrawn_slots`]);
+    /// 0 without a machine.
+    #[must_use]
+    pub fn withdrawn_slots<H: HostExperts>(&self, tier: &HostTier<H>) -> usize {
+        tier.swap_withdrawn_slots()
+    }
+
     /// Stop the machine before anything of the model is freed
     /// ([`HostTier::stop_swap`]); nothing without one.
     pub fn stop<H>(&mut self, tier: &mut HostTier<H>) {

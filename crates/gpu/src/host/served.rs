@@ -36,6 +36,13 @@ pub trait TierBody {
     /// The body's host tier, mutable.
     fn hybrid_mut(&mut self) -> &mut Hybrid<Self::Experts>;
 
+    /// Called after the residency machine moved slots (a boundary's flips, a reset, a reseed):
+    /// a body whose readers keep a copy of the slot map's live counts reads them again. The
+    /// default keeps none.
+    fn residency_moved(&self) -> Result<(), GpuError> {
+        Ok(())
+    }
+
     /// The body's residency machine's parts — the glue, the tier, the slot
     /// map's card copy — as one value of disjoint borrows; `None` for a body
     /// that runs no machine.
@@ -101,7 +108,8 @@ impl<B: TierBody> HostServed for B {
         match self.residency_parts() {
             Some(ResidencyParts { glue, hybrid, .. }) => glue.at_boundary(hybrid, stream, at),
             None => Ok(()),
-        }
+        }?;
+        self.residency_moved()
     }
 
     /// The pass the last boundary opened keeping `kept` rows
@@ -115,10 +123,12 @@ impl<B: TierBody> HostServed for B {
 
     /// The machine reset to its seed ([`ResidencyGlue::reset`]).
     fn residency_reset(&mut self, stream: &CudaStream) -> Result<Option<ResetReport>, GpuError> {
-        match self.residency_parts() {
+        let moved = match self.residency_parts() {
             Some(ResidencyParts { glue, hybrid, .. }) => glue.reset(hybrid, stream),
             None => Ok(None),
-        }
+        };
+        self.residency_moved()?;
+        moved
     }
 
     /// The machine to a new seed ([`ResidencyGlue::reseed`]).
@@ -127,10 +137,12 @@ impl<B: TierBody> HostServed for B {
         stream: &CudaStream,
         order: &[&[u32]],
     ) -> Result<Option<ResetReport>, GpuError> {
-        match self.residency_parts() {
+        let moved = match self.residency_parts() {
             Some(ResidencyParts { glue, hybrid, .. }) => glue.reseed(hybrid, stream, order),
             None => Ok(None),
-        }
+        };
+        self.residency_moved()?;
+        moved
     }
 
     /// The machine's rule ([`crate::host::HostTier::swap`]).
