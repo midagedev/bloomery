@@ -40,13 +40,12 @@ use bloomery_gpu::flash_gqa::{GROUP, partials_ms_len, partials_v_len};
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::PassKind;
 use bloomery_gpu::host::leg_tier::{Hang, LegOpen};
-use bloomery_gpu::host::refuse_tier_count;
 use bloomery_gpu::host::run::{HostRun, HostWidths};
 use bloomery_gpu::host::served::{ResidencyParts, TierBody};
 use bloomery_gpu::host::shell::TierShell;
 use bloomery_gpu::host::swap::{PassReport, Residency};
 use bloomery_gpu::host::swap_source::{
-    DEADLINE, FileSwap, LIVE_DELAY, PlanStacks, ResidencyGlue, ResidencySpec, hosted_stacks,
+    FileSwap, PlanStacks, ResidencyGlue, ResidencySpec, hosted_stacks,
 };
 use bloomery_gpu::host::tier::TierOpen;
 use bloomery_gpu::hybrid::{Chain, HostResidency, Hybrid, SlotMap};
@@ -59,7 +58,7 @@ use bloomery_gpu::model::{
 use bloomery_gpu::site::{self, SiteTy, WideActs};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel};
-use bloomery_levers::{ChurnHosting, HostCfg};
+use bloomery_levers::HostCfg;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::Arch;
@@ -653,18 +652,14 @@ impl Body {
                  slots to add"
             )));
         }
-        let tiers = TierOpen::of_machine(plan.machine)?;
-        refuse_tier_count(WHAT, tiers.len())?;
+        let tiers = TierOpen::one_of(plan.machine, WHAT)?;
         let kinds: Vec<Layer> = inputs.spec.layers.iter().map(Layer::of).collect();
-        let spec = ResidencySpec {
-            lever: residency,
-            pool: ChurnHosting::Hosted,
-            delay: LIVE_DELAY,
-            deadline: DEADLINE,
-            top_k: inputs.hp.experts.n_used,
-            max_rows: LOAD_ROWS,
-            stacks: Arc::new(stacks(inputs)?),
-        };
+        let spec = ResidencySpec::hosted(
+            residency,
+            inputs.hp.experts.n_used,
+            LOAD_ROWS,
+            Arc::new(stacks(inputs)?),
+        );
         GpuModel::load_placed_with(
             file,
             plan,

@@ -391,6 +391,28 @@ pub struct ResidencySpec {
     pub stacks: Arc<dyn FileStacks>,
 }
 
+impl ResidencySpec {
+    /// A spec whose churn pool is hosted ([`ChurnHosting::Hosted`]) at the common
+    /// [`LIVE_DELAY`] and [`DEADLINE`]: the model passes its router's pick count,
+    /// the most rows a pass runs and its routed stacks.
+    pub fn hosted(
+        lever: Residency,
+        top_k: usize,
+        max_rows: usize,
+        stacks: Arc<dyn FileStacks>,
+    ) -> Self {
+        Self {
+            lever,
+            pool: ChurnHosting::Hosted,
+            delay: LIVE_DELAY,
+            deadline: DEADLINE,
+            top_k,
+            max_rows,
+            stacks,
+        }
+    }
+}
+
 // --------------------------------------------------------------- source
 
 /// One layer's parts: the file tensors (its stacks), the stage stacks' base

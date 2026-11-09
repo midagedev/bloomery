@@ -31,14 +31,11 @@ use bloomery_gpu::checkpoint::saved::Identity;
 use bloomery_gpu::flash_gqa::{GROUP_16, HEAD, partials_ms_len, partials_v_len};
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::leg_tier::{Hang, LegOpen};
-use bloomery_gpu::host::refuse_tier_count;
 use bloomery_gpu::host::run::{HostRun, HostWidths};
 use bloomery_gpu::host::served::{ResidencyParts, TierBody};
 use bloomery_gpu::host::shell::TierShell;
 use bloomery_gpu::host::swap::Residency;
-use bloomery_gpu::host::swap_source::{
-    DEADLINE, LIVE_DELAY, PlanStacks, ResidencyGlue, ResidencySpec, hosted_stacks,
-};
+use bloomery_gpu::host::swap_source::{PlanStacks, ResidencyGlue, ResidencySpec, hosted_stacks};
 use bloomery_gpu::host::tier::TierOpen;
 use bloomery_gpu::hybrid::{Chain, HostResidency, Hybrid, SlotMap};
 use bloomery_gpu::model::{
@@ -50,7 +47,7 @@ use bloomery_gpu::rope_table::{RopeRows, RopeSpec, RopeTable};
 use bloomery_gpu::site::{self, SiteTy};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel};
-use bloomery_levers::{ChurnHosting, HostCfg};
+use bloomery_levers::HostCfg;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::Arch;
@@ -448,20 +445,16 @@ impl Body {
         slots: NonZeroUsize,
     ) -> Result<MiniMaxM3Model, GpuError> {
         let (file, origin) = file.into().into_origin(residency, plan)?;
-        let tiers = TierOpen::of_machine(plan.machine)?;
-        refuse_tier_count(WHAT, tiers.len())?;
+        let tiers = TierOpen::one_of(plan.machine, WHAT)?;
         let (layers, _) = stage_run(WHAT, plan, card, inputs.spec.layers.len())?;
         let one = inputs.kv.bytes(layers, plan.ctx_max);
         refuse_store_count(plan, card, one, slots)?;
-        let spec = ResidencySpec {
-            lever: residency,
-            pool: ChurnHosting::Hosted,
-            delay: LIVE_DELAY,
-            deadline: DEADLINE,
-            top_k: inputs.hp.experts.n_used,
-            max_rows: LOAD_ROWS,
-            stacks: Arc::new(stacks(inputs)?),
-        };
+        let spec = ResidencySpec::hosted(
+            residency,
+            inputs.hp.experts.n_used,
+            LOAD_ROWS,
+            Arc::new(stacks(inputs)?),
+        );
         GpuModel::load_placed_from(
             file,
             origin.bytes(),

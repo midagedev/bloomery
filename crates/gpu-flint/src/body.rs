@@ -9,14 +9,11 @@ use bloomery_gpu::card_experts::CardFamily;
 use bloomery_gpu::card_leg::ExpertInput;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::leg_tier::{Hang, LegOpen};
-use bloomery_gpu::host::refuse_tier_count;
 use bloomery_gpu::host::run::{HostRun, HostWidths};
 use bloomery_gpu::host::served::{ResidencyParts, TierBody};
 use bloomery_gpu::host::shell::TierShell;
 use bloomery_gpu::host::swap::Residency;
-use bloomery_gpu::host::swap_source::{
-    DEADLINE, LIVE_DELAY, ResidencyGlue, ResidencySpec, hosted_stacks,
-};
+use bloomery_gpu::host::swap_source::{ResidencyGlue, ResidencySpec, hosted_stacks};
 use bloomery_gpu::host::tier::TierOpen;
 use bloomery_gpu::hybrid::{Chain, HostResidency, Hybrid, SlotMap};
 use bloomery_gpu::model::{
@@ -29,7 +26,7 @@ use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel};
 use bloomery_gpu_deepseek41::prompt_walk::{self, BatchBufs};
 use bloomery_gpu_deepseek41::shared_routed::{FfnConfig, ResidualOrder, Routed, RoutedDims};
-use bloomery_levers::{ChurnHosting, HostCfg};
+use bloomery_levers::HostCfg;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::Arch;
@@ -141,21 +138,17 @@ impl Body {
         residency: Residency,
         slots: NonZeroUsize,
     ) -> Result<FlintModel, GpuError> {
-        let tiers = TierOpen::of_machine(plan.machine)?;
-        refuse_tier_count(WHAT, tiers.len())?;
+        let tiers = TierOpen::one_of(plan.machine, WHAT)?;
         let (layers, _) = stage_run(WHAT, plan, card, inputs.spec.layers.len())?;
         let one = inputs.kv.bytes(layers, plan.ctx_max);
         refuse_store_count(plan, card, one, slots)?;
         let run = hosted(&inputs.spec.layers).map_err(|e| shape(e.to_string()))?;
-        let residency = ResidencySpec {
-            lever: residency,
-            pool: ChurnHosting::Hosted,
-            delay: LIVE_DELAY,
-            deadline: DEADLINE,
-            top_k: 6,
-            max_rows: 1,
-            stacks: Arc::new(hosted_stacks(&inputs.model, WHAT, (run.len(), true))?),
-        };
+        let residency = ResidencySpec::hosted(
+            residency,
+            6,
+            1,
+            Arc::new(hosted_stacks(&inputs.model, WHAT, (run.len(), true))?),
+        );
         GpuModel::load_placed_with(
             file,
             plan,

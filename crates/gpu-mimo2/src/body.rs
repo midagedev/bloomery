@@ -48,7 +48,6 @@ use bloomery_gpu::flash_gqa::{self, FlashGqaKernels, HEAD, HEAD_K192};
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::PassKind;
 use bloomery_gpu::host::leg_tier::{self, Hang, LegOpen};
-use bloomery_gpu::host::refuse_tier_count;
 use bloomery_gpu::host::run::{HostRun, HostWidths};
 use bloomery_gpu::host::served::{ResidencyParts, TierBody};
 use bloomery_gpu::host::shell::TierShell;
@@ -68,7 +67,7 @@ use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel};
 use bloomery_gpu_deepseek41::block::{BlockPlan, BlockScratch, KBlockKernels};
 use bloomery_gpu_deepseek41::experts::ExpertKernels;
 use bloomery_gpu_deepseek41::router::mimo2::{N_EXPERT, N_USED, RouterKernels};
-use bloomery_levers::{ChurnHosting, HostCfg};
+use bloomery_levers::HostCfg;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::Arch;
@@ -646,8 +645,7 @@ impl Body {
         residency: Residency,
         slots: NonZeroUsize,
     ) -> Result<Mimo2Model, GpuError> {
-        let tiers = TierOpen::of_machine(plan.machine)?;
-        refuse_tier_count(WHAT, tiers.len())?;
+        let tiers = TierOpen::one_of(plan.machine, WHAT)?;
         if !tiers.is_empty() && slots.get() > 1 {
             return Err(shape(format!(
                 "a load of {slots} sequences beside the expert tier card {}: their pass runs \
@@ -656,15 +654,12 @@ impl Body {
                 tiers[0].name
             )));
         }
-        let spec = ResidencySpec {
-            lever: residency,
-            pool: ChurnHosting::Hosted,
-            delay: swap::LIVE_DELAY,
-            deadline: swap::DEADLINE,
-            top_k: N_USED,
-            max_rows: swap::LOAD_ROWS,
-            stacks: Arc::new(swap::stacks(inputs)?),
-        };
+        let spec = ResidencySpec::hosted(
+            residency,
+            N_USED,
+            swap::LOAD_ROWS,
+            Arc::new(swap::stacks(inputs)?),
+        );
         GpuModel::load_placed_with(
             file,
             plan,

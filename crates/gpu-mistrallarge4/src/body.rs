@@ -86,7 +86,6 @@ use bloomery_gpu::fused::FusedKernels;
 use bloomery_gpu::gemm::Gemm32Kernels;
 use bloomery_gpu::head::{Head, HeadNorm};
 use bloomery_gpu::host::leg_tier::{Hang, LegOpen, TierSide};
-use bloomery_gpu::host::refuse_tier_count;
 use bloomery_gpu::host::run::{HostRun, HostWidths};
 use bloomery_gpu::host::served::{ResidencyParts, TierBody};
 use bloomery_gpu::host::shell::TierShell;
@@ -563,8 +562,7 @@ impl Body {
         host: HostCfg,
         lever: Residency,
     ) -> Result<MistralLarge4Model, GpuError> {
-        let tiers = TierOpen::of_machine(plan.machine)?;
-        refuse_tier_count(WHAT, tiers.len())?;
+        let tiers = TierOpen::one_of(plan.machine, WHAT)?;
         stage_run(WHAT, plan, card, inputs.spec.layers.len())?;
         let run = hosted(&inputs.spec.layers).map_err(|e| GpuError::shape(WHAT, e.to_string()))?;
         let residency = resid::spec(lever, inputs, run.len())?;
