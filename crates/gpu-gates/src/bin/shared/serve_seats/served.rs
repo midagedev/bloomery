@@ -34,7 +34,7 @@ use bloomery_gpu::dspark::DraftLayers;
 use bloomery_gpu::model::{ChainBody, Rollback, Rows, Slots};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::bind::{SlotsFrom, nvidia_smi_index};
-use bloomery_levers::Levers;
+use bloomery_levers::{DraftWord, Levers};
 use model::placement::workstation::DeviceId;
 use runtime::width::{Choosing, Chosen, Mode as WidthMode};
 use runtime::{Advance, Committed, Draft as RtDraft, Speculative, Widths, Window};
@@ -621,22 +621,33 @@ pub enum Word {
     Mtp,
 }
 
-/// [`Word`] from the levers. A word this seat does not take is refused by name.
+/// `BLOOMERY_DRAFT` as the qwen3 seat reads it: every word the row takes, `None` unset.
+#[allow(
+    dead_code,
+    reason = "the qwen3 seat's parse; the V4.1 binary that includes this file serves no such seat"
+)]
+pub fn asked(levers: &Levers) -> Result<Option<DraftWord>, GateError> {
+    levers.draft_word(&DraftWord::ALL).map_err(|e| {
+        format!(
+            "BLOOMERY_DRAFT is lookup, dspark, mtp, off or unset, not {:?}",
+            e.word.as_str()
+        )
+        .into()
+    })
+}
+
+/// [`Word`] from the levers.
 #[allow(
     dead_code,
     reason = "the qwen3 seat's parse; the V4.1 binary that includes this file serves no such seat"
 )]
 pub fn word(levers: &Levers) -> Result<Word, GateError> {
-    match levers.draft() {
-        None | Some("off") => Ok(Word::Off),
-        Some("lookup") => Ok(Word::Lookup),
-        Some("dspark") => Ok(Word::Dspark),
-        Some("mtp") => Ok(Word::Mtp),
-        Some(other) => Err(format!(
-            "BLOOMERY_DRAFT is lookup, dspark, mtp, off or unset, not {other:?}"
-        )
-        .into()),
-    }
+    Ok(match asked(levers)? {
+        None | Some(DraftWord::Off) => Word::Off,
+        Some(DraftWord::Lookup) => Word::Lookup,
+        Some(DraftWord::Dspark) => Word::Dspark,
+        Some(DraftWord::Mtp) => Word::Mtp,
+    })
 }
 
 /// The slot count the DSpark draft decides, when it does: its window is one

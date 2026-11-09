@@ -280,7 +280,8 @@ use bloomery_gpu_glm5next::{
     seq_bytes, seq_lane, seq_resume, seq_resume_prefix, seq_save, seq_save_async, seq_save_bytes,
 };
 use bloomery_levers::{
-    ChurnHosting, GlmAt, GlmPick, ResidencyPick, ResidencyWhy, glm_residency_at_plan, glm_unset,
+    ChurnHosting, DraftWord, GlmAt, GlmPick, ResidencyPick, ResidencyWhy, glm_residency_at_plan,
+    glm_unset,
 };
 use gguf::Split;
 use model::arch::glm5next::place::{KdaLanes, NextnInputs, PROMPT_GROUP, PlaceError, PlanInputs};
@@ -401,16 +402,19 @@ const NEED: usize = VERIFY_ROWS + 1;
 const NEED_FLOOR: NonZeroU64 = NonZeroU64::new(NEED as u64).expect("a window of at least one row");
 
 /// The draft kinds this seat serves without inspecting its NextN layers.
-fn check_draft_word(levers: &bloomery_levers::Levers) -> Result<(), GateError> {
-    match levers.draft() {
-        None | Some("mtp" | "off") => Ok(()),
-        Some(other) => Err(format!(
-            "BLOOMERY_DRAFT={other}: on a glm5next file mtp drafts the window (the file's NextN \
+const DRAFT_WORDS: [DraftWord; 2] = [DraftWord::Mtp, DraftWord::Off];
+
+/// `BLOOMERY_DRAFT` as this seat reads it: a word outside [`DRAFT_WORDS`] is refused by name.
+fn draft_asked(levers: &bloomery_levers::Levers) -> Result<Option<DraftWord>, GateError> {
+    levers.draft_word(&DRAFT_WORDS).map_err(|e| {
+        format!(
+            "BLOOMERY_DRAFT={}: on a glm5next file mtp drafts the window (the file's NextN \
              layer); lookup needs a load that verifies two rows, which a glm5next load holds \
-             (two KDA lanes) only with its NextN layer, and dspark is the V4.1 binaries'"
+             (two KDA lanes) only with its NextN layer, and dspark is the V4.1 binaries'",
+            e.word
         )
-        .into()),
-    }
+        .into()
+    })
 }
 
 /// `BLOOMERY_DRAFT` on stores of `ctx` positions, `unset` the seat's rule
@@ -424,15 +428,14 @@ fn draft_of(
     ctx: usize,
     unset: GlmPick,
 ) -> Result<Option<String>, GateError> {
-    check_draft_word(levers)?;
-    match levers.draft() {
-        Some("mtp") if ctx < NEED => Err(format!(
+    match draft_asked(levers)? {
+        Some(DraftWord::Mtp) if ctx < NEED => Err(format!(
             "BLOOMERY_DRAFT=mtp needs --ctx {NEED} or more: token 0 comes out of the feed, and \
              a window's {VERIFY_ROWS} rows run after it (--ctx {ctx})"
         )
         .into()),
-        Some("mtp") => Ok(None),
-        Some("off") => Ok(Some("BLOOMERY_DRAFT=off".to_owned())),
+        Some(DraftWord::Mtp) => Ok(None),
+        Some(DraftWord::Off) => Ok(Some("BLOOMERY_DRAFT=off".to_owned())),
         Some(_) => unreachable!("the draft word was checked"),
         None => {
             Record::new(&record::DRAFT_UNSET_GLM)
@@ -819,8 +822,8 @@ fn checked_ctx(
     slots: usize,
     levers: &bloomery_levers::Levers,
 ) -> Result<Option<usize>, String> {
-    let (floor, why) = match levers.draft() {
-        Some("mtp") => (
+    let (floor, why) = match levers.draft_word(&DRAFT_WORDS).map_err(|e| e.to_string())? {
+        Some(DraftWord::Mtp) => (
             NEED_FLOOR,
             format!(
                 "BLOOMERY_DRAFT=mtp: token 0 comes out of the feed, and a window's {VERIFY_ROWS} \
@@ -864,13 +867,13 @@ pub(crate) fn check(
         a.vision.check_before_model(from_repo)?;
         if let Some(levers) = levers {
             WidthMode::of(levers.mtp_width())?;
-            check_draft_word(levers)?;
+            let draft = draft_asked(levers)?;
             super::tiered::check_residency_feed(
                 levers,
                 a.prefill == PrefillMode::Steps,
                 bloomery_levers::UnhostedPool::NotCarried,
             )?;
-            if levers.draft() == Some("off") {
+            if draft == Some(DraftWord::Off) {
                 bloomery_gpu_gates::bind::refuse_plain_width(levers, Some("BLOOMERY_DRAFT=off"))?;
             }
             let (slots, _) = slots_given(a.parallel, a.ctx, a.auto.is_some(), DEFAULT_SLOTS)?;

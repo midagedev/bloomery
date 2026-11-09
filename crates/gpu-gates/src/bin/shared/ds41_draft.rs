@@ -13,7 +13,7 @@ use bloomery_gpu_deepseek41::body::Body;
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::generate::{DraftSeat, Place};
 use bloomery_gpu_gates::record::{self, Record};
-use bloomery_levers::Levers;
+use bloomery_levers::{DraftWord, Levers};
 use gguf::Split;
 use model::arch::dspark::{DraftCardBytes, DraftHeld, DraftHparams};
 use model::placement::workstation::{CardSpec, GRANULE};
@@ -44,13 +44,16 @@ impl Draft {
 
     /// The draft word without record registration or model access.
     pub fn check_levers(levers: &Levers) -> Result<Draft, GateError> {
-        match levers.draft() {
-            None => Ok(Draft::Off),
-            Some("lookup") => Ok(Draft::Lookup),
-            Some("dspark") => Ok(Draft::Dspark),
-            Some(other) => {
-                Err(format!("BLOOMERY_DRAFT is lookup, dspark or unset, not {other:?}").into())
-            }
+        const WORDS: [DraftWord; 2] = [DraftWord::Lookup, DraftWord::Dspark];
+        match levers.draft_word(&WORDS) {
+            Ok(None) => Ok(Draft::Off),
+            Ok(Some(DraftWord::Lookup)) => Ok(Draft::Lookup),
+            Ok(Some(_)) => Ok(Draft::Dspark),
+            Err(e) => Err(format!(
+                "BLOOMERY_DRAFT is lookup, dspark or unset, not {:?}",
+                e.word.as_str()
+            )
+            .into()),
         }
     }
 

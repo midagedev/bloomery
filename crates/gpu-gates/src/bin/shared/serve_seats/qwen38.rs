@@ -495,9 +495,9 @@ use bloomery_gpu_gates::residency38::{
 };
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path, side_seat, vision_seat};
 use bloomery_levers::{
-    ChurnHosting, Draft38At, Draft38Off, KvHost, Paged, Residency38At, ResidencyPick, ResidencyWhy,
-    draft38_unset, residency_word_least_fewest, residency38_least_fewest, residency38_off,
-    residency38_unset,
+    ChurnHosting, Draft38At, Draft38Off, DraftWord, KvHost, Paged, Residency38At, ResidencyPick,
+    ResidencyWhy, draft38_unset, residency_word_least_fewest, residency38_least_fewest,
+    residency38_off, residency38_unset,
 };
 use gguf::Split;
 use model::arch::models::headpick::HeadSet;
@@ -1077,15 +1077,18 @@ pub(crate) fn refuse_media_feed(feed: Feed38) -> Result<(), GateError> {
 }
 
 /// The draft kinds this seat serves, before any model is read.
-fn check_draft_word(levers: &bloomery_levers::Levers) -> Result<(), GateError> {
-    match levers.draft() {
-        None | Some("mtp" | "lookup" | "off") => Ok(()),
-        Some(other) => Err(format!(
-            "BLOOMERY_DRAFT={other}: on a qwen4exp file mtp drafts the window, lookup the n-gram \
-             lookup and off runs the plain path; dspark is the V4.1 binaries'"
+const DRAFT_WORDS: [DraftWord; 3] = [DraftWord::Mtp, DraftWord::Lookup, DraftWord::Off];
+
+/// `BLOOMERY_DRAFT` as this seat reads it: a word outside [`DRAFT_WORDS`] is refused by name.
+fn draft_asked(levers: &bloomery_levers::Levers) -> Result<Option<DraftWord>, GateError> {
+    levers.draft_word(&DRAFT_WORDS).map_err(|e| {
+        format!(
+            "BLOOMERY_DRAFT={}: on a qwen4exp file mtp drafts the window, lookup the n-gram \
+             lookup and off runs the plain path; dspark is the V4.1 binaries'",
+            e.word
         )
-        .into()),
-    }
+        .into()
+    })
 }
 
 /// `BLOOMERY_DRAFT` on the seat at `place` with stores of `ctx` positions
@@ -1117,12 +1120,11 @@ fn draft38(
     looked: &[std::path::PathBuf],
     inputs: &PlanInputs,
 ) -> Result<(bool, Option<Draft38Off>), GateError> {
-    check_draft_word(levers)?;
-    match levers.draft() {
-        Some("mtp") => Ok((true, None)),
-        Some("lookup") => Ok((false, None)),
-        Some("off") => Ok((false, Some(Draft38Off::Set))),
-        Some(_) => unreachable!("the draft word was checked"),
+    match draft_asked(levers)? {
+        Some(DraftWord::Mtp) => Ok((true, None)),
+        Some(DraftWord::Lookup) => Ok((false, None)),
+        Some(DraftWord::Off) => Ok((false, Some(Draft38Off::Set))),
+        Some(DraftWord::Dspark) => unreachable!("the draft word was checked"),
         None => {
             let at = Draft38At {
                 place_a: place.stage_a(),
@@ -1160,7 +1162,7 @@ fn draft38(
 pub(crate) fn folder_draft_for(
     layer: &Result<Option<Split>, String>,
     reads: impl FnOnce(&Split) -> Result<(), GateError>,
-    word: Option<&str>,
+    word: Option<DraftWord>,
     (mtp, off): (bool, Option<Draft38Off>),
 ) -> Result<(bool, Option<Draft38Off>), GateError> {
     let why = match layer {
@@ -1172,7 +1174,7 @@ pub(crate) fn folder_draft_for(
             Err(e) => Draft38Off::FolderMtp { why: e.to_string() },
         },
     };
-    if word == Some("mtp") {
+    if word == Some(DraftWord::Mtp) {
         let load = match &why {
             Draft38Off::FolderMtp { why } => {
                 format!("with a checkpoint folder whose MTP layer the draft does not read ({why})")
@@ -1673,9 +1675,9 @@ pub(crate) fn check(
         };
         KvChoice::asked(a.cache_type_k.as_deref(), kv_set)?;
         if let Some(levers) = levers {
-            check_draft_word(levers)?;
+            let draft = draft_asked(levers)?;
             let feed = Feed38::of(levers)?;
-            if levers.draft() == Some("lookup") {
+            if draft == Some(DraftWord::Lookup) {
                 refuse_lookup_feed(feed)?;
                 if let Some(lever) = mtp_only_lever(levers) {
                     return Err(format!(
@@ -1684,19 +1686,19 @@ pub(crate) fn check(
                     .into());
                 }
             }
-            if levers.draft() == Some("off") {
+            if draft == Some(DraftWord::Off) {
                 refuse_mtp_levers(levers, &Some(Draft38Off::Set))?;
             }
             let residency = levers.residency().filter(|&r| r != "off");
             refuse_feed(
                 feed,
-                (a.parallel.unwrap_or(1), levers.draft() == Some("mtp")),
+                (a.parallel.unwrap_or(1), draft == Some(DraftWord::Mtp)),
                 residency,
             )?;
             if a.vision.mmproj()?.is_some() {
                 refuse_media_feed(feed)?;
             }
-            if levers.draft() == Some("mtp") {
+            if draft == Some(DraftWord::Mtp) {
                 let (slots, _) = slots_of(a.parallel, a.ctx.is_some(), DEFAULT_SLOTS)?;
                 if let Some(ctx) = a.ctx {
                     check_mtp_ctx(ctx / slots, slots)?;
@@ -1898,7 +1900,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
                 MtpInputs::read(d, &split, &inputs, HeadSet::Full)?;
                 Ok(())
             },
-            levers.draft(),
+            draft_asked(&levers)?,
             (mtp, draft_off),
         )?,
         None => (mtp, draft_off),
@@ -1911,7 +1913,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // A draft lever set on a server that drafts nothing is refused, with
     // why — asked once the yield below has said its last word, so a draft
     // the plan turns off refuses them the same as one the rule did.
-    let lookup = levers.draft() == Some("lookup");
+    let lookup = draft_asked(&levers)? == Some(DraftWord::Lookup);
     let width = WidthMode::of(levers.mtp_width())?;
     let experts = experts38(&levers)?;
     let plan_levers = PlanLevers::from_levers_with(&levers, kv_default)?;
