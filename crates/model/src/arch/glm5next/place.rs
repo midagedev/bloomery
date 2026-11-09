@@ -437,15 +437,67 @@ pub fn card_tile_bytes(n: usize, ff: usize, used: usize, cap: usize) -> usize {
     usize::try_from(b).unwrap_or(usize::MAX)
 }
 
+/// Positions one `hc_pre` launch's piece spans: the hyper-connection
+/// scratch's partials are one per piece of a token's streams. The card
+/// kernels' constant (`HC_PIECE`), which the prompt body binds to this.
+pub const HC_PIECE: usize = 512;
+
+/// Card bytes of the prompt batch's shared buffers besides the ones the other
+/// terms of [`prompt_reserve_bytes`] count (the GEMM front, the latent
+/// attention's partials, scores and lists, the card experts' scratch) and its
+/// units, for up to `cap` tokens of `hp`'s widths: the streams' working rows,
+/// the hyper-connection's mixes and scratch, the KDA mixer's and the latent
+/// mixer's projections, the selector's query and head weights, the
+/// feed-forward blocks' rows, the router's scores and picks, and the sum the
+/// back reads. Four bytes a value. The one formula of those bytes: the card
+/// body's batch checks its made bytes against the whole reserve.
+#[must_use]
+pub fn prompt_shared_bytes(hp: &Hparams, cap: usize) -> u64 {
+    let (n, head, heads) = (hp.n_embd, hp.kda_head_dim, hp.n_head);
+    let (streams, chunk) = (hp.hc.streams, PROMPT_CHUNK);
+    let mix = (2 + streams) * streams;
+    // The KDA mixer's conv channels: q, k and v heads, tiled.
+    let channels = 3 * heads * head;
+    let values = heads * head;
+    let rows = chunk * heads;
+    let groups = cap.div_ceil(chunk);
+    let pieces = streams * n / HC_PIECE;
+    let hc_scratch = (mix + 1) * pieces * chunk * groups + groups;
+    let ff = hp.dense_ff.max(hp.shared_ff);
+    let kv_width = hp.kv_lora + 2 * hp.indexer.head_dim;
+    let selector = chunk * hp.indexer.n_head * (hp.indexer.head_dim + 1);
+    let words = 9 * cap * n // x xn out fold, normed sh_y acc pre, the sum
+        + cap * mix
+        + hc_scratch
+        + 2 * cap * channels // qkv conv
+        + 2 * cap * head // fa ga
+        + 2 * cap * heads // beta_raw beta
+        + 5 * cap * values // f z decay o gated
+        + 2 * cap * hp.q_lora // qa qr
+        + cap * kv_width
+        + 2 * rows * hp.kv_lora // qabs att
+        + selector
+        + chunk * ff
+        + cap * hp.n_expert
+        + 2 * cap * hp.n_used; // ids sel
+    F32_BYTES * words as u64
+}
+
 /// The card bytes the plan reserves on the stage card for a load of `inputs`'s
-/// prompt batch at `ctx_max` positions: its GEMM front
+/// prompt batch at `ctx_max` positions: all the card bytes its first prompt
+/// pass makes. Its GEMM front
 /// ([`prompt_front_bytes`]), the latent attention's buffers
 /// ([`prompt_attn_bytes`] at [`PlanInputs::attn_shape`]), the card experts' grouped scratch
 /// ([`card_tile_bytes`] at the front's columns, plus [`card_leg_bytes`] in the
-/// forms [`card_leg_forms`] names) and the units a group of
-/// [`PROMPT_GROUP`] holds past the first ([`runtime::prompt::group_sets`], [`unit_bytes`] at
-/// the front's columns, the tier places when `tiered`). The first unit and
-/// the other buffers the units share come out of the card's margin.
+/// forms [`card_leg_forms`] names), the shared buffers
+/// ([`prompt_shared_bytes`]) and the units a group of
+/// [`PROMPT_GROUP`] holds ([`runtime::prompt::group_sets`], [`unit_bytes`] at
+/// the front's columns, the tier places when `tiered`). A media span adds no
+/// card buffer: its rows are staged on the host into the units' rows. The
+/// plan reserves it out of the expert budget and counts it as the stage card's
+/// prompt term ([`CardTotals::grow_prompt`](crate::placement::CardTotals::grow_prompt)); the card body's batch
+/// checks the bytes it made against it. A group past [`PROMPT_GROUP`] makes
+/// its further units out of the card's margin.
 #[must_use]
 pub fn prompt_reserve_bytes(inputs: &PlanInputs, ctx_max: u64, tiered: bool) -> u64 {
     let hp = &inputs.hp;
@@ -460,7 +512,43 @@ pub fn prompt_reserve_bytes(inputs: &PlanInputs, ctx_max: u64, tiered: bool) -> 
         );
     prompt_front_bytes(inputs, ctx_max)
         + prompt_attn_bytes(inputs.attn_shape(), ctx_max)
-        + (tiles + (group_sets(PROMPT_GROUP) - 1) * unit) as u64
+        + prompt_shared_bytes(hp, cols)
+        + (tiles + group_sets(PROMPT_GROUP) * unit) as u64
+}
+
+/// A prompt batch whose made card bytes are not the ones the plan counted
+/// ([`prompt_reserve_bytes`], less the units a smaller or larger group than
+/// [`PROMPT_GROUP`] differs by).
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "a prompt batch takes {made} B on the card; the plan counts {planned} B for it \
+     (place::prompt_reserve_bytes)"
+)]
+pub struct PromptUnplanned {
+    pub made: u64,
+    pub planned: u64,
+}
+
+/// Refused by name when the prompt batch's buffers, `made` bytes in all, are
+/// not the `planned` bytes the plan counted for a batch of a group's size
+/// ([`prompt_reserve_bytes`] with `unit` bytes a unit more or fewer for each
+/// set the group holds past or short of [`PROMPT_GROUP`]'s): a drift between
+/// the buffers and their formula is an error, not an overrun the card-byte
+/// reading finds later.
+pub fn check_prompt_bytes(
+    made: u64,
+    reserve: u64,
+    unit: u64,
+    group: usize,
+) -> Result<(), PromptUnplanned> {
+    let planned = i128::from(reserve)
+        + (group_sets(group) as i128 - group_sets(PROMPT_GROUP) as i128) * i128::from(unit);
+    let planned = u64::try_from(planned).unwrap_or(0);
+    if made == planned {
+        Ok(())
+    } else {
+        Err(PromptUnplanned { made, planned })
+    }
 }
 
 /// What a plan of a glm5next file is made from, read from its headers.
@@ -842,6 +930,10 @@ impl PlanInputs {
             // of the budget reserved above, so the card's bound holds them.
             if let Some(t) = plan.cards.first_mut() {
                 t.grow_kv(beside);
+                // The prompt pass's bytes are reserved out of the same budget
+                // and are a term of the card's count, so the first prompt's
+                // reading holds them.
+                t.grow_prompt(front);
             }
             let room = plan.plan_at(&self.room);
             placement::expert_nvme_tier(&mut plan, room, self.arena)?;
@@ -1205,6 +1297,7 @@ impl PlanInputs {
             // The bytes beside the stores ride the stage card's KV term, as
             // [`PlanInputs::plan_slots`] counts them.
             plan.cards[0].grow_kv(beside);
+            plan.cards[0].grow_prompt(front);
             let planned_at = plan.plan_at(&self.room);
             let room = planned_at
                 .checked_sub(draft_host)
@@ -1741,8 +1834,9 @@ mod tests {
         use super::super::super::hparams::{Hc, Hparams, Indexer};
         use super::super::{
             DenseForms, KdaLanes, Kind, KvLayout, MixerForms, NextnInputs, NextnKv, PROMPT_GROUP,
-            PlaceError, PlanInputs, card_leg_bytes, card_leg_forms, card_tile_bytes, group_sets,
-            prompt_attn_bytes, prompt_front_bytes, prompt_reserve_bytes, row_bytes, unit_bytes,
+            PlaceError, PlanInputs, card_leg_bytes, card_leg_forms, card_tile_bytes,
+            check_prompt_bytes, group_sets, prompt_attn_bytes, prompt_front_bytes,
+            prompt_reserve_bytes, prompt_shared_bytes, row_bytes, unit_bytes,
         };
         use crate::placement::churn::ChurnPool;
         use crate::placement::workstation::{HostNeed, HostRead};
@@ -2150,21 +2244,22 @@ mod tests {
             assert_eq!(row.segments[0].resident_bytes, 16_384 * (1568 + 4 * 13));
         }
 
-        /// The prompt reserve holds the latent attention's buffers beside the
-        /// GEMM front, the card experts' scratch and the group's units past the
-        /// first, at GLM-5.3-Flash's attention shape (2,051 keys a token): at
-        /// 1,536, 16,384 and 262,144 positions the reserve less the others is
-        /// `prompt_attn_bytes`, the bytes the card body makes. Mutant: the
+        /// The prompt reserve holds the latent attention's buffers and the
+        /// shared buffers beside the GEMM front, the card experts' scratch and
+        /// the group's units, at GLM-5.3-Flash's attention shape (2,051 keys a
+        /// token): at 1,536, 16,384 and 262,144 positions the reserve less the
+        /// others is `prompt_attn_bytes` and the shared buffers. Mutant: the
         /// reserve without the attention's term.
         #[test]
         fn the_prompt_reserve_holds_the_attention_buffers() {
             let i = inputs();
             assert_eq!(i.attn_shape().keys, 2051);
-            let units = (group_sets(PROMPT_GROUP) - 1) as u64;
+            let units = group_sets(PROMPT_GROUP) as u64;
             for ctx in [1536, 16_384, 262_144] {
                 let cols = usize::try_from(ctx).expect("a usize").min(512);
                 let others = prompt_front_bytes(&i, ctx)
                     + card_tile_bytes(4096, 2048, 8, cols) as u64
+                    + prompt_shared_bytes(&i.hp, cols)
                     + units * unit_bytes(4096, cols, 4, 8, false) as u64;
                 assert_eq!(
                     prompt_reserve_bytes(&i, ctx, false) - others,
@@ -2172,6 +2267,86 @@ mod tests {
                     "ctx {ctx}"
                 );
             }
+        }
+
+        /// The shared buffers' bytes are the sum of the card body's buffers
+        /// (`Bufs::new` less the front, the attention and the tiles, and the
+        /// sum the back reads), each written out by its length at 512 columns
+        /// of GLM-5.3-Flash's widths (4,096 values, 64 heads of 128, 4
+        /// streams, 288 experts of which 8 are used, the dense width 12,288
+        /// and the shared expert's 2,048). Mutant: the hc scratch's ticket
+        /// words left out.
+        #[test]
+        fn the_shared_prompt_buffers_are_the_sum_of_the_bodys() {
+            let mut i = inputs();
+            i.hp.dense_ff = 12_288;
+            i.hp.shared_ff = 2048;
+            let (cap, n, mix, head, heads, v) =
+                (512usize, 4096usize, 24usize, 128usize, 64usize, 8192usize);
+            let ch = 3 * v;
+            let rows = 8 * heads;
+            let pieces = 4 * n / 512;
+            let groups = cap / 8;
+            let f32s = [
+                cap * n, // x
+                cap * n, // xn
+                cap * n, // out
+                cap * n, // fold
+                cap * mix,
+                mix * pieces * 8 * groups, // hc part
+                pieces * 8 * groups,       // hc squares
+                cap * ch,                  // qkv
+                cap * ch,                  // conv
+                cap * head,                // fa
+                cap * head,                // ga
+                cap * heads,               // beta_raw
+                cap * heads,               // beta
+                cap * v,                   // f
+                cap * v,                   // z
+                cap * v,                   // decay
+                cap * v,                   // o
+                cap * v,                   // gated
+                cap * 1536,                // qa
+                cap * (512 + 2 * 128),     // kv
+                cap * 1536,                // qr
+                rows * 512,                // qabs
+                rows * 512,                // att
+                8 * 32 * 128,              // qi
+                8 * 32,                    // wi
+                8 * 12_288,                // h
+                cap * n,                   // normed
+                cap * n,                   // sh_y
+                cap * n,                   // acc
+                cap * n,                   // pre
+                cap * 288,                 // probs
+                cap * n,                   // hsum
+            ];
+            let u32s = [groups, cap * 8, cap * 8]; // hc tickets, ids, sel
+            let want = 4 * (f32s.iter().sum::<usize>() + u32s.iter().sum::<usize>());
+            assert_eq!(prompt_shared_bytes(&i.hp, cap), want as u64);
+        }
+
+        /// A batch whose buffers take other bytes than the plan counted is
+        /// refused by name, and a group of another size moves the count by
+        /// its units. Mutant: the check compares the plan's count alone.
+        #[test]
+        fn a_prompt_batch_off_the_plans_count_is_refused() {
+            let unit = 1000;
+            let reserve = 50_000;
+            let at_default = PROMPT_GROUP;
+            assert!(check_prompt_bytes(reserve, reserve, unit, at_default).is_ok());
+            assert_eq!(
+                check_prompt_bytes(reserve + 1, reserve, unit, at_default)
+                    .expect_err("one byte over")
+                    .to_string(),
+                "a prompt batch takes 50001 B on the card; the plan counts 50000 B for it \
+                 (place::prompt_reserve_bytes)"
+            );
+            let more = PROMPT_GROUP + 1;
+            let extra = (group_sets(more) - group_sets(PROMPT_GROUP)) as u64 * unit;
+            assert!(extra > 0);
+            assert!(check_prompt_bytes(reserve + extra, reserve, unit, more).is_ok());
+            assert!(check_prompt_bytes(reserve, reserve, unit, more).is_err());
         }
 
         /// The card leg's reserve follows the card layers' types: a file whose
@@ -2276,7 +2451,8 @@ mod tests {
                 + t.kv_bytes
                 + t.scratch_bytes
                 + t.context_bytes
-                + t.reserve_bytes;
+                + t.reserve_bytes
+                + t.prompt_bytes;
             (
                 t.headroom_bytes,
                 i128::from(p.usable_bytes(&p.machine.cards[0])) - i128::from(terms),

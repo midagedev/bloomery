@@ -837,6 +837,10 @@ pub struct Body {
     /// buffers (`place::prompt_attn_bytes`), which the batch feed's are
     /// held to before it makes them.
     attn_planned: u64,
+    /// The card bytes the plan counts for the whole prompt batch
+    /// (`place::prompt_reserve_bytes`), which the batch feed's are held to
+    /// once it has made them.
+    prompt_planned: u64,
     /// The KDA layers' stores on the host at chosen positions.
     ckpt: Checkpoints,
     /// How a prompt is fed, and the batch feed's buffers.
@@ -1765,6 +1769,7 @@ impl Body {
             )));
         }
         let attn_planned = place::prompt_attn_bytes(inputs.attn_shape(), plan.ctx_max);
+        let prompt_planned = place::prompt_reserve_bytes(inputs, plan.ctx_max, !tiers.is_empty());
         let tier_cards: Vec<usize> = tiers.iter().map(|t| t.card).collect();
         let map = SlotMap::of_plan_tiers(plan, card, &tier_cards, run.clone(), N_EXPERT)?;
         let plans = trunk_plans(file, inputs)?;
@@ -1939,6 +1944,7 @@ impl Body {
             wrote: nextn::Wrote::default(),
             dense,
             attn_planned,
+            prompt_planned,
             ckpt,
             prompt: prefill::PromptState::new(),
             nvme_tier,

@@ -168,6 +168,8 @@ const _: () = assert!(CHUNK == HC_MAX_TOKENS);
 // The plan counts a chunk's attention buffers (`place::prompt_attn_bytes`)
 // by this chunk and the attention's segment.
 const _: () = assert!(CHUNK == place::PROMPT_CHUNK && attn::SEG_KEYS == place::ATTN_SEG_KEYS);
+// So is its hyper-connection scratch's piece.
+const _: () = assert!(bloomery_gpu_deepseek41::hc::HC_PIECE == place::HC_PIECE);
 
 /// The fewest tokens a batch runs its GEMM projections over
 /// ([`GemmFront`]: a KDA mixer's input and output projections but its decay
@@ -1937,6 +1939,11 @@ impl Body {
             .collect::<Result<Vec<_>, _>>()?;
         let hsum = DeviceBuffer::zeroed(gpu.stream(), cap * self.dims.embd)?;
         let batch = Batch { bufs, units, hsum };
+        let made = u64::try_from(batch.bytes())
+            .map_err(|_| shape("the prompt batch's bytes pass u64".into()))?;
+        let unit = unit_bytes(self.dims.embd, cap, tiered) as u64;
+        place::check_prompt_bytes(made, self.prompt_planned, unit, self.prompt.group)
+            .map_err(|e| shape(e.to_string()))?;
         self.shell.hybrid.prepare_batch(gpu.context(), cap)?;
         self.shell.hybrid.host_mut().prepare_union(cap)?;
         gpu.stream().synchronize()?;
