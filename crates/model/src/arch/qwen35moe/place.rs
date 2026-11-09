@@ -401,7 +401,9 @@ impl PlanInputs {
     /// the device holds that room's spare page beside the card rooms'; under
     /// `all` the planes hold no card bytes, so they add no card padding and
     /// their whole bytes sit on the host ([`PlanInputs::kv_host_bytes`]),
-    /// their room's spare page still on the card.
+    /// their room's spare page still on the card. A layout that declares no
+    /// rooms (a file without the selector: plain buffers, counted whole in
+    /// the layer's bytes) pads nothing.
     pub fn room_padding(
         &self,
         ctx: u64,
@@ -411,6 +413,9 @@ impl PlanInputs {
         kv: KvHost,
     ) -> Result<u64, PlacementError> {
         assert!(page > 0, "the device allocation granularity is positive");
+        if self.kv.rooms().is_none() {
+            return Ok(0);
+        }
         let host_page = match kv {
             KvHost::Off => None,
             KvHost::Spill | KvHost::All => Some(self.kv_host_page_of()?),
@@ -5160,6 +5165,20 @@ mod tests {
 
         /// Every positional buffer rounds independently on every resident
         /// slot, including the draft's planes; the shared spare counts once.
+        /// A layout that declares no rooms (plain buffers) pads nothing, under every backing: the
+        /// plan of a file without the selector does not refuse.
+        #[test]
+        fn a_layout_without_rooms_pads_nothing() {
+            let mut inputs = inputs();
+            inputs.kv.rooms = None;
+            for kv in [KvHost::Off, KvHost::Spill, KvHost::All] {
+                let padding = inputs
+                    .room_padding(4096, 4, true, 2 << 20, kv)
+                    .expect("a layout without rooms pads");
+                assert_eq!(padding, 0, "{kv:?}");
+            }
+        }
+
         /// The reserve is part of admission even with no expert stream.
         #[test]
         fn room_padding_counts_each_buffer_each_slot_and_one_spare() {
