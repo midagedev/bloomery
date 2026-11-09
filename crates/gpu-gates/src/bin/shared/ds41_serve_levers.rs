@@ -4,8 +4,8 @@
 
 use bloomery_levers::{
     CARD_BUDGET, CARD_DONTNEED, CED, DRAFT, ENGRAM_HELPER, EXPERT_RANK, HOST_LANES, HOST_LOCK,
-    HOST_POPULATE, HOSTSTREAM, MTP_WIDTH, PIN_MAIN, PREFILL, PREFILL_CUT, PREFILL_GROUP, R8,
-    RESIDENCY, ROUTE_TRACE, SCHEMAJUMP, SCREEN, STEP_STATS,
+    HOST_POPULATE, HOSTSTREAM, KV_FLOOR, KV_HOST, KvHost, MTP_WIDTH, PIN_MAIN, PREFILL,
+    PREFILL_CUT, PREFILL_GROUP, R8, RESIDENCY, ROUTE_TRACE, SCHEMAJUMP, SCREEN, STEP_STATS,
 };
 
 /// Besides the pool's two: how a prompt is fed, and the batched feed's CED
@@ -26,6 +26,8 @@ pub const ACTS_ON: &[&str] = &[
     ENGRAM_HELPER,
     CARD_BUDGET,
     EXPERT_RANK,
+    KV_FLOOR,
+    KV_HOST,
     PIN_MAIN,
     HOST_LANES,
     HOST_POPULATE,
@@ -42,3 +44,16 @@ pub const ACTS_ON: &[&str] = &[
     SCHEMAJUMP,
     bloomery_gpu_gates::llama_place::DRAFT_CARD,
 ];
+
+/// What the server takes for the K/V levers it leaves unset: the routed experts spread at 8,192
+/// positions (a context no more has no floor) and the selected rows' pages spill to the host
+/// once the card's margin is reached. The server's one owner of these defaults; `off` stays a
+/// value of both levers.
+#[allow(
+    dead_code,
+    reason = "the serve seat reads the default; the other bins that include this file only read ACTS_ON"
+)]
+pub const KV_DEFAULT: model::placement::KvDefault = model::placement::KvDefault {
+    floor: 8192,
+    host: KvHost::Spill,
+};

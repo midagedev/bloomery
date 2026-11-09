@@ -230,14 +230,14 @@ use bloomery_gpu_gates::bind::{
     SlotsFrom, TemplateFile, Vocab, arm_screen, bind_server, call_token, model_props,
     parallel_line, placement_of,
 };
-use bloomery_gpu_gates::generate::{DraftSeat, Lane, Place, lane_at, mode_name};
+use bloomery_gpu_gates::generate::{DraftSeat, Lane, Place, lane_at, mode_name, stage_host_page};
 use bloomery_gpu_gates::need;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency38::{Seqs, checkpoints_reserved, reserve_checkpoints};
 use bloomery_gpu_gates::side_seat;
 use bloomery_gpu_gates::vision_seat;
 use bloomery_gpu_gates::{GateError, ref_model_path, residency};
-use bloomery_levers::{ResidencyAt, ResidencyPick, ResidencyWhy};
+use bloomery_levers::{KvHost, ResidencyAt, ResidencyPick, ResidencyWhy};
 use gguf::Split;
 use model::arch::deepseek41::hparams::Model as Hp41Model;
 use model::arch::deepseek41::place::{PlaceError, PlanInputs};
@@ -635,7 +635,28 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     drop(inv);
 
     let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let inputs = PlanInputs::read(&split)?;
+    let mut inputs = PlanInputs::read(&split)?;
+    // The page a host-capable room takes on the stage card, read once under
+    // `BLOOMERY_KV_HOST`: every plan counts the selected rows' host bytes at it. Unset, the
+    // backing is the server's default (`serve_levers::KV_DEFAULT`); where the device cannot
+    // stage a host page, that default is `off` by name, and a set `spill` or `all` is the
+    // refusal itself.
+    let mut kv_default = crate::serve_levers::KV_DEFAULT;
+    let kv_host_set = levers.kv_host_set().and_then(KvHost::parse);
+    if kv_host_set.unwrap_or(kv_default.host) != KvHost::Off {
+        match stage_host_page(a.place.card_specs()?[0]) {
+            Ok(page) => inputs.kv_host_page = Some(page),
+            Err(e) if kv_host_set.is_none() => {
+                eprintln!(
+                    "bloomery-serve-ds41: BLOOMERY_KV_HOST is unset and the stage card cannot \
+                     back a K/V page on the host ({e}); the rows stay on the card (kv_host=off)"
+                );
+                kv_default.host = KvHost::Off;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    let cfg = cfg.with_kv_default(&levers, kv_default);
     // A V4.1 model file is served with DeepSeek's official V4.1 prompt
     // encoding, which spells V4.1's tags, unless the client gave a template
     // of its own. A V4 file, and any file with a client template, keeps the
@@ -816,7 +837,8 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         residency,
         a.cache_ram,
     )?;
-    let cfg = body::OpenCfg::from_levers_with(&levers, Residency::parse(residency.word)?)?;
+    let cfg = body::OpenCfg::from_levers_with(&levers, Residency::parse(residency.word)?)?
+        .with_kv_default(&levers, kv_default);
     // The record's `headroom` is the room the budget came from: what
     // `MemAvailable` leaves past the plan's host need and the churn pool.
     Record::new(&record::CACHE_CONFIG)

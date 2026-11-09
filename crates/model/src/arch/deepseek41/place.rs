@@ -24,9 +24,12 @@ use crate::arch::coverage;
 use crate::placement::accepts::{Program, routed_rule};
 use crate::placement::ctx_ask::PlanRefusal;
 use crate::placement::workstation::{self, HostRead, TierBatchBytes};
+use bloomery_levers::KvHost;
+use runtime::stores::Class;
+
 use crate::placement::{
-    self, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Unimplemented, Violation,
-    checked, joined,
+    self, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Unimplemented,
+    Violation, checked, joined,
 };
 
 /// What a plan of a V4.1 or V4 file is made from, read from its headers.
@@ -55,6 +58,10 @@ pub struct PlanInputs {
     /// ([`workstation::nvtier_arena_given`]), `None` unset; the split takes it
     /// as its `given`. A gate that plans an arm by an arena of its own sets it.
     pub arena: Option<u64>,
+    /// The page a host-capable room takes on the stage card (`bloomery_gpu::host_page`), which
+    /// a plan under `BLOOMERY_KV_HOST` `spill` or `all` counts the selected rows' host bytes
+    /// at; `None` where no binary read it, a plan under either word refused by name.
+    pub kv_host_page: Option<u64>,
 }
 
 /// The expert tier's prompt-batch bytes plan (b′) reserves for a file of
@@ -153,6 +160,7 @@ impl PlanInputs {
             kv,
             room,
             arena,
+            kv_host_page: None,
         })
     }
 
@@ -224,11 +232,62 @@ impl PlanInputs {
                 0,
                 owned,
             )?;
+            // The selected rows' pages that sit on the host come out of the host room the
+            // plan was made at, before the NVMe tier's split reads it.
+            let host =
+                self.kv_host_bytes(ctx_max, slots.get() as u64, levers.kv_host, plan.kv_floor)?;
+            if host > 0 {
+                plan.kv_host_planes(host)?;
+            }
             let room = plan.plan_at(&self.room);
             placement::expert_nvme_tier(&mut plan, room, self.arena)?;
             Ok(plan)
         })?;
         checked(plan).map_err(PlaceError::Broken)
+    }
+
+    /// The host bytes the selected rows ([`Class::Host`] buffers of the layout's rooms) take
+    /// over `slots` sequences under the lever word `host`, each run rounded to whole pages of
+    /// the host-capable room's page ([`PlanInputs::kv_host_page`]): none under `off`; every
+    /// row at the cap under `all`; under `spill` the pages past the floor the plan spreads
+    /// its experts at (`floor`, none when the cache is planned whole), which a session that
+    /// grows to the cap may spill, so no growth meets a host refusal mid-session.
+    pub fn kv_host_bytes(
+        &self,
+        ctx_max: u64,
+        slots: u64,
+        host: KvHost,
+        floor: Option<u64>,
+    ) -> Result<u64, PlacementError> {
+        if host == KvHost::Off {
+            return Ok(0);
+        }
+        let page = self.kv_host_page.ok_or_else(|| PlacementError::Metadata {
+            key: "BLOOMERY_KV_HOST".to_owned(),
+            detail: "the page a host-capable room takes was not read; a binary that plans under \
+                     the lever reads it once (gpu's host_page) and sets PlanInputs::kv_host_page"
+                .to_owned(),
+        })?;
+        let rooms = self.kv.rooms().ok_or_else(|| PlacementError::Metadata {
+            key: "the stores' rooms".to_owned(),
+            detail: "this layout declares none".to_owned(),
+        })?;
+        let on_host = |class: Class| (class == Class::Host).then_some(page);
+        let past = || PlacementError::Metadata {
+            key: "the K/V rows on the host".to_owned(),
+            detail: "the selected rows' bytes over the resident slots pass u64".to_owned(),
+        };
+        let paged = |at: u64| -> Result<u64, PlacementError> {
+            (0..rooms.layers())
+                .try_fold(0u64, |sum, l| sum.checked_add(rooms.paged(l, at, on_host)))
+                .ok_or_else(past)
+        };
+        let held = match (host, floor) {
+            (KvHost::Off, _) | (KvHost::Spill, None) => 0,
+            (KvHost::Spill, Some(floor)) => paged(ctx_max)?.saturating_sub(paged(floor)?),
+            (KvHost::All, _) => paged(ctx_max)?,
+        };
+        held.checked_mul(slots).ok_or_else(past)
     }
 
     /// What one resident sequence of a load of the file holds on its card
