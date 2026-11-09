@@ -475,7 +475,7 @@ use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::kv_format::{KvChoice, KvQ8};
 use bloomery_gpu::model::ChainBody;
 use bloomery_gpu::model::StepMode;
-use bloomery_gpu::{Gpu, GpuError, GpuModel};
+use bloomery_gpu::{ElasticBody, Gpu, GpuError, GpuModel};
 use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{
     AutoSlots, CacheRam, Cached, ChatSurface, Landing, Listen, Pass, PutBack, Seat, SeatEngine,
@@ -1746,6 +1746,42 @@ fn reseated(at: vision_seat::Opened, place: Place) -> Result<vision_seat::Opened
     Ok(vision_seat::Opened { seat, ..at })
 }
 
+/// The elastic settle's terms, read off the plan at the open: the card's margin, and its
+/// budget when `BLOOMERY_CARD_BUDGET` gave it one, so the card's free bytes past the budget
+/// stay another process's. `None` when the load is not elastic.
+fn elastic_terms(plan: &model::placement::Plan<'_>, on: bool) -> Option<ElasticTerms> {
+    let card = plan.machine.cards.get(CARD38)?;
+    on.then(|| ElasticTerms {
+        margin: card.margin_bytes,
+        budget: model::placement::card_budget::of(&plan.card_budget, card),
+    })
+}
+
+/// What [`settle_elastic`] settles against ([`elastic_terms`]).
+#[derive(Clone, Copy, Debug)]
+struct ElasticTerms {
+    margin: u64,
+    budget: Option<u64>,
+}
+
+/// The elastic settle (`bloomery_gpu::settle_to_margin`, site `warm`): the engine stream
+/// drained, the card's free bytes read — under a budget, the budget's remainder when that is
+/// less — and settled to the margin; each move its `elastic` record, then `stat elastic`.
+fn settle_elastic(gpu: &Gpu, body: &mut Body38, terms: ElasticTerms) -> Result<(), GateError> {
+    gpu.stream().synchronize()?;
+    let (free, total) = gpu.mem_info()?;
+    let (free, total) = (free as u64, total as u64);
+    let free = match terms.budget {
+        Some(budget) => free.min(budget.saturating_sub(total.saturating_sub(free))),
+        None => free,
+    };
+    bloomery_gpu::settle_to_margin(body, "warm", free, terms.margin, 0, |e| {
+        super::elastic::settle(&e).eprint();
+    })?;
+    super::elastic::stat(body.elastic_stats()).eprint();
+    Ok(())
+}
+
 /// The rows a slot's window verifies in one pass: the MTP draft's verify
 /// rows, the lookup's [`LOOKUP_ROWS`], or `None` for a load that drafts
 /// nothing (a plain step's one row).
@@ -2482,6 +2518,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         cache_ram: cache.ram,
         vision,
         autotune: a.autotune.unwrap_or(levers.autotune()),
+        elastic: levers.elastic(),
     };
     let engine = SeatEngine::spawn(
         move || Q38::open(open),
@@ -2727,6 +2764,9 @@ struct SeatArgs {
     vision: Option<vision_seat::Opened>,
     /// Whether the load makes its kernel picks before the first capture ([`autotune_picks`]).
     autotune: bool,
+    /// `BLOOMERY_ELASTIC`: the expert stacks reserved past the plan and settled to the margin
+    /// after the open ([`settle_elastic`]).
+    elastic: bool,
 }
 
 /// The Qwen3.8 session on the engine thread: the session over the model,
@@ -2845,6 +2885,7 @@ impl Q38 {
         let ckpt = checkpoint_budget38(gdn, qsa, ctx_ub.0)?;
         // The wall before the loader's call, which the `load phases` record names.
         let opened: Duration;
+        let elastic: Option<ElasticTerms>;
         let mut m = match a.mtp {
             false => {
                 let machine =
@@ -2855,7 +2896,8 @@ impl Q38 {
                     inputs.plan_with_slots(&machine, ctx_ub, &a.plan_levers, a.experts, a.slots)?;
                 a.plan.hold(&PlanKey::of(&plan)?)?;
                 opened = t.elapsed();
-                Body38::open_placed_residency(
+                elastic = elastic_terms(&plan, a.elastic);
+                Body38::open_placed_elastic(
                     model,
                     &plan,
                     &inputs,
@@ -2865,6 +2907,7 @@ impl Q38 {
                     a.residency,
                     a.pool,
                     a.slots,
+                    a.elastic,
                 )?
             }
             true => {
@@ -2896,7 +2939,8 @@ impl Q38 {
                 )?;
                 a.plan.hold(&PlanKey::of(&plan.plan)?)?;
                 opened = t.elapsed();
-                Body38::open_placed_mtp_residency(
+                elastic = elastic_terms(&plan.plan, a.elastic);
+                Body38::open_placed_mtp_elastic(
                     model,
                     &plan,
                     &inputs,
@@ -2908,6 +2952,7 @@ impl Q38 {
                     a.residency,
                     a.pool,
                     a.slots,
+                    a.elastic,
                 )?
             }
         };
@@ -3064,6 +3109,11 @@ impl Q38 {
         let (gpu, _, body) = s.model_mut().body_parts(WHAT)?;
         let line = xstream_rule(gpu, body, a.xstream, a.place.stage38(), a.residency)?;
         eprintln!("{line}");
+        // The settle after every card buffer the open makes, the ring included: what the card
+        // has free now is what serving leaves it.
+        if let Some(terms) = elastic {
+            settle_elastic(gpu, body, terms)?;
+        }
         let mut census = record::host_tier::CensusSpan::default();
         {
             let b = s.model().body(WHAT)?;

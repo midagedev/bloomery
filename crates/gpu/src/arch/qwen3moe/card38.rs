@@ -328,7 +328,7 @@ fn stack<'w>(
         _ => Err(GpuError::Tensor {
             what: WHAT,
             name: name.to_string(),
-            need: "a resident routed stack of the slot map's experts of its layer on this card, \
+            need: "a resident routed stack of the slot map's capacity of its layer on this card, \
                    of the type the plan lists for it (the gate and up Q4_K, Q5_K, IQ3_XXS or \
                    IQ4_XS, the down Q5_1, Q8_0 or IQ4_NL, in the file's blocks; NVFP4 in its \
                    planes), each that count's rows",
@@ -336,20 +336,28 @@ fn stack<'w>(
     }
 }
 
-/// Per layer of `layers`, its experts on one card as `on(l)` counts them and
-/// `w` holds them, each layer's types as `stacks` lists them: a layer with
-/// experts there holds its three routed stacks as [`stack`] names them, at
-/// its count's rows and in types the leg runs ([`leg_types`]); a layer with
-/// none holds none. Anything else is refused by name. Load-time only.
+/// Per layer of `layers`, its experts on one card as `on(l)` counts them —
+/// the live experts and the slots the stacks were made with, at least as
+/// many — and `w` holds them, each layer's types as `stacks` lists them: a
+/// layer with experts there holds its three routed stacks as [`stack`] names
+/// them, at the slots' rows and in types the leg runs ([`leg_types`]); a
+/// layer with none holds none. Anything else is refused by name. Load-time
+/// only.
 pub(super) fn leg_layers(
     w: &Weights,
     stacks: &Qwen38Stacks,
-    on: impl Fn(usize) -> Result<usize, GpuError>,
+    on: impl Fn(usize) -> Result<(usize, usize), GpuError>,
     layers: usize,
 ) -> Result<Vec<Option<LegLayer>>, GpuError> {
     let mut per = Vec::with_capacity(layers);
     for l in 0..layers {
-        let n_card = on(l)?;
+        let (n_card, slots) = on(l)?;
+        if slots < n_card {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("layer {l}: {slots} stack slots below its {n_card} live experts"),
+            ));
+        }
         let [gate, up, down] = routed_stacks(l);
         if n_card == 0 {
             if let Some(n) = [&gate, &up, &down].into_iter().find(|n| w.get(n).is_some()) {
@@ -364,9 +372,9 @@ pub(super) fn leg_layers(
             continue;
         }
         let (gate_up_ty, down_ty) = leg_types(stacks, l)?;
-        stack(w, &gate, gate_up_ty, n_card * geo::FF)?;
-        stack(w, &up, gate_up_ty, n_card * geo::FF)?;
-        stack(w, &down, down_ty, n_card * geo::HIDDEN)?;
+        stack(w, &gate, gate_up_ty, slots * geo::FF)?;
+        stack(w, &up, gate_up_ty, slots * geo::FF)?;
+        stack(w, &down, down_ty, slots * geo::HIDDEN)?;
         per.push(Some(LegLayer {
             n_card,
             gate,
@@ -448,7 +456,14 @@ impl Card38 {
         layers: usize,
         keep_host: bool,
     ) -> Result<Card38, GpuError> {
-        let per = leg_layers(w, stacks, |l| map.on_card(l), layers)?;
+        // A stack is as long as the map's capacity: the plan's live experts
+        // and, on an elastic load, the slots a fill may back.
+        let per = leg_layers(
+            w,
+            stacks,
+            |l| Ok((map.on_card(l)?, map.capacity(l)?)),
+            layers,
+        )?;
         let hostless: Vec<bool> = per
             .iter()
             .map(|c| !keep_host && c.as_ref().is_some_and(|c| c.n_card == geo::EXPERTS))

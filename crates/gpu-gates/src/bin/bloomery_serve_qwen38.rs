@@ -32,6 +32,10 @@ mod qwen38;
 #[path = "shared/xstream_rule.rs"]
 mod xstream_rule;
 
+// The elastic expert tenant's record lines, printed by the seat's settle.
+#[path = "shared/elastic.rs"]
+mod elastic;
+
 // The seats' one owner of a checkpoint folder's open, a sibling of the seat as in `bloomery-serve`.
 #[cfg(feature = "gpu")]
 #[path = "shared/serve_seats/folder.rs"]
@@ -381,6 +385,7 @@ mod tests {
     const READS: &[(&str, &[&str])] = &[
         ("autotune", &[bloomery_levers::AUTOTUNE]),
         ("draft", &[bloomery_levers::DRAFT]),
+        ("elastic", &[bloomery_levers::ELASTIC]),
         (
             "host",
             &[

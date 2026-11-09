@@ -23,6 +23,7 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::MTP_WIDTH,
     bloomery_levers::RESIDENCY,
     bloomery_levers::XSTREAM,
+    bloomery_levers::ELASTIC,
     bloomery_levers::PREFILL,
     bloomery_levers::ROUTE_TRACE,
     bloomery_levers::STEP_STATS,

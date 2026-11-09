@@ -57,6 +57,11 @@ pub mod qwen38;
 #[cfg(feature = "deepseek41")]
 #[path = "../xstream_rule.rs"]
 pub mod xstream_rule;
+
+/// The elastic expert tenant's record lines, printed by the Qwen3.8 seat's settle.
+#[cfg(feature = "deepseek41")]
+#[path = "../elastic.rs"]
+pub mod elastic;
 // The seats' one owner of a checkpoint folder's open (`minimaxm3_folder`, `qwen38_folder`,
 // `qwen3_folder`, `nemotron`).
 #[cfg(feature = "deepseek41")]

@@ -132,7 +132,7 @@ use super::scratch38::{
     final_res, no_carry, store_rule_bytes,
 };
 use super::slot_pass::SlotIn;
-use super::swap38::{self, DEADLINE, LIVE_DELAY};
+use super::swap38::{self, DEADLINE, LIVE_DELAY, Qwen38Stacks};
 use super::tier38::{TierSide38, open_tier};
 use super::ubatch::UBATCH as UBATCH_MOST;
 use super::wide38::{
@@ -156,6 +156,7 @@ use crate::host::prompt_stream::PromptStream;
 use crate::host::run::{HostRun, HostWidths};
 use crate::host::served::{ResidencyParts, TierBody};
 use crate::host::swap::{CallPick, CallReport, PassReport, Residency};
+use crate::host::swap_source::FileStacks;
 use crate::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
 use crate::host::tier::TierOpen;
 use crate::host::xstream::{Costs, XCfg, XLayer, XMode, XReport};
@@ -177,7 +178,7 @@ use crate::site::ByName;
 use crate::tensor::{WindowMut, to_host};
 use crate::weights::{Weights, tensor_scales};
 use crate::{Branch, DeviceTensor, Gpu, GpuError, SharedPages, StagedRows, launch_u32, ple, qsa};
-use crate::{FreedBytes, KvRoomBody, fit_rooms};
+use crate::{ElasticBody, ElasticStats, FilledBytes, FreedBytes, KvRoomBody, fit_rooms};
 use bloomery_levers::{ChurnHosting, HostCfg};
 use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, sys};
 use engram::Hash;
@@ -1340,6 +1341,8 @@ pub struct Body38 {
     /// The NVMe expert tier's arena, when the plan paged routed experts
     /// ([`Body38::nvme_tier`]).
     nvme_tier: Option<Arc<NvTier>>,
+    /// The elastic tenant's moves since the load ([`ElasticBody`]).
+    elastic: ElasticStats,
     /// The recurrent stores on the host at chosen positions, and the PLE
     /// hash's history at each, ascending: the points a cut behind the fed
     /// positions restores. A prompt call takes them only while `marks` is on.
@@ -1430,6 +1433,7 @@ impl Body38 {
             ChurnHosting::Hosted,
             None,
             1,
+            false,
         )
     }
 
@@ -1458,6 +1462,7 @@ impl Body38 {
             ChurnHosting::Hosted,
             None,
             slots,
+            false,
         )
     }
 
@@ -1490,7 +1495,33 @@ impl Body38 {
         slots: usize,
     ) -> Result<Qwen38Model, GpuError> {
         Body38::open_with(
-            file, plan, inputs, card, host, ubatch, residency, pool, None, slots,
+            file, plan, inputs, card, host, ubatch, residency, pool, None, slots, false,
+        )
+    }
+
+    /// [`Body38::open_placed_residency`] with the expert stacks elastic when
+    /// `elastic`: each layer's card stacks reserved for the slots the plan's
+    /// assumed terms could hold ([`swap38::elastic_stacks`]), the plan's
+    /// experts backed, the rest withdrawn until the machine's fill. Refused by
+    /// name without a residency machine: nothing would fill them.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "open_placed_residency's nine and the elastic flag (rust-quality R12)"
+    )]
+    pub fn open_placed_elastic(
+        file: impl Into<Model38>,
+        plan: &Plan<'_>,
+        inputs: &model::arch::qwen35moe::place::PlanInputs,
+        card: usize,
+        host: HostCfg,
+        ubatch: usize,
+        residency: Residency,
+        pool: ChurnHosting,
+        slots: usize,
+        elastic: bool,
+    ) -> Result<Qwen38Model, GpuError> {
+        Body38::open_with(
+            file, plan, inputs, card, host, ubatch, residency, pool, None, slots, elastic,
         )
     }
 
@@ -1523,6 +1554,7 @@ impl Body38 {
             ChurnHosting::Hosted,
             Some((draft, mtp, plan)),
             1,
+            false,
         )
     }
 
@@ -1556,6 +1588,7 @@ impl Body38 {
             ChurnHosting::Hosted,
             Some((draft, mtp, plan)),
             slots,
+            false,
         )
     }
 
@@ -1591,6 +1624,42 @@ impl Body38 {
             pool,
             Some((draft, mtp, plan)),
             slots,
+            false,
+        )
+    }
+
+    /// [`Body38::open_placed_mtp_residency`] with the expert stacks elastic
+    /// when `elastic` ([`Body38::open_placed_elastic`]).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "open_placed_mtp_residency's eleven and the elastic flag (rust-quality R12)"
+    )]
+    pub fn open_placed_mtp_elastic(
+        file: impl Into<Model38>,
+        plan: &model::arch::qwen35moe::place::MtpPlan<'_>,
+        inputs: &model::arch::qwen35moe::place::PlanInputs,
+        card: usize,
+        host: HostCfg,
+        ubatch: usize,
+        draft: &Split,
+        mtp: &model::arch::qwen35moe::place::MtpInputs,
+        residency: Residency,
+        pool: ChurnHosting,
+        slots: usize,
+        elastic: bool,
+    ) -> Result<Qwen38Model, GpuError> {
+        Body38::open_with(
+            file,
+            &plan.plan,
+            inputs,
+            card,
+            host,
+            ubatch,
+            residency,
+            pool,
+            Some((draft, mtp, plan)),
+            slots,
+            elastic,
         )
     }
 
@@ -1618,6 +1687,7 @@ impl Body38 {
             &model::arch::qwen35moe::place::MtpPlan<'_>,
         )>,
         slots: usize,
+        elastic: bool,
     ) -> Result<Qwen38Model, GpuError> {
         if slots == 0 {
             return Err(GpuError::shape(WHAT, "a load of 0 resident sequence slots"));
@@ -1680,6 +1750,18 @@ impl Body38 {
             ));
         }
         let shape = plan38::read(&inputs.spec)?;
+        if elastic && residency == Residency::Off {
+            return Err(GpuError::shape(
+                WHAT,
+                "elastic expert stacks under no residency machine: nothing would fill or give \
+                 them back",
+            ));
+        }
+        let stacks = Arc::new(if elastic {
+            swap38::elastic_stacks(&inputs.model, plan, card)?
+        } else {
+            swap38::stacks(&inputs.model, plan)?
+        });
         let spec = ResidencySpec {
             lever: residency,
             pool,
@@ -1687,7 +1769,7 @@ impl Body38 {
             deadline: DEADLINE,
             top_k: geo::N_USED,
             max_rows: PASS_ROWS,
-            stacks: Arc::new(swap38::stacks(&inputs.model, plan)?),
+            stacks: Arc::clone(&stacks) as Arc<dyn FileStacks>,
         };
         GpuModel::load_placed_from(
             file,
@@ -1715,6 +1797,7 @@ impl Body38 {
                     set,
                     glue,
                     (ubatch, route_run, counted, slots),
+                    &stacks,
                 )?;
                 if let Some(mut d) = draft {
                     let rows = body.rope.table.len() / body.rope.width;
@@ -1785,6 +1868,7 @@ impl Body38 {
         set: HostResidency,
         residency_glue: ResidencyGlue,
         (ub, route_run, counted, planned): (usize, usize, u64, usize),
+        stacks: &Qwen38Stacks,
     ) -> Result<Body38, GpuError> {
         let spec = &inputs.spec;
         let n = spec.layers.len();
@@ -1882,7 +1966,15 @@ impl Body38 {
         let run = 0..n;
         let tiers = TierOpen::of_machine(plan.machine)?;
         let tier_cards: Vec<usize> = tiers.iter().map(|t| t.card).collect();
-        let map = SlotMap::of_plan_tiers(plan, 0, &tier_cards, run.clone(), geo::EXPERTS)?;
+        let mut map = SlotMap::of_plan_tiers(plan, 0, &tier_cards, run.clone(), geo::EXPERTS)?;
+        // An elastic load's layers reserve the slots their stacks were made
+        // with ([`swap38::elastic_stacks`]); the machine's layout seeds the
+        // rest withdrawn.
+        for l in run.clone() {
+            if let Some(capacity) = stacks.capacity(l) {
+                map.reserve_card(l, capacity)?;
+            }
+        }
         let card_leg = MapCheck::of(&map, !tiers.is_empty())?;
         let slots = Arc::new(DeviceTensor::upload(
             stream,
@@ -1890,11 +1982,10 @@ impl Body38 {
             n,
             geo::EXPERTS,
         )?);
-        let stacks = swap38::stacks(&inputs.model, plan)?;
         // A residency machine moves experts to the host after the load, and
         // the host service writes a route trace: either keeps every host leg.
         let machine = residency_glue.source().is_some();
-        let card = Card38::new(gpu, w, &stacks, &map, n, machine || host.route_trace)?;
+        let card = Card38::new(gpu, w, stacks, &map, n, machine || host.route_trace)?;
         // A tier layer's join sums the card's slots and the tier's in one
         // launch, which a layer with no card expert does not run.
         if let Some(l) = run
@@ -2119,6 +2210,7 @@ impl Body38 {
             residency_glue,
             engine: gpu.stream_handle(),
             nvme_tier,
+            elastic: ElasticStats::default(),
             ckpt,
             ple_points: Vec::new(),
             point_rows: Vec::new(),
@@ -5620,6 +5712,31 @@ impl KvRoomBody for Body38 {
             slots: freed.k,
             layers: freed.layers.len(),
         })
+    }
+}
+
+impl ElasticBody for Body38 {
+    fn fill_expert_bytes(&mut self, room: u64) -> Result<FilledBytes, GpuError> {
+        let Some(ResidencyParts { glue, hybrid, .. }) = self.residency_parts() else {
+            return Err(GpuError::state(
+                WHAT,
+                "a residency machine to fill expert slots from",
+            ));
+        };
+        let filled = glue.fill_bytes(hybrid, room)?;
+        Ok(FilledBytes {
+            bytes: filled.bytes,
+            slots: filled.k,
+            layers: filled.layers.len(),
+        })
+    }
+
+    fn expert_quantum(&self) -> Option<(u64, u64)> {
+        self.residency_glue.quantum(&self.hybrid)
+    }
+
+    fn elastic_stats(&mut self) -> &mut ElasticStats {
+        &mut self.elastic
     }
 }
 

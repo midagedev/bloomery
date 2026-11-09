@@ -664,6 +664,7 @@ fn accessors_read_their_rows() {
             QWEN38_EXPERTS,
             HOSTSTREAM,
             XSTREAM,
+            ELASTIC,
             SPLIT_WALK,
             QWEN3_KV,
             KV_FLOOR,

@@ -37,6 +37,7 @@ pub const RESIDENCY: &str = "BLOOMERY_RESIDENCY";
 pub const METAL_BREADCRUMB: &str = "BLOOMERY_METAL_BREADCRUMB";
 pub const HOSTSTREAM: &str = "BLOOMERY_HOSTSTREAM";
 pub const XSTREAM: &str = "BLOOMERY_XSTREAM";
+pub const ELASTIC: &str = "BLOOMERY_ELASTIC";
 pub const SPLIT_WALK: &str = "BLOOMERY_SPLIT_WALK";
 pub const ROUTE_TRACE: &str = "BLOOMERY_ROUTE_TRACE";
 pub const WARM_PROFILE: &str = "BLOOMERY_WARM_PROFILE";
@@ -1105,6 +1106,26 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               expert tier card (`--place bp`) the Muse Spark, MiniMax-M3.1 and Mistral Large 4 \
               loads take `split` set: a tier layer's join sums the streamed experts beside the \
               tier's slots.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: ELASTIC,
+        class: Class::A,
+        kind: Kind::OnOff,
+        default: Unset::Is("off"),
+        doc: "Qwen3.8 (`bloomery-serve-qwen38`) under a residency machine: `on` reserves each \
+              layer's card expert stacks for the slots the plan's assumed terms could hold \
+              (`placement::elastic::capacity`), the plan's experts backed and the rest withdrawn, \
+              and after the open — captures, drafts, slots, the expert stream's ring — reads the \
+              card's free bytes and settles them to the plan's margin (`settle_to_margin`): \
+              below it, the coldest experts go back to the host (`elastic give-back`); above it, \
+              withdrawn slots fill from the host (`elastic fill`), two quanta kept; a settle that \
+              moves nothing says why (`elastic held`), and `stat elastic` counts the moves. `off` \
+              loads today's plan, the same-binary arm. Set on a load with no residency machine or \
+              another binary, it is refused by name.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

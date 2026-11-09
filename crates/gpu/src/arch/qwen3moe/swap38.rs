@@ -26,7 +26,7 @@ use super::swap::{self, CardLeg};
 use crate::GpuError;
 use crate::host::swap_source::PlanStacks;
 use model::placement::accepts::Program;
-use model::placement::{ModelTensors, Plan};
+use model::placement::{ModelTensors, Plan, Role, elastic, per_expert};
 
 pub use crate::host::swap_source::{DEADLINE, LIVE_DELAY};
 
@@ -65,6 +65,57 @@ pub fn stacks(model: &ModelTensors, plan: &Plan<'_>) -> Result<Qwen38Stacks, Gpu
             )),
         }
     })
+}
+
+/// [`stacks`] for an elastic load: each layer the plan puts experts on reserves
+/// its card stacks for the slots the card's assumed terms could hold
+/// ([`elastic::capacity`]: the plan's count plus the quanta of
+/// [`elastic::reclaimable`] bytes, a quantum one slot on every such layer at
+/// the stack's own bytes an expert), the plan's rows backed and the rest
+/// withdrawn until the machine fills them. A layer with no card expert
+/// reserves nothing. Load-time only.
+pub fn elastic_stacks(
+    model: &ModelTensors,
+    plan: &Plan<'_>,
+    card: usize,
+) -> Result<Qwen38Stacks, GpuError> {
+    const WHAT: &str = "swap38::elastic_stacks";
+    let table = stacks(model, plan)?;
+    let (Some(spec), Some(totals)) = (plan.machine.cards.get(card), plan.cards.get(card)) else {
+        return Err(GpuError::shape(
+            WHAT,
+            format!("the plan has no card {card}"),
+        ));
+    };
+    let mut slot_bytes = vec![0u64; model.layers];
+    for t in model
+        .tensors
+        .iter()
+        .filter(|t| t.role == Role::RoutedExperts)
+    {
+        if let Some(b) = t.layer.and_then(|l| slot_bytes.get_mut(l)) {
+            let (_, per) = per_expert(t, model.experts).map_err(|e| GpuError::plan(WHAT, e))?;
+            *b = b.saturating_add(per);
+        }
+    }
+    let live = |l: usize| plan.n_l.get(l).copied().unwrap_or(0);
+    let quantum = (0..model.layers)
+        .filter(|&l| live(l) > 0)
+        .fold(0u64, |q, l| q.saturating_add(slot_bytes[l]));
+    let room = elastic::reclaimable(totals, spec.margin_bytes);
+    let capacity = (0..model.layers)
+        .map(|l| {
+            (live(l) > 0)
+                .then(|| {
+                    usize::try_from(elastic::capacity(live(l), room, quantum, model.experts))
+                        .map_err(|_| {
+                            GpuError::shape(WHAT, format!("layer {l}'s capacity passes usize"))
+                        })
+                })
+                .transpose()
+        })
+        .collect::<Result<Vec<Option<usize>>, GpuError>>()?;
+    table.with_capacity(capacity)
 }
 
 /// The stacks of `model`'s layers, the layers `set` gives tier experts
