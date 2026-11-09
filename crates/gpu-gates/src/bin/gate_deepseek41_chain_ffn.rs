@@ -106,7 +106,16 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "deepseek41")]
+#[allow(
+    dead_code,
+    reason = "the shared runner serves several gates; each takes the helpers it reads"
+)]
+#[path = "shared/e2e.rs"]
+mod e2e;
+
+#[cfg(feature = "deepseek41")]
 mod gate {
+    use crate::e2e::rel_max;
     use std::sync::Arc;
 
     use bloomery_gpu::fused::FusedKernels;
@@ -1352,15 +1361,6 @@ mod gate {
         if den > 0.0 { num / den } else { num }
     }
 
-    /// `max|a - b| / max|b|`.
-    fn rel(a: &[f32], b: &[f32]) -> f64 {
-        let den = b.iter().fold(0.0f64, |m, &v| m.max(f64::from(v).abs()));
-        let num = a.iter().zip(b).fold(0.0f64, |m, (&x, &y)| {
-            m.max((f64::from(x) - f64::from(y)).abs())
-        });
-        if den > 0.0 { num / den } else { num }
-    }
-
     /// The host-side data the bands read at one layer: each routed expert's
     /// down rows the sets use, and the shared down.
     struct BandWeights {
@@ -1970,7 +1970,7 @@ mod gate {
                 // 3. Against the dump.
                 let margin = tie_margin(d, &got.logits, &bias, &got.probs);
                 let ids_eq = got.ids == d.ids;
-                let x_rel = rel(&got.x, &d.x);
+                let x_rel = rel_max(&got.x, &d.x);
                 let x_near = x_within(&got.x, &d.x, norm_band(n));
                 let waived = !ids_eq && margin <= 1.0 && x_near;
                 let kind = if lc.n_card > 0 {
@@ -2035,8 +2035,8 @@ mod gate {
                     if fold { "post+fold" } else { "post" },
                     places.join(","),
                     pred_rel(&py, &d.y),
-                    rel(&got.y, &d.y),
-                    rel(&got.streams, &d.l_out),
+                    rel_max(&got.y, &d.y),
+                    rel_max(&got.streams, &d.l_out),
                     verdict(pass)
                 );
                 tally.add(pass);

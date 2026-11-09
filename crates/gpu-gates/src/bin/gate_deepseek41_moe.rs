@@ -88,7 +88,16 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "deepseek41")]
+#[allow(
+    dead_code,
+    reason = "the shared runner serves several gates; each takes the helpers it reads"
+)]
+#[path = "shared/e2e.rs"]
+mod e2e;
+
+#[cfg(feature = "deepseek41")]
 mod gate {
+    use crate::e2e::rel_max;
     use bloomery_gpu::kquant::{TileTable, TiledDown};
     use bloomery_gpu::q4k_sel::tile_cap;
     use bloomery_gpu::route_core::renorm_divisor;
@@ -479,15 +488,6 @@ mod gate {
         } else {
             ratio.max(r)
         }
-    }
-
-    /// `max|a - b| / max|b|` in f64 — the `ik_rel` of the other gates.
-    fn rel(a: &[f32], b: &[f32]) -> f64 {
-        let den = b.iter().fold(0.0f64, |m, &v| m.max(f64::from(v).abs()));
-        let num = a.iter().zip(b).fold(0.0f64, |m, (&x, &y)| {
-            m.max((f64::from(x) - f64::from(y)).abs())
-        });
-        if den > 0.0 { num / den } else { num }
     }
 
     /// A dot site's comparisons over one output vector (module doc): (1) the
@@ -1298,7 +1298,7 @@ mod gate {
                     + softplus_err(xb, HOST_EXP_ULPS, HOST_LOG_ULPS);
                 p3 = worst(p3, (f64::from(a) - f64::from(b)).abs(), band);
             }
-            ik_rel_p = ik_rel_p.max(rel(&pk, pd));
+            ik_rel_p = ik_rel_p.max(rel_max(&pk, pd));
             if idk.as_slice() == idd {
                 let (e_k, e_d) = (weights64(&pk, &idk, scale), weights64(pd, idd, scale));
                 for (s, (&a, &b)) in wk.iter().zip(wd).enumerate() {
@@ -1306,7 +1306,7 @@ mod gate {
                         (e_k[s] - e_d[s]).abs() + WEIGHT_ROUNDING * (e_k[s].abs() + e_d[s].abs());
                     w3 = worst(w3, (f64::from(a) - f64::from(b)).abs(), band);
                 }
-                ik_rel_w = ik_rel_w.max(rel(&wk, wd));
+                ik_rel_w = ik_rel_w.max(rel_max(&wk, wd));
             }
         }
         let pass = ok1
@@ -1413,7 +1413,7 @@ mod gate {
             let (a, b) = swiglu_cmp(&hk, ht, &gs, &us, no_k, ni_k, limit);
             h2 = h2.max(a);
             h3 = h3.max(b);
-            h_ik = h_ik.max(rel(&hk, ht));
+            h_ik = h_ik.max(rel_max(&hk, ht));
 
             let (ho, hi) = shared_acts(ly.sh_down.ty, ht);
             let ds = row_stats(&ly.sh_down.rows, &ho, &hi)?;
@@ -1421,7 +1421,7 @@ mod gate {
             y_rel = y_rel.max(a);
             y2 = y2.max(b);
             y3 = y3.max(c);
-            y_ik = y_ik.max(rel(&yk, yt));
+            y_ik = y_ik.max(rel_max(&yk, yt));
             if rule {
                 let got = ik_kq_rows(ly.sh_down.ty, &ly.sh_down.bytes, ht)?;
                 rule_same += same_bits(&got, yt);
@@ -1834,8 +1834,8 @@ mod gate {
                 d2 = d2.max(r2);
                 d3 = d3.max(r3);
             }
-            h_ik = h_ik.max(rel(&hk, h_d));
-            d_ik = d_ik.max(rel(&dk, d_d));
+            h_ik = h_ik.max(rel_max(&hk, h_d));
+            d_ik = d_ik.max(rel_max(&dk, d_d));
         }
         let pass = h_exact
             && g_rel <= KERNEL_BAND
